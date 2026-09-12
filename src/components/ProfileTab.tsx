@@ -1,0 +1,260 @@
+'use client';
+
+import { useCallback, useEffect, useState } from 'react';
+import type { SeedBook } from '@/lib/types';
+
+export default function ProfileTab() {
+  const [seeds, setSeeds] = useState<SeedBook[]>([]);
+  const [content, setContent] = useState('');
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState('');
+
+  const load = useCallback(async () => {
+    const res = await fetch('/api/profile');
+    if (res.ok) {
+      const d = await res.json();
+      setSeeds(d.seeds ?? []);
+      setContent(d.content ?? '');
+    }
+  }, []);
+
+  useEffect(() => {
+    load();
+  }, [load]);
+
+  function updateSeed(i: number, patch: Partial<SeedBook>) {
+    setSeeds((s) => s.map((x, j) => (j === i ? { ...x, ...patch } : x)));
+  }
+
+  async function saveSeeds() {
+    setBusy(true);
+    setMsg('');
+    try {
+      const res = await fetch('/api/profile', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ seeds }),
+      });
+      setMsg(res.ok ? '✓ 种子已保存' : '✗ 保存失败');
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function generate() {
+    setBusy(true);
+    setMsg('');
+    try {
+      const res = await fetch('/api/profile', { method: 'POST' });
+      const d = await res.json();
+      if (res.ok) {
+        setContent(d.content);
+        setMsg('✓ 画像已生成');
+      } else {
+        setMsg(`✗ ${d.error || '生成失败'}`);
+      }
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function saveDraft() {
+    setBusy(true);
+    try {
+      const res = await fetch('/api/profile', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ seeds, content: draft }),
+      });
+      if (res.ok) setContent(draft);
+      setEditing(false);
+      setMsg(res.ok ? '✓ 已保存' : '✗ 保存失败');
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const loveCount = seeds.filter((s) => s.kind === 'love').length;
+  const dropCount = seeds.filter((s) => s.kind === 'drop').length;
+
+  return (
+    <div className="grid lg:grid-cols-2 gap-10">
+      {/* 左：种子书单 */}
+      <section>
+        <h2 className="text-sm font-bold tracking-[0.25em] mb-1" style={{ color: 'var(--cinnabar)' }}>
+          种子书单
+        </h2>
+        <p className="text-xs mb-4 leading-6" style={{ color: 'var(--ink-faint)' }}>
+          最爱 {loveCount} 本 · 弃书 {dropCount} 本。弃书原因的权重高于最爱——网文口味「彼仙我毒」，雷点比萌点更能定义你。
+        </p>
+
+        <div className="space-y-3">
+          {seeds.map((s, i) => (
+            <div
+              key={i}
+              className="border border-[var(--line)] rounded p-3 bg-[var(--paper-card)]"
+            >
+              <div className="flex gap-2 items-center mb-2">
+                <button
+                  className={`chip text-xs ${s.kind === 'drop' ? 'chip-risk' : 'chip-like'}`}
+                  onClick={() => updateSeed(i, { kind: s.kind === 'drop' ? 'love' : 'drop' })}
+                  title="点击切换 最爱/弃书"
+                >
+                  {s.kind === 'drop' ? '弃书' : '最爱'}
+                </button>
+                <input
+                  className="paper-input text-sm flex-1 !py-1.5"
+                  placeholder="书名"
+                  value={s.title}
+                  onChange={(e) => updateSeed(i, { title: e.target.value })}
+                />
+                <input
+                  className="paper-input text-sm w-28 !py-1.5"
+                  placeholder="作者(可空)"
+                  value={s.author ?? ''}
+                  onChange={(e) => updateSeed(i, { author: e.target.value })}
+                />
+                <button
+                  className="text-xs px-1"
+                  style={{ color: 'var(--ink-faint)' }}
+                  onClick={() => setSeeds((arr) => arr.filter((_, j) => j !== i))}
+                >
+                  ✕
+                </button>
+              </div>
+              <input
+                className="paper-input text-xs w-full !py-1.5"
+                placeholder={s.kind === 'drop' ? '为什么弃？（毒点在哪）' : '为什么爱？（哪个点戳中你）'}
+                value={s.reason ?? ''}
+                onChange={(e) => updateSeed(i, { reason: e.target.value })}
+              />
+            </div>
+          ))}
+        </div>
+
+        <div className="flex flex-wrap gap-2.5 mt-4">
+          <button
+            className="chip hover:border-[var(--ink)] transition-colors"
+            onClick={() => setSeeds((s) => [...s, { title: '', kind: 'love' }])}
+          >
+            + 最爱
+          </button>
+          <button
+            className="chip hover:border-[var(--cinnabar)] transition-colors"
+            onClick={() => setSeeds((s) => [...s, { title: '', kind: 'drop' }])}
+          >
+            + 弃书
+          </button>
+          <div className="flex-1" />
+          <button className="ink-button text-xs !py-2" onClick={saveSeeds} disabled={busy}>
+            保存种子
+          </button>
+          <button className="seal-button text-xs !py-2" onClick={generate} disabled={busy}>
+            {busy ? '…' : '生成画像'}
+          </button>
+        </div>
+        {msg && (
+          <p className="text-xs mt-3" style={{ color: msg.startsWith('✓') ? 'var(--moss)' : 'var(--cinnabar)' }}>
+            {msg}
+          </p>
+        )}
+      </section>
+
+      {/* 右：画像 */}
+      <section>
+        <div className="flex items-center gap-3 mb-4">
+          <h2 className="text-sm font-bold tracking-[0.25em]" style={{ color: 'var(--cinnabar)' }}>
+            口味画像
+          </h2>
+          <div className="flex-1" />
+          {content && !editing && (
+            <button
+              className="chip text-xs"
+              onClick={() => {
+                setDraft(content);
+                setEditing(true);
+              }}
+            >
+              人工修订
+            </button>
+          )}
+          {editing && (
+            <>
+              <button className="chip chip-dai text-xs" onClick={saveDraft} disabled={busy}>
+                保存修订
+              </button>
+              <button
+                className="chip text-xs"
+                onClick={() => setEditing(false)}
+              >
+                取消
+              </button>
+            </>
+          )}
+        </div>
+
+        {editing ? (
+          <textarea
+            className="paper-input text-sm leading-7 w-full h-96 font-mono"
+            value={draft}
+            onChange={(e) => setDraft(e.target.value)}
+          />
+        ) : content ? (
+          <div className="book-card px-6 py-5 pl-8 md">
+            <Markdown md={content} />
+          </div>
+        ) : (
+          <p className="text-sm py-10 text-center" style={{ color: 'var(--ink-faint)' }}>
+            画像还是白纸 —— 填好种子书单，点「生成画像」
+          </p>
+        )}
+        {content && !editing && (
+          <p className="text-xs mt-3 leading-6" style={{ color: 'var(--ink-faint)' }}>
+            每次读完/弃书留下原因，画像会自动吸收（见找书页的反馈按钮）。人工修订可直接改。
+          </p>
+        )}
+      </section>
+    </div>
+  );
+}
+
+// 极简 Markdown 渲染（画像专用：## / 列表 / **粗体**）
+function Markdown({ md }: { md: string }) {
+  const lines = md.split('\n');
+  const out: React.ReactNode[] = [];
+  let list: React.ReactNode[] = [];
+  let key = 0;
+
+  const flush = () => {
+    if (list.length > 0) {
+      out.push(<ul key={key++}>{list}</ul>);
+      list = [];
+    }
+  };
+
+  for (const raw of lines) {
+    const line = raw.trimEnd();
+    if (line.startsWith('##')) {
+      flush();
+      out.push(<h2 key={key++}>{line.replace(/^#+\s*/, '')}</h2>);
+    } else if (/^\s*[-*]\s+/.test(line)) {
+      list.push(<li key={key++}>{inline(line.replace(/^\s*[-*]\s+/, ''))}</li>);
+    } else if (line.trim() === '') {
+      flush();
+    } else {
+      flush();
+      out.push(<p key={key++}>{inline(line)}</p>);
+    }
+  }
+  flush();
+  return <>{out}</>;
+}
+
+function inline(text: string): React.ReactNode {
+  const parts = text.split(/(\*\*[^*]+\*\*)/g);
+  return parts.map((p, i) =>
+    p.startsWith('**') && p.endsWith('**') ? <strong key={i}>{p.slice(2, -2)}</strong> : p,
+  );
+}
