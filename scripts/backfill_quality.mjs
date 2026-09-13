@@ -35,7 +35,17 @@ function loadEnvFile(path) {
     if (!line || line.startsWith('#')) continue;
     const eq = line.indexOf('=');
     if (eq < 1) continue;
-    env[line.slice(0, eq).trim()] = line.slice(eq + 1).trim();
+    const key = line.slice(0, eq).trim();
+    let value = line.slice(eq + 1).trim();
+    // vercel env pull 写的值带引号，必须剥掉（曾因此报 invalid URL）
+    if (
+      value.length >= 2 &&
+      ((value.startsWith('"') && value.endsWith('"')) ||
+        (value.startsWith("'") && value.endsWith("'")))
+    ) {
+      value = value.slice(1, -1);
+    }
+    env[key] = value;
   }
   return env;
 }
