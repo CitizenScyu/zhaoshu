@@ -3,7 +3,7 @@ import { requireApiOwner } from '@/lib/auth';
 import { ensureSchema, getSql } from '@/lib/db';
 import { isRecord } from '@/lib/sanitize';
 
-// 书库：读取批量打标入库的书（labeled_books）
+// 书库：读取批量打标入库的书（labeled_books），支持分类/流派/基调/完结筛选与排序
 export const maxDuration = 60;
 
 const PAGE_SIZE = 30;
@@ -30,28 +30,63 @@ export function labelText(labels: unknown, key: string, maxLength = 600): string
   return '';
 }
 
+const SORTS = new Set(['recent', 'oldest', 'title']);
+
 export async function GET(req: NextRequest) {
   const unauthorized = requireApiOwner(req);
   if (unauthorized) return unauthorized;
   const { searchParams } = new URL(req.url);
   const page = Math.max(1, Number(searchParams.get('page')) || 1);
   const query = (searchParams.get('q') || '').trim().slice(0, 100);
+  const category = (searchParams.get('category') || '').trim().slice(0, 30);
+  const tag = (searchParams.get('tag') || '').trim().slice(0, 30);
+  const finish = (searchParams.get('finish') || '').trim().slice(0, 10);
+  const sort = SORTS.has(searchParams.get('sort') || '') ? (searchParams.get('sort') as string) : 'recent';
   try {
     await ensureSchema();
     const s = getSql();
-    const like = query ? `%${query.toLowerCase()}%` : null;
-    const where = like
-      ? s`WHERE lower(title) LIKE ${like} OR lower(author) LIKE ${like}
-          OR lower(labels::text) LIKE ${like}`
-      : s``;
+    // 动态条件拼装（neon 库的 tagged template 每个分支都要是完整 SQL 片段）
+    const conds = [];
+    if (query) {
+      const like = `%${query.toLowerCase()}%`;
+      conds.push(s`(lower(title) LIKE ${like} OR lower(author) LIKE ${like} OR lower(labels::text) LIKE ${like})`);
+    }
+    if (category) conds.push(s`category = ${category}`);
+    if (tag) {
+      const tagLike = `%${tag.toLowerCase()}%`;
+      conds.push(s`lower(labels->>'genre') LIKE ${tagLike} OR lower(labels->>'style') LIKE ${tagLike} OR lower(labels->>'tone') LIKE ${tagLike}`);
+    }
+    if (finish) conds.push(s`finish_status = ${finish}`);
+    // 动态条件拼装（neon tagged template 不支持 sql.join，用 AND 手动归并）
+    let where = s``;
+    if (conds.length === 1) {
+      where = s`WHERE ${conds[0]}`;
+    } else if (conds.length > 1) {
+      let merged = conds[0];
+      for (let i = 1; i < conds.length; i++) {
+        merged = s`${merged} AND ${conds[i]}`;
+      }
+      where = s`WHERE ${merged}`;
+    }
+    const orderBy = sort === 'oldest' ? s`labeled_at ASC` : sort === 'title' ? s`title ASC` : s`labeled_at DESC`;
+
     const rows = (await s`
       SELECT id, title, author, category, finish_status, chars_labeled, labels,
              labeled_at::text AS labeled_at
       FROM labeled_books ${where}
-      ORDER BY labeled_at DESC
+      ORDER BY ${orderBy}
       LIMIT ${PAGE_SIZE} OFFSET ${(page - 1) * PAGE_SIZE}`) as unknown as LabeledBook[];
     const countRows = (await s`
       SELECT count(*)::int AS total FROM labeled_books ${where}`) as { total: number }[];
+
+    // 聚合可选筛选值（分类、完结状态、流派 topN）——给前端筛选条用
+    const catRows = (await s`
+      SELECT category, count(*)::int AS n FROM labeled_books
+      WHERE category <> '' GROUP BY category ORDER BY n DESC LIMIT 20`) as { category: string; n: number }[];
+    const finishRows = (await s`
+      SELECT finish_status, count(*)::int AS n FROM labeled_books
+      WHERE finish_status <> '' GROUP BY finish_status ORDER BY n DESC LIMIT 10`) as { finish_status: string; n: number }[];
+
     return NextResponse.json({
       books: rows.map((r) => ({
         id: r.id,
@@ -69,6 +104,10 @@ export async function GET(req: NextRequest) {
       total: countRows[0]?.total ?? 0,
       page,
       pageSize: PAGE_SIZE,
+      facets: {
+        categories: catRows.map((r) => ({ name: r.category, count: r.n })),
+        finishStates: finishRows.map((r) => ({ name: r.finish_status, count: r.n })),
+      },
     });
   } catch {
     return NextResponse.json({ error: 'internal error' }, { status: 500 });
