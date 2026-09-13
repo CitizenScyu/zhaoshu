@@ -36,19 +36,29 @@ async function searchSuggest(title: string): Promise<SuggestItem[]> {
   return (await res.json()) as SuggestItem[];
 }
 
+// 评分标记形如 <strong ... class="rating_num " property="v:average"> 8.5 </strong>,值两侧可能有空白
+export function parseRating(html: string): number | null {
+  const rating = html.match(/rating_num[^>]*>\s*([\d.]+)\s*</)?.[1];
+  return rating ? parseFloat(rating) : null;
+}
+
+// 人数标记形如 <span property="v:votes">2617</span>人评价(数字与文字跨标签)
+export function parseVotes(html: string): number | null {
+  const count = html
+    .match(/property="v:votes">\s*([\d,，]+)\s*</)?.[1]
+    ?.replace(/[,，]/g, '');
+  return count ? parseInt(count, 10) : null;
+}
+
 async function fetchSubjectRating(doubanId: string) {
   const res = await fetchWithTimeout(`https://book.douban.com/subject/${doubanId}/`);
   if (!res.ok) {
     throw new Error(`subject ${res.status}`);
   }
   const html = await res.text();
-  // 评分标记形如 <strong ... class="rating_num " property="v:average"> 8.5 </strong>，值两侧可能有空白
-  const rating = html.match(/rating_num[^>]*>\s*([\d.]+)\s*</)?.[1];
-  // 人数标记形如 <span property="v:votes">2617</span>人评价（数字与文字跨标签）
-  const count = html.match(/property="v:votes">\s*([\d,，]+)\s*</)?.[1]?.replace(/[,，]/g, '');
   return {
-    rating: rating ? parseFloat(rating) : null,
-    ratingCount: count ? parseInt(count, 10) : null,
+    rating: parseRating(html),
+    ratingCount: parseVotes(html),
   };
 }
 

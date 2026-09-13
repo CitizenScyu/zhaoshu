@@ -9,6 +9,12 @@ import {
   persistRecommendations,
 } from '@/lib/db';
 import { boundedString, readJsonBody, RequestBodyError } from '@/lib/http';
+import {
+  bookKey,
+  sanitizeCandidates,
+  sanitizeRerankedItems,
+  sanitizeVerified,
+} from '@/lib/sanitize';
 import { requireApiOwner } from '@/lib/auth';
 import {
   recallSystem,
@@ -16,7 +22,7 @@ import {
   rerankSystem,
   rerankUser,
 } from '@/lib/prompts';
-import type { Candidate, VerifiedCandidate, RerankedItem } from '@/lib/types';
+import type { VerifiedCandidate } from '@/lib/types';
 
 export const maxDuration = 295;
 
@@ -143,84 +149,4 @@ export async function POST(req: NextRequest) {
     console.error(e);
     return NextResponse.json({ error: 'internal error' }, { status: 500 });
   }
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null;
-}
-
-function cleanString(value: unknown, maxLength = 500): string {
-  return boundedString(value, maxLength) ?? '';
-}
-
-// 与 db.ts canonicalBookKey 保持一致：NFKC + trim + 小写，NUL 分隔
-function bookKey(title: string, author: string): string {
-  return `${title.normalize('NFKC').trim().toLocaleLowerCase()}\u0000${author.normalize('NFKC').trim().toLocaleLowerCase()}`;
-}
-
-function sanitizeCandidates(value: unknown): Candidate[] {
-  if (!Array.isArray(value)) return [];
-  return value.slice(0, 12).flatMap((candidate) => {
-    if (!isRecord(candidate)) return [];
-    const title = cleanString(candidate.title, 200);
-    const author = cleanString(candidate.author, 200);
-    if (!title || !author) return [];
-    return [{
-      title,
-      author,
-      category: cleanString(candidate.category),
-      wordCount: cleanString(candidate.wordCount),
-      why: cleanString(candidate.why),
-      source: 'llm' as const,
-    }];
-  });
-}
-
-function sanitizeVerified(value: unknown): VerifiedCandidate[] {
-  if (!Array.isArray(value)) return [];
-  return value.slice(0, 12).flatMap((candidate) => {
-    const [clean] = sanitizeCandidates([candidate]);
-    if (!clean || !isRecord(candidate) || !isRecord(candidate.douban)) return [];
-    const douban = candidate.douban;
-    return [{
-      ...clean,
-      douban: {
-        status: douban.status === 'verified' || douban.status === 'not_found'
-          ? douban.status : 'unavailable',
-        found: douban.status === 'verified' && douban.found === true,
-        doubanId: cleanString(douban.doubanId) || undefined,
-        rating: typeof douban.rating === 'number' && Number.isFinite(douban.rating)
-          ? douban.rating : null,
-        ratingCount: typeof douban.ratingCount === 'number' && Number.isFinite(douban.ratingCount)
-          ? douban.ratingCount : null,
-        url: cleanString(douban.url) || undefined,
-        note: cleanString(douban.note) || undefined,
-      },
-    }];
-  });
-}
-
-function sanitizeRerankedItems(value: unknown): RerankedItem[] {
-  if (!Array.isArray(value)) return [];
-  return value.flatMap((item) => {
-    if (!isRecord(item)) return [];
-    const title = cleanString(item.title, 200);
-    const author = cleanString(item.author, 200);
-    const matchScore = typeof item.matchScore === 'number' ? item.matchScore : Number(item.matchScore);
-    if (!title || !author || !Number.isFinite(matchScore)) return [];
-    return [{
-      title,
-      author,
-      category: cleanString(item.category),
-      wordCount: cleanString(item.wordCount),
-      matchScore: Math.max(0, Math.min(100, Math.round(matchScore))),
-      hitLikes: Array.isArray(item.hitLikes)
-        ? item.hitLikes.map((like) => cleanString(like)).filter(Boolean)
-        : [],
-      risks: cleanString(item.risks),
-      reason: cleanString(item.reason),
-      why: cleanString(item.why),
-      ...(item.hallucinationRisk === true ? { hallucinationRisk: true } : {}),
-    }];
-  });
 }

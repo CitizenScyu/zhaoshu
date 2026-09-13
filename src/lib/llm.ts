@@ -118,6 +118,36 @@ export async function chat(
   }
 }
 
+// 纯解析:吃一个已解码缓冲区,吐出完整行的 token 增量、剩余半行、以及是否见到 [DONE]。
+// flush=true 表示流已结束(调用方刚把 decoder 尾巴并进来),此时没有"半行"可留。
+export function consumeSseChunk(
+  buf: string,
+  flush: boolean,
+): { content: string; rest: string; done: boolean } {
+  const lines = buf.split('\n');
+  const rest = flush ? '' : (lines.pop() ?? '');
+  let content = '';
+  let done = false;
+  for (const line of lines) {
+    const t = line.trim();
+    if (!t.startsWith('data:')) continue;
+    const payload = t.slice(5).trim();
+    if (payload === '[DONE]') {
+      done = true;
+      break;
+    }
+    try {
+      const j = JSON.parse(payload) as {
+        choices?: { delta?: { content?: string } }[];
+      };
+      content += j.choices?.[0]?.delta?.content ?? '';
+    } catch {
+      // malformed SSE events are ignored; complete events are line-delimited
+    }
+  }
+  return { content, rest, done };
+}
+
 async function readSseContent(
   body: ReadableStream<Uint8Array>,
   idleMs: number,
@@ -148,25 +178,10 @@ async function readSseContent(
         buf += decoder.decode(value, { stream: true });
       }
 
-      const lines = buf.split('\n');
-      buf = sawDone ? '' : (lines.pop() ?? '');
-      for (const line of lines) {
-        const t = line.trim();
-        if (!t.startsWith('data:')) continue;
-        const payload = t.slice(5).trim();
-        if (payload === '[DONE]') {
-          sawDone = true;
-          break;
-        }
-        try {
-          const j = JSON.parse(payload) as {
-            choices?: { delta?: { content?: string } }[];
-          };
-          content += j.choices?.[0]?.delta?.content ?? '';
-        } catch {
-          // malformed SSE events are ignored; complete events are line-delimited
-        }
-      }
+      const parsed = consumeSseChunk(buf, sawDone);
+      content += parsed.content;
+      buf = parsed.rest;
+      if (parsed.done) sawDone = true;
     }
   } finally {
     reader.cancel().catch(() => {});

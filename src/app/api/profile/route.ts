@@ -5,8 +5,8 @@ import {
   profileSystem,
   profileFromSeedsUser,
 } from '@/lib/prompts';
-import type { SeedBook } from '@/lib/types';
 import { boundedString, readJsonBody, RequestBodyError } from '@/lib/http';
+import { sanitizeSeeds } from '@/lib/sanitize';
 import { requireApiOwner } from '@/lib/auth';
 
 export const maxDuration = 295;
@@ -90,18 +90,4 @@ export async function POST(req: NextRequest) {
     console.error(e);
     return NextResponse.json({ error: 'internal error' }, { status: 500 });
   }
-}
-
-function sanitizeSeeds(seeds: unknown): SeedBook[] {
-  if (!Array.isArray(seeds)) return [];
-  return seeds
-    .filter((seed): seed is Record<string, unknown> =>
-      typeof seed === 'object' && seed !== null &&
-      Boolean(boundedString(seed.title, 200)))
-    .map((seed) => ({
-      title: boundedString(seed.title, 200) as string,
-      author: boundedString(seed.author, 200) || undefined,
-      kind: seed.kind === 'drop' ? 'drop' : 'love',
-      reason: boundedString(seed.reason, 1_000) || undefined,
-    }));
 }
