@@ -187,6 +187,16 @@ def main() -> int:
     args = ap.parse_args()
 
     env = load_env()
+    # 断点续传：已写入 labels.jsonl 的书跳过（按详情页 url 判定）
+    done_urls: set[str] = set()
+    done_path = Path(__file__).parent / 'labels.jsonl'
+    if done_path.exists():
+        for line in done_path.read_text(encoding='utf-8').splitlines():
+            try:
+                done_urls.add(json.loads(line).get('url', ''))
+            except json.JSONDecodeError:
+                continue
+
     if args.book:
         queue = [{'url': args.book, 'title': args.book}]
     else:
@@ -194,7 +204,9 @@ def main() -> int:
         all_books = fetch_rank_books()
         print(f'榜单共 {len(all_books)} 本（去重后）')
         queue = all_books[:args.limit]
-        print(f'本轮处理 {len(queue)} 本')
+        done_count = sum(1 for b in queue if BASE + b['url'] in done_urls)
+        queue = [b for b in queue if BASE + b['url'] not in done_urls]
+        print(f'本轮处理 {len(queue)} 本（跳过已完成 {done_count} 本）')
 
     if args.dry_run:
         for b in queue:
