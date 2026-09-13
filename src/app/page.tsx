@@ -4,14 +4,16 @@ import { useState } from 'react';
 import FindTab from '@/components/FindTab';
 import ShelfTab from '@/components/ShelfTab';
 import ProfileTab from '@/components/ProfileTab';
+import ShuyuanTab from '@/components/ShuyuanTab';
 import { OwnerProvider, useOwner } from '@/components/OwnerProvider';
 
-type Tab = 'find' | 'shelf' | 'profile';
+type Tab = 'find' | 'shelf' | 'profile' | 'shuyuan';
 
 const TABS: { key: Tab; label: string }[] = [
   { key: 'find', label: '找书' },
   { key: 'shelf', label: '书架' },
   { key: 'profile', label: '画像' },
+  { key: 'shuyuan', label: '书源' },
 ];
 
 export default function Home() {
@@ -80,6 +82,7 @@ function HomeContent() {
           <div hidden={tab !== 'find'}><FindTab /></div>
           {tab === 'shelf' && <ShelfTab />}
           {tab === 'profile' && <ProfileTab />}
+          {tab === 'shuyuan' && <ShuyuanTab />}
         </div>
       </main>
 

@@ -1,22 +1,44 @@
+import { timingSafeEqual } from 'node:crypto';
 import { NextRequest, NextResponse } from 'next/server';
 import { requireApiOwner } from '@/lib/auth';
 import { ensureSchema } from '@/lib/db';
 import { readJsonBody, RequestBodyError } from '@/lib/http';
 import { disableShuyuanSource, getShuyuanStats, refreshShuyuan } from '@/lib/shuyuan';
 
-// 书源管理：GET 看统计，POST 刷新合集或给失效源打标记
+// 书源管理：GET 看统计（owner）或由 Vercel cron 触发刷新，POST 手动刷新/打失效标记
 export const maxDuration = 295;
 
 const MAX_BODY_BYTES = 4 * 1024;
 
+function equalSecret(provided: string, expected: string): boolean {
+  const a = Buffer.from(provided);
+  const b = Buffer.from(expected);
+  return a.length === b.length && timingSafeEqual(a, b);
+}
+
+// Vercel cron 每天调用一次：带 x-vercel-cron 头，配置了 CRON_SECRET 时附 Bearer
+function cronRequest(req: NextRequest): boolean {
+  if (req.headers.get('x-vercel-cron') !== '1') return false;
+  const expected = process.env.CRON_SECRET;
+  if (!expected) return true;
+  const authorization = req.headers.get('authorization') ?? '';
+  return authorization.startsWith('Bearer ') && equalSecret(authorization.slice(7), expected);
+}
+
 export async function GET(req: NextRequest) {
   const unauthorized = requireApiOwner(req);
-  if (unauthorized) return unauthorized;
+  if (unauthorized && !cronRequest(req)) return unauthorized;
   try {
     await ensureSchema();
+    if (unauthorized) {
+      // cron 路径：直接刷新
+      const stats = await refreshShuyuan();
+      return NextResponse.json(stats);
+    }
     return NextResponse.json(await getShuyuanStats());
-  } catch {
-    return NextResponse.json({ error: 'internal error' }, { status: 500 });
+  } catch (e) {
+    const message = e instanceof Error ? e.message : 'internal error';
+    return NextResponse.json({ error: message }, { status: 502 });
   }
 }
 

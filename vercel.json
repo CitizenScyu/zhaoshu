@@ -1,0 +1,8 @@
+{
+  "crons": [
+    {
+      "path": "/api/shuyuan",
+      "schedule": "0 20 * * *"
+    }
+  ]
+}
