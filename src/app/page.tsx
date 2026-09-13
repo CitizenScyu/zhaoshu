@@ -4,6 +4,7 @@ import { useState } from 'react';
 import FindTab from '@/components/FindTab';
 import ShelfTab from '@/components/ShelfTab';
 import ProfileTab from '@/components/ProfileTab';
+import { OwnerProvider, useOwner } from '@/components/OwnerProvider';
 
 type Tab = 'find' | 'shelf' | 'profile';
 
@@ -14,7 +15,16 @@ const TABS: { key: Tab; label: string }[] = [
 ];
 
 export default function Home() {
+  return (
+    <OwnerProvider>
+      <HomeContent />
+    </OwnerProvider>
+  );
+}
+
+function HomeContent() {
   const [tab, setTab] = useState<Tab>('find');
+  const { token, setToken } = useOwner();
 
   return (
     <div className="min-h-screen flex flex-col">
@@ -46,6 +56,16 @@ export default function Home() {
             {t.label}
           </button>
         ))}
+        <label className="ml-auto flex items-center gap-2 text-xs">
+          <span style={{ color: 'var(--ink-faint)' }}>Owner Token</span>
+          <input
+            className="paper-input text-xs !py-1.5 w-40"
+            type="password"
+            value={token}
+            onChange={(event) => setToken(event.target.value)}
+            autoComplete="current-password"
+          />
+        </label>
       </nav>
 
       {/* 内容区：纸面卡片 */}

@@ -18,6 +18,7 @@ export interface Candidate {
 
 // 豆瓣验证结果
 export interface DoubanInfo {
+  status: 'verified' | 'not_found' | 'unavailable';
   found: boolean;
   doubanId?: string;
   rating?: number | null;
@@ -42,6 +43,7 @@ export interface RerankedItem {
   risks: string; // 风险/雷点提示
   reason: string; // 一句话"对你值不值得开"
   why: string; // 召回理由（保留溯源）
+  hallucinationRisk?: boolean;
 }
 
 // 书架状态

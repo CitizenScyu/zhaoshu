@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useState } from 'react';
 import type { ShelfStatus } from '@/lib/types';
+import { useOwner } from '@/components/OwnerProvider';
 
 interface ShelfItem {
   id: number;
@@ -29,25 +30,41 @@ const GROUPS: { key: ShelfStatus; label: string; color: string }[] = [
 ];
 
 export default function ShelfTab() {
+  const { apiFetch } = useOwner();
   const [items, setItems] = useState<ShelfItem[] | null>(null);
 
   const load = useCallback(async () => {
-    const res = await fetch('/api/recommendations');
+    const res = await apiFetch('/api/recommendations');
     const data = await res.json();
     setItems(res.ok ? data.recommendations : []);
-  }, []);
+  }, [apiFetch]);
 
   useEffect(() => {
-    load();
-  }, [load]);
+    const controller = new AbortController();
+    void apiFetch('/api/recommendations', { signal: controller.signal }).then(async (res) => {
+      const data = await res.json();
+      setItems(res.ok ? data.recommendations : []);
+    }).catch((error) => {
+      if (error instanceof Error && error.name !== 'AbortError') {
+        console.error(error);
+        setItems([]);
+      }
+    });
+    return () => controller.abort();
+  }, [apiFetch]);
 
   async function setStatus(item: ShelfItem, status: ShelfStatus) {
-    await fetch('/api/feedback', {
+    const res = await apiFetch('/api/feedback', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ title: item.title, author: item.author, status, note: '' }),
     });
-    load();
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      window.alert(data.error || '更新状态失败');
+      return;
+    }
+    await load();
   }
 
   if (items === null) {

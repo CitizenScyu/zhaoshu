@@ -2,6 +2,7 @@
 
 import { useState } from 'react';
 import type { Candidate, RerankedItem, VerifiedCandidate, ShelfStatus } from '@/lib/types';
+import { useOwner } from '@/components/OwnerProvider';
 
 const EXAMPLES = [
   '类似《诡秘之主》的克苏鲁+升级流，主角要冷静理性',
@@ -13,6 +14,7 @@ const EXAMPLES = [
 type Phase = 'idle' | 'recall' | 'verify' | 'rerank' | 'done' | 'error';
 
 export default function FindTab() {
+  const { apiFetch } = useOwner();
   const [query, setQuery] = useState('');
   const [phase, setPhase] = useState<Phase>('idle');
   const [candidates, setCandidates] = useState<Candidate[]>([]);
@@ -26,7 +28,7 @@ export default function FindTab() {
     setError('');
     setResults([]);
     try {
-      const r1 = await fetch('/api/find', {
+      const r1 = await apiFetch('/api/find', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ step: 'recall', query: q }),
@@ -36,7 +38,7 @@ export default function FindTab() {
       setCandidates(d1.candidates);
 
       setPhase('verify');
-      const r2 = await fetch('/api/find', {
+      const r2 = await apiFetch('/api/find', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ step: 'verify', candidates: d1.candidates }),
@@ -46,7 +48,7 @@ export default function FindTab() {
       const verified: VerifiedCandidate[] = d2.verified;
 
       setPhase('rerank');
-      const r3 = await fetch('/api/find', {
+      const r3 = await apiFetch('/api/find', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ step: 'rerank', query: q, verified }),
@@ -54,6 +56,9 @@ export default function FindTab() {
       const d3 = await r3.json();
       if (!r3.ok) throw new Error(d3.error || '重排失败');
       setResults(d3.items);
+      if (d3.persisted === false) {
+        setError('推荐已生成，但保存到书架失败');
+      }
       setPhase('done');
     } catch (e) {
       setError(e instanceof Error ? e.message : '未知错误');
@@ -122,7 +127,7 @@ export default function FindTab() {
         </div>
       )}
 
-      {phase === 'error' && (
+      {(phase === 'error' || error) && (
         <p className="mt-6 text-sm" style={{ color: 'var(--cinnabar)' }}>
           ✗ {error}
         </p>
@@ -132,7 +137,7 @@ export default function FindTab() {
       {results.length > 0 && (
         <div className="mt-8 space-y-4">
           {results.map((it, i) => (
-            <BookCard key={`${it.title}-${i}`} item={it} index={i} />
+            <BookCard key={`${it.title}-${i}`} item={it} index={i} apiFetch={apiFetch} />
           ))}
         </div>
       )}
@@ -140,28 +145,42 @@ export default function FindTab() {
   );
 }
 
-function BookCard({ item, index }: { item: RerankedItem; index: number }) {
+function BookCard({
+  item,
+  index,
+  apiFetch,
+}: {
+  item: RerankedItem;
+  index: number;
+  apiFetch: (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
+}) {
   const [noteFor, setNoteFor] = useState<ShelfStatus | null>(null);
   const [note, setNote] = useState('');
   const [saved, setSaved] = useState(false);
+  const [profileUpdated, setProfileUpdated] = useState(false);
   const [sending, setSending] = useState(false);
 
   async function sendFeedback(status: ShelfStatus, noteText: string) {
     setSending(true);
     try {
-      await fetch('/api/feedback', {
+      const res = await apiFetch('/api/feedback', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ title: item.title, author: item.author, status, note: noteText }),
       });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error || '记录反馈失败');
       setSaved(true);
+      setProfileUpdated(data.profileUpdated === true);
       setNoteFor(null);
+    } catch (e) {
+      window.alert(e instanceof Error ? e.message : '记录反馈失败');
     } finally {
       setSending(false);
     }
   }
 
-  const suspicious = (item as RerankedItem & { hallucinationRisk?: boolean }).hallucinationRisk;
+  const suspicious = item.hallucinationRisk;
 
   return (
     <article className="book-card pl-6 pr-5 py-5 ink-rise" style={{ animationDelay: `${0.1 + index * 0.07}s` }}>
@@ -194,9 +213,14 @@ function BookCard({ item, index }: { item: RerankedItem; index: number }) {
                 豆瓣 {item.douban.rating}（{item.douban.ratingCount ?? '?'}人评价）
               </a>
             )}
-            {item.douban && !item.douban.found && (
+            {item.douban?.status === 'not_found' && (
               <span className="text-xs" style={{ color: 'var(--ink-faint)' }}>
                 豆瓣未收录（网文常见）
+              </span>
+            )}
+            {item.douban?.status === 'unavailable' && (
+              <span className="text-xs" style={{ color: 'var(--ink-faint)' }}>
+                豆瓣暂不可达，本轮未验证
               </span>
             )}
           </div>
@@ -270,7 +294,7 @@ function BookCard({ item, index }: { item: RerankedItem; index: number }) {
             </div>
           ) : (
             <p className="mt-3.5 text-xs" style={{ color: 'var(--moss)' }}>
-              ✓ 已记录到书架{note && '，画像已更新'}
+              ✓ 已记录到书架{profileUpdated && '，画像已更新'}
             </p>
           )}
         </div>

@@ -1,48 +1,70 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { ensureSchema, getSql, upsertBook, getProfile, saveProfile } from '@/lib/db';
-import { chatRobust, LlmError } from '@/lib/llm';
+import { chatRobust } from '@/lib/llm';
 import { profileUpdateSystem, profileUpdateUser } from '@/lib/prompts';
 import type { ShelfStatus } from '@/lib/types';
+import { boundedString, readJsonBody, RequestBodyError } from '@/lib/http';
+import { requireApiOwner } from '@/lib/auth';
 
-export const maxDuration = 300;
+export const maxDuration = 295;
+
+const MAX_BODY_BYTES = 8 * 1024;
 
 const VALID: ShelfStatus[] = ['want', 'reading', 'done', 'dropped'];
 
 export async function POST(req: NextRequest) {
-  const body = await req.json().catch(() => null);
-  const { title, author, status, note } = body ?? {};
-  if (!title || !VALID.includes(status)) {
-    return NextResponse.json({ error: 'missing title or invalid status' }, { status: 400 });
+  const unauthorized = requireApiOwner(req);
+  if (unauthorized) return unauthorized;
+  let body: Record<string, unknown> | null;
+  try {
+    body = await readJsonBody(req, MAX_BODY_BYTES);
+  } catch (e) {
+    if (e instanceof RequestBodyError) {
+      return NextResponse.json({ error: e.message }, { status: 413 });
+    }
+    throw e;
   }
+  const { title, author, status, note } = body ?? {};
+  const cleanTitle = boundedString(title, 200) ?? '';
+  const cleanAuthor = boundedString(author, 200) || '佚名';
+  const cleanNote = boundedString(note ?? '', 1_000);
+  if (!cleanTitle || cleanNote === null ||
+      typeof status !== 'string' || !VALID.includes(status as ShelfStatus)) {
+    return NextResponse.json({ error: 'missing title, invalid status, or note too long' }, { status: 400 });
+  }
+  const safeNote = cleanNote;
+  const shelfStatus = status as ShelfStatus;
   try {
     await ensureSchema();
     const sql = getSql();
     const bookId = await upsertBook({
-      title: String(title),
-      author: String(author ?? '佚名'),
+      title: cleanTitle,
+      author: cleanAuthor,
       meta: {},
     });
-    await sql`
-      INSERT INTO feedback (book_id, status, note) VALUES (${bookId}, ${status}, ${String(note ?? '')})`;
-    // 同步更新书架上这本书的推荐状态
-    await sql`UPDATE recommendations SET status = ${status} WHERE book_id = ${bookId}`;
+    await sql.transaction([
+      sql`INSERT INTO feedback (book_id, status, note)
+          VALUES (${bookId}, ${shelfStatus}, ${safeNote})`,
+      sql`UPDATE recommendations SET status = ${shelfStatus} WHERE book_id = ${bookId}`,
+    ]);
 
     // 有信息量的反馈 → 回写画像（失败不阻断）
     let profileUpdated = false;
-    if ((status === 'done' || status === 'dropped') && note && note.trim()) {
+    if ((shelfStatus === 'done' || shelfStatus === 'dropped') && safeNote) {
       try {
-        const { content } = await getProfile();
-        if (content) {
+        const profile = await getProfile();
+        if (profile.content) {
           const updated = await chatRobust(
             profileUpdateSystem(),
-            profileUpdateUser(content, JSON.stringify({ title, author, status, note })),
+            profileUpdateUser(profile.content, JSON.stringify({
+              title: cleanTitle,
+              author: cleanAuthor,
+              status: shelfStatus,
+              note: safeNote,
+            })),
             { temperature: 0.3 },
           );
-          await saveProfile(
-            (await getProfile()).seeds,
-            updated.trim(),
-          );
-          profileUpdated = true;
+          profileUpdated = await saveProfile(profile.seeds, updated.trim(), profile.updatedAt);
         }
       } catch (e) {
         console.error('profile update failed:', e);
@@ -55,7 +77,9 @@ export async function POST(req: NextRequest) {
   }
 }
 
-export async function GET() {
+export async function GET(req: NextRequest) {
+  const unauthorized = requireApiOwner(req);
+  if (unauthorized) return unauthorized;
   try {
     await ensureSchema();
     const sql = getSql();

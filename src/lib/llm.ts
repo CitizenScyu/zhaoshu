@@ -1,14 +1,34 @@
 // OpenAI 兼容的 LLM 客户端（流式），指向 NewAPI（Cloudflare Tunnel 公网入口）
 //
 // 三个实测教训（2026-09-12）：
-// 1. CF 免费版 ~100s 掐"无响应"连接（524）——流式请求首字节一到就不受此限
+// 1. 上游 SSE 只用于持续产生响应字节、避免 CF 约 100s 的无响应 524；Route Handler
+//    仍会聚合完整结果后一次性回给浏览器，并不是浏览器端流式输出。
 // 2. 渠道偶发把中文请求搞成 mojibake，请求体统一 ASCII 转义消除这个变量
 // 3. 公益渠道吞吐波动极大（同样任务 37s~180s+），所以加空闲超时 + 一次重试
 const BASE_URL = process.env.LLM_BASE_URL || 'https://api.cloud.us.kg/v1';
 const API_KEY = process.env.LLM_API_KEY || '';
 const MODEL = process.env.LLM_MODEL || 'claude-opus-5-88';
+const DEFAULT_TOTAL_TIMEOUT_MS = 280_000;
+const MAX_ROBUST_BUDGET_MS = 285_000;
+const DEFAULT_MAX_TOKENS = 3_000;
 
-export class LlmError extends Error {}
+export class LlmError extends Error {
+  constructor(
+    message: string,
+    readonly retryable = true,
+  ) {
+    super(message);
+    this.name = 'LlmError';
+  }
+}
+
+function configuredTotalTimeoutMs(): number {
+  const parsed = Number.parseInt(
+    process.env.LLM_TOTAL_TIMEOUT_MS ?? String(DEFAULT_TOTAL_TIMEOUT_MS),
+    10,
+  );
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_TOTAL_TIMEOUT_MS;
+}
 
 function asciiEscape(s: string): string {
   // 非 ASCII 转 \uXXXX：语义与 UTF-8 原文完全等价，但免疫链路上的编码损坏
@@ -21,74 +41,113 @@ function asciiEscape(s: string): string {
 export async function chat(
   system: string,
   user: string,
-  opts: { temperature?: number; idleTimeoutMs?: number; totalTimeoutMs?: number } = {},
+  opts: {
+    temperature?: number;
+    idleTimeoutMs?: number;
+    totalTimeoutMs?: number;
+    maxTokens?: number;
+  } = {},
 ): Promise<string> {
   if (!API_KEY) {
-    throw new LlmError('LLM_API_KEY is not set');
+    throw new LlmError('LLM_API_KEY is not set', false);
   }
   const idleMs = opts.idleTimeoutMs ?? 60_000; // 两个 chunk 之间超过 60s 视为卡死
-  const totalMs =
-    opts.totalTimeoutMs ?? parseInt(process.env.LLM_TOTAL_TIMEOUT_MS ?? '280000', 10);
-  const totalDeadline = Date.now() + totalMs;
+  const totalMs = opts.totalTimeoutMs ?? configuredTotalTimeoutMs();
+  const controller = new AbortController();
+  const totalTimer = setTimeout(() => controller.abort(), totalMs);
 
-  const res = await fetch(`${BASE_URL}/chat/completions`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json; charset=utf-8',
-      Authorization: `Bearer ${API_KEY}`,
-    },
-    body: asciiEscape(
-      JSON.stringify({
-        model: MODEL,
-        temperature: opts.temperature ?? 0.7,
-        stream: true,
-        messages: [
-          { role: 'system', content: system },
-          { role: 'user', content: user },
-        ],
-      }),
-    ),
-  });
-  if (!res.ok) {
-    const text = await res.text().catch(() => '');
-    throw new LlmError(`LLM ${res.status}: ${text.slice(0, 200)}`);
-  }
-  if (!res.body) {
-    throw new LlmError('LLM returned no body');
-  }
+  let res: Response;
+  try {
+    res = await fetch(`${BASE_URL}/chat/completions`, {
+      method: 'POST',
+      signal: controller.signal,
+      headers: {
+        'Content-Type': 'application/json; charset=utf-8',
+        Authorization: `Bearer ${API_KEY}`,
+      },
+      body: asciiEscape(
+        JSON.stringify({
+          model: MODEL,
+          temperature: opts.temperature ?? 0.7,
+          max_tokens: Math.min(opts.maxTokens ?? DEFAULT_MAX_TOKENS, DEFAULT_MAX_TOKENS),
+          stream: true,
+          messages: [
+            { role: 'system', content: system },
+            { role: 'user', content: user },
+          ],
+        }),
+      ),
+    });
+    if (!res.ok) {
+      const text = await res.text().catch(() => '');
+      throw new LlmError(
+        `LLM ${res.status}: ${text.slice(0, 200)}`,
+        res.status === 408 || res.status === 429 || res.status >= 500,
+      );
+    }
+    if (!res.body) {
+      throw new LlmError('LLM returned no body');
+    }
 
-  const reader = res.body.getReader();
+    return await readSseContent(res.body, idleMs, controller);
+  } catch (e) {
+    if (e instanceof LlmError) throw e;
+    if (controller.signal.aborted) {
+      throw new LlmError(`LLM 总超时（${Math.ceil(totalMs / 1000)}s）`);
+    }
+    throw new LlmError(e instanceof Error ? `LLM 请求失败：${e.message}` : 'LLM 请求失败');
+  } finally {
+    clearTimeout(totalTimer);
+  }
+}
+
+async function readSseContent(
+  body: ReadableStream<Uint8Array>,
+  idleMs: number,
+  controller: AbortController,
+): Promise<string> {
+  const reader = body.getReader();
   const decoder = new TextDecoder();
   let buf = '';
   let content = '';
+  let sawDone = false;
 
   try {
-    for (;;) {
-      if (Date.now() > totalDeadline) {
-        throw new LlmError('LLM 总超时（280s）');
-      }
+    while (!sawDone) {
+      let idleTimer: ReturnType<typeof setTimeout> | undefined;
       const { done, value } = await Promise.race([
         reader.read(),
-        new Promise<never>((_, rej) =>
-          setTimeout(() => rej(new LlmError('LLM 空闲超时（60s 无新 token）')), idleMs),
-        ),
-      ]);
-      if (done) break;
-      buf += decoder.decode(value, { stream: true });
+        new Promise<never>((_, reject) => {
+          idleTimer = setTimeout(() => {
+            controller.abort();
+            reject(new LlmError(`LLM 空闲超时（${Math.ceil(idleMs / 1000)}s 无新 token）`));
+          }, idleMs);
+        }),
+      ]).finally(() => clearTimeout(idleTimer));
+      if (done) {
+        buf += decoder.decode();
+        sawDone = true;
+      } else {
+        buf += decoder.decode(value, { stream: true });
+      }
+
       const lines = buf.split('\n');
-      buf = lines.pop() ?? '';
+      buf = sawDone ? '' : (lines.pop() ?? '');
       for (const line of lines) {
         const t = line.trim();
         if (!t.startsWith('data:')) continue;
         const payload = t.slice(5).trim();
-        if (payload === '[DONE]') continue;
+        if (payload === '[DONE]') {
+          sawDone = true;
+          break;
+        }
         try {
           const j = JSON.parse(payload) as {
             choices?: { delta?: { content?: string } }[];
           };
           content += j.choices?.[0]?.delta?.content ?? '';
         } catch {
-          // 非完整 JSON 行，忽略（残留在 buf 里的会拼上）
+          // malformed SSE events are ignored; complete events are line-delimited
         }
       }
     }
@@ -106,14 +165,20 @@ export async function chat(
 export async function chatRobust(
   system: string,
   user: string,
-  opts: { temperature?: number } = {},
+  opts: { temperature?: number; maxTokens?: number } = {},
 ): Promise<string> {
+  const startedAt = Date.now();
+  const budgetMs = Math.min(configuredTotalTimeoutMs(), MAX_ROBUST_BUDGET_MS);
   try {
-    return await chat(system, user, opts);
+    return await chat(system, user, { ...opts, totalTimeoutMs: budgetMs });
   } catch (e) {
     if (!(e instanceof LlmError)) throw e;
-    await new Promise((r) => setTimeout(r, 1500));
-    return chat(system, user, opts);
+    if (!e.retryable) throw e;
+    const retryDelayMs = 1_500;
+    const remainingMs = budgetMs - (Date.now() - startedAt) - retryDelayMs;
+    if (remainingMs <= 0) throw e;
+    await new Promise((r) => setTimeout(r, retryDelayMs));
+    return chat(system, user, { ...opts, totalTimeoutMs: remainingMs });
   }
 }
 

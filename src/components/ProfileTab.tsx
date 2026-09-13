@@ -1,9 +1,11 @@
 'use client';
 
-import { useCallback, useEffect, useState } from 'react';
+import { useEffect, useState } from 'react';
 import type { SeedBook } from '@/lib/types';
+import { useOwner } from '@/components/OwnerProvider';
 
 export default function ProfileTab() {
+  const { apiFetch } = useOwner();
   const [seeds, setSeeds] = useState<SeedBook[]>([]);
   const [content, setContent] = useState('');
   const [editing, setEditing] = useState(false);
@@ -11,18 +13,19 @@ export default function ProfileTab() {
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState('');
 
-  const load = useCallback(async () => {
-    const res = await fetch('/api/profile');
-    if (res.ok) {
-      const d = await res.json();
-      setSeeds(d.seeds ?? []);
-      setContent(d.content ?? '');
-    }
-  }, []);
-
   useEffect(() => {
-    load();
-  }, [load]);
+    const controller = new AbortController();
+    void apiFetch('/api/profile', { signal: controller.signal }).then(async (res) => {
+      if (res.ok) {
+        const data = await res.json();
+        setSeeds(data.seeds ?? []);
+        setContent(data.content ?? '');
+      }
+    }).catch((error) => {
+      if (error instanceof Error && error.name !== 'AbortError') console.error(error);
+    });
+    return () => controller.abort();
+  }, [apiFetch]);
 
   function updateSeed(i: number, patch: Partial<SeedBook>) {
     setSeeds((s) => s.map((x, j) => (j === i ? { ...x, ...patch } : x)));
@@ -32,7 +35,7 @@ export default function ProfileTab() {
     setBusy(true);
     setMsg('');
     try {
-      const res = await fetch('/api/profile', {
+      const res = await apiFetch('/api/profile', {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ seeds }),
@@ -47,7 +50,17 @@ export default function ProfileTab() {
     setBusy(true);
     setMsg('');
     try {
-      const res = await fetch('/api/profile', { method: 'POST' });
+      const saveRes = await apiFetch('/api/profile', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ seeds }),
+      });
+      const saveData = await saveRes.json().catch(() => ({}));
+      if (!saveRes.ok) {
+        setMsg(`✗ ${saveData.error || '保存种子失败'}`);
+        return;
+      }
+      const res = await apiFetch('/api/profile', { method: 'POST' });
       const d = await res.json();
       if (res.ok) {
         setContent(d.content);
@@ -63,14 +76,18 @@ export default function ProfileTab() {
   async function saveDraft() {
     setBusy(true);
     try {
-      const res = await fetch('/api/profile', {
+      const res = await apiFetch('/api/profile', {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ seeds, content: draft }),
       });
-      if (res.ok) setContent(draft);
-      setEditing(false);
-      setMsg(res.ok ? '✓ 已保存' : '✗ 保存失败');
+      if (res.ok) {
+        setContent(draft);
+        setEditing(false);
+        setMsg('✓ 已保存');
+      } else {
+        setMsg('✗ 保存失败');
+      }
     } finally {
       setBusy(false);
     }

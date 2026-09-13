@@ -42,22 +42,38 @@ async function fetchSubjectRating(doubanId: string) {
     throw new Error(`subject ${res.status}`);
   }
   const html = await res.text();
-  const rating = html.match(/rating_num"[^>]*>([\d.]+)</)?.[1];
-  const count = html.match(/(\d+)人评价/)?.[1];
+  // 评分标记形如 <strong ... class="rating_num " property="v:average"> 8.5 </strong>，值两侧可能有空白
+  const rating = html.match(/rating_num[^>]*>\s*([\d.]+)\s*</)?.[1];
+  // 人数标记形如 <span property="v:votes">2617</span>人评价（数字与文字跨标签）
+  const count = html.match(/property="v:votes">\s*([\d,，]+)\s*</)?.[1]?.replace(/[,，]/g, '');
   return {
     rating: rating ? parseFloat(rating) : null,
     ratingCount: count ? parseInt(count, 10) : null,
   };
 }
 
+function normalize(value: string): string {
+  return value
+    .normalize('NFKC')
+    .toLocaleLowerCase()
+    .replace(/[\s·•《》「」『』【】()（）\[\]：:，,。.!！?？'"“”‘’_-]/g, '');
+}
+
 function pickMatch(items: SuggestItem[], title: string, author?: string): SuggestItem | null {
   if (items.length === 0) return null;
-  // 优先：标题前缀匹配（"诡秘之主 1" 匹配 "诡秘之主"）+ 作者匹配
-  const authorOk = (it: SuggestItem) =>
-    !author || !it.author_name || it.author_name.includes(author) || author.includes(it.author_name);
-  const prefix = (it: SuggestItem) =>
-    it.title === title || it.title.startsWith(title) || it.title.includes(title);
-  return items.find((it) => prefix(it) && authorOk(it)) ?? items.find(prefix) ?? null;
+  const wantedTitle = normalize(title);
+  const wantedAuthor = author ? normalize(author) : '';
+  const titleOk = (it: SuggestItem) => {
+    const candidate = normalize(it.title);
+    return candidate === wantedTitle || candidate.startsWith(wantedTitle);
+  };
+  const authorOk = (it: SuggestItem) => {
+    if (!wantedAuthor) return true;
+    const candidate = normalize(it.author_name || '');
+    return Boolean(candidate) && (candidate.includes(wantedAuthor) || wantedAuthor.includes(candidate));
+  };
+  // 作者已知时不能降级为“只看标题”，否则同名书会被当成已验证。
+  return items.find((it) => titleOk(it) && authorOk(it)) ?? null;
 }
 
 export async function verifyBook(title: string, author?: string): Promise<DoubanInfo> {
@@ -65,12 +81,17 @@ export async function verifyBook(title: string, author?: string): Promise<Douban
     const items = await searchSuggest(title);
     const match = pickMatch(items, title, author);
     if (!match) {
-      return { found: false, note: '豆瓣无对应条目（常见于未出版网文，不代表书不存在）' };
+      return {
+        status: 'not_found',
+        found: false,
+        note: '豆瓣无对应条目（常见于未出版网文，不代表书不存在）',
+      };
     }
     const doubanId = match.id;
     try {
       const { rating, ratingCount } = await fetchSubjectRating(doubanId);
       return {
+        status: 'verified',
         found: true,
         doubanId,
         rating,
@@ -79,10 +100,16 @@ export async function verifyBook(title: string, author?: string): Promise<Douban
       };
     } catch {
       // 详情页被拦（数据中心 IP 可能 403）：条目存在就算验证通过
-      return { found: true, doubanId, url: `https://book.douban.com/subject/${doubanId}/`, note: '详情页暂不可达，未取到评分' };
+      return {
+        status: 'verified',
+        found: true,
+        doubanId,
+        url: `https://book.douban.com/subject/${doubanId}/`,
+        note: '详情页暂不可达，未取到评分',
+      };
     }
   } catch {
-    return { found: false, note: '豆瓣接口不可达，本轮未验证' };
+    return { status: 'unavailable', found: false, note: '豆瓣接口不可达，本轮未验证' };
   }
 }
 
@@ -90,7 +117,11 @@ export async function verifyBook(title: string, author?: string): Promise<Douban
 export async function verifyBatch(
   books: { title: string; author?: string }[],
 ): Promise<DoubanInfo[]> {
-  const results: DoubanInfo[] = new Array(books.length).fill(null).map(() => ({ found: false }));
+  const results: DoubanInfo[] = new Array(books.length).fill(null).map(() => ({
+    status: 'unavailable',
+    found: false,
+    note: '尚未验证',
+  }));
   const CONCURRENCY = 3;
   let next = 0;
   async function worker() {

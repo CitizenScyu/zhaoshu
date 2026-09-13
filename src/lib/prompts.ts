@@ -17,7 +17,11 @@ export function recallSystem() {
 {"candidates":[{"title":"书名","author":"作者","category":"题材流派标签","wordCount":"约X万字，完结/连载/不确定","why":"一句话理由"}]}`;
 }
 
-export function recallUser(profile: string, query: string) {
+export function recallUser(
+  profile: string,
+  query: string,
+  readBooks: { title: string; author: string }[] = [],
+): string {
   return `# 用户口味画像
 
 ${profile || '（画像为空，本次按需求自由发挥，风格上向"资深老书虫"的偏好靠拢：重剧情逻辑和文笔，轻无脑爽文）'}
@@ -25,6 +29,10 @@ ${profile || '（画像为空，本次按需求自由发挥，风格上向"资�
 # 本次找书需求
 
 ${query}
+
+${readBooks.length > 0 ? `# 以下书用户已读过/弃过/是种子书，禁止推荐（包括换书名号的同一作品）
+
+${readBooks.map((b) => `- 《${b.title}》${b.author ? ' ' + b.author : ''}`).join('\n')}` : ''}
 
 请召回候选书单。`;
 }

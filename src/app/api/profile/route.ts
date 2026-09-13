@@ -6,10 +6,17 @@ import {
   profileFromSeedsUser,
 } from '@/lib/prompts';
 import type { SeedBook } from '@/lib/types';
+import { boundedString, readJsonBody, RequestBodyError } from '@/lib/http';
+import { requireApiOwner } from '@/lib/auth';
 
-export const maxDuration = 300;
+export const maxDuration = 295;
 
-export async function GET() {
+const MAX_BODY_BYTES = 64 * 1024;
+const MAX_SEEDS = 100;
+
+export async function GET(req: NextRequest) {
+  const unauthorized = requireApiOwner(req);
+  if (unauthorized) return unauthorized;
   try {
     await ensureSchema();
     const profile = await getProfile();
@@ -22,17 +29,34 @@ export async function GET() {
 
 // 保存种子书单（可选同时保存画像正文，供人工修订用）
 export async function PUT(req: NextRequest) {
-  const body = await req.json().catch(() => null);
+  const unauthorized = requireApiOwner(req);
+  if (unauthorized) return unauthorized;
+  let body: Record<string, unknown> | null;
+  try {
+    body = await readJsonBody(req, MAX_BODY_BYTES);
+  } catch (e) {
+    if (e instanceof RequestBodyError) {
+      return NextResponse.json({ error: e.message }, { status: 413 });
+    }
+    throw e;
+  }
   const seeds = body?.seeds;
-  if (!Array.isArray(seeds)) {
-    return NextResponse.json({ error: 'seeds must be an array' }, { status: 400 });
+  if (!body || !Array.isArray(seeds) || seeds.length > MAX_SEEDS) {
+    return NextResponse.json({ error: `seeds must be an array of at most ${MAX_SEEDS}` }, { status: 400 });
+  }
+  if (typeof body.content === 'string' && boundedString(body.content, 5_000) === null) {
+    return NextResponse.json({ error: 'content is too long' }, { status: 400 });
   }
   try {
     await ensureSchema();
     const { content: existing } = await getProfile();
+    const sanitized = sanitizeSeeds(seeds);
+    if (sanitized.length !== seeds.length) {
+      return NextResponse.json({ error: '每本种子书都必须填写书名' }, { status: 400 });
+    }
     await saveProfile(
-      sanitizeSeeds(seeds),
-      typeof body.content === 'string' && body.content.trim() ? body.content.trim() : existing,
+      sanitized,
+      typeof body.content === 'string' ? (boundedString(body.content, 5_000) ?? '') : existing,
     );
     return NextResponse.json({ ok: true });
   } catch (e) {
@@ -43,6 +67,8 @@ export async function PUT(req: NextRequest) {
 
 // 从种子书单生成画像
 export async function POST(req: NextRequest) {
+  const unauthorized = requireApiOwner(req);
+  if (unauthorized) return unauthorized;
   try {
     await ensureSchema();
     const { seeds } = await getProfile();
@@ -67,12 +93,15 @@ export async function POST(req: NextRequest) {
 }
 
 function sanitizeSeeds(seeds: unknown): SeedBook[] {
-  return (seeds as SeedBook[])
-    .filter((s) => s && typeof s.title === 'string' && s.title.trim())
-    .map((s) => ({
-      title: s.title.trim(),
-      author: s.author?.trim() || undefined,
-      kind: s.kind === 'drop' ? 'drop' : 'love',
-      reason: s.reason?.trim() || undefined,
+  if (!Array.isArray(seeds)) return [];
+  return seeds
+    .filter((seed): seed is Record<string, unknown> =>
+      typeof seed === 'object' && seed !== null &&
+      Boolean(boundedString(seed.title, 200)))
+    .map((seed) => ({
+      title: boundedString(seed.title, 200) as string,
+      author: boundedString(seed.author, 200) || undefined,
+      kind: seed.kind === 'drop' ? 'drop' : 'love',
+      reason: boundedString(seed.reason, 1_000) || undefined,
     }));
 }
