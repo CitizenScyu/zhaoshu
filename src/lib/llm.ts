@@ -79,10 +79,26 @@ export async function chat(
       ),
     });
     if (!res.ok) {
-      const text = await res.text().catch(() => '');
+      const responseText = await res.text().catch(() => '');
+      const challenged = res.headers.get('cf-mitigated') === 'challenge' ||
+        /<title>\s*Just a moment|\/cdn-cgi\/challenge-platform/i.test(responseText);
+      // Upstream bodies may contain HTML, credentials, or provider internals.
+      console.error('LLM upstream request rejected', {
+        status: res.status,
+        challenged,
+        ray: res.headers.get('cf-ray'),
+      });
+      let message = `模型服务暂时不可用（HTTP ${res.status}），请稍后重试。`;
+      if (challenged) {
+        message = '模型服务被 Cloudflare 安全验证拦截，请管理员检查模型接口的防火墙规则。';
+      } else if (res.status === 401 || res.status === 403) {
+        message = `模型服务拒绝访问（HTTP ${res.status}），请管理员检查接口密钥、模型权限及访问规则。`;
+      } else if (res.status === 429) {
+        message = '模型服务请求过于频繁或额度不足，请稍后重试或联系管理员。';
+      }
       throw new LlmError(
-        `LLM ${res.status}: ${text.slice(0, 200)}`,
-        res.status === 408 || res.status === 429 || res.status >= 500,
+        message,
+        !challenged && (res.status === 408 || res.status === 429 || res.status >= 500),
       );
     }
     if (!res.body) {
