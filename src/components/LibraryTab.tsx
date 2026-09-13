@@ -21,6 +21,18 @@ interface Facets {
   finishStates: { name: string; count: number }[];
 }
 
+interface DownloadTask {
+  id: number;
+  bookId: number;
+  title: string;
+  status: 'pending' | 'running' | 'done' | 'failed';
+  chaptersTotal: number;
+  chaptersDone: number;
+  charsTotal: number;
+  error: string | null;
+  updatedAt: string;
+}
+
 const FIELD_LABELS: [string, string][] = [
   ['genre', '题材'],
   ['style', '文风'],
@@ -53,6 +65,50 @@ function fieldText(labels: Record<string, unknown>, key: string): string {
   return '';
 }
 
+// 单条任务响应兼容裸对象与 {task} 包装两种形态，字段缺失去零值兜底
+function parseTask(data: unknown): DownloadTask | null {
+  const wrapper = (typeof data === 'object' && data !== null ? data : {}) as { task?: unknown };
+  const t = (wrapper.task ?? data) as Record<string, unknown> | null;
+  if (typeof t !== 'object' || t === null || typeof t.id !== 'number') return null;
+  const status = typeof t.status === 'string' ? t.status : 'pending';
+  return {
+    id: t.id,
+    bookId: Number(t.bookId) || 0,
+    title: typeof t.title === 'string' ? t.title : '',
+    status: (['pending', 'running', 'done', 'failed'] as const).includes(status as never)
+      ? (status as DownloadTask['status'])
+      : 'pending',
+    chaptersTotal: Number(t.chaptersTotal) || 0,
+    chaptersDone: Number(t.chaptersDone) || 0,
+    charsTotal: Number(t.charsTotal) || 0,
+    error: typeof t.error === 'string' ? t.error : null,
+    updatedAt: typeof t.updatedAt === 'string' ? t.updatedAt : '',
+  };
+}
+
+function downloadStatusText(t: DownloadTask): string {
+  switch (t.status) {
+    case 'pending': return '排队中，Actions 最多 5 分钟后开始';
+    case 'running': return `下载中 ${t.chaptersDone}/${t.chaptersTotal} 章`;
+    case 'done': return `完成，共 ${t.charsTotal} 字`;
+    case 'failed': return `失败：${t.error ?? '未知原因'}`;
+  }
+}
+
+// Content-Disposition: filename*=UTF-8''xxx 或 filename="xxx"，取不到就用书名兜底
+function fileNameFrom(disposition: string, fallback: string): string {
+  const star = /filename\*=(?:UTF-8|utf-8)''([^;]+)/.exec(disposition);
+  if (star) {
+    try {
+      return decodeURIComponent(star[1]);
+    } catch {
+      // 脏值走后面的兜底
+    }
+  }
+  const plain = /filename="?([^";]+)"?/.exec(disposition);
+  return plain ? plain[1] : fallback;
+}
+
 export default function LibraryTab() {
   const { apiFetch } = useOwner();
   const [books, setBooks] = useState<LibraryBook[] | null>(null);
@@ -68,6 +124,9 @@ export default function LibraryTab() {
   const [detail, setDetail] = useState<LibraryBook | null>(null);
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(true);
+  const [task, setTask] = useState<DownloadTask | null>(null);
+  const [dlError, setDlError] = useState('');
+  const [dlBusy, setDlBusy] = useState(false);
   const reqId = useRef(0);
 
   const load = useCallback(async (p: number, q: string, cat: string, tg: string, fin: string, st: string, signal?: AbortSignal) => {
@@ -102,6 +161,143 @@ export default function LibraryTab() {
     return () => controller.abort();
   }, [load, page, search, category, tag, finish, sort]);
 
+  const detailId = detail?.id ?? null;
+
+  // 进入详情页时查这本书有没有进行中/已完成的下载任务
+  useEffect(() => {
+    if (detailId === null) return;
+    let stale = false;
+    const controller = new AbortController();
+    queueMicrotask(() => {
+      if (controller.signal.aborted) return;
+      void (async () => {
+        try {
+          const res = await apiFetch('/api/download', { signal: controller.signal });
+          const data = await res.json();
+          if (!res.ok) throw new Error(data.error || '查询下载任务失败');
+          if (stale) return;
+          const found = Array.isArray(data.tasks)
+            ? (data.tasks as unknown[]).map(parseTask).find((t) => t !== null && t.bookId === detailId)
+            : null;
+          setTask(found ?? null);
+        } catch {
+          // 查不到不影响看详情，只是下载区块退回按钮态
+        }
+      })();
+    });
+    return () => {
+      stale = true;
+      controller.abort();
+    };
+  }, [detailId, apiFetch]);
+
+  // pending/running 任务每 10 秒轮询单条进度
+  const pollTaskId = task !== null && (task.status === 'pending' || task.status === 'running')
+    ? task.id
+    : null;
+
+  useEffect(() => {
+    if (pollTaskId === null) return;
+    let stale = false;
+    const controller = new AbortController();
+    const timer = setInterval(() => {
+      if (controller.signal.aborted) return;
+      void (async () => {
+        try {
+          const res = await apiFetch(`/api/download?id=${pollTaskId}`, { signal: controller.signal });
+          const data = await res.json();
+          if (!res.ok) throw new Error(data.error || '查询下载进度失败');
+          const next = parseTask(data);
+          if (!stale && next !== null) setTask(next);
+        } catch {
+          // 单次失败不打断轮询
+        }
+      })();
+    }, 10000);
+    return () => {
+      stale = true;
+      controller.abort();
+      clearInterval(timer);
+    };
+  }, [pollTaskId, apiFetch]);
+
+  async function startDownload() {
+    if (!detail) return;
+    setDlBusy(true);
+    setDlError('');
+    try {
+      const res = await apiFetch('/api/download', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ bookId: detail.id }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if ((res.ok || res.status === 409) && typeof data.taskId === 'number') {
+        // 201 新任务 / 409 已有任务：都先挂 pending 占位，轮询拉真实进度
+        setTask({
+          id: data.taskId,
+          bookId: detail.id,
+          title: detail.title,
+          status: 'pending',
+          chaptersTotal: 0,
+          chaptersDone: 0,
+          charsTotal: 0,
+          error: null,
+          updatedAt: '',
+        });
+        return;
+      }
+      throw new Error(data.error || '提交下载失败');
+    } catch (e) {
+      setDlError(e instanceof Error ? e.message : '提交下载失败');
+    } finally {
+      setDlBusy(false);
+    }
+  }
+
+  async function cancelDownload() {
+    if (!task) return;
+    setDlBusy(true);
+    setDlError('');
+    try {
+      const res = await apiFetch('/api/download', {
+        method: 'DELETE',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ taskId: task.id }),
+      });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data.error || '取消失败');
+      }
+      setTask(null);
+    } catch (e) {
+      setDlError(e instanceof Error ? e.message : '取消失败');
+    } finally {
+      setDlBusy(false);
+    }
+  }
+
+  async function retrieveFile() {
+    if (!task) return;
+    try {
+      const res = await apiFetch(`/api/download/${task.id}/file`);
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data.error || '文件取回失败');
+      }
+      const blob = await res.blob();
+      const name = fileNameFrom(res.headers.get('Content-Disposition') ?? '', `${task.title || 'novel'}.txt`);
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = name;
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch (e) {
+      window.alert(e instanceof Error ? e.message : '文件取回失败');
+    }
+  }
+
   const pageSize = 30;
   const totalPages = Math.max(1, Math.ceil(total / pageSize));
   const hasFilter = Boolean(search || category || tag || finish);
@@ -119,7 +315,7 @@ export default function LibraryTab() {
   if (detail) {
     return (
       <div>
-        <button className="chip text-sm mb-4" onClick={() => setDetail(null)}>
+        <button className="chip text-sm mb-4" onClick={() => { setDetail(null); setTask(null); setDlError(''); }}>
           ← 返回书库
         </button>
         <article className="book-card px-6 py-6">
@@ -154,6 +350,37 @@ export default function LibraryTab() {
           <p className="text-xs mt-4" style={{ color: 'var(--ink-faint)' }}>
             标注 {Math.round(detail.charsLabeled / 10000)} 万字 · {new Date(detail.labeledAt).toLocaleDateString('zh-CN')}
           </p>
+          {/* 下载全书 */}
+          <div className="mt-5 pt-4 border-t border-dashed" style={{ borderColor: 'var(--line)' }}>
+            {dlError && (
+              <p role="alert" className="text-xs mb-2" style={{ color: 'var(--cinnabar)' }}>✗ {dlError}</p>
+            )}
+            {task === null ? (
+              <button className="seal-button text-sm" onClick={() => void startDownload()} disabled={dlBusy}>
+                {dlBusy ? '提交中…' : '⬇ 下载全书'}
+              </button>
+            ) : (
+              <div className="flex flex-wrap items-center gap-3">
+                <span
+                  role="status"
+                  className="text-sm"
+                  style={{ color: task.status === 'failed' ? 'var(--cinnabar)' : 'var(--ink-soft)' }}
+                >
+                  {downloadStatusText(task)}
+                </span>
+                {task.status === 'done' && (
+                  <button className="chip text-sm" onClick={() => void retrieveFile()}>
+                    取回文件
+                  </button>
+                )}
+                {task.status === 'pending' && (
+                  <button className="chip text-sm" onClick={() => void cancelDownload()} disabled={dlBusy}>
+                    取消
+                  </button>
+                )}
+              </div>
+            )}
+          </div>
         </article>
       </div>
     );
@@ -263,7 +490,7 @@ export default function LibraryTab() {
             <button
               key={b.id}
               className="book-card w-full text-left px-5 py-4 hover:border-[var(--cinnabar)] transition-colors"
-              onClick={() => setDetail(b)}
+              onClick={() => { setDetail(b); setTask(null); setDlError(''); }}
             >
               <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1">
                 <span className="text-base font-bold">{b.title}</span>

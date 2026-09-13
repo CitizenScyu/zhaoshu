@@ -37,7 +37,9 @@ SYSTEM_PROMPT = (
     "title_guess(书名猜测)、genre(题材)、style(文风,2-4个词)、pace(节奏)、"
     "protagonist(主角类型一句话)、strengths(爽点/看点,2-4条)、"
     "weaknesses(雷点风险,1-3条)、plot_stage(读到的内容进展到什么阶段,一句话)、"
-    "worldbuilding(世界观一句话)、tone(基调)、confidence(0-1)。"
+    "worldbuilding(世界观一句话)、tone(基调)、confidence(0-1)、"
+    "text_quality(文本质量,取值必须是 正常/疑似乱码/大面积重复/含广告注入 之一)、"
+    "is_beginning(读到的内容是否为全书开头,true 或 false)。"
 )
 
 
@@ -179,6 +181,18 @@ def label_book(text: str, api_key: str, model: str) -> dict:
 # phoenix 无需任何 PG 依赖。
 
 
+def title_matches(guess: str, actual: str) -> bool:
+    """书名模糊匹配:去空白后相等 / 一方包含另一方 / 去掉《》和空格后相等。"""
+    g, a = (guess or '').strip(), (actual or '').strip()
+    if not g or not a:
+        return False
+    if g == a or g in a or a in g:
+        return True
+    clean = lambda s: re.sub(r'[《》\s]', '', s)
+    cg, ca = clean(g), clean(a)
+    return bool(cg) and cg == ca
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument('--limit', type=int, default=100)
@@ -224,6 +238,20 @@ def main() -> int:
                 fail += 1
                 continue
             labels = label_book(text, env['LLM_API_KEY'], env['LLM_MODEL'])
+            # 质量校验:错书(书名对不上)或文本质量异常都不写入
+            # --book 单本模式没有榜单书名可比,跳过书名校验
+            guess = labels.get('title_guess') or ''
+            if not args.book and not title_matches(guess, b.get('title', '')):
+                print(f'  书名不符,疑似错书,跳过(榜单: {b.get("title")} / 标签: {guess})')
+                fail += 1
+                time.sleep(LLM_INTERVAL_SEC)
+                continue
+            quality = labels.get('text_quality')
+            if quality and quality != '正常':
+                print(f'  文本质量异常({quality}),跳过')
+                fail += 1
+                time.sleep(LLM_INTERVAL_SEC)
+                continue
             b_out = {
                 'title': labels.get('title_guess') or b.get('title', ''),
                 'author': b.get('author', ''),
