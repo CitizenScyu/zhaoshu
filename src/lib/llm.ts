@@ -62,6 +62,7 @@ export async function chat(
       method: 'POST',
       signal: controller.signal,
       headers: {
+        'User-Agent': 'NovelFinder/1.0 (+https://zhaoshu-brown.vercel.app)',
         'Content-Type': 'application/json; charset=utf-8',
         Authorization: `Bearer ${API_KEY}`,
       },
