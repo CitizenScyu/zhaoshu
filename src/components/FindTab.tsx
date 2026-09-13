@@ -1,15 +1,63 @@
 'use client';
 
-import { useState } from 'react';
+import { useState, useSyncExternalStore } from 'react';
 import type { Candidate, RerankedItem, VerifiedCandidate, ShelfStatus } from '@/lib/types';
 import { useOwner } from '@/components/OwnerProvider';
 
-const EXAMPLES = [
+// 示例池：每次进入页面随机抽几条，避免永远是同样几句
+const EXAMPLE_POOL = [
   '类似《诡秘之主》的克苏鲁+升级流，主角要冷静理性',
   '慢热权谋文，文笔好，不要无脑爽',
   '单女主都市日常，轻松治愈，别有系统',
   '历史文，考据扎实，主角不圣母',
+  '无限流团队作战，不要个人英雄主义',
+  '仙侠文，世界观宏大，主角不圣母',
+  '硬核科幻末世，拒绝恋爱脑',
+  '脑洞大的诡异怪谈，单元剧结构',
+  '克苏鲁风种田文，节奏慢没关系',
+  '轻松吐槽流，类似大王饶命的味儿',
 ];
+
+const HISTORY_KEY = 'novel-finder-recent-queries';
+const HISTORY_MAX = 6; // 存储上限
+const HISTORY_SHOW = 4; // 同时展示的最近条数
+const CHIP_TOTAL = 6; // chips 总数上限（最近 + 随机示例）
+
+// ---- 最近搜索历史：localStorage 的最小外部 store（useSyncExternalStore 需要稳定快照）----
+const EMPTY_HISTORY: string[] = [];
+let historyCache: string[] | null = null;
+const historyListeners = new Set<() => void>();
+
+function loadHistory(): string[] {
+  try {
+    const saved = JSON.parse(localStorage.getItem(HISTORY_KEY) ?? '[]');
+    if (Array.isArray(saved)) return saved.filter((q) => typeof q === 'string' && q);
+  } catch {
+    // 坏数据当没有
+  }
+  return [];
+}
+
+function getHistory(): string[] {
+  if (historyCache === null) historyCache = loadHistory();
+  return historyCache;
+}
+
+function subscribeHistory(listener: () => void) {
+  historyListeners.add(listener);
+  return () => historyListeners.delete(listener);
+}
+
+function rememberQuery(q: string) {
+  const next = [q, ...getHistory().filter((p) => p !== q)].slice(0, HISTORY_MAX);
+  try {
+    localStorage.setItem(HISTORY_KEY, JSON.stringify(next));
+  } catch {
+    // 存不进就算了，不影响找书
+  }
+  historyCache = next;
+  historyListeners.forEach((l) => l());
+}
 
 type Phase = 'idle' | 'recall' | 'verify' | 'rerank' | 'done' | 'error';
 
@@ -20,10 +68,23 @@ export default function FindTab() {
   const [candidates, setCandidates] = useState<Candidate[]>([]);
   const [results, setResults] = useState<RerankedItem[]>([]);
   const [error, setError] = useState('');
+  const history = useSyncExternalStore(subscribeHistory, getHistory, () => EMPTY_HISTORY);
+
+  const recent = history.slice(0, HISTORY_SHOW);
+  // 示例补位：与历史不重复，用最近一次查询做种子轮转——纯函数可在渲染期安全计算，
+  // 每搜一个新的需求，示例就换一批
+  const pool = EXAMPLE_POOL.filter((ex) => !history.includes(ex));
+  const seed = recent[0] ? [...recent[0]].reduce((acc, ch) => acc + ch.charCodeAt(0), 0) : 0;
+  const rotate = pool.length > 0 ? seed % pool.length : 0;
+  const examples = [...pool.slice(rotate), ...pool.slice(0, rotate)].slice(
+    0,
+    Math.max(2, CHIP_TOTAL - recent.length),
+  );
 
   async function run() {
     const q = query.trim();
     if (!q || phase === 'recall' || phase === 'verify' || phase === 'rerank') return;
+    rememberQuery(q);
     setPhase('recall');
     setError('');
     setCandidates([]);
@@ -90,7 +151,15 @@ export default function FindTab() {
           }}
         />
         <div className="flex flex-wrap items-center gap-2">
-          {EXAMPLES.map((ex) => (
+          {recent.length > 0 && (
+            <span className="text-xs" style={{ color: 'var(--ink-faint)' }}>最近</span>
+          )}
+          {recent.map((q) => (
+            <button key={q} className="chip hover:text-[var(--cinnabar)] transition-colors" onClick={() => setQuery(q)}>
+              {q.length > 22 ? `${q.slice(0, 22)}…` : q}
+            </button>
+          ))}
+          {examples.map((ex) => (
             <button key={ex} className="chip hover:text-[var(--cinnabar)] transition-colors" onClick={() => setQuery(ex)}>
               {ex}
             </button>
