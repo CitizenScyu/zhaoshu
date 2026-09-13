@@ -72,11 +72,17 @@ body {
 
 /* ---------- 竖排装饰 ---------- */
 .vertical-motto {
-  writing-mode: vertical-rl;
-  letter-spacing: 0.45em;
+  flex-direction: row-reverse;
+  gap: 14px;
+  letter-spacing: 0;
   color: var(--ink-faint);
   font-size: 13px;
   user-select: none;
+}
+.vertical-motto span {
+  writing-mode: vertical-rl;
+  white-space: nowrap;
+  line-height: 1.5;
 }
 
 /* ---------- 卡片：线装书页 ---------- */

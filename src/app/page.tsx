@@ -37,12 +37,14 @@ function HomeContent() {
             书山有路 · 按口味寻径
           </p>
         </div>
-        <span
-          className="vertical-motto hidden md:block ml-auto pb-2 h-24 ink-rise"
+        <div
+          className="vertical-motto hidden md:flex ml-auto pb-2 ink-rise"
           style={{ animationDelay: '0.16s' }}
         >
-          彼仙我毒 · 交叉验证 · 宁缺毋滥
-        </span>
+          <span>彼仙我毒</span>
+          <span>交叉验证</span>
+          <span>宁缺毋滥</span>
+        </div>
       </header>
 
       {/* 书签 Tab */}
