@@ -12,26 +12,34 @@ export default function ProfileTab() {
   const [draft, setDraft] = useState('');
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState('');
+  const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState('');
+  const [loadAttempt, setLoadAttempt] = useState(0);
 
   useEffect(() => {
     const controller = new AbortController();
     void apiFetch('/api/profile', { signal: controller.signal }).then(async (res) => {
-      if (res.ok) {
-        const data = await res.json();
-        setSeeds(data.seeds ?? []);
-        setContent(data.content ?? '');
-      }
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || `读取画像失败（${res.status}）`);
+      if (controller.signal.aborted) return;
+      setSeeds(data.seeds ?? []);
+      setContent(data.content ?? '');
     }).catch((error) => {
-      if (error instanceof Error && error.name !== 'AbortError') console.error(error);
+      if (!controller.signal.aborted) {
+        setLoadError(error instanceof Error ? error.message : '读取画像失败，请重试');
+      }
+    }).finally(() => {
+      if (!controller.signal.aborted) setLoading(false);
     });
     return () => controller.abort();
-  }, [apiFetch]);
+  }, [apiFetch, loadAttempt]);
 
   function updateSeed(i: number, patch: Partial<SeedBook>) {
     setSeeds((s) => s.map((x, j) => (j === i ? { ...x, ...patch } : x)));
   }
 
   async function saveSeeds() {
+    if (loading || loadError || busy) return;
     setBusy(true);
     setMsg('');
     try {
@@ -40,13 +48,17 @@ export default function ProfileTab() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ seeds }),
       });
-      setMsg(res.ok ? '✓ 种子已保存' : '✗ 保存失败');
+      const data = await res.json().catch(() => ({}));
+      setMsg(res.ok ? '✓ 种子已保存' : `✗ ${data.error || '保存失败'}`);
+    } catch (error) {
+      setMsg(`✗ ${error instanceof Error ? error.message : '保存失败，请重试'}`);
     } finally {
       setBusy(false);
     }
   }
 
   async function generate() {
+    if (loading || loadError || busy) return;
     setBusy(true);
     setMsg('');
     try {
@@ -68,13 +80,17 @@ export default function ProfileTab() {
       } else {
         setMsg(`✗ ${d.error || '生成失败'}`);
       }
+    } catch (error) {
+      setMsg(`✗ ${error instanceof Error ? error.message : '生成失败，请重试'}`);
     } finally {
       setBusy(false);
     }
   }
 
   async function saveDraft() {
+    if (loading || loadError || busy) return;
     setBusy(true);
+    setMsg('');
     try {
       const res = await apiFetch('/api/profile', {
         method: 'PUT',
@@ -86,8 +102,11 @@ export default function ProfileTab() {
         setEditing(false);
         setMsg('✓ 已保存');
       } else {
-        setMsg('✗ 保存失败');
+        const data = await res.json().catch(() => ({}));
+        setMsg(`✗ ${data.error || '保存失败'}`);
       }
+    } catch (error) {
+      setMsg(`✗ ${error instanceof Error ? error.message : '保存失败，请重试'}`);
     } finally {
       setBusy(false);
     }
@@ -95,6 +114,28 @@ export default function ProfileTab() {
 
   const loveCount = seeds.filter((s) => s.kind === 'love').length;
   const dropCount = seeds.filter((s) => s.kind === 'drop').length;
+
+  if (loading) {
+    return <p role="status" className="text-sm py-10 text-center">正在读取画像…</p>;
+  }
+
+  if (loadError) {
+    return (
+      <div className="py-10 text-center">
+        <p role="alert" className="text-sm mb-4" style={{ color: 'var(--cinnabar)' }}>{loadError}</p>
+        <button
+          className="ink-button text-xs"
+          onClick={() => {
+            setLoading(true);
+            setLoadError('');
+            setLoadAttempt((attempt) => attempt + 1);
+          }}
+        >
+          重新读取
+        </button>
+      </div>
+    );
+  }
 
   return (
     <div className="grid lg:grid-cols-2 gap-10">
@@ -113,7 +154,7 @@ export default function ProfileTab() {
               key={i}
               className="border border-[var(--line)] rounded p-3 bg-[var(--paper-card)]"
             >
-              <div className="flex gap-2 items-center mb-2">
+              <div className="flex flex-wrap gap-2 items-center mb-2">
                 <button
                   className={`chip text-xs ${s.kind === 'drop' ? 'chip-risk' : 'chip-like'}`}
                   onClick={() => updateSeed(i, { kind: s.kind === 'drop' ? 'love' : 'drop' })}
@@ -122,19 +163,22 @@ export default function ProfileTab() {
                   {s.kind === 'drop' ? '弃书' : '最爱'}
                 </button>
                 <input
-                  className="paper-input text-sm flex-1 !py-1.5"
+                  className="paper-input text-sm flex-1 min-w-0 !py-1.5"
+                  aria-label="书名"
                   placeholder="书名"
                   value={s.title}
                   onChange={(e) => updateSeed(i, { title: e.target.value })}
                 />
                 <input
                   className="paper-input text-sm w-28 !py-1.5"
+                  aria-label="作者"
                   placeholder="作者(可空)"
                   value={s.author ?? ''}
                   onChange={(e) => updateSeed(i, { author: e.target.value })}
                 />
                 <button
                   className="text-xs px-1"
+                  aria-label={`删除${s.title || '这本书'}`}
                   style={{ color: 'var(--ink-faint)' }}
                   onClick={() => setSeeds((arr) => arr.filter((_, j) => j !== i))}
                 >
@@ -143,6 +187,7 @@ export default function ProfileTab() {
               </div>
               <input
                 className="paper-input text-xs w-full !py-1.5"
+                aria-label="喜欢或弃书的原因"
                 placeholder={s.kind === 'drop' ? '为什么弃？（毒点在哪）' : '为什么爱？（哪个点戳中你）'}
                 value={s.reason ?? ''}
                 onChange={(e) => updateSeed(i, { reason: e.target.value })}
@@ -173,7 +218,7 @@ export default function ProfileTab() {
           </button>
         </div>
         {msg && (
-          <p className="text-xs mt-3" style={{ color: msg.startsWith('✓') ? 'var(--moss)' : 'var(--cinnabar)' }}>
+          <p role="status" className="text-xs mt-3" style={{ color: msg.startsWith('✓') ? 'var(--moss)' : 'var(--cinnabar)' }}>
             {msg}
           </p>
         )}

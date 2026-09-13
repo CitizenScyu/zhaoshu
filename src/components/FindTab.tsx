@@ -26,6 +26,7 @@ export default function FindTab() {
     if (!q || phase === 'recall' || phase === 'verify' || phase === 'rerank') return;
     setPhase('recall');
     setError('');
+    setCandidates([]);
     setResults([]);
     try {
       const r1 = await apiFetch('/api/find', {
@@ -80,6 +81,7 @@ export default function FindTab() {
         <textarea
           className="paper-input text-[15px] leading-7 resize-none"
           rows={2}
+          aria-label="找书需求"
           placeholder="想看什么？越具体越好：题材、流派、主角性格、雷点……"
           value={query}
           onChange={(e) => setQuery(e.target.value)}
@@ -98,19 +100,18 @@ export default function FindTab() {
           <button className="seal-button text-sm" onClick={run} disabled={busy || !query.trim()}>
             {busy ? '寻径中…' : '找 书'}
           </button>
-          <span className="text-xs" style={{ color: 'var(--ink-faint)' }}>Ctrl+Enter 提交</span>
         </div>
       </div>
 
       {/* 进度 */}
       {busy && (
-        <div className="mt-8 flex items-center gap-4">
+        <div role="status" className="mt-8 flex flex-wrap items-center gap-4">
           <div className="flex gap-1.5">
             <span className="ink-drop" />
             <span className="ink-drop" style={{ animationDelay: '0.18s' }} />
             <span className="ink-drop" style={{ animationDelay: '0.36s' }} />
           </div>
-          <div className="flex gap-5 text-sm">
+          <div className="flex flex-wrap gap-3 text-sm">
             {steps.map((s) => (
               <span
                 key={s.key}
@@ -128,12 +129,15 @@ export default function FindTab() {
       )}
 
       {(phase === 'error' || error) && (
-        <p className="mt-6 text-sm" style={{ color: 'var(--cinnabar)' }}>
+        <p role="alert" className="mt-6 text-sm" style={{ color: 'var(--cinnabar)' }}>
           ✗ {error}
         </p>
       )}
 
       {/* 结果 */}
+      {phase === 'done' && results.length === 0 && (
+        <p role="status" className="mt-8 text-sm">本轮没有符合条件的书。</p>
+      )}
       {results.length > 0 && (
         <div className="mt-8 space-y-4">
           {results.map((it, i) => (
@@ -271,9 +275,10 @@ function BookCard({
                 </button>
               ))}
               {noteFor && (
-                <span className="flex items-center gap-2 ml-2 flex-wrap">
+                <span className="flex w-full min-w-0 items-center gap-2 flex-wrap">
                   <input
                     className="paper-input text-xs !py-1.5 !px-2.5 w-64"
+                    aria-label="阅读反馈原因"
                     placeholder={`为什么${noteFor === 'done' ? '读完' : '弃书'}？一句话，喂给画像`}
                     value={note}
                     onChange={(e) => setNote(e.target.value)}

@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { chatRobust, parseJson, LlmError } from '@/lib/llm';
 import { verifyBatch } from '@/lib/douban';
 import {
+  ensureSchema,
   getExcludedBookKeys,
   getExcludedBookTitles,
   getProfile,
@@ -43,6 +44,7 @@ export async function POST(req: NextRequest) {
   const step = body.step as string;
 
   try {
+    await ensureSchema();
     if (step === 'recall') {
       const query = boundedString(body.query, MAX_QUERY_LENGTH) ?? '';
       if (!query) {
@@ -151,9 +153,9 @@ function cleanString(value: unknown, maxLength = 500): string {
   return boundedString(value, maxLength) ?? '';
 }
 
-// 与 db.ts canonicalBookKey 保持一致：NFKC + trim + 小写，空格分隔
+// 与 db.ts canonicalBookKey 保持一致：NFKC + trim + 小写，NUL 分隔
 function bookKey(title: string, author: string): string {
-  return `${title.normalize('NFKC').trim().toLocaleLowerCase()} ${author.normalize('NFKC').trim().toLocaleLowerCase()}`;
+  return `${title.normalize('NFKC').trim().toLocaleLowerCase()}\u0000${author.normalize('NFKC').trim().toLocaleLowerCase()}`;
 }
 
 function sanitizeCandidates(value: unknown): Candidate[] {
@@ -213,7 +215,7 @@ function sanitizeRerankedItems(value: unknown): RerankedItem[] {
       wordCount: cleanString(item.wordCount),
       matchScore: Math.max(0, Math.min(100, Math.round(matchScore))),
       hitLikes: Array.isArray(item.hitLikes)
-        ? item.hitLikes.map(cleanString).filter(Boolean)
+        ? item.hitLikes.map((like) => cleanString(like)).filter(Boolean)
         : [],
       risks: cleanString(item.risks),
       reason: cleanString(item.reason),

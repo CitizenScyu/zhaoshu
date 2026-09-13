@@ -19,6 +19,21 @@ html {
   color-scheme: light;
 }
 
+button, input, textarea, select { letter-spacing: 0; }
+button, select { min-height: 44px; }
+button { cursor: pointer; }
+button:disabled { cursor: not-allowed; }
+input, textarea { min-width: 0; max-width: 100%; }
+article, section { min-width: 0; overflow-wrap: anywhere; }
+:focus-visible { outline: 2px solid var(--dai); outline-offset: 3px; }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation: none !important;
+    transition: none !important;
+  }
+}
+
 body {
   background-color: var(--paper);
   color: var(--ink);
