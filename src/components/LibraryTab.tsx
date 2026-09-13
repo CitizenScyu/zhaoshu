@@ -14,6 +14,7 @@ interface LibraryBook {
   labeledAt: string;
   genre: string;
   intro: string;
+  quality?: number | null;
 }
 
 interface Facets {
@@ -46,6 +47,7 @@ const FIELD_LABELS: [string, string][] = [
 ];
 
 const SORTS: [string, string][] = [
+  ['quality', '质量优先'],
   ['recent', '最新打标'],
   ['oldest', '最早打标'],
   ['title', '书名'],
@@ -120,7 +122,7 @@ export default function LibraryTab() {
   const [category, setCategory] = useState('');
   const [tag, setTag] = useState('');
   const [finish, setFinish] = useState('');
-  const [sort, setSort] = useState('recent');
+  const [sort, setSort] = useState('quality');
   const [detail, setDetail] = useState<LibraryBook | null>(null);
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(true);
@@ -485,40 +487,27 @@ export default function LibraryTab() {
       )}
 
       {books && books.length > 0 && (
-        <div className="mt-5 space-y-3">
+        <div className="mt-5 border-t" style={{ borderColor: 'var(--line)' }}>
           {books.map((b) => (
             <button
               key={b.id}
-              className="book-card w-full text-left px-5 py-4 hover:border-[var(--cinnabar)] transition-colors"
+              className="group flex w-full items-center gap-3 px-1.5 py-2 text-left border-b transition-colors hover:bg-[var(--paper-deep)]"
+              style={{ borderColor: 'var(--line)' }}
               onClick={() => { setDetail(b); setTask(null); setDlError(''); }}
             >
-              <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1">
-                <span className="text-base font-bold">{b.title}</span>
-                <span className="text-sm" style={{ color: 'var(--ink-faint)' }}>{b.author}</span>
-                {b.finishStatus && (
-                  <span className="text-xs" style={{ color: 'var(--moss)' }}>{b.finishStatus}</span>
-                )}
-              </div>
-              <div className="flex flex-wrap gap-1.5 mt-1.5">
-                {tagTokens(b).map((t) => (
-                  <span
-                    key={t}
-                    className="chip text-xs cursor-pointer hover:border-[var(--cinnabar)]"
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      setTag(t);
-                      setPage(1);
-                    }}
-                  >
-                    {t}
+              <span className="min-w-0 flex-1 truncate text-sm transition-colors group-hover:text-[var(--cinnabar)]">
+                {b.title}
+              </span>
+              <span className="flex shrink-0 items-center gap-2">
+                {typeof b.quality === 'number' && (
+                  <span className="text-xs tabular-nums" style={{ color: 'var(--ink-faint)' }}>
+                    {b.quality.toFixed(1)}
                   </span>
-                ))}
-              </div>
-              {b.intro && (
-                <p className="text-sm mt-1.5 leading-6 line-clamp-2" style={{ color: 'var(--ink-soft)' }}>
-                  {b.intro}
-                </p>
-              )}
+                )}
+                {b.finishStatus?.includes('完结') && (
+                  <span className="text-xs" style={{ color: 'var(--moss)' }}>完</span>
+                )}
+              </span>
             </button>
           ))}
         </div>

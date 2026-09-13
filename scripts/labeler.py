@@ -39,7 +39,10 @@ SYSTEM_PROMPT = (
     "weaknesses(雷点风险,1-3条)、plot_stage(读到的内容进展到什么阶段,一句话)、"
     "worldbuilding(世界观一句话)、tone(基调)、confidence(0-1)、"
     "text_quality(文本质量,取值必须是 正常/疑似乱码/大面积重复/含广告注入 之一)、"
-    "is_beginning(读到的内容是否为全书开头,true 或 false)。"
+    "is_beginning(读到的内容是否为全书开头,true 或 false)、"
+    "quality(质量分对象: {\"prose\": 文笔0-10, \"worldbuilding\": 设定0-10, "
+    "\"pacing\": 节奏0-10, \"enjoyment\": 读感0-10, \"overall\": 综合0-10}, "
+    "整数或一位小数)。"
 )
 
 

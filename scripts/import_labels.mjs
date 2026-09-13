@@ -9,6 +9,7 @@ import { neon } from '@neondatabase/serverless';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { normalizeGenre } from './genre_map.mjs';
 
 const DEFAULT_FILE = './labels.jsonl';
 // PG 的 jsonb/text 严禁 NUL(0x00),源码里直接写裸 NUL 字节会被编辑链污染,
@@ -145,20 +146,31 @@ async function run() {
     }
 
     try {
+      // 分类规范化 + 质量分（quality = labels.quality.overall，0-10，非法置 null）
+      const { primary, sub } = normalizeGenre(rec.category, labels.genre);
+      const q = labels.quality;
+      const overall =
+        isRecord(q) && Number.isFinite(Number(q.overall)) && q.overall >= 0 && q.overall <= 10
+          ? Number(q.overall)
+          : null;
       await sql`
         INSERT INTO labeled_books
           (title, author, category, finish_status, source_site, source_url,
-           chars_labeled, labels, labeled_at)
+           chars_labeled, labels, labeled_at, primary_genre, sub_tags, quality)
         VALUES (${cleanString(String(title))}, ${cleanString(String(rec.author ?? ''))},
                 ${cleanString(String(rec.category ?? ''))}, ${cleanString(String(rec.status ?? ''))},
                 ${cleanString(String(rec.source ?? ''))}, ${cleanString(String(rec.url ?? ''))},
                 ${Number.isFinite(Number(rec.chars)) ? Math.trunc(Number(rec.chars)) : 0},
-                ${JSON.stringify(cleanJson(labels))}::jsonb, now())
+                ${JSON.stringify(cleanJson(labels))}::jsonb, now(),
+                ${primary}, ${JSON.stringify(sub)}::jsonb, ${overall})
         ON CONFLICT (lower(title), lower(author)) DO UPDATE SET
           labels = EXCLUDED.labels,
           finish_status = EXCLUDED.finish_status,
           chars_labeled = EXCLUDED.chars_labeled,
           source_url = EXCLUDED.source_url,
+          primary_genre = EXCLUDED.primary_genre,
+          sub_tags = EXCLUDED.sub_tags,
+          quality = COALESCE(EXCLUDED.quality, labeled_books.quality),
           labeled_at = now()`;
       inserted += 1;
     } catch (e) {

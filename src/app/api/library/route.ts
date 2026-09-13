@@ -13,6 +13,8 @@ interface LabeledBook {
   title: string;
   author: string;
   category: string;
+  primary_genre: string | null;
+  quality: number | null;
   finish_status: string;
   chars_labeled: number;
   labels: Record<string, unknown>;
@@ -30,7 +32,7 @@ export function labelText(labels: unknown, key: string, maxLength = 600): string
   return '';
 }
 
-const SORTS = new Set(['recent', 'oldest', 'title']);
+const SORTS = new Set(['quality', 'recent', 'oldest', 'title']);
 
 export async function GET(req: NextRequest) {
   const unauthorized = requireApiOwner(req);
@@ -41,7 +43,9 @@ export async function GET(req: NextRequest) {
   const category = (searchParams.get('category') || '').trim().slice(0, 30);
   const tag = (searchParams.get('tag') || '').trim().slice(0, 30);
   const finish = (searchParams.get('finish') || '').trim().slice(0, 10);
-  const sort = SORTS.has(searchParams.get('sort') || '') ? (searchParams.get('sort') as string) : 'recent';
+  const sort = SORTS.has(searchParams.get('sort') || '')
+    ? (searchParams.get('sort') as string)
+    : 'quality'; // 默认质量优先
   try {
     await ensureSchema();
     const s = getSql();
@@ -51,7 +55,7 @@ export async function GET(req: NextRequest) {
       const like = `%${query.toLowerCase()}%`;
       conds.push(s`(lower(title) LIKE ${like} OR lower(author) LIKE ${like} OR lower(labels::text) LIKE ${like})`);
     }
-    if (category) conds.push(s`category = ${category}`);
+    if (category) conds.push(s`(COALESCE(NULLIF(primary_genre, ''), category) = ${category})`);
     if (tag) {
       const tagLike = `%${tag.toLowerCase()}%`;
       conds.push(s`lower(labels->>'genre') LIKE ${tagLike} OR lower(labels->>'style') LIKE ${tagLike} OR lower(labels->>'tone') LIKE ${tagLike}`);
@@ -68,21 +72,28 @@ export async function GET(req: NextRequest) {
       }
       where = s`WHERE ${merged}`;
     }
-    const orderBy = sort === 'oldest' ? s`labeled_at ASC` : sort === 'title' ? s`title ASC` : s`labeled_at DESC`;
+    // 质量优先：分数降序，未评分的沉底（按打标时间近的在前）
+    const orderBy =
+      sort === 'oldest' ? s`labeled_at ASC`
+      : sort === 'title' ? s`title ASC`
+      : sort === 'recent' ? s`labeled_at DESC`
+      : s`quality DESC NULLS LAST, labeled_at DESC`;
 
     const rows = (await s`
-      SELECT id, title, author, category, finish_status, chars_labeled, labels,
-             labeled_at::text AS labeled_at
+      SELECT id, title, author, category, primary_genre, quality, finish_status,
+             chars_labeled, labels, labeled_at::text AS labeled_at
       FROM labeled_books ${where}
       ORDER BY ${orderBy}
       LIMIT ${PAGE_SIZE} OFFSET ${(page - 1) * PAGE_SIZE}`) as unknown as LabeledBook[];
     const countRows = (await s`
       SELECT count(*)::int AS total FROM labeled_books ${where}`) as { total: number }[];
 
-    // 聚合可选筛选值（分类、完结状态、流派 topN）——给前端筛选条用
+    // 聚合可选筛选值（规范化主分类、完结状态）——给前端筛选条用
     const catRows = (await s`
-      SELECT category, count(*)::int AS n FROM labeled_books
-      WHERE category <> '' GROUP BY category ORDER BY n DESC LIMIT 20`) as { category: string; n: number }[];
+      SELECT COALESCE(NULLIF(primary_genre, ''), category, '其他') AS category,
+             count(*)::int AS n
+      FROM labeled_books
+      GROUP BY 1 ORDER BY n DESC LIMIT 20`) as { category: string; n: number }[];
     const finishRows = (await s`
       SELECT finish_status, count(*)::int AS n FROM labeled_books
       WHERE finish_status <> '' GROUP BY finish_status ORDER BY n DESC LIMIT 10`) as { finish_status: string; n: number }[];
@@ -93,6 +104,8 @@ export async function GET(req: NextRequest) {
         title: r.title,
         author: r.author,
         category: r.category,
+        primaryGenre: r.primary_genre || r.category,
+        quality: typeof r.quality === 'number' ? r.quality : null,
         finishStatus: r.finish_status,
         charsLabeled: r.chars_labeled,
         labels: isRecord(r.labels) ? r.labels : {},
