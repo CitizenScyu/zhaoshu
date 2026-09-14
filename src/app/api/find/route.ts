@@ -90,7 +90,7 @@ export async function POST(req: NextRequest) {
       const raw = await chatRobust(
         recallSystem(),
         recallUser(profile.content, query, excludedBooks),
-        { temperature: 0.8 },
+        { temperature: 0.8, signal: req.signal },
       );
       const candidates = sanitizeCandidates(modelList(raw, 'candidates', MAX_CANDIDATES))
         .filter((candidate) =>
@@ -125,7 +125,7 @@ export async function POST(req: NextRequest) {
       const raw = await chatRobust(
         rerankSystem(),
         rerankUser(profile, query, JSON.stringify(verified)),
-        { temperature: 0.3 },
+        { temperature: 0.3, signal: req.signal },
       );
       // 用书名+作者关联，避免同名作品回填到错误的豆瓣条目。
       const byBook = new Map(verified.map((v) => [bookKey(v.title, v.author), v]));

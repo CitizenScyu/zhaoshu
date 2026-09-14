@@ -5,12 +5,18 @@
 //    仍会聚合完整结果后一次性回给浏览器，并不是浏览器端流式输出。
 // 2. 渠道偶发把中文请求搞成 mojibake，请求体统一 ASCII 转义消除这个变量
 // 3. 公益渠道吞吐波动极大（同样任务 37s~180s+），所以加空闲超时 + 一次重试
+import { cleanString, hasInvalidDatabaseCharacters, isRecord } from './sanitize';
+
 const BASE_URL = process.env.LLM_BASE_URL || 'https://api.cloud.us.kg/v1';
 const API_KEY = process.env.LLM_API_KEY || '';
 const MODEL = process.env.LLM_MODEL || 'claude-opus-5-88';
 const DEFAULT_TOTAL_TIMEOUT_MS = 280_000;
 const MAX_ROBUST_BUDGET_MS = 285_000;
 const DEFAULT_MAX_TOKENS = 3_000;
+const MAX_SSE_BUFFER = 256 * 1024;
+const MAX_CONTENT_LENGTH = 64 * 1024;
+
+export const MAX_PROFILE_LENGTH = 5_000;
 
 export class LlmError extends Error {
   constructor(
@@ -20,6 +26,18 @@ export class LlmError extends Error {
     super(message);
     this.name = 'LlmError';
   }
+}
+
+export function validateProfileContent(value: unknown): string {
+  const content = cleanString(value, MAX_PROFILE_LENGTH);
+  if (!content) {
+    throw new LlmError('模型返回的画像为空、过长或含非法字符，请重试。', false);
+  }
+  return content;
+}
+
+function cancelledError(): LlmError {
+  return new LlmError('模型调用已取消。', false);
 }
 
 function configuredTotalTimeoutMs(): number {
@@ -37,7 +55,7 @@ function asciiEscape(s: string): string {
   );
 }
 
-// 流式调用：首字节不受 CF 100s 限制；只要 token 还在流动就一直读
+// 流式中转避免等待整段响应；持续出 token 仍受同一次调用的总时限约束。
 export async function chat(
   system: string,
   user: string,
@@ -46,14 +64,18 @@ export async function chat(
     idleTimeoutMs?: number;
     totalTimeoutMs?: number;
     maxTokens?: number;
+    signal?: AbortSignal;
   } = {},
 ): Promise<string> {
   if (!API_KEY) {
     throw new LlmError('LLM_API_KEY is not set', false);
   }
+  if (opts.signal?.aborted) throw cancelledError();
   const idleMs = opts.idleTimeoutMs ?? 60_000; // 两个 chunk 之间超过 60s 视为卡死
   const totalMs = opts.totalTimeoutMs ?? configuredTotalTimeoutMs();
   const controller = new AbortController();
+  const cancel = () => controller.abort();
+  opts.signal?.addEventListener('abort', cancel, { once: true });
   const totalTimer = setTimeout(() => controller.abort(), totalMs);
 
   let res: Response;
@@ -106,8 +128,11 @@ export async function chat(
       throw new LlmError('LLM returned no body');
     }
 
-    return await readSseContent(res.body, idleMs, controller);
+    const content = await readSseContent(res.body, idleMs, controller);
+    if (opts.signal?.aborted) throw cancelledError();
+    return content;
   } catch (e) {
+    if (opts.signal?.aborted) throw cancelledError();
     if (e instanceof LlmError) throw e;
     if (controller.signal.aborted) {
       throw new LlmError(`LLM 总超时（${Math.ceil(totalMs / 1000)}s）`);
@@ -115,37 +140,117 @@ export async function chat(
     throw new LlmError(e instanceof Error ? `LLM 请求失败：${e.message}` : 'LLM 请求失败');
   } finally {
     clearTimeout(totalTimer);
+    opts.signal?.removeEventListener('abort', cancel);
   }
 }
 
-// 纯解析:吃一个已解码缓冲区,吐出完整行的 token 增量、剩余半行、以及是否见到 [DONE]。
-// flush=true 表示流已结束(调用方刚把 decoder 尾巴并进来),此时没有"半行"可留。
-export function consumeSseChunk(
-  buf: string,
-  flush: boolean,
-): { content: string; rest: string; done: boolean } {
-  const lines = buf.split('\n');
-  const rest = flush ? '' : (lines.pop() ?? '');
+interface SseChunk {
+  content: string;
+  rest: string;
+  done: boolean;
+  finished: boolean;
+}
+
+function invalidSse(): LlmError {
+  return new LlmError('模型流包含无效的 SSE 事件，请重试。');
+}
+
+function decodeSseEvent(event: unknown): { content: string; finished: boolean } {
+  if (!isRecord(event)) throw invalidSse();
+  if (event.error != null || event.type === 'error') {
+    // 不把可能含凭据或渠道内部信息的上游 error 原样返回给浏览器。
+    throw new LlmError('模型服务返回了错误事件，请重试。');
+  }
+  if (!Array.isArray(event.choices)) throw invalidSse();
+  if (event.choices.length === 0) return { content: '', finished: false }; // usage 块
+  if (event.choices.length !== 1 || !isRecord(event.choices[0])) throw invalidSse();
+  const choice = event.choices[0];
+  if (choice.error != null) throw new LlmError('模型服务返回了错误事件，请重试。');
+  if (choice.index != null && choice.index !== 0) throw invalidSse();
+  if (choice.delta != null && !isRecord(choice.delta)) throw invalidSse();
+  const delta = isRecord(choice.delta) ? choice.delta : {};
+  if (delta.content != null && typeof delta.content !== 'string') throw invalidSse();
+  if (delta.function_call != null ||
+      (delta.tool_calls != null && (!Array.isArray(delta.tool_calls) || delta.tool_calls.length > 0))) {
+    throw new LlmError('模型返回了工具调用，未生成完整正文，请重试。', false);
+  }
+
+  const reason = choice.finish_reason;
+  if (reason === 'length') {
+    throw new LlmError('模型输出因长度限制被截断，请缩短输入后重试。', false);
+  }
+  if (reason === 'content_filter') {
+    throw new LlmError('模型输出被上游内容过滤中断，请调整输入后重试。', false);
+  }
+  if (reason != null && reason !== 'stop') {
+    throw new LlmError('模型未以完整正文结束，请重试。', false);
+  }
+  return { content: typeof delta.content === 'string' ? delta.content : '', finished: reason === 'stop' };
+}
+
+// 当前 NewAPI /chat/completions 的兼容规则：
+// - [DONE]，或明确 finish_reason=stop 后的干净 EOF，均可完成。
+// - role / reasoning / usage 等不含正文的合法增量不算结束。
+// - 标准 SSE 的多行 data、LF/CRLF/CR，以及已有的逐行 JSON 中转格式均可读。
+// 无效事件必须报错；不能丢掉坏行后把残缺正文作为完整结果。
+export function consumeSseChunk(buf: string, flush: boolean): SseChunk {
+  if (buf.length > MAX_SSE_BUFFER) throw invalidSse();
+  const trailingCR = !flush && buf.endsWith('\r') ? '\r' : '';
+  const normalized = (trailingCR ? buf.slice(0, -1) : buf).replace(/\r\n|\r/g, '\n');
+  const lines = normalized.split('\n');
+  const tail = flush ? '' : (lines.pop() ?? '') + trailingCR;
   let content = '';
   let done = false;
+  let finished = false;
+  let data: string[] = [];
+  let pending: string[] = [];
+
   for (const line of lines) {
-    const t = line.trim();
-    if (!t.startsWith('data:')) continue;
-    const payload = t.slice(5).trim();
+    if (line === '') {
+      if (data.length > 0) throw invalidSse(); // 一个已结束但仍无法解析的事件
+      pending = [];
+      continue;
+    }
+    if (line.startsWith(':')) continue;
+    const colon = line.indexOf(':');
+    const field = colon < 0 ? line : line.slice(0, colon);
+    const value = colon < 0 ? '' : line.slice(colon + 1).replace(/^ /, '');
+    if (field === 'event') {
+      if (value.trim() === 'error') throw new LlmError('模型服务返回了错误事件，请重试。');
+      pending.push(line);
+      continue;
+    }
+    if (field !== 'data') continue;
+    pending.push(line);
+    data.push(value);
+    const payload = data.join('\n').trim();
     if (payload === '[DONE]') {
       done = true;
+      pending = [];
+      data = [];
       break;
     }
+    let event: unknown;
     try {
-      const j = JSON.parse(payload) as {
-        choices?: { delta?: { content?: string } }[];
-      };
-      content += j.choices?.[0]?.delta?.content ?? '';
+      event = JSON.parse(payload);
     } catch {
-      // malformed SSE events are ignored; complete events are line-delimited
+      // 可能是多行 data 的半个 JSON；保留到事件边界或 EOF 再判坏。
+      continue;
     }
+    const parsed = decodeSseEvent(event);
+    if (finished && parsed.content) throw invalidSse();
+    content += parsed.content;
+    finished ||= parsed.finished;
+    data = [];
+    pending = [];
   }
-  return { content, rest, done };
+  if (flush && data.length > 0) throw invalidSse();
+  return {
+    content,
+    rest: done ? '' : pending.map((line) => line + '\n').join('') + tail,
+    done,
+    finished,
+  };
 }
 
 async function readSseContent(
@@ -154,62 +259,92 @@ async function readSseContent(
   controller: AbortController,
 ): Promise<string> {
   const reader = body.getReader();
-  const decoder = new TextDecoder();
+  const decoder = new TextDecoder('utf-8', { fatal: true });
   let buf = '';
   let content = '';
-  let sawDone = false;
+  let finished = false;
+  let onAbort: () => void = () => {};
+  // 显式监听取消，连不响应 fetch signal 的上游 reader 也受总预算约束。
+  const aborted = new Promise<never>((_, reject) => {
+    onAbort = () => reject(new DOMException('The operation was aborted', 'AbortError'));
+    controller.signal.addEventListener('abort', onAbort, { once: true });
+    if (controller.signal.aborted) onAbort();
+  });
 
   try {
-    while (!sawDone) {
+    while (true) {
       let idleTimer: ReturnType<typeof setTimeout> | undefined;
       const { done, value } = await Promise.race([
         reader.read(),
+        aborted,
         new Promise<never>((_, reject) => {
           idleTimer = setTimeout(() => {
+            reject(new LlmError('LLM 空闲超时（' + Math.ceil(idleMs / 1000) + 's 无新 token）'));
             controller.abort();
-            reject(new LlmError(`LLM 空闲超时（${Math.ceil(idleMs / 1000)}s 无新 token）`));
           }, idleMs);
         }),
       ]).finally(() => clearTimeout(idleTimer));
-      if (done) {
-        buf += decoder.decode();
-        sawDone = true;
-      } else {
-        buf += decoder.decode(value, { stream: true });
-      }
-
-      const parsed = consumeSseChunk(buf, sawDone);
+      buf += done ? decoder.decode() : decoder.decode(value, { stream: true });
+      const parsed = consumeSseChunk(buf, done);
+      if (finished && parsed.content) throw invalidSse();
       content += parsed.content;
+      if (content.length > MAX_CONTENT_LENGTH) {
+        throw new LlmError('模型输出过长，请重试。', false);
+      }
       buf = parsed.rest;
-      if (parsed.done) sawDone = true;
+      finished ||= parsed.finished;
+      if (parsed.done) break;
+      if (done) {
+        if (!finished) throw new LlmError('模型流在结束标记之前中断，请重试。');
+        break;
+      }
     }
   } finally {
-    reader.cancel().catch(() => {});
+    controller.signal.removeEventListener('abort', onAbort);
+    void reader.cancel().catch(() => {});
+    reader.releaseLock();
   }
 
-  if (!content.trim()) {
-    throw new LlmError('LLM returned empty content');
+  if (!content.trim() || hasInvalidDatabaseCharacters(content)) {
+    throw new LlmError('模型返回了空正文或非法字符，请重试。');
   }
   return content;
 }
 
-// 带一次重试的调用：渠道抖动（524/超时/空回复）时自动再试一次
+function retryDelay(ms: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) return Promise.reject(cancelledError());
+  return new Promise((resolve, reject) => {
+    const cancel = () => {
+      clearTimeout(timer);
+      signal?.removeEventListener('abort', cancel);
+      reject(cancelledError());
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', cancel);
+      resolve();
+    }, ms);
+    signal?.addEventListener('abort', cancel, { once: true });
+  });
+}
+
+// 首次调用、等待和唯一一次重试共享截止时间，绝不重新获得完整预算。
 export async function chatRobust(
   system: string,
   user: string,
-  opts: { temperature?: number; maxTokens?: number } = {},
+  opts: { temperature?: number; maxTokens?: number; signal?: AbortSignal } = {},
 ): Promise<string> {
-  const startedAt = Date.now();
   const budgetMs = Math.min(configuredTotalTimeoutMs(), MAX_ROBUST_BUDGET_MS);
+  const deadline = Date.now() + budgetMs;
   try {
     return await chat(system, user, { ...opts, totalTimeoutMs: budgetMs });
   } catch (e) {
-    if (!(e instanceof LlmError)) throw e;
-    if (!e.retryable) throw e;
-    const retryDelayMs = 1_500;
-    const remainingMs = budgetMs - (Date.now() - startedAt) - retryDelayMs;
+    if (!(e instanceof LlmError) || !e.retryable) throw e;
+    if (opts.signal?.aborted) throw cancelledError();
+    const delayMs = 1_500;
+    if (deadline - Date.now() <= delayMs) throw e;
+    await retryDelay(delayMs, opts.signal);
+    const remainingMs = deadline - Date.now();
     if (remainingMs <= 0) throw e;
-    await new Promise((r) => setTimeout(r, retryDelayMs));
     return chat(system, user, { ...opts, totalTimeoutMs: remainingMs });
   }
 }

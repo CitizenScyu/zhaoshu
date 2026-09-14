@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { ensureSchema, getSql, upsertBook, getProfile, saveProfile } from '@/lib/db';
-import { chatRobust } from '@/lib/llm';
+import { chatRobust, LlmError, validateProfileContent } from '@/lib/llm';
 import { profileUpdateSystem, profileUpdateUser } from '@/lib/prompts';
 import type { ShelfStatus } from '@/lib/types';
 import { boundedString, readJsonBody, RequestBodyError } from '@/lib/http';
@@ -62,9 +62,11 @@ export async function POST(req: NextRequest) {
               status: shelfStatus,
               note: safeNote,
             })),
-            { temperature: 0.3 },
+            { temperature: 0.3, signal: req.signal },
           );
-          profileUpdated = await saveProfile(profile.seeds, updated.trim(), profile.updatedAt);
+          if (req.signal.aborted) throw new LlmError('模型调用已取消。', false);
+          const content = validateProfileContent(updated);
+          profileUpdated = await saveProfile(profile.seeds, content, profile.updatedAt);
         }
       } catch (e) {
         console.error('profile update failed:', e);

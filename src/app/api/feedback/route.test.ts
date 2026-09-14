@@ -22,8 +22,12 @@ vi.mock('@/lib/db', () => ({
   getProfile: mocks.getProfile,
   saveProfile: mocks.saveProfile,
 }));
-vi.mock('@/lib/llm', () => ({ chatRobust: mocks.chatRobust }));
+vi.mock('@/lib/llm', async (importOriginal) => ({
+  ...await importOriginal<typeof import('@/lib/llm')>(),
+  chatRobust: mocks.chatRobust,
+}));
 
+import { LlmError } from '@/lib/llm';
 import { POST } from './route';
 
 function request(status: string, note: string) {
@@ -49,6 +53,7 @@ describe('POST /api/feedback note contract', () => {
 
   afterEach(() => {
     vi.unstubAllEnvs();
+    vi.restoreAllMocks();
   });
 
   it('saves combined reasons and custom text through the existing profile feedback loop', async () => {
@@ -99,5 +104,43 @@ describe('POST /api/feedback note contract', () => {
     expect(mocks.ensureSchema).not.toHaveBeenCalled();
     expect(mocks.transaction).not.toHaveBeenCalled();
     expect(mocks.chatRobust).not.toHaveBeenCalled();
+  });
+
+  it.each(['', ' \n ', null, false, '字'.repeat(5_001), 'bad' + String.fromCharCode(0), '\ud800'])(
+    'retains feedback without saving invalid model profile %#', async (updated) => {
+      vi.spyOn(console, 'error').mockImplementation(() => {});
+      mocks.chatRobust.mockResolvedValue(updated);
+      const res = await POST(request('done', '喜欢严谨设定'));
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual({ ok: true, profileUpdated: false });
+      expect(mocks.transaction).toHaveBeenCalledOnce();
+      expect(mocks.saveProfile).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(['长度截断', '上游错误', '坏 SSE 事件', '无终止标记 EOF', '调用已取消'])(
+    'does not save a profile after %s', async (message) => {
+      vi.spyOn(console, 'error').mockImplementation(() => {});
+      mocks.chatRobust.mockRejectedValue(new LlmError(message, false));
+      const res = await POST(request('dropped', '节奏拖沓'));
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual({ ok: true, profileUpdated: false });
+      expect(mocks.transaction).toHaveBeenCalledOnce();
+      expect(mocks.saveProfile).not.toHaveBeenCalled();
+    },
+  );
+
+  it('does not save if the request was cancelled as the model returned', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    const controller = new AbortController();
+    const req = new NextRequest(request('done', '喜欢设定'), { signal: controller.signal });
+    mocks.chatRobust.mockImplementation(async () => {
+      controller.abort();
+      return '更新后的画像';
+    });
+    const res = await POST(req);
+    expect(await res.json()).toEqual({ ok: true, profileUpdated: false });
+    expect(mocks.chatRobust.mock.calls[0][2].signal.aborted).toBe(true);
+    expect(mocks.saveProfile).not.toHaveBeenCalled();
   });
 });

@@ -1,12 +1,12 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { ensureSchema, getProfile, saveProfile } from '@/lib/db';
-import { chatRobust, LlmError } from '@/lib/llm';
+import { chatRobust, LlmError, MAX_PROFILE_LENGTH, validateProfileContent } from '@/lib/llm';
 import {
   profileSystem,
   profileFromSeedsUser,
 } from '@/lib/prompts';
 import { boundedString, readJsonBody, RequestBodyError } from '@/lib/http';
-import { sanitizeSeeds } from '@/lib/sanitize';
+import { hasInvalidDatabaseCharacters, sanitizeSeeds } from '@/lib/sanitize';
 import { requireApiOwner } from '@/lib/auth';
 
 export const maxDuration = 295;
@@ -44,8 +44,11 @@ export async function PUT(req: NextRequest) {
   if (!body || !Array.isArray(seeds) || seeds.length > MAX_SEEDS) {
     return NextResponse.json({ error: `seeds must be an array of at most ${MAX_SEEDS}` }, { status: 400 });
   }
-  if (typeof body.content === 'string' && boundedString(body.content, 5_000) === null) {
+  if (typeof body.content === 'string' && boundedString(body.content, MAX_PROFILE_LENGTH) === null) {
     return NextResponse.json({ error: 'content is too long' }, { status: 400 });
+  }
+  if (typeof body.content === 'string' && hasInvalidDatabaseCharacters(body.content)) {
+    return NextResponse.json({ error: 'content contains invalid characters' }, { status: 400 });
   }
   try {
     await ensureSchema();
@@ -56,7 +59,7 @@ export async function PUT(req: NextRequest) {
     }
     await saveProfile(
       sanitized,
-      typeof body.content === 'string' ? (boundedString(body.content, 5_000) ?? '') : existing,
+      typeof body.content === 'string' ? (boundedString(body.content, MAX_PROFILE_LENGTH) ?? '') : existing,
     );
     return NextResponse.json({ ok: true });
   } catch (e) {
@@ -79,10 +82,12 @@ export async function POST(req: NextRequest) {
     const raw = await chatRobust(
       profileSystem(),
       profileFromSeedsUser(JSON.stringify(sanitized, null, 2)),
-      { temperature: 0.4 },
+      { temperature: 0.4, signal: req.signal },
     );
-    await saveProfile(sanitized, raw.trim());
-    return NextResponse.json({ content: raw.trim() });
+    if (req.signal.aborted) throw new LlmError('模型调用已取消。', false);
+    const content = validateProfileContent(raw);
+    await saveProfile(sanitized, content);
+    return NextResponse.json({ content });
   } catch (e) {
     if (e instanceof LlmError) {
       return NextResponse.json({ error: e.message }, { status: 502 });
