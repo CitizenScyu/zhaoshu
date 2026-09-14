@@ -49,3 +49,8 @@ next-env.d.ts
 
 # 书源合集数据(由 scripts/update_shuyuan.py 生成,不入库)
 /data/
+
+# 本地脚本凭据与数据快照
+.env.pull
+scripts/backfill.env
+labels.jsonl
