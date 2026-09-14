@@ -326,8 +326,9 @@ export default function LibraryTab() {
     }
   }
 
-  async function cancelDownload() {
-    if (!task || dlBusy) return;
+  async function removeDownload() {
+    if (!task || dlBusy || (task.status !== 'pending' && task.status !== 'failed')) return;
+    const failureMessage = task.status === 'failed' ? '清理失败' : '取消失败';
     const my = ++dlRequestId.current;
     setDlBusy(true);
     setDlError('');
@@ -341,11 +342,11 @@ export default function LibraryTab() {
       if (my !== dlRequestId.current) return;
       if (!res.ok) {
         const data = await res.json().catch(() => ({}));
-        throw new Error(data.error || '取消失败');
+        throw new Error(data.error || failureMessage);
       }
       setTask(null);
     } catch (e) {
-      if (my === dlRequestId.current) setDlError(e instanceof Error ? e.message : '取消失败');
+      if (my === dlRequestId.current) setDlError(e instanceof Error ? e.message : failureMessage);
     } finally {
       if (my === dlRequestId.current) setDlBusy(false);
     }
@@ -461,9 +462,9 @@ export default function LibraryTab() {
                       {dlBusy ? '处理中…' : '重试'}
                     </button>
                   )}
-                  {task.status === 'pending' && (
-                    <button className="chip text-sm" onClick={() => void cancelDownload()} disabled={dlBusy}>
-                      取消
+                  {(task.status === 'pending' || task.status === 'failed') && (
+                    <button className="chip text-sm" onClick={() => void removeDownload()} disabled={dlBusy}>
+                      {task.status === 'failed' ? '清理' : '取消'}
                     </button>
                   )}
                 </div>
