@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { requireApiOwner } from '@/lib/auth';
 import { ensureSchema, getSql } from '@/lib/db';
+import { triggerDownloadWorkflow } from '@/lib/github';
 import { readJsonBody, RequestBodyError } from '@/lib/http';
 
 // 书库下载任务:GET 查任务(最近 20 条或单条)、POST 建任务、DELETE 取消 pending
@@ -120,6 +121,12 @@ export async function POST(req: NextRequest) {
       INSERT INTO download_tasks (book_id, title, author, source_url, status)
       VALUES (${bookId}, ${book.title}, ${book.author}, ${book.source_url}, 'pending')
       RETURNING id`) as { id: number }[];
+    // 立刻唤醒 worker,不等 cron:dispatch 失败绝不能影响建任务结果(Vercel 环境要 await,否则函数可能被提前冻结)
+    try {
+      await triggerDownloadWorkflow();
+    } catch (e) {
+      console.error('workflow dispatch failed', e);
+    }
     return NextResponse.json({ taskId: created[0].id }, { status: 201 });
   } catch (e) {
     console.error(e);
