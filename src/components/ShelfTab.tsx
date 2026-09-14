@@ -4,6 +4,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import type { FeedbackStatus, ShelfStatus } from '@/lib/types';
 import { useOwner } from '@/components/OwnerProvider';
 import FeedbackEditor from '@/components/FeedbackEditor';
+import ReadBookLink from '@/components/ReadBookLink';
 
 interface ShelfItem {
   id: number;
@@ -21,6 +22,7 @@ interface ShelfItem {
   douban_rating: number | null;
   douban_rating_count: number | null;
   meta: { category?: string; wordCount?: string };
+  read_task_id?: number | null;
 }
 
 const GROUPS: { key: ShelfStatus; label: string; color: string }[] = [
@@ -194,6 +196,7 @@ export default function ShelfTab() {
                   </span>
                   {/* 状态切换 */}
                   <div className="flex flex-wrap gap-1.5 sm:shrink-0">
+                    <ReadBookLink taskId={it.read_task_id} title={it.title} from="shelf" />
                     {(
                       [
                         ['want', '想读'],

@@ -4,6 +4,7 @@ import { createContext, useCallback, useContext, useEffect, useState } from 'rea
 
 interface OwnerContextValue {
   token: string;
+  ready: boolean;
   setToken: (token: string) => void;
   apiFetch: (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
 }
@@ -12,17 +13,30 @@ const OwnerContext = createContext<OwnerContextValue | null>(null);
 
 export function OwnerProvider({ children }: { children: React.ReactNode }) {
   const [token, setTokenState] = useState('');
+  const [ready, setReady] = useState(false);
 
   useEffect(() => {
-    const stored = window.localStorage.getItem('novel-finder-owner-token') ?? '';
-    if (stored) queueMicrotask(() => setTokenState(stored));
+    let stored = '';
+    try {
+      stored = window.localStorage.getItem('novel-finder-owner-token') ?? '';
+    } catch {
+      // Private browsing can disable storage; an in-memory token still works.
+    }
+    queueMicrotask(() => {
+      setTokenState(stored);
+      setReady(true);
+    });
   }, []);
 
   const setToken = useCallback((value: string) => {
     const clean = value.trim();
     setTokenState(clean);
-    if (clean) window.localStorage.setItem('novel-finder-owner-token', clean);
-    else window.localStorage.removeItem('novel-finder-owner-token');
+    try {
+      if (clean) window.localStorage.setItem('novel-finder-owner-token', clean);
+      else window.localStorage.removeItem('novel-finder-owner-token');
+    } catch {
+      // Authentication remains usable when localStorage is unavailable.
+    }
   }, []);
 
   const apiFetch = useCallback((input: RequestInfo | URL, init: RequestInit = {}) => {
@@ -32,7 +46,7 @@ export function OwnerProvider({ children }: { children: React.ReactNode }) {
   }, [token]);
 
   return (
-    <OwnerContext.Provider value={{ token, setToken, apiFetch }}>
+    <OwnerContext.Provider value={{ token, ready, setToken, apiFetch }}>
       {children}
     </OwnerContext.Provider>
   );

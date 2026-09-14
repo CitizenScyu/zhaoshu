@@ -15,6 +15,12 @@ export async function GET(req: NextRequest) {
              r.status, r.created_at,
              b.title, b.author, b.douban_id, b.douban_rating, b.douban_rating_count,
              b.meta,
+             (SELECT dt.id FROM download_tasks dt
+              WHERE lower(btrim(dt.title)) = lower(btrim(b.title))
+                AND lower(COALESCE(NULLIF(btrim(dt.author), ''), '佚名'))
+                  = lower(COALESCE(NULLIF(btrim(b.author), ''), '佚名'))
+                AND dt.status = 'done'
+              ORDER BY dt.id DESC LIMIT 1) AS read_task_id,
              COALESCE((
                SELECT f.note FROM feedback f WHERE f.book_id = r.book_id
                ORDER BY f.created_at DESC, f.id DESC LIMIT 1

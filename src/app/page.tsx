@@ -1,6 +1,6 @@
 'use client';
 
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import FindTab from '@/components/FindTab';
 import ShelfTab from '@/components/ShelfTab';
 import ProfileTab from '@/components/ProfileTab';
@@ -32,6 +32,24 @@ function HomeContent() {
   const [tab, setTab] = useState<Tab>('find');
   const { token, setToken } = useOwner();
 
+  useEffect(() => {
+    const restoreTab = () => {
+      const requested = new URLSearchParams(window.location.search).get('tab');
+      const next = TABS.find((entry) => entry.key === requested)?.key ?? 'find';
+      queueMicrotask(() => setTab(next));
+    };
+    restoreTab();
+    window.addEventListener('popstate', restoreTab);
+    return () => window.removeEventListener('popstate', restoreTab);
+  }, []);
+
+  function selectTab(next: Tab) {
+    setTab(next);
+    const url = new URL(window.location.href);
+    url.searchParams.set('tab', next);
+    window.history.replaceState(null, '', url);
+  }
+
   return (
     <div className="min-h-screen flex flex-col">
       {/* 顶栏 */}
@@ -60,7 +78,7 @@ function HomeContent() {
             key={t.key}
             aria-current={tab === t.key ? 'page' : undefined}
             className={`bookmark-tab text-sm ${tab === t.key ? 'active' : 'hover:text-[var(--ink)]'}`}
-            onClick={() => setTab(t.key)}
+            onClick={() => selectTab(t.key)}
           >
             {t.label}
           </button>

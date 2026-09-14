@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useOwner } from '@/components/OwnerProvider';
+import ReadBookLink from '@/components/ReadBookLink';
 
 interface LibraryBook {
   id: number;
@@ -15,6 +16,7 @@ interface LibraryBook {
   genre: string;
   intro: string;
   quality?: number | null;
+  readTaskId?: number | null;
 }
 
 interface Facets {
@@ -142,6 +144,17 @@ export default function LibraryTab() {
   const reqId = useRef(0);
   const dlRequestId = useRef(0);
 
+  const updateTask = useCallback((next: DownloadTask | null) => {
+    setTask(next);
+    if (next?.status !== 'done') return;
+    // A newly finished download must also expose reading on its library card,
+    // including after the detail view (and its local task state) is closed.
+    setBooks((current) => current?.map((book) => book.id === next.bookId && book.readTaskId !== next.id
+      ? { ...book, readTaskId: next.id } : book) ?? null);
+    setDetail((current) => current?.id === next.bookId && current.readTaskId !== next.id
+      ? { ...current, readTaskId: next.id } : current);
+  }, []);
+
   function showDetail(book: LibraryBook | null) {
     dlRequestId.current += 1;
     setDetail(book);
@@ -184,6 +197,7 @@ export default function LibraryTab() {
   }, [load, page, search, category, tag, finish, sort]);
 
   const detailId = detail?.id ?? null;
+  const detailReadTaskId = detail?.readTaskId ?? null;
 
   // 进入详情页时查这本书有没有进行中/已完成的下载任务
   useEffect(() => {
@@ -195,14 +209,14 @@ export default function LibraryTab() {
       if (controller.signal.aborted) return;
       void (async () => {
         try {
-          const res = await apiFetch('/api/download', { signal: controller.signal });
+          const res = await apiFetch(detailReadTaskId ? `/api/download?id=${detailReadTaskId}` : '/api/download', { signal: controller.signal });
           const data = await res.json();
           if (!res.ok) throw new Error(data.error || '查询下载任务失败');
           if (stale || my !== dlRequestId.current) return;
-          const found = Array.isArray(data.tasks)
+          const found = detailReadTaskId ? parseTask(data) : Array.isArray(data.tasks)
             ? (data.tasks as unknown[]).map(parseTask).find((t) => t !== null && t.bookId === detailId)
             : null;
-          setTask(found ?? null);
+          updateTask(found ?? null);
         } catch {
           // 查不到不影响看详情，只是下载区块退回按钮态
         }
@@ -212,7 +226,7 @@ export default function LibraryTab() {
       stale = true;
       controller.abort();
     };
-  }, [detailId, apiFetch]);
+  }, [detailId, detailReadTaskId, apiFetch, updateTask]);
 
   // pending/running 任务每 10 秒轮询单条进度
   const pollTaskId = task !== null && (task.status === 'pending' || task.status === 'running')
@@ -233,7 +247,7 @@ export default function LibraryTab() {
           if (!res.ok) throw new Error(data.error || '查询下载进度失败');
           const next = parseTask(data);
           if (!stale && my === dlRequestId.current && next !== null) {
-            setTask(next);
+            updateTask(next);
             if (next.status === 'done' || next.status === 'failed') setDlMessage('');
           }
         } catch {
@@ -246,7 +260,7 @@ export default function LibraryTab() {
       controller.abort();
       clearInterval(timer);
     };
-  }, [pollTaskId, apiFetch]);
+  }, [pollTaskId, apiFetch, updateTask]);
 
   async function addToShelf(book: LibraryBook) {
     if (shelfBusy !== 0) return;
@@ -297,7 +311,7 @@ export default function LibraryTab() {
           if (!currentRes.ok || !current || current.bookId !== detail.id) {
             throw new Error('任务已在队列，暂时无法读取进度，请稍后重试');
           }
-          setTask(current);
+          updateTask(current);
           if (current.status === 'done') setDlMessage('任务已完成，可取回文件。');
           if (current.status === 'failed') setDlMessage('任务已失败，可再次重试。');
         }
@@ -428,6 +442,11 @@ export default function LibraryTab() {
           </p>
           {/* 下载全书 */}
           <div className="mt-5 pt-4 border-t border-dashed" style={{ borderColor: 'var(--line)' }}>
+            {(task?.status === 'done' || detail.readTaskId) && (
+              <div className="mb-3">
+                <ReadBookLink taskId={task?.status === 'done' ? task.id : detail.readTaskId} title={detail.title} from="library" />
+              </div>
+            )}
             {dlError && (
               <p role="alert" className="text-xs mb-2" style={{ color: 'var(--cinnabar)' }}>✗ {dlError}</p>
             )}
@@ -605,6 +624,7 @@ export default function LibraryTab() {
               style={{ borderColor: 'var(--line)' }}
               onClick={() => showDetail(b)}
               onKeyDown={(e) => {
+                if (e.target !== e.currentTarget) return;
                 if (e.key === 'Enter' || e.key === ' ') {
                   e.preventDefault();
                   showDetail(b);
@@ -647,6 +667,11 @@ export default function LibraryTab() {
                   {shelfBusy === b.id ? '…' : '+ 书架'}
                 </button>
               </span>
+              {b.readTaskId && (
+                <div className="mt-2">
+                  <ReadBookLink taskId={b.readTaskId} title={b.title} from="library" />
+                </div>
+              )}
             </div>
           ))}
         </div>

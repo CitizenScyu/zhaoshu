@@ -19,6 +19,7 @@ interface LabeledBook {
   chars_labeled: number;
   labels: Record<string, unknown>;
   labeled_at: string;
+  read_task_id: number | null;
 }
 
 // 标签字段的安全提取（labels 来自离线脚本，字段宽松）
@@ -82,7 +83,10 @@ export async function GET(req: NextRequest) {
 
     const rows = (await s`
       SELECT id, title, author, category, primary_genre, quality, finish_status,
-             chars_labeled, labels, labeled_at::text AS labeled_at
+             chars_labeled, labels, labeled_at::text AS labeled_at,
+             (SELECT dt.id FROM download_tasks dt
+              WHERE dt.book_id = labeled_books.id AND dt.status = 'done'
+              ORDER BY dt.id DESC LIMIT 1) AS read_task_id
       FROM labeled_books ${where}
       ORDER BY ${orderBy}
       LIMIT ${PAGE_SIZE} OFFSET ${(page - 1) * PAGE_SIZE}`) as unknown as LabeledBook[];
@@ -111,6 +115,7 @@ export async function GET(req: NextRequest) {
         charsLabeled: r.chars_labeled,
         labels: isRecord(r.labels) ? r.labels : {},
         labeledAt: r.labeled_at,
+        readTaskId: r.read_task_id ?? null,
         // 列表直出的简介级字段
         genre: labelText(r.labels, 'genre', 100),
         intro: labelText(r.labels, 'worldbuilding', 300) || labelText(r.labels, 'plot_stage', 300),
