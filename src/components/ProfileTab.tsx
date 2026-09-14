@@ -23,6 +23,7 @@ export default function ProfileTab() {
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || `读取画像失败（${res.status}）`);
       if (controller.signal.aborted) return;
+      setLoadError('');
       setSeeds(data.seeds ?? []);
       setSeedEditing(!(data.seeds && data.seeds.length > 0));
       setContent(data.content ?? '');
