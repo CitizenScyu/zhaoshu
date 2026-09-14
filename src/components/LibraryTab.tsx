@@ -111,6 +111,13 @@ function fileNameFrom(disposition: string, fallback: string): string {
   return plain ? plain[1] : fallback;
 }
 
+// 质量分分档配色：>=8.0 朱红 / 7.0~7.9 苔绿 / 更低灰墨，扫视时快速分辨优劣
+function qualityColor(q: number): string {
+  if (q >= 8.0) return 'var(--cinnabar)';
+  if (q >= 7.0) return 'var(--moss)';
+  return 'var(--ink-faint)';
+}
+
 export default function LibraryTab() {
   const { apiFetch } = useOwner();
   const [books, setBooks] = useState<LibraryBook[] | null>(null);
@@ -487,25 +494,34 @@ export default function LibraryTab() {
       )}
 
       {books && books.length > 0 && (
-        <div className="mt-5 border-t" style={{ borderColor: 'var(--line)' }}>
+        <div
+          className="mt-5 grid grid-cols-2 gap-2 border-t pt-4 sm:grid-cols-3 lg:grid-cols-4"
+          style={{ borderColor: 'var(--line)' }}
+        >
           {books.map((b) => (
             <button
               key={b.id}
-              className="group flex w-full items-center gap-3 px-1.5 py-2 text-left border-b transition-colors hover:bg-[var(--paper-deep)]"
+              className="group flex flex-col gap-1 rounded-[3px] border border-dashed px-3 py-2.5 text-left transition-colors hover:border-solid hover:bg-[var(--paper-deep)]"
               style={{ borderColor: 'var(--line)' }}
               onClick={() => { setDetail(b); setTask(null); setDlError(''); }}
             >
-              <span className="min-w-0 flex-1 truncate text-sm transition-colors group-hover:text-[var(--cinnabar)]">
+              <span className="line-clamp-2 min-w-0 text-sm font-bold transition-colors group-hover:text-[var(--cinnabar)]">
                 {b.title}
               </span>
-              <span className="flex shrink-0 items-center gap-2">
+              <span className="truncate text-xs" style={{ color: 'var(--ink-faint)' }}>{b.author}</span>
+              <span className="mt-auto flex min-w-0 items-center gap-2 text-xs">
                 {typeof b.quality === 'number' && (
-                  <span className="text-xs tabular-nums" style={{ color: 'var(--ink-faint)' }}>
+                  <span className="shrink-0 font-bold tabular-nums" style={{ color: qualityColor(b.quality) }}>
                     {b.quality.toFixed(1)}
                   </span>
                 )}
                 {b.finishStatus?.includes('完结') && (
-                  <span className="text-xs" style={{ color: 'var(--moss)' }}>完</span>
+                  <span className="shrink-0" style={{ color: 'var(--moss)' }}>完</span>
+                )}
+                {(b.category || b.genre) && (
+                  <span className="ml-auto truncate" style={{ color: 'var(--ink-faint)' }}>
+                    {b.category || b.genre}
+                  </span>
                 )}
               </span>
             </button>
