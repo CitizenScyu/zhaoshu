@@ -91,22 +91,24 @@ function HomeContent() {
       </nav>
 
       <form onSubmit={applyToken} aria-label="口令设置" className="flex flex-wrap items-center gap-x-3 gap-y-2 px-6 sm:px-10 py-4 max-w-5xl w-full mx-auto text-xs">
-        <label htmlFor="owner-token" style={{ color: 'var(--ink-soft)' }}>访问口令</label>
-        <input
-          id="owner-token"
-          className="paper-input text-sm min-h-11 flex-1 w-32 sm:max-w-56"
-          type="password"
-          value={draft}
-          onChange={(event) => { setDraft(event.target.value); setNotice(''); setTokenError(false); }}
-          placeholder={token ? '输入新口令以替换' : '输入访问口令'}
-          autoComplete="current-password"
-          disabled={submitting}
-          aria-describedby="owner-token-status"
-          aria-invalid={tokenError || undefined}
-        />
-        <button type="submit" className="ink-button text-xs !px-4" disabled={submitting || !draft.trim()}>
-          {submitting ? '验证中…' : '提交口令'}
-        </button>
+        <div className="flex w-full min-w-0 items-center gap-2 sm:w-auto sm:flex-1 sm:max-w-md">
+          <label htmlFor="owner-token" className="shrink-0" style={{ color: 'var(--ink-soft)' }}>访问口令</label>
+          <input
+            id="owner-token"
+            className="paper-input text-sm min-h-11 flex-1 w-32"
+            type="password"
+            value={draft}
+            onChange={(event) => { setDraft(event.target.value); setNotice(''); setTokenError(false); }}
+            placeholder={token ? '输入新口令以替换' : '输入访问口令'}
+            autoComplete="current-password"
+            disabled={submitting}
+            aria-describedby="owner-token-status"
+            aria-invalid={tokenError || undefined}
+          />
+          <button type="submit" className="ink-button text-xs !px-4 shrink-0" disabled={submitting || !draft.trim()}>
+            {submitting ? '验证中…' : '提交口令'}
+          </button>
+        </div>
         <label className="flex items-center gap-2 min-h-11" style={{ color: 'var(--ink-soft)' }}>
           <input type="checkbox" checked={sessionOnly} disabled={submitting} onChange={(event) => {
             setSessionOnly(event.target.checked);

@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import type { SeedBook } from '@/lib/types';
 import { useOwner } from '@/components/OwnerProvider';
 
@@ -16,6 +16,18 @@ export default function ProfileTab() {
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState('');
   const [loadAttempt, setLoadAttempt] = useState(0);
+  const editButton = useRef<HTMLButtonElement>(null);
+  const editor = useRef<HTMLTextAreaElement>(null);
+  const restoreEditorFocus = useRef(false);
+
+  useEffect(() => {
+    if (editing) {
+      editor.current?.focus();
+    } else if (restoreEditorFocus.current) {
+      editButton.current?.focus();
+      restoreEditorFocus.current = false;
+    }
+  }, [editing]);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -195,7 +207,7 @@ export default function ProfileTab() {
                   key={i}
                   className="border border-[var(--line)] rounded p-3 bg-[var(--paper-card)]"
                 >
-                  <div className="flex flex-wrap gap-2 items-center mb-2">
+                  <div className="grid grid-cols-[auto_minmax(0,1fr)_auto] gap-2 items-center mb-2">
                     <button
                       className={`chip text-xs ${s.kind === 'drop' ? 'chip-risk' : 'chip-like'}`}
                       onClick={() => updateSeed(i, { kind: s.kind === 'drop' ? 'love' : 'drop' })}
@@ -210,13 +222,6 @@ export default function ProfileTab() {
                       value={s.title}
                       onChange={(e) => updateSeed(i, { title: e.target.value })}
                     />
-                    <input
-                      className="paper-input text-sm w-28 !py-1.5"
-                      aria-label="作者"
-                      placeholder="作者(可空)"
-                      value={s.author ?? ''}
-                      onChange={(e) => updateSeed(i, { author: e.target.value })}
-                    />
                     <button
                       className="text-xs px-1"
                       aria-label={`删除${s.title || '这本书'}`}
@@ -226,6 +231,13 @@ export default function ProfileTab() {
                       ✕
                     </button>
                   </div>
+                  <input
+                    className="paper-input text-sm w-full !py-1.5 mb-2"
+                    aria-label="作者"
+                    placeholder="作者(可空)"
+                    value={s.author ?? ''}
+                    onChange={(e) => updateSeed(i, { author: e.target.value })}
+                  />
                   <input
                     className="paper-input text-xs w-full !py-1.5"
                     aria-label="喜欢或弃书的原因"
@@ -243,7 +255,7 @@ export default function ProfileTab() {
               {seeds.map((s, i) => (
                 <span
                   key={i}
-                  className="inline-flex items-center gap-1.5 text-xs px-2 py-1 border-b border-[var(--line)]"
+                  className="inline-flex max-w-full flex-wrap items-center gap-1.5 text-xs px-2 py-1 border-b border-[var(--line)]"
                   title="编辑书单"
                 >
                   <span
@@ -288,15 +300,16 @@ export default function ProfileTab() {
 
       {/* 右：画像 */}
       <section>
-        <div className="flex items-center gap-3 mb-4">
-          <h2 className="text-sm font-bold tracking-[0.25em]" style={{ color: 'var(--cinnabar)' }}>
+        <div className="flex flex-wrap items-center gap-2 mb-4">
+          <h2 id="profile-content-title" className="text-sm font-bold tracking-[0.25em] mr-auto" style={{ color: 'var(--cinnabar)' }}>
             口味画像
           </h2>
-          <div className="flex-1" />
           {content && !editing && (
             <button
+              ref={editButton}
               className="chip text-xs"
               onClick={() => {
+                restoreEditorFocus.current = true;
                 setDraft(content);
                 setEditing(true);
               }}
@@ -312,6 +325,7 @@ export default function ProfileTab() {
               <button
                 className="chip text-xs"
                 onClick={() => setEditing(false)}
+                disabled={busy}
               >
                 取消
               </button>
@@ -321,7 +335,9 @@ export default function ProfileTab() {
 
         {editing ? (
           <textarea
-            className="paper-input text-sm leading-7 w-full h-96 font-mono"
+            ref={editor}
+            aria-labelledby="profile-content-title"
+            className="paper-input text-sm leading-7 w-full h-96 font-mono resize-y"
             value={draft}
             onChange={(e) => setDraft(e.target.value)}
           />
