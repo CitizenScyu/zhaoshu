@@ -9,6 +9,7 @@ export default function ProfileTab() {
   const [seeds, setSeeds] = useState<SeedBook[]>([]);
   const [content, setContent] = useState('');
   const [editing, setEditing] = useState(false);
+  const [seedEditing, setSeedEditing] = useState(false);
   const [draft, setDraft] = useState('');
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState('');
@@ -23,6 +24,7 @@ export default function ProfileTab() {
       if (!res.ok) throw new Error(data.error || `读取画像失败（${res.status}）`);
       if (controller.signal.aborted) return;
       setSeeds(data.seeds ?? []);
+      setSeedEditing(!(data.seeds && data.seeds.length > 0));
       setContent(data.content ?? '');
     }).catch((error) => {
       if (!controller.signal.aborted) {
@@ -50,6 +52,7 @@ export default function ProfileTab() {
       });
       const data = await res.json().catch(() => ({}));
       setMsg(res.ok ? '✓ 种子已保存' : `✗ ${data.error || '保存失败'}`);
+      if (res.ok) setSeedEditing(false);
     } catch (error) {
       setMsg(`✗ ${error instanceof Error ? error.message : '保存失败，请重试'}`);
     } finally {
@@ -77,6 +80,7 @@ export default function ProfileTab() {
       if (res.ok) {
         setContent(d.content);
         setMsg('✓ 画像已生成');
+        if (seeds.length > 0) setSeedEditing(false);
       } else {
         setMsg(`✗ ${d.error || '生成失败'}`);
       }
@@ -148,67 +152,124 @@ export default function ProfileTab() {
           最爱 {loveCount} 本 · 弃书 {dropCount} 本。弃书原因的权重高于最爱——网文口味「彼仙我毒」，雷点比萌点更能定义你。
         </p>
 
-        <div className="space-y-3">
-          {seeds.map((s, i) => (
-            <div
-              key={i}
-              className="border border-[var(--line)] rounded p-3 bg-[var(--paper-card)]"
-            >
-              <div className="flex flex-wrap gap-2 items-center mb-2">
-                <button
-                  className={`chip text-xs ${s.kind === 'drop' ? 'chip-risk' : 'chip-like'}`}
-                  onClick={() => updateSeed(i, { kind: s.kind === 'drop' ? 'love' : 'drop' })}
-                  title="点击切换 最爱/弃书"
-                >
-                  {s.kind === 'drop' ? '弃书' : '最爱'}
-                </button>
-                <input
-                  className="paper-input text-sm flex-1 min-w-0 !py-1.5"
-                  aria-label="书名"
-                  placeholder="书名"
-                  value={s.title}
-                  onChange={(e) => updateSeed(i, { title: e.target.value })}
-                />
-                <input
-                  className="paper-input text-sm w-28 !py-1.5"
-                  aria-label="作者"
-                  placeholder="作者(可空)"
-                  value={s.author ?? ''}
-                  onChange={(e) => updateSeed(i, { author: e.target.value })}
-                />
-                <button
-                  className="text-xs px-1"
-                  aria-label={`删除${s.title || '这本书'}`}
-                  style={{ color: 'var(--ink-faint)' }}
-                  onClick={() => setSeeds((arr) => arr.filter((_, j) => j !== i))}
-                >
-                  ✕
-                </button>
-              </div>
-              <input
-                className="paper-input text-xs w-full !py-1.5"
-                aria-label="喜欢或弃书的原因"
-                placeholder={s.kind === 'drop' ? '为什么弃？（毒点在哪）' : '为什么爱？（哪个点戳中你）'}
-                value={s.reason ?? ''}
-                onChange={(e) => updateSeed(i, { reason: e.target.value })}
-              />
+        {seedEditing ? (
+          <>
+            <div className="flex flex-wrap gap-2.5 mb-3">
+              <button
+                className="chip hover:border-[var(--ink)] transition-colors"
+                onClick={() =>
+                  setSeeds((s) => [{ title: '', kind: 'love' }, ...s])
+                }
+              >
+                + 最爱
+              </button>
+              <button
+                className="chip hover:border-[var(--cinnabar)] transition-colors"
+                onClick={() =>
+                  setSeeds((s) => [{ title: '', kind: 'drop' }, ...s])
+                }
+              >
+                + 弃书
+              </button>
+              <div className="flex-1" />
+              <button
+                className="chip text-xs"
+                onClick={() => {
+                  if (
+                    seeds.length > 0 &&
+                    !window.confirm('有未保存的修改，收起会丢弃这些改动，确定？')
+                  ) {
+                    return;
+                  }
+                  setSeedEditing(false);
+                }}
+              >
+                收起
+              </button>
             </div>
-          ))}
-        </div>
+
+            <div className="space-y-3">
+              {seeds.map((s, i) => (
+                <div
+                  key={i}
+                  className="border border-[var(--line)] rounded p-3 bg-[var(--paper-card)]"
+                >
+                  <div className="flex flex-wrap gap-2 items-center mb-2">
+                    <button
+                      className={`chip text-xs ${s.kind === 'drop' ? 'chip-risk' : 'chip-like'}`}
+                      onClick={() => updateSeed(i, { kind: s.kind === 'drop' ? 'love' : 'drop' })}
+                      title="点击切换 最爱/弃书"
+                    >
+                      {s.kind === 'drop' ? '弃书' : '最爱'}
+                    </button>
+                    <input
+                      className="paper-input text-sm flex-1 min-w-0 !py-1.5"
+                      aria-label="书名"
+                      placeholder="书名"
+                      value={s.title}
+                      onChange={(e) => updateSeed(i, { title: e.target.value })}
+                    />
+                    <input
+                      className="paper-input text-sm w-28 !py-1.5"
+                      aria-label="作者"
+                      placeholder="作者(可空)"
+                      value={s.author ?? ''}
+                      onChange={(e) => updateSeed(i, { author: e.target.value })}
+                    />
+                    <button
+                      className="text-xs px-1"
+                      aria-label={`删除${s.title || '这本书'}`}
+                      style={{ color: 'var(--ink-faint)' }}
+                      onClick={() => setSeeds((arr) => arr.filter((_, j) => j !== i))}
+                    >
+                      ✕
+                    </button>
+                  </div>
+                  <input
+                    className="paper-input text-xs w-full !py-1.5"
+                    aria-label="喜欢或弃书的原因"
+                    placeholder={s.kind === 'drop' ? '为什么弃？（毒点在哪）' : '为什么爱？（哪个点戳中你）'}
+                    value={s.reason ?? ''}
+                    onChange={(e) => updateSeed(i, { reason: e.target.value })}
+                  />
+                </div>
+              ))}
+            </div>
+          </>
+        ) : (
+          <>
+            <div className="flex flex-wrap gap-1.5 mb-3">
+              {seeds.map((s, i) => (
+                <span
+                  key={i}
+                  className="inline-flex items-center gap-1.5 text-xs px-2 py-1 border-b border-[var(--line)]"
+                  title="编辑书单"
+                >
+                  <span
+                    className={`chip chip-sm !text-[10px] ${s.kind === 'drop' ? 'chip-risk' : 'chip-like'}`}
+                  >
+                    {s.kind === 'drop' ? '弃' : '爱'}
+                  </span>
+                  <span className="text-[var(--ink)]">{s.title}</span>
+                  {s.author && <span className="text-[var(--ink-faint)] text-[10px]">{s.author}</span>}
+                </span>
+              ))}
+              {seeds.length === 0 && (
+                <span className="text-xs" style={{ color: 'var(--ink-faint)' }}>
+                  书单还是空的 —— 点「编辑书单」加几本。
+                </span>
+              )}
+            </div>
+            <button
+              className="ink-button text-xs !py-2"
+              onClick={() => setSeedEditing(true)}
+            >
+              编辑书单
+            </button>
+          </>
+        )}
 
         <div className="flex flex-wrap gap-2.5 mt-4">
-          <button
-            className="chip hover:border-[var(--ink)] transition-colors"
-            onClick={() => setSeeds((s) => [...s, { title: '', kind: 'love' }])}
-          >
-            + 最爱
-          </button>
-          <button
-            className="chip hover:border-[var(--cinnabar)] transition-colors"
-            onClick={() => setSeeds((s) => [...s, { title: '', kind: 'drop' }])}
-          >
-            + 弃书
-          </button>
           <div className="flex-1" />
           <button className="ink-button text-xs !py-2" onClick={saveSeeds} disabled={busy}>
             保存种子
