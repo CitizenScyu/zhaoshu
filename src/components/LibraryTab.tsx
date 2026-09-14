@@ -93,7 +93,7 @@ function downloadStatusText(t: DownloadTask): string {
     case 'pending': return '排队中，Actions 最多 5 分钟后开始';
     case 'running': return `下载中 ${t.chaptersDone}/${t.chaptersTotal} 章`;
     case 'done': return `完成，共 ${t.charsTotal} 字`;
-    case 'failed': return `失败：${t.error ?? '未知原因'}`;
+    case 'failed': return t.error?.trim() ? '下载失败' : '下载失败：未知原因';
   }
 }
 
@@ -135,10 +135,21 @@ export default function LibraryTab() {
   const [loading, setLoading] = useState(true);
   const [task, setTask] = useState<DownloadTask | null>(null);
   const [dlError, setDlError] = useState('');
+  const [dlMessage, setDlMessage] = useState('');
   const [dlBusy, setDlBusy] = useState(false);
   const [shelfMsg, setShelfMsg] = useState('');
   const [shelfBusy, setShelfBusy] = useState(0); // 当前正在加书架的书 id，0 表示空闲
   const reqId = useRef(0);
+  const dlRequestId = useRef(0);
+
+  function showDetail(book: LibraryBook | null) {
+    dlRequestId.current += 1;
+    setDetail(book);
+    setTask(null);
+    setDlError('');
+    setDlMessage('');
+    setDlBusy(false);
+  }
 
   const load = useCallback(async (p: number, q: string, cat: string, tg: string, fin: string, st: string, signal?: AbortSignal) => {
     const my = ++reqId.current;
@@ -177,6 +188,7 @@ export default function LibraryTab() {
   // 进入详情页时查这本书有没有进行中/已完成的下载任务
   useEffect(() => {
     if (detailId === null) return;
+    const my = dlRequestId.current;
     let stale = false;
     const controller = new AbortController();
     queueMicrotask(() => {
@@ -186,7 +198,7 @@ export default function LibraryTab() {
           const res = await apiFetch('/api/download', { signal: controller.signal });
           const data = await res.json();
           if (!res.ok) throw new Error(data.error || '查询下载任务失败');
-          if (stale) return;
+          if (stale || my !== dlRequestId.current) return;
           const found = Array.isArray(data.tasks)
             ? (data.tasks as unknown[]).map(parseTask).find((t) => t !== null && t.bookId === detailId)
             : null;
@@ -213,13 +225,17 @@ export default function LibraryTab() {
     const controller = new AbortController();
     const timer = setInterval(() => {
       if (controller.signal.aborted) return;
+      const my = dlRequestId.current;
       void (async () => {
         try {
           const res = await apiFetch(`/api/download?id=${pollTaskId}`, { signal: controller.signal });
           const data = await res.json();
           if (!res.ok) throw new Error(data.error || '查询下载进度失败');
           const next = parseTask(data);
-          if (!stale && next !== null) setTask(next);
+          if (!stale && my === dlRequestId.current && next !== null) {
+            setTask(next);
+            if (next.status === 'done' || next.status === 'failed') setDlMessage('');
+          }
         } catch {
           // 单次失败不打断轮询
         }
@@ -257,9 +273,11 @@ export default function LibraryTab() {
   }
 
   async function startDownload() {
-    if (!detail) return;
+    if (!detail || dlBusy || task?.status === 'done' || task?.status === 'running') return;
+    const my = ++dlRequestId.current;
     setDlBusy(true);
     setDlError('');
+    setDlMessage('');
     try {
       const res = await apiFetch('/api/download', {
         method: 'POST',
@@ -267,8 +285,25 @@ export default function LibraryTab() {
         body: JSON.stringify({ bookId: detail.id }),
       });
       const data = await res.json().catch(() => ({}));
-      if ((res.ok || res.status === 409) && typeof data.taskId === 'number') {
-        // 201 新任务 / 409 已有任务：都先挂 pending 占位，轮询拉真实进度
+      if (my !== dlRequestId.current) return;
+      if (res.status === 409) {
+        setDlMessage('任务已在队列，无需重复提交。');
+        if (typeof data.taskId === 'number') {
+          // 读取已有任务的真实状态，避免把已经完成的任务重新显示成 pending。
+          const currentRes = await apiFetch(`/api/download?id=${data.taskId}`);
+          const currentData = await currentRes.json().catch(() => null);
+          if (my !== dlRequestId.current) return;
+          const current = parseTask(currentData);
+          if (!currentRes.ok || !current || current.bookId !== detail.id) {
+            throw new Error('任务已在队列，暂时无法读取进度，请稍后重试');
+          }
+          setTask(current);
+          if (current.status === 'done') setDlMessage('任务已完成，可取回文件。');
+          if (current.status === 'failed') setDlMessage('任务已失败，可再次重试。');
+        }
+        return;
+      }
+      if (res.ok && typeof data.taskId === 'number') {
         setTask({
           id: data.taskId,
           bookId: detail.id,
@@ -280,35 +315,39 @@ export default function LibraryTab() {
           error: null,
           updatedAt: '',
         });
+        setDlMessage(task ? '已重新加入下载队列。' : '已加入下载队列。');
         return;
       }
       throw new Error(data.error || '提交下载失败');
     } catch (e) {
-      setDlError(e instanceof Error ? e.message : '提交下载失败');
+      if (my === dlRequestId.current) setDlError(e instanceof Error ? e.message : '提交下载失败');
     } finally {
-      setDlBusy(false);
+      if (my === dlRequestId.current) setDlBusy(false);
     }
   }
 
   async function cancelDownload() {
-    if (!task) return;
+    if (!task || dlBusy) return;
+    const my = ++dlRequestId.current;
     setDlBusy(true);
     setDlError('');
+    setDlMessage('');
     try {
       const res = await apiFetch('/api/download', {
         method: 'DELETE',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ taskId: task.id }),
       });
+      if (my !== dlRequestId.current) return;
       if (!res.ok) {
         const data = await res.json().catch(() => ({}));
         throw new Error(data.error || '取消失败');
       }
       setTask(null);
     } catch (e) {
-      setDlError(e instanceof Error ? e.message : '取消失败');
+      if (my === dlRequestId.current) setDlError(e instanceof Error ? e.message : '取消失败');
     } finally {
-      setDlBusy(false);
+      if (my === dlRequestId.current) setDlBusy(false);
     }
   }
 
@@ -336,6 +375,7 @@ export default function LibraryTab() {
   const pageSize = 30;
   const totalPages = Math.max(1, Math.ceil(total / pageSize));
   const hasFilter = Boolean(search || category || tag || finish);
+  const taskNotes = task?.error?.split(/\r?\n/).map((line) => line.trim()).filter(Boolean) ?? [];
 
   function resetFilters() {
     setPage(1);
@@ -350,7 +390,7 @@ export default function LibraryTab() {
   if (detail) {
     return (
       <div>
-        <button className="chip text-sm mb-4" onClick={() => { setDetail(null); setTask(null); setDlError(''); }}>
+        <button className="chip text-sm mb-4" onClick={() => showDetail(null)}>
           ← 返回书库
         </button>
         <article className="book-card px-6 py-6">
@@ -390,28 +430,56 @@ export default function LibraryTab() {
             {dlError && (
               <p role="alert" className="text-xs mb-2" style={{ color: 'var(--cinnabar)' }}>✗ {dlError}</p>
             )}
+            {dlMessage && (
+              <p role="status" className="text-xs mb-2" style={{ color: 'var(--dai)' }}>{dlMessage}</p>
+            )}
             {task === null ? (
               <button className="seal-button text-sm" onClick={() => void startDownload()} disabled={dlBusy}>
                 {dlBusy ? '提交中…' : '⬇ 下载全书'}
               </button>
             ) : (
-              <div className="flex flex-wrap items-center gap-3">
-                <span
-                  role="status"
-                  className="text-sm"
-                  style={{ color: task.status === 'failed' ? 'var(--cinnabar)' : 'var(--ink-soft)' }}
-                >
-                  {downloadStatusText(task)}
-                </span>
-                {task.status === 'done' && (
-                  <button className="chip text-sm" onClick={() => void retrieveFile()}>
-                    取回文件
-                  </button>
-                )}
-                {task.status === 'pending' && (
-                  <button className="chip text-sm" onClick={() => void cancelDownload()} disabled={dlBusy}>
-                    取消
-                  </button>
+              <div className="space-y-3">
+                <div className="flex flex-wrap items-center gap-3">
+                  <span
+                    role="status"
+                    className="text-sm"
+                    style={{ color: task.status === 'failed' ? 'var(--cinnabar)' : 'var(--ink-soft)' }}
+                  >
+                    {downloadStatusText(task)}
+                  </span>
+                  {task.status === 'done' && (
+                    <button className="chip text-sm" onClick={() => void retrieveFile()}>
+                      取回文件
+                    </button>
+                  )}
+                  {(task.status === 'failed' || task.status === 'pending') && (
+                    <button
+                      className="chip chip-dai text-sm disabled:opacity-50"
+                      onClick={() => void startDownload()}
+                      disabled={dlBusy}
+                    >
+                      {dlBusy ? '处理中…' : '重试'}
+                    </button>
+                  )}
+                  {task.status === 'pending' && (
+                    <button className="chip text-sm" onClick={() => void cancelDownload()} disabled={dlBusy}>
+                      取消
+                    </button>
+                  )}
+                </div>
+                {taskNotes.length > 0 && (
+                  <div className="border-l-2 pl-3" style={{ borderColor: 'var(--line)' }}>
+                    <p className="text-xs font-bold mb-1" style={{ color: 'var(--ink-soft)' }}>
+                      {task.status === 'failed' ? '失败详情' : '抽验与提示'}
+                    </p>
+                    <ul
+                      className="list-disc pl-4 space-y-1 text-xs leading-6 break-words"
+                      aria-label="下载任务说明"
+                      style={{ color: task.status === 'failed' ? 'var(--cinnabar)' : 'var(--ink-soft)' }}
+                    >
+                      {taskNotes.map((line, index) => <li key={index}>{line}</li>)}
+                    </ul>
+                  </div>
                 )}
               </div>
             )}
@@ -534,13 +602,11 @@ export default function LibraryTab() {
               tabIndex={0}
               className="group flex flex-col gap-1 rounded-[3px] border border-dashed px-3 py-2.5 text-left transition-colors hover:border-solid hover:bg-[var(--paper-deep)] focus-visible:outline focus-visible:outline-2 focus-visible:outline-[var(--cinnabar)]"
               style={{ borderColor: 'var(--line)' }}
-              onClick={() => { setDetail(b); setTask(null); setDlError(''); }}
+              onClick={() => showDetail(b)}
               onKeyDown={(e) => {
                 if (e.key === 'Enter' || e.key === ' ') {
                   e.preventDefault();
-                  setDetail(b);
-                  setTask(null);
-                  setDlError('');
+                  showDetail(b);
                 }
               }}
             >
