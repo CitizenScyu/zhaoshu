@@ -4,17 +4,25 @@ export const READER_SETTINGS_KEY = 'novel-finder-reading-settings';
 export const readingProgressKey = (taskId: number) => `novel-finder-reading-progress-${taskId}`;
 
 export type ReaderTheme = 'day' | 'night' | 'sage';
+export type ReaderFont = 'wenkai' | 'serif' | 'sans';
+export type ReaderWidth = 'narrow' | 'standard' | 'wide';
 
 export interface ReaderSettings {
   fontSize: number;
   lineHeight: number;
   theme: ReaderTheme;
+  font: ReaderFont;
+  width: ReaderWidth;
+  continuous: boolean;
+  preloadNext: boolean;
 }
 
 export interface ReadingPosition {
   chapterIndex: number;
   partIndex: number;
   ratio: number;
+  textOffset?: number;
+  viewportOffset?: number;
 }
 
 export interface ReadingProgress extends ReadingPosition {
@@ -23,7 +31,10 @@ export interface ReadingProgress extends ReadingPosition {
   updatedAt: number;
 }
 
-export const DEFAULT_READER_SETTINGS: ReaderSettings = { fontSize: 20, lineHeight: 1.9, theme: 'day' };
+export const DEFAULT_READER_SETTINGS: ReaderSettings = {
+  fontSize: 20, lineHeight: 1.9, theme: 'day', font: 'wenkai', width: 'standard',
+  continuous: true, preloadNext: true,
+};
 
 function parseObject(raw: string | null): Record<string, unknown> | null {
   try {
@@ -43,6 +54,10 @@ export function parseReaderSettings(raw: string | null): ReaderSettings {
     lineHeight: typeof value?.lineHeight === 'number' && [1.6, 1.9, 2.2].includes(value.lineHeight)
       ? value.lineHeight : DEFAULT_READER_SETTINGS.lineHeight,
     theme: value?.theme === 'night' || value?.theme === 'sage' ? value.theme : 'day',
+    font: value?.font === 'serif' || value?.font === 'sans' ? value.font : 'wenkai',
+    width: value?.width === 'narrow' || value?.width === 'wide' ? value.width : 'standard',
+    continuous: typeof value?.continuous === 'boolean' ? value.continuous : true,
+    preloadNext: typeof value?.preloadNext === 'boolean' ? value.preloadNext : true,
   };
 }
 
@@ -63,6 +78,10 @@ export function parseReadingProgress(raw: string | null, index: ReaderIndex): Re
     chapterIndex,
     partIndex,
     ratio: Math.max(0, Math.min(1, value.ratio)),
+    ...(typeof value.textOffset === 'number' && Number.isSafeInteger(value.textOffset)
+      && value.textOffset >= 0 && value.textOffset <= 32768
+      && typeof value.viewportOffset === 'number' && Number.isFinite(value.viewportOffset)
+      ? { textOffset: value.textOffset, viewportOffset: Math.max(-256, Math.min(256, value.viewportOffset)) } : {}),
     updatedAt: value.updatedAt,
   };
 }

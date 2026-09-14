@@ -19,11 +19,20 @@ describe('reader preferences and resume positions', () => {
 
   it('bounds font sizes, validates line spacing, and ignores arbitrary theme names', () => {
     expect(parseReaderSettings('{"fontSize":200,"lineHeight":0,"theme":"url(evil)"}'))
-      .toEqual({ fontSize: 30, lineHeight: 1.9, theme: 'day' });
+      .toEqual({ ...DEFAULT_READER_SETTINGS, fontSize: 30, lineHeight: 1.9, theme: 'day' });
     expect(parseReaderSettings('{"fontSize":10,"lineHeight":2.2,"theme":"night"}'))
-      .toEqual({ fontSize: 16, lineHeight: 2.2, theme: 'night' });
+      .toEqual({ ...DEFAULT_READER_SETTINGS, fontSize: 16, lineHeight: 2.2, theme: 'night' });
     expect(parseReaderSettings('{"fontSize":22,"lineHeight":1.6,"theme":"sage"}'))
-      .toEqual({ fontSize: 22, lineHeight: 1.6, theme: 'sage' });
+      .toEqual({ ...DEFAULT_READER_SETTINGS, fontSize: 22, lineHeight: 1.6, theme: 'sage' });
+  });
+
+  it('preserves typography and explicit opt-outs while extending older settings', () => {
+    expect(parseReaderSettings('{"font":"serif","width":"wide","continuous":false,"preloadNext":false}'))
+      .toEqual({ ...DEFAULT_READER_SETTINGS, font: 'serif', width: 'wide', continuous: false, preloadNext: false });
+    expect(parseReaderSettings('{"fontSize":24,"theme":"night"}'))
+      .toEqual({ ...DEFAULT_READER_SETTINGS, fontSize: 24, theme: 'night' });
+    expect(parseReaderSettings('{"font":"url(evil)","width":999,"continuous":"false","preloadNext":0}'))
+      .toEqual(DEFAULT_READER_SETTINGS);
   });
 
   it('resumes the exact chapter, section, and relative scroll position', () => {
@@ -43,6 +52,17 @@ describe('reader preferences and resume positions', () => {
   it('clamps a saved scroll position when the viewport changes', () => {
     expect(parseReadingProgress(JSON.stringify({ ...saved, ratio: 1.1 }), index)?.ratio).toBe(1);
     expect(parseReadingProgress(JSON.stringify({ ...saved, ratio: -0.1 }), index)?.ratio).toBe(0);
+  });
+
+  it('restores an exact text anchor without invalidating legacy ratio-only records', () => {
+    const anchored = { ...saved, textOffset: 1200, viewportOffset: -8.5 };
+    expect(parseReadingProgress(JSON.stringify(anchored), index)).toEqual(anchored);
+    expect(parseReadingProgress(JSON.stringify(saved), index)).toEqual(saved);
+    expect(parseReadingProgress(JSON.stringify({ ...anchored, viewportOffset: 900 }), index)?.viewportOffset).toBe(256);
+  });
+
+  it.each([{ textOffset: -1 }, { textOffset: 32769 }, { textOffset: 1.5 }, { viewportOffset: '12' }])('falls back to ratio for a corrupt optional anchor: %j', (change) => {
+    expect(parseReadingProgress(JSON.stringify({ ...saved, textOffset: 1200, viewportOffset: 4, ...change }), index)).toEqual(saved);
   });
 
   it('weights progress by bytes and reaches 100% only at the end of the file', () => {
