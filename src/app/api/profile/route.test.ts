@@ -1,21 +1,27 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { NextRequest } from 'next/server';
+import type { ProfileSnapshot, SeedBook } from '@/lib/types';
 
 const mocks = vi.hoisted(() => ({
   ensureSchema: vi.fn(), getProfile: vi.fn(), saveProfile: vi.fn(), chatRobust: vi.fn(),
+  getSql: vi.fn(), upsertBook: vi.fn(), sql: vi.fn(), transaction: vi.fn(),
 }));
 vi.mock('@/lib/db', () => ({
   ensureSchema: mocks.ensureSchema, getProfile: mocks.getProfile, saveProfile: mocks.saveProfile,
+  getSql: mocks.getSql, upsertBook: mocks.upsertBook,
 }));
 vi.mock('@/lib/llm', async (importOriginal) => ({
   ...await importOriginal<typeof import('@/lib/llm')>(),
   chatRobust: mocks.chatRobust,
 }));
 import { LlmError } from '@/lib/llm';
-import { POST, PUT } from './route';
+import { GET, POST, PUT } from './route';
+import { POST as saveFeedback } from '../feedback/route';
 
-const seeds = [{ title: '测试书', author: '作者', kind: 'love' }];
-function request(method = 'POST', body?: unknown, signal?: AbortSignal) {
+const seeds: SeedBook[] = [{ title: '测试书', author: '作者', kind: 'love' }];
+const previousVersion = '2026-09-15 00:00:00.123456+00';
+const nextVersion = '2026-09-15 00:00:00.123457+00';
+function request(method = 'POST', body: unknown = { updatedAt: previousVersion }, signal?: AbortSignal) {
   return new NextRequest('http://localhost/api/profile', {
     method, signal, headers: { Authorization: 'Bearer profile-test-owner', 'Content-Type': 'application/json' },
     ...(body === undefined ? {} : { body: JSON.stringify(body) }),
@@ -27,9 +33,12 @@ describe('/api/profile writes', () => {
     vi.resetAllMocks();
     vi.stubEnv('APP_OWNER_TOKEN', 'profile-test-owner');
     mocks.ensureSchema.mockResolvedValue(undefined);
-    mocks.getProfile.mockResolvedValue({ seeds, content: '原画像', updatedAt: 'previous-version' });
-    mocks.saveProfile.mockResolvedValue(true);
+    mocks.getProfile.mockResolvedValue({ seeds, content: '原画像', updatedAt: previousVersion });
+    mocks.saveProfile.mockResolvedValue(nextVersion);
     mocks.chatRobust.mockResolvedValue('  有效画像😀\n喜欢严谨设定  ');
+    mocks.getSql.mockReturnValue(Object.assign(mocks.sql, { transaction: mocks.transaction }));
+    mocks.upsertBook.mockResolvedValue(42);
+    mocks.transaction.mockResolvedValue([]);
   });
   afterEach(() => { vi.unstubAllEnvs(); vi.restoreAllMocks(); });
 
@@ -37,8 +46,8 @@ describe('/api/profile writes', () => {
     const req = request();
     const res = await POST(req);
     expect(res.status).toBe(200);
-    expect(await res.json()).toEqual({ content: '有效画像😀\n喜欢严谨设定' });
-    expect(mocks.saveProfile).toHaveBeenCalledWith(seeds, '有效画像😀\n喜欢严谨设定');
+    expect(await res.json()).toEqual({ seeds, content: '有效画像😀\n喜欢严谨设定', updatedAt: nextVersion });
+    expect(mocks.saveProfile).toHaveBeenCalledWith(seeds, '有效画像😀\n喜欢严谨设定', previousVersion);
     expect(mocks.chatRobust.mock.calls[0][2].signal).toBe(req.signal);
   });
 
@@ -74,7 +83,7 @@ describe('/api/profile writes', () => {
 
   it.each(['bad' + String.fromCharCode(0), '\ud800', '\udc00'])(
     'rejects illegal manual body text before touching the database %#', async (content) => {
-      const res = await PUT(request('PUT', { seeds, content }));
+      const res = await PUT(request('PUT', { seeds, content, updatedAt: previousVersion }));
       expect(res.status).toBe(400);
       expect(await res.json()).toEqual({ error: 'content contains invalid characters' });
       expect(mocks.ensureSchema).not.toHaveBeenCalled();
@@ -83,7 +92,139 @@ describe('/api/profile writes', () => {
   );
 
   it('retains the manual empty-profile contract', async () => {
-    expect((await PUT(request('PUT', { seeds, content: '' }))).status).toBe(200);
-    expect(mocks.saveProfile).toHaveBeenCalledWith(seeds, '');
+    expect((await PUT(request('PUT', { seeds, content: '', updatedAt: previousVersion }))).status).toBe(200);
+    expect(mocks.saveProfile).toHaveBeenCalledWith(seeds, '', previousVersion);
+  });
+
+  it('returns the raw database version on GET without losing microseconds', async () => {
+    const res = await GET(new NextRequest('http://localhost/api/profile', {
+      headers: { Authorization: 'Bearer profile-test-owner' },
+    }));
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ seeds, content: '原画像', updatedAt: previousVersion });
+  });
+
+  it.each([undefined, null, false, 42, '', ' ', 'v'.repeat(129), 'bad\u0000', '\ud800'])(
+    'rejects a missing or invalid version before database/model access %#', async (updatedAt) => {
+      for (const method of ['PUT', 'POST']) {
+        const res = await (method === 'PUT' ? PUT : POST)(request(method, { seeds, updatedAt }));
+        expect(res.status).toBe(400);
+        expect((await res.json()).code).toBe('PROFILE_VERSION_REQUIRED');
+      }
+      expect(mocks.ensureSchema).not.toHaveBeenCalled();
+      expect(mocks.getProfile).not.toHaveBeenCalled();
+      expect(mocks.saveProfile).not.toHaveBeenCalled();
+      expect(mocks.chatRobust).not.toHaveBeenCalled();
+    },
+  );
+
+  it('requires a body for generation and bounds it before any database access', async () => {
+    const headers = { Authorization: 'Bearer profile-test-owner' };
+    const noBody = await POST(new NextRequest('http://localhost/api/profile', { method: 'POST', headers }));
+    expect(noBody.status).toBe(400);
+    const oversized = await POST(new NextRequest('http://localhost/api/profile', {
+      method: 'POST', headers, body: 'x'.repeat(64 * 1024 + 1),
+    }));
+    expect(oversized.status).toBe(413);
+    expect((await oversized.json()).code).toBe('BODY_TOO_LARGE');
+    expect(mocks.ensureSchema).not.toHaveBeenCalled();
+  });
+
+  it('saves sanitized seeds with the previously read content and returns the new version', async () => {
+    const res = await PUT(request('PUT', {
+      seeds: [{ title: ' 测试书 ', author: ' 作者 ', kind: 'love' }], updatedAt: previousVersion,
+    }));
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ ok: true, seeds, content: '原画像', updatedAt: nextVersion });
+    expect(mocks.saveProfile).toHaveBeenCalledWith(seeds, '原画像', previousVersion);
+  });
+
+  it.each(['PUT', 'POST'])('rejects an already stale %s without writing or calling the model', async (method) => {
+    const latest = { seeds: [{ title: '新书', kind: 'drop' }], content: '他人的更新', updatedAt: nextVersion };
+    mocks.getProfile.mockResolvedValue(latest);
+    const res = await (method === 'PUT' ? PUT : POST)(request(method, {
+      seeds, content: '我的修订', updatedAt: previousVersion,
+    }));
+    expect(res.status).toBe(409);
+    expect(await res.json()).toEqual({
+      error: expect.any(String), code: 'PROFILE_CONFLICT', profile: latest,
+      ...(method === 'PUT' ? { draft: { seeds, content: '我的修订' } } : {}),
+    });
+    expect(mocks.saveProfile).not.toHaveBeenCalled();
+    expect(mocks.chatRobust).not.toHaveBeenCalled();
+  });
+
+  it('allows only one of two saves based on the same version', async () => {
+    let current: ProfileSnapshot = { seeds, content: '原画像', updatedAt: previousVersion };
+    mocks.getProfile.mockImplementation(async () => structuredClone(current));
+    mocks.saveProfile.mockImplementation(async (nextSeeds, content, expected) => {
+      if (current.updatedAt !== expected) return null;
+      current = { seeds: nextSeeds, content, updatedAt: nextVersion };
+      return nextVersion;
+    });
+    const responses = await Promise.all(['窗口 A', '窗口 B'].map((content) =>
+      PUT(request('PUT', { seeds, content, updatedAt: previousVersion }))));
+    expect(responses.map((res) => res.status).sort()).toEqual([200, 409]);
+    const success = await responses.find((res) => res.status === 200)!.json();
+    const rejected = await responses.find((res) => res.status === 409)!.json();
+    expect(success).toEqual({ ok: true, ...current });
+    expect(rejected.profile).toEqual(current);
+    expect(rejected.draft.content).not.toBe(current.content);
+    expect(mocks.saveProfile).toHaveBeenCalledTimes(2);
+    expect(mocks.saveProfile.mock.calls.every((call) => call[2] === previousVersion)).toBe(true);
+  });
+
+  it.each(['manual', 'feedback'])('preserves a %s update made while generation is waiting', async (writer) => {
+    let current: ProfileSnapshot = { seeds, content: '原画像', updatedAt: previousVersion };
+    mocks.getProfile.mockImplementation(async () => structuredClone(current));
+    mocks.saveProfile.mockImplementation(async (nextSeeds, content, expected) => {
+      if (current.updatedAt !== expected) return null;
+      current = { seeds: nextSeeds, content, updatedAt: nextVersion };
+      return nextVersion;
+    });
+    let finishGeneration!: (value: string) => void;
+    let started!: () => void;
+    const modelStarted = new Promise<void>((resolve) => { started = resolve; });
+    mocks.chatRobust.mockImplementationOnce(() => {
+      started();
+      return new Promise<string>((resolve) => { finishGeneration = resolve; });
+    });
+    const generation = POST(request());
+    await modelStarted;
+    const newSeeds = [{ title: '新种子', kind: 'drop' }];
+    const saved = writer === 'manual'
+      ? await PUT(request('PUT', { seeds: newSeeds, content: '人工新画像', updatedAt: previousVersion }))
+      : await saveFeedback(new NextRequest('http://localhost/api/feedback', {
+        method: 'POST', headers: { Authorization: 'Bearer profile-test-owner' },
+        body: JSON.stringify({ title: '反馈书', status: 'done', note: '喜欢严谨设定' }),
+      }));
+    expect(saved.status).toBe(200);
+    const winner = structuredClone(current);
+    finishGeneration('本次生成稿');
+    const res = await generation;
+    expect(res.status).toBe(409);
+    expect(await res.json()).toEqual({
+      error: expect.any(String), code: 'PROFILE_CONFLICT', profile: winner,
+      draft: { seeds, content: '本次生成稿' },
+    });
+    expect(current).toEqual(winner);
+    expect(current.seeds).toEqual(writer === 'manual' ? newSeeds : seeds);
+    expect(mocks.chatRobust).toHaveBeenCalledTimes(writer === 'manual' ? 1 : 2);
+    expect(mocks.saveProfile.mock.calls.every((call) => call[2] === previousVersion)).toBe(true);
+  });
+
+  it('still returns a recoverable generated draft when reloading a conflict fails', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    mocks.getProfile.mockResolvedValueOnce({ seeds, content: '原画像', updatedAt: previousVersion })
+      .mockRejectedValueOnce(new Error('temporary database error'));
+    mocks.saveProfile.mockResolvedValue(null);
+    const res = await POST(request());
+    expect(res.status).toBe(409);
+    expect(await res.json()).toEqual({
+      error: expect.any(String), code: 'PROFILE_CONFLICT', profile: null,
+      draft: { seeds, content: '有效画像😀\n喜欢严谨设定' },
+    });
+    expect(mocks.chatRobust).toHaveBeenCalledOnce();
+    expect(mocks.saveProfile).toHaveBeenCalledOnce();
   });
 });

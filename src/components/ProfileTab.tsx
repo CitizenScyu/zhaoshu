@@ -1,13 +1,14 @@
 'use client';
 
 import { useEffect, useRef, useState } from 'react';
-import type { SeedBook } from '@/lib/types';
+import type { ProfileSnapshot, SeedBook } from '@/lib/types';
 import { useOwner } from '@/components/OwnerProvider';
 
 export default function ProfileTab() {
   const { apiFetch } = useOwner();
   const [seeds, setSeeds] = useState<SeedBook[]>([]);
   const [content, setContent] = useState('');
+  const [updatedAt, setUpdatedAt] = useState('');
   const [editing, setEditing] = useState(false);
   const [seedEditing, setSeedEditing] = useState(false);
   const [draft, setDraft] = useState('');
@@ -39,6 +40,7 @@ export default function ProfileTab() {
       setSeeds(data.seeds ?? []);
       setSeedEditing(!(data.seeds && data.seeds.length > 0));
       setContent(data.content ?? '');
+      setUpdatedAt(data.updatedAt ?? '');
     }).catch((error) => {
       if (!controller.signal.aborted) {
         setLoadError(error instanceof Error ? error.message : '读取画像失败，请重试');
@@ -53,6 +55,12 @@ export default function ProfileTab() {
     setSeeds((s) => s.map((x, j) => (j === i ? { ...x, ...patch } : x)));
   }
 
+  function acceptSaved(profile: ProfileSnapshot) {
+    setSeeds(profile.seeds);
+    setContent(profile.content);
+    setUpdatedAt(profile.updatedAt);
+  }
+
   async function saveSeeds() {
     if (loading || loadError || busy) return;
     setBusy(true);
@@ -61,11 +69,14 @@ export default function ProfileTab() {
       const res = await apiFetch('/api/profile', {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ seeds }),
+        body: JSON.stringify({ seeds, updatedAt }),
       });
       const data = await res.json().catch(() => ({}));
       setMsg(res.ok ? '✓ 种子已保存' : `✗ ${data.error || '保存失败'}`);
-      if (res.ok) setSeedEditing(false);
+      if (res.ok) {
+        acceptSaved(data);
+        setSeedEditing(false);
+      }
     } catch (error) {
       setMsg(`✗ ${error instanceof Error ? error.message : '保存失败，请重试'}`);
     } finally {
@@ -81,20 +92,29 @@ export default function ProfileTab() {
       const saveRes = await apiFetch('/api/profile', {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ seeds }),
+        body: JSON.stringify({ seeds, updatedAt }),
       });
       const saveData = await saveRes.json().catch(() => ({}));
       if (!saveRes.ok) {
         setMsg(`✗ ${saveData.error || '保存种子失败'}`);
         return;
       }
-      const res = await apiFetch('/api/profile', { method: 'POST' });
+      acceptSaved(saveData);
+      const res = await apiFetch('/api/profile', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ updatedAt: saveData.updatedAt }),
+      });
       const d = await res.json();
       if (res.ok) {
-        setContent(d.content);
+        acceptSaved(d);
         setMsg('✓ 画像已生成');
         if (seeds.length > 0) setSeedEditing(false);
       } else {
+        if (res.status === 409 && typeof d.draft?.content === 'string') {
+          setDraft(d.draft.content);
+          setEditing(true);
+        }
         setMsg(`✗ ${d.error || '生成失败'}`);
       }
     } catch (error) {
@@ -112,14 +132,14 @@ export default function ProfileTab() {
       const res = await apiFetch('/api/profile', {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ seeds, content: draft }),
+        body: JSON.stringify({ seeds, content: draft, updatedAt }),
       });
+      const data = await res.json().catch(() => ({}));
       if (res.ok) {
-        setContent(draft);
+        acceptSaved(data);
         setEditing(false);
         setMsg('✓ 已保存');
       } else {
-        const data = await res.json().catch(() => ({}));
         setMsg(`✗ ${data.error || '保存失败'}`);
       }
     } catch (error) {

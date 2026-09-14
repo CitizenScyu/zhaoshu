@@ -30,6 +30,9 @@ vi.mock('@/lib/llm', async (importOriginal) => ({
 import { LlmError } from '@/lib/llm';
 import { POST } from './route';
 
+const previousVersion = '2026-09-15 00:00:00.123456+00';
+const nextVersion = '2026-09-15 00:00:00.123457+00';
+
 function request(status: string, note: string) {
   return new NextRequest('http://localhost/api/feedback', {
     method: 'POST',
@@ -46,9 +49,9 @@ describe('POST /api/feedback note contract', () => {
     mocks.getSql.mockReturnValue(Object.assign(mocks.sql, { transaction: mocks.transaction }));
     mocks.upsertBook.mockResolvedValue(42);
     mocks.transaction.mockResolvedValue([]);
-    mocks.getProfile.mockResolvedValue({ seeds: [], content: '原画像', updatedAt: 'previous-version' });
+    mocks.getProfile.mockResolvedValue({ seeds: [], content: '原画像', updatedAt: previousVersion });
     mocks.chatRobust.mockResolvedValue('更新后的画像');
-    mocks.saveProfile.mockResolvedValue(true);
+    mocks.saveProfile.mockResolvedValue(nextVersion);
   });
 
   afterEach(() => {
@@ -62,13 +65,13 @@ describe('POST /api/feedback note contract', () => {
     const res = await POST(request('dropped', note));
 
     expect(res.status).toBe(200);
-    expect(await res.json()).toEqual({ ok: true, profileUpdated: true });
+    expect(await res.json()).toEqual({ ok: true, profileUpdated: true, updatedAt: nextVersion });
     const insert = mocks.sql.mock.results.find((result) => result.value.text.includes('INSERT INTO feedback'));
     expect(insert?.value.values).toEqual([42, 'dropped', note]);
     expect(mocks.chatRobust.mock.calls[0][1]).toContain(JSON.stringify({
       title: '测试书', author: '作者', status: 'dropped', note,
     }));
-    expect(mocks.saveProfile).toHaveBeenCalledWith([], '更新后的画像', 'previous-version');
+    expect(mocks.saveProfile).toHaveBeenCalledWith([], '更新后的画像', previousVersion);
   });
 
   it.each(['done', 'dropped'])('records an empty note for %s while retaining the status and profile', async (status) => {
@@ -142,5 +145,15 @@ describe('POST /api/feedback note contract', () => {
     expect(await res.json()).toEqual({ ok: true, profileUpdated: false });
     expect(mocks.chatRobust.mock.calls[0][2].signal.aborted).toBe(true);
     expect(mocks.saveProfile).not.toHaveBeenCalled();
+  });
+
+  it('keeps the recorded feedback when another writer wins and never retries the model', async () => {
+    mocks.saveProfile.mockResolvedValue(null);
+    const res = await POST(request('done', '喜欢严谨设定'));
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ ok: true, profileUpdated: false });
+    expect(mocks.transaction).toHaveBeenCalledOnce();
+    expect(mocks.saveProfile).toHaveBeenCalledExactlyOnceWith([], '更新后的画像', previousVersion);
+    expect(mocks.chatRobust).toHaveBeenCalledOnce();
   });
 });

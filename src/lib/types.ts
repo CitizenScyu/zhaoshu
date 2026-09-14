@@ -6,6 +6,13 @@ export interface SeedBook {
   reason?: string; // 为什么爱 / 为什么弃
 }
 
+// updatedAt 是数据库返回的原始版本字符串，不能经 Date 转换而丢失微秒精度。
+export interface ProfileSnapshot {
+  seeds: SeedBook[];
+  content: string;
+  updatedAt: string;
+}
+
 // LLM 召回的候选书
 export interface Candidate {
   title: string;

@@ -50,6 +50,7 @@ export async function POST(req: NextRequest) {
 
     // 有信息量的反馈 → 回写画像（失败不阻断）
     let profileUpdated = false;
+    let updatedAt: string | null = null;
     if ((shelfStatus === 'done' || shelfStatus === 'dropped') && safeNote) {
       try {
         const profile = await getProfile();
@@ -66,13 +67,14 @@ export async function POST(req: NextRequest) {
           );
           if (req.signal.aborted) throw new LlmError('模型调用已取消。', false);
           const content = validateProfileContent(updated);
-          profileUpdated = await saveProfile(profile.seeds, content, profile.updatedAt);
+          updatedAt = await saveProfile(profile.seeds, content, profile.updatedAt);
+          profileUpdated = updatedAt !== null;
         }
       } catch (e) {
         console.error('profile update failed:', e);
       }
     }
-    return NextResponse.json({ ok: true, profileUpdated });
+    return NextResponse.json({ ok: true, profileUpdated, ...(updatedAt ? { updatedAt } : {}) });
   } catch (e) {
     console.error(e);
     return NextResponse.json({ error: 'internal error' }, { status: 500 });

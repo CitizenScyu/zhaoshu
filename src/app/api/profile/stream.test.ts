@@ -13,6 +13,8 @@ const token = (content: string) => event({ choices: [{ delta: { content } }] });
 const finish = (reason: string) => event({ choices: [{ delta: {}, finish_reason: reason }] });
 const fetchMock = vi.fn<typeof fetch>();
 const seeds = [{ title: '测试书', kind: 'love' }];
+const previousVersion = '2026-09-15 00:00:00.123456+00';
+const nextVersion = '2026-09-15 00:00:00.123457+00';
 
 function request(route: string, signal?: AbortSignal) {
   return new NextRequest('http://localhost/api/' + route, {
@@ -20,7 +22,7 @@ function request(route: string, signal?: AbortSignal) {
     headers: { Authorization: 'Bearer stream-test-owner', 'Content-Type': 'application/json' },
     ...(route === 'feedback' ? { body: JSON.stringify({
       title: '测试书', author: '作者', status: 'done', note: '喜欢世界观',
-    }) } : {}),
+    }) } : { body: JSON.stringify({ updatedAt: previousVersion }) }),
   });
 }
 
@@ -35,8 +37,8 @@ describe('actual SSE failure cannot overwrite a profile', () => {
     vi.stubGlobal('fetch', fetchMock);
     vi.spyOn(console, 'error').mockImplementation(() => {});
     mocks.ensureSchema.mockResolvedValue(undefined);
-    mocks.getProfile.mockResolvedValue({ seeds, content: '原画像', updatedAt: 'original-version' });
-    mocks.saveProfile.mockResolvedValue(true);
+    mocks.getProfile.mockResolvedValue({ seeds, content: '原画像', updatedAt: previousVersion });
+    mocks.saveProfile.mockResolvedValue(nextVersion);
     mocks.upsertBook.mockResolvedValue(42);
     mocks.getSql.mockReturnValue(Object.assign(mocks.sql, { transaction: mocks.transaction }));
     mocks.transaction.mockResolvedValue([]);
@@ -76,10 +78,10 @@ describe('actual SSE failure cannot overwrite a profile', () => {
       .mockResolvedValueOnce(new Response(token('完整更新画像') + finish('stop')));
     const profile = await import('./route');
     const feedback = await import('../feedback/route');
-    expect(await (await profile.POST(request('profile'))).json()).toEqual({ content: '完整生成画像' });
-    expect(await (await feedback.POST(request('feedback'))).json()).toEqual({ ok: true, profileUpdated: true });
+    expect(await (await profile.POST(request('profile'))).json()).toEqual({ seeds, content: '完整生成画像', updatedAt: nextVersion });
+    expect(await (await feedback.POST(request('feedback'))).json()).toEqual({ ok: true, profileUpdated: true, updatedAt: nextVersion });
     expect(mocks.saveProfile.mock.calls).toEqual([
-      [seeds, '完整生成画像'], [seeds, '完整更新画像', 'original-version'],
+      [seeds, '完整生成画像', previousVersion], [seeds, '完整更新画像', previousVersion],
     ]);
   });
 

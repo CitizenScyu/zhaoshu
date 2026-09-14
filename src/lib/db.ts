@@ -1,5 +1,5 @@
 import { neon } from '@neondatabase/serverless';
-import type { RerankedItem } from '@/lib/types';
+import type { ProfileSnapshot, RerankedItem } from '@/lib/types';
 
 const DATABASE_URL = process.env.DATABASE_URL;
 
@@ -140,15 +140,11 @@ async function createSchema() {
   await s`INSERT INTO shuyuan_meta (id) VALUES (1) ON CONFLICT (id) DO NOTHING`;
 }
 
-export async function getProfile(): Promise<{
-  seeds: SeedJson[];
-  content: string;
-  updatedAt: string;
-}> {
+export async function getProfile(): Promise<ProfileSnapshot> {
   const s = getSql();
   const rows = (await s`
     SELECT seeds, content, updated_at::text AS updated_at FROM profile WHERE id = 1`) as {
-    seeds: SeedJson[];
+    seeds: ProfileSnapshot['seeds'];
     content: string;
     updated_at: string;
   }[];
@@ -165,21 +161,20 @@ export async function getProfile(): Promise<{
 export async function saveProfile(
   seeds: unknown,
   content: string,
-  expectedUpdatedAt?: string,
-): Promise<boolean> {
+  expectedUpdatedAt: string,
+): Promise<string | null> {
+  if (typeof expectedUpdatedAt !== 'string' || !expectedUpdatedAt.trim()) {
+    throw new Error('profile version is required');
+  }
   const s = getSql();
-  const rows = expectedUpdatedAt
-    ? await s`
-        UPDATE profile
-        SET seeds = ${JSON.stringify(seeds)}::jsonb, content = ${content}, updated_at = now()
-        WHERE id = 1 AND updated_at = ${expectedUpdatedAt}::timestamptz
-        RETURNING id` as Record<string, unknown>[]
-    : await s`
-        UPDATE profile
-        SET seeds = ${JSON.stringify(seeds)}::jsonb, content = ${content}, updated_at = now()
-        WHERE id = 1
-        RETURNING id` as Record<string, unknown>[];
-  return rows.length > 0;
+  // 同一条 UPDATE 同时比较并写入；即使时钟回拨或两个写入落在同一微秒，版本也前进。
+  const rows = await s`
+    UPDATE profile
+    SET seeds = ${JSON.stringify(seeds)}::jsonb, content = ${content},
+        updated_at = GREATEST(clock_timestamp(), updated_at + interval '1 microsecond')
+    WHERE id = 1 AND updated_at::text = ${expectedUpdatedAt}
+    RETURNING updated_at::text AS updated_at` as { updated_at: string }[];
+  return rows[0]?.updated_at ?? null;
 }
 
 export async function getExcludedBookKeys(): Promise<string[]> {
@@ -240,8 +235,6 @@ export async function persistRecommendations(
 function canonicalBookKey(title: string, author: string): string {
   return `${title.normalize('NFKC').trim().toLocaleLowerCase()} ${author.normalize('NFKC').trim().toLocaleLowerCase()}`;
 }
-
-type SeedJson = { title: string; author?: string; kind: string; reason?: string };
 
 export async function upsertBook(b: {
   title: string;
