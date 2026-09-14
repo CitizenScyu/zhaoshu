@@ -2,7 +2,7 @@
 
 import Link from 'next/link';
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
-import type { CSSProperties, ReactNode } from 'react';
+import type { CSSProperties, FormEvent, ReactNode } from 'react';
 import { OwnerProvider, useOwner } from '@/components/OwnerProvider';
 import type { ReaderIndex, ReaderPart } from '@/lib/reader-types';
 import {
@@ -63,8 +63,25 @@ function ReaderGate(props: Props) {
 }
 
 function AccessForm({ from, message }: Pick<Props, 'from'> & { message?: string }) {
-  const { setToken } = useOwner();
+  const { submitToken } = useOwner();
   const [draft, setDraft] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+
+  async function unlock(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (busy || !draft.trim()) return;
+    setBusy(true);
+    setError('');
+    try {
+      await submitToken(draft);
+    } catch (error) {
+      setError(error instanceof Error ? error.message : '口令验证失败，请稍后重试');
+    } finally {
+      setBusy(false);
+    }
+  }
+
   return (
     <div className={styles.access}>
       <BackLink from={from} />
@@ -72,11 +89,11 @@ function AccessForm({ from, message }: Pick<Props, 'from'> & { message?: string 
         <span className="seal w-12 h-12 text-lg" aria-hidden="true">书径</span>
         <h1>推门，入书中</h1>
         <p>输入站点访问口令，继续阅读。</p>
-        {message && <p role="alert" className={styles.errorText}>{message}</p>}
-        <form onSubmit={(event) => { event.preventDefault(); if (draft.trim()) setToken(draft); }}>
+        {(error || message) && <p id="reader-owner-error" role="alert" className={styles.errorText}>{error || message}</p>}
+        <form onSubmit={unlock}>
           <label htmlFor="reader-owner-token">访问口令</label>
-          <input id="reader-owner-token" className={styles.input} type="password" autoComplete="current-password" value={draft} onChange={(event) => setDraft(event.target.value)} required />
-          <button className={styles.primary} type="submit" disabled={!draft.trim()}>开始阅读 →</button>
+          <input id="reader-owner-token" className={styles.input} type="password" autoComplete="current-password" value={draft} onChange={(event) => { setDraft(event.target.value); setError(''); }} disabled={busy} aria-invalid={Boolean(error || message) || undefined} aria-describedby={error || message ? 'reader-owner-error' : undefined} required />
+          <button className={styles.primary} type="submit" disabled={busy || !draft.trim()}>{busy ? '验证中…' : '开始阅读 →'}</button>
         </form>
       </div>
     </div>

@@ -2,11 +2,13 @@ import { NextRequest, NextResponse } from 'next/server';
 import { requireApiOwner } from '@/lib/auth';
 import { ensureSchema, getSql } from '@/lib/db';
 import { isRecord } from '@/lib/sanitize';
+import { boundedPositiveInteger } from '@/lib/http';
 
 // 书库：读取批量打标入库的书（labeled_books），支持分类/流派/基调/完结筛选与排序
 export const maxDuration = 60;
 
 const PAGE_SIZE = 30;
+const MAX_PAGE = 10_000;
 
 interface LabeledBook {
   id: number;
@@ -39,7 +41,11 @@ export async function GET(req: NextRequest) {
   const unauthorized = requireApiOwner(req);
   if (unauthorized) return unauthorized;
   const { searchParams } = new URL(req.url);
-  const page = Math.max(1, Number(searchParams.get('page')) || 1);
+  const pageParam = searchParams.get('page');
+  const page = pageParam === null ? 1 : boundedPositiveInteger(pageParam, MAX_PAGE);
+  if (page === null) {
+    return NextResponse.json({ error: `page must be an integer from 1 to ${MAX_PAGE}`, code: 'INVALID_PAGE' }, { status: 400 });
+  }
   const query = (searchParams.get('q') || '').trim().slice(0, 100);
   const category = (searchParams.get('category') || '').trim().slice(0, 30);
   const tag = (searchParams.get('tag') || '').trim().slice(0, 30);
@@ -123,12 +129,13 @@ export async function GET(req: NextRequest) {
       total: countRows[0]?.total ?? 0,
       page,
       pageSize: PAGE_SIZE,
+      maxPage: MAX_PAGE,
       facets: {
         categories: catRows.map((r) => ({ name: r.category, count: r.n })),
         finishStates: finishRows.map((r) => ({ name: r.finish_status, count: r.n })),
       },
     });
   } catch {
-    return NextResponse.json({ error: 'internal error' }, { status: 500 });
+    return NextResponse.json({ error: 'internal error', code: 'DB_ERROR' }, { status: 500 });
   }
 }

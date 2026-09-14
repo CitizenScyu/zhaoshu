@@ -2,35 +2,9 @@
 
 import { useCallback, useEffect, useState } from 'react';
 import { useOwner } from '@/components/OwnerProvider';
+import type { StatsResponse as Stats } from '@/app/api/stats/route';
 
-// 与 /api/stats 的 StatsResponse 对应（tokens 占位除外，见下方 interface）
-interface Stats {
-  library: {
-    total: number;
-    withQuality: number;
-    avgQuality: number | null;
-    charsLabeled: number;
-    genres: { name: string; count: number }[];
-  };
-  download: {
-    total: number;
-    done: number;
-    chapters: number;
-    chars: number;
-  };
-  find: {
-    queries: number;
-    recommendations: number;
-  };
-  shelf: {
-    statuses: { name: string; count: number }[];
-  };
-  shuyuan: {
-    total: number;
-    active: number;
-  };
-  tokens: null;
-}
+const SECTION_NAMES = { library: '书库', download: '下载', find: '找书', shelf: '书架', shuyuan: '书源' };
 
 // 与 ShelfTab 的分组口径一致
 const SHELF_STATUS: Record<string, { label: string; color: string }> = {
@@ -42,7 +16,8 @@ const SHELF_STATUS: Record<string, { label: string; color: string }> = {
 };
 
 // 字数缩写：5540000 → 「554 万」、120000000 → 「1.2 亿」
-function formatChars(n: number): string {
+function formatChars(n: number | undefined): string {
+  if (n === undefined) return '不可用';
   if (!Number.isFinite(n) || n < 1e4) return String(Math.max(0, Math.round(n)));
   if (n < 1e8) {
     const wan = n / 1e4;
@@ -130,9 +105,11 @@ export default function StatsTab() {
       const res = await apiFetch('/api/stats', { signal });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || '统计加载失败');
+      if (signal?.aborted) return;
       setStats(data as Stats);
     } catch (e) {
       if (signal?.aborted) return;
+      setStats(null);
       setError(e instanceof Error ? e.message : '统计加载失败');
     } finally {
       if (!signal?.aborted) setLoading(false);
@@ -147,13 +124,20 @@ export default function StatsTab() {
     return () => controller.abort();
   }, [load]);
 
-  const shelfTotal = stats ? stats.shelf.statuses.reduce((sum, s) => sum + s.count, 0) : 0;
+  const shelfTotal = stats?.shelf ? stats.shelf.statuses.reduce((sum, s) => sum + s.count, 0) : null;
+  const unavailable = stats
+    ? (Object.keys(SECTION_NAMES) as (keyof typeof SECTION_NAMES)[])
+      .filter((key) => !stats.availability[key]).map((key) => SECTION_NAMES[key])
+    : [];
 
   return (
     <div>
       <div className="flex flex-wrap items-center gap-4">
         <h2 className="text-lg font-bold">统计</h2>
         <span className="chip text-xs">账本 · 战果</span>
+        <button type="button" className="chip text-xs" onClick={() => void load()} disabled={loading}>
+          {loading ? '读取中…' : '刷新统计'}
+        </button>
       </div>
       <p className="text-sm mt-2 leading-7" style={{ color: 'var(--ink-soft)' }}>
         书径运行以来的全部家底：收了多少书、打了多少字、找过多少次、下载了多少。
@@ -171,32 +155,38 @@ export default function StatsTab() {
 
       {stats && (
         <div className="mt-6 space-y-8">
+          {unavailable.length > 0 && (
+            <p role="status" className="text-sm" style={{ color: 'var(--cinnabar)' }}>
+              {unavailable.join('、')}统计暂不可用，可点击「刷新统计」重试。
+            </p>
+          )}
           {/* 核心战果 */}
           <dl className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
             <StatTile
               strong
               label="收书总数"
-              value={String(stats.library.total)}
-              unit="本"
-              note={`带质量分 ${stats.library.withQuality} 本`}
+              value={stats.library ? String(stats.library.total) : '不可用'}
+              unit={stats.library ? '本' : undefined}
+              note={stats.library ? `带质量分 ${stats.library.withQuality} 本` : '书库统计暂不可用'}
             />
             <StatTile
               label="累计打标字数"
-              value={formatChars(stats.library.charsLabeled)}
+              value={formatChars(stats.library?.charsLabeled)}
               note="批量打标读过的正文规模"
             />
             <StatTile
               label="找书次数"
-              value={String(stats.find.queries)}
-              unit="次"
-              note={`累计推荐 ${stats.find.recommendations} 本次`}
+              value={stats.find ? String(stats.find.queries) : '不可用'}
+              unit={stats.find ? '次' : undefined}
+              note={stats.find ? `累计推荐 ${stats.find.recommendations} 本次` : '找书统计暂不可用'}
             />
             <StatTile
               label="下载战果"
-              value={String(stats.download.done)}
-              unit="本"
+              value={stats.download ? String(stats.download.done) : '不可用'}
+              unit={stats.download ? '本' : undefined}
               note={
-                stats.download.done > 0
+                !stats.download ? '下载统计暂不可用'
+                : stats.download.done > 0
                   ? `${Math.round(stats.download.chapters).toLocaleString('zh-CN')} 章 · ${formatChars(stats.download.chars)}`
                   : stats.download.total > 0
                     ? `任务 ${stats.download.total} 个，尚无完成`
@@ -205,8 +195,8 @@ export default function StatsTab() {
             />
             <StatTile
               label="平均质量分"
-              value={stats.library.avgQuality !== null ? stats.library.avgQuality.toFixed(1) : '—'}
-              note={stats.library.avgQuality !== null ? `满分 10 · 已评 ${stats.library.withQuality} 本` : '还没有质量分'}
+              value={!stats.library ? '不可用' : stats.library.avgQuality !== null ? stats.library.avgQuality.toFixed(1) : '—'}
+              note={!stats.library ? '书库统计暂不可用' : stats.library.avgQuality !== null ? `满分 10 · 已评 ${stats.library.withQuality} 本` : '还没有质量分'}
             />
             <div className="book-card px-4 py-4 sm:px-5">
               <dt className="text-xs tracking-[0.2em]" style={{ color: 'var(--ink-faint)' }}>
@@ -229,10 +219,12 @@ export default function StatsTab() {
               <h3 id="stats-genres" className="text-sm font-bold mb-3">
                 分类分布
                 <span className="font-normal ml-2 text-xs" style={{ color: 'var(--ink-faint)' }}>
-                  书库 {stats.library.total} 本
+                  {stats.library ? `书库 ${stats.library.total} 本` : '统计不可用'}
                 </span>
               </h3>
-              {stats.library.genres.length > 0 ? (
+              {!stats.library ? (
+                <p className="text-sm" style={{ color: 'var(--cinnabar)' }}>书库分类统计暂不可用。</p>
+              ) : stats.library.genres.length > 0 ? (
                 <ul className="flex flex-wrap gap-2" aria-label="分类分布列表">
                   {stats.library.genres.map((g) => (
                     <li key={g.name} className="chip text-xs">
@@ -254,14 +246,16 @@ export default function StatsTab() {
               <h3 id="stats-shelf" className="text-sm font-bold mb-3">
                 书架状态分布
                 <span className="font-normal ml-2 text-xs" style={{ color: 'var(--ink-faint)' }}>
-                  共 {shelfTotal} 条
+                  {shelfTotal === null ? '统计不可用' : `共 ${shelfTotal} 条`}
                 </span>
               </h3>
-              {stats.shelf.statuses.length > 0 ? (
+              {!stats.shelf ? (
+                <p className="text-sm" style={{ color: 'var(--cinnabar)' }}>书架统计暂不可用。</p>
+              ) : stats.shelf.statuses.length > 0 ? (
                 <ul className="space-y-2" aria-label="书架状态分布列表">
                   {stats.shelf.statuses.map((s) => {
                     const meta = SHELF_STATUS[s.name] ?? { label: s.name, color: 'var(--ink-faint)' };
-                    const pct = shelfTotal > 0 ? Math.round((s.count / shelfTotal) * 100) : 0;
+                    const pct = shelfTotal && shelfTotal > 0 ? Math.round((s.count / shelfTotal) * 100) : 0;
                     return (
                       <li key={s.name} className="flex items-center gap-3 text-sm">
                         <span className="w-14 shrink-0" style={{ color: meta.color }}>{meta.label}</span>
@@ -292,7 +286,9 @@ export default function StatsTab() {
 
           {/* 书源一笔账 */}
           <p className="text-xs" style={{ color: 'var(--ink-faint)' }}>
-            另有书源 {stats.shuyuan.total} 个（可用 {stats.shuyuan.active}），供找书时做存在性验证与试读。
+            {stats.shuyuan
+              ? `另有书源资料 ${stats.shuyuan.total} 条（未停用 ${stats.shuyuan.active} 条），目前仅维护元数据，尚未接入找书验证或试读。`
+              : '书源统计暂不可用。'}
           </p>
         </div>
       )}

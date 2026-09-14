@@ -83,8 +83,8 @@ export default function ShuyuanTab() {
         )}
       </div>
       <p className="text-sm mt-2 leading-7" style={{ color: 'var(--ink-soft)' }}>
-        从 yckceo.com 拉取最新的书源合集（去重合并），供找书时做存在性验证与试读。
-        每天 04:00 自动更新一次，也可手动刷新；失效的书源会自动剔除出轮换。
+        从 yckceo.com 拉取书源合集并去重合并。目前仅维护书源资料（名称、规则和停用标记），尚未接入找书验证或试读。
+        计划每天自动更新一次，触发时间可能延迟；也可手动刷新。未停用不代表已通过实时可用性检测。
       </p>
 
       {error && (
@@ -101,8 +101,8 @@ export default function ShuyuanTab() {
         <div className="mt-6 space-y-4">
           <div className="flex flex-wrap gap-6 text-sm">
             <span>共 <b>{stats.total}</b> 个源</span>
-            <span style={{ color: 'var(--moss)' }}>可用 {stats.active}</span>
-            <span style={{ color: 'var(--ink-faint)' }}>失效 {stats.disabled}</span>
+            <span style={{ color: 'var(--moss)' }}>未停用 {stats.active}</span>
+            <span style={{ color: 'var(--ink-faint)' }}>已标记停用 {stats.disabled}</span>
           </div>
           {stats.collections.length > 0 ? (
             <div>

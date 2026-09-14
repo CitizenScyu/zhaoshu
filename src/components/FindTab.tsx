@@ -268,7 +268,7 @@ function BookCard({
       <div className="flex items-start gap-4">
         {/* 分数印章 */}
         <div
-          className={`seal-outline w-14 h-14 shrink-0 flex-col ${item.matchScore < 40 || suspicious ? 'opacity-60' : ''}`}
+          className={`seal-outline w-14 h-14 shrink-0 flex-col ${item.matchScore < 40 || suspicious ? 'border-dashed' : ''}`}
         >
           <span className="text-xl font-bold leading-none">{item.matchScore}</span>
           <span className="text-[10px] tracking-widest mt-0.5">匹配</span>
@@ -316,13 +316,13 @@ function BookCard({
 
           <p className="text-sm mt-2.5 leading-7" style={{ color: 'var(--ink-soft)' }}>
             <span style={{ color: 'var(--moss)' }}>荐</span>
-            <span className="mx-1.5" style={{ color: 'var(--line)' }}>|</span>
+            <span aria-hidden="true" className="mx-1.5" style={{ color: 'var(--line)' }}>|</span>
             {item.why || item.reason}
           </p>
           {item.risks && (
             <p className="text-sm mt-1.5 leading-7" style={{ color: 'var(--ink-soft)' }}>
               <span style={{ color: 'var(--cinnabar)' }}>险</span>
-              <span className="mx-1.5" style={{ color: 'var(--line)' }}>|</span>
+              <span aria-hidden="true" className="mx-1.5" style={{ color: 'var(--line)' }}>|</span>
               {item.risks}
             </p>
           )}

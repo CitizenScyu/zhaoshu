@@ -51,7 +51,7 @@ export async function POST(req: NextRequest) {
     body = await readJsonBody(req, MAX_BODY_BYTES);
   } catch (e) {
     if (e instanceof RequestBodyError) {
-      return NextResponse.json({ error: e.message }, { status: 413 });
+      return NextResponse.json({ error: e.message, code: e.code }, { status: 413 });
     }
     throw e;
   }

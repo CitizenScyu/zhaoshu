@@ -6,12 +6,12 @@
   --paper-card: #faf7ee;
   --ink: #2e2a23;
   --ink-soft: #5d5449;
-  --ink-faint: #8d8272;
-  --cinnabar: #b0392a;
-  --cinnabar-soft: #c9584a;
+  --ink-faint: #6b6153;
+  --cinnabar: #a93426;
+  --cinnabar-soft: #a6382a;
   --dai: #34566a;
-  --moss: #5a7247;
-  --gold: #9c7b34;
+  --moss: #4f653e;
+  --gold: #755c25;
   --line: #d8cfba;
 }
 
@@ -20,10 +20,12 @@ html {
 }
 
 button, input, textarea, select { letter-spacing: 0; }
-button, select { min-height: 44px; }
+button, select { min-width: 44px; min-height: 44px; }
 button { cursor: pointer; }
 button:disabled { cursor: not-allowed; }
 input, textarea { min-width: 0; max-width: 100%; }
+input:not([type='checkbox']):not([type='radio']) { min-height: 44px; }
+form { min-width: 0; max-width: 100%; }
 article, section { min-width: 0; overflow-wrap: anywhere; }
 :focus-visible { outline: 2px solid var(--dai); outline-offset: 3px; }
 
@@ -148,6 +150,9 @@ body {
   color: var(--ink);
   font-weight: 700;
 }
+.bookmark-tab:focus-visible {
+  box-shadow: inset 0 0 0 2px var(--dai);
+}
 .bookmark-tab.active::after {
   content: '';
   position: absolute;
@@ -174,8 +179,13 @@ body {
   border-color: var(--cinnabar);
   box-shadow: 0 0 0 3px rgba(176, 57, 42, 0.08);
 }
+.paper-input:focus-visible {
+  outline: 2px solid var(--dai);
+  outline-offset: 3px;
+}
 .paper-input::placeholder {
   color: var(--ink-faint);
+  opacity: 1;
 }
 
 .ink-button {
@@ -216,6 +226,8 @@ body {
 /* ---------- 标签 chips ---------- */
 .chip {
   display: inline-block;
+  max-width: 100%;
+  overflow-wrap: anywhere;
   padding: 2px 10px;
   border: 1px solid var(--line);
   border-radius: 999px;

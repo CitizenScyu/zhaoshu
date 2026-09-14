@@ -92,7 +92,7 @@ function parseTask(data: unknown): DownloadTask | null {
 
 function downloadStatusText(t: DownloadTask): string {
   switch (t.status) {
-    case 'pending': return '排队中，Actions 最多 5 分钟后开始';
+    case 'pending': return '排队中，等待下载任务开始';
     case 'running': return `下载中 ${t.chaptersDone}/${t.chaptersTotal} 章`;
     case 'done': return `完成，共 ${t.charsTotal} 字`;
     case 'failed': return t.error?.trim() ? '下载失败' : '下载失败：未知原因';
@@ -126,6 +126,7 @@ export default function LibraryTab() {
   const [facets, setFacets] = useState<Facets>({ categories: [], finishStates: [] });
   const [total, setTotal] = useState(0);
   const [page, setPage] = useState(1);
+  const [maxPage, setMaxPage] = useState(10_000);
   const [query, setQuery] = useState('');
   const [search, setSearch] = useState('');
   const [category, setCategory] = useState('');
@@ -143,6 +144,11 @@ export default function LibraryTab() {
   const [shelfBusy, setShelfBusy] = useState(0); // 当前正在加书架的书 id，0 表示空闲
   const reqId = useRef(0);
   const dlRequestId = useRef(0);
+  const detailEntries = useRef(new Map<number, HTMLButtonElement>());
+  const detailHeading = useRef<HTMLHeadingElement>(null);
+  const libraryHeading = useRef<HTMLHeadingElement>(null);
+  const returnLocation = useRef<{ id: number; scrollY: number } | null>(null);
+  const detailId = detail?.id ?? null;
 
   const updateTask = useCallback((next: DownloadTask | null) => {
     setTask(next);
@@ -156,6 +162,7 @@ export default function LibraryTab() {
   }, []);
 
   function showDetail(book: LibraryBook | null) {
+    if (book) returnLocation.current = { id: book.id, scrollY: window.scrollY };
     dlRequestId.current += 1;
     setDetail(book);
     setTask(null);
@@ -163,6 +170,18 @@ export default function LibraryTab() {
     setDlMessage('');
     setDlBusy(false);
   }
+
+  useEffect(() => {
+    if (detailId !== null) {
+      detailHeading.current?.focus();
+    } else if (returnLocation.current) {
+      const { id, scrollY } = returnLocation.current;
+      const entry = detailEntries.current.get(id) ?? libraryHeading.current;
+      entry?.focus({ preventScroll: true });
+      window.scrollTo(0, scrollY);
+      returnLocation.current = null;
+    }
+  }, [detailId]);
 
   const load = useCallback(async (p: number, q: string, cat: string, tg: string, fin: string, st: string, signal?: AbortSignal) => {
     const my = ++reqId.current;
@@ -179,6 +198,7 @@ export default function LibraryTab() {
       if (my !== reqId.current) return;
       setBooks(data.books);
       setTotal(data.total);
+      setMaxPage(data.maxPage ?? 10_000);
       setFacets(data.facets ?? { categories: [], finishStates: [] });
     } catch (e) {
       if (signal?.aborted || my !== reqId.current) return;
@@ -196,7 +216,6 @@ export default function LibraryTab() {
     return () => controller.abort();
   }, [load, page, search, category, tag, finish, sort]);
 
-  const detailId = detail?.id ?? null;
   const detailReadTaskId = detail?.readTaskId ?? null;
 
   // 进入详情页时查这本书有没有进行中/已完成的下载任务
@@ -388,7 +407,7 @@ export default function LibraryTab() {
   }
 
   const pageSize = 30;
-  const totalPages = Math.max(1, Math.ceil(total / pageSize));
+  const totalPages = Math.min(maxPage, Math.max(1, Math.ceil(total / pageSize)));
   const hasFilter = Boolean(search || category || tag || finish);
   const taskNotes = task?.error?.split(/\r?\n/).map((line) => line.trim()).filter(Boolean) ?? [];
 
@@ -410,7 +429,7 @@ export default function LibraryTab() {
         </button>
         <article className="book-card px-6 py-6">
           <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1">
-            <h2 className="text-xl font-bold">{detail.title}</h2>
+            <h2 ref={detailHeading} tabIndex={-1} className="text-xl font-bold">{detail.title}</h2>
             <span className="text-sm" style={{ color: 'var(--ink-faint)' }}>
               {detail.author} · {detail.category || detail.genre}
               {detail.finishStatus ? ` · ${detail.finishStatus}` : ''}
@@ -431,7 +450,7 @@ export default function LibraryTab() {
               return (
                 <p key={key} className="text-sm leading-7" style={{ color: 'var(--ink-soft)' }}>
                   <span className="font-bold" style={{ color: 'var(--ink)' }}>{label}</span>
-                  <span className="mx-1.5" style={{ color: 'var(--line)' }}>|</span>
+                  <span aria-hidden="true" className="mx-1.5" style={{ color: 'var(--line)' }}>|</span>
                   {text}
                 </p>
               );
@@ -513,9 +532,9 @@ export default function LibraryTab() {
     <div>
       {/* 顶部：搜索 + 排序 */}
       <div className="flex flex-wrap items-center gap-3">
-        <h2 className="text-lg font-bold">书库</h2>
+        <h2 ref={libraryHeading} tabIndex={-1} className="text-lg font-bold">书库</h2>
         <form
-          className="flex items-center gap-2"
+          className="flex w-full min-w-0 items-center gap-2 sm:w-auto"
           onSubmit={(e) => {
             e.preventDefault();
             setPage(1);
@@ -523,7 +542,7 @@ export default function LibraryTab() {
           }}
         >
           <input
-            className="paper-input text-sm !py-1.5 w-52"
+            className="paper-input text-sm !py-1.5 min-w-0 flex-1 w-40 sm:w-52"
             placeholder="搜书名 / 作者 / 标签"
             value={query}
             onChange={(e) => setQuery(e.target.value)}
@@ -612,73 +631,67 @@ export default function LibraryTab() {
 
       {books && books.length > 0 && (
         <div
-          className="mt-5 grid grid-cols-2 gap-2 border-t pt-4 sm:grid-cols-3 lg:grid-cols-4"
+          className="mt-5 grid grid-cols-1 min-[375px]:grid-cols-2 gap-2 border-t pt-4 sm:grid-cols-3 lg:grid-cols-4"
           style={{ borderColor: 'var(--line)' }}
         >
           {books.map((b) => (
-            <div
+            <article
               key={b.id}
-              role="button"
-              tabIndex={0}
-              className="group flex flex-col gap-1 rounded-[3px] border border-dashed px-3 py-2.5 text-left transition-colors hover:border-solid hover:bg-[var(--paper-deep)] focus-visible:outline focus-visible:outline-2 focus-visible:outline-[var(--cinnabar)]"
+              aria-labelledby={`library-title-${b.id}`}
+              className="group flex min-w-0 flex-col rounded-[3px] border border-dashed transition-colors hover:border-solid"
               style={{ borderColor: 'var(--line)' }}
-              onClick={() => showDetail(b)}
-              onKeyDown={(e) => {
-                if (e.target !== e.currentTarget) return;
-                if (e.key === 'Enter' || e.key === ' ') {
-                  e.preventDefault();
-                  showDetail(b);
-                }
-              }}
             >
-              <span className="line-clamp-2 min-w-0 text-sm font-bold transition-colors group-hover:text-[var(--cinnabar)]">
-                {b.title}
-              </span>
-              <span className="truncate text-xs" style={{ color: 'var(--ink-faint)' }}>{b.author}</span>
-              <span className="mt-auto flex min-w-0 items-center gap-2 text-xs">
-                {typeof b.quality === 'number' && (
-                  <span className="shrink-0 font-bold tabular-nums" style={{ color: qualityColor(b.quality) }}>
-                    {b.quality.toFixed(1)}
-                  </span>
-                )}
-                {b.finishStatus?.includes('完结') && (
-                  <span className="shrink-0" style={{ color: 'var(--moss)' }}>完</span>
-                )}
-                {(b.category || b.genre) && (
-                  <span className="ml-auto truncate" style={{ color: 'var(--ink-faint)' }}>
-                    {b.category || b.genre}
-                  </span>
-                )}
-                <button
-                  type="button"
-                  className="shrink-0 rounded-[3px] border border-solid px-1.5 py-0.5 text-[11px] transition-colors"
-                  style={{
-                    borderColor: 'var(--dai)',
-                    color: 'var(--dai)',
-                    cursor: 'pointer',
-                  }}
-                  aria-label={`将${b.title}加入书架`}
-                  disabled={shelfBusy !== 0}
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    void addToShelf(b);
-                  }}
-                >
-                  {shelfBusy === b.id ? '…' : '+ 书架'}
-                </button>
-              </span>
+              <button
+                type="button"
+                ref={(entry) => {
+                  if (entry) detailEntries.current.set(b.id, entry);
+                  else detailEntries.current.delete(b.id);
+                }}
+                aria-label={`查看${b.title}详情`}
+                className="flex min-w-0 flex-1 flex-col gap-1 p-3 text-left rounded-[3px] transition-colors hover:bg-[var(--paper-deep)]"
+                onClick={() => showDetail(b)}
+              >
+                <span id={`library-title-${b.id}`} className="line-clamp-2 min-w-0 text-sm font-bold transition-colors group-hover:text-[var(--cinnabar)]">
+                  {b.title}
+                </span>
+                <span className="truncate text-xs" style={{ color: 'var(--ink-faint)' }}>{b.author}</span>
+                <span className="mt-auto flex min-w-0 flex-wrap items-center gap-2 text-xs">
+                  {typeof b.quality === 'number' && (
+                    <span className="font-bold tabular-nums" style={{ color: qualityColor(b.quality) }}>
+                      {b.quality.toFixed(1)}
+                    </span>
+                  )}
+                  {b.finishStatus?.includes('完结') && (
+                    <span style={{ color: 'var(--moss)' }}>完</span>
+                  )}
+                  {(b.category || b.genre) && (
+                    <span className="min-w-0 ml-auto" style={{ color: 'var(--ink-faint)' }}>
+                      {b.category || b.genre}
+                    </span>
+                  )}
+                </span>
+              </button>
+              <button
+                type="button"
+                className="chip chip-dai text-xs mx-3 mb-3"
+                aria-label={`将${b.title}加入书架`}
+                disabled={shelfBusy !== 0}
+                onClick={() => void addToShelf(b)}
+              >
+                {shelfBusy === b.id ? '添加中…' : '+ 书架'}
+              </button>
               {b.readTaskId && (
-                <div className="mt-2">
+                <div className="mx-3 mb-3">
                   <ReadBookLink taskId={b.readTaskId} title={b.title} from="library" />
                 </div>
               )}
-            </div>
+            </article>
           ))}
         </div>
       )}
 
       {totalPages > 1 && (
-        <div className="mt-5 flex items-center justify-center gap-4 text-sm">
+        <div className="mt-5 flex flex-wrap items-center justify-center gap-3 text-sm">
           <button className="chip" disabled={page <= 1} onClick={() => setPage((p) => Math.max(1, p - 1))}>
             上一页
           </button>
@@ -687,6 +700,11 @@ export default function LibraryTab() {
             下一页
           </button>
         </div>
+      )}
+      {total > maxPage * pageSize && (
+        <p className="mt-3 text-xs" style={{ color: 'var(--ink-soft)' }}>
+          最多浏览前 {maxPage} 页，请使用搜索或筛选缩小范围。
+        </p>
       )}
     </div>
   );

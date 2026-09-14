@@ -173,7 +173,7 @@ export default function ShelfTab() {
                 >
                   <div className="w-full sm:w-auto sm:flex-1 min-w-0">
                     <div className="flex flex-wrap items-baseline gap-x-2.5">
-                      <span className="font-bold break-words">{it.title}</span>
+                      <span className="min-w-0 max-w-full font-bold break-words">{it.title}</span>
                       <span className="text-xs" style={{ color: 'var(--ink-faint)' }}>
                         {it.author}
                         {it.meta?.category ? ` · ${it.meta.category}` : ''}
