@@ -4,6 +4,8 @@
 import { neon } from '@neondatabase/serverless';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
+import { parseQuality } from './import_labels.mjs';
 
 const LLM_URL = 'https://api.cloud.us.kg/v1/chat/completions';
 const TARGET_CHARS = 400_000;
@@ -18,6 +20,13 @@ const SYSTEM_PROMPT =
   '"enjoyment": 读感0-10, "overall": 综合0-10}。整数或一位小数。';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+export function parseQualityResponse(value) {
+  const overall = typeof value === 'object' && value !== null && !Array.isArray(value)
+    ? parseQuality(value.overall) : null;
+  if (overall === null) throw new Error('overall 必须是 0 到 10 的有效数值');
+  return overall;
+}
 
 function parseArgs(argv) {
   const args = { env: null, limit: 20 };
@@ -123,12 +132,7 @@ async function llmQuality(apiKey, model, text) {
       if (content.startsWith('```')) {
         content = content.replace(/^```[a-zA-Z0-9_-]*/, '').replace(/```/g, '').trim();
       }
-      const parsed = JSON.parse(content);
-      const overall = Number(parsed.overall);
-      if (!Number.isFinite(overall) || overall < 0 || overall > 10) {
-        throw new Error(`overall 非法: ${parsed.overall}`);
-      }
-      return overall;
+      return parseQualityResponse(JSON.parse(content));
     } catch (e) {
       lastErr = e;
       console.error(`    LLM 尝试 ${attempt} 失败: ${e.message}`);
@@ -170,7 +174,11 @@ async function run() {
   console.log(`完成: ${ok}/${rows.length}`);
 }
 
-run().catch((e) => {
-  console.error(e);
-  process.exit(1);
-});
+const isDirectRun =
+  process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href;
+if (isDirectRun) {
+  run().catch((e) => {
+    console.error(e);
+    process.exit(1);
+  });
+}
