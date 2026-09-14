@@ -1,0 +1,406 @@
+'use client';
+
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
+import type { ReaderIndex, ReaderPart } from '@/lib/reader-types';
+import { ReaderPartCache, nextReadingPosition, previousReadingPosition } from '@/lib/reader-part-cache';
+import { captureTextAnchor, restoreTextAnchor } from '@/lib/reader-text-anchor';
+import { parseReaderSettings, parseReadingProgress, readingPercent, readingProgressKey, READER_SETTINGS_KEY } from '@/lib/reader-preferences';
+import type { ReaderSettings, ReadingPosition, ReadingProgress } from '@/lib/reader-preferences';
+
+interface Reading {
+  index: ReaderIndex;
+  parts: ReaderPart[];
+  position: ReadingPosition;
+  focus: boolean;
+  sectionOffset?: number;
+}
+interface Failure { message: string; status: number; target?: ReadingPosition; direction?: 'next' | 'previous' }
+type ApiFetch = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
+const START: ReadingPosition = { chapterIndex: 0, partIndex: 0, ratio: 0 };
+const WINDOW_SIZE = 3;
+export const partKey = (part: Pick<ReaderPart, 'chapterIndex' | 'partIndex'>) => `${part.chapterIndex}:${part.partIndex}`;
+
+class RequestError extends Error {
+  constructor(message: string, readonly status: number) { super(message); }
+}
+
+async function responseJson<T>(response: Response): Promise<T> {
+  const data = await response.json().catch(() => null);
+  if (!response.ok) {
+    if (response.status === 401) throw new RequestError('访问口令不正确或已失效，请重新输入。', 401);
+    throw new RequestError(typeof data?.error === 'string' ? data.error : '阅读服务暂时不可用，请稍后重试。', response.status);
+  }
+  if (!data) throw new RequestError('收到的阅读内容不完整，请重试。', 502);
+  return data as T;
+}
+
+function storedValue(key: string): string | null {
+  try { return window.localStorage.getItem(key); } catch { return null; }
+}
+
+function canPrefetch(): boolean {
+  const connection = (navigator as Navigator & { connection?: { saveData?: boolean; effectiveType?: string } }).connection;
+  return document.visibilityState !== 'hidden' && !connection?.saveData
+    && connection?.effectiveType !== '2g' && connection?.effectiveType !== 'slow-2g';
+}
+
+export function useReader(taskId: number, apiFetch: ApiFetch) {
+  const [settings, setSettings] = useState(() => parseReaderSettings(storedValue(READER_SETTINGS_KEY)));
+  const [reading, setReading] = useState<Reading | null>(null);
+  const [activeKey, setActiveKey] = useState('0:0');
+  const [loading, setLoading] = useState(true);
+  const [flowing, setFlowing] = useState(false);
+  const [failure, setFailure] = useState<Failure | null>(null);
+  const [percent, setPercent] = useState(0);
+  const [notice, setNotice] = useState('');
+  const [storageFailed, setStorageFailed] = useState(false);
+  const [focused, setFocused] = useState(false);
+  const scroller = useRef<HTMLElement>(null);
+  const article = useRef<HTMLElement>(null);
+  const heading = useRef<HTMLHeadingElement>(null);
+  const sections = useRef(new Map<string, HTMLElement>());
+  const request = useRef<AbortController | null>(null);
+  const flowRequest = useRef<AbortController | null>(null);
+  const serial = useRef(0);
+  const currentReading = useRef<Reading | null>(null);
+  const appliedReading = useRef<Reading | null>(null);
+  const progress = useRef<ReadingProgress | null>(null);
+  const measuredScrollTop = useRef<number | null>(null);
+  const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const scrollFrame = useRef<number | null>(null);
+  const restoring = useRef(false);
+  const scrollIntent = useRef(false);
+
+  const [cache] = useState(() => new ReaderPartCache(async (index, position, signal) => {
+    const query = new URLSearchParams({ chapter: String(position.chapterIndex), part: String(position.partIndex), version: index.version });
+    const part = await responseJson<ReaderPart>(await apiFetch(`/api/read/${taskId}/chapter?${query}`, { signal, cache: 'no-store' }));
+    if (part.taskId !== taskId || part.version !== index.version || part.chapterIndex !== position.chapterIndex
+      || part.partIndex !== position.partIndex || typeof part.text !== 'string') {
+      throw new RequestError('章节内容与目录不一致，请重新加载目录。', 409);
+    }
+    return part;
+  }));
+
+  const saveProgress = useCallback(() => {
+    if (saveTimer.current) clearTimeout(saveTimer.current);
+    saveTimer.current = null;
+    if (!progress.current) return;
+    try { window.localStorage.setItem(readingProgressKey(taskId), JSON.stringify(progress.current)); }
+    catch { setStorageFailed(true); }
+  }, [taskId]);
+
+  const capturePosition = useCallback(() => {
+    const current = currentReading.current;
+    const viewport = scroller.current;
+    if (!current || !viewport) return null;
+    const top = viewport.getBoundingClientRect().top + viewport.clientTop;
+    let part = current.parts[0];
+    const last = current.parts[current.parts.length - 1];
+    const atBookEnd = viewport.scrollHeight - viewport.scrollTop - viewport.clientHeight <= 2
+      && nextReadingPosition(current.index, last) === null;
+    if (viewport.scrollHeight <= viewport.clientHeight + 1 || atBookEnd) part = last;
+    else {
+      for (const candidate of current.parts) {
+        const section = sections.current.get(partKey(candidate));
+        if (section && section.getBoundingClientRect().top <= top + 20) part = candidate;
+      }
+    }
+    const section = sections.current.get(partKey(part));
+    if (!section) return null;
+    const rect = section.getBoundingClientRect();
+    const distance = Math.max(0, rect.height - viewport.clientHeight);
+    const ratio = distance > 0 ? Math.max(0, Math.min(1, (top - rect.top) / distance)) : 1;
+    const prose = section.querySelector<HTMLElement>('[data-reader-prose]');
+    const anchor = prose ? captureTextAnchor(prose, viewport) : null;
+    const position: ReadingProgress = {
+      schema: 1, version: current.index.version, chapterIndex: part.chapterIndex, partIndex: part.partIndex,
+      ratio, ...anchor, updatedAt: Date.now(),
+    };
+    return { position, sectionOffset: rect.top - top, part };
+  }, []);
+
+  const publishPosition = useCallback((snapshot: ReturnType<typeof capturePosition>) => {
+    if (!snapshot || !currentReading.current) return;
+    progress.current = snapshot.position;
+    measuredScrollTop.current = scroller.current?.scrollTop ?? null;
+    setActiveKey(partKey(snapshot.position));
+    setPercent(readingPercent(currentReading.current.index, snapshot.part, snapshot.position.ratio));
+  }, []);
+
+  const captureStablePosition = useCallback(() => {
+    const snapshot = capturePosition();
+    const previous = progress.current;
+    const viewport = scroller.current;
+    if (snapshot && previous && viewport && measuredScrollTop.current !== null
+      && Math.abs(viewport.scrollTop - measuredScrollTop.current) < 1
+      && partKey(snapshot.position) === partKey(previous) && snapshot.position.version === previous.version
+      && previous.textOffset !== undefined && previous.viewportOffset !== undefined) {
+      // Several layout changes can place this character in the middle of a new
+      // line. Re-capturing each new line start would accumulate a full-line drift.
+      snapshot.position.textOffset = previous.textOffset;
+      snapshot.position.viewportOffset = previous.viewportOffset;
+    }
+    return snapshot;
+  }, [capturePosition]);
+
+  const flushPosition = useCallback(() => {
+    if (!restoring.current) publishPosition(captureStablePosition());
+    saveProgress();
+  }, [captureStablePosition, publishPosition, saveProgress]);
+
+  const fail = useCallback((error: unknown, target?: ReadingPosition, direction?: 'next' | 'previous') => {
+    const status = error instanceof RequestError ? error.status : 0;
+    if (status === 401) { cache.clear(); setReading(null); }
+    setFailure({ message: error instanceof Error ? error.message : '阅读内容加载失败，请重试。', status, target, direction });
+  }, [cache]);
+
+  const beginRequest = useCallback(() => {
+    const previousRequest = request.current;
+    const previousFlow = flowRequest.current;
+    flowRequest.current = null;
+    scrollIntent.current = false;
+    const controller = new AbortController();
+    request.current = controller;
+    const id = ++serial.current;
+    setLoading(true);
+    setFlowing(false);
+    setFailure(null);
+    return {
+      controller, id,
+      retirePrevious: () => {
+        previousRequest?.abort();
+        previousFlow?.abort();
+        cache.cancelPrefetch();
+      },
+    };
+  }, [cache]);
+
+  const loadIndex = useCallback(async () => {
+    flushPosition();
+    const { controller, id, retirePrevious } = beginRequest();
+    retirePrevious();
+    cache.clear();
+    try {
+      const index = await responseJson<ReaderIndex>(await apiFetch(`/api/read/${taskId}/index`, { signal: controller.signal, cache: 'no-store' }));
+      if (!Array.isArray(index.chapters) || !index.chapters.length) throw new RequestError('这本书还没有可阅读的正文。', 422);
+      const saved = parseReadingProgress(storedValue(readingProgressKey(taskId)), index);
+      const position = saved ?? START;
+      const part = await cache.get(index, position, controller.signal);
+      if (controller.signal.aborted || id !== serial.current) return;
+      setActiveKey(partKey(part));
+      setReading({ index, parts: [part], position, focus: false });
+      setPercent(readingPercent(index, part, position.ratio));
+      setNotice(saved ? '已回到上次阅读的位置' : '');
+    } catch (error) {
+      if (!controller.signal.aborted && id === serial.current) fail(error);
+    } finally {
+      if (request.current === controller) request.current = null;
+      if (!controller.signal.aborted && id === serial.current) setLoading(false);
+    }
+  }, [apiFetch, taskId, beginRequest, cache, fail, flushPosition]);
+
+  useEffect(() => {
+    let active = true;
+    queueMicrotask(() => { if (active) void loadIndex(); });
+    return () => {
+      active = false; serial.current += 1;
+      request.current?.abort(); flowRequest.current?.abort(); cache.clear(); saveProgress();
+      if (scrollFrame.current !== null) cancelAnimationFrame(scrollFrame.current);
+    };
+  }, [loadIndex, cache, saveProgress]);
+
+  useEffect(() => {
+    const onHidden = () => {
+      if (document.visibilityState === 'hidden') { flushPosition(); cache.cancelPrefetch(); }
+    };
+    window.addEventListener('pagehide', flushPosition);
+    document.addEventListener('visibilitychange', onHidden);
+    return () => { window.removeEventListener('pagehide', flushPosition); document.removeEventListener('visibilitychange', onHidden); };
+  }, [flushPosition, cache]);
+
+  useEffect(() => {
+    if (!notice) return;
+    const timer = setTimeout(() => setNotice(''), 5000);
+    return () => clearTimeout(timer);
+  }, [notice]);
+
+  const activePart = reading?.parts.find((part) => partKey(part) === activeKey) ?? reading?.parts[0];
+  useEffect(() => {
+    if (!reading || !activePart || loading || failure || !settings.preloadNext || !canPrefetch()) {
+      cache.cancelPrefetch();
+      return;
+    }
+    const next = nextReadingPosition(reading.index, reading.parts[reading.parts.length - 1]);
+    if (!next) return;
+    const timer = setTimeout(() => { if (canPrefetch()) cache.prefetch(reading.index, next); }, 250);
+    return () => clearTimeout(timer);
+  }, [reading, activePart, loading, failure, settings.preloadNext, cache]);
+
+  useLayoutEffect(() => {
+    currentReading.current = reading;
+    if (!reading || !scroller.current) { appliedReading.current = reading; return; }
+    const viewport = scroller.current;
+    const changed = appliedReading.current !== reading;
+    appliedReading.current = reading;
+    if (changed) progress.current = { schema: 1, version: reading.index.version, ...reading.position, updatedAt: Date.now() };
+    let releaseFrame = 0;
+    let alive = true;
+    let initialRestore = changed;
+    const restore = () => {
+      if (!alive || currentReading.current !== reading || !progress.current) return;
+      const position = progress.current;
+      const section = sections.current.get(partKey(position));
+      if (!section) return;
+      restoring.current = true;
+      const prose = section.querySelector<HTMLElement>('[data-reader-prose]');
+      const anchored = prose && position.textOffset !== undefined && position.viewportOffset !== undefined
+        && restoreTextAnchor(prose, viewport, { textOffset: position.textOffset, viewportOffset: position.viewportOffset });
+      if (!anchored) {
+        const sectionTop = section.getBoundingClientRect().top - viewport.getBoundingClientRect().top - viewport.clientTop;
+        if (initialRestore && reading.sectionOffset !== undefined) viewport.scrollTop += sectionTop - reading.sectionOffset;
+        else if (position.ratio === 0 && partKey(position) === partKey(reading.parts[0])) viewport.scrollTop = 0;
+        else viewport.scrollTop += sectionTop + position.ratio * Math.max(0, section.offsetHeight - viewport.clientHeight);
+      }
+      initialRestore = false;
+      cancelAnimationFrame(releaseFrame);
+      releaseFrame = requestAnimationFrame(() => {
+        if (!alive) return;
+        const snapshot = capturePosition();
+        // Reflow may move the character within its line. Keep the chosen character
+        // until the user scrolls, instead of drifting toward each new line start.
+        if (anchored && snapshot && partKey(snapshot.position) === partKey(position)) {
+          snapshot.position.textOffset = position.textOffset;
+          snapshot.position.viewportOffset = position.viewportOffset;
+        }
+        publishPosition(snapshot);
+        restoring.current = false;
+        saveProgress();
+      });
+    };
+    restore();
+    if (changed && reading.focus) heading.current?.focus({ preventScroll: true });
+    const observer = new ResizeObserver(restore);
+    if (article.current) observer.observe(article.current);
+    observer.observe(viewport);
+    return () => { alive = false; observer.disconnect(); cancelAnimationFrame(releaseFrame); };
+  }, [reading, settings.fontSize, settings.lineHeight, settings.font, settings.width, focused, capturePosition, publishPosition, saveProgress]);
+
+  const navigate = useCallback(async (position: ReadingPosition) => {
+    const current = currentReading.current;
+    if (!current) return;
+    flushPosition();
+    setNotice('');
+    const { controller, id, retirePrevious } = beginRequest();
+    try {
+      // Subscribe to the destination before dropping speculative/previous interest.
+      // A click during its in-flight preload promotes that same network request.
+      const pending = cache.get(current.index, position, controller.signal);
+      retirePrevious();
+      const part = await pending;
+      if (controller.signal.aborted || id !== serial.current) return;
+      setActiveKey(partKey(part));
+      setReading({ index: current.index, parts: [part], position, focus: true });
+      setPercent(readingPercent(current.index, part, position.ratio));
+    } catch (error) {
+      if (!controller.signal.aborted && id === serial.current) fail(error, position);
+    } finally {
+      if (request.current === controller) request.current = null;
+      if (!controller.signal.aborted && id === serial.current) setLoading(false);
+    }
+  }, [beginRequest, cache, fail, flushPosition]);
+
+  const extend = useCallback(async (direction: 'next' | 'previous', manual = false) => {
+    const current = currentReading.current;
+    const viewport = scroller.current;
+    if (!current || !viewport || flowRequest.current || request.current || loading) return;
+    const next = direction === 'next'
+      ? nextReadingPosition(current.index, current.parts[current.parts.length - 1])
+      : previousReadingPosition(current.index, current.parts[0]);
+    if (!next) return;
+    if (current.parts.length >= WINDOW_SIZE) {
+      const evicted = direction === 'next' ? current.parts[0] : current.parts[current.parts.length - 1];
+      const bounds = sections.current.get(partKey(evicted))?.getBoundingClientRect();
+      const view = viewport.getBoundingClientRect();
+      const safelyOutside = bounds && (direction === 'next' ? bounds.bottom <= view.top + 2 : bounds.top >= view.bottom - 2);
+      if (!safelyOutside) {
+        if (manual) await navigate(next);
+        return;
+      }
+    }
+    const controller = new AbortController();
+    flowRequest.current = controller;
+    const id = serial.current;
+    setFlowing(true);
+    setFailure(null);
+    try {
+      const part = await cache.get(current.index, next, controller.signal);
+      if (controller.signal.aborted || id !== serial.current || currentReading.current !== current) return;
+      // The reader may have scrolled back while the next section was in flight.
+      // Keep the current window if its proposed eviction is visible again.
+      if (current.parts.length >= WINDOW_SIZE) {
+        const evicted = direction === 'next' ? current.parts[0] : current.parts[current.parts.length - 1];
+        const bounds = sections.current.get(partKey(evicted))?.getBoundingClientRect();
+        const view = viewport.getBoundingClientRect();
+        if (!bounds || (direction === 'next' ? bounds.bottom > view.top + 2 : bounds.top < view.bottom - 2)) return;
+      }
+      const snapshot = captureStablePosition();
+      let parts = direction === 'next' ? [...current.parts, part] : [part, ...current.parts];
+      if (parts.length > WINDOW_SIZE) parts = direction === 'next' ? parts.slice(-WINDOW_SIZE) : parts.slice(0, WINDOW_SIZE);
+      const retained = !manual && snapshot && parts.some((candidate) => partKey(candidate) === partKey(snapshot.position));
+      const destination = direction === 'previous' ? { ...next, ratio: 1 } : next;
+      setReading({ index: current.index, parts, position: retained ? snapshot.position : destination, sectionOffset: retained ? snapshot.sectionOffset : undefined, focus: false });
+    } catch (error) {
+      if (!controller.signal.aborted && id === serial.current) fail(error, next, direction);
+    } finally {
+      if (flowRequest.current === controller) { flowRequest.current = null; setFlowing(false); }
+    }
+  }, [loading, cache, captureStablePosition, fail, navigate]);
+
+  function onScroll() {
+    if (restoring.current || scrollFrame.current !== null) return;
+    scrollFrame.current = requestAnimationFrame(() => {
+      scrollFrame.current = null;
+      if (restoring.current) return;
+      publishPosition(capturePosition());
+      if (saveTimer.current) clearTimeout(saveTimer.current);
+      saveTimer.current = setTimeout(saveProgress, 400);
+      const viewport = scroller.current;
+      if (viewport && scrollIntent.current && settings.continuous && !failure && !loading
+        && viewport.scrollHeight - viewport.scrollTop - viewport.clientHeight < viewport.clientHeight * 0.7) void extend('next');
+    });
+  }
+
+  function updateSettings(next: ReaderSettings) {
+    flushPosition();
+    setSettings(next);
+    if (!next.preloadNext) cache.cancelPrefetch();
+    try { window.localStorage.setItem(READER_SETTINGS_KEY, JSON.stringify(next)); }
+    catch { setStorageFailed(true); }
+  }
+
+  function setFocusMode(next: boolean) { flushPosition(); setFocused(next); }
+  function retry() {
+    if (!failure || failure.status === 409 || !failure.target) return void loadIndex();
+    if (failure.direction) return void extend(failure.direction, true);
+    return void navigate(failure.target);
+  }
+
+  function markScrollIntent(forward = true) {
+    scrollIntent.current = forward;
+    const viewport = scroller.current;
+    const current = currentReading.current;
+    // A wheel/swipe on a fully visible short chapter emits no scroll event.
+    // Advance once per user gesture; never recursively download an idle book.
+    if (forward && viewport && current && viewport.scrollHeight <= viewport.clientHeight + 1
+      && settings.continuous && !failure && !loading) void extend('next', current.parts.length >= WINDOW_SIZE);
+  }
+
+  return {
+    settings, reading, activePart, loading, flowing, failure, percent, notice, storageFailed, focused,
+    scroller, article, heading, onScroll, updateSettings, setFocusMode, navigate, extend, retry,
+    markScrollIntent,
+    setSection: (part: ReaderPart, element: HTMLElement | null) => {
+      if (element) sections.current.set(partKey(part), element); else sections.current.delete(partKey(part));
+    },
+  };
+}
