@@ -20,7 +20,8 @@ function equalSecret(provided: string, expected: string): boolean {
 function cronRequest(req: NextRequest): boolean {
   if (req.headers.get('x-vercel-cron') !== '1') return false;
   const expected = process.env.CRON_SECRET;
-  if (!expected) return true;
+  // 密钥未配置时 fail closed：请求头本身不是身份凭据，不能因缺配置放行
+  if (!expected) return false;
   const authorization = req.headers.get('authorization') ?? '';
   return authorization.startsWith('Bearer ') && equalSecret(authorization.slice(7), expected);
 }

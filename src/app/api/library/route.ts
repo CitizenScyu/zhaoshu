@@ -58,7 +58,8 @@ export async function GET(req: NextRequest) {
     if (category) conds.push(s`(COALESCE(NULLIF(primary_genre, ''), category) = ${category})`);
     if (tag) {
       const tagLike = `%${tag.toLowerCase()}%`;
-      conds.push(s`lower(labels->>'genre') LIKE ${tagLike} OR lower(labels->>'style') LIKE ${tagLike} OR lower(labels->>'tone') LIKE ${tagLike}`);
+      // 括号必须包住整个 OR 组：AND 优先级更高，裸拼会让 tag 分支绕过其他筛选
+      conds.push(s`(lower(labels->>'genre') LIKE ${tagLike} OR lower(labels->>'style') LIKE ${tagLike} OR lower(labels->>'tone') LIKE ${tagLike})`);
     }
     if (finish) conds.push(s`finish_status = ${finish}`);
     // 动态条件拼装（neon tagged template 不支持 sql.join，用 AND 手动归并）
