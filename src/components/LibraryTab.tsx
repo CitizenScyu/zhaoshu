@@ -136,6 +136,8 @@ export default function LibraryTab() {
   const [task, setTask] = useState<DownloadTask | null>(null);
   const [dlError, setDlError] = useState('');
   const [dlBusy, setDlBusy] = useState(false);
+  const [shelfMsg, setShelfMsg] = useState('');
+  const [shelfBusy, setShelfBusy] = useState(0); // 当前正在加书架的书 id，0 表示空闲
   const reqId = useRef(0);
 
   const load = useCallback(async (p: number, q: string, cat: string, tg: string, fin: string, st: string, signal?: AbortSignal) => {
@@ -229,6 +231,30 @@ export default function LibraryTab() {
       clearInterval(timer);
     };
   }, [pollTaskId, apiFetch]);
+
+  async function addToShelf(book: LibraryBook) {
+    if (shelfBusy !== 0) return;
+    setShelfBusy(book.id);
+    setShelfMsg('');
+    try {
+      const res = await apiFetch('/api/shelf', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ labeledBookId: book.id }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (res.status === 409) {
+        setShelfMsg(`「${book.title}」已在书架`);
+        return;
+      }
+      if (!res.ok) throw new Error(data.error || '加入书架失败');
+      setShelfMsg(`「${book.title}」已加入书架（想读）`);
+    } catch (e) {
+      setShelfMsg(e instanceof Error ? e.message : '加入书架失败');
+    } finally {
+      setShelfBusy(0);
+    }
+  }
 
   async function startDownload() {
     if (!detail) return;
@@ -484,6 +510,9 @@ export default function LibraryTab() {
       {error && (
         <p role="alert" className="mt-4 text-sm" style={{ color: 'var(--cinnabar)' }}>✗ {error}</p>
       )}
+      {shelfMsg && (
+        <p role="status" className="mt-3 text-sm" style={{ color: 'var(--ink-soft)' }}>{shelfMsg}</p>
+      )}
       {loading && !books && (
         <p role="status" className="mt-6 text-sm" style={{ color: 'var(--ink-faint)' }}>读取中…</p>
       )}
@@ -499,11 +528,21 @@ export default function LibraryTab() {
           style={{ borderColor: 'var(--line)' }}
         >
           {books.map((b) => (
-            <button
+            <div
               key={b.id}
-              className="group flex flex-col gap-1 rounded-[3px] border border-dashed px-3 py-2.5 text-left transition-colors hover:border-solid hover:bg-[var(--paper-deep)]"
+              role="button"
+              tabIndex={0}
+              className="group flex flex-col gap-1 rounded-[3px] border border-dashed px-3 py-2.5 text-left transition-colors hover:border-solid hover:bg-[var(--paper-deep)] focus-visible:outline focus-visible:outline-2 focus-visible:outline-[var(--cinnabar)]"
               style={{ borderColor: 'var(--line)' }}
               onClick={() => { setDetail(b); setTask(null); setDlError(''); }}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' || e.key === ' ') {
+                  e.preventDefault();
+                  setDetail(b);
+                  setTask(null);
+                  setDlError('');
+                }
+              }}
             >
               <span className="line-clamp-2 min-w-0 text-sm font-bold transition-colors group-hover:text-[var(--cinnabar)]">
                 {b.title}
@@ -523,8 +562,25 @@ export default function LibraryTab() {
                     {b.category || b.genre}
                   </span>
                 )}
+                <button
+                  type="button"
+                  className="shrink-0 rounded-[3px] border border-solid px-1.5 py-0.5 text-[11px] transition-colors"
+                  style={{
+                    borderColor: 'var(--dai)',
+                    color: 'var(--dai)',
+                    cursor: 'pointer',
+                  }}
+                  aria-label={`将${b.title}加入书架`}
+                  disabled={shelfBusy !== 0}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    void addToShelf(b);
+                  }}
+                >
+                  {shelfBusy === b.id ? '…' : '+ 书架'}
+                </button>
               </span>
-            </button>
+            </div>
           ))}
         </div>
       )}

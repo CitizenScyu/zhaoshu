@@ -36,6 +36,8 @@ export default function ShelfTab() {
   const [loading, setLoading] = useState(true);
   const [updating, setUpdating] = useState(false);
   const updateInFlight = useRef(false);
+  const [removing, setRemoving] = useState(false);
+  const [confirmId, setConfirmId] = useState<number | null>(null);
 
   const load = useCallback(async (signal?: AbortSignal) => {
     setLoading(true);
@@ -80,6 +82,33 @@ export default function ShelfTab() {
     } finally {
       updateInFlight.current = false;
       setUpdating(false);
+    }
+  }
+
+  // 两段式移除：先标记 confirm 高亮，再点一次才真正发 DELETE
+  function askRemove(item: ShelfItem) {
+    if (confirmId === item.id) {
+      void doRemove(item);
+    } else {
+      setConfirmId(item.id);
+      window.setTimeout(() => setConfirmId((cur) => (cur === item.id ? null : cur)), 3000);
+    }
+  }
+
+  async function doRemove(item: ShelfItem) {
+    setConfirmId(null);
+    if (removing) return;
+    setRemoving(true);
+    setError('');
+    try {
+      const res = await apiFetch(`/api/shelf?id=${item.id}`, { method: 'DELETE' });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error || '移除失败');
+      await load();
+    } catch (error) {
+      setError(error instanceof Error ? error.message : '移除失败');
+    } finally {
+      setRemoving(false);
     }
   }
 
@@ -166,6 +195,23 @@ export default function ShelfTab() {
                         {label}
                       </button>
                     ))}
+                    <button
+                      className="chip text-xs"
+                      style={
+                        confirmId === it.id
+                          ? { borderColor: 'var(--cinnabar)', color: 'var(--cinnabar)' }
+                          : { color: 'var(--ink-faint)' }
+                      }
+                      onClick={() => askRemove(it)}
+                      disabled={removing || loading || updating}
+                      aria-label={
+                        confirmId === it.id
+                          ? `再次点击确认将${it.title}移出书架`
+                          : `将${it.title}移出书架`
+                      }
+                    >
+                      {confirmId === it.id ? '确认移除?' : '✕ 移除'}
+                    </button>
                   </div>
                 </div>
               ))}

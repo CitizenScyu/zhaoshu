@@ -6,9 +6,10 @@ import ShelfTab from '@/components/ShelfTab';
 import ProfileTab from '@/components/ProfileTab';
 import ShuyuanTab from '@/components/ShuyuanTab';
 import LibraryTab from '@/components/LibraryTab';
+import StatsTab from '@/components/StatsTab';
 import { OwnerProvider, useOwner } from '@/components/OwnerProvider';
 
-type Tab = 'find' | 'shelf' | 'profile' | 'shuyuan' | 'library';
+type Tab = 'find' | 'shelf' | 'profile' | 'shuyuan' | 'library' | 'stats';
 
 const TABS: { key: Tab; label: string }[] = [
   { key: 'find', label: '找书' },
@@ -16,6 +17,7 @@ const TABS: { key: Tab; label: string }[] = [
   { key: 'profile', label: '画像' },
   { key: 'shuyuan', label: '书源' },
   { key: 'library', label: '书库' },
+  { key: 'stats', label: '统计' },
 ];
 
 export default function Home() {
@@ -86,6 +88,7 @@ function HomeContent() {
           {tab === 'profile' && <ProfileTab />}
           {tab === 'shuyuan' && <ShuyuanTab />}
           {tab === 'library' && <LibraryTab />}
+          {tab === 'stats' && <StatsTab />}
         </div>
       </main>
 
