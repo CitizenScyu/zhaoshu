@@ -7,6 +7,7 @@ export const maxDuration = 60;
 
 const REPO = process.env.ZHAOSHU_BOOKS_REPO || 'CitizenScyu/zhaoshu-books';
 const BOOKS_DIR = 'books';
+const GITHUB_TIMEOUT_MS = 60_000;
 const UA = { 'User-Agent': 'zhaoshu-downloader/1.0' };
 
 // 必须与 zhaoshu-books/worker.mjs 的 sanitizeFilename 完全一致:
@@ -44,6 +45,7 @@ async function findBookName(title: string, author: string): Promise<string | nul
   const res = await fetch(contentsUrl(BOOKS_DIR), {
     headers: ghHeaders('application/vnd.github+json'),
     cache: 'no-store',
+    signal: AbortSignal.timeout(GITHUB_TIMEOUT_MS),
   });
   if (!res.ok) {
     throw new Error(`GitHub 目录读取失败: HTTP ${res.status}`);
@@ -67,30 +69,19 @@ async function findBookName(title: string, author: string): Promise<string | nul
   return null;
 }
 
-// base64 content 优先(contents API 常规返回),文件 >1MB 时无 content,退回 raw 媒体类型
-async function readFile(name: string): Promise<Uint8Array | null> {
+// 直接请求 raw 文件流,避免 JSON/base64 解码或整体缓冲 TXT
+async function readFile(name: string): Promise<ReadableStream<Uint8Array> | null> {
   const path = `${BOOKS_DIR}/${encodeURIComponent(name)}`;
   const res = await fetch(contentsUrl(path), {
-    headers: ghHeaders('application/vnd.github+json'),
+    headers: ghHeaders('application/vnd.github.raw'),
     cache: 'no-store',
+    signal: AbortSignal.timeout(GITHUB_TIMEOUT_MS),
   });
   if (res.status === 404) return null;
   if (!res.ok) {
     throw new Error(`GitHub 文件读取失败: HTTP ${res.status}`);
   }
-  const meta = (await res.json()) as { content?: string; encoding?: string };
-  if (typeof meta.content === 'string' && meta.encoding === 'base64') {
-    return new Uint8Array(Buffer.from(meta.content.replace(/\s/g, ''), 'base64'));
-  }
-
-  const raw = await fetch(contentsUrl(path), {
-    headers: ghHeaders('application/vnd.github.raw'),
-    cache: 'no-store',
-  });
-  if (!raw.ok) {
-    throw new Error(`GitHub 原始文件读取失败: HTTP ${raw.status}`);
-  }
-  return new Uint8Array(await raw.arrayBuffer());
+  return res.body;
 }
 
 export async function GET(
@@ -129,14 +120,13 @@ export async function GET(
     if (!name) {
       return NextResponse.json({ error: 'file not found' }, { status: 404 });
     }
-    const bytes = await readFile(name);
-    if (!bytes) {
+    const body = await readFile(name);
+    if (!body) {
       return NextResponse.json({ error: 'file not found' }, { status: 404 });
     }
 
     const downloadName = `${sanitizeFilename(task.title) || 'novel'}.txt`;
-    // Blob 而非裸 Uint8Array:后者在 TS 的 BodyInit 类型下不被接受
-    return new NextResponse(new Blob([bytes as BlobPart]), {
+    return new NextResponse(body, {
       status: 200,
       headers: {
         'Content-Type': 'text/plain; charset=utf-8',
