@@ -164,6 +164,9 @@ export default function ProfileTab() {
         <p className="text-xs mb-4 leading-6" style={{ color: 'var(--ink-faint)' }}>
           最爱 {loveCount} 本 · 弃书 {dropCount} 本。弃书原因的权重高于最爱——网文口味「彼仙我毒」，雷点比萌点更能定义你。
         </p>
+        <p id="seed-author-help" className="text-xs mb-4 leading-6" style={{ color: 'var(--ink-soft)' }}>
+          作者留空会排除所有同名书；填写作者后，仅排除该作者的同名作品。续篇书名不同，仍可推荐。
+        </p>
 
         {seedEditing ? (
           <>
@@ -234,6 +237,7 @@ export default function ProfileTab() {
                   <input
                     className="paper-input text-sm w-full !py-1.5 mb-2"
                     aria-label="作者"
+                    aria-describedby="seed-author-help"
                     placeholder="作者(可空)"
                     value={s.author ?? ''}
                     onChange={(e) => updateSeed(i, { author: e.target.value })}

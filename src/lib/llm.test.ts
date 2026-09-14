@@ -3,27 +3,27 @@ import { consumeSseChunk, parseJson } from './llm';
 
 describe('parseJson', () => {
   it('parses bare JSON object', () => {
-    expect(parseJson<{ a: number }>('{"a":1}')).toEqual({ a: 1 });
+    expect(parseJson('{"a":1}')).toEqual({ a: 1 });
   });
 
   it('parses a ```json fenced block', () => {
     const text = '```json\n{"candidates":[]}\n```';
-    expect(parseJson<{ candidates: unknown[] }>(text)).toEqual({ candidates: [] });
+    expect(parseJson(text)).toEqual({ candidates: [] });
   });
 
   it('parses a bare ``` fenced block', () => {
     const text = '```\n[1,2,3]\n```';
-    expect(parseJson<number[]>(text)).toEqual([1, 2, 3]);
+    expect(parseJson(text)).toEqual([1, 2, 3]);
   });
 
   it('extracts JSON surrounded by prose', () => {
     const text = '好的,这是结果:\n{"items":[{"title":"X"}]}\n希望有帮助!';
-    expect(parseJson<{ items: { title: string }[] }>(text).items[0].title).toBe('X');
+    expect(parseJson(text)).toEqual({ items: [{ title: 'X' }] });
   });
 
   it('extracts a top-level array surrounded by prose', () => {
     const text = 'result: [{"a":1},{"a":2}] done';
-    expect(parseJson<{ a: number }[]>(text)).toHaveLength(2);
+    expect(parseJson(text)).toEqual([{ a: 1 }, { a: 2 }]);
   });
 
   it('throws on non-JSON garbage', () => {

@@ -215,7 +215,7 @@ export async function chatRobust(
 }
 
 // 从 LLM 回复里稳健地抠出 JSON（容忍 ```json 围栏、前后废话）
-export function parseJson<T>(text: string): T {
+export function parseJson(text: string): unknown {
   let t = text.trim();
   const fence = t.match(/```(?:json)?\s*([\s\S]*?)```/);
   if (fence) t = fence[1].trim();
@@ -229,5 +229,9 @@ export function parseJson<T>(text: string): T {
       t = t.slice(first, last + 1);
     }
   }
-  return JSON.parse(t) as T;
+  try {
+    return JSON.parse(t) as unknown;
+  } catch {
+    throw new LlmError('模型返回了无效的 JSON，请重试。', false);
+  }
 }

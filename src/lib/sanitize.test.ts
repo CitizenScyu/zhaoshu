@@ -2,6 +2,8 @@ import { describe, expect, it } from 'vitest';
 import {
   bookKey,
   cleanString,
+  finiteScore,
+  isRecord,
   sanitizeCandidates,
   sanitizeRerankedItems,
   sanitizeSeeds,
@@ -27,6 +29,36 @@ describe('cleanString', () => {
   it('honours a custom max length', () => {
     expect(cleanString('abcdef', 3)).toBe('');
     expect(cleanString('abc', 3)).toBe('abc');
+  });
+});
+
+describe('untrusted field validation', () => {
+  it.each([null, [], 'text', 1, true])('does not treat %j as an object', (value) => {
+    expect(isRecord(value)).toBe(false);
+  });
+
+  it.each([String.fromCharCode(0), '\ud800', '\udc00'])('rejects database-illegal text %j', (bad) => {
+    expect(cleanString('正文' + bad)).toBe('');
+    expect(sanitizeCandidates([{ title: 'T', author: 'A', why: bad }])).toEqual([]);
+    expect(sanitizeRerankedItems([{ title: 'T', author: 'A', matchScore: 0, reason: bad }])).toEqual([]);
+    expect(sanitizeRerankedItems([{ title: 'T', author: 'A', matchScore: 0, hitLikes: [bad] }])).toEqual([]);
+    expect(sanitizeSeeds([{ title: 'T', author: bad }])).toEqual([]);
+  });
+
+  it('preserves valid unicode, newlines and surrogate pairs', () => {
+    expect(cleanString('  正文😀\n下一行  ')).toBe('正文😀\n下一行');
+  });
+
+  it.each([null, undefined, '', ' \t\n ', false, true, [], {}, '0x10', 'Infinity', NaN, Infinity])(
+    'does not coerce %j into a score', (value) => {
+      expect(finiteScore(value)).toBeNull();
+      expect(sanitizeRerankedItems([{ title: 'T', author: 'A', matchScore: value }])).toEqual([]);
+    },
+  );
+
+  it.each([0, '0', ' 0 ', '0.0'])('preserves a real zero score %j', (value) => {
+    expect(finiteScore(value)).toBe(0);
+    expect(sanitizeRerankedItems([{ title: 'T', author: 'A', matchScore: value }])[0].matchScore).toBe(0);
   });
 });
 
@@ -185,5 +217,45 @@ describe('sanitizeSeeds', () => {
 
   it('returns [] for a non-array', () => {
     expect(sanitizeSeeds('nope')).toEqual([]);
+  });
+});
+
+describe('bounded unique book lists', () => {
+  const first = {
+    title: 'ＡＢＣ', author: 'Ｘ', why: '原始理由', matchScore: 80,
+    douban: { status: 'not_found', found: false },
+  };
+  const duplicate = { ...first, title: ' abc ', author: 'x', why: '重复理由' };
+  const otherAuthor = { ...first, title: 'abc', author: 'y' };
+
+  it('deduplicates NFKC-equivalent candidates and keeps a different author', () => {
+    const result = sanitizeCandidates([first, duplicate, otherAuthor]);
+    expect(result.map(({ title, author }) => [title, author])).toEqual([['ＡＢＣ', 'Ｘ'], ['abc', 'y']]);
+    expect(result[0].why).toBe('原始理由');
+  });
+
+  it('deduplicates verified and reranked books using the same pair key', () => {
+    for (const sanitize of [sanitizeVerified, sanitizeRerankedItems]) {
+      const result = sanitize([first, duplicate, otherAuthor]);
+      expect(result.map(({ title, author }) => [title, author])).toEqual([['ＡＢＣ', 'Ｘ'], ['abc', 'y']]);
+    }
+  });
+
+  it('bounds reranked books and nested hitLikes', () => {
+    const many = Array.from({ length: 20 }, (_, i) => ({
+      ...first, title: String(i), hitLikes: Array.from({ length: 100 }, () => '萌点'),
+    }));
+    const result = sanitizeRerankedItems(many);
+    expect(result).toHaveLength(10);
+    expect(result.every((item) => item.hitLikes.length === 10)).toBe(true);
+  });
+
+  it('rejects invalid verification metadata while preserving a zero rating', () => {
+    expect(sanitizeVerified([{ ...first, douban: [] }])).toEqual([]);
+    expect(sanitizeVerified([{ ...first, douban: { note: '\ud800' } }])).toEqual([]);
+    const [invalid] = sanitizeVerified([{ ...first, douban: { rating: 11, ratingCount: -1 } }]);
+    expect(invalid.douban).toMatchObject({ rating: null, ratingCount: null });
+    const [zero] = sanitizeVerified([{ ...first, douban: { rating: 0, ratingCount: 0 } }]);
+    expect(zero.douban).toMatchObject({ rating: 0, ratingCount: 0 });
   });
 });

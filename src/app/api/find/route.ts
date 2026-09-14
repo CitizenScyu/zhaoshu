@@ -11,6 +11,9 @@ import {
 import { boundedString, readJsonBody, RequestBodyError } from '@/lib/http';
 import {
   bookKey,
+  isRecord,
+  MAX_CANDIDATES,
+  MAX_RERANKED_ITEMS,
   sanitizeCandidates,
   sanitizeRerankedItems,
   sanitizeVerified,
@@ -28,6 +31,19 @@ export const maxDuration = 295;
 
 const MAX_BODY_BYTES = 64 * 1024;
 const MAX_QUERY_LENGTH = 1_000;
+
+// 模型输出始终从 unknown 收窄；数量异常也属于上游错误，不能当成内部 500。
+function modelList(raw: string, field: 'candidates' | 'items', max: number): unknown[] {
+  const parsed = parseJson(raw);
+  if (!isRecord(parsed)) {
+    throw new LlmError('模型返回的 JSON 根节点必须是对象，请重试。', false);
+  }
+  const list = parsed[field];
+  if (!Array.isArray(list) || list.length === 0 || list.length > max) {
+    throw new LlmError('模型返回的书单字段或数量无效，请重试。', false);
+  }
+  return list;
+}
 
 // 三步流水线由前端分步调用：recall → verify → rerank
 // 每步都独立控制在函数时限内，前端可以展示进度
@@ -58,9 +74,14 @@ export async function POST(req: NextRequest) {
       }
       const profile = await getProfile();
       const excludedKeys = new Set([
-        ...profile.seeds.map((seed) => bookKey(seed.title, seed.author ?? '')),
+        ...profile.seeds.filter((seed) => seed.author?.trim())
+          .map((seed) => bookKey(seed.title, seed.author!)),
         ...(await getExcludedBookKeys()),
       ]);
+      // 作者缺失时只按完整书名排除；仍用同一套 NFKC 规则，不误伤续篇。
+      const excludedTitles = new Set(profile.seeds
+        .filter((seed) => !seed.author?.trim())
+        .map((seed) => bookKey(seed.title, '')));
       // 已读/弃书列表传给提示词做软约束，后端 filter 做硬约束
       const excludedBooks = [
         ...profile.seeds.map((seed) => ({ title: seed.title, author: seed.author ?? '' })),
@@ -71,9 +92,10 @@ export async function POST(req: NextRequest) {
         recallUser(profile.content, query, excludedBooks),
         { temperature: 0.8 },
       );
-      const parsed = parseJson<{ candidates: unknown }>(raw);
-      const candidates = sanitizeCandidates(parsed.candidates)
-        .filter((candidate) => !excludedKeys.has(bookKey(candidate.title, candidate.author)));
+      const candidates = sanitizeCandidates(modelList(raw, 'candidates', MAX_CANDIDATES))
+        .filter((candidate) =>
+          !excludedKeys.has(bookKey(candidate.title, candidate.author)) &&
+          !excludedTitles.has(bookKey(candidate.title, '')));
       if (candidates.length === 0) {
         return NextResponse.json({ error: '召回结果为空，换个说法试试' }, { status: 502 });
       }
@@ -105,24 +127,26 @@ export async function POST(req: NextRequest) {
         rerankUser(profile, query, JSON.stringify(verified)),
         { temperature: 0.3 },
       );
-      const parsed = parseJson<{ items: unknown }>(raw);
       // 用书名+作者关联，避免同名作品回填到错误的豆瓣条目。
       const byBook = new Map(verified.map((v) => [bookKey(v.title, v.author), v]));
-      const items = sanitizeRerankedItems(parsed.items)
+      const items = sanitizeRerankedItems(modelList(raw, 'items', MAX_RERANKED_ITEMS))
         .filter((it) => byBook.has(bookKey(it.title, it.author)))
         .map((it) => {
-          const source = byBook.get(bookKey(it.title, it.author));
+          const source = byBook.get(bookKey(it.title, it.author))!;
           return {
             ...it,
+            // 使用输入作品的原始拼写，不因模型的等价写法产生新的数据库身份。
+            title: source.title,
+            author: source.author,
             // why/元数据以召回阶段的原始输出为准，不信重排的转述
-            why: source?.why || it.why,
-            category: source?.category || it.category,
-            wordCount: source?.wordCount || it.wordCount,
-            douban: source?.douban,
+            why: source.why,
+            category: source.category,
+            wordCount: source.wordCount,
+            douban: source.douban,
           };
         })
         .sort((a, b) => b.matchScore - a.matchScore)
-        .slice(0, 10);
+        .slice(0, MAX_RERANKED_ITEMS);
       if (items.length === 0) {
         return NextResponse.json({ error: '重排结果为空，换个说法试试' }, { status: 502 });
       }
