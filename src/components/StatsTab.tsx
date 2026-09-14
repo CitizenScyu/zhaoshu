@@ -91,6 +91,37 @@ export default function StatsTab() {
   const [stats, setStats] = useState<Stats | null>(null);
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(true);
+  const [exporting, setExporting] = useState(false);
+  const [exportError, setExportError] = useState('');
+
+  async function exportData() {
+    setExporting(true);
+    setExportError('');
+    try {
+      const res = await apiFetch('/api/export', { cache: 'no-store' });
+      if (!res.ok) {
+        const data = await res.json().catch(() => null);
+        throw new Error(data?.error || '数据导出失败，请稍后重试');
+      }
+      const url = URL.createObjectURL(await res.blob());
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = res.headers.get('Content-Disposition')?.match(/filename="([^"]+)"/)?.[1]
+        || `shujing-data-${new Date().toISOString().slice(0, 10)}.json`;
+      document.body.appendChild(link);
+      try {
+        link.click();
+      } finally {
+        link.remove();
+        // 给浏览器留出接收下载的时间，再释放临时 URL。
+        window.setTimeout(() => URL.revokeObjectURL(url), 1_000);
+      }
+    } catch (e) {
+      setExportError(e instanceof Error ? e.message : '数据导出失败，请稍后重试');
+    } finally {
+      setExporting(false);
+    }
+  }
 
   const load = useCallback(async (signal?: AbortSignal) => {
     setLoading(true);
@@ -265,6 +296,25 @@ export default function StatsTab() {
           </p>
         </div>
       )}
+
+      <section className="mt-8 pt-5 border-t" style={{ borderColor: 'var(--line)' }} aria-label="数据导出">
+        <button
+          type="button"
+          onClick={() => void exportData()}
+          disabled={exporting}
+          className="chip chip-dai cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
+        >
+          {exporting ? '导出中…' : '导出我的数据'}
+        </button>
+        <p className="mt-2 text-xs leading-6" style={{ color: 'var(--ink-faint)' }}>
+          将画像、种子书单、书架、反馈和书库基本信息保存为 JSON 文件。
+        </p>
+        {exportError && (
+          <p role="alert" className="mt-2 text-sm" style={{ color: 'var(--cinnabar)' }}>
+            {exportError}
+          </p>
+        )}
+      </section>
     </div>
   );
 }
