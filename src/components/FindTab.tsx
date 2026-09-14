@@ -1,8 +1,9 @@
 'use client';
 
-import { useState, useSyncExternalStore } from 'react';
-import type { Candidate, RerankedItem, VerifiedCandidate, ShelfStatus } from '@/lib/types';
+import { useRef, useState, useSyncExternalStore } from 'react';
+import type { Candidate, RerankedItem, VerifiedCandidate, FeedbackStatus } from '@/lib/types';
 import { useOwner } from '@/components/OwnerProvider';
+import FeedbackEditor from '@/components/FeedbackEditor';
 
 // 示例池：每次进入页面随机抽几条，避免永远是同样几句
 const EXAMPLE_POOL = [
@@ -227,14 +228,19 @@ function BookCard({
   index: number;
   apiFetch: (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
 }) {
-  const [noteFor, setNoteFor] = useState<ShelfStatus | null>(null);
-  const [note, setNote] = useState('');
+  const [noteFor, setNoteFor] = useState<FeedbackStatus | null>(null);
+  const [savedNote, setSavedNote] = useState('');
   const [saved, setSaved] = useState(false);
   const [profileUpdated, setProfileUpdated] = useState(false);
   const [sending, setSending] = useState(false);
+  const [feedbackError, setFeedbackError] = useState('');
+  const feedbackInFlight = useRef(false);
 
-  async function sendFeedback(status: ShelfStatus, noteText: string) {
+  async function sendFeedback(status: FeedbackStatus, noteText: string) {
+    if (feedbackInFlight.current) return;
+    feedbackInFlight.current = true;
     setSending(true);
+    setFeedbackError('');
     try {
       const res = await apiFetch('/api/feedback', {
         method: 'POST',
@@ -244,11 +250,13 @@ function BookCard({
       const data = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(data.error || '记录反馈失败');
       setSaved(true);
+      setSavedNote(noteText);
       setProfileUpdated(data.profileUpdated === true);
       setNoteFor(null);
     } catch (e) {
-      window.alert(e instanceof Error ? e.message : '记录反馈失败');
+      setFeedbackError(e instanceof Error ? e.message : '记录反馈失败');
     } finally {
+      feedbackInFlight.current = false;
       setSending(false);
     }
   }
@@ -329,47 +337,43 @@ function BookCard({
                   ['reading', '在读'],
                   ['done', '读完'],
                   ['dropped', '弃书'],
-                ] as [ShelfStatus, string][]
+                ] as [FeedbackStatus, string][]
               ).map(([st, label]) => (
                 <button
                   key={st}
                   className="chip hover:border-[var(--cinnabar)] hover:text-[var(--cinnabar)] transition-colors"
                   onClick={() => {
-                    if (st === 'done' || st === 'dropped') setNoteFor(noteFor === st ? null : st);
-                    else sendFeedback(st, '');
+                    setNoteFor(noteFor === st ? null : st);
+                    setFeedbackError('');
                   }}
+                  aria-pressed={noteFor === st}
                   disabled={sending}
                 >
                   {label}
                 </button>
               ))}
+              {feedbackError && (
+                <p role="alert" className="w-full text-xs" style={{ color: 'var(--cinnabar)' }}>{feedbackError}</p>
+              )}
               {noteFor && (
-                <span className="flex w-full min-w-0 items-center gap-2 flex-wrap">
-                  <input
-                    className="paper-input text-xs !py-1.5 !px-2.5 w-64"
-                    aria-label="阅读反馈原因"
-                    placeholder={`为什么${noteFor === 'done' ? '读完' : '弃书'}？一句话，喂给画像`}
-                    value={note}
-                    onChange={(e) => setNote(e.target.value)}
-                    onKeyDown={(e) => {
-                      if (e.key === 'Enter' && note.trim()) sendFeedback(noteFor, note.trim());
-                    }}
-                    autoFocus
-                  />
-                  <button
-                    className="chip chip-dai"
-                    onClick={() => sendFeedback(noteFor, note.trim())}
-                    disabled={!note.trim() || sending}
-                  >
-                    记下
-                  </button>
-                </span>
+                <FeedbackEditor
+                  key={noteFor}
+                  status={noteFor}
+                  busy={sending}
+                  onSubmit={(note) => sendFeedback(noteFor, note)}
+                  onCancel={() => { setNoteFor(null); setFeedbackError(''); }}
+                />
               )}
             </div>
           ) : (
-            <p className="mt-3.5 text-xs" style={{ color: 'var(--moss)' }}>
-              ✓ 已记录到书架{profileUpdated && '，画像已更新'}
-            </p>
+            <div className="mt-3.5 text-xs">
+              <p style={{ color: 'var(--moss)' }}>✓ 已记录到书架{profileUpdated && '，画像已更新'}</p>
+              {savedNote && (
+                <p className="mt-1 whitespace-pre-wrap break-words leading-6" style={{ color: 'var(--ink-soft)' }}>
+                  {savedNote}
+                </p>
+              )}
+            </div>
           )}
         </div>
       </div>

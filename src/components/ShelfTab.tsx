@@ -1,8 +1,9 @@
 'use client';
 
 import { useCallback, useEffect, useRef, useState } from 'react';
-import type { ShelfStatus } from '@/lib/types';
+import type { FeedbackStatus, ShelfStatus } from '@/lib/types';
 import { useOwner } from '@/components/OwnerProvider';
+import FeedbackEditor from '@/components/FeedbackEditor';
 
 interface ShelfItem {
   id: number;
@@ -11,7 +12,8 @@ interface ShelfItem {
   hit_likes: string[] | null;
   risks: string | null;
   reason: string | null;
-  status: string;
+  status: ShelfStatus;
+  note: string;
   created_at: string;
   title: string;
   author: string;
@@ -38,6 +40,8 @@ export default function ShelfTab() {
   const updateInFlight = useRef(false);
   const [removing, setRemoving] = useState(false);
   const [confirmId, setConfirmId] = useState<number | null>(null);
+  const [editing, setEditing] = useState<{ id: number; status: FeedbackStatus } | null>(null);
+  const [feedbackMessage, setFeedbackMessage] = useState('');
 
   const load = useCallback(async (signal?: AbortSignal) => {
     setLoading(true);
@@ -63,22 +67,32 @@ export default function ShelfTab() {
     return () => controller.abort();
   }, [load]);
 
-  async function setStatus(item: ShelfItem, status: ShelfStatus) {
-    if (updateInFlight.current || item.status === status) return;
+  async function saveFeedback(item: ShelfItem, status: FeedbackStatus, note: string) {
+    if (updateInFlight.current) return;
     updateInFlight.current = true;
     setUpdating(true);
     setError('');
+    setFeedbackMessage('');
     try {
       const res = await apiFetch('/api/feedback', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ title: item.title, author: item.author, status, note: '' }),
+        body: JSON.stringify({ title: item.title, author: item.author, status, note }),
       });
       const data = await res.json().catch(() => ({}));
-      if (!res.ok) throw new Error(data.error || '更新状态失败');
+      if (!res.ok) throw new Error(data.error || '保存反馈失败');
+      setItems((current) => current?.map((entry) => entry.id === item.id
+        ? { ...entry, status, note }
+        : entry) ?? null);
+      setEditing(null);
+      setFeedbackMessage(note
+        ? `「${item.title}」反馈已记录${data.profileUpdated === true ? '，画像已更新' : ''}`
+        : item.note && status === item.status
+          ? `已清除「${item.title}」的反馈原因，阅读状态保留`
+          : `「${item.title}」阅读状态已更新`);
       await load();
     } catch (error) {
-      setError(error instanceof Error ? error.message : '更新状态失败');
+      setError(error instanceof Error ? error.message : '保存反馈失败');
     } finally {
       updateInFlight.current = false;
       setUpdating(false);
@@ -124,6 +138,9 @@ export default function ShelfTab() {
 
   return (
     <div className="space-y-8">
+      {feedbackMessage && (
+        <p role="status" className="text-sm" style={{ color: 'var(--moss)' }}>{feedbackMessage}</p>
+      )}
       {error && (
         <div role="alert" className="flex flex-wrap items-center gap-3 text-sm" style={{ color: 'var(--cinnabar)' }}>
           <p>{error}</p>
@@ -166,6 +183,11 @@ export default function ShelfTab() {
                         {it.reason}
                       </p>
                     )}
+                    {it.status !== 'new' && (
+                      <p className="text-xs mt-2 break-words whitespace-pre-wrap leading-6" style={{ color: 'var(--ink-soft)' }}>
+                        <span className="font-bold">反馈原因：</span>{it.note || '尚未填写'}
+                      </p>
+                    )}
                   </div>
                   <span className="text-xs shrink-0" style={{ color: 'var(--ink-faint)' }}>
                     {new Date(it.created_at).toLocaleDateString('zh-CN')}
@@ -178,7 +200,7 @@ export default function ShelfTab() {
                         ['reading', '在读'],
                         ['done', '完'],
                         ['dropped', '弃'],
-                      ] as [ShelfStatus, string][]
+                      ] as [FeedbackStatus, string][]
                     ).map(([st, label]) => (
                       <button
                         key={st}
@@ -188,13 +210,42 @@ export default function ShelfTab() {
                             ? { borderColor: g.color, color: g.color }
                             : undefined
                         }
-                        onClick={() => setStatus(it, st)}
-                        disabled={updating || loading || it.status === st}
+                        onClick={() => {
+                          setEditing({ id: it.id, status: st });
+                          setFeedbackMessage('');
+                        }}
+                        disabled={updating || loading || removing || it.status === st}
                         aria-label={`将${it.title}标记为${GROUPS.find((group) => group.key === st)?.label}`}
                       >
                         {label}
                       </button>
                     ))}
+                    {it.status !== 'new' && (
+                      <button
+                        className="chip chip-dai text-xs"
+                        disabled={updating || loading || removing}
+                        aria-expanded={editing?.id === it.id}
+                        onClick={() => {
+                          if (it.status === 'new') return;
+                          setEditing({ id: it.id, status: it.status });
+                          setFeedbackMessage('');
+                        }}
+                      >
+                        {it.note ? '编辑反馈' : '补充原因'}
+                      </button>
+                    )}
+                    {it.status !== 'new' && it.note && (
+                      <button
+                        className="chip text-xs"
+                        disabled={updating || loading || removing}
+                        aria-label={`清除${it.title}的反馈原因，保留阅读状态`}
+                        onClick={() => {
+                          if (it.status !== 'new') void saveFeedback(it, it.status, '');
+                        }}
+                      >
+                        清除原因
+                      </button>
+                    )}
                     <button
                       className="chip text-xs"
                       style={
@@ -213,6 +264,16 @@ export default function ShelfTab() {
                       {confirmId === it.id ? '确认移除?' : '✕ 移除'}
                     </button>
                   </div>
+                  {editing?.id === it.id && (
+                    <FeedbackEditor
+                      key={`${it.id}-${editing.status}`}
+                      status={editing.status}
+                      initialNote={editing.status === it.status ? it.note : ''}
+                      busy={updating || loading || removing}
+                      onSubmit={(note) => saveFeedback(it, editing.status, note)}
+                      onCancel={() => setEditing(null)}
+                    />
+                  )}
                 </div>
               ))}
             </div>

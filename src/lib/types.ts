@@ -48,3 +48,5 @@ export interface RerankedItem {
 
 // 书架状态
 export type ShelfStatus = 'new' | 'want' | 'reading' | 'done' | 'dropped';
+
+export type FeedbackStatus = Exclude<ShelfStatus, 'new'>;
