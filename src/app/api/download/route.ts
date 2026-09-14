@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { requireApiOwner } from '@/lib/auth';
 import { ensureSchema, getSql } from '@/lib/db';
 import { triggerDownloadWorkflow } from '@/lib/github';
-import { readJsonBody, RequestBodyError } from '@/lib/http';
+import { boundedPositiveInteger, readJsonBody, RequestBodyError } from '@/lib/http';
 
 // 书库下载任务:GET 查任务(最近 20 条或单条)、POST 建任务、DELETE 取消 pending/清理 failed
 export const maxDuration = 60;
@@ -55,9 +55,9 @@ export async function GET(req: NextRequest) {
   if (unauthorized) return unauthorized;
   const { searchParams } = new URL(req.url);
   const idParam = searchParams.get('id');
-  const id = idParam === null ? null : Number(idParam);
-  if (id !== null && (!Number.isInteger(id) || id <= 0)) {
-    return NextResponse.json({ error: 'invalid id' }, { status: 400 });
+  const id = boundedPositiveInteger(idParam);
+  if (idParam !== null && id === null) {
+    return NextResponse.json({ error: 'invalid id', code: 'INVALID_ID' }, { status: 400 });
   }
   try {
     await ensureSchema();
@@ -69,7 +69,7 @@ export async function GET(req: NextRequest) {
                chars_total, error, created_at::text AS created_at, updated_at::text AS updated_at
         FROM download_tasks WHERE id = ${id}`) as unknown as TaskRow[];
       if (rows.length === 0) {
-        return NextResponse.json({ error: 'task not found' }, { status: 404 });
+        return NextResponse.json({ error: 'task not found', code: 'TASK_NOT_FOUND' }, { status: 404 });
       }
       return NextResponse.json({ task: toTask(rows[0]) });
     }
@@ -80,7 +80,7 @@ export async function GET(req: NextRequest) {
     return NextResponse.json({ tasks: rows.map(toTask) });
   } catch (e) {
     console.error(e);
-    return NextResponse.json({ error: 'db error' }, { status: 500 });
+    return NextResponse.json({ error: 'db error', code: 'DB_ERROR' }, { status: 500 });
   }
 }
 
@@ -92,13 +92,13 @@ export async function POST(req: NextRequest) {
     body = await readJsonBody(req, MAX_BODY_BYTES);
   } catch (e) {
     if (e instanceof RequestBodyError) {
-      return NextResponse.json({ error: e.message }, { status: 413 });
+      return NextResponse.json({ error: e.message, code: e.code }, { status: 413 });
     }
     throw e;
   }
-  const bookId = Number(body?.bookId);
-  if (!Number.isInteger(bookId) || bookId <= 0) {
-    return NextResponse.json({ error: 'missing bookId' }, { status: 400 });
+  const bookId = boundedPositiveInteger(body?.bookId);
+  if (bookId === null) {
+    return NextResponse.json({ error: 'missing bookId', code: 'INVALID_ID' }, { status: 400 });
   }
   try {
     await ensureSchema();
@@ -111,11 +111,11 @@ export async function POST(req: NextRequest) {
       source_url: string;
     }[];
     if (books.length === 0) {
-      return NextResponse.json({ error: 'book not found' }, { status: 404 });
+      return NextResponse.json({ error: 'book not found', code: 'BOOK_NOT_FOUND' }, { status: 404 });
     }
     const book = books[0];
     if (!book.source_url) {
-      return NextResponse.json({ error: '该书没有来源链接' }, { status: 400 });
+      return NextResponse.json({ error: '该书没有来源链接', code: 'MISSING_SOURCE_URL' }, { status: 400 });
     }
     // 直接重试也先回收，避免必须先打开详情页查询才能解除僵尸任务的防重锁。
     await reclaimStaleTasks(sql);
@@ -126,7 +126,7 @@ export async function POST(req: NextRequest) {
       ORDER BY created_at DESC LIMIT 1`) as { id: number }[];
     if (existing.length > 0) {
       return NextResponse.json(
-        { error: '已有进行中的任务', taskId: existing[0].id },
+        { error: '已有进行中的任务', code: 'TASK_CONFLICT', taskId: existing[0].id },
         { status: 409 },
       );
     }
@@ -143,7 +143,7 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ taskId: created[0].id }, { status: 201 });
   } catch (e) {
     console.error(e);
-    return NextResponse.json({ error: 'db error' }, { status: 500 });
+    return NextResponse.json({ error: 'db error', code: 'DB_ERROR' }, { status: 500 });
   }
 }
 
@@ -155,13 +155,13 @@ export async function DELETE(req: NextRequest) {
     body = await readJsonBody(req, MAX_BODY_BYTES);
   } catch (e) {
     if (e instanceof RequestBodyError) {
-      return NextResponse.json({ error: e.message }, { status: 413 });
+      return NextResponse.json({ error: e.message, code: e.code }, { status: 413 });
     }
     throw e;
   }
-  const taskId = Number(body?.taskId);
-  if (!Number.isInteger(taskId) || taskId <= 0) {
-    return NextResponse.json({ error: 'missing taskId' }, { status: 400 });
+  const taskId = boundedPositiveInteger(body?.taskId);
+  if (taskId === null) {
+    return NextResponse.json({ error: 'missing taskId', code: 'INVALID_ID' }, { status: 400 });
   }
   try {
     await ensureSchema();
@@ -172,11 +172,11 @@ export async function DELETE(req: NextRequest) {
       WHERE id = ${taskId} AND status IN ('pending', 'failed')
       RETURNING id`) as { id: number }[];
     if (rows.length === 0) {
-      return NextResponse.json({ error: '只能取消排队中的任务或清理失败任务' }, { status: 409 });
+      return NextResponse.json({ error: '只能取消排队中的任务或清理失败任务', code: 'TASK_CONFLICT' }, { status: 409 });
     }
     return NextResponse.json({ ok: true });
   } catch (e) {
     console.error(e);
-    return NextResponse.json({ error: 'db error' }, { status: 500 });
+    return NextResponse.json({ error: 'db error', code: 'DB_ERROR' }, { status: 500 });
   }
 }

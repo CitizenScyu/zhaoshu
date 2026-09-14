@@ -124,6 +124,7 @@ export default function LibraryTab() {
   const [facets, setFacets] = useState<Facets>({ categories: [], finishStates: [] });
   const [total, setTotal] = useState(0);
   const [page, setPage] = useState(1);
+  const [maxPage, setMaxPage] = useState(10_000);
   const [query, setQuery] = useState('');
   const [search, setSearch] = useState('');
   const [category, setCategory] = useState('');
@@ -166,6 +167,7 @@ export default function LibraryTab() {
       if (my !== reqId.current) return;
       setBooks(data.books);
       setTotal(data.total);
+      setMaxPage(data.maxPage ?? 10_000);
       setFacets(data.facets ?? { categories: [], finishStates: [] });
     } catch (e) {
       if (signal?.aborted || my !== reqId.current) return;
@@ -374,7 +376,7 @@ export default function LibraryTab() {
   }
 
   const pageSize = 30;
-  const totalPages = Math.max(1, Math.ceil(total / pageSize));
+  const totalPages = Math.min(maxPage, Math.max(1, Math.ceil(total / pageSize)));
   const hasFilter = Boolean(search || category || tag || finish);
   const taskNotes = task?.error?.split(/\r?\n/).map((line) => line.trim()).filter(Boolean) ?? [];
 
@@ -662,6 +664,11 @@ export default function LibraryTab() {
             下一页
           </button>
         </div>
+      )}
+      {total > maxPage * pageSize && (
+        <p className="mt-3 text-xs" style={{ color: 'var(--ink-soft)' }}>
+          最多浏览前 {maxPage} 页，请使用搜索或筛选缩小范围。
+        </p>
       )}
     </div>
   );

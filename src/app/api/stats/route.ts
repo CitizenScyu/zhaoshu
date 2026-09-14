@@ -3,11 +3,12 @@ import { requireApiOwner } from '@/lib/auth';
 import { ensureSchema, getSql } from '@/lib/db';
 
 // 项目统计：聚合各表数据做「账本/战果」展示。全部用 SQL 聚合，不拉全表。
-// 每组独立容错：单表空/查询失败返回 0，不让整个接口 500。
+// 每组独立容错：真实空数据为 0，查询失败的整个分区为 null。
 export const maxDuration = 60;
 
 // 书架路由添加书时写入的伪 query，不算真正的找书行为（见 api/shelf/route.ts）
 const SHELF_PSEUDO_QUERY = '书库添加';
+type StatsSection = 'library' | 'download' | 'find' | 'shelf' | 'shuyuan';
 
 export interface StatsResponse {
   library: {
@@ -16,42 +17,52 @@ export interface StatsResponse {
     avgQuality: number | null;
     charsLabeled: number;
     genres: { name: string; count: number }[];
-  };
+  } | null;
   download: {
     total: number;
     done: number;
     chapters: number;
     chars: number;
-  };
+  } | null;
   find: {
     queries: number;
     recommendations: number;
-  };
+  } | null;
   shelf: {
     statuses: { name: string; count: number }[];
-  };
+  } | null;
   shuyuan: {
     total: number;
     active: number;
-  };
+  } | null;
   tokens: null;
+  availability: Record<StatsSection, boolean>;
+  error?: string;
+  code?: 'STATS_PARTIAL' | 'STATS_UNAVAILABLE';
 }
 
 export async function GET(req: NextRequest) {
   const unauthorized = requireApiOwner(req);
   if (unauthorized) return unauthorized;
 
-  await ensureSchema();
-  const s = getSql();
-
   const stats: StatsResponse = {
-    library: { total: 0, withQuality: 0, avgQuality: null, charsLabeled: 0, genres: [] },
-    download: { total: 0, done: 0, chapters: 0, chars: 0 },
-    find: { queries: 0, recommendations: 0 },
-    shelf: { statuses: [] },
-    shuyuan: { total: 0, active: 0 },
+    library: null,
+    download: null,
+    find: null,
+    shelf: null,
+    shuyuan: null,
+    availability: { library: false, download: false, find: false, shelf: false, shuyuan: false },
     tokens: null, // 占位：LLM token 用量第二期埋点后接入
   };
+
+  let s: ReturnType<typeof getSql>;
+  try {
+    await ensureSchema();
+    s = getSql();
+  } catch (error) {
+    console.error('stats initialization failed:', error);
+    return NextResponse.json({ ...stats, error: '统计暂不可用，请稍后重试', code: 'STATS_UNAVAILABLE' }, { status: 503 });
+  }
 
   try {
     const rows = (await s`
@@ -65,18 +76,20 @@ export async function GET(req: NextRequest) {
       avg_quality: number | null;
       chars_labeled: number;
     }[];
-    if (rows[0]) {
-      stats.library.total = rows[0].total;
-      stats.library.withQuality = rows[0].with_quality;
-      stats.library.avgQuality = rows[0].avg_quality;
-      stats.library.charsLabeled = rows[0].chars_labeled;
-    }
+    if (!rows[0]) throw new Error('Missing library aggregate');
     const genreRows = (await s`
       SELECT COALESCE(NULLIF(primary_genre, ''), category, '其他') AS genre,
              count(*)::int AS n
       FROM labeled_books
       GROUP BY 1 ORDER BY n DESC LIMIT 12`) as { genre: string; n: number }[];
-    stats.library.genres = genreRows.map((r) => ({ name: r.genre, count: r.n }));
+    stats.library = {
+      total: rows[0].total,
+      withQuality: rows[0].with_quality,
+      avgQuality: rows[0].avg_quality,
+      charsLabeled: rows[0].chars_labeled,
+      genres: genreRows.map((r) => ({ name: r.genre, count: r.n })),
+    };
+    stats.availability.library = true;
   } catch (e) {
     console.error('stats library aggregate failed:', e);
   }
@@ -93,12 +106,9 @@ export async function GET(req: NextRequest) {
       chapters: number;
       chars: number;
     }[];
-    if (rows[0]) {
-      stats.download.total = rows[0].total;
-      stats.download.done = rows[0].done;
-      stats.download.chapters = rows[0].chapters;
-      stats.download.chars = rows[0].chars;
-    }
+    if (!rows[0]) throw new Error('Missing download aggregate');
+    stats.download = rows[0];
+    stats.availability.download = true;
   } catch (e) {
     console.error('stats download aggregate failed:', e);
   }
@@ -111,10 +121,9 @@ export async function GET(req: NextRequest) {
       queries: number;
       recommendations: number;
     }[];
-    if (rows[0]) {
-      stats.find.queries = rows[0].queries;
-      stats.find.recommendations = rows[0].recommendations;
-    }
+    if (!rows[0]) throw new Error('Missing find aggregate');
+    stats.find = rows[0];
+    stats.availability.find = true;
   } catch (e) {
     console.error('stats find aggregate failed:', e);
   }
@@ -126,7 +135,8 @@ export async function GET(req: NextRequest) {
       name: string;
       count: number;
     }[];
-    stats.shelf.statuses = rows;
+    stats.shelf = { statuses: rows };
+    stats.availability.shelf = true;
   } catch (e) {
     console.error('stats shelf aggregate failed:', e);
   }
@@ -136,13 +146,22 @@ export async function GET(req: NextRequest) {
       SELECT count(*)::int AS total,
              count(*) FILTER (WHERE disabled_at IS NULL)::int AS active
       FROM shuyuan_sources`) as { total: number; active: number }[];
-    if (rows[0]) {
-      stats.shuyuan.total = rows[0].total;
-      stats.shuyuan.active = rows[0].active;
-    }
+    if (!rows[0]) throw new Error('Missing shuyuan aggregate');
+    stats.shuyuan = rows[0];
+    stats.availability.shuyuan = true;
   } catch (e) {
     console.error('stats shuyuan aggregate failed:', e);
   }
 
+  const available = Object.values(stats.availability);
+  if (available.some((value) => !value)) {
+    stats.error = '部分统计暂不可用，请稍后重试';
+    stats.code = 'STATS_PARTIAL';
+  }
+  if (available.every((value) => !value)) {
+    stats.error = '统计暂不可用，请稍后重试';
+    stats.code = 'STATS_UNAVAILABLE';
+    return NextResponse.json(stats, { status: 503 });
+  }
   return NextResponse.json(stats);
 }

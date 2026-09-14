@@ -12,7 +12,7 @@ export function requireApiOwner(req: NextRequest): NextResponse | null {
   const expected = process.env.APP_OWNER_TOKEN;
   if (!expected) {
     return NextResponse.json(
-      { error: 'APP_OWNER_TOKEN is not configured' },
+      { error: 'APP_OWNER_TOKEN is not configured', code: 'OWNER_NOT_CONFIGURED' },
       { status: 503 },
     );
   }
@@ -22,7 +22,7 @@ export function requireApiOwner(req: NextRequest): NextResponse | null {
     ? authorization.slice('Bearer '.length)
     : req.headers.get('x-owner-token') ?? '';
   if (!equalSecret(provided, expected)) {
-    return NextResponse.json({ error: 'unauthorized' }, { status: 401 });
+    return NextResponse.json({ error: 'unauthorized', code: 'UNAUTHORIZED' }, { status: 401 });
   }
   return null;
 }

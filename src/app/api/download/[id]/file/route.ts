@@ -1,13 +1,15 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { requireApiOwner } from '@/lib/auth';
 import { ensureSchema, getSql } from '@/lib/db';
+import { boundedPositiveInteger } from '@/lib/http';
 
 // 下载完成的任务取回 TXT:文件在 GitHub 私库 CitizenScyu/zhaoshu-books 的 books/ 下
 export const maxDuration = 60;
 
 const REPO = process.env.ZHAOSHU_BOOKS_REPO || 'CitizenScyu/zhaoshu-books';
 const BOOKS_DIR = 'books';
-const GITHUB_TIMEOUT_MS = 60_000;
+// One budget spans lookup and the raw stream, leaving room below maxDuration.
+const GITHUB_TIMEOUT_MS = 55_000;
 const UA = { 'User-Agent': 'zhaoshu-downloader/1.0' };
 
 // 必须与 zhaoshu-books/worker.mjs 的 sanitizeFilename 完全一致:
@@ -40,18 +42,41 @@ function contentsUrl(path: string): string {
   return `https://api.github.com/repos/${REPO}/contents/${path}`;
 }
 
-// 在 books/ 目录里按 worker 的命名规则定位文件:先精确匹配,再按书名前缀兜底
-async function findBookName(title: string, author: string): Promise<string | null> {
-  const res = await fetch(contentsUrl(BOOKS_DIR), {
-    headers: ghHeaders('application/vnd.github+json'),
+class FileUpstreamError extends Error {
+  constructor(
+    message: string,
+    readonly code: 'UPSTREAM_RATE_LIMITED' | 'UPSTREAM_ERROR',
+    readonly status: number,
+  ) {
+    super(message);
+  }
+}
+
+async function githubResponse(path: string, accept: string, signal: AbortSignal): Promise<Response | null> {
+  const res = await fetch(contentsUrl(path), {
+    headers: ghHeaders(accept),
     cache: 'no-store',
-    signal: AbortSignal.timeout(GITHUB_TIMEOUT_MS),
+    signal,
   });
   if (!res.ok) {
-    throw new Error(`GitHub 目录读取失败: HTTP ${res.status}`);
+    void res.body?.cancel().catch(() => {});
+    if (res.status === 404) return null;
+    if (res.status === 429 || (res.status === 403 && res.headers.get('x-ratelimit-remaining') === '0')) {
+      throw new FileUpstreamError('文件服务请求受限，请稍后重试', 'UPSTREAM_RATE_LIMITED', 503);
+    }
+    throw new FileUpstreamError('文件服务暂不可用，请稍后重试', 'UPSTREAM_ERROR', 502);
   }
+  return res;
+}
+
+// 在 books/ 目录里按 worker 的命名规则定位文件:先精确匹配,再按书名前缀兜底
+async function findBookName(title: string, author: string, signal: AbortSignal): Promise<string | null> {
+  const res = await githubResponse(BOOKS_DIR, 'application/vnd.github+json', signal);
+  if (!res) return null;
   const listing: unknown = await res.json();
-  if (!Array.isArray(listing)) return null;
+  if (!Array.isArray(listing)) {
+    throw new FileUpstreamError('文件服务返回了无效目录，请稍后重试', 'UPSTREAM_ERROR', 502);
+  }
   const names = listing
     .map((e) => (e as Partial<DirEntry>)?.name)
     .filter((n): n is string => typeof n === 'string' && n.endsWith('.txt'));
@@ -70,16 +95,12 @@ async function findBookName(title: string, author: string): Promise<string | nul
 }
 
 // 直接请求 raw 文件流,避免 JSON/base64 解码或整体缓冲 TXT
-async function readFile(name: string): Promise<ReadableStream<Uint8Array> | null> {
+async function readFile(name: string, signal: AbortSignal): Promise<ReadableStream<Uint8Array> | null> {
   const path = `${BOOKS_DIR}/${encodeURIComponent(name)}`;
-  const res = await fetch(contentsUrl(path), {
-    headers: ghHeaders('application/vnd.github.raw'),
-    cache: 'no-store',
-    signal: AbortSignal.timeout(GITHUB_TIMEOUT_MS),
-  });
-  if (res.status === 404) return null;
-  if (!res.ok) {
-    throw new Error(`GitHub 文件读取失败: HTTP ${res.status}`);
+  const res = await githubResponse(path, 'application/vnd.github.raw', signal);
+  if (!res) return null;
+  if (!res.body) {
+    throw new FileUpstreamError('文件服务返回了空响应，请稍后重试', 'UPSTREAM_ERROR', 502);
   }
   return res.body;
 }
@@ -91,13 +112,16 @@ export async function GET(
   const unauthorized = requireApiOwner(req);
   if (unauthorized) return unauthorized;
   const { id } = await params;
-  const taskId = Number(id);
-  if (!Number.isInteger(taskId) || taskId <= 0) {
-    return NextResponse.json({ error: 'invalid id' }, { status: 400 });
+  const taskId = boundedPositiveInteger(id);
+  if (taskId === null) {
+    return NextResponse.json({ error: 'invalid id', code: 'INVALID_ID' }, { status: 400 });
   }
   if (!process.env.GITHUB_TOKEN) {
-    return NextResponse.json({ error: 'GITHUB_TOKEN is not configured' }, { status: 503 });
+    return NextResponse.json({ error: 'GITHUB_TOKEN is not configured', code: 'FILE_SERVICE_NOT_CONFIGURED' }, { status: 503 });
   }
+  const timeout = AbortSignal.timeout(GITHUB_TIMEOUT_MS);
+  const signal = AbortSignal.any([req.signal, timeout]);
+  let task: { id: number; title: string; author: string; status: string };
   try {
     await ensureSchema();
     const sql = getSql();
@@ -109,20 +133,26 @@ export async function GET(
       status: string;
     }[];
     if (rows.length === 0) {
-      return NextResponse.json({ error: 'task not found' }, { status: 404 });
+      return NextResponse.json({ error: 'task not found', code: 'TASK_NOT_FOUND' }, { status: 404 });
     }
-    const task = rows[0];
+    task = rows[0];
     if (task.status !== 'done') {
-      return NextResponse.json({ error: '任务尚未完成' }, { status: 400 });
+      return NextResponse.json({ error: '任务尚未完成', code: 'TASK_NOT_READY' }, { status: 400 });
     }
+  } catch (e) {
+    console.error(e);
+    return NextResponse.json({ error: 'db error', code: 'DB_ERROR' }, { status: 500 });
+  }
 
-    const name = await findBookName(task.title, task.author);
+  try {
+    signal.throwIfAborted();
+    const name = await findBookName(task.title, task.author, signal);
     if (!name) {
-      return NextResponse.json({ error: 'file not found' }, { status: 404 });
+      return NextResponse.json({ error: 'file not found', code: 'FILE_NOT_FOUND' }, { status: 404 });
     }
-    const body = await readFile(name);
+    const body = await readFile(name, signal);
     if (!body) {
-      return NextResponse.json({ error: 'file not found' }, { status: 404 });
+      return NextResponse.json({ error: 'file not found', code: 'FILE_NOT_FOUND' }, { status: 404 });
     }
 
     const downloadName = `${sanitizeFilename(task.title) || 'novel'}.txt`;
@@ -138,6 +168,15 @@ export async function GET(
     });
   } catch (e) {
     console.error(e);
-    return NextResponse.json({ error: 'file not found' }, { status: 404 });
+    if (req.signal.aborted && !timeout.aborted) {
+      return NextResponse.json({ error: '请求已取消', code: 'REQUEST_ABORTED' }, { status: 499 });
+    }
+    if (timeout.aborted || (e instanceof Error && (e.name === 'TimeoutError' || e.name === 'AbortError'))) {
+      return NextResponse.json({ error: '文件服务响应超时，请稍后重试', code: 'UPSTREAM_TIMEOUT' }, { status: 504 });
+    }
+    if (e instanceof FileUpstreamError) {
+      return NextResponse.json({ error: e.message, code: e.code }, { status: e.status });
+    }
+    return NextResponse.json({ error: '文件服务暂不可用，请稍后重试', code: 'UPSTREAM_ERROR' }, { status: 502 });
   }
 }

@@ -114,7 +114,7 @@ describe('/api/download recovery and cleanup', () => {
     const res = await GET(request('GET'));
 
     expect(res.status).toBe(500);
-    expect(await res.json()).toEqual({ error: 'db error' });
+    expect(await res.json()).toEqual({ error: 'db error', code: 'DB_ERROR' });
     expect(sql).toHaveBeenCalledOnce();
   });
 
@@ -143,7 +143,7 @@ describe('/api/download recovery and cleanup', () => {
     const res = await POST(request('POST', { bookId: book.id }));
 
     expect(res.status).toBe(409);
-    expect(await res.json()).toEqual({ error: '已有进行中的任务', taskId: 42 });
+    expect(await res.json()).toEqual({ error: '已有进行中的任务', code: 'TASK_CONFLICT', taskId: 42 });
     expectSafeReclaim(1);
     expect(sql).toHaveBeenCalledTimes(3);
     expect(triggerDownloadWorkflow).not.toHaveBeenCalled();
@@ -174,7 +174,37 @@ describe('/api/download recovery and cleanup', () => {
     const res = await DELETE(request('DELETE', { taskId: recoveredTask.id }));
 
     expect(res.status).toBe(409);
-    expect(await res.json()).toEqual({ error: '只能取消排队中的任务或清理失败任务' });
+    expect(await res.json()).toEqual({ error: '只能取消排队中的任务或清理失败任务', code: 'TASK_CONFLICT' });
     expect(sql).toHaveBeenCalledOnce();
+  });
+
+  it.each(['', '1.5', 'Infinity', '1e2', '2147483648', '9007199254740992'])('rejects GET id %s before recovery writes', async (id) => {
+    const res = await GET(request('GET', undefined, `?id=${encodeURIComponent(id)}`));
+    expect(res.status).toBe(400);
+    expect(await res.json()).toEqual({ error: 'invalid id', code: 'INVALID_ID' });
+    expect(ensureSchema).not.toHaveBeenCalled();
+    expect(sql).not.toHaveBeenCalled();
+  });
+
+  it.each([null, true, [7], 1.5, 'Infinity', '1.0', 2147483648, '9007199254740992'])('rejects POST/DELETE IDs %s before writes or dispatch', async (id) => {
+    const post = await POST(request('POST', { bookId: id }));
+    const remove = await DELETE(request('DELETE', { taskId: id }));
+    expect(post.status).toBe(400);
+    expect(remove.status).toBe(400);
+    expect(await post.json()).toEqual({ error: 'missing bookId', code: 'INVALID_ID' });
+    expect(await remove.json()).toEqual({ error: 'missing taskId', code: 'INVALID_ID' });
+    expect(ensureSchema).not.toHaveBeenCalled();
+    expect(sql).not.toHaveBeenCalled();
+    expect(triggerDownloadWorkflow).not.toHaveBeenCalled();
+  });
+
+  it.each(['POST', 'DELETE'] as const)('rejects oversized %s bodies without content-length', async (method) => {
+    const req = request(method, { bookId: 7, taskId: 42, extra: 'x'.repeat(4096) });
+    expect(req.headers.has('content-length')).toBe(false);
+    const res = await (method === 'POST' ? POST : DELETE)(req);
+    expect(res.status).toBe(413);
+    expect(await res.json()).toEqual({ error: 'request body too large', code: 'BODY_TOO_LARGE' });
+    expect(sql).not.toHaveBeenCalled();
+    expect(triggerDownloadWorkflow).not.toHaveBeenCalled();
   });
 });
