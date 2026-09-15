@@ -4,6 +4,52 @@ import { useEffect, useRef, useState, useSyncExternalStore } from 'react';
 import type { Candidate, RerankedItem, VerifiedCandidate, FeedbackStatus } from '@/lib/types';
 import { useOwner } from '@/components/OwnerProvider';
 import FeedbackEditor from '@/components/FeedbackEditor';
+import { isRecord } from '@/lib/sanitize';
+
+// 找书三步的后端下行是真 SSE：事件 `data: <json>\n\n`。phase/progress 实时帧、
+// result 结束帧、error 错误帧（带可识别 code）。SSE 断线/超时给用户可识别错误与重试入口。
+type SseEvent = Record<string, unknown> & { type: string };
+const FIND_FETCH_TIMEOUT_MS = 290_000; // 略低于 295s 路由上限，避免读到一半被平台掐掉
+
+async function consumeFindSSE(
+  response: Response,
+  signal: AbortSignal,
+  timeoutMs: number,
+  onEvent: (event: SseEvent) => void,
+): Promise<void> {
+  if (!response.body) throw new Error('找书响应为空，请重试');
+  const reader = response.body.getReader();
+  const race = AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)]);
+  const decoder = new TextDecoder('utf-8');
+  let buf = '';
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      race.throwIfAborted();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      let boundary: number;
+      while ((boundary = buf.indexOf('\n\n')) !== -1) {
+        const frame = buf.slice(0, boundary);
+        buf = buf.slice(boundary + 2);
+        const m = frame.match(/^data: (.+)$/m);
+        if (!m) continue;
+        let data: unknown;
+        try { data = JSON.parse(m[1]); } catch { continue; }
+        if (!isRecord(data) || typeof data.type !== 'string') continue;
+        const type = data.type as string;
+        if (type === 'error') {
+          const e = new Error(typeof data.message === 'string' ? data.message : '找书失败，请重试');
+          (e as Error & { code?: string }).code = typeof data.code === 'string' ? data.code : undefined;
+          throw e;
+        }
+        onEvent(data as SseEvent);
+      }
+    }
+  } finally {
+    try { await reader.cancel(); } catch { /* 已取消或已关闭 */ }
+  }
+}
 
 // 示例池：每次进入页面随机抽几条，避免永远是同样几句
 const EXAMPLE_POOL = [
@@ -65,7 +111,9 @@ type Phase = 'idle' | 'recall' | 'verify' | 'rerank' | 'done' | 'error';
 export default function FindTab() {
   const { apiFetch } = useOwner();
   const [query, setQuery] = useState('');
-  const [conditions, setConditions] = useState('');
+  const [onlyThisTime, setOnlyThisTime] = useState(false); // 「仅本次有效」checkbox：默认不勾=长期
+  const [verifyTotal, setVerifyTotal] = useState(0);
+  const [verifyDone, setVerifyDone] = useState(0);
   const [phase, setPhase] = useState<Phase>('idle');
   const [candidates, setCandidates] = useState<Candidate[]>([]);
   const [results, setResults] = useState<RerankedItem[]>([]);
@@ -87,67 +135,115 @@ export default function FindTab() {
 
   async function run() {
     const q = query.trim();
-    const currentConditions = conditions.trim();
     if (!q || phase === 'recall' || phase === 'verify' || phase === 'rerank') return;
     rememberQuery(q);
     setPhase('recall');
     setError('');
     setCandidates([]);
     setResults([]);
+    setVerifyTotal(0);
+    setVerifyDone(0);
     const controller = new AbortController();
     request.current = controller;
+
+    // 勾选「仅本次有效」：本次输入走 conditions 通道（soft 约束、不写入长期画像/不入记忆）；
+    // 未勾 = 长期通道（conditions 传空），行为同现状。
+    const conditions = onlyThisTime ? q : '';
+    const stepBody = (step: string, extra: Record<string, unknown> = {}) => JSON.stringify({
+      step, query: q, conditions, ...extra,
+    });
+
     try {
-      const r1 = await apiFetch('/api/find', {
-        signal: controller.signal,
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ step: 'recall', query: q, conditions: currentConditions }),
-      });
-      const d1 = await r1.json();
-      controller.signal.throwIfAborted();
-      if (!r1.ok) throw new Error(d1.error || '召回失败');
-      setCandidates(d1.candidates);
-
+      // 1) recall：消费流，拿到 candidates。
+      const recalled = await fetchStepResult<Candidate[]>(
+        controller.signal,
+        () => apiFetch('/api/find', {
+          signal: controller.signal, method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: stepBody('recall'),
+        }),
+        'candidates',
+      );
+      setCandidates(recalled);
       setPhase('verify');
-      const r2 = await apiFetch('/api/find', {
-        signal: controller.signal,
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ step: 'verify', candidates: d1.candidates }),
-      });
-      const d2 = await r2.json();
-      controller.signal.throwIfAborted();
-      if (!r2.ok) throw new Error(d2.error || '验证失败');
-      const verified: VerifiedCandidate[] = d2.verified;
 
+      // 2) verify：实时 progress 帧更新进度；结束帧返回 verified。
+      const verified = await fetchStepResult<VerifiedCandidate[]>(
+        controller.signal,
+        () => apiFetch('/api/find', {
+          signal: controller.signal, method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: stepBody('verify', { candidates: recalled }),
+        }),
+        'verified',
+      );
       setPhase('rerank');
-      const r3 = await apiFetch('/api/find', {
-        signal: controller.signal,
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ step: 'rerank', query: q, conditions: currentConditions, verified }),
-      });
-      const d3 = await r3.json();
-      controller.signal.throwIfAborted();
-      if (!r3.ok) throw new Error(d3.error || '重排失败');
-      setResults(d3.items);
-      if (d3.persisted === false) {
-        setError('推荐已生成，但保存到书架失败');
-      }
+
+      // 3) rerank：结束帧带 items（+persisted）。
+      const items = await fetchStepResult<RerankedItem[]>(
+        controller.signal,
+        () => apiFetch('/api/find', {
+          signal: controller.signal, method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: stepBody('rerank', { verified }),
+        }),
+        'items',
+      );
+      setResults(items);
       setPhase('done');
     } catch (e) {
       if (controller.signal.aborted) return;
-      setError(e instanceof Error ? e.message : '未知错误');
+      // SSE 断线/超时/后端 error 帧都带可识别 code，提示里给用户可操作重试入口。
+      const code = (e as Error & { code?: string }).code;
+      const base = e instanceof Error ? e.message : '未知错误';
+      setError(code ? `${base}（${code}）` : base);
       setPhase('error');
     } finally {
       if (request.current === controller) request.current = null;
     }
   }
 
+  // 发送一步并取得它的 result 帧；同时把实时 progress/phase 帧喂给页面进度。
+  async function fetchStepResult<T>(
+    signal: AbortSignal,
+    doFetch: () => Promise<Response>,
+    field: 'candidates' | 'verified' | 'items',
+  ): Promise<T> {
+    const event = await fetchResultEvent(signal, doFetch);
+    if (!Array.isArray(event[field])) throw new Error('找书结果不完整，请重试');
+    return event[field] as T;
+  }
+
+  async function fetchResultEvent(
+    signal: AbortSignal,
+    doFetch: () => Promise<Response>,
+  ): Promise<SseEvent & { [k: string]: unknown }> {
+    const res = await doFetch();
+    signal.throwIfAborted();
+    if (!res.ok || !/text\/event-stream/i.test(res.headers.get('content-type') ?? '')) {
+      const data = await res.json().catch(() => ({}));
+      signal.throwIfAborted();
+      throw new Error((data as { error?: string }).error || '找书失败，请重试');
+    }
+    const race = AbortSignal.any([signal, AbortSignal.timeout(FIND_FETCH_TIMEOUT_MS)]);
+    return await new Promise<SseEvent & { [k: string]: unknown }>((resolve, reject) => {
+      void consumeFindSSE(res, race, FIND_FETCH_TIMEOUT_MS, (event) => {
+        if (event.type === 'result') {
+          resolve(event);
+        } else if (event.type === 'progress' && event.step === 'verify') {
+          setVerifyTotal(typeof event.total === 'number' ? event.total : 0);
+          setVerifyDone(typeof event.done === 'number' ? event.done : 0);
+        } else if (event.type === 'phase' && event.step === 'verify') {
+          setVerifyTotal(typeof event.total === 'number' ? event.total : 0);
+        }
+      }).catch((e) => reject(e instanceof Error ? e : new Error('找书失败，请重试')));
+    });
+  }
+
   const busy = phase === 'recall' || phase === 'verify' || phase === 'rerank';
   const steps: { key: Phase; label: string }[] = [
     { key: 'recall', label: `召回${candidates.length ? ` ${candidates.length} 本` : ''}` },
-    { key: 'verify', label: '豆瓣验证' },
+    { key: 'verify', label: `豆瓣验证${verifyTotal ? ` ${verifyDone}/${verifyTotal}` : ''}` },
     { key: 'rerank', label: '按画像重排' },
   ];
 
@@ -166,28 +262,19 @@ export default function FindTab() {
             if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) run();
           }}
         />
-        <div className="border-l-2 pl-3" style={{ borderColor: 'var(--line)' }}>
-          <div className="flex flex-wrap items-center gap-2 mb-2">
-            <label htmlFor="find-conditions" className="text-sm font-bold">仅本次条件</label>
-            <span className="text-xs" style={{ color: 'var(--ink-faint)' }}>
-              与长期画像分开，不会自动保存
-            </span>
-            {conditions && (
-              <button type="button" className="chip text-xs ml-auto" onClick={() => setConditions('')}>
-                清空本次条件
-              </button>
-            )}
-          </div>
-          <input
-            id="find-conditions"
-            className="paper-input text-sm w-full"
-            value={conditions}
-            onChange={(event) => setConditions(event.target.value)}
-            placeholder="例如：这次想轻松一点、偏短篇、节奏快；这些是软意图，属性仍需核验"
-          />
-          <p className="text-xs mt-1.5 leading-5" style={{ color: 'var(--ink-faint)' }}>
-            题材、节奏等用于本轮匹配；完结、字数、雷点等只有出现明确证据时才算已核验约束。
-          </p>
+        <div className="flex items-center gap-2 text-xs">
+          <label className="inline-flex items-center gap-1.5 cursor-pointer select-none">
+            <input
+              type="checkbox"
+              checked={onlyThisTime}
+              onChange={(e) => setOnlyThisTime(e.target.checked)}
+              className="accent-[var(--cinnabar)]"
+            />
+            <span>仅本次有效</span>
+          </label>
+          <span style={{ color: 'var(--ink-faint)' }}>
+            勾选后本次需求只用于本轮匹配，不写入长期画像/不进入记忆；默认长期记录。
+          </span>
         </div>
         <div className="flex flex-wrap items-center gap-2">
           {recent.length > 0 && (
