@@ -1,8 +1,10 @@
 import { neon } from '@neondatabase/serverless';
 import type { ProfileSnapshot, RerankedItem } from '@/lib/types';
 import { LLM_USAGE_PHASES, type LlmUsagePhase, type LlmUsageRecord, type TokenStats, type TokenTotals } from './llm-usage';
+import { initializeAuthSchema } from './auth-store';
 
 const DATABASE_URL = process.env.DATABASE_URL;
+const OWNER_USER_ID = 1;
 
 let sql: ReturnType<typeof neon> | null = null;
 
@@ -34,6 +36,7 @@ let schemaPromise: Promise<void> | null = null;
 
 async function createSchema() {
   const s = getSql();
+  // 认证迁移负责建立用户外键，旧个人数据表必须先存在。
   await s`
     CREATE TABLE IF NOT EXISTS profile (
       id int PRIMARY KEY DEFAULT 1,
@@ -79,6 +82,7 @@ async function createSchema() {
       note text NOT NULL DEFAULT '',
       created_at timestamptz NOT NULL DEFAULT now()
     )`;
+  await initializeAuthSchema(s);
   await s`
     CREATE TABLE IF NOT EXISTS shuyuan_sources (
       id serial PRIMARY KEY,
@@ -242,9 +246,13 @@ export async function getLlmUsageStats(): Promise<TokenStats> {
 }
 
 export async function getProfile(): Promise<ProfileSnapshot> {
+  return getProfileForUser(OWNER_USER_ID);
+}
+
+export async function getProfileForUser(userId: number): Promise<ProfileSnapshot> {
   const s = getSql();
   const rows = (await s`
-    SELECT seeds, content, updated_at::text AS updated_at FROM profile WHERE id = 1`) as {
+    SELECT seeds, content, updated_at::text AS updated_at FROM profile WHERE id = ${userId}`) as {
     seeds: ProfileSnapshot['seeds'];
     content: string;
     updated_at: string;
@@ -264,6 +272,15 @@ export async function saveProfile(
   content: string,
   expectedUpdatedAt: string,
 ): Promise<string | null> {
+  return saveProfileForUser(OWNER_USER_ID, seeds, content, expectedUpdatedAt);
+}
+
+export async function saveProfileForUser(
+  userId: number,
+  seeds: unknown,
+  content: string,
+  expectedUpdatedAt: string,
+): Promise<string | null> {
   if (typeof expectedUpdatedAt !== 'string' || !expectedUpdatedAt.trim()) {
     throw new Error('profile version is required');
   }
@@ -273,36 +290,52 @@ export async function saveProfile(
     UPDATE profile
     SET seeds = ${JSON.stringify(seeds)}::jsonb, content = ${content},
         updated_at = GREATEST(clock_timestamp(), updated_at + interval '1 microsecond')
-    WHERE id = 1 AND updated_at::text = ${expectedUpdatedAt}
+    WHERE id = ${userId} AND updated_at::text = ${expectedUpdatedAt}
     RETURNING updated_at::text AS updated_at` as { updated_at: string }[];
   return rows[0]?.updated_at ?? null;
 }
 
 export async function getExcludedBookKeys(): Promise<string[]> {
+  return getExcludedBookKeysForUser(OWNER_USER_ID);
+}
+
+export async function getExcludedBookKeysForUser(userId: number): Promise<string[]> {
   const s = getSql();
   const rows = (await s`
     SELECT b.title, b.author
     FROM books b
     WHERE EXISTS (
       SELECT 1 FROM feedback f
-      WHERE f.book_id = b.id AND f.status IN ('done', 'dropped')
+      WHERE f.book_id = b.id AND f.user_id = ${userId} AND f.status IN ('done', 'dropped')
     )`) as { title: string; author: string }[];
   return rows.map((row) => canonicalBookKey(row.title, row.author));
 }
 
 // 已读/弃书列表（带书名作者，供提示词软约束用）
 export async function getExcludedBookTitles(): Promise<{ title: string; author: string }[]> {
+  return getExcludedBookTitlesForUser(OWNER_USER_ID);
+}
+
+export async function getExcludedBookTitlesForUser(userId: number): Promise<{ title: string; author: string }[]> {
   const s = getSql();
   return (await s`
     SELECT b.title, b.author
     FROM books b
     WHERE EXISTS (
       SELECT 1 FROM feedback f
-      WHERE f.book_id = b.id AND f.status IN ('done', 'dropped')
+      WHERE f.book_id = b.id AND f.user_id = ${userId} AND f.status IN ('done', 'dropped')
     )`) as { title: string; author: string }[];
 }
 
 export async function persistRecommendations(
+  query: string,
+  items: RerankedItem[],
+): Promise<void> {
+  return persistRecommendationsForUser(OWNER_USER_ID, query, items);
+}
+
+export async function persistRecommendationsForUser(
+  userId: number,
   query: string,
   items: RerankedItem[],
 ): Promise<void> {
@@ -319,12 +352,12 @@ export async function persistRecommendations(
           douban_rating_count = COALESCE(EXCLUDED.douban_rating_count, books.douban_rating_count),
           meta = books.meta || EXCLUDED.meta`);
   const recommendationQueries = items.map((item) => s`
-    INSERT INTO recommendations (book_id, query, match_score, hit_likes, risks, reason)
-    SELECT id, ${query}, ${item.matchScore}, ${JSON.stringify(item.hitLikes)}::jsonb,
+    INSERT INTO recommendations (user_id, book_id, query, match_score, hit_likes, risks, reason)
+    SELECT ${userId}, id, ${query}, ${item.matchScore}, ${JSON.stringify(item.hitLikes)}::jsonb,
            ${item.risks}, ${item.reason}
     FROM books
     WHERE lower(title) = lower(${item.title}) AND lower(author) = lower(${item.author})
-    ON CONFLICT (book_id, query) DO UPDATE
+    ON CONFLICT (user_id, book_id, query) DO UPDATE
       SET match_score = EXCLUDED.match_score,
           hit_likes = EXCLUDED.hit_likes,
           risks = EXCLUDED.risks,

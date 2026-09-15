@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { LLM_USAGE_PHASES, parseLlmUsage, type LlmUsageRecord, type TokenTotals } from './llm-usage';
 
-const mocks = vi.hoisted(() => ({ neon: vi.fn(), sql: vi.fn() }));
+const mocks = vi.hoisted(() => ({ neon: vi.fn(), sql: vi.fn(), transaction: vi.fn() }));
 vi.mock('@neondatabase/serverless', () => ({ neon: mocks.neon }));
 
 const zero: TokenTotals = { prompt: 0, completion: 0, total: 0, cache: 0, calls: 0, missingUsageCalls: 0 };
@@ -25,8 +25,9 @@ describe('LLM usage storage and aggregates (mocked Neon HTTP queries)', () => {
     vi.resetModules();
     vi.resetAllMocks();
     vi.stubEnv('DATABASE_URL', 'postgresql://test:test@database.invalid/test');
-    mocks.neon.mockReturnValue(mocks.sql);
+    mocks.neon.mockReturnValue(Object.assign(mocks.sql, { transaction: mocks.transaction }));
     mocks.sql.mockResolvedValue([]);
+    mocks.transaction.mockImplementation(async (builder: (tx: typeof mocks.sql) => unknown[]) => builder(mocks.sql));
     vi.spyOn(console, 'error').mockImplementation(() => {});
   });
   afterEach(() => { vi.unstubAllEnvs(); vi.restoreAllMocks(); });
