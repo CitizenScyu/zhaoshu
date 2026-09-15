@@ -140,9 +140,11 @@ export async function verifyBook(
 
 // 并发受限地验证一批书（豆瓣对高频不友好，限制在 3）。
 // 传入预算 signal：预算耗尽即停止新增探测（signal.abort 后 worker 不再领新任务）。
+// onProgress 每完成一本回调一次（供找书 SSE 实时上报验证进度）。
 export async function verifyBatch(
   books: { title: string; author?: string }[],
   signal?: AbortSignal,
+  onProgress?: (done: number) => void,
 ): Promise<DoubanInfo[]> {
   const results: DoubanInfo[] = new Array(books.length).fill(null).map(() => ({
     status: 'unavailable',
@@ -151,6 +153,7 @@ export async function verifyBatch(
   }));
   const CONCURRENCY = 3;
   let next = 0;
+  let completed = 0;
   async function worker() {
     while (next < books.length) {
       if (signal?.aborted) {
@@ -159,6 +162,8 @@ export async function verifyBatch(
       }
       const i = next++;
       results[i] = await verifyBook(books[i].title, books[i].author, signal);
+      completed += 1;
+      try { onProgress?.(completed); } catch { /* 进度回调不阻断验证 */ }
     }
   }
   await Promise.all(Array.from({ length: Math.min(CONCURRENCY, books.length) }, worker));
