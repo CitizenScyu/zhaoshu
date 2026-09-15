@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { requireApiOwner } from '@/lib/auth';
-import { ensureSchema, getSql } from '@/lib/db';
+import { ensureSchema, getLlmUsageStats, getSql } from '@/lib/db';
+import type { TokenStats } from '@/lib/llm-usage';
 
 // 项目统计：聚合各表数据做「账本/战果」展示。全部用 SQL 聚合，不拉全表。
 // 每组独立容错：真实空数据为 0，查询失败的整个分区为 null。
@@ -8,7 +9,7 @@ export const maxDuration = 60;
 
 // 书架路由添加书时写入的伪 query，不算真正的找书行为（见 api/shelf/route.ts）
 const SHELF_PSEUDO_QUERY = '书库添加';
-type StatsSection = 'library' | 'download' | 'find' | 'shelf' | 'shuyuan';
+type StatsSection = 'library' | 'download' | 'find' | 'shelf' | 'shuyuan' | 'tokens';
 
 export interface StatsResponse {
   library: {
@@ -35,7 +36,7 @@ export interface StatsResponse {
     total: number;
     active: number;
   } | null;
-  tokens: null;
+  tokens: TokenStats | null;
   availability: Record<StatsSection, boolean>;
   error?: string;
   code?: 'STATS_PARTIAL' | 'STATS_UNAVAILABLE';
@@ -51,8 +52,8 @@ export async function GET(req: NextRequest) {
     find: null,
     shelf: null,
     shuyuan: null,
-    availability: { library: false, download: false, find: false, shelf: false, shuyuan: false },
-    tokens: null, // 占位：LLM token 用量第二期埋点后接入
+    availability: { library: false, download: false, find: false, shelf: false, shuyuan: false, tokens: false },
+    tokens: null,
   };
 
   let s: ReturnType<typeof getSql>;
@@ -151,6 +152,13 @@ export async function GET(req: NextRequest) {
     stats.availability.shuyuan = true;
   } catch (e) {
     console.error('stats shuyuan aggregate failed:', e);
+  }
+
+  try {
+    stats.tokens = await getLlmUsageStats();
+    stats.availability.tokens = true;
+  } catch (e) {
+    console.error('stats tokens aggregate failed:', e);
   }
 
   const available = Object.values(stats.availability);

@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { chatRobust, parseJson, LlmError } from '@/lib/llm';
+import { recordUsageAfterResponse } from '@/lib/record-llm-usage';
 import { verifyBatch } from '@/lib/douban';
 import {
   ensureSchema,
@@ -87,10 +88,10 @@ export async function POST(req: NextRequest) {
         ...profile.seeds.map((seed) => ({ title: seed.title, author: seed.author ?? '' })),
         ...(await getExcludedBookTitles()),
       ];
-      const raw = await chatRobust(
+      const { content: raw } = await chatRobust(
         recallSystem(),
         recallUser(profile.content, query, excludedBooks),
-        { temperature: 0.8, signal: req.signal },
+        { temperature: 0.8, signal: req.signal, onUsage: recordUsageAfterResponse('find_recall') },
       );
       const candidates = sanitizeCandidates(modelList(raw, 'candidates', MAX_CANDIDATES))
         .filter((candidate) =>
@@ -122,10 +123,10 @@ export async function POST(req: NextRequest) {
         return NextResponse.json({ error: 'missing query or verified' }, { status: 400 });
       }
       const { content: profile } = await getProfile();
-      const raw = await chatRobust(
+      const { content: raw } = await chatRobust(
         rerankSystem(),
         rerankUser(profile, query, JSON.stringify(verified)),
-        { temperature: 0.3, signal: req.signal },
+        { temperature: 0.3, signal: req.signal, onUsage: recordUsageAfterResponse('find_rerank') },
       );
       // 用书名+作者关联，避免同名作品回填到错误的豆瓣条目。
       const byBook = new Map(verified.map((v) => [bookKey(v.title, v.author), v]));

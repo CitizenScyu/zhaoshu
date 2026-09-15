@@ -2,9 +2,10 @@
 
 import { useCallback, useEffect, useState } from 'react';
 import { useOwner } from '@/components/OwnerProvider';
+import { TokenStatTile, TokenUsageDetails } from '@/components/TokenStats';
 import type { StatsResponse as Stats } from '@/app/api/stats/route';
 
-const SECTION_NAMES = { library: '书库', download: '下载', find: '找书', shelf: '书架', shuyuan: '书源' };
+const SECTION_NAMES = { library: '书库', download: '下载', find: '找书', shelf: '书架', shuyuan: '书源', tokens: '模型用量' };
 
 // 与 ShelfTab 的分组口径一致
 const SHELF_STATUS: Record<string, { label: string; color: string }> = {
@@ -127,7 +128,7 @@ export default function StatsTab() {
   const shelfTotal = stats?.shelf ? stats.shelf.statuses.reduce((sum, s) => sum + s.count, 0) : null;
   const unavailable = stats
     ? (Object.keys(SECTION_NAMES) as (keyof typeof SECTION_NAMES)[])
-      .filter((key) => !stats.availability[key]).map((key) => SECTION_NAMES[key])
+      .filter((key) => stats.availability?.[key] === false).map((key) => SECTION_NAMES[key])
     : [];
 
   return (
@@ -198,20 +199,10 @@ export default function StatsTab() {
               value={!stats.library ? '不可用' : stats.library.avgQuality !== null ? stats.library.avgQuality.toFixed(1) : '—'}
               note={!stats.library ? '书库统计暂不可用' : stats.library.avgQuality !== null ? `满分 10 · 已评 ${stats.library.withQuality} 本` : '还没有质量分'}
             />
-            <div className="book-card px-4 py-4 sm:px-5">
-              <dt className="text-xs tracking-[0.2em]" style={{ color: 'var(--ink-faint)' }}>
-                LLM tokens
-              </dt>
-              <dd className="mt-2 leading-none">
-                <span className="text-2xl sm:text-3xl font-bold" style={{ color: 'var(--ink-faint)' }}>
-                  暂未统计
-                </span>
-              </dd>
-              <p className="text-xs mt-2 leading-5" style={{ color: 'var(--ink-faint)' }}>
-                埋点接入后在此展示
-              </p>
-            </div>
+            <TokenStatTile tokens={stats.tokens} available={stats.availability?.tokens} />
           </dl>
+
+          <TokenUsageDetails tokens={stats.tokens} />
 
           {/* 次要分布 */}
           <div className="grid md:grid-cols-2 gap-8">

@@ -120,14 +120,14 @@ describe('stream completion and shared call budget', () => {
     token('完整内容') + finish('stop') + event({ choices: [], usage: { total_tokens: 9 } }) + 'data: [DONE]\n\n',
   ])('accepts explicitly completed compatible stream %#', async (sse) => {
     fetchMock.mockResolvedValue(response([sse]));
-    await expect(client.chat('system', 'user')).resolves.toBe('完整内容');
+    await expect(client.chat('system', 'user')).resolves.toMatchObject({ content: '完整内容' });
     expect(vi.getTimerCount()).toBe(0);
   });
 
   it('decodes UTF-8 characters and SSE lines split at every byte boundary', async () => {
     const bytes = new TextEncoder().encode(token('中文😀') + finish('stop') + 'data: [DONE]\r\n\r\n');
     fetchMock.mockResolvedValue(response(Array.from(bytes, (byte) => new Uint8Array([byte]))));
-    await expect(client.chat('system', 'user')).resolves.toBe('中文😀');
+    await expect(client.chat('system', 'user')).resolves.toMatchObject({ content: '中文😀' });
   });
 
   it('accepts multiline SSE data and CRLF split between chunks', async () => {
@@ -136,7 +136,7 @@ describe('stream completion and shared call budget', () => {
       '\ndata: [{"delta":{"content":"多行"}}]}\r\n\r',
       '\n' + finish('stop').replace(/\n/g, '\r') + 'data: [DONE]\r\r',
     ]));
-    await expect(client.chat('system', 'user')).resolves.toBe('多行');
+    await expect(client.chat('system', 'user')).resolves.toMatchObject({ content: '多行' });
   });
 
   it('accepts role, reasoning and usage chunks without mistaking them for completion', async () => {
@@ -146,7 +146,7 @@ describe('stream completion and shared call budget', () => {
       event({ choices: [{ delta: { reasoning_content: '隐藏推理' } }] }),
       token('正文'), finish('stop'), event({ choices: [], usage: { total_tokens: 8 } }),
     ]));
-    await expect(client.chat('system', 'user')).resolves.toBe('正文');
+    await expect(client.chat('system', 'user')).resolves.toMatchObject({ content: '正文' });
   });
 
   it.each([
@@ -235,7 +235,7 @@ describe('stream completion and shared call budget', () => {
   it('cancels the upstream reader after DONE without waiting for its socket to close', async () => {
     const cancel = vi.fn();
     fetchMock.mockResolvedValue(response([token('正文'), 'data: [DONE]\n\n'], true, cancel));
-    await expect(client.chat('system', 'user')).resolves.toBe('正文');
+    await expect(client.chat('system', 'user')).resolves.toMatchObject({ content: '正文' });
     expect(cancel).toHaveBeenCalledOnce();
   });
 
@@ -334,7 +334,7 @@ describe('stream completion and shared call budget', () => {
     fetchMock
       .mockResolvedValueOnce(response([token('丢弃的半份画像')]))
       .mockResolvedValueOnce(response([token('完整新画像'), 'data: [DONE]\n\n']));
-    const assertion = expect(client.chatRobust('system', 'user')).resolves.toBe('完整新画像');
+    const assertion = expect(client.chatRobust('system', 'user')).resolves.toMatchObject({ content: '完整新画像' });
     await vi.advanceTimersByTimeAsync(1500);
     await assertion;
     expect(fetchMock).toHaveBeenCalledTimes(2);

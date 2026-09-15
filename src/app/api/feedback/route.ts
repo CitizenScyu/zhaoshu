@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { ensureSchema, getSql, upsertBook, getProfile, saveProfile } from '@/lib/db';
 import { chatRobust, LlmError, validateProfileContent } from '@/lib/llm';
+import { recordUsageAfterResponse } from '@/lib/record-llm-usage';
 import { profileUpdateSystem, profileUpdateUser } from '@/lib/prompts';
 import type { ShelfStatus } from '@/lib/types';
 import { boundedString, readJsonBody, RequestBodyError } from '@/lib/http';
@@ -55,7 +56,7 @@ export async function POST(req: NextRequest) {
       try {
         const profile = await getProfile();
         if (profile.content) {
-          const updated = await chatRobust(
+          const { content: updated } = await chatRobust(
             profileUpdateSystem(),
             profileUpdateUser(profile.content, JSON.stringify({
               title: cleanTitle,
@@ -63,7 +64,7 @@ export async function POST(req: NextRequest) {
               status: shelfStatus,
               note: safeNote,
             })),
-            { temperature: 0.3, signal: req.signal },
+            { temperature: 0.3, signal: req.signal, onUsage: recordUsageAfterResponse('feedback') },
           );
           if (req.signal.aborted) throw new LlmError('模型调用已取消。', false);
           const content = validateProfileContent(updated);

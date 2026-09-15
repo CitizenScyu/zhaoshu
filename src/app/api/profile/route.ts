@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { ensureSchema, getProfile, saveProfile } from '@/lib/db';
 import { chatRobust, LlmError, MAX_PROFILE_LENGTH, validateProfileContent } from '@/lib/llm';
+import { recordUsageAfterResponse } from '@/lib/record-llm-usage';
 import {
   profileSystem,
   profileFromSeedsUser,
@@ -126,10 +127,10 @@ export async function POST(req: NextRequest) {
     if (sanitized.length === 0) {
       return NextResponse.json({ error: '先在下方填入种子书单' }, { status: 400 });
     }
-    const raw = await chatRobust(
+    const { content: raw } = await chatRobust(
       profileSystem(),
       profileFromSeedsUser(JSON.stringify(sanitized, null, 2)),
-      { temperature: 0.4, signal: req.signal },
+      { temperature: 0.4, signal: req.signal, onUsage: recordUsageAfterResponse('profile') },
     );
     if (req.signal.aborted) throw new LlmError('模型调用已取消。', false);
     const content = validateProfileContent(raw);

@@ -20,7 +20,7 @@ vi.mock('@/lib/db', () => ({
 }));
 vi.mock('@/lib/llm', async (importOriginal) => ({
   ...await importOriginal<typeof import('@/lib/llm')>(),
-  chatRobust: mocks.chatRobust,
+  chatRobust: async (...args: unknown[]) => ({ content: await mocks.chatRobust(...args) }),
 }));
 vi.mock('@/lib/douban', () => ({ verifyBatch: mocks.verifyBatch }));
 import { POST } from './route';
