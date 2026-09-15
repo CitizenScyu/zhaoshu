@@ -1,6 +1,6 @@
 'use client';
 
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState, type Dispatch, type SetStateAction } from 'react';
 import { useOwner } from '@/components/OwnerProvider';
 import ReadBookLink from '@/components/ReadBookLink';
 
@@ -120,19 +120,30 @@ function qualityColor(q: number): string {
   return 'var(--ink-faint)';
 }
 
-export default function LibraryTab() {
+export interface LibraryView {
+  page: number;
+  query: string;
+  search: string;
+  category: string;
+  tag: string;
+  finish: string;
+  sort: string;
+}
+
+export function createLibraryView(): LibraryView {
+  return { page: 1, query: '', search: '', category: '', tag: '', finish: '', sort: 'quality' };
+}
+
+export default function LibraryTab({ view, setView }: {
+  view: LibraryView;
+  setView: Dispatch<SetStateAction<LibraryView>>;
+}) {
   const { apiFetch } = useOwner();
   const [books, setBooks] = useState<LibraryBook[] | null>(null);
   const [facets, setFacets] = useState<Facets>({ categories: [], finishStates: [] });
   const [total, setTotal] = useState(0);
-  const [page, setPage] = useState(1);
+  const { page, query, search, category, tag, finish, sort } = view;
   const [maxPage, setMaxPage] = useState(10_000);
-  const [query, setQuery] = useState('');
-  const [search, setSearch] = useState('');
-  const [category, setCategory] = useState('');
-  const [tag, setTag] = useState('');
-  const [finish, setFinish] = useState('');
-  const [sort, setSort] = useState('quality');
   const [detail, setDetail] = useState<LibraryBook | null>(null);
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(true);
@@ -149,6 +160,10 @@ export default function LibraryTab() {
   const libraryHeading = useRef<HTMLHeadingElement>(null);
   const returnLocation = useRef<{ id: number; scrollY: number } | null>(null);
   const detailId = detail?.id ?? null;
+
+  function updateView(patch: Partial<LibraryView>) {
+    setView((current) => ({ ...current, ...patch }));
+  }
 
   const updateTask = useCallback((next: DownloadTask | null) => {
     setTask(next);
@@ -195,7 +210,7 @@ export default function LibraryTab() {
       const res = await apiFetch(`/api/library?${params}`, { signal });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || '书库加载失败');
-      if (my !== reqId.current) return;
+      if (signal?.aborted || my !== reqId.current) return;
       setBooks(data.books);
       setTotal(data.total);
       setMaxPage(data.maxPage ?? 10_000);
@@ -412,12 +427,7 @@ export default function LibraryTab() {
   const taskNotes = task?.error?.split(/\r?\n/).map((line) => line.trim()).filter(Boolean) ?? [];
 
   function resetFilters() {
-    setPage(1);
-    setCategory('');
-    setTag('');
-    setFinish('');
-    setSearch('');
-    setQuery('');
+    updateView({ page: 1, category: '', tag: '', finish: '', search: '', query: '' });
   }
 
   // 详情视图：点书名进入
@@ -537,15 +547,14 @@ export default function LibraryTab() {
           className="flex w-full min-w-0 items-center gap-2 sm:w-auto"
           onSubmit={(e) => {
             e.preventDefault();
-            setPage(1);
-            setSearch(query.trim());
+            updateView({ page: 1, search: query.trim() });
           }}
         >
           <input
             className="paper-input text-sm !py-1.5 min-w-0 flex-1 w-40 sm:w-52"
             placeholder="搜书名 / 作者 / 标签"
             value={query}
-            onChange={(e) => setQuery(e.target.value)}
+            onChange={(e) => updateView({ query: e.target.value })}
             aria-label="书库搜索"
           />
           <button className="chip text-sm" type="submit">搜</button>
@@ -555,7 +564,7 @@ export default function LibraryTab() {
           <select
             className="paper-input text-xs !py-1 !px-2"
             value={sort}
-            onChange={(e) => { setSort(e.target.value); setPage(1); }}
+            onChange={(e) => updateView({ sort: e.target.value, page: 1 })}
             aria-label="排序方式"
           >
             {SORTS.map(([v, l]) => <option key={v} value={v}>{l}</option>)}
@@ -573,13 +582,13 @@ export default function LibraryTab() {
             <span className="text-xs" style={{ color: 'var(--ink-faint)' }}>分类</span>
             <button
               className={`chip text-xs ${!category ? 'chip-dai' : ''}`}
-              onClick={() => { setCategory(''); setPage(1); }}
+              onClick={() => updateView({ category: '', page: 1 })}
             >全部</button>
             {facets.categories.map((c) => (
               <button
                 key={c.name}
                 className={`chip text-xs ${category === c.name ? 'chip-dai' : ''}`}
-                onClick={() => { setCategory(category === c.name ? '' : c.name); setPage(1); }}
+                onClick={() => updateView({ category: category === c.name ? '' : c.name, page: 1 })}
               >
                 {c.name}（{c.count}）
               </button>
@@ -593,7 +602,7 @@ export default function LibraryTab() {
               <button
                 key={f.name}
                 className={`chip text-xs ${finish === f.name ? 'chip-dai' : ''}`}
-                onClick={() => { setFinish(finish === f.name ? '' : f.name); setPage(1); }}
+                onClick={() => updateView({ finish: finish === f.name ? '' : f.name, page: 1 })}
               >
                 {f.name}（{f.count}）
               </button>
@@ -603,7 +612,7 @@ export default function LibraryTab() {
         {(tag || hasFilter) && (
           <div className="flex flex-wrap items-center gap-2">
             {tag && (
-              <button className="chip chip-dai text-xs" onClick={() => { setTag(''); setPage(1); }}>
+              <button className="chip chip-dai text-xs" onClick={() => updateView({ tag: '', page: 1 })}>
                 流派：{tag} ✕
               </button>
             )}
@@ -692,11 +701,11 @@ export default function LibraryTab() {
 
       {totalPages > 1 && (
         <div className="mt-5 flex flex-wrap items-center justify-center gap-3 text-sm">
-          <button className="chip" disabled={page <= 1} onClick={() => setPage((p) => Math.max(1, p - 1))}>
+          <button className="chip" disabled={page <= 1} onClick={() => setView((current) => ({ ...current, page: Math.max(1, current.page - 1) }))}>
             上一页
           </button>
           <span style={{ color: 'var(--ink-faint)' }}>{page} / {totalPages}</span>
-          <button className="chip" disabled={page >= totalPages} onClick={() => setPage((p) => p + 1)}>
+          <button className="chip" disabled={page >= totalPages} onClick={() => setView((current) => ({ ...current, page: current.page + 1 }))}>
             下一页
           </button>
         </div>

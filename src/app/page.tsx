@@ -1,13 +1,14 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useEffect, useReducer, useState } from 'react';
 import FindTab from '@/components/FindTab';
 import ShelfTab from '@/components/ShelfTab';
 import ProfileTab from '@/components/ProfileTab';
 import ShuyuanTab from '@/components/ShuyuanTab';
-import LibraryTab from '@/components/LibraryTab';
+import LibraryTab, { createLibraryView } from '@/components/LibraryTab';
 import StatsTab from '@/components/StatsTab';
 import { OwnerProvider, useOwner } from '@/components/OwnerProvider';
+import { createProfileDraft, profileDraftReducer } from '@/lib/profile-draft';
 
 type Tab = 'find' | 'shelf' | 'profile' | 'shuyuan' | 'library' | 'stats';
 
@@ -152,12 +153,7 @@ function HomeContent() {
           className="border-t border-[var(--line)] bg-[var(--paper-card)]/60 px-5 sm:px-8 py-8"
           style={{ boxShadow: '0 4px 24px rgba(46,42,35,0.05)' }}
         >
-          <div hidden={tab !== 'find'}><FindTab /></div>
-          {tab === 'shelf' && <ShelfTab />}
-          {tab === 'profile' && <ProfileTab />}
-          {tab === 'shuyuan' && <ShuyuanTab />}
-          {tab === 'library' && <LibraryTab />}
-          {tab === 'stats' && <StatsTab />}
+          <PrivateTabs key={token} tab={tab} />
         </div>
       </main>
 
@@ -165,5 +161,22 @@ function HomeContent() {
         LLM 召回 · 豆瓣验证 · 口味画像 —— 评分仅供参考，彼仙我毒是常态
       </footer>
     </div>
+  );
+}
+
+// 草稿与筛选仅存于当前页面内存；退出或更换口令会卸载整个私有会话。
+function PrivateTabs({ tab }: { tab: Tab }) {
+  const [profile, dispatchProfile] = useReducer(profileDraftReducer, undefined, createProfileDraft);
+  const [libraryView, setLibraryView] = useState(createLibraryView);
+  return (
+    <>
+      <div hidden={tab !== 'find'}><FindTab /></div>
+      {tab === 'shelf' && <ShelfTab />}
+      {/* 画像没有轮询，保留挂载以接收切 tab 期间完成的生成稿。 */}
+      <div hidden={tab !== 'profile'}><ProfileTab state={profile} dispatch={dispatchProfile} active={tab === 'profile'} /></div>
+      {tab === 'shuyuan' && <ShuyuanTab />}
+      {tab === 'library' && <LibraryTab view={libraryView} setView={setLibraryView} />}
+      {tab === 'stats' && <StatsTab />}
+    </>
   );
 }
