@@ -48,7 +48,9 @@ describe('GET /api/download/[id]/file', () => {
 
   it.each(['山河-佚名.txt', '山河.txt'])('locates anonymous authors by the exact canonical or legacy name %s', async (name) => {
     sql.mockResolvedValue([{ ...task, title: '山河', author: '' }]);
-    fetchMock.mockResolvedValueOnce(Response.json([{ name }, { name: '山河-另一作者.txt' }])).mockResolvedValueOnce(new Response('正确正文'));
+    fetchMock.mockResolvedValueOnce(Response.json([{ name }, { name: '山河-另一作者.txt' }]));
+    if (name === '山河.txt') fetchMock.mockResolvedValueOnce(new Response(null, { status: 404 }));
+    fetchMock.mockResolvedValueOnce(new Response('正确正文'));
     const response = await download();
     expect(response.status).toBe(200);
     expect(await response.text()).toBe('正确正文');
@@ -265,10 +267,55 @@ describe('GET /api/download/[id]/file', () => {
     fetchMock.mockResolvedValueOnce(kind === '404'
       ? new Response(null, { status: 404 })
       : Response.json(kind === 'empty' ? [] : [{ name: 'other.txt' }]));
+    if (kind !== '404') fetchMock.mockResolvedValueOnce(new Response(null, { status: 404 }));
     const res = await download();
     expect(res.status).toBe(404);
     expect(await res.json()).toEqual({ error: 'file not found', code: 'FILE_NOT_FOUND' });
-    expect(fetchMock).toHaveBeenCalledOnce();
+    expect(fetchMock).toHaveBeenCalledTimes(kind === '404' ? 1 : 2);
+  });
+
+  it('retrieves an exact file beyond the 1000-item limit without buffering the raw stream', async () => {
+    const listing = Array.from({ length: 1000 }, (_, i) => ({ name: `其他${i}.txt` }));
+    fetchMock.mockResolvedValueOnce(Response.json(listing))
+      .mockResolvedValueOnce(Response.json({ name: bookName, type: 'file' }))
+      .mockResolvedValueOnce(new Response('正确正文'));
+    const response = await download();
+    expect(response.status).toBe(200);
+    expect(await response.text()).toBe('正确正文');
+    expect(fetchMock.mock.calls.map(([, init]) => new Headers(init?.headers).get('Accept')))
+      .toEqual(['application/vnd.github+json', 'application/vnd.github.object+json', 'application/vnd.github.raw']);
+    expect(new Set(fetchMock.mock.calls.map(([, init]) => init?.signal)).size).toBe(1);
+  });
+
+  it('does not return a wrong author that only looks unique in a truncated directory', async () => {
+    const listing = [{ name: '长篇小说-另一作者.txt' }, ...Array.from({ length: 999 }, (_, i) => ({ name: `其他${i}.txt` }))];
+    fetchMock.mockResolvedValueOnce(Response.json(listing)).mockResolvedValueOnce(new Response(null, { status: 404 }));
+    const response = await download();
+    expect(response.status).toBe(404);
+    expect(await response.json()).toMatchObject({ code: 'FILE_NOT_FOUND' });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock.mock.calls.at(-1)?.[0]).toContain(encodeURIComponent(bookName));
+  });
+
+  it.each([
+    { response: () => new Response(null, { status: 429 }), expected: 503, code: 'UPSTREAM_RATE_LIMITED' },
+    { response: () => new Response('{bad'), expected: 502, code: 'UPSTREAM_ERROR' },
+    { response: () => Response.json({ name: 'wrong.txt', type: 'file' }), expected: 502, code: 'UPSTREAM_ERROR' },
+  ])('preserves $code from exact metadata lookup', async ({ response, expected, code }) => {
+    fetchMock.mockResolvedValueOnce(Response.json([])).mockResolvedValueOnce(response());
+    const result = await download();
+    expect(result.status).toBe(expected);
+    expect(await result.json()).toMatchObject({ code });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('maps a timeout while consuming exact metadata to 504', async () => {
+    const metadata = Response.json({ type: 'file', name: bookName });
+    vi.spyOn(metadata, 'json').mockRejectedValue(new DOMException('timeout', 'TimeoutError'));
+    fetchMock.mockResolvedValueOnce(Response.json([])).mockResolvedValueOnce(metadata);
+    const response = await download();
+    expect(response.status).toBe(504);
+    expect(await response.json()).toMatchObject({ code: 'UPSTREAM_TIMEOUT' });
   });
 
   it.each(['directory', 'file'].flatMap((stage) => [429, 500, 502, 503, 401, 403].map((status) => ({ stage, status }))))('keeps $stage HTTP $status distinct from 404', async ({ stage, status }) => {

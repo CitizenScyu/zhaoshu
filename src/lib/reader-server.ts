@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { getSql } from '@/lib/db';
-import { bookFilename, findBookFilename } from '@/lib/book-file-name';
+import { locateBookFile } from '@/lib/book-file-locator';
 import { MAX_READER_BYTES, parseTxtChapters, splitChapterParts } from '@/lib/txt-chapters';
 import type { ByteRange } from '@/lib/txt-chapters';
 import type { ReaderChapter, ReaderIndex, ReaderPart } from '@/lib/reader-types';
@@ -156,24 +156,17 @@ async function getDirectory(source: Source): Promise<Directory> {
 
 async function locateFile(source: Source, task: ReadableTask): Promise<BookFile | null> {
   const listing = await getDirectory(source);
-  const expected = bookFilename(task.title, task.author);
-  const exact = listing.files.find((file) => file.name === expected);
-  if (exact) return exact;
-
-  // The Contents directory API stops at 1,000 entries. Check the exact worker
-  // filename independently before considering a prefix match in a full listing.
-  const response = await githubFetch(source, expected);
-  if (response.status !== 404) {
+  return locateBookFile(listing, task.title, task.author, async (expected) => {
+    const response = await githubFetch(source, expected);
+    if (response.status === 404) {
+      await response.body?.cancel().catch(() => undefined);
+      return null;
+    }
     const file = parseFile(await githubJson(response));
-    if (!file) throw new ReaderError('书籍文件信息有误，请稍后重试。', 502);
-    // Bound the directory cache even for a repository with many extra entries.
+    if (!file || file.name !== expected) throw new ReaderError('书籍文件信息有误，请稍后重试。', 502);
     if (listing.files.length < 1100) listing.files.push(file);
     return file;
-  }
-  await response.body?.cancel().catch(() => undefined);
-  if (listing.truncated) return null;
-  const name = findBookFilename(listing.files.map((file) => file.name), task.title, task.author);
-  return listing.files.find((file) => file.name === name) ?? null;
+  });
 }
 
 export async function getReadableTask(taskId: number): Promise<ReadableTask> {

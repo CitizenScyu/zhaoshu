@@ -2,7 +2,8 @@ import { NextRequest, NextResponse } from 'next/server';
 import { requireApiOwner } from '@/lib/auth';
 import { ensureSchema, getSql } from '@/lib/db';
 import { boundedPositiveInteger } from '@/lib/http';
-import { findBookFilename, sanitizeBookFilename } from '@/lib/book-file-name';
+import { sanitizeBookFilename } from '@/lib/book-file-name';
+import { locateBookFile } from '@/lib/book-file-locator';
 
 // 下载完成的任务取回 TXT:文件在 GitHub 私库 CitizenScyu/zhaoshu-books 的 books/ 下
 export const maxDuration = 60;
@@ -69,9 +70,17 @@ async function findBookName(title: string, author: string, signal: AbortSignal):
   const names = listing
     .map((e) => (e as Partial<DirEntry>)?.name)
     .filter((n): n is string => typeof n === 'string' && n.endsWith('.txt'));
-  if (names.length === 0) return null;
-
-  return findBookFilename(names, title, author);
+  const file = await locateBookFile({ files: names.map(name => ({ name })), truncated: listing.length >= 1000 }, title, author, async (name) => {
+    const metadata = await githubResponse(`${BOOKS_DIR}/${encodeURIComponent(name)}`, 'application/vnd.github.object+json', signal);
+    if (!metadata) return null;
+    const value: unknown = await metadata.json();
+    if (!value || typeof value !== 'object' || !('type' in value) || value.type !== 'file'
+      || !('name' in value) || value.name !== name) {
+      throw new FileUpstreamError('文件服务返回了无效文件信息，请稍后重试', 'UPSTREAM_ERROR', 502);
+    }
+    return { name };
+  });
+  return file?.name ?? null;
 }
 
 // 直接请求 raw 文件流,避免 JSON/base64 解码或整体缓冲 TXT
