@@ -12,12 +12,18 @@ interface SuggestItem {
   id: string;
 }
 
-async function fetchWithTimeout<T>(url: string, consume: (response: Response) => Promise<T>, ms = 12_000): Promise<T> {
+async function fetchWithTimeout<T>(
+  url: string,
+  consume: (response: Response) => Promise<T>,
+  ms = 12_000,
+  signal?: AbortSignal,
+): Promise<T> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), ms);
+  const combined = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal;
   try {
     const response = await fetch(url, {
-      signal: controller.signal,
+      signal: combined,
       headers: { 'User-Agent': UA, 'Accept-Language': 'zh-CN,zh;q=0.9' },
     });
     if (!response.ok) {
@@ -31,11 +37,15 @@ async function fetchWithTimeout<T>(url: string, consume: (response: Response) =>
   }
 }
 
-// 用书名+作者在豆瓣找对应条目（网文多为实体书条目，标题形如"诡秘之主 1"）
-async function searchSuggest(title: string): Promise<SuggestItem[]> {
+// 调用方预算（deadline.signal）到期应升级为失败（超时/取消），不能降级为"未验证但条目存在"。
+// 具体判断直接看 signal.aborted，不带共享状态。
+
+async function searchSuggest(title: string, signal?: AbortSignal): Promise<SuggestItem[]> {
   return fetchWithTimeout(
     `https://book.douban.com/j/subject_suggest?q=${encodeURIComponent(title)}`,
     (response) => response.json() as Promise<SuggestItem[]>,
+    12_000,
+    signal,
   );
 }
 
@@ -53,8 +63,8 @@ export function parseVotes(html: string): number | null {
   return count ? parseInt(count, 10) : null;
 }
 
-async function fetchSubjectRating(doubanId: string) {
-  const html = await fetchWithTimeout(`https://book.douban.com/subject/${doubanId}/`, (response) => response.text());
+async function fetchSubjectRating(doubanId: string, signal?: AbortSignal) {
+  const html = await fetchWithTimeout(`https://book.douban.com/subject/${doubanId}/`, (response) => response.text(), 12_000, signal);
   return {
     rating: parseRating(html),
     ratingCount: parseVotes(html),
@@ -85,9 +95,13 @@ function pickMatch(items: SuggestItem[], title: string, author?: string): Sugges
   return items.find((it) => titleOk(it) && authorOk(it)) ?? null;
 }
 
-export async function verifyBook(title: string, author?: string): Promise<DoubanInfo> {
+export async function verifyBook(
+  title: string,
+  author?: string,
+  signal?: AbortSignal,
+): Promise<DoubanInfo> {
   try {
-    const items = await searchSuggest(title);
+    const items = await searchSuggest(title, signal);
     const match = pickMatch(items, title, author);
     if (!match) {
       return {
@@ -98,7 +112,7 @@ export async function verifyBook(title: string, author?: string): Promise<Douban
     }
     const doubanId = match.id;
     try {
-      const { rating, ratingCount } = await fetchSubjectRating(doubanId);
+      const { rating, ratingCount } = await fetchSubjectRating(doubanId, signal);
       return {
         status: 'verified',
         found: true,
@@ -107,7 +121,9 @@ export async function verifyBook(title: string, author?: string): Promise<Douban
         ratingCount,
         url: `https://book.douban.com/subject/${doubanId}/`,
       };
-    } catch {
+    } catch (e) {
+      // 预算耗尽不是"详情页被拦"：预算到期必须停，不能降级为"已验证"继续
+      if (signal?.aborted) throw e;
       // 详情页被拦（数据中心 IP 可能 403）：条目存在就算验证通过
       return {
         status: 'verified',
@@ -122,9 +138,11 @@ export async function verifyBook(title: string, author?: string): Promise<Douban
   }
 }
 
-// 并发受限地验证一批书（豆瓣对高频不友好，限制在 3）
+// 并发受限地验证一批书（豆瓣对高频不友好，限制在 3）。
+// 传入预算 signal：预算耗尽即停止新增探测（signal.abort 后 worker 不再领新任务）。
 export async function verifyBatch(
   books: { title: string; author?: string }[],
+  signal?: AbortSignal,
 ): Promise<DoubanInfo[]> {
   const results: DoubanInfo[] = new Array(books.length).fill(null).map(() => ({
     status: 'unavailable',
@@ -135,8 +153,12 @@ export async function verifyBatch(
   let next = 0;
   async function worker() {
     while (next < books.length) {
+      if (signal?.aborted) {
+        // 未探测的项绝不能当作"已恢复"；预算耗尽后停表为外部不可达（本轮未验证）
+        break;
+      }
       const i = next++;
-      results[i] = await verifyBook(books[i].title, books[i].author);
+      results[i] = await verifyBook(books[i].title, books[i].author, signal);
     }
   }
   await Promise.all(Array.from({ length: Math.min(CONCURRENCY, books.length) }, worker));

@@ -4,6 +4,8 @@ const REPO = process.env.ZHAOSHU_BOOKS_REPO || 'CitizenScyu/zhaoshu-books';
 const WORKFLOW = 'download.yml';
 const REF = 'main';
 const DISPATCH_TIMEOUT_MS = 10_000;
+// 建任务后的 dispatch 超时：worker 提交（commitFile）在 zhaoshu-books 侧有独立超时。
+export const GITHUB_TIMEOUT_MS = 10_000;
 
 // 建任务后立即触发一次 workflow_dispatch:cron 是 */5,但 GitHub 对高频 schedule
 // 有静默节流(实测可 3 小时不跑),不主动 dispatch 任务会一直 pending。
