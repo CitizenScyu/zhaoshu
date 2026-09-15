@@ -442,10 +442,10 @@ export default function LibraryTab({ view, setView }: {
             <h2 ref={detailHeading} tabIndex={-1} className="text-xl font-bold">{detail.title}</h2>
             <span className="text-sm" style={{ color: 'var(--ink-faint)' }}>
               {detail.author} · {detail.category || detail.genre}
-              {detail.finishStatus ? ` · ${detail.finishStatus}` : ''}
+              {detail.finishStatus ? ` · 标注状态：${detail.finishStatus}` : ''}
             </span>
             {typeof detail.labels.confidence === 'number' && (
-              <span className="chip text-xs">置信度 {detail.labels.confidence}</span>
+              <span className="chip text-xs">离线标注置信度 {detail.labels.confidence}</span>
             )}
           </div>
           <div className="flex flex-wrap gap-1.5 mt-3">
@@ -454,6 +454,9 @@ export default function LibraryTab({ view, setView }: {
             ))}
           </div>
           <div className="mt-4 space-y-2.5">
+            <p className="text-xs" style={{ color: 'var(--ink-faint)' }}>
+              以下内容来自离线模型标注，属于标注推断，不是外部事实核验。
+            </p>
             {FIELD_LABELS.map(([key, label]) => {
               const text = fieldText(detail.labels, key);
               if (!text) return null;
@@ -467,7 +470,7 @@ export default function LibraryTab({ view, setView }: {
             })}
           </div>
           <p className="text-xs mt-4" style={{ color: 'var(--ink-faint)' }}>
-            标注 {Math.round(detail.charsLabeled / 10000)} 万字 · {new Date(detail.labeledAt).toLocaleDateString('zh-CN')}
+            已分析文本约 {Math.round(detail.charsLabeled / 10000)} 万字（不是全书字数） · 标注于 {new Date(detail.labeledAt).toLocaleDateString('zh-CN')}
           </p>
           {/* 下载全书 */}
           <div className="mt-5 pt-4 border-t border-dashed" style={{ borderColor: 'var(--line)' }}>
@@ -667,11 +670,11 @@ export default function LibraryTab({ view, setView }: {
                 <span className="mt-auto flex min-w-0 flex-wrap items-center gap-2 text-xs">
                   {typeof b.quality === 'number' && (
                     <span className="font-bold tabular-nums" style={{ color: qualityColor(b.quality) }}>
-                      {b.quality.toFixed(1)}
+                      标注质量分 {b.quality.toFixed(1)}
                     </span>
                   )}
                   {b.finishStatus?.includes('完结') && (
-                    <span style={{ color: 'var(--moss)' }}>完</span>
+                    <span style={{ color: 'var(--moss)' }}>标注完结</span>
                   )}
                   {(b.category || b.genre) && (
                     <span className="min-w-0 ml-auto" style={{ color: 'var(--ink-faint)' }}>

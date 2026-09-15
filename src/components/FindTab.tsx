@@ -309,43 +309,60 @@ function BookCard({
           className={`seal-outline w-14 h-14 shrink-0 flex-col ${item.matchScore < 40 || suspicious ? 'border-dashed' : ''}`}
         >
           <span className="text-xl font-bold leading-none">{item.matchScore}</span>
-          <span className="text-[10px] tracking-widest mt-0.5">匹配</span>
+          <span className="text-[10px] tracking-widest mt-0.5">匹配分</span>
         </div>
 
         <div className="flex-1 min-w-0">
           <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1">
             <h3 className="text-lg font-bold">{item.title}</h3>
             <span className="text-sm" style={{ color: 'var(--ink-faint)' }}>
-              {item.author} · {item.category} · {item.wordCount}
+              {item.author} · {item.category}
             </span>
             {suspicious && (
               <span className="chip chip-risk">存在性存疑</span>
             )}
-            {item.douban?.rating != null && (
-              <a
-                href={item.douban.url}
-                target="_blank"
-                rel="noreferrer"
-                className="text-xs underline underline-offset-2"
-                style={{ color: 'var(--dai)' }}
-              >
-                豆瓣 {item.douban.rating}（{item.douban.ratingCount ?? '?'}人评价）
-              </a>
-            )}
-            {item.douban?.status === 'not_found' && (
-              <span className="text-xs" style={{ color: 'var(--ink-faint)' }}>
-                豆瓣未收录（网文常见）
-              </span>
-            )}
-            {item.douban?.status === 'unavailable' && (
-              <span className="text-xs" style={{ color: 'var(--ink-faint)' }}>
-                豆瓣暂不可达，本轮未验证
-              </span>
-            )}
           </div>
 
+          <p className="text-xs mt-1.5" style={{ color: 'var(--ink-faint)' }}>
+            个人匹配排序分，来自模型判断，不是喜欢概率 · 字数/状态：{item.wordCount || '模型未提供'}（模型提供，待核验）
+          </p>
+
+          {item.douban && (
+            <div
+              className="mt-2 border-l-2 pl-3 text-xs leading-6"
+              style={{ borderColor: 'var(--line)', color: 'var(--ink-soft)' }}
+            >
+              <p className="font-bold" style={{ color: 'var(--ink)' }}>豆瓣外部验证证据</p>
+              {item.douban.status === 'verified' && (
+                <p>
+                  {item.douban.url ? (
+                    <a
+                      href={item.douban.url}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="underline underline-offset-2"
+                      style={{ color: 'var(--dai)' }}
+                    >
+                      已找到豆瓣条目
+                    </a>
+                  ) : '已找到豆瓣条目'}
+                  {item.douban.rating != null ? ` · 评分 ${item.douban.rating}` : ' · 暂无评分'}
+                  {item.douban.ratingCount != null ? ` · ${item.douban.ratingCount} 人评价` : ''}
+                </p>
+              )}
+              {item.douban.status === 'not_found' && (
+                <p>豆瓣未检索到条目，不等于作品不存在。</p>
+              )}
+              {item.douban.status === 'unavailable' && (
+                <p>豆瓣验证暂不可用，本轮无法核验。</p>
+              )}
+              {item.douban.note && <p>验证说明：{item.douban.note}</p>}
+            </div>
+          )}
+
           {(item.hitLikes?.length > 0) && (
-            <div className="flex flex-wrap gap-1.5 mt-2">
+            <div className="flex flex-wrap items-center gap-1.5 mt-2">
+              <span className="text-xs" style={{ color: 'var(--ink-faint)' }}>模型推断的萌点命中</span>
               {item.hitLikes.map((h) => (
                 <span key={h} className="chip chip-like">{h}</span>
               ))}
@@ -353,18 +370,20 @@ function BookCard({
           )}
 
           <p className="text-sm mt-2.5 leading-7" style={{ color: 'var(--ink-soft)' }}>
-            <span style={{ color: 'var(--moss)' }}>荐</span>
+            <span style={{ color: 'var(--moss)' }}>召回理由（模型判断）</span>
             <span aria-hidden="true" className="mx-1.5" style={{ color: 'var(--line)' }}>|</span>
             {item.why || item.reason}
           </p>
           {item.risks && (
             <p className="text-sm mt-1.5 leading-7" style={{ color: 'var(--ink-soft)' }}>
-              <span style={{ color: 'var(--cinnabar)' }}>险</span>
+              <span style={{ color: 'var(--cinnabar)' }}>风险（模型推断，待核验）</span>
               <span aria-hidden="true" className="mx-1.5" style={{ color: 'var(--line)' }}>|</span>
               {item.risks}
             </p>
           )}
-          <p className="text-sm mt-1.5 leading-7 font-bold">{item.reason}</p>
+          <p className="text-sm mt-1.5 leading-7 font-bold">
+            <span className="font-normal" style={{ color: 'var(--ink-faint)' }}>模型结论：</span>{item.reason}
+          </p>
 
           {/* 反馈操作 */}
           {!saved ? (

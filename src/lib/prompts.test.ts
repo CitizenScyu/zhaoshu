@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { recallUser, rerankUser } from './prompts';
+import { recallSystem, recallUser, rerankSystem, rerankUser } from './prompts';
 
 describe('find prompt boundaries', () => {
   it('uses only the current input when the profile and one-off conditions are empty', () => {
@@ -27,5 +27,20 @@ describe('find prompt boundaries', () => {
     const prompt = rerankUser('', '找书', '[]', '必须完结且无雷');
     expect(prompt).toContain('只能作为模型推断或待核验风险');
     expect(prompt).toContain('不能陈述为已满足的事实');
+  });
+});
+
+describe('evidence and inference boundaries', () => {
+  it('defines match score as model ranking rather than a preference probability', () => {
+    const prompt = rerankSystem();
+    expect(prompt).toContain('个人匹配排序分');
+    expect(prompt).toContain('不是用户喜欢这本书的概率');
+  });
+
+  it('keeps unverifiable attributes and reference books constrained', () => {
+    const prompt = rerankSystem();
+    expect(prompt).toContain('只能表述为待核验的模型推断');
+    expect(prompt).toContain('不得发明作品');
+    expect(recallSystem()).toContain('wordCount 是召回模型提供的待核验描述');
   });
 });

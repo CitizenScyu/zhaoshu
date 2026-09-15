@@ -111,6 +111,7 @@ export function sanitizeRerankedItems(value: unknown): RerankedItem[] {
     const author = cleanString(item.author, 200);
     const matchScore = finiteScore(item.matchScore);
     if (!title || !author || matchScore === null) return [];
+    // 这里只清洗模型判断字段；豆瓣证据、召回理由和候选元数据由路由按已验证候选回填。
     return [{
       title,
       author,

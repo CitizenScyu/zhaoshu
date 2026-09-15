@@ -23,12 +23,12 @@ export interface Candidate {
   title: string;
   author: string;
   category: string; // 题材/流派标签
-  wordCount: string; // 字数规模，如 "约300万字，完结"
-  why: string; // 推荐理由
+  wordCount: string; // 召回模型提供的字数/状态描述，待核验
+  why: string; // 召回模型给出的推荐理由
   source: 'llm'; // 召回来源
 }
 
-// 豆瓣验证结果
+// 豆瓣外部验证证据
 export interface DoubanInfo {
   status: 'verified' | 'not_found' | 'unavailable';
   found: boolean;
@@ -48,13 +48,13 @@ export interface RerankedItem {
   title: string;
   author: string;
   category: string;
-  wordCount: string;
+  wordCount: string; // 召回模型描述，待核验
   douban?: DoubanInfo;
-  matchScore: number; // 0-100
-  hitLikes: string[]; // 命中的萌点
-  risks: string; // 风险/雷点提示
-  reason: string; // 一句话"对你值不值得开"
-  why: string; // 召回理由（保留溯源）
+  matchScore: number; // 0-100 的模型个人匹配排序分，不是喜欢概率
+  hitLikes: string[]; // 模型判断的萌点命中
+  risks: string; // 模型推断的风险/雷点提示，待核验
+  reason: string; // 模型给出的一句话结论
+  why: string; // 召回模型理由（保留溯源）
   hallucinationRisk?: boolean;
 }
 
