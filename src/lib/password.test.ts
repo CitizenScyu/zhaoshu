@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { beforeAll, describe, expect, it } from 'vitest';
 import {
   MAX_PASSWORD_CODEPOINTS,
   PASSWORD_HASH_PREFIX,
@@ -9,38 +9,48 @@ import {
   verifyPassword,
 } from './password';
 
-// 异步 scrypt（N=2^17）单项约几十到一百多毫秒；共享哈希值避免重复 KDF 放大测试时长。
+// 异步 scrypt（N=2^17）单项约几百毫秒；beforeAll 共享哈希值并放宽用例超时，避免并发负载下误报。
+const KDF_TEST_TIMEOUT = 20000;
+
 const asciiPassword = 'correct horse battery staple!';
 const chinesePassword = '三体 人的全部尊严在于思想';
 const spacesPassword = '  leading and trailing spaces kept  ';
 
+let asciiHash: string;
+let chineseHash: string;
+let spacesHash: string;
+
+beforeAll(async () => {
+  [asciiHash, chineseHash, spacesHash] = await Promise.all([
+    hashPassword(asciiPassword),
+    hashPassword(chinesePassword),
+    hashPassword(spacesPassword),
+  ]);
+}, KDF_TEST_TIMEOUT);
+
 describe('password hashing', () => {
-  it('produces the documented version string with whitelisted parameters', async () => {
-    const hash = await hashPassword(asciiPassword);
-    expect(hash.startsWith(`${PASSWORD_HASH_PREFIX}131072$8$1$`)).toBe(true);
-    const parts = hash.split('$');
+  it('produces the documented version string with whitelisted parameters', () => {
+    expect(asciiHash.startsWith(`${PASSWORD_HASH_PREFIX}131072$8$1$`)).toBe(true);
+    const parts = asciiHash.split('$');
     expect(parts).toHaveLength(7);
-    expect(parsePasswordHash(hash)).not.toBeNull();
+    expect(parsePasswordHash(asciiHash)).not.toBeNull();
   });
 
   it('hashes and verifies ASCII, Chinese, and space-containing passwords', async () => {
-    for (const password of [asciiPassword, chinesePassword, spacesPassword]) {
-      const hash = await hashPassword(password);
-      expect(await verifyPassword(password, hash)).toBe(true);
-    }
-  });
+    expect(await verifyPassword(asciiPassword, asciiHash)).toBe(true);
+    expect(await verifyPassword(chinesePassword, chineseHash)).toBe(true);
+    expect(await verifyPassword(spacesPassword, spacesHash)).toBe(true);
+  }, KDF_TEST_TIMEOUT);
 
   it('does not trim or normalize password bytes', async () => {
-    const hash = await hashPassword(spacesPassword);
-    expect(await verifyPassword(spacesPassword.trim(), hash)).toBe(false);
-    expect(await verifyPassword(spacesPassword, hash)).toBe(true);
-  });
+    expect(await verifyPassword(spacesPassword.trim(), spacesHash)).toBe(false);
+    expect(await verifyPassword(spacesPassword, spacesHash)).toBe(true);
+  }, KDF_TEST_TIMEOUT);
 
   it('rejects a wrong password', async () => {
-    const hash = await hashPassword(asciiPassword);
-    expect(await verifyPassword('Correct horse battery staple!', hash)).toBe(false);
-    expect(await verifyPassword('', hash)).toBe(false);
-  });
+    expect(await verifyPassword('Correct horse battery staple!', asciiHash)).toBe(false);
+    expect(await verifyPassword('', asciiHash)).toBe(false);
+  }, KDF_TEST_TIMEOUT);
 
   it('uses a fresh random salt per hash', async () => {
     const [a, b] = await Promise.all([hashPassword(asciiPassword), hashPassword(asciiPassword)]);
@@ -48,14 +58,14 @@ describe('password hashing', () => {
     expect(a.split('$')[5]).not.toBe(b.split('$')[5]);
     expect(await verifyPassword(asciiPassword, a)).toBe(true);
     expect(await verifyPassword(asciiPassword, b)).toBe(true);
-  });
+  }, KDF_TEST_TIMEOUT);
 
   it('accepts the maximum-length password and rejects longer input', async () => {
     const longChinese = '书'.repeat(MAX_PASSWORD_CODEPOINTS);
     const longHash = await hashPassword(longChinese);
     expect(await verifyPassword(longChinese, longHash)).toBe(true);
-    expect(hashPassword('书'.repeat(MAX_PASSWORD_CODEPOINTS + 1))).rejects.toThrow('out of bounds');
-  });
+    await expect(hashPassword('书'.repeat(MAX_PASSWORD_CODEPOINTS + 1))).rejects.toThrow('out of bounds');
+  }, KDF_TEST_TIMEOUT);
 });
 
 describe('password input bounds', () => {
@@ -103,7 +113,7 @@ describe('verification hardening', () => {
     expect(await verifyPassword(asciiPassword, null)).toBe(false);
     expect(await verifyPassword(asciiPassword, 'not-a-hash')).toBe(false);
     expect(await verifyPassword(asciiPassword, 'scrypt$1$999$8$1$AAAA$AAAA')).toBe(false);
-  });
+  }, KDF_TEST_TIMEOUT);
 
   it('spends comparable time on a dummy KDF when the hash is unusable', async () => {
     const before = performance.now();
@@ -114,5 +124,5 @@ describe('verification hardening', () => {
     await verifyPassword(asciiPassword, null);
     const rejectMs = performance.now() - start;
     expect(rejectMs).toBeGreaterThan(dummyMs * 0.25);
-  });
+  }, KDF_TEST_TIMEOUT);
 });

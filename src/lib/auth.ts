@@ -3,6 +3,28 @@ import { NextResponse } from 'next/server';
 import type { NextRequest } from 'next/server';
 import type { AuthResult, Permission } from './auth-types';
 import { hasPermission, OWNER_PRINCIPAL } from './permissions';
+import {
+  findSessionByToken,
+  getAuthSecuritySecret,
+  getSessionCookieName,
+  ownerCredentialTag,
+  type SessionRecord,
+} from './auth-session';
+import {
+  OWNER_FAIL_GLOBAL_RATE_LIMIT,
+  OWNER_FAIL_SOURCE_RATE_LIMIT,
+  GLOBAL_RATE_LIMIT_KEY,
+  bumpAuthRateLimit,
+  peekAuthRateLimit,
+  rateLimitKeyHash,
+  requestSourceIdentifier,
+} from './auth-rate-limit';
+import { getSql } from './db';
+
+// 部署开关 AUTH_ACCOUNTS_ENABLED（设计 §2.2）：默认 false，旧入口保持零数据库契约。
+export function authAccountsEnabled(): boolean {
+  return process.env.AUTH_ACCOUNTS_ENABLED === 'true';
+}
 
 function equalSecret(provided: string, expected: string): boolean {
   const a = Buffer.from(provided);
@@ -33,17 +55,36 @@ function unauthorized(): NextResponse {
   return NextResponse.json({ error: 'unauthorized', code: 'UNAUTHORIZED' }, { status: 401 });
 }
 
-export async function resolvePrincipal(req: NextRequest): Promise<AuthResult> {
+function serviceUnavailable(code: string, retryAfterSeconds?: number): NextResponse {
+  return NextResponse.json({ error: 'authentication service unavailable', code }, {
+    status: 503,
+    ...(retryAfterSeconds !== undefined ? { headers: { 'Retry-After': String(retryAfterSeconds) } } : {}),
+  });
+}
+
+function tooManyRequests(retryAfterSeconds: number): NextResponse {
+  return NextResponse.json({ error: 'too many authentication attempts', code: 'RATE_LIMITED' }, {
+    status: 429,
+    headers: { 'Retry-After': String(retryAfterSeconds) },
+  });
+}
+
+function ownerHeaderCredential(req: NextRequest): string | null {
   const authorization = req.headers.get('authorization');
   const ownerHeader = req.headers.get('x-owner-token');
-
-  if (authorization !== null && ownerHeader !== null) {
-    return { ok: false, response: unauthorized() };
+  if (authorization !== null && ownerHeader !== null) return null;
+  if (authorization === null && ownerHeader === null) return null;
+  if (authorization !== null) {
+    return authorization.startsWith('Bearer ') ? authorization.slice('Bearer '.length) : '';
   }
+  return ownerHeader ?? '';
+}
 
-  if (authorization === null && ownerHeader === null) {
-    return { ok: false, response: unauthorized() };
-  }
+// 显式 owner 头校验：账号模式下进入共享失败预算（先查冷却再验证，错误才计数），
+// 旧模式保持同步等价的零数据库行为。显式错误头永远不回退为 Cookie 身份。
+export async function verifyOwnerHeader(req: NextRequest): Promise<AuthResult> {
+  const provided = ownerHeaderCredential(req);
+  if (provided === null) return { ok: false, response: unauthorized() };
 
   const expected = process.env.APP_OWNER_TOKEN;
   if (!expected) {
@@ -56,13 +97,144 @@ export async function resolvePrincipal(req: NextRequest): Promise<AuthResult> {
     };
   }
 
-  const provided = authorization !== null
-    ? authorization.startsWith('Bearer ') ? authorization.slice('Bearer '.length) : ''
-    : ownerHeader ?? '';
-  if (!provided || !equalSecret(provided, expected)) {
+  const valid = provided !== '' && equalSecret(provided, expected);
+  if (!authAccountsEnabled()) {
+    return valid
+      ? { ok: true, principal: OWNER_PRINCIPAL }
+      : { ok: false, response: unauthorized() };
+  }
+
+  const secret = getAuthSecuritySecret();
+  if (!secret) {
+    return { ok: false, response: serviceUnavailable('AUTH_SECURITY_SECRET_REQUIRED') };
+  }
+
+  const sql = getSql();
+  const source = requestSourceIdentifier(req);
+  try {
+    const sourceBucket = await peekAuthRateLimit(
+      sql,
+      OWNER_FAIL_SOURCE_RATE_LIMIT,
+      rateLimitKeyHash(secret, OWNER_FAIL_SOURCE_RATE_LIMIT.scope, source),
+    );
+    const globalBucket = await peekAuthRateLimit(
+      sql,
+      OWNER_FAIL_GLOBAL_RATE_LIMIT,
+      rateLimitKeyHash(secret, OWNER_FAIL_GLOBAL_RATE_LIMIT.scope, GLOBAL_RATE_LIMIT_KEY),
+    );
+    if (sourceBucket.attempts >= OWNER_FAIL_SOURCE_RATE_LIMIT.limit
+      || globalBucket.attempts >= OWNER_FAIL_GLOBAL_RATE_LIMIT.limit) {
+      return {
+        ok: false,
+        response: tooManyRequests(
+          Math.max(sourceBucket.retryAfterSeconds, globalBucket.retryAfterSeconds),
+        ),
+      };
+    }
+  } catch {
+    // 限速状态不可用时账号模式失败关闭，不把服务故障当密码错误。
+    return { ok: false, response: serviceUnavailable('AUTH_RATE_LIMIT_UNAVAILABLE') };
+  }
+
+  if (valid) {
+    // 正确的日常请求不累计失败数。
+    return { ok: true, principal: OWNER_PRINCIPAL };
+  }
+
+  try {
+    await bumpAuthRateLimit(
+      sql,
+      OWNER_FAIL_SOURCE_RATE_LIMIT,
+      rateLimitKeyHash(secret, OWNER_FAIL_SOURCE_RATE_LIMIT.scope, source),
+    );
+    await bumpAuthRateLimit(
+      sql,
+      OWNER_FAIL_GLOBAL_RATE_LIMIT,
+      rateLimitKeyHash(secret, OWNER_FAIL_GLOBAL_RATE_LIMIT.scope, GLOBAL_RATE_LIMIT_KEY),
+    );
+  } catch {
+    return { ok: false, response: serviceUnavailable('AUTH_RATE_LIMIT_UNAVAILABLE') };
+  }
+  return { ok: false, response: unauthorized() };
+}
+
+// 把数据库会话记录映射为 Principal：owner 凭据代际标签不匹配即失效，
+// 成员闸门未开时 member 一律拒绝，未知角色或坏权限值默认拒绝。
+export function principalFromSessionRecord(record: SessionRecord | null): AuthResult {
+  if (!record) return { ok: false, response: unauthorized() };
+  if (record.role !== 'owner' && record.role !== 'member') {
     return { ok: false, response: unauthorized() };
   }
-  return { ok: true, principal: OWNER_PRINCIPAL };
+  if (
+    typeof record.canFind !== 'boolean' || typeof record.canRead !== 'boolean'
+    || typeof record.canDownload !== 'boolean' || typeof record.userId !== 'number'
+  ) {
+    return { ok: false, response: unauthorized() };
+  }
+  if (record.role === 'owner') {
+    // owner 行没有密码，password 会话不可能合法；owner_token 会话须匹配当前口令代际。
+    if (record.authMethod !== 'owner_token') return { ok: false, response: unauthorized() };
+    const ownerToken = process.env.APP_OWNER_TOKEN;
+    const secret = getAuthSecuritySecret();
+    if (!ownerToken || !secret) return { ok: false, response: unauthorized() };
+    if (record.ownerCredentialTag !== ownerCredentialTag(secret, ownerToken)) {
+      return { ok: false, response: unauthorized() };
+    }
+  } else if (!record.membersEnabled) {
+    return {
+      ok: false,
+      response: NextResponse.json(
+        { error: 'member access is not enabled', code: 'MEMBERS_DISABLED' },
+        { status: 403 },
+      ),
+    };
+  }
+  return {
+    ok: true,
+    principal: {
+      userId: record.userId,
+      role: record.role,
+      canFind: record.canFind,
+      canRead: record.canRead,
+      canDownload: record.canDownload,
+      authMethod: 'session',
+    },
+  };
+}
+
+// 每请求一次身份查询：同一请求内的重复 guard 复用同一个 Promise。
+const principalCache = new WeakMap<NextRequest, Promise<AuthResult>>();
+
+export function resolvePrincipal(req: NextRequest): Promise<AuthResult> {
+  let cached = principalCache.get(req);
+  if (!cached) {
+    cached = resolvePrincipalUncached(req);
+    principalCache.set(req, cached);
+  }
+  return cached;
+}
+
+async function resolvePrincipalUncached(req: NextRequest): Promise<AuthResult> {
+  const authorization = req.headers.get('authorization');
+  const ownerHeader = req.headers.get('x-owner-token');
+  if (authorization !== null || ownerHeader !== null) {
+    return verifyOwnerHeader(req);
+  }
+
+  // Cookie 会话只在账号模式启用；旧模式忽略 Cookie，不触碰数据库。
+  if (!authAccountsEnabled()) return { ok: false, response: unauthorized() };
+  const cookie = req.cookies.get(getSessionCookieName())?.value;
+  if (typeof cookie !== 'string' || cookie.length === 0) {
+    return { ok: false, response: unauthorized() };
+  }
+  let record: SessionRecord | null;
+  try {
+    record = await findSessionByToken(getSql(), cookie);
+  } catch {
+    // session 数据库不可用时不把 Cookie 当有效，也不降级为 owner。
+    return { ok: false, response: serviceUnavailable('AUTH_DB_UNAVAILABLE') };
+  }
+  return principalFromSessionRecord(record);
 }
 
 export async function requirePermission(
