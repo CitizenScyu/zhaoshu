@@ -45,6 +45,14 @@ function frameFor(prose: HTMLElement, viewport: HTMLElement): Frame | null {
   if (!view) return null;
   if (typeof prose.checkVisibility === 'function'
     && !prose.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true })) return null;
+  if (typeof prose.checkVisibility !== 'function') {
+    // Opacity is not inherited. Older engines still report visible geometry for
+    // text inside a transparent ancestor, including when both caret APIs are absent.
+    for (let parent = prose.parentElement; parent; parent = parent.parentElement) {
+      const parentStyle = view.getComputedStyle(parent);
+      if (parentStyle.opacity === '0' || parentStyle.contentVisibility === 'hidden') return null;
+    }
+  }
   const style = view.getComputedStyle(prose);
   if (style.visibility === 'hidden' || style.visibility === 'collapse' || style.opacity === '0'
     || !style.writingMode.startsWith('horizontal')) return null;

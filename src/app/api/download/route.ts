@@ -3,6 +3,7 @@ import { requireApiOwner } from '@/lib/auth';
 import { ensureSchema, getSql } from '@/lib/db';
 import { triggerDownloadWorkflow } from '@/lib/github';
 import { boundedPositiveInteger, readJsonBody, RequestBodyError } from '@/lib/http';
+import { DOWNLOAD_TASK_STALE_MS } from '@/lib/download-task-policy';
 
 // 书库下载任务:GET 查任务(最近 20 条或单条)、POST 建任务、DELETE 取消 pending/清理 failed
 export const maxDuration = 60;
@@ -41,13 +42,13 @@ function toTask(row: TaskRow) {
 }
 
 async function reclaimStaleTasks(sql: ReturnType<typeof getSql>) {
-  // Actions worker 单实例运行且每章更新心跳；超过 30 分钟无更新的 running 视为中断。
+  // Worker 每 60 秒独立更新心跳；长时间抓取/抽验也持续更新，与每 50 章的进度写回无关。
   await sql`
     UPDATE download_tasks
     SET status = 'failed',
         error = CONCAT(COALESCE(error, ''), ${'\nworker 中断自动回收'}),
         updated_at = now()
-    WHERE status = 'running' AND updated_at < now() - interval '30 minutes'`;
+    WHERE status = 'running' AND updated_at < now() - (${DOWNLOAD_TASK_STALE_MS} * interval '1 millisecond')`;
 }
 
 export async function GET(req: NextRequest) {

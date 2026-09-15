@@ -16,9 +16,9 @@ function equalSecret(provided: string, expected: string): boolean {
   return a.length === b.length && timingSafeEqual(a, b);
 }
 
-// Vercel cron 每天调用一次：带 x-vercel-cron 头，配置了 CRON_SECRET 时附 Bearer
+// Vercel authenticates cron invocations with CRON_SECRET in the Bearer header.
+// Do not require an undocumented x-vercel-cron marker.
 function cronRequest(req: NextRequest): boolean {
-  if (req.headers.get('x-vercel-cron') !== '1') return false;
   const expected = process.env.CRON_SECRET;
   // 密钥未配置时 fail closed：请求头本身不是身份凭据，不能因缺配置放行
   if (!expected) return false;

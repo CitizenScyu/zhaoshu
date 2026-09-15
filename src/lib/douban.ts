@@ -12,14 +12,20 @@ interface SuggestItem {
   id: string;
 }
 
-async function fetchWithTimeout(url: string, ms = 12_000): Promise<Response> {
+async function fetchWithTimeout<T>(url: string, consume: (response: Response) => Promise<T>, ms = 12_000): Promise<T> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), ms);
   try {
-    return await fetch(url, {
+    const response = await fetch(url, {
       signal: controller.signal,
       headers: { 'User-Agent': UA, 'Accept-Language': 'zh-CN,zh;q=0.9' },
     });
+    if (!response.ok) {
+      void response.body?.cancel().catch(() => {});
+      throw new Error(`HTTP ${response.status}`);
+    }
+    // Headers do not finish a fetch: keep the timeout until JSON/text is read.
+    return await consume(response);
   } finally {
     clearTimeout(timer);
   }
@@ -27,13 +33,10 @@ async function fetchWithTimeout(url: string, ms = 12_000): Promise<Response> {
 
 // 用书名+作者在豆瓣找对应条目（网文多为实体书条目，标题形如"诡秘之主 1"）
 async function searchSuggest(title: string): Promise<SuggestItem[]> {
-  const res = await fetchWithTimeout(
+  return fetchWithTimeout(
     `https://book.douban.com/j/subject_suggest?q=${encodeURIComponent(title)}`,
+    (response) => response.json() as Promise<SuggestItem[]>,
   );
-  if (!res.ok) {
-    throw new Error(`suggest ${res.status}`);
-  }
-  return (await res.json()) as SuggestItem[];
 }
 
 // 评分标记形如 <strong ... class="rating_num " property="v:average"> 8.5 </strong>,值两侧可能有空白
@@ -51,11 +54,7 @@ export function parseVotes(html: string): number | null {
 }
 
 async function fetchSubjectRating(doubanId: string) {
-  const res = await fetchWithTimeout(`https://book.douban.com/subject/${doubanId}/`);
-  if (!res.ok) {
-    throw new Error(`subject ${res.status}`);
-  }
-  const html = await res.text();
+  const html = await fetchWithTimeout(`https://book.douban.com/subject/${doubanId}/`, (response) => response.text());
   return {
     rating: parseRating(html),
     ratingCount: parseVotes(html),

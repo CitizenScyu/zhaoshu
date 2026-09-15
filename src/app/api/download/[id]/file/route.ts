@@ -2,6 +2,8 @@ import { NextRequest, NextResponse } from 'next/server';
 import { requireApiOwner } from '@/lib/auth';
 import { ensureSchema, getSql } from '@/lib/db';
 import { boundedPositiveInteger } from '@/lib/http';
+import { sanitizeBookFilename } from '@/lib/book-file-name';
+import { locateBookFile } from '@/lib/book-file-locator';
 
 // 下载完成的任务取回 TXT:文件在 GitHub 私库 CitizenScyu/zhaoshu-books 的 books/ 下
 export const maxDuration = 60;
@@ -11,18 +13,6 @@ const BOOKS_DIR = 'books';
 // One budget spans lookup and the raw stream, leaving room below maxDuration.
 const GITHUB_TIMEOUT_MS = 55_000;
 const UA = { 'User-Agent': 'zhaoshu-downloader/1.0' };
-
-// 必须与 zhaoshu-books/worker.mjs 的 sanitizeFilename 完全一致:
-// 非法字符删除(不转空格)、控制字符删除、空白折叠、结尾去横杠/空格、截 80 字符
-function sanitizeFilename(s: string): string {
-  const name = String(s ?? '')
-    .replace(/[\\/:*?"<>|]/g, '')
-    .replace(/[\x00-\x1f\x7f]/g, '')
-    .replace(/\s+/g, ' ')
-    .trim()
-    .replace(/[-\s]+$/, '');
-  return name.length > 80 ? name.slice(0, 80).replace(/[-\s]+$/, '') : name;
-}
 
 interface DirEntry {
   name: string;
@@ -80,18 +70,17 @@ async function findBookName(title: string, author: string, signal: AbortSignal):
   const names = listing
     .map((e) => (e as Partial<DirEntry>)?.name)
     .filter((n): n is string => typeof n === 'string' && n.endsWith('.txt'));
-  if (names.length === 0) return null;
-
-  const exact = `${sanitizeFilename(`${title}-${author}`)}.txt`;
-  if (names.includes(exact)) return exact;
-
-  // 兜底:书名部分前缀命中(作者名可能被 worker 截断或写过不同写法)
-  const titlePrefix = sanitizeFilename(title);
-  if (titlePrefix) {
-    const loose = names.filter((n) => n.startsWith(`${titlePrefix}-`));
-    if (loose.length === 1) return loose[0];
-  }
-  return null;
+  const file = await locateBookFile({ files: names.map(name => ({ name })), truncated: listing.length >= 1000 }, title, author, async (name) => {
+    const metadata = await githubResponse(`${BOOKS_DIR}/${encodeURIComponent(name)}`, 'application/vnd.github.object+json', signal);
+    if (!metadata) return null;
+    const value: unknown = await metadata.json();
+    if (!value || typeof value !== 'object' || !('type' in value) || value.type !== 'file'
+      || !('name' in value) || value.name !== name) {
+      throw new FileUpstreamError('文件服务返回了无效文件信息，请稍后重试', 'UPSTREAM_ERROR', 502);
+    }
+    return { name };
+  });
+  return file?.name ?? null;
 }
 
 // 直接请求 raw 文件流,避免 JSON/base64 解码或整体缓冲 TXT
@@ -155,7 +144,7 @@ export async function GET(
       return NextResponse.json({ error: 'file not found', code: 'FILE_NOT_FOUND' }, { status: 404 });
     }
 
-    const downloadName = `${sanitizeFilename(task.title) || 'novel'}.txt`;
+    const downloadName = `${sanitizeBookFilename(task.title) || 'novel'}.txt`;
     return new NextResponse(body, {
       status: 200,
       headers: {

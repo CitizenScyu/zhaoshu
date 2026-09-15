@@ -53,6 +53,15 @@ describe('reader server file resolution and bounded cache', () => {
     vi.unstubAllEnvs();
   });
 
+  it('resolves an anonymous task to its canonical worker file among other authors', async () => {
+    const book = fixture();
+    book.task.author = '';
+    book.file.name = bookFilename(book.task.title, '');
+    fetchMock.mockResolvedValueOnce(Response.json([book.file, { ...book.file, name: book.task.title + '-另一作者.txt' }]));
+    await expect(server.readerAvailability(book.task)).resolves.toEqual({ available: true });
+    expect(fetchMock).toHaveBeenCalledOnce();
+  });
+
   it.each([0, MAX_BYTES + 1])('reports a %s-byte file unavailable without fetching raw text', async (size) => {
     const book = fixture();
     fetchMock.mockResolvedValueOnce(Response.json([{ ...book.file, size }]));

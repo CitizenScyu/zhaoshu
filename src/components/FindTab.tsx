@@ -1,6 +1,6 @@
 'use client';
 
-import { useRef, useState, useSyncExternalStore } from 'react';
+import { useEffect, useRef, useState, useSyncExternalStore } from 'react';
 import type { Candidate, RerankedItem, VerifiedCandidate, FeedbackStatus } from '@/lib/types';
 import { useOwner } from '@/components/OwnerProvider';
 import FeedbackEditor from '@/components/FeedbackEditor';
@@ -69,6 +69,8 @@ export default function FindTab() {
   const [candidates, setCandidates] = useState<Candidate[]>([]);
   const [results, setResults] = useState<RerankedItem[]>([]);
   const [error, setError] = useState('');
+  const request = useRef<AbortController | null>(null);
+  useEffect(() => () => { request.current?.abort(); }, [apiFetch]);
   const history = useSyncExternalStore(subscribeHistory, getHistory, () => EMPTY_HISTORY);
 
   const recent = history.slice(0, HISTORY_SHOW);
@@ -90,33 +92,41 @@ export default function FindTab() {
     setError('');
     setCandidates([]);
     setResults([]);
+    const controller = new AbortController();
+    request.current = controller;
     try {
       const r1 = await apiFetch('/api/find', {
+        signal: controller.signal,
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ step: 'recall', query: q }),
       });
       const d1 = await r1.json();
+      controller.signal.throwIfAborted();
       if (!r1.ok) throw new Error(d1.error || '召回失败');
       setCandidates(d1.candidates);
 
       setPhase('verify');
       const r2 = await apiFetch('/api/find', {
+        signal: controller.signal,
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ step: 'verify', candidates: d1.candidates }),
       });
       const d2 = await r2.json();
+      controller.signal.throwIfAborted();
       if (!r2.ok) throw new Error(d2.error || '验证失败');
       const verified: VerifiedCandidate[] = d2.verified;
 
       setPhase('rerank');
       const r3 = await apiFetch('/api/find', {
+        signal: controller.signal,
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ step: 'rerank', query: q, verified }),
       });
       const d3 = await r3.json();
+      controller.signal.throwIfAborted();
       if (!r3.ok) throw new Error(d3.error || '重排失败');
       setResults(d3.items);
       if (d3.persisted === false) {
@@ -124,8 +134,11 @@ export default function FindTab() {
       }
       setPhase('done');
     } catch (e) {
+      if (controller.signal.aborted) return;
       setError(e instanceof Error ? e.message : '未知错误');
       setPhase('error');
+    } finally {
+      if (request.current === controller) request.current = null;
     }
   }
 
