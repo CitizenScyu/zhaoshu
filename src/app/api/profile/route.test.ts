@@ -28,6 +28,25 @@ function request(method = 'POST', body: unknown = { updatedAt: previousVersion }
   });
 }
 
+// 生成路由的下行是真 SSE：从流式响应收集事件，事件为 `data: <json>\n\n`。
+async function consumeSSE(res: Response): Promise<Record<string, unknown>[]> {
+  expect(res.status).toBe(200);
+  expect(res.headers.get('content-type')).toBe('text/event-stream; charset=utf-8');
+  const text = await res.text();
+  const events: Record<string, unknown>[] = [];
+  for (const chunk of text.split('\n\n')) {
+    const m = chunk.match(/^data: (.+)$/m);
+    if (m) events.push(JSON.parse(m[1]));
+  }
+  return events;
+}
+
+function lastEvent<R extends Record<string, unknown>>(events: Record<string, unknown>[], type: string): R {
+  const event = [...events].reverse().find((e) => e.type === type);
+  if (!event) throw new Error(`expected SSE event ${type}, got ${JSON.stringify(events)}`);
+  return event as R;
+}
+
 describe('/api/profile writes', () => {
   beforeEach(() => {
     vi.resetAllMocks();
@@ -42,31 +61,31 @@ describe('/api/profile writes', () => {
   });
   afterEach(() => { vi.unstubAllEnvs(); vi.restoreAllMocks(); });
 
-  it('saves valid generated markdown and passes cancellation to the model', async () => {
+  it('saves valid generated markdown as a stream ending in a done event, passing cancellation to the model', async () => {
     const req = request();
     const res = await POST(req);
-    expect(res.status).toBe(200);
-    expect(await res.json()).toEqual({ seeds, content: '有效画像😀\n喜欢严谨设定', updatedAt: nextVersion });
+    const events = await consumeSSE(res);
+    // 结束帧带完整结果（真正的 onToken 逐字首字节由 stream.test 用真实 llm 覆盖）。
+    expect(lastEvent(events, 'done')).toEqual({ type: 'done', seeds, content: '有效画像😀\n喜欢严谨设定', updatedAt: nextVersion });
     expect(mocks.saveProfile).toHaveBeenCalledWith(seeds, '有效画像😀\n喜欢严谨设定', previousVersion);
     expect(mocks.chatRobust.mock.calls[0][2].signal).toBe(req.signal);
   });
 
   it.each(['', ' \n ', null, false, '字'.repeat(5_001), 'bad' + String.fromCharCode(0), '\ud800', '\udc00'])(
-    'returns 502 without saving invalid model profile %#', async (content) => {
+    'returns an error event without saving invalid model profile %#', async (content) => {
       mocks.chatRobust.mockResolvedValue(content);
-      const res = await POST(request());
-      expect(res.status).toBe(502);
-      expect((await res.json()).error).toMatch(/画像为空、过长或含非法字符/);
+      const events = await consumeSSE(await POST(request()));
+      expect(lastEvent(events, 'error')).toMatchObject({ type: 'error' });
+      expect(String(lastEvent(events, 'error').message)).toMatch(/画像为空、过长或含非法字符/);
       expect(mocks.saveProfile).not.toHaveBeenCalled();
     },
   );
 
   it.each(['长度截断', '上游错误', '坏 SSE 事件', '无终止标记 EOF', '调用已取消'])(
-    'returns 502 without saving after %s', async (message) => {
+    'returns an error event without saving after %s', async (message) => {
       mocks.chatRobust.mockRejectedValue(new LlmError(message, false));
-      const res = await POST(request());
-      expect(res.status).toBe(502);
-      expect(await res.json()).toEqual({ error: message });
+      const events = await consumeSSE(await POST(request()));
+      expect(lastEvent<{ type: string; message: string }>(events, 'error').message).toBe(message);
       expect(mocks.saveProfile).not.toHaveBeenCalled();
     },
   );
@@ -77,7 +96,10 @@ describe('/api/profile writes', () => {
       controller.abort();
       return '有效画像';
     });
-    expect((await POST(request('POST', undefined, controller.signal))).status).toBe(502);
+    const res = await POST(request('POST', undefined, controller.signal));
+    expect(res.status).toBe(200);
+    // 请求已取消：流式响应被客户端撤掉，cancel() 会读取已中止的 signal 而抛错，属预期。
+    await res.body?.cancel().catch(() => {});
     expect(mocks.saveProfile).not.toHaveBeenCalled();
   });
 
@@ -142,6 +164,7 @@ describe('/api/profile writes', () => {
   it.each(['PUT', 'POST'])('rejects an already stale %s without writing or calling the model', async (method) => {
     const latest = { seeds: [{ title: '新书', kind: 'drop' }], content: '他人的更新', updatedAt: nextVersion };
     mocks.getProfile.mockResolvedValue(latest);
+    // 两人同时写、读取时已落后：都在调用模型前就暴露 409，POST 生成以 JSON 409 回（流尚未启动）。
     const res = await (method === 'PUT' ? PUT : POST)(request(method, {
       seeds, content: '我的修订', updatedAt: previousVersion,
     }));
@@ -201,12 +224,11 @@ describe('/api/profile writes', () => {
     expect(saved.status).toBe(200);
     const winner = structuredClone(current);
     finishGeneration('本次生成稿');
-    const res = await generation;
-    expect(res.status).toBe(409);
-    expect(await res.json()).toEqual({
-      error: expect.any(String), code: 'PROFILE_CONFLICT', profile: winner,
-      draft: { seeds, content: '本次生成稿' },
-    });
+    const events = await consumeSSE(await generation);
+    const conflict = lastEvent(events, 'conflict');
+    expect(conflict.code).toBe('PROFILE_CONFLICT');
+    expect(conflict.profile).toEqual(winner);
+    expect(conflict.draft).toEqual({ seeds, content: '本次生成稿' });
     expect(current).toEqual(winner);
     expect(current.seeds).toEqual(writer === 'manual' ? newSeeds : seeds);
     expect(mocks.chatRobust).toHaveBeenCalledTimes(writer === 'manual' ? 1 : 2);
@@ -218,25 +240,24 @@ describe('/api/profile writes', () => {
     mocks.getProfile.mockResolvedValueOnce({ seeds, content: '原画像', updatedAt: previousVersion })
       .mockRejectedValueOnce(new Error('temporary database error'));
     mocks.saveProfile.mockResolvedValue(null);
-    const res = await POST(request());
-    expect(res.status).toBe(409);
-    expect(await res.json()).toEqual({
-      error: expect.any(String), code: 'PROFILE_CONFLICT', profile: null,
-      draft: { seeds, content: '有效画像😀\n喜欢严谨设定' },
-    });
+    const events = await consumeSSE(await POST(request()));
+    const conflict = lastEvent(events, 'conflict');
+    expect(conflict.code).toBe('PROFILE_CONFLICT');
+    expect(conflict.profile).toBeNull();
+    expect(conflict.draft).toEqual({ seeds, content: '有效画像😀\n喜欢严谨设定' });
     expect(mocks.chatRobust).toHaveBeenCalledOnce();
     expect(mocks.saveProfile).toHaveBeenCalledOnce();
   });
 
-  it('returns a recognizable timeout code when the budget expires before the read finishes', async () => {
+  it('returns a recognizable timeout event when the budget expires before the read finishes', async () => {
     vi.useFakeTimers();
     try {
       mocks.ensureSchema.mockReturnValue(new Promise(() => {})); // block before model/save
-      const pending = POST(request());
+      const resPromise = POST(request()).then((res) => res.text());
       await vi.advanceTimersByTimeAsync(285_000);
-      const res = await pending;
-      expect(res.status).toBe(504);
-      expect(await res.json()).toEqual({ error: '请求预算已耗尽，请稍后重试。', code: 'DEADLINE_EXCEEDED' });
+      const body = await resPromise;
+      expect(body).toMatch(/DEADLINE_EXCEEDED/);
+      expect(body).toMatch(/请求预算已耗尽/);
       expect(mocks.chatRobust).not.toHaveBeenCalled();
       expect(mocks.saveProfile).not.toHaveBeenCalled();
     } finally {

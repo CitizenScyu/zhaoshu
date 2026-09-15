@@ -124,6 +124,57 @@ export default function ProfileTab({ state, dispatch, active }: {
     return controller;
   }
 
+  // POST 生成改为真 SSE：首字节尽早到达，避免浏览器→Vercel 之间的空闲连接被本地代理
+  // 在 60s 掐断。结束帧带最终 seeds/content/updatedAt；冲突以 `conflict` 事件结算，
+  // 保留第七批的 CAS/409 语义；最严苛错误落 `error` 事件，在正常流结束时交给调用方。
+  async function generateFromStream(res: Response, controller: AbortController): Promise<ProfileSnapshot | null> {
+    if (!res.body) throw new Error('生成响应为空，请重试');
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder('utf-8');
+    let buf = '';
+    try {
+      while (true) {
+        const { value, done } = await reader.read();
+        controller.signal.throwIfAborted();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+        let boundary: number;
+        while ((boundary = buf.indexOf('\n\n')) !== -1) {
+          const frame = buf.slice(0, boundary);
+          buf = buf.slice(boundary + 2);
+          const m = frame.match(/^data: (.+)$/m);
+          if (!m) continue;
+          let data: unknown;
+          try { data = JSON.parse(m[1]); } catch { continue; }
+          if (!isRecord(data) || typeof data.type !== 'string') continue;
+          if (data.type === 'done') {
+            const profile = readProfileSnapshot(data);
+            if (!profile) throw new Error('生成响应不完整，草稿已保留，请重新读取后核对');
+            return profile;
+          }
+          if (data.type === 'conflict') {
+            const generated = isRecord(data.draft)
+              ? readProfileSnapshot({ ...data.draft, updatedAt: state.saved?.updatedAt })
+              : null;
+            dispatch({
+              type: 'conflict', profile: readProfileSnapshot(data.profile),
+              ...(generated ? { generated: { seeds: generated.seeds, content: generated.content } } : {}),
+            });
+            if (generated) setEditing(true);
+            setMsg(generated ? '本次生成稿已保留，请比较后重新保存。' : '画像已在其他页面更新，你的草稿已保留。');
+            return null;
+          }
+          if (data.type === 'error') {
+            throw new Error(typeof data.message === 'string' ? data.message : '生成失败，请重试');
+          }
+        }
+      }
+      throw new Error('生成响应意外结束，请重试');
+    } finally {
+      try { await reader.cancel(); } catch { /* 已取消或已关闭 */ }
+    }
+  }
+
   function finishOperation(controller: AbortController) {
     if (operation.current !== controller) return;
     operation.current = null;
@@ -177,7 +228,16 @@ export default function ProfileTab({ state, dispatch, active }: {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ updatedAt: saved.updatedAt }),
       });
-      const profile = await readWriteResponse(res, controller, true);
+      if (!res.ok) {
+        // 非 200 仍是流未启动前的错误（如 409 冲突 / 校验失败），沿用旧 readWriteResponse 契约。
+        const fallback = await readWriteResponse(res, controller, true);
+        if (!fallback) return;
+        dispatch({ type: 'saved', profile: fallback, scope: 'all' });
+        setEditing(false);
+        setMsg('✓ 画像已生成');
+        return;
+      }
+      const profile = await generateFromStream(res, controller);
       if (!profile) return;
       dispatch({ type: 'saved', profile, scope: 'all' });
       setEditing(false);

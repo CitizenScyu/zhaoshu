@@ -35,6 +35,9 @@ interface ChatOptions {
   stream?: boolean;
   // 每次实际请求（含失败和重试）只通知一次；调用方负责在响应后落库。
   onUsage?: (call: LlmCallUsage) => void;
+  // 流式增量回调：每解析出新正文就叫一次（不分批、不等待完整结果）。
+  // 供 profile 生成把首字节尽早推给浏览器；调用方不得依赖该回调的调用次数。
+  onToken?: (delta: string) => void;
 }
 
 interface ResponseMetadata {
@@ -172,7 +175,7 @@ export async function chat(
 
     // 某些兼容中转即使收到 stream=true，也会返回完整 JSON。
     const json = !stream || /\bapplication\/(?:[\w.+-]+\+)?json\b/i.test(res.headers.get('content-type') ?? '');
-    const content = await readCompletionContent(res.body, idleMs, controller, json, captureMetadata);
+    const content = await readCompletionContent(res.body, idleMs, controller, json, captureMetadata, opts.onToken);
     if (opts.signal?.aborted) throw cancelledError();
     return { content, usage: call.usage, model: call.model, requestId: call.requestId };
   } catch (e) {
@@ -332,6 +335,7 @@ async function readCompletionContent(
   controller: AbortController,
   json: boolean,
   onMetadata: (metadata: ResponseMetadata) => void,
+  onToken?: (delta: string) => void,
 ): Promise<string> {
   const reader = body.getReader();
   const decoder = new TextDecoder('utf-8', { fatal: true });
@@ -376,6 +380,7 @@ async function readCompletionContent(
       const parsed = consumeSseChunk(buf, done, onMetadata);
       if (finished && parsed.content) throw invalidSse();
       content += parsed.content;
+      if (onToken && parsed.content) onToken(parsed.content);
       if (content.length > MAX_CONTENT_LENGTH) {
         throw new LlmError('模型输出过长，请重试。', false);
       }
@@ -418,11 +423,11 @@ function retryDelay(ms: number, signal?: AbortSignal): Promise<void> {
 
 // 首次调用、等待和唯一一次重试共享截止时间，绝不重新获得完整预算。
 // 调用方可传入 totalTimeoutMs 用请求级 deadline 派生的子预算来封顶本次调用的总时限；
-// 未传则回退到配置值（如内部预算），保持向后兼容。
+// 未传则回退到配置值（如内部预算），保持向后兼容。onToken 增量原样透传到每次实际请求。
 export async function chatRobust(
   system: string,
   user: string,
-  opts: Pick<ChatOptions, 'temperature' | 'maxTokens' | 'signal' | 'stream' | 'onUsage' | 'totalTimeoutMs'> = {},
+  opts: Pick<ChatOptions, 'temperature' | 'maxTokens' | 'signal' | 'stream' | 'onUsage' | 'totalTimeoutMs' | 'onToken'> = {},
 ): Promise<ChatResult> {
   const budgetMs = opts.totalTimeoutMs != null
     ? Math.min(opts.totalTimeoutMs, MAX_ROBUST_BUDGET_MS)

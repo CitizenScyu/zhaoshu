@@ -105,7 +105,11 @@ export async function PUT(req: NextRequest) {
   }
 }
 
-// 从种子书单生成画像
+// 从种子书单生成画像。
+// LLM 生成改为流式：把首字节尽早推给浏览器，避免浏览器→Vercel 之间无首字节的空闲连接
+// 被本地代理/中间网关在 60s 掐断（线上实测非流式 38.9s 单请求即触发）。结束帧带最终
+// seeds/content/updatedAt，沿用 CAS 版本与 409 冲突语义；把最严苛的错误（模型输出非法/超时/
+// 预算耗尽）升级成一个 JSON 的 `event:error` 事件，客户端据此在正常路径统一结算。
 export async function POST(req: NextRequest) {
   const unauthorized = requireApiOwner(req);
   if (unauthorized) return unauthorized;
@@ -141,30 +145,97 @@ export async function POST(req: NextRequest) {
         { status: 504 },
       );
     }
-    const { content: raw } = await chatRobust(
-      profileSystem(),
-      profileFromSeedsUser(JSON.stringify(sanitized, null, 2)),
-      { temperature: 0.4, signal: req.signal, onUsage: recordUsageAfterResponse('profile'), totalTimeoutMs: budgetMs },
-    );
-    if (req.signal.aborted) throw new LlmError('模型调用已取消。', false);
-    const content = validateProfileContent(raw);
-    deadline.assert();
-    const updatedAt = await saveProfile(sanitized, content, expectedUpdatedAt);
-    if (!updatedAt) return conflict({ seeds: sanitized, content });
-    return NextResponse.json({ seeds: sanitized, content, updatedAt });
+
+    // 流式响应体：下行是真 SSE。
+    const encoder = new TextEncoder();
+    const stream = new ReadableStream<Uint8Array>({
+      async start(controller) {
+        const send = (data: unknown) =>
+          controller.enqueue(encoder.encode(`data: ${JSON.stringify(data)}\n\n`));
+        try {
+          const { content: raw } = await chatRobust(
+            profileSystem(),
+            profileFromSeedsUser(JSON.stringify(sanitized, null, 2)),
+            {
+              temperature: 0.4,
+              signal: req.signal,
+              onUsage: recordUsageAfterResponse('profile'),
+              totalTimeoutMs: budgetMs,
+              onToken: (delta) => send({ type: 'token', content: delta }),
+            },
+          );
+          if (req.signal.aborted) throw new LlmError('模型调用已取消。', false);
+          const content = validateProfileContent(raw);
+          deadline.assert();
+          let updatedAt: string | null;
+          try {
+            updatedAt = await saveProfile(sanitized, content, expectedUpdatedAt);
+          } catch (e) {
+            console.error(e);
+            throw e;
+          }
+          if (!updatedAt) {
+            // 并发冲突：把冲突信息交给客户端（含本次生成稿，供比较后重存）。
+            let current: ProfileSnapshot | null = null;
+            try {
+              current = await getProfile();
+            } catch {
+              console.error('profile conflict reload failed');
+            }
+            send({ type: 'conflict', code: 'PROFILE_CONFLICT', profile: current, draft: { seeds: sanitized, content } });
+            return;
+          }
+          send({ type: 'done', seeds: sanitized, content, updatedAt });
+        } catch (e) {
+          send({ type: 'error', code: errorCode(e), message: errorMessage(e) });
+        } finally {
+          deadline.dispose();
+          try {
+            controller.close();
+          } catch {
+            // 已取消或已关闭，忽略。
+          }
+        }
+      },
+      cancel() {
+        deadline.dispose();
+        req.signal.throwIfAborted();
+        return undefined;
+      },
+    });
+
+    return new Response(stream, {
+      headers: {
+        'Content-Type': 'text/event-stream; charset=utf-8',
+        'Cache-Control': 'no-cache, no-transform',
+        'X-Accel-Buffering': 'no',
+      },
+    });
   } catch (e) {
-    if (e instanceof LlmError) {
-      return NextResponse.json({ error: e.message }, { status: 502 });
-    }
+    // 读库/校验/写回之外的处理阶段异常（如内部错误）：真流式已启动则只能靠事件收尾。
+    console.error(e);
     if (e instanceof DeadlineExceededError) {
       return NextResponse.json(
         { error: '请求预算已耗尽，请稍后重试。', code: e.code },
         { status: 504 },
       );
     }
-    console.error(e);
+    if (e instanceof LlmError) {
+      return NextResponse.json({ error: e.message }, { status: 502 });
+    }
     return NextResponse.json({ error: 'internal error' }, { status: 500 });
   } finally {
     deadline.dispose();
   }
+}
+
+function errorCode(e: unknown): string {
+  if (e instanceof DeadlineExceededError) return 'DEADLINE_EXCEEDED';
+  if (e instanceof LlmError) return 'LLM_ERROR';
+  return 'INTERNAL';
+}
+
+function errorMessage(e: unknown): string {
+  if (e instanceof LlmError) return e.message;
+  return '生成失败，请稍后重试。';
 }

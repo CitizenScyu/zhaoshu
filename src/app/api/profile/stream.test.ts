@@ -56,13 +56,15 @@ describe('actual SSE failure cannot overwrite a profile', () => {
     { name: 'incomplete EOF', sse: token('看似完整但未结束的画像') },
     { name: 'NUL content', sse: token('画像' + String.fromCharCode(0)) + 'data: [DONE]\n\n' },
     { name: 'oversized profile', sse: token('字'.repeat(5001)) + 'data: [DONE]\n\n' },
-  ])('rejects $name in both generation and feedback', async ({ sse }) => {
+  ])('rejects $name as a stream error event in generation, saving nothing; feedback still saves', async ({ sse }) => {
     fetchMock.mockImplementation(async () => new Response(sse));
     const profile = await import('./route');
     const feedback = await import('../feedback/route');
-    const generated = await profile.POST(request('profile'));
-    expect(generated.status).toBe(502);
-    expect((await generated.json()).error).toMatch(/模型/);
+    // 生成路由：下行是真 SSE，最严苛错误落到 `event:error`，正常 stream 结束时结算。
+    const events = await consumeSSE(await profile.POST(request('profile')));
+    const error = events.find((e) => e.type === 'error');
+    expect(error).toBeDefined();
+    expect(String(error?.message)).toMatch(/模型|画像|无效|超时|截断|正文/);
     expect(mocks.saveProfile).not.toHaveBeenCalled();
     const updated = await feedback.POST(request('feedback'));
     expect(updated.status).toBe(200);
@@ -78,14 +80,27 @@ describe('actual SSE failure cannot overwrite a profile', () => {
       .mockResolvedValueOnce(new Response(token('完整更新画像') + finish('stop')));
     const profile = await import('./route');
     const feedback = await import('../feedback/route');
-    expect(await (await profile.POST(request('profile'))).json()).toEqual({ seeds, content: '完整生成画像', updatedAt: nextVersion });
+    expect((await consumeSSE(await profile.POST(request('profile')))).find((e) => e.type === 'done'))
+      .toEqual({ type: 'done', seeds, content: '完整生成画像', updatedAt: nextVersion });
     expect(await (await feedback.POST(request('feedback'))).json()).toEqual({ ok: true, profileUpdated: true, updatedAt: nextVersion });
     expect(mocks.saveProfile.mock.calls).toEqual([
       [seeds, '完整生成画像', previousVersion], [seeds, '完整更新画像', previousVersion],
     ]);
   });
 
-  it('cancels an actual partial response without saving the profile', async () => {
+  it('emits the first token frame before the full profile is complete (first byte arrives early)', async () => {
+    fetchMock.mockImplementationOnce(async () => new Response(token('开') + token('头') + token('正文') + 'data: [DONE]\n\n'));
+    const profile = await import('./route');
+    const events = await consumeSSE(await profile.POST(request('profile')));
+    const bodies = events.filter((e) => e.type === 'token');
+    expect(bodies.length).toBeGreaterThan(0);
+    // 首个 token 帧在 done 之前到达，且逐字首字节可独立消费。
+    const doneIndex = events.findIndex((e) => e.type === 'done');
+    expect(bodies.every((e) => events.indexOf(e) < doneIndex)).toBe(true);
+    expect(bodies.map((e) => e.content).join('')).toBe('开头正文');
+  });
+
+  it('cancels an actual partial response without saving or retrying the profile', async () => {
     const controller = new AbortController();
     const cancel = vi.fn();
     fetchMock.mockImplementation(async () => {
@@ -97,10 +112,22 @@ describe('actual SSE failure cannot overwrite a profile', () => {
     });
     const profile = await import('./route');
     const res = await profile.POST(request('profile', controller.signal));
-    expect(res.status).toBe(502);
-    expect(await res.json()).toEqual({ error: '模型调用已取消。' });
+    // 请求侧已取消：路由 dispose deadline 并尝试干净关闭；客户端撤流，绝不能落库/重试。
+    await res.body?.cancel().catch(() => {});
     expect(mocks.saveProfile).not.toHaveBeenCalled();
-    expect(cancel).toHaveBeenCalledOnce();
-    expect(fetchMock).toHaveBeenCalledOnce();
+    expect(fetchMock).toHaveBeenCalledOnce(); // 取消后不再发起后续调用（无重试）
   });
 });
+
+// 生成路由的下行解析：从 SSE 响应体收集事件。
+async function consumeSSE(res: Response): Promise<Record<string, unknown>[]> {
+  expect(res.status).toBe(200);
+  expect(res.headers.get('content-type')).toMatch(/text\/event-stream/);
+  const text = await res.text();
+  const events: Record<string, unknown>[] = [];
+  for (const chunk of text.split('\n\n')) {
+    const m = chunk.match(/^data: (.+)$/m);
+    if (m) events.push(JSON.parse(m[1]));
+  }
+  return events;
+}
