@@ -15,9 +15,13 @@ if (!connectionString) {
         AND password_hash IS NULL AND can_find AND can_read AND can_download) AS owner_count,
       (SELECT count(*)::int FROM auth_settings WHERE id = 1 AND members_enabled = false
         AND registration_mode = 'closed') AS closed_settings_count,
+      to_regclass('sessions') IS NOT NULL AS has_sessions,
+      to_regclass('auth_rate_limits') IS NOT NULL AS has_rate_limits,
+      (SELECT count(*)::int FROM auth_schema_migrations WHERE version = 2) AS v2_count,
       pg_get_serial_sequence('users', 'id') AS identity_sequence`;
   const row = rows[0];
-  if (row.user_count !== 1 || row.owner_count !== 1 || row.closed_settings_count !== 1 || !row.identity_sequence) {
+  if (row.user_count !== 1 || row.owner_count !== 1 || row.closed_settings_count !== 1 || !row.identity_sequence
+    || !row.has_sessions || !row.has_rate_limits || row.v2_count !== 1) {
     throw new Error('Auth database skeleton verification failed. Use a dedicated empty test database.');
   }
   const nextRows = await sql`SELECT nextval(${row.identity_sequence}::regclass)::int AS next_id`;

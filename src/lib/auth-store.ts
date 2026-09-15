@@ -1,6 +1,6 @@
 import type { neon } from '@neondatabase/serverless';
 
-export const AUTH_SCHEMA_VERSION = 1;
+export const AUTH_SCHEMA_VERSION = 2;
 
 type Sql = ReturnType<typeof neon>;
 
@@ -17,8 +17,8 @@ export async function initializeAuthSchema(sql: Sql): Promise<void> {
       DECLARE newest integer;
       BEGIN
         SELECT max(version) INTO newest FROM auth_schema_migrations;
-        IF newest IS NOT NULL AND newest > 1 THEN
-          RAISE EXCEPTION 'auth schema version % is newer than supported version 1', newest;
+        IF newest IS NOT NULL AND newest > 2 THEN
+          RAISE EXCEPTION 'auth schema version % is newer than supported version 2', newest;
         END IF;
       END $$`,
     tx`
@@ -85,8 +85,43 @@ export async function initializeAuthSchema(sql: Sql): Promise<void> {
         END IF;
       END $$`,
     tx`
+      CREATE TABLE IF NOT EXISTS sessions (
+        token_hash char(64) PRIMARY KEY CHECK (token_hash ~ '^[0-9a-f]{64}$'),
+        user_id integer NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        auth_method text NOT NULL CHECK (auth_method IN ('password', 'owner_token')),
+        owner_credential_tag char(64),
+        created_at timestamptz NOT NULL DEFAULT now(),
+        expires_at timestamptz NOT NULL,
+        CHECK (expires_at > created_at),
+        CHECK ((auth_method = 'owner_token') = (user_id = 1)),
+        CHECK (
+          (auth_method = 'owner_token' AND owner_credential_tag IS NOT NULL)
+          OR (auth_method = 'password' AND owner_credential_tag IS NULL)
+        )
+      )`,
+    tx`
+      CREATE INDEX IF NOT EXISTS sessions_user_created_idx
+      ON sessions (user_id, created_at DESC)`,
+    tx`CREATE INDEX IF NOT EXISTS sessions_expires_idx ON sessions (expires_at)`,
+    tx`
+      CREATE TABLE IF NOT EXISTS auth_rate_limits (
+        scope text NOT NULL,
+        key_hash char(64) NOT NULL,
+        window_start timestamptz NOT NULL,
+        attempts integer NOT NULL CHECK (attempts >= 0),
+        expires_at timestamptz NOT NULL,
+        PRIMARY KEY (scope, key_hash, window_start)
+      )`,
+    tx`
+      CREATE INDEX IF NOT EXISTS auth_rate_limits_expires_idx
+      ON auth_rate_limits (expires_at)`,
+    tx`
       INSERT INTO auth_schema_migrations (version)
       VALUES (1)
+      ON CONFLICT (version) DO NOTHING`,
+    tx`
+      INSERT INTO auth_schema_migrations (version)
+      VALUES (2)
       ON CONFLICT (version) DO NOTHING`,
   ]);
 }
