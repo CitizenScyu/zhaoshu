@@ -26,7 +26,7 @@ export function authAccountsEnabled(): boolean {
   return process.env.AUTH_ACCOUNTS_ENABLED === 'true';
 }
 
-function equalSecret(provided: string, expected: string): boolean {
+export function secretsEqual(provided: string, expected: string): boolean {
   const a = Buffer.from(provided);
   const b = Buffer.from(expected);
   return a.length === b.length && timingSafeEqual(a, b);
@@ -45,7 +45,7 @@ export function requireApiOwner(req: NextRequest): NextResponse | null {
   const provided = authorization.startsWith('Bearer ')
     ? authorization.slice('Bearer '.length)
     : req.headers.get('x-owner-token') ?? '';
-  if (!equalSecret(provided, expected)) {
+  if (!secretsEqual(provided, expected)) {
     return NextResponse.json({ error: 'unauthorized', code: 'UNAUTHORIZED' }, { status: 401 });
   }
   return null;
@@ -97,7 +97,7 @@ export async function verifyOwnerHeader(req: NextRequest): Promise<AuthResult> {
     };
   }
 
-  const valid = provided !== '' && equalSecret(provided, expected);
+  const valid = provided !== '' && secretsEqual(provided, expected);
   if (!authAccountsEnabled()) {
     return valid
       ? { ok: true, principal: OWNER_PRINCIPAL }
