@@ -65,15 +65,25 @@ async function finishResponse() {
   for (const task of mocks.pending.splice(0)) await task();
 }
 
-// profile 生成路由的下行是真 SSE；其余模型路由仍是 JSON。消费响应到结束以触发 onUsage/after。
+// profile 与 find 的三步路由下行都是真 SSE；feedback 仍是 JSON。消费响应到结束以触发 onUsage/after。
 async function finishRequest(phase: LlmUsagePhase, response: Response): Promise<Response> {
-  if (phase === 'profile') {
+  if (phase === 'profile' || phase === 'find_recall' || phase === 'find_rerank') {
     expect(response.status).toBe(200);
     await response.text(); // 把流读完，start() 里的 chatRobust/写回与 after 埋点随之完成
     return response;
   }
   await response.json();
   return response;
+}
+
+// 找书与画像生成路由都发 SSE；把 SSE 响应以事件数组读出。
+async function sseOf(response: Response): Promise<Record<string, unknown>[]> {
+  const events: Record<string, unknown>[] = [];
+  for (const chunk of (await response.text()).split('\n\n')) {
+    const m = chunk.match(/^data: (.+)$/m);
+    if (m) events.push(JSON.parse(m[1]));
+  }
+  return events;
 }
 
 function inserts() {
@@ -136,7 +146,7 @@ describe('usage instrumentation through all model routes', () => {
     fetchMock.mockResolvedValue(new Response(sse(contentFor(phase), null)));
     const response = await invoke(phase);
     expect(response.status).toBe(200);
-    if (phase === 'profile') await response.text(); // 消费流结束触发 after 埋点
+    await finishRequest(phase, response); // 消费流结束触发 after 埋点
     await finishResponse();
     expect(inserts()).toEqual([[
       '2026-09-15T00:00:00.000Z', phase, 'reported-model', 0, 0, 0, 0, true, 'completion-id', '{}',
@@ -167,7 +177,9 @@ describe('usage instrumentation through all model routes', () => {
     expect(mocks.after).not.toHaveBeenCalled();
     upstream.enqueue(encoder.encode(event({ choices: [], usage: rawUsage }) + 'data: [DONE]\n\n'));
     upstream.close();
-    expect((await pending).status).toBe(200);
+    const res = await pending;
+    expect(res.status).toBe(200);
+    await res.text(); // 消费流结束触发 after 埋点
     expect(mocks.usageSql).not.toHaveBeenCalled();
     await finishResponse();
     expect(inserts()).toHaveLength(1);
@@ -175,7 +187,8 @@ describe('usage instrumentation through all model routes', () => {
 
   it('still records actual usage when model JSON fails the find output contract', async () => {
     fetchMock.mockResolvedValue(new Response(sse('not JSON')));
-    expect((await invoke('find_recall')).status).toBe(502);
+    const events = await sseOf(await invoke('find_recall'));
+    expect(events.find((e) => e.type === 'error')).toBeTruthy();
     expect(mocks.persistRecommendations).not.toHaveBeenCalled();
     await finishResponse();
     expect(inserts()[0].slice(1, 8)).toEqual(['find_recall', 'reported-model', 120, 30, 150, 50, false]);
