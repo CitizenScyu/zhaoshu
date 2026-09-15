@@ -683,20 +683,20 @@ export default function LibraryTab({ view, setView }: {
                   )}
                 </span>
               </button>
-              <button
-                type="button"
-                className="chip chip-dai text-xs mx-3 mb-3"
-                aria-label={`将${b.title}加入书架`}
-                disabled={shelfBusy !== 0}
-                onClick={() => void addToShelf(b)}
-              >
-                {shelfBusy === b.id ? '添加中…' : '+ 书架'}
-              </button>
-              {b.readTaskId && (
-                <div className="mx-3 mb-3">
+              <div className="flex items-center gap-2 px-3 pb-3">
+                <button
+                  type="button"
+                  className="text-[13px] px-1.5 py-0.5 rounded-[3px] transition-colors hover:bg-[var(--paper-deep)] hover:text-[var(--cinnabar)]"
+                  aria-label={`将${b.title}加入书架`}
+                  disabled={shelfBusy !== 0}
+                  onClick={() => void addToShelf(b)}
+                >
+                  {shelfBusy === b.id ? '添加中…' : '+ 书架'}
+                </button>
+                {b.readTaskId && (
                   <ReadBookLink taskId={b.readTaskId} title={b.title} from="library" />
-                </div>
-              )}
+                )}
+              </div>
             </article>
           ))}
         </div>
