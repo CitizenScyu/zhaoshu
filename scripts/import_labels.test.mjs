@@ -223,6 +223,112 @@ describe('incremental source and score preservation', () => {
   });
 });
 
+describe('作者在身份键和 SQL 绑定前规范化', () => {
+  const book15 = { source: 'book15.net', url: 'https://book15.net/books/details6728.html' };
+
+  for (const entity of ['&middot;', '&#183;', '&#xB7;']) {
+    it('SQL 作者绑定解码后的 ' + entity + '，原始记录和 labels 不变', async () => {
+      const input = record({
+        ...book15, author: ' 埃里克' + entity + '霍弗 ',
+        labels: { ...base.labels, author: '埃里克' + entity + '霍弗', note: '&middot;' },
+      });
+      const original = structuredClone(input);
+      Object.freeze(input.labels);
+      Object.freeze(input);
+      const out = validated(input);
+      let query;
+      await writeImportRecord(async (strings, ...values) => {
+        query = { text: strings.join('?'), values };
+      }, out);
+      assert.equal(out.author, '埃里克·霍弗');
+      assert.equal(query.values[1], '埃里克·霍弗');
+      assert.match(query.text, /ON CONFLICT \(lower\(title\), lower\(author\)\)/);
+      assert.deepEqual(JSON.parse(query.values[7]), original.labels);
+      assert.deepEqual(input, original);
+    });
+  }
+
+  it('实体的不同写法与普通文本进入同一个唯一身份键，重复导入不新增 mock 行', async () => {
+    const rows = new Map();
+    const sql = async (strings, ...values) => {
+      assert.match(strings.join('?'), /ON CONFLICT \(lower\(title\), lower\(author\)\)/);
+      const key = JSON.stringify([values[0].toLowerCase(), values[1].toLowerCase()]);
+      rows.set(key, values);
+    };
+    for (let pass = 0; pass < 2; pass += 1) {
+      for (const author of ['埃里克&middot;霍弗', '埃里克&#183;霍弗', '埃里克&#xB7;霍弗', '埃里克·霍弗']) {
+        await writeImportRecord(sql, validated(record({ ...book15, author })));
+      }
+    }
+    assert.equal(rows.size, 1);
+    assert.equal([...rows.values()][0][1], '埃里克·霍弗');
+  });
+
+  it('未知、多层、缺分号、非法实体和未知来源进入核验', () => {
+    for (const author of ['&unknown;', '&amp;middot;', '&middot', '&#0;', '&#xD800;', '&Tab;']) {
+      const input = record({ ...book15, author });
+      assert.equal(validateImportRecord(input).status, 'review');
+      assert.equal(input.author, author);
+    }
+    assert.equal(validateImportRecord(record({ author: '&middot;' })).status, 'review');
+  });
+
+  it('作者编码标记显式跳过已解码文本，未知标记不猜测', () => {
+    assert.equal(validated(record({ ...book15, author: '&middot;', author_encoding: 'text-v1' })).author, '&middot;');
+    assert.equal(validated(record({ ...book15, author: '&middot;', author_encoding: 'html-v1' })).author, '·');
+    assert.equal(validateImportRecord(record({ author_encoding: 'v2' })).status, 'review');
+    assert.equal(validateImportRecord(record({ author_encoding: 1 })).status, 'failed');
+  });
+
+  it('作者长度在解码之后校验，原有书名、身份和质量校验保持生效', () => {
+    assert.equal(validated(record({ ...book15, author: '&middot;'.repeat(200) })).author, '·'.repeat(200));
+    assert.equal(validated(record({ author: '😀'.repeat(200) })).author, '😀'.repeat(200));
+    assert.equal(validateImportRecord(record({ ...book15, author: '&middot;'.repeat(201) })).status, 'failed');
+    const author = '埃里克&middot;霍弗';
+    assert.equal(validateImportRecord(record({ ...book15, author, title: '字'.repeat(201) })).status, 'failed');
+    assert.equal(validateImportRecord(record({ ...book15, author, title: '测试书\0' })).status, 'review');
+    assert.equal(validateImportRecord(record({ ...book15, author, labels: { title_guess: '另一书' } })).status, 'review');
+    assert.equal(validateImportRecord(record({ ...book15, author, labels: { ...base.labels, text_quality: '含广告注入' } })).status, 'skipped');
+  });
+
+  it('dry-run 保留 JSONL、统计待核验作者且不读取 env 或创建 SQL 客户端', async () => {
+    const file = fixture([
+      record({ ...book15, author: '埃里克&middot;霍弗' }),
+      record({ ...book15, author: '&amp;middot;' }),
+      record({ ...book15, author: '&unknown;' }),
+      record({ author: '&middot;' }),
+    ]);
+    const original = readFileSync(file, 'utf8');
+    const logs = [];
+    const code = await run(['--dry-run', '--file', file, '--env', join(tempRoot, 'missing-author.env')], {
+      env: {}, log: (line) => logs.push(line),
+      createSql: () => assert.fail('dry-run 不能创建数据库客户端'),
+    });
+    assert.equal(code, 0);
+    assert.equal(logs.at(-1), '[dry-run] 总数 4 / 可导入 1 / 跳过 0 / 待核验 3 / 失败 0');
+    assert.equal(readFileSync(file, 'utf8'), original);
+  });
+
+  it('真实导入路径只将已核实的规范作者交给 SQL mock', async () => {
+    const file = fixture([
+      record({ ...book15, author: '埃里克&#xB7;霍弗' }),
+      record({ ...book15, author: '&unknown;' }),
+      record({ ...book15, author: '&amp;middot;' }),
+    ]);
+    const calls = [];
+    const logs = [];
+    const code = await run(['--file', file], {
+      env: { DATABASE_URL: 'postgresql://fixture:fixture@127.0.0.1:1/test' },
+      createSql: () => async (_strings, ...values) => { calls.push(values); },
+      log: (line) => logs.push(line),
+    });
+    assert.equal(code, 0);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0][1], '埃里克·霍弗');
+    assert.equal(logs.at(-1), '总数 3 / 入库 1 / 跳过 0 / 待核验 2 / 失败 0');
+  });
+});
+
 describe('offline dry-run and existing command entry', () => {
   it('retains env/file and positional arguments while rejecting missing paths', () => {
     assert.deepEqual(parseArgs(['--env', '.env.local', '--file', 'labels.jsonl']), { env: '.env.local', file: 'labels.jsonl', dryRun: false });
