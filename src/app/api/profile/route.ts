@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { ensureSchema, getProfile, saveProfile } from '@/lib/db';
-import { chatRobust, LlmError, MAX_PROFILE_LENGTH, validateProfileContent } from '@/lib/llm';
+import { chatRobust, configuredTotalTimeoutMs, LlmError, MAX_PROFILE_LENGTH, validateProfileContent } from '@/lib/llm';
 import { recordUsageAfterResponse } from '@/lib/record-llm-usage';
 import {
   profileSystem,
@@ -9,12 +9,15 @@ import {
 import { boundedString, readJsonBody, RequestBodyError } from '@/lib/http';
 import { hasInvalidDatabaseCharacters, sanitizeSeeds } from '@/lib/sanitize';
 import { requireApiOwner } from '@/lib/auth';
+import { createDeadline, DeadlineExceededError, MODEL_ROUTE_INTERNAL_BUDGET_MS, raceDeadline } from '@/lib/deadline';
 import type { ProfileSnapshot, SeedBook } from '@/lib/types';
 
 export const maxDuration = 295;
 
 const MAX_BODY_BYTES = 64 * 1024;
 const MAX_SEEDS = 100;
+// 生成画像的模型子预算：在内部预算里预留写回，不足即不调用模型
+const MODEL_CEILING_MS = 220_000;
 
 function isVersion(value: unknown): value is string {
   return typeof value === 'string' && value.length > 0 && value.length <= 128 &&
@@ -119,21 +122,33 @@ export async function POST(req: NextRequest) {
   if (!isVersion(expectedUpdatedAt)) {
     return NextResponse.json({ error: '读取画像后请携带原始 updatedAt 版本生成', code: 'PROFILE_VERSION_REQUIRED' }, { status: 400 });
   }
+  const deadline = createDeadline(MODEL_ROUTE_INTERNAL_BUDGET_MS);
+  const atomicRead = <T>(task: () => Promise<T>): Promise<T> =>
+    raceDeadline(deadline.signal, task);
   try {
-    await ensureSchema();
-    const profile = await getProfile();
+    await atomicRead(ensureSchema);
+    const profile = await atomicRead(getProfile);
     if (profile.updatedAt !== expectedUpdatedAt) return conflict(undefined, profile);
     const sanitized = sanitizeSeeds(profile.seeds);
     if (sanitized.length === 0) {
       return NextResponse.json({ error: '先在下方填入种子书单' }, { status: 400 });
     }
+    // 模型子预算：预留写回；前置读库耗时越多，留给模型越少，绝不重获整份预算
+    const budgetMs = Math.min(deadline.modelBudgetMs(MODEL_CEILING_MS), configuredTotalTimeoutMs());
+    if (budgetMs <= 0) {
+      return NextResponse.json(
+        { error: '请求预算已耗尽，请稍后重试。', code: 'DEADLINE_EXCEEDED' },
+        { status: 504 },
+      );
+    }
     const { content: raw } = await chatRobust(
       profileSystem(),
       profileFromSeedsUser(JSON.stringify(sanitized, null, 2)),
-      { temperature: 0.4, signal: req.signal, onUsage: recordUsageAfterResponse('profile') },
+      { temperature: 0.4, signal: req.signal, onUsage: recordUsageAfterResponse('profile'), totalTimeoutMs: budgetMs },
     );
     if (req.signal.aborted) throw new LlmError('模型调用已取消。', false);
     const content = validateProfileContent(raw);
+    deadline.assert();
     const updatedAt = await saveProfile(sanitized, content, expectedUpdatedAt);
     if (!updatedAt) return conflict({ seeds: sanitized, content });
     return NextResponse.json({ seeds: sanitized, content, updatedAt });
@@ -141,7 +156,15 @@ export async function POST(req: NextRequest) {
     if (e instanceof LlmError) {
       return NextResponse.json({ error: e.message }, { status: 502 });
     }
+    if (e instanceof DeadlineExceededError) {
+      return NextResponse.json(
+        { error: '请求预算已耗尽，请稍后重试。', code: e.code },
+        { status: 504 },
+      );
+    }
     console.error(e);
     return NextResponse.json({ error: 'internal error' }, { status: 500 });
+  } finally {
+    deadline.dispose();
   }
 }

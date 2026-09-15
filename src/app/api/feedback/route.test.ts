@@ -156,4 +156,21 @@ describe('POST /api/feedback note contract', () => {
     expect(mocks.saveProfile).toHaveBeenCalledExactlyOnceWith([], '更新后的画像', previousVersion);
     expect(mocks.chatRobust).toHaveBeenCalledOnce();
   });
+
+  it('stops the profile rewrite and still saves feedback when the budget expires before reading the profile', async () => {
+    vi.useFakeTimers();
+    try {
+      mocks.getProfile.mockReturnValue(new Promise(() => {})); // block before the model call
+      const pending = POST(request('done', '喜欢严谨设定'));
+      await vi.advanceTimersByTimeAsync(285_000); // expire the budget
+      const res = await pending;
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual({ ok: true, profileUpdated: false });
+      expect(mocks.transaction).toHaveBeenCalledOnce(); // feedback still committed
+      expect(mocks.chatRobust).not.toHaveBeenCalled();
+      expect(mocks.saveProfile).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });

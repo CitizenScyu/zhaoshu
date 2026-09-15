@@ -201,4 +201,31 @@ describe('POST /api/find output contract', () => {
     expect(res.status).toBe(200);
     expect(await res.json()).toMatchObject({ persisted: false, items: [item] });
   });
+
+  it('settles the request with a recognizable timeout code when the budget expires before the read finishes', async () => {
+    vi.useFakeTimers();
+    try {
+      mocks.ensureSchema.mockReturnValue(new Promise(() => {})); // block before the model call
+      const pending = POST(request({ step: 'recall', query: '找书' }));
+      const assertion = expect(pending).resolves.toBeInstanceOf(Response);
+      await vi.advanceTimersByTimeAsync(285_000);
+      await assertion; // wait for the request to settle against the budget
+      const res = await pending;
+      expect(res.status).toBe(504);
+      expect(await res.json()).toEqual({ error: '请求预算已耗尽，请稍后重试。', code: 'DEADLINE_EXCEEDED' });
+      expect(mocks.chatRobust).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('passes the request deadline signal into douban verification instead of a shared client', async () => {
+    mocks.verifyBatch.mockResolvedValue([douban]);
+    await POST(request({ step: 'verify', candidates: [candidate] }));
+    const signal = mocks.verifyBatch.mock.calls[0][1];
+    expect(signal).toBeInstanceOf(AbortSignal);
+    // 请求级发射，独立于 req.signal 与共享 abort
+    const req = request({ step: 'verify', candidates: [candidate] });
+    expect(signal).not.toBe(req.signal);
+  });
 });

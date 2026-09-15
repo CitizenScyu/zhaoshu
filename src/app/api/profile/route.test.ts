@@ -227,4 +227,20 @@ describe('/api/profile writes', () => {
     expect(mocks.chatRobust).toHaveBeenCalledOnce();
     expect(mocks.saveProfile).toHaveBeenCalledOnce();
   });
+
+  it('returns a recognizable timeout code when the budget expires before the read finishes', async () => {
+    vi.useFakeTimers();
+    try {
+      mocks.ensureSchema.mockReturnValue(new Promise(() => {})); // block before model/save
+      const pending = POST(request());
+      await vi.advanceTimersByTimeAsync(285_000);
+      const res = await pending;
+      expect(res.status).toBe(504);
+      expect(await res.json()).toEqual({ error: '请求预算已耗尽，请稍后重试。', code: 'DEADLINE_EXCEEDED' });
+      expect(mocks.chatRobust).not.toHaveBeenCalled();
+      expect(mocks.saveProfile).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });

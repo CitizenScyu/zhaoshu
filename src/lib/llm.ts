@@ -76,7 +76,7 @@ function cancelledError(): LlmError {
   return new LlmError('模型调用已取消。', false);
 }
 
-function configuredTotalTimeoutMs(): number {
+export function configuredTotalTimeoutMs(): number {
   const parsed = Number.parseInt(
     process.env.LLM_TOTAL_TIMEOUT_MS ?? String(DEFAULT_TOTAL_TIMEOUT_MS),
     10,
@@ -417,12 +417,16 @@ function retryDelay(ms: number, signal?: AbortSignal): Promise<void> {
 }
 
 // 首次调用、等待和唯一一次重试共享截止时间，绝不重新获得完整预算。
+// 调用方可传入 totalTimeoutMs 用请求级 deadline 派生的子预算来封顶本次调用的总时限；
+// 未传则回退到配置值（如内部预算），保持向后兼容。
 export async function chatRobust(
   system: string,
   user: string,
-  opts: Pick<ChatOptions, 'temperature' | 'maxTokens' | 'signal' | 'stream' | 'onUsage'> = {},
+  opts: Pick<ChatOptions, 'temperature' | 'maxTokens' | 'signal' | 'stream' | 'onUsage' | 'totalTimeoutMs'> = {},
 ): Promise<ChatResult> {
-  const budgetMs = Math.min(configuredTotalTimeoutMs(), MAX_ROBUST_BUDGET_MS);
+  const budgetMs = opts.totalTimeoutMs != null
+    ? Math.min(opts.totalTimeoutMs, MAX_ROBUST_BUDGET_MS)
+    : Math.min(configuredTotalTimeoutMs(), MAX_ROBUST_BUDGET_MS);
   const deadline = Date.now() + budgetMs;
   try {
     return await chat(system, user, { ...opts, totalTimeoutMs: budgetMs });
