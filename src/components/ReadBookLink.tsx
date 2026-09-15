@@ -11,9 +11,9 @@ interface Props {
 }
 
 export default function ReadBookLink(props: Props) {
-  const { ready, token } = useOwner();
+  const { ready, token, sessionId } = useOwner();
   if (!ready || !token || !props.taskId) return null;
-  return <AvailableBook key={`${props.taskId}:${token}`} {...props} taskId={props.taskId} />;
+  return <AvailableBook key={`${props.taskId}:${sessionId}`} {...props} taskId={props.taskId} />;
 }
 
 function AvailableBook({ taskId, title, from }: Props & { taskId: number }) {

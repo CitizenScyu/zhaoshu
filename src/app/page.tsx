@@ -30,7 +30,7 @@ export default function Home() {
 
 function HomeContent() {
   const [tab, setTab] = useState<Tab>('find');
-  const { token, sessionOnly, setSessionOnly, submitToken, logout } = useOwner();
+  const { token, ready, sessionId, sessionOnly, setSessionOnly, submitToken, logout } = useOwner();
   const [draft, setDraft] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const [notice, setNotice] = useState('');
@@ -147,17 +147,25 @@ function HomeContent() {
       </form>
 
       {/* 内容区：纸面卡片 */}
-      <main className="max-w-5xl w-full mx-auto px-6 sm:px-10 flex-1 min-w-0">
+      <main key={sessionId} className="max-w-5xl w-full mx-auto px-6 sm:px-10 flex-1 min-w-0">
         <div
           className="border-t border-[var(--line)] bg-[var(--paper-card)]/60 px-5 sm:px-8 py-8"
           style={{ boxShadow: '0 4px 24px rgba(46,42,35,0.05)' }}
         >
-          <div hidden={tab !== 'find'}><FindTab /></div>
-          {tab === 'shelf' && <ShelfTab />}
-          {tab === 'profile' && <ProfileTab />}
-          {tab === 'shuyuan' && <ShuyuanTab />}
-          {tab === 'library' && <LibraryTab />}
-          {tab === 'stats' && <StatsTab />}
+          {ready && token ? (
+            <>
+              <div hidden={tab !== 'find'}><FindTab /></div>
+              {tab === 'shelf' && <ShelfTab />}
+              {tab === 'profile' && <ProfileTab />}
+              {tab === 'shuyuan' && <ShuyuanTab />}
+              {tab === 'library' && <LibraryTab />}
+              {tab === 'stats' && <StatsTab />}
+            </>
+          ) : (
+            <p role="status" className="text-sm" style={{ color: 'var(--ink-soft)' }}>
+              {ready ? '请先输入并提交访问口令，继续使用书径。' : '正在恢复访问状态…'}
+            </p>
+          )}
         </div>
       </main>
 

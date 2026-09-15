@@ -2,9 +2,11 @@
 
 import { createContext, useCallback, useContext, useEffect, useRef, useState } from 'react';
 import { createOwnerRequest } from '@/lib/owner-request';
+import { OwnerSession } from '@/lib/owner-session';
 
 interface OwnerContextValue {
   token: string;
+  sessionId: number;
   ready: boolean;
   sessionOnly: boolean;
   setSessionOnly: (value: boolean) => void;
@@ -29,8 +31,8 @@ function storeToken(token: string, sessionOnly: boolean) {
   for (const area of ['localStorage', 'sessionStorage'] as const) {
     try {
       const storage = window[area];
-      storage.removeItem(STORAGE_KEY);
       if (token && area === selected) storage.setItem(STORAGE_KEY, token);
+      else storage.removeItem(STORAGE_KEY);
     } catch {
       // Try both storage areas independently; authentication still works in memory.
     }
@@ -39,31 +41,54 @@ function storeToken(token: string, sessionOnly: boolean) {
 
 export function OwnerProvider({ children }: { children: React.ReactNode }) {
   // A successful submission also refreshes consumers when the token is unchanged.
-  const [credentials, setCredentials] = useState({ token: '' });
+  const [credentials, setCredentials] = useState(() => new OwnerSession('', 0));
+  const currentSession = useRef(credentials);
   const [ready, setReady] = useState(false);
   const [sessionOnly, setSessionOnlyState] = useState(false);
+  const currentSessionOnly = useRef(false);
   const validation = useRef<AbortController | null>(null);
+
+  const replaceSession = useCallback((token: string) => {
+    const previous = currentSession.current;
+    const next = new OwnerSession(token, previous.id + 1);
+    currentSession.current = next;
+    previous.close();
+    setCredentials(next);
+  }, []);
 
   useEffect(() => {
     let active = true;
-    const session = readStoredToken('sessionStorage');
-    const stored = session || readStoredToken('localStorage');
-    if (session) {
-      try { window.localStorage.removeItem(STORAGE_KEY); } catch { /* Storage can be disabled. */ }
-    }
     queueMicrotask(() => {
       if (!active) return;
-      if (stored) setCredentials({ token: stored });
+      const session = readStoredToken('sessionStorage');
+      const stored = session || readStoredToken('localStorage');
+      currentSessionOnly.current = Boolean(session);
       setSessionOnlyState(Boolean(session));
+      // Always create a live generation, including after Strict Mode's effect replay.
+      replaceSession(stored);
       setReady(true);
     });
+    const onStorage = (event: StorageEvent) => {
+      if (currentSessionOnly.current || (event.key !== STORAGE_KEY && event.key !== null)) return;
+      try { if (event.storageArea !== window.localStorage) return; } catch { return; }
+      // Read the latest value; queued storage events may describe older values.
+      const stored = readStoredToken('localStorage');
+      if (stored === currentSession.current.token) return;
+      validation.current?.abort();
+      validation.current = null;
+      replaceSession(stored);
+    };
+    window.addEventListener('storage', onStorage);
     return () => {
       active = false;
       validation.current?.abort();
+      currentSession.current.close();
+      window.removeEventListener('storage', onStorage);
     };
-  }, []);
+  }, [replaceSession]);
 
   const setSessionOnly = useCallback((value: boolean) => {
+    currentSessionOnly.current = value;
     storeToken(credentials.token, value);
     setSessionOnlyState(value);
   }, [credentials.token]);
@@ -86,25 +111,25 @@ export function OwnerProvider({ children }: { children: React.ReactNode }) {
           : '暂时无法验证口令，请稍后重试');
       }
       storeToken(clean, sessionOnly);
-      setCredentials({ token: clean });
+      replaceSession(clean);
     } finally {
       if (validation.current === controller) validation.current = null;
     }
-  }, [sessionOnly]);
+  }, [sessionOnly, replaceSession]);
 
   const logout = useCallback(() => {
     validation.current?.abort();
     validation.current = null;
     storeToken('', false);
-    setCredentials({ token: '' });
-  }, []);
+    replaceSession('');
+  }, [replaceSession]);
 
   const apiFetch = useCallback(async (input: RequestInfo | URL, init: RequestInit = {}) => {
-    return fetch(createOwnerRequest(input, init, credentials.token, window.location.origin));
+    return credentials.fetch(input, init, window.location.origin);
   }, [credentials]);
 
   return (
-    <OwnerContext.Provider value={{ token: credentials.token, ready, sessionOnly, setSessionOnly, submitToken, logout, apiFetch }}>
+    <OwnerContext.Provider value={{ token: credentials.token, sessionId: credentials.id, ready, sessionOnly, setSessionOnly, submitToken, logout, apiFetch }}>
       {children}
     </OwnerContext.Provider>
   );
