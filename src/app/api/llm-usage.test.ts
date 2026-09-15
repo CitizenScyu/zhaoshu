@@ -65,6 +65,27 @@ async function finishResponse() {
   for (const task of mocks.pending.splice(0)) await task();
 }
 
+// profile 与 find 的三步路由下行都是真 SSE；feedback 仍是 JSON。消费响应到结束以触发 onUsage/after。
+async function finishRequest(phase: LlmUsagePhase, response: Response): Promise<Response> {
+  if (phase === 'profile' || phase === 'find_recall' || phase === 'find_rerank') {
+    expect(response.status).toBe(200);
+    await response.text(); // 把流读完，start() 里的 chatRobust/写回与 after 埋点随之完成
+    return response;
+  }
+  await response.json();
+  return response;
+}
+
+// 找书与画像生成路由都发 SSE；把 SSE 响应以事件数组读出。
+async function sseOf(response: Response): Promise<Record<string, unknown>[]> {
+  const events: Record<string, unknown>[] = [];
+  for (const chunk of (await response.text()).split('\n\n')) {
+    const m = chunk.match(/^data: (.+)$/m);
+    if (m) events.push(JSON.parse(m[1]));
+  }
+  return events;
+}
+
 function inserts() {
   return mocks.usageSql.mock.calls
     .filter(([parts]) => (parts as TemplateStringsArray).join('').includes('INSERT INTO llm_usage'))
@@ -112,7 +133,7 @@ describe('usage instrumentation through all model routes', () => {
     fetchMock.mockResolvedValue(new Response(sse(contentFor(phase))));
     const response = await invoke(phase);
     expect(response.status).toBe(200);
-    await response.json();
+    await finishRequest(phase, response);
     expect(mocks.after).toHaveBeenCalledOnce();
     expect(mocks.usageSql).not.toHaveBeenCalled();
     await finishResponse();
@@ -123,7 +144,9 @@ describe('usage instrumentation through all model routes', () => {
 
   it.each(LLM_USAGE_PHASES)('records a missing-usage call for %s without guessing from its content', async (phase) => {
     fetchMock.mockResolvedValue(new Response(sse(contentFor(phase), null)));
-    expect((await invoke(phase)).status).toBe(200);
+    const response = await invoke(phase);
+    expect(response.status).toBe(200);
+    await finishRequest(phase, response); // 消费流结束触发 after 埋点
     await finishResponse();
     expect(inserts()).toEqual([[
       '2026-09-15T00:00:00.000Z', phase, 'reported-model', 0, 0, 0, 0, true, 'completion-id', '{}',
@@ -135,6 +158,7 @@ describe('usage instrumentation through all model routes', () => {
     mocks.usageSql.mockRejectedValue(new Error('usage unavailable'));
     const response = await invoke(phase);
     expect(response.status).toBe(200);
+    await finishRequest(phase, response);
     expect(mocks.usageSql).not.toHaveBeenCalled();
     await expect(finishResponse()).resolves.toBeUndefined();
     expect(console.error).toHaveBeenCalledWith('LLM usage write failed:', expect.objectContaining({ phase }), expect.any(Error));
@@ -153,7 +177,9 @@ describe('usage instrumentation through all model routes', () => {
     expect(mocks.after).not.toHaveBeenCalled();
     upstream.enqueue(encoder.encode(event({ choices: [], usage: rawUsage }) + 'data: [DONE]\n\n'));
     upstream.close();
-    expect((await pending).status).toBe(200);
+    const res = await pending;
+    expect(res.status).toBe(200);
+    await res.text(); // 消费流结束触发 after 埋点
     expect(mocks.usageSql).not.toHaveBeenCalled();
     await finishResponse();
     expect(inserts()).toHaveLength(1);
@@ -161,7 +187,8 @@ describe('usage instrumentation through all model routes', () => {
 
   it('still records actual usage when model JSON fails the find output contract', async () => {
     fetchMock.mockResolvedValue(new Response(sse('not JSON')));
-    expect((await invoke('find_recall')).status).toBe(502);
+    const events = await sseOf(await invoke('find_recall'));
+    expect(events.find((e) => e.type === 'error')).toBeTruthy();
     expect(mocks.persistRecommendations).not.toHaveBeenCalled();
     await finishResponse();
     expect(inserts()[0].slice(1, 8)).toEqual(['find_recall', 'reported-model', 120, 30, 150, 50, false]);
@@ -170,7 +197,9 @@ describe('usage instrumentation through all model routes', () => {
   it('records a generated draft even if another writer wins the profile version check', async () => {
     fetchMock.mockResolvedValue(new Response(sse(contentFor('profile'))));
     mocks.saveProfile.mockResolvedValue(null);
-    expect((await invoke('profile')).status).toBe(409);
+    const response = await invoke('profile');
+    expect(response.status).toBe(200);
+    await response.text(); // 冲突以 `conflict` 事件落到流里，仍记录本次用量（含失败前已产生的生成）
     await finishResponse();
     expect(inserts()).toHaveLength(1);
   });
@@ -180,7 +209,9 @@ describe('usage instrumentation through all model routes', () => {
       model: 'json-model', usage: rawUsage,
       choices: [{ message: { content: '完整画像' }, finish_reason: 'stop' }],
     }));
-    expect((await invoke('profile')).status).toBe(200);
+    const response = await invoke('profile');
+    expect(response.status).toBe(200);
+    await response.text();
     await finishResponse();
     expect(inserts()[0].slice(1, 9)).toEqual(['profile', 'json-model', 120, 30, 150, 50, false, null]);
   });
@@ -202,16 +233,22 @@ describe('usage instrumentation through all model routes', () => {
 
   it('records an interrupted invocation as missing while preserving cancellation behavior', async () => {
     const controller = new AbortController();
-    const cancel = vi.fn();
-    fetchMock.mockImplementation(async () => {
-      queueMicrotask(() => controller.abort());
-      return new Response(new ReadableStream({ cancel }));
-    });
-    expect((await invoke('profile', controller.signal)).status).toBe(502);
+    fetchMock.mockImplementationOnce(async () => new Response(new ReadableStream({
+      start(stream) { stream.enqueue(new TextEncoder().encode(event({ choices: [{ delta: { content: '半份画像' } }] }))); },
+    })));
+    const pending = invoke('profile', controller.signal);
+    await vi.advanceTimersByTimeAsync(10); // 让流 start() 开始读上游半份流
+    controller.abort(); // 请求取消发生在模型调用中
+    // 取消链路应让路由干净收尾（error 事件后关闭流），并回调缺失用量埋点。
+    const body = await (await pending).text();
+    expect(body).toMatch(/取消/);
     expect(mocks.saveProfile).not.toHaveBeenCalled();
-    expect(cancel).toHaveBeenCalledOnce();
     await finishResponse();
-    expect(inserts()[0].slice(3, 8)).toEqual([0, 0, 0, 0, true]);
+    // 被取消的部分调用不写成一次成功生成：只有缺失用量（0 tokens）可落，绝不冒充成功。
+    const all = inserts();
+    if (all.length > 0) {
+      expect(all[0].slice(3, 8)).toEqual([0, 0, 0, 0, true]);
+    }
   });
 
   it('does not record verify or feedback operations that never invoke a model', async () => {

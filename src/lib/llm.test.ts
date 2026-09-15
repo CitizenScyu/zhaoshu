@@ -358,6 +358,26 @@ describe('stream completion and shared call budget', () => {
     expect(vi.getTimerCount()).toBe(0);
   });
 
+  it('calls onToken per content delta as it streams, before completion is known', async () => {
+    fetchMock.mockResolvedValue(response([token('开头'), token('中段'), finish('stop'), 'data: [DONE]\n\n']));
+    const deltas: string[] = [];
+    await client.chat('system', 'user', { onToken: (d) => deltas.push(d) });
+    // 每个增量在解析时即同步回调（首字节优先），不落最后一个 [DONE]。
+    expect(deltas).toEqual(['开头', '中段']);
+  });
+
+  it('does not call onToken on a retry that fails before producing content', async () => {
+    fetchMock
+      .mockResolvedValueOnce(new Response('', { status: 503 })) // 上游错误，无任何 content
+      .mockResolvedValueOnce(response([token('重试成功后正文'), finish('stop')]));
+    const deltas: string[] = [];
+    const pending = client.chatRobust('system', 'user', { onToken: (d) => deltas.push(d) });
+    await vi.advanceTimersByTimeAsync(1500); // 第一次失败后唯一的重试等待
+    await expect(pending).resolves.toMatchObject({ content: '重试成功后正文' });
+    expect(deltas).toEqual(['重试成功后正文']);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
   it('preserves non-ASCII request escaping and bounded max_tokens', async () => {
     fetchMock.mockResolvedValue(response([token('正文'), 'data: [DONE]\n\n']));
     await client.chat('系统😀', '用户中文', { maxTokens: 9000 });
