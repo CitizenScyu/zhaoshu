@@ -28,7 +28,7 @@ const HEADING = new RegExp(
 const TITLE_SEPARATOR = /^[ \t\u3000:：、.．\-—]+/u;
 const encoder = new TextEncoder();
 const TITLE_PREFIXES = new Set(
-  Array.from('第序前楔引后尾终番正', (character) => {
+  Array.from('第序前楔引后尾终番正【', (character) => {
     const bytes = encoder.encode(character);
     return (bytes[0] << 16) | (bytes[1] << 8) | bytes[2];
   }),
@@ -71,8 +71,15 @@ function couldStartTitle(bytes: Uint8Array, offset: number): boolean {
 
 function headingTitle(title: string): string | null {
   if (Array.from(title).length > MAX_TITLE_CHARACTERS) return null;
-  const match = HEADING.exec(title);
+  // The download worker wraps its heading in 【】. Keep the original title so
+  // ReaderClient can remove exactly that first line without changing byte offsets.
+  const wrapped = title.startsWith('【') && title.endsWith('】');
+  const label = wrapped ? title.slice(1, -1).trim() : title;
+  const match = HEADING.exec(label);
   if (!match) return null;
+  // Explicit delimiters disambiguate worker captions, including periods,
+  // semicolons/entities and captions immediately following the chapter number.
+  if (wrapped) return title;
   const suffix = match[1];
   if (!suffix) return title;
   // A label must end here or have an explicit separator. In particular,

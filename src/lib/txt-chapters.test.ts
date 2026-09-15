@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
+import { readFileSync } from 'node:fs';
 import {
   MAX_CHAPTER_PART_BYTES,
   MAX_READER_BYTES,
@@ -27,6 +28,30 @@ function expectCoverage(bytes: Uint8Array, ranges: ByteRange[], start = 0, end =
 }
 
 describe('parseTxtChapters', () => {
+  it('indexes the worker TXT format including book metadata and preserves every original byte', () => {
+    // Same title/author prefix, wrapped headings and paragraph separators as worker.mjs.
+    const bytes = readFileSync(new URL('./fixtures/worker-book.txt', import.meta.url));
+    const chapters = parseTxtChapters(bytes);
+    expect(chapters.map(({ title }) => title)).toEqual(['前言', '【第一章 夜行。】', '【第2章：消息】', '【尾声】']);
+    expectCoverage(bytes, chapters);
+    for (const chapter of chapters) expectCoverage(bytes, splitChapterParts(bytes, chapter, 32), chapter.startByte, chapter.endByte);
+    for (const chapter of chapters.slice(1)) {
+      const firstLine = decode(bytes.subarray(chapter.startByte, chapter.endByte)).split(/\r?\n/)[0];
+      expect(firstLine).toBe(chapter.title); // ReaderClient's heading de-duplication contract.
+    }
+  });
+
+  it.each(['第一章 起点', '第２回：来信', 'Chapter IV — Return', '番外三 假期', '序章', '第1章 论坛里的鬼故事。', '第115章 布鲁斯&middot;皮', '第一章起点'])
+    ('recognizes a worker-wrapped heading with CRLF: %s', (label) => {
+      const bytes = encode(`【${label}】\r\n\r\n正文。`);
+      expect(parseTxtChapters(bytes)).toEqual([{ index: 0, title: `【${label}】`, startByte: 0, endByte: bytes.length }]);
+    });
+
+  it.each(['【第一章 起点', '【第一章 起点】之后仍是正文', '【系统消息】', '【他说第一章讲的是正文。】'])
+    ('does not mistake bracketed body text for a heading: %s', (text) => {
+      expect(parseTxtChapters(encode(text + '\n普通正文。'))[0].title).toBe('正文');
+    });
+
   it('preserves Chinese byte offsets, BOM, preface, CRLF and the final unterminated line', () => {
     const source = '\uFEFF这是一段书前说明。\r\n\r\n第一章 初遇\r\n中文与 😀 的正文。\r\n\r\n第二回：夜访\r\n最后一行';
     const bytes = encode(source);
