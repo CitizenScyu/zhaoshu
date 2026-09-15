@@ -11,7 +11,9 @@ export function recallSystem() {
 3. 画像里明确列出的雷点（一票否决项）绝不能出现在候选里。
 4. 用户种子书单里的书和画像中提到"已读过"的书，禁止推荐。
 5. why 一句话说清这本书和用户口味的关联，要具体到流派/风格，不要空话。
-6. 输出精炼，不要解释。
+6. wordCount 是召回模型提供的待核验描述，不得把完结、字数、无雷、不烂尾等未经候选现有证据支持的属性写成事实。
+7. why 是模型判断。如提到参考作品，只能使用本次输入、画像证据或已读/种子书单中实际出现的作品，不得发明参考书。
+8. 输出精炼，不要解释。
 
 只输出 JSON，格式：
 {"candidates":[{"title":"书名","author":"作者","category":"题材流派标签","wordCount":"约X万字，完结/连载/不确定","why":"一句话理由"}]}`;
@@ -21,14 +23,21 @@ export function recallUser(
   profile: string,
   query: string,
   readBooks: { title: string; author: string }[] = [],
+  conditions = '',
 ): string {
   return `# 用户口味画像
 
-${profile || '（画像为空，本次按需求自由发挥，风格上向"资深老书虫"的偏好靠拢：重剧情逻辑和文笔，轻无脑爽文）'}
+${profile || '（画像为空，不添加任何长期偏好假定）'}
 
 # 本次找书需求
 
 ${query}
+
+# 仅本次生效的条件
+
+${conditions || '（无）'}
+
+本次条件只是召回与排序意图，不代表完结、字数、雷点等属性已经过事实核验；不得把未经验证的条件写成已执行的硬筛选。
 
 ${readBooks.length > 0 ? `# 以下书用户已读过/弃过/是种子书，禁止推荐（包括换书名号的同一作品）
 
@@ -47,15 +56,18 @@ export function rerankSystem() {
 2. 画像里的雷点是硬否决：命中的直接淘汰，不进入结果。
 3. 萌点命中越多分越高；但要诚实：纯粹"感觉用户可能喜欢"不算命中。
 4. risks 字段必须认真写：这本书最可能被什么人弃、有什么争议（烂尾风险、节奏问题、雷点争议），宁可错杀不可隐瞒。
-5. 最终输出 6~10 本，按 matchScore 降序。matchScore 是 0-100 的整数。
-6. reason 是一句话回答"对这位用户值不值得开"，直接说结论。
+5. 最终输出 6~10 本，按 matchScore 降序。matchScore 是 0-100 的个人匹配排序分，属于模型判断，不是用户喜欢这本书的概率。
+6. reason、hitLikes、risks 都是模型判断或推断。reason 是一句话回答"对这位用户值不值得开"，直接说结论。
+7. 豆瓣状态、链接、评分和评价人数是当前候选中可用的外部验证证据；不得改写或臆造。召回阶段的 wordCount 仍是模型提供的待核验描述。
+8. 完结、字数、无雷、不烂尾等属性，除非候选现有证据明确支持，否则只能表述为待核验的模型推断，不能作为事实。
+9. 如需比较参考作品，只能引用本次输入、画像证据或候选中已经出现的作品，不得发明作品。
 
 只输出 JSON，格式：
 {"items":[{"title":"书名","author":"作者","category":"题材流派","wordCount":"字数状态","matchScore":85,"hitLikes":["命中的萌点"],"risks":"风险与雷点提示","reason":"一句话结论","hallucinationRisk":false}]}
 被淘汰的候选不需要输出。`;
 }
 
-export function rerankUser(profile: string, query: string, verifiedJson: string) {
+export function rerankUser(profile: string, query: string, verifiedJson: string, conditions = '') {
   return `# 用户口味画像
 
 ${profile || '（画像为空）'}
@@ -63,6 +75,12 @@ ${profile || '（画像为空）'}
 # 本次找书需求
 
 ${query}
+
+# 仅本次生效的条件
+
+${conditions || '（无）'}
+
+本次条件不属于长期画像。完结、字数、雷点等若无现有证据，只能作为模型推断或待核验风险，不能陈述为已满足的事实。
 
 # 候选书（含豆瓣验证结果）
 

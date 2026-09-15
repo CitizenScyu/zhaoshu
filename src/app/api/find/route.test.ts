@@ -96,6 +96,23 @@ describe('POST /api/find output contract', () => {
       .toEqual([['ＡＢＣ', 'Ｘ'], ['abc', 'y']]);
   });
 
+  it('passes one-off conditions separately without changing the stored profile', async () => {
+    mocks.chatRobust.mockResolvedValue(JSON.stringify({ candidates: [candidate] }));
+    const res = await POST(request({ step: 'recall', query: '找书', conditions: '这次轻松一点' }));
+    expect(res.status).toBe(200);
+    expect(mocks.chatRobust.mock.calls[0][1]).toContain('# 用户口味画像\n\n画像');
+    expect(mocks.chatRobust.mock.calls[0][1]).toContain('# 仅本次生效的条件\n\n这次轻松一点');
+    expect(mocks.persistRecommendations).not.toHaveBeenCalled();
+  });
+
+  it('does not retain one-off conditions after the client clears them', async () => {
+    mocks.chatRobust.mockResolvedValue(JSON.stringify({ candidates: [candidate] }));
+    await POST(request({ step: 'recall', query: '找书', conditions: '这次轻松一点' }));
+    await POST(request({ step: 'recall', query: '找书', conditions: '' }));
+    expect(mocks.chatRobust.mock.calls[1][1]).toContain('# 仅本次生效的条件\n\n（无）');
+    expect(mocks.chatRobust.mock.calls[1][1]).not.toContain('这次轻松一点');
+  });
+
   it.each([undefined, '', '  '])('excludes exact seed titles with absent author %j and keeps sequels', async (author) => {
     mocks.getProfile.mockResolvedValue({ seeds: [{ title: 'ＡＢＣ', author, kind: 'love' }], content: '画像' });
     mocks.chatRobust.mockResolvedValue(JSON.stringify({ candidates: [

@@ -32,6 +32,7 @@ export const maxDuration = 295;
 
 const MAX_BODY_BYTES = 64 * 1024;
 const MAX_QUERY_LENGTH = 1_000;
+const MAX_CONDITIONS_LENGTH = 1_000;
 
 // 模型输出始终从 unknown 收窄；数量异常也属于上游错误，不能当成内部 500。
 function modelList(raw: string, field: 'candidates' | 'items', max: number): unknown[] {
@@ -70,6 +71,7 @@ export async function POST(req: NextRequest) {
     await ensureSchema();
     if (step === 'recall') {
       const query = boundedString(body.query, MAX_QUERY_LENGTH) ?? '';
+      const conditions = boundedString(body.conditions, MAX_CONDITIONS_LENGTH) ?? '';
       if (!query) {
         return NextResponse.json({ error: 'missing query' }, { status: 400 });
       }
@@ -90,7 +92,7 @@ export async function POST(req: NextRequest) {
       ];
       const { content: raw } = await chatRobust(
         recallSystem(),
-        recallUser(profile.content, query, excludedBooks),
+        recallUser(profile.content, query, excludedBooks, conditions),
         { temperature: 0.8, signal: req.signal, onUsage: recordUsageAfterResponse('find_recall') },
       );
       const candidates = sanitizeCandidates(modelList(raw, 'candidates', MAX_CANDIDATES))
@@ -118,6 +120,7 @@ export async function POST(req: NextRequest) {
 
     if (step === 'rerank') {
       const query = boundedString(body.query, MAX_QUERY_LENGTH) ?? '';
+      const conditions = boundedString(body.conditions, MAX_CONDITIONS_LENGTH) ?? '';
       const verified = sanitizeVerified(body.verified);
       if (!query || verified.length === 0) {
         return NextResponse.json({ error: 'missing query or verified' }, { status: 400 });
@@ -125,7 +128,7 @@ export async function POST(req: NextRequest) {
       const { content: profile } = await getProfile();
       const { content: raw } = await chatRobust(
         rerankSystem(),
-        rerankUser(profile, query, JSON.stringify(verified)),
+        rerankUser(profile, query, JSON.stringify(verified), conditions),
         { temperature: 0.3, signal: req.signal, onUsage: recordUsageAfterResponse('find_rerank') },
       );
       // 用书名+作者关联，避免同名作品回填到错误的豆瓣条目。
