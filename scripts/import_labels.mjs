@@ -12,6 +12,7 @@ import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { normalizeGenre } from './genre_map.mjs';
+import { normalizeAuthor } from './normalize_author.mjs';
 
 const DEFAULT_FILE = './labels.jsonl';
 // PG 的 jsonb/text 严禁 NUL(0x00),源码里直接写裸 NUL 字节会被编辑链污染,
@@ -128,14 +129,20 @@ function validateImportRecord(rec) {
   const review = (reason) => ({ status: 'review', reason });
   if (!isRecord(rec) || !isRecord(rec.labels)) return failed('记录或 labels 字段不是对象');
 
-  for (const field of ['title', 'site_title', 'author', 'category', 'status', 'source']) {
+  for (const field of ['title', 'site_title', 'author', 'author_encoding', 'category', 'status', 'source']) {
     if (rec[field] != null && typeof rec[field] !== 'string') return failed(field + ' 必须是字符串');
+  }
+  const normalizedAuthor = normalizeAuthor(rec.author ?? '', {
+    sourceSite: rec.source, encoding: rec.author_encoding,
+  });
+  if (normalizedAuthor.status !== 'ready') {
+    return { status: normalizedAuthor.status, reason: normalizedAuthor.reason };
   }
   const listedTitle = (rec.title ?? '').trim();
   const siteTitle = (rec.site_title ?? '').trim();
   const title = siteTitle || listedTitle;
-  const author = (rec.author ?? '').trim();
-  if (!title || title.length > 200 || listedTitle.length > 200 || author.length > 200) {
+  const author = normalizedAuthor.value;
+  if (!title || title.length > 200 || listedTitle.length > 200) {
     return failed('书名缺失或书名/作者超过 200 字');
   }
   if (cleanString(title) !== title || cleanString(listedTitle) !== listedTitle || cleanString(author) !== author) {
