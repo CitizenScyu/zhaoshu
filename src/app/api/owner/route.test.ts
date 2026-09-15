@@ -23,6 +23,30 @@ describe('GET /api/owner', () => {
     expect(res.headers.get('Cache-Control')).toBe('private, no-store');
   });
 
+  it.each(['', 'false', 'true'])('keeps the A01 owner draft contract in deployment mode %s', async (enabled) => {
+    vi.stubEnv('AUTH_ACCOUNTS_ENABLED', enabled);
+    vi.stubEnv('AUTH_SECURITY_SECRET', '');
+    vi.stubEnv('DATABASE_URL', '');
+    const res = await GET(new NextRequest('http://localhost/api/owner', {
+      headers: { Authorization: 'Bearer owner-test' },
+    }));
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ ok: true });
+  });
+
+  it('does not turn a rejected draft into a replacement credential', async () => {
+    const rejected = await GET(new NextRequest('http://localhost/api/owner', {
+      headers: { Authorization: 'Bearer wrong' },
+    }));
+    expect(rejected.status).toBe(401);
+    expect(rejected.headers.get('set-cookie')).toBeNull();
+
+    const current = await GET(new NextRequest('http://localhost/api/owner', {
+      headers: { Authorization: 'Bearer owner-test' },
+    }));
+    expect(current.status).toBe(200);
+  });
+
   it('fails closed when owner authentication is unconfigured', async () => {
     vi.stubEnv('APP_OWNER_TOKEN', '');
     expect((await GET(new NextRequest('http://localhost/api/owner'))).status).toBe(503);
