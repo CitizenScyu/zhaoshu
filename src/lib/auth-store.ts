@@ -1,6 +1,6 @@
 import type { neon } from '@neondatabase/serverless';
 
-export const AUTH_SCHEMA_VERSION = 2;
+export const AUTH_SCHEMA_VERSION = 3;
 
 type Sql = ReturnType<typeof neon>;
 
@@ -17,8 +17,8 @@ export async function initializeAuthSchema(sql: Sql): Promise<void> {
       DECLARE newest integer;
       BEGIN
         SELECT max(version) INTO newest FROM auth_schema_migrations;
-        IF newest IS NOT NULL AND newest > 2 THEN
-          RAISE EXCEPTION 'auth schema version % is newer than supported version 2', newest;
+        IF newest IS NOT NULL AND newest > 3 THEN
+          RAISE EXCEPTION 'auth schema version % is newer than supported version 3', newest;
         END IF;
       END $$`,
     tx`
@@ -122,6 +122,85 @@ export async function initializeAuthSchema(sql: Sql): Promise<void> {
     tx`
       INSERT INTO auth_schema_migrations (version)
       VALUES (2)
+      ON CONFLICT (version) DO NOTHING`,
+    tx`
+      DO $$
+      DECLARE profile_default text;
+      BEGIN
+        IF NOT EXISTS (SELECT 1 FROM auth_schema_migrations WHERE version = 3) AND (
+          to_regclass('profile') IS NULL
+          OR to_regclass('recommendations') IS NULL
+          OR to_regclass('feedback') IS NULL
+        ) THEN
+          RAISE EXCEPTION 'personal data migration requires profile, recommendations, and feedback tables';
+        END IF;
+
+        IF NOT EXISTS (SELECT 1 FROM auth_schema_migrations WHERE version = 3)
+          AND EXISTS (SELECT 1 FROM profile WHERE id <> 1) THEN
+          RAISE EXCEPTION 'profile contains an unexpected non-owner id';
+        END IF;
+
+        SELECT pg_get_expr(d.adbin, d.adrelid)
+          INTO profile_default
+        FROM pg_attribute a
+        LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum
+        WHERE a.attrelid = 'profile'::regclass AND a.attname = 'id' AND NOT a.attisdropped;
+        IF NOT EXISTS (SELECT 1 FROM auth_schema_migrations WHERE version = 3)
+          AND (profile_default IS NULL OR profile_default NOT IN ('1', '1::integer')) THEN
+          RAISE EXCEPTION 'profile.id default drifted from owner id 1: %', profile_default;
+        END IF;
+
+        IF NOT EXISTS (SELECT 1 FROM auth_schema_migrations WHERE version = 3) AND NOT EXISTS (
+          SELECT 1 FROM pg_constraint
+          WHERE conrelid = 'recommendations'::regclass AND contype = 'u'
+            AND pg_get_constraintdef(oid) = 'UNIQUE (book_id, query)'
+        ) THEN
+          RAISE EXCEPTION 'recommendations legacy table unique constraint has drifted';
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM auth_schema_migrations WHERE version = 3) AND NOT EXISTS (
+          SELECT 1 FROM pg_indexes
+          WHERE schemaname = current_schema()
+            AND tablename = 'recommendations'
+            AND indexname = 'recommendations_book_query_idx'
+            AND indexdef LIKE 'CREATE UNIQUE INDEX % ON %.recommendations USING btree (book_id, query)'
+        ) THEN
+          RAISE EXCEPTION 'recommendations legacy explicit unique index has drifted';
+        END IF;
+      END $$`,
+    tx`ALTER TABLE profile ALTER COLUMN id DROP DEFAULT`,
+    tx`
+      DO $$
+      BEGIN
+        IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid = 'profile'::regclass AND conname = 'profile_user_fk') THEN
+          ALTER TABLE profile ADD CONSTRAINT profile_user_fk FOREIGN KEY (id) REFERENCES users(id);
+        END IF;
+      END $$`,
+    tx`ALTER TABLE recommendations ADD COLUMN IF NOT EXISTS user_id integer DEFAULT 1`,
+    tx`UPDATE recommendations SET user_id = 1 WHERE user_id IS NULL`,
+    tx`ALTER TABLE recommendations ALTER COLUMN user_id SET DEFAULT 1, ALTER COLUMN user_id SET NOT NULL`,
+    tx`
+      DO $$
+      BEGIN
+        IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid = 'recommendations'::regclass AND conname = 'recommendations_user_fk') THEN
+          ALTER TABLE recommendations ADD CONSTRAINT recommendations_user_fk FOREIGN KEY (user_id) REFERENCES users(id);
+        END IF;
+      END $$`,
+    tx`CREATE INDEX IF NOT EXISTS recommendations_user_created_idx ON recommendations (user_id, created_at DESC)`,
+    tx`CREATE UNIQUE INDEX IF NOT EXISTS recommendations_user_book_query_idx ON recommendations (user_id, book_id, query)`,
+    tx`ALTER TABLE feedback ADD COLUMN IF NOT EXISTS user_id integer DEFAULT 1`,
+    tx`UPDATE feedback SET user_id = 1 WHERE user_id IS NULL`,
+    tx`ALTER TABLE feedback ALTER COLUMN user_id SET DEFAULT 1, ALTER COLUMN user_id SET NOT NULL`,
+    tx`
+      DO $$
+      BEGIN
+        IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid = 'feedback'::regclass AND conname = 'feedback_user_fk') THEN
+          ALTER TABLE feedback ADD CONSTRAINT feedback_user_fk FOREIGN KEY (user_id) REFERENCES users(id);
+        END IF;
+      END $$`,
+    tx`CREATE INDEX IF NOT EXISTS feedback_user_created_idx ON feedback (user_id, created_at DESC)`,
+    tx`
+      INSERT INTO auth_schema_migrations (version)
+      VALUES (3)
       ON CONFLICT (version) DO NOTHING`,
   ]);
 }
