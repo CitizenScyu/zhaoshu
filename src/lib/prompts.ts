@@ -21,14 +21,21 @@ export function recallUser(
   profile: string,
   query: string,
   readBooks: { title: string; author: string }[] = [],
+  conditions = '',
 ): string {
   return `# 用户口味画像
 
-${profile || '（画像为空，本次按需求自由发挥，风格上向"资深老书虫"的偏好靠拢：重剧情逻辑和文笔，轻无脑爽文）'}
+${profile || '（画像为空，不添加任何长期偏好假定）'}
 
 # 本次找书需求
 
 ${query}
+
+# 仅本次生效的条件
+
+${conditions || '（无）'}
+
+本次条件只是召回与排序意图，不代表完结、字数、雷点等属性已经过事实核验；不得把未经验证的条件写成已执行的硬筛选。
 
 ${readBooks.length > 0 ? `# 以下书用户已读过/弃过/是种子书，禁止推荐（包括换书名号的同一作品）
 
@@ -55,7 +62,7 @@ export function rerankSystem() {
 被淘汰的候选不需要输出。`;
 }
 
-export function rerankUser(profile: string, query: string, verifiedJson: string) {
+export function rerankUser(profile: string, query: string, verifiedJson: string, conditions = '') {
   return `# 用户口味画像
 
 ${profile || '（画像为空）'}
@@ -63,6 +70,12 @@ ${profile || '（画像为空）'}
 # 本次找书需求
 
 ${query}
+
+# 仅本次生效的条件
+
+${conditions || '（无）'}
+
+本次条件不属于长期画像。完结、字数、雷点等若无现有证据，只能作为模型推断或待核验风险，不能陈述为已满足的事实。
 
 # 候选书（含豆瓣验证结果）
 

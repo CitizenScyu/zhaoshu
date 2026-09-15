@@ -13,6 +13,11 @@ export interface ProfileSnapshot {
   updatedAt: string;
 }
 
+// 只对当前一次找书生效，不写入长期口味画像。
+export interface FindConditions {
+  text: string;
+}
+
 // LLM 召回的候选书
 export interface Candidate {
   title: string;

@@ -65,6 +65,7 @@ type Phase = 'idle' | 'recall' | 'verify' | 'rerank' | 'done' | 'error';
 export default function FindTab() {
   const { apiFetch } = useOwner();
   const [query, setQuery] = useState('');
+  const [conditions, setConditions] = useState('');
   const [phase, setPhase] = useState<Phase>('idle');
   const [candidates, setCandidates] = useState<Candidate[]>([]);
   const [results, setResults] = useState<RerankedItem[]>([]);
@@ -86,6 +87,7 @@ export default function FindTab() {
 
   async function run() {
     const q = query.trim();
+    const currentConditions = conditions.trim();
     if (!q || phase === 'recall' || phase === 'verify' || phase === 'rerank') return;
     rememberQuery(q);
     setPhase('recall');
@@ -99,7 +101,7 @@ export default function FindTab() {
         signal: controller.signal,
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ step: 'recall', query: q }),
+        body: JSON.stringify({ step: 'recall', query: q, conditions: currentConditions }),
       });
       const d1 = await r1.json();
       controller.signal.throwIfAborted();
@@ -123,7 +125,7 @@ export default function FindTab() {
         signal: controller.signal,
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ step: 'rerank', query: q, verified }),
+        body: JSON.stringify({ step: 'rerank', query: q, conditions: currentConditions, verified }),
       });
       const d3 = await r3.json();
       controller.signal.throwIfAborted();
@@ -164,6 +166,29 @@ export default function FindTab() {
             if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) run();
           }}
         />
+        <div className="border-l-2 pl-3" style={{ borderColor: 'var(--line)' }}>
+          <div className="flex flex-wrap items-center gap-2 mb-2">
+            <label htmlFor="find-conditions" className="text-sm font-bold">仅本次条件</label>
+            <span className="text-xs" style={{ color: 'var(--ink-faint)' }}>
+              与长期画像分开，不会自动保存
+            </span>
+            {conditions && (
+              <button type="button" className="chip text-xs ml-auto" onClick={() => setConditions('')}>
+                清空本次条件
+              </button>
+            )}
+          </div>
+          <input
+            id="find-conditions"
+            className="paper-input text-sm w-full"
+            value={conditions}
+            onChange={(event) => setConditions(event.target.value)}
+            placeholder="例如：这次想轻松一点、偏短篇、节奏快；这些是软意图，属性仍需核验"
+          />
+          <p className="text-xs mt-1.5 leading-5" style={{ color: 'var(--ink-faint)' }}>
+            题材、节奏等用于本轮匹配；完结、字数、雷点等只有出现明确证据时才算已核验约束。
+          </p>
+        </div>
         <div className="flex flex-wrap items-center gap-2">
           {recent.length > 0 && (
             <span className="text-xs" style={{ color: 'var(--ink-faint)' }}>最近</span>
