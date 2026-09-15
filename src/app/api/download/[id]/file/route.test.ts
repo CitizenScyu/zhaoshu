@@ -46,6 +46,25 @@ describe('GET /api/download/[id]/file', () => {
     vi.unstubAllEnvs();
   });
 
+  it.each(['山河-佚名.txt', '山河.txt'])('locates anonymous authors by the exact canonical or legacy name %s', async (name) => {
+    sql.mockResolvedValue([{ ...task, title: '山河', author: '' }]);
+    fetchMock.mockResolvedValueOnce(Response.json([{ name }, { name: '山河-另一作者.txt' }])).mockResolvedValueOnce(new Response('正确正文'));
+    const response = await download();
+    expect(response.status).toBe(200);
+    expect(await response.text()).toBe('正确正文');
+    expect(fetchMock.mock.calls.at(-1)?.[0]).toContain(encodeURIComponent(name));
+  });
+
+  it('keeps UTF-16 boundary filenames safe in both the upstream URL and download header', async () => {
+    sql.mockResolvedValue([{ ...task, title: '甲'.repeat(79) + '😀', author: '作者' }]);
+    const name = '甲'.repeat(79) + '.txt';
+    fetchMock.mockResolvedValueOnce(Response.json([{ name }])).mockResolvedValueOnce(new Response('正文'));
+    const response = await download();
+    expect(response.status).toBe(200);
+    expect(response.headers.get('Content-Disposition')).toContain(encodeURIComponent(name));
+    expect(await response.text()).toBe('正文');
+  });
+
   it.each([null, 'wrong-owner'])('rejects %s credentials before accessing data', async (token) => {
     expect((await download(token)).status).toBe(401);
     expect(ensureSchema).not.toHaveBeenCalled();
