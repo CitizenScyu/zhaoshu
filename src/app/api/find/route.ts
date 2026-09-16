@@ -103,11 +103,15 @@ export async function POST(req: NextRequest) {
     const body = await atomicRead(() => readJsonBody(req, MAX_BODY_BYTES, access.signal));
     if (!body?.step) return NextResponse.json({ error: 'missing step' }, { status: 400 });
     const step = body.step;
-    // 找书的两个模型步骤都带上兜底模型：主模型（换上的快模型有约 22% 的传输层失败率）
-    // 连不上时降级回已知可用的那个，而不是让整次找书失败。兜底只认传输层失败，且占用
-    // chatRobust 原本的重试名额，所以单步上游调用次数上界不变（见 chatRobust 注释）。
-    // 每次请求读一次，便于运维改 LLM_FALLBACK_MODEL 后立即生效。其它调用点（profile /
-    // feedback）刻意不传，保持既有行为中性。
+    // 找书的两个模型步骤都带上兜底模型，让主模型卡住时用它顶替原本的「重试」那次机会，
+    // 而不是让整次找书失败。降级只在**卡住**那一族失败触发：网关超时（524/408）、单次尝试
+    // 的首字节或停滞上限到点、总超时。连接层失败（UPSTREAM_UNREACHABLE）刻意不降级——它
+    // 重试极便宜且对所有模型一视同仁，换模型治不住，原地重试才对（判定见 llm.ts fallbackEligible）。
+    // 兜底占用 chatRobust 原本的重试名额，所以单步上游调用次数上界不变（见 chatRobust 注释）。
+    // 主模型（换上的快模型）路由级失败率 ≈10%：来自独立复测 n=10、CI 1.8–40%，点值无分辨力，
+    // 只能当量级；其中约一半是本机→Cloudflare 某边缘 IP 的 TLS 路径问题、与模型无关，生产
+    // Vercel 侧是否同样命中尚未验证。每次请求读一次配置，便于运维改 LLM_FALLBACK_MODEL 后
+    // 立即生效。其它调用点（profile / feedback）刻意不传，保持既有行为中性。
     const fallbackModel = configuredFallbackModel();
     // 单次尝试上限（首字节 + 流内停滞，取同一个值）：524 要吃满 ~126s，不给单次尝试封顶的话
     // 它一次就能把整步预算啃光、兜底永远轮不到。上限只压主模型那一路，兜底只受共享截止时间约束。
