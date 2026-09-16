@@ -159,7 +159,7 @@ export function feedbackForUserQueries(sql: PersonalQuery, userId: number, book:
     sql`SELECT id FROM books WHERE lower(title) = lower(${book.title}) AND lower(author) = lower(${book.author}) FOR UPDATE`,
     sql`SELECT id FROM books WHERE lower(title) = lower(${book.title}) AND lower(author) = lower(${book.author})`,
     sql`SELECT 1 / CASE WHEN COALESCE((
-      SELECT max(id) FROM feedback f JOIN books b ON b.id = f.book_id
+      SELECT max(f.id) FROM feedback f JOIN books b ON b.id = f.book_id
       WHERE f.user_id = ${userId} AND lower(b.title) = lower(${book.title}) AND lower(b.author) = lower(${book.author})
     ), 0) = ${expectedVersion} THEN 1 ELSE 0 END AS feedback_version_matches`,
     sql`INSERT INTO feedback (user_id, book_id, status, note)

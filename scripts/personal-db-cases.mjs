@@ -7,7 +7,7 @@ import { initializeBusinessSchema } from '../src/lib/business-schema.ts';
 import { authorizedTransaction } from '../src/lib/personal-write.ts';
 import {
   profileForUserQuery, saveProfileForUserQuery, persistRecommendationsForUserQueries,
-  feedbackForUserQueries, recommendationsForUserQuery, deleteShelfForUserQuery,
+  feedbackForUserQueries, feedbackSnapshotForUserQuery, recommendationsForUserQuery, deleteShelfForUserQuery,
   personalExportQueries, findStatsForUserQuery, shelfStatsForUserQuery,
   addShelfForUserQueries, shelfExistsForUserQuery,
 } from '../src/lib/user-data.ts';
@@ -141,9 +141,13 @@ export async function personalIsolationCase() {
     await write(2,(tx)=>persistRecommendationsForUserQueries(tx,2,'same-query',[common]));
     await write(3,(tx)=>persistRecommendationsForUserQueries(tx,3,'same-query',[{...common,reason:'B-reason'}]));
     assert.equal((await sql`SELECT count(*)::int AS n FROM recommendations WHERE query='same-query'`)[0].n,2);checks++;
-    await write(2,(tx)=>feedbackForUserQueries(tx,2,common,'done','A-note'));
-    await write(3,(tx)=>feedbackForUserQueries(tx,3,common,'reading','B-note'));
-    await write(2,(tx)=>feedbackForUserQueries(tx,2,common,'done',''));
+    // 前两次是各用户的首次创建（版本 0）；第三次是 user2 的二次写入并清空 note，
+    // 必须带上当前版本，才能验证「清空 note 不回退旧原因」的追加语义。版本从快照
+    // 读出（与路由同源），不写死：legacy 迁移保留的历史反馈会占用更小的 id。
+    await write(2,(tx)=>feedbackForUserQueries(tx,2,common,'done','A-note',0));
+    await write(3,(tx)=>feedbackForUserQueries(tx,3,common,'reading','B-note',0));
+    const [[{id:currentFeedbackVersion}]]=await sql.transaction((tx)=>[feedbackSnapshotForUserQuery(tx,2,common.title,common.author)]);
+    await write(2,(tx)=>feedbackForUserQueries(tx,2,common,'done','',currentFeedbackVersion));
     const a=await recommendationsForUserQuery(sql,2,false),b=await recommendationsForUserQuery(sql,3,false);
     assert.equal(a[0].note,'');assert.equal(a[0].status,'done');assert.equal(a[0].reason,'A-reason');
     assert.equal(b[0].note,'B-note');assert.equal(b[0].status,'reading');assert.equal(b[0].reason,'B-reason');checks++;
