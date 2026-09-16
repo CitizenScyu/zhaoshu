@@ -29,7 +29,8 @@ export async function GET(req: NextRequest) {
   if (!auth.ok) return withAuthHeaders(auth.response);
   try {
     await ensureSchema();
-    // GET 不发探测请求（那是 PATCH 保存前验证的职责），所以这里不知道是不是推理模型。
+    // GET 不发探测请求，所以「是不是推理模型」只能报上次保存时落库的那条判定；
+    // 从没保存过（或判定在写入前就丢了）时为 null，表示未知，不是「不是」。
     return authJson(modelSettingsPayload(await readModelSetting()));
   } catch {
     return authError(503, 'SETTINGS_UNAVAILABLE', SETTINGS_UNAVAILABLE);
@@ -71,7 +72,7 @@ export async function PATCH(req: NextRequest) {
       return authError(503, 'SETTINGS_UNAVAILABLE', SETTINGS_UNAVAILABLE);
     }
     resetModelCache();
-    return authJson(modelSettingsPayload({ model: null, updatedAt: null }));
+    return authJson(modelSettingsPayload({ model: null, updatedAt: null, reasoning: null }));
   }
 
   if (!isValidModelName(raw)) {
@@ -88,13 +89,13 @@ export async function PATCH(req: NextRequest) {
 
   let updatedAt: string | null;
   try {
-    updatedAt = await writeModelSetting(raw);
+    updatedAt = await writeModelSetting(raw, probe.reasoning);
   } catch {
     return authError(503, 'SETTINGS_UNAVAILABLE', SETTINGS_UNAVAILABLE);
   }
   resetModelCache();
   return authJson({
-    ...modelSettingsPayload({ model: raw, updatedAt }, probe.reasoning),
+    ...modelSettingsPayload({ model: raw, updatedAt, reasoning: probe.reasoning }),
     ...(probe.warning ? { warning: probe.warning } : {}),
   });
 }

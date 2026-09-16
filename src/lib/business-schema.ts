@@ -142,4 +142,10 @@ export async function initializeBusinessSchema(s: Sql) {
       updated_at timestamptz NOT NULL DEFAULT now()
     )`;
   await s`INSERT INTO app_settings (id) VALUES (1) ON CONFLICT (id) DO NOTHING`;
+  // 保存前验证观测到的推理结论（'yes' | 'unknown'；null 表示这次没探测/没有覆盖值）。
+  // 老表建立时没有这一列(CREATE TABLE IF NOT EXISTS 不会补列)，而这条结论刷新页面后仍要
+  // 看得见（否则「当前模型是推理模型」的告警只在保存成功那一次闪现）。幂等补列，不动 id=1
+  // 那行已有内容。
+  await s`
+    ALTER TABLE app_settings ADD COLUMN IF NOT EXISTS llm_reasoning text`;
 }

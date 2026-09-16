@@ -101,6 +101,27 @@ describe('GET /api/admin/llm', () => {
     expect(res.headers.get('Vary')).toBe('Cookie, Authorization, X-Owner-Token');
   });
 
+  // 回归护栏（warning 落库）：GET 不读那一列 / 不把它放进响应 → 本用例必须失败，
+  // 「当前模型是推理模型」的告警就会只在保存成功那一次闪现，刷新即失。
+  it('刷新后仍读得到上次保存时落库的推理判定', async () => {
+    db.resolve.mockResolvedValue([
+      { llm_model: 'vendor/model', llm_reasoning: 'yes', updated_at: '2026-09-16T10:00:00.000Z' },
+    ]);
+    const body = await (await GET(req('GET'))).json();
+    expect(body).toEqual({
+      model: 'vendor/model',
+      defaultModel: 'claude-opus-5-88',
+      source: 'database',
+      updatedAt: '2026-09-16T10:00:00.000Z',
+      reasoning: 'yes',
+    });
+  });
+
+  it('库里是脏判定值时当未知，不把它递给前端', async () => {
+    db.resolve.mockResolvedValue([{ llm_model: 'vendor/model', llm_reasoning: 'maybe', updated_at: null }]);
+    expect(await (await GET(req('GET'))).json()).toMatchObject({ reasoning: null });
+  });
+
   it('没有数据库覆盖值时报告环境变量来源', async () => {
     vi.stubEnv('LLM_MODEL', 'env-model');
     const body = await (await GET(req('GET'))).json();
@@ -196,17 +217,9 @@ describe('PATCH /api/admin/llm', () => {
     const writes = settingWrites();
     expect(writes).toHaveLength(1);
     expect(writes[0].text).toContain('INSERT INTO app_settings');
-    expect(writes[0].values).toEqual(['vendor/model']);
+    // 判定值一并落库：刷新页面后 GET 还要靠它显示「当前模型是推理模型」。
+    expect(writes[0].values).toEqual(['vendor/model', 'unknown']);
     expect(mocks.resetModelCache).toHaveBeenCalledTimes(1);
-  });
-
-  it('推理模型照常保存，但把提示透出给前端', async () => {
-    mocks.probeModel.mockResolvedValue({
-      ok: true, reasoning: 'yes', reason: '', warning: '该模型是推理模型：思维链与正文共享 max_tokens。',
-    });
-    db.resolve.mockResolvedValue([{ updated_at: '2026-09-16T10:00:00.000Z' }]);
-    const body = await (await PATCH(req('PATCH', { body: { model: 'reasoner/model' } }))).json();
-    expect(body).toMatchObject({ model: 'reasoner/model', reasoning: 'yes', warning: '该模型是推理模型：思维链与正文共享 max_tokens。' });
   });
 
   it('恢复默认清空覆盖值，且不需要通过验证', async () => {

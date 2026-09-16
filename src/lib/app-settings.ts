@@ -46,6 +46,8 @@ export function environmentModel(): { model: string; source: 'environment' | 'de
 export interface StoredModelSetting {
   model: string | null;
   updatedAt: string | null;
+  /** 上次保存前验证观测到的推理结论；GET 与刷新后的页面靠它显示告警。 */
+  reasoning: ReasoningVerdict | null;
 }
 
 // timestamptz 实际取值可能是字符串或 Date，两种都收敛成 ISO 字符串。
@@ -54,23 +56,38 @@ function isoTimestamp(value: unknown): string | null {
   return typeof value === 'string' && value.length > 0 ? value : null;
 }
 
+// 库里的判定值只可能是 PATCH 写入的这三种字面量；脏值一律当「未知」，
+// 不能让一个手写进库的字符串直达前端（前端按 ReasoningVerdict 渲染）。
+function storedVerdict(value: unknown): ReasoningVerdict | null {
+  return value === 'yes' || value === 'no' || value === 'unknown' ? value : null;
+}
+
 export async function readModelSetting(): Promise<StoredModelSetting> {
   const sql = getSql();
   const rows = await sql`
-    SELECT llm_model, updated_at FROM app_settings WHERE id = 1
-  ` as { llm_model: string | null; updated_at: unknown }[];
+    SELECT llm_model, llm_reasoning, updated_at FROM app_settings WHERE id = 1
+  ` as { llm_model: string | null; llm_reasoning: string | null; updated_at: unknown }[];
   const row = rows[0];
   // 库里的值只可能由 PATCH 写入；不合法就当没有覆盖，回退到环境变量/缺省。
-  if (!row || !isValidModelName(row.llm_model)) return { model: null, updatedAt: null };
-  return { model: row.llm_model, updatedAt: isoTimestamp(row.updated_at) };
+  // 判定值随之一起作废：它描述的是那个被忽略的模型名，留着就是张冠李戴。
+  if (!row || !isValidModelName(row.llm_model)) return { model: null, updatedAt: null, reasoning: null };
+  return {
+    model: row.llm_model,
+    updatedAt: isoTimestamp(row.updated_at),
+    reasoning: storedVerdict(row.llm_reasoning),
+  };
 }
 
-export async function writeModelSetting(model: string): Promise<string | null> {
+export async function writeModelSetting(
+  model: string,
+  reasoning: ReasoningVerdict | null,
+): Promise<string | null> {
   if (!isValidModelName(model)) throw new Error('invalid model name');
   const sql = getSql();
   const rows = await sql`
-    INSERT INTO app_settings (id, llm_model, updated_at) VALUES (1, ${model}, now())
-    ON CONFLICT (id) DO UPDATE SET llm_model = EXCLUDED.llm_model, updated_at = now()
+    INSERT INTO app_settings (id, llm_model, llm_reasoning, updated_at) VALUES (1, ${model}, ${reasoning}, now())
+    ON CONFLICT (id) DO UPDATE SET llm_model = EXCLUDED.llm_model,
+      llm_reasoning = EXCLUDED.llm_reasoning, updated_at = now()
     RETURNING updated_at` as { updated_at: unknown }[];
   return isoTimestamp(rows[0]?.updated_at);
 }
@@ -78,14 +95,11 @@ export async function writeModelSetting(model: string): Promise<string | null> {
 /** 恢复默认：清空数据库覆盖值，运行时解析回退到环境变量/缺省。 */
 export async function clearModelSetting(): Promise<void> {
   const sql = getSql();
-  await sql`UPDATE app_settings SET llm_model = NULL, updated_at = now() WHERE id = 1`;
+  await sql`UPDATE app_settings SET llm_model = NULL, llm_reasoning = NULL, updated_at = now() WHERE id = 1`;
 }
 
 /** GET 的响应体：数据库覆盖值优先，否则报告环境变量/缺省来源。 */
-export function modelSettingsPayload(
-  stored: StoredModelSetting,
-  reasoning: ReasoningVerdict | null = null,
-): LlmModelSettings {
+export function modelSettingsPayload(stored: StoredModelSetting): LlmModelSettings {
   const fallback = environmentModel();
   if (stored.model) {
     return {
@@ -93,7 +107,7 @@ export function modelSettingsPayload(
       defaultModel: fallback.model,
       source: 'database',
       updatedAt: stored.updatedAt,
-      reasoning,
+      reasoning: stored.reasoning,
     };
   }
   return {
@@ -101,6 +115,8 @@ export function modelSettingsPayload(
     defaultModel: fallback.model,
     source: fallback.source,
     updatedAt: null,
-    reasoning,
+    // 没有覆盖值时，库里残留的判定（正常情况下已被 clearModelSetting 清掉）不属于当前模型，
+    // 不能拿它给环境变量里的模型下结论。
+    reasoning: null,
   };
 }

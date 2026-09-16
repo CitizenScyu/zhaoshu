@@ -137,6 +137,14 @@ export default function ModelSettingsTab() {
             </div>
           </dl>
 
+          {/* 落库的判定让这条告警刷新后仍在：只在保存成功那一次闪现的提示等于没有提示。 */}
+          {settings.reasoning === 'yes' && (
+            <p role="alert" className="text-sm leading-7" style={{ color: 'var(--cinnabar)' }}>
+              ⚠ 当前模型是推理模型：思维链与正文共享 max_tokens，每次找书都会明显变慢，
+              预算不足时正文还会为空。请确认 LLM_MAX_TOKENS 足够大。
+            </p>
+          )}
+
           <form
             className="flex flex-wrap items-center gap-3"
             onSubmit={(event) => { event.preventDefault(); void submit(draft.trim()); }}
