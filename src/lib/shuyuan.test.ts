@@ -29,7 +29,7 @@ const { ensureSchema, getSql, sql, execute, transaction, readTransaction } = vi.
 vi.mock('@/lib/db', () => ({ ensureSchema, getSql }));
 
 import {
-  disableShuyuanSource, getShuyuanCounts, getShuyuanStats, refreshShuyuan,
+  disableShuyuanSource, getShuyuanCounts, getShuyuanStats, getReadingSources, refreshShuyuan,
   REFRESH_BUDGET_MS, RESPONSE_TIMEOUT_MS,
 } from './shuyuan';
 import { POST } from '@/app/api/shuyuan/route';
@@ -446,5 +446,32 @@ describe('refreshShuyuan atomic refresh', () => {
     expect(query.values).toEqual(['', unknownSource.bookSourceUrl]);
     expect(query.text).not.toContain('probeSnapshot');
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('在线阅读只选择支持且启用的来源，失败或禁用记录不能被内置源绕过', async () => {
+    execute.mockResolvedValueOnce([{ collections: [{ id: 1, title: '合集', count: 2,
+      probeSnapshot: { version: 1, entries: [{ url: knownSource.bookSourceUrl, status: 'failed', checked_at: '2026-09-16T00:00:00Z' }] },
+    }] }]).mockResolvedValueOnce([{ ...oldSource(knownSource), disabled_at: null, name: '失败源' }]);
+    expect(await getReadingSources(new AbortController().signal)).toEqual([]);
+    execute.mockResolvedValueOnce([{ collections: [] }]).mockResolvedValueOnce([{ ...oldSource(knownSource), name: '禁用源' }]);
+    expect(await getReadingSources(new AbortController().signal)).toEqual([]);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('在线阅读按需核验未探测来源，不篡改它的健康状态', async () => {
+    execute.mockResolvedValueOnce([{ collections: [] }]).mockResolvedValueOnce([
+      { ...oldSource(unknownSource), disabled_at: null, name: '未知域名' },
+      { ...oldSource(knownSource), disabled_at: null, name: '支持的来源' },
+    ]);
+    expect(await getReadingSources(new AbortController().signal)).toMatchObject([{ url: 'https://book15.net/', name: '支持的来源' }]);
+    expect(transaction).not.toHaveBeenCalled();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('合集没有已支持域名时复用 worker 的内置 book15 适配器', async () => {
+    execute.mockResolvedValueOnce([{ collections: [] }]).mockResolvedValueOnce([]);
+    expect(await getReadingSources(new AbortController().signal)).toMatchObject([
+      { url: 'https://book15.net/', searchUrl: 'https://book15.net/books/search.html?kw={{key}}' },
+    ]);
   });
 });

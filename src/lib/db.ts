@@ -143,6 +143,14 @@ async function createSchema() {
     )`;
   await s`INSERT INTO profile (id) VALUES (1) ON CONFLICT (id) DO NOTHING`;
   await s`INSERT INTO shuyuan_meta (id) VALUES (1) ON CONFLICT (id) DO NOTHING`;
+  // Disposable online-reader directories only; chapter text is never stored here.
+  await s`
+    CREATE TABLE IF NOT EXISTS source_read_catalogs (
+      id text PRIMARY KEY,
+      payload jsonb NOT NULL,
+      expires_at timestamptz NOT NULL
+    )`;
+  await s`CREATE INDEX IF NOT EXISTS source_read_catalogs_expiry_idx ON source_read_catalogs (expires_at)`;
 }
 
 // 用量表延迟、独立初始化；统计 DDL 失败不能阻断业务，也不占用找书首字节时间。
