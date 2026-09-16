@@ -196,7 +196,7 @@ export default function ShelfTab() {
                   </span>
                   {/* 状态切换 */}
                   <div className="flex flex-wrap gap-1.5 sm:shrink-0">
-                    <ReadBookLink taskId={it.read_task_id} title={it.title} from="shelf" />
+                    <ReadBookLink taskId={it.read_task_id} title={it.title} author={it.author} from="shelf" />
                     {(
                       [
                         ['want', '想读'],

@@ -31,7 +31,7 @@ function validPosition(index: ReaderIndex, position: PartPosition): boolean {
 }
 
 function partKey(index: ReaderIndex, position: ReadingPosition): string {
-  return JSON.stringify([index.taskId, index.version, position.chapterIndex, position.partIndex]);
+  return JSON.stringify([index.source?.id ?? index.taskId, index.version, position.chapterIndex, position.partIndex]);
 }
 
 /** Adjacent sections come before chapter changes; every returned section starts at its top. */

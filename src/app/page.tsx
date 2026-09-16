@@ -173,7 +173,9 @@ function HomeContent() {
 // 草稿与筛选仅存于当前页面内存；退出或更换口令会卸载整个私有会话。
 function PrivateTabs({ tab }: { tab: Tab }) {
   const [profile, dispatchProfile] = useReducer(profileDraftReducer, undefined, createProfileDraft);
-  const [libraryView, setLibraryView] = useState(createLibraryView);
+  const [libraryView, setLibraryView] = useState(() => createLibraryView(
+    typeof window === 'undefined' ? '' : (new URLSearchParams(window.location.search).get('q') ?? '').slice(0, 100),
+  ));
   return (
     <>
       <div hidden={tab !== 'find'}><FindTab /></div>

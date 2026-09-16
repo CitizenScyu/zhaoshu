@@ -2,6 +2,9 @@ import type { ReaderIndex, ReaderPart } from '@/lib/reader-types';
 
 export const READER_SETTINGS_KEY = 'novel-finder-reading-settings';
 export const readingProgressKey = (taskId: number) => `novel-finder-reading-progress-${taskId}`;
+export const indexProgressKey = (index: ReaderIndex) => index.source
+  ? `novel-finder-reading-progress-source-${index.source.id}`
+  : readingProgressKey(index.taskId!);
 
 export type ReaderTheme = 'day' | 'night' | 'sage';
 export type ReaderFont = 'wenkai' | 'serif' | 'sans';
@@ -88,6 +91,10 @@ export function parseReadingProgress(raw: string | null, index: ReaderIndex): Re
 
 /** Byte-weighted estimate; chapter lengths can differ by several orders of magnitude. */
 export function readingPercent(index: ReaderIndex, part: ReaderPart, ratio: number): number {
+  if (index.source) {
+    if (!index.chapters.length) return 0;
+    return Math.max(0, Math.min(100, (part.chapterIndex + Math.max(0, Math.min(1, ratio))) / index.chapters.length * 100));
+  }
   if (index.totalBytes <= 0) return 0;
   return Math.max(0, Math.min(100,
     (part.startByte + (part.endByte - part.startByte) * Math.max(0, Math.min(1, ratio)))
