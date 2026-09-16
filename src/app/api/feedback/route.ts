@@ -75,7 +75,9 @@ export async function POST(req: NextRequest) {
           ));
           const content = validateProfileContent(updated);
           updatedAt = await access.commit((write) => saveProfileForUser(userId, profile.seeds, content, profile.updatedAt, write));
-          profileUpdated = updatedAt !== null;
+          // 种子原样回传，所以"内容变了"就是这次回写真的改动了画像；
+          // CAS 命中只说明没有并发写入，不等于画像变了（模型可能原样返回）。
+          profileUpdated = updatedAt !== null && content !== profile.content;
         }
       } catch {
         // 已保存的反馈保留；授权改变、冲突、模型或预算错误都不再写画像。

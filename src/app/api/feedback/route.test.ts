@@ -85,6 +85,18 @@ describe('POST /api/feedback note contract', () => {
     expect(mocks.saveProfileForUser).toHaveBeenCalledWith(1, [], '更新后的画像', previousVersion, expect.any(Function));
   });
 
+  it('reports profileUpdated false when the model returns the profile byte-for-byte unchanged', async () => {
+    // 生产实测：模型对回写提示词原样返回输入画像，CAS 仍然命中。
+    mocks.chatRobust.mockResolvedValue('原画像');
+    mocks.saveProfileForUser.mockResolvedValue(previousVersion); // 内容没变，版本号不推进
+
+    const res = await POST(request('dropped', '题材不合'));
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ ok: true, profileUpdated: false, updatedAt: previousVersion });
+    expect(mocks.saveProfileForUser).toHaveBeenCalledWith(1, [], '原画像', previousVersion, expect.any(Function));
+  });
+
   it.each(['done', 'dropped'])('records an empty note for %s while retaining the status and profile', async (status) => {
     const res = await POST(request(status, ''));
 
