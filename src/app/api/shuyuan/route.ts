@@ -1,6 +1,6 @@
 import { timingSafeEqual } from 'node:crypto';
 import { NextRequest } from 'next/server';
-import { requireApiOwner, requirePermission } from '@/lib/auth';
+import { requirePermission } from '@/lib/auth';
 import { authJson, withAuthHeaders } from '@/lib/auth-http';
 import { ensureSchema } from '@/lib/db';
 import { readJsonBody, RequestBodyError } from '@/lib/http';
@@ -29,7 +29,7 @@ function cronRequest(req: NextRequest): boolean {
 
 export async function GET(req: NextRequest) {
   const cron = cronRequest(req);
-  const auth = cron ? null : await requirePermission(req, 'read');
+  const auth = cron ? null : await requirePermission(req, 'download');
   if (auth && !auth.ok) return withAuthHeaders(auth.response);
   try {
     await ensureSchema();
@@ -46,8 +46,8 @@ export async function GET(req: NextRequest) {
 }
 
 export async function POST(req: NextRequest) {
-  const unauthorized = requireApiOwner(req);
-  if (unauthorized) return unauthorized;
+  const auth = await requirePermission(req, 'download');
+  if (!auth.ok) return withAuthHeaders(auth.response);
   let body: Record<string, unknown> | null;
   try {
     body = await readJsonBody(req, MAX_BODY_BYTES);

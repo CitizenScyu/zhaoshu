@@ -14,11 +14,11 @@ const policies: Record<string, Record<string, 'find' | 'read' | 'download' | 'le
   download: { GET: 'download', POST: 'download', DELETE: 'download' },
   'download/[id]/file': { GET: 'download' }, export: { GET: 'find' },
   feedback: { GET: 'find', POST: 'find' }, find: { POST: 'find' },
-  library: { GET: 'read' }, owner: { GET: 'legacy-owner' },
+  library: { GET: 'find' }, owner: { GET: 'legacy-owner' },
   profile: { GET: 'find', PUT: 'find', POST: 'find' },
   'read/[id]/[resource]': { GET: 'read' }, 'read/source/[resource]': { GET: 'read' },
   recommendations: { GET: 'find' },
-  shelf: { POST: 'find', DELETE: 'find' }, shuyuan: { GET: 'read', POST: 'legacy-owner' },
+  shelf: { POST: 'find', DELETE: 'find' }, shuyuan: { GET: 'download', POST: 'download' },
   stats: { GET: 'find' },
 };
 const loaders = import.meta.glob('../app/api/**/route.ts');
