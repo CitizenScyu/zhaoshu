@@ -95,6 +95,7 @@ export async function initializeBusinessSchema(s: Sql) {
   await s`
     CREATE TABLE IF NOT EXISTS download_tasks (
       id serial PRIMARY KEY,
+      user_id int NOT NULL CONSTRAINT download_tasks_user_fk REFERENCES users(id),
       book_id int NOT NULL,
       title text NOT NULL,
       author text NOT NULL DEFAULT '',
@@ -107,6 +108,9 @@ export async function initializeBusinessSchema(s: Sql) {
       created_at timestamptz NOT NULL DEFAULT now(),
       updated_at timestamptz NOT NULL DEFAULT now()
     )`;
+  await s`CREATE INDEX IF NOT EXISTS download_tasks_user_created_idx ON download_tasks (user_id, created_at DESC)`;
+  await s`CREATE UNIQUE INDEX IF NOT EXISTS download_tasks_active_book_idx ON download_tasks (book_id)
+    WHERE status IN ('pending', 'running')`;
   await s`INSERT INTO shuyuan_meta (id) VALUES (1) ON CONFLICT (id) DO NOTHING`;
   // Disposable online-reader directories only; chapter text is never stored here.
   await s`

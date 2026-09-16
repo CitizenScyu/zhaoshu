@@ -1,6 +1,6 @@
 import type { neon } from '@neondatabase/serverless';
 
-export const AUTH_SCHEMA_VERSION = 4;
+export const AUTH_SCHEMA_VERSION = 5;
 
 type Sql = ReturnType<typeof neon>;
 
@@ -17,8 +17,8 @@ export async function initializeAuthSchema(sql: Sql): Promise<void> {
       DECLARE newest integer;
       BEGIN
         SELECT max(version) INTO newest FROM auth_schema_migrations;
-        IF newest IS NOT NULL AND newest > 4 THEN
-          RAISE EXCEPTION 'auth schema version % is newer than supported version 4', newest;
+        IF newest IS NOT NULL AND newest > 5 THEN
+          RAISE EXCEPTION 'auth schema version % is newer than supported version 5', newest;
         END IF;
       END $$`,
     // 仅专用迁移支持空库初始化；普通业务请求不会调用本函数。
@@ -242,6 +242,35 @@ export async function initializeAuthSchema(sql: Sql): Promise<void> {
           ALTER TABLE feedback ALTER COLUMN user_id DROP DEFAULT;
           INSERT INTO profile (id) VALUES (1) ON CONFLICT (id) DO NOTHING;
           INSERT INTO auth_schema_migrations (version) VALUES (4);
+        END IF;
+      END $$`,
+    tx`DO $$
+      BEGIN
+        IF NOT EXISTS (SELECT 1 FROM auth_schema_migrations WHERE version = 5) THEN
+          CREATE TABLE IF NOT EXISTS download_tasks (
+            id serial PRIMARY KEY, book_id int NOT NULL, title text NOT NULL,
+            author text NOT NULL DEFAULT '', status text NOT NULL DEFAULT 'pending',
+            source_url text NOT NULL DEFAULT '', chapters_total int NOT NULL DEFAULT 0,
+            chapters_done int NOT NULL DEFAULT 0, chars_total int NOT NULL DEFAULT 0,
+            error text NOT NULL DEFAULT '', created_at timestamptz NOT NULL DEFAULT now(),
+            updated_at timestamptz NOT NULL DEFAULT now()
+          );
+          LOCK TABLE download_tasks IN SHARE ROW EXCLUSIVE MODE;
+          ALTER TABLE download_tasks ADD COLUMN IF NOT EXISTS user_id integer;
+          UPDATE download_tasks SET user_id = 1 WHERE user_id IS NULL;
+          ALTER TABLE download_tasks ALTER COLUMN user_id SET NOT NULL;
+          IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid = 'download_tasks'::regclass
+            AND conname = 'download_tasks_user_fk') THEN
+            ALTER TABLE download_tasks ADD CONSTRAINT download_tasks_user_fk
+              FOREIGN KEY (user_id) REFERENCES users(id);
+          END IF;
+          CREATE INDEX IF NOT EXISTS download_tasks_user_created_idx
+            ON download_tasks (user_id, created_at DESC);
+          -- Existing duplicate active jobs are deliberately not deleted: index creation
+          -- aborts the migration so an operator can review them.
+          CREATE UNIQUE INDEX download_tasks_active_book_idx ON download_tasks (book_id)
+            WHERE status IN ('pending', 'running');
+          INSERT INTO auth_schema_migrations (version) VALUES (5);
         END IF;
       END $$`,
   ]);

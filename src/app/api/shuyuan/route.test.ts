@@ -1,11 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { NextRequest } from 'next/server';
 
-const { ensureSchema, refreshShuyuan, getShuyuanStats, disableShuyuanSource } = vi.hoisted(() => ({
-  ensureSchema: vi.fn(), refreshShuyuan: vi.fn(), getShuyuanStats: vi.fn(), disableShuyuanSource: vi.fn(),
+const { ensureSchema, getSql, refreshShuyuan, getShuyuanStats, disableShuyuanSource, session } = vi.hoisted(() => ({
+  ensureSchema: vi.fn(), getSql: vi.fn(), refreshShuyuan: vi.fn(), getShuyuanStats: vi.fn(), disableShuyuanSource: vi.fn(), session: vi.fn(),
 }));
-vi.mock('@/lib/db', () => ({ ensureSchema }));
+vi.mock('@/lib/db', () => ({ ensureSchema, getSql }));
 vi.mock('@/lib/shuyuan', () => ({ refreshShuyuan, getShuyuanStats, disableShuyuanSource }));
+vi.mock('@/lib/auth-session', async (original) => ({ ...await original<typeof import('@/lib/auth-session')>(), findSessionByToken: session }));
 import { GET, POST } from './route';
 
 describe('cron authorization', () => {
@@ -95,6 +96,80 @@ describe('cron authorization', () => {
     expect(await res.json()).toEqual({ disabled: true });
     expect(disableShuyuanSource).toHaveBeenCalledWith('https://unknown.invalid', '');
     expect(fetch).not.toHaveBeenCalled();
+    expect(refreshShuyuan).not.toHaveBeenCalled();
+  });
+});
+
+// 设计 §5.2 第 404/405 行：交互式 GET 与 POST（refresh / disable）都是 download 能力。
+describe('书源能力边界（§5.2）', () => {
+  const DOWNLOADER = { userId: 2, role: 'member', canFind: true, canRead: true, canDownload: true, authMethod: 'password', membersEnabled: true };
+  const READER = { userId: 3, role: 'member', canFind: true, canRead: true, canDownload: false, authMethod: 'password', membersEnabled: true };
+  const FIND_ONLY = { userId: 4, role: 'member', canFind: true, canRead: false, canDownload: false, authMethod: 'password', membersEnabled: true };
+
+  beforeEach(() => {
+    vi.resetAllMocks();
+    vi.stubEnv('AUTH_ACCOUNTS_ENABLED', 'true');
+    vi.stubEnv('NODE_ENV', 'test');
+    vi.stubEnv('APP_OWNER_TOKEN', 'owner-test');
+    vi.stubEnv('CRON_SECRET', 'cron-test');
+    ensureSchema.mockResolvedValue(undefined);
+    refreshShuyuan.mockResolvedValue({ total: 3 });
+    getShuyuanStats.mockResolvedValue({ total: 2 });
+    vi.stubGlobal('fetch', vi.fn(() => { throw new Error('未声明网络请求'); }));
+  });
+  afterEach(() => { vi.unstubAllEnvs(); vi.unstubAllGlobals(); });
+
+  const memberGet = () => GET(new NextRequest('http://localhost/api/shuyuan', { headers: { Cookie: 'nf-dev-session=member' } }));
+  const memberPost = (body: unknown) => POST(new NextRequest('http://localhost/api/shuyuan', {
+    method: 'POST', headers: { Cookie: 'nf-dev-session=member', 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+  }));
+
+  it('有 download 能力的成员可以看统计，且不触发刷新', async () => {
+    session.mockResolvedValue(DOWNLOADER);
+    const res = await memberGet();
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ total: 2 });
+    expect(refreshShuyuan).not.toHaveBeenCalled();
+  });
+
+  it('有 download 能力的成员可以 refresh 和 disable', async () => {
+    session.mockResolvedValue(DOWNLOADER);
+    expect((await memberPost({})).status).toBe(200);
+    expect(refreshShuyuan).toHaveBeenCalledOnce();
+    disableShuyuanSource.mockResolvedValueOnce(true);
+    const disabled = await memberPost({ action: 'disable', url: 'https://unknown.invalid' });
+    expect(await disabled.json()).toEqual({ disabled: true });
+    expect(disableShuyuanSource).toHaveBeenCalledWith('https://unknown.invalid', '');
+  });
+
+  it.each([READER, FIND_ONLY])('只有 read 或 find 的成员拿到 403，且不触发刷新 %#', async (record) => {
+    session.mockResolvedValue(record);
+    const get = await memberGet();
+    expect(get.status).toBe(403);
+    expect(get.headers.get('Cache-Control')).toBe('private, no-store');
+    expect(get.headers.get('Vary')).toBe('Cookie, Authorization, X-Owner-Token');
+    expect(refreshShuyuan).not.toHaveBeenCalled();
+    expect((await memberPost({})).status).toBe(403);
+    expect(refreshShuyuan).not.toHaveBeenCalled();
+  });
+
+  it('匿名 POST 在 DDL 与刷新之前拒绝，并带私有缓存头', async () => {
+    const res = await POST(new NextRequest('http://localhost/api/shuyuan', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}',
+    }));
+    expect(res.status).toBe(401);
+    expect(res.headers.get('Cache-Control')).toBe('private, no-store');
+    expect(res.headers.get('Vary')).toBe('Cookie, Authorization, X-Owner-Token');
+    expect(ensureSchema).not.toHaveBeenCalled();
+    expect(refreshShuyuan).not.toHaveBeenCalled();
+  });
+
+  it('成员 Cookie 不会因为带上 cron 标记就获得刷新权', async () => {
+    session.mockResolvedValue(DOWNLOADER);
+    const res = await GET(new NextRequest('http://localhost/api/shuyuan', {
+      headers: { Cookie: 'nf-dev-session=member', 'x-vercel-cron': '1', 'User-Agent': 'vercel-cron/1.0' },
+    }));
+    expect(res.status).toBe(200);
     expect(refreshShuyuan).not.toHaveBeenCalled();
   });
 });

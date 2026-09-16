@@ -169,16 +169,19 @@ async function locateFile(source: Source, task: ReadableTask): Promise<BookFile 
   });
 }
 
-export async function getReadableTask(taskId: number): Promise<ReadableTask> {
+export async function getReadableTask(taskId: number, viewerId: number): Promise<ReadableTask> {
   // Reading is deliberately read-only: these tables already exist for every
   // download task. Do not run ensureSchema's DDL on a chapter navigation.
   const sql = getSql();
   const rows = await sql`
-    SELECT id, title, author, status FROM download_tasks WHERE id = ${taskId}` as ReadableTask[];
+    SELECT id, title, author, status, user_id FROM download_tasks WHERE id = ${taskId}` as (ReadableTask & { user_id: number })[];
   const task = rows[0];
-  if (!task) throw new ReaderError('下载任务不存在。', 404);
+  // 已完成 TXT 是共享的，但他人未完成任务的存在性和状态不能透出：与不存在的任务同样返回 404。
+  if (!task || (task.status !== 'done' && task.user_id !== viewerId)) {
+    throw new ReaderError('下载任务不存在。', 404);
+  }
   if (task.status !== 'done') throw new ReaderError('下载尚未完成，请完成下载后再阅读。', 409);
-  return task;
+  return { id: task.id, title: task.title, author: task.author, status: task.status };
 }
 
 export async function readerAvailability(task: ReadableTask): Promise<{ available: boolean }> {

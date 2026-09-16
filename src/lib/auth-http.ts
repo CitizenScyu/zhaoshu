@@ -6,6 +6,13 @@ export const AUTH_NO_STORE_HEADERS = {
   Vary: 'Cookie, Authorization, X-Owner-Token',
 } as const;
 
+export function withAuthHeaders(response: Response): Response {
+  const headers = new Headers(response.headers);
+  for (const [key, value] of Object.entries(AUTH_NO_STORE_HEADERS)) headers.set(key, value);
+  if (response.status === 503 && !headers.has('Retry-After')) headers.set('Retry-After', '5');
+  return new Response(response.body, { status: response.status, statusText: response.statusText, headers });
+}
+
 export function authJson(data: unknown, init?: ResponseInit): NextResponse {
   return NextResponse.json(data, { ...init, headers: { ...AUTH_NO_STORE_HEADERS, ...init?.headers } });
 }

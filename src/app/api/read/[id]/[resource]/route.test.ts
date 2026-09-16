@@ -13,7 +13,7 @@ vi.mock('@/lib/db', () => ({ ensureSchema, getSql }));
 
 let GET: typeof import('./route').GET;
 
-const task = { id: 42, title: '长篇/小说', author: '测试作者', status: 'done' };
+const task = { id: 42, title: '长篇/小说', author: '测试作者', status: 'done', user_id: 1 };
 const firstChapter = '第一章 初见\n仅属于第一章的正文。\n\n';
 const secondChapter = '第二章 远行\n仅属于第二章的正文。\n';
 const bookText = firstChapter + secondChapter;
@@ -40,7 +40,7 @@ function mockBook(response = new Response(bookText)) {
 
 function expectPrivate(response: Response) {
   expect(response.headers.get('Cache-Control')).toBe('private, no-store');
-  expect(response.headers.get('Vary')).toBe('Authorization, X-Owner-Token');
+  expect(response.headers.get('Vary')).toBe('Cookie, Authorization, X-Owner-Token');
   expect(response.headers.get('X-Content-Type-Options')).toBe('nosniff');
 }
 
@@ -144,7 +144,7 @@ describe('GET /api/read/[id]/[resource]', () => {
       }),
     );
     expect(sql).toHaveBeenCalledTimes(2);
-    expect(sql.mock.calls[0][0].join(' ')).toMatch(/SELECT id, title, author, status FROM download_tasks WHERE id =/);
+    expect(sql.mock.calls[0][0].join(' ')).toMatch(/SELECT id, title, author, status, user_id FROM download_tasks WHERE id =/);
     expect(sql.mock.calls[0][1]).toBe(42);
     expect(ensureSchema).not.toHaveBeenCalled();
   });
@@ -183,6 +183,22 @@ describe('GET /api/read/[id]/[resource]', () => {
     expect(response.status).toBe(409);
     expectPrivate(response);
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it.each(['pending', 'running', 'failed'])("hides another user's %s task behind the same 404 as a missing task", async (status) => {
+    sql.mockResolvedValueOnce([{ ...task, status, user_id: 2 }]);
+    const response = await request();
+    expect(response.status).toBe(404);
+    expectPrivate(response);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("still reads another user's completed TXT because finished files are shared", async () => {
+    sql.mockResolvedValueOnce([{ ...task, user_id: 2 }]);
+    mockBook();
+    const response = await request();
+    expect(response.status).toBe(200);
+    expectPrivate(response);
   });
 
   it.each([['GITHUB_TOKEN', ''], ['ZHAOSHU_BOOKS_REPO', '../../invalid']])(

@@ -1,5 +1,7 @@
-import { NextRequest, NextResponse } from 'next/server';
-import { requireApiOwner } from '@/lib/auth';
+import { NextRequest } from 'next/server';
+import { requirePermission } from '@/lib/auth';
+import { authJson, withAuthHeaders } from '@/lib/auth-http';
+import { hasPermission } from '@/lib/permissions';
 import { ensureSchema, getSql } from '@/lib/db';
 import { isRecord } from '@/lib/sanitize';
 import { boundedPositiveInteger } from '@/lib/http';
@@ -38,13 +40,16 @@ export function labelText(labels: unknown, key: string, maxLength = 600): string
 const SORTS = new Set(['quality', 'recent', 'oldest', 'title']);
 
 export async function GET(req: NextRequest) {
-  const unauthorized = requireApiOwner(req);
-  if (unauthorized) return unauthorized;
+  const auth = await requirePermission(req, 'find');
+  if (!auth.ok) return withAuthHeaders(auth.response);
+  // 书库是共享元数据：找书组即可看。完成 TXT 的定位只在有 read 权限时返回，
+  // 与 recommendationsForUserQuery 的 read_task_id 门控同源。
+  const canRead = hasPermission(auth.principal, 'read');
   const { searchParams } = new URL(req.url);
   const pageParam = searchParams.get('page');
   const page = pageParam === null ? 1 : boundedPositiveInteger(pageParam, MAX_PAGE);
   if (page === null) {
-    return NextResponse.json({ error: `page must be an integer from 1 to ${MAX_PAGE}`, code: 'INVALID_PAGE' }, { status: 400 });
+    return authJson({ error: `page must be an integer from 1 to ${MAX_PAGE}`, code: 'INVALID_PAGE' }, { status: 400 });
   }
   const query = (searchParams.get('q') || '').trim().slice(0, 100);
   const category = (searchParams.get('category') || '').trim().slice(0, 30);
@@ -87,12 +92,14 @@ export async function GET(req: NextRequest) {
       : sort === 'recent' ? s`labeled_at DESC`
       : s`quality DESC NULLS LAST, labeled_at DESC`;
 
+    // 无 read 权限时直接取 NULL，连定位子查询都不发。
+    const readTask = canRead ? s`(SELECT dt.id FROM download_tasks dt
+              WHERE dt.book_id = labeled_books.id AND dt.status = 'done'
+              ORDER BY dt.id DESC LIMIT 1)` : s`NULL::integer`;
     const rows = (await s`
       SELECT id, title, author, category, primary_genre, quality, finish_status,
              chars_labeled, labels, labeled_at::text AS labeled_at,
-             (SELECT dt.id FROM download_tasks dt
-              WHERE dt.book_id = labeled_books.id AND dt.status = 'done'
-              ORDER BY dt.id DESC LIMIT 1) AS read_task_id
+             ${readTask} AS read_task_id
       FROM labeled_books ${where}
       ORDER BY ${orderBy}
       LIMIT ${PAGE_SIZE} OFFSET ${(page - 1) * PAGE_SIZE}`) as unknown as LabeledBook[];
@@ -109,7 +116,7 @@ export async function GET(req: NextRequest) {
       SELECT finish_status, count(*)::int AS n FROM labeled_books
       WHERE finish_status <> '' GROUP BY finish_status ORDER BY n DESC LIMIT 10`) as { finish_status: string; n: number }[];
 
-    return NextResponse.json({
+    return authJson({
       books: rows.map((r) => ({
         id: r.id,
         title: r.title,
@@ -136,6 +143,6 @@ export async function GET(req: NextRequest) {
       },
     });
   } catch {
-    return NextResponse.json({ error: 'internal error', code: 'DB_ERROR' }, { status: 500 });
+    return authJson({ error: 'internal error', code: 'DB_ERROR' }, { status: 500 });
   }
 }

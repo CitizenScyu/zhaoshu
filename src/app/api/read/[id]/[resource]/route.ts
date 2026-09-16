@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { requireApiOwner } from '@/lib/auth';
+import { requirePermission } from '@/lib/auth';
+import { withAuthHeaders } from '@/lib/auth-http';
 import { getReadableTask, readBookIndex, readBookPart, readerAvailability, ReaderError } from '@/lib/reader-server';
 
 // One route/function serves both index and chapter requests, so warm instances
@@ -12,7 +13,7 @@ function privateResponse(body: unknown, status = 200) {
     status,
     headers: {
       'Cache-Control': 'private, no-store',
-      'Vary': 'Authorization, X-Owner-Token',
+      'Vary': 'Cookie, Authorization, X-Owner-Token',
       'X-Content-Type-Options': 'nosniff',
       ...(status === 503 ? { 'Retry-After': '5' } : {}),
     },
@@ -29,13 +30,11 @@ export async function GET(
   req: NextRequest,
   { params }: { params: Promise<{ id: string; resource: string }> },
 ) {
-  const unauthorized = requireApiOwner(req);
-  if (unauthorized) {
-    unauthorized.headers.set('Cache-Control', 'private, no-store');
-    unauthorized.headers.set('Vary', 'Authorization, X-Owner-Token');
-    unauthorized.headers.set('X-Content-Type-Options', 'nosniff');
-    if (unauthorized.status === 503) unauthorized.headers.set('Retry-After', '5');
-    return unauthorized;
+  const auth = await requirePermission(req, 'read');
+  if (!auth.ok) {
+    const response = withAuthHeaders(auth.response);
+    response.headers.set('X-Content-Type-Options', 'nosniff');
+    return response;
   }
   const { id, resource } = await params;
   const taskId = parseOrdinal(id);
@@ -53,7 +52,7 @@ export async function GET(
     return privateResponse({ error: '无效的章节、段落或文件版本。' }, 400);
   }
   try {
-    const task = await getReadableTask(taskId);
+    const task = await getReadableTask(taskId, auth.principal.userId);
     if (resource === 'availability') return privateResponse(await readerAvailability(task));
     if (resource === 'index') return privateResponse(await readBookIndex(task));
     return privateResponse(await readBookPart(task, chapter!, part!, version));

@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { requireApiOwner } from '@/lib/auth';
+import { requirePermission } from '@/lib/auth';
+import { authJson, withAuthHeaders } from '@/lib/auth-http';
 import { ensureSchema, getSql } from '@/lib/db';
 import { boundedPositiveInteger } from '@/lib/http';
 import { sanitizeBookFilename } from '@/lib/book-file-name';
@@ -98,15 +99,12 @@ export async function GET(
   req: NextRequest,
   { params }: { params: Promise<{ id: string }> },
 ) {
-  const unauthorized = requireApiOwner(req);
-  if (unauthorized) return unauthorized;
+  const auth = await requirePermission(req, 'download');
+  if (!auth.ok) return withAuthHeaders(auth.response);
   const { id } = await params;
   const taskId = boundedPositiveInteger(id);
   if (taskId === null) {
-    return NextResponse.json({ error: 'invalid id', code: 'INVALID_ID' }, { status: 400 });
-  }
-  if (!process.env.GITHUB_TOKEN) {
-    return NextResponse.json({ error: 'GITHUB_TOKEN is not configured', code: 'FILE_SERVICE_NOT_CONFIGURED' }, { status: 503 });
+    return authJson({ error: 'invalid id', code: 'INVALID_ID' }, { status: 400 });
   }
   const timeout = AbortSignal.timeout(GITHUB_TIMEOUT_MS);
   const signal = AbortSignal.any([req.signal, timeout]);
@@ -115,33 +113,38 @@ export async function GET(
     await ensureSchema();
     const sql = getSql();
     const rows = (await sql`
-      SELECT id, title, author, status FROM download_tasks WHERE id = ${taskId}`) as {
+      SELECT id, title, author, status FROM download_tasks
+      WHERE id = ${taskId} AND user_id = ${auth.principal.userId}`) as {
       id: number;
       title: string;
       author: string;
       status: string;
     }[];
     if (rows.length === 0) {
-      return NextResponse.json({ error: 'task not found', code: 'TASK_NOT_FOUND' }, { status: 404 });
+      return authJson({ error: 'task not found', code: 'TASK_NOT_FOUND' }, { status: 404 });
     }
     task = rows[0];
     if (task.status !== 'done') {
-      return NextResponse.json({ error: '任务尚未完成', code: 'TASK_NOT_READY' }, { status: 400 });
+      return authJson({ error: '任务尚未完成', code: 'TASK_NOT_READY' }, { status: 400 });
     }
   } catch (e) {
     console.error(e);
-    return NextResponse.json({ error: 'db error', code: 'DB_ERROR' }, { status: 500 });
+    return authJson({ error: 'db error', code: 'DB_ERROR' }, { status: 500 });
+  }
+
+  if (!process.env.GITHUB_TOKEN) {
+    return authJson({ error: 'file service is not configured', code: 'FILE_SERVICE_NOT_CONFIGURED' }, { status: 503 });
   }
 
   try {
     signal.throwIfAborted();
     const name = await findBookName(task.title, task.author, signal);
     if (!name) {
-      return NextResponse.json({ error: 'file not found', code: 'FILE_NOT_FOUND' }, { status: 404 });
+      return authJson({ error: 'file not found', code: 'FILE_NOT_FOUND' }, { status: 404 });
     }
     const body = await readFile(name, signal);
     if (!body) {
-      return NextResponse.json({ error: 'file not found', code: 'FILE_NOT_FOUND' }, { status: 404 });
+      return authJson({ error: 'file not found', code: 'FILE_NOT_FOUND' }, { status: 404 });
     }
 
     const downloadName = `${sanitizeBookFilename(task.title) || 'novel'}.txt`;
@@ -153,19 +156,20 @@ export async function GET(
         'Content-Disposition':
           `attachment; filename="novel.txt"; filename*=UTF-8''${encodeURIComponent(downloadName)}`,
         'Cache-Control': 'private, no-store',
+        'Vary': 'Cookie, Authorization, X-Owner-Token',
       },
     });
   } catch (e) {
     console.error(e);
     if (req.signal.aborted && !timeout.aborted) {
-      return NextResponse.json({ error: '请求已取消', code: 'REQUEST_ABORTED' }, { status: 499 });
+      return authJson({ error: '请求已取消', code: 'REQUEST_ABORTED' }, { status: 499 });
     }
     if (timeout.aborted || (e instanceof Error && (e.name === 'TimeoutError' || e.name === 'AbortError'))) {
-      return NextResponse.json({ error: '文件服务响应超时，请稍后重试', code: 'UPSTREAM_TIMEOUT' }, { status: 504 });
+      return authJson({ error: '文件服务响应超时，请稍后重试', code: 'UPSTREAM_TIMEOUT' }, { status: 504 });
     }
     if (e instanceof FileUpstreamError) {
-      return NextResponse.json({ error: e.message, code: e.code }, { status: e.status });
+      return authJson({ error: e.message, code: e.code }, { status: e.status });
     }
-    return NextResponse.json({ error: '文件服务暂不可用，请稍后重试', code: 'UPSTREAM_ERROR' }, { status: 502 });
+    return authJson({ error: '文件服务暂不可用，请稍后重试', code: 'UPSTREAM_ERROR' }, { status: 502 });
   }
 }
