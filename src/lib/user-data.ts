@@ -55,6 +55,17 @@ export function findStatsForUserQuery(sql: PersonalQuery, userId: number) {
     FROM recommendations WHERE user_id = ${userId} AND query <> ${'书库添加'}`;
 }
 
+// 下载任务自 auth schema v5 起有 NOT NULL 的 user_id（历史行归到用户 1），归属可信。
+// 章数与字数只累加已完成任务：failed/中断任务的部分进度不是「战果」，与 tile 主数的 done 口径一致。
+export function downloadStatsForUserQuery(sql: PersonalQuery, userId: number) {
+  requireUserId(userId);
+  return sql`SELECT count(*)::int AS total,
+      count(*) FILTER (WHERE status = ${'done'})::int AS done,
+      COALESCE(sum(chapters_done) FILTER (WHERE status = ${'done'}), 0)::int AS chapters,
+      COALESCE(sum(chars_total) FILTER (WHERE status = ${'done'}), 0)::int AS chars
+    FROM download_tasks WHERE user_id = ${userId}`;
+}
+
 export function shelfStatsForUserQuery(sql: PersonalQuery, userId: number) {
   requireUserId(userId);
   return sql`SELECT status AS name, count(*)::int AS count FROM recommendations
