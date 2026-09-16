@@ -60,10 +60,13 @@ describe('共享登录表单', () => {
     expect(renderToStaticMarkup(createElement(AuthForm, { returnTo: null }))).toContain('服务暂不可用');
   });
 
-  it('locks every input while the session state is unresolved', () => {
+  it('shows only a status line while the session state is unresolved', () => {
     setOwner({ status: 'loading' });
     const html = renderToStaticMarkup(createElement(AuthForm));
-    expect(html.match(/disabled/g)?.length ?? 0).toBeGreaterThanOrEqual(3);
+    expect(html).toContain('正在恢复访问状态');
+    // 部署开关还不知道时不能先渲染某一个入口。
+    expect(html).not.toContain('<form');
+    expect(html).not.toContain('<input');
   });
 
   it('passes the validated return path through to the registration link', () => {

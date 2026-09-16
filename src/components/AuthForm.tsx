@@ -57,7 +57,10 @@ export default function AuthForm({
   const router = useRouter();
   const ids = useId();
   const skin = { ...PAPER_CLASSES, ...classes };
-  const [mode, setMode] = useState<'member' | 'owner'>(accountsEnabled ? defaultMode : 'owner');
+  // 部署开关是异步才知道的（首帧还不知道），所以入口按当前开关推导而不是锁死在初值，
+  // 只有用户显式切换过才用本地选择覆盖。
+  const [modeOverride, setModeOverride] = useState<'member' | 'owner' | null>(null);
+  const mode = modeOverride ?? (accountsEnabled ? defaultMode : 'owner');
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
   const [draft, setDraft] = useState('');
@@ -111,6 +114,11 @@ export default function AuthForm({
     : expired
       ? '登录已过期，请重新登录。'
       : error || message || '';
+
+  // 部署开关与权限都还没确定时不渲染表单：既不闪错误的入口，也不提前请求私有数据。
+  if (status === 'loading') {
+    return <p role="status" className={skin.note} style={{ color: 'var(--ink-soft)' }}>正在恢复访问状态…</p>;
+  }
 
   return (
     <div>
@@ -208,7 +216,7 @@ export default function AuthForm({
             <button
               type="button"
               className="underline underline-offset-4"
-              onClick={() => { setMode(memberMode ? 'owner' : 'member'); setError(''); setPassword(''); }}
+              onClick={() => { setModeOverride(memberMode ? 'owner' : 'member'); setError(''); setPassword(''); }}
             >
               {memberMode ? '管理员口令登录' : '返回账号登录'}
             </button>
