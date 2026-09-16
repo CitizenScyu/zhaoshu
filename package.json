@@ -14,7 +14,10 @@
     "test:contracts": "node --experimental-strip-types scripts/check-worker-contract.mjs",
     "migrate:auth": "node --experimental-strip-types scripts/migrate-user-auth.mjs",
     "test:auth-db": "node --experimental-strip-types scripts/test-auth-db.mjs",
-    "bench:auth": "node scripts/bench-auth.mjs"
+    "bench:auth": "node scripts/bench-auth.mjs",
+    "db:check": "node --experimental-strip-types scripts/check-schema.mjs",
+    "db:migrate": "node --experimental-strip-types scripts/migrate.mjs",
+    "test:db": "node --experimental-strip-types scripts/test-db.mjs"
   },
   "dependencies": {
     "@neondatabase/serverless": "^1.1.0",
