@@ -123,8 +123,8 @@ function HomeContent() {
         </p>
       )}
 
-      {/* 内容区：纸面卡片 */}
-      <main key={sessionId} className="max-w-5xl w-full mx-auto px-6 sm:px-10 py-6 flex-1 min-w-0">
+      {/* 草稿、书架、统计与轮询都挂在私有会话下；身份或代际变化即整体重挂。 */}
+      <main key={`${user?.id ?? 0}:${sessionId}`} className="max-w-5xl w-full mx-auto px-6 sm:px-10 py-6 flex-1 min-w-0">
         <div
           className="border-t border-[var(--line)] bg-[var(--paper-card)]/60 px-5 sm:px-8 py-8"
           style={{ boxShadow: '0 4px 24px rgba(46,42,35,0.05)' }}

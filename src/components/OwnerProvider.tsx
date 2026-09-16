@@ -3,6 +3,7 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react';
 import { AuthController } from '@/lib/auth-client';
 import type { AuthPhase, AuthUser, LegacyTokenStore, Permission } from '@/lib/auth-client';
+import { forgetHistory } from '@/lib/recent-queries';
 
 interface OwnerContextValue {
   /** 认证状态是否已经确定（无论是否已登录）。 */
@@ -118,7 +119,12 @@ export function OwnerProvider({ children }: { children: React.ReactNode }) {
     (username: string, password: string, remember: boolean) => controller.login(username, password, remember),
     [controller],
   );
-  const logout = useCallback(() => controller.logout(), [controller]);
+  const logout = useCallback(async () => {
+    // 显式退出要清掉当前用户的查询缓存：存储与模块快照一起清（设计 §6.4）。
+    const userId = controller.state.user?.id;
+    await controller.logout();
+    if (typeof userId === 'number' && userId > 0) forgetHistory(userId);
+  }, [controller]);
   const refresh = useCallback(() => controller.refresh('visible'), [controller]);
   const apiFetch = useCallback(
     (input: RequestInfo | URL, init: RequestInit = {}) => controller.fetch(input, init),

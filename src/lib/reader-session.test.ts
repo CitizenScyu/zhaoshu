@@ -25,9 +25,11 @@ describe('download and source reading sessions', () => {
   });
 
   it('keeps local progress compatible and separates both source kinds and different sources', () => {
-    expect(indexProgressKey(local)).toBe('novel-finder-reading-progress-7');
-    expect(indexProgressKey(online)).not.toBe(indexProgressKey(local));
-    expect(indexProgressKey({ ...online, source: { ...online.source!, id: 'source-two' } })).not.toBe(indexProgressKey(online));
+    expect(indexProgressKey(local, 1)).toBe('novel-finder-reading-progress-u1-7');
+    expect(indexProgressKey(online, 1)).not.toBe(indexProgressKey(local, 1));
+    expect(indexProgressKey({ ...online, source: { ...online.source!, id: 'source-two' } }, 1)).not.toBe(indexProgressKey(online, 1));
+    // 进度键必须带 userId：同一本书在两个账号下互不覆盖。
+    expect(indexProgressKey(local, 2)).not.toBe(indexProgressKey(local, 1));
     expect(readingSessionKey({ kind: 'download', taskId: 7 })).not.toBe(readingSessionKey({ kind: 'source', title: '7', author: '' }));
   });
 

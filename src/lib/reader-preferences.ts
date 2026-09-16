@@ -1,10 +1,11 @@
 import type { ReaderIndex, ReaderPart } from '@/lib/reader-types';
+import { userIndexProgressKey, userReadingProgressKey } from '@/lib/user-scope';
 
+// 设置类数据（字号 / 纸色 / 字体）不承载身份，可以作为本机设置共享。
 export const READER_SETTINGS_KEY = 'novel-finder-reading-settings';
-export const readingProgressKey = (taskId: number) => `novel-finder-reading-progress-${taskId}`;
-export const indexProgressKey = (index: ReaderIndex) => index.source
-  ? `novel-finder-reading-progress-source-${index.source.id}`
-  : readingProgressKey(index.taskId!);
+// 阅读进度是私人数据：键必须带 userId（设计 §6.4）。
+export const readingProgressKey = (taskId: number, userId: number) => userReadingProgressKey(userId, taskId);
+export const indexProgressKey = (index: ReaderIndex, userId: number) => userIndexProgressKey(index, userId);
 
 export type ReaderTheme = 'day' | 'night' | 'sage';
 export type ReaderFont = 'wenkai' | 'serif' | 'sans';

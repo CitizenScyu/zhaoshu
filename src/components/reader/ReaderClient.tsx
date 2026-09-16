@@ -85,12 +85,12 @@ function NoReadPermission({ from }: Pick<Props, 'from'>) {
 }
 
 function ReaderSession({ session, from }: Props) {
-  const { apiFetch } = useOwner();
+  const { apiFetch, user } = useOwner();
   const {
     settings, reading, activePart, loading, flowing, failure, percent, notice, storageFailed, focused,
     scroller, article, heading, onScroll, updateSettings, setFocusMode, navigate: requestNavigation,
     extend, retry, markScrollIntent, setSection,
-  } = useReader(session, apiFetch);
+  } = useReader(session, apiFetch, user?.id ?? 0);
   const [panel, setPanel] = useState<'directory' | 'settings' | null>(null);
   const restoreButton = useRef<HTMLButtonElement>(null);
   const focusButton = useRef<HTMLButtonElement>(null);

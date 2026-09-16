@@ -5,7 +5,8 @@ import type { ReaderIndex, ReaderPart, ReadingSession } from '@/lib/reader-types
 import { readerChapterUrl, readerIndexUrl, readerPartMatches } from '@/lib/reader-session';
 import { ReaderPartCache, nextReadingPosition, previousReadingPosition } from '@/lib/reader-part-cache';
 import { captureTextAnchor, restoreTextAnchor } from '@/lib/reader-text-anchor';
-import { parseReaderSettings, parseReadingProgress, readingPercent, indexProgressKey, READER_SETTINGS_KEY } from '@/lib/reader-preferences';
+import { parseReaderSettings, parseReadingProgress, readingPercent, READER_SETTINGS_KEY } from '@/lib/reader-preferences';
+import { migrateLegacyIndexProgressKey } from '@/lib/user-scope';
 import type { ReaderSettings, ReadingPosition, ReadingProgress } from '@/lib/reader-preferences';
 
 interface Reading {
@@ -45,8 +46,10 @@ function canPrefetch(): boolean {
     && connection?.effectiveType !== '2g' && connection?.effectiveType !== 'slow-2g';
 }
 
-export function useReader(session: ReadingSession, apiFetch: ApiFetch) {
+export function useReader(session: ReadingSession, apiFetch: ApiFetch, userId: number) {
   const indexUrl = readerIndexUrl(session);
+  // 进度键按当前用户固定：卸载清理时仍写回旧用户，不会写进下一个身份的键。
+  const progressKeyFor = useCallback((index: ReaderIndex) => migrateLegacyIndexProgressKey(index, userId), [userId]);
   const [settings, setSettings] = useState(() => parseReaderSettings(storedValue(READER_SETTINGS_KEY)));
   const [reading, setReading] = useState<Reading | null>(null);
   const [activeKey, setActiveKey] = useState('0:0');
@@ -86,9 +89,9 @@ export function useReader(session: ReadingSession, apiFetch: ApiFetch) {
     saveTimer.current = null;
     const index = currentReading.current?.index;
     if (!progress.current || !index) return;
-    try { window.localStorage.setItem(indexProgressKey(index), JSON.stringify(progress.current)); }
+    try { window.localStorage.setItem(progressKeyFor(index), JSON.stringify(progress.current)); }
     catch { setStorageFailed(true); }
-  }, []);
+  }, [progressKeyFor]);
 
   const capturePosition = useCallback(() => {
     const current = currentReading.current;
@@ -185,7 +188,7 @@ export function useReader(session: ReadingSession, apiFetch: ApiFetch) {
     try {
       const index = await responseJson<ReaderIndex>(await apiFetch(indexUrl, { signal: controller.signal, cache: 'no-store' }));
       if (!Array.isArray(index.chapters) || !index.chapters.length) throw new RequestError('这本书还没有可阅读的正文。', 422);
-      const saved = parseReadingProgress(storedValue(indexProgressKey(index)), index);
+      const saved = parseReadingProgress(storedValue(progressKeyFor(index)), index);
       const position = saved ?? START;
       const part = await cache.get(index, position, controller.signal);
       if (controller.signal.aborted || id !== serial.current) return;
@@ -199,7 +202,7 @@ export function useReader(session: ReadingSession, apiFetch: ApiFetch) {
       if (request.current === controller) request.current = null;
       if (!controller.signal.aborted && id === serial.current) setLoading(false);
     }
-  }, [apiFetch, indexUrl, beginRequest, cache, fail, flushPosition]);
+  }, [apiFetch, indexUrl, beginRequest, cache, fail, flushPosition, progressKeyFor]);
 
   useEffect(() => {
     let active = true;
