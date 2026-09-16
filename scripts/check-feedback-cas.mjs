@@ -23,6 +23,7 @@ const shelf = async (userId = 1) => (await db.query('SELECT * FROM recommendatio
 function append(userId, title, author, status, note, expectedVersion = 0) {
   const input = { userId, 'book.title': title, 'book.author': author, status, note, expectedVersion };
   return db.transaction(async (tx) => {
+    const results = [];
     for (const template of templates) {
       const params = [];
       const query = template.replace(/\$\{([^}]+)\}/g, (_match, expression) => {
@@ -30,8 +31,11 @@ function append(userId, title, author, status, note, expectedVersion = 0) {
         params.push(input[expression]);
         return '$' + params.length;
       });
-      await tx.query(query, params);
+      // Kept in order so callers can inspect the same indices db.ts reads
+      // (results[3] is the feedback INSERT ... RETURNING id).
+      results.push((await tx.query(query, params)).rows);
     }
+    return results;
   });
 }
 
@@ -47,7 +51,8 @@ try {
   `);
 
   await scenario('first feedback creation uses version zero and preserves other users', async () => {
-    await append(1, '书一', '作者一', 'want', '原反馈', 0);
+    const created = await append(1, '书一', '作者一', 'want', '原反馈', 0);
+    assert.equal(created[3].length, 1, 'the happy path must expose the inserted feedback id at index 3');
     assert.equal((await feedback()).length, 1);
     assert.equal((await shelf(2))[0].status, 'done');
     await assert.rejects(append(1, '书一', '作者一', 'reading', '', 0), /division by zero/);
@@ -90,6 +95,26 @@ try {
     await append(2, '书一', '作者一', 'reading', 'B 的反馈', 0);
     assert.equal((await feedback(2)).at(-1).note, 'B 的反馈');
     assert.deepEqual((await feedback(1)).map((row) => row.note), ['原反馈', '新反馈', '窗口 A', '另一本书']);
+  });
+
+  await scenario('a book missing from books writes nothing and leaves the insert empty for the caller', async () => {
+    const history = await feedback();
+    const shelves = [...(await shelf(1)), ...(await shelf(2))];
+    const results = await append(1, '不在库里的书', '无名', 'want', '幽灵反馈', 0);
+    // db.ts (recordFeedbackForUser) reads results[3] and maps an empty INSERT
+    // to FeedbackBookNotFoundError -> 404 BOOK_NOT_FOUND; assert it is exposed.
+    assert.equal(results.length, 5);
+    assert.equal(results[3].length, 0, 'the feedback INSERT must match 0 rows so the app can fail loudly');
+    assert.deepEqual(await feedback(), history, 'no feedback row may be left behind');
+    assert.deepEqual([...(await shelf(1)), ...(await shelf(2))], shelves, 'no recommendation status may change');
+  });
+
+  await scenario('a missing book with a stale version still fails the version guard and writes nothing', async () => {
+    const history = await feedback();
+    const shelves = [...(await shelf(1)), ...(await shelf(2))];
+    await assert.rejects(append(1, '不在库里的书', '无名', 'want', '幽灵反馈', 7), /division by zero/);
+    assert.deepEqual(await feedback(), history);
+    assert.deepEqual([...(await shelf(1)), ...(await shelf(2))], shelves);
   });
   console.log(JSON.stringify({ engine: 'PGlite (in-memory PostgreSQL)', passed: scenarios.length, scenarios }, null, 2));
 } finally { await db.close(); }
