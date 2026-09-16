@@ -47,6 +47,19 @@ describe('profile database version contract (mocked HTTP queries)', () => {
     expect(parts.join('?')).toContain('FROM previous, input, updated WHERE previous.seeds IS DISTINCT FROM input.seeds');
   });
 
+  it('holds the version steady when seeds and content are both unchanged', async () => {
+    mocks.sql.mockResolvedValue([{ updated_at: version }]);
+    const { saveProfileForUser } = await import('./db');
+    // 内容不变的写入仍然命中 CAS（返回当前版本），但 SQL 不再推进 updated_at，
+    // 否则一次 no-op 回写会让持有旧版本的草稿在提交时误撞 PROFILE_CONFLICT。
+    expect(await saveProfileForUser(7, seeds, '画像', version, write)).toBe(version);
+    const text = mocks.sql.mock.calls[0][0].join('?');
+    expect(text).toContain('SELECT id, seeds, content, updated_at FROM profile');
+    expect(text).toContain('CASE WHEN previous.seeds IS DISTINCT FROM input.seeds');
+    expect(text).toContain('OR previous.content IS DISTINCT FROM input.content');
+    expect(text).toContain('ELSE profile.updated_at END');
+  });
+
   it('reports a lost comparison without falling back to an unconditional write', async () => {
     mocks.sql.mockResolvedValue([]);
     const { saveProfileForUser } = await import('./db');

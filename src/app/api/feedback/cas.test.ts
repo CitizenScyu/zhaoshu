@@ -96,6 +96,22 @@ describe('feedback snapshot and append-only concurrency guard', () => {
     expect(write).toHaveBeenCalledOnce();
   });
 
+  it('reports a missing books row instead of silently appending nothing', async () => {
+    const { recordFeedbackForUser, FeedbackBookNotFoundError } = await import('@/lib/db');
+    // 5 条语句：索引 3 的 INSERT ... RETURNING id 命中 0 行 = books 里没有这本书。
+    const write = vi.fn().mockResolvedValue([[], [], [{ feedback_version_matches: 1 }], [], []]);
+    await expect(recordFeedbackForUser(1, { title: '不在书库', author: '作者' }, 'done', '原因', 0, write))
+      .rejects.toBeInstanceOf(FeedbackBookNotFoundError);
+    expect(write).toHaveBeenCalledOnce();
+  });
+
+  it('accepts the append when the books row was found and one history row was written', async () => {
+    const { recordFeedbackForUser } = await import('@/lib/db');
+    const write = vi.fn().mockResolvedValue([[], [], [{ feedback_version_matches: 1 }], [{ id: 7 }], []]);
+    await expect(recordFeedbackForUser(1, { title: '书', author: '作者' }, 'done', '原因', 0, write))
+      .resolves.toBeUndefined();
+  });
+
   it('refuses to read or build feedback writes without an explicit trusted userId', async () => {
     const { getFeedbackSnapshotForUser } = await import('@/lib/db');
     const { feedbackForUserQueries } = await import('@/lib/user-data');

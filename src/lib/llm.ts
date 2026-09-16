@@ -21,6 +21,9 @@ const DEFAULT_MAX_TOKENS = 16_000;
 const MAX_SSE_BUFFER = 256 * 1024;
 const MAX_CONTENT_LENGTH = 64 * 1024;
 
+// 硬性安全上限（拒绝异常长/被污染的模型输出），不是提示词里那句"画像总长控制在
+// 300 字内"。两者用途不同，不要为了"一致"把这里收紧到 300：线上已有 392 字符的
+// 正常画像，收紧会让下一次反馈回写把现有画像判成非法。
 export const MAX_PROFILE_LENGTH = 5_000;
 
 export interface ChatResult {

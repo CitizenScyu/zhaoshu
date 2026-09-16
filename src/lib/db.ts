@@ -179,6 +179,12 @@ export async function persistRecommendationsForUser(userId: number, query: strin
 
 export class FeedbackConflictError extends Error {}
 
+// books 里没有这本书时，追加历史的 INSERT ... SELECT 会插入 0 行且不报错。
+// 单独成类，让调用方把"静默成功"变成显式的 BOOK_NOT_FOUND。
+export class FeedbackBookNotFoundError extends Error {
+  readonly code = 'BOOK_NOT_FOUND';
+}
+
 export async function getFeedbackSnapshotForUser(userId: number, title: string, author: string): Promise<{ version: number; status: string | null; note: string }> {
   requireUserId(userId);
   const rows = await feedbackSnapshotForUserQuery(getSql(), userId, title, author) as { id: number; status: string; note: string }[];
@@ -188,7 +194,12 @@ export async function getFeedbackSnapshotForUser(userId: number, title: string, 
 
 export async function recordFeedbackForUser(userId: number, book: { title: string; author: string }, status: string, note: string, expectedVersion: number, write: PersonalWriter): Promise<void> {
   try {
-    await write((sql) => feedbackForUserQueries(sql, userId, book, status, note, expectedVersion));
+    const results = await write((sql) => feedbackForUserQueries(sql, userId, book, status, note, expectedVersion));
+    // 第 4 条语句（索引 3）是按 title/author 定位后追加 feedback 的 INSERT ... RETURNING id。
+    // books 里没有这本书时它插入 0 行——旧行为是静默成功，这里显式失败。
+    // 该情况下第 5 条 UPDATE recommendations 同样匹配 0 行，整个批次没有写入任何数据。
+    const inserted = results?.[3];
+    if (Array.isArray(inserted) && inserted.length === 0) throw new FeedbackBookNotFoundError();
   } catch (error) {
     if (error && typeof error === 'object' && 'code' in error && error.code === '22012') throw new FeedbackConflictError();
     throw error;

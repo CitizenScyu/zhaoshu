@@ -85,15 +85,20 @@ export function saveProfileForUserQuery(sql: PersonalQuery, userId: number, seed
   requireUserId(userId);
   // Lock and compare before replacing. Audit and CAS commit together: an audit
   // failure rolls back the save, and a stale writer creates neither change.
+  // updated_at 是乐观锁版本号，只在种子或正文真的变了时推进：否则一次内容
+  // 不变的写入（模型原样返回画像）也会让所有持有旧版本的草稿提交时误撞冲突。
   return sql`WITH input AS (
       SELECT ${JSON.stringify(seeds)}::jsonb AS seeds, ${content}::text AS content
     ), previous AS MATERIALIZED (
-      SELECT id, seeds, updated_at FROM profile
+      SELECT id, seeds, content, updated_at FROM profile
       WHERE id = ${userId} AND updated_at::text = ${expectedUpdatedAt} FOR UPDATE
     ), updated AS (
       UPDATE profile
       SET seeds = input.seeds, content = input.content,
-          updated_at = GREATEST(clock_timestamp(), profile.updated_at + interval '1 microsecond')
+          updated_at = CASE WHEN previous.seeds IS DISTINCT FROM input.seeds
+                              OR previous.content IS DISTINCT FROM input.content
+            THEN GREATEST(clock_timestamp(), profile.updated_at + interval '1 microsecond')
+            ELSE profile.updated_at END
       FROM previous, input
       WHERE profile.id = previous.id AND profile.updated_at = previous.updated_at
       RETURNING profile.updated_at::text AS updated_at
@@ -164,7 +169,8 @@ export function feedbackForUserQueries(sql: PersonalQuery, userId: number, book:
     ), 0) = ${expectedVersion} THEN 1 ELSE 0 END AS feedback_version_matches`,
     sql`INSERT INTO feedback (user_id, book_id, status, note)
         SELECT ${userId}, id, ${status}, ${note} FROM books
-        WHERE lower(title) = lower(${book.title}) AND lower(author) = lower(${book.author})`,
+        WHERE lower(title) = lower(${book.title}) AND lower(author) = lower(${book.author})
+        RETURNING id`,
     sql`UPDATE recommendations SET status = ${status}
         WHERE user_id = ${userId} AND book_id IN (
           SELECT id FROM books WHERE lower(title) = lower(${book.title}) AND lower(author) = lower(${book.author}))`,
