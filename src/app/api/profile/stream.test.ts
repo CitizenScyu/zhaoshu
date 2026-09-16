@@ -4,11 +4,11 @@ import { NextRequest } from 'next/server';
 // 只 mock 数据库和网络：实际经过 chatRobust → SSE 解析 → 画像/反馈路由。
 const mocks = vi.hoisted(() => ({
   ensureSchema: vi.fn(), getProfileForUser: vi.fn(), saveProfileForUser: vi.fn(), upsertBook: vi.fn(),
-  getSql: vi.fn(), sql: vi.fn(), transaction: vi.fn(),
+  getSql: vi.fn(), sql: vi.fn(), transaction: vi.fn(), getFeedbackSnapshotForUser: vi.fn(),
 }));
-vi.mock('@/lib/db', () => ({ ...mocks, recordFeedbackForUser: async (userId: number, book: { title: string; author: string }, status: string, note: string) => {
+vi.mock('@/lib/db', async (importOriginal) => ({ ...await importOriginal<typeof import('@/lib/db')>(), ...mocks, recordFeedbackForUser: async (userId: number, book: { title: string; author: string }, status: string, note: string, expectedVersion: number) => {
     const actual = await vi.importActual<typeof import('@/lib/db')>('@/lib/db');
-    await actual.recordFeedbackForUser(userId, book, status, note, async (batch) => {
+    await actual.recordFeedbackForUser(userId, book, status, note, expectedVersion, async (batch) => {
       await mocks.transaction(batch(mocks.sql as never));
       return [];
     });
@@ -49,6 +49,7 @@ describe('actual SSE failure cannot overwrite a profile', () => {
     mocks.upsertBook.mockResolvedValue(42);
     mocks.getSql.mockReturnValue(Object.assign(mocks.sql, { transaction: mocks.transaction }));
     mocks.transaction.mockResolvedValue([]);
+    mocks.getFeedbackSnapshotForUser.mockResolvedValue({ version: 0, status: null, note: '' });
   });
   afterEach(() => {
     vi.unstubAllGlobals();

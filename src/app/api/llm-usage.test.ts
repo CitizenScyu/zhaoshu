@@ -8,7 +8,7 @@ const mocks = vi.hoisted(() => ({
   ensureSchema: vi.fn(), getProfileForUser: vi.fn(), saveProfileForUser: vi.fn(), upsertBook: vi.fn(),
   getSql: vi.fn(), businessSql: vi.fn(), transaction: vi.fn(),
   getExcludedBookKeysForUser: vi.fn(), getExcludedBookTitlesForUser: vi.fn(), persistRecommendationsForUser: vi.fn(),
-  neon: vi.fn(), usageSql: vi.fn(), verifyBatch: vi.fn(),
+  neon: vi.fn(), usageSql: vi.fn(), verifyBatch: vi.fn(), getFeedbackSnapshotForUser: vi.fn(),
 }));
 vi.mock('next/server', async (importOriginal) => ({
   ...await importOriginal<typeof import('next/server')>(), after: mocks.after,
@@ -16,15 +16,16 @@ vi.mock('next/server', async (importOriginal) => ({
 vi.mock('@neondatabase/serverless', () => ({ neon: mocks.neon }));
 vi.mock('@/lib/db', async (importOriginal) => ({
   ...await importOriginal<typeof import('@/lib/db')>(),
-  recordFeedbackForUser: async (userId: number, book: { title: string; author: string }, status: string, note: string) => {
+  recordFeedbackForUser: async (userId: number, book: { title: string; author: string }, status: string, note: string, expectedVersion: number) => {
     const actual = await vi.importActual<typeof import('@/lib/db')>('@/lib/db');
-    await actual.recordFeedbackForUser(userId, book, status, note, async (batch) => {
+    await actual.recordFeedbackForUser(userId, book, status, note, expectedVersion, async (batch) => {
       await mocks.transaction(batch(mocks.businessSql as never));
       return [];
     });
   },
   ensureSchema: mocks.ensureSchema, getProfileForUser: mocks.getProfileForUser, saveProfileForUser: mocks.saveProfileForUser,
   getSql: mocks.getSql, upsertBook: mocks.upsertBook,
+  getFeedbackSnapshotForUser: mocks.getFeedbackSnapshotForUser,
   getExcludedBookKeysForUser: mocks.getExcludedBookKeysForUser, getExcludedBookTitlesForUser: mocks.getExcludedBookTitlesForUser,
   persistRecommendationsForUser: mocks.persistRecommendationsForUser,
 }));
@@ -123,6 +124,7 @@ describe('usage instrumentation through all model routes', () => {
     mocks.getExcludedBookKeysForUser.mockResolvedValue([]);
     mocks.getExcludedBookTitlesForUser.mockResolvedValue([]);
     mocks.persistRecommendationsForUser.mockResolvedValue(undefined);
+    mocks.getFeedbackSnapshotForUser.mockResolvedValue({ version: 0, status: null, note: '' });
     mocks.getSql.mockReturnValue(Object.assign(mocks.businessSql, { transaction: mocks.transaction }));
     mocks.transaction.mockResolvedValue([]);
     mocks.verifyBatch.mockResolvedValue([verified.douban]);

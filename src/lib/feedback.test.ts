@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { composeFeedbackNote, parseFeedbackNote } from './feedback';
+import { composeFeedbackNote, feedbackNeedsConfirmation, parseFeedbackNote, readFeedbackSnapshot } from './feedback';
 
 describe('feedback note editing', () => {
   it('round-trips multiple reasons and multiline custom text', () => {
@@ -22,5 +22,20 @@ describe('feedback note editing', () => {
   it('allows all reasons and custom text to be cleared to an empty note', () => {
     expect(composeFeedbackNote({ reasons: [], text: ' \n ' })).toBe('');
     expect(parseFeedbackNote('')).toEqual({ reasons: [], text: '' });
+  });
+});
+
+describe('feedback snapshot contract', () => {
+  it('accepts a well-formed online snapshot and rejects malformed ones', () => {
+    expect(readFeedbackSnapshot({ version: 4, status: 'want', note: '说明' })).toEqual({ version: 4, status: 'want', note: '说明' });
+    expect(readFeedbackSnapshot({ version: 4, status: null, note: '' })).toEqual({ version: 4, status: null, note: '' });
+    expect(readFeedbackSnapshot({ version: -1, status: 'want', note: '' })).toBeNull();
+    expect(readFeedbackSnapshot({ version: 1, status: 'bogus', note: '' })).toBeNull();
+    expect(readFeedbackSnapshot(null)).toBeNull();
+  });
+
+  it('detects destructive note reductions so the client can confirm before saving', () => {
+    expect(feedbackNeedsConfirmation('长反馈', '')).toBe(true);
+    expect(feedbackNeedsConfirmation('短', '长一点的反馈')).toBe(false);
   });
 });

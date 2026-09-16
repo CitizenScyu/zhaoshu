@@ -8,6 +8,7 @@ const mocks = vi.hoisted(() => ({
   upsertBook: vi.fn(),
   getProfileForUser: vi.fn(),
   saveProfileForUser: vi.fn(),
+  getFeedbackSnapshotForUser: vi.fn(),
   chatRobust: vi.fn(),
   sql: vi.fn((strings: TemplateStringsArray, ...values: unknown[]) => ({
     text: strings.join('?'), values,
@@ -16,9 +17,9 @@ const mocks = vi.hoisted(() => ({
 }));
 
 vi.mock('@/lib/db', () => ({
-  recordFeedbackForUser: async (userId: number, book: { title: string; author: string }, status: string, note: string) => {
+  recordFeedbackForUser: async (userId: number, book: { title: string; author: string }, status: string, note: string, expectedVersion: number) => {
     const actual = await vi.importActual<typeof import('@/lib/db')>('@/lib/db');
-    await actual.recordFeedbackForUser(userId, book, status, note, async (batch) => {
+    await actual.recordFeedbackForUser(userId, book, status, note, expectedVersion, async (batch) => {
       await mocks.transaction(batch(mocks.sql as never));
       return [];
     });
@@ -28,6 +29,7 @@ vi.mock('@/lib/db', () => ({
   upsertBook: mocks.upsertBook,
   getProfileForUser: mocks.getProfileForUser,
   saveProfileForUser: mocks.saveProfileForUser,
+  getFeedbackSnapshotForUser: mocks.getFeedbackSnapshotForUser,
 }));
 vi.mock('@/lib/llm', async (importOriginal) => ({
   ...await importOriginal<typeof import('@/lib/llm')>(),
@@ -56,6 +58,8 @@ describe('POST /api/feedback note contract', () => {
     mocks.getSql.mockReturnValue(Object.assign(mocks.sql, { transaction: mocks.transaction }));
     mocks.upsertBook.mockResolvedValue(42);
     mocks.transaction.mockResolvedValue([]);
+    // 每本书默认还没有反馈：CAS 期望版本 0 与读到的快照一致。
+    mocks.getFeedbackSnapshotForUser.mockResolvedValue({ version: 0, status: null, note: '' });
     mocks.getProfileForUser.mockResolvedValue({ seeds: [], content: '原画像', updatedAt: previousVersion });
     mocks.chatRobust.mockResolvedValue('更新后的画像');
     mocks.saveProfileForUser.mockResolvedValue(nextVersion);

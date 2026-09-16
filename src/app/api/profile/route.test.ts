@@ -4,18 +4,18 @@ import type { ProfileSnapshot, SeedBook } from '@/lib/types';
 
 const mocks = vi.hoisted(() => ({
   ensureSchema: vi.fn(), getProfileForUser: vi.fn(), saveProfileForUser: vi.fn(), chatRobust: vi.fn(),
-  getSql: vi.fn(), upsertBook: vi.fn(), sql: vi.fn(), transaction: vi.fn(),
+  getSql: vi.fn(), upsertBook: vi.fn(), sql: vi.fn(), transaction: vi.fn(), getFeedbackSnapshotForUser: vi.fn(),
 }));
 vi.mock('@/lib/db', () => ({
-  recordFeedbackForUser: async (userId: number, book: { title: string; author: string }, status: string, note: string) => {
+  recordFeedbackForUser: async (userId: number, book: { title: string; author: string }, status: string, note: string, expectedVersion: number) => {
     const actual = await vi.importActual<typeof import('@/lib/db')>('@/lib/db');
-    await actual.recordFeedbackForUser(userId, book, status, note, async (batch) => {
+    await actual.recordFeedbackForUser(userId, book, status, note, expectedVersion, async (batch) => {
       await mocks.transaction(batch(mocks.sql as never));
       return [];
     });
   },
   ensureSchema: mocks.ensureSchema, getProfileForUser: mocks.getProfileForUser, saveProfileForUser: mocks.saveProfileForUser,
-  getSql: mocks.getSql, upsertBook: mocks.upsertBook,
+  getSql: mocks.getSql, upsertBook: mocks.upsertBook, getFeedbackSnapshotForUser: mocks.getFeedbackSnapshotForUser,
 }));
 vi.mock('@/lib/llm', async (importOriginal) => ({
   ...await importOriginal<typeof import('@/lib/llm')>(),
@@ -65,6 +65,7 @@ describe('/api/profile writes', () => {
     mocks.getSql.mockReturnValue(Object.assign(mocks.sql, { transaction: mocks.transaction }));
     mocks.upsertBook.mockResolvedValue(42);
     mocks.transaction.mockResolvedValue([]);
+    mocks.getFeedbackSnapshotForUser.mockResolvedValue({ version: 0, status: null, note: '' });
   });
   afterEach(() => { vi.unstubAllEnvs(); vi.restoreAllMocks(); });
 
@@ -129,25 +130,25 @@ describe('/api/profile writes', () => {
     const res = await PUT(request('PUT', { seeds: [], updatedAt: previousVersion }));
     expect(res.status).toBe(409);
     expect(await res.json()).toMatchObject({ code: 'PROFILE_SEEDS_CONFIRM_REQUIRED', removedTitles: ['测试书'], draft: { seeds: [] } });
-    expect(mocks.saveProfile).not.toHaveBeenCalled();
+    expect(mocks.saveProfileForUser).not.toHaveBeenCalled();
   });
 
   it('allows a confirmed reduction but never lets confirmation bypass the version check', async () => {
     const res = await PUT(request('PUT', { seeds: [], updatedAt: previousVersion, confirmSeedRemoval: true }));
     expect(res.status).toBe(200);
-    expect(mocks.saveProfile).toHaveBeenCalledWith([], '原画像', previousVersion);
-    mocks.saveProfile.mockClear();
+    expect(mocks.saveProfileForUser).toHaveBeenCalledWith(1, [], '原画像', previousVersion, expect.any(Function));
+    mocks.saveProfileForUser.mockClear();
     const stale = await PUT(request('PUT', { seeds: [], updatedAt: 'stale', confirmSeedRemoval: true }));
     expect(stale.status).toBe(409);
     expect((await stale.json()).code).toBe('PROFILE_CONFLICT');
-    expect(mocks.saveProfile).not.toHaveBeenCalled();
+    expect(mocks.saveProfileForUser).not.toHaveBeenCalled();
   });
 
   it('leaves the profile untouched when the atomic audit/save fails', async () => {
     vi.spyOn(console, 'error').mockImplementation(() => {});
-    mocks.saveProfile.mockRejectedValue(new Error('audit unavailable'));
+    mocks.saveProfileForUser.mockRejectedValue(new Error('audit unavailable'));
     expect((await PUT(request('PUT', { seeds: [], updatedAt: previousVersion, confirmSeedRemoval: true }))).status).toBe(500);
-    expect(mocks.saveProfile).toHaveBeenCalledOnce();
+    expect(mocks.saveProfileForUser).toHaveBeenCalledOnce();
   });
 
   it('returns the raw database version on GET without losing microseconds', async () => {

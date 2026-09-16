@@ -8,8 +8,11 @@ import { pathToFileURL } from 'node:url';
 if (!process.argv[2]) throw new Error('Usage: node scripts/check-profile-audit.mjs <pglite/dist/index.js>');
 const { PGlite } = await import(pathToFileURL(resolve(process.argv[2])).href);
 const db = new PGlite();
-const source = await readFile(new URL('../src/lib/db.ts', import.meta.url), 'utf8');
-const queryTemplate = /const rows = await s`(\s*WITH input[\s\S]*?)` as/.exec(source)?.[1];
+const schemaSource = await readFile(new URL('../src/lib/business-schema.ts', import.meta.url), 'utf8');
+const querySource = await readFile(new URL('../src/lib/user-data.ts', import.meta.url), 'utf8');
+// 画像 CAS/审计 SQL 由 user-data.ts 的 saveProfileForUserQuery 构造，db.ts 的
+// saveProfileForUser 只负责注入带授权边界的事务写入器。
+const queryTemplate = /return sql`(\s*WITH input AS \([\s\S]*?)`;\s*\n\}/.exec(querySource)?.[1];
 assert.ok(queryTemplate, 'Read the actual application CAS/audit SQL');
 const scenarios = [];
 async function scenario(name, check) { await check(); scenarios.push(name); }
@@ -29,8 +32,11 @@ function save(seeds, content, expectedUpdatedAt, userId = 1) {
 }
 
 try {
+  // profile 现在通过外键指向 users；这里只建最小账号桩，不复制认证 schema。
+  await db.exec('CREATE TABLE users (id int PRIMARY KEY)');
+  await db.query('INSERT INTO users VALUES (1), (2)');
   for (const table of ['profile', 'profile_seed_audit']) {
-    const ddl = new RegExp('await s`\\s*(CREATE TABLE IF NOT EXISTS ' + table + ' \\([\\s\\S]*?)`').exec(source)?.[1];
+    const ddl = new RegExp('await s`\\s*(CREATE TABLE IF NOT EXISTS ' + table + ' \\([\\s\\S]*?)`').exec(schemaSource)?.[1];
     assert.ok(ddl, 'Read actual runtime DDL for ' + table);
     await db.exec(ddl);
   }
