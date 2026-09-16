@@ -10,6 +10,9 @@ import type { AuthUser, LegacyTokenStore } from './auth-client';
 
 const ORIGIN = 'https://books.example';
 
+/** 超时路径要用真实计时验证，所以这里也走真实 setTimeout。 */
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
 function store(initial = '', sessionOnly = false): LegacyTokenStore & { value: string; sessionOnly: boolean; cleared: number } {
   const state = {
     value: initial,
@@ -56,12 +59,13 @@ function stubFetch(handlers: Record<string, Handler>) {
   return calls;
 }
 
-function controller(options: { stored?: string; sessionOnly?: boolean; notify?: () => void } = {}) {
+function controller(options: { stored?: string; sessionOnly?: boolean; notify?: () => void; requestTimeoutMs?: number } = {}) {
   const tokens = store(options.stored ?? '', options.sessionOnly ?? false);
   const instance = new AuthController({
     origin: () => ORIGIN,
     storage: tokens,
     notify: options.notify,
+    requestTimeoutMs: options.requestTimeoutMs,
   });
   return { instance, tokens };
 }
@@ -345,6 +349,41 @@ describe('AuthController dual mode', () => {
     await instance.login('second', 'secret', false);
     await expect(staleFetch('/api/profile')).rejects.toMatchObject({ name: 'AbortError' });
     expect(instance.state.user).toMatchObject({ id: 7 });
+  });
+
+  // 回归：旧模式下 `/api/owner` 成功时只判 status、从不读正文。若 15s 上限的定时器
+  // 活得比请求久，它会在请求已经 200 返回之后 abort，取消那条尚未 drain 的响应流，
+  // 浏览器于是给这条成功的请求记一条假的 `net::ERR_ABORTED`。
+  //
+  // 用真实计时 + 短上限（见 AuthControllerOptions.requestTimeoutMs），而不是假时钟：
+  // `AbortSignal.timeout()` 的内建定时器既不受 vitest fake timers 控制、也不计入
+  // `vi.getTimerCount()`，假时钟下「改回 AbortSignal.timeout」这种搬家式改法分辨不出来。
+  it('never aborts a request that already answered, even after the deadline passes', async () => {
+    const calls = stubFetch({ 'GET /api/owner': () => json(200, { ok: true }) });
+    const { instance } = controller({ requestTimeoutMs: 100 });
+    await instance.loginOwner('legacy-secret', false);
+    expect(instance.state).toMatchObject({ phase: 'authenticated', transport: 'owner-header' });
+    const signal = calls[0].request.signal;
+    expect(signal.aborted).toBe(false);
+    await sleep(400);
+    expect(signal.aborted).toBe(false);
+  });
+
+  it('still aborts and reports unavailable when the server never answers', async () => {
+    const seen: { request: Request | null } = { request: null };
+    vi.stubGlobal('fetch', vi.fn((request: Request) => new Promise<Response>((_, reject) => {
+      seen.request = request;
+      request.signal.addEventListener('abort', () => reject(request.signal.reason), { once: true });
+    })));
+    const { instance } = controller({ requestTimeoutMs: 100 });
+    const settled = instance.loginOwner('legacy-secret', false).catch((failure: unknown) => failure);
+    const failure = await Promise.race([
+      settled,
+      sleep(3_000).then(() => 'TIMED_OUT' as const),
+    ]);
+    expect(seen.request?.signal.aborted).toBe(true);
+    expect(failure).toBeInstanceOf(AuthError);
+    expect(failure).toMatchObject({ status: 503 });
   });
 });
 
