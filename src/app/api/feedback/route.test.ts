@@ -6,8 +6,8 @@ const mocks = vi.hoisted(() => ({
   ensureSchema: vi.fn(),
   getSql: vi.fn(),
   upsertBook: vi.fn(),
-  getProfile: vi.fn(),
-  saveProfile: vi.fn(),
+  getProfileForUser: vi.fn(),
+  saveProfileForUser: vi.fn(),
   chatRobust: vi.fn(),
   sql: vi.fn((strings: TemplateStringsArray, ...values: unknown[]) => ({
     text: strings.join('?'), values,
@@ -16,11 +16,18 @@ const mocks = vi.hoisted(() => ({
 }));
 
 vi.mock('@/lib/db', () => ({
+  recordFeedbackForUser: async (userId: number, book: { title: string; author: string }, status: string, note: string) => {
+    const actual = await vi.importActual<typeof import('@/lib/db')>('@/lib/db');
+    await actual.recordFeedbackForUser(userId, book, status, note, async (batch) => {
+      await mocks.transaction(batch(mocks.sql as never));
+      return [];
+    });
+  },
   ensureSchema: mocks.ensureSchema,
   getSql: mocks.getSql,
   upsertBook: mocks.upsertBook,
-  getProfile: mocks.getProfile,
-  saveProfile: mocks.saveProfile,
+  getProfileForUser: mocks.getProfileForUser,
+  saveProfileForUser: mocks.saveProfileForUser,
 }));
 vi.mock('@/lib/llm', async (importOriginal) => ({
   ...await importOriginal<typeof import('@/lib/llm')>(),
@@ -49,9 +56,9 @@ describe('POST /api/feedback note contract', () => {
     mocks.getSql.mockReturnValue(Object.assign(mocks.sql, { transaction: mocks.transaction }));
     mocks.upsertBook.mockResolvedValue(42);
     mocks.transaction.mockResolvedValue([]);
-    mocks.getProfile.mockResolvedValue({ seeds: [], content: '原画像', updatedAt: previousVersion });
+    mocks.getProfileForUser.mockResolvedValue({ seeds: [], content: '原画像', updatedAt: previousVersion });
     mocks.chatRobust.mockResolvedValue('更新后的画像');
-    mocks.saveProfile.mockResolvedValue(nextVersion);
+    mocks.saveProfileForUser.mockResolvedValue(nextVersion);
   });
 
   afterEach(() => {
@@ -67,11 +74,11 @@ describe('POST /api/feedback note contract', () => {
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual({ ok: true, profileUpdated: true, updatedAt: nextVersion });
     const insert = mocks.sql.mock.results.find((result) => result.value.text.includes('INSERT INTO feedback'));
-    expect(insert?.value.values).toEqual([42, 'dropped', note]);
+    expect(insert?.value.values).toEqual([1, 'dropped', note, '测试书', '作者']);
     expect(mocks.chatRobust.mock.calls[0][1]).toContain(JSON.stringify({
       title: '测试书', author: '作者', status: 'dropped', note,
     }));
-    expect(mocks.saveProfile).toHaveBeenCalledWith([], '更新后的画像', previousVersion);
+    expect(mocks.saveProfileForUser).toHaveBeenCalledWith(1, [], '更新后的画像', previousVersion, expect.any(Function));
   });
 
   it.each(['done', 'dropped'])('records an empty note for %s while retaining the status and profile', async (status) => {
@@ -80,12 +87,13 @@ describe('POST /api/feedback note contract', () => {
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual({ ok: true, profileUpdated: false });
     const queries = mocks.sql.mock.results.map((result) => result.value);
-    expect(queries.find((query) => query.text.includes('INSERT INTO feedback'))?.values).toEqual([42, status, '']);
-    expect(queries.find((query) => query.text.includes('UPDATE recommendations'))?.values).toEqual([status, 42]);
+    expect(queries.find((query) => query.text.includes('INSERT INTO feedback'))?.values).toEqual([1, status, '', '测试书', '作者']);
+    expect(queries.find((query) => query.text.includes('UPDATE recommendations'))?.values).toEqual([status, 1, '测试书', '作者']);
+    expect(queries.find((query) => query.text.includes('UPDATE recommendations'))?.text).toMatch(/WHERE user_id = \? AND book_id IN/);
     expect(mocks.transaction).toHaveBeenCalledOnce();
-    expect(mocks.getProfile).not.toHaveBeenCalled();
+    expect(mocks.getProfileForUser).not.toHaveBeenCalled();
     expect(mocks.chatRobust).not.toHaveBeenCalled();
-    expect(mocks.saveProfile).not.toHaveBeenCalled();
+    expect(mocks.saveProfileForUser).not.toHaveBeenCalled();
   });
 
   it('accepts a combined note at the shared 1000-character limit', async () => {
@@ -117,7 +125,7 @@ describe('POST /api/feedback note contract', () => {
       expect(res.status).toBe(200);
       expect(await res.json()).toEqual({ ok: true, profileUpdated: false });
       expect(mocks.transaction).toHaveBeenCalledOnce();
-      expect(mocks.saveProfile).not.toHaveBeenCalled();
+      expect(mocks.saveProfileForUser).not.toHaveBeenCalled();
     },
   );
 
@@ -129,7 +137,7 @@ describe('POST /api/feedback note contract', () => {
       expect(res.status).toBe(200);
       expect(await res.json()).toEqual({ ok: true, profileUpdated: false });
       expect(mocks.transaction).toHaveBeenCalledOnce();
-      expect(mocks.saveProfile).not.toHaveBeenCalled();
+      expect(mocks.saveProfileForUser).not.toHaveBeenCalled();
     },
   );
 
@@ -144,31 +152,34 @@ describe('POST /api/feedback note contract', () => {
     const res = await POST(req);
     expect(await res.json()).toEqual({ ok: true, profileUpdated: false });
     expect(mocks.chatRobust.mock.calls[0][2].signal.aborted).toBe(true);
-    expect(mocks.saveProfile).not.toHaveBeenCalled();
+    expect(mocks.saveProfileForUser).not.toHaveBeenCalled();
   });
 
   it('keeps the recorded feedback when another writer wins and never retries the model', async () => {
-    mocks.saveProfile.mockResolvedValue(null);
+    mocks.saveProfileForUser.mockResolvedValue(null);
     const res = await POST(request('done', '喜欢严谨设定'));
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual({ ok: true, profileUpdated: false });
     expect(mocks.transaction).toHaveBeenCalledOnce();
-    expect(mocks.saveProfile).toHaveBeenCalledExactlyOnceWith([], '更新后的画像', previousVersion);
+    expect(mocks.saveProfileForUser).toHaveBeenCalledExactlyOnceWith(1, [], '更新后的画像', previousVersion, expect.any(Function));
     expect(mocks.chatRobust).toHaveBeenCalledOnce();
   });
 
   it('stops the profile rewrite and still saves feedback when the budget expires before reading the profile', async () => {
     vi.useFakeTimers();
     try {
-      mocks.getProfile.mockReturnValue(new Promise(() => {})); // block before the model call
+      let began!: () => void;
+      const reading = new Promise<void>((resolve) => { began = resolve; });
+      mocks.getProfileForUser.mockImplementation(() => { began(); return new Promise(() => {}); });
       const pending = POST(request('done', '喜欢严谨设定'));
+      await reading; // 明确反馈已经提交，再消耗画像读取预算。
       await vi.advanceTimersByTimeAsync(285_000); // expire the budget
       const res = await pending;
       expect(res.status).toBe(200);
       expect(await res.json()).toEqual({ ok: true, profileUpdated: false });
       expect(mocks.transaction).toHaveBeenCalledOnce(); // feedback still committed
       expect(mocks.chatRobust).not.toHaveBeenCalled();
-      expect(mocks.saveProfile).not.toHaveBeenCalled();
+      expect(mocks.saveProfileForUser).not.toHaveBeenCalled();
     } finally {
       vi.useRealTimers();
     }

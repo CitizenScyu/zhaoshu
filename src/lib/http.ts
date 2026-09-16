@@ -16,6 +16,7 @@ export function boundedPositiveInteger(value: unknown, max = MAX_BUSINESS_ID): n
 export async function readJsonBody(
   req: Request,
   maxBytes: number,
+  signal: AbortSignal = req.signal,
 ): Promise<Record<string, unknown> | null> {
   const declaredLength = Number(req.headers.get('content-length'));
   if (Number.isFinite(declaredLength) && declaredLength > maxBytes) {
@@ -25,12 +26,17 @@ export async function readJsonBody(
 
   if (!req.body) return null;
   const reader = req.body.getReader();
+  const abort = () => { void reader.cancel().catch(() => {}); };
+  signal.addEventListener('abort', abort, { once: true });
+  if (signal.aborted) abort();
   const decoder = new TextDecoder();
   let bytes = 0;
   let raw = '';
   try {
     while (true) {
+      signal.throwIfAborted();
       const { done, value } = await reader.read();
+      signal.throwIfAborted();
       if (done) break;
       bytes += value.byteLength;
       if (bytes > maxBytes) {
@@ -42,6 +48,7 @@ export async function readJsonBody(
     }
     raw += decoder.decode();
   } finally {
+    signal.removeEventListener('abort', abort);
     reader.releaseLock();
   }
   try {

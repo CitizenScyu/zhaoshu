@@ -131,8 +131,8 @@ export type SessionRecord = {
 };
 
 // 每请求一次身份查询：会话、用户与成员闸门设置在同一个 JOIN 里读取。
-export async function findSessionByToken(sql: Sql, token: string): Promise<SessionRecord | null> {
-  const rows = (await sql`
+export async function findSessionByToken(sql: Sql, token: string, signal?: AbortSignal): Promise<SessionRecord | null> {
+  const query = sql`
     SELECT s.user_id, s.auth_method, s.owner_credential_tag, u.username, u.role,
            u.can_find, u.can_read, u.can_download, m.members_enabled
     FROM sessions s
@@ -140,7 +140,8 @@ export async function findSessionByToken(sql: Sql, token: string): Promise<Sessi
     CROSS JOIN auth_settings m
     WHERE s.token_hash = ${hashSessionToken(token)}
       AND s.expires_at > now()
-      AND u.disabled_at IS NULL`) as {
+      AND u.disabled_at IS NULL`;
+  const rows = (signal ? (await sql.transaction([query], { fetchOptions: { signal } }))[0] : await query) as {
     user_id: number;
     username: string;
     role: string;

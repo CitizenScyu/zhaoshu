@@ -2,6 +2,7 @@ import { neon } from '@neondatabase/serverless';
 import type { ProfileSnapshot, RerankedItem } from '@/lib/types';
 import { LLM_USAGE_PHASES, type LlmUsagePhase, type LlmUsageRecord, type TokenStats, type TokenTotals } from './llm-usage';
 import { initializeAuthSchema } from './auth-store';
+import type { PersonalQuery, PersonalWriter } from './personal-write';
 
 const DATABASE_URL = process.env.DATABASE_URL;
 const OWNER_USER_ID = 1;
@@ -280,18 +281,20 @@ export async function saveProfileForUser(
   seeds: unknown,
   content: string,
   expectedUpdatedAt: string,
+  write?: PersonalWriter,
 ): Promise<string | null> {
   if (typeof expectedUpdatedAt !== 'string' || !expectedUpdatedAt.trim()) {
     throw new Error('profile version is required');
   }
   const s = getSql();
   // 同一条 UPDATE 同时比较并写入；即使时钟回拨或两个写入落在同一微秒，版本也前进。
-  const rows = await s`
+  const query = (s: PersonalQuery) => s`
     UPDATE profile
     SET seeds = ${JSON.stringify(seeds)}::jsonb, content = ${content},
         updated_at = GREATEST(clock_timestamp(), updated_at + interval '1 microsecond')
     WHERE id = ${userId} AND updated_at::text = ${expectedUpdatedAt}
-    RETURNING updated_at::text AS updated_at` as { updated_at: string }[];
+    RETURNING updated_at::text AS updated_at`;
+  const rows = (write ? (await write((tx) => [query(tx)]))[0] : await query(s)) as { updated_at: string }[];
   return rows[0]?.updated_at ?? null;
 }
 
@@ -338,9 +341,11 @@ export async function persistRecommendationsForUser(
   userId: number,
   query: string,
   items: RerankedItem[],
+  write?: PersonalWriter,
 ): Promise<void> {
   if (items.length === 0) return;
   const s = getSql();
+  const batch = (s: PersonalQuery) => {
   const bookQueries = items.map((item) => s`
     INSERT INTO books (title, author, douban_id, douban_rating, douban_rating_count, meta)
     VALUES (${item.title}, ${item.author}, ${item.douban?.doubanId ?? null},
@@ -363,7 +368,29 @@ export async function persistRecommendationsForUser(
           risks = EXCLUDED.risks,
           reason = EXCLUDED.reason,
           created_at = now()`);
-  await s.transaction([...bookQueries, ...recommendationQueries]);
+  return [...bookQueries, ...recommendationQueries];
+  };
+  if (write) await write(batch);
+  else await s.transaction(batch(s));
+}
+
+export async function recordFeedbackForUser(
+  userId: number,
+  book: { title: string; author: string },
+  status: string,
+  note: string,
+  write: PersonalWriter,
+): Promise<void> {
+  await write((sql) => [
+    sql`INSERT INTO books (title, author, meta) VALUES (${book.title}, ${book.author}, '{}'::jsonb)
+        ON CONFLICT (lower(title), lower(author)) DO NOTHING`,
+    sql`INSERT INTO feedback (user_id, book_id, status, note)
+        SELECT ${userId}, id, ${status}, ${note} FROM books
+        WHERE lower(title) = lower(${book.title}) AND lower(author) = lower(${book.author})`,
+    sql`UPDATE recommendations SET status = ${status}
+        WHERE user_id = ${userId} AND book_id IN (
+          SELECT id FROM books WHERE lower(title) = lower(${book.title}) AND lower(author) = lower(${book.author}))`,
+  ]);
 }
 
 function canonicalBookKey(title: string, author: string): string {

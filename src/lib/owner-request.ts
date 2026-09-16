@@ -27,6 +27,7 @@ export function createOwnerRequest(
   headers.delete('x-owner-token');
   headers.delete('Authorization');
   if (token) headers.set('Authorization', `Bearer ${token}`);
+  if (!['GET', 'HEAD', 'OPTIONS'].includes(request.method)) headers.set('X-NF-CSRF', '1');
 
   return new Request(request, {
     headers,
