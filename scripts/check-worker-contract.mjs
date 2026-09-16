@@ -8,6 +8,12 @@ import { validateSourceUrl } from '../src/lib/source-policy.ts';
 
 // Explicit cross-repository check; normal unit tests also run these fixtures in each repo.
 const workerRoot = resolve(process.argv[2] || '../zhaoshu-books');
+const workerSource = readFileSync(resolve(workerRoot, 'worker.mjs'), 'utf8');
+assert.match(workerSource, /CREATE TABLE IF NOT EXISTS download_tasks/);
+assert.match(workerSource, /UPDATE download_tasks SET status = 'running'[\s\S]*RETURNING \*/);
+assert.doesNotMatch(workerSource, /(?:user[_-]?token|session[_-]?token|owner[_-]?token)/i);
+assert.doesNotMatch(workerSource, /UPDATE download_tasks SET[\s\S]{0,300}user_id\s*=/);
+console.log('Worker ownership contract: additive schema and column-preserving updates passed');
 const worker = await import(pathToFileURL(resolve(workerRoot, 'book-file-name.mjs')).href);
 const cases = JSON.parse(readFileSync(new URL('../src/lib/fixtures/book-filenames.json', import.meta.url), 'utf8'));
 assert.deepEqual(JSON.parse(readFileSync(resolve(workerRoot, 'test/fixtures/book-filenames.json'), 'utf8')), cases);
