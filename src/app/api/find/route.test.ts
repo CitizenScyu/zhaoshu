@@ -303,6 +303,27 @@ describe('POST /api/find output contract', () => {
     expect(totalTimeoutMs).toBeGreaterThan(220_000);
   });
 
+  // 兜底模型：找书的两个模型步骤都必须显式带上它（删掉传参本用例必须失败）。换上的快模型
+  // 有约 22% 的传输层失败率，不兜底就是「换了速度、赔上可用性」。其它调用点刻意不传。
+  it('hands both recall and rerank the configured fallback model', async () => {
+    mocks.chatRobust.mockResolvedValue(JSON.stringify({ candidates: [candidate] }));
+    await consumeSSE(await POST(request({ step: 'recall', query: '找书' })));
+    expect(mocks.chatRobust.mock.calls[0][2]).toMatchObject({ fallbackModel: 'claude-opus-5-88' });
+
+    mocks.chatRobust.mockReset();
+    mocks.chatRobust.mockResolvedValue(JSON.stringify({ items: [{ ...item, matchScore: 80 }] }));
+    await consumeSSE(await POST(request({ step: 'rerank', query: '找书', verified: [verified] })));
+    expect(mocks.chatRobust.mock.calls[0][2]).toMatchObject({ fallbackModel: 'claude-opus-5-88' });
+  });
+
+  it('uses LLM_FALLBACK_MODEL when it is configured', async () => {
+    vi.stubEnv('LLM_FALLBACK_MODEL', 'other/model');
+    mocks.chatRobust.mockResolvedValue(JSON.stringify({ candidates: [candidate] }));
+    await consumeSSE(await POST(request({ step: 'recall', query: '找书' })));
+    expect(mocks.chatRobust.mock.calls[0][2]).toMatchObject({ fallbackModel: 'other/model' });
+    vi.unstubAllEnvs();
+  });
+
   // 回归护栏：第一次「超时」不能白白扔掉剩余预算。模型调用抛可重试错误、但剩下时间够时，
   // 必须让恢复路径接住它，而不是直接上抛。
   it('recovers when the first attempt times out and budget remains', async () => {

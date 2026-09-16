@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { chatRobust, configuredTotalTimeoutMs, parseJson, LlmError } from '@/lib/llm';
+import { chatRobust, configuredFallbackModel, configuredTotalTimeoutMs, parseJson, LlmError } from '@/lib/llm';
 import { recordUsageAfterResponse } from '@/lib/record-llm-usage';
 import { verifyBatch } from '@/lib/douban';
 import { supplementSourceEvidence } from '@/lib/source-verification';
@@ -103,6 +103,12 @@ export async function POST(req: NextRequest) {
     const body = await atomicRead(() => readJsonBody(req, MAX_BODY_BYTES, access.signal));
     if (!body?.step) return NextResponse.json({ error: 'missing step' }, { status: 400 });
     const step = body.step;
+    // 找书的两个模型步骤都带上兜底模型：主模型（换上的快模型有约 22% 的传输层失败率）
+    // 连不上时降级回已知可用的那个，而不是让整次找书失败。兜底只认传输层失败，且占用
+    // chatRobust 原本的重试名额，所以单步上游调用次数上界不变（见 chatRobust 注释）。
+    // 每次请求读一次，便于运维改 LLM_FALLBACK_MODEL 后立即生效。其它调用点（profile /
+    // feedback）刻意不传，保持既有行为中性。
+    const fallbackModel = configuredFallbackModel();
     const ms = () => {
       access.assertActive();
       const value = Math.min(deadline.modelBudgetMs(MODEL_CEILING_MS), configuredTotalTimeoutMs());
@@ -140,7 +146,7 @@ export async function POST(req: NextRequest) {
           async (totalTimeoutMs) => (await chatRobust(
             recallSystem(),
             recallUser(profile.content, query, excludedBooks, conditions),
-            { temperature: 0.8, signal: access.signal, onUsage: recordUsageAfterResponse('find_recall'), totalTimeoutMs },
+            { temperature: 0.8, signal: access.signal, onUsage: recordUsageAfterResponse('find_recall'), totalTimeoutMs, fallbackModel },
           )).content,
           (content) => modelList(content, 'candidates', MAX_CANDIDATES),
         ));
@@ -192,7 +198,7 @@ export async function POST(req: NextRequest) {
           async (totalTimeoutMs) => (await chatRobust(
             rerankSystem(),
             rerankUser(profile, query, JSON.stringify(verified), conditions),
-            { temperature: 0.3, signal: access.signal, onUsage: recordUsageAfterResponse('find_rerank'), totalTimeoutMs },
+            { temperature: 0.3, signal: access.signal, onUsage: recordUsageAfterResponse('find_rerank'), totalTimeoutMs, fallbackModel },
           )).content,
           (content) => modelList(content, 'items', MAX_RERANKED_ITEMS),
         ));

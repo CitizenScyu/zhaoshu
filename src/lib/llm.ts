@@ -127,6 +127,25 @@ export function configuredMaxTokens(): number {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_MAX_TOKENS;
 }
 
+// ---- 兜底模型（chatRobust 的传输层降级）----
+// 2026-09-17：找书全链路换用快模型（`gemini-3.1-pro-ely`，实测 recall 中位 10.2s，
+// 对比 claude-opus-5-88 的 115.8s），但那个路由有约 22% 的传输层失败率
+// （`TypeError: fetch failed` @~11s，以及 HTTP 524 @~126s）。换模型换来的是速度，
+// 不能同时换来「22% 的请求直接失败」，所以主模型连不上时按剩余预算降级回一个已知可用的模型。
+//
+// 兜底模型可配置（LLM_FALLBACK_MODEL），缺省回落到 claude-opus-5-88——换掉它不需要改代码。
+export const DEFAULT_FALLBACK_MODEL = 'claude-opus-5-88';
+
+export function configuredFallbackModel(): string {
+  const fromEnv = process.env.LLM_FALLBACK_MODEL?.trim();
+  return fromEnv || DEFAULT_FALLBACK_MODEL;
+}
+
+// 开一次兜底调用至少要留下的剩余预算。与 find 的 modelStep 用同一个约定
+// （MIN_SECOND_ATTEMPT_MS）：低于这个数就干脆不发起——宁可直接失败，
+// 也不要用一个注定超时的请求把截止时间耗光，那会让错误变成「总超时」而掩盖真实原因。
+export const MODEL_FALLBACK_MIN_BUDGET_MS = 5_000;
+
 // ---- 运行时模型解析（数据库设置 → 环境变量 LLM_MODEL → 硬编码缺省）----
 // 2026-09-16 的线上故障源于「换模型要改环境变量 + 重新部署」这条链路太长，
 // 所以模型不再在模块加载期定死，而是每次调用解析。
@@ -259,9 +278,15 @@ export async function chat(
       } else if (res.status === 429) {
         message = '模型服务请求过于频繁或额度不足，请稍后重试或联系管理员。';
       }
+      // 524（Cloudflare「源站没在时限内回应」）与 408 是**网关自己的超时**：上游一个字节都没答复，
+      // 和连接失败同类，所以一并标成 UPSTREAM_UNREACHABLE。其余状态码（含 503 model_not_found、
+      // 429、500）是上游对这次请求给的**答复**——那是关于这个模型的语义结论，换模型重试同样会拿到它。
+      // 被 CF 安全验证拦下的（challenged）也不在此列：那是防火墙在回话，不是没回话。
+      const gatewayTimeout = !challenged && (res.status === 408 || res.status === 524);
       throw new LlmError(
         message,
         !challenged && (res.status === 408 || res.status === 429 || res.status >= 500),
+        gatewayTimeout ? UPSTREAM_UNREACHABLE : undefined,
       );
     }
     if (!res.body) {
@@ -525,29 +550,53 @@ function retryDelay(ms: number, signal?: AbortSignal): Promise<void> {
   });
 }
 
+// 兜底只认「上游一个字节都没答复」类失败：连接失败、读流超时、无响应体，以及网关自己的
+// 超时状态码 524 / 408（都在 chat 里标成了 UPSTREAM_UNREACHABLE）。
+// 上游答复的其它状态码（含 503 model_not_found、429、500）、空正文、截断、内容过滤都是关于
+// **这个模型**的语义结论，换个模型只会拿到同一个答案——所以在那些错误上绝不兜底。
+//
+// 注意它刻意不复用 LlmError.retryable：那个字段还包含 429/5xx 这类「同一个模型现在忙」的
+// 判断，语义是「值得为同一个模型再花一次预算」，与「该换模型了」不是一回事。
+function fallbackEligible(error: unknown): boolean {
+  return error instanceof LlmError && error.code === UPSTREAM_UNREACHABLE;
+}
+
 // 首次调用、等待和唯一一次重试共享截止时间，绝不重新获得完整预算。
 // 调用方可传入 totalTimeoutMs 用请求级 deadline 派生的子预算来封顶本次调用的总时限；
 // 未传则回退到配置值（如内部预算），保持向后兼容。onToken 增量原样透传到每次实际请求。
+//
+// fallbackModel（可选，缺省不开启）：主模型在传输层失败时，用它顶替原本的「重试」那一次机会。
+// 之所以是**顶替**而不是叠加，是为了保住调用次数上界：find 的 modelStep 会调用本函数最多两次，
+// 本函数内部最多两次上游请求，所以单步最多 4 次上游调用——与加兜底之前完全一致（不是 8 次）。
 export async function chatRobust(
   system: string,
   user: string,
-  opts: Pick<ChatOptions, 'temperature' | 'maxTokens' | 'signal' | 'stream' | 'onUsage' | 'totalTimeoutMs' | 'onToken'> = {},
+  opts: Pick<ChatOptions, 'temperature' | 'maxTokens' | 'signal' | 'stream' | 'onUsage' | 'totalTimeoutMs' | 'onToken'> & {
+    fallbackModel?: string;
+  } = {},
 ): Promise<ChatResult> {
-  const budgetMs = opts.totalTimeoutMs != null
-    ? Math.min(opts.totalTimeoutMs, MAX_ROBUST_BUDGET_MS)
+  const { fallbackModel, ...chatOpts } = opts;
+  const budgetMs = chatOpts.totalTimeoutMs != null
+    ? Math.min(chatOpts.totalTimeoutMs, MAX_ROBUST_BUDGET_MS)
     : Math.min(configuredTotalTimeoutMs(), MAX_ROBUST_BUDGET_MS);
   const deadline = Date.now() + budgetMs;
   try {
-    return await chat(system, user, { ...opts, totalTimeoutMs: budgetMs });
+    return await chat(system, user, { ...chatOpts, totalTimeoutMs: budgetMs });
   } catch (e) {
-    if (!(e instanceof LlmError) || !e.retryable) throw e;
     if (opts.signal?.aborted) throw cancelledError();
+    // 降级：主模型连不上时不重试同一个模型，改用兜底模型（同为一次性，共享剩余预算）。
+    if (fallbackModel && fallbackEligible(e)) {
+      const remainingMs = deadline - Date.now();
+      if (remainingMs <= MODEL_FALLBACK_MIN_BUDGET_MS) throw e;
+      return chat(system, user, { ...chatOpts, model: fallbackModel, totalTimeoutMs: remainingMs });
+    }
+    if (!(e instanceof LlmError) || !e.retryable) throw e;
     const delayMs = 1_500;
     if (deadline - Date.now() <= delayMs) throw e;
     await retryDelay(delayMs, opts.signal);
     const remainingMs = deadline - Date.now();
     if (remainingMs <= 0) throw e;
-    return chat(system, user, { ...opts, totalTimeoutMs: remainingMs });
+    return chat(system, user, { ...chatOpts, totalTimeoutMs: remainingMs });
   }
 }
 

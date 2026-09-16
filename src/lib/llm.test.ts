@@ -419,6 +419,144 @@ describe('stream completion and shared call budget', () => {
     });
   });
 
+  // 兜底模型：主模型在**传输层**失败（连不上、网关超时）时换一个已知可用的模型，而不是
+  // 让整次找书失败。语义结论（HTTP 状态码、空正文、截断）绝不换模型——换也一样。
+  describe('fallback model on transport failures', () => {
+    const sentModel = (call = 0) => JSON.parse(String(fetchMock.mock.calls[call][1]?.body)).model as string;
+    const FALLBACK = 'fallback/model';
+    const withFallback = (totalTimeoutMs: number) => ({ totalTimeoutMs, fallbackModel: FALLBACK });
+
+    beforeEach(() => {
+      // 让主模型名可预期：库读不到时回退到 LLM_MODEL。
+      vi.stubEnv('LLM_MODEL', 'primary/model');
+    });
+
+    // 回归护栏：删掉兜底分支，本用例必须失败——那时第二次调用会用主模型而不是兜底模型。
+    it('主模型传输层失败 → 用剩余预算改打兜底模型并成功', async () => {
+      fetchMock
+        .mockRejectedValueOnce(new TypeError('fetch failed'))
+        .mockResolvedValueOnce(response([token('兜底正文'), finish('stop')]));
+      await expect(client.chatRobust('system', 'user', withFallback(20_000)))
+        .resolves.toMatchObject({ content: '兜底正文' });
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(sentModel(0)).toBe('primary/model');
+      expect(sentModel(1)).toBe(FALLBACK);
+    });
+
+    // 换模型占的是原本「重试」那一次名额，所以最坏情况下游请求次数不变（仍是 2 次，
+    // 不是 3 次）。find 的 modelStep 会调用本函数最多两次 → 单步最多 4 次上游调用。
+    it('兜底也传输层失败时如实失败，不会叠加成第三次请求', async () => {
+      fetchMock.mockRejectedValue(new TypeError('fetch failed'));
+      await expect(client.chatRobust('system', 'user', withFallback(20_000)))
+        .rejects.toThrow(/LLM 请求失败/);
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(sentModel(1)).toBe(FALLBACK);
+    });
+
+    it.each([
+      ['HTTP 500', () => new Response('', { status: 500 })],
+      ['HTTP 503（可能是 model_not_found，换模型更糟）', () => new Response('', { status: 503 })],
+      ['HTTP 429', () => new Response('', { status: 429 })],
+      ['空正文', () => response([token(''), finish('stop')])],
+    ])('语义结论（%s）不换模型：第二次仍打主模型', async (_name, make) => {
+      fetchMock.mockImplementationOnce(() => Promise.resolve(make()))
+        .mockResolvedValueOnce(response([token('重试成功'), finish('stop')]));
+      const pending = client.chatRobust('system', 'user', withFallback(20_000));
+      await vi.advanceTimersByTimeAsync(1_500); // 语义失败走的是原有的重试等待
+      await expect(pending).resolves.toMatchObject({ content: '重试成功' });
+      expect(sentModel(1)).toBe('primary/model');
+      expect(sentModel(1)).not.toBe(FALLBACK);
+    });
+
+    // 524 是 Cloudflare 的「源站没在时限内回应」：上游一个字节都没答复，与连接失败同类。
+    it.each([408, 524])('网关超时 HTTP %i 认作「没答复」，换兜底模型', async (status) => {
+      fetchMock
+        .mockResolvedValueOnce(new Response('', { status }))
+        .mockResolvedValueOnce(response([token('兜底正文'), finish('stop')]));
+      await expect(client.chatRobust('system', 'user', withFallback(20_000)))
+        .resolves.toMatchObject({ content: '兜底正文' });
+      expect(sentModel(1)).toBe(FALLBACK);
+    });
+
+    // Cloudflare 安全验证是**防火墙在回话**，不是没回话：照旧失败（且不可重试），不绕过它换模型。
+    it('CF 安全验证拦截不换模型，也不重试', async () => {
+      fetchMock.mockResolvedValue(new Response('<title>Just a moment...</title>', {
+        status: 403, headers: { 'cf-mitigated': 'challenge' },
+      }));
+      await expect(client.chatRobust('system', 'user', withFallback(20_000)))
+        .rejects.toThrow(/安全验证拦截/);
+      expect(fetchMock).toHaveBeenCalledOnce();
+    });
+
+    // deadline 不变量：两次调用共享同一个截止时间，兜底拿的是剩余预算，不重获整份。
+    it('兜底与主模型共享同一个截止时间，总耗时不超过预算', async () => {
+      const started = Date.now();
+      fetchMock
+        .mockImplementationOnce(() => new Promise((_resolve, reject) => {
+          setTimeout(() => reject(new TypeError('fetch failed')), 1_000);
+        }))
+        .mockResolvedValueOnce(response([], true)); // 兜底这一路挂到预算耗尽
+      const assertion = expect(client.chatRobust('system', 'user', withFallback(20_000)))
+        .rejects.toThrow(/总超时/);
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      const fallbackSignal = fetchMock.mock.calls[1][1]?.signal;
+      await vi.advanceTimersByTimeAsync(18_999);
+      expect(fallbackSignal?.aborted).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+      await assertion;
+      expect(Date.now() - started).toBe(20_000);
+      expect(fallbackSignal?.aborted).toBe(true);
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(vi.getTimerCount()).toBe(0);
+    });
+
+    it('剩余预算不足以开一次兜底时干脆不发起（宁可直接失败，也不发起注定超时的请求）', async () => {
+      fetchMock.mockImplementationOnce(() => new Promise((_resolve, reject) => {
+        setTimeout(() => reject(new TypeError('fetch failed')), 4_800);
+      }));
+      const assertion = expect(client.chatRobust('system', 'user', withFallback(5_000)))
+        .rejects.toThrow(/LLM 请求失败/);
+      await vi.advanceTimersByTimeAsync(4_800);
+      await assertion;
+      expect(fetchMock).toHaveBeenCalledOnce();
+    });
+
+    it('取消信号已中止时不发起兜底', async () => {
+      const controller = new AbortController();
+      fetchMock.mockImplementation(() => {
+        controller.abort();
+        return Promise.reject(new TypeError('fetch failed'));
+      });
+      await expect(client.chatRobust('system', 'user', { ...withFallback(20_000), signal: controller.signal }))
+        .rejects.toMatchObject({ message: '模型调用已取消。', retryable: false });
+      expect(fetchMock).toHaveBeenCalledOnce();
+    });
+
+    // 缺省不开启：不传 fallbackModel 的既有调用点（profile / feedback）行为与加兜底前一致。
+    it('没传兜底模型时传输层失败仍按原逻辑重试主模型', async () => {
+      fetchMock
+        .mockRejectedValueOnce(new TypeError('fetch failed'))
+        .mockResolvedValueOnce(response([token('重试成功'), finish('stop')]));
+      const pending = client.chatRobust('system', 'user');
+      await vi.advanceTimersByTimeAsync(0);
+      expect(sentModel(0)).toBe('primary/model');
+      await vi.advanceTimersByTimeAsync(1_500);
+      await expect(pending).resolves.toMatchObject({ content: '重试成功' });
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(sentModel(1)).toBe('primary/model');
+      expect(sentModel(1)).not.toBe(FALLBACK);
+    });
+
+    it('兜底模型可配置，缺省回落到 claude-opus-5-88', () => {
+      vi.stubEnv('LLM_FALLBACK_MODEL', '');
+      expect(client.configuredFallbackModel()).toBe('claude-opus-5-88');
+      expect(client.DEFAULT_FALLBACK_MODEL).toBe('claude-opus-5-88');
+      vi.stubEnv('LLM_FALLBACK_MODEL', 'other/model');
+      expect(client.configuredFallbackModel()).toBe('other/model');
+    });
+  });
+
   // 回归护栏：推理模型的思维链与正文共享 max_tokens，缺省值回到非推理模型的量级
   // （3000）就会让正文为空，用例必须失败。
   describe('output token budget', () => {
