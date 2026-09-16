@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { withFindAccess } from '@/lib/personal-request';
 import { hasPermission } from '@/lib/permissions';
-import { findStatsForUserQuery, shelfStatsForUserQuery } from '@/lib/user-data';
+import { downloadStatsForUserQuery, findStatsForUserQuery, shelfStatsForUserQuery } from '@/lib/user-data';
 import { ensureSchema, getLlmUsageStats, getSql } from '@/lib/db';
 import type { TokenStats } from '@/lib/llm-usage';
 import { getShuyuanCounts, type ShuyuanCounts } from '@/lib/shuyuan';
@@ -54,7 +54,7 @@ export async function GET(req: NextRequest) {
   const stats: StatsResponse = {
     subject: { userId }, allowedSections,
     sectionScopes: { library: 'shared', download: 'personal', find: 'personal', shelf: 'personal', shuyuan: 'shared', tokens: 'shared-owner' },
-    sectionStates: { library: 'unavailable', download: allowedSections.includes('download') ? 'not_ready' : 'forbidden', find: 'unavailable', shelf: 'unavailable', shuyuan: allowedSections.includes('shuyuan') ? 'unavailable' : 'forbidden', tokens: allowedSections.includes('tokens') ? 'unavailable' : 'forbidden' },
+    sectionStates: { library: 'unavailable', download: allowedSections.includes('download') ? 'unavailable' : 'forbidden', find: 'unavailable', shelf: 'unavailable', shuyuan: allowedSections.includes('shuyuan') ? 'unavailable' : 'forbidden', tokens: allowedSections.includes('tokens') ? 'unavailable' : 'forbidden' },
     library: null,
     download: null,
     find: null,
@@ -104,7 +104,21 @@ export async function GET(req: NextRequest) {
     console.error('stats library aggregate failed');
   }
 
-  // A05 尚未给下载任务建立可信用户归属；不查询全局任务，明确标记未就绪。
+  // 下载任务自 auth schema v5 起有 NOT NULL 的 user_id，按当前用户统计；历史行归到用户 1。
+  if (allowedSections.includes('download')) try {
+    const rows = await access.run(async () => downloadStatsForUserQuery(s, userId)) as {
+      total: number;
+      done: number;
+      chapters: number;
+      chars: number;
+    }[];
+    if (!rows[0]) throw new Error('Missing download aggregate');
+    stats.download = rows[0];
+    stats.availability.download = true;
+    stats.sectionStates.download = 'ok';
+  } catch {
+    console.error('stats download aggregate failed');
+  }
 
   try {
     // 找书次数按去重口味描述计；书架添加产生的伪 query 不算
@@ -148,7 +162,7 @@ export async function GET(req: NextRequest) {
     console.error('stats tokens aggregate failed');
   }
 
-  const available = allowedSections.filter((section) => stats.sectionStates[section] !== 'not_ready').map((section) => stats.availability[section]);
+  const available = allowedSections.map((section) => stats.availability[section]);
   if (available.some((value) => !value)) {
     stats.error = '部分统计暂不可用，请稍后重试';
     stats.code = 'STATS_PARTIAL';

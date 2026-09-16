@@ -8,7 +8,7 @@ import { authorizedTransaction } from '../src/lib/personal-write.ts';
 import {
   profileForUserQuery, saveProfileForUserQuery, persistRecommendationsForUserQueries,
   feedbackForUserQueries, feedbackSnapshotForUserQuery, recommendationsForUserQuery, deleteShelfForUserQuery,
-  personalExportQueries, findStatsForUserQuery, shelfStatsForUserQuery,
+  personalExportQueries, findStatsForUserQuery, shelfStatsForUserQuery, downloadStatsForUserQuery,
   addShelfForUserQueries, shelfExistsForUserQuery,
 } from '../src/lib/user-data.ts';
 import { withTestSchema } from './auth-db-fixtures.mjs';
@@ -274,6 +274,22 @@ export async function downloadIsolationCase() {
     await assert.rejects(initializeAuthSchema(sql));checks++;
     assert.equal((await sql`SELECT count(*)::int AS n FROM download_tasks WHERE book_id=20`)[0].n,2);checks++;
     await assert.rejects(assertAuthSchema(sql));checks++;
+  });
+  // stats 的 download 分区：按 user_id 统计，绝不串号；章数/字数只累加已完成任务。
+  await withTestSchema(async(sql)=>{
+    await legacyDatabase(sql);await initializeAuthSchema(sql);await initializeBusinessSchema(sql);
+    await sql.transaction((tx)=>[
+      tx`INSERT INTO users(id,username,password_hash,role) VALUES(2,'stats_member_a','fixture-password-hash','member'),(3,'stats_member_b','fixture-password-hash','member')`,
+    ]);
+    await sql`INSERT INTO download_tasks(user_id,book_id,title,author,status,chapters_done,chars_total) VALUES
+      (2,21,'A 已完成','谁','done',10,1000),
+      (2,22,'A 失败','谁','failed',7,700),
+      (2,23,'A 进行中','谁','running',3,300),
+      (3,31,'B 已完成','谁','done',20,2000)`;
+    assert.deepEqual(await downloadStatsForUserQuery(sql,2),[{total:3,done:1,chapters:10,chars:1000}]);checks++;
+    assert.deepEqual(await downloadStatsForUserQuery(sql,3),[{total:1,done:1,chapters:20,chars:2000}]);checks++;
+    // 用户 1 在本 schema 里没有任何下载任务；B 的任务绝不能落进 A 的统计。
+    assert.deepEqual(await downloadStatsForUserQuery(sql,1),[{total:0,done:0,chapters:0,chars:0}]);checks++;
   });
   console.log(`download-isolation：${checks}/${checks} 检查通过。`);
   return checks;
