@@ -82,11 +82,15 @@ function responseMetadata(value: unknown): ResponseMetadata {
   };
 }
 
+// 传输层失败：上游一个字节都没答复（连接失败、读流超时、没有响应体）。与「上游答复了一个
+// 失败状态」严格区分开——探测只对前者在同一个截止时间内重试，见 probeModel。
+const UPSTREAM_UNREACHABLE = 'UPSTREAM_UNREACHABLE';
+
 export class LlmError extends Error {
   constructor(
     message: string,
     readonly retryable = true,
-    // 供调用方区分可恢复的失败形态（当前只有「输出预算被思维链吃光」）。
+    // 供调用方区分可恢复的失败形态（当前有「输出预算被思维链吃光」与「传输层没答复」）。
     readonly code?: string,
   ) {
     super(message);
@@ -261,7 +265,7 @@ export async function chat(
       );
     }
     if (!res.body) {
-      throw new LlmError('LLM returned no body');
+      throw new LlmError('LLM returned no body', true, UPSTREAM_UNREACHABLE);
     }
 
     // 某些兼容中转即使收到 stream=true，也会返回完整 JSON。
@@ -273,9 +277,11 @@ export async function chat(
     if (opts.signal?.aborted) throw cancelledError();
     if (e instanceof LlmError) throw e;
     if (controller.signal.aborted) {
-      throw new LlmError(`LLM 总超时（${Math.ceil(totalMs / 1000)}s）`);
+      throw new LlmError(`LLM 总超时（${Math.ceil(totalMs / 1000)}s）`, true, UPSTREAM_UNREACHABLE);
     }
-    throw new LlmError(e instanceof Error ? `LLM 请求失败：${e.message}` : 'LLM 请求失败');
+    throw new LlmError(
+      e instanceof Error ? `LLM 请求失败：${e.message}` : 'LLM 请求失败', true, UPSTREAM_UNREACHABLE,
+    );
   } finally {
     clearTimeout(totalTimer);
     opts.signal?.removeEventListener('abort', cancel);
@@ -456,7 +462,7 @@ async function readCompletionContent(
         aborted,
         new Promise<never>((_, reject) => {
           idleTimer = setTimeout(() => {
-            reject(new LlmError('LLM 空闲超时（' + Math.ceil(idleMs / 1000) + 's 无新 token）'));
+            reject(new LlmError('LLM 空闲超时（' + Math.ceil(idleMs / 1000) + 's 无新 token）', true, UPSTREAM_UNREACHABLE));
             controller.abort();
           }, idleMs);
         }),
@@ -556,8 +562,18 @@ export async function chatRobust(
 //   a) 探测问题改成需要分步计算的小题、预算提到 512：让模型**有机会**真的思考；
 //   b) 判定改成三态：只有观测到思维链增量 / 网关自报 reasoning_tokens > 0 才说 'yes'，
 //      观测不到只能说 'unknown'——一次小探测没有资格断言「不是推理模型」。
+//
+// 2026-09-17 的第二个修正（冷连接随机 502）：真实探测实测 5 次里有 3 次是**进程内第一个**
+// 请求在 ~11s 被 undici 以 UND_ERR_CONNECT_TIMEOUT 掐掉（curl 与后续请求都正常，与 UA 无关），
+// 于是模型明明能用，owner 点保存却拿到 502。下面在**同一个截止时间**内加一次重试：
+// 两次尝试共享 MODEL_PROBE_TIMEOUT_MS，第二次拿到的是剩余预算而不是整份，所以探测墙钟
+// 上限不变（仍是 MODEL_PROBE_TIMEOUT_MS）；重试只针对「上游一个字节都没答复」的传输层
+// 失败，上游给出的 HTTP 状态、空正文、被截断都是关于这个模型的语义结论，不重试。
 export const MODEL_PROBE_TIMEOUT_MS = 30_000;
 export const MODEL_PROBE_MAX_TOKENS = 512;
+// 重试前的等待；以及开第二次所需的最小剩余预算——只剩几百毫秒的请求只会把截止时间耗光。
+export const MODEL_PROBE_RETRY_DELAY_MS = 500;
+export const MODEL_PROBE_MIN_RETRY_MS = 3_000;
 // 需要一两步推理的小题：非推理模型直接答，真推理模型会先出思维链。
 export const MODEL_PROBE_SYSTEM = '你是模型连通性探测，只回答一个简单的分步计算题。';
 export const MODEL_PROBE_USER =
@@ -583,38 +599,60 @@ function reasoningVerdict(observedDelta: boolean, observedReasoningTokens: numbe
   return observedDelta || observedReasoningTokens > 0 ? 'yes' : 'unknown';
 }
 
+// 只重试「上游一个字节都没答复」：连接失败、读流超时、没有响应体（UPSTREAM_UNREACHABLE）。
+// 上游答复了失败状态码（404/429/5xx…）或出了正文只是不合要求（空正文、被截断），都是关于
+// 这个模型的语义结论，换一次请求只会拿到同一个答案，重试纯属拖时间——尤其是 429 与 5xx，
+// LlmError.retryable 为真也不该在这里重试。
+function probeRetryable(error: unknown): boolean {
+  return error instanceof LlmError && error.code === UPSTREAM_UNREACHABLE;
+}
+
 export async function probeModel(model: string): Promise<ModelProbeResult> {
+  // 两次尝试共享这一个截止时间，谁也拿不到整份预算。
+  const deadline = Date.now() + MODEL_PROBE_TIMEOUT_MS;
   let observedDelta = false;
   let observedReasoningTokens = 0;
-  try {
-    // 与正式调用同一条流式路径，避免"非流式能过、流式不能用"的假阳性。
-    await chat(MODEL_PROBE_SYSTEM, MODEL_PROBE_USER, {
-      model,
-      maxTokens: MODEL_PROBE_MAX_TOKENS,
-      totalTimeoutMs: MODEL_PROBE_TIMEOUT_MS,
-      idleTimeoutMs: MODEL_PROBE_TIMEOUT_MS,
-      temperature: 0,
-      onReasoning: () => { observedDelta = true; },
-      // 旁证：部分网关只在 usage 里报思维链 token。onUsage 在 finally 里回调，
-      // 所以「正文被思维链吃光」这条失败路径也拿得到 usage。
-      onUsage: (call) => {
-        observedReasoningTokens = Math.max(observedReasoningTokens, reasoningTokenCount(call.usage));
-      },
-    });
-    return {
-      ok: true, reasoning: reasoningVerdict(observedDelta, observedReasoningTokens), reason: '', warning: '',
-    };
-  } catch (error) {
-    const reasoning = reasoningVerdict(observedDelta, observedReasoningTokens);
-    // 推理模型仍可能把 512 token 的探测预算全花在思维链上：上游已经正常返回并出了 token，
-    // 说明模型本身可用（今天挂掉的是"正文为空 + 预算被思维链吃光"的正式调用，
-    // 那是 LLM_MAX_TOKENS 的问题，不是模型不可用），所以判可用但给出提示。
-    if (reasoning === 'yes' && error instanceof LlmError && error.code === 'OUTPUT_TRUNCATED') {
-      return { ok: true, reasoning, reason: '', warning: REASONING_PROBE_WARNING };
+  let error: unknown;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    if (attempt > 0) {
+      if (deadline - Date.now() <= MODEL_PROBE_RETRY_DELAY_MS + MODEL_PROBE_MIN_RETRY_MS) break;
+      await retryDelay(MODEL_PROBE_RETRY_DELAY_MS);
     }
-    const message = error instanceof LlmError ? error.message : '模型验证请求失败，请稍后重试。';
-    return { ok: false, reasoning, reason: `模型验证失败：${message}`, warning: '' };
+    // 第二次用的是「截止时间还剩多少」，不是又一份 MODEL_PROBE_TIMEOUT_MS。
+    const budgetMs = Math.max(1, deadline - Date.now());
+    try {
+      // 与正式调用同一条流式路径，避免"非流式能过、流式不能用"的假阳性。
+      await chat(MODEL_PROBE_SYSTEM, MODEL_PROBE_USER, {
+        model,
+        maxTokens: MODEL_PROBE_MAX_TOKENS,
+        totalTimeoutMs: budgetMs,
+        idleTimeoutMs: budgetMs,
+        temperature: 0,
+        onReasoning: () => { observedDelta = true; },
+        // 旁证：部分网关只在 usage 里报思维链 token。onUsage 在 finally 里回调，
+        // 所以「正文被思维链吃光」这条失败路径也拿得到 usage。
+        onUsage: (call) => {
+          observedReasoningTokens = Math.max(observedReasoningTokens, reasoningTokenCount(call.usage));
+        },
+      });
+      return {
+        ok: true, reasoning: reasoningVerdict(observedDelta, observedReasoningTokens), reason: '', warning: '',
+      };
+    } catch (e) {
+      // 观测证据跨尝试保留：第一次看到过思维链，第二次没看到，结论仍是推理模型。
+      error = e;
+      if (!probeRetryable(e)) break;
+    }
   }
+  const reasoning = reasoningVerdict(observedDelta, observedReasoningTokens);
+  // 推理模型仍可能把 512 token 的探测预算全花在思维链上：上游已经正常返回并出了 token，
+  // 说明模型本身可用（今天挂掉的是"正文为空 + 预算被思维链吃光"的正式调用，
+  // 那是 LLM_MAX_TOKENS 的问题，不是模型不可用），所以判可用但给出提示。
+  if (reasoning === 'yes' && error instanceof LlmError && error.code === 'OUTPUT_TRUNCATED') {
+    return { ok: true, reasoning, reason: '', warning: REASONING_PROBE_WARNING };
+  }
+  const message = error instanceof LlmError ? error.message : '模型验证请求失败，请稍后重试。';
+  return { ok: false, reasoning, reason: `模型验证失败：${message}`, warning: '' };
 }
 
 // 从 LLM 回复里稳健地抠出 JSON（容忍 ```json 围栏、前后废话）

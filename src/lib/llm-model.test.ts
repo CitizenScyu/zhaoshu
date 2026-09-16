@@ -253,6 +253,8 @@ describe('probeModel：保存前验证的三态推理判定', () => {
     const probe = await client.probeModel('silent/model');
     expect(probe.ok).toBe(false);
     expect(probe.reason).toMatch(/空正文/);
+    // 上游答复了、只是内容不合要求：那是语义结论，不重试。
+    expect(fetchMock).toHaveBeenCalledOnce();
   });
 
   it('有独立的 30 秒上限，超时即判失败（不沿用路由的模型预算）', async () => {
@@ -270,6 +272,104 @@ describe('probeModel：保存前验证的三态推理判定', () => {
   it('探测独立超时仍远小于路由的 maxDuration，慢模型不会被平台砍掉', async () => {
     expect(client.MODEL_PROBE_TIMEOUT_MS).toBeLessThan(60_000);
     expect(client.MODEL_PROBE_TIMEOUT_MS).toBeGreaterThan(20_000);
+  });
+});
+
+// 2026-09-17 实测：真实网关 5 次探测里 3 次是**进程内第一个**请求在 ~11s 被掐成
+// UND_ERR_CONNECT_TIMEOUT（fetch failed），模型明明可用，owner 点保存却拿到 502。
+describe('probeModel：冷连接重试', () => {
+  const connectFailure = () => Promise.reject(new TypeError('fetch failed'));
+
+  // 回归护栏：把重试删掉（两次尝试改成一次）本用例必须失败。
+  it('第一次冷连接失败 → 同一次探测内重试成功 → 判定为可用', async () => {
+    vi.useFakeTimers();
+    fetchMock.mockImplementationOnce(connectFailure)
+      .mockImplementationOnce(() => sse([content('307.8'), finish('stop'), DONE]));
+    const pending = client.probeModel('cold/model');
+    await vi.advanceTimersByTimeAsync(client.MODEL_PROBE_RETRY_DELAY_MS);
+    await expect(pending).resolves.toMatchObject({ ok: true, reasoning: 'unknown' });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('两次都是冷连接失败时如实判失败，且失败原因不含地址或密钥', async () => {
+    vi.useFakeTimers();
+    fetchMock.mockImplementation(connectFailure);
+    const pending = client.probeModel('dead/model');
+    await vi.advanceTimersByTimeAsync(client.MODEL_PROBE_RETRY_DELAY_MS);
+    const probe = await pending;
+    expect(probe.ok).toBe(false);
+    expect(probe.reason).toMatch(/LLM 请求失败/);
+    expect(probe.reason).not.toMatch(/https?:|sk-|Bearer/i);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  // 不变量：两次尝试共享同一个截止时间，第二次拿不到整份预算。第一次就耗掉 ~28s 时，
+  // 剩下的 2s 连重试等待都不够——不能开第二次，否则总时长会越过 MODEL_PROBE_TIMEOUT_MS。
+  it('剩余预算不够时不开第二次，探测总时长仍被 30s 封住', async () => {
+    vi.useFakeTimers();
+    fetchMock.mockImplementation(() => new Promise((_resolve, reject) => {
+      setTimeout(() => reject(new TypeError('fetch failed')), 28_000);
+    }));
+    const pending = client.probeModel('slow-cold/model');
+    await vi.advanceTimersByTimeAsync(28_000);
+    await vi.advanceTimersByTimeAsync(client.MODEL_PROBE_TIMEOUT_MS);
+    const probe = await pending;
+    expect(probe.ok).toBe(false);
+    expect(fetchMock).toHaveBeenCalledOnce();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('第一次被自己的预算掐掉（用光 30s）后不开第二次，最坏墙钟仍是 30s', async () => {
+    vi.useFakeTimers();
+    const startedAt = Date.now();
+    fetchMock.mockImplementation((_url: unknown, init?: RequestInit) => new Promise((_resolve, reject) => {
+      init?.signal?.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')));
+    }));
+    const pending = client.probeModel('always-slow/model');
+    await vi.advanceTimersByTimeAsync(client.MODEL_PROBE_TIMEOUT_MS);
+    const probe = await pending;
+    expect(probe.ok).toBe(false);
+    expect(Date.now() - startedAt).toBeLessThanOrEqual(client.MODEL_PROBE_TIMEOUT_MS);
+    expect(fetchMock).toHaveBeenCalledOnce();
+  });
+
+  it('第二次拿的是剩余预算，墙钟合计不超过 MODEL_PROBE_TIMEOUT_MS', async () => {
+    vi.useFakeTimers();
+    const startedAt = Date.now();
+    let calls = 0;
+    fetchMock.mockImplementation((_url: unknown, init?: RequestInit) => new Promise((_resolve, reject) => {
+      calls += 1;
+      const index = calls;
+      const fail = () => reject(index === 1 ? new TypeError('fetch failed') : new DOMException('aborted', 'AbortError'));
+      if (index === 1) setTimeout(fail, 10_000); // 冷连接在 10s 被掐掉
+      else init?.signal?.addEventListener('abort', fail);
+    }));
+    const pending = client.probeModel('cold-then-slow/model');
+    // 10s（第一次连接失败）+ 0.5s（等待）+ 剩余 ~19.5s（第二次自己超时）
+    await vi.advanceTimersByTimeAsync(client.MODEL_PROBE_TIMEOUT_MS);
+    const probe = await pending;
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(probe.ok).toBe(false);
+    expect(Date.now() - startedAt).toBeLessThanOrEqual(client.MODEL_PROBE_TIMEOUT_MS);
+  });
+
+  // 上游答复了失败状态码就不是「没答复」：429/5xx 虽然 LlmError.retryable 为真，
+  // 也不该在这里重试——重试只会拿到同一个答案，还把 owner 的等待拖长。
+  it.each([
+    [429, /请求过于频繁或额度不足/],
+    [500, /HTTP 500/],
+    [503, /HTTP 503/],
+  ])('上游答复 HTTP %i 时不重试（那是语义结论，不是冷连接）', async (status, expected) => {
+    fetchMock.mockImplementation(() => new Response('upstream said no', { status }));
+    const probe = await client.probeModel('busy/model');
+    expect(probe.ok).toBe(false);
+    expect(probe.reason).toMatch(expected);
+    expect(fetchMock).toHaveBeenCalledOnce();
+  });
+
+  it('重试间隔与最小剩余预算都远小于探测上限，不会自己顶破预算', () => {
+    expect(client.MODEL_PROBE_RETRY_DELAY_MS + client.MODEL_PROBE_MIN_RETRY_MS)
+      .toBeLessThan(client.MODEL_PROBE_TIMEOUT_MS);
   });
 });
 
