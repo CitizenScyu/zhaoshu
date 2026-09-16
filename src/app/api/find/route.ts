@@ -53,6 +53,34 @@ function modelList(raw: string, field: 'candidates' | 'items', max: number): unk
   return list;
 }
 
+// 第一次尝试只拿整步预算的一部分：上游推理模型单步常见 130–150s，60% 装得下，
+// 同时给第二次尝试留出时间。
+const FIRST_ATTEMPT_RATIO = 0.6;
+// 剩余预算低于这个值就放弃第二次尝试——一次上游往返至少要留下可用的时间。
+const MIN_SECOND_ATTEMPT_MS = 5_000;
+
+// 正文解析（parseJson / modelList）发生在 chatRobust 之外，所以它的失败根本不会触发
+// chatRobust 的重试；而且 chatRobust 的 totalTimeoutMs 就是整步预算，第一次尝试一旦
+// 耗尽就再没有预算。这里补上真正的恢复路径：两次尝试共享同一个截止时间——第一次用
+// 有界子预算，正文解析不出预期结构时用该步剩余预算再试一次。总耗时绝不超过 budgetMs，
+// 重试不抬高整步预算（deadline 不变量）。模型调用本身失败不在这里重试，直接上抛，
+// 那是 chatRobust 自己的职责。
+async function modelStep<T>(
+  budgetMs: number,
+  call: (totalTimeoutMs: number) => Promise<string>,
+  parse: (content: string) => T,
+): Promise<T> {
+  const stepDeadline = Date.now() + budgetMs;
+  const content = await call(Math.max(1, Math.floor(budgetMs * FIRST_ATTEMPT_RATIO)));
+  try {
+    return parse(content);
+  } catch (error) {
+    const remainingMs = stepDeadline - Date.now();
+    if (remainingMs < MIN_SECOND_ATTEMPT_MS) throw error;
+    return parse(await call(remainingMs));
+  }
+}
+
 // 三步流水线由前端分步调用：recall → verify → rerank
 // 每步都独立控制在函数时限内，前端可以展示进度
 
@@ -96,12 +124,16 @@ export async function POST(req: NextRequest) {
           ...profile.seeds.map((seed) => ({ title: seed.title, author: seed.author ?? '' })),
           ...(await atomicRead(() => getExcludedBookTitlesForUser(userId))),
         ];
-        const { content: raw } = await atomicRead(() => chatRobust(
-          recallSystem(),
-          recallUser(profile.content, query, excludedBooks, conditions),
-          { temperature: 0.8, signal: access.signal, onUsage: recordUsageAfterResponse('find_recall'), totalTimeoutMs: ms() },
+        const raw = await atomicRead(() => modelStep(
+          ms(),
+          async (totalTimeoutMs) => (await chatRobust(
+            recallSystem(),
+            recallUser(profile.content, query, excludedBooks, conditions),
+            { temperature: 0.8, signal: access.signal, onUsage: recordUsageAfterResponse('find_recall'), totalTimeoutMs },
+          )).content,
+          (content) => modelList(content, 'candidates', MAX_CANDIDATES),
         ));
-        const candidates = sanitizeCandidates(modelList(raw, 'candidates', MAX_CANDIDATES))
+        const candidates = sanitizeCandidates(raw)
           .filter((candidate) =>
             !excludedKeys.has(bookKey(candidate.title, candidate.author)) &&
             !excludedTitles.has(bookKey(candidate.title, '')));
@@ -144,14 +176,18 @@ export async function POST(req: NextRequest) {
         }
         emit({ type: 'phase', step: 'rerank', total: verified.length });
         const { content: profile } = await atomicRead(() => getProfileForUser(userId));
-        const { content: raw } = await atomicRead(() => chatRobust(
-          rerankSystem(),
-          rerankUser(profile, query, JSON.stringify(verified), conditions),
-          { temperature: 0.3, signal: access.signal, onUsage: recordUsageAfterResponse('find_rerank'), totalTimeoutMs: ms() },
+        const raw = await atomicRead(() => modelStep(
+          ms(),
+          async (totalTimeoutMs) => (await chatRobust(
+            rerankSystem(),
+            rerankUser(profile, query, JSON.stringify(verified), conditions),
+            { temperature: 0.3, signal: access.signal, onUsage: recordUsageAfterResponse('find_rerank'), totalTimeoutMs },
+          )).content,
+          (content) => modelList(content, 'items', MAX_RERANKED_ITEMS),
         ));
         // 用书名+作者关联，避免同名作品回填到错误的豆瓣条目。
         const byBook = new Map(verified.map((v) => [bookKey(v.title, v.author), v]));
-        const items = sanitizeRerankedItems(modelList(raw, 'items', MAX_RERANKED_ITEMS))
+        const items = sanitizeRerankedItems(raw)
           .filter((it) => byBook.has(bookKey(it.title, it.author)))
           .map((it) => {
             const source = byBook.get(bookKey(it.title, it.author))!;

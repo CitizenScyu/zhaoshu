@@ -289,17 +289,74 @@ describe('POST /api/find output contract', () => {
     expect(mocks.chatRobust.mock.calls[0][1]).toContain('仅补充存在性');
   });
 
-  // 单步模型预算是硬上限：调用方传给 chatRobust 的 totalTimeoutMs 就等于它，第一次
-  // 尝试就会吃掉整份预算（重试路径因此永不生效）。上游推理模型单步实测 190s 上下，
-  // 220s 会稳定截断；可用额 285s − 12s 写回预留 = 273s，ceiling 取 260s。
-  it('hands a single model step the full 260s ceiling, not the old 220s', async () => {
+  // 单步模型预算是硬上限：调用方传给 chatRobust 的 totalTimeoutMs 来自它。上游推理模型
+  // 单步实测 190s 上下，220s 的 ceiling 会稳定截断；可用额 285s − 12s 写回预留 = 273s，
+  // ceiling 取 260s。第一次尝试只拿 60%，给重试留出余量。
+  it('hands a single model step a 156s first attempt inside the 260s ceiling', async () => {
     mocks.chatRobust.mockResolvedValue(JSON.stringify({ candidates: [candidate] }));
     await consumeSSE(await POST(request({ step: 'recall', query: '找书' })));
     expect(mocks.chatRobust).toHaveBeenCalledOnce();
     const { totalTimeoutMs } = mocks.chatRobust.mock.calls[0][2];
-    expect(totalTimeoutMs).toBe(260_000);
-    expect(totalTimeoutMs).toBeGreaterThan(220_000);
-    // 路由最坏情况（260s 模型 + 写回）仍留在 295s 平台上限内。
-    expect(totalTimeoutMs + 12_000).toBeLessThan(295_000);
+    expect(totalTimeoutMs).toBe(156_000); // 260s × 0.6
+    expect(totalTimeoutMs).toBeGreaterThan(132_000); // 旧的 220s ceiling 只给到这里
+    expect(totalTimeoutMs).toBeLessThan(260_000);
+  });
+
+  // parseJson / modelList 的失败发生在 chatRobust 之外，不重试就永远拉不回来。
+  it('retries once inside the same step when the first answer is not JSON', async () => {
+    mocks.chatRobust
+      .mockResolvedValueOnce('抱歉，我先解释一下我的选书思路，不输出 JSON。')
+      .mockResolvedValueOnce(JSON.stringify({ candidates: [candidate] }));
+    const events = await consumeSSE(await POST(request({ step: 'recall', query: '找书' })));
+    expect(lastEvent<{ candidates: unknown[] }>(events, 'result').candidates).toEqual([{ ...candidate, source: 'llm' }]);
+    expect(mocks.chatRobust).toHaveBeenCalledTimes(2);
+  });
+
+  it('recovers a rerank step whose first answer is not JSON', async () => {
+    mocks.chatRobust
+      .mockResolvedValueOnce('这里是我的分析（非 JSON）。')
+      .mockResolvedValueOnce(JSON.stringify({ items: [item] }));
+    const events = await consumeSSE(await POST(request({ step: 'rerank', query: '找书', verified: [verified] })));
+    expect(lastEvent<{ items: unknown[] }>(events, 'result').items).toHaveLength(1);
+    expect(mocks.chatRobust).toHaveBeenCalledTimes(2);
+  });
+
+  // 两次尝试共享一个单步截止时间：第二次只拿剩余预算，不重获整份（deadline 不变量）。
+  it('gives the retry only the remaining step budget, never a fresh one', async () => {
+    let clock = Date.now();
+    vi.spyOn(Date, 'now').mockImplementation(() => clock);
+    mocks.chatRobust
+      .mockImplementationOnce(async () => {
+        clock += 150_000; // 第一次尝试实际花掉 150s
+        return '不是 JSON';
+      })
+      .mockImplementationOnce(async () => JSON.stringify({ candidates: [candidate] }));
+
+    const events = await consumeSSE(await POST(request({ step: 'recall', query: '找书' })));
+
+    expect(lastEvent<{ candidates: unknown[] }>(events, 'result').candidates).toHaveLength(1);
+    expect(mocks.chatRobust).toHaveBeenCalledTimes(2);
+    const budgets = mocks.chatRobust.mock.calls.map((call) => (call[2] as { totalTimeoutMs: number }).totalTimeoutMs);
+    expect(budgets[0]).toBe(156_000); // 260s × 0.6
+    expect(budgets[1]).toBe(110_000); // 260s − 已用 150s，不是又一份 260s
+    expect(150_000 + budgets[1]).toBeLessThanOrEqual(260_000);
+  });
+
+  it('does not start a second attempt once the step budget is spent', async () => {
+    vi.stubEnv('LLM_TOTAL_TIMEOUT_MS', '1000'); // 整步只剩 1s，剩余远低于重试下限
+    mocks.chatRobust.mockResolvedValue('不是 JSON');
+    const events = await consumeSSE(await POST(request({ step: 'recall', query: '找书' })));
+    expect(lastEvent<{ code: string }>(events, 'error').code).toBe('LLM_ERROR');
+    expect(mocks.chatRobust).toHaveBeenCalledOnce();
+  });
+
+  it('reports LLM_ERROR when both attempts fail to produce JSON', async () => {
+    mocks.chatRobust.mockResolvedValue(JSON.stringify({ wrong: [] }));
+    const events = await consumeSSE(await POST(request({ step: 'rerank', query: '找书', verified: [verified] })));
+    expect(lastEvent<{ code: string; message: string }>(events, 'error')).toMatchObject({
+      code: 'LLM_ERROR', message: expect.stringMatching(/书单字段或数量/),
+    });
+    expect(mocks.chatRobust).toHaveBeenCalledTimes(2);
+    expect(mocks.persistRecommendationsForUser).not.toHaveBeenCalled();
   });
 });
