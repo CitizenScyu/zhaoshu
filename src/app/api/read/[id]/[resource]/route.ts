@@ -52,7 +52,7 @@ export async function GET(
     return privateResponse({ error: '无效的章节、段落或文件版本。' }, 400);
   }
   try {
-    const task = await getReadableTask(taskId);
+    const task = await getReadableTask(taskId, auth.principal.userId);
     if (resource === 'availability') return privateResponse(await readerAvailability(task));
     if (resource === 'index') return privateResponse(await readBookIndex(task));
     return privateResponse(await readBookPart(task, chapter!, part!, version));
