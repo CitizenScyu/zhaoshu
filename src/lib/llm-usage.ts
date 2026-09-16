@@ -44,6 +44,18 @@ function tokenCount(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : undefined;
 }
 
+// 网关对思维链 token 的独立计数（OpenAI 系的 completion_tokens_details.reasoning_tokens，
+// 也有网关放在 output_tokens_details 下）。只作为「确实是推理模型」的旁证：
+// 注意 completion_tokens 是思维链+正文的合计，不是正文长度。字段缺失或为 0 都不能反过来
+// 证明「不是推理模型」，所以这里读不到就返回 0。
+export function reasoningTokenCount(usage: LlmUsage): number {
+  const raw = usage.rawUsage;
+  if (!raw) return 0;
+  const details = isRecord(raw.completion_tokens_details) ? raw.completion_tokens_details
+    : isRecord(raw.output_tokens_details) ? raw.output_tokens_details : null;
+  return tokenCount(details?.reasoning_tokens) ?? 0;
+}
+
 export function parseLlmUsage(value: unknown): LlmUsage {
   const raw = isRecord(value) ? value : null;
   const prompt = tokenCount(raw?.prompt_tokens);

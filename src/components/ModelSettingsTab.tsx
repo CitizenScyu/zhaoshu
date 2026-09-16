@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useState } from 'react';
 import { useOwner } from '@/components/OwnerProvider';
-import type { LlmModelSettings } from '@/lib/app-settings';
+import type { LlmModelSettings, ReasoningVerdict } from '@/lib/app-settings';
 
 const SOURCE_LABELS: Record<LlmModelSettings['source'], string> = {
   database: '数据库设置',
@@ -10,9 +10,28 @@ const SOURCE_LABELS: Record<LlmModelSettings['source'], string> = {
   default: '硬编码缺省',
 };
 
-function reasoningLabel(reasoning: boolean | null): string {
+// 三态判定在页面上的说法。'unknown' 不能说成「否」：探测没观察到思维链不等于该模型
+// 不是推理模型（短请求本来就可能不触发思考），2026-09-17 之前这里就是这么说的。
+const REASONING_LABELS: Record<ReasoningVerdict, string> = {
+  yes: '是（先出思维链，找书更慢）',
+  no: '否',
+  unknown: '未观察到',
+};
+
+export function reasoningLabel(reasoning: ReasoningVerdict | null): string {
   if (reasoning === null) return '未知（保存时会实测一次）';
-  return reasoning ? '是（先出思维链，找书更慢）' : '否';
+  return REASONING_LABELS[reasoning];
+}
+
+// 保存成功后的提示：判定为推理模型时必须主动说出来，'unknown' 只补充一句限制说明。
+export function savedNotice(model: string, next: { reasoning: ReasoningVerdict | null; warning?: string }): string {
+  const notes: string[] = [];
+  if (next.warning) notes.push(next.warning);
+  else if (next.reasoning === 'yes') notes.push('探测观察到该模型会输出思维链（推理模型），找书会更慢。');
+  else if (next.reasoning === 'unknown') {
+    notes.push('本次探测没有观察到思维链，但不代表它不是推理模型——探测只能证明「是」。');
+  }
+  return `已切换到 ${model}，立即生效。${notes.map((note) => `注意：${note}`).join('')}`;
 }
 
 // owner 专用的最小模型切换入口：展示当前值 + 一个输入框 + 保存 / 恢复默认。
@@ -67,9 +86,7 @@ export default function ModelSettingsTab() {
       setSettings(next);
       setDraft('');
       setNotice(
-        model === null
-          ? '已恢复默认，立即生效'
-          : `已切换到 ${next.model}，立即生效。${next.warning ? `注意：${next.warning}` : ''}`,
+        model === null ? '已恢复默认，立即生效' : savedNotice(next.model, next),
       );
     } catch (e) {
       setError(e instanceof Error ? e.message : '模型设置保存失败');
@@ -84,6 +101,10 @@ export default function ModelSettingsTab() {
       <p className="text-sm mt-2 leading-7" style={{ color: 'var(--ink-soft)' }}>
         切换后立即生效，不需要重新部署。保存前会先用候选模型发一次极小请求验证：
         验证不通过就不写库，原因显示在下面。接口密钥与地址始终留在环境变量里，这里只切换模型名。
+      </p>
+      <p className="text-xs mt-2 leading-6" style={{ color: 'var(--ink-faint)' }}>
+        「推理模型」这一栏只能证明「是」：探测到思维链就报「是」；没探测到只报「未观察到」，
+        那不等于该模型不是推理模型。推理模型会让找书变慢，请确认 LLM_MAX_TOKENS 足够。
       </p>
 
       {error && (
@@ -144,7 +165,7 @@ export default function ModelSettingsTab() {
             </button>
           </form>
           <p className="text-xs" style={{ color: 'var(--ink-faint)' }}>
-            保存按钮会先用新模型发一次极小的验证请求（最长 20 秒），验证通过才写库。
+            保存按钮会先用新模型发一次极小的验证请求（最长 30 秒），验证通过才写库。
             「恢复默认」清空数据库覆盖值，回退到默认值那一栏的模型。
           </p>
         </div>

@@ -58,7 +58,7 @@ beforeEach(() => {
   db = mockSql();
   mocks.getSql.mockReturnValue(db.sql);
   mocks.ensureSchema.mockResolvedValue(undefined);
-  mocks.probeModel.mockResolvedValue({ ok: true, reasoning: false, reason: '', warning: '' });
+  mocks.probeModel.mockResolvedValue({ ok: true, reasoning: 'unknown', reason: '', warning: '' });
   db.resolve.mockResolvedValue([{ llm_model: null, updated_at: null }]);
 });
 
@@ -169,7 +169,7 @@ describe('PATCH /api/admin/llm', () => {
   // 回归护栏：删掉"保存前验证"这段，本用例必须失败（会把没验证的模型写进库）。
   it('保存前验证失败 → 502，绝不写库', async () => {
     mocks.probeModel.mockResolvedValue({
-      ok: false, reasoning: false, reason: '模型验证失败：模型服务暂时不可用（HTTP 400），请稍后重试。', warning: '',
+      ok: false, reasoning: 'unknown', reason: '模型验证失败：模型服务暂时不可用（HTTP 400），请稍后重试。', warning: '',
     });
     const res = await PATCH(req('PATCH', { body: { model: 'broken/model' } }));
     expect(res.status).toBe(502);
@@ -191,7 +191,7 @@ describe('PATCH /api/admin/llm', () => {
       defaultModel: 'claude-opus-5-88',
       source: 'database',
       updatedAt: '2026-09-16T10:00:00.000Z',
-      reasoning: false,
+      reasoning: 'unknown',
     });
     const writes = settingWrites();
     expect(writes).toHaveLength(1);
@@ -202,15 +202,15 @@ describe('PATCH /api/admin/llm', () => {
 
   it('推理模型照常保存，但把提示透出给前端', async () => {
     mocks.probeModel.mockResolvedValue({
-      ok: true, reasoning: true, reason: '', warning: '该模型是推理模型：思维链与正文共享 max_tokens。',
+      ok: true, reasoning: 'yes', reason: '', warning: '该模型是推理模型：思维链与正文共享 max_tokens。',
     });
     db.resolve.mockResolvedValue([{ updated_at: '2026-09-16T10:00:00.000Z' }]);
     const body = await (await PATCH(req('PATCH', { body: { model: 'reasoner/model' } }))).json();
-    expect(body).toMatchObject({ model: 'reasoner/model', reasoning: true, warning: '该模型是推理模型：思维链与正文共享 max_tokens。' });
+    expect(body).toMatchObject({ model: 'reasoner/model', reasoning: 'yes', warning: '该模型是推理模型：思维链与正文共享 max_tokens。' });
   });
 
   it('恢复默认清空覆盖值，且不需要通过验证', async () => {
-    mocks.probeModel.mockResolvedValue({ ok: false, reasoning: false, reason: '不该被调用', warning: '' });
+    mocks.probeModel.mockResolvedValue({ ok: false, reasoning: 'unknown', reason: '不该被调用', warning: '' });
     const res = await PATCH(req('PATCH', { body: { model: null } }));
     expect(res.status).toBe(200);
     expect(mocks.probeModel).not.toHaveBeenCalled();

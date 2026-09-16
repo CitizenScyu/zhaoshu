@@ -12,6 +12,12 @@ const MODEL_NAME_PATTERN = /^[A-Za-z0-9._/-]+$/;
 
 export type LlmModelSource = 'database' | 'environment' | 'default';
 
+// 「是不是推理模型」的判定值。**必须是三态**：一次小探测能证明「是」（真的观测到思维链），
+// 却证明不了「不是」（短提示词本来就不一定触发思维链，2026-09-17 实测旧判据对
+// claude-opus-5-88 报过 false）。'no' 只在将来有「这次探测确实有能力区分」的论证时才可以用，
+// 当前没有任何生产者会返回它；探测结果只能是 'yes' 或 'unknown'。
+export type ReasoningVerdict = 'yes' | 'no' | 'unknown';
+
 export interface LlmModelSettings {
   model: string;
   /** 「恢复默认」会回到的模型（环境变量或硬编码缺省）。 */
@@ -19,8 +25,8 @@ export interface LlmModelSettings {
   source: LlmModelSource;
   /** 数据库覆盖值的写入时间；没有覆盖时为 null。 */
   updatedAt: string | null;
-  /** 是否推理模型：只有 PATCH 的保存前验证能给出答案，GET 不做探测（null 表示未知）。 */
-  reasoning: boolean | null;
+  /** 保存前验证的推理判定；GET 不做探测，固定为 null（未知）。见 ReasoningVerdict。 */
+  reasoning: ReasoningVerdict | null;
 }
 
 export function isValidModelName(value: unknown): value is string {
@@ -78,7 +84,7 @@ export async function clearModelSetting(): Promise<void> {
 /** GET 的响应体：数据库覆盖值优先，否则报告环境变量/缺省来源。 */
 export function modelSettingsPayload(
   stored: StoredModelSetting,
-  reasoning: boolean | null = null,
+  reasoning: ReasoningVerdict | null = null,
 ): LlmModelSettings {
   const fallback = environmentModel();
   if (stored.model) {

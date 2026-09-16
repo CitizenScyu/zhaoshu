@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { parseLlmUsage } from './llm-usage';
+import { parseLlmUsage, reasoningTokenCount } from './llm-usage';
 import { consumeSseChunk } from './llm';
 
 const rawUsage = {
@@ -62,6 +62,29 @@ describe('token usage normalization', () => {
     expect(first.usage).toBeUndefined();
     const rest = consumeSseChunk(first.rest + source.slice(31), false);
     expect(rest).toMatchObject({ content: '', done: false, finished: false, usage });
+  });
+
+  // 思维链 token 是「确实是推理模型」的旁证，但读不到只能算 0（未知），不能算「没有」。
+  it('reads the reasoning token counter from either gateway field and only when present', () => {
+    expect(reasoningTokenCount(parseLlmUsage({
+      completion_tokens: 210, completion_tokens_details: { reasoning_tokens: 150 },
+    }))).toBe(150);
+    expect(reasoningTokenCount(parseLlmUsage({
+      completion_tokens: 90, output_tokens_details: { reasoning_tokens: 60 },
+    }))).toBe(60);
+    expect(reasoningTokenCount(parseLlmUsage({
+      completion_tokens: 12, completion_tokens_details: { reasoning_tokens: 0 },
+    }))).toBe(0);
+    expect(reasoningTokenCount(parseLlmUsage({ completion_tokens: 12 }))).toBe(0);
+    expect(reasoningTokenCount(parseLlmUsage({ completion_tokens_details: { reasoning_tokens: 'many' } }))).toBe(0);
+    expect(reasoningTokenCount(missingUsage)).toBe(0);
+  });
+
+  // completion_tokens 是思维链+正文的合计：不能拿它当正文长度，也不能靠它反推推理模型。
+  it('keeps completion_tokens as the combined count, never split into text length', () => {
+    const parsed = parseLlmUsage({ prompt_tokens: 30, completion_tokens: 180, completion_tokens_details: { reasoning_tokens: 170 } });
+    expect(parsed.completionTokens).toBe(180);
+    expect(reasoningTokenCount(parsed)).toBe(170);
   });
 });
 

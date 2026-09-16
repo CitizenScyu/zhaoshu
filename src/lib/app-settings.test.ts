@@ -147,7 +147,7 @@ describe('GET 响应体', () => {
     });
   });
 
-  it('保存后把探测到的推理模型结论透出', () => {
-    expect(modelSettingsPayload({ model: 'db-model', updatedAt: null }, true).reasoning).toBe(true);
+  it('保存后把探测到的推理模型结论透出（三态原样透传）', () => {
+    expect(modelSettingsPayload({ model: 'db-model', updatedAt: null }, 'yes').reasoning).toBe('yes');
   });
 });

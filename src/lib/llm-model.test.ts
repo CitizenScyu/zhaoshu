@@ -18,6 +18,12 @@ const sse = (events: string[]) => new Response(events.join(''), {
 const content = (text: string) => data({ choices: [{ index: 0, delta: { content: text }, finish_reason: null }] });
 const reasoning = (text: string) => data({ choices: [{ index: 0, delta: { reasoning_content: text }, finish_reason: null }] });
 const finish = (reason: string) => data({ choices: [{ index: 0, delta: {}, finish_reason: reason }] });
+// 真实记录形态：网关不在 delta 里吐思维链，只在最后的 usage 块里报思维链 token 数。
+const usageBlock = (usage: Record<string, unknown>) => data({ choices: [], usage });
+const REASONING_USAGE = {
+  prompt_tokens: 30, completion_tokens: 180, total_tokens: 210,
+  completion_tokens_details: { reasoning_tokens: 150 },
+};
 const DONE = 'data: [DONE]\n\n';
 const sentBody = (call = 0) => JSON.parse(String(fetchMock.mock.calls[call][1]?.body)) as Record<string, unknown>;
 
@@ -150,30 +156,87 @@ describe('chat / chatRobust 用的是每次调用解析出来的模型', () => {
   });
 });
 
-describe('probeModel：保存前验证', () => {
-  it('极小请求：候选模型 + 很小的 max_tokens，正文非空即通过', async () => {
-    fetchMock.mockImplementation(() => sse([content('OK'), finish('stop'), DONE]));
+describe('probeModel：保存前验证的三态推理判定', () => {
+  it('探测请求本身必须有机会触发思考：分步计算的题、预算远大于一个词', async () => {
+    fetchMock.mockImplementation(() => sse([content('307.8'), finish('stop'), DONE]));
     await expect(client.probeModel('candidate/model')).resolves.toEqual({
-      ok: true, reasoning: false, reason: '', warning: '',
+      ok: true, reasoning: 'unknown', reason: '', warning: '',
     });
     const body = sentBody();
     expect(body.model).toBe('candidate/model');
     expect(body.max_tokens).toBe(client.MODEL_PROBE_MAX_TOKENS);
-    expect(body.max_tokens).toBe(64);
     expect(body.stream).toBe(true);
+    // 旧探针是「只回一个词 / Say OK」+ 64 token，模型不需要思考，于是永远测不到思维链。
+    expect(client.MODEL_PROBE_MAX_TOKENS).toBeGreaterThanOrEqual(256);
+    const messages = body.messages as { content: string }[];
+    expect(messages[0].content).not.toContain('只回一个词');
+    expect(messages[1].content).not.toBe('Say OK');
+    expect(messages[1].content).toMatch(/分步|计算/);
+  });
+
+  // 回归护栏（判据说谎）：没有观测到思维链时只能说 unknown，绝不能说成「不是推理模型」。
+  // 还原成旧的 boolean 写法（observedDelta ? true : false）时本用例必须失败。
+  it('没观测到思维链时判 unknown，绝不判「不是推理模型」', async () => {
+    fetchMock.mockImplementation(() => sse([content('307.8'), finish('stop'), DONE]));
+    const probe = await client.probeModel('maybe-reasoner');
+    expect(probe.reasoning).toBe('unknown');
+    expect(probe.reasoning).not.toBe('no');
   });
 
   it('返回里有 reasoning_content 就报告是推理模型', async () => {
-    fetchMock.mockImplementation(() => sse([reasoning('先想一会'), content('OK'), finish('stop'), DONE]));
-    await expect(client.probeModel('reasoner')).resolves.toMatchObject({ ok: true, reasoning: true, warning: '' });
+    fetchMock.mockImplementation(() => sse([reasoning('先算 17×23'), content('307.8'), finish('stop'), DONE]));
+    await expect(client.probeModel('reasoner')).resolves.toMatchObject({ ok: true, reasoning: 'yes', warning: '' });
+  });
+
+  // 真实记录形态：delta 里没有 reasoning_content，只有 usage 里的 reasoning_tokens。
+  // 只看 delta 的写法会漏报成 unknown，这条用例钉住 usage 旁证。
+  it('只在 usage 里报 reasoning_tokens 也判是推理模型', async () => {
+    fetchMock.mockImplementation(() => sse([content('307.8'), finish('stop'), usageBlock(REASONING_USAGE), DONE]));
+    const probe = await client.probeModel('usage-only-reasoner');
+    expect(probe.reasoning).toBe('yes');
+    expect(probe.ok).toBe(true);
+  });
+
+  it('另一种真实形态：usage 的思维链计数放在 output_tokens_details 下', async () => {
+    fetchMock.mockImplementation(() => sse([
+      content('307.8'), finish('stop'),
+      usageBlock({ completion_tokens: 90, output_tokens_details: { reasoning_tokens: 60 } }),
+      DONE,
+    ]));
+    await expect(client.probeModel('output-details-reasoner')).resolves.toMatchObject({ reasoning: 'yes' });
+  });
+
+  it('usage 明写 reasoning_tokens=0 且没有思维链增量时仍是 unknown（0 不是「不是推理模型」的证据）', async () => {
+    fetchMock.mockImplementation(() => sse([
+      content('307.8'), finish('stop'),
+      usageBlock({ prompt_tokens: 30, completion_tokens: 12, total_tokens: 42, completion_tokens_details: { reasoning_tokens: 0 } }),
+      DONE,
+    ]));
+    await expect(client.probeModel('plain/model')).resolves.toMatchObject({ ok: true, reasoning: 'unknown' });
   });
 
   it('推理模型把探测预算用在思维链上时仍判可用，但必须给出提示', async () => {
     fetchMock.mockImplementation(() => sse([reasoning('想很久'), finish('length'), DONE]));
     const probe = await client.probeModel('reasoner');
     expect(probe.ok).toBe(true);
-    expect(probe.reasoning).toBe(true);
+    expect(probe.reasoning).toBe('yes');
     expect(probe.warning).toMatch(/推理模型/);
+  });
+
+  it('usage 旁证 + 预算被截断也走「可用 + 提示」这条既有裁决', async () => {
+    fetchMock.mockImplementation(() => sse([usageBlock(REASONING_USAGE), finish('length'), DONE]));
+    const probe = await client.probeModel('reasoner');
+    expect(probe.ok).toBe(true);
+    expect(probe.reasoning).toBe('yes');
+    expect(probe.warning).toMatch(/推理模型/);
+  });
+
+  it('预算被截断但没观测到思维链时不豁免：仍判失败（不能凭空断言它是推理模型）', async () => {
+    fetchMock.mockImplementation(() => sse([content('半截'), finish('length'), DONE]));
+    const probe = await client.probeModel('truncated/model');
+    expect(probe.ok).toBe(false);
+    expect(probe.reasoning).toBe('unknown');
+    expect(probe.reason).toMatch(/思考/);
   });
 
   it('上游拒绝时判失败，可读原因里不含上游正文', async () => {
@@ -192,7 +255,7 @@ describe('probeModel：保存前验证', () => {
     expect(probe.reason).toMatch(/空正文/);
   });
 
-  it('有独立的 20 秒上限，超时即判失败（不沿用路由的模型预算）', async () => {
+  it('有独立的 30 秒上限，超时即判失败（不沿用路由的模型预算）', async () => {
     vi.useFakeTimers();
     fetchMock.mockImplementation((_url: unknown, init?: RequestInit) => new Promise((_resolve, reject) => {
       init?.signal?.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')));
@@ -201,7 +264,12 @@ describe('probeModel：保存前验证', () => {
     await vi.advanceTimersByTimeAsync(client.MODEL_PROBE_TIMEOUT_MS);
     const probe = await pending;
     expect(probe.ok).toBe(false);
-    expect(probe.reason).toMatch(/总超时（20s）/);
+    expect(probe.reason).toMatch(/总超时（30s）/);
+  });
+
+  it('探测独立超时仍远小于路由的 maxDuration，慢模型不会被平台砍掉', async () => {
+    expect(client.MODEL_PROBE_TIMEOUT_MS).toBeLessThan(60_000);
+    expect(client.MODEL_PROBE_TIMEOUT_MS).toBeGreaterThan(20_000);
   });
 });
 

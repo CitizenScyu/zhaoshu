@@ -16,7 +16,8 @@ import { probeModel, resetModelCache } from '@/lib/llm';
 
 // owner 切换 LLM 模型：GET 看当前值与来源，PATCH 保存（保存前先用新模型发一次极小请求验证）。
 // 只处理模型名：LLM_BASE_URL / LLM_API_KEY 永远留在环境变量里，这里不读、不写、不返回。
-// 探针最长 20s，加上读库/写库余量，60s 足够。
+// 探针最长 30s（MODEL_PROBE_TIMEOUT_MS）+ 读库/写库余量，60s 足够；改探针超时必须同步
+// 检查这里的前台预算，探测失败被平台砍掉 60s 会让 owner 看到没有任何原因的失败。
 export const maxDuration = 60;
 
 const MAX_BODY_BYTES = 4 * 1024;

@@ -6,8 +6,8 @@
 // 2. 渠道偶发把中文请求搞成 mojibake，请求体统一 ASCII 转义消除这个变量
 // 3. 公益渠道吞吐波动极大（同样任务 37s~180s+），所以加空闲超时 + 一次重试
 import { cleanString, hasInvalidDatabaseCharacters, isRecord } from './sanitize';
-import { parseLlmUsage, type LlmCallUsage, type LlmUsage } from './llm-usage';
-import { environmentModel, readModelSetting } from './app-settings';
+import { parseLlmUsage, reasoningTokenCount, type LlmCallUsage, type LlmUsage } from './llm-usage';
+import { environmentModel, readModelSetting, type ReasoningVerdict } from './app-settings';
 
 const BASE_URL = process.env.LLM_BASE_URL || 'https://api.cloud.us.kg/v1';
 const API_KEY = process.env.LLM_API_KEY || '';
@@ -549,13 +549,24 @@ export async function chatRobust(
 // 2026-09-16 的找书故障就是「换成了一个不能用的模型」：验证要证明候选模型此刻真的能
 // 出正文，而不是等 owner 保存完再让整个找书功能去试错。
 // 独立短超时，不沿用路由的模型预算；失败只回可读原因，绝不回显上游正文。
-export const MODEL_PROBE_TIMEOUT_MS = 20_000;
-export const MODEL_PROBE_MAX_TOKENS = 64;
+//
+// 2026-09-17 的修正（判据说谎）：旧探针用「只回一个词 / Say OK」+ 64 token 去问，模型
+// 根本不需要思考，自然不吐 reasoning_content，于是把真推理模型（claude-opus-5-88）报成
+// 「不是推理模型」——护栏在最需要它的场景下说谎。两处改动：
+//   a) 探测问题改成需要分步计算的小题、预算提到 512：让模型**有机会**真的思考；
+//   b) 判定改成三态：只有观测到思维链增量 / 网关自报 reasoning_tokens > 0 才说 'yes'，
+//      观测不到只能说 'unknown'——一次小探测没有资格断言「不是推理模型」。
+export const MODEL_PROBE_TIMEOUT_MS = 30_000;
+export const MODEL_PROBE_MAX_TOKENS = 512;
+// 需要一两步推理的小题：非推理模型直接答，真推理模型会先出思维链。
+export const MODEL_PROBE_SYSTEM = '你是模型连通性探测，只回答一个简单的分步计算题。';
+export const MODEL_PROBE_USER =
+  '一件商品单价 17 元，买 23 件；总价打 8 折后再减 5 元，最终应付多少元？先分步计算，最后一行只写数字。';
 
 export interface ModelProbeResult {
   ok: boolean;
-  /** 返回里出现过思维链就是推理模型（找书变慢的直接征兆）。 */
-  reasoning: boolean;
+  /** 只有真的观测到思维链才是 'yes'；没观测到只能是 'unknown'（见 ReasoningVerdict）。 */
+  reasoning: ReasoningVerdict;
   /** ok=false 时的可读原因；已脱敏，不含上游正文。 */
   reason: string;
   /** ok=true 时仍需提示 owner 的注意事项。 */
@@ -566,25 +577,40 @@ const REASONING_PROBE_WARNING =
   '该模型是推理模型：思维链与正文共享 max_tokens，会把单次找书拖慢（2026-09-16 的找书故障就是这个征兆）。'
   + `探测预算（${MODEL_PROBE_MAX_TOKENS} token）已被思维链用尽，正式调用请确认 LLM_MAX_TOKENS 足够。`;
 
+// 判据只接受「观测到的证据」：思维链增量，或网关自己报的 reasoning_tokens > 0。
+// 两者都没有时返回 'unknown'，绝不返回 'no'——本次探测可能只是没触发思考。
+function reasoningVerdict(observedDelta: boolean, observedReasoningTokens: number): ReasoningVerdict {
+  return observedDelta || observedReasoningTokens > 0 ? 'yes' : 'unknown';
+}
+
 export async function probeModel(model: string): Promise<ModelProbeResult> {
-  let reasoning = false;
+  let observedDelta = false;
+  let observedReasoningTokens = 0;
   try {
     // 与正式调用同一条流式路径，避免"非流式能过、流式不能用"的假阳性。
-    await chat('你是模型连通性探测，只回一个词。', 'Say OK', {
+    await chat(MODEL_PROBE_SYSTEM, MODEL_PROBE_USER, {
       model,
       maxTokens: MODEL_PROBE_MAX_TOKENS,
       totalTimeoutMs: MODEL_PROBE_TIMEOUT_MS,
       idleTimeoutMs: MODEL_PROBE_TIMEOUT_MS,
       temperature: 0,
-      onReasoning: () => { reasoning = true; },
+      onReasoning: () => { observedDelta = true; },
+      // 旁证：部分网关只在 usage 里报思维链 token。onUsage 在 finally 里回调，
+      // 所以「正文被思维链吃光」这条失败路径也拿得到 usage。
+      onUsage: (call) => {
+        observedReasoningTokens = Math.max(observedReasoningTokens, reasoningTokenCount(call.usage));
+      },
     });
-    return { ok: true, reasoning, reason: '', warning: '' };
+    return {
+      ok: true, reasoning: reasoningVerdict(observedDelta, observedReasoningTokens), reason: '', warning: '',
+    };
   } catch (error) {
-    // 推理模型在 64 token 的探测预算下正文必然为空：上游已经正常返回并出了 token，
+    const reasoning = reasoningVerdict(observedDelta, observedReasoningTokens);
+    // 推理模型仍可能把 512 token 的探测预算全花在思维链上：上游已经正常返回并出了 token，
     // 说明模型本身可用（今天挂掉的是"正文为空 + 预算被思维链吃光"的正式调用，
     // 那是 LLM_MAX_TOKENS 的问题，不是模型不可用），所以判可用但给出提示。
-    if (reasoning && error instanceof LlmError && error.code === 'OUTPUT_TRUNCATED') {
-      return { ok: true, reasoning: true, reason: '', warning: REASONING_PROBE_WARNING };
+    if (reasoning === 'yes' && error instanceof LlmError && error.code === 'OUTPUT_TRUNCATED') {
+      return { ok: true, reasoning, reason: '', warning: REASONING_PROBE_WARNING };
     }
     const message = error instanceof LlmError ? error.message : '模型验证请求失败，请稍后重试。';
     return { ok: false, reasoning, reason: `模型验证失败：${message}`, warning: '' };
