@@ -180,3 +180,101 @@ export async function personalIsolationCase() {
   console.log(`personal-isolation：${checks}/${checks} 检查通过。`);
   return checks;
 }
+
+// worker.mjs 先建表的旧结构：没有 user_id。worker 的 CREATE TABLE IF NOT EXISTS 与
+// v5 迁移必须在两种建表顺序下收敛到同一形状。
+function legacyDownloadTasks(tx) {
+  return tx`CREATE TABLE download_tasks (
+    id serial PRIMARY KEY, book_id int NOT NULL, title text NOT NULL,
+    author text NOT NULL DEFAULT '', status text NOT NULL DEFAULT 'pending',
+    source_url text NOT NULL DEFAULT '', chapters_total int NOT NULL DEFAULT 0,
+    chapters_done int NOT NULL DEFAULT 0, chars_total int NOT NULL DEFAULT 0,
+    error text NOT NULL DEFAULT '', created_at timestamptz NOT NULL DEFAULT now(),
+    updated_at timestamptz NOT NULL DEFAULT now())`;
+}
+
+async function downloadTableShape(sql) {
+  return sql`SELECT a.attname AS column_name, a.attnotnull AS not_null
+    FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace JOIN pg_attribute a ON a.attrelid = c.oid
+    WHERE n.nspname = current_schema() AND c.relname = 'download_tasks' AND a.attnum > 0 ORDER BY a.attname`;
+}
+
+export async function downloadIsolationCase() {
+  let checks=0;
+  // 建表顺序一：worker 先按旧结构建表，且库里已有历史任务；应用侧 v5 迁移必须保留数据。
+  await withTestSchema(async(sql)=>{
+    await sql.transaction((tx)=>[
+      legacyDownloadTasks(tx),
+      tx`INSERT INTO download_tasks(book_id,title,author,status) VALUES(7,'旧任务','旧作者','running')`,
+    ]);
+    await assert.rejects(assertAuthSchema(sql));
+    await initializeAuthSchema(sql);
+    assert.deepEqual(await sql`SELECT user_id,status,title FROM download_tasks`,
+      [{user_id:1,status:'running',title:'旧任务'}]);checks++;
+    assert.equal((await downloadTableShape(sql)).find((row)=>row.column_name==='user_id')?.not_null,true);checks++;
+    await assert.rejects(sql`INSERT INTO download_tasks(book_id,title,author) VALUES(8,'缺归属','谁')`,(e)=>e.code==='23502');checks++;
+    await assert.rejects(sql`INSERT INTO download_tasks(user_id,book_id,title,author) VALUES(999,8,'孤儿','谁')`,(e)=>e.code==='23503');checks++;
+  });
+  // 建表顺序二：应用侧先建（auth v5 建表，业务 schema 的 CREATE TABLE IF NOT EXISTS 是空操作）。
+  await withTestSchema(async(sql)=>{
+    await initializeAuthSchema(sql);
+    await initializeBusinessSchema(sql);
+    const shape=await downloadTableShape(sql);
+    assert.equal(shape.find((row)=>row.column_name==='user_id')?.not_null,true);checks++;
+    assert.equal((await sql`SELECT count(*)::int AS n FROM pg_indexes WHERE schemaname=current_schema()
+      AND tablename='download_tasks' AND indexname='download_tasks_active_book_idx'`)[0].n,1);checks++;
+    await sql`INSERT INTO download_tasks(user_id,book_id,title,author,status) VALUES(1,7,'共享书','谁','pending')`;
+    assert.equal((await sql`SELECT count(*)::int AS n FROM download_tasks`)[0].n,1);checks++;
+    await initializeAuthSchema(sql);await initializeBusinessSchema(sql);
+    assert.equal((await sql`SELECT count(*)::int AS n FROM download_tasks`)[0].n,1);checks++;
+  });
+  // 归属与全局去重：跨用户活动任务仍然互斥，终态任务不占锁。
+  await withTestSchema(async(sql)=>{
+    await legacyDatabase(sql);await initializeAuthSchema(sql);await initializeBusinessSchema(sql);
+    await sql.transaction((tx)=>[
+      tx`INSERT INTO users(id,username,password_hash,role) VALUES(2,'dl_member_a','fixture-password-hash','member'),(3,'dl_member_b','fixture-password-hash','member')`,
+    ]);
+    await sql`INSERT INTO download_tasks(user_id,book_id,title,author,status) VALUES(2,11,'共享书','谁','pending')`;
+    await assert.rejects(sql`INSERT INTO download_tasks(user_id,book_id,title,author,status) VALUES(3,11,'共享书','谁','pending')`,(e)=>e.code==='23505');checks++;
+    assert.deepEqual(await sql`SELECT user_id,status FROM download_tasks WHERE book_id=11`,[{user_id:2,status:'pending'}]);checks++;
+    // 并发入队同一本书只有一个活动任务；另一个必须拿到唯一键冲突而不是第二行。
+    const race=await Promise.allSettled([
+      sql`INSERT INTO download_tasks(user_id,book_id,title,author,status) VALUES(2,12,'竞态','谁','pending')`,
+      sql`INSERT INTO download_tasks(user_id,book_id,title,author,status) VALUES(3,12,'竞态','谁','pending')`,
+    ]);
+    assert.equal(race.filter((item)=>item.status==='fulfilled').length,1);
+    assert.equal(race.filter((item)=>item.status==='rejected'&&item.reason?.code==='23505').length,1);checks++;
+    await sql`INSERT INTO download_tasks(user_id,book_id,title,author,status) VALUES(3,12,'已完成','谁','done')`;
+    await sql`INSERT INTO download_tasks(user_id,book_id,title,author,status) VALUES(2,13,'已完成','谁','done')`;
+    await sql`INSERT INTO download_tasks(user_id,book_id,title,author,status) VALUES(3,13,'终态后重排','谁','pending')`;
+    assert.equal((await sql`SELECT count(*)::int AS n FROM download_tasks WHERE book_id=13`)[0].n,2);checks++;
+    // 路由谓词（route.test.ts 锁定其原文，这里只验证谓词在真实库中的效果）。
+    const own=(userId)=>sql`SELECT id,user_id,status FROM download_tasks WHERE book_id=11 AND user_id=${userId}`;
+    assert.equal((await own(3)).length,0);assert.equal((await own(2)).length,1);checks++;
+    const cancel=(userId,id)=>sql`DELETE FROM download_tasks WHERE id=${id} AND user_id=${userId}
+      AND status IN ('pending', 'failed') RETURNING id`;
+    const [{id:sharedTaskId}]=await sql`SELECT id FROM download_tasks WHERE book_id=11`;
+    assert.equal((await cancel(3,sharedTaskId)).length,0);checks++;
+    assert.deepEqual(await sql`SELECT user_id,status FROM download_tasks WHERE id=${sharedTaskId}`,[{user_id:2,status:'pending'}]);checks++;
+    await sql`INSERT INTO download_tasks(user_id,book_id,title,author,status) VALUES(2,14,'跑着','谁','running')`;
+    await sql`INSERT INTO download_tasks(user_id,book_id,title,author,status) VALUES(2,15,'失败了','谁','failed')`;
+    const [{id:runningId}]=await sql`SELECT id FROM download_tasks WHERE book_id=14`;
+    const [{id:failedId}]=await sql`SELECT id FROM download_tasks WHERE book_id=15`;
+    assert.equal((await cancel(2,runningId)).length,0);
+    assert.equal((await sql`SELECT status FROM download_tasks WHERE id=${runningId}`)[0].status,'running');checks++;
+    assert.equal((await cancel(2,failedId)).length,1);checks++;
+  });
+  // 既有冲突活动任务：v5 的唯一索引让迁移中止，且不删除任何既有行。
+  await withTestSchema(async(sql)=>{
+    await sql.transaction((tx)=>[
+      legacyDownloadTasks(tx),
+      tx`INSERT INTO download_tasks(book_id,title,author,status) VALUES(20,'冲突A','谁','pending')`,
+      tx`INSERT INTO download_tasks(book_id,title,author,status) VALUES(20,'冲突B','谁','running')`,
+    ]);
+    await assert.rejects(initializeAuthSchema(sql));checks++;
+    assert.equal((await sql`SELECT count(*)::int AS n FROM download_tasks WHERE book_id=20`)[0].n,2);checks++;
+    await assert.rejects(assertAuthSchema(sql));checks++;
+  });
+  console.log(`download-isolation：${checks}/${checks} 检查通过。`);
+  return checks;
+}
