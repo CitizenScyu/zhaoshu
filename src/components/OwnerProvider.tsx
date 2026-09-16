@@ -1,22 +1,37 @@
 'use client';
 
-import { createContext, useCallback, useContext, useEffect, useRef, useState } from 'react';
-import { createOwnerRequest } from '@/lib/owner-request';
-import { OwnerSession } from '@/lib/owner-session';
+import { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react';
+import { AuthController } from '@/lib/auth-client';
+import type { AuthPhase, AuthUser, LegacyTokenStore, Permission } from '@/lib/auth-client';
+import { forgetHistory } from '@/lib/recent-queries';
 
 interface OwnerContextValue {
-  token: string;
-  sessionId: number;
+  /** 认证状态是否已经确定（无论是否已登录）。 */
   ready: boolean;
+  status: AuthPhase;
+  user: AuthUser | null;
+  permissions: Record<Permission, boolean>;
+  authMethod: 'owner-header' | 'session' | null;
+  accountsEnabled: boolean;
+  /** Cookie 失效被服务端拒绝过：只作提示，不代表已切换身份。 */
+  expired: boolean;
+  /** 前端请求代际；数据库 session token 永远不在这里。 */
+  sessionId: number;
   sessionOnly: boolean;
   setSessionOnly: (value: boolean) => void;
   submitToken: (draft: string) => Promise<void>;
-  logout: () => void;
+  login: (username: string, password: string, remember: boolean) => Promise<void>;
+  logout: () => Promise<void>;
+  refresh: () => Promise<void>;
   apiFetch: (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
+  can: (permission: Permission) => boolean;
 }
 
 const OwnerContext = createContext<OwnerContextValue | null>(null);
 const STORAGE_KEY = 'novel-finder-owner-token';
+// 跨标签回退信号键：只写时间戳，不含任何凭据。
+const AUTH_SIGNAL_KEY = 'novel-finder-auth-signal';
+const AUTH_CHANNEL_NAME = 'novel-finder-auth';
 
 function readStoredToken(area: 'localStorage' | 'sessionStorage'): string {
   try {
@@ -39,100 +54,110 @@ function storeToken(token: string, sessionOnly: boolean) {
   }
 }
 
-export function OwnerProvider({ children }: { children: React.ReactNode }) {
-  // A successful submission also refreshes consumers when the token is unchanged.
-  const [credentials, setCredentials] = useState(() => new OwnerSession('', 0));
-  const currentSession = useRef(credentials);
-  const [ready, setReady] = useState(false);
-  const [sessionOnly, setSessionOnlyState] = useState(false);
-  const currentSessionOnly = useRef(false);
-  const validation = useRef<AbortController | null>(null);
+const LEGACY_STORE: LegacyTokenStore = {
+  read: () => readStoredToken('sessionStorage') || readStoredToken('localStorage'),
+  readSessionOnly: () => Boolean(readStoredToken('sessionStorage')),
+  write: storeToken,
+  clear: () => storeToken('', false),
+};
 
-  const replaceSession = useCallback((token: string) => {
-    const previous = currentSession.current;
-    const next = new OwnerSession(token, previous.id + 1);
-    currentSession.current = next;
-    previous.close();
-    setCredentials(next);
-  }, []);
+// Cookie 变更没有 storage 事件；优先 BroadcastChannel，只广播非秘密通知。
+function createAuthNotifier(onExternalChange: () => void): { notify: () => void; dispose: () => void } {
+  if (typeof window === 'undefined') return { notify: () => {}, dispose: () => {} };
+  const channel = typeof BroadcastChannel === 'function' ? new BroadcastChannel(AUTH_CHANNEL_NAME) : null;
+  const onMessage = () => onExternalChange();
+  const onStorage = (event: StorageEvent) => {
+    if (event.key !== null && event.key !== AUTH_SIGNAL_KEY) return;
+    onExternalChange();
+  };
+  if (channel) channel.addEventListener('message', onMessage);
+  else window.addEventListener('storage', onStorage);
+  const onVisible = () => { if (document.visibilityState === 'visible') onExternalChange(); };
+  document.addEventListener('visibilitychange', onVisible);
+  return {
+    notify: () => {
+      try { channel?.postMessage({ type: 'auth-changed' }); } catch { /* 通道已关闭 */ }
+      if (!channel) {
+        try { window.localStorage.setItem(AUTH_SIGNAL_KEY, String(Date.now())); } catch { /* 存储被禁用 */ }
+      }
+    },
+    dispose: () => {
+      if (channel) { channel.removeEventListener('message', onMessage); channel.close(); }
+      else window.removeEventListener('storage', onStorage);
+      document.removeEventListener('visibilitychange', onVisible);
+    },
+  };
+}
+
+export function OwnerProvider({ children }: { children: React.ReactNode }) {
+  const [controller] = useState(() => new AuthController({
+    origin: () => (typeof window === 'undefined' ? 'https://internal.invalid' : window.location.origin),
+    storage: LEGACY_STORE,
+  }));
+  const [snapshot, setSnapshot] = useState(() => controller.state);
 
   useEffect(() => {
-    let active = true;
-    queueMicrotask(() => {
-      if (!active) return;
-      const session = readStoredToken('sessionStorage');
-      const stored = session || readStoredToken('localStorage');
-      currentSessionOnly.current = Boolean(session);
-      setSessionOnlyState(Boolean(session));
-      // Always create a live generation, including after Strict Mode's effect replay.
-      replaceSession(stored);
-      setReady(true);
-    });
-    const onStorage = (event: StorageEvent) => {
-      if (currentSessionOnly.current || (event.key !== STORAGE_KEY && event.key !== null)) return;
-      try { if (event.storageArea !== window.localStorage) return; } catch { return; }
-      // Read the latest value; queued storage events may describe older values.
-      const stored = readStoredToken('localStorage');
-      if (stored === currentSession.current.token) return;
-      validation.current?.abort();
-      validation.current = null;
-      replaceSession(stored);
-    };
-    window.addEventListener('storage', onStorage);
+    const notifier = createAuthNotifier(() => { void controller.handleExternalChange().catch(() => {}); });
+    controller.setNotify(() => notifier.notify());
+    const unsubscribe = controller.subscribe(() => setSnapshot(controller.state));
+    // Always create a live generation, including after Strict Mode's effect replay.
+    queueMicrotask(() => { void controller.start().catch(() => {}); });
     return () => {
-      active = false;
-      validation.current?.abort();
-      currentSession.current.close();
-      window.removeEventListener('storage', onStorage);
+      controller.setNotify(null);
+      unsubscribe();
+      notifier.dispose();
+      controller.close();
     };
-  }, [replaceSession]);
+  }, [controller]);
 
-  const setSessionOnly = useCallback((value: boolean) => {
-    currentSessionOnly.current = value;
-    storeToken(credentials.token, value);
-    setSessionOnlyState(value);
-  }, [credentials.token]);
-
-  const submitToken = useCallback(async (draft: string) => {
-    const clean = draft.trim();
-    if (!clean) throw new Error('请先输入访问口令');
-    validation.current?.abort();
-    const controller = new AbortController();
-    validation.current = controller;
-    try {
-      const res = await fetch(createOwnerRequest('/api/owner', {
-        cache: 'no-store',
-        signal: AbortSignal.any([controller.signal, AbortSignal.timeout(15_000)]),
-      }, clean, window.location.origin));
-      controller.signal.throwIfAborted();
-      if (!res.ok) {
-        throw new Error(res.status === 401
-          ? '口令不正确，当前口令未更改'
-          : '暂时无法验证口令，请稍后重试');
-      }
-      storeToken(clean, sessionOnly);
-      replaceSession(clean);
-    } finally {
-      if (validation.current === controller) validation.current = null;
-    }
-  }, [sessionOnly, replaceSession]);
-
-  const logout = useCallback(() => {
-    validation.current?.abort();
-    validation.current = null;
-    storeToken('', false);
-    replaceSession('');
-  }, [replaceSession]);
-
-  const apiFetch = useCallback(async (input: RequestInfo | URL, init: RequestInit = {}) => {
-    return credentials.fetch(input, init, window.location.origin);
-  }, [credentials]);
-
-  return (
-    <OwnerContext.Provider value={{ token: credentials.token, sessionId: credentials.id, ready, sessionOnly, setSessionOnly, submitToken, logout, apiFetch }}>
-      {children}
-    </OwnerContext.Provider>
+  const setSessionOnly = useCallback((value: boolean) => controller.setLegacySessionOnly(value), [controller]);
+  const submitToken = useCallback(
+    (draft: string) => controller.loginOwner(draft, controller.state.sessionOnly),
+    [controller],
   );
+  const login = useCallback(
+    (username: string, password: string, remember: boolean) => controller.login(username, password, remember),
+    [controller],
+  );
+  const logout = useCallback(async () => {
+    // 显式退出要清掉当前用户的查询缓存：存储与模块快照一起清（设计 §6.4）。
+    const userId = controller.state.user?.id;
+    await controller.logout();
+    if (typeof userId === 'number' && userId > 0) forgetHistory(userId);
+  }, [controller]);
+  const refresh = useCallback(() => controller.refresh('visible'), [controller]);
+  const apiFetch = useCallback(
+    (input: RequestInfo | URL, init: RequestInit = {}) => controller.fetch(input, init),
+    [controller],
+  );
+  const value = useMemo<OwnerContextValue>(() => {
+    const user = snapshot.user;
+    const permissions = {
+      find: Boolean(user?.canFind),
+      read: Boolean(user?.canRead),
+      download: Boolean(user?.canDownload),
+    };
+    return {
+      ready: snapshot.phase !== 'loading',
+      status: snapshot.phase,
+      user,
+      permissions,
+      authMethod: user?.authMethod ?? null,
+      accountsEnabled: snapshot.accountsEnabled,
+      expired: snapshot.expired,
+      sessionId: snapshot.generation,
+      sessionOnly: snapshot.sessionOnly,
+      setSessionOnly,
+      submitToken,
+      login,
+      logout,
+      refresh,
+      apiFetch,
+      can: (permission: Permission) => permissions[permission],
+    };
+  }, [snapshot, setSessionOnly, submitToken, login, logout, refresh, apiFetch]);
+
+  return <OwnerContext.Provider value={value}>{children}</OwnerContext.Provider>;
 }
 
 export function useOwner() {

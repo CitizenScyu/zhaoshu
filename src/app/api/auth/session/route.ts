@@ -18,10 +18,11 @@ function ownerUser() {
 
 // 匿名或当前凭据：无 Cookie 时 200 {user:null}；有效时只返回最小用户信息，
 // 绝不返回 token / hash；过期凭据 401，库故障 503，均 no-store。
+// accountsEnabled 是前端选择登录流程所需的部署开关，不是秘密（试登录接口即可探测）。
 export async function GET(req: NextRequest) {
   if (!authAccountsEnabled()) {
     // 旧模式不触碰数据库，也不把任何凭据当作已登录。
-    return authJson({ user: null });
+    return authJson({ user: null, accountsEnabled: false });
   }
 
   const hasAuthHeaders = req.headers.get('authorization') !== null
@@ -29,13 +30,13 @@ export async function GET(req: NextRequest) {
   const cookieToken = getSessionTokenFromRequest(req);
 
   if (!hasAuthHeaders && !cookieToken) {
-    return authJson({ user: null });
+    return authJson({ user: null, accountsEnabled: true });
   }
 
   if (hasAuthHeaders) {
     const result = await verifyOwnerHeader(req);
     if (!result.ok) return result.response;
-    return authJson({ user: ownerUser() });
+    return authJson({ user: ownerUser(), accountsEnabled: true });
   }
 
   let record;
@@ -47,6 +48,7 @@ export async function GET(req: NextRequest) {
   const result = principalFromSessionRecord(record);
   if (!result.ok) return result.response;
   return authJson({
+    accountsEnabled: true,
     user: {
       id: result.principal.userId,
       username: record?.username,

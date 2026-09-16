@@ -62,7 +62,7 @@ describe('GET /api/auth/session', () => {
     vi.stubEnv('AUTH_ACCOUNTS_ENABLED', 'false');
     const res = await GET(sessionRequest({ cookie: 'nf-dev-session=anything' }));
     expect(res.status).toBe(200);
-    expect(await res.json()).toEqual({ user: null });
+    expect(await res.json()).toEqual({ user: null, accountsEnabled: false });
     expect(mocks.getSql).not.toHaveBeenCalled();
     expect(res.headers.get('Cache-Control')).toBe('private, no-store');
   });
@@ -70,7 +70,7 @@ describe('GET /api/auth/session', () => {
   it('answers {user:null} for anonymous requests in account mode', async () => {
     const res = await GET(sessionRequest());
     expect(res.status).toBe(200);
-    expect(await res.json()).toEqual({ user: null });
+    expect(await res.json()).toEqual({ user: null, accountsEnabled: true });
     expect(mocks.findSessionByToken).not.toHaveBeenCalled();
   });
 
@@ -80,6 +80,7 @@ describe('GET /api/auth/session', () => {
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body).toEqual({
+      accountsEnabled: true,
       user: {
         id: 4, username: 'reader', role: 'member',
         canFind: true, canRead: true, canDownload: false, authMethod: 'session',

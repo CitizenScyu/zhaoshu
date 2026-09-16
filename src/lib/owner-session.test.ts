@@ -70,4 +70,22 @@ describe('owner credential generations', () => {
     await expect(session.fetch('/api/read/1/index', { signal: caller.signal }, origin)).rejects.toMatchObject({ name: 'AbortError' });
     expect((await session.fetch('/api/stats', {}, origin)).status).toBe(200);
   });
+
+  it('carries the cookie transport without attaching a legacy token', async () => {
+    const transport = vi.fn(async (request: Request) => Response.json({ url: request.url }));
+    vi.stubGlobal('fetch', transport);
+    const session = new OwnerSession('', 1, 'cookie');
+    await session.fetch('/api/profile', { headers: { Authorization: 'Bearer stale' } }, origin);
+    const request = transport.mock.calls[0][0];
+    expect(request.headers.has('Authorization')).toBe(false);
+    expect(request.headers.has('x-owner-token')).toBe(false);
+    expect(request.credentials).toBe('same-origin');
+  });
+
+  it.each(['owner-header', 'cookie'] as const)('applies the H02 generation rules to the %s transport', async (kind) => {
+    vi.stubGlobal('fetch', vi.fn(async () => Response.json({ ok: true })));
+    const session = new OwnerSession(kind === 'cookie' ? '' : 'token', 1, kind);
+    session.close();
+    await expect(session.fetch('/api/find', { method: 'POST' }, origin)).rejects.toMatchObject({ name: 'AbortError' });
+  });
 });

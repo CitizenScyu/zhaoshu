@@ -37,8 +37,10 @@ describe('reader preferences and resume positions', () => {
 
   it('resumes the exact chapter, section, and relative scroll position', () => {
     expect(parseReadingProgress(JSON.stringify(saved), index)).toEqual(saved);
-    expect(readingProgressKey(42)).toBe('novel-finder-reading-progress-42');
-    expect(readingProgressKey(43)).not.toBe(readingProgressKey(42));
+    expect(readingProgressKey(42, 1)).toBe('novel-finder-reading-progress-u1-42');
+    expect(readingProgressKey(43, 1)).not.toBe(readingProgressKey(42, 1));
+    // 同一本书在两个账号下必须是两个键，不能互相覆盖进度。
+    expect(readingProgressKey(42, 2)).not.toBe(readingProgressKey(42, 1));
   });
 
   it.each([

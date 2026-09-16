@@ -1,11 +1,12 @@
 'use client';
 
-import { useEffect, useRef, useState, useSyncExternalStore } from 'react';
+import { useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
 import type { Candidate, RerankedItem, VerifiedCandidate, FeedbackStatus } from '@/lib/types';
 import { useOwner } from '@/components/OwnerProvider';
 import FeedbackForm from '@/components/FeedbackForm';
 import ReadBookLink from '@/components/ReadBookLink';
 import { isRecord } from '@/lib/sanitize';
+import { EMPTY_HISTORY, historyKeyFor, historySnapshot, rememberQuery, subscribeHistory } from '@/lib/recent-queries';
 
 // 找书三步的后端下行是真 SSE：事件 `data: <json>\n\n`。phase/progress 实时帧、
 // result 结束帧、error 错误帧（带可识别 code）。SSE 断线/超时给用户可识别错误与重试入口。
@@ -66,51 +67,16 @@ const EXAMPLE_POOL = [
   '轻松吐槽流，类似大王饶命的味儿',
 ];
 
-const HISTORY_KEY = 'novel-finder-recent-queries';
-const HISTORY_MAX = 6; // 存储上限
 const HISTORY_SHOW = 4; // 同时展示的最近条数
 const CHIP_TOTAL = 6; // chips 总数上限（最近 + 随机示例）
-
-// ---- 最近搜索历史：localStorage 的最小外部 store（useSyncExternalStore 需要稳定快照）----
-const EMPTY_HISTORY: string[] = [];
-let historyCache: string[] | null = null;
-const historyListeners = new Set<() => void>();
-
-function loadHistory(): string[] {
-  try {
-    const saved = JSON.parse(localStorage.getItem(HISTORY_KEY) ?? '[]');
-    if (Array.isArray(saved)) return saved.filter((q) => typeof q === 'string' && q);
-  } catch {
-    // 坏数据当没有
-  }
-  return [];
-}
-
-function getHistory(): string[] {
-  if (historyCache === null) historyCache = loadHistory();
-  return historyCache;
-}
-
-function subscribeHistory(listener: () => void) {
-  historyListeners.add(listener);
-  return () => historyListeners.delete(listener);
-}
-
-function rememberQuery(q: string) {
-  const next = [q, ...getHistory().filter((p) => p !== q)].slice(0, HISTORY_MAX);
-  try {
-    localStorage.setItem(HISTORY_KEY, JSON.stringify(next));
-  } catch {
-    // 存不进就算了，不影响找书
-  }
-  historyCache = next;
-  historyListeners.forEach((l) => l());
-}
 
 type Phase = 'idle' | 'recall' | 'verify' | 'rerank' | 'done' | 'error';
 
 export default function FindTab() {
-  const { apiFetch } = useOwner();
+  const { apiFetch, user } = useOwner();
+  const userId = user?.id ?? 0;
+  // 最近搜索按身份分开；旧全局键只迁给已确认的 owner。
+  const historyKey = useMemo(() => historyKeyFor(userId), [userId]);
   const [query, setQuery] = useState('');
   const [onlyThisTime, setOnlyThisTime] = useState(false); // 「仅本次有效」checkbox：默认不勾=长期
   const [verifyTotal, setVerifyTotal] = useState(0);
@@ -122,7 +88,7 @@ export default function FindTab() {
   const [error, setError] = useState('');
   const request = useRef<AbortController | null>(null);
   useEffect(() => () => { request.current?.abort(); }, [apiFetch]);
-  const history = useSyncExternalStore(subscribeHistory, getHistory, () => EMPTY_HISTORY);
+  const history = useSyncExternalStore(subscribeHistory, () => historySnapshot(historyKey), () => EMPTY_HISTORY);
 
   const recent = history.slice(0, HISTORY_SHOW);
   // 示例补位：与历史不重复，用最近一次查询做种子轮转——纯函数可在渲染期安全计算，
@@ -138,7 +104,7 @@ export default function FindTab() {
   async function run() {
     const q = query.trim();
     if (!q || phase === 'recall' || phase === 'verify' || phase === 'rerank') return;
-    rememberQuery(q);
+    rememberQuery(historyKey, q);
     setPhase('recall');
     setError('');
     setCandidates([]);

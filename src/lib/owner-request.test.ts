@@ -74,4 +74,24 @@ describe('createOwnerRequest', () => {
     expect(req.headers.has('Authorization')).toBe(false);
     expect(req.headers.has('x-owner-token')).toBe(false);
   });
+
+  it('sends no explicit credential in cookie mode but keeps the CSRF header', () => {
+    const input = new Request(`${ORIGIN}/api/find`, {
+      method: 'POST',
+      headers: { Authorization: 'Bearer stale', 'x-owner-token': 'stale', 'Content-Type': 'application/json' },
+      body: '{}',
+    });
+    const req = createOwnerRequest(input, {}, 'legacy-owner', ORIGIN, 'cookie');
+    expect(req.headers.has('Authorization')).toBe(false);
+    expect(req.headers.has('x-owner-token')).toBe(false);
+    expect(req.headers.get('X-NF-CSRF')).toBe('1');
+    expect(req.credentials).toBe('same-origin');
+    expect(req.mode).toBe('same-origin');
+    expect(req.redirect).toBe('error');
+  });
+
+  it('keeps the same URL restrictions in cookie mode', () => {
+    expect(() => createOwnerRequest('https://outside.example/api/profile', {}, '', ORIGIN, 'cookie')).toThrow(TypeError);
+    expect(() => createOwnerRequest('/profile', {}, '', ORIGIN, 'cookie')).toThrow(TypeError);
+  });
 });
