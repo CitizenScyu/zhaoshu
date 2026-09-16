@@ -8,7 +8,8 @@ vi.mock('@/lib/db', async (original) => ({ ...await original<typeof import('@/li
 
 // 显式枚举 HTTP 导出；新增路由或方法必须同时声明权限，不能悄悄变成匿名入口。
 // auth-entry 仅表示认证流程可接收匿名请求，其 CSRF/凭据/限速由各自用例验证。
-const policies: Record<string, Record<string, 'find' | 'read' | 'download' | 'legacy-owner' | 'auth-entry'>> = {
+const policies: Record<string, Record<string, 'find' | 'read' | 'download' | 'owner' | 'legacy-owner' | 'auth-entry'>> = {
+  'admin/llm': { GET: 'owner', PATCH: 'owner' },
   'auth/login': { POST: 'auth-entry' }, 'auth/logout': { POST: 'auth-entry' },
   'auth/owner': { POST: 'auth-entry' }, 'auth/session': { GET: 'auth-entry' },
   download: { GET: 'download', POST: 'download', DELETE: 'download' },
