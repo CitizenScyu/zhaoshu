@@ -134,6 +134,20 @@ describe('chat / chatRobust 用的是每次调用解析出来的模型', () => {
     await client.chat('system', 'user');
     expect(sentBody(2).model).toBe('db/model-a');
   });
+
+  it('解析设置期间被取消时，这次调用立刻以取消失败，请求不会真的打到上游', async () => {
+    const controller = new AbortController();
+    let releaseRead: (setting: { model: string | null; updatedAt: string | null }) => void = () => {};
+    settings.readModelSetting.mockImplementation(() => new Promise((resolve) => { releaseRead = resolve; }));
+    const pending = client.chatRobust('system', 'user', { signal: controller.signal });
+    await Promise.resolve();
+    controller.abort();
+    releaseRead({ model: 'db/model-a', updatedAt: null });
+    await expect(pending).rejects.toMatchObject({ message: '模型调用已取消。', retryable: false });
+    // 取消补在解析之后：这次调用带着已经中止的信号失败，上游不会被真的调用。
+    expect(fetchMock.mock.calls[0]?.[1]?.signal?.aborted).toBe(true);
+    expect(fetchMock).toHaveBeenCalledOnce();
+  });
 });
 
 describe('probeModel：保存前验证', () => {

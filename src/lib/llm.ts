@@ -190,6 +190,10 @@ export async function chat(
   const controller = new AbortController();
   const cancel = () => controller.abort();
   opts.signal?.addEventListener('abort', cancel, { once: true });
+  // 解析设置是新增的一次等待：信号若恰好在这段时间里被取消，开头的检查已经过去、
+  // 监听又刚挂上，必须显式补一次中止。这样这次调用会立刻以「已取消」失败，
+  // 已中止的信号不会真的打到上游（取消语义与解析之前完全一致）。
+  if (opts.signal?.aborted) cancel();
   const totalTimer = setTimeout(() => controller.abort(), totalMs);
   const stream = opts.stream ?? true;
   const maxTokensCeiling = configuredMaxTokens();
@@ -559,7 +563,7 @@ export interface ModelProbeResult {
 }
 
 const REASONING_PROBE_WARNING =
-  '该模型是推理模型：思维链与正文共享 max_tokens，会把单次找书拖慢（今天的故障就是这个征兆）。'
+  '该模型是推理模型：思维链与正文共享 max_tokens，会把单次找书拖慢（2026-09-16 的找书故障就是这个征兆）。'
   + `探测预算（${MODEL_PROBE_MAX_TOKENS} token）已被思维链用尽，正式调用请确认 LLM_MAX_TOKENS 足够。`;
 
 export async function probeModel(model: string): Promise<ModelProbeResult> {
