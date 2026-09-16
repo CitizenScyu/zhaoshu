@@ -2,7 +2,7 @@ import { createHash, createHmac, randomBytes } from 'node:crypto';
 import type { NextRequest } from 'next/server';
 import type { neon } from '@neondatabase/serverless';
 import { getSql } from './db';
-import { initializeAuthSchema } from './auth-store';
+import { assertAuthSchema } from './auth-store';
 
 type Sql = ReturnType<typeof neon>;
 
@@ -67,12 +67,12 @@ export function ownerCredentialTag(secret: string, ownerToken: string): string {
     .digest('hex');
 }
 
-// 冷启动懒初始化认证表；失败后允许重试，不长期缓存失败的 Promise。
+// 冷启动只校验已迁移版本；不在登录或业务请求中执行迁移，失败后允许重试。
 let authSchemaPromise: Promise<void> | null = null;
 
 export async function ensureAuthSchema(): Promise<void> {
   if (!authSchemaPromise) {
-    authSchemaPromise = initializeAuthSchema(getSql()).catch((error) => {
+    authSchemaPromise = assertAuthSchema(getSql()).catch((error) => {
       authSchemaPromise = null;
       throw error;
     });

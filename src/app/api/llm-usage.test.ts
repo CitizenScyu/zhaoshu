@@ -168,7 +168,8 @@ describe('usage instrumentation through all model routes', () => {
     await finishRequest(phase, response);
     expect(mocks.usageSql).not.toHaveBeenCalled();
     await expect(finishResponse()).resolves.toBeUndefined();
-    expect(console.error).toHaveBeenCalledWith('LLM usage write failed:', expect.objectContaining({ phase }), expect.any(Error));
+    expect(console.error).toHaveBeenCalledWith('LLM usage write failed:', expect.objectContaining({ phase }));
+    expect(JSON.stringify(vi.mocked(console.error).mock.calls)).not.toContain('usage unavailable');
     expect(fetchMock).toHaveBeenCalledOnce();
   });
 

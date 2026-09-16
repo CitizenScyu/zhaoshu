@@ -4,13 +4,13 @@ import { createHash } from 'node:crypto';
 
 const mocks = vi.hoisted(() => ({
   getSql: vi.fn(),
-  initializeAuthSchema: vi.fn(),
+  assertAuthSchema: vi.fn(),
 }));
 
 vi.mock('@/lib/db', () => ({ getSql: mocks.getSql }));
 vi.mock('@/lib/auth-store', () => ({
   AUTH_SCHEMA_VERSION: 2,
-  initializeAuthSchema: mocks.initializeAuthSchema,
+  assertAuthSchema: mocks.assertAuthSchema,
 }));
 
 import {
@@ -218,23 +218,23 @@ describe('lazy auth schema initialization', () => {
   beforeEach(() => {
     // authSchemaPromise 是模块级状态；每个用例重载模块，避免跨用例缓存泄漏。
     vi.resetModules();
-    mocks.initializeAuthSchema.mockReset();
+    mocks.assertAuthSchema.mockReset();
     mocks.getSql.mockReset();
-    mocks.initializeAuthSchema.mockResolvedValue(undefined);
+    mocks.assertAuthSchema.mockResolvedValue(undefined);
     mocks.getSql.mockReturnValue({});
   });
 
   it('shares one initialization promise across concurrent callers', async () => {
     const { ensureAuthSchema: fresh } = await import('./auth-session');
     await Promise.all([fresh(), fresh(), fresh()]);
-    expect(mocks.initializeAuthSchema).toHaveBeenCalledTimes(1);
+    expect(mocks.assertAuthSchema).toHaveBeenCalledTimes(1);
   });
 
   it('retries after a failed initialization instead of caching the failure', async () => {
-    mocks.initializeAuthSchema.mockRejectedValueOnce(new Error('db down'));
+    mocks.assertAuthSchema.mockRejectedValueOnce(new Error('db down'));
     const { ensureAuthSchema: fresh } = await import('./auth-session');
     await expect(fresh()).rejects.toThrow('db down');
     await fresh();
-    expect(mocks.initializeAuthSchema).toHaveBeenCalledTimes(2);
+    expect(mocks.assertAuthSchema).toHaveBeenCalledTimes(2);
   });
 });

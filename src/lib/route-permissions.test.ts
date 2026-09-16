@@ -12,13 +12,13 @@ const policies: Record<string, Record<string, 'find' | 'legacy-owner' | 'auth-en
   'auth/login': { POST: 'auth-entry' }, 'auth/logout': { POST: 'auth-entry' },
   'auth/owner': { POST: 'auth-entry' }, 'auth/session': { GET: 'auth-entry' },
   download: { GET: 'legacy-owner', POST: 'legacy-owner', DELETE: 'legacy-owner' },
-  'download/[id]/file': { GET: 'legacy-owner' }, export: { GET: 'legacy-owner' },
+  'download/[id]/file': { GET: 'legacy-owner' }, export: { GET: 'find' },
   feedback: { GET: 'find', POST: 'find' }, find: { POST: 'find' },
   library: { GET: 'legacy-owner' }, owner: { GET: 'legacy-owner' },
   profile: { GET: 'find', PUT: 'find', POST: 'find' },
   'read/[id]/[resource]': { GET: 'legacy-owner' }, recommendations: { GET: 'find' },
   shelf: { POST: 'find', DELETE: 'find' }, shuyuan: { GET: 'legacy-owner', POST: 'legacy-owner' },
-  stats: { GET: 'legacy-owner' },
+  stats: { GET: 'find' },
 };
 const loaders = import.meta.glob('../app/api/**/route.ts');
 const sourceLoaders = import.meta.glob('../app/api/**/route.ts', { query: '?raw', import: 'default' });

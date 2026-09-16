@@ -14,6 +14,9 @@ class AuthResponseError extends Error {
 }
 
 export function personalError(error: unknown): { status: number; code: string; message: string } {
+  if (error && typeof error === 'object' && 'code' in error && error.code === 'AUTH_SCHEMA_MIGRATION_REQUIRED') {
+    return { status: 503, code: 'AUTH_SCHEMA_MIGRATION_REQUIRED', message: '个人数据迁移尚未就绪，请联系维护者。' };
+  }
   if (error instanceof DeadlineExceededError || (error && typeof error === 'object' && 'code' in error && error.code === '57014')) {
     return { status: 504, code: 'DEADLINE_EXCEEDED', message: '请求预算已耗尽，请稍后重试。' };
   }

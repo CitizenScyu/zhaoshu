@@ -70,18 +70,20 @@ describe('LLM usage storage and aggregates (mocked Neon HTTP queries)', () => {
     const { recordLlmUsage } = await import('./db');
     await expect(recordLlmUsage(record)).resolves.toBeUndefined();
     expect(console.error).toHaveBeenCalledWith(
-      'LLM usage write failed:', { phase: 'find_recall', model: 'test-model', requestId: 'request-123' }, expect.any(Error),
+      'LLM usage write failed:', { phase: 'find_recall', model: 'test-model', requestId: 'request-123' },
     );
   });
 
   it('retries failed usage initialization and leaves the main schema usable', async () => {
     mocks.sql.mockImplementation((parts: TemplateStringsArray) => {
       if (parts.join('').includes('llm_usage')) throw new Error('usage DDL unavailable');
+      if (parts.join('').includes('SELECT max(version)')) return [{ version: 4 }];
       return [];
     });
     const { ensureSchema, recordLlmUsage } = await import('./db');
     await recordLlmUsage(record);
     await expect(ensureSchema()).resolves.toBeUndefined();
+    expect(mocks.sql.mock.calls.map(queryText).join(' ')).not.toContain('recommendations_book_query_idx');
     mocks.sql.mockResolvedValue([]);
     await recordLlmUsage(record);
     expect(mocks.sql.mock.calls.filter((call) => queryText(call).includes('CREATE TABLE IF NOT EXISTS llm_usage'))).toHaveLength(2);

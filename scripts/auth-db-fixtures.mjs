@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { neon } from '@neondatabase/serverless';
 
 export function requireTestDatabaseUrl() {
-  const value = process.env.TEST_DATABASE_URL;
+  const value = process.env.TEST_DATABASE_URL?.trim();
   if (!value) throw Object.assign(new Error('TEST_DATABASE_URL is required; no environment files or DATABASE_URL fallback.'), { exitCode: 2 });
   return value;
 }
