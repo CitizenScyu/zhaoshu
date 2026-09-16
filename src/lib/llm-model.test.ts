@@ -223,11 +223,28 @@ describe('probeModel：保存前验证的三态推理判定', () => {
     expect(probe.warning).toMatch(/推理模型/);
   });
 
-  it('usage 旁证 + 预算被截断也走「可用 + 提示」这条既有裁决', async () => {
-    fetchMock.mockImplementation(() => sse([usageBlock(REASONING_USAGE), finish('length'), DONE]));
-    const probe = await client.probeModel('reasoner');
-    expect(probe.ok).toBe(true);
+  // 现实顺序（OpenAI include_usage 就这么发）：usage 块在 finish_reason **之后**。
+  // reader 在 finish_reason 处就抛错中断，「截断路径也拿得到 usage」在真实顺序下**不成立**。
+  // 所以这条路径只能 fail-closed：宁可多挡一次保存，也不靠读不到的旁证说它是推理模型。
+  // （审查方 2026-09-17 指出旧用例把 usage 摆在 finish 前面，是虚的；这里改成真实顺序。）
+  it('usage 块在 finish_reason 之后时读不到：只有 usage 旁证、没有思维链增量 → 判失败而不是放行', async () => {
+    fetchMock.mockImplementation(() => sse([
+      content('半截'), finish('length'), usageBlock(REASONING_USAGE), DONE,
+    ]));
+    const probe = await client.probeModel('usage-only-reasoner');
+    expect(probe.reasoning).toBe('unknown');
+    expect(probe.ok).toBe(false);
+    expect(probe.reason).toMatch(/思考/);
+  });
+
+  it('usage 块与 finish_reason 同在一个事件里时读得到（两种真实出法都要认）', async () => {
+    fetchMock.mockImplementation(() => sse([
+      data({ choices: [{ index: 0, delta: {}, finish_reason: 'length' }], usage: REASONING_USAGE }),
+      DONE,
+    ]));
+    const probe = await client.probeModel('same-chunk-reasoner');
     expect(probe.reasoning).toBe('yes');
+    expect(probe.ok).toBe(true);
     expect(probe.warning).toMatch(/推理模型/);
   });
 
