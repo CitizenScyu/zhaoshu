@@ -16,8 +16,8 @@ const policies: Record<string, Record<string, 'find' | 'legacy-owner' | 'auth-en
   feedback: { GET: 'find', POST: 'find' }, find: { POST: 'find' },
   library: { GET: 'legacy-owner' }, owner: { GET: 'legacy-owner' },
   profile: { GET: 'find', PUT: 'find', POST: 'find' },
-  'read/[id]/[resource]': { GET: 'legacy-owner' }, recommendations: { GET: 'legacy-owner' },
-  shelf: { POST: 'legacy-owner', DELETE: 'legacy-owner' }, shuyuan: { GET: 'legacy-owner', POST: 'legacy-owner' },
+  'read/[id]/[resource]': { GET: 'legacy-owner' }, recommendations: { GET: 'find' },
+  shelf: { POST: 'find', DELETE: 'find' }, shuyuan: { GET: 'legacy-owner', POST: 'legacy-owner' },
   stats: { GET: 'legacy-owner' },
 };
 const loaders = import.meta.glob('../app/api/**/route.ts');
