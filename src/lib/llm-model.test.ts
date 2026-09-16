@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { chatRobust } from './llm';
 
 // 只替换设置读取这一层：解析优先级、缓存、失败回退与保存前验证都走真实实现。
 const settings = vi.hoisted(() => ({ readModelSetting: vi.fn() }));
@@ -187,5 +188,29 @@ describe('probeModel：保存前验证', () => {
     const probe = await pending;
     expect(probe.ok).toBe(false);
     expect(probe.reason).toMatch(/总超时（20s）/);
+  });
+});
+
+// 29.5：三个既有调用点（find 的 recall/rerank、profile、feedback）都只经 chatRobust/chat，
+// 模型只能来自运行时解析——不写死模型名、不读 LLM_MODEL，类型上也没有 model 覆盖入口。
+describe('既有调用点没有模型旁路', () => {
+  const sources = import.meta.glob('../app/api/**/route.ts', {
+    query: '?raw', import: 'default', eager: true,
+  }) as Record<string, string>;
+
+  it.each(['find', 'profile', 'feedback'])('%s 路由不写死模型名也不读 LLM_MODEL', (route) => {
+    const source = sources[`../app/api/${route}/route.ts`];
+    expect(source).toBeDefined();
+    expect(source).toMatch(/from '@\/lib\/llm'/);
+    expect(source).not.toContain('claude-opus-5-88');
+    expect(source).not.toContain('LLM_MODEL');
+  });
+
+  it('chatRobust 的选项里没有 model，调用点在类型上就无法旁路运行时解析', () => {
+    // @ts-expect-error chatRobust 只接受 Pick<ChatOptions, ...> 的子集，model 不在其中。
+    // 一旦有人把 model 加回 chatRobust 的选项，这行会变成「未使用的 @ts-expect-error」，
+    // tsc --noEmit 直接失败。
+    const rejectedAtCompileTime = () => chatRobust('system', 'user', { model: 'hardcoded-model' });
+    expect(rejectedAtCompileTime).toBeTypeOf('function');
   });
 });
