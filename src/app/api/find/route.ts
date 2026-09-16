@@ -53,31 +53,42 @@ function modelList(raw: string, field: 'candidates' | 'items', max: number): unk
   return list;
 }
 
-// 第一次尝试只拿整步预算的一部分：上游推理模型单步常见 130–150s，60% 装得下，
-// 同时给第二次尝试留出时间。
-const FIRST_ATTEMPT_RATIO = 0.6;
 // 剩余预算低于这个值就放弃第二次尝试——一次上游往返至少要留下可用的时间。
 const MIN_SECOND_ATTEMPT_MS = 5_000;
 
-// 正文解析（parseJson / modelList）发生在 chatRobust 之外，所以它的失败根本不会触发
-// chatRobust 的重试；而且 chatRobust 的 totalTimeoutMs 就是整步预算，第一次尝试一旦
-// 耗尽就再没有预算。这里补上真正的恢复路径：两次尝试共享同一个截止时间——第一次用
-// 有界子预算，正文解析不出预期结构时用该步剩余预算再试一次。总耗时绝不超过 budgetMs，
-// 重试不抬高整步预算（deadline 不变量）。模型调用本身失败不在这里重试，直接上抛，
-// 那是 chatRobust 自己的职责。
+// 单步模型调用的恢复路径。只有一次额外尝试，且两次共享同一个截止时间：
+// 总耗时绝不超过 budgetMs，重试不重获整份预算（deadline 不变量）。
+//
+// 第一次尝试拿**满**整步预算，不预切：上游推理模型「正常但慢」是最常见的失败模式
+// （实测单步 190s 上下），预切预算会把本来能成功的调用硬切掉，还会顺带耗光
+// chatRobust 内部重试的余量。恢复只发生在「第一次没花完整步预算就结束」的情形：
+// - 正文解析不出预期结构（parseJson / modelList 在 chatRobust 之外，不会触发它的重试）；
+// - 模型调用抛可重试错误（超时、上游 5xx）且剩余预算够。
+// 不可重试的模型错误（密钥、取消、内容过滤）重试没有意义，直接上抛。
 async function modelStep<T>(
   budgetMs: number,
   call: (totalTimeoutMs: number) => Promise<string>,
   parse: (content: string) => T,
 ): Promise<T> {
   const stepDeadline = Date.now() + budgetMs;
-  const content = await call(Math.max(1, Math.floor(budgetMs * FIRST_ATTEMPT_RATIO)));
+  const remainingMs = () => stepDeadline - Date.now();
+
+  let content: string;
+  try {
+    content = await call(budgetMs);
+  } catch (error) {
+    if (error instanceof LlmError && !error.retryable) throw error;
+    const left = remainingMs();
+    if (left < MIN_SECOND_ATTEMPT_MS) throw error;
+    return parse(await call(left));
+  }
+
   try {
     return parse(content);
   } catch (error) {
-    const remainingMs = stepDeadline - Date.now();
-    if (remainingMs < MIN_SECOND_ATTEMPT_MS) throw error;
-    return parse(await call(remainingMs));
+    const left = remainingMs();
+    if (left < MIN_SECOND_ATTEMPT_MS) throw error;
+    return parse(await call(left));
   }
 }
 

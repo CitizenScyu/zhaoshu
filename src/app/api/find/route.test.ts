@@ -25,6 +25,7 @@ vi.mock('@/lib/llm', async (importOriginal) => ({
 }));
 vi.mock('@/lib/douban', () => ({ verifyBatch: mocks.verifyBatch }));
 vi.mock('@/lib/source-verification', () => ({ supplementSourceEvidence: mocks.supplementSourceEvidence }));
+import { LlmError } from '@/lib/llm';
 import { POST } from './route';
 
 const candidate = {
@@ -289,17 +290,60 @@ describe('POST /api/find output contract', () => {
     expect(mocks.chatRobust.mock.calls[0][1]).toContain('仅补充存在性');
   });
 
-  // 单步模型预算是硬上限：调用方传给 chatRobust 的 totalTimeoutMs 来自它。上游推理模型
-  // 单步实测 190s 上下，220s 的 ceiling 会稳定截断；可用额 285s − 12s 写回预留 = 273s，
-  // ceiling 取 260s。第一次尝试只拿 60%，给重试留出余量。
-  it('hands a single model step a 156s first attempt inside the 260s ceiling', async () => {
+  // 单步模型预算是硬上限：调用方传给 chatRobust 的 totalTimeoutMs 来自它。第一次尝试拿满
+  // 整步预算，不预切——上游推理模型「正常但慢」更常见，预切会把能成功的 190s 调用硬切掉。
+  // 可用额 285s − 12s 写回预留 = 273s，ceiling 取 260s。
+  it('hands the first model attempt the full 260s ceiling, not a pre-cut share', async () => {
     mocks.chatRobust.mockResolvedValue(JSON.stringify({ candidates: [candidate] }));
     await consumeSSE(await POST(request({ step: 'recall', query: '找书' })));
     expect(mocks.chatRobust).toHaveBeenCalledOnce();
     const { totalTimeoutMs } = mocks.chatRobust.mock.calls[0][2];
-    expect(totalTimeoutMs).toBe(156_000); // 260s × 0.6
-    expect(totalTimeoutMs).toBeGreaterThan(132_000); // 旧的 220s ceiling 只给到这里
-    expect(totalTimeoutMs).toBeLessThan(260_000);
+    expect(totalTimeoutMs).toBe(260_000);
+    // 旧的 220s ceiling 会在 190s 级的调用上提前截断。
+    expect(totalTimeoutMs).toBeGreaterThan(220_000);
+  });
+
+  // 回归护栏：第一次「超时」不能白白扔掉剩余预算。模型调用抛可重试错误、但剩下时间够时，
+  // 必须让恢复路径接住它，而不是直接上抛。
+  it('recovers when the first attempt times out and budget remains', async () => {
+    let clock = Date.now();
+    vi.spyOn(Date, 'now').mockImplementation(() => clock);
+    mocks.chatRobust
+      .mockImplementationOnce(async () => {
+        clock += 100_000; // 第一次尝试超时前已经花掉 100s
+        throw new LlmError('LLM 总超时（260s）');
+      })
+      .mockImplementationOnce(async () => JSON.stringify({ candidates: [candidate] }));
+
+    const events = await consumeSSE(await POST(request({ step: 'recall', query: '找书' })));
+
+    expect(lastEvent<{ candidates: unknown[] }>(events, 'result').candidates).toHaveLength(1);
+    expect(mocks.chatRobust).toHaveBeenCalledTimes(2);
+    const budgets = mocks.chatRobust.mock.calls.map((call) => (call[2] as { totalTimeoutMs: number }).totalTimeoutMs);
+    expect(budgets[0]).toBe(260_000);
+    expect(budgets[1]).toBe(160_000); // 260s − 已用 100s，不重获整份
+    expect(100_000 + budgets[1]).toBeLessThanOrEqual(260_000);
+  });
+
+  it('rethrows a first-attempt timeout once no budget is left to retry', async () => {
+    let clock = Date.now();
+    vi.spyOn(Date, 'now').mockImplementation(() => clock);
+    mocks.chatRobust.mockImplementation(async () => {
+      clock += 260_000; // 第一次就用完整步预算
+      throw new LlmError('LLM 总超时（260s）');
+    });
+
+    const events = await consumeSSE(await POST(request({ step: 'recall', query: '找书' })));
+
+    expect(lastEvent<{ code: string }>(events, 'error').code).toBe('LLM_ERROR');
+    expect(mocks.chatRobust).toHaveBeenCalledOnce();
+  });
+
+  it('does not retry a non-retryable model failure even with budget left', async () => {
+    mocks.chatRobust.mockRejectedValue(new LlmError('模型调用已取消。', false));
+    const events = await consumeSSE(await POST(request({ step: 'recall', query: '找书' })));
+    expect(lastEvent<{ code: string }>(events, 'error').code).toBe('LLM_ERROR');
+    expect(mocks.chatRobust).toHaveBeenCalledOnce();
   });
 
   // parseJson / modelList 的失败发生在 chatRobust 之外，不重试就永远拉不回来。
@@ -337,7 +381,7 @@ describe('POST /api/find output contract', () => {
     expect(lastEvent<{ candidates: unknown[] }>(events, 'result').candidates).toHaveLength(1);
     expect(mocks.chatRobust).toHaveBeenCalledTimes(2);
     const budgets = mocks.chatRobust.mock.calls.map((call) => (call[2] as { totalTimeoutMs: number }).totalTimeoutMs);
-    expect(budgets[0]).toBe(156_000); // 260s × 0.6
+    expect(budgets[0]).toBe(260_000);
     expect(budgets[1]).toBe(110_000); // 260s − 已用 150s，不是又一份 260s
     expect(150_000 + budgets[1]).toBeLessThanOrEqual(260_000);
   });
