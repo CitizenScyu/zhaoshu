@@ -288,4 +288,18 @@ describe('POST /api/find output contract', () => {
     expect(lastEvent<{ type: string; items: unknown[] }>(reranked, 'result').items[0]).toMatchObject({ sourceEvidence: evidence, douban: missing });
     expect(mocks.chatRobust.mock.calls[0][1]).toContain('仅补充存在性');
   });
+
+  // 单步模型预算是硬上限：调用方传给 chatRobust 的 totalTimeoutMs 就等于它，第一次
+  // 尝试就会吃掉整份预算（重试路径因此永不生效）。上游推理模型单步实测 190s 上下，
+  // 220s 会稳定截断；可用额 285s − 12s 写回预留 = 273s，ceiling 取 260s。
+  it('hands a single model step the full 260s ceiling, not the old 220s', async () => {
+    mocks.chatRobust.mockResolvedValue(JSON.stringify({ candidates: [candidate] }));
+    await consumeSSE(await POST(request({ step: 'recall', query: '找书' })));
+    expect(mocks.chatRobust).toHaveBeenCalledOnce();
+    const { totalTimeoutMs } = mocks.chatRobust.mock.calls[0][2];
+    expect(totalTimeoutMs).toBe(260_000);
+    expect(totalTimeoutMs).toBeGreaterThan(220_000);
+    // 路由最坏情况（260s 模型 + 写回）仍留在 295s 平台上限内。
+    expect(totalTimeoutMs + 12_000).toBeLessThan(295_000);
+  });
 });

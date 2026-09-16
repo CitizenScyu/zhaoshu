@@ -36,7 +36,9 @@ const MAX_BODY_BYTES = 64 * 1024;
 const MAX_QUERY_LENGTH = 1_000;
 const MAX_CONDITIONS_LENGTH = 1_000;
 // 模型子预算：在内部预算里预留写回，并向一次回调分配剩余时间，避免最后时刻被模型/写回吃光。
-const MODEL_CEILING_MS = 220_000;
+// 可用额 = 285s 内部预算 − 12s 写回 reserve = 273s；ceiling 取 260s 留 13s 余量。
+// 上游是推理模型，思考链会把单步拉到 190s 上下，旧的 220s 会稳定截断。
+const MODEL_CEILING_MS = 260_000;
 
 // 模型输出始终从 unknown 收窄；数量异常也属于上游错误，不能当成内部 500。
 function modelList(raw: string, field: 'candidates' | 'items', max: number): unknown[] {

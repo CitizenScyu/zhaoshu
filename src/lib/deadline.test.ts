@@ -108,4 +108,15 @@ describe('expired deadline constants', () => {
   it('keeps the model route internal budget strictly below the platform limit', () => {
     expect(MODEL_ROUTE_INTERNAL_BUDGET_MS).toBeLessThan(295_000);
   });
+
+  // find / profile / feedback 的单步模型 ceiling 是 260_000（各路由内的 const，由路由测试
+  // 断言实际下发的 totalTimeoutMs）。这里从 deadline 侧守住预算链：
+  // 可用额 = 285s 内部预算 − 12s 写回预留 = 273s > 260s，且 ceiling + 写回 < 285s。
+  it('allocates a 260s single-step ceiling inside the post-reserve budget', () => {
+    const d = createDeadline(MODEL_ROUTE_INTERNAL_BUDGET_MS);
+    expect(d.modelBudgetMs(260_000)).toBe(260_000);
+    expect(d.modelBudgetMs(260_000)).toBeGreaterThan(220_000);
+    expect(d.modelBudgetMs(260_000) + WRITE_BACK_RESERVE_MS).toBeLessThan(MODEL_ROUTE_INTERNAL_BUDGET_MS);
+    d.dispose();
+  });
 });

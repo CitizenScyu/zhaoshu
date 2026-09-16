@@ -188,4 +188,15 @@ describe('POST /api/feedback note contract', () => {
       vi.useRealTimers();
     }
   });
+
+  // 同 find：ceiling 就是 chatRobust 的总时限，220s 对推理模型的长思考流太紧。
+  it('hands the profile write-back the full 260s ceiling, not the old 220s', async () => {
+    const res = await POST(request('done', '喜欢严谨设定'));
+    expect(res.status).toBe(200);
+    expect(mocks.chatRobust).toHaveBeenCalledOnce();
+    const { totalTimeoutMs } = mocks.chatRobust.mock.calls[0][2];
+    expect(totalTimeoutMs).toBe(260_000);
+    expect(totalTimeoutMs).toBeGreaterThan(220_000);
+    expect(totalTimeoutMs + 12_000).toBeLessThan(295_000);
+  });
 });

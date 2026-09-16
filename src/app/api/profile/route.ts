@@ -17,8 +17,10 @@ export const maxDuration = 295;
 
 const MAX_BODY_BYTES = 64 * 1024;
 const MAX_SEEDS = 100;
-// 生成画像的模型子预算：在内部预算里预留写回，不足即不调用模型
-const MODEL_CEILING_MS = 220_000;
+// 生成画像的模型子预算：在内部预算里预留写回，不足即不调用模型。
+// 可用额 = 285s 内部预算 − 12s 写回 reserve = 273s；ceiling 取 260s 留 13s 余量。
+// 上游是推理模型，思考链会把单步拉到 190s 上下，旧的 220s 会稳定截断。
+const MODEL_CEILING_MS = 260_000;
 
 function isVersion(value: unknown): value is string {
   return typeof value === 'string' && value.length > 0 && value.length <= 128 &&

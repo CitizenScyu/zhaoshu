@@ -12,8 +12,10 @@ import { feedbackNeedsConfirmation } from '@/lib/feedback';
 export const maxDuration = 295;
 
 const MAX_BODY_BYTES = 8 * 1024;
-// 反馈回写画像的模型子预算：在内部预算里预留写回
-const MODEL_CEILING_MS = 220_000;
+// 反馈回写画像的模型子预算：在内部预算里预留写回。
+// 可用额 = 285s 内部预算 − 12s 写回 reserve = 273s；ceiling 取 260s 留 13s 余量。
+// 上游是推理模型，思考链会把单步拉到 190s 上下，旧的 220s 会稳定截断。
+const MODEL_CEILING_MS = 260_000;
 
 const VALID: FeedbackStatus[] = ['want', 'reading', 'done', 'dropped'];
 
