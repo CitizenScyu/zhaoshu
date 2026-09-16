@@ -22,10 +22,15 @@ export async function GET(req: NextRequest) {
                 AND dt.status = 'done'
               ORDER BY dt.id DESC LIMIT 1) AS read_task_id,
              COALESCE((
-               SELECT f.note FROM feedback f WHERE f.book_id = r.book_id
-               ORDER BY f.created_at DESC, f.id DESC LIMIT 1
-             ), '') AS note
+               SELECT f.note FROM feedback f WHERE f.book_id = r.book_id AND f.user_id = r.user_id
+               ORDER BY f.id DESC LIMIT 1
+             ), '') AS note,
+             COALESCE((
+               SELECT f.id FROM feedback f WHERE f.book_id = r.book_id AND f.user_id = r.user_id
+               ORDER BY f.id DESC LIMIT 1
+             ), 0) AS feedback_id
       FROM recommendations r JOIN books b ON b.id = r.book_id
+      WHERE r.user_id = 1
       ORDER BY r.book_id, r.created_at DESC, r.match_score DESC
       LIMIT 300` as Record<string, unknown>[];
     const recommendations = [...rows].sort((a, b) =>

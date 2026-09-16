@@ -11,16 +11,20 @@ export default function FeedbackEditor({
   status,
   initialNote = '',
   busy,
+  saveDisabled = false,
+  clearInitially = false,
   onSubmit,
   onCancel,
 }: {
   status: FeedbackStatus;
   initialNote?: string;
   busy: boolean;
+  saveDisabled?: boolean;
+  clearInitially?: boolean;
   onSubmit: (note: string) => Promise<void>;
   onCancel: () => void;
 }) {
-  const [draft, setDraft] = useState(() => parseFeedbackNote(initialNote));
+  const [draft, setDraft] = useState(() => parseFeedbackNote(clearInitially ? '' : initialNote));
   const hintId = useId();
   const note = composeFeedbackNote(draft);
   const tooLong = note.length > MAX_FEEDBACK_NOTE_LENGTH;
@@ -32,7 +36,7 @@ export default function FeedbackEditor({
       aria-label={`${FEEDBACK_STATUS_LABELS[status]}反馈`}
       onSubmit={(event) => {
         event.preventDefault();
-        if (!busy && !tooLong) void onSubmit(note);
+        if (!busy && !tooLong && !saveDisabled) void onSubmit(note);
       }}
     >
       <fieldset disabled={busy}>
@@ -82,7 +86,7 @@ export default function FeedbackEditor({
           原因与补充说明合计 {note.length}/{MAX_FEEDBACK_NOTE_LENGTH} 字{tooLong && '，请精简后再保存'}
         </p>
         <div className="mt-3 flex flex-wrap gap-2">
-          <button className="chip chip-dai disabled:opacity-50" type="submit" disabled={tooLong || busy}>
+          <button className="chip chip-dai disabled:opacity-50" type="submit" disabled={tooLong || busy || saveDisabled}>
             {busy ? '保存中…' : note ? '记下反馈' : initialNote ? '清除原因' : '只更新状态'}
           </button>
           <button className="chip" type="button" onClick={onCancel} disabled={busy}>取消</button>

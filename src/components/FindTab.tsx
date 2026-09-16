@@ -3,7 +3,7 @@
 import { useEffect, useRef, useState, useSyncExternalStore } from 'react';
 import type { Candidate, RerankedItem, VerifiedCandidate, FeedbackStatus } from '@/lib/types';
 import { useOwner } from '@/components/OwnerProvider';
-import FeedbackEditor from '@/components/FeedbackEditor';
+import FeedbackForm from '@/components/FeedbackForm';
 import ReadBookLink from '@/components/ReadBookLink';
 import { isRecord } from '@/lib/sanitize';
 
@@ -343,7 +343,7 @@ export default function FindTab() {
       {results.length > 0 && (
         <div className="mt-8 space-y-4">
           {results.map((it, i) => (
-            <BookCard key={`${it.title}-${i}`} item={it} index={i} apiFetch={apiFetch} />
+            <BookCard key={`${it.title}-${i}`} item={it} index={i} />
           ))}
         </div>
       )}
@@ -354,44 +354,15 @@ export default function FindTab() {
 function BookCard({
   item,
   index,
-  apiFetch,
 }: {
   item: RerankedItem;
   index: number;
-  apiFetch: (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
 }) {
   const [noteFor, setNoteFor] = useState<FeedbackStatus | null>(null);
   const [savedNote, setSavedNote] = useState('');
   const [saved, setSaved] = useState(false);
   const [profileUpdated, setProfileUpdated] = useState(false);
   const [sending, setSending] = useState(false);
-  const [feedbackError, setFeedbackError] = useState('');
-  const feedbackInFlight = useRef(false);
-
-  async function sendFeedback(status: FeedbackStatus, noteText: string) {
-    if (feedbackInFlight.current) return;
-    feedbackInFlight.current = true;
-    setSending(true);
-    setFeedbackError('');
-    try {
-      const res = await apiFetch('/api/feedback', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ title: item.title, author: item.author, status, note: noteText }),
-      });
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok) throw new Error(data.error || '记录反馈失败');
-      setSaved(true);
-      setSavedNote(noteText);
-      setProfileUpdated(data.profileUpdated === true);
-      setNoteFor(null);
-    } catch (e) {
-      setFeedbackError(e instanceof Error ? e.message : '记录反馈失败');
-    } finally {
-      feedbackInFlight.current = false;
-      setSending(false);
-    }
-  }
 
   const suspicious = item.hallucinationRisk;
 
@@ -506,26 +477,21 @@ function BookCard({
                 <button
                   key={st}
                   className="chip hover:border-[var(--cinnabar)] hover:text-[var(--cinnabar)] transition-colors"
-                  onClick={() => {
-                    setNoteFor(noteFor === st ? null : st);
-                    setFeedbackError('');
-                  }}
+                  onClick={() => setNoteFor(st)}
                   aria-pressed={noteFor === st}
                   disabled={sending}
                 >
                   {label}
                 </button>
               ))}
-              {feedbackError && (
-                <p role="alert" className="w-full text-xs" style={{ color: 'var(--cinnabar)' }}>{feedbackError}</p>
-              )}
               {noteFor && (
-                <FeedbackEditor
-                  key={noteFor}
-                  status={noteFor}
-                  busy={sending}
-                  onSubmit={(note) => sendFeedback(noteFor, note)}
-                  onCancel={() => { setNoteFor(null); setFeedbackError(''); }}
+                <FeedbackForm
+                  title={item.title} author={item.author} status={noteFor}
+                  onBusyChange={setSending}
+                  onSaved={(note, updated) => {
+                    setSaved(true); setSavedNote(note); setProfileUpdated(updated); setNoteFor(null);
+                  }}
+                  onCancel={() => setNoteFor(null)}
                 />
               )}
             </div>
