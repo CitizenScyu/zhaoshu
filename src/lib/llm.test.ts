@@ -419,12 +419,14 @@ describe('stream completion and shared call budget', () => {
     });
   });
 
-  // 兜底模型：主模型在**传输层**失败（连不上、网关超时）时换一个已知可用的模型，而不是
-  // 让整次找书失败。语义结论（HTTP 状态码、空正文、截断）绝不换模型——换也一样。
-  describe('fallback model on transport failures', () => {
+  // 兜底模型：主模型**卡住**（网关超时、首字节/停滞上限到点）时换一个已知可用的模型，
+  // 而不是让整次找书失败。两族传输层失败的治法完全不同，这里是它们的判别用例。
+  describe('fallback model on stalled attempts', () => {
     const sentModel = (call = 0) => JSON.parse(String(fetchMock.mock.calls[call][1]?.body)).model as string;
     const FALLBACK = 'fallback/model';
     const withFallback = (totalTimeoutMs: number) => ({ totalTimeoutMs, fallbackModel: FALLBACK });
+    // 昂贵的那一族：网关自己的超时，连响应头都要等到超时才回。
+    const stalledResponse = (status = 524) => new Response('', { status });
 
     beforeEach(() => {
       // 让主模型名可预期：库读不到时回退到 LLM_MODEL。
@@ -432,9 +434,9 @@ describe('stream completion and shared call budget', () => {
     });
 
     // 回归护栏：删掉兜底分支，本用例必须失败——那时第二次调用会用主模型而不是兜底模型。
-    it('主模型传输层失败 → 用剩余预算改打兜底模型并成功', async () => {
+    it('主模型 524 → 用剩余预算改打兜底模型并成功', async () => {
       fetchMock
-        .mockRejectedValueOnce(new TypeError('fetch failed'))
+        .mockResolvedValueOnce(stalledResponse())
         .mockResolvedValueOnce(response([token('兜底正文'), finish('stop')]));
       await expect(client.chatRobust('system', 'user', withFallback(20_000)))
         .resolves.toMatchObject({ content: '兜底正文' });
@@ -443,14 +445,50 @@ describe('stream completion and shared call budget', () => {
       expect(sentModel(1)).toBe(FALLBACK);
     });
 
-    // 换模型占的是原本「重试」那一次名额，所以最坏情况下游请求次数不变（仍是 2 次，
-    // 不是 3 次）。find 的 modelStep 会调用本函数最多两次 → 单步最多 4 次上游调用。
-    it('兜底也传输层失败时如实失败，不会叠加成第三次请求', async () => {
-      fetchMock.mockRejectedValue(new TypeError('fetch failed'));
+    it.each([408, 524])('网关超时 HTTP %i 归到「卡住」这一族，换兜底模型', async (status) => {
+      fetchMock
+        .mockResolvedValueOnce(stalledResponse(status))
+        .mockResolvedValueOnce(response([token('兜底正文'), finish('stop')]));
       await expect(client.chatRobust('system', 'user', withFallback(20_000)))
-        .rejects.toThrow(/LLM 请求失败/);
+        .resolves.toMatchObject({ content: '兜底正文' });
+      expect(sentModel(1)).toBe(FALLBACK);
+    });
+
+    // 换模型（或原地重试）占的是同一个「第二次尝试」名额，所以上游请求次数上界不变。
+    // find 的 modelStep 会调用本函数最多两次 → 单步最多 4 次上游调用。
+    it('兜底也卡住时如实失败，不会叠加成第三次请求', async () => {
+      fetchMock.mockResolvedValue(stalledResponse());
+      await expect(client.chatRobust('system', 'user', withFallback(20_000)))
+        .rejects.toThrow(/HTTP 524/);
       expect(fetchMock).toHaveBeenCalledTimes(2);
       expect(sentModel(1)).toBe(FALLBACK);
+    });
+
+    // 连接层失败是**便宜**的那一族，而且换模型也没用（本机到网关的连接问题对所有模型一视同仁），
+    // 所以原地重试、不换模型。变异成「连不上也降级」时本用例必须失败。
+    it('连接层失败（~10s fail-fast）原地重试主模型，不换模型', async () => {
+      fetchMock
+        .mockRejectedValueOnce(new TypeError('fetch failed'))
+        .mockResolvedValueOnce(response([token('重试成功'), finish('stop')]));
+      const pending = client.chatRobust('system', 'user', withFallback(20_000));
+      await vi.advanceTimersByTimeAsync(0);
+      expect(sentModel(0)).toBe('primary/model');
+      await vi.advanceTimersByTimeAsync(1_500);
+      await expect(pending).resolves.toMatchObject({ content: '重试成功' });
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(sentModel(1)).toBe('primary/model');
+      expect(sentModel(1)).not.toBe(FALLBACK);
+    });
+
+    it('连接层失败两次就如实失败，不降级', async () => {
+      fetchMock.mockRejectedValue(new TypeError('fetch failed'));
+      const assertion = expect(client.chatRobust('system', 'user', withFallback(20_000)))
+        .rejects.toThrow(/LLM 请求失败/);
+      await vi.advanceTimersByTimeAsync(1_500); // 便宜那族的原地重试等待
+      await assertion;
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(sentModel(1)).toBe('primary/model');
+      expect(sentModel(1)).not.toBe(FALLBACK);
     });
 
     it.each([
@@ -468,16 +506,6 @@ describe('stream completion and shared call budget', () => {
       expect(sentModel(1)).not.toBe(FALLBACK);
     });
 
-    // 524 是 Cloudflare 的「源站没在时限内回应」：上游一个字节都没答复，与连接失败同类。
-    it.each([408, 524])('网关超时 HTTP %i 认作「没答复」，换兜底模型', async (status) => {
-      fetchMock
-        .mockResolvedValueOnce(new Response('', { status }))
-        .mockResolvedValueOnce(response([token('兜底正文'), finish('stop')]));
-      await expect(client.chatRobust('system', 'user', withFallback(20_000)))
-        .resolves.toMatchObject({ content: '兜底正文' });
-      expect(sentModel(1)).toBe(FALLBACK);
-    });
-
     // Cloudflare 安全验证是**防火墙在回话**，不是没回话：照旧失败（且不可重试），不绕过它换模型。
     it('CF 安全验证拦截不换模型，也不重试', async () => {
       fetchMock.mockResolvedValue(new Response('<title>Just a moment...</title>', {
@@ -492,16 +520,14 @@ describe('stream completion and shared call budget', () => {
     it('兜底与主模型共享同一个截止时间，总耗时不超过预算', async () => {
       const started = Date.now();
       fetchMock
-        .mockImplementationOnce(() => new Promise((_resolve, reject) => {
-          setTimeout(() => reject(new TypeError('fetch failed')), 1_000);
-        }))
-        .mockResolvedValueOnce(response([], true)); // 兜底这一路挂到预算耗尽
+        .mockResolvedValueOnce(stalledResponse())          // 主模型：瞬时 524
+        .mockResolvedValueOnce(response([], true));        // 兜底：挂到预算耗尽
       const assertion = expect(client.chatRobust('system', 'user', withFallback(20_000)))
         .rejects.toThrow(/总超时/);
-      await vi.advanceTimersByTimeAsync(1_000);
+      await vi.advanceTimersByTimeAsync(0);
       expect(fetchMock).toHaveBeenCalledTimes(2);
       const fallbackSignal = fetchMock.mock.calls[1][1]?.signal;
-      await vi.advanceTimersByTimeAsync(18_999);
+      await vi.advanceTimersByTimeAsync(19_999);
       expect(fallbackSignal?.aborted).toBe(false);
       await vi.advanceTimersByTimeAsync(1);
       await assertion;
@@ -512,12 +538,15 @@ describe('stream completion and shared call budget', () => {
     });
 
     it('剩余预算不足以开一次兜底时干脆不发起（宁可直接失败，也不发起注定超时的请求）', async () => {
-      fetchMock.mockImplementationOnce(() => new Promise((_resolve, reject) => {
-        setTimeout(() => reject(new TypeError('fetch failed')), 4_800);
-      }));
+      fetchMock
+        .mockResolvedValueOnce(stalledResponse())
+        .mockImplementation(() => new Promise((_resolve, reject) => {
+          setTimeout(() => reject(new TypeError('fetch failed')), 10_000);
+        }));
+      // 第一次 524 之后只剩不到 5s：不开兜底，直接把 524 抛出去。
       const assertion = expect(client.chatRobust('system', 'user', withFallback(5_000)))
-        .rejects.toThrow(/LLM 请求失败/);
-      await vi.advanceTimersByTimeAsync(4_800);
+        .rejects.toThrow(/HTTP 524/);
+      await vi.advanceTimersByTimeAsync(0);
       await assertion;
       expect(fetchMock).toHaveBeenCalledOnce();
     });
@@ -526,7 +555,7 @@ describe('stream completion and shared call budget', () => {
       const controller = new AbortController();
       fetchMock.mockImplementation(() => {
         controller.abort();
-        return Promise.reject(new TypeError('fetch failed'));
+        return Promise.resolve(stalledResponse());
       });
       await expect(client.chatRobust('system', 'user', { ...withFallback(20_000), signal: controller.signal }))
         .rejects.toMatchObject({ message: '模型调用已取消。', retryable: false });
@@ -534,9 +563,9 @@ describe('stream completion and shared call budget', () => {
     });
 
     // 缺省不开启：不传 fallbackModel 的既有调用点（profile / feedback）行为与加兜底前一致。
-    it('没传兜底模型时传输层失败仍按原逻辑重试主模型', async () => {
+    it('没传兜底模型时卡住仍按原逻辑重试主模型', async () => {
       fetchMock
-        .mockRejectedValueOnce(new TypeError('fetch failed'))
+        .mockResolvedValueOnce(stalledResponse())
         .mockResolvedValueOnce(response([token('重试成功'), finish('stop')]));
       const pending = client.chatRobust('system', 'user');
       await vi.advanceTimersByTimeAsync(0);
@@ -554,6 +583,127 @@ describe('stream completion and shared call budget', () => {
       expect(client.DEFAULT_FALLBACK_MODEL).toBe('claude-opus-5-88');
       vi.stubEnv('LLM_FALLBACK_MODEL', 'other/model');
       expect(client.configuredFallbackModel()).toBe('other/model');
+    });
+  });
+
+  // 单次尝试上限：光有「失败后降级」不够——524 一次就能把整步预算啃光，兜底永远轮不到。
+  // 两种都要有：首字节（防 524 那种连响应头都不给）与流内停滞（防建流后卡住）。
+  describe('single-attempt deadline (first byte + in-stream stall)', () => {
+    const sentModel = (call = 0) => JSON.parse(String(fetchMock.mock.calls[call][1]?.body)).model as string;
+    const attempts = { idleTimeoutMs: 45_000, firstByteTimeoutMs: 45_000, fallbackModel: 'fallback/model' };
+
+    beforeEach(() => {
+      vi.stubEnv('LLM_MODEL', 'primary/model');
+    });
+
+    it('首字节上限可配置，缺省 45s', () => {
+      vi.stubEnv('LLM_ATTEMPT_TIMEOUT_MS', '');
+      expect(client.configuredAttemptTimeoutMs()).toBe(45_000);
+      expect(client.DEFAULT_ATTEMPT_TIMEOUT_MS).toBe(45_000);
+      vi.stubEnv('LLM_ATTEMPT_TIMEOUT_MS', '20000');
+      expect(client.configuredAttemptTimeoutMs()).toBe(20_000);
+    });
+
+    // 回归护栏：不设首字节上限时这次请求会一直挂到总超时（20s）才死；有了它 45s→这里用 2s
+    // 的短上限来验，第一次尝试在 2s 被截断，剩余预算交给兜底。
+    it('首字节上限到点 → 判「卡住」并降级（不是报成总超时）', async () => {
+      const started = Date.now();
+      fetchMock
+        .mockImplementationOnce((_url: unknown, init?: RequestInit) => new Promise((_resolve, reject) => {
+          init?.signal?.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')));
+        }))
+        .mockResolvedValueOnce(response([token('兜底正文'), finish('stop')]));
+      const pending = client.chatRobust('system', 'user', {
+        totalTimeoutMs: 20_000, idleTimeoutMs: 45_000, firstByteTimeoutMs: 2_000, fallbackModel: 'fallback/model',
+      });
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      await expect(pending).resolves.toMatchObject({ content: '兜底正文' });
+      expect(Date.now() - started).toBe(2_000);
+      expect(sentModel(1)).toBe('fallback/model');
+    });
+
+    // 这一族是「HTTP 200 + text/event-stream 已建立，TTFB 之后不再出正文」：
+    // 首字节早就到了，只有流内停滞上限拦得住。
+    it('建流后停滞 → 停滞上限到点后降级', async () => {
+      const encoder = new TextEncoder();
+      const started = Date.now();
+      fetchMock
+        .mockImplementationOnce(() => Promise.resolve(new Response(new ReadableStream({
+          start(controller) { controller.enqueue(encoder.encode(': keepalive\n\n')); },
+        }))))
+        .mockResolvedValueOnce(response([token('兜底正文'), finish('stop')]));
+      const pending = client.chatRobust('system', 'user', {
+        totalTimeoutMs: 20_000, idleTimeoutMs: 3_000, firstByteTimeoutMs: 45_000, fallbackModel: 'fallback/model',
+      });
+      await vi.advanceTimersByTimeAsync(3_000);
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      await expect(pending).resolves.toMatchObject({ content: '兜底正文' });
+      expect(Date.now() - started).toBe(3_000);
+      expect(sentModel(1)).toBe('fallback/model');
+    });
+
+    // 单次尝试上限**只压主模型那一路**：兜底是最后机会，不该被同一个 45s 停滞上限误杀
+    // （兜底模型是慢的推理模型，实测单步可到 220s）。变异成「兜底也套上限」时本用例必须失败。
+    it('兜底不套单次尝试上限：停滞的兜底仍能拖到共享截止时间', async () => {
+      const encoder = new TextEncoder();
+      fetchMock
+        .mockResolvedValueOnce(new Response('', { status: 524 }))
+        .mockImplementationOnce(() => Promise.resolve(new Response(new ReadableStream({
+          // 只有 keepalive，没有正文：若兜底也被套了 3s 的停滞上限，这里会以空闲超时失败。
+          start(controller) { controller.enqueue(encoder.encode(': keepalive\n\n')); },
+        }))));
+      const pending = client.chatRobust('system', 'user', {
+        totalTimeoutMs: 20_000, idleTimeoutMs: 3_000, firstByteTimeoutMs: 45_000, fallbackModel: 'fallback/model',
+      });
+      await vi.advanceTimersByTimeAsync(3_000);
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      // 兜底这一路没被单次上限掐掉：它一直挂到共享的总时限才结束。
+      const assertion = expect(pending).rejects.toThrow(/总超时（20s）/);
+      await vi.advanceTimersByTimeAsync(17_000);
+      await assertion;
+    });
+
+    it('单次尝试上限不破坏整步 deadline：截断 + 兜底仍以 totalTimeoutMs 为上限', async () => {
+      const started = Date.now();
+      fetchMock.mockImplementation((_url: unknown, init?: RequestInit) => new Promise((_resolve, reject) => {
+        init?.signal?.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')));
+      }));
+      // 主模型 2s 被首字节上限截断 → 兜底接着挂到剩下 18s 的共享 deadline。
+      // 兜底拿的是「剩余 18s」，所以它自己的超时文案是 18s；整步墙钟仍是 20s。
+      const pending = client.chatRobust('system', 'user', {
+        totalTimeoutMs: 20_000, idleTimeoutMs: 45_000, firstByteTimeoutMs: 2_000, fallbackModel: 'fallback/model',
+      });
+      // 断言先挂上：拒绝发生在 20s，晚于下面的 advance，否则会被 vitest 记成 unhandled rejection。
+      const assertion = expect(pending).rejects.toThrow(/总超时（18s）/);
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      await vi.advanceTimersByTimeAsync(17_999);
+      expect(Date.now() - started).toBe(19_999);
+      await vi.advanceTimersByTimeAsync(1);
+      await assertion;
+      expect(Date.now() - started).toBe(20_000);
+      expect(vi.getTimerCount()).toBe(0);
+    });
+
+    // 不给 firstByteTimeoutMs 时行为与加这个选项之前完全一致（只受总时限约束）。
+    it('不传首字节上限时不设这个计时器，仍是总超时', async () => {
+      fetchMock.mockImplementation((_url: unknown, init?: RequestInit) => new Promise((_resolve, reject) => {
+        init?.signal?.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')));
+      }));
+      const assertion = expect(client.chat('system', 'user', { totalTimeoutMs: 5_000 })).rejects.toThrow(/总超时（5s）/);
+      await vi.advanceTimersByTimeAsync(5_000);
+      await assertion;
+      expect(fetchMock).toHaveBeenCalledOnce();
+    });
+
+    it('chatRobust 的选项接受 idleTimeoutMs 与 firstByteTimeoutMs（此前类型上就传不进来）', async () => {
+      // 每次给新的 Response：同一个实例读第二次会挂住（body 已被消费）。
+      fetchMock.mockImplementation(() => Promise.resolve(response([token('正文'), finish('stop')])));
+      await expect(client.chatRobust('system', 'user', attempts)).resolves.toMatchObject({ content: '正文' });
+      await expect(client.chatRobust('system', 'user', { ...attempts, idleTimeoutMs: 4_000 }))
+        .resolves.toMatchObject({ content: '正文' });
+      expect(fetchMock).toHaveBeenCalledTimes(2);
     });
   });
 

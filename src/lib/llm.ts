@@ -34,6 +34,10 @@ interface ChatOptions {
   temperature?: number;
   idleTimeoutMs?: number;
   totalTimeoutMs?: number;
+  // 首字节上限（TTFB）：fetch 在拿到响应头之前就判死。有些失败连响应头都不给——
+  // Cloudflare 的 524 要等源站超时才回，实测 ~126s——只靠 idleTimeoutMs 拦不住它，
+  // 因为那时流还没建立、还没有「两个 chunk 之间」可言。不给则只受 totalTimeoutMs 约束。
+  firstByteTimeoutMs?: number;
   maxTokens?: number;
   signal?: AbortSignal;
   stream?: boolean;
@@ -82,15 +86,23 @@ function responseMetadata(value: unknown): ResponseMetadata {
   };
 }
 
-// 传输层失败：上游一个字节都没答复（连接失败、读流超时、没有响应体）。与「上游答复了一个
-// 失败状态」严格区分开——探测只对前者在同一个截止时间内重试，见 probeModel。
+// 传输层失败分两族，处理方式完全不同（2026-09-17 实测）：
+//
+// - UPSTREAM_UNREACHABLE：**连不上**——fetch 自己抛错（undici 冷连接 10s connect timeout 的
+//   指纹，实测本机 12 次 GET /v1/models 里 7 次失败，且跨 6 个以上模型路由命中）、没有响应体。
+//   特征：~10s fail-fast、重试极便宜，而且**换模型也没用**（连接层问题对所有模型一视同仁）。
+//   → 原地重试，不换模型。
+// - UPSTREAM_STALLED：**连上了但没进展或没答复**——网关自己的超时状态码 408/524、
+//   首字节上限到点、流内停滞、总超时。特征：昂贵（524 实测要 ~126s），一次就能吃光整步预算。
+//   → 降级到兜底模型（换一条路由才治得住）。
 const UPSTREAM_UNREACHABLE = 'UPSTREAM_UNREACHABLE';
+const UPSTREAM_STALLED = 'UPSTREAM_STALLED';
 
 export class LlmError extends Error {
   constructor(
     message: string,
     readonly retryable = true,
-    // 供调用方区分可恢复的失败形态（当前有「输出预算被思维链吃光」与「传输层没答复」）。
+    // 供调用方区分可恢复的失败形态（「输出预算被思维链吃光」、以及上面那两族传输层失败）。
     readonly code?: string,
   ) {
     super(message);
@@ -145,6 +157,27 @@ export function configuredFallbackModel(): string {
 // （MIN_SECOND_ATTEMPT_MS）：低于这个数就干脆不发起——宁可直接失败，
 // 也不要用一个注定超时的请求把截止时间耗光，那会让错误变成「总超时」而掩盖真实原因。
 export const MODEL_FALLBACK_MIN_BUDGET_MS = 5_000;
+
+// ---- 单次尝试上限（停滞与首字节）----
+// 2026-09-17 实测：这个网关上的失败有两族，只有「降级」治不住其中一族。
+//   - 连接层 `fetch failed`：~10s fail-fast，原地重试极便宜；
+//   - HTTP 524：要吃满 ~126s 才回，**一次就能把整步 260s 预算啃掉一半**，兜底还没轮到就没预算了；
+//   - 以及「流已建立后停滞」：HTTP 200 + text/event-stream 建流成功，TTFB 5.2–17.8s 之后
+//     不再出正文——只加首字节上限拦不住它（首字节早就到了），必须同时有流内停滞上限。
+// 所以单次尝试要有自己的上限，且**两种都要**：首字节（防 524 那种连响应头都不给）+
+// 流内停滞（防建流后卡住）。两者都压到 45s 以内，524 就会在 ~45s 被截断，把剩余预算留给兜底。
+//
+// 45s 的取法（推断，非实测最优）：实测正常响应的中位 12.3s、慢尾 30.0s，45s 留出约 1.5 倍余量；
+// 同时 45s < 260s/2，保证一次截断之后至少还剩一半预算给兜底。可用 LLM_ATTEMPT_TIMEOUT_MS 调。
+export const DEFAULT_ATTEMPT_TIMEOUT_MS = 45_000;
+
+export function configuredAttemptTimeoutMs(): number {
+  const parsed = Number.parseInt(
+    process.env.LLM_ATTEMPT_TIMEOUT_MS ?? String(DEFAULT_ATTEMPT_TIMEOUT_MS),
+    10,
+  );
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_ATTEMPT_TIMEOUT_MS;
+}
 
 // ---- 运行时模型解析（数据库设置 → 环境变量 LLM_MODEL → 硬编码缺省）----
 // 2026-09-16 的线上故障源于「换模型要改环境变量 + 重新部署」这条链路太长，
@@ -210,6 +243,9 @@ export async function chat(
   const model = opts.model ?? await resolveModel();
   const idleMs = opts.idleTimeoutMs ?? 60_000; // 两个 chunk 之间超过 60s 视为卡死
   const totalMs = opts.totalTimeoutMs ?? configuredTotalTimeoutMs();
+  // 首字节上限只在调用方显式给出时才设：不给就与加这个选项之前完全一致（只受总时限约束）。
+  const firstByteMs = opts.firstByteTimeoutMs != null
+    ? Math.min(opts.firstByteTimeoutMs, totalMs) : null;
   const controller = new AbortController();
   const cancel = () => controller.abort();
   opts.signal?.addEventListener('abort', cancel, { once: true });
@@ -217,7 +253,13 @@ export async function chat(
   // 监听又刚挂上，必须显式补一次中止。这样这次调用会立刻以「已取消」失败，
   // 已中止的信号不会真的打到上游（取消语义与解析之前完全一致）。
   if (opts.signal?.aborted) cancel();
-  const totalTimer = setTimeout(() => controller.abort(), totalMs);
+  // 两个计时器都可能 abort 同一个 controller，靠这个标记区分是哪一个到点，
+  // 否则 524 会被报成「总超时」，把「网关根本没回」误导成「模型太慢」。
+  let expiredBy: 'total' | 'first_byte' | null = null;
+  const totalTimer = setTimeout(() => {
+    if (expiredBy === null) expiredBy = 'total';
+    controller.abort();
+  }, totalMs);
   const stream = opts.stream ?? true;
   const maxTokensCeiling = configuredMaxTokens();
   const call: LlmCallUsage = {
@@ -234,7 +276,14 @@ export async function chat(
   };
 
   let res: Response;
+  let firstByteTimer: ReturnType<typeof setTimeout> | undefined;
   try {
+    if (firstByteMs !== null) {
+      firstByteTimer = setTimeout(() => {
+        if (expiredBy === null) expiredBy = 'first_byte';
+        controller.abort();
+      }, firstByteMs);
+    }
     res = await fetch(`${BASE_URL}/chat/completions`, {
       method: 'POST',
       signal: controller.signal,
@@ -257,6 +306,9 @@ export async function chat(
         }),
       ),
     });
+    // 响应头到手，首字节上限的使命结束；后面交给 idleMs 管「流内停滞」。
+    clearTimeout(firstByteTimer);
+    firstByteTimer = undefined;
     call.requestId = cleanString(res.headers.get('x-request-id'), 200)
       || cleanString(res.headers.get('request-id'), 200) || null;
     if (!res.ok) {
@@ -279,14 +331,15 @@ export async function chat(
         message = '模型服务请求过于频繁或额度不足，请稍后重试或联系管理员。';
       }
       // 524（Cloudflare「源站没在时限内回应」）与 408 是**网关自己的超时**：上游一个字节都没答复，
-      // 和连接失败同类，所以一并标成 UPSTREAM_UNREACHABLE。其余状态码（含 503 model_not_found、
-      // 429、500）是上游对这次请求给的**答复**——那是关于这个模型的语义结论，换模型重试同样会拿到它。
-      // 被 CF 安全验证拦下的（challenged）也不在此列：那是防火墙在回话，不是没回话。
+      // 只是**昂贵**（524 实测要 ~126s，一次就能吃光整步预算），所以归到 STALLED 让调用方降级。
+      // 其余状态码（含 503 model_not_found、429、500）是上游对这次请求给的**答复**——那是关于
+      // 这个模型的语义结论，换模型重试同样会拿到它。被 CF 安全验证拦下的（challenged）也不在此列：
+      // 那是防火墙在回话，不是没回话。
       const gatewayTimeout = !challenged && (res.status === 408 || res.status === 524);
       throw new LlmError(
         message,
         !challenged && (res.status === 408 || res.status === 429 || res.status >= 500),
-        gatewayTimeout ? UPSTREAM_UNREACHABLE : undefined,
+        gatewayTimeout ? UPSTREAM_STALLED : undefined,
       );
     }
     if (!res.body) {
@@ -302,13 +355,22 @@ export async function chat(
     if (opts.signal?.aborted) throw cancelledError();
     if (e instanceof LlmError) throw e;
     if (controller.signal.aborted) {
-      throw new LlmError(`LLM 总超时（${Math.ceil(totalMs / 1000)}s）`, true, UPSTREAM_UNREACHABLE);
+      // 首字节到点：连响应头都没等到（524 就是这一族），报成「总超时」会把它误导成「模型太慢」。
+      if (expiredBy === 'first_byte') {
+        throw new LlmError(
+          `模型服务首字节超时（${Math.ceil((firstByteMs ?? totalMs) / 1000)}s 内未返回响应头）`,
+          true, UPSTREAM_STALLED,
+        );
+      }
+      throw new LlmError(`LLM 总超时（${Math.ceil(totalMs / 1000)}s）`, true, UPSTREAM_STALLED);
     }
+    // 走到这里说明 fetch 自己抛了（连接失败）——便宜的那一族。
     throw new LlmError(
       e instanceof Error ? `LLM 请求失败：${e.message}` : 'LLM 请求失败', true, UPSTREAM_UNREACHABLE,
     );
   } finally {
     clearTimeout(totalTimer);
+    clearTimeout(firstByteTimer);
     opts.signal?.removeEventListener('abort', cancel);
     try {
       opts.onUsage?.(call);
@@ -487,7 +549,9 @@ async function readCompletionContent(
         aborted,
         new Promise<never>((_, reject) => {
           idleTimer = setTimeout(() => {
-            reject(new LlmError('LLM 空闲超时（' + Math.ceil(idleMs / 1000) + 's 无新 token）', true, UPSTREAM_UNREACHABLE));
+            // 流已经建立、但两个 chunk 之间停滞：这正是 2026-09-17 实测到的那一族
+            // （HTTP 200 + text/event-stream 已建立，TTFB 5.2–17.8s 之后不再出正文）。
+            reject(new LlmError('LLM 空闲超时（' + Math.ceil(idleMs / 1000) + 's 无新 token）', true, UPSTREAM_STALLED));
             controller.abort();
           }, idleMs);
         }),
@@ -550,45 +614,65 @@ function retryDelay(ms: number, signal?: AbortSignal): Promise<void> {
   });
 }
 
-// 兜底只认「上游一个字节都没答复」类失败：连接失败、读流超时、无响应体，以及网关自己的
-// 超时状态码 524 / 408（都在 chat 里标成了 UPSTREAM_UNREACHABLE）。
+// 降级只在**昂贵**的那一族失败上触发：网关自己的超时（524/408）、单次尝试的首字节或停滞
+// 上限到点、总超时——这些要么已经烧掉大段时间，要么说明这条路由卡住不动，只靠原地重试治不住。
+//
+// 连接失败（UPSTREAM_UNREACHABLE）刻意**不**降级：实测那族是**本机到网关的连接层**问题
+// （12 次不含模型的 GET /v1/models 里 7 次失败，跨 6 个以上模型路由命中），~10s fail-fast、
+// 重试极便宜，而且**换模型也一样**——它对所有模型一视同仁，所以原地重试才是对的解法。
+//
 // 上游答复的其它状态码（含 503 model_not_found、429、500）、空正文、截断、内容过滤都是关于
-// **这个模型**的语义结论，换个模型只会拿到同一个答案——所以在那些错误上绝不兜底。
+// **这个模型**的语义结论，换个模型只会拿到同一个答案——在那些错误上绝不降级。
 //
 // 注意它刻意不复用 LlmError.retryable：那个字段还包含 429/5xx 这类「同一个模型现在忙」的
 // 判断，语义是「值得为同一个模型再花一次预算」，与「该换模型了」不是一回事。
 function fallbackEligible(error: unknown): boolean {
-  return error instanceof LlmError && error.code === UPSTREAM_UNREACHABLE;
+  return error instanceof LlmError && error.code === UPSTREAM_STALLED;
 }
 
 // 首次调用、等待和唯一一次重试共享截止时间，绝不重新获得完整预算。
 // 调用方可传入 totalTimeoutMs 用请求级 deadline 派生的子预算来封顶本次调用的总时限；
 // 未传则回退到配置值（如内部预算），保持向后兼容。onToken 增量原样透传到每次实际请求。
 //
-// fallbackModel（可选，缺省不开启）：主模型在传输层失败时，用它顶替原本的「重试」那一次机会。
+// fallbackModel（可选，缺省不开启）：主模型卡住时用它顶替原本的「重试」那一次机会。
 // 之所以是**顶替**而不是叠加，是为了保住调用次数上界：find 的 modelStep 会调用本函数最多两次，
 // 本函数内部最多两次上游请求，所以单步最多 4 次上游调用——与加兜底之前完全一致（不是 8 次）。
+//
+// idleTimeoutMs / firstByteTimeoutMs 是**单次尝试**的上限（停滞与首字节），只压主模型这一路：
+// 它们的作用是「别让一个卡住的主模型吃光整步预算，以致兜底根本没机会跑」。兜底模型是最后机会，
+// 只受共享截止时间约束——给它再套一个 45s 的停滞上限，会把「慢但确实在出字」的兜底一起误杀。
 export async function chatRobust(
   system: string,
   user: string,
-  opts: Pick<ChatOptions, 'temperature' | 'maxTokens' | 'signal' | 'stream' | 'onUsage' | 'totalTimeoutMs' | 'onToken'> & {
+  opts: Pick<ChatOptions,
+    'temperature' | 'maxTokens' | 'signal' | 'stream' | 'onUsage' | 'totalTimeoutMs' | 'onToken'
+    | 'idleTimeoutMs' | 'firstByteTimeoutMs'> & {
     fallbackModel?: string;
   } = {},
 ): Promise<ChatResult> {
-  const { fallbackModel, ...chatOpts } = opts;
-  const budgetMs = chatOpts.totalTimeoutMs != null
-    ? Math.min(chatOpts.totalTimeoutMs, MAX_ROBUST_BUDGET_MS)
+  const { fallbackModel, temperature, maxTokens, signal, stream, onUsage, onToken } = opts;
+  const budgetMs = opts.totalTimeoutMs != null
+    ? Math.min(opts.totalTimeoutMs, MAX_ROBUST_BUDGET_MS)
     : Math.min(configuredTotalTimeoutMs(), MAX_ROBUST_BUDGET_MS);
   const deadline = Date.now() + budgetMs;
+  const primary = {
+    temperature, maxTokens, signal, stream, onUsage, onToken,
+    idleTimeoutMs: opts.idleTimeoutMs,
+    firstByteTimeoutMs: opts.firstByteTimeoutMs,
+    totalTimeoutMs: budgetMs,
+  };
   try {
-    return await chat(system, user, { ...chatOpts, totalTimeoutMs: budgetMs });
+    return await chat(system, user, primary);
   } catch (e) {
     if (opts.signal?.aborted) throw cancelledError();
-    // 降级：主模型连不上时不重试同一个模型，改用兜底模型（同为一次性，共享剩余预算）。
+    // 降级：主模型卡住时改用兜底模型，拿的是剩余预算，且不再套单次尝试上限（见上）。
     if (fallbackModel && fallbackEligible(e)) {
       const remainingMs = deadline - Date.now();
       if (remainingMs <= MODEL_FALLBACK_MIN_BUDGET_MS) throw e;
-      return chat(system, user, { ...chatOpts, model: fallbackModel, totalTimeoutMs: remainingMs });
+      return chat(system, user, {
+        temperature, maxTokens, signal, stream, onUsage, onToken,
+        model: fallbackModel, totalTimeoutMs: remainingMs,
+      });
     }
     if (!(e instanceof LlmError) || !e.retryable) throw e;
     const delayMs = 1_500;
@@ -596,7 +680,7 @@ export async function chatRobust(
     await retryDelay(delayMs, opts.signal);
     const remainingMs = deadline - Date.now();
     if (remainingMs <= 0) throw e;
-    return chat(system, user, { ...chatOpts, totalTimeoutMs: remainingMs });
+    return chat(system, user, { ...primary, totalTimeoutMs: remainingMs });
   }
 }
 

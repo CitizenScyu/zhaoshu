@@ -324,6 +324,26 @@ describe('POST /api/find output contract', () => {
     vi.unstubAllEnvs();
   });
 
+  // 单次尝试上限：光有「失败后降级」不够——524 实测要吃满 ~126s，一次就能把整步预算啃光，
+  // 兜底永远轮不到。首字节与流内停滞两个上限都必须在（删掉一个本用例即失败）。
+  it('hands the model calls a single-attempt cap (first byte + in-stream stall)', async () => {
+    mocks.chatRobust.mockResolvedValue(JSON.stringify({ candidates: [candidate] }));
+    await consumeSSE(await POST(request({ step: 'recall', query: '找书' })));
+    const opts = mocks.chatRobust.mock.calls[0][2] as { idleTimeoutMs: number; firstByteTimeoutMs: number };
+    expect(opts.firstByteTimeoutMs).toBe(45_000);
+    expect(opts.idleTimeoutMs).toBe(45_000);
+    // 必须远小于整步天花板，否则截断之后没预算留给兜底。
+    expect(opts.firstByteTimeoutMs).toBeLessThan(260_000 / 2);
+  });
+
+  it('uses LLM_ATTEMPT_TIMEOUT_MS when it is configured', async () => {
+    vi.stubEnv('LLM_ATTEMPT_TIMEOUT_MS', '20000');
+    mocks.chatRobust.mockResolvedValue(JSON.stringify({ candidates: [candidate] }));
+    await consumeSSE(await POST(request({ step: 'recall', query: '找书' })));
+    expect(mocks.chatRobust.mock.calls[0][2]).toMatchObject({ firstByteTimeoutMs: 20_000, idleTimeoutMs: 20_000 });
+    vi.unstubAllEnvs();
+  });
+
   // 回归护栏：第一次「超时」不能白白扔掉剩余预算。模型调用抛可重试错误、但剩下时间够时，
   // 必须让恢复路径接住它，而不是直接上抛。
   it('recovers when the first attempt times out and budget remains', async () => {
