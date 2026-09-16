@@ -1,6 +1,7 @@
 import { timingSafeEqual } from 'node:crypto';
-import { NextRequest, NextResponse } from 'next/server';
-import { requireApiOwner } from '@/lib/auth';
+import { NextRequest } from 'next/server';
+import { requireApiOwner, requirePermission } from '@/lib/auth';
+import { authJson, withAuthHeaders } from '@/lib/auth-http';
 import { ensureSchema } from '@/lib/db';
 import { readJsonBody, RequestBodyError } from '@/lib/http';
 import { disableShuyuanSource, getShuyuanStats, refreshShuyuan } from '@/lib/shuyuan';
@@ -27,19 +28,20 @@ function cronRequest(req: NextRequest): boolean {
 }
 
 export async function GET(req: NextRequest) {
-  const unauthorized = requireApiOwner(req);
-  if (unauthorized && !cronRequest(req)) return unauthorized;
+  const cron = cronRequest(req);
+  const auth = cron ? null : await requirePermission(req, 'read');
+  if (auth && !auth.ok) return withAuthHeaders(auth.response);
   try {
     await ensureSchema();
-    if (unauthorized) {
+    if (cron) {
       // cron 路径：直接刷新
       const stats = await refreshShuyuan(req.signal);
-      return NextResponse.json(stats);
+      return authJson(stats);
     }
-    return NextResponse.json(await getShuyuanStats(req.signal));
+    return authJson(await getShuyuanStats(req.signal));
   } catch (e) {
     const message = e instanceof Error ? e.message : 'internal error';
-    return NextResponse.json({ error: message }, { status: 502 });
+    return authJson({ error: message }, { status: 502 });
   }
 }
 
@@ -51,7 +53,7 @@ export async function POST(req: NextRequest) {
     body = await readJsonBody(req, MAX_BODY_BYTES);
   } catch (e) {
     if (e instanceof RequestBodyError) {
-      return NextResponse.json({ error: e.message, code: e.code }, { status: 413 });
+      return authJson({ error: e.message, code: e.code }, { status: 413 });
     }
     throw e;
   }
@@ -62,19 +64,19 @@ export async function POST(req: NextRequest) {
     if (action === 'disable') {
       const url = typeof body?.url === 'string' ? body.url : '';
       if (!url) {
-        return NextResponse.json({ error: 'missing url' }, { status: 400 });
+        return authJson({ error: 'missing url' }, { status: 400 });
       }
       const error = typeof body?.error === 'string' ? body.error : '';
       const updated = await disableShuyuanSource(url, error);
-      return NextResponse.json({ disabled: updated });
+      return authJson({ disabled: updated });
     }
     if (action !== 'refresh') {
-      return NextResponse.json({ error: 'unknown action' }, { status: 400 });
+      return authJson({ error: 'unknown action' }, { status: 400 });
     }
     const stats = await refreshShuyuan(req.signal);
-    return NextResponse.json(stats);
+    return authJson(stats);
   } catch (e) {
     const message = e instanceof Error ? e.message : '刷新失败';
-    return NextResponse.json({ error: message }, { status: 502 });
+    return authJson({ error: message }, { status: 502 });
   }
 }

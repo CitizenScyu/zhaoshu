@@ -85,6 +85,7 @@ describe('GET /api/download/[id]/file', () => {
     expect(res.status).toBe(200);
     expect(res.headers.get('Content-Type')).toBe('text/plain; charset=utf-8');
     expect(res.headers.get('Cache-Control')).toBe('private, no-store');
+    expect(res.headers.get('Vary')).toBe('Cookie, Authorization, X-Owner-Token');
     expect(res.headers.get('Content-Disposition')).toBe(
       `attachment; filename="novel.txt"; filename*=UTF-8''${encodeURIComponent('长篇小说.txt')}`,
     );
@@ -111,6 +112,15 @@ describe('GET /api/download/[id]/file', () => {
     controller.close();
     await expect(reader.read()).resolves.toEqual({ value: last, done: false });
     await expect(reader.read()).resolves.toEqual({ value: undefined, done: true });
+  });
+
+  it('returns 404 for another user task before touching the file service', async () => {
+    sql.mockResolvedValueOnce([]);
+    const res = await download();
+    expect(res.status).toBe(404);
+    expect(await res.json()).toMatchObject({ code: 'TASK_NOT_FOUND' });
+    expect(sql.mock.calls[0].slice(1)).toEqual([42, 1]);
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 
   it('transfers a 17 MiB file in order without waiting for all chunks before returning', async () => {
@@ -231,15 +241,16 @@ describe('GET /api/download/[id]/file', () => {
   it('accepts the largest serial ID without rounding', async () => {
     mockFile(new Response('正文'));
     expect((await download('file-test-owner', '2147483647')).status).toBe(200);
-    expect(sql.mock.calls[0].slice(1)).toEqual([2147483647]);
+    expect(sql.mock.calls[0].slice(1)).toEqual([2147483647, 1]);
   });
 
-  it('reports missing upstream configuration before data access', async () => {
+  it('reports missing upstream configuration only after checking task ownership', async () => {
     vi.stubEnv('GITHUB_TOKEN', '');
     const res = await download();
     expect(res.status).toBe(503);
-    expect(await res.json()).toEqual({ error: 'GITHUB_TOKEN is not configured', code: 'FILE_SERVICE_NOT_CONFIGURED' });
-    expect(ensureSchema).not.toHaveBeenCalled();
+    expect(await res.json()).toEqual({ error: 'file service is not configured', code: 'FILE_SERVICE_NOT_CONFIGURED' });
+    expect(ensureSchema).toHaveBeenCalledOnce();
+    expect(sql).toHaveBeenCalledOnce();
     expect(fetchMock).not.toHaveBeenCalled();
   });
 

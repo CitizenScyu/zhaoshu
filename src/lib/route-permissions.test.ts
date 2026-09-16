@@ -8,15 +8,15 @@ vi.mock('@/lib/db', async (original) => ({ ...await original<typeof import('@/li
 
 // 显式枚举 HTTP 导出；新增路由或方法必须同时声明权限，不能悄悄变成匿名入口。
 // auth-entry 仅表示认证流程可接收匿名请求，其 CSRF/凭据/限速由各自用例验证。
-const policies: Record<string, Record<string, 'find' | 'legacy-owner' | 'auth-entry'>> = {
+const policies: Record<string, Record<string, 'find' | 'read' | 'download' | 'legacy-owner' | 'auth-entry'>> = {
   'auth/login': { POST: 'auth-entry' }, 'auth/logout': { POST: 'auth-entry' },
   'auth/owner': { POST: 'auth-entry' }, 'auth/session': { GET: 'auth-entry' },
-  download: { GET: 'legacy-owner', POST: 'legacy-owner', DELETE: 'legacy-owner' },
-  'download/[id]/file': { GET: 'legacy-owner' }, export: { GET: 'find' },
+  download: { GET: 'download', POST: 'download', DELETE: 'download' },
+  'download/[id]/file': { GET: 'download' }, export: { GET: 'find' },
   feedback: { GET: 'find', POST: 'find' }, find: { POST: 'find' },
-  library: { GET: 'legacy-owner' }, owner: { GET: 'legacy-owner' },
+  library: { GET: 'read' }, owner: { GET: 'legacy-owner' },
   profile: { GET: 'find', PUT: 'find', POST: 'find' },
-  'read/[id]/[resource]': { GET: 'legacy-owner' }, 'read/source/[resource]': { GET: 'legacy-owner' },
+  'read/[id]/[resource]': { GET: 'read' }, 'read/source/[resource]': { GET: 'read' },
   recommendations: { GET: 'find' },
   shelf: { POST: 'find', DELETE: 'find' }, shuyuan: { GET: 'legacy-owner', POST: 'legacy-owner' },
   stats: { GET: 'find' },
@@ -68,7 +68,7 @@ describe('API 权限清单', () => {
         const response = await routeModule[method](req, { params: Promise.resolve({ id: '1', resource: 'manifest' }) });
         expect(response.status).toBe(401);
         expect(mocks.getSql).not.toHaveBeenCalled(); expect(mocks.ensureSchema).not.toHaveBeenCalled(); expect(mocks.fetch).not.toHaveBeenCalled();
-        if (policy === 'find') {
+        if (policy === 'find' || policy === 'read' || policy === 'download') {
           expect(response.headers.get('Cache-Control')).toBe('private, no-store');
           expect(response.headers.get('Vary')).toBe('Cookie, Authorization, X-Owner-Token');
         }

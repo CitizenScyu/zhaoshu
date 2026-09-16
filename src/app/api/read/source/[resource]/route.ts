@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { requireApiOwner } from '@/lib/auth';
+import { requirePermission } from '@/lib/auth';
+import { withAuthHeaders } from '@/lib/auth-http';
 import { ensureSchema } from '@/lib/db';
 import { createDeadline, raceDeadline } from '@/lib/deadline';
 import { cleanString } from '@/lib/sanitize';
@@ -11,18 +12,18 @@ import {
 
 export const runtime = 'nodejs';
 export const maxDuration = 60;
-const HEADERS = { 'Cache-Control': 'private, no-store', Vary: 'Authorization, X-Owner-Token', 'X-Content-Type-Options': 'nosniff' };
+const HEADERS = { 'Cache-Control': 'private, no-store', Vary: 'Cookie, Authorization, X-Owner-Token', 'X-Content-Type-Options': 'nosniff' };
 
 function response(body: unknown, status = 200) {
   return NextResponse.json(body, { status, headers: { ...HEADERS, ...(status === 503 ? { 'Retry-After': '5' } : {}) } });
 }
 
 export async function GET(req: NextRequest, { params }: { params: Promise<{ resource: string }> }) {
-  const unauthorized = requireApiOwner(req);
-  if (unauthorized) {
-    for (const [key, value] of Object.entries(HEADERS)) unauthorized.headers.set(key, value);
-    if (unauthorized.status === 503) unauthorized.headers.set('Retry-After', '5');
-    return unauthorized;
+  const auth = await requirePermission(req, 'read');
+  if (!auth.ok) {
+    const rejected = withAuthHeaders(auth.response);
+    rejected.headers.set('X-Content-Type-Options', 'nosniff');
+    return rejected;
   }
   const { resource } = await params;
   if (!['index', 'chapter'].includes(resource)) return response({ error: '阅读接口不存在。', code: 'SOURCE_RESOURCE_INVALID' }, 404);
@@ -42,9 +43,9 @@ export async function GET(req: NextRequest, { params }: { params: Promise<{ reso
   const deadline = createDeadline(55_000);
   const signal = AbortSignal.any([req.signal, deadline.signal]);
   try {
-    await raceDeadline(signal, ensureSchema);
     const context = new SourceRequestContext(signal);
     if (resource === 'index') {
+      await raceDeadline(signal, ensureSchema);
       const catalog = await resolveSourceBook({ title, author }, context);
       await saveSourceCatalog(catalog, signal);
       return response(sourceReaderIndex(catalog));

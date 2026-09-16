@@ -32,7 +32,7 @@ function request(resource = 'index', query = 'title=测试书&author=作者', to
 
 function expectPrivate(res: Response) {
   expect(res.headers.get('Cache-Control')).toBe('private, no-store');
-  expect(res.headers.get('Vary')).toBe('Authorization, X-Owner-Token');
+  expect(res.headers.get('Vary')).toBe('Cookie, Authorization, X-Owner-Token');
   expect(res.headers.get('X-Content-Type-Options')).toBe('nosniff');
 }
 

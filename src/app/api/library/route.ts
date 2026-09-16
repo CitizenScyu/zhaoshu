@@ -1,5 +1,6 @@
-import { NextRequest, NextResponse } from 'next/server';
-import { requireApiOwner } from '@/lib/auth';
+import { NextRequest } from 'next/server';
+import { requirePermission } from '@/lib/auth';
+import { authJson, withAuthHeaders } from '@/lib/auth-http';
 import { ensureSchema, getSql } from '@/lib/db';
 import { isRecord } from '@/lib/sanitize';
 import { boundedPositiveInteger } from '@/lib/http';
@@ -38,13 +39,13 @@ export function labelText(labels: unknown, key: string, maxLength = 600): string
 const SORTS = new Set(['quality', 'recent', 'oldest', 'title']);
 
 export async function GET(req: NextRequest) {
-  const unauthorized = requireApiOwner(req);
-  if (unauthorized) return unauthorized;
+  const auth = await requirePermission(req, 'read');
+  if (!auth.ok) return withAuthHeaders(auth.response);
   const { searchParams } = new URL(req.url);
   const pageParam = searchParams.get('page');
   const page = pageParam === null ? 1 : boundedPositiveInteger(pageParam, MAX_PAGE);
   if (page === null) {
-    return NextResponse.json({ error: `page must be an integer from 1 to ${MAX_PAGE}`, code: 'INVALID_PAGE' }, { status: 400 });
+    return authJson({ error: `page must be an integer from 1 to ${MAX_PAGE}`, code: 'INVALID_PAGE' }, { status: 400 });
   }
   const query = (searchParams.get('q') || '').trim().slice(0, 100);
   const category = (searchParams.get('category') || '').trim().slice(0, 30);
@@ -109,7 +110,7 @@ export async function GET(req: NextRequest) {
       SELECT finish_status, count(*)::int AS n FROM labeled_books
       WHERE finish_status <> '' GROUP BY finish_status ORDER BY n DESC LIMIT 10`) as { finish_status: string; n: number }[];
 
-    return NextResponse.json({
+    return authJson({
       books: rows.map((r) => ({
         id: r.id,
         title: r.title,
@@ -136,6 +137,6 @@ export async function GET(req: NextRequest) {
       },
     });
   } catch {
-    return NextResponse.json({ error: 'internal error', code: 'DB_ERROR' }, { status: 500 });
+    return authJson({ error: 'internal error', code: 'DB_ERROR' }, { status: 500 });
   }
 }

@@ -40,7 +40,7 @@ function mockBook(response = new Response(bookText)) {
 
 function expectPrivate(response: Response) {
   expect(response.headers.get('Cache-Control')).toBe('private, no-store');
-  expect(response.headers.get('Vary')).toBe('Authorization, X-Owner-Token');
+  expect(response.headers.get('Vary')).toBe('Cookie, Authorization, X-Owner-Token');
   expect(response.headers.get('X-Content-Type-Options')).toBe('nosniff');
 }
 
