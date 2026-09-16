@@ -33,7 +33,7 @@ export default function Home() {
 
 function HomeContent() {
   const [tab, setTab] = useState<Tab>('find');
-  const { token, ready, sessionId, sessionOnly, setSessionOnly, submitToken, logout } = useOwner();
+  const { user, ready, sessionId, sessionOnly, setSessionOnly, submitToken, logout } = useOwner();
   const [draft, setDraft] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const [notice, setNotice] = useState('');
@@ -120,7 +120,7 @@ function HomeContent() {
             type="password"
             value={draft}
             onChange={(event) => { setDraft(event.target.value); setNotice(''); setTokenError(false); }}
-            placeholder={token ? '输入新口令以替换' : '输入访问口令'}
+            placeholder={user ? '输入新口令以替换' : '输入访问口令'}
             autoComplete="current-password"
             disabled={submitting}
             aria-describedby="owner-token-status"
@@ -138,14 +138,18 @@ function HomeContent() {
           }} />
           仅本次会话保存
         </label>
-        {token && <button type="button" className="text-xs underline underline-offset-4 px-2" onClick={() => {
-          logout();
-          setDraft('');
-          setNotice('已退出，已清除保存的口令');
-          setTokenError(false);
+        {user && <button type="button" className="text-xs underline underline-offset-4 px-2" onClick={() => {
+          void logout().then(() => {
+            setDraft('');
+            setNotice('已退出，已清除保存的口令');
+            setTokenError(false);
+          }).catch((error: unknown) => {
+            setTokenError(true);
+            setNotice(error instanceof Error ? error.message : '退出尚未完成，请重试');
+          });
         }}>退出</button>}
         <p id="owner-token-status" role="status" className="w-full" style={{ color: tokenError ? 'var(--cinnabar)' : 'var(--ink-soft)' }}>
-          {notice || (token ? '访问口令已设置' : '输入并提交口令后生效')}
+          {notice || (user ? `当前身份：${user.username}` : '输入并提交口令后生效')}
         </p>
       </form>
 
@@ -155,7 +159,7 @@ function HomeContent() {
           className="border-t border-[var(--line)] bg-[var(--paper-card)]/60 px-5 sm:px-8 py-8"
           style={{ boxShadow: '0 4px 24px rgba(46,42,35,0.05)' }}
         >
-          {ready && token ? (
+          {ready && user ? (
             <PrivateTabs tab={tab} />
           ) : (
             <p role="status" className="text-sm" style={{ color: 'var(--ink-soft)' }}>

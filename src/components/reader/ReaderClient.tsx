@@ -36,9 +36,9 @@ export default function ReaderClient(props: Props) {
 }
 
 function ReaderGate(props: Props) {
-  const { ready, token, sessionId } = useOwner();
+  const { ready, user, sessionId } = useOwner();
   if (!ready) return <div className={styles.screen}><p className={styles.empty} role="status">正在打开书页…</p></div>;
-  if (!token) return <div className={styles.screen}><AccessForm from={props.from} /></div>;
+  if (!user) return <div className={styles.screen}><AccessForm from={props.from} /></div>;
   // Drop any in-flight work and previously displayed book when credentials change.
   return <ReaderSession key={`${readingSessionKey(props.session)}:${sessionId}`} {...props} />;
 }
