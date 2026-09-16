@@ -70,7 +70,11 @@ export default function AuthForm({
   const target = safeReturnPath(returnTo);
 
   function finish() {
-    if (target) router.replace(target);
+    // 有深链就回到深链；否则交给调用方决定（主页保持原地，独立登录页回首页）。
+    if (target) {
+      router.replace(target);
+      return;
+    }
     onSuccess?.();
   }
 
