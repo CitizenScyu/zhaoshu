@@ -485,6 +485,8 @@ export function parseJson(text: string): unknown {
   try {
     return JSON.parse(t) as unknown;
   } catch {
-    throw new LlmError('模型返回了无效的 JSON，请重试。', false);
+    // retryable=false：解析失败不是上游瞬时故障。文案不再写「请重试」，避免与标志矛盾、
+    // 也避免把排查引向「再点一次就好」。真正的恢复由调用方（find 的 modelStep）决定。
+    throw new LlmError('模型返回的 JSON 无法解析。', false);
   }
 }
