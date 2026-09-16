@@ -5,13 +5,13 @@ import { assertAuthSchema, AuthSchemaRequiredError } from './auth-store';
 import { requireUserId } from './user-data';
 
 describe('迁移入口与冷启动边界', () => {
-  it.each([3, 5, null])('版本 %s 不能被普通请求自动修复', async (version) => {
+  it.each([3, 4, null])('版本 %s 不能被普通请求自动修复', async (version) => {
     const sql = vi.fn().mockResolvedValue([{ version }]);
     await expect(assertAuthSchema(sql as never)).rejects.toBeInstanceOf(AuthSchemaRequiredError);
     expect(sql).toHaveBeenCalledOnce(); expect(sql.mock.calls[0][0].join('')).toMatch(/^SELECT max\(version\)/);
   });
-  it('v4 校验只读；连接故障不会被伪装成缺迁移', async () => {
-    const sql = vi.fn().mockResolvedValue([{ version: 4 }]);
+  it('v5 校验只读；连接故障不会被伪装成缺迁移', async () => {
+    const sql = vi.fn().mockResolvedValue([{ version: 5 }]);
     await assertAuthSchema(sql as never);
     const error = { code: '08006' }; sql.mockRejectedValueOnce(error);
     await expect(assertAuthSchema(sql as never)).rejects.toBe(error);

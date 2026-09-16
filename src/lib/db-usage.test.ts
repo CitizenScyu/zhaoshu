@@ -77,7 +77,7 @@ describe('LLM usage storage and aggregates (mocked Neon HTTP queries)', () => {
   it('retries failed usage initialization and leaves the main schema usable', async () => {
     mocks.sql.mockImplementation((parts: TemplateStringsArray) => {
       if (parts.join('').includes('llm_usage')) throw new Error('usage DDL unavailable');
-      if (parts.join('').includes('SELECT max(version)')) return [{ version: 4 }];
+      if (parts.join('').includes('SELECT max(version)')) return [{ version: 5 }];
       return [];
     });
     const { ensureSchema, recordLlmUsage } = await import('./db');

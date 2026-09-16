@@ -53,7 +53,7 @@ async function history(sql) {
   ],{isolationLevel:'RepeatableRead',readOnly:true});
 }
 function assertClosedV4(metadata) {
-  assert.equal(metadata.version,4);
+  assert.equal(metadata.version,5);
   assert.equal(metadata.defaults.length,3);
   assert.ok(metadata.defaults.every((column)=>column.value===null && column.not_null));
   assert.equal(metadata.indexes.filter((index)=>/\(book_id, query\)/.test(index.definition)).length,0);
@@ -154,7 +154,7 @@ export async function personalIsolationCase() {
     assert.equal((await write(2,(tx)=>[deleteShelfForUserQuery(tx,2,b[0].id)]))[0].length,0);
     assert.equal((await recommendationsForUserQuery(sql,3,false))[0].id,b[0].id);checks++;
     const [{id:bookId}]=await sql`SELECT id FROM books WHERE title='shared-book'`;
-    await sql`INSERT INTO download_tasks(book_id,title,author,status) VALUES(${bookId},'shared-book','共同作者','done')`;
+    await sql`INSERT INTO download_tasks(user_id,book_id,title,author,status) VALUES(1,${bookId},'shared-book','共同作者','done')`;
     assert.equal((await recommendationsForUserQuery(sql,2,false))[0].read_task_id,null);
     assert.equal(typeof(await recommendationsForUserQuery(sql,2,true))[0].read_task_id,'number');checks++;
     assert.deepEqual(await findStatsForUserQuery(sql,2),[{queries:1,recommendations:1}]);

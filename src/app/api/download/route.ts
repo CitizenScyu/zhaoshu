@@ -1,5 +1,6 @@
-import { NextRequest, NextResponse } from 'next/server';
-import { requireApiOwner } from '@/lib/auth';
+import { NextRequest } from 'next/server';
+import { requirePermission } from '@/lib/auth';
+import { authJson, withAuthHeaders } from '@/lib/auth-http';
 import { ensureSchema, getSql } from '@/lib/db';
 import { triggerDownloadWorkflow } from '@/lib/github';
 import { boundedPositiveInteger, readJsonBody, RequestBodyError } from '@/lib/http';
@@ -53,54 +54,54 @@ async function reclaimStaleTasks(sql: ReturnType<typeof getSql>) {
 }
 
 export async function GET(req: NextRequest) {
-  const unauthorized = requireApiOwner(req);
-  if (unauthorized) return unauthorized;
+  const auth = await requirePermission(req, 'download');
+  if (!auth.ok) return withAuthHeaders(auth.response);
   const { searchParams } = new URL(req.url);
   const idParam = searchParams.get('id');
   const id = boundedPositiveInteger(idParam);
   if (idParam !== null && id === null) {
-    return NextResponse.json({ error: 'invalid id', code: 'INVALID_ID' }, { status: 400 });
+    return authJson({ error: 'invalid id', code: 'INVALID_ID' }, { status: 400 });
   }
   try {
     await ensureSchema();
     const sql = getSql();
-    await reclaimStaleTasks(sql);
     if (id !== null) {
       const rows = (await sql`
         SELECT id, book_id, title, author, status, chapters_total, chapters_done,
                chars_total, error, created_at::text AS created_at, updated_at::text AS updated_at
-        FROM download_tasks WHERE id = ${id}`) as unknown as TaskRow[];
+        FROM download_tasks WHERE id = ${id} AND user_id = ${auth.principal.userId}`) as unknown as TaskRow[];
       if (rows.length === 0) {
-        return NextResponse.json({ error: 'task not found', code: 'TASK_NOT_FOUND' }, { status: 404 });
+        return authJson({ error: 'task not found', code: 'TASK_NOT_FOUND' }, { status: 404 });
       }
-      return NextResponse.json({ task: toTask(rows[0]) });
+      return authJson({ task: toTask(rows[0]) });
     }
     const rows = (await sql`
       SELECT id, book_id, title, author, status, chapters_total, chapters_done,
              chars_total, error, created_at::text AS created_at, updated_at::text AS updated_at
-      FROM download_tasks ORDER BY created_at DESC LIMIT ${LIST_LIMIT}`) as unknown as TaskRow[];
-    return NextResponse.json({ tasks: rows.map(toTask) });
+      FROM download_tasks WHERE user_id = ${auth.principal.userId}
+      ORDER BY created_at DESC LIMIT ${LIST_LIMIT}`) as unknown as TaskRow[];
+    return authJson({ tasks: rows.map(toTask) });
   } catch (e) {
     console.error(e);
-    return NextResponse.json({ error: 'db error', code: 'DB_ERROR' }, { status: 500 });
+    return authJson({ error: 'db error', code: 'DB_ERROR' }, { status: 500 });
   }
 }
 
 export async function POST(req: NextRequest) {
-  const unauthorized = requireApiOwner(req);
-  if (unauthorized) return unauthorized;
+  const auth = await requirePermission(req, 'download');
+  if (!auth.ok) return withAuthHeaders(auth.response);
   let body: Record<string, unknown> | null;
   try {
     body = await readJsonBody(req, MAX_BODY_BYTES);
   } catch (e) {
     if (e instanceof RequestBodyError) {
-      return NextResponse.json({ error: e.message, code: e.code }, { status: 413 });
+      return authJson({ error: e.message, code: e.code }, { status: 413 });
     }
     throw e;
   }
   const bookId = boundedPositiveInteger(body?.bookId);
   if (bookId === null) {
-    return NextResponse.json({ error: 'missing bookId', code: 'INVALID_ID' }, { status: 400 });
+    return authJson({ error: 'missing bookId', code: 'INVALID_ID' }, { status: 400 });
   }
   try {
     await ensureSchema();
@@ -113,11 +114,11 @@ export async function POST(req: NextRequest) {
       source_url: string;
     }[];
     if (books.length === 0) {
-      return NextResponse.json({ error: 'book not found', code: 'BOOK_NOT_FOUND' }, { status: 404 });
+      return authJson({ error: 'book not found', code: 'BOOK_NOT_FOUND' }, { status: 404 });
     }
     const book = books[0];
     if (!book.source_url) {
-      return NextResponse.json({ error: '该书没有来源链接', code: 'MISSING_SOURCE_URL' }, { status: 400 });
+      return authJson({ error: '该书没有来源链接', code: 'MISSING_SOURCE_URL' }, { status: 400 });
     }
     let sourceUrl: string;
     try {
@@ -125,7 +126,7 @@ export async function POST(req: NextRequest) {
       sourceUrl = validateSourceUrl(book.source_url).href;
     } catch (error) {
       if (!(error instanceof SourcePolicyError)) throw error;
-      return NextResponse.json({ error: error.message, code: 'UNSUPPORTED_SOURCE' }, { status: 400 });
+      return authJson({ error: error.message, code: 'UNSUPPORTED_SOURCE' }, { status: 400 });
     }
     // 直接重试也先回收，避免必须先打开详情页查询才能解除僵尸任务的防重锁。
     await reclaimStaleTasks(sql);
@@ -135,14 +136,14 @@ export async function POST(req: NextRequest) {
       WHERE book_id = ${bookId} AND status IN ('pending', 'running')
       ORDER BY created_at DESC LIMIT 1`) as { id: number }[];
     if (existing.length > 0) {
-      return NextResponse.json(
-        { error: '已有进行中的任务', code: 'TASK_CONFLICT', taskId: existing[0].id },
+      return authJson(
+        { error: '已有进行中的任务', code: 'TASK_CONFLICT' },
         { status: 409 },
       );
     }
     const created = (await sql`
-      INSERT INTO download_tasks (book_id, title, author, source_url, status)
-      VALUES (${bookId}, ${book.title}, ${book.author}, ${sourceUrl}, 'pending')
+      INSERT INTO download_tasks (user_id, book_id, title, author, source_url, status)
+      VALUES (${auth.principal.userId}, ${bookId}, ${book.title}, ${book.author}, ${sourceUrl}, 'pending')
       RETURNING id`) as { id: number }[];
     // 立刻唤醒 worker,不等 cron:dispatch 失败绝不能影响建任务结果(Vercel 环境要 await,否则函数可能被提前冻结)
     try {
@@ -150,43 +151,48 @@ export async function POST(req: NextRequest) {
     } catch (e) {
       console.error('workflow dispatch failed', e);
     }
-    return NextResponse.json({ taskId: created[0].id }, { status: 201 });
+    return authJson({ taskId: created[0].id }, { status: 201 });
   } catch (e) {
+    if (e && typeof e === 'object' && 'code' in e && e.code === '23505') {
+      return authJson({ error: '已有进行中的任务', code: 'TASK_CONFLICT' }, { status: 409 });
+    }
     console.error(e);
-    return NextResponse.json({ error: 'db error', code: 'DB_ERROR' }, { status: 500 });
+    return authJson({ error: 'db error', code: 'DB_ERROR' }, { status: 500 });
   }
 }
 
 export async function DELETE(req: NextRequest) {
-  const unauthorized = requireApiOwner(req);
-  if (unauthorized) return unauthorized;
+  const auth = await requirePermission(req, 'download');
+  if (!auth.ok) return withAuthHeaders(auth.response);
   let body: Record<string, unknown> | null;
   try {
     body = await readJsonBody(req, MAX_BODY_BYTES);
   } catch (e) {
     if (e instanceof RequestBodyError) {
-      return NextResponse.json({ error: e.message, code: e.code }, { status: 413 });
+      return authJson({ error: e.message, code: e.code }, { status: 413 });
     }
     throw e;
   }
   const taskId = boundedPositiveInteger(body?.taskId);
   if (taskId === null) {
-    return NextResponse.json({ error: 'missing taskId', code: 'INVALID_ID' }, { status: 400 });
+    return authJson({ error: 'missing taskId', code: 'INVALID_ID' }, { status: 400 });
   }
   try {
     await ensureSchema();
     const sql = getSql();
-    // 按状态原子删除，取消排队或清理失败记录；已被 worker 领取和已完成的任务仍受保护。
+    // 按状态原子删除：只有尚未被 worker 领取的本人任务可以取消。
     const rows = (await sql`
       DELETE FROM download_tasks
-      WHERE id = ${taskId} AND status IN ('pending', 'failed')
+      WHERE id = ${taskId} AND user_id = ${auth.principal.userId} AND status = 'pending'
       RETURNING id`) as { id: number }[];
     if (rows.length === 0) {
-      return NextResponse.json({ error: '只能取消排队中的任务或清理失败任务', code: 'TASK_CONFLICT' }, { status: 409 });
+      const visible = await sql`SELECT status FROM download_tasks WHERE id = ${taskId} AND user_id = ${auth.principal.userId}` as { status: string }[];
+      if (visible.length === 0) return authJson({ error: 'task not found', code: 'TASK_NOT_FOUND' }, { status: 404 });
+      return authJson({ error: '只能取消排队中的任务', code: 'TASK_CONFLICT' }, { status: 409 });
     }
-    return NextResponse.json({ ok: true });
+    return authJson({ ok: true });
   } catch (e) {
     console.error(e);
-    return NextResponse.json({ error: 'db error', code: 'DB_ERROR' }, { status: 500 });
+    return authJson({ error: 'db error', code: 'DB_ERROR' }, { status: 500 });
   }
 }

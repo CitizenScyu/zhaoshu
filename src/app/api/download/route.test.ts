@@ -81,8 +81,8 @@ describe('/api/download recovery and cleanup', () => {
     expect(triggerDownloadWorkflow).not.toHaveBeenCalled();
   });
 
-  it.each(['', '?id=42'])('reclaims stale running tasks before GET %s reads their status', async (suffix) => {
-    sql.mockResolvedValueOnce([]).mockResolvedValueOnce([recoveredTask]);
+  it.each(['', '?id=42'])('keeps GET %s read-only and scopes it to the authenticated user', async (suffix) => {
+    sql.mockResolvedValueOnce([recoveredTask]);
 
     const res = await GET(request('GET', undefined, suffix));
     const data = await res.json();
@@ -95,10 +95,10 @@ describe('/api/download recovery and cleanup', () => {
       error: recoveredTask.error,
       chaptersDone: recoveredTask.chapters_done,
     });
-    expect(sql).toHaveBeenCalledTimes(2);
-    expectSafeReclaim(0);
-    expect(queryText(1)).toMatch(/^SELECT .* FROM download_tasks /);
-    expect(sql.mock.calls[1].slice(1)).toEqual([suffix ? recoveredTask.id : 20]);
+    expect(sql).toHaveBeenCalledOnce();
+    expect(queryText(0)).toMatch(/^SELECT .* FROM download_tasks /);
+    expect(queryText(0)).toContain('user_id = ?');
+    expect(sql.mock.calls[0].slice(1)).toEqual(suffix ? [recoveredTask.id, 1] : [1, 20]);
   });
 
   it('rejects invalid task IDs before any recovery write', async () => {
@@ -131,7 +131,7 @@ describe('/api/download recovery and cleanup', () => {
     expectSafeReclaim(1);
     expect(queryText(2)).toMatch(/WHERE book_id = \? AND status IN \('pending', 'running'\) ORDER BY created_at DESC LIMIT 1$/);
     expect(queryText(3)).toMatch(/^INSERT INTO download_tasks /);
-    expect(sql.mock.calls[3].slice(1)).toEqual([book.id, book.title, book.author, book.source_url]);
+    expect(sql.mock.calls[3].slice(1)).toEqual([1, book.id, book.title, book.author, book.source_url]);
     expect(triggerDownloadWorkflow).toHaveBeenCalledOnce();
   });
 
@@ -143,7 +143,7 @@ describe('/api/download recovery and cleanup', () => {
     const res = await POST(request('POST', { bookId: book.id }));
 
     expect(res.status).toBe(409);
-    expect(await res.json()).toEqual({ error: '已有进行中的任务', code: 'TASK_CONFLICT', taskId: 42 });
+    expect(await res.json()).toEqual({ error: '已有进行中的任务', code: 'TASK_CONFLICT' });
     expectSafeReclaim(1);
     expect(sql).toHaveBeenCalledTimes(3);
     expect(triggerDownloadWorkflow).not.toHaveBeenCalled();
@@ -177,7 +177,7 @@ describe('/api/download recovery and cleanup', () => {
     sql.mockResolvedValueOnce([{ ...book, source_url: 'https://BOOK15.NET:443/books/details7.html#chapters' }])
       .mockResolvedValueOnce([]).mockResolvedValueOnce([]).mockResolvedValueOnce([{ id: 43 }]);
     expect((await POST(request('POST', { bookId: book.id, sourceUrl: 'https://127.0.0.1/private' }))).status).toBe(201);
-    expect(sql.mock.calls[3].slice(1)).toEqual([book.id, book.title, book.author, book.source_url]);
+    expect(sql.mock.calls[3].slice(1)).toEqual([1, book.id, book.title, book.author, book.source_url]);
     expect(triggerDownloadWorkflow).toHaveBeenCalledOnce();
   });
 
@@ -190,7 +190,7 @@ describe('/api/download recovery and cleanup', () => {
     expect(triggerDownloadWorkflow).not.toHaveBeenCalled();
   });
 
-  it('physically removes only pending/failed rows so cleared failures cannot reappear', async () => {
+  it('physically removes only an owned pending row', async () => {
     sql.mockResolvedValueOnce([{ id: recoveredTask.id }]);
 
     const res = await DELETE(request('DELETE', { taskId: recoveredTask.id }));
@@ -198,16 +198,26 @@ describe('/api/download recovery and cleanup', () => {
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual({ ok: true });
     expect(sql).toHaveBeenCalledOnce();
-    expect(queryText(0)).toMatch(/^DELETE FROM download_tasks WHERE id = \? AND status IN \('pending', 'failed'\) RETURNING id$/);
-    expect(sql.mock.calls[0].slice(1)).toEqual([recoveredTask.id]);
+    expect(queryText(0)).toMatch(/^DELETE FROM download_tasks WHERE id = \? AND user_id = \? AND status = 'pending' RETURNING id$/);
+    expect(sql.mock.calls[0].slice(1)).toEqual([recoveredTask.id, 1]);
   });
 
   it('reports a conflict when DELETE finds no cancellable or failed task', async () => {
+    sql.mockResolvedValueOnce([]).mockResolvedValueOnce([{ status: 'running' }]);
     const res = await DELETE(request('DELETE', { taskId: recoveredTask.id }));
 
     expect(res.status).toBe(409);
-    expect(await res.json()).toEqual({ error: '只能取消排队中的任务或清理失败任务', code: 'TASK_CONFLICT' });
-    expect(sql).toHaveBeenCalledOnce();
+    expect(await res.json()).toEqual({ error: '只能取消排队中的任务', code: 'TASK_CONFLICT' });
+    expect(sql).toHaveBeenCalledTimes(2);
+  });
+
+  it('returns 404 without changing a foreign task', async () => {
+    sql.mockResolvedValueOnce([]).mockResolvedValueOnce([]);
+    const res = await DELETE(request('DELETE', { taskId: recoveredTask.id }));
+    expect(res.status).toBe(404);
+    expect(await res.json()).toMatchObject({ code: 'TASK_NOT_FOUND' });
+    expect(queryText(0)).toContain('user_id = ?');
+    expect(queryText(1)).toContain('user_id = ?');
   });
 
   it.each(['', '1.5', 'Infinity', '1e2', '2147483648', '9007199254740992'])('rejects GET id %s before recovery writes', async (id) => {
