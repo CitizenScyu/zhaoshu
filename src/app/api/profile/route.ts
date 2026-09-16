@@ -11,6 +11,7 @@ import { hasInvalidDatabaseCharacters, sanitizeSeeds } from '@/lib/sanitize';
 import { requireApiOwner } from '@/lib/auth';
 import { createDeadline, DeadlineExceededError, MODEL_ROUTE_INTERNAL_BUDGET_MS, raceDeadline } from '@/lib/deadline';
 import type { ProfileSnapshot, SeedBook } from '@/lib/types';
+import { removedSeedBooks } from '@/lib/profile-seeds';
 
 export const maxDuration = 295;
 
@@ -95,6 +96,13 @@ export async function PUT(req: NextRequest) {
     await ensureSchema();
     const profile = await getProfile();
     if (profile.updatedAt !== expectedUpdatedAt) return conflict(draft, profile);
+    const removed = removedSeedBooks(profile.seeds, sanitized);
+    if (removed.length && body.confirmSeedRemoval !== true) {
+      return NextResponse.json({
+        error: '种子书单包含移除项，请核对后确认保存。', code: 'PROFILE_SEEDS_CONFIRM_REQUIRED',
+        removedTitles: removed.map((seed) => seed.title), profile, draft,
+      }, { status: 409 });
+    }
     const content = draft.content ?? profile.content;
     const updatedAt = await saveProfile(sanitized, content, expectedUpdatedAt);
     if (!updatedAt) return conflict(draft);

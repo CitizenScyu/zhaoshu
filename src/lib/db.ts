@@ -151,6 +151,19 @@ async function createSchema() {
       expires_at timestamptz NOT NULL
     )`;
   await s`CREATE INDEX IF NOT EXISTS source_read_catalogs_expiry_idx ON source_read_catalogs (expires_at)`;
+  await s`
+    CREATE TABLE IF NOT EXISTS profile_seed_audit (
+      id bigserial PRIMARY KEY,
+      user_id int NOT NULL,
+      previous_version text NOT NULL,
+      saved_version text NOT NULL,
+      added_titles jsonb NOT NULL,
+      removed_titles jsonb NOT NULL,
+      previous_seeds jsonb NOT NULL,
+      saved_seeds jsonb NOT NULL,
+      created_at timestamptz NOT NULL DEFAULT now()
+    )`;
+  await s`CREATE INDEX IF NOT EXISTS profile_seed_audit_user_time_idx ON profile_seed_audit (user_id, created_at DESC)`;
 }
 
 // 用量表延迟、独立初始化；统计 DDL 失败不能阻断业务，也不占用找书首字节时间。
@@ -293,13 +306,39 @@ export async function saveProfileForUser(
     throw new Error('profile version is required');
   }
   const s = getSql();
-  // 同一条 UPDATE 同时比较并写入；即使时钟回拨或两个写入落在同一微秒，版本也前进。
+  // Lock and compare before replacing. Audit and CAS commit together: an audit
+  // failure rolls back the save, and a stale writer creates neither change.
   const rows = await s`
-    UPDATE profile
-    SET seeds = ${JSON.stringify(seeds)}::jsonb, content = ${content},
-        updated_at = GREATEST(clock_timestamp(), updated_at + interval '1 microsecond')
-    WHERE id = ${userId} AND updated_at::text = ${expectedUpdatedAt}
-    RETURNING updated_at::text AS updated_at` as { updated_at: string }[];
+    WITH input AS (
+      SELECT ${JSON.stringify(seeds)}::jsonb AS seeds, ${content}::text AS content
+    ), previous AS MATERIALIZED (
+      SELECT id, seeds, updated_at FROM profile
+      WHERE id = ${userId} AND updated_at::text = ${expectedUpdatedAt} FOR UPDATE
+    ), updated AS (
+      UPDATE profile
+      SET seeds = input.seeds, content = input.content,
+          updated_at = GREATEST(clock_timestamp(), profile.updated_at + interval '1 microsecond')
+      FROM previous, input
+      WHERE profile.id = previous.id AND profile.updated_at = previous.updated_at
+      RETURNING profile.updated_at::text AS updated_at
+    ), audit AS (
+      INSERT INTO profile_seed_audit
+        (user_id, previous_version, saved_version, added_titles, removed_titles, previous_seeds, saved_seeds)
+      SELECT previous.id, previous.updated_at::text, updated.updated_at,
+        COALESCE((SELECT jsonb_agg(added.title) FROM (
+          SELECT n->>'title' AS title, COALESCE(n->>'author', '') AS author FROM jsonb_array_elements(input.seeds) n
+          EXCEPT ALL
+          SELECT p->>'title', COALESCE(p->>'author', '') FROM jsonb_array_elements(previous.seeds) p
+        ) added), '[]'::jsonb),
+        COALESCE((SELECT jsonb_agg(removed.title) FROM (
+          SELECT p->>'title' AS title, COALESCE(p->>'author', '') AS author FROM jsonb_array_elements(previous.seeds) p
+          EXCEPT ALL
+          SELECT n->>'title', COALESCE(n->>'author', '') FROM jsonb_array_elements(input.seeds) n
+        ) removed), '[]'::jsonb),
+        previous.seeds, input.seeds
+      FROM previous, input, updated WHERE previous.seeds IS DISTINCT FROM input.seeds
+      RETURNING id
+    ) SELECT updated_at FROM updated` as { updated_at: string }[];
   return rows[0]?.updated_at ?? null;
 }
 

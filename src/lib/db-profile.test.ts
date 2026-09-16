@@ -38,8 +38,11 @@ describe('profile database version contract (mocked HTTP queries)', () => {
     const [parts, ...values] = mocks.sql.mock.calls[0];
     expect(values).toEqual([JSON.stringify(seeds), '修订', 1, version]);
     expect(parts.join('?')).toMatch(/WHERE id = \? AND updated_at::text = \?/);
-    expect(parts.join('?')).toContain("GREATEST(clock_timestamp(), updated_at + interval '1 microsecond')");
-    expect(parts.join('?')).toContain('RETURNING updated_at::text AS updated_at');
+    expect(parts.join('?')).toContain("GREATEST(clock_timestamp(), profile.updated_at + interval '1 microsecond')");
+    expect(parts.join('?')).toContain('RETURNING profile.updated_at::text AS updated_at');
+    expect(parts.join('?')).toContain('FOR UPDATE');
+    expect(parts.join('?')).toContain('INSERT INTO profile_seed_audit');
+    expect(parts.join('?')).toContain('FROM previous, input, updated WHERE previous.seeds IS DISTINCT FROM input.seeds');
   });
 
   it('reports a lost comparison without falling back to an unconditional write', async () => {

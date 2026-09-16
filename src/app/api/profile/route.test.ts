@@ -118,6 +118,31 @@ describe('/api/profile writes', () => {
     expect(mocks.saveProfile).toHaveBeenCalledWith(seeds, '', previousVersion);
   });
 
+  it('requires explicit confirmation before removing a seed, returning the missing title and retained draft', async () => {
+    const res = await PUT(request('PUT', { seeds: [], updatedAt: previousVersion }));
+    expect(res.status).toBe(409);
+    expect(await res.json()).toMatchObject({ code: 'PROFILE_SEEDS_CONFIRM_REQUIRED', removedTitles: ['测试书'], draft: { seeds: [] } });
+    expect(mocks.saveProfile).not.toHaveBeenCalled();
+  });
+
+  it('allows a confirmed reduction but never lets confirmation bypass the version check', async () => {
+    const res = await PUT(request('PUT', { seeds: [], updatedAt: previousVersion, confirmSeedRemoval: true }));
+    expect(res.status).toBe(200);
+    expect(mocks.saveProfile).toHaveBeenCalledWith([], '原画像', previousVersion);
+    mocks.saveProfile.mockClear();
+    const stale = await PUT(request('PUT', { seeds: [], updatedAt: 'stale', confirmSeedRemoval: true }));
+    expect(stale.status).toBe(409);
+    expect((await stale.json()).code).toBe('PROFILE_CONFLICT');
+    expect(mocks.saveProfile).not.toHaveBeenCalled();
+  });
+
+  it('leaves the profile untouched when the atomic audit/save fails', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    mocks.saveProfile.mockRejectedValue(new Error('audit unavailable'));
+    expect((await PUT(request('PUT', { seeds: [], updatedAt: previousVersion, confirmSeedRemoval: true }))).status).toBe(500);
+    expect(mocks.saveProfile).toHaveBeenCalledOnce();
+  });
+
   it('returns the raw database version on GET without losing microseconds', async () => {
     const res = await GET(new NextRequest('http://localhost/api/profile', {
       headers: { Authorization: 'Bearer profile-test-owner' },
@@ -216,7 +241,7 @@ describe('/api/profile writes', () => {
     await modelStarted;
     const newSeeds = [{ title: '新种子', kind: 'drop' }];
     const saved = writer === 'manual'
-      ? await PUT(request('PUT', { seeds: newSeeds, content: '人工新画像', updatedAt: previousVersion }))
+      ? await PUT(request('PUT', { seeds: newSeeds, content: '人工新画像', updatedAt: previousVersion, confirmSeedRemoval: true }))
       : await saveFeedback(new NextRequest('http://localhost/api/feedback', {
         method: 'POST', headers: { Authorization: 'Bearer profile-test-owner' },
         body: JSON.stringify({ title: '反馈书', status: 'done', note: '喜欢严谨设定' }),
