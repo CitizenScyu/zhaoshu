@@ -10,18 +10,21 @@ const mocks = vi.hoisted(() => ({
   saveProfileForUser: vi.fn(),
   getFeedbackSnapshotForUser: vi.fn(),
   chatRobust: vi.fn(),
+  // 事务批次的原始返回：默认空数组表示"测试不关心每条语句的影响行数"。
+  writeResults: [] as unknown[],
   sql: vi.fn((strings: TemplateStringsArray, ...values: unknown[]) => ({
     text: strings.join('?'), values,
   })),
   transaction: vi.fn(),
 }));
 
-vi.mock('@/lib/db', () => ({
+vi.mock('@/lib/db', async (importOriginal) => ({
+  ...await importOriginal<typeof import('@/lib/db')>(),
   recordFeedbackForUser: async (userId: number, book: { title: string; author: string }, status: string, note: string, expectedVersion: number) => {
     const actual = await vi.importActual<typeof import('@/lib/db')>('@/lib/db');
     await actual.recordFeedbackForUser(userId, book, status, note, expectedVersion, async (batch) => {
       await mocks.transaction(batch(mocks.sql as never));
-      return [];
+      return mocks.writeResults as Record<string, unknown>[][];
     });
   },
   ensureSchema: mocks.ensureSchema,
@@ -58,6 +61,7 @@ describe('POST /api/feedback note contract', () => {
     mocks.getSql.mockReturnValue(Object.assign(mocks.sql, { transaction: mocks.transaction }));
     mocks.upsertBook.mockResolvedValue(42);
     mocks.transaction.mockResolvedValue([]);
+    mocks.writeResults = [];
     // 每本书默认还没有反馈：CAS 期望版本 0 与读到的快照一致。
     mocks.getFeedbackSnapshotForUser.mockResolvedValue({ version: 0, status: null, note: '' });
     mocks.getProfileForUser.mockResolvedValue({ seeds: [], content: '原画像', updatedAt: previousVersion });
@@ -95,6 +99,31 @@ describe('POST /api/feedback note contract', () => {
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual({ ok: true, profileUpdated: false, updatedAt: previousVersion });
     expect(mocks.saveProfileForUser).toHaveBeenCalledWith(1, [], '原画像', previousVersion, expect.any(Function));
+  });
+
+  it('fails explicitly with BOOK_NOT_FOUND instead of reporting a save that wrote nothing', async () => {
+    // 5 条语句：第 4 条 INSERT ... RETURNING id 表示按 title/author 定位后追加历史。
+    // books 里查不到这本书时它是 0 行——旧行为是 200 + "保存成功"。
+    mocks.writeResults = [
+      [{ id: 1 }], [{ id: 1 }], [{ feedback_version_matches: 1 }], [], [],
+    ];
+
+    const res = await POST(request('dropped', '题材不合'));
+
+    expect(res.status).toBe(404);
+    expect(await res.json()).toEqual({ error: '这本书不在书库中，未能保存反馈。', code: 'BOOK_NOT_FOUND' });
+    expect(mocks.chatRobust).not.toHaveBeenCalled();
+  });
+
+  it('still records feedback when the INSERT really appended a row', async () => {
+    mocks.writeResults = [
+      [{ id: 1 }], [{ id: 1 }], [{ feedback_version_matches: 1 }], [{ id: 7 }], [],
+    ];
+
+    const res = await POST(request('dropped', '题材不合'));
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ ok: true, profileUpdated: true, updatedAt: nextVersion });
   });
 
   it('logs the failing stage and error class instead of swallowing the reason', async () => {

@@ -169,7 +169,8 @@ export function feedbackForUserQueries(sql: PersonalQuery, userId: number, book:
     ), 0) = ${expectedVersion} THEN 1 ELSE 0 END AS feedback_version_matches`,
     sql`INSERT INTO feedback (user_id, book_id, status, note)
         SELECT ${userId}, id, ${status}, ${note} FROM books
-        WHERE lower(title) = lower(${book.title}) AND lower(author) = lower(${book.author})`,
+        WHERE lower(title) = lower(${book.title}) AND lower(author) = lower(${book.author})
+        RETURNING id`,
     sql`UPDATE recommendations SET status = ${status}
         WHERE user_id = ${userId} AND book_id IN (
           SELECT id FROM books WHERE lower(title) = lower(${book.title}) AND lower(author) = lower(${book.author}))`,

@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { ensureSchema, getSql, recordFeedbackForUser, getFeedbackSnapshotForUser, getProfileForUser, saveProfileForUser, FeedbackConflictError } from '@/lib/db';
+import { ensureSchema, getSql, recordFeedbackForUser, getFeedbackSnapshotForUser, getProfileForUser, saveProfileForUser, FeedbackBookNotFoundError, FeedbackConflictError } from '@/lib/db';
 import { chatRobust, configuredTotalTimeoutMs, validateProfileContent } from '@/lib/llm';
 import { recordUsageAfterResponse } from '@/lib/record-llm-usage';
 import { profileUpdateSystem, profileUpdateUser } from '@/lib/prompts';
@@ -54,6 +54,9 @@ export async function POST(req: NextRequest) {
       if (e instanceof FeedbackConflictError) {
         const latest = await access.run(() => getFeedbackSnapshotForUser(userId, cleanTitle, cleanAuthor)).catch(() => null);
         return NextResponse.json({ error: '反馈保存期间有新改动，草稿已保留，请比较后再保存。', code: 'FEEDBACK_CONFLICT', current: latest }, { status: 409 });
+      }
+      if (e instanceof FeedbackBookNotFoundError) {
+        return NextResponse.json({ error: '这本书不在书库中，未能保存反馈。', code: 'BOOK_NOT_FOUND' }, { status: 404 });
       }
       throw e;
     }
