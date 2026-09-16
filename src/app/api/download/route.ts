@@ -180,15 +180,15 @@ export async function DELETE(req: NextRequest) {
   try {
     await ensureSchema();
     const sql = getSql();
-    // 按状态原子删除：只有尚未被 worker 领取的本人任务可以取消。
+    // 按状态原子删除：取消排队中的任务或清理失败记录；本人之外与运行中 / 已完成的任务仍受保护。
     const rows = (await sql`
       DELETE FROM download_tasks
-      WHERE id = ${taskId} AND user_id = ${auth.principal.userId} AND status = 'pending'
+      WHERE id = ${taskId} AND user_id = ${auth.principal.userId} AND status IN ('pending', 'failed')
       RETURNING id`) as { id: number }[];
     if (rows.length === 0) {
       const visible = await sql`SELECT status FROM download_tasks WHERE id = ${taskId} AND user_id = ${auth.principal.userId}` as { status: string }[];
       if (visible.length === 0) return authJson({ error: 'task not found', code: 'TASK_NOT_FOUND' }, { status: 404 });
-      return authJson({ error: '只能取消排队中的任务', code: 'TASK_CONFLICT' }, { status: 409 });
+      return authJson({ error: '只能取消排队中的任务或清理失败任务', code: 'TASK_CONFLICT' }, { status: 409 });
     }
     return authJson({ ok: true });
   } catch (e) {

@@ -190,7 +190,7 @@ describe('/api/download recovery and cleanup', () => {
     expect(triggerDownloadWorkflow).not.toHaveBeenCalled();
   });
 
-  it('physically removes only an owned pending row', async () => {
+  it.each(['pending', 'failed'])('physically removes an owned %s row', async () => {
     sql.mockResolvedValueOnce([{ id: recoveredTask.id }]);
 
     const res = await DELETE(request('DELETE', { taskId: recoveredTask.id }));
@@ -198,17 +198,19 @@ describe('/api/download recovery and cleanup', () => {
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual({ ok: true });
     expect(sql).toHaveBeenCalledOnce();
-    expect(queryText(0)).toMatch(/^DELETE FROM download_tasks WHERE id = \? AND user_id = \? AND status = 'pending' RETURNING id$/);
+    expect(queryText(0)).toMatch(/^DELETE FROM download_tasks WHERE id = \? AND user_id = \? AND status IN \('pending', 'failed'\) RETURNING id$/);
     expect(sql.mock.calls[0].slice(1)).toEqual([recoveredTask.id, 1]);
   });
 
-  it('reports a conflict when DELETE finds no cancellable or failed task', async () => {
-    sql.mockResolvedValueOnce([]).mockResolvedValueOnce([{ status: 'running' }]);
+  it.each(['running', 'done'])('protects an owned %s row and leaves its state untouched', async (status) => {
+    sql.mockResolvedValueOnce([]).mockResolvedValueOnce([{ status }]);
     const res = await DELETE(request('DELETE', { taskId: recoveredTask.id }));
 
     expect(res.status).toBe(409);
-    expect(await res.json()).toEqual({ error: '只能取消排队中的任务', code: 'TASK_CONFLICT' });
+    expect(await res.json()).toEqual({ error: '只能取消排队中的任务或清理失败任务', code: 'TASK_CONFLICT' });
     expect(sql).toHaveBeenCalledTimes(2);
+    expect(queryText(0)).toMatch(/^DELETE FROM download_tasks /);
+    expect(queryText(1)).toMatch(/^SELECT status FROM download_tasks /);
   });
 
   it('returns 404 without changing a foreign task', async () => {
