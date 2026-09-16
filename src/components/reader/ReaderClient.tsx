@@ -2,8 +2,9 @@
 
 import Link from 'next/link';
 import { useEffect, useMemo, useRef, useState } from 'react';
-import type { CSSProperties, FormEvent, ReactNode } from 'react';
+import type { CSSProperties, ReactNode } from 'react';
 import { OwnerProvider, useOwner } from '@/components/OwnerProvider';
+import AuthForm from '@/components/AuthForm';
 import type { ReaderIndex, ReaderOrigin, ReaderPart, ReadingSession } from '@/lib/reader-types';
 import { readingSessionKey } from '@/lib/reader-session';
 import {
@@ -36,46 +37,48 @@ export default function ReaderClient(props: Props) {
 }
 
 function ReaderGate(props: Props) {
-  const { ready, user, sessionId } = useOwner();
+  const { ready, user, can, sessionId } = useOwner();
   if (!ready) return <div className={styles.screen}><p className={styles.empty} role="status">正在打开书页…</p></div>;
   if (!user) return <div className={styles.screen}><AccessForm from={props.from} /></div>;
+  // 无阅读权限与“文件不存在”必须区分：这里不发请求就给出明确原因。
+  if (!can('read')) return <div className={styles.screen}><NoReadPermission from={props.from} /></div>;
   // Drop any in-flight work and previously displayed book when credentials change.
   return <ReaderSession key={`${readingSessionKey(props.session)}:${sessionId}`} {...props} />;
 }
 
+/** 站内返回路径；登录成功后回到当前阅读深链。 */
+function readerReturnPath(): string | null {
+  if (typeof window === 'undefined') return null;
+  return `${window.location.pathname}${window.location.search}`;
+}
+
 function AccessForm({ from, message }: Pick<Props, 'from'> & { message?: string }) {
-  const { submitToken } = useOwner();
-  const [draft, setDraft] = useState('');
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState('');
-
-  async function unlock(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    if (busy || !draft.trim()) return;
-    setBusy(true);
-    setError('');
-    try {
-      await submitToken(draft);
-    } catch (error) {
-      setError(error instanceof Error ? error.message : '口令验证失败，请稍后重试');
-    } finally {
-      setBusy(false);
-    }
-  }
-
   return (
     <div className={styles.access}>
       <BackLink from={from} />
       <div className={styles.accessCard}>
         <span className="seal w-12 h-12 text-lg" aria-hidden="true">书径</span>
         <h1>推门，入书中</h1>
-        <p>输入站点访问口令，继续阅读。</p>
-        {(error || message) && <p id="reader-owner-error" role="alert" className={styles.errorText}>{error || message}</p>}
-        <form onSubmit={unlock}>
-          <label htmlFor="reader-owner-token">访问口令</label>
-          <input id="reader-owner-token" className={styles.input} type="password" autoComplete="current-password" value={draft} onChange={(event) => { setDraft(event.target.value); setError(''); }} disabled={busy} aria-invalid={Boolean(error || message) || undefined} aria-describedby={error || message ? 'reader-owner-error' : undefined} required />
-          <button className={styles.primary} type="submit" disabled={busy || !draft.trim()}>{busy ? '验证中…' : '开始阅读 →'}</button>
-        </form>
+        <p>登录后继续阅读；没有账号可先向管理员申请。</p>
+        <AuthForm
+          compact
+          returnTo={readerReturnPath()}
+          message={message}
+          classes={{ input: styles.input, primary: styles.primary, error: styles.errorText }}
+        />
+      </div>
+    </div>
+  );
+}
+
+function NoReadPermission({ from }: Pick<Props, 'from'>) {
+  return (
+    <div className={styles.access}>
+      <BackLink from={from} />
+      <div className={styles.accessCard}>
+        <span className="seal w-12 h-12 text-lg" aria-hidden="true">书径</span>
+        <h1>当前账号尚未获得阅读权限</h1>
+        <p>这本书在书库中存在，但当前账号没有在线阅读权限；请联系管理员开通后再试。</p>
       </div>
     </div>
   );
@@ -110,7 +113,9 @@ function ReaderSession({ session, from }: Props) {
     if (focusControl) requestAnimationFrame(() => (next ? restoreButton : focusButton).current?.focus({ preventScroll: true }));
   }
 
-  if (failure?.status === 401) return <div className={styles.screen} data-theme={settings.theme}><AccessForm from={from} message={failure.message} /></div>;
+  if (failure?.status === 401) return <div className={styles.screen}><AccessForm from={from} message={failure.message} /></div>;
+  // 403 是“没有阅读权限”，不是“书不存在”；不渲染成通用失败或 404。
+  if (failure?.status === 403) return <div className={styles.screen}><NoReadPermission from={from} /></div>;
 
   return (
     <div
