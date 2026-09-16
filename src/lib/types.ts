@@ -41,6 +41,16 @@ export interface DoubanInfo {
 
 export interface VerifiedCandidate extends Candidate {
   douban: DoubanInfo;
+  sourceEvidence?: SourceEvidence;
+}
+
+// A matching source directory establishes identity/existence, not rating or completeness.
+export interface SourceEvidence {
+  status: 'matched' | 'not_found' | 'unavailable';
+  sourceName?: string;
+  url?: string;
+  checkedAt?: string;
+  note: string;
 }
 
 // 重排后的最终推荐
@@ -50,6 +60,7 @@ export interface RerankedItem {
   category: string;
   wordCount: string; // 召回模型描述，待核验
   douban?: DoubanInfo;
+  sourceEvidence?: SourceEvidence;
   matchScore: number; // 0-100 的模型个人匹配排序分，不是喜欢概率
   hitLikes: string[]; // 模型判断的萌点命中
   risks: string; // 模型推断的风险/雷点提示，待核验

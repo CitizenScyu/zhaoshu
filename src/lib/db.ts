@@ -4,7 +4,7 @@ import { LLM_USAGE_PHASES, type LlmUsagePhase, type LlmUsageRecord, type TokenSt
 import { assertAuthSchema } from './auth-store';
 import { initializeBusinessSchema } from './business-schema';
 import type { PersonalWriter } from './personal-write';
-import { requireUserId, profileForUserQuery, saveProfileForUserQuery, excludedBooksForUserQuery, persistRecommendationsForUserQueries, feedbackForUserQueries } from './user-data';
+import { requireUserId, profileForUserQuery, saveProfileForUserQuery, excludedBooksForUserQuery, persistRecommendationsForUserQueries, feedbackForUserQueries, feedbackSnapshotForUserQuery } from './user-data';
 
 const DATABASE_URL = process.env.DATABASE_URL;
 
@@ -177,8 +177,22 @@ export async function persistRecommendationsForUser(userId: number, query: strin
   await write((sql) => persistRecommendationsForUserQueries(sql, userId, query, items));
 }
 
-export async function recordFeedbackForUser(userId: number, book: { title: string; author: string }, status: string, note: string, write: PersonalWriter): Promise<void> {
-  await write((sql) => feedbackForUserQueries(sql, userId, book, status, note));
+export class FeedbackConflictError extends Error {}
+
+export async function getFeedbackSnapshotForUser(userId: number, title: string, author: string): Promise<{ version: number; status: string | null; note: string }> {
+  requireUserId(userId);
+  const rows = await feedbackSnapshotForUserQuery(getSql(), userId, title, author) as { id: number; status: string; note: string }[];
+  const row = rows?.[0];
+  return row ? { version: row.id, status: row.status, note: row.note } : { version: 0, status: null, note: '' };
+}
+
+export async function recordFeedbackForUser(userId: number, book: { title: string; author: string }, status: string, note: string, expectedVersion: number, write: PersonalWriter): Promise<void> {
+  try {
+    await write((sql) => feedbackForUserQueries(sql, userId, book, status, note, expectedVersion));
+  } catch (error) {
+    if (error && typeof error === 'object' && 'code' in error && error.code === '22012') throw new FeedbackConflictError();
+    throw error;
+  }
 }
 
 function canonicalBookKey(title: string, author: string): string {

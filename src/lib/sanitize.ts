@@ -1,5 +1,6 @@
 import { boundedString } from './http';
-import type { Candidate, RerankedItem, SeedBook, VerifiedCandidate } from './types';
+import { validateSourceUrl } from './source-policy';
+import type { Candidate, RerankedItem, SeedBook, SourceEvidence, VerifiedCandidate } from './types';
 
 // 从 LLM / 客户端回传的不可信数据里清洗出结构化的值。
 // 这些函数是纯函数(无 IO),单独成模块以便测试。
@@ -82,6 +83,7 @@ export function sanitizeVerified(value: unknown): VerifiedCandidate[] {
     if (hasInvalidText(douban, ['doubanId', 'url', 'note'])) return [];
     return [{
       ...clean,
+      ...(candidate.sourceEvidence ? { sourceEvidence: sanitizeSourceEvidence(candidate.sourceEvidence) } : {}),
       douban: {
         status: douban.status === 'verified' || douban.status === 'not_found'
           ? douban.status : 'unavailable',
@@ -98,6 +100,22 @@ export function sanitizeVerified(value: unknown): VerifiedCandidate[] {
       },
     }];
   }));
+}
+
+export function sanitizeSourceEvidence(value: unknown): SourceEvidence {
+  const unavailable: SourceEvidence = { status: 'unavailable', note: '书源证据不完整，本轮无法核验。' };
+  if (!isRecord(value)) return unavailable;
+  if (value.status === 'not_found' || value.status === 'unavailable') {
+    return { status: value.status, note: cleanString(value.note, 500) || unavailable.note };
+  }
+  if (value.status !== 'matched') return unavailable;
+  try {
+    const url = validateSourceUrl(value.url);
+    const sourceName = cleanString(value.sourceName, 200);
+    const checkedAt = cleanString(value.checkedAt, 64);
+    if (!/^\/books\/details\d+\.html$/.test(url.pathname) || !sourceName || !Number.isFinite(Date.parse(checkedAt))) return unavailable;
+    return { status: 'matched', url: url.href, sourceName, checkedAt, note: cleanString(value.note, 500) || '书源提供匹配目录，仅补充存在性证据。' };
+  } catch { return unavailable; }
 }
 
 export function sanitizeRerankedItems(value: unknown): RerankedItem[] {

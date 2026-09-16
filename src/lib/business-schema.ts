@@ -108,4 +108,25 @@ export async function initializeBusinessSchema(s: Sql) {
       updated_at timestamptz NOT NULL DEFAULT now()
     )`;
   await s`INSERT INTO shuyuan_meta (id) VALUES (1) ON CONFLICT (id) DO NOTHING`;
+  // Disposable online-reader directories only; chapter text is never stored here.
+  await s`
+    CREATE TABLE IF NOT EXISTS source_read_catalogs (
+      id text PRIMARY KEY,
+      payload jsonb NOT NULL,
+      expires_at timestamptz NOT NULL
+    )`;
+  await s`CREATE INDEX IF NOT EXISTS source_read_catalogs_expiry_idx ON source_read_catalogs (expires_at)`;
+  await s`
+    CREATE TABLE IF NOT EXISTS profile_seed_audit (
+      id bigserial PRIMARY KEY,
+      user_id int NOT NULL,
+      previous_version text NOT NULL,
+      saved_version text NOT NULL,
+      added_titles jsonb NOT NULL,
+      removed_titles jsonb NOT NULL,
+      previous_seeds jsonb NOT NULL,
+      saved_seeds jsonb NOT NULL,
+      created_at timestamptz NOT NULL DEFAULT now()
+    )`;
+  await s`CREATE INDEX IF NOT EXISTS profile_seed_audit_user_time_idx ON profile_seed_audit (user_id, created_at DESC)`;
 }

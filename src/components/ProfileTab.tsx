@@ -8,6 +8,7 @@ import {
   type ProfileDraftAction, type ProfileDraftState, type SaveScope,
 } from '@/lib/profile-draft';
 import { isRecord } from '@/lib/sanitize';
+import { removedSeedBooks, seedRemovalMessage } from '@/lib/profile-seeds';
 
 export default function ProfileTab({ state, dispatch, active }: {
   state: ProfileDraftState;
@@ -95,7 +96,7 @@ export default function ProfileTab({ state, dispatch, active }: {
     const raw: unknown = await res.json().catch(() => null);
     controller.signal.throwIfAborted();
     const data = isRecord(raw) ? raw : {};
-    if (res.status === 409 && data.code === 'PROFILE_CONFLICT') {
+    if (res.status === 409 && (data.code === 'PROFILE_CONFLICT' || data.code === 'PROFILE_SEEDS_CONFIRM_REQUIRED')) {
       const generated = generating && isRecord(data.draft)
         ? readProfileSnapshot({ ...data.draft, updatedAt: state.saved?.updatedAt })
         : null;
@@ -184,6 +185,11 @@ export default function ProfileTab({ state, dispatch, active }: {
   async function save(scope: SaveScope) {
     const updatedAt = scope === 'all' ? state.conflict?.updatedAt : state.saved?.updatedAt;
     if (!updatedAt || (state.conflictDetected && scope !== 'all')) return;
+    const baseline = scope === 'all' ? state.conflict : state.saved;
+    if (!baseline || !state.saved) return;
+    const nextSeeds = scope === 'content' ? state.saved.seeds : seeds;
+    const confirmSeedRemoval = removedSeedBooks(baseline.seeds, nextSeeds).length > 0;
+    if (confirmSeedRemoval && !window.confirm(seedRemovalMessage(baseline.seeds, nextSeeds))) return;
     const controller = beginOperation();
     if (!controller || !state.saved) return;
     try {
@@ -191,7 +197,7 @@ export default function ProfileTab({ state, dispatch, active }: {
         method: 'PUT', signal: controller.signal,
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          seeds: scope === 'content' ? state.saved.seeds : seeds,
+          seeds: nextSeeds, confirmSeedRemoval,
           ...(scope === 'seeds' ? {} : { content: draft }),
           updatedAt,
         }),
@@ -203,7 +209,7 @@ export default function ProfileTab({ state, dispatch, active }: {
       if (scope !== 'seeds') setEditing(false);
       setMsg(scope === 'seeds' ? '✓ 种子已保存' : '✓ 已保存');
     } catch (error) {
-      if (!controller.signal.aborted) setMsg('✗ ' + (error instanceof Error ? error.message : '保存失败，请重试'));
+      if (!controller.signal.aborted) setMsg('✗ ' + (error instanceof Error ? error.message : '保存失败，请重试') + '，草稿已保留。');
     } finally {
       finishOperation(controller);
     }
@@ -211,13 +217,16 @@ export default function ProfileTab({ state, dispatch, active }: {
 
   async function generate() {
     if (state.conflictDetected || contentDirty) return;
+    if (!state.saved) return;
+    const confirmSeedRemoval = removedSeedBooks(state.saved.seeds, seeds).length > 0;
+    if (confirmSeedRemoval && !window.confirm(seedRemovalMessage(state.saved.seeds, seeds))) return;
     const controller = beginOperation();
     if (!controller || !state.saved) return;
     try {
       const saveRes = await apiFetch('/api/profile', {
         method: 'PUT', signal: controller.signal,
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ seeds, updatedAt: state.saved.updatedAt }),
+        body: JSON.stringify({ seeds, updatedAt: state.saved.updatedAt, confirmSeedRemoval }),
       });
       const saved = await readWriteResponse(saveRes, controller);
       if (!saved) return;

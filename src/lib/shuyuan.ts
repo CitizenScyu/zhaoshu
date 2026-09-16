@@ -52,6 +52,34 @@ type StoredSource = {
   source_url: string; source: Record<string, unknown>; last_error: string; disabled_at: string | null;
 };
 
+export interface ReadingSource {
+  url: string;
+  name: string;
+  searchUrl: unknown;
+  rules: Record<string, unknown>;
+}
+
+/** On-demand searches may check unprobed/pending sources, without calling them reachable. */
+export async function getReadingSources(signal: AbortSignal): Promise<ReadingSource[]> {
+  const s = getSql();
+  const { states } = readMeta((await storedMeta(s, signal)).collections);
+  const rows = await readRows<StoredSource & { name: string }>(s, s`
+    SELECT source_url, name, source, disabled_at::text AS disabled_at, last_error
+    FROM shuyuan_sources WHERE source_url ILIKE 'https://book15.net%' ORDER BY source_url`, signal);
+  const supported = rows.filter((row) => canProbe(row.source_url));
+  const defaultSearch = 'https://book15.net/books/search.html?kw={{key}}';
+  // The same built-in adapter as the download worker, only when the collection
+  // has no record for this host. A disabled/failed record must never be bypassed.
+  if (!supported.length) return [{ url: 'https://book15.net/', name: 'book15.net', searchUrl: defaultSearch, rules: {} }];
+  return supported.filter((row) => !row.disabled_at && isRecord(row.source) && row.source.enabled !== false && states.get(row.source_url)?.status !== 'failed')
+    .sort((a, b) => Number(states.get(b.source_url)?.status === 'reachable') - Number(states.get(a.source_url)?.status === 'reachable'))
+    .slice(0, 4)
+    .map((row) => ({
+      url: validateSourceUrl(row.source_url).href, name: row.name.slice(0, 200) || 'book15.net',
+      searchUrl: row.source.searchUrl ?? defaultSearch, rules: row.source,
+    }));
+}
+
 function canProbe(url: string): boolean {
   try { validateSourceUrl(url); return true; } catch { return false; }
 }

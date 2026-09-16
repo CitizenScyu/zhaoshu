@@ -17,6 +17,28 @@ export interface FeedbackDraft {
   text: string;
 }
 
+export interface FeedbackSnapshot {
+  version: number;
+  status: FeedbackStatus | null;
+  note: string;
+}
+
+export function readFeedbackSnapshot(value: unknown): FeedbackSnapshot | null {
+  if (!value || typeof value !== 'object') return null;
+  const data = value as Record<string, unknown>;
+  if (!Number.isSafeInteger(data.version) || (data.version as number) < 0 || typeof data.note !== 'string'
+    || (data.status !== null && !Object.hasOwn(FEEDBACK_STATUS_LABELS, String(data.status)))) return null;
+  return { version: data.version as number, status: data.status as FeedbackStatus | null, note: data.note };
+}
+
+export function feedbackNeedsConfirmation(previous: string, next: string): boolean {
+  return next.trim().length < previous.trim().length;
+}
+
+export function feedbackReductionMessage(previous: string, next: string): string {
+  return `反馈原因将从 ${previous.trim().length} 字减少到 ${next.trim().length} 字${next.trim() ? '' : '（清空）'}。\n\n原反馈：${previous}\n\n确认保存？`;
+}
+
 export function composeFeedbackNote({ reasons, text }: FeedbackDraft): string {
   const selected = FEEDBACK_REASONS.filter((reason) => reasons.includes(reason));
   return [selected.join('；'), text.trim()].filter(Boolean).join('\n');

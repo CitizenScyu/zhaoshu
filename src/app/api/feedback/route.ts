@@ -1,12 +1,13 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { ensureSchema, getSql, recordFeedbackForUser, getProfileForUser, saveProfileForUser } from '@/lib/db';
+import { ensureSchema, getSql, recordFeedbackForUser, getFeedbackSnapshotForUser, getProfileForUser, saveProfileForUser, FeedbackConflictError } from '@/lib/db';
 import { chatRobust, configuredTotalTimeoutMs, validateProfileContent } from '@/lib/llm';
 import { recordUsageAfterResponse } from '@/lib/record-llm-usage';
 import { profileUpdateSystem, profileUpdateUser } from '@/lib/prompts';
-import type { ShelfStatus } from '@/lib/types';
+import type { FeedbackStatus, ShelfStatus } from '@/lib/types';
 import { boundedString, readJsonBody } from '@/lib/http';
 import { withFindAccess } from '@/lib/personal-request';
 import { DeadlineExceededError, MODEL_ROUTE_INTERNAL_BUDGET_MS } from '@/lib/deadline';
+import { feedbackNeedsConfirmation } from '@/lib/feedback';
 
 export const maxDuration = 295;
 
@@ -14,25 +15,48 @@ const MAX_BODY_BYTES = 8 * 1024;
 // 反馈回写画像的模型子预算：在内部预算里预留写回
 const MODEL_CEILING_MS = 220_000;
 
-const VALID: ShelfStatus[] = ['want', 'reading', 'done', 'dropped'];
+const VALID: FeedbackStatus[] = ['want', 'reading', 'done', 'dropped'];
 
 export async function POST(req: NextRequest) {
   return withFindAccess(req, MODEL_ROUTE_INTERNAL_BUDGET_MS, async (access) => {
     const body = await access.run(() => readJsonBody(req, MAX_BODY_BYTES, access.signal));
-    const { title, author, status, note } = body ?? {};
+    const { title, author, status } = body ?? {};
     const cleanTitle = boundedString(title, 200) ?? '';
     const cleanAuthor = boundedString(author, 200) || '佚名';
-    const cleanNote = boundedString(note ?? '', 1_000);
+    const cleanNote = boundedString(body?.note ?? '', 1_000);
     if (!cleanTitle || cleanNote === null ||
-        typeof status !== 'string' || !VALID.includes(status as ShelfStatus)) {
+        typeof status !== 'string' || !VALID.includes(status as FeedbackStatus)) {
       return NextResponse.json({ error: 'missing title, invalid status, or note too long' }, { status: 400 });
     }
-    const safeNote = cleanNote;
+    // Missing version means a create-only expectation, never an unconditional overwrite.
+    const expectedVersion = body?.expectedFeedbackId === undefined ? 0 : body.expectedFeedbackId;
+    if (!Number.isSafeInteger(expectedVersion) || (expectedVersion as number) < 0) {
+      return NextResponse.json({ error: '无效的反馈版本', code: 'FEEDBACK_VERSION_REQUIRED' }, { status: 400 });
+    }
     const shelfStatus = status as ShelfStatus;
     const { userId } = access.principal;
     await access.run(ensureSchema);
-    await access.commit((write) => recordFeedbackForUser(userId,
-      { title: cleanTitle, author: cleanAuthor }, shelfStatus, safeNote, write));
+    const current = await access.run(() => getFeedbackSnapshotForUser(userId, cleanTitle, cleanAuthor));
+    if (current.version !== expectedVersion) {
+      return NextResponse.json({ error: '反馈已在其他页面更新，你的草稿已保留，请比较后再保存。', code: 'FEEDBACK_CONFLICT', current }, { status: 409 });
+    }
+    // Omitting note expresses a status-only change; it never clears the latest note.
+    const safeNote = body && Object.hasOwn(body, 'note') ? cleanNote : current.note;
+    if (feedbackNeedsConfirmation(current.note, safeNote) && body?.confirmNoteReduction !== true) {
+      return NextResponse.json({ error: '反馈原因将减少，请确认后保存。', code: 'FEEDBACK_CONFIRM_REQUIRED', current }, { status: 409 });
+    }
+    try {
+      await access.commit((write) => recordFeedbackForUser(userId,
+        { title: cleanTitle, author: cleanAuthor }, shelfStatus, safeNote, expectedVersion, write));
+    } catch (e) {
+      if (e instanceof FeedbackConflictError) {
+        const latest = await access.run(() => getFeedbackSnapshotForUser(userId, cleanTitle, cleanAuthor)).catch(() => null);
+        return NextResponse.json({ error: '反馈保存期间有新改动，草稿已保留，请比较后再保存。', code: 'FEEDBACK_CONFLICT', current: latest }, { status: 409 });
+      }
+      throw e;
+    }
+
+    // 有信息量的反馈 → 回写画像（失败不阻断；预算耗尽同样不阻断反馈保存）
     let profileUpdated = false;
     let updatedAt: string | null = null;
     if ((shelfStatus === 'done' || shelfStatus === 'dropped') && safeNote && !access.deadline.expired) {
@@ -62,12 +86,21 @@ export async function POST(req: NextRequest) {
 export async function GET(req: NextRequest) {
   return withFindAccess(req, MODEL_ROUTE_INTERNAL_BUDGET_MS, async (access) => {
     await access.run(ensureSchema);
+    if (req.nextUrl.searchParams.has('title')) {
+      const title = boundedString(req.nextUrl.searchParams.get('title'), 200) ?? '';
+      const author = boundedString(req.nextUrl.searchParams.get('author') ?? '', 200) || '佚名';
+      if (!title) return NextResponse.json({ error: '无效的书名或作者' }, { status: 400 });
+      const current = await access.run(() => getFeedbackSnapshotForUser(access.principal.userId, title, author));
+      return NextResponse.json({ current }, {
+        headers: { 'Cache-Control': 'private, no-store', Vary: 'Authorization, X-Owner-Token' },
+      });
+    }
     const sql = getSql();
     const rows = await access.run(async () => sql`
       SELECT f.id, f.status, f.note, f.created_at, b.title, b.author
       FROM feedback f JOIN books b ON b.id = f.book_id
       WHERE f.user_id = ${access.principal.userId}
-      ORDER BY f.created_at DESC LIMIT 200`);
+      ORDER BY f.id DESC LIMIT 200`);
     return NextResponse.json({ feedback: rows });
   });
 }

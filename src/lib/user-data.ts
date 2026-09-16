@@ -17,7 +17,9 @@ export function recommendationsForUserQuery(sql: PersonalQuery, userId: number, 
       b.title, b.author, b.douban_id, b.douban_rating, b.douban_rating_count, b.meta,
       ${readTask} AS read_task_id,
       COALESCE((SELECT f.note FROM feedback f WHERE f.book_id = r.book_id AND f.user_id = ${userId}
-        ORDER BY f.created_at DESC, f.id DESC LIMIT 1), '') AS note
+        ORDER BY f.id DESC LIMIT 1), '') AS note,
+      COALESCE((SELECT f.id FROM feedback f WHERE f.book_id = r.book_id AND f.user_id = ${userId}
+        ORDER BY f.id DESC LIMIT 1), 0) AS feedback_id
     FROM recommendations r JOIN books b ON b.id = r.book_id
     WHERE r.user_id = ${userId}
     ORDER BY r.book_id, r.created_at DESC, r.match_score DESC, r.id DESC LIMIT 300`;
@@ -81,11 +83,38 @@ export function profileForUserQuery(sql: PersonalQuery, userId: number) {
 
 export function saveProfileForUserQuery(sql: PersonalQuery, userId: number, seeds: unknown, content: string, expectedUpdatedAt: string) {
   requireUserId(userId);
-  return sql`UPDATE profile
-    SET seeds = ${JSON.stringify(seeds)}::jsonb, content = ${content},
-        updated_at = GREATEST(clock_timestamp(), updated_at + interval '1 microsecond')
-    WHERE id = ${userId} AND updated_at::text = ${expectedUpdatedAt}
-    RETURNING updated_at::text AS updated_at`;
+  // Lock and compare before replacing. Audit and CAS commit together: an audit
+  // failure rolls back the save, and a stale writer creates neither change.
+  return sql`WITH input AS (
+      SELECT ${JSON.stringify(seeds)}::jsonb AS seeds, ${content}::text AS content
+    ), previous AS MATERIALIZED (
+      SELECT id, seeds, updated_at FROM profile
+      WHERE id = ${userId} AND updated_at::text = ${expectedUpdatedAt} FOR UPDATE
+    ), updated AS (
+      UPDATE profile
+      SET seeds = input.seeds, content = input.content,
+          updated_at = GREATEST(clock_timestamp(), profile.updated_at + interval '1 microsecond')
+      FROM previous, input
+      WHERE profile.id = previous.id AND profile.updated_at = previous.updated_at
+      RETURNING profile.updated_at::text AS updated_at
+    ), audit AS (
+      INSERT INTO profile_seed_audit
+        (user_id, previous_version, saved_version, added_titles, removed_titles, previous_seeds, saved_seeds)
+      SELECT previous.id, previous.updated_at::text, updated.updated_at,
+        COALESCE((SELECT jsonb_agg(added.title) FROM (
+          SELECT n->>'title' AS title, COALESCE(n->>'author', '') AS author FROM jsonb_array_elements(input.seeds) n
+          EXCEPT ALL
+          SELECT p->>'title', COALESCE(p->>'author', '') FROM jsonb_array_elements(previous.seeds) p
+        ) added), '[]'::jsonb),
+        COALESCE((SELECT jsonb_agg(removed.title) FROM (
+          SELECT p->>'title' AS title, COALESCE(p->>'author', '') AS author FROM jsonb_array_elements(previous.seeds) p
+          EXCEPT ALL
+          SELECT n->>'title', COALESCE(n->>'author', '') FROM jsonb_array_elements(input.seeds) n
+        ) removed), '[]'::jsonb),
+        previous.seeds, input.seeds
+      FROM previous, input, updated WHERE previous.seeds IS DISTINCT FROM input.seeds
+      RETURNING id
+    ) SELECT updated_at FROM updated`;
 }
 
 export function excludedBooksForUserQuery(sql: PersonalQuery, userId: number) {
@@ -122,12 +151,17 @@ export function persistRecommendationsForUserQueries(s: PersonalQuery, userId: n
   return [...bookQueries, ...recommendationQueries];
 }
 
-export function feedbackForUserQueries(sql: PersonalQuery, userId: number, book: { title: string; author: string }, status: string, note: string) {
+// 追加式反馈历史同时是状态/note 编辑的审计记录。锁书籍行后比较最新反馈 id：
+// 缺版本只允许首次创建；旧版本不能覆盖已有反馈（22012 → FeedbackConflictError 由调用方转译）。
+export function feedbackForUserQueries(sql: PersonalQuery, userId: number, book: { title: string; author: string }, status: string, note: string, expectedVersion = 0) {
   requireUserId(userId);
   return [
-
-    sql`INSERT INTO books (title, author, meta) VALUES (${book.title}, ${book.author}, '{}'::jsonb)
-        ON CONFLICT (lower(title), lower(author)) DO NOTHING`,
+    sql`SELECT id FROM books WHERE lower(title) = lower(${book.title}) AND lower(author) = lower(${book.author}) FOR UPDATE`,
+    sql`SELECT id FROM books WHERE lower(title) = lower(${book.title}) AND lower(author) = lower(${book.author})`,
+    sql`SELECT 1 / CASE WHEN COALESCE((
+      SELECT max(id) FROM feedback f JOIN books b ON b.id = f.book_id
+      WHERE f.user_id = ${userId} AND lower(b.title) = lower(${book.title}) AND lower(b.author) = lower(${book.author})
+    ), 0) = ${expectedVersion} THEN 1 ELSE 0 END AS feedback_version_matches`,
     sql`INSERT INTO feedback (user_id, book_id, status, note)
         SELECT ${userId}, id, ${status}, ${note} FROM books
         WHERE lower(title) = lower(${book.title}) AND lower(author) = lower(${book.author})`,
@@ -135,4 +169,11 @@ export function feedbackForUserQueries(sql: PersonalQuery, userId: number, book:
         WHERE user_id = ${userId} AND book_id IN (
           SELECT id FROM books WHERE lower(title) = lower(${book.title}) AND lower(author) = lower(${book.author}))`,
   ];
+}
+
+export function feedbackSnapshotForUserQuery(sql: PersonalQuery, userId: number, title: string, author: string) {
+  requireUserId(userId);
+  return sql`SELECT f.id, f.status, f.note FROM feedback f JOIN books b ON b.id = f.book_id
+    WHERE f.user_id = ${userId} AND lower(b.title) = lower(${title}) AND lower(b.author) = lower(${author})
+    ORDER BY f.id DESC LIMIT 1`;
 }

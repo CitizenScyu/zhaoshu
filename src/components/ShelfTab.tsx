@@ -1,9 +1,9 @@
 'use client';
 
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import type { FeedbackStatus, ShelfStatus } from '@/lib/types';
 import { useOwner } from '@/components/OwnerProvider';
-import FeedbackEditor from '@/components/FeedbackEditor';
+import FeedbackForm from '@/components/FeedbackForm';
 import ReadBookLink from '@/components/ReadBookLink';
 
 interface ShelfItem {
@@ -15,6 +15,7 @@ interface ShelfItem {
   reason: string | null;
   status: ShelfStatus;
   note: string;
+  feedback_id?: number;
   created_at: string;
   title: string;
   author: string;
@@ -39,10 +40,9 @@ export default function ShelfTab() {
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(true);
   const [updating, setUpdating] = useState(false);
-  const updateInFlight = useRef(false);
   const [removing, setRemoving] = useState(false);
   const [confirmId, setConfirmId] = useState<number | null>(null);
-  const [editing, setEditing] = useState<{ id: number; status: FeedbackStatus } | null>(null);
+  const [editing, setEditing] = useState<{ id: number; status: FeedbackStatus; clear?: boolean } | null>(null);
   const [feedbackMessage, setFeedbackMessage] = useState('');
 
   const load = useCallback(async (signal?: AbortSignal) => {
@@ -68,38 +68,6 @@ export default function ShelfTab() {
     });
     return () => controller.abort();
   }, [load]);
-
-  async function saveFeedback(item: ShelfItem, status: FeedbackStatus, note: string) {
-    if (updateInFlight.current) return;
-    updateInFlight.current = true;
-    setUpdating(true);
-    setError('');
-    setFeedbackMessage('');
-    try {
-      const res = await apiFetch('/api/feedback', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ title: item.title, author: item.author, status, note }),
-      });
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok) throw new Error(data.error || '保存反馈失败');
-      setItems((current) => current?.map((entry) => entry.id === item.id
-        ? { ...entry, status, note }
-        : entry) ?? null);
-      setEditing(null);
-      setFeedbackMessage(note
-        ? `「${item.title}」反馈已记录${data.profileUpdated === true ? '，画像已更新' : ''}`
-        : item.note && status === item.status
-          ? `已清除「${item.title}」的反馈原因，阅读状态保留`
-          : `「${item.title}」阅读状态已更新`);
-      await load();
-    } catch (error) {
-      setError(error instanceof Error ? error.message : '保存反馈失败');
-    } finally {
-      updateInFlight.current = false;
-      setUpdating(false);
-    }
-  }
 
   // 两段式移除：先标记 confirm 高亮，再点一次才真正发 DELETE
   function askRemove(item: ShelfItem) {
@@ -196,7 +164,7 @@ export default function ShelfTab() {
                   </span>
                   {/* 状态切换 */}
                   <div className="flex flex-wrap gap-1.5 sm:shrink-0">
-                    <ReadBookLink taskId={it.read_task_id} title={it.title} from="shelf" />
+                    <ReadBookLink taskId={it.read_task_id} title={it.title} author={it.author} from="shelf" />
                     {(
                       [
                         ['want', '想读'],
@@ -243,7 +211,7 @@ export default function ShelfTab() {
                         disabled={updating || loading || removing}
                         aria-label={`清除${it.title}的反馈原因，保留阅读状态`}
                         onClick={() => {
-                          if (it.status !== 'new') void saveFeedback(it, it.status, '');
+                          if (it.status !== 'new') setEditing({ id: it.id, status: it.status, clear: true });
                         }}
                       >
                         清除原因
@@ -268,12 +236,18 @@ export default function ShelfTab() {
                     </button>
                   </div>
                   {editing?.id === it.id && (
-                    <FeedbackEditor
-                      key={`${it.id}-${editing.status}`}
-                      status={editing.status}
-                      initialNote={editing.status === it.status ? it.note : ''}
-                      busy={updating || loading || removing}
-                      onSubmit={(note) => saveFeedback(it, editing.status, note)}
+                    <FeedbackForm
+                      key={`${it.id}-${editing.clear ? 'clear' : 'edit'}`}
+                      title={it.title} author={it.author} status={editing.status}
+                      initialSnapshot={{ version: it.feedback_id ?? 0, note: it.note, status: it.status === 'new' ? null : it.status }}
+                      clearInitially={editing.clear}
+                      onBusyChange={setUpdating}
+                      onSaved={(note, profileUpdated) => {
+                        setItems((current) => current?.map((entry) => entry.id === it.id ? { ...entry, status: editing.status, note } : entry) ?? null);
+                        setEditing(null);
+                        setFeedbackMessage(`「${it.title}」反馈已记录${profileUpdated ? '，画像已更新' : ''}`);
+                        void load();
+                      }}
                       onCancel={() => setEditing(null)}
                     />
                   )}

@@ -1,10 +1,11 @@
 'use client';
 
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
-import type { ReaderIndex, ReaderPart } from '@/lib/reader-types';
+import type { ReaderIndex, ReaderPart, ReadingSession } from '@/lib/reader-types';
+import { readerChapterUrl, readerIndexUrl, readerPartMatches } from '@/lib/reader-session';
 import { ReaderPartCache, nextReadingPosition, previousReadingPosition } from '@/lib/reader-part-cache';
 import { captureTextAnchor, restoreTextAnchor } from '@/lib/reader-text-anchor';
-import { parseReaderSettings, parseReadingProgress, readingPercent, readingProgressKey, READER_SETTINGS_KEY } from '@/lib/reader-preferences';
+import { parseReaderSettings, parseReadingProgress, readingPercent, indexProgressKey, READER_SETTINGS_KEY } from '@/lib/reader-preferences';
 import type { ReaderSettings, ReadingPosition, ReadingProgress } from '@/lib/reader-preferences';
 
 interface Reading {
@@ -14,21 +15,21 @@ interface Reading {
   focus: boolean;
   sectionOffset?: number;
 }
-interface Failure { message: string; status: number; target?: ReadingPosition; direction?: 'next' | 'previous' }
+interface Failure { message: string; status: number; code?: string; target?: ReadingPosition; direction?: 'next' | 'previous' }
 type ApiFetch = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
 const START: ReadingPosition = { chapterIndex: 0, partIndex: 0, ratio: 0 };
 const WINDOW_SIZE = 3;
 export const partKey = (part: Pick<ReaderPart, 'chapterIndex' | 'partIndex'>) => `${part.chapterIndex}:${part.partIndex}`;
 
 class RequestError extends Error {
-  constructor(message: string, readonly status: number) { super(message); }
+  constructor(message: string, readonly status: number, readonly code?: string) { super(message); }
 }
 
 async function responseJson<T>(response: Response): Promise<T> {
   const data = await response.json().catch(() => null);
   if (!response.ok) {
     if (response.status === 401) throw new RequestError('访问口令不正确或已失效，请重新输入。', 401);
-    throw new RequestError(typeof data?.error === 'string' ? data.error : '阅读服务暂时不可用，请稍后重试。', response.status);
+    throw new RequestError(typeof data?.error === 'string' ? data.error : '阅读服务暂时不可用，请稍后重试。', response.status, typeof data?.code === 'string' ? data.code : undefined);
   }
   if (!data) throw new RequestError('收到的阅读内容不完整，请重试。', 502);
   return data as T;
@@ -44,7 +45,8 @@ function canPrefetch(): boolean {
     && connection?.effectiveType !== '2g' && connection?.effectiveType !== 'slow-2g';
 }
 
-export function useReader(taskId: number, apiFetch: ApiFetch) {
+export function useReader(session: ReadingSession, apiFetch: ApiFetch) {
+  const indexUrl = readerIndexUrl(session);
   const [settings, setSettings] = useState(() => parseReaderSettings(storedValue(READER_SETTINGS_KEY)));
   const [reading, setReading] = useState<Reading | null>(null);
   const [activeKey, setActiveKey] = useState('0:0');
@@ -72,10 +74,8 @@ export function useReader(taskId: number, apiFetch: ApiFetch) {
   const scrollIntent = useRef(false);
 
   const [cache] = useState(() => new ReaderPartCache(async (index, position, signal) => {
-    const query = new URLSearchParams({ chapter: String(position.chapterIndex), part: String(position.partIndex), version: index.version });
-    const part = await responseJson<ReaderPart>(await apiFetch(`/api/read/${taskId}/chapter?${query}`, { signal, cache: 'no-store' }));
-    if (part.taskId !== taskId || part.version !== index.version || part.chapterIndex !== position.chapterIndex
-      || part.partIndex !== position.partIndex || typeof part.text !== 'string') {
+    const part = await responseJson<ReaderPart>(await apiFetch(readerChapterUrl(index, position), { signal, cache: 'no-store' }));
+    if (!readerPartMatches(index, part, position)) {
       throw new RequestError('章节内容与目录不一致，请重新加载目录。', 409);
     }
     return part;
@@ -84,10 +84,11 @@ export function useReader(taskId: number, apiFetch: ApiFetch) {
   const saveProgress = useCallback(() => {
     if (saveTimer.current) clearTimeout(saveTimer.current);
     saveTimer.current = null;
-    if (!progress.current) return;
-    try { window.localStorage.setItem(readingProgressKey(taskId), JSON.stringify(progress.current)); }
+    const index = currentReading.current?.index;
+    if (!progress.current || !index) return;
+    try { window.localStorage.setItem(indexProgressKey(index), JSON.stringify(progress.current)); }
     catch { setStorageFailed(true); }
-  }, [taskId]);
+  }, []);
 
   const capturePosition = useCallback(() => {
     const current = currentReading.current;
@@ -151,7 +152,8 @@ export function useReader(taskId: number, apiFetch: ApiFetch) {
   const fail = useCallback((error: unknown, target?: ReadingPosition, direction?: 'next' | 'previous') => {
     const status = error instanceof RequestError ? error.status : 0;
     if (status === 401) { cache.clear(); setReading(null); }
-    setFailure({ message: error instanceof Error ? error.message : '阅读内容加载失败，请重试。', status, target, direction });
+    setFailure({ message: error instanceof Error ? error.message : '阅读内容加载失败，请重试。', status,
+      code: error instanceof RequestError ? error.code : undefined, target, direction });
   }, [cache]);
 
   const beginRequest = useCallback(() => {
@@ -181,9 +183,9 @@ export function useReader(taskId: number, apiFetch: ApiFetch) {
     retirePrevious();
     cache.clear();
     try {
-      const index = await responseJson<ReaderIndex>(await apiFetch(`/api/read/${taskId}/index`, { signal: controller.signal, cache: 'no-store' }));
+      const index = await responseJson<ReaderIndex>(await apiFetch(indexUrl, { signal: controller.signal, cache: 'no-store' }));
       if (!Array.isArray(index.chapters) || !index.chapters.length) throw new RequestError('这本书还没有可阅读的正文。', 422);
-      const saved = parseReadingProgress(storedValue(readingProgressKey(taskId)), index);
+      const saved = parseReadingProgress(storedValue(indexProgressKey(index)), index);
       const position = saved ?? START;
       const part = await cache.get(index, position, controller.signal);
       if (controller.signal.aborted || id !== serial.current) return;
@@ -197,7 +199,7 @@ export function useReader(taskId: number, apiFetch: ApiFetch) {
       if (request.current === controller) request.current = null;
       if (!controller.signal.aborted && id === serial.current) setLoading(false);
     }
-  }, [apiFetch, taskId, beginRequest, cache, fail, flushPosition]);
+  }, [apiFetch, indexUrl, beginRequest, cache, fail, flushPosition]);
 
   useEffect(() => {
     let active = true;

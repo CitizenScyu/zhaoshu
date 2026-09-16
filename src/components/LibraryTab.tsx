@@ -130,8 +130,8 @@ export interface LibraryView {
   sort: string;
 }
 
-export function createLibraryView(): LibraryView {
-  return { page: 1, query: '', search: '', category: '', tag: '', finish: '', sort: 'quality' };
+export function createLibraryView(initialQuery = ''): LibraryView {
+  return { page: 1, query: initialQuery, search: initialQuery, category: '', tag: '', finish: '', sort: 'quality' };
 }
 
 export default function LibraryTab({ view, setView }: {
@@ -474,11 +474,9 @@ export default function LibraryTab({ view, setView }: {
           </p>
           {/* 下载全书 */}
           <div className="mt-5 pt-4 border-t border-dashed" style={{ borderColor: 'var(--line)' }}>
-            {(task?.status === 'done' || detail.readTaskId) && (
-              <div className="mb-3">
-                <ReadBookLink taskId={task?.status === 'done' ? task.id : detail.readTaskId} title={detail.title} from="library" />
-              </div>
-            )}
+            <div className="mb-3">
+              <ReadBookLink taskId={task?.status === 'done' ? task.id : detail.readTaskId} title={detail.title} author={detail.author} from="library" />
+            </div>
             {dlError && (
               <p role="alert" className="text-xs mb-2" style={{ color: 'var(--cinnabar)' }}>✗ {dlError}</p>
             )}
@@ -693,9 +691,7 @@ export default function LibraryTab({ view, setView }: {
                 >
                   {shelfBusy === b.id ? '添加中…' : '+ 书架'}
                 </button>
-                {b.readTaskId && (
-                  <ReadBookLink taskId={b.readTaskId} title={b.title} from="library" />
-                )}
+                <ReadBookLink taskId={b.readTaskId} title={b.title} author={b.author} from="library" />
               </div>
             </article>
           ))}

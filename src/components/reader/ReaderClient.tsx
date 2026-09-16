@@ -4,7 +4,8 @@ import Link from 'next/link';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import type { CSSProperties, FormEvent, ReactNode } from 'react';
 import { OwnerProvider, useOwner } from '@/components/OwnerProvider';
-import type { ReaderIndex, ReaderPart } from '@/lib/reader-types';
+import type { ReaderIndex, ReaderOrigin, ReaderPart, ReadingSession } from '@/lib/reader-types';
+import { readingSessionKey } from '@/lib/reader-session';
 import {
   DEFAULT_READER_SETTINGS,
 } from '@/lib/reader-preferences';
@@ -13,7 +14,7 @@ import { useReader, partKey } from './useReader';
 import { nextReadingPosition, previousReadingPosition } from '@/lib/reader-part-cache';
 import styles from './reader.module.css';
 
-interface Props { taskId: number; from: 'library' | 'shelf' }
+interface Props { session: ReadingSession; from: ReaderOrigin }
 const DIRECTORY_PAGE_SIZE = 80;
 
 function bodyText(part: ReaderPart): string {
@@ -27,7 +28,7 @@ function bodyText(part: ReaderPart): string {
 }
 
 function BackLink({ from }: Pick<Props, 'from'>) {
-  return <Link className={styles.back} href={`/?tab=${from}`}>← 返回{from === 'shelf' ? '书架' : '书库'}</Link>;
+  return <Link className={styles.back} href={`/?tab=${from}`}>← 返回{from === 'shelf' ? '书架' : from === 'find' ? '找书' : '书库'}</Link>;
 }
 
 export default function ReaderClient(props: Props) {
@@ -39,7 +40,7 @@ function ReaderGate(props: Props) {
   if (!ready) return <div className={styles.screen}><p className={styles.empty} role="status">正在打开书页…</p></div>;
   if (!token) return <div className={styles.screen}><AccessForm from={props.from} /></div>;
   // Drop any in-flight work and previously displayed book when credentials change.
-  return <ReaderSession key={`${props.taskId}:${sessionId}`} {...props} />;
+  return <ReaderSession key={`${readingSessionKey(props.session)}:${sessionId}`} {...props} />;
 }
 
 function AccessForm({ from, message }: Pick<Props, 'from'> & { message?: string }) {
@@ -80,13 +81,13 @@ function AccessForm({ from, message }: Pick<Props, 'from'> & { message?: string 
   );
 }
 
-function ReaderSession({ taskId, from }: Props) {
+function ReaderSession({ session, from }: Props) {
   const { apiFetch } = useOwner();
   const {
     settings, reading, activePart, loading, flowing, failure, percent, notice, storageFailed, focused,
     scroller, article, heading, onScroll, updateSettings, setFocusMode, navigate: requestNavigation,
     extend, retry, markScrollIntent, setSection,
-  } = useReader(taskId, apiFetch);
+  } = useReader(session, apiFetch);
   const [panel, setPanel] = useState<'directory' | 'settings' | null>(null);
   const restoreButton = useRef<HTMLButtonElement>(null);
   const focusButton = useRef<HTMLButtonElement>(null);
@@ -143,6 +144,7 @@ function ReaderSession({ taskId, from }: Props) {
         <div className={styles.errorBar} role="alert">
           <span>{failure.message}</span>
           <button className={styles.tool} disabled={loading || flowing} onClick={retry}>{failure.status === 409 ? '重新加载目录' : '重试'}</button>
+          {session.kind === 'source' && <Link className={styles.tool} href={`/?${new URLSearchParams({ tab: 'library', q: session.title })}`}>去书库下载全书</Link>}
         </div>
       )}
       <div className={styles.liveStatus} role="status" aria-live="polite">
@@ -197,7 +199,7 @@ function ReaderSession({ taskId, from }: Props) {
                   aria-label={part.title}
                 >
                   {showTitle && <>
-                    <div className={styles.chapterMeta}><span>{reading.index.author || '佚名'} 著</span><span>{String(part.chapterIndex + 1).padStart(2, '0')} / {chapters.length}</span></div>
+                    <div className={styles.chapterMeta}><span>{reading.index.author || '佚名'} 著{reading.index.source ? ` · 书源：${part.servedFrom || reading.index.source.name}` : ''}</span><span>{String(part.chapterIndex + 1).padStart(2, '0')} / {chapters.length}</span></div>
                     {index === 0
                       ? <h1 ref={heading} tabIndex={-1} className={styles.chapterTitle}>{part.title}</h1>
                       : <h2 className={styles.chapterTitle}>{part.title}</h2>}
@@ -220,7 +222,7 @@ function ReaderSession({ taskId, from }: Props) {
           <div className={styles.empty}>
             <div className="seal w-14 h-14 text-xl" aria-hidden="true">书径</div>
             <h1>{failure ? '暂时未能打开这本书' : '一页书，一段光阴'}</h1>
-            <p>{failure ? '可重试，或返回查看书籍的下载状态。' : '书页正在准备中…'}</p>
+            <p>{failure ? session.kind === 'source' ? '可重试书源，或到书库尝试下载全书。' : '可重试，或返回查看书籍的下载状态。' : '书页正在准备中…'}</p>
             {failure && <BackLink from={from} />}
           </div>
         )}
@@ -232,7 +234,7 @@ function ReaderSession({ taskId, from }: Props) {
           <button className={styles.chapterButton} disabled={!reading || loading || chapter === 0} onClick={() => navigate(position(chapter - 1))}>← 上一章</button>
           <button className={styles.progressButton} disabled={!reading} onClick={() => showPanel('directory')} aria-label="打开目录，查看阅读位置">
             <span>{reading ? '第 ' + (chapter + 1) + ' / ' + chapters.length + ' 章' : '待展卷'}</span>
-            <small>{reading ? '全书 ' + percent.toFixed(1) + '%' : '书径 · 在线阅读'}</small>
+            <small>{reading ? (reading.index.source ? '按章节估算 ' : '全书 ') + percent.toFixed(1) + '%' : '书径 · 在线阅读'}</small>
           </button>
           <button className={styles.chapterButton} disabled={!reading || loading || !hasNextChapter} onClick={() => navigate(position(chapter + 1))}>下一章 →</button>
         </div>
