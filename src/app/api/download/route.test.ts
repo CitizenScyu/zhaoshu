@@ -35,7 +35,7 @@ function expectSafeReclaim(index: number) {
   expect(sql.mock.calls[index].slice(1)).toEqual(['\nworker 中断自动回收', 30 * 60_000]);
 }
 
-const book = { id: 7, title: '测试书', author: '作者', source_url: 'https://books.example/7' };
+const book = { id: 7, title: '测试书', author: '作者', source_url: 'https://book15.net/books/details7.html' };
 const recoveredTask = {
   id: 42,
   book_id: book.id,
@@ -147,6 +147,38 @@ describe('/api/download recovery and cleanup', () => {
     expectSafeReclaim(1);
     expect(sql).toHaveBeenCalledTimes(3);
     expect(triggerDownloadWorkflow).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    'http://book15.net/a', 'https://book15.net.evil.invalid/a', 'https://unknown.invalid/a',
+    'https://www.book15.net/a', 'https://user@book15.net/a', 'https://@book15.net/a',
+    'https://book15.net:444/a', 'https://127.0.0.1/a', 'https://[::1]/a', 'not a URL',
+  ])('拒绝书库中的非法来源 %s，不入队或 dispatch', async (source_url) => {
+    sql.mockResolvedValueOnce([{ ...book, source_url }]);
+    const res = await POST(request('POST', { bookId: book.id, sourceUrl: book.source_url }));
+    expect(res.status).toBe(400);
+    expect(await res.json()).toMatchObject({ code: 'UNSUPPORTED_SOURCE' });
+    expect(sql).toHaveBeenCalledOnce();
+    expect(queryText(0)).toContain('FROM labeled_books');
+    expect(triggerDownloadWorkflow).not.toHaveBeenCalled();
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it('保留缺来源的错误契约', async () => {
+    sql.mockResolvedValueOnce([{ ...book, source_url: '' }]);
+    const res = await POST(request('POST', { bookId: book.id }));
+    expect(res.status).toBe(400);
+    expect(await res.json()).toMatchObject({ code: 'MISSING_SOURCE_URL' });
+    expect(sql).toHaveBeenCalledOnce();
+    expect(triggerDownloadWorkflow).not.toHaveBeenCalled();
+  });
+
+  it('规范化书库 HTTPS 地址入队，忽略客户端自报地址', async () => {
+    sql.mockResolvedValueOnce([{ ...book, source_url: 'https://BOOK15.NET:443/books/details7.html#chapters' }])
+      .mockResolvedValueOnce([]).mockResolvedValueOnce([]).mockResolvedValueOnce([{ id: 43 }]);
+    expect((await POST(request('POST', { bookId: book.id, sourceUrl: 'https://127.0.0.1/private' }))).status).toBe(201);
+    expect(sql.mock.calls[3].slice(1)).toEqual([book.id, book.title, book.author, book.source_url]);
+    expect(triggerDownloadWorkflow).toHaveBeenCalledOnce();
   });
 
   it('does not enqueue or dispatch when recovery fails during POST', async () => {
