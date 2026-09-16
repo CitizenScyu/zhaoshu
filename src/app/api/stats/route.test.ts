@@ -20,6 +20,8 @@ const tokens: TokenStats = {
   ],
 };
 const emptyTokens: TokenStats = { total: zero, last24h: zero, byPhase: LLM_USAGE_PHASES.map((phase) => ({ phase, ...zero })) };
+const sourceCounts = { total: 10, active: 1, enabled: 8, disabled: 2, unprobed: 5, pending: 2, reachable: 2, failed: 1 };
+const emptySourceCounts = { total: 0, active: 0, enabled: 0, disabled: 0, unprobed: 0, pending: 0, reachable: 0, failed: 0 };
 
 const fixtures = [
   { section: 'library', needle: 'count(quality)', rows: [{ total: 12, with_quality: 10, avg_quality: 8.2, chars_labeled: 360000 }], empty: [{ total: 0, with_quality: 0, avg_quality: null, chars_labeled: 0 }] },
@@ -27,7 +29,8 @@ const fixtures = [
   { section: 'download', needle: 'FROM download_tasks', rows: [{ total: 3, done: 2, chapters: 100, chars: 400000 }], empty: [{ total: 0, done: 0, chapters: 0, chars: 0 }] },
   { section: 'find', needle: 'count(DISTINCT query)', rows: [{ queries: 4, recommendations: 6 }], empty: [{ queries: 0, recommendations: 0 }] },
   { section: 'shelf', needle: 'GROUP BY status', rows: [{ name: 'want', count: 6 }], empty: [] },
-  { section: 'shuyuan', needle: 'FROM shuyuan_sources', rows: [{ total: 10, active: 8 }], empty: [{ total: 0, active: 0 }] },
+  { section: 'shuyuan', needle: 'FROM shuyuan_meta', rows: [{ collections: [], refreshed_at: null }], empty: [] },
+  { section: 'shuyuan', needle: 'FROM shuyuan_sources', rows: [sourceCounts], empty: [emptySourceCounts] },
   { section: 'tokens', needle: 'FROM llm_usage', rows: [], empty: [] },
 ];
 
@@ -76,7 +79,7 @@ describe('GET /api/stats', () => {
       library: { total: 12, withQuality: 10, avgQuality: 8.2, charsLabeled: 360000, genres: [{ name: '仙侠', count: 12 }] },
       download: { total: 3, done: 2, chapters: 100, chars: 400000 },
       find: { queries: 4, recommendations: 6 }, shelf: { statuses: [{ name: 'want', count: 6 }] },
-      shuyuan: { total: 10, active: 8 }, tokens,
+      shuyuan: sourceCounts, tokens,
       availability: { library: true, download: true, find: true, shelf: true, shuyuan: true, tokens: true },
     });
     const findQuery = sql.mock.calls.find(([strings]) => (strings as TemplateStringsArray).join('').includes('count(DISTINCT query)'));
@@ -91,7 +94,7 @@ describe('GET /api/stats', () => {
     expect(await res.json()).toEqual({
       library: { total: 0, withQuality: 0, avgQuality: null, charsLabeled: 0, genres: [] },
       download: { total: 0, done: 0, chapters: 0, chars: 0 }, find: { queries: 0, recommendations: 0 },
-      shelf: { statuses: [] }, shuyuan: { total: 0, active: 0 }, tokens: emptyTokens,
+      shelf: { statuses: [] }, shuyuan: emptySourceCounts, tokens: emptyTokens,
       availability: { library: true, download: true, find: true, shelf: true, shuyuan: true, tokens: true },
     });
   });
@@ -111,6 +114,16 @@ describe('GET /api/stats', () => {
       expect(data[key]).not.toBeNull();
     }
     expect(JSON.stringify(data)).not.toContain('private database details');
+  });
+
+  it('启用数量与探测可达数量独立，active 只计启用且真实可达', async () => {
+    const data = await (await GET(request())).json();
+    expect(data.shuyuan).toEqual(sourceCounts);
+    expect(data.shuyuan.active).not.toBe(data.shuyuan.enabled);
+    const query = sql.mock.calls.find(([strings]) => (strings as TemplateStringsArray).join('').includes('FROM shuyuan_sources'));
+    expect((query![0] as TemplateStringsArray).join('')).toContain("disabled_at IS NULL AND p.status = 'reachable'");
+    expect((query![0] as TemplateStringsArray).join('')).toContain('AS unprobed');
+    expect((query![0] as TemplateStringsArray).join('')).toContain('AS pending');
   });
 
   it.each(['schema', 'client', 'all queries'])('returns controlled 503 for failed %s', async (stage) => {

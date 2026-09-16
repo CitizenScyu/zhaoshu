@@ -278,7 +278,7 @@ export default function StatsTab() {
           {/* 书源一笔账 */}
           <p className="text-xs" style={{ color: 'var(--ink-faint)' }}>
             {stats.shuyuan
-              ? `另有书源资料 ${stats.shuyuan.total} 条（未停用 ${stats.shuyuan.active} 条），目前仅维护元数据，尚未接入找书验证或试读。`
+              ? `另有书源资料 ${stats.shuyuan.total} 条（启用 ${stats.shuyuan.enabled} 条；最近探测可达 ${stats.shuyuan.reachable} 条；未探测 ${stats.shuyuan.unprobed} 条；待核验 ${stats.shuyuan.pending} 条）。启用不代表可用，尚未接入找书验证或试读。`
               : '书源统计暂不可用。'}
           </p>
         </div>
