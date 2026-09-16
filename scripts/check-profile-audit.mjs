@@ -96,5 +96,57 @@ try {
     assert.equal((await save([], 'wrong user', current.version, 2)).rows.length, 0);
   });
 
+  // --- CAS CASE coverage: the version must advance on real changes and only on real changes. ---
+
+  await scenario('a byte-identical write is a no-op that keeps the optimistic-lock version', async () => {
+    const before = await savedProfile();
+    const auditCount = (await audits()).length;
+    const result = await save(before.seeds, before.content, before.version);
+    assert.equal(result.rows.length, 1, 'the matching version must still return the CAS row');
+    const after = await savedProfile();
+    assert.deepEqual(after.seeds, before.seeds);
+    assert.equal(after.content, before.content);
+    assert.equal(after.version, before.version, 'identical seeds and content must not advance updated_at');
+    assert.equal((await audits()).length, auditCount, 'identical seeds must not append a seed audit row');
+    const again = await save(before.seeds, before.content, before.version);
+    assert.equal(again.rows.length, 1, 'the kept version must remain valid for drafts still holding it');
+    assert.equal((await savedProfile()).version, before.version, 'repeated no-op writes must not advance it either');
+  });
+
+  await scenario('a content-only change advances the version without a seed audit row', async () => {
+    const before = await savedProfile();
+    const auditCount = (await audits()).length;
+    assert.equal((await save(before.seeds, before.content + ' v2', before.version)).rows.length, 1);
+    const after = await savedProfile();
+    assert.equal(after.content, before.content + ' v2');
+    assert.notEqual(after.version, before.version, 'changed content must advance updated_at');
+    assert.equal((await audits()).length, auditCount, 'unchanged seeds must not append a seed audit row');
+    assert.equal((await save([], 'stale after content change', before.version)).rows.length, 0,
+      'the pre-change version must now be stale');
+  });
+
+  await scenario('a seed-only change advances the version and records the diff', async () => {
+    const before = await savedProfile();
+    const auditCount = (await audits()).length;
+    const nextSeeds = [...before.seeds, seed('新书')];
+    assert.equal((await save(nextSeeds, before.content, before.version)).rows.length, 1,
+      'identified content with changed seeds must advance, not no-op');
+    const after = await savedProfile();
+    assert.deepEqual(after.seeds, nextSeeds);
+    assert.equal(after.content, before.content);
+    assert.notEqual(after.version, before.version, 'changed seeds with identical content must advance updated_at');
+    const rows = await audits();
+    assert.equal(rows.length, auditCount + 1, 'changed seeds must commit exactly one audit row');
+    const [audit] = rows.slice(-1);
+    assert.deepEqual(audit.added_titles, ['新书']);
+    assert.deepEqual(audit.removed_titles, []);
+    assert.deepEqual(audit.previous_seeds, before.seeds);
+    assert.deepEqual(audit.saved_seeds, nextSeeds);
+    assert.equal(audit.previous_version, before.version);
+    assert.equal(audit.saved_version, after.version);
+    assert.equal((await save([], 'stale after seed change', before.version)).rows.length, 0,
+      'the pre-change version must now be stale');
+  });
+
   console.log(JSON.stringify({ engine: 'PGlite (in-memory PostgreSQL)', passed: scenarios.length, scenarios }, null, 2));
 } finally { await db.close(); }
