@@ -4,6 +4,7 @@ import { ensureSchema, getSql } from '@/lib/db';
 import { triggerDownloadWorkflow } from '@/lib/github';
 import { boundedPositiveInteger, readJsonBody, RequestBodyError } from '@/lib/http';
 import { DOWNLOAD_TASK_STALE_MS } from '@/lib/download-task-policy';
+import { SourcePolicyError, validateSourceUrl } from '@/lib/source-policy';
 
 // 书库下载任务:GET 查任务(最近 20 条或单条)、POST 建任务、DELETE 取消 pending/清理 failed
 export const maxDuration = 60;
@@ -118,6 +119,14 @@ export async function POST(req: NextRequest) {
     if (!book.source_url) {
       return NextResponse.json({ error: '该书没有来源链接', code: 'MISSING_SOURCE_URL' }, { status: 400 });
     }
+    let sourceUrl: string;
+    try {
+      // 只相信书库记录中的来源，客户端自报地址不能扩大 worker 的访问范围。
+      sourceUrl = validateSourceUrl(book.source_url).href;
+    } catch (error) {
+      if (!(error instanceof SourcePolicyError)) throw error;
+      return NextResponse.json({ error: error.message, code: 'UNSUPPORTED_SOURCE' }, { status: 400 });
+    }
     // 直接重试也先回收，避免必须先打开详情页查询才能解除僵尸任务的防重锁。
     await reclaimStaleTasks(sql);
     // 同一本书有进行中的任务就直接返回它,避免重复入队
@@ -133,7 +142,7 @@ export async function POST(req: NextRequest) {
     }
     const created = (await sql`
       INSERT INTO download_tasks (book_id, title, author, source_url, status)
-      VALUES (${bookId}, ${book.title}, ${book.author}, ${book.source_url}, 'pending')
+      VALUES (${bookId}, ${book.title}, ${book.author}, ${sourceUrl}, 'pending')
       RETURNING id`) as { id: number }[];
     // 立刻唤醒 worker,不等 cron:dispatch 失败绝不能影响建任务结果(Vercel 环境要 await,否则函数可能被提前冻结)
     try {

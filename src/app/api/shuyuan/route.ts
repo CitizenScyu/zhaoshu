@@ -33,10 +33,10 @@ export async function GET(req: NextRequest) {
     await ensureSchema();
     if (unauthorized) {
       // cron 路径：直接刷新
-      const stats = await refreshShuyuan();
+      const stats = await refreshShuyuan(req.signal);
       return NextResponse.json(stats);
     }
-    return NextResponse.json(await getShuyuanStats());
+    return NextResponse.json(await getShuyuanStats(req.signal));
   } catch (e) {
     const message = e instanceof Error ? e.message : 'internal error';
     return NextResponse.json({ error: message }, { status: 502 });
@@ -71,7 +71,7 @@ export async function POST(req: NextRequest) {
     if (action !== 'refresh') {
       return NextResponse.json({ error: 'unknown action' }, { status: 400 });
     }
-    const stats = await refreshShuyuan();
+    const stats = await refreshShuyuan(req.signal);
     return NextResponse.json(stats);
   } catch (e) {
     const message = e instanceof Error ? e.message : '刷新失败';

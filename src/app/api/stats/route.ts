@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { requireApiOwner } from '@/lib/auth';
 import { ensureSchema, getLlmUsageStats, getSql } from '@/lib/db';
 import type { TokenStats } from '@/lib/llm-usage';
+import { getShuyuanCounts, type ShuyuanCounts } from '@/lib/shuyuan';
 
 // 项目统计：聚合各表数据做「账本/战果」展示。全部用 SQL 聚合，不拉全表。
 // 每组独立容错：真实空数据为 0，查询失败的整个分区为 null。
@@ -32,10 +33,7 @@ export interface StatsResponse {
   shelf: {
     statuses: { name: string; count: number }[];
   } | null;
-  shuyuan: {
-    total: number;
-    active: number;
-  } | null;
+  shuyuan: ShuyuanCounts | null;
   tokens: TokenStats | null;
   availability: Record<StatsSection, boolean>;
   error?: string;
@@ -143,12 +141,7 @@ export async function GET(req: NextRequest) {
   }
 
   try {
-    const rows = (await s`
-      SELECT count(*)::int AS total,
-             count(*) FILTER (WHERE disabled_at IS NULL)::int AS active
-      FROM shuyuan_sources`) as { total: number; active: number }[];
-    if (!rows[0]) throw new Error('Missing shuyuan aggregate');
-    stats.shuyuan = rows[0];
+    stats.shuyuan = await getShuyuanCounts();
     stats.availability.shuyuan = true;
   } catch (e) {
     console.error('stats shuyuan aggregate failed:', e);

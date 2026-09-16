@@ -1,0 +1,218 @@
+[
+  {
+    "name": "详情页",
+    "input": "https://book15.net/books/details6728.html",
+    "expected": "https://book15.net/books/details6728.html"
+  },
+  {
+    "name": "HTTPS 和域名大小写",
+    "input": "HTTPS://BOOK15.NET/books/a",
+    "expected": "https://book15.net/books/a"
+  },
+  {
+    "name": "显式 443",
+    "input": "https://book15.net:443/a",
+    "expected": "https://book15.net/a"
+  },
+  {
+    "name": "省略路径",
+    "input": "https://book15.net",
+    "expected": "https://book15.net/"
+  },
+  {
+    "name": "相对章节",
+    "input": "../chapter/index1-2.html",
+    "base": "https://book15.net/books/details1.html",
+    "expected": "https://book15.net/chapter/index1-2.html"
+  },
+  {
+    "name": "根相对章节",
+    "input": "/chapter/index1-2.html",
+    "base": "https://book15.net/books/details1.html",
+    "expected": "https://book15.net/chapter/index1-2.html"
+  },
+  {
+    "name": "同域协议相对链接",
+    "input": "//book15.net:443/a",
+    "base": "https://book15.net/books/1",
+    "expected": "https://book15.net/a"
+  },
+  {
+    "name": "路径中的 @ 不是 userinfo",
+    "input": "https://book15.net/a@b?x=@",
+    "expected": "https://book15.net/a@b?x=@"
+  },
+  {
+    "name": "片段不参与请求",
+    "input": "#next",
+    "base": "https://book15.net/a",
+    "expected": "https://book15.net/a"
+  },
+  {
+    "name": "HTTP 降级",
+    "input": "http://book15.net/a"
+  },
+  {
+    "name": "非 443 端口",
+    "input": "https://book15.net:444/a"
+  },
+  {
+    "name": "HTTP 端口",
+    "input": "https://book15.net:80/a"
+  },
+  {
+    "name": "空端口",
+    "input": "https://book15.net:/a"
+  },
+  {
+    "name": "端口非标准写法",
+    "input": "https://book15.net:0443/a"
+  },
+  {
+    "name": "未知域",
+    "input": "https://unknown.invalid/a"
+  },
+  {
+    "name": "子域",
+    "input": "https://www.book15.net/a"
+  },
+  {
+    "name": "任意子域",
+    "input": "https://sub.book15.net/a"
+  },
+  {
+    "name": "伪后缀",
+    "input": "https://book15.net.evil.invalid/a"
+  },
+  {
+    "name": "伪前缀",
+    "input": "https://evilbook15.net/a"
+  },
+  {
+    "name": "尾随点",
+    "input": "https://book15.net./a"
+  },
+  {
+    "name": "userinfo",
+    "input": "https://user@book15.net/a"
+  },
+  {
+    "name": "密码",
+    "input": "https://user:pass@book15.net/a"
+  },
+  {
+    "name": "空 userinfo",
+    "input": "https://@book15.net/a"
+  },
+  {
+    "name": "空用户名密码",
+    "input": "https://:@book15.net/a"
+  },
+  {
+    "name": "混淆域名的 @",
+    "input": "https://book15.net@evil.invalid/a"
+  },
+  {
+    "name": "IPv4",
+    "input": "https://127.0.0.1/a"
+  },
+  {
+    "name": "私网 IPv4",
+    "input": "https://10.0.0.1/a"
+  },
+  {
+    "name": "十进制 IPv4",
+    "input": "https://2130706433/a"
+  },
+  {
+    "name": "十六进制 IPv4",
+    "input": "https://0x7f000001/a"
+  },
+  {
+    "name": "IPv6",
+    "input": "https://[::1]/a"
+  },
+  {
+    "name": "映射 IPv6",
+    "input": "https://[::ffff:127.0.0.1]/a"
+  },
+  {
+    "name": "缺少基址",
+    "input": "/chapter/index1-2.html"
+  },
+  {
+    "name": "非法基址",
+    "input": "/chapter/index1-2.html",
+    "base": "https://evil.invalid/a"
+  },
+  {
+    "name": "带空 userinfo 的基址",
+    "input": "/chapter/index1-2.html",
+    "base": "https://@book15.net/a"
+  },
+  {
+    "name": "跨域相对链接",
+    "input": "//evil.invalid/a",
+    "base": "https://book15.net/a"
+  },
+  {
+    "name": "相对私网跳转",
+    "input": "//192.168.1.1/a",
+    "base": "https://book15.net/a"
+  },
+  {
+    "name": "相对空 userinfo",
+    "input": "//@book15.net/a",
+    "base": "https://book15.net/a"
+  },
+  {
+    "name": "额外斜线",
+    "input": "https:////@book15.net/a"
+  },
+  {
+    "name": "相对额外斜线",
+    "input": "///book15.net/a",
+    "base": "https://book15.net/a"
+  },
+  {
+    "name": "缺少双斜线",
+    "input": "https:book15.net/a"
+  },
+  {
+    "name": "反斜线",
+    "input": "https://book15.net\\@evil.invalid/a"
+  },
+  {
+    "name": "空白",
+    "input": " https://book15.net/a"
+  },
+  {
+    "name": "换行",
+    "input": "https://book15.net/\npath"
+  },
+  {
+    "name": "NUL",
+    "input": "https://book15.net/\u0000"
+  },
+  {
+    "name": "JavaScript 协议",
+    "input": "javascript:alert(1)",
+    "base": "https://book15.net/a"
+  },
+  {
+    "name": "解析失败",
+    "input": "https://["
+  },
+  {
+    "name": "空字符串",
+    "input": ""
+  },
+  {
+    "name": "null",
+    "input": null
+  },
+  {
+    "name": "非字符串",
+    "input": 42
+  }
+]
