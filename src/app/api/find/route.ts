@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { chatRobust, configuredTotalTimeoutMs, parseJson, LlmError } from '@/lib/llm';
 import { recordUsageAfterResponse } from '@/lib/record-llm-usage';
 import { verifyBatch } from '@/lib/douban';
+import { supplementSourceEvidence } from '@/lib/source-verification';
 import {
   ensureSchema,
   getExcludedBookKeys,
@@ -132,13 +133,17 @@ export async function POST(req: NextRequest) {
             return;
           }
           emit({ type: 'phase', step: 'verify', total: candidates.length });
-          const infos = await verifyBatch(candidates, deadline.signal, (done) => {
+          const verifySignal = AbortSignal.any([req.signal, deadline.signal]);
+          const infos = await verifyBatch(candidates, verifySignal, (done) => {
             emit({ type: 'progress', step: 'verify', done, total: candidates.length });
           });
-          const verified: VerifiedCandidate[] = candidates.map((c, i) => ({
+          const doubanVerified: VerifiedCandidate[] = candidates.map((c, i) => ({
             ...c,
             douban: infos[i],
           }));
+          const verified = await supplementSourceEvidence(doubanVerified, deadline, verifySignal, (sourceDone, sourceTotal) => {
+            emit({ type: 'progress', step: 'verify', done: candidates.length, total: candidates.length, provider: 'source', sourceDone, sourceTotal });
+          });
           emit({ type: 'result', step: 'verify', verified });
           return;
         }
@@ -174,6 +179,7 @@ export async function POST(req: NextRequest) {
                 category: source.category,
                 wordCount: source.wordCount,
                 douban: source.douban,
+                ...(source.sourceEvidence ? { sourceEvidence: source.sourceEvidence } : {}),
               };
             })
             .sort((a, b) => b.matchScore - a.matchScore)

@@ -10,6 +10,7 @@ const mocks = vi.hoisted(() => ({
   persistRecommendations: vi.fn(),
   chatRobust: vi.fn(),
   verifyBatch: vi.fn(),
+  supplementSourceEvidence: vi.fn(),
 }));
 vi.mock('@/lib/db', () => ({
   ensureSchema: mocks.ensureSchema,
@@ -23,6 +24,7 @@ vi.mock('@/lib/llm', async (importOriginal) => ({
   chatRobust: async (...args: unknown[]) => ({ content: await mocks.chatRobust(...args) }),
 }));
 vi.mock('@/lib/douban', () => ({ verifyBatch: mocks.verifyBatch }));
+vi.mock('@/lib/source-verification', () => ({ supplementSourceEvidence: mocks.supplementSourceEvidence }));
 import { POST } from './route';
 
 const candidate = {
@@ -72,6 +74,7 @@ describe('POST /api/find output contract', () => {
     mocks.getExcludedBookTitles.mockResolvedValue([]);
     mocks.persistRecommendations.mockResolvedValue(undefined);
     mocks.verifyBatch.mockImplementation(async (candidates: unknown[]) => candidates.map(() => douban));
+    mocks.supplementSourceEvidence.mockImplementation(async (candidates) => candidates);
   });
   afterEach(() => { vi.unstubAllEnvs(); vi.restoreAllMocks(); });
 
@@ -264,5 +267,25 @@ describe('POST /api/find output contract', () => {
     const progress = events.filter((e) => e.type === 'progress');
     expect(progress[0]).toEqual({ type: 'progress', step: 'verify', done: 1, total: 2 });
     expect(progress[1]).toEqual({ type: 'progress', step: 'verify', done: 2, total: 2 });
+  });
+
+  it('adds independent source evidence inside verify and carries it through rerank', async () => {
+    const missing = { status: 'not_found', found: false };
+    const evidence = { status: 'matched', sourceName: '测试书源', url: 'https://book15.net/books/details42.html', checkedAt: '2026-09-16T00:00:00Z', note: '匹配目录，仅补充存在性' };
+    mocks.verifyBatch.mockResolvedValue([missing]);
+    mocks.supplementSourceEvidence.mockImplementation(async (candidates, _deadline, signal, progress) => {
+      expect(signal).toBeInstanceOf(AbortSignal);
+      progress(1, 1);
+      return candidates.map((entry: object) => ({ ...entry, sourceEvidence: evidence }));
+    });
+    const events = await consumeSSE(await POST(request({ step: 'verify', candidates: [candidate] })));
+    const result = lastEvent<{ type: string; verified: unknown[] }>(events, 'result');
+    expect(result.verified[0]).toMatchObject({ douban: missing, sourceEvidence: evidence });
+    expect(events.some((event) => event.step === 'verify' && event.provider === 'source')).toBe(true);
+    expect(events.every((event) => event.step === 'verify')).toBe(true);
+    mocks.chatRobust.mockResolvedValue(JSON.stringify({ items: [{ ...item, sourceEvidence: { status: 'forged' } }] }));
+    const reranked = await consumeSSE(await POST(request({ step: 'rerank', query: '找书', verified: result.verified })));
+    expect(lastEvent<{ type: string; items: unknown[] }>(reranked, 'result').items[0]).toMatchObject({ sourceEvidence: evidence, douban: missing });
+    expect(mocks.chatRobust.mock.calls[0][1]).toContain('仅补充存在性');
   });
 });

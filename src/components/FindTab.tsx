@@ -4,6 +4,7 @@ import { useEffect, useRef, useState, useSyncExternalStore } from 'react';
 import type { Candidate, RerankedItem, VerifiedCandidate, FeedbackStatus } from '@/lib/types';
 import { useOwner } from '@/components/OwnerProvider';
 import FeedbackEditor from '@/components/FeedbackEditor';
+import ReadBookLink from '@/components/ReadBookLink';
 import { isRecord } from '@/lib/sanitize';
 
 // 找书三步的后端下行是真 SSE：事件 `data: <json>\n\n`。phase/progress 实时帧、
@@ -114,6 +115,7 @@ export default function FindTab() {
   const [onlyThisTime, setOnlyThisTime] = useState(false); // 「仅本次有效」checkbox：默认不勾=长期
   const [verifyTotal, setVerifyTotal] = useState(0);
   const [verifyDone, setVerifyDone] = useState(0);
+  const [sourceProgress, setSourceProgress] = useState<{ done: number; total: number } | null>(null);
   const [phase, setPhase] = useState<Phase>('idle');
   const [candidates, setCandidates] = useState<Candidate[]>([]);
   const [results, setResults] = useState<RerankedItem[]>([]);
@@ -143,6 +145,7 @@ export default function FindTab() {
     setResults([]);
     setVerifyTotal(0);
     setVerifyDone(0);
+    setSourceProgress(null);
     const controller = new AbortController();
     request.current = controller;
 
@@ -233,6 +236,10 @@ export default function FindTab() {
         } else if (event.type === 'progress' && event.step === 'verify') {
           setVerifyTotal(typeof event.total === 'number' ? event.total : 0);
           setVerifyDone(typeof event.done === 'number' ? event.done : 0);
+          if (event.provider === 'source') setSourceProgress({
+            done: typeof event.sourceDone === 'number' ? event.sourceDone : 0,
+            total: typeof event.sourceTotal === 'number' ? event.sourceTotal : 0,
+          });
         } else if (event.type === 'phase' && event.step === 'verify') {
           setVerifyTotal(typeof event.total === 'number' ? event.total : 0);
         }
@@ -243,7 +250,7 @@ export default function FindTab() {
   const busy = phase === 'recall' || phase === 'verify' || phase === 'rerank';
   const steps: { key: Phase; label: string }[] = [
     { key: 'recall', label: `召回${candidates.length ? ` ${candidates.length} 本` : ''}` },
-    { key: 'verify', label: `豆瓣验证${verifyTotal ? ` ${verifyDone}/${verifyTotal}` : ''}` },
+    { key: 'verify', label: sourceProgress ? `书源补验 ${sourceProgress.done}/${sourceProgress.total}` : `豆瓣验证${verifyTotal ? ` ${verifyDone}/${verifyTotal}` : ''}` },
     { key: 'rerank', label: '按画像重排' },
   ];
 
@@ -446,6 +453,19 @@ function BookCard({
               {item.douban.note && <p>验证说明：{item.douban.note}</p>}
             </div>
           )}
+
+          {item.sourceEvidence && (
+            <div className="mt-2 border-l-2 pl-3 text-xs leading-6" style={{ borderColor: 'var(--dai)', color: 'var(--ink-soft)' }}>
+              <p className="font-bold" style={{ color: 'var(--dai)' }}>书源存在性补验</p>
+              {item.sourceEvidence.status === 'matched' && <p>
+                已找到匹配目录 · {item.sourceEvidence.sourceName}
+                {item.sourceEvidence.url && <> · <a href={item.sourceEvidence.url} target="_blank" rel="noreferrer" className="underline underline-offset-2">查看书源</a></>}
+              </p>}
+              <p>{item.sourceEvidence.note}</p>
+            </div>
+          )}
+
+          <div className="mt-3"><ReadBookLink title={item.title} author={item.author} from="find" label="直接阅读" /></div>
 
           {(item.hitLikes?.length > 0) && (
             <div className="flex flex-wrap items-center gap-1.5 mt-2">
