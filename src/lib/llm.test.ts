@@ -79,6 +79,10 @@ const event = (value: unknown) => 'data: ' + JSON.stringify(value) + '\n\n';
 const token = (content: unknown) => event({ choices: [{ index: 0, delta: { content }, finish_reason: null }] });
 const finish = (reason: string) => event({ choices: [{ index: 0, delta: {}, finish_reason: reason }] });
 
+// 逐字钉死文案：它的作用是让运维一眼看出「预算是被思考吃掉的」，不是输入太长。
+const REASONING_BUDGET_MESSAGE =
+  '模型把输出预算用在了思考上（推理模型的思维链与正文共享额度），正文未产出。请重试，或改用非推理模型。';
+
 function response(parts: (string | Uint8Array)[], keepOpen = false, cancel = vi.fn()) {
   const encoder = new TextEncoder();
   return new Response(new ReadableStream<Uint8Array>({
@@ -155,9 +159,34 @@ describe('stream completion and shared call budget', () => {
   ])('rejects length truncation even when the accumulated body looks valid %#', async (sse) => {
     fetchMock.mockResolvedValue(response([sse]));
     await expect(client.chatRobust('system', 'user')).rejects.toMatchObject({
-      message: expect.stringContaining('长度限制被截断'), retryable: false,
+      message: REASONING_BUDGET_MESSAGE, retryable: false,
     });
     expect(fetchMock).toHaveBeenCalledOnce();
+  });
+
+  // 推理模型（上游 claude-opus-5-88）把 max_tokens 花在思维链上时，finish_reason 报
+  // max_tokens；它不能落进「未以完整正文结束」的兜底分支，那会误导排查方向。
+  it.each(['length', 'max_tokens'])(
+    'classifies finish_reason=%s as a thinking-budget exhaustion, not a generic tail %#', async (reason) => {
+      fetchMock.mockResolvedValue(response([
+        event({ choices: [{ delta: { reasoning_content: '长思维链' } }] }),
+        finish(reason), 'data: [DONE]\n\n',
+      ]));
+      await expect(client.chatRobust('system', 'user')).rejects.toMatchObject({
+        message: REASONING_BUDGET_MESSAGE, retryable: false,
+      });
+      expect(fetchMock).toHaveBeenCalledOnce();
+    },
+  );
+
+  it('does not blame the input length for a truncated reasoning model answer', async () => {
+    fetchMock.mockResolvedValue(response([finish('max_tokens'), 'data: [DONE]\n\n']));
+    const error = await client.chat('system', 'user').catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(client.LlmError);
+    const message = (error as Error).message;
+    expect(message).not.toMatch(/缩短输入|输入过长|长度限制被截断|未以完整正文结束/);
+    expect(message).toMatch(/思考|推理模型/);
+    expect(message).not.toMatch(/deepseek|claude-opus|LLM_|https?:/);
   });
 
   it.each([
@@ -378,15 +407,74 @@ describe('stream completion and shared call budget', () => {
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
-  it('preserves non-ASCII request escaping and bounded max_tokens', async () => {
+  it('preserves non-ASCII request escaping and the default max_tokens bound', async () => {
     fetchMock.mockResolvedValue(response([token('正文'), 'data: [DONE]\n\n']));
-    await client.chat('系统😀', '用户中文', { maxTokens: 9000 });
+    await client.chat('系统😀', '用户中文', { maxTokens: 9_000 });
     const sent = String(fetchMock.mock.calls[0][1]?.body);
     expect([...sent].every((char) => char.charCodeAt(0) <= 127)).toBe(true);
     expect(sent).toContain('\\u');
     expect(JSON.parse(sent)).toMatchObject({
-      stream: true, max_tokens: 3000,
+      stream: true, max_tokens: 9_000,
       messages: [{ role: 'system', content: '系统😀' }, { role: 'user', content: '用户中文' }],
+    });
+  });
+
+  // 回归护栏：推理模型的思维链与正文共享 max_tokens，缺省值回到非推理模型的量级
+  // （3000）就会让正文为空，用例必须失败。
+  describe('output token budget', () => {
+    const sentMaxTokens = () => JSON.parse(String(fetchMock.mock.calls[0][1]?.body)).max_tokens as number;
+
+    it('defaults to a reasoning-model-sized budget without an explicit option', async () => {
+      expect(client.configuredMaxTokens()).toBe(16_000);
+      fetchMock.mockResolvedValue(response([token('正文'), 'data: [DONE]\n\n']));
+      await client.chat('system', 'user');
+      expect(sentMaxTokens()).toBe(16_000);
+      expect(sentMaxTokens()).toBeGreaterThan(3_000);
+    });
+
+    it.each([
+      ['8000', 8_000],   // 合法值
+      ['20000', 20_000],
+      ['999999', 999_999], // 解析层面不截断，截断发生在调用方的 Math.min
+      ['0', 16_000],     // 非正数回退缺省
+      ['-5', 16_000],
+      ['abc', 16_000],   // 非法值回退缺省
+      ['', 16_000],
+      ['12abc', 12],     // parseInt 前缀语义
+    ])('parses LLM_MAX_TOKENS=%j as %i', (raw, expected) => {
+      vi.stubEnv('LLM_MAX_TOKENS', raw);
+      expect(client.configuredMaxTokens()).toBe(expected);
+    });
+
+    it('falls back to the default when LLM_MAX_TOKENS is unset', () => {
+      vi.stubEnv('LLM_MAX_TOKENS', undefined as unknown as string);
+      expect(client.configuredMaxTokens()).toBe(16_000);
+    });
+
+    it('honours the configured ceiling for callers that pass no value', async () => {
+      vi.stubEnv('LLM_MAX_TOKENS', '2000');
+      fetchMock.mockResolvedValue(response([token('正文'), 'data: [DONE]\n\n']));
+      await client.chat('system', 'user');
+      expect(sentMaxTokens()).toBe(2_000);
+    });
+
+    it('clamps a larger caller value down to the ceiling', async () => {
+      fetchMock.mockResolvedValue(response([token('正文'), 'data: [DONE]\n\n']));
+      await client.chat('system', 'user', { maxTokens: 999_999 });
+      expect(sentMaxTokens()).toBe(16_000);
+    });
+
+    it('clamps a larger caller value down to a lowered ceiling', async () => {
+      vi.stubEnv('LLM_MAX_TOKENS', '4000');
+      fetchMock.mockResolvedValue(response([token('正文'), 'data: [DONE]\n\n']));
+      await client.chat('system', 'user', { maxTokens: 9_000 });
+      expect(sentMaxTokens()).toBe(4_000);
+    });
+
+    it('lets a smaller caller value win over the ceiling', async () => {
+      fetchMock.mockResolvedValue(response([token('正文'), 'data: [DONE]\n\n']));
+      await client.chat('system', 'user', { maxTokens: 512 });
+      expect(sentMaxTokens()).toBe(512);
     });
   });
 });

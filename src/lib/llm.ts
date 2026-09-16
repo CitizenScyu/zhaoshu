@@ -13,7 +13,11 @@ const API_KEY = process.env.LLM_API_KEY || '';
 const MODEL = process.env.LLM_MODEL || 'claude-opus-5-88';
 const DEFAULT_TOTAL_TIMEOUT_MS = 280_000;
 const MAX_ROBUST_BUDGET_MS = 285_000;
-const DEFAULT_MAX_TOKENS = 3_000;
+// 上游 claude-opus-5-88 是推理模型：它先流式吐 delta.reasoning_content（思维链），
+// 再吐 delta.content（正文），两者共享同一个 max_tokens 预算。预算太小（实测 3000）
+// 会让思维链吃光额度，finish_reason=max_tokens 而正文为空。按非推理模型的用量定
+// max_tokens 会稳定踩这个坑，所以缺省值按推理模型给足，并留出环境变量可调。
+const DEFAULT_MAX_TOKENS = 16_000;
 const MAX_SSE_BUFFER = 256 * 1024;
 const MAX_CONTENT_LENGTH = 64 * 1024;
 
@@ -87,6 +91,15 @@ export function configuredTotalTimeoutMs(): number {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_TOTAL_TIMEOUT_MS;
 }
 
+// 缺省上限。调用方显式传的 maxTokens 只能往下压，不能突破它（见 chat 的 Math.min）。
+export function configuredMaxTokens(): number {
+  const parsed = Number.parseInt(
+    process.env.LLM_MAX_TOKENS ?? String(DEFAULT_MAX_TOKENS),
+    10,
+  );
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_MAX_TOKENS;
+}
+
 function asciiEscape(s: string): string {
   // 非 ASCII 转 \uXXXX：语义与 UTF-8 原文完全等价，但免疫链路上的编码损坏
   return s.replace(/[^\x00-\x7f]/g, (c) =>
@@ -111,6 +124,7 @@ export async function chat(
   opts.signal?.addEventListener('abort', cancel, { once: true });
   const totalTimer = setTimeout(() => controller.abort(), totalMs);
   const stream = opts.stream ?? true;
+  const maxTokensCeiling = configuredMaxTokens();
   const call: LlmCallUsage = {
     model: MODEL, requestId: null, createdAt: new Date().toISOString(), usage: parseLlmUsage(undefined),
   };
@@ -134,7 +148,7 @@ export async function chat(
         JSON.stringify({
           model: MODEL,
           temperature: opts.temperature ?? 0.7,
-          max_tokens: Math.min(opts.maxTokens ?? DEFAULT_MAX_TOKENS, DEFAULT_MAX_TOKENS),
+          max_tokens: Math.min(opts.maxTokens ?? maxTokensCeiling, maxTokensCeiling),
           stream,
           ...(stream ? { stream_options: { include_usage: true } } : {}),
           messages: [
@@ -228,8 +242,14 @@ function decodeSseEvent(event: unknown): { content: string; finished: boolean } 
   }
 
   const reason = choice.finish_reason;
-  if (reason === 'length') {
-    throw new LlmError('模型输出因长度限制被截断，请缩短输入后重试。', false);
+  // OpenAI 兼容网关对「撞到 max_tokens 上限」既可能报 length（官方名），也可能直接
+  // 回传 max_tokens。推理模型会把预算先花在思维链上，正文一个字都没产出——不是输入
+  // 太长，所以文案不能说「请缩短输入」，那会把排查引到错误方向。
+  if (reason === 'length' || reason === 'max_tokens') {
+    throw new LlmError(
+      '模型把输出预算用在了思考上（推理模型的思维链与正文共享额度），正文未产出。请重试，或改用非推理模型。',
+      false,
+    );
   }
   if (reason === 'content_filter') {
     throw new LlmError('模型输出被上游内容过滤中断，请调整输入后重试。', false);
