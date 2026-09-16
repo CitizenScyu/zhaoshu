@@ -4,19 +4,19 @@ import { bookKey } from '@/lib/sanitize';
 
 const mocks = vi.hoisted(() => ({
   ensureSchema: vi.fn(),
-  getProfile: vi.fn(),
-  getExcludedBookKeys: vi.fn(),
-  getExcludedBookTitles: vi.fn(),
-  persistRecommendations: vi.fn(),
+  getProfileForUser: vi.fn(),
+  getExcludedBookKeysForUser: vi.fn(),
+  getExcludedBookTitlesForUser: vi.fn(),
+  persistRecommendationsForUser: vi.fn(),
   chatRobust: vi.fn(),
   verifyBatch: vi.fn(),
 }));
 vi.mock('@/lib/db', () => ({
   ensureSchema: mocks.ensureSchema,
-  getProfile: mocks.getProfile,
-  getExcludedBookKeys: mocks.getExcludedBookKeys,
-  getExcludedBookTitles: mocks.getExcludedBookTitles,
-  persistRecommendations: mocks.persistRecommendations,
+  getProfileForUser: mocks.getProfileForUser,
+  getExcludedBookKeysForUser: mocks.getExcludedBookKeysForUser,
+  getExcludedBookTitlesForUser: mocks.getExcludedBookTitlesForUser,
+  persistRecommendationsForUser: mocks.persistRecommendationsForUser,
 }));
 vi.mock('@/lib/llm', async (importOriginal) => ({
   ...await importOriginal<typeof import('@/lib/llm')>(),
@@ -67,10 +67,10 @@ describe('POST /api/find output contract', () => {
     vi.resetAllMocks();
     vi.stubEnv('APP_OWNER_TOKEN', 'find-test-owner');
     mocks.ensureSchema.mockResolvedValue(undefined);
-    mocks.getProfile.mockResolvedValue({ seeds: [], content: '画像' });
-    mocks.getExcludedBookKeys.mockResolvedValue([]);
-    mocks.getExcludedBookTitles.mockResolvedValue([]);
-    mocks.persistRecommendations.mockResolvedValue(undefined);
+    mocks.getProfileForUser.mockResolvedValue({ seeds: [], content: '画像' });
+    mocks.getExcludedBookKeysForUser.mockResolvedValue([]);
+    mocks.getExcludedBookTitlesForUser.mockResolvedValue([]);
+    mocks.persistRecommendationsForUser.mockResolvedValue(undefined);
     mocks.verifyBatch.mockImplementation(async (candidates: unknown[]) => candidates.map(() => douban));
   });
   afterEach(() => { vi.unstubAllEnvs(); vi.restoreAllMocks(); });
@@ -89,7 +89,7 @@ describe('POST /api/find output contract', () => {
       const res = await POST(request({ step, query: '找书', verified: [verified] }));
       const events = await consumeSSE(res);
       expect(lastEvent<{ type: string; code: string; message: string }>(events, 'error').message).toMatch(/模型.*JSON/);
-      expect(mocks.persistRecommendations).not.toHaveBeenCalled();
+      expect(mocks.persistRecommendationsForUser).not.toHaveBeenCalled();
     }
   });
 
@@ -101,7 +101,7 @@ describe('POST /api/find output contract', () => {
       mocks.chatRobust.mockResolvedValue(JSON.stringify({ [field]: list }));
       const events = await consumeSSE(await POST(request({ step, query: '找书', verified: [verified] })));
       expect(lastEvent<{ type: string; message: string }>(events, 'error').message).toMatch(/字段或数量/);
-      expect(mocks.persistRecommendations).not.toHaveBeenCalled();
+      expect(mocks.persistRecommendationsForUser).not.toHaveBeenCalled();
     }
   });
 
@@ -126,7 +126,7 @@ describe('POST /api/find output contract', () => {
     expect(candidates).toEqual([{ ...candidate, source: 'llm' }]);
     expect(mocks.chatRobust.mock.calls[0][1]).toContain('# 用户口味画像\n\n画像');
     expect(mocks.chatRobust.mock.calls[0][1]).toContain('# 仅本次生效的条件\n\n这次轻松一点');
-    expect(mocks.persistRecommendations).not.toHaveBeenCalled();
+    expect(mocks.persistRecommendationsForUser).not.toHaveBeenCalled();
   });
 
   it('does not retain one-off conditions after the client clears them', async () => {
@@ -138,7 +138,7 @@ describe('POST /api/find output contract', () => {
   });
 
   it.each([undefined, '', '  '])('excludes exact seed titles with absent author %j and keeps sequels', async (author) => {
-    mocks.getProfile.mockResolvedValue({ seeds: [{ title: 'ＡＢＣ', author, kind: 'love' }], content: '画像' });
+    mocks.getProfileForUser.mockResolvedValue({ seeds: [{ title: 'ＡＢＣ', author, kind: 'love' }], content: '画像' });
     mocks.chatRobust.mockResolvedValue(JSON.stringify({ candidates: [
       { ...candidate, title: 'abc', author: '作者甲' },
       { ...candidate, title: ' abc ', author: '作者乙' },
@@ -150,8 +150,8 @@ describe('POST /api/find output contract', () => {
   });
 
   it('uses title + author for authored seeds and read/dropped records', async () => {
-    mocks.getProfile.mockResolvedValue({ seeds: [{ ...candidate, kind: 'drop' }], content: '画像' });
-    mocks.getExcludedBookKeys.mockResolvedValue([bookKey('已读书', '作者甲')]);
+    mocks.getProfileForUser.mockResolvedValue({ seeds: [{ ...candidate, kind: 'drop' }], content: '画像' });
+    mocks.getExcludedBookKeysForUser.mockResolvedValue([bookKey('已读书', '作者甲')]);
     mocks.chatRobust.mockResolvedValue(JSON.stringify({ candidates: [
       candidate,
       { ...candidate, author: '作者乙' },
@@ -202,27 +202,27 @@ describe('POST /api/find output contract', () => {
       title: 'ＡＢＣ', author: 'Ｘ', matchScore: 80, why: '原始理由', category: '仙侠', douban: { doubanId: '123' },
     });
     expect(mocks.chatRobust.mock.calls[0][1]).not.toContain('"why":"重复"');
-    expect(mocks.persistRecommendations).toHaveBeenCalledWith('找书', data.items);
+    expect(mocks.persistRecommendationsForUser).toHaveBeenCalledWith(1, '找书', data.items, expect.any(Function));
   });
 
   it.each([null, '', false, true])('does not persist an invalid score %j', async (matchScore) => {
     mocks.chatRobust.mockResolvedValue(JSON.stringify({ items: [{ ...item, matchScore }] }));
     const events = await consumeSSE(await POST(request({ step: 'rerank', query: '找书', verified: [verified] })));
     expect(lastEvent(events, 'error')).toBeTruthy();
-    expect(mocks.persistRecommendations).not.toHaveBeenCalled();
+    expect(mocks.persistRecommendationsForUser).not.toHaveBeenCalled();
   });
 
   it('does not persist an item containing database-illegal body text', async () => {
     mocks.chatRobust.mockResolvedValue(JSON.stringify({ items: [{ ...item, reason: 'bad' + String.fromCharCode(0) }] }));
     const events = await consumeSSE(await POST(request({ step: 'rerank', query: '找书', verified: [verified] })));
     expect(lastEvent(events, 'error')).toBeTruthy();
-    expect(mocks.persistRecommendations).not.toHaveBeenCalled();
+    expect(mocks.persistRecommendationsForUser).not.toHaveBeenCalled();
   });
 
   it('reports persistence failure without discarding valid recommendations', async () => {
     vi.spyOn(console, 'error').mockImplementation(() => {});
     mocks.chatRobust.mockResolvedValue(JSON.stringify({ items: [item] }));
-    mocks.persistRecommendations.mockRejectedValue(new Error('offline database'));
+    mocks.persistRecommendationsForUser.mockRejectedValue(new Error('offline database'));
     const events = await consumeSSE(await POST(request({ step: 'rerank', query: '找书', verified: [verified] })));
     const result = lastEvent<{ type: string; persisted: boolean; items: typeof item[] }>(events, 'result');
     expect(result.persisted).toBe(false);

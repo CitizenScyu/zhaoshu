@@ -3,10 +3,17 @@ import { NextRequest } from 'next/server';
 
 // 只 mock 数据库和网络：实际经过 chatRobust → SSE 解析 → 画像/反馈路由。
 const mocks = vi.hoisted(() => ({
-  ensureSchema: vi.fn(), getProfile: vi.fn(), saveProfile: vi.fn(), upsertBook: vi.fn(),
+  ensureSchema: vi.fn(), getProfileForUser: vi.fn(), saveProfileForUser: vi.fn(), upsertBook: vi.fn(),
   getSql: vi.fn(), sql: vi.fn(), transaction: vi.fn(),
 }));
-vi.mock('@/lib/db', () => mocks);
+vi.mock('@/lib/db', () => ({ ...mocks, recordFeedbackForUser: async (userId: number, book: { title: string; author: string }, status: string, note: string) => {
+    const actual = await vi.importActual<typeof import('@/lib/db')>('@/lib/db');
+    await actual.recordFeedbackForUser(userId, book, status, note, async (batch) => {
+      await mocks.transaction(batch(mocks.sql as never));
+      return [];
+    });
+  },
+  }));
 
 const event = (value: unknown) => 'data: ' + JSON.stringify(value) + '\n\n';
 const token = (content: string) => event({ choices: [{ delta: { content } }] });
@@ -37,8 +44,8 @@ describe('actual SSE failure cannot overwrite a profile', () => {
     vi.stubGlobal('fetch', fetchMock);
     vi.spyOn(console, 'error').mockImplementation(() => {});
     mocks.ensureSchema.mockResolvedValue(undefined);
-    mocks.getProfile.mockResolvedValue({ seeds, content: '原画像', updatedAt: previousVersion });
-    mocks.saveProfile.mockResolvedValue(nextVersion);
+    mocks.getProfileForUser.mockResolvedValue({ seeds, content: '原画像', updatedAt: previousVersion });
+    mocks.saveProfileForUser.mockResolvedValue(nextVersion);
     mocks.upsertBook.mockResolvedValue(42);
     mocks.getSql.mockReturnValue(Object.assign(mocks.sql, { transaction: mocks.transaction }));
     mocks.transaction.mockResolvedValue([]);
@@ -65,12 +72,12 @@ describe('actual SSE failure cannot overwrite a profile', () => {
     const error = events.find((e) => e.type === 'error');
     expect(error).toBeDefined();
     expect(String(error?.message)).toMatch(/模型|画像|无效|超时|截断|正文/);
-    expect(mocks.saveProfile).not.toHaveBeenCalled();
+    expect(mocks.saveProfileForUser).not.toHaveBeenCalled();
     const updated = await feedback.POST(request('feedback'));
     expect(updated.status).toBe(200);
     expect(await updated.json()).toEqual({ ok: true, profileUpdated: false });
     expect(mocks.transaction).toHaveBeenCalledOnce(); // 反馈仍被保存
-    expect(mocks.saveProfile).not.toHaveBeenCalled();
+    expect(mocks.saveProfileForUser).not.toHaveBeenCalled();
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
@@ -83,8 +90,8 @@ describe('actual SSE failure cannot overwrite a profile', () => {
     expect((await consumeSSE(await profile.POST(request('profile')))).find((e) => e.type === 'done'))
       .toEqual({ type: 'done', seeds, content: '完整生成画像', updatedAt: nextVersion });
     expect(await (await feedback.POST(request('feedback'))).json()).toEqual({ ok: true, profileUpdated: true, updatedAt: nextVersion });
-    expect(mocks.saveProfile.mock.calls).toEqual([
-      [seeds, '完整生成画像', previousVersion], [seeds, '完整更新画像', previousVersion],
+    expect(mocks.saveProfileForUser.mock.calls).toEqual([
+      [1, seeds, '完整生成画像', previousVersion, expect.any(Function)], [1, seeds, '完整更新画像', previousVersion, expect.any(Function)],
     ]);
   });
 
@@ -114,7 +121,7 @@ describe('actual SSE failure cannot overwrite a profile', () => {
     const res = await profile.POST(request('profile', controller.signal));
     // 请求侧已取消：路由 dispose deadline 并尝试干净关闭；客户端撤流，绝不能落库/重试。
     await res.body?.cancel().catch(() => {});
-    expect(mocks.saveProfile).not.toHaveBeenCalled();
+    expect(mocks.saveProfileForUser).not.toHaveBeenCalled();
     expect(fetchMock).toHaveBeenCalledOnce(); // 取消后不再发起后续调用（无重试）
   });
 });

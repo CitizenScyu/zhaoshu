@@ -1,15 +1,16 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { NextRequest } from 'next/server';
 
-const { ensureSchema, getSql, sql, transaction } = vi.hoisted(() => ({
+const { ensureSchema, getSql, sql, transaction, session } = vi.hoisted(() => ({
   ensureSchema: vi.fn(),
   getSql: vi.fn(),
   sql: vi.fn((strings: TemplateStringsArray) => strings.join('')),
-  transaction: vi.fn(),
+  transaction: vi.fn(), session: vi.fn(),
 }));
 
 vi.mock('@/lib/db', () => ({ ensureSchema, getSql }));
 
+vi.mock('@/lib/auth-session', async (original) => ({ ...await original<typeof import('@/lib/auth-session')>(), findSessionByToken: session }));
 import { GET } from './route';
 
 function request(token?: string) {
@@ -22,6 +23,7 @@ describe('GET /api/export', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     vi.stubEnv('APP_OWNER_TOKEN', 'export-test-owner');
+    vi.stubEnv('AUTH_ACCOUNTS_ENABLED', 'false');
     ensureSchema.mockResolvedValue(undefined);
     getSql.mockReturnValue(Object.assign(sql, { transaction }));
   });
@@ -65,11 +67,13 @@ describe('GET /api/export', () => {
     );
     expect(res.headers.get('Cache-Control')).toBe('private, no-store');
     expect(data).toEqual({
-      formatVersion: 1, exportedAt: expect.any(String), profile, seeds, books,
+      formatVersion: 2, subject: { userId: 1 },
+      sections: { personal: ['profile', 'seeds', 'books', 'recommendations', 'feedback'], shared: ['labeled_books'] },
+      download: null, downloadState: 'not_ready', exportedAt: expect.any(String), profile, seeds, books,
       recommendations, feedback, labeled_books: labeledBooks,
     });
     expect(transaction).toHaveBeenCalledWith(expect.any(Array), {
-      isolationLevel: 'RepeatableRead', readOnly: true, arrayMode: false, fullResults: false,
+      isolationLevel: 'RepeatableRead', readOnly: true, arrayMode: false, fullResults: false, fetchOptions: { signal: expect.any(AbortSignal) },
     });
     const libraryQuery = sql.mock.results.map((result) => String(result.value))
       .find((query) => query.includes('FROM labeled_books'));
@@ -98,4 +102,23 @@ describe('GET /api/export', () => {
     expect(res.headers.get('Content-Disposition')).toBeNull();
     expect(await res.json()).toEqual({ error: '数据导出失败，请稍后重试' });
   });
+  it.each([2, 3])('用户 %s 的导出只取本人及被本人引用的书，下载分区不全局读取', async (userId) => {
+    vi.stubEnv('AUTH_ACCOUNTS_ENABLED', 'true');
+    session.mockResolvedValue({ userId, role: 'member', canFind: true, canRead: false, canDownload: false, authMethod: 'password', membersEnabled: true });
+    transaction.mockResolvedValue([[], [], [], [], []]);
+    const res = await GET(new NextRequest('http://localhost/api/export?userId=1', { headers: { Cookie: 'nf-dev-session=member' } }));
+    const data = await res.json(); expect(data.subject.userId).toBe(userId);
+    expect(data.download).toBeNull(); expect(data.downloadState).toBe('forbidden');
+    expect(res.headers.get('Vary')).toBe('Cookie, Authorization, X-Owner-Token');
+    for (const [parts, ...values] of sql.mock.calls) {
+      const text = parts.join('');
+      expect(text).not.toMatch(/FROM (users|sessions|auth_rate_limits|download_tasks)/);
+      if (text.includes('FROM labeled_books')) continue;
+      expect(values.length).toBeGreaterThan(0); expect(values.every((value) => value === userId)).toBe(true);
+      if (text.includes('FROM books b')) {
+        expect(text).toContain('r.user_id ='); expect(text).toContain('f.user_id =');
+      } else expect(text).toMatch(/WHERE (?:user_id|id) =/);
+    }
+  });
+
 });

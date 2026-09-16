@@ -5,9 +5,9 @@ import { LLM_USAGE_PHASES, type LlmUsagePhase } from '@/lib/llm-usage';
 // 真实路由 → chatRobust → SSE/JSON → after → 真实用量写库函数，只 mock 网络与业务数据。
 const mocks = vi.hoisted(() => ({
   after: vi.fn(), pending: [] as (() => Promise<void>)[],
-  ensureSchema: vi.fn(), getProfile: vi.fn(), saveProfile: vi.fn(), upsertBook: vi.fn(),
+  ensureSchema: vi.fn(), getProfileForUser: vi.fn(), saveProfileForUser: vi.fn(), upsertBook: vi.fn(),
   getSql: vi.fn(), businessSql: vi.fn(), transaction: vi.fn(),
-  getExcludedBookKeys: vi.fn(), getExcludedBookTitles: vi.fn(), persistRecommendations: vi.fn(),
+  getExcludedBookKeysForUser: vi.fn(), getExcludedBookTitlesForUser: vi.fn(), persistRecommendationsForUser: vi.fn(),
   neon: vi.fn(), usageSql: vi.fn(), verifyBatch: vi.fn(),
 }));
 vi.mock('next/server', async (importOriginal) => ({
@@ -16,10 +16,17 @@ vi.mock('next/server', async (importOriginal) => ({
 vi.mock('@neondatabase/serverless', () => ({ neon: mocks.neon }));
 vi.mock('@/lib/db', async (importOriginal) => ({
   ...await importOriginal<typeof import('@/lib/db')>(),
-  ensureSchema: mocks.ensureSchema, getProfile: mocks.getProfile, saveProfile: mocks.saveProfile,
+  recordFeedbackForUser: async (userId: number, book: { title: string; author: string }, status: string, note: string) => {
+    const actual = await vi.importActual<typeof import('@/lib/db')>('@/lib/db');
+    await actual.recordFeedbackForUser(userId, book, status, note, async (batch) => {
+      await mocks.transaction(batch(mocks.businessSql as never));
+      return [];
+    });
+  },
+  ensureSchema: mocks.ensureSchema, getProfileForUser: mocks.getProfileForUser, saveProfileForUser: mocks.saveProfileForUser,
   getSql: mocks.getSql, upsertBook: mocks.upsertBook,
-  getExcludedBookKeys: mocks.getExcludedBookKeys, getExcludedBookTitles: mocks.getExcludedBookTitles,
-  persistRecommendations: mocks.persistRecommendations,
+  getExcludedBookKeysForUser: mocks.getExcludedBookKeysForUser, getExcludedBookTitlesForUser: mocks.getExcludedBookTitlesForUser,
+  persistRecommendationsForUser: mocks.persistRecommendationsForUser,
 }));
 vi.mock('@/lib/douban', () => ({ verifyBatch: mocks.verifyBatch }));
 
@@ -110,12 +117,12 @@ describe('usage instrumentation through all model routes', () => {
     mocks.pending.length = 0;
     mocks.after.mockImplementation((task: () => Promise<void>) => { mocks.pending.push(task); });
     mocks.ensureSchema.mockResolvedValue(undefined);
-    mocks.getProfile.mockResolvedValue({ seeds: [{ title: '种子书', kind: 'love' }], content: '原画像', updatedAt: 'v1' });
-    mocks.saveProfile.mockResolvedValue('v2');
+    mocks.getProfileForUser.mockResolvedValue({ seeds: [{ title: '种子书', kind: 'love' }], content: '原画像', updatedAt: 'v1' });
+    mocks.saveProfileForUser.mockResolvedValue('v2');
     mocks.upsertBook.mockResolvedValue(42);
-    mocks.getExcludedBookKeys.mockResolvedValue([]);
-    mocks.getExcludedBookTitles.mockResolvedValue([]);
-    mocks.persistRecommendations.mockResolvedValue(undefined);
+    mocks.getExcludedBookKeysForUser.mockResolvedValue([]);
+    mocks.getExcludedBookTitlesForUser.mockResolvedValue([]);
+    mocks.persistRecommendationsForUser.mockResolvedValue(undefined);
     mocks.getSql.mockReturnValue(Object.assign(mocks.businessSql, { transaction: mocks.transaction }));
     mocks.transaction.mockResolvedValue([]);
     mocks.verifyBatch.mockResolvedValue([verified.douban]);
@@ -161,7 +168,8 @@ describe('usage instrumentation through all model routes', () => {
     await finishRequest(phase, response);
     expect(mocks.usageSql).not.toHaveBeenCalled();
     await expect(finishResponse()).resolves.toBeUndefined();
-    expect(console.error).toHaveBeenCalledWith('LLM usage write failed:', expect.objectContaining({ phase }), expect.any(Error));
+    expect(console.error).toHaveBeenCalledWith('LLM usage write failed:', expect.objectContaining({ phase }));
+    expect(JSON.stringify(vi.mocked(console.error).mock.calls)).not.toContain('usage unavailable');
     expect(fetchMock).toHaveBeenCalledOnce();
   });
 
@@ -189,14 +197,14 @@ describe('usage instrumentation through all model routes', () => {
     fetchMock.mockResolvedValue(new Response(sse('not JSON')));
     const events = await sseOf(await invoke('find_recall'));
     expect(events.find((e) => e.type === 'error')).toBeTruthy();
-    expect(mocks.persistRecommendations).not.toHaveBeenCalled();
+    expect(mocks.persistRecommendationsForUser).not.toHaveBeenCalled();
     await finishResponse();
     expect(inserts()[0].slice(1, 8)).toEqual(['find_recall', 'reported-model', 120, 30, 150, 50, false]);
   });
 
   it('records a generated draft even if another writer wins the profile version check', async () => {
     fetchMock.mockResolvedValue(new Response(sse(contentFor('profile'))));
-    mocks.saveProfile.mockResolvedValue(null);
+    mocks.saveProfileForUser.mockResolvedValue(null);
     const response = await invoke('profile');
     expect(response.status).toBe(200);
     await response.text(); // 冲突以 `conflict` 事件落到流里，仍记录本次用量（含失败前已产生的生成）
@@ -242,7 +250,7 @@ describe('usage instrumentation through all model routes', () => {
     // 取消链路应让路由干净收尾（error 事件后关闭流），并回调缺失用量埋点。
     const body = await (await pending).text();
     expect(body).toMatch(/取消/);
-    expect(mocks.saveProfile).not.toHaveBeenCalled();
+    expect(mocks.saveProfileForUser).not.toHaveBeenCalled();
     await finishResponse();
     // 被取消的部分调用不写成一次成功生成：只有缺失用量（0 tokens）可落，绝不冒充成功。
     const all = inserts();

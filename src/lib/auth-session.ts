@@ -2,7 +2,7 @@ import { createHash, createHmac, randomBytes } from 'node:crypto';
 import type { NextRequest } from 'next/server';
 import type { neon } from '@neondatabase/serverless';
 import { getSql } from './db';
-import { initializeAuthSchema } from './auth-store';
+import { assertAuthSchema } from './auth-store';
 
 type Sql = ReturnType<typeof neon>;
 
@@ -67,12 +67,12 @@ export function ownerCredentialTag(secret: string, ownerToken: string): string {
     .digest('hex');
 }
 
-// 冷启动懒初始化认证表；失败后允许重试，不长期缓存失败的 Promise。
+// 冷启动只校验已迁移版本；不在登录或业务请求中执行迁移，失败后允许重试。
 let authSchemaPromise: Promise<void> | null = null;
 
 export async function ensureAuthSchema(): Promise<void> {
   if (!authSchemaPromise) {
-    authSchemaPromise = initializeAuthSchema(getSql()).catch((error) => {
+    authSchemaPromise = assertAuthSchema(getSql()).catch((error) => {
       authSchemaPromise = null;
       throw error;
     });
@@ -131,8 +131,8 @@ export type SessionRecord = {
 };
 
 // 每请求一次身份查询：会话、用户与成员闸门设置在同一个 JOIN 里读取。
-export async function findSessionByToken(sql: Sql, token: string): Promise<SessionRecord | null> {
-  const rows = (await sql`
+export async function findSessionByToken(sql: Sql, token: string, signal?: AbortSignal): Promise<SessionRecord | null> {
+  const query = sql`
     SELECT s.user_id, s.auth_method, s.owner_credential_tag, u.username, u.role,
            u.can_find, u.can_read, u.can_download, m.members_enabled
     FROM sessions s
@@ -140,7 +140,8 @@ export async function findSessionByToken(sql: Sql, token: string): Promise<Sessi
     CROSS JOIN auth_settings m
     WHERE s.token_hash = ${hashSessionToken(token)}
       AND s.expires_at > now()
-      AND u.disabled_at IS NULL`) as {
+      AND u.disabled_at IS NULL`;
+  const rows = (signal ? (await sql.transaction([query], { fetchOptions: { signal } }))[0] : await query) as {
     user_id: number;
     username: string;
     role: string;

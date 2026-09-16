@@ -1,10 +1,14 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { NextRequest } from 'next/server';
+import { mockSql } from '@/lib/fixtures/mock-sql';
 
-const { ensureSchema, getSql, sql, upsertBook } = vi.hoisted(() => ({
-  ensureSchema: vi.fn(), getSql: vi.fn(), sql: vi.fn(), upsertBook: vi.fn(),
+const { ensureSchema, getSql, findSession } = vi.hoisted(() => ({
+  ensureSchema: vi.fn(), getSql: vi.fn(), findSession: vi.fn(),
 }));
-vi.mock('@/lib/db', () => ({ ensureSchema, getSql, upsertBook }));
+vi.mock('@/lib/db', () => ({ ensureSchema, getSql }));
+vi.mock('@/lib/auth-session', async (original) => ({ ...await original<typeof import('@/lib/auth-session')>(), findSessionByToken: findSession }));
+let db: ReturnType<typeof mockSql>;
+let sql: ReturnType<typeof mockSql>['resolve'];
 import { DELETE, POST } from './route';
 
 function request(method: 'POST' | 'DELETE', body?: unknown, id?: string) {
@@ -20,10 +24,11 @@ describe('/api/shelf', () => {
   beforeEach(() => {
     vi.resetAllMocks();
     vi.stubEnv('APP_OWNER_TOKEN', 'shelf-test-owner');
+    vi.stubEnv('AUTH_ACCOUNTS_ENABLED', 'false');
+    db = mockSql(); sql = db.resolve;
     ensureSchema.mockResolvedValue(undefined);
-    getSql.mockReturnValue(sql);
-    upsertBook.mockResolvedValue(42);
-    sql.mockResolvedValue([]);
+    getSql.mockReturnValue(db.sql);
+    sql.mockImplementation((query) => query.text.includes('INSERT INTO recommendations') ? [{ book_id: 42 }] : []);
     vi.spyOn(console, 'error').mockImplementation(() => {});
   });
   afterEach(() => { vi.unstubAllEnvs(); vi.restoreAllMocks(); });
@@ -41,7 +46,7 @@ describe('/api/shelf', () => {
     expect(res.status).toBe(400);
     expect(await res.json()).toEqual({ error: 'missing valid labeledBookId', code: 'INVALID_ID' });
     expect(ensureSchema).not.toHaveBeenCalled();
-    expect(upsertBook).not.toHaveBeenCalled();
+    expect(db.transaction).not.toHaveBeenCalled();
     expect(sql).not.toHaveBeenCalled();
   });
 
@@ -53,7 +58,7 @@ describe('/api/shelf', () => {
     expect(res.status).toBe(413);
     expect(await res.json()).toEqual({ error: 'request body too large', code: 'BODY_TOO_LARGE' });
     expect(ensureSchema).not.toHaveBeenCalled();
-    expect(upsertBook).not.toHaveBeenCalled();
+    expect(db.transaction).not.toHaveBeenCalled();
   });
 
   it.each([7, '7', 2147483647])('adds valid book %s as want without changing its identity', async (labeledBookId) => {
@@ -61,9 +66,9 @@ describe('/api/shelf', () => {
     const res = await POST(request('POST', { labeledBookId }));
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual({ ok: true, bookId: 42 });
-    expect(sql.mock.calls[0].slice(1)).toEqual([Number(labeledBookId)]);
-    expect(upsertBook).toHaveBeenCalledWith({ title: '测试书', author: '佚名', meta: {} });
-    expect(sql.mock.calls[2].slice(1)).toEqual([42, '书库添加', 'want']);
+    expect(sql.mock.calls[0][0].values).toEqual([Number(labeledBookId)]);
+    expect(db.queries.find((query) => query.text.includes('INSERT INTO books'))?.values).toEqual(['测试书', '佚名']);
+    expect(db.queries.find((query) => query.text.includes('INSERT INTO recommendations'))?.values).toEqual([1, '书库添加', 'want', '测试书', '佚名', 1]);
   });
 
   it('keeps not-found and duplicate-shelf outcomes distinct', async () => {
@@ -74,7 +79,7 @@ describe('/api/shelf', () => {
     const duplicate = await POST(request('POST', { labeledBookId: 7 }));
     expect(duplicate.status).toBe(409);
     expect(await duplicate.json()).toEqual({ error: '已在书架', code: 'ALREADY_ON_SHELF' });
-    expect(sql.mock.calls.some(([strings]) => (strings as TemplateStringsArray).join('').includes('INSERT'))).toBe(false);
+    expect(db.queries.some((query) => query.text.includes('INSERT'))).toBe(false);
   });
 
   it.each([undefined, '', '0', '1.5', 'Infinity', '2147483648', '9007199254740992'])('rejects DELETE id %s without writes', async (id) => {
@@ -89,7 +94,7 @@ describe('/api/shelf', () => {
     sql.mockResolvedValueOnce([{ id: 2147483647 }]);
     const deleted = await DELETE(request('DELETE', undefined, '2147483647'));
     expect(deleted.status).toBe(200);
-    expect(sql.mock.calls[0].slice(1)).toEqual([2147483647]);
+    expect(sql.mock.calls[0][0].values).toEqual([2147483647, 1]);
     const missing = await DELETE(request('DELETE', undefined, '7'));
     expect(missing.status).toBe(404);
     expect(await missing.json()).toEqual({ error: 'recommendation not found', code: 'RECOMMENDATION_NOT_FOUND' });
@@ -102,4 +107,58 @@ describe('/api/shelf', () => {
     expect(await res.json()).toEqual({ error: 'internal error', code: 'DB_ERROR' });
     expect(sql).not.toHaveBeenCalled();
   });
+  function memberRequest(method: 'POST' | 'DELETE', userId: number, body?: unknown, id?: string) {
+    vi.stubEnv('AUTH_ACCOUNTS_ENABLED', 'true');
+    findSession.mockImplementation(async (_sql, token) => ({ userId: token === 'member-a' ? 2 : 3,
+      username: 'member', role: 'member', canFind: true, canRead: false, canDownload: false,
+      authMethod: 'password', ownerCredentialTag: null, membersEnabled: true }));
+    const req = request(method, body, id); req.headers.delete('Authorization');
+    req.headers.set('Cookie', `nf-dev-session=${userId === 2 ? 'member-a' : 'member-b'}`);
+    req.headers.set('Origin', 'http://localhost'); req.headers.set('X-NF-CSRF', '1');
+    return new NextRequest(req);
+  }
+  it('同书 A/B 可各自加书架，重复判断和最终 INSERT 都按本人', async () => {
+    const onShelf = new Set<number>();
+    sql.mockImplementation((query) => {
+      if (query.text.includes('FROM labeled_books')) return [{ title: '同一本书', author: '同一作者' }];
+      if (query.text.includes('SELECT 1 FROM recommendations r JOIN books')) return onShelf.has(Number(query.values[0])) ? [{ exists: 1 }] : [];
+      if (query.text.includes('INSERT INTO recommendations')) { onShelf.add(Number(query.values[0])); return [{ book_id: 42 }]; }
+      return [];
+    });
+    expect((await POST(memberRequest('POST', 2, { labeledBookId: 7, userId: 3 }))).status).toBe(200);
+    expect((await POST(memberRequest('POST', 3, { labeledBookId: 7, userId: 2 }))).status).toBe(200);
+    expect((await POST(memberRequest('POST', 2, { labeledBookId: 7 }))).status).toBe(409);
+    expect([...onShelf]).toEqual([2, 3]);
+    for (const query of db.queries.filter((query) => query.text.includes('INSERT INTO recommendations'))) {
+      expect(query.text).toContain('r.book_id = b.id AND r.user_id = ?');
+      expect(query.text).toContain('ON CONFLICT (user_id, book_id, query)');
+      expect(query.values[0]).toBe(query.values.at(-1));
+    }
+  });
+  it('伪造他人的推荐 ID 与不存在的 ID 都是 404，且不改变任何状态', async () => {
+    const owners = new Map([[7, 3], [8, 2]]);
+    sql.mockImplementation((query) => {
+      if (!query.text.includes('DELETE FROM recommendations')) return [];
+      const [id, userId] = query.values.map(Number);
+      if (owners.get(id) !== userId) return [];
+      owners.delete(id); return [{ id }];
+    });
+    const foreign = await DELETE(memberRequest('DELETE', 2, undefined, '7'));
+    const missing = await DELETE(memberRequest('DELETE', 2, undefined, '999'));
+    expect([foreign.status, missing.status]).toEqual([404, 404]);
+    expect(await foreign.json()).toEqual(await missing.json());
+    expect([...owners]).toEqual([[7, 3], [8, 2]]);
+    expect((await DELETE(memberRequest('DELETE', 2, undefined, '8'))).status).toBe(200);
+    expect([...owners]).toEqual([[7, 3]]);
+    for (const query of db.queries.filter((q) => q.text.includes('DELETE FROM recommendations'))) {
+      expect(query.text).toContain('WHERE id = ? AND user_id = ?'); expect(query.values[1]).toBe(2);
+    }
+  });
+  it.each(['POST', 'DELETE'] as const)('%s 对无 find 能力的 member 先拒绝', async (method) => {
+    const req = memberRequest(method, 2, method === 'POST' ? { labeledBookId: 7 } : undefined, '7');
+    findSession.mockResolvedValue({ userId: 2, role: 'member', canFind: false, canRead: false, canDownload: false, authMethod: 'password', membersEnabled: true });
+    expect((await (method === 'POST' ? POST : DELETE)(req)).status).toBe(403);
+    expect(ensureSchema).not.toHaveBeenCalled(); expect(db.queries).toHaveLength(0);
+  });
+
 });

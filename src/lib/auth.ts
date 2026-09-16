@@ -1,7 +1,7 @@
 import { timingSafeEqual } from 'node:crypto';
 import { NextResponse } from 'next/server';
 import type { NextRequest } from 'next/server';
-import type { AuthResult, Permission } from './auth-types';
+import type { AuthResult, Permission, Principal } from './auth-types';
 import { hasPermission, OWNER_PRINCIPAL } from './permissions';
 import {
   findSessionByToken,
@@ -205,16 +205,16 @@ export function principalFromSessionRecord(record: SessionRecord | null): AuthRe
 // 每请求一次身份查询：同一请求内的重复 guard 复用同一个 Promise。
 const principalCache = new WeakMap<NextRequest, Promise<AuthResult>>();
 
-export function resolvePrincipal(req: NextRequest): Promise<AuthResult> {
+export function resolvePrincipal(req: NextRequest, signal?: AbortSignal): Promise<AuthResult> {
   let cached = principalCache.get(req);
   if (!cached) {
-    cached = resolvePrincipalUncached(req);
+    cached = resolvePrincipalUncached(req, signal);
     principalCache.set(req, cached);
   }
   return cached;
 }
 
-async function resolvePrincipalUncached(req: NextRequest): Promise<AuthResult> {
+async function resolvePrincipalUncached(req: NextRequest, signal?: AbortSignal): Promise<AuthResult> {
   const authorization = req.headers.get('authorization');
   const ownerHeader = req.headers.get('x-owner-token');
   if (authorization !== null || ownerHeader !== null) {
@@ -229,7 +229,7 @@ async function resolvePrincipalUncached(req: NextRequest): Promise<AuthResult> {
   }
   let record: SessionRecord | null;
   try {
-    record = await findSessionByToken(getSql(), cookie);
+    record = signal ? await findSessionByToken(getSql(), cookie, signal) : await findSessionByToken(getSql(), cookie);
   } catch {
     // session 数据库不可用时不把 Cookie 当有效，也不降级为 owner。
     return { ok: false, response: serviceUnavailable('AUTH_DB_UNAVAILABLE') };
@@ -240,8 +240,9 @@ async function resolvePrincipalUncached(req: NextRequest): Promise<AuthResult> {
 export async function requirePermission(
   req: NextRequest,
   permission: Permission,
+  signal?: AbortSignal,
 ): Promise<AuthResult> {
-  const result = await resolvePrincipal(req);
+  const result = await resolvePrincipal(req, signal);
   if (!result.ok) return result;
   if (!hasPermission(result.principal, permission)) {
     return {
@@ -262,4 +263,20 @@ export async function requireOwner(req: NextRequest): Promise<AuthResult> {
     };
   }
   return result;
+}
+
+// 长操作写回前必须重新查询原请求的凭据，不能复用请求内的 Principal 缓存。
+export async function revalidatePermission(
+  req: NextRequest,
+  original: Principal,
+  permission: Permission,
+  signal?: AbortSignal,
+): Promise<AuthResult> {
+  const fresh = await resolvePrincipalUncached(req, signal);
+  if (!fresh.ok) return fresh;
+  if (fresh.principal.userId !== original.userId || fresh.principal.role !== original.role ||
+      fresh.principal.authMethod !== original.authMethod || !hasPermission(fresh.principal, permission)) {
+    return { ok: false, response: NextResponse.json({ error: 'authorization changed', code: 'AUTHORIZATION_CHANGED' }, { status: 403 }) };
+  }
+  return fresh;
 }

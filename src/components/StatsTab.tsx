@@ -128,8 +128,16 @@ export default function StatsTab() {
   const shelfTotal = stats?.shelf ? stats.shelf.statuses.reduce((sum, s) => sum + s.count, 0) : null;
   const unavailable = stats
     ? (Object.keys(SECTION_NAMES) as (keyof typeof SECTION_NAMES)[])
-      .filter((key) => stats.availability?.[key] === false).map((key) => SECTION_NAMES[key])
+      .filter((key) => stats.sectionStates?.[key] === 'unavailable').map((key) => SECTION_NAMES[key])
     : [];
+
+  const sectionValue = (section: keyof typeof SECTION_NAMES) =>
+    stats?.sectionStates[section] === 'forbidden' ? '无权限'
+      : stats?.sectionStates[section] === 'not_ready' ? '待开放' : '不可用';
+  const sectionNote = (section: keyof typeof SECTION_NAMES) =>
+    stats?.sectionStates[section] === 'forbidden' ? `当前账号无权查看${SECTION_NAMES[section]}分区`
+      : stats?.sectionStates[section] === 'not_ready' ? `${SECTION_NAMES[section]}统计尚未开放`
+        : `${SECTION_NAMES[section]}统计暂不可用`;
 
   return (
     <div>
@@ -141,7 +149,7 @@ export default function StatsTab() {
         </button>
       </div>
       <p className="text-sm mt-2 leading-7" style={{ color: 'var(--ink-soft)' }}>
-        书径运行以来的全部家底：收了多少书、打了多少字、找过多少次、下载了多少。
+        查看本人的找书与书架记录，以及明确标注的共享书库、书源概况。
       </p>
 
       {error && (
@@ -165,28 +173,28 @@ export default function StatsTab() {
           <dl className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
             <StatTile
               strong
-              label="收书总数"
+              label="共享书库"
               value={stats.library ? String(stats.library.total) : '不可用'}
               unit={stats.library ? '本' : undefined}
               note={stats.library ? `带质量分 ${stats.library.withQuality} 本` : '书库统计暂不可用'}
             />
             <StatTile
-              label="累计打标字数"
+              label="共享打标字数"
               value={formatChars(stats.library?.charsLabeled)}
               note="批量打标读过的正文规模"
             />
             <StatTile
-              label="找书次数"
+              label="我的找书次数"
               value={stats.find ? String(stats.find.queries) : '不可用'}
               unit={stats.find ? '次' : undefined}
               note={stats.find ? `累计推荐 ${stats.find.recommendations} 本次` : '找书统计暂不可用'}
             />
             <StatTile
-              label="下载战果"
-              value={stats.download ? String(stats.download.done) : '不可用'}
+              label="我的下载"
+              value={stats.download ? String(stats.download.done) : sectionValue('download')}
               unit={stats.download ? '本' : undefined}
               note={
-                !stats.download ? '下载统计暂不可用'
+                !stats.download ? sectionNote('download')
                 : stats.download.done > 0
                   ? `${Math.round(stats.download.chapters).toLocaleString('zh-CN')} 章 · ${formatChars(stats.download.chars)}`
                   : stats.download.total > 0
@@ -195,20 +203,27 @@ export default function StatsTab() {
               }
             />
             <StatTile
-              label="平均质量分"
+              label="共享平均质量分"
               value={!stats.library ? '不可用' : stats.library.avgQuality !== null ? stats.library.avgQuality.toFixed(1) : '—'}
               note={!stats.library ? '书库统计暂不可用' : stats.library.avgQuality !== null ? `满分 10 · 已评 ${stats.library.withQuality} 本` : '还没有质量分'}
             />
-            <TokenStatTile tokens={stats.tokens} available={stats.availability?.tokens} />
+            {stats.allowedSections.includes('tokens')
+              ? <TokenStatTile tokens={stats.tokens} available={stats.availability.tokens} />
+              : <StatTile label="模型用量" value={sectionValue('tokens')} note={sectionNote('tokens')} />}
           </dl>
 
-          <TokenUsageDetails tokens={stats.tokens} />
+          {stats.allowedSections.includes('tokens') && (
+            <>
+              <p className="text-xs" style={{ color: 'var(--ink-faint)' }}>模型用量为全站共享账目，仅维护者可见。</p>
+              <TokenUsageDetails tokens={stats.tokens} />
+            </>
+          )}
 
           {/* 次要分布 */}
           <div className="grid md:grid-cols-2 gap-8">
             <section aria-labelledby="stats-genres">
               <h3 id="stats-genres" className="text-sm font-bold mb-3">
-                分类分布
+                共享分类分布
                 <span className="font-normal ml-2 text-xs" style={{ color: 'var(--ink-faint)' }}>
                   {stats.library ? `书库 ${stats.library.total} 本` : '统计不可用'}
                 </span>
@@ -235,7 +250,7 @@ export default function StatsTab() {
 
             <section aria-labelledby="stats-shelf">
               <h3 id="stats-shelf" className="text-sm font-bold mb-3">
-                书架状态分布
+                我的书架状态
                 <span className="font-normal ml-2 text-xs" style={{ color: 'var(--ink-faint)' }}>
                   {shelfTotal === null ? '统计不可用' : `共 ${shelfTotal} 条`}
                 </span>
@@ -278,8 +293,8 @@ export default function StatsTab() {
           {/* 书源一笔账 */}
           <p className="text-xs" style={{ color: 'var(--ink-faint)' }}>
             {stats.shuyuan
-              ? `另有书源资料 ${stats.shuyuan.total} 条（启用 ${stats.shuyuan.enabled} 条；最近探测可达 ${stats.shuyuan.reachable} 条；未探测 ${stats.shuyuan.unprobed} 条；待核验 ${stats.shuyuan.pending} 条）。启用不代表可用，尚未接入找书验证或试读。`
-              : '书源统计暂不可用。'}
+              ? `共享书源资料 ${stats.shuyuan.total} 条（启用 ${stats.shuyuan.enabled} 条；最近探测可达 ${stats.shuyuan.reachable} 条；未探测 ${stats.shuyuan.unprobed} 条；待核验 ${stats.shuyuan.pending} 条）。启用不代表可用，尚未接入找书验证或试读。`
+              : sectionNote('shuyuan')}
           </p>
         </div>
       )}
@@ -294,7 +309,7 @@ export default function StatsTab() {
           {exporting ? '导出中…' : '导出我的数据'}
         </button>
         <p className="mt-2 text-xs leading-6" style={{ color: 'var(--ink-faint)' }}>
-          将画像、种子书单、书架、反馈和书库基本信息保存为 JSON 文件。
+          将本人的画像、种子书单、书架、反馈及关联书目，与共享书库基本信息保存为 JSON 文件。
         </p>
         {exportError && (
           <p role="alert" className="mt-2 text-sm" style={{ color: 'var(--cinnabar)' }}>

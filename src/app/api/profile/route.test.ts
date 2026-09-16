@@ -3,11 +3,18 @@ import { NextRequest } from 'next/server';
 import type { ProfileSnapshot, SeedBook } from '@/lib/types';
 
 const mocks = vi.hoisted(() => ({
-  ensureSchema: vi.fn(), getProfile: vi.fn(), saveProfile: vi.fn(), chatRobust: vi.fn(),
+  ensureSchema: vi.fn(), getProfileForUser: vi.fn(), saveProfileForUser: vi.fn(), chatRobust: vi.fn(),
   getSql: vi.fn(), upsertBook: vi.fn(), sql: vi.fn(), transaction: vi.fn(),
 }));
 vi.mock('@/lib/db', () => ({
-  ensureSchema: mocks.ensureSchema, getProfile: mocks.getProfile, saveProfile: mocks.saveProfile,
+  recordFeedbackForUser: async (userId: number, book: { title: string; author: string }, status: string, note: string) => {
+    const actual = await vi.importActual<typeof import('@/lib/db')>('@/lib/db');
+    await actual.recordFeedbackForUser(userId, book, status, note, async (batch) => {
+      await mocks.transaction(batch(mocks.sql as never));
+      return [];
+    });
+  },
+  ensureSchema: mocks.ensureSchema, getProfileForUser: mocks.getProfileForUser, saveProfileForUser: mocks.saveProfileForUser,
   getSql: mocks.getSql, upsertBook: mocks.upsertBook,
 }));
 vi.mock('@/lib/llm', async (importOriginal) => ({
@@ -52,8 +59,8 @@ describe('/api/profile writes', () => {
     vi.resetAllMocks();
     vi.stubEnv('APP_OWNER_TOKEN', 'profile-test-owner');
     mocks.ensureSchema.mockResolvedValue(undefined);
-    mocks.getProfile.mockResolvedValue({ seeds, content: '原画像', updatedAt: previousVersion });
-    mocks.saveProfile.mockResolvedValue(nextVersion);
+    mocks.getProfileForUser.mockResolvedValue({ seeds, content: '原画像', updatedAt: previousVersion });
+    mocks.saveProfileForUser.mockResolvedValue(nextVersion);
     mocks.chatRobust.mockResolvedValue('  有效画像😀\n喜欢严谨设定  ');
     mocks.getSql.mockReturnValue(Object.assign(mocks.sql, { transaction: mocks.transaction }));
     mocks.upsertBook.mockResolvedValue(42);
@@ -67,8 +74,8 @@ describe('/api/profile writes', () => {
     const events = await consumeSSE(res);
     // 结束帧带完整结果（真正的 onToken 逐字首字节由 stream.test 用真实 llm 覆盖）。
     expect(lastEvent(events, 'done')).toEqual({ type: 'done', seeds, content: '有效画像😀\n喜欢严谨设定', updatedAt: nextVersion });
-    expect(mocks.saveProfile).toHaveBeenCalledWith(seeds, '有效画像😀\n喜欢严谨设定', previousVersion);
-    expect(mocks.chatRobust.mock.calls[0][2].signal).toBe(req.signal);
+    expect(mocks.saveProfileForUser).toHaveBeenCalledWith(1, seeds, '有效画像😀\n喜欢严谨设定', previousVersion, expect.any(Function));
+    expect(mocks.chatRobust.mock.calls[0][2].signal.aborted).toBe(req.signal.aborted);
   });
 
   it.each(['', ' \n ', null, false, '字'.repeat(5_001), 'bad' + String.fromCharCode(0), '\ud800', '\udc00'])(
@@ -77,7 +84,7 @@ describe('/api/profile writes', () => {
       const events = await consumeSSE(await POST(request()));
       expect(lastEvent(events, 'error')).toMatchObject({ type: 'error' });
       expect(String(lastEvent(events, 'error').message)).toMatch(/画像为空、过长或含非法字符/);
-      expect(mocks.saveProfile).not.toHaveBeenCalled();
+      expect(mocks.saveProfileForUser).not.toHaveBeenCalled();
     },
   );
 
@@ -86,7 +93,7 @@ describe('/api/profile writes', () => {
       mocks.chatRobust.mockRejectedValue(new LlmError(message, false));
       const events = await consumeSSE(await POST(request()));
       expect(lastEvent<{ type: string; message: string }>(events, 'error').message).toBe(message);
-      expect(mocks.saveProfile).not.toHaveBeenCalled();
+      expect(mocks.saveProfileForUser).not.toHaveBeenCalled();
     },
   );
 
@@ -100,7 +107,7 @@ describe('/api/profile writes', () => {
     expect(res.status).toBe(200);
     // 请求已取消：流式响应被客户端撤掉，cancel() 会读取已中止的 signal 而抛错，属预期。
     await res.body?.cancel().catch(() => {});
-    expect(mocks.saveProfile).not.toHaveBeenCalled();
+    expect(mocks.saveProfileForUser).not.toHaveBeenCalled();
   });
 
   it.each(['bad' + String.fromCharCode(0), '\ud800', '\udc00'])(
@@ -109,13 +116,13 @@ describe('/api/profile writes', () => {
       expect(res.status).toBe(400);
       expect(await res.json()).toEqual({ error: 'content contains invalid characters' });
       expect(mocks.ensureSchema).not.toHaveBeenCalled();
-      expect(mocks.saveProfile).not.toHaveBeenCalled();
+      expect(mocks.saveProfileForUser).not.toHaveBeenCalled();
     },
   );
 
   it('retains the manual empty-profile contract', async () => {
     expect((await PUT(request('PUT', { seeds, content: '', updatedAt: previousVersion }))).status).toBe(200);
-    expect(mocks.saveProfile).toHaveBeenCalledWith(seeds, '', previousVersion);
+    expect(mocks.saveProfileForUser).toHaveBeenCalledWith(1, seeds, '', previousVersion, expect.any(Function));
   });
 
   it('returns the raw database version on GET without losing microseconds', async () => {
@@ -134,8 +141,8 @@ describe('/api/profile writes', () => {
         expect((await res.json()).code).toBe('PROFILE_VERSION_REQUIRED');
       }
       expect(mocks.ensureSchema).not.toHaveBeenCalled();
-      expect(mocks.getProfile).not.toHaveBeenCalled();
-      expect(mocks.saveProfile).not.toHaveBeenCalled();
+      expect(mocks.getProfileForUser).not.toHaveBeenCalled();
+      expect(mocks.saveProfileForUser).not.toHaveBeenCalled();
       expect(mocks.chatRobust).not.toHaveBeenCalled();
     },
   );
@@ -158,12 +165,12 @@ describe('/api/profile writes', () => {
     }));
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual({ ok: true, seeds, content: '原画像', updatedAt: nextVersion });
-    expect(mocks.saveProfile).toHaveBeenCalledWith(seeds, '原画像', previousVersion);
+    expect(mocks.saveProfileForUser).toHaveBeenCalledWith(1, seeds, '原画像', previousVersion, expect.any(Function));
   });
 
   it.each(['PUT', 'POST'])('rejects an already stale %s without writing or calling the model', async (method) => {
     const latest = { seeds: [{ title: '新书', kind: 'drop' }], content: '他人的更新', updatedAt: nextVersion };
-    mocks.getProfile.mockResolvedValue(latest);
+    mocks.getProfileForUser.mockResolvedValue(latest);
     // 两人同时写、读取时已落后：都在调用模型前就暴露 409，POST 生成以 JSON 409 回（流尚未启动）。
     const res = await (method === 'PUT' ? PUT : POST)(request(method, {
       seeds, content: '我的修订', updatedAt: previousVersion,
@@ -173,14 +180,14 @@ describe('/api/profile writes', () => {
       error: expect.any(String), code: 'PROFILE_CONFLICT', profile: latest,
       ...(method === 'PUT' ? { draft: { seeds, content: '我的修订' } } : {}),
     });
-    expect(mocks.saveProfile).not.toHaveBeenCalled();
+    expect(mocks.saveProfileForUser).not.toHaveBeenCalled();
     expect(mocks.chatRobust).not.toHaveBeenCalled();
   });
 
   it('allows only one of two saves based on the same version', async () => {
     let current: ProfileSnapshot = { seeds, content: '原画像', updatedAt: previousVersion };
-    mocks.getProfile.mockImplementation(async () => structuredClone(current));
-    mocks.saveProfile.mockImplementation(async (nextSeeds, content, expected) => {
+    mocks.getProfileForUser.mockImplementation(async () => structuredClone(current));
+    mocks.saveProfileForUser.mockImplementation(async (_userId, nextSeeds, content, expected) => {
       if (current.updatedAt !== expected) return null;
       current = { seeds: nextSeeds, content, updatedAt: nextVersion };
       return nextVersion;
@@ -193,14 +200,14 @@ describe('/api/profile writes', () => {
     expect(success).toEqual({ ok: true, ...current });
     expect(rejected.profile).toEqual(current);
     expect(rejected.draft.content).not.toBe(current.content);
-    expect(mocks.saveProfile).toHaveBeenCalledTimes(2);
-    expect(mocks.saveProfile.mock.calls.every((call) => call[2] === previousVersion)).toBe(true);
+    expect(mocks.saveProfileForUser).toHaveBeenCalledTimes(2);
+    expect(mocks.saveProfileForUser.mock.calls.every((call) => call[0] === 1 && call[3] === previousVersion)).toBe(true);
   });
 
   it.each(['manual', 'feedback'])('preserves a %s update made while generation is waiting', async (writer) => {
     let current: ProfileSnapshot = { seeds, content: '原画像', updatedAt: previousVersion };
-    mocks.getProfile.mockImplementation(async () => structuredClone(current));
-    mocks.saveProfile.mockImplementation(async (nextSeeds, content, expected) => {
+    mocks.getProfileForUser.mockImplementation(async () => structuredClone(current));
+    mocks.saveProfileForUser.mockImplementation(async (_userId, nextSeeds, content, expected) => {
       if (current.updatedAt !== expected) return null;
       current = { seeds: nextSeeds, content, updatedAt: nextVersion };
       return nextVersion;
@@ -232,21 +239,21 @@ describe('/api/profile writes', () => {
     expect(current).toEqual(winner);
     expect(current.seeds).toEqual(writer === 'manual' ? newSeeds : seeds);
     expect(mocks.chatRobust).toHaveBeenCalledTimes(writer === 'manual' ? 1 : 2);
-    expect(mocks.saveProfile.mock.calls.every((call) => call[2] === previousVersion)).toBe(true);
+    expect(mocks.saveProfileForUser.mock.calls.every((call) => call[0] === 1 && call[3] === previousVersion)).toBe(true);
   });
 
   it('still returns a recoverable generated draft when reloading a conflict fails', async () => {
     vi.spyOn(console, 'error').mockImplementation(() => {});
-    mocks.getProfile.mockResolvedValueOnce({ seeds, content: '原画像', updatedAt: previousVersion })
+    mocks.getProfileForUser.mockResolvedValueOnce({ seeds, content: '原画像', updatedAt: previousVersion })
       .mockRejectedValueOnce(new Error('temporary database error'));
-    mocks.saveProfile.mockResolvedValue(null);
+    mocks.saveProfileForUser.mockResolvedValue(null);
     const events = await consumeSSE(await POST(request()));
     const conflict = lastEvent(events, 'conflict');
     expect(conflict.code).toBe('PROFILE_CONFLICT');
     expect(conflict.profile).toBeNull();
     expect(conflict.draft).toEqual({ seeds, content: '有效画像😀\n喜欢严谨设定' });
     expect(mocks.chatRobust).toHaveBeenCalledOnce();
-    expect(mocks.saveProfile).toHaveBeenCalledOnce();
+    expect(mocks.saveProfileForUser).toHaveBeenCalledOnce();
   });
 
   it('returns a recognizable timeout event when the budget expires before the read finishes', async () => {
@@ -259,7 +266,7 @@ describe('/api/profile writes', () => {
       expect(body).toMatch(/DEADLINE_EXCEEDED/);
       expect(body).toMatch(/请求预算已耗尽/);
       expect(mocks.chatRobust).not.toHaveBeenCalled();
-      expect(mocks.saveProfile).not.toHaveBeenCalled();
+      expect(mocks.saveProfileForUser).not.toHaveBeenCalled();
     } finally {
       vi.useRealTimers();
     }
