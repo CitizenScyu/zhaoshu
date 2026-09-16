@@ -7,10 +7,10 @@
 // 3. 公益渠道吞吐波动极大（同样任务 37s~180s+），所以加空闲超时 + 一次重试
 import { cleanString, hasInvalidDatabaseCharacters, isRecord } from './sanitize';
 import { parseLlmUsage, type LlmCallUsage, type LlmUsage } from './llm-usage';
+import { environmentModel, readModelSetting } from './app-settings';
 
 const BASE_URL = process.env.LLM_BASE_URL || 'https://api.cloud.us.kg/v1';
 const API_KEY = process.env.LLM_API_KEY || '';
-const MODEL = process.env.LLM_MODEL || 'claude-opus-5-88';
 const DEFAULT_TOTAL_TIMEOUT_MS = 280_000;
 const MAX_ROBUST_BUDGET_MS = 285_000;
 // 上游 claude-opus-5-88 是推理模型：它先流式吐 delta.reasoning_content（思维链），
@@ -37,17 +37,37 @@ interface ChatOptions {
   maxTokens?: number;
   signal?: AbortSignal;
   stream?: boolean;
+  // 显式指定模型（保存前验证用）；不给就按运行时优先级解析当前模型。
+  model?: string;
   // 每次实际请求（含失败和重试）只通知一次；调用方负责在响应后落库。
   onUsage?: (call: LlmCallUsage) => void;
   // 流式增量回调：每解析出新正文就叫一次（不分批、不等待完整结果）。
   // 供 profile 生成把首字节尽早推给浏览器；调用方不得依赖该回调的调用次数。
   onToken?: (delta: string) => void;
+  // 上游返回里出现思维链（reasoning_content / reasoning）时通知一次。
+  onReasoning?: () => void;
 }
 
 interface ResponseMetadata {
   usage?: LlmUsage;
   model?: string;
   requestId?: string;
+  reasoning?: boolean;
+}
+
+function reasoningText(value: unknown): boolean {
+  return typeof value === 'string' && value.length > 0;
+}
+
+// 兼容两种出法：reasoning_content（NewAPI / DeepSeek 系）与 reasoning（部分网关）。
+// 只作为推理模型的判据，不参与正文解析。
+function hasReasoningDelta(value: Record<string, unknown>): boolean {
+  if (!Array.isArray(value.choices) || value.choices.length === 0) return false;
+  const choice = value.choices[0];
+  if (!isRecord(choice)) return false;
+  const carrier = isRecord(choice.delta) ? choice.delta
+    : isRecord(choice.message) ? choice.message : null;
+  return carrier !== null && (reasoningText(carrier.reasoning_content) || reasoningText(carrier.reasoning));
 }
 
 function responseMetadata(value: unknown): ResponseMetadata {
@@ -58,6 +78,7 @@ function responseMetadata(value: unknown): ResponseMetadata {
     ...(value.usage != null ? { usage: parseLlmUsage(value.usage) } : {}),
     ...(model ? { model } : {}),
     ...(requestId ? { requestId } : {}),
+    ...(hasReasoningDelta(value) ? { reasoning: true } : {}),
   };
 }
 
@@ -65,6 +86,8 @@ export class LlmError extends Error {
   constructor(
     message: string,
     readonly retryable = true,
+    // 供调用方区分可恢复的失败形态（当前只有「输出预算被思维链吃光」）。
+    readonly code?: string,
   ) {
     super(message);
     this.name = 'LlmError';
@@ -100,6 +123,49 @@ export function configuredMaxTokens(): number {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_MAX_TOKENS;
 }
 
+// ---- 运行时模型解析（数据库设置 → 环境变量 LLM_MODEL → 硬编码缺省）----
+// 2026-09-16 的线上故障源于「换模型要改环境变量 + 重新部署」这条链路太长，
+// 所以模型不再在模块加载期定死，而是每次调用解析。
+//
+// 进程内短 TTL 缓存：连续多次 LLM 调用只读一次库（找书的一次请求里 recall 与
+// rerank 共享同一次读取）。PATCH 写库后调用 resetModelCache() 立即生效。
+export const MODEL_CACHE_TTL_MS = 30_000;
+// 设置读取的独立上限：读库慢或挂住不能拖长模型调用，超时即静默回退。
+export const MODEL_SETTINGS_READ_TIMEOUT_MS = 2_000;
+
+let modelCache: { model: string; expiresAt: number } | null = null;
+
+export function resetModelCache(): void {
+  modelCache = null;
+}
+
+// 只在成功读到设置时缓存（含"没有覆盖值"这一结论）；读失败不缓存，避免把一次
+// 故障钉住整个 TTL。任何失败都静默回退——设置读不到绝不能让模型调用失败。
+export async function resolveModel(): Promise<string> {
+  const cached = modelCache;
+  if (cached && cached.expiresAt > Date.now()) return cached.model;
+  const stored = await readStoredModelSafely();
+  const model = stored.model ?? environmentModel().model;
+  if (stored.ok) modelCache = { model, expiresAt: Date.now() + MODEL_CACHE_TTL_MS };
+  return model;
+}
+
+async function readStoredModelSafely(): Promise<{ ok: boolean; model: string | null }> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const timeout = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error('app settings read timed out')), MODEL_SETTINGS_READ_TIMEOUT_MS);
+      timer.unref?.();
+    });
+    const setting = await Promise.race([readModelSetting(), timeout]);
+    return { ok: true, model: setting.model };
+  } catch {
+    return { ok: false, model: null };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 function asciiEscape(s: string): string {
   // 非 ASCII 转 \uXXXX：语义与 UTF-8 原文完全等价，但免疫链路上的编码损坏
   return s.replace(/[^\x00-\x7f]/g, (c) =>
@@ -117,6 +183,8 @@ export async function chat(
     throw new LlmError('LLM_API_KEY is not set', false);
   }
   if (opts.signal?.aborted) throw cancelledError();
+  // 模型在每次调用时解析；解析有自己的短上限且失败即回退，耗时也不占下面的模型总预算。
+  const model = opts.model ?? await resolveModel();
   const idleMs = opts.idleTimeoutMs ?? 60_000; // 两个 chunk 之间超过 60s 视为卡死
   const totalMs = opts.totalTimeoutMs ?? configuredTotalTimeoutMs();
   const controller = new AbortController();
@@ -126,12 +194,16 @@ export async function chat(
   const stream = opts.stream ?? true;
   const maxTokensCeiling = configuredMaxTokens();
   const call: LlmCallUsage = {
-    model: MODEL, requestId: null, createdAt: new Date().toISOString(), usage: parseLlmUsage(undefined),
+    model, requestId: null, createdAt: new Date().toISOString(), usage: parseLlmUsage(undefined),
   };
   const captureMetadata = (metadata: ResponseMetadata) => {
     if (metadata.usage) call.usage = metadata.usage;
     if (metadata.model) call.model = metadata.model;
     call.requestId ??= metadata.requestId ?? null;
+    if (metadata.reasoning) {
+      // 探测回调不得影响正文解析。
+      try { opts.onReasoning?.(); } catch { /* ignore */ }
+    }
   };
 
   let res: Response;
@@ -146,7 +218,7 @@ export async function chat(
       },
       body: asciiEscape(
         JSON.stringify({
-          model: MODEL,
+          model,
           temperature: opts.temperature ?? 0.7,
           max_tokens: Math.min(opts.maxTokens ?? maxTokensCeiling, maxTokensCeiling),
           stream,
@@ -169,6 +241,7 @@ export async function chat(
         status: res.status,
         challenged,
         ray: res.headers.get('cf-ray'),
+        model,
       });
       let message = `模型服务暂时不可用（HTTP ${res.status}），请稍后重试。`;
       if (challenged) {
@@ -249,6 +322,7 @@ function decodeSseEvent(event: unknown): { content: string; finished: boolean } 
     throw new LlmError(
       '模型把输出预算用在了思考上（推理模型的思维链与正文共享额度），正文未产出。请重试，或改用非推理模型。',
       false,
+      'OUTPUT_TRUNCATED',
     );
   }
   if (reason === 'content_filter') {
@@ -464,6 +538,52 @@ export async function chatRobust(
     const remainingMs = deadline - Date.now();
     if (remainingMs <= 0) throw e;
     return chat(system, user, { ...opts, totalTimeoutMs: remainingMs });
+  }
+}
+
+// ---- 保存前验证（切换模型的护栏）----
+// 2026-09-16 的找书故障就是「换成了一个不能用的模型」：验证要证明候选模型此刻真的能
+// 出正文，而不是等 owner 保存完再让整个找书功能去试错。
+// 独立短超时，不沿用路由的模型预算；失败只回可读原因，绝不回显上游正文。
+export const MODEL_PROBE_TIMEOUT_MS = 20_000;
+export const MODEL_PROBE_MAX_TOKENS = 64;
+
+export interface ModelProbeResult {
+  ok: boolean;
+  /** 返回里出现过思维链就是推理模型（找书变慢的直接征兆）。 */
+  reasoning: boolean;
+  /** ok=false 时的可读原因；已脱敏，不含上游正文。 */
+  reason: string;
+  /** ok=true 时仍需提示 owner 的注意事项。 */
+  warning: string;
+}
+
+const REASONING_PROBE_WARNING =
+  '该模型是推理模型：思维链与正文共享 max_tokens，会把单次找书拖慢（今天的故障就是这个征兆）。'
+  + `探测预算（${MODEL_PROBE_MAX_TOKENS} token）已被思维链用尽，正式调用请确认 LLM_MAX_TOKENS 足够。`;
+
+export async function probeModel(model: string): Promise<ModelProbeResult> {
+  let reasoning = false;
+  try {
+    // 与正式调用同一条流式路径，避免"非流式能过、流式不能用"的假阳性。
+    await chat('你是模型连通性探测，只回一个词。', 'Say OK', {
+      model,
+      maxTokens: MODEL_PROBE_MAX_TOKENS,
+      totalTimeoutMs: MODEL_PROBE_TIMEOUT_MS,
+      idleTimeoutMs: MODEL_PROBE_TIMEOUT_MS,
+      temperature: 0,
+      onReasoning: () => { reasoning = true; },
+    });
+    return { ok: true, reasoning, reason: '', warning: '' };
+  } catch (error) {
+    // 推理模型在 64 token 的探测预算下正文必然为空：上游已经正常返回并出了 token，
+    // 说明模型本身可用（今天挂掉的是"正文为空 + 预算被思维链吃光"的正式调用，
+    // 那是 LLM_MAX_TOKENS 的问题，不是模型不可用），所以判可用但给出提示。
+    if (reasoning && error instanceof LlmError && error.code === 'OUTPUT_TRUNCATED') {
+      return { ok: true, reasoning: true, reason: '', warning: REASONING_PROBE_WARNING };
+    }
+    const message = error instanceof LlmError ? error.message : '模型验证请求失败，请稍后重试。';
+    return { ok: false, reasoning, reason: `模型验证失败：${message}`, warning: '' };
   }
 }
 
