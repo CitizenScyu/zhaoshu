@@ -7,10 +7,11 @@ import ProfileTab from '@/components/ProfileTab';
 import ShuyuanTab from '@/components/ShuyuanTab';
 import LibraryTab, { createLibraryView } from '@/components/LibraryTab';
 import StatsTab from '@/components/StatsTab';
+import ModelSettingsTab from '@/components/ModelSettingsTab';
 import { OwnerProvider, useOwner } from '@/components/OwnerProvider';
 import { createProfileDraft, profileDraftReducer } from '@/lib/profile-draft';
 
-type Tab = 'find' | 'shelf' | 'profile' | 'shuyuan' | 'library' | 'stats';
+type Tab = 'find' | 'shelf' | 'profile' | 'shuyuan' | 'library' | 'stats' | 'model';
 
 const TABS: { key: Tab; label: string }[] = [
   { key: 'find', label: '找书' },
@@ -19,6 +20,7 @@ const TABS: { key: Tab; label: string }[] = [
   { key: 'shuyuan', label: '书源' },
   { key: 'library', label: '书库' },
   { key: 'stats', label: '统计' },
+  { key: 'model', label: '模型' },
 ];
 
 export default function Home() {
@@ -185,6 +187,7 @@ function PrivateTabs({ tab }: { tab: Tab }) {
       {tab === 'shuyuan' && <ShuyuanTab />}
       {tab === 'library' && <LibraryTab view={libraryView} setView={setLibraryView} />}
       {tab === 'stats' && <StatsTab />}
+      {tab === 'model' && <ModelSettingsTab />}
     </>
   );
 }

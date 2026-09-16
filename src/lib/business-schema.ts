@@ -133,4 +133,13 @@ export async function initializeBusinessSchema(s: Sql) {
       created_at timestamptz NOT NULL DEFAULT now()
     )`;
   await s`CREATE INDEX IF NOT EXISTS profile_seed_audit_user_time_idx ON profile_seed_audit (user_id, created_at DESC)`;
+  // 应用级配置（当前只有 LLM 模型覆盖值）。刻意与 auth_settings 分开：认证 schema 有
+  // 版本闸门，为一条应用配置去动它会牵动全站可用性。单行表，id 固定为 1。
+  await s`
+    CREATE TABLE IF NOT EXISTS app_settings (
+      id integer PRIMARY KEY DEFAULT 1,
+      llm_model text,
+      updated_at timestamptz NOT NULL DEFAULT now()
+    )`;
+  await s`INSERT INTO app_settings (id) VALUES (1) ON CONFLICT (id) DO NOTHING`;
 }

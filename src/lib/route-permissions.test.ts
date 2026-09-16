@@ -8,7 +8,8 @@ vi.mock('@/lib/db', async (original) => ({ ...await original<typeof import('@/li
 
 // 显式枚举 HTTP 导出；新增路由或方法必须同时声明权限，不能悄悄变成匿名入口。
 // auth-entry 仅表示认证流程可接收匿名请求，其 CSRF/凭据/限速由各自用例验证。
-const policies: Record<string, Record<string, 'find' | 'read' | 'download' | 'legacy-owner' | 'auth-entry'>> = {
+const policies: Record<string, Record<string, 'find' | 'read' | 'download' | 'owner' | 'legacy-owner' | 'auth-entry'>> = {
+  'admin/llm': { GET: 'owner', PATCH: 'owner' },
   'auth/login': { POST: 'auth-entry' }, 'auth/logout': { POST: 'auth-entry' },
   'auth/owner': { POST: 'auth-entry' }, 'auth/session': { GET: 'auth-entry' },
   download: { GET: 'download', POST: 'download', DELETE: 'download' },
@@ -35,6 +36,8 @@ describe('API 权限清单', () => {
     vi.stubGlobal('fetch', mocks.fetch);
   });
   afterEach(() => { vi.unstubAllEnvs(); vi.unstubAllGlobals(); });
+  // 用 TypeScript 编译器解析每个路由源码，是纯静态清单检查；默认 5s 在多文件并行
+  // （尤其与其他测试/构建抢 CPU 时）会偶发超时，这里给足余量，断言本身不变。
   it('所有路由及 HTTP 导出都在清单内', async () => {
     const discovered: Record<string, string[]> = {};
     for (const [file, load] of Object.entries(sourceLoaders)) {
@@ -55,7 +58,7 @@ describe('API 权限清单', () => {
       discovered[route] = names.filter((name) => methodNames.has(name)).sort();
     }
     expect(discovered).toEqual(Object.fromEntries(Object.entries(policies).map(([route, methods]) => [route, Object.keys(methods).sort()])));
-  });
+  }, 30_000);
   for (const [route, methods] of Object.entries(policies)) {
     for (const [method, policy] of Object.entries(methods)) {
       if (policy === 'auth-entry') continue;
