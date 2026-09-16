@@ -18,6 +18,10 @@ export type LlmModelSource = 'database' | 'environment' | 'default';
 // 当前没有任何生产者会返回它；探测结果只能是 'yes' 或 'unknown'。
 export type ReasoningVerdict = 'yes' | 'no' | 'unknown';
 
+// PATCH 在「判为推理模型、但请求体没带确认标志」时用的错误码。放在这里是因为接口与前端
+// 必须用同一个字面量：写在两边各一份，改一处就会让确认块静默失效、退回成普通报错。
+export const REASONING_CONFIRMATION_CODE = 'REASONING_MODEL_REQUIRES_CONFIRMATION';
+
 export interface LlmModelSettings {
   model: string;
   /** 「恢复默认」会回到的模型（环境变量或硬编码缺省）。 */

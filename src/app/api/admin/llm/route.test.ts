@@ -222,6 +222,83 @@ describe('PATCH /api/admin/llm', () => {
     expect(mocks.resetModelCache).toHaveBeenCalledTimes(1);
   });
 
+  // S1：判为推理模型时不直接写库，先要一次显式确认。危害不在于模型本身，而在于
+  // owner 在不知道后果的情况下保存它——正是 2026-09-16 那次故障的形态。
+  describe('推理模型需要显式确认', () => {
+    const reasoningProbe = () => mocks.probeModel.mockResolvedValue({
+      ok: true, reasoning: 'yes', reason: '', warning: '该模型是推理模型：思维链与正文共享 max_tokens。',
+    });
+
+    // 回归护栏：删掉确认分支 → 本用例必须失败（会直接 200 写库）。
+    it('不带确认标志 → 409，且绝不写库、不清缓存', async () => {
+      reasoningProbe();
+      const res = await PATCH(req('PATCH', { body: { model: 'reasoner/model' } }));
+      expect(res.status).toBe(409);
+      const body = await res.json();
+      expect(body.code).toBe('REASONING_MODEL_REQUIRES_CONFIRMATION');
+      expect(body.error).toMatch(/推理模型/);
+      expect(body.error).toMatch(/acknowledgeReasoning/);
+      expect(settingWrites()).toHaveLength(0);
+      expect(mocks.resetModelCache).not.toHaveBeenCalled();
+    });
+
+    it('带 acknowledgeReasoning: true 才写库，并照旧把 warning 透出', async () => {
+      reasoningProbe();
+      db.resolve.mockResolvedValue([{ updated_at: '2026-09-16T10:00:00.000Z' }]);
+      const res = await PATCH(req('PATCH', { body: { model: 'reasoner/model', acknowledgeReasoning: true } }));
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body).toMatchObject({
+        model: 'reasoner/model',
+        reasoning: 'yes',
+        warning: '该模型是推理模型：思维链与正文共享 max_tokens。',
+      });
+      expect(settingWrites()[0].values).toEqual(['reasoner/model', 'yes']);
+    });
+
+    it('acknowledgeReasoning: false 等同于没确认', async () => {
+      reasoningProbe();
+      expect((await PATCH(req('PATCH', { body: { model: 'reasoner/model', acknowledgeReasoning: false } }))).status).toBe(409);
+      expect(settingWrites()).toHaveLength(0);
+    });
+
+    it.each([['字符串', 'true'], ['数字', 1], ['null', null]])(
+      'acknowledgeReasoning 是 %s → 400，不探测也不写库', async (_name, value) => {
+        const res = await PATCH(req('PATCH', { body: { model: 'vendor/model', acknowledgeReasoning: value } }));
+        expect(res.status).toBe(400);
+        expect(await res.json()).toMatchObject({ code: 'INVALID_CONFIRMATION' });
+        expect(mocks.probeModel).not.toHaveBeenCalled();
+        expect(settingWrites()).toHaveLength(0);
+      },
+    );
+
+    // 不谎报：判定不是 'yes'（unknown / 从没探测出思维链）时不拦，也不需要确认。
+    it.each(['unknown', 'no'])('判定是 %s 时不要求确认', async (verdict) => {
+      mocks.probeModel.mockResolvedValue({ ok: true, reasoning: verdict, reason: '', warning: '' });
+      db.resolve.mockResolvedValue([{ updated_at: '2026-09-16T10:00:00.000Z' }]);
+      const res = await PATCH(req('PATCH', { body: { model: 'vendor/model' } }));
+      expect(res.status).toBe(200);
+      expect(settingWrites()).toHaveLength(1);
+    });
+
+    // 🔴 死锁护栏：恢复默认必须永远不需要确认、永远不被挡住，
+    // 哪怕当前探测（这里根本不发生）本会判成推理模型。
+    it('恢复默认永远不需要确认，哪怕探测会判成推理模型', async () => {
+      reasoningProbe();
+      const res = await PATCH(req('PATCH', { body: { model: null } }));
+      expect(res.status).toBe(200);
+      expect(mocks.probeModel).not.toHaveBeenCalled();
+      expect(await res.json()).toMatchObject({ source: 'default', updatedAt: null, reasoning: null });
+      expect(settingWrites()).toHaveLength(1);
+    });
+
+    it('恢复默认也不接受畸形确认标志之外的任何门槛（带标志同样成功）', async () => {
+      reasoningProbe();
+      const res = await PATCH(req('PATCH', { body: { model: null, acknowledgeReasoning: true } }));
+      expect(res.status).toBe(200);
+    });
+  });
+
   it('恢复默认清空覆盖值，且不需要通过验证', async () => {
     mocks.probeModel.mockResolvedValue({ ok: false, reasoning: 'unknown', reason: '不该被调用', warning: '' });
     const res = await PATCH(req('PATCH', { body: { model: null } }));

@@ -7,6 +7,7 @@ import {
   MAX_MODEL_NAME_LENGTH,
   modelSettingsPayload,
   readModelSetting,
+  REASONING_CONFIRMATION_CODE,
   writeModelSetting,
 } from '@/lib/app-settings';
 import { verifySameOriginWrite } from '@/lib/csrf';
@@ -23,6 +24,17 @@ export const maxDuration = 60;
 
 const MAX_BODY_BYTES = 4 * 1024;
 const SETTINGS_UNAVAILABLE = '模型设置暂时不可用，请稍后重试。';
+
+// 判为推理模型时**不直接写库**，要求请求体显式带上确认标志。理由：推理模型本身是可接受的
+// （现役 claude-opus-5-88 就是，本轮把 LLM_MAX_TOKENS 提到 16000 也是为了让它能用），
+// 真正的危害是 owner 在不知道后果的情况下保存它——思维链与正文共享 max_tokens，找书会明显
+// 变慢、预算不足时正文会空，正是 2026-09-16 那次故障的形态。要消除的是「静默」，不是模型。
+// 这条只在探测真的观测到思维链（reasoning === 'yes'）时才拦；观测不到不拦，也不假装知道。
+// 错误码本身定义在 app-settings（前端要用同一个字面量），这里只放文案。
+const REASONING_CONFIRMATION_MESSAGE =
+  '该模型会输出思维链（推理模型）：思维链与正文共享 max_tokens，会让每次找书显著变慢，'
+  + '预算不足时正文还会为空。确认要切换到它，请在同一请求体里带 acknowledgeReasoning: true 重试；'
+  + '「恢复默认」不受此限制。';
 
 export async function GET(req: NextRequest) {
   const auth = await requireOwner(req);
@@ -55,6 +67,11 @@ export async function PATCH(req: NextRequest) {
     throw error;
   }
   const raw = body?.model;
+  // 只接受真正的布尔；写成字符串 "true" 会被当成没确认，而那看起来像「我明明带了标志」。
+  const acknowledgeReasoning = body?.acknowledgeReasoning;
+  if (acknowledgeReasoning !== undefined && typeof acknowledgeReasoning !== 'boolean') {
+    return authError(400, 'INVALID_CONFIRMATION', 'acknowledgeReasoning 只能是布尔值 true。');
+  }
 
   // 先确保表存在：验证通过后才发现写不进去，会白白花一次上游探测。
   try {
@@ -86,6 +103,12 @@ export async function PATCH(req: NextRequest) {
   // 保存前验证：不通过就绝不写库，错误原因可读但不含上游正文。
   const probe = await probeModel(raw);
   if (!probe.ok) return authError(502, 'MODEL_PROBE_FAILED', probe.reason);
+
+  // 判为推理模型时要显式确认（见上面 REASONING_CONFIRMATION_* 的说明）。确认分支不发上游
+  // 请求，所以不额外吃 maxDuration；owner 带上标志重试时才会再探测一次。
+  if (probe.reasoning === 'yes' && acknowledgeReasoning !== true) {
+    return authError(409, REASONING_CONFIRMATION_CODE, REASONING_CONFIRMATION_MESSAGE);
+  }
 
   let updatedAt: string | null;
   try {

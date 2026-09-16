@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useState } from 'react';
 import { useOwner } from '@/components/OwnerProvider';
+import { REASONING_CONFIRMATION_CODE } from '@/lib/app-settings';
 import type { LlmModelSettings, ReasoningVerdict } from '@/lib/app-settings';
 
 const SOURCE_LABELS: Record<LlmModelSettings['source'], string> = {
@@ -34,6 +35,21 @@ export function savedNotice(model: string, next: { reasoning: ReasoningVerdict |
   return `已切换到 ${model}，立即生效。${notes.map((note) => `注意：${note}`).join('')}`;
 }
 
+// 接口的「需要确认」响应 → 确认块要显示的内容；不是这个码就返回 null（当普通错误处理）。
+// 单独抽出来是因为它必须与接口的错误码逐字一致：写错一个字母，确认块会静默退化成
+// 一句干巴巴的报错，owner 只会以为保存坏了。
+export function confirmationFor(
+  status: number,
+  data: { code?: unknown; error?: unknown },
+  model: string | null,
+): { model: string; message: string } | null {
+  if (status < 400 || data.code !== REASONING_CONFIRMATION_CODE || typeof model !== 'string') return null;
+  return {
+    model,
+    message: typeof data.error === 'string' && data.error ? data.error : '该模型是推理模型，需要确认后才保存。',
+  };
+}
+
 // owner 专用的最小模型切换入口：展示当前值 + 一个输入框 + 保存 / 恢复默认。
 // 保存会先用新模型发一次极小请求验证，验证失败不写库，原因就地显示。
 export default function ModelSettingsTab() {
@@ -44,6 +60,9 @@ export default function ModelSettingsTab() {
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
+  // 判为推理模型时接口会先拒绝（409），由 owner 点按钮再保存一次——绝不自动重发，
+  // 否则这道确认就退化成一个多余的往返，等于没有确认。
+  const [confirmReasoning, setConfirmReasoning] = useState<{ model: string; message: string } | null>(null);
 
   const load = useCallback(async (signal?: AbortSignal) => {
     setLoading(true);
@@ -69,19 +88,28 @@ export default function ModelSettingsTab() {
     return () => controller.abort();
   }, [load]);
 
-  async function submit(model: string | null) {
+  async function submit(model: string | null, acknowledgeReasoning = false) {
     if (saving) return;
     setSaving(true);
     setError('');
     setNotice('');
+    setConfirmReasoning(null);
     try {
       const res = await apiFetch('/api/admin/llm', {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ model }),
+        body: JSON.stringify({ model, ...(acknowledgeReasoning ? { acknowledgeReasoning: true } : {}) }),
       });
       const data = await res.json();
-      if (!res.ok) throw new Error(data.error || '模型设置保存失败');
+      if (!res.ok) {
+        // 需要确认不是错误：单独摆成一个确认块，把接口给的原因原样带出来。
+        const confirmation = confirmationFor(res.status, data, model);
+        if (confirmation) {
+          setConfirmReasoning(confirmation);
+          return;
+        }
+        throw new Error(data.error || '模型设置保存失败');
+      }
       const next = data as LlmModelSettings & { warning?: string };
       setSettings(next);
       setDraft('');
@@ -116,6 +144,35 @@ export default function ModelSettingsTab() {
         <p role="status" className="mt-4 text-sm" style={{ color: 'var(--moss)' }}>
           ✓ {notice}
         </p>
+      )}
+
+      {confirmReasoning && (
+        <div
+          role="alertdialog"
+          aria-label="确认使用推理模型"
+          className="mt-4 p-3 text-sm space-y-2"
+          style={{ border: '1px solid var(--cinnabar)', color: 'var(--ink-soft)' }}
+        >
+          <p>{confirmReasoning.message}</p>
+          <div className="flex flex-wrap gap-3">
+            <button
+              type="button"
+              className="seal-button text-sm"
+              disabled={saving}
+              onClick={() => void submit(confirmReasoning.model, true)}
+            >
+              {saving ? '保存中…' : `确认使用 ${confirmReasoning.model}`}
+            </button>
+            <button
+              type="button"
+              className="ink-button text-xs !px-4"
+              disabled={saving}
+              onClick={() => setConfirmReasoning(null)}
+            >
+              取消
+            </button>
+          </div>
+        </div>
       )}
 
       {loading && !settings && (
@@ -154,7 +211,7 @@ export default function ModelSettingsTab() {
               id="llm-model"
               className="paper-input text-sm min-h-11 flex-1 min-w-48"
               value={draft}
-              onChange={(event) => { setDraft(event.target.value); setError(''); setNotice(''); }}
+              onChange={(event) => { setDraft(event.target.value); setError(''); setNotice(''); setConfirmReasoning(null); }}
               placeholder={settings.model}
               autoComplete="off"
               spellCheck={false}
