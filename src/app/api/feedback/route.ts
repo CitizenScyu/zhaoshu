@@ -62,25 +62,36 @@ export async function POST(req: NextRequest) {
     let profileUpdated = false;
     let updatedAt: string | null = null;
     if ((shelfStatus === 'done' || shelfStatus === 'dropped') && safeNote && !access.deadline.expired) {
+      let stage = 'read-profile';
       try {
         const profile = await access.run(() => getProfileForUser(userId));
         if (profile.content) {
           const budgetMs = Math.min(access.deadline.modelBudgetMs(MODEL_CEILING_MS), configuredTotalTimeoutMs());
           if (budgetMs <= 0) throw new DeadlineExceededError(MODEL_ROUTE_INTERNAL_BUDGET_MS);
+          stage = 'model';
           const { content: updated } = await access.run(() => chatRobust(
             profileUpdateSystem(), profileUpdateUser(profile.content, JSON.stringify({
               title: cleanTitle, author: cleanAuthor, status: shelfStatus, note: safeNote,
             })),
             { temperature: 0.3, signal: access.signal, onUsage: recordUsageAfterResponse('feedback'), totalTimeoutMs: budgetMs },
           ));
+          stage = 'validate';
           const content = validateProfileContent(updated);
+          stage = 'save';
           updatedAt = await access.commit((write) => saveProfileForUser(userId, profile.seeds, content, profile.updatedAt, write));
           // 种子原样回传，所以"内容变了"就是这次回写真的改动了画像；
           // CAS 命中只说明没有并发写入，不等于画像变了（模型可能原样返回）。
           profileUpdated = updatedAt !== null && content !== profile.content;
         }
-      } catch {
+      } catch (error) {
         // 已保存的反馈保留；授权改变、冲突、模型或预算错误都不再写画像。
+        // 不静默：否则"回写失败"与"模型判定无需修改"在用户侧完全无法区分。
+        // 只记阶段与错误类别，不落模型/数据库原文。
+        console.error('反馈回写画像失败，反馈本身已保存', {
+          stage,
+          name: error instanceof Error ? error.name : typeof error,
+          code: (error as { code?: unknown } | null)?.code ?? null,
+        });
       }
     }
     return NextResponse.json({ ok: true, profileUpdated, ...(updatedAt ? { updatedAt } : {}) });

@@ -97,6 +97,16 @@ describe('POST /api/feedback note contract', () => {
     expect(mocks.saveProfileForUser).toHaveBeenCalledWith(1, [], '原画像', previousVersion, expect.any(Function));
   });
 
+  it('logs the failing stage and error class instead of swallowing the reason', async () => {
+    const logged = vi.spyOn(console, 'error').mockImplementation(() => {});
+    mocks.chatRobust.mockRejectedValue(new LlmError('长度截断', false));
+
+    expect((await POST(request('dropped', '节奏拖沓'))).status).toBe(200);
+
+    expect(logged).toHaveBeenCalledWith('反馈回写画像失败，反馈本身已保存',
+      { stage: 'model', name: 'LlmError', code: null });
+  });
+
   it.each(['done', 'dropped'])('records an empty note for %s while retaining the status and profile', async (status) => {
     const res = await POST(request(status, ''));
 
