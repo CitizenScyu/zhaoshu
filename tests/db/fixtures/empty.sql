@@ -1,0 +1,1 @@
+-- Intentionally empty: the migration must bootstrap a new database schema.
