@@ -89,10 +89,10 @@ export function parseAuthUser(value: unknown): AuthUser | null {
 }
 
 /**
- * 深链返回路径只接受同源站内相对路径；拒绝 `//`、反斜杠、控制字符和外站跳转。
- * 与 `createOwnerRequest` 的 URL 约束同一套判断标准。
+ * 单次净化：只接受同源站内相对路径；拒绝 `//`、反斜杠、控制字符和外站跳转。
+ * 返回 `new URL` 规范化后的站内路径，或 null。
  */
-export function safeReturnPath(value: string | null | undefined): string | null {
+function normalizeReturnPathOnce(value: unknown): string | null {
   if (typeof value !== 'string' || value.length === 0 || value.length > 512) return null;
   if (!value.startsWith('/')) return null;
   if (value.startsWith('//') || value.startsWith('/\\')) return null;
@@ -113,6 +113,19 @@ export function safeReturnPath(value: string | null | undefined): string | null 
   } catch {
     return null;
   }
+}
+
+/**
+ * 深链返回路径：在单次净化的基础上强制**不动点**——净化产物必须能再次通过同一
+ * 套校验，否则拒绝。`new URL` 会把 `/..//evil.com` 规范化成 `//evil.com`
+ * （协议相对 URL，浏览器解析成外站），因此只校验「输入」不够，必须校验「输出」。
+ * 这样保证任意输入下返回值都以单个 `/` 开头，绝不产出 `//` 或反斜杠。
+ */
+export function safeReturnPath(value: string | null | undefined): string | null {
+  const normalized = normalizeReturnPathOnce(value);
+  if (normalized === null) return null;
+  // f(f(x)) === f(x)：产物必须是不动点，否则它自己会被本函数拒绝。
+  return normalizeReturnPathOnce(normalized) === normalized ? normalized : null;
 }
 
 export interface AuthControllerOptions {

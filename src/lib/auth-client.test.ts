@@ -80,6 +80,50 @@ describe('safeReturnPath', () => {
   ])('rejects unsafe return target %s', (value) => {
     expect(safeReturnPath(value as string | null)).toBeNull();
   });
+
+  // 回归：`new URL` 会把 `/..//evil.com` 规范化成协议相对 URL `//evil.com`，
+  // 旧的「只查输入」实现会把它当作合法返回值，浏览器据此跳到 https://evil.com/。
+  it.each([
+    '//evil.com',
+    '/..//evil.com',
+    '/a/..//evil.com',
+    '/..//evil.com/x',
+    '/..//evil.com?x=1',
+    '/a/../..//evil.com',
+  ])('rejects normalization bypass %s', (value) => {
+    expect(safeReturnPath(value)).toBeNull();
+  });
+
+  // 判别力核心：函数必须是不动点。只查输入的实现在这里必然失败
+  // （f('/..//evil.com') === '//evil.com'，而 f('//evil.com') === null）。
+  it('is a fixed point: f(f(x)) === f(x) for every corpus input', () => {
+    const corpus = [
+      '/read/12', '/?tab=shelf', '/login?returnTo=%2Fread%2F1', '/a/b#c', '/',
+      '//evil.com', '/..//evil.com', '/a/..//evil.com', '/..//evil.com/x',
+      '/..//evil.com?x=1', '/a/../..//evil.com', '/%2F%2Foutside.example',
+      '/..%2F%2Fevil.com', 'https://outside.example/read', '/\\outside.example',
+      '/a\\b', 'read/1', '', null, undefined,
+    ];
+    for (const value of corpus) {
+      const once = safeReturnPath(value as string | null);
+      const twice = once === null ? null : safeReturnPath(once);
+      expect(twice, `f(f(${JSON.stringify(value)})) must equal f(...)`).toBe(once);
+    }
+  });
+
+  it('never returns a protocol-relative, backslash or control-character target', () => {
+    const corpus = [
+      '/..//evil.com', '/a/..//evil.com', '/..//evil.com/x', '/..//evil.com?x=1',
+      '/a/../..//evil.com', '/.', '/..', '/...//x', '/%2e%2e//evil.com',
+      '/foo/../../..//evil.com', '/read/12', '/?tab=shelf', '/a/b#c', '//evil.com',
+    ];
+    for (const value of corpus) {
+      const out = safeReturnPath(value);
+      if (out === null) continue;
+      expect(out.startsWith('/') && !out.startsWith('//'), `unsafe output for ${JSON.stringify(value)}: ${JSON.stringify(out)}`).toBe(true);
+      expect(/[\\\x00-\x1f\x7f]/.test(out)).toBe(false);
+    }
+  });
 });
 
 describe('auth helpers', () => {
