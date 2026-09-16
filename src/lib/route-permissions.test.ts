@@ -18,7 +18,7 @@ const policies: Record<string, Record<string, 'find' | 'read' | 'download' | 'le
   profile: { GET: 'find', PUT: 'find', POST: 'find' },
   'read/[id]/[resource]': { GET: 'read' }, 'read/source/[resource]': { GET: 'read' },
   recommendations: { GET: 'find' },
-  shelf: { POST: 'find', DELETE: 'find' }, shuyuan: { GET: 'legacy-owner', POST: 'legacy-owner' },
+  shelf: { POST: 'find', DELETE: 'find' }, shuyuan: { GET: 'read', POST: 'legacy-owner' },
   stats: { GET: 'find' },
 };
 const loaders = import.meta.glob('../app/api/**/route.ts');
