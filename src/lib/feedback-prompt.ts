@@ -43,23 +43,22 @@ export function shouldPromptFeedback({ read, hasFeedback, prompted }: FeedbackPr
 }
 
 /**
- * 哪些入口该引导：只有能保证 books 有行的会话。
+ * 哪些入口该引导。
  *
- * 2026-09-17 在本仓核实（全仓非测试代码里 INSERT INTO books 只有两处）：
- *  - `books` 行只由 /api/find（user-data.ts:191 persistRecommendationsForUserQueries）
- *    与 POST /api/shelf（user-data.ts:52 addShelfForUserQueries）写入；
- *  - 书库走的是另一张表 `labeled_books`（library/route.ts、download_tasks.book_id =
- *    labeled_books.id），它并不同步到 `books`；
- *  - /api/feedback 只认 `books`，定位不到就 404 BOOK_NOT_FOUND（db.ts:190/205-208）。
+ * 核实（2026-09-17，全仓非测试代码里 INSERT INTO books 只有两处：user-data.ts:52
+ * POST /api/shelf、user-data.ts:191 由 /api/find:280 调用）：`books` 与书库的
+ * `labeled_books` 是两张表，彼此不同步；`/api/feedback` 只认 `books`，定位不到就
+ * 404 BOOK_NOT_FOUND（db.ts:190/205-208）。所以 library 这条路径并不保证有 books 行。
  *
- * 于是：shelf（recommendations JOIN books）与 find（同一次请求刚落库）一定有 books 行；
- * library 不一定——从书库直接下载、没跑过 find、也没丢进书架的书没有 books 行，
- * 引导出来也存不下反馈。所以只排除 library。
- * 要让书库的书也能收反馈，得在服务端做（下载时同步 books 或让 feedback 认 labeled_books），
- * 那是 schema/路由语义的改动，不在「只加入口」的范围内。
+ * 但仍全部放行：`from` 区分不出「书库独有、没跑过 find 也没进书架的书」与
+ * 「书库路径上已经跑过 find / 进过书架的书」，而后者正是「读完一本下载好的书」
+ * 这个最自然的反馈时机。产品裁决（task-66）：接受书库独有书在保存时收到明确的
+ * BOOK_NOT_FOUND 报错，换取入口覆盖。真正的修法在服务端（下载时同步 books，或让
+ * feedback 认 labeled_books），不在「只加入口」的范围内。
  */
 export function promptableOrigin(from: ReaderOrigin): boolean {
-  return from !== 'library';
+  // 逐入口列出而不是直接 return true：将来若要收窄，改这里一处即可。
+  return from === 'shelf' || from === 'find' || from === 'library';
 }
 
 /**
