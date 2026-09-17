@@ -99,6 +99,16 @@ describe('已知差异（保留原样，不掩盖）', () => {
   it('🔴 同一差异会让含 İ 的书名与全小写写法分成两键', () => {
     expect(canonicalBookKey('İ', 'a')).not.toBe(canonicalBookKey('i', 'a'));
   });
+
+  it('大小写不依赖宿主 locale（toLowerCase，不是 toLocaleLowerCase）', () => {
+    // tr/az 下 toLocaleLowerCase('I') = 'ı'；我们用 toLowerCase() 固定得到 'i'
+    expect('I'.toLocaleLowerCase('tr')).toBe('ı');
+    expect(normalizeBookAuthor('I')).toBe('i');
+    expect(normalizeBookAuthor('阎ZK')).toBe('阎zk');
+    expect(normalizeBookAuthor('Maxwell')).toBe('maxwell');
+    // 与 SQL C.UTF-8 的 lower() 一致：ASCII 大写 → ASCII 小写
+    expect(normalizeBookTitle('TMW')).toBe('tmw');
+  });
 });
 
 describe('canonicalBookKey', () => {

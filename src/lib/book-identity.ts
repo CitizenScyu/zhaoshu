@@ -53,20 +53,28 @@ function stripOuterTitleBrackets(value: string): string {
   return value.replace(OUTER_TITLE_BRACKETS, '$1');
 }
 
-// 大小写走 ICU（toLocaleLowerCase），与既有的 bookKey/canonicalBookKey 行为一致。
+// 大小写用 toLowerCase()：按 Unicode 默认（root）映射，**不依赖宿主 locale**。
 //
-// 🔴 已知差异 1（无法对齐，保留原样，不做 hack）：
+// 为什么不用 toLocaleLowerCase()（原 bookKey/canonicalBookKey 用的是它）：无参时它取
+// 宿主默认 locale，而生产 Node 的默认 locale 由运行环境决定。危险集合极小但非空——
+// 实测全码位扫描：tr / az 只有 U+0049 `I` 与 U+0130 `İ`（→ `ı`），lt 只有 U+00CC `Ì`、
+// U+00CD `Í`、U+0128 `Ĩ`。生产作者名里确实有 ASCII 大写（`阎ZK` / `TMW` / `Maxwell` 等），
+// 一旦宿主 locale 落到 tr/az/lt，`I` 会被 lower 成 `ı`，与 SQL lower() 的 `i` 分叉，
+// Phase 2 的唯一索引 / ON CONFLICT 就会炸。
+//
+// 换成 toLowerCase() 在**当前可观测的所有输入上是等价变换**：本机（默认 locale zh-CN）
+// 全码位扫描 0x0000–0x10FFFF，两者结果不同的码位 = 0。只有当宿主 locale 是 tr/az/lt 时
+// 行为才变，而那时旧行为本身就是那个 bug。所以这次改动对存量数据 0 影响，换来确定化。
+//
+// 🔴 已知差异（仅剩这一条，无法对齐，保留原样，不做 hack）：
 //   U+0130 'İ' 在 JS 走 Unicode 完整大小写映射 → 'i' + U+0307（2 个码位）；
 //   生产 PG 在 C.UTF-8 下 lower() → 'i'（1 个码位）。同一输入两种键。
-//   本机实测 Node v22.17.0、默认 locale zh-CN：'İ'.toLocaleLowerCase() = 'i̇'。
+//   本机实测 Node v22.17.0：'İ'.toLowerCase() = 'i̇'（与 toLocaleLowerCase 结果相同，
+//   换 toLowerCase() 并不能消除这一条，它来自 Unicode 版本而非 locale）。
 //   生产 books/labeled_books 实测 0 命中（task-49 交接报告）。
 //   不掩盖：一旦出现含 'İ' 的书名，该分叉会在 Phase 2 的唯一索引上直接暴露。
-//
-// 🔴 已知差异 2（同上，属同一类）：toLocaleLowerCase() 的结果依赖宿主默认 locale
-//   （tr/az/lt 下大小写映射不同）。这里刻意沿用既有实现不改，避免在本次改动里
-//   引入未经评审的行为变化；如需彻底确定化应改为 toLowerCase()，另批处理。
 function lower(value: string): string {
-  return value.toLocaleLowerCase();
+  return value.toLowerCase();
 }
 
 export function normalizeBookTitle(raw: string): string {
