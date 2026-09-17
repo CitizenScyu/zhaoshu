@@ -148,10 +148,20 @@ export function saveProfileForUserQuery(sql: PersonalQuery, userId: number, seed
     ) SELECT updated_at FROM updated`;
 }
 
+// 召回排除集合（task-56 T56-1）：除了有反馈记录的书，还要排除**已在书架**的书，
+// 否则同一本书会被后续每个 query 重新召回一次。
+//
+// 「已在书架」的口径是 recommendations.status <> 'new'：'new' 是 find 自动落库、用户
+// 尚未处理的推荐；want/reading/done/dropped 都来自用户显式动作（书架添加写 'want'，
+// 反馈写对应状态）。刻意**不**排除仅有 status = 'new' 历史推荐的书——那会让用户重搜
+// 同一题材时永远看不到这些书，相似书也被整片屏蔽。
+// books 没有 user 归属，user 维度只能由 recommendations/feedback 提供。
 export function excludedBooksForUserQuery(sql: PersonalQuery, userId: number) {
   requireUserId(userId);
-  return sql`SELECT b.title, b.author FROM books b WHERE EXISTS (
-    SELECT 1 FROM feedback f WHERE f.book_id = b.id AND f.user_id = ${userId} AND f.status IN ('done', 'dropped'))`;
+  return sql`SELECT b.title, b.author FROM books b WHERE
+    EXISTS (SELECT 1 FROM recommendations r
+      WHERE r.book_id = b.id AND r.user_id = ${userId} AND r.status <> 'new')
+    OR EXISTS (SELECT 1 FROM feedback f WHERE f.book_id = b.id AND f.user_id = ${userId})`;
 }
 
 export function persistRecommendationsForUserQueries(s: PersonalQuery, userId: number, query: string, items: RerankedItem[]) {

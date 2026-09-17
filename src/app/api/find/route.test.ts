@@ -26,6 +26,7 @@ vi.mock('@/lib/llm', async (importOriginal) => ({
 vi.mock('@/lib/douban', () => ({ verifyBatch: mocks.verifyBatch }));
 vi.mock('@/lib/source-verification', () => ({ supplementSourceEvidence: mocks.supplementSourceEvidence }));
 import { LlmError } from '@/lib/llm';
+import { rerankSystem } from '@/lib/prompts';
 import { POST } from './route';
 
 const candidate = {
@@ -280,8 +281,32 @@ describe('POST /api/find output contract', () => {
     expect(data.items[1]).toMatchObject({
       title: 'ＡＢＣ', author: 'Ｘ', matchScore: 80, why: '原始理由', category: '仙侠', douban: { doubanId: '123' },
     });
-    expect(mocks.chatRobust.mock.calls[0][1]).not.toContain('"why":"重复"');
+    // T55-6 后重排 prompt 只带必要字段：why/sourceEvidence 不进 prompt（重排后被召回原件覆盖）。
+    // 去重仍可从输入里看出来：两个身份各出现一次，被去重的 abc/Ｘ 那份整条不出现。
+    const rerankPrompt = mocks.chatRobust.mock.calls[0][1] as string;
+    expect(rerankPrompt).not.toContain('"why"');
+    expect(rerankPrompt).not.toContain('"sourceEvidence"');
+    expect(rerankPrompt.match(/"title":"ＡＢＣ"/g)).toHaveLength(1);
+    expect(rerankPrompt.match(/"title":"abc"/g)).toHaveLength(1);
     expect(mocks.persistRecommendationsForUser).toHaveBeenCalledWith(1, '找书', data.items, expect.any(Function));
+  });
+
+  // T55-6 收尾：喂给重排模型的投影必须与系统提示词声明可用的字段一致。
+  // 判别力：给投影加字段（或改回 JSON.stringify(verified)）→ 键列表断言失败；
+  // 提示词里残留模型看不到的字段名（sourceEvidence / why）→ 下面两条断言失败。
+  it('sends the rerank model exactly the fields the system prompt declares', async () => {
+    mocks.chatRobust.mockResolvedValue(JSON.stringify({ items: [item] }));
+    await consumeSSE(await POST(request({ step: 'rerank', query: '找书', verified: [verified] })));
+    const rerankPrompt = mocks.chatRobust.mock.calls[0][1] as string;
+    const embedded = /# 候选书[^\n]*\n\n([\s\S]*?)\n\n请重排输出最终推荐/.exec(rerankPrompt)?.[1];
+    expect(embedded).toBeTruthy();
+    const parsed = JSON.parse(embedded!) as Record<string, unknown>[];
+    expect(Object.keys(parsed[0])).toEqual(['title', 'author', 'category', 'wordCount', 'douban']);
+    const system = rerankSystem();
+    for (const field of ['title', 'author', 'category', 'wordCount']) expect(system).toContain(field);
+    expect(system).toContain('豆瓣验证结果');
+    expect(system).not.toContain('sourceEvidence');
+    expect(rerankPrompt).not.toContain('sourceEvidence');
   });
 
   it.each([null, '', false, true])('does not persist an invalid score %j', async (matchScore) => {
@@ -362,7 +387,10 @@ describe('POST /api/find output contract', () => {
     mocks.chatRobust.mockResolvedValue(JSON.stringify({ items: [{ ...item, sourceEvidence: { status: 'forged' } }] }));
     const reranked = await consumeSSE(await POST(request({ step: 'rerank', query: '找书', verified: result.verified })));
     expect(lastEvent<{ type: string; items: unknown[] }>(reranked, 'result').items[0]).toMatchObject({ sourceEvidence: evidence, douban: missing });
-    expect(mocks.chatRobust.mock.calls[0][1]).toContain('仅补充存在性');
+    // T55-6：sourceEvidence 在重排后被召回原件覆盖，因此不再进重排 prompt（省输入 token）；
+    // 结果里的存在性证据仍原样带回（上一行的断言），语义不变。
+    expect(mocks.chatRobust.mock.calls[0][1]).not.toContain('仅补充存在性');
+    expect(mocks.chatRobust.mock.calls[0][1]).not.toContain('"sourceEvidence"');
   });
 
   // 单步模型预算是硬上限：调用方传给 chatRobust 的 totalTimeoutMs 来自它。第一次尝试拿满

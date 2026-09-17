@@ -36,7 +36,8 @@ try {
   await db.exec('CREATE TABLE users (id int PRIMARY KEY)');
   await db.query('INSERT INTO users VALUES (1), (2)');
   for (const table of ['profile', 'profile_seed_audit']) {
-    const ddl = new RegExp('await s`\\s*(CREATE TABLE IF NOT EXISTS ' + table + ' \\([\\s\\S]*?)`').exec(schemaSource)?.[1];
+    // business-schema.ts 现在把 DDL 合成单次事务（task-55），语句由事务回调里的 tx 标签构造。
+    const ddl = new RegExp('(?:await s|tx)`\\s*(CREATE TABLE IF NOT EXISTS ' + table + ' \\([\\s\\S]*?)`').exec(schemaSource)?.[1];
     assert.ok(ddl, 'Read actual runtime DDL for ' + table);
     await db.exec(ddl);
   }

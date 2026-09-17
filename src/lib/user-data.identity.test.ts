@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { mockSql } from './fixtures/mock-sql';
 import {
   addShelfForUserQueries,
+  excludedBooksForUserQuery,
   feedbackForUserQueries,
   feedbackSnapshotForUserQuery,
   persistRecommendationsForUserQueries,
@@ -50,6 +51,19 @@ describe('persistRecommendationsForUserQueries（/api/find 写回路径）', () 
     ]));
     expect(queries.find((q) => q.text.includes('INSERT INTO books'))!.values[0]).toBe('修真聊天群:');
   });
+
+  // task-53 收口后的冲突目标护栏（T53R-6）：身份唯一索引已从表达式索引
+  // (lower(title), lower(author)) 换成生成列 title_key/author_key。
+  // 冲突目标与索引不一致时 PostgreSQL 报「no unique or exclusion constraint
+  // matching」，但那要连真库才会暴露；单测里若不钉这段文本，改回旧表达式仍全绿。
+  // 判别力：把 ON CONFLICT 目标改回 (lower(title), lower(author))，本用例必须失败。
+  it('books 的 INSERT 冲突目标钉在生成列身份键 title_key/author_key 上', () => {
+    const db = mockSql();
+    const queries = bound(persistRecommendationsForUserQueries(db.sql, 1, '找书', [ITEM as never]));
+    const bookInsert = queries.find((q) => q.text.includes('INSERT INTO books'))!;
+    expect(bookInsert.text).toContain('ON CONFLICT (title_key, author_key)');
+    expect(bookInsert.text).not.toMatch(/ON CONFLICT\s*\(\s*lower\(/);
+  });
 });
 
 describe('addShelfForUserQueries / shelfExistsForUserQuery（/api/shelf 路径）', () => {
@@ -67,6 +81,14 @@ describe('addShelfForUserQueries / shelfExistsForUserQuery（/api/shelf 路径�
     const [exists] = bound([shelfExistsForUserQuery(db.sql, 7, '《修真聊天群》', 'ＡＢＣ')]);
     expect(exists.values).toContain('修真聊天群');
     expect(exists.values).toContain('abc');
+  });
+
+  // 与 find 写回路径同一冲突目标：书架入口也不能写回旧表达式索引。
+  it('加入书架的 books INSERT 用同一个冲突目标 title_key/author_key', () => {
+    const db = mockSql();
+    const [bookInsert] = bound(addShelfForUserQueries(db.sql, 7, '《修真聊天群》', 'ＡＢＣ'));
+    expect(bookInsert.text).toContain('ON CONFLICT (title_key, author_key)');
+    expect(bookInsert.text).not.toMatch(/ON CONFLICT\s*\(\s*lower\(/);
   });
 });
 
@@ -101,5 +123,32 @@ describe('feedback 写查两侧同一身份', () => {
     expect(writtenTitle).toBe('修真聊天群');
     expect(read[0].values).toContain('修真聊天群');
     expect(read[0].values).not.toContain('《修真聊天群》');
+  });
+});
+
+// task-56 T56-1：召回排除集合要覆盖「已在书架的书」，否则同一本书会被每个 query 重推。
+// 书架状态在 recommendations.status 上（'new' = find 自动落库、用户未处理；
+// want/reading/done/dropped = 用户显式动作），books 表本身没有 user 归属。
+describe('excludedBooksForUserQuery（召回排除集合）', () => {
+  it('排除集合同时覆盖书架已有书与反馈记录', () => {
+    const db = mockSql();
+    const [query] = bound([excludedBooksForUserQuery(db.sql, 5)]);
+    expect(query.text).toContain('FROM recommendations r');
+    expect(query.text).toContain("r.status <> 'new'");
+    expect(query.text).toContain('FROM feedback f');
+    // 两条子查询各自限定到当前用户，且都绑定同一个 userId
+    expect(query.text.match(/user_id = \?/g)).toHaveLength(2);
+    expect(query.values).toEqual([5, 5]);
+  });
+
+  // 语义边界：仅出现在历史推荐里（status = 'new'）的书不排除，否则用户重搜同题材
+  // 时这些书永远回不来，相似书也被整片屏蔽。判别力：把条件改成 `r.status = 'new'`、
+  // 或去掉 `<>` 直接 EXISTS 任何 recommendation，本用例必须失败。
+  it('不排除仅有历史推荐（status = new）的书', () => {
+    const db = mockSql();
+    const [query] = bound([excludedBooksForUserQuery(db.sql, 5)]);
+    expect(query.text).not.toMatch(/status\s*=\s*'new'/);
+    expect(query.text).not.toMatch(/r\.status\s+IN/);
+    expect(query.text).toContain("r.status <> 'new'");
   });
 });
