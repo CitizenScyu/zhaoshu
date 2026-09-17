@@ -1,17 +1,22 @@
 'use client';
 
 import Link from 'next/link';
+import { useRouter } from 'next/navigation';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import type { CSSProperties, ReactNode } from 'react';
 import { OwnerProvider, useOwner } from '@/components/OwnerProvider';
 import AuthForm from '@/components/AuthForm';
 import type { ReaderIndex, ReaderOrigin, ReaderPart, ReadingSession } from '@/lib/reader-types';
 import { readingSessionKey } from '@/lib/reader-session';
+import { readFeedbackSnapshot } from '@/lib/feedback';
 import {
-  DEFAULT_READER_SETTINGS,
-} from '@/lib/reader-preferences';
+  feedbackPromptKey, hasPromptedFeedback, hasReadingTrace, markFeedbackPrompted,
+  planFeedbackPrompt, promptStorage, snapshotHasFeedback,
+} from '@/lib/feedback-prompt';
+import { DEFAULT_READER_SETTINGS, indexProgressKey } from '@/lib/reader-preferences';
 import type { ReaderSettings, ReaderTheme, ReadingPosition } from '@/lib/reader-preferences';
 import { useReader, partKey } from './useReader';
+import FeedbackPrompt from './FeedbackPrompt';
 import { nextReadingPosition, previousReadingPosition } from '@/lib/reader-part-cache';
 import styles from './reader.module.css';
 
@@ -28,8 +33,18 @@ function bodyText(part: ReaderPart): string {
   return text;
 }
 
-function BackLink({ from }: Pick<Props, 'from'>) {
-  return <Link className={styles.back} href={`/?tab=${from}`}>← 返回{from === 'shelf' ? '书架' : from === 'find' ? '找书' : '书库'}</Link>;
+// T66：返回键是「读完一本书」之后用户一定会走的一步，反馈引导就挂在这里。
+// onBeforeNavigate 返回 true 表示这次点击已被接管（展示引导卡），不再跳转。
+function BackLink({ from, onBeforeNavigate }: Pick<Props, 'from'> & { onBeforeNavigate?: () => boolean }) {
+  return (
+    <Link
+      className={styles.back}
+      href={`/?tab=${from}`}
+      onClick={onBeforeNavigate ? (event) => { if (onBeforeNavigate()) event.preventDefault(); } : undefined}
+    >
+      ← 返回{from === 'shelf' ? '书架' : from === 'find' ? '找书' : '书库'}
+    </Link>
+  );
 }
 
 export default function ReaderClient(props: Props) {
@@ -86,6 +101,7 @@ function NoReadPermission({ from }: Pick<Props, 'from'>) {
 
 function ReaderSession({ session, from }: Props) {
   const { apiFetch, user } = useOwner();
+  const router = useRouter();
   const {
     settings, reading, activePart, loading, flowing, failure, percent, notice, storageFailed, focused,
     scroller, article, heading, onScroll, updateSettings, setFocusMode, navigate: requestNavigation,
@@ -104,6 +120,65 @@ function ReaderSession({ session, from }: Props) {
   const hasNextChapter = chapter + 1 < chapters.length;
   const position = (chapterIndex: number): ReadingPosition => ({ chapterIndex, partIndex: 0, ratio: 0 });
   const screenStyle = { '--reader-font-size': settings.fontSize + 'px', '--reader-line-height': settings.lineHeight } as CSSProperties;
+
+  // T66 反馈入口：返回键只在「有阅读痕迹 + 尚无反馈 + 没引导过」时才被接管。
+  const userId = user?.id ?? 0;
+  const bookTitle = reading?.index.title ?? '';
+  const bookAuthor = reading?.index.author || '佚名';
+  // 本机存过进度也算读过（回到开头重看时 percent 为 0）；阈值判定在 lib 里，测试钉得到。
+  // useReader 读进度时已经做过旧键迁移，这里取纯键即可，渲染期不写存储。
+  const readTrace = useMemo(() => {
+    let stored = false;
+    try {
+      stored = reading ? window.localStorage.getItem(indexProgressKey(reading.index, userId)) !== null : false;
+    } catch {
+      stored = false; // 存储不可用：没有可靠痕迹，就不引导。
+    }
+    return hasReadingTrace(percent, stored);
+  }, [percent, reading, userId]);
+
+  // 读回线上状态前一律按「已有反馈」处理：宁可不引导，也绝不抢在真相前面弹卡。
+  const [hasFeedback, setHasFeedback] = useState(true);
+  // 默认按「已引导」：还不知道是哪本书、是谁的时候不判定。
+  const prompted = useMemo(() => (
+    !bookTitle || userId <= 0
+      ? true
+      : hasPromptedFeedback(promptStorage(), feedbackPromptKey(userId, bookTitle, bookAuthor))
+  ), [bookTitle, bookAuthor, userId]);
+  const [promptHandled, setPromptHandled] = useState(false);
+  const [promptOpen, setPromptOpen] = useState(false);
+  const decision = planFeedbackPrompt({ userId, from, read: readTrace, hasFeedback, prompted: prompted || promptHandled });
+
+  // 引导条件在后台先算好：点返回时必须同步可判定，不能卡在一次网络往返上。
+  // 失败一律按「已有反馈」——少一次引导也不能耽误用户离开。
+  useEffect(() => {
+    if (!readTrace || prompted || !bookTitle || userId <= 0) return;
+    const controller = new AbortController();
+    void apiFetch('/api/feedback?' + new URLSearchParams({ title: bookTitle, author: bookAuthor }), { signal: controller.signal, cache: 'no-store' })
+      .then(async (res) => {
+        const data = await res.json().catch(() => null);
+        if (!res.ok) throw new Error('读取当前反馈失败');
+        const snapshot = readFeedbackSnapshot(data?.current);
+        if (!snapshot) throw new Error('读取当前反馈失败');
+        setHasFeedback(snapshotHasFeedback(snapshot));
+      })
+      .catch(() => { /* 读不到就维持「已有反馈」，不引导 */ });
+    return () => controller.abort();
+  }, [apiFetch, readTrace, prompted, bookTitle, bookAuthor, userId]);
+
+  function handleBack(): boolean {
+    if (!decision.offer || promptOpen) return false;
+    // 展示即记账：同一本书只引导一次，填没填都不再出现。
+    markFeedbackPrompted(promptStorage(), feedbackPromptKey(userId, bookTitle, bookAuthor), Date.now());
+    setPromptHandled(true);
+    setPromptOpen(true);
+    return true;
+  }
+
+  function leaveReader() {
+    setPromptOpen(false);
+    router.push(`/?tab=${from}`);
+  }
 
   function navigate(next: ReadingPosition) { setPanel(null); void requestNavigation(next); }
   function showPanel(next: 'directory' | 'settings') { setFocusMode(false); setPanel(next); }
@@ -133,7 +208,7 @@ function ReaderSession({ session, from }: Props) {
       }}
     >
       <header className={styles.header} hidden={focused}>
-        <BackLink from={from} />
+        <BackLink from={from} onBeforeNavigate={handleBack} />
         <div className={styles.bookIdentity}>
           <span className={styles.smallSeal} aria-hidden="true">书径</span>
           <span title={reading?.index.title}>{reading?.index.title ?? '在线阅读'}</span>
@@ -247,6 +322,7 @@ function ReaderSession({ session, from }: Props) {
       {storageFailed && <p className={styles.storageWarning} role="status">浏览器未允许保存，阅读进度与设置暂时无法记住。</p>}
       {panel === 'directory' && reading && <Panel title="目录" side="left" onClose={() => setPanel(null)}><Directory index={reading.index} current={chapter} onSelect={(selected) => navigate(position(selected))} /></Panel>}
       {panel === 'settings' && <Panel title="阅读设置" side="right" onClose={() => setPanel(null)}><Settings value={settings} onChange={updateSettings} /></Panel>}
+      {promptOpen && <FeedbackPrompt title={bookTitle} author={bookAuthor} onDone={leaveReader} />}
     </div>
   );
 }
