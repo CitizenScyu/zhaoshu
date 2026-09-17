@@ -17,6 +17,12 @@ import {
 type Bound = { text: string; values: unknown[] };
 const bound = (queries: unknown): Bound[] => queries as Bound[];
 
+// T57R-2（428C9 面）：title_key/author_key 是 STORED 生成列，显式往列清单里写值会被
+// PostgreSQL 以 428C9（cannot insert a non-DEFAULT value into column）拒绝。身份键只允许
+// 出现在 ON CONFLICT 冲突目标里；把 INSERT 的列清单单独取出来断言，才不会因为冲突目标
+// 里合法地出现同一个词而误判。
+const insertColumns = (text: string): string => /INSERT INTO books \(([^)]*)\)/.exec(text)?.[1] ?? '';
+
 const ITEM = {
   title: '《修真聊天群》', author: 'ＡＢＣ', category: '', wordCount: '',
   matchScore: 1, hitLikes: [], risks: '', reason: '',
@@ -63,6 +69,9 @@ describe('persistRecommendationsForUserQueries（/api/find 写回路径）', () 
     const bookInsert = queries.find((q) => q.text.includes('INSERT INTO books'))!;
     expect(bookInsert.text).toContain('ON CONFLICT (title_key, author_key)');
     expect(bookInsert.text).not.toMatch(/ON CONFLICT\s*\(\s*lower\(/);
+    // 同一处再钉 428C9 面：身份键不得进入 INSERT 的列清单（生成列不可显式写入）。
+    expect(insertColumns(bookInsert.text)).not.toContain('title_key');
+    expect(insertColumns(bookInsert.text)).not.toContain('author_key');
   });
 });
 
@@ -89,6 +98,9 @@ describe('addShelfForUserQueries / shelfExistsForUserQuery（/api/shelf 路径�
     const [bookInsert] = bound(addShelfForUserQueries(db.sql, 7, '《修真聊天群》', 'ＡＢＣ'));
     expect(bookInsert.text).toContain('ON CONFLICT (title_key, author_key)');
     expect(bookInsert.text).not.toMatch(/ON CONFLICT\s*\(\s*lower\(/);
+    // 同一处再钉 428C9 面：身份键不得进入 INSERT 的列清单（生成列不可显式写入）。
+    expect(insertColumns(bookInsert.text)).not.toContain('title_key');
+    expect(insertColumns(bookInsert.text)).not.toContain('author_key');
   });
 });
 
