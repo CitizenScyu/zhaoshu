@@ -38,9 +38,13 @@ export class SourceRequestContext {
           beforeRequest: async (signal) => {
             if (this.requests >= this.limit) throw new SourceReaderError('书源查询预算已用完，请稍后重试或下载全书。', 'SOURCE_BUDGET_EXCEEDED', 503);
             this.requests++;
-            const delay = Math.max(0, this.nextRequestAt - Date.now());
-            if (delay) await pause(delay, signal);
-            this.nextRequestAt = Date.now() + SOURCE_DELAY_MS;
+            // 同步预占时间槽：并发调用各自拿到互不重叠的发射时刻，起始间隔恒为 SOURCE_DELAY_MS。
+            // 若像以前那样在 await 之后才写回 nextRequestAt，多个并发 page() 会读到同一个旧值、
+            // 一起免等、一起发射，节流对源站失效。
+            const now = Date.now();
+            const at = Math.max(now, this.nextRequestAt);
+            this.nextRequestAt = at + SOURCE_DELAY_MS;
+            if (at > now) await pause(at - now, signal);
           },
         });
       } catch (error) {

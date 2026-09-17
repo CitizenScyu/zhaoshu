@@ -44,9 +44,21 @@ export interface VerifiedCandidate extends Candidate {
   sourceEvidence?: SourceEvidence;
 }
 
+// 书源补验结果的分档码：让「源站没有这本」和「源站本轮挂了」在数据层可区分。
+// status 仍是三值并集（前端与清洗白名单按它分支），code 只做更细的失败归因。
+export type SourceEvidenceCode =
+  | 'SOURCE_NOT_FOUND'
+  | 'SOURCE_AMBIGUOUS'
+  | 'SOURCE_UNAVAILABLE'
+  | 'SOURCE_BUDGET_EXCEEDED'
+  | 'SOURCE_VERIFY_TIMEOUT'
+  | 'SOURCE_VERIFY_ERROR'
+  | 'SOURCE_VERIFY_SKIPPED';
+
 // A matching source directory establishes identity/existence, not rating or completeness.
 export interface SourceEvidence {
   status: 'matched' | 'not_found' | 'unavailable';
+  code?: SourceEvidenceCode;
   sourceName?: string;
   url?: string;
   checkedAt?: string;

@@ -6,7 +6,7 @@ import { sanitizeVerified } from './sanitize';
 const mocks = vi.hoisted(() => ({ resolve: vi.fn(), sources: vi.fn() }));
 vi.mock('./shuyuan', () => ({ getReadingSources: mocks.sources }));
 vi.mock('./source-reader', async (original) => ({ ...await original<typeof import('./source-reader')>(), resolveSourceBook: mocks.resolve }));
-import { supplementSourceEvidence, SOURCE_VERIFY_BUDGET_MS, SOURCE_VERIFY_REQUEST_LIMIT } from './source-verification';
+import { supplementSourceEvidence, SOURCE_VERIFY_BUDGET_MS, SOURCE_VERIFY_CONCURRENCY, SOURCE_VERIFY_REQUEST_LIMIT } from './source-verification';
 import { SourceReaderError } from './source-reader';
 
 const candidate: VerifiedCandidate = { title: '测试书', author: '作者', category: '', wordCount: '', why: '', source: 'llm', douban: { status: 'not_found', found: false } };
@@ -70,12 +70,19 @@ describe('source existence supplement inside verify', () => {
     mocks.resolve.mockImplementation((_book, context) => new Promise((_resolve, reject) => {
       context.signal.addEventListener('abort', () => reject(context.signal.reason), { once: true });
     }));
+    const books = Array.from({ length: 5 }, (_, index) => ({ ...candidate, title: `书${index}` }));
     const deadline = createDeadline(285_000);
     try {
-      const result = supplementSourceEvidence([candidate, { ...candidate, title: '第二书' }], deadline, deadline.signal);
+      const result = supplementSourceEvidence(books, deadline, deadline.signal);
       await vi.advanceTimersByTimeAsync(SOURCE_VERIFY_BUDGET_MS + 1);
-      expect((await result).every((item) => item.sourceEvidence?.status === 'unavailable')).toBe(true);
-      expect(mocks.resolve).toHaveBeenCalledOnce();
+      const settled = await result;
+      expect(settled.every((item) => item.sourceEvidence?.status === 'unavailable')).toBe(true);
+      // 共享预算到期时并行在飞的候选一起被终止；剩下的候选从未启动，也不会获得新预算。
+      expect(settled.filter((item) => item.sourceEvidence?.code === 'SOURCE_VERIFY_TIMEOUT'))
+        .toHaveLength(SOURCE_VERIFY_CONCURRENCY);
+      expect(settled.filter((item) => item.sourceEvidence?.code === 'SOURCE_VERIFY_SKIPPED'))
+        .toHaveLength(books.length - SOURCE_VERIFY_CONCURRENCY);
+      expect(mocks.resolve).toHaveBeenCalledTimes(SOURCE_VERIFY_CONCURRENCY);
       expect(deadline.remainingMs).toBeLessThan(285_000);
     } finally { deadline.dispose(); }
   });
@@ -108,5 +115,87 @@ describe('source existence supplement inside verify', () => {
     for (const url of ['javascript:alert(1)', 'https://evil.invalid/books/details42.html', 'https://book15.net/chapter/index42-1.html']) {
       expect(sanitizeVerified([{ ...candidate, sourceEvidence: { ...evidence, url } }])[0].sourceEvidence?.status).toBe('unavailable');
     }
+  });
+
+  it('keeps distinct failure codes instead of collapsing every miss into one unavailable', async () => {
+    const notes = new Map<string, string>();
+    const record = async (error: unknown) => {
+      mocks.resolve.mockRejectedValueOnce(error);
+      const deadline = createDeadline(285_000);
+      try {
+        const [entry] = await supplementSourceEvidence([{ ...candidate }], deadline, deadline.signal);
+        notes.set(entry.sourceEvidence!.code!, entry.sourceEvidence!.note);
+        return entry.sourceEvidence!;
+      } finally { deadline.dispose(); }
+    };
+    expect(await record(new SourceReaderError('missing', 'SOURCE_NOT_FOUND')))
+      .toMatchObject({ status: 'not_found', code: 'SOURCE_NOT_FOUND' });
+    expect(await record(new SourceReaderError('duplicate', 'SOURCE_AMBIGUOUS')))
+      .toMatchObject({ status: 'unavailable', code: 'SOURCE_AMBIGUOUS' });
+    expect(await record(new SourceReaderError('site down', 'SOURCE_UNAVAILABLE')))
+      .toMatchObject({ status: 'unavailable', code: 'SOURCE_UNAVAILABLE' });
+    expect(await record(new SourceReaderError('quota', 'SOURCE_BUDGET_EXCEEDED')))
+      .toMatchObject({ status: 'unavailable', code: 'SOURCE_BUDGET_EXCEEDED' });
+    expect(await record(new Error('socket hang up')))
+      .toMatchObject({ status: 'unavailable', code: 'SOURCE_VERIFY_ERROR' });
+    // 每条失败的 note 必须互不相同，否则前端仍然分不清「站点没有」和「站点挂了」。
+    expect(new Set(notes.values()).size).toBe(notes.size);
+  });
+
+  it('overlaps candidate lookups instead of running them one after another', async () => {
+    vi.useFakeTimers();
+    const DELAY = 1_000;
+    mocks.resolve.mockImplementation(() => new Promise((resolve) => { setTimeout(() => resolve(match), DELAY); }));
+    const progress = vi.fn();
+    const books = Array.from({ length: 6 }, (_, index) => ({ ...candidate, title: `书${index}` }));
+    const deadline = createDeadline(285_000);
+    try {
+      const completed = supplementSourceEvidence(books, deadline, deadline.signal, progress);
+      await vi.advanceTimersByTimeAsync(DELAY + 1);
+      // 并发下第一轮同时完成 SOURCE_VERIFY_CONCURRENCY 本；串行实现此时只会完成 1 本。
+      expect(progress).toHaveBeenLastCalledWith(SOURCE_VERIFY_CONCURRENCY, books.length);
+      await vi.advanceTimersByTimeAsync(DELAY + 1);
+      expect(progress).toHaveBeenLastCalledWith(books.length, books.length);
+      await expect(completed).resolves.toHaveLength(books.length);
+    } finally { deadline.dispose(); }
+  });
+
+  it('never runs more source lookups concurrently than the cap', async () => {
+    let inFlight = 0;
+    let peak = 0;
+    mocks.resolve.mockImplementation(async () => {
+      inFlight += 1;
+      peak = Math.max(peak, inFlight);
+      await new Promise((resolve) => { setTimeout(resolve, 5); });
+      inFlight -= 1;
+      return match;
+    });
+    const books = Array.from({ length: 9 }, (_, index) => ({ ...candidate, title: `书${index}` }));
+    const deadline = createDeadline(285_000);
+    try {
+      const result = await supplementSourceEvidence(books, deadline, deadline.signal);
+      expect(result.every((item) => item.sourceEvidence?.status === 'matched')).toBe(true);
+    } finally { deadline.dispose(); }
+    expect(peak).toBe(SOURCE_VERIFY_CONCURRENCY);
+  });
+
+  it('logs and explains a wholesale source-list failure instead of swallowing it', async () => {
+    const logged = vi.spyOn(console, 'error').mockImplementation(() => {});
+    mocks.sources.mockRejectedValue(new Error('source list down'));
+    const deadline = createDeadline(285_000);
+    try {
+      const result = await supplementSourceEvidence([candidate], deadline, deadline.signal);
+      expect(result[0].sourceEvidence).toMatchObject({ status: 'unavailable', code: 'SOURCE_VERIFY_ERROR' });
+      expect(logged).toHaveBeenCalled();
+    } finally { deadline.dispose(); }
+  });
+
+  it('carries the failure code through sanitize for the rerank round-trip', () => {
+    const evidence = { status: 'unavailable' as const, code: 'SOURCE_AMBIGUOUS' as const, note: '同名多部' };
+    expect(sanitizeVerified([{ ...candidate, sourceEvidence: evidence }])[0].sourceEvidence).toEqual(evidence);
+    // 未知 code 一律丢弃，不把客户端传来的任意字符串透传下去。
+    const forged = { status: 'unavailable' as const, code: 'evil<script>' as never, note: '注' };
+    expect(sanitizeVerified([{ ...candidate, sourceEvidence: forged }])[0].sourceEvidence)
+      .toEqual({ status: 'unavailable', note: '注' });
   });
 });

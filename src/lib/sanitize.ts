@@ -1,7 +1,7 @@
 import { boundedString } from './http';
 import { validateSourceUrl } from './source-policy';
 import { canonicalBookKey as bookKey } from './book-identity';
-import type { Candidate, RerankedItem, SeedBook, SourceEvidence, VerifiedCandidate } from './types';
+import type { Candidate, RerankedItem, SeedBook, SourceEvidence, SourceEvidenceCode, VerifiedCandidate } from './types';
 
 // 从 LLM / 客户端回传的不可信数据里清洗出结构化的值。
 // 这些函数是纯函数(无 IO),单独成模块以便测试。
@@ -101,11 +101,23 @@ export function sanitizeVerified(value: unknown): VerifiedCandidate[] {
   }));
 }
 
+// 已知的书源补验失败码白名单：只透传本地枚举，不把客户端传来的任意字符串带下去。
+const SOURCE_EVIDENCE_CODES = [
+  'SOURCE_NOT_FOUND', 'SOURCE_AMBIGUOUS', 'SOURCE_UNAVAILABLE', 'SOURCE_BUDGET_EXCEEDED',
+  'SOURCE_VERIFY_TIMEOUT', 'SOURCE_VERIFY_ERROR', 'SOURCE_VERIFY_SKIPPED',
+] as const satisfies readonly SourceEvidenceCode[];
+
+function cleanSourceEvidenceCode(value: unknown): SourceEvidenceCode | undefined {
+  return typeof value === 'string' && (SOURCE_EVIDENCE_CODES as readonly string[]).includes(value)
+    ? value as SourceEvidenceCode : undefined;
+}
+
 export function sanitizeSourceEvidence(value: unknown): SourceEvidence {
   const unavailable: SourceEvidence = { status: 'unavailable', note: '书源证据不完整，本轮无法核验。' };
   if (!isRecord(value)) return unavailable;
   if (value.status === 'not_found' || value.status === 'unavailable') {
-    return { status: value.status, note: cleanString(value.note, 500) || unavailable.note };
+    const code = cleanSourceEvidenceCode(value.code);
+    return { status: value.status, ...(code ? { code } : {}), note: cleanString(value.note, 500) || unavailable.note };
   }
   if (value.status !== 'matched') return unavailable;
   try {
