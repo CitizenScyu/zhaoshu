@@ -11,6 +11,9 @@ function fixture() {
 }
 
 describe('最终写事务的授权边界', () => {
+  // 本文件钉的是批次结构（timeout → 授权围栏 → 业务写 → 再次围栏）与错误转译；
+  // 围栏 DO 块里的 PL/pgSQL（FOR SHARE、NOT FOUND 拒写、owner_tag 比对）单测跑不到，
+  // 语义验收在 scripts/test-personal-write.mjs（真 PG：撤销/降权/锁竞争全走一遍）。
   it('在同一事务中设置 statement_timeout，前后检查原会话并锁住权限行', async () => {
     const { sql, queries, actor } = fixture();
     const signal = new AbortController().signal;
