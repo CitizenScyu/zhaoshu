@@ -43,9 +43,20 @@ export function shouldPromptFeedback({ read, hasFeedback, prompted }: FeedbackPr
 }
 
 /**
- * 哪些入口该引导。书库直读不引导，其余（书架 / 找书）引导。
- * 找书的「直接阅读」走书源会话，但那本书是经 recommendations → books 落过库的，反馈存得下来；
- * 只有书库直读这条路径没有稳定的书身份保证，先排除。
+ * 哪些入口该引导：只有能保证 books 有行的会话。
+ *
+ * 2026-09-17 在本仓核实（全仓非测试代码里 INSERT INTO books 只有两处）：
+ *  - `books` 行只由 /api/find（user-data.ts:191 persistRecommendationsForUserQueries）
+ *    与 POST /api/shelf（user-data.ts:52 addShelfForUserQueries）写入；
+ *  - 书库走的是另一张表 `labeled_books`（library/route.ts、download_tasks.book_id =
+ *    labeled_books.id），它并不同步到 `books`；
+ *  - /api/feedback 只认 `books`，定位不到就 404 BOOK_NOT_FOUND（db.ts:190/205-208）。
+ *
+ * 于是：shelf（recommendations JOIN books）与 find（同一次请求刚落库）一定有 books 行；
+ * library 不一定——从书库直接下载、没跑过 find、也没丢进书架的书没有 books 行，
+ * 引导出来也存不下反馈。所以只排除 library。
+ * 要让书库的书也能收反馈，得在服务端做（下载时同步 books 或让 feedback 认 labeled_books），
+ * 那是 schema/路由语义的改动，不在「只加入口」的范围内。
  */
 export function promptableOrigin(from: ReaderOrigin): boolean {
   return from !== 'library';

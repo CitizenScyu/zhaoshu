@@ -129,12 +129,22 @@ describe('阅读痕迹阈值', () => {
 });
 
 describe('引导入口范围', () => {
-  it('书架与找书都引导', () => {
+  it('书架与找书都引导：这两条路径的书一定有 books 行', () => {
+    // shelf = recommendations JOIN books；find = 同一次请求里刚 persistRecommendations 落库。
     expect(promptableOrigin('shelf')).toBe(true);
     expect(promptableOrigin('find')).toBe(true);
   });
 
-  it('书库直读不引导：这条路径没有稳定的书身份保证', () => {
+  it('书库直读不引导：书库是 labeled_books，不是 books，反馈会 404 BOOK_NOT_FOUND', () => {
+    // 全仓非测试代码里 INSERT INTO books 只有 /api/find 与 POST /api/shelf 两处；
+    // 从书库直接下载、没跑过 find 也没进书架的书没有 books 行。
+    expect(promptableOrigin('library')).toBe(false);
+  });
+
+  it('判定看 from 而不是会话类型：session.kind 判不出 book 身份', () => {
+    // library + taskId 是 download 会话但书只在 labeled_books；find 是 source 会话但书在 books。
+    // 这两条正好相反，所以 from 才是更准的判据。
+    expect(promptableOrigin('find')).toBe(true);
     expect(promptableOrigin('library')).toBe(false);
   });
 });
