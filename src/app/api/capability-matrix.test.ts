@@ -42,6 +42,7 @@ import { GET as profileGet, PUT as profilePut, POST as profilePost } from '@/app
 import { POST as findPost } from '@/app/api/find/route';
 import { GET as recommendationsGet } from '@/app/api/recommendations/route';
 import { POST as shelfPost, DELETE as shelfDelete } from '@/app/api/shelf/route';
+import { DELETE as shelfUnprocessedDelete } from '@/app/api/shelf/unprocessed/route';
 import { GET as feedbackGet, POST as feedbackPost } from '@/app/api/feedback/route';
 import { GET as statsGet } from '@/app/api/stats/route';
 import { GET as exportGet } from '@/app/api/export/route';
@@ -78,6 +79,9 @@ const ROUTES: { name: string; path: string; method: string; handler: Handler; pa
   { name: 'GET /api/recommendations', path: '/api/recommendations', method: 'GET', handler: recommendationsGet as Handler, requires: 'find' },
   { name: 'POST /api/shelf', path: '/api/shelf', method: 'POST', handler: shelfPost as Handler, requires: 'find' },
   { name: 'DELETE /api/shelf', path: '/api/shelf', method: 'DELETE', handler: shelfDelete as Handler, requires: 'find' },
+  // task-65 新增：书架未处理堆的批量清理。不在设计 §5.2 原表内，但同样由
+  // withFindAccess 保护，因此一并纳入矩阵，避免它在鉴权上成为未验证的旁路。
+  { name: 'DELETE /api/shelf/unprocessed', path: '/api/shelf/unprocessed', method: 'DELETE', handler: shelfUnprocessedDelete as Handler, requires: 'find' },
   { name: 'GET /api/feedback', path: '/api/feedback', method: 'GET', handler: feedbackGet as Handler, requires: 'find' },
   { name: 'POST /api/feedback', path: '/api/feedback', method: 'POST', handler: feedbackPost as Handler, requires: 'find' },
   { name: 'GET /api/library', path: '/api/library', method: 'GET', handler: libraryGet as Handler, requires: 'find' },
@@ -160,6 +164,7 @@ describe('§5.2 能力矩阵：逐一直接调用受保护方法', () => {
     expect(ROUTES.map((route) => route.name)).toEqual([
       'GET /api/profile', 'PUT /api/profile', 'POST /api/profile', 'POST /api/find',
       'GET /api/recommendations', 'POST /api/shelf', 'DELETE /api/shelf',
+      'DELETE /api/shelf/unprocessed',
       'GET /api/feedback', 'POST /api/feedback', 'GET /api/library', 'GET /api/stats', 'GET /api/export',
       'GET /api/read/[id]/[resource]', 'GET /api/read/source/[resource]',
       'GET /api/download', 'POST /api/download', 'DELETE /api/download', 'GET /api/download/[id]/file',

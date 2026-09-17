@@ -64,6 +64,21 @@ export function deleteShelfForUserQuery(sql: PersonalQuery, userId: number, id: 
   return sql`DELETE FROM recommendations WHERE id = ${id} AND user_id = ${userId} RETURNING id`;
 }
 
+// 批量清掉「未处理」堆：只删 status='new' 的推荐行。
+//
+// 刻意不按「书架返回的那批 id」删：recommendationsForUserQuery 是
+// `DISTINCT ON (r.book_id)`，一本书只返回最新那一条，而 status 更新
+// （feedbackForUserQueries）是整本书所有行一起改的——一本书完全可能同时有
+// 一条新的非 new 行和一条新的 new 行，按返回 id 删会漏掉后者。
+//
+// 也刻意不按「最新一条是 new 的书」删：那样一部分 new 行会留下成为孤儿。
+// 直接删全部 new 行是唯一与「清空未处理」字面一致的语义；被删行所属的书若
+// 还有非 new 行，书架卡不会消失，只会回到它真实的状态分组里。
+export function clearNewShelfForUserQuery(sql: PersonalQuery, userId: number) {
+  requireUserId(userId);
+  return sql`DELETE FROM recommendations WHERE user_id = ${userId} AND status = ${'new'} RETURNING id`;
+}
+
 export function findStatsForUserQuery(sql: PersonalQuery, userId: number) {
   requireUserId(userId);
   return sql`SELECT count(DISTINCT query)::int AS queries, count(*)::int AS recommendations

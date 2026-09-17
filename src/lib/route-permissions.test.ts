@@ -26,7 +26,9 @@ const policies: Record<string, Record<string, 'find' | 'read' | 'download' | 'ow
   profile: { GET: 'find', PUT: 'find', POST: 'find' },
   'read/[id]/[resource]': { GET: 'read' }, 'read/source/[resource]': { GET: 'read' },
   recommendations: { GET: 'find' },
-  shelf: { POST: 'find', DELETE: 'find' }, shuyuan: { GET: 'download', POST: 'download' },
+  shelf: { POST: 'find', DELETE: 'find' },
+  'shelf/unprocessed': { DELETE: 'find' },
+  shuyuan: { GET: 'download', POST: 'download' },
   stats: { GET: 'find' },
 };
 const loaders = import.meta.glob('../app/api/**/route.ts');
