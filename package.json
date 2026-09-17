@@ -12,6 +12,7 @@
     "typecheck": "tsc --noEmit",
     "lint": "eslint",
     "test": "vitest run",
+    "check": "npm run typecheck && npm run lint && npm test && npm run build",
     "test:contracts": "node --experimental-strip-types scripts/check-worker-contract.mjs",
     "migrate:auth": "node --experimental-strip-types scripts/migrate-user-auth.mjs",
     "test:auth-db": "node --experimental-strip-types scripts/test-auth-db.mjs",

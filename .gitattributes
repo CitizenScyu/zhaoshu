@@ -1,0 +1,6 @@
+# Git hook 必须是 LF 行尾。
+#
+# 本机 core.autocrlf=true，checkout 出来的脚本会被改写成 CRLF，`#!/bin/sh` 变成
+# `#!/bin/sh\r` —— Git Bash 会直接报 `command not found` / `\r: not found`，
+# 钩子静默不生效。这类「钩子以为装好了其实从没跑过」正是本项目最忌讳的护栏消失模式。
+/.githooks/** text eol=lf
