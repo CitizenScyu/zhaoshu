@@ -17,6 +17,7 @@
 - 用事务级 advisory lock（`schema_migrations` 同一把锁）串行化并发迁移，并设置 10 秒锁等待与 120 秒语句预算。
 - `schema_migrations` 同时记录版本和 SHA-256；已登记版本对应的文件摘要变化会阻断执行，提示人工复核。
 - **多版本记账**：逐条按 version 查 `schema_migrations`。已有行且摘要相符 → 跳过、不执行该文件的 SQL；无行 → 执行 SQL 并 INSERT 记账。因此对「DDL 已手工跑过但没记账」的库（生产当前状态），首次 `db:migrate` 只补记账、空转 DDL。
+- **行尾归一**：读文件后先把 CRLF 归成 LF 再算摘要、再执行。生产已登记的 v1 摘要是 LF 版（`0001` 的 git blob 摘要），而 Windows 上 `core.autocrlf=true` 的 checkout 读到的是 CRLF；不归一会让同一份文件在不同平台得到两枚摘要，迁移被「摘要不匹配」整批拒绝。归一不改盘上文件，也不改已登记的行。
 - SQL 文件作为整体交给 PostgreSQL，执行器不会按分号切割。
 - worker 旧表中无法可靠推断的必填 NULL 会阻断迁移，错误包含 `download_tasks.id`；不会用假值补齐，也不会删除历史数据。
 

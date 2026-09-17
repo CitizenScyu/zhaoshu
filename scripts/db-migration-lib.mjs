@@ -106,27 +106,46 @@ export async function probeEndpoint(connectionString) {
   return { serializedLocks, transactionPinned };
 }
 
-const checksumOf = (sql) => createHash('sha256').update(sql).digest('hex');
+// 行尾归一：摘要与执行都以 LF 文本为准。
+// 依据：生产库已登记的 v1 摘要是 LF 版（codex-done-28.md:71 记录首次 db:migrate
+// 输出 checksum 1b47f1ca…，等于 0001 的 git blob 摘要）。Windows checkout 因
+// core.autocrlf=true 读到 CRLF，不归一会得到另一枚摘要，db:check/db:migrate 会被
+// 「版本 1 摘要不匹配」整批拒绝。归一只影响读取，不改盘上文件、不改已登记的行。
+export const normalizeSqlText = (sql) => sql.replaceAll('\r\n', '\n');
 
-// 每个文件是一个版本：version 取自文件名数字前缀，name 是文件名，checksum 是原文 SHA-256。
+export const checksumOf = (sql) => createHash('sha256').update(normalizeSqlText(sql)).digest('hex');
+
+export function parseMigrationVersion(name) {
+  const matched = /^(\d+)_/.exec(name);
+  if (!matched) throw new Error(`迁移文件名缺少数字版本前缀: ${name}`);
+  return Number(matched[1]);
+}
+
+// 常量与文件脱节（例如加了 0003 却忘了抬 SCHEMA_VERSION）必须在执行前就炸，
+// 不能靠人工记得改两处。纯函数，便于在无数据库的套件里直接断言。
+export function assertSchemaVersionHead(versions, schemaVersion = SCHEMA_VERSION) {
+  const head = versions.length ? Math.max(...versions) : undefined;
+  if (head !== schemaVersion) {
+    throw new Error(`迁移列表最大版本 ${head} 与 SCHEMA_VERSION ${schemaVersion} 不一致`);
+  }
+  return head;
+}
+
+// 每个文件是一个版本：version 取自文件名数字前缀，name 是文件名，checksum 是归一后原文的 SHA-256。
 // 摘要进 schema_migrations 后即冻结——改已发布文件的一个字节会让已有库拒绝继续。
 export async function loadMigrations() {
   const migrations = [];
   for (const path of migrationPaths) {
     const name = basename(path);
-    const matched = /^(\d+)_/.exec(name);
-    if (!matched) throw new Error(`迁移文件名缺少数字版本前缀: ${name}`);
-    const sql = await readFile(path, 'utf8');
-    migrations.push({ version: Number(matched[1]), name, sql, checksum: checksumOf(sql) });
+    const version = parseMigrationVersion(name);
+    const sql = normalizeSqlText(await readFile(path, 'utf8'));
+    migrations.push({ version, name, sql, checksum: checksumOf(sql) });
   }
   migrations.sort((a, b) => a.version - b.version);
   if (new Set(migrations.map((item) => item.version)).size !== migrations.length) {
     throw new Error('迁移文件版本号重复');
   }
-  const head = migrations[migrations.length - 1]?.version;
-  if (head !== SCHEMA_VERSION) {
-    throw new Error(`迁移列表最大版本 ${head} 与 SCHEMA_VERSION ${SCHEMA_VERSION} 不一致`);
-  }
+  assertSchemaVersionHead(migrations.map((item) => item.version));
   return migrations;
 }
 
