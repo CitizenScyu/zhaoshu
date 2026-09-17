@@ -3,8 +3,11 @@ import { NextRequest } from 'next/server';
 
 type Query = { text: string; values: unknown[] };
 
-// 只伪造 Neon 传输层：CAS、冲突翻译、快照读取与写事务授权都跑真实的
-// db.ts / user-data.ts / personal-write.ts，测试因此绑定在已定稿的新架构上。
+// 只伪造 Neon 传输层：路由→db.ts→user-data.ts 的调用链、批次语句顺序、绑定参数
+// 与 22012→FeedbackConflictError 的转译都跑真实实现。版本守卫本身（SQL 里的
+// 1/CASE WHEN 除零）**不在这里执行**——mock 只按内存里的 current.id 与守卫的
+// 最后一个绑定参数比较后手抛 22012；除零/CASE 语义由 scripts/check-feedback-cas.mjs
+// 在 PGlite（内存 PostgreSQL）上验收。
 const mocks = vi.hoisted(() => ({
   neon: vi.fn(), ensureSchema: vi.fn(), getProfileForUser: vi.fn(), saveProfileForUser: vi.fn(),
   transaction: vi.fn(),

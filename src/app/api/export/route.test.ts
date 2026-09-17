@@ -77,8 +77,15 @@ describe('GET /api/export', () => {
     });
     const libraryQuery = sql.mock.results.map((result) => String(result.value))
       .find((query) => query.includes('FROM labeled_books'));
-    expect(libraryQuery).toBeDefined();
+    // 书库是全站共享数据，导出不得按 userId 过滤，也不得整行 SELECT *：
+    // 列清单必须显式（labels 正文列刻意排除，免得撑爆导出文件）。
+    expect(libraryQuery).toMatch(/^SELECT id, title, author, category, finish_status, source_site, source_url,\s*chars_labeled, labeled_at, primary_genre, sub_tags, quality FROM labeled_books ORDER BY id$/);
     expect(libraryQuery).not.toMatch(/\blabels\b|SELECT\s+\*/);
+    // 全库共享：这条语句不应携带任何绑定参数（区别于其它按 userId 过滤的查询）。
+    const libraryCall = sql.mock.calls
+      .map(([parts]) => parts.join(''))
+      .findIndex((text) => text.includes('FROM labeled_books'));
+    expect(sql.mock.calls[libraryCall].length).toBe(1);
   });
 
   it('exports an empty account without dropping any dataset', async () => {

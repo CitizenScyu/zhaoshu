@@ -60,7 +60,7 @@ beforeEach(() => {
 });
 
 describe('登录成功后的跳转互斥（深链 vs 回退）', () => {
-  it('jumps only to the deep link and never calls the fallback', async () => {
+  it('jumps only to the deep link and never calls the fallback, via the account login path', async () => {
     const onSuccess = vi.fn();
     const element = AuthForm({ returnTo: '/read/12', onSuccess }) as unknown;
     const form = findElement(element, 'form');
@@ -68,9 +68,29 @@ describe('登录成功后的跳转互斥（深链 vs 回退）', () => {
 
     await submit(form!.props);
 
+    // 深链场景也必须真的做了账号登录——把 member 分支改成走口令兑换仍会 replace，
+    // 只有钉住 login/submitToken 的取舍才能抓到「跳转对但凭据用错」的回归。
+    expect(mocks.owner.login).toHaveBeenCalledTimes(1);
+    expect(mocks.owner.login).toHaveBeenCalledWith('draft', 'draft', false);
+    expect(mocks.owner.submitToken).not.toHaveBeenCalled();
     expect(mocks.replace).toHaveBeenCalledWith('/read/12');
     // 修复前 finish() 会同时调用 onSuccess，导致独立登录页的 router.replace('/')
     // 覆盖深链；这里必须为 0。
+    expect(onSuccess).not.toHaveBeenCalled();
+  });
+
+  it('uses the owner token path when accounts mode is off, still without the fallback', async () => {
+    mocks.owner.accountsEnabled = false;
+    const onSuccess = vi.fn();
+    const element = AuthForm({ returnTo: '/read/12', onSuccess }) as unknown;
+    const form = findElement(element, 'form');
+
+    await submit(form!.props);
+
+    expect(mocks.owner.submitToken).toHaveBeenCalledTimes(1);
+    expect(mocks.owner.submitToken).toHaveBeenCalledWith('draft');
+    expect(mocks.owner.login).not.toHaveBeenCalled();
+    expect(mocks.replace).toHaveBeenCalledWith('/read/12');
     expect(onSuccess).not.toHaveBeenCalled();
   });
 
@@ -81,6 +101,7 @@ describe('登录成功后的跳转互斥（深链 vs 回退）', () => {
 
     await submit(form!.props);
 
+    expect(mocks.owner.login).toHaveBeenCalledTimes(1);
     expect(onSuccess).toHaveBeenCalledTimes(1);
     expect(mocks.replace).not.toHaveBeenCalled();
   });
@@ -95,4 +116,17 @@ describe('登录成功后的跳转互斥（深链 vs 回退）', () => {
     expect(mocks.replace).not.toHaveBeenCalledWith('//evil.com');
     expect(onSuccess).toHaveBeenCalledTimes(1);
   });
+
+  it('keeps the draft fields out of the wire when login itself rejects', async () => {
+    mocks.owner.login = vi.fn().mockRejectedValue(new Error('凭据无效'));
+    const element = AuthForm({ returnTo: '/read/12', onSuccess: vi.fn() }) as unknown;
+    const form = findElement(element, 'form');
+
+    await submit(form!.props);
+
+    // 登录失败绝不跳转：replace 未发生说明 finish() 只在 try 成功后运行。
+    expect(mocks.replace).not.toHaveBeenCalled();
+    expect(mocks.owner.submitToken).not.toHaveBeenCalled();
+  });
 });
+
