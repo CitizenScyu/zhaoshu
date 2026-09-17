@@ -9,9 +9,16 @@ vi.mock('@/lib/db', async (original) => ({ ...await original<typeof import('@/li
 // 显式枚举 HTTP 导出；新增路由或方法必须同时声明权限，不能悄悄变成匿名入口。
 // auth-entry 仅表示认证流程可接收匿名请求，其 CSRF/凭据/限速由各自用例验证。
 const policies: Record<string, Record<string, 'find' | 'read' | 'download' | 'owner' | 'legacy-owner' | 'auth-entry'>> = {
+  'admin/invites': { GET: 'owner', POST: 'owner' },
+  'admin/invites/[id]/revoke': { POST: 'owner' },
+  'admin/label-model': { GET: 'owner', PATCH: 'owner' },
   'admin/llm': { GET: 'owner', PATCH: 'owner' },
+  'admin/registration': { GET: 'owner', PATCH: 'owner' },
+  'admin/users': { GET: 'owner' },
+  'admin/users/[id]': { PATCH: 'owner' },
   'auth/login': { POST: 'auth-entry' }, 'auth/logout': { POST: 'auth-entry' },
-  'auth/owner': { POST: 'auth-entry' }, 'auth/session': { GET: 'auth-entry' },
+  'auth/owner': { POST: 'auth-entry' }, 'auth/register': { POST: 'auth-entry' },
+  'auth/registration': { GET: 'auth-entry' }, 'auth/session': { GET: 'auth-entry' },
   download: { GET: 'download', POST: 'download', DELETE: 'download' },
   'download/[id]/file': { GET: 'download' }, export: { GET: 'find' },
   feedback: { GET: 'find', POST: 'find' }, find: { POST: 'find' },

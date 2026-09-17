@@ -5,7 +5,7 @@ import RegisterCard from './RegisterCard';
 
 export const metadata: Metadata = { title: '注册 · 书径', robots: { index: false, follow: false } };
 
-// 注册接口属于第 35 批（A07）；本批只交付最小表单骨架与明确的关闭状态。
+// 三态注册开关由 /api/auth/registration 提供；关闭时表单保持禁用并给出明确提示。
 export default async function RegisterPage({ searchParams }: {
   searchParams: Promise<{ returnTo?: string | string[] }>;
 }) {

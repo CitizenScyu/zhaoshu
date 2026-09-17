@@ -14,6 +14,7 @@ export const PASSWORD_HASH_PREFIX = 'scrypt$1$';
 
 // 新账户密码边界（设计 §4.1）：15–128 个 Unicode 码点、UTF-8 最多 512 字节。
 // 下限属于注册规则（A07 落地）；本模块只统一上界与编码合法性。
+export const MIN_PASSWORD_CODEPOINTS = 15;
 export const MAX_PASSWORD_CODEPOINTS = 128;
 export const MAX_PASSWORD_UTF8_BYTES = 512;
 
