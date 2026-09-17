@@ -11,6 +11,12 @@ vi.mock('./app-settings', async (importOriginal) => ({
 const fetchMock = vi.fn();
 let client: typeof import('./llm');
 
+// 传输层失败行会补记目标主机 + DNS 解析结果（见 llm.ts 的 resolveUpstreamIps）。这些用例用
+// fake timers，真实解析的回调不会在 advanceTimersByTimeAsync 的推进里到达 ⇒ 观测那一步永远
+// 不结算、用例超时。钉死它：真去查 DNS 的单元测试本来也不该有。
+const dns = vi.hoisted(() => ({ lookup: vi.fn() }));
+vi.mock('node:dns/promises', () => ({ lookup: dns.lookup }));
+
 const data = (value: unknown) => `data: ${JSON.stringify(value)}\n\n`;
 const sse = (events: string[]) => new Response(events.join(''), {
   headers: { 'Content-Type': 'text/event-stream' },
@@ -33,6 +39,8 @@ beforeEach(async () => {
   vi.stubEnv('LLM_BASE_URL', 'https://llm.test/v1');
   vi.stubGlobal('fetch', fetchMock);
   fetchMock.mockReset();
+  dns.lookup.mockReset();
+  dns.lookup.mockResolvedValue([{ address: '203.0.113.7', family: 4 }]);
   settings.readModelSetting.mockReset();
   settings.readModelSetting.mockResolvedValue({ model: null, updatedAt: null });
   client = await import('./llm');

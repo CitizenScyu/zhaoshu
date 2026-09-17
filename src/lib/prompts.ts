@@ -24,7 +24,14 @@ export function recallUser(
   query: string,
   readBooks: { title: string; author: string }[] = [],
   conditions = '',
+  omittedReadBooks = 0,
 ): string {
+  // 调用方可能把软约束清单截断（书架只增不减，见 find/route.ts 的 EXCLUDED_BOOKS_PROMPT_LIMIT）。
+  // 截断时必须让模型知道「这只是一部分」，否则没列出来的那些书会被当成「没排除」而重新推荐；
+  // 硬过滤（excludedKeys/excludedTitles）不受截断影响，但那是后端兜底，软约束该说清就得说清。
+  const omittedNote = omittedReadBooks > 0
+    ? `\n\n以上是**部分**清单：另有 ${omittedReadBooks} 本已排除的书未列出，同样禁止推荐。`
+    : '';
   return `# 用户口味画像
 
 ${profile || '（画像为空，不添加任何长期偏好假定）'}
@@ -41,7 +48,7 @@ ${conditions || '（无）'}
 
 ${readBooks.length > 0 ? `# 以下书用户已读过/弃过/是种子书，禁止推荐（包括换书名号的同一作品）
 
-${readBooks.map((b) => `- 《${b.title}》${b.author ? ' ' + b.author : ''}`).join('\n')}` : ''}
+${readBooks.map((b) => `- 《${b.title}》${b.author ? ' ' + b.author : ''}`).join('\n')}${omittedNote}` : ''}
 
 请召回候选书单。`;
 }

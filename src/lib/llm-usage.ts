@@ -40,10 +40,26 @@ export interface LlmAttemptContext {
 export interface LlmCallObservation extends Partial<LlmAttemptContext> {
   /** 仅成功时：从发起 fetch 到拿到响应头（毫秒）。拿不到就不写，不编。 */
   ttfbMs?: number;
-  /** 仅成功时：响应头里的 cf-ray。拿不到就留空（不写这个键），不编。 */
+  /**
+   * 响应头里的 cf-ray（`<ray id>-<colo>`）。**成功与失败都写**，只要响应头里有——
+   * 2026-09-17 起才这样：此前只在成功时写，于是 HTTP 状态类失败（524/429/5xx，这些
+   * 响应**带着** cf-ray）的 colo 信息被白白丢掉，线上「成片失败是不是同一个 colo」
+   * 无从回答。拿不到就不写这个键，不编。
+   */
   cfRay?: string;
   /** 失败时：LlmError.code（如 UPSTREAM_FIRST_BYTE_TIMEOUT / UPSTREAM_UNREACHABLE）。 */
   errorCode?: string;
+  /**
+   * 仅「传输层失败、且连响应头都没拿到」时：目标主机名（BASE_URL 的 host）。
+   * 与 resolvedIps 成对出现——那时既没有 cf-ray 也没有状态码，这是唯一还能判定的上游身份。
+   */
+  upstreamHost?: string;
+  /**
+   * 同上那种行：**观测时刻**对该主机的 DNS 解析结果（去重）。只是代理指标，不是那一次
+   * 连接真正用的对端地址（undici 不暴露 socket 对端，Cloudflare 又是 anycast），
+   * 详见 llm.ts 的注释。取不到就不写，不编。
+   */
+  resolvedIps?: string[];
 }
 
 export interface LlmCallUsage {

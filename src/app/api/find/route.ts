@@ -77,6 +77,15 @@ function modelList(raw: string, field: 'candidates' | 'items', max: number): unk
 // 剩余预算低于这个值就放弃第二次尝试——一次上游往返至少要留下可用的时间。
 const MIN_SECOND_ATTEMPT_MS = 5_000;
 
+// 软约束清单进 prompt 的条数上限（T57R-5）。excludedBooks 是喂给模型的**软约束**——
+// 真正的排除由 excludedKeys / excludedTitles 两条硬过滤做（下面 filter 那两行，**不受本上限影响**，
+// 排除集合始终完整）。但书架与反馈记录只增不减，不设上限的话这个列表会随用量线性膨胀、
+// 把 prompt 越撑越大（每本一行，几百本时单这一段就几百行），而那属于纯浪费的输入 token。
+// 取 50：正常用户的书架规模远小于它（实测样本里是个位数到几十），真超限时说明确实需要收敛；
+// 截断后由 recallUser 追加一句「另有 X 本已排除」，避免模型把没列出的书当成没排除。
+// 调这个数不影响任何控制流，只影响 prompt 长度。
+const EXCLUDED_BOOKS_PROMPT_LIMIT = 50;
+
 // 单步模型调用的恢复路径。只有一次额外尝试，且两次共享同一个截止时间：
 // 总耗时绝不超过 budgetMs，重试不重获整份预算（deadline 不变量）。
 //
@@ -179,16 +188,24 @@ export async function POST(req: NextRequest) {
         const excludedTitles = new Set(profile.seeds
           .filter((seed) => !seed.author?.trim())
           .map((seed) => bookKey(seed.title, '')));
-        // 已读/弃书列表传给提示词做软约束，后端 filter 做硬约束
-        const excludedBooks = [
+        // 已读/弃书列表传给提示词做软约束，后端 filter 做硬约束（后者不做任何截断）。
+        // ⚠️ 种子书只是排在**最前**，并不豁免：MAX_SEEDS=100（profile/route.ts），种子 >50 时
+        // 尾部那些同样会被截掉、同样计进「另有 X 本」。要保种子必进提示词，得给它们单独留额度，
+        // 本轮不做（种子是用户显式锚点，但硬过滤仍然兜得住它们）。
+        // ⚠️ 库查询 excludedBooksForUserQuery 没有 ORDER BY，所以这个顺序是「种子书在前 +
+        // 库返回顺序」，不是严格时间序；上限只保证**大小**，不宣称「最近 N 本」。要按最近排序
+        // 得改 user-data.ts 的查询（超出本任务的文件域）。
+        const excludedBooksAll = [
           ...profile.seeds.map((seed) => ({ title: seed.title, author: seed.author ?? '' })),
           ...(await atomicRead(() => getExcludedBookTitlesForUser(userId))),
         ];
+        const excludedBooks = excludedBooksAll.slice(0, EXCLUDED_BOOKS_PROMPT_LIMIT);
+        const excludedBooksOmitted = excludedBooksAll.length - excludedBooks.length;
         const raw = await atomicRead(() => modelStep(
           ms(),
           async (totalTimeoutMs) => (await chatRobust(
             recallSystem(),
-            recallUser(profile.content, query, excludedBooks, conditions),
+            recallUser(profile.content, query, excludedBooks, conditions, excludedBooksOmitted),
             { temperature: 0.8, signal: access.signal, onUsage: recordUsageAfterResponse('find_recall'), totalTimeoutMs, fallbackModel, ...modelAttemptLimits },
           )).content,
           (content) => modelList(content, 'candidates', MAX_CANDIDATES),
