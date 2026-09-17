@@ -121,7 +121,7 @@ export default function ShelfTab() {
     setError('');
     setFeedbackMessage('');
     try {
-      const res = await apiFetch('/api/shelf?status=new', { method: 'DELETE' });
+      const res = await apiFetch('/api/shelf/unprocessed', { method: 'DELETE' });
       const data = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(data.error || '清理失败');
       const cleared = typeof data.cleared === 'number' ? data.cleared : 0;

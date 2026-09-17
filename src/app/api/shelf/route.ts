@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { ensureSchema, getSql } from '@/lib/db';
 import { withFindAccess, personalError } from '@/lib/personal-request';
-import { shelfExistsForUserQuery, addShelfForUserQueries, deleteShelfForUserQuery, clearNewShelfForUserQuery } from '@/lib/user-data';
+import { shelfExistsForUserQuery, addShelfForUserQueries, deleteShelfForUserQuery } from '@/lib/user-data';
 import { boundedPositiveInteger, readJsonBody } from '@/lib/http';
 
 // 书架管理：从书库(labeled_books)添加到书架，或从书架移除某条推荐
@@ -39,31 +39,14 @@ export async function POST(req: NextRequest) {
   });
 }
 
-// DELETE 有两种形态，靠查询参数区分：
-//   ?id=N           移除单条推荐（原有语义）
-//   ?status=new     批量清空本人全部「未处理」推荐
-// id 一旦出现（即使非法）就绝不走批量分支：否则一个漏掉 id 的前端 bug、
-// 或 `?id=typo&status=new` 这种 URL，会变成一次静默的大范围删除。
 export async function DELETE(req: NextRequest) {
   return withFindAccess(req, 55_000, async (access) => {
-    const params = new URL(req.url).searchParams;
-    const hasId = params.has('id');
-    const id = hasId ? boundedPositiveInteger(params.get('id')) : null;
-    if (!hasId && params.get('status') !== 'new') {
-      return NextResponse.json({ error: 'missing valid id', code: 'INVALID_ID' }, { status: 400 });
-    }
-    if (hasId && id === null) {
-      return NextResponse.json({ error: 'missing valid id', code: 'INVALID_ID' }, { status: 400 });
-    }
-    const { userId } = access.principal;
+    const id = boundedPositiveInteger(new URL(req.url).searchParams.get('id'));
+    if (id === null) return NextResponse.json({ error: 'missing valid id', code: 'INVALID_ID' }, { status: 400 });
     try {
       await access.run(ensureSchema);
-      if (id === null) {
-        const rows = await access.commit((write) => write((sql) => [clearNewShelfForUserQuery(sql, userId)]));
-        return NextResponse.json({ ok: true, cleared: rows[0].length });
-      }
       const rows = await access.commit((write) => write((sql) => [
-        deleteShelfForUserQuery(sql, userId, id),
+        deleteShelfForUserQuery(sql, access.principal.userId, id),
       ]));
       if (!rows[0].length) return NextResponse.json({ error: 'recommendation not found', code: 'RECOMMENDATION_NOT_FOUND' }, { status: 404 });
       return NextResponse.json({ ok: true });
