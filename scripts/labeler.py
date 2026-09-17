@@ -208,8 +208,9 @@ def fetch_chapters(detail_url: str) -> list[tuple[str, str]]:
 # 背景（t76 只读排查，证据 D:/ClaudeCode/projects/zhaoshu/.t76-analysis/）：
 # 旧实现从 chapter-content-panel 起**固定截 25k** 再抽 <p>，把容器闭合之后的页脚/推荐位，
 # 以及容器内的按钮行一起塞进提示词。t76 抽样显示约 18% 行是站点 UI 噪声（按钮行 + 导航行），
-# 噪声把模型推向自报 text_quality=含广告注入——470 条拒收里 337 条是这一项，且同一本
-# 《极品透视》被拒 30 次后同日又以「正常」入库，说明该判定非确定、被噪声放大。
+# 噪声把模型推向自报 text_quality=含广告注入——470 条拒收里 337 条是这一项；且 45 个书名
+# 既被「含广告注入」拒收过、又有入库记录（最多的是《我的老婆是阴阳眼》31 次），
+# 说明该判定非确定、被噪声放大。（注：《极品透视》28 次拒收全是「大面积重复」，与广告无关。）
 # 本层**只做清洗**：不改 text_quality 判定门（见 main()），不改提示词，不改入库语义。
 
 CONTENT_MARKER = 'chapter-content-panel'  # 站点章节页正文容器标记
@@ -237,21 +238,24 @@ UI_TOKENS_EXT = (
 _UI_TOKENS_SORTED = tuple(sorted(UI_TOKENS_CORE + UI_TOKENS_EXT, key=len, reverse=True))
 # 行内允许出现的分隔/装饰字符（含中英文标点与全角空格）；纯标点行由「必须命中过 UI 词」兜住。
 _UI_SEP_RE = re.compile(r'[\s\u3000|/\\·、,，;；:：!！?？。…~～\-—_+=*()（）\[\]【】<>《》「」『』]+')
+# 正文特征标点：出现即判为叙述/对白文本，UI 与导航规则一律不碰。
+# 交叉审查实测的误删形态正是这一类：单行「手机。」「打赏。」「「手机。」」，
+# 以及对白「“你翻上一章看看，下一章就明白了”」——真实按钮行不含句读与引号。
+_PROSE_MARK_RE = re.compile(r'[。！？；，、…“”‘’「」『』]')
 
-# 站点推广行黑名单，按行匹配。前四条 = t76 实测命中样本，后四条为同族变体
-# （均为站点自指语，小说正文不会出现）。
+# 站点推广行黑名单。四条 = t76 实测命中样本，第五条是第一条的形态变体。
+# 只收**固定口号**：「多多分享本站」「高速首发…最新章节」这类整句标语在小说正文里
+# 不可能出现。交叉审查证明「本站/手机用户」这类**站点自指泛化**会误伤对白
+# （“你给我记住本站的规矩。” / “手机用户请注意，前面是雷区。” / 分享本站。），已全部删除。
 INJECT_PATTERNS = (
     re.compile(r'无弹窗全文字在线阅读'),        # 「提供无弹窗全文字在线阅读」
     re.compile(r'多多分享本站'),                # 「多多分享本站」
     re.compile(r'高速首发.{0,12}?最新章节'),     # 「高速首发…最新章节」
     re.compile(r'qq\s*群和微博', re.I),          # 「向您qq群和微博里的朋友推荐」
-    re.compile(r'全文字在线阅读'),
-    re.compile(r'分享本站'),
-    re.compile(r'请?记住本站(网址)?'),
-    re.compile(r'手机用户请'),
+    re.compile(r'全文字在线阅读'),               # = 第一条去掉「无弹窗」的变体
 )
-# 「上一章 ... / ... 下一章」导航行：两个词都在且行够短。含句读则判为正文，不剥。
-_NAV_SENTENCE_RE = re.compile(r'[。！？；]')
+# 「上一章 ... / ... 下一章」导航行：两个词都在且行够短，且不含正文特征标点。
+_NAV_SENTENCE_RE = _PROSE_MARK_RE
 
 _DIV_TOKEN_RE = re.compile(r'</?div\b', re.I)
 
@@ -302,10 +306,13 @@ def extract_chapter_lines(html: str) -> tuple[list[str], str]:
 
 
 def _drop_rule(line: str) -> str | None:
-    """命中返回规则名，否则 None。三条规则都要求整行「只由噪声组成」，不做局部删除。"""
-    # 1) UI 按钮行：剥掉所有 UI 词后（连同分隔符）整行为空才算命中；必须真的命中过词，
-    #    否则「……」这类纯标点正文行会被误删。
-    if len(line) <= UI_LINE_MAX_LEN:
+    """命中返回规则名，否则 None。
+
+    1)、2) 要求**整行只由噪声构成**（不做局部删除）；3) 是子串命中——推广语是固定口号，
+    正常正文不会出现，靠「行长度上限 + 口号本身无歧义」控制误伤，不要求整行匹配。"""
+    # 1) UI 按钮行：行短、不含正文标点，且剥掉所有 UI 词后（连同分隔符）整行为空。
+    #    必须真的命中过词，否则「……」这类纯标点正文行会被误删。
+    if len(line) <= UI_LINE_MAX_LEN and not _PROSE_MARK_RE.search(line):
         core, hit = line, False
         for tok in _UI_TOKENS_SORTED:
             if tok in core:
@@ -313,7 +320,7 @@ def _drop_rule(line: str) -> str | None:
                 core = core.replace(tok, '')
         if hit and not _UI_SEP_RE.sub('', core):
             return 'ui'
-    # 2) 导航行：「上一章…/…下一章」及其带章节名的变体；含句读视为正文。
+    # 2) 导航行：「上一章…/…下一章」及其带章节名的变体；含正文标点（含引号）视为对白。
     if len(line) <= NAV_LINE_MAX_LEN and '上一章' in line and '下一章' in line \
             and not _NAV_SENTENCE_RE.search(line):
         return 'nav'
@@ -356,6 +363,11 @@ def fetch_chapter_text(chapter_url: str) -> str:
     text, stats = clean_chapter_text(html)
     if stats['container'] == 'missing':
         _clean_warn(f'{chapter_url} 未找到正文容器 {CONTENT_MARKER}，本页判为无正文')
+    elif stats['container'] == 'fallback':
+        # 退回旧窗口意味着页脚/推荐位噪声会一起回来，不能静默。
+        _clean_warn(
+            f'{chapter_url} 正文容器未能配对闭合标签，退回 {CONTAINER_FALLBACK_WINDOW} 字'
+            f'窗口（页脚噪声可能回归，需核对页面结构）')
     elif stats['drop_ratio'] > CLEAN_MAX_DROP_RATIO:
         _clean_warn(
             f'{chapter_url} 清洗丢弃 {stats["drop_ratio"]:.0%} 字符'

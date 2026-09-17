@@ -112,6 +112,17 @@ class TestContainer(unittest.TestCase):
         self.assertEqual(how, 'closed')
         self.assertEqual(lines, ['正文' * 80])
 
+    def test_non_div_container_does_not_return_the_header(self):
+        """变异钉：`m.start() > i` 是承重护栏，去掉后本用例会取回页头、正文全丢。
+
+        正文容器不是 <div>（如 <section>）时，rfind('<div') 只能配到 marker **之前**
+        那个已闭合的页头 div；没有护栏就会把页头当成正文返回。"""
+        html = ('<div class="nav">' + '<p>页头导航</p>' * 30 + '</div>'
+                '<section id="chapter-content-panel"><p>' + '正文' * 80 + '</p></section>')
+        lines, how = labeler.extract_chapter_lines(html)
+        self.assertEqual(how, 'fallback')
+        self.assertEqual(lines, ['正文' * 80])
+
 
 class TestNoiseRules(unittest.TestCase):
     """规则 1b/1c/1d：UI 按钮行、导航行、推广行。"""
@@ -119,6 +130,14 @@ class TestNoiseRules(unittest.TestCase):
     def test_ui_token_words_are_dropped(self):
         for token in labeler.UI_TOKENS_CORE:
             with self.subTest(token=token):
+                self.assertEqual(labeler._drop_rule(token), 'ui')
+
+    def test_ext_tokens_are_present_and_dropped(self):
+        # 变异钉：删掉 UI_TOKENS_EXT 整个词表也要能被抓到（所以先 assertIn 再逐词验）
+        for token in ('加入书架', '字体', '背景', '亮度', '返回目录', '章节报错',
+                      '打赏', '推荐本书', '投推荐票', '夜间模式', '上一节'):
+            with self.subTest(token=token):
+                self.assertIn(token, labeler.UI_TOKENS_EXT)
                 self.assertEqual(labeler._drop_rule(token), 'ui')
 
     def test_ui_lines_with_separators_are_dropped(self):
@@ -171,6 +190,31 @@ class TestProsePreserved(unittest.TestCase):
     def test_short_prose_with_ui_token_residue_is_kept(self):
         self.assertIsNone(labeler._drop_rule('他看了看目录。'))
 
+    def test_short_lines_and_dialogue_are_kept(self):
+        """交叉审查实测到的误删形态，全部必须保留（本轮修复的直接回归用例）。"""
+        for line in ('手机。', '打赏。', '背景。', '字体。', '书架。', '目录。',
+                     '「手机。」',
+                     '“你翻上一章看看，下一章就明白了”',   # nav 误删形态
+                     '“你给我记住本站的规矩。”',           # inject 误删形态
+                     '“手机用户请注意，前面是雷区。”',     # inject 误删形态
+                     '分享本站。'):                         # inject 误删形态
+            with self.subTest(line=line):
+                self.assertIsNone(labeler._drop_rule(line))
+
+    def test_injection_generalizations_are_gone(self):
+        # 变异钉：不许把「本站/手机用户」这类站点自指泛化重新加回黑名单。
+        # 用整条 pattern 相等判定——「分享本站」是 CORE「多多分享本站」的子串，子串判定会误报。
+        patterns = {p.pattern for p in labeler.INJECT_PATTERNS}
+        for removed in ('分享本站', r'请?记住本站(网址)?', '手机用户请'):
+            with self.subTest(pattern=removed):
+                self.assertNotIn(removed, patterns)
+
+    def test_promotional_full_sentence_is_still_dropped(self):
+        # 收紧到固定口号后，实测的整句推广仍然要被剥掉
+        self.assertEqual(
+            labeler._drop_rule('本站提供无弹窗全文字在线阅读，更新速度快，请记住本站网址。'),
+            'inject')
+
     def test_clean_text_is_stripped_and_deduplicated_newlines(self):
         text, _ = labeler.clean_chapter_text(html_with('<p>甲</p><p></p><p>乙</p>'))
         self.assertEqual(text, '甲\n乙')
@@ -199,6 +243,16 @@ class TestGuards(unittest.TestCase):
         self.assertEqual(text, plain)
         self.assertEqual(stats['lines_dropped'], 0)
         self.assertEqual(stats['chars_after'], stats['chars_before'])
+
+    def test_ui_line_cap_is_a_real_valve(self):
+        """变异钉：把 UI_LINE_MAX_LEN 从 20 改大（如 60）必须被抓到。
+
+        本行整行只由 UI 词+空格构成、但长于 20 字——长度上限就是为这种行留的安全阀，
+        超过上限一律不剥（宁漏勿误删）。"""
+        long_ui_row = '章节目录 阅读设置 加入书签 字体大小 返回目录 章节报错 打赏'
+        self.assertGreater(len(long_ui_row), labeler.UI_LINE_MAX_LEN)
+        self.assertLessEqual(len(long_ui_row), 60)
+        self.assertIsNone(labeler._drop_rule(long_ui_row))
 
 
 class TestFetchIntegration(unittest.TestCase):
@@ -236,6 +290,21 @@ class TestFetchIntegration(unittest.TestCase):
         finally:
             labeler.http_get = original
         self.assertEqual(text, '')
+
+    def test_warns_when_falling_back_to_window(self):
+        # 退回旧 25k 窗口意味着页脚噪声回归，必须显式告警而不是静默
+        import contextlib
+        import io
+        original = labeler.http_get
+        labeler.http_get = lambda url, timeout=30: (
+            '<div id="chapter-content-panel"><p>' + '正' * 300 + '</p>')
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(buf):
+                labeler.fetch_chapter_text('/chapter/index1-4.html')
+        finally:
+            labeler.http_get = original
+        self.assertIn('退回', buf.getvalue())
 
     def test_thresholds_are_declared(self):
         # 判定门与提示词不在本次改动范围：这里只是钉住常量仍在
