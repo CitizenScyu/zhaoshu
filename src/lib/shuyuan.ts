@@ -2,6 +2,12 @@ import { getSql } from '@/lib/db';
 import { isRecord } from '@/lib/sanitize';
 import { createDeadline, raceDeadline, type RequestDeadline } from '@/lib/deadline';
 import { validateSourceUrl } from '@/lib/source-policy';
+import {
+  FILTER_COUNT_KEYS, SOURCE_PAGE_SIZE, offsetFor, pageCount,
+  type ShuyuanAvailability, type ShuyuanSourceFilter,
+} from '@/lib/shuyuan-view';
+
+export type { ShuyuanAvailability };
 
 // 书源合集（yckceo.com）拉取、合并去重、失效治理。
 // 列表页是静态 HTML，合集 JSON 端点按 id 取；yckceo 在国内直连被 SNI 重置，
@@ -23,7 +29,6 @@ export const REFRESH_BUDGET_MS = 90_000;
 
 export type ShuyuanCollection = { id: number; title: string; count: number };
 
-export type ShuyuanAvailability = 'unprobed' | 'pending' | 'reachable' | 'failed';
 export type ShuyuanCounts = {
   total: number;
   active: number; // 兼容字段：启用且最近探测可达，不能用未禁用数量填充。
@@ -44,6 +49,20 @@ export type ShuyuanStats = ShuyuanCounts & {
   sources: ShuyuanSourceStatus[];
   sourcesLimit: number;
 };
+
+/**
+ * 分页元信息。只有显式传 list 参数调用 getShuyuanStats 时才会附在返回值上——
+ * 不带参数的调用保持原有形状，/api/stats 等既有消费方不受影响。
+ */
+export type ShuyuanSourcePage = {
+  filter: ShuyuanSourceFilter;
+  page: number;
+  pageSize: number;
+  total: number;
+  totalPages: number;
+};
+export type ShuyuanStatsPage = ShuyuanStats & ShuyuanSourcePage;
+export type ShuyuanListQuery = { filter: ShuyuanSourceFilter; page: number };
 
 type Sql = ReturnType<typeof getSql>;
 type ProbeState = { url: string; status: ShuyuanAvailability; checked_at: string | null; error: string | null };
@@ -223,11 +242,23 @@ export async function getShuyuanCounts(signal?: AbortSignal): Promise<ShuyuanCou
   return countsFromStates(s, meta.states, signal);
 }
 
-export async function getShuyuanStats(signal?: AbortSignal): Promise<ShuyuanStats> {
+export async function getShuyuanStats(signal?: AbortSignal): Promise<ShuyuanStats>;
+export async function getShuyuanStats(signal: AbortSignal | undefined, list: ShuyuanListQuery): Promise<ShuyuanStatsPage>;
+// 实现签名必须是两者的联合：不带 list 时走的是 `if (!list) return stats` 那条旧形状分支。
+// 对外形状由上面两个重载决定，调用方拿到的仍是精确类型。
+export async function getShuyuanStats(
+  signal?: AbortSignal, list?: ShuyuanListQuery,
+): Promise<ShuyuanStats | ShuyuanStatsPage> {
   const s = getSql();
   const rawMeta = await storedMeta(s, signal);
   const { collections, states } = readMeta(rawMeta.collections);
   const counts = await countsFromStates(s, states, signal);
+  const filter = list?.filter ?? 'all';
+  const page = list?.page ?? 1;
+  const pageSize = list ? SOURCE_PAGE_SIZE : SOURCE_STATUS_LIMIT;
+  // 筛选谓词写成 7 个绑定参数的布尔式，而不是拼 SQL 片段：filter 会决定谓词形状，
+  // 但它始终只是一个被比较的值，不进 SQL 文本。分支与 countsFromStates 的
+  // FILTER (WHERE ...) 逐条对齐，所以卡片上的数字就是点进去看到的条数。
   const rows = await readRows<{
     url: string; name: string; disabled: boolean; availability: ShuyuanAvailability;
     last_error: string; checked_at: string | null; probe_error: string | null;
@@ -238,16 +269,26 @@ export async function getShuyuanStats(signal?: AbortSignal): Promise<ShuyuanStat
     FROM shuyuan_sources
     LEFT JOIN jsonb_to_recordset(${JSON.stringify([...states.values()])}::jsonb)
       AS p(url text, status text, checked_at text, error text) ON p.url = source_url
+    WHERE ${filter} = 'all'
+       OR (${filter} = 'enabled' AND disabled_at IS NULL)
+       OR (${filter} = 'disabled' AND disabled_at IS NOT NULL)
+       OR (${filter} = 'unprobed' AND p.status IS NULL)
+       OR (${filter} = 'pending' AND p.status = 'pending')
+       OR (${filter} = 'reachable' AND p.status = 'reachable')
+       OR (${filter} = 'failed' AND p.status = 'failed')
     ORDER BY COALESCE(p.status = 'pending', false) DESC,
              (last_error <> '' OR disabled_at IS NOT NULL) DESC, source_url
-    LIMIT ${SOURCE_STATUS_LIMIT}`, signal);
-  return {
-    ...counts, collections, refreshedAt: rawMeta.refreshed_at, sourcesLimit: SOURCE_STATUS_LIMIT,
+    LIMIT ${pageSize} OFFSET ${offsetFor(page, pageSize)}`, signal);
+  const stats: ShuyuanStats = {
+    ...counts, collections, refreshedAt: rawMeta.refreshed_at, sourcesLimit: pageSize,
     sources: rows.map((row) => ({
       url: row.url, name: row.name, disabled: row.disabled, availability: row.availability,
       lastError: row.last_error, checkedAt: row.checked_at, probeError: row.probe_error,
     })),
   };
+  if (!list) return stats;
+  const total = counts[FILTER_COUNT_KEYS[filter]];
+  return { ...stats, filter, page, pageSize, total, totalPages: pageCount(total, pageSize) };
 }
 
 // V2 搜索失败时打失效标记：被标记的源不再进入搜索轮换
@@ -256,6 +297,30 @@ export async function disableShuyuanSource(url: string, reason: string): Promise
   const rows = (await s`
     UPDATE shuyuan_sources
     SET disabled_at = now(), last_error = COALESCE(NULLIF(${reason.slice(0, 200)}, ''), last_error)
+    WHERE source_url = ${normalizeUrl(url)}
+    RETURNING id`) as { id: number }[];
+  return rows.length > 0;
+}
+
+/**
+ * 与 disableShuyuanSource 对称的手动启用：只清 disabled_at，保留 last_error 作为历史失败信息。
+ *
+ * 不会被「失效自动复活」规则打回去：refreshShuyuan 里对 disabled_at 只有一处写入，
+ * 是把上一轮的旧值照抄进新行，没有任何把它重置为 NULL 的分支；上游规则变化只会把
+ * 探测状态置为 pending（待核验），不碰启停标记。所以手动启用的语义是稳定的。
+ *
+ * 保留 last_error 是为了让界面继续显示「上一次为什么失败」，而不是启用后抹成一片空白。
+ * 注意探活资格的门槛是「有 last_error + 域名可探测（目前只有 book15.net）+ 非 pending」，
+ * 其中没有 disabled_at：所以保留 last_error 并不会换来一次原本没有的重试，
+ * 可探测域名下的失败源本来每次刷新都会被探一遍，启用与否都一样。
+ *
+ * 幂等：对已启用的源执行同样返回 true（行存在）；URL 不在库里才返回 false。
+ */
+export async function enableShuyuanSource(url: string): Promise<boolean> {
+  const s = getSql();
+  const rows = (await s`
+    UPDATE shuyuan_sources
+    SET disabled_at = NULL
     WHERE source_url = ${normalizeUrl(url)}
     RETURNING id`) as { id: number }[];
   return rows.length > 0;

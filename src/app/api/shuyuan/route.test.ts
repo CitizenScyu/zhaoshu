@@ -1,11 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { NextRequest } from 'next/server';
 
-const { ensureSchema, getSql, refreshShuyuan, getShuyuanStats, disableShuyuanSource, session } = vi.hoisted(() => ({
-  ensureSchema: vi.fn(), getSql: vi.fn(), refreshShuyuan: vi.fn(), getShuyuanStats: vi.fn(), disableShuyuanSource: vi.fn(), session: vi.fn(),
+const { ensureSchema, getSql, refreshShuyuan, getShuyuanStats, disableShuyuanSource, enableShuyuanSource, session } = vi.hoisted(() => ({
+  ensureSchema: vi.fn(), getSql: vi.fn(), refreshShuyuan: vi.fn(), getShuyuanStats: vi.fn(), disableShuyuanSource: vi.fn(), enableShuyuanSource: vi.fn(), session: vi.fn(),
 }));
 vi.mock('@/lib/db', () => ({ ensureSchema, getSql }));
-vi.mock('@/lib/shuyuan', () => ({ refreshShuyuan, getShuyuanStats, disableShuyuanSource }));
+vi.mock('@/lib/shuyuan', () => ({ refreshShuyuan, getShuyuanStats, disableShuyuanSource, enableShuyuanSource }));
 vi.mock('@/lib/auth-session', async (original) => ({ ...await original<typeof import('@/lib/auth-session')>(), findSessionByToken: session }));
 import { GET, POST } from './route';
 
@@ -98,6 +98,63 @@ describe('cron authorization', () => {
     expect(fetch).not.toHaveBeenCalled();
     expect(refreshShuyuan).not.toHaveBeenCalled();
   });
+
+  // 启用与禁用同权限、同入参形状，只差一个布尔结果字段名（enabled / disabled）。
+  it('重新启用与禁用对称：只调元数据更新，不隐式探测也不触发刷新', async () => {
+    enableShuyuanSource.mockResolvedValueOnce(true);
+    const res = await POST(new NextRequest('http://localhost/api/shuyuan', {
+      method: 'POST', headers: { Authorization: 'Bearer owner-test', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: 'enable', url: 'https://unknown.invalid' }),
+    }));
+    expect(await res.json()).toEqual({ enabled: true });
+    expect(enableShuyuanSource).toHaveBeenCalledWith('https://unknown.invalid');
+    expect(disableShuyuanSource).not.toHaveBeenCalled();
+    expect(fetch).not.toHaveBeenCalled();
+    expect(refreshShuyuan).not.toHaveBeenCalled();
+  });
+
+  it('enable 缺少 url 时 400，不落库', async () => {
+    const res = await POST(new NextRequest('http://localhost/api/shuyuan', {
+      method: 'POST', headers: { Authorization: 'Bearer owner-test', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: 'enable' }),
+    }));
+    expect(res.status).toBe(400);
+    expect(await res.json()).toEqual({ error: 'missing url' });
+    expect(enableShuyuanSource).not.toHaveBeenCalled();
+  });
+
+  // URL 不在库里返回 200 + enabled:false，而不是 404：404 会把「这个源还在不在合集里」变成可探测信号。
+  it('启用不在库里的 URL 返回 enabled:false 而非 404', async () => {
+    enableShuyuanSource.mockResolvedValueOnce(false);
+    const res = await POST(new NextRequest('http://localhost/api/shuyuan', {
+      method: 'POST', headers: { Authorization: 'Bearer owner-test', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: 'enable', url: 'https://gone.invalid' }),
+    }));
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ enabled: false });
+  });
+
+  it('GET 的筛选与页码先归一化再交给统计层', async () => {
+    const filtered = new NextRequest('http://localhost/api/shuyuan?filter=failed&page=3', {
+      headers: { Authorization: 'Bearer owner-test' },
+    });
+    await GET(filtered);
+    expect(getShuyuanStats).toHaveBeenCalledWith(filtered.signal, { filter: 'failed', page: 3 });
+
+    // 非白名单筛选与非数字页码必须在下游被夹住，不能让原始值进到 SQL 谓词里。
+    const forged = new NextRequest('http://localhost/api/shuyuan?filter=DROP%20TABLE&page=-4', {
+      headers: { Authorization: 'Bearer owner-test' },
+    });
+    await GET(forged);
+    expect(getShuyuanStats).toHaveBeenLastCalledWith(forged.signal, { filter: 'all', page: 1 });
+  });
+
+  it('不带 filter 的 GET 保持旧的直调形状，不附加分页元信息', async () => {
+    const req = new NextRequest('http://localhost/api/shuyuan', { headers: { Authorization: 'Bearer owner-test' } });
+    await GET(req);
+    expect(getShuyuanStats).toHaveBeenCalledWith(req.signal);
+    expect(getShuyuanStats).toHaveBeenCalledOnce();
+  });
 });
 
 // 设计 §5.2 第 404/405 行：交互式 GET 与 POST（refresh / disable）都是 download 能力。
@@ -132,7 +189,7 @@ describe('书源能力边界（§5.2）', () => {
     expect(refreshShuyuan).not.toHaveBeenCalled();
   });
 
-  it('有 download 能力的成员可以 refresh 和 disable', async () => {
+  it('有 download 能力的成员可以 refresh、disable 和 enable', async () => {
     session.mockResolvedValue(DOWNLOADER);
     expect((await memberPost({})).status).toBe(200);
     expect(refreshShuyuan).toHaveBeenCalledOnce();
@@ -140,6 +197,10 @@ describe('书源能力边界（§5.2）', () => {
     const disabled = await memberPost({ action: 'disable', url: 'https://unknown.invalid' });
     expect(await disabled.json()).toEqual({ disabled: true });
     expect(disableShuyuanSource).toHaveBeenCalledWith('https://unknown.invalid', '');
+    enableShuyuanSource.mockResolvedValueOnce(true);
+    const enabled = await memberPost({ action: 'enable', url: 'https://unknown.invalid' });
+    expect(await enabled.json()).toEqual({ enabled: true });
+    expect(enableShuyuanSource).toHaveBeenCalledWith('https://unknown.invalid');
   });
 
   it.each([READER, FIND_ONLY])('只有 read 或 find 的成员拿到 403，且不触发刷新 %#', async (record) => {
@@ -151,6 +212,10 @@ describe('书源能力边界（§5.2）', () => {
     expect(refreshShuyuan).not.toHaveBeenCalled();
     expect((await memberPost({})).status).toBe(403);
     expect(refreshShuyuan).not.toHaveBeenCalled();
+    // enable 不能被当作比 disable 更弱的操作绕过能力判定。
+    expect((await memberPost({ action: 'enable', url: 'https://unknown.invalid' })).status).toBe(403);
+    expect(enableShuyuanSource).not.toHaveBeenCalled();
+    expect(disableShuyuanSource).not.toHaveBeenCalled();
   });
 
   it('匿名 POST 在 DDL 与刷新之前拒绝，并带私有缓存头', async () => {

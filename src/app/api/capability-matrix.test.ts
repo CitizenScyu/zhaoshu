@@ -20,6 +20,7 @@ vi.mock('@/lib/shuyuan', () => ({
   refreshShuyuan: vi.fn().mockResolvedValue({ total: 0 }),
   getShuyuanStats: vi.fn().mockResolvedValue({ total: 0 }),
   disableShuyuanSource: vi.fn().mockResolvedValue(true),
+  enableShuyuanSource: vi.fn().mockResolvedValue(true),
 }));
 vi.mock('@/lib/reader-server', async (original) => ({
   ...await original<typeof import('@/lib/reader-server')>(),

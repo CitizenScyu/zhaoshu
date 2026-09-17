@@ -29,9 +29,10 @@ const { ensureSchema, getSql, sql, execute, transaction, readTransaction } = vi.
 vi.mock('@/lib/db', () => ({ ensureSchema, getSql }));
 
 import {
-  disableShuyuanSource, getShuyuanCounts, getShuyuanStats, getReadingSources, refreshShuyuan,
+  disableShuyuanSource, enableShuyuanSource, getShuyuanCounts, getShuyuanStats, getReadingSources, refreshShuyuan,
   REFRESH_BUDGET_MS, RESPONSE_TIMEOUT_MS,
 } from './shuyuan';
+import { SOURCE_PAGE_SIZE, pageCount } from './shuyuan-view';
 import { POST } from '@/app/api/shuyuan/route';
 
 const indexUrl = 'https://www.yckceo.com/yuedu/shuyuans/index.html';
@@ -446,6 +447,79 @@ describe('refreshShuyuan atomic refresh', () => {
     expect(query.values).toEqual(['', unknownSource.bookSourceUrl]);
     expect(query.text).not.toContain('probeSnapshot');
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('重新启用只清禁用标记，保留上一次探测失败信息', async () => {
+    execute.mockResolvedValueOnce([{ id: 1 }]);
+    expect(await enableShuyuanSource(unknownSource.bookSourceUrl + '/')).toBe(true);
+    const query = execute.mock.calls[0][0];
+    expect(query.text).toContain('SET disabled_at = NULL');
+    // 计划明确要求 enable 不动 last_error：清掉它，界面上「上一次为什么失败」的证据就没了。
+    expect(query.text).not.toContain('last_error');
+    expect(query.text).toContain('RETURNING id');
+    expect(query.values).toEqual([unknownSource.bookSourceUrl]);
+    expect(query.text).not.toContain('probeSnapshot');
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('重新启用不在库里的 URL 返回 false，既不新增行也不探测', async () => {
+    execute.mockResolvedValueOnce([]);
+    expect(await enableShuyuanSource('https://gone.invalid/')).toBe(false);
+    const query = execute.mock.calls[0][0];
+    expect(query.text).not.toContain('INSERT');
+    expect(query.values).toEqual(['https://gone.invalid']);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('手动启用后刷新照抄当前禁用标记，不会把启用动作打回禁用', async () => {
+    // 启用后的库内状态：disabled_at 为 NULL、last_error 仍是上一轮探测失败原因。
+    setCollection(11, [unknownSource]);
+    seedPrevious([{ source_url: unknownSource.bookSourceUrl, source: unknownSource, last_error: '历史连接超时', disabled_at: null }]);
+    await refreshShuyuan();
+    expect(savedRows()).toEqual([expect.objectContaining({
+      url: unknownSource.bookSourceUrl, disabled_at: null, err: '历史连接超时',
+    })]);
+  });
+
+  it('筛选分支把谓词、总数和页偏移绑定成同一组参数', async () => {
+    const counts = { ...zeroCounts, total: 995, enabled: 900, disabled: 95, unprobed: 300, pending: 4, reachable: 402, failed: 289 };
+    execute.mockResolvedValueOnce([{ collections: [], refreshed_at: null }])
+      .mockResolvedValueOnce([counts])
+      .mockResolvedValueOnce([]);
+    const filter = 'disabled';
+    const query = { filter, page: 3 } satisfies Parameters<typeof getShuyuanStats>[1];
+
+    const stats = await getShuyuanStats(undefined, query);
+
+    // 7 个谓词参数都是同一个白名单 id，不由调用方提供 SQL 片段。
+    expect(execute.mock.calls[2][0].text).toContain("(? = 'disabled' AND disabled_at IS NOT NULL)");
+    const values = execute.mock.calls[2][0].values;
+    expect(values.slice(1, 8)).toEqual(Array(7).fill('disabled'));
+    expect(values[8]).toBe(SOURCE_PAGE_SIZE);
+    expect(values[9]).toBe(2 * SOURCE_PAGE_SIZE);
+    // 总数取该筛选自己的计数，明细条数与卡片数字同源。
+    expect(stats).toMatchObject({
+      filter, page: 3, pageSize: SOURCE_PAGE_SIZE, total: counts.disabled,
+      totalPages: pageCount(counts.disabled, SOURCE_PAGE_SIZE), sourcesLimit: SOURCE_PAGE_SIZE,
+    });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['all', 'total'], ['enabled', 'enabled'], ['disabled', 'disabled'],
+    ['unprobed', 'unprobed'], ['pending', 'pending'], ['reachable', 'reachable'], ['failed', 'failed'],
+  ] as const)('筛选 %s 的谓词与其统计计数取自同一维度', async (filter, countKey) => {
+    const counts = { ...zeroCounts, total: 995, enabled: 900, disabled: 95, unprobed: 300, pending: 4, reachable: 402, failed: 289 };
+    execute.mockResolvedValueOnce([{ collections: [], refreshed_at: null }])
+      .mockResolvedValueOnce([counts])
+      .mockResolvedValueOnce([]);
+
+    const stats = await getShuyuanStats(undefined, { filter, page: 1 });
+
+    expect(stats.total).toBe(counts[countKey]);
+    expect(stats.filter).toBe(filter);
+    expect(stats.totalPages).toBe(pageCount(counts[countKey], SOURCE_PAGE_SIZE));
+    expect(execute.mock.calls[2][0].values[1]).toBe(filter);
   });
 
   it('在线阅读只选择支持且启用的来源，失败或禁用记录不能被内置源绕过', async () => {
