@@ -1,7 +1,7 @@
 import { decodeHTML } from 'entities';
 import { validateSourceUrl, SourcePolicyError } from './source-policy';
 
-export interface SourceBookIdentity { title: string; author: string }
+export interface SourceBookIdentity { title: string; author: string; alias?: string }
 export interface SourceChapter { url: string; title: string }
 export const MAX_SOURCE_CHAPTERS = 10_000;
 export const MAX_SOURCE_CHAPTER_CHARACTERS = 32_768;
@@ -17,8 +17,10 @@ export function knownSourceAuthor(value: string): string {
 
 export function sourceBookMatches(expected: SourceBookIdentity, actual: SourceBookIdentity): boolean {
   const title = normalizeSourceTitle(expected.title);
+  // 站点可能把书上架为新名而在简介里自报原名（【原书名：X】）；标题或别名任一相等即过。
+  const actualTitles = [actual.title, ...(actual.alias ? [actual.alias] : [])].map(normalizeSourceTitle);
   const author = knownSourceAuthor(expected.author);
-  return Boolean(title && title === normalizeSourceTitle(actual.title)
+  return Boolean(title && actualTitles.includes(title)
     && (!author || author === knownSourceAuthor(actual.author)));
 }
 
@@ -38,10 +40,19 @@ export function parseSourceIdentity(html: string): SourceBookIdentity {
     const attrs = attributes(tag);
     if (attrs.property && attrs.content) meta.set(attrs.property.toLowerCase(), attrs.content.trim());
   }
-  return {
-    title: meta.get('og:novel:book_name') ?? plainText(/<h1\b[^>]*>([\s\S]*?)<\/h1>/i.exec(html)?.[1] ?? ''),
-    author: meta.get('og:novel:author') ?? '',
-  };
+  const title = meta.get('og:novel:book_name') ?? plainText(/<h1\b[^>]*>([\s\S]*?)<\/h1>/i.exec(html)?.[1] ?? '');
+  const author = meta.get('og:novel:author') ?? '';
+  return { title, author, ...parseSourceAlias(html) };
+}
+
+// 站点在简介里自报的改名标记（book15 实测：「小说简介:【原书名：我有一座恐怖屋】…」）。
+// 只认成对括号包裹的「原书名」，容错全半角括号/冒号/空白；X 归一化后作为别名存储。
+const ALIAS_PATTERN = /[【[(]\s*原书名\s*[:：]\s*([^【\][()（）\n]{1,200}?)[】\])）]/;
+
+export function parseSourceAlias(html: string): Pick<SourceBookIdentity, 'alias'> {
+  const matched = ALIAS_PATTERN.exec(plainText(html));
+  const alias = matched ? normalizeSourceTitle(matched[1]) : '';
+  return alias ? { alias } : {};
 }
 
 export function sourceSearchUrl(template: unknown, title: string, base: string): string {
@@ -59,6 +70,19 @@ export function parseSourceSearch(html: string, pageUrl: string, title: string):
   for (const match of html.matchAll(/<a\b([^>]*)>([\s\S]*?)<\/a>/gi)) {
     const href = attributes(match[1]).href;
     if (!href || normalizeSourceTitle(plainText(match[2])) !== normalizeSourceTitle(title)) continue;
+    const url = validateSourceUrl(href, pageUrl);
+    if (/^\/books\/details\d+\.html$/.test(url.pathname)) urls.add(url.href);
+  }
+  return [...urls];
+}
+
+// 作者搜索回退的候选收集：不看锚文本（改名书的锚文本是站点新名），只按链接形态取详情页。
+// 误配防线不在这一层，而在详情页的 sourceBookMatches 身份校验（标题/别名 + 作者门）。
+export function parseSourceDetailLinks(html: string, pageUrl: string): string[] {
+  const urls = new Set<string>();
+  for (const match of html.matchAll(/<a\b([^>]*)>([\s\S]*?)<\/a>/gi)) {
+    const href = attributes(match[1]).href;
+    if (!href) continue;
     const url = validateSourceUrl(href, pageUrl);
     if (/^\/books\/details\d+\.html$/.test(url.pathname)) urls.add(url.href);
   }

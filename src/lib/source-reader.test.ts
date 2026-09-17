@@ -192,6 +192,46 @@ describe('online reader source resolution and budgets', () => {
     expect(part.chapterIndex).toBe(0);
     expect(part.sourceId).toBe(catalog.sourceId);
   });
+
+  it('falls back to an author search when the title search yields no candidates, matching a renamed book via its self-reported alias', async () => {
+    // 站点把《改名书》上架为《站点新书》，标题搜索 0 结果；
+    // 作者搜索命中，详情页简介自报【原书名：改名书】。
+    const renamed = { title: '改名书', author: '原作者' };
+    const authorSearch = 'https://book15.net/books/search.html?kw=' + encodeURIComponent(renamed.author);
+    const detailHtml = (id: number, title: string, author: string, alias?: string) =>
+      `<meta property="og:novel:book_name" content="${title}"><meta property="og:novel:author" content="${author}">`
+      + (alias ? `<div>小说简介:【原书名：${alias}】正文</div>` : '')
+      + '<dd><a href="/chapter/index' + id + '-1.html">第一章</a></dd>';
+    pages.set('https://book15.net/books/search.html?kw=' + encodeURIComponent(renamed.title), { text: '' });
+    pages.set(authorSearch, { text: '<a href="/books/details7.html">站点新书</a><a href="/books/details8.html">其他书</a>' });
+    pages.set('https://book15.net/books/details7.html', { text: detailHtml(7, '站点新书', '原作者', '改名书') });
+    pages.set('https://book15.net/books/details8.html', { text: detailHtml(8, '其他书', '另一作者', '无关原名') });
+    const catalog = await service.resolveSourceBook(renamed, context());
+    expect(catalog).toMatchObject({ title: '站点新书', author: '原作者', bookUrl: 'https://book15.net/books/details7.html' });
+  });
+
+  it('does not mis-pair an alias candidate whose author differs (renamed-book negative control)', async () => {
+    // 目标《改名书》作者 A；作者搜索按 A 命中的唯一候选其实是另一作者的同素材书，
+    // 其简介自报的原书名恰好也叫《改名书》。作者门必须拒 ⇒ 404。
+    const target = { title: '改名书', author: '作者A' };
+    const authorSearch = 'https://book15.net/books/search.html?kw=' + encodeURIComponent(target.author);
+    pages.set('https://book15.net/books/search.html?kw=' + encodeURIComponent(target.title), { text: '' });
+    pages.set(authorSearch, { text: '<a href="/books/details7.html">站点新书</a>' });
+    pages.set('https://book15.net/books/details7.html', {
+      text: '<meta property="og:novel:book_name" content="站点新书"><meta property="og:novel:author" content="作者B">'
+        + '<div>小说简介:【原书名：改名书】正文</div>'
+        + '<dd><a href="/chapter/index7-1.html">第一章</a></dd>',
+    });
+    await expect(service.resolveSourceBook(target, context())).rejects.toMatchObject({ code: 'SOURCE_NOT_FOUND' });
+  });
+
+  it('does not run the author-search fallback when the title already matched', async () => {
+    const authorSearch = 'https://book15.net/books/search.html?kw=' + encodeURIComponent(book.author);
+    pages.set(authorSearch, { text: '' });
+    const catalog = await service.resolveSourceBook(book, context());
+    expect(catalog.bookUrl).toBe(pageUrl());
+    expect(mocks.fetch).toHaveBeenCalledTimes(2); // title search + detail only, no author search
+  });
 });
 
 describe('GET /api/read/source/[resource]', () => {

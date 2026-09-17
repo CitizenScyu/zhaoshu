@@ -5,7 +5,7 @@ import { fetchSourceText, sourceAbortable, SourceHttpError } from './source-fetc
 import { SourcePolicyError, validateSourceUrl } from './source-policy';
 import {
   knownSourceAuthor, normalizeSourceTitle, parseSourceChapters, parseSourceChapterText,
-  parseSourceIdentity, parseSourceSearch, sourceBookMatches, sourceSearchUrl,
+  parseSourceDetailLinks, parseSourceIdentity, parseSourceSearch, sourceBookMatches, sourceSearchUrl,
   type SourceBookIdentity, type SourceChapter,
 } from './source-parser';
 import type { ReaderIndex, ReaderPart } from './reader-types';
@@ -95,7 +95,8 @@ async function hintsFor(book: SourceBookIdentity, signal: AbortSignal): Promise<
 
 function catalogFrom(page: { text: string; url: string }, source: ReadingSource, expected: SourceBookIdentity): SourceCatalog | null {
   const identity = parseSourceIdentity(page.text);
-  if (identity.title.length > 200 || identity.author.length > 200 || !sourceBookMatches(expected, identity)) return null;
+  if (identity.title.length > 200 || identity.author.length > 200
+    || (identity.alias?.length ?? 0) > 200 || !sourceBookMatches(expected, identity)) return null;
   const chapters = parseSourceChapters(page.text, page.url);
   if (!chapters.length) return null;
   const sourceId = hash([source.url, page.url]);
@@ -144,15 +145,28 @@ export async function resolveSourceBook(
       const hinted = await inspect(hints);
       if (hinted) return hinted;
       const search = await context.page(sourceSearchUrl(source.searchUrl, book.title, source.url));
+      let candidates: string[] = [];
       if (/^\/books\/details\d+\.html$/.test(new URL(search.url).pathname) && search.url !== options.excludeBookUrl) {
         const direct = catalogFrom(search, source, book);
         if (direct) {
           if (knownSourceAuthor(book.author)) return direct;
           matches.set(direct.bookUrl, direct);
         }
+      } else {
+        candidates = parseSourceSearch(search.text, search.url, book.title);
       }
-      const result = await inspect(parseSourceSearch(search.text, search.url, book.title));
+      const result = await inspect(candidates);
       if (result) return result;
+      // 作者搜索回退：标题搜索 0 候选、有作者可搜且作者不是书名本身时（改名书的站点索引
+      // 只有新名），改搜作者。候选不看锚文本，身份靠详情页的标题/别名 + 作者门校验。
+      if (!candidates.length && knownSourceAuthor(book.author) && knownSourceAuthor(book.author) !== normalizeSourceTitle(book.title)) {
+        const authorSearch = await context.page(sourceSearchUrl(source.searchUrl, book.author, source.url));
+        const authorCandidates = /^\/books\/details\d+\.html$/.test(new URL(authorSearch.url).pathname)
+          ? [authorSearch.url]
+          : parseSourceDetailLinks(authorSearch.text, authorSearch.url);
+        const authorResult = await inspect(authorCandidates);
+        if (authorResult) return authorResult;
+      }
     } catch (error) {
       context.signal.throwIfAborted();
       if (error instanceof SourceReaderError) throw error;
