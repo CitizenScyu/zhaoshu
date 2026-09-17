@@ -11,9 +11,10 @@ let db: ReturnType<typeof mockSql>;
 let sql: ReturnType<typeof mockSql>['resolve'];
 import { DELETE, POST } from './route';
 
-function request(method: 'POST' | 'DELETE', body?: unknown, id?: string) {
+function request(method: 'POST' | 'DELETE', body?: unknown, id?: string, status?: string) {
   const url = new URL('http://localhost/api/shelf');
   if (id !== undefined) url.searchParams.set('id', id);
+  if (status !== undefined) url.searchParams.set('status', status);
   return new NextRequest(url, {
     method, headers: { Authorization: 'Bearer shelf-test-owner', 'Content-Type': 'application/json' },
     body: body === undefined ? undefined : JSON.stringify(body),
@@ -107,12 +108,12 @@ describe('/api/shelf', () => {
     expect(await res.json()).toEqual({ error: 'internal error', code: 'DB_ERROR' });
     expect(sql).not.toHaveBeenCalled();
   });
-  function memberRequest(method: 'POST' | 'DELETE', userId: number, body?: unknown, id?: string) {
+  function memberRequest(method: 'POST' | 'DELETE', userId: number, body?: unknown, id?: string, status?: string) {
     vi.stubEnv('AUTH_ACCOUNTS_ENABLED', 'true');
     findSession.mockImplementation(async (_sql, token) => ({ userId: token === 'member-a' ? 2 : 3,
       username: 'member', role: 'member', canFind: true, canRead: false, canDownload: false,
       authMethod: 'password', ownerCredentialTag: null, membersEnabled: true }));
-    const req = request(method, body, id); req.headers.delete('Authorization');
+    const req = request(method, body, id, status); req.headers.delete('Authorization');
     req.headers.set('Cookie', `nf-dev-session=${userId === 2 ? 'member-a' : 'member-b'}`);
     req.headers.set('Origin', 'http://localhost'); req.headers.set('X-NF-CSRF', '1');
     return new NextRequest(req);
@@ -159,6 +160,80 @@ describe('/api/shelf', () => {
     findSession.mockResolvedValue({ userId: 2, role: 'member', canFind: false, canRead: false, canDownload: false, authMethod: 'password', membersEnabled: true });
     expect((await (method === 'POST' ? POST : DELETE)(req)).status).toBe(403);
     expect(ensureSchema).not.toHaveBeenCalled(); expect(db.queries).toHaveLength(0);
+  });
+
+  // 批量清理未处理：DELETE ?status=new。
+  it('清空未处理只删本人的 status=new 行并回报条数', async () => {
+    sql.mockResolvedValueOnce([{ id: 1 }, { id: 2 }, { id: 3 }]);
+    const res = await DELETE(request('DELETE', undefined, undefined, 'new'));
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ ok: true, cleared: 3 });
+    const query = db.queries.find((entry) => entry.text.includes('DELETE FROM recommendations'))!;
+    expect(query.text).toContain('WHERE user_id = ? AND status = ?');
+    expect(query.text).not.toContain('WHERE id = ?');
+    expect(query.values).toEqual([1, 'new']);
+  });
+
+  it('没有未处理推荐时仍返回 200 与 cleared=0（幂等，不报 404）', async () => {
+    const res = await DELETE(request('DELETE', undefined, undefined, 'new'));
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ ok: true, cleared: 0 });
+  });
+
+  it.each([['want'], [''], ['new '], ['NEW']])('status=%s 不构成批量清理，按缺少 id 拒绝且不写库', async (status) => {
+    const res = await DELETE(request('DELETE', undefined, undefined, status));
+    expect(res.status).toBe(400);
+    expect(await res.json()).toEqual({ error: 'missing valid id', code: 'INVALID_ID' });
+    expect(ensureSchema).not.toHaveBeenCalled();
+    expect(db.queries).toHaveLength(0);
+  });
+
+  it('id 一旦出现就绝不回落成批量清理：非法 id 400，合法 id 仍只删那一条', async () => {
+    const forged = await DELETE(request('DELETE', undefined, 'abc', 'new'));
+    expect(forged.status).toBe(400);
+    expect(await forged.json()).toEqual({ error: 'missing valid id', code: 'INVALID_ID' });
+    expect(db.queries.filter((entry) => entry.text.includes('DELETE'))).toHaveLength(0);
+
+    sql.mockResolvedValueOnce([{ id: 7 }]);
+    expect((await DELETE(request('DELETE', undefined, '7', 'new'))).status).toBe(200);
+    const query = db.queries.find((entry) => entry.text.includes('DELETE FROM recommendations'))!;
+    expect(query.text).toContain('WHERE id = ? AND user_id = ?');
+    expect(query.values).toEqual([7, 1]);
+  });
+
+  it('member A 清空未处理不影响 member B 的行', async () => {
+    const rows = [
+      { id: 1, userId: 2, status: 'new' },
+      { id: 2, userId: 2, status: 'want' },
+      { id: 3, userId: 3, status: 'new' },
+    ];
+    sql.mockImplementation((query) => {
+      if (!query.text.includes('DELETE FROM recommendations')) return [];
+      const [userId, status] = query.values as [number, string];
+      const removed = rows.filter((entry) => entry.userId === Number(userId) && entry.status === status);
+      for (const entry of removed) rows.splice(rows.indexOf(entry), 1);
+      return removed;
+    });
+    const res = await DELETE(memberRequest('DELETE', 2, undefined, undefined, 'new'));
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ ok: true, cleared: 1 });
+    expect(rows).toEqual([{ id: 2, userId: 2, status: 'want' }, { id: 3, userId: 3, status: 'new' }]);
+    expect(db.queries.find((entry) => entry.text.includes('DELETE FROM recommendations'))?.values).toEqual([2, 'new']);
+  });
+
+  it('批量清理同样对匿名的 owner 口令缺失先拒绝', async () => {
+    const req = request('DELETE', undefined, undefined, 'new');
+    req.headers.delete('Authorization');
+    expect((await DELETE(req)).status).toBe(401);
+    expect(ensureSchema).not.toHaveBeenCalled();
+    expect(db.queries).toHaveLength(0);
+  });
+
+  it('批量清理对无 find 能力的 member 先拒绝', async () => {
+    const req = memberRequest('DELETE', 2, undefined, undefined, 'new');
+    findSession.mockResolvedValue({ userId: 2, role: 'member', canFind: false, canRead: false, canDownload: false, authMethod: 'password', membersEnabled: true });
+    expect((await DELETE(req)).status).toBe(403);
+    expect(db.queries).toHaveLength(0);
   });
 
 });
