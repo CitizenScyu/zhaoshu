@@ -132,6 +132,31 @@ describe('POST /api/auth/register 三态', () => {
     expect(sql).toContain('registration_mode IN (\'open\', \'invite\')');
   });
 
+  it('注册 CTE 的资格判定必须写在发出的 SQL 里（桩测试抓不到真库语义，只能钉住文本）', async () => {
+    mockRegisterDb({ members_enabled: true, registration_mode: 'open', claimed: 0, id: 2, username: 'reader_one', can_find: true, can_read: false, can_download: false });
+    await POST(req(GOOD));
+    const statements = db.queries.map((query) => query.text.replace(/\s+/g, ' '));
+    const registration = statements.find((text) => text.includes('registration_invites SET used_at'));
+    expect(registration).toBeDefined();
+
+    // 1) 闸门本身：members_enabled 与三态里的两态（closed 一律不允许）写死在 cfg 的子查询里。
+    expect(registration).toContain('INSERT INTO users');
+    expect(registration).toContain('SELECT members_enabled, registration_mode FROM auth_settings WHERE id = 1 FOR SHARE');
+    expect(registration).toContain('WHERE members_enabled AND registration_mode IN (\'open\', \'invite\')');
+    // 2) 插入 member 必须挂在 gate 的存在性上；换成 WHERE true 会让关闭状态下也能注册。
+    expect(registration).toContain('WHERE EXISTS (SELECT 1 FROM gate)');
+    // 3) open 免码、invite 必须有 claim 成功——这个析取是「哪些模式能不带码」的唯一定义。
+    expect(registration).toContain("AND ((SELECT registration_mode FROM cfg) = 'open' OR EXISTS (SELECT 1 FROM claim))");
+    // 4) 消费只发生在 invite 模式，且必须同时未使用、未作废、未过期。
+    expect(registration).toContain("AND (SELECT registration_mode FROM cfg) = 'invite'");
+    // 5) 三张表共用同一个 new_user 输出，不能各自独立判资格。
+    expect(registration).toContain('INSERT INTO profile (id) SELECT id FROM new_user');
+    expect(registration).toContain('FROM new_user');
+    // 6) 一个 WHERE true 或裸 true 的旁路都不允许出现在资格判定语句里。
+    expect(registration).not.toMatch(/WHERE true(\s|$)/);
+    expect(registration).not.toContain('AND true');
+  });
+
   it('invite + 有效码 → 201；消费与 used_by 回填都在同一事务里', async () => {
     mockRegisterDb({ members_enabled: true, registration_mode: 'invite', claimed: 1, id: 3, username: 'reader_one', can_find: true, can_read: false, can_download: false });
     const res = await POST(req({ ...GOOD, inviteCode: 'nf-goodcode' }));
