@@ -1,0 +1,41 @@
+#!/bin/sh
+# pre-push：push 之前跑「四道门」——与 .github/workflows/ci.yml 完全同款（npm run check）。
+#
+# 为什么需要本地这一道：
+#   本仓的工作方式是「本地多 worktree 并行开发 + 主会话统一合并后再 push」，而 GitHub
+#   Actions 只在 push **之后**才触发。也就是说 CI 能证明「已经推上去的没坏」，却挡不住
+#   「合并前忘了跑 tsc / eslint」——2026-09-17 的 t78 加固就差一点在没有跑 tsc 的情况下
+#   被合掉。本地这一道才是真正防住「合并前忘了跑四件套」的那一道。
+#
+# 安装（一次性，任选其一；本仓推荐原生 hooksPath，**不引入 husky 依赖**）：
+#
+#   git config core.hooksPath .githooks     # 推荐
+#
+#   ⚠️ core.hooksPath 存在**仓库级**配置里（即 .git/config），对**所有 worktree 生效**。
+#      这是有意的：任一个 worktree 的 push 都该过门禁。代价是每个 worktree 都要有自己
+#      的 node_modules（在该 worktree 根跑一次 npm ci）。
+#
+#   备选：手动把本文件复制/软链到 <git-common-dir>/hooks/pre-push
+#        （worktree 里 .git 是个文件不是目录，注意别链错位置）。
+#
+# 紧急出口：门禁挡住时可用 `git push --no-verify` 跳过。
+#   跳过了什么，请在回报 / PR 里写明——这个出口是给「线上热修」用的，不是给省事用的。
+
+if [ ! -d node_modules ]; then
+  echo "✖ pre-push：当前 worktree 没有 node_modules，四道门跑不起来。" >&2
+  echo "  请先在本目录执行 npm ci。" >&2
+  echo "  （紧急情况可用 git push --no-verify 跳过，但请说明原因。）" >&2
+  exit 1
+fi
+
+echo "▶ pre-push：跑四道门（typecheck / lint / test / build），与 CI 同款"
+echo "  （紧急情况可用 git push --no-verify 跳过，跳过了请自己说明原因。）"
+
+if ! npm run check; then
+  echo "" >&2
+  echo "✖ pre-push：门禁未通过，本次 push 已中止。" >&2
+  echo "  修完再推；确有紧急情况用 git push --no-verify 跳过。" >&2
+  exit 1
+fi
+
+echo "✔ pre-push：四道门全过。"
