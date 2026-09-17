@@ -287,14 +287,16 @@ describe('usage instrumentation through all model routes', () => {
   // 3 次上游调用（首发 + 首字节重发 + 兜底），find 的 modelStep 最多调它 2 次 → **单步最坏 6 次**
   // （此前 4 次）。本用例把两次 chatRobust 都逼到最坏路径，钉死这个数字。
   it('首字节超时的最坏路径：单步上游调用数封顶 6（chatRobust 3 × modelStep 2）', async () => {
-    vi.stubEnv('LLM_TOTAL_TIMEOUT_MS', '20000');
+    // 预算必须用生产量级（260s）：兜底门槛是 120s（llm.ts MODEL_FALLBACK_MIN_BUDGET_MS），
+    // 用 20s 压缩时钟的话兜底根本不会被发起，这一格就测不到「3 次」了。
+    vi.stubEnv('LLM_TOTAL_TIMEOUT_MS', '260000');
     vi.stubEnv('LLM_ATTEMPT_TIMEOUT_MS', '1000');
     const hang = (_url: unknown, init?: RequestInit): Promise<Response> => new Promise<Response>((_resolve, reject) => {
       init?.signal?.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')));
     });
     // 每 3 次一组：第 1、2 次是主模型（首发 + 首字节重发，都挂到 1s 的单次上限被截断），
     // 第 3 次是兜底（立刻回 524）。这样每次 chatRobust 都用满 3 次调用，且只花 2s 预算，
-    // 于是 modelStep 还剩 18s（≥ MIN_SECOND_ATTEMPT_MS）会再调一次。
+    // 于是 modelStep 还剩 258s（≥ MIN_SECOND_ATTEMPT_MS）会再调一次。
     let call = 0;
     fetchMock.mockImplementation((input, init) => {
       call += 1;

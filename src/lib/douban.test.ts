@@ -143,6 +143,56 @@ describe('书名判定：同一本书 vs 另一本书', () => {
   });
 });
 
+// 调用方预算（find 的 deadline/取消 signal）到期必须**上抛**，不能被降级成「豆瓣不可达」：
+// 落成 unavailable 会把「找书预算耗尽」伪装成「豆瓣挂了」，错误码指错层。
+// 判据只能是调用方的 signal.aborted——本模块自己也有一个 12s 单请求超时（内部 controller），
+// 它抛的同样是 AbortError，那才是真正的「豆瓣不可达」，必须继续降级。
+describe('caller abort propagation', () => {
+  afterEach(() => { vi.unstubAllGlobals(); vi.useRealTimers(); });
+
+  // 判别力：把 verifyBook 外层 catch 的 `if (signal?.aborted) throw signal.reason ?? e;` 去掉，
+  // 本用例立刻变红（会 resolve 成 { status: 'unavailable' }）。
+  it('verifyBook 在调用方 signal 中止时上抛中止原因，不落成「豆瓣不可达」', async () => {
+    const controller = new AbortController();
+    const reason = new Error('请求预算 285s 已耗尽。');
+    vi.stubGlobal('fetch', vi.fn((_url, init) => new Promise((_resolve, reject) => {
+      init.signal.addEventListener('abort', () => reject(init.signal.reason), { once: true });
+    })));
+    const pending = verifyBook('测试书', '作者', controller.signal);
+    controller.abort(reason);
+    await expect(pending).rejects.toBe(reason);
+  });
+
+  // verifyBatch 的契约同样是不吞：在飞的那本被中止时整批上抛，而不是把中止写成「本轮未验证」。
+  it('verifyBatch 在调用方中止后上抛，而不是把在飞的那本写成「不可用」', async () => {
+    const controller = new AbortController();
+    const reason = new DOMException('已取消', 'AbortError');
+    vi.stubGlobal('fetch', vi.fn((_url, init) => new Promise((_resolve, reject) => {
+      init.signal.addEventListener('abort', () => reject(init.signal.reason), { once: true });
+    })));
+    const pending = verifyBatch([{ title: '书一', author: '作者' }, { title: '书二', author: '作者' }], controller.signal);
+    controller.abort(reason);
+    await expect(pending).rejects.toBe(reason);
+  });
+
+  // 反向护栏：本模块**自己**的 12s 单请求超时（内部 controller）不是调用方中止，
+  // 必须继续降级为「本轮未验证」——把判据改成「error 名字是 AbortError 就上抛」会让本用例变红。
+  it('本模块自己的单请求超时仍降级为「本轮未验证」', async () => {
+    vi.useFakeTimers();
+    let signal!: AbortSignal;
+    vi.stubGlobal('fetch', vi.fn(async (_url, init) => new Response(new ReadableStream({
+      start(controller) {
+        signal = init.signal;
+        init.signal.addEventListener('abort', () => controller.error(init.signal.reason), { once: true });
+      },
+    }))));
+    const result = verifyBook('测试书', '作者');
+    await vi.advanceTimersByTimeAsync(12_001);
+    expect(signal.aborted).toBe(true);
+    expect(await result).toMatchObject({ status: 'unavailable', found: false });
+  });
+});
+
 describe('parseRating', () => {
   it('extracts the rating from a real subject page', () => {
     expect(parseRating(SUBJECT_HTML)).toBe(8.5);
