@@ -11,8 +11,11 @@ export function readingSessionKey(session: ReadingSession): string {
 }
 
 export function readerIndexUrl(session: ReadingSession): string {
-  return session.kind === 'download' ? `/api/read/${session.taskId}/index`
-    : '/api/read/source/index?' + new URLSearchParams({ title: session.title, author: session.author });
+  if (session.kind === 'download') return `/api/read/${session.taskId}/index`;
+  const query = new URLSearchParams({ title: session.title, author: session.author });
+  // 模糊候选点选后的确认重放：book_url 告诉服务端这是用户已确认的详情页。
+  if (session.bookUrl) query.set('book_url', session.bookUrl);
+  return '/api/read/source/index?' + query;
 }
 
 export function readerChapterUrl(index: ReaderIndex, position: ReadingPosition): string {

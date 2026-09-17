@@ -105,7 +105,7 @@ function ReaderSession({ session, from }: Props) {
   const {
     settings, reading, activePart, loading, flowing, failure, percent, notice, storageFailed, focused,
     scroller, article, heading, onScroll, updateSettings, setFocusMode, navigate: requestNavigation,
-    extend, retry, markScrollIntent, setSection,
+    extend, retry, markScrollIntent, setSection, loadConfirmedBook,
   } = useReader(session, apiFetch, user?.id ?? 0);
   const [panel, setPanel] = useState<'directory' | 'settings' | null>(null);
   const restoreButton = useRef<HTMLButtonElement>(null);
@@ -227,6 +227,23 @@ function ReaderSession({ session, from }: Props) {
           {session.kind === 'source' && <Link className={styles.tool} href={`/?${new URLSearchParams({ tab: 'library', q: session.title })}`}>去书库下载全书</Link>}
         </div>
       )}
+      {failure?.code === 'SOURCE_SIMILAR' && failure.candidates?.length ? (
+        <div className={styles.similarList} role="listbox" aria-label="相似书籍候选">
+          {failure.candidates.map((candidate) => (
+            <button
+              key={candidate.bookUrl}
+              className={styles.similarItem}
+              role="option"
+              aria-selected={false}
+              disabled={loading || flowing}
+              onClick={() => loadConfirmedBook(candidate.bookUrl)}
+            >
+              <strong>{candidate.title}</strong>
+              <span>{candidate.author || '佚名'}{candidate.alias ? ` · 原名《${candidate.alias}》` : ''} · {candidate.chapters} 章</span>
+            </button>
+          ))}
+        </div>
+      ) : null}
       <div className={styles.liveStatus} role="status" aria-live="polite">
         {loading ? reading ? '正在打开章节…' : '正在准备目录与正文，首次打开可能需要一点时间…' : notice}
       </div>

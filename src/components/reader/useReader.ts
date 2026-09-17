@@ -16,7 +16,8 @@ interface Reading {
   focus: boolean;
   sectionOffset?: number;
 }
-interface Failure { message: string; status: number; code?: string; target?: ReadingPosition; direction?: 'next' | 'previous' }
+export interface SimilarCandidate { title: string; author: string; alias?: string; chapters: number; bookUrl: string }
+interface Failure { message: string; status: number; code?: string; candidates?: SimilarCandidate[]; target?: ReadingPosition; direction?: 'next' | 'previous' }
 type ApiFetch = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
 const START: ReadingPosition = { chapterIndex: 0, partIndex: 0, ratio: 0 };
 const WINDOW_SIZE = 3;
@@ -30,12 +31,19 @@ async function responseJson<T>(response: Response): Promise<T> {
   const data = await response.json().catch(() => null);
   if (!response.ok) {
     if (response.status === 401) throw new RequestError('访问口令不正确或已失效，请重新输入。', 401);
-    throw new RequestError(typeof data?.error === 'string' ? data.error : '阅读服务暂时不可用，请稍后重试。', response.status, typeof data?.code === 'string' ? data.code : undefined);
+    const error = new RequestError(
+      typeof data?.error === 'string' ? data.error : '阅读服务暂时不可用，请稍后重试。',
+      response.status, typeof data?.code === 'string' ? data.code : undefined,
+    );
+    // 模糊降级层：把 SOURCE_SIMILAR 响应里的候选列表附在错误对象上，由 fail() 转入 Failure。
+    if (Array.isArray(data?.candidates)) {
+      (error as RequestError & { candidates?: SimilarCandidate[] }).candidates = data.candidates as SimilarCandidate[];
+    }
+    throw error;
   }
   if (!data) throw new RequestError('收到的阅读内容不完整，请重试。', 502);
   return data as T;
 }
-
 function storedValue(key: string): string | null {
   try { return window.localStorage.getItem(key); } catch { return null; }
 }
@@ -47,7 +55,8 @@ function canPrefetch(): boolean {
 }
 
 export function useReader(session: ReadingSession, apiFetch: ApiFetch, userId: number) {
-  const indexUrl = readerIndexUrl(session);
+  // 确认路径（模糊候选点选后）会换 bookUrl 重放；初始 indexUrl 仍由 session 派生。
+  const [indexUrl, setIndexUrl] = useState(() => readerIndexUrl(session));
   // 进度键按当前用户固定：卸载清理时仍写回旧用户，不会写进下一个身份的键。
   const progressKeyFor = useCallback((index: ReaderIndex) => migrateLegacyIndexProgressKey(index, userId), [userId]);
   const [settings, setSettings] = useState(() => parseReaderSettings(storedValue(READER_SETTINGS_KEY)));
@@ -155,8 +164,15 @@ export function useReader(session: ReadingSession, apiFetch: ApiFetch, userId: n
   const fail = useCallback((error: unknown, target?: ReadingPosition, direction?: 'next' | 'previous') => {
     const status = error instanceof RequestError ? error.status : 0;
     if (status === 401) { cache.clear(); setReading(null); }
-    setFailure({ message: error instanceof Error ? error.message : '阅读内容加载失败，请重试。', status,
-      code: error instanceof RequestError ? error.code : undefined, target, direction });
+    setFailure({
+      message: error instanceof Error ? error.message : '阅读内容加载失败，请重试。', status,
+      code: error instanceof RequestError ? error.code : undefined,
+      // 模糊降级层：SOURCE_SIMILAR 的失败体携带候选列表，交给前端渲染点选卡。
+      candidates: error instanceof RequestError && Array.isArray((error as RequestError & { candidates?: unknown }).candidates)
+        ? (error as RequestError & { candidates: SimilarCandidate[] }).candidates
+        : undefined,
+      target, direction,
+    });
   }, [cache]);
 
   const beginRequest = useCallback(() => {
@@ -203,6 +219,12 @@ export function useReader(session: ReadingSession, apiFetch: ApiFetch, userId: n
       if (!controller.signal.aborted && id === serial.current) setLoading(false);
     }
   }, [apiFetch, indexUrl, beginRequest, cache, fail, flushPosition, progressKeyFor]);
+
+  // 模糊候选点选后的确认重放：换 bookUrl 重载目录（server 端跳过书名/作者匹配）。
+  const loadConfirmedBook = useCallback((bookUrl: string) => {
+    if (session.kind !== 'source' || !bookUrl) return;
+    setIndexUrl('/api/read/source/index?' + new URLSearchParams({ title: session.title, author: session.author, book_url: bookUrl }));
+  }, [session]);
 
   useEffect(() => {
     let active = true;
@@ -403,7 +425,7 @@ export function useReader(session: ReadingSession, apiFetch: ApiFetch, userId: n
   return {
     settings, reading, activePart, loading, flowing, failure, percent, notice, storageFailed, focused,
     scroller, article, heading, onScroll, updateSettings, setFocusMode, navigate, extend, retry,
-    markScrollIntent,
+    markScrollIntent, loadConfirmedBook,
     setSection: (part: ReaderPart, element: HTMLElement | null) => {
       if (element) sections.current.set(partKey(part), element); else sections.current.delete(partKey(part));
     },
