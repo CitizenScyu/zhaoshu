@@ -1,0 +1,93 @@
+# CI 四道门：typecheck → lint → test → build
+#
+# 为什么存在：本仓此前唯一类型防线是 `next build`，已实证逃逸过三次问题——
+#   1) 手工移植不完整，53/53 测试全绿，只有 `tsc --noEmit` 报 4×TS2552 能抓；
+#   2) `getShuyuanStats` 签名声明与实现不符 → vitest 全绿，只有 tsc 报 TS2322；
+#   3) 一处 react-hooks 级联渲染 error 只有 eslint 抓得到（lint 此前不在任何门禁里）。
+#
+# Node 版本依据：package.json `engines.node = "22.x"`，仓库无 .nvmrc / .node-version。
+# 本地验证跑通的版本是 v22.17.0，故此处钉 '22'。
+#
+# ⚠️ 凭据红线：本工作流**绝不**连接真实数据库，也不读取任何真实密钥。
+#   - 真 Neon 复测依赖仓库外的临时库与凭据，只能在本地/受控环境跑，不进 CI。
+#   - 全新 checkout 里不存在 .env*（.gitignore 排除；vitest.config.ts 又设了 envDir: false，
+#     连文件系统里的 .env 都不会读），所以 CI 里的 DATABASE_URL 天然为空。
+#   - 需要密钥的测试在缺密钥时必须是**明确失败或明确跳过并告警**，不允许静默通过；
+#     仓库已有 scripts 的「缺 TEST_DATABASE_URL 退出 2」用例（auth-migration-safety.test.ts）在守这条。
+#   - 此处**故意不设** DATABASE_URL / TEST_DATABASE_URL 的假值：留空才能让上述用例真正生效。
+
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gates:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      # 用 `npm ci` 而不是 `npm install`：按 package-lock.json 精确还原，
+      # 且默认会装上 devDependencies——真库用例的 @electric-sql/pglite 就在这里。
+      - name: 安装依赖
+        run: npm ci
+
+      # 门 1：类型。必须排在 build 之前——`.next/types` 尚不存在时 tsc 只看源码，
+      # 这正是要抓的那一类「源码里类型写错、但测试全绿」的问题。
+      - name: typecheck
+        run: npm run typecheck
+
+      # 门 2：lint（eslint 9 flat config，无参数默认 lint 整个目录，实测 243 个文件）。
+      - name: lint
+        run: npm run lint
+
+      # 门 3：测试。见下方断言步骤，真库用例被静默跳过就判红。
+      # 显式断言 @electric-sql/pglite 可解析：它是 devDependency，只有 npm ci 带上 devDeps 才有。
+      # 若这里失败，说明依赖安装方式变了，真库用例会因此消失——必须先修依赖，不能让测试悄悄少跑。
+      - name: 确认 PGlite 真库依赖真的装上了
+        run: |
+          node -e "console.log('pglite ->', require.resolve('@electric-sql/pglite'))"
+          # NF_PGLITE_OPTIONAL 是仓库里唯一允许跳过真库用例的开关，CI 里绝不能设。
+          test -z "${NF_PGLITE_OPTIONAL:-}" || { echo "CI 不允许设 NF_PGLITE_OPTIONAL"; exit 1; }
+
+      - name: test
+        run: |
+          npm test -- --reporter=default --reporter=json --outputFile=.vitest-report.json
+
+      # 2026-09-17 邀请码 bug 的逃逸模式：真库用例整文件静默 skip，Tests 显示 skipped、退出码 0，
+      # `npm test` 依然全绿。仓库已用「缺依赖即抛错」堵住（src/lib/fixtures/pglite.ts），
+      # 这里再加一层结果断言：报告里必须出现两个 pglite 用例文件，且各自**零跳过、有通过**。
+      - name: 断言真库用例没有被静默跳过
+        run: |
+          node -e "
+          const r = require('./.vitest-report.json');
+          const files = r.testResults.filter((t) => /pglite/i.test(t.name));
+          if (files.length < 2) {
+            throw new Error('报告里只找到 ' + files.length + ' 个 PGlite 用例文件（期望 2 个），疑似被静默跳过');
+          }
+          for (const f of files) {
+            const passed = f.assertionResults.filter((a) => a.status === 'passed').length;
+            const notPassed = f.assertionResults.filter((a) => a.status !== 'passed').length;
+            if (passed === 0) throw new Error('PGlite 用例一个都没通过：' + f.name);
+            if (notPassed > 0) throw new Error('PGlite 用例存在跳过/失败（' + notPassed + ' 个）：' + f.name);
+            console.log('真库用例真实执行：' + f.name.split('/').pop() + ' → ' + passed + ' passed, 0 skipped');
+          }
+          "
+
+      # 门 4：构建。不注入任何密钥；若将来某处构建期真的需要环境变量，请先确认它不需要真实凭据。
+      - name: build
+        run: npm run build
