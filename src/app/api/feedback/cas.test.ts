@@ -7,13 +7,13 @@ type Query = { text: string; values: unknown[] };
 // db.ts / user-data.ts / personal-write.ts，测试因此绑定在已定稿的新架构上。
 const mocks = vi.hoisted(() => ({
   neon: vi.fn(), ensureSchema: vi.fn(), getProfileForUser: vi.fn(), saveProfileForUser: vi.fn(),
-  upsertBook: vi.fn(), transaction: vi.fn(),
+  transaction: vi.fn(),
 }));
 vi.mock('@neondatabase/serverless', () => ({ neon: mocks.neon }));
 vi.mock('@/lib/db', async (importOriginal) => ({
   ...await importOriginal<typeof import('@/lib/db')>(),
   ensureSchema: mocks.ensureSchema, getProfileForUser: mocks.getProfileForUser,
-  saveProfileForUser: mocks.saveProfileForUser, upsertBook: mocks.upsertBook,
+  saveProfileForUser: mocks.saveProfileForUser,
 }));
 
 let current: { id: number; note: string; status: string } | null;
@@ -39,7 +39,6 @@ beforeEach(() => {
   competingWrite = false;
   mocks.ensureSchema.mockResolvedValue(undefined);
   mocks.getProfileForUser.mockResolvedValue({ seeds: [], content: '', updatedAt: 'v1' });
-  mocks.upsertBook.mockResolvedValue(42);
   // 书源 SQL 的返回值：feedback 快照查询读到最后一条反馈，其余查询返回空集。
   const tag = (parts: TemplateStringsArray, ...values: unknown[]) => {
     const text = parts.join('?').replace(/\s+/g, ' ').trim();

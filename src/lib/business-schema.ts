@@ -21,9 +21,9 @@ export async function initializeBusinessSchema(s: Sql) {
       meta jsonb NOT NULL DEFAULT '{}',
       created_at timestamptz NOT NULL DEFAULT now()
     )`;
-  await s`
-    CREATE UNIQUE INDEX IF NOT EXISTS books_title_author_idx
-    ON books (lower(title), lower(author))`;
+  // 身份键唯一索引不在这里声明（task-53）：改成生成列 title_key/author_key 后由
+  // migrations/0002_identity_key.sql 建立。放在 ensureSchema 里一旦 23505 会让
+  // schemaPromise 重抛，全站 503。
   await s`
     CREATE TABLE IF NOT EXISTS recommendations (
       id serial PRIMARY KEY,
@@ -79,9 +79,7 @@ export async function initializeBusinessSchema(s: Sql) {
       labels jsonb NOT NULL DEFAULT '{}',
       labeled_at timestamptz NOT NULL DEFAULT now()
     )`;
-  await s`
-    CREATE UNIQUE INDEX IF NOT EXISTS labeled_books_title_author_idx
-    ON labeled_books (lower(title), lower(author))`;
+  // 同上：labeled_books 的身份键唯一索引由 0002_identity_key.sql 建立。
   // 老表建立时可能没有 source_url 列(CREATE TABLE IF NOT EXISTS 不会补列)
   await s`
     ALTER TABLE labeled_books ADD COLUMN IF NOT EXISTS source_url text NOT NULL DEFAULT ''`;

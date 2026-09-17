@@ -28,7 +28,6 @@ export async function initializeAuthSchema(sql: Sql): Promise<void> {
         CREATE TABLE profile (id integer PRIMARY KEY DEFAULT 1, seeds jsonb NOT NULL DEFAULT '[]', content text NOT NULL DEFAULT '', updated_at timestamptz NOT NULL DEFAULT now());
         CREATE TABLE IF NOT EXISTS books (id serial PRIMARY KEY, title text NOT NULL, author text NOT NULL,
           douban_id text, douban_rating float8, douban_rating_count int, meta jsonb NOT NULL DEFAULT '{}', created_at timestamptz NOT NULL DEFAULT now());
-        CREATE UNIQUE INDEX IF NOT EXISTS books_title_author_idx ON books (lower(title), lower(author));
         CREATE TABLE recommendations (id serial PRIMARY KEY, book_id int NOT NULL REFERENCES books(id), query text NOT NULL,
           match_score float8, hit_likes jsonb, risks text, reason text, status text NOT NULL DEFAULT 'new', created_at timestamptz NOT NULL DEFAULT now(), UNIQUE (book_id, query));
         CREATE UNIQUE INDEX recommendations_book_query_idx ON recommendations (book_id, query);

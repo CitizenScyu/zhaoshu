@@ -4,7 +4,7 @@ import type { ProfileSnapshot, SeedBook } from '@/lib/types';
 
 const mocks = vi.hoisted(() => ({
   ensureSchema: vi.fn(), getProfileForUser: vi.fn(), saveProfileForUser: vi.fn(), chatRobust: vi.fn(),
-  getSql: vi.fn(), upsertBook: vi.fn(), sql: vi.fn(), transaction: vi.fn(), getFeedbackSnapshotForUser: vi.fn(),
+  getSql: vi.fn(), sql: vi.fn(), transaction: vi.fn(), getFeedbackSnapshotForUser: vi.fn(),
 }));
 vi.mock('@/lib/db', () => ({
   recordFeedbackForUser: async (userId: number, book: { title: string; author: string }, status: string, note: string, expectedVersion: number) => {
@@ -15,7 +15,7 @@ vi.mock('@/lib/db', () => ({
     });
   },
   ensureSchema: mocks.ensureSchema, getProfileForUser: mocks.getProfileForUser, saveProfileForUser: mocks.saveProfileForUser,
-  getSql: mocks.getSql, upsertBook: mocks.upsertBook, getFeedbackSnapshotForUser: mocks.getFeedbackSnapshotForUser,
+  getSql: mocks.getSql, getFeedbackSnapshotForUser: mocks.getFeedbackSnapshotForUser,
 }));
 vi.mock('@/lib/llm', async (importOriginal) => ({
   ...await importOriginal<typeof import('@/lib/llm')>(),
@@ -63,7 +63,6 @@ describe('/api/profile writes', () => {
     mocks.saveProfileForUser.mockResolvedValue(nextVersion);
     mocks.chatRobust.mockResolvedValue('  有效画像😀\n喜欢严谨设定  ');
     mocks.getSql.mockReturnValue(Object.assign(mocks.sql, { transaction: mocks.transaction }));
-    mocks.upsertBook.mockResolvedValue(42);
     mocks.transaction.mockResolvedValue([]);
     mocks.getFeedbackSnapshotForUser.mockResolvedValue({ version: 0, status: null, note: '' });
   });
