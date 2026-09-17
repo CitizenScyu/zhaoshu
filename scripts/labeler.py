@@ -9,7 +9,11 @@
   python3 labeler.py --limit 100            # 给前 100 本书打标
   python3 labeler.py --dry-run              # 只列书目不打标
   python3 labeler.py --book /books/details3168.html   # 指定单本
-配置: /root/zhaoshu-labeler/.env（LLM_API_KEY / DATABASE_URL / LLM_MODEL）
+  python3 labeler.py --no-db-model          # 不读库，强制用 .env 的模型链
+配置: /root/zhaoshu-labeler/.env（LLM_API_KEY 必填；DATABASE_URL 与 LLM_MODEL 可选）
+模型: 优先读数据库 app_settings.label_model（管理界面里改，改完下次运行生效）；
+      命中时该模型作为模型链链首，后接 .env 链；无 DATABASE_URL / 读库失败 / 值为空
+      则静默回落到 .env。启动会打印「打标模型来源: database|environment」。
 """
 import argparse
 import json
@@ -17,6 +21,7 @@ import os
 import re
 import sys
 import time
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -33,6 +38,9 @@ UA = {'User-Agent': 'Mozilla/5.0 (compatible; zhaoshu-labeler/1.0)'}
 # 打标模型后备链：先 bohe，失败依次换 grok-4.6-hei → deepseek-v4.1-flash-hei → glm-5.3-agent。
 # 可用 .env 的 LLM_MODELS=模型1,模型2,... 覆盖；无 LLM_MODELS 时兜底用旧 LLM_MODEL 单值。
 MODELS = ['deepseek-v4-flash-bohe', 'grok-4.6-hei', 'deepseek-v4.1-flash-hei', 'glm-5.3-agent']
+# 读库取模型名用的白名单：只是防呆（挡住空串/换行/注入了 SQL 的怪值），不是安全边界。
+MODEL_NAME_RE = re.compile(r'^[A-Za-z0-9._/-]{1,200}$')
+DB_MODEL_TIMEOUT_SEC = 5    # 读配置失败必须快速回落，不能拖住批量任务
 
 SYSTEM_PROMPT = (
     "你是网文编目员。阅读给定的小说文本（若干章），输出一个 JSON 对象"
@@ -89,14 +97,14 @@ def load_env():
             if line and not line.startswith('#') and '=' in line:
                 k, v = line.split('=', 1)
                 env[k.strip()] = v.strip()
-    missing = [k for k in ('LLM_API_KEY', 'LLM_MODEL') if not env.get(k)]
+    missing = [k for k in ('LLM_API_KEY',) if not env.get(k)]
     if missing:
         sys.exit(f'缺少环境变量: {missing}（应在 {ENV_PATH} 里）')
     return env
 
 
-def resolve_models(env: dict) -> list[str]:
-    """解析打标模型链：优先 LLM_MODELS 逗号列表覆盖，缺省用 MODELS 常量链。
+def _env_models(env: dict) -> list[str]:
+    """解析 .env 里的打标模型链：优先 LLM_MODELS 逗号列表覆盖，缺省用 MODELS 常量链。
     旧 LLM_MODEL 仅作兼容：若它指向 MODELS 之外的模型，按单值兜底；否则并入默认链。"""
     if env.get('LLM_MODELS'):
         models = [m.strip() for m in env['LLM_MODELS'].split(',') if m.strip()]
@@ -107,6 +115,48 @@ def resolve_models(env: dict) -> list[str]:
         # 用户显式指定了默认链之外的模型，按旧的单值行为兜底
         return [legacy]
     return list(MODELS)
+
+
+def fetch_label_model_from_db(database_url: str) -> str | None:
+    """经 Neon 的 HTTP SQL 接口只读一行 app_settings.label_model。
+
+    打标机刻意不装 PG 驱动（见文件末尾说明），所以走 HTTPS；连接串只放在请求头里，
+    不打印、不写日志。任何失败都返回 None，由调用方静默回落到 .env。"""
+    if not database_url:
+        return None
+    parsed = urllib.parse.urlsplit(database_url)
+    if parsed.scheme not in ('postgres', 'postgresql') or not parsed.hostname:
+        return None
+    body = json.dumps({
+        'query': 'SELECT label_model FROM app_settings WHERE id = 1',
+        'params': [],
+    }).encode('utf-8')
+    req = urllib.request.Request(
+        f'https://{parsed.hostname}/sql', data=body, method='POST',
+        headers={'Content-Type': 'application/json',
+                 'Neon-Connection-String': database_url,
+                 'Neon-Raw-Text-Output': 'true'})
+    with urllib.request.urlopen(req, timeout=DB_MODEL_TIMEOUT_SEC) as res:
+        payload = json.loads(res.read().decode('utf-8'))
+    rows = payload.get('rows') or []
+    value = rows[0].get('label_model') if rows else None
+    if isinstance(value, str) and MODEL_NAME_RE.match(value):
+        return value
+    return None
+
+
+def resolve_models(env: dict, use_db: bool = True) -> tuple[list[str], str]:
+    """(模型链, 来源)。数据库的 label_model 命中时作为链首，后接 .env 链（去重）；
+    无 DATABASE_URL / 读库失败 / 值为空或非法，一律静默回落 .env，绝不中断批量任务。"""
+    chain = _env_models(env)
+    if use_db:
+        try:
+            db_model = fetch_label_model_from_db(env.get('DATABASE_URL', ''))
+        except Exception:
+            db_model = None
+        if db_model:
+            return [db_model] + [m for m in chain if m != db_model], 'database'
+    return chain, 'environment'
 
 
 def http_get(url: str, timeout: int = 30) -> str:
@@ -305,10 +355,13 @@ def main() -> int:
     ap.add_argument('--limit', type=int, default=100)
     ap.add_argument('--dry-run', action='store_true')
     ap.add_argument('--book', help='指定单本详情页路径，如 /books/details3168.html')
+    ap.add_argument('--no-db-model', action='store_true',
+                    help='不读数据库 app_settings.label_model，直接用 .env 的模型链')
     args = ap.parse_args()
 
     env = load_env()
-    models = resolve_models(env)
+    models, model_source = resolve_models(env, use_db=not args.no_db_model)
+    print(f'打标模型来源: {model_source}')
     print(f'模型链: {models}')
     # 断点续传：已写入 labels.jsonl 的书跳过（按详情页 url 判定）
     done_urls: set[str] = set()
