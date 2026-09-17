@@ -8,6 +8,9 @@ import ReadBookLink from '@/components/ReadBookLink';
 import { isRecord } from '@/lib/sanitize';
 import { EMPTY_HISTORY, historyKeyFor, historySnapshot, rememberQuery, subscribeHistory } from '@/lib/recent-queries';
 import { createElapsedTicker, recallProgressSuffix, retryLabel, retryStep, showRetry, type FindPhase, type FindStep } from '@/lib/find-progress';
+// SSE 消费与落定判定放在纯模块里：本仓 vitest 只收 *.test.ts 且没有 jsdom，写在 JSX 闭包里的
+// 超时/落定判定测不到（见 find-sse.test.ts）。
+import { FIND_FETCH_TIMEOUT_MS, fetchFindResult, persistWarning, type SseEvent } from '@/lib/find-sse';
 // 精确找书（task-77）：模式、状态机、文案全部在纯模块里，本文件只做 JSX 与请求编排。
 import {
   EMPTY_EXACT_STATE,
@@ -26,50 +29,8 @@ import {
   type ShelfPhase,
 } from '@/lib/find-exact';
 
-// 找书三步的后端下行是真 SSE：事件 `data: <json>\n\n`。phase/progress 实时帧、
-// result 结束帧、error 错误帧（带可识别 code）。SSE 断线/超时给用户可识别错误与重试入口。
-type SseEvent = Record<string, unknown> & { type: string };
-const FIND_FETCH_TIMEOUT_MS = 290_000; // 略低于 295s 路由上限，避免读到一半被平台掐掉
-
-async function consumeFindSSE(
-  response: Response,
-  signal: AbortSignal,
-  timeoutMs: number,
-  onEvent: (event: SseEvent) => void,
-): Promise<void> {
-  if (!response.body) throw new Error('找书响应为空，请重试');
-  const reader = response.body.getReader();
-  const race = AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)]);
-  const decoder = new TextDecoder('utf-8');
-  let buf = '';
-  try {
-    while (true) {
-      const { value, done } = await reader.read();
-      race.throwIfAborted();
-      if (done) break;
-      buf += decoder.decode(value, { stream: true });
-      let boundary: number;
-      while ((boundary = buf.indexOf('\n\n')) !== -1) {
-        const frame = buf.slice(0, boundary);
-        buf = buf.slice(boundary + 2);
-        const m = frame.match(/^data: (.+)$/m);
-        if (!m) continue;
-        let data: unknown;
-        try { data = JSON.parse(m[1]); } catch { continue; }
-        if (!isRecord(data) || typeof data.type !== 'string') continue;
-        const type = data.type as string;
-        if (type === 'error') {
-          const e = new Error(typeof data.message === 'string' ? data.message : '找书失败，请重试');
-          (e as Error & { code?: string }).code = typeof data.code === 'string' ? data.code : undefined;
-          throw e;
-        }
-        onEvent(data as SseEvent);
-      }
-    }
-  } finally {
-    try { await reader.cancel(); } catch { /* 已取消或已关闭 */ }
-  }
-}
+// 找书三步的后端下行是真 SSE（phase/progress 实时帧、result 结束帧、error 错误帧）；
+// 消费、超时与落定判定都在 @/lib/find-sse，本文件只负责编排与渲染。
 
 // 示例池：每次进入页面随机抽几条，避免永远是同样几句
 const EXAMPLE_POOL = [
@@ -106,6 +67,7 @@ export default function FindTab() {
   const [candidates, setCandidates] = useState<Candidate[]>([]);
   const [results, setResults] = useState<RerankedItem[]>([]);
   const [error, setError] = useState('');
+  const [persistNote, setPersistNote] = useState(''); // result 帧 persisted=false：结果没存下来，必须说给用户
   const [recallSeconds, setRecallSeconds] = useState(0); // recall 阶段已等待秒数
   const [retryFrom, setRetryFrom] = useState<FindStep | null>(null); // 失败后可从哪一步起重试
   const request = useRef<AbortController | null>(null);
@@ -167,6 +129,7 @@ export default function FindTab() {
 
     setError('');
     setRetryFrom(null);
+    setPersistNote('');
     setPhase(start);
     let recalled: Candidate[] = start === 'recall' ? [] : candidates;
     let verified: VerifiedCandidate[] = start === 'rerank' ? verifiedRef.current : [];
@@ -216,19 +179,23 @@ export default function FindTab() {
         verifiedRef.current = verified;
       }
 
-      // 3) rerank：结束帧带 items（+persisted）。
+      // 3) rerank：结束帧带 items（+persisted）。persisted=false 不丢结果，但书没存下来，
+      // 必须让用户看见——否则写库失败被当成找书成功。
       at = 'rerank';
       setPhase('rerank');
-      const items = await fetchStepResult<RerankedItem[]>(
+      const resultEvent = await fetchFindResult(
         controller.signal,
         () => apiFetch('/api/find', {
           signal: controller.signal, method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: stepBody('rerank', { verified }),
         }),
-        'items',
+        FIND_FETCH_TIMEOUT_MS,
+        onFindProgress,
       );
-      setResults(items);
+      if (!Array.isArray(resultEvent.items)) throw new Error('找书结果不完整，请重试');
+      setResults(resultEvent.items as RerankedItem[]);
+      setPersistNote(persistWarning(resultEvent) ?? '');
       setPhase('done');
     } catch (e) {
       if (controller.signal.aborted) return;
@@ -244,44 +211,29 @@ export default function FindTab() {
   }
 
   // 发送一步并取得它的 result 帧；同时把实时 progress/phase 帧喂给页面进度。
+  // 超时/断流的落地判定都在 @/lib/find-sse 里（见 find-sse.test.ts）。
   async function fetchStepResult<T>(
     signal: AbortSignal,
     doFetch: () => Promise<Response>,
     field: 'candidates' | 'verified' | 'items',
   ): Promise<T> {
-    const event = await fetchResultEvent(signal, doFetch);
+    const event = await fetchFindResult(signal, doFetch, FIND_FETCH_TIMEOUT_MS, onFindProgress);
     if (!Array.isArray(event[field])) throw new Error('找书结果不完整，请重试');
     return event[field] as T;
   }
 
-  async function fetchResultEvent(
-    signal: AbortSignal,
-    doFetch: () => Promise<Response>,
-  ): Promise<SseEvent & { [k: string]: unknown }> {
-    const res = await doFetch();
-    signal.throwIfAborted();
-    if (!res.ok || !/text\/event-stream/i.test(res.headers.get('content-type') ?? '')) {
-      const data = await res.json().catch(() => ({}));
-      signal.throwIfAborted();
-      throw new Error((data as { error?: string }).error || '找书失败，请重试');
+  // 进度帧 → 页面进度。verify 的 x/y 与书源补验的进度都从这里进来。
+  function onFindProgress(event: SseEvent) {
+    if (event.type === 'progress' && event.step === 'verify') {
+      setVerifyTotal(typeof event.total === 'number' ? event.total : 0);
+      setVerifyDone(typeof event.done === 'number' ? event.done : 0);
+      if (event.provider === 'source') setSourceProgress({
+        done: typeof event.sourceDone === 'number' ? event.sourceDone : 0,
+        total: typeof event.sourceTotal === 'number' ? event.sourceTotal : 0,
+      });
+    } else if (event.type === 'phase' && event.step === 'verify') {
+      setVerifyTotal(typeof event.total === 'number' ? event.total : 0);
     }
-    const race = AbortSignal.any([signal, AbortSignal.timeout(FIND_FETCH_TIMEOUT_MS)]);
-    return await new Promise<SseEvent & { [k: string]: unknown }>((resolve, reject) => {
-      void consumeFindSSE(res, race, FIND_FETCH_TIMEOUT_MS, (event) => {
-        if (event.type === 'result') {
-          resolve(event);
-        } else if (event.type === 'progress' && event.step === 'verify') {
-          setVerifyTotal(typeof event.total === 'number' ? event.total : 0);
-          setVerifyDone(typeof event.done === 'number' ? event.done : 0);
-          if (event.provider === 'source') setSourceProgress({
-            done: typeof event.sourceDone === 'number' ? event.sourceDone : 0,
-            total: typeof event.sourceTotal === 'number' ? event.sourceTotal : 0,
-          });
-        } else if (event.type === 'phase' && event.step === 'verify') {
-          setVerifyTotal(typeof event.total === 'number' ? event.total : 0);
-        }
-      }).catch((e) => reject(e instanceof Error ? e : new Error('找书失败，请重试')));
-    });
   }
 
   const busy = phase === 'recall' || phase === 'verify' || phase === 'rerank';
@@ -408,6 +360,12 @@ export default function FindTab() {
       )}
 
       {/* 结果 */}
+      {/* 写库失败（result 帧 persisted=false）：结果还在，但这批书没存下来，必须说清楚 */}
+      {phase === 'done' && persistNote && (
+        <p role="alert" className="mt-6 text-sm" style={{ color: 'var(--cinnabar)' }}>
+          ⚠ {persistNote}
+        </p>
+      )}
       {phase === 'done' && results.length === 0 && (
         <p role="status" className="mt-8 text-sm">本轮没有符合条件的书。</p>
       )}
