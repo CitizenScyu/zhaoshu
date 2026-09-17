@@ -74,23 +74,29 @@ export async function GET(req: NextRequest) {
   }
 
   try {
-    const rows = (await access.run(async () => s`
+    // 两段同属一个 try/catch（失败就整段 library 置空），合成一次事务往返（task-70 T55-4）：
+    // 原本两条串行 RTT。其余各段仍各自独立 access.run —— 每段有自己的容错，跨段合批会让
+    // 单段失败时的「部分可用」变成全事务回滚，那是行为变化，见回报。所有语句都是只读 SELECT，
+    // 行/列/排序逐字不变。
+    const [rows, genreRows] = (await access.run(async () => s.transaction((tx) => [
+      tx`
       SELECT count(*)::int AS total,
              count(quality)::int AS with_quality,
              round(avg(quality)::numeric, 1)::float8 AS avg_quality,
              COALESCE(sum(chars_labeled), 0)::float8 AS chars_labeled
-      FROM labeled_books`)) as {
+      FROM labeled_books`,
+      tx`
+      SELECT COALESCE(NULLIF(primary_genre, ''), category, '其他') AS genre,
+             count(*)::int AS n
+      FROM labeled_books
+      GROUP BY 1 ORDER BY n DESC LIMIT 12`,
+    ], { readOnly: true }))) as [{
       total: number;
       with_quality: number;
       avg_quality: number | null;
       chars_labeled: number;
-    }[];
+    }[], { genre: string; n: number }[]];
     if (!rows[0]) throw new Error('Missing library aggregate');
-    const genreRows = (await access.run(async () => s`
-      SELECT COALESCE(NULLIF(primary_genre, ''), category, '其他') AS genre,
-             count(*)::int AS n
-      FROM labeled_books
-      GROUP BY 1 ORDER BY n DESC LIMIT 12`)) as { genre: string; n: number }[];
     stats.library = {
       total: rows[0].total,
       withQuality: rows[0].with_quality,
