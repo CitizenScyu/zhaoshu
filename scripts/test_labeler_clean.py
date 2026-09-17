@@ -10,6 +10,7 @@
 原始章节 html 没有落盘，故正文用合成样例，UI/推广行按 t76 转写的实测样本构造）。
 """
 import os
+import re
 import sys
 import unittest
 
@@ -196,16 +197,16 @@ class TestProsePreserved(unittest.TestCase):
                      '「手机。」',
                      '“你翻上一章看看，下一章就明白了”',   # nav 误删形态
                      '“你给我记住本站的规矩。”',           # inject 误删形态
-                     '“手机用户请注意，前面是雷区。”',     # inject 误删形态
-                     '分享本站。'):                         # inject 误删形态
+                     '“手机用户请注意，前面是雷区。”'):     # inject 误删形态
             with self.subTest(line=line):
                 self.assertIsNone(labeler._drop_rule(line))
 
     def test_injection_generalizations_are_gone(self):
-        # 变异钉：不许把「本站/手机用户」这类站点自指泛化重新加回黑名单。
-        # 用整条 pattern 相等判定——「分享本站」是 CORE「多多分享本站」的子串，子串判定会误报。
+        # 变异钉：不许把「本站/手机用户」这类站点自指**泛化**重新加回黑名单——
+        # 带 `?`/分组的写法会把「（我）记住本站…」这类对白一起圈进来。
+        # 用整条 pattern 相等判定；固定字面（INJECT_LITERALS）不算泛化，不在此列。
         patterns = {p.pattern for p in labeler.INJECT_PATTERNS}
-        for removed in ('分享本站', r'请?记住本站(网址)?', '手机用户请'):
+        for removed in (r'请?记住本站(网址)?', '手机用户请'):
             with self.subTest(pattern=removed):
                 self.assertNotIn(removed, patterns)
 
@@ -218,6 +219,78 @@ class TestProsePreserved(unittest.TestCase):
     def test_clean_text_is_stripped_and_deduplicated_newlines(self):
         text, _ = labeler.clean_chapter_text(html_with('<p>甲</p><p></p><p>乙</p>'))
         self.assertEqual(text, '甲\n乙')
+
+
+class TestRound2PromoLiterals(unittest.TestCase):
+    """t79 第二轮补丁：独立成行的口号碎片按**固定字面**补回（task-79-review2 §六.2）。
+
+    上一轮整族删掉 `分享本站` / `请?记住本站(网址)?` 是对的（泛化会圈进对白），
+    代价是 `分享本站` / `请记住本站网址` 这类碎片一起漏剥；本轮只补固定字面。
+    `分享本站。` 由上一轮的「应留」改判为「应删」（复核 §二 第 11 条）。
+    """
+
+    NEW_LITERALS = ('分享本站', '请记住本站', '记住本站不迷路')
+
+    def test_new_literals_are_declared_and_dropped(self):
+        """变异钉：清空 INJECT_LITERALS 后本用例必须变红（先 assertIn 再验行为）。"""
+        for literal in self.NEW_LITERALS:
+            with self.subTest(literal=literal):
+                self.assertIn(literal, labeler.INJECT_LITERALS)
+                self.assertEqual(labeler._drop_rule(literal), 'inject')
+
+    def test_new_literal_noise_forms_are_dropped(self):
+        for line in ('分享本站', '分享本站。',
+                     '请记住本站网址', '请记住本站网址。', '请记住本站',
+                     '记住本站不迷路', '记住本站不迷路！'):
+            with self.subTest(line=line):
+                self.assertEqual(labeler._drop_rule(line), 'inject')
+
+    def test_new_literals_stay_fixed_not_generalized(self):
+        """约束钉子：补回的是固定字面，不是 `请?`/`(网址)?` 这类泛化。
+
+        re.escape 是恒等 → 串里不含任何正则元字符，匹配面严格等于该串本身。
+        把 `请记住本站` 改成 `请?记住本站(网址)?` 会被本用例抓到。"""
+        for literal in labeler.INJECT_LITERALS:
+            with self.subTest(literal=literal):
+                self.assertEqual(re.escape(literal), literal)
+        patterns = {p.pattern for p in labeler.INJECT_PATTERNS}
+        for generalized in (r'请?记住本站(网址)?', '手机用户请'):
+            with self.subTest(pattern=generalized):
+                self.assertNotIn(generalized, patterns)
+
+    def test_round2_counterexamples_are_kept(self):
+        """独立构造的对白/独词/短行反例（未照抄复核语料）：误删必须为 0。
+
+        重点是含「本站」「记住本站」「多多」「推荐」「全文字」的**非口号**句——
+        固定字面的匹配面必须严格小于这些句子。"""
+        for line in (
+            '“你把本站的规矩记牢了。”',          # 含「本站」但不含任何字面串
+            '“你也记住本站的规矩。”',            # 含「记住本站」但没有「请」→ 不命中
+            '“记住本站的路，别走岔了。”',         # 同上，句首无「请」
+            '“本站的规矩，你也记住了。”',
+            '“请记住，本站不欢迎外人。”',         # 「请记住」与「本站」被逗号隔开
+            '“分享的书单在本站置顶。”',          # 「分享」「本站」不相邻
+            '“上一章写完了，下一章还没动笔。”',   # 对白含 nav 词 + 中文逗号
+            '“目录在中间，设置在最下面。”',
+            '“字体再大一点。”',
+            '章节目录在哪一页？',
+            '他点开目录，又退了出来。',
+            '手机屏幕黑了下去。',
+            '书架的最上层落了灰。',
+            '打赏的银子她一分没要。',
+            '背景是灰蒙蒙的天。',
+            '亮度低得看不清字。',
+            '“夜。”',
+            '“风……”',
+            '门被推开，冷风灌了进来。',
+            '“多多保重。”',                     # 含「多多」但非「多多分享本站」
+            '“向我推荐几本书吧。”',              # 含「推荐」但非「推荐本书」整行
+            '“微博上有人转了。”',                # 含「微博」但非「qq群和微博」
+            '“高速路上的首发车队。”',            # 含「高速…首发」但非「高速首发…最新章节」
+            '“全文字数一共三十万。”',            # 含「全文字」但非「全文字在线阅读」
+        ):
+            with self.subTest(line=line):
+                self.assertIsNone(labeler._drop_rule(line))
 
 
 class TestGuards(unittest.TestCase):
