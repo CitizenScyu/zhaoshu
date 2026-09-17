@@ -6,6 +6,7 @@
 // 2. 渠道偶发把中文请求搞成 mojibake，请求体统一 ASCII 转义消除这个变量
 // 3. 公益渠道吞吐波动极大（同样任务 37s~180s+），所以加空闲超时 + 一次重试
 import { cleanString, hasInvalidDatabaseCharacters, isRecord } from './sanitize';
+import { lookup } from 'node:dns/promises';
 import {
   parseLlmUsage, reasoningTokenCount,
   type LlmAttemptContext, type LlmCallObservation, type LlmCallUsage, type LlmUsage,
@@ -297,6 +298,65 @@ function classifyFailure(
   );
 }
 
+// ---- 失败路径的上游身份观测（usage_details.upstreamHost / resolvedIps）----
+//
+// 2026-09-17 归因：快照（.t48-verify/usage.json，02:05–02:45Z，47 行）里 10 行没有 cfRay，
+// **这 10 行全是失败行**（8 次首字节超时 + 2 次总超时）；成功的 37 行清一色 IAD。
+// 而且这 10 行里有一行（UPSTREAM_STALLED，attempts=2）**明明拿到了响应头**——它的 x-request-id
+// 已经落库，说明响应里带着 cf-ray，只是被旧的 `succeeded &&` 门丢掉了。
+// 于是「成片失败是不是同一个 colo / 同一个 IP」这个问题至今答不了。两处补：
+//   ① cfRay 改成「响应头里有就记」（成功与失败都写）。HTTP 状态类失败（524/429/5xx）
+//      是**带着** cf-ray 回来的，那正是最该看 colo 的一族，此前被 `succeeded &&` 整个丢掉。
+//   ② 连响应头都没有的那族（首字节超时 / 连接层 / 总超时），退而记目标主机名 +
+//      观测时刻的 DNS 解析结果。
+//
+// ⚠️ DNS 结果只是**代理指标**，别当成那一次连接真正用的对端地址：
+//   - Node 的 fetch（undici）不暴露 socket 对端 IP，拿到它要自定义 dispatcher（undici）——
+//     那是已被否决的方案（abort 掉的停滞连接不会复用，普通重发天然是新连接，见 chatRobust）；
+//   - 上游走 Cloudflare anycast，同一个 A 记录可能对应不同 colo。所以「同一组 IP」只能用来
+//     排除「DNS 把我们转到了别的边缘」；判 colo 仍然只认 cf-ray。
+// 取不到就整个键不写，绝不填假值。上限只为兜住 DNS 挂住的情况，超时即放弃观测、不影响调用结果。
+//
+// ⚠️ 代价（只有失败路径付，**不是零影响**）：这次解析发生在 catch 里、占用共享 deadline 最多
+// DNS_LOOKUP_TIMEOUT_MS，所以 chatRobust 的「剩余预算 > 首字节上限」那道门槛理论上会被翻转一档
+// （[主模型重发] ↔ [直接兜底]，审查已复现）。受影响窗口只有剩余预算卡在门槛上下 250ms 的那一小段，
+// 而这一档本来就落在「重发几乎必然白烧」的边界带上 ⇒ 可接受。这是本项唯一的控制流副作用。
+const DNS_LOOKUP_TIMEOUT_MS = 250;
+
+// 只在「确实是传输层的问题」时才去解析主机名。截断 / 空正文 / 内容过滤是关于**模型输出**的
+// 语义结论，与「连到了哪个边缘」无关，给它们记 IP 只是噪音。
+const TRANSPORT_FAILURE_CODES = new Set<string>([
+  UPSTREAM_UNREACHABLE, UPSTREAM_STALLED, UPSTREAM_FIRST_BYTE_TIMEOUT,
+]);
+
+function upstreamHostname(): string | null {
+  try {
+    return new URL(BASE_URL).hostname || null;
+  } catch {
+    return null;
+  }
+}
+
+// best-effort：解析失败、超时、返回空都只意味着「这个键不写」。
+async function resolveUpstreamIps(host: string): Promise<string[] | undefined> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const addresses = await Promise.race([
+      lookup(host, { all: true }),
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error('upstream dns lookup timed out')), DNS_LOOKUP_TIMEOUT_MS);
+        timer.unref?.();
+      }),
+    ]);
+    const ips = [...new Set(addresses.map((address) => address.address).filter(Boolean))];
+    return ips.length > 0 ? ips : undefined;
+  } catch {
+    return undefined;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 // 流式中转避免等待整段响应；持续出 token 仍受同一次调用的总时限约束。
 export async function chat(
   system: string,
@@ -334,12 +394,15 @@ export async function chat(
     model, requestId: null, createdAt: new Date().toISOString(), usage: parseLlmUsage(undefined),
   };
   // 观测（落进 usage_details，见 llm-usage.ts 的 LlmCallObservation）：只记真实观测到的值。
-  // ttfbMs / cfRay 只在**这次调用成功**时写（题面要求「成功时」）：失败时它们说明不了什么，
-  // 失败族由 errorCode 表达。拿不到就整个键不写，绝不编。
+  // ttfbMs 仍只在**这次调用成功**时写（失败时它说明不了什么，失败族由 errorCode 表达）；
+  // cfRay 成功与失败都写——失败行有没有 colo 信息，正是「成片失败」归因缺的那一块。
+  // 拿不到就整个键不写，绝不编。
   let succeeded = false;
   let ttfbMs: number | undefined;
   let cfRay: string | undefined;
   let errorCode: string | undefined;
+  let upstreamHost: string | null = null;
+  let resolvedIps: string[] | undefined;
   // 尝试上下文由 chatRobust 给出；首字节超时是 chat 自己判定的，所以计数在这里累加
   // （chatRobust 只给「此前」的基数），这样本行记的就是「截止本行」的累计值。
   let firstByteTimeouts = opts.attemptContext?.firstByteTimeouts ?? 0;
@@ -354,8 +417,10 @@ export async function chat(
         fallbackUsed: context.fallbackUsed,
       } : {}),
       ...(succeeded && ttfbMs != null ? { ttfbMs } : {}),
-      ...(succeeded && cfRay ? { cfRay } : {}),
+      ...(cfRay ? { cfRay } : {}),
       ...(errorCode ? { errorCode } : {}),
+      ...(upstreamHost ? { upstreamHost } : {}),
+      ...(resolvedIps ? { resolvedIps } : {}),
     };
     return Object.keys(observed).length > 0 ? observed : undefined;
   };
@@ -458,6 +523,13 @@ export async function chat(
     // 失败也要留下失败族（usage_details.errorCode）：不然线上分不清是哪一族挂的。
     errorCode = error.code;
     if (error.code === UPSTREAM_FIRST_BYTE_TIMEOUT) firstByteTimeouts += 1;
+    // 传输层失败**且没拿到响应头**（cfRay 为空）时补记上游身份：有 cf-ray 的行，colo
+    // 信息比 DNS 直接，不必多花这一次查询。这次解析最多花掉 DNS_LOOKUP_TIMEOUT_MS 的
+    // 剩余预算（失败路径专用，正常调用一次都不会走到），值当。
+    if (!cfRay && error.code != null && TRANSPORT_FAILURE_CODES.has(error.code)) {
+      upstreamHost = upstreamHostname();
+      if (upstreamHost) resolvedIps = await resolveUpstreamIps(upstreamHost);
+    }
     throw error;
   } finally {
     clearTimeout(totalTimer);

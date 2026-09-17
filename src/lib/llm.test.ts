@@ -1,6 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { consumeSseChunk, parseJson, validateProfileContent } from './llm';
 
+// 失败行的上游身份观测（upstreamHost / resolvedIps）走的是系统 DNS。测试里必须把它钉死：
+// 真做解析既慢又不确定，而且 fake timers 下连「超时兜底」那个计时器都不会自己到点。
+const dns = vi.hoisted(() => ({ lookup: vi.fn() }));
+vi.mock('node:dns/promises', () => ({ lookup: dns.lookup }));
+
 describe('parseJson', () => {
   it('parses bare JSON object', () => {
     expect(parseJson('{"a":1}')).toEqual({ a: 1 });
@@ -107,6 +112,8 @@ describe('stream completion and shared call budget', () => {
     vi.stubEnv('LLM_TOTAL_TIMEOUT_MS', '5000');
     vi.stubGlobal('fetch', fetchMock);
     fetchMock.mockReset();
+    dns.lookup.mockReset();
+    dns.lookup.mockResolvedValue([{ address: '203.0.113.7', family: 4 }]);
     vi.spyOn(console, 'error').mockImplementation(() => {});
     client = await import('./llm');
   });
@@ -661,7 +668,7 @@ describe('stream completion and shared call budget', () => {
       expect(sentModel(1)).toBe('fallback/model');
       expect(sentModel(1)).not.toBe('primary/model');
       expect(onUsage.mock.calls.map(([call]) => call.observation)).toEqual([
-        { attempts: 1, firstByteTimeouts: 1, retried: false, fallbackUsed: false, errorCode: 'UPSTREAM_FIRST_BYTE_TIMEOUT' },
+        { attempts: 1, firstByteTimeouts: 1, retried: false, fallbackUsed: false, errorCode: 'UPSTREAM_FIRST_BYTE_TIMEOUT', upstreamHost: 'llm.invalid', resolvedIps: ['203.0.113.7'] },
         // 没有重发 ⇒ 兜底就是第 2 次尝试（不是第 3 次），且 retried 保持 false。
         { attempts: 2, firstByteTimeouts: 1, retried: false, fallbackUsed: true, ttfbMs: 0 },
       ]);
@@ -820,9 +827,12 @@ describe('stream completion and shared call budget', () => {
       await expect(pending).resolves.toMatchObject({ content: '重发成功的正文' });
       expect(observations(onUsage)).toEqual([
         // 第一行：失败族 + 累计首字节超时次数 1 + 还没重发过。
+        // 也是**没拿到响应头**的那一族：补记目标主机与观测时刻的 DNS 解析结果，
+        // 好让线上能回答「成片失败是不是同一台/同一个 IP」。
         {
           attempts: 1, firstByteTimeouts: 1, retried: false, fallbackUsed: false,
           errorCode: 'UPSTREAM_FIRST_BYTE_TIMEOUT',
+          upstreamHost: 'llm.invalid', resolvedIps: ['203.0.113.7'],
         },
         // 第二行：这是第 2 次尝试、是重发；成功所以带上 ttfbMs 与 cf-ray。
         // 失败那一次没有响应头，所以它既没有 ttfbMs 也没有 cfRay——不是编的 0。
@@ -842,8 +852,8 @@ describe('stream completion and shared call budget', () => {
       await expect(pending).resolves.toMatchObject({ content: '兜底正文' });
       expect(sentModel(2)).toBe('fallback/model');
       expect(observations(onUsage)).toEqual([
-        { attempts: 1, firstByteTimeouts: 1, retried: false, fallbackUsed: false, errorCode: 'UPSTREAM_FIRST_BYTE_TIMEOUT' },
-        { attempts: 2, firstByteTimeouts: 2, retried: true, fallbackUsed: false, errorCode: 'UPSTREAM_FIRST_BYTE_TIMEOUT' },
+        { attempts: 1, firstByteTimeouts: 1, retried: false, fallbackUsed: false, errorCode: 'UPSTREAM_FIRST_BYTE_TIMEOUT', upstreamHost: 'llm.invalid', resolvedIps: ['203.0.113.7'] },
+        { attempts: 2, firstByteTimeouts: 2, retried: true, fallbackUsed: false, errorCode: 'UPSTREAM_FIRST_BYTE_TIMEOUT', upstreamHost: 'llm.invalid', resolvedIps: ['203.0.113.7'] },
         { attempts: 3, firstByteTimeouts: 2, retried: true, fallbackUsed: true, ttfbMs: 0 },
       ]);
     });
@@ -867,9 +877,50 @@ describe('stream completion and shared call budget', () => {
       await vi.advanceTimersByTimeAsync(1_500); // 通用重发的等待
       await expect(pending).resolves.toMatchObject({ content: '重试成功' });
       expect(observations(onUsage)).toEqual([
-        { attempts: 1, firstByteTimeouts: 0, retried: false, fallbackUsed: false, errorCode: 'UPSTREAM_UNREACHABLE' },
+        { attempts: 1, firstByteTimeouts: 0, retried: false, fallbackUsed: false, errorCode: 'UPSTREAM_UNREACHABLE', upstreamHost: 'llm.invalid', resolvedIps: ['203.0.113.7'] },
         { attempts: 2, firstByteTimeouts: 0, retried: true, fallbackUsed: false, ttfbMs: 0 },
       ]);
+    });
+
+    // 🔴 2026-09-17 补：HTTP 状态类失败（524/429/5xx）是**带着 cf-ray** 回来的，那正是最该看
+    // colo 的一族。此前 cfRay 被 `succeeded &&` 挡着，这些行的 colo 信息整个丢掉，线上
+    // 「成片失败是不是同一个 colo」无从判定。
+    // 判别力：把 observationFor 里的 `cfRay ?` 改回 `succeeded && cfRay ?`，本用例必须失败。
+    it('HTTP 状态失败行也记 cfRay（但没有 ttfbMs——这次调用没成功）', async () => {
+      const onUsage = vi.fn();
+      fetchMock.mockResolvedValue(new Response('', { status: 524, headers: { 'cf-ray': 'a1b2c3-IAD' } }));
+      await expect(client.chat('system', 'user', { onUsage }))
+        .rejects.toMatchObject({ code: 'UPSTREAM_STALLED' });
+      // 拿到响应头 ⇒ 不再补记 host/IP（colo 比 DNS 直接），也不该多花那一次查询。
+      expect(observations(onUsage)).toEqual([{ cfRay: 'a1b2c3-IAD', errorCode: 'UPSTREAM_STALLED' }]);
+      expect(dns.lookup).not.toHaveBeenCalled();
+    });
+
+    // 语义类失败（截断/空正文/内容过滤）与「连到哪个边缘」无关，记 IP 只是噪音。
+    it('语义类失败不记 upstreamHost/resolvedIps', async () => {
+      const onUsage = vi.fn();
+      fetchMock.mockResolvedValue(response([finish('length')]));
+      await expect(client.chatRobust('system', 'user', { onUsage }))
+        .rejects.toMatchObject({ code: 'OUTPUT_TRUNCATED' });
+      expect(observations(onUsage)).toEqual([
+        { attempts: 1, firstByteTimeouts: 0, retried: false, fallbackUsed: false, errorCode: 'OUTPUT_TRUNCATED' },
+      ]);
+      expect(dns.lookup).not.toHaveBeenCalled();
+    });
+
+    // DNS 也拿不到时只留主机名：观测字段宁缺毋滥，不填假值。
+    it('DNS 解析失败时只记 upstreamHost', async () => {
+      const onUsage = vi.fn();
+      dns.lookup.mockRejectedValueOnce(new Error('getaddrinfo ENOTFOUND'));
+      fetchMock.mockImplementationOnce(hang);
+      const pending = client.chat('system', 'user', {
+        model: 'primary/model', onUsage, firstByteTimeoutMs: 2_000, totalTimeoutMs: 20_000,
+      });
+      const assertion = expect(pending).rejects.toMatchObject({ code: 'UPSTREAM_FIRST_BYTE_TIMEOUT' });
+      await vi.advanceTimersByTimeAsync(2_000);
+      await assertion;
+      expect(observations(onUsage)[0]).toMatchObject({ upstreamHost: 'llm.invalid' });
+      expect(observations(onUsage)[0]).not.toHaveProperty('resolvedIps');
     });
   });
 

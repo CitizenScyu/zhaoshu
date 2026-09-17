@@ -31,6 +31,12 @@ vi.mock('@/lib/db', async (importOriginal) => ({
 }));
 vi.mock('@/lib/douban', () => ({ verifyBatch: mocks.verifyBatch }));
 
+// 失败行会补记目标主机 + DNS 解析结果（见 llm.ts 的 resolveUpstreamIps）。这个文件跑的是真路由、
+// 真 chatRobust、真传输层失败，不钉死就会**真的去查 DNS**（最坏路径那个用例实测 6 次，
+// host=llm.invalid）——单元测试不该有网络依赖，fake timers 下真实解析的回调还不会按时到达。
+const dns = vi.hoisted(() => ({ lookup: vi.fn() }));
+vi.mock('node:dns/promises', () => ({ lookup: dns.lookup }));
+
 const event = (value: unknown) => 'data: ' + JSON.stringify(value) + '\n\n';
 const candidate = { title: '测试书', author: '作者', category: '仙侠', wordCount: '100万字', why: '设定严谨' };
 const verified = { ...candidate, douban: { status: 'verified', found: true, rating: 8, doubanId: '123' } };
@@ -120,6 +126,8 @@ describe('usage instrumentation through all model routes', () => {
     vi.stubEnv('LLM_TOTAL_TIMEOUT_MS', '500');
     vi.stubGlobal('fetch', fetchMock);
     fetchMock.mockReset();
+    dns.lookup.mockReset();
+    dns.lookup.mockResolvedValue([{ address: '203.0.113.7', family: 4 }]);
     vi.spyOn(console, 'error').mockImplementation(() => {});
     mocks.pending.length = 0;
     mocks.after.mockImplementation((task: () => Promise<void>) => { mocks.pending.push(task); });
@@ -299,6 +307,16 @@ describe('usage instrumentation through all model routes', () => {
     const events = await sseOf(await pending);
     expect(events.find((e) => e.type === 'error')).toBeTruthy();
     expect(fetchMock).toHaveBeenCalledTimes(6);
+    // 6 次失败（4 次挂到首字节上限 + 2 次无 cf-ray 的 524）都会去补记上游身份 —— 全部走 mock，
+    // 一次真实 DNS 查询都不发生。计数同时钉住「观测只在失败路径付」：没有多出来的第 7 次。
+    expect(dns.lookup).toHaveBeenCalledTimes(6);
+    expect(dns.lookup.mock.calls.every(([host]) => host === 'llm.invalid')).toBe(true);
+    // 端到端自证「0 次真实查询」：mock 的返回值确实落进了 usage_details——这条路径完全由
+    // mock 供给，真实的 node:dns/promises 一次都没被这条链路碰到。
+    await finishResponse();
+    const details = inserts().map((row) => String(row[9]));
+    expect(details.some((json) =>
+      json.includes('"upstreamHost":"llm.invalid"') && json.includes('"resolvedIps":["203.0.113.7"]'))).toBe(true);
     // 主模型那 4 次都是同一个模型，兜底那 2 次是另一个——「换连接重发」没有变成「多换几次模型」。
     const sentModels = fetchMock.mock.calls.map(([, init]) => JSON.parse(String(init?.body)).model as string);
     expect(new Set(sentModels).size).toBe(2);

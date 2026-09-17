@@ -245,6 +245,54 @@ describe('POST /api/find output contract', () => {
     ]);
   });
 
+  // T57R-5：软约束清单不再随书架无限膨胀。书架/反馈记录只增不减，全量进 prompt 会让
+  // 「已排除书单」这一段随用量线性变长，纯属白烧输入 token（排除本身由硬过滤保证）。
+  // 上限只截**提示词**：excludedKeys/excludedTitles 取的是未截断的两份数据，必须仍然完整。
+  it('recall 提示词里的已排除书单封顶 50 条，超出部分只报数量', async () => {
+    const shelf = Array.from({ length: 60 }, (_, i) => ({ title: `架上书${i}`, author: '作者甲' }));
+    mocks.getProfileForUser.mockResolvedValue({ seeds: [{ title: '种子书', author: '作者乙', kind: 'love' }], content: '画像' });
+    mocks.getExcludedBookKeysForUser.mockResolvedValue(shelf.map((b) => bookKey(b.title, b.author)));
+    mocks.getExcludedBookTitlesForUser.mockResolvedValue(shelf);
+    mocks.chatRobust.mockResolvedValue(JSON.stringify({ candidates: [
+      candidate,
+      { ...candidate, title: '架上书59' }, // 被截掉、没进提示词的那一本
+    ] }));
+    const events = await consumeSSE(await POST(request({ step: 'recall', query: '找书' })));
+    const prompt = mocks.chatRobust.mock.calls[0][1] as string;
+    // 种子书排在最前，所以它们先占额度、不会被截；但**不豁免**——种子 >50 时尾部照样被截
+    // （见下一条用例）。「排最前」只保证顺序，不保证一定进提示词。
+    expect(prompt).toContain('- 《种子书》 作者乙');
+    expect(prompt).toContain('- 《架上书48》 作者甲'); // 第 50 条（种子书 + 架上书0..48）
+    expect(prompt).not.toContain('- 《架上书49》'); // 第 51 条起只计数
+    expect(prompt.match(/^- 《/gm)).toHaveLength(50);
+    expect(prompt).toContain('另有 11 本已排除的书未列出');
+    // 硬过滤不受提示词上限影响：没进 prompt 的那本照样被排除。
+    expect(lastEvent<{ candidates: typeof candidate[] }>(events, 'result').candidates).toEqual([{ ...candidate, source: 'llm' }]);
+  });
+
+  // 种子书不豁免上限：MAX_SEEDS=100（profile/route.ts），种子 >50 时尾部会被截掉并计进
+  // 「另有 X 本」。这条用例钉住这个事实，防止注释再退化成「种子永不被截」。
+  it('种子书超过上限时同样被截断并计入「另有 X 本」', async () => {
+    const seeds = Array.from({ length: 60 }, (_, i) => ({ title: `种子书${i}`, author: '作者乙', kind: 'love' }));
+    mocks.getProfileForUser.mockResolvedValue({ seeds, content: '画像' });
+    mocks.chatRobust.mockResolvedValue(JSON.stringify({ candidates: [candidate] }));
+    await consumeSSE(await POST(request({ step: 'recall', query: '找书' })));
+    const prompt = mocks.chatRobust.mock.calls[0][1] as string;
+    expect(prompt).toContain('- 《种子书49》 作者乙'); // 第 50 条
+    expect(prompt).not.toContain('- 《种子书50》'); // 尾部种子被截
+    expect(prompt.match(/^- 《/gm)).toHaveLength(50);
+    expect(prompt).toContain('另有 10 本已排除的书未列出');
+  });
+
+  it('未超上限时不出现「另有 X 本已排除」提示', async () => {
+    mocks.getExcludedBookTitlesForUser.mockResolvedValue([{ title: '架上书', author: '作者甲' }]);
+    mocks.chatRobust.mockResolvedValue(JSON.stringify({ candidates: [candidate] }));
+    await consumeSSE(await POST(request({ step: 'recall', query: '找书' })));
+    const prompt = mocks.chatRobust.mock.calls[0][1] as string;
+    expect(prompt).toContain('- 《架上书》 作者甲');
+    expect(prompt).not.toContain('已排除的书未列出');
+  });
+
   it('verifies each canonical pair only once and keeps response metadata aligned', async () => {
     mocks.verifyBatch.mockResolvedValue([douban, { status: 'not_found', found: false }]);
     const res = await POST(request({ step: 'verify', candidates: [

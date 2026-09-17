@@ -28,6 +28,20 @@ describe('find prompt boundaries', () => {
     expect(prompt).toContain('只能作为模型推断或待核验风险');
     expect(prompt).toContain('不能陈述为已满足的事实');
   });
+
+  // 调用方会把软约束清单截断（书架无限增长，见 find/route.ts 的 EXCLUDED_BOOKS_PROMPT_LIMIT）。
+  // 截断了却不说，模型会把「没列出来」读成「没排除」，转身把用户书架上的书再推一遍。
+  it('截断已排除书单时必须说明这只列出了一部分', () => {
+    const prompt = recallUser('画像', '找书', [{ title: '架上书', author: '作者甲' }], '', 12);
+    expect(prompt).toContain('- 《架上书》 作者甲');
+    expect(prompt).toContain('另有 12 本已排除的书未列出');
+    expect(prompt).toContain('**部分**清单');
+  });
+
+  it('没截断时不出现「另有」提示', () => {
+    const prompt = recallUser('画像', '找书', [{ title: '架上书', author: '作者甲' }]);
+    expect(prompt).not.toContain('另有');
+  });
 });
 
 describe('evidence and inference boundaries', () => {
