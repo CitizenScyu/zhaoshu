@@ -1,14 +1,16 @@
 -- task-53 Phase 2：身份键从「表达式索引 lower(title),lower(author)」升级为
 -- 「生成列 + 新唯一索引」，让 ON CONFLICT 指向确定性的键。
 --
+-- version = 2（文件名前缀即版本号），由 scripts/db-migration-lib.mjs 的
+-- loadMigrations() 按有序列表执行并写入 schema_migrations。
+--
 -- 与 0001_baseline.sql 的关系：0001 里那两条旧 CREATE UNIQUE INDEX 保留原样，
 -- 因为 0001 的 sha256 摘要记录在 schema_migrations 里（scripts/db-migration-lib.mjs
--- 的 loadMigration 会用摘要拒绝重放被改过的基线），改一个字节就会让 db:check /
+-- 的 loadMigrations 会用摘要拒绝重放被改过的基线），改一个字节就会让 db:check /
 -- db:migrate 在已有库上直接失败。本文件按顺序接管：建新列/新索引 → 删旧索引。
 --
--- ⚠️ 本文件目前不在 scripts/migrate.mjs 的执行路径上（migrationPath 硬编码为
--- 0001_baseline.sql）。它是生产 DDL 的权威记录与重放脚本，执行顺序与 task-53
--- 步骤 4 逐字一致。
+-- 生产已按本文件手工执行过 DDL；首次由 runner 跑到这里时结构已存在，全部语句
+-- 走 IF [NOT] EXISTS 空转，真正的副作用只有 INSERT schema_migrations(version=2)。
 --
 -- ⚠️ normalize() 第二参数是**关键字**：normalize(x, NFKC) 可以，
 -- normalize(x, 'NFKC') 报 42601（生产实测）。

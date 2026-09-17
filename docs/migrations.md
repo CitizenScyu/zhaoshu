@@ -1,14 +1,23 @@
 # 数据库迁移
 
-数据库结构以 `migrations/*.sql` 和 `src/lib/schema-version.ts` 为唯一版本契约。`0001_baseline.sql` 冻结应用提交 `f48299b` 的现有结构：它记录**已有**表、列、约束与索引，不引入任何后续功能字段。
+数据库结构以 `migrations/*.sql` 和 `src/lib/schema-version.ts` 为唯一版本契约。迁移文件是一个**显式有序列表**（`scripts/db-migration-lib.mjs` 的 `MIGRATION_FILES`），不扫描目录：目录里多一个 `.sql` 不会在无人察觉时被执行。
+
+| 文件 | version | 内容 |
+| --- | --- | --- |
+| `0001_baseline.sql` | 1 | 冻结应用提交 `f48299b` 的现有结构；记录**已有**表、列、约束与索引，不引入后续功能字段 |
+| `0002_identity_key.sql` | 2 | 身份键从表达式索引升级为「生成列 + 唯一索引」（task-53 Phase 2） |
+
+版本号取自文件名数字前缀，`SCHEMA_VERSION` 必须等于列表里的最大版本，否则 `loadMigrations()` 直接报错——常量与文件脱节不会被静默放过。**已发布的文件内容即其摘要**：`0001` 的 sha256 已记入生产 `schema_migrations`，改一个字节会让 `db:check` / `db:migrate` 在已有库上拒绝继续。`0002` 已由生产按同一文件手工执行过 DDL，同样不得再改。
 
 ## 安全边界
 
 - 命令只接受 `--target=test`，且只读取进程中显式提供的 `TEST_DATABASE_URL`；不会读取 `.env*`，也不会回退到 `DATABASE_URL`。
 - 本轮只面向隔离测试库；**不应用到生产**。
-- 迁移在单个事务内执行，版本登记与 DDL 一起提交（原子）：要么全成，要么回滚且不登记。
+- 整个待执行列表在单个事务内执行，所有版本的登记与 DDL 一起提交（原子）：要么全成，要么回滚且不登记任何版本。
 - 用事务级 advisory lock（`schema_migrations` 同一把锁）串行化并发迁移，并设置 10 秒锁等待与 120 秒语句预算。
 - `schema_migrations` 同时记录版本和 SHA-256；已登记版本对应的文件摘要变化会阻断执行，提示人工复核。
+- **多版本记账**：逐条按 version 查 `schema_migrations`。已有行且摘要相符 → 跳过、不执行该文件的 SQL；无行 → 执行 SQL 并 INSERT 记账。因此对「DDL 已手工跑过但没记账」的库（生产当前状态），首次 `db:migrate` 只补记账、空转 DDL。
+- **行尾归一**：读文件后先把 CRLF 归成 LF 再算摘要、再执行。生产已登记的 v1 摘要是 LF 版（`0001` 的 git blob 摘要），而 Windows 上 `core.autocrlf=true` 的 checkout 读到的是 CRLF；不归一会让同一份文件在不同平台得到两枚摘要，迁移被「摘要不匹配」整批拒绝。归一不改盘上文件，也不改已登记的行。
 - SQL 文件作为整体交给 PostgreSQL，执行器不会按分号切割。
 - worker 旧表中无法可靠推断的必填 NULL 会阻断迁移，错误包含 `download_tasks.id`；不会用假值补齐，也不会删除历史数据。
 
@@ -37,11 +46,11 @@ npm run test:db    -- --target=test   # 三类起点 + 并发 + 回滚验收
 
 - 目标必须由 `-- --target=test` 显式给出；不加参数会直接报错退出（退出码 1）。脚本里没有内置默认目标。
 - 缺少 `TEST_DATABASE_URL` 时立即失败（退出码 1），不会回退到业务 `DATABASE_URL`。
-- `db:check` 未迁移或摘要不符时退出码为 2，参数/连接错误为 1；`db:migrate` 首次输出 `applied`，重复执行输出 `unchanged`。
+- `db:check` 会**逐个版本**核对 `schema_migrations` 里的 name 与 sha256：缺任一版本（例如只有 v1 的库）或摘要不符都退出码 2，参数/连接错误为 1。`db:migrate` 首次输出 `applied`，重复执行输出 `unchanged`；两者的 `versions[]` 逐条给出每个版本的 `applied` / `unchanged`。
 
 `db:check` 只读，报告版本、缺表、危险记录、全部列（类型 / nullable / default）、索引与约束，供人工比对三类起点的差异。`db:migrate` 只在同一事务内写 `schema_migrations` 与结构。
 
-`test:db` 在同一个显式测试库内创建随机命名的临时 schema，覆盖空库、旧主应用库、worker 先建库、重复执行、并发串行、故障回滚和危险 NULL 阻断，结束时删除这些临时 schema。它同样不应指向生产数据库。
+`test:db` 在同一个显式测试库内创建随机命名的临时 schema，覆盖空库、旧主应用库、worker 先建库、**手工跑过 0002 的生产形态**（先只 apply 0001，再裸跑 0002 的 DDL 不记账，然后重跑迁移只补记 v2）、重复执行、并发串行、故障回滚和危险 NULL 阻断，结束时删除这些临时 schema。它同样不应指向生产数据库。
 
 ## 三类起点差异
 
@@ -51,7 +60,7 @@ npm run test:db    -- --target=test   # 三类起点 + 并发 + 回滚验收
 | 旧主应用 | `profile.id` 默认 1；推荐和反馈没有 `user_id`；推荐存在全局唯一键 | 将既有单用户数据归属 owner，移除全局唯一键，建立用户外键及用户范围索引 |
 | worker 先建 | 只有宽松 `download_tasks`；业务列可空且多项无默认值 | 先列出含 NULL 的记录 ID 并阻断；无危险数据时收紧 nullable/default |
 
-升级后三类起点得到**同一份列 / 索引 / 约束集合**（验收脚本逐项比对）。唯一残留差异是物理列序：旧库的 `user_id` 由 `ALTER TABLE ADD COLUMN` 追加，必然排在表末尾。SQL 一律按列名访问，统一列序需要重建表，而本批不允许有损重建，因此列序不计入契约差异。
+升级后四类起点（含「手工跑过 0002 的生产形态」）得到**同一份列 / 索引 / 约束集合**（验收脚本逐项比对，并断言四个 schema 的指纹全等）。唯一残留差异是物理列序：旧库的 `user_id` 由 `ALTER TABLE ADD COLUMN` 追加，必然排在表末尾。SQL 一律按列名访问，统一列序需要重建表，而本批不允许有损重建，因此列序不计入契约差异。
 
 ## 其他
 
