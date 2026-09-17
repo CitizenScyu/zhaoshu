@@ -1,8 +1,6 @@
-import { existsSync } from 'node:fs';
-import { resolve } from 'node:path';
-import { pathToFileURL } from 'node:url';
 import { NextRequest } from 'next/server';
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import { loadPGlite, type PGliteLike } from '@/lib/fixtures/pglite';
 
 // 端到端真库用例：真的 POST 到路由处理器，SQL 真的打到 PostgreSQL（WASM）上。
 //
@@ -14,37 +12,10 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vites
 //    这个名字是 PostgreSQL 从 `username text NOT NULL UNIQUE` 生成的，桩里写什么都行，
 //    只有真库能证明它没写错。
 //
-// PGlite 不在 package.json 依赖里（先例见 ../.t62-pglite）。解析不到时显式 skip 并打印原因。
-
-type PGliteLike = {
-  exec(sql: string): Promise<unknown>;
-  query(text: string, params?: unknown[]): Promise<{ rows: Record<string, unknown>[] }>;
-  close(): Promise<void>;
-};
+// PGlite 是 devDependency（package.json 钉死 ^0.5.8）；缺依赖由 loadPGlite 抛错硬失败，
+// 只有在显式设了 NF_PGLITE_OPTIONAL=1 时才会走到 describe.skip。见 lib/fixtures/pglite.ts。
 
 type QueryLike = { text: string; params: unknown[]; then: (a: unknown, b: unknown) => Promise<unknown> };
-
-const CANDIDATES = [
-  '@electric-sql/pglite',
-  ...['.t62-pglite', '.t78-pglite'].map((dir) =>
-    pathToFileURL(resolve(process.cwd(), '..', dir, 'node_modules/@electric-sql/pglite/dist/index.js')).href),
-];
-
-let PGliteCtor: (new () => PGliteLike) | null = null;
-let skippedBecause = '';
-for (const candidate of CANDIDATES) {
-  if (candidate.startsWith('file:') && !existsSync(new URL(candidate))) continue;
-  try {
-    const mod = await import(/* @vite-ignore */ candidate) as { PGlite: new () => PGliteLike };
-    PGliteCtor = mod.PGlite;
-    break;
-  } catch (error) {
-    skippedBecause = error instanceof Error ? error.message : String(error);
-  }
-}
-if (!PGliteCtor) {
-  console.warn(`[register.e2e.pglite] 跳过端到端真库用例：解析不到 @electric-sql/pglite（${skippedBecause}）`);
-}
 
 const mocks = vi.hoisted(() => ({
   getSql: vi.fn(),
@@ -112,6 +83,7 @@ function adapt(pg: PGliteLike): SqlTagLike {
   return Object.assign(tag, { transaction }) as unknown as SqlTagLike;
 }
 
+const PGliteCtor = await loadPGlite();
 const maybe = PGliteCtor ? describe : describe.skip;
 let pg: PGliteLike;
 let sql: ReturnType<typeof adapt>;
