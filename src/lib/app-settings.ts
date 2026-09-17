@@ -102,6 +102,42 @@ export async function clearModelSetting(): Promise<void> {
   await sql`UPDATE app_settings SET llm_model = NULL, llm_reasoning = NULL, updated_at = now() WHERE id = 1`;
 }
 
+// ---- 打标模型（labeler.py 离线跑在 phoenix 上，Web 只存名字）----
+// 打标机用的是另一个上游地址（labeler.py 里的 LLM_URL），Web 侧无法探测，因此这里
+// 只做名字格式校验，不做保存前验证，也不读、不返回任何密钥或地址。留空表示「由打标机
+// 自己的 .env 决定」，这是缺省且向后兼容的路径。
+export interface LabelModelSetting {
+  /** 数据库覆盖值；null 表示未设置，打标机回落到它的 .env。 */
+  model: string | null;
+  updatedAt: string | null;
+}
+
+export async function readLabelModelSetting(): Promise<LabelModelSetting> {
+  const sql = getSql();
+  const rows = await sql`
+    SELECT label_model, label_model_updated_at FROM app_settings WHERE id = 1
+  ` as { label_model: string | null; label_model_updated_at: unknown }[];
+  const row = rows[0];
+  if (!row || !isValidModelName(row.label_model)) return { model: null, updatedAt: null };
+  return { model: row.label_model, updatedAt: isoTimestamp(row.label_model_updated_at) };
+}
+
+export async function writeLabelModelSetting(model: string): Promise<string | null> {
+  if (!isValidModelName(model)) throw new Error('invalid model name');
+  const sql = getSql();
+  const rows = await sql`
+    INSERT INTO app_settings (id, label_model, label_model_updated_at) VALUES (1, ${model}, now())
+    ON CONFLICT (id) DO UPDATE SET label_model = EXCLUDED.label_model,
+      label_model_updated_at = now()
+    RETURNING label_model_updated_at` as { label_model_updated_at: unknown }[];
+  return isoTimestamp(rows[0]?.label_model_updated_at);
+}
+
+export async function clearLabelModelSetting(): Promise<void> {
+  const sql = getSql();
+  await sql`UPDATE app_settings SET label_model = NULL, label_model_updated_at = NULL WHERE id = 1`;
+}
+
 /** GET 的响应体：数据库覆盖值优先，否则报告环境变量/缺省来源。 */
 export function modelSettingsPayload(stored: StoredModelSetting): LlmModelSettings {
   const fallback = environmentModel();

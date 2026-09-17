@@ -6,11 +6,14 @@ vi.mock('./db', () => ({ getSql: mocks.getSql }));
 
 import {
   DEFAULT_LLM_MODEL,
+  clearLabelModelSetting,
   clearModelSetting,
   environmentModel,
   isValidModelName,
   modelSettingsPayload,
+  readLabelModelSetting,
   readModelSetting,
+  writeLabelModelSetting,
   writeModelSetting,
 } from './app-settings';
 
@@ -180,5 +183,44 @@ describe('GET 响应体', () => {
     expect(modelSettingsPayload({ model: 'db-model', updatedAt: null, reasoning: 'yes' }).reasoning).toBe('yes');
     expect(modelSettingsPayload({ model: 'db-model', updatedAt: null, reasoning: 'unknown' }).reasoning).toBe('unknown');
     expect(modelSettingsPayload({ model: 'db-model', updatedAt: null, reasoning: null }).reasoning).toBe(null);
+  });
+});
+
+describe('打标模型设置', () => {
+  it('读不到行或值是脏值时报告未设置（由打标机的 .env 决定）', async () => {
+    db.resolve.mockResolvedValue([]);
+    expect(await readLabelModelSetting()).toEqual({ model: null, updatedAt: null });
+    db.resolve.mockResolvedValue([{ label_model: '坏 名字', label_model_updated_at: '2026-06-01T00:00:00.000Z' }]);
+    expect(await readLabelModelSetting()).toEqual({ model: null, updatedAt: null });
+  });
+
+  it('合法覆盖值带上独立的更新时间，不读 llm 那一列', async () => {
+    db.resolve.mockResolvedValue([{ label_model: 'vendor/label-1', label_model_updated_at: '2026-06-01T00:00:00.000Z' }]);
+    expect(await readLabelModelSetting()).toEqual({ model: 'vendor/label-1', updatedAt: '2026-06-01T00:00:00.000Z' });
+    expect(db.queries[0].text).toContain('label_model_updated_at');
+    expect(db.queries[0].text).not.toContain('llm_model');
+  });
+
+  it('写入前校验模型名，非法值不写库', async () => {
+    await expect(writeLabelModelSetting('bad name')).rejects.toThrow('invalid model name');
+    await expect(writeLabelModelSetting('')).rejects.toThrow('invalid model name');
+    expect(db.queries).toHaveLength(0);
+  });
+
+  it('写入只动 label_model 两列，不碰 llm_model / llm_reasoning', async () => {
+    db.resolve.mockResolvedValue([{ label_model_updated_at: '2026-06-01T00:00:00.000Z' }]);
+    expect(await writeLabelModelSetting('vendor/label-1')).toBe('2026-06-01T00:00:00.000Z');
+    const query = db.queries[0];
+    expect(query.text).toContain('label_model = EXCLUDED.label_model');
+    expect(query.text).not.toContain('llm_model');
+    expect(query.text).not.toContain('llm_reasoning');
+  });
+
+  it('清除覆盖值只清 label_model 两列', async () => {
+    await clearLabelModelSetting();
+    const query = db.queries[0];
+    expect(query.text).toContain('label_model = NULL');
+    expect(query.text).toContain('label_model_updated_at = NULL');
+    expect(query.text).not.toContain('llm_model');
   });
 });

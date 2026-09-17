@@ -10,6 +10,8 @@ export const LOGIN_USER_RATE_LIMIT = { scope: 'login-user', limit: 10, windowSec
 export const LOGIN_GLOBAL_RATE_LIMIT = { scope: 'login-global', limit: 100, windowSeconds: 600 } as const;
 export const OWNER_FAIL_SOURCE_RATE_LIMIT = { scope: 'owner-fail-source', limit: 10, windowSeconds: 900 } as const;
 export const OWNER_FAIL_GLOBAL_RATE_LIMIT = { scope: 'owner-fail-global', limit: 100, windowSeconds: 600 } as const;
+// 注册（设计 §4.4：每来源 5 次 / 小时，并受登录的全局认证预算限制）。失败的邀请码也计数。
+export const REGISTER_SOURCE_RATE_LIMIT = { scope: 'register-source', limit: 5, windowSeconds: 3600 } as const;
 
 export const GLOBAL_RATE_LIMIT_KEY = 'all';
 

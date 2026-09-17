@@ -10,8 +10,8 @@ describe('迁移入口与冷启动边界', () => {
     await expect(assertAuthSchema(sql as never)).rejects.toBeInstanceOf(AuthSchemaRequiredError);
     expect(sql).toHaveBeenCalledOnce(); expect(sql.mock.calls[0][0].join('')).toMatch(/^SELECT max\(version\)/);
   });
-  it('v5 校验只读；连接故障不会被伪装成缺迁移', async () => {
-    const sql = vi.fn().mockResolvedValue([{ version: 5 }]);
+  it('v6 校验只读；连接故障不会被伪装成缺迁移', async () => {
+    const sql = vi.fn().mockResolvedValue([{ version: 6 }]);
     await assertAuthSchema(sql as never);
     const error = { code: '08006' }; sql.mockRejectedValueOnce(error);
     await expect(assertAuthSchema(sql as never)).rejects.toBe(error);

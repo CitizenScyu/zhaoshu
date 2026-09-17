@@ -9,7 +9,9 @@
   python3 labeler.py --limit 100            # 给前 100 本书打标
   python3 labeler.py --dry-run              # 只列书目不打标
   python3 labeler.py --book /books/details3168.html   # 指定单本
-配置: /root/zhaoshu-labeler/.env（LLM_API_KEY / DATABASE_URL / LLM_MODEL）
+配置: /root/zhaoshu-labeler/.env（LLM_API_KEY 必填；DATABASE_URL 与 LLM_MODEL 可选）
+模型: 优先读数据库 app_settings.label_model（管理界面里改，改完下次运行生效）；
+      读不到或为空时回落到 .env 的 LLM_MODEL；--no-db-model 可跳过数据库只读。
 """
 import argparse
 import json
@@ -17,6 +19,7 @@ import os
 import re
 import sys
 import time
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -27,6 +30,9 @@ CHUNK_RETRY = 3             # 单章抓取重试
 LLM_INTERVAL_SEC = 30       # 两次 LLM 调用最小间隔（控频）
 CHAPTER_DELAY = 0.3         # 抓章节间隔（对目标站友好）
 RANKS = (1, 2, 3)           # 榜单页
+# 与 Web 端 app-settings 同一套保守字符集；不合规就当没设，不把它带进请求体。
+MODEL_NAME_RE = re.compile(r'^[A-Za-z0-9._/-]{1,200}$')
+DB_MODEL_TIMEOUT_SEC = 5    # 读配置失败必须快速回落，不能拖住批量任务
 BASE = 'https://book15.net'
 LLM_URL = 'https://api.cloud.us.kg/v1/chat/completions'
 UA = {'User-Agent': 'Mozilla/5.0 (compatible; zhaoshu-labeler/1.0)'}
@@ -54,10 +60,53 @@ def load_env():
             if line and not line.startswith('#') and '=' in line:
                 k, v = line.split('=', 1)
                 env[k.strip()] = v.strip()
-    missing = [k for k in ('LLM_API_KEY', 'LLM_MODEL') if not env.get(k)]
+    missing = [k for k in ('LLM_API_KEY',) if not env.get(k)]
     if missing:
         sys.exit(f'缺少环境变量: {missing}（应在 {ENV_PATH} 里）')
     return env
+
+
+def fetch_label_model_from_db(database_url: str) -> str | None:
+    """经 Neon 的 HTTP SQL 接口只读一行 app_settings.label_model。
+
+    打标机刻意不装 PG 驱动（见文件末尾说明），所以走 HTTPS；任何失败都返回 None 由调用方
+    回落到 .env。连接串只放在请求头里，不打印、不写日志。"""
+    if not database_url:
+        return None
+    parsed = urllib.parse.urlsplit(database_url)
+    if parsed.scheme not in ('postgres', 'postgresql') or not parsed.hostname:
+        return None
+    body = json.dumps({
+        'query': 'SELECT label_model FROM app_settings WHERE id = 1',
+        'params': [],
+    }).encode('utf-8')
+    req = urllib.request.Request(
+        f'https://{parsed.hostname}/sql', data=body, method='POST',
+        headers={'Content-Type': 'application/json',
+                 'Neon-Connection-String': database_url,
+                 'Neon-Raw-Text-Output': 'true'})
+    with urllib.request.urlopen(req, timeout=DB_MODEL_TIMEOUT_SEC) as res:
+        payload = json.loads(res.read().decode('utf-8'))
+    rows = payload.get('rows') or []
+    value = rows[0].get('label_model') if rows else None
+    if isinstance(value, str) and MODEL_NAME_RE.match(value):
+        return value
+    return None
+
+
+def resolve_label_model(env: dict, use_db: bool = True) -> tuple[str, str]:
+    """(模型名, 来源)。数据库优先，失败/为空回落 .env；两处都没有就退出。"""
+    if use_db:
+        try:
+            from_db = fetch_label_model_from_db(env.get('DATABASE_URL', ''))
+            if from_db:
+                return from_db, 'database'
+        except Exception as e:
+            print(f'  打标模型读取失败({type(e).__name__})，回落到 .env', file=sys.stderr)
+    fallback = env.get('LLM_MODEL', '')
+    if not fallback:
+        sys.exit(f'数据库没有 label_model，且 {ENV_PATH} 里没有 LLM_MODEL，无法确定打标模型')
+    return fallback, 'environment'
 
 
 def http_get(url: str, timeout: int = 30) -> str:
@@ -201,9 +250,12 @@ def main() -> int:
     ap.add_argument('--limit', type=int, default=100)
     ap.add_argument('--dry-run', action='store_true')
     ap.add_argument('--book', help='指定单本详情页路径，如 /books/details3168.html')
+    ap.add_argument('--no-db-model', action='store_true', help='不从数据库读打标模型，只用 .env 的 LLM_MODEL')
     args = ap.parse_args()
 
     env = load_env()
+    model, model_source = resolve_label_model(env, use_db=not args.no_db_model)
+    print(f'打标模型来源: {model_source}')
     # 断点续传：已写入 labels.jsonl 的书跳过（按详情页 url 判定）
     done_urls: set[str] = set()
     done_path = Path(__file__).parent / 'labels.jsonl'
@@ -240,7 +292,7 @@ def main() -> int:
                 print(f'  仅抓到 {chars} 字，跳过')
                 fail += 1
                 continue
-            labels = label_book(text, env['LLM_API_KEY'], env['LLM_MODEL'])
+            labels = label_book(text, env['LLM_API_KEY'], model)
             # 质量校验:错书(书名对不上)或文本质量异常都不写入
             # --book 单本模式没有榜单书名可比,跳过书名校验
             guess = labels.get('title_guess') or ''

@@ -14,6 +14,6 @@ try {
     await initializeAuthSchema(sql);
     await assertAuthSchema(sql);
     console.log(JSON.stringify({ phase: 'complete', ...await migrationMetadata(sql) }));
-    console.log('专用 TEST_DATABASE_URL 的认证 schema v5 迁移完成；没有使用业务 DATABASE_URL。');
+    console.log('专用 TEST_DATABASE_URL 的认证 schema v6 迁移完成；没有使用业务 DATABASE_URL。');
   }
 } catch (error) { reportDatabaseFailure(error); }

@@ -7,13 +7,13 @@ import ProfileTab from '@/components/ProfileTab';
 import ShuyuanTab from '@/components/ShuyuanTab';
 import LibraryTab, { createLibraryView } from '@/components/LibraryTab';
 import StatsTab from '@/components/StatsTab';
-import ModelSettingsTab from '@/components/ModelSettingsTab';
+import AdminTab from '@/components/AdminTab';
 import AuthForm from '@/components/AuthForm';
 import { OwnerProvider, useOwner } from '@/components/OwnerProvider';
 import type { Permission } from '@/lib/auth-client';
 import { createProfileDraft, profileDraftReducer } from '@/lib/profile-draft';
 
-type Tab = 'find' | 'shelf' | 'profile' | 'shuyuan' | 'library' | 'stats' | 'model';
+type Tab = 'find' | 'shelf' | 'profile' | 'shuyuan' | 'library' | 'stats' | 'admin';
 
 // 菜单按有效权限展示；隐藏只是呈现，服务端拒绝仍是最终保证（设计 §6.1）。
 const TABS: { key: Tab; label: string; permission: Permission | 'owner' }[] = [
@@ -23,7 +23,7 @@ const TABS: { key: Tab; label: string; permission: Permission | 'owner' }[] = [
   { key: 'shuyuan', label: '书源', permission: 'download' },
   { key: 'library', label: '书库', permission: 'find' },
   { key: 'stats', label: '统计', permission: 'find' },
-  { key: 'model', label: '模型', permission: 'owner' },
+  { key: 'admin', label: '管理', permission: 'owner' },
 ];
 
 export default function Home() {
@@ -46,7 +46,8 @@ function HomeContent() {
   useEffect(() => {
     const restoreTab = () => {
       const requested = new URLSearchParams(window.location.search).get('tab');
-      const next = TABS.find((entry) => entry.key === requested)?.key ?? 'find';
+      // 旧链接 ?tab=model 是原来的「模型」页，现在并入「管理」。
+      const next = TABS.find((entry) => entry.key === (requested === 'model' ? 'admin' : requested))?.key ?? 'find';
       queueMicrotask(() => setTab(next));
     };
     restoreTab();
@@ -170,7 +171,7 @@ function PrivateTabs({ tab }: { tab: Tab }) {
       {tab === 'shuyuan' && <ShuyuanTab />}
       {tab === 'library' && <LibraryTab view={libraryView} setView={setLibraryView} />}
       {tab === 'stats' && <StatsTab />}
-      {tab === 'model' && <ModelSettingsTab />}
+      {tab === 'admin' && <AdminTab />}
     </>
   );
 }

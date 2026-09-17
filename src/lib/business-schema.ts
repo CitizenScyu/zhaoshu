@@ -151,5 +151,11 @@ export async function initializeBusinessSchema(s: Sql) {
     // 那行已有内容。
     tx`
     ALTER TABLE app_settings ADD COLUMN IF NOT EXISTS llm_reasoning text`,
+    // 打标模型（labeler.py 在 phoenix 上离线跑；Web 只存名字，不读打标机的 .env）。
+    // 独立时间戳：改打标模型不会把 llm_model 那一栏的「更新时间」弄脏。
+    tx`
+    ALTER TABLE app_settings ADD COLUMN IF NOT EXISTS label_model text`,
+    tx`
+    ALTER TABLE app_settings ADD COLUMN IF NOT EXISTS label_model_updated_at timestamptz`,
   ]);
 }
