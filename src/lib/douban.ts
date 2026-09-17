@@ -49,6 +49,40 @@ async function searchSuggest(title: string, signal?: AbortSignal): Promise<Sugge
   );
 }
 
+// 精确找书（task-77）用到的检索原语。与 verifyBook 的区别是**用途**：
+// verifyBook 问「用户说的这本书是不是这本」（pickMatch 单条择一），
+// searchBooks 问「叫这个名字的东西有哪些」（全部返回，同名书让用户自己挑）。
+export interface DoubanCandidate {
+  doubanId: string;
+  title: string;
+  author: string;
+  doubanUrl: string;
+}
+
+// 建议接口正常情况下返回个位数；截断只为兜住异常响应，语义上不丢「同名书」。
+const MAX_BOOK_SEARCH_RESULTS = 10;
+
+// subject_suggest 是外部不可信数据：id 必须是纯数字才能拼进详情页 URL
+// （否则响应里的任意字符串会变成我们发出去的请求路径），标题必须有内容。
+function isSuggestItem(value: unknown): value is SuggestItem {
+  if (typeof value !== 'object' || value === null) return false;
+  const item = value as Partial<SuggestItem>;
+  return typeof item.id === 'string' && /^\d+$/.test(item.id) &&
+    typeof item.title === 'string' && item.title.trim().length > 0;
+}
+
+export async function searchBooks(title: string, signal?: AbortSignal): Promise<DoubanCandidate[]> {
+  const raw: unknown = await searchSuggest(title, signal);
+  if (!Array.isArray(raw)) return [];
+  return raw.filter(isSuggestItem).slice(0, MAX_BOOK_SEARCH_RESULTS).map((item) => ({
+    doubanId: item.id,
+    title: item.title.trim(),
+    author: typeof item.author_name === 'string' ? item.author_name.trim() : '',
+    // URL 由校验过的数字 id 拼出，不用响应里给的 url（外部数据不直接进前端 href）。
+    doubanUrl: `https://book.douban.com/subject/${item.id}/`,
+  }));
+}
+
 // 评分标记形如 <strong ... class="rating_num " property="v:average"> 8.5 </strong>,值两侧可能有空白
 export function parseRating(html: string): number | null {
   const rating = html.match(/rating_num[^>]*>\s*([\d.]+)\s*</)?.[1];
@@ -63,7 +97,9 @@ export function parseVotes(html: string): number | null {
   return count ? parseInt(count, 10) : null;
 }
 
-async function fetchSubjectRating(doubanId: string, signal?: AbortSignal) {
+// 导出给精确找书按需取评分（只抓候选详情页，不做存在性判定）。
+// 注意调用方：这里抛错就是「详情页没拿到」，不代表条目不存在——判定在 verifyBook 里。
+export async function fetchSubjectRating(doubanId: string, signal?: AbortSignal) {
   const html = await fetchWithTimeout(`https://book.douban.com/subject/${doubanId}/`, (response) => response.text(), 12_000, signal);
   return {
     rating: parseRating(html),

@@ -22,6 +22,9 @@ const policies: Record<string, Record<string, 'find' | 'read' | 'download' | 'ow
   download: { GET: 'download', POST: 'download', DELETE: 'download' },
   'download/[id]/file': { GET: 'download' }, export: { GET: 'find' },
   feedback: { GET: 'find', POST: 'find' }, find: { POST: 'find' },
+  // 精确找书（task-77）：与 /api/find 同为「找书」能力，且同样会向豆瓣发外部请求，
+  // 所以必须走同一套 withFindAccess（匿名必须在读写与外部副作用之前被拒）。
+  'find/exact': { POST: 'find' }, 'find/exact/shelf': { POST: 'find' },
   library: { GET: 'find' }, owner: { GET: 'legacy-owner' },
   profile: { GET: 'find', PUT: 'find', POST: 'find' },
   'read/[id]/[resource]': { GET: 'read' }, 'read/source/[resource]': { GET: 'read' },

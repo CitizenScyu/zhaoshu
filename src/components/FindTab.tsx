@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
+import { useEffect, useMemo, useReducer, useRef, useState, useSyncExternalStore } from 'react';
 import type { Candidate, RerankedItem, VerifiedCandidate, FeedbackStatus } from '@/lib/types';
 import { useOwner } from '@/components/OwnerProvider';
 import FeedbackForm from '@/components/FeedbackForm';
@@ -8,6 +8,23 @@ import ReadBookLink from '@/components/ReadBookLink';
 import { isRecord } from '@/lib/sanitize';
 import { EMPTY_HISTORY, historyKeyFor, historySnapshot, rememberQuery, subscribeHistory } from '@/lib/recent-queries';
 import { createElapsedTicker, recallProgressSuffix, retryLabel, retryStep, showRetry, type FindPhase, type FindStep } from '@/lib/find-progress';
+// 精确找书（task-77）：模式、状态机、文案全部在纯模块里，本文件只做 JSX 与请求编排。
+import {
+  EMPTY_EXACT_STATE,
+  canSubmitExact,
+  exactEmptyMessage,
+  exactFallbackQuery,
+  exactReducer,
+  exactResultNote,
+  initialShelfPhase,
+  parseExactResponse,
+  shelfButtonLabel,
+  shelfOutcome,
+  showExactEmpty,
+  type ExactBook,
+  type FindMode,
+  type ShelfPhase,
+} from '@/lib/find-exact';
 
 // 找书三步的后端下行是真 SSE：事件 `data: <json>\n\n`。phase/progress 实时帧、
 // result 结束帧、error 错误帧（带可识别 code）。SSE 断线/超时给用户可识别错误与重试入口。
@@ -76,6 +93,8 @@ type Phase = FindPhase;
 export default function FindTab() {
   const { apiFetch, user } = useOwner();
   const userId = user?.id ?? 0;
+  // 默认仍是口味推荐：精确找书是新增入口，不改变现有用户习惯。
+  const [mode, setMode] = useState<FindMode>('taste');
   // 最近搜索按身份分开；旧全局键只迁给已确认的 owner。
   const historyKey = useMemo(() => historyKeyFor(userId), [userId]);
   const [query, setQuery] = useState('');
@@ -274,6 +293,29 @@ export default function FindTab() {
 
   return (
     <div>
+      {/* 模式切换。两个面板都用 hidden 保持挂载：切回来时上一次的结果还在（同 page.tsx 的 tab）。
+          精确找书是**独立入口**，不改动右边口味推荐的任何语义。 */}
+      <div role="tablist" aria-label="找书模式" className="flex flex-wrap items-center gap-2 mb-5">
+        {([['taste', '口味推荐'], ['exact', '精确找书']] as [FindMode, string][]).map(([key, label]) => (
+          <button
+            key={key}
+            role="tab"
+            aria-selected={mode === key}
+            className={`chip ${mode === key ? 'chip-dai' : 'hover:text-[var(--cinnabar)]'} transition-colors`}
+            style={mode === key ? { fontWeight: 700 } : undefined}
+            onClick={() => setMode(key)}
+          >
+            {label}
+          </button>
+        ))}
+        <span className="text-xs" style={{ color: 'var(--ink-faint)' }}>
+          {mode === 'taste'
+            ? '描述你想看什么，模型按你的画像推荐。'
+            : '按书名直搜，命中就是这一本，不打模型。'}
+        </span>
+      </div>
+
+      <div hidden={mode !== 'taste'}>
       {/* 查询区 */}
       <div className="flex flex-col gap-3">
         <textarea
@@ -376,7 +418,213 @@ export default function FindTab() {
           ))}
         </div>
       )}
+      </div>
+
+      <div hidden={mode !== 'exact'}>
+        <ExactSearchSection
+          onFallback={(next) => { setQuery(next); setMode('taste'); }}
+        />
+      </div>
     </div>
+  );
+}
+
+// 精确找书面板（task-77）。状态机、文案选择、响应收窄全部来自 @/lib/find-exact——
+// 本仓 vitest 没有 jsdom，写在 JSX 里的判定测不到。
+function ExactSearchSection({ onFallback }: { onFallback: (query: string) => void }) {
+  const { apiFetch } = useOwner();
+  const [title, setTitle] = useState('');
+  const [author, setAuthor] = useState('');
+  const [state, dispatch] = useReducer(exactReducer, EMPTY_EXACT_STATE);
+  const request = useRef<AbortController | null>(null);
+  useEffect(() => () => { request.current?.abort(); }, [apiFetch]);
+
+  async function search() {
+    const q = title.trim();
+    if (!canSubmitExact(state.phase, q)) return;
+    request.current?.abort();
+    const controller = new AbortController();
+    request.current = controller;
+    dispatch({ type: 'submit', title: q });
+    try {
+      const res = await apiFetch('/api/find/exact', {
+        signal: controller.signal,
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ title: q, author: author.trim() }),
+      });
+      const payload: unknown = await res.json().catch(() => null);
+      if (controller.signal.aborted) return;
+      if (!res.ok) {
+        const message = isRecord(payload) && typeof payload.error === 'string' && payload.error
+          ? payload.error : '精确找书失败，请重试';
+        dispatch({ type: 'fail', message: `${message}（HTTP ${res.status}）` });
+        return;
+      }
+      dispatch({ type: 'settle', result: parseExactResponse(payload) });
+    } catch (e) {
+      if (controller.signal.aborted) return;
+      dispatch({ type: 'fail', message: e instanceof Error ? e.message : '精确找书失败，请重试' });
+    } finally {
+      if (request.current === controller) request.current = null;
+    }
+  }
+
+  const busy = state.phase === 'searching';
+  // 出路句用**本次提交**的书名，不是输入框当前值（用户可能已经改了框里的字）。
+  const fallback = exactFallbackQuery(state);
+
+  return (
+    <div>
+      <div className="flex flex-col gap-3">
+        <input
+          className="paper-input text-[15px] leading-7"
+          aria-label="书名"
+          placeholder="书名，例如：诡秘之主"
+          value={title}
+          onChange={(e) => setTitle(e.target.value)}
+          onKeyDown={(e) => { if (e.key === 'Enter') void search(); }}
+        />
+        <input
+          className="paper-input text-sm"
+          aria-label="作者（选填）"
+          placeholder="作者（选填，同名书多时用来区分）"
+          value={author}
+          onChange={(e) => setAuthor(e.target.value)}
+          onKeyDown={(e) => { if (e.key === 'Enter') void search(); }}
+        />
+        <div className="flex flex-wrap items-center gap-3">
+          <button
+            className="seal-button text-sm"
+            onClick={() => void search()}
+            disabled={!canSubmitExact(state.phase, title)}
+          >
+            {busy ? '检索中…' : '精确查找'}
+          </button>
+          <span className="text-xs" style={{ color: 'var(--ink-faint)' }}>
+            这里只输入书名，不要写口味描述（那属于「口味推荐」）。先查本地书库，没有再查豆瓣。
+          </span>
+        </div>
+      </div>
+
+      {busy && (
+        <div role="status" className="mt-8 flex items-center gap-4">
+          <div className="flex gap-1.5">
+            <span className="ink-drop" />
+            <span className="ink-drop" style={{ animationDelay: '0.18s' }} />
+            <span className="ink-drop" style={{ animationDelay: '0.36s' }} />
+          </div>
+          <span className="text-sm">正在查本地书库与豆瓣…</span>
+        </div>
+      )}
+
+      {state.phase === 'error' && (
+        <p role="alert" className="mt-6 text-sm" style={{ color: 'var(--cinnabar)' }}>✗ {state.error}</p>
+      )}
+
+      {showExactEmpty(state) && state.result && (
+        <div role="status" className="mt-8 flex flex-col gap-2">
+          <p className="text-sm">{exactEmptyMessage(state.result)}</p>
+          <p className="text-xs" style={{ color: 'var(--ink-faint)' }}>
+            也可以换个写法再试：去掉书名号或副标题，或把作者名填到下面一栏。
+          </p>
+          {fallback && (
+            <button className="chip chip-dai self-start" onClick={() => onFallback(fallback)}>
+              改用「口味推荐」找类似的书
+            </button>
+          )}
+        </div>
+      )}
+
+      {state.result && state.result.items.length > 0 && (
+        <div className="mt-8 space-y-4">
+          <p className="text-xs" style={{ color: 'var(--ink-faint)' }}>{exactResultNote(state.result)}</p>
+          {state.result.items.map((item, i) => (
+            <ExactBookCard key={`${item.source}-${item.doubanId ?? item.title}-${i}`} item={item} index={i} />
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// 精确找书的结果卡。复用 book-card / seal-outline 的既有视觉，但**不**沿用口味卡片的匹配分：
+// 精确命中没有模型打分，编一个分数出来就是假信息，这里改放来源标记（书库 / 豆瓣）。
+function ExactBookCard({ item, index }: { item: ExactBook; index: number }) {
+  const { apiFetch } = useOwner();
+  const [shelf, setShelf] = useState<ShelfPhase>(() => initialShelfPhase(item.onShelf));
+  const [note, setNote] = useState('');
+
+  async function addToShelf() {
+    if (shelf === 'saving' || shelf === 'saved') return;
+    setShelf('saving');
+    setNote('');
+    try {
+      const res = await apiFetch('/api/find/exact/shelf', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ title: item.title, author: item.author }),
+      });
+      const outcome = shelfOutcome(res.status);
+      setShelf(outcome);
+      if (outcome === 'error') setNote(`加入书架失败（HTTP ${res.status}）`);
+    } catch {
+      setShelf('error');
+      setNote('加入书架失败，请重试。');
+    }
+  }
+
+  return (
+    <article className="book-card pl-6 pr-5 py-5 ink-rise" style={{ animationDelay: `${0.1 + index * 0.07}s` }}>
+      <div className="flex items-start gap-4">
+        <div className="seal-outline w-14 h-14 shrink-0 flex-col">
+          <span className="text-sm font-bold leading-none">{item.source === 'library' ? '书库' : '豆瓣'}</span>
+        </div>
+
+        <div className="flex-1 min-w-0">
+          <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1">
+            <h3 className="text-lg font-bold">{item.title}</h3>
+            <span className="text-sm" style={{ color: 'var(--ink-faint)' }}>
+              {item.author || '作者未知'}
+              {item.category ? ` · ${item.category}` : ''}
+              {item.wordCount ? ` · ${item.wordCount}` : ''}
+            </span>
+          </div>
+
+          <p className="text-xs mt-1.5" style={{ color: 'var(--ink-faint)' }}>
+            {item.source === 'library'
+              ? '本地书库精确命中。'
+              : '来自豆瓣检索；豆瓣条目多为出版版本，网文常无条目。'}
+            {item.rating != null && ` 豆瓣评分 ${item.rating}`}
+            {item.ratingCount != null && ` · ${item.ratingCount} 人评价`}
+          </p>
+
+          <div className="mt-3 flex flex-wrap items-center gap-2">
+            <button
+              className="chip hover:border-[var(--cinnabar)] hover:text-[var(--cinnabar)] transition-colors !inline-flex min-h-11 items-center !px-4"
+              onClick={() => void addToShelf()}
+              disabled={shelf === 'saving' || shelf === 'saved'}
+              aria-pressed={shelf === 'saved'}
+            >
+              {shelfButtonLabel(shelf)}
+            </button>
+            {item.doubanUrl && (
+              <a
+                className="chip chip-dai !inline-flex min-h-11 items-center justify-center !px-4"
+                href={item.doubanUrl}
+                target="_blank"
+                rel="noreferrer"
+              >
+                豆瓣条目 →
+              </a>
+            )}
+            <ReadBookLink title={item.title} author={item.author} from="find" label="直接阅读" />
+          </div>
+
+          {note && <p className="mt-2 text-xs" role="alert" style={{ color: 'var(--cinnabar)' }}>{note}</p>}
+        </div>
+      </div>
+    </article>
   );
 }
 
