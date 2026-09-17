@@ -1,6 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { NextRequest } from 'next/server';
 
+// 本文件对真实墙钟敏感：每个用例都 vi.resetModules 后走一遍真实的认证链 + 路由模块
+// 图，机器被其他并行测试/代理占满时，亚秒级用例会被拖过 vitest 默认 5s testTimeout
+// （2026-09-17 flake 排查：失败全部卡在 ~5000-5112ms；超时用例遗留的 straggler 还会
+// 改写本文件共享的 current，让后续用例断言到错值）。只放宽本文件，不改全局缺省。
+vi.setConfig({ testTimeout: 30_000, hookTimeout: 30_000 });
+
 type Query = { text: string; values: unknown[] };
 
 // 只伪造 Neon 传输层：路由→db.ts→user-data.ts 的调用链、批次语句顺序、绑定参数

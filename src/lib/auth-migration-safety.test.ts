@@ -4,6 +4,12 @@ import { readFileSync } from 'node:fs';
 import { assertAuthSchema, AuthSchemaRequiredError } from './auth-store';
 import { requireUserId } from './user-data';
 
+// 三个用例组各 spawnSync 一个 node 子进程跑真实脚本（type-stripping 加载 TS 模块图，
+// 机器忙时冷启动可达数秒）。脚本本身已带 10s timeout，vitest 外层超时必须比它宽，
+// 否则并行饥饿时外层先到点、留下孤儿进程（2026-09-17 flake 排查：默认 5s testTimeout
+// 与脚本 10s timeout 倒挂）。只放宽本文件，不改全局缺省。
+vi.setConfig({ testTimeout: 30_000, hookTimeout: 30_000 });
+
 describe('迁移入口与冷启动边界', () => {
   it.each([3, 4, null])('版本 %s 不能被普通请求自动修复', async (version) => {
     const sql = vi.fn().mockResolvedValue([{ version }]);

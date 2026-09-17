@@ -1,6 +1,14 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { NextRequest } from 'next/server';
 
+// 本文件对真实墙钟敏感：每个用例都 vi.resetModules 后动态重载整张 next/server 路由
+// 模块图。多代理并行跑测试时 CPU/内存饥饿会把本该亚秒完成的用例拖过 vitest 默认
+// 5s testTimeout（2026-09-17 flake 排查：8 路并行 5/8 批失败，超时全部卡在
+// ~5000-5120ms，且逻辑上没有任何一处真等 5s），超时后被放弃的路由工作还会以
+// straggler 身份调用共享 mock，污染下一个用例的断言（"transaction 被调 3 次"）。
+// 只放宽本文件的超时，不改全局缺省。
+vi.setConfig({ testTimeout: 30_000, hookTimeout: 30_000 });
+
 // 只 mock 数据库和网络：实际经过 chatRobust → SSE 解析 → 画像/反馈路由。
 const mocks = vi.hoisted(() => ({
   ensureSchema: vi.fn(), getProfileForUser: vi.fn(), saveProfileForUser: vi.fn(),
