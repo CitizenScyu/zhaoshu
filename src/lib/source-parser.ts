@@ -29,6 +29,9 @@ export function sourceBookMatches(expected: SourceBookIdentity, actual: SourceBo
 // 分值越小越靠前；Number.POSITIVE_INFINITY 表示「不相似，淘汰」。
 const MIN_CONTAINMENT_LENGTH = 4;
 const MAX_EDIT_DISTANCE = 2;
+// 编辑距离档的最短书名门（R1）：2-3 字书名（活着/边城/三体）在距离 ≤2 内的近邻太多，
+// 全是无关书；两侧都达到该长度才允许用距离判相似，短名只走相等/去修饰/包含档。
+const MIN_EDIT_DISTANCE_TITLE_LENGTH = 4;
 
 // 去副标题/书名号等修饰后再比较：「书名（精品版）」「书名：修订版」→「书名」。
 function stripTitleDecorations(value: string): string {
@@ -53,7 +56,7 @@ function editDistance(a: string, b: string): number {
 /**
  * 期望书名 vs 候选（书名或别名任一）的相似档位。
  * 0 = 精确相等（含别名）；1 = 去副标题/书名号后相等；2 = 归一化互相包含；
- * 3 = 编辑距离 ≤2；Infinity = 不相似（负对照锚点：完全无关的书必须落这里）。
+ * 3 = 编辑距离 ≤2（两侧均 ≥4 字才启用）；Infinity = 不相似（负对照锚点：完全无关的书必须落这里）。
  */
 export function sourceTitleSimilarity(expectedTitle: string, candidate: SourceBookIdentity): number {
   const expected = normalizeSourceTitle(expectedTitle);
@@ -67,7 +70,8 @@ export function sourceTitleSimilarity(expectedTitle: string, candidate: SourceBo
     const shorter = actual.length < expected.length ? actual : expected;
     const longer = actual.length < expected.length ? expected : actual;
     if (shorter.length >= MIN_CONTAINMENT_LENGTH && longer.includes(shorter)) best = Math.min(best, 2);
-    if (editDistance(actual, expected) <= MAX_EDIT_DISTANCE) best = Math.min(best, 3);
+    if (actual.length >= MIN_EDIT_DISTANCE_TITLE_LENGTH && expected.length >= MIN_EDIT_DISTANCE_TITLE_LENGTH
+      && editDistance(actual, expected) <= MAX_EDIT_DISTANCE) best = Math.min(best, 3);
   }
   return best;
 }

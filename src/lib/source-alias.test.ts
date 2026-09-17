@@ -108,6 +108,24 @@ describe('sourceTitleSimilarity (fuzzy tier thresholds)', () => {
     expect(sourceTitleSimilarity('我有一座恐怖屋', { title: '我有一座恐布屋', author: 'x' })).toBe(3);
   });
 
+  it('requires both titles >= 4 chars for the edit-distance tier (R1: short names must not collect unrelated neighbors)', () => {
+    // 2-3 字书名的距离 1/2 近邻全是无关书：活着→活在、边城→边城纪、三体→三休。
+    // 这些必须淘汰（Infinity），否则 SOURCE_SIMILAR 候选会被短名近邻淹没。
+    expect(sourceTitleSimilarity('活着', { title: '活在', author: 'x' })).toBe(Number.POSITIVE_INFINITY);
+    expect(sourceTitleSimilarity('边城', { title: '边城纪', author: 'x' })).toBe(Number.POSITIVE_INFINITY);
+    expect(sourceTitleSimilarity('三体', { title: '三休', author: 'x' })).toBe(Number.POSITIVE_INFINITY);
+    // 短名仍可走相等（tier 0）与包含档（短侧 ≥4 才启用，短名同样不适用）。
+    expect(sourceTitleSimilarity('活着', { title: '活着', author: 'x' })).toBe(0);
+    expect(sourceTitleSimilarity('活着', { title: '活着的理由', author: 'x' })).toBe(Number.POSITIVE_INFINITY);
+  });
+
+  it('pins the edit-distance threshold at 2 (R2: widening to 5 must fail this test)', () => {
+    // 距离 3-5 的书名不允许进候选；MAX_EDIT_DISTANCE 改成 5 会让这两行变绿而红掉本用例。
+    expect(sourceTitleSimilarity('我有一座恐怖屋全本', { title: '我有一座恐布屋子读', author: 'x' })).toBe(Number.POSITIVE_INFINITY); // 距离 3
+    expect(sourceTitleSimilarity('全球高等学校', { title: '全球低等幼儿园', author: 'x' })).toBe(Number.POSITIVE_INFINITY); // 距离 4
+    expect(sourceTitleSimilarity('我有一座恐怖屋', { title: '我有一座恐布屋', author: 'x' })).toBe(3); // 距离 1 仍进
+  });
+
   it('rejects unrelated books entirely (negative control)', () => {
     expect(sourceTitleSimilarity('我有一座恐怖屋', { title: '全球高武', author: 'x' })).toBe(Number.POSITIVE_INFINITY);
     expect(sourceTitleSimilarity('我有一座恐怖屋', { title: '超神机械师', author: 'x', alias: '全球高武' })).toBe(Number.POSITIVE_INFINITY);
