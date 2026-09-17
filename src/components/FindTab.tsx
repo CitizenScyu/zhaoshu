@@ -7,6 +7,7 @@ import FeedbackForm from '@/components/FeedbackForm';
 import ReadBookLink from '@/components/ReadBookLink';
 import { isRecord } from '@/lib/sanitize';
 import { EMPTY_HISTORY, historyKeyFor, historySnapshot, rememberQuery, subscribeHistory } from '@/lib/recent-queries';
+import { createElapsedTicker, recallProgressSuffix, retryLabel, retryStep, showRetry, type FindPhase, type FindStep } from '@/lib/find-progress';
 
 // 找书三步的后端下行是真 SSE：事件 `data: <json>\n\n`。phase/progress 实时帧、
 // result 结束帧、error 错误帧（带可识别 code）。SSE 断线/超时给用户可识别错误与重试入口。
@@ -70,7 +71,7 @@ const EXAMPLE_POOL = [
 const HISTORY_SHOW = 4; // 同时展示的最近条数
 const CHIP_TOTAL = 6; // chips 总数上限（最近 + 随机示例）
 
-type Phase = 'idle' | 'recall' | 'verify' | 'rerank' | 'done' | 'error';
+type Phase = FindPhase;
 
 export default function FindTab() {
   const { apiFetch, user } = useOwner();
@@ -86,8 +87,27 @@ export default function FindTab() {
   const [candidates, setCandidates] = useState<Candidate[]>([]);
   const [results, setResults] = useState<RerankedItem[]>([]);
   const [error, setError] = useState('');
+  const [recallSeconds, setRecallSeconds] = useState(0); // recall 阶段已等待秒数
+  const [retryFrom, setRetryFrom] = useState<FindStep | null>(null); // 失败后可从哪一步起重试
   const request = useRef<AbortController | null>(null);
+  // 中间产物与本次查询参数：verify 结束帧的 verified 不进 state，只放 ref 供 rerank 重试接力。
+  const verifiedRef = useRef<VerifiedCandidate[]>([]);
+  const runCtxRef = useRef<{ q: string; conditions: string } | null>(null);
   useEffect(() => () => { request.current?.abort(); }, [apiFetch]);
+
+  // recall 阶段后端不发阶段推进事件，用前端计时器报「已等待 Xs」；phase 一变或组件卸载就清理，
+  // 本仓出过卸载后 timer 还在跑的缺陷。
+  useEffect(() => {
+    if (phase !== 'recall') return;
+    const ticker = createElapsedTicker({
+      now: () => Date.now(),
+      setInterval: (handler, ms) => window.setInterval(handler, ms),
+      clearInterval: (handle) => window.clearInterval(handle as number),
+      onTick: setRecallSeconds,
+    });
+    ticker.start();
+    return () => ticker.stop();
+  }, [phase]);
   const history = useSyncExternalStore(subscribeHistory, () => historySnapshot(historyKey), () => EMPTY_HISTORY);
 
   const recent = history.slice(0, HISTORY_SHOW);
@@ -105,50 +125,81 @@ export default function FindTab() {
     const q = query.trim();
     if (!q || phase === 'recall' || phase === 'verify' || phase === 'rerank') return;
     rememberQuery(historyKey, q);
-    setPhase('recall');
-    setError('');
-    setCandidates([]);
-    setResults([]);
-    setVerifyTotal(0);
-    setVerifyDone(0);
-    setSourceProgress(null);
-    const controller = new AbortController();
-    request.current = controller;
-
     // 勾选「仅本次有效」：本次输入走 conditions 通道（soft 约束、不写入长期画像/不入记忆）；
     // 未勾 = 长期通道（conditions 传空），行为同现状。
-    const conditions = onlyThisTime ? q : '';
-    const stepBody = (step: string, extra: Record<string, unknown> = {}) => JSON.stringify({
+    runCtxRef.current = { q, conditions: onlyThisTime ? q : '' };
+    await runFrom('recall');
+  }
+
+  // 失败重试：从失败那一步重来。recall/verify 已成功的产物直接从 state/ref 接力，
+  // 不再为前面的步骤重复付 LLM 钱；全新查询仍从 recall 起。
+  function retry() {
+    if (!retryFrom || phase === 'recall' || phase === 'verify' || phase === 'rerank') return;
+    void runFrom(retryFrom);
+  }
+
+  async function runFrom(start: FindStep) {
+    const ctx = runCtxRef.current;
+    if (!ctx) return;
+    const { q, conditions } = ctx;
+    const stepBody = (step: FindStep, extra: Record<string, unknown> = {}) => JSON.stringify({
       step, query: q, conditions, ...extra,
     });
 
+    setError('');
+    setRetryFrom(null);
+    setPhase(start);
+    let recalled: Candidate[] = start === 'recall' ? [] : candidates;
+    let verified: VerifiedCandidate[] = start === 'rerank' ? verifiedRef.current : [];
+    if (start === 'recall') {
+      setCandidates([]);
+      setResults([]);
+      setRecallSeconds(0);
+      verifiedRef.current = [];
+    }
+    if (start !== 'rerank') {
+      setVerifyTotal(0);
+      setVerifyDone(0);
+      setSourceProgress(null);
+    }
+    const controller = new AbortController();
+    request.current = controller;
+    let at: FindStep = start; // 当前在跑哪一步：失败时据此决定重试起点
+
     try {
       // 1) recall：消费流，拿到 candidates。
-      const recalled = await fetchStepResult<Candidate[]>(
-        controller.signal,
-        () => apiFetch('/api/find', {
-          signal: controller.signal, method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: stepBody('recall'),
-        }),
-        'candidates',
-      );
-      setCandidates(recalled);
-      setPhase('verify');
+      if (start === 'recall') {
+        recalled = await fetchStepResult<Candidate[]>(
+          controller.signal,
+          () => apiFetch('/api/find', {
+            signal: controller.signal, method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: stepBody('recall'),
+          }),
+          'candidates',
+        );
+        setCandidates(recalled);
+      }
 
       // 2) verify：实时 progress 帧更新进度；结束帧返回 verified。
-      const verified = await fetchStepResult<VerifiedCandidate[]>(
-        controller.signal,
-        () => apiFetch('/api/find', {
-          signal: controller.signal, method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: stepBody('verify', { candidates: recalled }),
-        }),
-        'verified',
-      );
-      setPhase('rerank');
+      if (start !== 'rerank') {
+        at = 'verify';
+        setPhase('verify');
+        verified = await fetchStepResult<VerifiedCandidate[]>(
+          controller.signal,
+          () => apiFetch('/api/find', {
+            signal: controller.signal, method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: stepBody('verify', { candidates: recalled }),
+          }),
+          'verified',
+        );
+        verifiedRef.current = verified;
+      }
 
       // 3) rerank：结束帧带 items（+persisted）。
+      at = 'rerank';
+      setPhase('rerank');
       const items = await fetchStepResult<RerankedItem[]>(
         controller.signal,
         () => apiFetch('/api/find', {
@@ -166,6 +217,7 @@ export default function FindTab() {
       const code = (e as Error & { code?: string }).code;
       const base = e instanceof Error ? e.message : '未知错误';
       setError(code ? `${base}（${code}）` : base);
+      setRetryFrom(retryStep(at, { candidates: recalled.length, verified: verified.length }));
       setPhase('error');
     } finally {
       if (request.current === controller) request.current = null;
@@ -215,7 +267,7 @@ export default function FindTab() {
 
   const busy = phase === 'recall' || phase === 'verify' || phase === 'rerank';
   const steps: { key: Phase; label: string }[] = [
-    { key: 'recall', label: `召回${candidates.length ? ` ${candidates.length} 本` : ''}` },
+    { key: 'recall', label: `召回${candidates.length ? ` ${candidates.length} 本` : ''}${recallProgressSuffix(phase, recallSeconds)}` },
     { key: 'verify', label: sourceProgress ? `书源补验 ${sourceProgress.done}/${sourceProgress.total}` : `豆瓣验证${verifyTotal ? ` ${verifyDone}/${verifyTotal}` : ''}` },
     { key: 'rerank', label: '按画像重排' },
   ];
@@ -297,9 +349,20 @@ export default function FindTab() {
       )}
 
       {(phase === 'error' || error) && (
-        <p role="alert" className="mt-6 text-sm" style={{ color: 'var(--cinnabar)' }}>
-          ✗ {error}
-        </p>
+        <div className="mt-6 flex flex-wrap items-center gap-3">
+          <p role="alert" className="text-sm" style={{ color: 'var(--cinnabar)' }}>
+            ✗ {error}
+          </p>
+          {showRetry(phase, retryFrom) && retryFrom && (
+            <button
+              className="chip hover:border-[var(--cinnabar)] hover:text-[var(--cinnabar)] transition-colors"
+              onClick={retry}
+              disabled={busy}
+            >
+              {retryLabel(retryFrom)}
+            </button>
+          )}
+        </div>
       )}
 
       {/* 结果 */}
