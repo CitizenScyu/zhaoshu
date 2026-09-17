@@ -242,6 +242,29 @@ describe('POST /api/auth/register 三态', () => {
     expect(res.status).toBe(503);
   });
 
+  it('23505 但约束名缺失（null / undefined）→ 503，绝不兜底成 USERNAME_TAKEN', async () => {
+    // 任务书：只有 constraint 明确等于 users_username_key 才 409，其余（含未知/为空）一律 503。
+    // 兜底成 409 会把「服务端唯一键语义变了」伪装成「用户名被占用」，排查方向直接跑偏。
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    for (const error of [
+      Object.assign(new Error('duplicate key'), { code: '23505', constraint: null }),
+      Object.assign(new Error('duplicate key'), { code: '23505' }), // 驱动没回传 constraint 字段
+    ]) {
+      mockRegisterDb(null);
+      db.resolve.mockImplementation((query) => {
+        if (query.text.includes('auth_rate_limits')) return [{ attempts: 1, retry_after_seconds: 0 }];
+        throw error;
+      });
+      const res = await POST(req(GOOD));
+      expect(res.status).toBe(503);
+      expect((await res.json()).code).toBe('AUTH_DB_UNAVAILABLE');
+      // 未知约束名不能静默：留在服务端日志里，方便和 Neon 的真实回传对照。
+      expect(errorSpy).toHaveBeenCalledWith('registration hit an unexpected unique violation', { constraint: null });
+    }
+    expect(errorSpy).toHaveBeenCalledTimes(2);
+    errorSpy.mockRestore();
+  });
+
   it('数据库不可用 → 503，不下发 Cookie', async () => {
     mocks.ensureAuthSchema.mockRejectedValue(new Error('down'));
     const res = await POST(req(GOOD));

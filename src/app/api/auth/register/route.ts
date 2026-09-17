@@ -175,13 +175,15 @@ export async function POST(req: NextRequest) {
   } catch (error) {
     const code = error && typeof error === 'object' && 'code' in error ? error.code : null;
     // 23505 = 唯一索引冲突。注册路径上只可能是 users.username（邀请码摘要是查询条件不是插入值，
-    // 会话 token 是 256 位随机值），所以按用户名占用回话；约束名不符时按服务端故障处理，
-    // 不把真实原因冒充成用户名冲突。
+    // 会话 token 是 256 位随机值），但**只有约束名明确等于 users_username_key 才回 409**。
+    // 约束名为空（null/undefined）或别的一律按服务端故障处理：注册路径上出现未知的唯一键冲突
+    // 本身就是异常，冒充成「用户名已被占用」会把排查引向完全错误的方向（任务书：其他 23505 → 503）。
     if (code === '23505') {
       const constraint = error && typeof error === 'object' && 'constraint' in error ? error.constraint : null;
-      if (constraint === null || constraint === undefined || constraint === 'users_username_key') {
+      if (constraint === 'users_username_key') {
         return authError(409, 'USERNAME_TAKEN', '用户名不可用');
       }
+      console.error('registration hit an unexpected unique violation', { constraint: constraint ?? null });
       return authError(503, 'AUTH_DB_UNAVAILABLE', 'authentication service unavailable');
     }
     // 23514 = CHECK 违约。用户侧输入早已逐项校验过，这里再犯就是服务端缺陷（例如曾经的
