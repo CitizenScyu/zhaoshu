@@ -2,6 +2,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { parseLlmUsage, reasoningTokenCount } from './llm-usage';
 import { consumeSseChunk } from './llm';
 
+// 第二个 describe 在 beforeEach 里动态 import('./llm')；机器被并行测试/代理占满时
+// 模块求值的墙钟会被拉长（2026-09-17 flake 排查：默认 5s testTimeout 在并行下偶发
+// 到点，重跑即绿）。假时钟用例本身仍是确定性的、毫秒级完成。只放宽本文件。
+vi.setConfig({ testTimeout: 30_000, hookTimeout: 30_000 });
+
 const rawUsage = {
   prompt_tokens: 120, completion_tokens: 30, total_tokens: 150,
   prompt_tokens_details: { cached_tokens: 50 }, cache_creation_input_tokens: 12,
