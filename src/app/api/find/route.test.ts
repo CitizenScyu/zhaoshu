@@ -26,6 +26,7 @@ vi.mock('@/lib/llm', async (importOriginal) => ({
 vi.mock('@/lib/douban', () => ({ verifyBatch: mocks.verifyBatch }));
 vi.mock('@/lib/source-verification', () => ({ supplementSourceEvidence: mocks.supplementSourceEvidence }));
 import { LlmError } from '@/lib/llm';
+import { rerankSystem } from '@/lib/prompts';
 import { POST } from './route';
 
 const candidate = {
@@ -288,6 +289,24 @@ describe('POST /api/find output contract', () => {
     expect(rerankPrompt.match(/"title":"ＡＢＣ"/g)).toHaveLength(1);
     expect(rerankPrompt.match(/"title":"abc"/g)).toHaveLength(1);
     expect(mocks.persistRecommendationsForUser).toHaveBeenCalledWith(1, '找书', data.items, expect.any(Function));
+  });
+
+  // T55-6 收尾：喂给重排模型的投影必须与系统提示词声明可用的字段一致。
+  // 判别力：给投影加字段（或改回 JSON.stringify(verified)）→ 键列表断言失败；
+  // 提示词里残留模型看不到的字段名（sourceEvidence / why）→ 下面两条断言失败。
+  it('sends the rerank model exactly the fields the system prompt declares', async () => {
+    mocks.chatRobust.mockResolvedValue(JSON.stringify({ items: [item] }));
+    await consumeSSE(await POST(request({ step: 'rerank', query: '找书', verified: [verified] })));
+    const rerankPrompt = mocks.chatRobust.mock.calls[0][1] as string;
+    const embedded = /# 候选书[^\n]*\n\n([\s\S]*?)\n\n请重排输出最终推荐/.exec(rerankPrompt)?.[1];
+    expect(embedded).toBeTruthy();
+    const parsed = JSON.parse(embedded!) as Record<string, unknown>[];
+    expect(Object.keys(parsed[0])).toEqual(['title', 'author', 'category', 'wordCount', 'douban']);
+    const system = rerankSystem();
+    for (const field of ['title', 'author', 'category', 'wordCount']) expect(system).toContain(field);
+    expect(system).toContain('豆瓣验证结果');
+    expect(system).not.toContain('sourceEvidence');
+    expect(rerankPrompt).not.toContain('sourceEvidence');
   });
 
   it.each([null, '', false, true])('does not persist an invalid score %j', async (matchScore) => {
