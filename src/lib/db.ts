@@ -5,7 +5,7 @@ import { assertAuthSchema } from './auth-store';
 import { initializeBusinessSchema } from './business-schema';
 import type { PersonalWriter } from './personal-write';
 import { requireUserId, profileForUserQuery, saveProfileForUserQuery, excludedBooksForUserQuery, persistRecommendationsForUserQueries, feedbackForUserQueries, feedbackSnapshotForUserQuery } from './user-data';
-import { canonicalBookKey } from './book-identity';
+export { canonicalBookKey } from './book-identity';
 
 const DATABASE_URL = process.env.DATABASE_URL;
 
@@ -165,11 +165,6 @@ export async function saveProfileForUser(
   if (typeof write !== 'function') throw new Error('authorized writer is required');
   const rows = (await write((sql) => [saveProfileForUserQuery(sql, userId, seeds, content, expectedUpdatedAt)]))[0] as { updated_at: string }[];
   return rows[0]?.updated_at ?? null;
-}
-
-export async function getExcludedBookKeysForUser(userId: number): Promise<string[]> {
-  const rows = await getExcludedBookTitlesForUser(userId);
-  return rows.map((row) => canonicalBookKey(row.title, row.author));
 }
 
 export async function getExcludedBookTitlesForUser(userId: number): Promise<{ title: string; author: string }[]> {

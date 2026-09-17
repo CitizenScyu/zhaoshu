@@ -6,7 +6,7 @@ import type { ProfileSnapshot } from '@/lib/types';
 const mocks = vi.hoisted(() => ({
   ensureSchema: vi.fn(), getSql: vi.fn(), session: vi.fn(),
   getProfileForUser: vi.fn(), saveProfileForUser: vi.fn(), recordFeedbackForUser: vi.fn(), getFeedbackSnapshotForUser: vi.fn(),
-  getExcludedBookKeysForUser: vi.fn(), getExcludedBookTitlesForUser: vi.fn(), persistRecommendationsForUser: vi.fn(),
+  getExcludedBookTitlesForUser: vi.fn(), persistRecommendationsForUser: vi.fn(),
   chat: vi.fn(), verify: vi.fn(),
 }));
 vi.mock('@/lib/db', () => mocks);
@@ -54,7 +54,7 @@ describe('32.1 真实权限入口与可信用户绑定（数据库状态为夹�
     });
     mocks.recordFeedbackForUser.mockResolvedValue(undefined);
     mocks.getFeedbackSnapshotForUser.mockResolvedValue({ version: 0, status: null, note: '' });
-    mocks.getExcludedBookKeysForUser.mockResolvedValue([]); mocks.getExcludedBookTitlesForUser.mockResolvedValue([]);
+    mocks.getExcludedBookTitlesForUser.mockResolvedValue([]);
     mocks.persistRecommendationsForUser.mockResolvedValue(undefined);
     mocks.chat.mockResolvedValue({ content: '有效生成稿' });
     mocks.verify.mockResolvedValue([{ status: 'not_found', found: false }]);
@@ -95,8 +95,9 @@ describe('32.1 真实权限入口与可信用户绑定（数据库状态为夹�
     mocks.chat.mockResolvedValueOnce({ content: JSON.stringify({ candidates: [candidate] }) });
     await events(await find.POST(request('find', 'POST', { step: 'recall', query: '找书', userId: 3 })));
     expect(mocks.getProfileForUser).toHaveBeenCalledWith(2);
-    expect(mocks.getExcludedBookKeysForUser).toHaveBeenCalledWith(2);
+    // P2-1 后排除集合只发一条查询（keys 从其结果在内存派生）。
     expect(mocks.getExcludedBookTitlesForUser).toHaveBeenCalledWith(2);
+    expect(mocks.getExcludedBookTitlesForUser).toHaveBeenCalledTimes(1);
     expect(mocks.chat.mock.calls[0][1]).toContain('USER-2-PRIVATE');
     expect(mocks.chat.mock.calls[0][1]).not.toMatch(/OWNER-PRIVATE|USER-3-PRIVATE/);
     mocks.chat.mockResolvedValueOnce({ content: JSON.stringify({ items: [item] }) });

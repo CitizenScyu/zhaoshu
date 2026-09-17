@@ -7,7 +7,7 @@ const mocks = vi.hoisted(() => ({
   after: vi.fn(), pending: [] as (() => Promise<void>)[],
   ensureSchema: vi.fn(), getProfileForUser: vi.fn(), saveProfileForUser: vi.fn(),
   getSql: vi.fn(), businessSql: vi.fn(), transaction: vi.fn(),
-  getExcludedBookKeysForUser: vi.fn(), getExcludedBookTitlesForUser: vi.fn(), persistRecommendationsForUser: vi.fn(),
+  getExcludedBookTitlesForUser: vi.fn(), persistRecommendationsForUser: vi.fn(),
   neon: vi.fn(), usageSql: vi.fn(), verifyBatch: vi.fn(), getFeedbackSnapshotForUser: vi.fn(),
 }));
 vi.mock('next/server', async (importOriginal) => ({
@@ -26,7 +26,7 @@ vi.mock('@/lib/db', async (importOriginal) => ({
   ensureSchema: mocks.ensureSchema, getProfileForUser: mocks.getProfileForUser, saveProfileForUser: mocks.saveProfileForUser,
   getSql: mocks.getSql,
   getFeedbackSnapshotForUser: mocks.getFeedbackSnapshotForUser,
-  getExcludedBookKeysForUser: mocks.getExcludedBookKeysForUser, getExcludedBookTitlesForUser: mocks.getExcludedBookTitlesForUser,
+  getExcludedBookTitlesForUser: mocks.getExcludedBookTitlesForUser,
   persistRecommendationsForUser: mocks.persistRecommendationsForUser,
 }));
 vi.mock('@/lib/douban', () => ({ verifyBatch: mocks.verifyBatch }));
@@ -134,7 +134,6 @@ describe('usage instrumentation through all model routes', () => {
     mocks.ensureSchema.mockResolvedValue(undefined);
     mocks.getProfileForUser.mockResolvedValue({ seeds: [{ title: '种子书', kind: 'love' }], content: '原画像', updatedAt: 'v1' });
     mocks.saveProfileForUser.mockResolvedValue('v2');
-    mocks.getExcludedBookKeysForUser.mockResolvedValue([]);
     mocks.getExcludedBookTitlesForUser.mockResolvedValue([]);
     mocks.persistRecommendationsForUser.mockResolvedValue(undefined);
     mocks.getFeedbackSnapshotForUser.mockResolvedValue({ version: 0, status: null, note: '' });

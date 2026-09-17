@@ -1,21 +1,19 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { NextRequest } from 'next/server';
-import { bookKey } from '@/lib/sanitize';
 
 const mocks = vi.hoisted(() => ({
   ensureSchema: vi.fn(),
   getProfileForUser: vi.fn(),
-  getExcludedBookKeysForUser: vi.fn(),
   getExcludedBookTitlesForUser: vi.fn(),
   persistRecommendationsForUser: vi.fn(),
   chatRobust: vi.fn(),
   verifyBatch: vi.fn(),
   supplementSourceEvidence: vi.fn(),
 }));
-vi.mock('@/lib/db', () => ({
+vi.mock('@/lib/db', async (original) => ({
+  ...await original<typeof import('@/lib/db')>(),
   ensureSchema: mocks.ensureSchema,
   getProfileForUser: mocks.getProfileForUser,
-  getExcludedBookKeysForUser: mocks.getExcludedBookKeysForUser,
   getExcludedBookTitlesForUser: mocks.getExcludedBookTitlesForUser,
   persistRecommendationsForUser: mocks.persistRecommendationsForUser,
 }));
@@ -72,7 +70,6 @@ describe('POST /api/find output contract', () => {
     vi.stubEnv('APP_OWNER_TOKEN', 'find-test-owner');
     mocks.ensureSchema.mockResolvedValue(undefined);
     mocks.getProfileForUser.mockResolvedValue({ seeds: [], content: '画像' });
-    mocks.getExcludedBookKeysForUser.mockResolvedValue([]);
     mocks.getExcludedBookTitlesForUser.mockResolvedValue([]);
     mocks.persistRecommendationsForUser.mockResolvedValue(undefined);
     mocks.verifyBatch.mockImplementation(async (candidates: unknown[]) => candidates.map(() => douban));
@@ -231,7 +228,7 @@ describe('POST /api/find output contract', () => {
 
   it('uses title + author for authored seeds and read/dropped records', async () => {
     mocks.getProfileForUser.mockResolvedValue({ seeds: [{ ...candidate, kind: 'drop' }], content: '画像' });
-    mocks.getExcludedBookKeysForUser.mockResolvedValue([bookKey('已读书', '作者甲')]);
+    mocks.getExcludedBookTitlesForUser.mockResolvedValue([{ title: '已读书', author: '作者甲' }]);
     mocks.chatRobust.mockResolvedValue(JSON.stringify({ candidates: [
       candidate,
       { ...candidate, author: '作者乙' },
@@ -251,7 +248,6 @@ describe('POST /api/find output contract', () => {
   it('recall 提示词里的已排除书单封顶 50 条，超出部分只报数量', async () => {
     const shelf = Array.from({ length: 60 }, (_, i) => ({ title: `架上书${i}`, author: '作者甲' }));
     mocks.getProfileForUser.mockResolvedValue({ seeds: [{ title: '种子书', author: '作者乙', kind: 'love' }], content: '画像' });
-    mocks.getExcludedBookKeysForUser.mockResolvedValue(shelf.map((b) => bookKey(b.title, b.author)));
     mocks.getExcludedBookTitlesForUser.mockResolvedValue(shelf);
     mocks.chatRobust.mockResolvedValue(JSON.stringify({ candidates: [
       candidate,
@@ -291,6 +287,26 @@ describe('POST /api/find output contract', () => {
     const prompt = mocks.chatRobust.mock.calls[0][1] as string;
     expect(prompt).toContain('- 《架上书》 作者甲');
     expect(prompt).not.toContain('已排除的书未列出');
+  });
+
+  // P2-1：排除集合（硬过滤 keys + 软约束书单）都从**同一次** excludedBooksForUserQuery 结果派生。
+  // 判别力：退回「keys/titles 各查一次」的写法时调用次数为 2，本用例必须失败。
+  it('排除集合只查一次库：keys 与提示词书单共用一次查询结果', async () => {
+    mocks.getExcludedBookTitlesForUser.mockResolvedValue([
+      { title: '已读书', author: '作者甲' },
+      { title: '弃书', author: '作者乙' },
+    ]);
+    mocks.chatRobust.mockResolvedValue(JSON.stringify({ candidates: [
+      candidate,
+      { ...candidate, title: '已读书' }, // 必须被硬过滤掉（keys 从同一份结果派生）
+    ] }));
+    const events = await consumeSSE(await POST(request({ step: 'recall', query: '找书' })));
+    expect(mocks.getExcludedBookTitlesForUser).toHaveBeenCalledTimes(1);
+    expect(lastEvent<{ candidates: typeof candidate[] }>(events, 'result').candidates).toEqual([{ ...candidate, source: 'llm' }]);
+    // 两本都进了软约束清单（同一份结果，不再二次查询）
+    const prompt = mocks.chatRobust.mock.calls[0][1] as string;
+    expect(prompt).toContain('- 《已读书》 作者甲');
+    expect(prompt).toContain('- 《弃书》 作者乙');
   });
 
   it('verifies each canonical pair only once and keeps response metadata aligned', async () => {
