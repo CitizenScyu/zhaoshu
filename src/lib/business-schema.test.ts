@@ -51,6 +51,21 @@ describe('业务 schema 的运行时 DDL', () => {
     expect(createIndex).toBeLessThan(alterIndex);
   });
 
+  // task-69：默认值那一层。删掉这三条 ALTER → 本用例必须失败；老库没有这些列，
+  // 读库就会抛错（列不存在），管理台整页 503。
+  it('幂等地补出 app_settings 默认值那三列，且排在建表之后', async () => {
+    const { statements, sql } = recorder();
+    await initializeBusinessSchema(sql as never);
+    const createIndex = statements.findIndex((text) => /CREATE TABLE IF NOT EXISTS app_settings/.test(text));
+    expect(createIndex).toBeGreaterThan(-1);
+    for (const column of ['default_model', 'default_model_reasoning', 'default_model_updated_at']) {
+      const index = statements.findIndex((text) =>
+        /ALTER TABLE app_settings/.test(text) && new RegExp(`ADD COLUMN IF NOT EXISTS\\s+${column}\\b`).test(text));
+      expect(index, `缺少幂等补列 ${column}`).toBeGreaterThan(-1);
+      expect(index).toBeGreaterThan(createIndex);
+    }
+  });
+
   it('不动 app_settings 已有行（单行记录不能被这条补列破坏）', async () => {
     const { statements, sql } = recorder();
     await initializeBusinessSchema(sql as never);

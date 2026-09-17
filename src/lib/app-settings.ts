@@ -24,12 +24,20 @@ export const REASONING_CONFIRMATION_CODE = 'REASONING_MODEL_REQUIRES_CONFIRMATIO
 
 export interface LlmModelSettings {
   model: string;
-  /** 「恢复默认」会回到的模型（环境变量或硬编码缺省）。 */
+  /**
+   * 「恢复默认」会回到的模型，也就是 llm_model 没有覆盖值时的生效值。
+   * 解析顺序：库内 default_model → 环境变量 LLM_MODEL → 硬编码 DEFAULT_LLM_MODEL。
+   */
   defaultModel: string;
+  /** 当前生效模型（model）的来源。数据库覆盖 → 库内默认值 → 环境变量 → 硬编码缺省。 */
   source: LlmModelSource;
-  /** 数据库覆盖值的写入时间；没有覆盖时为 null。 */
+  /** 默认值（defaultModel）自己的来源，与 source 相互独立（见 resolveDefaultModel）。 */
+  defaultSource: LlmModelSource;
+  /** llm_model 覆盖值的写入时间；没有覆盖时为 null。 */
   updatedAt: string | null;
-  /** 保存前验证的推理判定；GET 不做探测，固定为 null（未知）。见 ReasoningVerdict。 */
+  /** default_model 覆盖值的写入时间；没有覆盖时为 null。 */
+  defaultUpdatedAt: string | null;
+  /** 当前生效模型的推理判定；来源不是数据库时为 null（环境变量里的模型从没探测过）。 */
   reasoning: ReasoningVerdict | null;
 }
 
@@ -48,10 +56,24 @@ export function environmentModel(): { model: string; source: 'environment' | 'de
 }
 
 export interface StoredModelSetting {
+  /** llm_model 覆盖值：当前模型的覆盖。 */
   model: string | null;
   updatedAt: string | null;
-  /** 上次保存前验证观测到的推理结论；GET 与刷新后的页面靠它显示告警。 */
+  /** 上次保存 llm_model 前验证观测到的推理结论。 */
   reasoning: ReasoningVerdict | null;
+  /** default_model 覆盖值：llm_model 没有覆盖值时用的那个模型。 */
+  defaultModel: string | null;
+  defaultModelUpdatedAt: string | null;
+  /** 上次保存 default_model 前验证观测到的推理结论（默认值真的生效时才会被报告）。 */
+  defaultReasoning: ReasoningVerdict | null;
+}
+
+/** 一行都没读到时的空设置：全部回落到环境变量/硬编码缺省。 */
+export function emptyModelSetting(): StoredModelSetting {
+  return {
+    model: null, updatedAt: null, reasoning: null,
+    defaultModel: null, defaultModelUpdatedAt: null, defaultReasoning: null,
+  };
 }
 
 // timestamptz 实际取值可能是字符串或 Date，两种都收敛成 ISO 字符串。
@@ -69,17 +91,33 @@ function storedVerdict(value: unknown): ReasoningVerdict | null {
 export async function readModelSetting(): Promise<StoredModelSetting> {
   const sql = getSql();
   const rows = await sql`
-    SELECT llm_model, llm_reasoning, updated_at FROM app_settings WHERE id = 1
-  ` as { llm_model: string | null; llm_reasoning: string | null; updated_at: unknown }[];
+    SELECT llm_model, llm_reasoning, updated_at,
+      default_model, default_model_reasoning, default_model_updated_at
+    FROM app_settings WHERE id = 1
+  ` as {
+    llm_model: string | null; llm_reasoning: string | null; updated_at: unknown;
+    default_model: string | null; default_model_reasoning: string | null; default_model_updated_at: unknown;
+  }[];
   const row = rows[0];
-  // 库里的值只可能由 PATCH 写入；不合法就当没有覆盖，回退到环境变量/缺省。
-  // 判定值随之一起作废：它描述的是那个被忽略的模型名，留着就是张冠李戴。
-  if (!row || !isValidModelName(row.llm_model)) return { model: null, updatedAt: null, reasoning: null };
-  return {
-    model: row.llm_model,
-    updatedAt: isoTimestamp(row.updated_at),
-    reasoning: storedVerdict(row.llm_reasoning),
-  };
+  if (!row) return emptyModelSetting();
+  // 库里的值只可能由 PATCH 写入；不合法就当没有覆盖，回退到下一层。
+  // 判定值与时间戳随之一起作废：它们描述的是那个被忽略的模型名，留着就是张冠李戴。
+  // 两组（llm_model / default_model）各自独立判定：一组脏了不影响另一组。
+  const current = isValidModelName(row.llm_model)
+    ? {
+      model: row.llm_model,
+      updatedAt: isoTimestamp(row.updated_at),
+      reasoning: storedVerdict(row.llm_reasoning),
+    }
+    : { model: null, updatedAt: null, reasoning: null };
+  const fallback = isValidModelName(row.default_model)
+    ? {
+      defaultModel: row.default_model,
+      defaultModelUpdatedAt: isoTimestamp(row.default_model_updated_at),
+      defaultReasoning: storedVerdict(row.default_model_reasoning),
+    }
+    : { defaultModel: null, defaultModelUpdatedAt: null, defaultReasoning: null };
+  return { ...current, ...fallback };
 }
 
 export async function writeModelSetting(
@@ -96,10 +134,62 @@ export async function writeModelSetting(
   return isoTimestamp(rows[0]?.updated_at);
 }
 
-/** 恢复默认：清空数据库覆盖值，运行时解析回退到环境变量/缺省。 */
+/**
+ * 「恢复默认」：清空 llm_model 覆盖值，运行时解析回退到 default_model →
+ * 环境变量/硬编码缺省。**只动 llm_model 那三列**——库内默认值是另一件事，不能被这一步顺带清掉。
+ */
 export async function clearModelSetting(): Promise<void> {
   const sql = getSql();
   await sql`UPDATE app_settings SET llm_model = NULL, llm_reasoning = NULL, updated_at = now() WHERE id = 1`;
+}
+
+// ---- 默认模型（llm_model 没有覆盖值时用的那个）----
+// 语义：model（当前覆盖）→ default_model（库内默认）→ 环境变量 LLM_MODEL → 硬编码缺省。
+// 独立三列，避免改默认值弄脏 llm_model 的「当前值 / 判定 / 更新时间」。
+export async function writeDefaultModelSetting(
+  model: string,
+  reasoning: ReasoningVerdict | null,
+): Promise<string | null> {
+  if (!isValidModelName(model)) throw new Error('invalid model name');
+  const sql = getSql();
+  const rows = await sql`
+    INSERT INTO app_settings (id, default_model, default_model_reasoning, default_model_updated_at)
+    VALUES (1, ${model}, ${reasoning}, now())
+    ON CONFLICT (id) DO UPDATE SET default_model = EXCLUDED.default_model,
+      default_model_reasoning = EXCLUDED.default_model_reasoning,
+      default_model_updated_at = now()
+    RETURNING default_model_updated_at` as { default_model_updated_at: unknown }[];
+  return isoTimestamp(rows[0]?.default_model_updated_at);
+}
+
+/**
+ * 清除库内默认值，运行时解析回退到环境变量/硬编码缺省。
+ * 时间戳一并置 NULL（照 label_model 的模式）：清除之后「没有覆盖值」这件事本身
+ * 不该带着一个看起来像写入时间的残留值。**不碰 llm_model 那三列。**
+ */
+export async function clearDefaultModelSetting(): Promise<void> {
+  const sql = getSql();
+  await sql`UPDATE app_settings SET default_model = NULL, default_model_reasoning = NULL, default_model_updated_at = NULL WHERE id = 1`;
+}
+
+export interface ResolvedDefaultModel {
+  model: string;
+  source: LlmModelSource;
+  /** 库内覆盖的写入时间；来源不是数据库时为 null。 */
+  updatedAt: string | null;
+}
+
+/**
+ * 默认值解析链：库内 default_model → 环境变量 LLM_MODEL → 硬编码 DEFAULT_LLM_MODEL。
+ * 抽成独立函数（而不是散在 payload 里）是因为它同时决定「默认值是什么」和「默认值从哪来」，
+ * 两个答案必须来自同一次判定，否则会出现「值来自库、来源写着环境变量」这种自相矛盾的响应。
+ */
+export function resolveDefaultModel(stored: StoredModelSetting): ResolvedDefaultModel {
+  if (stored.defaultModel) {
+    return { model: stored.defaultModel, source: 'database', updatedAt: stored.defaultModelUpdatedAt };
+  }
+  const fallback = environmentModel();
+  return { model: fallback.model, source: fallback.source, updatedAt: null };
 }
 
 // ---- 打标模型（labeler.py 离线跑在 phoenix 上，Web 只存名字）----
@@ -138,25 +228,33 @@ export async function clearLabelModelSetting(): Promise<void> {
   await sql`UPDATE app_settings SET label_model = NULL, label_model_updated_at = NULL WHERE id = 1`;
 }
 
-/** GET 的响应体：数据库覆盖值优先，否则报告环境变量/缺省来源。 */
+/**
+ * GET/PATCH 的响应体。解析顺序：llm_model 覆盖 → default_model（库内默认）→ 环境变量 → 硬编码缺省。
+ *
+ * source 与 defaultSource 是**两件事**，别混：
+ *   - source：当前生效模型（model）的来源。库内覆盖存在时是 'database'；否则等于
+ *     defaultSource——没有覆盖值时，「当前值」就是那个默认值，来源自然也是默认值的来源。
+ *   - defaultSource：默认值（defaultModel）自己的来源。
+ * 所以 source === 'database' 有两种成因（有 llm_model 覆盖 / 默认值来自库），
+ * 需要区分时看 updatedAt 是否为 null（只有 llm_model 覆盖才会写它，见 readModelSetting）。
+ *
+ * reasoning 描述的是**当前生效模型**：覆盖值用 llm_model 的判定，默认值生效时用默认值的判定，
+ * 环境变量里的模型从没探测过 → null。绝不能拿一个不生效的判定给另一个模型下结论。
+ */
 export function modelSettingsPayload(stored: StoredModelSetting): LlmModelSettings {
-  const fallback = environmentModel();
-  if (stored.model) {
-    return {
-      model: stored.model,
-      defaultModel: fallback.model,
-      source: 'database',
-      updatedAt: stored.updatedAt,
-      reasoning: stored.reasoning,
-    };
-  }
+  const fallback = resolveDefaultModel(stored);
+  const override = stored.model;
+  // 只有「库内默认值真的生效」时，default_model 的判定才配得上当前模型。
+  const reasoning = override !== null
+    ? stored.reasoning
+    : (fallback.source === 'database' ? stored.defaultReasoning : null);
   return {
-    model: fallback.model,
+    model: override ?? fallback.model,
     defaultModel: fallback.model,
-    source: fallback.source,
-    updatedAt: null,
-    // 没有覆盖值时，库里残留的判定（正常情况下已被 clearModelSetting 清掉）不属于当前模型，
-    // 不能拿它给环境变量里的模型下结论。
-    reasoning: null,
+    source: override !== null ? 'database' : fallback.source,
+    defaultSource: fallback.source,
+    updatedAt: override !== null ? stored.updatedAt : null,
+    defaultUpdatedAt: fallback.updatedAt,
+    reasoning,
   };
 }

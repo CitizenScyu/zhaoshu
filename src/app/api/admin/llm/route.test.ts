@@ -59,7 +59,11 @@ beforeEach(() => {
   mocks.getSql.mockReturnValue(db.sql);
   mocks.ensureSchema.mockResolvedValue(undefined);
   mocks.probeModel.mockResolvedValue({ ok: true, reasoning: 'unknown', reason: '', warning: '' });
-  db.resolve.mockResolvedValue([{ llm_model: null, updated_at: null }]);
+  // 库里的行（含默认值那三列）。缺省是「两列都没有覆盖值」，回落到环境变量。
+  db.resolve.mockResolvedValue([{
+    llm_model: null, llm_reasoning: null, updated_at: null,
+    default_model: null, default_model_reasoning: null, default_model_updated_at: null,
+  }]);
 });
 
 afterEach(() => {
@@ -94,7 +98,9 @@ describe('GET /api/admin/llm', () => {
       model: 'vendor/model',
       defaultModel: 'claude-opus-5-88',
       source: 'database',
+      defaultSource: 'default',
       updatedAt: '2026-09-16T10:00:00.000Z',
+      defaultUpdatedAt: null,
       reasoning: null,
     });
     expect(res.headers.get('Cache-Control')).toBe('private, no-store');
@@ -112,7 +118,9 @@ describe('GET /api/admin/llm', () => {
       model: 'vendor/model',
       defaultModel: 'claude-opus-5-88',
       source: 'database',
+      defaultSource: 'default',
       updatedAt: '2026-09-16T10:00:00.000Z',
+      defaultUpdatedAt: null,
       reasoning: 'yes',
     });
   });
@@ -151,7 +159,7 @@ describe('GET /api/admin/llm', () => {
     expect(raw).not.toContain('secret-upstream');
     expect(raw).not.toContain('sk-should-never-be-returned');
     expect(Object.keys(JSON.parse(raw) as Record<string, unknown>).sort())
-      .toEqual(['defaultModel', 'model', 'reasoning', 'source', 'updatedAt']);
+      .toEqual(['defaultModel', 'defaultSource', 'defaultUpdatedAt', 'model', 'reasoning', 'source', 'updatedAt']);
   });
 });
 
@@ -211,7 +219,9 @@ describe('PATCH /api/admin/llm', () => {
       model: 'vendor/model',
       defaultModel: 'claude-opus-5-88',
       source: 'database',
+      defaultSource: 'default',
       updatedAt: '2026-09-16T10:00:00.000Z',
+      defaultUpdatedAt: null,
       reasoning: 'unknown',
     });
     const writes = settingWrites();
@@ -343,5 +353,134 @@ describe('PATCH /api/admin/llm', () => {
     }));
     expect(res.status).toBe(200);
     expect(settingWrites()).toHaveLength(1);
+  });
+
+  // task-69：默认值本身可改（llm_model 没有覆盖值时用的那个模型）。
+  // 走的是与 model 完全相同的护栏：探测在前、确认在后、写库最后。
+  describe('默认值（defaultModel）', () => {
+    it('只写默认值那三列，不碰 llm_model / llm_reasoning，并清缓存立即生效', async () => {
+      db.resolve.mockResolvedValue([{ default_model_updated_at: '2026-09-17T00:00:00.000Z' }]);
+      const res = await PATCH(req('PATCH', { body: { defaultModel: 'vendor/default-1' } }));
+      expect(res.status).toBe(200);
+      const writes = settingWrites();
+      expect(writes).toHaveLength(1);
+      expect(writes[0].text).toContain('default_model = EXCLUDED.default_model');
+      expect(writes[0].text).not.toContain('llm_model');
+      expect(writes[0].text).not.toContain('llm_reasoning');
+      expect(writes[0].values).toEqual(['vendor/default-1', 'unknown']);
+      // 不清缓存的话，30s 内运行时还在用旧值——界面就会看起来「改了但没生效」。
+      expect(mocks.resetModelCache).toHaveBeenCalledTimes(1);
+    });
+
+    it('没有当前覆盖值时，默认值就是生效模型（来源 database，但不谎报 updatedAt）', async () => {
+      db.resolve.mockResolvedValue([{ default_model_updated_at: '2026-09-17T00:00:00.000Z' }]);
+      const body = await (await PATCH(req('PATCH', { body: { defaultModel: 'vendor/default-1' } }))).json();
+      expect(body).toEqual({
+        model: 'vendor/default-1',
+        defaultModel: 'vendor/default-1',
+        source: 'database',
+        defaultSource: 'database',
+        updatedAt: null,
+        defaultUpdatedAt: '2026-09-17T00:00:00.000Z',
+        reasoning: 'unknown',
+      });
+    });
+
+    // 反向护栏：改默认值**不能**把当前生效模型说成默认值。已有 llm_model 覆盖时它必须原样不动。
+    it('已有当前覆盖值时，改默认值不动当前模型', async () => {
+      db.resolve.mockResolvedValue([{
+        llm_model: 'vendor/current', llm_reasoning: 'yes', updated_at: '2026-09-16T10:00:00.000Z',
+        default_model_updated_at: '2026-09-17T00:00:00.000Z',
+      }]);
+      const body = await (await PATCH(req('PATCH', { body: { defaultModel: 'vendor/default-1' } }))).json();
+      expect(body).toMatchObject({
+        model: 'vendor/current',
+        defaultModel: 'vendor/default-1',
+        source: 'database',
+        defaultSource: 'database',
+        updatedAt: '2026-09-16T10:00:00.000Z',
+        reasoning: 'yes',
+      });
+    });
+
+    it('非法默认值名 → 400，且不探测不读库不写库', async () => {
+      const res = await PATCH(req('PATCH', { body: { defaultModel: 'bad name' } }));
+      expect(res.status).toBe(400);
+      expect(await res.json()).toMatchObject({ code: 'INVALID_MODEL' });
+      expect(mocks.probeModel).not.toHaveBeenCalled();
+      expect(mocks.getSql).not.toHaveBeenCalled();
+      expect(settingWrites()).toHaveLength(0);
+    });
+
+    it('保存前验证失败 → 502，绝不写库', async () => {
+      mocks.probeModel.mockResolvedValue({
+        ok: false, reasoning: 'unknown', reason: '模型验证失败：模型服务暂时不可用（HTTP 400），请稍后重试。', warning: '',
+      });
+      const res = await PATCH(req('PATCH', { body: { defaultModel: 'broken/model' } }));
+      expect(res.status).toBe(502);
+      expect(await res.json()).toMatchObject({ code: 'MODEL_PROBE_FAILED' });
+      expect(mocks.probeModel).toHaveBeenCalledWith('broken/model');
+      expect(settingWrites()).toHaveLength(0);
+      expect(mocks.resetModelCache).not.toHaveBeenCalled();
+    });
+
+    it('判为推理模型时同样要确认，带标志才写库', async () => {
+      mocks.probeModel.mockResolvedValue({ ok: true, reasoning: 'yes', reason: '', warning: '' });
+      const denied = await PATCH(req('PATCH', { body: { defaultModel: 'reasoner/model' } }));
+      expect(denied.status).toBe(409);
+      expect(await denied.json()).toMatchObject({ code: 'REASONING_MODEL_REQUIRES_CONFIRMATION' });
+      expect(settingWrites()).toHaveLength(0);
+
+      db.resolve.mockResolvedValue([{ default_model_updated_at: '2026-09-17T00:00:00.000Z' }]);
+      const allowed = await PATCH(req('PATCH', { body: { defaultModel: 'reasoner/model', acknowledgeReasoning: true } }));
+      expect(allowed.status).toBe(200);
+      expect(settingWrites()[0].values).toEqual(['reasoner/model', 'yes']);
+    });
+
+    // 死锁护栏：清除库内默认值必须永远可行，不被一个坏模型挡住。
+    it('清除默认值不做探测，回退到环境变量/硬编码缺省', async () => {
+      mocks.probeModel.mockResolvedValue({ ok: false, reasoning: 'unknown', reason: '不该被调用', warning: '' });
+      const res = await PATCH(req('PATCH', { body: { defaultModel: null } }));
+      expect(res.status).toBe(200);
+      expect(mocks.probeModel).not.toHaveBeenCalled();
+      const writes = settingWrites();
+      expect(writes).toHaveLength(1);
+      expect(writes[0].text).toContain('default_model = NULL');
+      expect(writes[0].text).toContain('default_model_reasoning = NULL');
+      expect(writes[0].text).toContain('default_model_updated_at = NULL');
+      expect(writes[0].text).not.toContain('llm_model');
+      expect(await res.json()).toMatchObject({ source: 'default', defaultSource: 'default', updatedAt: null });
+      expect(mocks.resetModelCache).toHaveBeenCalledTimes(1);
+    });
+
+    it('清除默认值不动当前覆盖值', async () => {
+      db.resolve.mockResolvedValue([{ llm_model: 'vendor/current', updated_at: '2026-09-16T10:00:00.000Z' }]);
+      const body = await (await PATCH(req('PATCH', { body: { defaultModel: null } }))).json();
+      expect(body).toMatchObject({ model: 'vendor/current', source: 'database', defaultSource: 'default' });
+    });
+
+    // 两个目标一次只能改一个：各自要做一次最长 30s 的保存前验证，串起来会顶破 maxDuration 60s。
+    it('同时带 model 与 defaultModel → 400，不探测不写库', async () => {
+      const res = await PATCH(req('PATCH', { body: { model: 'vendor/a', defaultModel: 'vendor/b' } }));
+      expect(res.status).toBe(400);
+      expect(await res.json()).toMatchObject({ code: 'AMBIGUOUS_TARGET' });
+      expect(mocks.probeModel).not.toHaveBeenCalled();
+      expect(settingWrites()).toHaveLength(0);
+    });
+  });
+
+  // 向后兼容：加 defaultModel 之前的调用形态（只带 model）语义逐字不变。
+  it('旧调用形态（只带 model / model: null）不受 defaultModel 影响', async () => {
+    db.resolve.mockResolvedValue([{ default_model: 'vendor/default-1', default_model_updated_at: 'x' }]);
+    const set = await (await PATCH(req('PATCH', { body: { model: 'vendor/model' } }))).json();
+    expect(set).toMatchObject({ model: 'vendor/model', defaultModel: 'vendor/default-1', source: 'database' });
+    expect(mocks.probeModel).toHaveBeenCalledWith('vendor/model');
+
+    db.resolve.mockResolvedValue([{ default_model: 'vendor/default-1', default_model_updated_at: 'x' }]);
+    const cleared = await (await PATCH(req('PATCH', { body: { model: null } }))).json();
+    // 恢复默认：当前模型回到**库内默认值**（不是环境变量），而默认值本身不受影响。
+    expect(cleared).toMatchObject({
+      model: 'vendor/default-1', defaultModel: 'vendor/default-1', source: 'database', defaultSource: 'database',
+    });
   });
 });

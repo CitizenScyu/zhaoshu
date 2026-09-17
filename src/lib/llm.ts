@@ -209,9 +209,12 @@ export function configuredAttemptTimeoutMs(): number {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_ATTEMPT_TIMEOUT_MS;
 }
 
-// ---- 运行时模型解析（数据库设置 → 环境变量 LLM_MODEL → 硬编码缺省）----
+// ---- 运行时模型解析（数据库当前覆盖 → 数据库默认值 → 环境变量 LLM_MODEL → 硬编码缺省）----
 // 2026-09-16 的线上故障源于「换模型要改环境变量 + 重新部署」这条链路太长，
 // 所以模型不再在模块加载期定死，而是每次调用解析。
+//
+// 2026-09-17（task-69）：默认值本身也能在管理台改（app_settings.default_model），所以解析
+// 多了一层。**这一层必须在运行时真的生效**——只改管理台的展示而不改这里，界面就是空转。
 //
 // 进程内短 TTL 缓存：连续多次 LLM 调用只读一次库（找书的一次请求里 recall 与
 // rerank 共享同一次读取）。PATCH 写库后调用 resetModelCache() 立即生效。
@@ -231,12 +234,12 @@ export async function resolveModel(): Promise<string> {
   const cached = modelCache;
   if (cached && cached.expiresAt > Date.now()) return cached.model;
   const stored = await readStoredModelSafely();
-  const model = stored.model ?? environmentModel().model;
+  const model = stored.model ?? stored.defaultModel ?? environmentModel().model;
   if (stored.ok) modelCache = { model, expiresAt: Date.now() + MODEL_CACHE_TTL_MS };
   return model;
 }
 
-async function readStoredModelSafely(): Promise<{ ok: boolean; model: string | null }> {
+async function readStoredModelSafely(): Promise<{ ok: boolean; model: string | null; defaultModel: string | null }> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
     const timeout = new Promise<never>((_, reject) => {
@@ -244,9 +247,9 @@ async function readStoredModelSafely(): Promise<{ ok: boolean; model: string | n
       timer.unref?.();
     });
     const setting = await Promise.race([readModelSetting(), timeout]);
-    return { ok: true, model: setting.model };
+    return { ok: true, model: setting.model, defaultModel: setting.defaultModel };
   } catch {
-    return { ok: false, model: null };
+    return { ok: false, model: null, defaultModel: null };
   } finally {
     clearTimeout(timer);
   }
