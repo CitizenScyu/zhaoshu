@@ -61,7 +61,7 @@ npm run test:auth-db -- --case=personal-isolation
 
 ## 统计与导出契约
 
-stats 返回 subject.userId、allowedSections、sectionStates 和 sectionScopes。找书/书架是本人计数，书库是共享计数；书源只对 download 能力开放并标为共享，active 仅表示未停用，不等于验证健康。无权限为 forbidden，允许但未建设完成为 not_ready，查询失败才是 unavailable；前两者不混入数据库错误聚合。
+stats 返回 subject.userId、allowedSections、sectionStates 和 sectionScopes。找书/书架是本人计数，书库是共享计数；书源只对 download 能力开放并标为共享。书源计数（task-24 起口径）：enabled/disabled 看启停开关（disabled_at），unprobed/pending/reachable/failed 看探测快照，两者正交；active 是兼容字段，仅计「启用且最近探测可达」，不能用未禁用数量填充，界面不展示该字段。无权限为 forbidden，允许但未建设完成为 not_ready，查询失败才是 unavailable；前两者不混入数据库错误聚合。
 
 现有用量表没有用户归属，保留为仅 owner 可见的全站共享运营计数，不冒充个人用量，也不向 member 输出。下载任务归属仍属 A05：当前统计与导出都不读取全局下载任务；有 download 能力时显式标为 not_ready，否则为 forbidden。
 

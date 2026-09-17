@@ -142,9 +142,11 @@ def verify(browser, base_url, viewport, output):
         checks.append("书源页面没有水平溢出")
         page.get_by_role("button", name="统计", exact=True).focus()
         page.keyboard.press("Enter")
-        expect(page.get_by_text("另有书源资料", exact=False)).to_contain_text("最近探测可达 1 条")
-        expect(page.get_by_text("另有书源资料", exact=False)).to_contain_text("启用 2 条")
-        expect(page.get_by_text("另有书源资料", exact=False)).to_contain_text("待核验 2 条")
+        # 统计页书源一笔账：task-24 口径（enabled/reachable 等分列），「另有书源资料」是旧文案。
+        expect(page.get_by_text("共享书源资料", exact=False)).to_contain_text("最近探测可达 1 条")
+        expect(page.get_by_text("共享书源资料", exact=False)).to_contain_text("启用 2 条")
+        expect(page.get_by_text("共享书源资料", exact=False)).to_contain_text("待核验 2 条")
+        expect(page.get_by_text("共享书源资料", exact=False)).not_to_contain_text("尚未接入找书验证")
         checks.append("键盘切到统计页，未知与待核验来源不显示为可达")
         page.screenshot(path=str(output / f"stats-{width}.png"), full_page=True)
         assert not blocked, blocked
