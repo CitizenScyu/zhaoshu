@@ -258,16 +258,28 @@ INJECT_PATTERNS = (
 
 # 站点推广行黑名单·固定字面部分（t79 第二轮复核实测：独立成行的口号碎片）。
 # 上一轮把 `分享本站` 与 `请?记住本站(网址)?` 一整族删掉，代价是这两类碎片一起漏剥；
-# 本轮只把**固定字面**补回——刻意存真值字符串再 re.escape，保证匹配面严格等于该串本身，
-# 不含 `?`、分组或字符类，因此不会像 `请?记住本站(网址)?` 那样把「（我）记住本站…」也圈进来。
-# 注意第二条是**带「网址」的完整口号**：裸形 `请记住本站`（如“请记住本站的规矩。”）
-# 与复核 A 组「应留」样例同形，属于本轮要消灭的误删类，故刻意不收——剩下那点漏剥是有意付的代价。
+# 本轮只把**固定字面**补回：刻意存真值字符串再 re.escape，匹配面严格等于该串本身。
+# 第二条刻意收成**带「网址」的完整口号**——裸形 `请记住本站` 会命中 `“请记住本站的规矩。”`
+# （与复核 A 组「应留」样例同形），属本轮要消灭的误删类，故不收。
 INJECT_LITERALS = (
     '分享本站',          # 「分享本站」/「分享本站。」
-    '请记住本站网址',     # 「请记住本站网址」；裸 `请记住本站` 不收（会误删对白）
+    '请记住本站网址',     # 「请记住本站网址」
     '记住本站不迷路',     # 「记住本站不迷路」
 )
-INJECT_PATTERNS = INJECT_PATTERNS + tuple(re.compile(re.escape(s)) for s in INJECT_LITERALS)
+# 🔴 上面三个是**短固定串**，必须整行锚定后才能上：裸用 search 只要求子串相邻，
+# 会命中任何含该相邻串的正文行（实测误删：`他分享本站的帖子。` /
+# `“我分享本站的东西，你有意见？”` / `“大家都记住本站不迷路就好。”`）。
+# 锚定后匹配面 = 「整行只由该串 + 首尾空白/句读构成」，这才是「独立成行」的字面含义。
+_LITERAL_EDGE = r'[\s　]'
+_LITERAL_TAIL = r'[\s　。！!，,、…]'
+INJECT_LITERAL_PATTERNS = tuple(
+    re.compile(r'^' + _LITERAL_EDGE + r'*' + re.escape(s) + _LITERAL_TAIL + r'*$')
+    for s in INJECT_LITERALS
+)
+# 注意：CORE 的 INJECT_PATTERNS（上一行）**保持无锚 search**，不与上面合并——
+# 它收的是**整句标语**，真实噪声行「本站提供无弹窗全文字在线阅读，更新速度快，
+# 请记住本站网址。」正是靠子串命中才剥得掉；给 CORE 加锚会把它整条漏掉。
+# 两类目标不同：CORE 剥「含标语的整句」，字面表剥「只由碎片构成的整行」。
 # 「上一章 ... / ... 下一章」导航行：两个词都在且行够短，且不含正文特征标点。
 _NAV_SENTENCE_RE = _PROSE_MARK_RE
 
@@ -322,8 +334,10 @@ def extract_chapter_lines(html: str) -> tuple[list[str], str]:
 def _drop_rule(line: str) -> str | None:
     """命中返回规则名，否则 None。
 
-    1)、2) 要求**整行只由噪声构成**（不做局部删除）；3) 是子串命中——推广语是固定口号，
-    正常正文不会出现，靠「行长度上限 + 口号本身无歧义」控制误伤，不要求整行匹配。"""
+    1)、2) 要求**整行只由噪声构成**（不做局部删除）；3) 分两类目标：
+    CORE `INJECT_PATTERNS` 收**整句标语**，用无锚子串命中（真实噪声行常是长句，
+    只有子串命中才剥得掉）；字面表 `INJECT_LITERAL_PATTERNS` 收**独立成行的口号碎片**，
+    必须整行锚定——裸 search 会误删含该相邻串的叙述/对白行。"""
     # 1) UI 按钮行：行短、不含正文标点，且剥掉所有 UI 词后（连同分隔符）整行为空。
     #    必须真的命中过词，否则「……」这类纯标点正文行会被误删。
     if len(line) <= UI_LINE_MAX_LEN and not _PROSE_MARK_RE.search(line):
@@ -338,8 +352,10 @@ def _drop_rule(line: str) -> str | None:
     if len(line) <= NAV_LINE_MAX_LEN and '上一章' in line and '下一章' in line \
             and not _NAV_SENTENCE_RE.search(line):
         return 'nav'
-    # 3) 站点推广行：整行含推广语且行够短（正文里出现「本站」类自指语不会这么短）。
-    if len(line) <= INJECT_LINE_MAX_LEN and any(p.search(line) for p in INJECT_PATTERNS):
+    # 3) 站点推广行：CORE 整句标语（无锚子串）或独立成行的口号碎片（整行锚定）。
+    if len(line) <= INJECT_LINE_MAX_LEN and (
+            any(p.search(line) for p in INJECT_PATTERNS)
+            or any(p.search(line) for p in INJECT_LITERAL_PATTERNS)):
         return 'inject'
     return None
 

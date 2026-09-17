@@ -249,7 +249,7 @@ class TestRound2PromoLiterals(unittest.TestCase):
         """约束钉子：补回的是固定字面，不是 `请?`/`(网址)?` 这类泛化。
 
         re.escape 是恒等 → 串里不含任何正则元字符，匹配面严格等于该串本身。
-        把 `请记住本站` 改成 `请?记住本站(网址)?` 会被本用例抓到。"""
+        把 `请记住本站网址` 改成 `请?记住本站(网址)?` 会被本用例抓到。"""
         for literal in labeler.INJECT_LITERALS:
             with self.subTest(literal=literal):
                 self.assertEqual(re.escape(literal), literal)
@@ -257,6 +257,26 @@ class TestRound2PromoLiterals(unittest.TestCase):
         for generalized in (r'请?记住本站(网址)?', '手机用户请'):
             with self.subTest(pattern=generalized):
                 self.assertNotIn(generalized, patterns)
+
+    def test_literal_patterns_are_whole_line_anchored(self):
+        """结构钉子：短固定串**必须整行锚定**，不能裸 search。
+
+        裸 search 只要求子串相邻，`他分享本站的帖子。` 会被误删——这正是本轮阻断的根因。
+        去掉 `^…$` 锚会被 `test_round2_counterexamples_are_kept` 与下面的短串用例一起抓到。"""
+        self.assertEqual(len(labeler.INJECT_LITERAL_PATTERNS), len(labeler.INJECT_LITERALS))
+        for literal, pat in zip(labeler.INJECT_LITERALS, labeler.INJECT_LITERAL_PATTERNS):
+            with self.subTest(literal=literal):
+                self.assertTrue(pat.pattern.startswith('^'), pat.pattern)
+                self.assertTrue(pat.pattern.endswith('$'), pat.pattern)
+                self.assertIn(re.escape(literal), pat.pattern)
+
+    def test_core_patterns_stay_unanchored(self):
+        """反向钉子：CORE 整句标语**不能**加锚，否则真实噪声长句会漏剥。"""
+        pat = labeler.INJECT_PATTERNS[0]
+        self.assertFalse(pat.pattern.startswith('^'))
+        long_noise = '本站提供无弹窗全文字在线阅读，更新速度快，请记住本站网址。'
+        self.assertIsNotNone(pat.search(long_noise))
+        self.assertEqual(labeler._drop_rule(long_noise), 'inject')
 
     def test_round2_counterexamples_are_kept(self):
         """独立构造的对白/独词/短行反例（未照抄复核语料）：误删必须为 0。
@@ -267,8 +287,16 @@ class TestRound2PromoLiterals(unittest.TestCase):
         其中 `“请记住本站的规矩。”` 是收窄的判据：它只比复核 A 组「应留」样例
         `“你给我记住本站的规矩。”` 少一个「给我」，若字面表里放的是裸形 `请记住本站`
         就会被误删。因此 `INJECT_LITERALS` 只收带「网址」的完整口号。
-        代价是独立成行的裸形 `请记住本站` 会漏剥——有意付的，不在本用例钉。"""
+        代价是独立成行的裸形 `请记住本站` 会漏剥——有意付的，不在本用例钉。
+
+        前 5 条（含 `他分享本站的帖子。` / `“我分享本站的东西，你有意见？”`）是
+        确认方判阻断时实测的 da61153=keep → 97537eb=drop 误删；去掉整行锚就会全部变红。"""
         for line in (
+            '他分享本站的帖子。',                 # 阻断实测误删（短串裸 search 会命中）
+            '“我分享本站的东西，你有意见？”',     # 阻断实测误删
+            '“你分享本站的文章，别人也受益。”',   # 阻断实测误删
+            '“大家都记住本站不迷路就好。”',       # 阻断实测误删
+            '“分享本站是我的习惯。”',             # 阻断实测误删
             '“请记住本站的规矩。”',              # 收窄判据：裸形 `请记住本站` 会误删它
             '“请记住本站的规矩，别乱跑。”',
             '“你把本站的规矩记牢了。”',          # 含「本站」但不含任何字面串
