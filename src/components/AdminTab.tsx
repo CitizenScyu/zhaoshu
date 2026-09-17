@@ -4,6 +4,7 @@ import { useCallback, useEffect, useState } from 'react';
 import { useOwner } from '@/components/OwnerProvider';
 import ModelSettingsTab from '@/components/ModelSettingsTab';
 import type { InviteCodeSummary, RegistrationMode } from '@/lib/invite-codes';
+import { effectiveRegistrationMode, gateStatusLabel, gateWarning } from '@/lib/registration-gate';
 
 type AdminUser = {
   id: number;
@@ -17,7 +18,13 @@ type AdminUser = {
   inviteHint: string | null;
 };
 
-type RegistrationSettings = { membersEnabled: boolean; registrationMode: RegistrationMode; updatedAt: string | null };
+// accountsEnabled 是部署闸门（env），只读；管理台只展示不改，避免给出改不动的假按钮。
+type RegistrationSettings = {
+  membersEnabled: boolean;
+  registrationMode: RegistrationMode;
+  updatedAt: string | null;
+  accountsEnabled: boolean;
+};
 type LabelModelSetting = { model: string | null; updatedAt: string | null };
 type CreatedInvite = { code: string; codeHint: string; expiresAt: string | null };
 
@@ -220,6 +227,13 @@ export default function AdminTab() {
   const dirty = Boolean(registration && registrationDraft
     && (registration.membersEnabled !== registrationDraft.membersEnabled
       || registration.registrationMode !== registrationDraft.registrationMode));
+  // 「对外实际生效」刻意按**已保存**的 registration 算，不用草稿 registrationDraft：
+  // 这行描述的是此刻线上的真实行为，草稿还没提交、算进去就会谎报「改成 X 就生效 X」。
+  // 草稿的未保存差异已由 dirty 与保存按钮表达，这里不重复。改接线前请先读这段。
+  const effectiveMode = registration
+    ? effectiveRegistrationMode(registration.accountsEnabled, registration.membersEnabled, registration.registrationMode)
+    : null;
+  const effectiveModeMismatch = Boolean(registration && effectiveMode !== registration.registrationMode);
 
   return (
     <div className="space-y-10">
@@ -231,6 +245,18 @@ export default function AdminTab() {
 
       <section aria-label="注册开关" className="space-y-3">
         <h3 className="text-base font-bold">注册与成员开关</h3>
+        {registration && (
+          <div className="space-y-1">
+            <p className="text-sm" style={{ color: 'var(--ink-soft)' }}>
+              账号体系（部署闸门）：{gateStatusLabel(registration.accountsEnabled)}
+            </p>
+            {gateWarning(registration.accountsEnabled) && (
+              <p className="text-xs" style={{ color: 'var(--cinnabar)' }}>
+                {gateWarning(registration.accountsEnabled)}
+              </p>
+            )}
+          </div>
+        )}
         {registrationDraft && (
           <>
             <label className="flex items-center gap-3 text-sm" style={{ color: 'var(--ink-soft)' }}>
@@ -257,6 +283,11 @@ export default function AdminTab() {
             <p className="text-xs" style={{ color: 'var(--ink-faint)' }}>
               {MODE_HINTS[registrationDraft.registrationMode]}
             </p>
+            {effectiveModeMismatch && effectiveMode !== null && (
+              <p className="text-xs" style={{ color: 'var(--ink-faint)' }}>
+                对外实际生效：{MODE_LABELS[effectiveMode]}（部署闸门或成员总闸未开，注册接口对匿名访问一律返回关闭）
+              </p>
+            )}
             <button type="button" className="seal-button text-sm" disabled={!dirty || busy === 'registration'} onClick={() => void saveRegistration()}>
               {busy === 'registration' ? '保存中…' : '保存注册设置'}
             </button>
