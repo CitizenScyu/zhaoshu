@@ -229,7 +229,7 @@ class TestRound2PromoLiterals(unittest.TestCase):
     `分享本站。` 由上一轮的「应留」改判为「应删」（复核 §二 第 11 条）。
     """
 
-    NEW_LITERALS = ('分享本站', '请记住本站', '记住本站不迷路')
+    NEW_LITERALS = ('分享本站', '请记住本站网址', '记住本站不迷路')
 
     def test_new_literals_are_declared_and_dropped(self):
         """变异钉：清空 INJECT_LITERALS 后本用例必须变红（先 assertIn 再验行为）。"""
@@ -240,7 +240,7 @@ class TestRound2PromoLiterals(unittest.TestCase):
 
     def test_new_literal_noise_forms_are_dropped(self):
         for line in ('分享本站', '分享本站。',
-                     '请记住本站网址', '请记住本站网址。', '请记住本站',
+                     '请记住本站网址', '请记住本站网址。',
                      '记住本站不迷路', '记住本站不迷路！'):
             with self.subTest(line=line):
                 self.assertEqual(labeler._drop_rule(line), 'inject')
@@ -262,8 +262,15 @@ class TestRound2PromoLiterals(unittest.TestCase):
         """独立构造的对白/独词/短行反例（未照抄复核语料）：误删必须为 0。
 
         重点是含「本站」「记住本站」「多多」「推荐」「全文字」的**非口号**句——
-        固定字面的匹配面必须严格小于这些句子。"""
+        固定字面的匹配面必须严格小于这些句子。
+
+        其中 `“请记住本站的规矩。”` 是收窄的判据：它只比复核 A 组「应留」样例
+        `“你给我记住本站的规矩。”` 少一个「给我」，若字面表里放的是裸形 `请记住本站`
+        就会被误删。因此 `INJECT_LITERALS` 只收带「网址」的完整口号。
+        代价是独立成行的裸形 `请记住本站` 会漏剥——有意付的，不在本用例钉。"""
         for line in (
+            '“请记住本站的规矩。”',              # 收窄判据：裸形 `请记住本站` 会误删它
+            '“请记住本站的规矩，别乱跑。”',
             '“你把本站的规矩记牢了。”',          # 含「本站」但不含任何字面串
             '“你也记住本站的规矩。”',            # 含「记住本站」但没有「请」→ 不命中
             '“记住本站的路，别走岔了。”',         # 同上，句首无「请」
