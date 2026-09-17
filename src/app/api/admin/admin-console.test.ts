@@ -145,10 +145,13 @@ describe('注册开关管理', () => {
     expect(await res.json()).toMatchObject({ membersEnabled: false, registrationMode: 'open', accountsEnabled: true });
   });
 
-  it('库读不到时仍是 503，不泄露闸门状态', async () => {
+  it('库读不到时仍是 503，且响应体不含闸门状态', async () => {
     db.resolve.mockRejectedValue(new Error('db down'));
     const res = await call(registrationGet as Handler, owner('GET', '/api/admin/registration'));
     expect(res.status).toBe(503);
+    const payload = await res.json() as Record<string, unknown>;
+    expect(payload).toMatchObject({ code: 'SETTINGS_UNAVAILABLE' });
+    expect(payload).not.toHaveProperty('accountsEnabled');
   });
 
   it('PATCH 响应与 GET 同形（含 accountsEnabled），否则保存后闸门提示会消失', async () => {

@@ -227,7 +227,9 @@ export default function AdminTab() {
   const dirty = Boolean(registration && registrationDraft
     && (registration.membersEnabled !== registrationDraft.membersEnabled
       || registration.registrationMode !== registrationDraft.registrationMode));
-  // 「对外实际生效」按已保存的状态算，不跟未保存的草稿走。
+  // 「对外实际生效」刻意按**已保存**的 registration 算，不用草稿 registrationDraft：
+  // 这行描述的是此刻线上的真实行为，草稿还没提交、算进去就会谎报「改成 X 就生效 X」。
+  // 草稿的未保存差异已由 dirty 与保存按钮表达，这里不重复。改接线前请先读这段。
   const effectiveMode = registration
     ? effectiveRegistrationMode(registration.accountsEnabled, registration.membersEnabled, registration.registrationMode)
     : null;
