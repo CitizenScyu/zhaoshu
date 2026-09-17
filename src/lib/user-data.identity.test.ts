@@ -29,25 +29,36 @@ const ITEM = {
 };
 
 describe('persistRecommendationsForUserQueries（/api/find 写回路径）', () => {
-  it('books 的 INSERT 绑定的是归一后的 title/author，不是原始拼写', () => {
+  // P2-4 批量改写后语句恒为两条：[0] books 批量 upsert、[1] recommendations 批量落库。
+  // 身份值不再逐条绑定，而是整体 JSON 化进 jsonb_to_recordset——归一断言改为解析该
+  // JSON 参数后逐行核对，判别力与逐条绑定断言等价（脏值仍在参数里可见）。
+  const batchRows = (query: Bound) => JSON.parse(String(query.values.find((v) => String(v).startsWith('[')))) as {
+    title: string; author: string;
+  }[];
+
+  it('books 的批量 INSERT 绑定的是归一后的 title/author，不是原始拼写', () => {
     const db = mockSql();
     const queries = bound(persistRecommendationsForUserQueries(db.sql, 1, '找书', [ITEM as never]));
-    const bookInsert = queries.find((q) => q.text.includes('INSERT INTO books'))!;
-    expect(bookInsert.values[0]).toBe('修真聊天群');
-    expect(bookInsert.values[1]).toBe('abc');
-    expect(bookInsert.values).not.toContain('《修真聊天群》');
-    expect(bookInsert.values).not.toContain('ＡＢＣ');
+    expect(queries).toHaveLength(2);
+    const [rows, serialized] = [batchRows(queries[0]), JSON.stringify(queries[0].values)];
+    expect(rows[0].title).toBe('修真聊天群');
+    expect(rows[0].author).toBe('abc');
+    expect(serialized).not.toContain('《修真聊天群》');
+    expect(serialized).not.toContain('ＡＢＣ');
   });
 
-  it('recommendations 的第二条语句用同一份归一值回查，否则找不到刚写的那行', () => {
+  it('recommendations 的第二条语句用同一份归一值经身份键回查', () => {
     const db = mockSql();
     const queries = bound(persistRecommendationsForUserQueries(db.sql, 1, '找书', [ITEM as never]));
     const recommendation = queries.find((q) => q.text.includes('INSERT INTO recommendations'))!;
-    expect(recommendation.text).toContain('lower(title) = lower(?)');
-    expect(recommendation.values).toContain('修真聊天群');
-    expect(recommendation.values).toContain('abc');
-    expect(recommendation.values).not.toContain('《修真聊天群》');
-    expect(recommendation.values).not.toContain('ＡＢＣ');
+    // 身份回查钉在生成列键上（与 books upsert 的冲突目标同一套键）；
+    // 传参里的身份值必须是归一值。
+    expect(recommendation.text).toContain('b.title_key = j.title AND b.author_key = j.author');
+    const rows = batchRows(recommendation);
+    expect(rows[0].title).toBe('修真聊天群');
+    expect(rows[0].author).toBe('abc');
+    expect(JSON.stringify(recommendation.values)).not.toContain('《修真聊天群》');
+    expect(JSON.stringify(recommendation.values)).not.toContain('ＡＢＣ');
   });
 
   it('全角冒号与书名号变体写进同一个身份', () => {
@@ -55,7 +66,7 @@ describe('persistRecommendationsForUserQueries（/api/find 写回路径）', () 
     const queries = bound(persistRecommendationsForUserQueries(db.sql, 1, 'q', [
       { ...ITEM, title: '修真聊天群：', author: 'Ｘ' } as never,
     ]));
-    expect(queries.find((q) => q.text.includes('INSERT INTO books'))!.values[0]).toBe('修真聊天群:');
+    expect(batchRows(queries[0])[0].title).toBe('修真聊天群:');
   });
 
   // task-53 收口后的冲突目标护栏（T53R-6）：身份唯一索引已从表达式索引
@@ -72,6 +83,18 @@ describe('persistRecommendationsForUserQueries（/api/find 写回路径）', () 
     // 同一处再钉 428C9 面：身份键不得进入 INSERT 的列清单（生成列不可显式写入）。
     expect(insertColumns(bookInsert.text)).not.toContain('title_key');
     expect(insertColumns(bookInsert.text)).not.toContain('author_key');
+  });
+
+  // P2-4 专属护栏：批量改写的意义就是语句数不随 N 膨胀（原 2N，现恒 2）。
+  // 判别力：退回逐本 INSERT 时，10 本会渲染出 20 条语句，本用例必须失败。
+  it('语句数恒为 2，不随本数膨胀（P2-4）', () => {
+    const db = mockSql();
+    const items = Array.from({ length: 10 }, (_, i) => ({ ...ITEM, title: `批量书${i}` }));
+    const queries = bound(persistRecommendationsForUserQueries(db.sql, 1, '找书', items as never));
+    expect(queries).toHaveLength(2);
+    const rows = batchRows(queries[0]);
+    expect(rows).toHaveLength(10);
+    expect(rows.map((r) => r.title)).toEqual(items.map((item) => item.title));
   });
 });
 
@@ -130,9 +153,10 @@ describe('feedback 写查两侧同一身份', () => {
     // 反馈按原始拼写回查，必须落到同一身份，否则 404。
     const written = bound(persistRecommendationsForUserQueries(db.sql, 1, 'q', [ITEM as never]));
     const read = bound(feedbackForUserQueries(db.sql, 1, { title: ITEM.title, author: ITEM.author }, 'done', 'n', 0));
-    const writtenTitle = written.find((q) => q.text.includes('INSERT INTO books'))!.values[0];
+    const writtenRows = JSON.parse(String(written.find((q) => q.text.includes('INSERT INTO books'))!.values
+      .find((value) => String(value).startsWith('[')))) as { title: string }[];
     // 两侧都必须落在归一值上（不写成 writtenTitle === read 值，否则摘掉归一也成立）
-    expect(writtenTitle).toBe('修真聊天群');
+    expect(writtenRows[0].title).toBe('修真聊天群');
     expect(read[0].values).toContain('修真聊天群');
     expect(read[0].values).not.toContain('《修真聊天群》');
   });
