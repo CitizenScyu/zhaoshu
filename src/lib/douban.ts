@@ -169,13 +169,27 @@ export async function verifyBook(
         note: '详情页暂不可达，未取到评分',
       };
     }
-  } catch {
+  } catch (e) {
+    // 调用方预算耗尽 / 用户取消不是「豆瓣接口不可达」：把**中止的原始原因**上抛
+    // （signal.reason：deadline 耗尽是 DeadlineExceededError，用户取消是 AbortError），
+    // 由调用方按自己的语义分类。落成 unavailable 会把「找书预算耗尽」伪装成「豆瓣挂了」，
+    // 而且会把上层（内层 catch 的 throw、以及本 catch 的 throw）变成死代码。
+    //
+    // 判据只看**调用方的 signal**，不看 error 的名字：这里有**两个 abort 源**——
+    //   ① 调用方预算（signal，经 fetchWithTimeout 的 AbortSignal.any 合并）；
+    //   ② 本模块自己的 12s 单请求超时（fetchWithTimeout 内部的 controller）。
+    // 两者抛的都是 AbortError，但只有 ① 是「预算耗尽/取消」；② 是真正的「豆瓣不可达」，
+    // 必须继续降级为「本轮未验证」（否则一次豆瓣抖动会被误报成请求取消）。
+    if (signal?.aborted) throw signal.reason ?? e;
     return { status: 'unavailable', found: false, note: '豆瓣接口不可达，本轮未验证' };
   }
 }
 
 // 并发受限地验证一批书（豆瓣对高频不友好，限制在 3）。
 // 传入预算 signal：预算耗尽即停止新增探测（signal.abort 后 worker 不再领新任务）。
+// ⚠️ 契约：在飞的那本若因 signal 中止而失败，verifyBook 会**上抛中止原因**（不再降级成
+// 「本轮未验证」），于是本函数整体 reject——调用方据此分清「预算耗尽/已取消」与「豆瓣不可达」。
+// 未领到的项不会出现在结果里（本函数的返回只对「正常跑完」有意义）。
 // onProgress 每完成一本回调一次（供找书 SSE 实时上报验证进度）。
 export async function verifyBatch(
   books: { title: string; author?: string }[],
@@ -203,5 +217,9 @@ export async function verifyBatch(
     }
   }
   await Promise.all(Array.from({ length: Math.min(CONCURRENCY, books.length) }, worker));
+  // 中止若恰好落在「两本之间」（上一本已成功、下一本还没领），worker 只 break 不抛，
+  // 这里补一次同样的上抛：契约必须一致——调用方拿到「中止」还是「一批本轮未验证」，
+  // 不能取决于中止落在哪一瞬间。
+  if (signal?.aborted) throw signal.reason ?? new Error('豆瓣验证已中止');
   return results;
 }
