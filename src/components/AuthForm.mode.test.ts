@@ -10,6 +10,8 @@ vi.mock('react', async (importOriginal) => {
   return {
     ...actual,
     useId: () => 'test',
+    // 这里直接把组件当函数调，没有渲染器；effect（注册三态查询）跑不到也不该跑。
+    useEffect: () => {},
     useState: (initial: unknown) => {
       const slot = hooks.index++;
       if (!(slot in hooks.states)) hooks.states[slot] = initial;

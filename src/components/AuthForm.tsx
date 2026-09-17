@@ -1,9 +1,18 @@
 'use client';
 
-import { useId, useState } from 'react';
+import { useEffect, useId, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { useOwner } from '@/components/OwnerProvider';
 import { safeReturnPath } from '@/lib/auth-client';
+import {
+  parseRegistrationMode,
+  registerEntryHref,
+  registerEntryLabel,
+  registerEntryNotice,
+  registerEntryState,
+  registerEntryVisible,
+  type RegistrationMode,
+} from '@/lib/register-entry';
 
 export interface AuthFormClasses {
   form?: string;
@@ -29,7 +38,7 @@ interface AuthFormProps {
   /** 只接受经 safeReturnPath 过滤过的站内相对路径。 */
   returnTo?: string | null;
   classes?: AuthFormClasses;
-  /** 阅读器内嵌时可省略标题与注册链接。 */
+  /** 阅读器内嵌时可省略标题与说明文案。 */
   compact?: boolean;
   /** 覆盖默认标题与说明文案。 */
   title?: string;
@@ -61,6 +70,9 @@ export default function AuthForm({
   // 只有用户显式切换过才用本地选择覆盖。
   const [modeOverride, setModeOverride] = useState<'member' | 'owner' | null>(null);
   const mode = modeOverride ?? (accountsEnabled ? defaultMode : 'owner');
+  // 运行时注册开关（admin 的三态）与部署总闸不是一回事：总闸开着但注册可以是关闭的。
+  // null = 还没取到，交给 registerEntryState 乐观处理。
+  const [registrationMode, setRegistrationMode] = useState<RegistrationMode | null>(null);
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
   const [draft, setDraft] = useState('');
@@ -71,6 +83,25 @@ export default function AuthForm({
   const locked = status === 'loading' || status === 'unavailable';
   const memberMode = accountsEnabled && mode === 'member';
   const target = safeReturnPath(returnTo);
+  const entry = registerEntryState({ accountsEnabled, memberMode, registrationMode });
+
+  useEffect(() => {
+    // 总闸没开就不会有注册，别问；开了才去查三态。失败不改状态：未知保持未知。
+    if (!accountsEnabled) return;
+    const controller = new AbortController();
+    const load = async () => {
+      try {
+        const res = await fetch('/api/auth/registration', { signal: controller.signal });
+        const data = await res.json() as { registrationMode?: unknown };
+        if (!controller.signal.aborted) setRegistrationMode(parseRegistrationMode(data.registrationMode));
+      } catch {
+        // 网络/解析失败：入口按「未知」继续显示，注册接口自己会拒绝不合法的请求。
+      }
+    };
+    // 不在 effect 体内同步 setState（会触发级联渲染）；与项目其它 tab 一样丢进微任务。
+    queueMicrotask(() => { void load(); });
+    return () => controller.abort();
+  }, [accountsEnabled]);
 
   function finish() {
     // 有深链就回到深链；否则交给调用方决定（主页保持原地，独立登录页回首页）。
@@ -220,8 +251,21 @@ export default function AuthForm({
             >
               {memberMode ? '管理员口令登录' : '返回账号登录'}
             </button>
-            {memberMode && <a className="underline underline-offset-4" href={`/register${target ? `?returnTo=${encodeURIComponent(target)}` : ''}`}>注册</a>}
           </div>
+        )}
+        {/* 注册入口独立成行：先前它和模式切换挤在同一行小字里，实际没人看得见。 */}
+        {registerEntryVisible(entry) && (
+          <p className="text-sm" style={{ flexBasis: '100%', color: 'var(--ink-soft)' }}>
+            还没有账号？
+            <a className="underline underline-offset-4" style={{ color: 'var(--ink)' }} href={registerEntryHref(entry, target) ?? undefined}>
+              {registerEntryLabel(entry)}
+            </a>
+          </p>
+        )}
+        {registerEntryNotice(entry) && (
+          <p role="status" className="text-xs" style={{ flexBasis: '100%', color: 'var(--ink-faint)' }}>
+            {registerEntryNotice(entry)}
+          </p>
         )}
       </form>
     </div>

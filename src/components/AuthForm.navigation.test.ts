@@ -8,6 +8,8 @@ vi.mock('react', async (importOriginal) => {
   return {
     ...actual,
     useId: () => 'test',
+    // 组件在这里当普通函数调，没有渲染器；注册三态查询的 effect 不该在测试里发请求。
+    useEffect: () => {},
     useState: (initial: unknown) => {
       const value = initial === '' ? 'draft' : initial;
       return [value, vi.fn()];
