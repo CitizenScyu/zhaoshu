@@ -134,6 +134,12 @@ export interface AuthControllerOptions {
   storage: LegacyTokenStore;
   /** 跨标签广播“认证已变化”，只送非秘密通知。 */
   notify?: () => void;
+  /**
+   * 认证请求等响应头的上限，默认 15s。可配置是为了让超时路径能用**真实计时**被测到：
+   * `AbortSignal.timeout()` 的内建定时器既不受 fake timers 控制、也不计入 `vi.getTimerCount()`，
+   * 只靠假时钟无法证明「成功路径上不再留下定时器」。
+   */
+  requestTimeoutMs?: number;
 }
 
 /**
@@ -228,18 +234,37 @@ export class AuthController {
     return run;
   }
 
+  /**
+   * 15s 只给「等响应头」这一段计时：`fetch` 一落定（拿到 Response 或请求失败）就清掉定时器。
+   *
+   * `AbortSignal.timeout()` 的定时器在请求结束后仍会到期，而这里多个调用点只判 `status`、
+   * 从不读正文（旧模式 `/api/owner`、登出 `/api/auth/logout`、会话探测的 401/503 分支）。
+   * 那些 200 响应此时已经返回，浏览器只是还没把响应流交给任何人；定时器一到，
+   * signal 的 abort 会取消这条尚未 drain 的流，浏览器于是给已经成功的请求记一条
+   * 假的 `net::ERR_ABORTED`。把 abort 的作用域收回它真正该管的那个等待，成功路径上
+   * 就不会再留下能中止已结束请求的定时器；服务端不响应时的 15s 超时语义不变。
+   */
   private async request(
     input: string,
     init: RequestInit,
     transport: AuthTransport,
     token = '',
   ): Promise<Response> {
-    const request = createOwnerRequest(input, {
-      cache: 'no-store',
-      signal: AbortSignal.timeout(SESSION_TIMEOUT_MS),
-      ...init,
-    }, token, this.options.origin(), transport);
-    return fetch(request);
+    const deadline = new AbortController();
+    const timer = setTimeout(
+      () => deadline.abort(new DOMException('认证请求超时。', 'TimeoutError')),
+      this.options.requestTimeoutMs ?? SESSION_TIMEOUT_MS,
+    );
+    try {
+      const request = createOwnerRequest(input, {
+        cache: 'no-store',
+        signal: deadline.signal,
+        ...init,
+      }, token, this.options.origin(), transport);
+      return await fetch(request);
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   private post(path: string, body: unknown): Promise<Response> {
