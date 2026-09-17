@@ -270,8 +270,11 @@ INJECT_LITERALS = (
 # 会命中任何含该相邻串的正文行（实测误删：`他分享本站的帖子。` /
 # `“我分享本站的东西，你有意见？”` / `“大家都记住本站不迷路就好。”`）。
 # 锚定后匹配面 = 「整行只由该串 + 首尾空白/句读构成」，这才是「独立成行」的字面含义。
+# tail 是**行尾可接受的标点集**，方向上是「更容易删」，每次扩都要按正文句回归验一遍；
+# 之所以安全，是因为 `$` 仍要求字面串**之后整段**都在该集合内——`分享本站？他不敢相信。`
+# 里的「他不敢相信」不在集合内，照样不命中。
 _LITERAL_EDGE = r'[\s　]'
-_LITERAL_TAIL = r'[\s　。！!，,、…]'
+_LITERAL_TAIL = r'[\s　。！!，,、…？?；;：:~～—]'
 INJECT_LITERAL_PATTERNS = tuple(
     re.compile(r'^' + _LITERAL_EDGE + r'*' + re.escape(s) + _LITERAL_TAIL + r'*$')
     for s in INJECT_LITERALS

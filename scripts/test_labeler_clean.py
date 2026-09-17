@@ -245,6 +245,39 @@ class TestRound2PromoLiterals(unittest.TestCase):
             with self.subTest(line=line):
                 self.assertEqual(labeler._drop_rule(line), 'inject')
 
+    def test_literal_tail_punctuation_variants_are_dropped(self):
+        """行尾标点集（`_LITERAL_TAIL`）各变体都该剥——末轮补 `？?；;：:~～—` 的钉子。
+
+        变异钉：把 `_LITERAL_TAIL` 缩回旧集（去掉 `？?；;：:~～—`）本用例须变红。"""
+        for tail in ('', '。', '！', '!', '，', ',', '、', '…', '？', '?', '；', ';', '：', ':',
+                     '~', '～', '—', '。。。', '？？', '……', '。！？'):
+            with self.subTest(tail=tail):
+                self.assertEqual(labeler._drop_rule('记住本站不迷路' + tail), 'inject')
+                self.assertEqual(labeler._drop_rule('分享本站' + tail), 'inject')
+        for line in ('分享本站？', '分享本站：', '请记住本站网址~', '记住本站不迷路~',
+                     '记住本站不迷路——', '　分享本站。　'):  # 首尾全角空格
+            with self.subTest(line=line):
+                self.assertEqual(labeler._drop_rule(line), 'inject')
+
+    def test_punctuation_tail_does_not_widen_to_sentences(self):
+        """反向钉子：tail 只在**行尾**起作用，句中含字面串的正文句一律保留。
+
+        `$` 要求字面串之后整段都在标点集内，所以 `分享本站？他不敢相信。` 不命中。
+        特别钉住 `他喊：“分享本站！”`——整行**蕴含**口号但前面有说话人，必须保留。"""
+        for line in ('他喊：“分享本站！”', '她问：“分享本站？”',
+                     '“我分享本站？不可能。”', '“他分享本站：一个奇怪的说法。”',
+                     '“记住本站～然后呢？”',
+                     '分享本站？他不敢相信。', '分享本站——这只是个玩笑。',
+                     '分享本站：这句话他记得很清楚。',
+                     '记住本站不迷路，然后继续走。', '记住本站不迷路？他反问。',
+                     '记住本站不迷路：这才是重点。',
+                     '请记住本站网址；不然会走丢。', '请记住本站网址？他没听清。',
+                     '他念着“分享本站”这四个字。', '分享本站的口号他记了很多年。',
+                     '请你不要分享本站的链接，好吗？',
+                     '把记住本站不迷路写进了歌词里。'):
+            with self.subTest(line=line):
+                self.assertIsNone(labeler._drop_rule(line))
+
     def test_new_literals_stay_fixed_not_generalized(self):
         """约束钉子：补回的是固定字面，不是 `请?`/`(网址)?` 这类泛化。
 
