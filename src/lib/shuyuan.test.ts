@@ -213,8 +213,9 @@ describe('refreshShuyuan atomic refresh', () => {
 
     const res = await POST(req);
 
+    // P2-5：对外文案固定（错误消息可能含上游 URL，不再回显），状态码与失败语义不变。
     expect(res.status).toBe(502);
-    expect(await res.json()).toEqual({ error: '书源事务写入失败' });
+    expect(await res.json()).toEqual({ error: '刷新失败' });
     expect(transaction).toHaveBeenCalledOnce();
     expect(execute).toHaveBeenCalledTimes(2);
   });

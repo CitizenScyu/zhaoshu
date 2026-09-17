@@ -17,9 +17,11 @@ function memberRequest() {
   vi.stubEnv('AUTH_ACCOUNTS_ENABLED', 'true');
   return new NextRequest('http://localhost/api/library', { headers: { Cookie: 'nf-dev-session=member-a' } });
 }
-function ownerRequest(page?: string) {
+function ownerRequest(page?: string, query?: string, tag?: string) {
   const url = new URL('http://localhost/api/library');
   if (page !== undefined) url.searchParams.set('page', page);
+  if (query !== undefined) url.searchParams.set('q', query);
+  if (tag !== undefined) url.searchParams.set('tag', tag);
   return new NextRequest(url, { headers: { Authorization: 'Bearer library-test-owner' } });
 }
 function listQuery() {
@@ -166,5 +168,36 @@ describe('GET /api/library', () => {
     const res = await GET(ownerRequest());
     expect(res.status).toBe(500);
     expect(await res.json()).toEqual({ error: 'internal error', code: 'DB_ERROR' });
+  });
+
+  // P2-2：LIKE 通配符必须转义。判别力：摘掉 escapeLike（或 ESCAPE 子句）后，
+  // 绑定值变回原始用户输入，本组断言失败。
+  it.each([
+    { q: '100%', expected: '%100\\%%' },
+    { q: '副本_', expected: '%副本\\_%' },
+    { q: 'C:\\book', expected: '%c:\\\\book%' },
+  ])('q=$q 的 LIKE 模式绑定转义后的值 $expected', async ({ q, expected }) => {
+    const res = await GET(ownerRequest(undefined, q));
+    expect(res.status).toBe(200);
+    const list = listQuery();
+    expect(list?.text).toContain("LIKE ? ESCAPE '\\'");
+    // 同一个转义后的模式绑定给 title/author/labels 三处（事务批内 values 顺序收集）。
+    const likeValues = list?.values.filter((value) => value === expected);
+    expect(likeValues).toHaveLength(3);
+  });
+
+  it('tag 的 LIKE 模式同样转义（labels->>genre/style/tone 三处）', async () => {
+    const res = await GET(ownerRequest(undefined, undefined, '50%off'));
+    expect(res.status).toBe(200);
+    const list = listQuery();
+    expect(list?.text).toContain("LIKE ? ESCAPE '\\'");
+    expect(list?.values.filter((value) => value === '%50\\%off%')).toHaveLength(3);
+  });
+
+  it('普通中文/字母搜索不经转义改动，行为不变', async () => {
+    const res = await GET(ownerRequest(undefined, '仙侠'));
+    expect(res.status).toBe(200);
+    const list = listQuery();
+    expect(list?.values).toContain('%仙侠%');
   });
 });

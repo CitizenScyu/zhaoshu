@@ -68,8 +68,8 @@ export async function GET(req: NextRequest) {
   try {
     await access.run(ensureSchema);
     s = getSql();
-  } catch {
-    console.error('stats initialization failed');
+  } catch (e) {
+    console.error('stats initialization failed', e instanceof Error ? { message: e.message } : e);
     return NextResponse.json({ ...stats, error: '统计暂不可用，请稍后重试', code: 'STATS_UNAVAILABLE' }, { status: 503 });
   }
 
@@ -106,8 +106,8 @@ export async function GET(req: NextRequest) {
     };
     stats.availability.library = true;
     stats.sectionStates.library = 'ok';
-  } catch {
-    console.error('stats library aggregate failed');
+  } catch (e) {
+    console.error('stats library aggregate failed', e instanceof Error ? { message: e.message } : e);
   }
 
   // 下载任务自 auth schema v5 起有 NOT NULL 的 user_id，按当前用户统计；历史行归到用户 1。
@@ -122,8 +122,8 @@ export async function GET(req: NextRequest) {
     stats.download = rows[0];
     stats.availability.download = true;
     stats.sectionStates.download = 'ok';
-  } catch {
-    console.error('stats download aggregate failed');
+  } catch (e) {
+    console.error('stats download aggregate failed', e instanceof Error ? { message: e.message } : e);
   }
 
   try {
@@ -136,8 +136,8 @@ export async function GET(req: NextRequest) {
     stats.find = rows[0];
     stats.availability.find = true;
     stats.sectionStates.find = 'ok';
-  } catch {
-    console.error('stats find aggregate failed');
+  } catch (e) {
+    console.error('stats find aggregate failed', e instanceof Error ? { message: e.message } : e);
   }
 
   try {
@@ -148,24 +148,24 @@ export async function GET(req: NextRequest) {
     stats.shelf = { statuses: rows };
     stats.availability.shelf = true;
     stats.sectionStates.shelf = 'ok';
-  } catch {
-    console.error('stats shelf aggregate failed');
+  } catch (e) {
+    console.error('stats shelf aggregate failed', e instanceof Error ? { message: e.message } : e);
   }
 
   if (allowedSections.includes('shuyuan')) try {
     stats.shuyuan = await getShuyuanCounts();
     stats.availability.shuyuan = true;
     stats.sectionStates.shuyuan = 'ok';
-  } catch {
-    console.error('stats shuyuan aggregate failed');
+  } catch (e) {
+    console.error('stats shuyuan aggregate failed', e instanceof Error ? { message: e.message } : e);
   }
 
   if (allowedSections.includes('tokens')) try {
     stats.tokens = await access.run(getLlmUsageStats);
     stats.availability.tokens = true;
     stats.sectionStates.tokens = 'ok';
-  } catch {
-    console.error('stats tokens aggregate failed');
+  } catch (e) {
+    console.error('stats tokens aggregate failed', e instanceof Error ? { message: e.message } : e);
   }
 
   const available = allowedSections.map((section) => stats.availability[section]);

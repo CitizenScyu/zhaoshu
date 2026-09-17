@@ -5,7 +5,7 @@ import { verifyBatch } from '@/lib/douban';
 import { supplementSourceEvidence } from '@/lib/source-verification';
 import {
   ensureSchema,
-  getExcludedBookKeysForUser,
+  canonicalBookKey,
   getExcludedBookTitlesForUser,
   getProfileForUser,
   persistRecommendationsForUser,
@@ -179,10 +179,13 @@ export async function POST(req: NextRequest) {
         }
         emit({ type: 'phase', step: 'recall' });
         const profile = await atomicRead(() => getProfileForUser(userId));
+        // 排除集合一次取回（P2-1）：keys 与书单两份消费都从这一次查询派生，
+        // 不再对同一个 excludedBooksForUserQuery 各发一次往返。
+        const excludedDbRows = await atomicRead(() => getExcludedBookTitlesForUser(userId));
         const excludedKeys = new Set([
           ...profile.seeds.filter((seed) => seed.author?.trim())
             .map((seed) => bookKey(seed.title, seed.author!)),
-          ...(await atomicRead(() => getExcludedBookKeysForUser(userId))),
+          ...excludedDbRows.map((row) => canonicalBookKey(row.title, row.author)),
         ]);
         // 作者缺失时只按完整书名排除；仍用同一套 NFKC 规则，不误伤续篇。
         const excludedTitles = new Set(profile.seeds
@@ -197,7 +200,7 @@ export async function POST(req: NextRequest) {
         // 得改 user-data.ts 的查询（超出本任务的文件域）。
         const excludedBooksAll = [
           ...profile.seeds.map((seed) => ({ title: seed.title, author: seed.author ?? '' })),
-          ...(await atomicRead(() => getExcludedBookTitlesForUser(userId))),
+          ...excludedDbRows,
         ];
         const excludedBooks = excludedBooksAll.slice(0, EXCLUDED_BOOKS_PROMPT_LIMIT);
         const excludedBooksOmitted = excludedBooksAll.length - excludedBooks.length;
@@ -298,7 +301,7 @@ export async function POST(req: NextRequest) {
         } catch (e) {
           persisted = false;
           if (personalError(e).status !== 500) throw e;
-          console.error('persist failed');
+          console.error('persist failed', e instanceof Error ? { message: e.message, name: e.name } : e);
         }
         emit({ type: 'result', step: 'rerank', items, persisted });
         return;

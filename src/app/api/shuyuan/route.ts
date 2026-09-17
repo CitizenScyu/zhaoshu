@@ -48,8 +48,10 @@ export async function GET(req: NextRequest) {
       page: parseSourcePage(req.nextUrl.searchParams.get('page')),
     }));
   } catch (e) {
-    const message = e instanceof Error ? e.message : 'internal error';
-    return authJson({ error: message }, { status: 502 });
+    // 对外文案固定，不回 e.message：shuyuan.ts 的 fetch 失败消息含上游 URL，
+    // 原样返回会把源站地址泄给浏览器（audit P2-5）。错误详情进日志。
+    console.error('shuyuan stats failed', e instanceof Error ? { message: e.message } : e);
+    return authJson({ error: '书源统计暂不可用，请稍后重试' }, { status: 502 });
   }
 }
 
@@ -94,7 +96,8 @@ export async function POST(req: NextRequest) {
     const stats = await refreshShuyuan(req.signal);
     return authJson(stats);
   } catch (e) {
-    const message = e instanceof Error ? e.message : '刷新失败';
-    return authJson({ error: message }, { status: 502 });
+    // 同 GET：对外固定文案（POST 的失败消息同样可能含上游 URL），详情进日志。
+    console.error('shuyuan refresh failed', e instanceof Error ? { message: e.message } : e);
+    return authJson({ error: '刷新失败' }, { status: 502 });
   }
 }

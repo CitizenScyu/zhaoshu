@@ -18,6 +18,11 @@ const recordedQueries = () => mocks.sql.mock.calls.map(([parts, ...values]) => (
   text: (parts as string[]).join('?'), values: values as unknown[],
 }));
 
+// P2-4 批量改写后身份值整体 JSON 化进 jsonb_to_recordset 参数；
+// 归一断言改为解析 JSON 后核对（判别力等价：脏值仍在参数文本里可见）。
+const batchRows = (query: { text: string; values: unknown[] }) =>
+  JSON.parse(String(query.values.find((value) => String(value).startsWith('[')))) as { title: string; author: string }[];
+
 describe('db.ts persistRecommendationsForUser 透传不丢归一', () => {
   beforeEach(() => {
     vi.resetModules();
@@ -30,7 +35,7 @@ describe('db.ts persistRecommendationsForUser 透传不丢归一', () => {
   });
   afterEach(() => { vi.unstubAllEnvs(); });
 
-  it('经 db.ts 写库时，绑定到 INSERT INTO books 的仍是归一后的 title/author', async () => {
+  it('经 db.ts 写库时，批量参数里的仍是归一后的 title/author', async () => {
     const { persistRecommendationsForUser } = await import('./db');
     await persistRecommendationsForUser(1, '找书', [{
       title: '《修真聊天群》', author: 'ＡＢＣ', category: '', wordCount: '',
@@ -38,10 +43,10 @@ describe('db.ts persistRecommendationsForUser 透传不丢归一', () => {
     }] as never, write);
 
     const bookInsert = recordedQueries().find((q) => q.text.includes('INSERT INTO books'))!;
-    expect(bookInsert.values[0]).toBe('修真聊天群');
-    expect(bookInsert.values[1]).toBe('abc');
-    expect(bookInsert.values).not.toContain('《修真聊天群》');
-    expect(bookInsert.values).not.toContain('ＡＢＣ');
+    expect(bookInsert.values).toHaveLength(1); // 批量形态：单个 jsonb 参数
+    expect(batchRows(bookInsert)[0]).toMatchObject({ title: '修真聊天群', author: 'abc' });
+    expect(bookInsert.values[0]).not.toContain('《修真聊天群》');
+    expect(bookInsert.values[0]).not.toContain('ＡＢＣ');
   });
 
   it('全角冒号经整条链路也落到半角身份', async () => {
@@ -50,6 +55,6 @@ describe('db.ts persistRecommendationsForUser 透传不丢归一', () => {
       title: '修真聊天群：', author: 'Ｘ', category: '', wordCount: '',
       matchScore: 1, hitLikes: [], risks: '', reason: '',
     }] as never, write);
-    expect(recordedQueries().find((q) => q.text.includes('INSERT INTO books'))!.values[0]).toBe('修真聊天群:');
+    expect(batchRows(recordedQueries().find((q) => q.text.includes('INSERT INTO books'))!)[0].title).toBe('修真聊天群:');
   });
 });

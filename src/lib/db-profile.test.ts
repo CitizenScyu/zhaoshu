@@ -78,16 +78,14 @@ describe('profile database version contract (mocked HTTP queries)', () => {
 
   it('keeps excluded books isolated by required user id', async () => {
     mocks.sql.mockResolvedValue([{ title: '同一本书', author: '同一作者' }]);
-    const { getExcludedBookKeysForUser, getExcludedBookTitlesForUser } = await import('./db');
-    await getExcludedBookKeysForUser(11);
+    const { getExcludedBookTitlesForUser } = await import('./db');
     await getExcludedBookTitlesForUser(12);
     // T56-1 后排除集合同时查 recommendations 与 feedback，userId 在两条子查询里各绑定一次。
-    expect(mocks.sql.mock.calls[0].slice(1)).toEqual([11, 11]);
-    expect(mocks.sql.mock.calls[1].slice(1)).toEqual([12, 12]);
+    // P2-1 后 keys 从这次查询的返回值在内存派生，库只发这一条。
+    expect(mocks.sql.mock.calls).toHaveLength(1);
+    expect(mocks.sql.mock.calls[0].slice(1)).toEqual([12, 12]);
     expect(mocks.sql.mock.calls[0][0].join('?')).toContain('r.user_id = ?');
     expect(mocks.sql.mock.calls[0][0].join('?')).toContain('f.user_id = ?');
-    expect(mocks.sql.mock.calls[1][0].join('?')).toContain('r.user_id = ?');
-    expect(mocks.sql.mock.calls[1][0].join('?')).toContain('f.user_id = ?');
   });
 
   it('persists the same book and query independently for each user', async () => {

@@ -39,6 +39,14 @@ export function labelText(labels: unknown, key: string, maxLength = 600): string
 
 const SORTS = new Set(['quality', 'recent', 'oldest', 'title']);
 
+// LIKE 通配符转义（P2-2）：q/tag 来自用户输入，未转义的 %/_ 会变成通配符——
+// 既造成误匹配（搜 "100%" 命中一切含 100 的行），也放大扫描成本。反斜杠本身
+// 是 PG LIKE 的默认转义符，必须最先转义，且显式 ESCAPE '\\' 固定语义。
+// 转义只影响 LIKE 模式解释，不影响等值比较，中文书名不含这些字符时零变化。
+function escapeLike(value: string): string {
+  return value.replace(/([\\%_])/g, '\\$1');
+}
+
 export async function GET(req: NextRequest) {
   const auth = await requirePermission(req, 'find');
   if (!auth.ok) return withAuthHeaders(auth.response);
@@ -69,14 +77,14 @@ export async function GET(req: NextRequest) {
       // 动态条件拼装（neon 库的 tagged template 每个分支都要是完整 SQL 片段）
       const conds = [];
       if (query) {
-        const like = `%${query.toLowerCase()}%`;
-        conds.push(tx`(lower(title) LIKE ${like} OR lower(author) LIKE ${like} OR lower(labels::text) LIKE ${like})`);
+        const like = `%${escapeLike(query.toLowerCase())}%`;
+        conds.push(tx`(lower(title) LIKE ${like} ESCAPE '\\' OR lower(author) LIKE ${like} ESCAPE '\\' OR lower(labels::text) LIKE ${like} ESCAPE '\\')`);
       }
       if (category) conds.push(tx`(COALESCE(NULLIF(primary_genre, ''), category) = ${category})`);
       if (tag) {
-        const tagLike = `%${tag.toLowerCase()}%`;
+        const tagLike = `%${escapeLike(tag.toLowerCase())}%`;
         // 括号必须包住整个 OR 组：AND 优先级更高，裸拼会让 tag 分支绕过其他筛选
-        conds.push(tx`(lower(labels->>'genre') LIKE ${tagLike} OR lower(labels->>'style') LIKE ${tagLike} OR lower(labels->>'tone') LIKE ${tagLike})`);
+        conds.push(tx`(lower(labels->>'genre') LIKE ${tagLike} ESCAPE '\\' OR lower(labels->>'style') LIKE ${tagLike} ESCAPE '\\' OR lower(labels->>'tone') LIKE ${tagLike} ESCAPE '\\')`);
       }
       if (finish) conds.push(tx`finish_status = ${finish}`);
       // 动态条件拼装（neon tagged template 不支持 sql.join，用 AND 手动归并）
@@ -151,7 +159,8 @@ export async function GET(req: NextRequest) {
         finishStates: finishRows.map((r) => ({ name: r.finish_status, count: r.n })),
       },
     });
-  } catch {
+  } catch (e) {
+    console.error('library query failed', e instanceof Error ? { message: e.message } : e);
     return authJson({ error: 'internal error', code: 'DB_ERROR' }, { status: 500 });
   }
 }

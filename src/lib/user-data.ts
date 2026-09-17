@@ -183,37 +183,53 @@ export function persistRecommendationsForUserQueries(s: PersonalQuery, userId: n
   requireUserId(userId);
 
   // 写库前先按身份键归一：阻止新的《》/全半角/大小写变体继续在 books 里派生新行。
-  // 下面两条语句必须用同一份归一后的值——第二条靠 lower(title)=lower(...) 找回刚写的那行。
-  const identities = items.map((item) => identityOf(item.title, item.author));
-  const bookQueries = items.map((item, i) => {
-    const book = identities[i];
-    return s`
+  // 两条语句必须用同一份归一后的值——第二条靠身份键找回刚写的那行。
+  // 批量形态（P2-4）：原先每本两条语句（2N 条进同一事务批，10 本 = 20 条），现在
+  // 恒定两条：books 批量 upsert + recommendations 批量落库，身份经 jsonb 参数传入，
+  // 与 shuyuan.ts 的 jsonb_to_recordset 批插同一模式。j.title/j.author 是**归一后的
+  // 身份值**，与 books 的生成列 title_key/author_key 同源（book-identity.ts 对齐
+  // migrations/0002 的 SQL 表达式），因此 recommendations 侧的回查从旧的
+  // lower(title)=lower(...) 改为键等值比较——对已归一输入语义不变（见
+  // user-data.identity.test.ts 与 route.pglite.test.ts 的真库回归）。
+  const rows = items.map((item) => {
+    const book = identityOf(item.title, item.author);
+    return {
+      title: book.title,
+      author: book.author,
+      douban_id: item.douban?.doubanId ?? null,
+      rating: item.douban?.rating ?? null,
+      rating_count: item.douban?.ratingCount ?? null,
+      meta: { category: item.category, wordCount: item.wordCount },
+      match_score: item.matchScore,
+      hit_likes: item.hitLikes,
+      risks: item.risks,
+      reason: item.reason,
+    };
+  });
+  return [
+    s`
     INSERT INTO books (title, author, douban_id, douban_rating, douban_rating_count, meta)
-    VALUES (${book.title}, ${book.author}, ${item.douban?.doubanId ?? null},
-            ${item.douban?.rating ?? null}, ${item.douban?.ratingCount ?? null},
-            ${JSON.stringify({ category: item.category, wordCount: item.wordCount })}::jsonb)
+    SELECT title, author, douban_id, rating, rating_count, meta
+    FROM jsonb_to_recordset(${JSON.stringify(rows)}::jsonb)
+      AS j(title text, author text, douban_id text, rating float8, rating_count int, meta jsonb, match_score float8, hit_likes jsonb, risks text, reason text)
     ON CONFLICT (title_key, author_key) DO UPDATE
       SET douban_id = COALESCE(EXCLUDED.douban_id, books.douban_id),
           douban_rating = COALESCE(EXCLUDED.douban_rating, books.douban_rating),
           douban_rating_count = COALESCE(EXCLUDED.douban_rating_count, books.douban_rating_count),
-          meta = books.meta || EXCLUDED.meta`;
-  });
-  const recommendationQueries = items.map((item, i) => {
-    const book = identities[i];
-    return s`
+          meta = books.meta || EXCLUDED.meta`,
+    s`
     INSERT INTO recommendations (user_id, book_id, query, match_score, hit_likes, risks, reason)
-    SELECT ${userId}, id, ${query}, ${item.matchScore}, ${JSON.stringify(item.hitLikes)}::jsonb,
-           ${item.risks}, ${item.reason}
-    FROM books
-    WHERE lower(title) = lower(${book.title}) AND lower(author) = lower(${book.author})
+    SELECT ${userId}, b.id, ${query}, j.match_score, j.hit_likes, j.risks, j.reason
+    FROM jsonb_to_recordset(${JSON.stringify(rows)}::jsonb)
+      AS j(title text, author text, match_score float8, hit_likes jsonb, risks text, reason text)
+    JOIN books b ON b.title_key = j.title AND b.author_key = j.author
     ON CONFLICT (user_id, book_id, query) DO UPDATE
       SET match_score = EXCLUDED.match_score,
           hit_likes = EXCLUDED.hit_likes,
           risks = EXCLUDED.risks,
           reason = EXCLUDED.reason,
-          created_at = now()`;
-  });
-  return [...bookQueries, ...recommendationQueries];
+          created_at = now()`,
+  ];
 }
 
 // 追加式反馈历史同时是状态/note 编辑的审计记录。锁书籍行后比较最新反馈 id：
