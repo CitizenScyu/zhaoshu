@@ -7,12 +7,14 @@ export const metadata: Metadata = { title: '书源阅读 · 书径', robots: { i
 export const viewport: Viewport = { width: 'device-width', initialScale: 1, viewportFit: 'cover' };
 
 export default async function SourceReaderPage({ searchParams }: {
-  searchParams: Promise<{ title?: string | string[]; author?: string | string[]; from?: string | string[] }>;
+  searchParams: Promise<{ title?: string | string[]; author?: string | string[]; from?: string | string[]; book_url?: string | string[] }>;
 }) {
   const query = await searchParams;
   const title = cleanString(query.title, 200);
   const author = cleanString(query.author ?? '', 200);
   if (!title || (query.author && !author)) notFound();
   const from = query.from === 'shelf' || query.from === 'find' ? query.from : 'library';
-  return <ReaderClient session={{ kind: 'source', title, author }} from={from} />;
+  // 模糊候选的用户确认路径：点选候选后 URL 带 book_url 重放（服务端再做白名单校验）。
+  const bookUrl = cleanString(query.book_url ?? '', 2048);
+  return <ReaderClient session={{ kind: 'source', title, author, ...(bookUrl ? { bookUrl } : {}) }} from={from} />;
 }

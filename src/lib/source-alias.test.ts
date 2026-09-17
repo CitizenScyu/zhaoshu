@@ -3,12 +3,13 @@
 // 覆盖任务书的五类场景：①简介【原书名：X】解析；②别名命中 sourceBookMatches；
 // ③作者回退搜索拿到改名候选→命中；④同名不同书的负对照（别名不得引入误命中）；
 // ⑤归一化容错（全半角括号）。
+// 追加：模糊降级层（L3）——sourceTitleSimilarity 判据 + 模糊候选不直接 404。
 //
 // 该文件在基线 763afe0（无别名机制）上应全红，在修复后应全绿。
 
 import { describe, expect, it } from 'vitest';
 import {
-  parseSourceDetailLinks, parseSourceIdentity, sourceBookMatches,
+  parseSourceDetailLinks, parseSourceIdentity, sourceBookMatches, sourceTitleSimilarity,
 } from './source-parser';
 
 describe('source alias parsing', () => {
@@ -84,5 +85,32 @@ describe('sourceBookMatches with aliases', () => {
 
   it('does not let an empty alias match an empty expected title', () => {
     expect(sourceBookMatches({ title: '', author: '' }, { title: '', author: '', alias: '' })).toBe(false);
+  });
+});
+
+describe('sourceTitleSimilarity (fuzzy tier thresholds)', () => {
+  it('ranks exact and alias matches at tier 0', () => {
+    expect(sourceTitleSimilarity('我有一座恐怖屋', { title: '我有一座冒险屋', author: 'x', alias: '我有一座恐怖屋' })).toBe(0);
+    expect(sourceTitleSimilarity('我有一座恐怖屋', { title: '我有一座恐怖屋', author: 'x' })).toBe(0);
+  });
+
+  it('ranks decoration-stripped equality at tier 1', () => {
+    expect(sourceTitleSimilarity('我有一座恐怖屋', { title: '我有一座恐怖屋（精品版）', author: 'x' })).toBe(1);
+    expect(sourceTitleSimilarity('我有一座恐怖屋', { title: '我有一座恐怖屋：修订版', author: 'x' })).toBe(1);
+  });
+
+  it('ranks containment at tier 2 only when the shorter side is at least 4 chars', () => {
+    expect(sourceTitleSimilarity('我有一座恐怖屋', { title: '我有一座恐怖屋全本', author: 'x' })).toBe(2);
+    expect(sourceTitleSimilarity('我有一座恐怖屋', { title: '恐怖屋', author: 'x' })).not.toBe(2);
+  });
+
+  it('ranks small typos at tier 3', () => {
+    expect(sourceTitleSimilarity('我有一座恐怖屋', { title: '我有一座恐布屋', author: 'x' })).toBe(3);
+  });
+
+  it('rejects unrelated books entirely (negative control)', () => {
+    expect(sourceTitleSimilarity('我有一座恐怖屋', { title: '全球高武', author: 'x' })).toBe(Number.POSITIVE_INFINITY);
+    expect(sourceTitleSimilarity('我有一座恐怖屋', { title: '超神机械师', author: 'x', alias: '全球高武' })).toBe(Number.POSITIVE_INFINITY);
+    expect(sourceTitleSimilarity('我有一座恐怖屋', { title: '', author: 'x' })).toBe(Number.POSITIVE_INFINITY);
   });
 });

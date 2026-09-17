@@ -80,6 +80,10 @@
 .liveStatus:empty { display: none; }
 .errorBar { display: flex; justify-content: center; align-items: center; gap: 16px; flex-wrap: wrap; padding: 8px 20px; color: var(--reader-accent); background: var(--reader-paper); font-size: 14px; }
 .errorText { color: var(--reader-accent) !important; }
+.similarList { display: flex; flex-direction: column; gap: 8px; flex-shrink: 0; max-height: 40vh; overflow: auto; padding: 8px 20px 12px; }
+.similarItem { display: flex; flex-direction: column; gap: 4px; padding: 10px 14px; text-align: left; background: var(--reader-paper); border: 1px solid var(--reader-line); border-radius: 4px; color: inherit; font: inherit; cursor: pointer; }
+.similarItem:hover, .similarItem:focus-visible { border-color: var(--reader-accent); }
+.similarItem span { color: var(--reader-muted); font-size: 12px; }
 .scroller { flex: 1; min-height: 0; overflow: auto; overscroll-behavior: contain; scrollbar-gutter: stable both-edges; scroll-behavior: auto; }
 .scroller::-webkit-scrollbar, .directoryList::-webkit-scrollbar { width: 8px; }
 .scroller::-webkit-scrollbar-track, .directoryList::-webkit-scrollbar-track { background: var(--reader-bg); }

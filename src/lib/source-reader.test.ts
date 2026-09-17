@@ -101,7 +101,10 @@ describe('online reader source resolution and budgets', () => {
 
   it('rejects a same-title work by a different author', async () => {
     pages.set(pageUrl(), { text: detail(42, '其他作者') });
-    await expect(service.resolveSourceBook(book, context())).rejects.toMatchObject({ code: 'SOURCE_NOT_FOUND' });
+    // 模糊层语义：标题对得上但作者不符 ⇒ 不自动取书，改交用户选（SOURCE_SIMILAR + 候选）。
+    await expect(service.resolveSourceBook(book, context())).rejects.toMatchObject({
+      code: 'SOURCE_SIMILAR', candidates: [{ title: '测试书', author: '其他作者' }],
+    });
   });
 
   it('refuses ambiguous title-only matches', async () => {
@@ -212,7 +215,7 @@ describe('online reader source resolution and budgets', () => {
 
   it('does not mis-pair an alias candidate whose author differs (renamed-book negative control)', async () => {
     // 目标《改名书》作者 A；作者搜索按 A 命中的唯一候选其实是另一作者的同素材书，
-    // 其简介自报的原书名恰好也叫《改名书》。作者门必须拒 ⇒ 404。
+    // 其简介自报的原书名恰好也叫《改名书》。作者门必须拒 ⇒ 不自动取书；模糊层列为候选。
     const target = { title: '改名书', author: '作者A' };
     const authorSearch = 'https://book15.net/books/search.html?kw=' + encodeURIComponent(target.author);
     pages.set('https://book15.net/books/search.html?kw=' + encodeURIComponent(target.title), { text: '' });
@@ -222,7 +225,10 @@ describe('online reader source resolution and budgets', () => {
         + '<div>小说简介:【原书名：改名书】正文</div>'
         + '<dd><a href="/chapter/index7-1.html">第一章</a></dd>',
     });
-    await expect(service.resolveSourceBook(target, context())).rejects.toMatchObject({ code: 'SOURCE_NOT_FOUND' });
+    await expect(service.resolveSourceBook(target, context())).rejects.toMatchObject({
+      code: 'SOURCE_SIMILAR',
+      candidates: [{ title: '站点新书', author: '作者B', alias: '改名书' }],
+    });
   });
 
   it('does not run the author-search fallback when the title already matched', async () => {
@@ -231,6 +237,55 @@ describe('online reader source resolution and budgets', () => {
     const catalog = await service.resolveSourceBook(book, context());
     expect(catalog.bookUrl).toBe(pageUrl());
     expect(mocks.fetch).toHaveBeenCalledTimes(2); // title search + detail only, no author search
+  });
+
+  it('returns similar candidates instead of 404 when the site has fuzzy-titled detail pages', async () => {
+    // 标题搜索只有一个「书名对得上但作者不符」的候选（用户痛点：站点作者挂错/为空）。
+    // 精确层拒，模糊层必须收集并列出，不能直接 SOURCE_NOT_FOUND。
+    pages.set('https://book15.net/books/search.html?kw=' + encodeURIComponent(book.title), {
+      text: '<a href="/books/details42.html">测试书</a>',
+    });
+    pages.set(pageUrl(), { text: detail(42, '站点挂错的作者') });
+    await expect(service.resolveSourceBook(book, context())).rejects.toMatchObject({
+      code: 'SOURCE_SIMILAR',
+      candidates: [{ title: '测试书', author: '站点挂错的作者', chapters: 2, bookUrl: pageUrl() }],
+    });
+  });
+
+  it('excludes unrelated books from similar candidates (negative control)', async () => {
+    // 作者搜索命中两个候选：一个书名相似（作者不符）、一个完全无关 —— 只有前者可进候选。
+    // 书名取「我的改名书」（≥4 字）以覆盖包含判据；无关书共享 ≤1 字必须被淘汰。
+    const target = { title: '我的改名书', author: '作者A' };
+    const authorSearch = 'https://book15.net/books/search.html?kw=' + encodeURIComponent(target.author);
+    const unrelatedDetail = (id: number, title: string, author: string) =>
+      `<meta property="og:novel:book_name" content="${title}"><meta property="og:novel:author" content="${author}">`
+      + '<dd><a href="/chapter/index' + id + '-1.html">第一章</a></dd>';
+    pages.set('https://book15.net/books/search.html?kw=' + encodeURIComponent(target.title), { text: '' });
+    pages.set(authorSearch, {
+      text: '<a href="/books/details7.html">我的改名书·全本</a><a href="/books/details8.html">全球高武</a>',
+    });
+    pages.set('https://book15.net/books/details7.html', { text: unrelatedDetail(7, '我的改名书·全本', '别人') });
+    pages.set('https://book15.net/books/details8.html', { text: unrelatedDetail(8, '全球高武', '别人') });
+    await expect(service.resolveSourceBook(target, context())).rejects.toMatchObject({
+      code: 'SOURCE_SIMILAR',
+      candidates: [{ title: '我的改名书·全本' }],
+    });
+  });
+
+  it('resolves a user-confirmed book_url without title/author matching', async () => {
+    // 用户在候选列表点选后的确认重放：bookUrl 即用户决定，跳过书名/作者校验。
+    pages.set('https://book15.net/books/details77.html', {
+      text: detail(77, '随便什么作者')
+        .replace('content="测试书"', 'content="随便什么书名"'),
+    });
+    const catalog = await service.resolveSourceBook(book, context(), { bookUrl: 'https://book15.net/books/details77.html' });
+    expect(catalog).toMatchObject({ title: '随便什么书名', author: '随便什么作者', bookUrl: 'https://book15.net/books/details77.html' });
+    expect(mocks.fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it('still rejects a confirmed book_url outside the source allowlist', async () => {
+    await expect(service.resolveSourceBook(book, context(), { bookUrl: 'https://evil.invalid/books/details1.html' }))
+      .rejects.toThrow();
   });
 });
 

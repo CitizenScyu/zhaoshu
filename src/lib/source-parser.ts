@@ -24,6 +24,54 @@ export function sourceBookMatches(expected: SourceBookIdentity, actual: SourceBo
     && (!author || author === knownSourceAuthor(actual.author)));
 }
 
+// ---- 模糊降级层（L3）的相似度判据 ----
+// 从宽但有底线：完全无关的书（共享字符太少、既不包含也不近似）不得进入候选。
+// 分值越小越靠前；Number.POSITIVE_INFINITY 表示「不相似，淘汰」。
+const MIN_CONTAINMENT_LENGTH = 4;
+const MAX_EDIT_DISTANCE = 2;
+
+// 去副标题/书名号等修饰后再比较：「书名（精品版）」「书名：修订版」→「书名」。
+function stripTitleDecorations(value: string): string {
+  return value.replace(/[（(][^（()）]*[）)]/gu, '').replace(/[:：].*$/u, '').replace(/[·\s]/gu, '');
+}
+
+function editDistance(a: string, b: string): number {
+  if (a === b) return 0;
+  if (!a.length) return b.length;
+  if (!b.length) return a.length;
+  let previous = Array.from({ length: b.length + 1 }, (_, i) => i);
+  for (let i = 1; i <= a.length; i++) {
+    const current = [i];
+    for (let j = 1; j <= b.length; j++) {
+      current[j] = Math.min(previous[j] + 1, current[j - 1] + 1, previous[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+    }
+    previous = current;
+  }
+  return previous[b.length];
+}
+
+/**
+ * 期望书名 vs 候选（书名或别名任一）的相似档位。
+ * 0 = 精确相等（含别名）；1 = 去副标题/书名号后相等；2 = 归一化互相包含；
+ * 3 = 编辑距离 ≤2；Infinity = 不相似（负对照锚点：完全无关的书必须落这里）。
+ */
+export function sourceTitleSimilarity(expectedTitle: string, candidate: SourceBookIdentity): number {
+  const expected = normalizeSourceTitle(expectedTitle);
+  if (!expected) return Number.POSITIVE_INFINITY;
+  const candidates = [candidate.title, ...(candidate.alias ? [candidate.alias] : [])].map(normalizeSourceTitle);
+  let best = Number.POSITIVE_INFINITY;
+  for (const actual of candidates) {
+    if (!actual) continue;
+    if (actual === expected) best = Math.min(best, 0);
+    if (stripTitleDecorations(actual) === stripTitleDecorations(expected)) best = Math.min(best, 1);
+    const shorter = actual.length < expected.length ? actual : expected;
+    const longer = actual.length < expected.length ? expected : actual;
+    if (shorter.length >= MIN_CONTAINMENT_LENGTH && longer.includes(shorter)) best = Math.min(best, 2);
+    if (editDistance(actual, expected) <= MAX_EDIT_DISTANCE) best = Math.min(best, 3);
+  }
+  return best;
+}
+
 function plainText(html: string): string {
   return decodeHTML(html.replace(/<(script|style)\b[^>]*>[\s\S]*?<\/\1\s*>/gi, '').replace(/<[^>]+>/g, ''))
     .replace(/\u0000/g, '').trim();
