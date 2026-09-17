@@ -40,17 +40,38 @@ const MAX_CONDITIONS_LENGTH = 1_000;
 // 上游是推理模型，思考链会把单步拉到 190s 上下，旧的 220s 会稳定截断。
 const MODEL_CEILING_MS = 260_000;
 
-// 模型输出始终从 unknown 收窄；数量异常也属于上游错误，不能当成内部 500。
+// 模型输出始终从 unknown 收窄；形状偏了也尽量收容——整份正文是已付费的输出，
+// 丢掉它要赔上整步预算重跑，而真正的形状校验在下游（见下）。
 function modelList(raw: string, field: 'candidates' | 'items', max: number): unknown[] {
   const parsed = parseJson(raw);
-  if (!isRecord(parsed)) {
+  // 根直接是数组是不同模型族常见的「少包一层」写法（兜底模型尤其容易），收容它；
+  // 其余非对象根（字符串/数字/null）仍是上游格式错误，文案与 retryable 语义不变。
+  if (!Array.isArray(parsed) && !isRecord(parsed)) {
     throw new LlmError('模型返回的 JSON 根节点必须是对象，请重试。', false);
   }
-  const list = parsed[field];
-  if (!Array.isArray(list) || list.length === 0 || list.length > max) {
+  let list: unknown;
+  if (Array.isArray(parsed)) {
+    list = parsed;
+  } else {
+    list = parsed[field];
+    // 字段**缺失**时再尽力一次：若对象里**恰好只有一个**「值为非空数组」的属性，就认它是书单。
+    // 覆盖的是「兜底模型用了别的字段名」这一族（task-50 推断的两个候选之一，正文不入库所以
+    // 无法证实是哪一族）。条件刻意收窄到「恰好一个」：多个数组属性时无法判断哪个是书单，
+    // 猜错会把无关数据当成候选。字段存在但不是数组（含 null）**不**走这条路——那是形态错误，
+    // 不是命名差异。
+    if (list === undefined) {
+      const arrays = Object.values(parsed).filter((value) => Array.isArray(value) && value.length > 0);
+      if (arrays.length === 1) list = arrays[0];
+    }
+  }
+  if (!Array.isArray(list) || list.length === 0) {
     throw new LlmError('模型返回的书单字段或数量无效，请重试。', false);
   }
-  return list;
+  // 数量超限截断而不是抛：下游 sanitizeCandidates / sanitizeRerankedItems 第一行就是
+  // slice(0, MAX_CANDIDATES / MAX_RERANKED_ITEMS)。在这里为「数量」再抛一次是重复且更严格的
+  // 校验，代价是丢掉整份输出并触发整步重跑（2026-09-17 那次 260.3s 失败）。空数组仍抛错——
+  // 空不是「可收容」的形状。
+  return list.length > max ? list.slice(0, max) : list;
 }
 
 // 剩余预算低于这个值就放弃第二次尝试——一次上游往返至少要留下可用的时间。

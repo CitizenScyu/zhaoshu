@@ -87,8 +87,10 @@ describe('POST /api/find output contract', () => {
     expect(mocks.chatRobust).not.toHaveBeenCalled();
   });
 
+  // 根**不是**对象也不是数组（含解析失败）→ 仍是格式错误。空数组根不在这里：
+  // 它算「书单为空」，报的是字段/数量那条（见下面「尽力收容」用例）。
   it.each(['recall', 'rerank'])('returns an error event for invalid %s JSON and root shapes', async (step) => {
-    for (const raw of ['null', '[]', '"text"', '42', 'false', '{bad json', '{"items":']) {
+    for (const raw of ['null', '"text"', '42', 'false', '{bad json', '{"items":']) {
       mocks.chatRobust.mockResolvedValue(raw);
       const res = await POST(request({ step, query: '找书', verified: [verified] }));
       const events = await consumeSSE(res);
@@ -98,15 +100,88 @@ describe('POST /api/find output contract', () => {
   });
 
   it.each([
-    { step: 'recall', field: 'candidates', max: 12 },
-    { step: 'rerank', field: 'items', max: 10 },
-  ])('validates the $field field and count as an error event', async ({ step, field, max }) => {
-    for (const list of [undefined, null, false, {}, 'wrong', [], Array.from({ length: max + 1 }, () => item)]) {
+    { step: 'recall', field: 'candidates' },
+    { step: 'rerank', field: 'items' },
+  ])('validates the $field field as an error event', async ({ step, field }) => {
+    // 数量超限**不再**报错：modelList 截断、下游 sanitize 本来就会 slice（见「尽力收容」用例）。
+    for (const list of [undefined, null, false, {}, 'wrong', []]) {
       mocks.chatRobust.mockResolvedValue(JSON.stringify({ [field]: list }));
       const events = await consumeSSE(await POST(request({ step, query: '找书', verified: [verified] })));
       expect(lastEvent<{ type: string; message: string }>(events, 'error').message).toMatch(/字段或数量/);
       expect(mocks.persistRecommendationsForUser).not.toHaveBeenCalled();
     }
+  });
+
+  // 🔴 项 1：根直接是数组（不同模型族常见的「少包一层」）不再丢掉整份输出。
+  // 2026-09-17 那次线上失败就是「兜底模型交了完整正文，modelList 的形状校验把它整份丢掉
+  // 并触发重跑整步」。判别力：把 modelList 改回 `!isRecord(parsed)` 即抛，本用例必须失败。
+  it('salvages a root-level array instead of discarding the whole answer', async () => {
+    mocks.chatRobust.mockResolvedValue(JSON.stringify([candidate]));
+    const events = await consumeSSE(await POST(request({ step: 'recall', query: '找书' })));
+    expect(lastEvent<{ candidates: unknown[] }>(events, 'result').candidates).toEqual([{ ...candidate, source: 'llm' }]);
+    // 关键护栏：收容成功 = 不再白烧剩余预算重跑整步。
+    expect(mocks.chatRobust).toHaveBeenCalledOnce();
+  });
+
+  it('salvages a root-level array for rerank too', async () => {
+    mocks.chatRobust.mockResolvedValue(JSON.stringify([{ ...item, matchScore: 80 }]));
+    const events = await consumeSSE(await POST(request({ step: 'rerank', query: '找书', verified: [verified] })));
+    expect(lastEvent<{ items: unknown[] }>(events, 'result').items).toHaveLength(1);
+    expect(mocks.chatRobust).toHaveBeenCalledOnce();
+  });
+
+  // 数量超限：截断而不是抛。下游 sanitizeCandidates / sanitizeRerankedItems 第一行就是
+  // slice(0, MAX_CANDIDATES / MAX_RERANKED_ITEMS)，所以这里再抛一次是重复且更严格的校验。
+  // 判别力：把 `list.length > max` 改回抛错，本用例必须失败（会变成 LLM_ERROR + 调用 2 次）。
+  it('truncates an over-long candidates list to 12 instead of throwing it away', async () => {
+    mocks.chatRobust.mockResolvedValue(JSON.stringify({
+      candidates: Array.from({ length: 13 }, (_, i) => ({ ...candidate, title: `书${i}` })),
+    }));
+    const events = await consumeSSE(await POST(request({ step: 'recall', query: '找书' })));
+    expect(lastEvent<{ candidates: unknown[] }>(events, 'result').candidates).toHaveLength(12);
+    expect(mocks.chatRobust).toHaveBeenCalledOnce();
+  });
+
+  it('truncates an over-long items list to 10 instead of throwing it away', async () => {
+    // rerank 的输出要能按书名+作者关联回输入集合，所以这里造 11 本互不相同的已验证作品。
+    const books = Array.from({ length: 11 }, (_, i) => ({ ...verified, title: `书${i}` }));
+    mocks.chatRobust.mockResolvedValue(JSON.stringify({
+      items: books.map((book) => ({ ...item, title: book.title })),
+    }));
+    const events = await consumeSSE(await POST(request({ step: 'rerank', query: '找书', verified: books })));
+    expect(lastEvent<{ items: unknown[] }>(events, 'result').items).toHaveLength(10);
+    expect(mocks.chatRobust).toHaveBeenCalledOnce();
+  });
+
+  // 收容也有底线：空数组不是「可收容」的形状，仍报字段/数量错。
+  it('still rejects an empty root array (empty is not a salvageable shape)', async () => {
+    mocks.chatRobust.mockResolvedValue('[]');
+    const events = await consumeSSE(await POST(request({ step: 'recall', query: '找书' })));
+    expect(lastEvent<{ code: string; message: string }>(events, 'error').message).toMatch(/字段或数量/);
+  });
+
+  // 项 1b（已批准、收窄）：字段**缺失**且对象里恰好只有一个非空数组属性 → 认它是书单。
+  // 覆盖「兜底模型用了别的字段名」这一族（task-50 推断的两个候选之一）。
+  it('salvages a differently-named field when it is the only non-empty array', async () => {
+    mocks.chatRobust.mockResolvedValue(JSON.stringify({ books: [candidate] }));
+    const events = await consumeSSE(await POST(request({ step: 'recall', query: '找书' })));
+    expect(lastEvent<{ candidates: unknown[] }>(events, 'result').candidates).toEqual([{ ...candidate, source: 'llm' }]);
+    expect(mocks.chatRobust).toHaveBeenCalledOnce();
+  });
+
+  it('salvages a differently-named field for rerank too', async () => {
+    mocks.chatRobust.mockResolvedValue(JSON.stringify({ ranking: [{ ...item, matchScore: 80 }] }));
+    const events = await consumeSSE(await POST(request({ step: 'rerank', query: '找书', verified: [verified] })));
+    expect(lastEvent<{ items: unknown[] }>(events, 'result').items).toHaveLength(1);
+    expect(mocks.chatRobust).toHaveBeenCalledOnce();
+  });
+
+  // 收窄条件必须钉住：**恰好一个**才收容。两个数组属性时无法判断哪个是书单，猜错会把无关
+  // 数据当成候选，所以照旧抛错。（这条用例是「不要放宽成『随便挑一个数组』」的护栏。）
+  it('does not guess when more than one non-empty array property exists', async () => {
+    mocks.chatRobust.mockResolvedValue(JSON.stringify({ books: [candidate], notes: ['无关'] }));
+    const events = await consumeSSE(await POST(request({ step: 'recall', query: '找书' })));
+    expect(lastEvent<{ code: string; message: string }>(events, 'error').message).toMatch(/字段或数量/);
   });
 
   it('deduplicates recalled equivalents without dropping a different author', async () => {

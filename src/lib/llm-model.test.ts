@@ -283,7 +283,7 @@ describe('probeModel：保存前验证的三态推理判定', () => {
     await vi.advanceTimersByTimeAsync(client.MODEL_PROBE_TIMEOUT_MS);
     const probe = await pending;
     expect(probe.ok).toBe(false);
-    expect(probe.reason).toMatch(/总超时（30s）/);
+    expect(probe.reason).toMatch(/总超时（剩余预算 30s）/);
   });
 
   it('探测独立超时仍远小于路由的 maxDuration，慢模型不会被平台砍掉', async () => {
