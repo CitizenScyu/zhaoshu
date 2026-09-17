@@ -211,25 +211,3 @@ export async function recordFeedbackForUser(userId: number, book: { title: strin
     throw error;
   }
 }
-
-export async function upsertBook(b: {
-  title: string;
-  author: string;
-  doubanId?: string | null;
-  doubanRating?: number | null;
-  doubanRatingCount?: number | null;
-  meta?: Record<string, unknown>;
-}): Promise<number> {
-  const s = getSql();
-  const rows = (await s`
-    INSERT INTO books (title, author, douban_id, douban_rating, douban_rating_count, meta)
-    VALUES (${b.title}, ${b.author}, ${b.doubanId ?? null}, ${b.doubanRating ?? null},
-            ${b.doubanRatingCount ?? null}, ${JSON.stringify(b.meta ?? {})}::jsonb)
-    ON CONFLICT (lower(title), lower(author)) DO UPDATE
-      SET douban_id = COALESCE(EXCLUDED.douban_id, books.douban_id),
-          douban_rating = COALESCE(EXCLUDED.douban_rating, books.douban_rating),
-          douban_rating_count = COALESCE(EXCLUDED.douban_rating_count, books.douban_rating_count),
-          meta = books.meta || EXCLUDED.meta
-    RETURNING id`) as { id: number }[];
-  return rows[0].id;
-}

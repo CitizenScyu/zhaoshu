@@ -5,7 +5,7 @@ import { LLM_USAGE_PHASES, type LlmUsagePhase } from '@/lib/llm-usage';
 // 真实路由 → chatRobust → SSE/JSON → after → 真实用量写库函数，只 mock 网络与业务数据。
 const mocks = vi.hoisted(() => ({
   after: vi.fn(), pending: [] as (() => Promise<void>)[],
-  ensureSchema: vi.fn(), getProfileForUser: vi.fn(), saveProfileForUser: vi.fn(), upsertBook: vi.fn(),
+  ensureSchema: vi.fn(), getProfileForUser: vi.fn(), saveProfileForUser: vi.fn(),
   getSql: vi.fn(), businessSql: vi.fn(), transaction: vi.fn(),
   getExcludedBookKeysForUser: vi.fn(), getExcludedBookTitlesForUser: vi.fn(), persistRecommendationsForUser: vi.fn(),
   neon: vi.fn(), usageSql: vi.fn(), verifyBatch: vi.fn(), getFeedbackSnapshotForUser: vi.fn(),
@@ -24,7 +24,7 @@ vi.mock('@/lib/db', async (importOriginal) => ({
     });
   },
   ensureSchema: mocks.ensureSchema, getProfileForUser: mocks.getProfileForUser, saveProfileForUser: mocks.saveProfileForUser,
-  getSql: mocks.getSql, upsertBook: mocks.upsertBook,
+  getSql: mocks.getSql,
   getFeedbackSnapshotForUser: mocks.getFeedbackSnapshotForUser,
   getExcludedBookKeysForUser: mocks.getExcludedBookKeysForUser, getExcludedBookTitlesForUser: mocks.getExcludedBookTitlesForUser,
   persistRecommendationsForUser: mocks.persistRecommendationsForUser,
@@ -126,7 +126,6 @@ describe('usage instrumentation through all model routes', () => {
     mocks.ensureSchema.mockResolvedValue(undefined);
     mocks.getProfileForUser.mockResolvedValue({ seeds: [{ title: '种子书', kind: 'love' }], content: '原画像', updatedAt: 'v1' });
     mocks.saveProfileForUser.mockResolvedValue('v2');
-    mocks.upsertBook.mockResolvedValue(42);
     mocks.getExcludedBookKeysForUser.mockResolvedValue([]);
     mocks.getExcludedBookTitlesForUser.mockResolvedValue([]);
     mocks.persistRecommendationsForUser.mockResolvedValue(undefined);

@@ -5,7 +5,6 @@ import { composeFeedbackNote, MAX_FEEDBACK_NOTE_LENGTH } from '@/lib/feedback';
 const mocks = vi.hoisted(() => ({
   ensureSchema: vi.fn(),
   getSql: vi.fn(),
-  upsertBook: vi.fn(),
   getProfileForUser: vi.fn(),
   saveProfileForUser: vi.fn(),
   getFeedbackSnapshotForUser: vi.fn(),
@@ -29,7 +28,6 @@ vi.mock('@/lib/db', async (importOriginal) => ({
   },
   ensureSchema: mocks.ensureSchema,
   getSql: mocks.getSql,
-  upsertBook: mocks.upsertBook,
   getProfileForUser: mocks.getProfileForUser,
   saveProfileForUser: mocks.saveProfileForUser,
   getFeedbackSnapshotForUser: mocks.getFeedbackSnapshotForUser,
@@ -59,7 +57,6 @@ describe('POST /api/feedback note contract', () => {
     vi.stubEnv('APP_OWNER_TOKEN', 'feedback-test-owner');
     mocks.ensureSchema.mockResolvedValue(undefined);
     mocks.getSql.mockReturnValue(Object.assign(mocks.sql, { transaction: mocks.transaction }));
-    mocks.upsertBook.mockResolvedValue(42);
     mocks.transaction.mockResolvedValue([]);
     mocks.writeResults = [];
     // 每本书默认还没有反馈：CAS 期望版本 0 与读到的快照一致。

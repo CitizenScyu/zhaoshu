@@ -222,7 +222,7 @@ async function writeImportRecord(sql, record) {
             ${record.sourceSite}, ${record.sourceUrl ?? ''}, ${record.charsLabeled},
             ${JSON.stringify(record.labels)}::jsonb, now(),
             ${record.primaryGenre}, ${JSON.stringify(record.subTags)}::jsonb, ${record.quality})
-    ON CONFLICT (lower(title), lower(author)) DO UPDATE SET
+    ON CONFLICT (title_key, author_key) DO UPDATE SET
       labels = EXCLUDED.labels,
       finish_status = EXCLUDED.finish_status,
       chars_labeled = EXCLUDED.chars_labeled,
@@ -235,7 +235,7 @@ async function writeImportRecord(sql, record) {
 
 // R02 前置逐记录拦截（最小实现，原型）：写入前检查本条记录归一后的身份键是否会
 // 与既有「非不动点行」碰撞 —— 即某条存量行的 author 不等于它自身的归一结果，
-// 却与本次待写入的 author 归一后相同。这类行 ON CONFLICT(lower(title),lower(author))
+// 却与本次待写入的 author 归一后相同。这类行 ON CONFLICT (title_key, author_key)
 // 匹配不到，直接写就会凭空多一条重复。碰撞则跳过该条写入；只读，不改 DDL，
 // 也不合并/改写任何存量行的身份。
 //

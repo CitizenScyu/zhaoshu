@@ -50,7 +50,7 @@ export function addShelfForUserQueries(sql: PersonalQuery, userId: number, title
   const book = identityOf(title, author);
   return [
     sql`INSERT INTO books (title, author, meta) VALUES (${book.title}, ${book.author}, '{}'::jsonb)
-      ON CONFLICT (lower(title), lower(author)) DO NOTHING`,
+      ON CONFLICT (title_key, author_key) DO NOTHING`,
     sql`INSERT INTO recommendations (user_id, book_id, query, status)
       SELECT ${userId}, b.id, ${'书库添加'}, ${'want'} FROM books b
       WHERE lower(b.title) = lower(${book.title}) AND lower(b.author) = lower(${book.author})
@@ -167,7 +167,7 @@ export function persistRecommendationsForUserQueries(s: PersonalQuery, userId: n
     VALUES (${book.title}, ${book.author}, ${item.douban?.doubanId ?? null},
             ${item.douban?.rating ?? null}, ${item.douban?.ratingCount ?? null},
             ${JSON.stringify({ category: item.category, wordCount: item.wordCount })}::jsonb)
-    ON CONFLICT (lower(title), lower(author)) DO UPDATE
+    ON CONFLICT (title_key, author_key) DO UPDATE
       SET douban_id = COALESCE(EXCLUDED.douban_id, books.douban_id),
           douban_rating = COALESCE(EXCLUDED.douban_rating, books.douban_rating),
           douban_rating_count = COALESCE(EXCLUDED.douban_rating_count, books.douban_rating_count),
