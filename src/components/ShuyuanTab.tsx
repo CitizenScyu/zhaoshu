@@ -4,7 +4,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { useOwner } from '@/components/OwnerProvider';
 import type { ShuyuanSourceStatus, ShuyuanStatsPage } from '@/lib/shuyuan';
 import {
-  FILTER_COUNT_KEYS, SOURCE_FILTERS, availabilityLabel, filterLabel, pageCount,
+  FILTER_COUNT_KEYS, SOURCE_FILTERS, availabilityLabel, clampSourcePage, filterLabel, pageCount,
   participationHint, type ShuyuanSourceFilter,
 } from '@/lib/shuyuan-view';
 
@@ -29,6 +29,9 @@ export default function ShuyuanTab() {
       const res = await apiFetch(`/api/shuyuan?filter=${target.filter}&page=${target.page}`, { signal });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || '书源加载失败');
+      // 请求已取消时不要写回：下一次 load 可能已经把更新的数据放进去了，
+      // 迟到的旧响应会把它盖掉。与下面 catch/finally 的 aborted 守卫同一口径。
+      if (signal?.aborted) return null;
       setStats(data as ShuyuanStatsPage);
       return data as ShuyuanStatsPage;
     } catch (e) {
@@ -51,10 +54,13 @@ export default function ShuyuanTab() {
   const totalPages = stats ? pageCount(stats.total, stats.pageSize) : 1;
 
   // 关掉筛选里的最后一条会把当前页掏空（比如「已启用」第 3 页只剩 1 条）：退到最后一页，
-  // 而不是停在一个空页上。只在实际重载拿到新总数之后收口——放在 effect 里同步 setState
-  // 会触发级联渲染，所以这里由调用方把 load 的结果交回来。
+  // 而不是停在一个空页上。收口的算法在 clampSourcePage 里（有单测），这里只负责写回 state；
+  // 只在返回值与请求页码不同时才 set，避免白跑一次渲染和请求。只在实际重载拿到新总数
+  // 之后收口——放在 effect 里同步 setState 会触发级联渲染，所以由调用方把 load 的结果交回来。
   function retreatToLastPage(loaded: ShuyuanStatsPage | null, requested: number) {
-    if (loaded && requested > loaded.totalPages) setPage(loaded.totalPages);
+    if (!loaded) return;
+    const next = clampSourcePage(requested, loaded.total, loaded.pageSize);
+    if (next !== requested) setPage(next);
   }
 
   async function refresh() {

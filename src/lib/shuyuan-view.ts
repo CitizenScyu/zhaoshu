@@ -72,6 +72,24 @@ export function pageCount(total: number, pageSize: number = SOURCE_PAGE_SIZE): n
   return Math.max(1, Math.ceil(safeTotal / size));
 }
 
+/**
+ * 页码收口：把页码夹回 [1, 总页数]。
+ *
+ * 收口只发生在「重载之后总数可能变小」的场合：筛选下的最后一条被停用/启用后移出当前
+ * 筛选，总数缩水，原地停在旧页码就会显示一个空列表（页脚却还写着第 N 页）。
+ * 总数变 0 也要回第 1 页——pageCount 保证至少 1 页，所以这里不会返回 0。
+ * 页码本身非法（非整数、<1）时同样回第 1 页，与 parseSourcePage 的口径一致。
+ *
+ * 只返回收口后的页码，不碰 state：调用方在返回值与请求页码不同时才写回。
+ * 「该退到第几页」的判断只此一处，组件不再自己比较 totalPages。
+ */
+export function clampSourcePage(
+  page: number, total: number, pageSize: number = SOURCE_PAGE_SIZE,
+): number {
+  if (!Number.isSafeInteger(page) || page < 1) return 1;
+  return Math.min(page, pageCount(total, pageSize));
+}
+
 export function offsetFor(page: number, pageSize: number = SOURCE_PAGE_SIZE): number {
   return (Math.max(1, Math.floor(page)) - 1) * normalizedPageSize(pageSize);
 }

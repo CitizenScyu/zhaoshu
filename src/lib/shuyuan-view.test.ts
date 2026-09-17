@@ -1,9 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import { readFileSync } from 'node:fs';
 import {
-  FILTER_COUNT_KEYS, MAX_SOURCE_PAGE, SOURCE_FILTERS, SOURCE_PAGE_SIZE, availabilityLabel, filterLabel,
-  offsetFor, pageCount, parseSourceFilter, parseSourcePage, participationHint, participatesInSearch,
-  type ShuyuanSourceFilter,
+  FILTER_COUNT_KEYS, MAX_SOURCE_PAGE, SOURCE_FILTERS, SOURCE_PAGE_SIZE, availabilityLabel,
+  clampSourcePage, filterLabel, offsetFor, pageCount, parseSourceFilter, parseSourcePage,
+  participationHint, participatesInSearch, type ShuyuanSourceFilter,
 } from './shuyuan-view';
 
 describe('parseSourceFilter 白名单', () => {
@@ -99,6 +99,71 @@ describe('offsetFor', () => {
   it('与 SOURCE_PAGE_SIZE 的默认值一致', () => {
     expect(offsetFor(3)).toBe(offsetFor(3, SOURCE_PAGE_SIZE));
     expect(offsetFor(3)).toBe(2 * SOURCE_PAGE_SIZE);
+  });
+});
+
+describe('clampSourcePage 页码收口', () => {
+  it('总数变小、页码越界时退到最后一页（筛选缩水的实际场景）', () => {
+    // 场景：「已启用」第 5 页只剩 1 条，停用后启用数缩到 40 条 = 2 页，必须退到第 2 页。
+    expect(clampSourcePage(5, 40, 20)).toBe(2);
+    expect(clampSourcePage(3, 21, 20)).toBe(2);
+    expect(clampSourcePage(9, 19, 20)).toBe(1);
+  });
+
+  it('总数变 0 时回第 1 页，而不是 0 或负数', () => {
+    expect(clampSourcePage(4, 0)).toBe(1);
+    expect(clampSourcePage(1, 0)).toBe(1);
+    expect(clampSourcePage(500, 0)).toBe(1);
+  });
+
+  it('页码在范围内时原样返回，不会把用户往前挪', () => {
+    expect(clampSourcePage(1, 995)).toBe(1);
+    expect(clampSourcePage(2, 40, 20)).toBe(2);
+    expect(clampSourcePage(50, 995)).toBe(50);
+  });
+
+  it('恰好等于最后一页时保持不变（边界不多退一页）', () => {
+    expect(clampSourcePage(2, 40, 20)).toBe(2);
+    expect(clampSourcePage(2, 21, 20)).toBe(2);
+    expect(clampSourcePage(1, 20, 20)).toBe(1);
+  });
+
+  it('非法页码回第 1 页，与 parseSourcePage 口径一致', () => {
+    for (const page of [0, -1, -0.5, 1.5, Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY]) {
+      expect(clampSourcePage(page, 995)).toBe(1);
+    }
+  });
+
+  it('pageSize 非法时退回默认单页条数，不产生除零', () => {
+    expect(clampSourcePage(3, 25, 0)).toBe(clampSourcePage(3, 25, SOURCE_PAGE_SIZE));
+    expect(clampSourcePage(3, 25, -5)).toBe(clampSourcePage(3, 25, SOURCE_PAGE_SIZE));
+    expect(clampSourcePage(3, 25, Number.NaN)).toBe(clampSourcePage(3, 25, SOURCE_PAGE_SIZE));
+  });
+
+  it('收口是幂等的：再收一次不会继续往前挪', () => {
+    for (const page of [1, 2, 3, 7, 50]) {
+      for (const total of [0, 1, 19, 20, 21, 995]) {
+        const once = clampSourcePage(page, total);
+        expect(clampSourcePage(once, total)).toBe(once);
+      }
+    }
+  });
+
+  it('收口后的页码永远落在 [1, pageCount] 内，OFFSET 不会越过结果集', () => {
+    for (const page of [1, 2, 3, 50, 500, 1e9]) {
+      for (const total of [0, 1, 20, 21, 995, 10000]) {
+        const clamped = clampSourcePage(page, total);
+        expect(clamped).toBeGreaterThanOrEqual(1);
+        expect(clamped).toBeLessThanOrEqual(pageCount(total));
+        expect(offsetFor(clamped)).toBeLessThanOrEqual((pageCount(total) - 1) * SOURCE_PAGE_SIZE);
+      }
+    }
+  });
+
+  // 直接钉住「越界必须被改动」：把收口去掉（原样返回 page）会让这条和上面几条一起变红。
+  it('越界页码必须被改动，否则筛选缩水后会停在空页', () => {
+    expect(clampSourcePage(3, 40, 20)).not.toBe(3);
+    expect(clampSourcePage(3, 0)).not.toBe(3);
   });
 });
 
