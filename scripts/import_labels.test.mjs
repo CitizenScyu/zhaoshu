@@ -323,8 +323,11 @@ describe('作者在身份键和 SQL 绑定前规范化', () => {
       log: (line) => logs.push(line),
     });
     assert.equal(code, 0);
-    assert.equal(calls.length, 1);
-    assert.equal(calls[0][1], '埃里克·霍弗');
+    // R02 护栏会在写入前按 title 读一次（前置逐记录拦截），因此每条可导入记录
+    // 对应两条语句：先 SELECT 查非不动点孪生，再走原有的 UPSERT。
+    assert.equal(calls.length, 2);
+    assert.equal(calls[0].length, 1);
+    assert.equal(calls[1][1], '埃里克·霍弗');
     assert.equal(logs.at(-1), '总数 3 / 入库 1 / 跳过 0 / 待核验 2 / 失败 0');
   });
 });
@@ -405,8 +408,10 @@ describe('offline dry-run and existing command entry', () => {
     });
     assert.equal(code, 1);
     assert.equal(clients, 1);
-    assert.equal(calls.length, 2);
-    assert.equal(calls[1][0], '后续书');
+    // 护栏给每条可导入记录加了一次前置 SELECT：记录 1 的 SELECT 失败后，
+    // 后续记录的 SELECT + UPSERT 仍照常执行（失败不丢后面的行）。
+    assert.equal(calls.length, 3);
+    assert.equal(calls[2][0], '后续书');
     assert.equal(logs.at(-1), '总数 4 / 入库 1 / 跳过 1 / 待核验 1 / 失败 1');
   });
 

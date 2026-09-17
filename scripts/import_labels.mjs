@@ -12,7 +12,7 @@ import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { normalizeGenre } from './genre_map.mjs';
-import { normalizeAuthor } from './normalize_author.mjs';
+import { HTML_SOURCE, normalizeAuthor } from './normalize_author.mjs';
 
 const DEFAULT_FILE = './labels.jsonl';
 // PG 的 jsonb/text 严禁 NUL(0x00),源码里直接写裸 NUL 字节会被编辑链污染,
@@ -233,6 +233,35 @@ async function writeImportRecord(sql, record) {
       labeled_at = now()`;
 }
 
+// R02 前置逐记录拦截（最小实现，原型）：写入前检查本条记录归一后的身份键是否会
+// 与既有「非不动点行」碰撞 —— 即某条存量行的 author 不等于它自身的归一结果，
+// 却与本次待写入的 author 归一后相同。这类行 ON CONFLICT(lower(title),lower(author))
+// 匹配不到，直接写就会凭空多一条重复。碰撞则跳过该条写入；只读，不改 DDL，
+// 也不合并/改写任何存量行的身份。
+//
+// 判据不依赖既有行自己存的 source_site：手工 INSERT / 旧备份恢复 / 跨环境 merge
+// 恰恰常不带干净的来源，若拿 row.source_site 去归一，normalizeAuthor 会返回
+// review 而漏判孪生（缺口）。normalizeAuthor 只在 sourceSite === HTML_SOURCE 时
+// 才可能改变值，其余来源一律是恒等或 review，所以「该行是否非不动点」只需按
+// HTML_SOURCE 归一一次即完备 —— 既不再漏，也不需要再并列试别的来源。
+//
+// 驱动差异：neon 的 tag 模板 await 出来是行数组，PGlite 返回 { rows }，两种都兼容。
+async function findNonFixpointTwin(sql, record) {
+  const result = await sql`
+    SELECT id, author FROM labeled_books
+    WHERE lower(title) = lower(${record.title})`;
+  const rows = Array.isArray(result) ? result : (result?.rows ?? []);
+  const target = record.author.toLowerCase();
+  for (const row of rows) {
+    const stored = row.author ?? '';
+    const normalized = normalizeAuthor(stored, { sourceSite: HTML_SOURCE });
+    // 归一后与原文一致 = 不动点行，ON CONFLICT 能正确合并，不由本护栏处理
+    if (normalized.status !== 'ready' || normalized.value === stored) continue;
+    if (normalized.value.toLowerCase() === target) return row;
+  }
+  return null;
+}
+
 async function run(argv = process.argv.slice(2), { createSql = neon, env = process.env, log = console.log } = {}) {
   const args = parseArgs(argv);
   const file = resolve(args.file);
@@ -250,7 +279,7 @@ async function run(argv = process.argv.slice(2), { createSql = neon, env = proce
     sql = createSql(databaseUrl);
   }
 
-  const counts = { total: 0, ready: 0, imported: 0, skipped: 0, review: 0, failed: 0 };
+  const counts = { total: 0, ready: 0, imported: 0, skipped: 0, review: 0, failed: 0, nonFixpointSkipped: 0 };
   const reasons = [];
   const labels = { skipped: '跳过', review: '待核验', failed: '失败' };
   for (const [i, line] of lines.entries()) {
@@ -284,6 +313,12 @@ async function run(argv = process.argv.slice(2), { createSql = neon, env = proce
       continue;
     }
     try {
+      const twin = await findNonFixpointTwin(sql, result.record);
+      if (twin) {
+        counts.nonFixpointSkipped += 1;
+        reasons.push(at + ' [拦截] 与既有非不动点行 id=' + twin.id + ' 归一后身份相同，跳过写入');
+        continue;
+      }
       await writeImportRecord(sql, result.record);
       counts.imported += 1;
     } catch (error) {
@@ -296,10 +331,14 @@ async function run(argv = process.argv.slice(2), { createSql = neon, env = proce
     log('校验/导入明细:');
     for (const reason of reasons) log(' - ' + reason);
   }
+  // 非不动点拦截单独汇总。放在主汇总行之前，让主汇总行保持为最后一行
+  // （既有工具与测试按最后一行解析）；dry-run 不跑护栏，不打这行。
+  if (!args.dryRun) log('本次因非不动点孪生行跳过 ' + counts.nonFixpointSkipped + ' 条');
   log((args.dryRun ? '[dry-run] ' : '') + '总数 ' + counts.total +
     (args.dryRun ? ' / 可导入 ' + counts.ready : ' / 入库 ' + counts.imported) +
     ' / 跳过 ' + counts.skipped + ' / 待核验 ' + counts.review + ' / 失败 ' + counts.failed);
-  return counts.failed > 0 ? 1 : 0;
+  // 有拦截即非 0 退出：写入被跳过属于需要人看的信号，不能静默成功。
+  return counts.failed > 0 || counts.nonFixpointSkipped > 0 ? 1 : 0;
 }
 
 // 导出纯函数便于本地自测;直接运行时才连库
