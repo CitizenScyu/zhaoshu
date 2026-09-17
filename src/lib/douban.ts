@@ -118,17 +118,20 @@ function pickMatch(items: SuggestItem[], title: string, author?: string): Sugges
   if (items.length === 0) return null;
   const wantedTitle = normalize(title);
   const wantedAuthor = author ? normalize(author) : '';
-  const titleOk = (it: SuggestItem) => {
-    const candidate = normalize(it.title);
-    return candidate === wantedTitle || candidate.startsWith(wantedTitle);
-  };
   const authorOk = (it: SuggestItem) => {
     if (!wantedAuthor) return true;
     const candidate = normalize(it.author_name || '');
     return Boolean(candidate) && (candidate.includes(wantedAuthor) || wantedAuthor.includes(candidate));
   };
   // 作者已知时不能降级为“只看标题”，否则同名书会被当成已验证。
-  return items.find((it) => titleOk(it) && authorOk(it)) ?? null;
+  // 标题只认规范化后**完全相等**：不用前缀，也不认「书名:副标题」。
+  // 中文书里冒号副标题没有可靠信号——《人类简史：从动物到上帝》是同一本，
+  // 《三体：死神永生》却是另一本（三体 III），且作者也区分不了（都是刘慈欣）。
+  // 无可靠信号就不认：宁要 not_found，也不给用户挂上另一本书的评分和链接。
+  // 原实现用 candidate.startsWith(wantedTitle) 会把《诡秘之主2》《诡秘之主 · 外传》
+  // 《Dune Messiah》判成已验证，正是这条原则要堵的洞。
+  const exactTitle = (it: SuggestItem) => normalize(it.title) === wantedTitle;
+  return items.find((it) => exactTitle(it) && authorOk(it)) ?? null;
 }
 
 export async function verifyBook(
