@@ -114,15 +114,6 @@ function normalize(value: string): string {
     .replace(/[\s·•《》「」『』【】()（）\[\]：:，,。.!！?？'"“”‘’_-]/g, '');
 }
 
-// 豆瓣条目标题是不是「同一本书」的完整标题：形如《书名:副标题》。副标题（《人类简史：从动物到上帝》）
-// 属于同一本书的全名；而《X2》《X · 外传》《X 前传》是另一本书，靠分隔符区分——
-// 只有显式的书名号分隔（半/全角冒号）才认，裸拼接和「·」都不认。
-// 注意 rawTitle 是规范化前的原文：normalize 会把分隔符抹掉，抹掉后就再也分不清这两类了。
-function isFullTitleOf(rawTitle: string, wantedTitle: string): boolean {
-  const segments = rawTitle.split(/[:：]/);
-  return segments.length > 1 && normalize(segments[0]) === wantedTitle;
-}
-
 function pickMatch(items: SuggestItem[], title: string, author?: string): SuggestItem | null {
   if (items.length === 0) return null;
   const wantedTitle = normalize(title);
@@ -133,18 +124,14 @@ function pickMatch(items: SuggestItem[], title: string, author?: string): Sugges
     return Boolean(candidate) && (candidate.includes(wantedAuthor) || wantedAuthor.includes(candidate));
   };
   // 作者已知时不能降级为“只看标题”，否则同名书会被当成已验证。
-  // 两档都要求标题**完整**落在候选上，不给续篇留口子：
-  //   1) 规范化后完全相等；2) 候选是「书名:副标题」的全名。
-  // 不用 candidate.startsWith(wantedTitle)：那会把《诡秘之主2》《诡秘之主 · 外传》
-  // 判成《诡秘之主》已验证，把另一本书的评分和链接挂到用户书上。
-  // 精确档优先于副标题档，避免正条目被「书名 1」这类衍生条目抢先命中。
+  // 标题只认规范化后**完全相等**：不用前缀，也不认「书名:副标题」。
+  // 中文书里冒号副标题没有可靠信号——《人类简史：从动物到上帝》是同一本，
+  // 《三体：死神永生》却是另一本（三体 III），且作者也区分不了（都是刘慈欣）。
+  // 无可靠信号就不认：宁要 not_found，也不给用户挂上另一本书的评分和链接。
+  // 原实现用 candidate.startsWith(wantedTitle) 会把《诡秘之主2》《诡秘之主 · 外传》
+  // 《Dune Messiah》判成已验证，正是这条原则要堵的洞。
   const exactTitle = (it: SuggestItem) => normalize(it.title) === wantedTitle;
-  const fullTitle = (it: SuggestItem) => isFullTitleOf(it.title, wantedTitle);
-  return (
-    items.find((it) => exactTitle(it) && authorOk(it)) ??
-    items.find((it) => fullTitle(it) && authorOk(it)) ??
-    null
-  );
+  return items.find((it) => exactTitle(it) && authorOk(it)) ?? null;
 }
 
 export async function verifyBook(

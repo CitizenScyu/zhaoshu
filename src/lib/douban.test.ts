@@ -99,9 +99,14 @@ describe('书名判定：同一本书 vs 另一本书', () => {
     expect(await verifyBook('Dune', 'Frank Herbert')).toMatchObject({ status: 'not_found', found: false });
   });
 
-  it('同一本书的全名（书名:副标题）应当命中', async () => {
+  it('冒号副标题没有可靠信号，不认：《人类简史》不匹配《人类简史：从动物到上帝》', async () => {
     stubSuggest([{ id: '7', title: '人类简史：从动物到上帝', author_name: '尤瓦尔·赫拉利' }]);
-    expect(await verifyBook('人类简史', '尤瓦尔·赫拉利')).toMatchObject({ status: 'verified', doubanId: '7' });
+    expect(await verifyBook('人类简史', '尤瓦尔·赫拉利')).toMatchObject({ status: 'not_found', found: false });
+  });
+
+  it('冒号副标题可能是另一本书且作者相同，故一律不认：《三体》不匹配《三体：死神永生》', async () => {
+    stubSuggest([{ id: '10', title: '三体：死神永生', author_name: '刘慈欣' }]);
+    expect(await verifyBook('三体', '刘慈欣')).toMatchObject({ status: 'not_found', found: false });
   });
 
   it('书名完全一致应当命中', async () => {
