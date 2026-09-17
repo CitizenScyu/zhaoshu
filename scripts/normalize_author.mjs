@@ -3,7 +3,9 @@ import { decodeHTML, decodeHTMLStrict } from 'entities';
 // 仅 book15.net 的旧 HTML 元数据已核实。普通文本不依赖来源。
 // JSONL 可显式声明 author_encoding: "html-v1" / "text-v1"；
 // 未来采集端完成解码后必须使用 text-v1，导入器不再解释其中的实体。
-const HTML_SOURCE = 'book15.net';
+// 导出给 import_labels.mjs 的护栏用：这是导入器唯一会做实体解码的来源，
+// 护栏判「非不动点行」时必须按它归一，不能依赖既有行自己存的 source_site。
+export const HTML_SOURCE = 'book15.net';
 const ENCODINGS = new Set(['html-v1', 'text-v1']);
 const ENTITY_CANDIDATE = /&(?:#[^&;\s]*;?|[A-Za-z][^&;\s]*;|[A-Za-z][A-Za-z0-9]*)/g;
 
