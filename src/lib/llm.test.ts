@@ -624,6 +624,63 @@ describe('stream completion and shared call budget', () => {
       expect(sentModel(1)).not.toBe('fallback/model');
     });
 
+    // 🔴 项 2：重发只在「预算 > 自己那一次的首字节上限」时才有意义。chat 会把首字节上限压到
+    // 总时限以内，预算 ≤ 上限时两个计时器等长 → 这次重发的结局由 total 计时器决定（报文变成
+    // 误导性的「总超时」，剩余预算被整段烧光）。这三条用例把三个预算区间都钉住。
+    const hang = (_url: unknown, init?: RequestInit): Promise<Response> => new Promise<Response>((_resolve, reject) => {
+      init?.signal?.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')));
+    });
+
+    // 区间 3（≥90s）：重发是实测正收益（8 起首字节事件救回 6 起），必须保留。
+    // 本用例是「防退化成无条件跳过重发」的护栏。
+    it('剩余预算充裕时仍发起重发，不退回兜底', async () => {
+      fetchMock.mockImplementationOnce(hang).mockResolvedValueOnce(response([token('重发成功的正文'), finish('stop')]));
+      const pending = client.chatRobust('system', 'user', {
+        totalTimeoutMs: 200_000, idleTimeoutMs: 45_000, firstByteTimeoutMs: 45_000, fallbackModel: 'fallback/model',
+      });
+      await vi.advanceTimersByTimeAsync(45_000);
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      await expect(pending).resolves.toMatchObject({ content: '重发成功的正文' });
+      // 第二次仍是主模型 = 重发发生了；若被跳过，这里会是兜底模型。
+      expect(sentModel(1)).toBe('primary/model');
+    });
+
+    // 区间 2（45s, 90s）：剩余 35s ≤ 首字节上限 45s → 不再重发，把这段预算让给兜底。
+    // 判别力：把 llm.ts 的门槛改回 `remainingMs() > 0`，第二次调用会变成主模型的重发，
+    // fetch 调用数变 3、attempts/fallbackUsed 也全错，本用例必须失败。
+    it('剩余预算 ≤ 首字节上限时不发起重发，直接进兜底分支', async () => {
+      const onUsage = vi.fn();
+      fetchMock.mockImplementationOnce(hang).mockResolvedValueOnce(response([token('兜底正文'), finish('stop')]));
+      const pending = client.chatRobust('system', 'user', {
+        totalTimeoutMs: 80_000, idleTimeoutMs: 45_000, firstByteTimeoutMs: 45_000,
+        fallbackModel: 'fallback/model', onUsage,
+      });
+      await vi.advanceTimersByTimeAsync(45_000); // 首发吃满首字节上限
+      await expect(pending).resolves.toMatchObject({ content: '兜底正文' });
+      expect(fetchMock).toHaveBeenCalledTimes(2); // 首发 + 兜底，没有中间那次重发
+      expect(sentModel(1)).toBe('fallback/model');
+      expect(sentModel(1)).not.toBe('primary/model');
+      expect(onUsage.mock.calls.map(([call]) => call.observation)).toEqual([
+        { attempts: 1, firstByteTimeouts: 1, retried: false, fallbackUsed: false, errorCode: 'UPSTREAM_FIRST_BYTE_TIMEOUT' },
+        // 没有重发 ⇒ 兜底就是第 2 次尝试（不是第 3 次），且 retried 保持 false。
+        { attempts: 2, firstByteTimeouts: 1, retried: false, fallbackUsed: true, ttfbMs: 0 },
+      ]);
+    });
+
+    // 区间 1（<45s）：首字节上限被 total 压成等长，expiredBy 落成 'total' → 码是 UPSTREAM_STALLED，
+    // 重发分支（只认 UPSTREAM_FIRST_BYTE_TIMEOUT）根本不进入。行为本来就对，项 2 不得改变它。
+    it('剩余 < 首字节上限（等长竞态）时报 UPSTREAM_STALLED，不进入重发分支', async () => {
+      fetchMock.mockImplementation(hang);
+      const pending = client.chatRobust('system', 'user', {
+        totalTimeoutMs: 40_000, idleTimeoutMs: 45_000, firstByteTimeoutMs: 45_000, fallbackModel: 'fallback/model',
+      });
+      const assertion = expect(pending).rejects.toMatchObject({ code: 'UPSTREAM_STALLED' });
+      await vi.advanceTimersByTimeAsync(40_000);
+      await assertion;
+      // 首发就耗尽预算，既没有重发、也没有可开的兜底（剩余 0，低于 MODEL_FALLBACK_MIN_BUDGET_MS）。
+      expect(fetchMock).toHaveBeenCalledOnce();
+    });
+
     // 重发仍失败才降级。上界就在这里：本函数最多 3 次上游调用（首发 + 首字节重发 + 兜底），
     // find 的 modelStep 最多调本函数 2 次 → **单步最坏 6 次**（此前 4 次，见 chatRobust 注释）。
     it('首字节超时且重发也超时 → 才降级兜底；本函数上游调用数封顶 3', async () => {
@@ -680,7 +737,7 @@ describe('stream completion and shared call budget', () => {
       await vi.advanceTimersByTimeAsync(3_000);
       expect(fetchMock).toHaveBeenCalledTimes(2);
       // 兜底这一路没被单次上限掐掉：它一直挂到共享的总时限才结束。
-      const assertion = expect(pending).rejects.toThrow(/总超时（20s）/);
+      const assertion = expect(pending).rejects.toThrow(/总超时（剩余预算 20s）/);
       await vi.advanceTimersByTimeAsync(17_000);
       await assertion;
     });
@@ -694,12 +751,12 @@ describe('stream completion and shared call budget', () => {
         init?.signal?.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')));
       }));
       // 主模型 2s 被首字节上限截断 → 原地重发 2s 又被截断 → 兜底接着挂到剩下 16s 的共享 deadline。
-      // 兜底拿的是「剩余 16s」，所以它自己的超时文案是 16s；整步墙钟仍是 20s。
+      // 兜底拿的是「剩余 16s」，所以它自己的超时文案里是 16s；整步墙钟仍是 20s。
       const pending = client.chatRobust('system', 'user', {
         totalTimeoutMs: 20_000, idleTimeoutMs: 45_000, firstByteTimeoutMs: 2_000, fallbackModel: 'fallback/model',
       });
       // 断言先挂上：拒绝发生在 20s，晚于下面的 advance，否则会被 vitest 记成 unhandled rejection。
-      const assertion = expect(pending).rejects.toThrow(/总超时（16s）/);
+      const assertion = expect(pending).rejects.toThrow(/总超时（剩余预算 16s）/);
       await vi.advanceTimersByTimeAsync(2_000);
       expect(fetchMock).toHaveBeenCalledTimes(2);
       await vi.advanceTimersByTimeAsync(1_999);
@@ -718,7 +775,7 @@ describe('stream completion and shared call budget', () => {
       fetchMock.mockImplementation((_url: unknown, init?: RequestInit) => new Promise((_resolve, reject) => {
         init?.signal?.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')));
       }));
-      const assertion = expect(client.chat('system', 'user', { totalTimeoutMs: 5_000 })).rejects.toThrow(/总超时（5s）/);
+      const assertion = expect(client.chat('system', 'user', { totalTimeoutMs: 5_000 })).rejects.toThrow(/总超时（剩余预算 5s）/);
       await vi.advanceTimersByTimeAsync(5_000);
       await assertion;
       expect(fetchMock).toHaveBeenCalledOnce();

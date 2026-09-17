@@ -173,9 +173,19 @@ export function configuredFallbackModel(): string {
   return fromEnv || DEFAULT_FALLBACK_MODEL;
 }
 
-// 开一次兜底调用至少要留下的剩余预算。与 find 的 modelStep 用同一个约定
-// （MIN_SECOND_ATTEMPT_MS）：低于这个数就干脆不发起——宁可直接失败，
+// 开一次兜底调用至少要留下的剩余预算。低于这个数就干脆不发起——宁可直接失败，
 // 也不要用一个注定超时的请求把截止时间耗光，那会让错误变成「总超时」而掩盖真实原因。
+// 与 find 的 modelStep 用同一个**约定**（「预算不够就别发起」），但**取值不同**：那里是
+// 「一次上游往返至少要留下可用时间」的下限 5s，这里要的是「兜底真有可能答完」的门槛。
+//
+// ⚠️ TODO（2026-09-17 task-50 归因，**只有事实、没有实测取值**，故本轮不动这个数）：
+// 兜底模型 claude-opus-5-88 的 ttfbMs 13.6s 具有误导性——一次真实兜底（llm_usage row 214）
+// 的正文 3458 token 还流了约 76s，**整通 89.6s**，中位 115.8s（见本文件上方注释）。
+// ⇒ 线上这次的「兜底只剩 29.987s」注定跑不完，5s 的门槛拦不住它，只会把预算烧在一个必然
+// 超时、且报文更混乱（看起来像「总超时」）的调用上。
+// 把门槛提到 20–45s（例如与 MODEL_PROBE_TIMEOUT_MS 同量级的 30s）能换回真实墙钟，但
+// **该取值目前是推理、不是实测**，且会打断 llm.test.ts 里 4 个压缩计时器用例（totalTimeoutMs:
+// 20_000），属于策略旋钮而非正确性修复 ⇒ 留作 TODO，待有样本后再拍板。
 export const MODEL_FALLBACK_MIN_BUDGET_MS = 5_000;
 
 // ---- 单次尝试上限（停滞与首字节）----
@@ -274,7 +284,12 @@ function classifyFailure(
         true, UPSTREAM_FIRST_BYTE_TIMEOUT,
       );
     }
-    return new LlmError(`LLM 总超时（${Math.ceil(state.totalMs / 1000)}s）`, true, UPSTREAM_STALLED);
+    // 括号里的秒数是**动态剩余预算**，不是配置值。task-50 归因时的第一反应是「30s 与
+    // 260s/45s 都对不上，一定有个常量」——它其实 = 调用方传进来的 totalMs，在 find 链路上
+    // 通常已经等于「整步预算 − 已用」。旧文案只写「总超时（30s）」会被读成配置 cap，
+    // 所以明写「剩余预算」。本项目反复吃过「错误码指向错误的层」的亏（前有假 ERR_ABORTED），
+    // 这里把最后一个歧义钉掉。
+    return new LlmError(`LLM 总超时（剩余预算 ${Math.ceil(state.totalMs / 1000)}s）`, true, UPSTREAM_STALLED);
   }
   // 走到这里说明 fetch 自己抛了（连接失败）——便宜的那一族。
   return new LlmError(
@@ -772,13 +787,30 @@ export async function chatRobust(
     //   - 重发**不新开预算**，拿的是共享 deadline 剩下的时间，且仍带着单次尝试上限
     //     （...primary 里的 firstByteTimeoutMs / idleTimeoutMs），所以它最多再烧一个 45s；
     //     兜底可用预算因此从 260−45 ≈ 215s 降到 260−45−45 ≈ **170s**，仍高于 opus 中位 115.8s。
-    //   - 剩余预算不足就不发起（remainingMs() > 0，与下面原有的「重试」判定同一条约定）；
+    //   - 剩余预算**≤ 重发自己的首字节上限**时不发起（见下），与下面原有的「重试」判定
+    //     同一条约定（「预算不够就不发起」）；
     //     重发本身再失败时，仍会走下面的兜底分支（那时兜底自己再看一次 MODEL_FALLBACK_MIN_BUDGET_MS）。
     //   - 这里**不等** retryDelay：探针的 53.3% 是在「立刻重发」的条件下测的，而且首发已经把
     //     45s 单次上限烧掉了，再等 1.5s 只是白花预算。
     if (first instanceof LlmError && first.code === UPSTREAM_FIRST_BYTE_TIMEOUT) {
       observed.firstByteTimeouts += 1;
-      if (remainingMs() > 0) {
+      // 判据（2026-09-17 task-50 实测）：chat 会把首字节上限压到总时限以内
+      // （`Math.min(opts.firstByteTimeoutMs, totalMs)`）。当**剩余预算 ≤ 首字节上限**时两者等长，
+      // 这次重发的结局由 total 计时器决定——expiredBy 落成 'total'、错误码变成 UPSTREAM_STALLED、
+      // 报文变成误导性的「LLM 总超时（Xs）」，而剩余预算被整段烧光、兜底一个字节都轮不到。
+      // 本次线上就是这一格：重发前剩 29.987s < 45s → 烧光 → 报「总超时（30s）」。
+      // 所以只在「预算 > 自己的首字节上限」时发起；不再拿 >0 当门槛（>0 那一格必然白烧）。
+      // 三区间（实测）：<45s 时首字节码根本不会出现（已落 UPSTREAM_STALLED，走下面的兜底，
+      // 行为本来就对）；∈(45s, 90s) 必然白烧，本行就是关掉它；(≥90s) 重发是实测正收益
+      // （8 起首字节事件救回 6 起 = 75%），必须保留。
+      //
+      // ⚠️ 两条不要读错（task-50 自我修正）：
+      //   (a) **本项不省墙钟**。本函数的 deadline 是共享的，跳过重发只是把同一段预算转交给
+      //       兜底（下面的 fallback 分支），整步耗时不变。收益是「不把预算押在刚连挂两次的
+      //       主模型上」+「让兜底拿到它唯一的那次机会」+「观测里出现真实的第 3 次尝试行」。
+      //   (b) **修后客户端文案可能仍是「总超时」**——那这次是**兜底自己的**超时（合法）。
+      //       ⇒ 验收项 2 是否生效**看 `llm_usage` 的 `attempts` / `fallbackUsed`，不要看文案**。
+      if (remainingMs() > (opts.firstByteTimeoutMs ?? 0)) {
         const retryBudgetMs = remainingMs();
         try {
           return await chat(system, user, {
