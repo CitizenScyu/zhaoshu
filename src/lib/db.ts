@@ -5,6 +5,7 @@ import { assertAuthSchema } from './auth-store';
 import { initializeBusinessSchema } from './business-schema';
 import type { PersonalWriter } from './personal-write';
 import { requireUserId, profileForUserQuery, saveProfileForUserQuery, excludedBooksForUserQuery, persistRecommendationsForUserQueries, feedbackForUserQueries, feedbackSnapshotForUserQuery } from './user-data';
+import { canonicalBookKey } from './book-identity';
 
 const DATABASE_URL = process.env.DATABASE_URL;
 
@@ -209,10 +210,6 @@ export async function recordFeedbackForUser(userId: number, book: { title: strin
     if (error && typeof error === 'object' && 'code' in error && error.code === '22012') throw new FeedbackConflictError();
     throw error;
   }
-}
-
-function canonicalBookKey(title: string, author: string): string {
-  return `${title.normalize('NFKC').trim().toLocaleLowerCase()}\0${author.normalize('NFKC').trim().toLocaleLowerCase()}`;
 }
 
 export async function upsertBook(b: {

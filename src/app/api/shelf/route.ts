@@ -21,9 +21,11 @@ export async function POST(req: NextRequest) {
       const labeledRows = await access.run(async () => sql`
         SELECT title, author FROM labeled_books WHERE id = ${labeledBookId}`) as { title: string; author: string }[];
       if (!labeledRows.length) return NextResponse.json({ error: 'book not found', code: 'BOOK_NOT_FOUND' }, { status: 404 });
-      const title = labeledRows[0].title.trim();
+      // title 原样往下传：身份归一（NFKC + btrim + 剥《》）只在 user-data.ts 的查询
+      // 构造器里做一次——那里是 books 身份的唯一边界，重复归一会被《《x》》多剥一层。
+      const title = labeledRows[0].title;
       const author = labeledRows[0].author.trim() || '佚名';
-      if (!title) return NextResponse.json({ error: 'book has no title', code: 'INVALID_BOOK' }, { status: 400 });
+      if (!title.trim()) return NextResponse.json({ error: 'book has no title', code: 'INVALID_BOOK' }, { status: 400 });
       const exists = await access.run(async () => shelfExistsForUserQuery(sql, userId, title, author)) as unknown[];
       if (exists.length) return NextResponse.json({ error: '已在书架', code: 'ALREADY_ON_SHELF' }, { status: 409 });
       const rows = await access.commit((write) => write((sql) => addShelfForUserQueries(sql, userId, title, author)));
