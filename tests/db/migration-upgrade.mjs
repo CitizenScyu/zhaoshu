@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { applyMigration, assertIdentifier, createClient, EXPECTED_TABLES, inspectSchema, loadMigration, runInSchema } from '../../scripts/db-migration-lib.mjs';
+import { applyMigration, assertIdentifier, createClient, EXPECTED_TABLES, inspectSchema, loadMigrations, runInSchema } from '../../scripts/db-migration-lib.mjs';
 
 const fixtureDir = resolve(dirname(fileURLToPath(import.meta.url)), 'fixtures');
 
@@ -36,14 +36,29 @@ function fingerprint(report) {
   });
 }
 
-async function assertContract(client, schema, expectedChecksum) {
+// 结构契约同时钉住「跑过哪些版本」：每个迁移版本都必须有一行且摘要与文件一致。
+async function assertContract(client, schema, migrations) {
   const report = await inspectSchema(client, schema);
   const tables = new Set(report.columns.map((column) => column.table_name));
   assert.deepEqual(EXPECTED_TABLES.filter((table) => !tables.has(table)), []);
   assert.equal(report.dangerous.length, 0);
-  assert.equal(report.versions.length, 1);
-  assert.equal(report.versions[0].version, 1);
-  assert.equal(report.versions[0].checksum.trim(), expectedChecksum);
+  assert.equal(report.versions.length, migrations.length);
+  for (const migration of migrations) {
+    const row = report.versions.find((item) => item.version === migration.version);
+    assert.ok(row, `缺少迁移版本 ${migration.version} 的记账行`);
+    assert.equal(row.name, migration.name);
+    assert.equal(row.checksum.trim(), migration.checksum);
+  }
+  // 0002 的身份键落点：指纹相等已覆盖，这里显式断言让失败信息可读。
+  for (const table of ['books', 'labeled_books']) {
+    const columns = new Set(report.columns.filter((column) => column.table_name === table).map((column) => column.column_name));
+    assert.ok(columns.has('title_key') && columns.has('author_key'), `${table} 缺少身份键生成列`);
+  }
+  const indexNames = new Set(report.indexes.map((index) => index.index_name));
+  assert.ok(indexNames.has('books_identity_idx'), '缺少 books_identity_idx');
+  assert.ok(indexNames.has('labeled_books_identity_idx'), '缺少 labeled_books_identity_idx');
+  assert.ok(!indexNames.has('books_title_author_idx'), '旧表达式唯一索引不应存在');
+  assert.ok(!indexNames.has('labeled_books_title_author_idx'), '旧表达式唯一索引不应存在');
   const required = report.columns.filter((column) => column.table_name === 'download_tasks');
   assert.ok(required.length > 0 && required.every((column) => column.is_nullable === 'NO'));
   return report;
@@ -73,44 +88,67 @@ const preservationChecks = {
 
 export async function runMigrationUpgradeSuite(connectionString) {
   const runId = `${process.pid}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-  const schemas = Object.fromEntries(['empty', 'legacy', 'worker', 'concurrent', 'failure', 'danger']
+  const schemas = Object.fromEntries(['empty', 'legacy', 'worker', 'manual', 'concurrent', 'failure', 'danger']
     .map((name) => [name, `migration_test_${runId}_${name}`]));
-  const migration = await loadMigration();
+  const migrations = await loadMigrations();
   const results = [];
   const fingerprints = {};
   try {
     for (const [fixture, key] of [['empty.sql', 'empty'], ['legacy-app.sql', 'legacy'], ['worker-first.sql', 'worker']]) {
       const schema = schemas[key];
       const client = await createFixture(connectionString, schema, fixture);
-      const first = await applyMigration(client, migration, { schema });
-      const second = await applyMigration(client, migration, { schema });
+      const first = await applyMigration(client, migrations, { schema });
+      const second = await applyMigration(client, migrations, { schema });
       assert.equal(first.status, 'applied');
+      assert.deepEqual(first.versions.map((item) => item.status), migrations.map(() => 'applied'));
       assert.equal(second.status, 'unchanged');
-      fingerprints[fixture] = fingerprint(await assertContract(client, schema, migration.checksum));
+      fingerprints[fixture] = fingerprint(await assertContract(client, schema, migrations));
       await preservationChecks[fixture]?.(client, schema);
       await client.end();
       results.push({ fixture, first: first.status, second: second.status, historyPreserved: true });
     }
-    assert.equal(new Set(Object.values(fingerprints)).size, 1, '三类起点升级后必须得到同一份结构契约');
+
+    // 第四类起点（生产形态）：只跑 0001 并记账，再裸跑 0002 的 DDL 但不记账——
+    // 也就是「生产已手工执行过 0002」。再跑迁移必须只补记 v2、不重放任何 DDL。
+    const manual = await createFixture(connectionString, schemas.manual, 'empty.sql');
+    const onlyV1 = migrations.find((item) => item.version === 1);
+    const identityV2 = migrations.find((item) => item.version === 2);
+    assert.ok(onlyV1 && identityV2, '需要 v1 与 v2 两个迁移文件');
+    const firstV1 = await applyMigration(manual, [onlyV1], { schema: schemas.manual });
+    assert.equal(firstV1.status, 'applied');
+    assert.deepEqual(firstV1.versions.map((item) => item.version), [1]);
+    await runInSchema(manual, schemas.manual, () => manual.query(identityV2.sql));
+    assert.equal((await manual.query(`SELECT count(*)::int AS n FROM ${assertIdentifier(schemas.manual)}.schema_migrations`)).rows[0].n, 1);
+    const manualFirst = await applyMigration(manual, migrations, { schema: schemas.manual });
+    assert.equal(manualFirst.status, 'applied');
+    assert.deepEqual(manualFirst.versions.map((item) => [item.version, item.status]), [[1, 'unchanged'], [2, 'applied']]);
+    const manualSecond = await applyMigration(manual, migrations, { schema: schemas.manual });
+    assert.equal(manualSecond.status, 'unchanged');
+    assert.deepEqual(manualSecond.versions.map((item) => item.status), ['unchanged', 'unchanged']);
+    fingerprints['manual-0002.sql'] = fingerprint(await assertContract(manual, schemas.manual, migrations));
+    await manual.end();
+    results.push({ fixture: 'manual-0002.sql', first: manualFirst.status, second: manualSecond.status, historyPreserved: true });
+
+    assert.equal(new Set(Object.values(fingerprints)).size, 1, '四类起点升级后必须得到同一份结构契约');
     results.push({ identicalContract: Object.keys(fingerprints) });
 
     const seed = await createFixture(connectionString, schemas.concurrent, 'empty.sql');
     await seed.end();
     const [left, right] = await Promise.all([connect(connectionString), connect(connectionString)]);
     const concurrent = await Promise.all([
-      applyMigration(left, migration, { schema: schemas.concurrent }),
-      applyMigration(right, migration, { schema: schemas.concurrent }),
+      applyMigration(left, migrations, { schema: schemas.concurrent }),
+      applyMigration(right, migrations, { schema: schemas.concurrent }),
     ]);
     assert.deepEqual(concurrent.map((item) => item.status).sort(), ['applied', 'unchanged']);
-    assert.equal(fingerprint(await assertContract(left, schemas.concurrent, migration.checksum)), fingerprints['empty.sql']);
+    assert.equal(fingerprint(await assertContract(left, schemas.concurrent, migrations)), fingerprints['empty.sql']);
     await Promise.all([left.end(), right.end()]);
     results.push({ concurrent: concurrent.map((item) => item.status) });
 
     const failure = await createFixture(connectionString, schemas.failure, 'empty.sql');
-    await assert.rejects(applyMigration(failure, {
+    await assert.rejects(applyMigration(failure, [{
       version: 99, name: 'fault.sql', checksum: 'f'.repeat(64),
       sql: 'CREATE TABLE must_rollback(id int); SELECT missing_column FROM must_rollback',
-    }, { schema: schemas.failure }));
+    }], { schema: schemas.failure }));
     assert.equal((await failure.query(`SELECT to_regclass('${schemas.failure}.must_rollback') AS value`)).rows[0].value, null);
     assert.equal((await failure.query(`SELECT to_regclass('${schemas.failure}.schema_migrations') AS value`)).rows[0].value, null);
     await failure.end();
@@ -121,7 +159,7 @@ export async function runMigrationUpgradeSuite(connectionString) {
       `INSERT INTO ${assertIdentifier(schemas.danger)}.download_tasks(book_id, title)
        VALUES(NULL, 'ambiguous') RETURNING id`);
     const blockedId = inserted.rows[0].id;
-    const blocked = await applyMigration(danger, migration, { schema: schemas.danger }).then(() => null, (error) => error);
+    const blocked = await applyMigration(danger, migrations, { schema: schemas.danger }).then(() => null, (error) => error);
     assert.ok(blocked, '含无法推断的必填 NULL 时必须阻断迁移');
     assert.match(blocked.message, /record ids:/);
     assert.match(blocked.message, new RegExp(`record ids: ${blockedId}(\\D|$)`));

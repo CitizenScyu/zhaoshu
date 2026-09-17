@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
-import { dirname, resolve } from 'node:path';
+import { basename, dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Client } from '@neondatabase/serverless';
 import { SCHEMA_MIGRATION_LOCK_ID, SCHEMA_VERSION } from '../src/lib/schema-version.ts';
@@ -16,7 +16,12 @@ export const EXPECTED_TABLES = [
 ];
 
 const here = dirname(fileURLToPath(import.meta.url));
-export const migrationPath = resolve(here, '..', 'migrations', '0001_baseline.sql');
+const migrationsDir = resolve(here, '..', 'migrations');
+
+// 迁移文件是显式有序列表，不扫目录：目录里多一个 .sql 不该在无人察觉时被执行。
+// version 由文件名前缀解析，SCHEMA_VERSION 必须等于列表里的最大版本（见 loadMigrations）。
+export const MIGRATION_FILES = ['0001_baseline.sql', '0002_identity_key.sql'];
+export const migrationPaths = MIGRATION_FILES.map((name) => resolve(migrationsDir, name));
 
 export function parseTarget(argv) {
   if (argv.length !== 1 || argv[0] !== '--target=test') {
@@ -101,14 +106,28 @@ export async function probeEndpoint(connectionString) {
   return { serializedLocks, transactionPinned };
 }
 
-export async function loadMigration() {
-  const sql = await readFile(migrationPath, 'utf8');
-  return {
-    version: SCHEMA_VERSION,
-    name: '0001_baseline.sql',
-    sql,
-    checksum: createHash('sha256').update(sql).digest('hex'),
-  };
+const checksumOf = (sql) => createHash('sha256').update(sql).digest('hex');
+
+// 每个文件是一个版本：version 取自文件名数字前缀，name 是文件名，checksum 是原文 SHA-256。
+// 摘要进 schema_migrations 后即冻结——改已发布文件的一个字节会让已有库拒绝继续。
+export async function loadMigrations() {
+  const migrations = [];
+  for (const path of migrationPaths) {
+    const name = basename(path);
+    const matched = /^(\d+)_/.exec(name);
+    if (!matched) throw new Error(`迁移文件名缺少数字版本前缀: ${name}`);
+    const sql = await readFile(path, 'utf8');
+    migrations.push({ version: Number(matched[1]), name, sql, checksum: checksumOf(sql) });
+  }
+  migrations.sort((a, b) => a.version - b.version);
+  if (new Set(migrations.map((item) => item.version)).size !== migrations.length) {
+    throw new Error('迁移文件版本号重复');
+  }
+  const head = migrations[migrations.length - 1]?.version;
+  if (head !== SCHEMA_VERSION) {
+    throw new Error(`迁移列表最大版本 ${head} 与 SCHEMA_VERSION ${SCHEMA_VERSION} 不一致`);
+  }
+  return migrations;
 }
 
 export function createClient(connectionString) {
@@ -122,8 +141,13 @@ export function safeError(error) {
   return result;
 }
 
-export async function applyMigration(client, migration, options = {}) {
-  migration ??= await loadMigration();
+// 待执行列表整体在一个事务里跑完：中途失败连同已登记的版本一起回滚，不留半成品。
+// 逐条按 version 查 schema_migrations：有行则核 name+checksum 后跳过（不重放 DDL），
+// 无行才执行 SQL 并 INSERT 记账。生产手工跑过的版本因此能被「只补记账」地接纳。
+export async function applyMigration(client, migrations, options = {}) {
+  const list = migrations == null
+    ? await loadMigrations()
+    : (Array.isArray(migrations) ? migrations : [migrations]);
   const quoted = assertIdentifier(options.schema ?? TARGET_SCHEMA);
   await client.query('BEGIN');
   try {
@@ -134,20 +158,28 @@ export async function applyMigration(client, migration, options = {}) {
     await client.query(`CREATE TABLE IF NOT EXISTS schema_migrations (
       version integer PRIMARY KEY, name text NOT NULL, checksum char(64) NOT NULL,
       applied_at timestamptz NOT NULL DEFAULT now())`);
-    const existing = await client.query('SELECT name, checksum FROM schema_migrations WHERE version=$1', [migration.version]);
-    if (existing.rows.length) {
-      const row = existing.rows[0];
-      if (row.name !== migration.name || row.checksum.trim() !== migration.checksum) {
-        throw new Error(`迁移版本 ${migration.version} 的摘要不匹配，拒绝继续`);
+    const ordered = [...list].sort((left, right) => left.version - right.version);
+    const versions = [];
+    let anyApplied = false;
+    for (const migration of ordered) {
+      const existing = await client.query('SELECT name, checksum FROM schema_migrations WHERE version=$1', [migration.version]);
+      const entry = { version: migration.version, name: migration.name, checksum: migration.checksum };
+      if (existing.rows.length) {
+        const row = existing.rows[0];
+        if (row.name !== migration.name || row.checksum.trim() !== migration.checksum) {
+          throw new Error(`迁移版本 ${migration.version} 的摘要不匹配，拒绝继续`);
+        }
+        versions.push({ ...entry, status: 'unchanged' });
+        continue;
       }
-      await client.query('COMMIT');
-      return { status: 'unchanged', version: migration.version, checksum: migration.checksum };
+      await client.query(migration.sql);
+      await client.query('INSERT INTO schema_migrations(version,name,checksum) VALUES($1,$2,$3)',
+        [migration.version, migration.name, migration.checksum]);
+      versions.push({ ...entry, status: 'applied' });
+      anyApplied = true;
     }
-    await client.query(migration.sql);
-    await client.query('INSERT INTO schema_migrations(version,name,checksum) VALUES($1,$2,$3)',
-      [migration.version, migration.name, migration.checksum]);
     await client.query('COMMIT');
-    return { status: 'applied', version: migration.version, checksum: migration.checksum };
+    return { status: anyApplied ? 'applied' : 'unchanged', versions };
   } catch (error) {
     await client.query('ROLLBACK').catch(() => {});
     throw error;
