@@ -108,6 +108,10 @@ export async function POST(req: NextRequest) {
     // 的首字节或停滞上限到点、总超时。连接层失败（UPSTREAM_UNREACHABLE）刻意不降级——它
     // 重试极便宜且对所有模型一视同仁，换模型治不住，原地重试才对（判定见 llm.ts fallbackEligible）。
     // 兜底占用 chatRobust 原本的重试名额，所以单步上游调用次数上界不变（见 chatRobust 注释）。
+    // 🔴 2026-09-17 起有一个例外：首字节超时（响应头 45s 内没到）会先**原地重发主模型一次**
+    // 才降级，所以 chatRobust 内部最多 3 次上游调用、本步 modelStep 最多 2 次 → **单步最坏 6 次**
+    // （此前 4 次）。重发拿的是共享 deadline 的剩余预算、仍带 45s 单次上限，所以整步墙钟不变，
+    // 兜底可用预算从 ~215s 降到 ~170s（仍高于 opus 中位 115.8s）。判定见 llm.ts chatRobust。
     // 主模型（换上的快模型）路由级失败率 ≈10%：来自独立复测 n=10、CI 1.8–40%，点值无分辨力，
     // 只能当量级；其中约一半是本机→Cloudflare 某边缘 IP 的 TLS 路径问题、与模型无关，生产
     // Vercel 侧是否同样命中尚未验证。每次请求读一次配置，便于运维改 LLM_FALLBACK_MODEL 后

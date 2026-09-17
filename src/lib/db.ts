@@ -85,13 +85,18 @@ export async function recordLlmUsage(record: LlmUsageRecord): Promise<void> {
     await ensureUsageSchema();
     const s = getSql();
     const { phase, model, requestId, createdAt, usage } = record;
+    // usage_details 的组成：上游原始 usage 之上叠加我们自己的观测字段，观测值放后面因此优先
+    // （attempts / firstByteTimeouts / retried / fallbackUsed / ttfbMs / cfRay / errorCode）。
+    // 🔴 零迁移：usage_details 本来就是 jsonb（见 createUsageSchema），这里只加键，不改表结构。
+    // 观测字段全部可选：chat 直接调用、或旧版本写入的行都不会有它们，读侧必须容忍缺失。
+    const details = { ...(usage.rawUsage ?? {}), ...(record.observation ?? {}) };
     await s`
       INSERT INTO llm_usage
         (created_at, phase, model, prompt_tokens, completion_tokens, total_tokens,
          cache_tokens, usage_missing, request_id, usage_details)
       VALUES (${createdAt}::timestamptz, ${phase}, ${model}, ${usage.promptTokens},
               ${usage.completionTokens}, ${usage.totalTokens}, ${usage.cacheTokens},
-              ${usage.usageMissing}, ${requestId}, ${JSON.stringify(usage.rawUsage ?? {})}::jsonb)`;
+              ${usage.usageMissing}, ${requestId}, ${JSON.stringify(details)}::jsonb)`;
   } catch {
     console.error('LLM usage write failed:', { phase: record.phase, model: record.model, requestId: record.requestId });
   }

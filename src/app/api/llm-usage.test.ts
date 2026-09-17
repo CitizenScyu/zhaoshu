@@ -94,6 +94,12 @@ async function sseOf(response: Response): Promise<Record<string, unknown>[]> {
   return events;
 }
 
+// Part 2 观测字段：成功且**没有**重试/降级的那一行。假时钟冻结，所以 ttfbMs 是 0。
+// 这些值落在同一个 usage_details jsonb 里（零迁移），所以断言的是它的完整内容。
+const observedFirstAttempt = {
+  attempts: 1, firstByteTimeouts: 0, retried: false, fallbackUsed: false, ttfbMs: 0,
+};
+
 function inserts() {
   return mocks.usageSql.mock.calls
     .filter(([parts]) => (parts as TemplateStringsArray).join('').includes('INSERT INTO llm_usage'))
@@ -147,7 +153,8 @@ describe('usage instrumentation through all model routes', () => {
     expect(mocks.usageSql).not.toHaveBeenCalled();
     await finishResponse();
     expect(inserts()).toEqual([[
-      '2026-09-15T00:00:00.000Z', phase, 'reported-model', 120, 30, 150, 50, false, 'completion-id', JSON.stringify(rawUsage),
+      '2026-09-15T00:00:00.000Z', phase, 'reported-model', 120, 30, 150, 50, false, 'completion-id',
+      JSON.stringify({ ...rawUsage, ...observedFirstAttempt }),
     ]]);
   });
 
@@ -158,7 +165,8 @@ describe('usage instrumentation through all model routes', () => {
     await finishRequest(phase, response); // 消费流结束触发 after 埋点
     await finishResponse();
     expect(inserts()).toEqual([[
-      '2026-09-15T00:00:00.000Z', phase, 'reported-model', 0, 0, 0, 0, true, 'completion-id', '{}',
+      '2026-09-15T00:00:00.000Z', phase, 'reported-model', 0, 0, 0, 0, true, 'completion-id',
+      JSON.stringify(observedFirstAttempt),
     ]]);
   });
 
@@ -239,6 +247,13 @@ describe('usage instrumentation through all model routes', () => {
     await finishResponse();
     expect(inserts().map((values) => values.slice(3, 8))).toEqual([[0, 0, 0, 0, true], [120, 30, 150, 50, false]]);
     expect(inserts().every((values) => values[1] === 'find_recall')).toBe(true);
+    // Part 2：两行都要能看出「这是同一次调用的第几次尝试」——失败行记失败族，重试行记重试。
+    // HTTP 503 这条失败路径没有 code（语义结论，不是传输层族），所以第一行只有四个计数；
+    // 成功的那一行还叠着上游原始 usage，所以这里用子集匹配。
+    expect(inserts().map((values) => JSON.parse(values[9] as string))).toMatchObject([
+      { attempts: 1, firstByteTimeouts: 0, retried: false, fallbackUsed: false },
+      { attempts: 2, firstByteTimeouts: 0, retried: true, fallbackUsed: false, ttfbMs: 0 },
+    ]);
   });
 
   it('records an interrupted invocation as missing while preserving cancellation behavior', async () => {

@@ -122,6 +122,8 @@ describe('actual LLM response usage', () => {
     });
     expect(onUsage).toHaveBeenCalledExactlyOnceWith({
       usage, model: 'reported-model', requestId: 'request-header-id', createdAt: '2026-09-15T00:00:00.000Z',
+      // Part 2 观测：假时钟冻结所以 ttfbMs 是 0；这一路没重试也没降级。
+      observation: { attempts: 1, firstByteTimeouts: 0, retried: false, fallbackUsed: false, ttfbMs: 0 },
     });
     const body = String(fetchMock.mock.calls[0][1]?.body);
     expect([...body].every((char) => char.charCodeAt(0) <= 127)).toBe(true);
