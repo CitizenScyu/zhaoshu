@@ -129,21 +129,23 @@ describe('阅读痕迹阈值', () => {
 });
 
 describe('引导入口范围', () => {
-  it('三条入口都放行：书架、找书、书库', () => {
+  it('书架与找书都引导：这两条路径的书一定有 books 行', () => {
+    // shelf = recommendations JOIN books；find = 同一次请求里刚 persistRecommendations 落库。
     expect(promptableOrigin('shelf')).toBe(true);
     expect(promptableOrigin('find')).toBe(true);
-    expect(promptableOrigin('library')).toBe(true);
   });
 
-  it('书库 + taskId（LibraryTab 已下载的书）能拿到引导', () => {
-    // 书库的书走 labeled_books，不保证有 books 行；产品裁决接受这一点换取入口覆盖。
-    expect(planFeedbackPrompt({ userId: 1, from: 'library', read: true, hasFeedback: false, prompted: false }))
-      .toEqual({ offer: true, remember: true });
+  it('书库不引导：书库是 labeled_books，不是 books，反馈会 404 BOOK_NOT_FOUND', () => {
+    // 全仓非测试代码里 INSERT INTO books 只有 /api/find:280 与 POST /api/shelf 两处；
+    // 从书库直接下载、没跑过 find 也没进书架的书没有 books 行。
+    expect(promptableOrigin('library')).toBe(false);
   });
 
-  it('判定按 from 逐入口列，不是恒放行：收窄时这条会先红', () => {
-    // 逐入口列出的写法留一个收窄用的接缝；哪天要排除某条路径，改 lib 里那一行。
-    expect(['shelf', 'find', 'library'].every((from) => promptableOrigin(from as ReaderOrigin))).toBe(true);
+  it('判定看 from 而不是会话类型：session.kind 判不出 book 身份', () => {
+    // library + taskId 是 download 会话但书只在 labeled_books；find 是 source 会话但书在 books。
+    // 这两条正好相反，所以 from 才是更准的判据。
+    expect(promptableOrigin('find')).toBe(true);
+    expect(promptableOrigin('library')).toBe(false);
   });
 });
 
@@ -160,8 +162,8 @@ describe('点返回时的编排', () => {
     expect(plan({ from: 'find' })).toEqual({ offer: true, remember: true });
   });
 
-  it('书库直读同样接管：三条入口一致', () => {
-    expect(plan({ from: 'library' })).toEqual({ offer: true, remember: true });
+  it('书库直读不接管，也不记账：没展示就不该消耗掉这本书唯一的一次引导', () => {
+    expect(plan({ from: 'library' })).toEqual({ offer: false, remember: false });
   });
 
   it('未登录不接管也不记账：u0 的键会把同一个人拆成两次引导', () => {
