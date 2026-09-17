@@ -37,7 +37,9 @@ describe('共享登录表单', () => {
     expect(html).toContain('current-password');
     expect(html).toContain('保持登录');
     expect(html).toContain('管理员口令登录');
-    expect(html).toContain('注册');
+    // 注册入口是独立一行、正常字号，不再和模式切换挤在小字里。
+    expect(html).toContain('还没有账号？');
+    expect(html).toContain('注册新账号');
     // 账号模式下不展示旧口令的“仅本次会话保存”。
     expect(html).not.toContain('仅本次会话保存');
   });
@@ -85,6 +87,8 @@ describe('共享登录表单', () => {
     expect(html).toContain('口令不正确或已失效');
     // compact 不重复标题。
     expect(html).not.toContain('<h1');
+    // 阅读器的准入卡也是「没有账号的人」的落点，注册入口照样给。
+    expect(html).toContain('/register');
   });
 });
 
