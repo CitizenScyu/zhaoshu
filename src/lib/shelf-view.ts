@@ -2,7 +2,7 @@
  * 书架视图的纯逻辑：同书折叠、按书名/作者过滤、两段式确认。
  * 抽成不依赖 DOM 的模块，才能在 node 环境直接测——本仓 vitest 只收 *.test.ts 且没有 jsdom。
  */
-import { canonicalBookKey, normalizeBookAuthor, normalizeBookTitle } from './book-identity.ts';
+import { canonicalBookKey, normalizeBookAuthor } from './book-identity.ts';
 
 /**
  * 书架单次最多返回的书数。与 user-data.ts 里 recommendationsForUserQuery 的
@@ -83,15 +83,27 @@ export function foldShelfItems<T extends ShelfRowLike>(rows: T[]): ShelfCard<T>[
 }
 
 /**
- * 命中书名或作者其一即可。书名留两个变体：归一后的（已剥《》）和未剥的，
- * 否则用户敲「《红」这种带书名号的半截词永远搜不到。空关键词返回全部。
+ * 搜索用的宽松书名键：在 NFKC + btrim + 小写之外，再无条件剥掉首尾的《与》。
+ *
+ * canonicalBookKey 只剥**成对**的一层书名号，这对书籍身份是对的（《《x》》 不能多剥），
+ * 但对搜索词不成立：用户敲的常常只有半边——「《红楼」「红楼梦》」都指《红楼梦》。
+ * 所以匹配时两侧都过这一个函数，而不是只处理「书名自带书名号」那一种形态。
+ */
+function looseSearchKey(value: string): string {
+  return normalizeBookAuthor(value).replace(/^《+/, '').replace(/》+$/, '');
+}
+
+/**
+ * 命中书名或作者其一即可。空关键词返回全部。
+ * 书名与关键词都过 looseSearchKey，两侧同一套归一才有对称性。
  */
 function matchTargets(row: ShelfRowLike): string[] {
-  return [normalizeBookTitle(row.title), normalizeBookAuthor(row.title), normalizeBookAuthor(row.author)];
+  return [looseSearchKey(row.title), normalizeBookAuthor(row.author)];
 }
 
 export function filterShelfCards<T extends ShelfRowLike>(cards: ShelfCard<T>[], keyword: string): ShelfCard<T>[] {
-  const needle = normalizeBookAuthor(keyword);
+  // 只有书名号的词（如「《」）宽松归一后是空串，此时退回字面匹配，别把它当成空搜索。
+  const needle = looseSearchKey(keyword) || normalizeBookAuthor(keyword);
   if (!needle) return cards;
   return cards.filter((card) => matchTargets(card.master).some((target) => target.includes(needle)));
 }
