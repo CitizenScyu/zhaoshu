@@ -42,7 +42,7 @@ function stats() {
     sectionScopes:{library:'shared',find:'personal',shelf:'personal',download:'personal',shuyuan:'shared',tokens:'shared-owner'},
     library:mode==='failure'?null:{total:109,withQuality:90,avgQuality:8.2,charsLabeled:360000,genres:[{name:'仙侠',count:12}]},
     find:{queries:4,recommendations:6},shelf:{statuses:[{name:'want',count:6}]},download:null,
-    shuyuan:allowed.includes('shuyuan')?{total:10,active:8}:null,
+    shuyuan:allowed.includes('shuyuan')?{total:10,active:8,enabled:8,disabled:2,unprobed:5,pending:2,reachable:2,failed:1}:null,
     tokens:allowed.includes('tokens')?{total:zero,last24h:zero,byPhase:['find_recall','find_rerank','profile','feedback'].map(phase=>({phase,...zero}))}:null,
     availability:Object.fromEntries(Object.entries(states).map(([key,state])=>[key,state==='ok'])),
     ...(mode==='failure'?{code:'STATS_PARTIAL',error:'部分统计暂不可用，请稍后重试'}:{})};

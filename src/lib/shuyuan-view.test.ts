@@ -272,3 +272,33 @@ describe('筛选谓词与统计口径同源', () => {
     expect(shuyuan).not.toMatch(/LIMIT \$\{20\}/);
   });
 });
+
+// 统计页书源文案（claims 审计）：尾句曾声称「尚未接入找书验证或试读」，但找书补验
+// （source-verification）与直接阅读（source-reader + ReadBookLink）都已上线——文案失实。
+// 这里钉住两件事：过期尾句不复活；数字只从分列口径（enabled/reachable/…）取，不碰 active。
+describe('统计页书源文案与计数口径', () => {
+  const statsTab = readFileSync(new URL('../components/StatsTab.tsx', import.meta.url), 'utf8');
+  const shuyuan = readFileSync(new URL('./shuyuan.ts', import.meta.url), 'utf8');
+
+  it('能定位到书源文案（防止本组断言因重构静默失效）', () => {
+    expect(statsTab).toContain('共享书源资料');
+  });
+
+  it('不再声称尚未接入找书验证或试读', () => {
+    expect(statsTab).not.toContain('尚未接入');
+  });
+
+  it('文案只展示分列口径的计数键，不把 active 当展示字段', () => {
+    const block = statsTab.slice(statsTab.indexOf('共享书源资料'));
+    for (const key of ['total', 'enabled', 'reachable', 'unprobed', 'pending'] as const) {
+      expect(block).toContain(`stats.shuyuan.${key}`);
+    }
+    // active 是兼容字段（仅 /api/stats 返回），界面上从未展示，混进来就是口径回退。
+    expect(block).not.toContain('stats.shuyuan.active');
+  });
+
+  it('后端类型注释仍声明 active 为兼容字段且口径与 SQL 一致', () => {
+    expect(shuyuan).toContain('兼容字段：启用且最近探测可达');
+    expect(shuyuan).toContain("disabled_at IS NULL AND p.status = 'reachable')::int AS active");
+  });
+});

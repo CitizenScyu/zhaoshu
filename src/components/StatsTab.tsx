@@ -293,7 +293,7 @@ export default function StatsTab() {
           {/* 书源一笔账 */}
           <p className="text-xs" style={{ color: 'var(--ink-faint)' }}>
             {stats.shuyuan
-              ? `共享书源资料 ${stats.shuyuan.total} 条（启用 ${stats.shuyuan.enabled} 条；最近探测可达 ${stats.shuyuan.reachable} 条；未探测 ${stats.shuyuan.unprobed} 条；待核验 ${stats.shuyuan.pending} 条）。启用不代表可用，尚未接入找书验证或试读。`
+              ? `共享书源资料 ${stats.shuyuan.total} 条（启用 ${stats.shuyuan.enabled} 条；最近探测可达 ${stats.shuyuan.reachable} 条；未探测 ${stats.shuyuan.unprobed} 条；待核验 ${stats.shuyuan.pending} 条）。可达只代表源站本身探测通过，不代表每本书都能搜到或读到。`
               : sectionNote('shuyuan')}
           </p>
         </div>
