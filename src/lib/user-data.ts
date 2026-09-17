@@ -234,3 +234,29 @@ export function feedbackSnapshotForUserQuery(sql: PersonalQuery, userId: number,
     WHERE f.user_id = ${userId} AND lower(b.title) = lower(${book.title}) AND lower(b.author) = lower(${book.author})
     ORDER BY f.id DESC LIMIT 1`;
 }
+
+// 精确找书（task-77）的本地命中查询：按身份键在 books 里精确找，命中即返回、不打豆瓣。
+//
+// 查询条件是**生成列** title_key / author_key（migrations/0002_identity_key.sql），
+// 与写侧的 ON CONFLICT (title_key, author_key) 指向同一套键。这里刻意不再用
+// lower(title) = lower(...)：那套比较绕过了《》/全角归一，`《红楼》` 与 `红楼` 会查不到同一行。
+//
+// 输入只归一一次（identityOf），与所有其他 books 身份查询同源。
+// 不传作者时可能命中同名不同作者的多行——那是要展示给用户挑的，所以不是 LIMIT 1。
+const MAX_EXACT_LIBRARY_HITS = 5;
+
+export function exactLibraryBooksForUserQuery(sql: PersonalQuery, userId: number, title: string, author: string) {
+  requireUserId(userId);
+  const book = identityOf(title, author);
+  // on_shelf 只影响「加入书架」按钮的初始态；books 没有 user 归属，user 维度由
+  // recommendations 提供（与 excludedBooksForUserQuery 同源）。这里**不**限定 status：
+  // 书架上任何状态都算「已在书架」，与 shelfExistsForUserQuery 的口径一致。
+  const columns = sql`SELECT b.id, b.title, b.author, b.douban_id, b.douban_rating, b.douban_rating_count, b.meta,
+      EXISTS (SELECT 1 FROM recommendations r WHERE r.book_id = b.id AND r.user_id = ${userId}) AS on_shelf
+    FROM books b`;
+  return book.author
+    ? sql`${columns} WHERE b.title_key = ${book.title} AND b.author_key = ${book.author}
+        ORDER BY b.id LIMIT ${MAX_EXACT_LIBRARY_HITS}`
+    : sql`${columns} WHERE b.title_key = ${book.title}
+        ORDER BY b.id LIMIT ${MAX_EXACT_LIBRARY_HITS}`;
+}
