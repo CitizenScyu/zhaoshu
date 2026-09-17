@@ -157,5 +157,17 @@ export async function initializeBusinessSchema(s: Sql) {
     ALTER TABLE app_settings ADD COLUMN IF NOT EXISTS label_model text`,
     tx`
     ALTER TABLE app_settings ADD COLUMN IF NOT EXISTS label_model_updated_at timestamptz`,
+    // 默认模型（llm_model 没有覆盖值时要用的那个）。此前「默认值」只有环境变量与硬编码缺省
+    // 两个来源，改它必须重新部署；加这一列之后改默认值与管理台改当前模型同路，不需要发布。
+    // 独立三列（含判定与时间戳）：改默认值不能弄脏 llm_model 那三列的「当前值/判定/更新时间」。
+    // 幂等补列，与 label_model 同一模式，不动 id=1 那行已有内容。
+    tx`
+    ALTER TABLE app_settings ADD COLUMN IF NOT EXISTS default_model text`,
+    // 保存默认值时探测到的推理结论。与 llm_reasoning 同理：一旦默认值真的生效，
+    // 「当前模型是推理模型」的告警必须刷新后仍然看得见。
+    tx`
+    ALTER TABLE app_settings ADD COLUMN IF NOT EXISTS default_model_reasoning text`,
+    tx`
+    ALTER TABLE app_settings ADD COLUMN IF NOT EXISTS default_model_updated_at timestamptz`,
   ]);
 }

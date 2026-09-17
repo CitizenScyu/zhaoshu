@@ -44,11 +44,39 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
-describe('resolveModel：数据库设置 → 环境变量 → 硬编码缺省', () => {
+describe('resolveModel：数据库当前覆盖 → 数据库默认值 → 环境变量 → 硬编码缺省', () => {
   it('数据库有覆盖值时优先于环境变量', async () => {
     vi.stubEnv('LLM_MODEL', 'env-model');
     settings.readModelSetting.mockResolvedValue({ model: 'db-model', updatedAt: null });
     await expect(client.resolveModel()).resolves.toBe('db-model');
+  });
+
+  // task-69 的核心：默认值这一层只在**运行时真的被解析**才有意义。
+  // 只改管理台展示、不改这里 → 本用例必须失败（界面会看起来改了却完全没生效）。
+  it('没有当前覆盖值时用库内默认值，且优先于环境变量', async () => {
+    vi.stubEnv('LLM_MODEL', 'env-model');
+    settings.readModelSetting.mockResolvedValue({ model: null, updatedAt: null, defaultModel: 'db-default' });
+    await expect(client.resolveModel()).resolves.toBe('db-default');
+  });
+
+  it('当前覆盖值优先于库内默认值', async () => {
+    vi.stubEnv('LLM_MODEL', 'env-model');
+    settings.readModelSetting.mockResolvedValue({
+      model: 'db-model', updatedAt: null, defaultModel: 'db-default',
+    });
+    await expect(client.resolveModel()).resolves.toBe('db-model');
+  });
+
+  it('库内默认值也优先于硬编码缺省', async () => {
+    const saved = process.env.LLM_MODEL;
+    delete process.env.LLM_MODEL;
+    try {
+      settings.readModelSetting.mockResolvedValue({ model: null, updatedAt: null, defaultModel: 'db-default' });
+      await expect(client.resolveModel()).resolves.toBe('db-default');
+    } finally {
+      if (saved === undefined) delete process.env.LLM_MODEL;
+      else process.env.LLM_MODEL = saved;
+    }
   });
 
   it('数据库没有覆盖值时用环境变量', async () => {
@@ -127,6 +155,15 @@ describe('chat / chatRobust 用的是每次调用解析出来的模型', () => {
     await client.chatRobust('system', 'user');
     expect(sentBody(1).model).toBe('db/model-b');
     expect(settings.readModelSetting).toHaveBeenCalledTimes(2);
+  });
+
+  // 端到端钉住默认值这一层：真正发到上游的请求体里必须是库内默认值。
+  it('库内默认值会真的出现在上游请求体里', async () => {
+    vi.stubEnv('LLM_MODEL', 'env-model');
+    settings.readModelSetting.mockResolvedValue({ model: null, updatedAt: null, defaultModel: 'db/default' });
+    fetchMock.mockImplementation(() => sse([content('正文'), finish('stop'), DONE]));
+    await client.chatRobust('system', 'user');
+    expect(sentBody().model).toBe('db/default');
   });
 
   it('chat 默认用解析结果，显式传入的候选模型只影响那一次调用', async () => {
