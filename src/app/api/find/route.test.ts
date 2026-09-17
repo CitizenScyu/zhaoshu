@@ -280,7 +280,13 @@ describe('POST /api/find output contract', () => {
     expect(data.items[1]).toMatchObject({
       title: 'ＡＢＣ', author: 'Ｘ', matchScore: 80, why: '原始理由', category: '仙侠', douban: { doubanId: '123' },
     });
-    expect(mocks.chatRobust.mock.calls[0][1]).not.toContain('"why":"重复"');
+    // T55-6 后重排 prompt 只带必要字段：why/sourceEvidence 不进 prompt（重排后被召回原件覆盖）。
+    // 去重仍可从输入里看出来：两个身份各出现一次，被去重的 abc/Ｘ 那份整条不出现。
+    const rerankPrompt = mocks.chatRobust.mock.calls[0][1] as string;
+    expect(rerankPrompt).not.toContain('"why"');
+    expect(rerankPrompt).not.toContain('"sourceEvidence"');
+    expect(rerankPrompt.match(/"title":"ＡＢＣ"/g)).toHaveLength(1);
+    expect(rerankPrompt.match(/"title":"abc"/g)).toHaveLength(1);
     expect(mocks.persistRecommendationsForUser).toHaveBeenCalledWith(1, '找书', data.items, expect.any(Function));
   });
 
@@ -362,7 +368,10 @@ describe('POST /api/find output contract', () => {
     mocks.chatRobust.mockResolvedValue(JSON.stringify({ items: [{ ...item, sourceEvidence: { status: 'forged' } }] }));
     const reranked = await consumeSSE(await POST(request({ step: 'rerank', query: '找书', verified: result.verified })));
     expect(lastEvent<{ type: string; items: unknown[] }>(reranked, 'result').items[0]).toMatchObject({ sourceEvidence: evidence, douban: missing });
-    expect(mocks.chatRobust.mock.calls[0][1]).toContain('仅补充存在性');
+    // T55-6：sourceEvidence 在重排后被召回原件覆盖，因此不再进重排 prompt（省输入 token）；
+    // 结果里的存在性证据仍原样带回（上一行的断言），语义不变。
+    expect(mocks.chatRobust.mock.calls[0][1]).not.toContain('仅补充存在性');
+    expect(mocks.chatRobust.mock.calls[0][1]).not.toContain('"sourceEvidence"');
   });
 
   // 单步模型预算是硬上限：调用方传给 chatRobust 的 totalTimeoutMs 来自它。第一次尝试拿满

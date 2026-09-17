@@ -81,9 +81,12 @@ describe('profile database version contract (mocked HTTP queries)', () => {
     const { getExcludedBookKeysForUser, getExcludedBookTitlesForUser } = await import('./db');
     await getExcludedBookKeysForUser(11);
     await getExcludedBookTitlesForUser(12);
-    expect(mocks.sql.mock.calls[0].slice(1)).toEqual([11]);
-    expect(mocks.sql.mock.calls[1].slice(1)).toEqual([12]);
+    // T56-1 后排除集合同时查 recommendations 与 feedback，userId 在两条子查询里各绑定一次。
+    expect(mocks.sql.mock.calls[0].slice(1)).toEqual([11, 11]);
+    expect(mocks.sql.mock.calls[1].slice(1)).toEqual([12, 12]);
+    expect(mocks.sql.mock.calls[0][0].join('?')).toContain('r.user_id = ?');
     expect(mocks.sql.mock.calls[0][0].join('?')).toContain('f.user_id = ?');
+    expect(mocks.sql.mock.calls[1][0].join('?')).toContain('r.user_id = ?');
     expect(mocks.sql.mock.calls[1][0].join('?')).toContain('f.user_id = ?');
   });
 

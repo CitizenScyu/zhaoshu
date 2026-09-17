@@ -116,6 +116,16 @@ async function modelStep<T>(
 // 三步流水线由前端分步调用：recall → verify → rerank
 // 每步都独立控制在函数时限内，前端可以展示进度
 
+// 喂给重排模型的候选投影（task-55 T55-6）：why 与 sourceEvidence 在重排输出之后
+// 一律用召回原件覆盖（见下面 byBook 回填），回传全文只是把 prompt 撑大——12 本候选的
+// 合成样本上这两项占输入 JSON 的 45%。重排真正要看的信号是身份（title/author）、
+// 题材字数与豆瓣外部证据，全部保留。
+function rerankInput(verified: VerifiedCandidate[]) {
+  return verified.map(({ title, author, category, wordCount, douban }) => ({
+    title, author, category, wordCount, douban,
+  }));
+}
+
 export async function POST(req: NextRequest) {
   return withFindAccess(req, MODEL_ROUTE_INTERNAL_BUDGET_MS, async (access) => {
     const { userId } = access.principal;
@@ -230,7 +240,7 @@ export async function POST(req: NextRequest) {
           ms(),
           async (totalTimeoutMs) => (await chatRobust(
             rerankSystem(),
-            rerankUser(profile, query, JSON.stringify(verified), conditions),
+            rerankUser(profile, query, JSON.stringify(rerankInput(verified)), conditions),
             { temperature: 0.3, signal: access.signal, onUsage: recordUsageAfterResponse('find_rerank'), totalTimeoutMs, fallbackModel, ...modelAttemptLimits },
           )).content,
           (content) => modelList(content, 'items', MAX_RERANKED_ITEMS),
