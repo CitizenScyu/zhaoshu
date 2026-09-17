@@ -12,16 +12,25 @@
 
 const NUL = String.fromCharCode(0);
 
-// 空白规则：只剥 U+0020，与 PostgreSQL btrim(text) 的默认行为逐字对齐。
+// 空白规则：只剥 U+0020，**刻意对齐 SQL 侧 btrim(text) 的默认语义，与 JS 的
+// String.prototype.trim() 不同**（trim() 剥的是宿主定义的一整组 Unicode 空白）。
 //
-// 为什么不用 String.prototype.trim()：它剥的是宿主定义的一整组 Unicode 空白
-// （TAB / CR / LF / 全角空格 U+3000 / NBSP 等），比 btrim() 宽。用 trim() 会让
-// JS 侧算出与 SQL 权威键不同的键——那正是本任务要消灭的那类分叉（生产数据里
-// `《修真聊天群》` 就是这么裂成两行的）。这里显式写成 0x20 常量，行为不随引擎
-// 或宿主 locale 变化，也不依赖 trim() 的隐式字符集。
+// 为什么不用 String.prototype.trim()：它剥 TAB / LF / CR / FF / VT / U+1680 /
+// U+FEFF / U+2028 等，比 btrim() 宽。任何绕过应用归一化的写入路径（导入脚本 /
+// backfill / 直接 SQL）只要落了含 TAB 的值，SQL 键保留 TAB 而应用键剥掉 ⇒ 分叉
+// ⇒ Phase 2 的生成列唯一索引上必出 23505 或 42P10。
+// 反向（让应用归一得更激进）同样不安全，所以两侧必须逐字对齐。
 //
-// 代价（已知、已钉在测试里）：首尾 TAB / 换行不再被视为可忽略，与 SQL 一致。
+// 这里用显式码位常量做循环，等价于 /^ +| +$/g，但不依赖宿主默认 trim() 的
+// 隐式字符集，行为不随引擎或 locale 变化。
+//
+// 🔴 首尾 TAB / 换行 / U+1680 / U+FEFF / U+2028 **不会被剥除——这是有意为之的
+// 与 SQL 一致，不是遗漏**。代价已钉在测试里（'\\t修真聊天群' 必须原样保留）。
 // 生产 books/labeled_books 实测首尾空白 0 行，改这条规则对存量数据无影响。
+//
+// 注意区分：NBSP(U+00A0) / U+2000 / U+2003 / U+2009 / U+202F / U+205F /
+// U+3000 会被剥掉，但**不是 trim() 泄漏**——NFKC 先把它们折叠成 U+0020，再由本
+// 规则剥除；SQL 侧 normalize(t,NFKC) 同样先折叠，所以两侧一致。同样已钉在测试里。
 const BTRIM_CODE_POINT = 0x20;
 
 function btrimSpace(value: string): string {

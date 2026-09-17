@@ -66,6 +66,17 @@ describe('空白规则（显式钉住，防止有人换回 trim()）', () => {
     expect(normalizeBookAuthor('人' + ws)).toBe('人' + ws);
   });
 
+  it('硬约束：只剥 U+0020，与 SQL btrim 一致，与 JS .trim() 不一致', () => {
+    // 保留 TAB —— 有意为之的与 SQL 一致，不是遗漏
+    expect(normalizeBookTitle('\t修真聊天群')).toBe('\t修真聊天群');
+    expect(normalizeBookAuthor('\t佚名')).toBe('\t佚名');
+    // 剥掉 U+0020
+    expect(normalizeBookTitle(' 修真聊天群 ')).toBe('修真聊天群');
+    expect(normalizeBookAuthor(' 佚名 ')).toBe('佚名');
+    // 分歧点就在这里：宿主 trim() 会剥 TAB，我们刻意不剥
+    expect('\t修真聊天群'.trim()).toBe('修真聊天群');
+  });
+
   it('首尾 TAB / 换行的书名与干净写法是两个键（与 SQL 一致）', () => {
     const clean = canonicalBookKey('修真聊天群', '作者');
     expect(canonicalBookKey('\t修真聊天群', '作者')).not.toBe(clean);
