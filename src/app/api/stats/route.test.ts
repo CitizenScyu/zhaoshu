@@ -43,17 +43,42 @@ const fixtures = [
   { section: 'tokens', needle: 'FROM llm_usage', rows: [], empty: [] },
 ];
 
+// 事务合批的观测面：每条批内语句的文本、整体成败、事务选项。
+// 把某个只读段从批里摘出去时，批内语句数会变，下面的断言必须变红。
+type BatchRecord = { texts: string[]; result: 'pending' | 'ok' | 'failed'; options?: unknown };
+const batches: BatchRecord[] = [];
+
+function rowsForQuery(text: string, failure?: string, empty = false) {
+  const fixture = fixtures.find(({ needle }) => text.includes(needle));
+  if (!fixture) throw new Error('Unexpected SQL query');
+  if (failure === '*' || failure === fixture.needle) throw new Error('private database details');
+  return empty ? fixture.empty : fixture.rows;
+}
+
 function mockQueries(failure?: string, empty = false) {
   getLlmUsageStats.mockImplementation(async () => {
     if (failure === '*' || failure === 'FROM llm_usage') throw new Error('private database details');
     return empty ? emptyTokens : tokens;
   });
-  sql.mockImplementation((strings: TemplateStringsArray) => {
-    const text = strings.join('');
-    const fixture = fixtures.find(({ needle }) => text.includes(needle));
-    if (!fixture) throw new Error('Unexpected SQL query');
-    if (failure === '*' || failure === fixture.needle) throw new Error('private database details');
-    return empty ? fixture.empty : fixture.rows;
+  sql.mockImplementation((strings: TemplateStringsArray) => rowsForQuery(strings.join(''), failure, empty));
+  batches.length = 0;
+  Object.assign(sql, {
+    transaction: vi.fn(async (batch: ((tx: unknown) => unknown[]) | unknown[], options?: unknown) => {
+      const record: BatchRecord = { texts: [], result: 'pending', options };
+      batches.push(record);
+      const tx = (strings: TemplateStringsArray, ...values: unknown[]) => {
+        record.texts.push(strings.join(''));
+        return (sql as unknown as (parts: TemplateStringsArray, ...rest: unknown[]) => unknown)(strings, ...values);
+      };
+      try {
+        const result = typeof batch === 'function' ? (batch as (t: unknown) => unknown[])(tx) : batch;
+        record.result = 'ok';
+        return result;
+      } catch (error) {
+        record.result = 'failed';
+        throw error;
+      }
+    }),
   });
 }
 
@@ -98,6 +123,21 @@ describe('GET /api/stats', () => {
     const downloadQuery = sql.mock.calls.find(([strings]) => (strings as TemplateStringsArray).join('').includes('FROM download_tasks'));
     expect(downloadQuery?.slice(1)).toEqual(['done', 'done', 'done', 1]);
     expect(getLlmUsageStats).toHaveBeenCalledOnce();
+  });
+
+  it('library 段的两条查询合成一次只读事务往返，语句与顺序不变', async () => {
+    const res = await GET(request());
+    expect(res.status).toBe(200);
+    // 合批专属断言：库段只发一次事务；摘掉任一条只会让批内语句数变少（变异自测见回报）。
+    expect(batches).toHaveLength(1);
+    expect(batches[0].result).toBe('ok');
+    expect(batches[0].options).toEqual({ readOnly: true });
+    expect(batches[0].texts).toHaveLength(2);
+    expect(batches[0].texts[0]).toContain('count(quality)');
+    expect(batches[0].texts[1]).toContain('AS genre');
+    // 合批没有把别的容错段卷进来：下载段仍是自己的一次独立往返（单段失败不连坐）。
+    const downloadCalls = sql.mock.calls.filter(([parts]) => (parts as TemplateStringsArray).join('').includes('FROM download_tasks'));
+    expect(downloadCalls).toHaveLength(1);
   });
 
   it('keeps real empty aggregates at zero with available=true', async () => {

@@ -25,6 +25,23 @@ function ownerRequest(page?: string) {
 function listQuery() {
   return db.queries.find((query) => query.text.includes('FROM labeled_books'));
 }
+// 只记录不执行的 tag：拿事务回调重建批内 SQL，断言「哪些语句确实在同一个批里」。
+// 必需——只看 db.queries 的总条数无法区分「4 条同一事务」与「3 条在事务 + 1 条另发」
+// （变异自测实证：摘掉一条 facet 后总条数仍是 4，靠条数断言不会红）。
+function batchTexts(call: unknown[]) {
+  const build = call[0] as (tx: unknown) => { text: string }[];
+  const tag = (parts: TemplateStringsArray, ...values: unknown[]) => {
+    let text = '';
+    parts.forEach((part, index) => {
+      text += part;
+      if (index >= values.length) return;
+      const value = values[index] as { text?: string } | null | undefined;
+      text += value && typeof value === 'object' && typeof value.text === 'string' ? value.text : '?';
+    });
+    return { text, values: [] as unknown[] };
+  };
+  return build(tag).map((query) => query.text);
+}
 
 describe('GET /api/library', () => {
   beforeEach(() => {
@@ -120,5 +137,34 @@ describe('GET /api/library', () => {
     expect(res.status).toBe(500);
     expect(await res.json()).toEqual({ error: 'internal error', code: 'DB_ERROR' });
     expect(db.queries).toHaveLength(0);
+  });
+
+  it('四条查询合成一次只读事务往返：批内语句与顺序不变', async () => {
+    const res = await GET(ownerRequest());
+    expect(res.status).toBe(200);
+    // 合批专属断言：退回四条独立 await 时 transaction 调用数为 0，这条变红。
+    expect(db.transaction).toHaveBeenCalledTimes(1);
+    expect((db.transaction.mock.calls[0] as unknown[])[1]).toEqual({ readOnly: true });
+    expect(db.queries).toHaveLength(4);
+    // 语句数与顺序：行 / 计数 / 分类 facet / 完结 facet，与逐条执行时完全一致。
+    expect(batchTexts(db.transaction.mock.calls[0] as unknown[])).toEqual([
+      expect.stringContaining('SELECT id, title'),
+      expect.stringContaining('count(*)::int AS total'),
+      expect.stringContaining('GROUP BY 1 ORDER BY n DESC LIMIT 20'),
+      expect.stringContaining("WHERE finish_status <> '' GROUP BY finish_status"),
+    ]);
+  });
+
+  it('单条查询失败时整体仍是 DB_ERROR（合批前后错误路径一致）', async () => {
+    // 只有第 3 条（分类 facet）失败：合批前它也会让整个 try 走 catch 返回 500。
+    db.resolve.mockImplementation((query) => {
+      if (query.text.includes('GROUP BY 1 ORDER BY n DESC LIMIT 20')) throw new Error('facet boom');
+      if (query.text.includes('SELECT id, title')) return [{ id: 7, title: '测试书', author: '作者', category: '仙侠', primary_genre: '修仙', quality: 8, finish_status: '完结', chars_labeled: 30000, labels: {}, labeled_at: '2026-09-14' }];
+      if (query.text.includes('AS total')) return [{ total: 1 }];
+      return [];
+    });
+    const res = await GET(ownerRequest());
+    expect(res.status).toBe(500);
+    expect(await res.json()).toEqual({ error: 'internal error', code: 'DB_ERROR' });
   });
 });

@@ -241,6 +241,13 @@ body {
 .chip-risk { border-color: #e3c4bd; color: var(--cinnabar); background: rgba(176, 57, 42, 0.05); }
 .chip-dai  { border-color: #c2d1da; color: var(--dai); background: rgba(52, 86, 106, 0.06); }
 
+/* chip 的触控目标（task-70 T56-6 实测结论）：可点的 chip 全部是 <button>，
+   globals.css:23 的 `button, select { min-width: 44px; min-height: 44px }` 已经让它们
+   实测达到 46×44 / 44×44；静态标签是 span，不参与触控目标。这里只补上同一类交互元素里
+   唯一没有 44px 保证的 <a>.chip（当前只有 ReadBookLink，它自带 min-h-11，故今天零视觉变化）。
+   不要给 .chip 加伪元素扩热区：chip 已是 44px 高，撑大热区只会在换行时盖住上一行 chip。 */
+a.chip { min-width: 44px; min-height: 44px; }
+
 /* ---------- 简易 Markdown（画像） ---------- */
 .md h2 {
   font-size: 15px;
