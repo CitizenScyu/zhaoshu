@@ -14,11 +14,46 @@ export interface LlmUsage {
   rawUsage: Record<string, unknown> | null;
 }
 
+// 一次上游调用的**尝试上下文**：由 chatRobust 在发起前给出，chat 原样带进 usage 回调。
+// firstByteTimeouts 记的是「**此前**已经发生过的」首字节超时次数，chat 会把自己这一次也算上
+// （见 llm.ts 的 observationFor），所以每一行的值都是「截止本行」的累计数。
+export interface LlmAttemptContext {
+  /** 这是本次 chatRobust 内的第几次上游调用（从 1 开始）。 */
+  attempts: number;
+  /** 本次 chatRobust 内到此为止的首字节超时次数。 */
+  firstByteTimeouts: number;
+  /** 首次尝试失败后原地重发过主模型。 */
+  retried: boolean;
+  /** 本行是降级到兜底模型的那次调用。 */
+  fallbackUsed: boolean;
+}
+
+// 落进 llm_usage.usage_details 的观测字段（2026-09-17）。
+//
+// 为什么需要：失败行的 usage_details 原本恒为 {}，线上分不清失败族，也看不出
+// 「首字节超时后原地重发有没有发生、有没有成功」——那正是重试修复赖以验证的东西。
+// 🔴 零迁移：usage_details 本来就是 jsonb（见 db.ts 的 DDL），这里只是往里加键，
+// **不改表结构、不加列**。所以每个字段都必须能容忍缺失（老行没有它们）。
+//
+// 前四个来自 LlmAttemptContext：由 chatRobust 驱动时一定齐全（chat 会原样带上）。
+// 这里写成可选是因为 chat 也可以被直接调用（如模型探测），那时它们没有意义、不该编造。
+export interface LlmCallObservation extends Partial<LlmAttemptContext> {
+  /** 仅成功时：从发起 fetch 到拿到响应头（毫秒）。拿不到就不写，不编。 */
+  ttfbMs?: number;
+  /** 仅成功时：响应头里的 cf-ray。拿不到就留空（不写这个键），不编。 */
+  cfRay?: string;
+  /** 失败时：LlmError.code（如 UPSTREAM_FIRST_BYTE_TIMEOUT / UPSTREAM_UNREACHABLE）。 */
+  errorCode?: string;
+}
+
 export interface LlmCallUsage {
   model: string;
   requestId: string | null;
   createdAt: string;
   usage: LlmUsage;
+  // 观测字段（可选）：chat 直接调用时只有它自己观测到的部分；chatRobust 还会补上
+  // 尝试上下文。任何字段都拿不到时整个对象不挂上，避免写入无意义的结构。
+  observation?: LlmCallObservation;
 }
 
 export interface LlmUsageRecord extends LlmCallUsage {

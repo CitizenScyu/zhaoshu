@@ -604,23 +604,44 @@ describe('stream completion and shared call budget', () => {
       expect(client.configuredAttemptTimeoutMs()).toBe(20_000);
     });
 
-    // 回归护栏：不设首字节上限时这次请求会一直挂到总超时（20s）才死；有了它 45s→这里用 2s
-    // 的短上限来验，第一次尝试在 2s 被截断，剩余预算交给兜底。
-    it('首字节上限到点 → 判「卡住」并降级（不是报成总超时）', async () => {
+    // 回归护栏（Part 1 的核心）：首字节超时**不等于**该降级——探针实测立刻重发有 53.3% 直接
+    // 拿到正文。这里第二次仍是**主模型**（不是兜底）；把重发改掉/去掉，本用例立刻变红。
+    it('首字节上限到点 → 先用主模型原地重发，成功就不降级', async () => {
       const started = Date.now();
       fetchMock
         .mockImplementationOnce((_url: unknown, init?: RequestInit) => new Promise((_resolve, reject) => {
           init?.signal?.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')));
         }))
-        .mockResolvedValueOnce(response([token('兜底正文'), finish('stop')]));
+        .mockResolvedValueOnce(response([token('重发成功的正文'), finish('stop')]));
       const pending = client.chatRobust('system', 'user', {
         totalTimeoutMs: 20_000, idleTimeoutMs: 45_000, firstByteTimeoutMs: 2_000, fallbackModel: 'fallback/model',
       });
       await vi.advanceTimersByTimeAsync(2_000);
       expect(fetchMock).toHaveBeenCalledTimes(2);
-      await expect(pending).resolves.toMatchObject({ content: '兜底正文' });
+      await expect(pending).resolves.toMatchObject({ content: '重发成功的正文' });
       expect(Date.now() - started).toBe(2_000);
-      expect(sentModel(1)).toBe('fallback/model');
+      expect(sentModel(1)).toBe('primary/model');
+      expect(sentModel(1)).not.toBe('fallback/model');
+    });
+
+    // 重发仍失败才降级。上界就在这里：本函数最多 3 次上游调用（首发 + 首字节重发 + 兜底），
+    // find 的 modelStep 最多调本函数 2 次 → **单步最坏 6 次**（此前 4 次，见 chatRobust 注释）。
+    it('首字节超时且重发也超时 → 才降级兜底；本函数上游调用数封顶 3', async () => {
+      const hang = (_url: unknown, init?: RequestInit): Promise<Response> => new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')));
+      });
+      fetchMock
+        .mockImplementationOnce(hang)
+        .mockImplementationOnce(hang)
+        .mockResolvedValueOnce(response([token('兜底正文'), finish('stop')]));
+      const pending = client.chatRobust('system', 'user', {
+        totalTimeoutMs: 20_000, idleTimeoutMs: 45_000, firstByteTimeoutMs: 2_000, fallbackModel: 'fallback/model',
+      });
+      await vi.advanceTimersByTimeAsync(4_000); // 首发 2s 被截断 + 重发 2s 被截断
+      expect(fetchMock).toHaveBeenCalledTimes(3);
+      await expect(pending).resolves.toMatchObject({ content: '兜底正文' });
+      expect([sentModel(0), sentModel(1), sentModel(2)])
+        .toEqual(['primary/model', 'primary/model', 'fallback/model']);
     });
 
     // 这一族是「HTTP 200 + text/event-stream 已建立，TTFB 之后不再出正文」：
@@ -664,25 +685,31 @@ describe('stream completion and shared call budget', () => {
       await assertion;
     });
 
-    it('单次尝试上限不破坏整步 deadline：截断 + 兜底仍以 totalTimeoutMs 为上限', async () => {
+    // 单次尝试上限不破坏整步 deadline：截断 + 重发 + 兜底仍以 totalTimeoutMs 为上限。
+    // 预算链（Part 1 之后，生产数字是 260s / 45s）：首发 45s + 首字节重发 45s + 兜底剩余 170s；
+    // 这里按 20s / 2s 等比例缩小 —— 首发 2s + 重发 2s + 兜底 16s = 20s。
+    it('单次尝试上限不破坏整步 deadline：截断 + 重发 + 兜底仍以 totalTimeoutMs 为上限', async () => {
       const started = Date.now();
       fetchMock.mockImplementation((_url: unknown, init?: RequestInit) => new Promise((_resolve, reject) => {
         init?.signal?.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')));
       }));
-      // 主模型 2s 被首字节上限截断 → 兜底接着挂到剩下 18s 的共享 deadline。
-      // 兜底拿的是「剩余 18s」，所以它自己的超时文案是 18s；整步墙钟仍是 20s。
+      // 主模型 2s 被首字节上限截断 → 原地重发 2s 又被截断 → 兜底接着挂到剩下 16s 的共享 deadline。
+      // 兜底拿的是「剩余 16s」，所以它自己的超时文案是 16s；整步墙钟仍是 20s。
       const pending = client.chatRobust('system', 'user', {
         totalTimeoutMs: 20_000, idleTimeoutMs: 45_000, firstByteTimeoutMs: 2_000, fallbackModel: 'fallback/model',
       });
       // 断言先挂上：拒绝发生在 20s，晚于下面的 advance，否则会被 vitest 记成 unhandled rejection。
-      const assertion = expect(pending).rejects.toThrow(/总超时（18s）/);
+      const assertion = expect(pending).rejects.toThrow(/总超时（16s）/);
       await vi.advanceTimersByTimeAsync(2_000);
       expect(fetchMock).toHaveBeenCalledTimes(2);
-      await vi.advanceTimersByTimeAsync(17_999);
-      expect(Date.now() - started).toBe(19_999);
+      await vi.advanceTimersByTimeAsync(1_999);
+      expect(Date.now() - started).toBe(3_999);
       await vi.advanceTimersByTimeAsync(1);
+      expect(fetchMock).toHaveBeenCalledTimes(3);
+      await vi.advanceTimersByTimeAsync(16_000);
       await assertion;
       expect(Date.now() - started).toBe(20_000);
+      expect(fetchMock).toHaveBeenCalledTimes(3);
       expect(vi.getTimerCount()).toBe(0);
     });
 
@@ -704,6 +731,88 @@ describe('stream completion and shared call budget', () => {
       await expect(client.chatRobust('system', 'user', { ...attempts, idleTimeoutMs: 4_000 }))
         .resolves.toMatchObject({ content: '正文' });
       expect(fetchMock).toHaveBeenCalledTimes(2);
+    });
+  });
+
+  // Part 2：观测字段。没有它，Part 1 上线后线上分不清「重发有没有发生、有没有成功」——
+  // 失败行的 usage_details 原本恒为 {}。这些字段落进**已存在的** jsonb，零迁移。
+  describe('usage_details observation fields', () => {
+    const sentModel = (call = 0) => JSON.parse(String(fetchMock.mock.calls[call][1]?.body)).model as string;
+    const hang = (_url: unknown, init?: RequestInit): Promise<Response> => new Promise<Response>((_resolve, reject) => {
+      init?.signal?.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')));
+    });
+    const okWithRay = () => new Response(new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode(token('重发成功的正文') + finish('stop')));
+        controller.close();
+      },
+    }), { headers: { 'Content-Type': 'text/event-stream', 'cf-ray': 'a1b2c3-ZRH' } });
+    const attempts = { idleTimeoutMs: 45_000, firstByteTimeoutMs: 2_000, totalTimeoutMs: 20_000, fallbackModel: 'fallback/model' };
+    const observations = (onUsage: ReturnType<typeof vi.fn>) =>
+      onUsage.mock.calls.map(([call]) => call.observation);
+
+    beforeEach(() => {
+      vi.stubEnv('LLM_MODEL', 'primary/model');
+    });
+
+    it('首字节超时的两行分别记下：失败族 / 这是第几次尝试 / 有没有重发', async () => {
+      const onUsage = vi.fn();
+      fetchMock.mockImplementationOnce(hang).mockResolvedValueOnce(okWithRay());
+      const pending = client.chatRobust('system', 'user', { ...attempts, onUsage });
+      await vi.advanceTimersByTimeAsync(2_000);
+      await expect(pending).resolves.toMatchObject({ content: '重发成功的正文' });
+      expect(observations(onUsage)).toEqual([
+        // 第一行：失败族 + 累计首字节超时次数 1 + 还没重发过。
+        {
+          attempts: 1, firstByteTimeouts: 1, retried: false, fallbackUsed: false,
+          errorCode: 'UPSTREAM_FIRST_BYTE_TIMEOUT',
+        },
+        // 第二行：这是第 2 次尝试、是重发；成功所以带上 ttfbMs 与 cf-ray。
+        // 失败那一次没有响应头，所以它既没有 ttfbMs 也没有 cfRay——不是编的 0。
+        {
+          attempts: 2, firstByteTimeouts: 1, retried: true, fallbackUsed: false,
+          ttfbMs: 0, cfRay: 'a1b2c3-ZRH',
+        },
+      ]);
+    });
+
+    it('重发也超时才降级：第三行标出 fallbackUsed，首字节超时累计到 2', async () => {
+      const onUsage = vi.fn();
+      fetchMock.mockImplementationOnce(hang).mockImplementationOnce(hang)
+        .mockResolvedValueOnce(response([token('兜底正文'), finish('stop')]));
+      const pending = client.chatRobust('system', 'user', { ...attempts, onUsage });
+      await vi.advanceTimersByTimeAsync(4_000);
+      await expect(pending).resolves.toMatchObject({ content: '兜底正文' });
+      expect(sentModel(2)).toBe('fallback/model');
+      expect(observations(onUsage)).toEqual([
+        { attempts: 1, firstByteTimeouts: 1, retried: false, fallbackUsed: false, errorCode: 'UPSTREAM_FIRST_BYTE_TIMEOUT' },
+        { attempts: 2, firstByteTimeouts: 2, retried: true, fallbackUsed: false, errorCode: 'UPSTREAM_FIRST_BYTE_TIMEOUT' },
+        { attempts: 3, firstByteTimeouts: 2, retried: true, fallbackUsed: true, ttfbMs: 0 },
+      ]);
+    });
+
+    // 拿不到 cf-ray 就不写这个键（不是写空字符串），拿不到响应头就更不写。
+    it('没有 cf-ray 的成功行不写 cfRay 键', async () => {
+      const onUsage = vi.fn();
+      fetchMock.mockResolvedValue(response([token('正文'), finish('stop')]));
+      await expect(client.chatRobust('system', 'user', { onUsage })).resolves.toMatchObject({ content: '正文' });
+      expect(observations(onUsage)).toEqual([
+        { attempts: 1, firstByteTimeouts: 0, retried: false, fallbackUsed: false, ttfbMs: 0 },
+      ]);
+    });
+
+    // 连接层失败（便宜的那一族）同样要能看出族：它不降级，但会走通用重发。
+    it('连接层失败记 UPSTREAM_UNREACHABLE，重发那一行标 retried', async () => {
+      const onUsage = vi.fn();
+      fetchMock.mockRejectedValueOnce(new TypeError('fetch failed'))
+        .mockResolvedValueOnce(response([token('重试成功'), finish('stop')]));
+      const pending = client.chatRobust('system', 'user', { ...attempts, onUsage });
+      await vi.advanceTimersByTimeAsync(1_500); // 通用重发的等待
+      await expect(pending).resolves.toMatchObject({ content: '重试成功' });
+      expect(observations(onUsage)).toEqual([
+        { attempts: 1, firstByteTimeouts: 0, retried: false, fallbackUsed: false, errorCode: 'UPSTREAM_UNREACHABLE' },
+        { attempts: 2, firstByteTimeouts: 0, retried: true, fallbackUsed: false, ttfbMs: 0 },
+      ]);
     });
   });
 

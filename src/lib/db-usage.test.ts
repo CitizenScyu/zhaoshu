@@ -62,6 +62,33 @@ describe('LLM usage storage and aggregates (mocked Neon HTTP queries)', () => {
     expect(insert.slice(1)).toEqual([record.createdAt, 'find_recall', 'test-model', 0, 0, 0, 0, true, null, '{}']);
   });
 
+  // Part 2：观测字段叠在**已存在的** usage_details jsonb 里（零迁移）。这里钉住它的位置与内容：
+  // 观测键在上游原始 usage 之**后**写，所以同名的上游字段会被我们观测到的真值覆盖。
+  it('merges observation fields into the existing usage_details jsonb without adding columns', async () => {
+    const { recordLlmUsage } = await import('./db');
+    await recordLlmUsage({
+      ...record,
+      observation: {
+        attempts: 2, firstByteTimeouts: 1, retried: true, fallbackUsed: false,
+        ttfbMs: 12_345, errorCode: 'UPSTREAM_FIRST_BYTE_TIMEOUT',
+      },
+    });
+    const insert = mocks.sql.mock.calls.find((call) => queryText(call).includes('INSERT INTO llm_usage'))!;
+    expect(insert.slice(1)).toEqual([
+      record.createdAt, 'find_recall', 'test-model', 120, 30, 150, 50, false, 'request-123',
+      JSON.stringify({
+        ...record.usage.rawUsage,
+        attempts: 2, firstByteTimeouts: 1, retried: true, fallbackUsed: false,
+        ttfbMs: 12_345, errorCode: 'UPSTREAM_FIRST_BYTE_TIMEOUT',
+      }),
+    ]);
+    // 零迁移：整条写入路径的 SQL 里没有为观测字段新加的列/键（既有的 ALTER 只补 total_tokens
+    // 与 usage_details 两列，是本改动之前就有的）。
+    const sqlText = mocks.sql.mock.calls.map(queryText).join(' ');
+    expect(sqlText).toContain('ADD COLUMN IF NOT EXISTS usage_details');
+    expect(sqlText).not.toMatch(/attempts|ttfb|cf_ray|error_code|first_byte/i);
+  });
+
   it.each(['CREATE TABLE', 'INSERT INTO'])('logs a %s failure without rejecting business work', async (needle) => {
     mocks.sql.mockImplementation((parts: TemplateStringsArray) => {
       if (parts.join('').includes(needle)) throw new Error('usage database unavailable');

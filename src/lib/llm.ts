@@ -6,7 +6,10 @@
 // 2. 渠道偶发把中文请求搞成 mojibake，请求体统一 ASCII 转义消除这个变量
 // 3. 公益渠道吞吐波动极大（同样任务 37s~180s+），所以加空闲超时 + 一次重试
 import { cleanString, hasInvalidDatabaseCharacters, isRecord } from './sanitize';
-import { parseLlmUsage, reasoningTokenCount, type LlmCallUsage, type LlmUsage } from './llm-usage';
+import {
+  parseLlmUsage, reasoningTokenCount,
+  type LlmAttemptContext, type LlmCallObservation, type LlmCallUsage, type LlmUsage,
+} from './llm-usage';
 import { environmentModel, readModelSetting, type ReasoningVerdict } from './app-settings';
 
 const BASE_URL = process.env.LLM_BASE_URL || 'https://api.cloud.us.kg/v1';
@@ -48,6 +51,9 @@ interface ChatOptions {
   model?: string;
   // 每次实际请求（含失败和重试）只通知一次；调用方负责在响应后落库。
   onUsage?: (call: LlmCallUsage) => void;
+  // 本次调用在 chatRobust 里是第几次尝试（见 llm-usage.ts 的 LlmAttemptContext）。
+  // 不给就只写 chat 自己能观测到的 ttfbMs / cfRay / errorCode。
+  attemptContext?: LlmAttemptContext;
   // 流式增量回调：每解析出新正文就叫一次（不分批、不等待完整结果）。
   // 供 profile 生成把首字节尽早推给浏览器；调用方不得依赖该回调的调用次数。
   onToken?: (delta: string) => void;
@@ -98,8 +104,19 @@ function responseMetadata(value: unknown): ResponseMetadata {
 // - UPSTREAM_STALLED：**连上了但没进展或没答复**——网关自己的超时状态码 408/524、
 //   首字节上限到点、流内停滞、总超时。特征：昂贵（524 实测要 ~126s），一次就能吃光整步预算。
 //   → 降级到兜底模型（换一条路由才治得住）。
+//
+// 2026-09-17 细分出第三种，因为「换成兜底模型」并不是这一族的最优解：
+// - UPSTREAM_FIRST_BYTE_TIMEOUT：**响应头在单次上限内根本没到**（`expiredBy === 'first_byte'`）。
+//   这是失败族里最大的那一个——线上 n=68 次失败中 86% 是它（request_id IS NULL + 相邻差恰好
+//   45.000–45.003s = 单次上限）。探针实测（n=15 次超时事件）：**首字节超时后立刻重发，
+//   8/15 = 53.3% 直接拿到正文、11/15 = 73.3% 至少拿到响应头**，而 abort 掉的停滞连接不会被
+//   复用、普通重试天然就是新连接（T31 实测，所以不需要引入 undici 的 dispatcher）。
+//   → 先**原地重发主模型一次**，仍失败才降级（见 chatRobust）。
+// 刻意不去重试其余 STALLED 形态：408/524 是网关**已经回话**（内容与这次请求绑定），流内停滞与
+// 总超时是「流已建立之后」的失败——探针对它们没有观测，重发价值未知且更费预算。
 const UPSTREAM_UNREACHABLE = 'UPSTREAM_UNREACHABLE';
 const UPSTREAM_STALLED = 'UPSTREAM_STALLED';
+const UPSTREAM_FIRST_BYTE_TIMEOUT = 'UPSTREAM_FIRST_BYTE_TIMEOUT';
 
 export class LlmError extends Error {
   constructor(
@@ -232,6 +249,39 @@ function asciiEscape(s: string): string {
   );
 }
 
+// 把一次尝试的失败归到失败族。拆出来只为让 chat 能在 finally 里拿到错误码写进观测
+// （usage_details.errorCode）。**除「首字节超时」自成一族外，其余分支与拆分前逐字一致**：
+// 调用方取消 → 已取消；已是 LlmError → 原样；controller 被 abort → 按 expiredBy 分首字节/总超时；
+// 否则 fetch 自己抛了 → 连接层。
+function classifyFailure(
+  e: unknown,
+  state: {
+    // 调用方取消（signal），与下面「本次尝试自己的 controller 被 abort」是两回事。
+    callerAborted: boolean;
+    controllerAborted: boolean;
+    expiredBy: 'total' | 'first_byte' | null;
+    firstByteMs: number | null;
+    totalMs: number;
+  },
+): LlmError {
+  if (state.callerAborted) return cancelledError();
+  if (e instanceof LlmError) return e;
+  if (state.controllerAborted) {
+    // 首字节到点：连响应头都没等到（524 就是这一族），报成「总超时」会把它误导成「模型太慢」。
+    if (state.expiredBy === 'first_byte') {
+      return new LlmError(
+        `模型服务首字节超时（${Math.ceil((state.firstByteMs ?? state.totalMs) / 1000)}s 内未返回响应头）`,
+        true, UPSTREAM_FIRST_BYTE_TIMEOUT,
+      );
+    }
+    return new LlmError(`LLM 总超时（${Math.ceil(state.totalMs / 1000)}s）`, true, UPSTREAM_STALLED);
+  }
+  // 走到这里说明 fetch 自己抛了（连接失败）——便宜的那一族。
+  return new LlmError(
+    e instanceof Error ? `LLM 请求失败：${e.message}` : 'LLM 请求失败', true, UPSTREAM_UNREACHABLE,
+  );
+}
+
 // 流式中转避免等待整段响应；持续出 token 仍受同一次调用的总时限约束。
 export async function chat(
   system: string,
@@ -268,6 +318,32 @@ export async function chat(
   const call: LlmCallUsage = {
     model, requestId: null, createdAt: new Date().toISOString(), usage: parseLlmUsage(undefined),
   };
+  // 观测（落进 usage_details，见 llm-usage.ts 的 LlmCallObservation）：只记真实观测到的值。
+  // ttfbMs / cfRay 只在**这次调用成功**时写（题面要求「成功时」）：失败时它们说明不了什么，
+  // 失败族由 errorCode 表达。拿不到就整个键不写，绝不编。
+  let succeeded = false;
+  let ttfbMs: number | undefined;
+  let cfRay: string | undefined;
+  let errorCode: string | undefined;
+  // 尝试上下文由 chatRobust 给出；首字节超时是 chat 自己判定的，所以计数在这里累加
+  // （chatRobust 只给「此前」的基数），这样本行记的就是「截止本行」的累计值。
+  let firstByteTimeouts = opts.attemptContext?.firstByteTimeouts ?? 0;
+  // 没有任何观测时不挂这个对象——不允许为了凑结构编造数值。
+  const observationFor = (): LlmCallObservation | undefined => {
+    const context = opts.attemptContext;
+    const observed: LlmCallObservation = {
+      ...(context ? {
+        attempts: context.attempts,
+        firstByteTimeouts,
+        retried: context.retried,
+        fallbackUsed: context.fallbackUsed,
+      } : {}),
+      ...(succeeded && ttfbMs != null ? { ttfbMs } : {}),
+      ...(succeeded && cfRay ? { cfRay } : {}),
+      ...(errorCode ? { errorCode } : {}),
+    };
+    return Object.keys(observed).length > 0 ? observed : undefined;
+  };
   const captureMetadata = (metadata: ResponseMetadata) => {
     if (metadata.usage) call.usage = metadata.usage;
     if (metadata.model) call.model = metadata.model;
@@ -287,6 +363,7 @@ export async function chat(
         controller.abort();
       }, firstByteMs);
     }
+    const requestedAt = Date.now();
     res = await fetch(`${BASE_URL}/chat/completions`, {
       method: 'POST',
       signal: controller.signal,
@@ -312,6 +389,8 @@ export async function chat(
     // 响应头到手，首字节上限的使命结束；后面交给 idleMs 管「流内停滞」。
     clearTimeout(firstByteTimer);
     firstByteTimer = undefined;
+    ttfbMs = Date.now() - requestedAt;
+    cfRay = cleanString(res.headers.get('cf-ray'), 200);
     call.requestId = cleanString(res.headers.get('x-request-id'), 200)
       || cleanString(res.headers.get('request-id'), 200) || null;
     if (!res.ok) {
@@ -353,28 +432,24 @@ export async function chat(
     const json = !stream || /\bapplication\/(?:[\w.+-]+\+)?json\b/i.test(res.headers.get('content-type') ?? '');
     const content = await readCompletionContent(res.body, idleMs, controller, json, captureMetadata, opts.onToken);
     if (opts.signal?.aborted) throw cancelledError();
+    succeeded = true;
     return { content, usage: call.usage, model: call.model, requestId: call.requestId };
   } catch (e) {
-    if (opts.signal?.aborted) throw cancelledError();
-    if (e instanceof LlmError) throw e;
-    if (controller.signal.aborted) {
-      // 首字节到点：连响应头都没等到（524 就是这一族），报成「总超时」会把它误导成「模型太慢」。
-      if (expiredBy === 'first_byte') {
-        throw new LlmError(
-          `模型服务首字节超时（${Math.ceil((firstByteMs ?? totalMs) / 1000)}s 内未返回响应头）`,
-          true, UPSTREAM_STALLED,
-        );
-      }
-      throw new LlmError(`LLM 总超时（${Math.ceil(totalMs / 1000)}s）`, true, UPSTREAM_STALLED);
-    }
-    // 走到这里说明 fetch 自己抛了（连接失败）——便宜的那一族。
-    throw new LlmError(
-      e instanceof Error ? `LLM 请求失败：${e.message}` : 'LLM 请求失败', true, UPSTREAM_UNREACHABLE,
-    );
+    const error = classifyFailure(e, {
+      callerAborted: opts.signal?.aborted === true,
+      controllerAborted: controller.signal.aborted,
+      expiredBy, firstByteMs, totalMs,
+    });
+    // 失败也要留下失败族（usage_details.errorCode）：不然线上分不清是哪一族挂的。
+    errorCode = error.code;
+    if (error.code === UPSTREAM_FIRST_BYTE_TIMEOUT) firstByteTimeouts += 1;
+    throw error;
   } finally {
     clearTimeout(totalTimer);
     clearTimeout(firstByteTimer);
     opts.signal?.removeEventListener('abort', cancel);
+    const observation = observationFor();
+    if (observation) call.observation = observation;
     try {
       opts.onUsage?.(call);
     } catch (error) {
@@ -629,8 +704,12 @@ function retryDelay(ms: number, signal?: AbortSignal): Promise<void> {
 //
 // 注意它刻意不复用 LlmError.retryable：那个字段还包含 429/5xx 这类「同一个模型现在忙」的
 // 判断，语义是「值得为同一个模型再花一次预算」，与「该换模型了」不是一回事。
+//
+// 首字节超时（UPSTREAM_FIRST_BYTE_TIMEOUT）也在这个集合里：chatRobust 会**先**原地重发主模型
+// 一次，重发仍失败才走到这里降级——重试是这条路的前半段，不是它的替代品（见 chatRobust）。
 function fallbackEligible(error: unknown): boolean {
-  return error instanceof LlmError && error.code === UPSTREAM_STALLED;
+  return error instanceof LlmError
+    && (error.code === UPSTREAM_STALLED || error.code === UPSTREAM_FIRST_BYTE_TIMEOUT);
 }
 
 // 首次调用、等待和唯一一次重试共享截止时间，绝不重新获得完整预算。
@@ -640,6 +719,8 @@ function fallbackEligible(error: unknown): boolean {
 // fallbackModel（可选，缺省不开启）：主模型卡住时用它顶替原本的「重试」那一次机会。
 // 之所以是**顶替**而不是叠加，是为了保住调用次数上界：find 的 modelStep 会调用本函数最多两次，
 // 本函数内部最多两次上游请求，所以单步最多 4 次上游调用——与加兜底之前完全一致（不是 8 次）。
+//
+// 🔴 2026-09-17 起首字节超时是**唯一**的例外，上界因此变成 6（见 chatRobust 里首字节那条分支的注释）。
 //
 // idleTimeoutMs / firstByteTimeoutMs 是**单次尝试**的上限（停滞与首字节），只压主模型这一路：
 // 它们的作用是「别让一个卡住的主模型吃光整步预算，以致兜底根本没机会跑」。兜底模型是最后机会，
@@ -658,6 +739,16 @@ export async function chatRobust(
     ? Math.min(opts.totalTimeoutMs, MAX_ROBUST_BUDGET_MS)
     : Math.min(configuredTotalTimeoutMs(), MAX_ROBUST_BUDGET_MS);
   const deadline = Date.now() + budgetMs;
+  const remainingMs = () => deadline - Date.now();
+  // 观测上下文（usage_details 的键）：跨本函数内多次尝试共享，让线上能回答
+  // 「首字节超时后重发有没有发生、有没有成功」。firstByteTimeouts 只给**基数**——
+  // 本次尝试自己那一次由 chat 判定后加上（见 observationFor），所以不会重复计数。
+  const observed = { attempts: 0, firstByteTimeouts: 0, retried: false, fallbackUsed: false };
+  const attemptContext = (over: Partial<typeof observed> = {}) => {
+    Object.assign(observed, over);
+    observed.attempts += 1;
+    return { ...observed };
+  };
   const primary = {
     temperature, maxTokens, signal, stream, onUsage, onToken,
     idleTimeoutMs: opts.idleTimeoutMs,
@@ -665,25 +756,66 @@ export async function chatRobust(
     totalTimeoutMs: budgetMs,
   };
   try {
-    return await chat(system, user, primary);
-  } catch (e) {
+    return await chat(system, user, { ...primary, attemptContext: attemptContext() });
+  } catch (first) {
     if (opts.signal?.aborted) throw cancelledError();
+    let error: unknown = first;
+    // 首字节超时：**先用主模型原地重发一次，仍失败才降级**。
+    //
+    // 依据（2026-09-17 实测）：线上失败里 86% 是这一族（响应头 45s 内根本没到），而探针
+    // n=15 次超时事件中**立刻重发有 8/15 = 53.3% 直接拿到正文、11/15 = 73.3% 至少拿到响应头**；
+    // 对照无条件基线 70.8%。直接降级会白白丢掉这一半成功率，而换连接不需要任何额外依赖——
+    // abort 掉的停滞连接不会被复用（T31 实测），普通重发天然就是新连接，所以**不引入 undici**。
+    //
+    // 🔴 代价与不变量：
+    //   - 最坏上游调用数 4 → **6**：本函数 3 次（首发 + 首字节重发 + 兜底）× modelStep 2 次。
+    //   - 重发**不新开预算**，拿的是共享 deadline 剩下的时间，且仍带着单次尝试上限
+    //     （...primary 里的 firstByteTimeoutMs / idleTimeoutMs），所以它最多再烧一个 45s；
+    //     兜底可用预算因此从 260−45 ≈ 215s 降到 260−45−45 ≈ **170s**，仍高于 opus 中位 115.8s。
+    //   - 剩余预算不足就不发起（remainingMs() > 0，与下面原有的「重试」判定同一条约定）；
+    //     重发本身再失败时，仍会走下面的兜底分支（那时兜底自己再看一次 MODEL_FALLBACK_MIN_BUDGET_MS）。
+    //   - 这里**不等** retryDelay：探针的 53.3% 是在「立刻重发」的条件下测的，而且首发已经把
+    //     45s 单次上限烧掉了，再等 1.5s 只是白花预算。
+    if (first instanceof LlmError && first.code === UPSTREAM_FIRST_BYTE_TIMEOUT) {
+      observed.firstByteTimeouts += 1;
+      if (remainingMs() > 0) {
+        const retryBudgetMs = remainingMs();
+        try {
+          return await chat(system, user, {
+            ...primary, totalTimeoutMs: retryBudgetMs,
+            attemptContext: attemptContext({ retried: true }),
+          });
+        } catch (retried) {
+          if (opts.signal?.aborted) throw cancelledError();
+          // 重发自己也首字节超时：同样计进累计值，否则兜底那一行会漏报一次。
+          if (retried instanceof LlmError && retried.code === UPSTREAM_FIRST_BYTE_TIMEOUT) {
+            observed.firstByteTimeouts += 1;
+          }
+          error = retried;
+        }
+      }
+    }
     // 降级：主模型卡住时改用兜底模型，拿的是剩余预算，且不再套单次尝试上限（见上）。
-    if (fallbackModel && fallbackEligible(e)) {
-      const remainingMs = deadline - Date.now();
-      if (remainingMs <= MODEL_FALLBACK_MIN_BUDGET_MS) throw e;
+    if (fallbackModel && fallbackEligible(error)) {
+      const fallbackBudgetMs = remainingMs();
+      if (fallbackBudgetMs <= MODEL_FALLBACK_MIN_BUDGET_MS) throw error;
       return chat(system, user, {
         temperature, maxTokens, signal, stream, onUsage, onToken,
-        model: fallbackModel, totalTimeoutMs: remainingMs,
+        model: fallbackModel, totalTimeoutMs: fallbackBudgetMs,
+        attemptContext: attemptContext({ fallbackUsed: true }),
       });
     }
-    if (!(e instanceof LlmError) || !e.retryable) throw e;
+    if (!(error instanceof LlmError) || !error.retryable) throw error;
     const delayMs = 1_500;
-    if (deadline - Date.now() <= delayMs) throw e;
+    if (remainingMs() <= delayMs) throw error;
     await retryDelay(delayMs, opts.signal);
-    const remainingMs = deadline - Date.now();
-    if (remainingMs <= 0) throw e;
-    return chat(system, user, { ...primary, totalTimeoutMs: remainingMs });
+    const retryBudgetMs = remainingMs();
+    if (retryBudgetMs <= 0) throw error;
+    return chat(system, user, {
+      // 这条既有路径同样是「原地重发主模型」，所以 retried 一样置真（区分靠 errorCode）：
+      // 线上就能一眼看出「这一行是某次重试」，不必去猜是哪条分支发的。
+      ...primary, totalTimeoutMs: retryBudgetMs, attemptContext: attemptContext({ retried: true }),
+    });
   }
 }
 
