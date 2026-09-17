@@ -4,9 +4,11 @@ import { requirePermission } from '@/lib/auth';
 import { authJson, withAuthHeaders } from '@/lib/auth-http';
 import { ensureSchema } from '@/lib/db';
 import { readJsonBody, RequestBodyError } from '@/lib/http';
-import { disableShuyuanSource, getShuyuanStats, refreshShuyuan } from '@/lib/shuyuan';
+import { disableShuyuanSource, enableShuyuanSource, getShuyuanStats, refreshShuyuan } from '@/lib/shuyuan';
+import { parseSourceFilter, parseSourcePage } from '@/lib/shuyuan-view';
 
-// 书源管理：GET 看统计（owner）或由 Vercel cron 触发刷新，POST 手动刷新/打失效标记
+// 书源管理：GET 看统计/分页明细（owner）或由 Vercel cron 触发刷新，
+// POST 手动刷新 / 打失效标记 / 重新启用。
 export const maxDuration = 295;
 
 const MAX_BODY_BYTES = 4 * 1024;
@@ -38,7 +40,13 @@ export async function GET(req: NextRequest) {
       const stats = await refreshShuyuan(req.signal);
       return authJson(stats);
     }
-    return authJson(await getShuyuanStats(req.signal));
+    // 不带 filter 的请求保持旧形状（只统计 + 默认明细），分页元信息只在显式筛选时附上。
+    const filter = req.nextUrl.searchParams.get('filter');
+    if (filter === null) return authJson(await getShuyuanStats(req.signal));
+    return authJson(await getShuyuanStats(req.signal, {
+      filter: parseSourceFilter(filter),
+      page: parseSourcePage(req.nextUrl.searchParams.get('page')),
+    }));
   } catch (e) {
     const message = e instanceof Error ? e.message : 'internal error';
     return authJson({ error: message }, { status: 502 });
@@ -69,6 +77,16 @@ export async function POST(req: NextRequest) {
       const error = typeof body?.error === 'string' ? body.error : '';
       const updated = await disableShuyuanSource(url, error);
       return authJson({ disabled: updated });
+    }
+    if (action === 'enable') {
+      const url = typeof body?.url === 'string' ? body.url : '';
+      if (!url) {
+        return authJson({ error: 'missing url' }, { status: 400 });
+      }
+      // 与 disable 同权限、同入参形状；URL 不在库里返回 enabled:false 而不是 404，
+      // 避免把「这个源还在不在合集里」变成一个可探测的信号。
+      const updated = await enableShuyuanSource(url);
+      return authJson({ enabled: updated });
     }
     if (action !== 'refresh') {
       return authJson({ error: 'unknown action' }, { status: 400 });
