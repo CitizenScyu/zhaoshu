@@ -262,6 +262,8 @@ export async function POST(req: NextRequest) {
         }
 
         // 持久化：books + recommendations（写回阶段用同一份预算，预算耗尽则停写）
+        // 身份归一在 user-data.ts 的查询构造器里做（写库边界唯一一处），
+        // 回传给客户端的仍是召回阶段的原始拼写——这条契约由 route.test.ts 钉住。
         let persisted = true;
         try {
           deadline.assert();

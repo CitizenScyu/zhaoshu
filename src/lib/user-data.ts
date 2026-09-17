@@ -1,8 +1,21 @@
 import type { PersonalQuery } from './personal-write';
 import type { RerankedItem } from './types';
+// 显式带 .ts 扩展名：本文件被 scripts/*.mjs 用 node --experimental-strip-types 直接
+// 加载（见 personal-db-cases.mjs），Node 的 ESM 解析器不做扩展名补全。
+import { normalizeBookAuthor, normalizeBookTitle } from './book-identity.ts';
 
 export function requireUserId(userId: number): void {
   if (!Number.isSafeInteger(userId) || userId < 1 || userId > 2_147_483_647) throw new Error('explicit userId is required');
+}
+
+// books 的身份边界：凡是把 (title, author) 变成 books 身份查询的地方，都先过这一对
+// 归一函数（task-49）。写和查必须用同一个函数，否则同一本书会写成两行、或查不到
+// 已写的那一行。归一在这里做且只做一次——函数对书名号不幂等（《《x》》会被剥两层），
+// 所以调用方（find/shelf 路由）传原值，不要预先归一。
+// 返回值刻意叫 title/author：SQL 模板里仍然写 ${book.title} / ${book.author}，
+// scripts/check-feedback-cas.mjs 会抽取模板并按这个字面量白名单替换参数。
+function identityOf(title: string, author: string): { title: string; author: string } {
+  return { title: normalizeBookTitle(title), author: normalizeBookAuthor(author) };
 }
 
 // 只构造 SQL，供路由和隔离库验收共用；不读取任何连接配置或客户端身份字段。
@@ -27,18 +40,20 @@ export function recommendationsForUserQuery(sql: PersonalQuery, userId: number, 
 
 export function shelfExistsForUserQuery(sql: PersonalQuery, userId: number, title: string, author: string) {
   requireUserId(userId);
+  const book = identityOf(title, author);
   return sql`SELECT 1 FROM recommendations r JOIN books b ON b.id = r.book_id
-    WHERE r.user_id = ${userId} AND lower(b.title) = lower(${title}) AND lower(b.author) = lower(${author}) LIMIT 1`;
+    WHERE r.user_id = ${userId} AND lower(b.title) = lower(${book.title}) AND lower(b.author) = lower(${book.author}) LIMIT 1`;
 }
 
 export function addShelfForUserQueries(sql: PersonalQuery, userId: number, title: string, author: string) {
   requireUserId(userId);
+  const book = identityOf(title, author);
   return [
-    sql`INSERT INTO books (title, author, meta) VALUES (${title}, ${author}, '{}'::jsonb)
+    sql`INSERT INTO books (title, author, meta) VALUES (${book.title}, ${book.author}, '{}'::jsonb)
       ON CONFLICT (lower(title), lower(author)) DO NOTHING`,
     sql`INSERT INTO recommendations (user_id, book_id, query, status)
       SELECT ${userId}, b.id, ${'书库添加'}, ${'want'} FROM books b
-      WHERE lower(b.title) = lower(${title}) AND lower(b.author) = lower(${author})
+      WHERE lower(b.title) = lower(${book.title}) AND lower(b.author) = lower(${book.author})
         AND NOT EXISTS (SELECT 1 FROM recommendations r WHERE r.book_id = b.id AND r.user_id = ${userId})
       ON CONFLICT (user_id, book_id, query) DO NOTHING RETURNING book_id`,
   ];
@@ -142,35 +157,49 @@ export function excludedBooksForUserQuery(sql: PersonalQuery, userId: number) {
 export function persistRecommendationsForUserQueries(s: PersonalQuery, userId: number, query: string, items: RerankedItem[]) {
   requireUserId(userId);
 
-  const bookQueries = items.map((item) => s`
+  // 写库前先按身份键归一：阻止新的《》/全半角/大小写变体继续在 books 里派生新行。
+  // 下面两条语句必须用同一份归一后的值——第二条靠 lower(title)=lower(...) 找回刚写的那行。
+  const identities = items.map((item) => identityOf(item.title, item.author));
+  const bookQueries = items.map((item, i) => {
+    const book = identities[i];
+    return s`
     INSERT INTO books (title, author, douban_id, douban_rating, douban_rating_count, meta)
-    VALUES (${item.title}, ${item.author}, ${item.douban?.doubanId ?? null},
+    VALUES (${book.title}, ${book.author}, ${item.douban?.doubanId ?? null},
             ${item.douban?.rating ?? null}, ${item.douban?.ratingCount ?? null},
             ${JSON.stringify({ category: item.category, wordCount: item.wordCount })}::jsonb)
     ON CONFLICT (lower(title), lower(author)) DO UPDATE
       SET douban_id = COALESCE(EXCLUDED.douban_id, books.douban_id),
           douban_rating = COALESCE(EXCLUDED.douban_rating, books.douban_rating),
           douban_rating_count = COALESCE(EXCLUDED.douban_rating_count, books.douban_rating_count),
-          meta = books.meta || EXCLUDED.meta`);
-  const recommendationQueries = items.map((item) => s`
+          meta = books.meta || EXCLUDED.meta`;
+  });
+  const recommendationQueries = items.map((item, i) => {
+    const book = identities[i];
+    return s`
     INSERT INTO recommendations (user_id, book_id, query, match_score, hit_likes, risks, reason)
     SELECT ${userId}, id, ${query}, ${item.matchScore}, ${JSON.stringify(item.hitLikes)}::jsonb,
            ${item.risks}, ${item.reason}
     FROM books
-    WHERE lower(title) = lower(${item.title}) AND lower(author) = lower(${item.author})
+    WHERE lower(title) = lower(${book.title}) AND lower(author) = lower(${book.author})
     ON CONFLICT (user_id, book_id, query) DO UPDATE
       SET match_score = EXCLUDED.match_score,
           hit_likes = EXCLUDED.hit_likes,
           risks = EXCLUDED.risks,
           reason = EXCLUDED.reason,
-          created_at = now()`);
+          created_at = now()`;
+  });
   return [...bookQueries, ...recommendationQueries];
 }
 
 // 追加式反馈历史同时是状态/note 编辑的审计记录。锁书籍行后比较最新反馈 id：
 // 缺版本只允许首次创建；旧版本不能覆盖已有反馈（22012 → FeedbackConflictError 由调用方转译）。
-export function feedbackForUserQueries(sql: PersonalQuery, userId: number, book: { title: string; author: string }, status: string, note: string, expectedVersion = 0) {
+export function feedbackForUserQueries(sql: PersonalQuery, userId: number, raw: { title: string; author: string }, status: string, note: string, expectedVersion = 0) {
   requireUserId(userId);
+  // 客户端回传的是召回阶段的原始拼写（find 结果原样显示），写库时已归一，
+  // 这里必须过同一个函数才能找回那一行；否则含《》/全半角的书名一律 404。
+  // 参数名 raw、局部名 book：SQL 模板里的 ${book.title}/${book.author} 是
+  // scripts/check-feedback-cas.mjs 抽取模板时依赖的字面量，别改。
+  const book = identityOf(raw.title, raw.author);
   return [
     sql`SELECT id FROM books WHERE lower(title) = lower(${book.title}) AND lower(author) = lower(${book.author}) FOR UPDATE`,
     sql`SELECT id FROM books WHERE lower(title) = lower(${book.title}) AND lower(author) = lower(${book.author})`,
@@ -190,7 +219,8 @@ export function feedbackForUserQueries(sql: PersonalQuery, userId: number, book:
 
 export function feedbackSnapshotForUserQuery(sql: PersonalQuery, userId: number, title: string, author: string) {
   requireUserId(userId);
+  const book = identityOf(title, author);
   return sql`SELECT f.id, f.status, f.note FROM feedback f JOIN books b ON b.id = f.book_id
-    WHERE f.user_id = ${userId} AND lower(b.title) = lower(${title}) AND lower(b.author) = lower(${author})
+    WHERE f.user_id = ${userId} AND lower(b.title) = lower(${book.title}) AND lower(b.author) = lower(${book.author})
     ORDER BY f.id DESC LIMIT 1`;
 }

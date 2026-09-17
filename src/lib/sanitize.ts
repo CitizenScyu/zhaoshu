@@ -1,5 +1,6 @@
 import { boundedString } from './http';
 import { validateSourceUrl } from './source-policy';
+import { canonicalBookKey as bookKey } from './book-identity';
 import type { Candidate, RerankedItem, SeedBook, SourceEvidence, VerifiedCandidate } from './types';
 
 // 从 LLM / 客户端回传的不可信数据里清洗出结构化的值。
@@ -49,11 +50,9 @@ function uniqueBooks<T extends { title: string; author: string }>(books: T[]): T
   });
 }
 
-// 与 db.ts canonicalBookKey 保持一致:NFKC + trim + 小写,NUL 分隔
-const BOOK_KEY_SEP = String.fromCharCode(0);
-export function bookKey(title: string, author: string): string {
-  return `${title.normalize('NFKC').trim().toLocaleLowerCase()}${BOOK_KEY_SEP}${author.normalize('NFKC').trim().toLocaleLowerCase()}`;
-}
+// 身份键的唯一实现在 ./book-identity（与 SQL 权威键对齐）。这里保留 bookKey 这个名字，
+// 只是为了不改动 find/route.ts、profile-seeds.ts 等既有调用点。
+export { bookKey };
 
 export function sanitizeCandidates(value: unknown): Candidate[] {
   if (!Array.isArray(value)) return [];
