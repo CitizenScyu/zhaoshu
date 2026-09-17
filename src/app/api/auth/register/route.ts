@@ -25,6 +25,7 @@ import { isJsonContentType, verifySameOriginWrite } from '@/lib/csrf';
 import { getSql } from '@/lib/db';
 import { MAX_INVITE_CODE_LENGTH, hashInviteCode } from '@/lib/invite-codes';
 import { MIN_PASSWORD_CODEPOINTS, checkPasswordBounds, hashPassword } from '@/lib/password';
+import { buildRegistrationStatement, type SqlTag } from '@/lib/register-statement';
 
 // 用户名 + 密码 + 邀请码合计上限 4 KiB（设计 §4.1）。
 const MAX_REGISTER_BODY_CHARS = 4096;
@@ -54,8 +55,11 @@ type RegisterRow = {
 // 一条参数化数据修改 CTE 内完成「锁配置行 → 消费邀请码 → 插 member → 插空画像 → 插 session」。
 // 数据修改 CTE 只共享同一快照，所以每一步都通过 RETURNING 的**输出**串联，绝不回读基表；
 // 资格判断不满足时所有 INSERT 都是零行，用户名冲突则由唯一索引让整条语句回滚（不耗码）。
-// 邀请码的 used_by 指向新用户，与消费必须同事务，但同一语句里二次更新同一行是禁止的——
-// 所以放在同一事务的第二条语句里，按业务键回填。
+// 邀请码的 used_at 与 used_by 必须在同一次 UPDATE 里同时置位：registration_invites 的
+// CHECK ((used_by IS NULL) = (used_at IS NULL)) 是 condeferrable=false，PostgreSQL 的 CHECK
+// 不可延迟，拆成「先置 used_at、再回填 used_by」两条语句时第一条就抛 23514。
+// 因此先 nextval 预分配 userId，claim 同时写 used_at 与 used_by，再用同一个 id 插用户；
+// 消费（权威判定）仍发生在插用户之前，并发同码注册最多一人成功。语句本体见 lib/register-statement.ts。
 //
 // 配置行 FOR SHARE：owner 的「关闭注册」与本次提交按行锁排序，先提交的关闭生效。
 export async function POST(req: NextRequest) {
@@ -155,63 +159,39 @@ export async function POST(req: NextRequest) {
 
   let row: RegisterRow | undefined;
   try {
+    // 只有一条语句：registration_invites 的 CHECK ((used_by IS NULL) = (used_at IS NULL))
+    // 不可延迟，used_at / used_by 必须在同一次 UPDATE 里同时置位（见 lib/register-statement.ts）。
     const results = (await sql.transaction((tx) => [
-      tx`
-        WITH cfg AS (
-          SELECT members_enabled, registration_mode FROM auth_settings WHERE id = 1 FOR SHARE
-        ),
-        gate AS (
-          SELECT 1 WHERE EXISTS (
-            SELECT 1 FROM cfg WHERE members_enabled AND registration_mode IN ('open', 'invite')
-          )
-        ),
-        claim AS (
-          UPDATE registration_invites SET used_at = now()
-          WHERE ${useInvite}::boolean
-            AND code_hash = ${codeHash}
-            AND (SELECT registration_mode FROM cfg) = 'invite'
-            AND used_at IS NULL AND revoked_at IS NULL
-            AND (expires_at IS NULL OR expires_at > now())
-            AND EXISTS (SELECT 1 FROM gate)
-          RETURNING id
-        ),
-        new_user AS (
-          INSERT INTO users (username, password_hash, role, created_via_invite_id)
-          SELECT ${normalizedUsername}, ${passwordHash}, 'member', (SELECT id FROM claim)
-          WHERE EXISTS (SELECT 1 FROM gate)
-            AND ((SELECT registration_mode FROM cfg) = 'open' OR EXISTS (SELECT 1 FROM claim))
-          RETURNING id, username, can_find, can_read, can_download
-        ),
-        new_profile AS (
-          INSERT INTO profile (id) SELECT id FROM new_user ON CONFLICT (id) DO NOTHING RETURNING id
-        ),
-        new_session AS (
-          INSERT INTO sessions (token_hash, user_id, auth_method, owner_credential_tag, expires_at)
-          SELECT ${tokenHash}, id, 'password', NULL,
-                 now() + (${ttlSeconds}::double precision * interval '1 second')
-          FROM new_user
-          RETURNING user_id
-        )
-        SELECT (SELECT members_enabled FROM cfg) AS members_enabled,
-               (SELECT registration_mode FROM cfg) AS registration_mode,
-               (SELECT count(*) FROM claim)::int AS claimed,
-               u.id, u.username, u.can_find, u.can_read, u.can_download
-        FROM cfg LEFT JOIN new_user u ON true`,
-      // 同一事务的第二条语句：回填邀请码的 used_by。此时第一条语句插入的用户行在同一
-      // 事务里可见，外键也能通过；不满足条件时是零行 no-op。
-      tx`
-        UPDATE registration_invites SET used_by = (SELECT id FROM users WHERE username = ${normalizedUsername})
-        WHERE ${useInvite}::boolean
-          AND code_hash = ${codeHash}
-          AND used_at IS NOT NULL
-          AND used_by IS NULL`,
-    ])) as unknown as [RegisterRow[], unknown[]];
+      buildRegistrationStatement(tx as unknown as SqlTag, {
+        useInvite,
+        codeHash,
+        username: normalizedUsername,
+        passwordHash,
+        tokenHash,
+        ttlSeconds,
+      }) as ReturnType<typeof tx>,
+    ])) as unknown as [RegisterRow[]];
     row = results[0]?.[0];
   } catch (error) {
-    // 23505 = 用户名唯一索引；23514 = member 行的 CHECK（保留名/角色/密码哈希非空）。
-    // 两者都是「这个名字不能用」，对外同一个结果。
-    if (error && typeof error === 'object' && 'code' in error && (error.code === '23505' || error.code === '23514')) {
-      return authError(409, 'USERNAME_TAKEN', '用户名不可用');
+    const code = error && typeof error === 'object' && 'code' in error ? error.code : null;
+    // 23505 = 唯一索引冲突。注册路径上只可能是 users.username（邀请码摘要是查询条件不是插入值，
+    // 会话 token 是 256 位随机值），但**只有约束名明确等于 users_username_key 才回 409**。
+    // 约束名为空（null/undefined）或别的一律按服务端故障处理：注册路径上出现未知的唯一键冲突
+    // 本身就是异常，冒充成「用户名已被占用」会把排查引向完全错误的方向（任务书：其他 23505 → 503）。
+    if (code === '23505') {
+      const constraint = error && typeof error === 'object' && 'constraint' in error ? error.constraint : null;
+      if (constraint === 'users_username_key') {
+        return authError(409, 'USERNAME_TAKEN', '用户名不可用');
+      }
+      console.error('registration hit an unexpected unique violation', { constraint: constraint ?? null });
+      return authError(503, 'AUTH_DB_UNAVAILABLE', 'authentication service unavailable');
+    }
+    // 23514 = CHECK 违约。用户侧输入早已逐项校验过，这里再犯就是服务端缺陷（例如曾经的
+    // 「两列不一致」写法），如实报 503 而不是伪装成用户名冲突。
+    if (code === '23514') {
+      console.error('registration rejected by a database CHECK constraint', {
+        constraint: error && typeof error === 'object' && 'constraint' in error ? error.constraint : null,
+      });
     }
     return authError(503, 'AUTH_DB_UNAVAILABLE', 'authentication service unavailable');
   }
