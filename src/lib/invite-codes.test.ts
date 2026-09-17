@@ -103,6 +103,15 @@ describe('邀请码读库', () => {
     expect(await revokeInviteCode(db.sql as never, 7)).toBe('not_found');
   });
 
+  // 审计（audit-admin Finding 2）确认并发 revoke 语义安全：UPDATE 0 行之后、SELECT 复核之前，
+  // 行被并发改动为已用/已废之外的情况，最终一律按幂等的 already_revoked 收口。这里钉住这个
+  // 竞态兜底分支，防止后续重构把它改成 500 或误报 not_found。
+  it('UPDATE 与 SELECT 之间的并发改动按已作废收口（幂等兜底）', async () => {
+    const db = mockSql();
+    db.resolve.mockResolvedValueOnce([]).mockResolvedValueOnce([{ used_at: null, revoked_at: null }]);
+    expect(await revokeInviteCode(db.sql as never, 8)).toBe('already_revoked');
+  });
+
   it('批量上限与有效期在库里也拒绝，不靠上层校验', async () => {
     const db = mockSql();
     await expect(createInviteCodes(db.sql as never, MAX_INVITE_BATCH + 1, DEFAULT_INVITE_TTL_DAYS, 1)).rejects.toThrow('invite batch');

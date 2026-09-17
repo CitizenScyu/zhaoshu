@@ -112,6 +112,25 @@ describe('管理 API 鉴权', () => {
     expect(db.queries).toHaveLength(0);
   });
 
+  // 读接口同样 owner 专用：审计（audit-admin Finding 1/5）确认 requireOwner 的显式角色
+  // 检查没有成员绕过，这里把「成员会话打全部 admin 读接口 → 403 且不碰业务库」钉进清单，
+  // 防止后续重构悄悄给读接口放宽（admin/llm 的 GET 在它自己的 route.test.ts 里有同款用例）。
+  it.each(READS)('$name 成员会话 → 403（owner 专用读接口）', async (route) => {
+    vi.stubEnv('AUTH_ACCOUNTS_ENABLED', 'true');
+    mocks.findSessionByToken.mockResolvedValue({
+      userId: 7, username: 'member', role: 'member',
+      canFind: true, canRead: true, canDownload: true,
+      authMethod: 'password', ownerCredentialTag: null, membersEnabled: true,
+    });
+    const req = new NextRequest(`http://localhost${route.path}`, {
+      method: 'GET', headers: { Cookie: 'nf-dev-session=member' },
+    });
+    const res = await call(route.handler, req);
+    expect(res.status).toBe(403);
+    expect(await res.json()).toMatchObject({ code: 'FORBIDDEN' });
+    expect(db.queries).toHaveLength(0);
+  });
+
   it.each(WRITES)('$name 带 Origin 但缺 CSRF 固定头 → 403，不写库', async (route) => {
     const req = owner('POST', route.path, {}, { Origin: 'http://localhost' });
     const res = await call(route.handler, req, route.params);
