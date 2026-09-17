@@ -1,5 +1,6 @@
 import type { NextRequest } from 'next/server';
 import { guardOwnerRead, guardOwnerWrite } from '@/lib/admin-http';
+import { authAccountsEnabled } from '@/lib/auth';
 import { authError, authJson } from '@/lib/auth-http';
 import { isRegistrationMode, readRegistrationSettings, writeRegistrationSettings } from '@/lib/invite-codes';
 import { getSql } from '@/lib/db';
@@ -10,11 +11,14 @@ const UNAVAILABLE = '注册设置暂时不可用，请稍后重试。';
 
 // owner 读写注册开关与成员总闸。写入不做探测、立即生效：注册接口每次都在自己的事务里
 // 重读这一行，所以「随时关闭」对已经发出的注册请求也是有界的（先提交的关闭生效）。
+// accountsEnabled 是**只读**的部署闸门快照（env AUTH_ACCOUNTS_ENABLED，运行时改不了）：
+// 管理台据此说明「下方开关是否真的生效」，因此没有对应的写入入口。
 export async function GET(req: NextRequest) {
   const guard = await guardOwnerRead(req);
   if (!guard.ok) return guard.response;
   try {
-    return authJson(await readRegistrationSettings(getSql()));
+    const settings = await readRegistrationSettings(getSql());
+    return authJson({ ...settings, accountsEnabled: authAccountsEnabled() });
   } catch {
     return authError(503, 'SETTINGS_UNAVAILABLE', UNAVAILABLE);
   }
@@ -57,6 +61,8 @@ export async function PATCH(req: NextRequest) {
       membersEnabled: typeof membersEnabled === 'boolean' ? membersEnabled : current.membersEnabled,
       registrationMode: isRegistrationMode(registrationMode) ? registrationMode : current.registrationMode,
       updatedAt,
+      // 与 GET 同形：管理台用本响应整体替换状态，缺了它闸门提示会在保存后消失。
+      accountsEnabled: authAccountsEnabled(),
     });
   } catch {
     return authError(503, 'SETTINGS_UNAVAILABLE', UNAVAILABLE);

@@ -2,7 +2,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { NextRequest } from 'next/server';
 import { mockSql } from '@/lib/fixtures/mock-sql';
 
-const mocks = vi.hoisted(() => ({ getSql: vi.fn(), findSessionByToken: vi.fn() }));
+const mocks = vi.hoisted(() => ({
+  getSql: vi.fn(), findSessionByToken: vi.fn(), peekAuthRateLimit: vi.fn(), bumpAuthRateLimit: vi.fn(),
+}));
 
 vi.mock('@/lib/db', async (original) => ({
   ...await original<typeof import('@/lib/db')>(),
@@ -11,6 +13,12 @@ vi.mock('@/lib/db', async (original) => ({
 vi.mock('@/lib/auth-session', async (original) => ({
   ...await original<typeof import('@/lib/auth-session')>(),
   findSessionByToken: mocks.findSessionByToken,
+}));
+// 账号模式下 owner 头要过限速查询：闸门打开的用例必须把这一层钉住，否则 503 会被误当成业务失败。
+vi.mock('@/lib/auth-rate-limit', async (original) => ({
+  ...await original<typeof import('@/lib/auth-rate-limit')>(),
+  peekAuthRateLimit: mocks.peekAuthRateLimit,
+  bumpAuthRateLimit: mocks.bumpAuthRateLimit,
 }));
 
 import { GET as registrationGet, PATCH as registrationPatch } from './registration/route';
@@ -61,11 +69,19 @@ beforeEach(() => {
   vi.clearAllMocks();
   vi.stubEnv('APP_OWNER_TOKEN', OWNER_TOKEN);
   vi.stubEnv('AUTH_ACCOUNTS_ENABLED', 'false');
+  mocks.peekAuthRateLimit.mockResolvedValue({ attempts: 0, retryAfterSeconds: 0 });
+  mocks.bumpAuthRateLimit.mockResolvedValue({ attempts: 1, retryAfterSeconds: 900 });
   db = mockSql();
   mocks.getSql.mockReturnValue(db.sql);
 });
 
 afterEach(() => { vi.unstubAllEnvs(); });
+
+// 闸门打开时 owner 头走限速 + 代际标签那条路，缺 AUTH_SECURITY_SECRET 会直接 503。
+function enableAccounts(): void {
+  vi.stubEnv('AUTH_ACCOUNTS_ENABLED', 'true');
+  vi.stubEnv('AUTH_SECURITY_SECRET', 'a'.repeat(48));
+}
 
 describe('管理 API 鉴权', () => {
   it.each(READS)('$name 匿名 → 401，且在业务读库前拒绝', async (route) => {
@@ -116,7 +132,35 @@ describe('注册开关管理', () => {
     db.resolve.mockResolvedValue([{ members_enabled: true, registration_mode: 'invite', updated_at: '2026-06-01T00:00:00.000Z' }]);
     const res = await call(registrationGet as Handler, owner('GET', '/api/admin/registration'));
     expect(res.status).toBe(200);
-    expect(await res.json()).toEqual({ membersEnabled: true, registrationMode: 'invite', updatedAt: '2026-06-01T00:00:00.000Z' });
+    // 既有三个字段原样保留（向后兼容），只多一个只读的 accountsEnabled。
+    expect(await res.json()).toEqual({
+      membersEnabled: true, registrationMode: 'invite', updatedAt: '2026-06-01T00:00:00.000Z', accountsEnabled: false,
+    });
+  });
+
+  it('accountsEnabled 跟随部署闸门，且读得到设置时不受库值影响', async () => {
+    enableAccounts();
+    db.resolve.mockResolvedValue([{ members_enabled: false, registration_mode: 'open', updated_at: null }]);
+    const res = await call(registrationGet as Handler, owner('GET', '/api/admin/registration'));
+    expect(await res.json()).toMatchObject({ membersEnabled: false, registrationMode: 'open', accountsEnabled: true });
+  });
+
+  it('库读不到时仍是 503，不泄露闸门状态', async () => {
+    db.resolve.mockRejectedValue(new Error('db down'));
+    const res = await call(registrationGet as Handler, owner('GET', '/api/admin/registration'));
+    expect(res.status).toBe(503);
+  });
+
+  it('PATCH 响应与 GET 同形（含 accountsEnabled），否则保存后闸门提示会消失', async () => {
+    enableAccounts();
+    db.resolve
+      .mockResolvedValueOnce([{ members_enabled: false, registration_mode: 'invite', updated_at: null }])
+      .mockResolvedValue([{ updated_at: '2026-06-01T00:00:00.000Z' }]);
+    const res = await call(registrationPatch as Handler, owner('PATCH', '/api/admin/registration', { membersEnabled: true }));
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({
+      membersEnabled: true, registrationMode: 'invite', updatedAt: '2026-06-01T00:00:00.000Z', accountsEnabled: true,
+    });
   });
 
   it('非法模式 → 400，不写库', async () => {
