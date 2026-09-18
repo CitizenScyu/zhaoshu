@@ -13,7 +13,10 @@ import {
 } from './llm-usage';
 import { environmentModel, readModelSetting, type ReasoningVerdict } from './app-settings';
 
-const BASE_URL = process.env.LLM_BASE_URL || 'https://api.cloud.us.kg/v1';
+// fail-closed（config-audit B6）：未配置时没有缺省回退。曾经回退的公网中转地址
+// 无法证明可信（内网地址/缓存命中均不构成信任证据），静默回退等于把书名/用户反馈
+// 发给未经确认的上游。与 LLM_API_KEY 同层：调用期显式报错。
+const BASE_URL = process.env.LLM_BASE_URL || '';
 const API_KEY = process.env.LLM_API_KEY || '';
 const DEFAULT_TOTAL_TIMEOUT_MS = 280_000;
 const MAX_ROBUST_BUDGET_MS = 285_000;
@@ -372,6 +375,9 @@ export async function chat(
 ): Promise<ChatResult> {
   if (!API_KEY) {
     throw new LlmError('LLM_API_KEY is not set', false);
+  }
+  if (!BASE_URL) {
+    throw new LlmError('LLM_BASE_URL is not set', false);
   }
   if (opts.signal?.aborted) throw cancelledError();
   // 模型在每次调用时解析；解析有自己的短上限且失败即回退，耗时也不占下面的模型总预算。

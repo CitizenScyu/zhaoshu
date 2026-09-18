@@ -147,6 +147,17 @@ describe('stream completion and shared call budget', () => {
     await expect(client.chat('system', 'user')).resolves.toMatchObject({ content: '中文😀' });
   });
 
+  it('fails closed when LLM_BASE_URL is unconfigured, without a public fallback', async () => {
+    // B6 钉子：没有缺省回退。删掉曾经的公网中转回退后，未配置必须显式报错，
+    // 且绝不发任何网络请求（fetch mock 上断言零调用）。
+    vi.unstubAllEnvs();
+    vi.stubEnv('LLM_API_KEY', 'test-only-key');
+    vi.resetModules();
+    const bare = await import('./llm');
+    await expect(bare.chat('system', 'user')).rejects.toMatchObject({ message: 'LLM_BASE_URL is not set' });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
   it('accepts multiline SSE data and CRLF split between chunks', async () => {
     fetchMock.mockResolvedValue(response([
       'event: message\r\ndata: {"choices":\r',
