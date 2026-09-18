@@ -25,8 +25,13 @@ vi.mock('@/lib/douban', () => ({ verifyBatch: mocks.verifyBatch }));
 vi.mock('@/lib/source-verification', () => ({ supplementSourceEvidence: mocks.supplementSourceEvidence }));
 import { LlmError } from '@/lib/llm';
 import { rerankSystem } from '@/lib/prompts';
+import { issueVerifyTicket, ticketSigningKey, VERIFY_TICKET_TTL_MS, type IssueVerifyTicketInput } from '@/lib/verify-ticket';
+import { isRecord } from '@/lib/sanitize';
+import type { VerifiedCandidate } from '@/lib/types';
 import { POST } from './route';
 
+const TEST_SECRET = 'test-auth-security-secret-0123456789abcdef'; // 假密钥，仅测试
+const OWNER_USER_ID = 1; // owner-header 的 principal userId（OWNER_PRINCIPAL）
 const candidate = {
   title: '测试书', author: '作者甲', category: '仙侠', wordCount: '100万字', why: '原始理由',
 };
@@ -34,11 +39,38 @@ const douban = { status: 'verified', found: true, rating: 8, doubanId: '123' };
 const verified = { ...candidate, douban };
 const item = { ...candidate, matchScore: 88, hitLikes: ['设定'], reason: '值得读', risks: '' };
 
-function request(body: unknown) {
+function ticketFor(partial: Partial<{
+  userId: number; query: string; conditions: string; verified: unknown[]; now: number;
+}> = {}): string {
+  const key = ticketSigningKey()!;
+  return issueVerifyTicket(key, {
+    userId: OWNER_USER_ID, query: '找书', conditions: '', verified: [verified], ...partial,
+  } as IssueVerifyTicketInput);
+}
+
+// 默认给 rerank 请求自动补一张合法票据：绝大多数用例测的是验证之后的行为，票据只是入场券。
+// 安全用例显式传 autoTicket=false，或自己塞一张坏票。
+function withTicket(body: unknown): unknown {
+  if (!isRecord(body) || body.step !== 'rerank' || body.ticket !== undefined) return body;
+  if (!Array.isArray(body.verified) || body.verified.length === 0) return body;
+  const key = ticketSigningKey();
+  if (!key) return body;
+  return {
+    ...body,
+    ticket: issueVerifyTicket(key, {
+      userId: OWNER_USER_ID,
+      query: typeof body.query === 'string' ? body.query : '',
+      conditions: typeof body.conditions === 'string' ? body.conditions : '',
+      verified: body.verified as unknown as VerifiedCandidate[],
+    }),
+  };
+}
+
+function request(body: unknown, autoTicket = true) {
   return new NextRequest('http://localhost/api/find', {
     method: 'POST',
     headers: { Authorization: 'Bearer find-test-owner', 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
+    body: JSON.stringify(autoTicket ? withTicket(body) : body),
   });
 }
 
@@ -68,6 +100,7 @@ describe('POST /api/find output contract', () => {
   beforeEach(() => {
     vi.resetAllMocks();
     vi.stubEnv('APP_OWNER_TOKEN', 'find-test-owner');
+    vi.stubEnv('AUTH_SECURITY_SECRET', TEST_SECRET);
     mocks.ensureSchema.mockResolvedValue(undefined);
     mocks.getProfileForUser.mockResolvedValue({ seeds: [], content: '画像' });
     mocks.getExcludedBookTitlesForUser.mockResolvedValue([]);
@@ -610,5 +643,112 @@ describe('POST /api/find output contract', () => {
     });
     expect(mocks.chatRobust).toHaveBeenCalledTimes(2);
     expect(mocks.persistRecommendationsForUser).not.toHaveBeenCalled();
+  });
+});
+
+// F01：rerank 只信服务端签发的验证票据。以下用例的判别力在于「去掉票据校验就必然失败」——
+// 伪造的 verified 会直接落进 persistRecommendationsForUser 的共享 books 行。
+describe('POST /api/find rerank 验证票据', () => {
+  beforeEach(() => {
+    vi.resetAllMocks();
+    vi.stubEnv('APP_OWNER_TOKEN', 'find-test-owner');
+    vi.stubEnv('AUTH_SECURITY_SECRET', TEST_SECRET);
+    mocks.ensureSchema.mockResolvedValue(undefined);
+    mocks.getProfileForUser.mockResolvedValue({ seeds: [], content: '画像' });
+    mocks.getExcludedBookTitlesForUser.mockResolvedValue([]);
+    mocks.persistRecommendationsForUser.mockResolvedValue(undefined);
+    mocks.verifyBatch.mockImplementation(async (candidates: unknown[]) => candidates.map(() => douban));
+    mocks.supplementSourceEvidence.mockImplementation(async (candidates) => candidates);
+    mocks.chatRobust.mockResolvedValue(JSON.stringify({ items: [item] }));
+  });
+  afterEach(() => { vi.unstubAllEnvs(); vi.restoreAllMocks(); });
+
+  it('无票据的伪造 verified 被判 403 且完全不碰模型与写库', async () => {
+    const forged = { ...verified, douban: { status: 'verified', found: true, doubanId: '伪造', rating: 10, ratingCount: 999999 } };
+    const res = await POST(request({ step: 'rerank', query: '找书', verified: [forged] }, false));
+    expect(res.status).toBe(403);
+    expect(await res.text()).toContain('VERIFY_TICKET_INVALID');
+    expect(mocks.chatRobust).not.toHaveBeenCalled();
+    expect(mocks.persistRecommendationsForUser).not.toHaveBeenCalled();
+  });
+
+  it('他人签发的票据被拒（重放）', async () => {
+    const res = await POST(request({ step: 'rerank', query: '找书', verified: [verified], ticket: ticketFor({ userId: 999 }) }));
+    expect(res.status).toBe(403);
+    expect(mocks.persistRecommendationsForUser).not.toHaveBeenCalled();
+  });
+
+  it('篡改过的票据被拒', async () => {
+    const good = ticketFor();
+    const tampered = good.slice(0, -1) + (good.endsWith('A') ? 'B' : 'A');
+    const res = await POST(request({ step: 'rerank', query: '找书', verified: [verified], ticket: tampered }));
+    expect(res.status).toBe(403);
+    expect(mocks.persistRecommendationsForUser).not.toHaveBeenCalled();
+  });
+
+  it('过期票据被拒', async () => {
+    const expired = ticketFor({ now: Date.now() - VERIFY_TICKET_TTL_MS - 1_000 });
+    const res = await POST(request({ step: 'rerank', query: '找书', verified: [verified], ticket: expired }));
+    expect(res.status).toBe(403);
+    expect(mocks.persistRecommendationsForUser).not.toHaveBeenCalled();
+  });
+
+  it('查询与票据不符被拒（绑定 q）', async () => {
+    const res = await POST(request({ step: 'rerank', query: '另一个需求', verified: [verified], ticket: ticketFor({ query: '找书' }) }));
+    expect(res.status).toBe(403);
+    expect(mocks.persistRecommendationsForUser).not.toHaveBeenCalled();
+  });
+
+  // P2-2：绑定 c 的路由层反例（模块层已有，路由层缺）。
+  it('conditions 与票据不符被拒（绑定 c）', async () => {
+    const res = await POST(request({ step: 'rerank', query: '找书', conditions: '', verified: [verified], ticket: ticketFor({ conditions: '仅本次' }) }));
+    expect(res.status).toBe(403);
+    expect(await res.text()).toContain('VERIFY_TICKET_INVALID');
+    expect(mocks.persistRecommendationsForUser).not.toHaveBeenCalled();
+  });
+
+  it('合法票据放行，且落库的豆瓣值只来自票据、忽略 body.verified 的伪造值', async () => {
+    const ticketVerified = { ...verified, douban: { status: 'verified', found: true, doubanId: 'TICKET', rating: 7, ratingCount: 7 } };
+    const forgedBody = { ...verified, douban: { status: 'verified', found: true, doubanId: 'FORGED', rating: 10, ratingCount: 999999 } };
+    const ticket = ticketFor({ verified: [ticketVerified] });
+    const events = await consumeSSE(await POST(request({ step: 'rerank', query: '找书', verified: [forgedBody], ticket })));
+    const result = lastEvent<{ type: string; items: typeof item[]; persisted: boolean }>(events, 'result');
+    expect(result.persisted).toBe(true);
+    expect(result.items[0]).toMatchObject({ douban: { doubanId: 'TICKET', rating: 7, ratingCount: 7 } });
+    expect(mocks.persistRecommendationsForUser.mock.calls[0][2][0].douban).toMatchObject({ doubanId: 'TICKET', rating: 7, ratingCount: 7 });
+  });
+
+  it('分步重试可用：verify 拿到票据后只重跑 rerank 仍成功', async () => {
+    const verifyEvents = await consumeSSE(await POST(request({ step: 'verify', query: '找书', candidates: [candidate] })));
+    const ticket = lastEvent<{ ticket?: string }>(verifyEvents, 'result').ticket;
+    expect(typeof ticket).toBe('string');
+    const rerankEvents = await consumeSSE(await POST(request({ step: 'rerank', query: '找书', ticket })));
+    expect(lastEvent<{ items: unknown[] }>(rerankEvents, 'result').items).toHaveLength(1);
+    expect(mocks.persistRecommendationsForUser).toHaveBeenCalledTimes(1);
+  });
+
+  it('无 AUTH_SECURITY_SECRET 的 legacy owner 部署：回退用 owner 口令签名，票据仍不可伪造', async () => {
+    vi.stubEnv('AUTH_SECURITY_SECRET', '');
+    vi.stubEnv('AUTH_ACCOUNTS_ENABLED', 'false');
+    // 回退 key 生效，票据仍须有效签名才放行（body.verified 依然不被采信）。
+    const ticket = ticketFor();
+    const events = await consumeSSE(await POST(request({ step: 'rerank', query: '找书', verified: [verified], ticket })));
+    expect(lastEvent<{ items: unknown[] }>(events, 'result').items).toHaveLength(1);
+    // 未签名的伪造 verified 仍被拒。
+    const res = await POST(request({ step: 'rerank', query: '找书', verified: [verified] }, false));
+    expect(res.status).toBe(403);
+  });
+
+  // P1-1：账号模式下 secret 不可用时一律 fail-closed，绝不回退 owner 口令。
+  // owner 头在此模式下走限速/代际标签那条路，缺 secret 会先由认证层拒绝（更早，同样 503）。
+  it('账号模式开启且 secret 不可用时 fail-closed：503，不回退 owner 口令', async () => {
+    vi.stubEnv('AUTH_SECURITY_SECRET', '');
+    vi.stubEnv('AUTH_ACCOUNTS_ENABLED', 'true');
+    // APP_OWNER_TOKEN 仍在（beforeEach stub），但不得被用作签名 key。
+    const res = await POST(request({ step: 'rerank', query: '找书', verified: [verified] }, false));
+    expect(res.status).toBe(503);
+    expect(await res.text()).toMatch(/VERIFY_TICKET_UNAVAILABLE|AUTH_SECURITY_SECRET_REQUIRED/);
+    expect(mocks.persistRecommendationsForUser).not.toHaveBeenCalled();
+    expect(mocks.chatRobust).not.toHaveBeenCalled();
   });
 });

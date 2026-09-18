@@ -104,9 +104,13 @@ export async function fetchFindResult(
   const res = await doFetch();
   signal.throwIfAborted();
   if (!res.ok || !/text\/event-stream/i.test(res.headers.get('content-type') ?? '')) {
-    const data = await res.json().catch(() => ({}));
+    const data = (await res.json().catch(() => ({}))) as { error?: string; code?: string };
     signal.throwIfAborted();
-    throw new Error((data as { error?: string }).error || '找书失败，请重试');
+    // 错误码必须挂上：调用方要靠它区分可恢复的重试起点（例如票据失效要回到 verify 重新出票，
+    // 而不是拿同一张废票在 rerank 空转）。
+    const e = new Error(data.error || '找书失败，请重试');
+    (e as Error & { code?: string }).code = typeof data.code === 'string' ? data.code : undefined;
+    throw e;
   }
   return await new Promise<SseEvent>((resolve, reject) => {
     let settled = false;

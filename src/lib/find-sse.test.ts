@@ -141,6 +141,17 @@ describe('流结束却没收到 result 帧时必须落地成失败', () => {
       fetchFindResult(new AbortController().signal, () => Promise.resolve(res), 1000, () => {}),
     ).rejects.toThrow('数据库未配置');
   });
+
+  // P2-1：非 SSE 失败响应必须带上后端 code，调用方才能区分可恢复的重试起点
+  // （票据失效要从 verify 重新出票，而不是拿废票在 rerank 空转）。
+  it('非 event-stream 的失败响应也带上后端 code', async () => {
+    const res = new Response(JSON.stringify({ error: '缺少或无效的验证票据，请重新执行验证步骤。', code: 'VERIFY_TICKET_INVALID' }), {
+      status: 403, headers: { 'content-type': 'application/json' },
+    });
+    await expect(
+      fetchFindResult(new AbortController().signal, () => Promise.resolve(res), 1000, () => {}),
+    ).rejects.toMatchObject({ code: 'VERIFY_TICKET_INVALID' });
+  });
 });
 
 describe('写库失败必须对用户可见', () => {

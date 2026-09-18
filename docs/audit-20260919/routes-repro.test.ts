@@ -1,5 +1,8 @@
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { NextRequest } from 'next/server';
+import { issueVerifyTicket, ticketSigningKey } from '@/lib/verify-ticket';
+import { isRecord } from '@/lib/sanitize';
+import type { VerifiedCandidate } from '@/lib/types';
 
 const mocks = vi.hoisted(() => ({
   sql: vi.fn(), model: vi.fn(), persist: vi.fn(), verify: vi.fn(), disable: vi.fn(),
@@ -32,24 +35,44 @@ import { POST as feedback } from '@/app/api/feedback/route';
 const candidate = { title: '合成审查作品', author: '审查作者', category: '', wordCount: '', why: '' };
 const ranked = { ...candidate, matchScore: 90, hitLikes: [], risks: '', reason: '合成判断' };
 const verified = { ...candidate, douban: { status: 'verified', found: true, doubanId: '999999', rating: 10, ratingCount: 123456 } };
-function request(path: string, body: unknown, untrustedOrigin = false) {
+const TEST_SECRET = 'audit-fake-security-secret-0123456789abcd';
+
+// F01：rerank 现在只认服务端签发的验证票据；除 R10（验证伪造被拒）外，其余 rerank 用例
+// 自动补一张合法票据，继续测它们原本关心的行为。
+function withTicket(body: unknown): unknown {
+  if (!isRecord(body) || body.step !== 'rerank' || body.ticket !== undefined) return body;
+  if (!Array.isArray(body.verified)) return body;
+  const key = ticketSigningKey();
+  if (!key) return body;
+  return {
+    ...body,
+    ticket: issueVerifyTicket(key, {
+      userId: principal.userId,
+      query: typeof body.query === 'string' ? body.query : '',
+      conditions: typeof body.conditions === 'string' ? body.conditions : '',
+      verified: body.verified as unknown as VerifiedCandidate[],
+    }),
+  };
+}
+function request(path: string, body: unknown, untrustedOrigin = false, autoTicket = true) {
   return new NextRequest(`https://app.example.invalid/api/${path}`, {
     method: 'POST',
     headers: untrustedOrigin
       ? { Origin: 'https://other.example.invalid', 'Content-Type': 'text/plain' }
       : { Origin: 'https://app.example.invalid', 'Content-Type': 'application/json', 'x-nf-csrf': '1' },
-    body: JSON.stringify(body),
+    body: JSON.stringify(autoTicket ? withTicket(body) : body),
   });
 }
 beforeEach(() => {
   vi.resetAllMocks();
+  vi.stubEnv('AUTH_SECURITY_SECRET', TEST_SECRET);
   mocks.model.mockResolvedValue({ content: JSON.stringify({ items: [ranked] }) });
   mocks.profile.mockResolvedValue({ seeds: [{ title: '合成种子', kind: 'love' }], content: '反馈独有偏好：讨厌机械降神', updatedAt: 'v1' });
   mocks.snapshot.mockResolvedValue({ version: 0, note: '', status: null });
   mocks.saveProfile.mockResolvedValue('v2');
   mocks.persist.mockResolvedValue(undefined);
 });
-afterEach(() => vi.restoreAllMocks());
+afterEach(() => { vi.unstubAllEnvs(); vi.restoreAllMocks(); });
 
 // 语义翻转（F02 修复后）：原复现断言「异源 Origin + text/plain + 缺 CSRF 头的 session 写请求被接受」，
 // 证明 /api/download 与 /api/shuyuan 缺少统一写校验。现改为断言同款请求被拒绝——通过即表示漏洞已堵。
@@ -73,12 +96,15 @@ it('R09（翻转）: shuyuan 拒绝缺 CSRF 头、异源 Origin 的禁用请求'
   expect((await find(request('find', { step: 'recall', query: '合成需求' }, true))).status).toBe(403);
 });
 
-it('R10: fabricated verification values reach persistence without any server verification', async () => {
-  const response = await find(request('find', { step: 'rerank', query: '合成需求', verified: [verified] }));
-  const events = await response.text();
-  expect(events).toContain('"type":"result"');
+// F01 翻转：原断言「伪造 verified 无服务端核验也能落库」记录的是漏洞；修复后必须有服务端
+// HMAC 票据才放行，否则 403 且完全不触达模型/写库。
+it('R10: fabricated verification values are rejected without a server-signed ticket', async () => {
+  const response = await find(request('find', { step: 'rerank', query: '合成需求', verified: [verified] }, false, false));
+  expect(response.status).toBe(403);
+  expect(await response.text()).toContain('VERIFY_TICKET_INVALID');
   expect(mocks.verify).not.toHaveBeenCalled();
-  expect(mocks.persist.mock.calls[0][2][0].douban).toMatchObject({ rating: 10, ratingCount: 123456, doubanId: '999999' });
+  expect(mocks.persist).not.toHaveBeenCalled();
+  expect(mocks.model).not.toHaveBeenCalled();
 });
 
 it('R11: legitimate zero-survivor rerank is retried and then reported as a model error', async () => {
