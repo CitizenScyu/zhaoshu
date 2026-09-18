@@ -6,6 +6,7 @@ import type { ProfileSnapshot } from '@/lib/types';
 const mocks = vi.hoisted(() => ({
   ensureSchema: vi.fn(), getSql: vi.fn(), session: vi.fn(),
   getProfileForUser: vi.fn(), saveProfileForUser: vi.fn(), recordFeedbackForUser: vi.fn(), getFeedbackSnapshotForUser: vi.fn(),
+  getProfileFeedbackForUser: vi.fn(),
   getExcludedBookTitlesForUser: vi.fn(), persistRecommendationsForUser: vi.fn(),
   chat: vi.fn(), verify: vi.fn(),
 }));
@@ -54,6 +55,7 @@ describe('32.1 真实权限入口与可信用户绑定（数据库状态为夹�
     });
     mocks.recordFeedbackForUser.mockResolvedValue(undefined);
     mocks.getFeedbackSnapshotForUser.mockResolvedValue({ version: 0, status: null, note: '' });
+    mocks.getProfileFeedbackForUser.mockResolvedValue([]);
     mocks.getExcludedBookTitlesForUser.mockResolvedValue([]);
     mocks.persistRecommendationsForUser.mockResolvedValue(undefined);
     mocks.chat.mockResolvedValue({ content: '有效生成稿' });

@@ -5,6 +5,7 @@ import type { ProfileSnapshot, SeedBook } from '@/lib/types';
 const mocks = vi.hoisted(() => ({
   ensureSchema: vi.fn(), getProfileForUser: vi.fn(), saveProfileForUser: vi.fn(), chatRobust: vi.fn(),
   getSql: vi.fn(), sql: vi.fn(), transaction: vi.fn(), getFeedbackSnapshotForUser: vi.fn(),
+  getProfileFeedbackForUser: vi.fn(),
 }));
 vi.mock('@/lib/db', () => ({
   recordFeedbackForUser: async (userId: number, book: { title: string; author: string }, status: string, note: string, expectedVersion: number) => {
@@ -16,6 +17,7 @@ vi.mock('@/lib/db', () => ({
   },
   ensureSchema: mocks.ensureSchema, getProfileForUser: mocks.getProfileForUser, saveProfileForUser: mocks.saveProfileForUser,
   getSql: mocks.getSql, getFeedbackSnapshotForUser: mocks.getFeedbackSnapshotForUser,
+  getProfileFeedbackForUser: mocks.getProfileFeedbackForUser,
 }));
 vi.mock('@/lib/llm', async (importOriginal) => ({
   ...await importOriginal<typeof import('@/lib/llm')>(),
@@ -65,6 +67,7 @@ describe('/api/profile writes', () => {
     mocks.getSql.mockReturnValue(Object.assign(mocks.sql, { transaction: mocks.transaction }));
     mocks.transaction.mockResolvedValue([]);
     mocks.getFeedbackSnapshotForUser.mockResolvedValue({ version: 0, status: null, note: '' });
+    mocks.getProfileFeedbackForUser.mockResolvedValue([]);
   });
   afterEach(() => { vi.unstubAllEnvs(); vi.restoreAllMocks(); });
 
@@ -73,7 +76,7 @@ describe('/api/profile writes', () => {
     const res = await POST(req);
     const events = await consumeSSE(res);
     // 结束帧带完整结果（真正的 onToken 逐字首字节由 stream.test 用真实 llm 覆盖）。
-    expect(lastEvent(events, 'done')).toEqual({ type: 'done', seeds, content: '有效画像😀\n喜欢严谨设定', updatedAt: nextVersion });
+    expect(lastEvent(events, 'done')).toEqual({ type: 'done', seeds, content: '有效画像😀\n喜欢严谨设定', updatedAt: nextVersion, feedbackCount: 0, resetFromSeeds: false });
     expect(mocks.saveProfileForUser).toHaveBeenCalledWith(1, seeds, '有效画像😀\n喜欢严谨设定', previousVersion, expect.any(Function));
     expect(mocks.chatRobust.mock.calls[0][2].signal.aborted).toBe(req.signal.aborted);
   });
@@ -305,5 +308,52 @@ describe('/api/profile writes', () => {
     expect(totalTimeoutMs).toBe(260_000);
     expect(totalTimeoutMs).toBeGreaterThan(220_000);
     expect(totalTimeoutMs + 12_000).toBeLessThan(295_000);
+  });
+
+  // F04：默认重新生成不得丢掉反馈积累的偏好。
+  it('merges the current profile and this user\'s latest feedback into the default regeneration input', async () => {
+    mocks.getProfileForUser.mockResolvedValue({ seeds, content: '反馈独有偏好：讨厌机械降神', updatedAt: previousVersion });
+    mocks.getProfileFeedbackForUser.mockResolvedValue([
+      { title: '反馈书', author: '作者', status: 'dropped', note: '讨厌机械降神' },
+    ]);
+    const events = await consumeSSE(await POST(request()));
+    const input = mocks.chatRobust.mock.calls[0][1] as string;
+    expect(input).toContain('讨厌机械降神'); // 旧 content 里的积累偏好进了模型输入
+    expect(input).toContain('反馈书'); // 最新反馈的 note 也进了
+    expect(input).toContain('测试书'); // 种子仍在
+    expect(lastEvent(events, 'done')).toMatchObject({ feedbackCount: 1, resetFromSeeds: false });
+    expect(mocks.getProfileFeedbackForUser).toHaveBeenCalledWith(1); // 只读本人（owner）反馈
+  });
+
+  it('resetFromSeeds:true keeps the legacy seed-only input and flags the override in the response', async () => {
+    mocks.getProfileForUser.mockResolvedValue({ seeds, content: '反馈独有偏好：讨厌机械降神', updatedAt: previousVersion });
+    const events = await consumeSSE(await POST(request('POST', { updatedAt: previousVersion, resetFromSeeds: true })));
+    const input = mocks.chatRobust.mock.calls[0][1] as string;
+    expect(input).not.toContain('讨厌机械降神'); // 旧行为：只按种子重写，会覆盖反馈积累
+    expect(input).toContain('测试书');
+    expect(mocks.getProfileFeedbackForUser).not.toHaveBeenCalled(); // reset 模式不读反馈
+    expect(lastEvent(events, 'done')).toMatchObject({ resetFromSeeds: true, feedbackCount: 0 });
+  });
+
+  it('does not resurrect a withdrawn preference: only the latest effective feedback the database returns is fed in', async () => {
+    // 撤回/更改后，DB 侧查询只会返回该书的「最新一行且仍具信息量」的状态；旧的那条
+    // done+note（讨厌机械降神）不在返回里，路由不得把它补回来。
+    mocks.getProfileForUser.mockResolvedValue({ seeds, content: '', updatedAt: previousVersion });
+    mocks.getProfileFeedbackForUser.mockResolvedValue([
+      { title: '反馈书', author: '作者', status: 'reading', note: '停更，先观望' },
+    ]);
+    await consumeSSE(await POST(request()));
+    const input = mocks.chatRobust.mock.calls[0][1] as string;
+    expect(input).toContain('停更，先观望');
+    expect(input).not.toContain('讨厌机械降神');
+  });
+
+  it.each([0, 1, 'true', null])('rejects a non-boolean resetFromSeeds before any database access %#', async (value) => {
+    const res = await POST(request('POST', { updatedAt: previousVersion, resetFromSeeds: value }));
+    expect(res.status).toBe(400);
+    expect(await res.json()).toEqual({ error: 'resetFromSeeds must be a boolean' });
+    expect(mocks.ensureSchema).not.toHaveBeenCalled();
+    expect(mocks.getProfileForUser).not.toHaveBeenCalled();
+    expect(mocks.chatRobust).not.toHaveBeenCalled();
   });
 });

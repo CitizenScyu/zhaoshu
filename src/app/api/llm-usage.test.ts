@@ -9,6 +9,7 @@ const mocks = vi.hoisted(() => ({
   getSql: vi.fn(), businessSql: vi.fn(), transaction: vi.fn(),
   getExcludedBookTitlesForUser: vi.fn(), persistRecommendationsForUser: vi.fn(),
   neon: vi.fn(), usageSql: vi.fn(), verifyBatch: vi.fn(), getFeedbackSnapshotForUser: vi.fn(),
+  getProfileFeedbackForUser: vi.fn(),
 }));
 vi.mock('next/server', async (importOriginal) => ({
   ...await importOriginal<typeof import('next/server')>(), after: mocks.after,
@@ -26,6 +27,7 @@ vi.mock('@/lib/db', async (importOriginal) => ({
   ensureSchema: mocks.ensureSchema, getProfileForUser: mocks.getProfileForUser, saveProfileForUser: mocks.saveProfileForUser,
   getSql: mocks.getSql,
   getFeedbackSnapshotForUser: mocks.getFeedbackSnapshotForUser,
+  getProfileFeedbackForUser: mocks.getProfileFeedbackForUser,
   getExcludedBookTitlesForUser: mocks.getExcludedBookTitlesForUser,
   persistRecommendationsForUser: mocks.persistRecommendationsForUser,
 }));
@@ -137,6 +139,7 @@ describe('usage instrumentation through all model routes', () => {
     mocks.getExcludedBookTitlesForUser.mockResolvedValue([]);
     mocks.persistRecommendationsForUser.mockResolvedValue(undefined);
     mocks.getFeedbackSnapshotForUser.mockResolvedValue({ version: 0, status: null, note: '' });
+    mocks.getProfileFeedbackForUser.mockResolvedValue([]);
     mocks.getSql.mockReturnValue(Object.assign(mocks.businessSql, { transaction: mocks.transaction }));
     mocks.transaction.mockResolvedValue([]);
     mocks.verifyBatch.mockResolvedValue([verified.douban]);
