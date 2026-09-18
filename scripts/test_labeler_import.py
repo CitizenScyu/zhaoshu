@@ -133,6 +133,14 @@ class TestAutoImportWiring(MainHarness):
                       **{import_one.BACKLOG_ENV: '200'})
         self.assertEqual(FakeAutoImporter.last.backlog_calls, [('labels.jsonl', 200)])
 
+    def test_broken_backlog_limit_falls_back_to_default(self):
+        self.books = self.books[:1]
+        code, _, _ = self.run_main(['--no-db-model'], DATABASE_URL=DATABASE_URL,
+                                   **{import_one.BACKLOG_ENV: 'abc'})
+        self.assertEqual(code, 0)
+        self.assertEqual(FakeAutoImporter.last.backlog_calls,
+                         [('labels.jsonl', import_one.IMPORT_BACKLOG_DEFAULT)])
+
     def test_import_failure_does_not_stop_labeling(self):
         FakeAutoImporter.behavior_template = {
             labeler.BASE + '/books/detailsA.html': RuntimeError('boom')}

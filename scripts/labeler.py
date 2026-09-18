@@ -765,7 +765,11 @@ def main() -> int:
                   f'产物仍只进 labels.jsonl，需人工跑 import_labels.mjs')
         if not args.dry_run and importer.enabled:
             # 历史欠账（上次导入失败 / 部署前的存量）自动补录；标记文件保证幂等。
-            limit = int(env.get(import_one.BACKLOG_ENV) or import_one.IMPORT_BACKLOG_DEFAULT)
+            # .env 值坏掉（非数字）不能拖垮整轮 → 回落到默认上限。
+            try:
+                limit = int(env.get(import_one.BACKLOG_ENV) or import_one.IMPORT_BACKLOG_DEFAULT)
+            except ValueError:
+                limit = import_one.IMPORT_BACKLOG_DEFAULT
             retried = importer.retry_backlog(data_path('labels.jsonl'), limit=limit)
             if retried:
                 print(f'  自动导入: 补录了 {retried} 本历史欠账')
