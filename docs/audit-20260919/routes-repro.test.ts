@@ -8,6 +8,8 @@ const mocks = vi.hoisted(() => ({
   sql: vi.fn(), model: vi.fn(), persist: vi.fn(), verify: vi.fn(), disable: vi.fn(),
   profile: vi.fn(), saveProfile: vi.fn(), recordFeedback: vi.fn(), snapshot: vi.fn(), dispatch: vi.fn(),
   feedback: vi.fn(), withdrawn: vi.fn(),
+  // F15：profile 路由重建成功后要推进反馈吸收水位，需要这两个真实现（其他用例不受影响）。
+  maxFeedbackId: vi.fn(), markAbsorbed: vi.fn(),
 }));
 const principal = { userId: 7, role: 'member', canFind: true, canRead: true, canDownload: true, authMethod: 'session' };
 vi.mock('@/lib/auth', () => ({
@@ -21,6 +23,7 @@ vi.mock('@/lib/db', async original => ({
   getProfileFeedbackForUser: mocks.feedback, getWithdrawnFeedbackBookTitlesForUser: mocks.withdrawn,
   getExcludedBookTitlesForUser: async () => [], persistRecommendationsForUser: mocks.persist,
   recordFeedbackForUser: mocks.recordFeedback, getFeedbackSnapshotForUser: mocks.snapshot,
+  getMaxFeedbackIdForUser: mocks.maxFeedbackId, markProfileFeedbackAbsorbedForUser: mocks.markAbsorbed,
 }));
 vi.mock('@/lib/llm', async original => ({ ...await original<typeof import('@/lib/llm')>(), chatRobust: mocks.model }));
 vi.mock('@/lib/douban', () => ({ verifyBatch: mocks.verify }));
@@ -74,7 +77,11 @@ beforeEach(() => {
   mocks.feedback.mockResolvedValue([]);
   mocks.withdrawn.mockResolvedValue([]);
   mocks.saveProfile.mockResolvedValue('v2');
+  // F09：persist 返回实际写入行数（/api/find 会与本批期望本数比对）。
   mocks.persist.mockImplementation(async (_userId: number, _query: string, items: unknown[]) => items.length);
+  // F15：反馈写路径不再同步吸收画像，改为队列水位；这两个 mock 是 profile/absorb 新调用的替身。
+  mocks.maxFeedbackId.mockResolvedValue(0);
+  mocks.markAbsorbed.mockResolvedValue(null);
 });
 afterEach(() => { vi.unstubAllEnvs(); vi.restoreAllMocks(); });
 
@@ -138,13 +145,21 @@ it('R12（翻转）: profile regeneration preserves feedback-derived preferences
   expect(mocks.saveProfile.mock.calls[0][2]).toBe('基于积累的合成画像');
 });
 
-it('R13: failed feedback profile update returns the same user-facing state as a no-op and offers no retry identity', async () => {
+// F15 翻转：原复现断言「反馈写入后模型失败只返回 {ok:true,profileUpdated:false}，与无需修改
+// 不可区分、且没有可重放身份」。修复后写路径只做快速持久化 + 登记待吸收事件：模型完全不在
+// 反馈请求里同步执行，响应带 profileStatus/pending/retryable，可区分于 unchanged 并可重放。
+it('R13（翻转）: 模型不可用时反馈照常保存，响应给出可区分的待吸收状态与重放身份', async () => {
   mocks.model.mockRejectedValue(new Error('synthetic offline failure'));
   vi.spyOn(console, 'error').mockImplementation(() => {});
   const response = await feedback(request('feedback', { ...candidate, status: 'done', note: '合成读后反馈' }));
   expect(mocks.recordFeedback).toHaveBeenCalledOnce();
   expect(response.status).toBe(200);
-  expect(await response.json()).toEqual({ ok: true, profileUpdated: false });
+  const body = await response.json();
+  // 不再是「静默 no-op」形状：待吸收与无需修改在用户侧可区分，且明确可重放。
+  expect(body).not.toEqual({ ok: true, profileUpdated: false });
+  expect(body).toMatchObject({ ok: true, profileUpdated: false, profileStatus: 'pending', pending: true, retryable: true });
+  // 写路径不触发模型：用户不为数分钟的模型调用同步等待（吸收由独立端点按用户合并执行）。
+  expect(mocks.model).not.toHaveBeenCalled();
 });
 
 // F12 翻转：原断言「临时 conditions 仍把原 query 传给推荐持久化」记录的是缺陷（模式混用）。

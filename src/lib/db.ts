@@ -4,7 +4,7 @@ import { LLM_USAGE_PHASES, type LlmUsagePhase, type LlmUsageRecord, type TokenSt
 import { assertAuthSchema } from './auth-store';
 import { initializeBusinessSchema } from './business-schema';
 import type { PersonalWriter } from './personal-write';
-import { requireUserId, profileForUserQuery, saveProfileForUserQuery, excludedBooksForUserQuery, persistRecommendationsForUserQueries, feedbackForUserQueries, feedbackSnapshotForUserQuery, recentInformativeFeedbackForUserQuery, withdrawnFeedbackBookTitlesForUserQuery } from './user-data';
+import { requireUserId, profileForUserQuery, saveProfileForUserQuery, excludedBooksForUserQuery, persistRecommendationsForUserQueries, feedbackForUserQueries, feedbackSnapshotForUserQuery, recentInformativeFeedbackForUserQuery, withdrawnFeedbackBookTitlesForUserQuery, enqueueProfileFeedbackForUserQuery, profileFeedbackQueueForUserQuery, markProfileFeedbackAbsorbedForUserQuery, markProfileFeedbackFailedForUserQuery, maxFeedbackIdForUserQuery, ensureProfileForUserQuery } from './user-data';
 export { canonicalBookKey } from './book-identity';
 
 const DATABASE_URL = process.env.DATABASE_URL;
@@ -214,9 +214,14 @@ export async function getFeedbackSnapshotForUser(userId: number, title: string, 
   return row ? { version: row.id, status: row.status, note: row.note } : { version: 0, status: null, note: '' };
 }
 
-export async function recordFeedbackForUser(userId: number, book: { title: string; author: string }, status: string, note: string, expectedVersion: number, write: PersonalWriter): Promise<void> {
+export async function recordFeedbackForUser(userId: number, book: { title: string; author: string }, status: string, note: string, expectedVersion: number, write: PersonalWriter, queued = false): Promise<void> {
   try {
-    const results = await write((sql) => feedbackForUserQueries(sql, userId, book, status, note, expectedVersion));
+    // 第 7 条语句（索引 6）是与反馈写入同一事务的「待吸收事件」登记（F15）：反馈落库即事件
+    // 落库。queued=false（本次改动不含信息量、也不是对既有 informative 反馈的撤回）时它写 0 行。
+    const results = await write((sql) => [
+      ...feedbackForUserQueries(sql, userId, book, status, note, expectedVersion),
+      enqueueProfileFeedbackForUserQuery(sql, userId, expectedVersion, queued),
+    ]);
     // 第 5 条语句（索引 4）是按 title/author 定位后追加 feedback 的 INSERT ... RETURNING id
     // （索引 0 是 route B 补 books 行的 upsert，见 user-data.ts feedbackForUserQueries）。
     // books 里没有这本书时它插入 0 行——旧行为是静默成功，这里显式失败。
@@ -229,4 +234,64 @@ export async function recordFeedbackForUser(userId: number, book: { title: strin
     if (error && typeof error === 'object' && 'code' in error && error.code === '22012') throw new FeedbackConflictError();
     throw error;
   }
+}
+
+// F15：每用户一行的待吸收反馈队列。语义见 user-data.ts 的队列查询注释与报告 §2。
+export interface ProfileFeedbackQueueState {
+  pendingFeedbackId: number | null;
+  absorbedFeedbackId: number;
+  status: string;
+  attempts: number;
+  lastError: string;
+  updatedAt: string;
+}
+
+export async function getProfileFeedbackQueueForUser(userId: number): Promise<ProfileFeedbackQueueState | null> {
+  requireUserId(userId);
+  const rows = await profileFeedbackQueueForUserQuery(getSql(), userId) as {
+    pending_feedback_id: number | null; absorbed_feedback_id: number; status: string;
+    attempts: number; last_error: string; updated_at: string;
+  }[];
+  const row = rows?.[0];
+  if (!row) return null;
+  return {
+    pendingFeedbackId: row.pending_feedback_id,
+    absorbedFeedbackId: row.absorbed_feedback_id,
+    status: row.status,
+    attempts: row.attempts,
+    lastError: row.last_error,
+    updatedAt: row.updated_at,
+  };
+}
+
+// 返回推进后仍待处理的反馈 id（null = 已清空）。吸收期间若又有新反馈把 pending 抬高，
+// 这里会看到更高的 id，调用方据此知道还没吸收干净。
+export async function markProfileFeedbackAbsorbedForUser(
+  userId: number, candidate: number, status: string, write: PersonalWriter,
+): Promise<number | null> {
+  requireUserId(userId);
+  if (typeof write !== 'function') throw new Error('authorized writer is required');
+  const rows = (await write((sql) => [markProfileFeedbackAbsorbedForUserQuery(sql, userId, candidate, status)]))[0] as { pending_feedback_id: number | null }[];
+  return rows[0]?.pending_feedback_id ?? null;
+}
+
+export async function markProfileFeedbackFailedForUser(
+  userId: number, status: string, error: string, write: PersonalWriter,
+): Promise<void> {
+  requireUserId(userId);
+  if (typeof write !== 'function') throw new Error('authorized writer is required');
+  await write((sql) => [markProfileFeedbackFailedForUserQuery(sql, userId, status, error)]);
+}
+
+export async function getMaxFeedbackIdForUser(userId: number): Promise<number> {
+  requireUserId(userId);
+  const rows = await maxFeedbackIdForUserQuery(getSql(), userId) as { max_id: number }[];
+  return rows[0]?.max_id ?? 0;
+}
+
+// 空画像起步：没有 profile 行时先建一行（seeds 空），让反馈吸收拿到有效的 updated_at 走 CAS。
+export async function ensureProfileForUser(userId: number, write: PersonalWriter): Promise<void> {
+  requireUserId(userId);
+  if (typeof write !== 'function') throw new Error('authorized writer is required');
+  await write((sql) => [ensureProfileForUserQuery(sql, userId)]);
 }

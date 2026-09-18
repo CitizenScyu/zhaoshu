@@ -27,6 +27,8 @@ const policies: Record<string, Record<string, 'find' | 'read' | 'download' | 'ow
   'find/exact': { POST: 'find' }, 'find/exact/shelf': { POST: 'find' },
   library: { GET: 'find' }, owner: { GET: 'legacy-owner' },
   profile: { GET: 'find', PUT: 'find', POST: 'find' },
+  // F15：画像吸收端点与 profile 同权限（同样是本人数据 + 模型调用）。
+  'profile/absorb': { GET: 'find', POST: 'find' },
   'read/[id]/[resource]': { GET: 'read' }, 'read/source/[resource]': { GET: 'read' },
   recommendations: { GET: 'find' },
   shelf: { POST: 'find', DELETE: 'find' },

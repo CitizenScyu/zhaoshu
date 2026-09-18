@@ -14,6 +14,7 @@ const mocks = vi.hoisted(() => ({
   ensureSchema: vi.fn(), getProfileForUser: vi.fn(), saveProfileForUser: vi.fn(),
   getSql: vi.fn(), sql: vi.fn(), transaction: vi.fn(), getFeedbackSnapshotForUser: vi.fn(),
   getProfileFeedbackForUser: vi.fn(), getWithdrawnFeedbackBookTitlesForUser: vi.fn(),
+  getMaxFeedbackIdForUser: vi.fn(), markProfileFeedbackAbsorbedForUser: vi.fn(),
 }));
 vi.mock('@/lib/db', async (importOriginal) => ({ ...await importOriginal<typeof import('@/lib/db')>(), ...mocks, recordFeedbackForUser: async (userId: number, book: { title: string; author: string }, status: string, note: string, expectedVersion: number) => {
     const actual = await vi.importActual<typeof import('@/lib/db')>('@/lib/db');
@@ -60,6 +61,8 @@ describe('actual SSE failure cannot overwrite a profile', () => {
     mocks.getFeedbackSnapshotForUser.mockResolvedValue({ version: 0, status: null, note: '' });
     mocks.getProfileFeedbackForUser.mockResolvedValue([]);
     mocks.getWithdrawnFeedbackBookTitlesForUser.mockResolvedValue([]);
+    mocks.getMaxFeedbackIdForUser.mockResolvedValue(0);
+    mocks.markProfileFeedbackAbsorbedForUser.mockResolvedValue(null);
   });
   afterEach(() => {
     vi.unstubAllGlobals();
@@ -86,10 +89,12 @@ describe('actual SSE failure cannot overwrite a profile', () => {
     expect(mocks.saveProfileForUser).not.toHaveBeenCalled();
     const updated = await feedback.POST(request('feedback'));
     expect(updated.status).toBe(200);
-    expect(await updated.json()).toEqual({ ok: true, profileUpdated: false });
+    // F15：写路径只登记待吸收事件，不再同步回写画像。
+    expect(await updated.json()).toEqual({ ok: true, profileUpdated: false, profileStatus: 'pending', pending: true, retryable: true });
     expect(mocks.transaction).toHaveBeenCalledOnce(); // 反馈仍被保存
     expect(mocks.saveProfileForUser).not.toHaveBeenCalled();
-    expect(fetchMock).toHaveBeenCalledTimes(2);
+    // 反馈写路径不再发起模型调用，只剩画像生成那一次 fetch。
+    expect(fetchMock).toHaveBeenCalledOnce();
   });
 
   it('keeps both normal completion forms working through the real routes', async () => {
@@ -100,9 +105,11 @@ describe('actual SSE failure cannot overwrite a profile', () => {
     const feedback = await import('../feedback/route');
     expect((await consumeSSE(await profile.POST(request('profile')))).find((e) => e.type === 'done'))
       .toEqual({ type: 'done', seeds, content: '完整生成画像', updatedAt: nextVersion, feedbackCount: 0, resetFromSeeds: false });
-    expect(await (await feedback.POST(request('feedback'))).json()).toEqual({ ok: true, profileUpdated: true, updatedAt: nextVersion });
+    expect(await (await feedback.POST(request('feedback'))).json())
+      .toEqual({ ok: true, profileUpdated: false, profileStatus: 'pending', pending: true, retryable: true });
+    // F15：反馈写路径不再回写画像，只有生成路由这一次 saveProfileForUser。
     expect(mocks.saveProfileForUser.mock.calls).toEqual([
-      [1, seeds, '完整生成画像', previousVersion, expect.any(Function)], [1, seeds, '完整更新画像', previousVersion, expect.any(Function)],
+      [1, seeds, '完整生成画像', previousVersion, expect.any(Function)],
     ]);
   });
 

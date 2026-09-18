@@ -10,6 +10,9 @@ const mocks = vi.hoisted(() => ({
   getExcludedBookTitlesForUser: vi.fn(), persistRecommendationsForUser: vi.fn(),
   neon: vi.fn(), usageSql: vi.fn(), verifyBatch: vi.fn(), getFeedbackSnapshotForUser: vi.fn(),
   getProfileFeedbackForUser: vi.fn(), getWithdrawnFeedbackBookTitlesForUser: vi.fn(),
+  // F15：吸收/重建涉及的队列函数。
+  getProfileFeedbackQueueForUser: vi.fn(), markProfileFeedbackAbsorbedForUser: vi.fn(),
+  markProfileFeedbackFailedForUser: vi.fn(), getMaxFeedbackIdForUser: vi.fn(), ensureProfileForUser: vi.fn(),
 }));
 vi.mock('next/server', async (importOriginal) => ({
   ...await importOriginal<typeof import('next/server')>(), after: mocks.after,
@@ -29,6 +32,11 @@ vi.mock('@/lib/db', async (importOriginal) => ({
   getFeedbackSnapshotForUser: mocks.getFeedbackSnapshotForUser,
   getProfileFeedbackForUser: mocks.getProfileFeedbackForUser,
   getWithdrawnFeedbackBookTitlesForUser: mocks.getWithdrawnFeedbackBookTitlesForUser,
+  getProfileFeedbackQueueForUser: mocks.getProfileFeedbackQueueForUser,
+  markProfileFeedbackAbsorbedForUser: mocks.markProfileFeedbackAbsorbedForUser,
+  markProfileFeedbackFailedForUser: mocks.markProfileFeedbackFailedForUser,
+  getMaxFeedbackIdForUser: mocks.getMaxFeedbackIdForUser,
+  ensureProfileForUser: mocks.ensureProfileForUser,
   getExcludedBookTitlesForUser: mocks.getExcludedBookTitlesForUser,
   persistRecommendationsForUser: mocks.persistRecommendationsForUser,
 }));
@@ -81,8 +89,11 @@ async function invoke(phase: LlmUsagePhase, signal?: AbortSignal) {
     const { POST } = await import('./profile/route');
     return POST(request('profile', { updatedAt: 'v1' }, signal));
   }
-  const { POST } = await import('./feedback/route');
-  return POST(request('feedback', { title: '测试书', status: 'done', note: '喜欢严谨设定' }, signal));
+  // F15：feedback 相位现在由独立的画像吸收路由产生（反馈写路径不再同步调用模型）。
+  const { POST } = await import('./profile/absorb/route');
+  mocks.getProfileFeedbackQueueForUser.mockResolvedValue({ pendingFeedbackId: 7, absorbedFeedbackId: 0, status: 'pending', attempts: 0, lastError: '', updatedAt: '' });
+  mocks.getProfileFeedbackForUser.mockResolvedValue([{ title: '测试书', author: '作者', status: 'done', note: '喜欢严谨设定' }]);
+  return POST(request('profile/absorb', {}, signal));
 }
 
 async function finishResponse() {
@@ -150,6 +161,11 @@ describe('usage instrumentation through all model routes', () => {
     mocks.getFeedbackSnapshotForUser.mockResolvedValue({ version: 0, status: null, note: '' });
     mocks.getProfileFeedbackForUser.mockResolvedValue([]);
     mocks.getWithdrawnFeedbackBookTitlesForUser.mockResolvedValue([]);
+    mocks.getProfileFeedbackQueueForUser.mockResolvedValue({ pendingFeedbackId: 7, absorbedFeedbackId: 0, status: 'pending', attempts: 0, lastError: '', updatedAt: '' });
+    mocks.markProfileFeedbackAbsorbedForUser.mockResolvedValue(null);
+    mocks.markProfileFeedbackFailedForUser.mockResolvedValue(undefined);
+    mocks.getMaxFeedbackIdForUser.mockResolvedValue(0);
+    mocks.ensureProfileForUser.mockResolvedValue(undefined);
     mocks.getSql.mockReturnValue(Object.assign(mocks.businessSql, { transaction: mocks.transaction }));
     mocks.transaction.mockResolvedValue([]);
     mocks.verifyBatch.mockResolvedValue([verified.douban]);

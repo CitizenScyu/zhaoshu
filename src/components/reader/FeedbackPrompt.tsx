@@ -2,6 +2,7 @@
 
 import { useState } from 'react';
 import FeedbackForm from '@/components/FeedbackForm';
+import { feedbackProfileUpdateSentence, type FeedbackProfileStatus } from '@/lib/feedback';
 import type { FeedbackStatus } from '@/lib/types';
 import styles from './reader.module.css';
 
@@ -17,7 +18,7 @@ export default function FeedbackPrompt({ title, author, onDone }: {
 }) {
   const [status, setStatus] = useState<FeedbackStatus | null>(null);
   const [busy, setBusy] = useState(false);
-  const [saved, setSaved] = useState<{ note: string; profileUpdated: boolean } | null>(null);
+  const [saved, setSaved] = useState<{ note: string; profileStatus: FeedbackProfileStatus } | null>(null);
 
   if (saved) {
     return (
@@ -25,7 +26,7 @@ export default function FeedbackPrompt({ title, author, onDone }: {
         <p className={styles.promptTitle}>已记下，谢谢。</p>
         <p className={styles.promptHint}>
           {saved.note ? '下次「找书」会带上这一条。' : '阅读状态已更新。'}
-          {saved.profileUpdated ? '口味画像已随之更新。' : ''}
+          {feedbackProfileUpdateSentence(saved.profileStatus)}
         </p>
         <div className={styles.promptActions}>
           <button className={styles.primary} onClick={onDone}>返回</button>
@@ -44,7 +45,7 @@ export default function FeedbackPrompt({ title, author, onDone }: {
             author={author}
             status={status}
             onBusyChange={setBusy}
-            onSaved={(note, profileUpdated) => setSaved({ note, profileUpdated })}
+            onSaved={(note, profileStatus) => setSaved({ note, profileStatus })}
             onCancel={() => setStatus(null)}
           />
         : (

@@ -35,8 +35,43 @@ export function feedbackNeedsConfirmation(previous: string, next: string): boole
   return next.trim().length < previous.trim().length;
 }
 
+// F15：反馈是否有信息量——只有「读完/弃书 + 原因」才会给画像补充偏好。与 F04 的
+// recentInformativeFeedbackForUserQuery 判定口径一致（status IN (done,dropped) 且 note 非空）。
+export function isInformativeFeedback(status: string | null, note: string): boolean {
+  return (status === 'done' || status === 'dropped') && note.trim() !== '';
+}
+
+// 是否需要登记一条待吸收事件：本次反馈有信息量，或本次把先前有信息量的反馈撤回/改成了
+// 无信息量（撤回也要吸收——否则旧偏好会留在画像里）。其余（want/reading、无不含撤回）
+// 对画像零影响，返回 false，写路径也就不产生队列事件。
+export function feedbackQueuesProfileAbsorption(
+  status: string, note: string, previousStatus: string | null, previousNote: string,
+): boolean {
+  return isInformativeFeedback(status, note) || isInformativeFeedback(previousStatus, previousNote);
+}
+
 export function feedbackReductionMessage(previous: string, next: string): string {
   return `反馈原因将从 ${previous.trim().length} 字减少到 ${next.trim().length} 字${next.trim() ? '' : '（清空）'}。\n\n原反馈：${previous}\n\n确认保存？`;
+}
+
+// F15：反馈保存后画像的两种用户可见状态。
+//   pending   = 反馈已保存，画像吸收是后台的（别承诺"已更新"）
+//   unchanged = 这次反馈对画像没有信息量，无需更新
+// 旧的 profileUpdated 布尔在异步吸收后恒为 false（不再区分任何东西），改由这两个状态驱动文案。
+export type FeedbackProfileStatus = 'pending' | 'unchanged';
+
+export function readFeedbackProfileStatus(value: unknown): FeedbackProfileStatus {
+  return value === 'pending' ? 'pending' : 'unchanged';
+}
+
+// 追加在「反馈已保存」之后的状态子句；unchanged 不追加任何内容（本来就无需更新画像）。
+export function feedbackProfileUpdateMessage(status: FeedbackProfileStatus): string {
+  return status === 'pending' ? '，画像待更新' : '';
+}
+
+// 阅读器反馈卡用的整句版本（它不拼接"已记录"前缀）。
+export function feedbackProfileUpdateSentence(status: FeedbackProfileStatus): string {
+  return status === 'pending' ? '口味画像待更新。' : '';
 }
 
 export function composeFeedbackNote({ reasons, text }: FeedbackDraft): string {

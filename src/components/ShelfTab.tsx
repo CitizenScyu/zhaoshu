@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { FeedbackStatus, ShelfStatus } from '@/lib/types';
-import { MAX_FEEDBACK_NOTE_LENGTH } from '@/lib/feedback';
+import { feedbackProfileUpdateMessage, MAX_FEEDBACK_NOTE_LENGTH } from '@/lib/feedback';
 import { useOwner } from '@/components/OwnerProvider';
 import FeedbackForm from '@/components/FeedbackForm';
 import ReadBookLink from '@/components/ReadBookLink';
@@ -405,10 +405,10 @@ export default function ShelfTab() {
                       initialSnapshot={{ version: it.feedback_id ?? 0, note: it.note, status: it.status === 'new' ? null : it.status }}
                       clearInitially={editing.clear}
                       onBusyChange={setUpdating}
-                      onSaved={(note, profileUpdated) => {
+                      onSaved={(note, profileStatus) => {
                         setItems((current) => current?.map((entry) => entry.id === it.id ? { ...entry, status: editing.status, note } : entry) ?? null);
                         setEditing(null);
-                        setFeedbackMessage(`「${it.title}」反馈已记录${profileUpdated ? '，画像已更新' : ''}`);
+                        setFeedbackMessage(`「${it.title}」反馈已记录${feedbackProfileUpdateMessage(profileStatus)}`);
                         void load();
                       }}
                       onCancel={() => setEditing(null)}

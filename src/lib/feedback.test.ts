@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { composeFeedbackNote, feedbackNeedsConfirmation, parseFeedbackNote, readFeedbackSnapshot } from './feedback';
+import { composeFeedbackNote, feedbackNeedsConfirmation, feedbackProfileUpdateMessage, feedbackProfileUpdateSentence, parseFeedbackNote, readFeedbackProfileStatus, readFeedbackSnapshot } from './feedback';
 
 describe('feedback note editing', () => {
   it('round-trips multiple reasons and multiline custom text', () => {
@@ -37,5 +37,30 @@ describe('feedback snapshot contract', () => {
   it('detects destructive note reductions so the client can confirm before saving', () => {
     expect(feedbackNeedsConfirmation('长反馈', '')).toBe(true);
     expect(feedbackNeedsConfirmation('短', '长一点的反馈')).toBe(false);
+  });
+});
+
+// F15：异步吸收后用户侧文案必须能区分「反馈已保存、画像待更新」与「无需修改画像」。
+// （组件测试需要 jsdom，本仓 vitest 是 node 环境，所以文案逻辑抽成纯函数在这里断言。）
+describe('feedback saved profile-status messaging (F15)', () => {
+  it('maps only the explicit pending status to pending, everything else to unchanged', () => {
+    expect(readFeedbackProfileStatus('pending')).toBe('pending');
+    expect(readFeedbackProfileStatus('unchanged')).toBe('unchanged');
+    // 旧/缺失/非法值一律按 unchanged 处理（不误报"待更新"）。
+    expect(readFeedbackProfileStatus(undefined)).toBe('unchanged');
+    expect(readFeedbackProfileStatus(false)).toBe('unchanged');
+    expect(readFeedbackProfileStatus('failed')).toBe('unchanged');
+  });
+
+  it('never promises the profile was updated while absorption is still pending', () => {
+    expect(feedbackProfileUpdateMessage('pending')).toBe('，画像待更新');
+    expect(feedbackProfileUpdateMessage('unchanged')).toBe('');
+    expect(feedbackProfileUpdateSentence('pending')).toBe('口味画像待更新。');
+    expect(feedbackProfileUpdateSentence('unchanged')).toBe('');
+    // 关键不变量：任何状态都不会出现「已更新」的承诺。
+    for (const status of ['pending', 'unchanged'] as const) {
+      expect(feedbackProfileUpdateMessage(status)).not.toContain('已更新');
+      expect(feedbackProfileUpdateSentence(status)).not.toContain('已更新');
+    }
   });
 });

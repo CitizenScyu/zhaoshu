@@ -350,8 +350,81 @@ export function feedbackForUserQueries(sql: PersonalQuery, userId: number, raw: 
   ];
 }
 
-// 重新生成画像时的「本人最新有效反馈」（F04）：feedback 是追加式历史，每本书只认最新一行
-// （id DESC）；只有最新状态仍具信息量（done/dropped 且 note 非空）才作为偏好证据喂给模型。
+// F15：反馈写事务的第二步——登记「该用户有反馈待吸收」。与反馈 INSERT 同一事务，反馈落库
+// 即事件落库（要么都有、要么都没有）。吸收侧按用户合并执行，写路径绝不调用模型。
+//
+// 为什么用「单值水位 + GREATEST」而不是每本书一行：并发写两本书的反馈时，两条事务都只把水位
+// 抬到各自（或更高的）反馈 id，互不覆盖；吸收侧按用户一次性读取全部最新有效反馈，于是两条
+// 反馈必然被同一次吸收覆盖，不存在「一个 CAS 成功、另一个永久不被吸收」。
+//
+// HAVING max(id) > expectedVersion：只有本次真的追加了新反馈行才登记。route B 之后
+// 「定位不到 books」几乎不可达，但一旦 INSERT 写 0 行，max(id) 仍等于旧版本，HAVING 落空 →
+// 不产生队列事件（404 路径不留脏 pending）。
+// queued=false（want/reading 且此前也非 informative）时 SELECT 无行，不登记——只有
+// 「有信息量的反馈」或「撤回先前的 informative 反馈」才需要吸收。
+export function enqueueProfileFeedbackForUserQuery(sql: PersonalQuery, userId: number, expectedVersion: number, queued: boolean) {
+  requireUserId(userId);
+  return sql`INSERT INTO profile_feedback_queue (user_id, pending_feedback_id, status, updated_at)
+    SELECT ${userId}, max(id), ${'pending'}, now() FROM feedback
+    WHERE user_id = ${userId} AND ${queued}
+    HAVING max(id) > ${expectedVersion}
+    ON CONFLICT (user_id) DO UPDATE SET
+      pending_feedback_id = GREATEST(COALESCE(profile_feedback_queue.pending_feedback_id, 0), EXCLUDED.pending_feedback_id),
+      status = ${'pending'},
+      updated_at = now()`;
+}
+
+export function profileFeedbackQueueForUserQuery(sql: PersonalQuery, userId: number) {
+  requireUserId(userId);
+  return sql`SELECT pending_feedback_id, absorbed_feedback_id, status, attempts, last_error, updated_at::text AS updated_at
+    FROM profile_feedback_queue WHERE user_id = ${userId}`;
+}
+
+// 一次吸收成功（applied/unchanged）后的水位推进：absorbed 取 GREATEST，pending 只在
+// 「水位不高于本次候选」时清空——若吸收期间又有新反馈把 pending 抬得更高，保留它，并把
+// 状态退回 pending（SET 里所有 RHS 都读旧值，所以这里的比较是推进前的 pending）。
+export function markProfileFeedbackAbsorbedForUserQuery(sql: PersonalQuery, userId: number, candidate: number, status: string) {
+  requireUserId(userId);
+  return sql`UPDATE profile_feedback_queue
+    SET absorbed_feedback_id = GREATEST(absorbed_feedback_id, ${candidate}),
+        pending_feedback_id = CASE WHEN pending_feedback_id IS NOT NULL AND pending_feedback_id <= ${candidate}
+          THEN NULL ELSE pending_feedback_id END,
+        status = CASE WHEN pending_feedback_id IS NOT NULL AND pending_feedback_id > ${candidate}
+          THEN ${'pending'} ELSE ${status} END,
+        attempts = attempts + 1,
+        last_error = '',
+        updated_at = now()
+    WHERE user_id = ${userId}
+    RETURNING pending_feedback_id`;
+}
+
+// 吸收失败（failed/conflict）：保留 pending_feedback_id 不清，下次机会重放。last_error 只存
+// 错误类别（error.name / code），绝不落模型或数据库原文。
+export function markProfileFeedbackFailedForUserQuery(sql: PersonalQuery, userId: number, status: string, error: string) {
+  requireUserId(userId);
+  return sql`UPDATE profile_feedback_queue
+    SET status = ${status}, attempts = attempts + 1, last_error = ${error}, updated_at = now()
+    WHERE user_id = ${userId}`;
+}
+
+// 重建画像成功后用它把队列水位推到「重建时已看到的反馈上界」：重建本身已经把最新有效反馈
+// 并入新画像，因此这些反馈无需再吸收一次。候选值必须在读取反馈之前取（否则会漏掉重建期间
+// 新写入、却未被并入的反馈）。
+export function maxFeedbackIdForUserQuery(sql: PersonalQuery, userId: number) {
+  requireUserId(userId);
+  return sql`SELECT COALESCE(max(id), 0)::int AS max_id FROM feedback WHERE user_id = ${userId}`;
+}
+
+// 空画像起步（F15 ③）：用户还没有 profile 行时，反馈吸收需要先建一行占位（seeds 为空），
+// 才能带着有效 updated_at 走既有的 CAS 保存。ON CONFLICT DO NOTHING 幂等，绝不覆盖已有画像。
+export function ensureProfileForUserQuery(sql: PersonalQuery, userId: number) {
+  requireUserId(userId);
+  return sql`INSERT INTO profile (id) VALUES (${userId})
+    ON CONFLICT (id) DO NOTHING
+    RETURNING updated_at::text AS updated_at`;
+}
+
+// 重新生成画像时的「本人最新有效反馈」（F04）：feedback 是追加式历史，每本书只认最新一行// （id DESC）；只有最新状态仍具信息量（done/dropped 且 note 非空）才作为偏好证据喂给模型。
 //
 // 🔴 先取最新、再判是否有信息量，顺序不能反：若先过滤 done/dropped+note，用户把某本书
 // 的反馈改成 want/reading 或清空 note（撤回）之后，那条历史 done+note 仍会被选中，
