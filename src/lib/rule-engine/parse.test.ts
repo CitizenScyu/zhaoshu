@@ -112,6 +112,46 @@ describe('parse: 默认语法翻译细节', () => {
   });
 });
 
+describe('parse: 单段末端关键字（P0：段视为 op 而非 CSS 标签）', () => {
+  it('单段 text → chain 空 + terminal text（不当 <text> 标签）', () => {
+    expect(parseFieldRule('text')).toEqual({
+      rules: [{ kind: 'css', chain: [], terminal: { op: 'text' } }],
+    });
+  });
+
+  it('单段 href → chain 空 + terminal href', () => {
+    expect(parseFieldRule('href')).toEqual({
+      rules: [{ kind: 'css', chain: [], terminal: { op: 'href' } }],
+    });
+  });
+
+  it('单段 html → chain 空 + terminal html', () => {
+    expect(parseRule('html')).toEqual({ kind: 'css', chain: [], terminal: { op: 'html' } });
+  });
+
+  it('text##上次阅读 → chain 空 + terminal text，正则尾缀保留', () => {
+    expect(parseFieldRule('text##上次阅读')).toEqual({
+      rules: [{ kind: 'css', chain: [], terminal: { op: 'text' } }],
+      regex: [{ pattern: '上次阅读', replacement: '', flags: undefined }],
+    });
+  });
+
+  it('单段 div → 选择器步，无 terminal（回归：裸标签名不得误判为 attr/op）', () => {
+    expect(parseFieldRule('div')).toEqual({
+      rules: [{ kind: 'css', chain: [{ selector: 'div' }] }],
+    });
+  });
+
+  it('单段 a / p → 选择器步（回归）', () => {
+    expect(parseRule('a')).toEqual({ kind: 'css', chain: [{ selector: 'a' }] });
+    expect(parseRule('p')).toEqual({ kind: 'css', chain: [{ selector: 'p' }] });
+  });
+
+  it('单段具名属性型 token（data-id）仍走选择器步（回归）', () => {
+    expect(parseRule('data-id')).toEqual({ kind: 'css', chain: [{ selector: 'data-id' }] });
+  });
+});
+
 describe('parse: 正则尾缀剥离', () => {
   it('单 ## = 删匹配（replacement 空）', () => {
     const { body, regex } = stripRegexSuffix('text##上次阅读', 'text##上次阅读');

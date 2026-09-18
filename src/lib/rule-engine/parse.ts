@@ -319,6 +319,12 @@ function buildCssChain(body: string, rule: string, explicit: boolean): RuleIr {
   if (atParts.length > 1 && isTerminalToken(last)) {
     terminal = toTerminal(last, rule);
     atParts.pop();
+  } else if (atParts.length === 1 && TERMINAL_KEYWORDS.has(last)) {
+    // 单段且属已知末端关键字（`text`/`href`/`html`…，如 chapterUrl=href、chapterName=text##上次阅读）：
+    // 也是 terminal（对当前 scope 套 op），不能当 CSS 标签名去找 <text>。注意只用 TERMINAL_KEYWORDS 判定，
+    // 不得用 isTerminalToken 兜底——否则裸标签名 div/a/p、具名属性 data-id 会被误判成 op/attr。
+    terminal = toTerminal(last, rule);
+    atParts.pop();
   } else if (atParts.length > 1 && last === '') {
     // 末尾空 @（节点集原样，bookList/chapterList 用）
     atParts.pop();
