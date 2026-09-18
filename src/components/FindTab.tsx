@@ -71,8 +71,10 @@ export default function FindTab() {
   const [recallSeconds, setRecallSeconds] = useState(0); // recall 阶段已等待秒数
   const [retryFrom, setRetryFrom] = useState<FindStep | null>(null); // 失败后可从哪一步起重试
   const request = useRef<AbortController | null>(null);
-  // 中间产物与本次查询参数：verify 结束帧的 verified 不进 state，只放 ref 供 rerank 重试接力。
+  // 中间产物与本次查询参数：verify 结束帧的 verified 不进 state，只放 ref 供 rerank 重试接力；
+  // ticket 是服务端签发的验证票据（F01），rerank 必须回传它，服务端只认票据里的 verified。
   const verifiedRef = useRef<VerifiedCandidate[]>([]);
+  const ticketRef = useRef('');
   const runCtxRef = useRef<{ q: string; conditions: string } | null>(null);
   useEffect(() => () => { request.current?.abort(); }, [apiFetch]);
 
@@ -138,6 +140,7 @@ export default function FindTab() {
       setResults([]);
       setRecallSeconds(0);
       verifiedRef.current = [];
+      ticketRef.current = '';
     }
     if (start !== 'rerank') {
       setVerifyTotal(0);
@@ -163,24 +166,29 @@ export default function FindTab() {
         setCandidates(recalled);
       }
 
-      // 2) verify：实时 progress 帧更新进度；结束帧返回 verified。
+      // 2) verify：实时 progress 帧更新进度；结束帧返回 verified 与服务端签发的 ticket。
+      // ticket 必须保存：rerank 只回传票据，服务端不再信 body.verified（F01）。
       if (start !== 'rerank') {
         at = 'verify';
         setPhase('verify');
-        verified = await fetchStepResult<VerifiedCandidate[]>(
+        const verifyEvent = await fetchFindResult(
           controller.signal,
           () => apiFetch('/api/find', {
             signal: controller.signal, method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: stepBody('verify', { candidates: recalled }),
           }),
-          'verified',
+          FIND_FETCH_TIMEOUT_MS,
+          onFindProgress,
         );
+        if (!Array.isArray(verifyEvent.verified)) throw new Error('找书结果不完整，请重试');
+        verified = verifyEvent.verified as VerifiedCandidate[];
+        ticketRef.current = typeof verifyEvent.ticket === 'string' ? verifyEvent.ticket : '';
         verifiedRef.current = verified;
       }
 
       // 3) rerank：结束帧带 items（+persisted）。persisted=false 不丢结果，但书没存下来，
-      // 必须让用户看见——否则写库失败被当成找书成功。
+      // 必须让用户看见——否则写库失败被当成找书成功。请求只带 ticket，服务端用票内的 verified。
       at = 'rerank';
       setPhase('rerank');
       const resultEvent = await fetchFindResult(
@@ -188,7 +196,7 @@ export default function FindTab() {
         () => apiFetch('/api/find', {
           signal: controller.signal, method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: stepBody('rerank', { verified }),
+          body: stepBody('rerank', { ticket: ticketRef.current }),
         }),
         FIND_FETCH_TIMEOUT_MS,
         onFindProgress,
