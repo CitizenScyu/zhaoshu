@@ -16,6 +16,8 @@ vi.mock('@/lib/douban', () => ({ verifyBatch: mocks.verify }));
 import * as profile from './profile/route';
 import * as find from './find/route';
 import * as feedback from './feedback/route';
+import { issueVerifyTicket, ticketSigningKey } from '@/lib/verify-ticket';
+import type { VerifiedCandidate } from '@/lib/types';
 
 const sessions = new Map<string, SessionRecord>();
 const profiles = new Map<number, ProfileSnapshot>();
@@ -41,6 +43,7 @@ describe('32.1 真实权限入口与可信用户绑定（数据库状态为夹�
     vi.resetAllMocks(); sessions.clear(); profiles.clear();
     vi.stubEnv('AUTH_ACCOUNTS_ENABLED', 'true'); vi.stubEnv('NODE_ENV', 'test');
     vi.stubEnv('APP_OWNER_TOKEN', 'fixture-owner'); vi.stubEnv('LLM_TOTAL_TIMEOUT_MS', '280000');
+    vi.stubEnv('AUTH_SECURITY_SECRET', 'fixture-security-secret-0123456789abcdef');
     sessions.set('session-a', member(2)); sessions.set('session-b', member(3));
     profiles.set(1, { seeds: [], content: 'OWNER-PRIVATE', updatedAt: 'v1' });
     for (const id of [2, 3]) profiles.set(id, { seeds: [{ title: `用户${id}种子`, kind: 'love' }], content: `USER-${id}-PRIVATE`, updatedAt: 'v1' });
@@ -101,7 +104,12 @@ describe('32.1 真实权限入口与可信用户绑定（数据库状态为夹�
     expect(mocks.chat.mock.calls[0][1]).toContain('USER-2-PRIVATE');
     expect(mocks.chat.mock.calls[0][1]).not.toMatch(/OWNER-PRIVATE|USER-3-PRIVATE/);
     mocks.chat.mockResolvedValueOnce({ content: JSON.stringify({ items: [item] }) });
-    await events(await find.POST(request('find', 'POST', { step: 'rerank', query: '找书', verified: [{ ...candidate, douban: { found: false, status: 'not_found' } }], userId: 3 })));
+    // F01：rerank 只认服务端签发的验证票据，测试按可信用户 2 签一张（query/conditions 必须匹配）。
+    const rerankVerified = { ...candidate, douban: { found: false, status: 'not_found' } };
+    const ticket = issueVerifyTicket(ticketSigningKey()!, {
+      userId: 2, query: '找书', conditions: '', verified: [rerankVerified] as unknown as VerifiedCandidate[],
+    });
+    await events(await find.POST(request('find', 'POST', { step: 'rerank', query: '找书', ticket, userId: 3 })));
     expect(mocks.persistRecommendationsForUser).toHaveBeenCalledWith(2, '找书', expect.any(Array), expect.any(Function));
   });
   it.each(['logout', 'disable', 'downgrade'])('模型等待时 %s，重新查询原会话后拒绝写回', async (change) => {

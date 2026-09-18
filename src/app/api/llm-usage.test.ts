@@ -65,7 +65,14 @@ function request(path: string, body: unknown, signal?: AbortSignal) {
 async function invoke(phase: LlmUsagePhase, signal?: AbortSignal) {
   if (phase === 'find_recall' || phase === 'find_rerank') {
     const { POST } = await import('./find/route');
-    return POST(request('find', { step: phase === 'find_recall' ? 'recall' : 'rerank', query: '找书', verified: [verified] }, signal));
+    // F01：rerank 需要服务端签发的验证票据。这里动态 import，避免在收集阶段就加载
+    // verify-ticket → auth-session，干扰本文件对 next/server after 的 mock。
+    const { issueVerifyTicket, ticketSigningKey } = await import('@/lib/verify-ticket');
+    const ticket = issueVerifyTicket(ticketSigningKey()!, {
+      userId: 1, query: '找书', conditions: '',
+      verified: [verified] as unknown as Parameters<typeof issueVerifyTicket>[1]['verified'],
+    });
+    return POST(request('find', { step: phase === 'find_recall' ? 'recall' : 'rerank', query: '找书', verified: [verified], ticket }, signal));
   }
   if (phase === 'profile') {
     const { POST } = await import('./profile/route');
@@ -119,6 +126,7 @@ describe('usage instrumentation through all model routes', () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date('2026-09-15T00:00:00Z'));
     vi.stubEnv('APP_OWNER_TOKEN', 'usage-owner');
+    vi.stubEnv('AUTH_SECURITY_SECRET', 'usage-fake-security-secret-0123456789ab');
     vi.stubEnv('DATABASE_URL', 'postgresql://test:test@database.invalid/test');
     vi.stubEnv('LLM_API_KEY', 'usage-test-key');
     vi.stubEnv('LLM_MODEL', 'configured-model');
