@@ -10,6 +10,8 @@
   python3 labeler.py --dry-run              # 只列书目不打标
   python3 labeler.py --book /books/details3168.html   # 指定单本
   python3 labeler.py --no-db-model          # 不读库，强制用 .env 的模型链
+  python3 labeler.py --source douban        # 豆瓣网文 tag 名单选书（默认 rank=book15 榜单，行为不变）
+  python3 labeler.py --source webnovel      # 网文站榜单（起点完本/月票/畅销）为主+豆瓣 tag 补充
 配置: /root/zhaoshu-labeler/.env（LLM_API_KEY 必填；DATABASE_URL 与 LLM_MODEL 可选）
       数据目录默认 = 脚本同目录（.env / labels.jsonl / labels-rejected.jsonl）；
       只有显式设置 LABELER_DATA_DIR 时才改指向该目录——给本地 dry-run 用副本数据复现，
@@ -728,6 +730,10 @@ def main() -> int:
     ap.add_argument('--book', help='指定单本详情页路径，如 /books/details3168.html')
     ap.add_argument('--no-db-model', action='store_true',
                     help='不读数据库 app_settings.label_model，直接用 .env 的模型链')
+    ap.add_argument('--source', choices=('rank', 'douban', 'webnovel'), default='rank',
+                    help='选书来源：rank=book15 榜单页（默认，行为不变）；'
+                         'douban=豆瓣网文 tag 名单经 book15 站内搜索映射；'
+                         'webnovel=网文站榜单（起点完本/月票/畅销）为主+豆瓣 tag 补充')
     args = ap.parse_args()
 
     env = load_env()
@@ -746,9 +752,20 @@ def main() -> int:
     if args.book:
         queue = [{'url': args.book, 'title': args.book}]
     else:
-        print('拉取榜单书目...')
-        all_books = fetch_rank_books()
-        print(f'榜单共 {len(all_books)} 本（去重后）')
+        if args.source in ('douban', 'webnovel'):
+            # 名单选书：豆瓣网文 tag / 网文站榜单 → book15 站内搜索（含误匹配校验）。
+            # 产出与 fetch_rank_books() 同构，后续打标循环零改动复用。
+            import douban_list
+            print('拉取名单并搜索 book15...')
+            # 桥接：名单源（豆瓣/起点）传完整 URL，book15 搜索侧传站内相对路径。
+            bridged = lambda path: http_get(path if path.startswith('http') else BASE + path)
+            all_books = (douban_list.build_douban_queue(bridged) if args.source == 'douban'
+                         else douban_list.build_webnovel_queue(bridged))
+            print(f'{args.source} 线共 {len(all_books)} 本（搜索命中后）')
+        else:
+            print('拉取榜单书目...')
+            all_books = fetch_rank_books()
+            print(f'榜单共 {len(all_books)} 本（去重后）')
         candidates = all_books[:args.limit]
         queue, skipped_done, skipped_pinned = split_queue(candidates, done_urls, pinned)
         # X = 本轮跳过总数（已完成 + 钉子户终态，互斥不重叠），Y = 其中因钉子户终态跳过的。
@@ -841,6 +858,10 @@ def main() -> int:
                 'category': b.get('category', ''),
                 'status': b.get('status', ''),
                 'source': 'book15.net',
+                # 名单线选出的书记录来源标记，便于与榜单线的产出区分；
+                # 正文仍抓自 book15，source 语义不变。
+                'selected_by': (args.source if args.source != 'rank' else 'book15-rank')
+                               if not args.book else 'book15-rank',
                 'url': BASE + b['url'],
                 'chars': chars,
                 'labels': labels,
