@@ -112,6 +112,22 @@ describe('32.1 真实权限入口与可信用户绑定（数据库状态为夹�
     await events(await find.POST(request('find', 'POST', { step: 'rerank', query: '找书', ticket, userId: 3 })));
     expect(mocks.persistRecommendationsForUser).toHaveBeenCalledWith(2, '找书', expect.any(Array), expect.any(Function));
   });
+  // P1-1：账号模式下 secret 不可用时，成员会话（请求期不复核 secret）仍必须 fail-closed——
+  // 路由不得回退 APP_OWNER_TOKEN 签名。这里刻意用 owner 口令当 key 伪造一张**签名有效**的票，
+  // 修复后必须仍被 503 挡下（不放行回退 key 签出的任何票）。
+  it('账号模式缺 secret 时成员 rerank 返回 503，不回退 owner 口令', async () => {
+    vi.stubEnv('AUTH_SECURITY_SECRET', '');
+    vi.stubEnv('AUTH_ACCOUNTS_ENABLED', 'true');
+    const ownerSigned = issueVerifyTicket(process.env.APP_OWNER_TOKEN!, {
+      userId: 2, query: '找书', conditions: '',
+      verified: [{ ...candidate, douban: { found: false, status: 'not_found' } }] as unknown as VerifiedCandidate[],
+    });
+    const response = await find.POST(request('find', 'POST', { step: 'rerank', query: '找书', ticket: ownerSigned }));
+    expect(response.status).toBe(503);
+    expect(await response.text()).toContain('VERIFY_TICKET_UNAVAILABLE');
+    expect(mocks.persistRecommendationsForUser).not.toHaveBeenCalled();
+    expect(mocks.chat).not.toHaveBeenCalled();
+  });
   it.each(['logout', 'disable', 'downgrade'])('模型等待时 %s，重新查询原会话后拒绝写回', async (change) => {
     let finish!: (value: { content: string }) => void;
     let started!: () => void;

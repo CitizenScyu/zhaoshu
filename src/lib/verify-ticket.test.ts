@@ -67,14 +67,32 @@ describe('verify-ticket 签名 key 解析', () => {
     expect(ticketSigningKey()).toBe(SECRET);
   });
 
-  it('security secret 缺失时回退 APP_OWNER_TOKEN', () => {
+  it('security secret 缺失且账号模式未启用时回退 APP_OWNER_TOKEN', () => {
     vi.stubEnv('AUTH_SECURITY_SECRET', 'short');
+    vi.stubEnv('AUTH_ACCOUNTS_ENABLED', 'false');
     vi.stubEnv('APP_OWNER_TOKEN', 'owner-token-fallback');
     expect(ticketSigningKey()).toBe('owner-token-fallback');
   });
 
+  // P1-1：账号模式下 secret 缺失必须 fail-closed。已有 member 会话在请求期不复核 secret，
+  // 若回退用 owner 口令签名，成员跑 verify 就能拿到 HMAC(owner 口令, 明文+MAC) 离线撞口令。
+  it('账号模式开启且 secret 不可用时禁止回退（返回 null）', () => {
+    vi.stubEnv('AUTH_SECURITY_SECRET', 'short');
+    vi.stubEnv('AUTH_ACCOUNTS_ENABLED', 'true');
+    vi.stubEnv('APP_OWNER_TOKEN', 'owner-token-fallback');
+    expect(ticketSigningKey()).toBeNull();
+  });
+
+  it('账号模式开启且 secret 缺失（未设置）时同样禁止回退', () => {
+    vi.stubEnv('AUTH_SECURITY_SECRET', '');
+    vi.stubEnv('AUTH_ACCOUNTS_ENABLED', 'true');
+    vi.stubEnv('APP_OWNER_TOKEN', 'owner-token-fallback');
+    expect(ticketSigningKey()).toBeNull();
+  });
+
   it('两者都缺时返回 null（调用方必须拒绝，不得静默放行）', () => {
     vi.stubEnv('AUTH_SECURITY_SECRET', '');
+    vi.stubEnv('AUTH_ACCOUNTS_ENABLED', 'false');
     vi.stubEnv('APP_OWNER_TOKEN', '');
     expect(ticketSigningKey()).toBeNull();
   });
@@ -83,6 +101,7 @@ describe('verify-ticket 签名 key 解析', () => {
     vi.resetModules();
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     vi.stubEnv('AUTH_SECURITY_SECRET', '');
+    vi.stubEnv('AUTH_ACCOUNTS_ENABLED', 'false');
     vi.stubEnv('APP_OWNER_TOKEN', 'owner-token-fallback');
     const fresh = await import('./verify-ticket');
     expect(fresh.ticketSigningKey()).toBe('owner-token-fallback');

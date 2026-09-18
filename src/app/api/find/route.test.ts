@@ -699,6 +699,14 @@ describe('POST /api/find rerank 验证票据', () => {
     expect(mocks.persistRecommendationsForUser).not.toHaveBeenCalled();
   });
 
+  // P2-2：绑定 c 的路由层反例（模块层已有，路由层缺）。
+  it('conditions 与票据不符被拒（绑定 c）', async () => {
+    const res = await POST(request({ step: 'rerank', query: '找书', conditions: '', verified: [verified], ticket: ticketFor({ conditions: '仅本次' }) }));
+    expect(res.status).toBe(403);
+    expect(await res.text()).toContain('VERIFY_TICKET_INVALID');
+    expect(mocks.persistRecommendationsForUser).not.toHaveBeenCalled();
+  });
+
   it('合法票据放行，且落库的豆瓣值只来自票据、忽略 body.verified 的伪造值', async () => {
     const ticketVerified = { ...verified, douban: { status: 'verified', found: true, doubanId: 'TICKET', rating: 7, ratingCount: 7 } };
     const forgedBody = { ...verified, douban: { status: 'verified', found: true, doubanId: 'FORGED', rating: 10, ratingCount: 999999 } };
@@ -721,6 +729,7 @@ describe('POST /api/find rerank 验证票据', () => {
 
   it('无 AUTH_SECURITY_SECRET 的 legacy owner 部署：回退用 owner 口令签名，票据仍不可伪造', async () => {
     vi.stubEnv('AUTH_SECURITY_SECRET', '');
+    vi.stubEnv('AUTH_ACCOUNTS_ENABLED', 'false');
     // 回退 key 生效，票据仍须有效签名才放行（body.verified 依然不被采信）。
     const ticket = ticketFor();
     const events = await consumeSSE(await POST(request({ step: 'rerank', query: '找书', verified: [verified], ticket })));
@@ -728,5 +737,18 @@ describe('POST /api/find rerank 验证票据', () => {
     // 未签名的伪造 verified 仍被拒。
     const res = await POST(request({ step: 'rerank', query: '找书', verified: [verified] }, false));
     expect(res.status).toBe(403);
+  });
+
+  // P1-1：账号模式下 secret 不可用时一律 fail-closed，绝不回退 owner 口令。
+  // owner 头在此模式下走限速/代际标签那条路，缺 secret 会先由认证层拒绝（更早，同样 503）。
+  it('账号模式开启且 secret 不可用时 fail-closed：503，不回退 owner 口令', async () => {
+    vi.stubEnv('AUTH_SECURITY_SECRET', '');
+    vi.stubEnv('AUTH_ACCOUNTS_ENABLED', 'true');
+    // APP_OWNER_TOKEN 仍在（beforeEach stub），但不得被用作签名 key。
+    const res = await POST(request({ step: 'rerank', query: '找书', verified: [verified] }, false));
+    expect(res.status).toBe(503);
+    expect(await res.text()).toMatch(/VERIFY_TICKET_UNAVAILABLE|AUTH_SECURITY_SECRET_REQUIRED/);
+    expect(mocks.persistRecommendationsForUser).not.toHaveBeenCalled();
+    expect(mocks.chatRobust).not.toHaveBeenCalled();
   });
 });

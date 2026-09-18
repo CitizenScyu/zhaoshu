@@ -1,4 +1,5 @@
 import { createHmac, timingSafeEqual } from 'node:crypto';
+import { authAccountsEnabled } from './auth';
 import { getAuthSecuritySecret } from './auth-session';
 import type { VerifiedCandidate } from './types';
 
@@ -33,23 +34,31 @@ export type IssueVerifyTicketInput = {
   now?: number;
 };
 
-let warnedFallbackKey = false;
-
 // 票据签名 key。
 // - 正常：AUTH_SECURITY_SECRET（账号模式）。
-// - 降级：仅当它不可用而 APP_OWNER_TOKEN 存在时，用 owner 口令作 key 并 console.warn 一次。
-//   这是给「仅 owner 口令」的 legacy 部署留的可用路径（该模式下没有成员、不存在共享行被
-//   成员污染的前提；且 owner 口令对成员不可知，票据仍不可伪造）。
-// - 两者都缺：返回 null，调用方**拒绝**（不静默接受 body.verified）。
+// - 账号模式（AUTH_ACCOUNTS_ENABLED=true）下 secret 不可用：**禁止回退**，返回 null，
+//   调用方 503（与登录/注册路径的 fail-closed 一致）。理由：已有 member 会话在
+//   principalFromSessionRecord **不复核** secret（只有 owner 会话才查），若此时拿
+//   APP_OWNER_TOKEN 当 key，成员跑一次 verify 就拿到 HMAC(owner 口令, 明文消息) 的消息+MAC，
+//   可离线猜 owner 口令——把 owner 口令变成对成员可撞的 HMAC key，扩大了攻击面。
+// - 仅当账号模式**未启用**（legacy 仅 owner 口令部署）才允许用 APP_OWNER_TOKEN 回退并告警一次：
+//   该模式没有成员、不存在共享行被成员污染的前提，owner 本就持有口令，回退不新增泄露。
 export function ticketSigningKey(): string | null {
   const secret = getAuthSecuritySecret();
   if (secret) return secret;
+  if (authAccountsEnabled()) return null;
+  return ownerTokenFallbackKey();
+}
+
+let warnedFallbackKey = false;
+
+function ownerTokenFallbackKey(): string | null {
   const ownerToken = process.env.APP_OWNER_TOKEN;
   if (ownerToken) {
     if (!warnedFallbackKey) {
       warnedFallbackKey = true;
       console.warn(
-        'verify-ticket: AUTH_SECURITY_SECRET 不可用，回退用 APP_OWNER_TOKEN 作为票据签名 key（legacy owner 部署）。',
+        'verify-ticket: AUTH_SECURITY_SECRET 不可用且账号模式未启用，回退用 APP_OWNER_TOKEN 作为票据签名 key（legacy owner 部署）。',
       );
     }
     return ownerToken;

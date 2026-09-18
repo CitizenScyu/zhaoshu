@@ -211,7 +211,16 @@ export default function FindTab() {
       const code = (e as Error & { code?: string }).code;
       const base = e instanceof Error ? e.message : '未知错误';
       setError(code ? `${base}（${code}）` : base);
-      setRetryFrom(retryStep(at, { candidates: recalled.length, verified: verified.length }));
+      if (at === 'rerank' && code === 'VERIFY_TICKET_INVALID') {
+        // 票据过期/被拒：同一张废票重试必然再失败，作废它并回到 verify 重新出票。
+        ticketRef.current = '';
+        setRetryFrom('verify');
+      } else if (at === 'rerank' && code === 'VERIFY_TICKET_UNAVAILABLE') {
+        // 服务端缺签名 key：重试同样会失败（配置问题），不给会空转的重试按钮，文案已提示联系维护者。
+        setRetryFrom(null);
+      } else {
+        setRetryFrom(retryStep(at, { candidates: recalled.length, verified: verified.length }));
+      }
       setPhase('error');
     } finally {
       if (request.current === controller) request.current = null;
