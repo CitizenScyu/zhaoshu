@@ -482,6 +482,11 @@ class AutoImporter:
             pass
         self.log(f'  自动导入失败（已记 {FAIL_LOG_NAME}，不阻断打标）: {message}')
 
+    def forget_markers(self):
+        """忽略已导入标记（本次进程内）。用途：库里那本书被人工删掉后需要重导，
+        配合 CLI `--url <地址> --force` 使用；标记文件本身不改写。"""
+        self._imported.clear()
+
     # ---- HTTP SQL（Neon）----
     def _redact(self, message):
         text = str(message)
@@ -616,6 +621,8 @@ def main(argv=None):
     parser.add_argument('--limit', type=int, default=0,
                         help='最多处理最新 N 条（0=不限）')
     parser.add_argument('--url', help='只导入该 url 的记录')
+    parser.add_argument('--force', action='store_true',
+                        help='忽略 labels-imported.jsonl 标记（配合 --url 重导已被人工删除的书）')
     parser.add_argument('--dry-run', action='store_true', help='只校验与统计，不连库')
     args = parser.parse_args(argv)
 
@@ -658,6 +665,8 @@ def main(argv=None):
     importer = AutoImporter(database_url, directory=path.parent)
     if not importer.enabled:
         sys.exit(f'自动导入不可用：{importer.disabled_reason}（--env 或 DATABASE_URL）')
+    if args.force:
+        importer.forget_markers()
     for rec in records:
         status = importer.import_record(rec)
         counts[status] = counts.get(status, 0) + 1

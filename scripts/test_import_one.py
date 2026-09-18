@@ -473,6 +473,15 @@ class TestAutoImporter(TempDirCase):
         self.assertEqual(importer.retry_backlog(self.dir / 'nope.jsonl', limit=5), 0)
         self.assertEqual(importer.retry_backlog(self.dir / 'nope.jsonl', limit=0), 0)
 
+    def test_marker_blocks_reimport_but_force_clears_it(self):
+        db = FakeDb()
+        importer = self.importer(db)
+        self.assertEqual(importer.import_record(record()), 'imported')
+        self.assertEqual(importer.import_record(record()), 'duplicate')
+        importer.forget_markers()                     # CLI --force 的等价动作
+        self.assertEqual(importer.import_record(record()), 'imported')
+        self.assertEqual(len(db.rows), 1)             # 仍然只有一行（UPSERT 兜底）
+
     def test_backlog_default_is_small(self):
         self.assertEqual(import_one.IMPORT_BACKLOG_DEFAULT, 20)
 
