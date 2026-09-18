@@ -457,13 +457,15 @@ export async function getShuyuanPoolHealth(signal: AbortSignal): Promise<Shuyuan
   const raw = await storedMeta(s, signal);
   const [pool, admissionRows] = await Promise.all([
     getReadingPool(signal),
-    readRows<ShuyuanAdmissionFunnel>(s, s`
-      SELECT count(*) FILTER (WHERE compile_ok AND search_ok IS TRUE)::int AS ok,
-             count(*) FILTER (WHERE NOT compile_ok
-               OR search_verdict IN ('challenge', 'conn_fail', 'shell'))::int AS rejected,
-             count(*) FILTER (WHERE compile_ok AND search_ok IS NOT TRUE
-               AND search_verdict NOT IN ('challenge', 'conn_fail', 'shell'))::int AS deferred
-      FROM source_admission`, signal),
+    // 漏斗是纯观测的增量：source_admission 读失败（schema 未就绪/库抖动）不能连坐
+    // readingPoolSize 这条既有核心指标，退化为全 0 并响亮告警（与引擎源的降级同款纪律）。
+    readAdmissionFunnel(s, signal).catch((error) => {
+      signal.throwIfAborted();
+      console.error('shuyuan admission funnel unavailable, reporting zeros', {
+        reason: error instanceof Error ? error.message : String(error),
+      });
+      return [] as ShuyuanAdmissionFunnel[];
+    }),
   ]);
   const refreshedMs = raw.refreshed_at ? Date.parse(raw.refreshed_at) : NaN;
   return {
@@ -476,6 +478,17 @@ export async function getShuyuanPoolHealth(signal: AbortSignal): Promise<Shuyuan
       ? Math.max(0, Math.round((Date.now() - refreshedMs) / 3_600_000 * 10) / 10)
       : null,
   };
+}
+
+/** 准入漏斗聚合（§6.3）：三桶谓词与入池判据 / admissionBucket 同口径。 */
+function readAdmissionFunnel(s: Sql, signal: AbortSignal): Promise<ShuyuanAdmissionFunnel[]> {
+  return readRows<ShuyuanAdmissionFunnel>(s, s`
+    SELECT count(*) FILTER (WHERE compile_ok AND search_ok IS TRUE)::int AS ok,
+           count(*) FILTER (WHERE NOT compile_ok
+             OR search_verdict IN ('challenge', 'conn_fail', 'shell'))::int AS rejected,
+           count(*) FILTER (WHERE compile_ok AND search_ok IS NOT TRUE
+             AND search_verdict NOT IN ('challenge', 'conn_fail', 'shell'))::int AS deferred
+    FROM source_admission`, signal);
 }
 
 export async function getShuyuanStats(signal?: AbortSignal): Promise<ShuyuanStats>;

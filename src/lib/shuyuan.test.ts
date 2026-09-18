@@ -888,6 +888,25 @@ describe('refreshShuyuan atomic refresh', () => {
       expect(funnel.text).toContain('compile_ok AND search_ok IS TRUE');
       expect(funnel.text).toContain("search_verdict IN ('challenge', 'conn_fail', 'shell')");
     });
+
+    it('admission 漏斗读失败降级为全 0，不连坐 readingPoolSize（纯观测增量）', async () => {
+      execute.mockImplementation(async (query) => {
+        const text = query.text;
+        if (text.includes('FROM source_admission')) throw new Error('relation "source_admission" does not exist');
+        if (text.includes('FROM shuyuan_sources')) return [];
+        if (text.includes('FROM shuyuan_meta')) return [{ collections: [], refreshed_at: null }];
+        return [];
+      });
+      const health = await getShuyuanPoolHealth(new AbortController().signal);
+      expect(health).toMatchObject({
+        readingPoolSize: 1, enginePoolSize: 0, poolCandidates: 0,
+        admission: { ok: 0, deferred: 0, rejected: 0 },
+      });
+      expect(console.error).toHaveBeenCalledWith(
+        expect.stringContaining('shuyuan admission funnel unavailable'),
+        expect.objectContaining({ reason: expect.stringContaining('source_admission') }),
+      );
+    });
   });
 
   // 归纳：last_error 的自动写点、连续失败阈值、失败计数的持久化与解析等价。
