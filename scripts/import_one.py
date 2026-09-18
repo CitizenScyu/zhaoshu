@@ -614,7 +614,7 @@ def main(argv=None):
     parser.add_argument('--file', default=str(Path(__file__).parent / 'labels.jsonl'))
     parser.add_argument('--env', help='从这里读 DATABASE_URL（KEY=VALUE，默认用环境变量）')
     parser.add_argument('--limit', type=int, default=0,
-                        help='最多补录多少条（0=不限；新→旧）')
+                        help='最多处理最新 N 条（0=不限）')
     parser.add_argument('--url', help='只导入该 url 的记录')
     parser.add_argument('--dry-run', action='store_true', help='只校验与统计，不连库')
     args = parser.parse_args(argv)
@@ -643,6 +643,9 @@ def main(argv=None):
             print('  [失败] JSON 解析失败，跳过一行')
     if args.url:
         records = [r for r in records if isinstance(r, dict) and r.get('url') == args.url]
+    # limit 取**最新**的 N 条（labels.jsonl 是追加写，越靠后越新）
+    if args.limit > 0:
+        records = records[-args.limit:]
 
     counts = {}
     if args.dry_run:

@@ -15,6 +15,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import import_one  # noqa: E402
@@ -477,21 +478,42 @@ class TestAutoImporter(TempDirCase):
 
 
 class TestCli(unittest.TestCase):
+    def _fixture(self, tmp):
+        path = Path(tmp) / 'labels.jsonl'
+        path.write_text('\n'.join([
+            json.dumps(record(), ensure_ascii=False),
+            json.dumps(labels_record(text_quality='疑似乱码'), ensure_ascii=False),
+            json.dumps(labels_record(site_title_match=False), ensure_ascii=False),
+            '{bad json',
+        ]), encoding='utf-8')
+        return path
+
     def test_dry_run_counts_without_network(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(import_one.main(['--dry-run', '--file', str(self._fixture(tmp))]), 0)
+
+    def test_dry_run_limit_takes_the_newest_records(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._fixture(tmp)
+            # 最后两条：1 条 review + 1 条坏行（坏行在读取阶段就被跳过，不计入）
+            self.assertEqual(import_one.main(
+                ['--dry-run', '--file', str(path), '--limit', '2']), 0)
+
+    def test_url_filter_selects_one_record(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / 'labels.jsonl'
             path.write_text('\n'.join([
-                json.dumps(record(), ensure_ascii=False),
-                json.dumps(labels_record(text_quality='疑似乱码'), ensure_ascii=False),
-                json.dumps(labels_record(site_title_match=False), ensure_ascii=False),
-                '{bad json',
+                json.dumps(record(url='https://book15.net/books/details1.html'),
+                           ensure_ascii=False),
+                json.dumps(record(url='https://book15.net/books/details2.html'),
+                           ensure_ascii=False),
             ]), encoding='utf-8')
-            self.assertEqual(import_one.main(['--dry-run', '--file', str(path)]), 0)
+            self.assertEqual(import_one.main(
+                ['--dry-run', '--file', str(path), '--limit', '1']), 0)
 
     def test_missing_database_url_exits(self):
         with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / 'labels.jsonl'
-            path.write_text(json.dumps(record(), ensure_ascii=False), encoding='utf-8')
+            path = self._fixture(tmp)
             saved = os.environ.pop('DATABASE_URL', None)
             try:
                 with self.assertRaises(SystemExit):
@@ -499,6 +521,23 @@ class TestCli(unittest.TestCase):
             finally:
                 if saved is not None:
                     os.environ['DATABASE_URL'] = saved
+
+    def test_database_failure_does_not_raise_and_logs(self):
+        # 真实 CLI 路径 + 数据库不可达：必须 exit 0（打标侧靠这个不被打断），
+        # 且失败落在 labels-import-fail.log（不联网：urlopen 被替换）。
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._fixture(tmp)
+            os.environ['DATABASE_URL'] = 'postgresql://u:p@db.example/neondb'
+            try:
+                with mock.patch.object(import_one.urllib.request, 'urlopen',
+                                       side_effect=OSError('connection refused')):
+                    self.assertEqual(import_one.main(
+                        ['--file', str(path), '--url', BASE['url']]), 0)
+            finally:
+                os.environ.pop('DATABASE_URL', None)
+            log_text = (Path(tmp) / import_one.FAIL_LOG_NAME).read_text(encoding='utf-8')
+            self.assertIn('connection refused', log_text)
+            self.assertNotIn('db.example', log_text)
 
 
 if __name__ == '__main__':
