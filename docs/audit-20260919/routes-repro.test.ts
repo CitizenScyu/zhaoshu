@@ -4,7 +4,7 @@ import { NextRequest } from 'next/server';
 const mocks = vi.hoisted(() => ({
   sql: vi.fn(), model: vi.fn(), persist: vi.fn(), verify: vi.fn(), disable: vi.fn(),
   profile: vi.fn(), saveProfile: vi.fn(), recordFeedback: vi.fn(), snapshot: vi.fn(), dispatch: vi.fn(),
-  feedback: vi.fn(),
+  feedback: vi.fn(), withdrawn: vi.fn(),
 }));
 const principal = { userId: 7, role: 'member', canFind: true, canRead: true, canDownload: true, authMethod: 'session' };
 vi.mock('@/lib/auth', () => ({
@@ -15,7 +15,7 @@ vi.mock('@/lib/db', async original => ({
   ...await original<typeof import('@/lib/db')>(),
   ensureSchema: async () => {}, getSql: () => mocks.sql,
   getProfileForUser: mocks.profile, saveProfileForUser: mocks.saveProfile,
-  getProfileFeedbackForUser: mocks.feedback,
+  getProfileFeedbackForUser: mocks.feedback, getWithdrawnFeedbackBookTitlesForUser: mocks.withdrawn,
   getExcludedBookTitlesForUser: async () => [], persistRecommendationsForUser: mocks.persist,
   recordFeedbackForUser: mocks.recordFeedback, getFeedbackSnapshotForUser: mocks.snapshot,
 }));
@@ -49,6 +49,7 @@ beforeEach(() => {
   mocks.profile.mockResolvedValue({ seeds: [{ title: '合成种子', kind: 'love' }], content: '反馈独有偏好：讨厌机械降神', updatedAt: 'v1' });
   mocks.snapshot.mockResolvedValue({ version: 0, note: '', status: null });
   mocks.feedback.mockResolvedValue([]);
+  mocks.withdrawn.mockResolvedValue([]);
   mocks.saveProfile.mockResolvedValue('v2');
   mocks.persist.mockResolvedValue(undefined);
 });

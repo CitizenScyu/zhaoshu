@@ -5,7 +5,7 @@ import type { ProfileSnapshot, SeedBook } from '@/lib/types';
 const mocks = vi.hoisted(() => ({
   ensureSchema: vi.fn(), getProfileForUser: vi.fn(), saveProfileForUser: vi.fn(), chatRobust: vi.fn(),
   getSql: vi.fn(), sql: vi.fn(), transaction: vi.fn(), getFeedbackSnapshotForUser: vi.fn(),
-  getProfileFeedbackForUser: vi.fn(),
+  getProfileFeedbackForUser: vi.fn(), getWithdrawnFeedbackBookTitlesForUser: vi.fn(),
 }));
 vi.mock('@/lib/db', () => ({
   recordFeedbackForUser: async (userId: number, book: { title: string; author: string }, status: string, note: string, expectedVersion: number) => {
@@ -18,6 +18,7 @@ vi.mock('@/lib/db', () => ({
   ensureSchema: mocks.ensureSchema, getProfileForUser: mocks.getProfileForUser, saveProfileForUser: mocks.saveProfileForUser,
   getSql: mocks.getSql, getFeedbackSnapshotForUser: mocks.getFeedbackSnapshotForUser,
   getProfileFeedbackForUser: mocks.getProfileFeedbackForUser,
+  getWithdrawnFeedbackBookTitlesForUser: mocks.getWithdrawnFeedbackBookTitlesForUser,
 }));
 vi.mock('@/lib/llm', async (importOriginal) => ({
   ...await importOriginal<typeof import('@/lib/llm')>(),
@@ -68,6 +69,7 @@ describe('/api/profile writes', () => {
     mocks.transaction.mockResolvedValue([]);
     mocks.getFeedbackSnapshotForUser.mockResolvedValue({ version: 0, status: null, note: '' });
     mocks.getProfileFeedbackForUser.mockResolvedValue([]);
+    mocks.getWithdrawnFeedbackBookTitlesForUser.mockResolvedValue([]);
   });
   afterEach(() => { vi.unstubAllEnvs(); vi.restoreAllMocks(); });
 
@@ -332,20 +334,52 @@ describe('/api/profile writes', () => {
     expect(input).not.toContain('讨厌机械降神'); // 旧行为：只按种子重写，会覆盖反馈积累
     expect(input).toContain('测试书');
     expect(mocks.getProfileFeedbackForUser).not.toHaveBeenCalled(); // reset 模式不读反馈
+    expect(mocks.getWithdrawnFeedbackBookTitlesForUser).not.toHaveBeenCalled(); // 也不读撤回清单
     expect(lastEvent(events, 'done')).toMatchObject({ resetFromSeeds: true, feedbackCount: 0 });
   });
 
-  it('does not resurrect a withdrawn preference: only the latest effective feedback the database returns is fed in', async () => {
-    // 撤回/更改后，DB 侧查询只会返回该书的「最新一行且仍具信息量」的状态；旧的那条
-    // done+note（讨厌机械降神）不在返回里，路由不得把它补回来。
-    mocks.getProfileForUser.mockResolvedValue({ seeds, content: '', updatedAt: previousVersion });
-    mocks.getProfileFeedbackForUser.mockResolvedValue([
-      { title: '反馈书', author: '作者', status: 'reading', note: '停更，先观望' },
-    ]);
+  it('tells the model which books\' feedback was withdrawn so old-profile preferences are removed', async () => {
+    // 反例（P1-1）：书的历史 done+note（讨厌机械降神）已写进旧画像，最新一行改口（撤回）。
+    // 反馈 JSON 为空，但光靠空数组模型无从知道"这句已被撤回"——必须显式喂撤回信号。
+    mocks.getProfileForUser.mockResolvedValue({ seeds, content: '反馈独有偏好：讨厌机械降神', updatedAt: previousVersion });
+    mocks.getProfileFeedbackForUser.mockResolvedValue([]);
+    mocks.getWithdrawnFeedbackBookTitlesForUser.mockResolvedValue(['撤回书']);
     await consumeSSE(await POST(request()));
     const input = mocks.chatRobust.mock.calls[0][1] as string;
-    expect(input).toContain('停更，先观望');
-    expect(input).not.toContain('讨厌机械降神');
+    expect(input).toContain('撤回书'); // 撤回书名进了输入
+    expect(input).toMatch(/已被撤回/); // 并带有明确的撤回语义指令
+    expect(mocks.getWithdrawnFeedbackBookTitlesForUser).toHaveBeenCalledWith(1); // 只读本人（owner）
+  });
+
+  it('omits the withdrawn section entirely when nothing was withdrawn', async () => {
+    mocks.getProfileFeedbackForUser.mockResolvedValue([
+      { title: '反馈书', author: '作者', status: 'dropped', note: '讨厌机械降神' },
+    ]);
+    mocks.getWithdrawnFeedbackBookTitlesForUser.mockResolvedValue([]);
+    await consumeSSE(await POST(request()));
+    const input = mocks.chatRobust.mock.calls[0][1] as string;
+    expect(input).toContain('反馈书');
+    expect(input).not.toMatch(/已被撤回/); // 空撤回清单不出现该段（保持输入形状）
+    expect(input).not.toContain('撤回'); // 连标题行也不出现
+  });
+
+  it('never back-feeds a withdrawn book\'s old note as evidence, only the withdrawal marker', async () => {
+    mocks.getProfileForUser.mockResolvedValue({ seeds, content: '', updatedAt: previousVersion });
+    mocks.getProfileFeedbackForUser.mockResolvedValue([]);
+    mocks.getWithdrawnFeedbackBookTitlesForUser.mockResolvedValue(['撤回书']);
+    await consumeSSE(await POST(request()));
+    const input = mocks.chatRobust.mock.calls[0][1] as string;
+    expect(input).not.toContain('讨厌机械降神'); // 旧 note 原文不回喂
+    expect(input).toContain('撤回书');
+  });
+
+  it('treats an explicit resetFromSeeds:false as the merge path and spies the rebuild system prompt', async () => {
+    mocks.getWithdrawnFeedbackBookTitlesForUser.mockResolvedValue(['撤回书']);
+    await consumeSSE(await POST(request('POST', { updatedAt: previousVersion, resetFromSeeds: false })));
+    const [system, input] = mocks.chatRobust.mock.calls[0] as [string, string];
+    expect(system).toContain('在既有积累之上'); // 合并路径的 system
+    expect(input).toContain('撤回书');
+    expect(mocks.getProfileFeedbackForUser).toHaveBeenCalledWith(1);
   });
 
   it.each([0, 1, 'true', null])('rejects a non-boolean resetFromSeeds before any database access %#', async (value) => {
