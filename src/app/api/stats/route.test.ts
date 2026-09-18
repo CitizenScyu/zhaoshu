@@ -6,7 +6,12 @@ const { ensureSchema, getSql, sql, getLlmUsageStats, session, pool } = vi.hoiste
   ensureSchema: vi.fn(), getSql: vi.fn(), sql: vi.fn(), getLlmUsageStats: vi.fn(), session: vi.fn(),
   // B3：池健康度（getShuyuanPoolHealth → getReadingSources）不触 SQL mock 之外的路径，
   // 直接替换为固定值；测试需要控制 readingPoolSize/refreshedAtAgeHours 时再覆写。
-  pool: { readingPoolSize: 1, refreshedAtAgeHours: 72.5 },
+  // M2-3 §6.3：观测面扩面，pool 一并带 enginePoolSize / poolCandidates / admission 漏斗。
+  pool: {
+    readingPoolSize: 1, refreshedAtAgeHours: 72.5,
+    enginePoolSize: 0, poolCandidates: 0,
+    admission: { ok: 3, deferred: 4, rejected: 2 },
+  },
 }));
 vi.mock('@/lib/db', () => ({ ensureSchema, getSql, getLlmUsageStats }));
 vi.mock('@/lib/auth-session', async (original) => ({ ...await original<typeof import('@/lib/auth-session')>(), findSessionByToken: session }));
@@ -196,6 +201,10 @@ describe('GET /api/stats', () => {
     pool.readingPoolSize = 0; pool.refreshedAtAgeHours = 74.2;
     const data = await (await GET(request())).json();
     expect(data.shuyuan).toMatchObject({ enabled: 8, readingPoolSize: 0, refreshedAtAgeHours: 74.2 });
+    // M2-3 §6.3：放量观测三字段随池健康度一并暴露（数字来自池的真实判定，非复刻）。
+    expect(data.shuyuan).toMatchObject({
+      enginePoolSize: 0, poolCandidates: 0, admission: { ok: 3, deferred: 4, rejected: 2 },
+    });
     // 池查询失败不连坐计数段：pool 拒绝时 counts 仍在，shuyuan 段整体降级。
     const { getShuyuanPoolHealth } = await import('@/lib/shuyuan');
     (getShuyuanPoolHealth as ReturnType<typeof vi.fn>).mockRejectedValueOnce(new Error('pool down'));

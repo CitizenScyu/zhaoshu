@@ -59,9 +59,24 @@ export type ShuyuanCounts = {
 // B3（audit-1 P0-2）：源池可观测。readingPoolSize = getReadingSources 实际取书池大小
 // （不是「启用数」——995 enabled / 0 可达的假象正是这次审计要暴露的）；
 // refreshedAtAgeHours = 刷新停更了多久，null 表示从未成功刷新。
+// M2-3 §6.3 扩面：enginePoolSize / poolCandidates / admission 三项放量观测。
+export type ShuyuanAdmissionFunnel = {
+  /** compile_ok ∧ search_ok IS TRUE —— 与引擎源入池判据同一口径。 */
+  ok: number;
+  /** 可复测（未测/限流/5xx/4xx/url_invalid/no_result）。 */
+  deferred: number;
+  /** 站点行为终态（compile 拒、challenge、conn_fail、shell）。 */
+  rejected: number;
+};
 export type ShuyuanPoolHealth = {
   readingPoolSize: number;
   refreshedAtAgeHours: number | null;
+  /** 池内非 builtin（引擎）源数：区分「池里有 5 个源」与「只有 book15」（§6.3）。 */
+  enginePoolSize: number;
+  /** 满足入池条件但被池上限截断的源数：>0 = 还有放量空间（W2/W3 放行判据，§2.3）。 */
+  poolCandidates: number;
+  /** 准入漏斗现状（§4.3）：池小的原因可能是没有合格源，也可能是准入批次没跑够。 */
+  admission: ShuyuanAdmissionFunnel;
 };
 export type ShuyuanSourceStatus = {
   url: string; name: string; disabled: boolean; availability: ShuyuanAvailability;
@@ -132,34 +147,71 @@ export function readingPoolLimit(): number {
 }
 
 /**
- * 取书源池：注册表合成视图（设计 §5.2/§5.3）。builtin 恒在前（book15 零回归红线）。
- * 引擎源（admission ok ∧ 非 disabled ∧ probe 非 failed，按 probe reachable 优先排序）**受
- * kill switch 约束**：READING_ENGINE_SOURCES 默认关 ⇒ 池 = builtin only，与今天逐字节相同。
+ * 取书源池的完整形状（M2-3 §2.3/§6.3）：除排序后的池条目外，带两个放量观测数。
+ * `poolCandidates` = 满足入池条件但被 `readingPoolLimit` 截断的源数（>0 说明还有放量空间）。
  */
-export async function getReadingSources(signal: AbortSignal): Promise<ReadingSource[]> {
+export interface ReadingPool {
+  sources: ReadingSource[];
+  enginePoolSize: number;
+  poolCandidates: number;
+}
+
+/**
+ * 取书源池：注册表合成视图（设计 §5.2/§5.3）。builtin 恒在前（book15 零回归红线）。
+ * 引擎源（admission ok ∧ 非 disabled ∧ probe 非 failed，按 §2.4 全序排序）**受
+ * kill switch 约束**：READING_ENGINE_SOURCES 默认关 ⇒ 池 = builtin only，与今天逐字节相同。
+ *
+ * §2.4 全序（先表内各自排好，再按「builtin 恒在引擎源之前」拼接——builtin 是优先级最高的
+ * 首键，故拼接即等价于对合并集按全序排序）：
+ *   (tier='builtin') DESC → (probe reachable) DESC → tier 升序 → search_checked_at DESC → url 升序。
+ */
+export async function getReadingPool(signal: AbortSignal): Promise<ReadingPool> {
   const s = getSql();
   const limit = readingPoolLimit();
   const { states } = readMeta((await storedMeta(s, signal)).collections);
-  const builtin = await builtinReadingSources(s, states, signal, limit);
+  const builtin = await builtinReadingSources(s, states, signal);
   // 开关默认关：连准入表都不查（省一次 DB 往返，也彻底不暴露引擎源的失败面）。
-  if (!engineSourcesEnabled()) return builtin;
-  // 引擎源是**增量**：读该表出错（如 schema 未就绪/库抖动）绝不能杀死 builtin 取书路径
-  // （零回归红线）。失败按空集处理，book15 单源行为与今日逐点相同。
-  let engine: ReadingSource[] = [];
+  const engine = engineSourcesEnabled() ? await engineSourcesIncremental(s, states, signal) : [];
+  const eligible = [...builtin, ...engine];
+  // builtin 全部排在引擎源之前（§2.4 首键），故 slice 上限作用在合并序列上即等价于
+  // 「先取满 builtin、再按引擎源全序补位」——builtin 永远不会被引擎源挤出池。
+  const sources = eligible.slice(0, limit);
+  return {
+    sources,
+    enginePoolSize: sources.filter((source) => source.tier !== undefined && source.tier !== 'builtin').length,
+    poolCandidates: Math.max(0, eligible.length - sources.length),
+  };
+}
+
+/**
+ * 取书源列表（既有签名，`getReadingPool().sources`）。保留此入口以零回归既有调用方
+ * （read/source 路径与既有测试只关心条目，不关心放量观测）。
+ */
+export async function getReadingSources(signal: AbortSignal): Promise<ReadingSource[]> {
+  return (await getReadingPool(signal)).sources;
+}
+
+/**
+ * 引擎源是**增量**：读该表出错（如 schema 未就绪/库抖动）绝不能杀死 builtin 取书路径
+ * （零回归红线）。失败按空集处理，book15 单源行为与今日逐点相同。
+ */
+async function engineSourcesIncremental(
+  s: Sql, states: Map<string, ProbeState>, signal: AbortSignal,
+): Promise<ReadingSource[]> {
   try {
-    engine = await engineReadingSources(s, states, signal);
+    return await engineReadingSources(s, states, signal);
   } catch (error) {
     signal.throwIfAborted();
     console.error('shuyuan engine sources unavailable, falling back to builtin only', {
       reason: error instanceof Error ? error.message : String(error),
     });
+    return [];
   }
-  return [...builtin, ...engine].slice(0, limit);
 }
 
 /** 内建（builtin）档条目：改查注册表内建 URL 前缀，不再硬编码 ILIKE 字面量。 */
 async function builtinReadingSources(
-  s: Sql, states: Map<string, ProbeState>, signal: AbortSignal, limit: number,
+  s: Sql, states: Map<string, ProbeState>, signal: AbortSignal,
 ): Promise<ReadingSource[]> {
   const patterns = builtinUrlPrefixes().map((prefix) => `${prefix}%`);
   const rows = await readRows<StoredSource & { name: string }>(s, s`
@@ -177,24 +229,42 @@ async function builtinReadingSources(
     return [{ url: fallback.url, name: fallback.name, searchUrl: fallback.searchUrl, rules: {}, tier: 'builtin' }];
   }
   return supported.filter((row) => !row.disabled_at && isRecord(row.source) && row.source.enabled !== false && states.get(row.source_url)?.status !== 'failed')
-    .sort((a, b) => Number(states.get(b.source_url)?.status === 'reachable') - Number(states.get(a.source_url)?.status === 'reachable'))
-    .slice(0, limit)
+    .sort((a, b) => probeRank(states, b.source_url) - probeRank(states, a.source_url)
+      || a.source_url.localeCompare(b.source_url))
     .map((row) => ({
       url: validateSourceUrl(row.source_url).href, name: row.name.slice(0, 200) || fallback.name,
       searchUrl: row.source.searchUrl ?? fallback.searchUrl, rules: row.source, tier: 'builtin' as const,
     }));
 }
 
+/** probe 优先序：可达 = 2、其余 = 1（可达优先，§2.4）。 */
+function probeRank(states: Map<string, ProbeState>, url: string): number {
+  return states.get(url)?.status === 'reachable' ? 2 : 1;
+}
+
+/** tier 升序权重（§2.4：builtin < M1 < T7）；builtin 不出现在引擎源里。 */
+function tierRank(tier: string): number {
+  return tier === 'T7' ? 2 : 1;
+}
+
+/** 新鲜结论优先（§2.4）：无结论时刻（未测）排最后。 */
+function checkedAtMs(value: string | null): number {
+  const ms = value ? Date.parse(value) : NaN;
+  return Number.isFinite(ms) ? ms : Number.NEGATIVE_INFINITY;
+}
+
 /**
  * 引擎档条目（设计 §5.2）：shuyuan_sources JOIN source_admission，admission ok（compile_ok ∧
  * search_ok IS TRUE）∧ 非 disabled ∧ probe 非 failed；rules 原样透传 source 对象（m2-scaleout
  * §5.2 第 1 条：任何裁剪都会让 revision 漂移、目录缓存全体失效）。
+ * 排序即 §2.4 全序的引擎段：(probe reachable) DESC → tier 升序 → search_checked_at DESC → url 升序。
  */
 async function engineReadingSources(
   s: Sql, states: Map<string, ProbeState>, signal: AbortSignal,
 ): Promise<ReadingSource[]> {
-  const rows = await readRows<StoredSource & { name: string; tier: string }>(s, s`
-    SELECT src.source_url, src.name, src.source, src.disabled_at::text AS disabled_at, src.last_error, a.tier
+  const rows = await readRows<StoredSource & { name: string; tier: string; search_checked_at: string | null }>(s, s`
+    SELECT src.source_url, src.name, src.source, src.disabled_at::text AS disabled_at, src.last_error,
+           a.tier, a.search_checked_at::text AS search_checked_at
     FROM shuyuan_sources src
     JOIN source_admission a ON a.source_url = src.source_url
     WHERE a.compile_ok AND a.search_ok IS TRUE
@@ -202,7 +272,9 @@ async function engineReadingSources(
   return rows
     .filter((row) => canProbe(row.source_url) && !row.disabled_at && isRecord(row.source)
       && row.source.enabled !== false && states.get(row.source_url)?.status !== 'failed')
-    .sort((a, b) => Number(states.get(b.source_url)?.status === 'reachable') - Number(states.get(a.source_url)?.status === 'reachable')
+    .sort((a, b) => probeRank(states, b.source_url) - probeRank(states, a.source_url)
+      || tierRank(a.tier) - tierRank(b.tier)
+      || checkedAtMs(b.search_checked_at) - checkedAtMs(a.search_checked_at)
       || a.source_url.localeCompare(b.source_url))
     .map((row) => ({
       url: validateSourceUrl(row.source_url).href,
@@ -378,13 +450,28 @@ export async function getShuyuanCounts(signal?: AbortSignal): Promise<ShuyuanCou
 // B3：给 /api/stats 的 shuyuan 段补源池健康度。池大小直接走 getReadingSources 的
 // 真实判定（含 canProbe/禁用/failed 剔除），不在这里复刻筛选逻辑——两处逻辑一旦
 // 漂移，监控数字就不再代表实际取书能力。
+// M2-3 §6.3：同一次调用带出 enginePoolSize / poolCandidates（同一份真实判定）与
+// admission 漏斗（source_admission 三态聚合，与入池判据同口径）。
 export async function getShuyuanPoolHealth(signal: AbortSignal): Promise<ShuyuanPoolHealth> {
   const s = getSql();
   const raw = await storedMeta(s, signal);
-  const pool = await getReadingSources(signal);
+  const [pool, admissionRows] = await Promise.all([
+    getReadingPool(signal),
+    readRows<ShuyuanAdmissionFunnel>(s, s`
+      SELECT count(*) FILTER (WHERE compile_ok AND search_ok IS TRUE)::int AS ok,
+             count(*) FILTER (WHERE NOT compile_ok
+               OR search_verdict IN ('challenge', 'conn_fail', 'shell'))::int AS rejected,
+             count(*) FILTER (WHERE compile_ok AND search_ok IS NOT TRUE
+               AND search_verdict NOT IN ('challenge', 'conn_fail', 'shell'))::int AS deferred
+      FROM source_admission`, signal),
+  ]);
   const refreshedMs = raw.refreshed_at ? Date.parse(raw.refreshed_at) : NaN;
   return {
-    readingPoolSize: pool.length,
+    readingPoolSize: pool.sources.length,
+    enginePoolSize: pool.enginePoolSize,
+    poolCandidates: pool.poolCandidates,
+    // 空表与无行都返回 0（count FILTER 恒返回一行；缺失时保守取 0）。
+    admission: admissionRows[0] ?? { ok: 0, deferred: 0, rejected: 0 },
     refreshedAtAgeHours: Number.isFinite(refreshedMs)
       ? Math.max(0, Math.round((Date.now() - refreshedMs) / 3_600_000 * 10) / 10)
       : null,

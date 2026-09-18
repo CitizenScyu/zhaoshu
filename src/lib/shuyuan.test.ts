@@ -29,9 +29,12 @@ const { ensureSchema, getSql, sql, execute, transaction, readTransaction } = vi.
 vi.mock('@/lib/db', () => ({ ensureSchema, getSql }));
 
 import {
-  disableShuyuanSource, enableShuyuanSource, getEngineSources, getShuyuanCounts, getShuyuanPoolHealth,
-  getShuyuanStats, getReadingSources, refreshShuyuan, REFRESH_BUDGET_MS, RESPONSE_TIMEOUT_MS,
+  disableShuyuanSource, enableShuyuanSource, getEngineSources, getReadingPool, getShuyuanCounts,
+  getShuyuanPoolHealth, getShuyuanStats, getReadingSources, refreshShuyuan,
+  REFRESH_BUDGET_MS, RESPONSE_TIMEOUT_MS,
 } from './shuyuan';
+import { sourceRevision } from './source-revision';
+import { rulesHash } from './rule-engine/admission';
 import { refreshSupportedHosts } from './source-policy';
 import { SOURCE_PAGE_SIZE, pageCount } from './shuyuan-view';
 import { POST } from '@/app/api/shuyuan/route';
@@ -745,6 +748,145 @@ describe('refreshShuyuan atomic refresh', () => {
       const health = await getShuyuanPoolHealth(new AbortController().signal);
       expect(health.readingPoolSize).toBe(1);
       expect(health.refreshedAtAgeHours).toBeGreaterThanOrEqual(0);
+    });
+
+    // ---------------------------------------------------------------- M2-3 §2.4 排序全序 / §2.3 池上限 / §6.3 观测
+    const engineItemAt = (host: string) => ({
+      bookSourceUrl: `https://${host}/`, bookSourceName: host,
+      searchUrl: `https://${host}/s?q={{key}}`,
+      ruleSearch: { bookList: '.i', name: '.t@text', bookUrl: 'a@href' },
+      ruleContent: { content: '.c' }, enabled: true,
+    });
+    const engineRowAt = (host: string, over: Record<string, unknown> = {}) => ({
+      source_url: `https://${host}`, source: engineItemAt(host), name: host,
+      disabled_at: null, last_error: '', tier: 'M1', search_checked_at: null, ...over,
+    });
+    const reachableMeta = (url: string) => ({
+      collections: [{ id: 1, title: '合集', count: 1, probeSnapshot: { version: 1, entries: [
+        { url, status: 'reachable', checked_at: '2026-09-18T00:00:00Z' },
+      ] } }],
+    });
+
+    it('排序全序：probe reachable DESC → tier 升序 → search_checked_at DESC → url 升序', async () => {
+      vi.stubEnv('READING_ENGINE_SOURCES', '1');
+      vi.stubEnv('READING_POOL_LIMIT', '10');
+      refreshSupportedHosts(['a.example', 'b.example', 'c.example', 'd.example', 't7.example']);
+      execute.mockResolvedValueOnce([reachableMeta('https://b.example')]).mockResolvedValueOnce([])
+        .mockResolvedValueOnce([
+          engineRowAt('a.example', { search_checked_at: '2026-09-01T00:00:00Z' }),
+          engineRowAt('b.example', { search_checked_at: '2026-09-01T00:00:00Z' }), // reachable，应最先
+          engineRowAt('c.example', { search_checked_at: '2026-09-20T00:00:00Z' }),
+          engineRowAt('d.example', { search_checked_at: '2026-09-20T00:00:00Z' }), // 与 c 同刻，url 靠后
+          engineRowAt('t7.example', { tier: 'T7', search_checked_at: '2026-09-30T00:00:00Z' }), // tier 最晚
+        ]);
+      const { sources } = await getReadingPool(new AbortController().signal);
+      expect(sources.map((source) => source.url)).toEqual([
+        'https://book15.net/', // builtin 恒 index 0
+        'https://b.example/',  // 唯一 reachable
+        'https://c.example/',  // M1 新结论优先，同刻 url 升序
+        'https://d.example/',
+        'https://a.example/',  // M1 旧结论
+        'https://t7.example/', // T7 排在全部 M1 之后
+      ]);
+    });
+
+    it('排序对抗用例：builtin probe=failed 时引擎源递补 index 0；builtin 在场时恒 index 0', async () => {
+      vi.stubEnv('READING_ENGINE_SOURCES', '1');
+      refreshSupportedHosts(['engine.example']);
+      const builtinRow = { source_url: 'https://book15.net', source: { bookSourceUrl: 'https://book15.net', searchUrl: 'https://book15.net/s?kw={{key}}', enabled: true }, name: 'book15', disabled_at: null, last_error: '' };
+      // ① builtin probe=failed ⇒ 被剔除，reachable 的引擎源递补到 index 0。
+      const failedMeta = { collections: [{ id: 1, title: '合集', count: 1, probeSnapshot: { version: 1, entries: [
+        { url: 'https://book15.net', status: 'failed', checked_at: '2026-09-18T00:00:00Z' },
+      ] } }] };
+      execute.mockResolvedValueOnce([failedMeta]).mockResolvedValueOnce([builtinRow])
+        .mockResolvedValueOnce([engineRow({ search_checked_at: '2026-09-18T00:00:00Z' })]);
+      const absent = await getReadingSources(new AbortController().signal);
+      expect(absent.map((source) => source.tier)).toEqual(['M1']);
+      expect(absent[0].url).toBe('https://engine.example/');
+      // ② builtin 在场（即使引擎源 reachable）⇒ builtin 恒 index 0，引擎源靠后。
+      execute.mockResolvedValueOnce([reachableMeta('https://engine.example')]).mockResolvedValueOnce([builtinRow])
+        .mockResolvedValueOnce([engineRow({ search_checked_at: '2026-09-18T00:00:00Z' })]);
+      const present = await getReadingSources(new AbortController().signal);
+      expect(present.map((source) => source.tier)).toEqual(['builtin', 'M1']);
+      expect(present[0].url).toBe('https://book15.net/');
+    });
+
+    it('READING_POOL_LIMIT 生效且 poolCandidates 计数正确（§2.3 放行判据）', async () => {
+      vi.stubEnv('READING_ENGINE_SOURCES', '1');
+      refreshSupportedHosts(['a.example', 'b.example', 'c.example', 'd.example']);
+      const engineRows = ['a.example', 'b.example', 'c.example', 'd.example'].map((host) => engineRowAt(host));
+      // 候选 = builtin(1) + 引擎(4) = 5。上限 3 ⇒ 池 3、截断 2、其中引擎 2。
+      vi.stubEnv('READING_POOL_LIMIT', '3');
+      execute.mockResolvedValueOnce([{ collections: [] }]).mockResolvedValueOnce([]).mockResolvedValueOnce(engineRows);
+      await expect(getReadingPool(new AbortController().signal)).resolves.toMatchObject({
+        enginePoolSize: 2, poolCandidates: 2,
+      });
+      // 上限 6 ≥ 候选 5 ⇒ 放量空间为 0（W1：1 builtin + 4 引擎正好填不满 6）。
+      vi.stubEnv('READING_POOL_LIMIT', '6');
+      execute.mockResolvedValueOnce([{ collections: [] }]).mockResolvedValueOnce([]).mockResolvedValueOnce(engineRows);
+      await expect(getReadingPool(new AbortController().signal)).resolves.toMatchObject({
+        enginePoolSize: 4, poolCandidates: 0,
+      });
+    });
+
+    it('合成条目的 rules 与 shuyuan_sources.source 深相等；sourceRevision 与 rules_hash 同源（§5.2）', async () => {
+      vi.stubEnv('READING_ENGINE_SOURCES', '1');
+      refreshSupportedHosts(['engine.example']);
+      execute.mockResolvedValueOnce([{ collections: [] }]).mockResolvedValueOnce([])
+        .mockResolvedValueOnce([engineRow()]);
+      const sources = await getReadingSources(new AbortController().signal);
+      const engine = sources.find((source) => source.tier === 'M1')!;
+      // 硬约束 1：不做字段裁剪/重排/包装——同一对象、深相等、键集完全一致。
+      expect(engine.rules).toBe(engineItem);
+      expect(engine.rules).toEqual(engineItem);
+      expect(Object.keys(engine.rules).sort()).toEqual(Object.keys(engineItem).sort());
+      // 硬约束 2：池里合成的源算出的 revision 与准入 rules_hash 是同一函数、同一值。
+      const pooled = sourceRevision({ url: engine.url, searchUrl: engine.searchUrl, rules: engine.rules });
+      expect(pooled).toBe(rulesHash(engineItem));
+      // 判别力：任何一个键被裁掉都会改变 revision（防裁剪断言不是恒真）。
+      const trimmed = { ...engineItem } as Record<string, unknown>;
+      delete trimmed.ruleContent;
+      expect(sourceRevision({ url: engine.url, searchUrl: engine.searchUrl, rules: trimmed })).not.toBe(pooled);
+    });
+
+    it('disableShuyuanSource 后源即时出池，且刷新照抄禁用标记不打回', async () => {
+      vi.stubEnv('READING_ENGINE_SOURCES', '1');
+      refreshSupportedHosts(['engine.example']);
+      // ① 即时出池：库内该源 disabled_at 非空 ⇒ engineReadingSources 直接剔除。
+      execute.mockResolvedValueOnce([{ collections: [] }]).mockResolvedValueOnce([])
+        .mockResolvedValueOnce([engineRow({ disabled_at: '2026-09-10T00:00:00Z' })]);
+      const disabledPool = await getReadingPool(new AbortController().signal);
+      expect(disabledPool).toMatchObject({ enginePoolSize: 0 });
+      expect(disabledPool.sources).toHaveLength(1); // 只剩 builtin
+      // ② 下一次刷新原样照抄 disabled_at（refreshShuyuan 无重置分支），不打回启用态。
+      setCollection(11, [unknownSource]);
+      seedPrevious([{ source_url: unknownSource.bookSourceUrl, source: unknownSource, last_error: '', disabled_at: '2026-09-10T00:00:00Z' }]);
+      await refreshShuyuan();
+      expect(savedRows()).toEqual([expect.objectContaining({ disabled_at: '2026-09-10T00:00:00Z' })]);
+    });
+
+    it('getShuyuanPoolHealth 带出 enginePoolSize/poolCandidates/admission 漏斗（§6.3）', async () => {
+      vi.stubEnv('READING_ENGINE_SOURCES', '1');
+      vi.stubEnv('READING_POOL_LIMIT', '6');
+      refreshSupportedHosts(['engine.example']);
+      // getShuyuanPoolHealth 内部 Promise.all 并发取池与漏斗，靠 SQL 文本分派而非调用顺序。
+      execute.mockImplementation(async (query) => {
+        const text = query.text;
+        if (text.includes('FROM source_admission')) return [{ ok: 12, deferred: 5, rejected: 3 }];
+        if (text.includes('JOIN source_admission')) return [engineRow()];
+        if (text.includes('FROM shuyuan_sources')) return [];
+        if (text.includes('FROM shuyuan_meta')) return [{ collections: [], refreshed_at: null }];
+        return [];
+      });
+      const health = await getShuyuanPoolHealth(new AbortController().signal);
+      expect(health).toMatchObject({
+        readingPoolSize: 2, enginePoolSize: 1, poolCandidates: 0,
+        admission: { ok: 12, deferred: 5, rejected: 3 },
+      });
+      // 漏斗谓词与入池判据同口径：ok 必须含 compile_ok ∧ search_ok IS TRUE。
+      const funnel = execute.mock.calls.find(([query]) => query.text.includes('FROM source_admission'))![0];
+      expect(funnel.text).toContain('compile_ok AND search_ok IS TRUE');
+      expect(funnel.text).toContain("search_verdict IN ('challenge', 'conn_fail', 'shell')");
     });
   });
 
