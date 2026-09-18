@@ -1,11 +1,37 @@
+import { BUILTIN_SOURCE_HOSTS, type BuiltinSourceHost } from './supported-sources';
+
 // 只允许代码实际支持的书源；该策略不代替 DNS/实际连接地址防护。
 // www 与 apex 是同一站点的两个 host（同内容、故障路径不相关，见 better-source-survey §1.2），
 // fetch 层据此做请求级换 host 兜底；SUPPORTED_SOURCE_HOST 仍是规范化后的主 host。
-export const SUPPORTED_SOURCE_HOSTS = ['book15.net', 'www.book15.net'] as const;
-export type SupportedSourceHost = (typeof SUPPORTED_SOURCE_HOSTS)[number];
+// 静态内建集合迁自 supported-sources.ts 注册表（设计 §5.3）。
+export const SUPPORTED_SOURCE_HOSTS = BUILTIN_SOURCE_HOSTS;
+export type SupportedSourceHost = BuiltinSourceHost;
 export const SUPPORTED_SOURCE_HOST: SupportedSourceHost = 'book15.net';
 
-const supportedHosts = new Set<string>(SUPPORTED_SOURCE_HOSTS);
+// 运行时 host 白名单：常态 = 内建集合；cron 准入批次经 refreshSupportedHosts 并入
+// source_admission ok 态 host（§6.1）。冷启动/加载失败保持内建集合——
+// **绝不放大、也绝不空集**（空集会杀死全部现有阅读）。
+const builtinHosts: ReadonlySet<string> = new Set(BUILTIN_SOURCE_HOSTS);
+let supportedHosts: ReadonlySet<string> = builtinHosts;
+
+/**
+ * 用一批 host 重算运行时集合（设计 §6.1 第 2 条）。语义：
+ * - 始终以内建集合为底（book15 双 host 永不被移除，绝不空集）；
+ * - 只并入**规范 hostname** 形态的条目（无端口/路径/userinfo/方括号），且非裸 IP/私网/环回；
+ * - 传入空/全非法时结果 = 内建集合（收窄，绝不放大）。
+ * 写入口只在 cron 准入批次（shuyuan.ts refreshWithinBudget）；运行时请求无写路径。
+ */
+export function refreshSupportedHosts(hosts: Iterable<string>): void {
+  const next = new Set<string>(builtinHosts);
+  for (const host of hosts) {
+    if (typeof host !== 'string') continue;
+    const normalized = host.trim().toLowerCase();
+    // 只接受规范 hostname：允许字母/数字/连字符/点，至少一个点，首尾非点，且非 IP/私网字面量。
+    if (!/^[a-z0-9-]+(?:\.[a-z0-9-]+)+$/.test(normalized) || isForbiddenHostAddress(normalized)) continue;
+    next.add(normalized);
+  }
+  supportedHosts = next;
+}
 
 // 同站备用 host：输入集合内的 host 时返回另一个，否则 null（无备用可换）。
 export function alternateSourceHost(hostname: string): SupportedSourceHost | null {

@@ -8,8 +8,8 @@
 // - 两把锁共享 source-policy.ts 的 checkSourceUrl（检查项逐条同款，仅 host 白名单来源不同）；
 // - admissionFetch / validateAdmissionUrl **不导出**（任务 4 有导出快照断言）。
 
-import { createHash } from 'node:crypto';
 import { checkSourceUrl, SourcePolicyError } from '@/lib/source-policy';
+import { sourceRevision } from '@/lib/source-revision';
 import { sourceAbortable } from '@/lib/source-fetch';
 import { CORE_FIELDS, iterRulePairs, selectCandidates, type RawSource } from './compile-smoke';
 import { parseFieldRule } from './parse';
@@ -389,13 +389,18 @@ function hostOf(url: string): string {
   try { return new URL(url).hostname; } catch { return ''; }
 }
 
-/** revision(source) 同款 stable-sha1：jsonb 键顺序不算变化，数组顺序算。 */
+/**
+ * source_admission.rules_hash：与目录版本 sourceRevision **同一函数**（M1 任务 4 收口；
+ * m2-scaleout §5.2 第 2 条 / §9 M2-3 验收 5）。入参形状由调用方按 reader 的
+ * `{url, searchUrl, rules}` 组配——rules 传整个源对象，规则一变哈希即变。
+ */
 export function rulesHash(source: unknown): string {
-  const stable = JSON.stringify(source, (_key, item: unknown) =>
-    item && typeof item === 'object' && !Array.isArray(item)
-      ? Object.fromEntries(Object.keys(item as Record<string, unknown>).sort().map((key) => [key, (item as Record<string, unknown>)[key]]))
-      : item);
-  return createHash('sha1').update(stable ?? '').digest('hex');
+  const raw = (source && typeof source === 'object' ? source : {}) as RawSource;
+  return sourceRevision({
+    url: typeof raw.bookSourceUrl === 'string' ? raw.bookSourceUrl : '',
+    searchUrl: raw.searchUrl,
+    rules: source,
+  });
 }
 
 function isRetestDue(row: AdmissionSourceRow, nowMs: number): boolean {

@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
+import { createHash } from 'node:crypto';
 import corpus from './fixtures/admission-174.json';
 import {
   ADMISSION_RETEST_INTERVAL_MS, admissionBucket, compileAdmission, runAdmissionBatch, searchAdmission,
@@ -408,5 +409,32 @@ describe('导出面红线（任务 4 结构断言的前置）', () => {
     expect(moduleExports).not.toContain('admissionFetch');
     expect(moduleExports).not.toContain('validateAdmissionUrl');
     expect(moduleExports).not.toContain('checkSourceUrl');
+  });
+});
+
+// M1 任务 4 硬性要求 0（M1 任务 3 复审 P1-1 收口）：rulesHash 与 reader 的 sourceRevision
+// 必须走同一实现。断言 = 同一 source 经两处取 hash 输出相同，且不再是旧的「整份源键排序 sha1」。
+describe('rulesHash 与 sourceRevision 同源（M1 任务 4 硬性要求 0）', () => {
+  const oldStableHash = (source: unknown): string => {
+    const stable = JSON.stringify(source, (_key, item: unknown) =>
+      item && typeof item === 'object' && !Array.isArray(item)
+        ? Object.fromEntries(Object.keys(item as Record<string, unknown>).sort().map((key) => [key, (item as Record<string, unknown>)[key]]))
+        : item);
+    return createHash('sha1').update(stable ?? '').digest('hex');
+  };
+
+  it('rulesHash({url,searchUrl,rules}) === sourceRevision(source)（同一实现）', async () => {
+    const { sourceRevision } = await import('@/lib/source-revision');
+    const source = syntheticSource('https://same.example.com/');
+    expect(rulesHash(source)).toBe(sourceRevision({
+      url: source.bookSourceUrl as string, searchUrl: source.searchUrl, rules: source,
+    }));
+    // 反证：不再是对整份源键排序序列化的旧实现（旧值会与任一字段顺序无关）。
+    expect(rulesHash(source)).not.toBe(oldStableHash(source));
+  });
+
+  it('规则变化（含 searchUrl）即哈希变化', async () => {
+    const base = syntheticSource('https://changed.example.com/');
+    expect(rulesHash(base)).not.toBe(rulesHash({ ...base, searchUrl: 'https://changed.example.com/other?q={{key}}' }));
   });
 });

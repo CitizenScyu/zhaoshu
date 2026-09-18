@@ -1,6 +1,8 @@
 import { NextRequest } from 'next/server';
+import { createHash } from 'node:crypto';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { SourceCatalog, SourceReaderError, SourceSimilarCandidate } from './source-reader';
+import { sourceRevision } from './source-revision';
 
 type Query = { text: string; values: unknown[] };
 const mocks = vi.hoisted(() => ({ getSql: vi.fn(), ensureSchema: vi.fn(), sources: vi.fn(), fetch: vi.fn<typeof fetch>() }));
@@ -659,5 +661,69 @@ describe('source budget primitives: child scopes and openPool (M2-1)', () => {
     expect(starts).toHaveLength(3);
     expect(starts[1] - starts[0]).toBeGreaterThanOrEqual(300);
     expect(starts[2] - starts[1]).toBeGreaterThanOrEqual(300);
+  });
+});
+
+// M1 任务 4：sourceRevision 抽成共享实现后，builtin 目录版本必须逐字节不变（零回归红线）。
+// 冻结的十六进制值 = 抽取前的实现 sha1(JSON.stringify([url, searchUrl, rules])) 的输出；
+// 改回键排序序列化或改动 version 参与项都会让此用例红。
+describe('builtin 目录版本逐字节冻结（M1 任务 4 零回归）', () => {
+  it('sourceId/sourceRevision/version 与抽取前逐字节相同', async () => {
+    const catalog = await service.resolveSourceBook(book, context());
+    expect(catalog.sourceId).toBe('82ace1838da7f52acaca856ee2a528257903268b');
+    expect(catalog.sourceRevision).toBe('a7be1f84fd76b1a0e25618ee7acf3d92b0e37a16');
+    expect(catalog.version).toBe('3abbe7d9a0116f562e7e61ecdf119363a8876d48');
+  });
+
+  it('reader 的 sourceRevision 就是共享函数 sourceRevision(source)（同一实现）', async () => {
+    const catalog = await service.resolveSourceBook(book, context());
+    expect(catalog.sourceRevision).toBe(sourceRevision(source));
+  });
+
+  it('rules 为空的源仍走 builtin 路径（分派判据不含 rules 内容）', async () => {
+    mocks.sources.mockResolvedValue([{ ...source, rules: {} }]);
+    const catalog = await service.resolveSourceBook(book, context());
+    expect(catalog.sourceRevision).toBe(sourceRevision({ ...source, rules: {} }));
+  });
+});
+
+// M1 任务 4 §7.2：rules 非空且非 builtin 的源走引擎门面；identity 校验留在调用方。
+describe('引擎源分派（M1 任务 4 §7.2）', () => {
+  const engineSource = {
+    url: 'https://book15.net/engine/', name: '引擎源', searchUrl: 'https://book15.net/s?q={{key}}',
+    tier: 'M1' as const,
+    rules: {
+      ruleSearch: { bookList: '.book', name: '.name@text', author: '.author@text', bookUrl: 'a@href' },
+      ruleBookInfo: { name: '.title@text', author: '.writer@text', tocUrl: '.toc@href' },
+      ruleToc: { chapterList: '.chapter', chapterName: 'a@text', chapterUrl: 'a@href' },
+      ruleContent: { content: '.content@text' },
+    },
+  };
+  const searchUrl = 'https://book15.net/s?q=' + encodeURIComponent('测试书');
+  const detailUrl = 'https://book15.net/detail/1.html';
+  const tocUrl = 'https://book15.net/toc/1.html';
+
+  it('engineSearchBook → engineFetchDetail → engineFetchToc 产出目录（version 带 rule-engine-v1 前缀区分）', async () => {
+    mocks.sources.mockResolvedValue([engineSource]);
+    pages.set(searchUrl, { text: '<div class="book"><span class="name">测试书</span><span class="author">作者</span><a href="/detail/1.html">x</a></div>' });
+    pages.set(detailUrl, { text: '<h1 class="title">测试书</h1><span class="writer">作者</span><a class="toc" href="/toc/1.html">目录</a>' });
+    pages.set(tocUrl, { text: '<li class="chapter"><a href="/c/1.html">第一章</a></li><li class="chapter"><a href="/c/2.html">第二章</a></li>' });
+    const catalog = await service.resolveSourceBook(book, context());
+    expect(catalog).toMatchObject({
+      title: '测试书', author: '作者', bookUrl: detailUrl,
+      chapters: [{ url: 'https://book15.net/c/1.html', title: '第一章' }, { url: 'https://book15.net/c/2.html', title: '第二章' }],
+    });
+    // 源归属：sourceId 用引擎源的 url + 详情页 URL（与 builtin 同口径，m2-scaleout §5.1）。
+    const sha1 = (value: unknown) => createHash('sha1').update(JSON.stringify(value)).digest('hex');
+    expect(catalog.sourceId).toBe(sha1([engineSource.url, detailUrl]));
+    expect(catalog.sourceRevision).toBe(sourceRevision(engineSource));
+  });
+
+  it('identity 不符时引擎源不自动取书（校验在调用方，§7.2）', async () => {
+    mocks.sources.mockResolvedValue([engineSource]);
+    pages.set(searchUrl, { text: '<div class="book"><span class="name">别的书</span><span class="author">别人</span><a href="/detail/1.html">x</a></div>' });
+    pages.set(detailUrl, { text: '<h1 class="title">别的书</h1><span class="writer">别人</span><a class="toc" href="/toc/1.html">目录</a>' });
+    pages.set(tocUrl, { text: '<li class="chapter"><a href="/c/1.html">第一章</a></li>' });
+    await expect(service.resolveSourceBook(book, context())).rejects.toMatchObject({ code: 'SOURCE_NOT_FOUND' });
   });
 });

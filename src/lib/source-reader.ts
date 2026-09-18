@@ -3,6 +3,11 @@ import { getSql } from './db';
 import { getReadingSources, type ReadingSource } from './shuyuan';
 import { fetchSourceText, sourceAbortable, SourceHttpError } from './source-fetch';
 import { SourcePolicyError, validateSourceUrl } from './source-policy';
+import { sourceRevision } from './source-revision';
+import {
+  engineFetchDetail, engineFetchToc, engineSearchBook, type EngineSource,
+} from './rule-engine/api';
+import { compileSource } from './rule-engine/compile';
 import {
   knownSourceAuthor, normalizeSourceTitle, parseSourceChapters, parseSourceChapterText,
   parseSourceDetailLinks, parseSourceIdentity, parseSourceSearch, sourceBookMatches,
@@ -167,7 +172,34 @@ export interface SourceCatalog extends SourceBookIdentity {
 }
 
 const hash = (value: unknown) => createHash('sha1').update(JSON.stringify(value)).digest('hex');
-const revision = (source: ReadingSource) => hash([source.url, source.searchUrl, source.rules]);
+// 目录版本口径的唯一实现在 source-revision.ts（与 admission.rules_hash 同源，M1 任务3 复审 P1-1）。
+// 引擎源的 version 用 rule-engine-v1 前缀与 builtin 区分（设计 §7.2）。
+const ENGINE_PARSER_VERSION = 'rule-engine-v1';
+
+/** builtin 档走 source-parser 站点特化路径；引擎档（M1/T7，rules 非空）走 rule-engine 门面。 */
+function isBuiltinReadingSource(source: ReadingSource): boolean {
+  return source.tier === 'builtin' || !source.rules || Object.keys(source.rules).length === 0;
+}
+
+function engineSourceOf(source: ReadingSource): EngineSource {
+  return {
+    url: source.url, name: source.name,
+    searchUrl: typeof source.searchUrl === 'string' ? source.searchUrl : '',
+    compiled: compileSource({ url: source.url, searchUrl: source.searchUrl, rules: source.rules }),
+  };
+}
+
+/** 引擎源目录构造：与 catalogFrom 同构，version 用 ENGINE_PARSER_VERSION 区分（设计 §7.2）。 */
+function engineCatalogFrom(
+  pageUrl: string, source: ReadingSource, identity: SourceBookIdentity, chapters: SourceChapter[],
+): SourceCatalog {
+  const sourceId = hash([source.url, pageUrl]);
+  const revisionValue = sourceRevision(source);
+  return {
+    ...identity, sourceUrl: source.url, sourceName: source.name, sourceRevision: revisionValue, bookUrl: pageUrl,
+    sourceId, version: hash([ENGINE_PARSER_VERSION, sourceId, revisionValue, identity, chapters]), chapters,
+  };
+}
 
 // ---- 只读观测（不改行为）：生产 404 零日志无法定位「空页 / 反爬页 / 解析错」----
 // 只输出 host、URL、字节数、计数、书名等非敏感字段；绝不输出 Cookie/Authorization/整页 HTML。
@@ -222,10 +254,10 @@ function catalogFrom(page: { text: string; url: string }, source: ReadingSource,
   const chapters = parseSourceChapters(page.text, page.url);
   if (!chapters.length) return null;
   const sourceId = hash([source.url, page.url]);
-  const sourceRevision = revision(source);
+  const revisionValue = sourceRevision(source);
   return {
-    ...identity, sourceUrl: source.url, sourceName: source.name, sourceRevision, bookUrl: page.url,
-    sourceId, version: hash([PARSER_VERSION, sourceId, sourceRevision, identity, chapters]), chapters,
+    ...identity, sourceUrl: source.url, sourceName: source.name, sourceRevision: revisionValue, bookUrl: page.url,
+    sourceId, version: hash([PARSER_VERSION, sourceId, revisionValue, identity, chapters]), chapters,
   };
 }
 
@@ -248,10 +280,10 @@ function confirmedCatalogFrom(page: { text: string; url: string }, source: Readi
   const chapters = parseSourceChapters(page.text, page.url);
   if (!chapters.length) return null;
   const sourceId = hash([source.url, page.url]);
-  const sourceRevision = revision(source);
+  const revisionValue = sourceRevision(source);
   return {
-    ...identity, sourceUrl: source.url, sourceName: source.name, sourceRevision, bookUrl: page.url,
-    sourceId, version: hash([PARSER_VERSION, sourceId, sourceRevision, identity, chapters]), chapters,
+    ...identity, sourceUrl: source.url, sourceName: source.name, sourceRevision: revisionValue, bookUrl: page.url,
+    sourceId, version: hash([PARSER_VERSION, sourceId, revisionValue, identity, chapters]), chapters,
   };
 }
 
@@ -279,8 +311,24 @@ export async function resolveSourceBook(
   if (options.bookUrl) {
     const url = validateSourceUrl(options.bookUrl).href;
     if (url === options.excludeBookUrl) throw new SourceReaderError('该书源已失效，请重新搜索。', 'SOURCE_NOT_FOUND', 404);
-    const source = sources[0];
+    // 源归属按 host 反查（m2-scaleout §3.7 的铺路）：池内匹配 bookUrl 的 host，避免用
+    // builtin 的 url 给引擎源的 bookUrl 算 sourceId/revision。匹配不到保持既有 sources[0]
+    // 回退（单源池下等价），M2 收紧为 404。
+    const targetHost = hostOf(url);
+    const source = sources.find((item) => hostOf(item.url) === targetHost) ?? sources[0];
     if (!source) throw new SourceReaderError('书源已停用或规则已更新，请重新选择书源。', 'SOURCE_CHANGED', 409);
+    if (!isBuiltinReadingSource(source)) {
+      // 用户点选即用户决定：跳过书名/作者校验，只保留结构性防御与目录可解析（沿用现有语义）。
+      const engineSource = engineSourceOf(source);
+      const detail = await engineFetchDetail(engineSource, url, context);
+      const toc = detail.title ? await engineFetchToc(engineSource, detail.tocUrl ?? url, context) : { chapters: [] };
+      if (!detail.title || !toc.chapters.length) {
+        throw new SourceReaderError('用户选择的书源无法建立目录，请重试或换一个候选。', 'SOURCE_NOT_FOUND', 404);
+      }
+      return engineCatalogFrom(url, source, {
+        title: detail.title, author: detail.author ?? '', ...(detail.alias ? { alias: detail.alias } : {}),
+      }, toc.chapters);
+    }
     const confirmed = confirmedCatalogFrom(await context.page(url), source);
     if (!confirmed) throw new SourceReaderError('用户选择的书源无法建立目录，请重试或换一个候选。', 'SOURCE_NOT_FOUND', 404);
     return confirmed;
@@ -301,6 +349,42 @@ export async function resolveSourceBook(
     const stat: SourceSearchStat = { host: hostOf(source.url), searched: false, candidates: 0, bytes: 0 };
     searchStats.push(stat);
     try {
+      // 引擎档分派（设计 §7.2）：rules 非空且非 builtin ⇒ 走 rule-engine 门面；
+      // 只做「搜索→详情→目录 + 身份校验」，身份校验沿用 sourceBookMatches（留在调用方）。
+      if (!isBuiltinReadingSource(source)) {
+        const engineSource = engineSourceOf(source);
+        const results = await engineSearchBook(engineSource, book.title, context);
+        stat.searched = true;
+        stat.candidates = results.length;
+        for (const result of results.slice(0, MAX_DETAIL_CANDIDATES)) {
+          if (result.bookUrl === options.excludeBookUrl || checked.has(source.url + result.bookUrl)) continue;
+          checked.add(source.url + result.bookUrl);
+          try {
+            const detail = await engineFetchDetail(engineSource, result.bookUrl, context);
+            const identity: SourceBookIdentity = {
+              title: detail.title ?? result.title, author: detail.author ?? result.author,
+              ...(detail.alias ? { alias: detail.alias } : {}),
+            };
+            // 引擎只解释规则，不判断「这是不是那本书」——identity 是业务语义，留在调用方（§7.2）。
+            if (!sourceBookMatches(book, identity)) continue;
+            const toc = await engineFetchToc(engineSource, detail.tocUrl ?? result.bookUrl, context);
+            if (!toc.chapters.length) continue;
+            const catalog = engineCatalogFrom(result.bookUrl, source, identity, toc.chapters);
+            matches.set(catalog.bookUrl, catalog);
+            if (knownSourceAuthor(book.author)) return catalog;
+          } catch (error) {
+            context.signal.throwIfAborted();
+            // 预算耗尽=搜索不完整：置 hadFailure 后交给外层循环的既有分桶（空结果 503）。
+            if (error instanceof SourceReaderError) {
+              if (error.code === 'SOURCE_BUDGET_EXCEEDED') { hadFailure = true; break; }
+              if (error.code === 'SOURCE_SCOPE_EXHAUSTED') break;
+              throw error;
+            }
+            hadFailure = true;
+          }
+        }
+        continue;
+      }
       // Known metadata links save a source search but still require live identity checks.
       const inspect = async (urls: string[], collectFuzzy = false): Promise<SourceCatalog | undefined> => {
         if (urls.length > MAX_DETAIL_CANDIDATES && !knownSourceAuthor(book.author)) {
@@ -466,7 +550,7 @@ async function loadSourceCatalog(session: string, context: SourceRequestContext)
   if (!row) throw new SourceReaderError('阅读目录已过期，请重新加载目录。', 'SOURCE_SESSION_EXPIRED', 409);
   const catalog = row.payload;
   const sources = await getReadingSources(context.signal);
-  if (!sources.some((source) => source.url === catalog.sourceUrl && revision(source) === catalog.sourceRevision)) {
+  if (!sources.some((source) => source.url === catalog.sourceUrl && sourceRevision(source) === catalog.sourceRevision)) {
     throw new SourceReaderError('书源已停用或规则已更新，请重新选择书源。', 'SOURCE_CHANGED', 409);
   }
   validateSourceUrl(catalog.bookUrl);
