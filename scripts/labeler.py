@@ -122,7 +122,11 @@ def load_env():
             line = line.strip()
             if line and not line.startswith('#') and '=' in line:
                 k, v = line.split('=', 1)
-                env[k.strip()] = v.strip()
+                # 与 import_one.py CLI 的 --env 解析保持一致：剥掉取值两侧的引号。
+                # .env 里写 `DATABASE_URL="postgresql://…"` 是常见做法（dotenv 约定），
+                # 不剥的话取值会带上引号 → urlsplit 得到 scheme `"postgresql` →
+                # 自动导入报「DATABASE_URL 不是 postgres 连接串」而静默失败。
+                env[k.strip()] = v.strip().strip('"').strip("'")
     missing = [k for k in ('LLM_API_KEY',) if not env.get(k)]
     if missing:
         sys.exit(f'缺少环境变量: {missing}（应在 {env_path} 里）')

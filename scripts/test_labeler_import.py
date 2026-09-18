@@ -16,6 +16,7 @@ import os
 import sys
 import tempfile
 import unittest
+import urllib.parse
 from pathlib import Path
 from unittest import mock
 
@@ -226,6 +227,42 @@ class TestAutoImportDisabled(MainHarness):
         self.assertEqual(code, 0)
         self.assertIsNone(FakeAutoImporter.last)          # --book 根本不构造导入器
         self.assertEqual(len(self.labels_jsonl()), 1)
+
+
+class TestEnvQuoting(MainHarness):
+    """load_env 必须与 import_one.py CLI 的 --env 解析同款：剥掉取值两侧的引号。
+
+    现场事故（2026-09-19 部署）：.env 里写 `DATABASE_URL="postgresql://…"`（dotenv 常见写法），
+    不剥引号时 urlsplit 得到 scheme `"postgresql` → 自动导入报「不是 postgres 连接串」静默失败。
+    """
+
+    def _load_env(self):
+        with mock.patch.dict(os.environ, {'LABELER_DATA_DIR': str(self.dir)}):
+            return labeler.load_env()
+
+    def test_quoted_values_are_unquoted(self):
+        self.write_env(DATABASE_URL='"postgresql://u:p@db.example/neondb"')
+        env = self._load_env()
+        self.assertEqual(env['DATABASE_URL'], 'postgresql://u:p@db.example/neondb')
+        # 与 import_one.py 的解析结果一致（同款规范化）。
+        self.assertEqual(
+            env['DATABASE_URL'],
+            import_one.AutoImporter.from_env({'DATABASE_URL': env['DATABASE_URL']}).database_url,
+        )
+
+    def test_single_quoted_and_unquoted_values_are_equivalent(self):
+        self.write_env(DATABASE_URL="'postgresql://u:p@db.example/neondb'")
+        self.assertEqual(self._load_env()['DATABASE_URL'], 'postgresql://u:p@db.example/neondb')
+        self.write_env(DATABASE_URL='postgresql://u:p@db.example/neondb')
+        self.assertEqual(self._load_env()['DATABASE_URL'], 'postgresql://u:p@db.example/neondb')
+
+    def test_quoted_url_is_accepted_by_the_import_channel(self):
+        """剥引号后 _http_sql 的 scheme 校验必须通过（回归：现场就是这个校验报的错）。"""
+        self.write_env(DATABASE_URL='"postgresql://u:p@db.example/neondb"')
+        importer = import_one.AutoImporter(self._load_env()['DATABASE_URL'])
+        parsed = urllib.parse.urlsplit(importer.database_url)
+        self.assertIn(parsed.scheme, ('postgres', 'postgresql'))
+        self.assertTrue(parsed.hostname)
 
 
 if __name__ == '__main__':
