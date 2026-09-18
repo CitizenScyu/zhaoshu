@@ -177,8 +177,11 @@ describe('书源能力边界（§5.2）', () => {
   afterEach(() => { vi.unstubAllEnvs(); vi.unstubAllGlobals(); });
 
   const memberGet = () => GET(new NextRequest('http://localhost/api/shuyuan', { headers: { Cookie: 'nf-dev-session=member' } }));
+  // F02：浏览器成员写请求必须带同源固定头；此处的 Cookie 会话经 principalFromSessionRecord 映射为 session 身份。
   const memberPost = (body: unknown) => POST(new NextRequest('http://localhost/api/shuyuan', {
-    method: 'POST', headers: { Cookie: 'nf-dev-session=member', 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+    method: 'POST',
+    headers: { Cookie: 'nf-dev-session=member', 'Content-Type': 'application/json', 'x-nf-csrf': '1', Origin: 'http://localhost' },
+    body: JSON.stringify(body),
   }));
 
   it('有 download 能力的成员可以看统计，且不触发刷新', async () => {
