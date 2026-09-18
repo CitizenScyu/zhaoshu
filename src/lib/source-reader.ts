@@ -90,6 +90,9 @@ export class SourceRequestContext {
   /** 全局请求计数：父子共享，子 context 的请求同样计入且不回退（设计 §3.1）。 */
   get requests(): number { return this.budget.requests; }
 
+  // 保留可写：既有消费方（source-verification 的共享预算判定/测试模拟）会直接回写计数。
+  set requests(value: number) { this.budget.requests = value; }
+
   /** 全局兜底上限：openPool 只增不减地抬高它。 */
   get totalLimit(): number { return this.budget.totalLimit; }
 
