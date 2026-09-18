@@ -3,6 +3,11 @@ import { isRecord } from '@/lib/sanitize';
 import { createDeadline, raceDeadline, type RequestDeadline } from '@/lib/deadline';
 import { validateSourceUrl } from '@/lib/source-policy';
 import {
+  ADMISSION_MIN_BUDGET_MS, ADMISSION_TIMEOUT_MS, defaultAdmissionTransport, runAdmissionBatch,
+  type AdmissionCandidate, type AdmissionSourceRow,
+} from '@/lib/rule-engine/admission';
+import { selectCandidates, type RawSource } from '@/lib/rule-engine/compile-smoke';
+import {
   FILTER_COUNT_KEYS, SOURCE_PAGE_SIZE, offsetFor, pageCount,
   type ShuyuanAvailability, type ShuyuanSourceFilter,
 } from '@/lib/shuyuan-view';
@@ -543,5 +548,73 @@ async function refreshWithinBudget(s: Sql, budget: RequestDeadline, signal: Abor
     if (isRecord(error) && error.code === '22012') throw new Error('书源在刷新期间发生变化，本次保留原数据，请重新刷新');
     throw error;
   }
+  // M1 准入库：挂在全量替换事务**之后**（设计 §4.2 v3 E2）。事务已提交，validateAdmissionUrl
+  // 读到的「源声明 host 集合」本轮即含新源；滤网 2 不在用户请求路径上跑，只在此 cron 批次。
+  await runAdmissionAfterRefresh(s, rows, budget, signal);
   return getShuyuanStats(signal);
+}
+
+/**
+ * 准入批次（设计 §4.2）。时序：全量替换事务之后。硬约束：
+ * - 剩余预算 ≤ ADMISSION_MIN_BUDGET_MS 即整批跳过，绝不挤占 90s 刷新；
+ * - 候选池 = 通过 survey 初筛的源（非候选根本不进 M1 准入，故无候选时零 DB 往返）；
+ * - runAdmissionBatch 每轮真实搜索 ≤ 5 源，逐探前再查预算。
+ * 只写 source_admission，不碰 shuyuan_sources；异常不终结刷新（§6.3：准入异常 → deferred）。
+ */
+async function runAdmissionAfterRefresh(
+  s: Sql, rows: { url: string; source: Record<string, unknown> }[], budget: RequestDeadline, signal: AbortSignal,
+): Promise<void> {
+  if (signal.aborted || budget.remainingMs <= ADMISSION_MIN_BUDGET_MS) return;
+  const declaredHosts = new Set<string>();
+  for (const row of rows) {
+    try { declaredHosts.add(new URL(row.url).hostname); } catch { /* 上游脏 URL：无法声明 host */ }
+  }
+  const candidates: AdmissionCandidate[] = [];
+  for (const row of rows) {
+    const source = row.source as RawSource;
+    if (selectCandidates([source]).length !== 1) continue;
+    candidates.push({ url: row.url, source });
+  }
+  if (candidates.length === 0) return;
+  try {
+    const existing = await readAdmissionRows(s, candidates.map((candidate) => candidate.url), signal);
+    const result = await runAdmissionBatch({
+      candidates, declaredHosts, existing, fetchPage: defaultAdmissionTransport, signal,
+      canProbe: () => !signal.aborted && budget.remainingMs > ADMISSION_TIMEOUT_MS + WRITE_RESERVE_MS,
+    });
+    if (result.rows.length > 0) await writeAdmissionRows(s, result.rows);
+  } catch (error) {
+    // 准入失败只影响本轮准入（§6.3）：该批 next round 重来，刷新本身已成功。
+    if (signal.aborted) return;
+    console.error('shuyuan admission batch failed', {
+      candidates: candidates.length,
+      reason: error instanceof Error ? error.message : String(error),
+    });
+  }
+}
+
+async function readAdmissionRows(s: Sql, urls: string[], signal: AbortSignal): Promise<Map<string, AdmissionSourceRow>> {
+  const rows = await readRows<AdmissionSourceRow>(s, s`
+    SELECT source_url, tier, compile_ok, core_field_mask, search_ok,
+           search_verdict, search_checked_at::text AS search_checked_at, rules_hash, host, error
+    FROM source_admission
+    WHERE source_url IN (
+      SELECT source_url FROM jsonb_to_recordset(${JSON.stringify(urls.map((source_url) => ({ source_url })))}::jsonb)
+        AS q(source_url text))`, signal);
+  return new Map(rows.map((row) => [row.source_url, row]));
+}
+
+async function writeAdmissionRows(s: Sql, rows: AdmissionSourceRow[]): Promise<void> {
+  await s`
+    INSERT INTO source_admission
+      (source_url, tier, compile_ok, core_field_mask, search_ok, search_verdict, search_checked_at, rules_hash, host, error)
+    SELECT source_url, tier, compile_ok, core_field_mask, search_ok, search_verdict, search_checked_at, rules_hash, host, error
+    FROM jsonb_to_recordset(${JSON.stringify(rows)}::jsonb)
+      AS t(source_url text, tier text, compile_ok boolean, core_field_mask jsonb, search_ok boolean,
+           search_verdict text, search_checked_at timestamptz, rules_hash text, host text, error text)
+    ON CONFLICT (source_url) DO UPDATE SET
+      tier = EXCLUDED.tier, compile_ok = EXCLUDED.compile_ok, core_field_mask = EXCLUDED.core_field_mask,
+      search_ok = EXCLUDED.search_ok, search_verdict = EXCLUDED.search_verdict,
+      search_checked_at = EXCLUDED.search_checked_at, rules_hash = EXCLUDED.rules_hash,
+      host = EXCLUDED.host, error = EXCLUDED.error`;
 }
