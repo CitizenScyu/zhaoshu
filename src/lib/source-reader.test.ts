@@ -510,6 +510,13 @@ describe('source budget primitives: child scopes and openPool (M2-1)', () => {
     expect(root.totalLimit).toBe(30); // failover 复用同一 context 时第二次调用不得把预算收窄
   });
 
+  it('keeps the shared counter writable for existing budget consumers', () => {
+    // source-verification 的共享预算判定会直接回写 requests（source-verification.ts:69），不能退化成只读。
+    const root = context();
+    root.requests = root.limit;
+    expect(root.requests).toBe(12);
+  });
+
   it('shares the request counter with a child while keeping the limits independent', async () => {
     pages.set(scopedUrl(50), { text: '正文占位' });
     const root = context();
