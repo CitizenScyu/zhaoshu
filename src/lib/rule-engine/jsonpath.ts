@@ -35,9 +35,9 @@ export function parseJsonPath(input: string): JsonPathIr {
       if (raw[i + 1] === '.') {
         i += 2;
         if (raw[i] === '*') {
-          segments.push({ kind: 'wildcard' });
-          i += 1;
-          continue;
+          // 递归通配 `$..*` 不在 M1 子集：语义应为「所有层级的所有值」，与 `$.*`（仅一层）不同。
+          // 不静默塌缩为 $.*（那会悄悄改语义），显式拒绝（对齐 `$..[*]` 的「递归后缺字段名」）。
+          fail('递归通配 `$..*` 不在 M1 子集（递归 .. 后需字段名）');
         }
         const name = readIdent(raw, i);
         if (name === null) fail('递归 .. 后缺少字段名');

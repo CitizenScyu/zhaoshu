@@ -66,6 +66,18 @@ describe('jsonpath: 5 构件', () => {
   it('递归 + 通配组合 $..books[*]', () => {
     expect(query('$..books[*]', doc)).toEqual(doc.books);
   });
+
+  it('$..name 在多层深树命中所有层级（回归）', () => {
+    const deep = {
+      n: 'L0',
+      child: { n: 'L1', child: { n: 'L2', items: [{ n: 'L3' }, { other: { n: 'L4' } }] } },
+    };
+    expect(query('$..n', deep)).toEqual(['L0', 'L1', 'L2', 'L3', 'L4']);
+  });
+
+  it('$.* 单层通配仍为 wildcard（回归）', () => {
+    expect(query('$.*', { a: 1, b: 2 })).toEqual([1, 2]);
+  });
 });
 
 describe('jsonpath: 越界/缺字段/非 JSON = 空（不抛业务错）', () => {
@@ -100,6 +112,8 @@ describe('jsonpath: 非子集语法 → RULE_UNSUPPORTED', () => {
     '$.a[', //        未闭合 [
     '$.', //          . 后缺字段
     '$..', //         .. 后缺字段
+    '$..*', //        递归通配不在 M1 子集（B.8：不静默塌缩为 $.*）
+    '$..[*]', //      递归 .. 后缺字段名（回归）
   ])('%s', (bad) => {
     let caught: unknown;
     try {
@@ -109,5 +123,17 @@ describe('jsonpath: 非子集语法 → RULE_UNSUPPORTED', () => {
     }
     expect(caught).toBeInstanceOf(RuleEngineError);
     expect((caught as RuleEngineError).code).toBe('RULE_UNSUPPORTED');
+  });
+
+  it('$..* 错误信息点明递归通配不在 M1 子集', () => {
+    let caught: unknown;
+    try {
+      parseJsonPath('$..*');
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeInstanceOf(RuleEngineError);
+    expect((caught as RuleEngineError).message).toContain('$..*');
+    expect((caught as RuleEngineError).message).toContain('M1');
   });
 });
