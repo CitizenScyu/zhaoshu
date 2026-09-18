@@ -453,5 +453,93 @@ class TestFetchIntegration(unittest.TestCase):
         self.assertIn('含广告注入', labeler.SYSTEM_PROMPT)
 
 
+class TestSplitNavAndSourceWatermark(unittest.TestCase):
+    """t79 真数据实测的两类残留噪声（labeler-p0-report §2.2e）。
+
+    旧 `nav` 规则要求**同一行内同时**含「上一章」「下一章」，而 book15.net 把两者
+    渲染成两行（抽样 90 章里 86 章残留 `(英雄救美)下一章` 这类半截行）⇒ 几乎永不触发；
+    上游书源（三七中文）的水印行每章 1 行，`INJECT_PATTERNS` 五条全不匹配。
+    本组用例直接钉住这两处补强，**误删防线优先于覆盖率**。
+    """
+
+    SPLIT_NAV_DROPS = (
+        '(英雄救美)下一章',              # t79 现场样本
+        '(你也配)下一章',
+        '(危机)下一章',
+        '上一章(第11章 初入宗门)',
+        '(第12章 比斗)下一章',
+        '上一章(章节名)',
+        '上一章 【第7章 出山】',
+        # 真数据回测（25 章）发现的章节名自带嵌套括号写法：括号须按深度取最外层
+        '上一章(狼子野心（二）)',
+        '(缓兵之计（四更）)下一章',
+        '上一章(第五十三章(完))',
+    )
+
+    def test_split_nav_lines_are_dropped(self):
+        """变异钉：把 `_nav_shape_ok` 退回旧的「两词同行」判据，本用例全组变红。"""
+        for line in self.SPLIT_NAV_DROPS:
+            with self.subTest(line=line):
+                self.assertEqual(labeler._drop_rule(line), 'nav')
+
+    SPLIT_NAV_KEEPS = (
+        '他想起了上一章的内容',            # 🔴 本轮派单点名的反例：无标点也必须留
+        '（他想起了上一章的事）',          # 整句被括号裹住，导航词在括号内
+        '上一章的内容和下一章的内容',
+        '他翻到上一章，又看了看下一章。',
+        '“上一章写完了，下一章还没动笔。”',
+        # 括号里是整句、括号外只有导航词——结构判据本身拦不住，靠正文标点闸兜底。
+        # 变异钉：把 _NAV_SENTENCE_RE 闸去掉，本条立刻变红。
+        '上一章（他想起了一些往事，很难过。）',
+    )
+
+    def test_prose_mentioning_nav_words_is_kept(self):
+        """变异钉：去掉整行结构判据、只留「行内出现导航词」，本组立刻变红。"""
+        for line in self.SPLIT_NAV_KEEPS:
+            with self.subTest(line=line):
+                self.assertIsNone(labeler._drop_rule(line))
+
+    WATERMARK_DROPS = (
+        '〖三七中文www.37zw.com〗百度搜索“37zw”访问',   # t79 现场样本 1（弯引号）
+        '[三七中文www.37zw.com]百度搜索“37zw.com”',     # t79 现场样本 2（弯引号）
+        '〖三七中文www.37zw.com〗百度搜索"37zw"访问',      # 直引号变体
+        '[三七中文www.37zw.com]百度搜索"37zw.com"',        # 直引号变体
+    )
+
+    def test_source_watermark_lines_are_dropped(self):
+        """变异钉：清空 `_WATERMARK_BRACKET_RE` / `_WATERMARK_RESIDUE_WORDS_RE` 任一条即变红。"""
+        for line in self.WATERMARK_DROPS:
+            with self.subTest(line=line):
+                self.assertEqual(labeler._drop_rule(line), 'inject')
+
+    WATERMARK_KEEPS = (
+        '他打开浏览器，输入 www.37zw.com，页面却是一片空白。',
+        '“这书是从37zw.com搬来的。”',
+        '小说里提到的 www.37zw.com 只是一个虚构站点。',
+        '他念道：“[www.37zw.com]”',       # 括号裹域名但句中还有说话人，整行非水印
+    )
+
+    def test_prose_mentioning_domain_is_kept(self):
+        """反向钉子：只按「含域名」删会把这些正文行一起剥掉——锚点必须落在**括号包裹**上。"""
+        for line in self.WATERMARK_KEEPS:
+            with self.subTest(line=line):
+                self.assertIsNone(labeler._drop_rule(line))
+
+    def test_watermark_anchor_requires_bracketed_domain(self):
+        # 结构钉子：裸域名（无括号包裹）不构成水印，任何情况下都不能只凭域名删行
+        self.assertIsNone(labeler._WATERMARK_BRACKET_RE.search('www.37zw.com 全文字无水印'))
+        self.assertIsNotNone(labeler._WATERMARK_BRACKET_RE.search('[三七中文www.37zw.com]'))
+
+    def test_split_nav_and_watermark_survive_whole_chapter_pipeline(self):
+        """接线：两类新噪声在 clean_chapter_text 里真的被剥掉，且正文一字不少。"""
+        html = html_with(paras(
+            PROSE[:2] + list(self.SPLIT_NAV_DROPS[:2]) + PROSE[2:]
+            + list(self.WATERMARK_DROPS[:2])))
+        text, stats = labeler.clean_chapter_text(html)
+        self.assertEqual(stats['container'], 'closed')
+        self.assertEqual(stats['lines_dropped'], 4)
+        self.assertEqual(text.split('\n'), PROSE)
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

@@ -283,8 +283,44 @@ INJECT_LITERAL_PATTERNS = tuple(
 # 它收的是**整句标语**，真实噪声行「本站提供无弹窗全文字在线阅读，更新速度快，
 # 请记住本站网址。」正是靠子串命中才剥得掉；给 CORE 加锚会把它整条漏掉。
 # 两类目标不同：CORE 剥「含标语的整句」，字面表剥「只由碎片构成的整行」。
-# 「上一章 ... / ... 下一章」导航行：两个词都在且行够短，且不含正文特征标点。
 _NAV_SENTENCE_RE = _PROSE_MARK_RE
+
+# ---- 导航行（含**分行**形态）----
+# t79 真数据实测（labeler-p0-report §2.2e）：book15.net 把「上一章」「下一章」渲染成**两行**，
+# 形如 `上一章(章节名)` 与 `(章节名)下一章`（抽样 90 章里 86 章残留这类行）。
+# 旧规则要求**同一行内同时**含两词 ⇒ 在这批页面上几乎永不触发。
+# 分行形态单行只有一个词，所以不能再用「含导航词」作判据，必须改用**整行结构**判据：
+#   整行 = 可选分隔符 + (章节名括号 或 导航词) 的序列 + 可选分隔符，
+#   且至少有一个导航词、且括号内不得剩下正文（`《上一章》` 里的括号只裹着导航词，算导航词）。
+# 这样 `他想起了上一章的内容` / `（他想起上一章的事）` / `上一章的内容和下一章的内容`
+# 全部落在结构外，一律保留。正文标点闸（_NAV_SENTENCE_RE）仍在前面兜底。
+# 真数据回测（25 章）另发现章节名括号**自带嵌套括号**的写法
+# （`上一章(狼子野心（二）)` / `(缓兵之计（四更）)下一章` / `上一章(第五十三章(完))`），
+# 故括号按**深度配对**取最外层，而不是 find 第一个闭合符。
+_NAV_WORD_RE = re.compile(r'上一章|下一章')
+_NAV_BRACKET_PAIRS = {'（': '）', '(': ')', '[': ']', '【': '】', '《': '》'}
+_NAV_BRACKET_MAX_INNER = 30        # 括号内章节名的长度上限（章节名可能不短，上限只作病态兜底）
+_NAV_SEP_CHARS = ' \t\r\n　' + '-—_=+*|/\\<>·、,，;；:：!！?？~～^&' + '←→↑↓'
+
+# ---- 上游书源水印行 ----
+# t79 真数据实测（同上）：上游书源（三七中文）拷进正文的水印，**在容器内**，每章 1 行：
+#   `〖三七中文www.37zw.com〗百度搜索“37zw”访问`
+#   `[三七中文www.37zw.com]百度搜索“37zw.com”`
+# 现有 INJECT_PATTERNS 五条全不匹配（它们收的是「无弹窗全文字在线阅读」这类整句标语）。
+# 判据分两步，第一步是**锚点**：括号（〖〗/【】/[]/（）/()）内紧贴闭合符处必须有域名。
+# 第二步是收口：整行去掉「水印括号 + 推广词 + 域名/字母数字残片 + 分隔/引号」后必须不剩东西。
+# 这里**刻意不用** _PROSE_MARK_RE 闸——真实样本自己就带中文引号（`“37zw”`），
+# 而锚点（括号内域名）比正文标点强得多：正文里出现 `[www.xxx.com]` 这种整括号包裹的域名
+# 几乎不可能，且还要整行残渣为零才算数。
+_WATERMARK_BRACKET_RE = re.compile(
+    r'[〖\[【（(]\s*.{0,12}?(?:www\.)?[A-Za-z0-9-]{2,32}\.[A-Za-z]{2,6}\s*[〗\]】）)]')
+_WATERMARK_RESIDUE_WORDS_RE = re.compile(
+    r'百度搜索|百度一下|百度|搜索引擎|搜索|访问|本站|网址|首发|最新章节|'
+    r'免费阅读|在线阅读|全文字|无弹窗|温馨提示|记住')
+_WATERMARK_RESIDUE_ALNUM_RE = re.compile(r'[A-Za-z0-9]{1,32}')
+_WATERMARK_SEP_RE = re.compile(
+    r'[\s　\-—_=+*|/\\<>·、,，;；:：!！?？。~～^&.'
+    r'“”"\'‘’()（）\[\]【】〖〗《》{}]+')
 
 _DIV_TOKEN_RE = re.compile(r'</?div\b', re.I)
 
@@ -334,10 +370,65 @@ def extract_chapter_lines(html: str) -> tuple[list[str], str]:
     return lines, how
 
 
+def _nav_shape_ok(line: str) -> bool:
+    """整行是否是导航行结构（含书源站分屏渲染出的**单行半截**形态）。
+
+    逐字符扫：分隔符/箭头跳过，`上一章`/`下一章` 记一个 nav，章节名括号记一个 name
+    （括号内只剩导航词与分隔符时改记为 nav，覆盖 `《上一章》|《下一章》` 这类写法）。
+    出现任何其它字符 → 结构不成立。要求至少有一个 nav（挡住 `（他想起上一章的事）`
+    这种整句被括号裹住、导航词只出现在括号内的情况）。括号按**深度**取最外层，
+    以容纳章节名里自带的嵌套括号（`(缓兵之计（四更）)下一章`）。
+
+    对照（t79 现场样本）：`(英雄救美)下一章` → [name, nav] ✅；
+    `他想起了上一章的内容` → 首字符 `他` 即失败 ✅；`（他想起了上一章的事）` → [name] 无 nav ✅。"""
+    tokens: list[str] = []
+    i, n = 0, len(line)
+    while i < n:
+        ch = line[i]
+        if ch in _NAV_SEP_CHARS:
+            i += 1
+            continue
+        m = _NAV_WORD_RE.match(line, i)
+        if m:
+            tokens.append('nav')
+            i = m.end()
+            continue
+        if ch in _NAV_BRACKET_PAIRS:
+            depth, j = 0, i
+            while j < n:
+                if line[j] in _NAV_BRACKET_PAIRS:
+                    depth += 1
+                elif line[j] in _NAV_BRACKET_PAIRS.values():
+                    depth -= 1
+                    if depth == 0:
+                        break
+                j += 1
+            if j >= n or j - i - 1 > _NAV_BRACKET_MAX_INNER:
+                return False
+            inner = line[i + 1:j]
+            residue = _NAV_WORD_RE.sub('', inner)
+            residue = ''.join(c for c in residue if c not in _NAV_SEP_CHARS)
+            tokens.append('nav' if not residue and _NAV_WORD_RE.search(inner) else 'name')
+            i = j + 1
+            continue
+        return False
+    return 'nav' in tokens
+
+
+def _is_watermark_line(line: str) -> bool:
+    """整行是否只有「书源水印 + 推广词残句」构成（锚点：括号内紧贴闭合符的域名）。"""
+    if not _WATERMARK_BRACKET_RE.search(line):
+        return False
+    rest = _WATERMARK_BRACKET_RE.sub('', line)
+    rest = _WATERMARK_RESIDUE_WORDS_RE.sub('', rest)
+    rest = _WATERMARK_RESIDUE_ALNUM_RE.sub('', rest)
+    return not _WATERMARK_SEP_RE.sub('', rest)
+
+
 def _drop_rule(line: str) -> str | None:
     """命中返回规则名，否则 None。
 
-    1)、2) 要求**整行只由噪声构成**（不做局部删除）；3) 分两类目标：
+    1)、2)、4) 要求**整行只由噪声构成**（不做局部删除）；3) 分两类目标：
     CORE `INJECT_PATTERNS` 收**整句标语**，用无锚子串命中（真实噪声行常是长句，
     只有子串命中才剥得掉）；字面表 `INJECT_LITERAL_PATTERNS` 收**独立成行的口号碎片**，
     必须整行锚定——裸 search 会误删含该相邻串的叙述/对白行。"""
@@ -351,14 +442,18 @@ def _drop_rule(line: str) -> str | None:
                 core = core.replace(tok, '')
         if hit and not _UI_SEP_RE.sub('', core):
             return 'ui'
-    # 2) 导航行：「上一章…/…下一章」及其带章节名的变体；含正文标点（含引号）视为对白。
-    if len(line) <= NAV_LINE_MAX_LEN and '上一章' in line and '下一章' in line \
-            and not _NAV_SENTENCE_RE.search(line):
+    # 2) 导航行：同行形态（两词都在）与**分行**形态（单行半截，如 `(英雄救美)下一章`）
+    #    统一走整行结构判据；含正文标点（含引号）视为对白，一律不剥。
+    if len(line) <= NAV_LINE_MAX_LEN and _NAV_WORD_RE.search(line) \
+            and not _NAV_SENTENCE_RE.search(line) and _nav_shape_ok(line):
         return 'nav'
     # 3) 站点推广行：CORE 整句标语（无锚子串）或独立成行的口号碎片（整行锚定）。
     if len(line) <= INJECT_LINE_MAX_LEN and (
             any(p.search(line) for p in INJECT_PATTERNS)
             or any(p.search(line) for p in INJECT_LITERAL_PATTERNS)):
+        return 'inject'
+    # 4) 上游书源水印行（`〖三七中文www.37zw.com〗百度搜索“37zw”访问` 一类）。
+    if len(line) <= INJECT_LINE_MAX_LEN and _is_watermark_line(line):
         return 'inject'
     return None
 
