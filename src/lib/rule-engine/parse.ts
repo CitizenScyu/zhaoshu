@@ -149,7 +149,6 @@ export function stripRegexSuffix(segment: string, rule: string): { body: string;
   const cleanFlags = flags ? [...new Set(flags.split(''))].filter((c) => 'gimsuy'.includes(c)).join('') : '';
   const finalFlags = cleanFlags === '' ? undefined : cleanFlags;
   try {
-    // eslint-disable-next-line no-new
     new RegExp(pattern, finalFlags ?? 'g');
   } catch {
     unsupported(`正则 pattern 无法编译：${pattern}`, rule);
@@ -373,6 +372,10 @@ export function parseFieldRule(rule: string): FieldIr {
 
   const segment = orParts[0];
   const { body, regex } = stripRegexSuffix(segment, rule);
+  // 正则-only 规则（剥掉 ##...## 尾缀后主体为空，如 `##<a.*?href="([^"]+)"##$1###`）：
+  // ##regex## 在 §2.3 里只定义为「选择器后缀」，无选择器主体的独立正则不在 M1 集内 → 显式拒绝
+  // （不猜「对原始输入直接跑正则」的语义，§2.3 第5条不猜测）。
+  if (body.trim() === '' && regex.length > 0) unsupported('正则-only 规则（无选择器主体，非 M1 集）', rule);
   const ir = translateSegment(body, rule);
   const field: FieldIr = { rules: [ir] };
   if (regex.length > 0) field.regex = regex;
