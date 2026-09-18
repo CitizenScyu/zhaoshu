@@ -32,19 +32,13 @@ const field = (rule: string): FieldIr => parseFieldRule(rule);
 /**
  * 裸 `@op`（chain 为空、只对当前 scope 节点套末端操作）——legado 列表字段的标准写法，
  * 如 ruleToc.chapterName="@text" / chapterUrl="@href"（book15 自身即此形态）。
- * 求值层支持 `chain: []` + terminal；但**冻结的 parse.ts 目前把它判成「空选择器」误拒**，
- * 该 bug 归任务 1 修（已上报主会话，见实施报告 §8）。修复前这里用等价手工 IR 走通求值路径，
- * 修复后自动改走真实 parse 产物（本函数优先返回 parse 结果）。
+ * 上游 `parse.ts` 曾把它判成「空选择器」误拒（归任务 1 修，已随 fd2372c 修复并 merge 进来）。
+ * 这里**不再兜底**：直接断言 parse 产出 `chain: [] + terminal`，上游若回归则本用例立刻变红。
  */
 function bareTerminal(op: Exclude<TerminalOp['op'], 'attr'>): FieldIr {
-  try {
-    return field(`@${op}`);
-  } catch (error) {
-    if (error instanceof RuleEngineError && error.code === 'RULE_UNSUPPORTED') {
-      return { rules: [{ kind: 'css', chain: [], terminal: { op } }] };
-    }
-    throw error;
-  }
+  const parsed = field(`@${op}`);
+  expect(parsed).toEqual({ rules: [{ kind: 'css', chain: [], terminal: { op } }] });
+  return parsed;
 }
 
 describe('裸 @op 规则（列表字段对 scope 节点本身求值）', () => {
@@ -54,19 +48,6 @@ describe('裸 @op 规则（列表字段对 scope 节点本身求值）', () => {
     expect(evaluateField(bareTerminal('text'), item)).toBe('第一条');
     expect(evaluateField(bareTerminal('href'), item)).toBe('https://book15.net/x/1.html');
     expect(evaluateField(bareTerminal('title'), item)).toBe('一号');
-  });
-
-  it('上游修复契约：parse 若接受裸 @op，必须产出 chain:[] + terminal（否则必须 RULE_UNSUPPORTED）', () => {
-    let parsed: FieldIr | null = null;
-    try {
-      parsed = parseFieldRule('@text');
-    } catch (error) {
-      expect(error).toBeInstanceOf(RuleEngineError);
-      expect((error as RuleEngineError).code).toBe('RULE_UNSUPPORTED');
-    }
-    if (parsed !== null) {
-      expect(parsed).toEqual({ rules: [{ kind: 'css', chain: [], terminal: { op: 'text' } }] });
-    }
   });
 });
 
