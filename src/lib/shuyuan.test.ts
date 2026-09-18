@@ -692,6 +692,13 @@ describe('refreshShuyuan atomic refresh', () => {
       expect(sources[1].rules).toBe(engineItem);
     });
 
+    it('引擎源查询失败时降级为 builtin 单源，不 500（零回归）', async () => {
+      execute.mockResolvedValueOnce([{ collections: [] }]).mockResolvedValueOnce([])
+        .mockRejectedValueOnce(new Error('relation "source_admission" does not exist'));
+      const sources = await getReadingSources(new AbortController().signal);
+      expect(sources.map((source) => source.tier)).toEqual(['builtin']);
+    });
+
     it('getEngineSources 只返回 admission ok 的引擎源（不含 builtin 兜底）', async () => {
       refreshSupportedHosts(['engine.example']);
       execute.mockResolvedValueOnce([{ collections: [] }]).mockResolvedValueOnce([engineRow()]);

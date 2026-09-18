@@ -119,7 +119,17 @@ export async function getReadingSources(signal: AbortSignal): Promise<ReadingSou
   const s = getSql();
   const { states } = readMeta((await storedMeta(s, signal)).collections);
   const builtin = await builtinReadingSources(s, states, signal);
-  const engine = await engineReadingSources(s, states, signal);
+  // 引擎源是**增量**：读该表出错（如 schema 未就绪/库抖动）绝不能杀死 builtin 取书路径
+  // （零回归红线）。失败按空集处理，book15 单源行为与今日逐点相同。
+  let engine: ReadingSource[] = [];
+  try {
+    engine = await engineReadingSources(s, states, signal);
+  } catch (error) {
+    signal.throwIfAborted();
+    console.error('shuyuan engine sources unavailable, falling back to builtin only', {
+      reason: error instanceof Error ? error.message : String(error),
+    });
+  }
   return [...builtin, ...engine].slice(0, READING_POOL_LIMIT);
 }
 
