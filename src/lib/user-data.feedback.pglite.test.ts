@@ -106,6 +106,17 @@ maybe('真实 PostgreSQL：feedbackForUserQueries 路线 B（写反馈时补 boo
     expect((await pg.query('SELECT status FROM feedback ORDER BY id DESC LIMIT 1')).rows).toEqual([{ status: 'want' }]);
   });
 
+  it('书库拼写带首尾空格时写入前 btrim，否则后面 4 条 lower(title) 比较会落空（仍 404）', async () => {
+    await pg.query(`INSERT INTO labeled_books (title, author, source_url) VALUES ($1, $2, $3)`,
+      ['  Spaced 书  ', 'Spaced 作者', 'https://example.invalid/spaced']);
+    // 只回落客户端值也能"补出行"，但那样 books 里存的是客户端拼写、而不是书库拼写；
+    // 真正会被打红的是把 labeled 原样（带空格）写进去——补行成功、随后定位却 0 行。
+    const results = await sql.transaction(() => statements('Spaced 书', 'Spaced 作者', 'done', '空格拼写', 0) as never);
+    expect(results[4]).toHaveLength(1);
+    expect((await pg.query(`SELECT title, author, title_key FROM books WHERE title_key = 'spaced 书'`)).rows)
+      .toEqual([{ title: 'Spaced 书', author: 'Spaced 作者', title_key: 'spaced 书' }]);
+  });
+
   it('版本守卫失败时补行一起回滚，不留孤儿 books 行', async () => {
     const books = (await pg.query('SELECT id, title, author FROM books ORDER BY id')).rows;
     const feedbackRows = (await pg.query('SELECT id FROM feedback ORDER BY id')).rows;
