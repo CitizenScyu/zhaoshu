@@ -23,11 +23,26 @@ export class SourcePolicyError extends Error {
 
 // 相对引用只接受已验证的基址；返回规范 URL，供请求、入队和循环检测使用。
 export function validateSourceUrl(value: unknown, base?: string): URL {
+  return checkSourceUrl(value, base, { hostAllowed: (hostname) => supportedHosts.has(hostname) });
+}
+
+/**
+ * 两把锁共享的检查函数源（设计 §4.4 / v3 E4）：validateSourceUrl（运行时门）与
+ * admission.ts 的 validateAdmissionUrl（准入门）逐条同款，**只有 host 白名单来源不同**
+ * （前者=已准入 ok host，后者=shuyuan_sources 声明的 bookSourceUrl host）。
+ * 任何检查项改动必须只改这里，禁止在两把锁里各写一份（防漂移）。
+ */
+export interface SourceUrlPolicy {
+  /** host 白名单判定（hostname 已由 URL 小写与规范化）。 */
+  hostAllowed(hostname: string): boolean;
+}
+
+export function checkSourceUrl(value: unknown, base: string | undefined, policy: SourceUrlPolicy): URL {
   if (typeof value !== 'string' || !value || value.length > 2048 ||
       value.includes('\\') || [...value].some((char) => char.charCodeAt(0) <= 32 || char.charCodeAt(0) === 127)) {
     throw new SourcePolicyError('来源地址为空、过长或包含异常字符');
   }
-  const baseUrl = base === undefined ? undefined : validateSourceUrl(base);
+  const baseUrl = base === undefined ? undefined : checkSourceUrl(base, undefined, policy);
   if (/^[a-z][a-z\d+.-]*:/i.test(value) && !/^https:\/\//i.test(value)) {
     throw new SourcePolicyError('来源仅支持 HTTPS 完整地址');
   }
@@ -43,10 +58,22 @@ export function validateSourceUrl(value: unknown, base?: string): URL {
   } catch {
     throw new SourcePolicyError('来源地址无法解析');
   }
-  if (url.protocol !== 'https:' || !supportedHosts.has(url.hostname) ||
+  if (url.protocol !== 'https:' || !policy.hostAllowed(url.hostname) ||
       url.port !== '' || url.username !== '' || url.password !== '') {
-    throw new SourcePolicyError('仅支持 HTTPS book15.net 精确域名和默认端口/443');
+    throw new SourcePolicyError('仅支持 HTTPS 精确域名和默认端口/443');
+  }
+  // IP/私网红线（v3 E4）：两把锁同防线。裸 IP 直连（WHATWG URL 已把十进制/十六进制
+  // 归一化为点分 IPv4）与 IPv6 字面量（含 ::1、fc00::/7）一律拒，即便它出现在
+  // shuyuan_sources 声明的 bookSourceUrl 里。
+  if (isForbiddenHostAddress(url.hostname)) {
+    throw new SourcePolicyError('来源地址禁止直连 IP 或私网/环回地址');
   }
   url.hash = '';
   return url;
+}
+
+/** 裸 IP / IPv6 字面量判定（URL.hostname 形态：IPv4 点分、IPv6 带方括号）。 */
+export function isForbiddenHostAddress(hostname: string): boolean {
+  if (hostname.includes(':') || hostname.startsWith('[')) return true; // IPv6 字面量（含 ::1、fc00::/7）
+  return /^\d{1,3}(?:\.\d{1,3}){3}$/.test(hostname); // 任意 IPv4 直连（公网/私网/环回/链路本地全拒）
 }
