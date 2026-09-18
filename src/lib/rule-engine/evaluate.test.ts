@@ -225,6 +225,12 @@ describe('evaluate：JSON 输入与输入归一化（§3.1）', () => {
     expect(decodeBase64Layer(prose)).toBe(prose);
     expect(decodeBase64Layer(prose).includes('�')).toBe(false);
 
+    // UTF-8 有效性用「解码 → 重编码」字节往返判定：原文本就含 U+FFFD 的**合法**文本必须通过。
+    // （反例：若扫 `decoded.includes('�')`，下面这条合法 payload 会被误判成非法回落。）
+    expect(decodeBase64Layer('aGVsbG/vv713b3JsZA==')).toBe('hello�world');
+    // 非法 UTF-8（JPEG 头 ff d8 ff）→ 字节往返不等 → 回落原文。
+    expect(decodeBase64Layer('/9j/4AAQSkZJRg==')).toBe('/9j/4AAQSkZJRg==');
+
     // 超限：长度粗筛 → 原文（保留既有约束）。
     const oversized = 'A'.repeat(Math.ceil(((MAX_DECODED_BYTES + 16) * 4) / 3));
     expect(decodeBase64Layer(oversized)).toBe(oversized);
@@ -238,6 +244,25 @@ describe('evaluate：JSON 输入与输入归一化（§3.1）', () => {
     expect(noPad.includes('=')).toBe(false);
     expect(noPad.length % 4).toBe(0);
     expect(decodeBase64Layer(noPad)).toBe(noPadPlain);
+  });
+
+  it('inte_base64 层：往返校验 / 规范 padding 的判别力（P1-2）', () => {
+    // 往返层独有：非规范 padding 位（Node 宽容解码成 a / ab），重编码后与原串不等 → 回落原文。
+    // 字符集正则放过这两条，只有往返比对能拦下，专门覆盖第 65 行的判别力。
+    expect(decodeBase64Layer('YR==')).toBe('YR==');
+    expect(decodeBase64Layer('YWJ=')).toBe('YWJ=');
+
+    // 无 / 少 padding 的规范形正常解码（现有只测了 %4==0 的 YWJj）。
+    expect(decodeBase64Layer('YWI')).toBe('ab');
+    expect(decodeBase64Layer('YQ')).toBe('a');
+    expect(decodeBase64Layer('YQ=')).toBe('a'); // 少一个 = ：去 pad 后往返相等，接受
+    expect(decodeBase64Layer('YWJj')).toBe('abc');
+    expect(decodeBase64Layer('YWJ')).toBe('YWJ'); // 长度 3、非规范 2 字节编码 → 往返 fail → 原文
+
+    // 空白剥离契约：base64 内部空白被剥掉后正常解码（MIME/折行）。
+    expect(decodeBase64Layer('YW Jj')).toBe('abc');
+    // 已知边角：正文去空白后恰好是规范 base64 会被解成别的字（与前缀误伤同类，接受现状并文档化）。
+    expect(decodeBase64Layer('S E l U')).toBe('HIT');
   });
 });
 
