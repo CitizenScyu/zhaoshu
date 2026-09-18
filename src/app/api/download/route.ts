@@ -5,14 +5,18 @@ import { requirePermission } from '@/lib/auth';
 import { ensureSchema, getSql } from '@/lib/db';
 import { triggerDownloadWorkflow } from '@/lib/github';
 import { boundedPositiveInteger, readJsonBody, RequestBodyError } from '@/lib/http';
-import { DOWNLOAD_TASK_STALE_MS } from '@/lib/download-task-policy';
+import { isLeaseExpired, reclaimStaleTasks, type DownloadSql } from '@/lib/download-task-reclaim';
 import { SourcePolicyError, validateSourceUrl } from '@/lib/source-policy';
 
-// 书库下载任务:GET 查任务(最近 20 条或单条)、POST 建任务、DELETE 取消 pending/清理 failed/partial
+// 书库下载任务:GET 查任务(最近 20 条 / 单条 / 按书查本人最新一条)、POST 建任务、
+// DELETE 取消 pending/清理 failed/partial。GET 保持只读，过期租约由 POST 与 cron 回收。
 export const maxDuration = 60;
 
 const MAX_BODY_BYTES = 4 * 1024;
 const LIST_LIMIT = 20;
+
+// updated_at 以 ISO-8601 UTC 文本返回（to_char）：leaseExpired 的派生比较依赖稳定格式，
+// 不同驱动的 timestamptz::text 形态不一致（空格分隔、无 Z），会解析歧义。
 
 interface TaskRow {
   id: number;
@@ -41,17 +45,37 @@ function toTask(row: TaskRow) {
     error: row.error,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
+    // 派生状态，不写库：running 但心跳已过期的任务在 UI 里视为可重试。
+    leaseExpired: isLeaseExpired(row.status, row.updated_at),
   };
 }
 
-async function reclaimStaleTasks(sql: ReturnType<typeof getSql>) {
-  // Worker 每 60 秒独立更新心跳；长时间抓取/抽验也持续更新，与每 50 章的进度写回无关。
-  await sql`
-    UPDATE download_tasks
-    SET status = 'failed',
-        error = CONCAT(COALESCE(error, ''), ${'\nworker 中断自动回收'}),
-        updated_at = now()
-    WHERE status = 'running' AND updated_at < now() - (${DOWNLOAD_TASK_STALE_MS} * interval '1 millisecond')`;
+interface ActiveTask {
+  id: number;
+  status: string;
+}
+
+// 同一用户对同一本书的活动任务（pending/running）。F03 的 partial 不在锁内：残缺终态可重下补齐。
+async function activeTaskFor(sql: DownloadSql, userId: number, bookId: number): Promise<ActiveTask | null> {
+  const rows = (await sql`
+    SELECT id, status FROM download_tasks
+    WHERE user_id = ${userId} AND book_id = ${bookId} AND status IN ('pending', 'running')
+    ORDER BY created_at DESC LIMIT 1`) as ActiveTask[];
+  return rows[0] ?? null;
+}
+
+// 冲突响应带上同一用户已有任务的 taskId 与状态：前端据此接续轮询，而不是只显示一句
+// 「已在队列」后拿不到任务（F17）。竞争路径查不到时 taskId/status 为 null，前端回退提示。
+function conflictResponse(existing: ActiveTask | null) {
+  return authJson(
+    {
+      error: '已有进行中的任务',
+      code: 'TASK_CONFLICT',
+      taskId: existing?.id ?? null,
+      status: existing?.status ?? null,
+    },
+    { status: 409 },
+  );
 }
 
 export async function GET(req: NextRequest) {
@@ -63,22 +87,37 @@ export async function GET(req: NextRequest) {
   if (idParam !== null && id === null) {
     return authJson({ error: 'invalid id', code: 'INVALID_ID' }, { status: 400 });
   }
+  const bookIdParam = searchParams.get('bookId');
+  const bookId = boundedPositiveInteger(bookIdParam);
+  if (bookIdParam !== null && bookId === null) {
+    return authJson({ error: 'invalid bookId', code: 'INVALID_ID' }, { status: 400 });
+  }
   try {
     await ensureSchema();
     const sql = getSql();
     if (id !== null) {
       const rows = (await sql`
         SELECT id, book_id, title, author, status, chapters_total, chapters_done,
-               chars_total, error, created_at::text AS created_at, updated_at::text AS updated_at
+               chars_total, error, created_at::text AS created_at, to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS updated_at
         FROM download_tasks WHERE id = ${id} AND user_id = ${auth.principal.userId}`) as unknown as TaskRow[];
       if (rows.length === 0) {
         return authJson({ error: 'task not found', code: 'TASK_NOT_FOUND' }, { status: 404 });
       }
       return authJson({ task: toTask(rows[0]) });
     }
+    if (bookId !== null) {
+      // 按 bookId 查本人最新任务：详情页据此显示自己的下载状态，不依赖最近 20 条列表，
+      // 也不会误读别的用户在同一本书上的完成任务（F17/F18）。
+      const rows = (await sql`
+        SELECT id, book_id, title, author, status, chapters_total, chapters_done,
+               chars_total, error, created_at::text AS created_at, to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS updated_at
+        FROM download_tasks WHERE book_id = ${bookId} AND user_id = ${auth.principal.userId}
+        ORDER BY created_at DESC LIMIT 1`) as unknown as TaskRow[];
+      return authJson({ task: rows.length > 0 ? toTask(rows[0]) : null });
+    }
     const rows = (await sql`
       SELECT id, book_id, title, author, status, chapters_total, chapters_done,
-             chars_total, error, created_at::text AS created_at, updated_at::text AS updated_at
+             chars_total, error, created_at::text AS created_at, to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS updated_at
       FROM download_tasks WHERE user_id = ${auth.principal.userId}
       ORDER BY created_at DESC LIMIT ${LIST_LIMIT}`) as unknown as TaskRow[];
     return authJson({ tasks: rows.map(toTask) });
@@ -134,16 +173,8 @@ export async function POST(req: NextRequest) {
     await reclaimStaleTasks(sql);
     // 同一用户对同一本书有进行中的任务就直接返回它，避免重复入队。
     // 活动锁粒度是 (user_id, book_id)（B2）：不同用户共享同一书源互不阻塞。
-    const existing = (await sql`
-      SELECT id FROM download_tasks
-      WHERE user_id = ${guard.principal.userId} AND book_id = ${bookId} AND status IN ('pending', 'running')
-      ORDER BY created_at DESC LIMIT 1`) as { id: number }[];
-    if (existing.length > 0) {
-      return authJson(
-        { error: '已有进行中的任务', code: 'TASK_CONFLICT' },
-        { status: 409 },
-      );
-    }
+    const existing = await activeTaskFor(sql, guard.principal.userId, bookId);
+    if (existing) return conflictResponse(existing);
     const created = (await sql`
       INSERT INTO download_tasks (user_id, book_id, title, author, source_url, status)
       VALUES (${guard.principal.userId}, ${bookId}, ${book.title}, ${book.author}, ${sourceUrl}, 'pending')
@@ -157,7 +188,14 @@ export async function POST(req: NextRequest) {
     return authJson({ taskId: created[0].id }, { status: 201 });
   } catch (e) {
     if (e && typeof e === 'object' && 'code' in e && e.code === '23505') {
-      return authJson({ error: '已有进行中的任务', code: 'TASK_CONFLICT' }, { status: 409 });
+      // 唯一索引竞争：另一个并发请求刚插入了同一 (user,book) 的活动任务。
+      // 补读本人活动任务，返回同一个 taskId，让两边页面都跟到同一任务（F17）。
+      try {
+        const raced = await activeTaskFor(getSql(), guard.principal.userId, bookId);
+        return conflictResponse(raced);
+      } catch {
+        return conflictResponse(null);
+      }
     }
     console.error(e);
     return authJson({ error: 'db error', code: 'DB_ERROR' }, { status: 500 });

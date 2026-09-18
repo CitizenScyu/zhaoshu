@@ -32,7 +32,7 @@ vi.mock('@/lib/github', () => ({ triggerDownloadWorkflow: mocks.dispatch }));
 vi.mock('@/lib/shuyuan', () => ({ disableShuyuanSource: mocks.disable, enableShuyuanSource: vi.fn(), getShuyuanStats: vi.fn(), refreshShuyuan: vi.fn() }));
 
 import { POST as find } from '@/app/api/find/route';
-import { POST as download } from '@/app/api/download/route';
+import { GET as downloadGet, POST as download } from '@/app/api/download/route';
 import { POST as source } from '@/app/api/shuyuan/route';
 import { POST as profile } from '@/app/api/profile/route';
 import { POST as feedback } from '@/app/api/feedback/route';
@@ -189,4 +189,34 @@ it('R15: compressed source verification reaches the reranking model without the 
   expect(prompt).toContain('"matchedBy":"title+author"');
   expect(prompt).not.toContain('身份匹配'); // note 不进 prompt
   expect(prompt).not.toContain('https://book15.net'); // URL 不进 prompt
+});
+
+// 本文件原只有 R08–R15，没有 R16–R18。F16/F17 的等价用例补在这里（download 路由的 mock
+// 够用）；F18 走 library 的合批只读事务，本文件的 getSql mock 不支持，等价用例放在
+// src/app/api/library/route.test.ts（见「F18：两用户同书」）。
+
+it('R16（补，翻转）: 已有活动任务的冲突响应返回同一用户的 taskId 与状态，而不是只有 error/code', async () => {
+  mocks.sql
+    .mockResolvedValueOnce([{ id: 7, title: '合成书', author: '审查作者', source_url: 'https://book15.net/books/details7.html' }])
+    .mockResolvedValueOnce([]) // 回收
+    .mockResolvedValueOnce([{ id: 42, status: 'running' }]);
+  const response = await download(request('download', { bookId: 7 }));
+  expect(response.status).toBe(409);
+  expect(await response.json()).toMatchObject({ code: 'TASK_CONFLICT', taskId: 42, status: 'running' });
+  expect(mocks.dispatch).not.toHaveBeenCalled();
+});
+
+it('R17（补，翻转）: GET 保持只读、派生 leaseExpired，过期回收不再依赖 POST', async () => {
+  mocks.sql.mockResolvedValueOnce([{
+    id: 42, book_id: 7, title: '合成书', author: '审查作者', status: 'running',
+    chapters_total: 100, chapters_done: 12, chars_total: 0, error: '',
+    created_at: '2026-09-14T00:00:00Z',
+    updated_at: new Date(Date.now() - 31 * 60_000).toISOString(),
+  }]);
+  const response = await downloadGet(new NextRequest('https://app.example.invalid/api/download?id=42'));
+  expect(response.status).toBe(200);
+  expect((await response.json()).task).toMatchObject({ status: 'running', leaseExpired: true });
+  // 只读：GET 只发一条 SELECT，不写回收。
+  expect(mocks.sql).toHaveBeenCalledOnce();
+  expect(mocks.sql.mock.calls[0][0].join(' ')).toMatch(/^\s*SELECT /);
 });

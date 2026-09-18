@@ -16,7 +16,10 @@ interface LibraryBook {
   genre: string;
   intro: string;
   quality?: number | null;
-  readTaskId?: number | null;
+  // 共享可读：任意用户的 done 文件（在线阅读）。
+  sharedReadTaskId?: number | null;
+  // 私有：当前用户自己在这本书上的最新任务（下载 / 取消 / 取回）。
+  myDownloadTaskId?: number | null;
 }
 
 interface Facets {
@@ -34,6 +37,8 @@ interface DownloadTask {
   charsTotal: number;
   error: string | null;
   updatedAt: string;
+  // 派生状态：running 且 worker 心跳过期。GET 保持只读，由这里暴露给 UI 做受控重试。
+  leaseExpired?: boolean;
 }
 
 const FIELD_LABELS: [string, string][] = [
@@ -87,13 +92,17 @@ function parseTask(data: unknown): DownloadTask | null {
     charsTotal: Number(t.charsTotal) || 0,
     error: typeof t.error === 'string' ? t.error : null,
     updatedAt: typeof t.updatedAt === 'string' ? t.updatedAt : '',
+    leaseExpired: t.leaseExpired === true,
   };
 }
 
 function downloadStatusText(t: DownloadTask): string {
   switch (t.status) {
     case 'pending': return '排队中，等待下载任务开始';
-    case 'running': return `下载中 ${t.chaptersDone}/${t.chaptersTotal} 章`;
+    // 心跳过期的 running 是硬中断残留：不再显示诱人的「下载中 n/m」，明确告知可重试。
+    case 'running': return t.leaseExpired
+      ? `下载已中断（worker 无心跳），已存 ${t.chaptersDone}/${t.chaptersTotal} 章，可重试`
+      : `下载中 ${t.chaptersDone}/${t.chaptersTotal} 章`;
     case 'done': return `完成，共 ${t.charsTotal} 字`;
     case 'partial': {
       const missing = Math.max(0, t.chaptersTotal - t.chaptersDone);
@@ -174,10 +183,21 @@ export default function LibraryTab({ view, setView }: {
     if (next?.status !== 'done') return;
     // A newly finished download must also expose reading on its library card,
     // including after the detail view (and its local task state) is closed.
-    setBooks((current) => current?.map((book) => book.id === next.bookId && book.readTaskId !== next.id
-      ? { ...book, readTaskId: next.id } : book) ?? null);
-    setDetail((current) => current?.id === next.bookId && current.readTaskId !== next.id
-      ? { ...current, readTaskId: next.id } : current);
+    // 自己的 done 任务既是私有下载结果，也是一份共享可读文件，两个字段同步更新。
+    setBooks((current) => current?.map((book) => book.id === next.bookId
+      ? {
+          ...book,
+          sharedReadTaskId: book.sharedReadTaskId ?? next.id,
+          myDownloadTaskId: next.id,
+        }
+      : book) ?? null);
+    setDetail((current) => current?.id === next.bookId
+      ? {
+          ...current,
+          sharedReadTaskId: current.sharedReadTaskId ?? next.id,
+          myDownloadTaskId: next.id,
+        }
+      : current);
   }, []);
 
   function showDetail(book: LibraryBook | null) {
@@ -235,9 +255,8 @@ export default function LibraryTab({ view, setView }: {
     return () => controller.abort();
   }, [load, page, search, category, tag, finish, sort]);
 
-  const detailReadTaskId = detail?.readTaskId ?? null;
-
-  // 进入详情页时查这本书有没有进行中/已完成的下载任务
+  // 进入详情页时按 bookId 查「本人」在这本书上的最新任务；共享可读定位（sharedReadTaskId）
+  // 只用于在线阅读，不再拿去查强制 user_id 的 /api/download（F18）。
   useEffect(() => {
     if (detailId === null) return;
     const my = dlRequestId.current;
@@ -247,14 +266,12 @@ export default function LibraryTab({ view, setView }: {
       if (controller.signal.aborted) return;
       void (async () => {
         try {
-          const res = await apiFetch(detailReadTaskId ? `/api/download?id=${detailReadTaskId}` : '/api/download', { signal: controller.signal });
+          const res = await apiFetch(`/api/download?bookId=${detailId}`, { signal: controller.signal });
           const data = await res.json();
           if (!res.ok) throw new Error(data.error || '查询下载任务失败');
           if (stale || my !== dlRequestId.current) return;
-          const found = detailReadTaskId ? parseTask(data) : Array.isArray(data.tasks)
-            ? (data.tasks as unknown[]).map(parseTask).find((t) => t !== null && t.bookId === detailId)
-            : null;
-          updateTask(found ?? null);
+          const found = parseTask(data);
+          updateTask(found && found.bookId === detailId ? found : null);
         } catch {
           // 查不到不影响看详情，只是下载区块退回按钮态
         }
@@ -264,7 +281,7 @@ export default function LibraryTab({ view, setView }: {
       stale = true;
       controller.abort();
     };
-  }, [detailId, detailReadTaskId, apiFetch, updateTask]);
+  }, [detailId, apiFetch, updateTask]);
 
   // pending/running 任务每 10 秒轮询单条进度
   const pollTaskId = task !== null && (task.status === 'pending' || task.status === 'running')
@@ -325,7 +342,8 @@ export default function LibraryTab({ view, setView }: {
   }
 
   async function startDownload() {
-    if (!detail || dlBusy || task?.status === 'done' || task?.status === 'running') return;
+    // 心跳过期的 running 视为可重试：POST 会先回收僵尸租约再建任务。
+    if (!detail || dlBusy || task?.status === 'done' || (task?.status === 'running' && !task.leaseExpired)) return;
     const my = ++dlRequestId.current;
     setDlBusy(true);
     setDlError('');
@@ -479,7 +497,7 @@ export default function LibraryTab({ view, setView }: {
           {/* 下载全书 */}
           <div className="mt-5 pt-4 border-t border-dashed" style={{ borderColor: 'var(--line)' }}>
             <div className="mb-3">
-              <ReadBookLink taskId={task?.status === 'done' ? task.id : detail.readTaskId} title={detail.title} author={detail.author} from="library" />
+              <ReadBookLink taskId={task?.status === 'done' ? task.id : detail.sharedReadTaskId} title={detail.title} author={detail.author} from="library" />
             </div>
             {dlError && (
               <p role="alert" className="text-xs mb-2" style={{ color: 'var(--cinnabar)' }}>✗ {dlError}</p>
@@ -497,7 +515,7 @@ export default function LibraryTab({ view, setView }: {
                   <span
                     role="status"
                     className="text-sm"
-                    style={{ color: task.status === 'failed' ? 'var(--cinnabar)' : task.status === 'partial' ? 'var(--dai)' : 'var(--ink-soft)' }}
+                    style={{ color: task.status === 'failed' || (task.status === 'running' && task.leaseExpired) ? 'var(--cinnabar)' : task.status === 'partial' ? 'var(--dai)' : 'var(--ink-soft)' }}
                   >
                     {downloadStatusText(task)}
                   </span>
@@ -506,7 +524,8 @@ export default function LibraryTab({ view, setView }: {
                       取回文件
                     </button>
                   )}
-                  {(task.status === 'failed' || task.status === 'pending' || task.status === 'partial') && (
+                  {(task.status === 'failed' || task.status === 'pending' || task.status === 'partial'
+                    || (task.status === 'running' && task.leaseExpired)) && (
                     <button
                       className="chip chip-dai text-sm disabled:opacity-50"
                       onClick={() => void startDownload()}
@@ -695,7 +714,7 @@ export default function LibraryTab({ view, setView }: {
                 >
                   {shelfBusy === b.id ? '添加中…' : '+ 书架'}
                 </button>
-                <ReadBookLink taskId={b.readTaskId} title={b.title} author={b.author} from="library" />
+                <ReadBookLink taskId={b.sharedReadTaskId} title={b.title} author={b.author} from="library" />
               </div>
             </article>
           ))}

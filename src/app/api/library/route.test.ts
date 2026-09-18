@@ -11,6 +11,7 @@ let db: ReturnType<typeof mockSql>;
 
 const FIND_ONLY = { userId: 2, role: 'member', canFind: true, canRead: false, canDownload: false, authMethod: 'password', membersEnabled: true };
 const READER = { userId: 3, role: 'member', canFind: true, canRead: true, canDownload: false, authMethod: 'password', membersEnabled: true };
+const READER_DOWNLOADER = { userId: 4, role: 'member', canFind: true, canRead: true, canDownload: true, authMethod: 'password', membersEnabled: true };
 
 function memberRequest() {
   // 成员路径只在账号模式启用时走 Cookie 会话。
@@ -83,37 +84,61 @@ describe('GET /api/library', () => {
     expect(db.queries).toHaveLength(0);
   });
 
-  it('find-only 会话仍能读共享书库元数据，但拿不到完成文件定位', async () => {
+  it('find-only 会话仍能读共享书库元数据，但拿不到共享可读定位，也没有本人任务', async () => {
     const res = await GET(memberRequest());
     expect(res.status).toBe(200);
-    expect((await res.json()).books[0]).toMatchObject({ id: 7, readTaskId: null });
+    expect((await res.json()).books[0]).toMatchObject({ id: 7, sharedReadTaskId: null, myDownloadTaskId: null });
     expect(res.headers.get('Cache-Control')).toBe('private, no-store');
     expect(res.headers.get('Vary')).toBe('Cookie, Authorization, X-Owner-Token');
   });
 
-  it('无 read 权限不查询共享任务定位，直接取 NULL', async () => {
+  it('无 read/download 权限不查询任务定位，两个字段都直接取 NULL', async () => {
     await GET(memberRequest());
-    expect(listQuery()?.text).toContain('NULL::integer AS read_task_id');
+    expect(listQuery()?.text).toContain('NULL::integer AS shared_read_task_id');
+    expect(listQuery()?.text).toContain('NULL::integer AS my_download_task_id');
     expect(listQuery()?.text).not.toContain('download_tasks');
   });
 
-  it('有 read 权限才返回共享完成文件定位', async () => {
+  it('有 read 权限才返回共享完成文件定位（与本人任务分开）', async () => {
     mocks.session.mockResolvedValue(READER);
     db.resolve.mockImplementation((query) => {
       if (query.text.includes('SELECT id, title')) return [{
         id: 7, title: '测试书', author: '作者', category: '仙侠', primary_genre: '修仙',
         quality: 8, finish_status: '完结', chars_labeled: 30000, labels: { genre: '成长' },
-        labeled_at: '2026-09-14', read_task_id: 90,
+        labeled_at: '2026-09-14', shared_read_task_id: 90,
       }];
       if (query.text.includes('AS total')) return [{ total: 31 }];
       return [];
     });
     const res = await GET(memberRequest());
-    expect((await res.json()).books[0].readTaskId).toBe(90);
+    const books = (await res.json()).books;
+    expect(books[0].sharedReadTaskId).toBe(90);
+    // READER 无 download 权限：本人任务字段保持 NULL，不因共享可读而串号。
+    expect(books[0].myDownloadTaskId).toBeNull();
     expect(listQuery()?.text).toContain('download_tasks');
     expect(listQuery()?.text).toContain("dt.status = 'done'");
     // F03：partial（残缺终态）永不可读，定位子查询不得把它当成完成文件
     expect(listQuery()?.text).not.toContain('partial');
+  });
+
+  it('F18：两用户同书——B 的 done 是共享可读 id，A 自己的任务单独给，两者不混用', async () => {
+    // 同一本书：shared_read_task_id=90（B 的完成任务，供在线阅读），
+    // my_download_task_id=42（A 自己的 partial 任务，供下载/清理）。
+    mocks.session.mockResolvedValue(READER_DOWNLOADER);
+    db.resolve.mockImplementation((query) => {
+      if (query.text.includes('SELECT id, title')) return [{
+        id: 7, title: '测试书', author: '作者', category: '仙侠', primary_genre: '修仙',
+        quality: 8, finish_status: '完结', chars_labeled: 30000, labels: { genre: '成长' },
+        labeled_at: '2026-09-14', shared_read_task_id: 90, my_download_task_id: 42,
+      }];
+      if (query.text.includes('AS total')) return [{ total: 31 }];
+      return [];
+    });
+    const res = await GET(memberRequest());
+    expect((await res.json()).books[0]).toMatchObject({ sharedReadTaskId: 90, myDownloadTaskId: 42 });
+    // 两个定位各查各的：共享面要求 done，私有面限定本人 user_id 且不挑 done。
+    expect(listQuery()?.text).toContain("dt.book_id = labeled_books.id AND dt.status = 'done'");
+    expect(listQuery()?.text).toContain('dt.user_id = ?');
   });
 
   it.each(['', '0', '-1', '1.5', '1.0', 'Infinity', 'NaN', '1e3', '0x10', ' 1', '10001', '9007199254740992'])('rejects page %s before touching the database', async (page) => {
