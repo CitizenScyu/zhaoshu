@@ -283,6 +283,28 @@ export function feedbackForUserQueries(sql: PersonalQuery, userId: number, raw: 
   ];
 }
 
+// 重新生成画像时的「本人最新有效反馈」（F04）：feedback 是追加式历史，每本书只认最新一行
+// （id DESC）；只有最新状态仍具信息量（done/dropped 且 note 非空）才作为偏好证据喂给模型。
+//
+// 🔴 先取最新、再判是否有信息量，顺序不能反：若先过滤 done/dropped+note，用户把某本书
+// 的反馈改成 want/reading 或清空 note（撤回）之后，那条历史 done+note 仍会被选中，
+// 等于靠旧数据永久保留已失效偏好。按 book_id 取最新一行即可让撤回如实生效。
+//
+// 只按 user_id 过滤，书中身份经 books join 取当前拼写；绝不跨用户读取。
+const MAX_PROFILE_FEEDBACK = 50;
+
+export function recentInformativeFeedbackForUserQuery(sql: PersonalQuery, userId: number, limit = MAX_PROFILE_FEEDBACK) {
+  requireUserId(userId);
+  return sql`SELECT title, author, status, note FROM (
+      SELECT DISTINCT ON (f.book_id) b.title, b.author, f.status, f.note, f.book_id
+      FROM feedback f JOIN books b ON b.id = f.book_id
+      WHERE f.user_id = ${userId}
+      ORDER BY f.book_id, f.id DESC
+    ) latest
+    WHERE latest.status IN (${'done'}, ${'dropped'}) AND btrim(latest.note) <> ''
+    ORDER BY title, author LIMIT ${limit}`;
+}
+
 export function feedbackSnapshotForUserQuery(sql: PersonalQuery, userId: number, title: string, author: string) {
   requireUserId(userId);
   const book = identityOf(title, author);
