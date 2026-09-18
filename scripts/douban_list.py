@@ -217,6 +217,11 @@ QIDIAN_MOBILE = 'https://m.qidian.com'
 # 不是区块名，靠 QIDIAN_FINISH_SUBTITLES 排除。
 QIDIAN_FINISH_SECTIONS = ('影视同期', '经典必读', '大神完本', '畅销完本')
 QIDIAN_FINISH_SUBTITLES = ('火热影视原作',)
+# 页脚导航词：出现即清空 section（真实页面最后一个区块（畅销完本）后直接接页脚，
+# 没有下一个区块名来切片，页脚词会被当条目收进名单——2026-09-18 phoenix 实跑抓到）。
+QIDIAN_FINISH_STOP = ('首页', '完本小说', '登录后获得更多特色功能', '立即登录',
+                      'QQ阅读', '红袖添香', '腾讯动漫', '客户端', '触屏版',
+                      '帮助与客服', '安装起点读书客户端', '看更多正版好书', '下载')
 # 区块条目里会出现的分类/导航词（既不是书名也不是作者）
 _QD_NOISE = {'玄幻', '仙侠', '都市', '历史', '游戏', '科幻', '悬疑', '奇幻', '武侠',
              '完本', '完结', '连载', '更多', '男生', '女生', '返回', '取消'}
@@ -252,6 +257,10 @@ def parse_qidian_finish(html: str) -> list[dict]:
         t = texts[i]
         if t in QIDIAN_FINISH_SECTIONS:
             section = t
+            i += 1
+            continue
+        if any(t == w or t.startswith(w) for w in QIDIAN_FINISH_STOP):
+            section = ''      # 页脚：后面不再有条目
             i += 1
             continue
         if section and t not in _QD_NOISE and t not in QIDIAN_FINISH_SUBTITLES \

@@ -757,10 +757,10 @@ def main() -> int:
             # 产出与 fetch_rank_books() 同构，后续打标循环零改动复用。
             import douban_list
             print('拉取名单并搜索 book15...')
-            # 桥接：豆瓣/起点侧传完整 URL（各名单源带自己的 BASE），book15 搜索侧传站内相对路径。
-            all_books = (douban_list.build_douban_queue(http_get) if args.source == 'douban'
-                         else douban_list.build_webnovel_queue(http_get))(
-                lambda path: http_get(path if path.startswith('http') else BASE + path))
+            # 桥接：名单源（豆瓣/起点）传完整 URL，book15 搜索侧传站内相对路径。
+            bridged = lambda path: http_get(path if path.startswith('http') else BASE + path)
+            all_books = (douban_list.build_douban_queue(bridged) if args.source == 'douban'
+                         else douban_list.build_webnovel_queue(bridged))
             print(f'{args.source} 线共 {len(all_books)} 本（搜索命中后）')
         else:
             print('拉取榜单书目...')

@@ -262,6 +262,8 @@ QIDIAN_FINISH_HTML = """<html><body>
 <div>畅销完本</div><div>更多</div>
 <div>捞尸人</div><div>人知鬼恐怖，鬼晓人心毒。这是一本传统灵异小说。</div><div>纯洁滴小龙</div>
 <div>都市</div><div>完本</div><div>651.82万字</div>
+<div>首页</div><div>完本小说</div><div>登录后获得更多特色功能</div><div>立即登录</div>
+<div>QQ阅读</div><div>腾讯动漫</div><div>触屏版</div><div>下载</div>
 </body></html>"""
 
 # 榜单页：序号 → 书名 → 简介 → 作者 → 分类 → 字数（月票榜是 书名→N月票→简介→作者→分类→字数）
@@ -301,6 +303,15 @@ class TestParseQidianFinish(unittest.TestCase):
             '<div>畅销完本</div><div>更多</div><div>诡秘之主</div><div>爱潜水的乌贼</div>')
         books = douban_list.parse_qidian_finish(html)
         self.assertEqual(len([b for b in books if b['title'] == '诡秘之主']), 1)
+
+    def test_footer_nav_words_are_not_titles(self):
+        # 2026-09-18 phoenix 实跑 bug：最后一个区块后直接接页脚（没有下一个区块名切片），
+        # 页脚词（首页/登录后…/QQ阅读/触屏版…）被当书名收进名单
+        books = douban_list.parse_qidian_finish(QIDIAN_FINISH_HTML)
+        titles = {b['title'] for b in books}
+        for footer in ('首页', '完本小说', '登录后获得更多特色功能', '立即登录',
+                       'QQ阅读', '腾讯动漫', '触屏版', '帮助与客服', '下载'):
+            self.assertNotIn(footer, titles)
 
     def test_empty_page(self):
         self.assertEqual(douban_list.parse_qidian_finish('<html></html>'), [])
