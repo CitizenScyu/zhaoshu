@@ -6,7 +6,7 @@
     },
     {
       "path": "/api/download/reclaim",
-      "schedule": "*/10 * * * *"
+      "schedule": "0 21 * * *"
     }
   ]
 }
