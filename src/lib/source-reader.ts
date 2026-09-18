@@ -14,6 +14,15 @@ import type { ReaderIndex, ReaderPart } from './reader-types';
 const MAX_SOURCE_REQUESTS = 12;
 const MAX_SOURCE_ATTEMPTS = 2;
 const SOURCE_DELAY_MS = 350;
+// M2 预算三层闸门的常量出处见 multisource-project-plan M0.2 与 m2-scaleout-design §3.1：
+// L1 单源点数/切片（非 builtin 源生效）、L2 全局兜底（openPool 抬高 totalLimit）、
+// 软预算 45s 的起点由根 context 的 startedAt 给出（判据本身在 M2-2）。
+export const PER_SOURCE_REQUESTS = 6;
+export const PER_SOURCE_SLICE_MS = 14_000;
+export const SOFT_BUDGET_MS = 45_000;
+export const MAX_POOL_REQUESTS = 30;
+/** 根 context 的 scope：builtin 首源不受 L1 单源闸门约束（零回归的机械保证）。 */
+export const BUILTIN_SCOPE = 'builtin';
 const MAX_DETAIL_CANDIDATES = 4;
 const MAX_SIMILAR_PAGES = 2;
 const MAX_SIMILAR_CANDIDATES = 6;
@@ -35,10 +44,74 @@ export interface SourceSimilarCandidate {
   bookUrl: string;
 }
 
+/** 父子共享的预算状态（设计 §3.1 的 shared）：计数、350ms 节流槽、全局上限、软预算起点。 */
+interface SharedSourceBudget {
+  requests: number;
+  nextRequestAt: number;
+  totalLimit: number;
+  startedAt: number;
+}
+
+interface SourceContextOptions {
+  budget?: SharedSourceBudget;
+  scope?: string;
+  sliceMs?: number;
+  sliceController?: AbortController;
+}
+
 export class SourceRequestContext {
-  requests = 0;
-  private nextRequestAt = 0;
-  constructor(readonly signal: AbortSignal, readonly limit = MAX_SOURCE_REQUESTS) {}
+  /** 源归属：根 context 是 builtin，其余由 child(sourceUrl) 指定（M2-2 消费）。 */
+  readonly scope: string;
+  /** 本 scope 独立的点数上限；全局上限见 totalLimit。 */
+  readonly limit: number;
+  private readonly budget: SharedSourceBudget;
+  // 本 scope 已扣点数：与 shared.requests 同步递增，但单独记账用于 L1 单源闸门判定。
+  private readonly scoped = { used: 0 };
+
+  constructor(readonly signal: AbortSignal, limit = MAX_SOURCE_REQUESTS, options: SourceContextOptions = {}) {
+    this.scope = options.scope ?? BUILTIN_SCOPE;
+    this.limit = limit;
+    // 根 context 的全局上限初值 = 构造 limit：单独用 context(n) 的既有调用路径行为逐点不变
+    //（openPool 只在 M2-2 的 resolveSourceBook 里被调用，M2-1 不改任何现有调用路径）。
+    this.budget = options.budget ?? { requests: 0, nextRequestAt: 0, totalLimit: limit, startedAt: Date.now() };
+    const sliceController = options.sliceController;
+    if (sliceController) {
+      // 单源切片：到点只 abort 子 signal（原因码 SOURCE_SCOPE_EXHAUSTED），父 signal 不受影响。
+      const timer = setTimeout(
+        () => sliceController.abort(new SourceReaderError('当前书源查询预算已用完，正在尝试下一个书源。', 'SOURCE_SCOPE_EXHAUSTED', 503)),
+        options.sliceMs ?? PER_SOURCE_SLICE_MS,
+      );
+      (timer as { unref?: () => void }).unref?.();
+      if (this.signal.aborted) clearTimeout(timer);
+      else this.signal.addEventListener('abort', () => clearTimeout(timer), { once: true });
+    }
+  }
+
+  /** 全局请求计数：父子共享，子 context 的请求同样计入且不回退（设计 §3.1）。 */
+  get requests(): number { return this.budget.requests; }
+
+  // 保留可写：既有消费方（source-verification 的共享预算判定/测试模拟）会直接回写计数。
+  set requests(value: number) { this.budget.requests = value; }
+
+  /** 全局兜底上限：openPool 只增不减地抬高它。 */
+  get totalLimit(): number { return this.budget.totalLimit; }
+
+  /** 软预算起点（M2-2 用 Date.now() − startedAt 与 SOFT_BUDGET_MS 比较）。 */
+  get startedAt(): number { return this.budget.startedAt; }
+
+  /** 池大小 → 全局兜底上限 min(30, max(12, 6×n))；幂等取最大值：failover 复用 context 时不得收窄。 */
+  openPool(poolSize: number): void {
+    const opened = Math.min(MAX_POOL_REQUESTS, Math.max(MAX_SOURCE_REQUESTS, PER_SOURCE_REQUESTS * poolSize));
+    this.budget.totalLimit = Math.max(this.budget.totalLimit, opened);
+  }
+
+  /** 单源子 context：requests/节流槽共享，limit 与切片独立；signal = any([父 signal, 切片定时器])。 */
+  child(scope: string, opts: { limit?: number; sliceMs?: number } = {}): SourceRequestContext {
+    const sliceController = new AbortController();
+    return new SourceRequestContext(AbortSignal.any([this.signal, sliceController.signal]), opts.limit ?? PER_SOURCE_REQUESTS, {
+      budget: this.budget, scope, sliceMs: opts.sliceMs, sliceController,
+    });
+  }
 
   async page(url: string, attempts = MAX_SOURCE_ATTEMPTS): Promise<{ url: string; text: string }> {
     let lastError: unknown;
@@ -48,14 +121,18 @@ export class SourceRequestContext {
         return await fetchSourceText(url, {
           signal: this.signal,
           beforeRequest: async (signal) => {
-            if (this.requests >= this.limit) throw new SourceReaderError('书源查询预算已用完，请稍后重试或下载全书。', 'SOURCE_BUDGET_EXCEEDED', 503);
-            this.requests++;
+            // L2 全局兜底：池预算用尽即停所有源（错误码与文案与今天逐字相同）。
+            if (this.budget.requests >= this.budget.totalLimit) throw new SourceReaderError('书源查询预算已用完，请稍后重试或下载全书。', 'SOURCE_BUDGET_EXCEEDED', 503);
+            // L1 单源点数：只放弃当前源（跳源），父/兄弟源的计数不回退；builtin 首源不受此闸门约束。
+            if (this.scope !== BUILTIN_SCOPE && this.scoped.used >= this.limit) throw new SourceReaderError('当前书源查询预算已用完，正在尝试下一个书源。', 'SOURCE_SCOPE_EXHAUSTED', 503);
+            this.budget.requests++;
+            this.scoped.used++;
             // 同步预占时间槽：并发调用各自拿到互不重叠的发射时刻，起始间隔恒为 SOURCE_DELAY_MS。
             // 若像以前那样在 await 之后才写回 nextRequestAt，多个并发 page() 会读到同一个旧值、
-            // 一起免等、一起发射，节流对源站失效。
+            // 一起免等、一起发射，节流对源站失效。槽位在父子 context 间共享（M2 不做每 host 分桶）。
             const now = Date.now();
-            const at = Math.max(now, this.nextRequestAt);
-            this.nextRequestAt = at + SOURCE_DELAY_MS;
+            const at = Math.max(now, this.budget.nextRequestAt);
+            this.budget.nextRequestAt = at + SOURCE_DELAY_MS;
             if (at > now) await pause(at - now, signal);
           },
         });
