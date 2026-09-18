@@ -128,10 +128,10 @@ describe('addShelfForUserQueries / shelfExistsForUserQuery（/api/shelf 路径�
 });
 
 describe('feedback 写查两侧同一身份', () => {
-  it('feedbackForUserQueries 五条语句全部绑定归一值', () => {
+  it('feedbackForUserQueries 六条语句全部绑定归一值', () => {
     const db = mockSql();
     const queries = bound(feedbackForUserQueries(db.sql, 3, { title: '《修真聊天群》', author: 'ＡＢＣ' }, 'want', 'n', 0));
-    expect(queries).toHaveLength(5);
+    expect(queries).toHaveLength(6);
     for (const query of queries) {
       expect(query.values).toContain('修真聊天群');
       expect(query.values).toContain('abc');
@@ -157,8 +157,11 @@ describe('feedback 写查两侧同一身份', () => {
       .find((value) => String(value).startsWith('[')))) as { title: string }[];
     // 两侧都必须落在归一值上（不写成 writtenTitle === read 值，否则摘掉归一也成立）
     expect(writtenRows[0].title).toBe('修真聊天群');
+    // read[0] 是 route B 补 books 行的 upsert，read[1] 才是锁行/定位的那条 SELECT。
     expect(read[0].values).toContain('修真聊天群');
     expect(read[0].values).not.toContain('《修真聊天群》');
+    expect(read[1].values).toContain('修真聊天群');
+    expect(read[1].values).not.toContain('《修真聊天群》');
   });
 });
 

@@ -196,10 +196,13 @@ export async function getFeedbackSnapshotForUser(userId: number, title: string, 
 export async function recordFeedbackForUser(userId: number, book: { title: string; author: string }, status: string, note: string, expectedVersion: number, write: PersonalWriter): Promise<void> {
   try {
     const results = await write((sql) => feedbackForUserQueries(sql, userId, book, status, note, expectedVersion));
-    // 第 4 条语句（索引 3）是按 title/author 定位后追加 feedback 的 INSERT ... RETURNING id。
+    // 第 5 条语句（索引 4）是按 title/author 定位后追加 feedback 的 INSERT ... RETURNING id
+    // （索引 0 是 route B 补 books 行的 upsert，见 user-data.ts feedbackForUserQueries）。
     // books 里没有这本书时它插入 0 行——旧行为是静默成功，这里显式失败。
+    // route B 之后这条路径基本不可达（upsert 已在同事务补行），但保留作护栏：身份键相同而
+    // 拼写不同的历史行会让 upsert 走 DO NOTHING、随后的 lower(title) 比较仍可能落空。
     // 该情况下第 5 条 UPDATE recommendations 同样匹配 0 行，整个批次没有写入任何数据。
-    const inserted = results?.[3];
+    const inserted = results?.[4];
     if (Array.isArray(inserted) && inserted.length === 0) throw new FeedbackBookNotFoundError();
   } catch (error) {
     if (error && typeof error === 'object' && 'code' in error && error.code === '22012') throw new FeedbackConflictError();
