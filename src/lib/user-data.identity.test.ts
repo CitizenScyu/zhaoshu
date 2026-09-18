@@ -30,35 +30,35 @@ const ITEM = {
 
 describe('persistRecommendationsForUserQueries（/api/find 写回路径）', () => {
   // P2-4 批量改写后语句恒为两条：[0] books 批量 upsert、[1] recommendations 批量落库。
-  // 身份值不再逐条绑定，而是整体 JSON 化进 jsonb_to_recordset——归一断言改为解析该
-  // JSON 参数后逐行核对，判别力与逐条绑定断言等价（脏值仍在参数里可见）。
+  // F09 后归一断言的两层含义：① 展示列存原始拼写；② 身份比较参数（title_key/author_key）
+  // 是归一值——生成列从原始值算出同一把键，两侧才同源。
   const batchRows = (query: Bound) => JSON.parse(String(query.values.find((v) => String(v).startsWith('[')))) as {
-    title: string; author: string;
+    title: string; author: string; title_key: string; author_key: string;
   }[];
 
-  it('books 的批量 INSERT 绑定的是归一后的 title/author，不是原始拼写', () => {
+  it('books 的批量 INSERT 存原始展示名，身份键参数是归一值', () => {
     const db = mockSql();
     const queries = bound(persistRecommendationsForUserQueries(db.sql, 1, '找书', [ITEM as never]));
     expect(queries).toHaveLength(2);
-    const [rows, serialized] = [batchRows(queries[0]), JSON.stringify(queries[0].values)];
-    expect(rows[0].title).toBe('修真聊天群');
-    expect(rows[0].author).toBe('abc');
-    expect(serialized).not.toContain('《修真聊天群》');
-    expect(serialized).not.toContain('ＡＢＣ');
+    const rows = batchRows(queries[0]);
+    expect(rows[0].title).toBe('《修真聊天群》');
+    expect(rows[0].author).toBe('ＡＢＣ');
+    expect(rows[0].title_key).toBe('修真聊天群');
+    expect(rows[0].author_key).toBe('abc');
+    // INSERT 的列清单里没有身份键（生成列不可显式写入，428C9）
+    expect(insertColumns(queries[0].text)).not.toContain('title_key');
   });
 
-  it('recommendations 的第二条语句用同一份归一值经身份键回查', () => {
+  it('recommendations 的第二条语句经归一的身份键回查', () => {
     const db = mockSql();
     const queries = bound(persistRecommendationsForUserQueries(db.sql, 1, '找书', [ITEM as never]));
     const recommendation = queries.find((q) => q.text.includes('INSERT INTO recommendations'))!;
     // 身份回查钉在生成列键上（与 books upsert 的冲突目标同一套键）；
     // 传参里的身份值必须是归一值。
-    expect(recommendation.text).toContain('b.title_key = j.title AND b.author_key = j.author');
+    expect(recommendation.text).toContain('b.title_key = j.title_key AND b.author_key = j.author_key');
     const rows = batchRows(recommendation);
-    expect(rows[0].title).toBe('修真聊天群');
-    expect(rows[0].author).toBe('abc');
-    expect(JSON.stringify(recommendation.values)).not.toContain('《修真聊天群》');
-    expect(JSON.stringify(recommendation.values)).not.toContain('ＡＢＣ');
+    expect(rows[0].title_key).toBe('修真聊天群');
+    expect(rows[0].author_key).toBe('abc');
   });
 
   it('全角冒号与书名号变体写进同一个身份', () => {
@@ -66,7 +66,8 @@ describe('persistRecommendationsForUserQueries（/api/find 写回路径）', () 
     const queries = bound(persistRecommendationsForUserQueries(db.sql, 1, 'q', [
       { ...ITEM, title: '修真聊天群：', author: 'Ｘ' } as never,
     ]));
-    expect(batchRows(queries[0])[0].title).toBe('修真聊天群:');
+    expect(batchRows(queries[0])[0].title_key).toBe('修真聊天群:');
+    expect(batchRows(queries[0])[0].title).toBe('修真聊天群：');
   });
 
   // task-53 收口后的冲突目标护栏（T53R-6）：身份唯一索引已从表达式索引
@@ -99,13 +100,23 @@ describe('persistRecommendationsForUserQueries（/api/find 写回路径）', () 
 });
 
 describe('addShelfForUserQueries / shelfExistsForUserQuery（/api/shelf 路径）', () => {
-  it('加入书架时绑定归一值', () => {
+  it('加入书架：展示列存原始拼写，比较参数用归一值', () => {
     const db = mockSql();
     const [bookInsert, recommendationInsert] = bound(addShelfForUserQueries(db.sql, 7, '《修真聊天群》', 'ＡＢＣ'));
-    expect(bookInsert.values[0]).toBe('修真聊天群');
-    expect(bookInsert.values[1]).toBe('abc');
+    expect(bookInsert.values[0]).toBe('《修真聊天群》');
+    expect(bookInsert.values[1]).toBe('ＡＢＣ');
     expect(recommendationInsert.values).toContain('修真聊天群');
+    expect(recommendationInsert.values).toContain('abc');
     expect(recommendationInsert.values).not.toContain('《修真聊天群》');
+  });
+
+  it('F08：status 取本人最新反馈，没有才 want', () => {
+    const db = mockSql();
+    const [, recommendationInsert] = bound(addShelfForUserQueries(db.sql, 7, '状态审查', '审查作者'));
+    expect(recommendationInsert.text).toContain('FROM feedback f');
+    expect(recommendationInsert.text).toContain('ORDER BY f.id DESC LIMIT 1');
+    expect(recommendationInsert.text).toContain('f.user_id = ?');
+    expect(recommendationInsert.values).toContain('want');
   });
 
   it('查重与写入用同一个函数，否则会重复入架', () => {
@@ -147,16 +158,17 @@ describe('feedback 写查两侧同一身份', () => {
     expect(snapshot.values).toContain('abc');
   });
 
-  it('回归护栏：客户端传原始拼写、库里存归一值 —— 两侧仍是同一个键', () => {
+  it('回归护栏：客户端传原始拼写、反馈按归一值回查 —— 两侧仍是同一个键', () => {
     const db = mockSql();
-    // find 回传的是召回阶段原始拼写（ＡＢＣ/《…》），写库时归一；
+    // find 回传的是召回阶段原始拼写（ＡＢＣ/《…》），写库时展示列存原始、身份键归一；
     // 反馈按原始拼写回查，必须落到同一身份，否则 404。
     const written = bound(persistRecommendationsForUserQueries(db.sql, 1, 'q', [ITEM as never]));
     const read = bound(feedbackForUserQueries(db.sql, 1, { title: ITEM.title, author: ITEM.author }, 'done', 'n', 0));
     const writtenRows = JSON.parse(String(written.find((q) => q.text.includes('INSERT INTO books'))!.values
-      .find((value) => String(value).startsWith('[')))) as { title: string }[];
-    // 两侧都必须落在归一值上（不写成 writtenTitle === read 值，否则摘掉归一也成立）
-    expect(writtenRows[0].title).toBe('修真聊天群');
+      .find((value) => String(value).startsWith('[')))) as { title: string; title_key: string }[];
+    // 写入侧展示列是原始拼写，身份键才是归一值（不写成 writtenTitle === read 值，否则摘掉归一也成立）
+    expect(writtenRows[0].title).toBe('《修真聊天群》');
+    expect(writtenRows[0].title_key).toBe('修真聊天群');
     // read[0] 是 route B 补 books 行的 upsert，read[1] 才是锁行/定位的那条 SELECT。
     expect(read[0].values).toContain('修真聊天群');
     expect(read[0].values).not.toContain('《修真聊天群》');

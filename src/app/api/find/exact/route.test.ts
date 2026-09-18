@@ -80,17 +80,20 @@ describe('POST /api/find/exact', () => {
   // （下面那条 values 断言会失败）；把归一去掉则 values 里会出现带书名号的原串。
   it('matches the local library through the shared identity key and skips douban', async () => {
     libraryRows([{
-      id: 7, title: '诡秘之主', author: '爱潜水的乌贼', douban_id: '1081275',
+      metadata_source: 'books', id: 7, title: '诡秘之主', author: '爱潜水的乌贼', douban_id: '1081275',
       douban_rating: 8.7, douban_rating_count: 1234,
       meta: { category: '西幻', wordCount: '400万字' }, on_shelf: true,
+      author_match: true, has_txt: false, has_online_source: false,
     }]);
     const res = await POST(request({ title: '《 诡秘之主 》' }));
 
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.source).toBe('library');
+    // F10：本地命中带来源/作者匹配/可读性；仅元数据不承诺可读。
     expect(body.items).toEqual([{
       title: '诡秘之主', author: '爱潜水的乌贼', source: 'library',
+      metadataSource: 'books', authorMatch: true, readAvailability: 'metadata',
       doubanId: '1081275', doubanUrl: 'https://book.douban.com/subject/1081275/',
       rating: 8.7, ratingCount: 1234, category: '西幻', wordCount: '400万字', onShelf: true,
     }]);
@@ -102,16 +105,44 @@ describe('POST /api/find/exact', () => {
     expect(libraryQuery?.text).toContain('b.title_key = ?');
     expect(libraryQuery?.values).toContain('诡秘之主');
     expect(libraryQuery?.values).not.toContain('《 诡秘之主 》');
-    // 没给作者就不按作者过滤（同名不同作者的书要一起列出来给用户挑）。
-    expect(libraryQuery?.text).not.toContain('author_key');
+    // F10：本地同时查 labeled_books，且不因作者缺失而硬过滤（作者只用于标注 author_match）。
+    expect(libraryQuery?.text).toContain('FROM labeled_books lb');
+    expect(libraryQuery?.text).toContain('author_match');
   });
 
-  it('filters by the normalized author when one is given', async () => {
+  it('annotates author match instead of hard-filtering (local and douban behave alike)', async () => {
     libraryRows([]);
     await POST(request({ title: '诡秘之主', author: '爱潜水的乌贼' }));
     const libraryQuery = db.queries.find((query: RecordedQuery) => query.text.includes('FROM books'));
+    // 作者输入用于标注（author_match），不再当过滤条件：同名不同作者的条目保留但标 false。
     expect(libraryQuery?.text).toContain('b.author_key = ?');
     expect(libraryQuery?.values).toContain('爱潜水的乌贼');
+    expect(libraryQuery?.text).not.toMatch(/WHERE[^)]*b\.author_key = \?/);
+  });
+
+  it('F10：labeled_books 命中带在线书源标注，有完成 TXT 时标 txt', async () => {
+    sql.mockImplementation((query) => query.text.includes('FROM books')
+      ? [{ metadata_source: 'labeled_books', id: 3, title: '书库独有', author: '作者甲', douban_id: null,
+        douban_rating: null, douban_rating_count: null, meta: {}, on_shelf: false,
+        author_match: true, has_txt: false, has_online_source: true }]
+      : []);
+    const body = await (await POST(request({ title: '书库独有' }))).json();
+    expect(body.items[0]).toMatchObject({ metadataSource: 'labeled_books', readAvailability: 'online' });
+
+    sql.mockImplementation((query) => query.text.includes('FROM books')
+      ? [{ metadata_source: 'books', id: 4, title: '有TXT', author: '作者甲', douban_id: null,
+        douban_rating: null, douban_rating_count: null, meta: {}, on_shelf: false,
+        author_match: true, has_txt: true, has_online_source: false }]
+      : []);
+    const txt = await (await POST(request({ title: '有TXT' }))).json();
+    expect(txt.items[0]).toMatchObject({ readAvailability: 'txt' });
+  });
+
+  it('F10：豆瓣候选按作者标 authorMatch，且不承诺可读', async () => {
+    mocks.searchBooks.mockResolvedValue(CANDIDATES);
+    const body = await (await POST(request({ title: '同名书', author: '作者甲' }))).json();
+    expect(body.items.map((item: { author: string; authorMatch: boolean; readAvailability: string }) => [item.author, item.authorMatch, item.readAvailability]))
+      .toEqual([['作者甲', true, 'unknown'], ['作者乙', false, 'unknown']]);
   });
 
   it('returns every douban candidate so same-title books can be told apart', async () => {

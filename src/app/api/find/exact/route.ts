@@ -3,6 +3,7 @@ import { ensureSchema, getSql } from '@/lib/db';
 import { withFindAccess, type PersonalRequest } from '@/lib/personal-request';
 import { boundedString, readJsonBody } from '@/lib/http';
 import { exactLibraryBooksForUserQuery } from '@/lib/user-data';
+import { normalizeBookAuthor } from '@/lib/book-identity';
 import { fetchSubjectRating, searchBooks, type DoubanCandidate } from '@/lib/douban';
 import { isRecord } from '@/lib/sanitize';
 import {
@@ -40,6 +41,7 @@ const MAX_RATING_LOOKUPS = 3;
 const DETAIL_CONCURRENCY = 3;
 
 interface LibraryRow {
+  metadata_source: string;
   id: number;
   title: string;
   author: string;
@@ -48,6 +50,9 @@ interface LibraryRow {
   douban_rating_count: number | null;
   meta: unknown;
   on_shelf: boolean;
+  author_match: boolean;
+  has_txt: boolean;
+  has_online_source: boolean;
 }
 
 // douban_id 进 URL 前先确认是纯数字：库里这一列由 verifyBook 写入，但它是 text 列，
@@ -59,10 +64,17 @@ function doubanUrlFor(id: string | null | undefined): string | undefined {
 function toLibraryItem(row: LibraryRow): ExactBook {
   const meta = isRecord(row.meta) ? row.meta : {};
   const url = doubanUrlFor(row.douban_id);
+  // F10：可读性只据数据推导，不承诺。有完成 TXT → 'txt'；书库行有在线书源 URL →
+  // 'online'（待确认）；否则只有元数据 → 'metadata'。文案由客户端按此渲染。
+  const readAvailability = row.has_txt ? 'txt' as const
+    : row.has_online_source ? 'online' as const : 'metadata' as const;
   return {
     title: row.title,
     author: row.author,
     source: 'library',
+    metadataSource: row.metadata_source === 'labeled_books' ? 'labeled_books' : 'books',
+    authorMatch: row.author_match === true,
+    readAvailability,
     ...(url ? { doubanId: row.douban_id as string, doubanUrl: url } : {}),
     rating: typeof row.douban_rating === 'number' ? row.douban_rating : null,
     ratingCount: typeof row.douban_rating_count === 'number' ? row.douban_rating_count : null,
@@ -149,8 +161,15 @@ export async function POST(req: NextRequest) {
       } satisfies ExactResponse);
     }
 
-    // 3) 可选评分（只抓前 N 个）。
-    const items = await withRatings(candidates, access, MAX_RATING_LOOKUPS);
+    // 3) 可选评分（只抓前 N 个）。F10：作者输入在豆瓣阶段用于**标注**（不合的保留但
+    // 标 authorMatch:false），与本地阶段行为一致；不承诺可读（readAvailability 'unknown'）。
+    const queryAuthor = author ? normalizeBookAuthor(author) : '';
+    const items = (await withRatings(candidates, access, MAX_RATING_LOOKUPS)).map((candidate) => ({
+      ...candidate,
+      metadataSource: 'douban' as const,
+      authorMatch: queryAuthor === '' || normalizeBookAuthor(candidate.author) === queryAuthor,
+      readAvailability: 'unknown' as const,
+    }));
     return NextResponse.json({ source: 'douban', items } satisfies ExactResponse);
   });
 }

@@ -21,6 +21,7 @@ import {
   exactResultNote,
   initialShelfPhase,
   parseExactResponse,
+  readAvailabilityLabel,
   shelfButtonLabel,
   shelfOutcome,
   showExactEmpty,
@@ -568,9 +569,11 @@ function ExactBookCard({ item, index }: { item: ExactBook; index: number }) {
 
           <p className="text-xs mt-1.5" style={{ color: 'var(--ink-faint)' }}>
             {item.source === 'library'
-              ? '本地书库精确命中。'
+              ? `本地命中（${item.metadataSource === 'labeled_books' ? '书库主表' : '书目记录'}）`
               : '来自豆瓣检索；豆瓣条目多为出版版本，网文常无条目。'}
-            {item.rating != null && ` 豆瓣评分 ${item.rating}`}
+            {readAvailabilityLabel(item.readAvailability) && ` · ${readAvailabilityLabel(item.readAvailability)}`}
+            {item.authorMatch === false && ' · 作者不匹配'}
+            {item.rating != null && ` · 豆瓣评分 ${item.rating}`}
             {item.ratingCount != null && ` · ${item.ratingCount} 人评价`}
           </p>
 
@@ -593,7 +596,11 @@ function ExactBookCard({ item, index }: { item: ExactBook; index: number }) {
                 豆瓣条目 →
               </a>
             )}
-            <ReadBookLink title={item.title} author={item.author} from="find" label="直接阅读" />
+            {/* F10：只有确认有正文（已完成 TXT / 有在线书源）才给「直接阅读」；仅有元数据
+                记录的命中不给，避免对无正文记录承诺可读。 */}
+            {(item.readAvailability === 'txt' || item.readAvailability === 'online') && (
+              <ReadBookLink title={item.title} author={item.author} from="find" label="直接阅读" />
+            )}
           </div>
 
           {note && <p className="mt-2 text-xs" role="alert" style={{ color: 'var(--cinnabar)' }}>{note}</p>}

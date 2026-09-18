@@ -12,30 +12,77 @@ export function requireUserId(userId: number): void {
 // 归一函数（task-49）。写和查必须用同一个函数，否则同一本书会写成两行、或查不到
 // 已写的那一行。归一在这里做且只做一次——函数对书名号不幂等（《《x》》会被剥两层），
 // 所以调用方（find/shelf 路由）传原值，不要预先归一。
+//
+// F09：返回值是**身份键**，不是展示名。写库时原始 title/author 原样进 title/author 列
+// （生成列再归一一次得到同一把键），这里的归一结果只作为比较参数 / 冲突目标出现。
+// 若把本函数结果写回展示列，生成列会对《《x》》再剥一层，键与参数分叉 → 静默漏写。
 // 返回值刻意叫 title/author：SQL 模板里仍然写 ${book.title} / ${book.author}，
 // scripts/check-feedback-cas.mjs 会抽取模板并按这个字面量白名单替换参数。
 function identityOf(title: string, author: string): { title: string; author: string } {
   return { title: normalizeBookTitle(title), author: normalizeBookAuthor(author) };
 }
 
+// 书架分页默认与上限（本也是原 LIMIT 300 的字面量；SHELF_ROW_LIMIT 由 shelf-view 导出，
+// 两边一致性由 shelf-view.test.ts 的源码断言钉住）。
+const SHELF_PAGE_LIMIT = 300;
+
+export interface ShelfQueryOptions {
+  /** 服务端搜索词，按 title/author 子串过滤（空串 = 不过滤）。 */
+  q?: string;
+  /** 单页本数，1..300。 */
+  limit?: number;
+  /** 跳过本数，>= 0。 */
+  offset?: number;
+}
+
+// LIKE 通配符转义（与 library/route.ts 同式）：未转义的 %/_ 会变成通配符。
+function escapeLike(value: string): string {
+  return value.replace(/([\\%_])/g, '\\$1');
+}
+
+function boundedLimit(value: number | undefined): number {
+  if (!Number.isSafeInteger(value) || (value as number) < 1) return SHELF_PAGE_LIMIT;
+  return Math.min(value as number, SHELF_PAGE_LIMIT);
+}
+
+function boundedOffset(value: number | undefined): number {
+  return Number.isSafeInteger(value) && (value as number) >= 0 ? (value as number) : 0;
+}
+
 // 只构造 SQL，供路由和隔离库验收共用；不读取任何连接配置或客户端身份字段。
-export function recommendationsForUserQuery(sql: PersonalQuery, userId: number, canRead: boolean) {
+//
+// F06：内层 DISTINCT ON (r.book_id) 取每本书的代表行（同一套「最新优先」三级 tie-break），
+// **外层**才按 created_at DESC, id DESC 排序并分页。旧写法把 LIMIT 300 压在内层
+// `ORDER BY r.book_id` 上，等于按 book_id 砍尾巴，第 301 本新书被时间排序救不回来。
+export function recommendationsForUserQuery(
+  sql: PersonalQuery, userId: number, canRead: boolean, options: ShelfQueryOptions = {},
+) {
   requireUserId(userId);
+  const limit = boundedLimit(options.limit);
+  const offset = boundedOffset(options.offset);
+  const keyword = (options.q ?? '').trim().slice(0, 100);
+  const search = keyword
+    ? sql`AND (b.title ILIKE ${`%${escapeLike(keyword)}%`} ESCAPE '\\' OR b.author ILIKE ${`%${escapeLike(keyword)}%`} ESCAPE '\\')`
+    : sql``;
   const readTask = canRead ? sql`(SELECT dt.id FROM download_tasks dt
     WHERE lower(btrim(dt.title)) = lower(btrim(b.title))
       AND lower(COALESCE(NULLIF(btrim(dt.author), ''), '佚名')) = lower(COALESCE(NULLIF(btrim(b.author), ''), '佚名'))
       AND dt.status = 'done' ORDER BY dt.id DESC LIMIT 1)` : sql`NULL::integer`;
-  return sql`SELECT DISTINCT ON (r.book_id)
-      r.id, r.query, r.match_score, r.hit_likes, r.risks, r.reason, r.status, r.created_at,
-      b.title, b.author, b.douban_id, b.douban_rating, b.douban_rating_count, b.meta,
-      ${readTask} AS read_task_id,
-      COALESCE((SELECT f.note FROM feedback f WHERE f.book_id = r.book_id AND f.user_id = ${userId}
-        ORDER BY f.id DESC LIMIT 1), '') AS note,
-      COALESCE((SELECT f.id FROM feedback f WHERE f.book_id = r.book_id AND f.user_id = ${userId}
-        ORDER BY f.id DESC LIMIT 1), 0) AS feedback_id
-    FROM recommendations r JOIN books b ON b.id = r.book_id
-    WHERE r.user_id = ${userId}
-    ORDER BY r.book_id, r.created_at DESC, r.match_score DESC, r.id DESC LIMIT 300`;
+  return sql`SELECT * FROM (
+      SELECT DISTINCT ON (r.book_id)
+        r.id, r.book_id, r.query, r.match_score, r.hit_likes, r.risks, r.reason, r.status, r.created_at,
+        b.title, b.author, b.douban_id, b.douban_rating, b.douban_rating_count, b.meta,
+        ${readTask} AS read_task_id,
+        COALESCE((SELECT f.note FROM feedback f WHERE f.book_id = r.book_id AND f.user_id = ${userId}
+          ORDER BY f.id DESC LIMIT 1), '') AS note,
+        COALESCE((SELECT f.id FROM feedback f WHERE f.book_id = r.book_id AND f.user_id = ${userId}
+          ORDER BY f.id DESC LIMIT 1), 0) AS feedback_id
+      FROM recommendations r JOIN books b ON b.id = r.book_id
+      WHERE r.user_id = ${userId} ${search}
+      ORDER BY r.book_id, r.created_at DESC, r.match_score DESC, r.id DESC
+    ) rep
+    ORDER BY rep.created_at DESC, rep.id DESC
+    LIMIT ${limit} OFFSET ${offset}`;
 }
 
 export function shelfExistsForUserQuery(sql: PersonalQuery, userId: number, title: string, author: string) {
@@ -49,19 +96,30 @@ export function addShelfForUserQueries(sql: PersonalQuery, userId: number, title
   requireUserId(userId);
   const book = identityOf(title, author);
   return [
-    sql`INSERT INTO books (title, author, meta) VALUES (${book.title}, ${book.author}, '{}'::jsonb)
+    // F09：展示列存原始拼写；身份键由生成列从原始值归一得到，与 ${book.*} 比较参数同源。
+    sql`INSERT INTO books (title, author, meta) VALUES (${title}, ${author}, '{}'::jsonb)
       ON CONFLICT (title_key, author_key) DO NOTHING`,
+    // F08：加书架只改变「是否收藏」，**不隐式重置阅读状态**——status 取该用户该书最新
+    // 有效 feedback；没有 feedback 才 want。移除后重新加入同样保持原读后状态。
     sql`INSERT INTO recommendations (user_id, book_id, query, status)
-      SELECT ${userId}, b.id, ${'书库添加'}, ${'want'} FROM books b
+      SELECT ${userId}, b.id, ${'书库添加'},
+        COALESCE((SELECT f.status FROM feedback f
+          WHERE f.book_id = b.id AND f.user_id = ${userId}
+          ORDER BY f.id DESC LIMIT 1), ${'want'})
+      FROM books b
       WHERE b.title_key = ${book.title} AND b.author_key = ${book.author}
         AND NOT EXISTS (SELECT 1 FROM recommendations r WHERE r.book_id = b.id AND r.user_id = ${userId})
       ON CONFLICT (user_id, book_id, query) DO NOTHING RETURNING book_id`,
   ];
 }
 
-export function deleteShelfForUserQuery(sql: PersonalQuery, userId: number, id: number) {
+// F05：移除语义按 (user_id, book_id) —— 列表按书展示（DISTINCT ON book_id），删除也必须
+// 按书删除，否则同一本书的另一条 query 行会残留、刷新重现。**只删推荐行，feedback 保留**
+// （读后状态不属书架归属）。bookId 由调用方从列表行带回；不接受 recommendation id，
+// 避免「删错一本书的某一条」再次发生。
+export function deleteShelfForUserQuery(sql: PersonalQuery, userId: number, bookId: number) {
   requireUserId(userId);
-  return sql`DELETE FROM recommendations WHERE id = ${id} AND user_id = ${userId} RETURNING id`;
+  return sql`DELETE FROM recommendations WHERE user_id = ${userId} AND book_id = ${bookId} RETURNING id`;
 }
 
 // 批量清掉「未处理」堆：只删 status='new' 的推荐行。
@@ -96,10 +154,17 @@ export function downloadStatsForUserQuery(sql: PersonalQuery, userId: number) {
     FROM download_tasks WHERE user_id = ${userId}`;
 }
 
+// F07：统计与列表同口径——先按 (user_id, book_id) 取代表行（与 recommendationsForUserQuery
+// 同一套 DISTINCT ON + 三级 tie-break），再 GROUP BY status 计数。状态是整本书所有推荐行
+// 一起改的（feedbackForUserQueries），取代表行的 status 即该书的书架状态。
+// 验收：同书多次推荐不增本数；各分类之和 = 可分页列出的作品总数。
 export function shelfStatsForUserQuery(sql: PersonalQuery, userId: number) {
   requireUserId(userId);
-  return sql`SELECT status AS name, count(*)::int AS count FROM recommendations
-    WHERE user_id = ${userId} GROUP BY status ORDER BY count DESC`;
+  return sql`SELECT status AS name, count(*)::int AS count FROM (
+      SELECT DISTINCT ON (r.book_id) r.book_id, r.status, r.created_at, r.match_score, r.id
+      FROM recommendations r WHERE r.user_id = ${userId}
+      ORDER BY r.book_id, r.created_at DESC, r.match_score DESC, r.id DESC
+    ) rep GROUP BY status ORDER BY count DESC`;
 }
 
 export function personalExportQueries(sql: PersonalQuery, userId: number) {
@@ -182,20 +247,20 @@ export function excludedBooksForUserQuery(sql: PersonalQuery, userId: number) {
 export function persistRecommendationsForUserQueries(s: PersonalQuery, userId: number, query: string, items: RerankedItem[]) {
   requireUserId(userId);
 
-  // 写库前先按身份键归一：阻止新的《》/全半角/大小写变体继续在 books 里派生新行。
-  // 两条语句必须用同一份归一后的值——第二条靠身份键找回刚写的那行。
-  // 批量形态（P2-4）：原先每本两条语句（2N 条进同一事务批，10 本 = 20 条），现在
-  // 恒定两条：books 批量 upsert + recommendations 批量落库，身份经 jsonb 参数传入，
-  // 与 shuyuan.ts 的 jsonb_to_recordset 批插同一模式。j.title/j.author 是**归一后的
-  // 身份值**，与 books 的生成列 title_key/author_key 同源（book-identity.ts 对齐
-  // migrations/0002 的 SQL 表达式），因此 recommendations 侧的回查从旧的
-  // lower(title)=lower(...) 改为键等值比较——对已归一输入语义不变（见
-  // user-data.identity.test.ts 与 route.pglite.test.ts 的真库回归）。
+  // F09：books 的 title/author 存**原始展示名**，身份归一**只发生在生成列与比较参数**。
+  // 归一结果（identityOf）作为 title_key/author_key 参数随行传入，仅用于：
+  //   ① books 的 ON CONFLICT (title_key, author_key)（生成列从原始值算键，与参数同源）；
+  //   ② recommendations 用 j.title_key/j.author_key 回查 books。
+  // 旧写法把归一结果写进 books.title，生成列再剥一层《》→ 键与参数分叉，
+  // `《《x》》` 这类输入 0 条推荐且事务成功（R06）。
+  // 批量形态（P2-4）：恒定两条语句：books 批量 upsert + recommendations 批量落库。
   const rows = items.map((item) => {
     const book = identityOf(item.title, item.author);
     return {
-      title: book.title,
-      author: book.author,
+      title: item.title,
+      author: item.author,
+      title_key: book.title,
+      author_key: book.author,
       douban_id: item.douban?.doubanId ?? null,
       rating: item.douban?.rating ?? null,
       rating_count: item.douban?.ratingCount ?? null,
@@ -211,24 +276,26 @@ export function persistRecommendationsForUserQueries(s: PersonalQuery, userId: n
     INSERT INTO books (title, author, douban_id, douban_rating, douban_rating_count, meta)
     SELECT title, author, douban_id, rating, rating_count, meta
     FROM jsonb_to_recordset(${JSON.stringify(rows)}::jsonb)
-      AS j(title text, author text, douban_id text, rating float8, rating_count int, meta jsonb, match_score float8, hit_likes jsonb, risks text, reason text)
+      AS j(title text, author text, douban_id text, rating float8, rating_count int, meta jsonb, match_score float8, hit_likes jsonb, risks text, reason text, title_key text, author_key text)
     ON CONFLICT (title_key, author_key) DO UPDATE
       SET douban_id = COALESCE(EXCLUDED.douban_id, books.douban_id),
           douban_rating = COALESCE(EXCLUDED.douban_rating, books.douban_rating),
           douban_rating_count = COALESCE(EXCLUDED.douban_rating_count, books.douban_rating_count),
           meta = books.meta || EXCLUDED.meta`,
+    // RETURNING b.id：调用方据实际写入行数与期望本数比对，数量不符不得回报 persisted=true。
     s`
     INSERT INTO recommendations (user_id, book_id, query, match_score, hit_likes, risks, reason)
     SELECT ${userId}, b.id, ${query}, j.match_score, j.hit_likes, j.risks, j.reason
     FROM jsonb_to_recordset(${JSON.stringify(rows)}::jsonb)
-      AS j(title text, author text, match_score float8, hit_likes jsonb, risks text, reason text)
-    JOIN books b ON b.title_key = j.title AND b.author_key = j.author
+      AS j(title_key text, author_key text, match_score float8, hit_likes jsonb, risks text, reason text)
+    JOIN books b ON b.title_key = j.title_key AND b.author_key = j.author_key
     ON CONFLICT (user_id, book_id, query) DO UPDATE
       SET match_score = EXCLUDED.match_score,
           hit_likes = EXCLUDED.hit_likes,
           risks = EXCLUDED.risks,
           reason = EXCLUDED.reason,
-          created_at = now()`,
+          created_at = now()
+    RETURNING book_id`,
   ];
 }
 
@@ -337,28 +404,59 @@ export function feedbackSnapshotForUserQuery(sql: PersonalQuery, userId: number,
     ORDER BY f.id DESC LIMIT 1`;
 }
 
-// 精确找书（task-77）的本地命中查询：按身份键在 books 里精确找，命中即返回、不打豆瓣。
+// 精确找书（task-77）的本地命中查询：按身份键在 books 与书库主表 labeled_books 里精确找，
+// 命中即返回、不打豆瓣。
 //
 // 查询条件是**生成列** title_key / author_key（migrations/0002_identity_key.sql），
-// 与写侧的 ON CONFLICT (title_key, author_key) 指向同一套键。这里刻意不再用
-// lower(title) = lower(...)：那套比较绕过了《》/全角归一，`《红楼》` 与 `红楼` 会查不到同一行。
+// 与写侧的 ON CONFLICT 指向同一套键（books 与 labeled_books 各自一列，表达式逐字相同）。
+// 这里刻意不再用 lower(title) = lower(...)：那套比较绕过了《》/全角归一。
+//
+// F10：只查 books 会漏掉只存在于 labeled_books（书库主表）的书；两张表都查、按同一把
+// 规范化身份键匹配，并用 metadata_source 区分命中来源。
+//
+// F10/A：给了作者也**不**硬过滤（同名不同作者要一起列给用户挑，与豆瓣阶段行为一致），
+// 只计算 author_match：作者不符的保留但标 false。
+// F10/B：has_txt（有完成 TXT）与 has_online_source（书库行有在线书源 URL）都从数据推导，
+// 调用方据此给「已有 TXT / 在线书源待确认 / 找到记录」——**不得**对无正文记录承诺可读。
 //
 // 输入只归一一次（identityOf），与所有其他 books 身份查询同源。
-// 不传作者时可能命中同名不同作者的多行——那是要展示给用户挑的，所以不是 LIMIT 1。
 const MAX_EXACT_LIBRARY_HITS = 5;
 
 export function exactLibraryBooksForUserQuery(sql: PersonalQuery, userId: number, title: string, author: string) {
   requireUserId(userId);
   const book = identityOf(title, author);
   // on_shelf 只影响「加入书架」按钮的初始态；books 没有 user 归属，user 维度由
-  // recommendations 提供（与 excludedBooksForUserQuery 同源）。这里**不**限定 status：
-  // 书架上任何状态都算「已在书架」，与 shelfExistsForUserQuery 的口径一致。
-  const columns = sql`SELECT b.id, b.title, b.author, b.douban_id, b.douban_rating, b.douban_rating_count, b.meta,
-      EXISTS (SELECT 1 FROM recommendations r WHERE r.book_id = b.id AND r.user_id = ${userId}) AS on_shelf
-    FROM books b`;
-  return book.author
-    ? sql`${columns} WHERE b.title_key = ${book.title} AND b.author_key = ${book.author}
-        ORDER BY b.id LIMIT ${MAX_EXACT_LIBRARY_HITS}`
-    : sql`${columns} WHERE b.title_key = ${book.title}
-        ORDER BY b.id LIMIT ${MAX_EXACT_LIBRARY_HITS}`;
+  // recommendations 提供（与 excludedBooksForUserQuery 同源），labeled_books 经身份键
+  // 关联到对应 books 行后再查推荐。这里**不**限定 status：书架上任何状态都算「已在书架」，
+  // 与 shelfExistsForUserQuery 的口径一致。
+  return sql`SELECT metadata_source, id, title, author, douban_id, douban_rating, douban_rating_count, meta,
+      on_shelf, author_match, has_txt, has_online_source
+    FROM (
+      SELECT 'books'::text AS metadata_source, 1 AS source_rank,
+        b.id, b.title, b.author, b.douban_id, b.douban_rating, b.douban_rating_count, b.meta,
+        EXISTS (SELECT 1 FROM recommendations r WHERE r.book_id = b.id AND r.user_id = ${userId}) AS on_shelf,
+        (${book.author} = '' OR b.author_key = ${book.author}) AS author_match,
+        EXISTS (SELECT 1 FROM download_tasks dt
+          WHERE lower(btrim(dt.title)) = lower(btrim(b.title))
+            AND lower(COALESCE(NULLIF(btrim(dt.author), ''), '佚名')) = lower(COALESCE(NULLIF(btrim(b.author), ''), '佚名'))
+            AND dt.status = 'done') AS has_txt,
+        EXISTS (SELECT 1 FROM labeled_books lb
+          WHERE lb.title_key = b.title_key AND lb.author_key = b.author_key AND lb.source_url <> '') AS has_online_source
+      FROM books b WHERE b.title_key = ${book.title}
+      UNION ALL
+      SELECT 'labeled_books'::text, 0,
+        lb.id, lb.title, lb.author, NULL::text, NULL::float8, NULL::int, '{}'::jsonb,
+        EXISTS (SELECT 1 FROM recommendations r JOIN books b2 ON b2.id = r.book_id
+          WHERE b2.title_key = lb.title_key AND b2.author_key = lb.author_key AND r.user_id = ${userId}),
+        (${book.author} = '' OR lb.author_key = ${book.author}),
+        EXISTS (SELECT 1 FROM download_tasks dt WHERE dt.book_id = lb.id AND dt.status = 'done'),
+        (lb.source_url <> '')
+      -- 同一身份只出一条：两表都有时以 books 行（带豆瓣元数据）为准，labeled_books
+      -- 只补 on_shelf/has_txt/has_online_source；只有 labeled_books 的书才会走这一支。
+      FROM labeled_books lb WHERE lb.title_key = ${book.title}
+        AND NOT EXISTS (SELECT 1 FROM books b3
+          WHERE b3.title_key = lb.title_key AND b3.author_key = lb.author_key)
+    ) hits
+    ORDER BY author_match DESC, source_rank ASC, id ASC
+    LIMIT ${MAX_EXACT_LIBRARY_HITS}`;
 }

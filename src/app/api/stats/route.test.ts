@@ -237,7 +237,8 @@ describe('GET /api/stats', () => {
         expect(text).toContain('WHERE user_id =');
         expect(values.at(-1)).toBe(2);
       }
-      if (text.includes('FROM recommendations')) { expect(text).toContain('WHERE user_id ='); expect(values[0]).toBe(2); }
+      // F07：书架统计也按本人 userId 过滤（新口径是 DISTINCT ON 子查询 + GROUP BY status）。
+      if (text.includes('FROM recommendations')) { expect(text).toContain('user_id ='); expect(values[0]).toBe(2); }
       if (!canDownload) { expect(text).not.toContain('download_tasks'); expect(text).not.toContain('shuyuan_sources'); }
     }
     if (!canDownload) expect(sql.mock.calls.some(([parts]) => parts.join('').includes('download_tasks'))).toBe(false);

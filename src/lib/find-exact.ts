@@ -16,11 +16,41 @@ export type FindMode = 'taste' | 'exact';
 
 export type ExactSource = 'library' | 'douban' | 'none';
 
-/** 精确找书的一条结果。library 来自本地 books 表，douban 来自 subject_suggest。 */
+/** 本地命中来源：books 元数据行 / 书库主表 labeled_books；豆瓣条目为 douban。 */
+export type ExactMetadataSource = 'books' | 'labeled_books' | 'douban';
+
+/**
+ * 可读性（F10）。**只描述数据事实，不承诺正文存在**：
+ *   - txt      有已完成的下载 TXT（可读）；
+ *   - online   书库行带在线书源 URL，但未验证目录（待确认）；
+ *   - metadata 只有元数据记录，没有正文；
+ *   - unknown  豆瓣条目，正文未知。
+ */
+export type ExactReadAvailability = 'txt' | 'online' | 'metadata' | 'unknown';
+
+export const EXACT_READ_LABELS: Record<ExactReadAvailability, string> = {
+  txt: '已有 TXT',
+  online: '在线书源待确认',
+  metadata: '找到记录',
+  unknown: '未确认正文',
+};
+
+/** 每条命中一行可读性说明；缺字段（旧响应）时不显示，避免编造。 */
+export function readAvailabilityLabel(value: ExactReadAvailability | undefined): string {
+  return value ? EXACT_READ_LABELS[value] : '';
+}
+
+/** 精确找书的一条结果。library 来自本地 books/labeled_books，douban 来自 subject_suggest。 */
 export interface ExactBook {
   title: string;
   author: string;
   source: 'library' | 'douban';
+  /** 元数据出处（本地命中区分 books / labeled_books）。 */
+  metadataSource?: ExactMetadataSource;
+  /** 作者输入是否与本条匹配；作者不符的候选保留但标 false。 */
+  authorMatch?: boolean;
+  /** 可读性；library 命中必带，douban 为 'unknown'。 */
+  readAvailability?: ExactReadAvailability;
   doubanId?: string;
   doubanUrl?: string;
   rating?: number | null;
@@ -41,7 +71,9 @@ export interface ExactResponse {
 
 export const EXACT_DOUBAN_MISS_NOTE = '豆瓣未收录这本书。未出版的网文常常没有条目，这不代表书不存在。';
 export const EXACT_UNAVAILABLE_NOTE = '豆瓣接口暂不可达，本轮没查成——这不代表书不存在。稍后可以重试。';
-export const EXACT_LIBRARY_NOTE = '本地书库命中，可以直接阅读。';
+// F10：命中一条元数据记录不等于有正文。文案不再说「可以直接阅读」，只陈述命中，
+// 可读性由每条结果上的 readAvailability 标注（已有 TXT / 在线书源待确认 / 找到记录）。
+export const EXACT_LIBRARY_NOTE = '本地书库命中以下记录；能否阅读见每条正文标注。';
 export const EXACT_DOUBAN_NOTE = '以下条目来自豆瓣，同名书可能有多本，请按作者挑。';
 
 /* ---------- 模式切换 ---------- */
@@ -138,10 +170,18 @@ function toExactBook(value: unknown): ExactBook[] {
   if (!isRecord(value)) return [];
   const title = typeof value.title === 'string' ? value.title.trim() : '';
   if (!title) return [];
+  const metadataSource = value.metadataSource === 'books' || value.metadataSource === 'labeled_books' || value.metadataSource === 'douban'
+    ? value.metadataSource : undefined;
+  const readAvailability = value.readAvailability === 'txt' || value.readAvailability === 'online'
+    || value.readAvailability === 'metadata' || value.readAvailability === 'unknown'
+    ? value.readAvailability : undefined;
   return [{
     title,
     author: typeof value.author === 'string' ? value.author.trim() : '',
     source: value.source === 'library' ? 'library' : 'douban',
+    ...(metadataSource ? { metadataSource } : {}),
+    ...(typeof value.authorMatch === 'boolean' ? { authorMatch: value.authorMatch } : {}),
+    ...(readAvailability ? { readAvailability } : {}),
     ...(typeof value.doubanId === 'string' && value.doubanId ? { doubanId: value.doubanId } : {}),
     ...(typeof value.doubanUrl === 'string' && value.doubanUrl ? { doubanUrl: value.doubanUrl } : {}),
     rating: typeof value.rating === 'number' && Number.isFinite(value.rating) ? value.rating : null,

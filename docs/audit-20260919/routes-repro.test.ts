@@ -74,7 +74,7 @@ beforeEach(() => {
   mocks.feedback.mockResolvedValue([]);
   mocks.withdrawn.mockResolvedValue([]);
   mocks.saveProfile.mockResolvedValue('v2');
-  mocks.persist.mockResolvedValue(undefined);
+  mocks.persist.mockImplementation(async (_userId: number, _query: string, items: unknown[]) => items.length);
 });
 afterEach(() => { vi.unstubAllEnvs(); vi.restoreAllMocks(); });
 

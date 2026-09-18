@@ -104,7 +104,8 @@ describe('POST /api/find output contract', () => {
     mocks.ensureSchema.mockResolvedValue(undefined);
     mocks.getProfileForUser.mockResolvedValue({ seeds: [], content: '画像' });
     mocks.getExcludedBookTitlesForUser.mockResolvedValue([]);
-    mocks.persistRecommendationsForUser.mockResolvedValue(undefined);
+    // F09：persist 返回实际写入行数；默认按输入本数成功写入。
+    mocks.persistRecommendationsForUser.mockImplementation(async (_userId: number, _query: string, items: unknown[]) => items.length);
     mocks.verifyBatch.mockImplementation(async (candidates: unknown[]) => candidates.map(() => douban));
     mocks.supplementSourceEvidence.mockImplementation(async (candidates) => candidates);
   });
@@ -428,6 +429,16 @@ describe('POST /api/find output contract', () => {
     const result = lastEvent<{ type: string; persisted: boolean; items: typeof item[] }>(events, 'result');
     expect(result.persisted).toBe(false);
     expect(result.items[0]).toMatchObject({ ...item, why: verified.why, douban: verified.douban });
+  });
+
+  // F09：写库「成功」但实际行数少于期望（身份连接漏写）不得回报 persisted=true。
+  it('reports persisted=false when fewer rows were written than expected', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    mocks.chatRobust.mockResolvedValue(JSON.stringify({ items: [item] }));
+    mocks.persistRecommendationsForUser.mockResolvedValue(0);
+    const events = await consumeSSE(await POST(request({ step: 'rerank', query: '找书', verified: [verified] })));
+    const result = lastEvent<{ type: string; persisted: boolean }>(events, 'result');
+    expect(result.persisted).toBe(false);
   });
 
   it('settles the request with a recognizable timeout event when the budget expires before the read finishes', async () => {
