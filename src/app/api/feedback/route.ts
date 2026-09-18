@@ -1,21 +1,14 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { ensureSchema, getSql, recordFeedbackForUser, getFeedbackSnapshotForUser, getProfileForUser, saveProfileForUser, FeedbackBookNotFoundError, FeedbackConflictError } from '@/lib/db';
-import { chatRobust, configuredTotalTimeoutMs, validateProfileContent } from '@/lib/llm';
-import { recordUsageAfterResponse } from '@/lib/record-llm-usage';
-import { profileUpdateSystem, profileUpdateUser } from '@/lib/prompts';
+import { ensureSchema, getSql, recordFeedbackForUser, getFeedbackSnapshotForUser, FeedbackBookNotFoundError, FeedbackConflictError } from '@/lib/db';
 import type { FeedbackStatus, ShelfStatus } from '@/lib/types';
 import { boundedString, readJsonBody } from '@/lib/http';
 import { withFindAccess } from '@/lib/personal-request';
-import { DeadlineExceededError, MODEL_ROUTE_INTERNAL_BUDGET_MS } from '@/lib/deadline';
-import { feedbackNeedsConfirmation } from '@/lib/feedback';
+import { MODEL_ROUTE_INTERNAL_BUDGET_MS } from '@/lib/deadline';
+import { feedbackNeedsConfirmation, feedbackQueuesProfileAbsorption } from '@/lib/feedback';
 
 export const maxDuration = 295;
 
 const MAX_BODY_BYTES = 8 * 1024;
-// 反馈回写画像的模型子预算：在内部预算里预留写回。
-// 可用额 = 285s 内部预算 − 12s 写回 reserve = 273s；ceiling 取 260s 留 13s 余量。
-// 上游是推理模型，思考链会把单步拉到 190s 上下，旧的 220s 会稳定截断。
-const MODEL_CEILING_MS = 260_000;
 
 const VALID: FeedbackStatus[] = ['want', 'reading', 'done', 'dropped'];
 
@@ -47,9 +40,14 @@ export async function POST(req: NextRequest) {
     if (feedbackNeedsConfirmation(current.note, safeNote) && body?.confirmNoteReduction !== true) {
       return NextResponse.json({ error: '反馈原因将减少，请确认后保存。', code: 'FEEDBACK_CONFIRM_REQUIRED', current }, { status: 409 });
     }
+    // 写路径只做两件事：快速持久化反馈 + 在同一事务登记「该用户有待吸收反馈」（F15）。
+    // 模型吸收不在这个请求里同步执行——用户不为数分钟的模型调用等待；吸收由
+    // /api/profile/absorb（显式/机会触发）按用户合并执行，失败保留 pending 可重放。
+    // 既有 CAS 语义、409/404/确认口径全部不变；queued=false 时不登记事件，响应如实报 unchanged。
+    const queued = feedbackQueuesProfileAbsorption(shelfStatus, safeNote, current.status, current.note);
     try {
       await access.commit((write) => recordFeedbackForUser(userId,
-        { title: cleanTitle, author: cleanAuthor }, shelfStatus, safeNote, expectedVersion, write));
+        { title: cleanTitle, author: cleanAuthor }, shelfStatus, safeNote, expectedVersion, write, queued));
     } catch (e) {
       if (e instanceof FeedbackConflictError) {
         const latest = await access.run(() => getFeedbackSnapshotForUser(userId, cleanTitle, cleanAuthor)).catch(() => null);
@@ -61,43 +59,17 @@ export async function POST(req: NextRequest) {
       throw e;
     }
 
-    // 有信息量的反馈 → 回写画像（失败不阻断；预算耗尽同样不阻断反馈保存）
-    let profileUpdated = false;
-    let updatedAt: string | null = null;
-    if ((shelfStatus === 'done' || shelfStatus === 'dropped') && safeNote && !access.deadline.expired) {
-      let stage = 'read-profile';
-      try {
-        const profile = await access.run(() => getProfileForUser(userId));
-        if (profile.content) {
-          const budgetMs = Math.min(access.deadline.modelBudgetMs(MODEL_CEILING_MS), configuredTotalTimeoutMs());
-          if (budgetMs <= 0) throw new DeadlineExceededError(MODEL_ROUTE_INTERNAL_BUDGET_MS);
-          stage = 'model';
-          const { content: updated } = await access.run(() => chatRobust(
-            profileUpdateSystem(), profileUpdateUser(profile.content, JSON.stringify({
-              title: cleanTitle, author: cleanAuthor, status: shelfStatus, note: safeNote,
-            })),
-            { temperature: 0.3, signal: access.signal, onUsage: recordUsageAfterResponse('feedback'), totalTimeoutMs: budgetMs },
-          ));
-          stage = 'validate';
-          const content = validateProfileContent(updated);
-          stage = 'save';
-          updatedAt = await access.commit((write) => saveProfileForUser(userId, profile.seeds, content, profile.updatedAt, write));
-          // 种子原样回传，所以"内容变了"就是这次回写真的改动了画像；
-          // CAS 命中只说明没有并发写入，不等于画像变了（模型可能原样返回）。
-          profileUpdated = updatedAt !== null && content !== profile.content;
-        }
-      } catch (error) {
-        // 已保存的反馈保留；授权改变、冲突、模型或预算错误都不再写画像。
-        // 不静默：否则"回写失败"与"模型判定无需修改"在用户侧完全无法区分。
-        // 只记阶段与错误类别，不落模型/数据库原文。
-        console.error('反馈回写画像失败，反馈本身已保存', {
-          stage,
-          name: error instanceof Error ? error.name : typeof error,
-          code: (error as { code?: unknown } | null)?.code ?? null,
-        });
-      }
-    }
-    return NextResponse.json({ ok: true, profileUpdated, ...(updatedAt ? { updatedAt } : {}) });
+    // profileUpdated 语义不变（本次响应是否真的改写了画像）；吸收已异步化，故恒为 false。
+    // profileStatus/pending/retryable 是新增的可观测字段：
+    //   pending    反馈已保存、画像待更新（可调用 /api/profile/absorb 重放）
+    //   unchanged  这次反馈对画像没有信息量，无需更新
+    return NextResponse.json({
+      ok: true,
+      profileUpdated: false,
+      profileStatus: queued ? 'pending' : 'unchanged',
+      pending: queued,
+      retryable: queued,
+    });
   });
 }
 

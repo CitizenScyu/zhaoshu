@@ -195,5 +195,25 @@ export async function initializeBusinessSchema(s: Sql) {
       error text NOT NULL DEFAULT ''
     )`,
     tx`CREATE INDEX IF NOT EXISTS source_admission_host_idx ON source_admission (host)`,
+    // F15：每个用户一行「待吸收反馈」队列。反馈写事务只做快速持久化 + 把 pending_feedback_id
+    // 抬到本次写入的反馈 id（GREATEST 合并并发写入）；画像吸收按用户合并成一次模型调用，成功后
+    // 才把 absorbed_feedback_id 推进、必要时清空 pending。status 记录最后一次结果：
+    // pending / applied / unchanged / failed / conflict。
+    //
+    // 为什么不需要迁移既有数据：这是**新表**，不改任何既有列；且队列语义是「从建表这一刻起
+    // 新写入的反馈才需要吸收」。历史反馈在旧版本里要么已经写进 profile.content，要么已经被
+    // 静默丢弃——本任务默认不动历史，不回填：absence of a row = 没有待处理事件。若把历史
+    // feedback 全量回填成 pending，会在用户下次写反馈时触发一次覆盖全史的大重放，属于改变既有
+    // 画像的破坏性动作，故刻意不做（如需回填见报告 §6，另行给出幂等方案）。
+    tx`
+    CREATE TABLE IF NOT EXISTS profile_feedback_queue (
+      user_id int PRIMARY KEY CONSTRAINT profile_feedback_queue_user_fk REFERENCES users(id),
+      pending_feedback_id int,
+      absorbed_feedback_id int NOT NULL DEFAULT 0,
+      status text NOT NULL DEFAULT 'unchanged',
+      attempts int NOT NULL DEFAULT 0,
+      last_error text NOT NULL DEFAULT '',
+      updated_at timestamptz NOT NULL DEFAULT now()
+    )`,
   ]);
 }
