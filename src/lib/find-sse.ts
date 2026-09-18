@@ -134,3 +134,16 @@ export function persistWarning(event: SseEvent): string | null {
   if (event.type !== 'result' || event.persisted !== false) return null;
   return '本轮结果未能保存，离开页面后可能不再保留。';
 }
+
+/**
+ * F13：rerank 合法零结果（items 为空）时，后端随 result 帧带上的排除原因摘要与放宽建议。
+ * 空 items 与写库失败（persisted=false）是两回事：前者是正常结局，只讲清为什么没有结果，
+ * 不套用「未能保存」的警告。返回 null 表示不是零结果帧（或后端没带摘要）。
+ */
+export function zeroResultNote(event: SseEvent): string | null {
+  if (event.type !== 'result') return null;
+  if (!Array.isArray(event.items) || event.items.length > 0) return null;
+  const reason = typeof event.zeroReason === 'string' ? event.zeroReason.trim() : '';
+  const suggestion = typeof event.zeroSuggestion === 'string' ? event.zeroSuggestion.trim() : '';
+  return [reason, suggestion].filter(Boolean).join(' ') || null;
+}

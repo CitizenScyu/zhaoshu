@@ -135,12 +135,43 @@ describe('POST /api/find output contract', () => {
     { step: 'rerank', field: 'items' },
   ])('validates the $field field as an error event', async ({ step, field }) => {
     // 数量超限**不再**报错：modelList 截断、下游 sanitize 本来就会 slice（见「尽力收容」用例）。
-    for (const list of [undefined, null, false, {}, 'wrong', []]) {
+    // F13 后 rerank 的 `items: []` 是合法零结果（另有专测），不再落在这里；recall 的空书单
+    // 仍是「无效数量」。
+    const invalidLists = step === 'rerank'
+      ? [undefined, null, false, {}, 'wrong']
+      : [undefined, null, false, {}, 'wrong', []];
+    for (const list of invalidLists) {
       mocks.chatRobust.mockResolvedValue(JSON.stringify({ [field]: list }));
       const events = await consumeSSE(await POST(request({ step, query: '找书', verified: [verified] })));
       expect(lastEvent<{ type: string; message: string }>(events, 'error').message).toMatch(/字段或数量/);
       expect(mocks.persistRecommendationsForUser).not.toHaveBeenCalled();
     }
+  });
+
+  // F13：模型明确交出空书单（全部候选命中硬雷点被淘汰）是**合法零结果**，不是模型故障。
+  // 判别力：把 allowEmpty 去掉（或把 items.length===0 也当错误）→ 这里会变成 error 帧且
+  // 模型被调两次，本用例必须失败。
+  it.each(['{"items":[]}', '[]'])('F13: legitimate empty rerank answer %j yields 200 + zero result in one model call', async (raw) => {
+    mocks.chatRobust.mockResolvedValue(raw);
+    const res = await POST(request({ step: 'rerank', query: '找书', verified: [verified] }));
+    const events = await consumeSSE(res);
+    expect(res.status).toBe(200);
+    const result = lastEvent<{ type: string; items: unknown[]; zeroReason?: string; zeroSuggestion?: string }>(events, 'result');
+    expect(result.items).toEqual([]);
+    expect(result.zeroReason).toMatch(/全被重排淘汰/);
+    // 明确不自动放宽硬约束，只给放宽建议。
+    expect(result.zeroSuggestion).toMatch(/没有自动放宽/);
+    expect(mocks.chatRobust).toHaveBeenCalledOnce();
+    expect(mocks.persistRecommendationsForUser).not.toHaveBeenCalled();
+  });
+
+  // F13 的边界：模型给了条目但全部没通过清洗/关联仍是形态错误，不能伪装成「没有符合条件的书」。
+  // 这条与上一条一起钉住「结构错误」与「合法零结果」的分界。
+  it('F13: items that fail validation are still an error, not a zero result', async () => {
+    mocks.chatRobust.mockResolvedValue(JSON.stringify({ items: [{ ...item, matchScore: null }] }));
+    const events = await consumeSSE(await POST(request({ step: 'rerank', query: '找书', verified: [verified] })));
+    expect(lastEvent(events, 'error')).toBeTruthy();
+    expect(mocks.persistRecommendationsForUser).not.toHaveBeenCalled();
   });
 
   // 🔴 项 1：根直接是数组（不同模型族常见的「少包一层」）不再丢掉整份输出。

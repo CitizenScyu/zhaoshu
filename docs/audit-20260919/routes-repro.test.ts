@@ -106,11 +106,16 @@ it('R10: fabricated verification values are rejected without a server-signed tic
   expect(mocks.model).not.toHaveBeenCalled();
 });
 
-it('R11: legitimate zero-survivor rerank is retried and then reported as a model error', async () => {
+// F13 翻转：原断言「合法语义的 {items:[]}（全部命中硬雷点）被重试后报模型错误」记录的是缺陷；
+// 修复后空书单是合法零结果——一次模型调用、result 帧带空 items + 排除摘要，不是 error。
+it('R11: legitimate zero-survivor rerank settles as a zero result in a single model call', async () => {
   mocks.model.mockResolvedValue({ content: '{"items":[]}' });
   const response = await find(request('find', { step: 'rerank', query: '全部命中雷点的合成需求', verified: [verified] }));
-  expect(await response.text()).toContain('"type":"error"');
-  expect(mocks.model).toHaveBeenCalledTimes(2);
+  const events = await response.text();
+  expect(events).toContain('"type":"result"');
+  expect(events).not.toContain('"type":"error"');
+  expect(events).toContain('全被重排淘汰');
+  expect(mocks.model).toHaveBeenCalledTimes(1);
   expect(mocks.persist).not.toHaveBeenCalled();
 });
 

@@ -1,16 +1,17 @@
 'use client';
 
 import { useEffect, useMemo, useReducer, useRef, useState, useSyncExternalStore } from 'react';
-import type { Candidate, RerankedItem, VerifiedCandidate, FeedbackStatus } from '@/lib/types';
+import type { Candidate, FindRetention, RerankedItem, VerifiedCandidate, FeedbackStatus } from '@/lib/types';
 import { useOwner } from '@/components/OwnerProvider';
 import FeedbackForm from '@/components/FeedbackForm';
 import ReadBookLink from '@/components/ReadBookLink';
 import { isRecord } from '@/lib/sanitize';
 import { EMPTY_HISTORY, historyKeyFor, historySnapshot, rememberQuery, subscribeHistory } from '@/lib/recent-queries';
+import { shouldRememberQuery } from '@/lib/find-retention';
 import { createElapsedTicker, recallProgressSuffix, retryLabel, retryStep, showRetry, type FindPhase, type FindStep } from '@/lib/find-progress';
 // SSE 消费与落定判定放在纯模块里：本仓 vitest 只收 *.test.ts 且没有 jsdom，写在 JSX 闭包里的
 // 超时/落定判定测不到（见 find-sse.test.ts）。
-import { FIND_FETCH_TIMEOUT_MS, fetchFindResult, persistWarning, type SseEvent } from '@/lib/find-sse';
+import { FIND_FETCH_TIMEOUT_MS, fetchFindResult, persistWarning, zeroResultNote, type SseEvent } from '@/lib/find-sse';
 // 精确找书（task-77）：模式、状态机、文案全部在纯模块里，本文件只做 JSX 与请求编排。
 import {
   EMPTY_EXACT_STATE,
@@ -68,6 +69,7 @@ export default function FindTab() {
   const [results, setResults] = useState<RerankedItem[]>([]);
   const [error, setError] = useState('');
   const [persistNote, setPersistNote] = useState(''); // result 帧 persisted=false：结果没存下来，必须说给用户
+  const [emptyNote, setEmptyNote] = useState(''); // F13：合法零结果的排除原因摘要/放宽建议
   const [recallSeconds, setRecallSeconds] = useState(0); // recall 阶段已等待秒数
   const [retryFrom, setRetryFrom] = useState<FindStep | null>(null); // 失败后可从哪一步起重试
   const request = useRef<AbortController | null>(null);
@@ -75,7 +77,7 @@ export default function FindTab() {
   // ticket 是服务端签发的验证票据（F01），rerank 必须回传它，服务端只认票据里的 verified。
   const verifiedRef = useRef<VerifiedCandidate[]>([]);
   const ticketRef = useRef('');
-  const runCtxRef = useRef<{ q: string; conditions: string } | null>(null);
+  const runCtxRef = useRef<{ q: string; conditions: string; retention: FindRetention } | null>(null);
   useEffect(() => () => { request.current?.abort(); }, [apiFetch]);
 
   // recall 阶段后端不发阶段推进事件，用前端计时器报「已等待 Xs」；phase 一变或组件卸载就清理，
@@ -107,10 +109,14 @@ export default function FindTab() {
   async function run() {
     const q = query.trim();
     if (!q || phase === 'recall' || phase === 'verify' || phase === 'rerank') return;
-    rememberQuery(historyKey, q);
-    // 勾选「仅本次有效」：本次输入走 conditions 通道（soft 约束、不写入长期画像/不入记忆）；
-    // 未勾 = 长期通道（conditions 传空），行为同现状。
-    runCtxRef.current = { q, conditions: onlyThisTime ? q : '' };
+    // F12：勾选「仅本次有效」= session 契约——本次需求只用于本轮匹配，不写搜索历史、
+    // 推荐记录不落需求原文；未勾 = longterm。搜索历史的写入由 retention 显式决定，
+    // 不再无条件 rememberQuery（旧实现勾不勾都写历史，与文案「不进入记忆」不符）。
+    const retention = onlyThisTime ? 'session' : 'longterm';
+    if (shouldRememberQuery(retention)) rememberQuery(historyKey, q);
+    // conditions 仍是「仅本次生效的软约束」通道，但持久化意图改由 retention 显式承载，
+    // 不再靠 conditions 是否为空反推。
+    runCtxRef.current = { q, conditions: onlyThisTime ? q : '', retention };
     await runFrom('recall');
   }
 
@@ -124,14 +130,15 @@ export default function FindTab() {
   async function runFrom(start: FindStep) {
     const ctx = runCtxRef.current;
     if (!ctx) return;
-    const { q, conditions } = ctx;
+    const { q, conditions, retention } = ctx;
     const stepBody = (step: FindStep, extra: Record<string, unknown> = {}) => JSON.stringify({
-      step, query: q, conditions, ...extra,
+      step, query: q, conditions, retention, ...extra,
     });
 
     setError('');
     setRetryFrom(null);
     setPersistNote('');
+    setEmptyNote('');
     setPhase(start);
     let recalled: Candidate[] = start === 'recall' ? [] : candidates;
     let verified: VerifiedCandidate[] = start === 'rerank' ? verifiedRef.current : [];
@@ -204,6 +211,7 @@ export default function FindTab() {
       if (!Array.isArray(resultEvent.items)) throw new Error('找书结果不完整，请重试');
       setResults(resultEvent.items as RerankedItem[]);
       setPersistNote(persistWarning(resultEvent) ?? '');
+      setEmptyNote(zeroResultNote(resultEvent) ?? '');
       setPhase('done');
     } catch (e) {
       if (controller.signal.aborted) return;
@@ -375,7 +383,10 @@ export default function FindTab() {
         </p>
       )}
       {phase === 'done' && results.length === 0 && (
-        <p role="status" className="mt-8 text-sm">本轮没有符合条件的书。</p>
+        <div role="status" className="mt-8 flex flex-col gap-1.5">
+          <p className="text-sm">本轮没有符合条件的书。</p>
+          {emptyNote && <p className="text-xs" style={{ color: 'var(--ink-faint)' }}>{emptyNote}</p>}
+        </div>
       )}
       {results.length > 0 && (
         <div className="mt-8 space-y-4">
