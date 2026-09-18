@@ -131,6 +131,30 @@ describe('online catalog growth keeps a verifiable resume position', () => {
     expect(parseReadingProgress(JSON.stringify(saved), after)).toBeNull();
   });
 
+  // 下列两条唯一能拦住「当前章标题仍在原位且唯一、但读取位置之前的标题序列已被改写/交换」的窗口：
+  // 标题与唯一性两道门都会放过，只有前缀指纹能证明原章位置未被打乱。删掉指纹判断必须变红。
+  it('位置之前的两章被交换：当前章壳仍在原位且唯一，但前缀已变 → null', () => {
+    const before = onlineIndex('rev-1', ['第1章', '第2章', '第3章']);
+    const saved = onlineProgress(before, 2); // 第3章
+    const after = onlineIndex('rev-2', ['第2章', '第1章', '第3章']);
+    // 索引 2 仍是「第3章」且全目录唯一；若不比指纹会静默续读到被换了前文的目录。
+    expect(parseReadingProgress(JSON.stringify(saved), after)).toBeNull();
+  });
+
+  it('位置之前的某章被改题：当前章壳仍在原位且唯一，但前缀已变 → null', () => {
+    const before = onlineIndex('rev-1', ['第1章', '第2章', '第3章']);
+    const saved = onlineProgress(before, 2); // 第3章
+    const after = onlineIndex('rev-2', ['序章', '第2章', '第3章']);
+    expect(parseReadingProgress(JSON.stringify(saved), after)).toBeNull();
+  });
+
+  it('对照：位置之后插入一章（前缀未变）仍恢复到同一章', () => {
+    const before = onlineIndex('rev-1', ['第1章', '第2章', '第3章']);
+    const saved = onlineProgress(before, 2); // 第3章，位于索引 2
+    const after = onlineIndex('rev-2', ['第1章', '第2章', '第3章', '插页', '第4章']);
+    expect(parseReadingProgress(JSON.stringify(saved), after)?.chapterIndex).toBe(2);
+  });
+
   it('同名章多匹配：追加一章与进度章同名 → 无法唯一命中，返回 null', () => {
     const before = onlineIndex('rev-1', ['第1章', '第2章', '第3章']);
     const saved = onlineProgress(before, 2);
@@ -168,13 +192,12 @@ describe('online catalog growth keeps a verifiable resume position', () => {
     });
   });
 
-  it('迁移后分段越界（partCount 缩短）时返回 null', () => {
-    const before = onlineIndex('rev-1', ['第1章', '第2章']);
-    const saved = onlineProgress(before, 1, { partIndex: 2, partCount: 3 });
-    const after: ReaderIndex = {
-      ...onlineIndex('rev-2', ['第1章', '第2章', '第3章']),
-      chapters: ['第1章', '第2章', '第3章'].map((title, i) => ({ index: i, title, startByte: 0, endByte: 0, partCount: i === 1 ? 1 : 1 })),
-    };
+  it('迁移后分段越界（partCount 真的缩短）时返回 null', () => {
+    const before = onlineIndex('rev-1', ['第1章', '第2章', '第3章']);
+    before.chapters[1] = { ...before.chapters[1], partCount: 3 };
+    const saved = onlineProgress(before, 1, { partIndex: 2 }); // 旧「第2章」有 3 段，读到第 3 段
+    const after = onlineIndex('rev-2', ['第1章', '第2章', '第3章', '第4章']);
+    after.chapters[1] = { ...after.chapters[1], partCount: 1 }; // 新目录里同一章只剩 1 段
     expect(parseReadingProgress(JSON.stringify(saved), after)).toBeNull();
   });
 });
