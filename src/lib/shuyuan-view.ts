@@ -12,7 +12,10 @@ export const SOURCE_PAGE_SIZE = 20;
  */
 export const MAX_SOURCE_PAGE = 500;
 
-/** 探测状态。unprobed 表示没有快照记录，不代表失败。 */
+/**
+ * 探测状态。unprobed 表示还没有可用的探测结论——可能从未探测过，也可能是探测过但连续失败
+ * 还没达到判死阈值（见 shuyuan.ts 的 PROBE_FAILURE_THRESHOLD）。两种情况都不代表失败。
+ */
 export type ShuyuanAvailability = 'unprobed' | 'pending' | 'reachable' | 'failed';
 
 const AVAILABILITY_LABELS: Record<ShuyuanAvailability, string> = {
@@ -98,7 +101,10 @@ function normalizedPageSize(pageSize: number): number {
   return Number.isSafeInteger(pageSize) && pageSize > 0 ? pageSize : SOURCE_PAGE_SIZE;
 }
 
-/** getReadingSources 的两个可用条件。上游规则自带的 enabled 标记是第三个条件，界面暂不展示。 */
+/**
+ * getReadingSources 的两个可用条件。上游规则自带的 enabled 标记是第三个条件，界面暂不展示。
+ * availability 的 failed 只由「连续探测失败达到阈值」写成，单次抖动不会走到这里。
+ */
 export function participatesInSearch(source: { disabled: boolean; availability: ShuyuanAvailability }): boolean {
   return !source.disabled && source.availability !== 'failed';
 }

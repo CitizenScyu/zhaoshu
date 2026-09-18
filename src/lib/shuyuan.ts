@@ -18,6 +18,14 @@ const jsonUrl = (id: number) => `https://www.yckceo.com/yuedu/shuyuans/json/id/$
 const LATEST_COUNT = 3; // 只跟最新 3 个合集
 const PROBE_TIMEOUT_MS = 8_000;
 const PROBE_CONCURRENCY = 10;
+// 连续探测失败达到该次数，才把源写成 failed（failed 会被 getReadingSources 剔除，退出取书可用集）。
+// 单次失败（含连接层挂起拖满 PROBE_TIMEOUT_MS 这类瞬时抖动）只累加计数，不改变上一次的结论状态：
+// probeWorker 每个源每轮刷新只探测一次、不重试，阈值就是靠跨刷新累积的这几次单次探测生效的。
+const PROBE_FAILURE_THRESHOLD = 3;
+// 每轮刷新最多补探多少个「还没有任何探测结论」的可探测源。补探是为了让可用性数据从零自动建立
+// （否则门控只认已有的失败记录，永远没有第一条记录）。上限取并发数：这批补探正好压在一轮并发里
+// （≤ PROBE_TIMEOUT_MS），不会额外吃掉刷新预算，也永远排在已知失败源之后。
+const PROBE_DISCOVERY_PER_REFRESH = PROBE_CONCURRENCY;
 const INSERT_CHUNK = 100;
 const SOURCE_STATUS_LIMIT = 100;
 const WRITE_RESERVE_MS = 5_000;
@@ -65,7 +73,13 @@ export type ShuyuanStatsPage = ShuyuanStats & ShuyuanSourcePage;
 export type ShuyuanListQuery = { filter: ShuyuanSourceFilter; page: number };
 
 type Sql = ReturnType<typeof getSql>;
-type ProbeState = { url: string; status: ShuyuanAvailability; checked_at: string | null; error: string | null };
+// consecutive_failures 是跨刷新累积的连续探测失败次数：成功写 0（清零），失败 +1，
+// 达到 PROBE_FAILURE_THRESHOLD 才把 status 写成 failed。旧快照没有这个字段 ⇒ undefined，
+// 与加字段前的解析结果逐字节等价（`?? 0` 只在判据处补齐，不写回解析结果）。
+type ProbeState = {
+  url: string; status: ShuyuanAvailability; checked_at: string | null; error: string | null;
+  consecutive_failures?: number;
+};
 type MetaRow = { collections: unknown; refreshed_at: string | null };
 type StoredSource = {
   source_url: string; source: Record<string, unknown>; last_error: string; disabled_at: string | null;
@@ -105,6 +119,8 @@ function canProbe(url: string): boolean {
 
 // collections 仍是数组，首项附带仅由服务端产生的版本化探测快照；旧数据默认未探测。
 // 不需要 DDL，也不信任上游规则 JSON 中自报的健康状态。
+// 条目里允许出现 status='unprobed'：那是「探测过、但连续失败还没达到判死阈值」的一态，
+// 对展示、筛选和取书判据而言与「没有条目」完全等价，加它只是为了把连续失败计数持久化下来。
 function readMeta(value: unknown): { collections: ShuyuanCollection[]; states: Map<string, ProbeState> } {
   const list = Array.isArray(value) ? value : [];
   const collections = list.filter((item) => isRecord(item) &&
@@ -118,14 +134,20 @@ function readMeta(value: unknown): { collections: ShuyuanCollection[]; states: M
       if (!isRecord(entry) || typeof entry.url !== 'string') continue;
       if (seen.has(entry.url)) { states.delete(entry.url); continue; }
       seen.add(entry.url);
-      if (!['pending', 'reachable', 'failed'].includes(String(entry.status))) continue;
+      if (!['unprobed', 'pending', 'reachable', 'failed'].includes(String(entry.status))) continue;
       const status = entry.status as ProbeState['status'];
       const checkedAt = typeof entry.checked_at === 'string' && Number.isFinite(Date.parse(entry.checked_at))
         ? entry.checked_at : null;
-      if (status !== 'pending' && (!canProbe(entry.url) || !checkedAt)) continue;
+      // pending 与 unprobed 都没有「结论时刻」，其余两态必须有可探测域名和有效时间戳。
+      if (status !== 'pending' && (!canProbe(entry.url) || (status !== 'unprobed' && !checkedAt))) continue;
+      const failures = typeof entry.consecutive_failures === 'number' && Number.isSafeInteger(entry.consecutive_failures)
+        && entry.consecutive_failures >= 0 ? entry.consecutive_failures : undefined;
       states.set(entry.url, {
-        url: entry.url, status, checked_at: status === 'pending' ? null : checkedAt,
+        url: entry.url, status,
+        checked_at: status === 'pending' || status === 'unprobed' ? null : checkedAt,
         error: typeof entry.error === 'string' ? entry.error.slice(0, 200) : null,
+        // 缺字段时留 undefined（不补 0）：解析旧快照必须与加字段前逐字节等价。
+        consecutive_failures: failures,
       });
     }
   }
@@ -225,7 +247,7 @@ async function countsFromStates(s: Sql, states: Map<string, ProbeState>, signal?
            count(*) FILTER (WHERE disabled_at IS NULL AND p.status = 'reachable')::int AS active,
            count(*) FILTER (WHERE disabled_at IS NULL)::int AS enabled,
            count(*) FILTER (WHERE disabled_at IS NOT NULL)::int AS disabled,
-           count(*) FILTER (WHERE p.status IS NULL)::int AS unprobed,
+           count(*) FILTER (WHERE COALESCE(p.status, 'unprobed') = 'unprobed')::int AS unprobed,
            count(*) FILTER (WHERE p.status = 'pending')::int AS pending,
            count(*) FILTER (WHERE p.status = 'reachable')::int AS reachable,
            count(*) FILTER (WHERE p.status = 'failed')::int AS failed
@@ -272,7 +294,7 @@ export async function getShuyuanStats(
     WHERE ${filter} = 'all'
        OR (${filter} = 'enabled' AND disabled_at IS NULL)
        OR (${filter} = 'disabled' AND disabled_at IS NOT NULL)
-       OR (${filter} = 'unprobed' AND p.status IS NULL)
+       OR (${filter} = 'unprobed' AND COALESCE(p.status, 'unprobed') = 'unprobed')
        OR (${filter} = 'pending' AND p.status = 'pending')
        OR (${filter} = 'reachable' AND p.status = 'reachable')
        OR (${filter} = 'failed' AND p.status = 'failed')
@@ -310,9 +332,12 @@ export async function disableShuyuanSource(url: string, reason: string): Promise
  * 探测状态置为 pending（待核验），不碰启停标记。所以手动启用的语义是稳定的。
  *
  * 保留 last_error 是为了让界面继续显示「上一次为什么失败」，而不是启用后抹成一片空白。
- * 注意探活资格的门槛是「有 last_error + 域名可探测（目前只有 book15.net）+ 非 pending」，
- * 其中没有 disabled_at：所以保留 last_error 并不会换来一次原本没有的重试，
- * 可探测域名下的失败源本来每次刷新都会被探一遍，启用与否都一样。
+ * 注意探活资格的门槛是「有失败记录（last_error 非空，或快照里连续失败计数 > 0）+ 域名可探测
+ * （目前只有 book15.net）+ 非 pending」，其中没有 disabled_at：所以保留 last_error 并不会换来
+ * 一次原本没有的重试，可探测域名下的失败源本来每次刷新都会被探一遍，启用与否都一样。
+ * （每轮刷新另外补探少量「还没有任何结论」的启用源，那条才看 disabled_at——禁用源不参与取书，
+ * 探它没有意义；详见 refreshWithinBudget 里的入队注释。）
+ * 探测成功不清 last_error：它是历史失败证据，清掉界面上「上一次为什么失败」就没了。
  *
  * 幂等：对已启用的源执行同样返回 true（行存在）；URL 不在库里才返回 false。
  */
@@ -378,17 +403,30 @@ async function refreshWithinBudget(s: Sql, budget: RequestDeadline, signal: Abor
   const oldStates = readMeta(oldMeta.collections).states;
   const states = new Map<string, ProbeState>();
   const probes: string[] = [];
+  // 还没有任何探测结论的启用源，按名额补探（排在已知失败源之后，理由见 PROBE_DISCOVERY_PER_REFRESH）。
+  const discovery: string[] = [];
+  let discoverySlots = PROBE_DISCOVERY_PER_REFRESH;
   for (const [url, item] of merged) {
     const old = previous.get(url);
     if (old && !sameRules(old.source, item)) {
+      // 规则变了：旧的结论和连续失败计数一起作废，退回待核验。
       states.set(url, { url, status: 'pending', checked_at: null, error: null });
       continue;
     }
     const state = oldStates.get(url);
     if (state) states.set(url, state);
-    if (old?.last_error && state?.status !== 'pending' && canProbe(url)) probes.push(url);
+    if (state?.status === 'pending' || !canProbe(url)) continue;
+    // 已知失败记录（人工写的 last_error，或上一轮探测累计的连续失败计数）每轮都重探，
+    // 探到成功才清零计数、回到可达。
+    if (old?.last_error || (state?.consecutive_failures ?? 0) > 0) probes.push(url);
+    // 没有任何结论的启用源才补探：禁用源不参与取书，探它没有意义。
+    else if (!state && !old?.disabled_at && discoverySlots > 0) { discoverySlots--; discovery.push(url); }
   }
+  probes.push(...discovery);
 
+  // 本轮探测失败、且这个源还没有失败记录时，补一条 last_error——这是 last_error 的自动写点
+  // （在此之前只有人工 POST {action:disable} 会写它）。已有值不覆盖：那是历史失败证据。
+  const probeFailures = new Map<string, string>();
   let next = 0;
   async function probeWorker() {
     while (next < probes.length) {
@@ -396,13 +434,23 @@ async function refreshWithinBudget(s: Sql, budget: RequestDeadline, signal: Abor
       const url = probes[next++];
       try {
         await fetchText(validateSourceUrl(url).href, PROBE_TIMEOUT_MS, signal);
-        states.set(url, { url, status: 'reachable', checked_at: new Date().toISOString(), error: null });
+        // 探测成功即清零连续失败计数，回到可达。
+        states.set(url, { url, status: 'reachable', checked_at: new Date().toISOString(), error: null, consecutive_failures: 0 });
       } catch (error) {
+        // 调用方中止（含刷新预算耗尽）不是源故障：不写状态、不计数，保持旧态。
         if (signal.aborted) return;
-        states.set(url, {
-          url, status: 'failed', checked_at: new Date().toISOString(),
-          error: (error instanceof Error ? error.message : '探测失败').slice(0, 200),
-        });
+        const message = (error instanceof Error ? error.message : '探测失败').slice(0, 200);
+        const previousState = states.get(url);
+        const consecutive_failures = (previousState?.consecutive_failures ?? 0) + 1;
+        if (!previous.get(url)?.last_error) probeFailures.set(url, message);
+        // 未达阈值：保留上一次的结论状态（含结论时刻与错误原文），只把计数 +1。
+        // 单次失败——含连接层挂起拖满 8s 超时这类瞬时抖动——不能把源踢出可用集；
+        // 没有历史结论的源写成 unprobed（对展示/筛选/取书判据都等价于「没有条目」）。
+        states.set(url, consecutive_failures >= PROBE_FAILURE_THRESHOLD
+          ? { url, status: 'failed', checked_at: new Date().toISOString(), error: message, consecutive_failures }
+          : previousState
+            ? { ...previousState, consecutive_failures }
+            : { url, status: 'unprobed', checked_at: null, error: null, consecutive_failures });
       }
     }
   }
@@ -413,7 +461,7 @@ async function refreshWithinBudget(s: Sql, budget: RequestDeadline, signal: Abor
     url, name: typeof item.bookSourceName === 'string' ? item.bookSourceName : '',
     grp: typeof item.bookSourceGroup === 'string' ? item.bookSourceGroup : '', source: item,
     disabled_at: previous.get(url)?.disabled_at ?? null,
-    err: previous.get(url)?.last_error ?? '',
+    err: previous.get(url)?.last_error || probeFailures.get(url) || '',
   }));
   const insertChunk = (chunk: typeof rows) => s`
     INSERT INTO shuyuan_sources (source_url, name, group_name, source, disabled_at, last_error)
