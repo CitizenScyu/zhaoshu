@@ -73,8 +73,14 @@
     "input": "https://unknown.invalid/a"
   },
   {
-    "name": "子域",
-    "input": "https://www.book15.net/a"
+    "name": "备用 host www",
+    "input": "https://www.book15.net/a",
+    "expected": "https://www.book15.net/a"
+  },
+  {
+    "name": "备用 host www 显式 443",
+    "input": "https://www.book15.net:443/a",
+    "expected": "https://www.book15.net/a"
   },
   {
     "name": "任意子域",

@@ -1,5 +1,18 @@
 // 只允许代码实际支持的书源；该策略不代替 DNS/实际连接地址防护。
-export const SUPPORTED_SOURCE_HOST = 'book15.net';
+// www 与 apex 是同一站点的两个 host（同内容、故障路径不相关，见 better-source-survey §1.2），
+// fetch 层据此做请求级换 host 兜底；SUPPORTED_SOURCE_HOST 仍是规范化后的主 host。
+export const SUPPORTED_SOURCE_HOSTS = ['book15.net', 'www.book15.net'] as const;
+export type SupportedSourceHost = (typeof SUPPORTED_SOURCE_HOSTS)[number];
+export const SUPPORTED_SOURCE_HOST: SupportedSourceHost = 'book15.net';
+
+const supportedHosts = new Set<string>(SUPPORTED_SOURCE_HOSTS);
+
+// 同站备用 host：输入集合内的 host 时返回另一个，否则 null（无备用可换）。
+export function alternateSourceHost(hostname: string): SupportedSourceHost | null {
+  if (SUPPORTED_SOURCE_HOSTS.length !== 2) return null;
+  const index = SUPPORTED_SOURCE_HOSTS.indexOf(hostname as SupportedSourceHost);
+  return index === -1 ? null : SUPPORTED_SOURCE_HOSTS[1 - index];
+}
 
 export class SourcePolicyError extends Error {
   constructor(reason: string) {
@@ -30,7 +43,7 @@ export function validateSourceUrl(value: unknown, base?: string): URL {
   } catch {
     throw new SourcePolicyError('来源地址无法解析');
   }
-  if (url.protocol !== 'https:' || url.hostname !== SUPPORTED_SOURCE_HOST ||
+  if (url.protocol !== 'https:' || !supportedHosts.has(url.hostname) ||
       url.port !== '' || url.username !== '' || url.password !== '') {
     throw new SourcePolicyError('仅支持 HTTPS book15.net 精确域名和默认端口/443');
   }
