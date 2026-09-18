@@ -347,8 +347,9 @@ function buildCssChain(body: string, rule: string, explicit: boolean): RuleIr {
 
 function isTerminalToken(token: string): boolean {
   if (TERMINAL_KEYWORDS.has(token)) return true;
-  // 具名属性形态：单 token、无空格、无组合符
-  return /^[\w:-]+$/.test(token) && !/^\d+$/.test(token);
+  if (LEGADO_SPECIAL_VARS.has(token)) return true; // 交给 toTerminal 显式拒绝，不当选择器步
+  // 具名属性形态：含 - 或 :（如 data-id、og:title）。裸标签名（li/a/p/div）是选择器步，不是末端。
+  return /^[\w]+[-:][\w:-]*$/.test(token);
 }
 
 // ---- 顶层入口 ----
