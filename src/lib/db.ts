@@ -4,7 +4,7 @@ import { LLM_USAGE_PHASES, type LlmUsagePhase, type LlmUsageRecord, type TokenSt
 import { assertAuthSchema } from './auth-store';
 import { initializeBusinessSchema } from './business-schema';
 import type { PersonalWriter } from './personal-write';
-import { requireUserId, profileForUserQuery, saveProfileForUserQuery, excludedBooksForUserQuery, persistRecommendationsForUserQueries, feedbackForUserQueries, feedbackSnapshotForUserQuery } from './user-data';
+import { requireUserId, profileForUserQuery, saveProfileForUserQuery, excludedBooksForUserQuery, persistRecommendationsForUserQueries, feedbackForUserQueries, feedbackSnapshotForUserQuery, recentInformativeFeedbackForUserQuery, withdrawnFeedbackBookTitlesForUserQuery } from './user-data';
 export { canonicalBookKey } from './book-identity';
 
 const DATABASE_URL = process.env.DATABASE_URL;
@@ -184,6 +184,23 @@ export class FeedbackConflictError extends Error {}
 // 单独成类，让调用方把"静默成功"变成显式的 BOOK_NOT_FOUND。
 export class FeedbackBookNotFoundError extends Error {
   readonly code = 'BOOK_NOT_FOUND';
+}
+
+export interface ProfileFeedback { title: string; author: string; status: string; note: string }
+
+// 重新生成画像时并入模型的「本人最新有效反馈」（F04）。查询本身见
+// user-data.recentInformativeFeedbackForUserQuery：按 user_id 隔离 + 每本书取最新一行。
+export async function getProfileFeedbackForUser(userId: number): Promise<ProfileFeedback[]> {
+  requireUserId(userId);
+  return await recentInformativeFeedbackForUserQuery(getSql(), userId) as ProfileFeedback[];
+}
+
+// 已撤回反馈的书名（F04）：曾 informative、最新已非 informative。空数组表示没有撤回信号，
+// 路由据此不渲染撤回段。查询语义见 user-data.withdrawnFeedbackBookTitlesForUserQuery。
+export async function getWithdrawnFeedbackBookTitlesForUser(userId: number): Promise<string[]> {
+  requireUserId(userId);
+  const rows = await withdrawnFeedbackBookTitlesForUserQuery(getSql(), userId) as { title: string }[];
+  return rows.map((row) => row.title);
 }
 
 export async function getFeedbackSnapshotForUser(userId: number, title: string, author: string): Promise<{ version: number; status: string | null; note: string }> {

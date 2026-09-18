@@ -283,6 +283,52 @@ export function feedbackForUserQueries(sql: PersonalQuery, userId: number, raw: 
   ];
 }
 
+// 重新生成画像时的「本人最新有效反馈」（F04）：feedback 是追加式历史，每本书只认最新一行
+// （id DESC）；只有最新状态仍具信息量（done/dropped 且 note 非空）才作为偏好证据喂给模型。
+//
+// 🔴 先取最新、再判是否有信息量，顺序不能反：若先过滤 done/dropped+note，用户把某本书
+// 的反馈改成 want/reading 或清空 note（撤回）之后，那条历史 done+note 仍会被选中，
+// 等于靠旧数据永久保留已失效偏好。按 book_id 取最新一行即可让撤回如实生效。
+//
+// 只按 user_id 过滤，书中身份经 books join 取当前拼写；绝不跨用户读取。
+const MAX_PROFILE_FEEDBACK = 50;
+
+export function recentInformativeFeedbackForUserQuery(sql: PersonalQuery, userId: number, limit = MAX_PROFILE_FEEDBACK) {
+  requireUserId(userId);
+  return sql`SELECT title, author, status, note FROM (
+      SELECT DISTINCT ON (f.book_id) b.title, b.author, f.status, f.note, f.book_id
+      FROM feedback f JOIN books b ON b.id = f.book_id
+      WHERE f.user_id = ${userId}
+      ORDER BY f.book_id, f.id DESC
+    ) latest
+    WHERE latest.status IN (${'done'}, ${'dropped'}) AND btrim(latest.note) <> ''
+    ORDER BY title, author LIMIT ${limit}`;
+}
+
+// F04 撤回标记：曾有过 informative 反馈行（done/dropped + note 非空）、但**最新一行已非
+// informative** 的书。这些书的偏好很可能已经写进 profile.content，而上面的查询不会再返回
+// 它们——若不额外告诉模型「这些书的反馈已被撤回」，模型看到旧画像里那句「讨厌机械降神」
+// 只会照着「仍有效者请保留」留下它，等于靠旧画像永久保留已撤回偏好。
+//
+// 只回传**书名**（不回传旧 note 原文）：喂旧 note 会把要删除的偏好又当证据送进输入，
+// 与「不得作为既定事实保留」相悖。判定只看本人反馈，绝不跨用户。
+export function withdrawnFeedbackBookTitlesForUserQuery(sql: PersonalQuery, userId: number, limit = MAX_PROFILE_FEEDBACK) {
+  requireUserId(userId);
+  return sql`SELECT latest.title FROM (
+      SELECT DISTINCT ON (f.book_id) b.title, f.status, f.note, f.book_id
+      FROM feedback f JOIN books b ON b.id = f.book_id
+      WHERE f.user_id = ${userId}
+      ORDER BY f.book_id, f.id DESC
+    ) latest
+    WHERE NOT (latest.status IN (${'done'}, ${'dropped'}) AND btrim(latest.note) <> '')
+      AND EXISTS (
+        SELECT 1 FROM feedback h
+        WHERE h.user_id = ${userId} AND h.book_id = latest.book_id
+          AND h.status IN (${'done'}, ${'dropped'}) AND btrim(h.note) <> ''
+      )
+    ORDER BY latest.title LIMIT ${limit}`;
+}
+
 export function feedbackSnapshotForUserQuery(sql: PersonalQuery, userId: number, title: string, author: string) {
   requireUserId(userId);
   const book = identityOf(title, author);

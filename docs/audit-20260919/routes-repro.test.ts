@@ -7,6 +7,7 @@ import type { VerifiedCandidate } from '@/lib/types';
 const mocks = vi.hoisted(() => ({
   sql: vi.fn(), model: vi.fn(), persist: vi.fn(), verify: vi.fn(), disable: vi.fn(),
   profile: vi.fn(), saveProfile: vi.fn(), recordFeedback: vi.fn(), snapshot: vi.fn(), dispatch: vi.fn(),
+  feedback: vi.fn(), withdrawn: vi.fn(),
 }));
 const principal = { userId: 7, role: 'member', canFind: true, canRead: true, canDownload: true, authMethod: 'session' };
 vi.mock('@/lib/auth', () => ({
@@ -17,6 +18,7 @@ vi.mock('@/lib/db', async original => ({
   ...await original<typeof import('@/lib/db')>(),
   ensureSchema: async () => {}, getSql: () => mocks.sql,
   getProfileForUser: mocks.profile, saveProfileForUser: mocks.saveProfile,
+  getProfileFeedbackForUser: mocks.feedback, getWithdrawnFeedbackBookTitlesForUser: mocks.withdrawn,
   getExcludedBookTitlesForUser: async () => [], persistRecommendationsForUser: mocks.persist,
   recordFeedbackForUser: mocks.recordFeedback, getFeedbackSnapshotForUser: mocks.snapshot,
 }));
@@ -69,6 +71,8 @@ beforeEach(() => {
   mocks.model.mockResolvedValue({ content: JSON.stringify({ items: [ranked] }) });
   mocks.profile.mockResolvedValue({ seeds: [{ title: '合成种子', kind: 'love' }], content: '反馈独有偏好：讨厌机械降神', updatedAt: 'v1' });
   mocks.snapshot.mockResolvedValue({ version: 0, note: '', status: null });
+  mocks.feedback.mockResolvedValue([]);
+  mocks.withdrawn.mockResolvedValue([]);
   mocks.saveProfile.mockResolvedValue('v2');
   mocks.persist.mockResolvedValue(undefined);
 });
@@ -115,12 +119,18 @@ it('R11: legitimate zero-survivor rerank is retried and then reported as a model
   expect(mocks.persist).not.toHaveBeenCalled();
 });
 
-it('R12: profile regeneration omits feedback-derived preferences from the model input before overwriting', async () => {
-  mocks.model.mockResolvedValue({ content: '仅基于种子的合成画像' });
+// F04 翻转：重新生成画像必须把「当前画像 + 本人最新有效反馈」并入模型输入，且不得丢反馈积累。
+// 旧复现断言输入**不含**反馈独有偏好（缺陷存在）；现改为断言偏好仍在。
+it('R12（翻转）: profile regeneration preserves feedback-derived preferences in the model input', async () => {
+  mocks.model.mockResolvedValue({ content: '基于积累的合成画像' });
+  mocks.feedback.mockResolvedValue([
+    { title: '合成反馈书', author: '审查作者', status: 'dropped', note: '讨厌机械降神' },
+  ]);
   const response = await profile(request('profile', { updatedAt: 'v1' }));
   expect(await response.text()).toContain('"type":"done"');
-  expect(mocks.model.mock.calls[0][1]).not.toContain('讨厌机械降神');
-  expect(mocks.saveProfile.mock.calls[0][2]).toBe('仅基于种子的合成画像');
+  expect(mocks.model.mock.calls[0][1]).toContain('讨厌机械降神');
+  expect(mocks.feedback).toHaveBeenCalledWith(7); // 只读当前 principal 的反馈
+  expect(mocks.saveProfile.mock.calls[0][2]).toBe('基于积累的合成画像');
 });
 
 it('R13: failed feedback profile update returns the same user-facing state as a no-op and offers no retry identity', async () => {

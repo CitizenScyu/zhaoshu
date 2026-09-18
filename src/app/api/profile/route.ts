@@ -1,10 +1,12 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { ensureSchema, getProfileForUser, saveProfileForUser } from '@/lib/db';
+import { ensureSchema, getProfileFeedbackForUser, getProfileForUser, getWithdrawnFeedbackBookTitlesForUser, saveProfileForUser } from '@/lib/db';
 import { chatRobust, configuredTotalTimeoutMs, LlmError, MAX_PROFILE_LENGTH, validateProfileContent } from '@/lib/llm';
 import { recordUsageAfterResponse } from '@/lib/record-llm-usage';
 import {
   profileSystem,
   profileFromSeedsUser,
+  profileRebuildSystem,
+  profileRebuildUser,
 } from '@/lib/prompts';
 import { boundedString, readJsonBody } from '@/lib/http';
 import { hasInvalidDatabaseCharacters, sanitizeSeeds } from '@/lib/sanitize';
@@ -95,17 +97,32 @@ export async function POST(req: NextRequest) {
     if (!isVersion(expectedUpdatedAt)) return NextResponse.json({
       error: '读取画像后请携带原始 updatedAt 版本生成', code: 'PROFILE_VERSION_REQUIRED',
     }, { status: 400 });
+    // resetFromSeeds：显式选择「只按种子从零重写」的旧行为，会覆盖反馈积累。
+    // 缺省（false）= 在现有画像 + 本人最新有效反馈之上重建（F04 默认）。
+    if (body?.resetFromSeeds !== undefined && typeof body.resetFromSeeds !== 'boolean') {
+      return NextResponse.json({ error: 'resetFromSeeds must be a boolean' }, { status: 400 });
+    }
+    const resetFromSeeds = body?.resetFromSeeds === true;
     const { userId } = access.principal;
     await access.run(ensureSchema);
     const profile = await access.run(() => getProfileForUser(userId));
     if (profile.updatedAt !== expectedUpdatedAt) return conflict(access, undefined, profile);
     const sanitized = sanitizeSeeds(profile.seeds);
     if (!sanitized.length) return NextResponse.json({ error: '先在下方填入种子书单' }, { status: 400 });
+    // 默认重建才读反馈；resetFromSeeds 走旧的纯种子路径，不读反馈（也不并入旧画像）。
+    // withdrawn：曾 informative、最新已撤回的书名——旧画像里可能还留着这些偏好，
+    // 必须把「已撤回」这一信号显式喂给模型，否则它会按「仍被证据支持」把旧结论留下。
+    const feedback = resetFromSeeds ? [] : await access.run(() => getProfileFeedbackForUser(userId));
+    const withdrawn = resetFromSeeds ? [] : await access.run(() => getWithdrawnFeedbackBookTitlesForUser(userId));
     const budgetMs = Math.min(access.deadline.modelBudgetMs(MODEL_CEILING_MS), configuredTotalTimeoutMs());
     if (budgetMs <= 0) throw new DeadlineExceededError(MODEL_ROUTE_INTERNAL_BUDGET_MS);
     return access.sse(async (send) => {
+      const seedsJson = JSON.stringify(sanitized, null, 2);
       const { content: raw } = await access.run(() => chatRobust(
-        profileSystem(), profileFromSeedsUser(JSON.stringify(sanitized, null, 2)),
+        resetFromSeeds ? profileSystem() : profileRebuildSystem(),
+        resetFromSeeds
+          ? profileFromSeedsUser(seedsJson)
+          : profileRebuildUser(seedsJson, profile.content, JSON.stringify(feedback, null, 2), withdrawn),
         { temperature: 0.4, signal: access.signal, onUsage: recordUsageAfterResponse('profile'),
           totalTimeoutMs: budgetMs, onToken: (delta) => send({ type: 'token', content: delta }) },
       ));
@@ -118,7 +135,10 @@ export async function POST(req: NextRequest) {
         send({ type: 'conflict', code: 'PROFILE_CONFLICT', profile: current, draft: { seeds: sanitized, content } });
         return;
       }
-      send({ type: 'done', seeds: sanitized, content, updatedAt });
+      // feedbackCount/resetFromSeeds 是本次重建的构成元信息：resetFromSeeds=true 明确
+      // 表示「已忽略反馈积累、按种子覆盖重写」，供调用方提示用户。
+      send({ type: 'done', seeds: sanitized, content, updatedAt,
+        feedbackCount: feedback.length, resetFromSeeds });
     }, (error) => error instanceof LlmError
       ? { status: 502, code: 'LLM_ERROR', message: error.message } : personalError(error));
   });
