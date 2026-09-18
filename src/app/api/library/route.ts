@@ -23,7 +23,8 @@ interface LabeledBook {
   chars_labeled: number;
   labels: Record<string, unknown>;
   labeled_at: string;
-  read_task_id: number | null;
+  shared_read_task_id: number | null;
+  my_download_task_id: number | null;
 }
 
 // 标签字段的安全提取（labels 来自离线脚本，字段宽松）
@@ -53,6 +54,7 @@ export async function GET(req: NextRequest) {
   // 书库是共享元数据：找书组即可看。完成 TXT 的定位只在有 read 权限时返回，
   // 与 recommendationsForUserQuery 的 read_task_id 门控同源。
   const canRead = hasPermission(auth.principal, 'read');
+  const canDownload = hasPermission(auth.principal, 'download');
   const { searchParams } = new URL(req.url);
   const pageParam = searchParams.get('page');
   const page = pageParam === null ? 1 : boundedPositiveInteger(pageParam, MAX_PAGE);
@@ -105,15 +107,22 @@ export async function GET(req: NextRequest) {
         : sort === 'recent' ? tx`labeled_at DESC`
         : tx`quality DESC NULLS LAST, labeled_at DESC`;
 
-      // 无 read 权限时直接取 NULL，连定位子查询都不发。
-      const readTask = canRead ? tx`(SELECT dt.id FROM download_tasks dt
+      // 共享阅读是既有明确设计：任何有 read 权限的用户都可在线阅读任意用户的 done 文件。
+      // 这里只暴露「共享可读定位」，绝不把它当成当前用户的私有下载任务 id 使用（F18）。
+      const sharedReadTask = canRead ? tx`(SELECT dt.id FROM download_tasks dt
                 WHERE dt.book_id = labeled_books.id AND dt.status = 'done'
                 ORDER BY dt.id DESC LIMIT 1)` : tx`NULL::integer`;
+      // 当前用户自己在这本书上的最新任务：下载 / 取消 / 取回都只走这个 id。
+      // 与共享可读分开取，避免拿别人的完成任务去查强制 user_id 的 /api/download（F18）。
+      const myDownloadTask = canDownload ? tx`(SELECT dt.id FROM download_tasks dt
+                WHERE dt.user_id = ${auth.principal.userId} AND dt.book_id = labeled_books.id
+                ORDER BY dt.created_at DESC, dt.id DESC LIMIT 1)` : tx`NULL::integer`;
       return [
         tx`
         SELECT id, title, author, category, primary_genre, quality, finish_status,
                chars_labeled, labels, labeled_at::text AS labeled_at,
-               ${readTask} AS read_task_id
+               ${sharedReadTask} AS shared_read_task_id,
+               ${myDownloadTask} AS my_download_task_id
         FROM labeled_books ${where}
         ORDER BY ${orderBy}
         LIMIT ${PAGE_SIZE} OFFSET ${(page - 1) * PAGE_SIZE}`,
@@ -145,7 +154,10 @@ export async function GET(req: NextRequest) {
         charsLabeled: r.chars_labeled,
         labels: isRecord(r.labels) ? r.labels : {},
         labeledAt: r.labeled_at,
-        readTaskId: r.read_task_id ?? null,
+        // 共享可读：任意用户的 done 文件，供在线阅读。
+        sharedReadTaskId: r.shared_read_task_id ?? null,
+        // 私有：当前用户自己在这本书上的最新任务，供下载 / 取消 / 取回。
+        myDownloadTaskId: r.my_download_task_id ?? null,
         // 列表直出的简介级字段
         genre: labelText(r.labels, 'genre', 100),
         intro: labelText(r.labels, 'worldbuilding', 300) || labelText(r.labels, 'plot_stage', 300),
