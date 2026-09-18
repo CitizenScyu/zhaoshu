@@ -29,9 +29,10 @@ const { ensureSchema, getSql, sql, execute, transaction, readTransaction } = vi.
 vi.mock('@/lib/db', () => ({ ensureSchema, getSql }));
 
 import {
-  disableShuyuanSource, enableShuyuanSource, getShuyuanCounts, getShuyuanStats, getReadingSources, refreshShuyuan,
-  REFRESH_BUDGET_MS, RESPONSE_TIMEOUT_MS,
+  disableShuyuanSource, enableShuyuanSource, getEngineSources, getShuyuanCounts, getShuyuanPoolHealth,
+  getShuyuanStats, getReadingSources, refreshShuyuan, REFRESH_BUDGET_MS, RESPONSE_TIMEOUT_MS,
 } from './shuyuan';
+import { refreshSupportedHosts } from './source-policy';
 import { SOURCE_PAGE_SIZE, pageCount } from './shuyuan-view';
 import { POST } from '@/app/api/shuyuan/route';
 
@@ -653,6 +654,60 @@ describe('refreshShuyuan atomic refresh', () => {
     expect(await getReadingSources(new AbortController().signal)).toMatchObject([
       { url: 'https://book15.net/', searchUrl: 'https://book15.net/books/search.html?kw={{key}}' },
     ]);
+  });
+
+  // M1 任务 4 §5.2/§6.1：注册表合成视图。builtin 恒在前；引擎源 = admission ok ∧ 非 disabled
+  // ∧ probe 非 failed，且 host 必须已在运行时门集合内（冷启动 fail-closed，不 500）。
+  describe('注册表合成视图（M1 任务 4）', () => {
+    const engineItem = {
+      bookSourceUrl: 'https://engine.example/', bookSourceName: '引擎源',
+      searchUrl: 'https://engine.example/s?q={{key}}',
+      ruleSearch: { bookList: '.i', name: '.t@text', bookUrl: 'a@href' },
+      ruleContent: { content: '.c' },
+    };
+    const engineRow = (over: Record<string, unknown> = {}) => ({
+      source_url: 'https://engine.example', source: engineItem, name: '引擎源',
+      disabled_at: null, last_error: '', tier: 'M1', ...over,
+    });
+    afterEach(() => refreshSupportedHosts([])); // 复位运行时 host 集合
+
+    it('冷启动（动态 host 未就绪）时引擎源不出池：只看 builtin，不 500', async () => {
+      execute.mockResolvedValueOnce([{ collections: [] }]).mockResolvedValueOnce([])
+        .mockResolvedValueOnce([engineRow()]);
+      const sources = await getReadingSources(new AbortController().signal);
+      expect(sources.map((source) => source.tier)).toEqual(['builtin']);
+      expect(sources[0].url).toBe('https://book15.net/');
+    });
+
+    it('动态 host 就绪后 builtin 在前、引擎源在后，rules 原对象透传', async () => {
+      refreshSupportedHosts(['engine.example']);
+      execute.mockResolvedValueOnce([{ collections: [] }]).mockResolvedValueOnce([])
+        .mockResolvedValueOnce([engineRow()]);
+      const sources = await getReadingSources(new AbortController().signal);
+      expect(sources.map((source) => source.tier)).toEqual(['builtin', 'M1']);
+      expect(sources[1]).toMatchObject({
+        url: 'https://engine.example/', searchUrl: 'https://engine.example/s?q={{key}}', tier: 'M1',
+      });
+      // m2-scaleout §5.2 第 1 条：rules 必须与 shuyuan_sources.source 同一对象（不裁剪）。
+      expect(sources[1].rules).toBe(engineItem);
+    });
+
+    it('getEngineSources 只返回 admission ok 的引擎源（不含 builtin 兜底）', async () => {
+      refreshSupportedHosts(['engine.example']);
+      execute.mockResolvedValueOnce([{ collections: [] }]).mockResolvedValueOnce([engineRow()]);
+      expect(await getEngineSources(new AbortController().signal)).toMatchObject([
+        { url: 'https://engine.example/', tier: 'M1' },
+      ]);
+    });
+
+    it('/api/stats 的 readingPoolSize 在测试 DB 下符合预期：无引擎源时仍为 1', async () => {
+      const refreshedAt = '2026-09-19T00:00:00Z';
+      execute.mockResolvedValueOnce([{ collections: [], refreshed_at: refreshedAt }])
+        .mockResolvedValueOnce([{ collections: [] }]).mockResolvedValueOnce([]).mockResolvedValueOnce([]);
+      const health = await getShuyuanPoolHealth(new AbortController().signal);
+      expect(health.readingPoolSize).toBe(1);
+      expect(health.refreshedAtAgeHours).toBeGreaterThanOrEqual(0);
+    });
   });
 
   // 归纳：last_error 的自动写点、连续失败阈值、失败计数的持久化与解析等价。
