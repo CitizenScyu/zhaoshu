@@ -501,8 +501,8 @@ class TestAutoImporter(TempDirCase):
         self.assertEqual(importer.retry_backlog(jsonl, limit=2), 1)     # 只剩最后一条
         self.assertEqual(len(db.rows), 5)
 
-    def test_backlog_budget_counts_attempts_not_only_successes(self):
-        # 一条一直失败（review）的记录会吃掉一次尝试配额，不能无限扫描整个文件
+    def test_backlog_reaches_past_permanently_failing_records(self):
+        # 审查 A.5：永失败（review）记录不再吃死配额——继续往旧扫，直到成功满额。
         records = []
         for i in range(5):
             rec = record(title=f'正常{i}', site_title=f'正常{i}',
@@ -518,9 +518,34 @@ class TestAutoImporter(TempDirCase):
                          encoding='utf-8')
         db = FakeDb()
         importer = self.importer(db)
-        # attempted=1 撞上 review；attempted=2 补录正常4 → 配额用满即停
-        self.assertEqual(importer.retry_backlog(jsonl, limit=2), 1)
-        self.assertEqual([row['title'] for row in db.rows.values()], ['正常4'])
+        # 旧行为：最新 2 条里撞上 review，净成功可能为 0/1；新行为：扫过 review 继续补满 2 本
+        self.assertEqual(importer.retry_backlog(jsonl, limit=2), 2)
+        self.assertEqual(sorted(row['title'] for row in db.rows.values()),
+                         ['正常3', '正常4'])
+
+    def test_backlog_scan_is_bounded_when_nothing_succeeds(self):
+        # 全 review 时不能无限回溯整个 labels.jsonl：尝试到扫描上限即停
+        records = [record(title=f'可疑{i}', site_title=f'可疑{i}',
+                          url=f'https://book15.net/books/details{i}.html')
+                   for i in range(10)]
+        for rec in records:
+            rec['labels']['site_title_match'] = False                  # 全 review
+        jsonl = self.dir / 'labels.jsonl'
+        jsonl.write_text('\n'.join(json.dumps(r, ensure_ascii=False) for r in records),
+                         encoding='utf-8')
+        db = FakeDb()
+        importer = self.importer(db)
+        calls = []
+        original = importer.import_record
+
+        def counting(rec):
+            calls.append(rec)
+            return original(rec)
+
+        importer.import_record = counting
+        with mock.patch.object(import_one, 'IMPORT_BACKLOG_SCAN_CAP', 3):
+            self.assertEqual(importer.retry_backlog(jsonl, limit=2), 0)
+        self.assertEqual(len(calls), 3)                                # 尝试 3 条即停
 
     def test_retry_backlog_disabled_or_missing_file(self):
         db = FakeDb()

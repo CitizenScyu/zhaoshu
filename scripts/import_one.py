@@ -59,6 +59,9 @@ from pathlib import Path
 # ---- 配置 ----
 IMPORT_TIMEOUT_SEC = 15          # 单次 HTTP SQL 超时；导入失败绝不能拖住打标循环
 IMPORT_BACKLOG_DEFAULT = 20      # labeler 每轮启动时自动补录的历史欠账条数上限
+# 补录扫描上限（审查 A.5）：配额按**成功**计，永失败（review/twin-skipped）不再吃死
+# 最新 N 条的历史欠账。但也不能无限回溯整个 labels.jsonl → 给一个最大尝试条数。
+IMPORT_BACKLOG_SCAN_CAP = 500
 MARKER_NAME = 'labels-imported.jsonl'
 FAIL_LOG_NAME = 'labels-import-fail.log'
 AUTO_IMPORT_ENV = 'LABELER_AUTO_IMPORT'
@@ -421,6 +424,8 @@ class AutoImporter:
         self.timeout = timeout
         self.log = log
         self._imported = set()
+        # 最近一次导入失败的（已脱敏）错误文本；只给运维告警用，绝不落盘原始凭据。
+        self.last_error = ''
         self.enabled = bool(enabled) and bool(self.database_url)
         self.disabled_reason = ''
         if not enabled:
@@ -572,18 +577,22 @@ class AutoImporter:
                 self._mark_imported(record)
             return 'imported'
         except Exception as error:              # 校验器/标记层的 bug 也不能拖垮打标
+            self.last_error = self._redact(error)
             try:
                 self._log_failure(rec if isinstance(rec, dict) else {},
-                                  self._redact(error))
+                                  self.last_error)
             except Exception:
                 pass
             return 'failed'
 
     def retry_backlog(self, jsonl_path, limit=IMPORT_BACKLOG_DEFAULT):
-        """把 labels.jsonl 里**尚未导入标记**的记录补录（新→旧），最多尝试 limit 条。
+        """把 labels.jsonl 里**尚未导入标记**的记录补录（新→旧），直到补满 limit 本成功。
 
         用途：部署切换时把历史欠账一次补齐；轮内某条导入失败后，下轮启动自动重试。
-        已标记的 url 直接跳过且**不占配额**（否则标记越攒越多，每轮都停在同一批上）。
+        配额按**成功导入数**计（审查 A.5）：永失败记录（review / twin-skipped / failed）
+        不再吃死最新 N 条——否则部署后积压一批身份可疑书时，补录净成功恒 0，
+        历史欠账永不还。已标记的 url 跳过且不占配额（否则标记越攒越多，每轮停在同一批）。
+        为免无限回溯整个文件，最多**尝试** IMPORT_BACKLOG_SCAN_CAP 条（或 limit，取大者）。
         只读 labels.jsonl，绝不改写它。返回成功导入条数。"""
         if not self.enabled or limit <= 0:
             return 0
@@ -596,8 +605,9 @@ class AutoImporter:
             self.log(f'  自动导入: 读取 {path} 失败（忽略）: {error}')
             return 0
         done = attempted = 0
+        scan_cap = max(limit, IMPORT_BACKLOG_SCAN_CAP)
         for line in reversed(lines):
-            if attempted >= limit:
+            if done >= limit or attempted >= scan_cap:
                 break
             line = line.strip()
             if not line:

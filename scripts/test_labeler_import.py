@@ -159,6 +159,38 @@ class TestAutoImportWiring(MainHarness):
         self.assertEqual(len(self.labels_jsonl()), 2)
         self.assertIn('未自动入库（failed）', out)
         self.assertIn('→ 已写入书库', out)                 # 乙书不受甲书失败影响
+        # failed 是异常路径，仍指向 fail log
+        self.assertIn('未自动入库（failed），详见 labels-import-fail.log', out)
+
+    def test_review_status_does_not_point_at_the_fail_log(self):
+        # 审查 B.4：review/skipped/twin-skipped 根本不写 fail log，指向它会让操作员
+        # 以为没发生。应指向 stdout / labels.jsonl。
+        FakeAutoImporter.behavior_template = {
+            labeler.BASE + '/books/detailsA.html': 'review'}
+        code, out, _ = self.run_main(['--no-db-model'], DATABASE_URL=DATABASE_URL)
+        self.assertEqual(code, 0)
+        self.assertIn('未自动入库（review），详见 stdout / labels.jsonl', out)
+        self.assertNotIn('未自动入库（review），详见 labels-import-fail.log', out)
+
+    def _all_failed(self, count):
+        self.books = [{'url': f'/books/detailsF{i}.html', 'title': f'书{i}'}
+                      for i in range(count)]
+        FakeAutoImporter.behavior_template = {
+            labeler.BASE + b['url']: 'failed' for b in self.books}
+
+    def test_consecutive_failures_raise_exactly_one_alert(self):
+        # 审查 B.2：连续失败升级——本轮失败达阈值打一行醒目告警（不做 fail-fast）
+        self._all_failed(labeler.AUTO_IMPORT_FAILURE_ALERT + 1)
+        code, out, _ = self.run_main(['--no-db-model'], DATABASE_URL=DATABASE_URL)
+        self.assertEqual(code, 0)
+        self.assertEqual(out.count(f'自动导入本轮已失败 {labeler.AUTO_IMPORT_FAILURE_ALERT} 次'), 1)
+        self.assertNotIn(f'自动导入本轮已失败 {labeler.AUTO_IMPORT_FAILURE_ALERT + 1} 次', out)
+
+    def test_below_threshold_prints_no_alert(self):
+        self._all_failed(labeler.AUTO_IMPORT_FAILURE_ALERT - 1)
+        code, out, _ = self.run_main(['--no-db-model'], DATABASE_URL=DATABASE_URL)
+        self.assertEqual(code, 0)
+        self.assertNotIn('自动导入本轮已失败', out)
 
 
 class TestAutoImportDisabled(MainHarness):

@@ -50,6 +50,9 @@ MODELS = ['deepseek-v4-flash-bohe', 'grok-4.6-hei', 'deepseek-v4.1-flash-hei', '
 # 读库取模型名用的白名单：只是防呆（挡住空串/换行/注入了 SQL 的怪值），不是安全边界。
 MODEL_NAME_RE = re.compile(r'^[A-Za-z0-9._/-]{1,200}$')
 DB_MODEL_TIMEOUT_SEC = 5    # 读配置失败必须快速回落，不能拖住批量任务
+# 自动导入连续失败升级阈值（审查 B.2）：本轮 SQL 失败达此次数就在 stdout 打醒目告警。
+# 不做进程级 fail-fast（与「失败不阻断打标」一致），但坏配置不能长期静默。
+AUTO_IMPORT_FAILURE_ALERT = 5
 
 SYSTEM_PROMPT = (
     "你是网文编目员。阅读给定的小说文本（若干章），输出一个 JSON 对象"
@@ -819,6 +822,7 @@ def main() -> int:
         return 0
 
     ok = fail = 0
+    import_failures = 0
     for i, b in enumerate(queue, 1):
         print(f'[{i}/{len(queue)}] {b.get("title")} ...')
         try:
@@ -921,8 +925,19 @@ def main() -> int:
                 elif import_status == 'duplicate':
                     print('  → 书库已有同书（自动导入 no-op）')
                 elif import_status in ('failed', 'review', 'skipped', 'twin-skipped'):
-                    print(f'  → 未自动入库（{import_status}），详见 labels-import-fail.log / '
-                          f'labels.jsonl')
+                    # 只有 failed（异常路径）会写 labels-import-fail.log；review / skipped /
+                    # twin-skipped 是**刻意不导入**，记录在 stdout 与 labels.jsonl 里，
+                    # 指向 fail log 会误导操作员（审查 B.4）。
+                    where = ('labels-import-fail.log' if import_status == 'failed'
+                             else 'stdout / labels.jsonl')
+                    print(f'  → 未自动入库（{import_status}），详见 {where}')
+                if import_status == 'failed':
+                    # 连续失败升级（审查 B.2）：坏配置下不能长期静默产 jsonl 却不入库。
+                    import_failures += 1
+                    if import_failures == AUTO_IMPORT_FAILURE_ALERT:
+                        print(f'  ⚠️ 自动导入本轮已失败 {import_failures} 次，疑似 .env 配置'
+                              f'或数据库不可达——打标不阻断，但产物可能没有入库：'
+                              f'{getattr(importer, "last_error", "") or "（无错误详情）"}')
         except Exception as e:
             print(f'  失败: {e}', file=sys.stderr)
             fail += 1
