@@ -204,8 +204,6 @@ class TestBuildDoubanQueue(unittest.TestCase):
                 NO_RESULT_HTML,
         }
         douban_list.SEARCH_DELAY = 0
-        douban_list.DoubanTags = None  # 防御：不允许测试改到全局 tag 表
-        del douban_list.DoubanTags
         try:
             queue = douban_list.build_douban_queue(self._http_get)
         finally:
@@ -245,6 +243,149 @@ class TestBuildDoubanQueue(unittest.TestCase):
                 seen.add(k)
                 deduped.append(b)
         self.assertEqual(len(deduped), 3)
+
+
+# ---- 起点移动版页面（2026-09-18 实测结构缩写）----
+# finish 页：区块名后跟 (书名, 作者) 对（影视同期区），或 书名/简介/作者/分类/完本/字数
+QIDIAN_FINISH_HTML = """<html><body>
+<div>返回</div><div>完本</div><div>男生</div><div>女生</div>
+<div>大家都在搜</div>
+<div>影视同期</div><div>火热影视原作</div>
+<div>庆余年</div><div>猫腻</div>
+<div>将夜</div><div>猫腻</div>
+<div>斗破苍穹</div><div>天蚕土豆</div>
+<div>经典必读</div><div>更多</div>
+<div>诡秘之主</div><div>爱潜水的乌贼</div>
+<div>玄幻</div><div>完结</div><div>446.77万字</div>
+<div>灵境行者</div><div>卖报小郎君</div>
+<div>科幻</div><div>完结</div><div>417.95万字</div>
+<div>畅销完本</div><div>更多</div>
+<div>捞尸人</div><div>人知鬼恐怖，鬼晓人心毒。这是一本传统灵异小说。</div><div>纯洁滴小龙</div>
+<div>都市</div><div>完本</div><div>651.82万字</div>
+</body></html>"""
+
+# 榜单页：序号 → 书名 → 简介 → 作者 → 分类 → 字数（月票榜是 书名→N月票→简介→作者→分类→字数）
+QIDIAN_RANK_HTML = """<html><body>
+<div>大家都在搜</div><div>全站</div><div>玄幻</div>
+<div>1</div><div>夜无疆</div><div>4.47万月票</div><div>那一天太阳落下再也没有升起…………………</div><div>辰东</div><div>玄幻</div><div>402.69万字</div>
+<div>2</div><div>玄鉴仙族</div><div>3.66万月票</div><div>陆江仙熬夜猝死，残魂却附在了一面满是裂痕的青灰色铜镜上……</div><div>季越人</div><div>仙侠</div><div>628.86万字</div>
+<div>3</div><div>武道！</div><div>4.11万月票</div><div>田隶</div><div>玄幻</div><div>85.21万字</div>
+</body></html>"""
+
+
+class TestParseQidianFinish(unittest.TestCase):
+    def test_extracts_pairs_per_section(self):
+        books = douban_list.parse_qidian_finish(QIDIAN_FINISH_HTML)
+        titles = {b['title'] for b in books}
+        # 影视同期 3 本 + 经典必读 2 本 + 畅销完本 1 本
+        self.assertTrue({'庆余年', '将夜', '斗破苍穹', '诡秘之主',
+                         '灵境行者', '捞尸人'} <= titles)
+
+    def test_categories_and_wordcounts_are_not_titles(self):
+        books = douban_list.parse_qidian_finish(QIDIAN_FINISH_HTML)
+        titles = {b['title'] for b in books}
+        for noise in ('玄幻', '科幻', '都市', '完结', '更多', '返回'):
+            self.assertNotIn(noise, titles)
+
+    def test_author_extraction_with_long_intro(self):
+        # 畅销完本区：书名 → 长简介 → 作者。简介行被长度闸挡在作者位外
+        books = douban_list.parse_qidian_finish(QIDIAN_FINISH_HTML)
+        target = [b for b in books if b['title'] == '捞尸人']
+        self.assertEqual(len(target), 1)
+        self.assertEqual(target[0]['author'], '纯洁滴小龙')
+
+    def test_dedup_across_sections(self):
+        # 同书跨区块出现（真实页面：诡秘之主/斗破苍穹在多区块）→ 去重
+        html = QIDIAN_FINISH_HTML.replace(
+            '<div>畅销完本</div><div>更多</div>',
+            '<div>畅销完本</div><div>更多</div><div>诡秘之主</div><div>爱潜水的乌贼</div>')
+        books = douban_list.parse_qidian_finish(html)
+        self.assertEqual(len([b for b in books if b['title'] == '诡秘之主']), 1)
+
+    def test_empty_page(self):
+        self.assertEqual(douban_list.parse_qidian_finish('<html></html>'), [])
+
+
+class TestParseQidianRank(unittest.TestCase):
+    def test_extracts_numbered_entries(self):
+        books = douban_list.parse_qidian_rank(QIDIAN_RANK_HTML)
+        self.assertEqual(len(books), 3)
+        self.assertEqual(books[0]['title'], '夜无疆')
+        self.assertEqual(books[0]['author'], '辰东')
+        self.assertEqual(books[1]['title'], '玄鉴仙族')
+        self.assertEqual(books[1]['author'], '季越人')
+
+    def test_no_desc_when_author_adjacent(self):
+        # 第 3 条：书名 → 月票 → 作者 → 分类（无简介），作者照样取到
+        books = douban_list.parse_qidian_rank(QIDIAN_RANK_HTML)
+        self.assertEqual(books[2]['title'], '武道！')
+        self.assertEqual(books[2]['author'], '田隶')
+
+    def test_category_words_not_titles(self):
+        books = douban_list.parse_qidian_rank(QIDIAN_RANK_HTML)
+        titles = {b['title'] for b in books}
+        self.assertNotIn('玄幻', titles)
+        self.assertNotIn('仙侠', titles)
+
+
+class TestBuildWebnovelQueue(unittest.TestCase):
+    """多源合并：起点为主、豆瓣补充，跨源去重后过 book15 搜索。"""
+
+    def _http_get(self, url):
+        if url == douban_list.QIDIAN_MOBILE + '/finish/':
+            return QIDIAN_FINISH_HTML
+        if url == douban_list.QIDIAN_MOBILE + '/rank/yuepiao/':
+            return QIDIAN_RANK_HTML
+        if url == douban_list.QIDIAN_MOBILE + '/rank/hotsales/':
+            return QIDIAN_RANK_HTML
+        if url.startswith('https://book.douban.com/tag/'):
+            return DOUBAN_TAG_HTML
+        return self.search_pages.get(url, NO_RESULT_HTML)
+
+    def test_multi_source_merge_and_dedup(self):
+        # 起点 finish 的盗墓笔记？没有——DOUBAN_TAG_HTML 提供盗墓笔记（豆瓣源）。
+        # 混合源：起点诡秘之主（miss）+ 豆瓣盗墓笔记（hit）
+        self.search_pages = {
+            '/books/search.html?kw=%E8%AF%A1%E7%A7%98%E4%B9%8B%E4%B8%BB': NO_RESULT_HTML,
+            '/books/search.html?kw=%E7%81%B5%E5%A2%83%E8%A1%8C%E8%80%85': NO_RESULT_HTML,
+            '/books/search.html?kw=%E7%9B%97%E5%A2%93%E7%AC%94%E8%AE%B0':
+                book15_search_html('盗墓笔记7', '/books/details42.html'),
+        }
+        douban_list.SEARCH_DELAY = 0
+        try:
+            queue = douban_list.build_webnovel_queue(self._http_get)
+        finally:
+            douban_list.SEARCH_DELAY = 1.5
+        self.assertEqual(len(queue), 1)
+        b = queue[0]
+        self.assertEqual(b['title'], '盗墓笔记7')
+        self.assertEqual(b['category'], '豆瓣网文tag')
+
+    def test_douban_excluded_when_disabled(self):
+        self.search_pages = {}
+        douban_list.SEARCH_DELAY = 0
+        try:
+            queue = douban_list.build_webnovel_queue(self._http_get, include_douban=False)
+        finally:
+            douban_list.SEARCH_DELAY = 1.5
+        # 只有起点源（全 miss）→ 空队列，且没有任何豆瓣请求
+        self.assertEqual(queue, [])
+
+    def test_qidian_fetch_failure_falls_through_to_douban(self):
+        # 起点全线挂掉：豆瓣照常供给
+        def failing_qidian(url):
+            if 'qidian' in url:
+                raise ConnectionError('qidian down')
+            if url.startswith('https://book.douban.com/tag/'):
+                return DOUBAN_TAG_HTML
+            return NO_RESULT_HTML
+
+        douban_list.SEARCH_DELAY = 0
+        try:
+            queue = douban_list.build_webnovel_queue(failing_qidian)
+        finally:
+            douban_list.SEARCH_DELAY = 1.5
+        self.assertEqual(queue, [])
 
 
 if __name__ == '__main__':
