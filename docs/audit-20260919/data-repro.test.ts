@@ -54,61 +54,90 @@ beforeAll(async () => {
   await pg.exec(`ALTER TABLE books ADD COLUMN title_key text GENERATED ALWAYS AS
     (lower(btrim(regexp_replace(btrim(normalize(title, NFKC)), '^《(.+)》$', '\\1')))) STORED;
     ALTER TABLE books ADD COLUMN author_key text GENERATED ALWAYS AS (lower(btrim(normalize(author, NFKC)))) STORED;
-    CREATE UNIQUE INDEX books_identity_idx ON books(title_key, author_key)`);
+    CREATE UNIQUE INDEX books_identity_idx ON books(title_key, author_key);
+    ALTER TABLE labeled_books ADD COLUMN title_key text GENERATED ALWAYS AS
+    (lower(btrim(regexp_replace(btrim(normalize(title, NFKC)), '^《(.+)》$', '\\1')))) STORED;
+    ALTER TABLE labeled_books ADD COLUMN author_key text GENERATED ALWAYS AS (lower(btrim(normalize(author, NFKC)))) STORED;
+    CREATE UNIQUE INDEX labeled_books_identity_idx ON labeled_books(title_key, author_key)`);
 }, 60_000);
 afterAll(() => pg.close());
 
-it('R01: removing the displayed recommendation reveals an older recommendation of the same book', async () => {
+// R01–R06 已由「缺陷复现」翻转为「正确行为断言」（F05–F10 修复后）。
+
+it('R01: removing one shelf card removes every recommendation of that book, keeping other users and feedback (F05)', async () => {
   await batch(persistRecommendationsForUserQueries(queryTag, 1, '需求A', [item('审查删除')]) as unknown[]);
   await batch(persistRecommendationsForUserQueries(queryTag, 1, '需求B', [item('审查删除')]) as unknown[]);
+  await batch(persistRecommendationsForUserQueries(queryTag, 2, '需求C', [item('审查删除')]) as unknown[]);
+  await batch(feedbackForUserQueries(queryTag, 1, item('审查删除'), 'done', '保留原因', 0) as unknown[]);
   const before = await run(recommendationsForUserQuery(queryTag, 1, false));
   expect(before).toHaveLength(1);
-  await run(deleteShelfForUserQuery(queryTag, 1, before[0].id as number));
-  const after = await run(recommendationsForUserQuery(queryTag, 1, false));
-  expect(after).toHaveLength(1);
-  expect(after[0].title).toBe(before[0].title);
-  expect(after[0].id).not.toBe(before[0].id);
+  // 按书移除：该用户该书的全部推荐行
+  await run(deleteShelfForUserQuery(queryTag, 1, before[0].book_id as number));
+  expect(await run(recommendationsForUserQuery(queryTag, 1, false))).toEqual([]);
+  // 跨用户：他人书架不受影响
+  expect(await run(recommendationsForUserQuery(queryTag, 2, false))).toHaveLength(1);
+  // 反馈保留：读后状态不属书架归属
+  const feedback = await pg.query('SELECT status, note FROM feedback WHERE user_id = 1');
+  expect(feedback.rows).toEqual([{ status: 'done', note: '保留原因' }]);
 });
 
-it('R02: 301st book is absent even though it is the most recently added book', async () => {
+it('R02: the 301st book, being newest, appears on the first page; paging and search reach the rest (F06)', async () => {
   await pg.exec(`INSERT INTO books(title, author) SELECT '容量审查' || n, '审查作者' FROM generate_series(1,301) n;
     INSERT INTO recommendations(user_id, book_id, query, created_at)
-    SELECT 2, id, '容量审查', '2026-01-01'::timestamptz + id * interval '1 second'
+    SELECT 8, id, '容量审查', '2026-01-01'::timestamptz + id * interval '1 second'
     FROM books WHERE title LIKE '容量审查%'`);
-  const visible = await run(recommendationsForUserQuery(queryTag, 2, false));
-  expect(visible).toHaveLength(300);
-  expect(visible.some(row => row.title === '容量审查301')).toBe(false);
-  const newest = await pg.query(`SELECT b.title FROM recommendations r JOIN books b ON b.id=r.book_id
-    WHERE r.user_id=2 ORDER BY r.created_at DESC LIMIT 1`);
-  expect(newest.rows[0]).toEqual({ title: '容量审查301' });
+  const page1 = await run(recommendationsForUserQuery(queryTag, 8, false, { limit: 300, offset: 0 }));
+  expect(page1).toHaveLength(300);
+  expect(page1[0].title).toBe('容量审查301');
+  const page2 = await run(recommendationsForUserQuery(queryTag, 8, false, { limit: 300, offset: 300 }));
+  expect(page2.map((row) => row.title)).toEqual(['容量审查1']);
+  // 无重复无遗漏
+  expect(new Set([...page1, ...page2].map((row) => row.title)).size).toBe(301);
+  const searched = await run(recommendationsForUserQuery(queryTag, 8, false, { q: '容量审查301' }));
+  expect(searched.map((row) => row.title)).toEqual(['容量审查301']);
 });
 
-it('R03: one book in two recommendation queries counts twice in shelf statistics', async () => {
+it('R03: one book in two recommendation queries counts once in shelf statistics (F07)', async () => {
   await batch(persistRecommendationsForUserQueries(queryTag, 3, '需求A', [item('统计审查')]) as unknown[]);
   await batch(persistRecommendationsForUserQueries(queryTag, 3, '需求B', [item('统计审查')]) as unknown[]);
   expect(await run(recommendationsForUserQuery(queryTag, 3, false))).toHaveLength(1);
-  expect(await run(shelfStatsForUserQuery(queryTag, 3))).toEqual([{ name: 'new', count: 2 }]);
+  expect(await run(shelfStatsForUserQuery(queryTag, 3))).toEqual([{ name: 'new', count: 1 }]);
 });
 
-it('R04: re-adding a previously completed book sets shelf status to want while feedback remains done', async () => {
+it('R04: re-adding a completed book keeps its reading status (F08)', async () => {
   await batch(feedbackForUserQueries(queryTag, 4, item('状态审查'), 'done', '已读完', 0) as unknown[]);
   await batch(addShelfForUserQueries(queryTag, 4, '状态审查', '审查作者') as unknown[]);
-  const rows = await run(recommendationsForUserQuery(queryTag, 4, false));
-  expect(rows[0]).toMatchObject({ status: 'want', note: '已读完' });
-  const feedback = await pg.query('SELECT status FROM feedback WHERE user_id=4');
-  expect(feedback.rows[0]).toEqual({ status: 'done' });
+  let rows = await run(recommendationsForUserQuery(queryTag, 4, false));
+  expect(rows[0]).toMatchObject({ status: 'done', note: '已读完' });
+  // 移除后重新加入同样保持读后状态（feedback 未被删）
+  await run(deleteShelfForUserQuery(queryTag, 4, rows[0].book_id as number));
+  await batch(addShelfForUserQueries(queryTag, 4, '状态审查', '审查作者') as unknown[]);
+  rows = await run(recommendationsForUserQuery(queryTag, 4, false));
+  expect(rows[0]).toMatchObject({ status: 'done', note: '已读完' });
+  // 无反馈的新书正常写 want
+  await batch(addShelfForUserQueries(queryTag, 4, '状态审查新书', '审查作者') as unknown[]);
+  const added = await run(recommendationsForUserQuery(queryTag, 4, false));
+  expect(added.find((row) => row.title === '状态审查新书')?.status).toBe('want');
 });
 
-it('R05: exact local search misses a book present only in labeled_books', async () => {
-  await pg.exec("INSERT INTO labeled_books(title,author) VALUES ('书库独有审查','审查作者')");
-  expect(await run(exactLibraryBooksForUserQuery(queryTag, 5, '书库独有审查', '审查作者'))).toEqual([]);
+it('R05: exact local search finds a labeled_books-only book and does not promise text (F10)', async () => {
+  await pg.exec("INSERT INTO labeled_books(title,author,source_url) VALUES ('书库独有审查','审查作者','https://example.invalid/book')");
+  const hits = await run(exactLibraryBooksForUserQuery(queryTag, 5, '书库独有审查', '审查作者'));
+  expect(hits).toHaveLength(1);
+  expect(hits[0]).toMatchObject({ metadata_source: 'labeled_books', author_match: true, has_txt: false, has_online_source: true });
 });
 
-it('R06: nested book brackets are normalized twice across insert and generated column, losing the recommendation', async () => {
-  await batch(persistRecommendationsForUserQueries(queryTag, 6, '嵌套身份审查', [item('《《嵌套审查》》')]) as unknown[]);
-  expect(await run(recommendationsForUserQuery(queryTag, 6, false))).toHaveLength(0);
-  const stored = await pg.query("SELECT title,title_key FROM books WHERE title_key='嵌套审查'");
-  expect(stored.rows).toEqual([{ title: '《嵌套审查》', title_key: '嵌套审查' }]);
+it('R06: nested book brackets are persisted and can be read back; no silent loss (F09)', async () => {
+  const written = await batch(persistRecommendationsForUserQueries(queryTag, 6, '嵌套身份审查', [item('《《嵌套审查》》')]) as unknown[]);
+  expect(written[1]).toHaveLength(1); // RETURNING：实际写入行数与期望一致
+  const rows = await run(recommendationsForUserQuery(queryTag, 6, false));
+  expect(rows).toHaveLength(1);
+  expect(rows[0].title).toBe('《《嵌套审查》》'); // 展示名保留原始拼写
+  const stored = await pg.query("SELECT title, title_key FROM books WHERE title_key = '《嵌套审查》'");
+  expect(stored.rows).toEqual([{ title: '《《嵌套审查》》', title_key: '《嵌套审查》' }]);
+  // 写后能查回：精确搜索走同一身份键
+  const hits = await run(exactLibraryBooksForUserQuery(queryTag, 6, '《《嵌套审查》》', '审查作者'));
+  expect(hits.map((row) => row.title)).toContain('《《嵌套审查》》');
 });
 
 it('R07: appending a chapter invalidates an otherwise valid online reading position', () => {

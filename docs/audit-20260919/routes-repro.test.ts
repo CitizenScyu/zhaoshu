@@ -50,7 +50,7 @@ beforeEach(() => {
   mocks.snapshot.mockResolvedValue({ version: 0, note: '', status: null });
   mocks.feedback.mockResolvedValue([]);
   mocks.saveProfile.mockResolvedValue('v2');
-  mocks.persist.mockResolvedValue(undefined);
+  mocks.persist.mockImplementation(async (_userId: number, _query: string, items: unknown[]) => items.length);
 });
 afterEach(() => vi.restoreAllMocks());
 
