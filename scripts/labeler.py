@@ -11,6 +11,8 @@
   python3 labeler.py --book /books/details3168.html   # 指定单本
   python3 labeler.py --no-db-model          # 不读库，强制用 .env 的模型链
 配置: /root/zhaoshu-labeler/.env（LLM_API_KEY 必填；DATABASE_URL 与 LLM_MODEL 可选）
+      数据目录默认 = 脚本同目录（.env / labels.jsonl / labels-rejected.jsonl）；
+      只有显式设置 LABELER_DATA_DIR 时才改指向该目录——给本地 dry-run 用副本数据复现，
 模型: 优先读数据库 app_settings.label_model（管理界面里改，改完下次运行生效）；
       命中时该模型作为模型链链首，后接 .env 链；无 DATABASE_URL / 读库失败 / 值为空
       则静默回落到 .env。启动会打印「打标模型来源: database|environment」。
@@ -26,7 +28,6 @@ import urllib.request
 from pathlib import Path
 
 # ---- 配置 ----
-ENV_PATH = Path(__file__).parent / '.env'
 TARGET_CHARS = 500_000      # 每本抓取字数上限
 CHUNK_RETRY = 3             # 单章抓取重试
 LLM_INTERVAL_SEC = 30       # 两次 LLM 调用最小间隔（控频）
@@ -35,6 +36,12 @@ RANKS = (1, 2, 3)           # 榜单页
 BASE = 'https://book15.net'
 LLM_URL = 'https://api.cloud.us.kg/v1/chat/completions'
 UA = {'User-Agent': 'Mozilla/5.0 (compatible; zhaoshu-labeler/1.0)'}
+# 钉子户终态（诊断 P1-1）：被拒的书不进 labels.jsonl，断点续传（done_urls）认不出来，
+# 于是每轮都被重新抓取 + 重新打标 + 重新拒收——5 本钉子户历史被拒 34~51 次，
+# 每轮白烧 ~25 分钟 LLM 调用。这里给「历史被拒 ≥ 此次数」的书一个终态：跳过。
+# 恢复方式刻意保持简单：**不做自动恢复**。人工删掉 labels-rejected.jsonl 里该书的行
+# 即重新并入候选；也可用 --book 单本模式强制重试（--book 不受本名单约束）。
+REJECT_TERMINAL_THRESHOLD = 5
 # 打标模型后备链：先 bohe，失败依次换 grok-4.6-hei → deepseek-v4.1-flash-hei → glm-5.3-agent。
 # 可用 .env 的 LLM_MODELS=模型1,模型2,... 覆盖；无 LLM_MODELS 时兜底用旧 LLM_MODEL 单值。
 MODELS = ['deepseek-v4-flash-bohe', 'grok-4.6-hei', 'deepseek-v4.1-flash-hei', 'glm-5.3-agent']
@@ -89,17 +96,31 @@ def _build_verification(title: str, author: str) -> str:
     )
 
 
+def data_dir() -> Path:
+    """数据目录（.env / labels.jsonl / labels-rejected.jsonl 的所在目录）。
+
+    默认 = 脚本同目录，服务器行为一字不变；仅当显式设置环境变量 LABELER_DATA_DIR
+    时改指向该目录——供本地用副本数据跑 --dry-run 复现线上行为，不碰服务器路径。"""
+    override = os.environ.get('LABELER_DATA_DIR')
+    return Path(override) if override else Path(__file__).parent
+
+
+def data_path(name: str) -> Path:
+    return data_dir() / name
+
+
 def load_env():
     env = {}
-    if ENV_PATH.exists():
-        for line in ENV_PATH.read_text().splitlines():
+    env_path = data_path('.env')
+    if env_path.exists():
+        for line in env_path.read_text(encoding='utf-8').splitlines():
             line = line.strip()
             if line and not line.startswith('#') and '=' in line:
                 k, v = line.split('=', 1)
                 env[k.strip()] = v.strip()
     missing = [k for k in ('LLM_API_KEY',) if not env.get(k)]
     if missing:
-        sys.exit(f'缺少环境变量: {missing}（应在 {ENV_PATH} 里）')
+        sys.exit(f'缺少环境变量: {missing}（应在 {env_path} 里）')
     return env
 
 
@@ -546,6 +567,65 @@ def title_matches(guess: str, actual: str) -> bool:
     return bool(cg) and cg == ca
 
 
+# ---- 断点续传 / 钉子户终态（纯函数，可离线单测）----
+def _read_url_lines(path: Path):
+    """逐行解析 jsonl，产出非空 url 字符串。文件不存在 / 空行 / 坏行一律跳过。"""
+    if not path.exists():
+        return
+    for line in path.read_text(encoding='utf-8').splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            url = json.loads(line).get('url') or ''
+        except (json.JSONDecodeError, AttributeError):
+            # 坏行（截断的 json / 非对象）不能拖垮整轮：跳过继续
+            continue
+        if isinstance(url, str) and url:
+            yield url
+
+
+def load_done_urls(path: Path) -> set[str]:
+    """labels.jsonl → 已成功产出的详情页 url 集合（断点续传口径）。"""
+    return set(_read_url_lines(path))
+
+
+def count_rejections(path: Path) -> dict[str, int]:
+    """labels-rejected.jsonl → {url: 被拒次数}（每行 = 一次拒收）。"""
+    counts: dict[str, int] = {}
+    for url in _read_url_lines(path):
+        counts[url] = counts.get(url, 0) + 1
+    return counts
+
+
+def terminal_urls(counts: dict[str, int],
+                  threshold: int = REJECT_TERMINAL_THRESHOLD) -> set[str]:
+    """被拒次数 ≥ threshold 的 url = 钉子户终态名单。threshold ≤ 0 表示关闭该机制。"""
+    if threshold <= 0:
+        return set()
+    return {url for url, n in counts.items() if n >= threshold}
+
+
+def split_queue(books: list[dict], done_urls: set[str],
+                pinned: set[str]) -> tuple[list[dict], list[dict], list[dict]]:
+    """榜单 → (待处理, 已完成跳过, 钉子户终态跳过)。
+
+    两个跳过名单**互斥**：已在 labels.jsonl 的书优先算「已完成」，不再算「钉子户」——
+    它被拒过是历史，后来已成功，不该继续占用终态名额。"""
+    todo: list[dict] = []
+    skipped_done: list[dict] = []
+    skipped_pinned: list[dict] = []
+    for b in books:
+        url = BASE + b['url']
+        if url in done_urls:
+            skipped_done.append(b)
+        elif url in pinned:
+            skipped_pinned.append(b)
+        else:
+            todo.append(b)
+    return todo, skipped_done, skipped_pinned
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument('--limit', type=int, default=100)
@@ -560,14 +640,13 @@ def main() -> int:
     print(f'打标模型来源: {model_source}')
     print(f'模型链: {models}')
     # 断点续传：已写入 labels.jsonl 的书跳过（按详情页 url 判定）
-    done_urls: set[str] = set()
-    done_path = Path(__file__).parent / 'labels.jsonl'
-    if done_path.exists():
-        for line in done_path.read_text(encoding='utf-8').splitlines():
-            try:
-                done_urls.add(json.loads(line).get('url', ''))
-            except json.JSONDecodeError:
-                continue
+    done_urls = load_done_urls(data_path('labels.jsonl'))
+    # 钉子户终态：历史被拒 ≥ REJECT_TERMINAL_THRESHOLD 次的书同样跳过，
+    # 与 done_urls 同等地位（都算「本轮不处理」），止住每轮白烧的 LLM 调用。
+    rejection_counts = count_rejections(data_path('labels-rejected.jsonl'))
+    # 显式把常量传进去（而不是靠默认参数）：默认参数在 def 时就求值了，
+    # 读模块常量本意是「改常量即调参/关闸（0 或负数关闭）」，这里保持这个语义。
+    pinned = terminal_urls(rejection_counts, REJECT_TERMINAL_THRESHOLD)
 
     if args.book:
         queue = [{'url': args.book, 'title': args.book}]
@@ -575,10 +654,14 @@ def main() -> int:
         print('拉取榜单书目...')
         all_books = fetch_rank_books()
         print(f'榜单共 {len(all_books)} 本（去重后）')
-        queue = all_books[:args.limit]
-        done_count = sum(1 for b in queue if BASE + b['url'] in done_urls)
-        queue = [b for b in queue if BASE + b['url'] not in done_urls]
-        print(f'本轮处理 {len(queue)} 本（跳过已完成 {done_count} 本）')
+        candidates = all_books[:args.limit]
+        queue, skipped_done, skipped_pinned = split_queue(candidates, done_urls, pinned)
+        # X = 本轮跳过总数（已完成 + 钉子户终态，互斥不重叠），Y = 其中因钉子户终态跳过的。
+        print(f'本轮处理 {len(queue)} 本（跳过已完成 {len(skipped_done) + len(skipped_pinned)} 本'
+              f'（含钉子户 {len(skipped_pinned)} 本））')
+        for b in skipped_pinned:
+            print(f'  钉子户终态：跳过（历史被拒 {rejection_counts[BASE + b["url"]]} 次）'
+                  f' {b.get("title")} | {b["url"]}')
 
     if args.dry_run:
         for b in queue:
@@ -600,7 +683,7 @@ def main() -> int:
                     'url': BASE + b['url'],
                     'reason': f'抓取字数不足: {chars}',
                 }
-                rej_path = Path(__file__).parent / 'labels-rejected.jsonl'
+                rej_path = data_path('labels-rejected.jsonl')
                 with open(rej_path, 'a', encoding='utf-8') as f:
                     f.write(json.dumps(reject, ensure_ascii=False) + '\n')
                 fail += 1
@@ -631,7 +714,7 @@ def main() -> int:
                     'site_title_note': labels.get('site_title_note'),
                     'reason': reason,
                 }
-                rej_path = Path(__file__).parent / 'labels-rejected.jsonl'
+                rej_path = data_path('labels-rejected.jsonl')
                 with open(rej_path, 'a', encoding='utf-8') as f:
                     f.write(json.dumps(reject, ensure_ascii=False) + '\n')
                 fail += 1
@@ -650,7 +733,7 @@ def main() -> int:
                     'site_title_note': labels.get('site_title_note'),
                     'reason': f'文本质量异常: {quality}',
                 }
-                rej_path = Path(__file__).parent / 'labels-rejected.jsonl'
+                rej_path = data_path('labels-rejected.jsonl')
                 with open(rej_path, 'a', encoding='utf-8') as f:
                     f.write(json.dumps(reject, ensure_ascii=False) + '\n')
                 fail += 1
@@ -668,7 +751,7 @@ def main() -> int:
                 'labels': labels,
             }
             print(f'  {chars} 字 | {labels.get("genre")} | conf {labels.get("confidence")} | {calls} 次调用')
-            out_path = Path(__file__).parent / 'labels.jsonl'
+            out_path = data_path('labels.jsonl')
             with open(out_path, 'a', encoding='utf-8') as f:
                 f.write(json.dumps(b_out, ensure_ascii=False) + '\n')
             ok += 1
