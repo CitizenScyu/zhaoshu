@@ -30,6 +30,17 @@ vi.mock('@/lib/db', () => ({
     const statement = withdrawnFeedbackBookTitlesForUserQuery(mocks.getSql() as never, userId) as unknown as { text: string; params: unknown[] };
     return (await pg.query(statement.text, statement.params)).rows.map((row) => row.title as string);
   },
+  // F15：重建成功后推进反馈吸收水位——真 SQL，走真表。
+  getMaxFeedbackIdForUser: async (userId: number) =>
+    ((await pg.query('SELECT COALESCE(max(id), 0)::int AS max_id FROM feedback WHERE user_id = $1', [userId])).rows[0] as { max_id: number }).max_id,
+  markProfileFeedbackAbsorbedForUser: async (userId: number, candidate: number) => {
+    await pg.query(`UPDATE profile_feedback_queue
+      SET absorbed_feedback_id = GREATEST(absorbed_feedback_id, $2),
+          pending_feedback_id = CASE WHEN pending_feedback_id IS NOT NULL AND pending_feedback_id <= $2 THEN NULL ELSE pending_feedback_id END,
+          updated_at = now()
+      WHERE user_id = $1`, [userId, candidate]);
+    return null;
+  },
 }));
 vi.mock('@/lib/llm', async (importOriginal) => ({
   ...await importOriginal<typeof import('@/lib/llm')>(),

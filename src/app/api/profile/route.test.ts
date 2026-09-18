@@ -6,6 +6,7 @@ const mocks = vi.hoisted(() => ({
   ensureSchema: vi.fn(), getProfileForUser: vi.fn(), saveProfileForUser: vi.fn(), chatRobust: vi.fn(),
   getSql: vi.fn(), sql: vi.fn(), transaction: vi.fn(), getFeedbackSnapshotForUser: vi.fn(),
   getProfileFeedbackForUser: vi.fn(), getWithdrawnFeedbackBookTitlesForUser: vi.fn(),
+  getMaxFeedbackIdForUser: vi.fn(), markProfileFeedbackAbsorbedForUser: vi.fn(),
 }));
 vi.mock('@/lib/db', () => ({
   recordFeedbackForUser: async (userId: number, book: { title: string; author: string }, status: string, note: string, expectedVersion: number) => {
@@ -19,6 +20,9 @@ vi.mock('@/lib/db', () => ({
   getSql: mocks.getSql, getFeedbackSnapshotForUser: mocks.getFeedbackSnapshotForUser,
   getProfileFeedbackForUser: mocks.getProfileFeedbackForUser,
   getWithdrawnFeedbackBookTitlesForUser: mocks.getWithdrawnFeedbackBookTitlesForUser,
+  // F15：重建成功后推进反馈吸收水位所需的两个真实现替身。
+  getMaxFeedbackIdForUser: mocks.getMaxFeedbackIdForUser,
+  markProfileFeedbackAbsorbedForUser: mocks.markProfileFeedbackAbsorbedForUser,
 }));
 vi.mock('@/lib/llm', async (importOriginal) => ({
   ...await importOriginal<typeof import('@/lib/llm')>(),
@@ -70,6 +74,9 @@ describe('/api/profile writes', () => {
     mocks.getFeedbackSnapshotForUser.mockResolvedValue({ version: 0, status: null, note: '' });
     mocks.getProfileFeedbackForUser.mockResolvedValue([]);
     mocks.getWithdrawnFeedbackBookTitlesForUser.mockResolvedValue([]);
+    // 默认没有待吸收反馈水位，重建后的推进是 no-op。
+    mocks.getMaxFeedbackIdForUser.mockResolvedValue(0);
+    mocks.markProfileFeedbackAbsorbedForUser.mockResolvedValue(null);
   });
   afterEach(() => { vi.unstubAllEnvs(); vi.restoreAllMocks(); });
 
@@ -234,7 +241,7 @@ describe('/api/profile writes', () => {
     expect(mocks.saveProfileForUser.mock.calls.every((call) => call[0] === 1 && call[3] === previousVersion)).toBe(true);
   });
 
-  it.each(['manual', 'feedback'])('preserves a %s update made while generation is waiting', async (writer) => {
+  it('preserves a manual update made while generation is waiting', async () => {
     let current: ProfileSnapshot = { seeds, content: '原画像', updatedAt: previousVersion };
     mocks.getProfileForUser.mockImplementation(async () => structuredClone(current));
     mocks.saveProfileForUser.mockImplementation(async (_userId, nextSeeds, content, expected) => {
@@ -252,12 +259,7 @@ describe('/api/profile writes', () => {
     const generation = POST(request());
     await modelStarted;
     const newSeeds = [{ title: '新种子', kind: 'drop' }];
-    const saved = writer === 'manual'
-      ? await PUT(request('PUT', { seeds: newSeeds, content: '人工新画像', updatedAt: previousVersion, confirmSeedRemoval: true }))
-      : await saveFeedback(new NextRequest('http://localhost/api/feedback', {
-        method: 'POST', headers: { Authorization: 'Bearer profile-test-owner' },
-        body: JSON.stringify({ title: '反馈书', status: 'done', note: '喜欢严谨设定' }),
-      }));
+    const saved = await PUT(request('PUT', { seeds: newSeeds, content: '人工新画像', updatedAt: previousVersion, confirmSeedRemoval: true }));
     expect(saved.status).toBe(200);
     const winner = structuredClone(current);
     finishGeneration('本次生成稿');
@@ -267,9 +269,43 @@ describe('/api/profile writes', () => {
     expect(conflict.profile).toEqual(winner);
     expect(conflict.draft).toEqual({ seeds, content: '本次生成稿' });
     expect(current).toEqual(winner);
-    expect(current.seeds).toEqual(writer === 'manual' ? newSeeds : seeds);
-    expect(mocks.chatRobust).toHaveBeenCalledTimes(writer === 'manual' ? 1 : 2);
+    expect(current.seeds).toEqual(newSeeds);
+    expect(mocks.chatRobust).toHaveBeenCalledOnce();
     expect(mocks.saveProfileForUser.mock.calls.every((call) => call[0] === 1 && call[3] === previousVersion)).toBe(true);
+  });
+
+  // F15：反馈写路径不再同步回写画像，所以生成等待期间提交反馈不会抢画像版本——生成照常完成，
+  // 反馈只登记为待吸收事件（由 /api/profile/absorb 在独立时机消化）。
+  it('a feedback submitted while generation is waiting never steals the profile version', async () => {
+    let current: ProfileSnapshot = { seeds, content: '原画像', updatedAt: previousVersion };
+    mocks.getProfileForUser.mockImplementation(async () => structuredClone(current));
+    mocks.saveProfileForUser.mockImplementation(async (_userId, nextSeeds, content, expected) => {
+      if (current.updatedAt !== expected) return null;
+      current = { seeds: nextSeeds, content, updatedAt: nextVersion };
+      return nextVersion;
+    });
+    let finishGeneration!: (value: string) => void;
+    let started!: () => void;
+    const modelStarted = new Promise<void>((resolve) => { started = resolve; });
+    mocks.chatRobust.mockImplementationOnce(() => {
+      started();
+      return new Promise<string>((resolve) => { finishGeneration = resolve; });
+    });
+    const generation = POST(request());
+    await modelStarted;
+    const saved = await saveFeedback(new NextRequest('http://localhost/api/feedback', {
+      method: 'POST', headers: { Authorization: 'Bearer profile-test-owner' },
+      body: JSON.stringify({ title: '反馈书', status: 'done', note: '喜欢严谨设定' }),
+    }));
+    expect(saved.status).toBe(200);
+    expect(await saved.json()).toMatchObject({ profileStatus: 'pending', pending: true, retryable: true });
+    finishGeneration('本次生成稿');
+    const events = await consumeSSE(await generation);
+    expect(events.find((e) => e.type === 'conflict')).toBeUndefined();
+    expect(lastEvent(events, 'done').content).toBe('本次生成稿');
+    expect(current.content).toBe('本次生成稿');
+    // 只有生成那一次模型调用；反馈写路径不调用模型。
+    expect(mocks.chatRobust).toHaveBeenCalledOnce();
   });
 
   it('still returns a recoverable generated draft when reloading a conflict fails', async () => {

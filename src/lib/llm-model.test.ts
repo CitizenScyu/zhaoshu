@@ -435,14 +435,15 @@ describe('probeModel：冷连接重试', () => {
   });
 });
 
-// 29.5：三个既有调用点（find 的 recall/rerank、profile、feedback）都只经 chatRobust/chat，
-// 模型只能来自运行时解析——不写死模型名、不读 LLM_MODEL，类型上也没有 model 覆盖入口。
+// 29.5：模型调用点（find 的 recall/rerank、profile 重建、F15 的画像吸收）都只经
+// chatRobust/chat，模型只能来自运行时解析——不写死模型名、不读 LLM_MODEL，类型上也没有
+// model 覆盖入口。（F15 起反馈写路径不再调用模型，feedback 相位的模型调用移到 profile/absorb。）
 describe('既有调用点没有模型旁路', () => {
   const sources = import.meta.glob('../app/api/**/route.ts', {
     query: '?raw', import: 'default', eager: true,
   }) as Record<string, string>;
 
-  it.each(['find', 'profile', 'feedback'])('%s 路由不写死模型名也不读 LLM_MODEL', (route) => {
+  it.each(['find', 'profile', 'profile/absorb'])('%s 路由不写死模型名也不读 LLM_MODEL', (route) => {
     const source = sources[`../app/api/${route}/route.ts`];
     expect(source).toBeDefined();
     expect(source).toMatch(/from '@\/lib\/llm'/);

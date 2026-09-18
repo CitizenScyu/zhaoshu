@@ -7,6 +7,7 @@ const mocks = vi.hoisted(() => ({
   ensureSchema: vi.fn(), getSql: vi.fn(), session: vi.fn(),
   getProfileForUser: vi.fn(), saveProfileForUser: vi.fn(), recordFeedbackForUser: vi.fn(), getFeedbackSnapshotForUser: vi.fn(),
   getProfileFeedbackForUser: vi.fn(), getWithdrawnFeedbackBookTitlesForUser: vi.fn(),
+  getMaxFeedbackIdForUser: vi.fn(), markProfileFeedbackAbsorbedForUser: vi.fn(),
   getExcludedBookTitlesForUser: vi.fn(), persistRecommendationsForUser: vi.fn(),
   chat: vi.fn(), verify: vi.fn(),
 }));
@@ -60,6 +61,8 @@ describe('32.1 真实权限入口与可信用户绑定（数据库状态为夹�
     mocks.getFeedbackSnapshotForUser.mockResolvedValue({ version: 0, status: null, note: '' });
     mocks.getProfileFeedbackForUser.mockResolvedValue([]);
     mocks.getWithdrawnFeedbackBookTitlesForUser.mockResolvedValue([]);
+    mocks.getMaxFeedbackIdForUser.mockResolvedValue(0);
+    mocks.markProfileFeedbackAbsorbedForUser.mockResolvedValue(null);
     mocks.getExcludedBookTitlesForUser.mockResolvedValue([]);
     mocks.persistRecommendationsForUser.mockResolvedValue(undefined);
     mocks.chat.mockResolvedValue({ content: '有效生成稿' });
@@ -160,8 +163,10 @@ describe('32.1 真实权限入口与可信用户绑定（数据库状态为夹�
   it('A 的反馈和画像回写始终绑定 A，不使用客户端传入的 B', async () => {
     const res = await feedback.POST(request('feedback', 'POST', { ...candidate, userId: 3, status: 'done', note: '喜欢设定' }));
     expect(res.status).toBe(200);
-    expect(mocks.recordFeedbackForUser).toHaveBeenCalledWith(2, { title: candidate.title, author: candidate.author }, 'done', '喜欢设定', expect.any(Number), expect.any(Function));
-    expect(mocks.saveProfileForUser.mock.calls[0][0]).toBe(2);
+    expect(mocks.recordFeedbackForUser).toHaveBeenCalledWith(2, { title: candidate.title, author: candidate.author }, 'done', '喜欢设定', expect.any(Number), expect.any(Function), true);
+    // F15：反馈写路径不再同步回写画像（吸收走独立的 /api/profile/absorb），所以这里既不发生
+    // 画像写库，客户端传入的 userId=3 也绝不会被动到。
+    expect(mocks.saveProfileForUser).not.toHaveBeenCalled();
     expect(profiles.get(3)?.content).toBe('USER-3-PRIVATE');
   });
   it('Cookie 写请求检查 CSRF、Origin 与 JSON 类型', async () => {
