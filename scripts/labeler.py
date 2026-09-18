@@ -294,6 +294,9 @@ _NAV_SENTENCE_RE = _PROSE_MARK_RE
 #   且至少有一个导航词、且括号内不得剩下正文（`《上一章》` 里的括号只裹着导航词，算导航词）。
 # 这样 `他想起了上一章的内容` / `（他想起上一章的事）` / `上一章的内容和下一章的内容`
 # 全部落在结构外，一律保留。正文标点闸（_NAV_SENTENCE_RE）仍在前面兜底。
+# 真数据回测（25 章）另发现章节名括号**自带嵌套括号**的写法
+# （`上一章(狼子野心（二）)` / `(缓兵之计（四更）)下一章` / `上一章(第五十三章(完))`），
+# 故括号按**深度配对**取最外层，而不是 find 第一个闭合符。
 _NAV_WORD_RE = re.compile(r'上一章|下一章')
 _NAV_BRACKET_PAIRS = {'（': '）', '(': ')', '[': ']', '【': '】', '《': '》'}
 _NAV_BRACKET_MAX_INNER = 30        # 括号内章节名的长度上限（章节名可能不短，上限只作病态兜底）
@@ -373,7 +376,8 @@ def _nav_shape_ok(line: str) -> bool:
     逐字符扫：分隔符/箭头跳过，`上一章`/`下一章` 记一个 nav，章节名括号记一个 name
     （括号内只剩导航词与分隔符时改记为 nav，覆盖 `《上一章》|《下一章》` 这类写法）。
     出现任何其它字符 → 结构不成立。要求至少有一个 nav（挡住 `（他想起上一章的事）`
-    这种整句被括号裹住、导航词只出现在括号内的情况）。
+    这种整句被括号裹住、导航词只出现在括号内的情况）。括号按**深度**取最外层，
+    以容纳章节名里自带的嵌套括号（`(缓兵之计（四更）)下一章`）。
 
     对照（t79 现场样本）：`(英雄救美)下一章` → [name, nav] ✅；
     `他想起了上一章的内容` → 首字符 `他` 即失败 ✅；`（他想起了上一章的事）` → [name] 无 nav ✅。"""
@@ -389,15 +393,19 @@ def _nav_shape_ok(line: str) -> bool:
             tokens.append('nav')
             i = m.end()
             continue
-        close = _NAV_BRACKET_PAIRS.get(ch)
-        if close:
-            j = line.find(close, i + 1)
-            if j < 0 or j - i - 1 > _NAV_BRACKET_MAX_INNER:
+        if ch in _NAV_BRACKET_PAIRS:
+            depth, j = 0, i
+            while j < n:
+                if line[j] in _NAV_BRACKET_PAIRS:
+                    depth += 1
+                elif line[j] in _NAV_BRACKET_PAIRS.values():
+                    depth -= 1
+                    if depth == 0:
+                        break
+                j += 1
+            if j >= n or j - i - 1 > _NAV_BRACKET_MAX_INNER:
                 return False
             inner = line[i + 1:j]
-            if any(c in _NAV_BRACKET_PAIRS or c in _NAV_BRACKET_PAIRS.values()
-                   for c in inner):
-                return False
             residue = _NAV_WORD_RE.sub('', inner)
             residue = ''.join(c for c in residue if c not in _NAV_SEP_CHARS)
             tokens.append('nav' if not residue and _NAV_WORD_RE.search(inner) else 'name')

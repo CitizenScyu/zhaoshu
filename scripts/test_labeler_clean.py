@@ -470,6 +470,10 @@ class TestSplitNavAndSourceWatermark(unittest.TestCase):
         '(第12章 比斗)下一章',
         '上一章(章节名)',
         '上一章 【第7章 出山】',
+        # 真数据回测（25 章）发现的章节名自带嵌套括号写法：括号须按深度取最外层
+        '上一章(狼子野心（二）)',
+        '(缓兵之计（四更）)下一章',
+        '上一章(第五十三章(完))',
     )
 
     def test_split_nav_lines_are_dropped(self):
@@ -484,6 +488,9 @@ class TestSplitNavAndSourceWatermark(unittest.TestCase):
         '上一章的内容和下一章的内容',
         '他翻到上一章，又看了看下一章。',
         '“上一章写完了，下一章还没动笔。”',
+        # 括号里是整句、括号外只有导航词——结构判据本身拦不住，靠正文标点闸兜底。
+        # 变异钉：把 _NAV_SENTENCE_RE 闸去掉，本条立刻变红。
+        '上一章（他想起了一些往事，很难过。）',
     )
 
     def test_prose_mentioning_nav_words_is_kept(self):
