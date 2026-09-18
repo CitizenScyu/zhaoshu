@@ -271,6 +271,11 @@ describe('GET /api/download/[id]/file', () => {
     const running = await download();
     expect(running.status).toBe(400);
     expect(await running.json()).toEqual({ error: '任务尚未完成', code: 'TASK_NOT_READY' });
+    // F03：partial（残缺）不是完成态，取文件同样 TASK_NOT_READY
+    sql.mockResolvedValueOnce([{ ...task, status: 'partial' }]);
+    const partial = await download();
+    expect(partial.status).toBe(400);
+    expect(await partial.json()).toEqual({ error: '任务尚未完成', code: 'TASK_NOT_READY' });
     expect(fetchMock).not.toHaveBeenCalled();
   });
 

@@ -177,7 +177,7 @@ describe('GET /api/read/[id]/[resource]', () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
-  it.each(['pending', 'running', 'failed', 'cancelled'])('rejects a %s task before GitHub access', async (status) => {
+  it.each(['pending', 'running', 'failed', 'cancelled', 'partial'])('rejects a %s task before GitHub access', async (status) => {
     sql.mockResolvedValueOnce([{ ...task, status }]);
     const response = await request();
     expect(response.status).toBe(409);
