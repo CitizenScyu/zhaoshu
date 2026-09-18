@@ -611,6 +611,27 @@ class TestParse17kQuanben(unittest.TestCase):
         html = '<a href="//www.17k.com/book/3381946.html" title="风起龙城" target="_blank">风起龙城</a>'
         self.assertEqual([b['title'] for b in douban_list.parse_17k_quanben(html)], ['风起龙城'])
 
+    def test_span_wrapped_title_is_parsed(self):
+        # 审查 C.1/F.2：现场有 8 个 id 的书名在 <span> 里（href><img><span>书名</span>），
+        # 旧正则 `>([^<]*)</a>` 吃不到 → 漏收真书。剥标签后取文本即可。
+        html = ('<a href="//www.17k.com/book/2402178.html" target="_blank">'
+                '<img src="cover.jpg" width="90"><span>挣大钱斗极品：重生好媳妇</span></a>')
+        self.assertEqual([b['title'] for b in douban_list.parse_17k_quanben(html)],
+                         ['挣大钱斗极品：重生好媳妇'])
+
+    def test_image_only_anchor_yields_no_title(self):
+        # 剥标签后为空 → 不当作书名（封面锚点不得进候选池）
+        html = '<a href="//www.17k.com/book/9.html"><img src="cover.jpg"></a>'
+        self.assertEqual(douban_list.parse_17k_quanben(html), [])
+
+    def test_plain_anchor_wins_over_promo_span_for_same_book(self):
+        # 实测：推广锚点（img+span「XX：书名」）在前、权威纯文本锚点在后。
+        # 必须优先纯文本（旧行为），否则会拿整串推广名去搜索而 miss。
+        html = ('<a href="//www.17k.com/book/2065918.html"><img src="x.jpg">'
+                '<span>参天悟道问鼎大乾坤：参天</span></a>'
+                '<a href="//www.17k.com/book/2065918.html">参天</a>')
+        self.assertEqual([b['title'] for b in douban_list.parse_17k_quanben(html)], ['参天'])
+
     def test_empty_page(self):
         self.assertEqual(douban_list.parse_17k_quanben('<html></html>'), [])
 

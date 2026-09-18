@@ -480,7 +480,14 @@ def fetch_zongheng_complete_books(http_get) -> list[dict]:
 # 含巫颂/罪恶之城/超级兵王等经典，book15 抽样命中 8/25 ≈ 32%。
 # 各榜 Top100 详情页被 Aliyun WAF 挡，**不接**；/quanben/ 与 /top/ 不受影响。
 Y17K_BASE = 'https://www.17k.com'
-_Y17K_BOOK_RE = re.compile(r'href="//www\.17k\.com/book/(\d+)\.html"[^>]*>([^<]*)</a>')
+# 页面有两种锚点形态（2026-09-19 审查 C.1/F.2 实测）：
+#   纯文本：href=//www.17k.com/book/N.html ...>书名</a>
+#   带图：  href=//www.17k.com/book/N.html ...><img .../><span>书名</span></a>（8 个 id）
+# 原正则 `>([^<]*)</a>` 吃不到第二种（`[^>]*>` 后紧跟 `<img`）→ 漏收 8 本真书。
+# 改为捕获锚点内部 HTML，再剥标签：两种形态都取到纯书名。
+_Y17K_BOOK_RE = re.compile(
+    r'href="//www\.17k\.com/book/(\d+)\.html"[^>]*>(.*?)</a>', re.S)
+_Y17K_TAG_RE = re.compile(r'<[^>]*>')
 # 页面有 48 条被截断的标题（结尾 ...），按前缀搜 book15 命中率低且易误配 → 丢弃
 _17K_TRUNCATED_RE = re.compile(r'(?:\.{2,}|…+|。{2,})\s*$')
 # 推广前缀：「骁骑校大作：匹夫的逆袭！」「失落叶月恒系列力作：天行」→ 取冒号后的真书名
@@ -508,16 +515,34 @@ def _clean_17k_title(title: str) -> str:
 def parse_17k_quanben(html: str) -> list[dict]:
     """17K 完本页 → [{title, author, origin}]（页面无作者，author 空）。
 
-    同一本书在页面上有**两个锚点**：书名锚点 + 简介锚点（实测
-    `…/book/1469383.html` 先出现书名「绝世战体逆天斩仙：吞天记」，
-    后出现整句简介）。因此**按 book id 取首个锚点**，简介锚点天然被跳过；
-    再按归一化书名跨 id 去重。"""
-    books, seen, seen_ids = [], set(), set()
+    同一本书在页面上有多个锚点（实测）：
+    - **纯文本**锚点：`<a href=…>书名</a>`（权威书名，页面后段）；
+    - **推广**锚点：`<a href=…><img …/><span>XX：书名</span></a>`（封面/推荐位）；
+    - **简介**锚点：`<a href=…>整句简介</a>`。
+
+    取法：按 book id 分组，**优先纯文本锚点**（旧行为，推广/简介锚点被天然跳过）；
+    该 id 没有任何纯文本锚点时，才回退用带标签锚点剥标签后的文本——覆盖审查 C.1 指出的
+    「8 个 id 书名只在 `<span>` 里」的漏收（例：`挣大钱斗极品：重生好媳妇`）。
+    再按归一化书名跨 id 去重。宁缺勿滥：简介句仍被 _clean_17k_title 的标点/长度闸挡掉。"""
+    order: list[str] = []
+    plain: dict[str, str] = {}
+    wrapped: dict[str, str] = {}
     for m in _Y17K_BOOK_RE.finditer(html):
-        if m.group(1) in seen_ids:
-            continue
-        seen_ids.add(m.group(1))
-        title = _clean_17k_title(m.group(2))
+        bid, inner = m.group(1), m.group(2)
+        if bid not in order:
+            order.append(bid)
+        if '<' in inner:
+            if bid not in wrapped:
+                title = _clean_17k_title(_Y17K_TAG_RE.sub('', inner))
+                if title:
+                    wrapped[bid] = title
+        elif bid not in plain:
+            title = _clean_17k_title(inner)
+            if title:
+                plain[bid] = title
+    books, seen = [], set()
+    for bid in order:
+        title = plain.get(bid) or wrapped.get(bid) or ''
         key = _norm_title(title)
         if not title or not key or key in seen:
             continue
