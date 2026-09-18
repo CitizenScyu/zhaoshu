@@ -12,6 +12,7 @@ import {
 
 interface ShelfItem {
   id: number;
+  book_id: number;
   query: string;
   match_score: number | null;
   hit_likes: string[] | null;
@@ -146,7 +147,8 @@ export default function ShelfTab() {
         noteIsSaved = true;
         setNoteSaved({ id: item.id, text: draft });
       }
-      const res = await apiFetch(`/api/shelf?id=${item.id}`, { method: 'DELETE' });
+      // F05：按书移除（book_id），服务端删除该用户这本书的全部推荐行；不再传单条推荐 id。
+      const res = await apiFetch(`/api/shelf?bookId=${item.book_id}`, { method: 'DELETE' });
       const data = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(data.error || '移除失败');
       setRemoveDraft(null);

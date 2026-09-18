@@ -41,12 +41,14 @@ export async function POST(req: NextRequest) {
 
 export async function DELETE(req: NextRequest) {
   return withFindAccess(req, 55_000, async (access) => {
-    const id = boundedPositiveInteger(new URL(req.url).searchParams.get('id'));
-    if (id === null) return NextResponse.json({ error: 'missing valid id', code: 'INVALID_ID' }, { status: 400 });
+    // F05：按 (user_id, book_id) 移除——传 bookId，而不是某一条 recommendation 的 id。
+    // 同一本书可能有多条 query 行，按单行 id 删会残留、刷新重现。
+    const bookId = boundedPositiveInteger(new URL(req.url).searchParams.get('bookId'));
+    if (bookId === null) return NextResponse.json({ error: 'missing valid bookId', code: 'INVALID_ID' }, { status: 400 });
     try {
       await access.run(ensureSchema);
       const rows = await access.commit((write) => write((sql) => [
-        deleteShelfForUserQuery(sql, access.principal.userId, id),
+        deleteShelfForUserQuery(sql, access.principal.userId, bookId),
       ]));
       if (!rows[0].length) return NextResponse.json({ error: 'recommendation not found', code: 'RECOMMENDATION_NOT_FOUND' }, { status: 404 });
       return NextResponse.json({ ok: true });

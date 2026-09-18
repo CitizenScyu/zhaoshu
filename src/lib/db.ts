@@ -172,10 +172,14 @@ export async function getExcludedBookTitlesForUser(userId: number): Promise<{ ti
   return await excludedBooksForUserQuery(getSql(), userId) as { title: string; author: string }[];
 }
 
-export async function persistRecommendationsForUser(userId: number, query: string, items: RerankedItem[], write: PersonalWriter): Promise<void> {
+// 返回**实际写入的推荐行数**：调用方（/api/find）必须与本批期望本数比对，
+// 数量不符不得回报 persisted=true（F09：静默漏写不能当成功）。
+export async function persistRecommendationsForUser(userId: number, query: string, items: RerankedItem[], write: PersonalWriter): Promise<number> {
   requireUserId(userId);
-  if (!items.length) return;
-  await write((sql) => persistRecommendationsForUserQueries(sql, userId, query, items));
+  if (!items.length) return 0;
+  const results = await write((sql) => persistRecommendationsForUserQueries(sql, userId, query, items));
+  // 第二条语句是 recommendations 落库，RETURNING b.id 每行一条。
+  return (results[1] as unknown[] | undefined)?.length ?? 0;
 }
 
 export class FeedbackConflictError extends Error {}

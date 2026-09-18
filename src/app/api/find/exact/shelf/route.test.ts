@@ -54,8 +54,10 @@ describe('POST /api/find/exact/shelf', () => {
     expect(await res.json()).toEqual({ ok: true, bookId: 42 });
 
     const insertBook = db.queries.find((query: RecordedQuery) => query.text.includes('INSERT INTO books'));
-    expect(insertBook?.values).toContain('诡秘之主');
-    expect(insertBook?.values).not.toContain('《诡秘之主》');
+    // F09：展示列存原始拼写；归一值只出现在 recommendations 的比较参数里。
+    expect(insertBook?.values).toContain('《诡秘之主》');
+    const insertRec = db.queries.find((query: RecordedQuery) => query.text.includes('INSERT INTO recommendations'));
+    expect(insertRec?.values).toContain('诡秘之主');
     expect(insertBook?.text).toContain('ON CONFLICT (title_key, author_key)');
   });
 

@@ -84,8 +84,9 @@ maybe('真实 PostgreSQL：persistRecommendationsForUserQueries 批量写', () =
     await sql.transaction(() => statements as never);
 
     const books = (await pg.query('SELECT title, author, douban_id, douban_rating, meta FROM books ORDER BY id')).rows;
+    // F09：展示列存原始拼写（身份键由生成列归一，此处不选键列）。
     expect(books).toEqual([
-      { title: '修真聊天群', author: 'abc', douban_id: '123', douban_rating: 8, meta: { category: '仙侠', wordCount: '100万字' } },
+      { title: '《修真聊天群》', author: 'ＡＢＣ', douban_id: '123', douban_rating: 8, meta: { category: '仙侠', wordCount: '100万字' } },
       { title: '凡人修仙传', author: '忘语', douban_id: null, douban_rating: null, meta: { category: '仙侠', wordCount: '700万字' } },
     ]);
     const recs = (await pg.query(

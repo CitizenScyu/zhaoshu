@@ -131,26 +131,28 @@ describe('nextConfirm 两段式确认', () => {
 });
 
 describe('SHELF_ROW_LIMIT', () => {
-  // 从源码里**解析出实际生效的 LIMIT 数字**，而不是找 'LIMIT 300' 这个子串：
-  // 子串断言会被注释骗过（把真值改成 250、再在同函数里写一句「旧口径 LIMIT 300」
-  // 依然全绿，前端却还显示 300）。所以先剥掉 JS 注释，再取唯一一处 LIMIT 的数字。
+  // F06：分页后 LIMIT 变成绑定参数（limit/offset），不能再从模板里找字面量。
+  // 前后端一致性改钉在「默认页大小常量」上：recommendationsForUserQuery 未显式传 limit 时
+  // 用的就是它，前端 SHELF_ROW_LIMIT 又按它判断「还有更多」。解析常量值而非子串。
   const body = (() => {
     const source = readFileSync(new URL('./user-data.ts', import.meta.url), 'utf8');
     const slice = source.split('export function recommendationsForUserQuery')[1]?.split('\nexport function')[0];
     expect(slice).toBeTruthy();
-    // 只剥 JS 注释；本函数体内没有含 '//' 的字符串或 SQL，剥离不会误伤。
     return slice!.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/[^\n]*/g, '');
   })();
 
-  it('与 user-data.ts 里 recommendationsForUserQuery 实际生效的 LIMIT 数字一致', () => {
-    // 函数里的 LIMIT 1 是 read_task / feedback 子查询的取一行上限，不在本断言范围；
-    // 除它们以外的 LIMIT（也就是书架那个）必须恰好等于前端的常量。
-    const limits = [...body.matchAll(/\bLIMIT\s+(\d+)\b/g)].map((match) => Number(match[1]));
-    expect(limits.filter((value) => value !== 1)).toEqual([SHELF_ROW_LIMIT]);
+  it('user-data.ts 的默认页大小常量与前端 SHELF_ROW_LIMIT 一致', () => {
+    const source = readFileSync(new URL('./user-data.ts', import.meta.url), 'utf8');
+    const declared = /const SHELF_PAGE_LIMIT = (\d+);/.exec(source);
+    expect(declared?.[1]).toBe(String(SHELF_ROW_LIMIT));
+    // 默认值真的用在查询里（不是只声明）：boundedLimit 缺省返回它。
+    const bounded = source.slice(source.indexOf('function boundedLimit'));
+    expect(bounded).toContain('SHELF_PAGE_LIMIT');
   });
 
-  it('LIMIT 必须是字面量，不能是绑定参数', () => {
-    // 写成参数会让 recommendations/route.test.ts 的 userId 占位符断言多出一项。
-    expect(body).not.toMatch(/LIMIT\s+\$\{/);
+  it('分页 LIMIT/OFFSET 走绑定参数，且外层的排序在分页之前', () => {
+    expect(body).toMatch(/LIMIT \$\{limit\} OFFSET \$\{offset\}/);
+    // DISTINCT ON 在内层，外层再按时间排序分页（否则第 301 本被 book_id 截断）。
+    expect(body.indexOf('DISTINCT ON (r.book_id)')).toBeLessThan(body.indexOf('ORDER BY rep.created_at'));
   });
 });

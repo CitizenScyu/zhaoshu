@@ -297,7 +297,12 @@ export async function POST(req: NextRequest) {
         let persisted = true;
         try {
           deadline.assert();
-          await access.commit((write) => persistRecommendationsForUser(userId, query, items, write));
+          const written = await access.commit((write) => persistRecommendationsForUser(userId, query, items, write));
+          // F09：写入行数与期望本数不符（身份/连接问题导致静默漏写）不得回报成功。
+          if (written !== items.length) {
+            persisted = false;
+            console.error('persist row count mismatch', { expected: items.length, written });
+          }
         } catch (e) {
           persisted = false;
           if (personalError(e).status !== 500) throw e;

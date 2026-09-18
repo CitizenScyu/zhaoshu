@@ -25,8 +25,9 @@ describe('推荐主查询、最新原因和共享阅读定位', () => {
     expect(response.status).toBe(200);
     expect((await response.json()).recommendations[0]).toMatchObject({ note: '', reason: 'A-private', read_task_id: null });
     const query = db.queries[0];
-    // 主表、note 与 feedback_id 三处都必须绑定可信 userId（合计三个占位符）。
-    expect(query.values).toEqual([2, 2, 2]);
+    // 主表、note 与 feedback_id 三处都必须绑定可信 userId（合计三个占位符）；
+    // F06 分页再追加默认 limit=300 / offset=0。
+    expect(query.values).toEqual([2, 2, 2, 300, 0]);
     expect(query.text).toContain('f.book_id = r.book_id AND f.user_id = ?');
     expect(query.text).toContain('WHERE r.user_id = ?');
     // 最新反馈与 CAS 版本同源：都取最大 id，避免书架显示的原因/版本与保存时的快照不一致。
@@ -47,7 +48,7 @@ describe('推荐主查询、最新原因和共享阅读定位', () => {
     const response = await GET(request());
     expect((await response.json()).recommendations[0].read_task_id).toBe(90);
     const query = db.queries[0];
-    expect(query.values).toEqual([3, 3, 3]);
+    expect(query.values).toEqual([3, 3, 3, 300, 0]);
     expect(query.text).toContain("dt.status = 'done'");
     expect(query.text).toContain('SELECT dt.id');
     expect(query.text).not.toMatch(/dt\.(?:error|user_id|source_url|log)/);
@@ -55,7 +56,20 @@ describe('推荐主查询、最新原因和共享阅读定位', () => {
   it('owner 的个人推荐仍只按 userId=1 查询', async () => {
     vi.stubEnv('AUTH_ACCOUNTS_ENABLED', 'false');
     expect((await GET(new NextRequest('http://localhost/api/recommendations', { headers: { 'X-Owner-Token': 'recommendations-owner' } }))).status).toBe(200);
-    expect(db.queries[0].values).toEqual([1, 1, 1]);
+    expect(db.queries[0].values).toEqual([1, 1, 1, 300, 0]);
+  });
+  // F06：搜索移服务端 + 分页，均走绑定参数（不做字符串拼接）。
+  it('F06：?q= 过滤 title/author，?limit=&offset= 分页', async () => {
+    const res = await GET(new NextRequest('http://localhost/api/recommendations?q=%E9%AC%BC&limit=50&offset=100', { headers: { Cookie: 'nf-dev-session=member-a' } }));
+    expect(res.status).toBe(200);
+    const query = db.queries[0];
+    expect(query.text).toContain('ILIKE ?');
+    expect(query.values).toEqual([2, 2, 2, '%鬼%', '%鬼%', 50, 100]);
+  });
+  it('F06：非法 limit/offset 返回 400 且不发查询', async () => {
+    const res = await GET(new NextRequest('http://localhost/api/recommendations?limit=0', { headers: { Cookie: 'nf-dev-session=member-a' } }));
+    expect(res.status).toBe(400);
+    expect(db.queries).toHaveLength(0);
   });
   it.each([null, { userId: 2, role: 'member', canFind: false, canRead: false, canDownload: false, authMethod: 'password', membersEnabled: true }])('拒绝匿名及缺少 find 能力的会话 %#', async (session) => {
     mocks.session.mockResolvedValue(session);
