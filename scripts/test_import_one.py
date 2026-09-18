@@ -463,9 +463,32 @@ class TestAutoImporter(TempDirCase):
         self.assertEqual(sorted(row['title'] for row in db.rows.values()),
                          ['测试书3', '测试书4'])     # 新→旧
         self.assertEqual(jsonl.read_text(encoding='utf-8'), original)   # 不改写断点文件
-        # 已导入的不会重复补录
+        # 已导入的不重复补录，且已标记的记录不占配额 → 继续往旧的补
         self.assertEqual(importer.retry_backlog(jsonl, limit=2), 2)
         self.assertEqual(len(db.rows), 4)
+        self.assertEqual(importer.retry_backlog(jsonl, limit=2), 1)     # 只剩最后一条
+        self.assertEqual(len(db.rows), 5)
+
+    def test_backlog_budget_counts_attempts_not_only_successes(self):
+        # 一条一直失败（review）的记录会吃掉一次尝试配额，不能无限扫描整个文件
+        records = []
+        for i in range(5):
+            rec = record(title=f'正常{i}', site_title=f'正常{i}',
+                         url=f'https://book15.net/books/details{i}.html')
+            rec['labels']['title_guess'] = f'正常{i}'
+            records.append(rec)
+        stuck = record(title='不可核验', site_title='不可核验',
+                       url='https://book15.net/books/details9.html')
+        stuck['labels']['site_title_match'] = False                    # → review
+        records.append(stuck)                                          # 最新一条：永远 review
+        jsonl = self.dir / 'labels.jsonl'
+        jsonl.write_text('\n'.join(json.dumps(r, ensure_ascii=False) for r in records),
+                         encoding='utf-8')
+        db = FakeDb()
+        importer = self.importer(db)
+        # attempted=1 撞上 review；attempted=2 补录正常4 → 配额用满即停
+        self.assertEqual(importer.retry_backlog(jsonl, limit=2), 1)
+        self.assertEqual([row['title'] for row in db.rows.values()], ['正常4'])
 
     def test_retry_backlog_disabled_or_missing_file(self):
         db = FakeDb()

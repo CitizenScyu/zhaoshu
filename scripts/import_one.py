@@ -574,10 +574,11 @@ class AutoImporter:
             return 'failed'
 
     def retry_backlog(self, jsonl_path, limit=IMPORT_BACKLOG_DEFAULT):
-        """把 labels.jsonl 里**尚未导入标记**的记录补录（新→旧），最多 limit 条。
+        """把 labels.jsonl 里**尚未导入标记**的记录补录（新→旧），最多尝试 limit 条。
 
         用途：部署切换时把历史欠账一次补齐；轮内某条导入失败后，下轮启动自动重试。
-        只读 labels.jsonl，绝不改写它。"""
+        已标记的 url 直接跳过且**不占配额**（否则标记越攒越多，每轮都停在同一批上）。
+        只读 labels.jsonl，绝不改写它。返回成功导入条数。"""
         if not self.enabled or limit <= 0:
             return 0
         path = Path(jsonl_path)
@@ -588,9 +589,9 @@ class AutoImporter:
         except OSError as error:
             self.log(f'  自动导入: 读取 {path} 失败（忽略）: {error}')
             return 0
-        done = 0
+        done = attempted = 0
         for line in reversed(lines):
-            if done >= limit:
+            if attempted >= limit:
                 break
             line = line.strip()
             if not line:
@@ -604,6 +605,7 @@ class AutoImporter:
             url = rec.get('url')
             if isinstance(url, str) and url in self._imported:
                 continue
+            attempted += 1
             if self.import_record(rec) == 'imported':
                 done += 1
         return done
