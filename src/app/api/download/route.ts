@@ -130,10 +130,11 @@ export async function POST(req: NextRequest) {
     }
     // 直接重试也先回收，避免必须先打开详情页查询才能解除僵尸任务的防重锁。
     await reclaimStaleTasks(sql);
-    // 同一本书有进行中的任务就直接返回它,避免重复入队
+    // 同一用户对同一本书有进行中的任务就直接返回它，避免重复入队。
+    // 活动锁粒度是 (user_id, book_id)（B2）：不同用户共享同一书源互不阻塞。
     const existing = (await sql`
       SELECT id FROM download_tasks
-      WHERE book_id = ${bookId} AND status IN ('pending', 'running')
+      WHERE user_id = ${auth.principal.userId} AND book_id = ${bookId} AND status IN ('pending', 'running')
       ORDER BY created_at DESC LIMIT 1`) as { id: number }[];
     if (existing.length > 0) {
       return authJson(

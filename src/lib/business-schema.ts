@@ -54,6 +54,10 @@ export async function initializeBusinessSchema(s: Sql) {
       note text NOT NULL DEFAULT '',
       created_at timestamptz NOT NULL DEFAULT now()
     )`,
+    // B7（audit-3 P1-4）：书架/召回路径大量 EXISTS (feedback WHERE book_id = b.id AND
+    // user_id = ...)——auth v5 的 feedback_user_created_idx 只罩 user 前缀，book 定位
+    // 全表扫。幂等补建，老库下一次 ensureSchema 生效。
+    tx`CREATE INDEX IF NOT EXISTS feedback_user_book_idx ON feedback (user_id, book_id)`,
     tx`
     CREATE TABLE IF NOT EXISTS shuyuan_sources (
       id serial PRIMARY KEY,
@@ -112,8 +116,12 @@ export async function initializeBusinessSchema(s: Sql) {
       updated_at timestamptz NOT NULL DEFAULT now()
     )`,
     tx`CREATE INDEX IF NOT EXISTS download_tasks_user_created_idx ON download_tasks (user_id, created_at DESC)`,
-    tx`CREATE UNIQUE INDEX IF NOT EXISTS download_tasks_active_book_idx ON download_tasks (book_id)
+    // 跨用户共享书源：活动任务锁的粒度是 (user_id, book_id)——书可以在多用户任务单里
+    // 同时在途，单用户内仍互斥（audit-3 P0-2）。旧的全局 book_id 索引（B2 迁移前的
+    // 唯一键）在这里退役；23505 冲突在应用层表现为 409 TASK_CONFLICT。
+    tx`CREATE UNIQUE INDEX IF NOT EXISTS download_tasks_user_active_book_idx ON download_tasks (user_id, book_id)
     WHERE status IN ('pending', 'running')`,
+    tx`DROP INDEX IF EXISTS download_tasks_active_book_idx`,
     tx`INSERT INTO shuyuan_meta (id) VALUES (1) ON CONFLICT (id) DO NOTHING`,
     // Disposable online-reader directories only; chapter text is never stored here.
     tx`

@@ -88,3 +88,20 @@ describe('业务 schema 的运行时 DDL', () => {
     expect(all).not.toMatch(/auth_settings|AUTH_SCHEMA_VERSION|auth_schema_migrations/);
   });
 });
+
+// B2（audit-3 P0-2）：活动任务唯一键从全局 book_id 改为 (user_id, book_id)——
+// 共享书源可多用户同时在途，单用户内仍互斥。删掉 DROP → 老库留着旧全局键，
+// 新语义永远不生效（CREATE IF NOT EXISTS 不报错）；删掉新 CREATE → 单用户去重裸奔。
+describe('下载活动锁的 B2 迁移', () => {
+  it('换为 (user_id, book_id) 唯一键并退役旧全局键', async () => {
+    const { statements, sql } = recorder();
+    await initializeBusinessSchema(sql as never);
+    const all = statements.join('\n');
+    expect(all).toMatch(/CREATE UNIQUE INDEX IF NOT EXISTS download_tasks_user_active_book_idx\s+ON download_tasks \(user_id, book_id\)\s+WHERE status IN \('pending', 'running'\)/);
+    expect(all).toMatch(/DROP INDEX IF EXISTS download_tasks_active_book_idx/);
+    const create = statements.findIndex((text) => /download_tasks_user_active_book_idx/.test(text));
+    const drop = statements.findIndex((text) => /DROP INDEX IF EXISTS download_tasks_active_book_idx/.test(text));
+    expect(create).toBeGreaterThan(-1);
+    expect(drop).toBeGreaterThan(create); // 先建新键再删旧键：中间不会出现无锁窗口
+  });
+});
