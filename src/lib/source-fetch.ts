@@ -15,7 +15,12 @@ function cancelBody(response: Response, reason?: unknown) {
 
 // 换 host 重试只对网络层失败（连接/传输超时、连接错误）生效；HTTP 状态码与策略
 // 拒绝是拿到响应后的判定，换 host 不改变结果（任务书与调研 §1.2 口径）。
+// beforeRequest 钩子的失败（预算耗尽/节流中止）也在这里排除：那是调用方的停止指令，
+// 与路径无关；标记而非 instanceof 是为了不引入 source-reader 的循环依赖。
+interface BeforeRequestFailure { fromBeforeRequest?: boolean }
+
 function isTransportError(error: unknown): boolean {
+  if ((error as BeforeRequestFailure).fromBeforeRequest) return false;
   if (error instanceof SourcePolicyError || error instanceof SourceHttpError) return false;
   if (error instanceof DOMException) return error.name === 'TimeoutError' || error.name === 'ConnectTimeoutError';
   // undici 网络错误（TypeError: fetch failed 等）与调用方 signal abort 之外的剩余错误。
@@ -123,7 +128,10 @@ async function attemptOnce(start: URL, {
   try {
     for (let redirects = 0; ; redirects += 1) {
       signal.throwIfAborted();
-      if (redirects > 0 || !skipFirstBeforeRequest) await beforeRequest?.(signal);
+      if (redirects > 0 || !skipFirstBeforeRequest) {
+        try { await beforeRequest?.(signal); }
+        catch (error) { (error as BeforeRequestFailure).fromBeforeRequest = true; throw error; }
+      }
       signal.throwIfAborted();
       const connectTimer = setTimeout(() => {
         controller.abort(new DOMException('书源连接超时', 'ConnectTimeoutError'));
