@@ -195,6 +195,14 @@ class TestNormalizeAuthor(unittest.TestCase):
     def test_non_string_author_fails(self):
         self.assertEqual(import_one.normalize_author(None)[0], 'failed')
 
+    def test_empty_author_is_review_not_ready(self):
+        # 幂等红线：空作者 → author_key=''，与存量同 title 的非空作者行不冲突。
+        for value in ('', '   ', '　'):
+            with self.subTest(value=repr(value)):
+                status, _, reason = import_one.normalize_author(value)
+                self.assertEqual(status, 'review')
+                self.assertIn('作者为空', reason)
+
 
 # ---- validate_record：与 import_labels.mjs 的门对齐 ----
 class TestValidateRecord(unittest.TestCase):
@@ -424,6 +432,30 @@ class TestAutoImporter(TempDirCase):
         self.assertEqual(importer.import_record(record(author='作者甲')), 'twin-skipped')
         inserts = [c for c in db.calls if c[0].startswith('INSERT')]
         self.assertEqual(inserts, [])
+        self.assertEqual(len(db.rows), 1)
+
+    def test_empty_author_cannot_insert_a_second_row(self):
+        """审查 A.3 红线：库里已有 (测试书, 作者甲)，本轮 17K 给出同书名空作者。
+
+        旧行为：normalize_author('') → ready，author_key='' 与 '作者甲' 不冲突 →
+        ON CONFLICT 不触发 → 凭空插入第二行。现在必须 review 且零 SQL。"""
+        db = FakeDb()
+        db.seed('测试书', '作者甲')
+        importer = self.importer(db)
+        status = importer.import_record(record(author=''))
+        self.assertEqual(status, 'review')
+        self.assertEqual(db.calls, [])                 # 校验阶段拦下，连 SELECT 都不发
+        self.assertEqual(len(db.rows), 1)
+        self.assertEqual(db.rows[('测试书', '作者甲')]['author'], '作者甲')
+        self.assertFalse((self.dir / import_one.MARKER_NAME).exists())
+
+    def test_non_empty_author_with_same_title_still_upserts(self):
+        """反例对照：作者非空时同 title 仍走 UPSERT（同身份 → 更新同一行，不新增）。"""
+        db = FakeDb()
+        db.seed('测试书', '作者甲')
+        importer = self.importer(db)
+        self.assertEqual(importer.import_record(record(author='作者甲')), 'imported')
+        self.assertTrue(any(c[0].startswith('INSERT') for c in db.calls))
         self.assertEqual(len(db.rows), 1)
 
     def test_review_records_are_not_imported(self):

@@ -211,6 +211,12 @@ def normalize_author(value, encoding=None):
     if encoding != 'text-v1' and _ENTITY_CANDIDATE_RE.search(value):
         return 'review', value, '作者含 HTML 实体，自动导入不冒进，留给完整导入器'
     normalized = value.strip()
+    if not normalized:
+        # 幂等红线：身份键是 (title_key, author_key)。空作者 → author_key=''，
+        # 与存量同一本书的 (title_key, '血红') **不冲突** → ON CONFLICT 不触发 →
+        # 凭空插入第二行（17K 完本页写死 author='' 就是这条口子）。
+        # 拿不准就不导：空作者一律 review，仍照常写 labels.jsonl 留给完整导入器/人工补作者。
+        return 'review', value, '作者为空，自动导入无法判定身份（可能与存量非空作者行重复）'
     if len(normalized) > 200:
         return 'failed', value, '作者超过 200 字（Unicode 码点）'
     return 'ready', normalized, ''
