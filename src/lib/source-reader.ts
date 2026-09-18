@@ -15,6 +15,7 @@ const MAX_SOURCE_REQUESTS = 12;
 const MAX_SOURCE_ATTEMPTS = 2;
 const SOURCE_DELAY_MS = 350;
 const MAX_DETAIL_CANDIDATES = 4;
+const MAX_SIMILAR_PAGES = 2;
 const MAX_SIMILAR_CANDIDATES = 6;
 const CHAPTER_CACHE_MS = 2 * 60_000;
 const MAX_CACHE_BYTES = 4 * 1024 * 1024;
@@ -39,9 +40,9 @@ export class SourceRequestContext {
   private nextRequestAt = 0;
   constructor(readonly signal: AbortSignal, readonly limit = MAX_SOURCE_REQUESTS) {}
 
-  async page(url: string): Promise<{ url: string; text: string }> {
+  async page(url: string, attempts = MAX_SOURCE_ATTEMPTS): Promise<{ url: string; text: string }> {
     let lastError: unknown;
-    for (let attempt = 0; attempt < MAX_SOURCE_ATTEMPTS; attempt++) {
+    for (let attempt = 0; attempt < attempts; attempt++) {
       this.signal.throwIfAborted();
       try {
         return await fetchSourceText(url, {
@@ -210,7 +211,11 @@ export async function resolveSourceBook(
             }
           } catch (error) {
             context.signal.throwIfAborted();
-            if (error instanceof SourceReaderError) throw error;
+            // 预算是全部源共享的：耗尽即停止请求，保留已收集的匹配/候选。
+            if (error instanceof SourceReaderError) {
+              if (error.code === 'SOURCE_BUDGET_EXCEEDED') break;
+              throw error;
+            }
             hadFailure = true;
           }
         }
@@ -242,31 +247,44 @@ export async function resolveSourceBook(
         const authorResult = await inspect(authorCandidates, true);
         if (authorResult) return authorResult;
         // 模糊层收集面 b)：作者搜索里 L1/L2 未消费过的其余详情页候选。
+        // 可选层限量：只再补 MAX_SIMILAR_PAGES 页，纯为凑候选不值得放大请求；
         // 预算余量不足时 SourceRequestContext 会抛 SOURCE_BUDGET_EXCEEDED，停止收集即可。
-        for (const url of authorCandidates.slice(MAX_DETAIL_CANDIDATES)) {
+        for (const url of authorCandidates.slice(MAX_DETAIL_CANDIDATES, MAX_DETAIL_CANDIDATES + MAX_SIMILAR_PAGES)) {
           if (checked.has(source.url + url) || url === options.excludeBookUrl) continue;
           try {
-            collectSimilar(await context.page(url));
+            // 可选请求不重试（attempts=1）：一次抖动不应吃掉 2 点预算 + 2×8s。
+            collectSimilar(await context.page(url, 1));
           } catch (error) {
             context.signal.throwIfAborted();
             if (error instanceof SourceReaderError && error.code === 'SOURCE_BUDGET_EXCEEDED') break;
-            if (!(error instanceof SourceReaderError)) hadFailure = true;
+            // 可选层失败不记账：只有决定「这本书在不在」的关键路径失败才算 partial，
+            // 为凑候选而失败的抓取不否决任何东西。
           }
         }
       }
     } catch (error) {
       context.signal.throwIfAborted();
-      if (error instanceof SourceReaderError) throw error;
+      // 预算是全部源共享的：耗尽即停止请求，保留已有匹配/候选（与上方 break 语义对齐）。
+      if (error instanceof SourceReaderError) {
+        if (error.code === 'SOURCE_BUDGET_EXCEEDED') break;
+        throw error;
+      }
       hadFailure = true;
     }
   }
   if (matches.size > 1) throw new SourceReaderError('找到多部同名作品，请补全作者后再阅读。', 'SOURCE_AMBIGUOUS', 422);
-  // A partial search cannot establish uniqueness for a book without an author.
-  if (matches.size === 1 && !hadFailure) return [...matches.values()][0];
+  // 无作者书的唯一匹配照常交付：接受「部分搜索下的唯一性风险」（生产无作者书 0-1 本，交付优于拒付；
+  // 搜索不完整只意味着可能漏掉第二个匹配，交给 SOURCE_AMBIGUOUS 的多匹配档兜底，参照 legado 换源行为：
+  // 单源失败绝不影响整体判定）。有作者书的命中在 :206/:225 提前返回，不受此处影响。
+  if (matches.size === 1) return [...matches.values()][0];
   // 模糊降级层：精确/别名/作者回退都没命中，但抓到过相似的详情页 ⇒ 交给用户选，不再 404。
+  // 候选层语义就是「不确定交给用户」，不能用「搜索不完整」否决它（那会剥夺用户自救手段）。
   const ranked = rankSimilarCandidates(book, [...similar.values()]);
-  if (ranked.length && !hadFailure) {
-    const error = new SourceReaderError(`没有完全匹配的书源，但找到 ${ranked.length} 个相似结果，请确认后阅读。`, 'SOURCE_SIMILAR', 422) as SourceReaderError & { candidates?: SourceSimilarCandidate[] };
+  if (ranked.length) {
+    const message = hadFailure
+      ? `没有完全匹配的书源，但找到 ${ranked.length} 个相似结果，请确认后阅读。（部分请求本轮未完成）`
+      : `没有完全匹配的书源，但找到 ${ranked.length} 个相似结果，请确认后阅读。`;
+    const error = new SourceReaderError(message, 'SOURCE_SIMILAR', 422) as SourceReaderError & { candidates?: SourceSimilarCandidate[] };
     error.candidates = ranked;
     throw error;
   }
