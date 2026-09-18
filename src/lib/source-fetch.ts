@@ -1,13 +1,25 @@
 // TypeScript port of zhaoshu-books/lib/source-fetch.mjs (batch 10).
 // Keep redirects, body limits and the single request/body timeout in sync.
-import { SourcePolicyError, validateSourceUrl } from './source-policy';
+import { alternateSourceHost, SourcePolicyError, validateSourceUrl } from './source-policy';
 
 export const MAX_SOURCE_REDIRECTS = 3;
 export const MAX_SOURCE_BYTES = 2 * 1024 * 1024;
 export const SOURCE_TIMEOUT_MS = 8_000;
+// 连接段（近似为 fetch settle，即 connect+响应头到达）独立上限：成功样本 connect ≤0.51s、
+// TTFB ≤2.11s，3s 是紧但有余量的合并段（调研 §4）；卡在连接/TTFB 的请求等满总 8s 纯浪费预算。
+export const SOURCE_CONNECT_TIMEOUT_MS = 3_000;
 
 function cancelBody(response: Response, reason?: unknown) {
   if (response.body && !response.body.locked) void response.body.cancel(reason).catch(() => {});
+}
+
+// 换 host 重试只对网络层失败（连接/传输超时、连接错误）生效；HTTP 状态码与策略
+// 拒绝是拿到响应后的判定，换 host 不改变结果（任务书与调研 §1.2 口径）。
+function isTransportError(error: unknown): boolean {
+  if (error instanceof SourcePolicyError || error instanceof SourceHttpError) return false;
+  if (error instanceof DOMException) return error.name === 'TimeoutError' || error.name === 'ConnectTimeoutError';
+  // undici 网络错误（TypeError: fetch failed 等）与调用方 signal abort 之外的剩余错误。
+  return error instanceof Error;
 }
 
 export function sourceAbortable<T>(promise: PromiseLike<T>, signal: AbortSignal): Promise<T> {
@@ -49,18 +61,58 @@ async function responseText(response: Response, signal: AbortSignal, maxBytes: n
 }
 
 export async function fetchSourceText(input: string, {
-  signal: parentSignal, timeoutMs = SOURCE_TIMEOUT_MS,
+  signal: parentSignal, timeoutMs = SOURCE_TIMEOUT_MS, connectTimeoutMs = SOURCE_CONNECT_TIMEOUT_MS,
   maxRedirects = MAX_SOURCE_REDIRECTS, maxBytes = MAX_SOURCE_BYTES,
   beforeRequest,
 }: {
   signal: AbortSignal;
   timeoutMs?: number;
+  connectTimeoutMs?: number;
   maxRedirects?: number;
   maxBytes?: number;
   beforeRequest?: (signal: AbortSignal) => Promise<void>;
 }) {
   parentSignal.throwIfAborted();
-  let current = validateSourceUrl(input).href;
+  const initial = validateSourceUrl(input);
+  const swapped = swapHost(initial);
+  try {
+    return await attemptOnce(initial, {
+      signal: parentSignal, timeoutMs, connectTimeoutMs, maxRedirects, maxBytes, beforeRequest,
+    });
+  } catch (error) {
+    // 4xx/5xx/策略拒绝：源站行为或响应侧判定，换 host 不改变结果，原样上抛；
+    // 网络层失败且确有备用 host 时，换 host 整体重试一次（同一次逻辑请求，见下）。
+    parentSignal.throwIfAborted();
+    if (!isTransportError(error) || !swapped) throw error;
+    return await attemptOnce(swapped, {
+      signal: parentSignal, timeoutMs, connectTimeoutMs, maxRedirects, maxBytes, beforeRequest,
+      skipFirstBeforeRequest: true,
+    });
+  }
+}
+
+function swapHost(url: URL): URL | null {
+  const alternate = alternateSourceHost(url.hostname);
+  if (!alternate) return null;
+  const next = new URL(url.href);
+  next.hostname = alternate;
+  return next;
+}
+
+async function attemptOnce(start: URL, {
+  signal: parentSignal, timeoutMs, connectTimeoutMs, maxRedirects, maxBytes, beforeRequest,
+  skipFirstBeforeRequest = false,
+}: {
+  signal: AbortSignal;
+  timeoutMs: number;
+  connectTimeoutMs: number;
+  maxRedirects: number;
+  maxBytes: number;
+  beforeRequest?: (signal: AbortSignal) => Promise<void>;
+  /** 换 host 重试的首次请求：与失败的那次是同一逻辑请求，预算/节流不重复扣。 */
+  skipFirstBeforeRequest?: boolean;
+}) {
+  let current = start.href;
   const visited = new Set([current]);
   const controller = new AbortController();
   const onAbort = () => controller.abort(parentSignal.reason);
@@ -71,14 +123,21 @@ export async function fetchSourceText(input: string, {
   try {
     for (let redirects = 0; ; redirects += 1) {
       signal.throwIfAborted();
-      await beforeRequest?.(signal);
+      if (redirects > 0 || !skipFirstBeforeRequest) await beforeRequest?.(signal);
       signal.throwIfAborted();
+      const connectTimer = setTimeout(() => {
+        controller.abort(new DOMException('书源连接超时', 'ConnectTimeoutError'));
+      }, connectTimeoutMs);
       const pending = fetch(current, {
         redirect: 'manual', cache: 'no-store', signal,
         headers: { 'User-Agent': 'Mozilla/5.0 (compatible; novel-finder-reader/1.0)' },
       });
       void pending.then((late) => { if (signal.aborted) cancelBody(late, signal.reason); }, () => {});
-      response = await sourceAbortable(pending, signal);
+      try {
+        response = await sourceAbortable(pending, signal);
+      } finally {
+        clearTimeout(connectTimer);
+      }
       if (response.redirected) throw new SourcePolicyError('书源响应发生未受控跳转');
       if ([301, 302, 303, 307, 308].includes(response.status)) {
         const location = response.headers.get('location');

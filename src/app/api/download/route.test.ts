@@ -151,7 +151,7 @@ describe('/api/download recovery and cleanup', () => {
 
   it.each([
     'http://book15.net/a', 'https://book15.net.evil.invalid/a', 'https://unknown.invalid/a',
-    'https://www.book15.net/a', 'https://user@book15.net/a', 'https://@book15.net/a',
+    'https://sub.book15.net/a', 'https://user@book15.net/a', 'https://@book15.net/a',
     'https://book15.net:444/a', 'https://127.0.0.1/a', 'https://[::1]/a', 'not a URL',
   ])('拒绝书库中的非法来源 %s，不入队或 dispatch', async (source_url) => {
     sql.mockResolvedValueOnce([{ ...book, source_url }]);

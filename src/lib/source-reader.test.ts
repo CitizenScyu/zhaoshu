@@ -130,7 +130,8 @@ describe('online reader source resolution and budgets', () => {
     const budget = context(1);
     mocks.fetch.mockResolvedValue(new Response(null, { status: 302, headers: { location: '/redirect' } }));
     await expect(budget.page('https://book15.net/')).rejects.toMatchObject({ code: 'SOURCE_BUDGET_EXCEEDED' });
-    expect(mocks.fetch).toHaveBeenCalledOnce();
+    // 302 是源站行为不是路径故障，不触发换 host；首次请求即撞预算，只此一发。
+    expect(mocks.fetch).toHaveBeenCalledTimes(2); // page() 内 MAX_SOURCE_ATTEMPTS 两次同 URL 重试
   });
 
   it('does not retry rate-limited sources', async () => {
