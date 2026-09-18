@@ -6,7 +6,7 @@ import {
   feedbackForUserQueries, persistRecommendationsForUserQueries, recommendationsForUserQuery,
   shelfStatsForUserQuery,
 } from '@/lib/user-data';
-import { parseReadingProgress } from '@/lib/reader-preferences';
+import { catalogPrefixKey, parseReadingProgress } from '@/lib/reader-preferences';
 import type { ReaderIndex } from '@/lib/reader-types';
 
 type Statement = { text: string; params: unknown[] };
@@ -111,14 +111,24 @@ it('R06: nested book brackets are normalized twice across insert and generated c
   expect(stored.rows).toEqual([{ title: '《嵌套审查》', title_key: '嵌套审查' }]);
 });
 
-it('R07: appending a chapter invalidates an otherwise valid online reading position', () => {
+it('R07: appending a chapter keeps an otherwise valid online reading position', () => {
   const index: ReaderIndex = {
     taskId: null, title: '连载审查', author: '审查作者', totalBytes: 0, version: 'old-catalog',
     source: { id: 'stable-book', name: '合成书源', url: 'https://example.invalid/book', session: 'old-catalog' },
     chapters: [0, 1].map(i => ({ index: i, title: `第${i+1}章`, startByte: 0, endByte: 0, partCount: 1 })),
   };
-  const progress = JSON.stringify({ schema: 1, version: index.version, chapterIndex: 1, partIndex: 0, ratio: 0.6, updatedAt: 1 });
+  // F11 修复后的进度带稳定章节键与前缀指纹（旧格式缺这两个字段时下面负例仍会失效）。
+  const progress = JSON.stringify({
+    schema: 1, version: index.version, chapterIndex: 1, partIndex: 0, ratio: 0.6,
+    chapterTitle: '第2章', catalogPrefix: catalogPrefixKey(index, 1), updatedAt: 1,
+  });
   expect(parseReadingProgress(progress, index)?.chapterIndex).toBe(1);
+  // 追加一章后 version 必然变化，但「第2章」在新目录里位置与标题都未变 → 续读回同一章。
   const updated = { ...index, version: 'new-catalog', chapters: [...index.chapters, { index: 2, title: '第三章', startByte: 0, endByte: 0, partCount: 1 }] };
-  expect(parseReadingProgress(progress, updated)).toBeNull();
+  const resumed = parseReadingProgress(progress, updated);
+  expect(resumed?.chapterIndex).toBe(1);
+  expect(resumed?.version).toBe('new-catalog');
+  // 负例：真正被替换/乱序（原章位置标题不再一致）时不得猜测，必须失效回退。
+  const rewritten = { ...index, version: 'rewritten', chapters: [{ index: 0, title: '第1章', startByte: 0, endByte: 0, partCount: 1 }, { index: 1, title: '换过的第2章', startByte: 0, endByte: 0, partCount: 1 }] };
+  expect(parseReadingProgress(progress, rewritten)).toBeNull();
 });

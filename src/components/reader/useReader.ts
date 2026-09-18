@@ -5,7 +5,7 @@ import type { ReaderIndex, ReaderPart, ReadingSession } from '@/lib/reader-types
 import { readerChapterUrl, readerIndexUrl, readerPartMatches } from '@/lib/reader-session';
 import { ReaderPartCache, nextReadingPosition, previousReadingPosition } from '@/lib/reader-part-cache';
 import { captureTextAnchor, restoreTextAnchor } from '@/lib/reader-text-anchor';
-import { parseReaderSettings, parseReadingProgress, readingPercent, READER_SETTINGS_KEY } from '@/lib/reader-preferences';
+import { catalogPrefixKey, parseReaderSettings, parseReadingProgress, readingPercent, READER_SETTINGS_KEY } from '@/lib/reader-preferences';
 import { migrateLegacyIndexProgressKey } from '@/lib/user-scope';
 import type { ReaderSettings, ReadingPosition, ReadingProgress } from '@/lib/reader-preferences';
 
@@ -125,9 +125,13 @@ export function useReader(session: ReadingSession, apiFetch: ApiFetch, userId: n
     const ratio = distance > 0 ? Math.max(0, Math.min(1, (top - rect.top) / distance)) : 1;
     const prose = section.querySelector<HTMLElement>('[data-reader-prose]');
     const anchor = prose ? captureTextAnchor(prose, viewport) : null;
+    // 在线目录可增长：除 version 外再存稳定章节键 + 前缀指纹，目录追加后才可验证地续读（F11）。
+    const chapter = current.index.chapters[part.chapterIndex];
+    const catalog = current.index.taskId === null && current.index.source && chapter?.title
+      ? { chapterTitle: chapter.title, catalogPrefix: catalogPrefixKey(current.index, part.chapterIndex) } : {};
     const position: ReadingProgress = {
       schema: 1, version: current.index.version, chapterIndex: part.chapterIndex, partIndex: part.partIndex,
-      ratio, ...anchor, updatedAt: Date.now(),
+      ratio, ...anchor, ...catalog, updatedAt: Date.now(),
     };
     return { position, sectionOffset: rect.top - top, part };
   }, []);
