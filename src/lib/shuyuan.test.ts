@@ -344,7 +344,9 @@ describe('refreshShuyuan atomic refresh', () => {
     await vi.advanceTimersByTimeAsync(8_001);
     await pending;
     expect(cancelled).toBe(true);
-    expect(savedStates()[0]).toMatchObject({ status: 'failed', checked_at: expect.any(String) });
+    // 单次挂起只累加连续失败计数（1 < 阈值 3），不写 failed、不把源踢出可用集；
+    // 没有历史结论的源记为 unprobed，对展示与取书判据都等价于「没有条目」。
+    expect(savedStates()[0]).toMatchObject({ status: 'unprobed', checked_at: null, consecutive_failures: 1 });
     expect(savedRows()[0].err).toBe('历史连接超时');
     expect(vi.getTimerCount()).toBe(0);
   });
@@ -548,5 +550,112 @@ describe('refreshShuyuan atomic refresh', () => {
     expect(await getReadingSources(new AbortController().signal)).toMatchObject([
       { url: 'https://book15.net/', searchUrl: 'https://book15.net/books/search.html?kw={{key}}' },
     ]);
+  });
+
+  // 归纳：last_error 的自动写点、连续失败阈值、失败计数的持久化与解析等价。
+  describe('源健康探测：连续失败计数', () => {
+    const storedKnown = (lastError: string, disabledAt: string | null = null) => ({
+      source_url: knownSource.bookSourceUrl, source: knownSource, last_error: lastError, disabled_at: disabledAt,
+    });
+    const entry = (over: Record<string, unknown> = {}) => ({
+      url: knownSource.bookSourceUrl, status: 'reachable', checked_at: '2026-09-16T00:00:00Z', error: null, ...over,
+    });
+    const probedUrls = () => fetchMock.mock.calls.map(([url]) => String(url));
+
+    it('没有任何失败记录的启用源也会被自动探测，失败后留下证据（不再恒为 unprobed）', async () => {
+      // 生产现状：库内 last_error 全空、无快照 ⇒ 旧门控永远不入队，探测链断电。
+      setCollection(11, [knownSource]);
+      seedPrevious([storedKnown('')]);
+      responses.set('https://book15.net/', { body: 'unavailable', status: 503 });
+
+      await refreshShuyuan();
+
+      expect(probedUrls()).toContain('https://book15.net/');
+      expect(savedStates()).toEqual([{
+        url: knownSource.bookSourceUrl, status: 'unprobed', checked_at: null, error: null, consecutive_failures: 1,
+      }]);
+      // last_error 的自动写点：此前只有人工 POST {action:disable} 会写它。
+      expect(savedRows()[0].err).toBe('503 https://book15.net/');
+    });
+
+    it('单次探测失败不降级：保留上一次可达结论，只把计数加到 1', async () => {
+      setCollection(11, [knownSource]);
+      seedPrevious([storedKnown('历史连接超时')], [entry()]);
+
+      await refreshShuyuan();
+
+      expect(probedUrls()).toContain('https://book15.net/');
+      expect(savedStates()).toEqual([{
+        url: knownSource.bookSourceUrl, status: 'reachable', checked_at: '2026-09-16T00:00:00Z', error: null,
+        consecutive_failures: 1,
+      }]);
+      expect(savedRows()[0].err).toBe('历史连接超时');
+    });
+
+    it('连续第三次探测失败才写 failed，并带出这次探测的错误原文', async () => {
+      setCollection(11, [knownSource]);
+      seedPrevious([storedKnown('历史连接超时')], [entry({ status: 'unprobed', checked_at: null, consecutive_failures: 2 })]);
+
+      await refreshShuyuan();
+
+      expect(savedStates()).toEqual([{
+        url: knownSource.bookSourceUrl, status: 'failed', checked_at: expect.any(String),
+        error: expect.stringContaining('https://book15.net/'), consecutive_failures: 3,
+      }]);
+    });
+
+    it('探测成功把连续失败计数清零并回到可达', async () => {
+      setCollection(11, [knownSource]);
+      seedPrevious([storedKnown('历史连接超时')], [entry({ status: 'unprobed', checked_at: null, consecutive_failures: 2 })]);
+      responses.set('https://book15.net/', { body: '离线合成响应' });
+
+      await refreshShuyuan();
+
+      expect(savedStates()).toEqual([{
+        url: knownSource.bookSourceUrl, status: 'reachable', checked_at: expect.any(String), error: null,
+        consecutive_failures: 0,
+      }]);
+    });
+
+    it('未达阈值的失败记录仍在取书可用集里，只有 failed 才被剔除', async () => {
+      execute.mockResolvedValueOnce([{ collections: [{ id: 1, title: '合集', count: 1,
+        probeSnapshot: { version: 1, entries: [entry({ status: 'unprobed', checked_at: null, consecutive_failures: 2 })] },
+      }] }]).mockResolvedValueOnce([{ ...oldSource(knownSource), disabled_at: null, name: '抖动源' }]);
+
+      expect(await getReadingSources(new AbortController().signal))
+        .toMatchObject([{ url: 'https://book15.net/', name: '抖动源' }]);
+      expect(fetchMock).not.toHaveBeenCalled();
+    });
+
+    it('探测期间调用方中止不算源失败：不写状态、不累加计数、不提交事务', async () => {
+      const controller = new AbortController();
+      setCollection(11, [knownSource]);
+      seedPrevious([storedKnown('历史连接超时')], [entry({ consecutive_failures: 1 })]);
+      const ordinary = fetchMock.getMockImplementation()!;
+      fetchMock.mockImplementation((input, init) => {
+        if (String(input) === 'https://book15.net/') {
+          controller.abort(new Error('测试取消'));
+          return Promise.reject(new Error('测试取消'));
+        }
+        return ordinary(input, init);
+      });
+
+      await expect(refreshShuyuan(controller.signal)).rejects.toThrow('测试取消');
+      expect(transaction).not.toHaveBeenCalled();
+      expect(execute.mock.calls.every(([query]) => query.text.startsWith('SELECT '))).toBe(true);
+    });
+
+    it('旧快照缺 consecutive_failures 时，喂给 SQL 的绑定值与加字段前逐字节相同', async () => {
+      const legacy = { url: knownSource.bookSourceUrl, status: 'reachable', checked_at: '2026-09-16T00:00:00Z', error: null };
+      execute.mockResolvedValueOnce([{ collections: [{ id: 11, title: '旧合集', count: 1,
+        probeSnapshot: { version: 1, entries: [legacy] },
+      }], refreshed_at: null }])
+        .mockResolvedValueOnce([{ ...zeroCounts, total: 1, enabled: 1, reachable: 1 }])
+        .mockResolvedValueOnce([]);
+
+      await getShuyuanStats();
+
+      expect(execute.mock.calls[1][0].values[0]).toBe(JSON.stringify([legacy]));
+    });
   });
 });
