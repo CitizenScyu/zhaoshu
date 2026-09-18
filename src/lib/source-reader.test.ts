@@ -488,3 +488,102 @@ describe('GET /api/read/source/[resource]', () => {
     expect(line).not.toContain('作者');
   });
 });
+
+// M2-1 只做原语：SourceRequestContext.child / openPool 的语义与信号传递。
+// 软预算判据与跳源循环在 M2-2（设计 §9 任务卡：本文件这 5 条才是 M2-1 的权威验收）。
+describe('source budget primitives: child scopes and openPool (M2-1)', () => {
+  const scopedUrl = (id: number) => `https://book15.net/books/details${id}.html`;
+
+  it('opens the global pool with a 12 floor and a 30 cap, never shrinking', () => {
+    // 设计 §3.1：openPool(n) = min(30, max(12, 6n))，幂等取最大值。
+    const root = context();
+    expect(root.totalLimit).toBe(12); // 池里只有 builtin：与今天的单源预算逐点相同
+    root.openPool(1);
+    expect(root.totalLimit).toBe(12);
+    root.openPool(2);
+    expect(root.totalLimit).toBe(12); // 6×2=12 仍在保底线上
+    root.openPool(3);
+    expect(root.totalLimit).toBe(18);
+    root.openPool(5);
+    expect(root.totalLimit).toBe(30);
+    root.openPool(1);
+    expect(root.totalLimit).toBe(30); // failover 复用同一 context 时第二次调用不得把预算收窄
+  });
+
+  it('shares the request counter with a child while keeping the limits independent', async () => {
+    pages.set(scopedUrl(50), { text: '正文占位' });
+    const root = context();
+    const child = root.child('https://book15.net/mirror-page');
+    expect(root.scope).toBe('builtin'); // 根 context 是 builtin 首源
+    expect(child.scope).toBe('https://book15.net/mirror-page');
+    expect(root.limit).toBe(12);
+    expect(child.limit).toBe(service.PER_SOURCE_REQUESTS); // 单源默认 6（设计 §3.1）
+    expect(root.child('https://book15.net/x', { limit: 3 }).limit).toBe(3);
+    await child.page(scopedUrl(50));
+    expect(child.requests).toBe(1); // 子计数写回共享
+    expect(root.requests).toBe(1);
+    await root.page(scopedUrl(50));
+    expect(root.requests).toBe(2); // 父的请求同样进同一个计数
+  });
+
+  it('abandons only the exhausted source scope and keeps the shared count', async () => {
+    // 设计 §3.3：单源点数耗尽 ⇒ SOURCE_SCOPE_EXHAUSTED（跳源信号，M2-2 消费）；
+    // 父计数不回退，兄弟/首源仍可用剩余全局预算。
+    for (const id of [51, 52, 53, 54]) pages.set(scopedUrl(id), { text: '正文占位' });
+    const root = context();
+    const child = root.child('https://book15.net/mirror-page', { limit: 2 });
+    await child.page(scopedUrl(51));
+    await child.page(scopedUrl(52));
+    await expect(child.page(scopedUrl(53))).rejects.toMatchObject({ code: 'SOURCE_SCOPE_EXHAUSTED', status: 503 });
+    expect(root.requests).toBe(2); // 父计数不回退
+    // 红线（2eca42d）：beforeRequest 的预算拒绝不得被当成传输错误 ⇒ 不换 host 重试，一次物理请求都没多发。
+    expect(mocks.fetch).toHaveBeenCalledTimes(2);
+    await root.page(scopedUrl(54)); // builtin 首源不受 L1 单源闸门约束
+    expect(root.requests).toBe(3);
+  });
+
+  it('propagates a parent abort to an in-flight child request', async () => {
+    // 验收 3：child 的 signal = AbortSignal.any([父 signal, 切片定时器])，父 abort 立刻传到子。
+    const controller = new AbortController();
+    const root = new service.SourceRequestContext(controller.signal);
+    const child = root.child('https://book15.net/mirror-page');
+    mocks.fetch.mockImplementation(() => new Promise<Response>(() => { /* 挂起，等父 abort */ }));
+    const pending = child.page(scopedUrl(55));
+    await new Promise((resolve) => setTimeout(resolve, 5)); // 让请求真正挂在 fetch 上
+    controller.abort(new Error('cancelled'));
+    await expect(pending).rejects.toThrow('cancelled');
+    expect(root.requests).toBe(1); // 已发出的点数照记
+  });
+
+  it('expires a source slice without aborting the parent', async () => {
+    // 设计 §3.3 陷阱：切片只 abort 子 signal。若父 signal 也 aborted，M2-2 的循环会把它误判成整体取消。
+    const root = context();
+    const child = root.child('https://book15.net/mirror-page', { sliceMs: 5 });
+    mocks.fetch.mockImplementation(() => new Promise<Response>(() => { /* 挂起，等切片超时 */ }));
+    const error = await child.page(scopedUrl(56)).catch((reason: unknown) => reason);
+    expect(error).toMatchObject({ code: 'SOURCE_SCOPE_EXHAUSTED', status: 503 });
+    expect(root.requests).toBe(1); // 切片前的点数已计入，不回退
+    expect(root.signal.aborted).toBe(false); // 只 abort 子 signal
+    expect(child.signal.aborted).toBe(true);
+  });
+
+  it('keeps one 350ms pacing series shared by the parent and its children', async () => {
+    // 验收 4：M2 不做每 host 分桶，350ms 节流槽父子共享（沿用并发断言，证明没有按源分桶）。
+    vi.mocked(Date.now).mockRestore(); // 本用例需要真实时钟测量槽位间隔
+    const starts: number[] = [];
+    mocks.fetch.mockImplementation(async () => {
+      starts.push(Date.now());
+      return new Response('<html></html>', { status: 200 });
+    });
+    const root = new service.SourceRequestContext(new AbortController().signal);
+    const child = root.child('https://book15.net/mirror-page');
+    await Promise.all([
+      root.page('https://book15.net/a'),
+      child.page('https://book15.net/b'),
+      root.page('https://book15.net/c'),
+    ]);
+    expect(starts).toHaveLength(3);
+    expect(starts[1] - starts[0]).toBeGreaterThanOrEqual(300);
+    expect(starts[2] - starts[1]).toBeGreaterThanOrEqual(300);
+  });
+});
