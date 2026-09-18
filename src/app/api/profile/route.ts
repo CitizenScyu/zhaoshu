@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { ensureSchema, getProfileFeedbackForUser, getProfileForUser, saveProfileForUser } from '@/lib/db';
+import { ensureSchema, getProfileFeedbackForUser, getProfileForUser, getWithdrawnFeedbackBookTitlesForUser, saveProfileForUser } from '@/lib/db';
 import { chatRobust, configuredTotalTimeoutMs, LlmError, MAX_PROFILE_LENGTH, validateProfileContent } from '@/lib/llm';
 import { recordUsageAfterResponse } from '@/lib/record-llm-usage';
 import {
@@ -110,7 +110,10 @@ export async function POST(req: NextRequest) {
     const sanitized = sanitizeSeeds(profile.seeds);
     if (!sanitized.length) return NextResponse.json({ error: '先在下方填入种子书单' }, { status: 400 });
     // 默认重建才读反馈；resetFromSeeds 走旧的纯种子路径，不读反馈（也不并入旧画像）。
+    // withdrawn：曾 informative、最新已撤回的书名——旧画像里可能还留着这些偏好，
+    // 必须把「已撤回」这一信号显式喂给模型，否则它会按「仍被证据支持」把旧结论留下。
     const feedback = resetFromSeeds ? [] : await access.run(() => getProfileFeedbackForUser(userId));
+    const withdrawn = resetFromSeeds ? [] : await access.run(() => getWithdrawnFeedbackBookTitlesForUser(userId));
     const budgetMs = Math.min(access.deadline.modelBudgetMs(MODEL_CEILING_MS), configuredTotalTimeoutMs());
     if (budgetMs <= 0) throw new DeadlineExceededError(MODEL_ROUTE_INTERNAL_BUDGET_MS);
     return access.sse(async (send) => {
@@ -119,7 +122,7 @@ export async function POST(req: NextRequest) {
         resetFromSeeds ? profileSystem() : profileRebuildSystem(),
         resetFromSeeds
           ? profileFromSeedsUser(seedsJson)
-          : profileRebuildUser(seedsJson, profile.content, JSON.stringify(feedback, null, 2)),
+          : profileRebuildUser(seedsJson, profile.content, JSON.stringify(feedback, null, 2), withdrawn),
         { temperature: 0.4, signal: access.signal, onUsage: recordUsageAfterResponse('profile'),
           totalTimeoutMs: budgetMs, onToken: (delta) => send({ type: 'token', content: delta }) },
       ));
