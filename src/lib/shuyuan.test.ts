@@ -451,6 +451,65 @@ describe('refreshShuyuan atomic refresh', () => {
     expect(fetchMock).toHaveBeenCalledTimes(4);
   });
 
+  // M1 任务 3：准入批次挂在全量替换事务之后（设计 §4.2 v3 E2）。候选源 = 通过 survey 初筛者。
+  const admissionCandidate = {
+    bookSourceUrl: 'https://new.example/', bookSourceName: '新源',
+    searchUrl: 'https://new.example/s?q={{key}}',
+    ruleSearch: { bookList: '.i', name: '.t@text', bookUrl: 'a@href', author: '.a@text' },
+    ruleContent: { content: '.c' },
+  };
+  const admissionSearchUrl = `https://new.example/s?q=${encodeURIComponent('斗破苍穹')}`;
+
+  it('准入批次写 source_admission，且写库排在替换事务提交之后', async () => {
+    setCollection(11, [admissionCandidate]);
+    fetchMock.mockImplementation(async (input, options) => {
+      const url = String(input);
+      if (url === admissionSearchUrl) {
+        expect(options?.redirect).toBe('manual'); // 准入通道独立于 fetchSourceText 的 redirect:'error'
+        return new Response('<div class="i"><span class="t">书名</span><a href="/b/1">x</a></div>', { status: 200 });
+      }
+      expect(options?.redirect).toBe('error');
+      const fixture = responses.get(url);
+      if (!fixture) throw new Error(`Unexpected network request: ${url}`);
+      return new Response(fixture.body, { status: fixture.status ?? 200 });
+    });
+
+    await refreshShuyuan();
+
+    const insertIndex = execute.mock.calls.findIndex(([query]) => query.text.startsWith('INSERT INTO source_admission'));
+    expect(insertIndex).toBeGreaterThan(-1);
+    const payload = JSON.parse(execute.mock.calls[insertIndex][0].values[0] as string) as { source_url: string; search_verdict: string }[];
+    expect(payload).toEqual([expect.objectContaining({ source_url: 'https://new.example', search_verdict: 'ok' })]);
+    // 时序：替换事务在前，准入写库在后（事务提交后才探测/写库）。
+    expect(transaction.mock.invocationCallOrder[0]).toBeLessThan(execute.mock.invocationCallOrder[insertIndex]);
+  });
+
+  it('剩余预算不足时整批跳过准入：不读不写 source_admission、不发搜索请求', async () => {
+    vi.useFakeTimers();
+    const started = Date.now();
+    setCollection(11, [admissionCandidate]);
+    readTransaction.mockImplementation(async (queries) => {
+      const result = await Promise.all(queries.map((query) => execute(query)));
+      if (queries[0].text.includes('FROM shuyuan_meta')) vi.setSystemTime(started + REFRESH_BUDGET_MS - 5_000);
+      return result;
+    });
+    fetchMock.mockImplementation(async (input, options) => {
+      expect(options?.redirect).toBe('error');
+      const fixture = responses.get(String(input));
+      if (!fixture) throw new Error(`Unexpected network request: ${String(input)}`);
+      return new Response(fixture.body, { status: fixture.status ?? 200 });
+    });
+
+    await refreshShuyuan();
+
+    // 预算剩余 5s < ADMISSION_MIN_BUDGET_MS(10s)：整批跳过，零准入 DB 往返、零搜索请求。
+    expect(execute.mock.calls.some(([query]) => query.text.includes('source_admission'))).toBe(false);
+    expect(fetchMock.mock.calls.map(([url]) => String(url))).toEqual([
+      indexUrl, collectionUrl(11), collectionUrl(12), collectionUrl(13),
+    ]);
+    expect(transaction).toHaveBeenCalledOnce();
+  });
+
   it('统计拒绝未知来源健康声明，未禁用数量不能替代探测可达数量', async () => {
     execute.mockResolvedValueOnce([{ collections: [{
       id: 11, title: '合集', count: 3, probeSnapshot: { version: 1, entries: [
