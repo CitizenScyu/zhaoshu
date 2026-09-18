@@ -129,7 +129,9 @@ describe('/api/download recovery and cleanup', () => {
     expect(res.status).toBe(201);
     expect(await res.json()).toEqual({ taskId: 43 });
     expectSafeReclaim(1);
+    // F03：活动锁只看 pending/running——partial（残缺终态）不阻塞重下补齐
     expect(queryText(2)).toMatch(/WHERE user_id = \? AND book_id = \? AND status IN \('pending', 'running'\) ORDER BY created_at DESC LIMIT 1$/);
+    expect(queryText(2)).not.toContain('partial');
     expect(queryText(3)).toMatch(/^INSERT INTO download_tasks /);
     expect(sql.mock.calls[3].slice(1)).toEqual([1, book.id, book.title, book.author, book.source_url]);
     expect(triggerDownloadWorkflow).toHaveBeenCalledOnce();
@@ -147,6 +149,21 @@ describe('/api/download recovery and cleanup', () => {
     expectSafeReclaim(1);
     expect(sql).toHaveBeenCalledTimes(3);
     expect(triggerDownloadWorkflow).not.toHaveBeenCalled();
+  });
+
+  it('F03：同一本书只有 partial（残缺）任务时可重新入队补齐', async () => {
+    // 活动锁只匹配 pending/running，已有的 partial 行不在去重结果里，因此建任务成功。
+    sql.mockResolvedValueOnce([book])
+      .mockResolvedValueOnce([])   // 回收
+      .mockResolvedValueOnce([])   // 活动任务查询：partial 不返回
+      .mockResolvedValueOnce([{ id: 44 }]);
+
+    const res = await POST(request('POST', { bookId: book.id }));
+
+    expect(res.status).toBe(201);
+    expect(await res.json()).toEqual({ taskId: 44 });
+    expect(queryText(2)).not.toContain('partial');
+    expect(triggerDownloadWorkflow).toHaveBeenCalledOnce();
   });
 
   it.each([
@@ -200,7 +217,7 @@ describe('/api/download recovery and cleanup', () => {
     expect(triggerDownloadWorkflow).not.toHaveBeenCalled();
   });
 
-  it.each(['pending', 'failed'])('physically removes an owned %s row', async () => {
+  it.each(['pending', 'failed', 'partial'])('physically removes an owned %s row', async () => {
     sql.mockResolvedValueOnce([{ id: recoveredTask.id }]);
 
     const res = await DELETE(request('DELETE', { taskId: recoveredTask.id }));
@@ -208,7 +225,7 @@ describe('/api/download recovery and cleanup', () => {
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual({ ok: true });
     expect(sql).toHaveBeenCalledOnce();
-    expect(queryText(0)).toMatch(/^DELETE FROM download_tasks WHERE id = \? AND user_id = \? AND status IN \('pending', 'failed'\) RETURNING id$/);
+    expect(queryText(0)).toMatch(/^DELETE FROM download_tasks WHERE id = \? AND user_id = \? AND status IN \('pending', 'failed', 'partial'\) RETURNING id$/);
     expect(sql.mock.calls[0].slice(1)).toEqual([recoveredTask.id, 1]);
   });
 
@@ -217,7 +234,7 @@ describe('/api/download recovery and cleanup', () => {
     const res = await DELETE(request('DELETE', { taskId: recoveredTask.id }));
 
     expect(res.status).toBe(409);
-    expect(await res.json()).toEqual({ error: '只能取消排队中的任务或清理失败任务', code: 'TASK_CONFLICT' });
+    expect(await res.json()).toEqual({ error: '只能取消排队中的任务或清理未完成任务', code: 'TASK_CONFLICT' });
     expect(sql).toHaveBeenCalledTimes(2);
     expect(queryText(0)).toMatch(/^DELETE FROM download_tasks /);
     expect(queryText(1)).toMatch(/^SELECT status FROM download_tasks /);

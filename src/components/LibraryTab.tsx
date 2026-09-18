@@ -28,7 +28,7 @@ interface DownloadTask {
   id: number;
   bookId: number;
   title: string;
-  status: 'pending' | 'running' | 'done' | 'failed';
+  status: 'pending' | 'running' | 'done' | 'failed' | 'partial';
   chaptersTotal: number;
   chaptersDone: number;
   charsTotal: number;
@@ -79,7 +79,7 @@ function parseTask(data: unknown): DownloadTask | null {
     id: t.id,
     bookId: Number(t.bookId) || 0,
     title: typeof t.title === 'string' ? t.title : '',
-    status: (['pending', 'running', 'done', 'failed'] as const).includes(status as never)
+    status: (['pending', 'running', 'done', 'failed', 'partial'] as const).includes(status as never)
       ? (status as DownloadTask['status'])
       : 'pending',
     chaptersTotal: Number(t.chaptersTotal) || 0,
@@ -95,6 +95,10 @@ function downloadStatusText(t: DownloadTask): string {
     case 'pending': return '排队中，等待下载任务开始';
     case 'running': return `下载中 ${t.chaptersDone}/${t.chaptersTotal} 章`;
     case 'done': return `完成，共 ${t.charsTotal} 字`;
+    case 'partial': {
+      const missing = Math.max(0, t.chaptersTotal - t.chaptersDone);
+      return `未完成：已存 ${t.chaptersDone}/${t.chaptersTotal} 章${missing > 0 ? `，缺 ${missing} 章` : ''}，可重试补齐`;
+    }
     case 'failed': return t.error?.trim() ? '下载失败' : '下载失败：未知原因';
   }
 }
@@ -375,7 +379,7 @@ export default function LibraryTab({ view, setView }: {
   }
 
   async function removeDownload() {
-    if (!task || dlBusy || (task.status !== 'pending' && task.status !== 'failed')) return;
+    if (!task || dlBusy || (task.status !== 'pending' && task.status !== 'failed' && task.status !== 'partial')) return;
     const failureMessage = task.status === 'failed' ? '清理失败' : '取消失败';
     const my = ++dlRequestId.current;
     setDlBusy(true);
@@ -493,7 +497,7 @@ export default function LibraryTab({ view, setView }: {
                   <span
                     role="status"
                     className="text-sm"
-                    style={{ color: task.status === 'failed' ? 'var(--cinnabar)' : 'var(--ink-soft)' }}
+                    style={{ color: task.status === 'failed' ? 'var(--cinnabar)' : task.status === 'partial' ? 'var(--dai)' : 'var(--ink-soft)' }}
                   >
                     {downloadStatusText(task)}
                   </span>
@@ -502,7 +506,7 @@ export default function LibraryTab({ view, setView }: {
                       取回文件
                     </button>
                   )}
-                  {(task.status === 'failed' || task.status === 'pending') && (
+                  {(task.status === 'failed' || task.status === 'pending' || task.status === 'partial') && (
                     <button
                       className="chip chip-dai text-sm disabled:opacity-50"
                       onClick={() => void startDownload()}
@@ -511,16 +515,16 @@ export default function LibraryTab({ view, setView }: {
                       {dlBusy ? '处理中…' : '重试'}
                     </button>
                   )}
-                  {(task.status === 'pending' || task.status === 'failed') && (
+                  {(task.status === 'pending' || task.status === 'failed' || task.status === 'partial') && (
                     <button className="chip text-sm" onClick={() => void removeDownload()} disabled={dlBusy}>
-                      {task.status === 'failed' ? '清理' : '取消'}
+                      {task.status === 'pending' ? '取消' : '清理'}
                     </button>
                   )}
                 </div>
                 {taskNotes.length > 0 && (
                   <div className="border-l-2 pl-3" style={{ borderColor: 'var(--line)' }}>
                     <p className="text-xs font-bold mb-1" style={{ color: 'var(--ink-soft)' }}>
-                      {task.status === 'failed' ? '失败详情' : '抽验与提示'}
+                      {task.status === 'failed' ? '失败详情' : task.status === 'partial' ? '未完成详情（缺章 / 抽验）' : '抽验与提示'}
                     </p>
                     <ul
                       className="list-disc pl-4 space-y-1 text-xs leading-6 break-words"

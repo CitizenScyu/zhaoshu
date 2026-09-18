@@ -8,7 +8,7 @@ import { boundedPositiveInteger, readJsonBody, RequestBodyError } from '@/lib/ht
 import { DOWNLOAD_TASK_STALE_MS } from '@/lib/download-task-policy';
 import { SourcePolicyError, validateSourceUrl } from '@/lib/source-policy';
 
-// 书库下载任务:GET 查任务(最近 20 条或单条)、POST 建任务、DELETE 取消 pending/清理 failed
+// 书库下载任务:GET 查任务(最近 20 条或单条)、POST 建任务、DELETE 取消 pending/清理 failed/partial
 export const maxDuration = 60;
 
 const MAX_BODY_BYTES = 4 * 1024;
@@ -184,15 +184,16 @@ export async function DELETE(req: NextRequest) {
   try {
     await ensureSchema();
     const sql = getSql();
-    // 按状态原子删除：取消排队中的任务或清理失败记录；本人之外与运行中 / 已完成的任务仍受保护。
+    // 按状态原子删除：取消排队中的任务、清理失败记录或残缺（partial）任务；
+    // 本人之外与运行中 / 已完成的任务仍受保护。partial 不是终态完成，删除后用户可重下补齐。
     const rows = (await sql`
       DELETE FROM download_tasks
-      WHERE id = ${taskId} AND user_id = ${guard.principal.userId} AND status IN ('pending', 'failed')
+      WHERE id = ${taskId} AND user_id = ${guard.principal.userId} AND status IN ('pending', 'failed', 'partial')
       RETURNING id`) as { id: number }[];
     if (rows.length === 0) {
       const visible = await sql`SELECT status FROM download_tasks WHERE id = ${taskId} AND user_id = ${guard.principal.userId}` as { status: string }[];
       if (visible.length === 0) return authJson({ error: 'task not found', code: 'TASK_NOT_FOUND' }, { status: 404 });
-      return authJson({ error: '只能取消排队中的任务或清理失败任务', code: 'TASK_CONFLICT' }, { status: 409 });
+      return authJson({ error: '只能取消排队中的任务或清理未完成任务', code: 'TASK_CONFLICT' }, { status: 409 });
     }
     return authJson({ ok: true });
   } catch (e) {
