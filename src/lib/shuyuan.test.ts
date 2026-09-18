@@ -197,10 +197,54 @@ describe('refreshShuyuan atomic refresh', () => {
   it('does not replace existing sources with an empty collection result', async () => {
     setCollection(11, []);
 
-    await expect(refreshShuyuan()).rejects.toThrow('所有书源合集下载失败');
+    // 合集 JSON 都拉到了、只是没有任何源：同样不写库，但走降级返回而不是抛错。
+    await expect(refreshShuyuan()).resolves.toMatchObject({ collections: [], refreshedAt: null });
 
     expect(transaction).not.toHaveBeenCalled();
-    expect(execute).not.toHaveBeenCalled();
+    expect(execute.mock.calls.every(([query]) => query.text.startsWith('SELECT '))).toBe(true);
+  });
+
+  it('上游合集整体不可达时降级：不抛错、不写库、返回库中既有统计并响亮告警', async () => {
+    // 判别性构造：传输层对索引页之外的合集请求一律抛 undici 网络错误形态（ECONNRESET 那一类），
+    // 三个合集全部拉不到 ⇒ merged.size === 0，正是生产 09-15 之后每轮 cron 走到的分支。
+    fetchMock.mockImplementation(async (input, options) => {
+      expect(options?.redirect).toBe('error');
+      const url = String(input);
+      if (url === indexUrl) return new Response(responses.get(indexUrl)!.body, { status: 200 });
+      throw new TypeError('fetch failed');
+    });
+    const staleMeta = {
+      collections: [{ id: 10, title: '旧合集', count: 1 }],
+      refreshed_at: '2026-09-15T20:27:18Z',
+    };
+    execute.mockImplementation(async (query) => {
+      if (query.text.includes('FROM shuyuan_meta')) return [staleMeta];
+      if (query.text.startsWith('SELECT count(*)')) return [{ ...zeroCounts, total: 1, enabled: 1, unprobed: 1 }];
+      return [];
+    });
+
+    const stats = await refreshShuyuan();
+
+    // ②返回的是库里既有数据：refreshed_at 停留旧值，绝不被写成「刚刷新过」。
+    expect(stats.refreshedAt).toBe(staleMeta.refreshed_at);
+    expect(stats.collections).toEqual(staleMeta.collections);
+    expect(stats.total).toBe(1);
+    // ①不抛错（resolves）+ 未执行任何写库：没有事务，所有 SQL 都是 SELECT。
+    expect(transaction).not.toHaveBeenCalled();
+    expect(execute.mock.calls.every(([query]) => query.text.startsWith('SELECT '))).toBe(true);
+    // ③响亮告警带失败合集与原因归类。
+    expect(console.error).toHaveBeenCalledWith(
+      expect.stringContaining('shuyuan refresh degraded'),
+      expect.objectContaining({
+        collections: [11, 12, 13],
+        failures: [
+          { id: 11, reason: 'fetch failed' },
+          { id: 12, reason: 'fetch failed' },
+          { id: 13, reason: 'fetch failed' },
+        ],
+      }),
+    );
+    expect(fetchMock).toHaveBeenCalledTimes(4);
   });
 
   it('returns the transaction error to the refresh API instead of announcing success', async () => {

@@ -395,16 +395,22 @@ async function refreshWithinBudget(s: Sql, budget: RequestDeadline, signal: Abor
 
   const merged = new Map<string, Record<string, unknown>>();
   const collections: ShuyuanCollection[] = [];
+  // 失败合集的原因归类，只用于降级告警：上游整体不可达时要说清「拉了哪些、为什么没拿到」。
+  const collectionFailures: { id: number; reason: string }[] = [];
   for (const entry of entries.slice(0, LATEST_COUNT)) {
     assertActive();
     let parsed: unknown;
     try {
       parsed = JSON.parse(await fetchText(jsonUrl(entry.id), RESPONSE_TIMEOUT_MS, signal));
-    } catch {
+    } catch (error) {
       assertActive();
+      collectionFailures.push({ id: entry.id, reason: error instanceof Error ? error.message : '合集下载失败' });
       continue;
     }
-    if (!Array.isArray(parsed)) continue;
+    if (!Array.isArray(parsed)) {
+      collectionFailures.push({ id: entry.id, reason: '合集 JSON 不是数组' });
+      continue;
+    }
     for (const item of parsed) {
       if (!isRecord(item) || typeof item.bookSourceUrl !== 'string') continue;
       const url = normalizeUrl(item.bookSourceUrl);
@@ -414,7 +420,17 @@ async function refreshWithinBudget(s: Sql, budget: RequestDeadline, signal: Abor
     }
     collections.push({ id: entry.id, title: entry.title, count: parsed.length });
   }
-  if (merged.size === 0) throw new Error('所有书源合集下载失败');
+  if (merged.size === 0) {
+    // 降级而不是抛错：上游合集整体不可达时抛错会让 /api/shuyuan 返回 502，且 refreshed_at 冻结——
+    // 治理面（含探测与可观测）跟着上游一起停摆，库里 995 条既有源却什么都做不了。
+    // 这里必须在任何写库动作之前返回：refreshed_at 停留旧值，「陈旧」由既有可观测暴露
+    // （getShuyuanPoolHealth().refreshedAtAgeHours），不需要新字段，也绝不允许写假新鲜时间。
+    console.error('shuyuan refresh degraded: 所有书源合集下载失败，保留既有数据', {
+      collections: entries.slice(0, LATEST_COUNT).map((entry) => entry.id),
+      failures: collectionFailures,
+    });
+    return getShuyuanStats(signal);
+  }
   const expected = Math.min(LATEST_COUNT, entries.length);
   if (collections.length < expected) {
     throw new Error(`仅拉到 ${collections.length}/${expected} 个书源合集，本次刷新中止，保留既有数据`);
