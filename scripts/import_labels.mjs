@@ -135,6 +135,9 @@ function validateImportRecord(rec) {
   const normalizedAuthor = normalizeAuthor(rec.author ?? '', {
     sourceSite: rec.source, encoding: rec.author_encoding,
   });
+  // 空作者现在由 normalizeAuthor 归为 review（见 empty-author），在此统一拦下：
+  // 该行按 review 计数并报告，**不写库**——否则 author_key='' 与存量同书名的非空
+  // 作者行不冲突，ON CONFLICT 不触发会插入第二行（与 python 自动导入语义对齐）。
   if (normalizedAuthor.status !== 'ready') {
     return { status: normalizedAuthor.status, reason: normalizedAuthor.reason };
   }

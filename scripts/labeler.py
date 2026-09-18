@@ -27,7 +27,9 @@ import sys
 import time
 import urllib.parse
 import urllib.request
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 # ---- 配置 ----
 TARGET_CHARS = 500_000      # 每本抓取字数上限
@@ -50,6 +52,9 @@ MODELS = ['deepseek-v4-flash-bohe', 'grok-4.6-hei', 'deepseek-v4.1-flash-hei', '
 # 读库取模型名用的白名单：只是防呆（挡住空串/换行/注入了 SQL 的怪值），不是安全边界。
 MODEL_NAME_RE = re.compile(r'^[A-Za-z0-9._/-]{1,200}$')
 DB_MODEL_TIMEOUT_SEC = 5    # 读配置失败必须快速回落，不能拖住批量任务
+# 自动导入连续失败升级阈值（审查 B.2）：本轮 SQL 失败达此次数就在 stdout 打醒目告警。
+# 不做进程级 fail-fast（与「失败不阻断打标」一致），但坏配置不能长期静默。
+AUTO_IMPORT_FAILURE_ALERT = 5
 
 SYSTEM_PROMPT = (
     "你是网文编目员。阅读给定的小说文本（若干章），输出一个 JSON 对象"
@@ -119,7 +124,11 @@ def load_env():
             line = line.strip()
             if line and not line.startswith('#') and '=' in line:
                 k, v = line.split('=', 1)
-                env[k.strip()] = v.strip()
+                # 与 import_one.py CLI 的 --env 解析保持一致：剥掉取值两侧的引号。
+                # .env 里写 `DATABASE_URL="postgresql://…"` 是常见做法（dotenv 约定），
+                # 不剥的话取值会带上引号 → urlsplit 得到 scheme `"postgresql` →
+                # 自动导入报「DATABASE_URL 不是 postgres 连接串」而静默失败。
+                env[k.strip()] = v.strip().strip('"').strip("'")
     missing = [k for k in ('LLM_API_KEY',) if not env.get(k)]
     if missing:
         sys.exit(f'缺少环境变量: {missing}（应在 {env_path} 里）')
@@ -188,13 +197,60 @@ def http_get(url: str, timeout: int = 30) -> str:
         return res.read().decode('utf-8', 'replace')
 
 
+# ---- 书源适配层：把「基址 + 站点解析」从主流程解耦 ----
+# 目前唯一适配器是 book15：它的实现**逐字复用**解耦前的逻辑（章节链接正则、章节页
+# 清洗函数、重试/异常语义、日志文案全部原样），所以行为与改前完全相同。
+# 【T5 接入点】接第二个源时：构造一个 BookSource（自己的 base / 章节链接正则 /
+# 章节页解析函数），注册进 SOURCES；取正文链路（fetch_chapters / fetch_chapter_text /
+# fetch_book_text / split_queue）已全部只依赖本抽象，无需再认识具体站点。
+@dataclass(frozen=True)
+class BookSource:
+    """书源适配：base + URL 归一 + 章节列表解析 + 章节正文解析。
+
+    - base：站内相对路径的基址（如 https://book15.net）。
+    - chapter_link_re：详情页 html -> [(章节相对路径, 章节标题)] 的匹配正则
+      （两个捕获组，顺序为「相对路径, 标题」）。
+    - parse_chapter_html：章节页 html -> (正文, 统计)。统计须含 `container` 键
+      （closed/fallback/missing）与 `drop_ratio`（closed 时用于过度清洗告警）；
+      字段口径与 clean_chapter_text 的统计一致，fetch_chapter_text 的护栏告警依赖它。
+    """
+    name: str
+    base: str
+    chapter_link_re: re.Pattern
+    parse_chapter_html: Callable[[str], tuple[str, dict]]
+
+    def absolute(self, path: str) -> str:
+        """站内相对路径 → 绝对 URL；已是绝对 URL（http 开头）的原样返回。
+
+        兼容解耦前 `path if path.startswith('http') else BASE + path` 的既有语义。"""
+        return path if path.startswith('http') else self.base + path
+
+    def chapters_from_html(self, html: str) -> list[tuple[str, str]]:
+        return self.chapter_link_re.findall(html)
+
+
+_BOOK15_CHAPTER_LINK_RE = re.compile(
+    r'<dd[^>]*>\s*<a[^>]*href="(/chapter/index\d+-\d+\.html)"[^>]*>([^<]{1,60})</a>')
+
+BOOK15 = BookSource(
+    name='book15.net',
+    base=BASE,
+    chapter_link_re=_BOOK15_CHAPTER_LINK_RE,
+    # lambda 延迟绑定：clean_chapter_text 定义在本文件下方，调用时才解析名字。
+    parse_chapter_html=lambda html: clean_chapter_text(html),
+)
+
+# 已注册的书源（基址不可变，故用 name -> 源 的字典；T5 在此追加第二个源）。
+SOURCES: dict[str, BookSource] = {BOOK15.name: BOOK15}
+
+
 # ---- 抓取层（将来可整体搬进主应用）----
 def fetch_rank_books() -> list[dict]:
     """榜单页 → [{url, title, author, category, status}]"""
     books, seen = [], set()
     for rank in RANKS:
         try:
-            html = http_get(f'{BASE}/books/rank{rank}.html')
+            html = http_get(f'{BOOK15.base}/books/rank{rank}.html')
         except Exception as e:
             print(f'  rank{rank} 拉取失败: {e}', file=sys.stderr)
             continue
@@ -206,7 +262,7 @@ def fetch_rank_books() -> list[dict]:
     # 补详情页元数据（作者/分类/状态）
     for b in books:
         try:
-            html = http_get(BASE + b['url'])
+            html = http_get(BOOK15.absolute(b['url']))
             for field, pat in (
                 ('author', r'og:novel:author"\s+content="([^"]+)"'),
                 ('category', r'og:novel:category"\s+content="([^"]+)"'),
@@ -220,11 +276,12 @@ def fetch_rank_books() -> list[dict]:
     return books
 
 
-def fetch_chapters(detail_url: str) -> list[tuple[str, str]]:
-    """详情页 → [(chapter_url, chapter_title)]"""
-    html = http_get(BASE + detail_url)
-    return re.findall(
-        r'<dd[^>]*>\s*<a[^>]*href="(/chapter/index\d+-\d+\.html)"[^>]*>([^<]{1,60})</a>', html)
+def fetch_chapters(detail_url: str,
+                   source: BookSource | None = None) -> list[tuple[str, str]]:
+    """详情页 → [(chapter_url, chapter_title)]（经书源适配器取基址与解析）"""
+    src = source or BOOK15
+    html = http_get(src.absolute(detail_url))
+    return src.chapters_from_html(html)
 
 
 # ---- 抓取层清洗：站点 UI / 导航 / 推广行（纯函数，可离线单测）----
@@ -506,12 +563,14 @@ def clean_chapter_text(html: str) -> tuple[str, dict]:
     return text, stats
 
 
-def fetch_chapter_text(chapter_url: str) -> str:
+def fetch_chapter_text(chapter_url: str, source: BookSource | None = None) -> str:
     """章节页 → 纯文本。先按容器配对标签精确定界正文，再逐行剥 UI/导航/推广行。
 
-    抓取层的修复（缺陷样本见 .t76-analysis/）；判定门与提示词不动。"""
-    html = http_get(BASE + chapter_url)
-    text, stats = clean_chapter_text(html)
+    抓取层的修复（缺陷样本见 .t76-analysis/）；判定门与提示词不动。
+    基址与正文解析经书源适配器取得（book15 语义与解耦前逐字相同）。"""
+    src = source or BOOK15
+    html = http_get(src.absolute(chapter_url))
+    text, stats = src.parse_chapter_html(html)
     if stats['container'] == 'missing':
         _clean_warn(f'{chapter_url} 未找到正文容器 {CONTENT_MARKER}，本页判为无正文')
     elif stats['container'] == 'fallback':
@@ -528,9 +587,10 @@ def fetch_chapter_text(chapter_url: str) -> str:
     return text
 
 
-def fetch_book_text(detail_url: str, target_chars: int = TARGET_CHARS) -> tuple[str, int]:
+def fetch_book_text(detail_url: str, target_chars: int = TARGET_CHARS,
+                    source: BookSource | None = None) -> tuple[str, int]:
     """整本（到字数上限）→ (拼接文本, 实际字数)"""
-    chapters = fetch_chapters(detail_url)
+    chapters = fetch_chapters(detail_url, source=source)
     parts, chars = [], 0
     for url, title in chapters:
         if chars >= target_chars:
@@ -538,7 +598,7 @@ def fetch_book_text(detail_url: str, target_chars: int = TARGET_CHARS) -> tuple[
         text = ''
         for attempt in range(CHUNK_RETRY):
             try:
-                text = fetch_chapter_text(url)
+                text = fetch_chapter_text(url, source=source)
                 break
             except Exception:
                 time.sleep(2 * (attempt + 1))
@@ -648,8 +708,12 @@ def _label_once(user_content: str, api_key: str, models: list[str],
 
 # ---- 入库层 ----
 # 试点期产物为 labels.jsonl（每行一本）；批量入库由本地用项目的
-# @neondatabase/serverless 驱动统一执行（scripts/import_labels.mjs），
-# phoenix 无需任何 PG 依赖。
+# @neondatabase/serverless 驱动统一执行（scripts/import_labels.mjs）。
+# 全自动增量导入（2026-09-19 起）：每标完一本即调 import_one.py 走 Neon 的 HTTPS
+# SQL 接口写库——同样零 PG 依赖（与上面读 label_model 同一通道），
+# 消灭「打标在跑、书库没书」的错位。失败只记 labels-import-fail.log 不阻断打标；
+# 用 labels-imported.jsonl 去重，重复导入同一 url 是 no-op。开关：.env 里
+# LABELER_AUTO_IMPORT=0 可关闭（默认开），LABELER_IMPORT_BACKLOG 调每轮补录上限。
 
 
 def title_matches(guess: str, actual: str) -> bool:
@@ -704,16 +768,19 @@ def terminal_urls(counts: dict[str, int],
 
 
 def split_queue(books: list[dict], done_urls: set[str],
-                pinned: set[str]) -> tuple[list[dict], list[dict], list[dict]]:
+                pinned: set[str],
+                source: BookSource | None = None) -> tuple[list[dict], list[dict], list[dict]]:
     """榜单 → (待处理, 已完成跳过, 钉子户终态跳过)。
 
     两个跳过名单**互斥**：已在 labels.jsonl 的书优先算「已完成」，不再算「钉子户」——
-    它被拒过是历史，后来已成功，不该继续占用终态名额。"""
+    它被拒过是历史，后来已成功，不该继续占用终态名额。
+    书的站内相对路径经书源适配器归一到绝对 URL 后与跳过名单比对。"""
+    src = source or BOOK15
     todo: list[dict] = []
     skipped_done: list[dict] = []
     skipped_pinned: list[dict] = []
     for b in books:
-        url = BASE + b['url']
+        url = src.absolute(b['url'])
         if url in done_urls:
             skipped_done.append(b)
         elif url in pinned:
@@ -749,6 +816,27 @@ def main() -> int:
     # 读模块常量本意是「改常量即调参/关闸（0 或负数关闭）」，这里保持这个语义。
     pinned = terminal_urls(rejection_counts, REJECT_TERMINAL_THRESHOLD)
 
+    # 自动导入：打标完一本即写库（见文件头「入库层」）。启用与否由 .env 决定；
+    # --book 是人工调试模式（无站点书名、身份证据弱），不进自动导入。
+    importer = None
+    if not args.book:
+        import import_one
+        importer = import_one.AutoImporter.from_env(env, directory=data_dir())
+        print(importer.status_line())
+        if not importer.enabled and args.source in ('douban', 'webnovel'):
+            print(f'  提示: 自动导入未启用（{importer.disabled_reason}），'
+                  f'产物仍只进 labels.jsonl，需人工跑 import_labels.mjs')
+        if not args.dry_run and importer.enabled:
+            # 历史欠账（上次导入失败 / 部署前的存量）自动补录；标记文件保证幂等。
+            # .env 值坏掉（非数字）不能拖垮整轮 → 回落到默认上限。
+            try:
+                limit = int(env.get(import_one.BACKLOG_ENV) or import_one.IMPORT_BACKLOG_DEFAULT)
+            except ValueError:
+                limit = import_one.IMPORT_BACKLOG_DEFAULT
+            retried = importer.retry_backlog(data_path('labels.jsonl'), limit=limit)
+            if retried:
+                print(f'  自动导入: 补录了 {retried} 本历史欠账')
+
     if args.book:
         queue = [{'url': args.book, 'title': args.book}]
     else:
@@ -758,21 +846,33 @@ def main() -> int:
             import douban_list
             print('拉取名单并搜索 book15...')
             # 桥接：名单源（豆瓣/起点）传完整 URL，book15 搜索侧传站内相对路径。
-            bridged = lambda path: http_get(path if path.startswith('http') else BASE + path)
-            all_books = (douban_list.build_douban_queue(bridged) if args.source == 'douban'
-                         else douban_list.build_webnovel_queue(bridged))
+            bridged = lambda path: http_get(BOOK15.absolute(path))
+            # 搜索前跳过已打标书名（审查 D.3「收益最大的一刀」）：缓存是优化，
+            # 跳过已完成再搜是正确性——否则扩容后稳态每轮全量空搜。
+            skip_titles = douban_list.load_done_titles(data_path('labels.jsonl'))
+            # 豆瓣翻页默认 1 页；.env 里 LABELER_DOUBAN_PAGES=3 才开 3 页（审查 D.3）。
+            pages = douban_list.resolve_douban_pages(env)
+            all_books = (douban_list.build_douban_queue(
+                             bridged, skip_titles=skip_titles, pages=pages)
+                         if args.source == 'douban'
+                         else douban_list.build_webnovel_queue(
+                             bridged, skip_titles=skip_titles, pages=pages))
             print(f'{args.source} 线共 {len(all_books)} 本（搜索命中后）')
         else:
             print('拉取榜单书目...')
             all_books = fetch_rank_books()
             print(f'榜单共 {len(all_books)} 本（去重后）')
-        candidates = all_books[:args.limit]
-        queue, skipped_done, skipped_pinned = split_queue(candidates, done_urls, pinned)
+        # --limit 切在 split_queue **之后**（审查 F.1）：命中数一旦 > limit，切在前缀会
+        # 让队尾（多半是豆瓣/17K 尾部）永远进不了视野——每轮只处理前 limit 条，做完进
+        # done_urls，之后每轮 queue=[] 却仍全量搜索。先剔除已完成/钉子户再取上限，
+        # 语义 = 「本轮最多打 limit 本**未完成**的书」。
+        queue, skipped_done, skipped_pinned = split_queue(all_books, done_urls, pinned)
+        queue = queue[:args.limit]
         # X = 本轮跳过总数（已完成 + 钉子户终态，互斥不重叠），Y = 其中因钉子户终态跳过的。
         print(f'本轮处理 {len(queue)} 本（跳过已完成 {len(skipped_done) + len(skipped_pinned)} 本'
               f'（含钉子户 {len(skipped_pinned)} 本））')
         for b in skipped_pinned:
-            print(f'  钉子户终态：跳过（历史被拒 {rejection_counts[BASE + b["url"]]} 次）'
+            print(f'  钉子户终态：跳过（历史被拒 {rejection_counts[BOOK15.absolute(b["url"])]} 次）'
                   f' {b.get("title")} | {b["url"]}')
 
     if args.dry_run:
@@ -782,6 +882,7 @@ def main() -> int:
         return 0
 
     ok = fail = 0
+    import_failures = 0
     for i, b in enumerate(queue, 1):
         print(f'[{i}/{len(queue)}] {b.get("title")} ...')
         try:
@@ -792,7 +893,7 @@ def main() -> int:
                     'site_title': '' if args.book else (b.get('title') or '').strip(),
                     'author': b.get('author', ''),
                     'category': b.get('category', ''),
-                    'url': BASE + b['url'],
+                    'url': BOOK15.absolute(b['url']),
                     'reason': f'抓取字数不足: {chars}',
                 }
                 rej_path = data_path('labels-rejected.jsonl')
@@ -820,7 +921,7 @@ def main() -> int:
                     'site_title': site_title,
                     'author': b.get('author', ''),
                     'category': b.get('category', ''),
-                    'url': BASE + b['url'],
+                    'url': BOOK15.absolute(b['url']),
                     'title_guess': guess,
                     'site_title_match': labels.get('site_title_match'),
                     'site_title_note': labels.get('site_title_note'),
@@ -839,7 +940,7 @@ def main() -> int:
                     'site_title': site_title,
                     'author': b.get('author', ''),
                     'category': b.get('category', ''),
-                    'url': BASE + b['url'],
+                    'url': BOOK15.absolute(b['url']),
                     'title_guess': guess,
                     'site_title_match': labels.get('site_title_match'),
                     'site_title_note': labels.get('site_title_note'),
@@ -857,12 +958,12 @@ def main() -> int:
                 'author': b.get('author', ''),
                 'category': b.get('category', ''),
                 'status': b.get('status', ''),
-                'source': 'book15.net',
+                'source': BOOK15.name,
                 # 名单线选出的书记录来源标记，便于与榜单线的产出区分；
                 # 正文仍抓自 book15，source 语义不变。
                 'selected_by': (args.source if args.source != 'rank' else 'book15-rank')
                                if not args.book else 'book15-rank',
-                'url': BASE + b['url'],
+                'url': BOOK15.absolute(b['url']),
                 'chars': chars,
                 'labels': labels,
             }
@@ -871,6 +972,32 @@ def main() -> int:
             with open(out_path, 'a', encoding='utf-8') as f:
                 f.write(json.dumps(b_out, ensure_ascii=False) + '\n')
             ok += 1
+            # 即时导入书库。import_record 内部吞掉所有异常并记 fail log，
+            # 这里的 try/except 只是最后一道保险：导入问题绝不能让打标循环中断。
+            if importer is not None and importer.enabled:
+                try:
+                    import_status = importer.import_record(b_out)
+                except Exception as import_error:      # pragma: no cover - 双保险
+                    print(f'  自动导入异常（不阻断打标）: {import_error}', file=sys.stderr)
+                    import_status = 'failed'
+                if import_status == 'imported':
+                    print('  → 已写入书库')
+                elif import_status == 'duplicate':
+                    print('  → 书库已有同书（自动导入 no-op）')
+                elif import_status in ('failed', 'review', 'skipped', 'twin-skipped'):
+                    # 只有 failed（异常路径）会写 labels-import-fail.log；review / skipped /
+                    # twin-skipped 是**刻意不导入**，记录在 stdout 与 labels.jsonl 里，
+                    # 指向 fail log 会误导操作员（审查 B.4）。
+                    where = ('labels-import-fail.log' if import_status == 'failed'
+                             else 'stdout / labels.jsonl')
+                    print(f'  → 未自动入库（{import_status}），详见 {where}')
+                if import_status == 'failed':
+                    # 连续失败升级（审查 B.2）：坏配置下不能长期静默产 jsonl 却不入库。
+                    import_failures += 1
+                    if import_failures == AUTO_IMPORT_FAILURE_ALERT:
+                        print(f'  ⚠️ 自动导入本轮已失败 {import_failures} 次，疑似 .env 配置'
+                              f'或数据库不可达——打标不阻断，但产物可能没有入库：'
+                              f'{getattr(importer, "last_error", "") or "（无错误详情）"}')
         except Exception as e:
             print(f'  失败: {e}', file=sys.stderr)
             fail += 1

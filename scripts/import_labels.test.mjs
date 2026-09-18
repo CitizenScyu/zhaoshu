@@ -242,7 +242,9 @@ describe('作者在身份键和 SQL 绑定前规范化', () => {
       }, out);
       assert.equal(out.author, '埃里克·霍弗');
       assert.equal(query.values[1], '埃里克·霍弗');
-      assert.match(query.text, /ON CONFLICT \(lower\(title\), lower\(author\)\)/);
+      // 0002_identity_key.sql 起，冲突目标从表达式索引 lower(title),lower(author)
+      // 换成确定性生成列 title_key/author_key；断言随 DDL 归位。
+      assert.match(query.text, /ON CONFLICT \(title_key, author_key\)/);
       assert.deepEqual(JSON.parse(query.values[7]), original.labels);
       assert.deepEqual(input, original);
     });
@@ -251,7 +253,7 @@ describe('作者在身份键和 SQL 绑定前规范化', () => {
   it('实体的不同写法与普通文本进入同一个唯一身份键，重复导入不新增 mock 行', async () => {
     const rows = new Map();
     const sql = async (strings, ...values) => {
-      assert.match(strings.join('?'), /ON CONFLICT \(lower\(title\), lower\(author\)\)/);
+      assert.match(strings.join('?'), /ON CONFLICT \(title_key, author_key\)/);
       const key = JSON.stringify([values[0].toLowerCase(), values[1].toLowerCase()]);
       rows.set(key, values);
     };
@@ -271,6 +273,62 @@ describe('作者在身份键和 SQL 绑定前规范化', () => {
       assert.equal(input.author, author);
     }
     assert.equal(validateImportRecord(record({ author: '&middot;' })).status, 'review');
+  });
+
+  it('空作者记录不进库，也不与存量同书名非空作者并列成第二行', async () => {
+    // 幂等红线：author_key='' 与存量同书名非空作者（此处 '血红'）不冲突，
+    // ON CONFLICT 不触发会插入第二行。空作者必须 review，不能写库。
+    for (const empty of ['', '  ', '　']) {
+      const rows = new Map();
+      rows.set(JSON.stringify(['测试书', '血红']), ['测试书', '血红']);
+      const writes = [];
+      const sql = async (strings, ...values) => {
+        const text = strings.join('?');
+        if (/INSERT INTO labeled_books/.test(text)) {
+          writes.push(values);
+          rows.set(JSON.stringify([values[0].toLowerCase(), values[1].toLowerCase()]), [values[0], values[1]]);
+          return;
+        }
+        // 前置 SELECT：findNonFixpointTwin 按书名读取既有行
+        return [...rows.values()]
+          .map(([title, author], i) => ({ id: i + 1, title, author }))
+          .filter((row) => row.title.toLowerCase() === values[0].toLowerCase());
+      };
+      const file = fixture([record({ author: empty })]);
+      const logs = [];
+      const code = await run(['--file', file], {
+        env: { DATABASE_URL: 'postgresql://fixture:fixture@127.0.0.1:1/test' },
+        createSql: () => sql,
+        log: (line) => logs.push(line),
+      });
+      assert.equal(code, 0);
+      assert.equal(writes.length, 0, 'empty=' + JSON.stringify(empty));
+      assert.equal(rows.size, 1);
+      assert.equal(logs.at(-1), '总数 1 / 入库 0 / 跳过 0 / 待核验 1 / 失败 0');
+    }
+    // 非空作者路径不放宽：同书名仍正常 UPSERT（写库计数 1）
+    const rows = new Map();
+    rows.set(JSON.stringify(['测试书', '血红']), ['测试书', '血红']);
+    const writes = [];
+    const sql = async (strings, ...values) => {
+      const text = strings.join('?');
+      if (/INSERT INTO labeled_books/.test(text)) {
+        writes.push(values);
+        rows.set(JSON.stringify([values[0].toLowerCase(), values[1].toLowerCase()]), [values[0], values[1]]);
+        return;
+      }
+      return [...rows.values()]
+        .map(([title, author], i) => ({ id: i + 1, title, author }))
+        .filter((row) => row.title.toLowerCase() === values[0].toLowerCase());
+    };
+    const file = fixture([record({ author: '血红' })]);
+    const logs = [];
+    assert.equal(await run(['--file', file], {
+      env: { DATABASE_URL: 'postgresql://fixture:fixture@127.0.0.1:1/test' },
+      createSql: () => sql, log: (line) => logs.push(line),
+    }), 0);
+    assert.equal(writes.length, 1);
+    assert.equal(rows.size, 1);
   });
 
   it('作者编码标记显式跳过已解码文本，未知标记不猜测', () => {

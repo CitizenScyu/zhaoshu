@@ -57,6 +57,7 @@ const REVIEW_REASONS = {
   'unconfirmed-source': '作者实体的 HTML 来源未确认，保留原值待核验',
   'multiple-encoding': '作者疑似多层 HTML 编码，保留原值待核验',
   'invalid-characters': '作者含非法控制符、NUL、孤立代理项或非法 Unicode，保留原值待核验',
+  'empty-author': '作者为空或纯空白，自动导入无法判定身份（可能与存量非空作者行重复），保留原值待核验',
 };
 
 // ready 的 value 才能用于身份键；review/failed 的 value 始终为原输入。
@@ -86,6 +87,11 @@ export function normalizeAuthor(value, { sourceSite, encoding } = {}) {
   // 必须在 trim 之前检查；例如 &Tab; 不能被 trim 静默清除。
   if (invalidCharacters(decoded)) return review('invalid-characters');
   const normalized = decoded.trim();
+  // 空作者（含纯空白 / 全角空格 　 / 实体解码后只剩空白）不能自动导入：
+  // 身份键是 (title_key, author_key)，author_key='' 与存量同一本书的非空作者行
+  // **不冲突** → ON CONFLICT 不触发 → 凭空插入第二行。与 import_one.py 的
+  // normalize_author 同归为 review，保留原值交给完整导入器/人工补作者。
+  if (!normalized) return review('empty-author');
   if ([...normalized].length > 200) {
     return { status: 'failed', value, reasonCode: 'too-long', reason: '作者超过 200 字（Unicode 码点）' };
   }
