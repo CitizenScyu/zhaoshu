@@ -213,7 +213,11 @@ export async function resolveSourceBook(
             context.signal.throwIfAborted();
             // 预算是全部源共享的：耗尽即停止请求，保留已收集的匹配/候选。
             if (error instanceof SourceReaderError) {
-              if (error.code === 'SOURCE_BUDGET_EXCEEDED') break;
+              if (error.code === 'SOURCE_BUDGET_EXCEEDED') {
+                // 预算耗尽=搜索不完整，空结果仍 503；有结果不受影响已被去闸门放行。
+                hadFailure = true;
+                break;
+              }
               throw error;
             }
             hadFailure = true;
@@ -266,7 +270,11 @@ export async function resolveSourceBook(
       context.signal.throwIfAborted();
       // 预算是全部源共享的：耗尽即停止请求，保留已有匹配/候选（与上方 break 语义对齐）。
       if (error instanceof SourceReaderError) {
-        if (error.code === 'SOURCE_BUDGET_EXCEEDED') break;
+        if (error.code === 'SOURCE_BUDGET_EXCEEDED') {
+          // 预算耗尽=搜索不完整，空结果仍 503；有结果不受影响已被去闸门放行。
+          hadFailure = true;
+          break;
+        }
         throw error;
       }
       hadFailure = true;

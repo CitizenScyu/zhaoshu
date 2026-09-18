@@ -320,6 +320,8 @@ describe('online reader source resolution and budgets', () => {
       .catch((error: SourceReaderError & { candidates?: SourceSimilarCandidate[] }) => error);
     expect(healthy).toMatchObject({ code: 'SOURCE_SIMILAR', status: 422 });
     expect(degraded).toMatchObject({ code: 'SOURCE_SIMILAR', status: 422 });
+    expect((healthy as Error).message).not.toContain('部分请求本轮未完成');
+    expect((degraded as Error).message).toContain('部分请求本轮未完成');
     expect((degraded as SourceReaderError & { candidates?: SourceSimilarCandidate[] }).candidates)
       .toEqual((healthy as SourceReaderError & { candidates?: SourceSimilarCandidate[] }).candidates);
   });
@@ -351,6 +353,18 @@ describe('online reader source resolution and budgets', () => {
     // 负控（语义不变）：空结果 + 关键路径失败（标题搜索自身网络失败）→ 仍 503 SOURCE_UNAVAILABLE。
     pages.set('https://book15.net/books/search.html?kw=' + encodeURIComponent(book.title), networkFailure);
     await expect(service.resolveSourceBook(book, context())).rejects.toMatchObject({
+      code: 'SOURCE_UNAVAILABLE', status: 503,
+    });
+  });
+
+  it('still reports 503 SOURCE_UNAVAILABLE when the shared budget runs out with no results', async () => {
+    // P1-1 负控：空结果 + 仅 BUDGET（无网络失败）→ 503，不能把「没搜完」说成「没这本书」。
+    // 双源 miss：主源标题/作者搜索均空（2 请求），镜像源搜索触发 BUDGET。
+    const target = { title: '不存在的书', author: '作者A' };
+    mocks.sources.mockResolvedValue([source, { ...source, url: 'https://book15.net/mirror', searchUrl: '/mirror/search.html?kw={{key}}' }]);
+    pages.set('https://book15.net/books/search.html?kw=' + encodeURIComponent(target.title), { text: '' });
+    pages.set('https://book15.net/books/search.html?kw=' + encodeURIComponent(target.author), { text: '' });
+    await expect(service.resolveSourceBook(target, context(2))).rejects.toMatchObject({
       code: 'SOURCE_UNAVAILABLE', status: 503,
     });
   });
