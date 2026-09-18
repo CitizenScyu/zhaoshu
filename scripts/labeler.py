@@ -27,7 +27,9 @@ import sys
 import time
 import urllib.parse
 import urllib.request
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 # ---- 配置 ----
 TARGET_CHARS = 500_000      # 每本抓取字数上限
@@ -195,13 +197,60 @@ def http_get(url: str, timeout: int = 30) -> str:
         return res.read().decode('utf-8', 'replace')
 
 
+# ---- 书源适配层：把「基址 + 站点解析」从主流程解耦 ----
+# 目前唯一适配器是 book15：它的实现**逐字复用**解耦前的逻辑（章节链接正则、章节页
+# 清洗函数、重试/异常语义、日志文案全部原样），所以行为与改前完全相同。
+# 【T5 接入点】接第二个源时：构造一个 BookSource（自己的 base / 章节链接正则 /
+# 章节页解析函数），注册进 SOURCES；取正文链路（fetch_chapters / fetch_chapter_text /
+# fetch_book_text / split_queue）已全部只依赖本抽象，无需再认识具体站点。
+@dataclass(frozen=True)
+class BookSource:
+    """书源适配：base + URL 归一 + 章节列表解析 + 章节正文解析。
+
+    - base：站内相对路径的基址（如 https://book15.net）。
+    - chapter_link_re：详情页 html -> [(章节相对路径, 章节标题)] 的匹配正则
+      （两个捕获组，顺序为「相对路径, 标题」）。
+    - parse_chapter_html：章节页 html -> (正文, 统计)。统计须含 `container` 键
+      （closed/fallback/missing）与 `drop_ratio`（closed 时用于过度清洗告警）；
+      字段口径与 clean_chapter_text 的统计一致，fetch_chapter_text 的护栏告警依赖它。
+    """
+    name: str
+    base: str
+    chapter_link_re: re.Pattern
+    parse_chapter_html: Callable[[str], tuple[str, dict]]
+
+    def absolute(self, path: str) -> str:
+        """站内相对路径 → 绝对 URL；已是绝对 URL（http 开头）的原样返回。
+
+        兼容解耦前 `path if path.startswith('http') else BASE + path` 的既有语义。"""
+        return path if path.startswith('http') else self.base + path
+
+    def chapters_from_html(self, html: str) -> list[tuple[str, str]]:
+        return self.chapter_link_re.findall(html)
+
+
+_BOOK15_CHAPTER_LINK_RE = re.compile(
+    r'<dd[^>]*>\s*<a[^>]*href="(/chapter/index\d+-\d+\.html)"[^>]*>([^<]{1,60})</a>')
+
+BOOK15 = BookSource(
+    name='book15.net',
+    base=BASE,
+    chapter_link_re=_BOOK15_CHAPTER_LINK_RE,
+    # lambda 延迟绑定：clean_chapter_text 定义在本文件下方，调用时才解析名字。
+    parse_chapter_html=lambda html: clean_chapter_text(html),
+)
+
+# 已注册的书源（基址不可变，故用 name -> 源 的字典；T5 在此追加第二个源）。
+SOURCES: dict[str, BookSource] = {BOOK15.name: BOOK15}
+
+
 # ---- 抓取层（将来可整体搬进主应用）----
 def fetch_rank_books() -> list[dict]:
     """榜单页 → [{url, title, author, category, status}]"""
     books, seen = [], set()
     for rank in RANKS:
         try:
-            html = http_get(f'{BASE}/books/rank{rank}.html')
+            html = http_get(f'{BOOK15.base}/books/rank{rank}.html')
         except Exception as e:
             print(f'  rank{rank} 拉取失败: {e}', file=sys.stderr)
             continue
@@ -213,7 +262,7 @@ def fetch_rank_books() -> list[dict]:
     # 补详情页元数据（作者/分类/状态）
     for b in books:
         try:
-            html = http_get(BASE + b['url'])
+            html = http_get(BOOK15.absolute(b['url']))
             for field, pat in (
                 ('author', r'og:novel:author"\s+content="([^"]+)"'),
                 ('category', r'og:novel:category"\s+content="([^"]+)"'),
@@ -227,11 +276,12 @@ def fetch_rank_books() -> list[dict]:
     return books
 
 
-def fetch_chapters(detail_url: str) -> list[tuple[str, str]]:
-    """详情页 → [(chapter_url, chapter_title)]"""
-    html = http_get(BASE + detail_url)
-    return re.findall(
-        r'<dd[^>]*>\s*<a[^>]*href="(/chapter/index\d+-\d+\.html)"[^>]*>([^<]{1,60})</a>', html)
+def fetch_chapters(detail_url: str,
+                   source: BookSource | None = None) -> list[tuple[str, str]]:
+    """详情页 → [(chapter_url, chapter_title)]（经书源适配器取基址与解析）"""
+    src = source or BOOK15
+    html = http_get(src.absolute(detail_url))
+    return src.chapters_from_html(html)
 
 
 # ---- 抓取层清洗：站点 UI / 导航 / 推广行（纯函数，可离线单测）----
@@ -513,12 +563,14 @@ def clean_chapter_text(html: str) -> tuple[str, dict]:
     return text, stats
 
 
-def fetch_chapter_text(chapter_url: str) -> str:
+def fetch_chapter_text(chapter_url: str, source: BookSource | None = None) -> str:
     """章节页 → 纯文本。先按容器配对标签精确定界正文，再逐行剥 UI/导航/推广行。
 
-    抓取层的修复（缺陷样本见 .t76-analysis/）；判定门与提示词不动。"""
-    html = http_get(BASE + chapter_url)
-    text, stats = clean_chapter_text(html)
+    抓取层的修复（缺陷样本见 .t76-analysis/）；判定门与提示词不动。
+    基址与正文解析经书源适配器取得（book15 语义与解耦前逐字相同）。"""
+    src = source or BOOK15
+    html = http_get(src.absolute(chapter_url))
+    text, stats = src.parse_chapter_html(html)
     if stats['container'] == 'missing':
         _clean_warn(f'{chapter_url} 未找到正文容器 {CONTENT_MARKER}，本页判为无正文')
     elif stats['container'] == 'fallback':
@@ -535,9 +587,10 @@ def fetch_chapter_text(chapter_url: str) -> str:
     return text
 
 
-def fetch_book_text(detail_url: str, target_chars: int = TARGET_CHARS) -> tuple[str, int]:
+def fetch_book_text(detail_url: str, target_chars: int = TARGET_CHARS,
+                    source: BookSource | None = None) -> tuple[str, int]:
     """整本（到字数上限）→ (拼接文本, 实际字数)"""
-    chapters = fetch_chapters(detail_url)
+    chapters = fetch_chapters(detail_url, source=source)
     parts, chars = [], 0
     for url, title in chapters:
         if chars >= target_chars:
@@ -545,7 +598,7 @@ def fetch_book_text(detail_url: str, target_chars: int = TARGET_CHARS) -> tuple[
         text = ''
         for attempt in range(CHUNK_RETRY):
             try:
-                text = fetch_chapter_text(url)
+                text = fetch_chapter_text(url, source=source)
                 break
             except Exception:
                 time.sleep(2 * (attempt + 1))
@@ -715,16 +768,19 @@ def terminal_urls(counts: dict[str, int],
 
 
 def split_queue(books: list[dict], done_urls: set[str],
-                pinned: set[str]) -> tuple[list[dict], list[dict], list[dict]]:
+                pinned: set[str],
+                source: BookSource | None = None) -> tuple[list[dict], list[dict], list[dict]]:
     """榜单 → (待处理, 已完成跳过, 钉子户终态跳过)。
 
     两个跳过名单**互斥**：已在 labels.jsonl 的书优先算「已完成」，不再算「钉子户」——
-    它被拒过是历史，后来已成功，不该继续占用终态名额。"""
+    它被拒过是历史，后来已成功，不该继续占用终态名额。
+    书的站内相对路径经书源适配器归一到绝对 URL 后与跳过名单比对。"""
+    src = source or BOOK15
     todo: list[dict] = []
     skipped_done: list[dict] = []
     skipped_pinned: list[dict] = []
     for b in books:
-        url = BASE + b['url']
+        url = src.absolute(b['url'])
         if url in done_urls:
             skipped_done.append(b)
         elif url in pinned:
@@ -790,7 +846,7 @@ def main() -> int:
             import douban_list
             print('拉取名单并搜索 book15...')
             # 桥接：名单源（豆瓣/起点）传完整 URL，book15 搜索侧传站内相对路径。
-            bridged = lambda path: http_get(path if path.startswith('http') else BASE + path)
+            bridged = lambda path: http_get(BOOK15.absolute(path))
             # 搜索前跳过已打标书名（审查 D.3「收益最大的一刀」）：缓存是优化，
             # 跳过已完成再搜是正确性——否则扩容后稳态每轮全量空搜。
             skip_titles = douban_list.load_done_titles(data_path('labels.jsonl'))
@@ -816,7 +872,7 @@ def main() -> int:
         print(f'本轮处理 {len(queue)} 本（跳过已完成 {len(skipped_done) + len(skipped_pinned)} 本'
               f'（含钉子户 {len(skipped_pinned)} 本））')
         for b in skipped_pinned:
-            print(f'  钉子户终态：跳过（历史被拒 {rejection_counts[BASE + b["url"]]} 次）'
+            print(f'  钉子户终态：跳过（历史被拒 {rejection_counts[BOOK15.absolute(b["url"])]} 次）'
                   f' {b.get("title")} | {b["url"]}')
 
     if args.dry_run:
@@ -837,7 +893,7 @@ def main() -> int:
                     'site_title': '' if args.book else (b.get('title') or '').strip(),
                     'author': b.get('author', ''),
                     'category': b.get('category', ''),
-                    'url': BASE + b['url'],
+                    'url': BOOK15.absolute(b['url']),
                     'reason': f'抓取字数不足: {chars}',
                 }
                 rej_path = data_path('labels-rejected.jsonl')
@@ -865,7 +921,7 @@ def main() -> int:
                     'site_title': site_title,
                     'author': b.get('author', ''),
                     'category': b.get('category', ''),
-                    'url': BASE + b['url'],
+                    'url': BOOK15.absolute(b['url']),
                     'title_guess': guess,
                     'site_title_match': labels.get('site_title_match'),
                     'site_title_note': labels.get('site_title_note'),
@@ -884,7 +940,7 @@ def main() -> int:
                     'site_title': site_title,
                     'author': b.get('author', ''),
                     'category': b.get('category', ''),
-                    'url': BASE + b['url'],
+                    'url': BOOK15.absolute(b['url']),
                     'title_guess': guess,
                     'site_title_match': labels.get('site_title_match'),
                     'site_title_note': labels.get('site_title_note'),
@@ -902,12 +958,12 @@ def main() -> int:
                 'author': b.get('author', ''),
                 'category': b.get('category', ''),
                 'status': b.get('status', ''),
-                'source': 'book15.net',
+                'source': BOOK15.name,
                 # 名单线选出的书记录来源标记，便于与榜单线的产出区分；
                 # 正文仍抓自 book15，source 语义不变。
                 'selected_by': (args.source if args.source != 'rank' else 'book15-rank')
                                if not args.book else 'book15-rank',
-                'url': BASE + b['url'],
+                'url': BOOK15.absolute(b['url']),
                 'chars': chars,
                 'labels': labels,
             }
