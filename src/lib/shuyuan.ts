@@ -111,14 +111,38 @@ export interface ReadingSource {
 }
 
 /**
- * 取书源池：注册表合成视图（设计 §5.2/§5.3）。builtin 恒在前（book15 零回归红线），
- * 引擎源（admission ok ∧ 非 disabled ∧ probe 非 failed）按 probe reachable 优先排序。
- * slice 上限保留待 M2 放量（M2-3 用 READING_POOL_LIMIT / READING_ENGINE_SOURCES 开关）。
+ * M2-3 全局 kill switch（m2-scaleout §6.1，本任务提前落地）。
+ * **默认关闭**：多源循环（M2-2 的软预算/切片/跳源）未落地前不把引擎源并入取书池——
+ * 否则准入数据一到位，`resolveSourceBook` 会按池里每个源发请求，单次阅读预算被多源分食，
+ * 55s deadline 下可能把「上游慢」变成用户侧超时/503。打开即等价 W1 起的放量（配合 READING_POOL_LIMIT）。
+ * 只有显式 `1`/`true`/`on` 才开；缺失/`0`/`false` 一律关闭（回退效果 = book15-only）。
+ */
+export function engineSourcesEnabled(): boolean {
+  const raw = process.env.READING_ENGINE_SOURCES?.trim().toLowerCase();
+  return raw === '1' || raw === 'true' || raw === 'on';
+}
+
+/** M2-3 波次开关（m2-scaleout §6.1）：池上限默认 4（放量前与既有 slice(0,4) 逐字相同）。 */
+export const DEFAULT_READING_POOL_LIMIT = 4;
+
+/** 池上限：env `READING_POOL_LIMIT` 生效；非法/≤0/缺失回退默认。 */
+export function readingPoolLimit(): number {
+  const parsed = Number.parseInt(process.env.READING_POOL_LIMIT ?? '', 10);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : DEFAULT_READING_POOL_LIMIT;
+}
+
+/**
+ * 取书源池：注册表合成视图（设计 §5.2/§5.3）。builtin 恒在前（book15 零回归红线）。
+ * 引擎源（admission ok ∧ 非 disabled ∧ probe 非 failed，按 probe reachable 优先排序）**受
+ * kill switch 约束**：READING_ENGINE_SOURCES 默认关 ⇒ 池 = builtin only，与今天逐字节相同。
  */
 export async function getReadingSources(signal: AbortSignal): Promise<ReadingSource[]> {
   const s = getSql();
+  const limit = readingPoolLimit();
   const { states } = readMeta((await storedMeta(s, signal)).collections);
-  const builtin = await builtinReadingSources(s, states, signal);
+  const builtin = await builtinReadingSources(s, states, signal, limit);
+  // 开关默认关：连准入表都不查（省一次 DB 往返，也彻底不暴露引擎源的失败面）。
+  if (!engineSourcesEnabled()) return builtin;
   // 引擎源是**增量**：读该表出错（如 schema 未就绪/库抖动）绝不能杀死 builtin 取书路径
   // （零回归红线）。失败按空集处理，book15 单源行为与今日逐点相同。
   let engine: ReadingSource[] = [];
@@ -130,14 +154,12 @@ export async function getReadingSources(signal: AbortSignal): Promise<ReadingSou
       reason: error instanceof Error ? error.message : String(error),
     });
   }
-  return [...builtin, ...engine].slice(0, READING_POOL_LIMIT);
+  return [...builtin, ...engine].slice(0, limit);
 }
-
-const READING_POOL_LIMIT = 4;
 
 /** 内建（builtin）档条目：改查注册表内建 URL 前缀，不再硬编码 ILIKE 字面量。 */
 async function builtinReadingSources(
-  s: Sql, states: Map<string, ProbeState>, signal: AbortSignal,
+  s: Sql, states: Map<string, ProbeState>, signal: AbortSignal, limit: number,
 ): Promise<ReadingSource[]> {
   const patterns = builtinUrlPrefixes().map((prefix) => `${prefix}%`);
   const rows = await readRows<StoredSource & { name: string }>(s, s`
@@ -156,7 +178,7 @@ async function builtinReadingSources(
   }
   return supported.filter((row) => !row.disabled_at && isRecord(row.source) && row.source.enabled !== false && states.get(row.source_url)?.status !== 'failed')
     .sort((a, b) => Number(states.get(b.source_url)?.status === 'reachable') - Number(states.get(a.source_url)?.status === 'reachable'))
-    .slice(0, READING_POOL_LIMIT)
+    .slice(0, limit)
     .map((row) => ({
       url: validateSourceUrl(row.source_url).href, name: row.name.slice(0, 200) || fallback.name,
       searchUrl: row.source.searchUrl ?? fallback.searchUrl, rules: row.source, tier: 'builtin' as const,
