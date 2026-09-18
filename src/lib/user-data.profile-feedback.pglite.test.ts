@@ -1,7 +1,7 @@
 import { beforeAll, describe, expect, it } from 'vitest';
 import { initializeBusinessSchema } from '@/lib/business-schema';
 import { loadPGlite, type PGliteLike } from '@/lib/fixtures/pglite';
-import { recentInformativeFeedbackForUserQuery } from '@/lib/user-data';
+import { recentInformativeFeedbackForUserQuery, withdrawnFeedbackBookTitlesForUserQuery } from '@/lib/user-data';
 
 // 真实 PostgreSQL（WASM）：F04 的「本人最新有效反馈」查询语义。
 //
@@ -9,7 +9,9 @@ import { recentInformativeFeedbackForUserQuery } from '@/lib/user-data';
 //   ① 每本书只认最新一行——用户把反馈改成 want/reading 或清空 note（撤回）后，
 //      更早那条 done+note 不得再被选中；
 //   ② 只有最新状态仍具信息量（done/dropped 且 note 非空）才喂给模型；
-//   ③ 严格按 user_id 隔离，另一用户的反馈绝不进入本用户结果。
+//   ③ 严格按 user_id 隔离，另一用户的反馈绝不进入本用户结果；
+//   ④ 撤回标记查询（withdrawnFeedbackBookTitlesForUserQuery）只列出「曾 informative、最新已非
+//      informative」的书，且只回传书名（不含旧 note）。
 
 type SqlTag = (parts: TemplateStringsArray, ...values: unknown[]) => { text: string; params: unknown[] };
 
@@ -44,6 +46,10 @@ maybe('真实 PostgreSQL：recentInformativeFeedbackForUserQuery（F04 最新有
   const rowsFor = async (userId: number) => {
     const statement = recentInformativeFeedbackForUserQuery(tag as never, userId) as unknown as { text: string; params: unknown[] };
     return (await pg.query(statement.text, statement.params)).rows;
+  };
+  const withdrawnFor = async (userId: number) => {
+    const statement = withdrawnFeedbackBookTitlesForUserQuery(tag as never, userId) as unknown as { text: string; params: unknown[] };
+    return (await pg.query(statement.text, statement.params)).rows.map((row) => row.title);
   };
   const book = async (title: string, author = '审查作者') =>
     ((await pg.query('INSERT INTO books (title, author) VALUES ($1, $2) RETURNING id', [title, author])).rows[0] as { id: number }).id;
@@ -81,5 +87,28 @@ maybe('真实 PostgreSQL：recentInformativeFeedbackForUserQuery（F04 最新有
     expect((await rowsFor(1)).some((row) => row.title === '他人偏好审查')).toBe(false);
     expect((await rowsFor(2)).some((row) => row.title === '有效反馈审查')).toBe(false);
     expect(await rowsFor(2)).toEqual([{ title: '他人偏好审查', author: '审查作者', status: 'done', note: '别人的萌点' }]);
+  });
+
+  it('撤回标记：只列「曾 informative、最新已非 informative」的书，且只回传书名', async () => {
+    // 上面的夹具已构造：撤回审查（done→reading）、清空原因审查（dropped→空 note）。
+    // 二者都应出现在 user 1 的撤回清单，且清单里只有 title（旧 note 原文不回传）。
+    expect(await withdrawnFor(1)).toEqual(['撤回审查', '清空原因审查']);
+    // 仍有效的反馈、以及从未 informative 的书不进撤回清单。
+    const plain = await book('从未反馈审查');
+    await feedback(1, plain, 'want', '想读');
+    expect(await withdrawnFor(1)).not.toContain('从未反馈审查');
+    expect(await withdrawnFor(1)).not.toContain('有效反馈审查');
+  });
+
+  it('撤回标记严格按 user_id 隔离', async () => {
+    const mine = await book('我的撤回审查');
+    await feedback(3, mine, 'done', '我的雷点');
+    await feedback(3, mine, 'reading', '');
+    const others = await book('他人的撤回审查');
+    await feedback(4, others, 'done', '别人的雷点');
+    await feedback(4, others, 'reading', '');
+    expect(await withdrawnFor(3)).toContain('我的撤回审查');
+    expect(await withdrawnFor(3)).not.toContain('他人的撤回审查');
+    expect(await withdrawnFor(4)).not.toContain('我的撤回审查');
   });
 });

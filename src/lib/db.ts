@@ -4,7 +4,7 @@ import { LLM_USAGE_PHASES, type LlmUsagePhase, type LlmUsageRecord, type TokenSt
 import { assertAuthSchema } from './auth-store';
 import { initializeBusinessSchema } from './business-schema';
 import type { PersonalWriter } from './personal-write';
-import { requireUserId, profileForUserQuery, saveProfileForUserQuery, excludedBooksForUserQuery, persistRecommendationsForUserQueries, feedbackForUserQueries, feedbackSnapshotForUserQuery, recentInformativeFeedbackForUserQuery } from './user-data';
+import { requireUserId, profileForUserQuery, saveProfileForUserQuery, excludedBooksForUserQuery, persistRecommendationsForUserQueries, feedbackForUserQueries, feedbackSnapshotForUserQuery, recentInformativeFeedbackForUserQuery, withdrawnFeedbackBookTitlesForUserQuery } from './user-data';
 export { canonicalBookKey } from './book-identity';
 
 const DATABASE_URL = process.env.DATABASE_URL;
@@ -193,6 +193,14 @@ export interface ProfileFeedback { title: string; author: string; status: string
 export async function getProfileFeedbackForUser(userId: number): Promise<ProfileFeedback[]> {
   requireUserId(userId);
   return await recentInformativeFeedbackForUserQuery(getSql(), userId) as ProfileFeedback[];
+}
+
+// 已撤回反馈的书名（F04）：曾 informative、最新已非 informative。空数组表示没有撤回信号，
+// 路由据此不渲染撤回段。查询语义见 user-data.withdrawnFeedbackBookTitlesForUserQuery。
+export async function getWithdrawnFeedbackBookTitlesForUser(userId: number): Promise<string[]> {
+  requireUserId(userId);
+  const rows = await withdrawnFeedbackBookTitlesForUserQuery(getSql(), userId) as { title: string }[];
+  return rows.map((row) => row.title);
 }
 
 export async function getFeedbackSnapshotForUser(userId: number, title: string, author: string): Promise<{ version: number; status: string | null; note: string }> {
