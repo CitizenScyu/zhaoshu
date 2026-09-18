@@ -15,9 +15,18 @@
 import os
 import sys
 import unittest
+import urllib.parse
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import douban_list  # noqa: E402
+
+
+def no_wait(case):
+    """把两个站间间隔都置 0（测试不等真 sleep；对目标站的礼貌延迟只在生产生效）。"""
+    patcher = mock.patch.multiple(douban_list, SEARCH_DELAY=0, DOUBAN_PAGE_DELAY=0)
+    patcher.start()
+    case.addCleanup(patcher.stop)
 
 
 # 豆瓣 tag 页实测结构（按 2026-09-18 抓到的 subject-item 块缩写，
@@ -203,11 +212,8 @@ class TestBuildDoubanQueue(unittest.TestCase):
             '/books/search.html?kw=%E7%BC%BA%20pub%20%E7%9A%84%E6%9D%A1%E7%9B%AE':
                 NO_RESULT_HTML,
         }
-        douban_list.SEARCH_DELAY = 0
-        try:
-            queue = douban_list.build_douban_queue(self._http_get)
-        finally:
-            douban_list.SEARCH_DELAY = 1.5
+        no_wait(self)
+        queue = douban_list.build_douban_queue(self._http_get)
         self.assertEqual(len(queue), 1)
         b = queue[0]
         self.assertEqual(b['url'], '/books/details42.html')
@@ -222,11 +228,8 @@ class TestBuildDoubanQueue(unittest.TestCase):
                 raise ConnectionError('douban down')
             return NO_RESULT_HTML
 
-        douban_list.SEARCH_DELAY = 0
-        try:
-            queue = douban_list.build_douban_queue(failing_douban)
-        finally:
-            douban_list.SEARCH_DELAY = 1.5
+        no_wait(self)
+        queue = douban_list.build_douban_queue(failing_douban)
         self.assertEqual(queue, [])
 
     def test_dedup_across_tags(self):
@@ -243,6 +246,77 @@ class TestBuildDoubanQueue(unittest.TestCase):
                 seen.add(k)
                 deduped.append(b)
         self.assertEqual(len(deduped), 3)
+
+
+# ---- 豆瓣 tag 翻页（2026-09-19 实测 ?start=N 生效，每 tag 3 页）----
+def douban_page_html(titles, start):
+    """一页 subject-item 列表（title 依次编号，便于断言页码）。"""
+    items = ''.join(
+        f'<li class="subject-item"><div class="info">'
+        f'<h2><a href="https://book.douban.com/subject/{1000 + start + i}/" '
+        f'title="{t}">{t}</a></h2><div class="pub">{t}作者 / 某社</div></div></li>'
+        for i, t in enumerate(titles))
+    return f'<ul class="subject-list">{items}</ul>'
+
+
+class TestDoubanPagination(unittest.TestCase):
+    def setUp(self):
+        no_wait(self)
+
+    def _recording_get(self, pages):
+        self.urls = []
+
+        def http_get(url):
+            self.urls.append(url)
+            return pages.get(url, '<html></html>')
+
+        return http_get
+
+    def test_first_page_has_no_start_param_and_later_pages_do(self):
+        # 标题必须两两不同：数字会被 _norm_title 当卷号剥掉，单字重复也会被去重
+        alphabet = '甲乙丙丁戊己庚辛壬癸子丑寅卯辰巳午未申酉戌'
+        counter = 0
+        pages = {}
+        for p in range(3):
+            for tag in douban_list.DOUBAN_TAGS:
+                titles = []
+                for _ in range(3):
+                    titles.append(alphabet[counter // len(alphabet)] +
+                                  alphabet[counter % len(alphabet)] + '书')
+                    counter += 1
+                pages[douban_list._douban_tag_url(tag, p)] = douban_page_html(titles, p * 20)
+        http_get = self._recording_get(pages)
+        books = douban_list.fetch_douban_books(http_get)
+        self.assertEqual(len(books), len(douban_list.DOUBAN_TAGS) * 3 * 3)
+        first_tag_quoted = urllib.parse.quote(douban_list.DOUBAN_TAGS[0])
+        tag_urls = [u for u in self.urls if first_tag_quoted in u]
+        self.assertTrue(tag_urls[0].endswith('/tag/' + first_tag_quoted))  # 第一页不带参数
+        self.assertTrue(tag_urls[1].endswith('?start=20'))
+        self.assertTrue(tag_urls[2].endswith('?start=40'))
+
+    def test_pages_are_deduplicated_within_a_tag(self):
+        same = douban_page_html(['重复书', '独有书'], 0)
+        pages = {douban_list._douban_tag_url('网络小说', p): same for p in range(3)}
+        books = douban_list.fetch_douban_books(self._recording_get(pages))
+        self.assertEqual([b['title'] for b in books], ['重复书', '独有书'])
+
+    def test_single_page_failure_does_not_drop_the_others(self):
+        def http_get(url):
+            if url.endswith('?start=20'):
+                raise ConnectionError('豆瓣第二页超时')
+            return douban_page_html(['甲书', '乙书'], 0)
+
+        books = douban_list.fetch_douban_books(http_get)
+        self.assertEqual(len(books), 2)          # 失败页被跳过，其余页照常
+
+    def test_pages_per_tag_is_configurable(self):
+        self.assertEqual(douban_list.DOUBAN_PAGES, 3)
+        with mock.patch.object(douban_list, 'DOUBAN_PAGES', 1):
+            urls = []
+            douban_list.fetch_douban_books(
+                lambda url: urls.append(url) or douban_page_html([], 0))
+            self.assertEqual(len(urls), len(douban_list.DOUBAN_TAGS))
+            self.assertTrue(all('?start=' not in u for u in urls))
 
 
 # ---- 起点移动版页面（2026-09-18 实测结构缩写）----
@@ -339,16 +413,140 @@ class TestParseQidianRank(unittest.TestCase):
         self.assertNotIn('仙侠', titles)
 
 
+# ---- 纵横移动版完本专区（2026-09-19 调研接入；两种 book-author 形态并存）----
+ZHENG_COMPLETE_HTML = """<!doctype html><html><body>
+<div class="book-layout" data-sa-d={&#34;book_id&#34;:&#34;1235249&#34;}>
+  <a href="//m.zongheng.com/book/1235249" class="book-title">剑来</a>
+  <a href="//m.zongheng.com/book/1235249" class="book-author">烽火戏诸侯</a></div>
+<div class="book-layout" data-sa-d={&#34;book_id&#34;:&#34;1207373&#34;}>
+  <a href="//m.zongheng.com/book/1207373" class="book-title">雪中悍刀行</a>
+  <a href="//m.zongheng.com/book/1207373" class="book-author">烽火戏诸侯</a></div>
+<div class="book-cell"><a class="book-title">超品神瞳</a>
+  <div class="book-meta"><span class="book-author"><aria>作者：</aria>李闲鱼 · 856.8万</span></div></div>
+<div class="book-cell"><a class="book-title">剑来</a>
+  <div class="book-meta"><span class="book-author"><aria>作者：</aria>烽火戏诸侯 · 680.1万</span></div></div>
+</body></html>"""
+
+
+class TestParseZonghengComplete(unittest.TestCase):
+    """纵横完本页：两种 book-author 形态 + 邻条不串作者 + 跨条去重。"""
+
+    def test_extracts_title_and_author_in_both_shapes(self):
+        books = douban_list.parse_zongheng_complete(ZHENG_COMPLETE_HTML)
+        self.assertEqual([b['title'] for b in books], ['剑来', '雪中悍刀行', '超品神瞳'])
+        self.assertEqual(books[0]['author'], '烽火戏诸侯')       # <a class="book-author">
+        self.assertEqual(books[1]['author'], '烽火戏诸侯')
+        self.assertEqual(books[2]['author'], '李闲鱼')           # <aria>作者：</aria>作者 · 字数
+
+    def test_author_is_not_borrowed_from_the_neighbour_entry(self):
+        html = ('<a class="book-title">甲书</a><a class="book-author">甲作者</a>'
+                '<a class="book-title">乙书</a><a class="book-author">乙作者</a>')
+        books = douban_list.parse_zongheng_complete(html)
+        self.assertEqual([(b['title'], b['author']) for b in books],
+                         [('甲书', '甲作者'), ('乙书', '乙作者')])
+
+    def test_dedup_across_sections(self):
+        books = douban_list.parse_zongheng_complete(ZHENG_COMPLETE_HTML)
+        self.assertEqual(len([b for b in books if b['title'] == '剑来']), 1)
+
+    def test_origin_marker_is_zongheng(self):
+        books = douban_list.parse_zongheng_complete(ZHENG_COMPLETE_HTML)
+        self.assertEqual({b['origin'] for b in books}, {'纵横完本'})
+
+    def test_empty_page(self):
+        self.assertEqual(douban_list.parse_zongheng_complete('<html></html>'), [])
+
+    def test_fetch_failure_returns_empty_isolation(self):
+        def failing(url):
+            raise ConnectionError('zongheng down')
+        self.assertEqual(douban_list.fetch_zongheng_complete_books(failing), [])
+
+    def test_fetch_uses_mobile_complete_url(self):
+        seen = []
+        douban_list.fetch_zongheng_complete_books(
+            lambda url: seen.append(url) or ZHENG_COMPLETE_HTML)
+        self.assertEqual(seen, [douban_list.ZHENG_MOBILE + '/complete'])
+
+
+# ---- 17K 完本页（2026-09-19 调研接入）----
+Y17K_QUANBEN_HTML = """<html><body>
+<a href="//www.17k.com/book/101834.html" target="_blank">乱世王妃</a>
+<a href="//www.17k.com/book/101834.html" target="_blank">她是大曜王朝唯一的女王爷，却被迫下嫁给敌国的质子。</a>
+<a href="//www.17k.com/book/3671230.html" target="_blank">绝世战体逆天斩仙：吞天记</a>
+<a href="//www.17k.com/book/285.html" target="_blank">骁骑校大作：匹夫的逆袭！</a>
+<a href="//www.17k.com/book/999.html" target="_blank">被截断的长书名其实还有后半段...</a>
+<a href="//www.17k.com/book/7.html" target="_blank">完本小说</a>
+<a href="//www.17k.com/author/8.html" target="_blank">某作者</a>
+</body></html>"""
+
+
+class TestParse17kQuanben(unittest.TestCase):
+    def test_extracts_only_book_links(self):
+        books = douban_list.parse_17k_quanben(Y17K_QUANBEN_HTML)
+        self.assertEqual([b['title'] for b in books],
+                         ['乱世王妃', '绝世战体逆天斩仙：吞天记', '匹夫的逆袭！'])
+
+    def test_same_book_id_keeps_the_title_anchor_not_the_intro_sentence(self):
+        # 实测形态：同一 book id 先出现书名锚点，后出现整句简介锚点；
+        # 简介不得进名单（否则会拿一整句话去 book15 搜索）
+        titles = [b['title'] for b in douban_list.parse_17k_quanben(Y17K_QUANBEN_HTML)]
+        self.assertNotIn('她是大曜王朝唯一的女王爷，却被迫下嫁给敌国的质子。', titles)
+        self.assertEqual(titles.count('乱世王妃'), 1)
+
+    def test_intro_like_text_is_rejected_even_as_first_anchor(self):
+        html = ('<a href="//www.17k.com/book/1.html">他是落魄书生，却一步步走上巅峰，'
+                '终成一代霸主。</a>')
+        self.assertEqual(douban_list.parse_17k_quanben(html), [])
+
+    def test_promotional_prefix_is_stripped(self):
+        titles = [b['title'] for b in douban_list.parse_17k_quanben(Y17K_QUANBEN_HTML)]
+        self.assertIn('匹夫的逆袭！', titles)
+        self.assertNotIn('骁骑校大作：匹夫的逆袭！', titles)
+        # 系列力作前缀同族（实测「失落叶月恒系列力作：天行」→《天行》）
+        html = '<a href="//www.17k.com/book/2.html">失落叶月恒系列力作：天行</a>'
+        self.assertEqual([b['title'] for b in douban_list.parse_17k_quanben(html)], ['天行'])
+
+    def test_truncated_titles_are_dropped(self):
+        titles = [b['title'] for b in douban_list.parse_17k_quanben(Y17K_QUANBEN_HTML)]
+        self.assertNotIn('被截断的长书名其实还有后半段...', titles)
+
+    def test_navigation_words_are_dropped(self):
+        titles = [b['title'] for b in douban_list.parse_17k_quanben(Y17K_QUANBEN_HTML)]
+        self.assertNotIn('完本小说', titles)
+
+    def test_title_attribute_form_is_parsed(self):
+        html = '<a href="//www.17k.com/book/3381946.html" title="风起龙城" target="_blank">风起龙城</a>'
+        self.assertEqual([b['title'] for b in douban_list.parse_17k_quanben(html)], ['风起龙城'])
+
+    def test_empty_page(self):
+        self.assertEqual(douban_list.parse_17k_quanben('<html></html>'), [])
+
+    def test_fetch_failure_returns_empty_isolation(self):
+        def failing(url):
+            raise ConnectionError('17k down')
+        self.assertEqual(douban_list.fetch_17k_quanben_books(failing), [])
+
+    def test_fetch_uses_quanben_url(self):
+        seen = []
+        douban_list.fetch_17k_quanben_books(lambda url: seen.append(url) or Y17K_QUANBEN_HTML)
+        self.assertEqual(seen, [douban_list.Y17K_BASE + '/quanben/'])
+
+
 class TestBuildWebnovelQueue(unittest.TestCase):
-    """多源合并：起点为主、豆瓣补充，跨源去重后过 book15 搜索。"""
+    """多源合并：完本经典优先（起点/纵横/17K）、起点榜单次之、豆瓣补充。"""
+
+    def setUp(self):
+        no_wait(self)
 
     def _http_get(self, url):
         if url == douban_list.QIDIAN_MOBILE + '/finish/':
             return QIDIAN_FINISH_HTML
-        if url == douban_list.QIDIAN_MOBILE + '/rank/yuepiao/':
+        if url.startswith(douban_list.QIDIAN_MOBILE + '/rank/'):
             return QIDIAN_RANK_HTML
-        if url == douban_list.QIDIAN_MOBILE + '/rank/hotsales/':
-            return QIDIAN_RANK_HTML
+        if url == douban_list.ZHENG_MOBILE + '/complete':
+            return ZHENG_COMPLETE_HTML
+        if url == douban_list.Y17K_BASE + '/quanben/':
+            return Y17K_QUANBEN_HTML
         if url.startswith('https://book.douban.com/tag/'):
             return DOUBAN_TAG_HTML
         return self.search_pages.get(url, NO_RESULT_HTML)
@@ -357,16 +555,10 @@ class TestBuildWebnovelQueue(unittest.TestCase):
         # 起点 finish 的盗墓笔记？没有——DOUBAN_TAG_HTML 提供盗墓笔记（豆瓣源）。
         # 混合源：起点诡秘之主（miss）+ 豆瓣盗墓笔记（hit）
         self.search_pages = {
-            '/books/search.html?kw=%E8%AF%A1%E7%A7%98%E4%B9%8B%E4%B8%BB': NO_RESULT_HTML,
-            '/books/search.html?kw=%E7%81%B5%E5%A2%83%E8%A1%8C%E8%80%85': NO_RESULT_HTML,
             '/books/search.html?kw=%E7%9B%97%E5%A2%93%E7%AC%94%E8%AE%B0':
                 book15_search_html('盗墓笔记7', '/books/details42.html'),
         }
-        douban_list.SEARCH_DELAY = 0
-        try:
-            queue = douban_list.build_webnovel_queue(self._http_get)
-        finally:
-            douban_list.SEARCH_DELAY = 1.5
+        queue = douban_list.build_webnovel_queue(self._http_get)
         self.assertEqual(len(queue), 1)
         b = queue[0]
         self.assertEqual(b['title'], '盗墓笔记7')
@@ -374,29 +566,62 @@ class TestBuildWebnovelQueue(unittest.TestCase):
 
     def test_douban_excluded_when_disabled(self):
         self.search_pages = {}
-        douban_list.SEARCH_DELAY = 0
-        try:
-            queue = douban_list.build_webnovel_queue(self._http_get, include_douban=False)
-        finally:
-            douban_list.SEARCH_DELAY = 1.5
-        # 只有起点源（全 miss）→ 空队列，且没有任何豆瓣请求
+        queue = douban_list.build_webnovel_queue(self._http_get, include_douban=False)
+        # 网文站源全 miss（未配 search_pages）→ 空队列
         self.assertEqual(queue, [])
 
+    def test_new_sources_enter_the_candidate_pool(self):
+        # 纵横/17K 的书进候选池（命中与否另说），且各自带 origin
+        self.search_pages = {
+            '/books/search.html?kw=%E5%89%91%E6%9D%A5':
+                book15_search_html('剑来', '/books/details100.html'),
+            '/books/search.html?kw=%E4%B9%B1%E4%B8%96%E7%8E%8B%E5%A6%83':
+                book15_search_html('乱世王妃', '/books/details200.html'),
+        }
+        queue = douban_list.build_webnovel_queue(self._http_get, include_douban=False)
+        by_title = {b['title']: b for b in queue}
+        self.assertEqual(by_title['剑来']['category'], '纵横完本')
+        self.assertEqual(by_title['乱世王妃']['category'], '17K完本')
+
+    def test_qidian_rank_slugs_are_expanded(self):
+        self.assertEqual(douban_list.QIDIAN_RANKS,
+                         ('yuepiao', 'hotsales', 'rec', 'update', 'sign', 'newbook'))
+
+    def test_all_six_qidian_ranks_are_fetched(self):
+        seen = []
+
+        def http_get(url):
+            seen.append(url)
+            return self._http_get(url)
+
+        self.search_pages = {}
+        douban_list.build_webnovel_queue(http_get, include_douban=False)
+        for rank in douban_list.QIDIAN_RANKS:
+            with self.subTest(rank=rank):
+                self.assertIn(f'{douban_list.QIDIAN_MOBILE}/rank/{rank}/', seen)
+
     def test_qidian_fetch_failure_falls_through_to_douban(self):
-        # 起点全线挂掉：豆瓣照常供给
+        # 起点全线挂掉：其余源照常供给
+        self.search_pages = {
+            '/books/search.html?kw=%E7%9B%97%E5%A2%93%E7%AC%94%E8%AE%B0':
+                book15_search_html('盗墓笔记7', '/books/details42.html'),
+        }
+
         def failing_qidian(url):
             if 'qidian' in url:
                 raise ConnectionError('qidian down')
-            if url.startswith('https://book.douban.com/tag/'):
-                return DOUBAN_TAG_HTML
-            return NO_RESULT_HTML
+            return self._http_get(url)
 
-        douban_list.SEARCH_DELAY = 0
-        try:
-            queue = douban_list.build_webnovel_queue(failing_qidian)
-        finally:
-            douban_list.SEARCH_DELAY = 1.5
-        self.assertEqual(queue, [])
+        queue = douban_list.build_webnovel_queue(failing_qidian)
+        self.assertEqual([b['title'] for b in queue], ['盗墓笔记7'])
+
+    def test_every_source_down_yields_empty_queue(self):
+        def all_down(url):
+            if url.startswith('https://book15.net') or url.startswith('/books/'):
+                raise ConnectionError('book15 down')
+            raise ConnectionError('source down')
+
+        self.assertEqual(douban_list.build_webnovel_queue(all_down), [])
 
 
 if __name__ == '__main__':

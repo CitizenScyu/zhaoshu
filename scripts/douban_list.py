@@ -29,6 +29,11 @@ DOUBAN_TAGS = (
     '科幻小说', '盗墓', '穿越小说', '历史小说', '悬疑小说', '恐怖小说', '言情',
 )
 DOUBAN_BASE = 'https://book.douban.com'
+# 豆瓣 tag 翻页（2026-09-19 实测：?start=N 生效，三页书目不重复）：
+# 每 tag 3 页 × 20 本 → 名单 ×3（遗留问题 1a 的 a 方案）。
+DOUBAN_PAGES = 3
+DOUBAN_PAGE_SIZE = 20
+DOUBAN_PAGE_DELAY = 1.0   # 翻页间隔：39 个请求连发容易触发豆瓣验证码（对站点友好）
 # 豆瓣对非浏览器 UA 偶尔弹验证码；用与浏览器一致的 UA（phoenix 实测可直连）。
 DOUBAN_UA = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
                            'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36'}
@@ -121,23 +126,35 @@ def parse_book15_search(html: str) -> list[tuple[str, str]]:
 
 
 # ---- 在线抓取（labeler 侧接线用，单测全部 mock http_get）----
-def fetch_douban_books(http_get) -> list[dict]:
-    """抓全部 DOUBAN_TAGS 页 → 去重的 [{title, author, douban_url}]。
+def _douban_tag_url(tag: str, page: int) -> str:
+    """tag 页 URL。第一页保持原样（不带参数，线上行为一字不变），后续页用 ?start=N。"""
+    base = f'{DOUBAN_BASE}/tag/{urllib.parse.quote(tag)}'
+    return base if page == 0 else f'{base}?start={page * DOUBAN_PAGE_SIZE}'
 
-    单个 tag 拉取失败只告警不中断（下次轮次再试）；按 title 去重。"""
+
+def fetch_douban_books(http_get) -> list[dict]:
+    """抓全部 DOUBAN_TAGS 页（每 tag DOUBAN_PAGES 页）→ 去重 [{title, author, douban_url}]。
+
+    单个 tag/页拉取失败只告警不中断（下次轮次再试）；按 title 去重。
+    翻页用 ?start=N（2026-09-19 实测三页书目不重复），页间留 DOUBAN_PAGE_DELAY。"""
     books, seen = [], set()
+    first = True
     for tag in DOUBAN_TAGS:
-        url = f'{DOUBAN_BASE}/tag/{urllib.parse.quote(tag)}'
-        try:
-            html = http_get(url)
-        except Exception as e:
-            print(f'  豆瓣tag[{tag}] 拉取失败: {e}', file=sys.stderr)
-            continue
-        for b in parse_douban_tag_page(html):
-            key = _norm_title(b['title'])
-            if key and key not in seen:
-                seen.add(key)
-                books.append(b)
+        for page in range(DOUBAN_PAGES):
+            if not first:
+                time.sleep(DOUBAN_PAGE_DELAY)
+            first = False
+            url = _douban_tag_url(tag, page)
+            try:
+                html = http_get(url)
+            except Exception as e:
+                print(f'  豆瓣tag[{tag}] 第{page + 1}页拉取失败: {e}', file=sys.stderr)
+                continue
+            for b in parse_douban_tag_page(html):
+                key = _norm_title(b['title'])
+                if key and key not in seen:
+                    seen.add(key)
+                    books.append(b)
     return books
 
 
@@ -207,11 +224,13 @@ def _resolve_candidates(candidates: list[dict], http_get, origin: str = '') -> l
 #   是 JS 盾，恒 209B）。?ym= / chanId= 参数被忽略（恒返回当月全站榜），每榜 20 本。
 # - m.qidian.com/finish/：完本频道页，SSR 渲染 4 个区块（影视同期/经典必读/
 #   大神完本/畅销完本），**经典完本对口 book15 库存**：13 本核心书目实测命中 12。
-# - www.zongheng.com/rank/details.html：Nuxt SSR，__NUXT__ 闭包内有月票榜 20 本，
-#   但当前在更新书为主（剑来/最强狂兵外命中率低），且闭包解析脆，不接。
 QIDIAN_UA = {'User-Agent': 'Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 '
                            '(KHTML, like Gecko) Chrome/120.0 Mobile Safari/537.36'}
 QIDIAN_MOBILE = 'https://m.qidian.com'
+# 6 个榜单 slug（2026-09-19 实测：rec/update/sign/newbook 与 yuepiao/hotsales
+# 同构 SSR，解析函数零改动，改常量即每轮 +80 本）。
+# update/sign/newbook 是在更新书（2026-09-19 口径修正：未完结连载名作同样算目标）。
+QIDIAN_RANKS = ('yuepiao', 'hotsales', 'rec', 'update', 'sign', 'newbook')
 
 # 完本频道区块名（按出现顺序切片）。区块后紧跟的小标题（如「火热影视原作」）
 # 不是区块名，靠 QIDIAN_FINISH_SUBTITLES 排除。
@@ -330,9 +349,9 @@ def fetch_qidian_finish_books(http_get) -> list[dict]:
 
 
 def fetch_qidian_rank_books(http_get) -> list[dict]:
-    """起点月票榜+畅销榜（当前在更新书为主，命中偏低，补充量）。"""
+    """起点 6 榜（月票/畅销/推荐/更新/签约/新书，各 20 本）。"""
     books: list[dict] = []
-    for rank in ('yuepiao', 'hotsales'):
+    for rank in QIDIAN_RANKS:
         try:
             books.extend(parse_qidian_rank(http_get(f'{QIDIAN_MOBILE}/rank/{rank}/')))
         except Exception as e:
@@ -340,12 +359,120 @@ def fetch_qidian_rank_books(http_get) -> list[dict]:
     return books
 
 
+# ---- 纵横（m.zongheng.com/complete，2026-09-19 调研接入）----
+# 入口翻案说明：此前判「不接」的两条理由（榜单以在更新书为主 + __NUXT__ 闭包脆）
+# 都被 m 站完本专区绕开——它是**完本页**（不是榜单），书目直接 SSR 在 HTML 里
+# （不碰闭包）。实测 42 条完本（去重 41），含雪中悍刀行/剑来/最强狂兵，
+# book15 抽样命中 17/41 ≈ 41%。桌面榜单/移动榜单/API 均不接（空壳/WAF）。
+ZHENG_MOBILE = 'https://m.zongheng.com'
+_ZH_TITLE_RE = re.compile(r'class="book-title">([^<]+)</a>')
+# 两种形态：人气完本/最新完本 = <a class="book-author">作者</a>；
+# 更多完本 = <span class="book-author"><aria>作者：</aria>作者 · 856.8万</span>
+_ZH_AUTHOR_RE = re.compile(
+    r'class="book-author">[\s\S]{0,60}?(?:</aria>)?([^<·\n]+?)\s*(?:</a>|·)')
+
+
+def parse_zongheng_complete(html: str) -> list[dict]:
+    """纵横移动版完本专区 → [{title, author, origin}]。
+
+    逐条以 class="book-title" 锚点定位，作者只在**本条锚点与下一条锚点之间**找
+    （找不到再回头找上一条锚点之后的空档），避免把邻条作者串到本条；
+    两种页面形态共用一条作者正则。跨条按归一化书名去重。"""
+    entries = [(m.start(), m.end(), m.group(1).strip())
+               for m in _ZH_TITLE_RE.finditer(html)]
+    books, seen = [], set()
+    for i, (start, end, title) in enumerate(entries):
+        if not title or len(title) > 40:
+            continue
+        nxt = entries[i + 1][0] if i + 1 < len(entries) else len(html)
+        prev = entries[i - 1][1] if i > 0 else 0
+        m = _ZH_AUTHOR_RE.search(html[end:nxt]) or _ZH_AUTHOR_RE.search(html[prev:start])
+        author = m.group(1).strip() if m else ''
+        key = _norm_title(title)
+        if key and key not in seen:
+            seen.add(key)
+            books.append({'title': title, 'author': author,
+                          'origin': '纵横完本', 'douban_url': ''})
+    return books
+
+
+def fetch_zongheng_complete_books(http_get) -> list[dict]:
+    """纵横移动版完本专区（纯 SSR 完本页，book15 命中率实测 41%）。"""
+    try:
+        return parse_zongheng_complete(http_get(f'{ZHENG_MOBILE}/complete'))
+    except Exception as e:
+        print(f'  纵横[完本专区] 拉取失败: {e}', file=sys.stderr)
+        return []
+
+
+# ---- 17K 小说网（www.17k.com/quanben/，2026-09-19 调研接入）----
+# 完本页纯 SSR（无 JS 盾），实测 159 本去重（约 111 条标题干净），
+# 含巫颂/罪恶之城/超级兵王等经典，book15 抽样命中 8/25 ≈ 32%。
+# 各榜 Top100 详情页被 Aliyun WAF 挡，**不接**；/quanben/ 与 /top/ 不受影响。
+Y17K_BASE = 'https://www.17k.com'
+_Y17K_BOOK_RE = re.compile(r'href="//www\.17k\.com/book/(\d+)\.html"[^>]*>([^<]*)</a>')
+# 页面有 48 条被截断的标题（结尾 ...），按前缀搜 book15 命中率低且易误配 → 丢弃
+_17K_TRUNCATED_RE = re.compile(r'(?:\.{2,}|…+|。{2,})\s*$')
+# 推广前缀：「骁骑校大作：匹夫的逆袭！」「失落叶月恒系列力作：天行」→ 取冒号后的真书名
+_17K_PROMO_RE = re.compile(r'^[^：:]{0,12}?(?:大作|力作|作品)[：:]\s*')
+_17K_NOISE = {'完本小说', '排行榜', '首页', '更多', '全部', '免费阅读'}
+
+
+def _clean_17k_title(title: str) -> str:
+    """17K 完本页标题清洗：去推广前缀 / 丢弃截断标题与简介句 / 去多余空白。
+
+    实测（y17k_quanben.html）：159 本书名全 ≤20 字，而同页的**简介锚点**是整句
+    （「修行即时掠夺，强者方能侠义，他于绝境中得绝世战仙之衣钵，从此逆天崛起。」）。
+    `parse_17k_quanben` 已按 book id 取首个锚点把简介挡在外面；这里再用
+    「含句中标点或超长即判简介」作第二道防线（宁缺勿滥，宁可少收也不放脏书名进搜索）。"""
+    text = re.sub(r'\s+', ' ', (title or '').replace('&nbsp;', ' ')).strip()
+    text = _17K_PROMO_RE.sub('', text)
+    if _17K_TRUNCATED_RE.search(text):
+        return ''
+    text = text.strip()
+    if not 2 <= len(text) <= 25 or text in _17K_NOISE or '，' in text or '。' in text:
+        return ''
+    return text
+
+
+def parse_17k_quanben(html: str) -> list[dict]:
+    """17K 完本页 → [{title, author, origin}]（页面无作者，author 空）。
+
+    同一本书在页面上有**两个锚点**：书名锚点 + 简介锚点（实测
+    `…/book/1469383.html` 先出现书名「绝世战体逆天斩仙：吞天记」，
+    后出现整句简介）。因此**按 book id 取首个锚点**，简介锚点天然被跳过；
+    再按归一化书名跨 id 去重。"""
+    books, seen, seen_ids = [], set(), set()
+    for m in _Y17K_BOOK_RE.finditer(html):
+        if m.group(1) in seen_ids:
+            continue
+        seen_ids.add(m.group(1))
+        title = _clean_17k_title(m.group(2))
+        key = _norm_title(title)
+        if not title or not key or key in seen:
+            continue
+        seen.add(key)
+        books.append({'title': title, 'author': '',
+                      'origin': '17K完本', 'douban_url': ''})
+    return books
+
+
+def fetch_17k_quanben_books(http_get) -> list[dict]:
+    """17K 完本小说页（纯 SSR，book15 命中率实测 32%）。"""
+    try:
+        return parse_17k_quanben(http_get(f'{Y17K_BASE}/quanben/'))
+    except Exception as e:
+        print(f'  17K[完本页] 拉取失败: {e}', file=sys.stderr)
+        return []
+
+
 def build_webnovel_queue(http_get, include_douban: bool = True) -> list[dict]:
     """网文站名单（主）+ 豆瓣 tag（补充）→ book15 打标队列。
 
     用户指令（2026-09-18）：网文站榜单是对口 book15 的一手来源，优先；
-    豆瓣 tag 名单补充。跨源按归一化书名去重，产出与 fetch_rank_books() 同构，
-    每个候选过 search_book15（LIKE 模糊搜索 + title_compatible 校验）。
+    豆瓣 tag 名单补充。2026-09-19 扩容：豆瓣翻页 3 页 + 纵横完本 + 17K 完本 +
+    起点榜单 2→6。跨源按归一化书名去重（断点续传另按 url 去重，扩名单不会重标已完成的），
+    产出与 fetch_rank_books() 同构，每个候选过 search_book15（LIKE + title_compatible）。
     """
     candidates: list[dict] = []
     seen: set = set()
@@ -361,7 +488,10 @@ def build_webnovel_queue(http_get, include_douban: bool = True) -> list[dict]:
                 added += 1
         print(f'{origin}: 新增 {added} 本（累计 {len(candidates)}）')
 
+    # 顺序 = 预期命中率（完本经典 > 在更新书 > 豆瓣补充）；任何源失败只告警。
     add_batch(fetch_qidian_finish_books(http_get), '起点完本频道')
+    add_batch(fetch_zongheng_complete_books(http_get), '纵横完本')
+    add_batch(fetch_17k_quanben_books(http_get), '17K完本')
     add_batch(fetch_qidian_rank_books(http_get), '起点榜单')
     if include_douban:
         add_batch(fetch_douban_books(http_get), '豆瓣网文tag')
