@@ -16,10 +16,13 @@
 
 本模块只做「选书」，抓正文/清洗/打标/断点续传统一走 labeler.py 既有管线。
 """
+import json
+import os
 import re
 import sys
 import time
 import urllib.parse
+from pathlib import Path
 
 # ---- 豆瓣侧配置 ----
 # 网文向 tag（2026-09-18 实测全部可抓；严肃 tag 如「文学」命中率为 0 故不收）。
@@ -29,9 +32,13 @@ DOUBAN_TAGS = (
     '科幻小说', '盗墓', '穿越小说', '历史小说', '悬疑小说', '恐怖小说', '言情',
 )
 DOUBAN_BASE = 'https://book.douban.com'
-# 豆瓣 tag 翻页（2026-09-19 实测：?start=N 生效，三页书目不重复）：
-# 每 tag 3 页 × 20 本 → 名单 ×3（遗留问题 1a 的 a 方案）。
-DOUBAN_PAGES = 3
+# 豆瓣翻页（2026-09-19 实测：?start=N 生效，三页书目不重复）。
+# **默认 1 页**（审查 D.3 独立结论）：3 页贡献候选大头与搜索时间大头、命中最差，
+# 把每轮搜索墙钟从 ~6 min 拉到 20–25 min，可能咬门卫窗口。3 页作显式开关：
+# .env 里 LABELER_DOUBAN_PAGES=3（或进程环境同名字段）才开。首轮「灌满预备」
+# 可临时开一次，不应当每轮默认。
+DOUBAN_PAGES = 1
+DOUBAN_PAGES_ENV = 'LABELER_DOUBAN_PAGES'
 DOUBAN_PAGE_SIZE = 20
 DOUBAN_PAGE_DELAY = 1.0   # 翻页间隔：39 个请求连发容易触发豆瓣验证码（对站点友好）
 # 豆瓣对非浏览器 UA 偶尔弹验证码；用与浏览器一致的 UA（phoenix 实测可直连）。
@@ -132,15 +139,67 @@ def _douban_tag_url(tag: str, page: int) -> str:
     return base if page == 0 else f'{base}?start={page * DOUBAN_PAGE_SIZE}'
 
 
-def fetch_douban_books(http_get) -> list[dict]:
-    """抓全部 DOUBAN_TAGS 页（每 tag DOUBAN_PAGES 页）→ 去重 [{title, author, douban_url}]。
+def resolve_douban_pages(env: dict | None = None) -> int:
+    """豆瓣翻页数：显式开关优先（env 字典 → 进程环境），默认 1 页。
+
+    开关值非法/小于 1 时回落默认，绝不因为一个环境变量把整轮拉长或拉挂。
+    labeler 的 .env 由 load_env() 读成字典，**不 export 到 os.environ**，
+    所以必须支持把 env 字典显式传进来。"""
+    raw = ''
+    if env and env.get(DOUBAN_PAGES_ENV) is not None:
+        raw = str(env.get(DOUBAN_PAGES_ENV)).strip()
+    if not raw:
+        raw = (os.environ.get(DOUBAN_PAGES_ENV) or '').strip()
+    if not raw:
+        return DOUBAN_PAGES
+    try:
+        pages = int(raw)
+    except ValueError:
+        return DOUBAN_PAGES
+    return pages if pages >= 1 else DOUBAN_PAGES
+
+
+def load_done_titles(path) -> set:
+    """labels.jsonl → 已打标书名的归一化集合（搜索前跳过用）。
+
+    审查 D.3 认定「已在 labels.jsonl 的书名不要再搜」是收益最大的一刀：缓存是优化，
+    「跳过已完成再搜」是正确性/产品问题——否则扩容后稳态每轮全量空搜。
+    title / site_title 都收（LLM 猜名与站点名可能只中一个）。文件不存在/坏行只跳过。"""
+    titles: set = set()
+    source = Path(path)
+    if not source.exists():
+        return titles
+    try:
+        lines = source.read_text(encoding='utf-8').splitlines()
+    except OSError:
+        return titles
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(rec, dict):
+            continue
+        for field in ('title', 'site_title'):
+            key = _norm_title(rec.get(field) or '')
+            if key:
+                titles.add(key)
+    return titles
+
+
+def fetch_douban_books(http_get, pages: int | None = None) -> list[dict]:
+    """抓全部 DOUBAN_TAGS 页（每 tag `pages` 页，默认 DOUBAN_PAGES）→ 去重。
 
     单个 tag/页拉取失败只告警不中断（下次轮次再试）；按 title 去重。
     翻页用 ?start=N（2026-09-19 实测三页书目不重复），页间留 DOUBAN_PAGE_DELAY。"""
+    pages = DOUBAN_PAGES if pages is None else pages
     books, seen = [], set()
     first = True
     for tag in DOUBAN_TAGS:
-        for page in range(DOUBAN_PAGES):
+        for page in range(pages):
             if not first:
                 time.sleep(DOUBAN_PAGE_DELAY)
             first = False
@@ -184,25 +243,35 @@ def search_book15(http_get, title: str) -> dict | None:
     return None
 
 
-def build_douban_queue(http_get) -> list[dict]:
+def build_douban_queue(http_get, skip_titles: set | None = None,
+                       pages: int | None = None) -> list[dict]:
     """豆瓣名单 → book15 打标队列 [{url, title, author, category, status, douban_url}]。
 
     与 labeler.fetch_rank_books() 的产出同构（url 为站内相对路径），
     打标循环零改动直接消费。搜不到 / 误匹配的书记日志跳过，不阻塞队列。
-    """
-    douban_books = fetch_douban_books(http_get)
+    skip_titles（归一化书名集合）= 已打标书名，搜索前直接跳过（审查 D.3）。"""
+    douban_books = fetch_douban_books(http_get, pages=pages)
     print(f'豆瓣名单共 {len(douban_books)} 本（去重后）')
-    return _resolve_candidates(douban_books, http_get, origin='豆瓣tag')
+    return _resolve_candidates(douban_books, http_get, origin='豆瓣tag',
+                               skip_titles=skip_titles)
 
 
-def _resolve_candidates(candidates: list[dict], http_get, origin: str = '') -> list[dict]:
+def _resolve_candidates(candidates: list[dict], http_get, origin: str = '',
+                        skip_titles: set | None = None) -> list[dict]:
     """候选名单（[{title, author, ...}]）→ 过 book15 搜索+校验的打标队列。
 
     各名单源共用：命中记队列（category 记来源标记，默认取候选自带 origin，
-    调用方可用 origin 参数覆盖），miss 记日志跳过。"""
+    调用方可用 origin 参数覆盖），miss 记日志跳过。
+    skip_titles 命中（书名归一化后已在 labels.jsonl）→ **不发搜索**直接跳过：
+    缓存是优化，「跳过已完成再搜」是正确性/产品问题（审查 D.3）。"""
     queue: list[dict] = []
     miss: list[str] = []
+    skipped = 0
     for b in candidates:
+        key = _norm_title(b.get('title', ''))
+        if skip_titles and key and key in skip_titles:
+            skipped += 1
+            continue
         hit = search_book15(http_get, b['title'])
         if hit:
             queue.append({'url': hit['url'], 'title': hit['title'],
@@ -213,7 +282,8 @@ def _resolve_candidates(candidates: list[dict], http_get, origin: str = '') -> l
         else:
             miss.append(b['title'])
         time.sleep(SEARCH_DELAY)
-    print(f'book15 命中 {len(queue)} 本，未命中 {len(miss)} 本'
+    print(f'book15 命中 {len(queue)} 本，未命中 {len(miss)} 本，'
+          f'跳过已打标 {skipped} 本'
           f'{"（" + "、".join(miss[:10]) + ("…" if len(miss) > 10 else "") + "）" if miss else ""}')
     return queue
 
@@ -466,12 +536,16 @@ def fetch_17k_quanben_books(http_get) -> list[dict]:
         return []
 
 
-def build_webnovel_queue(http_get, include_douban: bool = True) -> list[dict]:
+def build_webnovel_queue(http_get, include_douban: bool = True,
+                         skip_titles: set | None = None,
+                         pages: int | None = None) -> list[dict]:
     """网文站名单（主）+ 豆瓣 tag（补充）→ book15 打标队列。
 
     用户指令（2026-09-18）：网文站榜单是对口 book15 的一手来源，优先；
-    豆瓣 tag 名单补充。2026-09-19 扩容：豆瓣翻页 3 页 + 纵横完本 + 17K 完本 +
-    起点榜单 2→6。跨源按归一化书名去重（断点续传另按 url 去重，扩名单不会重标已完成的），
+    豆瓣 tag 名单补充。2026-09-19 扩容：纵横完本 + 17K 完本 + 起点榜单 2→6；
+    豆瓣翻页默认 1 页、3 页走 LABELER_DOUBAN_PAGES 开关（审查 D.3）。
+    跨源按归一化书名去重（断点续传另按 url 去重，扩名单不会重标已完成的）；
+    skip_titles = 已打标书名，搜索前跳过（收益最大的一刀）。
     产出与 fetch_rank_books() 同构，每个候选过 search_book15（LIKE + title_compatible）。
     """
     candidates: list[dict] = []
@@ -494,5 +568,5 @@ def build_webnovel_queue(http_get, include_douban: bool = True) -> list[dict]:
     add_batch(fetch_17k_quanben_books(http_get), '17K完本')
     add_batch(fetch_qidian_rank_books(http_get), '起点榜单')
     if include_douban:
-        add_batch(fetch_douban_books(http_get), '豆瓣网文tag')
-    return _resolve_candidates(candidates, http_get)
+        add_batch(fetch_douban_books(http_get, pages=pages), '豆瓣网文tag')
+    return _resolve_candidates(candidates, http_get, skip_titles=skip_titles)

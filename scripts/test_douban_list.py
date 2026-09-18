@@ -12,10 +12,13 @@
   误匹配样本（间客→天上有间客栈、斗破苍穹→一切从斗破苍穹开始、
   遮天→穿越从遮天开始）是 phoenix 上真跑出来的。
 """
+import json
 import os
 import sys
+import tempfile
 import unittest
 import urllib.parse
+from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -286,7 +289,7 @@ class TestDoubanPagination(unittest.TestCase):
                     counter += 1
                 pages[douban_list._douban_tag_url(tag, p)] = douban_page_html(titles, p * 20)
         http_get = self._recording_get(pages)
-        books = douban_list.fetch_douban_books(http_get)
+        books = douban_list.fetch_douban_books(http_get, pages=3)
         self.assertEqual(len(books), len(douban_list.DOUBAN_TAGS) * 3 * 3)
         first_tag_quoted = urllib.parse.quote(douban_list.DOUBAN_TAGS[0])
         tag_urls = [u for u in self.urls if first_tag_quoted in u]
@@ -297,7 +300,7 @@ class TestDoubanPagination(unittest.TestCase):
     def test_pages_are_deduplicated_within_a_tag(self):
         same = douban_page_html(['重复书', '独有书'], 0)
         pages = {douban_list._douban_tag_url('网络小说', p): same for p in range(3)}
-        books = douban_list.fetch_douban_books(self._recording_get(pages))
+        books = douban_list.fetch_douban_books(self._recording_get(pages), pages=3)
         self.assertEqual([b['title'] for b in books], ['重复书', '独有书'])
 
     def test_single_page_failure_does_not_drop_the_others(self):
@@ -306,17 +309,107 @@ class TestDoubanPagination(unittest.TestCase):
                 raise ConnectionError('豆瓣第二页超时')
             return douban_page_html(['甲书', '乙书'], 0)
 
-        books = douban_list.fetch_douban_books(http_get)
+        books = douban_list.fetch_douban_books(http_get, pages=3)
         self.assertEqual(len(books), 2)          # 失败页被跳过，其余页照常
 
-    def test_pages_per_tag_is_configurable(self):
-        self.assertEqual(douban_list.DOUBAN_PAGES, 3)
-        with mock.patch.object(douban_list, 'DOUBAN_PAGES', 1):
+    def test_default_is_one_page_and_pages_are_configurable(self):
+        self.assertEqual(douban_list.DOUBAN_PAGES, 1)   # 审查 D.3：默认 1 页
+        with mock.patch.object(douban_list, 'DOUBAN_PAGES', 2):
             urls = []
             douban_list.fetch_douban_books(
                 lambda url: urls.append(url) or douban_page_html([], 0))
-            self.assertEqual(len(urls), len(douban_list.DOUBAN_TAGS))
-            self.assertTrue(all('?start=' not in u for u in urls))
+            self.assertEqual(len(urls), len(douban_list.DOUBAN_TAGS) * 2)
+            self.assertTrue(any('?start=20' in u for u in urls))
+
+
+class TestDoubanPagesSwitch(unittest.TestCase):
+    """3 页是显式开关（审查 D.3）：默认 1 页，LABELER_DOUBAN_PAGES 才开。"""
+
+    def setUp(self):
+        no_wait(self)
+
+    def test_default_is_one_page(self):
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(douban_list.DOUBAN_PAGES_ENV, None)
+            self.assertEqual(douban_list.resolve_douban_pages(), 1)
+            self.assertEqual(douban_list.resolve_douban_pages({}), 1)
+
+    def test_env_dict_opens_more_pages(self):
+        # labeler 的 .env 读成字典、不 export 到 os.environ → 必须支持传字典
+        self.assertEqual(
+            douban_list.resolve_douban_pages({douban_list.DOUBAN_PAGES_ENV: '3'}), 3)
+
+    def test_process_env_is_used_when_dict_is_silent(self):
+        with mock.patch.dict(os.environ, {douban_list.DOUBAN_PAGES_ENV: '2'}):
+            self.assertEqual(douban_list.resolve_douban_pages({}), 2)
+
+    def test_invalid_or_non_positive_values_fall_back(self):
+        for value in ('abc', '0', '-1', ''):
+            with self.subTest(value=value):
+                self.assertEqual(
+                    douban_list.resolve_douban_pages(
+                        {douban_list.DOUBAN_PAGES_ENV: value}), 1)
+
+    def test_explicit_pages_argument_wins(self):
+        urls = []
+        douban_list.fetch_douban_books(
+            lambda url: urls.append(url) or douban_page_html([], 0), pages=3)
+        self.assertEqual(len(urls), len(douban_list.DOUBAN_TAGS) * 3)
+
+
+class TestSkipDoneTitles(unittest.TestCase):
+    """搜索前跳过已打标书名（审查 D.3）：这是「跳过已完成」的正确性，不是缓存优化。"""
+
+    def setUp(self):
+        no_wait(self)
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def test_load_done_titles_reads_title_and_site_title(self):
+        path = Path(self.tmp.name) / 'labels.jsonl'
+        path.write_text('\n'.join([
+            json.dumps({'title': '剑来', 'site_title': '剑来'}, ensure_ascii=False),
+            json.dumps({'title': '《雪中悍刀行》', 'site_title': ''}, ensure_ascii=False),
+            '坏行',
+            json.dumps({'title': '', 'site_title': ''}, ensure_ascii=False),
+        ]), encoding='utf-8')
+        self.assertEqual(douban_list.load_done_titles(path),
+                         {'剑来', '雪中悍刀行'})          # 归一化（去书名号）
+        self.assertEqual(douban_list.load_done_titles(Path(self.tmp.name) / 'nope.jsonl'),
+                         set())
+
+    def test_skipped_candidate_is_not_searched(self):
+        seen = []
+
+        def http_get(url):
+            seen.append(url)
+            if url == douban_list.ZHENG_MOBILE + '/complete':
+                return ZHENG_COMPLETE_HTML
+            if url.startswith(douban_list.QIDIAN_MOBILE):
+                return '<html></html>'
+            return NO_RESULT_HTML
+
+        queue = douban_list.build_webnovel_queue(
+            http_get, include_douban=False, skip_titles={'剑来'})
+        self.assertEqual(queue, [])
+        # 「剑来」在候选池里，但已在 labels.jsonl → 连搜索都不发
+        self.assertNotIn('/books/search.html?kw=%E5%89%91%E6%9D%A5', seen)
+        # 未打标的同源候选照常搜索（雪中悍刀行）
+        self.assertIn('/books/search.html?kw=%E9%9B%AA%E4%B8%AD%E6%82%8D%E5%88%80%E8%A1%8C', seen)
+
+    def test_no_skip_set_searches_everything(self):
+        seen = []
+
+        def http_get(url):
+            seen.append(url)
+            if url == douban_list.ZHENG_MOBILE + '/complete':
+                return ZHENG_COMPLETE_HTML
+            if url.startswith(douban_list.QIDIAN_MOBILE):
+                return '<html></html>'
+            return NO_RESULT_HTML
+
+        douban_list.build_webnovel_queue(http_get, include_douban=False)
+        self.assertIn('/books/search.html?kw=%E5%89%91%E6%9D%A5', seen)
 
 
 # ---- 起点移动版页面（2026-09-18 实测结构缩写）----

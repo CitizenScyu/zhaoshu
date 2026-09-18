@@ -305,7 +305,7 @@ class TestWebnovelLimitCut(unittest.TestCase):
         import io
         buf = io.StringIO()
 
-        def fake_build(http_get, skip_titles=None, include_douban=True):
+        def fake_build(http_get, skip_titles=None, include_douban=True, pages=None):
             return list(self.books)
 
         with mock.patch.dict(os.environ, {'LABELER_DATA_DIR': str(self.data_dir)}), \

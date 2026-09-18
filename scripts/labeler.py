@@ -784,8 +784,16 @@ def main() -> int:
             print('拉取名单并搜索 book15...')
             # 桥接：名单源（豆瓣/起点）传完整 URL，book15 搜索侧传站内相对路径。
             bridged = lambda path: http_get(path if path.startswith('http') else BASE + path)
-            all_books = (douban_list.build_douban_queue(bridged) if args.source == 'douban'
-                         else douban_list.build_webnovel_queue(bridged))
+            # 搜索前跳过已打标书名（审查 D.3「收益最大的一刀」）：缓存是优化，
+            # 跳过已完成再搜是正确性——否则扩容后稳态每轮全量空搜。
+            skip_titles = douban_list.load_done_titles(data_path('labels.jsonl'))
+            # 豆瓣翻页默认 1 页；.env 里 LABELER_DOUBAN_PAGES=3 才开 3 页（审查 D.3）。
+            pages = douban_list.resolve_douban_pages(env)
+            all_books = (douban_list.build_douban_queue(
+                             bridged, skip_titles=skip_titles, pages=pages)
+                         if args.source == 'douban'
+                         else douban_list.build_webnovel_queue(
+                             bridged, skip_titles=skip_titles, pages=pages))
             print(f'{args.source} 线共 {len(all_books)} 本（搜索命中后）')
         else:
             print('拉取榜单书目...')
