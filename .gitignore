@@ -56,3 +56,7 @@ next-env.d.ts
 .env.pull
 scripts/backfill.env
 labels.jsonl
+
+# python
+__pycache__/
+*.pyc
