@@ -17,6 +17,7 @@ from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import douban_list  # noqa: E402
 import labeler  # noqa: E402
 
 
@@ -278,6 +279,62 @@ class TestMainDryRun(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertIn('本轮处理 3 本（跳过已完成 1 本（含钉子户 0 本））', out)
         self.assertNotIn('钉子户终态', out)
+
+
+class TestWebnovelLimitCut(unittest.TestCase):
+    """--limit 必须切在「剔除已完成/钉子户之后」（审查 F.1 / 必修 3）。
+
+    扩容后命中数会 > limit：切在前缀会让队尾（豆瓣/17K 尾部）永远进不了视野——
+    每轮只处理前缀 limit 条，做完进 done_urls，之后每轮 queue=[] 却仍全量搜索。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        d = Path(self.tmp.name)
+        (d / '.env').write_text('LLM_API_KEY=test-key-not-real\n', encoding='utf-8')
+        # 命中 150：前 100 已打标，后 50 未完成
+        self.books = [{'url': f'/books/details{i}.html', 'title': f'书{i}'}
+                      for i in range(1, 151)]
+        write_jsonl(d / 'labels.jsonl', [
+            {'url': labeler.BASE + f'/books/details{i}.html',
+             'title': f'书{i}', 'site_title': f'书{i}'} for i in range(1, 101)])
+        self.data_dir = d
+
+    def _run(self, limit):
+        import contextlib
+        import io
+        buf = io.StringIO()
+
+        def fake_build(http_get, skip_titles=None, include_douban=True):
+            return list(self.books)
+
+        with mock.patch.dict(os.environ, {'LABELER_DATA_DIR': str(self.data_dir)}), \
+                mock.patch.object(douban_list, 'build_webnovel_queue', side_effect=fake_build), \
+                mock.patch.object(sys, 'argv', ['labeler.py', '--source', 'webnovel',
+                                                '--limit', str(limit), '--dry-run',
+                                                '--no-db-model']), \
+                contextlib.redirect_stdout(buf):
+            rc = labeler.main()
+        return rc, buf.getvalue()
+
+    def test_limit_applies_after_done_filtering(self):
+        rc, out = self._run(100)
+        self.assertEqual(rc, 0)
+        self.assertIn('本轮处理 50 本', out)          # 切在 split_queue 之后
+        self.assertIn('跳过已完成 100 本', out)
+        self.assertIn(' - 书101', out)                # 队尾的未完成书真的进队列
+        self.assertIn(' - 书150', out)
+        self.assertNotIn(' - 书1 ', out)              # 已完成的 1..100 不进本轮
+        self.assertNotIn(' - 书99', out)
+
+    def test_limit_still_caps_the_unfinished_queue(self):
+        # limit 的作用仍在：未完成 50 本、limit 10 → 只取前 10 本未完成的
+        rc, out = self._run(10)
+        self.assertEqual(rc, 0)
+        self.assertIn('本轮处理 10 本', out)
+        self.assertIn(' - 书101', out)
+        self.assertIn(' - 书110', out)
+        self.assertNotIn(' - 书111', out)
 
 
 if __name__ == '__main__':

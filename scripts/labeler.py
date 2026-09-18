@@ -791,8 +791,12 @@ def main() -> int:
             print('拉取榜单书目...')
             all_books = fetch_rank_books()
             print(f'榜单共 {len(all_books)} 本（去重后）')
-        candidates = all_books[:args.limit]
-        queue, skipped_done, skipped_pinned = split_queue(candidates, done_urls, pinned)
+        # --limit 切在 split_queue **之后**（审查 F.1）：命中数一旦 > limit，切在前缀会
+        # 让队尾（多半是豆瓣/17K 尾部）永远进不了视野——每轮只处理前 limit 条，做完进
+        # done_urls，之后每轮 queue=[] 却仍全量搜索。先剔除已完成/钉子户再取上限，
+        # 语义 = 「本轮最多打 limit 本**未完成**的书」。
+        queue, skipped_done, skipped_pinned = split_queue(all_books, done_urls, pinned)
+        queue = queue[:args.limit]
         # X = 本轮跳过总数（已完成 + 钉子户终态，互斥不重叠），Y = 其中因钉子户终态跳过的。
         print(f'本轮处理 {len(queue)} 本（跳过已完成 {len(skipped_done) + len(skipped_pinned)} 本'
               f'（含钉子户 {len(skipped_pinned)} 本））')
