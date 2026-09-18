@@ -223,8 +223,14 @@ describe('evaluate：失败隔离（§3.4）', () => {
     expect(evaluateFieldSafe('ruleSearch.wordCount', broken(), $)).toBe('');
   });
 
-  it('CORE_FIELDS 为 survey 的 13 字段（与滤网 1 同口径）', () => {
-    expect([...CORE_FIELDS].sort()).toEqual([
+  it('T7 组合规则（&& / %%）：M1 未实现 → RULE_EVAL_FAILED，不静默返回错值', () => {
+    const withJoin: FieldIr = { rules: [{ kind: 'text', literal: 'x' }], joins: [''] };
+    const withConcat: FieldIr = { rules: [{ kind: 'text', literal: 'x' }], concats: ' ' };
+    expect(() => evaluateField(withJoin, synthScope())).toThrow(RuleEngineError);
+    expect(() => evaluateField(withConcat, synthScope())).toThrow(RuleEngineError);
+  });
+
+  it('CORE_FIELDS 为 survey 的 13 字段（与滤网 1 同口径）', () => {    expect([...CORE_FIELDS].sort()).toEqual([
       'ruleBookInfo.author', 'ruleBookInfo.name', 'ruleBookInfo.tocUrl',
       'ruleContent.content', 'ruleContent.nextContentUrl',
       'ruleSearch.author', 'ruleSearch.bookList', 'ruleSearch.bookUrl', 'ruleSearch.name',

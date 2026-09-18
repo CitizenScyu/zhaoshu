@@ -112,6 +112,10 @@ function jsonValuesToString(values: unknown[]): string {
  * 空字符串 = 未命中（上层按「字段缺失降级」处理，§7.2）。
  */
 export function evaluateField(field: FieldIr, scope: EvalScope): string {
+  if (field.joins !== undefined || field.concats !== undefined) {
+    // T7 构件（&& 连接符 / %% 拼接）：M1 未实现，宁可失败也不要静默返回错的字符串。
+    return evalFailed('M1 不支持 && / %% 组合规则（T7）');
+  }
   let value = '';
   for (const ir of field.rules) {
     const result = evaluateRule(ir, scope);
