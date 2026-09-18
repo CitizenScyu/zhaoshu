@@ -112,6 +112,8 @@ describe('GET /api/library', () => {
     expect((await res.json()).books[0].readTaskId).toBe(90);
     expect(listQuery()?.text).toContain('download_tasks');
     expect(listQuery()?.text).toContain("dt.status = 'done'");
+    // F03：partial（残缺终态）永不可读，定位子查询不得把它当成完成文件
+    expect(listQuery()?.text).not.toContain('partial');
   });
 
   it.each(['', '0', '-1', '1.5', '1.0', 'Infinity', 'NaN', '1e3', '0x10', ' 1', '10001', '9007199254740992'])('rejects page %s before touching the database', async (page) => {
