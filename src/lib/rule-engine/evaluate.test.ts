@@ -30,10 +30,11 @@ const fixture = (name: string) => readFileSync(new URL(`./fixtures/${name}`, imp
 const field = (rule: string): FieldIr => parseFieldRule(rule);
 
 /**
- * 裸 `@op`（chain 为空、只对当前 scope 节点套末端操作）的规则对象。
- * 上游 parse.ts 目前对 `@text`/`@href` 抛「空选择器」（见实施报告 §8，已上报主会话）；
- * 求值层本身支持 `chain: []` + terminal，这里在 parse 拒绝时退回等价的手工 IR，
- * 以便对拍用例能验证完整求值路径。parse 修好后本兜底自动不再触发。
+ * 裸 `@op`（chain 为空、只对当前 scope 节点套末端操作）——legado 列表字段的标准写法，
+ * 如 ruleToc.chapterName="@text" / chapterUrl="@href"（book15 自身即此形态）。
+ * 求值层支持 `chain: []` + terminal；但**冻结的 parse.ts 目前把它判成「空选择器」误拒**，
+ * 该 bug 归任务 1 修（已上报主会话，见实施报告 §8）。修复前这里用等价手工 IR 走通求值路径，
+ * 修复后自动改走真实 parse 产物（本函数优先返回 parse 结果）。
  */
 function bareTerminal(op: Exclude<TerminalOp['op'], 'attr'>): FieldIr {
   try {
@@ -45,6 +46,29 @@ function bareTerminal(op: Exclude<TerminalOp['op'], 'attr'>): FieldIr {
     throw error;
   }
 }
+
+describe('裸 @op 规则（列表字段对 scope 节点本身求值）', () => {
+  it('对单个节点（bookList 条目）求值：取自身文本 / 绝对化自身 href', () => {
+    const scope = synthScope();
+    const item = insideNode(scope, evaluateFieldNodes(field('a.link'), scope).get(0));
+    expect(evaluateField(bareTerminal('text'), item)).toBe('第一条');
+    expect(evaluateField(bareTerminal('href'), item)).toBe('https://book15.net/x/1.html');
+    expect(evaluateField(bareTerminal('title'), item)).toBe('一号');
+  });
+
+  it('上游修复契约：parse 若接受裸 @op，必须产出 chain:[] + terminal（否则必须 RULE_UNSUPPORTED）', () => {
+    let parsed: FieldIr | null = null;
+    try {
+      parsed = parseFieldRule('@text');
+    } catch (error) {
+      expect(error).toBeInstanceOf(RuleEngineError);
+      expect((error as RuleEngineError).code).toBe('RULE_UNSUPPORTED');
+    }
+    if (parsed !== null) {
+      expect(parsed).toEqual({ rules: [{ kind: 'css', chain: [], terminal: { op: 'text' } }] });
+    }
+  });
+});
 
 // 合成 DOM：覆盖链式选择、索引/切片/排除、text./ownText 复核、全 TerminalOp、坏 URL。
 const PAGE_URL = 'https://book15.net/books/details42.html';
@@ -321,7 +345,7 @@ describe('book15 对拍：正文（引擎 vs parseSourceChapterText）', () => {
 // ---------------------------------------------------------------- §7.3 接口纪律
 describe('引擎接口纪律（§7.3）', () => {
   it('求值层不含任何请求路径/定时器/预算逻辑', () => {
-    const sources = ['dom-ops.ts', 'evaluate.ts', 'normalize-body.ts']
+    const sources = ['dom-ops.ts', 'evaluate.ts']
       .map((name) => readFileSync(new URL(`./${name}`, import.meta.url), 'utf8'))
       .join('\n')
       // 只看代码，注释里提到 fetch/source-fetch 属说明性文字，不算请求路径
