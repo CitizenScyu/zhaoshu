@@ -1,7 +1,10 @@
 import { getSql } from '@/lib/db';
 import { isRecord } from '@/lib/sanitize';
 import { createDeadline, raceDeadline, type RequestDeadline } from '@/lib/deadline';
-import { validateSourceUrl } from '@/lib/source-policy';
+import { validateSourceUrl, refreshSupportedHosts } from '@/lib/source-policy';
+import {
+  builtinFallbackSource, builtinUrlPrefixes, engineHosts, type SupportedSourceTier,
+} from '@/lib/supported-sources';
 import {
   ADMISSION_MIN_BUDGET_MS, ADMISSION_TIMEOUT_MS, defaultAdmissionTransport, runAdmissionBatch,
   type AdmissionCandidate, type AdmissionSourceRow,
@@ -103,27 +106,90 @@ export interface ReadingSource {
   name: string;
   searchUrl: unknown;
   rules: Record<string, unknown>;
+  /** 注册表档位：builtin=book15 内建适配器；M1/T7=引擎解释（source-reader 分派依据）。 */
+  tier?: SupportedSourceTier;
 }
 
-/** On-demand searches may check unprobed/pending sources, without calling them reachable. */
+/**
+ * 取书源池：注册表合成视图（设计 §5.2/§5.3）。builtin 恒在前（book15 零回归红线），
+ * 引擎源（admission ok ∧ 非 disabled ∧ probe 非 failed）按 probe reachable 优先排序。
+ * slice 上限保留待 M2 放量（M2-3 用 READING_POOL_LIMIT / READING_ENGINE_SOURCES 开关）。
+ */
 export async function getReadingSources(signal: AbortSignal): Promise<ReadingSource[]> {
   const s = getSql();
   const { states } = readMeta((await storedMeta(s, signal)).collections);
+  const builtin = await builtinReadingSources(s, states, signal);
+  const engine = await engineReadingSources(s, states, signal);
+  return [...builtin, ...engine].slice(0, READING_POOL_LIMIT);
+}
+
+const READING_POOL_LIMIT = 4;
+
+/** 内建（builtin）档条目：改查注册表内建 URL 前缀，不再硬编码 ILIKE 字面量。 */
+async function builtinReadingSources(
+  s: Sql, states: Map<string, ProbeState>, signal: AbortSignal,
+): Promise<ReadingSource[]> {
+  const patterns = builtinUrlPrefixes().map((prefix) => `${prefix}%`);
   const rows = await readRows<StoredSource & { name: string }>(s, s`
     SELECT source_url, name, source, disabled_at::text AS disabled_at, last_error
-    FROM shuyuan_sources WHERE source_url ILIKE 'https://book15.net%' ORDER BY source_url`, signal);
+    FROM shuyuan_sources
+    WHERE EXISTS (
+      SELECT 1 FROM jsonb_array_elements_text(${JSON.stringify(patterns)}::jsonb) AS p(pattern)
+      WHERE source_url ILIKE p.pattern)
+    ORDER BY source_url`, signal);
   const supported = rows.filter((row) => canProbe(row.source_url));
-  const defaultSearch = 'https://book15.net/books/search.html?kw={{key}}';
+  const fallback = builtinFallbackSource();
   // The same built-in adapter as the download worker, only when the collection
   // has no record for this host. A disabled/failed record must never be bypassed.
-  if (!supported.length) return [{ url: 'https://book15.net/', name: 'book15.net', searchUrl: defaultSearch, rules: {} }];
+  if (!supported.length) {
+    return [{ url: fallback.url, name: fallback.name, searchUrl: fallback.searchUrl, rules: {}, tier: 'builtin' }];
+  }
   return supported.filter((row) => !row.disabled_at && isRecord(row.source) && row.source.enabled !== false && states.get(row.source_url)?.status !== 'failed')
     .sort((a, b) => Number(states.get(b.source_url)?.status === 'reachable') - Number(states.get(a.source_url)?.status === 'reachable'))
-    .slice(0, 4)
+    .slice(0, READING_POOL_LIMIT)
     .map((row) => ({
-      url: validateSourceUrl(row.source_url).href, name: row.name.slice(0, 200) || 'book15.net',
-      searchUrl: row.source.searchUrl ?? defaultSearch, rules: row.source,
+      url: validateSourceUrl(row.source_url).href, name: row.name.slice(0, 200) || fallback.name,
+      searchUrl: row.source.searchUrl ?? fallback.searchUrl, rules: row.source, tier: 'builtin' as const,
     }));
+}
+
+/**
+ * 引擎档条目（设计 §5.2）：shuyuan_sources JOIN source_admission，admission ok（compile_ok ∧
+ * search_ok IS TRUE）∧ 非 disabled ∧ probe 非 failed；rules 原样透传 source 对象（m2-scaleout
+ * §5.2 第 1 条：任何裁剪都会让 revision 漂移、目录缓存全体失效）。
+ */
+async function engineReadingSources(
+  s: Sql, states: Map<string, ProbeState>, signal: AbortSignal,
+): Promise<ReadingSource[]> {
+  const rows = await readRows<StoredSource & { name: string; tier: string }>(s, s`
+    SELECT src.source_url, src.name, src.source, src.disabled_at::text AS disabled_at, src.last_error, a.tier
+    FROM shuyuan_sources src
+    JOIN source_admission a ON a.source_url = src.source_url
+    WHERE a.compile_ok AND a.search_ok IS TRUE
+    ORDER BY src.source_url`, signal);
+  return rows
+    .filter((row) => canProbe(row.source_url) && !row.disabled_at && isRecord(row.source)
+      && row.source.enabled !== false && states.get(row.source_url)?.status !== 'failed')
+    .sort((a, b) => Number(states.get(b.source_url)?.status === 'reachable') - Number(states.get(a.source_url)?.status === 'reachable')
+      || a.source_url.localeCompare(b.source_url))
+    .map((row) => ({
+      url: validateSourceUrl(row.source_url).href,
+      name: row.name.slice(0, 200) || hostOfUrl(row.source_url),
+      searchUrl: typeof row.source.searchUrl === 'string' ? row.source.searchUrl : '',
+      rules: row.source,
+      tier: (row.tier === 'T7' ? 'T7' : 'M1') as SupportedSourceTier,
+    }));
+}
+
+function hostOfUrl(url: string): string {
+  try { return new URL(url).hostname; } catch { return ''; }
+}
+
+/** 引擎档候选（设计 §5.2 的新增导出；M2-3 的放量/排序在此扩面）。 */
+export async function getEngineSources(signal: AbortSignal): Promise<ReadingSource[]> {
+  const s = getSql();
+  const { states } = readMeta((await storedMeta(s, signal)).collections);
+  return engineReadingSources(s, states, signal);
 }
 
 function canProbe(url: string): boolean {
@@ -588,6 +654,17 @@ async function runAdmissionAfterRefresh(
     if (signal.aborted) return;
     console.error('shuyuan admission batch failed', {
       candidates: candidates.length,
+      reason: error instanceof Error ? error.message : String(error),
+    });
+    return;
+  }
+  // host 集合动态化（设计 §6.1）：准入写库后重算 ok 态 host 并入运行时门；
+  // DB 失败/预算中止 → 保持既有集合（fail-closed：收窄到内建，绝不放大）。
+  try {
+    refreshSupportedHosts(await engineHosts(signal));
+  } catch (error) {
+    if (signal.aborted) return;
+    console.error('shuyuan supported host refresh failed', {
       reason: error instanceof Error ? error.message : String(error),
     });
   }
