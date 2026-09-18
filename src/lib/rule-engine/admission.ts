@@ -316,18 +316,26 @@ export async function searchAdmission(source: RawSource, options: {
     return { verdict: 'conn_fail', candidateCount: 0, error: errorMessage(error) };
   }
   const low = response.text.toLowerCase();
-  const marker = STRONG_CHALLENGE_MARKERS.find((item) => low.includes(item));
-  if (response.status === 403 || response.status === 503 || marker !== undefined) {
-    return { verdict: 'challenge', candidateCount: 0, status: response.status, error: marker ?? String(response.status) };
+  // 判定顺序（P1-2 裁定）：403/503 与 5xx/4xx 状态先判，**候选计数先于强标记**。
+  // 反例教训：200 正常搜索页页脚含「安全验证/enable javascript/人机验证」时，若标记先判
+  // 会把它误判成 challenge（rejected 终态、24h 不重测）；probe-reachability.py 只是一次性
+  // 探测，准入把它升级成了永久拒。故「有 ≥1 候选的正常页一律 ok」，墙只在 403/503 或
+  // 「0 候选 + 强标记」成立。弱标记 cloudflare 仍不判墙。
+  if (response.status === 403 || response.status === 503) {
+    return { verdict: 'challenge', candidateCount: 0, status: response.status, error: String(response.status) };
   }
   if (response.status >= 500) return { verdict: 'http_5xx', candidateCount: 0, status: response.status, error: String(response.status) };
   if (response.status >= 400) return { verdict: 'http_4xx', candidateCount: 0, status: response.status, error: String(response.status) };
+  const candidateCount = countSearchCandidates(source, response.text, response.url);
+  if (candidateCount >= 1) return { verdict: 'ok', candidateCount, status: response.status, error: '' };
+  const marker = STRONG_CHALLENGE_MARKERS.find((item) => low.includes(item));
+  if (marker !== undefined) {
+    return { verdict: 'challenge', candidateCount: 0, status: response.status, error: marker };
+  }
   if (response.text.length < 3000 && (low.match(/<script/g)?.length ?? 0) >= 2 &&
       !low.includes('<h') && !low.includes('book') && !low.includes('novel')) {
     return { verdict: 'shell', candidateCount: 0, status: response.status, error: `len=${response.text.length}` };
   }
-  const candidateCount = countSearchCandidates(source, response.text, response.url);
-  if (candidateCount >= 1) return { verdict: 'ok', candidateCount, status: response.status, error: '' };
   return { verdict: 'no_result', candidateCount: 0, status: response.status, error: 'bookList 未解析出候选' };
 }
 

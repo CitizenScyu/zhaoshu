@@ -106,6 +106,62 @@ describe('滤网 2 searchAdmission 判定分桶', () => {
     expect(strongResult.verdict).toBe('challenge');
   });
 
+  // P1-2（复审裁定）：强标记先判会把正常 200 搜索页判成 challenge 终态（rejected 24h 不重测）。
+  // 判定顺序改为「候选计数先于强标记」——有 ≥1 候选一律 ok，墙只在 403/503 或 0 候选+强标记成立。
+  describe('P1-2 候选计数先于强标记（正常页不得判墙）', () => {
+    const candidateHtml = (footer: string) =>
+      `<html><body><div class="i"><span class="t">书名</span><a href="/b/1">x</a></div>${footer}</body></html>`;
+
+    it.each(['安全验证', 'enable javascript', '人机验证', '请开启 javascript', 'ddos protection by'])(
+      '200 + 合法候选 + 强标记「%s」→ ok（不判墙）', async (marker) => {
+        const fetchPage = vi.fn<AdmissionTransport>().mockResolvedValue(page(candidateHtml(`<footer>${marker}</footer>`)));
+        const result = await searchAdmission(syntheticSource('https://normal.example.com/'), {
+          fetchPage, declaredHosts: declared('normal.example.com'), signal: signal(), throttleMs: 0,
+        });
+        expect(result).toEqual({ verdict: 'ok', candidateCount: 1, status: 200, error: '' });
+        expect(admissionBucket(result.verdict)).toBe('ok');
+      });
+
+    it('200 + 无候选 + 同一批强标记 → challenge（原语义保留，仍不硬刚）', async () => {
+      for (const marker of ['安全验证', 'enable javascript', '人机验证']) {
+        const fetchPage = vi.fn<AdmissionTransport>().mockResolvedValue(page(`<html><body>${marker}</body></html>`));
+        const result = await searchAdmission(syntheticSource('https://wall.example.com/'), {
+          fetchPage, declaredHosts: declared('wall.example.com'), signal: signal(), throttleMs: 0,
+        });
+        expect(result.verdict, marker).toBe('challenge');
+        expect(admissionBucket(result.verdict)).toBe('rejected');
+      }
+    });
+
+    it('200 + 候选 + 弱标记 cloudflare → ok（回归）', async () => {
+      const fetchPage = vi.fn<AdmissionTransport>().mockResolvedValue(page(candidateHtml('<footer>cloudflare</footer>')));
+      const result = await searchAdmission(syntheticSource('https://cdn.example.com/'), {
+        fetchPage, declaredHosts: declared('cdn.example.com'), signal: signal(), throttleMs: 0,
+      });
+      expect(result.verdict).toBe('ok');
+    });
+
+    it('403/503 → challenge，不论有无候选（回归）', async () => {
+      for (const status of [403, 503]) {
+        for (const body of [candidateHtml(''), '<html><body>no results</body></html>']) {
+          const fetchPage = vi.fn<AdmissionTransport>().mockResolvedValue(page(body, status));
+          const result = await searchAdmission(syntheticSource('https://wall.example.com/'), {
+            fetchPage, declaredHosts: declared('wall.example.com'), signal: signal(), throttleMs: 0,
+          });
+          expect(result.verdict, `${status} ${body.length}`).toBe('challenge');
+        }
+      }
+    });
+
+    it('200 + 无候选 + 无标记 → no_result（deferred，未受重排影响）', async () => {
+      const fetchPage = vi.fn<AdmissionTransport>().mockResolvedValue(page('<html><body>no results</body></html>'));
+      const result = await searchAdmission(syntheticSource('https://empty.example.com/'), {
+        fetchPage, declaredHosts: declared('empty.example.com'), signal: signal(), throttleMs: 0,
+      });
+      expect(result).toEqual({ verdict: 'no_result', candidateCount: 0, status: 200, error: 'bookList 未解析出候选' });
+    });
+  });
+
   it('网络层失败 → conn_fail（rejected）；500 → http_5xx（deferred）', async () => {
     const down = vi.fn<AdmissionTransport>().mockRejectedValue(new TypeError('fetch failed'));
     const downResult = await searchAdmission(syntheticSource('https://down.example.com/'), {
