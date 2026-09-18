@@ -604,6 +604,48 @@ describe('refreshShuyuan atomic refresh', () => {
       }]);
     });
 
+    it('阈值差一次时探测失败仍不判死：第二次失败只把计数加到 2，第三次才写 failed', async () => {
+      setCollection(11, [knownSource]);
+      responses.set('https://book15.net/', { body: 'unavailable', status: 503 });
+      seedPrevious([storedKnown('历史连接超时')], [entry({ status: 'unprobed', checked_at: null, consecutive_failures: 1 })]);
+
+      await refreshShuyuan();
+
+      const afterSecond = savedStates()[0];
+      expect(afterSecond).toEqual({
+        url: knownSource.bookSourceUrl, status: 'unprobed', checked_at: null, error: null, consecutive_failures: 2,
+      });
+      // 差一次就到阈值时最容易提前判死：status 必须仍是 unprobed。
+      expect(afterSecond.status).not.toBe('failed');
+
+      // 第三轮：把上一轮写出的快照原样喂回去，只有这一次才允许判死。
+      transaction.mockClear();
+      seedPrevious([storedKnown('历史连接超时')], [afterSecond]);
+      await refreshShuyuan();
+
+      expect(savedStates()).toEqual([{
+        url: knownSource.bookSourceUrl, status: 'failed', checked_at: expect.any(String),
+        error: expect.stringContaining('https://book15.net/'), consecutive_failures: 3,
+      }]);
+    });
+
+    it('已知失败源排在补探的未探测源之前', async () => {
+      const freshSource = { ...knownSource, bookSourceUrl: 'https://book15.net/fresh', bookSourceName: '全新源' };
+      setCollection(11, [knownSource, freshSource]);
+      seedPrevious([storedKnown('历史连接超时')]);
+      responses.set('https://book15.net/', { body: 'unavailable', status: 503 });
+      responses.set('https://book15.net/fresh', { body: 'unavailable', status: 503 });
+
+      await refreshShuyuan();
+
+      // 前 4 次是 index + 3 个合集。探测按 probes 数组顺序下发（并发窗口内也保序），
+      // 带 last_error 的已知失败源必须先于「没有任何结论」的补探源，补探不能插到队首。
+      expect(probedUrls()).toEqual([
+        indexUrl, collectionUrl(11), collectionUrl(12), collectionUrl(13),
+        'https://book15.net/', 'https://book15.net/fresh',
+      ]);
+    });
+
     it('探测成功把连续失败计数清零并回到可达', async () => {
       setCollection(11, [knownSource]);
       seedPrevious([storedKnown('历史连接超时')], [entry({ status: 'unprobed', checked_at: null, consecutive_failures: 2 })]);

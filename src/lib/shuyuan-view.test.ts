@@ -197,7 +197,8 @@ describe('participationHint 标注「已启用但探测失败」', () => {
     const source = { disabled: false, availability: 'failed' as const };
     expect(participatesInSearch(source)).toBe(false);
     expect(participationHint(source)).toContain('已启用');
-    expect(participationHint(source)).toContain('探测失败');
+    // 判死口径是「连续探测失败达阈值」，不是「最近一次失败」——单次抖动不会走到 failed。
+    expect(participationHint(source)).toContain('连续探测失败');
   });
 
   it('已禁用时提示禁用，且禁用优先于探测失败', () => {
