@@ -48,6 +48,13 @@ export type ShuyuanCounts = {
   reachable: number;
   failed: number;
 };
+// B3（audit-1 P0-2）：源池可观测。readingPoolSize = getReadingSources 实际取书池大小
+// （不是「启用数」——995 enabled / 0 可达的假象正是这次审计要暴露的）；
+// refreshedAtAgeHours = 刷新停更了多久，null 表示从未成功刷新。
+export type ShuyuanPoolHealth = {
+  readingPoolSize: number;
+  refreshedAtAgeHours: number | null;
+};
 export type ShuyuanSourceStatus = {
   url: string; name: string; disabled: boolean; availability: ShuyuanAvailability;
   lastError: string; checkedAt: string | null; probeError: string | null;
@@ -263,6 +270,22 @@ export async function getShuyuanCounts(signal?: AbortSignal): Promise<ShuyuanCou
   const s = getSql();
   const meta = readMeta((await storedMeta(s, signal)).collections);
   return countsFromStates(s, meta.states, signal);
+}
+
+// B3：给 /api/stats 的 shuyuan 段补源池健康度。池大小直接走 getReadingSources 的
+// 真实判定（含 canProbe/禁用/failed 剔除），不在这里复刻筛选逻辑——两处逻辑一旦
+// 漂移，监控数字就不再代表实际取书能力。
+export async function getShuyuanPoolHealth(signal: AbortSignal): Promise<ShuyuanPoolHealth> {
+  const s = getSql();
+  const raw = await storedMeta(s, signal);
+  const pool = await getReadingSources(signal);
+  const refreshedMs = raw.refreshed_at ? Date.parse(raw.refreshed_at) : NaN;
+  return {
+    readingPoolSize: pool.length,
+    refreshedAtAgeHours: Number.isFinite(refreshedMs)
+      ? Math.max(0, Math.round((Date.now() - refreshedMs) / 3_600_000 * 10) / 10)
+      : null,
+  };
 }
 
 export async function getShuyuanStats(signal?: AbortSignal): Promise<ShuyuanStats>;

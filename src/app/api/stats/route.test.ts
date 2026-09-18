@@ -2,11 +2,18 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { NextRequest } from 'next/server';
 import { LLM_USAGE_PHASES, type TokenStats } from '@/lib/llm-usage';
 
-const { ensureSchema, getSql, sql, getLlmUsageStats, session } = vi.hoisted(() => ({
+const { ensureSchema, getSql, sql, getLlmUsageStats, session, pool } = vi.hoisted(() => ({
   ensureSchema: vi.fn(), getSql: vi.fn(), sql: vi.fn(), getLlmUsageStats: vi.fn(), session: vi.fn(),
+  // B3：池健康度（getShuyuanPoolHealth → getReadingSources）不触 SQL mock 之外的路径，
+  // 直接替换为固定值；测试需要控制 readingPoolSize/refreshedAtAgeHours 时再覆写。
+  pool: { readingPoolSize: 1, refreshedAtAgeHours: 72.5 },
 }));
 vi.mock('@/lib/db', () => ({ ensureSchema, getSql, getLlmUsageStats }));
 vi.mock('@/lib/auth-session', async (original) => ({ ...await original<typeof import('@/lib/auth-session')>(), findSessionByToken: session }));
+vi.mock('@/lib/shuyuan', async (original) => ({
+  ...await original<typeof import('@/lib/shuyuan')>(),
+  getShuyuanPoolHealth: vi.fn(async () => pool),
+}));
 import { GET } from './route';
 
 const zero = { prompt: 0, completion: 0, total: 0, cache: 0, calls: 0, missingUsageCalls: 0 };
@@ -115,7 +122,7 @@ describe('GET /api/stats', () => {
       library: { total: 12, withQuality: 10, avgQuality: 8.2, charsLabeled: 360000, genres: [{ name: '仙侠', count: 12 }] },
       download: downloadStats,
       find: { queries: 4, recommendations: 6 }, shelf: { statuses: [{ name: 'want', count: 6 }] },
-      shuyuan: sourceCounts, tokens,
+      shuyuan: { ...sourceCounts, ...pool }, tokens,
       availability: { library: true, download: true, find: true, shelf: true, shuyuan: true, tokens: true },
     });
     const findQuery = sql.mock.calls.find(([strings]) => (strings as TemplateStringsArray).join('').includes('count(DISTINCT query)'));
@@ -129,12 +136,15 @@ describe('GET /api/stats', () => {
     const res = await GET(request());
     expect(res.status).toBe(200);
     // 合批专属断言：库段只发一次事务；摘掉任一条只会让批内语句数变少（变异自测见回报）。
-    expect(batches).toHaveLength(1);
-    expect(batches[0].result).toBe('ok');
-    expect(batches[0].options).toEqual({ readOnly: true });
-    expect(batches[0].texts).toHaveLength(2);
-    expect(batches[0].texts[0]).toContain('count(quality)');
-    expect(batches[0].texts[1]).toContain('AS genre');
+    // shuyuan 段（counts+meta）与 download 段也各走一次事务（B3 起 shuyuan 增加了
+    // meta 往返）；这里锁的是「库段本身只有一批且语句恰好两条」。
+    const libraryBatch = batches.find((batch) => batch.texts.some((text) => text.includes('count(quality)')));
+    expect(libraryBatch).toBeDefined();
+    expect(libraryBatch!.result).toBe('ok');
+    expect(libraryBatch!.options).toEqual({ readOnly: true });
+    expect(libraryBatch!.texts).toHaveLength(2);
+    expect(libraryBatch!.texts[0]).toContain('count(quality)');
+    expect(libraryBatch!.texts[1]).toContain('AS genre');
     // 合批没有把别的容错段卷进来：下载段仍是自己的一次独立往返（单段失败不连坐）。
     const downloadCalls = sql.mock.calls.filter(([parts]) => (parts as TemplateStringsArray).join('').includes('FROM download_tasks'));
     expect(downloadCalls).toHaveLength(1);
@@ -148,7 +158,7 @@ describe('GET /api/stats', () => {
       ...ownerMetadata, sectionStates: readyStates,
       library: { total: 0, withQuality: 0, avgQuality: null, charsLabeled: 0, genres: [] },
       download: emptyDownloadStats, find: { queries: 0, recommendations: 0 },
-      shelf: { statuses: [] }, shuyuan: emptySourceCounts, tokens: emptyTokens,
+      shelf: { statuses: [] }, shuyuan: { ...emptySourceCounts, ...pool }, tokens: emptyTokens,
       availability: { library: true, download: true, find: true, shelf: true, shuyuan: true, tokens: true },
     });
   });
@@ -173,12 +183,25 @@ describe('GET /api/stats', () => {
 
   it('启用数量与探测可达数量独立，active 只计启用且真实可达', async () => {
     const data = await (await GET(request())).json();
-    expect(data.shuyuan).toEqual(sourceCounts);
+    expect(data.shuyuan).toEqual({ ...sourceCounts, ...pool });
     expect(data.shuyuan.active).not.toBe(data.shuyuan.enabled);
     const query = sql.mock.calls.find(([strings]) => (strings as TemplateStringsArray).join('').includes('FROM shuyuan_sources'));
     expect((query![0] as TemplateStringsArray).join('')).toContain("disabled_at IS NULL AND p.status = 'reachable'");
     expect((query![0] as TemplateStringsArray).join('')).toContain('AS unprobed');
     expect((query![0] as TemplateStringsArray).join('')).toContain('AS pending');
+  });
+
+  it('B3：shuyuan 段带 readingPoolSize 与 refreshedAtAgeHours，池健康独立于计数', async () => {
+    // 995 enabled / 0 可达的假象正是这次要暴露的：池大小必须独立可见。
+    pool.readingPoolSize = 0; pool.refreshedAtAgeHours = 74.2;
+    const data = await (await GET(request())).json();
+    expect(data.shuyuan).toMatchObject({ enabled: 8, readingPoolSize: 0, refreshedAtAgeHours: 74.2 });
+    // 池查询失败不连坐计数段：pool 拒绝时 counts 仍在，shuyuan 段整体降级。
+    const { getShuyuanPoolHealth } = await import('@/lib/shuyuan');
+    (getShuyuanPoolHealth as ReturnType<typeof vi.fn>).mockRejectedValueOnce(new Error('pool down'));
+    const degraded = await (await GET(request())).json();
+    expect(degraded.shuyuan).toBeNull();
+    expect(degraded.availability.shuyuan).toBe(false);
   });
 
   it.each(['schema', 'client', 'all queries'])('returns controlled 503 for failed %s', async (stage) => {

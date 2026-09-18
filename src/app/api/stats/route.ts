@@ -4,7 +4,7 @@ import { hasPermission } from '@/lib/permissions';
 import { downloadStatsForUserQuery, findStatsForUserQuery, shelfStatsForUserQuery } from '@/lib/user-data';
 import { ensureSchema, getLlmUsageStats, getSql } from '@/lib/db';
 import type { TokenStats } from '@/lib/llm-usage';
-import { getShuyuanCounts, type ShuyuanCounts } from '@/lib/shuyuan';
+import { getShuyuanCounts, getShuyuanPoolHealth, type ShuyuanCounts, type ShuyuanPoolHealth } from '@/lib/shuyuan';
 
 // 项目统计：聚合各表数据做「账本/战果」展示。全部用 SQL 聚合，不拉全表。
 // 每组独立容错：真实空数据为 0，查询失败的整个分区为 null。
@@ -37,7 +37,7 @@ export interface StatsResponse {
   shelf: {
     statuses: { name: string; count: number }[];
   } | null;
-  shuyuan: ShuyuanCounts | null;
+  shuyuan: (ShuyuanCounts & ShuyuanPoolHealth) | null;
   tokens: TokenStats | null;
   availability: Record<StatsSection, boolean>;
   error?: string;
@@ -153,7 +153,13 @@ export async function GET(req: NextRequest) {
   }
 
   if (allowedSections.includes('shuyuan')) try {
-    stats.shuyuan = await getShuyuanCounts();
+    // B3：counts 与池健康度并行取——池大小要走 getReadingSources 的真实判定，
+    // 刷新年龄来自同一条 meta 行；两者都只读，合段容错语义不变。
+    const signal = AbortSignal.timeout(10_000);
+    const [counts, pool] = await Promise.all([
+      getShuyuanCounts(signal), getShuyuanPoolHealth(signal),
+    ]);
+    stats.shuyuan = { ...counts, ...pool };
     stats.availability.shuyuan = true;
     stats.sectionStates.shuyuan = 'ok';
   } catch (e) {
