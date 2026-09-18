@@ -648,8 +648,12 @@ def _label_once(user_content: str, api_key: str, models: list[str],
 
 # ---- 入库层 ----
 # 试点期产物为 labels.jsonl（每行一本）；批量入库由本地用项目的
-# @neondatabase/serverless 驱动统一执行（scripts/import_labels.mjs），
-# phoenix 无需任何 PG 依赖。
+# @neondatabase/serverless 驱动统一执行（scripts/import_labels.mjs）。
+# 全自动增量导入（2026-09-19 起）：每标完一本即调 import_one.py 走 Neon 的 HTTPS
+# SQL 接口写库——同样零 PG 依赖（与上面读 label_model 同一通道），
+# 消灭「打标在跑、书库没书」的错位。失败只记 labels-import-fail.log 不阻断打标；
+# 用 labels-imported.jsonl 去重，重复导入同一 url 是 no-op。开关：.env 里
+# LABELER_AUTO_IMPORT=0 可关闭（默认开），LABELER_IMPORT_BACKLOG 调每轮补录上限。
 
 
 def title_matches(guess: str, actual: str) -> bool:
@@ -748,6 +752,23 @@ def main() -> int:
     # 显式把常量传进去（而不是靠默认参数）：默认参数在 def 时就求值了，
     # 读模块常量本意是「改常量即调参/关闸（0 或负数关闭）」，这里保持这个语义。
     pinned = terminal_urls(rejection_counts, REJECT_TERMINAL_THRESHOLD)
+
+    # 自动导入：打标完一本即写库（见文件头「入库层」）。启用与否由 .env 决定；
+    # --book 是人工调试模式（无站点书名、身份证据弱），不进自动导入。
+    importer = None
+    if not args.book:
+        import import_one
+        importer = import_one.AutoImporter.from_env(env, directory=data_dir())
+        print(importer.status_line())
+        if not importer.enabled and args.source in ('douban', 'webnovel'):
+            print(f'  提示: 自动导入未启用（{importer.disabled_reason}），'
+                  f'产物仍只进 labels.jsonl，需人工跑 import_labels.mjs')
+        if not args.dry_run and importer.enabled:
+            # 历史欠账（上次导入失败 / 部署前的存量）自动补录；标记文件保证幂等。
+            limit = int(env.get(import_one.BACKLOG_ENV) or import_one.IMPORT_BACKLOG_DEFAULT)
+            retried = importer.retry_backlog(data_path('labels.jsonl'), limit=limit)
+            if retried:
+                print(f'  自动导入: 补录了 {retried} 本历史欠账')
 
     if args.book:
         queue = [{'url': args.book, 'title': args.book}]
@@ -871,6 +892,21 @@ def main() -> int:
             with open(out_path, 'a', encoding='utf-8') as f:
                 f.write(json.dumps(b_out, ensure_ascii=False) + '\n')
             ok += 1
+            # 即时导入书库。import_record 内部吞掉所有异常并记 fail log，
+            # 这里的 try/except 只是最后一道保险：导入问题绝不能让打标循环中断。
+            if importer is not None and importer.enabled:
+                try:
+                    import_status = importer.import_record(b_out)
+                except Exception as import_error:      # pragma: no cover - 双保险
+                    print(f'  自动导入异常（不阻断打标）: {import_error}', file=sys.stderr)
+                    import_status = 'failed'
+                if import_status == 'imported':
+                    print('  → 已写入书库')
+                elif import_status == 'duplicate':
+                    print('  → 书库已有同书（自动导入 no-op）')
+                elif import_status in ('failed', 'review', 'skipped', 'twin-skipped'):
+                    print(f'  → 未自动入库（{import_status}），详见 labels-import-fail.log / '
+                          f'labels.jsonl')
         except Exception as e:
             print(f'  失败: {e}', file=sys.stderr)
             fail += 1
