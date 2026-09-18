@@ -75,6 +75,13 @@ export default function FeedbackForm({ title, author, status, initialSnapshot, c
       }
       if (!res.ok || data.ok !== true) throw new Error(typeof data.error === 'string' ? data.error : '保存反馈失败');
       onSaved(note, data.profileUpdated === true);
+      // F15：反馈已在服务端落地；画像吸收是独立的长模型调用，不阻塞本次保存的 UI。
+      // 这里后台触发一次（结果若失败会留在队列里，由后续机会/显式重试重放）。
+      if (data.pending === true) {
+        void apiFetch('/api/profile/absorb', {
+          method: 'POST', keepalive: true, headers: { 'Content-Type': 'application/json' }, body: '{}',
+        }).catch(() => {});
+      }
     } catch (error) {
       if (!controller.signal.aborted) setError((error instanceof Error ? error.message : '保存反馈失败') + '，草稿已保留。');
     } finally {
