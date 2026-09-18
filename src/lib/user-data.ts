@@ -242,6 +242,31 @@ export function feedbackForUserQueries(sql: PersonalQuery, userId: number, raw: 
   // scripts/check-feedback-cas.mjs 抽取模板时依赖的字面量，别改。
   const book = identityOf(raw.title, raw.author);
   return [
+    // 路线 B（task-82）：书库的书只在 labeled_books 里，books 没有行——而后 4 条语句全靠
+    // books 定位（feedback.book_id NOT NULL FK→books，写不进去就是 404 BOOK_NOT_FOUND）。
+    // 所以在同一事务最前面补一行 books，后面 4 条语句一个字都不用改，它们会自动找到这行。
+    //
+    // 拼写优先取 labeled_books 那一行（与 addShelfForUserQueries:52 同式，DO NOTHING 是
+    // 同一个 books_identity_idx 唯一索引）；取不到（find-only 的书）才回落客户端归一值，
+    // 与加书架路径一致。这样新建行的身份键 == 书库那一行的身份键，两张表真"对上"。
+    //
+    // 🔴 两条不变量：
+    //   ① 刻意**不建 recommendations 行**：'new' 之外的状态会经 excludedBooksForUserQuery
+    //      把书永久移出召回，只有"真的提交了反馈"才该触发那条排除。这里只补身份行，
+    //      召回排除仍由本函数最后一条 UPDATE（反馈真的写成功时）负责。
+    //   ② 插入的是 btrim 过的拼写，不是 labeled_books 原值：后面 4 条语句比的是
+    //      lower(title) = lower(book.title)（不带 btrim），若把带首尾空格的拼写原样写进
+    //      books，就会"行建出来了却仍定位不到"→ 依旧 404。生产实测首尾空白 0 行，
+    //      这里是把它钉死，不依赖数据恰好干净。
+    sql`INSERT INTO books (title, author, meta)
+      SELECT title, author, '{}'::jsonb FROM (
+        SELECT btrim(title) AS title, btrim(author) AS author, 0 AS pref FROM labeled_books
+         WHERE lower(btrim(title)) = lower(${book.title})
+           AND lower(btrim(author)) = lower(${book.author})
+        UNION ALL
+        SELECT ${book.title}, ${book.author}, 1
+      ) c ORDER BY pref LIMIT 1
+      ON CONFLICT (title_key, author_key) DO NOTHING`,
     sql`SELECT id FROM books WHERE lower(title) = lower(${book.title}) AND lower(author) = lower(${book.author}) FOR UPDATE`,
     sql`SELECT id FROM books WHERE lower(title) = lower(${book.title}) AND lower(author) = lower(${book.author})`,
     sql`SELECT 1 / CASE WHEN COALESCE((

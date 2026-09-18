@@ -49,15 +49,19 @@ export function shouldPromptFeedback({ read, hasFeedback, prompted }: FeedbackPr
  * POST /api/shelf、user-data.ts:191 由 /api/find:280 调用）：`books` 与书库的
  * `labeled_books` 是两张表、彼此不同步——/api/library 读的是 labeled_books
  * （library/route.ts:103/107/113）；而 `/api/feedback` 只认 `books`，定位不到就
- * 404 BOOK_NOT_FOUND（db.ts:205-208）。所以「书库的书也在 books 表里」不成立：
+ * 404 BOOK_NOT_FOUND（db.ts:204-206）。所以「书库的书也在 books 表里」不成立：
  * 从书库直接下载、没跑过 find、也没进书架的书，引导出来也存不下反馈。
  *
  * 判据看 `from` 而不是 `session.kind`：library + taskId 是 download 会话却可能没有
  * books 行，find 是 source 会话却一定有（同一次请求刚落库，user-data.ts:191）——
  * 两者恰好相反，所以会话类型判不出 book 身份。
  *
- * 要让书库的书也能收反馈，得在服务端做（下载时同步 books，或让 feedback 认
- * labeled_books），属 schema/路由语义的改动，不在「只加入口」的范围内。
+ * ✅ 已实施（2026-09-18，task-82 路线 B）：上面那个"服务端存不下"的缺口已经补上——
+ * 写反馈的同一事务会先按身份键 upsert 一行 books（优先取 labeled_books 的拼写，
+ * 见 user-data.ts `feedbackForUserQueries` 数组头部那条 upsert），所以书库的书现在
+ * 存得下反馈（不会再 404）。本函数**仍**不收 `from === 'library'`：那是 c978d86 的
+ * 产品裁决（书库入口不弹引导卡），不再代表服务端能力不足——要不要重开书库入口是
+ * 产品决定，不是这里遗留的欠账。
  */
 export function promptableOrigin(from: ReaderOrigin): boolean {
   // 逐入口列出而不是直接比较：三条入口各自为什么放行/排除，看上面的核实结论。

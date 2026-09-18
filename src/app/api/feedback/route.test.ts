@@ -99,10 +99,11 @@ describe('POST /api/feedback note contract', () => {
   });
 
   it('fails explicitly with BOOK_NOT_FOUND instead of reporting a save that wrote nothing', async () => {
-    // 5 条语句：第 4 条 INSERT ... RETURNING id 表示按 title/author 定位后追加历史。
-    // books 里查不到这本书时它是 0 行——旧行为是 200 + "保存成功"。
+    // 6 条语句：索引 0 是 route B 补 books 行的 upsert，第 5 条（索引 4）
+    // INSERT ... RETURNING id 表示按 title/author 定位后追加历史。
+    // 仍定位不到这本书时它是 0 行——旧行为是 200 + "保存成功"。
     mocks.writeResults = [
-      [{ id: 1 }], [{ id: 1 }], [{ feedback_version_matches: 1 }], [], [],
+      [], [{ id: 1 }], [{ id: 1 }], [{ feedback_version_matches: 1 }], [], [],
     ];
 
     const res = await POST(request('dropped', '题材不合'));
@@ -114,7 +115,7 @@ describe('POST /api/feedback note contract', () => {
 
   it('still records feedback when the INSERT really appended a row', async () => {
     mocks.writeResults = [
-      [{ id: 1 }], [{ id: 1 }], [{ feedback_version_matches: 1 }], [{ id: 7 }], [],
+      [], [{ id: 1 }], [{ id: 1 }], [{ feedback_version_matches: 1 }], [{ id: 7 }], [],
     ];
 
     const res = await POST(request('dropped', '题材不合'));
