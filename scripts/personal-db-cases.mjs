@@ -223,39 +223,56 @@ export async function downloadIsolationCase() {
     await initializeBusinessSchema(sql);
     const shape=await downloadTableShape(sql);
     assert.equal(shape.find((row)=>row.column_name==='user_id')?.not_null,true);checks++;
-    assert.equal((await sql`SELECT count(*)::int AS n FROM pg_indexes WHERE schemaname=current_schema()
-      AND tablename='download_tasks' AND indexname='download_tasks_active_book_idx'`)[0].n,1);checks++;
+    // B2：活动锁改 (user_id, book_id) 后，v5 建的旧全局部索引必须退役、新索引就位。
+    // 只按名字断存在不够——这里连 pg_indexes 的 indexdef 一起核对新定义。
+    const activeIndexes=await sql`SELECT indexname,indexdef FROM pg_indexes WHERE schemaname=current_schema()
+      AND tablename='download_tasks' AND indexname LIKE 'download_tasks_%active_book_idx' ORDER BY indexname`;
+    assert.deepEqual(activeIndexes.map((row)=>row.indexname),['download_tasks_user_active_book_idx']);checks++;
+    assert.match(activeIndexes[0].indexdef,/UNIQUE INDEX.*\(user_id, book_id\)/);
+    assert.match(activeIndexes[0].indexdef,/WHERE.*pending.*running/);checks++;
     await sql`INSERT INTO download_tasks(user_id,book_id,title,author,status) VALUES(1,7,'共享书','谁','pending')`;
     assert.equal((await sql`SELECT count(*)::int AS n FROM download_tasks`)[0].n,1);checks++;
     await initializeAuthSchema(sql);await initializeBusinessSchema(sql);
     assert.equal((await sql`SELECT count(*)::int AS n FROM download_tasks`)[0].n,1);checks++;
   });
-  // 归属与全局去重：跨用户活动任务仍然互斥，终态任务不占锁。
+  // 归属与按用户去重：活动锁粒度是 (user_id, book_id)——跨用户同书 pending 可以并存
+  // （各用户独立入队同一本书），同一用户对同一本书的活动任务仍然互斥；终态任务不占锁。
   await withTestSchema(async(sql)=>{
     await legacyDatabase(sql);await initializeAuthSchema(sql);await initializeBusinessSchema(sql);
     await sql.transaction((tx)=>[
       tx`INSERT INTO users(id,username,password_hash,role) VALUES(2,'dl_member_a','fixture-password-hash','member'),(3,'dl_member_b','fixture-password-hash','member')`,
     ]);
     await sql`INSERT INTO download_tasks(user_id,book_id,title,author,status) VALUES(2,11,'共享书','谁','pending')`;
-    await assert.rejects(sql`INSERT INTO download_tasks(user_id,book_id,title,author,status) VALUES(3,11,'共享书','谁','pending')`,(e)=>e.code==='23505');checks++;
-    assert.deepEqual(await sql`SELECT user_id,status FROM download_tasks WHERE book_id=11`,[{user_id:2,status:'pending'}]);checks++;
-    // 并发入队同一本书只有一个活动任务；另一个必须拿到唯一键冲突而不是第二行。
+    // 跨用户同书：不再 23505，两行并存（B2 语义变更，audit-3 P0-2）。
+    await sql`INSERT INTO download_tasks(user_id,book_id,title,author,status) VALUES(3,11,'共享书','谁','pending')`;
+    assert.deepEqual(await sql`SELECT user_id,status FROM download_tasks WHERE book_id=11 ORDER BY user_id`,
+      [{user_id:2,status:'pending'},{user_id:3,status:'pending'}]);checks++;
+    // 同一用户同一本书才是新索引真正的约束面，仍然必须 23505。
+    await assert.rejects(sql`INSERT INTO download_tasks(user_id,book_id,title,author,status) VALUES(2,11,'重复','谁','pending')`,(e)=>e.code==='23505');checks++;
+    // 并发入队：同一用户同一本书只有一个活动任务，另一个拿到唯一键冲突而不是第二行。
     const race=await Promise.allSettled([
       sql`INSERT INTO download_tasks(user_id,book_id,title,author,status) VALUES(2,12,'竞态','谁','pending')`,
-      sql`INSERT INTO download_tasks(user_id,book_id,title,author,status) VALUES(3,12,'竞态','谁','pending')`,
+      sql`INSERT INTO download_tasks(user_id,book_id,title,author,status) VALUES(2,12,'竞态','谁','pending')`,
     ]);
     assert.equal(race.filter((item)=>item.status==='fulfilled').length,1);
     assert.equal(race.filter((item)=>item.status==='rejected'&&item.reason?.code==='23505').length,1);checks++;
+    // 不同用户并发同一本书：各自成功，都不该被对方的锁挡住。
+    const raceUsers=await Promise.allSettled([
+      sql`INSERT INTO download_tasks(user_id,book_id,title,author,status) VALUES(2,16,'跨用户竞态','谁','pending')`,
+      sql`INSERT INTO download_tasks(user_id,book_id,title,author,status) VALUES(3,16,'跨用户竞态','谁','pending')`,
+    ]);
+    assert.equal(raceUsers.filter((item)=>item.status==='fulfilled').length,2);checks++;
     await sql`INSERT INTO download_tasks(user_id,book_id,title,author,status) VALUES(3,12,'已完成','谁','done')`;
     await sql`INSERT INTO download_tasks(user_id,book_id,title,author,status) VALUES(2,13,'已完成','谁','done')`;
     await sql`INSERT INTO download_tasks(user_id,book_id,title,author,status) VALUES(3,13,'终态后重排','谁','pending')`;
     assert.equal((await sql`SELECT count(*)::int AS n FROM download_tasks WHERE book_id=13`)[0].n,2);checks++;
-    // 路由谓词（route.test.ts 锁定其原文，这里只验证谓词在真实库中的效果）。
+    // 路由谓词（route.test.ts 锁定其原文，这里只验证谓词在真实库中的效果）：
+    // 每个用户只看得到、也只动得了自己那一行。
     const own=(userId)=>sql`SELECT id,user_id,status FROM download_tasks WHERE book_id=11 AND user_id=${userId}`;
-    assert.equal((await own(3)).length,0);assert.equal((await own(2)).length,1);checks++;
+    assert.equal((await own(2)).length,1);assert.equal((await own(3)).length,1);checks++;
     const cancel=(userId,id)=>sql`DELETE FROM download_tasks WHERE id=${id} AND user_id=${userId}
       AND status IN ('pending', 'failed') RETURNING id`;
-    const [{id:sharedTaskId}]=await sql`SELECT id FROM download_tasks WHERE book_id=11`;
+    const [{id:sharedTaskId}]=await sql`SELECT id FROM download_tasks WHERE book_id=11 AND user_id=2`;
     assert.equal((await cancel(3,sharedTaskId)).length,0);checks++;
     assert.deepEqual(await sql`SELECT user_id,status FROM download_tasks WHERE id=${sharedTaskId}`,[{user_id:2,status:'pending'}]);checks++;
     await sql`INSERT INTO download_tasks(user_id,book_id,title,author,status) VALUES(2,14,'跑着','谁','running')`;
