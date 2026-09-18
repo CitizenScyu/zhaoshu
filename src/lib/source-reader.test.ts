@@ -727,3 +727,223 @@ describe('引擎源分派（M1 任务 4 §7.2）', () => {
     await expect(service.resolveSourceBook(book, context())).rejects.toMatchObject({ code: 'SOURCE_NOT_FOUND' });
   });
 });
+
+// M2-2 多源循环（设计 §3.1–§3.7 / §9 任务 M2-2）。
+describe('M2-2 多源循环：跳源 / 软预算 / 去重 / bookUrl 反查', () => {
+  const search = (kw: string, host = 'https://book15.net') => host + '/books/search.html?kw=' + encodeURIComponent(kw);
+  const sourceB = { ...source, url: 'https://book15.net/b', name: '备用书源', searchUrl: '/b/search.html?kw={{key}}' };
+  const bSearch = 'https://book15.net/b/search.html?kw=' + encodeURIComponent(book.title);
+  // 引擎源 A：ruleToc.chapterList 在选择器无命中时返回空目录 ⇒ 每个候选只消耗 detail+toc 两点；
+  // 4 个候选共 1+2×4 点，在单源 6 点闸门处撞 SOURCE_SCOPE_EXHAUSTED（跳源信号）。
+  const engineRulesA = {
+    ruleSearch: { bookList: '.book', name: '.name@text', author: '.author@text', bookUrl: 'a@href' },
+    ruleBookInfo: { name: '.title@text', author: '.writer@text' },
+    ruleToc: { chapterList: '.chapter', chapterName: 'a@text', chapterUrl: 'a@href' },
+  };
+  const engineA = {
+    url: 'https://book15.net/e-a/', name: '引擎A', searchUrl: 'https://book15.net/e-a?q={{key}}',
+    tier: 'M1' as const, rules: engineRulesA,
+  };
+  const engineASearch = 'https://book15.net/e-a?q=' + encodeURIComponent(book.title);
+  const engineABook = (n: number) => `https://book15.net/d/${n}.html`;
+  // 首个源（builtin）干净 miss：标题/作者搜索都返回空页（无 hadFailure）。
+  const primeMiss = () => {
+    pages.set(search(book.title), { text: '' });
+    pages.set(search(book.author), { text: '' });
+  };
+  const primeHitB = () => {
+    pages.set(bSearch, { text: '<a href="/books/details42.html">测试书</a>' });
+  };
+
+  it('源 A 单源点数耗尽 ⇒ 跳源；源 B 命中 ⇒ 返回 B 的目录（验收 2）', async () => {
+    primeMiss();
+    mocks.sources.mockResolvedValue([source, engineA, sourceB]);
+    pages.set(engineASearch, {
+      text: [1, 2, 3, 4].map((n) => `<div class="book"><span class="name">测试书</span><span class="author">作者</span><a href="/d/${n}.html">x</a></div>`).join(''),
+    });
+    for (const n of [1, 2, 3]) pages.set(engineABook(n), { text: '<h1 class="title">测试书</h1><span class="writer">作者</span>' });
+    primeHitB();
+    const catalog = await service.resolveSourceBook(book, context());
+    expect(catalog.sourceUrl).toBe(sourceB.url);
+    expect(catalog.bookUrl).toBe(pageUrl());
+    expect(catalog.sourceName).toBe('备用书源');
+    // 引擎 A 在 6 点闸门处被跳源（detail+toc 各源独立计数），不会再发第 7 点请求。
+    expect(mocks.fetch.mock.calls.filter(([input]) => String(input).startsWith('https://book15.net/e-a')).length).toBe(1);
+  });
+
+  it('全源耗尽（含跳源）⇒ 503 SOURCE_UNAVAILABLE，不是 404（验收 3）', async () => {
+    primeMiss();
+    mocks.sources.mockResolvedValue([source, engineA]);
+    pages.set(engineASearch, {
+      text: [1, 2, 3, 4].map((n) => `<div class="book"><span class="name">测试书</span><span class="author">作者</span><a href="/d/${n}.html">x</a></div>`).join(''),
+    });
+    for (const n of [1, 2, 3]) pages.set(engineABook(n), { text: '<h1 class="title">测试书</h1><span class="writer">作者</span>' });
+    await expect(service.resolveSourceBook(book, context())).rejects.toMatchObject({
+      code: 'SOURCE_UNAVAILABLE', status: 503,
+    });
+  });
+
+  it('软预算到点 ⇒ 不再发起后续源请求，已收集的命中照常返回（验收 4a）', async () => {
+    mocks.sources.mockResolvedValue([source, sourceB, { ...sourceB, url: 'https://book15.net/c', name: '第三源' }]);
+    const ctx = context();
+    vi.mocked(Date.now).mockReturnValue(ctx.startedAt + 46_000); // elapsed 46000 > SOFT_BUDGET 45000
+    // 无作者书：首源命中不提前返回（matches 累积），软预算到点后仍应交付首源命中。
+    const catalog = await service.resolveSourceBook({ ...book, author: '' }, ctx);
+    expect(catalog.bookUrl).toBe(pageUrl());
+    expect(mocks.fetch).toHaveBeenCalledTimes(2); // 只发首源的 搜索+详情，第 2/3 源未发起
+  });
+
+  it('软预算边界：剩余恰为一片切片（elapsed 31000 ⇔ remaining 14000）⇒ 进入下一个源（验收 4b 放行侧）', async () => {
+    primeMiss();
+    primeHitB();
+    mocks.sources.mockResolvedValue([source, sourceB]);
+    const ctx = context();
+    // 判据 remaining < PER_SOURCE_SLICE_MS ⇔ elapsed + slice > SOFT_BUDGET；边界 elapsed = 45000−14000 = 31000。
+    vi.mocked(Date.now).mockReturnValue(ctx.startedAt + 31_000);
+    const catalog = await service.resolveSourceBook(book, ctx);
+    expect(catalog.sourceUrl).toBe(sourceB.url); // 第二个源被真实进入
+    expect(mocks.fetch).toHaveBeenCalledTimes(4);
+  });
+
+  it('软预算边界−1ms（elapsed 31001 ⇔ remaining 13999）⇒ 不进新源、直接 break、hadFailure=true（验收 4b 拒绝侧）', async () => {
+    primeMiss();
+    primeHitB();
+    mocks.sources.mockResolvedValue([source, sourceB]);
+    const ctx = context();
+    vi.mocked(Date.now).mockReturnValue(ctx.startedAt + 31_001);
+    await expect(service.resolveSourceBook(book, ctx)).rejects.toMatchObject({
+      code: 'SOURCE_UNAVAILABLE', status: 503,
+    });
+    expect(mocks.fetch).toHaveBeenCalledTimes(2); // 第二个源一次都没发
+  });
+
+  it('单源切片超时 ⇒ 跳源（不 504），后续源照常命中（验收 5 前半，子/父 signal 陷阱）', async () => {
+    primeMiss();
+    primeHitB();
+    const sourceHang = { ...source, url: 'https://book15.net/hang', name: '挂起源', searchUrl: '/hang/search.html?kw={{key}}' };
+    const sourceC = { ...sourceB, url: 'https://book15.net/c', name: '命中源' };
+    mocks.sources.mockResolvedValue([source, sourceHang, sourceC]);
+    const hangUrl = 'https://book15.net/hang/search.html?kw=' + encodeURIComponent(book.title);
+    // 测试注入机制：只缩短单源切片，不改生产签名（resolveSourceBook 内部仍用默认常量）。
+    const ctx = context();
+    const baseChild = ctx.child.bind(ctx);
+    ctx.child = (scope: string) => baseChild(scope, { sliceMs: 5 });
+    const base = mocks.fetch.getMockImplementation()!;
+    mocks.fetch.mockImplementation(async (input: RequestInfo | URL) => {
+      if (String(input) === hangUrl) return new Promise<Response>(() => { /* 永挂起，等切片超时 */ });
+      return base(input);
+    });
+    const catalog = await service.resolveSourceBook(book, ctx);
+    expect(catalog.sourceUrl).toBe(sourceC.url); // 切片只放弃挂起源，跳到命中源，绝不 504
+    expect(ctx.signal.aborted).toBe(false); // 父 signal 未被切片 abort
+  });
+
+  it('父 signal 中止 ⇒ 仍按整体取消抛出（route 504），不被跳源吞成 503（验收 5 后半）', async () => {
+    primeMiss();
+    const sourceHang = { ...source, url: 'https://book15.net/hang', name: '挂起源', searchUrl: '/hang/search.html?kw={{key}}' };
+    mocks.sources.mockResolvedValue([source, sourceHang]);
+    const hangUrl = 'https://book15.net/hang/search.html?kw=' + encodeURIComponent(book.title);
+    const base = mocks.fetch.getMockImplementation()!;
+    mocks.fetch.mockImplementation(async (input: RequestInfo | URL) => {
+      if (String(input) === hangUrl) return new Promise<Response>(() => { /* 挂起 */ });
+      return base(input);
+    });
+    const controller = new AbortController();
+    const ctx = new service.SourceRequestContext(controller.signal);
+    const pending = service.resolveSourceBook(book, ctx);
+    await vi.waitFor(() => expect(mocks.fetch.mock.calls.some(([input]) => String(input) === hangUrl)).toBe(true));
+    controller.abort(new Error('cancelled'));
+    await expect(pending).rejects.toThrow('cancelled');
+  });
+
+  it('无作者书跨源「同标题同作者」⇒ 返回首源；「同标题不同作者」⇒ 422（验收 6/§3.6）', async () => {
+    mocks.sources.mockResolvedValue([source, sourceB]);
+    // 同作者：两个源各命中一条 catalog，去重后保留源优先级最高的首条。
+    pages.set(bSearch, { text: '<a href="/books/details43.html">测试书</a>' });
+    pages.set(pageUrl(43), { text: detail(43, '作者', ['第一章']) });
+    const same = await service.resolveSourceBook({ ...book, author: '' }, context());
+    expect(same.bookUrl).toBe(pageUrl()); // 首源（book15 主源），不 422
+    // 不同作者：同名不同书，仍是真歧义，保留 422。
+    pages.set(pageUrl(43), { text: detail(43, '别的作者', ['第一章']) });
+    await expect(service.resolveSourceBook({ ...book, author: '' }, context())).rejects.toMatchObject({
+      code: 'SOURCE_AMBIGUOUS', status: 422,
+    });
+  });
+
+  it('bookUrl 确认路径不建 child、不调 openPool，只走根预算（验收 8a/8b）', async () => {
+    mocks.sources.mockResolvedValue([source, engineA]); // 池里有引擎源，openPool 本会被触发
+    pages.set('https://book15.net/books/details77.html', {
+      text: detail(77, '随便什么作者').replace('content="测试书"', 'content="随便什么书名"'),
+    });
+    const childSpy = vi.spyOn(service.SourceRequestContext.prototype, 'child');
+    const poolSpy = vi.spyOn(service.SourceRequestContext.prototype, 'openPool');
+    const catalog = await service.resolveSourceBook(book, context(), { bookUrl: 'https://book15.net/books/details77.html' });
+    expect(catalog).toMatchObject({ title: '随便什么书名', author: '随便什么作者' });
+    expect(childSpy).not.toHaveBeenCalled(); // 无 child ⇒ 无切片定时器 ⇒ SOURCE_SCOPE_EXHAUSTED 不可能出现
+    expect(poolSpy).not.toHaveBeenCalled();
+    expect(mocks.fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it('bookUrl 按 host 反查引擎源（不再硬取 sources[0]），走同一引擎构造器（验收 8c）', async () => {
+    const { refreshSupportedHosts } = await import('./source-policy');
+    refreshSupportedHosts(['engine.test']);
+    const engineHost = {
+      url: 'https://engine.test/', name: '外部引擎', searchUrl: 'https://engine.test/s?q={{key}}',
+      tier: 'M1' as const,
+      rules: {
+        ruleSearch: engineRulesA.ruleSearch,
+        ruleBookInfo: { name: '.title@text', author: '.writer@text', tocUrl: '.toc@href' },
+        ruleToc: engineRulesA.ruleToc,
+      },
+    };
+    mocks.sources.mockResolvedValue([source, engineHost]); // sources[0] 恒为 builtin
+    pages.set('https://engine.test/d/1.html', { text: '<h1 class="title">外部书</h1><span class="writer">外作者</span><a class="toc" href="/toc/1.html">目录</a>' });
+    pages.set('https://engine.test/toc/1.html', { text: '<li class="chapter"><a href="/c/1.html">第一章</a></li>' });
+    const catalog = await service.resolveSourceBook(book, context(), { bookUrl: 'https://engine.test/d/1.html' });
+    expect(catalog.sourceUrl).toBe(engineHost.url); // 源标识来自反查到的引擎源，而非 builtin
+    expect(catalog.sourceName).toBe('外部引擎');
+    expect(catalog.chapters).toHaveLength(1);
+  });
+
+  it('bookUrl 的 host 不在池内 ⇒ 404 重选（不回退 sources[0]）（验收 8c 负控）', async () => {
+    const { refreshSupportedHosts } = await import('./source-policy');
+    refreshSupportedHosts(['engine.test']);
+    mocks.sources.mockResolvedValue([source]);
+    await expect(service.resolveSourceBook(book, context(), { bookUrl: 'https://engine.test/d/1.html' }))
+      .rejects.toMatchObject({ code: 'SOURCE_NOT_FOUND', status: 404 });
+    expect(mocks.fetch).not.toHaveBeenCalled();
+  });
+
+  it('引擎源 identity 回退链：ruleBookInfo 缺 name/author ⇒ 用 ruleSearch 的名字/作者（验收 9）', async () => {
+    const engineFallback = {
+      url: 'https://book15.net/e-f/', name: '引擎回退', searchUrl: 'https://book15.net/e-f?q={{key}}',
+      tier: 'M1' as const,
+      rules: {
+        ruleSearch: { bookList: '.book', name: '.name@text', author: '.author@text', bookUrl: 'a@href' },
+        ruleBookInfo: { tocUrl: '.toc@href' }, // 只有 tocUrl，没有 name/author
+        ruleToc: { chapterList: '.chapter', chapterName: 'a@text', chapterUrl: 'a@href' },
+      },
+    };
+    const searchUrl = 'https://book15.net/e-f?q=' + encodeURIComponent(book.title);
+    const detailUrl = 'https://book15.net/f/detail/1.html';
+    mocks.sources.mockResolvedValue([engineFallback]);
+    pages.set(searchUrl, { text: '<div class="book"><span class="name">测试书</span><span class="author">作者</span><a href="/f/detail/1.html">x</a></div>' });
+    pages.set(detailUrl, { text: '<a class="toc" href="/f/toc/1.html">目录</a>' }); // 详情页无 .title/.writer
+    pages.set('https://book15.net/f/toc/1.html', { text: '<li class="chapter"><a href="/f/c/1.html">第一章</a></li>' });
+    const catalog = await service.resolveSourceBook(book, context());
+    expect(catalog).toMatchObject({ title: '测试书', author: '作者' }); // 回退到搜索结果
+    expect(catalog.chapters).toHaveLength(1);
+  });
+
+  it('章节级 failover 复用父 context：预算累加、openPool 不收窄（验收 7/§3.4）', async () => {
+    mocks.sources.mockResolvedValue([source, engineA]);
+    const ctx = context();
+    await service.resolveSourceBook(book, ctx);
+    const firstRequests = ctx.requests;
+    const firstLimit = ctx.totalLimit;
+    await service.resolveSourceBook(book, ctx);
+    expect(ctx.requests).toBeGreaterThan(firstRequests); // 重试吃的是剩余预算，不续杯
+    expect(ctx.totalLimit).toBe(firstLimit); // 二次 openPool 幂等取最大值
+  });
+});
+
