@@ -185,7 +185,7 @@ describe('GET /api/read/[id]/[resource]', () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
-  it.each(['pending', 'running', 'failed'])("hides another user's %s task behind the same 404 as a missing task", async (status) => {
+  it.each(['pending', 'running', 'failed', 'partial'])("hides another user's %s task behind the same 404 as a missing task", async (status) => {
     sql.mockResolvedValueOnce([{ ...task, status, user_id: 2 }]);
     const response = await request();
     expect(response.status).toBe(404);
