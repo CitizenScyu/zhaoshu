@@ -1,0 +1,475 @@
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+
+exports[`parse: 支持构件 → IR 快照 > 'bare_terminal_href': '@href' 1`] = `
+{
+  "rules": [
+    {
+      "chain": [],
+      "kind": "css",
+      "terminal": {
+        "op": "href",
+      },
+    },
+  ],
+}
+`;
+
+exports[`parse: 支持构件 → IR 快照 > 'bare_terminal_text': '@text' 1`] = `
+{
+  "rules": [
+    {
+      "chain": [],
+      "kind": "css",
+      "terminal": {
+        "op": "text",
+      },
+    },
+  ],
+}
+`;
+
+exports[`parse: 支持构件 → IR 快照 > 'class_shorthand': '.list-item-panel' 1`] = `
+{
+  "rules": [
+    {
+      "chain": [
+        {
+          "selector": ".list-item-panel",
+        },
+      ],
+      "kind": "css",
+      "terminal": undefined,
+    },
+  ],
+}
+`;
+
+exports[`parse: 支持构件 → IR 快照 > 'css_attr': 'a[href*=list-t]@text' 1`] = `
+{
+  "rules": [
+    {
+      "chain": [
+        {
+          "selector": "a[href*=list-t]",
+        },
+      ],
+      "kind": "css",
+      "terminal": {
+        "op": "text",
+      },
+    },
+  ],
+}
+`;
+
+exports[`parse: 支持构件 → IR 快照 > 'css_explicit': '@css:.info dl dd a[href*=\\'/cat/\\']@t…' 1`] = `
+{
+  "rules": [
+    {
+      "chain": [
+        {
+          "selector": ".info dl dd a[href*='/cat/']",
+        },
+      ],
+      "kind": "css",
+      "terminal": {
+        "op": "text",
+      },
+    },
+  ],
+}
+`;
+
+exports[`parse: 支持构件 → IR 快照 > 'css_pseudo_contains': '@css:.info dl dt:contains(作者) + dd@te…' 1`] = `
+{
+  "rules": [
+    {
+      "chain": [
+        {
+          "selector": ".info dl dt:contains(作者) + dd",
+        },
+      ],
+      "kind": "css",
+      "terminal": {
+        "op": "text",
+      },
+    },
+  ],
+}
+`;
+
+exports[`parse: 支持构件 → IR 快照 > 'css_pseudo_nth': 'ol li:nth-child(3) a@text' 1`] = `
+{
+  "rules": [
+    {
+      "chain": [
+        {
+          "selector": "ol li:nth-child(3) a",
+        },
+      ],
+      "kind": "css",
+      "terminal": {
+        "op": "text",
+      },
+    },
+  ],
+}
+`;
+
+exports[`parse: 支持构件 → IR 快照 > 'default_class': 'class.cont@p@text' 1`] = `
+{
+  "rules": [
+    {
+      "chain": [
+        {
+          "selector": ".cont",
+        },
+        {
+          "selector": "p",
+        },
+      ],
+      "kind": "css",
+      "terminal": {
+        "op": "text",
+      },
+    },
+  ],
+}
+`;
+
+exports[`parse: 支持构件 → IR 快照 > 'default_class_multi': 'class.book-list-indb clearfix@li' 1`] = `
+{
+  "rules": [
+    {
+      "chain": [
+        {
+          "selector": ".book-list-indb.clearfix",
+        },
+        {
+          "selector": "li",
+        },
+      ],
+      "kind": "css",
+      "terminal": undefined,
+    },
+  ],
+}
+`;
+
+exports[`parse: 支持构件 → IR 快照 > 'default_id': 'id.ret-list@li' 1`] = `
+{
+  "rules": [
+    {
+      "chain": [
+        {
+          "selector": "#ret-list",
+        },
+        {
+          "selector": "li",
+        },
+      ],
+      "kind": "css",
+      "terminal": undefined,
+    },
+  ],
+}
+`;
+
+exports[`parse: 支持构件 → IR 快照 > 'default_tag': 'tag.a@text' 1`] = `
+{
+  "rules": [
+    {
+      "chain": [
+        {
+          "selector": "a",
+        },
+      ],
+      "kind": "css",
+      "terminal": {
+        "op": "text",
+      },
+    },
+  ],
+}
+`;
+
+exports[`parse: 支持构件 → IR 快照 > 'default_tag_index': 'tag.p.0@text' 1`] = `
+{
+  "rules": [
+    {
+      "chain": [
+        {
+          "index": 0,
+          "selector": "p",
+        },
+      ],
+      "kind": "css",
+      "terminal": {
+        "op": "text",
+      },
+    },
+  ],
+}
+`;
+
+exports[`parse: 支持构件 → IR 快照 > 'default_text_kw': 'text.目录@href' 1`] = `
+{
+  "rules": [
+    {
+      "chain": [
+        {
+          "ownTextContains": "目录",
+          "selector": ":contains(目录)",
+        },
+      ],
+      "kind": "css",
+      "terminal": {
+        "op": "href",
+      },
+    },
+  ],
+}
+`;
+
+exports[`parse: 支持构件 → IR 快照 > 'exclude': 'class.books-list@tag.div!0' 1`] = `
+{
+  "rules": [
+    {
+      "chain": [
+        {
+          "selector": ".books-list",
+        },
+        {
+          "excludes": [
+            0,
+          ],
+          "selector": "div",
+        },
+      ],
+      "kind": "css",
+      "terminal": undefined,
+    },
+  ],
+}
+`;
+
+exports[`parse: 支持构件 → IR 快照 > 'exclude_bracket': 'class.SHsectionThree-middle@p[!1,3,5]' 1`] = `
+{
+  "rules": [
+    {
+      "chain": [
+        {
+          "selector": ".SHsectionThree-middle",
+        },
+        {
+          "excludes": [
+            1,
+            3,
+            5,
+          ],
+          "selector": "p",
+        },
+      ],
+      "kind": "css",
+      "terminal": undefined,
+    },
+  ],
+}
+`;
+
+exports[`parse: 支持构件 → IR 快照 > 'index_dot': 'a.0@href' 1`] = `
+{
+  "rules": [
+    {
+      "chain": [
+        {
+          "index": 0,
+          "selector": "a",
+        },
+      ],
+      "kind": "css",
+      "terminal": {
+        "op": "href",
+      },
+    },
+  ],
+}
+`;
+
+exports[`parse: 支持构件 → IR 快照 > 'jsonpath_child': '$.bookAuthor' 1`] = `
+{
+  "rules": [
+    {
+      "kind": "jsonpath",
+      "path": {
+        "segments": [
+          {
+            "kind": "root",
+          },
+          {
+            "kind": "child",
+            "name": "bookAuthor",
+          },
+        ],
+      },
+    },
+  ],
+}
+`;
+
+exports[`parse: 支持构件 → IR 快照 > 'jsonpath_recursive': '$..books[*]' 1`] = `
+{
+  "rules": [
+    {
+      "kind": "jsonpath",
+      "path": {
+        "segments": [
+          {
+            "kind": "root",
+          },
+          {
+            "kind": "recursive",
+            "name": "books",
+          },
+          {
+            "kind": "wildcard",
+          },
+        ],
+      },
+    },
+  ],
+}
+`;
+
+exports[`parse: 支持构件 → IR 快照 > 'multistep_chain': 'h3 a@href' 1`] = `
+{
+  "rules": [
+    {
+      "chain": [
+        {
+          "selector": "h3 a",
+        },
+      ],
+      "kind": "css",
+      "terminal": {
+        "op": "href",
+      },
+    },
+  ],
+}
+`;
+
+exports[`parse: 支持构件 → IR 快照 > 'regex_sub_delete': '.chapter-content@html##<!--[\\s\\S]*?--…' 1`] = `
+{
+  "regex": [
+    {
+      "flags": undefined,
+      "pattern": "<!--[\\s\\S]*?-->",
+      "replacement": "",
+    },
+  ],
+  "rules": [
+    {
+      "chain": [
+        {
+          "selector": ".chapter-content",
+        },
+      ],
+      "kind": "css",
+      "terminal": {
+        "op": "html",
+      },
+    },
+  ],
+}
+`;
+
+exports[`parse: 支持构件 → IR 快照 > 'regex_sub_replace': 'a.0@href##\\'([^\\']+)\\'##$1###' 1`] = `
+{
+  "regex": [
+    {
+      "flags": undefined,
+      "pattern": "'([^']+)'",
+      "replacement": "$1",
+    },
+  ],
+  "rules": [
+    {
+      "chain": [
+        {
+          "index": 0,
+          "selector": "a",
+        },
+      ],
+      "kind": "css",
+      "terminal": {
+        "op": "href",
+      },
+    },
+  ],
+}
+`;
+
+exports[`parse: 支持构件 → IR 快照 > 'slice': 'id.list@dd.0:8' 1`] = `
+{
+  "rules": [
+    {
+      "chain": [
+        {
+          "selector": "#list",
+        },
+        {
+          "selector": "dd",
+          "slice": [
+            0,
+            8,
+          ],
+        },
+      ],
+      "kind": "css",
+      "terminal": undefined,
+    },
+  ],
+}
+`;
+
+exports[`parse: 支持构件 → IR 快照 > 'text_literal_url': 'https://example.com/toc/123' 1`] = `
+{
+  "rules": [
+    {
+      "kind": "text",
+      "literal": "https://example.com/toc/123",
+    },
+  ],
+}
+`;
+
+exports[`parse: 支持构件 → IR 快照 > 'tpl_jsonpath': 'https://appi.kuwo.cn/novels/api/book/…' 1`] = `
+{
+  "rules": [
+    {
+      "kind": "template",
+      "parts": [
+        {
+          "kind": "literal",
+          "text": "https://appi.kuwo.cn/novels/api/book/",
+        },
+        {
+          "kind": "jsonpath",
+          "path": {
+            "segments": [
+              {
+                "kind": "root",
+              },
+              {
+                "kind": "child",
+                "name": "book_id",
+              },
+            ],
+          },
+        },
+      ],
+    },
+  ],
+}
+`;
