@@ -14,6 +14,7 @@
     "test": "vitest run --no-file-parallelism",
     "check": "npm run typecheck && npm run lint && npm test && npm run build",
     "test:contracts": "node --experimental-strip-types scripts/check-worker-contract.mjs",
+    "w1:candidates": "node --experimental-strip-types scripts/w1-candidates.mjs",
     "migrate:auth": "node --experimental-strip-types scripts/migrate-user-auth.mjs",
     "test:auth-db": "node --experimental-strip-types scripts/test-auth-db.mjs",
     "bench:auth": "node scripts/bench-auth.mjs",
