@@ -667,7 +667,9 @@ describe('POST /api/find rerank 验证票据', () => {
     mocks.ensureSchema.mockResolvedValue(undefined);
     mocks.getProfileForUser.mockResolvedValue({ seeds: [], content: '画像' });
     mocks.getExcludedBookTitlesForUser.mockResolvedValue([]);
-    mocks.persistRecommendationsForUser.mockResolvedValue(undefined);
+    // F09 起 /api/find 会比对「实际写入行数 vs 期望本数」，不符即 persisted=false。
+    // 故 mock 必须返回条数（与文件顶部 beforeEach 同款），否则合法票据用例会被误判为写库失败。
+    mocks.persistRecommendationsForUser.mockImplementation(async (_userId: number, _query: string, items: unknown[]) => items.length);
     mocks.verifyBatch.mockImplementation(async (candidates: unknown[]) => candidates.map(() => douban));
     mocks.supplementSourceEvidence.mockImplementation(async (candidates) => candidates);
     mocks.chatRobust.mockResolvedValue(JSON.stringify({ items: [item] }));
