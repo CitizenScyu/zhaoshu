@@ -1,6 +1,6 @@
 import { NextRequest } from 'next/server';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import type { SourceCatalog } from './source-reader';
+import type { SourceCatalog, SourceReaderError, SourceSimilarCandidate } from './source-reader';
 
 type Query = { text: string; values: unknown[] };
 const mocks = vi.hoisted(() => ({ getSql: vi.fn(), ensureSchema: vi.fn(), sources: vi.fn(), fetch: vi.fn<typeof fetch>() }));
@@ -17,12 +17,14 @@ const detail = (id = 42, author = '作者', titles = ['第一章', '第二章'])
   `<meta property="og:novel:book_name" content="测试书"><meta property="og:novel:author" content="${author}">`
   + titles.map((title, i) => `<dd><a href="/chapter/index${id}-${i + 1}.html">${title}</a></dd>`).join('');
 const chapterHtml = (text = '离线测试正文。') => `<li class="chapter-content"><p>${text}</p></li>`;
-const pages = new Map<string, { text: string; status?: number }>();
+const pages = new Map<string, { text?: string; status?: number }>();
 const catalogs = new Map<string, SourceCatalog>();
 let hints: unknown[];
 let writes: Query[];
 const transaction = vi.fn();
 const context = (limit?: number) => new service.SourceRequestContext(new AbortController().signal, limit);
+// status: -2 表示连接层失败（TypeError('fetch failed')），text 可省略。
+const networkFailure = { status: -2 } as const;
 
 function request(resource = 'index', query = 'title=测试书&author=作者', token: string | null = 'source-owner') {
   return GET(new NextRequest('http://localhost/api/read/source/' + resource + '?' + query, {
@@ -72,6 +74,7 @@ beforeEach(async () => {
   mocks.fetch.mockImplementation(async (input) => {
     const fixture = pages.get(String(input));
     if (!fixture) throw new Error('Unexpected source request');
+    if (fixture.status === -2) throw new TypeError('fetch failed'); // 连接层失败（DNS/重置），page() 内重试后抛回
     return new Response(fixture.text, { status: fixture.status ?? 200 });
   });
   vi.stubGlobal('fetch', mocks.fetch);
@@ -287,6 +290,107 @@ describe('online reader source resolution and budgets', () => {
     await expect(service.resolveSourceBook(book, context(), { bookUrl: 'https://evil.invalid/books/details1.html' }))
       .rejects.toThrow();
   });
+
+  // ---- 去闸门回归（fix/read-source-gate）：部分搜索失败不再否决已拿到的唯一匹配 / 相似候选 ----
+
+  it('delivers the sole no-author match even when an earlier candidate detail fetch failed', async () => {
+    // 改动 1 回归：author=''、唯一匹配，前一个候选详情页连接层失败（TypeError，page() 重试后抛回）。
+    // 旧闸门：hadFailure ⇒ 丢弃唯一匹配 503 SOURCE_UNAVAILABLE；新语义：照常交付目录。
+    pages.set('https://book15.net/books/search.html?kw=' + encodeURIComponent(book.title), {
+      text: '<a href="/books/details41.html">测试书</a><a href="/books/details42.html">测试书</a>',
+    });
+    pages.set(pageUrl(41), networkFailure);
+    pages.set(pageUrl(42), { text: detail() });
+    const catalog = await service.resolveSourceBook({ ...book, author: '' }, context());
+    expect(catalog).toMatchObject({ title: '测试书', bookUrl: pageUrl(), chapters: [{ title: '第一章' }, { title: '第二章' }] });
+  });
+
+  it('still surfaces SOURCE_SIMILAR candidates when a request failed mid-resolve', async () => {
+    // 改动 1 回归：有相似候选 + 一次网络失败 → 仍 422 SOURCE_SIMILAR，且候选与健康路径一致。
+    // 主源抓到作者不符的候选（进 similar）；镜像源健康时也复查同一详情页，候选不变。
+    const mirror = { ...source, url: 'https://book15.net/mirror', searchUrl: '/mirror/search.html?kw={{key}}' };
+    mocks.sources.mockResolvedValue([source, mirror]);
+    pages.set(pageUrl(), { text: detail(42, '站点挂错的作者') });
+    const mirrorSearch = 'https://book15.net/mirror/search.html?kw=' + encodeURIComponent(book.title);
+    pages.set(mirrorSearch, { text: '<a href="/books/details42.html">测试书</a>' });
+    const healthy = await service.resolveSourceBook(book, context())
+      .catch((error: SourceReaderError & { candidates?: SourceSimilarCandidate[] }) => error);
+    pages.set(mirrorSearch, networkFailure); // 唯一变量：镜像源搜索连接层失败（hadFailure=true）
+    const degraded = await service.resolveSourceBook(book, context())
+      .catch((error: SourceReaderError & { candidates?: SourceSimilarCandidate[] }) => error);
+    expect(healthy).toMatchObject({ code: 'SOURCE_SIMILAR', status: 422 });
+    expect(degraded).toMatchObject({ code: 'SOURCE_SIMILAR', status: 422 });
+    expect((degraded as SourceReaderError & { candidates?: SourceSimilarCandidate[] }).candidates)
+      .toEqual((healthy as SourceReaderError & { candidates?: SourceSimilarCandidate[] }).candidates);
+  });
+
+  it('returns the match already found when the shared budget runs out mid-resolve', async () => {
+    // 改动 2 回归：预算中途耗尽不再终结 resolve（旧：503 SOURCE_BUDGET_EXCEEDED 重抛作废全部）。
+    // 构造：无作者书在主源收集到唯一匹配（搜索+详情=2 请求）；镜像源搜索时预算已耗尽 ⇒
+    // SOURCE_BUDGET_EXCEEDED 从 page() 抛到外层 catch → 特判 break → 已有唯一匹配照常返回。
+    mocks.sources.mockResolvedValue([source, { ...source, url: 'https://book15.net/mirror', searchUrl: '/mirror/search.html?kw={{key}}' }]);
+    const catalog = await service.resolveSourceBook({ ...book, author: '' }, context(2));
+    expect(catalog).toMatchObject({ title: '测试书', bookUrl: pageUrl(), chapters: [{ title: '第一章' }, { title: '第二章' }] });
+  });
+
+  it('falls back to SOURCE_SIMILAR when the budget runs out after collecting candidates', async () => {
+    // 改动 2 回归：similar 已收集 + 预算中途耗尽 → 不再 503，落 422 SOURCE_SIMILAR。
+    // 构造：主源搜索+详情（2 请求）抓到作者不符候选（进 similar）；镜像源搜索（第 3 请求）
+    // 后其详情页触发 BUDGET → inspect 内层特判 break → similar 保留。
+    mocks.sources.mockResolvedValue([source, { ...source, url: 'https://book15.net/mirror', searchUrl: '/mirror/search.html?kw={{key}}' }]);
+    pages.set(pageUrl(), { text: detail(42, '站点挂错的作者') });
+    pages.set('https://book15.net/mirror/search.html?kw=' + encodeURIComponent(book.title), {
+      text: '<a href="/books/details43.html">测试书</a>',
+    });
+    await expect(service.resolveSourceBook(book, context(3))).rejects.toMatchObject({
+      code: 'SOURCE_SIMILAR', status: 422, candidates: [{ title: '测试书', author: '站点挂错的作者' }],
+    });
+  });
+
+  it('still reports 503 SOURCE_UNAVAILABLE when the search itself fails with no results', async () => {
+    // 负控（语义不变）：空结果 + 关键路径失败（标题搜索自身网络失败）→ 仍 503 SOURCE_UNAVAILABLE。
+    pages.set('https://book15.net/books/search.html?kw=' + encodeURIComponent(book.title), networkFailure);
+    await expect(service.resolveSourceBook(book, context())).rejects.toMatchObject({
+      code: 'SOURCE_UNAVAILABLE', status: 503,
+    });
+  });
+
+  it('reports 404 SOURCE_NOT_FOUND when only the optional fuzzy-collection layer failed', async () => {
+    // 改动 3 回归：模糊收集层（作者候选补抓）失败不记账 hadFailure → 关键路径全成功、无匹配 ⇒ 404。
+    const target = { title: '改名书', author: '作者A' };
+    const titleSearch = 'https://book15.net/books/search.html?kw=' + encodeURIComponent(target.title);
+    const authorSearch = 'https://book15.net/books/search.html?kw=' + encodeURIComponent(target.author);
+    const unrelatedDetail = (id: number, title: string, author: string) =>
+      `<meta property="og:novel:book_name" content="${title}"><meta property="og:novel:author" content="${author}">`
+      + '<dd><a href="/chapter/index' + id + '-1.html">第一章</a></dd>';
+    pages.set(titleSearch, { text: '' }); // 标题搜索 0 候选 ⇒ 作者回退
+    // 作者搜索给 6 个候选：前 4 进 inspect（关键路径），后 2 才是模糊补抓层（可选）。
+    pages.set(authorSearch, {
+      text: Array.from({ length: 6 }, (_, i) => `<a href="/books/details${60 + i}.html">无关书${i}</a>`).join(''),
+    });
+    for (let i = 0; i < 6; i++) {
+      pages.set(pageUrl(60 + i), i >= 4 ? networkFailure : { text: unrelatedDetail(60 + i, '无关书' + i, '别人') });
+    }
+    await expect(service.resolveSourceBook(target, context())).rejects.toMatchObject({
+      code: 'SOURCE_NOT_FOUND', status: 404,
+    });
+  });
+
+  it('bounds a miss to 8 requests: title search, author search, 4 inspects, 2 fuzzy pages', async () => {
+    // 改动 3 回归（定量）：miss 路径请求上限 ≤ 1(标题)+1(作者)+4(inspect)+2(模糊补抓) = 8。
+    const target = { title: '改名书', author: '作者A' };
+    const titleSearch = 'https://book15.net/books/search.html?kw=' + encodeURIComponent(target.title);
+    const authorSearch = 'https://book15.net/books/search.html?kw=' + encodeURIComponent(target.author);
+    const links = Array.from({ length: 23 }, (_, i) => `<a href="/books/details${800 + i}.html">无关书${i}</a>`).join('');
+    const unrelatedDetail = (id: number, title: string, author: string) =>
+      `<meta property="og:novel:book_name" content="${title}"><meta property="og:novel:author" content="${author}">`
+      + '<dd><a href="/chapter/index' + id + '-1.html">第一章</a></dd>';
+    pages.set(titleSearch, { text: links });
+    pages.set(authorSearch, { text: links });
+    for (let i = 0; i < 23; i++) pages.set(pageUrl(800 + i), { text: unrelatedDetail(800 + i, '无关书' + i, '别人') });
+    await expect(service.resolveSourceBook(target, context())).rejects.toMatchObject({ code: 'SOURCE_NOT_FOUND' });
+    expect(mocks.fetch).toHaveBeenCalledTimes(8);
+  });
 });
 
 describe('GET /api/read/source/[resource]', () => {
@@ -351,5 +455,20 @@ describe('GET /api/read/source/[resource]', () => {
     expect(res.status).toBe(409);
     expect(await res.json()).toMatchObject({ code: 'SOURCE_SESSION_EXPIRED' });
     expect(mocks.fetch).not.toHaveBeenCalled();
+  });
+
+  it('logs a structured 503 line with the error code when the source is unavailable', async () => {
+    // 改动 4 回归：SOURCE_UNAVAILABLE 的 503 档必须有结构化日志（此前零观测）。
+    // 只记 code/requests/elapsedMs，不打书名、作者、URL、查询串。
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    pages.set('https://book15.net/books/search.html?kw=' + encodeURIComponent(book.title), networkFailure);
+    const res = await request();
+    expect(res.status).toBe(503);
+    expect(await res.json()).toMatchObject({ code: 'SOURCE_UNAVAILABLE' });
+    expect(errorSpy).toHaveBeenCalledOnce();
+    const line = errorSpy.mock.calls[0][0] as string;
+    expect(JSON.parse(line)).toMatchObject({ code: 'SOURCE_UNAVAILABLE', requests: expect.any(Number), elapsedMs: expect.any(Number) });
+    expect(line).not.toContain('测试书');
+    expect(line).not.toContain('作者');
   });
 });
