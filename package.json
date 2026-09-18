@@ -11,7 +11,7 @@
     "start": "next start",
     "typecheck": "tsc --noEmit",
     "lint": "eslint",
-    "test": "vitest run",
+    "test": "vitest run --no-file-parallelism",
     "check": "npm run typecheck && npm run lint && npm test && npm run build",
     "test:contracts": "node --experimental-strip-types scripts/check-worker-contract.mjs",
     "migrate:auth": "node --experimental-strip-types scripts/migrate-user-auth.mjs",

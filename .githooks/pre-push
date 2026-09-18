@@ -20,6 +20,9 @@
 #
 # 紧急出口：门禁挡住时可用 `git push --no-verify` 跳过。
 #   跳过了什么，请在回报 / PR 里写明——这个出口是给「线上热修」用的，不是给省事用的。
+#
+# 测试那道门的 --no-file-parallelism 写在 package.json 的 test script 里（本机多 worker 会 OOM）。
+#   钩子委托给 `npm run check`，不在这里另起一条 vitest 命令，避免与 CI 跑出两套参数。
 
 if [ ! -d node_modules ]; then
   echo "✖ pre-push：当前 worktree 没有 node_modules，四道门跑不起来。" >&2

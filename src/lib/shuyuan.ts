@@ -23,8 +23,9 @@ const PROBE_CONCURRENCY = 10;
 // probeWorker 每个源每轮刷新只探测一次、不重试，阈值就是靠跨刷新累积的这几次单次探测生效的。
 const PROBE_FAILURE_THRESHOLD = 3;
 // 每轮刷新最多补探多少个「还没有任何探测结论」的可探测源。补探是为了让可用性数据从零自动建立
-// （否则门控只认已有的失败记录，永远没有第一条记录）。上限取并发数：这批补探正好压在一轮并发里
-// （≤ PROBE_TIMEOUT_MS），不会额外吃掉刷新预算，也永远排在已知失败源之后。
+// （否则门控只认已有的失败记录，永远没有第一条记录）。上限取并发数，且整批排在已知失败源之后：
+// 已知失败源为空时，补探正好压在一轮并发里（≤ PROBE_TIMEOUT_MS），不额外吃刷新预算；
+// 已知失败源占满并发时，补探要等下一波，最坏多花一轮 PROBE_TIMEOUT_MS。
 const PROBE_DISCOVERY_PER_REFRESH = PROBE_CONCURRENCY;
 const INSERT_CHUNK = 100;
 const SOURCE_STATUS_LIMIT = 100;

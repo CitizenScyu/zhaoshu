@@ -112,9 +112,11 @@ export function participatesInSearch(source: { disabled: boolean; availability: 
 /**
  * 「开关开着但实际不会参与搜索」的原因。这是最容易误判的一态：开关是开的，
  * 但探测状态是 failed 时 getReadingSources 会把它排除——刷新后重探成功才回来。
+ * failed 只在连续探测失败达到阈值后写成，单次抖动（含超时）不会走到这里，
+ * 文案要与 ShuyuanTab 的说明保持同一口径。
  */
 export function participationHint(source: { disabled: boolean; availability: ShuyuanAvailability }): string {
   if (participatesInSearch(source)) return '';
   if (source.disabled) return '已禁用，不会参与书源搜索';
-  return '已启用，但最近一次探测失败，当前不会参与搜索；刷新后会重试';
+  return '已启用，但连续探测失败次数已达阈值，当前不会参与搜索；刷新后会重试';
 }
