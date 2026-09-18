@@ -21,6 +21,7 @@ import {
   sanitizeVerified,
 } from '@/lib/sanitize';
 import { withFindAccess, personalError } from '@/lib/personal-request';
+import { issueVerifyTicket, readVerifyTicket, ticketSigningKey } from '@/lib/verify-ticket';
 import {
   recallSystem,
   recallUser,
@@ -35,6 +36,10 @@ export const maxDuration = 295;
 const MAX_BODY_BYTES = 64 * 1024;
 const MAX_QUERY_LENGTH = 1_000;
 const MAX_CONDITIONS_LENGTH = 1_000;
+// 票据随整个请求体一起受 MAX_BODY_BYTES(64KB) 约束，这里再按同一上限做字段级封顶：
+// 票据是 base64url(...)+'.'+base64url(...)，无空格，boundedString 的 trim 不影响它。
+// 实测大小见 docs/../gpt-f01-report.md 第 2 节。
+const MAX_VERIFY_TICKET_LENGTH = MAX_BODY_BYTES;
 // 模型子预算：在内部预算里预留写回，并向一次回调分配剩余时间，避免最后时刻被模型/写回吃光。
 // 可用额 = 285s 内部预算 − 12s 写回 reserve = 273s；ceiling 取 260s 留 13s 余量。
 // 上游是推理模型，思考链会把单步拉到 190s 上下，旧的 220s 会稳定截断。
@@ -143,6 +148,37 @@ export async function POST(req: NextRequest) {
     const body = await atomicRead(() => readJsonBody(req, MAX_BODY_BYTES, access.signal));
     if (!body?.step) return NextResponse.json({ error: 'missing step' }, { status: 400 });
     const step = body.step;
+
+    // F01：rerank 的输入只认服务端签发的验证票据，不认 body.verified。
+    // 票据在 verify 步由服务端签发（把 verified 嵌进 payload 并绑定 u/q/c/exp），这里只验票：
+    // 缺失 / 篡改 / 过期 / 绑定不符 / 为他人签发 → 403，且**在进入 SSE 之前**就拒绝，
+    // 不给伪造的 verified 任何到达模型或写库的机会。提前算好的 verified 复用给下面的 SSE 回调。
+    let rerankVerified: VerifiedCandidate[] | null = null;
+    if (step === 'rerank') {
+      const query = boundedString(body.query, MAX_QUERY_LENGTH) ?? '';
+      const conditions = boundedString(body.conditions, MAX_CONDITIONS_LENGTH) ?? '';
+      const key = ticketSigningKey();
+      if (!key) {
+        // 无签名 key（既无 AUTH_SECURITY_SECRET 也无 APP_OWNER_TOKEN）：拒绝而不是放行。
+        return NextResponse.json(
+          { error: '验证票据服务不可用，请联系维护者。', code: 'VERIFY_TICKET_UNAVAILABLE' },
+          { status: 503 },
+        );
+      }
+      const ticket = boundedString(body.ticket, MAX_VERIFY_TICKET_LENGTH) ?? '';
+      const payload = ticket ? readVerifyTicket(key, ticket, { userId, query, conditions }) : null;
+      if (!payload) {
+        return NextResponse.json(
+          { error: '缺少或无效的验证票据，请重新执行验证步骤。', code: 'VERIFY_TICKET_INVALID' },
+          { status: 403 },
+        );
+      }
+      const verified = sanitizeVerified(payload.v);
+      if (!query || verified.length === 0) {
+        return NextResponse.json({ error: 'missing query or verified', code: 'MISSING_QUERY_OR_VERIFIED' }, { status: 400 });
+      }
+      rerankVerified = verified;
+    }
     // 找书的两个模型步骤都带上兜底模型，让主模型卡住时用它顶替原本的「重试」那次机会，
     // 而不是让整次找书失败。降级只在**卡住**那一族失败触发：网关超时（524/408）、单次尝试
     // 的首字节或停滞上限到点、总超时。连接层失败（UPSTREAM_UNREACHABLE）刻意不降级——它
@@ -226,6 +262,8 @@ export async function POST(req: NextRequest) {
       }
 
       if (step === 'verify') {
+        const query = boundedString(body.query, MAX_QUERY_LENGTH) ?? '';
+        const conditions = boundedString(body.conditions, MAX_CONDITIONS_LENGTH) ?? '';
         const candidates = sanitizeCandidates(body.candidates);
         if (candidates.length === 0) {
           fail('MISSING_CANDIDATES', 'missing candidates');
@@ -242,18 +280,19 @@ export async function POST(req: NextRequest) {
         const verified = await atomicRead(() => supplementSourceEvidence(doubanVerified, deadline, access.signal, (sourceDone, sourceTotal) => {
           emit({ type: 'progress', step: 'verify', done: candidates.length, total: candidates.length, provider: 'source', sourceDone, sourceTotal });
         }));
-        emit({ type: 'result', step: 'verify', verified });
+        // 签发票据：把 verified 嵌进 payload，绑 u/q/c/exp。key 不可用时不发票（rerank 会拒绝），
+        // 保留 verified 字段以免前端大改；ticket 为新增字段。
+        const key = ticketSigningKey();
+        const ticket = key ? issueVerifyTicket(key, { userId, query, conditions, verified }) : null;
+        emit({ type: 'result', step: 'verify', verified, ...(ticket ? { ticket } : {}) });
         return;
       }
 
       if (step === 'rerank') {
         const query = boundedString(body.query, MAX_QUERY_LENGTH) ?? '';
         const conditions = boundedString(body.conditions, MAX_CONDITIONS_LENGTH) ?? '';
-        const verified = sanitizeVerified(body.verified);
-        if (!query || verified.length === 0) {
-          fail('MISSING_QUERY_OR_VERIFIED', 'missing query or verified');
-          return;
-        }
+        // 只信上面预检从票据解出的 verified；body.verified 完全不参与。
+        const verified = rerankVerified!;
         emit({ type: 'phase', step: 'rerank', total: verified.length });
         const { content: profile } = await atomicRead(() => getProfileForUser(userId));
         const raw = await atomicRead(() => modelStep(
