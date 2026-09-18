@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { fetchSourceText, MAX_SOURCE_BYTES } from './source-fetch';
+import { fetchSourceText, MAX_SOURCE_BYTES, SOURCE_CONNECT_TIMEOUT_MS, SOURCE_HOST_SWAP_DELAY_MS } from './source-fetch';
 
 afterEach(() => { vi.unstubAllGlobals(); vi.useRealTimers(); });
 const options = () => ({ signal: new AbortController().signal });
@@ -51,9 +51,9 @@ describe('source fetch worker policy parity', () => {
     vi.stubGlobal('fetch', vi.fn().mockImplementation(async () => new Response(new ReadableStream({ cancel }))));
     const result = fetchSourceText('https://book15.net/', { ...options(), timeoutMs: 100, connectTimeoutMs: 1000 });
     const assertion = expect(result).rejects.toMatchObject({ name: 'TimeoutError' });
-    // 首次总超时 → 换 host 重试（新计时器）→ 第二次总超时；两次都到点才算收敛。
+    // 首次总超时 → 换 host 退避 → 换 host 重试（新计时器）→ 第二次总超时；全部到点才算收敛。
     await vi.advanceTimersByTimeAsync(101);
-    await vi.advanceTimersByTimeAsync(101);
+    await vi.advanceTimersByTimeAsync(SOURCE_HOST_SWAP_DELAY_MS + 101);
     await assertion;
     expect(cancel).toHaveBeenCalledTimes(2); // apex 与 www 各释放一次迟到的响应体
   });
@@ -85,6 +85,55 @@ describe('www.book15.net 同站兜底与超时拆段', () => {
     expect(beforeRequest).toHaveBeenCalledOnce();
   });
 
+  it('waits the host-swap backoff between the failed attempt and the retry', async () => {
+    // www-review-2 P2-4：0ms 连打另一 host 只是撞同一抖动簇。fake timers 断言退避一拍。
+    vi.useFakeTimers();
+    const starts: number[] = [];
+    const fetchMock = vi.fn()
+      .mockImplementationOnce(async () => { starts.push(Date.now()); throw transportFailure; })
+      .mockImplementationOnce(async () => { starts.push(Date.now()); return new Response('正文'); });
+    vi.stubGlobal('fetch', fetchMock);
+    const result = fetchSourceText('https://book15.net/a', options());
+    const assertion = expect(result).resolves.toEqual({ url: 'https://www.book15.net/a', text: '正文' });
+    await vi.advanceTimersByTimeAsync(SOURCE_HOST_SWAP_DELAY_MS - 1);
+    expect(fetchMock).toHaveBeenCalledOnce(); // 退避未到，第二发还没发出
+    await vi.advanceTimersByTimeAsync(1);
+    await assertion;
+    expect(starts[1] - starts[0]).toBeGreaterThanOrEqual(SOURCE_HOST_SWAP_DELAY_MS);
+  });
+
+  it('uses the 3s connect deadline without an explicit connectTimeoutMs', async () => {
+    // 默认值钉子（两线审查同发现：变异 3s→300s 现有用例全绿）。不传 connectTimeoutMs，
+    // 断言 3s 前不放弃、3s 整触发换 host。退避期间已越过 3s 边界，一次推进收敛。
+    vi.useFakeTimers();
+    const fetchMock = vi.fn()
+      .mockImplementationOnce(() => new Promise<Response>(() => {}))
+      .mockImplementationOnce(async () => new Response('正文'));
+    vi.stubGlobal('fetch', fetchMock);
+    const result = fetchSourceText('https://book15.net/a', options());
+    const assertion = expect(result).resolves.toEqual({ url: 'https://www.book15.net/a', text: '正文' });
+    await vi.advanceTimersByTimeAsync(SOURCE_CONNECT_TIMEOUT_MS - 1);
+    expect(fetchMock).toHaveBeenCalledOnce(); // 默认 3s 未到，连接段还没超时
+    await vi.advanceTimersByTimeAsync(SOURCE_HOST_SWAP_DELAY_MS + 1);
+    await assertion;
+  });
+
+  it('does not swap hosts for decode errors', async () => {
+    // 非法 UTF-8 的 TextDecoder TypeError：内容侧问题，两 host 同内容，换 host 注定再失败
+    // （www-review-2 P2-2 的核心反例：兜底 instanceof Error 会放行为 4 次物理请求）。
+    const badUtf8 = () => {
+      const decoder = new TextDecoder('utf-8', { fatal: true });
+      decoder.decode(new Uint8Array([0xff, 0xfe, 0xfd]));
+      throw new TypeError('The encoded data is not valid.');
+    };
+    const fetchMock = vi.fn()
+      .mockImplementationOnce(async () => { badUtf8(); return new Response('x'); })
+      .mockImplementation(async () => new Response('x'));
+    vi.stubGlobal('fetch', fetchMock);
+    await expect(fetchSourceText('https://book15.net/', options())).rejects.toThrow('not valid');
+    expect(fetchMock).toHaveBeenCalledOnce();
+  });
+
   it('swaps back from www to the apex host symmetrically', async () => {
     const fetchMock = vi.fn()
       .mockRejectedValueOnce(transportFailure)
@@ -111,14 +160,14 @@ describe('www.book15.net 同站兜底与超时拆段', () => {
 
   it('aborts a stalled connect phase at connectTimeoutMs and falls back to the alternate host', async () => {
     vi.useFakeTimers();
-    // apex：fetch 永不 settle（连接挂起）；www：返回正常正文。
+    // apex：fetch 永不 settle（连接挂起）；www：返回正常正文。显式传 3s 与默认用例互补。
     const fetchMock = vi.fn()
       .mockImplementationOnce(() => new Promise<Response>(() => {}))
       .mockImplementationOnce(async () => new Response('正文'));
     vi.stubGlobal('fetch', fetchMock);
     const result = fetchSourceText('https://book15.net/a', { ...options(), connectTimeoutMs: 3_000 });
     const assertion = expect(result).resolves.toEqual({ url: 'https://www.book15.net/a', text: '正文' });
-    await vi.advanceTimersByTimeAsync(3_001);
+    await vi.advanceTimersByTimeAsync(3_000 + SOURCE_HOST_SWAP_DELAY_MS + 1);
     await assertion;
   });
 });

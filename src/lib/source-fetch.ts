@@ -8,23 +8,30 @@ export const SOURCE_TIMEOUT_MS = 8_000;
 // 连接段（近似为 fetch settle，即 connect+响应头到达）独立上限：成功样本 connect ≤0.51s、
 // TTFB ≤2.11s，3s 是紧但有余量的合并段（调研 §4）；卡在连接/TTFB 的请求等满总 8s 纯浪费预算。
 export const SOURCE_CONNECT_TIMEOUT_MS = 3_000;
+// 换 host 重试前的退避：抖动是秒级簇，0ms 连打另一 host 只是撞同一簇；复用 source-reader
+// 的节流槽宽（350ms）。导出供调用方共享同一常量语义，避免两处漂移。
+export const SOURCE_HOST_SWAP_DELAY_MS = 350;
 
 function cancelBody(response: Response, reason?: unknown) {
   if (response.body && !response.body.locked) void response.body.cancel(reason).catch(() => {});
 }
 
-// 换 host 重试只对网络层失败（连接/传输超时、连接错误）生效；HTTP 状态码与策略
-// 拒绝是拿到响应后的判定，换 host 不改变结果（任务书与调研 §1.2 口径）。
-// beforeRequest 钩子的失败（预算耗尽/节流中止）也在这里排除：那是调用方的停止指令，
-// 与路径无关；标记而非 instanceof 是为了不引入 source-reader 的循环依赖。
+// 换 host 重试只对网络/传输层失败生效；HTTP 状态码与策略拒绝是拿到响应后的判定，
+// 换 host 不改变结果（任务书与调研 §1.2 口径）。三类排除：
+// - beforeRequest 钩子的失败（预算耗尽/节流中止）：调用方的停止指令，与路径无关；
+//   标记而非 instanceof 是为了不引入 source-reader 的循环依赖。
+// - 解码/解析类错误（TextDecoder fatal、JSON 解析）：内容侧问题，另一 host 同样内容。
+// - abort（AbortError）：调用方主动取消。
 interface BeforeRequestFailure { fromBeforeRequest?: boolean }
 
 function isTransportError(error: unknown): boolean {
   if ((error as BeforeRequestFailure).fromBeforeRequest) return false;
   if (error instanceof SourcePolicyError || error instanceof SourceHttpError) return false;
   if (error instanceof DOMException) return error.name === 'TimeoutError' || error.name === 'ConnectTimeoutError';
-  // undici 网络错误（TypeError: fetch failed 等）与调用方 signal abort 之外的剩余错误。
-  return error instanceof Error;
+  // 只认传输特征：undici 网络错误固定为 TypeError 且 message 前缀 fetch failed（含 cause
+  // 链上的 ECONNRESET/ENOTFOUND 等）。TextDecoder 的 TypeError（非法 UTF-8）等其余 Error
+  // 一律不换 host——4 次注定失败的物理请求比 1 次更糟（www-review-2 P2-2）。
+  return error instanceof TypeError && /^fetch failed/i.test(error.message);
 }
 
 export function sourceAbortable<T>(promise: PromiseLike<T>, signal: AbortSignal): Promise<T> {
@@ -86,14 +93,27 @@ export async function fetchSourceText(input: string, {
     });
   } catch (error) {
     // 4xx/5xx/策略拒绝：源站行为或响应侧判定，换 host 不改变结果，原样上抛；
-    // 网络层失败且确有备用 host 时，换 host 整体重试一次（同一次逻辑请求，见下）。
+    // 网络层失败且确有备用 host 时，退避后换 host 整体重试一次（同一次逻辑请求，见下）。
     parentSignal.throwIfAborted();
     if (!isTransportError(error) || !swapped) throw error;
+    await sourceHostSwapDelay(parentSignal);
+    parentSignal.throwIfAborted();
     return await attemptOnce(swapped, {
       signal: parentSignal, timeoutMs, connectTimeoutMs, maxRedirects, maxBytes, beforeRequest,
       skipFirstBeforeRequest: true,
     });
   }
+}
+
+// 抖动是秒级簇，换 host 前 0ms 连打只会撞同一簇；退避一拍再换路。
+// 不与 page() 的节流叠加：那里 nextRequestAt 已罩住常规请求间隔，这里是失败重试的额外一拍。
+function sourceHostSwapDelay(signal: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => { signal.removeEventListener('abort', abort); resolve(); }, SOURCE_HOST_SWAP_DELAY_MS);
+    const abort = () => { clearTimeout(timer); signal.removeEventListener('abort', abort); reject(signal.reason); };
+    signal.addEventListener('abort', abort, { once: true });
+    if (signal.aborted) abort();
+  });
 }
 
 function swapHost(url: URL): URL | null {

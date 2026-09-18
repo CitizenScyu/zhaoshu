@@ -129,7 +129,7 @@ describe('/api/download recovery and cleanup', () => {
     expect(res.status).toBe(201);
     expect(await res.json()).toEqual({ taskId: 43 });
     expectSafeReclaim(1);
-    expect(queryText(2)).toMatch(/WHERE book_id = \? AND status IN \('pending', 'running'\) ORDER BY created_at DESC LIMIT 1$/);
+    expect(queryText(2)).toMatch(/WHERE user_id = \? AND book_id = \? AND status IN \('pending', 'running'\) ORDER BY created_at DESC LIMIT 1$/);
     expect(queryText(3)).toMatch(/^INSERT INTO download_tasks /);
     expect(sql.mock.calls[3].slice(1)).toEqual([1, book.id, book.title, book.author, book.source_url]);
     expect(triggerDownloadWorkflow).toHaveBeenCalledOnce();
@@ -178,6 +178,16 @@ describe('/api/download recovery and cleanup', () => {
       .mockResolvedValueOnce([]).mockResolvedValueOnce([]).mockResolvedValueOnce([{ id: 43 }]);
     expect((await POST(request('POST', { bookId: book.id, sourceUrl: 'https://127.0.0.1/private' }))).status).toBe(201);
     expect(sql.mock.calls[3].slice(1)).toEqual([1, book.id, book.title, book.author, book.source_url]);
+    expect(triggerDownloadWorkflow).toHaveBeenCalledOnce();
+  });
+
+  it('enqueues a www.book15.net source, mirroring the reading-side allowlist', async () => {
+    // www 是同站备用 host（阅读侧与 worker 侧 policy 已同步放行），书库存量 www 来源照常入队。
+    const wwwUrl = 'https://www.book15.net/books/details7.html';
+    sql.mockResolvedValueOnce([{ ...book, source_url: wwwUrl }])
+      .mockResolvedValueOnce([]).mockResolvedValueOnce([]).mockResolvedValueOnce([{ id: 43 }]);
+    expect((await POST(request('POST', { bookId: book.id }))).status).toBe(201);
+    expect(sql.mock.calls[3].slice(1)).toEqual([1, book.id, book.title, book.author, wwwUrl]);
     expect(triggerDownloadWorkflow).toHaveBeenCalledOnce();
   });
 
