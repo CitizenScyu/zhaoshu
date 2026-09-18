@@ -70,6 +70,15 @@ describe('找书面板的默认状态', () => {
     // 默认是长期通道：checkbox 上没有 checked 属性。
     expect(html).toMatch(/<input type="checkbox"(?![^>]*checked)[^>]*\/>/);
   });
+
+  // F12：文案承诺的两个边界必须与实现的 retention 契约一致——「仅本次」= session（不写搜索
+  // 历史、推荐记录不落需求原文），默认 = longterm（两者都写）。文案里这两句是可断言的锚点；
+  // 真正的保留行为由 find-retention.test.ts 逐格钉住。
+  it('文案承诺的「仅本次」/「默认长期」边界与 retention 契约一致', () => {
+    const html = render();
+    expect(html).toContain('不进入记忆');
+    expect(html).toContain('默认长期记录');
+  });
 });
 
 describe('示例 chips 的补位规则', () => {

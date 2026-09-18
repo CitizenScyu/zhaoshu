@@ -3,6 +3,7 @@ import {
   consumeFindSSE,
   fetchFindResult,
   persistWarning,
+  zeroResultNote,
   type SseEvent,
 } from './find-sse';
 
@@ -180,5 +181,29 @@ describe('写库失败必须对用户可见', () => {
       new AbortController().signal, () => Promise.resolve(res), 1000, () => {},
     );
     expect(persistWarning(event)).toBeTruthy();
+  });
+});
+
+// F13：合法零结果（items 为空）与写库失败是两回事——前者是正常结局，只讲清为什么没结果，
+// 不套用「未能保存」的警告；后者走 persistWarning。
+describe('合法零结果给出排除摘要而不是保存警告', () => {
+  it('空 items 且带摘要时拼出原因 + 建议', () => {
+    const note = zeroResultNote({
+      type: 'result', items: [], zeroReason: '本轮 3 本候选全被重排淘汰。', zeroSuggestion: '没有自动放宽任何硬约束。',
+    });
+    expect(note).toContain('全被重排淘汰');
+    expect(note).toContain('没有自动放宽');
+  });
+
+  it('items 非空 / 非 result 帧 / 缺摘要都不误报', () => {
+    expect(zeroResultNote({ type: 'result', items: [{ title: '书' }] })).toBeNull();
+    expect(zeroResultNote({ type: 'result', items: [] })).toBeNull();
+    expect(zeroResultNote({ type: 'progress', step: 'verify' })).toBeNull();
+  });
+
+  it('零结果不触发「未能保存」的写库警告（persisted 缺省）', () => {
+    const event: SseEvent = { type: 'result', items: [], zeroReason: '全被淘汰。', zeroSuggestion: '重新试。' };
+    expect(persistWarning(event)).toBeNull();
+    expect(zeroResultNote(event)).toBeTruthy();
   });
 });

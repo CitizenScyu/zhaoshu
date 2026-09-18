@@ -22,13 +22,14 @@ import {
 } from '@/lib/sanitize';
 import { withFindAccess, personalError } from '@/lib/personal-request';
 import { issueVerifyTicket, readVerifyTicket, ticketSigningKey } from '@/lib/verify-ticket';
+import { parseRetention, persistedQuery } from '@/lib/find-retention';
 import {
   recallSystem,
   recallUser,
   rerankSystem,
   rerankUser,
 } from '@/lib/prompts';
-import type { VerifiedCandidate } from '@/lib/types';
+import type { SourceEvidence, VerifiedCandidate } from '@/lib/types';
 import { DeadlineExceededError, MODEL_ROUTE_INTERNAL_BUDGET_MS } from '@/lib/deadline';
 
 export const maxDuration = 295;
@@ -47,7 +48,17 @@ const MODEL_CEILING_MS = 260_000;
 
 // 模型输出始终从 unknown 收窄；形状偏了也尽量收容——整份正文是已付费的输出，
 // 丢掉它要赔上整步预算重跑，而真正的形状校验在下游（见下）。
-function modelList(raw: string, field: 'candidates' | 'items', max: number): unknown[] {
+//
+// F13：空列表不再一律当形状错误。recall 的书单为空仍是「无效数量」（保留原语义），
+// 但 rerank 的 `{items:[]}` 是**合法零结果**——模型据画像硬雷点淘汰了全部候选，是正常
+// 结局而非模型故障（旧实现把它当解析失败，白重试一次模型再报 502）。调用方用 allowEmpty
+// 显式声明该步是否接受空列表，避免把「结构错误」与「合法零结果」混在一个判定里。
+function modelList(
+  raw: string,
+  field: 'candidates' | 'items',
+  max: number,
+  { allowEmpty = false }: { allowEmpty?: boolean } = {},
+): unknown[] {
   const parsed = parseJson(raw);
   // 根直接是数组是不同模型族常见的「少包一层」写法（兜底模型尤其容易），收容它；
   // 其余非对象根（字符串/数字/null）仍是上游格式错误，文案与 retryable 语义不变。
@@ -69,13 +80,12 @@ function modelList(raw: string, field: 'candidates' | 'items', max: number): unk
       if (arrays.length === 1) list = arrays[0];
     }
   }
-  if (!Array.isArray(list) || list.length === 0) {
+  if (!Array.isArray(list) || (list.length === 0 && !allowEmpty)) {
     throw new LlmError('模型返回的书单字段或数量无效，请重试。', false);
   }
   // 数量超限截断而不是抛：下游 sanitizeCandidates / sanitizeRerankedItems 第一行就是
   // slice(0, MAX_CANDIDATES / MAX_RERANKED_ITEMS)。在这里为「数量」再抛一次是重复且更严格的
-  // 校验，代价是丢掉整份输出并触发整步重跑（2026-09-17 那次 260.3s 失败）。空数组仍抛错——
-  // 空不是「可收容」的形状。
+  // 校验，代价是丢掉整份输出并触发整步重跑（2026-09-17 那次 260.3s 失败）。
   return list.length > max ? list.slice(0, max) : list;
 }
 
@@ -134,9 +144,26 @@ async function modelStep<T>(
 // 一律用召回原件覆盖（见下面 byBook 回填），回传全文只是把 prompt 撑大——12 本候选的
 // 合成样本上这两项占输入 JSON 的 45%。重排真正要看的信号是身份（title/author）、
 // 题材字数与豆瓣外部证据，全部保留。
+//
+// F14：书源补验（sourceEvidence）**压缩后**进重排输入。此前它被整个丢掉，补验花掉的时间与
+// 额度影响不了排序（豆瓣未收录但书源已匹配的候选仍可能被当幻觉降分）。这里只带三个短字段
+// ——status、匹配维度 matchedBy、来源类型 source——去掉冗长 note / URL / checkedAt
+// （单条 note ≈50 字，12 本候选就是约 600 字纯浪费的输入 token）。证据的**证明力**由
+// rerankSystem 约束：只证存在性/身份，不得当质量、评分或完结证明。
+function compactSourceEvidence(evidence: SourceEvidence) {
+  return {
+    status: evidence.status,
+    source: 'reading-source',
+    ...(evidence.status === 'matched'
+      ? { matchedBy: 'title+author' }
+      : evidence.code ? { code: evidence.code } : {}),
+  };
+}
+
 function rerankInput(verified: VerifiedCandidate[]) {
-  return verified.map(({ title, author, category, wordCount, douban }) => ({
+  return verified.map(({ title, author, category, wordCount, douban, sourceEvidence }) => ({
     title, author, category, wordCount, douban,
+    ...(sourceEvidence ? { sourceEvidence: compactSourceEvidence(sourceEvidence) } : {}),
   }));
 }
 
@@ -302,7 +329,7 @@ export async function POST(req: NextRequest) {
             rerankUser(profile, query, JSON.stringify(rerankInput(verified)), conditions),
             { temperature: 0.3, signal: access.signal, onUsage: recordUsageAfterResponse('find_rerank'), totalTimeoutMs, fallbackModel, ...modelAttemptLimits },
           )).content,
-          (content) => modelList(content, 'items', MAX_RERANKED_ITEMS),
+          (content) => modelList(content, 'items', MAX_RERANKED_ITEMS, { allowEmpty: true }),
         ));
         // 用书名+作者关联，避免同名作品回填到错误的豆瓣条目。
         const byBook = new Map(verified.map((v) => [bookKey(v.title, v.author), v]));
@@ -325,18 +352,38 @@ export async function POST(req: NextRequest) {
           })
           .sort((a, b) => b.matchScore - a.matchScore)
           .slice(0, MAX_RERANKED_ITEMS);
+        // F13：全部候选被淘汰是**合法零结果**，不是模型故障——正常收尾为 200 + 空 items，
+        // 让前端的空态（「本轮没有符合条件的书。」）真正可达。不自动放宽硬约束：只把本轮
+        // 候选的证据构成说清楚，并建议用户自己改条件。模型在重排时整批淘汰，原因只在模型
+        // 判断里，服务端能提供的客观摘要就是候选的证据分布。
+        //
+        // 关键区分：只有**模型的原始输出就是空书单**（raw.length === 0，如 {"items":[]}）才算
+        // 合法零结果。模型给了条目、但全部没通过清洗/身份关联（非法分数、不可入库文本、
+        // 输入集合之外的书）仍是形态错误——那是模型没按契约输出，不能伪装成「没有符合条件的书」。
         if (items.length === 0) {
-          fail('LLM_ERROR', '重排结果为空，换个说法试试');
+          if (raw.length > 0) {
+            fail('LLM_ERROR', '重排结果为空，换个说法试试');
+            return;
+          }
+          const doubanVerified = verified.filter((v) => v.douban?.status === 'verified').length;
+          const sourceMatched = verified.filter((v) => v.sourceEvidence?.status === 'matched').length;
+          const zeroReason = `本轮 ${verified.length} 本候选全被重排淘汰：命中你画像里的硬性雷点，或可用证据不足。`
+            + `（其中豆瓣已收录 ${doubanVerified} 本、书源已匹配 ${sourceMatched} 本）`;
+          const zeroSuggestion = '没有自动放宽任何硬约束；可修改本次条件或换个说法再试。';
+          emit({ type: 'result', step: 'rerank', items: [], zeroReason, zeroSuggestion });
           return;
         }
 
         // 持久化：books + recommendations（写回阶段用同一份预算，预算耗尽则停写）
         // 身份归一在 user-data.ts 的查询构造器里做（写库边界唯一一处），
         // 回传给客户端的仍是召回阶段的原始拼写——这条契约由 route.test.ts 钉住。
+        // F12：临时契约（retention=session）不把需求原文写进推荐记录的 query 字段，
+        // 避免本次需求进入长期检索记录；推荐的书本身仍照常落库。
+        const retention = parseRetention(body.retention);
         let persisted = true;
         try {
           deadline.assert();
-          const written = await access.commit((write) => persistRecommendationsForUser(userId, query, items, write));
+          const written = await access.commit((write) => persistRecommendationsForUser(userId, persistedQuery(retention, query), items, write));
           // F09：写入行数与期望本数不符（身份/连接问题导致静默漏写）不得回报成功。
           if (written !== items.length) {
             persisted = false;

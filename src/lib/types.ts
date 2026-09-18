@@ -18,6 +18,11 @@ export interface FindConditions {
   text: string;
 }
 
+// F12：找书需求的保留契约。显式声明「只影响本次」还是「记入长期」，不再以 conditions
+// 是否为空来推断。session 不写搜索历史、推荐记录的 query 字段不落原文；longterm 两者都写。
+// 两条路径都**不**写画像（找书本身从不改画像）。
+export type FindRetention = 'session' | 'longterm';
+
 // LLM 召回的候选书
 export interface Candidate {
   title: string;
