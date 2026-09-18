@@ -61,10 +61,12 @@ export function decodeBase64Layer(payload: string): string {
   if (compact.length % 4 === 1 || !/^[A-Za-z0-9+/]+={0,2}$/.test(compact)) return payload;
   const bytes = Buffer.from(compact, 'base64');
   // 往返校验：宽容解码会丢弃非法字符，重编码后与原串不等；此步是识别非法输入的关键。
+  // 要求「规范 base64（填充位为零）」：如 `YR==`（Node 宽容解成 `a`）会因重编码为 `YQ==` 被拒。
   if (bytes.toString('base64').replace(/=+$/u, '') !== compact.replace(/=+$/u, '')) return payload;
   const decoded = bytes.toString('utf8');
-  // UTF-8 有效性：空结果或含替换字符 U+FFFD = 解码出的不是合法文本，回落原文。
-  if (decoded === '' || decoded.includes('�')) return payload;
+  // UTF-8 有效性：空结果，或「解码 → 重编码」字节不等（非法字节被折叠成了 U+FFFD）。
+  // 用字节往返而非扫 U+FFFD，避免把原文本就含替换字符的**合法** UTF-8 误判为非法。
+  if (decoded === '' || !Buffer.from(decoded, 'utf8').equals(bytes)) return payload;
   return decoded;
 }
 
