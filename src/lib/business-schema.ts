@@ -177,5 +177,23 @@ export async function initializeBusinessSchema(s: Sql) {
     ALTER TABLE app_settings ADD COLUMN IF NOT EXISTS default_model_reasoning text`,
     tx`
     ALTER TABLE app_settings ADD COLUMN IF NOT EXISTS default_model_updated_at timestamptz`,
+    // M1 准入结果（设计 §4.3）：probe 是 host 级健康态、生命周期长；admission 是「源+规则版本」
+    // 级资格，规则变（rules_hash 变）即作废重测，故独立成表，不复用 probeSnapshot。
+    // host 冗余一列喂运行时门的 host 集合（§6.1）；tier 记引擎档位（M1/T7）。
+    tx`
+    CREATE TABLE IF NOT EXISTS source_admission (
+      id serial PRIMARY KEY,
+      source_url text NOT NULL UNIQUE,
+      tier text NOT NULL,
+      compile_ok boolean NOT NULL,
+      core_field_mask jsonb NOT NULL,
+      search_ok boolean,
+      search_verdict text NOT NULL DEFAULT '',
+      search_checked_at timestamptz,
+      rules_hash text NOT NULL,
+      host text NOT NULL,
+      error text NOT NULL DEFAULT ''
+    )`,
+    tx`CREATE INDEX IF NOT EXISTS source_admission_host_idx ON source_admission (host)`,
   ]);
 }
