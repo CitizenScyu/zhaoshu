@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { normalizeAuthor } from './normalize_author.mjs';
+import { HTML_SOURCE, normalizeAuthor } from './normalize_author.mjs';
 
 const html = Object.freeze({ sourceSite: 'book15.net' });
 const normalize = (value, options = html) => normalizeAuthor(value, options);
@@ -26,7 +26,7 @@ describe('作者 HTML 实体规范化', () => {
     });
   }
 
-  for (const input of ['埃里克·霍弗', '作者😀', '作者👩‍💻', 'A & B', 'AT&T', 'A&B', '&', '作者&', 'e\u0301', 'ＡＢＣ', '']) {
+  for (const input of ['埃里克·霍弗', '作者😀', '作者👩‍💻', 'A & B', 'AT&T', 'A&B', '&', '作者&', 'e\u0301', 'ＡＢＣ']) {
     it('普通文本保持原值 ' + JSON.stringify(input), () => {
       assert.deepEqual(normalize(input), { status: 'ready', value: input, changed: false });
       assert.equal(normalize(input, {}).status, 'ready');
@@ -35,7 +35,31 @@ describe('作者 HTML 实体规范化', () => {
 
   it('只 trim 外围空格，不改作者内部空格或 Unicode 形式', () => {
     assert.equal(normalize('  作  者　').value, '作  者');
-    assert.equal(normalize('  ').value, '');
+  });
+
+  // 空作者（含纯空白 / 全角空格 　 / 实体解码后为空白）不能自动导入：
+  // 身份键 author_key='' 与存量非空作者不冲突，ON CONFLICT 不触发会插入第二行。
+  // status 必须是 review（与 import_one.py 对齐），不是 ready。
+  for (const input of ['', '  ', '　', ' ', ' 　 ']) {
+    it('空作者不予自动导入 ' + JSON.stringify(input), () => {
+      for (const options of [html, {}, { sourceSite: HTML_SOURCE, encoding: 'text-v1' }]) {
+        const result = normalize(input, options);
+        assert.equal(result.status, 'review');
+        assert.equal(result.reasonCode, 'empty-author');
+        assert.equal(result.value, input);
+      }
+    });
+  }
+
+  it('实体解码后只剩空白的作者也不予自动导入', () => {
+    const result = normalize('&nbsp;  ', html);
+    assert.equal(result.status, 'review');
+    assert.equal(result.reasonCode, 'empty-author');
+    assert.equal(result.value, '&nbsp;  ');
+    // 未确认来源走 unconfirmed-source，同样不是 ready
+    assert.equal(normalize('&nbsp;  ', {}).status, 'review');
+    // text-v1 不解码实体，&nbsp; 是普通文本，保持原值
+    assert.equal(normalize('&nbsp;  ', { ...html, encoding: 'text-v1' }).status, 'ready');
   });
 
   for (const [input, reasonCode] of [
