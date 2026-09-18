@@ -8,7 +8,8 @@ vi.mock('@/lib/db', async (original) => ({ ...await original<typeof import('@/li
 
 // 显式枚举 HTTP 导出；新增路由或方法必须同时声明权限，不能悄悄变成匿名入口。
 // auth-entry 仅表示认证流程可接收匿名请求，其 CSRF/凭据/限速由各自用例验证。
-const policies: Record<string, Record<string, 'find' | 'read' | 'download' | 'owner' | 'legacy-owner' | 'auth-entry'>> = {
+// cron 表示只由平台定时器以 CRON_SECRET 调用，不面向用户身份，守卫在各自路由用例里验证。
+const policies: Record<string, Record<string, 'find' | 'read' | 'download' | 'owner' | 'legacy-owner' | 'auth-entry' | 'cron'>> = {
   'admin/invites': { GET: 'owner', POST: 'owner' },
   'admin/invites/[id]/revoke': { POST: 'owner' },
   'admin/label-model': { GET: 'owner', PATCH: 'owner' },
@@ -20,7 +21,10 @@ const policies: Record<string, Record<string, 'find' | 'read' | 'download' | 'ow
   'auth/owner': { POST: 'auth-entry' }, 'auth/register': { POST: 'auth-entry' },
   'auth/registration': { GET: 'auth-entry' }, 'auth/session': { GET: 'auth-entry' },
   download: { GET: 'download', POST: 'download', DELETE: 'download' },
-  'download/[id]/file': { GET: 'download' }, export: { GET: 'find' },
+  'download/[id]/file': { GET: 'download' },
+  // F16：过期下载租约的周期回收，只由 Vercel cron 以 CRON_SECRET 调用（见 route.test.ts）。
+  'download/reclaim': { GET: 'cron' },
+  export: { GET: 'find' },
   feedback: { GET: 'find', POST: 'find' }, find: { POST: 'find' },
   // 精确找书（task-77）：与 /api/find 同为「找书」能力，且同样会向豆瓣发外部请求，
   // 所以必须走同一套 withFindAccess（匿名必须在读写与外部副作用之前被拒）。
@@ -73,7 +77,7 @@ describe('API 权限清单', () => {
   }, 30_000);
   for (const [route, methods] of Object.entries(policies)) {
     for (const [method, policy] of Object.entries(methods)) {
-      if (policy === 'auth-entry') continue;
+      if (policy === 'auth-entry' || policy === 'cron') continue;
       it(`${method} /api/${route} (${policy}) 在业务读写和外部副作用前拒绝匿名`, async () => {
         const routeModule = await loaders[`../app/api/${route}/route.ts`]() as Record<string, (req: NextRequest, ctx: unknown) => Promise<Response>>;
         const req = new NextRequest(`http://localhost/api/${route}`, {
