@@ -242,7 +242,9 @@ describe('作者在身份键和 SQL 绑定前规范化', () => {
       }, out);
       assert.equal(out.author, '埃里克·霍弗');
       assert.equal(query.values[1], '埃里克·霍弗');
-      assert.match(query.text, /ON CONFLICT \(lower\(title\), lower\(author\)\)/);
+      // 0002_identity_key.sql 起，冲突目标从表达式索引 lower(title),lower(author)
+      // 换成确定性生成列 title_key/author_key；断言随 DDL 归位。
+      assert.match(query.text, /ON CONFLICT \(title_key, author_key\)/);
       assert.deepEqual(JSON.parse(query.values[7]), original.labels);
       assert.deepEqual(input, original);
     });
@@ -251,7 +253,7 @@ describe('作者在身份键和 SQL 绑定前规范化', () => {
   it('实体的不同写法与普通文本进入同一个唯一身份键，重复导入不新增 mock 行', async () => {
     const rows = new Map();
     const sql = async (strings, ...values) => {
-      assert.match(strings.join('?'), /ON CONFLICT \(lower\(title\), lower\(author\)\)/);
+      assert.match(strings.join('?'), /ON CONFLICT \(title_key, author_key\)/);
       const key = JSON.stringify([values[0].toLowerCase(), values[1].toLowerCase()]);
       rows.set(key, values);
     };
