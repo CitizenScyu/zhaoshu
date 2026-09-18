@@ -44,19 +44,28 @@ export function normalizeBody(input: string, contentType?: string): NormalizedBo
   return { kind: 'html', text: decoded };
 }
 
-/** `inte_base64:` 一层解包。解不出（非法 base64 / 超限）→ 返回原文，交给上层按 HTML 处理。 */
+/**
+ * `inte_base64:` 一层解包。严格校验；任一不通过 → 返回原文，交给上层按 HTML 处理。
+ *
+ * Node 的 `Buffer.from(x, 'base64')` 是**宽容解码**（丢弃非法字符、不抛异常），
+ * 单靠 try/catch 无法识别非法输入。故这里额外做字符集 + 长度 + 往返重编码比对 +
+ * UTF-8 有效性四道校验，避免把乱码当成功（如 `inte_base64:!!!not-base64!!!`
+ * 或误伤以该前缀开头的正常正文）。
+ */
 export function decodeBase64Layer(payload: string): string {
   const compact = payload.replace(/\s+/gu, '');
   if (compact === '') return payload;
   // 先按长度粗筛，避免为大体积输入分配解码缓冲。
   if (Math.floor((compact.length * 3) / 4) > MAX_DECODED_BYTES) return payload;
-  try {
-    const decoded = Buffer.from(compact, 'base64').toString('utf8');
-    if (decoded === '') return payload;
-    return decoded;
-  } catch {
-    return payload;
-  }
+  // 字符集 + 结构校验：base64 只含 A-Za-z0-9+/，尾部至多两个 =；长度 %4 不可能余 1。
+  if (compact.length % 4 === 1 || !/^[A-Za-z0-9+/]+={0,2}$/.test(compact)) return payload;
+  const bytes = Buffer.from(compact, 'base64');
+  // 往返校验：宽容解码会丢弃非法字符，重编码后与原串不等；此步是识别非法输入的关键。
+  if (bytes.toString('base64').replace(/=+$/u, '') !== compact.replace(/=+$/u, '')) return payload;
+  const decoded = bytes.toString('utf8');
+  // UTF-8 有效性：空结果或含替换字符 U+FFFD = 解码出的不是合法文本，回落原文。
+  if (decoded === '' || decoded.includes('�')) return payload;
+  return decoded;
 }
 
 function tryParseJson(text: string): { ok: true; value: unknown } | { ok: false } {
