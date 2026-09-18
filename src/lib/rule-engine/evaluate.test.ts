@@ -12,10 +12,13 @@ import {
   createHtmlScope,
   createJsonScope,
   createScope,
+  decodeBase64Layer,
   evaluateField,
   evaluateFieldNodes,
   evaluateFieldSafe,
   insideNode,
+  INTE_BASE64_PREFIX,
+  MAX_DECODED_BYTES,
   normalizeBody,
 } from './evaluate';
 import {
@@ -201,8 +204,40 @@ describe('evaluate：JSON 输入与输入归一化（§3.1）', () => {
     const b64 = (value: string) => Buffer.from(value, 'utf8').toString('base64');
     expect(normalizeBody(`inte_base64:${b64('<div>x</div>')}`)).toMatchObject({ kind: 'html', text: '<div>x</div>' });
     expect(normalizeBody(`inte_base64:${b64('{"a":1}')}`)).toMatchObject({ kind: 'json' });
-    expect(normalizeBody('inte_base64:!!!not-base64!!!').kind).toBe('html');
+    // 非法 payload → 回落原文（不得把宽容解码的乱码当 HTML）。
+    expect(normalizeBody('inte_base64:!!!not-base64!!!')).toMatchObject({ kind: 'html', text: '!!!not-base64!!!' });
     expect(createScope(normalizeBody('{"a":1}'), PAGE_URL).kind).toBe('json');
+  });
+
+  it('inte_base64 层：非法/非 UTF-8 payload 必须回落原文（C.11）', () => {
+    // 合法：decodeBase64Layer 直出明文；normalizeBody 文本相等（不再只断 kind）。
+    const plain = '<html><body>第1章 开端</body></html>';
+    const payload = INTE_BASE64_PREFIX + Buffer.from(plain, 'utf8').toString('base64');
+    expect(decodeBase64Layer(payload.slice(INTE_BASE64_PREFIX.length))).toBe(plain);
+    expect(normalizeBody(payload)).toEqual({ kind: 'html', text: plain });
+
+    // 非法 base64：Node 宽容解码会产出乱码，修复后必须回落原文。
+    const bad = '!!!not-base64!!!';
+    expect(decodeBase64Layer(bad)).toBe(bad);
+
+    // 前缀误伤：以 inte_base64: 开头的正常正文不得被解码毁掉。
+    const prose = 'this is normal chapter text about encoding';
+    expect(decodeBase64Layer(prose)).toBe(prose);
+    expect(decodeBase64Layer(prose).includes('�')).toBe(false);
+
+    // 超限：长度粗筛 → 原文（保留既有约束）。
+    const oversized = 'A'.repeat(Math.ceil(((MAX_DECODED_BYTES + 16) * 4) / 3));
+    expect(decodeBase64Layer(oversized)).toBe(oversized);
+
+    // 空串 → 空串。
+    expect(decodeBase64Layer('')).toBe('');
+
+    // 无 padding 的合法 base64（长度 %4==0）正常解码。
+    const noPadPlain = 'abc';
+    const noPad = Buffer.from(noPadPlain, 'utf8').toString('base64');
+    expect(noPad.includes('=')).toBe(false);
+    expect(noPad.length % 4).toBe(0);
+    expect(decodeBase64Layer(noPad)).toBe(noPadPlain);
   });
 });
 
