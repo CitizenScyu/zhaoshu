@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import { getSql } from './db';
 import { getReadingSources, type ReadingSource } from './shuyuan';
 import { fetchSourceText, sourceAbortable, SourceHttpError } from './source-fetch';
-import { SourcePolicyError, validateSourceUrl } from './source-policy';
+import { SourcePolicyError, alternateSourceHost, validateSourceUrl } from './source-policy';
 import { sourceRevision } from './source-revision';
 import {
   engineFetchDetail, engineFetchToc, engineSearchBook, type EngineSource,
@@ -315,8 +315,13 @@ export async function resolveSourceBook(
     // builtin 的 url 给引擎源的 bookUrl 算 sourceId/revision。匹配不到保持既有 sources[0]
     // 回退（单源池下等价），M2 收紧为 404。
     const targetHost = hostOf(url);
-    const source = sources.find((item) => hostOf(item.url) === targetHost) ?? sources[0];
-    if (!source) throw new SourceReaderError('书源已停用或规则已更新，请重新选择书源。', 'SOURCE_CHANGED', 409);
+    const source = sources.find((item) => {
+      const host = hostOf(item.url);
+      // 同站备用 host（book15.net ↔ www.book15.net，fetch 层换 host 兜底）视为同一个源。
+      return host === targetHost || (host.length > 0 && alternateSourceHost(targetHost) === host);
+    });
+    // 匹配不到 → 404 让用户重新选择（设计 §3.7：不猜、不回退 sources[0]，避免源标识错配）。
+    if (!source) throw new SourceReaderError('没有找到该候选对应的可用书源，请重新搜索。', 'SOURCE_NOT_FOUND', 404);
     if (!isBuiltinReadingSource(source)) {
       // 用户点选即用户决定：跳过书名/作者校验，只保留结构性防御与目录可解析（沿用现有语义）。
       const engineSource = engineSourceOf(source);
@@ -333,6 +338,9 @@ export async function resolveSourceBook(
     if (!confirmed) throw new SourceReaderError('用户选择的书源无法建立目录，请重试或换一个候选。', 'SOURCE_NOT_FOUND', 404);
     return confirmed;
   }
+  // 池预算（设计 §3.1）：只有池里真的含引擎源时才抬高全局兜底上限。builtin-only 池保持
+  // 今日预算语义逐点不变（零回归红线）；confirm 路径已在上面 return，不进入这里（§3.7）。
+  if (sources.some((source) => !isBuiltinReadingSource(source))) context.openPool(sources.length);
   const hints = await hintsFor(book, context.signal);
   let hadFailure = false;
   const checked = new Set<string>();
@@ -344,7 +352,20 @@ export async function resolveSourceBook(
   };
   // 只读观测账本：逐源记录「搜没搜、命中几候选、多少字节」，供整轮 404 汇总（不改控制流）。
   const searchStats: SourceSearchStat[] = [];
+  let index = 0;
   for (const source of sources) {
+    const isFirst = index === 0;
+    index += 1;
+    // 软预算 + 切片余量两段式判据（设计 §3.2）：只从第 2 个源起生效，builtin 首源不受约束。
+    // 剩余不足一片切片就不开新源——那次源注定被切片砍掉，只白白消耗墙钟与已扣点数。
+    // 判据与常量都在实现里（elapsed + slice > soft ⇔ remaining < slice），测试只做两侧反向断言。
+    if (!isFirst && SOFT_BUDGET_MS - (Date.now() - context.startedAt) < PER_SOURCE_SLICE_MS) {
+      hadFailure = true;
+      break;
+    }
+    // 首源沿用根 context；第 2 源起各自的 child（单源点数上限 + 切片定时器），requests/节流槽父子共享。
+    const sourceContext = isFirst ? context : context.child(source.url);
+    // 「整体中止」（父 deadline/取消 ⇒ route 504）只认父 signal：切片只 abort 子 signal（§3.3 陷阱）。
     context.signal.throwIfAborted();
     const stat: SourceSearchStat = { host: hostOf(source.url), searched: false, candidates: 0, bytes: 0 };
     searchStats.push(stat);
@@ -353,31 +374,32 @@ export async function resolveSourceBook(
       // 只做「搜索→详情→目录 + 身份校验」，身份校验沿用 sourceBookMatches（留在调用方）。
       if (!isBuiltinReadingSource(source)) {
         const engineSource = engineSourceOf(source);
-        const results = await engineSearchBook(engineSource, book.title, context);
+        const results = await engineSearchBook(engineSource, book.title, sourceContext);
         stat.searched = true;
         stat.candidates = results.length;
         for (const result of results.slice(0, MAX_DETAIL_CANDIDATES)) {
           if (result.bookUrl === options.excludeBookUrl || checked.has(source.url + result.bookUrl)) continue;
           checked.add(source.url + result.bookUrl);
           try {
-            const detail = await engineFetchDetail(engineSource, result.bookUrl, context);
+            const detail = await engineFetchDetail(engineSource, result.bookUrl, sourceContext);
             const identity: SourceBookIdentity = {
               title: detail.title ?? result.title, author: detail.author ?? result.author,
               ...(detail.alias ? { alias: detail.alias } : {}),
             };
             // 引擎只解释规则，不判断「这是不是那本书」——identity 是业务语义，留在调用方（§7.2）。
             if (!sourceBookMatches(book, identity)) continue;
-            const toc = await engineFetchToc(engineSource, detail.tocUrl ?? result.bookUrl, context);
+            const toc = await engineFetchToc(engineSource, detail.tocUrl ?? result.bookUrl, sourceContext);
             if (!toc.chapters.length) continue;
             const catalog = engineCatalogFrom(result.bookUrl, source, identity, toc.chapters);
             matches.set(catalog.bookUrl, catalog);
             if (knownSourceAuthor(book.author)) return catalog;
           } catch (error) {
             context.signal.throwIfAborted();
-            // 预算耗尽=搜索不完整：置 hadFailure 后交给外层循环的既有分桶（空结果 503）。
             if (error instanceof SourceReaderError) {
-              if (error.code === 'SOURCE_BUDGET_EXCEEDED') { hadFailure = true; break; }
-              if (error.code === 'SOURCE_SCOPE_EXHAUSTED') break;
+              // 全局兜底耗尽 ⇒ 交给外层统一 break（保留已收集，走既有 503 分桶）。
+              if (error.code === 'SOURCE_BUDGET_EXCEEDED') throw error;
+              // 单源点数/切片耗尽 ⇒ 该源本轮放弃，跳下一个源（hadFailure 置位，空结果最终 503 不 404）。
+              if (error.code === 'SOURCE_SCOPE_EXHAUSTED') { hadFailure = true; break; }
               throw error;
             }
             hadFailure = true;
@@ -394,7 +416,7 @@ export async function resolveSourceBook(
           if (url === options.excludeBookUrl || checked.has(source.url + url)) continue;
           checked.add(source.url + url);
           try {
-            const page = await context.page(url);
+            const page = await sourceContext.page(url);
             const catalog = catalogFrom(page, source, book);
             if (catalog) {
               matches.set(catalog.bookUrl, catalog);
@@ -420,7 +442,7 @@ export async function resolveSourceBook(
       };
       const hinted = await inspect(hints);
       if (hinted) return hinted;
-      const search = await context.page(sourceSearchUrl(source.searchUrl, book.title, source.url));
+      const search = await sourceContext.page(sourceSearchUrl(source.searchUrl, book.title, source.url));
       let candidates: string[] = [];
       stat.searched = true;
       stat.bytes = search.text.length;
@@ -453,7 +475,7 @@ export async function resolveSourceBook(
       // 作者搜索回退：标题搜索 0 候选、有作者可搜且作者不是书名本身时（改名书的站点索引
       // 只有新名），改搜作者。候选不看锚文本，身份靠详情页的标题/别名 + 作者门校验。
       if (!candidates.length && knownSourceAuthor(book.author) && knownSourceAuthor(book.author) !== normalizeSourceTitle(book.title)) {
-        const authorSearch = await context.page(sourceSearchUrl(source.searchUrl, book.author, source.url));
+        const authorSearch = await sourceContext.page(sourceSearchUrl(source.searchUrl, book.author, source.url));
         const authorCandidates = /^\/books\/details\d+\.html$/.test(new URL(authorSearch.url).pathname)
           ? [authorSearch.url]
           : parseSourceDetailLinks(authorSearch.text, authorSearch.url);
@@ -466,7 +488,7 @@ export async function resolveSourceBook(
           if (checked.has(source.url + url) || url === options.excludeBookUrl) continue;
           try {
             // 可选请求不重试（attempts=1）：一次抖动不应吃掉 2 点预算 + 2×8s。
-            collectSimilar(await context.page(url, 1));
+            collectSimilar(await sourceContext.page(url, 1));
           } catch (error) {
             context.signal.throwIfAborted();
             if (error instanceof SourceReaderError && error.code === 'SOURCE_BUDGET_EXCEEDED') break;
@@ -484,10 +506,27 @@ export async function resolveSourceBook(
           hadFailure = true;
           break;
         }
+        if (error.code === 'SOURCE_SCOPE_EXHAUSTED') {
+          // 单源点数/切片耗尽=跳源（设计 §3.3）：置 hadFailure（空结果 ⇒ 503 而非 404），继续下一个源。
+          hadFailure = true;
+          continue;
+        }
         throw error;
       }
       hadFailure = true;
     }
+  }
+  // 跨源同名去重（设计 §3.6）：无作者书里「同标题同作者」的跨源命中是同一本书的不同来源，
+  // 只保留源优先级最高的首条（Map 插入序=源序），交给 M3 换源；「同标题不同作者」仍计入 ⇒ 保留 422。
+  // 池=1 时不启用：单源内同键重复条目是该源的**真实歧义**，保持既有 422 语义（零回归红线）。
+  if (sources.length > 1 && !knownSourceAuthor(book.author) && matches.size > 1) {
+    const unique = new Map<string, SourceCatalog>();
+    for (const catalog of matches.values()) {
+      const key = normalizeSourceTitle(catalog.title) + '|' + knownSourceAuthor(catalog.author);
+      if (!unique.has(key)) unique.set(key, catalog);
+    }
+    matches.clear();
+    for (const [key, catalog] of unique) matches.set(key, catalog);
   }
   if (matches.size > 1) throw new SourceReaderError('找到多部同名作品，请补全作者后再阅读。', 'SOURCE_AMBIGUOUS', 422);
   // 无作者书的唯一匹配照常交付：接受「部分搜索下的唯一性风险」（生产无作者书 0-1 本，交付优于拒付；
