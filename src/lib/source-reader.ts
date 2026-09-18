@@ -169,6 +169,35 @@ export interface SourceCatalog extends SourceBookIdentity {
 const hash = (value: unknown) => createHash('sha1').update(JSON.stringify(value)).digest('hex');
 const revision = (source: ReadingSource) => hash([source.url, source.searchUrl, source.rules]);
 
+// ---- 只读观测（不改行为）：生产 404 零日志无法定位「空页 / 反爬页 / 解析错」----
+// 只输出 host、URL、字节数、计数、书名等非敏感字段；绝不输出 Cookie/Authorization/整页 HTML。
+function hostOf(url: string): string {
+  try { return new URL(url).host; } catch { return ''; }
+}
+
+function stripHash(url: string): string {
+  try { const parsed = new URL(url); parsed.hash = ''; return parsed.href; } catch { return url; }
+}
+
+// 反爬/挑战页的常见标记，语汇沿用 src/lib/llm.ts:491-492（`Just a moment` / `challenge-platform`），
+// 补 Cloudflare「Attention Required」、瑞数 ge_js_validator、cf-chl 挑战资源。
+const CHALLENGE_HINTS = [
+  'just a moment', 'cf-mitigated', 'attention required', 'ge_js_validator',
+  'challenge-platform', 'cf-chl', 'enable javascript and cookies to continue',
+];
+
+/** 页内是否疑似反爬挑战页；只读判定，不影响控制流。空响应不算挑战页（bytes 字段已单独体现）。 */
+function hasChallengeHint(text: string): boolean {
+  if (!text) return false;
+  const lower = text.toLowerCase();
+  if (CHALLENGE_HINTS.some((hint) => lower.includes(hint))) return true;
+  // 空壳 + script：正文极短却带脚本，常见于 JS 挑战页（真实目录页远大于此）。
+  return text.length < 1024 && /<script\b/i.test(text);
+}
+
+interface SourceSearchStat { host: string; searched: boolean; candidates: number; bytes: number }
+
+
 async function queryRows<T>(query: ReturnType<ReturnType<typeof getSql>>, signal: AbortSignal, readOnly = true): Promise<T[]> {
   signal.throwIfAborted();
   const [rows] = await sourceAbortable(getSql().transaction([query], { readOnly, fetchOptions: { signal } }), signal);
@@ -265,8 +294,12 @@ export async function resolveSourceBook(
     const candidate = similarCandidateFrom(page);
     if (candidate) similar.set(candidate.bookUrl, candidate);
   };
+  // 只读观测账本：逐源记录「搜没搜、命中几候选、多少字节」，供整轮 404 汇总（不改控制流）。
+  const searchStats: SourceSearchStat[] = [];
   for (const source of sources) {
     context.signal.throwIfAborted();
+    const stat: SourceSearchStat = { host: hostOf(source.url), searched: false, candidates: 0, bytes: 0 };
+    searchStats.push(stat);
     try {
       // Known metadata links save a source search but still require live identity checks.
       const inspect = async (urls: string[], collectFuzzy = false): Promise<SourceCatalog | undefined> => {
@@ -305,6 +338,8 @@ export async function resolveSourceBook(
       if (hinted) return hinted;
       const search = await context.page(sourceSearchUrl(source.searchUrl, book.title, source.url));
       let candidates: string[] = [];
+      stat.searched = true;
+      stat.bytes = search.text.length;
       if (/^\/books\/details\d+\.html$/.test(new URL(search.url).pathname) && search.url !== options.excludeBookUrl) {
         const direct = catalogFrom(search, source, book);
         if (direct) {
@@ -315,6 +350,19 @@ export async function resolveSourceBook(
         }
       } else {
         candidates = parseSourceSearch(search.text, search.url, book.title);
+        stat.candidates = candidates.length;
+        // 关键信号：搜索页抓取成功（无异常）却一个匹配锚点都没有 —— 区分「空页 / 反爬页 / 解析错」。
+        if (!candidates.length) {
+          console.warn('[read-source] search_no_candidates', JSON.stringify({
+            event: 'search_no_candidates',
+            sourceHost: stat.host,
+            searchUrl: stripHash(search.url),
+            bytes: search.text.length,
+            candidateCount: 0,
+            title: book.title,
+            hadChallengeHint: hasChallengeHint(search.text),
+          }));
+        }
       }
       const result = await inspect(candidates, true);
       if (result) return result;
@@ -372,6 +420,16 @@ export async function resolveSourceBook(
     const error = new SourceReaderError(message, 'SOURCE_SIMILAR', 422) as SourceReaderError & { candidates?: SourceSimilarCandidate[] };
     error.candidates = ranked;
     throw error;
+  }
+  // 整轮结束仍 404（所有抓取成功、只是没有匹配）时的汇总观测：一次带出「哪些源、搜没搜、命中几候选、多少字节」。
+  // 只在 SOURCE_NOT_FOUND 触发，不覆盖 hadFailure/预算耗尽（那是 SOURCE_UNAVAILABLE）。
+  if (!hadFailure) {
+    console.warn('[read-source] source_not_found', JSON.stringify({
+      event: 'source_not_found',
+      title: book.title,
+      sourcesTried: searchStats.length,
+      perSource: searchStats,
+    }));
   }
   throw new SourceReaderError(
     hadFailure ? '书源暂时无法提供这本书，请稍后重试，也可返回书库尝试「下载全书」。' : '没有找到书名和作者相符的可读书源，可返回书库尝试「下载全书」。',
