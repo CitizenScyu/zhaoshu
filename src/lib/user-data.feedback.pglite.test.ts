@@ -126,16 +126,16 @@ maybe('真实 PostgreSQL：feedbackForUserQueries 路线 B（写反馈时补 boo
     expect((await pg.query('SELECT id FROM feedback ORDER BY id')).rows).toEqual(feedbackRows);
   });
 
-  it('既有边界（非路线 B 引入）：同身份键、异拼写的历史行会让 lower(title) 定位落空', async () => {
-    // 直接写一行「未归一的旧拼写」——路线 B 的 upsert 会因身份键相同走 DO NOTHING，
-    // 而后面 4 条语句比的是 lower(title)（不带书名号归一），于是仍定位不到 → 0 行。
-    // 这是路线 B 之前就存在的行为（老代码同样 0 行），本用例只把边界钉住：
-    // 不新增第二行 books、不写进半条 feedback。find/shelf 写出的行都带归一拼写，
-    // 只有历史/直连 SQL 的行会落进这个分支。
+  it('既有边界（非路线 B 引入）：同身份键、异拼写的历史行也能被键等值定位（B7 修复）', async () => {
+    // 直接写一行「未归一的旧拼写」——路线 B 的 upsert 会因身份键相同走 DO NOTHING。
+    // 旧实现比 lower(title)（不做书名号归一），《斗破苍穹》会被定位落空 → 0 行反馈；
+    // B7 改为 title_key 键等值后同一身份键即可定位，反馈正常落库、books 不新增第二行。
+    // 这是键等值较旧实现的**行为改进**（修复而非破坏）：老边界只钉住「不建第二行」，
+    // 该不变量继续成立。
     await pg.query(`INSERT INTO books (title, author) VALUES ($1, $2)`, ['《斗破苍穹》', '天蚕土豆']);
     const books = (await pg.query('SELECT id, title FROM books ORDER BY id')).rows;
     const results = await sql.transaction(() => statements('斗破苍穹', '天蚕土豆', 'want', '旧拼写', 0) as never);
-    expect(results[4]).toHaveLength(0);
-    expect((await pg.query('SELECT id, title FROM books ORDER BY id')).rows).toEqual(books);
+    expect(results[4]).toHaveLength(1); // 键等值定位到那行历史行，反馈落库
+    expect((await pg.query('SELECT id, title FROM books ORDER BY id')).rows).toEqual(books); // 不新增第二行
   });
 });

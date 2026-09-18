@@ -42,7 +42,7 @@ export function shelfExistsForUserQuery(sql: PersonalQuery, userId: number, titl
   requireUserId(userId);
   const book = identityOf(title, author);
   return sql`SELECT 1 FROM recommendations r JOIN books b ON b.id = r.book_id
-    WHERE r.user_id = ${userId} AND lower(b.title) = lower(${book.title}) AND lower(b.author) = lower(${book.author}) LIMIT 1`;
+    WHERE r.user_id = ${userId} AND b.title_key = ${book.title} AND b.author_key = ${book.author} LIMIT 1`;
 }
 
 export function addShelfForUserQueries(sql: PersonalQuery, userId: number, title: string, author: string) {
@@ -53,7 +53,7 @@ export function addShelfForUserQueries(sql: PersonalQuery, userId: number, title
       ON CONFLICT (title_key, author_key) DO NOTHING`,
     sql`INSERT INTO recommendations (user_id, book_id, query, status)
       SELECT ${userId}, b.id, ${'书库添加'}, ${'want'} FROM books b
-      WHERE lower(b.title) = lower(${book.title}) AND lower(b.author) = lower(${book.author})
+      WHERE b.title_key = ${book.title} AND b.author_key = ${book.author}
         AND NOT EXISTS (SELECT 1 FROM recommendations r WHERE r.book_id = b.id AND r.user_id = ${userId})
       ON CONFLICT (user_id, book_id, query) DO NOTHING RETURNING book_id`,
   ];
@@ -254,10 +254,10 @@ export function feedbackForUserQueries(sql: PersonalQuery, userId: number, raw: 
     //   ① 刻意**不建 recommendations 行**：'new' 之外的状态会经 excludedBooksForUserQuery
     //      把书永久移出召回，只有"真的提交了反馈"才该触发那条排除。这里只补身份行，
     //      召回排除仍由本函数最后一条 UPDATE（反馈真的写成功时）负责。
-    //   ② 插入的是 btrim 过的拼写，不是 labeled_books 原值：后面 4 条语句比的是
-    //      lower(title) = lower(book.title)（不带 btrim），若把带首尾空格的拼写原样写进
-    //      books，就会"行建出来了却仍定位不到"→ 依旧 404。生产实测首尾空白 0 行，
-    //      这里是把它钉死，不依赖数据恰好干净。
+    //   ② 插入的是 btrim 过的拼写，不是 labeled_books 原值：后续语句按 title_key 键等值
+    //      定位，若把带首尾空格的拼写原样写进 books，生成列就与参数键分叉 →
+    //      "行建出来了却仍定位不到" → 依旧 404。生产实测首尾空白 0 行，这里是把它
+    //      钉死，不依赖数据恰好干净。
     sql`INSERT INTO books (title, author, meta)
       SELECT title, author, '{}'::jsonb FROM (
         SELECT btrim(title) AS title, btrim(author) AS author, 0 AS pref FROM labeled_books
@@ -267,19 +267,19 @@ export function feedbackForUserQueries(sql: PersonalQuery, userId: number, raw: 
         SELECT ${book.title}, ${book.author}, 1
       ) c ORDER BY pref LIMIT 1
       ON CONFLICT (title_key, author_key) DO NOTHING`,
-    sql`SELECT id FROM books WHERE lower(title) = lower(${book.title}) AND lower(author) = lower(${book.author}) FOR UPDATE`,
-    sql`SELECT id FROM books WHERE lower(title) = lower(${book.title}) AND lower(author) = lower(${book.author})`,
+    sql`SELECT id FROM books WHERE title_key = ${book.title} AND author_key = ${book.author} FOR UPDATE`,
+    sql`SELECT id FROM books WHERE title_key = ${book.title} AND author_key = ${book.author}`,
     sql`SELECT 1 / CASE WHEN COALESCE((
       SELECT max(f.id) FROM feedback f JOIN books b ON b.id = f.book_id
-      WHERE f.user_id = ${userId} AND lower(b.title) = lower(${book.title}) AND lower(b.author) = lower(${book.author})
+      WHERE f.user_id = ${userId} AND b.title_key = ${book.title} AND b.author_key = ${book.author}
     ), 0) = ${expectedVersion} THEN 1 ELSE 0 END AS feedback_version_matches`,
     sql`INSERT INTO feedback (user_id, book_id, status, note)
         SELECT ${userId}, id, ${status}, ${note} FROM books
-        WHERE lower(title) = lower(${book.title}) AND lower(author) = lower(${book.author})
+        WHERE title_key = ${book.title} AND author_key = ${book.author}
         RETURNING id`,
     sql`UPDATE recommendations SET status = ${status}
         WHERE user_id = ${userId} AND book_id IN (
-          SELECT id FROM books WHERE lower(title) = lower(${book.title}) AND lower(author) = lower(${book.author}))`,
+          SELECT id FROM books WHERE title_key = ${book.title} AND author_key = ${book.author})`,
   ];
 }
 
@@ -287,7 +287,7 @@ export function feedbackSnapshotForUserQuery(sql: PersonalQuery, userId: number,
   requireUserId(userId);
   const book = identityOf(title, author);
   return sql`SELECT f.id, f.status, f.note FROM feedback f JOIN books b ON b.id = f.book_id
-    WHERE f.user_id = ${userId} AND lower(b.title) = lower(${book.title}) AND lower(b.author) = lower(${book.author})
+    WHERE f.user_id = ${userId} AND b.title_key = ${book.title} AND b.author_key = ${book.author}
     ORDER BY f.id DESC LIMIT 1`;
 }
 
