@@ -19,12 +19,23 @@ Next.js (App Router) · Neon Postgres（serverless） · OpenAI 兼容 LLM 接�
 ## 本地开发
 
 ```bash
-cp .env.local.example .env.local   # 填好五个变量
+cp .env.local.example .env.local   # 填好示例里的数据库 / owner 口令 / LLM 变量
 npm install
 npm run dev
 ```
 
-开发环境默认服务在 http://localhost:3000。所有 `/api` 路由都要求 owner 认证（`APP_OWNER_TOKEN`）：浏览器右上角填入同一口令后存在 localStorage，请求带 `Authorization: Bearer <token>` 或 `X-Owner-Token`；未配置时接口返回 503，口令不符返回 401。
+开发环境默认服务在 http://localhost:3000。
+
+### 认证与权限
+
+`/api` 不是单一口令闸门，而是按路由逐项校验能力；完整的「路由/方法 → 能力」清单以 `src/lib/route-permissions.test.ts` 为准。有两条身份通道：
+
+- **账号 / 会话通道**（部署开关 `AUTH_ACCOUNTS_ENABLED=true`，并需 ≥32 字节的 `AUTH_SECURITY_SECRET`）：浏览器用户名/密码登录后由服务端下发 httpOnly Cookie（生产 `__Host-nf-session`，开发 `nf-dev-session`），此后每次请求按会话用户的角色与能力位判定。浏览器发起的写请求还必须带同源固定头 `x-nf-csrf: 1` 且 `Origin` 同源（`src/lib/csrf.ts` 的 `verifySameOriginWrite`）；成员访问默认关闭，须由 owner 在管理页开启。
+- **显式 owner 口令通道**（脚本、或账号模式启用前的旧路径，无 Cookie）：请求带 `Authorization: Bearer <APP_OWNER_TOKEN>` 或 `X-Owner-Token`；浏览器右上角填入的口令保存在 localStorage（键 `novel-finder-owner-token`）。`APP_OWNER_TOKEN` 未配置返回 503，口令不符返回 401。
+
+**能力位。** `find` / `read` / `download` 三类定义在 `src/lib/permissions.ts`：owner 恒有全部三类；成员按用户行的 `can_find` / `can_read` / `can_download` 逐项判定，缺位返回 403。认证流程端点（`/api/auth/login`、`/api/auth/register`、`/api/auth/session` 等）允许匿名访问，`/api/owner` 保留旧口令入口，`/api/shuyuan` 的 GET 另可由 Vercel cron 用 `CRON_SECRET` 触发。
+
+开关、迁移与部署顺序的权威说明见 [docs/auth-deployment.md](docs/auth-deployment.md)，此处只作指引。
 
 ### 凭据存放与代理访问
 
@@ -38,7 +49,7 @@ npm run dev
 
 1. 推到 GitHub 私有仓库
 2. 在 Vercel 项目里通过 Marketplace 的 Neon 集成创建数据库（免费档），自动注入 `DATABASE_URL`
-3. Vercel 导入仓库，配 Environment Variables（同 `.env.local.example` 五项：数据库连接串、owner 口令、LLM 三件套）
+3. Vercel 导入仓库，配 Environment Variables（同 `.env.local.example`：数据库连接串、owner 口令、LLM 三件套；启用账号模式再加 `AUTH_ACCOUNTS_ENABLED=true` 与 ≥32 字节的 `AUTH_SECURITY_SECRET`，部署顺序见 `docs/auth-deployment.md`）
 4. （推荐，国内直连）把 `find.cloud.us.kg` 之类子域 DNS-only CNAME 到 `cname.vercel-dns.com`，在 Vercel 项目里 Add Domain
 
 注意：Hobby 档 Fluid Compute 单函数上限 300s，流水线已拆为 recall / verify / rerank 三步由前端分步调用（各 Route Handler 声明 `maxDuration = 295`；LLM 侧默认总超时 280s、空闲超时 60s，可用 `LLM_TOTAL_TIMEOUT_MS` 覆盖）。
@@ -46,6 +57,11 @@ npm run dev
 ## 路线图
 
 - [x] MVP：LLM 召回 + 豆瓣验证 + 画像 + 反馈闭环
-- [ ] V2 验证增强：豆瓣未命中时，借鉴开源阅读（Legado）书源的站点搜索 URL 模板，对起点/番茄等站直接做存在性验证（书源规则引擎本身不接，只借 URL 模板——书源只解决元数据，不解决口碑）
-- [ ] V2 召回增强：历史推荐去重、同好书单聚合
+- [x] 精确找书：按书名直搜（`/api/find/exact`），先查本地书库、未命中再走豆瓣 `subject_suggest` 返回候选，不调用 LLM（`src/lib/find-exact.ts`）
+- [x] 书源补验：找书验证阶段对豆瓣未命中的候选，用书源检索章节目录补一条**存在性证据**（`src/lib/source-verification.ts`，25s 子预算 / 24 次请求上限）
+- [x] 书源治理：拉取 yckceo 书源合集、合并去重、探测可达性与启停失效（`src/lib/shuyuan.ts`、`/api/shuyuan`）
+- [x] 书架 / 反馈 / 画像闭环：从书库加入书架，读完/弃书留一句话原因回写画像（`/api/shelf`、`/api/feedback`、`/api/profile`）
+- [x] 召回去重：种子书、历史推荐（非 `new`）与已反馈书在召回前排除（`getExcludedBookTitlesForUser` / `excludedBooksForUserQuery`）
+- [ ] 验证增强（续）：当前取书只走内置源 `book15.net` 的专用解析器（`src/lib/source-reader.ts`）；完整的 legado 规则子集引擎与多源放量尚未接入（设计见工作区 `m1-engine-design.md`、`m2-scaleout-design.md`）
+- [ ] 召回增强（续）：同好书单聚合
 - [ ] V3：本地已读书 TXT 向量化，"和我爱的那本文风最像"的语义检索（参考 INovelRec 架构）
