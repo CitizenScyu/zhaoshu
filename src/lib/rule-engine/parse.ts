@@ -36,6 +36,25 @@ function rejectUnsupportedConstructs(rule: string): void {
   if (rule.includes('@get:')) unsupported('规则含 @get 变量存取', rule);
   if (rule.trimStart().startsWith('match:')) unsupported('规则含 match: 正则', rule);
   if (rule.includes('%%')) unsupported('规则含 %% 拼接（T7）', rule);
+  rejectUnsupportedTemplates(rule);
+}
+
+/**
+ * 全串扫描 {{...}} 模板并拒绝不支持类别（对齐 §2.3 step 2 与 survey.py refined_feats：
+ * 二者都对整条规则做扫描——含正则尾缀里的 {{变量}}，如 `##...{{chapter.title}}`）。
+ * 只有 {{$...}}（tpl_jsonpath）放行；{{@@}}（tpl_rule）/JS 表达式（tpl_js_expr）/
+ * 其余 {{变量}}（tpl_var）一律 RULE_UNSUPPORTED。
+ */
+function rejectUnsupportedTemplates(rule: string): void {
+  const re = /\{\{(.*?)\}\}/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(rule)) !== null) {
+    const inner = m[1].trim();
+    if (inner.startsWith('$')) continue; // tpl_jsonpath（M1 支持）
+    if (inner.startsWith('@@')) unsupported('模板含 {{@@规则}}（tpl_rule）', rule);
+    if (JS_EXPR_RE.test(inner)) unsupported('模板含 JS 表达式（tpl_js_expr）', rule);
+    unsupported('模板含 {{变量}}（tpl_var）', rule);
+  }
 }
 
 /** XPath 判别（survey.py JS_EXPR 之外的 xpath 检测同款口径）。 */
@@ -126,13 +145,16 @@ export function stripRegexSuffix(segment: string, rule: string): { body: string;
   const replacement = chunks[1] ?? '';
   const flags = chunks[2] !== undefined && chunks[2] !== '' ? chunks[2] : undefined;
   if (pattern.length > MAX_REGEX_PATTERN_LENGTH) unsupported('正则 pattern 过长', rule);
+  // 只保留合法 JS 正则 flag 字符（去重）；legado 规则常有 trailing ### 等噪声 → 视作无 flags。
+  const cleanFlags = flags ? [...new Set(flags.split(''))].filter((c) => 'gimsuy'.includes(c)).join('') : '';
+  const finalFlags = cleanFlags === '' ? undefined : cleanFlags;
   try {
     // eslint-disable-next-line no-new
-    new RegExp(pattern, flags ?? 'g');
+    new RegExp(pattern, finalFlags ?? 'g');
   } catch {
     unsupported(`正则 pattern 无法编译：${pattern}`, rule);
   }
-  regex.push({ pattern, replacement, flags });
+  regex.push({ pattern, replacement, flags: finalFlags });
   return { body, regex };
 }
 
@@ -155,9 +177,14 @@ const TERMINAL_KEYWORDS = new Set([
 
 type TerminalKeyword = Exclude<Extract<TerminalOp, { op: string }>['op'], 'attr'>;
 
+// legado 运行时特殊变量（非 DOM 属性）——§2.3 第 5 条：不认识的 token 编译期拒绝，不猜测。
+// 若当具名属性兜底（@baseUrl → {op:'attr',name:'baseUrl'}）会让实跑不通的源静默编译通过，污染数字。
+const LEGADO_SPECIAL_VARS = new Set(['baseUrl', 'result', 'book', 'chapter', 'headerMap']);
+
 function toTerminal(token: string, rule: string): TerminalOp {
   if (TERMINAL_KEYWORDS.has(token)) return { op: token as TerminalKeyword };
-  // 具名属性兜底：@some-attr
+  if (LEGADO_SPECIAL_VARS.has(token)) unsupported(`不支持 legado 特殊变量 @${token}`, rule);
+  // 具名属性兜底：@some-attr（HTML 属性名，含连字符/冒号）
   if (/^[\w:-]+$/.test(token)) return { op: 'attr', name: token };
   unsupported(`不支持的末端操作 @${token}`, rule);
 }
@@ -312,7 +339,9 @@ function buildCssChain(body: string, rule: string, explicit: boolean): RuleIr {
       chain.push(translateStep(p, rule));
     }
   }
-  if (chain.length === 0) unsupported('空选择器', rule);
+  // 裸 @op（如 chapterName=`@text`、chapterUrl=`@href`，book15 自身即此形态）：
+  // 对当前 scope 节点集直接套末端操作，chain 合法为空。仅「既无选择器又无 terminal」才是空规则。
+  if (chain.length === 0 && !terminal) unsupported('空选择器', rule);
   return { kind: 'css', chain, terminal };
 }
 
