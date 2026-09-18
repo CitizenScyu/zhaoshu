@@ -407,6 +407,73 @@ describe('online reader source resolution and budgets', () => {
     await expect(service.resolveSourceBook(target, context())).rejects.toMatchObject({ code: 'SOURCE_NOT_FOUND' });
     expect(mocks.fetch).toHaveBeenCalledTimes(8);
   });
+
+  it('warns search_no_candidates when the search page yields zero candidates', async () => {
+    // 只加观测：搜索页抓到（200）但锚点无一匹配 ⇒ 打一条结构化 warn，字段可 JSON.parse。
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const titleSearch = 'https://book15.net/books/search.html?kw=' + encodeURIComponent(book.title);
+    pages.set(titleSearch, { text: '<html><body><a href="/books/details99.html">别的书</a></body></html>' });
+    pages.set('https://book15.net/books/search.html?kw=' + encodeURIComponent(book.author), { text: '' });
+    await service.resolveSourceBook(book, context()).catch(() => {});
+    const calls = warn.mock.calls.filter(([tag]) => tag === '[read-source] search_no_candidates');
+    expect(calls).toHaveLength(1);
+    const payload = JSON.parse(calls[0][1] as string);
+    expect(payload).toMatchObject({
+      event: 'search_no_candidates',
+      sourceHost: 'book15.net',
+      searchUrl: titleSearch,
+      candidateCount: 0,
+      title: '测试书',
+      hadChallengeHint: false,
+    });
+    expect(typeof payload.bytes).toBe('number');
+    expect(payload.bytes).toBeGreaterThan(0);
+    expect(payload.searchUrl).not.toContain('#'); // 去 hash
+  });
+
+  it('flags hadChallengeHint for an anti-bot shell search page', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    pages.set('https://book15.net/books/search.html?kw=' + encodeURIComponent(book.title), {
+      text: '<html><head><title>Just a moment...</title></head><body></body></html>',
+    });
+    pages.set('https://book15.net/books/search.html?kw=' + encodeURIComponent(book.author), { text: '' });
+    await service.resolveSourceBook(book, context()).catch(() => {});
+    const calls = warn.mock.calls.filter(([tag]) => tag === '[read-source] search_no_candidates');
+    expect(calls).toHaveLength(1);
+    expect(JSON.parse(calls[0][1] as string).hadChallengeHint).toBe(true);
+  });
+
+  it('does not emit read-source observability warnings on the successful path', async () => {
+    // 成功路径不打日志（避免日志洪泛）：默认 fixture 命中详情页并返回目录。
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    await service.resolveSourceBook(book, context());
+    const observability = warn.mock.calls.filter(([tag]) => String(tag).startsWith('[read-source]'));
+    expect(observability).toEqual([]);
+  });
+
+  it('warns source_not_found with per-source stats when the round ends 404', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const target = { title: '不存在书', author: '作者A' };
+    pages.set('https://book15.net/books/search.html?kw=' + encodeURIComponent(target.title), {
+      text: '<a href="/books/details99.html">别的书</a>',
+    });
+    pages.set('https://book15.net/books/search.html?kw=' + encodeURIComponent(target.author), { text: '' });
+    await expect(service.resolveSourceBook(target, context())).rejects.toMatchObject({
+      code: 'SOURCE_NOT_FOUND', status: 404,
+    });
+    const calls = warn.mock.calls.filter(([tag]) => tag === '[read-source] source_not_found');
+    expect(calls).toHaveLength(1);
+    const payload = JSON.parse(calls[0][1] as string);
+    expect(payload).toMatchObject({
+      event: 'source_not_found',
+      title: '不存在书',
+      sourcesTried: 1,
+      perSource: [{ host: 'book15.net', searched: true, candidates: 0 }],
+    });
+    expect(typeof payload.perSource[0].bytes).toBe('number');
+    // 汇总与逐源信号是两条独立事件，且都出现。
+    expect(warn.mock.calls.some(([tag]) => tag === '[read-source] search_no_candidates')).toBe(true);
+  });
 });
 
 describe('GET /api/read/source/[resource]', () => {
