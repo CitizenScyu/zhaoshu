@@ -19,6 +19,7 @@ function response(body: unknown, status = 200) {
 }
 
 export async function GET(req: NextRequest, { params }: { params: Promise<{ resource: string }> }) {
+  const startedAt = Date.now();
   const auth = await requirePermission(req, 'read');
   if (!auth.ok) {
     const rejected = withAuthHeaders(auth.response);
@@ -44,8 +45,8 @@ export async function GET(req: NextRequest, { params }: { params: Promise<{ reso
   }
   const deadline = createDeadline(55_000);
   const signal = AbortSignal.any([req.signal, deadline.signal]);
+  const context = new SourceRequestContext(signal);
   try {
-    const context = new SourceRequestContext(signal);
     if (resource === 'index') {
       await raceDeadline(signal, ensureSchema);
       const catalog = await resolveSourceBook({ title, author }, context, bookUrl ? { bookUrl } : {});
@@ -60,6 +61,11 @@ export async function GET(req: NextRequest, { params }: { params: Promise<{ reso
       // 模糊降级层：把候选列表带回前端供用户点选确认。
       const candidates = (error as SourceReaderError & { candidates?: unknown }).candidates;
       if (Array.isArray(candidates)) body.candidates = candidates;
+      // 503 档（SOURCE_UNAVAILABLE / SOURCE_BUDGET_EXCEEDED）此前零观测，线上无法按 code 统计；
+      // 只记 code/请求量/耗时，不打书名、作者、URL、查询串。
+      if (error.status === 503) {
+        console.error(JSON.stringify({ code: error.code, requests: context.requests, elapsedMs: Date.now() - startedAt }));
+      }
       return response(body, error.status);
     }
     if (error instanceof SourcePolicyError) return response({ error: '书源内容或地址未通过校验，可尝试「下载全书」。', code: 'SOURCE_REJECTED' }, 422);
