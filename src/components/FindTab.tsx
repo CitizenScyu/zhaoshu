@@ -6,6 +6,7 @@ import { useOwner } from '@/components/OwnerProvider';
 import FeedbackForm from '@/components/FeedbackForm';
 import ReadBookLink from '@/components/ReadBookLink';
 import { isRecord } from '@/lib/sanitize';
+import { feedbackProfileUpdateMessage, type FeedbackProfileStatus } from '@/lib/feedback';
 import { EMPTY_HISTORY, historyKeyFor, historySnapshot, rememberQuery, subscribeHistory } from '@/lib/recent-queries';
 import { createElapsedTicker, recallProgressSuffix, retryLabel, retryStep, showRetry, type FindPhase, type FindStep } from '@/lib/find-progress';
 // SSE 消费与落定判定放在纯模块里：本仓 vitest 只收 *.test.ts 且没有 jsdom，写在 JSX 闭包里的
@@ -613,7 +614,8 @@ function BookCard({
   const [noteFor, setNoteFor] = useState<FeedbackStatus | null>(null);
   const [savedNote, setSavedNote] = useState('');
   const [saved, setSaved] = useState(false);
-  const [profileUpdated, setProfileUpdated] = useState(false);
+  // F15：画像吸收是后台的，这里显示「已保存 + 画像待更新」而不是承诺「已更新」。
+  const [savedProfileStatus, setSavedProfileStatus] = useState<FeedbackProfileStatus>('unchanged');
   const [sending, setSending] = useState(false);
 
   const suspicious = item.hallucinationRisk;
@@ -740,8 +742,8 @@ function BookCard({
                 <FeedbackForm
                   title={item.title} author={item.author} status={noteFor}
                   onBusyChange={setSending}
-                  onSaved={(note, updated) => {
-                    setSaved(true); setSavedNote(note); setProfileUpdated(updated); setNoteFor(null);
+                  onSaved={(note, profileStatus) => {
+                    setSaved(true); setSavedNote(note); setSavedProfileStatus(profileStatus); setNoteFor(null);
                   }}
                   onCancel={() => setNoteFor(null)}
                 />
@@ -749,7 +751,7 @@ function BookCard({
             </div>
           ) : (
             <div className="mt-3.5 text-xs">
-              <p style={{ color: 'var(--moss)' }}>✓ 已记录到书架{profileUpdated && '，画像已更新'}</p>
+              <p style={{ color: 'var(--moss)' }}>✓ 已记录到书架{feedbackProfileUpdateMessage(savedProfileStatus)}</p>
               {savedNote && (
                 <p className="mt-1 whitespace-pre-wrap break-words leading-6" style={{ color: 'var(--ink-soft)' }}>
                   {savedNote}

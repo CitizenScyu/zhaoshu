@@ -3,7 +3,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { useOwner } from './OwnerProvider';
 import FeedbackEditor from './FeedbackEditor';
-import { feedbackNeedsConfirmation, feedbackReductionMessage, readFeedbackSnapshot, type FeedbackSnapshot } from '@/lib/feedback';
+import { feedbackNeedsConfirmation, feedbackReductionMessage, readFeedbackProfileStatus, readFeedbackSnapshot, type FeedbackProfileStatus, type FeedbackSnapshot } from '@/lib/feedback';
 import type { FeedbackStatus } from '@/lib/types';
 
 export default function FeedbackForm({ title, author, status, initialSnapshot, clearInitially = false, onSaved, onCancel, onBusyChange }: {
@@ -12,7 +12,8 @@ export default function FeedbackForm({ title, author, status, initialSnapshot, c
   status: FeedbackStatus;
   initialSnapshot?: FeedbackSnapshot;
   clearInitially?: boolean;
-  onSaved: (note: string, profileUpdated: boolean) => void;
+  // 第二参是画像吸收状态（F15）：pending=反馈已保存、画像待后台吸收；unchanged=无需改画像。
+  onSaved: (note: string, profileStatus: FeedbackProfileStatus) => void;
   onCancel: () => void;
   onBusyChange: (busy: boolean) => void;
 }) {
@@ -74,7 +75,8 @@ export default function FeedbackForm({ title, author, status, initialSnapshot, c
         return;
       }
       if (!res.ok || data.ok !== true) throw new Error(typeof data.error === 'string' ? data.error : '保存反馈失败');
-      onSaved(note, data.profileUpdated === true);
+      // F15：透传画像吸收状态（而不是恒为 false 的 profileUpdated），调用方据此显示「待更新」。
+      onSaved(note, readFeedbackProfileStatus(data.profileStatus));
       // F15：反馈已在服务端落地；画像吸收是独立的长模型调用，不阻塞本次保存的 UI。
       // 这里后台触发一次（结果若失败会留在队列里，由后续机会/显式重试重放）。
       if (data.pending === true) {
