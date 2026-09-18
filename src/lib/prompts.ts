@@ -121,6 +121,37 @@ ${seedsJson}
 请生成口味画像。`;
 }
 
+// F04：默认重新生成 = 在现有画像与最新反馈之上重建，而不是从种子重写。
+// 旧行为（只按种子重写、会覆盖反馈积累）保留给显式 resetFromSeeds 模式，见 profileSystem()。
+export function profileRebuildSystem() {
+  return `你是一位阅读口味分析师。用户已有口味画像和历史反馈，现在给你种子书单，请在既有积累之上**重建**画像。
+
+原则：
+- 现有画像里仍被证据支持的显式偏好（尤其"雷点"）必须保留：不要因为本次种子书单没体现它就删掉。用户反复确认过的偏好是资产。
+- 最新反馈优先：反馈与现有画像冲突时，以最新反馈为准——反馈已被用户撤回/更改时，对应的旧结论必须去掉，不得作为既定事实保留。
+- 弃书原因的权重高于最爱书：网文口味"彼仙我毒"，雷点比萌点更能定义一个人。
+- 只写有证据的结论，不脑补；证据不足的维度写进"灵活区"。
+- 画像分四档输出（Markdown）：硬性条件 / 萌点（加分项）/ 雷点（一票否决）/ 灵活区（可探索）。
+- 每条尽量短，画像总长控制在 300 字内，这是要被反复使用的查询文档。
+只输出画像 Markdown，不要其他内容。`;
+}
+
+export function profileRebuildUser(seedsJson: string, currentContent: string, feedbackJson: string) {
+  return `# 种子书单（love=最爱，drop=弃书）
+
+${seedsJson}
+
+# 当前画像（已积累的偏好，仍有效者请保留）
+
+${currentContent}
+
+# 本人最新有效反馈
+
+${feedbackJson}
+
+请在上述基础上重建口味画像。`;
+}
+
 export function profileUpdateSystem() {
   return `你是一位阅读口味分析师。你将拿到用户当前的口味画像和一条新的读后反馈，请判断这条反馈是否（以及如何）应该修订画像。
 
