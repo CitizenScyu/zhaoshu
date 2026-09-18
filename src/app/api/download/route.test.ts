@@ -107,6 +107,63 @@ describe('/api/download recovery and cleanup', () => {
     expect(sql).not.toHaveBeenCalled();
   });
 
+  it('F16：GET 保持只读并派生 leaseExpired；活跃心跳不被标记过期', async () => {
+    const staleRunning = { ...recoveredTask, status: 'running', updated_at: new Date(Date.now() - 31 * 60_000).toISOString() };
+    sql.mockResolvedValueOnce([staleRunning]);
+    const res = await GET(request('GET', undefined, `?id=${staleRunning.id}`));
+    const data = await res.json();
+    expect(res.status).toBe(200);
+    expect(data.task).toMatchObject({ status: 'running', leaseExpired: true });
+    // 只读：GET 不做回收写，回收由 POST 与 cron 路径承担。
+    expect(sql).toHaveBeenCalledOnce();
+    expect(queryText(0)).toMatch(/^SELECT /);
+    expect(queryText(0)).not.toContain('UPDATE download_tasks');
+
+    const freshRunning = { ...recoveredTask, status: 'running', updated_at: new Date(Date.now() - 60_000).toISOString() };
+    sql.mockResolvedValueOnce([freshRunning]);
+    const freshRes = await GET(request('GET', undefined, `?id=${freshRunning.id}`));
+    expect((await freshRes.json()).task).toMatchObject({ status: 'running', leaseExpired: false });
+  });
+
+  it.each(['failed', 'partial', 'done', 'pending'])('F16/F03：%s 状态永不带 leaseExpired', async (status) => {
+    sql.mockResolvedValueOnce([{ ...recoveredTask, status }]);
+    const res = await GET(request('GET', undefined, `?id=${recoveredTask.id}`));
+    expect((await res.json()).task).toMatchObject({ status, leaseExpired: false });
+  });
+
+  it('F17：GET ?bookId 返回本人在这本书上的最新任务', async () => {
+    sql.mockResolvedValueOnce([{ ...recoveredTask, status: 'partial' }]);
+    const res = await GET(request('GET', undefined, '?bookId=7'));
+    expect(res.status).toBe(200);
+    expect((await res.json()).task).toMatchObject({ id: recoveredTask.id, bookId: 7, status: 'partial' });
+    expect(queryText(0)).toContain('book_id = ?');
+    expect(queryText(0)).toContain('user_id = ?');
+    expect(sql.mock.calls[0].slice(1)).toEqual([7, 1]);
+  });
+
+  it('F17：GET ?bookId 无本人任务时返回 null task（不猜测他人任务）', async () => {
+    sql.mockResolvedValueOnce([]);
+    const res = await GET(request('GET', undefined, '?bookId=7'));
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ task: null });
+  });
+
+  it.each(['0', '-1', '1.5', 'Infinity', '1e3'])('F17：拒绝非法 bookId %s', async (bookId) => {
+    const res = await GET(request('GET', undefined, `?bookId=${encodeURIComponent(bookId)}`));
+    expect(res.status).toBe(400);
+    expect(await res.json()).toEqual({ error: 'invalid bookId', code: 'INVALID_ID' });
+    expect(sql).not.toHaveBeenCalled();
+  });
+
+  it('F18 边界：GET 单条仍强制本人 user_id，他人的完成任务返回 404', async () => {
+    // 共享阅读走 library 的 sharedReadTaskId；/api/download 的归属约束不得放宽。
+    sql.mockResolvedValueOnce([]);
+    const res = await GET(request('GET', undefined, '?id=999'));
+    expect(res.status).toBe(404);
+    expect(await res.json()).toEqual({ error: 'task not found', code: 'TASK_NOT_FOUND' });
+    expect(queryText(0)).toContain('user_id = ?');
+  });
+
   it('reports recovery errors instead of returning stale task data', async () => {
     sql.mockRejectedValueOnce(new Error('database unavailable'));
     vi.spyOn(console, 'error').mockImplementation(() => {});
@@ -137,17 +194,44 @@ describe('/api/download recovery and cleanup', () => {
     expect(triggerDownloadWorkflow).toHaveBeenCalledOnce();
   });
 
-  it('still refuses to enqueue a duplicate active task', async () => {
+  it('still refuses to enqueue a duplicate active task and returns its taskId and status', async () => {
     sql.mockResolvedValueOnce([book])
       .mockResolvedValueOnce([])
-      .mockResolvedValueOnce([{ id: 42 }]);
+      .mockResolvedValueOnce([{ id: 42, status: 'running' }]);
 
     const res = await POST(request('POST', { bookId: book.id }));
 
     expect(res.status).toBe(409);
-    expect(await res.json()).toEqual({ error: '已有进行中的任务', code: 'TASK_CONFLICT' });
+    // F17：冲突响应必须带上同一用户已有任务的 taskId + 状态，前端据此接续轮询。
+    expect(await res.json()).toEqual({
+      error: '已有进行中的任务',
+      code: 'TASK_CONFLICT',
+      taskId: 42,
+      status: 'running',
+    });
     expectSafeReclaim(1);
     expect(sql).toHaveBeenCalledTimes(3);
+    expect(triggerDownloadWorkflow).not.toHaveBeenCalled();
+  });
+
+  it('F17：23505 竞争路径补读本人活动任务，两个并发请求最终指向同一 taskId', async () => {
+    sql.mockResolvedValueOnce([book])
+      .mockResolvedValueOnce([])   // 回收
+      .mockResolvedValueOnce([])   // 竞争前的活动查询：对手尚未提交可见
+      .mockRejectedValueOnce(Object.assign(new Error('duplicate key'), { code: '23505' })) // INSERT 撞唯一索引
+      .mockResolvedValueOnce([{ id: 55, status: 'pending' }]); // 补读本人活动任务
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    const res = await POST(request('POST', { bookId: book.id }));
+
+    expect(res.status).toBe(409);
+    expect(await res.json()).toEqual({
+      error: '已有进行中的任务',
+      code: 'TASK_CONFLICT',
+      taskId: 55,
+      status: 'pending',
+    });
+    expect(sql).toHaveBeenCalledTimes(5);
     expect(triggerDownloadWorkflow).not.toHaveBeenCalled();
   });
 
