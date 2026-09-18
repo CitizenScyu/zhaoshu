@@ -1,5 +1,6 @@
 import { timingSafeEqual } from 'node:crypto';
 import { NextRequest } from 'next/server';
+import { guardPermissionWrite } from '@/lib/admin-http';
 import { requirePermission } from '@/lib/auth';
 import { authJson, withAuthHeaders } from '@/lib/auth-http';
 import { ensureSchema } from '@/lib/db';
@@ -56,8 +57,9 @@ export async function GET(req: NextRequest) {
 }
 
 export async function POST(req: NextRequest) {
-  const auth = await requirePermission(req, 'download');
-  if (!auth.ok) return withAuthHeaders(auth.response);
+  // 写校验（能力位 + 同源固定头 + JSON 类型）必须在 refresh / 打标之前完成；GET 保持只读语义不加写校验。
+  const guard = await guardPermissionWrite(req, 'download');
+  if (!guard.ok) return guard.response;
   let body: Record<string, unknown> | null;
   try {
     body = await readJsonBody(req, MAX_BODY_BYTES);

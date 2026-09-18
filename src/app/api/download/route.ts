@@ -1,6 +1,7 @@
 import { NextRequest } from 'next/server';
-import { requirePermission } from '@/lib/auth';
+import { guardPermissionWrite } from '@/lib/admin-http';
 import { authJson, withAuthHeaders } from '@/lib/auth-http';
+import { requirePermission } from '@/lib/auth';
 import { ensureSchema, getSql } from '@/lib/db';
 import { triggerDownloadWorkflow } from '@/lib/github';
 import { boundedPositiveInteger, readJsonBody, RequestBodyError } from '@/lib/http';
@@ -88,8 +89,9 @@ export async function GET(req: NextRequest) {
 }
 
 export async function POST(req: NextRequest) {
-  const auth = await requirePermission(req, 'download');
-  if (!auth.ok) return withAuthHeaders(auth.response);
+  // 写校验（能力位 + 同源固定头 + JSON 类型）必须在建任务与 triggerDownloadWorkflow 之前完成。
+  const guard = await guardPermissionWrite(req, 'download');
+  if (!guard.ok) return guard.response;
   let body: Record<string, unknown> | null;
   try {
     body = await readJsonBody(req, MAX_BODY_BYTES);
@@ -134,7 +136,7 @@ export async function POST(req: NextRequest) {
     // 活动锁粒度是 (user_id, book_id)（B2）：不同用户共享同一书源互不阻塞。
     const existing = (await sql`
       SELECT id FROM download_tasks
-      WHERE user_id = ${auth.principal.userId} AND book_id = ${bookId} AND status IN ('pending', 'running')
+      WHERE user_id = ${guard.principal.userId} AND book_id = ${bookId} AND status IN ('pending', 'running')
       ORDER BY created_at DESC LIMIT 1`) as { id: number }[];
     if (existing.length > 0) {
       return authJson(
@@ -144,7 +146,7 @@ export async function POST(req: NextRequest) {
     }
     const created = (await sql`
       INSERT INTO download_tasks (user_id, book_id, title, author, source_url, status)
-      VALUES (${auth.principal.userId}, ${bookId}, ${book.title}, ${book.author}, ${sourceUrl}, 'pending')
+      VALUES (${guard.principal.userId}, ${bookId}, ${book.title}, ${book.author}, ${sourceUrl}, 'pending')
       RETURNING id`) as { id: number }[];
     // 立刻唤醒 worker,不等 cron:dispatch 失败绝不能影响建任务结果(Vercel 环境要 await,否则函数可能被提前冻结)
     try {
@@ -163,8 +165,9 @@ export async function POST(req: NextRequest) {
 }
 
 export async function DELETE(req: NextRequest) {
-  const auth = await requirePermission(req, 'download');
-  if (!auth.ok) return withAuthHeaders(auth.response);
+  // 与 POST 同款写校验：DELETE 删除任务前先过能力位 + 同源固定头（DELETE 无 JSON 正文要求）。
+  const guard = await guardPermissionWrite(req, 'download');
+  if (!guard.ok) return guard.response;
   let body: Record<string, unknown> | null;
   try {
     body = await readJsonBody(req, MAX_BODY_BYTES);
@@ -184,10 +187,10 @@ export async function DELETE(req: NextRequest) {
     // 按状态原子删除：取消排队中的任务或清理失败记录；本人之外与运行中 / 已完成的任务仍受保护。
     const rows = (await sql`
       DELETE FROM download_tasks
-      WHERE id = ${taskId} AND user_id = ${auth.principal.userId} AND status IN ('pending', 'failed')
+      WHERE id = ${taskId} AND user_id = ${guard.principal.userId} AND status IN ('pending', 'failed')
       RETURNING id`) as { id: number }[];
     if (rows.length === 0) {
-      const visible = await sql`SELECT status FROM download_tasks WHERE id = ${taskId} AND user_id = ${auth.principal.userId}` as { status: string }[];
+      const visible = await sql`SELECT status FROM download_tasks WHERE id = ${taskId} AND user_id = ${guard.principal.userId}` as { status: string }[];
       if (visible.length === 0) return authJson({ error: 'task not found', code: 'TASK_NOT_FOUND' }, { status: 404 });
       return authJson({ error: '只能取消排队中的任务或清理失败任务', code: 'TASK_CONFLICT' }, { status: 409 });
     }
