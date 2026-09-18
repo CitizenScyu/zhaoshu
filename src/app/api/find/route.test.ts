@@ -421,7 +421,8 @@ describe('POST /api/find output contract', () => {
 
   // T55-6 收尾：喂给重排模型的投影必须与系统提示词声明可用的字段一致。
   // 判别力：给投影加字段（或改回 JSON.stringify(verified)）→ 键列表断言失败；
-  // 提示词里残留模型看不到的字段名（sourceEvidence / why）→ 下面两条断言失败。
+  // 提示词里残留模型看不到的字段名 → 下面两条断言失败。
+  // F14：书源补验（sourceEvidence）现在是重排的第五类字段，提示词必须声明它及其证明力边界。
   it('sends the rerank model exactly the fields the system prompt declares', async () => {
     mocks.chatRobust.mockResolvedValue(JSON.stringify({ items: [item] }));
     await consumeSSE(await POST(request({ step: 'rerank', query: '找书', verified: [verified] })));
@@ -429,11 +430,16 @@ describe('POST /api/find output contract', () => {
     const embedded = /# 候选书[^\n]*\n\n([\s\S]*?)\n\n请重排输出最终推荐/.exec(rerankPrompt)?.[1];
     expect(embedded).toBeTruthy();
     const parsed = JSON.parse(embedded!) as Record<string, unknown>[];
+    // 本条 verified 没有 sourceEvidence，投影就不会多出该键（该字段按需出现）。
     expect(Object.keys(parsed[0])).toEqual(['title', 'author', 'category', 'wordCount', 'douban']);
     const system = rerankSystem();
     for (const field of ['title', 'author', 'category', 'wordCount']) expect(system).toContain(field);
     expect(system).toContain('豆瓣验证结果');
-    expect(system).not.toContain('sourceEvidence');
+    // F14：提示词必须声明书源证据字段与其证明力边界（只证存在性，不得当质量/完结证明）。
+    expect(system).toContain('sourceEvidence');
+    expect(system).toContain('matchedBy');
+    expect(system).toContain('只证明');
+    // 没有证据时字段不出现——省 token 的投影契约不因 F14 放宽。
     expect(rerankPrompt).not.toContain('sourceEvidence');
   });
 
@@ -515,10 +521,14 @@ describe('POST /api/find output contract', () => {
     mocks.chatRobust.mockResolvedValue(JSON.stringify({ items: [{ ...item, sourceEvidence: { status: 'forged' } }] }));
     const reranked = await consumeSSE(await POST(request({ step: 'rerank', query: '找书', verified: result.verified })));
     expect(lastEvent<{ type: string; items: unknown[] }>(reranked, 'result').items[0]).toMatchObject({ sourceEvidence: evidence, douban: missing });
-    // T55-6：sourceEvidence 在重排后被召回原件覆盖，因此不再进重排 prompt（省输入 token）；
-    // 结果里的存在性证据仍原样带回（上一行的断言），语义不变。
-    expect(mocks.chatRobust.mock.calls[0][1]).not.toContain('仅补充存在性');
-    expect(mocks.chatRobust.mock.calls[0][1]).not.toContain('"sourceEvidence"');
+    // F14：书源证据压缩后进重排 prompt——带上存在性信号（status/matchedBy/source），
+    // 但去掉冗长 note（「匹配目录，仅补充存在性」）与 URL，省输入 token。
+    const rerankPrompt = mocks.chatRobust.mock.calls[0][1] as string;
+    expect(rerankPrompt).toContain('"sourceEvidence"');
+    expect(rerankPrompt).toContain('"status":"matched"');
+    expect(rerankPrompt).toContain('"matchedBy":"title+author"');
+    expect(rerankPrompt).not.toContain('仅补充存在性'); // note 不进 prompt
+    expect(rerankPrompt).not.toContain('https://book15.net'); // URL 不进 prompt
   });
 
   // 单步模型预算是硬上限：调用方传给 chatRobust 的 totalTimeoutMs 来自它。第一次尝试拿满

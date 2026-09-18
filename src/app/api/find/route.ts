@@ -144,9 +144,26 @@ async function modelStep<T>(
 // 一律用召回原件覆盖（见下面 byBook 回填），回传全文只是把 prompt 撑大——12 本候选的
 // 合成样本上这两项占输入 JSON 的 45%。重排真正要看的信号是身份（title/author）、
 // 题材字数与豆瓣外部证据，全部保留。
+//
+// F14：书源补验（sourceEvidence）**压缩后**进重排输入。此前它被整个丢掉，补验花掉的时间与
+// 额度影响不了排序（豆瓣未收录但书源已匹配的候选仍可能被当幻觉降分）。这里只带三个短字段
+// ——status、匹配维度 matchedBy、来源类型 source——去掉冗长 note / URL / checkedAt
+// （单条 note ≈50 字，12 本候选就是约 600 字纯浪费的输入 token）。证据的**证明力**由
+// rerankSystem 约束：只证存在性/身份，不得当质量、评分或完结证明。
+function compactSourceEvidence(evidence: SourceEvidence) {
+  return {
+    status: evidence.status,
+    source: 'reading-source',
+    ...(evidence.status === 'matched'
+      ? { matchedBy: 'title+author' }
+      : evidence.code ? { code: evidence.code } : {}),
+  };
+}
+
 function rerankInput(verified: VerifiedCandidate[]) {
-  return verified.map(({ title, author, category, wordCount, douban }) => ({
+  return verified.map(({ title, author, category, wordCount, douban, sourceEvidence }) => ({
     title, author, category, wordCount, douban,
+    ...(sourceEvidence ? { sourceEvidence: compactSourceEvidence(sourceEvidence) } : {}),
   }));
 }
 

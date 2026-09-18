@@ -138,8 +138,8 @@ it('R13: failed feedback profile update returns the same user-facing state as a 
 
 it('R14: temporary conditions still reach recommendation query persistence verbatim', async () => {
   const query = '仅本次生效的合成需求';
-  const response = await find(request('find', { step: 'rerank', query, conditions: query, verified: [verified] }));
-  await response.text();
+  // 关键判别力：conditions 非空但显式 longterm → 仍落原文（不再拿 conditions 反推）。
+  await find(request('find', { step: 'rerank', query, conditions: query, verified: [verified], retention: 'longterm' })).then((r) => r.text());
   expect(mocks.persist.mock.calls[0][1]).toBe(query);
 });
 

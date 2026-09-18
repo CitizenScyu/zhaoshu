@@ -66,13 +66,15 @@ export function rerankSystem() {
 5. 最终输出 6~10 本，按 matchScore 降序。matchScore 是 0-100 的个人匹配排序分，属于模型判断，不是用户喜欢这本书的概率。
 6. reason、hitLikes、risks 都是模型判断或推断。reason 是一句话回答"对这位用户值不值得开"，直接说结论。
 7. 豆瓣状态、链接、评分和评价人数是当前候选中可用的外部验证证据；不得改写或臆造。召回阶段的 wordCount 仍是模型提供的待核验描述。
-8. 完结、字数、无雷、不烂尾等属性，除非候选现有证据明确支持，否则只能表述为待核验的模型推断，不能作为事实。
-9. 如需比较参考作品，只能引用本次输入、画像证据或候选中已经出现的作品，不得发明作品。
-10. 候选项只有四类字段可用：身份（title/author）、category、wordCount（召回模型的待核验描述）和豆瓣验证结果（status/doubanId/rating/ratingCount/url/note）。不要引用或输出候选里没有的字段，也不要臆造外部来源；豆瓣证据按第 7 条原样遵守，不得改写或扩大其证明力。
+8. 书源补验结果（sourceEvidence）只证明"这本书在某在线书源里存在、且书名与作者匹配"：status=matched 表示目录已匹配（matchedBy 说明按 title+author 匹配），它**不**证明评分、完结、字数、质量或全书可用；不得把 matched 当作加分以外的质量/完结证明。status=not_found / unavailable 只说明本轮没匹配上（或没查成），**不代表**这本书不存在，更不能仅凭它就压低 matchScore 或标 hallucinationRisk。
+9. 完结、字数、无雷、不烂尾等属性，除非候选现有证据明确支持，否则只能表述为待核验的模型推断，不能作为事实。
+10. 如需比较参考作品，只能引用本次输入、画像证据或候选中已经出现的作品，不得发明作品。
+11. 候选项只有五类字段可用：身份（title/author）、category、wordCount（召回模型的待核验描述）、豆瓣验证结果（status/doubanId/rating/ratingCount/url/note）和书源补验结果（status/matchedBy/code/source）。不要引用或输出候选里没有的字段，也不要臆造外部来源；豆瓣证据按第 7 条、书源证据按第 8 条原样遵守，不得改写或扩大其证明力。
+12. 如果所有候选都命中硬雷点或都不可用，就老实输出空书单 {"items":[]}，不要为凑数保留命中雷点的书。
 
 只输出 JSON，格式：
 {"items":[{"title":"书名","author":"作者","category":"题材流派","wordCount":"字数状态","matchScore":85,"hitLikes":["命中的萌点"],"risks":"风险与雷点提示","reason":"一句话结论","hallucinationRisk":false}]}
-被淘汰的候选不需要输出。`;
+被淘汰的候选不需要输出；若全部被淘汰，输出 {"items":[]}。`;
 }
 
 export function rerankUser(profile: string, query: string, verifiedJson: string, conditions = '') {
@@ -90,7 +92,7 @@ ${conditions || '（无）'}
 
 本次条件不属于长期画像。完结、字数、雷点等若无现有证据，只能作为模型推断或待核验风险，不能陈述为已满足的事实。
 
-# 候选书（含豆瓣验证结果）
+# 候选书（含豆瓣与书源验证结果）
 
 ${verifiedJson}
 
