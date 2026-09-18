@@ -136,18 +136,31 @@ it('R13: failed feedback profile update returns the same user-facing state as a 
   expect(await response.json()).toEqual({ ok: true, profileUpdated: false });
 });
 
-it('R14: temporary conditions still reach recommendation query persistence verbatim', async () => {
+// F12 翻转：原断言「临时 conditions 仍把原 query 传给推荐持久化」记录的是缺陷（模式混用）。
+// 修复后持久化 query 字段由**显式 retention** 决定，与 conditions 是否为空无关：
+// - longterm（默认）：落需求原文；
+// - session（仅本次有效）：不落原文（存空串），本次需求不进入长期检索记录。
+it('R14: recommendation query persistence follows the explicit retention field, not conditions', async () => {
   const query = '仅本次生效的合成需求';
   // 关键判别力：conditions 非空但显式 longterm → 仍落原文（不再拿 conditions 反推）。
   await find(request('find', { step: 'rerank', query, conditions: query, verified: [verified], retention: 'longterm' })).then((r) => r.text());
   expect(mocks.persist.mock.calls[0][1]).toBe(query);
+  // session：不落原文。
+  await find(request('find', { step: 'rerank', query, verified: [verified], retention: 'session' })).then((r) => r.text());
+  expect(mocks.persist.mock.calls[1][1]).toBe('');
 });
 
-it('R15: successful source verification is not provided to the reranking model', async () => {
+// F14 翻转：原断言「书源补验结果不给重排模型」记录的是缺陷（补验影响不了排序）；修复后
+// **压缩证据**进 prompt（status/matchedBy/source），但去掉冗长 note/URL；完整证据仍在结果里回传。
+it('R15: compressed source verification reaches the reranking model without the note or URL', async () => {
   const sourceEvidence = { status: 'matched', sourceName: '合成补验源', url: 'https://book15.net/books/details42.html', checkedAt: '2026-09-19T00:00:00.000Z', note: '身份匹配' };
   const response = await find(request('find', { step: 'rerank', query: '合成需求', verified: [{ ...verified, sourceEvidence }] }));
   const events = await response.text();
-  expect(events).toContain('合成补验源');
-  expect(mocks.model.mock.calls[0][1]).not.toContain('合成补验源');
-  expect(mocks.model.mock.calls[0][1]).not.toContain('sourceEvidence');
+  expect(events).toContain('合成补验源'); // 完整证据仍回传客户端
+  const prompt = mocks.model.mock.calls[0][1];
+  expect(prompt).toContain('"sourceEvidence"');
+  expect(prompt).toContain('"status":"matched"');
+  expect(prompt).toContain('"matchedBy":"title+author"');
+  expect(prompt).not.toContain('身份匹配'); // note 不进 prompt
+  expect(prompt).not.toContain('https://book15.net'); // URL 不进 prompt
 });
