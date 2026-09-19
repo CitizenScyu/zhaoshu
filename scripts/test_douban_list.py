@@ -860,6 +860,47 @@ class TestSearchEngine(unittest.TestCase):
             douban_list.search_engine(Boom(), '某书')
 
 
+class TestEngineCliInvocation(unittest.TestCase):
+    """EngineCli.run 组装命令 + 凭据红线（DATABASE_URL 只经子进程 env，不进命令行）。"""
+
+    def test_command_assembly_and_credential_isolation(self):
+        cli = douban_list.EngineCli(
+            node='/usr/bin/node',
+            script_path='/repo/scripts/engine-fetch.mjs',
+            database_url='postgresql://user:pw@host/db')
+        captured = {}
+
+        def fake_run(cmd, **kwargs):
+            captured['cmd'] = cmd
+            captured['env'] = kwargs.get('env')
+            return _proc(1)
+
+        with mock.patch.object(douban_list.subprocess, 'run', fake_run):
+            cli.run('search', '--title', '斗破苍穹')
+
+        cmd = captured['cmd']
+        self.assertEqual(cmd[0], '/usr/bin/node')
+        self.assertEqual(cmd[1], '--import')
+        self.assertTrue(cmd[2].startswith('file://'))          # hook 转 file:// URI
+        self.assertTrue(cmd[2].endswith('ts-alias-hook.mjs'))
+        self.assertEqual(cmd[3], '/repo/scripts/engine-fetch.mjs')
+        self.assertEqual(cmd[4], 'search')
+        self.assertIn('--json', cmd)                            # 自动补 --json
+        # 凭据红线：连接串绝不出现在命令行参数里
+        self.assertFalse(any('pw@host' in str(part) for part in cmd))
+        self.assertFalse(any('postgres' in str(part) for part in cmd))
+        # 只经子进程 env 注入
+        self.assertEqual(captured['env']['DATABASE_URL'],
+                         'postgresql://user:pw@host/db')
+
+    def test_hook_defaults_to_sibling_of_script(self):
+        cli = douban_list.EngineCli(node='node',
+                                    script_path='/repo/scripts/engine-fetch.mjs',
+                                    database_url='x')
+        self.assertTrue(cli.hook_path.replace('\\', '/').endswith(
+            '/repo/scripts/ts-alias-hook.mjs'))
+
+
 class TestResolveCandidatesEngineFallback(unittest.TestCase):
     """_resolve_candidates 接入引擎兜底：book15 miss 才回落；开关关闭行为不变。"""
 
