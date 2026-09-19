@@ -38,11 +38,33 @@ export interface SurveyProbe {
 
 /** W1 名单（§2.2）：site 归一后的 host，顺序即设计表格顺序。 */
 export const W1_SOURCES = [
-  { site: 'jhssd.com', host: 'm.jhssd.com', name: '精华书阁（m）', tier: 'T1' },
+  { site: 'jhssd.com', host: 'm.jhsssd.com', name: '精华书阁（m）', tier: 'T1' },
   { site: 'yingsx.com', host: 'www.yingsx.com', name: '小刀阅读', tier: 'T1' },
   { site: 'czhiyao.com', host: 'www.czhiyao.com', name: '知妖-中国妖怪百集', tier: 'T1' },
   { site: 'kanshuw.com', host: 'www.kanshuw.com', name: '看书', tier: 'T6' },
 ] as const;
+
+/**
+ * W1 名单 host 替换：survey（candidates.json）里的 host → 站点迁移后的实际 host。
+ * 依据（2026-09-19 实测）：`m.jhssd.com` 已 301 到 `m.jhsssd.com`（三个 s），三站同址；
+ * DB 里 `m.jhsssd.com` 是独立记录且搜索 200，survey 快照（candidates.json/probe_results.json）
+ * 只有迁移前的 `m./wap.jhssd.com` 两条、无 jhsssd 条目。故复算仍以 survey 数据为准（按 host
+ * 匹配），仅在输出 W1 名单时套用本站点迁移替换，避免直接手抄常量。
+ */
+export const W1_HOST_REPLACEMENTS: Record<string, string> = {
+  'm.jhssd.com': 'm.jhsssd.com',
+};
+
+/** survey host → 站点迁移后的实际 host（无替换则原样返回）。 */
+function actualHostOf(surveyHost: string): string {
+  return W1_HOST_REPLACEMENTS[surveyHost] ?? surveyHost;
+}
+
+/** 实际 host → survey（candidates.json/probe_results.json）里的 host，用于按名单 host 反查数据。 */
+export function surveyHostOf(actualHost: string): string {
+  const hit = Object.entries(W1_HOST_REPLACEMENTS).find(([, actual]) => actual === actualHost);
+  return hit ? hit[0] : actualHost;
+}
 
 /** ④ 传输编码包裹的显式排除（E 节实测：正文需 b64 解包，属 W2 编码路径）。 */
 export const W1_ENCODING_EXCLUDED_HOSTS = ['wap2.xinbiquge.org'] as const;
@@ -123,8 +145,9 @@ export interface W1Recompute {
 }
 
 /**
- * 复算 W1 名单：候选 → ①②④⑤ 过滤 → ③ 同站去重（保留候选数组里的首个，设计保留 m.jhssd.com）。
- * 返回的 selected 必须等于 W1_SOURCES，matchesDesign 为 true。
+ * 复算 W1 名单：候选 → ①②④⑤ 过滤 → ③ 同站去重（保留候选数组里的首个，即 survey 的 m.jhssd.com）
+ * → W1_HOST_REPLACEMENTS 套用站点迁移后的实际 host。返回的 selected 必须等于 W1_SOURCES，
+ * matchesDesign 为 true。
  */
 export function recomputeW1(candidates: SurveyCandidate[], probes: SurveyProbe[]): W1Recompute {
   const distribution = recomputeTierDistribution(candidates);
@@ -140,7 +163,8 @@ export function recomputeW1(candidates: SurveyCandidate[], probes: SurveyProbe[]
     const site = siteOf(item.host);
     if (seen.has(site)) continue;
     seen.add(site);
-    selected.push(item);
+    // 输出时套用站点迁移替换（survey host → 实际 host），使名单与 DB 可达 host 对齐。
+    selected.push({ ...item, host: actualHostOf(item.host) });
   }
   const matchesDesign = selected.length === W1_SOURCES.length
     && W1_SOURCES.every((source) => selected.some((item) => item.host === source.host));

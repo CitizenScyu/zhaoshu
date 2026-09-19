@@ -8,7 +8,7 @@ import { readFileSync } from 'node:fs';
 import { resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
-  EXPECTED_TIER_DISTRIBUTION, W1_SOURCES, checkW1Criteria, recomputeTierDistribution, recomputeW1,
+  EXPECTED_TIER_DISTRIBUTION, W1_SOURCES, checkW1Criteria, recomputeTierDistribution, recomputeW1, surveyHostOf,
 } from '../src/lib/rule-engine/w1-candidates.ts';
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
@@ -28,8 +28,10 @@ console.log('复算名单:', result.selected.map((item) => `${item.host} [${item
 assert.equal(result.matchesDesign, true, '复算名单与设计 W1 四源不一致，需重跑并重选');
 
 for (const source of W1_SOURCES) {
-  const candidate = candidates.find((item) => new URL(item.url).hostname === source.host);
-  assert.ok(candidate, `candidates.json 缺少 W1 源 ${source.host}`);
+  // 名单 host 可能是站点迁移后的实际 host（如 m.jhsssd.com），survey 数据里仍是迁移前的 host。
+  const surveyHost = surveyHostOf(source.host);
+  const candidate = candidates.find((item) => new URL(item.url).hostname === surveyHost);
+  assert.ok(candidate, `candidates.json 缺少 W1 源 ${source.host}（survey host ${surveyHost}）`);
   const check = checkW1Criteria(candidate, probes);
   assert.deepEqual(check, { reachable: true, thinSurface: true, uniqueSite: true, noEncoding: true, cleanQuality: true },
     `W1 源 ${source.host} 不再满足 §2.2 五条标准：${JSON.stringify(check)}`);

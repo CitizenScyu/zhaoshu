@@ -2,8 +2,8 @@ import { existsSync, readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import {
-  EXPECTED_TIER_DISTRIBUTION, W1_SOURCES, checkW1Criteria, recomputeTierDistribution, recomputeW1,
-  type SurveyCandidate, type SurveyProbe,
+  EXPECTED_TIER_DISTRIBUTION, W1_SOURCES, W1_HOST_REPLACEMENTS, checkW1Criteria, recomputeTierDistribution,
+  recomputeW1, surveyHostOf, type SurveyCandidate, type SurveyProbe,
 } from './w1-candidates';
 
 // W1 名单可复算（m2-scaleout §2.2 / §9 M2-3 验收 8，v2）。
@@ -16,6 +16,8 @@ const probesPath = `${surveyDir.replace(/[\\/]$/, '')}/probe_results.json`;
 const hasSurvey = existsSync(candidatesPath) && existsSync(probesPath);
 const load = <T,>(path: string): T => JSON.parse(readFileSync(path, 'utf8')) as T;
 
+// 合成数据用 survey 口径的 host（candidates.json 里的 m./wap.jhssd.com），
+// W1 名单的 host 替换在 recomputeW1 输出时套用。
 const syntheticCandidates: SurveyCandidate[] = [
   { name: '📂小刀阅读', url: 'https://www.yingsx.com', tier: 'T1', core_feats: [], checkKeyWord: '我的', enabled: true, cn_novel: true },
   { name: '精华书阁', url: 'https://m.jhssd.com/', tier: 'T1', core_feats: [], checkKeyWord: 'k', enabled: true, cn_novel: true },
@@ -26,6 +28,7 @@ const syntheticCandidates: SurveyCandidate[] = [
   { name: '知妖-中国妖怪百集', url: 'https://www.czhiyao.com', tier: 'T1', core_feats: [], checkKeyWord: '山海经', enabled: true, cn_novel: true },
   { name: '被禁', url: 'https://dead.example', tier: 'T6', core_feats: ['regex_sub'], checkKeyWord: 'k', enabled: true, cn_novel: true },
 ];
+
 const syntheticProbes: SurveyProbe[] = [
   { host: 'https://www.yingsx.com', verdict: 'ok' },
   { host: 'https://m.jhssd.com/', verdict: 'ok' },
@@ -37,6 +40,18 @@ const syntheticProbes: SurveyProbe[] = [
   { host: 'https://dead.example', verdict: 'conn_fail' },
 ];
 
+describe('W1 host 替换（m.jhssd.com → m.jhsssd.com，站点 301 迁移）', () => {
+  it('surveyHostOf 把 W1 的实际 host 映射回 survey 数据里的 host', () => {
+    expect(surveyHostOf('m.jhsssd.com')).toBe('m.jhssd.com');
+    expect(surveyHostOf('www.yingsx.com')).toBe('www.yingsx.com');
+  });
+
+  it('W1_SOURCES 已替换为迁移后 host，且替换表与名单一致', () => {
+    expect(W1_SOURCES.find((source) => source.site === 'jhssd.com')!.host).toBe('m.jhsssd.com');
+    expect(W1_HOST_REPLACEMENTS).toEqual({ 'm.jhssd.com': 'm.jhsssd.com' });
+  });
+});
+
 describe('W1 名单可复算（§2.2 五条标准 / §9 验收 8）', () => {
   it('纯函数：①②④⑤ 过滤 + ③ 同站去重后得到设计名单；不探测/编码/质量项各自剔除一条', () => {
     const result = recomputeW1(syntheticCandidates, syntheticProbes);
@@ -44,9 +59,9 @@ describe('W1 名单可复算（§2.2 五条标准 / §9 验收 8）', () => {
     expect(result.culled.map((item) => item.host).sort()).toEqual([
       'm.jhssd.com', 'wap.jhssd.com', 'www.czhiyao.com', 'www.kanshuw.com', 'www.yingsx.com',
     ]);
-    // ③ 同站去重：m./wap.jhssd.com 归一为 jhssd.com，保留首个（m）。
+    // ③ 同站去重：m./wap.jhssd.com 归一为 jhssd.com，保留首个（m），再套 host 替换到迁移后站。
     expect(result.selected.map((item) => item.host)).toEqual([
-      'www.yingsx.com', 'm.jhssd.com', 'www.kanshuw.com', 'www.czhiyao.com',
+      'www.yingsx.com', 'm.jhsssd.com', 'www.kanshuw.com', 'www.czhiyao.com',
     ]);
     expect(result.matchesDesign).toBe(true);
   });
@@ -55,7 +70,7 @@ describe('W1 名单可复算（§2.2 五条标准 / §9 验收 8）', () => {
     const candidates = syntheticCandidates;
     const probes = syntheticProbes;
     for (const source of W1_SOURCES) {
-      const candidate = candidates.find((item) => new URL(item.url).hostname === source.host)!;
+      const candidate = candidates.find((item) => new URL(item.url).hostname === surveyHostOf(source.host))!;
       expect(candidate, `W1 源 ${source.host} 必须在 candidates.json 中`).toBeDefined();
       const check = checkW1Criteria(candidate, probes);
       expect(check).toEqual({ reachable: true, thinSurface: true, uniqueSite: true, noEncoding: true, cleanQuality: true });
@@ -72,9 +87,9 @@ describe('W1 名单可复算（§2.2 五条标准 / §9 验收 8）', () => {
     expect(result.selected.map((item) => item.host).sort()).toEqual(
       W1_SOURCES.map((source) => source.host).sort(),
     );
-    // 逐条五标准（真实数据）仍全部为真。
+    // 逐条五标准（真实数据）仍全部为真（survey host 经替换映射回 candidates.json）。
     for (const source of W1_SOURCES) {
-      const candidate = candidates.find((item) => new URL(item.url).hostname === source.host)!;
+      const candidate = candidates.find((item) => new URL(item.url).hostname === surveyHostOf(source.host))!;
       expect(checkW1Criteria(candidate, probes)).toEqual({
         reachable: true, thinSurface: true, uniqueSite: true, noEncoding: true, cleanQuality: true,
       });
