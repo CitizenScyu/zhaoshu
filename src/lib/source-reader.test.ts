@@ -947,3 +947,117 @@ describe('M2-2 多源循环：跳源 / 软预算 / 去重 / bookUrl 反查', () 
   });
 });
 
+// N01（P2）：目录加载保留 ReadingSource，chapterText 按 builtin/engine 分派正文提取。
+// 反例出处：codex 复核报告 2026-09-19 §N01 —— 合成规则 ruleContent.content='#body@text' +
+// 正文 <div id="body">…</div>：engineFetchContent 直接调成功，readSourceChapter 却返回
+// SOURCE_CHAPTER_UNAVAILABLE（因为正文只走 book15 的 parseSourceChapterText）。
+describe('引擎源正文分派（N01）', () => {
+  // 对齐 N01 反例的合成规则：ruleContent.content='#body@text'。
+  const contentEngineSource = {
+    url: 'https://book15.net/n01/', name: 'N01引擎源', searchUrl: 'https://book15.net/n01s?q={{key}}',
+    tier: 'M1' as const,
+    rules: {
+      ruleSearch: { bookList: '.book', name: '.name@text', author: '.author@text', bookUrl: 'a@href' },
+      ruleBookInfo: { name: '.title@text', author: '.writer@text', tocUrl: '.toc@href' },
+      ruleToc: { chapterList: '.chapter', chapterName: 'a@text', chapterUrl: 'a@href' },
+      ruleContent: { content: '#body@text' },
+    },
+  };
+  const n01Search = 'https://book15.net/n01s?q=' + encodeURIComponent(book.title);
+  const n01Detail = 'https://book15.net/n01/d/1.html';
+  const n01Toc = 'https://book15.net/n01/toc/1.html';
+  const n01Chapter = 'https://book15.net/n01/c/1.html';
+  const primeEngineCatalog = async () => {
+    mocks.sources.mockResolvedValue([contentEngineSource]);
+    pages.set(n01Search, { text: '<div class="book"><span class="name">测试书</span><span class="author">作者</span><a href="/n01/d/1.html">x</a></div>' });
+    pages.set(n01Detail, { text: '<h1 class="title">测试书</h1><span class="writer">作者</span><a class="toc" href="/n01/toc/1.html">目录</a>' });
+    pages.set(n01Toc, { text: '<li class="chapter"><a href="/n01/c/1.html">第一章</a></li>' });
+    const catalog = await service.resolveSourceBook(book, context());
+    catalogs.set(catalog.version, catalog);
+    return catalog;
+  };
+
+  it('引擎源目录 + #body@text 正文 → readSourceChapter 成功（对齐 N01 反例）', async () => {
+    const catalog = await primeEngineCatalog();
+    pages.set(n01Chapter, { text: '<div id="body">Synthetic chapter body.</div>' });
+    const part = await service.readSourceChapter(catalog.version, 0, context());
+    expect(part.text).toBe('Synthetic chapter body.');
+    expect(part).toMatchObject({ sourceId: catalog.sourceId, chapterIndex: 0, servedFrom: 'N01引擎源' });
+  });
+
+  it('反例对照：同一输入 engineFetchContent 直接调成功（不经过 readSourceChapter）', async () => {
+    // 反例的另一半：修复前 engineFetchContent 本身就是好的，坏的是 chapterText 的分派缺失。
+    const { engineFetchContent } = await import('./rule-engine/api');
+    const { compileSource } = await import('./rule-engine/compile');
+    const engine = {
+      url: contentEngineSource.url, name: contentEngineSource.name, searchUrl: contentEngineSource.searchUrl,
+      compiled: compileSource({ url: contentEngineSource.url, searchUrl: contentEngineSource.searchUrl, rules: contentEngineSource.rules }),
+    };
+    pages.set(n01Chapter, { text: '<div id="body">Synthetic chapter body.</div>' });
+    expect(await engineFetchContent(engine, n01Chapter, context())).toEqual({ text: 'Synthetic chapter body.' });
+  });
+
+  it('builtin 源仍走 parseSourceChapterText（行为不变）：#body 页面对 builtin 是无效正文', async () => {
+    const catalog = await service.resolveSourceBook(book, context()); // 默认 fixture = builtin book15
+    catalogs.set(catalog.version, catalog);
+    // builtin 的章节 URL 换成引擎式 #body 正文页：parseSourceChapterText 找不到
+    // <li class="chapter-content"> ⇒ 按既有语义失败（负控：builtin 分支没被引擎化）。
+    pages.set(chapterUrl(), { text: '<div id="body">Synthetic chapter body.</div>' });
+    pages.set('https://book15.net/books/search.html?kw=' + encodeURIComponent(book.title), { text: '' });
+    pages.set('https://book15.net/books/search.html?kw=' + encodeURIComponent(book.author), { text: '' });
+    await expect(service.readSourceChapter(catalog.version, 0, context()))
+      .rejects.toMatchObject({ code: 'SOURCE_CHAPTER_UNAVAILABLE', status: 503 });
+  });
+
+  it('builtin 源正常正文仍走 parseSourceChapterText 且成功（逐字不变）', async () => {
+    const catalog = await service.resolveSourceBook(book, context());
+    catalogs.set(catalog.version, catalog);
+    const part = await service.readSourceChapter(catalog.version, 0, context());
+    expect(part.text).toBe('离线测试正文。'); // 默认 fixture：<li class="chapter-content"><p>…</p></li>
+  });
+
+  it('引擎正文规则不命中（空正文）→ SOURCE_CHAPTER_UNAVAILABLE 语义保持', async () => {
+    const catalog = await primeEngineCatalog();
+    // 规则 #body 不命中 ⇒ engineFetchContent 返回空串 ⇒ 分派层抛书源未提供有效正文
+    // ⇒ 主路径失败进 failover；failover（同池同书）也无匹配目录 ⇒ SOURCE_CHAPTER_UNAVAILABLE。
+    pages.set(n01Chapter, { text: '<div class="no-body">别的容器</div>' });
+    pages.set(n01Search, { text: '' });
+    await expect(service.readSourceChapter(catalog.version, 0, context()))
+      .rejects.toMatchObject({ code: 'SOURCE_CHAPTER_UNAVAILABLE', status: 503 });
+  });
+
+  it('换源后备用源为引擎源 → 备用源正文走引擎（按备用源自己的规则分派）', async () => {
+    // 主源 builtin 目录第一章正文 404 ⇒ failover；备用引擎源命中同书 ⇒ 备用正文按 #body@text 取。
+    mocks.sources.mockResolvedValue([source, contentEngineSource]);
+    const catalog = await service.resolveSourceBook(book, context());
+    catalogs.set(catalog.version, catalog);
+    pages.set(chapterUrl(), { text: '', status: 404 });
+    pages.set(n01Search, { text: '<div class="book"><span class="name">测试书</span><span class="author">作者</span><a href="/n01/d/1.html">x</a></div>' });
+    pages.set(n01Detail, { text: '<h1 class="title">测试书</h1><span class="writer">作者</span><a class="toc" href="/n01/toc/1.html">目录</a>' });
+    pages.set(n01Toc, { text: '<li class="chapter"><a href="/n01/c/1.html">第一章</a></li>' });
+    pages.set(n01Chapter, { text: '<div id="body">备用引擎源正文。</div>' });
+    const part = await service.readSourceChapter(catalog.version, 0, context());
+    expect(part.text).toBe('备用引擎源正文。');
+    expect(part.servedFrom).toBe('N01引擎源');
+    expect(part.sourceId).toBe(catalog.sourceId); // 目录归属仍是主源
+  });
+
+  it('端到端（离线，源池/DB mock）：引擎源目录成功 → 正文成功', async () => {
+    // 完整链路 = GET /api/read/source/index（建目录+落库）→ GET /api/read/source/chapter（读正文）。
+    mocks.sources.mockResolvedValue([contentEngineSource]);
+    pages.set(n01Search, { text: '<div class="book"><span class="name">测试书</span><span class="author">作者</span><a href="/n01/d/1.html">x</a></div>' });
+    pages.set(n01Detail, { text: '<h1 class="title">测试书</h1><span class="writer">作者</span><a class="toc" href="/n01/toc/1.html">目录</a>' });
+    pages.set(n01Toc, { text: '<li class="chapter"><a href="/n01/c/1.html">第一章</a></li>' });
+    pages.set(n01Chapter, { text: '<div id="body">Synthetic chapter body.</div>' });
+    const indexRes = await request(); // index：title=测试书&author=作者
+    expect(indexRes.status).toBe(200);
+    const index = await indexRes.json();
+    expect(index.title).toBe('测试书');
+    expect(index.source.name).toBe('N01引擎源');
+    const partRes = await request('chapter', `session=${index.source.session}&version=${index.version}&chapter=0`);
+    expect(partRes.status).toBe(200);
+    expectPrivate(partRes);
+    expect((await partRes.json()).text).toBe('Synthetic chapter body.');
+  });
+});
+
