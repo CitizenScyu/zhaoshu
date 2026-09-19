@@ -292,12 +292,12 @@
 "coreRules": {
 "ruleSearch.author": "$.bookAuthor",
 "ruleSearch.bookList": "$..books[*]",
-"ruleSearch.bookUrl": "https://fiction.fengduxiaoshuo.com/doReader/enter_bookinfo_index?_token=d2a094ff-b75f-4b60-ba2c-19e1cfe6cf73&bookId={{$.bookId}}&_sv=v2",
+"ruleSearch.bookUrl": "https://fiction.fengduxiaoshuo.com/doReader/enter_bookinfo_index?_token=a01db672-e64d-cfb6-e862-80c9ab776be1&bookId={{$.bookId}}&_sv=v2",
 "ruleSearch.name": "$.bookTitle##（+.*|.*最新章节|\\(+.*",
 "ruleContent.content": "$..chapterContent",
 "ruleToc.chapterList": "$..detailedBookInfo.bookChapterAllInfo[*]",
 "ruleToc.chapterName": "$.chapterTitle##[\\(（].*[求更谢乐发推].*[）\\)]",
-"ruleToc.chapterUrl": "https://fiction.fengduxiaoshuo.com/doReader/get_content_by_chapterId?_token=d2a094ff-b75f-4b60-ba2c-19e1cfe6cf73&bookId={{$.bookId}}&chapterId={{$.chapterId}}&chapterCount=1&_sv=v2"
+"ruleToc.chapterUrl": "https://fiction.fengduxiaoshuo.com/doReader/get_content_by_chapterId?_token=a01db672-e64d-cfb6-e862-80c9ab776be1&bookId={{$.bookId}}&chapterId={{$.chapterId}}&chapterCount=1&_sv=v2"
 }
 },
 {
@@ -863,7 +863,7 @@
 "ruleContent.content": "<p>{{$.data.Content[0].Content}}</p>",
 "ruleToc.chapterList": "$.rows",
 "ruleToc.chapterName": "$.serialName",
-"ruleToc.chapterUrl": "https://novel.html5.qq.com/be-api/content/ads-read,{\n\t\"method\": \"POST\",\n\t\"body\": {\n\t\t\"Scene\": \"chapter\",\n\t\t\"ContentAnchorBatch\": [{\n\t\t\t\t\"BookID\": \"{{baseUrl.match(/bookId=(\\d+)/)[1]}}\",\n\t\t\t\t\"ChapterSeqNo\": [{{$.serialID}}]\n\t\t\t}]\n\t},\n\t\"headers\": {\n\t\t\"Q-GUID\": \"47822b7d93d45ed7d703338913b788cb\"\n\t}\n}"
+"ruleToc.chapterUrl": "https://novel.html5.qq.com/be-api/content/ads-read,{\n\t\"method\": \"POST\",\n\t\"body\": {\n\t\t\"Scene\": \"chapter\",\n\t\t\"ContentAnchorBatch\": [{\n\t\t\t\t\"BookID\": \"{{baseUrl.match(/bookId=(\\d+)/)[1]}}\",\n\t\t\t\t\"ChapterSeqNo\": [{{$.serialID}}]\n\t\t\t}]\n\t},\n\t\"headers\": {\n\t\t\"Q-GUID\": \"2ee9d6c4754804d19265dc1eee4616d8\"\n\t}\n}"
 }
 },
 {
@@ -880,7 +880,7 @@
 "ruleContent.content": "$.chapter.body||$.msg",
 "ruleToc.chapterList": "$.data.chapters",
 "ruleToc.chapterName": "$.tit",
-"ruleToc.chapterUrl": "https://xs.zzxsa.com/read/@get:{xid}/{{$.num}}?app_name=com.zhuxshah.mszlhdgwa&app_vn=2.7&dev_id=89b2628c-292f-32c6-b512-8ef3cbe58315&ts={{Date.now()}}&app_vc=20227&token=030590f5f9f4b2ab0879ea5cda0670a2"
+"ruleToc.chapterUrl": "https://xs.zzxsa.com/read/@get:{xid}/{{$.num}}?app_name=com.zhuxshah.mszlhdgwa&app_vn=2.7&dev_id=472d3390-5382-1297-144e-79659817c120&ts={{Date.now()}}&app_vc=20227&token=d5591fbb52b70152a57cd18ff99572d4"
 }
 },
 {
@@ -1026,7 +1026,7 @@
 "ruleContent.content": "$.chapter.body",
 "ruleToc.chapterList": "$.data.chapters",
 "ruleToc.chapterName": "$.tit",
-"ruleToc.chapterUrl": "https://xs.zzxsa.com/read/@get:{xid}/{{$.num}}?app_name=com.zhuxshah.mszlhdgwa&app_vn=2.7&dev_id=89b2628c-292f-32c6-b512-8ef3cbe58315&ts={{Date.now()}}&app_vc=20227&token=030590f5f9f4b2ab0879ea5cda0670a2"
+"ruleToc.chapterUrl": "https://xs.zzxsa.com/read/@get:{xid}/{{$.num}}?app_name=com.zhuxshah.mszlhdgwa&app_vn=2.7&dev_id=472d3390-5382-1297-144e-79659817c120&ts={{Date.now()}}&app_vc=20227&token=d5591fbb52b70152a57cd18ff99572d4"
 }
 },
 {
@@ -1209,7 +1209,7 @@
 "ruleContent.content": "<p>{{$.data.Content[0].Content}}</p>",
 "ruleToc.chapterList": "$.rows",
 "ruleToc.chapterName": "$.serialName",
-"ruleToc.chapterUrl": "https://novel.html5.qq.com/be-api/content/ads-read,{\n\t\"method\": \"POST\",\n\t\"body\": {\n\t\t\"Scene\": \"chapter\",\n\t\t\"ContentAnchorBatch\": [{\n\t\t\t\t\"BookID\": \"{{baseUrl.match(/bookId=(\\d+)/)[1]}}\",\n\t\t\t\t\"ChapterSeqNo\": [{{$.serialID}}]\n\t\t\t}]\n\t},\n\t\"headers\": {\n\t\t\"Q-GUID\": \"4aa27c7cf2d9aca3359656ea186488cb\"\n\t}\n}"
+"ruleToc.chapterUrl": "https://novel.html5.qq.com/be-api/content/ads-read,{\n\t\"method\": \"POST\",\n\t\"body\": {\n\t\t\"Scene\": \"chapter\",\n\t\t\"ContentAnchorBatch\": [{\n\t\t\t\t\"BookID\": \"{{baseUrl.match(/bookId=(\\d+)/)[1]}}\",\n\t\t\t\t\"ChapterSeqNo\": [{{$.serialID}}]\n\t\t\t}]\n\t},\n\t\"headers\": {\n\t\t\"Q-GUID\": \"05251cd15b7862eb97dcf2d983b3821b\"\n\t}\n}"
 }
 },
 {
@@ -2299,12 +2299,12 @@
 "coreRules": {
 "ruleSearch.author": "$.bookAuthor",
 "ruleSearch.bookList": "$..books[*]",
-"ruleSearch.bookUrl": "https://fiction.fengduxiaoshuo.com/doReader/enter_bookinfo_index?_token=d2a094ff-b75f-4b60-ba2c-19e1cfe6cf73&bookId={{$.bookId}}&_sv=v2",
+"ruleSearch.bookUrl": "https://fiction.fengduxiaoshuo.com/doReader/enter_bookinfo_index?_token=a01db672-e64d-cfb6-e862-80c9ab776be1&bookId={{$.bookId}}&_sv=v2",
 "ruleSearch.name": "$.bookTitle##（+.*|.*最新章节|\\(+.*",
 "ruleContent.content": "$..chapterContent",
 "ruleToc.chapterList": "$..detailedBookInfo.bookChapterAllInfo[*]",
 "ruleToc.chapterName": "$.chapterTitle##[\\(（].*[求更谢乐发推].*[）\\)]",
-"ruleToc.chapterUrl": "https://fiction.fengduxiaoshuo.com/doReader/get_content_by_chapterId?_token=d2a094ff-b75f-4b60-ba2c-19e1cfe6cf73&bookId={{$.bookId}}&chapterId={{$.chapterId}}&chapterCount=1&_sv=v2"
+"ruleToc.chapterUrl": "https://fiction.fengduxiaoshuo.com/doReader/get_content_by_chapterId?_token=a01db672-e64d-cfb6-e862-80c9ab776be1&bookId={{$.bookId}}&chapterId={{$.chapterId}}&chapterCount=1&_sv=v2"
 }
 },
 {
