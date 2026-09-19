@@ -120,11 +120,11 @@ export function insideNode(scope: HtmlScope, node: unknown): HtmlScope {
 }
 
 // ---------------------------------------------------------------- 单规则求值
-export function evaluateRule(ir: RuleIr, scope: EvalScope): EvalResult {
+export function evaluateRule(ir: RuleIr, scope: EvalScope, multi = false): EvalResult {
   switch (ir.kind) {
     case 'css': {
       if (scope.kind !== 'html') return evalFailed('HTML 选择器规则不能对 JSON 输入求值');
-      const result = evaluateCssChain(scope.$, scope.nodes, ir.chain, ir.terminal, scope.pageUrl);
+      const result = evaluateCssChain(scope.$, scope.nodes, ir.chain, ir.terminal, scope.pageUrl, multi);
       return typeof result === 'string' ? { kind: 'text', value: result } : { kind: 'nodes', nodes: result };
     }
     case 'jsonpath': {
@@ -172,17 +172,20 @@ function jsonValuesToString(values: unknown[]): string {
  * 求值一个字符串字段：
  * 逐条候选取首个非空（M1 期候选数=1）；套用 ##正则## 替换；统一 trim()。
  * 空字符串 = 未命中（上层按「字段缺失降级」处理，§7.2）。
+ *
+ * `multi`（默认 false）：终端命中多个节点时是否拼接。单值字段（name/bookUrl/...）取首个非空；
+ * 仅 `ruleContent.content` 由门面传 `multi=true` 拼接多段落。见 dom-ops.ts:applyTerminal。
  */
-export function evaluateField(field: FieldIr, scope: EvalScope): string {
+export function evaluateField(field: FieldIr, scope: EvalScope, multi = false): string {
   if (field.joins !== undefined || field.concats !== undefined) {
     // T7 构件（&& 连接符 / %% 拼接）：M1 未实现，宁可失败也不要静默返回错的字符串。
     return evalFailed('M1 不支持 && / %% 组合规则（T7）');
   }
   let value = '';
   for (const ir of field.rules) {
-    const result = evaluateRule(ir, scope);
+    const result = evaluateRule(ir, scope, multi);
     if (result.kind === 'text') value = result.value;
-    else value = scope.kind === 'html' ? applyTerminal(scope.$, result.nodes, { op: 'text' }, scope.pageUrl) : '';
+    else value = scope.kind === 'html' ? applyTerminal(scope.$, result.nodes, { op: 'text' }, scope.pageUrl, multi) : '';
     if (value.trim() !== '') break;
   }
   if (field.regex !== undefined) value = applyRegexSubs(value, field.regex);

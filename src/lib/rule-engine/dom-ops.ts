@@ -10,8 +10,10 @@ export type HtmlNode = AnyNode;
 export type CheerioNodes = Cheerio<AnyNode>;
 
 /**
- * 多命中拼接分隔符。legado AnalyzeByDefault 对「多元素取同一字段」用换行连接；
- * 单元素（bookList/chapterList 内逐条求值）不受影响。
+ * 多节点拼接分隔符。
+ * 仅用于「确需拼接多个节点」的两处：正文 `ruleContent.content`（多段落容器，applyTerminal
+ * multi=true）与单节点内 `@textNodes` 子文本拼接（textNodesOf，与命中数无关）；jsonpath 多值
+ * （jsonValuesToString）另有其约定。**单值字段**（name/bookUrl/... ）不再拼接，取首个非空值。
  */
 export const MULTI_JOIN = '\n';
 
@@ -77,21 +79,34 @@ const OP_ATTRS: Partial<Record<TerminalOp['op'], string>> = {
 
 // ---------------------------------------------------------------- 末端操作
 /**
- * 对命中的节点集应用末端操作，返回字段字符串（多命中按 MULTI_JOIN 连接）。
+ * 对命中的节点集应用末端操作，返回字段字符串。
  * 属性不存在 / URL 绝对化失败 → 该节点贡献被丢弃（null）。
+ *
+ * `multi=false`（默认，单值字段）：取**首个非空**节点值（等价 legado 单值字段 first()——
+ *   yingsx 一类 `li` 含「标题a + 章节a」时只取首个，不再把两条 URL/文本 `\n` 拼坏）。
+ * `multi=true`（仅正文 `ruleContent.content`，由门面 opt-in）：多节点按 MULTI_JOIN 拼接
+ *   （多段落容器 `@p@text` 靠此拼成整章，40/174 源依赖，不能改）。
  */
 export function applyTerminal(
   $: CheerioAPI,
   nodes: CheerioNodes,
   terminal: TerminalOp,
   pageUrl: string,
+  multi = false,
 ): string {
   const values: string[] = [];
+  let first: string | null = null;
   nodes.each((_index, node) => {
+    if (!multi && first !== null) return;
     const value = terminalValue($, node, terminal, pageUrl);
-    if (value !== null) values.push(value);
+    if (value === null) return;
+    if (multi) { values.push(value); return; }
+    // 首命中取「首个非空」：`@text/@ownText/@html/@textNodes` 对空节点返回 '' 而非 null，
+    // 若首节点是空壳（如 `<a><img></a>` 后跟含书名的 `<a>`），跳过空串继续找下一节点。
+    // （与 legado textS 只收非空一致；multi=true 不跳空，保正文拼接零 diff。）
+    if (value !== '' && first === null) first = value;
   });
-  return values.join(MULTI_JOIN);
+  return multi ? values.join(MULTI_JOIN) : (first ?? '');
 }
 
 function terminalValue(
@@ -142,13 +157,14 @@ export function evaluateCssChain(
   chain: CssStep[],
   terminal: TerminalOp | undefined,
   pageUrl: string,
+  multi = false,
 ): CheerioNodes | string {
   let nodes = scope;
   for (const step of chain) {
     nodes = runStep($, nodes, step);
     if (nodes.length === 0) return terminal ? '' : nodes;
   }
-  return terminal ? applyTerminal($, nodes, terminal, pageUrl) : nodes;
+  return terminal ? applyTerminal($, nodes, terminal, pageUrl, multi) : nodes;
 }
 
 /**
