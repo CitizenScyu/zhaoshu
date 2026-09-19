@@ -2,7 +2,8 @@
 // shuyuan.ts（runAdmissionBatch 只吃内存态、吐要写库的行），便于单测与判定隔离。
 //
 // 关键防线（设计 §4.4 / v3 E4）：
-// - 滤网 1 compileAdmission：纯本地，survey 初筛 + 核心字段 compile；
+// - 滤网 1 compileAdmission：纯本地，survey 初筛 + 核心字段 compile + 最低必需组（N03：
+//   缺目录/搜索/正文任一必需规则 = 无可执行阅读路径，compile 拒）；
 // - 滤网 2 searchAdmission：真实搜索一次，走独立 admissionFetch 通道（自带
 //   validateAdmissionUrl），**不经过运行时 host 门 fetchSourceText/validateSourceUrl**；
 // - 两把锁共享 source-policy.ts 的 checkSourceUrl（检查项逐条同款，仅 host 白名单来源不同）；
@@ -56,9 +57,32 @@ export interface AdmissionCompile {
 }
 
 /**
+ * 最低必需组（N03）：「可执行阅读路径」的最小字段集——搜索三件（bookList/name/bookUrl）
+ * + 目录三件（chapterList/chapterName/chapterUrl）+ 正文 content。缺任一 → compile 拒：
+ *   - 无 chapterList/chapterName/chapterUrl：engineFetchToc 对真实目录页必产出空 chapters
+ *     （反例：正常搜索+正文、删 ruleToc → 旧版仍 compile_ok/search_ok，进池后目录恒空）；
+ *   - 无 content：正文恒空；无搜索三件：搜不到书，阅读链路起点即断。
+ * 能力可选字段（author/tocUrl/nextTocUrl/nextContentUrl/ruleBookInfo.*）不机械要求——
+ * 缺了只是能力降级（作者未知/单页目录/单页正文），不阻断准入。
+ * 注意 ruleToc.chapterUrl 缺失但 chapterList/chapterName 在的源（174 fixture 有 10 条）
+ * 旧行为放行、本修复起拒——对已 admitted 源的影响见 isGrandfatheredAdmitted。
+ */
+const REQUIRED_FIELDS = [
+  'ruleSearch.bookList',
+  'ruleSearch.name',
+  'ruleSearch.bookUrl',
+  'ruleToc.chapterList',
+  'ruleToc.chapterName',
+  'ruleToc.chapterUrl',
+  'ruleContent.content',
+] as const;
+
+/**
  * 滤网 1：规则可解释（设计 §4.1）。survey 初筛（HTTPS 源 URL、纯 GET 搜索模板、
  * bookSourceType≠2、无 JS）+ 对全部核心字段跑 compile；任一核心字段
  * RULE_UNSUPPORTED → 拒。装饰字段不阻断（本层只看核心字段）。
+ * N03：核心字段全部可解释**且必需组全部在场**才 ok——只查 failures 会放行
+ * 「删掉 ruleToc 的源」（规则不存在就没有 failure），它进池后目录必空。
  */
 export function compileAdmission(source: RawSource): AdmissionCompile {
   const coreFieldMask: Record<string, boolean> = {};
@@ -81,11 +105,32 @@ export function compileAdmission(source: RawSource): AdmissionCompile {
       failures.push({ field, rule, message });
     }
   }
-  const ok = failures.length === 0;
-  return {
-    ok, tier: ok ? 'M1' : 'T7', coreFieldMask, failures,
-    reason: ok ? '' : failures.map((f) => `${f.field}: ${f.message}`).join('; ').slice(0, 200),
-  };
+  // N03：必需组缺位（mask=false 即规则不存在或不可编译）→ 拒，reason 落字段名。
+  const missing = REQUIRED_FIELDS.filter((field) => !coreFieldMask[field]);
+  const ok = failures.length === 0 && missing.length === 0;
+  const reason = failures.length > 0
+    ? failures.map((f) => `${f.field}: ${f.message}`).join('; ').slice(0, 200)
+    : missing.length > 0 ? `缺少必需规则（无可执行阅读路径）: ${missing.join(', ')}` : '';
+  return { ok, tier: ok ? 'M1' : 'T7', coreFieldMask, failures, reason };
+}
+
+/**
+ * W1 现网池豁免（N03 红线）：新校验收紧后，既有 source_admission 行可能被判
+ * compile_ok=false（例：174 池里 10 条缺 ruleToc.chapterUrl 的源）。若该源此前
+ * search_ok=true（已在运行时阅读池，如 yingsx/jhsssd），直接改判会在下轮 cron
+ * 把它写出池。豁免条件（窄）：
+ *   - 既有行 rules_hash === 当前 hash（规则未变——资格评审对象没换）；
+ *   - 既有行 compile_ok=true ∧ search_ok===true（已在池、已实证可搜索）。
+ * 规则一变（hash 变）资格评审重开，新校验立即生效——豁免只保护「旧行为下已进池
+ * 且规则未变」的存量，不给新源留后门（新源无既有行，不满足第一条）。
+ */
+export function isGrandfatheredAdmitted(
+  previous: AdmissionSourceRow | undefined, currentHash: string,
+): boolean {
+  return previous !== undefined
+    && previous.rules_hash === currentHash
+    && previous.compile_ok === true
+    && previous.search_ok === true;
 }
 
 // ---------------------------------------------------------------- 滤网 2（searchAdmission）
@@ -387,6 +432,8 @@ export interface AdmissionBatchResult {
   compileRejected: number;
   probed: number;
   verdicts: Record<string, number>;
+  /** N03 祖父条款命中数（新校验下本会拒、因「规则未变 ∧ 已在池」维持既有资格的源）。 */
+  grandfathered: number;
 }
 
 function hostOf(url: string): string {
@@ -416,9 +463,52 @@ function isRetestDue(row: AdmissionSourceRow, nowMs: number): boolean {
 }
 
 /**
+ * N04 公平调度：探测优先序（小者先）。**未测过的源优先**（class 0），其次复测到期者
+ * 按 search_checked_at **最旧优先**（class 1，天然轮转——上轮刚测过的时间戳最新、排最后），
+ * 结论仍有效者不占探测名额（class 2）。同 class 内保持输入序（稳定排序，可复算）。
+ * 反例背景：旧版按输入顺序最多探 5 个，前 5 个持续 http_5xx 的源每轮吃满全部名额，
+ * 第 6 个源永远 search_ok=null（饿死）。
+ */
+type ProbeClass = 0 | 1 | 2;
+
+interface AdmissionPlanEntry {
+  candidate: AdmissionCandidate;
+  /** 输入序（稳定排序次键）。 */
+  index: number;
+  previous: AdmissionSourceRow | undefined;
+  hash: string;
+  probeClass: ProbeClass;
+  /** search_checked_at 毫秒（未测/缺时间戳 = -Infinity，最旧优先语义下排最前）。 */
+  checkedAtMs: number;
+}
+
+function planProbeOrder(input: AdmissionBatchInput, nowMs: number): AdmissionPlanEntry[] {
+  const entries: AdmissionPlanEntry[] = input.candidates.map((candidate, index) => {
+    const previous = input.existing.get(candidate.url);
+    const hash = rulesHash(candidate.source);
+    const rulesChanged = !previous || previous.rules_hash !== hash;
+    let probeClass: ProbeClass = 2;
+    if (!previous || previous.search_ok === null) probeClass = 0; // 从未测过（含占位行）
+    else if (rulesChanged || isRetestDue(previous, nowMs)) probeClass = 1; // 规则变/复测到期
+    const checked = previous?.search_checked_at ? Date.parse(previous.search_checked_at) : Number.NaN;
+    return {
+      candidate, index, previous, hash, probeClass,
+      checkedAtMs: Number.isFinite(checked) ? checked : Number.NEGATIVE_INFINITY,
+    };
+  });
+  return entries.sort((a, b) =>
+    a.probeClass - b.probeClass
+    || a.checkedAtMs - b.checkedAtMs
+    || a.index - b.index);
+}
+
+/**
  * 跑一轮准入批次（设计 §4.2）。纯逻辑：不碰 DB，输入既有行、输出要写库的行。
  * 状态机：new → compile_rejected（终态，规则不变不复测）｜new → deferred → (ok|rejected)｜ok。
- * 每轮真实搜索 ≤ maxProbes（默认 5）；canProbe 为 false 时停止探测但仍写出可离线得到的结论。
+ * 每轮真实搜索 ≤ maxProbes（默认 5），按 planProbeOrder 的公平序分配名额（N04）；
+ * canProbe 为 false 时停止探测但仍写出可离线得到的结论。
+ * N03 祖父条款：新必需组校验收紧时，既有「规则未变 ∧ compile_ok ∧ search_ok=true」的行
+ * 不改判 compile 拒（W1 现网池红线），规则一变即按新校验重审。
  */
 export async function runAdmissionBatch(input: AdmissionBatchInput): Promise<AdmissionBatchResult> {
   const now = input.now ?? (() => new Date());
@@ -426,17 +516,18 @@ export async function runAdmissionBatch(input: AdmissionBatchInput): Promise<Adm
   const verdicts: Record<string, number> = {};
   let compileOk = 0;
   let compileRejected = 0;
+  let grandfathered = 0;
   let probed = 0;
   let probeSlots = Math.max(0, input.maxProbes ?? ADMISSION_MAX_PROBES_PER_REFRESH);
   const canProbe = input.canProbe ?? (() => true);
 
-  for (const candidate of input.candidates) {
-    const hash = rulesHash(candidate.source);
-    const previous = input.existing.get(candidate.url);
+  for (const { candidate, previous, hash, probeClass } of planProbeOrder(input, now().getTime())) {
     const host = hostOf(candidate.url);
     const compile = compileAdmission(candidate.source);
+    // N03 祖父条款：新校验下会拒、但规则未变且已在池（compile_ok ∧ search_ok=true）→ 维持既有资格。
+    const exempt = !compile.ok && isGrandfatheredAdmitted(previous, hash);
 
-    if (!compile.ok) {
+    if (!compile.ok && !exempt) {
       compileRejected += 1;
       // 规则未变且上一轮已是 compile 拒 → 终态不重写（§4.2）。
       if (previous && previous.rules_hash === hash && previous.compile_ok === false) continue;
@@ -447,9 +538,10 @@ export async function runAdmissionBatch(input: AdmissionBatchInput): Promise<Adm
       continue;
     }
     compileOk += 1;
+    if (exempt) grandfathered += 1;
 
     const rulesChanged = !previous || previous.rules_hash !== hash;
-    const needsProbe = !previous || previous.rules_hash !== hash || isRetestDue(previous, now().getTime());
+    const needsProbe = probeClass <= 1; // 未测 / 规则变 / 复测到期（planProbeOrder 同口径）
     if (!needsProbe) continue; // 结论仍有效，不重写
 
     if (probeSlots > 0 && canProbe() && !input.signal.aborted) {
@@ -476,5 +568,5 @@ export async function runAdmissionBatch(input: AdmissionBatchInput): Promise<Adm
       });
     }
   }
-  return { rows, compileOk, compileRejected, probed, verdicts };
+  return { rows, compileOk, compileRejected, probed, verdicts, grandfathered };
 }
