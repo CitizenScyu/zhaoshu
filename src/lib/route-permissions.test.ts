@@ -33,6 +33,8 @@ const policies: Record<string, Record<string, 'find' | 'read' | 'download' | 'ow
   profile: { GET: 'find', PUT: 'find', POST: 'find' },
   // F15：画像吸收端点与 profile 同权限（同样是本人数据 + 模型调用）。
   'profile/absorb': { GET: 'find', POST: 'find' },
+  // F15 残留③：吸收 drain 兜底入口，只由 cron 以 CRON_SECRET 调用（与 download/reclaim 同款）。
+  'profile/absorb/drain': { GET: 'cron' },
   'read/[id]/[resource]': { GET: 'read' }, 'read/source/[resource]': { GET: 'read' },
   recommendations: { GET: 'find' },
   shelf: { POST: 'find', DELETE: 'find' },

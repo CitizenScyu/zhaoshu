@@ -13,6 +13,8 @@ const mocks = vi.hoisted(() => ({
   // F15：吸收/重建涉及的队列函数。
   getProfileFeedbackQueueForUser: vi.fn(), markProfileFeedbackAbsorbedForUser: vi.fn(),
   markProfileFeedbackFailedForUser: vi.fn(), getMaxFeedbackIdForUser: vi.fn(), ensureProfileForUser: vi.fn(),
+  // F15 租约：吸收路径先 claim 再调模型。
+  claimProfileFeedbackForUser: vi.fn(), getProfileFeedbackFailCountForUser: vi.fn(),
 }));
 vi.mock('next/server', async (importOriginal) => ({
   ...await importOriginal<typeof import('next/server')>(), after: mocks.after,
@@ -35,6 +37,8 @@ vi.mock('@/lib/db', async (importOriginal) => ({
   getProfileFeedbackQueueForUser: mocks.getProfileFeedbackQueueForUser,
   markProfileFeedbackAbsorbedForUser: mocks.markProfileFeedbackAbsorbedForUser,
   markProfileFeedbackFailedForUser: mocks.markProfileFeedbackFailedForUser,
+  claimProfileFeedbackForUser: mocks.claimProfileFeedbackForUser,
+  getProfileFeedbackFailCountForUser: mocks.getProfileFeedbackFailCountForUser,
   getMaxFeedbackIdForUser: mocks.getMaxFeedbackIdForUser,
   ensureProfileForUser: mocks.ensureProfileForUser,
   getExcludedBookTitlesForUser: mocks.getExcludedBookTitlesForUser,
@@ -164,6 +168,9 @@ describe('usage instrumentation through all model routes', () => {
     mocks.getProfileFeedbackQueueForUser.mockResolvedValue({ pendingFeedbackId: 7, absorbedFeedbackId: 0, status: 'pending', attempts: 0, lastError: '', updatedAt: '' });
     mocks.markProfileFeedbackAbsorbedForUser.mockResolvedValue(null);
     mocks.markProfileFeedbackFailedForUser.mockResolvedValue(undefined);
+    // F15 租约：默认领取成功（候选 7），失败计数 0（退避第一档 30s，但本文件只关心 usage 记录）。
+    mocks.claimProfileFeedbackForUser.mockResolvedValue(7);
+    mocks.getProfileFeedbackFailCountForUser.mockResolvedValue(0);
     mocks.getMaxFeedbackIdForUser.mockResolvedValue(0);
     mocks.ensureProfileForUser.mockResolvedValue(undefined);
     mocks.getSql.mockReturnValue(Object.assign(mocks.businessSql, { transaction: mocks.transaction }));
