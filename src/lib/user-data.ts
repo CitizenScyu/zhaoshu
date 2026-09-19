@@ -362,8 +362,23 @@ export function feedbackForUserQueries(sql: PersonalQuery, userId: number, raw: 
 // 不产生队列事件（404 路径不留脏 pending）。
 // queued=false（want/reading 且此前也非 informative）时 SELECT 无行，不登记——只有
 // 「有信息量的反馈」或「撤回先前的 informative 反馈」才需要吸收。
+// 退避曲线（F15 残留②）：连续第 n 次失败 → base × 4^(n-1)，封顶 cap。
+// 30s → 2m → 8m → 32m → 1h（封顶）。曲线在这里算好（可单测），SQL 只落数值——
+// 失败写入与退避设置在同一 UPDATE 里原子完成。
+export const PROFILE_FEEDBACK_BACKOFF_BASE_MS = 30_000;
+export const PROFILE_FEEDBACK_BACKOFF_CAP_MS = 3_600_000;
+
+export function profileFeedbackBackoffMs(consecutiveFailures: number): number {
+  if (!Number.isSafeInteger(consecutiveFailures) || consecutiveFailures < 1) return 0;
+  return Math.min(PROFILE_FEEDBACK_BACKOFF_BASE_MS * 4 ** (consecutiveFailures - 1), PROFILE_FEEDBACK_BACKOFF_CAP_MS);
+}
+
 export function enqueueProfileFeedbackForUserQuery(sql: PersonalQuery, userId: number, expectedVersion: number, queued: boolean) {
   requireUserId(userId);
+  // 新反馈登记时**不动**租约与退避列：若吸收正持有租约进行中，这次 GREATEST 抬高 pending
+  // 即可，完成后 markAbsorbed 的「pending 仍更高 → 退回 pending」分支会让它被下一次领取；
+  // 若此前在退避中，新反馈也不解除退避（吸收本就要合并全部 pending，晚一个退避周期
+  // 再一并吸收，语义正确且避免「每写一条反馈就重置退避」的打模型风暴）。
   return sql`INSERT INTO profile_feedback_queue (user_id, pending_feedback_id, status, updated_at)
     SELECT ${userId}, max(id), ${'pending'}, now() FROM feedback
     WHERE user_id = ${userId} AND ${queued}
@@ -380,10 +395,50 @@ export function profileFeedbackQueueForUserQuery(sql: PersonalQuery, userId: num
     FROM profile_feedback_queue WHERE user_id = ${userId}`;
 }
 
+// 领取谓词（租约 + 退避共用）。一行可被领取当且仅当：
+//   - 有 pending 待吸收（pending_feedback_id 非空）；
+//   - 无人持有效租约（lease_token 为空或 lease_expires_at 已过）；
+//   - 退避已到期（next_eligible_at 为空或已过）。
+// 三个条件都是列值判断，进同一 WHERE，供下面两条查询/UPDATE 共用（保持两处谓词
+// 逐字一致，避免「领取用的谓词与扫描用的谓词分叉」这一类静默漏单）。
+// 返回类型是单个 sql`` 表达式（模板调用结果），用 unknown 收窄避免与带 .transaction
+// 属性的完整 tag 类型混淆。
+export function leaseEligiblePredicate(sql: PersonalQuery): PersonalQuery {
+  return sql`pending_feedback_id IS NOT NULL
+    AND (lease_token = '' OR lease_expires_at IS NULL OR lease_expires_at < now())
+    AND (next_eligible_at IS NULL OR next_eligible_at <= now())` as unknown as PersonalQuery;
+}
+
+// 排他领取（原子 CAS）：UPDATE ... WHERE 领取谓词，拿到行的执行者独占处理。
+// PG 单条 UPDATE 对同一行天然串行：两个并发执行者只有先到者能把 lease_token 从
+// ''/过期值改成自己的新 token（后到者的 WHERE 已不匹配，0 行），这就是「只有一个拿到」
+// 的判定——不依赖 ReadCommitted 下的 SELECT FOR UPDATE 轮询。
+// leaseMs 由调用方传（毫秒），写成参数而不是 interval 字面量，便于测试注入不同时长。
+export function claimProfileFeedbackForUserQuery(sql: PersonalQuery, userId: number, leaseToken: string, leaseMs: number) {
+  requireUserId(userId);
+  const eligible = leaseEligiblePredicate(sql);
+  return sql`UPDATE profile_feedback_queue
+    SET lease_token = ${leaseToken},
+        lease_expires_at = now() + (${leaseMs} * interval '1 millisecond')
+    WHERE user_id = ${userId} AND ${eligible}
+    RETURNING pending_feedback_id AS candidate`;
+}
+
+// drain 扫描：找出所有「有 pending 且可领取」的用户（与上面的单用户谓词同一来源）。
+// 只选 id 不带行锁：真正的排他仍由后续对每个用户的 claim UPDATE 决定——扫描与领取之间
+// 若浏览器先领走，claim 落 0 行，drain 跳过该用户即可，不产生双跑。
+export function drainableProfileFeedbackUsersQuery(sql: PersonalQuery, limit: number) {
+  const eligible = leaseEligiblePredicate(sql);
+  return sql`SELECT user_id FROM profile_feedback_queue WHERE ${eligible} ORDER BY user_id LIMIT ${limit}`;
+}
+
 // 一次吸收成功（applied/unchanged）后的水位推进：absorbed 取 GREATEST，pending 只在
 // 「水位不高于本次候选」时清空——若吸收期间又有新反馈把 pending 抬得更高，保留它，并把
 // 状态退回 pending（SET 里所有 RHS 都读旧值，所以这里的比较是推进前的 pending）。
-export function markProfileFeedbackAbsorbedForUserQuery(sql: PersonalQuery, userId: number, candidate: number, status: string) {
+// F15 租约配套：完成时校验 lease_token 未变才提交（WHERE 带 token），防租约过期后被
+// 第二执行者重领、第一个迟到提交双写。成功即释放租约（lease_token=''、expires=NULL）
+// 并清零退避（fail_count=0、next_eligible_at=NULL）——下次失败从曲线第一档重新开始。
+export function markProfileFeedbackAbsorbedForUserQuery(sql: PersonalQuery, userId: number, candidate: number, status: string, leaseToken: string) {
   requireUserId(userId);
   return sql`UPDATE profile_feedback_queue
     SET absorbed_feedback_id = GREATEST(absorbed_feedback_id, ${candidate}),
@@ -393,18 +448,61 @@ export function markProfileFeedbackAbsorbedForUserQuery(sql: PersonalQuery, user
           THEN ${'pending'} ELSE ${status} END,
         attempts = attempts + 1,
         last_error = '',
+        lease_token = '',
+        lease_expires_at = NULL,
+        fail_count = 0,
+        next_eligible_at = NULL,
+        updated_at = now()
+    WHERE user_id = ${userId} AND lease_token = ${leaseToken}
+    RETURNING pending_feedback_id`;
+}
+
+// 无租约版水位推进（/api/profile 重建成功后推水位走这里）：调用方不持租约，不能带
+// lease_token 校验（否则永远 0 行）。清 fail_count/next_eligible_at 保留——重建成功
+// 等价于一次成功吸收，退避重置语义一致。
+export function markProfileFeedbackAbsorbedUncheckedForUserQuery(sql: PersonalQuery, userId: number, candidate: number, status: string) {
+  requireUserId(userId);
+  return sql`UPDATE profile_feedback_queue
+    SET absorbed_feedback_id = GREATEST(absorbed_feedback_id, ${candidate}),
+        pending_feedback_id = CASE WHEN pending_feedback_id IS NOT NULL AND pending_feedback_id <= ${candidate}
+          THEN NULL ELSE pending_feedback_id END,
+        status = CASE WHEN pending_feedback_id IS NOT NULL AND pending_feedback_id > ${candidate}
+          THEN ${'pending'} ELSE ${status} END,
+        attempts = attempts + 1,
+        last_error = '',
+        fail_count = 0,
+        next_eligible_at = NULL,
         updated_at = now()
     WHERE user_id = ${userId}
     RETURNING pending_feedback_id`;
 }
 
+// 退避档位读取：markProfileFeedbackFailedForUser 在 TS 侧算曲线（可测），SQL 只落数值。
+// race 说明：读 fail_count 与写失败之间若有人并发改写（同租约串行），最多差一档退避，
+// 不破坏「失败必有退避、成功清零」两个不变量。
+export function profileFeedbackFailCountForUserQuery(sql: PersonalQuery, userId: number) {
+  requireUserId(userId);
+  return sql`SELECT fail_count FROM profile_feedback_queue WHERE user_id = ${userId}`;
+}
+
 // 吸收失败（failed/conflict）：保留 pending_feedback_id 不清，下次机会重放。last_error 只存
 // 错误类别（error.name / code），绝不落模型或数据库原文。
-export function markProfileFeedbackFailedForUserQuery(sql: PersonalQuery, userId: number, status: string, error: string) {
+// F15 退避配套：fail_count+1，next_eligible_at = now() + backoffMs（曲线由 TS 侧
+// profileFeedbackBackoffMs 计算：30s → 2m → 8m → 32m → 1h 封顶）。领取谓词在退避到期前
+// 不匹配，浏览器刷新不会立刻重打模型。失败同时释放租约（token=''）：退避到期后该行可被
+// 任何人重领，不与租约互相卡死。leaseToken：只有持租约者能记失败（租约过期被重领后，
+// 迟到者的失败记录写 0 行，不会把新主的退避档位打乱）。
+export function markProfileFeedbackFailedForUserQuery(sql: PersonalQuery, userId: number, status: string, error: string, leaseToken: string, backoffMs: number) {
   requireUserId(userId);
   return sql`UPDATE profile_feedback_queue
-    SET status = ${status}, attempts = attempts + 1, last_error = ${error}, updated_at = now()
-    WHERE user_id = ${userId}`;
+    SET status = ${status}, attempts = attempts + 1, last_error = ${error},
+        lease_token = '',
+        lease_expires_at = NULL,
+        fail_count = fail_count + 1,
+        next_eligible_at = now() + (${backoffMs} * interval '1 millisecond'),
+        updated_at = now()
+    WHERE user_id = ${userId} AND lease_token = ${leaseToken}
+    RETURNING user_id`;
 }
 
 // 重建画像成功后用它把队列水位推到「重建时已看到的反馈上界」：重建本身已经把最新有效反馈

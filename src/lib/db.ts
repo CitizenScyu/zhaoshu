@@ -4,7 +4,7 @@ import { LLM_USAGE_PHASES, type LlmUsagePhase, type LlmUsageRecord, type TokenSt
 import { assertAuthSchema } from './auth-store';
 import { initializeBusinessSchema } from './business-schema';
 import type { PersonalWriter } from './personal-write';
-import { requireUserId, profileForUserQuery, saveProfileForUserQuery, excludedBooksForUserQuery, persistRecommendationsForUserQueries, feedbackForUserQueries, feedbackSnapshotForUserQuery, recentInformativeFeedbackForUserQuery, withdrawnFeedbackBookTitlesForUserQuery, enqueueProfileFeedbackForUserQuery, profileFeedbackQueueForUserQuery, markProfileFeedbackAbsorbedForUserQuery, markProfileFeedbackFailedForUserQuery, maxFeedbackIdForUserQuery, ensureProfileForUserQuery } from './user-data';
+import { requireUserId, profileForUserQuery, saveProfileForUserQuery, excludedBooksForUserQuery, persistRecommendationsForUserQueries, feedbackForUserQueries, feedbackSnapshotForUserQuery, recentInformativeFeedbackForUserQuery, withdrawnFeedbackBookTitlesForUserQuery, enqueueProfileFeedbackForUserQuery, profileFeedbackQueueForUserQuery, markProfileFeedbackAbsorbedForUserQuery, markProfileFeedbackFailedForUserQuery, markProfileFeedbackAbsorbedUncheckedForUserQuery, profileFeedbackFailCountForUserQuery, maxFeedbackIdForUserQuery, ensureProfileForUserQuery, claimProfileFeedbackForUserQuery, drainableProfileFeedbackUsersQuery, profileFeedbackBackoffMs } from './user-data';
 export { canonicalBookKey } from './book-identity';
 
 const DATABASE_URL = process.env.DATABASE_URL;
@@ -266,21 +266,67 @@ export async function getProfileFeedbackQueueForUser(userId: number): Promise<Pr
 
 // 返回推进后仍待处理的反馈 id（null = 已清空）。吸收期间若又有新反馈把 pending 抬高，
 // 这里会看到更高的 id，调用方据此知道还没吸收干净。
+// leaseToken：完成提交前校验租约未易主（WHERE lease_token = token），租约过期被重领后
+// 迟到者写 0 行 → 返回 null 之外无法区分？不——这里仍返回 null，由调用方先比对
+// hasLease 再认定成功（见 profile-absorption.ts）。免 token 校验的旧调用（重建后推水位）
+// 传空串会落 0 行，故重建路径改走 markProfileFeedbackAbsorbedUncheckedForUser。
 export async function markProfileFeedbackAbsorbedForUser(
+  userId: number, candidate: number, status: string, write: PersonalWriter, leaseToken = '',
+): Promise<number | null> {
+  requireUserId(userId);
+  if (typeof write !== 'function') throw new Error('authorized writer is required');
+  const rows = (await write((sql) => [markProfileFeedbackAbsorbedForUserQuery(sql, userId, candidate, status, leaseToken)]))[0] as { pending_feedback_id: number | null }[];
+  return rows[0]?.pending_feedback_id ?? null;
+}
+
+// 迁移兼容：候选上界推进（/api/profile 重建成功后推水位、pglite 测试替身等旧路径）不持有
+// 租约，不能带 token 校验——否则永远写 0 行。此变体不校验也不清租约（没有租约可清），
+// 只推水位。幂等安全：重建确实已把反馈并入画像，等价于一次成功的吸收。
+export async function markProfileFeedbackAbsorbedUncheckedForUser(
   userId: number, candidate: number, status: string, write: PersonalWriter,
 ): Promise<number | null> {
   requireUserId(userId);
   if (typeof write !== 'function') throw new Error('authorized writer is required');
-  const rows = (await write((sql) => [markProfileFeedbackAbsorbedForUserQuery(sql, userId, candidate, status)]))[0] as { pending_feedback_id: number | null }[];
+  const rows = (await write((sql) => [markProfileFeedbackAbsorbedUncheckedForUserQuery(sql, userId, candidate, status)]))[0] as { pending_feedback_id: number | null }[];
   return rows[0]?.pending_feedback_id ?? null;
 }
 
 export async function markProfileFeedbackFailedForUser(
-  userId: number, status: string, error: string, write: PersonalWriter,
+  userId: number, status: string, error: string, write: PersonalWriter, leaseToken = '',
 ): Promise<void> {
   requireUserId(userId);
   if (typeof write !== 'function') throw new Error('authorized writer is required');
-  await write((sql) => [markProfileFeedbackFailedForUserQuery(sql, userId, status, error)]);
+  // 退避档位 = 失败前的连续失败数 + 1（本次是第几次连续失败）；先读再算，
+  // 曲线函数 profileFeedbackBackoffMs 单独可测，SQL 只落数值。
+  const backoffMs = profileFeedbackBackoffMs(await getProfileFeedbackFailCountForUser(userId) + 1);
+  await write((sql) => [markProfileFeedbackFailedForUserQuery(sql, userId, status, error, leaseToken, backoffMs)]);
+}
+
+// 退避要用「失败前」的 fail_count（+1 后作为本次档位）；单独读一次而不是塞进 UPDATE 的
+// 表达式里，是为了让 backoff 曲线可测（曲线函数在 TS 侧，SQL 只落数值）。
+export async function getProfileFeedbackFailCountForUser(userId: number): Promise<number> {
+  requireUserId(userId);
+  const rows = await profileFeedbackFailCountForUserQuery(getSql(), userId) as { fail_count: number }[];
+  return rows[0]?.fail_count ?? 0;
+}
+
+// 排他领取：UPDATE CAS，拿到才返回候选反馈 id；被别人持租约/退避未到 → null。
+// token 由调用方生成（crypto.randomUUID）；leaseMs 默认 8 分钟（模型调用 + 合并的耗时
+// 级别，见报告 §1；测试可注入短租约）。
+export const PROFILE_FEEDBACK_LEASE_MS = 8 * 60_000;
+
+export async function claimProfileFeedbackForUser(userId: number, leaseToken: string, leaseMs = PROFILE_FEEDBACK_LEASE_MS): Promise<number | null> {
+  requireUserId(userId);
+  if (typeof leaseToken !== 'string' || leaseToken.length > 128) throw new Error('lease token is required');
+  const rows = await claimProfileFeedbackForUserQuery(getSql(), userId, leaseToken, leaseMs) as { candidate: number }[];
+  return rows[0]?.candidate ?? null;
+}
+
+// drain：扫描全部可领取用户（有 pending、租约空/过期、退避到期）。
+export async function drainableProfileFeedbackUsers(limit: number): Promise<number[]> {
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1000) throw new Error('drain limit out of range');
+  const rows = await drainableProfileFeedbackUsersQuery(getSql(), limit) as { user_id: number }[];
+  return rows.map((row) => row.user_id);
 }
 
 export async function getMaxFeedbackIdForUser(userId: number): Promise<number> {

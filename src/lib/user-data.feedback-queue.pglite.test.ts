@@ -3,8 +3,8 @@ import { initializeBusinessSchema } from '@/lib/business-schema';
 import { loadPGlite, type PGliteLike } from '@/lib/fixtures/pglite';
 import {
   enqueueProfileFeedbackForUserQuery,
-  markProfileFeedbackAbsorbedForUserQuery,
-  markProfileFeedbackFailedForUserQuery,
+  markProfileFeedbackAbsorbedUncheckedForUserQuery,
+  profileFeedbackBackoffMs,
   profileFeedbackQueueForUserQuery,
   recentInformativeFeedbackForUserQuery,
 } from '@/lib/user-data';
@@ -51,10 +51,17 @@ maybe('真实 PostgreSQL：profile_feedback_queue（F15 待吸收水位）', () 
     (await pg.query(statement.text, statement.params)).rows;
   const enqueue = (userId: number, expectedVersion: number, queued: boolean) =>
     run(enqueueProfileFeedbackForUserQuery(tag as never, userId, expectedVersion, queued) as unknown as { text: string; params: unknown[] });
+  // 既有水位测试不持租约：absorbed 走无租约变体（重建后推水位同款），failed 用空 token
+  // 会写 0 行，因此先按无租约模式直接 UPDATE——这里保留旧断言语义（attempts/last_error
+  // 如实记录），退避与租约的独立验收在 lease 专项用例里。
   const markAbsorbed = (userId: number, candidate: number, status: string) =>
-    run(markProfileFeedbackAbsorbedForUserQuery(tag as never, userId, candidate, status) as unknown as { text: string; params: unknown[] });
+    run(markProfileFeedbackAbsorbedUncheckedForUserQuery(tag as never, userId, candidate, status) as unknown as { text: string; params: unknown[] });
   const markFailed = (userId: number, status: string, error: string) =>
-    run(markProfileFeedbackFailedForUserQuery(tag as never, userId, status, error) as unknown as { text: string; params: unknown[] });
+    pg.query(`UPDATE profile_feedback_queue
+      SET status = $2, attempts = attempts + 1, last_error = $3, fail_count = fail_count + 1,
+          next_eligible_at = now() + ($4 * interval '1 millisecond'), updated_at = now()
+      WHERE user_id = $1`,
+      [userId, status, error, profileFeedbackBackoffMs(1)]);
   const queue = async (userId: number) =>
     (await run(profileFeedbackQueueForUserQuery(tag as never, userId) as unknown as { text: string; params: unknown[] }))[0] as
       { pending_feedback_id: number | null; absorbed_feedback_id: number; status: string; attempts: number; last_error: string } | undefined;
