@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { NextRequest } from 'next/server';
+import { readFileSync } from 'node:fs';
 
 // F15 残留③：drain 入口的安全与接线。真正的租约/退避/水位语义在
 // user-data.feedback-lease.pglite.test.ts（真库）；吸收路径的状态机在
@@ -21,7 +22,7 @@ vi.mock('@/lib/profile-absorption', () => ({
   absorbPendingProfileFeedback: mocks.absorbPendingProfileFeedback,
 }));
 
-import { GET } from './route';
+import { GET, maxDuration } from './route';
 
 const SECRET = 'absorb-drain-test-secret';
 
@@ -33,13 +34,51 @@ function request(secret?: string) {
 
 describe('GET /api/profile/absorb/drain (F15 兜底 drain)', () => {
   beforeEach(() => {
-    vi.clearAllMocks();
+    vi.resetAllMocks();
+    vi.stubEnv('CRON_SECRET', '');
+    vi.stubEnv('LLM_TOTAL_TIMEOUT_MS', '260000');
     mocks.ensureSchema.mockResolvedValue(undefined);
     mocks.absorbPendingProfileFeedback.mockResolvedValue({ status: 'applied', pendingFeedbackId: null });
   });
   afterEach(() => {
+    vi.useRealTimers();
     vi.unstubAllEnvs();
     vi.restoreAllMocks();
+  });
+
+  it('R1：每日 cron 直接调用拥有 295s 预算的 drain 路由', () => {
+    const config = JSON.parse(readFileSync('vercel.json', 'utf8'));
+    expect(config.crons).toContainEqual({ path: '/api/profile/absorb/drain', schedule: '30 21 * * *' });
+    expect(maxDuration).toBe(295);
+  });
+
+  it('R2：两用户各需 200s 时只处理第一人，预算不足不领取第二人', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    vi.stubEnv('CRON_SECRET', SECRET);
+    mocks.drainableProfileFeedbackUsers.mockResolvedValue([4, 5]);
+    mocks.absorbPendingProfileFeedback.mockImplementation(async () => {
+      vi.setSystemTime(Date.now() + 200_000);
+      return { status: 'applied', pendingFeedbackId: null };
+    });
+    const res = await GET(request(SECRET));
+    expect(await res.json()).toMatchObject({
+      ok: true, drained: 1, stoppedForBudget: true,
+      results: [{ userId: 4, status: 'applied' }],
+    });
+    expect(mocks.absorbPendingProfileFeedback).toHaveBeenCalledOnce();
+    expect(Date.now()).toBe(200_000);
+  });
+
+  it('R2：初始化耗时也扣宿主预算，余量不足不领取用户', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    vi.stubEnv('CRON_SECRET', SECRET);
+    mocks.ensureSchema.mockImplementation(async () => { vi.setSystemTime(280_000); });
+    mocks.drainableProfileFeedbackUsers.mockResolvedValue([4]);
+    const res = await GET(request(SECRET));
+    expect(await res.json()).toMatchObject({ drained: 0, stoppedForBudget: true });
+    expect(mocks.absorbPendingProfileFeedback).not.toHaveBeenCalled();
   });
 
   it('未配置 CRON_SECRET 时 fail closed，不触达数据库', async () => {
@@ -65,13 +104,15 @@ describe('GET /api/profile/absorb/drain (F15 兜底 drain)', () => {
     expect(await res.json()).toMatchObject({ ok: true, drained: 2 });
     expect(mocks.absorbPendingProfileFeedback).toHaveBeenCalledTimes(2);
     for (const call of mocks.absorbPendingProfileFeedback.mock.calls) {
-      // 与浏览器触发同一条路径：leaseToken 非空、每用户独立预算与 signal。
+      // 与浏览器触发同一条路径：leaseToken 非空，所有用户共享宿主 signal。
       expect(call[0]).toMatchObject({ userId: expect.any(Number) });
       expect(typeof call[0].leaseToken).toBe('string');
       expect(call[0].leaseToken.length).toBeGreaterThan(0);
       expect(call[0].modelBudgetMs).toBeGreaterThan(0);
     }
     expect(mocks.absorbPendingProfileFeedback.mock.calls.map((c) => c[0].userId)).toEqual([4, 5]);
+    expect(mocks.absorbPendingProfileFeedback.mock.calls[0][0].signal)
+      .toBe(mocks.absorbPendingProfileFeedback.mock.calls[1][0].signal);
   });
 
   it('无候选时 drained=0，不调吸收路径', async () => {

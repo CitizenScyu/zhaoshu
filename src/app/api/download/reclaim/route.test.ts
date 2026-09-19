@@ -75,14 +75,12 @@ describe('GET /api/download/reclaim (F16 周期回收)', () => {
     expect(sql.mock.calls[0].slice(1)).toEqual(['\nworker 中断自动回收', 30 * 60_000]);
   });
 
-  it('回收成功后在响应后排队 F15 画像吸收 drain（不阻塞回收响应）', async () => {
+  it('R1：回收不再把长模型任务挂到 30s 宿主的 after', async () => {
     vi.stubEnv('CRON_SECRET', SECRET);
     const res = await GET(request(SECRET));
     expect(res.status).toBe(200);
-    // 回收响应先落地；drain 以 after() 回调形式排队，本用例不执行（drain 本身离线验收在
-    // profile/absorb/drain 专项）。
-    expect(after).toHaveBeenCalledOnce();
-    expect(pending.length).toBe(1);
+    expect(after).not.toHaveBeenCalled();
+    expect(pending).toHaveLength(0);
   });
 
   it('回收失败返回受控 500', async () => {
