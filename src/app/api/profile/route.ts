@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { ensureSchema, getMaxFeedbackIdForUser, getProfileFeedbackForUser, getProfileForUser, getWithdrawnFeedbackBookTitlesForUser, markProfileFeedbackAbsorbedForUser, saveProfileForUser } from '@/lib/db';
+import { ensureSchema, getMaxFeedbackIdForUser, getProfileFeedbackForUser, getProfileForUser, getWithdrawnFeedbackBookTitlesForUser, markProfileFeedbackAbsorbedUncheckedForUser, saveProfileForUser } from '@/lib/db';
 import { chatRobust, configuredTotalTimeoutMs, LlmError, MAX_PROFILE_LENGTH, validateProfileContent } from '@/lib/llm';
 import { recordUsageAfterResponse } from '@/lib/record-llm-usage';
 import {
@@ -142,7 +142,7 @@ export async function POST(req: NextRequest) {
       // 重建已把最新有效反馈并入画像 → 推进队列水位（best-effort：失败只会让同一批反馈
       // 被异步吸收重跑一次，幂等，不影响重建结果）。候选上界在读取反馈前取。
       if (absorbedUpTo > 0) {
-        await access.commit((write) => markProfileFeedbackAbsorbedForUser(
+        await access.commit((write) => markProfileFeedbackAbsorbedUncheckedForUser(
           userId, absorbedUpTo, content === profile.content ? 'unchanged' : 'applied', write,
         )).catch(() => {});
       }
