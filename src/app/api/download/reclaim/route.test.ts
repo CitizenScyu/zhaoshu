@@ -1,10 +1,21 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { NextRequest } from 'next/server';
 
-const { ensureSchema, getSql, sql } = vi.hoisted(() => ({
+const { ensureSchema, getSql, sql, after } = vi.hoisted(() => ({
   ensureSchema: vi.fn(),
   getSql: vi.fn(),
   sql: vi.fn<(strings: TemplateStringsArray, ...values: unknown[]) => Promise<unknown[]>>(),
+  // F15 挂接：reclaim 响应后异步 drain。这里 mock next/server 的 after，把回调收进
+  // pending 供用例显式执行（与 llm-usage.test.ts 同款），不真跑 drain（模型/真库都在
+  // 专项用例里离线验证）。
+  after: vi.fn((work: () => Promise<unknown>) => { pending.push(work); return undefined as never; }),
+}));
+
+const pending: (() => Promise<unknown>)[] = [];
+
+vi.mock('next/server', async (importOriginal) => ({
+  ...await importOriginal<typeof import('next/server')>(),
+  after,
 }));
 
 vi.mock('@/lib/db', () => ({ ensureSchema, getSql }));
@@ -27,6 +38,7 @@ function queryText(index: number) {
 describe('GET /api/download/reclaim (F16 周期回收)', () => {
   beforeEach(() => {
     vi.resetAllMocks();
+    pending.length = 0;
     ensureSchema.mockResolvedValue(undefined);
     getSql.mockReturnValue(sql);
     sql.mockResolvedValue([]);
@@ -61,6 +73,16 @@ describe('GET /api/download/reclaim (F16 周期回收)', () => {
     expect(query).toContain("status = 'running' AND updated_at < now()");
     expect(query).toContain("interval '1 millisecond'");
     expect(sql.mock.calls[0].slice(1)).toEqual(['\nworker 中断自动回收', 30 * 60_000]);
+  });
+
+  it('回收成功后在响应后排队 F15 画像吸收 drain（不阻塞回收响应）', async () => {
+    vi.stubEnv('CRON_SECRET', SECRET);
+    const res = await GET(request(SECRET));
+    expect(res.status).toBe(200);
+    // 回收响应先落地；drain 以 after() 回调形式排队，本用例不执行（drain 本身离线验收在
+    // profile/absorb/drain 专项）。
+    expect(after).toHaveBeenCalledOnce();
+    expect(pending.length).toBe(1);
   });
 
   it('回收失败返回受控 500', async () => {
