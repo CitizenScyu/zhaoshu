@@ -5,13 +5,13 @@ import { fetchSourceText, sourceAbortable, SourceHttpError } from './source-fetc
 import { SourcePolicyError, alternateSourceHost, validateSourceUrl } from './source-policy';
 import { sourceRevision } from './source-revision';
 import {
-  engineFetchDetail, engineFetchToc, engineSearchBook, type EngineSource,
+  engineFetchContent, engineFetchDetail, engineFetchToc, engineSearchBook, type EngineSource,
 } from './rule-engine/api';
 import { compileSource } from './rule-engine/compile';
 import {
-  knownSourceAuthor, normalizeSourceTitle, parseSourceChapters, parseSourceChapterText,
-  parseSourceDetailLinks, parseSourceIdentity, parseSourceSearch, sourceBookMatches,
-  sourceSearchUrl, sourceTitleSimilarity,
+  knownSourceAuthor, MAX_SOURCE_CHAPTER_CHARACTERS, normalizeSourceTitle, parseSourceChapters,
+  parseSourceChapterText, parseSourceDetailLinks, parseSourceIdentity, parseSourceSearch,
+  sourceBookMatches, sourceSearchUrl, sourceTitleSimilarity,
   type SourceBookIdentity, type SourceChapter,
 } from './source-parser';
 import type { ReaderIndex, ReaderPart } from './reader-types';
@@ -582,26 +582,47 @@ export function sourceReaderIndex(catalog: SourceCatalog): ReaderIndex {
   return index;
 }
 
-async function loadSourceCatalog(session: string, context: SourceRequestContext): Promise<SourceCatalog> {
+async function loadSourceCatalog(session: string, context: SourceRequestContext): Promise<LoadedSource> {
   const sql = getSql();
   const [row] = await queryRows<{ payload: SourceCatalog }>(sql`
     SELECT payload FROM source_read_catalogs WHERE id = ${session} AND expires_at > now()`, context.signal);
   if (!row) throw new SourceReaderError('阅读目录已过期，请重新加载目录。', 'SOURCE_SESSION_EXPIRED', 409);
   const catalog = row.payload;
   const sources = await getReadingSources(context.signal);
-  if (!sources.some((source) => source.url === catalog.sourceUrl && sourceRevision(source) === catalog.sourceRevision)) {
+  // N01：revision 校验从 some() 改为 find()，同时把命中的源带出供 chapterText 分派（零额外查询）。
+  const source = sources.find((item) => item.url === catalog.sourceUrl && sourceRevision(item) === catalog.sourceRevision);
+  if (!source) {
     throw new SourceReaderError('书源已停用或规则已更新，请重新选择书源。', 'SOURCE_CHANGED', 409);
   }
   validateSourceUrl(catalog.bookUrl);
-  return catalog;
+  return { catalog, source, sources };
 }
 
 const chapterCache = new Map<string, { text: string; servedFrom: string; expires: number; bytes: number }>();
 let cacheBytes = 0;
-async function chapterText(context: SourceRequestContext, chapter: SourceChapter): Promise<string> {
-  const page = await context.page(chapter.url);
-  if (new URL(page.url).pathname !== new URL(chapter.url).pathname) throw new SourcePolicyError('章节跳转到了另一页面');
-  return parseSourceChapterText(page.text, chapter.title);
+
+/** 目录加载时随 catalog 一起带出的源归属（N01）：按 builtin/engine 分派正文提取。 */
+interface LoadedSource {
+  catalog: SourceCatalog;
+  source: ReadingSource;
+  /** 目录加载时的池快照：章节级 failover 复用（备用的源标识必在同一快照内，确定性反查）。 */
+  sources: ReadingSource[];
+}
+
+async function chapterText(context: SourceRequestContext, chapter: SourceChapter, source: ReadingSource): Promise<string> {
+  // N01 分派：builtin 走 book15 特化解析（逐字不变）；引擎档走 rule-engine 取正文。
+  // 取页两侧都经 context.page ⇒ 预算/节流/重试层沿用；builtin 分支零行为变化。
+  if (isBuiltinReadingSource(source)) {
+    const page = await context.page(chapter.url);
+    if (new URL(page.url).pathname !== new URL(chapter.url).pathname) throw new SourcePolicyError('章节跳转到了另一页面');
+    return parseSourceChapterText(page.text, chapter.title);
+  }
+  const { text } = await engineFetchContent(engineSourceOf(source), chapter.url, context);
+  // 引擎只解释规则不做内容判定：builtin 的两道内容闸（空正文 / 单章限长）在这里补齐，
+  // 错误语义与 builtin 对齐（同样落入章节级 failover，最终 SOURCE_CHAPTER_UNAVAILABLE 不变）。
+  if (!text) throw new SourcePolicyError('书源未提供有效正文');
+  if (text.length > MAX_SOURCE_CHAPTER_CHARACTERS) throw new SourcePolicyError('单章过长，请尝试下载全书');
+  return text;
 }
 
 function remember(key: string, text: string, servedFrom: string) {
@@ -620,7 +641,7 @@ function remember(key: string, text: string, servedFrom: string) {
 
 export async function readSourceChapter(session: string, chapterIndex: number, context: SourceRequestContext): Promise<ReaderPart> {
   // Recheck enablement even for a warm chapter cache.
-  const catalog = await loadSourceCatalog(session, context);
+  const { catalog, source, sources } = await loadSourceCatalog(session, context);
   const chapter = catalog.chapters[chapterIndex];
   if (!chapter) throw new SourceReaderError('章节不存在。', 'SOURCE_CHAPTER_INVALID', 400);
   const key = catalog.version + ':' + chapterIndex;
@@ -629,15 +650,21 @@ export async function readSourceChapter(session: string, chapterIndex: number, c
   let servedFrom = cached && cached.expires > Date.now() ? cached.servedFrom : catalog.sourceName;
   if (!text) {
     try {
-      text = await chapterText(context, chapter);
+      text = await chapterText(context, chapter, source);
     } catch {
       context.signal.throwIfAborted();
       try {
-        const alternative = await resolveSourceBook(catalog, context, { excludeBookUrl: catalog.bookUrl });
+        // 池快照钉在目录加载时点（N01）：备用源的 url+revision 必能在同一快照反查到 ReadingSource，
+        // 避免读取瞬间源池变更导致备用源没有规则可分派；也省一次源池查询。
+        const alternative = await resolveSourceBook(catalog, context, {
+          excludeBookUrl: catalog.bookUrl, sources,
+        });
         // Never assume two catalogs have the same ordinal positions.
         const chapters = alternative.chapters.filter((item) => normalizeSourceTitle(item.title) === normalizeSourceTitle(chapter.title));
         if (chapters.length !== 1) throw new Error('No unique matching chapter');
-        text = await chapterText(context, chapters[0]);
+        const alternativeSource = sources.find((item) => item.url === alternative.sourceUrl && sourceRevision(item) === alternative.sourceRevision);
+        if (!alternativeSource) throw new Error('Alternative source not in pool snapshot');
+        text = await chapterText(context, chapters[0], alternativeSource);
         servedFrom = alternative.sourceName;
       } catch {
         context.signal.throwIfAborted();
