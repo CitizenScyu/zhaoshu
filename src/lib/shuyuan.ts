@@ -67,6 +67,15 @@ export type ShuyuanAdmissionFunnel = {
   deferred: number;
   /** 站点行为终态（compile 拒、challenge、conn_fail、shell）。 */
   rejected: number;
+  /**
+   * 准入兼容 L4（§2.4）：靠引擎默认值（缺 ruleToc.chapterUrl，legado baseUrl 兜底）进池的
+   * 源数。救回的 10 条预期就是退化「1 章书」——数字突然上涨 ⇒ 上游源池形态变了，需人工看。
+   * 不计入 W1/W2 放量容量判据（审查修改点）。
+   */
+  url_defaulted: number;
+  /** 被拒源的必需组缺失分布（新拒原因当天可见；不在 ENGINE_DEFAULT_FIELDS 的字段）。 */
+  miss_chapter_list: number;
+  miss_chapter_name: number;
 };
 export type ShuyuanPoolHealth = {
   readingPoolSize: number;
@@ -512,7 +521,7 @@ export async function getShuyuanPoolHealth(signal: AbortSignal): Promise<Shuyuan
     enginePoolSize: pool.enginePoolSize,
     poolCandidates: pool.poolCandidates,
     // 空表与无行都返回 0（count FILTER 恒返回一行；缺失时保守取 0）。
-    admission: admissionRows[0] ?? { ok: 0, deferred: 0, rejected: 0 },
+    admission: admissionRows[0] ?? { ok: 0, deferred: 0, rejected: 0, url_defaulted: 0, miss_chapter_list: 0, miss_chapter_name: 0 },
     refreshedAtAgeHours: Number.isFinite(refreshedMs)
       ? Math.max(0, Math.round((Date.now() - refreshedMs) / 3_600_000 * 10) / 10)
       : null,
@@ -526,7 +535,13 @@ function readAdmissionFunnel(s: Sql, signal: AbortSignal): Promise<ShuyuanAdmiss
            count(*) FILTER (WHERE NOT compile_ok
              OR search_verdict IN ('challenge', 'conn_fail', 'shell'))::int AS rejected,
            count(*) FILTER (WHERE compile_ok AND search_ok IS NOT TRUE
-             AND search_verdict NOT IN ('challenge', 'conn_fail', 'shell'))::int AS deferred
+             AND search_verdict NOT IN ('challenge', 'conn_fail', 'shell'))::int AS deferred,
+           count(*) FILTER (WHERE compile_ok AND search_ok IS TRUE
+             AND (core_field_mask->>'ruleToc.chapterUrl') IS DISTINCT FROM 'true')::int AS url_defaulted,
+           count(*) FILTER (WHERE NOT compile_ok
+             AND (core_field_mask->>'ruleToc.chapterList') IS DISTINCT FROM 'true')::int AS miss_chapter_list,
+           count(*) FILTER (WHERE NOT compile_ok
+             AND (core_field_mask->>'ruleToc.chapterName') IS DISTINCT FROM 'true')::int AS miss_chapter_name
     FROM source_admission`, signal);
 }
 
@@ -818,6 +833,14 @@ async function runAdmissionAfterRefresh(
     const result = await runAdmissionBatch({
       candidates, declaredHosts, existing, fetchPage: defaultAdmissionTransport, signal,
       canProbe: () => !signal.aborted && budget.remainingMs > ADMISSION_TIMEOUT_MS + WRITE_RESERVE_MS,
+    });
+    // 准入兼容 L4（§2.4）：每轮一行漂移计数（不建历史表；要趋势曲线再上日表，Phase 2）。
+    console.log('shuyuan admission batch', {
+      candidates: candidates.length,
+      compileOk: result.compileOk,
+      compileRejected: result.compileRejected,
+      grandfathered: result.grandfathered,
+      probed: result.probed,
     });
     if (result.rows.length > 0) await writeAdmissionRows(s, result.rows);
   } catch (error) {

@@ -489,6 +489,55 @@ describe('refreshShuyuan atomic refresh', () => {
     expect(transaction.mock.invocationCallOrder[0]).toBeLessThan(execute.mock.invocationCallOrder[insertIndex]);
   });
 
+  // 准入兼容 L3 反例 17：compile 拒 ≠ 出环。候选池只由 selectCandidates（survey 初筛）
+  // 决定（runAdmissionAfterRefresh），不读 source_admission、不看 compile_ok/search_ok——
+  // 把「compile 拒的源每天仍进评估环」钉成机器可验的事实，防止后续「只喂 compile_ok 源」
+  // 这类善意但致命的优化切断恢复回路。
+  it('准入兼容 L3 反例 17：source_admission 全为 compile 拒 → 下一轮刷新仍对同批源跑准入（compile 拒 ≠ 出环）', async () => {
+    setCollection(11, [admissionCandidate]);
+    // 上一轮已写下 compile 拒行（readAdmissionRows 读 source_admission）。
+    execute.mockImplementation(async (query) => {
+      if (query.text.startsWith('SELECT count(*)')) return [zeroCounts];
+      if (query.text.startsWith('SELECT source_url, tier, compile_ok')) {
+        return [{
+          source_url: 'https://new.example', tier: 'T7', compile_ok: false, core_field_mask: {},
+          search_ok: null, search_verdict: '', search_checked_at: null,
+          rules_hash: rulesHash(admissionCandidate), host: 'new.example', error: '历史拒因',
+        }];
+      }
+      if (query.text.startsWith('INSERT INTO source_admission')) return [];
+      if (query.text.includes('SELECT DISTINCT host FROM source_admission')) return [];
+      if (query.text.startsWith('SELECT source_url, last_error')) return [];
+      if (query.text.startsWith('SELECT source_url AS url, name')) return [{ ...zeroCounts }];
+      if (query.text.includes('FROM shuyuan_meta')) return [{ collections: [], refreshed_at: null }];
+      return [];
+    });
+    fetchMock.mockImplementation(async (input, options) => {
+      const url = String(input);
+      if (url === admissionSearchUrl) {
+        expect(options?.redirect).toBe('manual');
+        return new Response('<div class="i"><span class="t">书名</span><a href="/b/1">x</a></div>', { status: 200 });
+      }
+      expect(options?.redirect).toBe('error');
+      const fixture = responses.get(url);
+      if (!fixture) throw new Error(`Unexpected network request: ${url}`);
+      return new Response(fixture.body, { status: fixture.status ?? 200 });
+    });
+
+    await refreshShuyuan();
+
+    // 证据 1：即便库里是 compile 拒行，本轮仍读了 source_admission 既有行
+    // （说明批次跑了，源没被候选池过滤掉）。
+    const readExisting = execute.mock.calls.find(([query]) =>
+      query.text.startsWith('SELECT source_url, tier, compile_ok'));
+    expect(readExisting).toBeDefined();
+    // 证据 2：本轮对该源重新探测（compile-ok 后 search_ok=null ⇒ 未测优先）——
+    // 既有行 rules_hash 与候选一致（终态去抖只拦「仍然拒」，不拦「救回后待测」）。
+    expect(fetchMock.mock.calls.map(([input]) => String(input))).toContain(admissionSearchUrl);
+    // 证据 3：救回结论写库（compile_ok=true 行 upsert）。
+    expect(execute.mock.calls.some(([query]) => query.text.startsWith('INSERT INTO source_admission'))).toBe(true);
+  });
+
   it('剩余预算不足时整批跳过准入：不读不写 source_admission、不发搜索请求', async () => {
     vi.useFakeTimers();
     const started = Date.now();
@@ -884,7 +933,10 @@ describe('refreshShuyuan atomic refresh', () => {
         const text = query.text;
         // engineHosts（门随池刷）：DISTINCT host 必须先于漏斗聚合分派，两者都命中 FROM source_admission。
         if (text.includes('SELECT DISTINCT host FROM source_admission')) return [{ host: 'engine.example' }];
-        if (text.includes('FROM source_admission')) return [{ ok: 12, deferred: 5, rejected: 3 }];
+        if (text.includes('FROM source_admission')) {
+          // 准入兼容 L4：漏斗带 url_defaulted / miss_chapter_list / miss_chapter_name 三个新列。
+          return [{ ok: 12, deferred: 5, rejected: 3, url_defaulted: 10, miss_chapter_list: 0, miss_chapter_name: 0 }];
+        }
         if (text.includes('JOIN source_admission')) return [engineRow()];
         if (text.includes('FROM shuyuan_sources')) return [];
         if (text.includes('FROM shuyuan_meta')) return [{ collections: [], refreshed_at: null }];
@@ -893,12 +945,44 @@ describe('refreshShuyuan atomic refresh', () => {
       const health = await getShuyuanPoolHealth(new AbortController().signal);
       expect(health).toMatchObject({
         readingPoolSize: 2, enginePoolSize: 1, poolCandidates: 0,
-        admission: { ok: 12, deferred: 5, rejected: 3 },
+        admission: { ok: 12, deferred: 5, rejected: 3, url_defaulted: 10, miss_chapter_list: 0, miss_chapter_name: 0 },
       });
       // 漏斗谓词与入池判据同口径：ok 必须含 compile_ok ∧ search_ok IS TRUE。
       const funnel = execute.mock.calls.find(([query]) => query.text.includes('FROM source_admission'))![0];
       expect(funnel.text).toContain('compile_ok AND search_ok IS TRUE');
       expect(funnel.text).toContain("search_verdict IN ('challenge', 'conn_fail', 'shell')");
+      // 准入兼容 L4（反例 18）：三个观测列都由既有 core_field_mask 列派生（零 schema 改动）。
+      expect(funnel.text).toContain("core_field_mask->>'ruleToc.chapterUrl'");
+      expect(funnel.text).toContain("core_field_mask->>'ruleToc.chapterList'");
+      expect(funnel.text).toContain("core_field_mask->>'ruleToc.chapterName'");
+    });
+
+    it('准入兼容 L4 反例 18：靠引擎默认进池的行计入 url_defaulted（core_field_mask.chapterUrl=false）', async () => {
+      // 漏斗是 SQL 聚合（无真库时按 SQL 文本断言 + 类型形状验证）；本用例钉死
+      // url_defaulted 的谓词形状：只数 ok 桶（compile_ok ∧ search_ok IS TRUE）里
+      // chapterUrl 位图非 true 的行——救回的 10 条预期形态。
+      execute.mockImplementation(async (query) => {
+        const text = query.text;
+        if (text.includes('SELECT DISTINCT host FROM source_admission')) return [];
+        if (text.includes('FROM source_admission')) return [{
+          ok: 3, deferred: 0, rejected: 0, url_defaulted: 1, miss_chapter_list: 2, miss_chapter_name: 1,
+        }];
+        if (text.includes('FROM shuyuan_sources')) return [];
+        if (text.includes('FROM shuyuan_meta')) return [{ collections: [], refreshed_at: null }];
+        return [];
+      });
+      const health = await getShuyuanPoolHealth(new AbortController().signal);
+      expect(health.admission).toEqual({
+        ok: 3, deferred: 0, rejected: 0, url_defaulted: 1, miss_chapter_list: 2, miss_chapter_name: 1,
+      });
+      const funnel = execute.mock.calls.find(([query]) => query.text.includes('FROM source_admission'))![0];
+      expect(funnel.text).toContain('AS url_defaulted');
+      expect(funnel.text).toContain('AS miss_chapter_list');
+      expect(funnel.text).toContain('AS miss_chapter_name');
+      // 谓词限定在 ok 桶内（url_defaulted 不得把 compile 拒的缺位行也数进去）。
+      const urlDefaultedPredicate = funnel.text.split('\n')
+        .find((line) => line.includes('AS url_defaulted'))!;
+      expect(urlDefaultedPredicate).toContain('compile_ok AND search_ok IS TRUE');
     });
 
     it('admission 漏斗读失败降级为全 0，不连坐 readingPoolSize（纯观测增量）', async () => {
@@ -912,7 +996,7 @@ describe('refreshShuyuan atomic refresh', () => {
       const health = await getShuyuanPoolHealth(new AbortController().signal);
       expect(health).toMatchObject({
         readingPoolSize: 1, enginePoolSize: 0, poolCandidates: 0,
-        admission: { ok: 0, deferred: 0, rejected: 0 },
+        admission: { ok: 0, deferred: 0, rejected: 0, url_defaulted: 0, miss_chapter_list: 0, miss_chapter_name: 0 },
       });
       expect(console.error).toHaveBeenCalledWith(
         expect.stringContaining('shuyuan admission funnel unavailable'),
