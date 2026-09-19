@@ -460,6 +460,7 @@ describe('refreshShuyuan atomic refresh', () => {
     bookSourceUrl: 'https://new.example/', bookSourceName: '新源',
     searchUrl: 'https://new.example/s?q={{key}}',
     ruleSearch: { bookList: '.i', name: '.t@text', bookUrl: 'a@href', author: '.a@text' },
+    ruleToc: { chapterList: '.toc@li', chapterName: 'a@text', chapterUrl: 'a@href' },
     ruleContent: { content: '.c' },
   };
   const admissionSearchUrl = `https://new.example/s?q=${encodeURIComponent('斗破苍穹')}`;
