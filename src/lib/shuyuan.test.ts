@@ -937,6 +937,43 @@ describe('refreshShuyuan atomic refresh', () => {
       expect(() => validateSourceUrl('https://never.example/x')).toThrow(SourcePolicyError);
     });
 
+    it('🔴 降级日志脱敏：engineHosts 错误 message 里的连接串（含口令）不进 console.error', async () => {
+      // 审查遗留项（shuyuan hostgate/引擎源降级日志）：Neon 连接错误会把 DATABASE_URL 原文
+      // 回显在 message 里；降级日志必须先过 safeReason（`://` token 抹成 [redacted-url]）。
+      vi.stubEnv('READING_ENGINE_SOURCES', '1');
+      const secret = 'postgres://leak_user:leak_secret@db.internal.example/finder';
+      execute.mockRejectedValueOnce(new Error(`Error connecting to database: ${secret}`))
+        .mockResolvedValueOnce([{ collections: [] }]).mockResolvedValueOnce([]);
+      const sources = await getReadingSources(new AbortController().signal);
+      expect(sources.map((source) => source.tier)).toEqual(['builtin']); // 降级路径本身不变
+      const logged = (console.error as ReturnType<typeof vi.fn>).mock.calls
+        .map((call) => JSON.stringify(call))
+        .join('\n');
+      expect(logged).toContain('shuyuan engine host gate refresh failed');
+      // 写死的敏感 pattern：连接串任何一段都不许出现。
+      expect(logged).not.toContain('leak_secret');
+      expect(logged).not.toContain('leak_user');
+      expect(logged).not.toContain('postgres://leak_user:leak_secret@db.internal.example/finder');
+      expect(logged).toContain('[redacted-url]'); // 抹除痕迹可读，保留错误类别
+    });
+
+    it('🔴 降级日志脱敏：引擎源查询（JOIN source_admission）失败同款不泄连接串', async () => {
+      vi.stubEnv('READING_ENGINE_SOURCES', '1');
+      const secret = 'postgresql://engine:pw123@db2.internal.example/prod';
+      execute.mockResolvedValueOnce([{ host: 'engine.example' }]).mockResolvedValueOnce([{ collections: [] }])
+        .mockResolvedValueOnce([])
+        .mockRejectedValueOnce(new Error(`fetch failed while connecting: ${secret}`));
+      const sources = await getReadingSources(new AbortController().signal);
+      expect(sources.map((source) => source.tier)).toEqual(['builtin']);
+      const logged = (console.error as ReturnType<typeof vi.fn>).mock.calls
+        .map((call) => JSON.stringify(call))
+        .join('\n');
+      expect(logged).toContain('shuyuan engine sources unavailable');
+      expect(logged).not.toContain('pw123');
+      expect(logged).not.toContain(secret);
+      expect(logged).toContain('[redacted-url]');
+    });
+
     it('§6.1 零回归：引擎开关关时完全不碰 host 门，也不查准入表', async () => {
       // beforeEach 未设 READING_ENGINE_SOURCES ⇒ 开关关。预置门集合，验证 getReadingPool 后原样不动。
       refreshSupportedHosts(['preset.example']);

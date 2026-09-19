@@ -884,7 +884,7 @@ class TestEngineCliInvocation(unittest.TestCase):
         self.assertEqual(cmd[0], '/usr/bin/node')
         self.assertEqual(cmd[1], '--import')
         self.assertTrue(cmd[2].startswith('file://'))          # hook 转 file:// URI
-        self.assertTrue(cmd[2].endswith('ts-alias-hook.mjs'))
+        self.assertTrue(cmd[2].endswith('ts-esm-loader.mjs'))
         self.assertEqual(cmd[3], '/repo/scripts/engine-fetch.mjs')
         self.assertEqual(cmd[4], 'search')
         self.assertIn('--json', cmd)                            # 自动补 --json
@@ -900,7 +900,7 @@ class TestEngineCliInvocation(unittest.TestCase):
                                     script_path='/repo/scripts/engine-fetch.mjs',
                                     database_url='x')
         self.assertTrue(cli.hook_path.replace('\\', '/').endswith(
-            '/repo/scripts/ts-alias-hook.mjs'))
+            '/repo/scripts/ts-esm-loader.mjs'))
 
 
 class TestResolveCandidatesEngineFallback(unittest.TestCase):

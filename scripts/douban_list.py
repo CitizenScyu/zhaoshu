@@ -330,7 +330,7 @@ class EngineCli:
     """封装 engine-fetch.mjs 子进程调用（labeler 在 phoenix 上 shell out）。
 
     组装形态（任务书 §C）：
-      node --import <file://.../ts-alias-hook.mjs> <.../engine-fetch.mjs> <sub> … --json
+      node --import <file://.../ts-esm-loader.mjs> <.../engine-fetch.mjs> <sub> … --json
     Windows 裸驱动器路径给 --import 会 ERR_UNSUPPORTED_ESM_URL_SCHEME，故 hook 统一转
     file:// URI（Linux/phoenix 亦合法）。
 
@@ -341,8 +341,8 @@ class EngineCli:
                  hook_path: str | None = None, timeout: int = ENGINE_CLI_TIMEOUT):
         self.node = node or 'node'
         self.script_path = script_path
-        # hook 默认取 engine-fetch.mjs 同目录的 ts-alias-hook.mjs
-        self.hook_path = hook_path or str(Path(script_path).parent / 'ts-alias-hook.mjs')
+        # hook 默认取 engine-fetch.mjs 同目录的 ts-esm-loader.mjs
+        self.hook_path = hook_path or str(Path(script_path).parent / 'ts-esm-loader.mjs')
         self._database_url = database_url
         self.timeout = timeout
 

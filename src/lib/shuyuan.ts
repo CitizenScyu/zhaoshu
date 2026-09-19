@@ -195,6 +195,14 @@ export async function getReadingSources(signal: AbortSignal): Promise<ReadingSou
   return (await getReadingPool(signal)).sources;
 }
 
+// 🔴 脱敏（审查遗留项）：DB/网络错误的 message 可能含连接串（含口令）——Neon 连接错误会
+// 回显 DATABASE_URL 原文。降级日志只保留可读的错误类别：任何带 `://` 或 `@host` 形态的
+// token 一律抹掉再截断（与 engine-fetch.mjs 的 safeReason 同款纪律）。
+function safeReason(error: unknown): string {
+  const raw = error instanceof Error ? error.message : String(error);
+  return raw.replace(/\S*:\/\/\S*/g, '[redacted-url]').replace(/\S+@\S+/g, '[redacted]').slice(0, 300);
+}
+
 /**
  * 引擎源是**增量**：读该表出错（如 schema 未就绪/库抖动）绝不能杀死 builtin 取书路径
  * （零回归红线）。失败按空集处理，book15 单源行为与今日逐点相同。
@@ -207,7 +215,7 @@ async function engineSourcesIncremental(
   } catch (error) {
     signal.throwIfAborted();
     console.error('shuyuan engine sources unavailable, falling back to builtin only', {
-      reason: error instanceof Error ? error.message : String(error),
+      reason: safeReason(error),
     });
     return [];
   }
@@ -234,7 +242,7 @@ async function refreshEngineHostGate(signal: AbortSignal): Promise<boolean> {
   } catch (error) {
     signal.throwIfAborted();
     console.error('shuyuan engine host gate refresh failed, falling back to builtin only', {
-      reason: error instanceof Error ? error.message : String(error),
+      reason: safeReason(error),
     });
     return false;
   }
@@ -493,7 +501,7 @@ export async function getShuyuanPoolHealth(signal: AbortSignal): Promise<Shuyuan
     readAdmissionFunnel(s, signal).catch((error) => {
       signal.throwIfAborted();
       console.error('shuyuan admission funnel unavailable, reporting zeros', {
-        reason: error instanceof Error ? error.message : String(error),
+        reason: safeReason(error),
       });
       return [] as ShuyuanAdmissionFunnel[];
     }),
@@ -817,7 +825,7 @@ async function runAdmissionAfterRefresh(
     if (signal.aborted) return;
     console.error('shuyuan admission batch failed', {
       candidates: candidates.length,
-      reason: error instanceof Error ? error.message : String(error),
+      reason: safeReason(error),
     });
     return;
   }
@@ -828,7 +836,7 @@ async function runAdmissionAfterRefresh(
   } catch (error) {
     if (signal.aborted) return;
     console.error('shuyuan supported host refresh failed', {
-      reason: error instanceof Error ? error.message : String(error),
+      reason: safeReason(error),
     });
   }
 }
