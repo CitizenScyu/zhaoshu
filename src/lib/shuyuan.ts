@@ -168,10 +168,14 @@ export interface ReadingPool {
 export async function getReadingPool(signal: AbortSignal): Promise<ReadingPool> {
   const s = getSql();
   const limit = readingPoolLimit();
+  // 引擎分支：host 门随池合成刷新（设计 §6.1）。必须排在 readMeta **之前**——readMeta 解析
+  // probeSnapshot 时用 canProbe（= validateSourceUrl 的运行时 host 门）过滤引擎源的探测态；门没刷，
+  // 引擎源的 reachable 结论会被旧门丢弃、排序失真。engineHosts 读失败 ⇒ 不刷门（既有集合原样保留，
+  // fail-closed）且本次降级 builtin-only。开关默认关时完全不碰门、连准入表都不查（零回归 + 省 DB 往返）。
+  const engineOk = engineSourcesEnabled() ? await refreshEngineHostGate(signal) : false;
   const { states } = readMeta((await storedMeta(s, signal)).collections);
   const builtin = await builtinReadingSources(s, states, signal);
-  // 开关默认关：连准入表都不查（省一次 DB 往返，也彻底不暴露引擎源的失败面）。
-  const engine = engineSourcesEnabled() ? await engineSourcesIncremental(s, states, signal) : [];
+  const engine = engineOk ? await engineSourcesIncremental(s, states, signal) : [];
   const eligible = [...builtin, ...engine];
   // builtin 全部排在引擎源之前（§2.4 首键），故 slice 上限作用在合并序列上即等价于
   // 「先取满 builtin、再按引擎源全序补位」——builtin 永远不会被引擎源挤出池。
@@ -206,6 +210,33 @@ async function engineSourcesIncremental(
       reason: error instanceof Error ? error.message : String(error),
     });
     return [];
+  }
+}
+
+/**
+ * host 门随池合成刷新（设计 §6.1）：把 source_admission ok 态 host（compile_ok ∧ search_ok IS TRUE）
+ * 并入运行时门（validateSourceUrl 的 supportedHosts）。此前该门只在 cron 准入批次尾部刷新
+ * （refreshWithinBudget → runAdmissionAfterRefresh → refreshSupportedHosts）；hub 不可达时
+ * refreshShuyuan 降级、准入批次不跑，门就永远不刷——人工种进 source_admission 的 ok 行也过不了门、
+ * 进不了取书池。这里把「cron 批次成功后才刷」放宽为「池合成时按 DB 实况刷」。
+ *
+ * 语义安全：engineHosts 读的正是 cron 尾部同一数据源（source_admission ok 行的 host）；写路径仍只有
+ * cron 准入批次（或人工 SQL），运行时无写、无放大。每次池合成刷一遍开销可接受（一次只读 DISTINCT，表很小）。
+ *
+ * 返回值：true = 已成功刷门、可查引擎源；false = engineHosts 读失败（表不存在/库抖动）⇒ **未刷门**
+ * （既有集合原样保留，fail-closed：收窄到内建，绝不放大、绝不空集），且本次池降级为 builtin-only。
+ * 绝不让 getReadingPool 抛错（零回归红线）。
+ */
+async function refreshEngineHostGate(signal: AbortSignal): Promise<boolean> {
+  try {
+    refreshSupportedHosts(await engineHosts(signal));
+    return true;
+  } catch (error) {
+    signal.throwIfAborted();
+    console.error('shuyuan engine host gate refresh failed, falling back to builtin only', {
+      reason: error instanceof Error ? error.message : String(error),
+    });
+    return false;
   }
 }
 
