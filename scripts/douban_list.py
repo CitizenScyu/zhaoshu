@@ -92,6 +92,53 @@ def title_compatible(douban_title: str, site_title: str) -> bool:
     return False
 
 
+# ---- 作者归一化（N02：引擎兜底身份过滤的比对口径）----
+# 背景：search_engine(title, author) 的 author 传给 CLI 但候选不过滤，同名异作者时
+# B 的正文会绑上 A 的名单身份入 labels.jsonl / 书库（共享数据污染）。本函数把两端
+# 作者归一到可比形态，比对语义 = 归一化后**严格相等**（不做包含——「唐家三少」不得
+# 匹配「唐家三少之子」）。方向「宁拒不错绑」：误拒可从 labels-rejected.jsonl 复核。
+# 真实形态对齐 labels-from-phoenix-20260918.jsonl 抽样（261 非空作者：
+# 「乔治&middot;奥威尔」HTML 实体、「贝尔纳.布尔蒂克斯」半角点、其余几乎全为纯中文名）。
+_AUTHOR_PUNCT_RE = re.compile(
+    "["
+    r"\s\u3000"                       # 空白 + 全角空格
+    "·、，,。:：;；"                # 分隔类：中点/顿号/中英逗号句号冒号分号
+    r"\-—_/\'""“”‘’"                # 连字符/破折号/斜杠/下划线/各类引号
+    "《》「」『』（）()【】"          # 括号类
+    r"!！?？\.&;\[\]"                # 感叹/问号/小数点/&/分号/方括号（[]须转义）
+    "]+")
+_AUTHOR_SUFFIX_RE = re.compile(r'(?:等著|编著|校译|校注|合著|著|译|绘|校|主编|编)$')
+# 前导国籍/语种括号段：（美）/【日】/[英]/(英) 等；剥后剩余非空才剥
+_AUTHOR_LEAD_BRACKET_RE = re.compile(r'^[（(【\[][^）)】\]]{0,6}[）)】\]]')
+
+
+def _norm_author(s: str) -> str:
+    """作者身份比对前的归一化：空白（含全角）/分隔标点/尾部著述后缀/前导国籍段/casefold。
+
+    与 import 线（import_one.normalize_author）的分工：那条线管**入库身份键**，
+    宁 review 不冒进；本函数只管**打标前的候选过滤与 toc 校验**，把两端写法差
+    桥接掉即可。HTML 实体按「&...; 整体替换为 ·」处理（乔治&middot;奥威尔 →
+    乔治·奥威尔），与标点剥离天然衔接；未成对的 & / ; 当普通标点剥。"""
+    text = (s or '').casefold()
+    text = re.sub(r'&[a-zA-Z]+;', '·', text)      # &middot; 等实体 → 分隔符
+    # 前导括号段（（美）/【日】）：必须在标点剥离**之前**剥，否则括号字符先被标点层
+    # 吃掉、内容残片（美）就留在名首了。剥后剩余非空才剥（「（佚名）」保留括号内容）。
+    m = _AUTHOR_LEAD_BRACKET_RE.match(text)
+    if m and text[m.end():]:
+        text = text[m.end():]
+    text = _AUTHOR_PUNCT_RE.sub('', text)
+    # 尾部著述后缀循环剥（「等著」先于「著」匹配，防复合尾巴剥不净）
+    while True:
+        stripped = _AUTHOR_SUFFIX_RE.sub('', text)
+        if stripped == text:
+            break
+        text = stripped
+    return text
+
+
+
+
+
 # ---- 豆瓣 tag 页解析（纯函数，可离线单测）----
 def parse_douban_tag_page(html: str) -> list[dict]:
     """豆瓣 tag 页 HTML → [{title, author, douban_url}]。
@@ -317,10 +364,13 @@ class EngineCli:
 
 
 def search_engine(cli, title: str, author: str = '') -> dict | None:
-    """book15 miss 后的引擎兜底搜索：调 CLI `search --title …`，同款 title_compatible 校验。
+    """book15 miss 后的引擎兜底搜索：调 CLI `search --title …`，title + 作者双校验。
 
+    N02 修复：author 不再只传不用——候选作者非空且归一化后与名单作者不等 → 必拒
+    （防同名异作者的正文绑定名单身份，即身份错配污染共享数据）。
+    两遍选择：先「title 兼容 + 作者已验证匹配」，再退「title 兼容 + 候选作者空」。
     返回命中 {'url': bookUrl（绝对）, 'title': site_title, 'source': host} 或 None（miss）。
-    退出码：0=有候选（逐条按 title_compatible 校验，跳过 book15.net 源）；1=正常 miss；
+    退出码：0=有候选（逐条校验，跳过 book15.net 源）；1=正常 miss；
     2/未知非零/无法调用 → 抛 EngineUnavailable（调用方本轮降级 book15-only、不重试）。"""
     args = ['--title', title]
     if author:
@@ -345,6 +395,13 @@ def search_engine(cli, title: str, author: str = '') -> dict | None:
         return None
     if not isinstance(candidates, list):
         return None
+    # ---- N02 两遍选择（只在引擎路径生效，CLI 调用形态不变）----
+    # 第一遍：title 兼容 + author 已验证匹配（名单 author 已知且 _norm_author 相等）。
+    # 第二遍：名单 author 已知但无已验证匹配 → 退「title 兼容 + 候选 author 空」（降级收）。
+    # 已验证错配的候选两遍都不收（必拒，防同名异作者正文绑错身份）。
+    # 名单 author 为空 → 照旧行为：title 兼容即收，不看候选 author。
+    want = _norm_author(author)
+    fallback = None
     for c in candidates:
         if not isinstance(c, dict):
             continue
@@ -352,10 +409,23 @@ def search_engine(cli, title: str, author: str = '') -> dict | None:
             continue          # book15 路径已搜过（这是兜底），跳过
         site_title = c.get('title') or ''
         book_url = c.get('bookUrl') or ''
-        if book_url and title_compatible(title, site_title):
+        if not book_url or not title_compatible(title, site_title):
+            continue
+        got = _norm_author(c.get('author') or '')
+        if not want:          # 名单无作者：行为同现状
             return {'url': book_url, 'title': site_title,
                     'source': c.get('source', '')}
-    return None
+        if got and got == want:
+            return {'url': book_url, 'title': site_title,
+                    'source': c.get('source', '')}
+        if not got and fallback is None:
+            fallback = {'url': book_url, 'title': site_title,
+                        'source': c.get('source', '')}
+        elif got:
+            print(f'  作者不符跳过: {site_title}（名单 {author} vs 引擎 {c.get("author")}）')
+    if fallback is not None and want:
+        print(f'  作者未知命中（降级）: {fallback["title"]}（名单作者 {author}，引擎未给作者）')
+    return fallback
 
 
 def build_douban_queue(http_get, skip_titles: set | None = None,

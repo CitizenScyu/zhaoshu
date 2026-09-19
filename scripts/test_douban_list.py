@@ -12,6 +12,8 @@
   误匹配样本（间客→天上有间客栈、斗破苍穹→一切从斗破苍穹开始、
   遮天→穿越从遮天开始）是 phoenix 上真跑出来的。
 """
+import contextlib
+import io
 import json
 import os
 import sys
@@ -960,6 +962,129 @@ class TestResolveCandidatesEngineFallback(unittest.TestCase):
             skip_titles={'剑来'}, engine_cli=cli)
         self.assertEqual(queue, [])
         self.assertEqual(cli.calls, [])          # 已打标：连 book15 带引擎都不搜
+
+
+# ---- N02：引擎兜底作者身份过滤（同名异作者正文不得绑定名单身份）----
+class TestNormAuthor(unittest.TestCase):
+    """_norm_author：身份比对前的作者归一化。
+
+    真实形态对齐 labels-from-phoenix-20260918.jsonl 抽样（261 非空作者里
+    出现过分隔符写法差/HTML 实体/「著」尾缀/国籍前缀）；比对语义 = 归一化后
+    **严格相等**（不做包含），方向「宁拒不错绑」。"""
+
+    TRUE_PAIRS = (
+        ('天蚕土豆', '天蚕土豆著'),                       # 尾缀「著」
+        ('priest', 'Priest'),                             # 大小写
+        ('（美）乔治·R·R·马丁', '乔治·R·R·马丁'),          # 前导国籍括号段
+        ('烽火戏诸侯', ' 烽火戏诸侯 '),                    # 空白
+        ('烽火戏诸侯', '烽火戏诸侯 编著'),                 # 分隔 + 组合尾缀
+        ('乔治·奥威尔', '乔治&middot;奥威尔'),              # book15 元数据实体形态
+        ('贝尔纳·布尔蒂克斯', '贝尔纳.布尔蒂克斯'),         # 半角点分隔
+        ('甲', '甲 等著'),                                # 等著组合尾缀
+    )
+
+    def test_true_pairs_are_equal(self):
+        for a, b in self.TRUE_PAIRS:
+            with self.subTest(pair=(a, b)):
+                self.assertEqual(douban_list._norm_author(a),
+                                 douban_list._norm_author(b))
+
+    def test_containment_is_not_equality(self):
+        # 严格相等，不做包含：唐家三少 vs 唐家三少之子 必须不等
+        self.assertNotEqual(douban_list._norm_author('唐家三少'),
+                            douban_list._norm_author('唐家三少之子'))
+
+    def test_empty_and_punct_only_normalize_to_empty(self):
+        for s in ('', '   ', '·', '（）'):
+            with self.subTest(s=s):
+                self.assertEqual(douban_list._norm_author(s), '')
+
+    def test_bracket_only_author_is_not_stripped_to_nothing(self):
+        # 剥前导括号段要求剥后剩余非空：整串就是括号段时先不剥，再走标点剥离
+        self.assertEqual(douban_list._norm_author('（佚名）'), '佚名')
+
+
+class TestSearchEngineAuthorFilter(unittest.TestCase):
+    """N02 第一层：search_engine 候选过滤 + 两遍选择。"""
+
+    def test_n02_repro_different_author_is_rejected(self):
+        # 对齐 gpt-review-recheck-evidence/labeler_repro.py（codex 复核反例）：
+        # 名单 Same Title / Author A，引擎返回 Author B 的书 → 队列为空，
+        # B 的正文不得绑 A 的身份进队列；拒收要有 stdout 审计行。
+        cli = FakeEngineCli({'search': _proc(0, _engine_search_stdout([
+            {'source': 'audit.example', 'title': 'Same Title', 'author': 'Author B',
+             'bookUrl': 'https://audit.example/book-b'}]))})
+        no_wait(self)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            queue = douban_list._resolve_candidates(
+                [{'title': 'Same Title', 'author': 'Author A'}],
+                lambda url: NO_RESULT_HTML, engine_cli=cli)
+        self.assertEqual(queue, [])
+        out = buf.getvalue()
+        self.assertIn('作者不符跳过', out)
+        self.assertIn('Author A', out)
+        self.assertIn('Author B', out)
+
+    def test_verified_match_wins_over_earlier_empty_author(self):
+        # 两遍选择第一遍：author 已验证匹配的候选优先于更早的空 author 候选
+        cli = FakeEngineCli({'search': _proc(0, _engine_search_stdout([
+            {'source': 's1.example', 'title': '斗破苍穹', 'author': '',
+             'bookUrl': 'https://s1.example/b1'},
+            {'source': 's2.example', 'title': '斗破苍穹', 'author': '天蚕土豆著',
+             'bookUrl': 'https://s2.example/b2'},
+        ]))})
+        hit = douban_list.search_engine(cli, '斗破苍穹', '天蚕土豆')
+        self.assertEqual(hit['url'], 'https://s2.example/b2')
+
+    def test_empty_author_candidate_is_accepted_as_fallback(self):
+        # 两遍选择第二遍：没有已验证匹配时退「候选 author 空」（降级可收）
+        cli = FakeEngineCli({'search': _proc(0, _engine_search_stdout([
+            {'source': 's1.example', 'title': '斗破苍穹', 'author': '',
+             'bookUrl': 'https://s1.example/b1'},
+        ]))})
+        hit = douban_list.search_engine(cli, '斗破苍穹', '天蚕土豆')
+        self.assertEqual(hit['url'], 'https://s1.example/b1')
+
+    def test_verified_mismatch_is_never_chosen_in_either_pass(self):
+        # 已验证错配的候选两遍都不收：只剩错配 → miss（None）
+        cli = FakeEngineCli({'search': _proc(0, _engine_search_stdout([
+            {'source': 's1.example', 'title': '斗破苍穹', 'author': '别人',
+             'bookUrl': 'https://s1.example/b1'},
+        ]))})
+        self.assertIsNone(douban_list.search_engine(cli, '斗破苍穹', '天蚕土豆'))
+
+    def test_author_form_differences_bridge_the_filter(self):
+        # 归一化桥接写法差：名单 Priest / 引擎 priest 也能对上
+        cli = FakeEngineCli({'search': _proc(0, _engine_search_stdout([
+            {'source': 's.example', 'title': '镇魂', 'author': 'priest',
+             'bookUrl': 'https://s.example/b1'},
+        ]))})
+        hit = douban_list.search_engine(cli, '镇魂', 'Priest')
+        self.assertEqual(hit['url'], 'https://s.example/b1')
+
+    def test_list_author_empty_keeps_legacy_behavior(self):
+        # 名单 author 为空：行为同现状（title 兼容即收，不看候选 author）
+        cli = FakeEngineCli({'search': _proc(0, _engine_search_stdout([
+            {'source': 's.example', 'title': '斗破苍穹', 'author': '随便谁',
+             'bookUrl': 'https://s.example/b1'},
+        ]))})
+        hit = douban_list.search_engine(cli, '斗破苍穹')
+        self.assertEqual(hit['url'], 'https://s.example/b1')
+
+    def test_engine_off_stdout_is_byte_identical(self):
+        # 红线：开关关闭（engine_cli=None）时 stdout 逐字节不变——
+        # 新增的「作者不符跳过」等打印全部只在引擎分支内出现。
+        no_wait(self)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            queue = douban_list._resolve_candidates(
+                [{'title': '斗破苍穹', 'author': '天蚕土豆'}],
+                lambda url: NO_RESULT_HTML)
+        self.assertEqual(queue, [])
+        self.assertEqual(
+            buf.getvalue(),
+            'book15 命中 0 本，未命中 1 本，跳过已打标 0 本（斗破苍穹）\n')
 
 
 if __name__ == '__main__':

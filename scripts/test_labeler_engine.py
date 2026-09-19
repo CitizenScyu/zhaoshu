@@ -6,11 +6,15 @@ target_chars 截断；单章失败隔离；toc 失败抛错交主循环计失败
 全离线：不联网、不真调 CLI、不调 LLM。mock 引擎 CLI（返回 CompletedProcess-like）。
 复跑：PYTHONIOENCODING=utf-8 python -m unittest discover -s scripts -p 'test_labeler_engine.py'
 """
+import contextlib
+import io
 import json
 import os
 import sys
+import tempfile
 import types
 import unittest
+from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -135,6 +139,92 @@ class TestFetchBookTextEngine(unittest.TestCase):
         self.assertEqual((text, chars), ('', 0))
 
 
+class TestEngineIdentityVerification(unittest.TestCase):
+    """N02 第二层：toc 后二次校验（EngineIdentityMismatch）。"""
+
+    def setUp(self):
+        patcher = mock.patch.object(labeler.time, 'sleep')
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    @staticmethod
+    def _toc_proc(title, author, chapters=None):
+        out = {'source': 'www.yingsx.com', 'title': title, 'author': author,
+               'chapters': chapters or [{'title': 'A', 'url': 'https://y/a'}]}
+        return _proc(0, json.dumps(out, ensure_ascii=False))
+
+    def test_toc_author_mismatch_raises_before_any_content(self):
+        # toc 返回异作者 → 抛 EngineIdentityMismatch，且没有任何 content 调用
+        cli = FakeEngineCli(
+            lambda sub, url: self._toc_proc('斗破苍穹', '别人') if sub == 'toc'
+            else _content('正' * 200))
+        with self.assertRaises(labeler.EngineIdentityMismatch):
+            labeler.fetch_book_text_engine(cli, 'https://y/x',
+                                           expect_title='斗破苍穹',
+                                           expect_author='天蚕土豆')
+        self.assertEqual([c[0] for c in cli.calls], ['toc'])   # 没发起 content
+
+    def test_toc_title_incompatible_raises_before_any_content(self):
+        # toc title 不兼容（中部命中的同人书标题）→ 同上
+        cli = FakeEngineCli(
+            lambda sub, url: self._toc_proc('一切从斗破苍穹开始', '天蚕土豆')
+            if sub == 'toc' else _content('正' * 200))
+        with self.assertRaises(labeler.EngineIdentityMismatch):
+            labeler.fetch_book_text_engine(cli, 'https://y/x',
+                                           expect_title='斗破苍穹',
+                                           expect_author='天蚕土豆')
+        self.assertEqual([c[0] for c in cli.calls], ['toc'])
+
+    def test_mismatch_message_contains_both_ends(self):
+        cli = FakeEngineCli(
+            lambda sub, url: self._toc_proc('斗破苍穹', '别人'))
+        with self.assertRaises(labeler.EngineIdentityMismatch) as ctx:
+            labeler.fetch_book_text_engine(cli, 'https://y/x',
+                                           expect_title='斗破苍穹',
+                                           expect_author='天蚕土豆')
+        msg = str(ctx.exception)
+        self.assertIn('天蚕土豆', msg)
+        self.assertIn('别人', msg)
+
+    def test_missing_toc_identity_skips_verification(self):
+        # toc JSON 里 title/author 缺失（空串）→ 校验不触发（双侧非空才比对）
+        cli = FakeEngineCli(
+            lambda sub, url: self._toc_proc('', '') if sub == 'toc'
+            else _content('正' * 200))
+        text, chars = labeler.fetch_book_text_engine(
+            cli, 'https://y/x',
+            expect_title='斗破苍穹', expect_author='天蚕土豆')
+        self.assertEqual(chars, 200)                    # 正文照常取
+
+    def test_no_expect_values_keeps_legacy_behavior(self):
+        # 不传 expect_title/expect_author（既有调用形态）：不校验，行为不变
+        cli = FakeEngineCli(
+            lambda sub, url: self._toc_proc('斗破苍穹', '天蚕土豆') if sub == 'toc'
+            else _content('正' * 200))
+        text, chars = labeler.fetch_book_text_engine(cli, 'https://y/x')
+        self.assertEqual(chars, 200)
+
+    def test_compatible_prefix_title_passes(self):
+        # title 校验复用 title_compatible 语义：系列卷号形态放行
+        cli = FakeEngineCli(
+            lambda sub, url: self._toc_proc('斗罗大陆IV终极斗罗', '唐家三少')
+            if sub == 'toc' else _content('正' * 200))
+        text, chars = labeler.fetch_book_text_engine(
+            cli, 'https://y/x',
+            expect_title='斗罗大陆', expect_author='唐家三少')
+        self.assertEqual(chars, 200)
+
+    def test_author_form_difference_passes_verification(self):
+        # author 校验用 _norm_author 归一化比对：国籍前缀写法差过
+        cli = FakeEngineCli(
+            lambda sub, url: self._toc_proc('冰与火之歌', '（美）乔治·R·R·马丁')
+            if sub == 'toc' else _content('正' * 200))
+        text, chars = labeler.fetch_book_text_engine(
+            cli, 'https://y/x',
+            expect_title='冰与火之歌', expect_author='乔治·R·R·马丁')
+        self.assertEqual(chars, 200)
+
+
 class TestBuildEngineCli(unittest.TestCase):
     """_build_engine_cli：开关 + 必要配置齐备才返回 EngineCli，否则降级 None。"""
 
@@ -161,6 +251,84 @@ class TestBuildEngineCli(unittest.TestCase):
         self.assertIsNotNone(cli)
         self.assertEqual(cli.node, '/usr/bin/node')
         self.assertEqual(cli.script_path, '/repo/scripts/engine-fetch.mjs')
+
+
+
+class TestMainRejectsIdentityMismatch(unittest.TestCase):
+    """N02 第三层：主循环专门 catch EngineIdentityMismatch → labels-rejected.jsonl
+    新增一行（reason 含「引擎目录身份不符」）、不调 LLM、不写 labels.jsonl。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dir = Path(self.tmp.name)
+        (self.dir / '.env').write_text('LLM_API_KEY=test-key-not-real\n', encoding='utf-8')
+
+    def test_identity_mismatch_is_rejected_without_llm_call(self):
+        book = {'url': 'https://www.yingsx.com/book/1', 'title': '斗破苍穹',
+                'author': '天蚕土豆', 'engine': True,
+                'source_host': 'www.yingsx.com'}
+        llm_called = []
+
+        def fake_build(http_get, skip_titles=None, include_douban=True, pages=None,
+                       engine_cli=None):
+            return [book]
+
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.dict(os.environ, {'LABELER_DATA_DIR': str(self.dir)}), \
+                mock.patch.object(labeler.douban_list, 'build_webnovel_queue',
+                                  side_effect=fake_build), \
+                mock.patch.object(labeler, 'fetch_book_text_engine',
+                                  side_effect=labeler.EngineIdentityMismatch(
+                                      '引擎目录身份不符: 名单《斗破苍穹》/天蚕土豆'
+                                      ' vs 目录《斗破苍穹》/别人')), \
+                mock.patch.object(labeler, 'label_book',
+                                  side_effect=lambda *a, **k: llm_called.append(1)), \
+                mock.patch.object(labeler.time, 'sleep'), \
+                mock.patch.object(sys, 'argv',
+                                  ['labeler.py', '--source', 'webnovel',
+                                   '--no-db-model']), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = labeler.main()
+        self.assertEqual(code, 2)                       # 整轮零成功
+        self.assertEqual(llm_called, [])                # 没调模型
+        rej_path = self.dir / 'labels-rejected.jsonl'
+        lines = [json.loads(x) for x in
+                 rej_path.read_text(encoding='utf-8').splitlines() if x]
+        self.assertEqual(len(lines), 1)
+        rec = lines[0]
+        self.assertEqual(rec['site_title'], '斗破苍穹')
+        self.assertEqual(rec['author'], '天蚕土豆')
+        self.assertEqual(rec['url'], 'https://www.yingsx.com/book/1')
+        self.assertIn('引擎目录身份不符', rec['reason'])
+        self.assertFalse((self.dir / 'labels.jsonl').exists())   # 未入库
+        self.assertIn('引擎目录身份不符', out.getvalue())
+
+    def test_generic_exception_still_works(self):
+        # 对照：普通异常仍走通用 except（打 stderr、不写 rejected）——分层不互相吃
+        book = {'url': 'https://www.yingsx.com/book/1', 'title': '斗破苍穹',
+                'author': '天蚕土豆', 'engine': True}
+
+        def fake_build(http_get, skip_titles=None, include_douban=True, pages=None,
+                       engine_cli=None):
+            return [book]
+
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.dict(os.environ, {'LABELER_DATA_DIR': str(self.dir)}), \
+                mock.patch.object(labeler.douban_list, 'build_webnovel_queue',
+                                  side_effect=fake_build), \
+                mock.patch.object(labeler, 'fetch_book_text_engine',
+                                  side_effect=RuntimeError('boom')), \
+                mock.patch.object(labeler, 'label_book', return_value=({}, 1)), \
+                mock.patch.object(labeler.time, 'sleep'), \
+                mock.patch.object(sys, 'argv',
+                                  ['labeler.py', '--source', 'webnovel',
+                                   '--no-db-model']), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = labeler.main()
+        self.assertEqual(code, 2)
+        self.assertIn('失败: boom', err.getvalue())
+        self.assertFalse((self.dir / 'labels-rejected.jsonl').exists())
 
 
 if __name__ == '__main__':
