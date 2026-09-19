@@ -627,14 +627,41 @@ def _engine_json(engine_cli, subcommand: str, *args: str) -> dict:
     return json.loads(proc.stdout)
 
 
+class EngineIdentityMismatch(Exception):
+    """N02：引擎 toc 自报的 title/author 与名单身份不符（错书防线）。
+
+    消息含双端 title/author 摘要，供 labels-rejected.jsonl 的 reason 与 stdout 审计。
+    只在引擎路径抛出（book15 路径无 toc 自报身份可用）；主循环在通用 except 之前
+    专门 catch：写拒收、不调 LLM、不 sleep LLM_INTERVAL。"""
+
+
 def fetch_book_text_engine(engine_cli, book_url: str,
-                           target_chars: int = TARGET_CHARS) -> tuple[str, int]:
+                           target_chars: int = TARGET_CHARS,
+                           expect_title: str = '',
+                           expect_author: str = '') -> tuple[str, int]:
     """引擎源整本（到字数上限）→ (拼接文本, 实际字数)。
 
     toc 失败（无章 / 环境错误，CLI 退出码非 0）→ 抛异常，交主循环计失败（不静默产空文本）。
     单章 content 失败（重试后仍空）跳过，隔离不拖垮整本；target_chars/CHUNK_RETRY/CHAPTER_DELAY
-    与 book15 路径沿用同一常量。"""
+    与 book15 路径沿用同一常量。
+
+    N02 二次校验（toc 取回后、逐章 content **之前**）：expect_title/expect_author
+    是名单侧身份锚点（队列条目的 title/author）。**双侧非空才比对**——toc 缺自报
+    身份（空串）不触发（向后兼容），名单没给期望值（空串）也不触发。
+    title 用 title_compatible 语义比对；author 用 douban_list._norm_author 归一化后
+    严格相等。不符 → 抛 EngineIdentityMismatch（此时一个 content 调用都没发起，
+    省掉整本抓取）。"""
     toc = _engine_json(engine_cli, 'toc', '--url', book_url)
+    toc_title = (toc.get('title') or '').strip()
+    toc_author = (toc.get('author') or '').strip()
+    if expect_title and toc_title and not douban_list.title_compatible(expect_title, toc_title):
+        raise EngineIdentityMismatch(
+            f'引擎目录身份不符: 名单《{expect_title}》/作者 {expect_author or "（未知）"}'
+            f' vs 目录《{toc_title}》/作者 {toc_author or "（未知）"}（标题不兼容）')
+    if expect_author and toc_author and             douban_list._norm_author(expect_author) != douban_list._norm_author(toc_author):
+        raise EngineIdentityMismatch(
+            f'引擎目录身份不符: 名单《{expect_title}》/作者 {expect_author}'
+            f' vs 目录《{toc_title}》/作者 {toc_author}（作者不符）')
     chapters = toc.get('chapters') or []
     parts, chars = [], 0
     for ch in chapters:
@@ -969,7 +996,11 @@ def main() -> int:
             # 引擎兜底条目走 CLI 取正文（toc/content，不过 clean_chapter_text）；
             # 其余走 book15 适配器路径，行为不变。
             if b.get('engine'):
-                text, chars = fetch_book_text_engine(engine_cli, b['url'])
+                # N02：toc 自报身份与名单身份比对（双侧非空才比对），错书在抓正文前拦下。
+                text, chars = fetch_book_text_engine(
+                    engine_cli, b['url'],
+                    expect_title=b.get('title') or '',
+                    expect_author=b.get('author') or '')
             else:
                 text, chars = fetch_book_text(b['url'])
             if chars < 10_000:
@@ -1085,6 +1116,22 @@ def main() -> int:
                         print(f'  ⚠️ 自动导入本轮已失败 {import_failures} 次，疑似 .env 配置'
                               f'或数据库不可达——打标不阻断，但产物可能没有入库：'
                               f'{getattr(importer, "last_error", "") or "（无错误详情）"}')
+        except EngineIdentityMismatch as e:
+            # N02：错书防线——toc 身份不符，一个 content/LLM 调用都没发起。
+            # 与「抓取字数不足」同款落盘形态；不 sleep LLM_INTERVAL（没调模型）。
+            print(f'  {e}')
+            reject = {
+                'site_title': '' if args.book else (b.get('title') or '').strip(),
+                'author': b.get('author', ''),
+                'category': b.get('category', ''),
+                'url': BOOK15.absolute(b['url']),
+                'reason': str(e),
+            }
+            rej_path = data_path('labels-rejected.jsonl')
+            with open(rej_path, 'a', encoding='utf-8') as f:
+                f.write(json.dumps(reject, ensure_ascii=False) + '\n')
+            fail += 1
+            continue
         except Exception as e:
             print(f'  失败: {e}', file=sys.stderr)
             fail += 1

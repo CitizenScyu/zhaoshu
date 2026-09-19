@@ -194,7 +194,7 @@ class TestEngineIdentityVerification(unittest.TestCase):
         text, chars = labeler.fetch_book_text_engine(
             cli, 'https://y/x',
             expect_title='斗破苍穹', expect_author='天蚕土豆')
-        self.assertEqual(chars, 202)                    # 正文照常取
+        self.assertEqual(chars, 200)                    # 正文照常取
 
     def test_no_expect_values_keeps_legacy_behavior(self):
         # 不传 expect_title/expect_author（既有调用形态）：不校验，行为不变
@@ -202,7 +202,7 @@ class TestEngineIdentityVerification(unittest.TestCase):
             lambda sub, url: self._toc_proc('斗破苍穹', '天蚕土豆') if sub == 'toc'
             else _content('正' * 200))
         text, chars = labeler.fetch_book_text_engine(cli, 'https://y/x')
-        self.assertEqual(chars, 202)
+        self.assertEqual(chars, 200)
 
     def test_compatible_prefix_title_passes(self):
         # title 校验复用 title_compatible 语义：系列卷号形态放行
@@ -212,7 +212,7 @@ class TestEngineIdentityVerification(unittest.TestCase):
         text, chars = labeler.fetch_book_text_engine(
             cli, 'https://y/x',
             expect_title='斗罗大陆', expect_author='唐家三少')
-        self.assertEqual(chars, 202)
+        self.assertEqual(chars, 200)
 
     def test_author_form_difference_passes_verification(self):
         # author 校验用 _norm_author 归一化比对：国籍前缀写法差过
@@ -222,7 +222,7 @@ class TestEngineIdentityVerification(unittest.TestCase):
         text, chars = labeler.fetch_book_text_engine(
             cli, 'https://y/x',
             expect_title='冰与火之歌', expect_author='乔治·R·R·马丁')
-        self.assertEqual(chars, 202)
+        self.assertEqual(chars, 200)
 
 
 class TestBuildEngineCli(unittest.TestCase):
