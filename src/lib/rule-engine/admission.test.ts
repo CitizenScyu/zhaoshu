@@ -119,7 +119,7 @@ describe('滤网 2 searchAdmission 判定分桶', () => {
     expect(strongResult.verdict).toBe('challenge');
   });
 
-  // P1-2（复审裁定）：强标记先判会把正常 200 搜索页判成 challenge 终态（rejected 24h 不重测）。
+  // P1-2（复审裁定）：强标记先判会把正常 200 搜索页判成 challenge 终态（rejected 20h 不重测）。
   // 判定顺序改为「候选计数先于强标记」——有 ≥1 候选一律 ok，墙只在 403/503 或 0 候选+强标记成立。
   describe('P1-2 候选计数先于强标记（正常页不得判墙）', () => {
     const candidateHtml = (footer: string) =>
@@ -374,13 +374,13 @@ describe('准入状态机 runAdmissionBatch', () => {
     expect(admissionBucket('ok')).toBe('ok');
   });
 
-  it('deferred 每 24h 重测：超窗复测转 ok，未超窗不重测', async () => {
+  it('deferred 定期重测：超窗复测转 ok，未超窗不重测', async () => {
     const url = 'https://retry.example.com';
     const source = syntheticSource('https://retry.example.com/');
     const hash = rulesHash(source);
     const fetchPage = vi.fn<AdmissionTransport>().mockResolvedValue(
       page('<div class="i"><span class="t">书名</span><a href="/b/1">x</a></div>'));
-    // 未超窗：24h 内不重测。
+    // 未超窗：60min 内不重测。
     const fresh = new Map([[url, sourceRow(url, {
       compile_ok: true, rules_hash: hash, search_ok: false, search_verdict: 'http_5xx',
       search_checked_at: new Date(Date.now() - 60 * 60 * 1000).toISOString(),
@@ -404,6 +404,34 @@ describe('准入状态机 runAdmissionBatch', () => {
     expect(retested.probed).toBe(1);
     expect(retested.rows[0]).toMatchObject({ search_ok: true, search_verdict: 'ok' });
     expect(Date.parse(retested.rows[0].search_checked_at!)).toBeGreaterThan(Date.now() - ADMISSION_RETEST_INTERVAL_MS);
+  });
+
+  it('复测窗 20h 边界：19h 不重测、21h 重测（防 cron 分钟级抖动推迟整周期）', async () => {
+    const url = 'https://window.example.com';
+    const source = syntheticSource('https://window.example.com/');
+    const hash = rulesHash(source);
+    const mkExisting = (hoursAgo: number) => new Map([[url, sourceRow(url, {
+      compile_ok: true, rules_hash: hash, search_ok: false, search_verdict: 'http_5xx',
+      search_checked_at: new Date(Date.now() - hoursAgo * 3_600_000).toISOString(),
+    })]]);
+
+    // 19h：仍在 20h 窗内，fetchPage 不被调用。
+    const within = await runAdmissionBatch({
+      candidates: [{ url, source }], declaredHosts: new Set(['window.example.com']),
+      existing: mkExisting(19), fetchPage: vi.fn<AdmissionTransport>(), signal: signal(), throttleMs: 0,
+    });
+    expect(within.rows).toHaveLength(0);
+    expect(within.probed).toBe(0);
+
+    // 21h：已超 20h 窗，触发复测。
+    const beyond = await runAdmissionBatch({
+      candidates: [{ url, source }], declaredHosts: new Set(['window.example.com']),
+      existing: mkExisting(21), fetchPage: vi.fn<AdmissionTransport>().mockResolvedValue(
+        page('<div class="i"><span class="t">书名</span><a href="/b/1">x</a></div>')),
+      signal: signal(), throttleMs: 0,
+    });
+    expect(beyond.probed).toBe(1);
+    expect(beyond.rows[0]).toMatchObject({ search_ok: true, search_verdict: 'ok' });
   });
 
   it('compile 拒是终态：规则未变不复测、不重写；规则变才重跑滤网 1', async () => {
@@ -770,7 +798,7 @@ describe('准入状态机 runAdmissionBatch', () => {
       const s5Round1 = round1.rows.find((row) => row.source_url === 'https://s5.example.com');
       expect(s5Round1).toMatchObject({ compile_ok: true, search_ok: null });
 
-      // 轮 2（恰好 24h 后，deferred 全部到期）：未测优先 → s5（唯一 search_ok=null）先占名额。
+      // 轮 2（恰好 24h 后，deferred 全部到期——已远超 20h 窗）：未测优先 → s5（唯一 search_ok=null）先占名额。
       const round2 = await runOne();
       const probedHosts = fail.mock.calls.map(([input]) => new URL(String(input)).hostname);
       expect(probedHosts).toContain('s5.example.com');
@@ -791,7 +819,7 @@ describe('准入状态机 runAdmissionBatch', () => {
       const existing = new Map<string, AdmissionSourceRow>([
         ['https://a-old.example.com', mk('a-old.example.com', now - 72 * 3_600_000)], // 最旧
         ['https://b-mid.example.com', mk('b-mid.example.com', now - 48 * 3_600_000)],
-        ['https://c-new.example.com', mk('c-new.example.com', now - 25 * 3_600_000)], // 最新（刚过 24h 窗）
+        ['https://c-new.example.com', mk('c-new.example.com', now - 25 * 3_600_000)], // 最新（刚过 20h 复测窗）
         // d：未测（search_ok=null）——未测优先级最高，即使比到期者“新”。
         ['https://d-untested.example.com', sourceRow('https://d-untested.example.com', {
           tier: 'M1', compile_ok: true, search_ok: null, search_verdict: '', search_checked_at: null,

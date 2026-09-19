@@ -344,7 +344,7 @@ describe('/api/download recovery and cleanup', () => {
     expect(triggerDownloadWorkflow).not.toHaveBeenCalled();
   });
 
-  it.each(['pending', 'failed', 'partial'])('physically removes an owned %s row', async () => {
+  it.each(['pending', 'failed', 'partial', 'superseded_by_incomplete'])('physically removes an owned %s row', async () => {
     sql.mockResolvedValueOnce([{ id: recoveredTask.id }]);
 
     const res = await DELETE(request('DELETE', { taskId: recoveredTask.id }));
@@ -352,7 +352,7 @@ describe('/api/download recovery and cleanup', () => {
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual({ ok: true });
     expect(sql).toHaveBeenCalledOnce();
-    expect(queryText(0)).toMatch(/^DELETE FROM download_tasks WHERE id = \? AND user_id = \? AND status IN \('pending', 'failed', 'partial'\) RETURNING id$/);
+    expect(queryText(0)).toMatch(/^DELETE FROM download_tasks WHERE id = \? AND user_id = \? AND status IN \('pending', 'failed', 'partial', 'superseded_by_incomplete'\) RETURNING id$/);
     expect(sql.mock.calls[0].slice(1)).toEqual([recoveredTask.id, 1]);
   });
 

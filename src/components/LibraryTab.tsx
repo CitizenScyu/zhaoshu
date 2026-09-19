@@ -31,7 +31,7 @@ interface DownloadTask {
   id: number;
   bookId: number;
   title: string;
-  status: 'pending' | 'running' | 'done' | 'failed' | 'partial';
+  status: 'pending' | 'running' | 'done' | 'failed' | 'partial' | 'superseded_by_incomplete';
   chaptersTotal: number;
   chaptersDone: number;
   charsTotal: number;
@@ -84,7 +84,7 @@ function parseTask(data: unknown): DownloadTask | null {
     id: t.id,
     bookId: Number(t.bookId) || 0,
     title: typeof t.title === 'string' ? t.title : '',
-    status: (['pending', 'running', 'done', 'failed', 'partial'] as const).includes(status as never)
+    status: (['pending', 'running', 'done', 'failed', 'partial', 'superseded_by_incomplete'] as const).includes(status as never)
       ? (status as DownloadTask['status'])
       : 'pending',
     chaptersTotal: Number(t.chaptersTotal) || 0,
@@ -108,6 +108,10 @@ function downloadStatusText(t: DownloadTask): string {
       const missing = Math.max(0, t.chaptersTotal - t.chaptersDone);
       return `未完成：已存 ${t.chaptersDone}/${t.chaptersTotal} 章${missing > 0 ? `，缺 ${missing} 章` : ''}，可重试补齐`;
     }
+    // 残缺终态（worker F03）：候选版本完整度过不了晋升校验，保留的是此前的完整版本；
+    // 删除后可重新下载（worker 只领 pending，不会被重捞，须用户手动重下）。
+    case 'superseded_by_incomplete':
+      return '新下载的版本不完整，已保留此前的完整版本；可删除任务后重新下载';
     case 'failed': return t.error?.trim() ? '下载失败' : '下载失败：未知原因';
   }
 }
@@ -397,7 +401,8 @@ export default function LibraryTab({ view, setView }: {
   }
 
   async function removeDownload() {
-    if (!task || dlBusy || (task.status !== 'pending' && task.status !== 'failed' && task.status !== 'partial')) return;
+    if (!task || dlBusy || (task.status !== 'pending' && task.status !== 'failed' && task.status !== 'partial'
+      && task.status !== 'superseded_by_incomplete')) return;
     const failureMessage = task.status === 'failed' ? '清理失败' : '取消失败';
     const my = ++dlRequestId.current;
     setDlBusy(true);
@@ -515,7 +520,7 @@ export default function LibraryTab({ view, setView }: {
                   <span
                     role="status"
                     className="text-sm"
-                    style={{ color: task.status === 'failed' || (task.status === 'running' && task.leaseExpired) ? 'var(--cinnabar)' : task.status === 'partial' ? 'var(--dai)' : 'var(--ink-soft)' }}
+                    style={{ color: task.status === 'failed' || (task.status === 'running' && task.leaseExpired) ? 'var(--cinnabar)' : task.status === 'partial' || task.status === 'superseded_by_incomplete' ? 'var(--dai)' : 'var(--ink-soft)' }}
                   >
                     {downloadStatusText(task)}
                   </span>
@@ -524,7 +529,7 @@ export default function LibraryTab({ view, setView }: {
                       取回文件
                     </button>
                   )}
-                  {(task.status === 'failed' || task.status === 'pending' || task.status === 'partial'
+                  {(task.status === 'failed' || task.status === 'pending' || task.status === 'partial' || task.status === 'superseded_by_incomplete'
                     || (task.status === 'running' && task.leaseExpired)) && (
                     <button
                       className="chip chip-dai text-sm disabled:opacity-50"
@@ -534,7 +539,8 @@ export default function LibraryTab({ view, setView }: {
                       {dlBusy ? '处理中…' : '重试'}
                     </button>
                   )}
-                  {(task.status === 'pending' || task.status === 'failed' || task.status === 'partial') && (
+                  {(task.status === 'pending' || task.status === 'failed' || task.status === 'partial'
+                    || task.status === 'superseded_by_incomplete') && (
                     <button className="chip text-sm" onClick={() => void removeDownload()} disabled={dlBusy}>
                       {task.status === 'pending' ? '取消' : '清理'}
                     </button>
@@ -543,7 +549,7 @@ export default function LibraryTab({ view, setView }: {
                 {taskNotes.length > 0 && (
                   <div className="border-l-2 pl-3" style={{ borderColor: 'var(--line)' }}>
                     <p className="text-xs font-bold mb-1" style={{ color: 'var(--ink-soft)' }}>
-                      {task.status === 'failed' ? '失败详情' : task.status === 'partial' ? '未完成详情（缺章 / 抽验）' : '抽验与提示'}
+                      {task.status === 'failed' ? '失败详情' : task.status === 'partial' || task.status === 'superseded_by_incomplete' ? '未完成详情（缺章 / 抽验）' : '抽验与提示'}
                     </p>
                     <ul
                       className="list-disc pl-4 space-y-1 text-xs leading-6 break-words"
