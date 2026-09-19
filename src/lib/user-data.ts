@@ -478,6 +478,48 @@ export function markProfileFeedbackAbsorbedUncheckedForUserQuery(sql: PersonalQu
     RETURNING pending_feedback_id`;
 }
 
+// R3：画像正文与队列水位原子提交。先锁租约行，再锁匹配版本的画像；失配不会进入写 CTE。
+// 吸收不修改 seeds，因此不需要种子审计；保留原内容未变化时不推进 updated_at 的 CAS 语义。
+// completed 依赖 updated，画像 CAS 失败时绝不推进水位；任一写入报错会整条语句回滚。
+export function completeProfileFeedbackForUserQuery(
+  sql: PersonalQuery, userId: number, candidate: number, status: string,
+  leaseToken: string, content: string, expectedUpdatedAt: string,
+) {
+  requireUserId(userId);
+  return sql`WITH lease AS MATERIALIZED (
+      SELECT user_id FROM profile_feedback_queue
+      WHERE user_id = ${userId} AND lease_token = ${leaseToken} FOR UPDATE
+    ), previous AS MATERIALIZED (
+      SELECT id, content, updated_at FROM profile
+      WHERE id = ${userId} AND updated_at::text = ${expectedUpdatedAt}
+        AND EXISTS (SELECT 1 FROM lease) FOR UPDATE
+    ), updated AS (
+      UPDATE profile SET content = ${content},
+        updated_at = CASE WHEN previous.content IS DISTINCT FROM ${content}
+          THEN GREATEST(clock_timestamp(), profile.updated_at + interval '1 microsecond')
+          ELSE profile.updated_at END
+      FROM previous
+      WHERE profile.id = previous.id AND profile.updated_at = previous.updated_at
+      RETURNING profile.updated_at::text AS updated_at
+    ), completed AS (
+      UPDATE profile_feedback_queue SET
+        absorbed_feedback_id = GREATEST(absorbed_feedback_id, ${candidate}),
+        pending_feedback_id = CASE WHEN pending_feedback_id IS NOT NULL AND pending_feedback_id <= ${candidate}
+          THEN NULL ELSE pending_feedback_id END,
+        status = CASE WHEN pending_feedback_id IS NOT NULL AND pending_feedback_id > ${candidate}
+          THEN ${'pending'} ELSE ${status} END,
+        attempts = attempts + 1, last_error = '', lease_token = '', lease_expires_at = NULL,
+        fail_count = 0, next_eligible_at = NULL, updated_at = now()
+      WHERE user_id = ${userId} AND lease_token = ${leaseToken}
+        AND EXISTS (SELECT 1 FROM updated)
+      RETURNING pending_feedback_id
+    ) SELECT CASE WHEN NOT EXISTS (SELECT 1 FROM lease) THEN 'lostLease'
+        WHEN NOT EXISTS (SELECT 1 FROM updated) THEN 'profileConflict'
+        ELSE 'matched' END AS outcome,
+      (SELECT updated_at FROM updated) AS updated_at,
+      (SELECT pending_feedback_id FROM completed) AS pending_feedback_id`;
+}
+
 // 退避档位读取：markProfileFeedbackFailedForUser 在 TS 侧算曲线（可测），SQL 只落数值。
 // race 说明：读 fail_count 与写失败之间若有人并发改写（同租约串行），最多差一档退避，
 // 不破坏「失败必有退避、成功清零」两个不变量。

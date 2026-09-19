@@ -3,6 +3,7 @@ import { initializeBusinessSchema } from '@/lib/business-schema';
 import { loadPGlite, type PGliteLike } from '@/lib/fixtures/pglite';
 import {
   claimProfileFeedbackForUserQuery,
+  completeProfileFeedbackForUserQuery,
   enqueueProfileFeedbackForUserQuery,
   markProfileFeedbackAbsorbedForUserQuery,
   markProfileFeedbackFailedForUserQuery,
@@ -228,5 +229,77 @@ maybe('真实 PostgreSQL：profile_feedback_queue 租约与退避（F15 残留�
     // 用户 2、3 已在前面用例里 absorbed（pending 清空）。
     expect(users).not.toContain(2);
     expect(users).not.toContain(3);
+  });
+
+  const prepareCommit = async (userId: number) => {
+    await pg.query('INSERT INTO users (id) VALUES ($1)', [userId]);
+    await pg.query(`INSERT INTO profile (id, seeds, content) VALUES ($1, $2::jsonb, '旧画像')`,
+      [userId, JSON.stringify([{ title: '合成种子', author: '合成作者' }])]);
+    const b = await book(`原子提交${userId}`);
+    const id = await feedback(userId, b, 'done', '喜欢严谨设定');
+    await enqueue(userId, id - 1, true);
+    await claim(userId, 'current-lease', 60_000);
+    const version = (await pg.query('SELECT updated_at::text AS version FROM profile WHERE id = $1', [userId])).rows[0].version as string;
+    return { id, version, bookId: b };
+  };
+  const complete = async (userId: number, candidate: number, version: string, token = 'current-lease', content = '新画像') =>
+    (await run(completeProfileFeedbackForUserQuery(baseTag as never, userId, candidate,
+      content === '旧画像' ? 'unchanged' : 'applied', token, content, version) as unknown as { text: string; params: unknown[] }))[0];
+
+  it('R3：租约已易主，旧执行者不能写画像或推进队列，即使画像 CAS 版本仍匹配', async () => {
+    const { id, version } = await prepareCommit(101);
+    const result = await complete(101, id, version, 'old-lease');
+    expect(result.outcome).toBe('lostLease');
+    expect((await pg.query('SELECT content, updated_at::text AS version FROM profile WHERE id=101')).rows[0])
+      .toEqual({ content: '旧画像', version });
+    expect(await queueRow(101)).toMatchObject({ pending_feedback_id: id, lease_token: 'current-lease', status: 'pending' });
+  });
+
+  it('R3：画像 CAS 失败时不推进水位、不释放当前租约', async () => {
+    const { id } = await prepareCommit(102);
+    expect((await complete(102, id, 'stale-version')).outcome).toBe('profileConflict');
+    expect((await pg.query('SELECT content FROM profile WHERE id=102')).rows[0].content).toBe('旧画像');
+    expect(await queueRow(102)).toMatchObject({ pending_feedback_id: id, lease_token: 'current-lease' });
+  });
+
+  it('R3：成功原子提交保留种子、推进画像版本，且不清掉吸收期间更高水位', async () => {
+    const { id, version, bookId } = await prepareCommit(103);
+    const newer = await feedback(103, bookId, 'dropped', '新增雷点');
+    await enqueue(103, id, true);
+    const result = await complete(103, id, version);
+    expect(result).toMatchObject({ outcome: 'matched', pending_feedback_id: newer });
+    expect(result.updated_at).not.toBe(version);
+    expect((await pg.query('SELECT content, seeds FROM profile WHERE id=103')).rows[0])
+      .toEqual({ content: '新画像', seeds: [{ title: '合成种子', author: '合成作者' }] });
+    expect(await queueRow(103)).toMatchObject({ status: 'pending', pending_feedback_id: newer, lease_token: '', fail_count: 0 });
+    expect((await pg.query('SELECT absorbed_feedback_id FROM profile_feedback_queue WHERE user_id=103')).rows[0].absorbed_feedback_id).toBe(id);
+  });
+
+  it('R3：模型原样返回时版本不变，队列仍正常完成', async () => {
+    const { id, version } = await prepareCommit(104);
+    expect(await complete(104, id, version, 'current-lease', '旧画像'))
+      .toMatchObject({ outcome: 'matched', updated_at: version, pending_feedback_id: null });
+    expect(await queueRow(104)).toMatchObject({ status: 'unchanged', pending_feedback_id: null, lease_token: '' });
+  });
+
+  it('R3：画像写入后队列提交失败，整个事务回滚画像与水位', async () => {
+    const { id, version } = await prepareCommit(105);
+    await pg.exec(`CREATE FUNCTION reject_review_completion() RETURNS trigger LANGUAGE plpgsql AS $$
+      BEGIN
+        IF NEW.user_id = 105 AND NEW.status = 'applied' THEN
+          RAISE EXCEPTION 'synthetic completion failure';
+        END IF;
+        RETURN NEW;
+      END $$;
+      CREATE TRIGGER reject_review_completion BEFORE UPDATE ON profile_feedback_queue
+        FOR EACH ROW EXECUTE FUNCTION reject_review_completion();`);
+    try {
+      await expect(complete(105, id, version)).rejects.toThrow('synthetic completion failure');
+      expect((await pg.query('SELECT content, updated_at::text AS version FROM profile WHERE id=105')).rows[0])
+        .toEqual({ content: '旧画像', version });
+      expect(await queueRow(105)).toMatchObject({ pending_feedback_id: id, lease_token: 'current-lease', status: 'pending' });
+    } finally {
+      await pg.exec('DROP TRIGGER reject_review_completion ON profile_feedback_queue; DROP FUNCTION reject_review_completion();');
+    }
   });
 });
