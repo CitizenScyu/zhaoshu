@@ -31,6 +31,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
+import douban_list
+
 # ---- 配置 ----
 TARGET_CHARS = 500_000      # 每本抓取字数上限
 CHUNK_RETRY = 3             # 单章抓取重试
@@ -609,6 +611,72 @@ def fetch_book_text(detail_url: str, target_chars: int = TARGET_CHARS,
     return '\n\n'.join(parts), chars
 
 
+# ---- 引擎源取正文（T5：book15 miss 回落的引擎源，走 engine-fetch.mjs CLI）----
+# 队列条目带 engine=True 的书不走 BookSource 适配器（那是 book15 站点结构），
+# 改调 engine CLI：toc 拿章节清单 → 逐章 content → 拼接。正文**不过 clean_chapter_text**
+# （引擎 engineFetchContent 已抽干净文本；调研 §4：多源正文优先引擎结果，少依赖 book15
+# 结构的 Python 清洗）。产出与 fetch_book_text 同构：'【章节标题】\n正文'。
+def _engine_json(engine_cli, subcommand: str, *args: str) -> dict:
+    """调引擎 CLI 子命令并解析 JSON stdout；非零退出 → RuntimeError（脱敏摘要）。
+
+    凭据红线：stderr 不原样透传——只留单行化 + 截断的错误摘要（CLI 侧另有 safeReason）。"""
+    proc = engine_cli.run(subcommand, *args)
+    if proc.returncode != 0:
+        summary = ' '.join((proc.stderr or '').split())[:200]
+        raise RuntimeError(f'引擎 {subcommand} 失败 rc={proc.returncode}: {summary}')
+    return json.loads(proc.stdout)
+
+
+def fetch_book_text_engine(engine_cli, book_url: str,
+                           target_chars: int = TARGET_CHARS) -> tuple[str, int]:
+    """引擎源整本（到字数上限）→ (拼接文本, 实际字数)。
+
+    toc 失败（无章 / 环境错误，CLI 退出码非 0）→ 抛异常，交主循环计失败（不静默产空文本）。
+    单章 content 失败（重试后仍空）跳过，隔离不拖垮整本；target_chars/CHUNK_RETRY/CHAPTER_DELAY
+    与 book15 路径沿用同一常量。"""
+    toc = _engine_json(engine_cli, 'toc', '--url', book_url)
+    chapters = toc.get('chapters') or []
+    parts, chars = [], 0
+    for ch in chapters:
+        if chars >= target_chars:
+            break
+        ch_url = ch.get('url') or ''
+        title = (ch.get('title') or '').strip()
+        if not ch_url:
+            continue
+        text = ''
+        for attempt in range(CHUNK_RETRY):
+            try:
+                text = _engine_json(engine_cli, 'content', '--url', ch_url).get('text') or ''
+                break
+            except Exception:
+                time.sleep(2 * (attempt + 1))
+        if len(text) > 100:
+            parts.append(f'【{title}】\n{text}')
+            chars += len(text)
+        time.sleep(CHAPTER_DELAY)
+    return '\n\n'.join(parts), chars
+
+
+def _build_engine_cli(env: dict):
+    """按 .env 装配 EngineCli；开关关闭或必要配置缺失 → 返回 None（降级 book15-only）。
+
+    需三者齐备：LABELER_ENGINE_FALLBACK=1 + LABELER_ENGINE_CLI（engine-fetch.mjs 绝对路径）
+    + DATABASE_URL。node 路径由 LABELER_ENGINE_NODE 覆盖（默认 'node'）。
+    凭据红线：DATABASE_URL 只交给 EngineCli 经子进程 env 注入，不打印。"""
+    if not douban_list.engine_fallback_enabled(env):
+        return None
+    cli_path = (env.get('LABELER_ENGINE_CLI') or '').strip()
+    database_url = env.get('DATABASE_URL') or ''
+    if not cli_path or not database_url:
+        print('  提示: LABELER_ENGINE_FALLBACK 已开，但缺 LABELER_ENGINE_CLI 或 '
+              'DATABASE_URL，本轮降级 book15-only')
+        return None
+    node = (env.get('LABELER_ENGINE_NODE') or 'node').strip() or 'node'
+    return douban_list.EngineCli(node=node, script_path=cli_path,
+                                 database_url=database_url)
+
+
 # ---- 打标层（将来可整体搬进主应用）----
 SEGMENT_CHARS = 250_000  # 每段字数上限（~160k tokens，远离 CF 100s prefill 死区）
 
@@ -816,6 +884,10 @@ def main() -> int:
     # 读模块常量本意是「改常量即调参/关闸（0 或负数关闭）」，这里保持这个语义。
     pinned = terminal_urls(rejection_counts, REJECT_TERMINAL_THRESHOLD)
 
+    # T5 引擎兜底 CLI：仅 douban/webnovel 名单线用（下方分支按 .env 装配）；
+    # rank / --book 线保持 None，取正文只走 book15，行为不变。
+    engine_cli = None
+
     # 自动导入：打标完一本即写库（见文件头「入库层」）。启用与否由 .env 决定；
     # --book 是人工调试模式（无站点书名、身份证据弱），不进自动导入。
     importer = None
@@ -843,7 +915,6 @@ def main() -> int:
         if args.source in ('douban', 'webnovel'):
             # 名单选书：豆瓣网文 tag / 网文站榜单 → book15 站内搜索（含误匹配校验）。
             # 产出与 fetch_rank_books() 同构，后续打标循环零改动复用。
-            import douban_list
             print('拉取名单并搜索 book15...')
             # 桥接：名单源（豆瓣/起点）传完整 URL，book15 搜索侧传站内相对路径。
             bridged = lambda path: http_get(BOOK15.absolute(path))
@@ -852,11 +923,17 @@ def main() -> int:
             skip_titles = douban_list.load_done_titles(data_path('labels.jsonl'))
             # 豆瓣翻页默认 1 页；.env 里 LABELER_DOUBAN_PAGES=3 才开 3 页（审查 D.3）。
             pages = douban_list.resolve_douban_pages(env)
+            # T5 引擎兜底：book15 miss 才回落引擎源池（开关默认关，配置缺失自动降级）。
+            engine_cli = _build_engine_cli(env)
+            if engine_cli is not None:
+                print('  引擎兜底已启用：book15 miss 将回落引擎源池')
             all_books = (douban_list.build_douban_queue(
-                             bridged, skip_titles=skip_titles, pages=pages)
+                             bridged, skip_titles=skip_titles, pages=pages,
+                             engine_cli=engine_cli)
                          if args.source == 'douban'
                          else douban_list.build_webnovel_queue(
-                             bridged, skip_titles=skip_titles, pages=pages))
+                             bridged, skip_titles=skip_titles, pages=pages,
+                             engine_cli=engine_cli))
             print(f'{args.source} 线共 {len(all_books)} 本（搜索命中后）')
         else:
             print('拉取榜单书目...')
@@ -877,8 +954,11 @@ def main() -> int:
 
     if args.dry_run:
         for b in queue:
+            # 引擎兜底命中的条目标注来源 host，便于人工核对多源供给。
+            engine_tag = f' | 引擎源:{b.get("source_host")}' if b.get('engine') else ''
             print(' -', b.get('title'), '|', b.get('author', '?'), '|',
-                  b.get('category', '?'), '|', b.get('status', '?'), '|', b['url'])
+                  b.get('category', '?'), '|', b.get('status', '?'), '|',
+                  b['url'], engine_tag)
         return 0
 
     ok = fail = 0
@@ -886,7 +966,12 @@ def main() -> int:
     for i, b in enumerate(queue, 1):
         print(f'[{i}/{len(queue)}] {b.get("title")} ...')
         try:
-            text, chars = fetch_book_text(b['url'])
+            # 引擎兜底条目走 CLI 取正文（toc/content，不过 clean_chapter_text）；
+            # 其余走 book15 适配器路径，行为不变。
+            if b.get('engine'):
+                text, chars = fetch_book_text_engine(engine_cli, b['url'])
+            else:
+                text, chars = fetch_book_text(b['url'])
             if chars < 10_000:
                 print(f'  仅抓到 {chars} 字，跳过')
                 reject = {
@@ -952,15 +1037,17 @@ def main() -> int:
                 fail += 1
                 time.sleep(LLM_INTERVAL_SEC)
                 continue
+            # 引擎兜底条目：source 记引擎源 host（如 www.yingsx.com）、url 记引擎源 bookUrl
+            # （已是绝对，BOOK15.absolute 对 http 开头原样透传）；book15 条目现状不变。
+            is_engine = bool(b.get('engine'))
             b_out = {
                 'title': labels.get('title_guess') or b.get('title', ''),
                 'site_title': site_title,
                 'author': b.get('author', ''),
                 'category': b.get('category', ''),
                 'status': b.get('status', ''),
-                'source': BOOK15.name,
-                # 名单线选出的书记录来源标记，便于与榜单线的产出区分；
-                # 正文仍抓自 book15，source 语义不变。
+                'source': (b.get('source_host') or BOOK15.name) if is_engine else BOOK15.name,
+                # 名单线选出的书记录来源标记，便于与榜单线的产出区分。
                 'selected_by': (args.source if args.source != 'rank' else 'book15-rank')
                                if not args.book else 'book15-rank',
                 'url': BOOK15.absolute(b['url']),
