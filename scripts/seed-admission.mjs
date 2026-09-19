@@ -14,7 +14,7 @@
 //
 // 凭据纪律：不打印 DATABASE_URL 或任何密钥；汇总只输出 host / verdict 计数。
 //
-// TS 加载：经 scripts/ts-esm-loader.mjs（esbuild ESM 钩子）import 仓库 TS——
+// TS 加载：经 scripts/ts-esm-loader.mjs（唯一 TS shim：esbuild 钩子，--import 与 register() 两用）import 仓库 TS——
 // 本仓库 tsconfig 是 bundler 目标，`node --experimental-strip-types` 无法加载 admission.ts
 // 的依赖图（@/ 别名 / 无扩展名相对导入 / TS 参数属性 / 跨模块类型导入）。
 

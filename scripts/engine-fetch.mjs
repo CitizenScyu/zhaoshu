@@ -2,10 +2,10 @@
 // 复用 M1 引擎库（rule-engine/api.ts 门面四函数）+ book15 内建适配器（source-parser），
 // 直接取书，不走 serverless、无 55s 限制。每次进程冷启，不做跨进程状态。
 //
-// 用法（labeler 逐级调用；`@/` 别名靠 ts-alias-hook.mjs，故必须带 --import）：
-//   node --import ./scripts/ts-alias-hook.mjs scripts/engine-fetch.mjs search  --title "斗破苍穹" [--author "天蚕土豆"] [--json]
-//   node --import ./scripts/ts-alias-hook.mjs scripts/engine-fetch.mjs toc     --url <bookUrl>    [--json]
-//   node --import ./scripts/ts-alias-hook.mjs scripts/engine-fetch.mjs content --url <chapterUrl> [--json]
+// 用法（labeler 逐级调用；`@/` 别名靠 ts-esm-loader.mjs，故必须带 --import）：
+//   node --import ./scripts/ts-esm-loader.mjs scripts/engine-fetch.mjs search  --title "斗破苍穹" [--author "天蚕土豆"] [--json]
+//   node --import ./scripts/ts-esm-loader.mjs scripts/engine-fetch.mjs toc     --url <bookUrl>    [--json]
+//   node --import ./scripts/ts-esm-loader.mjs scripts/engine-fetch.mjs content --url <chapterUrl> [--json]
 //   （env：--env <file> 或环境变量 DATABASE_URL；--env 剥引号，参照 backfill_quality.mjs）
 //
 // 退出码契约：0=有结果；1=无候选/无章/空正文（stderr 原因）；2=无法尝试（无 DATABASE_URL、

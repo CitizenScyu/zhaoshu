@@ -9,7 +9,7 @@ import { describe, expect, it } from 'vitest';
 const scriptsDir = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(scriptsDir, '..');
 // --import 需要 file:// URL：Windows 下裸绝对路径 `D:\...` 会被当成协议 `d:`（ERR_UNSUPPORTED_ESM_URL_SCHEME）。
-const hook = pathToFileURL(resolve(scriptsDir, 'ts-alias-hook.mjs')).href;
+const hook = pathToFileURL(resolve(scriptsDir, 'ts-esm-loader.mjs')).href;
 const cli = resolve(scriptsDir, 'engine-fetch.mjs');
 
 function run(args: string[], env: Record<string, string | undefined> = {}) {
