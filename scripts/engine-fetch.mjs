@@ -9,7 +9,7 @@
 //   （env：--env <file> 或环境变量 DATABASE_URL；--env 剥引号，参照 backfill_quality.mjs）
 //
 // 退出码契约：0=有结果；1=无候选/无章/空正文（stderr 原因）；2=无法尝试（无 DATABASE_URL、
-//   DB 不可达、参数/URL 非法；stderr 原因）。stdout 只放数据（--json 时单行 JSON）。
+//   DB 不可达、参数/URL 非法——含非 https:// scheme；stderr 原因）。stdout 只放数据（--json 时单行 JSON）。
 // 🔴 凭据红线：任何输出（stdout/stderr）不得包含 DATABASE_URL 或密钥（见 safeReason）。
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
@@ -160,6 +160,9 @@ async function cmdSearch(m, args) {
 }
 
 async function resolveSourceForUrl(m, url, signal) {
+  // 用法错先行：http:// 等非 https scheme 的 URL 属「参数/用法错」退 2（交回默认门也会拒，
+  // 但那会落进运行时兜底 code=1——与「无候选」同档，labeler 会误当正常 miss 重试整轮）。
+  if (!/^https:\/\//i.test(url)) throw new ExitError(2, '--url 非法：仅支持 HTTPS 完整地址');
   const host = hostOf(url);
   if (!host) throw new ExitError(2, `--url 非法：无法解析 host`);
   if (isBuiltinHost(m, host)) return { source: builtinSource(m), builtin: true };

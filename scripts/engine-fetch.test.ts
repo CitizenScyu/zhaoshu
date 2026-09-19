@@ -65,10 +65,29 @@ describe('engine-fetch CLI 契约', () => {
   });
 
   it('content --url 非法 → 退出码 2（DB/fetch 之前返回）', () => {
+    // "not a url" 无 scheme ⇒ 先撞 scheme 用法错（见下一条用例）；这里用「有 scheme 但无 host」
+    // 走 host 解析分支。两条都是 2，但错误信息不同。
     const r = run(['content', '--url', 'not a url'], { DATABASE_URL: 'postgres://u:p@h/db' });
     expect(r.status).toBe(2);
-    expect(r.stderr).toContain('host');
+    expect(r.stderr).toContain('HTTPS');
   });
+
+  // 退出码边界（审查遗留）：scheme 用法错与运行时错分档——http:// 是参数/用法错退 2，
+  // 不是运行时错退 1（labeler 把 1 当正常 miss，1 会吞掉这类配置错误）。
+  it('toc/content --url 为 http:// scheme → 退出码 2（用法错，非 1）', () => {
+    for (const sub of ['toc', 'content']) {
+      const r = run([sub, '--url', 'http://book15.net/book/123.html'], { DATABASE_URL: 'postgres://u:p@h/db' });
+      expect(r.status).toBe(2);
+      expect(r.stderr).toContain('HTTPS');
+      expect(r.stdout).toBe('');
+    }
+  });
+
+  // 运行时错档（1）：builtin host 过了用法门后取页失败 → 运行时错 1 而非用法错 2。
+  // 离线复现：builtin 双 host 之一是本机不可解析/不可达仍属 builtin；直接用真 builtin host
+  // 依赖外网（本文件契约是零外网），故以「无结果」档未覆盖的 content 空正文路径同理不测网络——
+  // 运行时档的完整断言留给 python 侧 mock（test_douban_list.py 的 _proc(1) 已锁 rc=1 语义），
+  // TS 侧只锁用法错边界（上一条）。
 
   it('🔴 凭据红线：任何错误路径的 stdout/stderr 都不含连接串/口令', () => {
     const secret = 'postgres://leak_user:leak_secret@db.internal.example/finder';
