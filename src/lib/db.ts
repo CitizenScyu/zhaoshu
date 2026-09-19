@@ -4,6 +4,7 @@ import { LLM_USAGE_PHASES, type LlmUsagePhase, type LlmUsageRecord, type TokenSt
 import { assertAuthSchema } from './auth-store';
 import { initializeBusinessSchema } from './business-schema';
 import type { PersonalWriter } from './personal-write';
+import { completeProfileFeedbackForUserQuery } from './user-data';
 import { requireUserId, profileForUserQuery, saveProfileForUserQuery, excludedBooksForUserQuery, persistRecommendationsForUserQueries, feedbackForUserQueries, feedbackSnapshotForUserQuery, recentInformativeFeedbackForUserQuery, withdrawnFeedbackBookTitlesForUserQuery, enqueueProfileFeedbackForUserQuery, profileFeedbackQueueForUserQuery, markProfileFeedbackAbsorbedForUserQuery, markProfileFeedbackFailedForUserQuery, markProfileFeedbackAbsorbedUncheckedForUserQuery, profileFeedbackFailCountForUserQuery, maxFeedbackIdForUserQuery, ensureProfileForUserQuery, claimProfileFeedbackForUserQuery, drainableProfileFeedbackUsersQuery, profileFeedbackBackoffMs } from './user-data';
 export { canonicalBookKey } from './book-identity';
 
@@ -270,16 +271,41 @@ export async function getProfileFeedbackQueueForUser(userId: number): Promise<Pr
 // 返回推进后仍待处理的反馈 id（null = 已清空）。吸收期间若又有新反馈把 pending 抬高，
 // 这里会看到更高的 id，调用方据此知道还没吸收干净。
 // leaseToken：完成提交前校验租约未易主（WHERE lease_token = token），租约过期被重领后
-// 迟到者写 0 行 → 返回 null 之外无法区分？不——这里仍返回 null，由调用方先比对
-// hasLease 再认定成功（见 profile-absorption.ts）。免 token 校验的旧调用（重建后推水位）
-// 传空串会落 0 行，故重建路径改走 markProfileFeedbackAbsorbedUncheckedForUser。
+// R3：明确区分租约失配（零行）与成功完成（pending 清空或仍有更高水位）。
+// 无租约的重建路径继续使用 markProfileFeedbackAbsorbedUncheckedForUser。
+export type ProfileFeedbackCompletion =
+  | { matched: false }
+  | { matched: true; pendingFeedbackId: number | null };
+
 export async function markProfileFeedbackAbsorbedForUser(
   userId: number, candidate: number, status: string, write: PersonalWriter, leaseToken = '',
-): Promise<number | null> {
+): Promise<ProfileFeedbackCompletion> {
   requireUserId(userId);
   if (typeof write !== 'function') throw new Error('authorized writer is required');
   const rows = (await write((sql) => [markProfileFeedbackAbsorbedForUserQuery(sql, userId, candidate, status, leaseToken)]))[0] as { pending_feedback_id: number | null }[];
-  return rows[0]?.pending_feedback_id ?? null;
+  return rows.length === 0 ? { matched: false } : { matched: true, pendingFeedbackId: rows[0].pending_feedback_id };
+}
+
+export type ProfileFeedbackCommit =
+  | { outcome: 'lostLease' }
+  | { outcome: 'profileConflict' }
+  | { outcome: 'matched'; updatedAt: string; pendingFeedbackId: number | null };
+
+export async function completeProfileFeedbackForUser(
+  userId: number, candidate: number, status: string, content: string, expectedUpdatedAt: string,
+  write: PersonalWriter, leaseToken: string,
+): Promise<ProfileFeedbackCommit> {
+  requireUserId(userId);
+  if (!expectedUpdatedAt.trim()) throw new Error('profile version is required');
+  if (!leaseToken) throw new Error('lease token is required');
+  if (typeof write !== 'function') throw new Error('authorized writer is required');
+  const rows = (await write((sql) => [completeProfileFeedbackForUserQuery(
+    sql, userId, candidate, status, leaseToken, content, expectedUpdatedAt,
+  )]))[0] as { outcome: 'lostLease' | 'profileConflict' | 'matched'; updated_at: string; pending_feedback_id: number | null }[];
+  const row = rows[0];
+  if (!row || row.outcome === 'lostLease') return { outcome: 'lostLease' };
+  if (row.outcome === 'profileConflict') return { outcome: 'profileConflict' };
+  return { outcome: 'matched', updatedAt: row.updated_at, pendingFeedbackId: row.pending_feedback_id };
 }
 
 // 迁移兼容：候选上界推进（/api/profile 重建成功后推水位、pglite 测试替身等旧路径）不持有

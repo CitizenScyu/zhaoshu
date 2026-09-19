@@ -1,6 +1,7 @@
 import type { PersonalWriter } from './personal-write';
 import {
   claimProfileFeedbackForUser,
+  completeProfileFeedbackForUser,
   ensureProfileForUser,
   getProfileFeedbackQueueForUser,
   getProfileForUser,
@@ -8,7 +9,6 @@ import {
   getWithdrawnFeedbackBookTitlesForUser,
   markProfileFeedbackAbsorbedForUser,
   markProfileFeedbackFailedForUser,
-  saveProfileForUser,
 } from './db';
 import { chatRobust, validateProfileContent } from './llm';
 import { recordUsageAfterResponse } from './record-llm-usage';
@@ -97,7 +97,9 @@ export async function absorbPendingProfileFeedback(deps: {
 
   // 既无有效反馈、也无撤回信号：这次 pending 对画像零影响，直接推进水位（不调模型）。
   if (!feedback.length && !withdrawn.length) {
-    const pendingFeedbackId = await markProfileFeedbackAbsorbedForUser(userId, candidate, 'unchanged', write, leaseToken);
+    const completion = await markProfileFeedbackAbsorbedForUser(userId, candidate, 'unchanged', write, leaseToken);
+    if (!completion.matched) return { status: 'conflict', pendingFeedbackId: candidate };
+    const { pendingFeedbackId } = completion;
     return { status: pendingFeedbackId == null ? 'unchanged' : 'pending', pendingFeedbackId };
   }
 
@@ -108,17 +110,20 @@ export async function absorbPendingProfileFeedback(deps: {
       { temperature: 0.3, signal, onUsage: recordUsageAfterResponse('feedback'), totalTimeoutMs: modelBudgetMs },
     );
     const content = validateProfileContent(raw);
-    const updatedAt = await saveProfileForUser(userId, profile.seeds, content, profile.updatedAt, write);
-    if (!updatedAt) {
+    const applied = content !== profile.content;
+    // R3：同一事务先锁定租约，画像 CAS 与队列推进一起提交，旧租约不能先写画像。
+    const completion = await completeProfileFeedbackForUser(
+      userId, candidate, applied ? 'applied' : 'unchanged', content, profile.updatedAt, write, leaseToken,
+    );
+    if (completion.outcome === 'lostLease') {
+      return { status: 'conflict', pendingFeedbackId: candidate };
+    }
+    if (completion.outcome === 'profileConflict') {
       // 其他写入者先改了画像：不覆盖，保留 pending 下次重放（旧实现这里会永久丢失）。
       await markProfileFeedbackFailedForUser(userId, 'conflict', 'ProfileConflict', write, leaseToken).catch(() => {});
       return { status: 'conflict', pendingFeedbackId: candidate };
     }
-    // 种子原样回传，"内容变了"就是这次真的改动了画像；CAS 命中不等于画像变了（模型可能原样返回）。
-    const applied = content !== profile.content;
-    // 提交带 lease_token：租约过期被重领（drain）时这里是 0 行、返回 null——按失败处理
-    // （水位已由新持有者负责），本执行者不再声称 applied。
-    const pendingFeedbackId = await markProfileFeedbackAbsorbedForUser(userId, candidate, applied ? 'applied' : 'unchanged', write, leaseToken);
+    const { pendingFeedbackId, updatedAt } = completion;
     return {
       // 吸收期间若又有新反馈把水位抬高，pendingFeedbackId 非空，状态如实回到 pending。
       status: pendingFeedbackId == null ? (applied ? 'applied' : 'unchanged') : 'pending',
