@@ -6,7 +6,7 @@ import { ensureSchema, getSql } from '@/lib/db';
 import { triggerDownloadWorkflow } from '@/lib/github';
 import { boundedPositiveInteger, readJsonBody, RequestBodyError } from '@/lib/http';
 import { isLeaseExpired, reclaimStaleTasks, type DownloadSql } from '@/lib/download-task-reclaim';
-import { SourcePolicyError, validateSourceUrl } from '@/lib/source-policy';
+import { SourcePolicyError, SUPPORTED_SOURCE_HOSTS, validateSourceUrl } from '@/lib/source-policy';
 
 // 书库下载任务:GET 查任务(最近 20 条 / 单条 / 按书查本人最新一条)、POST 建任务、
 // DELETE 取消 pending/清理 failed/partial。GET 保持只读，过期租约由 POST 与 cron 回收。
@@ -168,6 +168,13 @@ export async function POST(req: NextRequest) {
     } catch (error) {
       if (!(error instanceof SourcePolicyError)) throw error;
       return authJson({ error: error.message, code: 'UNSUPPORTED_SOURCE' }, { status: 400 });
+    }
+    // 下载能力门（M2-4）：运行时门（validateSourceUrl 读 supportedHosts）可能已并入引擎档 host
+    // ——阅读侧放行，但下载 worker 只认 builtin 适配器。此处按内建 host 集合二次收窄，让引擎源
+    // 「可读不可下」，避免主应用放行、worker 拒绝的半开状态稳定贡献假失败率。必须在任何写库 /
+    // dispatch 之前拒绝；message 与 URL 非法报错区分，别混成同一个报错丢诊断信息。
+    if (!(SUPPORTED_SOURCE_HOSTS as readonly string[]).includes(new URL(sourceUrl).hostname)) {
+      return authJson({ error: '该来源暂不支持全书下载', code: 'UNSUPPORTED_SOURCE' }, { status: 400 });
     }
     // 直接重试也先回收，避免必须先打开详情页查询才能解除僵尸任务的防重锁。
     await reclaimStaleTasks(sql);
