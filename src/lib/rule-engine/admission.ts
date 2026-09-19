@@ -78,6 +78,18 @@ const REQUIRED_FIELDS = [
 ] as const;
 
 /**
+ * 引擎内置默认值可覆盖的字段（对齐 legado 语义）：规则缺失时引擎仍能产出有效值，
+ * 准入必需组的缺位判据据此放宽为「显式规则存在 ∨ 引擎默认可产」。
+ * 目前仅 ruleToc.chapterUrl —— legado BookChapterList.kt:230-244（取证快照
+ * Jer-Chao@c2c4775 / vvb2060@5a65aa42，摘录见 docs/legado-semantics/）在规则
+ * 缺失/求值空时用当前目录页 URL 兜底，api.ts engineFetchToc 已实现同款。
+ * 注意这只覆盖「规则不存在」；规则存在但编译不过（例 @baseUrl）仍走 failures 拒，
+ * failures.length === 0 这一条不放松。非 URL 字段（name/content）legado 无默认
+ * （BookList.kt:220 / BookContent.kt:179），不得加入本集合。
+ */
+const ENGINE_DEFAULT_FIELDS = new Set<string>(['ruleToc.chapterUrl']);
+
+/**
  * 滤网 1：规则可解释（设计 §4.1）。survey 初筛（HTTPS 源 URL、纯 GET 搜索模板、
  * bookSourceType≠2、无 JS）+ 对全部核心字段跑 compile；任一核心字段
  * RULE_UNSUPPORTED → 拒。装饰字段不阻断（本层只看核心字段）。
@@ -105,8 +117,10 @@ export function compileAdmission(source: RawSource): AdmissionCompile {
       failures.push({ field, rule, message });
     }
   }
-  // N03：必需组缺位（mask=false 即规则不存在或不可编译）→ 拒，reason 落字段名。
-  const missing = REQUIRED_FIELDS.filter((field) => !coreFieldMask[field]);
+  // 必需组缺位判据（准入兼容 L2）：从「显式规则存在」升级为「显式规则存在或引擎默认可产」
+  // （ENGINE_DEFAULT_FIELDS，对齐 legado「URL 类规则缺失 → 当前页 URL」语义）。
+  // 规则存在但编译不过的仍走 failures 拒（上面那段），本判据只放宽「缺位」。
+  const missing = REQUIRED_FIELDS.filter((f) => !coreFieldMask[f] && !ENGINE_DEFAULT_FIELDS.has(f));
   const ok = failures.length === 0 && missing.length === 0;
   const reason = failures.length > 0
     ? failures.map((f) => `${f.field}: ${f.message}`).join('; ').slice(0, 200)

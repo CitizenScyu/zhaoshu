@@ -111,7 +111,12 @@ export async function engineFetchToc(
       for (let index = 0; index < nodes.length; index += 1) {
         const inner = insideNode(scope, nodes[index]);
         const title = evaluateText(source.compiled, 'ruleToc.chapterName', inner);
-        const chapterUrl = absoluteUrl(evaluateText(source.compiled, 'ruleToc.chapterUrl', inner), page.url);
+        // legado BookChapterList.kt:230-244（Jer-Chao@c2c4775 / vvb2060@5a65aa42，取证见
+        // docs/legado-semantics/）：URL 类规则缺失或求值为空 → 章节 url 取当前目录页 URL
+        // （baseUrl）。只有这两种情况落兜底；规则产出非空但过不了 host 门的 URL 一律丢弃
+        // （absoluteUrl 返回 undefined），绝不洗成 page.url。
+        const rawUrl = evaluateText(source.compiled, 'ruleToc.chapterUrl', inner);
+        const chapterUrl = rawUrl.trim() ? absoluteUrl(rawUrl, page.url) : page.url;
         if (!title || title.length > MAX_TITLE_LENGTH || !chapterUrl || seenUrls.has(chapterUrl)) continue;
         seenUrls.add(chapterUrl);
         chapters.push({ url: chapterUrl, title });

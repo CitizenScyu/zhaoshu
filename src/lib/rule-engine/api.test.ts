@@ -92,6 +92,83 @@ describe('引擎门面四函数（M1 任务 4 §7.1）', () => {
   });
 });
 
+// ---------------------------------------------------------------- 准入兼容 L1（admission-compat §3.1 反例 2-6）
+// legado 语义（BookChapterList.kt:230-244，取证见 docs/legado-semantics/）：
+// ruleToc.chapterUrl 缺失或求值空 → 章节 url 取当前目录页 URL（baseUrl），不是 href 回退。
+// 反例要求「尖锐」：mock 里 page.url ≠ source.url ≠ tocUrl，否则「取的是页 URL」没被钉死。
+describe('chapterUrl 缺失/求值空 → 取当前目录页 URL（legado baseUrl 兜底）', () => {
+  // page.url（跳转后的目录页）与 source.url、tocUrl 都不同——兜底值必须取前者。
+  // 调用方传 toc-in（模拟跳转前），context.page 返回 toc-real（跳转后的真实 URL）。
+  const tocUrl = 'https://book15.net/toc-in/1.html'; // 调用方传入
+  const pageUrl = 'https://book15.net/toc-real/1.html'; // page() 实际返回（含跳转后）
+
+  function fakeRedirectContext(pages: Map<string, string>): SourceRequestContext {
+    // 引擎用 tocUrl 作 key 请求；页面真实 URL 是重定向后的 pageUrl（更尖锐的 mock）。
+    return {
+      page: async (url: string) => {
+        const text = pages.get(url === tocUrl ? pageUrl : url);
+        if (text === undefined) throw new Error('Unexpected engine request: ' + url);
+        return { url: url === tocUrl ? pageUrl : url, text };
+      },
+    } as unknown as SourceRequestContext;
+  }
+
+  function defaultTocSource(ruleToc: Record<string, unknown>): EngineSource {
+    const merged = { ...rules, ruleToc: { ...rules.ruleToc, ...ruleToc } };
+    return {
+      url: 'https://book15.net/engine/', name: '引擎源', searchUrl: SEARCH_URL,
+      compiled: compileSource({ url: 'https://book15.net/engine/', searchUrl: SEARCH_URL, rules: merged }),
+    };
+  }
+
+  it('反例 2：缺 chapterUrl、chapterList 命中 div、chapterName 有文本 → 非空，url=page.url', async () => {
+    const pages = new Map([[pageUrl,
+      '<div class="chapter"><h3>第一章 标题</h3></div><div class="chapter"><h3>第二章 标题</h3></div>']]);
+    const src = defaultTocSource({ chapterList: '.chapter', chapterName: 'h3@text', chapterUrl: undefined });
+    const result = await engineFetchToc(src, tocUrl, fakeRedirectContext(pages));
+    expect(result.chapters).toEqual([{ url: pageUrl, title: '第一章 标题' }]);
+  });
+
+  it('反例 3：chapterUrl 存在但求值空（@href 命中无 href 属性的节点）→ 同样回退 page.url', async () => {
+    const pages = new Map([[pageUrl, '<div class="chapter"><h3>第一章</h3><a>无链接</a></div>']]);
+    const src = defaultTocSource({ chapterList: '.chapter', chapterName: 'h3@text' });
+    const result = await engineFetchToc(src, tocUrl, fakeRedirectContext(pages));
+    expect(result.chapters).toEqual([{ url: pageUrl, title: '第一章' }]);
+  });
+
+  it('反例 4：chapterUrl 求值出 host 门外的绝对 URL → 丢弃，不静默洗成 page.url', async () => {
+    const pages = new Map([[pageUrl,
+      '<div class="chapter"><h3>第一章</h3><a href="https://evil.invalid/c/1.html">x</a></div>']]);
+    const src = defaultTocSource({ chapterList: '.chapter', chapterName: 'h3@text' });
+    const result = await engineFetchToc(src, tocUrl, fakeRedirectContext(pages));
+    expect(result.chapters).toEqual([]); // h3@text 有值但节点无 href 语义，evil 链接被丢
+  });
+
+  it('反例 5：兜底后多节点同 url → 按 url 去重只剩 1 章（legado LinkedHashSet 同结果）', async () => {
+    const pages = new Map([[pageUrl,
+      '<div class="chapter"><h3>第一章</h3></div><div class="chapter"><h3>第二章</h3></div><div class="chapter"><h3>第三章</h3></div>']]);
+    const src = defaultTocSource({ chapterList: '.chapter', chapterName: 'h3@text' });
+    const result = await engineFetchToc(src, tocUrl, fakeRedirectContext(pages));
+    expect(result.chapters).toHaveLength(1);
+    expect(result.chapters[0].url).toBe(pageUrl);
+  });
+
+  it('反例 6：nextTocUrl 翻页时缺 chapterUrl → 每页兜底值是该页的 page.url，不是首页 tocUrl', async () => {
+    const page2 = 'https://book15.net/toc-real/2.html';
+    const pages = new Map([
+      [pageUrl, '<div class="chapter"><h3>第一章</h3></div><a class="next" href="/toc-real/2.html">下一页</a>'],
+      [page2, '<div class="chapter"><h3>第二章</h3></div>'],
+    ]);
+    const src = defaultTocSource({ chapterList: '.chapter', chapterName: 'h3@text', nextTocUrl: '.next@href' });
+    const result = await engineFetchToc(src, tocUrl, fakeRedirectContext(pages));
+    // 各页兜底值是该页 page.url（两页 URL 不同 ⇒ 不互相吞并），首页 tocUrl 不出现在结果里。
+    expect(result.chapters).toEqual([
+      { url: pageUrl, title: '第一章' },
+      { url: page2, title: '第二章' },
+    ]);
+  });
+});
+
 describe('导出面快照（M1 任务 4 v3 E5 结构断言）', () => {
   it('模块导出恰为门面四函数；admissionFetch / validateAdmissionUrl 不在其中', async () => {
     const moduleExports = Object.keys(await import('./api')).sort();
