@@ -544,6 +544,13 @@ export async function runAdmissionBatch(input: AdmissionBatchInput): Promise<Adm
     if (!compile.ok && !exempt) {
       compileRejected += 1;
       // 规则未变且上一轮已是 compile 拒 → 终态不重写（§4.2）。
+      // 准入兼容 §2.3 陷阱：这条终态去抖只在「仍然 compile 拒」时生效；引擎默认值救回的源
+      // 走 compile.ok===true 分支，既有行 search_ok===null ⇒ planProbeOrder 判 probeClass=0
+      // （未测优先）⇒ 下一轮即被探测并改写为 compile_ok=true。恢复回路全自动——
+      // **不需要数据迁移，不需要人工 SQL，也不需要清旧终态行**。同理，严禁把候选池
+      // （shuyuan.ts runAdmissionAfterRefresh 的 selectCandidates 过滤）改成「只喂
+      // compile_ok 的源」：那会让 compile 拒的源出评估环、上游补字段后永远回不了池
+      // （反例 15-17 钉死该回路）。
       if (previous && previous.rules_hash === hash && previous.compile_ok === false) continue;
       rows.push({
         source_url: candidate.url, tier: 'T7', compile_ok: false, core_field_mask: compile.coreFieldMask,
