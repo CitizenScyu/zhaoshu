@@ -114,7 +114,7 @@ describe('chapterUrl 缺失/求值空 → 取当前目录页 URL（legado baseUr
   }
 
   function defaultTocSource(ruleToc: Record<string, unknown>): EngineSource {
-    const merged = { ...rules, ruleToc: { ...rules.ruleToc, ...ruleToc } };
+    const merged = { ...rules, ruleToc: { ...(rules.ruleToc as Record<string, unknown>), ...ruleToc } };
     return {
       url: 'https://book15.net/engine/', name: '引擎源', searchUrl: SEARCH_URL,
       compiled: compileSource({ url: 'https://book15.net/engine/', searchUrl: SEARCH_URL, rules: merged }),

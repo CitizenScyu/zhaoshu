@@ -42,9 +42,20 @@ function syntheticSource(url: string, over: Partial<RawSource> = {}): RawSource 
 }
 
 describe('滤网 1 compileAdmission（纯本地）', () => {
-  it('174 源核心字段可解释 = 104（N03 必需组后新冻结数字；原 114 里 10 条缺 ruleToc.chapterUrl）', () => {
+  it('174 源有效规则判据下 compile-ok = 114（准入兼容 L2；原 N03 104 + 10 条缺 ruleToc.chapterUrl 由引擎默认救回）', () => {
     const ok = sources.filter((source) => compileAdmission(source).ok);
-    expect(ok.length).toBe(104);
+    expect(ok.length).toBe(114);
+    // 「靠引擎默认进池」可自查：救回的 10 条 reason 空、mask 里 chapterUrl=false。
+    const defaulted = ok.filter((source) => {
+      const result = compileAdmission(source);
+      return result.coreFieldMask['ruleToc.chapterUrl'] === false;
+    });
+    expect(defaulted).toHaveLength(10);
+    for (const source of defaulted) {
+      const result = compileAdmission(source);
+      expect(result.reason).toBe('');
+      expect(result.coreFieldMask['ruleToc.chapterUrl']).toBe(false);
+    }
   });
 
   it('未通过 survey 初筛（无 {{key}} 搜索模板）判 T7 拒，且不进 compile', () => {
@@ -298,15 +309,15 @@ describe('两把锁判别性用例（v3 E3 正例+负例）', () => {
 });
 
 describe('准入状态机 runAdmissionBatch', () => {
-  it('174 源一轮 mock 准入：104 compile-ok / 70 compile 拒，真实搜索 ≤5，未探测占位可续测', async () => {
+  it('174 源一轮 mock 准入：114 compile-ok / 60 compile 拒（L2 后冻结数字），真实搜索 ≤5，未探测占位可续测', async () => {
     const fetchPage = vi.fn<AdmissionTransport>().mockResolvedValue(page('<html><body>no results</body></html>'));
     const declaredHosts = new Set(sources.map((source) => new URL(source.bookSourceUrl).hostname));
     const result = await runAdmissionBatch({
       candidates: sources.map((source) => ({ url: new URL(source.bookSourceUrl).href.replace(/\/$/, ''), source })),
       declaredHosts, existing: new Map(), fetchPage, signal: signal(), throttleMs: 0,
     });
-    expect(result.compileOk).toBe(104);
-    expect(result.compileRejected).toBe(70);
+    expect(result.compileOk).toBe(114);
+    expect(result.compileRejected).toBe(60);
     expect(result.probed).toBe(5);
     expect(fetchPage).toHaveBeenCalledTimes(5);
     // 200 但 bookList 无候选 → no_result（deferred 桶，下轮可复测），不是 ok/rejected。
@@ -315,13 +326,16 @@ describe('准入状态机 runAdmissionBatch', () => {
       expect(admissionBucket(row.search_verdict)).toBe('deferred');
       expect(row.search_ok).toBe(false);
     }
-    // 全部 174 源都有行（104 通过 + 70 拒），未轮到的通过源写未测占位。
+    // 全部 174 源都有行（114 通过 + 60 拒），未轮到的通过源写未测占位。
     expect(result.rows).toHaveLength(174);
-    expect(result.rows.filter((row) => row.compile_ok && row.search_ok === null)).toHaveLength(99);
+    expect(result.rows.filter((row) => row.compile_ok && row.search_ok === null)).toHaveLength(109);
     for (const row of result.rows.filter((item) => !item.compile_ok)) {
       expect(row.tier).toBe('T7');
       expect(row.host).not.toBe('');
     }
+    // 救回的 10 条以 mask 可自查（url_defaulted 观测的本地口径）。
+    expect(result.rows.filter((row) => row.compile_ok
+      && row.core_field_mask['ruleToc.chapterUrl'] === false)).toHaveLength(10);
   });
 
   it('合成源覆盖六种分桶：ok / challenge / conn_fail / http_5xx / shell / url_invalid', async () => {
@@ -451,7 +465,8 @@ describe('准入状态机 runAdmissionBatch', () => {
       expect(result.tier).toBe('T7');
       expect(result.reason).toContain('缺少必需规则');
       expect(result.reason).toContain('ruleToc.chapterList');
-      expect(result.reason).toContain('ruleToc.chapterUrl');
+      // 准入兼容 L2：chapterUrl 已由引擎默认覆盖，缺位 reason 不再含它。
+      expect(result.reason).not.toContain('ruleToc.chapterUrl');
     });
 
     it('反例（批次层）：无 ruleToc 的源进 runAdmissionBatch 不再得 compile_ok=true/search 探测', async () => {
@@ -470,12 +485,34 @@ describe('准入状态机 runAdmissionBatch', () => {
       expect(result.rows[0].error).toContain('ruleToc.chapterList');
     });
 
-    it('单缺 chapterUrl（chapterList/chapterName 在）同样拒——174 池 10 条这类源是收紧对象', () => {
+    it('反例 12（准入兼容 L2）：单缺 chapterUrl（chapterList/chapterName 在）→ 引擎默认可产，不再拒', () => {
       const result = compileAdmission(syntheticSource('https://toc.example.com/', {
         ruleToc: { chapterList: '.toc@li', chapterName: 'a@text' },
       }));
-      expect(result.ok).toBe(false);
-      expect(result.reason).toContain('ruleToc.chapterUrl');
+      expect(result.ok).toBe(true);
+      expect(result.reason).toBe('');
+      expect(result.coreFieldMask['ruleToc.chapterUrl']).toBe(false); // 「靠默认进池」可自查
+    });
+
+    it('规则存在但编译不过（chapterUrl:"@baseUrl"）→ 仍拒（failures 路径不放松）；缺 chapterList/chapterName/content 仍拒（不在 ENGINE_DEFAULT_FIELDS）', () => {
+      const baseUrlRule = compileAdmission(syntheticSource('https://toc.example.com/', {
+        ruleToc: { chapterList: '.toc@li', chapterName: 'a@text', chapterUrl: '@baseUrl' },
+      }));
+      expect(baseUrlRule.ok).toBe(false);
+      expect(baseUrlRule.reason).toContain('特殊变量');
+
+      const noName = compileAdmission(syntheticSource('https://toc.example.com/', {
+        ruleToc: { chapterList: '.toc@li', chapterUrl: 'a@href' },
+      }));
+      expect(noName.ok).toBe(false);
+      expect(noName.reason).toContain('ruleToc.chapterName');
+
+      const noContent = compileAdmission(syntheticSource('https://toc.example.com/', {
+        ruleToc: { chapterList: '.toc@li', chapterName: 'a@text' },
+        ruleContent: { content: '##%%' }, // 编译不过：不走缺位分支，failures 拒
+      }));
+      expect(noContent.ok).toBe(false);
+      expect(noContent.reason).toContain('ruleContent.content');
     });
 
     it('完整规则照旧 ok；能力可选字段缺失不误杀', () => {
@@ -494,9 +531,11 @@ describe('准入状态机 runAdmissionBatch', () => {
 
   describe('N03 祖父条款：W1 现网 admitted 池不被新校验打回（红线）', () => {
     const url = 'https://pool.example.com';
-    // yingsx 形态：缺 chapterUrl 但其余齐——新校验会拒的存量形态。
+    // 准入兼容 L2 后「缺 chapterUrl」不再触发 compile 拒（引擎默认救回），祖父条款的
+    // 触发形态改为显式规则不可解释（@baseUrl，failures 路径不放松）——反例 10 要求，
+    // 否则整组退化失去保护力。
     const legacy = () => syntheticSource(url, {
-      ruleToc: { chapterList: '.toc@li', chapterName: 'a@text' },
+      ruleToc: { chapterList: '.toc@li', chapterName: 'a@text', chapterUrl: '@baseUrl' },
     });
     const admittedRow = (hash: string): [string, AdmissionSourceRow] => [url, sourceRow(url, {
       tier: 'M1', compile_ok: true, search_ok: true, search_verdict: 'ok',
@@ -512,7 +551,7 @@ describe('准入状态机 runAdmissionBatch', () => {
         existing: new Map([admittedRow(hash)]), fetchPage, signal: signal(), throttleMs: 0,
       });
       expect(result.grandfathered).toBe(1);
-      expect(result.compileOk).toBe(1); // 计入 ok（资格维持），不再占用 70 拒里
+      expect(result.compileOk).toBe(1); // 计入 ok（资格维持），不再占用 60 拒里
       expect(result.rows).toHaveLength(0); // 不重写——写库会把 compile_ok 打成 false，出池
       expect(fetchPage).not.toHaveBeenCalled(); // search 结论仍有效，无需复测
     });
@@ -526,7 +565,7 @@ describe('准入状态机 runAdmissionBatch', () => {
       });
       expect(result.grandfathered).toBe(0);
       expect(result.rows[0]).toMatchObject({ compile_ok: false, tier: 'T7' });
-      expect(result.rows[0].error).toContain('ruleToc.chapterUrl');
+      expect(result.rows[0].error).toContain('ruleToc.chapterUrl'); // failures 落到字段
     });
 
     it('既有行非 admitted（search_ok=false/null）→ 无豁免，新源无既有行更无豁免', async () => {
@@ -555,12 +594,12 @@ describe('准入状态机 runAdmissionBatch', () => {
       expect(fresh.rows[0].compile_ok).toBe(false);
     });
 
-    it('174 池现实核对：缺 chapterUrl 的 10 条若已有 admitted 行则维持，否则转拒', async () => {
+    it('174 池现实核对：缺 chapterUrl 的 10 条 L2 后直接 compile-ok（不再依赖祖父）；@baseUrl 形态才有维持/转拒分叉', async () => {
       // W1 四源 ruleToc 三件套齐（yingsx/jhssd 实测在池），走不到祖父分支；
-      // 此用例只验证混合批次里 admitted 与未 admitted 的缺 chapterUrl 源分别维持/转拒。
+      // 此用例验证混合批次里 admitted 的 @baseUrl 源维持、未 admitted 的缺 chapterUrl 源直接通过。
       const hashA = rulesHash(legacy());
       const b = syntheticSource('https://never-probed.example.com', {
-        ruleToc: { chapterList: '.toc@li', chapterName: 'a@text' },
+        ruleToc: { chapterList: '.toc@li', chapterName: 'a@text' }, // 缺 chapterUrl：L2 救回
       });
       const result = await runAdmissionBatch({
         candidates: [
@@ -569,11 +608,16 @@ describe('准入状态机 runAdmissionBatch', () => {
         ],
         declaredHosts: new Set(['pool.example.com', 'never-probed.example.com']),
         existing: new Map([admittedRow(hashA)]),
-        fetchPage: vi.fn<AdmissionTransport>(), signal: signal(), throttleMs: 0,
+        fetchPage: vi.fn<AdmissionTransport>().mockResolvedValue(
+          page('<div class="i"><span class="t">书名</span><a href="/b/1">x</a></div>')),
+        signal: signal(), throttleMs: 0,
       });
       expect(result.grandfathered).toBe(1);
+      // b 是新源（无既有行）且缺 chapterUrl：L2 判 compile-ok、直接拿探测名额，不转拒。
       expect(result.rows).toHaveLength(1);
-      expect(result.rows[0]).toMatchObject({ source_url: 'https://never-probed.example.com', compile_ok: false });
+      expect(result.rows[0]).toMatchObject({
+        source_url: 'https://never-probed.example.com', compile_ok: true, search_ok: true,
+      });
     });
   });
 
