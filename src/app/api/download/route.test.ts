@@ -11,6 +11,7 @@ const { ensureSchema, getSql, sql, triggerDownloadWorkflow } = vi.hoisted(() => 
 vi.mock('@/lib/db', () => ({ ensureSchema, getSql }));
 vi.mock('@/lib/github', () => ({ triggerDownloadWorkflow }));
 
+import { refreshSupportedHosts } from '@/lib/source-policy';
 import { DELETE, GET, POST } from './route';
 
 function request(method: 'GET' | 'POST' | 'DELETE', body?: unknown, suffix = '') {
@@ -290,6 +291,48 @@ describe('/api/download recovery and cleanup', () => {
     expect((await POST(request('POST', { bookId: book.id }))).status).toBe(201);
     expect(sql.mock.calls[3].slice(1)).toEqual([1, book.id, book.title, book.author, wwwUrl]);
     expect(triggerDownloadWorkflow).toHaveBeenCalledOnce();
+  });
+
+  it('M2-4：引擎档 host（运行时门已放行）被下载能力门拒绝，不回收/去重/入队/dispatch', async () => {
+    // 运行时门（supportedHosts）经 cron 准入并入引擎 host 后 validateSourceUrl 会放行该 host；
+    // 下载 worker 只认 builtin 适配器，故按 SUPPORTED_SOURCE_HOSTS 二次收窄拒绝——可读不可下。
+    const engineUrl = 'https://www.yingsx.com/books/1.html';
+    refreshSupportedHosts(['www.yingsx.com']);
+    try {
+      sql.mockResolvedValueOnce([{ ...book, source_url: engineUrl }]);
+      const res = await POST(request('POST', { bookId: book.id }));
+      expect(res.status).toBe(400);
+      const data = await res.json();
+      expect(data.code).toBe('UNSUPPORTED_SOURCE');
+      expect(data.error).toContain('不支持全书下载');
+      // 拒绝在回收/去重/INSERT/dispatch 之前：只读了 labeled_books 一次，无写库无 workflow。
+      expect(sql).toHaveBeenCalledOnce();
+      expect(queryText(0)).toContain('FROM labeled_books');
+      expect(triggerDownloadWorkflow).not.toHaveBeenCalled();
+      expect(fetch).not.toHaveBeenCalled();
+    } finally {
+      refreshSupportedHosts([]); // 复位为内建集合，不污染既有用例
+    }
+  });
+
+  it('M2-4：能力门 message 与 URL 非法 message 可区分（同为 UNSUPPORTED_SOURCE code）', async () => {
+    // URL 非法：validateSourceUrl 抛 SourcePolicyError，message = 策略报错文案。
+    sql.mockResolvedValueOnce([{ ...book, source_url: 'https://unknown.invalid/a' }]);
+    const bad = await (await POST(request('POST', { bookId: book.id }))).json();
+    // 能力门：引擎 host 经运行时门放行后由能力门拒绝，message = 「该来源暂不支持全书下载」。
+    refreshSupportedHosts(['www.yingsx.com']);
+    let gated: { error: string; code: string };
+    try {
+      sql.mockResolvedValueOnce([{ ...book, source_url: 'https://www.yingsx.com/books/1.html' }]);
+      gated = await (await POST(request('POST', { bookId: book.id }))).json();
+    } finally {
+      refreshSupportedHosts([]);
+    }
+    expect(bad.code).toBe('UNSUPPORTED_SOURCE');
+    expect(gated.code).toBe('UNSUPPORTED_SOURCE');
+    expect(bad.error).not.toContain('全书下载');
+    expect(gated.error).toContain('全书下载');
+    expect(bad.error).not.toBe(gated.error);
   });
 
   it('does not enqueue or dispatch when recovery fails during POST', async () => {
