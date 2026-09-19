@@ -215,5 +215,16 @@ export async function initializeBusinessSchema(s: Sql) {
       last_error text NOT NULL DEFAULT '',
       updated_at timestamptz NOT NULL DEFAULT now()
     )`,
+    // F15 残留（租约/退避）：排他领取与失败退避的行状态。幂等补列，老库下一次
+    // ensureSchema 生效；默认值让既有行**立即可领取**（lease 空 = 无人持有）、**立即可试**
+    // （next_eligible_at 空 = 无退避）——零数据迁移。列语义与使用见 user-data.ts 队列查询。
+    // 该表族一贯走运行时幂等 DDL（同 labeled_books.source_url / app_settings 各列），
+    // 不进 migrations/ 的版本化契约（那里的 EXPECTED_TABLES 也不含本表）。
+    tx`
+    ALTER TABLE profile_feedback_queue
+      ADD COLUMN IF NOT EXISTS lease_token text NOT NULL DEFAULT '',
+      ADD COLUMN IF NOT EXISTS lease_expires_at timestamptz,
+      ADD COLUMN IF NOT EXISTS fail_count int NOT NULL DEFAULT 0,
+      ADD COLUMN IF NOT EXISTS next_eligible_at timestamptz`,
   ]);
 }

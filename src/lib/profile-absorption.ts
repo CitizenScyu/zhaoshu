@@ -1,9 +1,10 @@
 import type { PersonalWriter } from './personal-write';
 import {
+  claimProfileFeedbackForUser,
   ensureProfileForUser,
+  getProfileFeedbackQueueForUser,
   getProfileForUser,
   getProfileFeedbackForUser,
-  getProfileFeedbackQueueForUser,
   getWithdrawnFeedbackBookTitlesForUser,
   markProfileFeedbackAbsorbedForUser,
   markProfileFeedbackFailedForUser,
@@ -26,8 +27,14 @@ import { profileAbsorbSystem, profileAbsorbUser } from './prompts';
 //  4. 撤回不复活：输入显式带上 withdrawnFeedbackBookTitles（F04 同一查询），异步路径与重建
 //     路径对「旧偏好必须移除」的口径一致。
 //  5. 空画像起点：没有 profile 行时先补一行（seeds 空），让反馈能建立画像。
-
-export type ProfileAbsorbStatus = 'pending' | 'applied' | 'unchanged' | 'failed' | 'conflict';
+//
+// F15 残留①②③：吸收入口现在是「领取 → 处理 → 归还」的租约协议：
+//  - 领取（claim）是原子 UPDATE CAS：两个并发执行者（浏览器 + drain、双开标签页）只有
+//    一个拿到候选，另一个看到 busy/unchanged 直接返回，**不调模型**。
+//  - 领取失败（退避未到期）同样直接返回：退防窗口内浏览器刷新不重打模型。
+//  - 完成提交（absorbed/failed）都带 lease_token 校验：租约过期被 drain 重领后，浏览器侧
+//    迟到的提交写 0 行，不会覆盖 drain 的结果或污染退避档位。
+export type ProfileAbsorbStatus = 'pending' | 'busy' | 'applied' | 'unchanged' | 'failed' | 'conflict';
 
 export interface ProfileAbsorbResult {
   status: ProfileAbsorbStatus;
@@ -35,30 +42,41 @@ export interface ProfileAbsorbResult {
   updatedAt?: string;
 }
 
-const STATUSES: ProfileAbsorbStatus[] = ['pending', 'applied', 'unchanged', 'failed', 'conflict'];
+const STATUSES: ProfileAbsorbStatus[] = ['pending', 'busy', 'applied', 'unchanged', 'failed', 'conflict'];
 
 function normalizeStatusForIdle(status: string): ProfileAbsorbStatus {
   return (STATUSES as string[]).includes(status) ? status as ProfileAbsorbStatus : 'unchanged';
 }
 
+// 执行者身份：同一个函数服务浏览器触发（access.commit 的授权写事务）与 cron drain
+// （无用户授权，直连 getSql 的写事务）。leaseToken 由调用方生成；write 由调用方提供
+// 对应渠道的事务写入器。退避重领检测：leaseToken 归还后重用即可（claim 会换成新 token）。
 export async function absorbPendingProfileFeedback(deps: {
   userId: number;
+  leaseToken: string;
   write: PersonalWriter;
   signal: AbortSignal;
   modelBudgetMs: number;
+  leaseMs?: number;
 }): Promise<ProfileAbsorbResult> {
-  const { userId, write, signal, modelBudgetMs } = deps;
-  const queue = await getProfileFeedbackQueueForUser(userId);
-  // 没有队列行、或没有待处理事件：无可吸收，返回上一次的结果供用户侧显示。
-  if (!queue) return { status: 'unchanged', pendingFeedbackId: null };
-  if (queue.pendingFeedbackId == null) {
-    return { status: normalizeStatusForIdle(queue.status), pendingFeedbackId: null };
+  const { userId, leaseToken, write, signal, modelBudgetMs, leaseMs } = deps;
+  // 领取（F15 残留①）：原子 CAS。拿不到（被并发执行者持有 / 退避未到期 / 没有 pending）
+  // 都不调模型。queue 状态单独读一次供「busy」与「退避中」的区分展示。
+  const candidate = await claimProfileFeedbackForUser(userId, leaseToken, leaseMs);
+  if (candidate == null) {
+    const queue = await getProfileFeedbackQueueForUser(userId);
+    if (queue?.pendingFeedbackId == null) {
+      return { status: normalizeStatusForIdle(queue?.status ?? 'unchanged'), pendingFeedbackId: null };
+    }
+    // 有 pending 但没领到：并发执行者已持有（busy）或退避未到期（failed——上一轮失败
+    // 的退避窗口内，UI 提示「稍后自动重试」比「忙」准确）。
+    return { status: (queue.nextEligibleAt ? 'failed' : 'busy'), pendingFeedbackId: queue.pendingFeedbackId };
   }
-  const candidate = queue.pendingFeedbackId;
 
   // 预算耗尽：不调用模型，保留 pending 供下次机会重放（失败不丢事件）。
+  // 这里记一次带退避的失败（租约持有者本人），让退避窗口内不重试。
   if (modelBudgetMs <= 0) {
-    await markProfileFeedbackFailedForUser(userId, 'failed', 'DeadlineExceededError', write).catch(() => {});
+    await markProfileFeedbackFailedForUser(userId, 'failed', 'DeadlineExceededError', write, leaseToken).catch(() => {});
     return { status: 'failed', pendingFeedbackId: candidate };
   }
 
@@ -72,14 +90,14 @@ export async function absorbPendingProfileFeedback(deps: {
     await ensureProfileForUser(userId, write);
     profile = await getProfileForUser(userId);
     if (!profile.updatedAt) {
-      await markProfileFeedbackFailedForUser(userId, 'failed', 'ProfileRowMissing', write).catch(() => {});
+      await markProfileFeedbackFailedForUser(userId, 'failed', 'ProfileRowMissing', write, leaseToken).catch(() => {});
       return { status: 'failed', pendingFeedbackId: candidate };
     }
   }
 
   // 既无有效反馈、也无撤回信号：这次 pending 对画像零影响，直接推进水位（不调模型）。
   if (!feedback.length && !withdrawn.length) {
-    const pendingFeedbackId = await markProfileFeedbackAbsorbedForUser(userId, candidate, 'unchanged', write);
+    const pendingFeedbackId = await markProfileFeedbackAbsorbedForUser(userId, candidate, 'unchanged', write, leaseToken);
     return { status: pendingFeedbackId == null ? 'unchanged' : 'pending', pendingFeedbackId };
   }
 
@@ -93,12 +111,14 @@ export async function absorbPendingProfileFeedback(deps: {
     const updatedAt = await saveProfileForUser(userId, profile.seeds, content, profile.updatedAt, write);
     if (!updatedAt) {
       // 其他写入者先改了画像：不覆盖，保留 pending 下次重放（旧实现这里会永久丢失）。
-      await markProfileFeedbackFailedForUser(userId, 'conflict', 'ProfileConflict', write).catch(() => {});
+      await markProfileFeedbackFailedForUser(userId, 'conflict', 'ProfileConflict', write, leaseToken).catch(() => {});
       return { status: 'conflict', pendingFeedbackId: candidate };
     }
     // 种子原样回传，"内容变了"就是这次真的改动了画像；CAS 命中不等于画像变了（模型可能原样返回）。
     const applied = content !== profile.content;
-    const pendingFeedbackId = await markProfileFeedbackAbsorbedForUser(userId, candidate, applied ? 'applied' : 'unchanged', write);
+    // 提交带 lease_token：租约过期被重领（drain）时这里是 0 行、返回 null——按失败处理
+    // （水位已由新持有者负责），本执行者不再声称 applied。
+    const pendingFeedbackId = await markProfileFeedbackAbsorbedForUser(userId, candidate, applied ? 'applied' : 'unchanged', write, leaseToken);
     return {
       // 吸收期间若又有新反馈把水位抬高，pendingFeedbackId 非空，状态如实回到 pending。
       status: pendingFeedbackId == null ? (applied ? 'applied' : 'unchanged') : 'pending',
@@ -111,7 +131,7 @@ export async function absorbPendingProfileFeedback(deps: {
       name: error instanceof Error ? error.name : typeof error,
       code: (error as { code?: unknown } | null)?.code ?? null,
     });
-    await markProfileFeedbackFailedForUser(userId, 'failed', error instanceof Error ? error.name : 'Error', write).catch(() => {});
+    await markProfileFeedbackFailedForUser(userId, 'failed', error instanceof Error ? error.name : 'Error', write, leaseToken).catch(() => {});
     return { status: 'failed', pendingFeedbackId: candidate };
   }
 }
