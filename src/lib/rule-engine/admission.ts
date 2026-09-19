@@ -27,8 +27,12 @@ export const ADMISSION_MAX_REDIRECTS = 3;
 export const ADMISSION_THROTTLE_MS = 350;
 /** 每轮刷新最多跑几个新源的真实搜索（对齐 PROBE_DISCOVERY_PER_REFRESH 模式，设计 §4.2）。 */
 export const ADMISSION_MAX_PROBES_PER_REFRESH = 5;
-/** deferred 态重测间隔（设计 §4.2：软故障/url_invalid 每 24h 重测）。 */
-export const ADMISSION_RETEST_INTERVAL_MS = 24 * 3_600_000;
+/**
+ * deferred 态重测间隔（设计 §4.2：软故障/url_invalid 定期重测）。
+ * 取 20h 而非 24h：cron 有分钟级抖动/偶发漏触发，严格 24h 判据会把前一日刚测过的
+ * deferred 源推迟一整周期才复测；20h 留 4h 余量，保证每个自然日至少复测一次。
+ */
+export const ADMISSION_RETEST_INTERVAL_MS = 20 * 3_600_000;
 /** 剩余预算低于此值即整批跳过，绝不挤占 90s 刷新（设计风险台账 #4）。 */
 export const ADMISSION_MIN_BUDGET_MS = 10_000;
 
@@ -381,7 +385,7 @@ export async function searchAdmission(source: RawSource, options: {
   const low = response.text.toLowerCase();
   // 判定顺序（P1-2 裁定）：403/503 与 5xx/4xx 状态先判，**候选计数先于强标记**。
   // 反例教训：200 正常搜索页页脚含「安全验证/enable javascript/人机验证」时，若标记先判
-  // 会把它误判成 challenge（rejected 终态、24h 不重测）；probe-reachability.py 只是一次性
+  // 会把它误判成 challenge（rejected 终态、20h 不重测）；probe-reachability.py 只是一次性
   // 探测，准入把它升级成了永久拒。故「有 ≥1 候选的正常页一律 ok」，墙只在 403/503 或
   // 「0 候选 + 强标记」成立。弱标记 cloudflare 仍不判墙。
   if (response.status === 403 || response.status === 503) {

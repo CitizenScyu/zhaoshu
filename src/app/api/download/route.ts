@@ -229,11 +229,12 @@ export async function DELETE(req: NextRequest) {
   try {
     await ensureSchema();
     const sql = getSql();
-    // 按状态原子删除：取消排队中的任务、清理失败记录或残缺（partial）任务；
-    // 本人之外与运行中 / 已完成的任务仍受保护。partial 不是终态完成，删除后用户可重下补齐。
+    // 按状态原子删除：取消排队中的任务、清理失败或残缺终态记录（partial：下载不完整；
+    // superseded_by_incomplete：候选版本完整度过不了晋升校验、旧完整版受保护——同为
+    // 残缺终态，删除后用户可重下）；本人之外与运行中 / 已完成的任务仍受保护。
     const rows = (await sql`
       DELETE FROM download_tasks
-      WHERE id = ${taskId} AND user_id = ${guard.principal.userId} AND status IN ('pending', 'failed', 'partial')
+      WHERE id = ${taskId} AND user_id = ${guard.principal.userId} AND status IN ('pending', 'failed', 'partial', 'superseded_by_incomplete')
       RETURNING id`) as { id: number }[];
     if (rows.length === 0) {
       const visible = await sql`SELECT status FROM download_tasks WHERE id = ${taskId} AND user_id = ${guard.principal.userId}` as { status: string }[];
