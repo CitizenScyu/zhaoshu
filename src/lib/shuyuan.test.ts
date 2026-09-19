@@ -489,6 +489,55 @@ describe('refreshShuyuan atomic refresh', () => {
     expect(transaction.mock.invocationCallOrder[0]).toBeLessThan(execute.mock.invocationCallOrder[insertIndex]);
   });
 
+  // 准入兼容 L3 反例 17：compile 拒 ≠ 出环。候选池只由 selectCandidates（survey 初筛）
+  // 决定（runAdmissionAfterRefresh），不读 source_admission、不看 compile_ok/search_ok——
+  // 把「compile 拒的源每天仍进评估环」钉成机器可验的事实，防止后续「只喂 compile_ok 源」
+  // 这类善意但致命的优化切断恢复回路。
+  it('准入兼容 L3 反例 17：source_admission 全为 compile 拒 → 下一轮刷新仍对同批源跑准入（compile 拒 ≠ 出环）', async () => {
+    setCollection(11, [admissionCandidate]);
+    // 上一轮已写下 compile 拒行（readAdmissionRows 读 source_admission）。
+    execute.mockImplementation(async (query) => {
+      if (query.text.startsWith('SELECT count(*)')) return [zeroCounts];
+      if (query.text.startsWith('SELECT source_url, tier, compile_ok')) {
+        return [{
+          source_url: 'https://new.example', tier: 'T7', compile_ok: false, core_field_mask: {},
+          search_ok: null, search_verdict: '', search_checked_at: null,
+          rules_hash: rulesHash(admissionCandidate), host: 'new.example', error: '历史拒因',
+        }];
+      }
+      if (query.text.startsWith('INSERT INTO source_admission')) return [];
+      if (query.text.includes('SELECT DISTINCT host FROM source_admission')) return [];
+      if (query.text.startsWith('SELECT source_url, last_error')) return [];
+      if (query.text.startsWith('SELECT source_url AS url, name')) return [{ ...zeroCounts }];
+      if (query.text.includes('FROM shuyuan_meta')) return [{ collections: [], refreshed_at: null }];
+      return [];
+    });
+    fetchMock.mockImplementation(async (input, options) => {
+      const url = String(input);
+      if (url === admissionSearchUrl) {
+        expect(options?.redirect).toBe('manual');
+        return new Response('<div class="i"><span class="t">书名</span><a href="/b/1">x</a></div>', { status: 200 });
+      }
+      expect(options?.redirect).toBe('error');
+      const fixture = responses.get(url);
+      if (!fixture) throw new Error(`Unexpected network request: ${url}`);
+      return new Response(fixture.body, { status: fixture.status ?? 200 });
+    });
+
+    await refreshShuyuan();
+
+    // 证据 1：即便库里是 compile 拒行，本轮仍读了 source_admission 既有行
+    // （说明批次跑了，源没被候选池过滤掉）。
+    const readExisting = execute.mock.calls.find(([query]) =>
+      query.text.startsWith('SELECT source_url, tier, compile_ok'));
+    expect(readExisting).toBeDefined();
+    // 证据 2：本轮对该源重新探测（compile-ok 后 search_ok=null ⇒ 未测优先）——
+    // 既有行 rules_hash 与候选一致（终态去抖只拦「仍然拒」，不拦「救回后待测」）。
+    expect(fetchMock.mock.calls.map(([input]) => String(input))).toContain(admissionSearchUrl);
+    // 证据 3：救回结论写库（compile_ok=true 行 upsert）。
+    expect(execute.mock.calls.some(([query]) => query.text.startsWith('INSERT INTO source_admission'))).toBe(true);
+  });
+
   it('剩余预算不足时整批跳过准入：不读不写 source_admission、不发搜索请求', async () => {
     vi.useFakeTimers();
     const started = Date.now();

@@ -621,10 +621,131 @@ describe('准入状态机 runAdmissionBatch', () => {
     });
   });
 
+  // ---------------------------------------------------------------- 准入兼容（回滚态用例，设计 §5.2）
+  describe('回滚态：L2 revert 后救回的源由祖父条款接住（源留存池内）', () => {
+    // 场景：L1+L2 上线后某缺 chapterUrl 源过探测进池（行=compile_ok ∧ search_ok=true ∧
+    // hash=h）；随后 git revert——compileAdmission 复判 false，但 isGrandfatheredAdmitted
+    // 命中（hash 未变 ∧ 已在池）⇒ exempt=true、计入 grandfathered、probeClass=2 不重写行。
+    // 源以祖父身份长期留在池内（与 W1 现网池同机制），直到上游规则变化——可接受，钉死此结论。
+    const url = 'https://rollback.example.com';
+    const rescued = () => syntheticSource(url, { ruleToc: { chapterList: '.toc@li', chapterName: 'a@text' } });
+
+    it('revert 后（模拟：既有 admitted 行 + hash 未变）→ 免疫命中、不重写行、不发请求', async () => {
+      const hash = rulesHash(rescued());
+      const existing = new Map([[url, sourceRow(url, {
+        tier: 'M1', compile_ok: true, search_ok: true, search_verdict: 'ok',
+        search_checked_at: '2026-09-19T00:00:00Z', rules_hash: hash,
+      })]]);
+      // 注意：当前代码（L2 生效）下 compileAdmission(rescued()) 已 ok，exempt 分支不可达——
+      // 回滚态由「既有行不变 + compileAdmission 复判」联合表达：本用例先钉住
+      // 「L2 下同规则同 hash 复判 ok ⇒ 行不重写」（回滚前的稳态），再钉
+      // 「写库只会发生在 probe 结论更新时」，两端合起来即 revert 后行的命运：
+      // compile 复判 false + 免疫命中 ⇒ rows 为空 ⇒ 行原样留存池内。
+      const fetchPage = vi.fn<AdmissionTransport>();
+      const steady = await runAdmissionBatch({
+        candidates: [{ url, source: rescued() }], declaredHosts: new Set(['rollback.example.com']),
+        existing, fetchPage, signal: signal(), throttleMs: 0,
+      });
+      expect(steady.rows).toHaveLength(0); // probeClass=2（结论仍有效）不重写、不复测
+      expect(fetchPage).not.toHaveBeenCalled();
+
+      // revert 态的直接复现：老代码判 false 时 isGrandfatheredAdmitted 的语义
+      // （admission.ts 导出的纯函数，直接对同一行断言）。
+      const { isGrandfatheredAdmitted } = await import('./admission');
+      const row = existing.get(url)!;
+      expect(isGrandfatheredAdmitted(row, hash)).toBe(true); // 免疫命中（hash 未变 ∧ 已 admitted）
+      expect(isGrandfatheredAdmitted(row, 'changed-hash')).toBe(false); // 规则一变即失保护
+    });
+  });
+
   // ---------------------------------------------------------------- N04 回归
   describe('N04：公平调度——前 5 个持续失败源不再饿死新源', () => {
     const hosts = Array.from({ length: 6 }, (_, i) => `s${i}.example.com`);
     const candidates = hosts.map((host) => ({ url: `https://${host}`, source: syntheticSource(`https://${host}/`) }));
+
+    // ---------------------------------------------------------------- 准入兼容 L3（反例 15-17：恢复回路钉死）
+    describe('L3 恢复回路：compile 拒 ≠ 出环，上游补字段自动回池', () => {
+      const url = 'https://recover.example.com';
+      const fetchOk = () => vi.fn<AdmissionTransport>().mockResolvedValue(
+        page('<div class="i"><span class="t">书名</span><a href="/b/1">x</a></div>'));
+
+      it('反例 15：既有 compile 拒行 + 规则未变（仍拒）→ 终态去抖不写行不探测；'
+        + '上游补上合法 chapterUrl（hash 变）→ compileOk+1、probed+1、写出的行 compile_ok=true', async () => {
+        // 用「缺 chapterUrl」作拒因已不可（L2 救回），反例 15 的「拒」形态用 @baseUrl（failures 拒）。
+        const bad = syntheticSource(url, { ruleToc: { chapterList: '.toc@li', chapterName: 'a@text', chapterUrl: '@baseUrl' } });
+        const existing = new Map([[url, sourceRow(url, {
+          tier: 'T7', compile_ok: false, search_ok: null, rules_hash: rulesHash(bad),
+        })]]);
+
+        // 规则未变仍拒 → compileRejected+1、不写行、不探测（终态去抖）。
+        const unchanged = await runAdmissionBatch({
+          candidates: [{ url, source: bad }], declaredHosts: new Set(['recover.example.com']),
+          existing, fetchPage: fetchOk(), signal: signal(), throttleMs: 0,
+        });
+        expect(unchanged.compileRejected).toBe(1);
+        expect(unchanged.rows).toHaveLength(0);
+        expect(unchanged.probed).toBe(0);
+
+        // 上游补字段（改成合法 a@href，hash 变）：下一轮自动回池并拿探测名额。
+        const fixed = syntheticSource(url, { ruleToc: { chapterList: '.toc@li', chapterName: 'a@text', chapterUrl: 'a@href' } });
+        const recovered = await runAdmissionBatch({
+          candidates: [{ url, source: fixed }], declaredHosts: new Set(['recover.example.com']),
+          existing, fetchPage: fetchOk(), signal: signal(), throttleMs: 0,
+        });
+        expect(recovered.compileRejected).toBe(0);
+        expect(recovered.compileOk).toBe(1);
+        expect(recovered.probed).toBe(1);
+        expect(recovered.rows).toHaveLength(1);
+        expect(recovered.rows[0]).toMatchObject({ compile_ok: true, search_ok: true, search_verdict: 'ok' });
+      });
+
+      it('反例 15b（引擎默认救回变体）：既有 compile 拒行（缺 chapterUrl 时代写下）+ 上游不改规则 → '
+        + 'L2 后同一批规则即 compile-ok（引擎默认可产），hash 未变也直接回池拿探测名额', async () => {
+        // 这是 L1+L2 落地当天的真实路径：10 条缺 chapterUrl 源的旧行是 compile_ok=false
+        // （N03 写下），规则未变；L2 生效后 compileAdmission 直接 ok——不是靠上游补字段，
+        // 是判定本身放行。终态去抖只在「仍然拒」时生效，此路径不受其阻挡。
+        const stillMissing = syntheticSource(url, { ruleToc: { chapterList: '.toc@li', chapterName: 'a@text' } });
+        const existing = new Map([[url, sourceRow(url, {
+          tier: 'T7', compile_ok: false, search_ok: null, rules_hash: rulesHash(stillMissing),
+        })]]);
+        const result = await runAdmissionBatch({
+          candidates: [{ url, source: stillMissing }], declaredHosts: new Set(['recover.example.com']),
+          existing, fetchPage: fetchOk(), signal: signal(), throttleMs: 0,
+        });
+        expect(result.compileRejected).toBe(0);
+        expect(result.compileOk).toBe(1);
+        expect(result.probed).toBe(1);
+        expect(result.rows[0]).toMatchObject({
+          compile_ok: true, search_ok: true,
+          core_field_mask: expect.objectContaining({ 'ruleToc.chapterUrl': false }),
+        });
+      });
+
+      it('反例 16：恢复后优先级——该行 search_ok=null ⇒ probeClass=0 未测优先，同一轮即拿名额', async () => {
+        // 反例 15b 的对照扩展：一个「已恢复但未测」源 + 一个「结论仍有效」源抢 1 个名额，
+        // 未测优先 ⇒ 恢复源赢（不被 60 条拒源或稳定源饿死）。
+        const recovered = syntheticSource(url, { ruleToc: { chapterList: '.toc@li', chapterName: 'a@text' } });
+        const stable = syntheticSource('https://stable.example.com/');
+        const result = await runAdmissionBatch({
+          candidates: [
+            { url: 'https://stable.example.com', source: stable },
+            { url, source: recovered },
+          ],
+          declaredHosts: new Set(['recover.example.com', 'stable.example.com']),
+          existing: new Map([
+            [url, sourceRow(url, { tier: 'T7', compile_ok: false, search_ok: null, rules_hash: rulesHash(recovered) })],
+            ['https://stable.example.com', sourceRow('https://stable.example.com', {
+              tier: 'M1', compile_ok: true, search_ok: true, search_verdict: 'ok',
+              search_checked_at: new Date(Date.now() - 3_600_000).toISOString(),
+              rules_hash: rulesHash(stable),
+            })],
+          ]),
+          fetchPage: fetchOk(), signal: signal(), throttleMs: 0, maxProbes: 1,
+        });
+        expect(result.probed).toBe(1);
+        expect(result.rows[0].source_url).toBe(url); // 未测优先（probeClass 0 < 2）
+      });
+    });
 
     it('反例：6 候选前 5 个 HTTP 500，首轮名额给前 5、第 6 个写占位；第 2 轮即被探测（3 轮内）', async () => {
       const fetchPage = vi.fn<AdmissionTransport>().mockImplementation(async (input) => {
