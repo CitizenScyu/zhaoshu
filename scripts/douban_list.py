@@ -19,6 +19,7 @@
 import json
 import os
 import re
+import subprocess
 import sys
 import time
 import urllib.parse
@@ -243,8 +244,122 @@ def search_book15(http_get, title: str) -> dict | None:
     return None
 
 
+# ---- 引擎源兜底（T5：book15 miss 才回落引擎源池）----
+# 背景（2026-09-18 用户高优先项）：打标名单候选 468 本，book15 只命中 39（8.3%）——
+# 供给被 book15 收录面锁死。M2 W1 已放量（enginePoolSize=2：yingsx + jhsssd）。
+# 本模块解除「每个候选必须过 search_book15」的硬约束：book15 仍首选（命中质量最高），
+# miss 才回落引擎源池（调 scripts/engine-fetch.mjs CLI，同款 title_compatible 校验）。
+# 开关 LABELER_ENGINE_FALLBACK=1 默认关；关闭时 _resolve_candidates 行为逐字不变（红线）。
+ENGINE_FALLBACK_ENV = 'LABELER_ENGINE_FALLBACK'
+ENGINE_CLI_TIMEOUT = 60         # 单次 CLI 调用墙钟上限（CLI 内部各子命令另有更紧的界）
+
+
+class EngineUnavailable(Exception):
+    """引擎 CLI 环境错误（退出码 2 / 无法调用 / 未知非零）。
+
+    语义：本轮禁用引擎兜底、降级 book15-only、不重试（不连坐后续候选）。
+    异常消息只带脱敏后的 returncode + 截断 stderr 摘要，绝不含连接串。"""
+
+
+def engine_fallback_enabled(env: dict | None = None) -> bool:
+    """引擎兜底是否开启：env 字典 → 进程环境，取值恰为 '1' 才开（默认关，红线）。"""
+    raw = ''
+    if env and env.get(ENGINE_FALLBACK_ENV) is not None:
+        raw = str(env.get(ENGINE_FALLBACK_ENV)).strip()
+    if not raw:
+        raw = (os.environ.get(ENGINE_FALLBACK_ENV) or '').strip()
+    return raw == '1'
+
+
+def _short_stderr(stderr: str | None, limit: int = 200) -> str:
+    """CLI stderr 摘要：单行化 + 截断。CLI 侧已有 safeReason 脱敏，这里再兜一层长度。
+
+    凭据红线：即便如此也不把 stderr 原样长篇透传日志——只留可读的错误类别摘要。"""
+    text = ' '.join((stderr or '').split())
+    return text[:limit]
+
+
+class EngineCli:
+    """封装 engine-fetch.mjs 子进程调用（labeler 在 phoenix 上 shell out）。
+
+    组装形态（任务书 §C）：
+      node --import <file://.../ts-alias-hook.mjs> <.../engine-fetch.mjs> <sub> … --json
+    Windows 裸驱动器路径给 --import 会 ERR_UNSUPPORTED_ESM_URL_SCHEME，故 hook 统一转
+    file:// URI（Linux/phoenix 亦合法）。
+
+    凭据红线：DATABASE_URL 只经**子进程 env** 注入（db.ts 模块初始化读它），
+    绝不进命令行参数、日志或异常消息；stdout/stderr 只在调用方按需截断摘要。"""
+
+    def __init__(self, node: str, script_path: str, database_url: str,
+                 hook_path: str | None = None, timeout: int = ENGINE_CLI_TIMEOUT):
+        self.node = node or 'node'
+        self.script_path = script_path
+        # hook 默认取 engine-fetch.mjs 同目录的 ts-alias-hook.mjs
+        self.hook_path = hook_path or str(Path(script_path).parent / 'ts-alias-hook.mjs')
+        self._database_url = database_url
+        self.timeout = timeout
+
+    def _import_target(self) -> str:
+        """--import 目标转 file:// URI（跨平台安全）。"""
+        return Path(self.hook_path).resolve().as_uri()
+
+    def run(self, subcommand: str, *args: str):
+        """调 CLI 子命令（自动补 --json）。返回 CompletedProcess（returncode/stdout/stderr）。
+
+        DATABASE_URL 从当前 env 复制的副本里注入子进程，不落任何参数或日志。"""
+        cmd = [self.node, '--import', self._import_target(), self.script_path,
+               subcommand, *args, '--json']
+        child_env = dict(os.environ)
+        if self._database_url:
+            child_env['DATABASE_URL'] = self._database_url
+        return subprocess.run(cmd, capture_output=True, text=True,
+                              timeout=self.timeout, env=child_env)
+
+
+def search_engine(cli, title: str, author: str = '') -> dict | None:
+    """book15 miss 后的引擎兜底搜索：调 CLI `search --title …`，同款 title_compatible 校验。
+
+    返回命中 {'url': bookUrl（绝对）, 'title': site_title, 'source': host} 或 None（miss）。
+    退出码：0=有候选（逐条按 title_compatible 校验，跳过 book15.net 源）；1=正常 miss；
+    2/未知非零/无法调用 → 抛 EngineUnavailable（调用方本轮降级 book15-only、不重试）。"""
+    args = ['--title', title]
+    if author:
+        args += ['--author', author]
+    try:
+        proc = cli.run('search', *args)
+    except subprocess.TimeoutExpired:
+        raise EngineUnavailable(f'引擎搜索超时（{ENGINE_CLI_TIMEOUT}s）')
+    except OSError as e:
+        # node/脚本不可执行等：环境错误，禁用兜底
+        raise EngineUnavailable(f'引擎 CLI 无法调用: {type(e).__name__}')
+    if proc.returncode == 2:
+        raise EngineUnavailable(f'引擎源池不可用（rc=2）: {_short_stderr(proc.stderr)}')
+    if proc.returncode == 1:
+        return None
+    if proc.returncode != 0:
+        raise EngineUnavailable(f'引擎 CLI 异常退出（rc={proc.returncode}）: '
+                                f'{_short_stderr(proc.stderr)}')
+    try:
+        candidates = json.loads(proc.stdout)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(candidates, list):
+        return None
+    for c in candidates:
+        if not isinstance(c, dict):
+            continue
+        if c.get('source') == 'book15.net':
+            continue          # book15 路径已搜过（这是兜底），跳过
+        site_title = c.get('title') or ''
+        book_url = c.get('bookUrl') or ''
+        if book_url and title_compatible(title, site_title):
+            return {'url': book_url, 'title': site_title,
+                    'source': c.get('source', '')}
+    return None
+
+
 def build_douban_queue(http_get, skip_titles: set | None = None,
-                       pages: int | None = None) -> list[dict]:
+                       pages: int | None = None, engine_cli=None) -> list[dict]:
     """豆瓣名单 → book15 打标队列 [{url, title, author, category, status, douban_url}]。
 
     与 labeler.fetch_rank_books() 的产出同构（url 为站内相对路径），
@@ -253,20 +368,28 @@ def build_douban_queue(http_get, skip_titles: set | None = None,
     douban_books = fetch_douban_books(http_get, pages=pages)
     print(f'豆瓣名单共 {len(douban_books)} 本（去重后）')
     return _resolve_candidates(douban_books, http_get, origin='豆瓣tag',
-                               skip_titles=skip_titles)
+                               skip_titles=skip_titles, engine_cli=engine_cli)
 
 
 def _resolve_candidates(candidates: list[dict], http_get, origin: str = '',
-                        skip_titles: set | None = None) -> list[dict]:
+                        skip_titles: set | None = None, engine_cli=None) -> list[dict]:
     """候选名单（[{title, author, ...}]）→ 过 book15 搜索+校验的打标队列。
 
     各名单源共用：命中记队列（category 记来源标记，默认取候选自带 origin，
     调用方可用 origin 参数覆盖），miss 记日志跳过。
     skip_titles 命中（书名归一化后已在 labels.jsonl）→ **不发搜索**直接跳过：
-    缓存是优化，「跳过已完成再搜」是正确性/产品问题（审查 D.3）。"""
+    缓存是优化，「跳过已完成再搜」是正确性/产品问题（审查 D.3）。
+
+    engine_cli（T5）：非空且 LABELER_ENGINE_FALLBACK 开启时，book15 miss 才回落引擎源池。
+    engine_cli=None（开关关闭）时本函数行为**逐字不变**（红线）——不调 CLI、条目无 engine 标记。
+    引擎命中的条目带 {'engine': True, 'source_host': host, url=bookUrl（绝对）}；
+    退出码 2（环境错误）→ 本轮禁用引擎、降级 book15-only、不重试（不连坐后续候选）。"""
     queue: list[dict] = []
     miss: list[str] = []
     skipped = 0
+    book15_hits = 0
+    engine_hits = 0
+    engine_disabled = False
     for b in candidates:
         key = _norm_title(b.get('title', ''))
         if skip_titles and key and key in skip_titles:
@@ -279,11 +402,35 @@ def _resolve_candidates(candidates: list[dict], http_get, origin: str = '',
                           'category': origin or b.get('origin', ''),
                           'status': '',
                           'douban_url': b.get('douban_url', '')})
+            book15_hits += 1
+            time.sleep(SEARCH_DELAY)
+            continue
+        # book15 miss：开关开启且引擎未被禁用时回落引擎源池
+        engine_hit = None
+        if engine_cli is not None and not engine_disabled:
+            try:
+                engine_hit = search_engine(engine_cli, b['title'], b.get('author', ''))
+            except EngineUnavailable as e:
+                # 环境错误：本轮降级 book15-only，后续候选不再尝试引擎（不连坐重试）
+                print(f'  引擎兜底不可用，本轮降级 book15-only（不重试）: {e}',
+                      file=sys.stderr)
+                engine_disabled = True
+        if engine_hit:
+            queue.append({'url': engine_hit['url'], 'title': engine_hit['title'],
+                          'author': b.get('author', ''),
+                          'category': origin or b.get('origin', ''),
+                          'status': '',
+                          'douban_url': b.get('douban_url', ''),
+                          'engine': True,
+                          'source_host': engine_hit['source']})
+            engine_hits += 1
         else:
             miss.append(b['title'])
         time.sleep(SEARCH_DELAY)
-    print(f'book15 命中 {len(queue)} 本，未命中 {len(miss)} 本，'
-          f'跳过已打标 {skipped} 本'
+    # 开关关闭时 engine_hits=0 且 book15_hits==len(queue)，本行逐字复现旧文案（红线）。
+    engine_note = f'，引擎兜底命中 {engine_hits} 本' if engine_cli is not None else ''
+    print(f'book15 命中 {book15_hits} 本，未命中 {len(miss)} 本，'
+          f'跳过已打标 {skipped} 本{engine_note}'
           f'{"（" + "、".join(miss[:10]) + ("…" if len(miss) > 10 else "") + "）" if miss else ""}')
     return queue
 
@@ -563,7 +710,7 @@ def fetch_17k_quanben_books(http_get) -> list[dict]:
 
 def build_webnovel_queue(http_get, include_douban: bool = True,
                          skip_titles: set | None = None,
-                         pages: int | None = None) -> list[dict]:
+                         pages: int | None = None, engine_cli=None) -> list[dict]:
     """网文站名单（主）+ 豆瓣 tag（补充）→ book15 打标队列。
 
     用户指令（2026-09-18）：网文站榜单是对口 book15 的一手来源，优先；
@@ -594,4 +741,5 @@ def build_webnovel_queue(http_get, include_douban: bool = True,
     add_batch(fetch_qidian_rank_books(http_get), '起点榜单')
     if include_douban:
         add_batch(fetch_douban_books(http_get, pages=pages), '豆瓣网文tag')
-    return _resolve_candidates(candidates, http_get, skip_titles=skip_titles)
+    return _resolve_candidates(candidates, http_get, skip_titles=skip_titles,
+                               engine_cli=engine_cli)

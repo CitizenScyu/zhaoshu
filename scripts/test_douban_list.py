@@ -16,6 +16,7 @@ import json
 import os
 import sys
 import tempfile
+import types
 import unittest
 import urllib.parse
 from pathlib import Path
@@ -23,6 +24,32 @@ from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import douban_list  # noqa: E402
+
+
+class FakeEngineCli:
+    """引擎 CLI 桩：记录调用、返回预置的 CompletedProcess-like 结果（不真调子进程）。
+
+    results 可为 {subcommand: SimpleNamespace(returncode, stdout, stderr)} 字典，
+    或 callable(subcommand, args) -> SimpleNamespace（用于按调用序变结果）。"""
+
+    def __init__(self, results):
+        self.results = results
+        self.calls = []
+
+    def run(self, subcommand, *args):
+        self.calls.append((subcommand, list(args)))
+        if callable(self.results):
+            return self.results(subcommand, list(args))
+        return self.results[subcommand]
+
+
+def _proc(returncode=0, stdout='', stderr=''):
+    return types.SimpleNamespace(returncode=returncode, stdout=stdout, stderr=stderr)
+
+
+def _engine_search_stdout(candidates):
+    """engine-fetch.mjs `search --json` 的 stdout：单行 JSON 数组。"""
+    return json.dumps(candidates, ensure_ascii=False)
 
 
 def no_wait(case):
@@ -736,6 +763,162 @@ class TestBuildWebnovelQueue(unittest.TestCase):
             raise ConnectionError('source down')
 
         self.assertEqual(douban_list.build_webnovel_queue(all_down), [])
+
+
+# ---- 引擎兜底搜索（T5：book15 miss 才回落引擎源池）----
+class TestEngineFallbackSwitch(unittest.TestCase):
+    """LABELER_ENGINE_FALLBACK 开关：默认关（红线：关闭时行为逐字不变）。"""
+
+    def test_default_disabled(self):
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(douban_list.ENGINE_FALLBACK_ENV, None)
+            self.assertFalse(douban_list.engine_fallback_enabled({}))
+            self.assertFalse(douban_list.engine_fallback_enabled(None))
+
+    def test_env_dict_enables(self):
+        self.assertTrue(
+            douban_list.engine_fallback_enabled({douban_list.ENGINE_FALLBACK_ENV: '1'}))
+
+    def test_only_one_enables(self):
+        for value in ('0', 'true', 'yes', '', 'no'):
+            with self.subTest(value=value):
+                self.assertFalse(
+                    douban_list.engine_fallback_enabled(
+                        {douban_list.ENGINE_FALLBACK_ENV: value}))
+
+
+class TestSearchEngine(unittest.TestCase):
+    """search_engine：解析 CLI JSON、同款 title_compatible 校验、退出码语义。"""
+
+    def test_hit_returns_compatible_engine_candidate(self):
+        cli = FakeEngineCli({'search': _proc(0, _engine_search_stdout([
+            {'source': 'www.yingsx.com', 'title': '斗破苍穹',
+             'author': '天蚕土豆', 'bookUrl': 'https://www.yingsx.com/book/1'},
+        ]))})
+        hit = douban_list.search_engine(cli, '斗破苍穹', '天蚕土豆')
+        self.assertEqual(hit, {'url': 'https://www.yingsx.com/book/1',
+                               'title': '斗破苍穹', 'source': 'www.yingsx.com'})
+        # author 非空时随 --author 传入
+        self.assertEqual(cli.calls[0],
+                         ('search', ['--title', '斗破苍穹', '--author', '天蚕土豆']))
+
+    def test_author_omitted_when_empty(self):
+        cli = FakeEngineCli({'search': _proc(1)})
+        douban_list.search_engine(cli, '斗破苍穹')
+        self.assertEqual(cli.calls[0], ('search', ['--title', '斗破苍穹']))
+
+    def test_book15_source_candidate_is_skipped(self):
+        # book15 路径已搜过（这是兜底），候选里的 book15.net 条目跳过
+        cli = FakeEngineCli({'search': _proc(0, _engine_search_stdout([
+            {'source': 'book15.net', 'title': '斗破苍穹', 'author': '',
+             'bookUrl': 'https://book15.net/books/details1.html'},
+        ]))})
+        self.assertIsNone(douban_list.search_engine(cli, '斗破苍穹'))
+
+    def test_incompatible_title_is_rejected(self):
+        # 同款 title_compatible：中部命中的同人书拦下
+        cli = FakeEngineCli({'search': _proc(0, _engine_search_stdout([
+            {'source': 'www.yingsx.com', 'title': '一切从斗破苍穹开始',
+             'author': '', 'bookUrl': 'https://www.yingsx.com/book/9'},
+        ]))})
+        self.assertIsNone(douban_list.search_engine(cli, '斗破苍穹'))
+
+    def test_first_compatible_non_book15_wins(self):
+        cli = FakeEngineCli({'search': _proc(0, _engine_search_stdout([
+            {'source': 'book15.net', 'title': '剑来', 'author': '',
+             'bookUrl': 'https://book15.net/books/details2.html'},
+            {'source': 'www.jhsssd.com', 'title': '剑来', 'author': '烽火戏诸侯',
+             'bookUrl': 'https://www.jhsssd.com/book/7'},
+        ]))})
+        hit = douban_list.search_engine(cli, '剑来')
+        self.assertEqual(hit['source'], 'www.jhsssd.com')
+        self.assertEqual(hit['url'], 'https://www.jhsssd.com/book/7')
+
+    def test_exit_code_1_is_normal_miss(self):
+        cli = FakeEngineCli({'search': _proc(1, '', '无候选：某书')})
+        self.assertIsNone(douban_list.search_engine(cli, '某书'))
+
+    def test_exit_code_2_raises_unavailable(self):
+        cli = FakeEngineCli({'search': _proc(2, '', '引擎源池不可用：[redacted-url]')})
+        with self.assertRaises(douban_list.EngineUnavailable):
+            douban_list.search_engine(cli, '某书')
+
+    def test_unknown_nonzero_raises_unavailable(self):
+        cli = FakeEngineCli({'search': _proc(7, '', 'boom')})
+        with self.assertRaises(douban_list.EngineUnavailable):
+            douban_list.search_engine(cli, '某书')
+
+    def test_bad_json_is_treated_as_miss(self):
+        cli = FakeEngineCli({'search': _proc(0, 'not json')})
+        self.assertIsNone(douban_list.search_engine(cli, '某书'))
+
+    def test_subprocess_error_raises_unavailable(self):
+        class Boom:
+            def run(self, *a):
+                raise OSError('node not found')
+        with self.assertRaises(douban_list.EngineUnavailable):
+            douban_list.search_engine(Boom(), '某书')
+
+
+class TestResolveCandidatesEngineFallback(unittest.TestCase):
+    """_resolve_candidates 接入引擎兜底：book15 miss 才回落；开关关闭行为不变。"""
+
+    def setUp(self):
+        no_wait(self)
+
+    def test_engine_fallback_off_is_unchanged(self):
+        # engine_cli=None（开关关闭）：book15 miss 直接进 miss，队列条目无 engine 标记
+        cands = [{'title': '斗破苍穹', 'author': '天蚕土豆'}]
+        queue = douban_list._resolve_candidates(
+            cands, lambda url: NO_RESULT_HTML, origin='测试')
+        self.assertEqual(queue, [])
+
+    def test_book15_miss_falls_back_to_engine(self):
+        cli = FakeEngineCli({'search': _proc(0, _engine_search_stdout([
+            {'source': 'www.yingsx.com', 'title': '斗破苍穹',
+             'author': '天蚕土豆', 'bookUrl': 'https://www.yingsx.com/book/1'},
+        ]))})
+        cands = [{'title': '斗破苍穹', 'author': '天蚕土豆', 'douban_url': 'd'}]
+        queue = douban_list._resolve_candidates(
+            cands, lambda url: NO_RESULT_HTML, origin='测试', engine_cli=cli)
+        self.assertEqual(len(queue), 1)
+        b = queue[0]
+        self.assertEqual(b['url'], 'https://www.yingsx.com/book/1')
+        self.assertTrue(b['engine'])
+        self.assertEqual(b['source_host'], 'www.yingsx.com')
+        self.assertEqual(b['title'], '斗破苍穹')
+        self.assertEqual(b['category'], '测试')
+
+    def test_book15_hit_wins_engine_not_called(self):
+        cli = FakeEngineCli({'search': _proc(0, _engine_search_stdout([]))})
+        pages = {'/books/search.html?kw=' + urllib.parse.quote('盗墓笔记'):
+                 book15_search_html('盗墓笔记7', '/books/details42.html')}
+        queue = douban_list._resolve_candidates(
+            [{'title': '盗墓笔记'}], lambda url: pages.get(url, NO_RESULT_HTML),
+            engine_cli=cli)
+        self.assertEqual(queue[0]['url'], '/books/details42.html')
+        self.assertNotIn('engine', queue[0])   # book15 命中不带引擎标记
+        self.assertEqual(cli.calls, [])          # 引擎未被调用
+
+    def test_exit_code_2_disables_engine_for_the_rest_of_the_round(self):
+        # 第一本触发退出码 2 → 本轮禁用引擎，后续 book15-miss 不再重试引擎
+        cli = FakeEngineCli({'search': _proc(2, '', '引擎源池不可用')})
+        cands = [{'title': '甲书'}, {'title': '乙书'}]
+        queue = douban_list._resolve_candidates(
+            cands, lambda url: NO_RESULT_HTML, engine_cli=cli)
+        self.assertEqual(queue, [])
+        self.assertEqual(len(cli.calls), 1)      # 只调了一次就禁用，不连坐重试
+
+    def test_skip_titles_gate_applies_before_engine(self):
+        cli = FakeEngineCli({'search': _proc(0, _engine_search_stdout([
+            {'source': 'www.yingsx.com', 'title': '剑来', 'author': '',
+             'bookUrl': 'https://www.yingsx.com/book/1'},
+        ]))})
+        queue = douban_list._resolve_candidates(
+            [{'title': '剑来'}], lambda url: NO_RESULT_HTML,
+            skip_titles={'剑来'}, engine_cli=cli)
+        self.assertEqual(queue, [])
+        self.assertEqual(cli.calls, [])          # 已打标：连 book15 带引擎都不搜
 
 
 if __name__ == '__main__':
