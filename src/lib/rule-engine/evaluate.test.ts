@@ -72,8 +72,11 @@ const SYNTH = `<!DOCTYPE html><html><body>
 const synthScope = () => createHtmlScope(SYNTH, PAGE_URL);
 
 describe('evaluate：CSS 链求值（§3.2 四步）', () => {
-  it('逐段 find + 末端操作：多命中按换行连接', () => {
-    expect(evaluateField(field('ul@li@a@text'), synthScope())).toBe('第一条\n第二条\n第三条');
+  // 单值字段默认取首个非空（applyTerminal multi=false，等价 legado 单值字段 first()）。
+  // 旧行为是把多命中按 \n 全量拼接——这正是 yingsx 一类 `li` 含多个 a 时把 URL 拼坏、
+  // 整条候选被丢的根因（fix/engine-first-match）。正文的多节点拼接见「正文多段拼接」用例。
+  it('多命中取首个非空（不再 \\n 拼接）', () => {
+    expect(evaluateField(field('ul@li@a@text'), synthScope())).toBe('第一条');
   });
 
   it('索引与负数索引从尾数（.0 / .-1）', () => {
@@ -81,18 +84,51 @@ describe('evaluate：CSS 链求值（§3.2 四步）', () => {
     expect(evaluateField(field('ul@li.-1@a@text'), synthScope())).toBe('第三条');
   });
 
-  it('切片 .a:b 与超出范围不报错', () => {
-    expect(evaluateField(field('ul@li.0:2@a@text'), synthScope())).toBe('第一条\n第二条');
+  it('切片 .a:b 与超出范围不报错（切片后仍取首个非空）', () => {
+    expect(evaluateField(field('ul@li.0:2@a@text'), synthScope())).toBe('第一条');
     expect(evaluateField(field('ul@li.5:9@a@text'), synthScope())).toBe('');
   });
 
-  it('排除 !n / !-n', () => {
-    expect(evaluateField(field('ul@li!1@a@text'), synthScope())).toBe('第一条\n第三条');
-    expect(evaluateField(field('ul@li!-1@a@text'), synthScope())).toBe('第一条\n第二条');
+  it('排除 !n / !-n（排除后仍取首个非空）', () => {
+    expect(evaluateField(field('ul@li!1@a@text'), synthScope())).toBe('第一条');
+    expect(evaluateField(field('ul@li!-1@a@text'), synthScope())).toBe('第一条');
   });
 
   it('索引越界 → 空字段（不抛异常）', () => {
     expect(evaluateField(field('ul@li.9@a@text'), synthScope())).toBe('');
+  });
+});
+
+// yingsx 复现：bookList 的 li 内含「标题a + 最新章节a」，name=a@text / bookUrl=a@href。
+// 修前两个 a 被 \n 拼接 → bookUrl 多行 → 绝对化/校验失败 → 整条候选被丢 → 全池 0。
+// 修后取首个非空 → 拿到标题与书链接（首个 a 是书本身，次个是最新章节）。
+describe('首命中复现：列表条目内多个 a（yingsx 普遍结构）', () => {
+  const YINGSX = `<ul class="novelslist2">
+    <li class="row">
+      <a href="/137_137506/">末日成神：我的都是我的异能</a>
+      <a href="/137_137506/49994452.html">第69章 魔师</a>
+    </li>
+  </ul>`;
+  const url = 'https://www.yingsx.com/xiaoshuo/1_1/';
+  it('name 取首个 a 的文本，bookUrl 取首个 a 的 href（不再拼接）', () => {
+    const scope = createHtmlScope(YINGSX, url);
+    const item = insideNode(scope, evaluateFieldNodes(field('class.novelslist2@li'), scope).get(0));
+    expect(evaluateField(field('a@text'), item)).toBe('末日成神：我的都是我的异能');
+    expect(evaluateField(field('a@href'), item)).toBe('https://www.yingsx.com/137_137506/');
+  });
+});
+
+// 正文是唯一 multi=true 字段：@p@text 类规则靠拼接把多段落拼成整章（40/174 源依赖）。
+describe('正文多段拼接：multi=true 保留 \\n 拼接，multi=false 只取首段', () => {
+  const CHAPTER = `<div id="content"><p>第一段。</p><p>第二段。</p><p>第三段。</p></div>`;
+  const url = 'https://example.com/c/1.html';
+  it('multi=true → 三段以换行拼接（正文门面口径）', () => {
+    const scope = createHtmlScope(CHAPTER, url);
+    expect(evaluateField(field('id.content@p@text'), scope, true)).toBe('第一段。\n第二段。\n第三段。');
+  });
+  it('multi=false（默认）→ 只取首段（证明单值字段不会误拼正文）', () => {
+    const scope = createHtmlScope(CHAPTER, url);
+    expect(evaluateField(field('id.content@p@text'), scope)).toBe('第一段。');
   });
 });
 
@@ -116,7 +152,8 @@ describe('evaluate：TerminalOp 语义表（§3.2）', () => {
 
   it('URL 类属性绝对化（href/src），相对与绝对都归一', () => {
     const $ = synthScope();
-    expect(evaluateField(field('ul@li@a@href'), $)).toBe('https://book15.net/x/1.html\nhttps://other.example/x/2.html\nhttps://book15.net/x/3.html');
+    // 首命中：多个 li 的 a@href 只取首个绝对化成功的值（不再 \n 拼接多条 URL）。
+    expect(evaluateField(field('ul@li@a@href'), $)).toBe('https://book15.net/x/1.html');
     expect(evaluateField(field('ul@li.0@a@src'), $)).toBe('https://book15.net/s/1.jpg');
   });
 

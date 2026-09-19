@@ -34,9 +34,12 @@ function field(compiled: CompiledRules, name: string): FieldIr | undefined {
   return found && !('skipped' in found) ? found : undefined;
 }
 
-function evaluateText(compiled: CompiledRules, name: string, scope: ReturnType<typeof createScope>): string {
+// 单值字段默认取首命中（applyTerminal multi=false）；仅正文拼接多段落。
+function evaluateText(
+  compiled: CompiledRules, name: string, scope: ReturnType<typeof createScope>, multi = false,
+): string {
   const ir = field(compiled, name);
-  return ir ? evaluateField(ir, scope) : '';
+  return ir ? evaluateField(ir, scope, multi) : '';
 }
 
 /** 相对→绝对化 + 过运行时 host 门（§3.2/§6.1）；不合法返回 undefined（丢弃，不猜测）。 */
@@ -135,7 +138,8 @@ export async function engineFetchContent(
     visited.add(next);
     const page = await context.page(next);
     const scope = createScope(normalizeBody(page.text), page.url);
-    const content = evaluateText(source.compiled, 'ruleContent.content', scope);
+    // 正文是唯一「多节点拼接」字段：@p@text 类规则靠 multi=true 把多段落拼成整章。
+    const content = evaluateText(source.compiled, 'ruleContent.content', scope, true);
     if (content) parts.push(content);
     next = scope.kind === 'html'
       ? absoluteUrl(evaluateText(source.compiled, 'ruleContent.nextContentUrl', scope), page.url)
