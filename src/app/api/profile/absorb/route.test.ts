@@ -7,6 +7,8 @@ import { NextRequest } from 'next/server';
 const mocks = vi.hoisted(() => ({
   ensureSchema: vi.fn(),
   getProfileFeedbackQueueForUser: vi.fn(),
+  claimProfileFeedbackForUser: vi.fn(),
+  getProfileFeedbackFailCountForUser: vi.fn(),
   getProfileForUser: vi.fn(),
   getProfileFeedbackForUser: vi.fn(),
   getWithdrawnFeedbackBookTitlesForUser: vi.fn(),
@@ -20,6 +22,8 @@ const mocks = vi.hoisted(() => ({
 vi.mock('@/lib/db', async (importOriginal) => ({
   ...await importOriginal<typeof import('@/lib/db')>(),
   getProfileFeedbackQueueForUser: mocks.getProfileFeedbackQueueForUser,
+  claimProfileFeedbackForUser: mocks.claimProfileFeedbackForUser,
+  getProfileFeedbackFailCountForUser: mocks.getProfileFeedbackFailCountForUser,
   getProfileForUser: mocks.getProfileForUser,
   getProfileFeedbackForUser: mocks.getProfileFeedbackForUser,
   getWithdrawnFeedbackBookTitlesForUser: mocks.getWithdrawnFeedbackBookTitlesForUser,
@@ -44,12 +48,15 @@ function request(method: 'POST' | 'GET', body?: unknown) {
   });
 }
 
-const pendingQueue = { pendingFeedbackId: 7, absorbedFeedbackId: 3, status: 'pending', attempts: 1, lastError: '', updatedAt: 'v1' };
+const pendingQueue = { pendingFeedbackId: 7, absorbedFeedbackId: 3, status: 'pending', attempts: 1, lastError: '', updatedAt: 'v1', nextEligibleAt: null };
 
 beforeEach(() => {
   vi.clearAllMocks();
   vi.stubEnv('APP_OWNER_TOKEN', 'absorb-test-owner');
   mocks.ensureSchema.mockResolvedValue(undefined);
+  // F15 租约：默认领取成功（候选 7），既有状态机用例不感知租约细节。
+  mocks.claimProfileFeedbackForUser.mockResolvedValue(7);
+  mocks.getProfileFeedbackFailCountForUser.mockResolvedValue(0);
   mocks.getProfileFeedbackQueueForUser.mockResolvedValue(pendingQueue);
   mocks.getProfileForUser.mockResolvedValue({ seeds: [], content: '旧画像', updatedAt: 'v1' });
   mocks.getProfileFeedbackForUser.mockResolvedValue([{ title: '书甲', author: '作者', status: 'dropped', note: '讨厌机械降神' }]);
@@ -69,6 +76,8 @@ afterEach(() => {
 
 describe('POST /api/profile/absorb (F15 state machine)', () => {
   it('returns unchanged without a model call when nothing is pending', async () => {
+    // F15 租约：没有 pending 时领取（claim）落 0 行，吸收路径不调模型。
+    mocks.claimProfileFeedbackForUser.mockResolvedValue(null);
     mocks.getProfileFeedbackQueueForUser.mockResolvedValue({ ...pendingQueue, pendingFeedbackId: null, status: 'applied' });
 
     const res = await POST(request('POST'));
@@ -91,7 +100,7 @@ describe('POST /api/profile/absorb (F15 state machine)', () => {
     expect(prompt).toContain('讨厌机械降神');
     expect(prompt).toContain('喜欢严谨设定');
     expect(mocks.saveProfileForUser).toHaveBeenCalledWith(1, [], '合并后的画像', 'v1', expect.any(Function));
-    expect(mocks.markProfileFeedbackAbsorbedForUser).toHaveBeenCalledWith(1, 7, 'applied', expect.any(Function));
+    expect(mocks.markProfileFeedbackAbsorbedForUser).toHaveBeenCalledWith(1, 7, 'applied', expect.any(Function), expect.any(String));
   });
 
   it('keeps pending and reports failed when the model fails, then applies on a successful replay', async () => {
@@ -101,12 +110,12 @@ describe('POST /api/profile/absorb (F15 state machine)', () => {
     const failed = await POST(request('POST'));
     expect(await failed.json()).toMatchObject({ status: 'failed', pendingFeedbackId: 7 });
     expect(mocks.saveProfileForUser).not.toHaveBeenCalled();
-    expect(mocks.markProfileFeedbackFailedForUser).toHaveBeenCalledWith(1, 'failed', 'Error', expect.any(Function));
+    expect(mocks.markProfileFeedbackFailedForUser).toHaveBeenCalledWith(1, 'failed', 'Error', expect.any(Function), expect.any(String));
 
     // 下一次机会：同步 pending 仍在，模型恢复 → 最终 applied，水位推进。
     const replay = await POST(request('POST'));
     expect(await replay.json()).toMatchObject({ status: 'applied', pendingFeedbackId: null });
-    expect(mocks.markProfileFeedbackAbsorbedForUser).toHaveBeenLastCalledWith(1, 7, 'applied', expect.any(Function));
+    expect(mocks.markProfileFeedbackAbsorbedForUser).toHaveBeenLastCalledWith(1, 7, 'applied', expect.any(Function), expect.any(String));
   });
 
   it('reports unchanged when the model returns the profile byte-for-byte, still advancing the watermark', async () => {
@@ -116,7 +125,7 @@ describe('POST /api/profile/absorb (F15 state machine)', () => {
     const res = await POST(request('POST'));
 
     expect(await res.json()).toMatchObject({ status: 'unchanged', pendingFeedbackId: null });
-    expect(mocks.markProfileFeedbackAbsorbedForUser).toHaveBeenCalledWith(1, 7, 'unchanged', expect.any(Function));
+    expect(mocks.markProfileFeedbackAbsorbedForUser).toHaveBeenCalledWith(1, 7, 'unchanged', expect.any(Function), expect.any(String));
   });
 
   it('reports conflict and keeps pending when another writer wins the profile CAS', async () => {
@@ -125,7 +134,7 @@ describe('POST /api/profile/absorb (F15 state machine)', () => {
     const res = await POST(request('POST'));
 
     expect(await res.json()).toMatchObject({ status: 'conflict', pendingFeedbackId: 7 });
-    expect(mocks.markProfileFeedbackFailedForUser).toHaveBeenCalledWith(1, 'conflict', 'ProfileConflict', expect.any(Function));
+    expect(mocks.markProfileFeedbackFailedForUser).toHaveBeenCalledWith(1, 'conflict', 'ProfileConflict', expect.any(Function), expect.any(String));
     expect(mocks.markProfileFeedbackAbsorbedForUser).not.toHaveBeenCalled();
   });
 
@@ -170,7 +179,7 @@ describe('POST /api/profile/absorb (F15 state machine)', () => {
 
     expect(await res.json()).toMatchObject({ status: 'unchanged' });
     expect(mocks.chatRobust).not.toHaveBeenCalled();
-    expect(mocks.markProfileFeedbackAbsorbedForUser).toHaveBeenCalledWith(1, 7, 'unchanged', expect.any(Function));
+    expect(mocks.markProfileFeedbackAbsorbedForUser).toHaveBeenCalledWith(1, 7, 'unchanged', expect.any(Function), expect.any(String));
   });
 });
 

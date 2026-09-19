@@ -391,7 +391,8 @@ export function enqueueProfileFeedbackForUserQuery(sql: PersonalQuery, userId: n
 
 export function profileFeedbackQueueForUserQuery(sql: PersonalQuery, userId: number) {
   requireUserId(userId);
-  return sql`SELECT pending_feedback_id, absorbed_feedback_id, status, attempts, last_error, updated_at::text AS updated_at
+  return sql`SELECT pending_feedback_id, absorbed_feedback_id, status, attempts, last_error, updated_at::text AS updated_at,
+    next_eligible_at::text AS next_eligible_at
     FROM profile_feedback_queue WHERE user_id = ${userId}`;
 }
 

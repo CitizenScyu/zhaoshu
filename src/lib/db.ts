@@ -244,13 +244,15 @@ export interface ProfileFeedbackQueueState {
   attempts: number;
   lastError: string;
   updatedAt: string;
+  /** 退避到期时刻（ISO 文本）；NULL = 无退避。absorb 路由用它区分 busy 与 failed。 */
+  nextEligibleAt: string | null;
 }
 
 export async function getProfileFeedbackQueueForUser(userId: number): Promise<ProfileFeedbackQueueState | null> {
   requireUserId(userId);
   const rows = await profileFeedbackQueueForUserQuery(getSql(), userId) as {
     pending_feedback_id: number | null; absorbed_feedback_id: number; status: string;
-    attempts: number; last_error: string; updated_at: string;
+    attempts: number; last_error: string; updated_at: string; next_eligible_at: string | null;
   }[];
   const row = rows?.[0];
   if (!row) return null;
@@ -261,6 +263,7 @@ export async function getProfileFeedbackQueueForUser(userId: number): Promise<Pr
     attempts: row.attempts,
     lastError: row.last_error,
     updatedAt: row.updated_at,
+    nextEligibleAt: row.next_eligible_at,
   };
 }
 

@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { NextRequest, NextResponse } from 'next/server';
 import { ensureSchema, getProfileFeedbackQueueForUser } from '@/lib/db';
 import { configuredTotalTimeoutMs } from '@/lib/llm';
@@ -16,8 +17,10 @@ export async function POST(req: NextRequest) {
   return withFindAccess(req, MODEL_ROUTE_INTERNAL_BUDGET_MS, async (access) => {
     await access.run(ensureSchema);
     const budgetMs = Math.min(access.deadline.modelBudgetMs(MODEL_CEILING_MS), configuredTotalTimeoutMs());
+    // F15 租约：领取 token 每次请求新生成；吸收路径内部先 claim 再调模型（拿不到租约
+    // 不调模型），完成提交校验 token 未易主。见 profile-absorption.ts 注释。
     const result = await access.commit((write) => absorbPendingProfileFeedback({
-      userId: access.principal.userId, write, signal: access.signal, modelBudgetMs: budgetMs,
+      userId: access.principal.userId, leaseToken: randomUUID(), write, signal: access.signal, modelBudgetMs: budgetMs,
     }));
     return NextResponse.json({ ok: true, ...result });
   });
@@ -34,6 +37,8 @@ export async function GET(req: NextRequest) {
       pending: queue?.pendingFeedbackId != null,
       pendingFeedbackId: queue?.pendingFeedbackId ?? null,
       attempts: queue?.attempts ?? 0,
+      // F15 退避可观测：退避窗口内 UI 可显示「稍后自动重试」；drain 每日兜底会接住。
+      nextEligibleAt: queue?.nextEligibleAt ?? null,
     });
   });
 }
