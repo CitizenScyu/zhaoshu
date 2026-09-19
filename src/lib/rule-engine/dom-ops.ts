@@ -100,8 +100,11 @@ export function applyTerminal(
     if (!multi && first !== null) return;
     const value = terminalValue($, node, terminal, pageUrl);
     if (value === null) return;
-    if (multi) values.push(value);
-    else if (first === null) first = value;
+    if (multi) { values.push(value); return; }
+    // 首命中取「首个非空」：`@text/@ownText/@html/@textNodes` 对空节点返回 '' 而非 null，
+    // 若首节点是空壳（如 `<a><img></a>` 后跟含书名的 `<a>`），跳过空串继续找下一节点。
+    // （与 legado textS 只收非空一致；multi=true 不跳空，保正文拼接零 diff。）
+    if (value !== '' && first === null) first = value;
   });
   return multi ? values.join(MULTI_JOIN) : (first ?? '');
 }

@@ -116,6 +116,17 @@ describe('首命中复现：列表条目内多个 a（yingsx 普遍结构）', (
     expect(evaluateField(field('a@text'), item)).toBe('末日成神：我的都是我的异能');
     expect(evaluateField(field('a@href'), item)).toBe('https://www.yingsx.com/137_137506/');
   });
+
+  // 首命中取「首个非空」：首个 a 是封面图壳（@text 得 ''），书名在次个 a。
+  // 若只判 null 会卡在空串返回 ''；空串跳过后才取到书名。
+  it('首节点为空壳（封面图在前）→ 跳过空串取到书名', () => {
+    const COVER_FIRST = `<ul class="novelslist2"><li>
+      <a href="/b/1"><img src="/cover.jpg"></a><a href="/b/1">书名</a>
+    </li></ul>`;
+    const scope = createHtmlScope(COVER_FIRST, 'https://www.yingsx.com/');
+    const item = insideNode(scope, evaluateFieldNodes(field('class.novelslist2@li'), scope).get(0));
+    expect(evaluateField(field('a@text'), item)).toBe('书名');
+  });
 });
 
 // 正文是唯一 multi=true 字段：@p@text 类规则靠拼接把多段落拼成整章（40/174 源依赖）。
