@@ -206,6 +206,43 @@ describe('滤网 2 searchAdmission 判定分桶', () => {
     expect(innerResult.verdict).toBe('ok');
     expect(inner).toHaveBeenCalledTimes(2);
   });
+
+  // checkKeyWord 取值（legado 标准嵌套位置优先）：DB 995 源顶层 checkKeyWord=0 行，
+  // 实际都在 ruleSearch.checkKeyWord。全用兜底词曾致 kanshuw 超时 / czhiyao 搜兜底词 0 结果。
+  describe('expandAdmissionSearchUrl 的 checkKeyWord 取值（嵌套优先）', () => {
+    const candidateHtml = '<div class="i"><span class="t">书名</span><a href="/b/1">x</a></div>';
+    const defaultRules = { bookList: '.i', name: '.t@text', bookUrl: 'a@href', author: '.a@text' };
+    // over.ruleSearch 与默认核心规则合并（bookList 等不能被 checkKeyWord 用例冲掉）。
+    const assertUrlKeyword = async (over: Partial<RawSource>, expected: string) => {
+      const fetchPage = vi.fn<AdmissionTransport>().mockResolvedValue(page(candidateHtml));
+      const { ruleSearch, ...rest } = over;
+      const source = syntheticSource('https://kw.example.com/', {
+        ...rest, ruleSearch: { ...defaultRules, ...(ruleSearch as Record<string, unknown> | undefined) },
+      });
+      const result = await searchAdmission(source, {
+        fetchPage, declaredHosts: declared('kw.example.com'), signal: signal(), throttleMs: 0,
+      });
+      expect(result.verdict).toBe('ok');
+      expect(fetchPage.mock.calls[0][0]).toBe(`https://kw.example.com/s?q=${encodeURIComponent(expected)}`);
+    };
+
+    it('嵌套 ruleSearch.checkKeyWord 生效（源自带词，非兜底词）', async () => {
+      await assertUrlKeyword({ ruleSearch: { checkKeyWord: '我的' } }, '我的');
+    });
+
+    it('嵌套为空白时回落顶层 checkKeyWord（非标准源兼容）', async () => {
+      await assertUrlKeyword({ checkKeyWord: '山海经', ruleSearch: { checkKeyWord: '  ' } }, '山海经');
+    });
+
+    it('无嵌套时顶层 checkKeyWord 生效', async () => {
+      // syntheticSource 默认顶层 checkKeyWord=「测试关键字」、ruleSearch 无该字段。
+      await assertUrlKeyword({}, '测试关键字');
+    });
+
+    it('嵌套与顶层都无 → 落 DEFAULT_ADMISSION_KEYWORD（现有行为不变）', async () => {
+      await assertUrlKeyword({ checkKeyWord: '' }, '斗破苍穹');
+    });
+  });
 });
 
 describe('滤网 2 IP/私网负例（v3 E4：两把锁同防线）', () => {

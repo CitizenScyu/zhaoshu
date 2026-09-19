@@ -237,8 +237,12 @@ function expandAdmissionSearchUrl(source: RawSource, declaredHosts: ReadonlySet<
   if (typeof template !== 'string' || template.length > 2048 || !/\{\{key\}\}/.test(template)) {
     throw new SourcePolicyError('书源缺少支持的搜索模板');
   }
-  const keyword = typeof source.checkKeyWord === 'string' && source.checkKeyWord.trim()
-    ? source.checkKeyWord.trim() : DEFAULT_ADMISSION_KEYWORD;
+  // legado 标准位置是嵌套 ruleSearch.checkKeyWord（DB 995 源顶层无此字段）；
+  // 顶层 source.checkKeyWord 仅作非标准源兼容，都无才落兜底词。
+  const nestedKeyword = (source.ruleSearch as Record<string, unknown> | undefined)?.checkKeyWord;
+  const keyword = (typeof nestedKeyword === 'string' && nestedKeyword.trim() ? nestedKeyword
+    : typeof source.checkKeyWord === 'string' && source.checkKeyWord.trim() ? source.checkKeyWord
+      : DEFAULT_ADMISSION_KEYWORD).trim();
   const expanded = template.replace(/\{\{key\}\}/g, encodeURIComponent(keyword)).replace(/\{\{page\}\}/g, '1');
   if (/[{}]|@js:|<js>|,\s*\[/i.test(expanded)) throw new SourcePolicyError('不支持该书源的动态搜索规则');
   const base = typeof source.bookSourceUrl === 'string' ? source.bookSourceUrl : undefined;
