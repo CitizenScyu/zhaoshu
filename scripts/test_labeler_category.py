@@ -148,5 +148,113 @@ class TestLoadStubUrls(unittest.TestCase):
             Path(self.tmp.name) / 'nope.jsonl'), set())
 
 
+class TestStubTimesLimit(unittest.TestCase):
+    """P1 核心组合断言：残本 × --limit —— 残本不得永久占住 --limit 名额把正常书饿死。
+
+    诊断（labeler.py 文件头 P1）：残本候选一旦记入 labels-stub.jsonl，下轮必须与
+    done_urls **同口径**在 split_queue 中先剔除，再切 --limit。否则残本堆在队首、
+    小 limit 一切全是残本，正常书永远排不进本轮视野（exit 0 的饥饿）。
+    现有 42 例（source/pinned/clean/import/engine）无一覆盖「残本 × limit」这一组合。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        d = Path(self.tmp.name)
+        (d / '.env').write_text('LLM_API_KEY=test-key-not-real\n', encoding='utf-8')
+        self.data_dir = d
+        # details1..5 = 已记录的残本；details6..10 = 正常书
+        self.stub_urls = [labeler.BASE + f'/books/details{i}.html' for i in range(1, 6)]
+        write_jsonl(d / 'labels-stub.jsonl',
+                    [{'url': u, 'title': f'残本{i}', 'reason': '章节数 3 < 10'}
+                     for i, u in enumerate(self.stub_urls, 1)])
+        self.books = (
+            [{'url': f'/books/details{i}.html', 'title': f'残本{i}'} for i in range(1, 6)]
+            + [{'url': f'/books/details{i}.html', 'title': f'正常{i}'} for i in range(6, 11)])
+
+    def _dry_run(self, limit):
+        import contextlib
+        import io
+        buf = io.StringIO()
+        from unittest import mock
+        with mock.patch.dict(os.environ, {'LABELER_DATA_DIR': str(self.data_dir)}), \
+                mock.patch.object(labeler, 'fetch_rank_books', return_value=list(self.books)), \
+                mock.patch.object(sys, 'argv', ['labeler.py', '--dry-run', '--no-db-model',
+                                                '--limit', str(limit)]), \
+                contextlib.redirect_stdout(buf):
+            rc = labeler.main()
+        return rc, buf.getvalue()
+
+    def test_recorded_stubs_folded_into_skip_before_limit(self):
+        """残本折进「已完成」侧先剔除，--limit 只切在正常书上——正常书不被饿死。"""
+        rc, out = self._dry_run(3)
+        self.assertEqual(rc, 0)
+        # 5 残本折进跳过侧（含钉子户 0），正常书 5 本切到 limit=3
+        self.assertIn('本轮处理 3 本（跳过已完成 5 本（含钉子户 0 本））', out)
+        # 关键：正常书确实进了本轮视野（没被残本占满 limit 饿死）
+        self.assertIn(' - 正常6', out)
+        self.assertIn(' - 正常8', out)
+        # 残本一个都不在本轮队列（被当作已完成跳过）
+        for i in range(1, 6):
+            self.assertNotIn(f' - 残本{i}', out)
+        # limit=3 生效：正常 9/10 被切掉
+        self.assertNotIn(' - 正常9', out)
+        self.assertNotIn(' - 正常10', out)
+
+    def test_all_stubs_recorded_means_no_starvation_regression(self):
+        """变异钉：若 main() 改回 `done_urls`（漏掉 `| stub_urls`），残本会重回队首，
+        limit=2 时本轮全是残本、正常书 0 本 —— 下面对正常书的断言必红。"""
+        rc, out = self._dry_run(2)
+        self.assertEqual(rc, 0)
+        self.assertIn('本轮处理 2 本', out)
+        self.assertIn(' - 正常6', out)
+        self.assertIn(' - 正常7', out)
+
+
+class TestRuntimeStubDetection(unittest.TestCase):
+    """运行时残本检测（非 dry-run）：章节数不足的书被记入 labels-stub.jsonl，
+    形成 P1 闭环（下轮据此跳过）。全离线：http_get 打桩、不触达 LLM。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        d = Path(self.tmp.name)
+        (d / '.env').write_text('LLM_API_KEY=test-key-not-real\n', encoding='utf-8')
+        self.data_dir = d
+        # 详情页只有 3 章（< STUB_MIN_CHAPTERS=10）⇒ 章节数短路判残本，绝不抓全本正文
+        self.detail_html = (
+            '<html><body>'
+            '<dd><a href="/chapter/index1-1.html">第一章</a></dd>'
+            '<dd><a href="/chapter/index1-2.html">第二章</a></dd>'
+            '<dd><a href="/chapter/index1-3.html">第三章</a></dd>'
+            '</body></html>')
+        self.books = [{'url': f'/books/details{i}.html', 'title': f'残本{i}'}
+                      for i in range(1, 4)]
+
+    def test_short_book_recorded_to_stub_and_never_reaches_llm(self):
+        import contextlib
+        import io
+        from unittest import mock
+        buf = io.StringIO()
+
+        def boom(*a, **k):
+            raise AssertionError('残本不应触达 label_book（应在章节数处短路）')
+
+        with mock.patch.dict(os.environ, {'LABELER_DATA_DIR': str(self.data_dir)}), \
+                mock.patch.object(labeler, 'fetch_rank_books', return_value=list(self.books)), \
+                mock.patch.object(labeler, 'http_get', return_value=self.detail_html), \
+                mock.patch.object(labeler, 'label_book', side_effect=boom), \
+                mock.patch.object(sys, 'argv', ['labeler.py', '--no-db-model', '--limit', '5']), \
+                contextlib.redirect_stdout(buf):
+            rc = labeler.main()
+        out = buf.getvalue()
+        self.assertEqual(rc, 0)                      # 无成功也无失败（残本跳过），fail==0
+        self.assertIn('残本候选跳过 3', out)
+        stub_written = labeler.load_stub_urls(self.data_dir / 'labels-stub.jsonl')
+        # 三本残本 url 全部落盘 → 下轮 load_stub_urls 会把它们折进跳过侧（P1 闭环）
+        self.assertEqual(stub_written,
+                         {labeler.BASE + f'/books/details{i}.html' for i in range(1, 4)})
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)
