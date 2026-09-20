@@ -60,3 +60,6 @@ labels.jsonl
 # python
 __pycache__/
 *.pyc
+
+# T8 运行包打包产物（esbuild bundle + tar，可重复生成）
+runtime-download/build/
