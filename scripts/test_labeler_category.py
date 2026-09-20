@@ -380,6 +380,125 @@ class TestStubTimesLimit(unittest.TestCase):
         self.assertIn(' - 正常7', out)
 
 
+class TestFrameworkAlignment(unittest.TestCase):
+    """分类入口接 master 源分派框架（任务 2/3）：章节列表经 BookSource.chapters_from_html
+    解析（无 branch 重复的 _CHAPTER_ANCHOR_RE/parse_chapters）；惰性元数据现抓详情页复用。"""
+
+    def test_no_duplicate_chapter_parsing_symbols(self):
+        """变异钉：若有人把 branch 的 parse_chapters/_CHAPTER_ANCHOR_RE 加回来，本用例必红。"""
+        self.assertFalse(hasattr(labeler, 'parse_chapters'))
+        self.assertFalse(hasattr(labeler, '_CHAPTER_ANCHOR_RE'))
+
+    def test_chapters_parsed_via_book_source_adapter(self):
+        self.assertEqual(len(labeler.BOOK15.chapters_from_html(DETAIL_HTML)), 12)
+
+    def test_parse_book_meta_reads_og_fields(self):
+        self.assertEqual(labeler.parse_book_meta(DETAIL_HTML),
+                         {'author': '忘语', 'category': '玄幻奇幻', 'status': '连载中'})
+
+    def test_missing_meta_fields_are_empty_strings(self):
+        self.assertEqual(labeler.parse_book_meta('<html></html>'),
+                         {'author': '', 'category': '', 'status': ''})
+
+    def test_fetch_book_meta_swallows_errors(self):
+        original = labeler.http_get
+        labeler.http_get = lambda url, timeout=30: (_ for _ in ()).throw(RuntimeError('boom'))
+        try:
+            self.assertEqual(labeler.fetch_book_meta('/books/details1.html'),
+                             {'author': '', 'category': '', 'status': ''})
+        finally:
+            labeler.http_get = original
+
+    def test_fetch_rank_books_no_longer_fetches_detail_pages(self):
+        """🔴 性能坑回归钉：候选阶段不得再逐本抓详情页（数千本时是主要耗时）。"""
+        calls = []
+        original = labeler.http_get
+        labeler.http_get = lambda url, timeout=30: (
+            calls.append(url) or f'<html>{_anchor(101, "甲")}{_anchor(102, "乙")}</html>')
+        try:
+            books = labeler.fetch_rank_books()
+        finally:
+            labeler.http_get = original
+        self.assertEqual(calls, [f'{labeler.BASE}/books/rank{r}.html'
+                                 for r in labeler.RANKS])
+        self.assertEqual(books, [{'url': '/books/details101.html', 'title': '甲'},
+                                 {'url': '/books/details102.html', 'title': '乙'}])
+
+    def test_fetch_book_text_reuses_detail_html_no_extra_get(self):
+        """detail_html 传入时复用其章节解析（省一次 GET）——章节经 chapters_from_html。"""
+        from unittest import mock
+
+        def boom(url, timeout=30):
+            raise AssertionError(f'传了 detail_html 就不该再抓详情页: {url}')
+        original_get, original_chapter = labeler.http_get, labeler.fetch_chapter_text
+        labeler.http_get = boom
+        labeler.fetch_chapter_text = lambda url, source=None: '正文' * 200  # 400 字/章
+        try:
+            with mock.patch.object(labeler.time, 'sleep', lambda s: None):
+                text, chars = labeler.fetch_book_text('/books/details1.html',
+                                                      detail_html=DETAIL_HTML)
+        finally:
+            labeler.http_get, labeler.fetch_chapter_text = original_get, original_chapter
+        self.assertEqual(chars, 12 * 400)
+        self.assertIn('【第1章 测试章节】', text)
+
+
+class TestHttpGetRetry(unittest.TestCase):
+    """站点 GET 重试：侦察实测 list-t-4 有一次 25s 超时后重试成功。移植自 branch2。"""
+
+    class _Resp:
+        def __init__(self, body):
+            self._body = body
+
+        def read(self):
+            return self._body
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    def _patch(self, side_effect, retry):
+        from unittest import mock
+        return (
+            mock.patch.object(labeler.urllib.request, 'urlopen', side_effect=side_effect),
+            mock.patch.object(labeler.time, 'sleep', lambda s: None),
+            mock.patch.object(labeler, 'HTTP_RETRY', retry),
+        )
+
+    def test_succeeds_on_retry(self):
+        import contextlib
+        import io
+        err = io.StringIO()
+        p1, p2, p3 = self._patch([TimeoutError('25s 超时'),
+                                  self._Resp('页面正文'.encode())], 1)
+        with p1, p2, p3, contextlib.redirect_stderr(err):
+            self.assertEqual(labeler.http_get('https://book15.net/x'), '页面正文')
+        self.assertIn('重试', err.getvalue())
+
+    def test_raises_after_retries_exhausted(self):
+        import contextlib
+        import io
+        p1, p2, p3 = self._patch([TimeoutError('超时'), TimeoutError('超时')], 1)
+        with p1, p2, p3, contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(TimeoutError):
+                labeler.http_get('https://book15.net/x')
+
+    def test_retry_zero_means_single_attempt(self):
+        calls = []
+
+        def fake_urlopen(req, timeout=30):
+            calls.append(1)
+            raise TimeoutError('超时')
+
+        p1, p2, p3 = self._patch(fake_urlopen, 0)
+        with p1, p2, p3:
+            with self.assertRaises(TimeoutError):
+                labeler.http_get('https://book15.net/x')
+        self.assertEqual(len(calls), 1)
+
+
 class TestRuntimeStubDetection(unittest.TestCase):
     """运行时残本检测（非 dry-run）：章节数不足的书被记入 labels-stub.jsonl，
     形成 P1 闭环（下轮据此跳过）。全离线：http_get 打桩、不触达 LLM。"""
