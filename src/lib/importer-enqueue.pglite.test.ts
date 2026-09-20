@@ -1,9 +1,7 @@
 // T5 PGlite 真库用例:labels 入库 + 系统入队同语句(=同事务)、幂等、边界与补账。
 //
 // 环境:复用 src/lib/fixtures/pglite.ts(缺依赖硬失败,不静默跳过)。
-// 迁移:用 T1 的 auth v7 迁移体(authSchemaV7Statement)建真实队列结构——本 worktree
-// 基于 master,还没有 v7 文件,所以这里本地复刻一份**只读参考**的 v7 DDL(见下),
-// 与 t1-worktree/src/lib/auth-store.ts 的 v7 逐字对齐;T1 合并后应改为 import。
+// 迁移:直接用 T1 的 auth v7 迁移体(authSchemaV7Statement)建真实队列结构。
 
 import { beforeEach, describe, expect, it } from 'vitest';
 import {
@@ -14,6 +12,7 @@ import {
   type ImportedLabelRecord,
   type ImporterSql,
 } from './importer-enqueue';
+import { authSchemaV7Statement } from './auth-store';
 import { loadPGlite, type PGliteLike } from './fixtures/pglite';
 
 type Row = Record<string, unknown>;
@@ -29,43 +28,6 @@ function adapter(pg: PGliteLike): ImporterSql {
     return (await pg.query(text, params)).rows;
   }) as ImporterSql;
 }
-
-// T1 v7 迁移体(只读参考,逐字对齐 t1-worktree/src/lib/auth-store.ts:7-63)。
-// 合并 T1 后本常量删除,改为 import { authSchemaV7Statement }。
-const AUTH_V7_STATEMENTS = (tx: (parts: TemplateStringsArray, ...values: unknown[]) => unknown): unknown[] => [
-  tx`CREATE TABLE IF NOT EXISTS auth_schema_migrations (
-      version integer PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now())`,
-  tx`INSERT INTO auth_schema_migrations(version) VALUES (7)`,
-
-  tx`ALTER TABLE download_tasks ADD COLUMN IF NOT EXISTS requested_by text NOT NULL DEFAULT 'user'`,
-  tx`ALTER TABLE download_tasks ADD COLUMN IF NOT EXISTS source_kind text NOT NULL DEFAULT 'builtin'`,
-  tx`ALTER TABLE download_tasks ADD COLUMN IF NOT EXISTS source_id text`,
-  tx`ALTER TABLE download_tasks ADD COLUMN IF NOT EXISTS source_revision text NOT NULL DEFAULT ''`,
-  tx`ALTER TABLE download_tasks ADD COLUMN IF NOT EXISTS policy_version text NOT NULL DEFAULT ''`,
-  tx`ALTER TABLE download_tasks ADD COLUMN IF NOT EXISTS enqueue_key text`,
-  tx`ALTER TABLE download_tasks ADD COLUMN IF NOT EXISTS attempt_count integer NOT NULL DEFAULT 1`,
-  tx`ALTER TABLE download_tasks ADD COLUMN IF NOT EXISTS next_attempt_at timestamptz`,
-  tx`ALTER TABLE download_tasks ADD COLUMN IF NOT EXISTS lease_generation integer NOT NULL DEFAULT 0`,
-  tx`ALTER TABLE download_tasks ADD COLUMN IF NOT EXISTS lease_owner text NOT NULL DEFAULT ''`,
-  tx`ALTER TABLE download_tasks ALTER COLUMN user_id DROP NOT NULL`,
-
-  tx`DO $$ BEGIN
-      IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'download_tasks_identity_check') THEN
-        ALTER TABLE download_tasks ADD CONSTRAINT download_tasks_identity_check CHECK (
-          (requested_by = 'user' AND user_id IS NOT NULL)
-          OR (requested_by = 'system' AND user_id IS NULL));
-      END IF;
-      IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'download_tasks_requested_by_check') THEN
-        ALTER TABLE download_tasks ADD CONSTRAINT download_tasks_requested_by_check
-          CHECK (requested_by IN ('user', 'system'));
-      END IF;
-    END $$`,
-
-  tx`CREATE UNIQUE INDEX IF NOT EXISTS download_tasks_system_active_book_idx
-      ON download_tasks (book_id) WHERE requested_by = 'system' AND status IN ('pending', 'running')`,
-  tx`CREATE UNIQUE INDEX IF NOT EXISTS download_tasks_system_event_idx
-      ON download_tasks (enqueue_key) WHERE requested_by = 'system' AND enqueue_key IS NOT NULL`,
-];
 
 const PGliteCtor = await loadPGlite();
 const maybe = PGliteCtor ? describe : describe.skip;
@@ -136,9 +98,8 @@ maybe('T5:labels 入库与系统入队同语句', () => {
       });
       return { text, params };
     };
-    for (const statement of AUTH_V7_STATEMENTS(tx) as { text: string; params: unknown[] }[]) {
-      await pg.query(statement.text, statement.params);
-    }
+    const statement = authSchemaV7Statement(tx as never) as unknown as { text: string; params: unknown[] };
+    await pg.query(statement.text, statement.params);
   }, 60_000);
 
   async function taskRows(): Promise<Row[]> {
