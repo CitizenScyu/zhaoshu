@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createHash } from 'node:crypto';
 import corpus from './fixtures/admission-174.json';
 import {
@@ -935,5 +935,108 @@ describe('rulesHash 纳入引擎语义版本', () => {
       compile_ok: true, search_ok: null, search_verdict: '', rules_hash: rulesHash(source),
       engine_semantics_version: ENGINE_SEMANTICS_VERSION,
     });
+  });
+});
+
+// P1a 开闸前置修复（review-batch-t3t6p1a-p2.md 第三节 P2 条）：三处落库此前写死常量 1，
+// 而 rulesHash 在 ENGINE_SYNTAX_OR=1 时产出 `2:<hash>` → 行内元数据自相矛盾。修复后版本列
+// 与 hash 前缀同源。三条路径逐一覆盖：compile 拒 / 探测落库 / 未测占位。
+// env 注入只动 process.env（vi.stubEnv），与 engineSyntaxOrEnabled 默认读 env 的口径一致；
+// 不给 runAdmissionBatch 加参数、不 stub 其它全局。
+describe('落库元数据自洽：engine_semantics_version 与 rulesHash 前缀同源', () => {
+  afterEach(() => vi.unstubAllEnvs());
+
+  const hashVersion = (hash: string): number => Number(hash.slice(0, hash.indexOf(':')));
+  // ruleContent.content 含 ||：off 态拒（旧行为），on 态编过——两态都产行，便于对照。
+  const orSource = (host: string) => syntheticSource(`https://${host}/`, {
+    ruleContent: { content: '#content@html||.body@html' },
+  } as Partial<RawSource>);
+  // xpath 两态均拒，用来覆盖 on 态仍走 compile 拒落库的那条路径。
+  const xpathSource = (host: string) => syntheticSource(`https://${host}/`, {
+    ruleSearch: { bookList: '.i', name: '.t@text', bookUrl: 'a@href', author: '//div/a' },
+  } as Partial<RawSource>);
+
+  it('off 态（env 缺失）：compile 拒行版本列 1、hash 前缀 1:（与修复前等值）', async () => {
+    vi.stubEnv('ENGINE_SYNTAX_OR', '');
+    const source = orSource('off-version.example.com');
+    const result = await runAdmissionBatch({
+      candidates: [{ url: 'https://off-version.example.com/', source }],
+      declaredHosts: new Set(['off-version.example.com']),
+      existing: new Map(), fetchPage: vi.fn<AdmissionTransport>(), signal: signal(), maxProbes: 0,
+    });
+    expect(result.rows).toHaveLength(1);
+    const row = result.rows[0];
+    expect(row.compile_ok).toBe(false); // off 态 || 仍拒
+    expect(row.engine_semantics_version).toBe(1);
+    expect(row.rules_hash.startsWith('1:')).toBe(true);
+    expect(row.engine_semantics_version).toBe(hashVersion(row.rules_hash));
+  });
+
+  it('off 态：compile 通过的未测占位行版本列仍为 1', async () => {
+    vi.stubEnv('ENGINE_SYNTAX_OR', '');
+    const source = syntheticSource('https://off-ok.example.com/');
+    const result = await runAdmissionBatch({
+      candidates: [{ url: 'https://off-ok.example.com/', source }],
+      declaredHosts: new Set(['off-ok.example.com']),
+      existing: new Map(), fetchPage: vi.fn<AdmissionTransport>(), signal: signal(), maxProbes: 0,
+    });
+    expect(result.rows).toHaveLength(1);
+    const row = result.rows[0];
+    expect(row.compile_ok).toBe(true);
+    expect(row.search_ok).toBeNull();
+    expect(row.engine_semantics_version).toBe(1);
+    expect(row.rules_hash.startsWith('1:')).toBe(true);
+    expect(row.engine_semantics_version).toBe(hashVersion(row.rules_hash));
+  });
+
+  it('on 态（ENGINE_SYNTAX_OR=1）：未测占位行版本列 2、hash 前缀 2:', async () => {
+    vi.stubEnv('ENGINE_SYNTAX_OR', '1');
+    const source = orSource('on-version.example.com');
+    const result = await runAdmissionBatch({
+      candidates: [{ url: 'https://on-version.example.com/', source }],
+      declaredHosts: new Set(['on-version.example.com']),
+      existing: new Map(), fetchPage: vi.fn<AdmissionTransport>(), signal: signal(), maxProbes: 0,
+    });
+    expect(result.rows).toHaveLength(1);
+    const row = result.rows[0];
+    expect(row.compile_ok).toBe(true); // on 态 || 编过
+    expect(row.search_ok).toBeNull(); // 本轮无探测名额 → 占位行
+    expect(row.engine_semantics_version).toBe(2);
+    expect(row.rules_hash.startsWith('2:')).toBe(true);
+    expect(row.engine_semantics_version).toBe(hashVersion(row.rules_hash));
+  });
+
+  it('on 态（ENGINE_SYNTAX_OR=1）：真实探测落库行版本列同样 2', async () => {
+    vi.stubEnv('ENGINE_SYNTAX_OR', '1');
+    const source = orSource('on-probe.example.com');
+    const fetchPage = vi.fn<AdmissionTransport>().mockResolvedValue(
+      page('<div class="i"><span class="t">书名</span><a href="/b/1">x</a></div>'));
+    const result = await runAdmissionBatch({
+      candidates: [{ url: 'https://on-probe.example.com/', source }],
+      declaredHosts: new Set(['on-probe.example.com']),
+      existing: new Map(), fetchPage, signal: signal(), maxProbes: 1, throttleMs: 0,
+    });
+    expect(result.probed).toBe(1);
+    const row = result.rows[0];
+    expect(row.search_verdict).toBe('ok');
+    expect(row.engine_semantics_version).toBe(2);
+    expect(row.engine_semantics_version).toBe(hashVersion(row.rules_hash));
+    expect(row.rules_hash.startsWith('2:')).toBe(true);
+  });
+
+  it('on 态（ENGINE_SYNTAX_OR=1）：compile 拒行同样版本列 2、hash 前缀 2:', async () => {
+    vi.stubEnv('ENGINE_SYNTAX_OR', '1');
+    const source = xpathSource('on-reject.example.com');
+    const result = await runAdmissionBatch({
+      candidates: [{ url: 'https://on-reject.example.com/', source }],
+      declaredHosts: new Set(['on-reject.example.com']),
+      existing: new Map(), fetchPage: vi.fn<AdmissionTransport>(), signal: signal(), maxProbes: 0,
+    });
+    expect(result.rows).toHaveLength(1);
+    const row = result.rows[0];
+    expect(row.compile_ok).toBe(false);
+    expect(row.engine_semantics_version).toBe(2);
+    expect(row.rules_hash.startsWith('2:')).toBe(true);
+    expect(row.engine_semantics_version).toBe(hashVersion(row.rules_hash));
   });
 });
