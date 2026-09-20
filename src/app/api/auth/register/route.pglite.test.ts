@@ -4,7 +4,7 @@ import { loadPGlite, type PGliteLike } from '@/lib/fixtures/pglite';
 import { hashInviteCode } from '@/lib/invite-codes';
 import { buildRegistrationStatement } from '@/lib/register-statement';
 
-// 真实 PostgreSQL（WASM）离线用例：把 auth schema v6 真建出来，再真跑注册语句。
+// 真实 PostgreSQL（WASM）离线用例：把当前 auth schema 真建出来，再真跑注册语句。
 //
 // 为什么必须有这一条：本目录的 route.test.ts 全是桩，`claimed: 1` 是 mock 喂的，永远看不见
 // 「registration_invites 的 CHECK ((used_by IS NULL) = (used_at IS NULL)) 不可延迟」这类
@@ -56,7 +56,7 @@ maybe('真实 PostgreSQL：注册语句与 registration_invites 的 CHECK', () =
     // 真的跑迁移，不是为了这条用例手抄一份 DDL。
     await initializeAuthSchema(sql as never);
     const version = await pg.query('SELECT max(version)::int AS version FROM auth_schema_migrations');
-    expect(version.rows[0].version).toBe(6);
+    expect(version.rows[0].version).toBe(7);
   }, 60_000);
 
   async function seedInvite(mode = 'invite') {

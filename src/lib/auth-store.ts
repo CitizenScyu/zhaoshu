@@ -1,8 +1,66 @@
-import type { neon } from '@neondatabase/serverless';
+import type { neon, NeonQueryFunctionInTransaction } from '@neondatabase/serverless';
 
-export const AUTH_SCHEMA_VERSION = 6;
+export const AUTH_SCHEMA_VERSION = 7;
 
 type Sql = ReturnType<typeof neon>;
+
+export function authSchemaV7Statement(tx: NeonQueryFunctionInTransaction<boolean, boolean>) {
+  return tx`DO $$
+    BEGIN
+      IF NOT EXISTS (SELECT 1 FROM auth_schema_migrations WHERE version = 7) THEN
+        LOCK TABLE download_tasks IN SHARE ROW EXCLUSIVE MODE;
+        ALTER TABLE download_tasks
+          ADD COLUMN IF NOT EXISTS requested_by text NOT NULL DEFAULT 'user',
+          ADD COLUMN IF NOT EXISTS source_kind text NOT NULL DEFAULT 'builtin',
+          ADD COLUMN IF NOT EXISTS source_id text,
+          ADD COLUMN IF NOT EXISTS source_revision text NOT NULL DEFAULT '',
+          ADD COLUMN IF NOT EXISTS policy_version text NOT NULL DEFAULT '',
+          ADD COLUMN IF NOT EXISTS enqueue_key text,
+          ADD COLUMN IF NOT EXISTS attempt_count integer NOT NULL DEFAULT 1,
+          ADD COLUMN IF NOT EXISTS retry_of integer,
+          ADD COLUMN IF NOT EXISTS next_attempt_at timestamptz,
+          ADD COLUMN IF NOT EXISTS lease_generation bigint NOT NULL DEFAULT 0,
+          ADD COLUMN IF NOT EXISTS lease_owner text NOT NULL DEFAULT '',
+          ADD COLUMN IF NOT EXISTS artifact_id bigint;
+        ALTER TABLE download_tasks ALTER COLUMN user_id DROP NOT NULL;
+        IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid = 'download_tasks'::regclass
+          AND conname = 'download_tasks_requested_by_check') THEN
+          ALTER TABLE download_tasks ADD CONSTRAINT download_tasks_requested_by_check
+            CHECK (requested_by IN ('user', 'system'));
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid = 'download_tasks'::regclass
+          AND conname = 'download_tasks_request_identity_check') THEN
+          ALTER TABLE download_tasks ADD CONSTRAINT download_tasks_request_identity_check
+            CHECK ((requested_by = 'user' AND user_id IS NOT NULL)
+              OR (requested_by = 'system' AND user_id IS NULL));
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid = 'download_tasks'::regclass
+          AND conname = 'download_tasks_attempt_count_check') THEN
+          ALTER TABLE download_tasks ADD CONSTRAINT download_tasks_attempt_count_check
+            CHECK (attempt_count >= 1);
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid = 'download_tasks'::regclass
+          AND conname = 'download_tasks_lease_generation_check') THEN
+          ALTER TABLE download_tasks ADD CONSTRAINT download_tasks_lease_generation_check
+            CHECK (lease_generation >= 0);
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid = 'download_tasks'::regclass
+          AND conname = 'download_tasks_retry_of_fk') THEN
+          ALTER TABLE download_tasks ADD CONSTRAINT download_tasks_retry_of_fk
+            FOREIGN KEY (retry_of) REFERENCES download_tasks(id) ON DELETE SET NULL;
+        END IF;
+        CREATE UNIQUE INDEX IF NOT EXISTS download_tasks_system_active_book_idx
+          ON download_tasks (book_id)
+          WHERE requested_by = 'system' AND status IN ('pending', 'running');
+        CREATE UNIQUE INDEX IF NOT EXISTS download_tasks_system_event_idx
+          ON download_tasks (enqueue_key)
+          WHERE requested_by = 'system' AND enqueue_key IS NOT NULL;
+        CREATE INDEX IF NOT EXISTS download_tasks_claim_idx
+          ON download_tasks (status, next_attempt_at, created_at, id);
+        INSERT INTO auth_schema_migrations (version) VALUES (7);
+      END IF;
+    END $$`;
+}
 
 export async function initializeAuthSchema(sql: Sql): Promise<void> {
   await sql.transaction((tx) => [
@@ -17,8 +75,8 @@ export async function initializeAuthSchema(sql: Sql): Promise<void> {
       DECLARE newest integer;
       BEGIN
         SELECT max(version) INTO newest FROM auth_schema_migrations;
-        IF newest IS NOT NULL AND newest > 6 THEN
-          RAISE EXCEPTION 'auth schema version % is newer than supported version 6', newest;
+        IF newest IS NOT NULL AND newest > 7 THEN
+          RAISE EXCEPTION 'auth schema version % is newer than supported version 7', newest;
         END IF;
       END $$`,
     // 仅专用迁移支持空库初始化；普通业务请求不会调用本函数。
@@ -307,6 +365,10 @@ export async function initializeAuthSchema(sql: Sql): Promise<void> {
           INSERT INTO auth_schema_migrations (version) VALUES (6);
         END IF;
       END $$`,
+    // v7：同一队列表同时承载用户任务与系统任务。系统身份不冒用 owner；事件键负责
+    // importer 重放去重，活动键负责同一本书在途互斥。领取时递增 lease_generation，
+    // 心跳/进度/终态写必须同时匹配 generation + owner，旧执行者不能提交新租约。
+    authSchemaV7Statement(tx),
   ]);
 }
 

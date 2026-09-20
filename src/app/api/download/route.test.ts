@@ -30,9 +30,11 @@ function queryText(index: number) {
 function expectSafeReclaim(index: number) {
   const query = queryText(index);
   expect(query).toMatch(/^UPDATE download_tasks SET status = 'failed',/);
-  expect(query).toContain("error = CONCAT(COALESCE(error, ''), ?)");
+  expect(query).toContain("error = CONCAT(COALESCE(error, ''), ?::text)");
+  expect(query).toContain('lease_generation = lease_generation + 1');
+  expect(query).toContain("lease_owner = ''");
   expect(query).toContain('updated_at = now()');
-  expect(query).toMatch(/WHERE status = 'running' AND updated_at < now\(\) - \(\? \* interval '1 millisecond'\)$/);
+  expect(query).toMatch(/WHERE status = 'running' AND updated_at < now\(\) - \(\?::bigint \* interval '1 millisecond'\)$/);
   expect(sql.mock.calls[index].slice(1)).toEqual(['\nworker 中断自动回收', 30 * 60_000]);
 }
 
