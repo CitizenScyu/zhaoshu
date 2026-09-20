@@ -42,8 +42,8 @@ function setup(style = 0, failure = '') {
     return { url, text: `<li class="chapter-content" id="article-content">${failure === 'blank' ? '' : '<p>合成正文，离线测试。</p>'}</li>` };
   };
   vi.stubGlobal('fetch', () => { throw new Error('network forbidden'); });
-  const run = () => downloadBook({ api, compile, parser }, options, async () => ({ source, builtin: style < 0 }), transport);
-  return { run, options, calls, times };
+  const run = (selectedTransport = transport) => downloadBook({ api, compile, parser }, options, async () => ({ source, builtin: style < 0 }), selectedTransport);
+  return { run, options, calls, times, transport };
 }
 
 describe('download offline full books', () => {
@@ -67,6 +67,39 @@ describe('download offline full books', () => {
   it('total budget preserves partial checkpoint', async () => {
     const f = setup(0, 'timeout'); f.options['budget-ms'] = 30;
     expect((await f.run()).manifest.status).toBe('partial');
+  });
+  it('pre-toc interruption preserves previous completed chapter records', async () => {
+    const f = setup();
+    const first = await f.run();
+    expect(first.code).toBe(0);
+    f.options['budget-ms'] = 20;
+    const interrupted = await f.run((_url, opts) => new Promise((_, reject) => {
+      opts.signal.addEventListener('abort', () => reject(opts.signal.reason), { once: true });
+    }));
+    expect(interrupted.code).toBe(1);
+    const saved = JSON.parse(readFileSync(first.manifestPath, 'utf8'));
+    expect(saved.chapters).toHaveLength(2);
+    expect(saved.chapters.every((chapter: {status: string}) => chapter.status === 'done')).toBe(true);
+  });
+  it('rejects builtin chapter redirects to another book path', async () => {
+    const f = setup(-1);
+    const redirected = async (url: string, opts: Parameters<typeof f.transport>[1]) => {
+      const page = await f.transport(url, opts);
+      return url.includes('/chapter/') ? { ...page, url: 'https://book15.net/other-book/chapter.html' } : page;
+    };
+    const result = await f.run(redirected);
+    expect(result.code).toBe(1);
+    expect(result.manifest.status).toBe('partial');
+  });
+  it('rejects toc pagination redirects to another book path', async () => {
+    const f = setup();
+    const redirected = async (url: string, opts: Parameters<typeof f.transport>[1]) => {
+      const page = await f.transport(url, opts);
+      return url.endsWith('/page2') ? { ...page, url: 'https://book15.net/other-book/catalog.html' } : page;
+    };
+    const result = await f.run(redirected);
+    expect(result.code).toBe(1);
+    expect(result.manifest.status).toBe('partial');
   });
   it('SIGINT preserves partial checkpoint and removes listeners', async () => {
     const f = setup(0, 'timeout'); const before = process.listenerCount('SIGINT');

@@ -29,7 +29,7 @@ export async function downloadBook(m, args, resolveSource, transport = fetchSour
   const manifestPath = join(dir, 'manifest.json');
   let previous;
   try { previous = JSON.parse(readFileSync(manifestPath, 'utf8')); } catch { /* first attempt */ }
-  const manifest = { schemaVersion: 1, status: 'partial', title: args.title, author: args.author, source: args.source, chapters: [], errors: [], generated_at: new Date().toISOString() };
+  const manifest = { schemaVersion: 1, status: 'partial', title: args.title, author: args.author, source: args.source, chapters: previous?.chapters ?? [], errors: [], generated_at: new Date().toISOString() };
   const controller = new AbortController();
   const stop = () => controller.abort(new Error('interrupted'));
   const timer = setTimeout(() => controller.abort(new Error('budget_exhausted')), args['budget-ms']);
@@ -41,19 +41,22 @@ export async function downloadBook(m, args, resolveSource, transport = fetchSour
     const local = new AbortController();
     const timeout = setTimeout(() => local.abort(new Error('operation_timeout')), args['timeout-ms']);
     const signal = AbortSignal.any([controller.signal, local.signal]);
-    const context = { signal, page: url => transport(url, { signal, timeoutMs: args['timeout-ms'], beforeRequest: async requestSignal => {
+    const context = { signal, page: async url => {
+      const page = await transport(url, { signal, timeoutMs: args['timeout-ms'], beforeRequest: async requestSignal => {
       requestSignal.throwIfAborted();
       const now = Date.now(), at = Math.max(now, nextAt);
       nextAt = at + args['rate-ms'];
       if (at > now) await pause(at - now, undefined, { signal: requestSignal });
       requestSignal.throwIfAborted();
       nextAt = Math.max(nextAt, Date.now() + args['rate-ms']);
-    } }) };
+      } });
+      if (new URL(page.url).pathname !== new URL(url).pathname) throw new Error('response_path_mismatch');
+      return page;
+    } };
     try { signal.throwIfAborted(); return await sourceAbortable(Promise.resolve().then(() => fn(context)), signal); }
     finally { clearTimeout(timeout); local.abort(); }
   };
   try {
-    checkpoint();
     const { source, builtin } = await operation(ctx => resolveSource(m, args.source, ctx.signal));
     manifest.sourceRevision = hash(JSON.stringify(source));
     const engine = builtin ? null : { url: source.url, name: source.name, searchUrl: source.searchUrl, compiled: m.compile.compileSource(source) };
@@ -97,7 +100,7 @@ export async function downloadBook(m, args, resolveSource, transport = fetchSour
         }
         if (text === undefined) text = await operation(async ctx => {
           if (!builtin) return (await m.api.engineFetchContent(engine, chapter.url, ctx, true)).text;
-          return m.parser.parseSourceChapterText((await ctx.page(chapter.url)).text);
+          return m.parser.parseSourceChapterText((await ctx.page(chapter.url)).text, chapter.title);
         });
         if (!text.trim()) throw new Error('empty_content');
         bytes += Buffer.byteLength(chapter.title + '\n\n' + text + '\n\n');
