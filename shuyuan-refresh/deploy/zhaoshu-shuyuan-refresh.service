@@ -1,0 +1,17 @@
+[Unit]
+Description=zhaoshu shuyuan refresh (phoenix; reuses repo refreshShuyuan)
+Documentation=file:/opt/zhaoshu-shuyuan-refresh/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+# 只读 DATABASE_URL 一个键(见 /etc/zhaoshu-shuyuan/env 的键清单)。
+EnvironmentFile=/etc/zhaoshu-shuyuan/env
+Environment=HEARTBEAT_FILE=/opt/zhaoshu-shuyuan-refresh/heartbeat.log
+Environment=STATUS_FILE=/opt/zhaoshu-shuyuan-refresh/last-run.status
+Environment=WATCHDOG_MS=150000
+ExecStart=/opt/node24/bin/node /opt/zhaoshu-shuyuan-refresh/refresh-runner.mjs
+TimeoutStartSec=180
+Nice=10

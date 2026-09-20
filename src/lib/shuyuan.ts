@@ -22,9 +22,9 @@ export type { ShuyuanAvailability };
 // 列表页是静态 HTML，合集 JSON 端点按 id 取；yckceo 在国内直连被 SNI 重置，
 // 但 Vercel 出口在美国，直连没问题（2026-09-13 经凤凰城 VPS 验证）。
 
-const INDEX_URL = 'https://www.yckceo.com/yuedu/shuyuans/index.html';
+export const INDEX_URL = 'https://www.yckceo.com/yuedu/shuyuans/index.html';
 const jsonUrl = (id: number) => `https://www.yckceo.com/yuedu/shuyuans/json/id/${id}.json`;
-const LATEST_COUNT = 3; // 只跟最新 3 个合集
+export const LATEST_COUNT = 3; // 只跟最新 3 个合集
 const PROBE_TIMEOUT_MS = 8_000;
 const PROBE_CONCURRENCY = 10;
 // 连续探测失败达到该次数，才把源写成 failed（failed 会被 getReadingSources 剔除，退出取书可用集）。
@@ -388,20 +388,20 @@ function readMeta(value: unknown): { collections: ShuyuanCollection[]; states: M
   return { collections, states };
 }
 
-function sameRules(a: unknown, b: unknown): boolean {
+export function sameRules(a: unknown, b: unknown): boolean {
   // jsonb 对象键顺序不是规则变化，数组顺序仍有意义。
   const stable = (value: unknown) => JSON.stringify(value, (_key, item: unknown) =>
     isRecord(item) ? Object.fromEntries(Object.keys(item).sort().map((key) => [key, item[key]])) : item);
   return stable(a) === stable(b);
 }
 
-function normalizeUrl(url: string): string {
+export function normalizeUrl(url: string): string {
   return url.trim().replace(/\/+$/, '');
 }
 
 // PG jsonb 严禁 NUL，孤立 UTF-16 代理项编码成 UTF-8 也非法；
 // 上游合集里确实存在这类脏数据（2026-09-13 实测 bookSourceComment 混入 NUL）。
-function cleanJson(value: unknown): unknown {
+export function cleanJson(value: unknown): unknown {
   if (typeof value === 'string') {
     return value
       .replace(/\u0000/g, '')
@@ -415,7 +415,7 @@ function cleanJson(value: unknown): unknown {
   return value;
 }
 
-async function fetchText(url: string, timeoutMs: number, parentSignal: AbortSignal): Promise<string> {
+export async function fetchText(url: string, timeoutMs: number, parentSignal: AbortSignal): Promise<string> {
   const deadline = createDeadline(timeoutMs);
   const signal = AbortSignal.any([parentSignal, deadline.signal]);
   let response: Response | undefined;
@@ -452,7 +452,7 @@ async function fetchText(url: string, timeoutMs: number, parentSignal: AbortSign
   }
 }
 
-function parseIndex(html: string): { id: number; title: string }[] {
+export function parseIndex(html: string): { id: number; title: string }[] {
   const entries: { id: number; title: string }[] = [];
   const re = /href="\/yuedu\/shuyuans\/content\/id\/(\d+)\.html"[^>]*>([^<]+)/g;
   for (let m = re.exec(html); m; m = re.exec(html)) {

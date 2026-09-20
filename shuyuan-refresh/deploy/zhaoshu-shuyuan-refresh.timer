@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily zhaoshu shuyuan refresh (phoenix)
+
+[Timer]
+# Vercel cron 是 0 20 * * * UTC;错开 30 分钟后本地跑同一份代码(上游可达)。
+OnCalendar=*-*-* 20:30:00 UTC
+Persistent=true
+RandomizedDelaySec=120
+
+[Install]
+WantedBy=timers.target

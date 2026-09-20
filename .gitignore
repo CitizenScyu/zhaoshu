@@ -59,6 +59,8 @@ labels.jsonl
 
 # python
 __pycache__/
+# shuyuan-refresh:只提交脚本与部署模板;打包产物是本机构建物(phoenix 侧另有 sha 比对)。
+shuyuan-refresh/dist/
 *.pyc
 
 # T8 运行包打包产物（esbuild bundle + tar，可重复生成）
