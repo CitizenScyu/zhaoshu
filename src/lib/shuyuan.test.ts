@@ -105,7 +105,7 @@ describe('refreshShuyuan atomic refresh', () => {
     setCollection(12, []);
     setCollection(13, []);
     fetchMock.mockReset().mockImplementation(async (input, options) => {
-      expect(options?.redirect).toBe('error');
+      expect(options?.redirect).toBe('manual');
       const fixture = responses.get(String(input));
       if (!fixture) throw new Error(`Unexpected network request: ${String(input)}`);
       return new Response(fixture.body, { status: fixture.status ?? 200 });
@@ -213,7 +213,7 @@ describe('refreshShuyuan atomic refresh', () => {
     // 判别性构造：传输层对索引页之外的合集请求一律抛 undici 网络错误形态（ECONNRESET 那一类），
     // 三个合集全部拉不到 ⇒ merged.size === 0，正是生产 09-15 之后每轮 cron 走到的分支。
     fetchMock.mockImplementation(async (input, options) => {
-      expect(options?.redirect).toBe('error');
+      expect(options?.redirect).toBe('manual');
       const url = String(input);
       if (url === indexUrl) return new Response(responses.get(indexUrl)!.body, { status: 200 });
       throw new TypeError('fetch failed');
@@ -356,9 +356,9 @@ describe('refreshShuyuan atomic refresh', () => {
     fetchMock.mockResolvedValueOnce(new Response(new ReadableStream({ cancel() { cancelled = true; } }), {
       status: 302, headers: { location: 'https://unknown.invalid/collection' },
     }));
-    await expect(refreshShuyuan()).rejects.toThrow('302');
+    await expect(refreshShuyuan()).rejects.toThrow('非受信主机');
     expect(fetchMock).toHaveBeenCalledOnce();
-    expect(fetchMock.mock.calls[0][1]?.redirect).toBe('error');
+    expect(fetchMock.mock.calls[0][1]?.redirect).toBe('manual');
     expect(cancelled).toBe(true);
     expect(transaction).not.toHaveBeenCalled();
     expect(execute).not.toHaveBeenCalled();
@@ -474,7 +474,7 @@ describe('refreshShuyuan atomic refresh', () => {
         expect(options?.redirect).toBe('manual'); // 准入通道独立于 fetchSourceText 的 redirect:'error'
         return new Response('<div class="i"><span class="t">书名</span><a href="/b/1">x</a></div>', { status: 200 });
       }
-      expect(options?.redirect).toBe('error');
+      expect(options?.redirect).toBe('manual');
       const fixture = responses.get(url);
       if (!fixture) throw new Error(`Unexpected network request: ${url}`);
       return new Response(fixture.body, { status: fixture.status ?? 200 });
@@ -519,7 +519,7 @@ describe('refreshShuyuan atomic refresh', () => {
         expect(options?.redirect).toBe('manual');
         return new Response('<div class="i"><span class="t">书名</span><a href="/b/1">x</a></div>', { status: 200 });
       }
-      expect(options?.redirect).toBe('error');
+      expect(options?.redirect).toBe('manual');
       const fixture = responses.get(url);
       if (!fixture) throw new Error(`Unexpected network request: ${url}`);
       return new Response(fixture.body, { status: fixture.status ?? 200 });
@@ -549,7 +549,7 @@ describe('refreshShuyuan atomic refresh', () => {
       return result;
     });
     fetchMock.mockImplementation(async (input, options) => {
-      expect(options?.redirect).toBe('error');
+      expect(options?.redirect).toBe('manual');
       const fixture = responses.get(String(input));
       if (!fixture) throw new Error(`Unexpected network request: ${String(input)}`);
       return new Response(fixture.body, { status: fixture.status ?? 200 });
