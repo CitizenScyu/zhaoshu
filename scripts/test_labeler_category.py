@@ -24,6 +24,47 @@ class TestParseCategoriesSafeDefault(unittest.TestCase):
         """变异钉：把 parse_categories(None) 改成返回全量 = 默认开全扫，本用例必红。"""
         self.assertEqual(labeler.parse_categories(None), ())
 
+    def test_empty_and_none_string_disable(self):
+        """空串 / 'none'（含大小写与空白）同样关闭分类入口。"""
+        for spec in ('', '   ', 'none', 'None', ' NONE '):
+            with self.subTest(spec=spec):
+                self.assertEqual(labeler.parse_categories(spec), ())
+
+    def test_all_returns_full_category_pages(self):
+        """'all' = 全量 CATEGORY_PAGES（显式全量）。"""
+        self.assertEqual(labeler.parse_categories('all'), tuple(labeler.CATEGORY_PAGES))
+        self.assertEqual(labeler.parse_categories(' ALL '), tuple(labeler.CATEGORY_PAGES))
+
+    def test_comma_list_parsed_and_deduped_in_order(self):
+        """逗号列表按出现顺序取整数，重复项去重、空段忽略。"""
+        self.assertEqual(labeler.parse_categories('3,21,23'), (3, 21, 23))
+        self.assertEqual(labeler.parse_categories('3, 3 ,21,3'), (3, 21))
+        self.assertEqual(labeler.parse_categories('3,,,21'), (3, 21))
+
+    def test_invalid_spec_exits(self):
+        """非整数 / 非正整数一律 sys.exit，不静默忽略（省得以为限了范围其实没限）。"""
+        for spec in ('3,abc', '3,0', '3,-1', 'foo'):
+            with self.subTest(spec=spec):
+                with self.assertRaises(SystemExit):
+                    labeler.parse_categories(spec)
+
+
+class TestParseLastPage(unittest.TestCase):
+    """分类列表页尾页页码从 HTML 解析，不写死（各类不同且随书目增长）。"""
+
+    def test_parses_last_page_number(self):
+        html = '<li><a href="/books/list-t-3.html?page=133">尾页</a></li>'
+        self.assertEqual(labeler.parse_last_page(html), 133)
+
+    def test_handles_ampersand_and_other_params(self):
+        html = '<a href="/books/list-t-21.html?foo=1&page=93">尾页</a>'
+        self.assertEqual(labeler.parse_last_page(html), 93)
+
+    def test_missing_tail_link_returns_none(self):
+        """无「尾页」链接（单页 / 结构变化）→ None，调用方回落 1 页。"""
+        self.assertIsNone(labeler.parse_last_page('<a href="/x?page=2">下一页</a>'))
+        self.assertIsNone(labeler.parse_last_page('<html>no pager</html>'))
+
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)
