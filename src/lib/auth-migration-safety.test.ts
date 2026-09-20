@@ -33,7 +33,7 @@ describe('迁移入口与冷启动边界', () => {
   it.each([undefined, null, 0, -1, 1.5, Number.NaN])('拒绝缺失或无效 userId %s', (userId) => {
     expect(() => requireUserId(userId as number)).toThrow('explicit userId is required');
   });
-  it.each(['scripts/migrate-user-auth.mjs', 'scripts/test-auth-db.mjs'])('%s 缺 TEST_DATABASE_URL 退出 2，不回退业务连接', (script) => {
+  it.each(['scripts/migrate-user-auth.mjs', 'scripts/test-auth-db.mjs', 'scripts/migrate-artifacts.mjs'])('%s 缺 TEST_DATABASE_URL 退出 2，不回退业务连接', (script) => {
     const env: NodeJS.ProcessEnv = { ...process.env, DATABASE_URL: 'postgresql://must-not-be-used.invalid/production', NODE_NO_WARNINGS: '1' };
     delete env.TEST_DATABASE_URL;
     const result = spawnSync(process.execPath, ['--experimental-strip-types', script], { env, encoding: 'utf8', timeout: 10_000 });

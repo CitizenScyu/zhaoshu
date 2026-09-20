@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { getSql } from '@/lib/db';
 import { locateBookFile } from '@/lib/book-file-locator';
+import { artifactContentsUrl, locateTaskArtifact, type ArtifactLocation } from '@/lib/artifact-locator';
 import { MAX_READER_BYTES, parseTxtChapters, splitChapterParts } from '@/lib/txt-chapters';
 import type { ByteRange } from '@/lib/txt-chapters';
 import type { ReaderChapter, ReaderIndex, ReaderPart } from '@/lib/reader-types';
@@ -25,6 +26,7 @@ export interface ReadableTask {
   title: string;
   author: string;
   status: string;
+  artifact_id?: string | number | null;
 }
 
 interface BookFile {
@@ -37,6 +39,7 @@ interface Source {
   key: string;
   baseUrl: string;
   token: string;
+  artifactFile?: BookFile;
 }
 
 interface Directory {
@@ -59,9 +62,18 @@ const books = new Map<string, CachedBook>();
 const pendingBooks = new Map<string, Promise<CachedBook>>();
 let cachedBytes = 0;
 
-function getSource(): Source {
+function getSource(artifact: ArtifactLocation | null = null): Source {
   const token = process.env.GITHUB_TOKEN;
   if (!token) throw new ReaderError('文件服务尚未配置，请联系站点所有者。', 503);
+  if (artifact) {
+    const url = artifactContentsUrl(artifact);
+    return {
+      key: `${url}:${createHash('sha256').update(token).digest('hex')}`,
+      baseUrl: url,
+      token,
+      artifactFile: { name: artifact.canonical_path, sha: artifact.blob_sha, size: Number(artifact.bytes) },
+    };
+  }
   const repo = process.env.ZHAOSHU_BOOKS_REPO || 'CitizenScyu/zhaoshu-books';
   if (!/^[\w.-]+\/[\w.-]+$/.test(repo)) {
     throw new ReaderError('文件服务配置有误。', 503);
@@ -75,7 +87,7 @@ function getSource(): Source {
 
 async function githubFetch(source: Source, name?: string, raw = false): Promise<Response> {
   try {
-    const response = await fetch(`${source.baseUrl}${name ? `/${encodeURIComponent(name)}` : ''}`, {
+    const response = await fetch(`${source.baseUrl}${name && !source.artifactFile ? `/${encodeURIComponent(name)}` : ''}`, {
       headers: {
         Authorization: `Bearer ${source.token}`,
         Accept: raw ? 'application/vnd.github.raw+json' : name
@@ -155,6 +167,7 @@ async function getDirectory(source: Source): Promise<Directory> {
 }
 
 async function locateFile(source: Source, task: ReadableTask): Promise<BookFile | null> {
+  if (source.artifactFile) return source.artifactFile;
   const listing = await getDirectory(source);
   return locateBookFile(listing, task.title, task.author, async (expected) => {
     const response = await githubFetch(source, expected);
@@ -174,18 +187,21 @@ export async function getReadableTask(taskId: number, viewerId: number): Promise
   // download task. Do not run ensureSchema's DDL on a chapter navigation.
   const sql = getSql();
   const rows = await sql`
-    SELECT id, title, author, status, user_id FROM download_tasks WHERE id = ${taskId}` as (ReadableTask & { user_id: number })[];
+    SELECT id, title, author, status, user_id, to_jsonb(download_tasks)->>'artifact_id' AS artifact_id
+    FROM download_tasks WHERE id = ${taskId}` as (ReadableTask & { user_id: number })[];
   const task = rows[0];
   // 已完成 TXT 是共享的，但他人未完成任务的存在性和状态不能透出：与不存在的任务同样返回 404。
   if (!task || (task.status !== 'done' && task.user_id !== viewerId)) {
     throw new ReaderError('下载任务不存在。', 404);
   }
   if (task.status !== 'done') throw new ReaderError('下载尚未完成，请完成下载后再阅读。', 409);
-  return { id: task.id, title: task.title, author: task.author, status: task.status };
+  return { id: task.id, title: task.title, author: task.author, status: task.status,
+    ...(task.artifact_id != null ? { artifact_id: task.artifact_id } : {}) };
 }
 
 export async function readerAvailability(task: ReadableTask): Promise<{ available: boolean }> {
-  const file = await locateFile(getSource(), task);
+  const source = getSource(task.artifact_id == null ? null : await locateTaskArtifact(getSql(), task.artifact_id));
+  const file = await locateFile(source, task);
   return { available: file !== null && file.size > 0 && file.size <= MAX_READER_BYTES };
 }
 
@@ -255,7 +271,7 @@ function cacheBook(key: string, book: CachedBook) {
 }
 
 async function getBook(task: ReadableTask): Promise<CachedBook> {
-  const source = getSource();
+  const source = getSource(task.artifact_id == null ? null : await locateTaskArtifact(getSql(), task.artifact_id));
   const file = await locateFile(source, task);
   if (!file) throw new ReaderError('书籍文件不存在，请返回书库检查下载任务。', 404);
   const key = `${source.key}/${file.name}:${file.sha}`;

@@ -1,4 +1,6 @@
 import type { neon } from '@neondatabase/serverless';
+// Dedicated additive migration; deliberately not invoked by runtime initialization.
+export { initializeArtifactSchema } from './artifact-schema.ts';
 type Sql = ReturnType<typeof neon>;
 
 export async function initializeBusinessSchema(s: Sql) {
