@@ -9,12 +9,22 @@ merge_books 去重、is_stub_candidate 判据、残本折进 done 侧口径、�
 全离线：不联网、不调 LLM、不读 .env（http_get 一律打桩）。
 复跑：cd <worktree> && python scripts/test_labeler_category.py
 """
+import json
 import os
 import sys
+import tempfile
 import unittest
+from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import labeler  # noqa: E402
+
+
+def write_jsonl(path: Path, rows) -> None:
+    with open(path, 'w', encoding='utf-8') as f:
+        for row in rows:
+            f.write((row if isinstance(row, str)
+                     else json.dumps(row, ensure_ascii=False)) + '\n')
 
 
 class TestParseCategoriesSafeDefault(unittest.TestCase):
@@ -64,6 +74,78 @@ class TestParseLastPage(unittest.TestCase):
         """无「尾页」链接（单页 / 结构变化）→ None，调用方回落 1 页。"""
         self.assertIsNone(labeler.parse_last_page('<a href="/x?page=2">下一页</a>'))
         self.assertIsNone(labeler.parse_last_page('<html>no pager</html>'))
+
+
+class TestMergeBooks(unittest.TestCase):
+    """多路书目按 url 去重合并：先出现者优先（榜单路在前、分类路在后）。"""
+
+    def test_dedup_keeps_first_occurrence_title(self):
+        rank = [{'url': '/books/details1.html', 'title': '榜单甲'},
+                {'url': '/books/details2.html', 'title': '榜单乙'}]
+        cat = [{'url': '/books/details2.html', 'title': '分类乙改名'},   # 同 url 被前者占
+               {'url': '/books/details3.html', 'title': '分类丙'}]
+        merged = labeler.merge_books(rank, cat)
+        self.assertEqual([b['url'] for b in merged],
+                         ['/books/details1.html', '/books/details2.html',
+                          '/books/details3.html'])
+        # 先出现者（榜单）的 title 保留，后路同 url 的改名被丢弃
+        self.assertEqual(merged[1]['title'], '榜单乙')
+
+    def test_missing_url_entries_dropped(self):
+        self.assertEqual(labeler.merge_books([{'title': '无 url'}], []), [])
+
+    def test_empty_groups_yield_empty(self):
+        self.assertEqual(labeler.merge_books([], []), [])
+
+
+class TestIsStubCandidate(unittest.TestCase):
+    """残本判据：章节数 < 阈值 或 正文字数 < 阈值 ⇒ 残本（返回原因），否则 None。"""
+
+    def test_below_min_chapters_flagged(self):
+        reason = labeler.is_stub_candidate(labeler.STUB_MIN_CHAPTERS - 1,
+                                           labeler.STUB_MIN_CHARS)
+        self.assertIsNotNone(reason)
+        self.assertIn('章节数', reason)
+
+    def test_below_min_chars_flagged(self):
+        reason = labeler.is_stub_candidate(labeler.STUB_MIN_CHAPTERS,
+                                           labeler.STUB_MIN_CHARS - 1)
+        self.assertIsNotNone(reason)
+        self.assertIn('正文字数', reason)
+
+    def test_at_thresholds_is_not_stub(self):
+        """边界闭区间：恰好达阈值不算残本（变异钉：把 < 改成 <= 本用例必红）。"""
+        self.assertIsNone(labeler.is_stub_candidate(labeler.STUB_MIN_CHAPTERS,
+                                                    labeler.STUB_MIN_CHARS))
+
+    def test_chapter_count_checked_before_chars(self):
+        """章节数不足优先短路（不必抓全本正文即可判残本）。"""
+        reason = labeler.is_stub_candidate(0, 0)
+        self.assertIn('章节数', reason)
+
+
+class TestLoadStubUrls(unittest.TestCase):
+    """labels-stub.jsonl → 残本候选 url 集合（与 done_urls 同口径参与跳过）。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = Path(self.tmp.name) / 'labels-stub.jsonl'
+
+    def test_reads_urls_and_skips_bad_lines(self):
+        write_jsonl(self.path, [
+            {'url': labeler.BASE + '/books/details1.html', 'reason': '章节数 3 < 10'},
+            '坏行',
+            {'reason': '缺 url'},
+            {'url': labeler.BASE + '/books/details2.html'},
+        ])
+        self.assertEqual(labeler.load_stub_urls(self.path), {
+            labeler.BASE + '/books/details1.html',
+            labeler.BASE + '/books/details2.html'})
+
+    def test_missing_file_is_empty(self):
+        self.assertEqual(labeler.load_stub_urls(
+            Path(self.tmp.name) / 'nope.jsonl'), set())
 
 
 if __name__ == '__main__':
