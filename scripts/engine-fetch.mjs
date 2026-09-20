@@ -28,7 +28,11 @@ function parseArgs(argv) {
   const args = { _: [], json: false, env: null, title: null, author: null, url: null };
   for (let i = 0; i < argv.length; i += 1) {
     const a = argv[i];
-    if (a === '--json') args.json = true;
+    if (['--source', '--out', '--max-chapters', '--rate-ms', '--timeout-ms', '--budget-ms'].includes(a)) {
+      if (!argv[i + 1] || argv[i + 1].startsWith('--')) throw new ExitError(2, `缺少参数值：${a}`);
+      args[a.slice(2)] = argv[++i];
+    }
+    else if (a === '--json') args.json = true;
     else if (a === '--env') args.env = argv[++i] ?? null;
     else if (a === '--title') args.title = argv[++i] ?? null;
     else if (a === '--author') args.author = argv[++i] ?? null;
@@ -242,20 +246,32 @@ function emit(args, data, human) {
   process.stdout.write(args.json ? JSON.stringify(data) + '\n' : human() + '\n');
 }
 
-const COMMANDS = { search: cmdSearch, toc: cmdToc, content: cmdContent };
+async function cmdDownload(m, args) {
+  const { downloadBook } = await import('./engine-download.mjs');
+  const result = await downloadBook(m, args, resolveSourceForUrl);
+  process.stdout.write(JSON.stringify(result) + '\n');
+  if (result.code) throw new ExitError(1, 'download partial');
+}
+
+const COMMANDS = { download: cmdDownload, search: cmdSearch, toc: cmdToc, content: cmdContent };
 
 async function main() {
   const args = parseArgs(process.argv.slice(2));
   const command = args._[0];
   const handler = COMMANDS[command];
-  if (!handler) throw new ExitError(2, `未知子命令：${command ?? '(空)'}；支持 search|toc|content`);
+  if (!handler) throw new ExitError(2, `未知子命令：${command ?? '(空)'}；支持 search|toc|content|download`);
+
+  if (command === 'download') {
+    try { Object.assign(args, (await import('./engine-download.mjs')).downloadOptions(args)); }
+    catch { throw new ExitError(2, 'download 参数非法：需要 --source --title --author；数值参数须在允许范围内'); }
+  }
 
   // env：--env 文件的 DATABASE_URL 注入 process.env（db.ts 模块初始化读它）。绝不打印。
   if (args.env) {
     const env = loadEnvFile(resolve(args.env));
     if (env.DATABASE_URL) process.env.DATABASE_URL = env.DATABASE_URL;
   }
-  if (!process.env.DATABASE_URL) throw new ExitError(2, 'DATABASE_URL 未设置（用 --env <file> 或环境变量）');
+  if (command !== 'download' && !process.env.DATABASE_URL) throw new ExitError(2, 'DATABASE_URL 未设置（用 --env <file> 或环境变量）');
 
   const m = await loadModules();
   await handler(m, args);

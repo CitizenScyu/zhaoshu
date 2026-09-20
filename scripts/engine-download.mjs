@@ -1,0 +1,133 @@
+import { createHash } from 'node:crypto';
+import { mkdirSync, readFileSync, writeFileSync, renameSync, existsSync, openSync, closeSync, unlinkSync } from 'node:fs';
+import { resolve, join } from 'node:path';
+import { setTimeout as pause } from 'node:timers/promises';
+import { canonicalBookKey } from '../src/lib/book-identity.ts';
+import { fetchSourceText, sourceAbortable } from '../src/lib/source-fetch.ts';
+
+const hash = value => createHash('sha256').update(value).digest('hex');
+const atomic = (path, data) => { writeFileSync(path + '.tmp', data); renameSync(path + '.tmp', path); };
+export function downloadOptions(args) {
+  if (!args.source || !args.title?.trim() || !args.author?.trim()) throw new Error('download 需要 --source --title --author');
+  const source = new URL(args.source.includes('://') ? args.source : `https://${args.source}`);
+  if (source.protocol !== 'https:' || source.username || source.password || source.search || source.hash) throw new Error('--source 必须是 HTTPS URL 或 host');
+  const options = { ...args, source: source.href };
+  for (const [key, fallback, min, max] of [['max-chapters', 20000, 1, 20000], ['rate-ms', 800, 0, 60000], ['timeout-ms', 30000, 1, 600000], ['budget-ms', 19800000, 1, 19800000]]) {
+    const n = args[key] === undefined ? fallback : Number(args[key]);
+    if (!Number.isSafeInteger(n) || n < min || n > max) throw new Error(`非法 --${key}`);
+    options[key] = n;
+  }
+  return options;
+}
+
+// One shared request slot covers search/detail/toc/content, redirects and alternate hosts.
+export async function downloadBook(m, args, resolveSource, transport = fetchSourceText) {
+  const dir = resolve(args.out ?? 'engine-download', hash(args.source + canonicalBookKey(args.title, args.author)).slice(0, 24));
+  mkdirSync(dir, { recursive: true });
+  const lockPath = join(dir, 'download.lock');
+  const lock = openSync(lockPath, 'wx');
+  const manifestPath = join(dir, 'manifest.json');
+  let previous;
+  try { previous = JSON.parse(readFileSync(manifestPath, 'utf8')); } catch { /* first attempt */ }
+  const manifest = { schemaVersion: 1, status: 'partial', title: args.title, author: args.author, source: args.source, chapters: [], errors: [], generated_at: new Date().toISOString() };
+  const controller = new AbortController();
+  const stop = () => controller.abort(new Error('interrupted'));
+  const timer = setTimeout(() => controller.abort(new Error('budget_exhausted')), args['budget-ms']);
+  process.on('SIGINT', stop); process.on('SIGTERM', stop);
+  let nextAt = 0;
+  let bytes = 0;
+  const checkpoint = () => atomic(manifestPath, JSON.stringify(manifest, null, 2) + '\n');
+  const operation = async fn => {
+    const local = new AbortController();
+    const timeout = setTimeout(() => local.abort(new Error('operation_timeout')), args['timeout-ms']);
+    const signal = AbortSignal.any([controller.signal, local.signal]);
+    const context = { signal, page: url => transport(url, { signal, timeoutMs: args['timeout-ms'], beforeRequest: async requestSignal => {
+      requestSignal.throwIfAborted();
+      const now = Date.now(), at = Math.max(now, nextAt);
+      nextAt = at + args['rate-ms'];
+      if (at > now) await pause(at - now, undefined, { signal: requestSignal });
+      requestSignal.throwIfAborted();
+      nextAt = Math.max(nextAt, Date.now() + args['rate-ms']);
+    } }) };
+    try { signal.throwIfAborted(); return await sourceAbortable(Promise.resolve().then(() => fn(context)), signal); }
+    finally { clearTimeout(timeout); local.abort(); }
+  };
+  try {
+    checkpoint();
+    const { source, builtin } = await operation(ctx => resolveSource(m, args.source, ctx.signal));
+    manifest.sourceRevision = hash(JSON.stringify(source));
+    const engine = builtin ? null : { url: source.url, name: source.name, searchUrl: source.searchUrl, compiled: m.compile.compileSource(source) };
+    const candidates = await operation(async ctx => {
+      if (!builtin) return m.api.engineSearchBook(engine, args.title, ctx);
+      const page = await ctx.page(m.parser.sourceSearchUrl(source.searchUrl, args.title, source.url));
+      return m.parser.parseSourceSearch(page.text, page.url, args.title).map(bookUrl => ({ bookUrl }));
+    });
+    let selected;
+    for (const candidate of candidates) {
+      const detail = await operation(async ctx => {
+        if (!builtin) return m.api.engineFetchDetail(engine, candidate.bookUrl, ctx);
+        return m.parser.parseSourceIdentity((await ctx.page(candidate.bookUrl)).text);
+      });
+      if (detail.title && detail.author && canonicalBookKey(detail.title, detail.author) === canonicalBookKey(args.title, args.author)) { selected = { ...candidate, ...detail }; break; }
+    }
+    if (!selected) throw new Error('identity_mismatch_or_no_candidate');
+    manifest.bookUrl = selected.bookUrl;
+    const toc = () => operation(async ctx => {
+      if (!builtin) return (await m.api.engineFetchToc(engine, selected.tocUrl ?? selected.bookUrl, ctx, true)).chapters;
+      const page = await ctx.page(selected.bookUrl);
+      return m.parser.parseSourceChapters(page.text, page.url);
+    });
+    const chapters = await toc();
+    if (!chapters.length) throw new Error('empty_toc');
+    manifest.tocHash = hash(JSON.stringify(chapters));
+    manifest.chapters_total = chapters.length;
+    manifest.chapters = chapters.map((c, index) => ({ index, title: c.title, url: c.url, chars: 0, status: 'pending', file: `${index}.txt` }));
+    checkpoint();
+    if (chapters.length > args['max-chapters']) throw new Error('max_chapters');
+    const resume = previous?.sourceRevision === manifest.sourceRevision && previous?.tocHash === manifest.tocHash && previous?.bookUrl === manifest.bookUrl;
+    for (const chapter of manifest.chapters) {
+      controller.signal.throwIfAborted();
+      try {
+        const path = join(dir, chapter.file);
+        const prior = resume && previous.chapters?.[chapter.index];
+        let text;
+        if (prior?.status === 'done' && existsSync(path)) {
+          const cached = readFileSync(path, 'utf8');
+          if (hash(cached) === prior.sha256 && cached.trim()) text = cached;
+        }
+        if (text === undefined) text = await operation(async ctx => {
+          if (!builtin) return (await m.api.engineFetchContent(engine, chapter.url, ctx, true)).text;
+          return m.parser.parseSourceChapterText((await ctx.page(chapter.url)).text);
+        });
+        if (!text.trim()) throw new Error('empty_content');
+        bytes += Buffer.byteLength(chapter.title + '\n\n' + text + '\n\n');
+        if (bytes > 15 * 1024 * 1024) throw new Error('size_limit');
+        atomic(path, text);
+        Object.assign(chapter, { status: 'done', chars: [...text].length, sha256: hash(text) });
+      } catch (error) {
+        chapter.status = 'failed';
+        // Do not persist upstream messages, URLs or credentials in diagnostics.
+        chapter.error = ['empty_content', 'size_limit', 'operation_timeout'].includes(error.message) ? error.message : 'chapter_failed';
+        if (chapter.error === 'size_limit' || controller.signal.aborted) throw error;
+      }
+      checkpoint();
+    }
+    if (hash(JSON.stringify(await toc())) !== manifest.tocHash) throw new Error('toc_changed');
+    if (manifest.chapters.some(c => c.status !== 'done')) throw new Error('missing_chapters');
+    const txt = manifest.chapters.map(c => `${c.title}\n\n${readFileSync(join(dir, c.file), 'utf8')}\n\n`).join('');
+    atomic(join(dir, 'book.txt'), txt);
+    manifest.artifact = { file: 'book.txt', sha256: hash(txt), bytes: Buffer.byteLength(txt) };
+    manifest.status = 'done';
+  } catch (error) {
+    const known = /^(identity_mismatch_or_no_candidate|empty_toc|empty_toc_page|pagination_cycle|toc_limit|unsupported_toc_rule|max_chapters|size_limit|toc_changed|missing_chapters|interrupted|budget_exhausted|operation_timeout)$/;
+    manifest.errors.push(known.test(error.message) ? error.message : 'download_failed');
+  } finally {
+    manifest.chapters_done = manifest.chapters.filter(c => c.status === 'done').length;
+    manifest.chars = manifest.chapters.reduce((n, c) => n + c.chars, 0);
+    try { checkpoint(); } finally {
+      clearTimeout(timer); process.off('SIGINT', stop); process.off('SIGTERM', stop);
+      closeSync(lock); unlinkSync(lockPath);
+    }
+  }
+  return { manifest, manifestPath, code: manifest.status === 'done' ? 0 : 1 };
+}

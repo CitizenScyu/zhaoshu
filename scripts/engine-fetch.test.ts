@@ -26,6 +26,12 @@ function run(args: string[], env: Record<string, string | undefined> = {}) {
 }
 
 describe('engine-fetch CLI 契约', () => {
+  it('download validates usage before DB access', () => {
+    for (const args of [[], ['--source', 'book15.net', '--title', 'x', '--author', 'y', '--max-chapters', '0'], ['--source', 'http://book15.net', '--title', 'x', '--author', 'y']]) {
+      const r = run(['download', ...args], { DATABASE_URL: undefined });
+      expect(r.status).toBe(2); expect(r.stderr).toContain('download');
+    }
+  });
   it('无 DATABASE_URL → 退出码 2，stderr 点名 DATABASE_URL，stdout 空', () => {
     const r = run(['search', '--title', 'X'], { DATABASE_URL: undefined });
     expect(r.status).toBe(2);
