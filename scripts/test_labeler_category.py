@@ -27,6 +27,56 @@ def write_jsonl(path: Path, rows) -> None:
                      else json.dumps(row, ensure_ascii=False)) + '\n')
 
 
+# ---- 真实 HTML 片段（branch2 用 curl 抓回，2026-09-18 实测，未改一字）----
+# list-t-23.html?page=1：尾页 = 2（共16条记录）
+TAIL_PAGE_HTML_T23 = (
+    '<div class="public-page"><ul class="pagination">'
+    '<li><a href="/books/list-t-23.html?page=1">首页</a></li> '
+    '<li class="disabled"><span>上一页</span></li> '
+    '<li class="active"><span>1</span></li>'
+    '<li><a href="/books/list-t-23.html?page=2">2</a></li> '
+    '<li><a href="/books/list-t-23.html?page=2">下一页</a></li> '
+    '<li><a href="/books/list-t-23.html?page=2">尾页</a></li> '
+    '<li class="more">共16条记录</li></ul></div>'
+)
+# list-t-3.html?page=70：中段页带省略号，尾页 = 133（不能被「下一页 71」带偏）
+TAIL_PAGE_HTML_T3_P70 = (
+    '<ul class="pagination">'
+    '<li><a href="/books/list-t-3.html?page=69">上一页</a></li> '
+    '<li class="active"><span>70</span></li>'
+    '<li><a href="/books/list-t-3.html?page=71">71</a></li>'
+    '<li><a href="/books/list-t-3.html?page=133">尾页</a></li>'
+    '<li class="more">共1995条记录</li></ul>'
+)
+# 详情页 og:novel 元数据 + 12 章 dd 列表（形态与实测一致）
+DETAIL_HTML = (
+    '<html><head>'
+    '<meta property="og:novel:author" content="忘语"/>'
+    '<meta property="og:novel:category" content="玄幻奇幻"/>'
+    '<meta property="og:novel:status" content="连载中"/>'
+    '</head><body><div id="list">'
+    + ''.join(f'<dd><a href="/chapter/index{100 + i}-{i}.html">第{i}章 测试章节</a></dd>'
+              for i in range(1, 13))
+    + '</div></body></html>'
+)
+
+
+def _anchor(details_id: int, title: str) -> str:
+    return f'<a href="/books/details{details_id}.html">{title}</a>'
+
+
+def _list_page(grid_ids, sidebar_ids=(9001, 9002), tail: str = '') -> str:
+    """合成分类列表页：真网格 + 每页固定侧栏（侧栏在真实页面里每页相同）。"""
+    body = ''.join(_anchor(i, f'网格{i}') for i in grid_ids)
+    side = ''.join(_anchor(i, f'侧栏{i}') for i in sidebar_ids)
+    return f'<html><body>{body}{side}{tail}</body></html>'
+
+
+def _tail_link(cat: int, page: int) -> str:
+    return (f'<ul class="pagination"><li><a href="/books/list-t-{cat}.html?page=1">首页</a></li>'
+            f'<li><a href="/books/list-t-{cat}.html?page={page}">尾页</a></li></ul>')
+
+
 class TestParseCategoriesSafeDefault(unittest.TestCase):
     """--categories 默认关闭：不给参数 = 只走榜单，行为不变（上线安全默认）。"""
 
@@ -74,6 +124,25 @@ class TestParseLastPage(unittest.TestCase):
         """无「尾页」链接（单页 / 结构变化）→ None，调用方回落 1 页。"""
         self.assertIsNone(labeler.parse_last_page('<a href="/x?page=2">下一页</a>'))
         self.assertIsNone(labeler.parse_last_page('<html>no pager</html>'))
+
+    def test_real_two_page_category_fragment(self):
+        """真实片段（list-t-23 p1，共16条）：尾页=2。"""
+        self.assertEqual(labeler.parse_last_page(TAIL_PAGE_HTML_T23), 2)
+
+    def test_real_middle_page_fragment_reports_tail_not_next(self):
+        """真实中段片段（list-t-3 p70）：取到 133，不被「下一页 71」带偏。"""
+        self.assertEqual(labeler.parse_last_page(TAIL_PAGE_HTML_T3_P70), 133)
+
+    def test_next_page_link_alone_is_not_a_tail(self):
+        """变异钉：把锚定放宽成「任何 page= 链接」时本用例必红。"""
+        html = ('<ul><li><a href="/books/list-t-3.html?page=1">首页</a></li>'
+                '<li><a href="/books/list-t-3.html?page=2">下一页</a></li></ul>')
+        self.assertIsNone(labeler.parse_last_page(html))
+
+    def test_zero_page_and_missing_param_and_non_numeric(self):
+        self.assertIsNone(labeler.parse_last_page('<a href="/books/list-t-3.html?page=0">尾页</a>'))
+        self.assertIsNone(labeler.parse_last_page('<a href="/books/list-t-3.html">尾页</a>'))
+        self.assertIsNone(labeler.parse_last_page('<a href="/books/x.html?page=abc">尾页</a>'))
 
 
 class TestMergeBooks(unittest.TestCase):
@@ -146,6 +215,106 @@ class TestLoadStubUrls(unittest.TestCase):
     def test_missing_file_is_empty(self):
         self.assertEqual(labeler.load_stub_urls(
             Path(self.tmp.name) / 'nope.jsonl'), set())
+
+
+class TestCategoryUrl(unittest.TestCase):
+    def test_format(self):
+        self.assertEqual(labeler.category_url(23, 2),
+                         'https://book15.net/books/list-t-23.html?page=2')
+
+
+class TestFetchCategoryBooks(unittest.TestCase):
+    """分类翻页：先解析尾页、再逐页拉；侧栏靠 seen 去重；超上界只取前 max_pages 页。
+    移植自 branch2，http_get 全打桩离线。"""
+
+    def setUp(self):
+        self.calls = []
+
+    def _serve(self, pages: dict):
+        def fake(url, timeout=30):
+            self.calls.append(url)
+            if url in pages:
+                return pages[url]
+            raise RuntimeError(f'未打桩的 URL: {url}')
+        return fake
+
+    def _run(self, pages, **kw):
+        original = labeler.http_get
+        labeler.http_get = self._serve(pages)
+        try:
+            return labeler.fetch_category_books(page_delay=0, **kw)
+        finally:
+            labeler.http_get = original
+
+    def test_walks_first_to_tail_and_dedupes_sidebar(self):
+        pages = {
+            labeler.category_url(23, 1): _list_page([101, 102], tail=_tail_link(23, 2)),
+            labeler.category_url(23, 2): _list_page([103], tail=_tail_link(23, 2)),
+        }
+        books = self._run(pages, categories=(23,), max_pages=200)
+        urls = [b['url'] for b in books]
+        self.assertEqual(urls, ['/books/details101.html', '/books/details102.html',
+                                '/books/details9001.html', '/books/details9002.html',
+                                '/books/details103.html'])
+        self.assertEqual(self.calls,
+                         [labeler.category_url(23, 1), labeler.category_url(23, 2)])
+        self.assertEqual(books[0]['title'], '网格101')
+
+    def test_max_pages_caps_a_long_category(self):
+        """🔴 安全上界：尾页 133 但 --max-pages 2 ⇒ 只拉 2 页。"""
+        import contextlib
+        import io
+        pages = {labeler.category_url(3, 1): _list_page([1], tail=_tail_link(3, 133)),
+                 labeler.category_url(3, 2): _list_page([2]),
+                 labeler.category_url(3, 3): _list_page([3])}
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self._run(pages, categories=(3,), max_pages=2)
+        self.assertEqual(self.calls, [labeler.category_url(3, p) for p in (1, 2)])
+        self.assertIn('超过上界', err.getvalue())
+
+    def test_single_page_without_tail_link(self):
+        pages = {labeler.category_url(23, 1): _list_page([7])}
+        self._run(pages, categories=(23,), max_pages=200)
+        self.assertEqual(self.calls, [labeler.category_url(23, 1)])
+
+    def test_first_page_failure_skips_that_category_only(self):
+        import contextlib
+        import io
+        pages = {labeler.category_url(3, 1): _list_page([5])}   # t-23 未打桩 → 抛错
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            books = self._run(pages, categories=(23, 3), max_pages=200)
+        self.assertIn('分类 t-23 第 1 页拉取失败', err.getvalue())
+        urls = [b['url'] for b in books]
+        self.assertEqual(urls[0], '/books/details5.html')   # t-3 网格书仍拉到
+        # t-23 整类被跳过（第 1 页失败），其网格书一本都不在
+        self.assertNotIn('/books/details101.html', urls)
+
+    def test_midpage_failure_continues_with_remaining_pages(self):
+        import contextlib
+        import io
+        pages = {labeler.category_url(3, 1): _list_page([1], tail=_tail_link(3, 3)),
+                 labeler.category_url(3, 3): _list_page([3])}   # 第 2 页缺失
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            books = self._run(pages, categories=(3,), max_pages=200)
+        self.assertIn('第 2 页拉取失败', err.getvalue())
+        self.assertIn('/books/details3.html', [b['url'] for b in books])
+
+    def test_page_delay_applied_between_pages_only(self):
+        from unittest import mock
+        pages = {labeler.category_url(3, 1): _list_page([1], tail=_tail_link(3, 2)),
+                 labeler.category_url(3, 2): _list_page([2])}
+        sleeps = []
+        original = labeler.http_get
+        labeler.http_get = self._serve(pages)
+        try:
+            with mock.patch.object(labeler.time, 'sleep', lambda s: sleeps.append(s)):
+                labeler.fetch_category_books(categories=(3,), max_pages=200, page_delay=1.2)
+        finally:
+            labeler.http_get = original
+        self.assertEqual(sleeps, [1.2])       # 2 页 ⇒ 只睡 1 次页间
 
 
 class TestStubTimesLimit(unittest.TestCase):
