@@ -135,9 +135,41 @@ export function evaluateRule(ir: RuleIr, scope: EvalScope, multi = false): EvalR
       return { kind: 'text', value: renderTemplate(ir.parts, scope) };
     case 'text':
       return { kind: 'text', value: ir.literal };
+    case 'or':
+      // P1a || 组合（空值短路）。列表上下文（evaluateFieldNodes）不走这里——
+      // 它按「首个非空节点集」逐支取，见 evaluateFieldNodes 的 or 分支。
+      return evaluateOr(ir, scope, multi);
     default:
       return evalFailed('未知的规则 IR');
   }
+}
+
+/**
+ * || 组合求值（P1a，设计 §3.7「逐支求值，首个非空即停止」+ §7 P1a「节点与标量结果
+ * 不压扁」）。字符串字段口径：
+ * - 标量支（text/jsonpath/template/带 terminal 的 css）：值 trim 后非空即胜出，原样返回；
+ * - 节点支（无 terminal 的 css）：以**文本视图**（@text + multi 口径，与字段层转换同款）
+ *   判空——非空即胜出并返回该文本视图。空壳节点集（命中但文本全空，如 `<a><img></a>`）
+ *   视为空，继续试下一支（legado getStringEach 的「首个非空」按字符串口径）。
+ * 求值异常（选择器坏/作用域不匹配/超限）**不吞**：直接上抛（§5.1「非法规则及资源超限
+ * 不得吞掉」），空值短路只对「求值成功但结果为空」生效。
+ * 全部支皆空 → 空文本（字段层按「未命中」处理）。
+ */
+function evaluateOr(ir: { kind: 'or'; branches: RuleIr[] }, scope: EvalScope, multi: boolean): EvalResult {
+  for (const branch of ir.branches) {
+    const result = evaluateRule(branch, scope, multi);
+    if (result.kind === 'text') {
+      if (result.value.trim() !== '') return result;
+      continue;
+    }
+    if (scope.kind !== 'html') {
+      // css 支在 JSON 作用域已在 evaluateRule 内抛错，此处防御不可达路径。
+      continue;
+    }
+    const textValue = applyTerminal(scope.$, result.nodes, { op: 'text' }, scope.pageUrl, multi);
+    if (textValue.trim() !== '') return { kind: 'text', value: textValue };
+  }
+  return { kind: 'text', value: '' };
 }
 
 /** `{{$.x}}` 模板渲染：字面段原样，求值段取首个命中（多值取首，避免把 URL 类字段拼坏）。 */
@@ -195,10 +227,21 @@ export function evaluateField(field: FieldIr, scope: EvalScope, multi = false): 
 /**
  * 求值一个列表字段（bookList/chapterList）：返回节点集供上层逐条套子规则。
  * M1 期候选数=1；非 HTML 作用域或未命中 → 空节点集。
+ * P1a || 组合（or 节点在 rules[0]）：空值短路取**首个非空节点集**——只有节点支能
+ * 献出节点集；标量支（text/jsonpath/template/带 terminal 的 css）在列表口径下视为
+ * 空支（它没有节点身份，不能把「节点与标量压成一个 selector」，设计 §7 P1a），
+ * 求值异常照旧上抛不吞。
  */
 export function evaluateFieldNodes(field: FieldIr, scope: EvalScope): CheerioNodes {
   if (scope.kind !== 'html') return emptyNodes();
   for (const ir of field.rules) {
+    if (ir.kind === 'or') {
+      for (const branch of ir.branches) {
+        const result = evaluateRule(branch, scope);
+        if (result.kind === 'nodes' && result.nodes.length > 0) return result.nodes;
+      }
+      continue;
+    }
     const result = evaluateRule(ir, scope);
     if (result.kind === 'nodes' && result.nodes.length > 0) return result.nodes;
   }
