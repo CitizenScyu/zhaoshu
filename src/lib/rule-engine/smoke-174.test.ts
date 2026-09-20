@@ -33,6 +33,39 @@ describe('174 源 compile 冒烟', () => {
     expect(passed.length).toBe(114);
   });
 
+  it('结构化诊断保持 114/60 行为基线，并覆盖设计中的主要拒绝桶', () => {
+    const rejected = sources.map((source) => compileCoreFieldsFromRules(source.coreRules)).filter((result) => !result.ok);
+    expect(rejected).toHaveLength(60);
+    const codes = new Set(rejected.flatMap((result) => result.failures.map((failure) => failure.diagnostic.code)));
+    expect([...codes]).toEqual(expect.arrayContaining([
+      'unsupported_operator', 'unsupported_var_get', 'unsupported_var_put',
+      'unsupported_template_var', 'unsupported_template_js', 'unsupported_xpath', 'regex_only',
+    ]));
+  });
+
+  it('结构化拒绝桶计数与设计 §2.5 一致（按源去重）', () => {
+    const counts: Record<string, number> = {};
+    for (const source of sources) {
+      const buckets = new Set(compileCoreFieldsFromRules(source.coreRules).failures.map(({ diagnostic }) =>
+        diagnostic.code === 'unsupported_operator' ? diagnostic.operator! : diagnostic.code));
+      for (const bucket of buckets) counts[bucket] = (counts[bucket] ?? 0) + 1;
+    }
+    expect(counts).toMatchObject({
+      '||': 30,
+      unsupported_var_get: 13,
+      unsupported_template_var: 12,
+      unsupported_var_put: 7,
+      regex_only: 6,
+      unsupported_template_js: 5,
+      unsupported_xpath: 3,
+      '&&': 2,
+      '%%': 2,
+      unsupported_template_rule: 1,
+      unsupported_special_var: 1,
+      unsupported_jsonpath: 1,
+    });
+  });
+
   it('book15（📂网阅小说）在通过集内——M1 对拍基线（任务 2 依赖）', () => {
     const book15 = sources.find((s) => s.name === '📂网阅小说');
     expect(book15, 'fixture 应含 book15 条目').toBeDefined();

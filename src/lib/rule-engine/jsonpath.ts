@@ -18,14 +18,14 @@ const IDENT = /[^.\[\]]+/y; // 一段裸标识（child），到 . 或 [ 为止
 export function parseJsonPath(input: string): JsonPathIr {
   const raw = input.trim();
   if (!raw.startsWith('$')) {
-    throw new RuleEngineError('RULE_UNSUPPORTED', 'JSONPath 必须以 $ 开头', input);
+    throw new RuleEngineError('RULE_UNSUPPORTED', 'JSONPath 必须以 $ 开头', input, { code: 'unsupported_jsonpath' });
   }
   const segments: JsonPathSegment[] = [{ kind: 'root' }];
   let i = 1;
   const n = raw.length;
 
   const fail = (msg: string): never => {
-    throw new RuleEngineError('RULE_UNSUPPORTED', `JSONPath 不支持的语法：${msg}`, input);
+    throw new RuleEngineError('RULE_UNSUPPORTED', `JSONPath 不支持的语法：${msg}`, input, { code: 'unsupported_jsonpath' });
   };
 
   while (i < n) {

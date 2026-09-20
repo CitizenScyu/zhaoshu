@@ -10,7 +10,8 @@ const { ensureSchema, getSql, sql, getLlmUsageStats, session, pool } = vi.hoiste
   pool: {
     readingPoolSize: 1, refreshedAtAgeHours: 72.5,
     enginePoolSize: 0, poolCandidates: 0,
-    admission: { ok: 3, deferred: 4, rejected: 2 },
+    admission: { ok: 3, deferred: 4, rejected: 2, url_defaulted: 0, miss_chapter_list: 0, miss_chapter_name: 0,
+      rejection_codes: {} },
   },
 }));
 vi.mock('@/lib/db', () => ({ ensureSchema, getSql, getLlmUsageStats }));
@@ -203,7 +204,9 @@ describe('GET /api/stats', () => {
     expect(data.shuyuan).toMatchObject({ enabled: 8, readingPoolSize: 0, refreshedAtAgeHours: 74.2 });
     // M2-3 §6.3：放量观测三字段随池健康度一并暴露（数字来自池的真实判定，非复刻）。
     expect(data.shuyuan).toMatchObject({
-      enginePoolSize: 0, poolCandidates: 0, admission: { ok: 3, deferred: 4, rejected: 2 },
+      enginePoolSize: 0, poolCandidates: 0,
+      admission: { ok: 3, deferred: 4, rejected: 2, url_defaulted: 0, miss_chapter_list: 0, miss_chapter_name: 0,
+        rejection_codes: {} },
     });
     // 池查询失败不连坐计数段：pool 拒绝时 counts 仍在，shuyuan 段整体降级。
     const { getShuyuanPoolHealth } = await import('@/lib/shuyuan');

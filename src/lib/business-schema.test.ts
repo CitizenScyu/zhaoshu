@@ -87,6 +87,18 @@ describe('业务 schema 的运行时 DDL', () => {
     const all = statements.join('\n');
     expect(all).not.toMatch(/auth_settings|AUTH_SCHEMA_VERSION|auth_schema_migrations/);
   });
+
+  it('幂等补出 source_admission 的语义版本与结构化诊断列', async () => {
+    const { statements, sql } = recorder();
+    await initializeBusinessSchema(sql as never);
+    const createIndex = statements.findIndex((text) => /CREATE TABLE IF NOT EXISTS source_admission/.test(text));
+    expect(createIndex).toBeGreaterThan(-1);
+    for (const column of ['engine_semantics_version', 'compile_diagnostics']) {
+      const index = statements.findIndex((text) =>
+        /ALTER TABLE source_admission/.test(text) && new RegExp(`ADD COLUMN IF NOT EXISTS\\s+${column}\\b`).test(text));
+      expect(index, `缺少幂等补列 ${column}`).toBeGreaterThan(createIndex);
+    }
+  });
 });
 
 // B2（audit-3 P0-2）：活动任务唯一键从全局 book_id 改为 (user_id, book_id)——

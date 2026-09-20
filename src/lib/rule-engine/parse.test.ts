@@ -25,6 +25,22 @@ describe('parse: 不支持构件 → RULE_UNSUPPORTED', () => {
   });
 });
 
+describe('parse: 结构化拒绝诊断', () => {
+  it.each([
+    ['.a||.b', { code: 'unsupported_operator', operator: '||' }],
+    ['.a&&.b', { code: 'unsupported_operator', operator: '&&' }],
+    ['.a%%.b', { code: 'unsupported_operator', operator: '%%' }],
+    ['.a@get:x', { code: 'unsupported_var_get' }],
+    ['.a@put:x', { code: 'unsupported_var_put' }],
+    ['.a{{book.name}}', { code: 'unsupported_template_var' }],
+    ['.a{{1+1}}', { code: 'unsupported_template_js' }],
+    ['//div/a', { code: 'unsupported_xpath' }],
+    ['##x##', { code: 'regex_only' }],
+  ])('%s', (rule, diagnostic) => {
+    expect(() => parseFieldRule(rule)).toThrowError(expect.objectContaining({ diagnostic }));
+  });
+});
+
 describe('parse: 默认语法翻译细节', () => {
   it('tag.X → X', () => {
     const ir = parseRule('tag.a@text');

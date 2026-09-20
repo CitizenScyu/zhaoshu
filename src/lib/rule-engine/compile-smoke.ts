@@ -3,7 +3,7 @@
 // 设计依据：m1-engine-design.md v3 §8.2；移植逻辑参考 .rule-survey/survey.py。
 
 import { parseFieldRule } from './parse';
-import { RuleEngineError } from './types';
+import { RuleEngineError, type RuleDiagnostic } from './types';
 
 // survey.py CORE_FIELDS（阅读路径必需字段）
 export const CORE_FIELDS = [
@@ -87,7 +87,7 @@ export interface CompileResult {
   /** 核心字段全部编译成功（无 RULE_UNSUPPORTED）。 */
   ok: boolean;
   /** 编译失败的核心字段 → 原因。 */
-  failures: { field: string; rule: string; message: string }[];
+  failures: { field: string; rule: string; message: string; diagnostic: RuleDiagnostic }[];
 }
 
 /** 对一个源的核心字段跑 parseFieldRule；任一核心字段 RULE_UNSUPPORTED → ok=false。 */
@@ -112,9 +112,9 @@ export function compileCoreFieldsFromRules(coreRules: Record<string, string>): C
       parseFieldRule(rule);
     } catch (err) {
       if (err instanceof RuleEngineError && err.code === 'RULE_UNSUPPORTED') {
-        failures.push({ field, rule, message: err.message });
+        failures.push({ field, rule, message: err.message, diagnostic: err.diagnostic ?? { code: 'unsupported_rule' } });
       } else {
-        failures.push({ field, rule, message: `非 RULE_UNSUPPORTED: ${String(err)}` });
+        failures.push({ field, rule, message: `非 RULE_UNSUPPORTED: ${String(err)}`, diagnostic: { code: 'unexpected_compile_error' } });
       }
     }
   }

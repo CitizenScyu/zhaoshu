@@ -899,9 +899,9 @@ describe('refreshShuyuan atomic refresh', () => {
       expect(engine.rules).toBe(engineItem);
       expect(engine.rules).toEqual(engineItem);
       expect(Object.keys(engine.rules).sort()).toEqual(Object.keys(engineItem).sort());
-      // 硬约束 2：池里合成的源算出的 revision 与准入 rules_hash 是同一函数、同一值。
+      // 内容 revision 保持同源；准入 rules_hash 额外带引擎语义版本前缀。
       const pooled = sourceRevision({ url: engine.url, searchUrl: engine.searchUrl, rules: engine.rules });
-      expect(pooled).toBe(rulesHash(engineItem));
+      expect(rulesHash(engineItem)).toBe(`1:${pooled}`);
       // 判别力：任何一个键被裁掉都会改变 revision（防裁剪断言不是恒真）。
       const trimmed = { ...engineItem } as Record<string, unknown>;
       delete trimmed.ruleContent;
@@ -935,7 +935,8 @@ describe('refreshShuyuan atomic refresh', () => {
         if (text.includes('SELECT DISTINCT host FROM source_admission')) return [{ host: 'engine.example' }];
         if (text.includes('FROM source_admission')) {
           // 准入兼容 L4：漏斗带 url_defaulted / miss_chapter_list / miss_chapter_name 三个新列。
-          return [{ ok: 12, deferred: 5, rejected: 3, url_defaulted: 10, miss_chapter_list: 0, miss_chapter_name: 0 }];
+          return [{ ok: 12, deferred: 5, rejected: 3, url_defaulted: 10, miss_chapter_list: 0, miss_chapter_name: 0,
+            rejection_codes: { unsupported_operator: 3 } }];
         }
         if (text.includes('JOIN source_admission')) return [engineRow()];
         if (text.includes('FROM shuyuan_sources')) return [];
@@ -945,7 +946,8 @@ describe('refreshShuyuan atomic refresh', () => {
       const health = await getShuyuanPoolHealth(new AbortController().signal);
       expect(health).toMatchObject({
         readingPoolSize: 2, enginePoolSize: 1, poolCandidates: 0,
-        admission: { ok: 12, deferred: 5, rejected: 3, url_defaulted: 10, miss_chapter_list: 0, miss_chapter_name: 0 },
+        admission: { ok: 12, deferred: 5, rejected: 3, url_defaulted: 10, miss_chapter_list: 0, miss_chapter_name: 0,
+          rejection_codes: { unsupported_operator: 3 } },
       });
       // 漏斗谓词与入池判据同口径：ok 必须含 compile_ok ∧ search_ok IS TRUE。
       const funnel = execute.mock.calls.find(([query]) => query.text.includes('FROM source_admission'))![0];
@@ -955,6 +957,7 @@ describe('refreshShuyuan atomic refresh', () => {
       expect(funnel.text).toContain("core_field_mask->>'ruleToc.chapterUrl'");
       expect(funnel.text).toContain("core_field_mask->>'ruleToc.chapterList'");
       expect(funnel.text).toContain("core_field_mask->>'ruleToc.chapterName'");
+      expect(funnel.text).toContain('jsonb_array_elements(a.compile_diagnostics)');
     });
 
     it('准入兼容 L4 反例 18：靠引擎默认进池的行计入 url_defaulted（core_field_mask.chapterUrl=false）', async () => {
@@ -966,6 +969,7 @@ describe('refreshShuyuan atomic refresh', () => {
         if (text.includes('SELECT DISTINCT host FROM source_admission')) return [];
         if (text.includes('FROM source_admission')) return [{
           ok: 3, deferred: 0, rejected: 0, url_defaulted: 1, miss_chapter_list: 2, miss_chapter_name: 1,
+          rejection_codes: {},
         }];
         if (text.includes('FROM shuyuan_sources')) return [];
         if (text.includes('FROM shuyuan_meta')) return [{ collections: [], refreshed_at: null }];
@@ -974,6 +978,7 @@ describe('refreshShuyuan atomic refresh', () => {
       const health = await getShuyuanPoolHealth(new AbortController().signal);
       expect(health.admission).toEqual({
         ok: 3, deferred: 0, rejected: 0, url_defaulted: 1, miss_chapter_list: 2, miss_chapter_name: 1,
+        rejection_codes: {},
       });
       const funnel = execute.mock.calls.find(([query]) => query.text.includes('FROM source_admission'))![0];
       expect(funnel.text).toContain('AS url_defaulted');
@@ -996,7 +1001,8 @@ describe('refreshShuyuan atomic refresh', () => {
       const health = await getShuyuanPoolHealth(new AbortController().signal);
       expect(health).toMatchObject({
         readingPoolSize: 1, enginePoolSize: 0, poolCandidates: 0,
-        admission: { ok: 0, deferred: 0, rejected: 0, url_defaulted: 0, miss_chapter_list: 0, miss_chapter_name: 0 },
+        admission: { ok: 0, deferred: 0, rejected: 0, url_defaulted: 0, miss_chapter_list: 0, miss_chapter_name: 0,
+          rejection_codes: {} },
       });
       expect(console.error).toHaveBeenCalledWith(
         expect.stringContaining('shuyuan admission funnel unavailable'),

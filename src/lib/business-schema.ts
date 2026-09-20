@@ -191,9 +191,13 @@ export async function initializeBusinessSchema(s: Sql) {
       search_verdict text NOT NULL DEFAULT '',
       search_checked_at timestamptz,
       rules_hash text NOT NULL,
+      engine_semantics_version integer NOT NULL DEFAULT 0,
       host text NOT NULL,
-      error text NOT NULL DEFAULT ''
+      error text NOT NULL DEFAULT '',
+      compile_diagnostics jsonb NOT NULL DEFAULT '[]'::jsonb
     )`,
+    tx`ALTER TABLE source_admission ADD COLUMN IF NOT EXISTS engine_semantics_version integer NOT NULL DEFAULT 0`,
+    tx`ALTER TABLE source_admission ADD COLUMN IF NOT EXISTS compile_diagnostics jsonb NOT NULL DEFAULT '[]'::jsonb`,
     tx`CREATE INDEX IF NOT EXISTS source_admission_host_idx ON source_admission (host)`,
     // F15：每个用户一行「待吸收反馈」队列。反馈写事务只做快速持久化 + 把 pending_feedback_id
     // 抬到本次写入的反馈 id（GREATEST 合并并发写入）；画像吸收按用户合并成一次模型调用，成功后
