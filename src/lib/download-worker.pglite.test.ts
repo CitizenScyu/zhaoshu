@@ -376,7 +376,9 @@ maybe('T3 worker 任务层：租约、单写者、五阶段对账（PGlite + moc
   it('engine adapter 接缝：code=0 → complete；missing_chapters → incomplete；抛错 → failure', async () => {
     const fakeDownload = vi.fn(async (_m: unknown, args: { source: string }, _resolve: unknown, _transport: unknown, hooks: { signal?: AbortSignal; onProgress?: (u: { chaptersDone: number; chaptersTotal: number; charsTotal: number }) => Promise<void> }) => {
       await hooks.onProgress?.({ chaptersDone: 2, chaptersTotal: 3, charsTotal: 1620 });
-      if (args.source.includes('dead')) return { code: 2, manifest: { status: 'partial', errors: ['source_unavailable'], chapters_total: 0, chapters_done: 0, chars: 0 } };
+      // errors 故意不放 source_unavailable：该 reason 本就在 incomplete 名单内，
+      // 删掉 `result.code===2` 分支测试仍绿。用 download_failed 才能钉住退出码契约。
+      if (args.source.includes('dead')) return { code: 2, manifest: { status: 'partial', errors: ['download_failed'], chapters_total: 0, chapters_done: 0, chars: 0 } };
       const mode = args.source.includes('bad') ? 'missing' : 'ok';
       if (mode === 'ok') return { code: 0, manifest: { status: 'done', errors: [], chapters_total: 3, chapters_done: 3, chars: 2430, artifact: { file: 'book.txt', sha256: 'x', bytes: 9 } } };
       return { code: 1, manifest: { status: 'partial', errors: ['missing_chapters'], chapters_total: 3, chapters_done: 2, chars: 1620 } };
@@ -479,6 +481,38 @@ maybe('T3 worker 任务层：租约、单写者、五阶段对账（PGlite + moc
       signal: lease.signal,
       progress: async () => {},
     })).rejects.toBeInstanceOf(TaskLeaseLostError);
+  });
+
+  it('runDownloadTask 端到端：taskTimeoutMs 耗尽 → DB 终态 partial（不是 failed）', async () => {
+    // 复审阻断：taskTimer abort 合成 signal 后，incomplete 分支若无条件 throwIfAborted，
+    // partial 永不写入、外层 catch 落 failed。本例经 runDownloadTask，删掉守卫放行即失败。
+    const id = await insertTask();
+    const adapter = createEngineAdapter({
+      downloadBook: (async (_m: unknown, _args: unknown, _resolve: unknown, _transport: unknown, hooks: { signal?: AbortSignal }) => {
+        await new Promise<void>((resolve, reject) => {
+          const s = hooks.signal;
+          if (!s) return reject(new Error('missing signal'));
+          if (s.aborted) return resolve();
+          const watchdog = setTimeout(() => reject(new Error('budget timer did not fire')), 2000);
+          s.addEventListener('abort', () => { clearTimeout(watchdog); resolve(); }, { once: true });
+        });
+        return { code: 1, manifest: { status: 'partial', errors: ['download_failed'], chapters_total: 10, chapters_done: 4, chars: 8100 } };
+      }) as never,
+      modules: {},
+      resolveSource: async () => ({}),
+      readBookText: async () => '',
+      outRoot: 'unused',
+    });
+    const result = await runDownloadTask(
+      options([adapter], { taskTimeoutMs: 30 }),
+      (await claimDownloadTask(sql as never, 'worker-a'))!,
+    );
+    expect(result.terminal).toBe('partial');
+    expect(result.reason).toBe('budget_exhausted');
+    const state = await taskState(id);
+    expect(state.status).toBe('partial');
+    expect(String(state.error)).toContain('budget_exhausted');
+    expect(github.calls).toHaveLength(0);
   });
 
   it('运行不做 DDL：任务层全程零 CREATE/ALTER 语句（对 sql 标签包装捕获）', async () => {

@@ -184,7 +184,11 @@ async function loadCurrentBaseline(github: GitHubContents, dir: string, canonica
   if (pointerBytes === null) return fallbackBaseline(github, dir, canonicalPath);
   const pointer = parseJson<ReleasePointer>(pointerBytes);
   if (!pointer || typeof pointer.current !== 'string' || !Array.isArray(pointer.history)) {
-    // 指针损坏时静默放行会绕过晋升保护，按可人工修复的硬失败处理（同原 worker 语义）。
+    // 合法 JSON 但 current 非字符串 / history 非数组：本处硬失败，不走 fallbackBaseline。
+    // 与参照 worker.mjs:332 不完全一致——那边 JSON.parse 成功即把对象当 current，
+    // current.current 非 8-hex 时 readSnapshotManifest 返回 null 再走规范路径兜底。
+    // 差异有意保留：history 非数组时 spread 会污染指针文件；current 非字符串当「无指针」
+    // 静默放行会绕过晋升保护。损坏指针改由人工核对后删除该文件恢复（同原 worker 解析失败口径）。
     throw new PublicationStageError('pointer', 'current_json_unreadable');
   }
   // current 是合法 JSON 字符串但不是 8-hex 版本号：按「指针不可用」走规范路径内容 hash 兜底，
