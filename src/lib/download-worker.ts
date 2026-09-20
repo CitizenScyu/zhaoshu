@@ -104,6 +104,16 @@ export function isBudgetExhausted(error: unknown): boolean {
 }
 
 /**
+ * 写终态前的 abort 守卫。
+ * `taskTimer` 以 `budget_exhausted` abort 合成 signal 后，adapter 已把结果归一为 incomplete；
+ * 若此处无条件 `throwIfAborted()`，partial 写入被跳过、外层 catch 落 failed，与预算归一目标矛盾。
+ * 预算耗尽仍持有租约，按 adapter 已分类结果收口；失权（心跳 abort 的 TaskLeaseLostError）必须抛、不得写终态。
+ */
+function throwIfAbortedUnlessBudget(signal: AbortSignal): void {
+  if (!isBudgetExhausted(signal.reason)) signal.throwIfAborted();
+}
+
+/**
  * 心跳定时器（zhaoshu-books task-heartbeat 的 v7 化形态）：
  * 每 60s 一次租约条件心跳；连续失败置 signal，抓取/发布链路立即停。
  */
@@ -198,7 +208,7 @@ export async function runDownloadTask(
     if (outcome.kind === 'incomplete') {
       // partial 零发布：任何 GitHub PUT 都没发生，DB 只写终态。
       await heartbeat.stop();
-      signal.throwIfAborted();
+      throwIfAbortedUnlessBudget(signal);
       // 源不可用是「没尝试成抓取」，章数 0/0 读作缺章会误导——按源侧措辞落库。
       const detail = outcome.reason === 'source_unavailable'
         ? '源不可用（未尝试抓取）：source_unavailable'
@@ -212,7 +222,7 @@ export async function runDownloadTask(
     }
     if (outcome.kind === 'failure') {
       await heartbeat.stop();
-      signal.throwIfAborted();
+      throwIfAbortedUnlessBudget(signal);
       const written = await storage.finish(lease, { status: 'failed', error: outcome.code.slice(0, 4000) });
       if (!written) throw new TaskLeaseLostError();
       return { processed: true, terminal: 'failed', reason: outcome.code };
@@ -251,7 +261,7 @@ export async function runDownloadTask(
 
     if (!release.promoted) {
       await heartbeat.stop();
-      signal.throwIfAborted();
+      throwIfAbortedUnlessBudget(signal);
       const written = await storage.finish(lease, {
         status: 'superseded_by_incomplete',
         error: cleanPgText([
@@ -267,7 +277,7 @@ export async function runDownloadTask(
     // 第五阶段（DB）：登记已发布产物并指向任务行；失败按可对账恢复的 failed 收口，
     // 快照/manifest 已落库，修复器凭完整 hash 与目标路径补登记，不重复下载。
     await heartbeat.stop();
-    signal.throwIfAborted();
+    throwIfAbortedUnlessBudget(signal);
     const registered = await storage.registerArtifact({
       artifactId, version: release.version, blobSha: release.blobSha, bytes: release.bytes,
       chaptersTotal: outcome.chaptersTotal, chaptersDone: outcome.chaptersDone,

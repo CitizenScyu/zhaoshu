@@ -1,5 +1,5 @@
 import { describe, it, expect, afterEach, vi } from 'vitest';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
 import { tmpdir } from 'node:os';
@@ -42,8 +42,9 @@ function setup(style = 0, failure = '') {
     return { url, text: `<li class="chapter-content" id="article-content">${failure === 'blank' ? '' : '<p>合成正文，离线测试。</p>'}</li>` };
   };
   vi.stubGlobal('fetch', () => { throw new Error('network forbidden'); });
-  const run = (selectedTransport = transport) => downloadBook({ api, compile, parser }, options, async () => ({ source, builtin: style < 0 }), selectedTransport);
-  return { run, options, calls, times, transport };
+  const builtin = style < 0;
+  const run = (selectedTransport = transport) => downloadBook({ api, compile, parser }, options, async () => ({ source, builtin }), selectedTransport);
+  return { run, options, calls, times, transport, source, builtin };
 }
 
 describe('download offline full books', () => {
@@ -164,5 +165,42 @@ describe('download offline full books', () => {
   it('validates numeric limits and required identity', () => {
     expect(() => downloadOptions({})).toThrow();
     expect(() => downloadOptions({ source: 'book15.net', title: 'x', author: 'y', 'max-chapters': -1 })).toThrow();
+  });
+  it('onProgress 每章必发；<5s 章级 checkpoint 不落盘；finally 强制落盘', async () => {
+    const f = setup();
+    const progress: { chaptersDone: number; diskChaptersDone: number | null; mtimeMs: number | null; content: string | null }[] = [];
+    const findManifest = () => {
+      const sub = readdirSync(f.options.out as string).find(name => existsSync(join(f.options.out as string, name, 'manifest.json')));
+      return sub ? join(f.options.out as string, sub, 'manifest.json') : null;
+    };
+    const result = await downloadBook({ api, compile, parser }, f.options, async () => ({ source: f.source, builtin: f.builtin }), f.transport, {
+      onProgress: async (update: { chaptersDone: number; chaptersTotal: number; charsTotal: number }) => {
+        const path = findManifest();
+        const content = path && existsSync(path) ? readFileSync(path, 'utf8') : null;
+        progress.push({
+          chaptersDone: update.chaptersDone,
+          diskChaptersDone: content ? JSON.parse(content).chapters_done : null,
+          mtimeMs: path && existsSync(path) ? statSync(path).mtimeMs : null,
+          content,
+        });
+      },
+    });
+    expect(result.code).toBe(0);
+    // toc 解析 + 2 章 + finally 收尾：删掉「onProgress 在节流外必发」即少两次章级回调。
+    expect(progress).toHaveLength(4);
+    expect(progress.map(p => p.chaptersDone)).toEqual([0, 1, 2, 2]);
+    // 相邻两次章级 checkpoint 间隔 <<5s：磁盘内容/mtime 相对 toc 落盘不变，回调计数仍递增。
+    expect(progress[1].content).toBe(progress[0].content);
+    expect(progress[2].content).toBe(progress[0].content);
+    expect(progress[1].mtimeMs).toBe(progress[0].mtimeMs);
+    expect(progress[2].mtimeMs).toBe(progress[0].mtimeMs);
+    expect(progress[1].diskChaptersDone).toBe(0);
+    expect(progress[2].diskChaptersDone).toBe(0);
+    // finally 强制落盘：最后一次磁盘计数与内存一致。
+    expect(progress[3].diskChaptersDone).toBe(2);
+    expect(progress[3].content).not.toBe(progress[0].content);
+    const saved = JSON.parse(readFileSync(result.manifestPath, 'utf8'));
+    expect(saved.chapters_done).toBe(2);
+    expect(saved.chapters.filter((c: { status: string }) => c.status === 'done')).toHaveLength(2);
   });
 });
