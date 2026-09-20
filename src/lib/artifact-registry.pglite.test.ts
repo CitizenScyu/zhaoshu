@@ -86,7 +86,9 @@ describe('artifact registry: real local Postgres and mock private GitHub', () =>
     expect((await pg.query('SELECT user_id,artifact_id,chapters_done FROM download_tasks WHERE id=1')).rows)
       .toEqual([{ user_id: 1, artifact_id: null, chapters_done: 0 }]);
     await expect(pg.exec('UPDATE download_tasks SET artifact_id=999 WHERE id=1')).rejects.toMatchObject({ code: '23503' });
-    await expect(pg.exec('UPDATE download_tasks SET user_id=NULL WHERE id=1')).rejects.toMatchObject({ code: '23502' });
+    // T1 v7 makes user_id nullable for system tasks; user-task ownership is now enforced
+    // by download_tasks_request_identity_check (23514) instead of a NOT NULL column (23502).
+    await expect(pg.exec('UPDATE download_tasks SET user_id=NULL WHERE id=1')).rejects.toMatchObject({ code: '23514' });
   });
 
   it('reads a pre-migration database without artifact tables or column', async () => {
