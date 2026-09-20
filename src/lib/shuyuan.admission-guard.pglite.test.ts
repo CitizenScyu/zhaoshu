@@ -105,4 +105,25 @@ maybe('shuyuan writeAdmissionRows 版本自洽守卫（真库 INSERT 路径）',
     const rows = await sql`SELECT count(*)::int AS n FROM source_admission`;
     expect(rows[0].n).toBe(0);
   });
+
+  // 对抗性：钉「严格等值」而非「子串包含」。判据若退化成 includes（版本值只要出现在前缀里就放行），
+  // 以下用例仍必须转红。前缀是版本的**超串**（前缀 "12" 含版本 "1"）：strict 应拒、includes 会误放。
+  it('版本值是版本前缀的真子串（前缀 12 vs 版本 1）→ 抛错且不落库', async () => {
+    const subset = row({ rules_hash: '12:deadbeef', engine_semantics_version: 1 });
+    await expect(
+      writeAdmissionRows(sql as unknown as Parameters<typeof writeAdmissionRows>[0], [subset]),
+    ).rejects.toThrow(/版本自查失败/);
+    const rows = await sql`SELECT count(*)::int AS n FROM source_admission`;
+    expect(rows[0].n).toBe(0);
+  });
+
+  // 反方向：版本值是前缀的**超串**（版本 "12" 含前缀 "1"），钉住 versionStr.includes(prefixStr) 式退化。
+  it('版本值是版本前缀的超串（前缀 1 vs 版本 12）→ 抛错且不落库', async () => {
+    const superset = row({ rules_hash: '1:deadbeef', engine_semantics_version: 12 });
+    await expect(
+      writeAdmissionRows(sql as unknown as Parameters<typeof writeAdmissionRows>[0], [superset]),
+    ).rejects.toThrow(/版本自查失败/);
+    const rows = await sql`SELECT count(*)::int AS n FROM source_admission`;
+    expect(rows[0].n).toBe(0);
+  });
 });
