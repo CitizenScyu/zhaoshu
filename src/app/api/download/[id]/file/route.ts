@@ -5,6 +5,7 @@ import { ensureSchema, getSql } from '@/lib/db';
 import { boundedPositiveInteger } from '@/lib/http';
 import { sanitizeBookFilename } from '@/lib/book-file-name';
 import { locateBookFile } from '@/lib/book-file-locator';
+import { artifactContentsUrl, locateTaskArtifact } from '@/lib/artifact-locator';
 
 // 下载完成的任务取回 TXT:文件在 GitHub 私库 CitizenScyu/zhaoshu-books 的 books/ 下
 export const maxDuration = 60;
@@ -43,8 +44,8 @@ class FileUpstreamError extends Error {
   }
 }
 
-async function githubResponse(path: string, accept: string, signal: AbortSignal): Promise<Response | null> {
-  const res = await fetch(contentsUrl(path), {
+async function githubResponse(path: string, accept: string, signal: AbortSignal, artifactUrl?: string): Promise<Response | null> {
+  const res = await fetch(artifactUrl ?? contentsUrl(path), {
     headers: ghHeaders(accept),
     cache: 'no-store',
     signal,
@@ -85,9 +86,9 @@ async function findBookName(title: string, author: string, signal: AbortSignal):
 }
 
 // 直接请求 raw 文件流,避免 JSON/base64 解码或整体缓冲 TXT
-async function readFile(name: string, signal: AbortSignal): Promise<ReadableStream<Uint8Array> | null> {
+async function readFile(name: string, signal: AbortSignal, artifactUrl?: string): Promise<ReadableStream<Uint8Array> | null> {
   const path = `${BOOKS_DIR}/${encodeURIComponent(name)}`;
-  const res = await githubResponse(path, 'application/vnd.github.raw', signal);
+  const res = await githubResponse(path, 'application/vnd.github.raw', signal, artifactUrl);
   if (!res) return null;
   if (!res.body) {
     throw new FileUpstreamError('文件服务返回了空响应，请稍后重试', 'UPSTREAM_ERROR', 502);
@@ -108,17 +109,18 @@ export async function GET(
   }
   const timeout = AbortSignal.timeout(GITHUB_TIMEOUT_MS);
   const signal = AbortSignal.any([req.signal, timeout]);
-  let task: { id: number; title: string; author: string; status: string };
+  let task: { id: number; title: string; author: string; status: string; artifact_id?: string | null };
   try {
     await ensureSchema();
     const sql = getSql();
     const rows = (await sql`
-      SELECT id, title, author, status FROM download_tasks
+      SELECT id, title, author, status, to_jsonb(download_tasks)->>'artifact_id' AS artifact_id FROM download_tasks
       WHERE id = ${taskId} AND user_id = ${auth.principal.userId}`) as {
       id: number;
       title: string;
       author: string;
       status: string;
+      artifact_id?: string | null;
     }[];
     if (rows.length === 0) {
       return authJson({ error: 'task not found', code: 'TASK_NOT_FOUND' }, { status: 404 });
@@ -138,11 +140,12 @@ export async function GET(
 
   try {
     signal.throwIfAborted();
-    const name = await findBookName(task.title, task.author, signal);
+    const artifact = task.artifact_id == null ? null : await locateTaskArtifact(getSql(), task.artifact_id);
+    const name = artifact ? artifact.canonical_path : await findBookName(task.title, task.author, signal);
     if (!name) {
       return authJson({ error: 'file not found', code: 'FILE_NOT_FOUND' }, { status: 404 });
     }
-    const body = await readFile(name, signal);
+    const body = await readFile(name, signal, artifact ? artifactContentsUrl(artifact) : undefined);
     if (!body) {
       return authJson({ error: 'file not found', code: 'FILE_NOT_FOUND' }, { status: 404 });
     }

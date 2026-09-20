@@ -144,7 +144,7 @@ describe('GET /api/read/[id]/[resource]', () => {
       }),
     );
     expect(sql).toHaveBeenCalledTimes(2);
-    expect(sql.mock.calls[0][0].join(' ')).toMatch(/SELECT id, title, author, status, user_id FROM download_tasks WHERE id =/);
+    expect(sql.mock.calls[0][0].join(' ')).toMatch(/SELECT id, title, author, status, user_id, to_jsonb\(download_tasks\)->>'artifact_id' AS artifact_id\s+FROM download_tasks WHERE id =/);
     expect(sql.mock.calls[0][1]).toBe(42);
     expect(ensureSchema).not.toHaveBeenCalled();
   });
