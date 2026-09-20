@@ -12,6 +12,11 @@
   python3 labeler.py --no-db-model          # 不读库，强制用 .env 的模型链
   python3 labeler.py --source douban        # 豆瓣网文 tag 名单选书（默认 rank=book15 榜单，行为不变）
   python3 labeler.py --source webnovel      # 网文站榜单（起点完本/月票/畅销）为主+豆瓣 tag 补充
+  python3 labeler.py --categories 23 --max-pages 2    # rank 线叠加分类 t-23 前 2 页（小范围试跑）
+  python3 labeler.py --categories all       # rank 线叠加全部分类（小时级扫页，慎用）
+分类列表入口（list-t-N）叠加在 --source rank 线上：候选惰性只留 {url,title}，打标时现抓
+详情页取元数据/章节/正文（1 次请求）。**默认关闭**（不给 --categories = 只走榜单，行为不变），
+需显式 --categories 才开启；残本候选记入 labels-stub.jsonl，下轮跳过（人工删行可恢复）。
 配置: /root/zhaoshu-labeler/.env（LLM_API_KEY 必填；DATABASE_URL 与 LLM_MODEL 可选）
       数据目录默认 = 脚本同目录（.env / labels.jsonl / labels-rejected.jsonl）；
       只有显式设置 LABELER_DATA_DIR 时才改指向该目录——给本地 dry-run 用副本数据复现，
@@ -39,6 +44,22 @@ CHUNK_RETRY = 3             # 单章抓取重试
 LLM_INTERVAL_SEC = 30       # 两次 LLM 调用最小间隔（控频）
 CHAPTER_DELAY = 0.3         # 抓章节间隔（对目标站友好）
 RANKS = (1, 2, 3)           # 榜单页
+# 分类列表页 list-t-N（扩源入口，侦察报告 D:/ClaudeCode/projects/zhaoshu/source-scout-report.md §1/§4）。
+# 叠加在 rank 线上：两路书目并进同一去重池（merge_books），不动 RANKS 既有行为。
+# 🔴 默认关闭：不给 --categories 时 parse_categories(None)=() ⇒ 只走榜单（见 parse_categories）；
+# 全量 17 类是小时级扫页且每轮重扫，gatekeeper 上线日须显式定死 --categories/--max-pages。
+CATEGORY_PAGES = (3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14, 15, 16, 17, 21, 22, 23)
+CATEGORY_MAX_PAGES = 200    # 每个分类的翻页安全上界；真实尾页从 HTML 解析（不写死 133/93）
+CATEGORY_PAGE_DELAY = 1.2   # 分类页翻页间隔（对目标站友好）；17 类全量是小时级
+# 站点 GET 重试：侦察实测 list-t-4 有一次 25s 超时后重试成功，说明站点偶发慢响应。
+HTTP_RETRY = 1              # 失败后重试次数（总尝试 = 1 + HTTP_RETRY）；0 = 只试 1 次
+HTTP_RETRY_DELAY = 2.0      # 重试间隔（秒）
+# 残本/空壳页下限（侦察报告 §5：details7984 只有 32KB，其余动辄 300KB+）。
+# 这是**候选过滤**不是内容拒收：命中的书打标前直接跳过，记入 labels-stub.jsonl（不进
+# labels-rejected.jsonl、不占钉子户终态名额），下轮据此跳过——避免残本永久占住 --limit 名额
+# 让正常书饥饿（P1）。人工删 labels-stub.jsonl 里该行即重新并入候选。
+STUB_MIN_CHAPTERS = 10
+STUB_MIN_CHARS = 50_000
 BASE = 'https://book15.net'
 LLM_URL = 'https://api.cloud.us.kg/v1/chat/completions'
 UA = {'User-Agent': 'Mozilla/5.0 (compatible; zhaoshu-labeler/1.0)'}
@@ -194,9 +215,25 @@ def resolve_models(env: dict, use_db: bool = True) -> tuple[list[str], str]:
 
 
 def http_get(url: str, timeout: int = 30) -> str:
-    req = urllib.request.Request(url, headers=UA)
-    with urllib.request.urlopen(req, timeout=timeout) as res:
-        return res.read().decode('utf-8', 'replace')
+    """站点页面 GET（失败重试 HTTP_RETRY 次）。签名保持 (url, timeout) 不变，
+    便于单测继续用 `labeler.http_get = lambda url, timeout=30: ...` 替换传输层。
+
+    注意：章节抓取路径上还有 fetch_book_text 的 CHUNK_RETRY=3 外层重试，
+    两处叠加时「持续失败的单章」最坏尝试 3×(1+HTTP_RETRY) 次——只影响失败页，
+    正常页面仍是 1 次请求。"""
+    last_err = None
+    for attempt in range(1 + HTTP_RETRY):
+        try:
+            req = urllib.request.Request(url, headers=UA)
+            with urllib.request.urlopen(req, timeout=timeout) as res:
+                return res.read().decode('utf-8', 'replace')
+        except Exception as e:      # noqa: BLE001 —— 网络层异常一律重试，最后一次原样抛出
+            last_err = e
+            if attempt < HTTP_RETRY:
+                print(f'  GET 失败，重试 {attempt + 1}/{HTTP_RETRY}: {url} ({e})',
+                      file=sys.stderr)
+                time.sleep(HTTP_RETRY_DELAY)
+    raise last_err
 
 
 # ---- 书源适配层：把「基址 + 站点解析」从主流程解耦 ----
@@ -247,8 +284,51 @@ SOURCES: dict[str, BookSource] = {BOOK15.name: BOOK15}
 
 
 # ---- 抓取层（将来可整体搬进主应用）----
+# 详情页 anchor 正则：榜单页与分类列表页的这段 HTML 逐字节一致，两路复用同一条。
+_DETAIL_ANCHOR_RE = re.compile(r'href="(/books/details\d+\.html)"[^>]*>([^<]+)</a>')
+# 分类页「尾页」锚：<li><a href="/books/list-t-3.html?page=133">尾页</a></li>
+# 🔴 尾页页码一律从 HTML 解析，不写死——各类不同（t-3=133 / t-21=93 / t-23=2）且随书目增长。
+_LAST_PAGE_RE = re.compile(r'href="[^"]*[?&]page=(\d+)"[^>]*>\s*尾页\s*</a>')
+# 详情页 og:novel 元数据（惰性元数据路径用；与解耦前 fetch_rank_books 同款正则，行为不变）。
+_DETAIL_META_PATTERNS = (
+    ('author', r'og:novel:author"\s+content="([^"]+)"'),
+    ('category', r'og:novel:category"\s+content="([^"]+)"'),
+    ('status', r'og:novel:status"\s+content="([^"]+)"'),
+)
+
+
+def parse_last_page(html: str) -> int | None:
+    """分类列表页 html → 尾页页码；无「尾页」链接（单页 / 结构变化）返回 None。纯函数。"""
+    m = _LAST_PAGE_RE.search(html)
+    if not m:
+        return None
+    n = int(m.group(1))
+    return n if n >= 1 else None
+
+
+def parse_book_meta(html: str) -> dict:
+    """详情页 html → {author, category, status}（缺字段为空串）。纯函数，可离线单测。"""
+    meta = {}
+    for field, pat in _DETAIL_META_PATTERNS:
+        m = re.search(pat, html)
+        meta[field] = m.group(1).strip() if m else ''
+    return meta
+
+
+def fetch_book_meta(detail_url: str) -> dict:
+    """单本详情页 url → 元数据 dict（失败返回全空，不抛）。
+
+    惰性元数据：解耦前在**候选阶段**对每本书多抓一次详情页补 author/category/status，
+    232 本尚可忍、扩源到数千本时成为主要耗时；改成候选只留 {url, title}，
+    轮到打标时再抓——打标本来就要抓详情页，这次抓取顺带取元数据。"""
+    try:
+        return parse_book_meta(http_get(BOOK15.absolute(detail_url)))
+    except Exception:
+        return {'author': '', 'category': '', 'status': ''}
+
+
 def fetch_rank_books() -> list[dict]:
-    """榜单页 → [{url, title, author, category, status}]"""
+    """榜单页 → [{url, title}]（元数据改为惰性，见 fetch_book_meta / main 打标循环）"""
     books, seen = [], set()
     for rank in RANKS:
         try:
@@ -256,26 +336,111 @@ def fetch_rank_books() -> list[dict]:
         except Exception as e:
             print(f'  rank{rank} 拉取失败: {e}', file=sys.stderr)
             continue
-        for m in re.finditer(r'href="(/books/details\d+\.html)"[^>]*>([^<]+)</a>', html):
+        for m in _DETAIL_ANCHOR_RE.finditer(html):
             url, title = m.group(1), m.group(2).strip()
             if url not in seen:
                 seen.add(url)
                 books.append({'url': url, 'title': title})
-    # 补详情页元数据（作者/分类/状态）
-    for b in books:
-        try:
-            html = http_get(BOOK15.absolute(b['url']))
-            for field, pat in (
-                ('author', r'og:novel:author"\s+content="([^"]+)"'),
-                ('category', r'og:novel:category"\s+content="([^"]+)"'),
-                ('status', r'og:novel:status"\s+content="([^"]+)"'),
-            ):
-                m = re.search(pat, html)
-                if m:
-                    b[field] = m.group(1)
-        except Exception:
-            b['author'] = b.get('author', '')
     return books
+
+
+def category_url(cat: int, page: int) -> str:
+    """分类列表页 URL：/books/list-t-{cat}.html?page={page}"""
+    return f'{BOOK15.base}/books/list-t-{cat}.html?page={page}'
+
+
+def fetch_category_books(categories=CATEGORY_PAGES, max_pages=CATEGORY_MAX_PAGES,
+                         page_delay=CATEGORY_PAGE_DELAY) -> list[dict]:
+    """分类列表页 → [{url, title}]（跨类去重，元数据同样惰性）。
+
+    每类先拉 page=1，解析「尾页」页码（不写死），再逐页迭代到 min(尾页, max_pages)。
+    每页 35 个 details 链接 = 15 本真网格 + 20 本固定侧栏；侧栏 20 本每页完全相同，
+    由 seen 自然去重，无需特判。翻页间隔 page_delay 秒。
+    17 类全量 ≈ 1500+ 页是小时级，首轮用 --categories / --max-pages 限范围试跑。"""
+    books, seen = [], set()
+    for cat in categories:
+        try:
+            html = http_get(category_url(cat, 1))
+        except Exception as e:
+            print(f'  分类 t-{cat} 第 1 页拉取失败: {e}', file=sys.stderr)
+            continue
+        last = parse_last_page(html) or 1
+        if last > max_pages:
+            print(f'  分类 t-{cat} 尾页 {last} 超过上界 {max_pages}，只取前 {max_pages} 页',
+                  file=sys.stderr)
+            last = max_pages
+        added = 0
+        for page in range(1, last + 1):
+            if page > 1:
+                time.sleep(page_delay)
+                try:
+                    html = http_get(category_url(cat, page))
+                except Exception as e:
+                    print(f'  分类 t-{cat} 第 {page} 页拉取失败: {e}', file=sys.stderr)
+                    continue
+            for m in _DETAIL_ANCHOR_RE.finditer(html):
+                url, title = m.group(1), m.group(2).strip()
+                if url not in seen:
+                    seen.add(url)
+                    books.append({'url': url, 'title': title})
+                    added += 1
+        print(f'  分类 t-{cat}: {last} 页，本类新增 {added} 本')
+    return books
+
+
+# ---- 候选池（纯函数，可离线单测）----
+def merge_books(*groups: list[dict]) -> list[dict]:
+    """多路书目按 url 去重合并（先出现者优先，保留其 title）。榜单路在前、分类路在后。"""
+    merged, seen = [], set()
+    for group in groups:
+        for b in group:
+            url = b.get('url')
+            if url and url not in seen:
+                seen.add(url)
+                merged.append(b)
+    return merged
+
+
+def is_stub_candidate(chapter_count: int, chars: int) -> str | None:
+    """残本/空壳页判据：命中返回原因字符串，未命中返回 None。
+
+    章节数 < STUB_MIN_CHAPTERS 或 正文字数 < STUB_MIN_CHARS ⇒ 残本。
+    这是**候选过滤**不是内容拒收：调用方跳过 + 记 labels-stub.jsonl（不写 rejected）。"""
+    if chapter_count < STUB_MIN_CHAPTERS:
+        return f'章节数 {chapter_count} < {STUB_MIN_CHAPTERS}'
+    if chars < STUB_MIN_CHARS:
+        return f'正文字数 {chars} < {STUB_MIN_CHARS}'
+    return None
+
+
+def parse_categories(spec: str | None) -> tuple[int, ...]:
+    """CLI --categories → 分类 ID 元组。
+
+    🔴 默认安全：None（未给参数）= **关闭分类入口**（返回空元组，只走榜单，行为不变）。
+    空串 / `none` 同样关闭；`all` 才是全部 CATEGORY_PAGES（显式全量，慎用）。
+    逗号列表指定具体分类（如 `3,21,23`）。非法值直接退出，不静默忽略——
+    省得以为限了范围其实没限、或以为开了其实没开。"""
+    if spec is None:
+        return ()
+    spec = spec.strip()
+    if not spec or spec.lower() == 'none':
+        return ()
+    if spec.lower() == 'all':
+        return tuple(CATEGORY_PAGES)
+    out: list[int] = []
+    for part in spec.split(','):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            n = int(part)
+        except ValueError:
+            sys.exit(f'--categories 解析失败: {part!r} 不是整数（或 none/all）')
+        if n < 1:
+            sys.exit(f'--categories 解析失败: {n} 必须是正整数')
+        if n not in out:
+            out.append(n)
+    return tuple(out)
 
 
 def fetch_chapters(detail_url: str,
@@ -590,9 +755,16 @@ def fetch_chapter_text(chapter_url: str, source: BookSource | None = None) -> st
 
 
 def fetch_book_text(detail_url: str, target_chars: int = TARGET_CHARS,
-                    source: BookSource | None = None) -> tuple[str, int]:
-    """整本（到字数上限）→ (拼接文本, 实际字数)"""
-    chapters = fetch_chapters(detail_url, source=source)
+                    source: BookSource | None = None,
+                    detail_html: str | None = None) -> tuple[str, int]:
+    """整本（到字数上限）→ (拼接文本, 实际字数)
+
+    detail_html 传入时复用调用方已抓的详情页解析章节（省一次 GET，也保证元数据/章节
+    同源）——章节列表经书源适配器 chapters_from_html 解析（不引入重复正则）。默认 None，
+    签名向后兼容：主应用照旧 `fetch_book_text(url)` / `fetch_book_text(url, source=src)`。"""
+    src = source or BOOK15
+    chapters = (src.chapters_from_html(detail_html) if detail_html is not None
+                else fetch_chapters(detail_url, source=source))
     parts, chars = [], 0
     for url, title in chapters:
         if chars >= target_chars:
@@ -854,6 +1026,15 @@ def load_done_urls(path: Path) -> set[str]:
     return set(_read_url_lines(path))
 
 
+def load_stub_urls(path: Path) -> set[str]:
+    """labels-stub.jsonl → 残本候选 url 集合。
+
+    P1 修复：残本候选一旦命中即记入本文件，下轮与 done_urls 同口径参与跳过——
+    不再每轮占住 --limit 名额、把正常书永久挡在队尾（残本 + 小 limit 时 exit 0 的饥饿）。
+    人工删掉本文件里某行即把该书重新并入候选（与 rejected/钉子户的恢复方式一致）。"""
+    return set(_read_url_lines(path))
+
+
 def count_rejections(path: Path) -> dict[str, int]:
     """labels-rejected.jsonl → {url: 被拒次数}（每行 = 一次拒收）。"""
     counts: dict[str, int] = {}
@@ -904,6 +1085,12 @@ def main() -> int:
                     help='选书来源：rank=book15 榜单页（默认，行为不变）；'
                          'douban=豆瓣网文 tag 名单经 book15 站内搜索映射；'
                          'webnovel=网文站榜单（起点完本/月票/畅销）为主+豆瓣 tag 补充')
+    ap.add_argument('--categories', default=None,
+                    help='仅 --source rank 生效：逗号分隔的分类 ID（list-t-N），如 "23" 或 '
+                         '"3,21"；none/空串=关闭（默认），all=全部分类 '
+                         f'{CATEGORY_PAGES}（小时级扫页，慎用）')
+    ap.add_argument('--max-pages', type=int, default=None,
+                    help=f'每个分类最多抓取的页数（默认 {CATEGORY_MAX_PAGES}，即以页内尾页为准）')
     args = ap.parse_args()
 
     env = load_env()
@@ -918,6 +1105,9 @@ def main() -> int:
     # 显式把常量传进去（而不是靠默认参数）：默认参数在 def 时就求值了，
     # 读模块常量本意是「改常量即调参/关闸（0 或负数关闭）」，这里保持这个语义。
     pinned = terminal_urls(rejection_counts, REJECT_TERMINAL_THRESHOLD)
+    # 残本候选终态（P1）：历史命中残本判据的书与 done_urls 同口径跳过，
+    # 不再每轮占住 --limit 名额把正常书挡死。空文件 / 未开分类时为空集，行为不变。
+    stub_urls = load_stub_urls(data_path('labels-stub.jsonl'))
 
     # T5 引擎兜底 CLI：仅 douban/webnovel 名单线用（下方分支按 .env 装配）；
     # rank / --book 线保持 None，取正文只走 book15，行为不变。
@@ -972,13 +1162,31 @@ def main() -> int:
             print(f'{args.source} 线共 {len(all_books)} 本（搜索命中后）')
         else:
             print('拉取榜单书目...')
-            all_books = fetch_rank_books()
-            print(f'榜单共 {len(all_books)} 本（去重后）')
+            rank_books = fetch_rank_books()
+            print(f'榜单共 {len(rank_books)} 本（去重后）')
+            all_books = rank_books
+            # 扩源：分类列表页（list-t-N）叠加在 rank 线上，并进同一去重池（榜单路在前）。
+            # 默认关闭（parse_categories(None)=()）；须显式 --categories 才开。
+            cat_ids = parse_categories(args.categories)
+            if cat_ids:
+                max_pages = (args.max_pages if args.max_pages is not None
+                             else CATEGORY_MAX_PAGES)
+                if max_pages < 1:
+                    sys.exit('--max-pages 必须 ≥ 1')
+                print(f'拉取分类列表书目（{len(cat_ids)} 类，每类最多 {max_pages} 页）...')
+                # 显式传 CATEGORY_PAGE_DELAY（同 REJECT_TERMINAL_THRESHOLD 的理由：
+                # 默认参数在 def 时就求值了，显式传才是「改常量即调参」）。
+                cat_books = fetch_category_books(cat_ids, max_pages, CATEGORY_PAGE_DELAY)
+                all_books = merge_books(rank_books, cat_books)
+                print(f'分类入口新增 {len(all_books) - len(rank_books)} 本候选'
+                      f'（分类页去重后 {len(cat_books)} 本，'
+                      f'与 rank 并集去重后 {len(all_books)} 本）')
         # --limit 切在 split_queue **之后**（审查 F.1）：命中数一旦 > limit，切在前缀会
-        # 让队尾（多半是豆瓣/17K 尾部）永远进不了视野——每轮只处理前 limit 条，做完进
-        # done_urls，之后每轮 queue=[] 却仍全量搜索。先剔除已完成/钉子户再取上限，
-        # 语义 = 「本轮最多打 limit 本**未完成**的书」。
-        queue, skipped_done, skipped_pinned = split_queue(all_books, done_urls, pinned)
+        # 让队尾（多半是豆瓣/17K 尾部 / 分类新书）永远进不了视野——每轮只处理前 limit 条，
+        # 做完进 done_urls，之后每轮 queue=[] 却仍全量搜索。先剔除已完成/钉子户/残本再取上限，
+        # 语义 = 「本轮最多打 limit 本**未完成**的书」。stub_urls 折进 done 侧一并跳过（P1）。
+        queue, skipped_done, skipped_pinned = split_queue(
+            all_books, done_urls | stub_urls, pinned)
         queue = queue[:args.limit]
         # X = 本轮跳过总数（已完成 + 钉子户终态，互斥不重叠），Y = 其中因钉子户终态跳过的。
         print(f'本轮处理 {len(queue)} 本（跳过已完成 {len(skipped_done) + len(skipped_pinned)} 本'
@@ -996,19 +1204,54 @@ def main() -> int:
                   b['url'], engine_tag)
         return 0
 
-    ok = fail = 0
+    ok = fail = stub_skipped = 0
     import_failures = 0
+
+    def record_stub(book: dict, reason: str) -> None:
+        """残本候选跳过：记 labels-stub.jsonl（不写 rejected、不占钉子户名额），
+        下轮据此跳过（P1 修复）。人工删该行即重新并入候选。"""
+        print(f'  残本候选：{reason}，跳过并记入 labels-stub.jsonl（下轮不再取，人工删行可恢复）')
+        rec = {'url': BOOK15.absolute(book['url']),
+               'title': book.get('title', ''), 'reason': reason}
+        with open(data_path('labels-stub.jsonl'), 'a', encoding='utf-8') as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + '\n')
+
     for i, b in enumerate(queue, 1):
         print(f'[{i}/{len(queue)}] {b.get("title")} ...')
         try:
             # 引擎兜底条目走 CLI 取正文（toc/content，不过 clean_chapter_text）；
-            # 其余走 book15 适配器路径，行为不变。
+            # rank/分类线走 book15 惰性元数据路径；douban/webnovel 候选已带元数据、--book
+            # 无元数据，二者直接取正文（行为不变）。
             if b.get('engine'):
                 # N02：toc 自报身份与名单身份比对（双侧非空才比对），错书在抓正文前拦下。
+                # 引擎条目 url 是绝对 host URL，绝不能走 http_get(BASE + url) 打错站。
                 text, chars = fetch_book_text_engine(
                     engine_cli, b['url'],
                     expect_title=b.get('title') or '',
                     expect_author=b.get('author') or '')
+            elif not args.book and args.source == 'rank':
+                # 惰性元数据：rank/分类候选只带 {url,title}，这里现抓一次详情页——
+                # og:novel 元数据 + 章节列表 + 全本正文都复用这份 html（共 1 次详情页请求）。
+                # 把元数据写回 b，下方 reject/入库路径照旧读 b.get(...)，零改动复用。
+                detail_html = http_get(BOOK15.absolute(b['url']))
+                meta = parse_book_meta(detail_html)
+                b['author'], b['category'], b['status'] = (
+                    meta['author'], meta['category'], meta['status'])
+                chapter_count = len(BOOK15.chapters_from_html(detail_html))
+                # 残本候选过滤（P1/P2）：章节数已可判残本 → 先短路（不抓全本正文），
+                # 命中即记 stub 侧车后跳过。chars=STUB_MIN_CHARS 使此处仅按章节数触发。
+                stub_reason = is_stub_candidate(chapter_count, STUB_MIN_CHARS)
+                if stub_reason:
+                    record_stub(b, stub_reason)
+                    stub_skipped += 1
+                    continue
+                text, chars = fetch_book_text(b['url'], detail_html=detail_html)
+                # 章节够但正文过短的空壳页：抓完再按正文字数复判。
+                stub_reason = is_stub_candidate(chapter_count, chars)
+                if stub_reason:
+                    record_stub(b, stub_reason)
+                    stub_skipped += 1
+                    continue
             else:
                 text, chars = fetch_book_text(b['url'])
             if chars < 10_000:
@@ -1144,7 +1387,7 @@ def main() -> int:
             print(f'  失败: {e}', file=sys.stderr)
             fail += 1
         time.sleep(LLM_INTERVAL_SEC)
-    print(f'\n完成: 成功 {ok} / 失败 {fail}，结果在 labels.jsonl')
+    print(f'\n完成: 成功 {ok} / 失败 {fail} / 残本候选跳过 {stub_skipped}，结果在 labels.jsonl')
     # exit 2 = 整轮零成功（渠道坏，门卫据此回等待窗口）；1 = 部分失败；0 = 全成功
     if ok == 0 and fail > 0:
         return 2
