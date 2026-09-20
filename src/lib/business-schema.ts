@@ -2,7 +2,7 @@ import type { neon } from '@neondatabase/serverless';
 type Sql = ReturnType<typeof neon>;
 
 export async function initializeBusinessSchema(s: Sql) {
-  // 仅在已完成 v4 专用迁移后由业务入口调用；声明不含旧全局唯一键或 owner 默认值。
+  // 仅在已完成当前专用迁移后由业务入口调用；声明不含旧全局唯一键或 owner 默认值。
   //
   // 这些 DDL 全部幂等（CREATE ... IF NOT EXISTS / ON CONFLICT DO NOTHING），把它们合成
   // 一次事务往返（task-55 T55-1）：Neon HTTP 下每条独立 await 都是一次串行 RTT，冷启动
@@ -102,7 +102,7 @@ export async function initializeBusinessSchema(s: Sql) {
     tx`
     CREATE TABLE IF NOT EXISTS download_tasks (
       id serial PRIMARY KEY,
-      user_id int NOT NULL CONSTRAINT download_tasks_user_fk REFERENCES users(id),
+      user_id int CONSTRAINT download_tasks_user_fk REFERENCES users(id),
       book_id int NOT NULL,
       title text NOT NULL,
       author text NOT NULL DEFAULT '',
@@ -113,7 +113,26 @@ export async function initializeBusinessSchema(s: Sql) {
       chars_total int NOT NULL DEFAULT 0,
       error text NOT NULL DEFAULT '',
       created_at timestamptz NOT NULL DEFAULT now(),
-      updated_at timestamptz NOT NULL DEFAULT now()
+      updated_at timestamptz NOT NULL DEFAULT now(),
+      requested_by text NOT NULL DEFAULT 'user'
+        CONSTRAINT download_tasks_requested_by_check CHECK (requested_by IN ('user', 'system')),
+      source_kind text NOT NULL DEFAULT 'builtin',
+      source_id text,
+      source_revision text NOT NULL DEFAULT '',
+      policy_version text NOT NULL DEFAULT '',
+      enqueue_key text,
+      attempt_count int NOT NULL DEFAULT 1
+        CONSTRAINT download_tasks_attempt_count_check CHECK (attempt_count >= 1),
+      retry_of int CONSTRAINT download_tasks_retry_of_fk REFERENCES download_tasks(id) ON DELETE SET NULL,
+      next_attempt_at timestamptz,
+      lease_generation bigint NOT NULL DEFAULT 0
+        CONSTRAINT download_tasks_lease_generation_check CHECK (lease_generation >= 0),
+      lease_owner text NOT NULL DEFAULT '',
+      artifact_id bigint,
+      CONSTRAINT download_tasks_request_identity_check CHECK (
+        (requested_by = 'user' AND user_id IS NOT NULL)
+        OR (requested_by = 'system' AND user_id IS NULL)
+      )
     )`,
     tx`CREATE INDEX IF NOT EXISTS download_tasks_user_created_idx ON download_tasks (user_id, created_at DESC)`,
     // 跨用户共享书源：活动任务锁的粒度是 (user_id, book_id)——书可以在多用户任务单里
@@ -121,6 +140,12 @@ export async function initializeBusinessSchema(s: Sql) {
     // 唯一键）在这里退役；23505 冲突在应用层表现为 409 TASK_CONFLICT。
     tx`CREATE UNIQUE INDEX IF NOT EXISTS download_tasks_user_active_book_idx ON download_tasks (user_id, book_id)
     WHERE status IN ('pending', 'running')`,
+    tx`CREATE UNIQUE INDEX IF NOT EXISTS download_tasks_system_active_book_idx ON download_tasks (book_id)
+    WHERE requested_by = 'system' AND status IN ('pending', 'running')`,
+    tx`CREATE UNIQUE INDEX IF NOT EXISTS download_tasks_system_event_idx ON download_tasks (enqueue_key)
+    WHERE requested_by = 'system' AND enqueue_key IS NOT NULL`,
+    tx`CREATE INDEX IF NOT EXISTS download_tasks_claim_idx
+    ON download_tasks (status, next_attempt_at, created_at, id)`,
     tx`DROP INDEX IF EXISTS download_tasks_active_book_idx`,
     tx`INSERT INTO shuyuan_meta (id) VALUES (1) ON CONFLICT (id) DO NOTHING`,
     // Disposable online-reader directories only; chapter text is never stored here.

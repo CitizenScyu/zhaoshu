@@ -10,9 +10,11 @@ export async function reclaimStaleTasks(sql: DownloadSql): Promise<void> {
   await sql`
     UPDATE download_tasks
     SET status = 'failed',
-        error = CONCAT(COALESCE(error, ''), ${'\nworker 中断自动回收'}),
+        error = CONCAT(COALESCE(error, ''), ${'\nworker 中断自动回收'}::text),
+        lease_generation = lease_generation + 1,
+        lease_owner = '',
         updated_at = now()
-    WHERE status = 'running' AND updated_at < now() - (${DOWNLOAD_TASK_STALE_MS} * interval '1 millisecond')`;
+    WHERE status = 'running' AND updated_at < now() - (${DOWNLOAD_TASK_STALE_MS}::bigint * interval '1 millisecond')`;
 }
 
 // GET 保持只读：不写库，只把「running 且心跳过期」派生为可操作状态。

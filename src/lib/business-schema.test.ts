@@ -98,6 +98,8 @@ describe('下载活动锁的 B2 迁移', () => {
     await initializeBusinessSchema(sql as never);
     const all = statements.join('\n');
     expect(all).toMatch(/CREATE UNIQUE INDEX IF NOT EXISTS download_tasks_user_active_book_idx\s+ON download_tasks \(user_id, book_id\)\s+WHERE status IN \('pending', 'running'\)/);
+    expect(all).toMatch(/CREATE UNIQUE INDEX IF NOT EXISTS download_tasks_system_active_book_idx\s+ON download_tasks \(book_id\)\s+WHERE requested_by = 'system' AND status IN \('pending', 'running'\)/);
+    expect(all).toMatch(/CREATE UNIQUE INDEX IF NOT EXISTS download_tasks_system_event_idx\s+ON download_tasks \(enqueue_key\)/);
     expect(all).toMatch(/DROP INDEX IF EXISTS download_tasks_active_book_idx/);
     const create = statements.findIndex((text) => /download_tasks_user_active_book_idx/.test(text));
     const drop = statements.findIndex((text) => /DROP INDEX IF EXISTS download_tasks_active_book_idx/.test(text));

@@ -70,6 +70,8 @@ describe('GET /api/download/reclaim (F16 周期回收)', () => {
     // 复用与 POST 相同的回收谓词：running 且心跳过期；活跃心跳不在其中。
     const query = queryText(0);
     expect(query).toMatch(/^UPDATE download_tasks SET status = 'failed',/);
+    expect(query).toContain('lease_generation = lease_generation + 1');
+    expect(query).toContain("lease_owner = ''");
     expect(query).toContain("status = 'running' AND updated_at < now()");
     expect(query).toContain("interval '1 millisecond'");
     expect(sql.mock.calls[0].slice(1)).toEqual(['\nworker 中断自动回收', 30 * 60_000]);
