@@ -95,7 +95,12 @@ export type RuleIr =
   // 设计 §2.2 的三 kind 草图未含 tpl_jsonpath，但 §2.1 明确 M1 支持——补此 kind。
   | { kind: 'template'; parts: TemplatePart[] }
   // 纯文本规则（如 tocUrl 的绝对 URL）
-  | { kind: 'text'; literal: string };
+  | { kind: 'text'; literal: string }
+  // || 组合节点（P1a，ENGINE_SYNTAX_OR 开启时产出；设计 §3.7/§5.1 与 §7 P1a 行）：
+  // 空值短路——逐支求值到首个非空（文本非空白 / 节点集非空）；每支各自保持
+  // css/jsonpath/template/text 形态，**节点支与标量支不互相压扁、不跨支合并**。
+  // 求值语义见 evaluate.ts evaluateOr；分支预算见 MAX_OR_BRANCHES。
+  | { kind: 'or'; branches: RuleIr[] };
 
 export type TemplatePart =
   | { kind: 'literal'; text: string }
@@ -132,3 +137,5 @@ export type CompiledRules = Map<string, FieldIr | SkippedField>;
 export const MAX_RULE_LENGTH = 2048; //          规则串长度上限，对齐 sourceSearchUrl
 export const MAX_CSS_CHAIN_DEPTH = 8; //         CssStep 链深上限
 export const MAX_REGEX_PATTERN_LENGTH = 256; //  正则 pattern 长度上限
+/** || 组合分支数上限（P1a，设计 §5.1 建议 16 的保守起点；2048 字符规则串最多也就 ~1024 支，预算前置防滥用）。 */
+export const MAX_OR_BRANCHES = 16;

@@ -73,6 +73,54 @@ describe('174 源 compile 冒烟', () => {
     expect(result.ok, JSON.stringify(result.failures)).toBe(true);
   });
 
+  // ---------------- P1a（task-syntax-p1a 验收）：ENGINE_SYNTAX_OR 两态口径 ----------------
+  // off（默认 env）：全量 174/114/60 与旧基线逐字一致——上面的冻结断言即 off 态，
+  // 这里再显式传 { orEnabled: false } 跑一遍，锁住「显式 off」与「默认 off」等价。
+  it('P1a off（显式 orEnabled:false）：114/60 与默认态完全一致', () => {
+    const explicitOff = sources.filter((s) => compileCoreFieldsFromRules(s.coreRules, { orEnabled: false }).ok);
+    expect(explicitOff.length).toBe(114);
+    const rejected = sources.map((s) => compileCoreFieldsFromRules(s.coreRules, { orEnabled: false })).filter((r) => !r.ok);
+    expect(rejected).toHaveLength(60);
+  });
+
+  it('P1a on：|| 桶 30 源全部 compile-ok（133/41）；其余桶结论不因 || 放开而漂移', () => {
+    const onOk = sources.filter((s) => compileCoreFieldsFromRules(s.coreRules, { orEnabled: true }).ok);
+    expect(onOk.length).toBe(133); // 114 + 19（|| 单桶救回：9559 之外的 19 源，见报告）
+    // || 桶（off 态诊断 operator='||' 的 30 源）在 on 态的结局：
+    const orBucket = sources.filter((s) => compileCoreFieldsFromRules(s.coreRules).failures.some((f) => f.diagnostic.operator === '||'));
+    expect(orBucket.length).toBe(30);
+    // 其一：30 源中 19 源 on 态全核心字段编译通过（其余 11 源还叠着 @get/@put/{{var}}/regex_only/&& 桶）。
+    const rescued = orBucket.filter((s) => compileCoreFieldsFromRules(s.coreRules, { orEnabled: true }).ok);
+    expect(rescued.length).toBe(19);
+    // 其二：|| 桶之外（144 源）两态结论必须逐源一致——|| 不连带救回/误伤别的桶。
+    for (const s of sources) {
+      if (orBucket.includes(s)) continue;
+      expect(
+        compileCoreFieldsFromRules(s.coreRules).ok,
+        `${s.name} 非 || 桶源在 on 态漂移`,
+      ).toBe(compileCoreFieldsFromRules(s.coreRules, { orEnabled: true }).ok);
+    }
+    // 其三：on 态新失败的诊断全部是既有已知桶（无 || 之外的新构件被引进；
+    // 与 off 态同款已知桶集合——unsupported_template_rule/special_var/jsonpath 也在
+    // 既有 60 拒绝的诊断集内，见上面「结构化诊断保持 114/60 行为基线」）。
+    const onRejected = sources.flatMap((s) => compileCoreFieldsFromRules(s.coreRules, { orEnabled: true }).failures.map((f) => f.diagnostic.code));
+    expect(new Set(onRejected)).toEqual(new Set([
+      'unsupported_operator', 'unsupported_var_get', 'unsupported_var_put',
+      'unsupported_template_var', 'unsupported_template_js', 'unsupported_xpath', 'regex_only',
+      'unsupported_template_rule', 'unsupported_special_var', 'unsupported_jsonpath',
+    ]));
+  });
+
+  it('P1a on：|| 诊断桶清零（operator:"||" 不再出现在 on 态 failures）', () => {
+    const orFailures = sources.flatMap((s) => compileCoreFieldsFromRules(s.coreRules, { orEnabled: true }).failures)
+      .filter((f) => f.diagnostic.operator === '||');
+    expect(orFailures).toEqual([]);
+    // && / %% 桶不受影响（P1b 前仍拒）。
+    const mixed = sources.flatMap((s) => compileCoreFieldsFromRules(s.coreRules, { orEnabled: true }).failures)
+      .filter((f) => f.diagnostic.operator === '&&' || f.diagnostic.operator === '%%');
+    expect(mixed.length).toBeGreaterThan(0);
+  });
+
   it('失败源的原因全部落在已知不支持构件（无非预期错误）', () => {
     const knownReasons = [
       '||', '&&', '%%', // 并联/拼接（T7）

@@ -7,6 +7,7 @@ import {
   FieldIr,
   JsonPathIr,
   MAX_CSS_CHAIN_DEPTH,
+  MAX_OR_BRANCHES,
   MAX_REGEX_PATTERN_LENGTH,
   MAX_RULE_LENGTH,
   RegexSub,
@@ -17,6 +18,7 @@ import {
   TerminalOp,
 } from './types';
 import { parseJsonPath } from './jsonpath';
+import { engineSyntaxOrEnabled } from './syntax-flags';
 
 function unsupported(msg: string, rule: string, diagnostic: RuleDiagnostic): never {
   throw new RuleEngineError('RULE_UNSUPPORTED', msg, rule, diagnostic);
@@ -116,6 +118,63 @@ export function splitTopLevel(rule: string, sep: string): string[] {
       out.push(buf);
       buf = '';
       i += sep.length - 1;
+      continue;
+    }
+    buf += ch;
+  }
+  out.push(buf);
+  return out;
+}
+
+// ---- P1a tokenizer：顶层 || 切分（括号/引号/花括号/反斜杠转义感知）----
+/**
+ * P1a tokenizer（设计 §4 末段：splitTopLevel 未处理转义与花括号，不能当完整 Legado
+ * tokenizer；§3.7：RuleAnalyzer 感知 []、代码 {}、引号与反斜杠）。
+ * 只用于 **on 态** 的 || 切分；off 态继续用上面的旧 splitTopLevel（行为冻结）。
+ * 相比旧函数多两件事：
+ * 1) `{}`：模板 `{{...}}`、JSONPath filter 代码块内的 || 不切；
+ * 2) `\`：反斜杠转义下一个字符——`\|`、`\|\|` 不构成操作符（legado RuleAnalyzer 的
+ *    反斜杠感知同款），转义字符原样留在支内。
+ */
+export function tokenizeOrBranches(rule: string): string[] {
+  const out: string[] = [];
+  let buf = '';
+  let quote: string | null = null;
+  let escaped = false;
+  const stack: string[] = [];
+  for (let i = 0; i < rule.length; i++) {
+    const ch = rule[i];
+    if (escaped) {
+      buf += ch;
+      escaped = false;
+      continue;
+    }
+    if (ch === '\\') {
+      buf += ch;
+      escaped = true;
+      continue;
+    }
+    if (quote) {
+      buf += ch;
+      if (ch === quote) quote = null;
+      continue;
+    }
+    if (ch === "'" || ch === '"') {
+      quote = ch;
+      buf += ch;
+      continue;
+    }
+    const closer = ch === ')' ? '(' : ch === ']' ? '[' : ch === '}' ? '{' : null;
+    if (closer) {
+      const at = stack.lastIndexOf(closer);
+      if (at >= 0) stack.length = at; // 弹到最近匹配（未配对开括号宽容忽略）
+    } else if (ch === '(' || ch === '[' || ch === '{') {
+      stack.push(ch);
+    }
+    if (stack.length === 0 && rule.startsWith('||', i)) {
+      out.push(buf);
+      buf = '';
+      i += 1;
       continue;
     }
     buf += ch;
@@ -361,9 +420,25 @@ function isTerminalToken(token: string): boolean {
 // ---- 顶层入口 ----
 /**
  * 编译一条字段规则文本为 FieldIr。
- * M1 期：顶层 || 切出 >1 段 → RULE_UNSUPPORTED；&& → RULE_UNSUPPORTED。
+ *
+ * 两态（task-syntax-p1a / 设计 §7 P1a 行）：
+ * - **off（默认，ENGINE_SYNTAX_OR 关）**：与旧 parser **逐字一致**——顶层 || 切出 >1 段
+ *   → RULE_UNSUPPORTED（{ code:'unsupported_operator', operator:'||' }），且沿用旧
+ *   splitTopLevel（对整串、含正则尾缀切分）与旧「先切 || 后剥 ##」顺序。冻结不动。
+ * - **on**：先剥**字段级** ## 净化尾缀（legado splitSourceRule 顺序：## 净化作用于组合
+ *   之后的最终值，尾缀属于整字段而非某一支——设计 §3.2「最后套 ## 净化」），再用 P1a
+ *   tokenizer（tokenizeOrBranches，{}/转义感知）切顶层 ||，>1 支产出 OrNode
+ *   （{ kind:'or', branches }）。逐支独立走 translateSegment——后支的非法构件
+ *   （@get/JS/模板变量…）不会被前支掩盖（§5.1「编译时检查所有分支」）；节点支与
+ *   标量支保持各自形态，不互相压扁（求值见 evaluate.ts 'or' 分支）。
+ *   && 顶层两态均拒（P1b）；%%/模板/JS/@get/@put 拒绝逻辑两态共用（rejectUnsupportedConstructs）。
  */
-export function parseFieldRule(rule: string): FieldIr {
+export interface ParseOptions {
+  /** 顶层 || 组合是否可编译（ENGINE_SYNTAX_OR）。默认读 env（缺失=off）。 */
+  orEnabled?: boolean;
+}
+
+export function parseFieldRule(rule: string, options: ParseOptions = {}): FieldIr {
   if (typeof rule !== 'string') unsupported('规则非字符串', String(rule), { code: 'invalid_rule_type' });
   const trimmed = rule.trim();
   if (trimmed === '') unsupported('空规则', rule, { code: 'empty_rule' });
@@ -371,22 +446,56 @@ export function parseFieldRule(rule: string): FieldIr {
 
   rejectUnsupportedConstructs(trimmed);
 
-  // 顶层 && → T7 拒绝
+  // 顶层 && → 拒（P1b 前两态一致）
   if (splitTopLevel(trimmed, '&&').length > 1) unsupported('规则含顶层 &&（T7）', rule, { code: 'unsupported_operator', operator: '&&' });
-  // 顶层 || → M1 期 >1 段拒绝
-  const orParts = splitTopLevel(trimmed, '||');
-  if (orParts.length > 1) unsupported('规则含顶层 ||（T7）', rule, { code: 'unsupported_operator', operator: '||' });
 
-  const segment = orParts[0];
-  const { body, regex } = stripRegexSuffix(segment, rule);
+  const orEnabled = options.orEnabled ?? engineSyntaxOrEnabled();
+  if (!orEnabled) {
+    // off：冻结的 M1 路径（旧 splitTopLevel、旧顺序，逐字保留）。
+    const orParts = splitTopLevel(trimmed, '||');
+    if (orParts.length > 1) unsupported('规则含顶层 ||（T7）', rule, { code: 'unsupported_operator', operator: '||' });
+    return singleSegmentField(orParts[0], rule);
+  }
+
+  // on：先剥字段级 ## 尾缀，再切顶层 ||。尾缀挂在 FieldIr.regex（组合选定后净化）。
+  const { body, regex } = stripRegexSuffix(trimmed, rule);
+  if (body.trim() === '' && regex.length > 0) unsupported('正则-only 规则（无选择器主体，非 M1 集）', rule, { code: 'regex_only' });
+  const branches = tokenizeOrBranches(body);
+  if (branches.length > 1) {
+    if (branches.length > MAX_OR_BRANCHES) {
+      unsupported(`|| 分支数超上限（${branches.length} > ${MAX_OR_BRANCHES}）`, rule, { code: 'or_branches_too_many' });
+    }
+    const field: FieldIr = { rules: [{ kind: 'or', branches: branches.map((branch) => parseOrBranch(branch, rule)) }] };
+    if (regex.length > 0) field.regex = regex;
+    return field;
+  }
+  return singleSegmentField(body, rule, { body, regex });
+}
+
+/** 单段（无顶层 ||）字段编译。off 路径的这段与旧实现逐行等价。 */
+function singleSegmentField(
+  segment: string,
+  rule: string,
+  precomputed?: { body: string; regex: RegexSub[] },
+): FieldIr {
+  const { body, regex } = precomputed ?? stripRegexSuffix(segment, rule);
   // 正则-only 规则（剥掉 ##...## 尾缀后主体为空，如 `##<a.*?href="([^"]+)"##$1###`）：
   // ##regex## 在 §2.3 里只定义为「选择器后缀」，无选择器主体的独立正则不在 M1 集内 → 显式拒绝
   // （不猜「对原始输入直接跑正则」的语义，§2.3 第5条不猜测）。
   if (body.trim() === '' && regex.length > 0) unsupported('正则-only 规则（无选择器主体，非 M1 集）', rule, { code: 'regex_only' });
-  const ir = translateSegment(body, rule);
-  const field: FieldIr = { rules: [ir] };
+  const field: FieldIr = { rules: [translateSegment(body, rule)] };
   if (regex.length > 0) field.regex = regex;
   return field;
+}
+
+/**
+ * 编译一个 || 支（P1a）。支内不再有顶层 ||（tokenizer 已把括号/引号/花括号内的 || 留在
+ * 支内，形如 `(b||c)` 的「嵌套组合」不是合法本方言构件——按不支持的 CSS 选择器在
+ * 求值期失败，编译期不猜其语义）。空支显式拒（`a||` 不猜「跳过空支」）。
+ */
+function parseOrBranch(branch: string, rule: string): RuleIr {
+  if (branch.trim() === '') unsupported('|| 分支为空', rule, { code: 'empty_or_branch' });
+  return translateSegment(branch, rule);
 }
 
 /** 便捷单规则解析（返回首个 RuleIr，测试用）。 */

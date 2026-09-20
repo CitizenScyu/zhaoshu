@@ -91,25 +91,28 @@ export interface CompileResult {
 }
 
 /** 对一个源的核心字段跑 parseFieldRule；任一核心字段 RULE_UNSUPPORTED → ok=false。 */
-export function compileCoreFields(src: RawSource): CompileResult {
+export function compileCoreFields(src: RawSource, options: { orEnabled?: boolean } = {}): CompileResult {
   const core: Record<string, string> = {};
   const coreSet = new Set<string>(CORE_FIELDS);
   for (const [field, rule] of iterRulePairs(src)) {
     if (coreSet.has(field)) core[field] = rule;
   }
-  return compileCoreFieldsFromRules(core);
+  return compileCoreFieldsFromRules(core, options);
 }
 
 /**
  * 对「字段名→规则文本」映射（核心字段冻结 fixture smoke-174.json 的 coreRules）跑编译。
  * 任一核心字段 RULE_UNSUPPORTED → ok=false。
+ * `orEnabled`（P1a，默认 off）透传 parseFieldRule：on 态顶层 || 编译成 OrNode。
  */
-export function compileCoreFieldsFromRules(coreRules: Record<string, string>): CompileResult {
+export function compileCoreFieldsFromRules(
+  coreRules: Record<string, string>, options: { orEnabled?: boolean } = {},
+): CompileResult {
   const failures: CompileResult['failures'] = [];
   for (const [field, rule] of Object.entries(coreRules)) {
     if (typeof rule !== 'string' || !rule.trim()) continue;
     try {
-      parseFieldRule(rule);
+      parseFieldRule(rule, options);
     } catch (err) {
       if (err instanceof RuleEngineError && err.code === 'RULE_UNSUPPORTED') {
         failures.push({ field, rule, message: err.message, diagnostic: err.diagnostic ?? { code: 'unsupported_rule' } });
