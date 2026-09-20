@@ -21,7 +21,11 @@ export function downloadOptions(args) {
 }
 
 // One shared request slot covers search/detail/toc/content, redirects and alternate hosts.
-export async function downloadBook(m, args, resolveSource, transport = fetchSourceText) {
+// hooks（T3 任务层接缝，全部可选、向后兼容）：
+//   signal      —— 外部租约/截止信号：触发时等价 SIGINT，中断抓取并把 partial 检查点落盘；
+//   onProgress  —— 每次清单检查点（目录解析后、每章后、收尾）回调最新计数；抛错（租约丢失）
+//                  立即中断下载，不吞成单章失败。
+export async function downloadBook(m, args, resolveSource, transport = fetchSourceText, hooks = {}) {
   const dir = resolve(args.out ?? 'engine-download', hash(args.source + canonicalBookKey(args.title, args.author)).slice(0, 24));
   mkdirSync(dir, { recursive: true });
   const lockPath = join(dir, 'download.lock');
@@ -32,11 +36,20 @@ export async function downloadBook(m, args, resolveSource, transport = fetchSour
   const manifest = { schemaVersion: 1, status: 'partial', title: args.title, author: args.author, source: args.source, chapters: previous?.chapters ?? [], errors: [], generated_at: new Date().toISOString() };
   const controller = new AbortController();
   const stop = () => controller.abort(new Error('interrupted'));
+  const external = hooks.signal;
+  const onExternalAbort = () => controller.abort(external.reason ?? new Error('interrupted'));
+  if (external?.aborted) controller.abort(external.reason);
+  else external?.addEventListener('abort', onExternalAbort, { once: true });
   const timer = setTimeout(() => controller.abort(new Error('budget_exhausted')), args['budget-ms']);
   process.on('SIGINT', stop); process.on('SIGTERM', stop);
   let nextAt = 0;
   let bytes = 0;
-  const checkpoint = () => atomic(manifestPath, JSON.stringify(manifest, null, 2) + '\n');
+  const checkpoint = async () => {
+    manifest.chapters_done = manifest.chapters.filter(c => c.status === 'done').length;
+    manifest.chars = manifest.chapters.reduce((n, c) => n + c.chars, 0);
+    atomic(manifestPath, JSON.stringify(manifest, null, 2) + '\n');
+    await hooks.onProgress?.({ chaptersDone: manifest.chapters_done, chaptersTotal: manifest.chapters_total ?? manifest.chapters.length, charsTotal: manifest.chars });
+  };
   const operation = async fn => {
     const local = new AbortController();
     const timeout = setTimeout(() => local.abort(new Error('operation_timeout')), args['timeout-ms']);
@@ -85,7 +98,7 @@ export async function downloadBook(m, args, resolveSource, transport = fetchSour
     manifest.tocHash = hash(JSON.stringify(chapters));
     manifest.chapters_total = chapters.length;
     manifest.chapters = chapters.map((c, index) => ({ index, title: c.title, url: c.url, chars: 0, status: 'pending', file: `${index}.txt` }));
-    checkpoint();
+    await checkpoint();
     if (chapters.length > args['max-chapters']) throw new Error('max_chapters');
     const resume = previous?.sourceRevision === manifest.sourceRevision && previous?.tocHash === manifest.tocHash && previous?.bookUrl === manifest.bookUrl;
     for (const chapter of manifest.chapters) {
@@ -113,7 +126,7 @@ export async function downloadBook(m, args, resolveSource, transport = fetchSour
         chapter.error = ['empty_content', 'size_limit', 'operation_timeout'].includes(error.message) ? error.message : 'chapter_failed';
         if (chapter.error === 'size_limit' || controller.signal.aborted) throw error;
       }
-      checkpoint();
+      await checkpoint();
     }
     if (hash(JSON.stringify(await toc())) !== manifest.tocHash) throw new Error('toc_changed');
     if (manifest.chapters.some(c => c.status !== 'done')) throw new Error('missing_chapters');
@@ -125,10 +138,9 @@ export async function downloadBook(m, args, resolveSource, transport = fetchSour
     const known = /^(identity_mismatch_or_no_candidate|empty_toc|empty_toc_page|pagination_cycle|toc_limit|unsupported_toc_rule|max_chapters|size_limit|toc_changed|missing_chapters|interrupted|budget_exhausted|operation_timeout)$/;
     manifest.errors.push(known.test(error.message) ? error.message : 'download_failed');
   } finally {
-    manifest.chapters_done = manifest.chapters.filter(c => c.status === 'done').length;
-    manifest.chars = manifest.chapters.reduce((n, c) => n + c.chars, 0);
-    try { checkpoint(); } finally {
-      clearTimeout(timer); process.off('SIGINT', stop); process.off('SIGTERM', stop);
+    clearTimeout(timer); process.off('SIGINT', stop); process.off('SIGTERM', stop);
+    if (external) external.removeEventListener?.('abort', onExternalAbort);
+    try { await checkpoint(); } finally {
       closeSync(lock); unlinkSync(lockPath);
     }
   }
