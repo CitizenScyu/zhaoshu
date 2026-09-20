@@ -216,6 +216,35 @@ describe('T3 发布器：五阶段与合成 HTTP 故障', () => {
     expect(result.promoted === false && result.oldManifest?.chapters).toBe(100);
   });
 
+  it('指针 current 非字符串（合法 JSON）→ 同「指针不可用」走内容 hash 兜底（非硬失败），晋升保护仍在', async () => {
+    // 复审 P3（review-p1a-t3fix.md:61 / review-merge-reconcile.md:29）：合法 JSON 但 current 非字符串
+    // 改走 fallbackBaseline，与参照 worker.mjs（readSnapshotManifest 对非法 current 返回 null → 兜底）
+    // 净效果一致，且与上面「非 8-hex current」同口径——不再硬失败。
+    const github = new MemoryGitHub();
+    const seeded = seedPublished(github, { chapters: 100, chars: 100 * 2000 });
+    const { dir } = snapshotPaths('测试书', '佚名');
+    github.files.set(`${dir}/current.json`, JSON.stringify({ current: 5, history: [seeded.version] }));
+    const result = await publishBookVersion(github, guardOk, candidate({ chaptersDone: 80, chaptersTotal: 80 }));
+    // 不抛 PublicationStageError；经规范路径内容 hash 找回 100 章旧 manifest → 拒绝 80 章更差候选。
+    expect(result).toMatchObject({ promoted: false });
+    expect(result.promoted === false && result.oldManifest?.chapters).toBe(100);
+  });
+
+  it('指针 history 非数组（合法 JSON）→ 兜底且不透传坏 history，新指针 history 干净（不被逐字符 spread 污染）', async () => {
+    // 比参照更安全：worker.mjs:351 会 [...history] 把字符串逐字符 spread 进 history。这里丢弃坏
+    // pointer、兜底后写一份干净的新 current.json（history 只含本版本）。
+    const github = new MemoryGitHub();
+    const { dir } = snapshotPaths('测试书', '佚名');
+    // current 是合法 8-hex、但 history 是字符串（非数组）；无规范路径旧文件 → 兜底后正常晋升。
+    github.files.set(`${dir}/current.json`, JSON.stringify({ current: 'aaaaaaaa', history: 'polluted' }));
+    const result = await publishBookVersion(github, guardOk, candidate());
+    expect(result.promoted).toBe(true);
+    const pointer = JSON.parse(github.files.get(`${dir}/current.json`)!);
+    // 干净 history：只含新版本，绝不含被 spread 的字符（'p','o','l',...）。
+    expect(pointer.history).toEqual([result.version]);
+    expect(pointer.history).not.toContain('p');
+  });
+
   it('15 MiB 预检：超限在第一个 PUT 之前失败', async () => {
     const github = new MemoryGitHub();
     const huge = 'x'.repeat(15 * 1024 * 1024 + 1);

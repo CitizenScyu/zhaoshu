@@ -53,6 +53,26 @@ function keywordOf(source) {
   return typeof raw === 'string' && raw.trim() ? raw.trim() : DEFAULT_ADMISSION_KEYWORD;
 }
 
+// 版本自洽自查（复审 P3）：source_admission.rules_hash 形如 `<engine_semantics_version>:<contentRevision>`
+// （compile.ts engineVersionedKey / engineSourceRevision）。种库前确认每行「版本列」与 rules_hash 前缀
+// 同源，否则写进库的行会像修复前那样自相矛盾——rules_hash 带 `1:`/`2:` 前缀、engine_semantics_version
+// 却取 schema 默认 0（INSERT 列清单漏写该列所致）。现 INSERT 已显式带上该列（取 admission.ts 同一批
+// runAdmissionBatch 计算的值），此查确保不再分叉；发现错配即拒绝写库，暴露上游口径问题。
+function assertVersionSelfConsistent(rows) {
+  for (const row of rows) {
+    const prefix = Number(String(row.rules_hash).split(':', 1)[0]);
+    if (!Number.isInteger(prefix)) {
+      throw new Error(`[seed-admission] 版本自查失败：host=${row.host} rules_hash 无版本前缀`);
+    }
+    if (row.engine_semantics_version !== prefix) {
+      throw new Error(
+        `[seed-admission] 版本自查失败：host=${row.host} engine_semantics_version=${row.engine_semantics_version} ` +
+        `≠ rules_hash 版本前缀=${prefix}（行内元数据不自洽，拒绝写库）`,
+      );
+    }
+  }
+}
+
 function parseArgs(argv) {
   const args = { env: null, urls: [], dryRun: false };
   for (let i = 0; i < argv.length; i += 1) {
@@ -122,6 +142,9 @@ async function run() {
     maxProbes: candidates.length,
   });
 
+  // 写库前自查：行内 engine_semantics_version 必须与 rules_hash 的版本前缀同源（见函数注释）。
+  assertVersionSelfConsistent(result.rows);
+
   // 展示行：host / verdict / keyword / compile / search_ok（不含任何凭据）。
   console.log('[seed-admission] 将写入的行：');
   for (const row of result.rows) {
@@ -144,15 +167,16 @@ async function run() {
   // 与 shuyuan.ts writeAdmissionRows 同款 upsert：ON CONFLICT (source_url) DO UPDATE。
   await sql`
     INSERT INTO source_admission
-      (source_url, tier, compile_ok, core_field_mask, search_ok, search_verdict, search_checked_at, rules_hash, host, error)
-    SELECT source_url, tier, compile_ok, core_field_mask, search_ok, search_verdict, search_checked_at, rules_hash, host, error
+      (source_url, tier, compile_ok, core_field_mask, search_ok, search_verdict, search_checked_at, rules_hash, engine_semantics_version, host, error)
+    SELECT source_url, tier, compile_ok, core_field_mask, search_ok, search_verdict, search_checked_at, rules_hash, engine_semantics_version, host, error
     FROM jsonb_to_recordset(${JSON.stringify(result.rows)}::jsonb)
       AS t(source_url text, tier text, compile_ok boolean, core_field_mask jsonb, search_ok boolean,
-           search_verdict text, search_checked_at timestamptz, rules_hash text, host text, error text)
+           search_verdict text, search_checked_at timestamptz, rules_hash text, engine_semantics_version integer, host text, error text)
     ON CONFLICT (source_url) DO UPDATE SET
       tier = EXCLUDED.tier, compile_ok = EXCLUDED.compile_ok, core_field_mask = EXCLUDED.core_field_mask,
       search_ok = EXCLUDED.search_ok, search_verdict = EXCLUDED.search_verdict,
       search_checked_at = EXCLUDED.search_checked_at, rules_hash = EXCLUDED.rules_hash,
+      engine_semantics_version = EXCLUDED.engine_semantics_version,
       host = EXCLUDED.host, error = EXCLUDED.error`;
   const okHosts = result.rows.filter((r) => r.compile_ok && r.search_ok === true).map((r) => r.host);
   console.log(`[seed-admission] 已写 ${result.rows.length} 行；ok 态 host ${okHosts.length} 个：${okHosts.join(', ') || '(无)'}`);
@@ -168,6 +192,16 @@ if (process.argv.includes('--selftest')) {
     ruleSearch: { bookList: '.i', name: '.t@text', bookUrl: 'a@href' }, ruleContent: { content: '.c' } });
   console.log('[selftest] compileAdmission:', JSON.stringify({ ok: c.ok, tier: c.tier }));
   void searchAdmission; // 引用以证明已成功 import（真实搜索在 run() 里经 runAdmissionBatch 触发）
+  // 版本自洽自查的判别力（不依赖 DB/网络）：rules_hash 前缀与版本列同源的行通过，伪造错配必抛。
+  const seedHash = rulesHash({ bookSourceUrl: 'https://x.example', searchUrl: 's', ruleSearch: { name: 'h1' } });
+  const seedVersion = Number(seedHash.split(':', 1)[0]);
+  assertVersionSelfConsistent([{ host: 'x.example', rules_hash: seedHash, engine_semantics_version: seedVersion }]);
+  let mismatchCaught = false;
+  try {
+    assertVersionSelfConsistent([{ host: 'x.example', rules_hash: seedHash, engine_semantics_version: seedVersion + 99 }]);
+  } catch { mismatchCaught = true; }
+  console.log('[selftest] 版本自洽自查：同源通过、错配即抛 =', mismatchCaught, '（前缀', seedVersion, '）');
+  if (!mismatchCaught) { console.error('[selftest] 版本自查无判别力'); process.exit(1); }
   process.exit(0);
 }
 

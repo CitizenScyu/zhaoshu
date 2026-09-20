@@ -183,13 +183,17 @@ async function loadCurrentBaseline(github: GitHubContents, dir: string, canonica
   const pointerBytes = await github.getBytes(`${dir}/current.json`);
   if (pointerBytes === null) return fallbackBaseline(github, dir, canonicalPath);
   const pointer = parseJson<ReleasePointer>(pointerBytes);
-  if (!pointer || typeof pointer.current !== 'string' || !Array.isArray(pointer.history)) {
-    // 合法 JSON 但 current 非字符串 / history 非数组：本处硬失败，不走 fallbackBaseline。
-    // 与参照 worker.mjs:332 不完全一致——那边 JSON.parse 成功即把对象当 current，
-    // current.current 非 8-hex 时 readSnapshotManifest 返回 null 再走规范路径兜底。
-    // 差异有意保留：history 非数组时 spread 会污染指针文件；current 非字符串当「无指针」
-    // 静默放行会绕过晋升保护。损坏指针改由人工核对后删除该文件恢复（同原 worker 解析失败口径）。
-    throw new PublicationStageError('pointer', 'current_json_unreadable');
+  // 不是合法 JSON：无法程序化恢复，硬失败（人工删文件即恢复自动发布），与原 worker.mjs 的
+  // JSON.parse 抛错同档（worker.mjs:328-329）。
+  if (!pointer) throw new PublicationStageError('pointer', 'current_json_unreadable');
+  // 合法 JSON 但指针形状不可用（current 非字符串 / history 非数组）：按「指针不可用」走规范路径
+  // 内容 hash 兜底，与下面 current 非 8-hex 同口径。参照 worker.mjs 也不是硬失败——形状不对的
+  // current 经 readSnapshotManifest 返回 null → findCanonicalPriorVersion 兜底（worker.mjs:332,338）。
+  // 这里不透传坏 pointer：非数组 history 若进下游 [...history] 会被逐字符 spread 污染（worker.mjs:351
+  // 的潜伏 bug），故丢弃它、兜底后写一份干净的新 current.json。晋升保护不失效：fallbackBaseline
+  // 仍按规范路径内容 hash 重建基线，manifestIsWorse 照旧生效，只有确无旧基线可比时才放行。
+  if (typeof pointer.current !== 'string' || !Array.isArray(pointer.history)) {
+    return fallbackBaseline(github, dir, canonicalPath);
   }
   // current 是合法 JSON 字符串但不是 8-hex 版本号：按「指针不可用」走规范路径内容 hash 兜底，
   // 与 !current/!oldManifest 同口径（原 worker !current || !oldManifest → findCanonicalPriorVersion）。
