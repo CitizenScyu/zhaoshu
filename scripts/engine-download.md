@@ -4,7 +4,7 @@
 node --import ./scripts/ts-esm-loader.mjs scripts/engine-fetch.mjs download --source book15.net --title "书名" --author "作者" --out ./downloads --max-chapters 10000 --rate-ms 800 --timeout-ms 30000 --budget-ms 19800000
 ```
 
-Exit codes: `0` complete, `1` partial/runtime failure, `2` invalid usage. Stdout is one JSON result `{ code, manifestPath, manifest }`. The built-in source does not require DATABASE_URL; engine source resolution uses the existing approved source pool. Do not use production credentials for testing.
+Exit codes: `0` complete, `1` partial/runtime failure, `2` invalid usage or unavailable engine source pool (including DB failure). Stdout is one JSON result `{ code, manifestPath, manifest }`. The built-in source does not require DATABASE_URL; engine source resolution uses the existing approved source pool. Do not use production credentials for testing.
 
 Each source + canonical title/author gets its own hashed directory. `manifest.json` is atomically checkpointed; chapters are `<index>.txt`. Only a fully validated attempt writes `book.txt` and sets `status: done`. A partial attempt must never be published, even if a previous `book.txt` remains in the directory.
 
@@ -17,3 +17,7 @@ Defaults: 800 ms between actual HTTP request starts, 30 seconds per operation/ch
 The engine's optional strict mode rejects empty/unparseable catalog pages, invalid chapter URLs, unsupported catalog rules, invalid next links, cycles and page caps. Content pagination also rejects empty pages/cycles/caps/unsupported next rules. The catalog is read again after chapter downloads; any ordered change leaves partial. Builtin book15 retains its existing single-detail-page directory grammar.
 
 Offline validation uses book15 synthetic HTML and rules from the first two sources in `rule-engine/fixtures/smoke-174.json` (网阅小说、免费小说), with synthetic search/detail/catalog/content pages. A synthetic nextTocUrl rule exercises pagination without contacting their hosts.
+
+Checkpoints are throttled to once per 5 seconds during chapter processing, with forced initial/final checkpoints. A hard kill may require re-fetching chapters since the last checkpoint. Chapter, book and manifest temporary files are fsynced before rename; directory-entry durability on power loss remains filesystem/platform dependent. T3 integration must preserve exit 2 for source/DB unavailability.
+
+模型调用超 8min 双计费窗口为已知遗留（供应商级 exactly-once，本地测不了）。

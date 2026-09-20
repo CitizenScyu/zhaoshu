@@ -1,12 +1,18 @@
 import { createHash } from 'node:crypto';
-import { mkdirSync, readFileSync, writeFileSync, renameSync, existsSync, openSync, closeSync, unlinkSync } from 'node:fs';
+import { mkdirSync, readFileSync, writeFileSync, renameSync, existsSync, openSync, closeSync, unlinkSync, fsyncSync } from 'node:fs';
 import { resolve, join } from 'node:path';
 import { setTimeout as pause } from 'node:timers/promises';
 import { canonicalBookKey } from '../src/lib/book-identity.ts';
 import { fetchSourceText, sourceAbortable } from '../src/lib/source-fetch.ts';
 
 const hash = value => createHash('sha256').update(value).digest('hex');
-const atomic = (path, data) => { writeFileSync(path + '.tmp', data); renameSync(path + '.tmp', path); };
+const atomic = (path, data) => {
+  const temp = path + '.tmp';
+  const fd = openSync(temp, 'w');
+  try { writeFileSync(fd, data); fsyncSync(fd); } finally { closeSync(fd); }
+  renameSync(temp, path);
+};
+const knownError = /^(identity_mismatch_or_no_candidate|empty_toc|empty_toc_page|pagination_cycle|toc_limit|unsupported_toc_rule|invalid_chapter|invalid_next_page|empty_content_page|content_page_limit|unsupported_content_rule|max_chapters|size_limit|toc_changed|missing_chapters|interrupted|budget_exhausted|operation_timeout|empty_content)$/;
 export function downloadOptions(args) {
   if (!args.source || !args.title?.trim() || !args.author?.trim()) throw new Error('download 需要 --source --title --author');
   const source = new URL(args.source.includes('://') ? args.source : `https://${args.source}`);
@@ -36,7 +42,13 @@ export async function downloadBook(m, args, resolveSource, transport = fetchSour
   process.on('SIGINT', stop); process.on('SIGTERM', stop);
   let nextAt = 0;
   let bytes = 0;
-  const checkpoint = () => atomic(manifestPath, JSON.stringify(manifest, null, 2) + '\n');
+  let failureCode = 1;
+  let lastCheckpoint = 0;
+  const checkpoint = (force = true) => {
+    if (!force && Date.now() - lastCheckpoint < 5000) return;
+    atomic(manifestPath, JSON.stringify(manifest, null, 2) + '\n');
+    lastCheckpoint = Date.now();
+  };
   const operation = async fn => {
     const local = new AbortController();
     const timeout = setTimeout(() => local.abort(new Error('operation_timeout')), args['timeout-ms']);
@@ -57,7 +69,10 @@ export async function downloadBook(m, args, resolveSource, transport = fetchSour
     finally { clearTimeout(timeout); local.abort(); }
   };
   try {
-    const { source, builtin } = await operation(ctx => resolveSource(m, args.source, ctx.signal));
+    const { source, builtin } = await operation(async ctx => {
+      try { return await resolveSource(m, args.source, ctx.signal); }
+      catch (error) { if (error.code === 2) failureCode = 2; throw error; }
+    });
     manifest.sourceRevision = hash(JSON.stringify(source));
     const engine = builtin ? null : { url: source.url, name: source.name, searchUrl: source.searchUrl, compiled: m.compile.compileSource(source) };
     const candidates = await operation(async ctx => {
@@ -110,10 +125,10 @@ export async function downloadBook(m, args, resolveSource, transport = fetchSour
       } catch (error) {
         chapter.status = 'failed';
         // Do not persist upstream messages, URLs or credentials in diagnostics.
-        chapter.error = ['empty_content', 'size_limit', 'operation_timeout'].includes(error.message) ? error.message : 'chapter_failed';
+        chapter.error = knownError.test(error.message) ? error.message : 'chapter_failed';
         if (chapter.error === 'size_limit' || controller.signal.aborted) throw error;
       }
-      checkpoint();
+      checkpoint(false);
     }
     if (hash(JSON.stringify(await toc())) !== manifest.tocHash) throw new Error('toc_changed');
     if (manifest.chapters.some(c => c.status !== 'done')) throw new Error('missing_chapters');
@@ -122,8 +137,7 @@ export async function downloadBook(m, args, resolveSource, transport = fetchSour
     manifest.artifact = { file: 'book.txt', sha256: hash(txt), bytes: Buffer.byteLength(txt) };
     manifest.status = 'done';
   } catch (error) {
-    const known = /^(identity_mismatch_or_no_candidate|empty_toc|empty_toc_page|pagination_cycle|toc_limit|unsupported_toc_rule|max_chapters|size_limit|toc_changed|missing_chapters|interrupted|budget_exhausted|operation_timeout)$/;
-    manifest.errors.push(known.test(error.message) ? error.message : 'download_failed');
+    manifest.errors.push(failureCode === 2 ? 'source_unavailable' : knownError.test(error.message) ? error.message : 'download_failed');
   } finally {
     manifest.chapters_done = manifest.chapters.filter(c => c.status === 'done').length;
     manifest.chars = manifest.chapters.reduce((n, c) => n + c.chars, 0);
@@ -132,5 +146,5 @@ export async function downloadBook(m, args, resolveSource, transport = fetchSour
       closeSync(lock); unlinkSync(lockPath);
     }
   }
-  return { manifest, manifestPath, code: manifest.status === 'done' ? 0 : 1 };
+  return { manifest, manifestPath, code: manifest.status === 'done' ? 0 : failureCode };
 }

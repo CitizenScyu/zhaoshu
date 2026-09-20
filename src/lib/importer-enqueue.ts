@@ -206,7 +206,8 @@ export async function importLabelWithSystemTask(
     if (!isUniqueViolation(error)) throw error;
     const labeledBookId = await upsertLabelsOnly(sql, record);
     const active = await findActiveSystemTask(sql, labeledBookId);
-    return { labeledBookId, taskOutcome: active !== null ? 'existing' : 'artifact_exists', taskId: active, labelsWritten: true };
+    if (active === null) throw new Error('system_task_outcome_unresolved');
+    return { labeledBookId, taskOutcome: 'existing', taskId: active, labelsWritten: true };
   }
 
   const labeledBookId = positiveIntOrNull(result.labeled_book_id);
@@ -220,9 +221,10 @@ export async function importLabelWithSystemTask(
   // 没插进去且没有产物 ⇒ 事件键已有任务(幂等重放),或同书已有活动任务(不同事件)。
   const existing = await findSystemTaskByEnqueueKey(sql, labeledBookId, task)
     ?? await findActiveSystemTask(sql, labeledBookId);
+  if (existing === null) throw new Error('system_task_outcome_unresolved');
   return {
     labeledBookId,
-    taskOutcome: existing !== null ? 'existing' : 'artifact_exists',
+    taskOutcome: 'existing',
     taskId: existing,
     labelsWritten: true,
   };
@@ -263,9 +265,7 @@ export async function ensureSystemTask(
   policy: ImportTaskPolicy | NormalizedTaskPolicy,
   artifacts: SystemTaskArtifactPolicy = NO_ARTIFACTS,
 ): Promise<Omit<ImportOutcome, 'labelsWritten'>> {
-  const task = 'policyVersion' in policy && !('sourceKind' in policy)
-    ? normalizeTaskPolicy(policy as ImportTaskPolicy)
-    : (policy as NormalizedTaskPolicy);
+  const task = normalizeTaskPolicy(policy);
   const labeledBookId = await findLabeledBookId(sql, record);
   if (labeledBookId === null) throw new Error('labeled book not found');
   if (await artifacts.hasReadableArtifact(labeledBookId, task.policyVersion, task.sourceRevision)) {
@@ -305,9 +305,10 @@ export async function ensureSystemTask(
   }
   const raced = await findSystemTaskByEnqueueKey(sql, labeledBookId, task)
     ?? await findActiveSystemTask(sql, labeledBookId);
+  if (raced === null) throw new Error('system_task_outcome_unresolved');
   return {
     labeledBookId,
-    taskOutcome: raced !== null ? 'existing' : 'artifact_exists',
+    taskOutcome: 'existing',
     taskId: raced,
   };
 }

@@ -105,7 +105,7 @@ export async function engineFetchToc(
     visited.add(next);
     const page = await context.page(next);
     const scope = createScope(normalizeBody(page.text), page.url);
-    const before = chapters.length;
+    let validChapters = 0;
     const list = field(source.compiled, 'ruleToc.chapterList');
     if (strict && [...source.compiled.entries()].some(([key, value]) => key.startsWith('ruleToc.') && 'skipped' in value)) throw new Error('unsupported_toc_rule');
     if (list && scope.kind === 'html') {
@@ -120,13 +120,15 @@ export async function engineFetchToc(
         const rawUrl = evaluateText(source.compiled, 'ruleToc.chapterUrl', inner);
         const chapterUrl = rawUrl.trim() ? absoluteUrl(rawUrl, page.url) : page.url;
         if (strict && (!title || title.length > MAX_TITLE_LENGTH || !chapterUrl || !rawUrl.trim())) throw new Error('invalid_chapter');
-        if (!title || title.length > MAX_TITLE_LENGTH || !chapterUrl || seenUrls.has(chapterUrl)) continue;
+        if (!title || title.length > MAX_TITLE_LENGTH || !chapterUrl) continue;
+        validChapters += 1;
+        if (seenUrls.has(chapterUrl)) continue;
         seenUrls.add(chapterUrl);
         chapters.push({ url: chapterUrl, title });
         if (chapters.length > MAX_SOURCE_CHAPTERS) break;
       }
     }
-    if (strict && chapters.length === before) throw new Error('empty_toc_page');
+    if (strict && validChapters === 0) throw new Error('empty_toc_page');
     // 只有当前页确实是 HTML 时才解析翻页 URL；否则链结束（避免对 JSON 输入跑 CSS 规则）。
     const rawNext = scope.kind === 'html' ? evaluateText(source.compiled, 'ruleToc.nextTocUrl', scope) : '';
     next = absoluteUrl(rawNext, page.url);
