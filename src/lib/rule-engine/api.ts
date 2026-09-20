@@ -94,18 +94,20 @@ export async function engineFetchDetail(
 
 /** ruleToc.chapterList → SourceChapter[]，含 nextTocUrl 翻页循环。 */
 export async function engineFetchToc(
-  source: EngineSource, tocUrl: string, context: SourceRequestContext,
+  source: EngineSource, tocUrl: string, context: SourceRequestContext, strict = false,
 ): Promise<EngineTocResult> {
   const chapters: SourceChapter[] = [];
   const seenUrls = new Set<string>();
   const visited = new Set<string>();
   let next = absoluteUrl(tocUrl, source.url);
   for (let pageIndex = 0; next && pageIndex < MAX_TOC_PAGES && chapters.length <= MAX_SOURCE_CHAPTERS; pageIndex += 1) {
-    if (visited.has(next)) break;
+    if (visited.has(next)) { if (strict) throw new Error('pagination_cycle'); break; }
     visited.add(next);
     const page = await context.page(next);
     const scope = createScope(normalizeBody(page.text), page.url);
+    const before = chapters.length;
     const list = field(source.compiled, 'ruleToc.chapterList');
+    if (strict && [...source.compiled.entries()].some(([key, value]) => key.startsWith('ruleToc.') && 'skipped' in value)) throw new Error('unsupported_toc_rule');
     if (list && scope.kind === 'html') {
       const nodes = evaluateFieldNodes(list, scope);
       for (let index = 0; index < nodes.length; index += 1) {
@@ -117,38 +119,45 @@ export async function engineFetchToc(
         // （absoluteUrl 返回 undefined），绝不洗成 page.url。
         const rawUrl = evaluateText(source.compiled, 'ruleToc.chapterUrl', inner);
         const chapterUrl = rawUrl.trim() ? absoluteUrl(rawUrl, page.url) : page.url;
+        if (strict && (!title || title.length > MAX_TITLE_LENGTH || !chapterUrl || !rawUrl.trim())) throw new Error('invalid_chapter');
         if (!title || title.length > MAX_TITLE_LENGTH || !chapterUrl || seenUrls.has(chapterUrl)) continue;
         seenUrls.add(chapterUrl);
         chapters.push({ url: chapterUrl, title });
         if (chapters.length > MAX_SOURCE_CHAPTERS) break;
       }
     }
+    if (strict && chapters.length === before) throw new Error('empty_toc_page');
     // 只有当前页确实是 HTML 时才解析翻页 URL；否则链结束（避免对 JSON 输入跑 CSS 规则）。
-    next = scope.kind === 'html'
-      ? absoluteUrl(evaluateText(source.compiled, 'ruleToc.nextTocUrl', scope), page.url)
-      : undefined;
+    const rawNext = scope.kind === 'html' ? evaluateText(source.compiled, 'ruleToc.nextTocUrl', scope) : '';
+    next = absoluteUrl(rawNext, page.url);
+    if (strict && rawNext.trim() && !next) throw new Error('invalid_next_page');
   }
+  if (strict && (next || chapters.length > MAX_SOURCE_CHAPTERS)) throw new Error('toc_limit');
   return { chapters };
 }
 
 /** ruleContent.content 拼接，含 nextContentUrl 翻页；多页以换行连接（§7.1）。 */
 export async function engineFetchContent(
-  source: EngineSource, chapterUrl: string, context: SourceRequestContext,
+  source: EngineSource, chapterUrl: string, context: SourceRequestContext, strict = false,
 ): Promise<EngineContentResult> {
   const parts: string[] = [];
   const visited = new Set<string>();
   let next = absoluteUrl(chapterUrl, source.url);
   for (let pageIndex = 0; next && pageIndex < MAX_CONTENT_PAGES; pageIndex += 1) {
-    if (visited.has(next)) break;
+    if (visited.has(next)) { if (strict) throw new Error('pagination_cycle'); break; }
     visited.add(next);
     const page = await context.page(next);
     const scope = createScope(normalizeBody(page.text), page.url);
     // 正文是唯一「多节点拼接」字段：@p@text 类规则靠 multi=true 把多段落拼成整章。
     const content = evaluateText(source.compiled, 'ruleContent.content', scope, true);
+    if (strict && !content.trim()) throw new Error('empty_content_page');
     if (content) parts.push(content);
-    next = scope.kind === 'html'
-      ? absoluteUrl(evaluateText(source.compiled, 'ruleContent.nextContentUrl', scope), page.url)
-      : undefined;
+    const nextRule = source.compiled.get('ruleContent.nextContentUrl');
+    if (strict && nextRule && 'skipped' in nextRule) throw new Error('unsupported_content_rule');
+    const rawNext = scope.kind === 'html' ? evaluateText(source.compiled, 'ruleContent.nextContentUrl', scope) : '';
+    next = absoluteUrl(rawNext, page.url);
+    if (strict && rawNext.trim() && !next) throw new Error('invalid_next_page');
   }
+  if (strict && next) throw new Error('content_page_limit');
   return { text: parts.join('\n') };
 }
