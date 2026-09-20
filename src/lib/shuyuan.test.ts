@@ -33,6 +33,7 @@ import {
   getShuyuanPoolHealth, getShuyuanStats, getReadingSources, refreshShuyuan,
   REFRESH_BUDGET_MS, RESPONSE_TIMEOUT_MS,
 } from './shuyuan';
+import { resolveDownloadSource } from './download-source';
 import { sourceRevision } from './source-revision';
 import { rulesHash } from './rule-engine/admission';
 import { refreshSupportedHosts, validateSourceUrl, SourcePolicyError } from './source-policy';
@@ -795,6 +796,33 @@ describe('refreshShuyuan atomic refresh', () => {
       expect(await getEngineSources(new AbortController().signal)).toMatchObject([
         { url: 'https://engine.example/', tier: 'M1' },
       ]);
+    });
+
+    it.each([
+      { name: 'admitted', row: {}, failed: false, allowed: true },
+      { name: 'disabled', row: { disabled_at: '2026-09-20T00:00:00Z' }, failed: false, allowed: false },
+      { name: 'rule disabled', row: { source: { ...engineItem, enabled: false } }, failed: false, allowed: false },
+      { name: 'failed probe', row: {}, failed: true, allowed: false },
+    ])('T6 download capability follows T4 engine pool: $name', async ({ row, failed, allowed }) => {
+      execute.mockResolvedValueOnce([{ host: 'engine.example' }])
+        .mockResolvedValueOnce([{ collections: [{ id: 1, title: 'fixture', count: 1, probeSnapshot: { version: 1, entries: [
+          { url: 'https://engine.example', status: failed ? 'failed' : 'reachable', checked_at: '2026-09-20T00:00:00Z' },
+        ] } }] }])
+        .mockResolvedValueOnce([engineRow(row)]);
+      const result = resolveDownloadSource('https://engine.example/book/1');
+      if (allowed) {
+        expect(await result).toEqual({ url: 'https://engine.example/book/1', kind: 'engine', id: 'https://engine.example/',
+          revision: sourceRevision({ url: 'https://engine.example/', searchUrl: engineItem.searchUrl, rules: engineItem }) });
+      } else await expect(result).rejects.toThrow('不支持全书下载');
+      expect(execute.mock.calls.at(-1)![0].text).toContain('WHERE a.compile_ok AND a.search_ok IS TRUE');
+      expect(fetchMock).not.toHaveBeenCalled();
+    });
+
+    it('T6 builtin download needs no engine DB; missing admission never grants download', async () => {
+      expect(await resolveDownloadSource('https://www.book15.net/book/1')).toMatchObject({kind: 'builtin'});
+      expect(execute).not.toHaveBeenCalled();
+      execute.mockResolvedValueOnce([]);
+      await expect(resolveDownloadSource('https://engine.example/book/1')).rejects.toThrow(SourcePolicyError);
     });
 
     it('/api/stats 的 readingPoolSize 在默认开关下为 1', async () => {

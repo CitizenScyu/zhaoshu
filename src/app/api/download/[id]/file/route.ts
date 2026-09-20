@@ -115,7 +115,7 @@ export async function GET(
     const sql = getSql();
     const rows = (await sql`
       SELECT id, title, author, status, to_jsonb(download_tasks)->>'artifact_id' AS artifact_id FROM download_tasks
-      WHERE id = ${taskId} AND user_id = ${auth.principal.userId}`) as {
+      WHERE id = ${taskId} AND requested_by = 'user' AND user_id = ${auth.principal.userId}`) as {
       id: number;
       title: string;
       author: string;

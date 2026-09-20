@@ -5,6 +5,8 @@ import { useOwner } from '@/components/OwnerProvider';
 import { TokenStatTile, TokenUsageDetails } from '@/components/TokenStats';
 import type { StatsResponse as Stats } from '@/app/api/stats/route';
 
+import { DOWNLOAD_STATES, DOWNLOAD_STATE_LABELS, type DownloadObservation } from '@/lib/download-observation';
+
 const SECTION_NAMES = { library: '书库', download: '下载', find: '找书', shelf: '书架', shuyuan: '书源', tokens: '模型用量' };
 
 // 与 ShelfTab 的分组口径一致
@@ -65,6 +67,8 @@ function StatTile({
 export default function StatsTab() {
   const { apiFetch } = useOwner();
   const [stats, setStats] = useState<Stats | null>(null);
+  const [queue, setQueue] = useState<DownloadObservation | null>(null);
+  const [queueError, setQueueError] = useState('');
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(true);
   const [exporting, setExporting] = useState(false);
@@ -102,12 +106,24 @@ export default function StatsTab() {
   const load = useCallback(async (signal?: AbortSignal) => {
     setLoading(true);
     setError('');
+    setQueue(null);
+    setQueueError('');
     try {
       const res = await apiFetch('/api/stats', { signal });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || '统计加载失败');
       if (signal?.aborted) return;
       setStats(data as Stats);
+      if (data.allowedSections?.includes('tokens')) {
+        try {
+          const response = await apiFetch('/api/admin/download-stats', { signal });
+          if (!response.ok) throw new Error('下载队列统计暂不可用');
+          const observation = await response.json();
+          if (!signal?.aborted) setQueue(observation);
+        } catch {
+          if (!signal?.aborted) setQueueError('下载队列统计暂不可用，请刷新重试');
+        }
+      }
     } catch (e) {
       if (signal?.aborted) return;
       setStats(null);
@@ -217,6 +233,27 @@ export default function StatsTab() {
               <p className="text-xs" style={{ color: 'var(--ink-faint)' }}>模型用量为全站共享账目，仅维护者可见。</p>
               <TokenUsageDetails tokens={stats.tokens} />
             </>
+          )}
+
+          {stats.allowedSections.includes('tokens') && (
+            <section aria-labelledby="download-funnel">
+              <h3 id="download-funnel" className="text-sm font-bold mb-3">下载任务漏斗 · 只读</h3>
+              {queueError && <p role="status">{queueError}</p>}
+              {queue && <div className="overflow-x-auto">
+                <table className="w-full text-sm text-left tabular-nums">
+                  <caption className="text-left text-xs mb-3" style={{ color: 'var(--ink-faint)' }}>
+                    共 {queue.total} 个请求；心跳过期率 = 过期请求 / 该类全部请求。未完成含旧版保护拒绝晋升。
+                  </caption>
+                  <thead><tr><th scope="col">请求来源</th>{DOWNLOAD_STATES.map(state => <th scope="col" key={state} className="p-2">{DOWNLOAD_STATE_LABELS[state]}</th>)}<th scope="col">占比 / 过期率</th><th scope="col">重试 / 已关联产物</th></tr></thead>
+                  <tbody>{queue.groups.map(group => <tr key={group.requestedBy}>
+                    <th scope="row">{group.requestedBy === 'system' ? '系统任务 · 只读' : '用户任务'}</th>
+                    {DOWNLOAD_STATES.map(state => <td key={state} className="p-2">{group.states[state]}</td>)}
+                    <td>{(group.share * 100).toFixed(1)}% / {(group.leaseExpiredRate * 100).toFixed(1)}%</td>
+                    <td>{group.retries} / {group.withArtifact}</td>
+                  </tr>)}</tbody>
+                </table>
+              </div>}
+            </section>
           )}
 
           {/* 次要分布 */}

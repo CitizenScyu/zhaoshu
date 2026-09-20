@@ -81,20 +81,20 @@ describe('/api/download 写守卫（F02）', () => {
     expect(triggerDownloadWorkflow).not.toHaveBeenCalled();
   });
 
-  it('session POST 合法（同源 + 固定头 + JSON）→ 201 并 dispatch 一次', async () => {
+  it('session POST 合法（同源 + 固定头 + JSON）→ 201；旧 dispatch 默认关，建任务不派发', async () => {
     sql.mockResolvedValueOnce([book]).mockResolvedValueOnce([]).mockResolvedValueOnce([]).mockResolvedValueOnce([{ id: 43 }]);
     const res = await POST(browserRequest('POST', { bookId: book.id }));
     expect(res.status).toBe(201);
     expect(await res.json()).toEqual({ taskId: 43 });
-    expect(triggerDownloadWorkflow).toHaveBeenCalledOnce();
+    expect(triggerDownloadWorkflow).not.toHaveBeenCalled();
   });
 
-  it('owner 头脚本通道 POST（Bearer、无 Cookie、无 Origin）保持兼容 → 201', async () => {
+  it('owner 头脚本通道 POST（Bearer、无 Cookie、无 Origin）保持兼容 → 201，dispatch 默认关', async () => {
     vi.stubEnv('AUTH_ACCOUNTS_ENABLED', 'false');
     sql.mockResolvedValueOnce([book]).mockResolvedValueOnce([]).mockResolvedValueOnce([]).mockResolvedValueOnce([{ id: 43 }]);
     const res = await POST(ownerRequest('POST', { bookId: book.id }));
     expect(res.status).toBe(201);
-    expect(triggerDownloadWorkflow).toHaveBeenCalledOnce();
+    expect(triggerDownloadWorkflow).not.toHaveBeenCalled();
   });
 
   it('session DELETE 缺 x-nf-csrf → 403 且未写库', async () => {

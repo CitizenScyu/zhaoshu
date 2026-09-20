@@ -110,7 +110,7 @@ export async function GET(req: NextRequest) {
     console.error('stats library aggregate failed', e instanceof Error ? { message: e.message } : e);
   }
 
-  // 下载任务自 auth schema v5 起有 NOT NULL 的 user_id，按当前用户统计；历史行归到用户 1。
+  // 个人下载只统计 requested_by=user 且属于本人；系统/用户漏斗见 owner 只读 download-stats。
   if (allowedSections.includes('download')) try {
     const rows = await access.run(async () => downloadStatsForUserQuery(s, userId)) as {
       total: number;

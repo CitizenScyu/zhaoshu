@@ -143,7 +143,7 @@ export function findStatsForUserQuery(sql: PersonalQuery, userId: number) {
     FROM recommendations WHERE user_id = ${userId} AND query <> ${'书库添加'}`;
 }
 
-// 下载任务自 auth schema v5 起有 NOT NULL 的 user_id（历史行归到用户 1），归属可信。
+// v7 系统请求没有 user_id；个人统计显式限定 user 身份和当前用户。
 // 章数与字数只累加已完成任务：failed/中断任务的部分进度不是「战果」，与 tile 主数的 done 口径一致。
 export function downloadStatsForUserQuery(sql: PersonalQuery, userId: number) {
   requireUserId(userId);
@@ -151,7 +151,7 @@ export function downloadStatsForUserQuery(sql: PersonalQuery, userId: number) {
       count(*) FILTER (WHERE status = ${'done'})::int AS done,
       COALESCE(sum(chapters_done) FILTER (WHERE status = ${'done'}), 0)::int AS chapters,
       COALESCE(sum(chars_total) FILTER (WHERE status = ${'done'}), 0)::int AS chars
-    FROM download_tasks WHERE user_id = ${userId}`;
+    FROM download_tasks WHERE requested_by = 'user' AND user_id = ${userId}`;
 }
 
 // F07：统计与列表同口径——先按 (user_id, book_id) 取代表行（与 recommendationsForUserQuery

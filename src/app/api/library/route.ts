@@ -115,7 +115,7 @@ export async function GET(req: NextRequest) {
       // 当前用户自己在这本书上的最新任务：下载 / 取消 / 取回都只走这个 id。
       // 与共享可读分开取，避免拿别人的完成任务去查强制 user_id 的 /api/download（F18）。
       const myDownloadTask = canDownload ? tx`(SELECT dt.id FROM download_tasks dt
-                WHERE dt.user_id = ${auth.principal.userId} AND dt.book_id = labeled_books.id
+                WHERE dt.requested_by = 'user' AND dt.user_id = ${auth.principal.userId} AND dt.book_id = labeled_books.id
                 ORDER BY dt.created_at DESC, dt.id DESC LIMIT 1)` : tx`NULL::integer`;
       return [
         tx`
