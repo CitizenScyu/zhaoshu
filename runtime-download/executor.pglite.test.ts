@@ -197,11 +197,11 @@ maybe('T8 执行器端到端：领取 → 合成抓取 → 五阶段发布 → D
     expect(github.calls).toHaveLength(0);
   });
 
-  it('worker 侧预算定时器 abort：T3 现有收口为 failed（见报告未尽事项，未改 T3 逻辑）', async () => {
+  it('worker 侧预算定时器 abort：归一切续传 partial，零发布', async () => {
     const id = await insertTask();
     const executor = createExecutor(deps([engineAdapter({ waitAbort: true, total: 10, done: 4, chars: 8100 })], fakeBudget(), { taskTimeoutMs: 40 }));
     expect(await executor.runOnce()).toBe(DEFAULT_DECISIONS.TASK_DONE);
-    expect((await taskState(id)).status).toBe('failed');
+    expect((await taskState(id)).status).toBe('partial');
     expect(github.calls).toHaveLength(0);
   });
 
