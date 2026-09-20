@@ -18,7 +18,8 @@ import {
   createScope, evaluateField, evaluateFieldNodes, insideNode, normalizeBody, type HtmlScope,
 } from './evaluate';
 import { RuleEngineError, type RuleDiagnostic } from './types';
-import { ENGINE_SEMANTICS_VERSION, engineSourceRevision } from './compile';
+import { engineSourceRevision } from './compile';
+import { engineSemanticsVersion, engineSyntaxOrEnabled } from './syntax-flags';
 
 // ---------------------------------------------------------------- 常量
 export const DEFAULT_ADMISSION_KEYWORD = '斗破苍穹';
@@ -480,6 +481,18 @@ export function rulesHash(source: unknown): string {
   });
 }
 
+/**
+ * 落库的 engine_semantics_version：必须与 rulesHash 的版本前缀同一口径
+ * （engineSourceRevision → engineSemanticsVersion(engineSyntaxOrEnabled())，P1a off=1/on=2）。
+ * P1a 开闸前置修复：此前三处落库写死常量 ENGINE_SEMANTICS_VERSION（恒 1），而 rulesHash
+ * 在 ENGINE_SYNTAX_OR=1 时产出 `2:<hash>`，会写下行内自相矛盾的元数据
+ * （hash 带 2 前缀、版本列写 1）。off 态两式逐字等值：engineSyntaxOrEnabled()=false
+ * ⇒ engineSemanticsVersion(false)===ENGINE_SEMANTICS_VERSION===1，行为不变。
+ */
+function admissionSemanticsVersion(): number {
+  return engineSemanticsVersion(engineSyntaxOrEnabled());
+}
+
 function compileDiagnostics(compile: AdmissionCompile): AdmissionSourceRow['compile_diagnostics'] {
   return compile.failures.map(({ field, diagnostic }) => ({ field, ...diagnostic }));
 }
@@ -542,6 +555,9 @@ function planProbeOrder(input: AdmissionBatchInput, nowMs: number): AdmissionPla
  */
 export async function runAdmissionBatch(input: AdmissionBatchInput): Promise<AdmissionBatchResult> {
   const now = input.now ?? (() => new Date());
+  // 每批判定一次语义版本：同一批所有行的版本列必须彼此一致，且与各自 rules_hash 前缀同源
+  // （rulesHash 内部同款默认读 ENGINE_SYNTAX_OR）。
+  const semanticsVersion = admissionSemanticsVersion();
   const rows: AdmissionSourceRow[] = [];
   const verdicts: Record<string, number> = {};
   let compileOk = 0;
@@ -571,7 +587,7 @@ export async function runAdmissionBatch(input: AdmissionBatchInput): Promise<Adm
       rows.push({
         source_url: candidate.url, tier: 'T7', compile_ok: false, core_field_mask: compile.coreFieldMask,
         search_ok: null, search_verdict: '', search_checked_at: null, rules_hash: hash,
-        engine_semantics_version: ENGINE_SEMANTICS_VERSION, host, error: compile.reason,
+        engine_semantics_version: semanticsVersion, host, error: compile.reason,
         compile_diagnostics: compileDiagnostics(compile),
       });
       continue;
@@ -595,7 +611,7 @@ export async function runAdmissionBatch(input: AdmissionBatchInput): Promise<Adm
         source_url: candidate.url, tier: 'M1', compile_ok: true, core_field_mask: compile.coreFieldMask,
         search_ok: result.verdict === 'ok', search_verdict: result.verdict,
         search_checked_at: now().toISOString(), rules_hash: hash,
-        engine_semantics_version: ENGINE_SEMANTICS_VERSION, host,
+        engine_semantics_version: semanticsVersion, host,
         error: result.error, compile_diagnostics: [],
       });
       continue;
@@ -605,7 +621,7 @@ export async function runAdmissionBatch(input: AdmissionBatchInput): Promise<Adm
       rows.push({
         source_url: candidate.url, tier: 'M1', compile_ok: true, core_field_mask: compile.coreFieldMask,
         search_ok: null, search_verdict: '', search_checked_at: null, rules_hash: hash,
-        engine_semantics_version: ENGINE_SEMANTICS_VERSION, host, error: '', compile_diagnostics: [],
+        engine_semantics_version: semanticsVersion, host, error: '', compile_diagnostics: [],
       });
     }
   }
