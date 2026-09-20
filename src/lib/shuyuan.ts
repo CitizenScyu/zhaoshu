@@ -6,7 +6,7 @@ import {
   builtinFallbackSource, builtinUrlPrefixes, engineHosts, type SupportedSourceTier,
 } from '@/lib/supported-sources';
 import {
-  ADMISSION_MIN_BUDGET_MS, ADMISSION_TIMEOUT_MS, assertAdmissionVersionConsistent,
+  ADMISSION_MAX_REDIRECTS, ADMISSION_MIN_BUDGET_MS, ADMISSION_TIMEOUT_MS, assertAdmissionVersionConsistent,
   defaultAdmissionTransport, runAdmissionBatch,
   type AdmissionCandidate, type AdmissionSourceRow,
 } from '@/lib/rule-engine/admission';
@@ -22,9 +22,9 @@ export type { ShuyuanAvailability };
 // 列表页是静态 HTML，合集 JSON 端点按 id 取；yckceo 在国内直连被 SNI 重置，
 // 但 Vercel 出口在美国，直连没问题（2026-09-13 经凤凰城 VPS 验证）。
 
-const INDEX_URL = 'https://www.yckceo.com/yuedu/shuyuans/index.html';
+export const INDEX_URL = 'https://www.yckceo.com/yuedu/shuyuans/index.html';
 const jsonUrl = (id: number) => `https://www.yckceo.com/yuedu/shuyuans/json/id/${id}.json`;
-const LATEST_COUNT = 3; // 只跟最新 3 个合集
+export const LATEST_COUNT = 3; // 只跟最新 3 个合集
 const PROBE_TIMEOUT_MS = 8_000;
 const PROBE_CONCURRENCY = 10;
 // 连续探测失败达到该次数，才把源写成 failed（failed 会被 getReadingSources 剔除，退出取书可用集）。
@@ -388,20 +388,20 @@ function readMeta(value: unknown): { collections: ShuyuanCollection[]; states: M
   return { collections, states };
 }
 
-function sameRules(a: unknown, b: unknown): boolean {
+export function sameRules(a: unknown, b: unknown): boolean {
   // jsonb 对象键顺序不是规则变化，数组顺序仍有意义。
   const stable = (value: unknown) => JSON.stringify(value, (_key, item: unknown) =>
     isRecord(item) ? Object.fromEntries(Object.keys(item).sort().map((key) => [key, item[key]])) : item);
   return stable(a) === stable(b);
 }
 
-function normalizeUrl(url: string): string {
+export function normalizeUrl(url: string): string {
   return url.trim().replace(/\/+$/, '');
 }
 
 // PG jsonb 严禁 NUL，孤立 UTF-16 代理项编码成 UTF-8 也非法；
 // 上游合集里确实存在这类脏数据（2026-09-13 实测 bookSourceComment 混入 NUL）。
-function cleanJson(value: unknown): unknown {
+export function cleanJson(value: unknown): unknown {
   if (typeof value === 'string') {
     return value
       .replace(/\u0000/g, '')
@@ -415,31 +415,75 @@ function cleanJson(value: unknown): unknown {
   return value;
 }
 
-async function fetchText(url: string, timeoutMs: number, parentSignal: AbortSignal): Promise<string> {
+// 跳转目标主机白名单:上游 yckceo 把合集 JSON 端点改成 302 跳转到 jsdelivr 托管文件
+// (2026-09-21 实测 gcore.jsdelivr.net,三镜像均可达)。原先 fetchText 用 redirect:'error'
+// 硬拒一切跳转,上游一改就全量失败;这里改为**有界跟随**,但只跟随到受信 CDN 主机,
+// 绝不无脑 redirect:'follow'(那会放大 SSRF 面:上游可把请求引向任意内网/元数据地址)。
+// 判据:目标 host === 白名单精确 host,或其子域(endsWith('.' + 白名单 host))。
+const TRUSTED_REDIRECT_HOSTS = ['jsdelivr.net'] as const;
+// 跳数上限复用准入通道既有常量,避免两处漂移。
+const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
+
+export function isTrustedRedirectTarget(rawLocation: string, base: string): boolean {
+  let target: URL;
+  try {
+    target = new URL(rawLocation, base); // 缺省 base 处理相对 Location
+  } catch {
+    return false;
+  }
+  if (target.protocol !== 'https:') return false;
+  const host = target.hostname.toLowerCase();
+  return TRUSTED_REDIRECT_HOSTS.some((allowed) => host === allowed || host.endsWith(`.${allowed}`));
+}
+
+export async function fetchText(url: string, timeoutMs: number, parentSignal: AbortSignal): Promise<string> {
   const deadline = createDeadline(timeoutMs);
   const signal = AbortSignal.any([parentSignal, deadline.signal]);
   let response: Response | undefined;
   let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
   let complete = false;
   try {
-    signal.throwIfAborted();
-    const pending = fetch(url, {
-      signal, redirect: 'error',
-      headers: { 'User-Agent': 'Mozilla/5.0 (compatible; zhaoshu/1.0)' },
-    });
-    void pending.then((late) => {
-      if (signal.aborted && late.body && !late.body.locked) void late.body.cancel().catch(() => {});
-    }, () => {});
-    response = await raceDeadline(signal, () => pending);
-    if (!response.ok || response.redirected) throw new Error(`${response.status} ${url}`);
-    if (!response.body) return '';
-    reader = response.body.getReader();
-    const decoder = new TextDecoder();
-    let text = '';
-    while (true) {
-      const result = await raceDeadline(signal, () => reader!.read());
-      if (result.done) { complete = true; return text + decoder.decode(); }
-      text += decoder.decode(result.value, { stream: true });
+    // 有界跟随:每跳手动取 Location,逐跳复验主机白名单;超跳数/非白名单/非 https/循环即拒。
+    // 错误只带 host 与状态,不带任何键值。HTTP 与 body 读取仍走同一份 signal(含超时预算)。
+    let current = url;
+    const visited = new Set<string>([current]);
+    for (let redirects = 0; ; redirects += 1) {
+      signal.throwIfAborted();
+      const pending = fetch(current, {
+        signal, redirect: 'manual',
+        headers: { 'User-Agent': 'Mozilla/5.0 (compatible; zhaoshu/1.0)' },
+      });
+      void pending.then((late) => {
+        if (signal.aborted && late.body && !late.body.locked) void late.body.cancel().catch(() => {});
+      }, () => {});
+      response = await raceDeadline(signal, () => pending);
+      if (REDIRECT_STATUSES.has(response.status)) {
+        const location = response.headers.get('location');
+        if (response.body && !response.body.locked) void response.body.cancel(signal.reason).catch(() => {});
+        response = undefined;
+        if (!location) throw new Error(`书源跳转缺少 Location ${hostOf(current)}`);
+        if (redirects >= ADMISSION_MAX_REDIRECTS) throw new Error(`书源跳转次数超限 ${hostOf(current)}`);
+        if (!isTrustedRedirectTarget(location, current)) {
+          throw new Error(`书源跳转到非受信主机(拒绝)${redirectHostOf(location, current)}`);
+        }
+        const next = new URL(location, current).href;
+        if (visited.has(next)) throw new Error(`书源跳转形成循环 ${hostOf(next)}`);
+        visited.add(next);
+        current = next;
+        continue;
+      }
+      // 非跳转的 HTTP 失败沿用原语义:错误里带完整源 URL(既有测试与下游 err 字段依赖此形状;
+      // 该 URL 是源地址、非秘密)。仅「跳转类」错误改为只带 host,避免回显上游带签名的 Location。
+      if (!response.ok) throw new Error(`${response.status} ${current}`);
+      if (!response.body) return '';
+      reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let text = '';
+      while (true) {
+        const result = await raceDeadline(signal, () => reader!.read());
+        if (result.done) { complete = true; return text + decoder.decode(); }
+        text += decoder.decode(result.value, { stream: true });
+      }
     }
   } finally {
     if (reader) {
@@ -452,7 +496,16 @@ async function fetchText(url: string, timeoutMs: number, parentSignal: AbortSign
   }
 }
 
-function parseIndex(html: string): { id: number; title: string }[] {
+/** 只取 URL 的主机名用于错误信息(绝不回显路径/查询,避免把带签名的 URL 泄漏进日志)。 */
+function hostOf(url: string): string {
+  try { return new URL(url).hostname; } catch { return '[unparseable-url]'; }
+}
+
+function redirectHostOf(rawLocation: string, base: string): string {
+  try { return `-> ${new URL(rawLocation, base).hostname}`; } catch { return '-> [unparseable-location]'; }
+}
+
+export function parseIndex(html: string): { id: number; title: string }[] {
   const entries: { id: number; title: string }[] = [];
   const re = /href="\/yuedu\/shuyuans\/content\/id\/(\d+)\.html"[^>]*>([^<]+)/g;
   for (let m = re.exec(html); m; m = re.exec(html)) {
