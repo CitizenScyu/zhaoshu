@@ -544,5 +544,71 @@ class TestRuntimeStubDetection(unittest.TestCase):
                          {labeler.BASE + f'/books/details{i}.html' for i in range(1, 4)})
 
 
+class TestMainCategoryWiring(unittest.TestCase):
+    """main() 接线：rank + 分类两路合并去重、--categories 默认/none 关闭、参数转发。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.data_dir = Path(self.tmp.name)
+        (self.data_dir / '.env').write_text('LLM_API_KEY=test-key-not-real\n',
+                                            encoding='utf-8')
+
+    def _run_main(self, argv, rank_books, cat_books=None):
+        import contextlib
+        import io
+        from unittest import mock
+        buf = io.StringIO()
+        cat_mock = mock.MagicMock(return_value=list(cat_books or []))
+        with mock.patch.dict(os.environ, {'LABELER_DATA_DIR': str(self.data_dir)}), \
+                mock.patch.object(labeler, 'fetch_rank_books',
+                                  return_value=list(rank_books)), \
+                mock.patch.object(labeler, 'fetch_category_books', cat_mock), \
+                mock.patch.object(labeler.time, 'sleep', lambda s: None), \
+                mock.patch.object(sys, 'argv', ['labeler.py'] + argv), \
+                contextlib.redirect_stdout(buf):
+            rc = labeler.main()
+        return rc, buf.getvalue(), cat_mock
+
+    def test_no_categories_flag_keeps_rank_only(self):
+        """默认安全：不给 --categories = 只走榜单，fetch_category_books 一次都不调。"""
+        rc, out, cat_mock = self._run_main(
+            ['--dry-run', '--no-db-model'],
+            [{'url': '/books/details1.html', 'title': '甲'}])
+        self.assertEqual(rc, 0)
+        cat_mock.assert_not_called()
+        self.assertNotIn('分类入口新增', out)
+
+    def test_categories_none_disables_the_source(self):
+        rc, out, cat_mock = self._run_main(
+            ['--dry-run', '--no-db-model', '--categories', 'none'],
+            [{'url': '/books/details1.html', 'title': '甲'}])
+        self.assertEqual(rc, 0)
+        cat_mock.assert_not_called()
+        self.assertNotIn('分类入口新增', out)
+
+    def test_merge_line_and_dedupe(self):
+        rank = [{'url': '/books/details1.html', 'title': '甲'}]
+        cat = [{'url': '/books/details1.html', 'title': '甲（分类）'},
+               {'url': '/books/details2.html', 'title': '乙'}]
+        rc, out, _ = self._run_main(
+            ['--dry-run', '--no-db-model', '--limit', '10', '--categories', '23'],
+            rank, cat)
+        self.assertEqual(rc, 0)
+        self.assertIn('榜单共 1 本（去重后）', out)
+        self.assertIn('分类入口新增 1 本候选', out)
+        self.assertIn('本轮处理 2 本（跳过已完成 0 本（含钉子户 0 本））', out)
+        self.assertIn(' - 乙', out)
+        self.assertEqual(out.count(' - 甲 |'), 1)   # 重复的书只出现一次
+
+    def test_max_pages_and_categories_forwarded(self):
+        rc, out, cat_mock = self._run_main(
+            ['--dry-run', '--no-db-model', '--categories', '23', '--max-pages', '2'],
+            [{'url': '/books/details1.html', 'title': '甲'}])
+        self.assertEqual(rc, 0)
+        cat_mock.assert_called_once_with((23,), 2, labeler.CATEGORY_PAGE_DELAY)
+        self.assertIn('拉取分类列表书目（1 类，每类最多 2 页）', out)
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)
