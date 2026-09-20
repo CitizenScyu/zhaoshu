@@ -21,11 +21,10 @@ phoenix（打标机）刻意不装 PG 驱动（见 labeler.py「入库层」注�
    + lower）。重复写同一本书 = 更新同一行，不新增。
 2. **R02 非不动点孪生行前置拦截**（import_labels.mjs 同判据的保守移植）：存量行的作者
    经实体解码后与本次作者同身份、但原文不同 → 跳过写入，不凭空多一行。
-3. **labels-imported.jsonl 标记**：成功导入过的 url 不再重复 POST（快的 no-op 层）。
+3. **labels-imported.jsonl 标记**：已导入的 url 不重写 labels，只补系统任务账。
 
-另有一条刻意的改进：`labeled_at` 只在**内容真的变了**时才刷新
-（`CASE WHEN labels IS DISTINCT FROM EXCLUDED.labels ...`），
-避免首次全量补录把存量行的 labeled_at 整体推到当下、打乱书库「最近打标」排序。
+labels 与系统任务通过同一 SQL 原子写入，与 importer-enqueue.ts 对齐。
+重复标记只补账，不刷新 labeled_at；显式重导与 TS 一样刷新 labeled_at。
 
 ## 失败不阻断打标
 
@@ -352,29 +351,51 @@ def _sql_text(query):
 
 
 def build_upsert(record):
-    """与 import_labels.mjs writeImportRecord 同形的 UPSERT → (query, params)。
-
-    params 顺序：title, author, category, finish_status, source_site, source_url,
-    chars_labeled, labels(jsonb), primary_genre, sub_tags(jsonb), quality。
-    唯一刻意的差异：labeled_at 只在内容真的变化时刷新，重复导入是真正的 no-op。"""
-    query = (
-        'INSERT INTO labeled_books\n'
-        '  (title, author, category, finish_status, source_site, source_url,\n'
-        '   chars_labeled, labels, labeled_at, primary_genre, sub_tags, quality)\n'
-        'VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, now(), $9, $10::jsonb, $11)\n'
-        'ON CONFLICT (title_key, author_key) DO UPDATE SET\n'
-        '  labels = EXCLUDED.labels,\n'
-        '  finish_status = EXCLUDED.finish_status,\n'
-        '  chars_labeled = EXCLUDED.chars_labeled,\n'
-        "  source_url = COALESCE(NULLIF(EXCLUDED.source_url, ''), labeled_books.source_url),\n"
-        '  primary_genre = EXCLUDED.primary_genre,\n'
-        '  sub_tags = EXCLUDED.sub_tags,\n'
-        '  quality = COALESCE(EXCLUDED.quality, labeled_books.quality),\n'
-        '  labeled_at = CASE\n'
-        '    WHEN labeled_books.labels IS DISTINCT FROM EXCLUDED.labels\n'
-        '      OR labeled_books.chars_labeled IS DISTINCT FROM EXCLUDED.chars_labeled\n'
-        '    THEN now() ELSE labeled_books.labeled_at END'
+    """TS importLabelWithSystemTask 同语句 SQL；默认采用 NO_ARTIFACTS 策略。"""
+    query = r"""
+    WITH upserted AS (
+      INSERT INTO labeled_books
+        (title, author, category, finish_status, source_site, source_url,
+         chars_labeled, labels, labeled_at, primary_genre, sub_tags, quality)
+      VALUES ($1, $2, $3, $4,
+              $5, $6, $7,
+              $8::jsonb, now(),
+              $9, $10::jsonb, $11)
+      ON CONFLICT (title_key, author_key) DO UPDATE SET
+        labels = EXCLUDED.labels,
+        finish_status = EXCLUDED.finish_status,
+        chars_labeled = EXCLUDED.chars_labeled,
+        source_url = COALESCE(NULLIF(EXCLUDED.source_url, ''), labeled_books.source_url),
+        primary_genre = EXCLUDED.primary_genre,
+        sub_tags = EXCLUDED.sub_tags,
+        quality = COALESCE(EXCLUDED.quality, labeled_books.quality),
+        labeled_at = now()
+      RETURNING id, title, author, source_url
+    ), inserted AS (
+      INSERT INTO download_tasks
+        (user_id, book_id, title, author, source_url, status, requested_by,
+         source_kind, source_id, source_revision, policy_version, enqueue_key)
+      SELECT NULL, u.id, u.title, u.author, u.source_url, 'pending', 'system',
+             $12, $13, $14, $15,
+             u.id::text || ':' || $16 || ':' || $17
+      FROM upserted u
+      WHERE $18
+        -- 同书已有活动系统任务(pending/running)时不再插第二条:否则会撞
+        -- download_tasks_system_active_book_idx 的 23505,把**整个导入**回滚掉,
+        -- 让「书已在队列里」这个正常状态反而阻塞标签更新。T1 的 enqueue 函数对这类
+        -- 竞争同样解析为「返回该书现有活动任务」,这里在 SQL 里提前等价处理。
+        AND NOT EXISTS (
+          SELECT 1 FROM download_tasks t
+          WHERE t.requested_by = 'system' AND t.book_id = u.id
+            AND t.status IN ('pending', 'running')
+        )
+      ON CONFLICT (enqueue_key) WHERE requested_by = 'system' AND enqueue_key IS NOT NULL
+      DO NOTHING
+      RETURNING id
     )
+    SELECT (SELECT id FROM upserted)          AS labeled_book_id,
+           (SELECT count(*)::int FROM inserted) AS created_task_count,
+           (SELECT id FROM inserted)          AS created_task_id"""
     params = [
         record['title'],
         record['author'],
@@ -388,7 +409,52 @@ def build_upsert(record):
         json.dumps(record['sub_tags'], ensure_ascii=False),
         record['quality'],
     ]
-    return query, params
+    return query, params + _task_params() + [True]
+
+
+def _task_params():
+    """TS normalizeTaskPolicy defaults; repeated binds preserve its SQL exactly."""
+    policy = (os.environ.get('LABELER_DOWNLOAD_POLICY_VERSION') or 't5-backfill-v1').strip()
+    if not policy or len(policy) > 200:
+        raise ValueError('policyVersion is invalid')
+    return ['builtin', None, '', policy, policy, '']
+
+
+def build_ensure_system_task(labeled_book_id):
+    """Only pass an id resolved from labeled_books, never a books.id."""
+    if isinstance(labeled_book_id, bool) or not isinstance(labeled_book_id, int) or labeled_book_id < 1:
+        raise ValueError('invalid labeled_books id')
+    return r"""
+    WITH target AS (
+      SELECT id, title, author, source_url FROM labeled_books WHERE id = $1
+    ), inserted AS (
+      INSERT INTO download_tasks
+        (user_id, book_id, title, author, source_url, status, requested_by,
+         source_kind, source_id, source_revision, policy_version, enqueue_key)
+      SELECT NULL, t.id, t.title, t.author, t.source_url, 'pending', 'system',
+             $2, $3, $4, $5,
+             t.id::text || ':' || $6 || ':' || $7
+      FROM target t
+      WHERE NOT EXISTS (
+        SELECT 1 FROM download_tasks d
+        WHERE d.requested_by = 'system' AND d.book_id = t.id
+          AND d.status IN ('pending', 'running')
+      )
+      ON CONFLICT (enqueue_key) WHERE requested_by = 'system' AND enqueue_key IS NOT NULL
+      DO NOTHING
+      RETURNING id
+    )
+    SELECT (SELECT id FROM target)              AS labeled_book_id,
+           (SELECT count(*)::int FROM inserted) AS created_task_count,
+           (SELECT id FROM inserted)            AS created_task_id""", [labeled_book_id] + _task_params()
+
+
+FIND_LABELED_BOOK_SQL = r"""
+    SELECT id FROM labeled_books
+    WHERE title_key = lower(btrim(regexp_replace(btrim(normalize($1, NFKC)), '^《(.+)》$', '\1')))
+      AND author_key = lower(btrim(normalize($2, NFKC)))
+    ORDER BY id
+    LIMIT 1"""
 
 
 def find_twin(rows, author):
@@ -559,8 +625,7 @@ class AutoImporter:
             return 'disabled'
         try:
             url = rec.get('url') if isinstance(rec, dict) else None
-            if isinstance(url, str) and url in self._imported:
-                return 'duplicate'
+            duplicate = isinstance(url, str) and url in self._imported
             result = validate_record(rec)
             if result['status'] != 'ready':
                 if result['status'] in ('review', 'failed'):
@@ -570,6 +635,13 @@ class AutoImporter:
             for warning in result.get('warnings', []):
                 self.log(f'  自动导入提示: {warning}')
             record = result['record']
+            if duplicate:
+                rows = self._rows(FIND_LABELED_BOOK_SQL, [record['title'], record['author']])
+                if not rows:
+                    raise ValueError('labeled book not found')
+                query, params = build_ensure_system_task(int(rows[0]['id']))
+                self._sql_exec(query, params)
+                return 'duplicate'
             outcome = self._write(record)
             if outcome == 'twin-skipped':
                 return 'twin-skipped'

@@ -72,7 +72,10 @@ class FakeDb:
         return row
 
     def __call__(self, query, params):
+        query = query.strip()
         self.calls.append((query, params))
+        if query.startswith('WITH target'):
+            return {}
         if query.startswith('SELECT'):
             title = params[0].lower()
             return {'rows': [dict(row) for row in self.rows.values()
@@ -292,7 +295,7 @@ class TestBuildUpsert(unittest.TestCase):
         out = validated(record())
         query, params = import_one.build_upsert(out)
         self.assertIn('ON CONFLICT (title_key, author_key) DO UPDATE', query)
-        self.assertEqual(len(params), 11)
+        self.assertEqual(len(params), 18)
         self.assertEqual(params[0], '测试书')
         self.assertEqual(params[1], '作者甲')
         self.assertEqual(params[5], 'https://book15.net/books/details1.html')
@@ -313,13 +316,9 @@ class TestBuildUpsert(unittest.TestCase):
         self.assertIn('COALESCE(EXCLUDED.quality, labeled_books.quality)', query)
         self.assertNotIn('DROP', query)
 
-    def test_labeled_at_is_only_bumped_when_content_changes(self):
-        # 重复导入是真正的 no-op：内容没变就不动 labeled_at（否则书库「最近打标」
-        # 排序会被补录整体推到现在）。
+    def test_explicit_reimport_matches_ts_timestamp(self):
         query, _ = import_one.build_upsert(validated(record()))
-        self.assertIn('labeled_at = CASE', query)
-        self.assertIn('IS DISTINCT FROM EXCLUDED.labels', query)
-        self.assertIn('ELSE labeled_books.labeled_at END', query)
+        self.assertIn('labeled_at = now()', query)
 
     def test_labels_json_has_no_nul_or_lone_surrogates(self):
         out = validated(labels_record(note='a\0b\ud800😀'))
@@ -374,7 +373,8 @@ class TestAutoImporter(TempDirCase):
         self.assertEqual(importer.import_record(record()), 'imported')
         writes_after_first = len(db.calls)
         self.assertEqual(importer.import_record(record()), 'duplicate')
-        self.assertEqual(len(db.calls), writes_after_first)   # 没有新 SQL
+        self.assertEqual(len(db.calls), writes_after_first + 2)  # 查身份 + 补账
+        self.assertTrue(db.calls[-1][0].startswith("WITH target"))
         self.assertEqual(len(db.rows), 1)
 
     def test_upsert_keeps_one_row_for_same_identity(self):
@@ -430,7 +430,7 @@ class TestAutoImporter(TempDirCase):
         db.seed('测试书', '作&#32773;甲')
         importer = self.importer(db)
         self.assertEqual(importer.import_record(record(author='作者甲')), 'twin-skipped')
-        inserts = [c for c in db.calls if c[0].startswith('INSERT')]
+        inserts = [c for c in db.calls if c[0].startswith('WITH upserted')]
         self.assertEqual(inserts, [])
         self.assertEqual(len(db.rows), 1)
 
@@ -455,7 +455,7 @@ class TestAutoImporter(TempDirCase):
         db.seed('测试书', '作者甲')
         importer = self.importer(db)
         self.assertEqual(importer.import_record(record(author='作者甲')), 'imported')
-        self.assertTrue(any(c[0].startswith('INSERT') for c in db.calls))
+        self.assertTrue(any(c[0].startswith('WITH upserted') for c in db.calls))
         self.assertEqual(len(db.rows), 1)
 
     def test_review_records_are_not_imported(self):
