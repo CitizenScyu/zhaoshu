@@ -59,6 +59,36 @@ describe('download offline full books', () => {
     const r = await f.run(); expect(r.code).toBe(1); expect(r.manifest.status).toBe('partial');
     expect(JSON.parse(readFileSync(r.manifestPath, 'utf8')).status).toBe('partial');
   });
+  it.each(['invalid_chapter', 'invalid_next_page', 'empty_content_page', 'content_page_limit', 'unsupported_content_rule'])('preserves safe diagnostic %s', async reason => {
+    const f = setup();
+    const result = await f.run(async () => { throw new Error(reason); });
+    expect(result.manifest.errors).toEqual([reason]);
+    const chapters = await f.run(async (url, opts) => {
+      if (url.includes('/read/')) throw new Error(reason);
+      return f.transport(url, opts);
+    });
+    expect(chapters.manifest.chapters.every((c: {error: string}) => c.error === reason)).toBe(true);
+  });
+  it('accepts a fully overlapping catalog page and continues to a new page', async () => {
+    const f = setup();
+    const result = await f.run(async (url, opts) => {
+      const page = await f.transport(url, opts);
+      if (url.endsWith('/page2')) return { url, text: '<div class="d-chapter-list"><dd><a href="/read/1">第1章</a></dd></div><a class="next" href="/page3">next</a>' };
+      if (url.endsWith('/page3')) return { url, text: '<div class="d-chapter-list"><dd><a href="/read/2">第2章</a></dd></div>' };
+      return page;
+    });
+    expect(result.code).toBe(0);
+    expect(result.manifest.chapters).toHaveLength(2);
+  });
+  it('source resolution inability returns 2 without persisting upstream details', async () => {
+    const f = setup();
+    const result = await downloadBook({}, f.options, async () => {
+      throw Object.assign(new Error('synthetic private connection detail'), { code: 2 });
+    });
+    expect(result.code).toBe(2);
+    expect(result.manifest.errors).toEqual(['source_unavailable']);
+    expect(readFileSync(result.manifestPath, 'utf8')).not.toContain('private connection');
+  });
   it('max chapters fails before fetching chapters', async () => {
     const f = setup(); f.options['max-chapters'] = 1;
     const r = await f.run(); expect(r.code).toBe(1); expect(r.manifest.errors).toContain('max_chapters');

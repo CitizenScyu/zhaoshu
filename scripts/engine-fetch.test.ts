@@ -26,6 +26,14 @@ function run(args: string[], env: Record<string, string | undefined> = {}) {
 }
 
 describe('engine-fetch CLI 契约', () => {
+  it.each(['source', 'out', 'max-chapters', 'rate-ms', 'timeout-ms', 'budget-ms'])('rejects download-only --%s before DB or env access', flag => {
+    for (const command of ['search', 'toc', 'content', 'doctor']) {
+      const result = run([command, `--${flag}`, '1', '--env', 'nonexistent-test-env'], { DATABASE_URL: undefined });
+      expect(result.status).toBe(2);
+      expect(result.stderr).toContain(`--${flag} 仅用于 download`);
+      expect(result.stdout).toBe('');
+    }
+  });
   it('doctor 真实加载 TS 模块且不访问 DB/网络', () => {
     const r = run(['doctor', '--json'], { DATABASE_URL: undefined });
     expect(r.status).toBe(0);

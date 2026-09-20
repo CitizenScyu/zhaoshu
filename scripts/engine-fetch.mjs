@@ -258,7 +258,7 @@ async function cmdDownload(m, args) {
   const { downloadBook } = await import('./engine-download.mjs');
   const result = await downloadBook(m, args, resolveSourceForUrl);
   process.stdout.write(JSON.stringify(result) + '\n');
-  if (result.code) throw new ExitError(1, 'download partial');
+  if (result.code) throw new ExitError(result.code, 'download partial');
 }
 
 const COMMANDS = { doctor: cmdDoctor, download: cmdDownload, search: cmdSearch, toc: cmdToc, content: cmdContent };
@@ -269,6 +269,11 @@ async function main() {
   const handler = COMMANDS[command];
   if (!handler) throw new ExitError(2, `未知子命令：${command ?? '(空)'}；支持 doctor|search|toc|content|download`);
 
+  if (command !== 'download') {
+    for (const key of ['source', 'out', 'max-chapters', 'rate-ms', 'timeout-ms', 'budget-ms']) {
+      if (args[key] !== undefined) throw new ExitError(2, `--${key} 仅用于 download`);
+    }
+  }
   if (command === 'download') {
     try { Object.assign(args, (await import('./engine-download.mjs')).downloadOptions(args)); }
     catch { throw new ExitError(2, 'download 参数非法：需要 --source --title --author；数值参数须在允许范围内'); }

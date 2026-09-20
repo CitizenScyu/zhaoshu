@@ -112,6 +112,14 @@ maybe('T5:labels 入库与系统入队同语句', () => {
     return (await pg.query('SELECT id, title, author, source_url FROM labeled_books ORDER BY id')).rows;
   }
 
+  it('explicit sourceKind still normalizes policy fields and rejects blank policy', async () => {
+    await importLabelWithSystemTask(sql, { record: BASE, marker: 'ready', task: POLICY });
+    const result = await ensureSystemTask(sql, BASE, {
+      policyVersion: ` ${POLICY.policyVersion} `, sourceRevision: ' r1 ', sourceKind: ' builtin ', sourceId: ' ',
+    });
+    expect(result.taskOutcome).toBe('existing');
+    await expect(ensureSystemTask(sql, BASE, { policyVersion: ' ', sourceKind: 'builtin' })).rejects.toThrow('policyVersion is invalid');
+  });
   it('同一语句:labels 落库与系统任务入队一起成功,book_id 取自 labeled_books.id', async () => {
     const outcome = await importLabelWithSystemTask(sql, { record: BASE, marker: 'ready', task: POLICY });
     expect(outcome.taskOutcome).toBe('created');
