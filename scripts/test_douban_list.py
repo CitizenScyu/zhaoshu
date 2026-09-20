@@ -902,6 +902,34 @@ class TestEngineCliInvocation(unittest.TestCase):
         self.assertTrue(cli.hook_path.replace('\\', '/').endswith(
             '/repo/scripts/ts-esm-loader.mjs'))
 
+    def test_validate_uses_doctor_subcommand(self):
+        cli = douban_list.EngineCli(node='node',
+                                    script_path='/repo/scripts/engine-fetch.mjs',
+                                    database_url='x')
+        with mock.patch.object(cli, 'run', return_value=_proc(0, '{"ok":true}\n')) as run:
+            proc = cli.validate()
+        self.assertEqual(proc.returncode, 0)
+        run.assert_called_once_with('doctor')
+
+
+class TestValidateEngine(unittest.TestCase):
+    def test_success(self):
+        cli = mock.Mock()
+        cli.validate.return_value = _proc(0, '{"ok":true}\n')
+        douban_list.validate_engine(cli)
+
+    def test_nonzero_raises_unavailable(self):
+        cli = mock.Mock()
+        cli.validate.return_value = _proc(1, '', 'Unknown file extension ".ts"')
+        with self.assertRaisesRegex(douban_list.EngineUnavailable, '启动探针失败'):
+            douban_list.validate_engine(cli)
+
+    def test_invalid_payload_raises_unavailable(self):
+        cli = mock.Mock()
+        cli.validate.return_value = _proc(0, 'not-json')
+        with self.assertRaisesRegex(douban_list.EngineUnavailable, '无效 JSON'):
+            douban_list.validate_engine(cli)
+
 
 class TestResolveCandidatesEngineFallback(unittest.TestCase):
     """_resolve_candidates 接入引擎兜底：book15 miss 才回落；开关关闭行为不变。"""

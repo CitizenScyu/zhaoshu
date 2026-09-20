@@ -26,6 +26,13 @@ function run(args: string[], env: Record<string, string | undefined> = {}) {
 }
 
 describe('engine-fetch CLI 契约', () => {
+  it('doctor 真实加载 TS 模块且不访问 DB/网络', () => {
+    const r = run(['doctor', '--json'], { DATABASE_URL: undefined });
+    expect(r.status).toBe(0);
+    expect(JSON.parse(r.stdout)).toEqual({ ok: true });
+    expect(r.stderr).toBe('');
+  });
+
   it('无 DATABASE_URL → 退出码 2，stderr 点名 DATABASE_URL，stdout 空', () => {
     const r = run(['search', '--title', 'X'], { DATABASE_URL: undefined });
     expect(r.status).toBe(2);

@@ -247,10 +247,26 @@ class TestBuildEngineCli(unittest.TestCase):
                'LABELER_ENGINE_CLI': '/repo/scripts/engine-fetch.mjs',
                'LABELER_ENGINE_NODE': '/usr/bin/node',
                'DATABASE_URL': 'postgres://user:pw@host/db'}
-        cli = labeler._build_engine_cli(env)
+        with mock.patch.object(labeler.douban_list, 'validate_engine') as validate:
+            cli = labeler._build_engine_cli(env)
         self.assertIsNotNone(cli)
         self.assertEqual(cli.node, '/usr/bin/node')
         self.assertEqual(cli.script_path, '/repo/scripts/engine-fetch.mjs')
+        validate.assert_called_once_with(cli)
+
+    def test_probe_failure_disables_engine_with_clear_error(self):
+        env = {labeler.douban_list.ENGINE_FALLBACK_ENV: '1',
+               'LABELER_ENGINE_CLI': '/repo/scripts/engine-fetch.mjs',
+               'DATABASE_URL': 'postgres://user:pw@host/db'}
+        err = io.StringIO()
+        with mock.patch.object(labeler.douban_list, 'validate_engine',
+                               side_effect=labeler.douban_list.EngineUnavailable(
+                                   '引擎启动探针失败（rc=1）: Unknown file extension')), \
+                contextlib.redirect_stderr(err):
+            cli = labeler._build_engine_cli(env)
+        self.assertIsNone(cli)
+        self.assertIn('引擎启动探针失败', err.getvalue())
+        self.assertNotIn('pw@host', err.getvalue())
 
 
 

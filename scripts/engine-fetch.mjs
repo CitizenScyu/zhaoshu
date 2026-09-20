@@ -6,9 +6,10 @@
 //   node --import ./scripts/ts-esm-loader.mjs scripts/engine-fetch.mjs search  --title "斗破苍穹" [--author "天蚕土豆"] [--json]
 //   node --import ./scripts/ts-esm-loader.mjs scripts/engine-fetch.mjs toc     --url <bookUrl>    [--json]
 //   node --import ./scripts/ts-esm-loader.mjs scripts/engine-fetch.mjs content --url <chapterUrl> [--json]
+//   node --import ./scripts/ts-esm-loader.mjs scripts/engine-fetch.mjs doctor --json
 //   （env：--env <file> 或环境变量 DATABASE_URL；--env 剥引号，参照 backfill_quality.mjs）
 //
-// 退出码契约：0=有结果；1=无候选/无章/空正文（stderr 原因）；2=无法尝试（无 DATABASE_URL、
+// 退出码契约：0=有结果（doctor=模块装配正常）；1=无候选/无章/空正文（stderr 原因）；2=无法尝试（无 DATABASE_URL、
 //   DB 不可达、参数/URL 非法——含非 https:// scheme；stderr 原因）。stdout 只放数据（--json 时单行 JSON）。
 // 🔴 凭据红线：任何输出（stdout/stderr）不得包含 DATABASE_URL 或密钥（见 safeReason）。
 import { readFileSync } from 'node:fs';
@@ -238,24 +239,34 @@ async function cmdContent(m, args) {
   emit(args, out, () => `[${out.source}] ${out.url}\n\n${out.text}`);
 }
 
+async function cmdDoctor(m, args) {
+  // main 已完成 loader + 七个依赖模块的真实加载；不访问 DB/网络、不输出配置真值。
+  const required = ['api', 'compile', 'shuyuan', 'supported', 'policy', 'parser', 'reader'];
+  if (!required.every((name) => m[name])) throw new ExitError(2, '引擎模块装配不完整');
+  emit(args, { ok: true }, () => 'ok');
+}
+
 function emit(args, data, human) {
   process.stdout.write(args.json ? JSON.stringify(data) + '\n' : human() + '\n');
 }
 
-const COMMANDS = { search: cmdSearch, toc: cmdToc, content: cmdContent };
+const COMMANDS = { doctor: cmdDoctor, search: cmdSearch, toc: cmdToc, content: cmdContent };
 
 async function main() {
   const args = parseArgs(process.argv.slice(2));
   const command = args._[0];
   const handler = COMMANDS[command];
-  if (!handler) throw new ExitError(2, `未知子命令：${command ?? '(空)'}；支持 search|toc|content`);
+  if (!handler) throw new ExitError(2, `未知子命令：${command ?? '(空)'}；支持 doctor|search|toc|content`);
 
   // env：--env 文件的 DATABASE_URL 注入 process.env（db.ts 模块初始化读它）。绝不打印。
   if (args.env) {
     const env = loadEnvFile(resolve(args.env));
     if (env.DATABASE_URL) process.env.DATABASE_URL = env.DATABASE_URL;
   }
-  if (!process.env.DATABASE_URL) throw new ExitError(2, 'DATABASE_URL 未设置（用 --env <file> 或环境变量）');
+  // doctor 只验证 loader/模块装配，不读取数据库；其余命令仍要求连接串。
+  if (command !== 'doctor' && !process.env.DATABASE_URL) {
+    throw new ExitError(2, 'DATABASE_URL 未设置（用 --env <file> 或环境变量）');
+  }
 
   const m = await loadModules();
   await handler(m, args);

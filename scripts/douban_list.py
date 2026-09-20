@@ -350,6 +350,14 @@ class EngineCli:
         """--import 目标转 file:// URI（跨平台安全）。"""
         return Path(self.hook_path).resolve().as_uri()
 
+    def validate(self):
+        """启动前探针：确认 node、CLI 与 TS loader 确实可用。
+
+        用 CLI 的无副作用 ``doctor`` 子命令做真实模块加载；这能在抓几百本候选之前
+        发现部署漏同步/旧 loader 等启动故障，而不是把它伪装成一轮正常 miss。
+        返回 CompletedProcess，错误解释仍统一由调用方处理。"""
+        return self.run('doctor')
+
     def run(self, subcommand: str, *args: str):
         """调 CLI 子命令（自动补 --json）。返回 CompletedProcess（returncode/stdout/stderr）。
 
@@ -426,6 +434,25 @@ def search_engine(cli, title: str, author: str = '') -> dict | None:
     if fallback is not None and want:
         print(f'  作者未知命中（降级）: {fallback["title"]}（名单作者 {author}，引擎未给作者）')
     return fallback
+
+
+def validate_engine(cli) -> None:
+    """验证引擎 CLI 可启动；失败按环境错误抛出且不泄露连接串。"""
+    try:
+        proc = cli.validate()
+    except subprocess.TimeoutExpired:
+        raise EngineUnavailable(f'引擎启动探针超时（{ENGINE_CLI_TIMEOUT}s）')
+    except OSError as e:
+        raise EngineUnavailable(f'引擎 CLI 无法调用: {type(e).__name__}')
+    if proc.returncode != 0:
+        raise EngineUnavailable(f'引擎启动探针失败（rc={proc.returncode}）: '
+                                f'{_short_stderr(proc.stderr)}')
+    try:
+        payload = json.loads(proc.stdout)
+    except (json.JSONDecodeError, TypeError):
+        raise EngineUnavailable('引擎启动探针返回无效 JSON')
+    if not isinstance(payload, dict) or payload.get('ok') is not True:
+        raise EngineUnavailable('引擎启动探针返回异常结果')
 
 
 def build_douban_queue(http_get, skip_titles: set | None = None,

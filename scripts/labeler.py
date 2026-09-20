@@ -686,10 +686,11 @@ def fetch_book_text_engine(engine_cli, book_url: str,
 
 
 def _build_engine_cli(env: dict):
-    """按 .env 装配 EngineCli；开关关闭或必要配置缺失 → 返回 None（降级 book15-only）。
+    """按 .env 装配并探测 EngineCli；开关关闭/配置缺失/探针失败 → 返回 None。
 
     需三者齐备：LABELER_ENGINE_FALLBACK=1 + LABELER_ENGINE_CLI（engine-fetch.mjs 绝对路径）
     + DATABASE_URL。node 路径由 LABELER_ENGINE_NODE 覆盖（默认 'node'）。
+    探针会真实加载 CLI 的 TS 依赖但不访问 DB/网络，提前暴露旧 loader 等部署故障。
     凭据红线：DATABASE_URL 只交给 EngineCli 经子进程 env 注入，不打印。"""
     if not douban_list.engine_fallback_enabled(env):
         return None
@@ -700,8 +701,15 @@ def _build_engine_cli(env: dict):
               'DATABASE_URL，本轮降级 book15-only')
         return None
     node = (env.get('LABELER_ENGINE_NODE') or 'node').strip() or 'node'
-    return douban_list.EngineCli(node=node, script_path=cli_path,
-                                 database_url=database_url)
+    cli = douban_list.EngineCli(node=node, script_path=cli_path,
+                                database_url=database_url)
+    try:
+        douban_list.validate_engine(cli)
+    except douban_list.EngineUnavailable as e:
+        print(f'  错误: LABELER_ENGINE_FALLBACK 已开，但引擎启动探针失败: {e}',
+              file=sys.stderr)
+        return None
+    return cli
 
 
 # ---- 打标层（将来可整体搬进主应用）----
