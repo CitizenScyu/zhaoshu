@@ -9,6 +9,7 @@ describe('triggerDownloadWorkflow', () => {
   beforeEach(() => {
     vi.resetModules();
     vi.stubEnv('GITHUB_TOKEN', 'offline-github-token');
+    vi.stubEnv('LEGACY_DOWNLOAD_DISPATCH_ENABLED', '1');
     vi.stubGlobal('fetch', fetchMock);
     fetchMock.mockReset();
   });
@@ -21,6 +22,7 @@ describe('triggerDownloadWorkflow', () => {
   it('throws a clear error when GITHUB_TOKEN is missing before any request', async () => {
     vi.unstubAllEnvs();
     vi.stubEnv('GITHUB_TOKEN', '');
+    vi.stubEnv('LEGACY_DOWNLOAD_DISPATCH_ENABLED', '1');
     await expect(triggerDownloadWorkflow()).rejects.toThrow('GITHUB_TOKEN is not configured');
     expect(fetchMock).not.toHaveBeenCalled();
   });
@@ -42,6 +44,15 @@ describe('triggerDownloadWorkflow', () => {
   it('maps a non-2xx dispatch to an error carrying the status', async () => {
     fetchMock.mockResolvedValue(new Response('rate limited', { status: 403 }));
     await expect(triggerDownloadWorkflow()).rejects.toThrow('HTTP 403');
+  });
+
+  it('never dispatches system requests, or user requests with default/off configuration', async () => {
+    await triggerDownloadWorkflow('system');
+    vi.stubEnv('LEGACY_DOWNLOAD_DISPATCH_ENABLED', '');
+    await triggerDownloadWorkflow();
+    vi.stubEnv('LEGACY_DOWNLOAD_DISPATCH_ENABLED', '0');
+    await triggerDownloadWorkflow();
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 
   it('keeps the dispatch timeout at its explicit bound', () => {

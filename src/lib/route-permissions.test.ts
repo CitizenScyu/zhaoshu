@@ -24,6 +24,7 @@ const policies: Record<string, Record<string, 'find' | 'read' | 'download' | 'ow
   'download/[id]/file': { GET: 'download' },
   // F16：过期下载租约的周期回收，只由 Vercel cron 以 CRON_SECRET 调用（见 route.test.ts）。
   'download/reclaim': { GET: 'cron' },
+  'admin/download-stats': { GET: 'owner' },
   export: { GET: 'find' },
   feedback: { GET: 'find', POST: 'find' }, find: { POST: 'find' },
   // 精确找书（task-77）：与 /api/find 同为「找书」能力，且同样会向豆瓣发外部请求，

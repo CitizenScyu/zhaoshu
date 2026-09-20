@@ -245,8 +245,10 @@ describe('GET /api/stats', () => {
     for (const [parts, ...values] of sql.mock.calls) {
       const text = parts.join('');
       if (text.includes('FROM download_tasks')) {
-        // 归属必须是会话里的 userId(2)，而不是查询串里的 userId=1。
-        expect(text).toContain('WHERE user_id =');
+        // 归属必须是会话里的 userId(2)，而不是查询串里的 userId=1；
+        // T6 起系统行 user_id 为 NULL，还必须限定 requested_by='user' 防串入系统任务。
+        expect(text).toContain('requested_by');
+        expect(text).toContain('user_id =');
         expect(values.at(-1)).toBe(2);
       }
       // F07：书架统计也按本人 userId 过滤（新口径是 DISTINCT ON 子查询 + GROUP BY status）。

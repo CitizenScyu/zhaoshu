@@ -37,6 +37,7 @@ vi.mock('@/lib/source-reader', async (original) => ({
   readSourceChapter: vi.fn().mockResolvedValue({ text: '' }),
 }));
 
+import { GET as downloadStatsGet } from '@/app/api/admin/download-stats/route';
 import { GET as libraryGet } from '@/app/api/library/route';
 import { GET as ownerGet } from '@/app/api/owner/route';
 import { GET as profileGet, PUT as profilePut, POST as profilePost } from '@/app/api/profile/route';
@@ -72,7 +73,10 @@ const MEMBER: Record<'findOnly' | 'reader' | 'downloader', Record<string, unknow
 };
 
 // §5.2 接口表的每一行受保护方法。path 用具体的动态参数，params 同步给出。
-const ROUTES: { name: string; path: string; method: string; handler: Handler; params?: Record<string, string>; requires: Capability }[] = [
+// memberDenial：owner-only 路由对已认证成员的拒绝码。/api/owner 只验显式口令头，
+// Cookie 会话连认证形态都不匹配 → 401；admin 读接口走 requireOwner（接受会话身份，
+// 成员是「已认证但非 owner」）→ 403。不标则沿用 owner-only 默认 401。
+const ROUTES: { name: string; path: string; method: string; handler: Handler; params?: Record<string, string>; requires: Capability; memberDenial?: 401 | 403 }[] = [
   { name: 'GET /api/profile', path: '/api/profile', method: 'GET', handler: profileGet as Handler, requires: 'find' },
   { name: 'PUT /api/profile', path: '/api/profile', method: 'PUT', handler: profilePut as Handler, requires: 'find' },
   { name: 'POST /api/profile', path: '/api/profile', method: 'POST', handler: profilePost as Handler, requires: 'find' },
@@ -96,6 +100,7 @@ const ROUTES: { name: string; path: string; method: string; handler: Handler; pa
   { name: 'GET /api/download/[id]/file', path: '/api/download/1/file', method: 'GET', handler: downloadFileGet as Handler, params: { id: '1' }, requires: 'download' },
   { name: 'GET /api/shuyuan', path: '/api/shuyuan', method: 'GET', handler: shuyuanGet as Handler, requires: 'download' },
   { name: 'POST /api/shuyuan', path: '/api/shuyuan', method: 'POST', handler: shuyuanPost as Handler, requires: 'download' },
+  { name: 'GET /api/admin/download-stats', path: '/api/admin/download-stats', method: 'GET', handler: downloadStatsGet as Handler, requires: 'owner-only', memberDenial: 403 },
   { name: 'GET /api/owner', path: '/api/owner', method: 'GET', handler: ownerGet as Handler, requires: 'owner-only' },
 ];
 
@@ -143,8 +148,12 @@ describe('§5.2 能力矩阵：逐一直接调用受保护方法', () => {
   for (const route of ROUTES) {
     for (const identity of ['anonymous', 'findOnly', 'reader', 'downloader', 'owner'] as IdentityName[]) {
       const allowed = isAllowed(route.requires, identity);
-      // owner-only 方法（/api/owner）对成员也只是一次失败的旧口令验证：401，不是 403。
-      const denial = route.requires === 'owner-only' ? 401 : identity === 'anonymous' ? 401 : 403;
+      // owner-only 方法对成员也只是一次失败的旧口令验证：401，不是 403；
+      // 但 requireOwner 守卫的 admin 路由接受会话身份、按角色判 403（admin-console 同款）。
+      // 匿名身份始终先死于 401（无凭据，不进入角色判定）。
+      const denial = identity === 'anonymous' ? 401
+        : route.requires === 'owner-only' ? route.memberDenial ?? 401
+        : 403;
       const expected = allowed ? '不被鉴权层拒绝' : String(denial);
       it(`${route.name} × ${identity} → ${expected}`, async () => {
         if (identity !== 'anonymous' && identity !== 'owner') {
@@ -169,7 +178,10 @@ describe('§5.2 能力矩阵：逐一直接调用受保护方法', () => {
       'GET /api/feedback', 'POST /api/feedback', 'GET /api/library', 'GET /api/stats', 'GET /api/export',
       'GET /api/read/[id]/[resource]', 'GET /api/read/source/[resource]',
       'GET /api/download', 'POST /api/download', 'DELETE /api/download', 'GET /api/download/[id]/file',
-      'GET /api/shuyuan', 'POST /api/shuyuan', 'GET /api/owner',
+      'GET /api/shuyuan', 'POST /api/shuyuan',
+      // T6 新增：管理员只读的下载漏斗聚合（requireOwner，非 §5.2 原表，同 §5.2 方式纳入）。
+      'GET /api/admin/download-stats',
+      'GET /api/owner',
     ]);
   });
 });

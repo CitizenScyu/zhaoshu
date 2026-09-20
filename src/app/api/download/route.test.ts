@@ -10,7 +10,13 @@ const { ensureSchema, getSql, sql, triggerDownloadWorkflow } = vi.hoisted(() => 
 
 vi.mock('@/lib/db', () => ({ ensureSchema, getSql }));
 vi.mock('@/lib/github', () => ({ triggerDownloadWorkflow }));
+vi.mock('@/lib/supported-sources', async (original) => ({
+  ...await original<typeof import('@/lib/supported-sources')>(),
+  engineHosts: vi.fn(async () => ['www.yingsx.com']),
+}));
+vi.mock('@/lib/shuyuan', () => ({ getEngineSources: vi.fn(async () => []) }));
 
+import { getEngineSources } from '@/lib/shuyuan';
 import { refreshSupportedHosts } from '@/lib/source-policy';
 import { DELETE, GET, POST } from './route';
 
@@ -57,6 +63,7 @@ describe('/api/download recovery and cleanup', () => {
   beforeEach(() => {
     vi.resetAllMocks();
     vi.stubEnv('APP_OWNER_TOKEN', 'download-test-owner');
+    vi.stubEnv('LEGACY_DOWNLOAD_DISPATCH_ENABLED', '1');
     vi.stubGlobal('fetch', vi.fn(() => { throw new Error('Unexpected network request'); }));
     ensureSchema.mockResolvedValue(undefined);
     getSql.mockReturnValue(sql);
@@ -190,10 +197,10 @@ describe('/api/download recovery and cleanup', () => {
     expect(await res.json()).toEqual({ taskId: 43 });
     expectSafeReclaim(1);
     // F03：活动锁只看 pending/running——partial（残缺终态）不阻塞重下补齐
-    expect(queryText(2)).toMatch(/WHERE user_id = \? AND book_id = \? AND status IN \('pending', 'running'\) ORDER BY created_at DESC LIMIT 1$/);
+    expect(queryText(2)).toMatch(/WHERE requested_by = 'user' AND user_id = \? AND book_id = \? AND status IN \('pending', 'running'\) ORDER BY created_at DESC LIMIT 1$/);
     expect(queryText(2)).not.toContain('partial');
     expect(queryText(3)).toMatch(/^INSERT INTO download_tasks /);
-    expect(sql.mock.calls[3].slice(1)).toEqual([1, book.id, book.title, book.author, book.source_url]);
+    expect(sql.mock.calls[3].slice(1)).toEqual([1, book.id, book.title, book.author, book.source_url, 'builtin', null, '']);
     expect(triggerDownloadWorkflow).toHaveBeenCalledOnce();
   });
 
@@ -268,6 +275,23 @@ describe('/api/download recovery and cleanup', () => {
     expect(fetch).not.toHaveBeenCalled();
   });
 
+  it('admitted engine requests persist source identity/revision and never wake the legacy builtin worker', async () => {
+    vi.mocked(getEngineSources).mockResolvedValueOnce([{ url:'https://www.yingsx.com/', name:'合成源', searchUrl:'/search', rules:{ ruleContent:{content:'.body'} }, tier:'M1' }]);
+    sql.mockResolvedValueOnce([{...book,source_url:'https://www.yingsx.com/book/7'}]).mockResolvedValueOnce([]).mockResolvedValueOnce([]).mockResolvedValueOnce([{id:43}]);
+    expect((await POST(request('POST',{bookId:7}))).status).toBe(201);
+    expect(sql.mock.calls[3].slice(-3)).toEqual(['engine','https://www.yingsx.com/',expect.stringMatching(/^[a-f0-9]{40}$/)]);
+    expect(triggerDownloadWorkflow).not.toHaveBeenCalled();
+  });
+
+  it('dispatch defaults off: creation succeeds and client cannot create system requests', async () => {
+    vi.stubEnv('LEGACY_DOWNLOAD_DISPATCH_ENABLED', '');
+    sql.mockResolvedValueOnce([book]).mockResolvedValueOnce([]).mockResolvedValueOnce([]).mockResolvedValueOnce([{ id: 43 }]);
+    expect((await POST(request('POST', { bookId: 7, requestedBy: 'system', userId: 2 }))).status).toBe(201);
+    expect(queryText(3)).toContain("'user'");
+    expect(sql.mock.calls[3][1]).toBe(1);
+    expect(triggerDownloadWorkflow).not.toHaveBeenCalled();
+  });
+
   it('保留缺来源的错误契约', async () => {
     sql.mockResolvedValueOnce([{ ...book, source_url: '' }]);
     const res = await POST(request('POST', { bookId: book.id }));
@@ -281,7 +305,7 @@ describe('/api/download recovery and cleanup', () => {
     sql.mockResolvedValueOnce([{ ...book, source_url: 'https://BOOK15.NET:443/books/details7.html#chapters' }])
       .mockResolvedValueOnce([]).mockResolvedValueOnce([]).mockResolvedValueOnce([{ id: 43 }]);
     expect((await POST(request('POST', { bookId: book.id, sourceUrl: 'https://127.0.0.1/private' }))).status).toBe(201);
-    expect(sql.mock.calls[3].slice(1)).toEqual([1, book.id, book.title, book.author, book.source_url]);
+    expect(sql.mock.calls[3].slice(1)).toEqual([1, book.id, book.title, book.author, book.source_url, 'builtin', null, '']);
     expect(triggerDownloadWorkflow).toHaveBeenCalledOnce();
   });
 
@@ -291,13 +315,13 @@ describe('/api/download recovery and cleanup', () => {
     sql.mockResolvedValueOnce([{ ...book, source_url: wwwUrl }])
       .mockResolvedValueOnce([]).mockResolvedValueOnce([]).mockResolvedValueOnce([{ id: 43 }]);
     expect((await POST(request('POST', { bookId: book.id }))).status).toBe(201);
-    expect(sql.mock.calls[3].slice(1)).toEqual([1, book.id, book.title, book.author, wwwUrl]);
+    expect(sql.mock.calls[3].slice(1)).toEqual([1, book.id, book.title, book.author, wwwUrl, 'builtin', null, '']);
     expect(triggerDownloadWorkflow).toHaveBeenCalledOnce();
   });
 
-  it('M2-4：引擎档 host（运行时门已放行）被下载能力门拒绝，不回收/去重/入队/dispatch', async () => {
+  it('T6：引擎档 host 虽准入但已不在可用池，被下载能力门拒绝，不回收/去重/入队/dispatch', async () => {
     // 运行时门（supportedHosts）经 cron 准入并入引擎 host 后 validateSourceUrl 会放行该 host；
-    // 下载 worker 只认 builtin 适配器，故按 SUPPORTED_SOURCE_HOSTS 二次收窄拒绝——可读不可下。
+    // 仅 host 准入不足以下载：还必须在非 disabled / 非 failed 的可用引擎池。
     const engineUrl = 'https://www.yingsx.com/books/1.html';
     refreshSupportedHosts(['www.yingsx.com']);
     try {
@@ -354,7 +378,7 @@ describe('/api/download recovery and cleanup', () => {
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual({ ok: true });
     expect(sql).toHaveBeenCalledOnce();
-    expect(queryText(0)).toMatch(/^DELETE FROM download_tasks WHERE id = \? AND user_id = \? AND status IN \('pending', 'failed', 'partial', 'superseded_by_incomplete'\) RETURNING id$/);
+    expect(queryText(0)).toMatch(/^DELETE FROM download_tasks WHERE id = \? AND requested_by = 'user' AND user_id = \? AND status IN \('pending', 'failed', 'partial', 'superseded_by_incomplete'\) RETURNING id$/);
     expect(sql.mock.calls[0].slice(1)).toEqual([recoveredTask.id, 1]);
   });
 

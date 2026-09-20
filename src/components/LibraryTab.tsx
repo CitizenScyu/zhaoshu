@@ -39,6 +39,9 @@ interface DownloadTask {
   updatedAt: string;
   // 派生状态：running 且 worker 心跳过期。GET 保持只读，由这里暴露给 UI 做受控重试。
   leaseExpired?: boolean;
+  requestedBy?: 'user' | 'system';
+  retryOf?: number | null;
+  artifactId?: string | null;
 }
 
 const FIELD_LABELS: [string, string][] = [
@@ -93,6 +96,9 @@ function parseTask(data: unknown): DownloadTask | null {
     error: typeof t.error === 'string' ? t.error : null,
     updatedAt: typeof t.updatedAt === 'string' ? t.updatedAt : '',
     leaseExpired: t.leaseExpired === true,
+    requestedBy: t.requestedBy === 'system' ? 'system' : 'user',
+    retryOf: typeof t.retryOf === 'number' ? t.retryOf : null,
+    artifactId: t.artifactId == null ? null : String(t.artifactId),
   };
 }
 
@@ -347,7 +353,7 @@ export default function LibraryTab({ view, setView }: {
 
   async function startDownload() {
     // 心跳过期的 running 视为可重试：POST 会先回收僵尸租约再建任务。
-    if (!detail || dlBusy || task?.status === 'done' || (task?.status === 'running' && !task.leaseExpired)) return;
+    if (task?.requestedBy === 'system' || !detail || dlBusy || task?.status === 'done' || (task?.status === 'running' && !task.leaseExpired)) return;
     const my = ++dlRequestId.current;
     setDlBusy(true);
     setDlError('');
@@ -401,6 +407,7 @@ export default function LibraryTab({ view, setView }: {
   }
 
   async function removeDownload() {
+    if (task?.requestedBy === 'system') return;
     if (!task || dlBusy || (task.status !== 'pending' && task.status !== 'failed' && task.status !== 'partial'
       && task.status !== 'superseded_by_incomplete')) return;
     const failureMessage = task.status === 'failed' ? '清理失败' : '取消失败';
@@ -428,6 +435,7 @@ export default function LibraryTab({ view, setView }: {
   }
 
   async function retrieveFile() {
+    if (task?.requestedBy === 'system') return;
     if (!task) return;
     try {
       const res = await apiFetch(`/api/download/${task.id}/file`);
@@ -523,13 +531,16 @@ export default function LibraryTab({ view, setView }: {
                     style={{ color: task.status === 'failed' || (task.status === 'running' && task.leaseExpired) ? 'var(--cinnabar)' : task.status === 'partial' || task.status === 'superseded_by_incomplete' ? 'var(--dai)' : 'var(--ink-soft)' }}
                   >
                     {downloadStatusText(task)}
+                    {task.requestedBy === 'system' && ' · 系统任务（只读）'}
+                    {task.retryOf != null && ` · 重试自 #${task.retryOf}`}
+                    {task.artifactId != null && ` · 产物 #${task.artifactId}`}
                   </span>
-                  {task.status === 'done' && (
+                  {task.requestedBy !== 'system' && task.status === 'done' && (
                     <button className="chip text-sm" onClick={() => void retrieveFile()}>
                       取回文件
                     </button>
                   )}
-                  {(task.status === 'failed' || task.status === 'pending' || task.status === 'partial' || task.status === 'superseded_by_incomplete'
+                  {task.requestedBy !== 'system' && (task.status === 'failed' || task.status === 'pending' || task.status === 'partial' || task.status === 'superseded_by_incomplete'
                     || (task.status === 'running' && task.leaseExpired)) && (
                     <button
                       className="chip chip-dai text-sm disabled:opacity-50"
@@ -539,7 +550,7 @@ export default function LibraryTab({ view, setView }: {
                       {dlBusy ? '处理中…' : '重试'}
                     </button>
                   )}
-                  {(task.status === 'pending' || task.status === 'failed' || task.status === 'partial'
+                  {task.requestedBy !== 'system' && (task.status === 'pending' || task.status === 'failed' || task.status === 'partial'
                     || task.status === 'superseded_by_incomplete') && (
                     <button className="chip text-sm" onClick={() => void removeDownload()} disabled={dlBusy}>
                       {task.status === 'pending' ? '取消' : '清理'}
