@@ -1,7 +1,10 @@
 // T8 验收：执行器端到端（PGlite 真库 + 合成抓取 + 内存 GitHubContents，禁真网络/真 DB）。
 // 覆盖：完整五阶段、partial 零发布、失权停止（无终态）、任务预算耗尽→可续传 partial、
 // code=2 源不可用、日预算耗尽→BUDGET_EXHAUSTED 且任务回退 pending、空队列 NO_TASK。
-import { beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { tmpdir } from 'node:os';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { join } from 'node:path';
 import { createSchema, loadPGlite, makeSqlTag, type PGliteLike } from './testing/pglite';
 import { createWorkerStorage, type DownloadSql } from './storage';
 import { createExecutor, DEFAULT_DECISIONS, type DailyBudgetLike } from './executor';
@@ -9,6 +12,8 @@ import type { SourceAdapter } from '../src/lib/download-worker';
 import type { GitHubContents } from '../src/lib/download-publisher';
 import { gitBlobSha, snapshotPaths } from '../src/lib/download-publisher';
 import { createEngineAdapter } from '../src/lib/download-worker';
+import { downloadBook } from '../scripts/engine-download.mjs';
+import { assembleEngineModules, createResolveSource } from './engine';
 
 const PGliteCtor = await loadPGlite();
 const maybe = PGliteCtor ? describe : describe.skip;
@@ -62,6 +67,11 @@ maybe('T8 执行器端到端：领取 → 合成抓取 → 五阶段发布 → D
   let pg: PGliteLike;
   let sql: DownloadSql;
   let github: MemoryGitHub;
+  const tmpDirs: string[] = [];
+
+  afterEach(() => {
+    while (tmpDirs.length) rmSync(tmpDirs.pop()!, { recursive: true, force: true });
+  });
 
   const insertTask = async (status = 'pending', sourceKind = 'engine'): Promise<number> => {
     const rows = await pg.query(
@@ -130,6 +140,35 @@ maybe('T8 执行器端到端：领取 → 合成抓取 → 五阶段发布 → D
     expect(state.status).toBe('partial');
     expect(state.error).toContain('source_unavailable');
     expect(github.calls).toHaveLength(0);
+  });
+
+  it('code=2 端到端：真实 createResolveSource 抛 ResolveSourceError(2) → 真实 downloadBook → source_unavailable partial', async () => {
+    // 发现 3：走真实 createResolveSource + 真实 downloadBook（非 stub），钉住 code=2 的
+    // 端到端转译（resolve 抛 code 2 → downloadBook failureCode=2 → errors[source_unavailable]
+    // → adapter incomplete → 任务 partial）。非 https URL 触发 ResolveSourceError(2)。
+    const rows = await pg.query(
+      `INSERT INTO download_tasks(user_id, book_id, title, author, status, source_url, requested_by, source_kind)
+       VALUES (NULL, 1, '测试书', '佚名', 'pending', 'http://book15.net/books/1.html', 'system', 'engine') RETURNING id`,
+    );
+    const id = Number((rows.rows[0] as { id: number }).id);
+    const outRoot = mkdtempSync(join(tmpdir(), 't8-resolve-'));
+    tmpDirs.push(outRoot);
+    const modules = assembleEngineModules();
+    const adapter = createEngineAdapter({
+      downloadBook: downloadBook as never,
+      modules,
+      resolveSource: createResolveSource(modules),
+      readBookText: async () => { throw new Error('should not read book on code=2'); },
+      outRoot,
+      sourceKind: 'engine',
+    });
+    const executor = createExecutor(deps([adapter], fakeBudget()));
+    expect(await executor.runOnce()).toBe(DEFAULT_DECISIONS.TASK_DONE);
+    const state = await taskState(id);
+    expect(state.status).toBe('partial');
+    expect(state.error).toContain('source_unavailable');
+    expect(github.calls).toHaveLength(0);
+    expect((await pg.query('SELECT count(*)::int AS n FROM book_artifacts')).rows[0].n).toBe(0);
   });
 
   it('失权停止：抓取中租约被收回 → 无终态写入、无发布；决策 TASK_DONE（任务已尝试）', async () => {

@@ -127,7 +127,11 @@ export function createSourceTransport(limiter?: RateLimiterLike): SourceTranspor
     } catch (error) {
       const status = (error as { status?: unknown })?.status;
       // 源站行为类错误（SourceHttpError 带 status，含 429）计入熔断；网络/中止不算源站失败。
-      if (limiter && typeof status === 'number') limiter.recordFailure?.(key);
+      // 429/503 若带 Retry-After（SourceHttpError.retryAfterMs 已解析）则传给限速器尊重退避窗口。
+      if (limiter && typeof status === 'number') {
+        const retryAfterMs = (error as { retryAfterMs?: unknown })?.retryAfterMs;
+        limiter.recordFailure?.(key, typeof retryAfterMs === 'number' ? { retryAfterMs } : undefined);
+      }
       throw error;
     }
   };

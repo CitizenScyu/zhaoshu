@@ -16,6 +16,7 @@ import { createGitHubContents } from './github-contents';
 import { assembleEngineModules, createResolveSource, createSourceTransport, type EngineModules, type RateLimiterLike, type ResolvedSource } from './engine';
 import { readBookText } from './read-book-text';
 import { resolveRepositoryId } from './repository';
+import { withoutProcessSignals } from './without-process-signals';
 import { createExecutor, DEFAULT_DECISIONS, type DailyBudgetLike, type DownloadExecutor, type LoopDecisions } from './executor';
 
 export type { DownloadExecutor, DailyBudgetLike, LoopDecisions } from './executor';
@@ -65,6 +66,7 @@ export async function createDownloadExecutor(options: ProductionExecutorOptions)
   const github = options.github ?? createGitHubContents({
     token: requiredEnv(env, 'GITHUB_TOKEN'),
     repository: requiredEnv(env, 'GITHUB_REPOSITORY'),
+    branch, // 与 resolveRepositoryId 反查的同一条 branch，读写不落默认分支
   });
 
   const modules = options.modules ?? assembleEngineModules();
@@ -72,14 +74,19 @@ export async function createDownloadExecutor(options: ProductionExecutorOptions)
   const transport = options.transport ?? createSourceTransport(options.rateLimiter);
 
   const outRoot = join(options.workDir, 'out');
+  // 常驻 drain：包一层去掉 downloadBook 对 process 的 SIGINT/SIGTERM 注册（外部停机由 hooks.signal
+  // 覆盖）；不然每本调用累积进程监听。并发=1，同一时刻只有一次 downloadBook 在跑。
+  const engineDownload = withoutProcessSignals(
+    (options.engineDownload ?? downloadBook) as unknown as (...a: unknown[]) => Promise<unknown>,
+  ) as unknown as EngineDownloadLike;
   const adapters = options.adapters ?? ([
     createEngineAdapter({
-      downloadBook: (options.engineDownload ?? downloadBook) as unknown as EngineDownloadLike,
+      downloadBook: engineDownload,
       modules, resolveSource, transport, readBookText, outRoot, sourceKind: 'engine',
     }),
     // builtin book15 任务（source_kind='builtin'）走同一 downloadBook 的 source-parser 分支。
     createEngineAdapter({
-      downloadBook: (options.engineDownload ?? downloadBook) as unknown as EngineDownloadLike,
+      downloadBook: engineDownload,
       modules, resolveSource, transport, readBookText, outRoot, sourceKind: 'builtin',
     }),
   ]);

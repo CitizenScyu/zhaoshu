@@ -13,6 +13,11 @@ export interface GitHubContentsOptions {
   token: string;
   /** owner/repo（现役键 GITHUB_REPOSITORY 形态）。 */
   repository: string;
+  /**
+   * 发布目标分支（DOWNLOAD_TARGET_BRANCH 反查 storage_repositories 出的同一条 branch）。
+   * GET 带 `?ref=`、PUT body 带 `branch`，避免 contents API 落到仓库默认分支导致 DB 登记与真实写入分叉。
+   */
+  branch: string;
   fetchImpl?: typeof fetch;
   timeoutMs?: number;
 }
@@ -28,7 +33,8 @@ function httpError(status: number): Error {
   return Object.assign(new Error(`github_http_${status}`), { status });
 }
 
-export function createGitHubContents({ token, repository, fetchImpl = fetch, timeoutMs = 60_000 }: GitHubContentsOptions): GitHubContents {
+export function createGitHubContents({ token, repository, branch, fetchImpl = fetch, timeoutMs = 60_000 }: GitHubContentsOptions): GitHubContents {
+  if (!branch) throw new Error('createGitHubContents requires branch');
   const headers = {
     Authorization: `Bearer ${token}`,
     Accept: 'application/vnd.github+json',
@@ -37,9 +43,11 @@ export function createGitHubContents({ token, repository, fetchImpl = fetch, tim
   };
   const request = (url: string, init: RequestInit = {}) =>
     fetchImpl(url, { ...init, headers: { ...headers, ...(init.headers ?? {}) }, signal: AbortSignal.timeout(timeoutMs) });
+  // GET 落到 `?ref=<branch>`，与 PUT body 的 branch 同一条，读写不分叉到默认分支。
+  const withRef = (url: string) => `${url}?ref=${encodeURIComponent(branch)}`;
 
   async function currentSha(url: string): Promise<string | null> {
-    const res = await request(url);
+    const res = await request(withRef(url));
     if (res.status === 404) return null;
     if (!res.ok) throw httpError(res.status);
     const value = (await res.json()) as { sha?: unknown };
@@ -56,6 +64,7 @@ export function createGitHubContents({ token, repository, fetchImpl = fetch, tim
         body: JSON.stringify({
           message,
           content: Buffer.from(text, 'utf8').toString('base64'),
+          branch,
           ...(sha ? { sha } : {}),
         }),
       });
@@ -64,7 +73,7 @@ export function createGitHubContents({ token, repository, fetchImpl = fetch, tim
 
     async getBytes(path) {
       const { url } = apiUrl(repository, path);
-      const res = await request(url);
+      const res = await request(withRef(url));
       if (res.status === 404) return null;
       if (!res.ok) throw httpError(res.status);
       const value = (await res.json()) as { encoding?: unknown; content?: unknown };

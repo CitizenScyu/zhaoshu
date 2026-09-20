@@ -158,6 +158,20 @@ describe('www.book15.net 同站兜底与超时拆段', () => {
     expect(fetchMock).toHaveBeenCalledOnce();
   });
 
+  it('parses Retry-After (seconds) into retryAfterMs on SourceHttpError', async () => {
+    // 429 带 Retry-After 秒数 → SourceHttpError.retryAfterMs 供限速器尊重退避窗口。
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('', { status: 429, headers: { 'retry-after': '5' } })));
+    await expect(fetchSourceText('https://book15.net/', options())).rejects.toMatchObject({ status: 429, retryAfterMs: 5000 });
+  });
+
+  it('leaves retryAfterMs undefined when Retry-After absent', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('', { status: 429 })));
+    await fetchSourceText('https://book15.net/', options()).catch((e: { status: number; retryAfterMs?: number }) => {
+      expect(e.status).toBe(429);
+      expect(e.retryAfterMs).toBeUndefined();
+    });
+  });
+
   it('aborts a stalled connect phase at connectTimeoutMs and falls back to the alternate host', async () => {
     vi.useFakeTimers();
     // apex：fetch 永不 settle（连接挂起）；www：返回正常正文。显式传 3s 与默认用例互补。

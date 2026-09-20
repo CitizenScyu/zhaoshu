@@ -178,7 +178,7 @@ async function attemptOnce(start: URL, {
         current = next;
         continue;
       }
-      if (!response.ok) throw new SourceHttpError(response.status);
+      if (!response.ok) throw new SourceHttpError(response.status, parseRetryAfterMs(response.headers.get('retry-after')));
       const text = await responseText(response, signal, maxBytes);
       signal.throwIfAborted();
       return { url: current, text };
@@ -191,5 +191,25 @@ async function attemptOnce(start: URL, {
 }
 
 export class SourceHttpError extends Error {
-  constructor(readonly status: number) { super('书源 HTTP ' + status); }
+  // retryAfterMs：源站 Retry-After 头（429/503 等）解析成的毫秒退避；缺省/不可解析为 undefined。
+  // 只保留状态与退避量，绝不透传响应体（可能含服务端回显）。
+  constructor(readonly status: number, readonly retryAfterMs?: number) { super('书源 HTTP ' + status); }
+}
+
+/**
+ * 解析 HTTP Retry-After 头 → 毫秒。支持两种形态（RFC 7231 §7.1.3）：
+ * 纯秒（`Retry-After: 120`）与 HTTP-date（`Retry-After: Wed, 21 Oct 2015 07:28:00 GMT`）。
+ * 无值/非法/负值 → undefined（由调用方决定不带退避）。
+ */
+export function parseRetryAfterMs(value: string | null): number | undefined {
+  if (!value) return undefined;
+  const trimmed = value.trim();
+  if (/^\d+$/.test(trimmed)) {
+    const seconds = Number(trimmed);
+    return Number.isSafeInteger(seconds) && seconds >= 0 ? seconds * 1000 : undefined;
+  }
+  const at = Date.parse(trimmed);
+  if (Number.isNaN(at)) return undefined;
+  const delta = at - Date.now();
+  return delta > 0 ? delta : 0;
 }
