@@ -76,6 +76,8 @@ export type ShuyuanAdmissionFunnel = {
   /** 被拒源的必需组缺失分布（新拒原因当天可见；不在 ENGINE_DEFAULT_FIELDS 的字段）。 */
   miss_chapter_list: number;
   miss_chapter_name: number;
+  /** compile 拒绝按 machine-readable code 聚合，避免依赖本地化 message。 */
+  rejection_codes: Record<string, number>;
 };
 export type ShuyuanPoolHealth = {
   readingPoolSize: number;
@@ -521,7 +523,10 @@ export async function getShuyuanPoolHealth(signal: AbortSignal): Promise<Shuyuan
     enginePoolSize: pool.enginePoolSize,
     poolCandidates: pool.poolCandidates,
     // 空表与无行都返回 0（count FILTER 恒返回一行；缺失时保守取 0）。
-    admission: admissionRows[0] ?? { ok: 0, deferred: 0, rejected: 0, url_defaulted: 0, miss_chapter_list: 0, miss_chapter_name: 0 },
+    admission: admissionRows[0] ?? {
+      ok: 0, deferred: 0, rejected: 0, url_defaulted: 0,
+      miss_chapter_list: 0, miss_chapter_name: 0, rejection_codes: {},
+    },
     refreshedAtAgeHours: Number.isFinite(refreshedMs)
       ? Math.max(0, Math.round((Date.now() - refreshedMs) / 3_600_000 * 10) / 10)
       : null,
@@ -541,7 +546,17 @@ function readAdmissionFunnel(s: Sql, signal: AbortSignal): Promise<ShuyuanAdmiss
            count(*) FILTER (WHERE NOT compile_ok
              AND (core_field_mask->>'ruleToc.chapterList') IS DISTINCT FROM 'true')::int AS miss_chapter_list,
            count(*) FILTER (WHERE NOT compile_ok
-             AND (core_field_mask->>'ruleToc.chapterName') IS DISTINCT FROM 'true')::int AS miss_chapter_name
+             AND (core_field_mask->>'ruleToc.chapterName') IS DISTINCT FROM 'true')::int AS miss_chapter_name,
+           COALESCE((
+             SELECT jsonb_object_agg(code, n)
+             FROM (
+               SELECT diagnostic->>'code' AS code, count(*)::int AS n
+               FROM source_admission a
+               CROSS JOIN LATERAL jsonb_array_elements(a.compile_diagnostics) diagnostic
+               WHERE NOT a.compile_ok AND diagnostic ? 'code'
+               GROUP BY diagnostic->>'code'
+             ) rejection_counts
+           ), '{}'::jsonb) AS rejection_codes
     FROM source_admission`, signal);
 }
 
@@ -867,7 +882,8 @@ async function runAdmissionAfterRefresh(
 async function readAdmissionRows(s: Sql, urls: string[], signal: AbortSignal): Promise<Map<string, AdmissionSourceRow>> {
   const rows = await readRows<AdmissionSourceRow>(s, s`
     SELECT source_url, tier, compile_ok, core_field_mask, search_ok,
-           search_verdict, search_checked_at::text AS search_checked_at, rules_hash, host, error
+           search_verdict, search_checked_at::text AS search_checked_at, rules_hash,
+           engine_semantics_version, host, error, compile_diagnostics
     FROM source_admission
     WHERE source_url IN (
       SELECT source_url FROM jsonb_to_recordset(${JSON.stringify(urls.map((source_url) => ({ source_url })))}::jsonb)
@@ -878,14 +894,18 @@ async function readAdmissionRows(s: Sql, urls: string[], signal: AbortSignal): P
 async function writeAdmissionRows(s: Sql, rows: AdmissionSourceRow[]): Promise<void> {
   await s`
     INSERT INTO source_admission
-      (source_url, tier, compile_ok, core_field_mask, search_ok, search_verdict, search_checked_at, rules_hash, host, error)
-    SELECT source_url, tier, compile_ok, core_field_mask, search_ok, search_verdict, search_checked_at, rules_hash, host, error
+      (source_url, tier, compile_ok, core_field_mask, search_ok, search_verdict, search_checked_at, rules_hash,
+       engine_semantics_version, host, error, compile_diagnostics)
+    SELECT source_url, tier, compile_ok, core_field_mask, search_ok, search_verdict, search_checked_at, rules_hash,
+           engine_semantics_version, host, error, compile_diagnostics
     FROM jsonb_to_recordset(${JSON.stringify(rows)}::jsonb)
       AS t(source_url text, tier text, compile_ok boolean, core_field_mask jsonb, search_ok boolean,
-           search_verdict text, search_checked_at timestamptz, rules_hash text, host text, error text)
+           search_verdict text, search_checked_at timestamptz, rules_hash text,
+           engine_semantics_version integer, host text, error text, compile_diagnostics jsonb)
     ON CONFLICT (source_url) DO UPDATE SET
       tier = EXCLUDED.tier, compile_ok = EXCLUDED.compile_ok, core_field_mask = EXCLUDED.core_field_mask,
       search_ok = EXCLUDED.search_ok, search_verdict = EXCLUDED.search_verdict,
       search_checked_at = EXCLUDED.search_checked_at, rules_hash = EXCLUDED.rules_hash,
-      host = EXCLUDED.host, error = EXCLUDED.error`;
+      engine_semantics_version = EXCLUDED.engine_semantics_version,
+      host = EXCLUDED.host, error = EXCLUDED.error, compile_diagnostics = EXCLUDED.compile_diagnostics`;
 }

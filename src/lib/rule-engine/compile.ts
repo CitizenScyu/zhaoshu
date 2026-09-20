@@ -5,6 +5,17 @@ import { sourceRevision } from '@/lib/source-revision';
 import { parseFieldRule } from './parse';
 import type { CompiledRules } from './types';
 
+export const ENGINE_SEMANTICS_VERSION = 1;
+
+export function engineVersionedKey(contentRevision: string, semanticsVersion = ENGINE_SEMANTICS_VERSION): string {
+  return `${semanticsVersion}:${contentRevision}`;
+}
+
+/** 内容 identity 与引擎语义 identity 的唯一组合口径。 */
+export function engineSourceRevision(source: { url: string; searchUrl: unknown; rules: Record<string, unknown> }): string {
+  return engineVersionedKey(sourceRevision(source));
+}
+
 const RULE_GROUPS = ['ruleSearch', 'ruleBookInfo', 'ruleContent', 'ruleToc', 'ruleExplore'] as const;
 
 /** LRU 上限：单测/低并发下足够；无关热路径，只防规则对象无限积累。 */
@@ -17,7 +28,7 @@ const cache = new Map<string, CompiledRules>();
  * 阻断语义由准入（滤网 1）与字段层（§3.4）决定，此处只做无异常的物化。
  */
 export function compileSource(source: { url: string; searchUrl: unknown; rules: Record<string, unknown> }): CompiledRules {
-  const key = sourceRevision(source);
+  const key = engineSourceRevision(source);
   const hit = cache.get(key);
   if (hit) {
     cache.delete(key); // 触达即续期（Map 插入序 = LRU 序）

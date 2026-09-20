@@ -5,6 +5,7 @@ import {
   ADMISSION_RETEST_INTERVAL_MS, admissionBucket, compileAdmission, runAdmissionBatch, searchAdmission,
   rulesHash, type AdmissionSourceRow, type AdmissionTransport,
 } from './admission';
+import { ENGINE_SEMANTICS_VERSION, engineVersionedKey } from './compile';
 import { isForbiddenHostAddress, validateSourceUrl } from '@/lib/source-policy';
 import type { RawSource } from './compile-smoke';
 
@@ -26,7 +27,8 @@ const signal = () => new AbortController().signal;
 function sourceRow(url: string, over: Partial<AdmissionSourceRow> = {}): AdmissionSourceRow {
   return {
     source_url: url, tier: 'T7', compile_ok: false, core_field_mask: {}, search_ok: null,
-    search_verdict: '', search_checked_at: null, rules_hash: '', host: '', error: '', ...over,
+    search_verdict: '', search_checked_at: null, rules_hash: '', engine_semantics_version: 0,
+    host: '', error: '', compile_diagnostics: [], ...over,
   };
 }
 
@@ -868,9 +870,7 @@ describe('导出面红线（任务 4 结构断言的前置）', () => {
   });
 });
 
-// M1 任务 4 硬性要求 0（M1 任务 3 复审 P1-1 收口）：rulesHash 与 reader 的 sourceRevision
-// 必须走同一实现。断言 = 同一 source 经两处取 hash 输出相同，且不再是旧的「整份源键排序 sha1」。
-describe('rulesHash 与 sourceRevision 同源（M1 任务 4 硬性要求 0）', () => {
+describe('rulesHash 纳入引擎语义版本', () => {
   const oldStableHash = (source: unknown): string => {
     const stable = JSON.stringify(source, (_key, item: unknown) =>
       item && typeof item === 'object' && !Array.isArray(item)
@@ -879,12 +879,12 @@ describe('rulesHash 与 sourceRevision 同源（M1 任务 4 硬性要求 0）', 
     return createHash('sha1').update(stable ?? '').digest('hex');
   };
 
-  it('rulesHash({url,searchUrl,rules}) === sourceRevision(source)（同一实现）', async () => {
+  it('内容 revision 保持同源，并增加可见的语义版本前缀', async () => {
     const { sourceRevision } = await import('@/lib/source-revision');
     const source = syntheticSource('https://same.example.com/');
-    expect(rulesHash(source)).toBe(sourceRevision({
+    expect(rulesHash(source)).toBe(`${ENGINE_SEMANTICS_VERSION}:${sourceRevision({
       url: source.bookSourceUrl as string, searchUrl: source.searchUrl, rules: source,
-    }));
+    })}`);
     // 反证：不再是对整份源键排序序列化的旧实现（旧值会与任一字段顺序无关）。
     expect(rulesHash(source)).not.toBe(oldStableHash(source));
   });
@@ -892,5 +892,48 @@ describe('rulesHash 与 sourceRevision 同源（M1 任务 4 硬性要求 0）', 
   it('规则变化（含 searchUrl）即哈希变化', async () => {
     const base = syntheticSource('https://changed.example.com/');
     expect(rulesHash(base)).not.toBe(rulesHash({ ...base, searchUrl: 'https://changed.example.com/other?q={{key}}' }));
+  });
+
+  it('语义版本升级会改变缓存/准入 identity，即使源内容不变', () => {
+    expect(engineVersionedKey('same-content', 1)).not.toBe(engineVersionedKey('same-content', 2));
+  });
+
+  it('预置旧语义 rulesHash 的 compile_rejected 行会失效并重评', async () => {
+    const source = syntheticSource('https://version.example.com/');
+    const { sourceRevision } = await import('@/lib/source-revision');
+    const legacyHash = sourceRevision({
+      url: source.bookSourceUrl as string, searchUrl: source.searchUrl, rules: source,
+    });
+    const result = await runAdmissionBatch({
+      candidates: [{ url: 'https://version.example.com/', source }],
+      declaredHosts: new Set(['version.example.com']),
+      existing: new Map([['https://version.example.com/', sourceRow('https://version.example.com/', {
+        compile_ok: false, rules_hash: legacyHash, engine_semantics_version: 0,
+      })]]),
+      fetchPage: vi.fn<AdmissionTransport>(), signal: signal(), maxProbes: 0,
+    });
+    expect(result.rows).toHaveLength(1);
+    expect(result.rows[0]).toMatchObject({
+      compile_ok: true, search_ok: null, rules_hash: rulesHash(source),
+      engine_semantics_version: ENGINE_SEMANTICS_VERSION,
+    });
+  });
+
+  it('预置旧语义 rulesHash 的 search_ok 不会复用，先失效为待探测', async () => {
+    const source = syntheticSource('https://search-version.example.com/');
+    const result = await runAdmissionBatch({
+      candidates: [{ url: 'https://search-version.example.com/', source }],
+      declaredHosts: new Set(['search-version.example.com']),
+      existing: new Map([['https://search-version.example.com/', sourceRow('https://search-version.example.com/', {
+        tier: 'M1', compile_ok: true, search_ok: true, search_verdict: 'ok',
+        rules_hash: '0:legacy-content', engine_semantics_version: 0,
+      })]]),
+      fetchPage: vi.fn<AdmissionTransport>(), signal: signal(), maxProbes: 0,
+    });
+    expect(result.rows).toHaveLength(1);
+    expect(result.rows[0]).toMatchObject({
+      compile_ok: true, search_ok: null, search_verdict: '', rules_hash: rulesHash(source),
+      engine_semantics_version: ENGINE_SEMANTICS_VERSION,
+    });
   });
 });

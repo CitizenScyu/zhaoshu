@@ -17,7 +17,8 @@ import { parseFieldRule } from './parse';
 import {
   createScope, evaluateField, evaluateFieldNodes, insideNode, normalizeBody, type HtmlScope,
 } from './evaluate';
-import { RuleEngineError } from './types';
+import { RuleEngineError, type RuleDiagnostic } from './types';
+import { ENGINE_SEMANTICS_VERSION, engineSourceRevision } from './compile';
 
 // ---------------------------------------------------------------- 常量
 export const DEFAULT_ADMISSION_KEYWORD = '斗破苍穹';
@@ -55,7 +56,7 @@ export interface AdmissionCompile {
   tier: AdmissionTier;
   /** 13 核心字段的可用性位图（诊断用，设计 §4.3 core_field_mask）。 */
   coreFieldMask: Record<string, boolean>;
-  failures: { field: string; rule: string; message: string }[];
+  failures: { field: string; rule: string; message: string; diagnostic: RuleDiagnostic }[];
   /** 失败摘要（空串=通过），写进 source_admission.error。 */
   reason: string;
 }
@@ -118,7 +119,12 @@ export function compileAdmission(source: RawSource): AdmissionCompile {
       coreFieldMask[field] = true;
     } catch (error) {
       const message = error instanceof RuleEngineError ? error.message : String(error);
-      failures.push({ field, rule, message });
+      failures.push({
+        field, rule, message,
+        diagnostic: error instanceof RuleEngineError
+          ? (error.diagnostic ?? { code: 'unsupported_rule' })
+          : { code: 'unexpected_compile_error' },
+      });
     }
   }
   // 必需组缺位判据（准入兼容 L2）：从「显式规则存在」升级为「显式规则存在或引擎默认可产」
@@ -416,8 +422,10 @@ export interface AdmissionSourceRow {
   search_verdict: string;
   search_checked_at: string | null;
   rules_hash: string;
+  engine_semantics_version: number;
   host: string;
   error: string;
+  compile_diagnostics: { field: string; code: string; operator?: '||' | '&&' | '%%' }[];
 }
 
 export interface AdmissionCandidate {
@@ -459,17 +467,21 @@ function hostOf(url: string): string {
 }
 
 /**
- * source_admission.rules_hash：与目录版本 sourceRevision **同一函数**（M1 任务 4 收口；
- * m2-scaleout §5.2 第 2 条 / §9 M2-3 验收 5）。入参形状由调用方按 reader 的
- * `{url, searchUrl, rules}` 组配——rules 传整个源对象，规则一变哈希即变。
+ * source_admission.rules_hash：内容 identity 沿用目录的 sourceRevision，再加引擎语义版本前缀。
+ * 入参形状由调用方按 reader 的 `{url, searchUrl, rules}` 组配——rules 传整个源对象；
+ * 源内容或引擎语义任一变化，准入 identity 都会变化。
  */
 export function rulesHash(source: unknown): string {
   const raw = (source && typeof source === 'object' ? source : {}) as RawSource;
-  return sourceRevision({
+  return engineSourceRevision({
     url: typeof raw.bookSourceUrl === 'string' ? raw.bookSourceUrl : '',
     searchUrl: raw.searchUrl,
-    rules: source,
+    rules: raw,
   });
+}
+
+function compileDiagnostics(compile: AdmissionCompile): AdmissionSourceRow['compile_diagnostics'] {
+  return compile.failures.map(({ field, diagnostic }) => ({ field, ...diagnostic }));
 }
 
 function isRetestDue(row: AdmissionSourceRow, nowMs: number): boolean {
@@ -558,7 +570,9 @@ export async function runAdmissionBatch(input: AdmissionBatchInput): Promise<Adm
       if (previous && previous.rules_hash === hash && previous.compile_ok === false) continue;
       rows.push({
         source_url: candidate.url, tier: 'T7', compile_ok: false, core_field_mask: compile.coreFieldMask,
-        search_ok: null, search_verdict: '', search_checked_at: null, rules_hash: hash, host, error: compile.reason,
+        search_ok: null, search_verdict: '', search_checked_at: null, rules_hash: hash,
+        engine_semantics_version: ENGINE_SEMANTICS_VERSION, host, error: compile.reason,
+        compile_diagnostics: compileDiagnostics(compile),
       });
       continue;
     }
@@ -580,8 +594,9 @@ export async function runAdmissionBatch(input: AdmissionBatchInput): Promise<Adm
       rows.push({
         source_url: candidate.url, tier: 'M1', compile_ok: true, core_field_mask: compile.coreFieldMask,
         search_ok: result.verdict === 'ok', search_verdict: result.verdict,
-        search_checked_at: now().toISOString(), rules_hash: hash, host,
-        error: result.error,
+        search_checked_at: now().toISOString(), rules_hash: hash,
+        engine_semantics_version: ENGINE_SEMANTICS_VERSION, host,
+        error: result.error, compile_diagnostics: [],
       });
       continue;
     }
@@ -589,7 +604,8 @@ export async function runAdmissionBatch(input: AdmissionBatchInput): Promise<Adm
     if (rulesChanged) {
       rows.push({
         source_url: candidate.url, tier: 'M1', compile_ok: true, core_field_mask: compile.coreFieldMask,
-        search_ok: null, search_verdict: '', search_checked_at: null, rules_hash: hash, host, error: '',
+        search_ok: null, search_verdict: '', search_checked_at: null, rules_hash: hash,
+        engine_semantics_version: ENGINE_SEMANTICS_VERSION, host, error: '', compile_diagnostics: [],
       });
     }
   }

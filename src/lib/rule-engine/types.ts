@@ -8,16 +8,25 @@ export type Tier = 'M1' | 'T7';
 /** 引擎错误码。编译期不支持构件 → RULE_UNSUPPORTED；求值期异常 → RULE_EVAL_FAILED。 */
 export type RuleEngineErrorCode = 'RULE_UNSUPPORTED' | 'RULE_EVAL_FAILED';
 
+/** 编译拒绝的稳定观测维度；message 只供人读，统计必须使用这里的 code。 */
+export type RuleDiagnostic = {
+  code: string;
+  /** 组合运算符共用一个 code，以 operator 保留细分桶。 */
+  operator?: '||' | '&&' | '%%';
+};
+
 export class RuleEngineError extends Error {
   readonly code: RuleEngineErrorCode;
   /** 触发错误的规则片段（诊断用，脱敏无害）。 */
   readonly rule?: string;
+  readonly diagnostic?: RuleDiagnostic;
 
-  constructor(code: RuleEngineErrorCode, message: string, rule?: string) {
+  constructor(code: RuleEngineErrorCode, message: string, rule?: string, diagnostic?: RuleDiagnostic) {
     super(message);
     this.name = 'RuleEngineError';
     this.code = code;
     this.rule = rule;
+    this.diagnostic = diagnostic;
   }
 }
 

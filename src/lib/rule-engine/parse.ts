@@ -10,6 +10,7 @@ import {
   MAX_REGEX_PATTERN_LENGTH,
   MAX_RULE_LENGTH,
   RegexSub,
+  RuleDiagnostic,
   RuleEngineError,
   RuleIr,
   TemplatePart,
@@ -17,8 +18,8 @@ import {
 } from './types';
 import { parseJsonPath } from './jsonpath';
 
-function unsupported(msg: string, rule: string): never {
-  throw new RuleEngineError('RULE_UNSUPPORTED', msg, rule);
+function unsupported(msg: string, rule: string, diagnostic: RuleDiagnostic): never {
+  throw new RuleEngineError('RULE_UNSUPPORTED', msg, rule, diagnostic);
 }
 
 // ---- 不支持构件（编译期一律拒绝，见 §0/§2.3 与任务 reject-list）----
@@ -31,11 +32,11 @@ const JS_EXPR_RE = /[=+*/%!<>?;]|java\.|Date\.|baseUrl\.|typeof|new\s|\breturn\b
  * 命中任何不支持构件 → RULE_UNSUPPORTED。
  */
 function rejectUnsupportedConstructs(rule: string): void {
-  if (rule.includes('@js:') || /<js\b|<js>/.test(rule)) unsupported('规则含 JS（@js:/<js>）', rule);
-  if (rule.includes('@put:')) unsupported('规则含 @put 变量存取', rule);
-  if (rule.includes('@get:')) unsupported('规则含 @get 变量存取', rule);
-  if (rule.trimStart().startsWith('match:')) unsupported('规则含 match: 正则', rule);
-  if (rule.includes('%%')) unsupported('规则含 %% 拼接（T7）', rule);
+  if (rule.includes('@js:') || /<js\b|<js>/.test(rule)) unsupported('规则含 JS（@js:/<js>）', rule, { code: 'unsupported_js' });
+  if (rule.includes('@put:')) unsupported('规则含 @put 变量存取', rule, { code: 'unsupported_var_put' });
+  if (rule.includes('@get:')) unsupported('规则含 @get 变量存取', rule, { code: 'unsupported_var_get' });
+  if (rule.trimStart().startsWith('match:')) unsupported('规则含 match: 正则', rule, { code: 'unsupported_regex_match' });
+  if (rule.includes('%%')) unsupported('规则含 %% 拼接（T7）', rule, { code: 'unsupported_operator', operator: '%%' });
   rejectUnsupportedTemplates(rule);
 }
 
@@ -51,9 +52,9 @@ function rejectUnsupportedTemplates(rule: string): void {
   while ((m = re.exec(rule)) !== null) {
     const inner = m[1].trim();
     if (inner.startsWith('$')) continue; // tpl_jsonpath（M1 支持）
-    if (inner.startsWith('@@')) unsupported('模板含 {{@@规则}}（tpl_rule）', rule);
-    if (JS_EXPR_RE.test(inner)) unsupported('模板含 JS 表达式（tpl_js_expr）', rule);
-    unsupported('模板含 {{变量}}（tpl_var）', rule);
+    if (inner.startsWith('@@')) unsupported('模板含 {{@@规则}}（tpl_rule）', rule, { code: 'unsupported_template_rule' });
+    if (JS_EXPR_RE.test(inner)) unsupported('模板含 JS 表达式（tpl_js_expr）', rule, { code: 'unsupported_template_js' });
+    unsupported('模板含 {{变量}}（tpl_var）', rule, { code: 'unsupported_template_var' });
   }
 }
 
@@ -76,13 +77,13 @@ function tryParseTemplate(segment: string, rule: string): TemplatePart[] | null 
   while ((m = re.exec(segment)) !== null) {
     if (m.index > last) parts.push({ kind: 'literal', text: segment.slice(last, m.index) });
     const inner = m[1].trim();
-    if (inner.startsWith('@@')) unsupported('模板含 {{@@规则}}（tpl_rule）', rule);
+    if (inner.startsWith('@@')) unsupported('模板含 {{@@规则}}（tpl_rule）', rule, { code: 'unsupported_template_rule' });
     if (inner.startsWith('$')) {
       parts.push({ kind: 'jsonpath', path: parseJsonPath(inner) });
     } else if (JS_EXPR_RE.test(inner)) {
-      unsupported('模板含 JS 表达式（tpl_js_expr）', rule);
+      unsupported('模板含 JS 表达式（tpl_js_expr）', rule, { code: 'unsupported_template_js' });
     } else {
-      unsupported('模板含 {{变量}}（tpl_var）', rule);
+      unsupported('模板含 {{变量}}（tpl_var）', rule, { code: 'unsupported_template_var' });
     }
     last = re.lastIndex;
   }
@@ -144,14 +145,14 @@ export function stripRegexSuffix(segment: string, rule: string): { body: string;
   const pattern = chunks[0] ?? '';
   const replacement = chunks[1] ?? '';
   const flags = chunks[2] !== undefined && chunks[2] !== '' ? chunks[2] : undefined;
-  if (pattern.length > MAX_REGEX_PATTERN_LENGTH) unsupported('正则 pattern 过长', rule);
+  if (pattern.length > MAX_REGEX_PATTERN_LENGTH) unsupported('正则 pattern 过长', rule, { code: 'regex_pattern_too_long' });
   // 只保留合法 JS 正则 flag 字符（去重）；legado 规则常有 trailing ### 等噪声 → 视作无 flags。
   const cleanFlags = flags ? [...new Set(flags.split(''))].filter((c) => 'gimsuy'.includes(c)).join('') : '';
   const finalFlags = cleanFlags === '' ? undefined : cleanFlags;
   try {
     new RegExp(pattern, finalFlags ?? 'g');
   } catch {
-    unsupported(`正则 pattern 无法编译：${pattern}`, rule);
+    unsupported(`正则 pattern 无法编译：${pattern}`, rule, { code: 'regex_invalid' });
   }
   regex.push({ pattern, replacement, flags: finalFlags });
   return { body, regex };
@@ -182,10 +183,10 @@ const LEGADO_SPECIAL_VARS = new Set(['baseUrl', 'result', 'book', 'chapter', 'he
 
 function toTerminal(token: string, rule: string): TerminalOp {
   if (TERMINAL_KEYWORDS.has(token)) return { op: token as TerminalKeyword };
-  if (LEGADO_SPECIAL_VARS.has(token)) unsupported(`不支持 legado 特殊变量 @${token}`, rule);
+  if (LEGADO_SPECIAL_VARS.has(token)) unsupported(`不支持 legado 特殊变量 @${token}`, rule, { code: 'unsupported_special_var' });
   // 具名属性兜底：@some-attr（HTML 属性名，含连字符/冒号）
   if (/^[\w:-]+$/.test(token)) return { op: 'attr', name: token };
-  unsupported(`不支持的末端操作 @${token}`, rule);
+  unsupported(`不支持的末端操作 @${token}`, rule, { code: 'unsupported_terminal' });
 }
 
 /**
@@ -278,7 +279,7 @@ function translateSegment(segment: string, rule: string): RuleIr {
   }
 
   // 3) XPath → 拒绝
-  if (looksLikeXPath(seg)) unsupported('规则疑似 XPath', rule);
+  if (looksLikeXPath(seg)) unsupported('规则疑似 XPath', rule, { code: 'unsupported_xpath' });
 
   // 4) 显式 CSS：@css: / css:
   let cssBody = seg;
@@ -311,7 +312,7 @@ function translateSegment(segment: string, rule: string): RuleIr {
 function buildCssChain(body: string, rule: string, explicit: boolean): RuleIr {
   // 末端 @op 与段间 @ 都用 @ 表达。策略：按顶层 @ 切分，最后一段若是纯末端关键字/属性则为 terminal。
   const atParts = splitTopLevel(body, '@');
-  if (atParts.length > MAX_CSS_CHAIN_DEPTH + 1) unsupported('选择器链过深', rule);
+  if (atParts.length > MAX_CSS_CHAIN_DEPTH + 1) unsupported('选择器链过深', rule, { code: 'selector_chain_too_deep' });
 
   let terminal: TerminalOp | undefined;
   const last = atParts[atParts.length - 1].trim();
@@ -346,7 +347,7 @@ function buildCssChain(body: string, rule: string, explicit: boolean): RuleIr {
   }
   // 裸 @op（如 chapterName=`@text`、chapterUrl=`@href`，book15 自身即此形态）：
   // 对当前 scope 节点集直接套末端操作，chain 合法为空。仅「既无选择器又无 terminal」才是空规则。
-  if (chain.length === 0 && !terminal) unsupported('空选择器', rule);
+  if (chain.length === 0 && !terminal) unsupported('空选择器', rule, { code: 'empty_selector' });
   return { kind: 'css', chain, terminal };
 }
 
@@ -363,25 +364,25 @@ function isTerminalToken(token: string): boolean {
  * M1 期：顶层 || 切出 >1 段 → RULE_UNSUPPORTED；&& → RULE_UNSUPPORTED。
  */
 export function parseFieldRule(rule: string): FieldIr {
-  if (typeof rule !== 'string') unsupported('规则非字符串', String(rule));
+  if (typeof rule !== 'string') unsupported('规则非字符串', String(rule), { code: 'invalid_rule_type' });
   const trimmed = rule.trim();
-  if (trimmed === '') unsupported('空规则', rule);
-  if (trimmed.length > MAX_RULE_LENGTH) unsupported('规则过长', rule);
+  if (trimmed === '') unsupported('空规则', rule, { code: 'empty_rule' });
+  if (trimmed.length > MAX_RULE_LENGTH) unsupported('规则过长', rule, { code: 'rule_too_long' });
 
   rejectUnsupportedConstructs(trimmed);
 
   // 顶层 && → T7 拒绝
-  if (splitTopLevel(trimmed, '&&').length > 1) unsupported('规则含顶层 &&（T7）', rule);
+  if (splitTopLevel(trimmed, '&&').length > 1) unsupported('规则含顶层 &&（T7）', rule, { code: 'unsupported_operator', operator: '&&' });
   // 顶层 || → M1 期 >1 段拒绝
   const orParts = splitTopLevel(trimmed, '||');
-  if (orParts.length > 1) unsupported('规则含顶层 ||（T7）', rule);
+  if (orParts.length > 1) unsupported('规则含顶层 ||（T7）', rule, { code: 'unsupported_operator', operator: '||' });
 
   const segment = orParts[0];
   const { body, regex } = stripRegexSuffix(segment, rule);
   // 正则-only 规则（剥掉 ##...## 尾缀后主体为空，如 `##<a.*?href="([^"]+)"##$1###`）：
   // ##regex## 在 §2.3 里只定义为「选择器后缀」，无选择器主体的独立正则不在 M1 集内 → 显式拒绝
   // （不猜「对原始输入直接跑正则」的语义，§2.3 第5条不猜测）。
-  if (body.trim() === '' && regex.length > 0) unsupported('正则-only 规则（无选择器主体，非 M1 集）', rule);
+  if (body.trim() === '' && regex.length > 0) unsupported('正则-only 规则（无选择器主体，非 M1 集）', rule, { code: 'regex_only' });
   const ir = translateSegment(body, rule);
   const field: FieldIr = { rules: [ir] };
   if (regex.length > 0) field.regex = regex;
