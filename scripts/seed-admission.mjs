@@ -27,7 +27,7 @@ import { pathToFileURL } from 'node:url';
 register('./ts-esm-loader.mjs', import.meta.url);
 const {
   compileAdmission, searchAdmission, runAdmissionBatch, rulesHash,
-  defaultAdmissionTransport, DEFAULT_ADMISSION_KEYWORD,
+  defaultAdmissionTransport, DEFAULT_ADMISSION_KEYWORD, assertAdmissionVersionConsistent,
 } = await import('../src/lib/rule-engine/admission.ts');
 
 // W1 四源（m2-scaleout §2.2；jhsssd 三个 s）。这里是规范化后的 bookSourceUrl origin。
@@ -53,25 +53,11 @@ function keywordOf(source) {
   return typeof raw === 'string' && raw.trim() ? raw.trim() : DEFAULT_ADMISSION_KEYWORD;
 }
 
-// 版本自洽自查（复审 P3）：source_admission.rules_hash 形如 `<engine_semantics_version>:<contentRevision>`
-// （compile.ts engineVersionedKey / engineSourceRevision）。种库前确认每行「版本列」与 rules_hash 前缀
-// 同源，否则写进库的行会像修复前那样自相矛盾——rules_hash 带 `1:`/`2:` 前缀、engine_semantics_version
-// 却取 schema 默认 0（INSERT 列清单漏写该列所致）。现 INSERT 已显式带上该列（取 admission.ts 同一批
-// runAdmissionBatch 计算的值），此查确保不再分叉；发现错配即拒绝写库，暴露上游口径问题。
-function assertVersionSelfConsistent(rows) {
-  for (const row of rows) {
-    const prefix = Number(String(row.rules_hash).split(':', 1)[0]);
-    if (!Number.isInteger(prefix)) {
-      throw new Error(`[seed-admission] 版本自查失败：host=${row.host} rules_hash 无版本前缀`);
-    }
-    if (row.engine_semantics_version !== prefix) {
-      throw new Error(
-        `[seed-admission] 版本自查失败：host=${row.host} engine_semantics_version=${row.engine_semantics_version} ` +
-        `≠ rules_hash 版本前缀=${prefix}（行内元数据不自洽，拒绝写库）`,
-      );
-    }
-  }
-}
+// 版本自洽自查改用 admission.ts 导出的单一真源 assertAdmissionVersionConsistent（复审 P3）：
+// source_admission.rules_hash 形如 `<engine_semantics_version>:<contentRevision>`，种库前确认每行
+// 「版本列」与 rules_hash 前缀同源，否则写进库的行会自相矛盾——rules_hash 带 `1:`/`2:` 前缀、
+// engine_semantics_version 却取 schema 默认 0（INSERT 列清单漏写该列所致）。种库脚本与
+// shuyuan.ts writeAdmissionRows 共用同一判据，不再各自抄一份（两处复制正是本发现的成因）。
 
 function parseArgs(argv) {
   const args = { env: null, urls: [], dryRun: false };
@@ -142,8 +128,8 @@ async function run() {
     maxProbes: candidates.length,
   });
 
-  // 写库前自查：行内 engine_semantics_version 必须与 rules_hash 的版本前缀同源（见函数注释）。
-  assertVersionSelfConsistent(result.rows);
+  // 写库前自查：行内 engine_semantics_version 必须与 rules_hash 的版本前缀同源（共享判据）。
+  assertAdmissionVersionConsistent(result.rows);
 
   // 展示行：host / verdict / keyword / compile / search_ok（不含任何凭据）。
   console.log('[seed-admission] 将写入的行：');
@@ -195,10 +181,10 @@ if (process.argv.includes('--selftest')) {
   // 版本自洽自查的判别力（不依赖 DB/网络）：rules_hash 前缀与版本列同源的行通过，伪造错配必抛。
   const seedHash = rulesHash({ bookSourceUrl: 'https://x.example', searchUrl: 's', ruleSearch: { name: 'h1' } });
   const seedVersion = Number(seedHash.split(':', 1)[0]);
-  assertVersionSelfConsistent([{ host: 'x.example', rules_hash: seedHash, engine_semantics_version: seedVersion }]);
+  assertAdmissionVersionConsistent([{ host: 'x.example', rules_hash: seedHash, engine_semantics_version: seedVersion }]);
   let mismatchCaught = false;
   try {
-    assertVersionSelfConsistent([{ host: 'x.example', rules_hash: seedHash, engine_semantics_version: seedVersion + 99 }]);
+    assertAdmissionVersionConsistent([{ host: 'x.example', rules_hash: seedHash, engine_semantics_version: seedVersion + 99 }]);
   } catch { mismatchCaught = true; }
   console.log('[selftest] 版本自洽自查：同源通过、错配即抛 =', mismatchCaught, '（前缀', seedVersion, '）');
   if (!mismatchCaught) { console.error('[selftest] 版本自查无判别力'); process.exit(1); }

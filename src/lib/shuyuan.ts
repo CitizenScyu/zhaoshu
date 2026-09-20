@@ -6,7 +6,8 @@ import {
   builtinFallbackSource, builtinUrlPrefixes, engineHosts, type SupportedSourceTier,
 } from '@/lib/supported-sources';
 import {
-  ADMISSION_MIN_BUDGET_MS, ADMISSION_TIMEOUT_MS, defaultAdmissionTransport, runAdmissionBatch,
+  ADMISSION_MIN_BUDGET_MS, ADMISSION_TIMEOUT_MS, assertAdmissionVersionConsistent,
+  defaultAdmissionTransport, runAdmissionBatch,
   type AdmissionCandidate, type AdmissionSourceRow,
 } from '@/lib/rule-engine/admission';
 import { selectCandidates, type RawSource } from '@/lib/rule-engine/compile-smoke';
@@ -891,7 +892,10 @@ async function readAdmissionRows(s: Sql, urls: string[], signal: AbortSignal): P
   return new Map(rows.map((row) => [row.source_url, row]));
 }
 
-async function writeAdmissionRows(s: Sql, rows: AdmissionSourceRow[]): Promise<void> {
+export async function writeAdmissionRows(s: Sql, rows: AdmissionSourceRow[]): Promise<void> {
+  // 写库前自查：行内 engine_semantics_version 必须与 rules_hash 版本前缀同源（复审 P3 单一真源，
+  // 与 scripts/seed-admission.mjs 共用同一判据）。错配即抛、整批不落库，暴露上游口径分裂。
+  assertAdmissionVersionConsistent(rows);
   await s`
     INSERT INTO source_admission
       (source_url, tier, compile_ok, core_field_mask, search_ok, search_verdict, search_checked_at, rules_hash,

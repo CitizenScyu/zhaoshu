@@ -493,6 +493,32 @@ function admissionSemanticsVersion(): number {
   return engineSemanticsVersion(engineSyntaxOrEnabled());
 }
 
+/**
+ * 版本自洽守卫（复审 P3 单一真源）：source_admission 每行的 `engine_semantics_version` 必须等于
+ * `rules_hash` 的版本前缀（rules_hash 形如 `<engine_semantics_version>:<contentRevision>`，见
+ * engineSourceRevision / admissionSemanticsVersion）。**两条写库路径**——`scripts/seed-admission.mjs`
+ * 与 `src/lib/shuyuan.ts` 的 `writeAdmissionRows`——都在写库之前调用此函数，判据集中在此、两侧不各自抄一份
+ * （两处复制正是复审发现的成因）。发现错配即抛错、拒绝写库：防的是 INSERT 列清单漏写版本列时行内元数据
+ * 自相矛盾（版本列取 schema 默认 0，rules_hash 却带真实 `1:`/`2:` 前缀）。当前落库靠 P1a 让
+ * runAdmissionBatch 同源产出保证一致（by construction），此守卫把该不变式钉死在写库边界。
+ */
+export function assertAdmissionVersionConsistent(
+  rows: ReadonlyArray<Pick<AdmissionSourceRow, 'rules_hash' | 'engine_semantics_version' | 'host'>>,
+): void {
+  for (const row of rows) {
+    const prefix = Number(String(row.rules_hash).split(':', 1)[0]);
+    if (!Number.isInteger(prefix)) {
+      throw new Error(`[admission] 版本自查失败：host=${row.host} rules_hash 无版本前缀`);
+    }
+    if (row.engine_semantics_version !== prefix) {
+      throw new Error(
+        `[admission] 版本自查失败：host=${row.host} engine_semantics_version=${row.engine_semantics_version} ` +
+        `≠ rules_hash 版本前缀=${prefix}（行内元数据不自洽，拒绝写库）`,
+      );
+    }
+  }
+}
+
 function compileDiagnostics(compile: AdmissionCompile): AdmissionSourceRow['compile_diagnostics'] {
   return compile.failures.map(({ field, diagnostic }) => ({ field, ...diagnostic }));
 }
