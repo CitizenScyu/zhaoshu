@@ -52,6 +52,9 @@ function baseManifest(): VolumeManifest {
   };
 }
 
+/** 构造-变异用的松类型:变异项本身就是「越界/畸形」,不能依赖严格类型。 */
+type LooseEntry = Record<string, unknown>;
+
 const encode = (value: unknown): Uint8Array =>
   new TextEncoder().encode(typeof value === 'string' ? value : JSON.stringify(value));
 
@@ -120,23 +123,23 @@ describe('parseVolumeManifest 反例(一律 null)', () => {
   });
 
   it('卷 path 越界(..)', () => {
-    expect(parseMutated(raw => { (raw.volumes as any)[0].path = 'books/../etc/passwd'; })).toBeNull();
+    expect(parseMutated(raw => { (raw.volumes as LooseEntry[])[0].path = 'books/../etc/passwd'; })).toBeNull();
   });
 
   it('卷 bytes 为 0', () => {
-    expect(parseMutated(raw => { (raw.volumes as any)[0].bytes = 0; })).toBeNull();
+    expect(parseMutated(raw => { (raw.volumes as LooseEntry[])[0].bytes = 0; })).toBeNull();
   });
 
   it('卷 bytes 超 MAX_READER_BYTES', () => {
-    expect(parseMutated(raw => { (raw.volumes as any)[0].bytes = MAX_READER_BYTES + 1; })).toBeNull();
+    expect(parseMutated(raw => { (raw.volumes as LooseEntry[])[0].bytes = MAX_READER_BYTES + 1; })).toBeNull();
   });
 
   it('首卷 first_byte !== 0', () => {
-    expect(parseMutated(raw => { (raw.volumes as any)[0].first_byte = 5; })).toBeNull();
+    expect(parseMutated(raw => { (raw.volumes as LooseEntry[])[0].first_byte = 5; })).toBeNull();
   });
 
   it('卷偏移不首尾相接(断缝)', () => {
-    expect(parseMutated(raw => { (raw.volumes as any)[1].first_byte = 2001; })).toBeNull();
+    expect(parseMutated(raw => { (raw.volumes as LooseEntry[])[1].first_byte = 2001; })).toBeNull();
   });
 
   it('Σvolumes.bytes !== bytes', () => {
@@ -144,7 +147,7 @@ describe('parseVolumeManifest 反例(一律 null)', () => {
   });
 
   it('末卷 last_byte !== bytes', () => {
-    expect(parseMutated(raw => { (raw.volumes as any)[1].last_byte = 2999; })).toBeNull();
+    expect(parseMutated(raw => { (raw.volumes as LooseEntry[])[1].last_byte = 2999; })).toBeNull();
   });
 
   it('chapter_index.length !== chapters', () => {
@@ -152,27 +155,27 @@ describe('parseVolumeManifest 反例(一律 null)', () => {
   });
 
   it('i 不连续', () => {
-    expect(parseMutated(raw => { (raw.chapter_index as any)[1].i = 5; })).toBeNull();
+    expect(parseMutated(raw => { (raw.chapter_index as LooseEntry[])[1].i = 5; })).toBeNull();
   });
 
   it('v 越界', () => {
-    expect(parseMutated(raw => { (raw.chapter_index as any)[0].v = 2; })).toBeNull();
+    expect(parseMutated(raw => { (raw.chapter_index as LooseEntry[])[0].v = 2; })).toBeNull();
   });
 
   it('s >= e', () => {
-    expect(parseMutated(raw => { (raw.chapter_index as any)[0].e = 0; })).toBeNull();
+    expect(parseMutated(raw => { (raw.chapter_index as LooseEntry[])[0].e = 0; })).toBeNull();
   });
 
   it('e > bytes', () => {
-    expect(parseMutated(raw => { (raw.chapter_index as any)[1].e = 3001; })).toBeNull();
+    expect(parseMutated(raw => { (raw.chapter_index as LooseEntry[])[1].e = 3001; })).toBeNull();
   });
 
   it('p < 1', () => {
-    expect(parseMutated(raw => { (raw.chapter_index as any)[0].p = 0; })).toBeNull();
+    expect(parseMutated(raw => { (raw.chapter_index as LooseEntry[])[0].p = 0; })).toBeNull();
   });
 
   it('章起点不落在其卷区间(错标卷号)', () => {
     // 章 0 实际在卷 0(s=0),谎报 v=1。
-    expect(parseMutated(raw => { (raw.chapter_index as any)[0].v = 1; })).toBeNull();
+    expect(parseMutated(raw => { (raw.chapter_index as LooseEntry[])[0].v = 1; })).toBeNull();
   });
 });
