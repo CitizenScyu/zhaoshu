@@ -1,5 +1,5 @@
 import { decodeHTML } from 'entities';
-import { validateSourceUrl, SourcePolicyError } from './source-policy';
+import { alternateSourceHost, validateSourceUrl, SourcePolicyError } from './source-policy';
 
 export interface SourceBookIdentity { title: string; author: string; alias?: string }
 export interface SourceChapter { url: string; title: string }
@@ -220,28 +220,67 @@ export function sourceSearchUrl(template: unknown, title: string, base: string):
   return validateSourceUrl(expanded, base).href;
 }
 
+/** 详情页链接形态:book15 的 `/books/details<数字>.html`。候选收集的两条路径共用同一 grammar。 */
+const DETAIL_PATH = /^\/books\/details\d+\.html$/;
+
+/**
+ * 链接必须落在同一站点根内(同 origin,或同站备用 host 的 origin)。
+ * 判定走 URL 解析后的 origin,而不是 raw href 字符串 —— 站点改版把绝对 URL 写全即
+ * `https://book15.net/books/details1.html` 时,形态不变但 href 不再以 `/` 开头。
+ * 这是**收窄**而非放宽:book15 三类页面上实测的跨站链接只有百度与自家 m.* 手机站,
+ * 全部被拦;真正的 host 白名单仍是 validateSourceUrl。
+ */
+function sameSite(url: URL, pageUrl: string): boolean {
+  let base: URL;
+  try { base = new URL(pageUrl); } catch { return false; }
+  if (url.origin === base.origin) return true;
+  const alternate = alternateSourceHost(base.hostname.toLowerCase());
+  return alternate !== null && url.origin === `https://${alternate}`;
+}
+
 export function parseSourceSearch(html: string, pageUrl: string, title: string): string[] {
   const urls = new Set<string>();
   for (const match of html.matchAll(/<a\b([^>]*)>([\s\S]*?)<\/a>/gi)) {
     const href = attributes(match[1]).href;
     if (!href || normalizeSourceTitle(plainText(match[2])) !== normalizeSourceTitle(title)) continue;
     const url = validateSourceUrl(href, pageUrl);
-    if (/^\/books\/details\d+\.html$/.test(url.pathname)) urls.add(url.href);
+    if (DETAIL_PATH.test(url.pathname)) urls.add(url.href);
   }
   return [...urls];
 }
 
-// 作者搜索回退的候选收集：不看锚文本（改名书的锚文本是站点新名），只按链接形态取详情页。
-// 误配防线不在这一层，而在详情页的 sourceBookMatches 身份校验（标题/别名 + 作者门）。
-export function parseSourceDetailLinks(html: string, pageUrl: string): string[] {
-  const urls = new Set<string>();
+// 详情页候选收集(标题搜索 0 命中时的同页兜底 + 作者搜索回退):只按链接形态取详情页,不看锚文本相等。
+// 误配防线不在这一层,而在详情页的 sourceBookMatches 身份校验(标题/别名 + 作者门)。
+export const MAX_SOURCE_DETAIL_LINKS = 24;
+// 三道过滤缺一不可:
+// 1) 单个解析不下来的锚点只跳过、不抛。book15 每张页面上都有 11-13 个 `javascript:`
+//    与跨站(百度 / 自家 m.* 手机站)链接;基线实现会在第一个这样的锚点上抛
+//    SourcePolicyError,把整条候选收集打死 —— 这正是「搜索页有结果却 0 候选」的机制之一。
+// 2) 锚文本/title/alt 里出现过期望书名的链接排在前。站点把「图片链接 + 标题链接 + 阅读小说链接」
+//    三份重复指向同一详情页,标题链接常排在整页中后段;这个顺序保证上游 inspect 的
+//    MAX_DETAIL_CANDIDATES 切片够得到真正相关的那些。比较用 sourceTitleSimilarity(与上游
+//    模糊层同源判据)而不是子串测试:短书名做子串测试会把无关的近邻误判进来。
+// 3) 其余同站详情页按文档序接在后(站点改版 / 锚文本带修饰时的最后一道兜底)。
+// 上限 MAX_SOURCE_DETAIL_LINKS:站点在大页面上吐出几十条链接时不得把预算摊薄。
+
+export function parseSourceDetailLinks(html: string, pageUrl: string, expectedTitle?: string): string[] {
+  const expected = expectedTitle ? normalizeSourceTitle(expectedTitle) : '';
+  const titleMatches: string[] = [];
+  const others: string[] = [];
+  const seen = new Set<string>();
   for (const match of html.matchAll(/<a\b([^>]*)>([\s\S]*?)<\/a>/gi)) {
-    const href = attributes(match[1]).href;
+    const tag = attributes(match[1]);
+    const href = tag.href;
     if (!href) continue;
     const url = validateSourceUrl(href, pageUrl);
-    if (/^\/books\/details\d+\.html$/.test(url.pathname)) urls.add(url.href);
+    if (!DETAIL_PATH.test(url.pathname) || !sameSite(url, pageUrl) || seen.has(url.href)) continue;
+    seen.add(url.href);
+    // 锚文本里的书名可能只写在 title/alt 属性里(图片链接的锚文本为空),三者都喂给判据。
+    const anchor = `${plainText(match[2])} ${tag.title ?? ''} ${tag.alt ?? ''}`.trim();
+    if (expected && sourceTitleSimilarity(expected, { title: anchor, author: '' }) === 0) titleMatches.push(url.href);
+    else others.push(url.href);
   }
-  return [...urls];
+  return [...titleMatches, ...others].slice(0, MAX_SOURCE_DETAIL_LINKS);
 }
 
 export function parseSourceChapters(html: string, pageUrl: string): SourceChapter[] {
