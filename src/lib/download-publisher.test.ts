@@ -320,6 +320,83 @@ describe('分卷切分(splitBookVolumes;设计 v2 §六)', () => {
     expect(ranges[0].endByte - ranges[0].startByte).toBe(buf.byteLength);
   });
 
+  it('注入 maxVolumeBytes=1 MiB:Σvolumes.bytes===bytes、拼接字节===输入、每卷 ≤ 软目标', async () => {
+    const github = new MemoryGitHub();
+    // 3 章,每章约 420 KB ⇒ 整本 > 1 MiB,软目标 1 MiB ⇒ 至少 2 卷。
+    const txt = bookText(3, 70_000);
+    const buf = Buffer.from(txt, 'utf8');
+    expect(buf.byteLength).toBeGreaterThan(1024 * 1024);
+    const result = await publishBookVersion(github, guardOk,
+      candidate({ txt, chaptersDone: 3, chaptersTotal: 3 }), { maxVolumeBytes: 1024 * 1024 });
+    expect(result.promoted).toBe(true);
+    const { canonicalPath } = snapshotPaths(TITLE, AUTHOR);
+    const canonical = JSON.parse(github.files.get(canonicalPath)!);
+    // Σvolumes.bytes === 全书字节
+    const sum = canonical.volumes.reduce((acc: number, v: { bytes: number }) => acc + v.bytes, 0);
+    expect(sum).toBe(buf.byteLength);
+    expect(canonical.bytes).toBe(buf.byteLength);
+    expect(canonical.volumes.length).toBeGreaterThan(1);
+    // 拼接字节 === 输入(逐字节)
+    const joined = canonical.volumes.map((v: { path: string }) => github.files.get(v.path)).join('');
+    expect(joined).toBe(txt);
+    // 每卷 ≤ 软目标(这些是整章装箱卷,不会触硬上限)
+    for (const v of canonical.volumes as { bytes: number }[]) expect(v.bytes).toBeLessThanOrEqual(1024 * 1024);
+  });
+
+  it('>maxBookBytes:第一个 PUT 之前失败,零 PUT 零 GET', async () => {
+    const github = new MemoryGitHub();
+    const big = candidate({ txt: bookText(1, 500_000) }); // 单章正文约 1.5 MiB > 1 MiB
+    await expect(publishBookVersion(github, guardOk, big, { maxBookBytes: 1024 * 1024 }))
+      .rejects.toMatchObject({ stage: 'snapshot', detail: 'size_limit' });
+    expect(github.calls.filter(c => c.op === 'put')).toHaveLength(0);
+    expect(github.calls.filter(c => c.op === 'get')).toHaveLength(0);
+  });
+
+  it('同内容重试:规范/清单/指针区零 PUT(只有内容寻址快照卷 PUT)', async () => {
+    const github = new MemoryGitHub();
+    const first = await publishBookVersion(github, guardOk, candidate());
+    expect(first.promoted).toBe(true);
+    github.calls.length = 0;
+    const second = await publishBookVersion(github, guardOk, candidate({ taskId: 99 }));
+    expect(second.promoted).toBe(true);
+    const { dir, canonicalPath } = snapshotPaths(TITLE, AUTHOR);
+    const isnapshot = (p: string) => /^books\/\.snapshots\/[^/]+\/v-[a-f0-9]{8}\.txt$/.test(p);
+    const nonSnapshotPuts = github.calls.filter(c => c.op === 'put' && !isnapshot(c.path));
+    // 规范卷 / manifest / 清单 / 指针一律不重写(清单最后写 = 提交点,重试不重提交)
+    expect(nonSnapshotPuts).toHaveLength(0);
+    expect(nonSnapshotPuts.some(c => c.path === canonicalPath)).toBe(false);
+    expect(github.calls.some(c => c.op === 'put' && c.path.endsWith('current.json'))).toBe(false);
+    void dir;
+  });
+
+  it('更差候选:规范清单零写、指针零写,候选快照 manifest 留档', async () => {
+    const github = new MemoryGitHub();
+    await seedPublished(github, { chapters: 100, chars: 100 * 2000 });
+    github.calls.length = 0;
+    const result = await publishBookVersion(github, guardOk, candidate({ chaptersDone: 80, chaptersTotal: 80 }));
+    expect(result).toMatchObject({ promoted: false, reason: 'superseded_by_incomplete' });
+    const { canonicalPath, dir } = snapshotPaths(TITLE, AUTHOR);
+    const writes = github.calls.filter(c => c.op === 'put' && (c.path === canonicalPath || c.path.endsWith('current.json')));
+    expect(writes).toHaveLength(0); // 规范区与指针零写
+    // 候选快照 manifest 留档(够人工晋升)
+    expect(github.files.has(`${dir}/${result.version}.json`)).toBe(true);
+    expect(JSON.parse(github.files.get(`${dir}/${result.version}.json`)!).chapters).toBe(80);
+  });
+
+  it('fallbackBaseline 的 v2 JSON 分支:指针缺失时按规范清单自述 version 找回旧 manifest', async () => {
+    const github = new MemoryGitHub();
+    const seeded = await seedPublished(github, { chapters: 100, chars: 100 * 2000 });
+    const { dir, canonicalPath } = snapshotPaths(TITLE, AUTHOR);
+    github.files.delete(`${dir}/current.json`); // 指针丢失
+    github.calls.length = 0;
+    const result = await publishBookVersion(github, guardOk, candidate({ chaptersDone: 80, chaptersTotal: 80 }));
+    expect(result).toMatchObject({ promoted: false });
+    // v2 分支:读规范清单 JSON 的 version → 取 `${dir}/${version}.json`,不是内容 hash
+    expect(github.calls.some(c => c.op === 'get' && c.path === canonicalPath)).toBe(true);
+    expect(github.calls.some(c => c.op === 'get' && c.path === `${dir}/${seeded.version}.json`)).toBe(true);
+    expect(result.promoted === false && result.oldManifest?.chapters).toBe(100);
+  });
+
   it('单章 > 16 MiB 硬上限 → 按行/码点边界切开,该章跨卷', () => {
     // 无标题 ⇒ 整本一章「正文」,总量 > 16 MiB ⇒ 触发硬上限切分。
     const line = 'x'.repeat(79) + '\n';
