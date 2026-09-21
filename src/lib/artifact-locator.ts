@@ -23,6 +23,18 @@ export function artifactContentsUrl(location: ArtifactLocation): string {
     + `?ref=${encodeURIComponent(location.branch)}`;
 }
 
+/**
+ * Contents API root for the artifact's repository, after validating owner/repo and branch.
+ * Volume-split artifacts live beside their manifest (`books/<stem>/vol-001.txt`), so the
+ * volume reader needs the same repository root with a different path — and it must not
+ * re-derive it from the canonical path's prefix.
+ */
+export function artifactContentsRoot(location: ArtifactLocation): string {
+  if (![location.owner, location.repo].every(value => /^[\w.-]+$/.test(value) && value !== '.' && value !== '..')
+    || !location.branch) throw new Error('INVALID_ARTIFACT_LOCATION');
+  return `https://api.github.com/repos/${location.owner}/${location.repo}/contents`;
+}
+
 /** No artifact pointer means byte-for-byte legacy file protocol; never guess a new identity by filename. */
 export async function locateTaskArtifact(
   sql: ReturnType<typeof neon>, artifactId?: number | string | null,

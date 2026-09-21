@@ -204,12 +204,17 @@ maybe('T3 worker 任务层：租约、单写者、五阶段对账（PGlite + moc
     const state = await taskState(id);
     expect(state.status).toBe('done');
     expect(state.artifact_id).not.toBeNull();
-    // GitHub 四阶段都写了
+    // GitHub 四阶段都写了。v2:快照与规范都是分卷清单 JSON,整本 <version>.txt 永不落盘(设计 §六);
+    // 整本正文靠卷还原,规范提交点是 index.json 清单。
     const { canonicalPath, dir } = snapshotPaths('测试书', '佚名');
     const version = gitBlobSha(txt).slice(0, 8);
-    expect(github.files.has(`${dir}/${version}.txt`)).toBe(true);
     expect(github.files.has(`${dir}/${version}.json`)).toBe(true);
-    expect(github.files.get(canonicalPath)).toBe(txt);
+    expect(github.files.has(`${dir}/${version}.txt`)).toBe(false);
+    expect(canonicalPath.endsWith('/index.json')).toBe(true);
+    const canonical = JSON.parse(github.files.get(canonicalPath)!);
+    expect(canonical.format).toBe('volumes');
+    expect(canonical.blob_sha).toBe(gitBlobSha(txt)); // 清单钉住整本完整 hash
+    expect(canonical.volumes.map((v: { path: string }) => github.files.get(v.path)).join('')).toBe(txt);
     expect(JSON.parse(github.files.get(`${dir}/current.json`)!).current).toBe(version);
     // DB 第五阶段：artifact published 且带完整 hash
     const artifact = (await pg.query('SELECT quality_status, blob_sha, bytes, version FROM book_artifacts')).rows[0];
@@ -249,13 +254,17 @@ maybe('T3 worker 任务层：租约、单写者、五阶段对账（PGlite + moc
     const state = await taskState(secondId);
     expect(state.status).toBe('superseded_by_incomplete');
     const { canonicalPath, dir } = snapshotPaths('测试书', '佚名');
-    // 规范内容仍是旧版
-    expect(github.files.get(canonicalPath)).toBe(oldTxt);
+    const oldVersion = gitBlobSha(oldTxt).slice(0, 8);
+    // 规范内容仍是旧版:v2 规范是清单 index.json(非整本),清单仍钉旧版 hash、卷拼接仍还原旧正文。
+    const canonical = JSON.parse(github.files.get(canonicalPath)!);
+    expect(canonical.blob_sha).toBe(gitBlobSha(oldTxt));
+    expect(canonical.volumes.map((v: { path: string }) => github.files.get(v.path)).join('')).toBe(oldTxt);
+    expect(JSON.parse(github.files.get(`${dir}/current.json`)!).current).toBe(oldVersion);
     // 指针未重写（零指针 PUT）
     expect(github.calls.some(call => call.op === 'put' && call.path.endsWith('current.json'))).toBe(false);
-    // 候选快照留档
+    // 候选快照留档(分卷清单 JSON)
     const newVersion = gitBlobSha(completeText('测试书', 80)).slice(0, 8);
-    expect(github.files.has(`${dir}/${newVersion}.txt`)).toBe(true);
+    expect(github.files.has(`${dir}/${newVersion}.json`)).toBe(true);
   });
 
   it('失租约停止：处理过程中行被 reclaim（generation+1）→ 无终态写入、无复活', async () => {
@@ -316,9 +325,13 @@ maybe('T3 worker 任务层：租约、单写者、五阶段对账（PGlite + moc
     expect(state.status).toBe('failed');
     const { dir, canonicalPath } = snapshotPaths('测试书', '佚名');
     const version = gitBlobSha(txt).slice(0, 8);
-    // GitHub 侧前四阶段已落（可凭完整 hash 对账恢复），artifact 行仍是 reserved
-    expect(github.files.has(`${dir}/${version}.txt`)).toBe(true);
-    expect(github.files.get(canonicalPath)).toBe(txt);
+    // GitHub 侧前四阶段已落（可凭完整 hash 对账恢复），artifact 行仍是 reserved。
+    // v2:规范/快照都是分卷清单 JSON,整本 <version>.txt 永不落盘,清单钉整本 hash + 卷拼接还原。
+    expect(github.files.has(`${dir}/${version}.json`)).toBe(true);
+    expect(github.files.has(`${dir}/${version}.txt`)).toBe(false);
+    const canonical = JSON.parse(github.files.get(canonicalPath)!);
+    expect(canonical.blob_sha).toBe(gitBlobSha(txt));
+    expect(canonical.volumes.map((v: { path: string }) => github.files.get(v.path)).join('')).toBe(txt);
     const artifact = (await pg.query('SELECT quality_status FROM book_artifacts')).rows[0];
     expect(artifact.quality_status).toBe('reserved');
     // 修复路径：同内容重试（新 attempt）保留 manifest 原始字节

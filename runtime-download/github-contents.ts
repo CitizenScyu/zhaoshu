@@ -35,9 +35,13 @@ function httpError(status: number): Error {
 
 export function createGitHubContents({ token, repository, branch, fetchImpl = fetch, timeoutMs = 60_000 }: GitHubContentsOptions): GitHubContents {
   if (!branch) throw new Error('createGitHubContents requires branch');
+  // Raw media type on the shared header: the same envelope is used for GET (currentSha,
+  // getBytes) and PUT. Object/JSON responses return `encoding:"none"` with an empty
+  // `content` for 1–100 MB files, which broke reading a manifest once it passed 1 MB.
+  // `application/vnd.github.raw+json` still yields the `sha` field used by currentSha.
   const headers = {
     Authorization: `Bearer ${token}`,
-    Accept: 'application/vnd.github+json',
+    Accept: 'application/vnd.github.raw+json',
     'X-GitHub-Api-Version': '2022-11-28',
     'User-Agent': USER_AGENT,
   };

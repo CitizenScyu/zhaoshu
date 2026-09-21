@@ -1,7 +1,12 @@
-/** Reader limits also apply to books with no recognizable chapter headings. */
+/**
+ * Hard limit for one raw file pulled by the reader (a volume file or a legacy
+ * single-file artifact). It is no longer a whole-book limit: reading a chapter
+ * costs one volume. The publisher holds the whole book in memory and passes its
+ * own larger bound explicitly.
+ */
 export const MAX_READER_BYTES = 16 * 1024 * 1024;
 export const MAX_CHAPTER_PART_BYTES = 32 * 1024;
-export const MAX_READER_CHAPTERS = 10_000;
+export const MAX_READER_CHAPTERS = 20_000;
 
 const MAX_TITLE_LINE_BYTES = 320;
 const MAX_TITLE_CHARACTERS = 80;
@@ -90,9 +95,14 @@ function headingTitle(title: string): string | null {
   return title;
 }
 
-function checkBookSize(bytes: Uint8Array): void {
-  if (bytes.byteLength > MAX_READER_BYTES) {
-    throw new RangeError('暂不支持超过 16 MiB 的 TXT 文件。');
+function checkBookSize(bytes: Uint8Array, maxBookBytes: number): void {
+  if (!Number.isSafeInteger(maxBookBytes) || maxBookBytes < 1) {
+    throw new RangeError('TXT 大小上限无效。');
+  }
+  if (bytes.byteLength > maxBookBytes) {
+    // 16 MiB 是读端单文件默认值;发布器传入更大的内存上限,消息随之变化。
+    const mib = Math.floor(maxBookBytes / (1024 * 1024));
+    throw new RangeError(`暂不支持超过 ${mib} MiB 的 TXT 文件。`);
   }
 }
 
@@ -108,11 +118,15 @@ function checkBookSize(bytes: Uint8Array): void {
  * For a nonblank book, chapter ranges cover every original byte exactly once.
  * Whitespace/BOM before the first heading stay with that heading; a meaningful
  * prefix becomes "前言". With no headings the book becomes one "正文" chapter.
- * Empty/whitespace-only books return [], and the 10,000 chapter cap includes
+ * Empty/whitespace-only books return [], and the 20,000 chapter cap includes
  * a generated preface. Source bytes are never mutated or retained by the result.
+ *
+ * `maxBookBytes` defaults to the reader's single-file bound. The publisher holds
+ * the whole book in memory and passes its own larger bound; the scan itself never
+ * decodes or copies body text, so a larger bound costs no extra memory.
  */
-export function parseTxtChapters(bytes: Uint8Array): TxtChapter[] {
-  checkBookSize(bytes);
+export function parseTxtChapters(bytes: Uint8Array, maxBookBytes = MAX_READER_BYTES): TxtChapter[] {
+  checkBookSize(bytes, maxBookBytes);
   const firstContentByte = skipWhitespace(bytes, 0, bytes.byteLength);
   if (firstContentByte === bytes.byteLength) return [];
 
@@ -121,7 +135,7 @@ export function parseTxtChapters(bytes: Uint8Array): TxtChapter[] {
 
   function append(title: string, startByte: number): void {
     if (chapters.length >= MAX_READER_CHAPTERS) {
-      throw new RangeError('TXT 章节数量超过 10000，暂时无法生成目录。');
+      throw new RangeError(`TXT 章节数量超过 ${MAX_READER_CHAPTERS}，暂时无法生成目录。`);
     }
     if (chapters.length) chapters[chapters.length - 1].endByte = startByte;
     chapters.push({ index: chapters.length, title, startByte, endByte: bytes.byteLength });
@@ -159,13 +173,18 @@ function isContinuationByte(byte: number): boolean {
  * code-point boundary. CRLF pairs are kept together. The optional smaller limit
  * is useful for other bounded consumers; limits below one UTF-8 scalar (4 bytes)
  * or above the reader's 32 KiB response budget are rejected.
+ *
+ * `maxBookBytes` mirrors `parseTxtChapters`: a slice of a large book (for example
+ * one volume) must not be rejected just because the whole book exceeds the reader
+ * bound; the publisher passes its own bound the same way.
  */
 export function splitChapterParts(
   bytes: Uint8Array,
   chapter: ByteRange,
   maxPartBytes = MAX_CHAPTER_PART_BYTES,
+  maxBookBytes = MAX_READER_BYTES,
 ): ByteRange[] {
-  checkBookSize(bytes);
+  checkBookSize(bytes, maxBookBytes);
   const { startByte, endByte } = chapter;
   if (!Number.isSafeInteger(startByte) || !Number.isSafeInteger(endByte)
     || startByte < 0 || endByte < startByte || endByte > bytes.byteLength

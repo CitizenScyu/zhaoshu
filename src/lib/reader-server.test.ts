@@ -1,6 +1,8 @@
 import { createHash } from 'node:crypto';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { bookFilename } from './book-file-name';
+import { VOLUME_MANIFEST_FORMAT, VOLUME_MANIFEST_SCHEMA } from './volume-manifest';
+import type { ReaderIndex } from './reader-types';
 import type { ReadableTask } from './reader-server';
 
 const { getSql, sql, fetchMock } = vi.hoisted(() => ({
@@ -20,6 +22,182 @@ function fixture(id = 1, text = '第一章 开始\n用于验证阅读切片的�
 
 function mockBook(book: ReturnType<typeof fixture>, response = new Response(book.text)) {
   fetchMock.mockResolvedValueOnce(Response.json([book.file])).mockResolvedValueOnce(response);
+}
+
+// ---- v2 分卷产物夹具 --------------------------------------------------------
+//
+// 发布形状从「整本 <version>.txt」变成「清单 <version>.json + 同目录 vol-NNN.txt」,
+// DB 的 canonical_path 指向清单。阅读端读路径由 `artifact.canonical_path` 是否以
+// `/index.json` 结尾决定,所以夹具用与发布器同口径的路径字符串。
+
+const ARTIFACT_ID = 7;
+const OWNER = 'fixture';
+const REPO = 'private';
+const BRANCH = 'main';
+
+/** 章节/卷清单 + 各卷字节(卷边界必须落在章起点,否则读端校验会拒)。 */
+interface VolumeFixture {
+  paths: { canonicalPath: string };
+  task: ReadableTask;
+  bookText: string;
+  chapters: { title: string; text: string }[];
+  ranges: { startByte: number; endByte: number }[];
+  volumes: { path: string; blobSha: string; bytes: number }[];
+  manifest: Record<string, unknown>;
+}
+
+function volumeFixture(options: {
+  id?: number; title?: string; author?: string; maxVolumeBytes: number; chapters: { title: string; text: string }[];
+}): VolumeFixture {
+  const title = options.title ?? '测试书';
+  const author = options.author ?? '测试作者';
+  const text = options.chapters.map(chapter => `${chapter.title}\n${chapter.text}\n`).join('');
+  const bytes = Buffer.from(text);
+  const blobSha = createHash('sha1').update(`blob ${bytes.byteLength}\0`).update(bytes).digest('hex');
+  const version = blobSha.slice(0, 8);
+  const stem = encodeURIComponent(bookFilename(title, author).replace(/\.txt$/, ''));
+  const paths = { canonicalPath: `books/${stem}/index.json` };
+
+  const chapterBytes = options.chapters.map(chapter => Buffer.byteLength(`${chapter.title}\n${chapter.text}\n`, 'utf8'));
+  const chapterStarts: number[] = [];
+  const chapterEnds: number[] = [];
+  let offset = 0;
+  for (const size of chapterBytes) { chapterStarts.push(offset); offset += size; chapterEnds.push(offset); }
+
+  // 按章贪心装箱(与发布器 splitBookVolumes 同口径:整章装得下就推进章边界)。
+  const ranges: { startByte: number; endByte: number }[] = [];
+  let volumeStart = 0;
+  let filled = 0;
+  for (let index = 0; index < chapterEnds.length; index++) {
+    if (chapterEnds[index]! - volumeStart <= options.maxVolumeBytes) { filled = chapterEnds[index]!; continue; }
+    if (filled > volumeStart) { ranges.push({ startByte: volumeStart, endByte: filled }); volumeStart = filled; }
+    ranges.push({ startByte: volumeStart, endByte: chapterEnds[index]! }); // 单章 > 软目标:独占一卷
+    volumeStart = chapterEnds[index]!;
+    filled = chapterEnds[index]!;
+  }
+  if (filled > volumeStart) ranges.push({ startByte: volumeStart, endByte: filled });
+  if (!ranges.length) ranges.push({ startByte: 0, endByte: 0 });
+
+  const volumes = ranges.map((range, index) => {
+    const volumeBytes = bytes.subarray(range.startByte, range.endByte);
+    const sha = createHash('sha1').update(`blob ${volumeBytes.byteLength}\0`).update(volumeBytes).digest('hex');
+    return {
+      path: paths.canonicalPath.replace(/index\.json$/, `vol-${String(index + 1).padStart(3, '0')}.txt`),
+      blobSha: sha,
+      bytes: volumeBytes.byteLength,
+    };
+  });
+
+  const chapterIndex = options.chapters.map((chapter, index) => {
+    const start = chapterStarts[index]!;
+    const end = chapterEnds[index]!;
+    const volumeIndex = ranges.findIndex(range => start >= range.startByte && start < range.endByte);
+    return {
+      i: index, t: chapter.title, v: Math.max(volumeIndex, 0), s: start, e: end,
+      p: Math.max(1, Math.ceil((end - start) / (32 * 1024))),
+    };
+  });
+
+  return {
+    paths,
+    task: { id: options.id ?? 1, title, author, status: 'done', artifact_id: ARTIFACT_ID },
+    bookText: text,
+    chapters: options.chapters,
+    ranges,
+    volumes,
+    manifest: {
+      schema: VOLUME_MANIFEST_SCHEMA, format: VOLUME_MANIFEST_FORMAT, version, blob_sha: blobSha,
+      bytes: bytes.byteLength, chars: text.length,
+      chapters: options.chapters.length, chapters_total: options.chapters.length,
+      title, author, generated_at: '2026-09-21T00:00:00.000Z', task_id: options.id ?? 1,
+      volumes: ranges.map((range, index) => ({
+        path: volumes[index]!.path,
+        snapshot_path: `books/.snapshots/${stem}/v-${version}.txt`,
+        blob_sha: volumes[index]!.blobSha, bytes: volumes[index]!.bytes,
+        first_byte: range.startByte, last_byte: range.endByte,
+      })),
+      chapter_index: chapterIndex,
+    },
+  };
+}
+
+/** locateTaskArtifact 的 SQL 返回一条 v2 artifact 行(canonical_path 指向清单)。 */
+function applyVolumeArtifact(book: VolumeFixture) {
+  sql.mockResolvedValue([{
+    owner: OWNER, repo: REPO, branch: BRANCH,
+    canonical_path: book.paths.canonicalPath,
+    blob_sha: book.manifest.blob_sha as string,
+    bytes: book.manifest.bytes as number,
+  }]);
+}
+
+/** raw 取数分发:清单/卷按 URL 末段名解析,卷字节按清单区间切片。 */
+function volumeResponder(book: VolumeFixture): (input: RequestInfo | URL) => Promise<Response> {
+  return async (input) => {
+    const url = String(input);
+    const name = decodeURIComponent(url.slice(url.lastIndexOf('/') + 1));
+    if (name === 'index.json') return new Response(JSON.stringify(book.manifest));
+    const index = book.volumes.findIndex(volume => volume.path.endsWith(name));
+    if (index < 0) throw new Error('Unexpected manifest/volume request: ' + name);
+    const range = book.ranges[index]!;
+    return new Response(Buffer.from(book.bookText, 'utf8').subarray(range.startByte, range.endByte));
+  };
+}
+
+/** 把分卷夹具接到 SQL 与 fetch 上(artifact 定位走 sql,清单/卷走 raw fetch)。 */
+function mockVolumeArtifact(book: VolumeFixture) {
+  applyVolumeArtifact(book);
+  fetchMock.mockImplementation(volumeResponder(book) as never);
+}
+
+type ChapterIndexEntry = { i: number; t: string; v: number; s: number; e: number; p: number };
+
+const OVERSIZED_CHAPTERS = 8500;
+const ESCAPED_TITLE = String.fromCharCode(1).repeat(70) + '尾';
+const PLAIN_TITLE = 'x'.repeat(70) + '尾';
+
+function manifestJson(book: VolumeFixture): string {
+  return JSON.stringify(book.manifest);
+}
+
+function manifestBytes(book: VolumeFixture): number {
+  return Buffer.byteLength(manifestJson(book), 'utf8');
+}
+
+function indexJsonBytes(book: VolumeFixture): number {
+  const entries = book.manifest.chapter_index as ChapterIndexEntry[];
+  const index: ReaderIndex = {
+    taskId: book.task.id, title: book.task.title, author: book.task.author,
+    version: book.manifest.blob_sha as string, totalBytes: book.manifest.bytes as number,
+    chapters: entries.map(entry => ({
+      index: entry.i, title: entry.t, startByte: entry.s, endByte: entry.e, partCount: entry.p,
+    })),
+  };
+  return Buffer.byteLength(JSON.stringify(index), 'utf8');
+}
+
+/**
+ * 转义标题病态书:每章标题带 70 个控制字符,JSON 转义后把读端索引顶穿 4 MiB,
+ * 而清单 raw 本身仍在 4 MiB 门内(见 §索引门 vs 清单门)。
+ */
+function escapedTitleBook(id = 3, chapters = OVERSIZED_CHAPTERS): VolumeFixture {
+  const book = volumeFixture({
+    id, title: '转义超限书', maxVolumeBytes: 64 * 1024 * 1024,
+    chapters: Array.from({ length: chapters }, () => ({ title: ESCAPED_TITLE, text: '正文' })),
+  });
+  // 夹具里的 manifest 是手工构造的对象;整份 JSON 必须真的仍在 4 MiB 门内。
+  expect(manifestBytes(book)).toBeLessThan(4 * 1024 * 1024);
+  return book;
+}
+
+/** 对照组:同一批章节、标题只把控制字符换成等字节的 'x',索引不膨胀 ⇒ 必须仍可读。 */
+function plainTitleBook(id = 4, chapters = OVERSIZED_CHAPTERS): VolumeFixture {
+  const book = volumeFixture({
+    id, title: '纯文本达标书', maxVolumeBytes: 64 * 1024 * 1024,
+    chapters: Array.from({ length: chapters }, () => ({ title: PLAIN_TITLE, text: '正文' })),
+  });
+  expect(manifestBytes(book)).toBeLessThan(4 * 1024 * 1024);
+  return book;
 }
 
 function streamBytes(bytes: Uint8Array, chunkSize: number, cancel = vi.fn()) {
@@ -143,45 +321,53 @@ describe('reader server file resolution and bounded cache', () => {
     expect(fetchMock).toHaveBeenCalledTimes(3);
   });
 
-  it('evicts the least recently used book when a fourth book is loaded', async () => {
-    const library = [fixture(1), fixture(2), fixture(3), fixture(4)];
-    const rawReads = new Map<string, number>();
-    fetchMock.mockImplementation(async (input) => {
-      const url = String(input);
-      if (url.endsWith('/books')) return Response.json(library.map((book) => book.file));
-      const name = decodeURIComponent(url.slice(url.lastIndexOf('/') + 1));
-      const book = library.find((item) => item.file.name === name);
-      if (!book) throw new Error('Unexpected book');
-      rawReads.set(name, (rawReads.get(name) ?? 0) + 1);
-      return new Response(book.text);
-    });
-    for (const book of library.slice(0, 3)) await server.readBookIndex(book.task);
-    await server.readBookIndex(library[0].task);
-    await server.readBookIndex(library[3].task);
-    await server.readBookIndex(library[2].task);
-    await server.readBookIndex(library[1].task);
-    expect(rawReads.get(library[0].file.name)).toBe(1);
-    expect(rawReads.get(library[1].file.name)).toBe(2);
-    expect(rawReads.get(library[2].file.name)).toBe(1);
-    expect(rawReads.get(library[3].file.name)).toBe(1);
-    expect(fetchMock).toHaveBeenCalledTimes(6);
+  it('evicts the least recently used volume when the volume cache is over capacity', async () => {
+    // v2 语义:发布形状是「清单 + 卷」,缓存单元从「整本书」变成「卷」(内容寻址,
+    // 键 = 卷路径@blob_sha,MAX_CACHED_VOLUMES = 8)。「第四本书进缓存时淘汰第一本」
+    // 的整本口径已不存在;这里保住同一冷热判据的唯一对应物:
+    // 每章独占一卷(单章 > 软目标),读满 9 卷后最冷的第 1 卷被淘汰 ⇒ 复读要重取;
+    // 而仍在缓存里的末卷复读零请求。
+    const chapters = Array.from({ length: 9 }, (_, index) => ({
+      title: `第${index + 1}章 冷热`, text: `CH${index}`.repeat(40),
+    }));
+    const book = volumeFixture({ id: 1, title: '冷热书', maxVolumeBytes: 64, chapters });
+    expect(book.volumes).toHaveLength(9); // 单章 > 软目标 ⇒ 每章一卷
+    mockVolumeArtifact(book);
+
+    await server.readBookIndex(book.task);
+    const version = book.manifest.blob_sha as string;
+    for (let index = 0; index < 9; index++) await server.readBookPart(book.task, index, 0, version);
+
+    // 末卷仍在缓存:复读零新请求。
+    const beforeHot = fetchMock.mock.calls.length;
+    const hot = await server.readBookPart(book.task, 8, 0, version);
+    expect(hot.text).toBe(`${chapters[8]!.title}\n${chapters[8]!.text}\n`);
+    expect(fetchMock.mock.calls.length).toBe(beforeHot);
+
+    // 第 1 卷已被 8 卷上限淘汰:复读必须重新拉取,且内容逐字节相同。
+    const cold = await server.readBookPart(book.task, 0, 0, version);
+    expect(fetchMock.mock.calls.length).toBe(beforeHot + 1);
+    expect(cold.text).toBe(`${chapters[0]!.title}\n${chapters[0]!.text}\n`);
   });
 
-  it('coalesces simultaneous directory and raw requests for the same book', async () => {
-    const book = fixture();
-    let releaseDirectory!: (response: Response) => void;
-    let releaseRaw!: (response: Response) => void;
-    fetchMock.mockImplementationOnce(() => new Promise((resolve) => { releaseDirectory = resolve; }))
-      .mockImplementationOnce(() => new Promise((resolve) => { releaseRaw = resolve; }));
+  it('coalesces simultaneous manifest requests for the same book into one fetch', async () => {
+    // v2 语义:并发同一本书的目录请求只在「清单」这一跳去重(manifestPending);
+    // 同一清单的两次 readBookIndex 必须共享同一个在途 raw 拉取,绝不重复拉清单。
+    const book = volumeFixture({ id: 1, maxVolumeBytes: 1024 * 1024, chapters: [{ title: '第一章 合流', text: '并发合流正文。' }] });
+    let releaseManifest!: (response: Response) => void;
+    applyVolumeArtifact(book);
+    fetchMock.mockImplementationOnce(() => new Promise((resolve) => { releaseManifest = resolve; }));
     const first = server.readBookIndex(book.task);
     const second = server.readBookIndex(book.task);
+    await vi.waitFor(() => expect(releaseManifest).toBeTypeOf('function'));
+    // 两次并发调用只发出清单这一跳 raw 拉取,且仍在途。
     expect(fetchMock).toHaveBeenCalledTimes(1);
-    releaseDirectory(Response.json([book.file]));
-    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
-    releaseRaw(new Response(book.text));
+    releaseManifest(new Response(JSON.stringify(book.manifest)));
     const [firstIndex, secondIndex] = await Promise.all([first, second]);
     expect(firstIndex).toEqual(secondIndex);
-    expect(fetchMock).toHaveBeenCalledTimes(2);
+    // 清单只被拉取一次(绝无第二次)。
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock).toHaveBeenCalledWith(expect.stringContaining('index.json'), expect.anything());
   });
 
   it('limits different in-flight books to two and frees capacity after they complete', async () => {
@@ -203,34 +389,46 @@ describe('reader server file resolution and bounded cache', () => {
   });
 
   it('maps parser limits consistently for every coalesced caller', async () => {
-    const text = Array.from({ length: 10_001 }, (_, index) => '第' + (index + 1) + '章 标题\n').join('');
-    const book = fixture(1, text);
-    mockBook(book);
+    // v2 语义:目录门限不再来自 parseTxtChapters 的章数上限,而是清单派生索引的字节门。
+    // 两次并发读同一本书必须**共享同一次清单拉取**,并拿到同一个 422(不得一个成功一个失败)。
+    const book = escapedTitleBook();
+    applyVolumeArtifact(book);
+    fetchMock.mockImplementation(volumeResponder(book) as never);
     const results = await Promise.allSettled([server.readBookIndex(book.task), server.readBookIndex(book.task)]);
     for (const result of results) {
       expect(result.status).toBe('rejected');
-      if (result.status === 'rejected') expect(result.reason).toMatchObject({ name: 'ReaderError', status: 422 });
+      if (result.status === 'rejected') expect(result.reason).toMatchObject({ status: 422 });
     }
-    expect(fetchMock).toHaveBeenCalledTimes(2);
+    const reasons = results.map(result => (result.status === 'rejected' ? (result.reason as Error).message : null));
+    expect(reasons[0]).toBe(reasons[1]);
+    // 清单只被拉取一次(合流)。
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
   it('bounds the actual JSON index bytes including control-character escaping, not just the chapter count', async () => {
-    const escapedText = Array.from({ length: 10_000 }, (_, index) =>
-      '第' + (index + 1) + '章 ' + '\u0001'.repeat(70) + '尾\n').join('');
-    const escapedBook = fixture(1, escapedText);
-    const plainBook = fixture(2, escapedText.replaceAll('\u0001', 'x'));
-    expect(escapedBook.bytes.byteLength).toBeLessThan(1024 * 1024);
-    expect(escapedBook.bytes.byteLength).toBe(plainBook.bytes.byteLength);
-    fetchMock.mockResolvedValueOnce(Response.json([escapedBook.file, plainBook.file]))
-      .mockResolvedValueOnce(new Response(escapedBook.text))
-      .mockResolvedValueOnce(new Response(plainBook.text));
-    const failure = await server.readBookIndex(escapedBook.task).then(() => null, (error: unknown) => error);
+    // v2 语义:目录来自清单的 `chapter_index`。控制字符在标题里被 JSON 转义成
+    // \uXXXX 后使索引膨胀 —— 同一批章节、等字节的纯文本标题必须仍可读,而转义标题版本必须 422。
+    // 两侧都钉住,防止把门限退化成只看章数。
+    const escaped = escapedTitleBook();
+    const plain = plainTitleBook();
+    // 清单 raw 与读端索引 JSON 是两个不同的门:构造出「清单未顶 4 MiB、索引顶穿」的窗口,
+    // 这样 422 只可能来自索引字节门(否则会先在清单 raw 拉取处 413)。
+    expect(manifestBytes(escaped)).toBeLessThan(4 * 1024 * 1024);
+    expect(indexJsonBytes(escaped)).toBeGreaterThan(4 * 1024 * 1024);
+    expect(indexJsonBytes(plain)).toBeLessThan(4 * 1024 * 1024);
+
+    applyVolumeArtifact(escaped);
+    fetchMock.mockImplementation(volumeResponder(escaped) as never);
+    const failure = await server.readBookIndex(escaped.task).then(() => null, (error: unknown) => error);
     expect(failure).toMatchObject({
-      status: 422, message: '章节目录过大，暂时无法在线阅读这本书。',
+      status: 422, message: '章节目录过大,暂时无法在线阅读这本书。',
     });
-    const plainIndex = await server.readBookIndex(plainBook.task);
-    expect(plainIndex.chapters).toHaveLength(10_000);
-    expect(Buffer.byteLength(JSON.stringify(plainIndex))).toBeLessThan(4 * 1024 * 1024);
+
+    applyVolumeArtifact(plain);
+    fetchMock.mockImplementation(volumeResponder(plain) as never);
+    const plainIndex = await server.readBookIndex(plain.task);
+    expect(plainIndex.chapters).toHaveLength(OVERSIZED_CHAPTERS);
+    expect(Buffer.byteLength(JSON.stringify(plainIndex), 'utf8')).toBeLessThan(4 * 1024 * 1024);
   });
 
   it('does not cache failed reads and allows a later request to retry', async () => {
