@@ -151,12 +151,19 @@ const TITLE_DECORATION = /[[【《〈「(](?:完结|全本|完本|全集|精品|
 function stripTitleWrappers(value: string): string {
   return value.replace(TITLE_DECORATION, '');
 }
-// 书名**本体**就是修饰词时(书就叫《全集》),整串会被 stripTitleWrappers 剥成空串;
-// 空串与空串相等不是「书名对上」的证据,而是「什么都没剩下」。此处退回「只去括号、保留词本体」
-// 比较,使《全集》↔【全集】仍能判档位 1,同时【全集】↔【番外】不会被提权(词本体不同)。
+// 书名**本体**就是修饰词、或修饰词被外层括号再包一层时(【全集】、`【[全本]】`),
+// `stripTitleWrappers` 剥完会只剩空串或**纯括号残壳**(`【】`)。空串/纯括号都不是「书名本体」,
+// 二者相等只说明「都没剩下东西」,不是「书名对上」。此时退回「只去括号、保留词本体」的形态:
+//   【全集】→「全集」、`【[全本]】`→「全本」、`【】`→「」(真无内容,仍不匹配)。
+// 这样《全集》↔【全集】、【[全本]】↔全本仍判档位 1,而【全集】↔【番外】、【[全本]】↔【[完结]】不判。
 const TITLE_BRACKETS = /[\]\[【】《》〈〉「」()]/gu;
 function stripTitleBrackets(value: string): string {
   return value.replace(TITLE_BRACKETS, '');
+}
+/** 档位 1 比较用的「书名本体」:剥完修饰后,空串或纯括号残壳一律退回剥括号的形态。 */
+function titleBody(value: string): string {
+  const stripped = stripTitleWrappers(stripTitleDecorations(value));
+  return stripped !== '' && stripTitleBrackets(stripped) !== '' ? stripped : stripTitleBrackets(value);
 }
 
 function editDistance(a: string, b: string): number {
@@ -187,12 +194,9 @@ export function sourceTitleSimilarity(expectedTitle: string, candidate: SourceBo
   for (const actual of candidates) {
     if (!actual) continue;
     if (actual === expected) best = Math.min(best, 0);
-    const strippedActual = stripTitleWrappers(stripTitleDecorations(actual));
-    const strippedExpected = stripTitleWrappers(stripTitleDecorations(expected));
-    // 剥离结果为**空串**时不进「空串===空串」档位 1:那说明两边都是纯修饰词(【全集】vs【番外】),
-    // 不是「书名对上」。退回「只去括号、保留词本体」比较:【全集】↔《全集》仍判 1,【番外】↛。
-    const bodyActual = strippedActual || stripTitleBrackets(actual);
-    const bodyExpected = strippedExpected || stripTitleBrackets(expected);
+    // 档位 1 比较「书名本体」:剥完修饰与括号残壳后的主体相等才算「书名对上」。空/纯括号残壳不进档位 1。
+    const bodyActual = titleBody(actual);
+    const bodyExpected = titleBody(expected);
     if (bodyActual !== '' && bodyActual === bodyExpected) best = Math.min(best, 1);
     const shorter = actual.length < expected.length ? actual : expected;
     const longer = actual.length < expected.length ? expected : actual;
