@@ -562,6 +562,49 @@ describe('online reader source resolution and budgets', () => {
     expect(catalog.bookUrl).toBe(pageUrl(96)); // 作者不符的 95 被作者门挡下,不误配
   });
 
+  it('degrades to SOURCE_SIMILAR when the fallback collects only decorated, unmatched detail pages', async () => {
+    // 真实场景「搜『鬼眼』:50 条候选无一精确,但书就在池里」:
+    // 搜索页锚文本全带修饰(【完结】书名)⇒ parseSourceSearch 精确层 0 候选 ⇒ 同页兜底接上;
+    // 兜底抓到的详情页里没有一页能过 sourceBookMatches(标题被修饰打过、作者也不符),
+    // 但其中一页的标题在模糊层是有限的相似档 ⇒ 必须 422 SOURCE_SIMILAR 带候选,绝不 404。
+    const titleSearch = 'https://book15.net/books/search.html?kw=' + encodeURIComponent(book.title);
+    const decorDetail = (id: number, title: string, author: string) =>
+      `<meta property="og:novel:book_name" content="${title}"><meta property="og:novel:author" content="${author}">`
+      + '<dd><a href="/chapter/index' + id + '-1.html">第一章</a></dd>'
+      + '<dd><a href="/chapter/index' + id + '-2.html">第二章</a></dd>';
+    pages.set(titleSearch, {
+      // 锚文本全程带修饰:精确层(锚文本归一后必须与书名相等)收 0 个。
+      text: '<a href="/books/details71.html" title="测试书">【完结】测试书</a>'
+        + '<a href="/books/details72.html" title="全球高武">【完结】全球高武</a>',
+    });
+    // 71:标题被修饰打过(归一后 ≠ 「测试书」⇒ 身份门不过),作者也不符 ⇒ 只能当模糊候选。
+    pages.set('https://book15.net/books/details71.html', { text: decorDetail(71, '【完结】测试书', '站点挂错的作者') });
+    // 72:完全无关(共享字符太少、编辑距离过大)⇒ 模糊层 Infinity 淘汰,不得进候选。
+    pages.set('https://book15.net/books/details72.html', { text: decorDetail(72, '全球高武', '别人') });
+    await expect(service.resolveSourceBook(book, context())).rejects.toMatchObject({
+      code: 'SOURCE_SIMILAR',
+      status: 422,
+      candidates: [{ title: '【完结】测试书', author: '站点挂错的作者', chapters: 2, bookUrl: 'https://book15.net/books/details71.html' }],
+    });
+  });
+
+  it('never auto-delivers when the only fallback candidate is a same-title different-author work', async () => {
+    // 反向负控(异厂审查点名):模糊层唯一候选是**同名异作者**、且没有任何正确候选 ⇒
+    // 必须 404/422 且**不得交付**。模糊层的宽松语义只放宽「交给用户选」,绝不放宽成
+    // 「把别人的书当目标书送出去」—— 没有交付路径能绕过这里。
+    const titleSearch = 'https://book15.net/books/search.html?kw=' + encodeURIComponent(book.title);
+    pages.set(titleSearch, { text: '<a href="/books/details71.html" title="测试书">【完结】测试书</a>' });
+    pages.set('https://book15.net/books/details71.html', {
+      text: '<meta property="og:novel:book_name" content="【完结】测试书"><meta property="og:novel:author" content="站点挂错的作者">'
+        + '<dd><a href="/chapter/index71-1.html">第一章</a></dd>',
+    });
+    const outcome = await service.resolveSourceBook(book, context())
+      .then((catalog) => ({ delivered: catalog }), (error: SourceReaderError) => ({ code: error.code, status: error.status }));
+    expect('delivered' in outcome).toBe(false); // 未交付
+    expect([404, 422]).toContain((outcome as { status: number }).status);
+    expect(['SOURCE_NOT_FOUND', 'SOURCE_SIMILAR']).toContain((outcome as { code: string }).code);
+  });
+
   it('never auto-delivers an unrelated detail page reached through the fallback', async () => {
     // 负控:兜底收到的详情页书名作者都对不上 ⇒ 不自动取书,交回既有判据(404,不放大到 503)。
     const titleSearch = 'https://book15.net/books/search.html?kw=' + encodeURIComponent(book.title);
