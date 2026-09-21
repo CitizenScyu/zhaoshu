@@ -145,7 +145,9 @@ function stripTitleDecorations(value: string): string {
 // 同一串（`[全本]余生` 与 `[典藏]余生` 都成 `余生`），造出假的「档位 1 = 书名直接对上」，
 // 进而在 parseSourceDetailLinks 里把无关详情页提权进 MAX_DETAIL_CANDIDATES 切片（40 任审查 B）。
 // 与上面的副标题剥离同属「书名字面之外的修饰」这一层语义。
-const TITLE_DECORATION = /[【《〈「(](?:完结|全本|完本|全集|精品|推荐|热门|连载|新书|免费|首发|独家|番外|无删减|已完结|txt|TXT)[】》〉」)]/gu;
+// 开闭字符类含 ASCII 方括号(`[全本]测试书`):`normalizeSourceTitle` 先做 NFKC,全角 `[]`(U+FF3B/U+FF3D)
+// 已折成 ASCII,故此处只需 ASCII `[` `]` 即可一并覆盖全角写法。
+const TITLE_DECORATION = /[[【《〈「(](?:完结|全本|完本|全集|精品|推荐|热门|连载|新书|免费|首发|独家|番外|无删减|已完结|txt|TXT)[\]】》〉」)]/gu;
 function stripTitleWrappers(value: string): string {
   return value.replace(TITLE_DECORATION, '');
 }
