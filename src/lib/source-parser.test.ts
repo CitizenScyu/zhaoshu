@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  chapterTitlesMatch, matchSourceChapter, normalizeChapterTitle,
   parseSourceIdentity, parseSourceChapters, parseSourceChapterText, parseSourceSearch,
   sourceBookMatches, sourceSearchUrl,
 } from './source-parser';
@@ -64,5 +65,58 @@ describe('supported source parser', () => {
 
   it('rejects a chapter whose heading disagrees with the directory', () => {
     expect(() => parseSourceChapterText('<h1>第二章</h1><li class="chapter-content"><p>正文</p></li>', '第一章')).toThrow('标题');
+    // 无关标题仍拒:换源后标题比对放宽(「第1章」=「第一章」),但底线不变 ——
+    // 正文页标题若既不是同章号也不是同一主体,绝不能当成这一章交付。
+    expect(() => parseSourceChapterText('<h1>风起云涌</h1><li class="chapter-content"><p>正文</p></li>', '第一章')).toThrow('标题');
+  });
+});
+
+// 洞 4:章节标题对齐(换源与正文校验共用)。归一化层吸收「第1章」/「第一章」这类同义写法,
+// 但完全无关的章必须落 Infinity —— 这正是本组负对照锚点存在的理由。
+describe('章节标题对齐(洞 4)', () => {
+  const chapters = (...titles: string[]) => titles.map((title, i) => ({ url: `https://book15.net/chapter/index42-${i + 1}.html`, title }));
+
+  it('折叠章号写法:第一章 = 第1章 = 第 1 章,并去尾部标点', () => {
+    expect(normalizeChapterTitle('第一章')).toBe(normalizeChapterTitle('第1章'));
+    expect(normalizeChapterTitle('第 1 章 风起')).toBe(normalizeChapterTitle('第一章风起'));
+    expect(normalizeChapterTitle('Chapter 1')).toBe(normalizeChapterTitle('Chapter 1'));
+    expect(normalizeChapterTitle('第十二章。')).toBe(normalizeChapterTitle('第12章'));
+    expect(normalizeChapterTitle('第1章')).not.toBe(normalizeChapterTitle('第2章'));
+  });
+
+  it('中文数字与阿拉伯数字互认(含百/千量级),但不同章号不互认', () => {
+    expect(normalizeChapterTitle('第一百零五章')).toBe(normalizeChapterTitle('第105章'));
+    expect(normalizeChapterTitle('第二十三章')).toBe(normalizeChapterTitle('第23章'));
+    expect(normalizeChapterTitle('第一百零五章')).not.toBe(normalizeChapterTitle('第一百五十章'));
+  });
+
+  it('chapterTitlesMatch:同义写法 true,完全无关 false(负对照)', () => {
+    expect(chapterTitlesMatch('第一章', '第1章')).toBe(true);
+    expect(chapterTitlesMatch('第一章 风起', '第1章 风起')).toBe(true);
+    expect(chapterTitlesMatch('第一章 风起', '第1章')).toBe(true);
+    expect(chapterTitlesMatch('第一章', '第三章')).toBe(false);
+    expect(chapterTitlesMatch('第一章', '全球高武')).toBe(false);
+    expect(chapterTitlesMatch('序章', '楔子')).toBe(false);
+  });
+
+  it('matchSourceChapter:跨站换写法也能定位到同一章', () => {
+    // 备用站把「第一章」写成「第1章 风起」:同章号即可对齐。
+    expect(matchSourceChapter(chapters('序言', '第1章 风起', '第2章'), '第一章 风起', 1)).toBe(1);
+    expect(matchSourceChapter(chapters('第1章', '第2章'), '第一章')).toBe(0);
+  });
+
+  it('matchSourceChapter:重名章取序号最接近当前章的一条,而不是直接失败', () => {
+    // 「番外」出现两次(站点把两卷番外同名):旧实现「必须唯一」→ 换源失败;
+    // 现在取离当前章序号最近的那一条。
+    const duplicated = chapters('第1章', '番外', '第2章', '第3章', '番外', '第4章');
+    expect(matchSourceChapter(duplicated, '番外', 4)).toBe(4);
+    expect(matchSourceChapter(duplicated, '番外', 1)).toBe(1);
+  });
+
+  it('matchSourceChapter:没有标题证据时宁可 null,绝不按序号交付别的章(负对照)', () => {
+    // 备用站只有小标题(无章号):序号不构成「这是同一章」的证明 —— 静默交付另一章
+    // 比 503 更糟(用户读完才发现串章且无从重试),故一律 null。
+    expect(matchSourceChapter(chapters('起风', '落雨', '归途'), '第2章', 1)).toBeNull();
+    expect(matchSourceChapter(chapters('起风', '落雨', '归途', '重逢'), '第三章')).toBeNull();
   });
 });

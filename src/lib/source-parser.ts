@@ -10,6 +10,109 @@ export function normalizeSourceTitle(value: string): string {
   return value.normalize('NFKC').trim().replace(/^《(.+)》$/, '$1').replace(/\s+/gu, '').toLocaleLowerCase();
 }
 
+// ---- 章节标题对齐(换源与正文校验共用) ----
+// 章节标题比书名更易漂移:同一本书在别的书源上常被写成「第1章」/「第 1 章」/「第一章」,
+// 站点也可能改写尾部标点或省略章号。折叠层只吸收这些**同义写法**,底限不变:完全无关的章不得匹配。
+const CHAPTER_MARKER = /^第([零〇一二三四五六七八九十百千万两\d]+)([章节回卷篇部集])/u;
+const CHAPTER_TAIL = /[.。、,;:;:!！??·…~—-]+$/u;
+const CN_DIGITS: Record<string, number> = { 零: 0, 〇: 0, 一: 1, 二: 2, 两: 2, 三: 3, 四: 4, 五: 5, 六: 6, 七: 7, 八: 8, 九: 9 };
+/** 「第N章」纯序数标题的最长归一化长度(两位数,如「第12章」);短于此长度的标题不做包含档。 */
+const ORDINAL_ONLY_LENGTH = '第12章'.length;
+
+/** 章号量级的中文数字→阿拉伯数字(支持「十/十二/二十三/一百零五/两千」);非章号写法返回 null。 */
+function chapterNumber(value: string): number | null {
+  if (/^\d+$/.test(value)) return Number(value);
+  let total = 0;
+  let section = 0;
+  let current = 0;
+  for (const char of value) {
+    const digit = CN_DIGITS[char];
+    if (digit !== undefined) { current = digit; continue; }
+    if (char === '十') { section += (current || 1) * 10; current = 0; continue; }
+    if (char === '百') { section += (current || 1) * 100; current = 0; continue; }
+    if (char === '千') { section += (current || 1) * 1000; current = 0; continue; }
+    if (char === '万') { total += (section + current || 1) * 10_000; section = 0; current = 0; continue; }
+    return null;
+  }
+  return total + section + current;
+}
+
+interface ChapterKey {
+  /** 折叠章号写法后的比较键:「第一章」与「第1章」同为「第1章」。 */
+  key: string;
+  /** 显式章号(「第N章」的 N);无章号写法时为 null。 */
+  number: number | null;
+  /** 去掉章号标记后的标题主体(「第1章 风起」→「风起」)。 */
+  rest: string;
+}
+
+function chapterKey(value: string): ChapterKey {
+  const normalized = normalizeSourceTitle(value).replace(CHAPTER_TAIL, '');
+  const matched = CHAPTER_MARKER.exec(normalized);
+  if (!matched) return { key: normalized, number: null, rest: normalized };
+  const number = chapterNumber(matched[1]);
+  if (number === null) return { key: normalized, number: null, rest: normalized };
+  const rest = normalized.slice(matched[0].length).replace(CHAPTER_TAIL, '');
+  return { key: `第${number}${matched[2]}${rest}`, number, rest };
+}
+
+/** 章节标题归一化:标题归一化 + 章号写法折叠(「第一章」=「第1章」)+ 去尾部标点。 */
+export function normalizeChapterTitle(value: string): string {
+  return chapterKey(value).key;
+}
+
+/**
+ * 相似档位,越小越优;Infinity = 不相似(负对照锚点:完全无关的章必须落这里)。
+ * 底线:章号/主体都对不上时,只有归一化标题**互相包含且公共部分够长**才放行 ——
+ * 「第一章」与「第三章」这类无公共主体的标题永远落 Infinity。
+ */
+function chapterTier(expected: ChapterKey, actual: ChapterKey): number {
+  if (actual.key === expected.key) return 0;
+  if (expected.number !== null && actual.number !== null && expected.number === actual.number) {
+    if (actual.rest === expected.rest) return 1;
+    // 一侧只写了章号、另一侧还带主体(「第1章」/「第1章 风起」):同章号即成立。
+    if (!expected.rest || !actual.rest) return 2;
+    // 同章号 + 主体互相包含(「风起」/「风起了」):章号已对齐,主体只需近似。
+    if (containable(expected.rest, actual.rest, 2)) return 3;
+  }
+  // 键内包含:主体已参与比较(「第1章 风起」/「第一章 风起与云涌」),公共部分取 4 字下限;
+  // 纯序数标题短于该下限 ⇒ 不适用(3 字标题的包含在中文里太容易凑巧)。
+  return containable(expected.key, actual.key, ORDINAL_ONLY_LENGTH < expected.key.length ? 4 : 5)
+    ? 4 : Number.POSITIVE_INFINITY;
+}
+
+function containable(a: string, b: string, min: number): boolean {
+  const shorter = a.length <= b.length ? a : b;
+  const longer = a.length <= b.length ? b : a;
+  return shorter.length >= min && longer.includes(shorter);
+}
+
+/** 目录里某章是否就是期望的章(标题层判据;完全无关的章为 false)。 */
+export function chapterTitlesMatch(expectedTitle: string, actualTitle: string): boolean {
+  return chapterTier(chapterKey(expectedTitle), chapterKey(actualTitle)) !== Number.POSITIVE_INFINITY;
+}
+
+/**
+ * 在备用目录里定位期望的章,返回其下标;找不到返回 null(调用方 503)。
+ * 档位:键相等 → 同章号且主体相等 → 同章号一方带主体 → 同章号且主体包含 → 键互相包含。
+ * 同档多命中(重名章)不再直接失败,而是取**序号最接近** preferredIndex 的那一条。
+ */
+export function matchSourceChapter(chapters: SourceChapter[], expectedTitle: string, preferredIndex?: number): number | null {
+  const expected = chapterKey(expectedTitle);
+  const distance = (index: number) => preferredIndex === undefined ? 0 : Math.abs(index - preferredIndex);
+  let bestIndex = -1;
+  let bestTier = Number.POSITIVE_INFINITY;
+  for (let index = 0; index < chapters.length; index++) {
+    const tier = chapterTier(expected, chapterKey(chapters[index].title));
+    if (tier === Number.POSITIVE_INFINITY) continue;
+    if (tier < bestTier || (tier === bestTier && distance(index) < distance(bestIndex))) { bestIndex = index; bestTier = tier; }
+  }
+  // **不做「按目录序号兜底交付」**:备用目录里没有标题证据时,序号不构成「这是同一章」的证明,
+  // 静默交付另一章比 503 更糟(用户可能读完才发现串章,且无从重试)。宁可 503 ——
+  // 与「完全无关的章不得匹配」这条底线同源。
+  return bestIndex >= 0 ? bestIndex : null;
+}
+
 export function knownSourceAuthor(value: string): string {
   const normalized = value.normalize('NFKC').trim().replace(/\s+/gu, '').toLocaleLowerCase();
   return ['', '佚名', '未知', '未知作者'].includes(normalized) ? '' : normalized;
@@ -166,7 +269,8 @@ export function parseSourceChapters(html: string, pageUrl: string): SourceChapte
 export function parseSourceChapterText(html: string, expectedTitle?: string): string {
   // Anchor to the actual content <li>, excluding menus, ads and navigation.
   const heading = /<h1\b[^>]*>([\s\S]*?)<\/h1>/i.exec(html)?.[1];
-  if (expectedTitle && heading && normalizeSourceTitle(plainText(heading)) !== normalizeSourceTitle(expectedTitle)) {
+  // 与目录对齐同用一套折叠判据(「第1章」=「第一章」);完全无关的标题仍然拒绝。
+  if (expectedTitle && heading && !chapterTitlesMatch(expectedTitle, plainText(heading))) {
     throw new SourcePolicyError('章节标题与目录不符');
   }
   const segment = [...html.matchAll(/<li\b([^>]*)>([\s\S]*?)<\/li>/gi)]
