@@ -147,7 +147,7 @@ describe('parseTxtChapters', () => {
     expect(chapters.at(-1)?.index).toBe(MAX_READER_CHAPTERS - 1);
     expect(chapters.at(-1)?.endByte).toBe(bytes.length);
     expect(() => parseTxtChapters(encode('第一章\n'.repeat(MAX_READER_CHAPTERS + 1))))
-      .toThrow(new RangeError('TXT 章节数量超过 10000，暂时无法生成目录。'));
+      .toThrow(new RangeError(`TXT 章节数量超过 ${MAX_READER_CHAPTERS}，暂时无法生成目录。`));
     expect(() => parseTxtChapters(encode(`书前说明\n${'第一章\n'.repeat(MAX_READER_CHAPTERS)}`)))
       .toThrow(RangeError);
   });

@@ -13,6 +13,10 @@ const atomic = (path, data) => {
   renameSync(temp, path);
 };
 const knownError = /^(identity_mismatch_or_no_candidate|empty_toc|empty_toc_page|pagination_cycle|toc_limit|unsupported_toc_rule|invalid_chapter|invalid_next_page|empty_content_page|content_page_limit|unsupported_content_rule|max_chapters|size_limit|toc_changed|missing_chapters|interrupted|budget_exhausted|operation_timeout|empty_content)$/;
+
+// 发布侧整本上限(内存约束,分卷 v2)：15 MiB → 64 MiB。阅读侧已无整本上限(按卷懒取)，
+// 这里只卡引擎与发布器把整本当字符串持有的内存峰值；二期按章流式写后解除。
+const MAX_BOOK_BYTES = 64 * 1024 * 1024;
 export function downloadOptions(args) {
   if (!args.source || !args.title?.trim() || !args.author?.trim()) throw new Error('download 需要 --source --title --author');
   const source = new URL(args.source.includes('://') ? args.source : `https://${args.source}`);
@@ -133,7 +137,7 @@ export async function downloadBook(m, args, resolveSource, transport = fetchSour
         });
         if (!text.trim()) throw new Error('empty_content');
         bytes += Buffer.byteLength(chapter.title + '\n\n' + text + '\n\n');
-        if (bytes > 15 * 1024 * 1024) throw new Error('size_limit');
+        if (bytes > MAX_BOOK_BYTES) throw new Error('size_limit');
         atomic(path, text);
         Object.assign(chapter, { status: 'done', chars: [...text].length, sha256: hash(text) });
       } catch (error) {

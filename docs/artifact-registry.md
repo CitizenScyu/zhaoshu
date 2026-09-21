@@ -55,8 +55,13 @@ exact capacity lock**. T3/T8 must reconcile and enforce allocation separately.
 [GitHub Contents API](https://docs.github.com/en/rest/repos/contents?apiVersion=2022-11-28)
 supports raw/object media types for 1–100 MB files. Object metadata has empty
 `content` and `encoding: "none"`; neither existing fallback reads that field.
-Both readers fetch actual bytes with raw media types. The online reader retains
-its existing 16 MiB limit. Files over 100 MB require a separate API/protocol.
+Both readers fetch actual bytes with raw media types. The online reader's
+**single-file** limit is 16 MiB (a tampered manifest must not make the server
+fetch a huge "volume"); the **whole-book** limit is gone — a volume-split
+artifact (`canonical_path` ends in `/index.json`) declares the book's logical
+bytes as `Σ volumes[].bytes` in its manifest, and chapters are fetched one
+volume at a time. Publishing still caps a book at 64 MiB (an in-memory
+constraint). Files over 100 MB require a separate API/protocol.
 
 Rollback preserves the added tables, column and all registered locations. Pause
 new allocation/publication and use this compatible reader; reverting the global
