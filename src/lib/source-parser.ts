@@ -145,9 +145,25 @@ function stripTitleDecorations(value: string): string {
 // 同一串（`[全本]余生` 与 `[典藏]余生` 都成 `余生`），造出假的「档位 1 = 书名直接对上」，
 // 进而在 parseSourceDetailLinks 里把无关详情页提权进 MAX_DETAIL_CANDIDATES 切片（40 任审查 B）。
 // 与上面的副标题剥离同属「书名字面之外的修饰」这一层语义。
-const TITLE_DECORATION = /[【《〈「(](?:完结|全本|完本|全集|精品|推荐|热门|连载|新书|免费|首发|独家|番外|无删减|已完结|txt|TXT)[】》〉」)]/gu;
+// 开闭字符类含 ASCII 方括号(`[全本]测试书`):`normalizeSourceTitle` 先做 NFKC,全角 `[]`(U+FF3B/U+FF3D)
+// 已折成 ASCII,故此处只需 ASCII `[` `]` 即可一并覆盖全角写法。
+const TITLE_DECORATION = /[[【《〈「(](?:完结|全本|完本|全集|精品|推荐|热门|连载|新书|免费|首发|独家|番外|无删减|已完结|txt|TXT)[\]】》〉」)]/gu;
 function stripTitleWrappers(value: string): string {
   return value.replace(TITLE_DECORATION, '');
+}
+// 书名**本体**就是修饰词、或修饰词被外层括号再包一层时(【全集】、`【[全本]】`),
+// `stripTitleWrappers` 剥完会只剩空串或**纯括号残壳**(`【】`)。空串/纯括号都不是「书名本体」,
+// 二者相等只说明「都没剩下东西」,不是「书名对上」。此时退回「只去括号、保留词本体」的形态:
+//   【全集】→「全集」、`【[全本]】`→「全本」、`【】`→「」(真无内容,仍不匹配)。
+// 这样《全集》↔【全集】、【[全本]】↔全本仍判档位 1,而【全集】↔【番外】、【[全本]】↔【[完结]】不判。
+const TITLE_BRACKETS = /[\]\[【】《》〈〉「」()]/gu;
+function stripTitleBrackets(value: string): string {
+  return value.replace(TITLE_BRACKETS, '');
+}
+/** 档位 1 比较用的「书名本体」:剥完修饰后,空串或纯括号残壳一律退回剥括号的形态。 */
+function titleBody(value: string): string {
+  const stripped = stripTitleWrappers(stripTitleDecorations(value));
+  return stripped !== '' && stripTitleBrackets(stripped) !== '' ? stripped : stripTitleBrackets(value);
 }
 
 function editDistance(a: string, b: string): number {
@@ -178,7 +194,10 @@ export function sourceTitleSimilarity(expectedTitle: string, candidate: SourceBo
   for (const actual of candidates) {
     if (!actual) continue;
     if (actual === expected) best = Math.min(best, 0);
-    if (stripTitleWrappers(stripTitleDecorations(actual)) === stripTitleWrappers(stripTitleDecorations(expected))) best = Math.min(best, 1);
+    // 档位 1 比较「书名本体」:剥完修饰与括号残壳后的主体相等才算「书名对上」。空/纯括号残壳不进档位 1。
+    const bodyActual = titleBody(actual);
+    const bodyExpected = titleBody(expected);
+    if (bodyActual !== '' && bodyActual === bodyExpected) best = Math.min(best, 1);
     const shorter = actual.length < expected.length ? actual : expected;
     const longer = actual.length < expected.length ? expected : actual;
     if (shorter.length >= MIN_CONTAINMENT_LENGTH && longer.includes(shorter)) best = Math.min(best, 2);

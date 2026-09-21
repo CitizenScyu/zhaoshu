@@ -133,11 +133,37 @@ describe('sourceTitleSimilarity (fuzzy tier thresholds)', () => {
     // 站点加在书名**之外**的状态修饰按档位 1 折叠（book15 实测「【完结】书名」）。
     expect(sourceTitleSimilarity('测试书', { title: '【完结】测试书', author: '' })).toBe(1);
     expect(sourceTitleSimilarity('测试书', { title: '测试书(全本)', author: '' })).toBe(1);
+    // 正向钉:方括号是同一种站点修饰,修好之后必须被剥 ⇒ 档位 1(缺 [ ] 时这里是 Infinity)。
+    expect(sourceTitleSimilarity('测试书', { title: '[全本]测试书', author: '' })).toBe(1);
     // 反例 1：见成对符号就剥会把**不同**书剥成同一串（都成「余生」）⇒ 假的「书名直接对上」，
     // 进而在 parseSourceDetailLinks 里把无关详情页提权进 MAX_DETAIL_CANDIDATES 切片。
-    expect(sourceTitleSimilarity('[全本]余生', { title: '[典藏]余生', author: '' })).not.toBe(1);
+    expect(sourceTitleSimilarity('【全本】余生', { title: '【典藏】余生', author: '' })).not.toBe(1);
     // 反例 2：书名本体里的方括号编号不是修饰，剥掉会让「…【1】」与「…【2】」互相假匹配。
     expect(sourceTitleSimilarity('大奉打更人【1】', { title: '大奉打更人【2】', author: '' })).not.toBe(1);
+  });
+
+  it('does not treat a decoration-only title (empty body) as tier 1 (40 任审查 B / 空串假等)', () => {
+    // 【全集】/【番外】都是纯修饰词,剥光后是空串:空串===空串不是「书名对上」的证据 ⇒ 不得判档位 1。
+    expect(sourceTitleSimilarity('【全集】', { title: '【番外】', author: '' })).not.toBe(1);
+    expect(sourceTitleSimilarity('【完结】', { title: '【精品】', author: '' })).not.toBe(1);
+    // 反向:真书名本体就叫《全集》时,【全集】应能判档位 1(词本体相等,只是被加了括号)。
+    expect(sourceTitleSimilarity('全集', { title: '【全集】', author: '' })).toBe(1);
+    expect(sourceTitleSimilarity('番外', { title: '【番外】', author: '' })).toBe(1);
+  });
+
+  it('does not treat a bracket-only residue (outer brackets around a stripped decoration) as tier 1', () => {
+    // 外层括号再包一层白名单修饰词时,stripTitleWrappers 剥完只剩括号残壳(【】)。残壳非空,
+    // 旧的「空串守卫」不触发 ⇒ 两串按 【】===【】 假判档位 1(rev41decor P1)。
+    // 四种外层括号形态一并钉。
+    expect(sourceTitleSimilarity('【[全本]】', { title: '【[完结]】', author: '' })).not.toBe(1);
+    expect(sourceTitleSimilarity('「[全本]」', { title: '「[完结]」', author: '' })).not.toBe(1);
+    expect(sourceTitleSimilarity('〈[全本]〉', { title: '〈[完结]〉', author: '' })).not.toBe(1);
+    expect(sourceTitleSimilarity('[[全本]]', { title: '[[完结]]', author: '' })).not.toBe(1);
+    // 与「只剩括号、没有词」的空壳也不得假等。
+    expect(sourceTitleSimilarity('【[全本]】', { title: '【】', author: '' })).not.toBe(1);
+    // 反向:退化到本体后,真书《全本》仍能与带外层括号的写法判档位 1。
+    expect(sourceTitleSimilarity('【[全本]】', { title: '全本', author: '' })).toBe(1);
+    expect(sourceTitleSimilarity('「[全本]」', { title: '全本', author: '' })).toBe(1);
   });
 
   it('ranks containment at tier 2 only when the shorter side is at least 4 chars', () => {
