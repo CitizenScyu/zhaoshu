@@ -1240,3 +1240,95 @@ describe('引擎源正文分派（N01）', () => {
   });
 });
 
+
+// M3 手动换源:surveySourceBooks 逐源扫描 + alternates 路由分支。
+// 与 resolveSourceBook 的差异(†):首命中即 break、单源失败记 unreachable 继续、不跨源去重、
+// 不抛 422 AMBIGUOUS、独立池上限 min(池, 6)。
+describe('M3 surveySourceBooks 换源扫描', () => {
+  const search = (kw: string, host = 'https://book15.net') => host + '/books/search.html?kw=' + encodeURIComponent(kw);
+  const sourceB = { ...source, url: 'https://backup.test/', name: '备用书源', searchUrl: '/books/search.html?kw={{key}}' };
+  const bSearch = backupSearch();
+  const primeHitB = () => {
+    pages.set(bSearch, { text: '<a href="/books/details777.html">测试书</a>' });
+    pages.set(backupPage, { text: detail(777) }); // 备用源命中详情页
+  };
+
+  it('逐源扫描:各源独立命中 ⇒ 均记 ok(含各自 bookUrl/title/chapters),不跨源去重', async () => {
+    primeHitB();
+    mocks.sources.mockResolvedValue([source, sourceB]);
+    const { sources, partial } = await service.surveySourceBooks(book, context());
+    expect(partial).toBe(false);
+    const ok = sources.find((item) => item.sourceName === '备用书源');
+    expect(ok).toMatchObject({ status: 'ok', bookUrl: backupPage, title: '测试书', chapters: 2 });
+    // 首源(book15 默认夹具命中)同样记 ok:survey 不做跨源去重,两源各留一条候选。
+    expect(sources.find((item) => item.sourceName === '测试书源')).toMatchObject({ status: 'ok', bookUrl: pageUrl() });
+  });
+
+  it('单源失败(网络)→ 该源 unreachable,继续下一源,不中断全局', async () => {
+    // 首源搜索页连接层失败页面 ;备源命中。
+    pages.set(search(book.title), networkFailure);
+    pages.set(search(book.author), networkFailure);
+    mocks.sources.mockResolvedValue([source, sourceB]);
+    primeHitB();
+    const { sources } = await service.surveySourceBooks(book, context());
+    expect(sources.find((item) => item.sourceName === '测试书源')).toMatchObject({ status: 'unreachable' });
+    expect(sources.find((item) => item.sourceName === '备用书源')).toMatchObject({ status: 'ok' });
+  });
+
+  it('excludeBookUrl 命中的候选被跳过(当前源排除)', async () => {
+    pages.set(search(book.title), { text: '<a href="/books/details42.html">测试书</a>' });
+    pages.set(pageUrl(), { text: detail() });
+    mocks.sources.mockResolvedValue([source]);
+    const { sources } = await service.surveySourceBooks(book, context(), { excludeBookUrl: pageUrl() });
+    expect(sources[0]).toMatchObject({ status: 'miss' }); // 唯一候选被排除 ⇒ miss
+  });
+
+  it('currentSourceName 命中 ⇒ 该源回填 current(与探测状态无关)', async () => {
+    mocks.sources.mockResolvedValue([source, sourceB]);
+    pages.set(search(book.title), { text: '' });
+    pages.set(search(book.author), { text: '' });
+    const { sources } = await service.surveySourceBooks(book, context(), {
+      currentSourceName: '测试书源', excludeBookUrl: pageUrl(),
+    });
+    expect(sources.find((item) => item.sourceName === '测试书源')).toMatchObject({ status: 'miss', current: true });
+  });
+
+  it('池超过 6 源 ⇒ 独立池上限 min(池, 6):第 7 源不扫', async () => {
+    const many = Array.from({ length: 7 }, (_, i) => ({ ...source, url: `https://book15.net/s${i}/`, name: `源${i}` }));
+    mocks.sources.mockResolvedValue(many);
+    for (const item of many) pages.set(item.url.replace(/\/$/, '') + '/books/search.html?kw=' + encodeURIComponent(book.title), { text: '' });
+    const { sources } = await service.surveySourceBooks(book, context());
+    expect(sources).toHaveLength(6);
+    expect(sources.some((item) => item.sourceName === '源6')).toBe(false);
+  });
+
+  it('软预算到点 ⇒ partial=true,后续源不再扫', async () => {
+    primeHitB();
+    mocks.sources.mockResolvedValue([source, sourceB, { ...sourceB, url: 'https://backup.test/c', name: '第三源' }]);
+    const ctx = context();
+    vi.mocked(Date.now).mockReturnValue(ctx.startedAt + 46_000); // elapsed 46000 > SOFT_BUDGET
+    const { sources, partial } = await service.surveySourceBooks(book, ctx);
+    expect(partial).toBe(true);
+    expect(sources).toHaveLength(1);
+  });
+
+  it('GET /api/read/source/alternates:200 返回 sources/partial,session 过期降级为无标记', async () => {
+    primeHitB();
+    mocks.sources.mockResolvedValue([source, sourceB]);
+    const res = await request('alternates', 'title=测试书&author=作者&session=' + 'a'.repeat(40));
+    expect(res.status).toBe(200);
+    expectPrivate(res);
+    const body = await res.json();
+    expect(body.partial).toBe(false);
+    expect(Array.isArray(body.sources)).toBe(true);
+    expect(body.sources.some((item: { status: string }) => item.status === 'ok')).toBe(true);
+    // session 过期(source_read_catalogs 无此 id)⇒ 不标 current、不排除源,不报错。
+    expect(body.sources.every((item: { current?: boolean }) => item.current !== true)).toBe(true);
+  });
+
+  it('GET /api/read/source/alternates:缺 title ⇒ 400', async () => {
+    const res = await request('alternates', 'author=作者');
+    expect(res.status).toBe(400);
+    expectPrivate(res);
+  });
+});
