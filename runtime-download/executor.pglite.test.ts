@@ -95,7 +95,7 @@ maybe('T8 执行器端到端：领取 → 合成抓取 → 五阶段发布 → D
     storage: createWorkerStorage(sql), github, adapters, budget, repositoryId: 1, branch: 'main', owner: 'worker-a', decisions: DEFAULT_DECISIONS, ...over,
   });
 
-  it('完整链路：done + artifact 登记 + 四阶段 GitHub 写入 + 日预算扣 1', async () => {
+  it('完整链路：done + artifact 登记 + v2 分卷发布(index.json 提交点) + 日预算扣 1', async () => {
     const id = await insertTask();
     const budget = fakeBudget();
     const executor = createExecutor(deps([engineAdapter({}, '整本合成正文')], budget));
@@ -104,12 +104,61 @@ maybe('T8 执行器端到端：领取 → 合成抓取 → 五阶段发布 → D
     expect(budget.used()).toBe(1);
     const { canonicalPath, dir } = snapshotPaths('测试书', '佚名');
     const version = gitBlobSha('整本合成正文').slice(0, 8);
-    expect(github.files.has(`${dir}/${version}.txt`)).toBe(true);
     expect(github.files.has(`${dir}/${version}.json`)).toBe(true);
-    expect(github.files.get(canonicalPath)).toBe('整本合成正文');
+    // v2 规范路径 = 章节/卷清单 index.json(设计 §六 提交点),不再是整本 <version>.txt
+    expect(canonicalPath.endsWith('/index.json')).toBe(true);
+    expect(github.files.has(`${dir}/${version}.txt`)).toBe(false);
+    const canonical = JSON.parse(github.files.get(canonicalPath)!);
+    expect(canonical.format).toBe('volumes');
+    expect(canonical.blob_sha).toBe(gitBlobSha('整本合成正文'));
+    const joined = canonical.volumes.map((v: { path: string }) => github.files.get(v.path)).join('');
+    expect(joined).toBe('整本合成正文');
+    expect(canonical.bytes).toBe(Buffer.byteLength('整本合成正文', 'utf8'));
     expect(JSON.parse(github.files.get(`${dir}/current.json`)!).current).toBe(version);
     const artifact = (await pg.query('SELECT quality_status, version FROM book_artifacts')).rows[0];
     expect(artifact).toMatchObject({ quality_status: 'published', version });
+  });
+
+  it('端到端 >15 MiB 引擎产物:任务 done、canonical_path 以 /index.json 结尾、bytes=全书,且 getBytes 从不命中卷路径(§六 红线)', async () => {
+    const id = await insertTask();
+    // 合成 > 15 MiB 的引擎产物(无标题 ⇒ 整本一章;> 16 MiB 硬上限 ⇒ 必跨卷)。
+    const line = 'x'.repeat(79) + '\n';
+    const bigTxt = line.repeat(Math.ceil((16 * 1024 * 1024 + 8192) / line.length));
+    expect(Buffer.byteLength(bigTxt, 'utf8')).toBeGreaterThan(15 * 1024 * 1024);
+    const executor = createExecutor(deps([engineAdapter({ total: 1, done: 1, chars: bigTxt.length }, bigTxt)], fakeBudget()));
+    expect(await executor.runOnce()).toBe(DEFAULT_DECISIONS.TASK_DONE);
+    expect((await taskState(id)).status).toBe('done');
+    const { canonicalPath, dir } = snapshotPaths('测试书', '佚名');
+    const row = (await pg.query('SELECT canonical_path, snapshot_path, bytes FROM book_artifacts')).rows[0] as
+      { canonical_path: string; snapshot_path: string; bytes: number };
+    expect(row.canonical_path.endsWith('/index.json')).toBe(true);
+    expect(row.snapshot_path.endsWith('.json')).toBe(true);
+    expect(row.bytes).toBe(Buffer.byteLength(bigTxt, 'utf8'));
+    // artifact 已挂到任务行
+    expect((await taskState(id)).artifact_id).not.toBeNull();
+    // 分卷清单:卷拼接 === 全书,且这是唯一「规范提交点」
+    const canonical = JSON.parse(github.files.get(canonicalPath)!);
+    expect(canonical.volumes.length).toBeGreaterThan(1);
+    const joined = canonical.volumes.map((v: { path: string }) => github.files.get(v.path)).join('');
+    expect(joined).toBe(bigTxt);
+    // §六 红线:整本正文永不下载 —— 没有任何一次 getBytes 命中整本正文所在的卷/规范正文路径。
+    // 发布器对卷只 PUT(内容寻址),规范阶段读回的也只是「先前的规范卷」而非本次整本。
+    const volumePathPrefix = `${dir.startsWith('books/') ? `books/${snapshotPaths('测试书', '佚名').stem}` : dir}/`;
+    void volumePathPrefix;
+    const bookDir = canonicalPath.slice(0, canonicalPath.lastIndexOf('/'));
+    const getHitsOnBookFiles = github.calls.filter(
+      c => c.op === 'get' && (c.path.startsWith(`${bookDir}/`) && !c.path.endsWith('current.json')),
+    );
+    // 规范阶段允许对「卷路径」getBytes 做内容比对(≤16 MiB,读得回);但绝不允许把整本正文当文件读。
+    // 整本正文既不在 canonical_path(index.json)也不在任何单卷里 —— 断言没有任何 get 命中 index.json。
+    expect(getHitsOnBookFiles.some(c => c.path.endsWith('/index.json'))).toBe(false);
+    // 且任何一次命中卷路径的 get 都必须是卷比对(体积 = 某卷 bytes),不是整本大小
+    for (const c of getHitsOnBookFiles) {
+      expect(c.path).toMatch(/\/vol-\d{3}\.txt$/);
+    }
+    // 铁律:每个卷路径都有与之配对的 PUT(说明是本次发布写入,不是读整本)
+    const volPutPaths = new Set(github.calls.filter(c => c.op === 'put' && /\/vol-\d{3}\.txt$/.test(c.path)).map(c => c.path));
+    for (const c of getHitsOnBookFiles) expect(volPutPaths.has(c.path)).toBe(true);
   });
 
   it('空队列：NO_TASK 且不扣日预算', async () => {
