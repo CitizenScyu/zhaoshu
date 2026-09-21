@@ -274,7 +274,7 @@ export function useReader(session: ReadingSession, apiFetch: ApiFetch, userId: n
     if (session.kind !== 'source' || !bookUrl) return;
     flushPosition();
     const current = currentReading.current;
-    if (current?.index.source) {
+    if (current?.index.source && progress.current) {
       pendingMigration.current = { progress: progress.current, fromIndex: current.index };
     }
     setIndexUrl('/api/read/source/index?' + new URLSearchParams({ title: session.title, author: session.author, book_url: bookUrl }));
