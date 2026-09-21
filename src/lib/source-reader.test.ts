@@ -492,9 +492,11 @@ describe('online reader source resolution and budgets', () => {
   });
 
   it('bounds a miss with the same-page fallback inside the previous request ceiling', async () => {
-    // 新增候选收集兜底后重算:标题搜索 1 + 同页兜底切片(MAX_DETAIL_CANDIDATES=4)+ 模糊补抓 ≤2。
-    // 站点吐 23 条详情链接时兜底切片先走,作者搜索仍会触发(它判的是「精确层 0 候选」),
-    // 但两者共用同一切片宽度,请求数不放大 —— 这是防「站点把整站链接都吐出来」的定量红线。
+    // 定量红线:站点吐 23 条详情链接时,同页兜底切片与作者搜索回退**共用**同一个
+    // MAX_DETAIL_CANDIDATES=4 宽度,请求数不放大。精确构成:
+    //   标题搜索 1 + 同页兜底 inspect 4 + 作者搜索 1 + 作者层重走已核验候选 0(checked 去重)+ 模糊补抓 2 = 8。
+    // 关键回归:同页兜底捡到无关详情链接**不得**关掉作者搜索回退 —— 它判的是「精确层 0 候选」,
+    // 不是「candidates 是否为空」(40 任实测:改判据前作者搜索根本没跑,改名书路径被掐断)。
     const target = { title: '改名书', author: '作者A' };
     const titleSearch = 'https://book15.net/books/search.html?kw=' + encodeURIComponent(target.title);
     const authorSearch = 'https://book15.net/books/search.html?kw=' + encodeURIComponent(target.author);
@@ -505,8 +507,33 @@ describe('online reader source resolution and budgets', () => {
     pages.set(titleSearch, { text: links });
     pages.set(authorSearch, { text: links });
     for (let i = 0; i < 23; i++) pages.set(pageUrl(800 + i), { text: unrelatedDetail(800 + i, '无关书' + i, '别人') });
-    await expect(service.resolveSourceBook(target, context())).rejects.toMatchObject({ code: 'SOURCE_UNAVAILABLE' });
-    expect(mocks.fetch.mock.calls.length).toBeLessThanOrEqual(8);
+    // 23 个候选页全部抓取成功、身份全不符 ⇒ 这是「完整搜索后的未找到」(404),不是「书源故障」(503)。
+    await expect(service.resolveSourceBook(target, context())).rejects.toMatchObject({ code: 'SOURCE_NOT_FOUND', status: 404 });
+    expect(mocks.fetch.mock.calls.length).toBe(8);
+  });
+
+  it('still runs the author fallback when the same-page fallback only returns unrelated books', async () => {
+    // A 点回归(核心):标题搜索页有详情链接但都是**无关书**,精确层 0 候选;
+    // 改名书的站点索引里只有新名,只能靠作者搜索找到 —— 而作者搜索**必须仍然触发**。
+    const target = { title: '旧名', author: '作者甲' };
+    // 别名走站点自报的「【原书名：X】」标记（parseSourceAlias），不是 meta。
+    const renamedDetail = (id: number) =>
+      '<meta property="og:novel:book_name" content="新名"><meta property="og:novel:author" content="作者甲">'
+      + '<div>小说简介:【原书名：旧名】改名前的版本。</div>'
+      + '<dd><a href="/chapter/index' + id + '-1.html">第一章</a></dd>';
+    pages.set('https://book15.net/books/search.html?kw=' + encodeURIComponent(target.title), {
+      text: '<a href="/books/details61.html">无关书</a>',
+    });
+    pages.set('https://book15.net/books/details61.html', {
+      text: '<meta property="og:novel:book_name" content="无关书"><meta property="og:novel:author" content="别人">'
+        + '<dd><a href="/chapter/index61-1.html">第一章</a></dd>',
+    });
+    pages.set('https://book15.net/books/search.html?kw=' + encodeURIComponent(target.author), {
+      text: '<a href="/books/details62.html">新名</a>',
+    });
+    pages.set('https://book15.net/books/details62.html', { text: renamedDetail(62) });
+    const catalog = await service.resolveSourceBook(target, context());
+    expect(catalog).toMatchObject({ title: '新名', author: '作者甲', bookUrl: 'https://book15.net/books/details62.html' });
   });
 
   it('falls back to same-page detail links when no anchor text matches the title exactly', async () => {
@@ -547,6 +574,10 @@ describe('online reader source resolution and budgets', () => {
     await expect(service.resolveSourceBook(book, context())).rejects.toMatchObject({
       code: 'SOURCE_NOT_FOUND', status: 404,
     });
+    // 基线不会请求这条链接（精确层 0 ⇒ 直接转作者搜索），新实现必须**真的核验过**它 ——
+    // 否则这条负控在基线上恒真，证明不了兜底路径被守住（40 任审查 E）。
+    expect(mocks.fetch.mock.calls.map((call) => String(call[0])))
+      .toContain('https://book15.net/books/details97.html');
   });
 
   it('warns search_no_candidates when no anchor text matches the title exactly', async () => {
@@ -598,6 +629,12 @@ describe('online reader source resolution and budgets', () => {
     pages.set('https://book15.net/books/search.html?kw=' + encodeURIComponent(target.title), {
       text: '<a href="/books/details99.html">别的书</a>',
     });
+    // 新语义下同页兜底**会**去核验这条无关详情链接（基线不会），故必须给它 fixture：
+    // 抓取成功 + 身份不符 ⇒ 干净 404；不给 fixture 会让 mock 抛错、hadFailure=true、错放大成 503。
+    pages.set('https://book15.net/books/details99.html', {
+      text: '<meta property="og:novel:book_name" content="别的书"><meta property="og:novel:author" content="别人">'
+        + '<dd><a href="/chapter/index99-1.html">第一章</a></dd>',
+    });
     pages.set('https://book15.net/books/search.html?kw=' + encodeURIComponent(target.author), { text: '' });
     await expect(service.resolveSourceBook(target, context())).rejects.toMatchObject({
       code: 'SOURCE_NOT_FOUND', status: 404,
@@ -609,7 +646,9 @@ describe('online reader source resolution and budgets', () => {
       event: 'source_not_found',
       title: '不存在书',
       sourcesTried: 1,
-      perSource: [{ host: 'book15.net', searched: true, candidates: 0 }],
+      // candidates 仍只指**精确层**命中数（0）；同页兜到的那 1 条另记 fallbackCandidates
+      // —— 混成一个数会让「搜索页有结果却 0 候选」这个 P0 信号失效（40 任审查 D）。
+      perSource: [{ host: 'book15.net', searched: true, candidates: 0, fallbackCandidates: 1 }],
     });
     expect(typeof payload.perSource[0].bytes).toBe('number');
     // 汇总与逐源信号是两条独立事件，且都出现。

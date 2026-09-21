@@ -140,10 +140,14 @@ const MIN_EDIT_DISTANCE_TITLE_LENGTH = 4;
 function stripTitleDecorations(value: string): string {
   return value.replace(/[（(][^（()）]*[）)]/gu, '').replace(/[:：].*$/u, '').replace(/[·\s]/gu, '');
 }
-// 书名号/方括号/尖括号里的成对装饰(【完结】书名、[全本]书名);括号内为空(如「书名【1】」)不剥,
-// 那里的内容是书名的一部分。与上面的副标题剥离同属「书名字面之外的修饰」这一层语义。
+// 「修饰」= 站点加在书名**之外**的状态标记（【完结】书名、书名(全本)），不是书名的一部分。
+// 只剥**已知修饰词**的成对包裹。**不能**见成对符号就剥：那样会把书名本体吃掉，或把不同书剥成
+// 同一串（`[全本]余生` 与 `[典藏]余生` 都成 `余生`），造出假的「档位 1 = 书名直接对上」，
+// 进而在 parseSourceDetailLinks 里把无关详情页提权进 MAX_DETAIL_CANDIDATES 切片（40 任审查 B）。
+// 与上面的副标题剥离同属「书名字面之外的修饰」这一层语义。
+const TITLE_DECORATION = /[【《〈「(](?:完结|全本|完本|全集|精品|推荐|热门|连载|新书|免费|首发|独家|番外|无删减|已完结|txt|TXT)[】》〉」)]/gu;
 function stripTitleWrappers(value: string): string {
-  return value.replace(/[【《〈「(][^】》〉」)]*[】》〉」)]/gu, '');
+  return value.replace(TITLE_DECORATION, '');
 }
 
 function editDistance(a: string, b: string): number {

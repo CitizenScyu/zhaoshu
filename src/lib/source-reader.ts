@@ -227,7 +227,10 @@ function hasChallengeHint(text: string): boolean {
   return text.length < 1024 && /<script\b/i.test(text);
 }
 
-interface SourceSearchStat { host: string; searched: boolean; candidates: number; bytes: number }
+// candidates = **精确层**（parseSourceSearch 锚文本相等）命中数；fallbackCandidates = 精确层收 0 后
+// 按详情页形态从同页兜到的数。两者分开记：「搜索页有结果却 0 候选」这个 P0 信号靠 candidates 表达，
+// 混成一个数会让它失效（40 任审查 D）。
+interface SourceSearchStat { host: string; searched: boolean; candidates: number; fallbackCandidates: number; bytes: number }
 
 
 async function queryRows<T>(query: ReturnType<ReturnType<typeof getSql>>, signal: AbortSignal, readOnly = true): Promise<T[]> {
@@ -387,7 +390,7 @@ export async function resolveSourceBook(
     const sourceContext = isFirst ? context : context.child(source.url);
     // 「整体中止」（父 deadline/取消 ⇒ route 504）只认父 signal：切片只 abort 子 signal（§3.3 陷阱）。
     context.signal.throwIfAborted();
-    const stat: SourceSearchStat = { host: hostOf(source.url), searched: false, candidates: 0, bytes: 0 };
+    const stat: SourceSearchStat = { host: hostOf(source.url), searched: false, candidates: 0, fallbackCandidates: 0, bytes: 0 };
     searchStats.push(stat);
     try {
       // 引擎档分派（设计 §7.2）：rules 非空且非 builtin ⇒ 走 rule-engine 门面；
@@ -464,6 +467,10 @@ export async function resolveSourceBook(
       if (hinted) return hinted;
       const search = await sourceContext.page(sourceSearchUrl(source.searchUrl, book.title, source.url));
       let candidates: string[] = [];
+      // 标题搜索页的**精确层**（parseSourceSearch 锚文本相等）是否收 0 候选。作者搜索回退判的是这个，
+      // **不是** candidates 是否为空 —— 同页形态兜底会把无关详情链接填进 candidates，拿它当判据
+      // 等于把「改名书」（站点索引只有新名）唯一的救命路径关掉（40 任实测 + 审查 A）。
+      let exactLayerEmpty = false;
       stat.searched = true;
       stat.bytes = search.text.length;
       if (/^\/books\/details\d+\.html$/.test(new URL(search.url).pathname) && search.url !== options.excludeBookUrl) {
@@ -476,12 +483,15 @@ export async function resolveSourceBook(
         }
       } else {
         const exact = parseSourceSearch(search.text, search.url, book.title);
+        exactLayerEmpty = !exact.length;
         // 搜索页抓取成功(无异常)却一个可核验候选都没有 —— 区分「空页 / 反爬页 / 解析错」。
         // 候选收集两级:parseSourceSearch 仍按锚文本精确相等取(收 0 个时打下面这条观测);
         // 再从同一页按详情页形态兜一轮 —— book15 把「图片链接 + 标题链接 + 阅读小说链接」三份
         // 重复指向同一详情页,锚文本带修饰(【完结】书名 / 空白标点差异)时精确层会全丢。
         // 兜底只放宽「候选收集」:身份判定仍是详情页层的 sourceBookMatches(标题/别名 + 作者门),
         // 误配防线原地不动。两轮都走 inspect 的同一个 MAX_DETAIL_CANDIDATES 切片,不增请求上限。
+        // 兜底**不**改变作者搜索回退的判据(见上面 exactLayerEmpty):兜底捡到的无关详情链接
+        // 只表示「同页有别的书」,不代表「这本书不在本站」。
         if (!exact.length) {
           console.warn('[read-source] search_no_candidates', JSON.stringify({
             event: 'search_no_candidates',
@@ -492,17 +502,20 @@ export async function resolveSourceBook(
             title: book.title,
             hadChallengeHint: hasChallengeHint(search.text),
           }));
-          candidates = parseSourceDetailLinks(search.text, search.url, book.title);
-        } else {
-          candidates = exact;
         }
-        stat.candidates = candidates.length;
+        const fallback = exact.length ? [] : parseSourceDetailLinks(search.text, search.url, book.title);
+        candidates = exact.length ? exact : fallback;
+        // 观测账本分开记:混成一个数会让「搜索页有结果却 0 候选」这个 P0 信号失效。
+        stat.candidates = exact.length;
+        stat.fallbackCandidates = fallback.length;
       }
       const result = await inspect(candidates, true);
       if (result) return result;
-      // 作者搜索回退:标题搜索仍 0 候选(精确层与同页兜底都空)、有作者可搜且作者不是书名本身时
-      // (改名书的站点索引只有新名),改搜作者。候选不看锚文本,身份靠详情页的标题/别名 + 作者门校验。
-      if (!candidates.length && knownSourceAuthor(book.author) && knownSourceAuthor(book.author) !== normalizeSourceTitle(book.title)) {
+      // 作者搜索回退:标题搜索页的**精确层** 0 候选(搜索页可能仍吐一堆无关详情链接)、有作者可搜
+      // 且作者不是书名本身时(改名书的站点索引只有新名),改搜作者。候选不看锚文本,
+      // 身份靠详情页的标题/别名 + 作者门校验。
+      // `!candidates.length` 保留给「搜索 URL 本身就是详情页」那一支的既有语义。
+      if ((exactLayerEmpty || !candidates.length) && knownSourceAuthor(book.author) && knownSourceAuthor(book.author) !== normalizeSourceTitle(book.title)) {
         const authorSearch = await sourceContext.page(sourceSearchUrl(source.searchUrl, book.author, source.url));
         const authorCandidates = /^\/books\/details\d+\.html$/.test(new URL(authorSearch.url).pathname)
           ? [authorSearch.url]

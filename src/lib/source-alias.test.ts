@@ -129,6 +129,17 @@ describe('sourceTitleSimilarity (fuzzy tier thresholds)', () => {
     expect(sourceTitleSimilarity('我有一座恐怖屋', { title: '我有一座恐怖屋：修订版', author: 'x' })).toBe(1);
   });
 
+  it('collapses only known decorations, never the title body (40 任审查 B)', () => {
+    // 站点加在书名**之外**的状态修饰按档位 1 折叠（book15 实测「【完结】书名」）。
+    expect(sourceTitleSimilarity('测试书', { title: '【完结】测试书', author: '' })).toBe(1);
+    expect(sourceTitleSimilarity('测试书', { title: '测试书(全本)', author: '' })).toBe(1);
+    // 反例 1：见成对符号就剥会把**不同**书剥成同一串（都成「余生」）⇒ 假的「书名直接对上」，
+    // 进而在 parseSourceDetailLinks 里把无关详情页提权进 MAX_DETAIL_CANDIDATES 切片。
+    expect(sourceTitleSimilarity('[全本]余生', { title: '[典藏]余生', author: '' })).not.toBe(1);
+    // 反例 2：书名本体里的方括号编号不是修饰，剥掉会让「…【1】」与「…【2】」互相假匹配。
+    expect(sourceTitleSimilarity('大奉打更人【1】', { title: '大奉打更人【2】', author: '' })).not.toBe(1);
+  });
+
   it('ranks containment at tier 2 only when the shorter side is at least 4 chars', () => {
     expect(sourceTitleSimilarity('我有一座恐怖屋', { title: '我有一座恐怖屋全本', author: 'x' })).toBe(2);
     expect(sourceTitleSimilarity('我有一座恐怖屋', { title: '恐怖屋', author: 'x' })).not.toBe(2);
