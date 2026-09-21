@@ -267,7 +267,7 @@ export async function runDownloadTask(
         error: cleanPgText([
           `更差版本不晋升：新版 ${outcome.chaptersDone} 章 / ${outcome.charsTotal} 字，`
           + `已发布版 ${release.oldManifest?.chapters ?? '?'} 章 / ${release.oldManifest?.chars ?? '?'} 字`,
-          `候选快照留档 ${dir}/${release.version}.txt，人工确认后可手动晋升`,
+          `候选快照留档 ${dir}/${release.version}.json，人工确认后可手动晋升`,
         ].join('\n').slice(0, 4000)),
       });
       if (!written) throw new TaskLeaseLostError();
