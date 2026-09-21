@@ -676,6 +676,152 @@ interface LoadedSource {
   sources: ReadingSource[];
 }
 
+// ---- M3 手动换源:可用源列表(survey)----
+// 与 resolveSourceBook 的差异(设计 §3,† 标出):逐源扫描、每源**首命中即停**、
+// 单源失败记 unreachable 继续下一源、跨源不去重、不做 knownSourceAuthor 提前返回、
+// 不抛 422 SOURCE_AMBIGUOUS(多源同名正是本接口的目的)。不动既有函数。
+const MAX_SURVEY_SOURCES = 6;
+
+/** 换源面板的一行:每源一个候选(ok/miss/unreachable),current 标记当前在用源。 */
+export interface SourceAlternateStatus {
+  sourceName: string;
+  status: 'ok' | 'miss' | 'unreachable';
+  current?: boolean;
+  // status === 'ok' 时:
+  bookUrl?: string; title?: string; author?: string; chapters?: number;
+}
+
+/** 单源探测:首命中即返回该源候选;无命中返回 null(由调用方记 miss)。异常交给调用方记 unreachable。 */
+async function surveyOneSource(
+  book: SourceBookIdentity, source: ReadingSource, context: SourceRequestContext,
+  hints: string[], excludeBookUrl: string | undefined,
+): Promise<SourceAlternateStatus | null> {
+  const checked = new Set<string>();
+  const record = (catalog: SourceCatalog): SourceAlternateStatus => ({
+    sourceName: source.name, status: 'ok', bookUrl: catalog.bookUrl,
+    title: catalog.title, author: catalog.author, chapters: catalog.chapters.length,
+  });
+  if (!isBuiltinReadingSource(source)) {
+    const engineSource = engineSourceOf(source);
+    const results = await engineSearchBook(engineSource, book.title, context);
+    for (const result of results.slice(0, MAX_DETAIL_CANDIDATES)) {
+      if (result.bookUrl === excludeBookUrl || checked.has(result.bookUrl)) continue;
+      checked.add(result.bookUrl);
+      const detail = await engineFetchDetail(engineSource, result.bookUrl, context);
+      const identity: SourceBookIdentity = {
+        title: detail.title ?? result.title, author: detail.author ?? result.author,
+        ...(detail.alias ? { alias: detail.alias } : {}),
+      };
+      if (!sourceBookMatches(book, identity)) continue;
+      const toc = await engineFetchToc(engineSource, detail.tocUrl ?? result.bookUrl, context);
+      if (!toc.chapters.length) continue;
+      return record(engineCatalogFrom(result.bookUrl, source, identity, toc.chapters));
+    }
+    return null;
+  }
+  const inspect = async (urls: string[]): Promise<SourceCatalog | null> => {
+    for (const url of urls.slice(0, MAX_DETAIL_CANDIDATES)) {
+      if (url === excludeBookUrl || checked.has(url)) continue;
+      checked.add(url);
+      const catalog = catalogFrom(await context.page(url), source, book);
+      if (catalog) return catalog;
+    }
+    return null;
+  };
+  const hinted = await inspect(hints);
+  if (hinted) return record(hinted);
+  const search = await context.page(sourceSearchUrl(source.searchUrl, book.title, source.url));
+  let candidates: string[] = [];
+  // 精确层(parseSourceSearch 锚文本相等)是否收 0 —— 与 resolveSourceBook(:486)同口径。
+  // 作者搜索回退判的是这个,而不是「兜底后 candidates 是否为空」:同页兜底(parseSourceDetailLinks)
+  // 捡到的无关详情链接只表示「本页有别的书」,不代表「本书不在本站」,不能据此拦掉作者回退(复审 P1-2)。
+  let exactLayerEmpty = false;
+  if (/^\/books\/details\d+\.html$/.test(new URL(search.url).pathname) && search.url !== excludeBookUrl) {
+    const direct = catalogFrom(search, source, book);
+    if (direct) return record(direct);
+  } else {
+    const exact = parseSourceSearch(search.text, search.url, book.title);
+    exactLayerEmpty = !exact.length;
+    candidates = exact.length ? exact : parseSourceDetailLinks(search.text, search.url, book.title);
+  }
+  const found = await inspect(candidates);
+  if (found) return record(found);
+  // 作者搜索回退(同 resolveSourceBook:精确层 0 候选 + 有独立作者可搜)。
+  if ((exactLayerEmpty || !candidates.length) && knownSourceAuthor(book.author) && knownSourceAuthor(book.author) !== normalizeSourceTitle(book.title)) {
+    const authorSearch = await context.page(sourceSearchUrl(source.searchUrl, book.author, source.url));
+    const authorCandidates = /^\/books\/details\d+\.html$/.test(new URL(authorSearch.url).pathname)
+      ? [authorSearch.url]
+      : parseSourceDetailLinks(authorSearch.text, authorSearch.url, book.title);
+    const authorResult = await inspect(authorCandidates);
+    if (authorResult) return record(authorResult);
+  }
+  return null;
+}
+
+/**
+ * 扫全池、每源一候选(设计 §3)。独立池上限 min(池, 6)(§9 开放问题 1,第一期即加)。
+ * partial = true 当且仅当软预算/全局预算导致有源没被扫完。
+ */
+export async function surveySourceBooks(
+  book: SourceBookIdentity,
+  context: SourceRequestContext,
+  options: { excludeBookUrl?: string; currentBookUrl?: string; currentSourceName?: string } = {},
+): Promise<{ sources: SourceAlternateStatus[]; partial: boolean }> {
+  const all = await getReadingSources(context.signal);
+  const pool = all.slice(0, Math.min(all.length, MAX_SURVEY_SOURCES));
+  // 无论池里是否含引擎源,都先开满池点数(复审 P2):引擎源同样占请求预算,
+  // 只在「有引擎源时」才 openPool 会让纯内置源池的预算记账缺失。
+  context.openPool(pool.length);
+  const hints = await hintsFor(book, context.signal);
+  const excludeBookUrl = options.excludeBookUrl ?? options.currentBookUrl;
+  const results: SourceAlternateStatus[] = [];
+  let partial = false;
+  let index = 0;
+  for (const source of pool) {
+    const isFirst = index === 0;
+    index += 1;
+    // 软预算判据照抄 resolveSourceBook:只从第 2 源起生效;剩余不足一片切片就不开新源 ⇒ partial。
+    if (!isFirst && SOFT_BUDGET_MS - (Date.now() - context.startedAt) < PER_SOURCE_SLICE_MS) {
+      partial = true;
+      break;
+    }
+    const sourceContext = isFirst ? context : context.child(source.url);
+    context.signal.throwIfAborted();
+    try {
+      const found = await surveyOneSource(book, source, sourceContext, hints, excludeBookUrl);
+      results.push(found ?? { sourceName: source.name, status: 'miss' });
+    } catch (error) {
+      context.signal.throwIfAborted();
+      // 全局预算耗尽 ⇒ 停止整轮(partial);其余单源失败(网络/切片/点数)⇒ 记 unreachable 继续。
+      if (error instanceof SourceReaderError && error.code === 'SOURCE_BUDGET_EXCEEDED') {
+        partial = true;
+        break;
+      }
+      results.push({ sourceName: source.name, status: 'unreachable' });
+    }
+  }
+  // current 标记以 session 目录实况(sourceName)为准,与探测状态无关:当前源即便本轮 miss/unreachable
+  // 也要标出来,面板才认得「哪个是我正在读的」。
+  if (options.currentSourceName) {
+    for (const entry of results) if (entry.sourceName === options.currentSourceName) entry.current = true;
+  }
+  return { sources: results, partial };
+}
+
+/** alternates 分支用:session 目录当前源信息;过期/缺失一律降级为无标记(设计 §2,不抛错)。 */
+export async function currentSourceHint(
+  session: string, context: SourceRequestContext,
+): Promise<{ currentSourceName?: string; currentBookUrl?: string }> {
+  try {
+    const [row] = await queryRows<{ payload: SourceCatalog }>(getSql()`
+      SELECT payload FROM source_read_catalogs WHERE id = ${session} AND expires_at > now()`, context.signal);
+    return row ? { currentSourceName: row.payload.sourceName, currentBookUrl: row.payload.bookUrl } : {};
+  } catch {
+    context.signal.throwIfAborted();
+    return {};
+  }
+}
+
 async function chapterText(context: SourceRequestContext, chapter: SourceChapter, source: ReadingSource): Promise<string> {
   // N01 分派：builtin 走 book15 特化解析（逐字不变）；引擎档走 rule-engine 取正文。
   // 取页两侧都经 context.page ⇒ 预算/节流/重试层沿用；builtin 分支零行为变化。

@@ -17,6 +17,9 @@ const mocks = vi.hoisted(() => ({
 // renderToStaticMarkup + 模块桩这条既有先例（AuthForm.test.ts / LoginCard.test.ts）。
 // ReaderClient 的重活（取数/滚动/预取）在 useReader 里，这里把它换成受控替身，
 // 专门钉 ReaderClient 自己的分支：准入判定、失败口径、正文与页脚渲染。
+// reader.module.css 纯样式、与渲染断言无关，桩掉它以绕开本机 PostCSS/Tailwind
+// 插件链的加载问题（@alloc/quick-lru 在本机 node_modules 缺失，属环境问题）。
+vi.mock('./reader.module.css', () => ({ default: {} }));
 vi.mock('next/link', () => ({ default: 'a' }));
 vi.mock('next/navigation', () => ({ useRouter: () => ({ push: mocks.push, replace: mocks.push }) }));
 vi.mock('@/components/OwnerProvider', () => ({
@@ -36,6 +39,7 @@ vi.mock('./useReader', async (importOriginal) => {
 });
 
 import ReaderClient from './ReaderClient';
+import { useReader } from './useReader';
 
 const part = (
   chapterIndex: number, partIndex: number, title: string, text: string,
@@ -248,6 +252,46 @@ describe('正文未就绪与加载失败', () => {
     });
     expect(render()).not.toContain('相似书籍候选');
   });
+
+  // M3 复审 P1-3:reading=null(目录还没回来 / 换源飞着 / 失败兜底)时,
+  // 头部的「换源」入口必须能点开换源面板 —— 否则确认失败后用户被一个 disabled 按钮卡死。
+  it('书源会话 reading=null 时「换源」按钮仍可用(复审 P1-3)', () => {
+    mocks.reader = readerBase({ loading: true, reading: null });
+    const html = render({ session: { kind: 'source', title: '诡秘之主', author: '爱潜水的乌贼' } });
+    // ⇄ 在按钮里;aria-expanded 表明它就是换源面板的触发器。
+    // (用 [\s\S] 代替 /s 标志:本仓 tsconfig target 低于 es2018,/s 会被 tsc 拒收。)
+    const button = html.match(/<button[^>]*aria-expanded="(?:false|true)"[^>]*>[\s\S]*?换源<\/button>/)?.[0]
+      ?? html.match(/<button[^>]*>[\s\S]*?换源<\/button>/)?.[0];
+    if (!button) throw new Error('找不到换源按钮');
+    expect(button).not.toContain('disabled');
+  });
+
+  // M3 复审 P1-3:确认失败码(候选建目录失败 404/422/503)必须给「换个书源」出口;
+  // 不再依赖已死的 SOURCE_CHANGED 码(服务端不产出),也不只认 SOURCE_CHAPTER_UNAVAILABLE。
+  it('确认失败码(404/422/503)的错误条给出「换个书源」出口(复审 P1-3)', () => {
+    for (const status of [404, 422, 503]) {
+      mocks.reader = readerBase({
+        loading: false,
+        failure: { message: '书源未能提供这本书的目录。', status },
+      });
+      const html = render({ session: { kind: 'source', title: '诡秘之主', author: '爱潜水的乌贼' } });
+      expect(buttonFor(html, '换个书源')).not.toContain('disabled');
+    }
+  });
+
+  // 回归护栏:非确认失败码(如 409 目录不一致、500 服务错误)不该摆「换个书源」——
+  // 那不是换源能解决的问题,重复入口反而误导用户。
+  it('非确认失败码(409/500)不摆「换个书源」', () => {
+    for (const status of [409, 500]) {
+      mocks.reader = readerBase({
+        loading: false,
+        failure: { message: '出错了', status },
+      });
+      const html = render({ session: { kind: 'source', title: '诡秘之主', author: '爱潜水的乌贼' } });
+      expect(html).not.toContain('换个书源');
+    }
+  });
+
 });
 
 describe('正文渲染', () => {

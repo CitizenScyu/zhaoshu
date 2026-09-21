@@ -6,8 +6,8 @@ import { createDeadline, raceDeadline } from '@/lib/deadline';
 import { cleanString } from '@/lib/sanitize';
 import { SourcePolicyError } from '@/lib/source-policy';
 import {
-  readSourceChapter, resolveSourceBook, saveSourceCatalog, sourceReaderIndex,
-  SourceReaderError, SourceRequestContext,
+  currentSourceHint, readSourceChapter, resolveSourceBook, saveSourceCatalog, sourceReaderIndex,
+  SourceReaderError, SourceRequestContext, surveySourceBooks,
 } from '@/lib/source-reader';
 
 export const runtime = 'nodejs';
@@ -27,7 +27,7 @@ export async function GET(req: NextRequest, { params }: { params: Promise<{ reso
     return rejected;
   }
   const { resource } = await params;
-  if (!['index', 'chapter'].includes(resource)) return response({ error: '阅读接口不存在。', code: 'SOURCE_RESOURCE_INVALID' }, 404);
+  if (!['index', 'chapter', 'alternates'].includes(resource)) return response({ error: '阅读接口不存在。', code: 'SOURCE_RESOURCE_INVALID' }, 404);
   const query = req.nextUrl.searchParams;
   const title = cleanString(query.get('title'), 200);
   const author = cleanString(query.get('author') ?? '', 200);
@@ -35,7 +35,7 @@ export async function GET(req: NextRequest, { params }: { params: Promise<{ reso
   const bookUrl = cleanString(query.get('book_url') ?? '', 2048);
   const chapter = query.get('chapter') ?? '';
   const session = query.get('session') ?? '';
-  if (resource === 'index' && (!title || (query.get('author') && !author))) {
+  if ((resource === 'index' || resource === 'alternates') && (!title || (query.get('author') && !author))) {
     return response({ error: '请输入有效的书名和作者。', code: 'SOURCE_BOOK_INVALID' }, 400);
   }
   if (resource === 'chapter' && (!/^[a-f0-9]{40}$/.test(session) || query.get('version') !== session
@@ -52,6 +52,13 @@ export async function GET(req: NextRequest, { params }: { params: Promise<{ reso
       const catalog = await resolveSourceBook({ title, author }, context, bookUrl ? { bookUrl } : {});
       await saveSourceCatalog(catalog, signal);
       return response(sourceReaderIndex(catalog));
+    }
+    if (resource === 'alternates') {
+      await raceDeadline(signal, ensureSchema);
+      // session 可选(40-hex):提供则标 current / 排除当前源;过期或非法一律降级为无标记(§2)。
+      const hint = /^[a-f0-9]{40}$/.test(session) ? await currentSourceHint(session, context) : {};
+      const result = await surveySourceBooks({ title, author }, context, hint);
+      return response(result);
     }
     return response(await readSourceChapter(session, Number(chapter), context));
   } catch (error) {

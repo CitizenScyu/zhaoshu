@@ -1365,3 +1365,139 @@ describe('引擎源正文分派（N01）', () => {
   });
 });
 
+
+// M3 手动换源:surveySourceBooks 逐源扫描 + alternates 路由分支。
+// 与 resolveSourceBook 的差异(†):首命中即 break、单源失败记 unreachable 继续、不跨源去重、
+// 不抛 422 AMBIGUOUS、独立池上限 min(池, 6)。
+describe('M3 surveySourceBooks 换源扫描', () => {
+  const search = (kw: string, host = 'https://book15.net') => host + '/books/search.html?kw=' + encodeURIComponent(kw);
+  const sourceB = { ...source, url: 'https://backup.test/', name: '备用书源', searchUrl: '/books/search.html?kw={{key}}' };
+  const bSearch = backupSearch();
+  const primeHitB = () => {
+    pages.set(bSearch, { text: '<a href="/books/details777.html">测试书</a>' });
+    pages.set(backupPage, { text: detail(777) }); // 备用源命中详情页
+  };
+
+  it('逐源扫描:各源独立命中 ⇒ 均记 ok(含各自 bookUrl/title/chapters),不跨源去重', async () => {
+    primeHitB();
+    mocks.sources.mockResolvedValue([source, sourceB]);
+    const { sources, partial } = await service.surveySourceBooks(book, context());
+    expect(partial).toBe(false);
+    const ok = sources.find((item) => item.sourceName === '备用书源');
+    expect(ok).toMatchObject({ status: 'ok', bookUrl: backupPage, title: '测试书', chapters: 2 });
+    // 首源(book15 默认夹具命中)同样记 ok:survey 不做跨源去重,两源各留一条候选。
+    expect(sources.find((item) => item.sourceName === '测试书源')).toMatchObject({ status: 'ok', bookUrl: pageUrl() });
+  });
+
+  it('单源失败(网络)→ 该源 unreachable,继续下一源,不中断全局', async () => {
+    // 首源搜索页连接层失败页面 ;备源命中。
+    pages.set(search(book.title), networkFailure);
+    pages.set(search(book.author), networkFailure);
+    mocks.sources.mockResolvedValue([source, sourceB]);
+    primeHitB();
+    const { sources } = await service.surveySourceBooks(book, context());
+    expect(sources.find((item) => item.sourceName === '测试书源')).toMatchObject({ status: 'unreachable' });
+    expect(sources.find((item) => item.sourceName === '备用书源')).toMatchObject({ status: 'ok' });
+  });
+
+  it('excludeBookUrl 命中的候选被跳过(当前源排除)', async () => {
+    pages.set(search(book.title), { text: '<a href="/books/details42.html">测试书</a>' });
+    pages.set(pageUrl(), { text: detail() });
+    mocks.sources.mockResolvedValue([source]);
+    const { sources } = await service.surveySourceBooks(book, context(), { excludeBookUrl: pageUrl() });
+    expect(sources[0]).toMatchObject({ status: 'miss' }); // 唯一候选被排除 ⇒ miss
+  });
+
+  it('currentSourceName 命中 ⇒ 该源回填 current(与探测状态无关)', async () => {
+    mocks.sources.mockResolvedValue([source, sourceB]);
+    pages.set(search(book.title), { text: '' });
+    pages.set(search(book.author), { text: '' });
+    const { sources } = await service.surveySourceBooks(book, context(), {
+      currentSourceName: '测试书源', excludeBookUrl: pageUrl(),
+    });
+    expect(sources.find((item) => item.sourceName === '测试书源')).toMatchObject({ status: 'miss', current: true });
+  });
+
+  it('P1-2: 精确层 0 候选但同页兜底捡到无关详情链接 ⇒ 仍触发作者搜索回退(与 resolveSourceBook 同口径)', async () => {
+    // 精确层(parseSourceSearch 锚文本相等)收 0,同页兜底(parseSourceDetailLinks)捡到一条
+    // 锚文本带修饰的**无关**详情链接 ⇒ candidates 非空但身份不匹配 ⇒ 修复前因 `!candidates.length`
+    // 为假而**不触发**作者回退,该源被判 miss;修复后按 exactLayerEmpty 触发作者回退并命中。
+    mocks.sources.mockResolvedValue([source]);
+    pages.set(search(book.title), {
+      // 「【完结】无关书」≠「测试书」:精确层 0;但同页兜底会把它当详情链接候选收集进来。
+      text: '<a href="/books/details999.html">【完结】无关书</a>',
+    });
+    pages.set(pageUrl(999), {
+      text: detail(999, '别的作者').replace('content="测试书"', 'content="无关书"'),
+    });
+    // 作者搜索页命中本书(作者搜索回退的正面出口)。
+    pages.set(search(book.author), { text: '<a href="/books/details42.html">测试书</a>' });
+    pages.set(pageUrl(), { text: detail() });
+    const { sources } = await service.surveySourceBooks(book, context(), { excludeBookUrl: undefined });
+    // 修复后:exactLayerEmpty ⇒ 走作者回退 ⇒ inspect 作者页候选 ⇒ 命中 details42 ⇒ ok。
+    // 修复前:判据是 !candidates.length(=false,因为兜底捡到了 details999)⇒ 不回退 ⇒ miss。
+    expect(sources[0]).toMatchObject({ status: 'ok', bookUrl: pageUrl() });
+  });
+
+  it('P2: 纯内置源池也 openPool 满池预算(不再只在含引擎源时开)', async () => {
+    // 修复前 openPool 只在池里含非 builtin 源时调用,纯内置源池的 totalLimit 停在默认 12。
+    // 修复后无论池构成都开 min(30, max(12, 6×n));此处两源纯 builtin ⇒ totalLimit 应为 12(6×2 命中保底),
+    // 关键是 openPool **被调用**(可观测:totalLimit 与显式 openPool(2) 一致,且 budget 被抬高到池规模)。
+    mocks.sources.mockResolvedValue([source, sourceB]);
+    primeHitB();
+    const ctx = context();
+    const before = ctx.totalLimit;
+    await service.surveySourceBooks(book, ctx);
+    // context() 默认 limit=undefined ⇒ totalLimit 保底 12;两源 openPool(2)=max(12,12)=12。
+    // 断言点在于「openPool 被调用过」:用一个 6 源纯内置池才能看出抬升(max(12,36)→30)。
+    expect(before).toBe(12);
+    const many = Array.from({ length: 6 }, (_, i) => ({ ...source, url: `https://book15.net/p${i}/`, name: `池源${i}` }));
+    mocks.sources.mockResolvedValue(many);
+    for (const item of many) {
+      pages.set(item.url.replace(/\/$/, '') + '/books/search.html?kw=' + encodeURIComponent(book.title), { text: '' });
+      pages.set(item.url.replace(/\/$/, '') + '/books/search.html?kw=' + encodeURIComponent(book.author), { text: '' });
+    }
+    const ctx6 = context();
+    await service.surveySourceBooks(book, ctx6);
+    expect(ctx6.totalLimit).toBe(30); // 6 纯内置源:openPool(6)=min(30, max(12,36))=30
+  });
+
+  it('池超过 6 源 ⇒ 独立池上限 min(池, 6):第 7 源不扫', async () => {
+    const many = Array.from({ length: 7 }, (_, i) => ({ ...source, url: `https://book15.net/s${i}/`, name: `源${i}` }));
+    mocks.sources.mockResolvedValue(many);
+    for (const item of many) pages.set(item.url.replace(/\/$/, '') + '/books/search.html?kw=' + encodeURIComponent(book.title), { text: '' });
+    const { sources } = await service.surveySourceBooks(book, context());
+    expect(sources).toHaveLength(6);
+    expect(sources.some((item) => item.sourceName === '源6')).toBe(false);
+  });
+
+  it('软预算到点 ⇒ partial=true,后续源不再扫', async () => {
+    primeHitB();
+    mocks.sources.mockResolvedValue([source, sourceB, { ...sourceB, url: 'https://backup.test/c', name: '第三源' }]);
+    const ctx = context();
+    vi.mocked(Date.now).mockReturnValue(ctx.startedAt + 46_000); // elapsed 46000 > SOFT_BUDGET
+    const { sources, partial } = await service.surveySourceBooks(book, ctx);
+    expect(partial).toBe(true);
+    expect(sources).toHaveLength(1);
+  });
+
+  it('GET /api/read/source/alternates:200 返回 sources/partial,session 过期降级为无标记', async () => {
+    primeHitB();
+    mocks.sources.mockResolvedValue([source, sourceB]);
+    const res = await request('alternates', 'title=测试书&author=作者&session=' + 'a'.repeat(40));
+    expect(res.status).toBe(200);
+    expectPrivate(res);
+    const body = await res.json();
+    expect(body.partial).toBe(false);
+    expect(Array.isArray(body.sources)).toBe(true);
+    expect(body.sources.some((item: { status: string }) => item.status === 'ok')).toBe(true);
+    // session 过期(source_read_catalogs 无此 id)⇒ 不标 current、不排除源,不报错。
+    expect(body.sources.every((item: { current?: boolean }) => item.current !== true)).toBe(true);
+  });
+
+  it('GET /api/read/source/alternates:缺 title ⇒ 400', async () => {
+    const res = await request('alternates', 'author=作者');
+    expect(res.status).toBe(400);
+    expectPrivate(res);
+  });
+});

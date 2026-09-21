@@ -175,3 +175,79 @@ export function readingPercent(index: ReaderIndex, part: ReaderPart, ratio: numb
     (part.startByte + (part.endByte - part.startByte) * Math.max(0, Math.min(1, ratio)))
       / index.totalBytes * 100));
 }
+
+// ---- M3 手动换源:跨源进度迁移(设计 §5) ----
+
+// 客户端章标题归一化:**直接复用** `source-parser.ts` 的 `normalizeChapterTitle`
+// (NFKC / trim / 去全角书名号 / 去空白 / 小写 / 章号折叠「第一章」=「第1章」/ 去尾部标点),
+// 不在客户端再写第二套折叠逻辑,避免两份实现漂移(复审 P1-1)。
+// source-parser 的依赖链(source-policy / supported-sources 均 client-safe,db 仅动态 import)
+// 可安全静态 import 进客户端包;测试文件同时 import 两边做一致性钉死。
+import { normalizeChapterTitle } from './source-parser';
+export { normalizeChapterTitle };
+
+/** 比例估算:按旧目录相对位置映射到新目录索引(边界 clamp)。 */
+function estimateIndex(oldChapterIndex: number, oldTotal: number, newTotal: number): number {
+  if (newTotal <= 0) return 0;
+  if (oldTotal <= 1) return 0;
+  return Math.max(0, Math.min(newTotal - 1,
+    Math.round(oldChapterIndex / (oldTotal - 1) * (newTotal - 1))));
+}
+
+/** 归一化标题在新目录里的全部匹配索引。 */
+function matchingIndexes(index: ReaderIndex, title: string): number[] {
+  const key = normalizeChapterTitle(title);
+  const hits: number[] = [];
+  for (let i = 0; i < index.chapters.length; i++) {
+    if (normalizeChapterTitle(index.chapters[i].title) === key) hits.push(i);
+  }
+  return hits;
+}
+
+/**
+ * 跨源进度迁移(设计 §5 三级保守回退,never silently 跳到明显错误的章):
+ * 1) 标题锚定(唯一匹配 ⇒ exact;重复章名按序号邻近度破平 ⇒ estimated)
+ * 2) 邻章锚定(旧目录 chapterIndex±1 唯一匹配 ⇒ 推算目标 ⇒ estimated)
+ * 3) 比例回退(estimated);全失败 ⇒ null。
+ * 产出只给 ReadingPosition:partIndex=0(在线目录恒单 part)、ratio 保留并 clamp、
+ * **丢弃 textOffset/viewportOffset**(字符锚点绑定具体正文,跨源必错);
+ * version/chapterTitle/catalogPrefix 由调用方按新目录重写(与 capturePosition 写入口径一致)。
+ */
+export function migrateProgressAcrossSources(
+  old: ReadingProgress, oldIndex: ReaderIndex, newIndex: ReaderIndex,
+): { position: ReadingPosition; confidence: 'exact' | 'estimated' } | null {
+  if (!newIndex.chapters.length) return null;
+  const oldTotal = oldIndex.chapters.length;
+  const newTotal = newIndex.chapters.length;
+  const ratio = Math.max(0, Math.min(1, old.ratio));
+  const estimate = estimateIndex(old.chapterIndex, oldTotal, newTotal);
+  // 空标题不是有效锚点(parseReadingProgress 同样把空 chapterTitle 判为无键)⇒ 退回旧目录索引标题。
+  const anchor = old.chapterTitle || oldIndex.chapters[old.chapterIndex]?.title;
+  if (anchor) {
+    const hits = matchingIndexes(newIndex, anchor);
+    if (hits.length === 1) return { position: { chapterIndex: hits[0], partIndex: 0, ratio }, confidence: 'exact' };
+    if (hits.length > 1) {
+      const best = hits.reduce((a, b) => Math.abs(a - estimate) <= Math.abs(b - estimate) ? a : b);
+      return { position: { chapterIndex: best, partIndex: 0, ratio }, confidence: 'estimated' };
+    }
+    // 邻章锚定:当前章标题在新源不存在时,看旧目录 ±1 两章是否有唯一匹配。
+    const derived: number[] = [];
+    for (const offset of [-1, 1] as const) {
+      const neighborTitle = oldIndex.chapters[old.chapterIndex + offset]?.title;
+      if (!neighborTitle) continue;
+      const hits2 = matchingIndexes(newIndex, neighborTitle);
+      // 邻章在新目录的索引 = 目标 ∓ offset;故目标 = 新索引 − offset。
+      if (hits2.length === 1) derived.push(Math.max(0, Math.min(newTotal - 1, hits2[0] - offset)));
+    }
+    if (derived.length) {
+      // 两邻章推算一致 ⇒ 采用;不一致取更接近比例估算者(仍标 estimated)。
+      const chosen = derived.reduce((a, b) => Math.abs(a - estimate) <= Math.abs(b - estimate) ? a : b);
+      return { position: { chapterIndex: chosen, partIndex: 0, ratio }, confidence: 'estimated' };
+    }
+    // 旧章标题有证据、但标题与邻章在新源都锚定不到 ⇒ 没有任何可采信的标题锚点。
+    // 比例回退会落到一个纯按序号估算的章(可能完全无关),这比「落空让用户自己选」更糟。
+    // 宁可返回 null:调用方保持 START 位置并提示用户手动换源/选章(设计 §5 三级回退的兜底语义)。
+    return null;
+  }
+  return { position: { chapterIndex: estimate, partIndex: 0, ratio }, confidence: 'estimated' };
+}

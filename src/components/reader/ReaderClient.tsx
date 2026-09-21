@@ -2,11 +2,12 @@
 
 import Link from 'next/link';
 import { useRouter } from 'next/navigation';
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { CSSProperties, ReactNode } from 'react';
 import { OwnerProvider, useOwner } from '@/components/OwnerProvider';
 import AuthForm from '@/components/AuthForm';
 import type { ReaderIndex, ReaderOrigin, ReaderPart, ReadingSession } from '@/lib/reader-types';
+import type { SourceAlternateStatus } from '@/lib/source-reader';
 import { readingSessionKey } from '@/lib/reader-session';
 import { readFeedbackSnapshot } from '@/lib/feedback';
 import {
@@ -105,9 +106,9 @@ function ReaderSession({ session, from }: Props) {
   const {
     settings, reading, activePart, loading, flowing, failure, percent, notice, storageFailed, focused,
     scroller, article, heading, onScroll, updateSettings, setFocusMode, navigate: requestNavigation,
-    extend, retry, markScrollIntent, setSection, loadConfirmedBook,
+    extend, retry, markScrollIntent, setSection, loadConfirmedBook, switchedBookUrl, onSwitchCommitted,
   } = useReader(session, apiFetch, user?.id ?? 0);
-  const [panel, setPanel] = useState<'directory' | 'settings' | null>(null);
+  const [panel, setPanel] = useState<'directory' | 'settings' | 'sources' | null>(null);
   const restoreButton = useRef<HTMLButtonElement>(null);
   const focusButton = useRef<HTMLButtonElement>(null);
   const tap = useRef<{ x: number; y: number; time: number } | null>(null);
@@ -181,7 +182,29 @@ function ReaderSession({ session, from }: Props) {
   }
 
   function navigate(next: ReadingPosition) { setPanel(null); void requestNavigation(next); }
-  function showPanel(next: 'directory' | 'settings') { setFocusMode(false); setPanel(next); }
+  function showPanel(next: 'directory' | 'settings' | 'sources') { setFocusMode(false); setPanel(next); }
+  // M3 手动换源:先走确认重放换目录(useReader 内做进度迁移),再把 book_url 写进 URL 防刷新丢源。
+  // readingSessionKey 不含 bookUrl,router.replace 不会重挂 ReaderSession。
+  // 复审 P1-3:book_url 只在**目录加载成功后**才写进 URL。确认路径(book_url=...)会让服务端
+  // 跳过书名/作者匹配去建目录,一旦该候选建目录失败(404/422/503),URL 若已先被 replace 成
+  // 新 book_url,刷新/回退都会重放一个已知失败的候选。失败时 URL 必须保持旧源,用户可重试或换源。
+  function switchSource(bookUrl: string) {
+    if (session.kind !== 'source' || !bookUrl) return;
+    loadConfirmedBook(bookUrl);
+    setPanel(null);
+  }
+  // 目录加载成功后把 book_url 持久化进 URL(与 loadIndex 成功对齐)。从 indexUrl 取实参,
+  // 保证「写进 URL 的就是服务端刚成功建目录的那个候选」。
+  const commitSwitchedBookUrl = useCallback((bookUrl: string | undefined) => {
+    if (session.kind !== 'source' || !bookUrl) return;
+    const query = new URLSearchParams({ title: session.title, author: session.author, from, book_url: bookUrl });
+    if (window.location.search !== '?' + query.toString()) router.replace('/read/source?' + query);
+  }, [session, from, router]);
+  // M3 复审 P1-3:回调注册放进 effect(ref 写入不得在渲染期做,SSR 会抛)。
+  // loadIndex 由 useReader 的 effect 里 queueMicrotask 触发,微排在所有 effect 之后,
+  // 因此此处的注册必然先于任何一次 loadIndex 成功回调,时序安全。
+  useEffect(() => { onSwitchCommitted.current = commitSwitchedBookUrl; }, [commitSwitchedBookUrl]);
+
   function toggleFocus(focusControl = false) {
     const next = !focused;
     setFocusMode(next);
@@ -214,6 +237,7 @@ function ReaderSession({ session, from }: Props) {
           <span title={reading?.index.title}>{reading?.index.title ?? '在线阅读'}</span>
         </div>
         <div className={styles.tools}>
+          {session.kind === 'source' && <button className={styles.tool} aria-haspopup="dialog" aria-expanded={panel === 'sources'} onClick={() => showPanel('sources')}><span aria-hidden="true">⇄</span> 换源</button>}
           <button ref={focusButton} className={styles.tool} disabled={!reading} aria-label="专注阅读" onClick={() => toggleFocus(true)}>专注</button>
           <button className={styles.tool} disabled={!reading} aria-haspopup="dialog" aria-expanded={panel === 'directory'} onClick={() => showPanel('directory')}><span aria-hidden="true">☷</span> 目录</button>
           <button className={styles.tool} aria-haspopup="dialog" aria-expanded={panel === 'settings'} onClick={() => showPanel('settings')}><span aria-hidden="true">Aa</span> 设置</button>
@@ -224,6 +248,12 @@ function ReaderSession({ session, from }: Props) {
         <div className={styles.errorBar} role="alert">
           <span>{failure.message}</span>
           <button className={styles.tool} disabled={loading || flowing} onClick={retry}>{failure.status === 409 ? '重新加载目录' : '重试'}</button>
+          {/* M3 复审 P1-3:确认失败(候选建目录失败 404/422/503,或章节在新源不可读 503
+              SOURCE_CHAPTER_UNAVAILABLE)时必须给一个「换个书源」的出口 —— 用户的本意是
+              「我要读这本书」,某个候选失败不该把他困死在重试上。SOURCE_CHANGED 是旧实现的
+              死码(服务端已不产出,见 source-reader.ts:634 注释),不再作为条件。 */}
+          {session.kind === 'source' && (failure.status === 404 || failure.status === 422 || failure.status === 503)
+            && <button className={styles.tool} disabled={loading || flowing} onClick={() => showPanel('sources')}>换个书源</button>}
           {session.kind === 'source' && <Link className={styles.tool} href={`/?${new URLSearchParams({ tab: 'library', q: session.title })}`}>去书库下载全书</Link>}
         </div>
       )}
@@ -339,6 +369,18 @@ function ReaderSession({ session, from }: Props) {
       {storageFailed && <p className={styles.storageWarning} role="status">浏览器未允许保存，阅读进度与设置暂时无法记住。</p>}
       {panel === 'directory' && reading && <Panel title="目录" side="left" onClose={() => setPanel(null)}><Directory index={reading.index} current={chapter} onSelect={(selected) => navigate(position(selected))} /></Panel>}
       {panel === 'settings' && <Panel title="阅读设置" side="right" onClose={() => setPanel(null)}><Settings value={settings} onChange={updateSettings} /></Panel>}
+      {panel === 'sources' && session.kind === 'source' && (
+        <Panel title="切换书源" side="right" onClose={() => setPanel(null)}>
+          <SourcePanel
+            apiFetch={apiFetch}
+            title={session.title}
+            author={session.author}
+            session={reading?.index.source?.session}
+            currentSourceName={reading?.index.source?.name}
+            onSwitch={switchSource}
+          />
+        </Panel>
+      )}
       {promptOpen && <FeedbackPrompt title={bookTitle} author={bookAuthor} onDone={leaveReader} />}
     </div>
   );
@@ -414,6 +456,89 @@ function Directory({ index, current, onSelect }: { index: ReaderIndex; current: 
         <button className={styles.tool} disabled={page + 1 >= pageCount} onClick={() => { locateOnRender.current = false; setPage(page + 1); }}>下一页</button>
       </div>}
     </>
+  );
+}
+
+const SOURCE_STATUS_TEXT: Record<SourceAlternateStatus['status'], string> = {
+  ok: '', miss: '该书源没有这本书', unreachable: '该书源暂时无法访问',
+};
+
+/** 换源面板(设计 §4):打开即检测,一次会话内默认只自动检测一次;「重新检测」手动刷新。 */
+function SourcePanel({ apiFetch, title, author, session: catalogSession, currentSourceName, onSwitch }: {
+  apiFetch: (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
+  title: string; author: string; session?: string; currentSourceName?: string;
+  onSwitch: (bookUrl: string) => void;
+}) {
+  const [sources, setSources] = useState<SourceAlternateStatus[] | null>(null);
+  const [partial, setPartial] = useState(false);
+  const [error, setError] = useState('');
+  const [detecting, setDetecting] = useState(false);
+  const request = useRef<AbortController | null>(null);
+  const autoDone = useRef(false);
+
+  const detect = useCallback(() => {
+    request.current?.abort();
+    const controller = new AbortController();
+    request.current = controller;
+    setDetecting(true); setError('');
+    const query = new URLSearchParams({ title, author });
+    if (catalogSession) query.set('session', catalogSession);
+    void apiFetch('/api/read/source/alternates?' + query, { signal: controller.signal, cache: 'no-store' })
+      .then(async (res) => {
+        const data = await res.json().catch(() => null);
+        if (!res.ok) throw new Error(typeof data?.error === 'string' ? data.error : '检测书源失败,请重试。');
+        if (controller.signal.aborted) return;
+        // 当前源标记以 session 目录实况为准;服务端已标,这里回退用前端已知源名兜底。
+        const list: SourceAlternateStatus[] = Array.isArray(data?.sources) ? data.sources : [];
+        if (currentSourceName && !list.some((item) => item.current)) {
+          for (const item of list) if (item.sourceName === currentSourceName) item.current = true;
+        }
+        setSources(list); setPartial(data?.partial === true);
+      })
+      .catch((err: unknown) => { if (!controller.signal.aborted) setError(err instanceof Error ? err.message : '检测书源失败,请重试。'); })
+      .finally(() => { if (!controller.signal.aborted) setDetecting(false); });
+  }, [apiFetch, title, author, catalogSession, currentSourceName]);
+
+  useEffect(() => {
+    if (autoDone.current) return;
+    autoDone.current = true;
+    detect();
+    return () => request.current?.abort();
+  }, [detect]);
+
+  const ordered = sources ? [...sources].sort((a, b) => (a.current ? -1 : 0) - (b.current ? -1 : 0)) : null;
+  return (
+    <div className={styles.sources}>
+      <p className={styles.sourcesIntro}>下方列出各书源能否提供这本书;点击可切换书源,尽量保留当前阅读进度。</p>
+      <div className={styles.sourceActions}>
+        <button className={styles.locate} disabled={detecting} onClick={detect}>{detecting ? '检测中...' : '重新检测'}</button>
+      </div>
+      {error && <p className={styles.sourcesError} role="alert">{error}</p>}
+      {detecting && !ordered && <p className={styles.noResults}>正在检测各书源...</p>}
+      {ordered && <ul className={styles.sourceList}>
+        {ordered.map((item) => {
+          const clickable = item.status === 'ok' && !item.current && !!item.bookUrl;
+          return (
+            <li key={item.sourceName + (item.bookUrl ?? '')}>
+              <button
+                className={styles.sourceItem}
+                data-status={item.status}
+                disabled={!clickable}
+                aria-current={item.current ? 'true' : undefined}
+                onClick={() => clickable && onSwitch(item.bookUrl!)}
+              >
+                <span className={styles.sourceName}>{item.sourceName}</span>
+                {item.current && <small className={styles.sourceBadge}>当前源</small>}
+                {item.status === 'ok'
+                  ? <span>{item.title || title}{item.author ? ` · ${item.author}` : ''} · {item.chapters} 章</span>
+                  : <span>{SOURCE_STATUS_TEXT[item.status]}</span>}
+              </button>
+            </li>
+          );
+        })}
+      </ul>}
+      {partial && <p className={styles.sourcesNote}>部分书源未检测完(预算或时间限制),可再次点击「重新检测」。</p>}
+    </div>
   );
 }
 
