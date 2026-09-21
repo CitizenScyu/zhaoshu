@@ -91,4 +91,29 @@ describe('首屏返回的阅读状态', () => {
     const { apiFetch } = readInitial();
     expect(apiFetch).not.toHaveBeenCalled();
   });
+
+  // M3 复审 P1-3:换源提交的回调句柄必须随 hook 暴露,且初始为 null(还没注册)。
+  // ReaderClient 用它在「目录加载成功后」才把 book_url 写进 URL;句柄缺失会让
+  // onSwitchCommitted.current?.(...) 永远空转,book_url 永不落 URL(刷新丢源)。
+  it('暴露 onSwitchCommitted ref 与 switchedBookUrl,初始未注册', () => {
+    const { reader } = readInitial();
+    expect(reader.onSwitchCommitted).toHaveProperty('current');
+    expect(reader.onSwitchCommitted.current).toBeNull();
+    expect(typeof reader.switchedBookUrl).toBe('function');
+  });
+
+  // M3 复审 P1-3:switchedBookUrl 从 indexUrl 的 book_url 参数取值;下载会话
+  // (kind !== 'source')不该掺和换源,恒返回 undefined。
+  it('switchedBookUrl:非书源会话恒为 undefined;书源会话取 indexUrl 的 book_url', () => {
+    const apiFetch = vi.fn();
+    let seen: ReturnType<typeof useReader> | undefined;
+    function Probe() {
+      seen = useReader({ kind: 'source', title: '测试书', author: '作者' }, apiFetch, 3);
+      return null;
+    }
+    renderToStaticMarkup(createElement(Probe));
+    if (!seen) throw new Error('useReader 没有返回句柄');
+    // 首屏 indexUrl 由 session 派生,不带 book_url ⇒ undefined(确认路径才会带)。
+    expect(seen.switchedBookUrl()).toBeUndefined();
+  });
 });

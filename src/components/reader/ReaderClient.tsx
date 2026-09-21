@@ -106,7 +106,7 @@ function ReaderSession({ session, from }: Props) {
   const {
     settings, reading, activePart, loading, flowing, failure, percent, notice, storageFailed, focused,
     scroller, article, heading, onScroll, updateSettings, setFocusMode, navigate: requestNavigation,
-    extend, retry, markScrollIntent, setSection, loadConfirmedBook,
+    extend, retry, markScrollIntent, setSection, loadConfirmedBook, switchedBookUrl, onSwitchCommitted,
   } = useReader(session, apiFetch, user?.id ?? 0);
   const [panel, setPanel] = useState<'directory' | 'settings' | 'sources' | null>(null);
   const restoreButton = useRef<HTMLButtonElement>(null);
@@ -185,12 +185,26 @@ function ReaderSession({ session, from }: Props) {
   function showPanel(next: 'directory' | 'settings' | 'sources') { setFocusMode(false); setPanel(next); }
   // M3 手动换源:先走确认重放换目录(useReader 内做进度迁移),再把 book_url 写进 URL 防刷新丢源。
   // readingSessionKey 不含 bookUrl,router.replace 不会重挂 ReaderSession。
+  // 复审 P1-3:book_url 只在**目录加载成功后**才写进 URL。确认路径(book_url=...)会让服务端
+  // 跳过书名/作者匹配去建目录,一旦该候选建目录失败(404/422/503),URL 若已先被 replace 成
+  // 新 book_url,刷新/回退都会重放一个已知失败的候选。失败时 URL 必须保持旧源,用户可重试或换源。
   function switchSource(bookUrl: string) {
     if (session.kind !== 'source' || !bookUrl) return;
     loadConfirmedBook(bookUrl);
-    router.replace('/read/source?' + new URLSearchParams({ title: session.title, author: session.author, from, book_url: bookUrl }));
     setPanel(null);
   }
+  // 目录加载成功后把 book_url 持久化进 URL(与 loadIndex 成功对齐)。从 indexUrl 取实参,
+  // 保证「写进 URL 的就是服务端刚成功建目录的那个候选」。
+  const commitSwitchedBookUrl = useCallback((bookUrl: string | undefined) => {
+    if (session.kind !== 'source' || !bookUrl) return;
+    const query = new URLSearchParams({ title: session.title, author: session.author, from, book_url: bookUrl });
+    if (window.location.search !== '?' + query.toString()) router.replace('/read/source?' + query);
+  }, [session, from, router]);
+  // M3 复审 P1-3:回调注册放进 effect(ref 写入不得在渲染期做,SSR 会抛)。
+  // loadIndex 由 useReader 的 effect 里 queueMicrotask 触发,微排在所有 effect 之后,
+  // 因此此处的注册必然先于任何一次 loadIndex 成功回调,时序安全。
+  useEffect(() => { onSwitchCommitted.current = commitSwitchedBookUrl; }, [commitSwitchedBookUrl]);
+
   function toggleFocus(focusControl = false) {
     const next = !focused;
     setFocusMode(next);
@@ -223,7 +237,7 @@ function ReaderSession({ session, from }: Props) {
           <span title={reading?.index.title}>{reading?.index.title ?? '在线阅读'}</span>
         </div>
         <div className={styles.tools}>
-          {session.kind === 'source' && <button className={styles.tool} disabled={!reading} aria-haspopup="dialog" aria-expanded={panel === 'sources'} onClick={() => showPanel('sources')}><span aria-hidden="true">⇄</span> 换源</button>}
+          {session.kind === 'source' && <button className={styles.tool} aria-haspopup="dialog" aria-expanded={panel === 'sources'} onClick={() => showPanel('sources')}><span aria-hidden="true">⇄</span> 换源</button>}
           <button ref={focusButton} className={styles.tool} disabled={!reading} aria-label="专注阅读" onClick={() => toggleFocus(true)}>专注</button>
           <button className={styles.tool} disabled={!reading} aria-haspopup="dialog" aria-expanded={panel === 'directory'} onClick={() => showPanel('directory')}><span aria-hidden="true">☷</span> 目录</button>
           <button className={styles.tool} aria-haspopup="dialog" aria-expanded={panel === 'settings'} onClick={() => showPanel('settings')}><span aria-hidden="true">Aa</span> 设置</button>
@@ -234,8 +248,12 @@ function ReaderSession({ session, from }: Props) {
         <div className={styles.errorBar} role="alert">
           <span>{failure.message}</span>
           <button className={styles.tool} disabled={loading || flowing} onClick={retry}>{failure.status === 409 ? '重新加载目录' : '重试'}</button>
-          {session.kind === 'source' && (failure.code === 'SOURCE_CHANGED' || failure.code === 'SOURCE_CHAPTER_UNAVAILABLE')
-            && <button className={styles.tool} onClick={() => showPanel('sources')}>换个书源</button>}
+          {/* M3 复审 P1-3:确认失败(候选建目录失败 404/422/503,或章节在新源不可读 503
+              SOURCE_CHAPTER_UNAVAILABLE)时必须给一个「换个书源」的出口 —— 用户的本意是
+              「我要读这本书」,某个候选失败不该把他困死在重试上。SOURCE_CHANGED 是旧实现的
+              死码(服务端已不产出,见 source-reader.ts:634 注释),不再作为条件。 */}
+          {session.kind === 'source' && (failure.status === 404 || failure.status === 422 || failure.status === 503)
+            && <button className={styles.tool} disabled={loading || flowing} onClick={() => showPanel('sources')}>换个书源</button>}
           {session.kind === 'source' && <Link className={styles.tool} href={`/?${new URLSearchParams({ tab: 'library', q: session.title })}`}>去书库下载全书</Link>}
         </div>
       )}

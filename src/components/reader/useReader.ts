@@ -91,6 +91,8 @@ export function useReader(session: ReadingSession, apiFetch: ApiFetch, userId: n
   const pendingMigration = useRef<{ progress: ReadingProgress; fromIndex: ReaderIndex } | null>(null);
   // 迁移 notice 文案由 loadIndex 消费(设计 §5),用 ref 传递避免额外状态。
   const migrationNotice = useRef<string | null>(null);
+  // M3 复审 P1-3:目录加载成功后,回调 UI 层把 book_url 持久化进 URL(失败不写)。
+  const onSwitchCommitted = useRef<((bookUrl: string | undefined) => void) | null>(null);
 
   const [cache] = useState(() => new ReaderPartCache(async (index, position, signal) => {
     const part = await responseJson<ReaderPart>(await apiFetch(readerChapterUrl(index, position), { signal, cache: 'no-store' }));
@@ -188,6 +190,16 @@ export function useReader(session: ReadingSession, apiFetch: ApiFetch, userId: n
     return switched;
   }, []);
 
+  /**
+   * M3 手动换源(复审 P1-3):目录加载成功后,把新目录的 bookUrl 通知 UI 层持久化进 URL。
+   * book_url 只在成功后才落 URL;失败时 URL 保持旧源,避免「刷新重放一个已知失败的候选」。
+   * 值取自 indexUrl 里的 book_url 参数(它就是用户点选/确认的那个候选),由 ReaderSession 写 URL。
+   */
+  const switchedBookUrl = useCallback(() => {
+    if (session.kind !== 'source') return undefined;
+    return new URLSearchParams(indexUrl.split('?')[1] ?? '').get('book_url') ?? undefined;
+  }, [session.kind, indexUrl]);
+
   const fail = useCallback((error: unknown, target?: ReadingPosition, direction?: 'next' | 'previous') => {
     const status = error instanceof RequestError ? error.status : 0;
     if (status === 401) { cache.clear(); setReading(null); }
@@ -238,7 +250,13 @@ export function useReader(session: ReadingSession, apiFetch: ApiFetch, userId: n
       if (!saved && pending && index.source && index.source.id !== pending.fromIndex.source?.id) {
         const result = migrateProgressAcrossSources(pending.progress, pending.fromIndex, index);
         if (result) {
-          saved = { schema: 1, version: index.version, ...result.position, updatedAt: Date.now() };
+          // M3 复审 P2:迁移落盘的进度必须带上新目录的章节键(chapterTitle/catalogPrefix),
+          // 与 capturePosition 写入口径一致 —— 否则随后目录 version 变化(追加)时,
+          // parseReadingProgress 的 version 分支拿不到章节键而判进度失效,迁移成果白费。
+          const chapter = index.chapters[result.position.chapterIndex];
+          const catalog = index.taskId === null && index.source && chapter?.title
+            ? { chapterTitle: chapter.title, catalogPrefix: catalogPrefixKey(index, result.position.chapterIndex) } : {};
+          saved = { schema: 1, version: index.version, ...result.position, ...catalog, updatedAt: Date.now() };
           try { window.localStorage.setItem(progressKeyFor(index), JSON.stringify(saved)); } catch { setStorageFailed(true); }
           migrationNotice.current = result.confidence === 'exact'
             ? '已切换书源,回到原进度'
@@ -261,13 +279,18 @@ export function useReader(session: ReadingSession, apiFetch: ApiFetch, userId: n
       const notice = migrationNotice.current;
       migrationNotice.current = null;
       setNotice(notice ?? (saved ? '已回到上次阅读的位置' : ''));
+      // M3 复审 P1-3:目录与首段都拿到才算换源成功,此时才把 book_url 持久化进 URL。
+      onSwitchCommitted.current?.(switchedBookUrl());
     } catch (error) {
+      // M3 复审 P2:失败路径也要清掉暂存的迁移进度 —— 否则下一次 loadIndex(重试)
+      // 会把一次已经失败的换源进度再迁移一遍;且失败时 URL 不变(见 switchSource 注释)。
+      pendingMigration.current = null;
       if (!controller.signal.aborted && id === serial.current) fail(error);
     } finally {
       if (request.current === controller) request.current = null;
       if (!controller.signal.aborted && id === serial.current) setLoading(false);
     }
-  }, [apiFetch, indexUrl, beginRequest, adoptSwitch, cache, fail, flushPosition, progressKeyFor]);
+  }, [apiFetch, indexUrl, beginRequest, adoptSwitch, cache, fail, flushPosition, progressKeyFor, switchedBookUrl]);
 
   // 模糊候选点选后的确认重放：换 bookUrl 重载目录（server 端跳过书名/作者匹配）。
   const loadConfirmedBook = useCallback((bookUrl: string) => {
@@ -483,7 +506,9 @@ export function useReader(session: ReadingSession, apiFetch: ApiFetch, userId: n
   return {
     settings, reading, activePart, loading, flowing, failure, percent, notice, storageFailed, focused,
     scroller, article, heading, onScroll, updateSettings, setFocusMode, navigate, extend, retry,
-    markScrollIntent, loadConfirmedBook,
+    markScrollIntent, loadConfirmedBook, switchedBookUrl,
+    /** M3 复审 P1-3:注册「目录加载成功」回调,供 UI 层在成功后才写 book_url 进 URL。 */
+    onSwitchCommitted,
     setSection: (part: ReaderPart, element: HTMLElement | null) => {
       if (element) sections.current.set(partKey(part), element); else sections.current.delete(partKey(part));
     },
