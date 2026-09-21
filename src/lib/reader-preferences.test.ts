@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { catalogPrefixKey, DEFAULT_READER_SETTINGS, migrateProgressAcrossSources, normalizeChapterTitle, parseReaderSettings, parseReadingProgress, readingPercent, readingProgressKey } from './reader-preferences';
-import { normalizeSourceTitle } from './source-parser';
+import { matchSourceChapter, normalizeSourceTitle } from './source-parser';
 import type { ReaderIndex, ReaderPart } from './reader-types';
 
 const index: ReaderIndex = {
@@ -245,14 +245,24 @@ describe('M3 跨源进度迁移', () => {
     expect(result).toMatchObject({ confidence: 'estimated', position: { chapterIndex: 2 } });
   });
 
-  it('标题与邻章都无法锚定 ⇒ 比例回退(estimated)', () => {
+  it('旧目录无标题证据(章标题为空)且新源无法对上 ⇒ 比例回退(estimated)', () => {
+    // 旧目录章标题恒为空串、saved 进度也不带 chapterTitle ⇒ anchor 为空,完全没有标题证据。
+    // 这时不存在「锚定失败」可言,退到比例回退:旧索引 4 / 4 → round(4/4×9)=9。
+    const old = oldIndex(['', '', '', '', '']);
+    const next = newIndex(['V', 'W', 'X', 'Y', 'Z', 'P', 'Q', 'R', 'S', 'T']);
+    const result = migrateProgressAcrossSources(pos(4), old, next);
+    expect(result).toMatchObject({ confidence: 'estimated', position: { chapterIndex: 9 } });
+  });
+
+  it('旧章标题有证据、新源标题与邻章全对不上 ⇒ null(不猜比例)', () => {
     const old = oldIndex(['第1章', '第2章', '第3章', '第4章', '第5章']);
-    const next = newIndex(['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J']);
-    // 旧索引 4 / 4 → round(4/4×9)=9。
+    const next = newIndex(['V', 'W', 'X', 'Y', 'Z', 'P', 'Q', 'R', 'S', 'T']);
+    // 旧章 chapterTitle='第5章' 是有语义的标题证据,但新源完全没有对应章、邻章也对不上
+    // ⇒ 落比例会给出一个明显无关的章(串章),宁可 null。
     const result = migrateProgressAcrossSources(
       { ...pos(4), chapterTitle: '第5章' }, old, next,
     );
-    expect(result).toMatchObject({ confidence: 'estimated', position: { chapterIndex: 9 } });
+    expect(result).toBeNull();
   });
 
   it('新目录为空 ⇒ null', () => {
@@ -271,10 +281,40 @@ describe('M3 跨源进度迁移', () => {
   });
 });
 
-describe('M3 normalizeChapterTitle 与 source-parser.normalizeSourceTitle 逐字一致', () => {
-  // 一致性钉死:两处实现必须逐字同语义,防语义漂移(设计 §5 风险 5)。
+describe('M3 章标题归一化 = 自动换源同一折叠器(复审 P1-1:复用不重写)', () => {
+  // 复审 P1-1:reader-preferences 不再自带第二套归一化,而是 re-export source-parser 的
+  // normalizeChapterTitle(章号折叠「第一章」=「第1章」+ 去尾部标点)。这里钉死折叠行为。
   it.each([
-    '《测试书》', '  第 1 章  ', 'ＡＢＣ', '第1章', 'fF', '未知书名１２３', '书名\t空 白',
+    // 章号中文写法 ⇄ 阿拉伯写法必须折叠到同一键。
+    { a: '第一章', b: '第1章' },
+    { a: '第十章', b: '第10章' },
+    { a: '第十二章', b: '第12章' },
+    // 尾部标点不参与比较。
+    { a: '第1章。', b: '第1章' },
+    { a: '第3章、', b: '第3章' },
+    // 空白 / 全角 / 书名号同 source-parser 语义。
+    { a: '  第 1 章  ', b: '第1章' },
+    { a: '《第1章》', b: '第1章' },
+  ])('$a ≡ $b', ({ a, b }) => {
+    expect(normalizeChapterTitle(a)).toBe(normalizeChapterTitle(b));
+  });
+
+  it('带章号的标题与无章号的写法不折叠(防串章:第1章 ≠ 第二章)', () => {
+    expect(normalizeChapterTitle('第1章')).not.toBe(normalizeChapterTitle('第2章'));
+  });
+
+  it('折叠器在跨源目录定位上真正生效(matchSourceChapter 同源判定)', () => {
+    // 旧目录写「第一章」,新源写「第1章」:必须定位到索引 0 而不是 503。
+    const chapters = [{ url: 'a', title: '第1章' }, { url: 'b', title: '第2章' }];
+    expect(matchSourceChapter(chapters, '第一章', 0)).toBe(0);
+  });
+});
+
+describe('M3 normalizeChapterTitle 与 source-parser 归一化同源', () => {
+  // re-export 一致性钉死:reader-preferences 的归一化就是 source-parser 的实现(非第二份副本)。
+  // 下列输入不含中文章号,折叠层与书名归一化层结果必然一致;含章号的折叠由上一 describe 钉死。
+  it.each([
+    '《测试书》', '  第 1 章  ', 'ＡＢＣ', 'fF', '未知书名１２３', '书名\t空 白',
   ])('同一输入给出同一结果: %s', (value) => {
     expect(normalizeChapterTitle(value)).toBe(normalizeSourceTitle(value));
   });

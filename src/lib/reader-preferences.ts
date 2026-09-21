@@ -178,14 +178,13 @@ export function readingPercent(index: ReaderIndex, part: ReaderPart, ratio: numb
 
 // ---- M3 手动换源:跨源进度迁移(设计 §5) ----
 
-/**
- * 客户端章标题归一化:与 `source-parser.ts` 的 `normalizeSourceTitle` **逐字一致**
- * (NFKC / trim / 去全角书名号 / 去空白 / 小写)。source-parser 不进客户端包,
- * 故在此处复刻;测试文件同时 import 两边做一致性钉死(防止语义漂移)。
- */
-export function normalizeChapterTitle(value: string): string {
-  return value.normalize('NFKC').trim().replace(/^《(.+)》$/, '$1').replace(/\s+/gu, '').toLocaleLowerCase();
-}
+// 客户端章标题归一化:**直接复用** `source-parser.ts` 的 `normalizeChapterTitle`
+// (NFKC / trim / 去全角书名号 / 去空白 / 小写 / 章号折叠「第一章」=「第1章」/ 去尾部标点),
+// 不在客户端再写第二套折叠逻辑,避免两份实现漂移(复审 P1-1)。
+// source-parser 的依赖链(source-policy / supported-sources 均 client-safe,db 仅动态 import)
+// 可安全静态 import 进客户端包;测试文件同时 import 两边做一致性钉死。
+import { normalizeChapterTitle } from './source-parser';
+export { normalizeChapterTitle };
 
 /** 比例估算:按旧目录相对位置映射到新目录索引(边界 clamp)。 */
 function estimateIndex(oldChapterIndex: number, oldTotal: number, newTotal: number): number {
@@ -245,6 +244,10 @@ export function migrateProgressAcrossSources(
       const chosen = derived.reduce((a, b) => Math.abs(a - estimate) <= Math.abs(b - estimate) ? a : b);
       return { position: { chapterIndex: chosen, partIndex: 0, ratio }, confidence: 'estimated' };
     }
+    // 旧章标题有证据、但标题与邻章在新源都锚定不到 ⇒ 没有任何可采信的标题锚点。
+    // 比例回退会落到一个纯按序号估算的章(可能完全无关),这比「落空让用户自己选」更糟。
+    // 宁可返回 null:调用方保持 START 位置并提示用户手动换源/选章(设计 §5 三级回退的兜底语义)。
+    return null;
   }
   return { position: { chapterIndex: estimate, partIndex: 0, ratio }, confidence: 'estimated' };
 }
