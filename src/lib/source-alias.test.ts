@@ -142,6 +142,15 @@ describe('sourceTitleSimilarity (fuzzy tier thresholds)', () => {
     expect(sourceTitleSimilarity('大奉打更人【1】', { title: '大奉打更人【2】', author: '' })).not.toBe(1);
   });
 
+  it('does not treat a decoration-only title (empty body) as tier 1 (40 任审查 B / 空串假等)', () => {
+    // 【全集】/【番外】都是纯修饰词,剥光后是空串:空串===空串不是「书名对上」的证据 ⇒ 不得判档位 1。
+    expect(sourceTitleSimilarity('【全集】', { title: '【番外】', author: '' })).not.toBe(1);
+    expect(sourceTitleSimilarity('【完结】', { title: '【精品】', author: '' })).not.toBe(1);
+    // 反向:真书名本体就叫《全集》时,【全集】应能判档位 1(词本体相等,只是被加了括号)。
+    expect(sourceTitleSimilarity('全集', { title: '【全集】', author: '' })).toBe(1);
+    expect(sourceTitleSimilarity('番外', { title: '【番外】', author: '' })).toBe(1);
+  });
+
   it('ranks containment at tier 2 only when the shorter side is at least 4 chars', () => {
     expect(sourceTitleSimilarity('我有一座恐怖屋', { title: '我有一座恐怖屋全本', author: 'x' })).toBe(2);
     expect(sourceTitleSimilarity('我有一座恐怖屋', { title: '恐怖屋', author: 'x' })).not.toBe(2);

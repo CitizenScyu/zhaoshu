@@ -151,6 +151,13 @@ const TITLE_DECORATION = /[[【《〈「(](?:完结|全本|完本|全集|精品|
 function stripTitleWrappers(value: string): string {
   return value.replace(TITLE_DECORATION, '');
 }
+// 书名**本体**就是修饰词时(书就叫《全集》),整串会被 stripTitleWrappers 剥成空串;
+// 空串与空串相等不是「书名对上」的证据,而是「什么都没剩下」。此处退回「只去括号、保留词本体」
+// 比较,使《全集》↔【全集】仍能判档位 1,同时【全集】↔【番外】不会被提权(词本体不同)。
+const TITLE_BRACKETS = /[\]\[【】《》〈〉「」()]/gu;
+function stripTitleBrackets(value: string): string {
+  return value.replace(TITLE_BRACKETS, '');
+}
 
 function editDistance(a: string, b: string): number {
   if (a === b) return 0;
@@ -180,7 +187,13 @@ export function sourceTitleSimilarity(expectedTitle: string, candidate: SourceBo
   for (const actual of candidates) {
     if (!actual) continue;
     if (actual === expected) best = Math.min(best, 0);
-    if (stripTitleWrappers(stripTitleDecorations(actual)) === stripTitleWrappers(stripTitleDecorations(expected))) best = Math.min(best, 1);
+    const strippedActual = stripTitleWrappers(stripTitleDecorations(actual));
+    const strippedExpected = stripTitleWrappers(stripTitleDecorations(expected));
+    // 剥离结果为**空串**时不进「空串===空串」档位 1:那说明两边都是纯修饰词(【全集】vs【番外】),
+    // 不是「书名对上」。退回「只去括号、保留词本体」比较:【全集】↔《全集》仍判 1,【番外】↛。
+    const bodyActual = strippedActual || stripTitleBrackets(actual);
+    const bodyExpected = strippedExpected || stripTitleBrackets(expected);
+    if (bodyActual !== '' && bodyActual === bodyExpected) best = Math.min(best, 1);
     const shorter = actual.length < expected.length ? actual : expected;
     const longer = actual.length < expected.length ? expected : actual;
     if (shorter.length >= MIN_CONTAINMENT_LENGTH && longer.includes(shorter)) best = Math.min(best, 2);
