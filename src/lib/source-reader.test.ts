@@ -1293,6 +1293,50 @@ describe('M3 surveySourceBooks 换源扫描', () => {
     expect(sources.find((item) => item.sourceName === '测试书源')).toMatchObject({ status: 'miss', current: true });
   });
 
+  it('P1-2: 精确层 0 候选但同页兜底捡到无关详情链接 ⇒ 仍触发作者搜索回退(与 resolveSourceBook 同口径)', async () => {
+    // 精确层(parseSourceSearch 锚文本相等)收 0,同页兜底(parseSourceDetailLinks)捡到一条
+    // 锚文本带修饰的**无关**详情链接 ⇒ candidates 非空但身份不匹配 ⇒ 修复前因 `!candidates.length`
+    // 为假而**不触发**作者回退,该源被判 miss;修复后按 exactLayerEmpty 触发作者回退并命中。
+    mocks.sources.mockResolvedValue([source]);
+    pages.set(search(book.title), {
+      // 「【完结】无关书」≠「测试书」:精确层 0;但同页兜底会把它当详情链接候选收集进来。
+      text: '<a href="/books/details999.html">【完结】无关书</a>',
+    });
+    pages.set(pageUrl(999), {
+      text: detail(999, '别的作者').replace('content="测试书"', 'content="无关书"'),
+    });
+    // 作者搜索页命中本书(作者搜索回退的正面出口)。
+    pages.set(search(book.author), { text: '<a href="/books/details42.html">测试书</a>' });
+    pages.set(pageUrl(), { text: detail() });
+    const { sources } = await service.surveySourceBooks(book, context(), { excludeBookUrl: undefined });
+    // 修复后:exactLayerEmpty ⇒ 走作者回退 ⇒ inspect 作者页候选 ⇒ 命中 details42 ⇒ ok。
+    // 修复前:判据是 !candidates.length(=false,因为兜底捡到了 details999)⇒ 不回退 ⇒ miss。
+    expect(sources[0]).toMatchObject({ status: 'ok', bookUrl: pageUrl() });
+  });
+
+  it('P2: 纯内置源池也 openPool 满池预算(不再只在含引擎源时开)', async () => {
+    // 修复前 openPool 只在池里含非 builtin 源时调用,纯内置源池的 totalLimit 停在默认 12。
+    // 修复后无论池构成都开 min(30, max(12, 6×n));此处两源纯 builtin ⇒ totalLimit 应为 12(6×2 命中保底),
+    // 关键是 openPool **被调用**(可观测:totalLimit 与显式 openPool(2) 一致,且 budget 被抬高到池规模)。
+    mocks.sources.mockResolvedValue([source, sourceB]);
+    primeHitB();
+    const ctx = context();
+    const before = ctx.totalLimit;
+    await service.surveySourceBooks(book, ctx);
+    // context() 默认 limit=undefined ⇒ totalLimit 保底 12;两源 openPool(2)=max(12,12)=12。
+    // 断言点在于「openPool 被调用过」:用一个 6 源纯内置池才能看出抬升(max(12,36)→30)。
+    expect(before).toBe(12);
+    const many = Array.from({ length: 6 }, (_, i) => ({ ...source, url: `https://book15.net/p${i}/`, name: `池源${i}` }));
+    mocks.sources.mockResolvedValue(many);
+    for (const item of many) {
+      pages.set(item.url.replace(/\/$/, '') + '/books/search.html?kw=' + encodeURIComponent(book.title), { text: '' });
+      pages.set(item.url.replace(/\/$/, '') + '/books/search.html?kw=' + encodeURIComponent(book.author), { text: '' });
+    }
+    const ctx6 = context();
+    await service.surveySourceBooks(book, ctx6);
+    expect(ctx6.totalLimit).toBe(30); // 6 纯内置源:openPool(6)=min(30, max(12,36))=30
+  });
+
   it('池超过 6 源 ⇒ 独立池上限 min(池, 6):第 7 源不扫', async () => {
     const many = Array.from({ length: 7 }, (_, i) => ({ ...source, url: `https://book15.net/s${i}/`, name: `源${i}` }));
     mocks.sources.mockResolvedValue(many);

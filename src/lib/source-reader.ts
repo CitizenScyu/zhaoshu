@@ -709,17 +709,22 @@ async function surveyOneSource(
   if (hinted) return record(hinted);
   const search = await context.page(sourceSearchUrl(source.searchUrl, book.title, source.url));
   let candidates: string[] = [];
+  // 精确层(parseSourceSearch 锚文本相等)是否收 0 —— 与 resolveSourceBook(:486)同口径。
+  // 作者搜索回退判的是这个,而不是「兜底后 candidates 是否为空」:同页兜底(parseSourceDetailLinks)
+  // 捡到的无关详情链接只表示「本页有别的书」,不代表「本书不在本站」,不能据此拦掉作者回退(复审 P1-2)。
+  let exactLayerEmpty = false;
   if (/^\/books\/details\d+\.html$/.test(new URL(search.url).pathname) && search.url !== excludeBookUrl) {
     const direct = catalogFrom(search, source, book);
     if (direct) return record(direct);
   } else {
     const exact = parseSourceSearch(search.text, search.url, book.title);
+    exactLayerEmpty = !exact.length;
     candidates = exact.length ? exact : parseSourceDetailLinks(search.text, search.url, book.title);
   }
   const found = await inspect(candidates);
   if (found) return record(found);
   // 作者搜索回退(同 resolveSourceBook:精确层 0 候选 + 有独立作者可搜)。
-  if (!candidates.length && knownSourceAuthor(book.author) && knownSourceAuthor(book.author) !== normalizeSourceTitle(book.title)) {
+  if ((exactLayerEmpty || !candidates.length) && knownSourceAuthor(book.author) && knownSourceAuthor(book.author) !== normalizeSourceTitle(book.title)) {
     const authorSearch = await context.page(sourceSearchUrl(source.searchUrl, book.author, source.url));
     const authorCandidates = /^\/books\/details\d+\.html$/.test(new URL(authorSearch.url).pathname)
       ? [authorSearch.url]
@@ -741,7 +746,9 @@ export async function surveySourceBooks(
 ): Promise<{ sources: SourceAlternateStatus[]; partial: boolean }> {
   const all = await getReadingSources(context.signal);
   const pool = all.slice(0, Math.min(all.length, MAX_SURVEY_SOURCES));
-  if (pool.some((source) => !isBuiltinReadingSource(source))) context.openPool(pool.length);
+  // 无论池里是否含引擎源,都先开满池点数(复审 P2):引擎源同样占请求预算,
+  // 只在「有引擎源时」才 openPool 会让纯内置源池的预算记账缺失。
+  context.openPool(pool.length);
   const hints = await hintsFor(book, context.signal);
   const excludeBookUrl = options.excludeBookUrl ?? options.currentBookUrl;
   const results: SourceAlternateStatus[] = [];
