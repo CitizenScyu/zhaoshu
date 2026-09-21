@@ -19,6 +19,11 @@ const detail = (id = 42, author = '作者', titles = ['第一章', '第二章'])
   `<meta property="og:novel:book_name" content="测试书"><meta property="og:novel:author" content="${author}">`
   + titles.map((title, i) => `<dd><a href="/chapter/index${id}-${i + 1}.html">${title}</a></dd>`).join('');
 const chapterHtml = (text = '离线测试正文。') => `<li class="chapter-content"><p>${text}</p></li>`;
+// 换源测试用的「另一个站」备用源:与主源**不同 host**,且章名写法不同(「第1章」)。
+const backup = { url: 'https://backup.test/', name: '备用书源', searchUrl: '/books/search.html?kw={{key}}', rules: {} };
+const backupSearch = () => 'https://backup.test/books/search.html?kw=' + encodeURIComponent(book.title);
+const backupPage = 'https://backup.test/books/details777.html';
+const backupChapter = (id: number, chapter: number) => `https://backup.test/chapter/index${id}-${chapter}.html`;
 const pages = new Map<string, { text?: string; status?: number }>();
 const catalogs = new Map<string, SourceCatalog>();
 let hints: unknown[];
@@ -84,6 +89,8 @@ beforeEach(async () => {
   let time = Date.now();
   vi.spyOn(Date, 'now').mockImplementation(() => time += 400);
   service = await import('./source-reader');
+  // 换源测试用另一个站:host 必须先过运行时白名单(source-policy),否则请求在到达 fetch 前就被拒。
+  (await import('./source-policy')).refreshSupportedHosts(['backup.test']);
   GET = (await import('@/app/api/read/source/[resource]/route')).GET;
 });
 afterEach(() => { vi.unstubAllGlobals(); vi.unstubAllEnvs(); vi.restoreAllMocks(); });
@@ -180,12 +187,23 @@ describe('online reader source resolution and budgets', () => {
     expect((await service.readSourceChapter(catalog.version, 0, context())).text).toBe('更新正文');
   });
 
-  it('rejects disabled sources even when the chapter is cached', async () => {
+  it('switches source instead of a hard 409 when the stored source is gone', async () => {
+    // 洞 1:旧实现在 loadSourceCatalog 抛 SOURCE_CHANGED(409)⇒ 换源流程永远到不了,
+    // 用户只能手点「重新加载目录」。现在同一 URL 若还在池里就继续读;整条源被停用时进换源。
     const catalog = await service.resolveSourceBook(book, context());
     catalogs.set(catalog.version, catalog);
-    await service.readSourceChapter(catalog.version, 0, context());
+    // (a) 源记录被刷新(revision 漂移:改名/改规则)但 URL 还在池里 —— 旧 409 挡不住阅读,
+    //     直接用池里的当前记录继续读(生产复现:源名「📂网阅小说」→「网阅小说」)。
+    mocks.sources.mockResolvedValue([{ ...source, name: '刷新后的书源' }]);
+    const part = await service.readSourceChapter(catalog.version, 0, context());
+    expect(part.text).toBe('离线测试正文。');
+    expect(part.servedFrom).toBe('刷新后的书源');
+
+    // (b) 源整条被停用(池空):不再 409,而是找不到备用源 ⇒ 503 章节不可读。
+    // 换一章读(上一章已进暖缓存,缓存语义与源状态无关,不参与本断言)。
     mocks.sources.mockResolvedValue([]);
-    await expect(service.readSourceChapter(catalog.version, 0, context())).rejects.toMatchObject({ code: 'SOURCE_CHANGED' });
+    await expect(service.readSourceChapter(catalog.version, 1, context()))
+      .rejects.toMatchObject({ code: 'SOURCE_CHAPTER_UNAVAILABLE', status: 503 });
   });
 
   it('fails over by unique chapter title instead of the chapter ordinal', async () => {
@@ -200,9 +218,88 @@ describe('online reader source resolution and budgets', () => {
     const part = await service.readSourceChapter(catalog.version, 0, context());
     expect(part.text).toBe('备用来源第一章');
     expect(part.chapterIndex).toBe(0);
-    expect(part.sourceId).toBe(catalog.sourceId);
+    // 洞 2:换源成功即把目录换成备用源(version/sourceId/session 一并换新),
+    // 前端据此把后续章节的请求直接打向新源。
+    const alternative = catalogs.get(part.version)!;
+    expect(part.version).toBe(alternative.version);
+    expect(part.sourceId).toBe(alternative.sourceId);
+    expect(part.sourceSession).toBe(alternative.version);
+    expect(part.servedFrom).toBe(alternative.sourceName);
   });
 
+  // ---- 换源的四条洞(修复批次 fix/autoswitch-holes) ----
+
+  it('SOURCE_CHANGED(源整条不在池里)也进换源,换源成功后 chapter/sourceId/session 换新源(洞 1+2)', async () => {
+    // 旧行为:loadSourceCatalog 抛 409 SOURCE_CHANGED ⇒ 换源流程永远到不了。
+    // 新行为:同 URL 换版本 ⇒ 复用当前记录(上一用例);同 URL 也没了 ⇒ 换源。
+    mocks.sources.mockResolvedValue([source, backup]);
+    const catalog = await service.resolveSourceBook(book, context());
+    catalogs.set(catalog.version, catalog);
+    pages.set(chapterUrl(), { text: '', status: 404 }); // 当前源章节失效(与源被停用等价的可达路径)
+    pages.set(backupSearch(), { text: '<a href="/books/details777.html">测试书</a>' });
+    pages.set(backupPage, { text: detail(777, '作者', ['第1章', '第2章']) });
+    // detail() 生成的章节链接从 1 起编号:第 1 章 = index777-1。
+    pages.set(backupChapter(777, 1), { text: chapterHtml('备用源第1章正文') });
+    // 备用站的章名写法与当前站不同(「第1章」vs「第一章」)—— 洞 4 的对齐在这里生效。
+    const part = await service.readSourceChapter(catalog.version, 0, context());
+    expect(part.text).toBe('备用源第1章正文');
+    expect(part.servedFrom).toBe(backup.name);
+    expect(part.version).not.toBe(catalog.version);
+    expect(part.sourceId).toBe(catalogs.get(part.version)!.sourceId);
+    expect(part.sourceSession).toBe(part.version);
+    // 洞 2:备用源目录已落库(换源固化),新会话可直接续读下一章。
+    expect(catalogs.has(part.version)).toBe(true);
+    // 下一章直接用新源:不再回到故障原源(原源章节页一次都没被再请求)。
+    mocks.fetch.mockClear();
+    pages.set(backupChapter(777, 2), { text: chapterHtml('备用源第2章正文') });
+    const next = await service.readSourceChapter(part.sourceSession!, 1, context());
+    expect(next.text).toBe('备用源第2章正文');
+    expect(next.servedFrom).toBe(backup.name);
+    expect(mocks.fetch.mock.calls.map(([input]) => String(input))).not.toContain(chapterUrl());
+  });
+
+  it('换源候选排除当前源(同站候选降到队尾),全网只剩同站时才用它(洞 3)', async () => {
+    // 当前源失效后,若候选只排除了「当前 bookUrl」,同站另一个详情页会立刻被选中 ——
+    // 「换源」变成同站换 URL,仍留在故障站点。这里断言同站候选被降到**另一个站**之后。
+    const sameStation = { ...source, url: 'https://book15.net/same', name: '同站备用', searchUrl: '/same/search.html?kw={{key}}' };
+    mocks.sources.mockResolvedValue([source, sameStation, backup]);
+    pages.set(backupSearch(), { text: '<a href="/books/details777.html">测试书</a>' });
+    pages.set(backupPage, { text: detail(777, '作者', ['第一章']) });
+    pages.set(backupChapter(777, 1), { text: chapterHtml('另一站正文') });
+    pages.set('https://book15.net/same/search.html?kw=' + encodeURIComponent(book.title), {
+      text: '<a href="/books/details888.html">测试书</a>',
+    });
+    pages.set(pageUrl(888), { text: detail(888, '作者', ['第一章']) });
+    pages.set(chapterUrl(888, 1), { text: chapterHtml('同站正文') });
+    // 洞 3 的正向断言:同站新 URL 必须**先不被选中** —— 一旦被选中,另一站根本不会被访问。
+    const catalog = await service.resolveSourceBook(book, context(), { sources: [source, sameStation, backup] });
+    const alternative = await service.resolveSourceBook(catalog, context(), {
+      excludeBookUrl: catalog.bookUrl, sources: [source, sameStation, backup], preferAfterSourceUrl: catalog.sourceUrl,
+    });
+    expect(alternative.sourceName).toBe(backup.name); // 先出另一站,而不是同站的新 URL
+    // 只剩同站时仍可用(降级不是禁止):同站候选排在最后但能被选到。
+    const onlySame = await service.resolveSourceBook(catalog, context(), {
+      excludeBookUrl: catalog.bookUrl, sources: [source, sameStation], preferAfterSourceUrl: catalog.sourceUrl,
+    });
+    expect(onlySame.sourceName).toBe('同站备用');
+  });
+
+  it('章节标题跨站写法差异仍能对齐;完全无关的章不匹配(洞 4)', async () => {
+    const catalog = await service.resolveSourceBook(book, context());
+    catalogs.set(catalog.version, catalog);
+    pages.set(chapterUrl(), { text: '', status: 404 });
+    pages.set(backupSearch(), { text: '<a href="/books/details777.html">测试书</a>' });
+    // 备用站把「第一章」写成「第 1 章」并带主体;旧实现「归一化后须完全相同且唯一」⇒ 换源失败。
+    pages.set(backupPage, { text: detail(777, '作者', ['序言', '第 1 章']) });
+    pages.set(backupChapter(777, 2), { text: chapterHtml('跨站写法对齐') });
+    mocks.sources.mockResolvedValue([source, backup]);
+    const part = await service.readSourceChapter(catalog.version, 0, context());
+    expect(part.text).toBe('跨站写法对齐');
+    // 负对照:备用站目录里只有完全无关的章名 ⇒ 不匹配,仍 503(绝不交付别的章)。
+    pages.set(backupPage, { text: detail(777, '作者', ['楔子', '风起云涌']) });
+    await expect(service.readSourceChapter(catalog.version, 1, context()))
+      .rejects.toMatchObject({ code: 'SOURCE_CHAPTER_UNAVAILABLE', status: 503 });
+  });
   it('falls back to an author search when the title search yields no candidates, matching a renamed book via its self-reported alias', async () => {
     // 站点把《改名书》上架为《站点新书》，标题搜索 0 结果；
     // 作者搜索命中，详情页简介自报【原书名：改名书】。
@@ -1039,7 +1136,8 @@ describe('引擎源正文分派（N01）', () => {
     const part = await service.readSourceChapter(catalog.version, 0, context());
     expect(part.text).toBe('备用引擎源正文。');
     expect(part.servedFrom).toBe('N01引擎源');
-    expect(part.sourceId).toBe(catalog.sourceId); // 目录归属仍是主源
+    // 洞 2:换源后目录归属换成备用源(不再是主源 catalog)。
+    expect(part.sourceId).toBe(catalogs.get(part.version)!.sourceId);
   });
 
   it('端到端（离线，源池/DB mock）：引擎源目录成功 → 正文成功', async () => {

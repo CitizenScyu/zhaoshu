@@ -9,7 +9,7 @@ import {
 } from './rule-engine/api';
 import { compileSource } from './rule-engine/compile';
 import {
-  knownSourceAuthor, MAX_SOURCE_CHAPTER_CHARACTERS, normalizeSourceTitle, parseSourceChapters,
+  knownSourceAuthor, matchSourceChapter, MAX_SOURCE_CHAPTER_CHARACTERS, normalizeSourceTitle, parseSourceChapters,
   parseSourceChapterText, parseSourceDetailLinks, parseSourceIdentity, parseSourceSearch,
   sourceBookMatches, sourceSearchUrl, sourceTitleSimilarity,
   type SourceBookIdentity, type SourceChapter,
@@ -299,13 +299,33 @@ function rankSimilarCandidates(expected: SourceBookIdentity, found: SourceSimila
     .map(({ candidate }) => candidate);
 }
 
+/**
+ * 洞 3:换源时把**当前源**(含同站备用 host)的候选降到队尾 —— 稳定重排,其余保持原有优先级。
+ * 不是绝对禁止:全网只剩同站候选时它仍能被选到,只是排在最后,避免「同站换 URL 不换站」原地打转。
+ */
+function deprioritizeSource(sources: ReadingSource[], url: string | undefined): ReadingSource[] {
+  if (!url) return sources;
+  const host = hostOf(url);
+  if (!host) return sources;
+  const current: ReadingSource[] = [];
+  const rest: ReadingSource[] = [];
+  for (const source of sources) {
+    const sourceHost = hostOf(source.url);
+    const sameStation = sourceHost === host || (sourceHost.length > 0 && alternateSourceHost(host) === sourceHost);
+    (sameStation ? current : rest).push(source);
+  }
+  return current.length && rest.length ? [...rest, ...current] : sources;
+}
+
 /** Search/detail validation only; never fetches chapter text or evaluates source rules. */
 export async function resolveSourceBook(
   book: SourceBookIdentity,
   context: SourceRequestContext,
-  options: { excludeBookUrl?: string; sources?: ReadingSource[]; bookUrl?: string } = {},
+  options: { excludeBookUrl?: string; sources?: ReadingSource[]; preferAfterSourceUrl?: string; bookUrl?: string } = {},
 ): Promise<SourceCatalog> {
-  const sources = options.sources ?? await getReadingSources(context.signal);
+  const sources = deprioritizeSource(
+    options.sources ?? await getReadingSources(context.signal), options.preferAfterSourceUrl,
+  );
   // 用户在前端候选列表里点选后的确认路径：URL 即用户决定，跳过书名/作者校验，
   // 只保留结构性防御（域名白名单在 validateSourceUrl、目录可解析、非 excludeBookUrl）。
   if (options.bookUrl) {
@@ -586,14 +606,16 @@ async function loadSourceCatalog(session: string, context: SourceRequestContext)
   const sql = getSql();
   const [row] = await queryRows<{ payload: SourceCatalog }>(sql`
     SELECT payload FROM source_read_catalogs WHERE id = ${session} AND expires_at > now()`, context.signal);
-  if (!row) throw new SourceReaderError('阅读目录已过期，请重新加载目录。', 'SOURCE_SESSION_EXPIRED', 409);
+  if (!row) throw new SourceReaderError('阅读目录已过期,请重新加载目录。', 'SOURCE_SESSION_EXPIRED', 409);
   const catalog = row.payload;
   const sources = await getReadingSources(context.signal);
-  // N01：revision 校验从 some() 改为 find()，同时把命中的源带出供 chapterText 分派（零额外查询）。
-  const source = sources.find((item) => item.url === catalog.sourceUrl && sourceRevision(item) === catalog.sourceRevision);
-  if (!source) {
-    throw new SourceReaderError('书源已停用或规则已更新，请重新选择书源。', 'SOURCE_CHANGED', 409);
-  }
+  // N01:revision 校验用 find() 把命中的源带出供 chapterText 分派(零额外查询)。
+  // 旧实现在找不到时抛 SOURCE_CHANGED(409):源记录一刷新(改名/改规则),在途读者的
+  // 旧 catalog 全书 409,只能手点「重新加载目录」自救。现在两档降级(洞 1):
+  // 1) url+revision 精确相符 ⇒ 就是它;2) **同 URL 换版本**(revision 漂移)⇒ 复用池中当前记录,
+  //    目录内容未变、源站未变,直接用当前规则继续读;3) 同 URL 也没了 ⇒ source=null,调用方换源。
+  const source = sources.find((item) => item.url === catalog.sourceUrl && sourceRevision(item) === catalog.sourceRevision)
+    ?? sources.find((item) => item.url === catalog.sourceUrl) ?? null;
   validateSourceUrl(catalog.bookUrl);
   return { catalog, source, sources };
 }
@@ -604,8 +626,9 @@ let cacheBytes = 0;
 /** 目录加载时随 catalog 一起带出的源归属（N01）：按 builtin/engine 分派正文提取。 */
 interface LoadedSource {
   catalog: SourceCatalog;
-  source: ReadingSource;
-  /** 目录加载时的池快照：章节级 failover 复用（备用的源标识必在同一快照内，确定性反查）。 */
+  /** 与目录 revision 精确相符的当前源;null = 已停用或规则漂移(调用方走换源)。 */
+  source: ReadingSource | null;
+  /** 目录加载时的池快照:章节级 failover 复用(备用的源标识必在同一快照内,确定性反查)。 */
   sources: ReadingSource[];
 }
 
@@ -640,41 +663,77 @@ function remember(key: string, text: string, servedFrom: string) {
 }
 
 export async function readSourceChapter(session: string, chapterIndex: number, context: SourceRequestContext): Promise<ReaderPart> {
-  // Recheck enablement even for a warm chapter cache.
+  // 目录会话与源池快照:不再因源身份漂移硬 409 —— 变化交给 loadSourceCatalog 区分后,这里按需换源。
   const { catalog, source, sources } = await loadSourceCatalog(session, context);
   const chapter = catalog.chapters[chapterIndex];
   if (!chapter) throw new SourceReaderError('章节不存在。', 'SOURCE_CHAPTER_INVALID', 400);
   const key = catalog.version + ':' + chapterIndex;
   const cached = chapterCache.get(key);
   let text = cached && cached.expires > Date.now() ? cached.text : '';
-  let servedFrom = cached && cached.expires > Date.now() ? cached.servedFrom : catalog.sourceName;
-  if (!text) {
+  let servedFrom = cached && cached.expires > Date.now() ? cached.servedFrom : (source?.name ?? catalog.sourceName);
+  // 洞 1:当前源身份失效(池中已无同 URL 版本或源被停用)时不再抛 409,直接进换源;
+  // 洞 2:换源成功即把本返回值换成新源的 version/sourceId,前端随之切目录、下一章直接用新源。
+  let switched: Awaited<ReturnType<typeof switchSourceChapter>> | null = null;
+  if (text) {
+    // 暖缓存命中:正文与源状态无关,直接交付(不校验源身份,保持既有缓存语义)。
+  } else if (!source) {
+    context.signal.throwIfAborted();
+    switched = await switchSourceChapter(catalog, chapter, chapterIndex, context, sources);
+    text = switched.text;
+    servedFrom = switched.sourceName;
+  } else {
     try {
       text = await chapterText(context, chapter, source);
     } catch {
+      // 章节正文失败(含源被停用/服务端判定失效):进换源流程。
       context.signal.throwIfAborted();
-      try {
-        // 池快照钉在目录加载时点（N01）：备用源的 url+revision 必能在同一快照反查到 ReadingSource，
-        // 避免读取瞬间源池变更导致备用源没有规则可分派；也省一次源池查询。
-        const alternative = await resolveSourceBook(catalog, context, {
-          excludeBookUrl: catalog.bookUrl, sources,
-        });
-        // Never assume two catalogs have the same ordinal positions.
-        const chapters = alternative.chapters.filter((item) => normalizeSourceTitle(item.title) === normalizeSourceTitle(chapter.title));
-        if (chapters.length !== 1) throw new Error('No unique matching chapter');
-        const alternativeSource = sources.find((item) => item.url === alternative.sourceUrl && sourceRevision(item) === alternative.sourceRevision);
-        if (!alternativeSource) throw new Error('Alternative source not in pool snapshot');
-        text = await chapterText(context, chapters[0], alternativeSource);
-        servedFrom = alternative.sourceName;
-      } catch {
-        context.signal.throwIfAborted();
-        throw new SourceReaderError('本章暂不可读，备用书源也未找到相同章节。可重试或尝试「下载全书」。', 'SOURCE_CHAPTER_UNAVAILABLE', 503);
-      }
+      switched = await switchSourceChapter(catalog, chapter, chapterIndex, context, sources);
+      text = switched.text;
+      servedFrom = switched.sourceName;
     }
-    remember(key, text, servedFrom);
   }
+  remember(key, text, servedFrom);
   return {
-    taskId: null, sourceId: catalog.sourceId, servedFrom, version: catalog.version, chapterIndex,
+    taskId: null, sourceId: switched?.sourceId ?? catalog.sourceId, servedFrom,
+    version: switched?.version ?? catalog.version,
+    // 洞 2:换源成功时带出新源的目录会话版本,前端据此把阅读目录切成新源,
+    // 下一章直接用新源(不再每章从故障原源重试)。未换源时省略,响应体与既有逐字相同。
+    ...(switched ? { sourceSession: switched.version } : {}),
+    chapterIndex,
     partIndex: 0, partCount: 1, title: chapter.title, startByte: 0, endByte: Buffer.byteLength(text, 'utf8'), text,
   };
+}
+
+/**
+ * 章节级换源:在同一池快照里找同书的另一个源,按标题对齐取回本章正文。
+ * 返回备用源目录 + 正文 —— 调用方据此把 version/sourceId/servedFrom 换成新源(洞 2)。
+ * 找不到(无备用源 / 备用源无同章)时抛既有的 SOURCE_CHAPTER_UNAVAILABLE(503)。
+ */
+async function switchSourceChapter(
+  catalog: SourceCatalog, chapter: SourceChapter, chapterIndex: number,
+  context: SourceRequestContext, sources: ReadingSource[],
+): Promise<SourceCatalog & { text: string }> {
+  try {
+    // 池快照钉在目录加载时点(N01):备用源的 url+revision 必能在同一快照反查到 ReadingSource,
+    // 避免读取瞬间源池变更导致备用源没有规则可分派;也省一次源池查询。
+    // 洞 3:preferAfterSourceUrl 把当前源的同站候选降到队尾(不是绝对禁止 —— 全网只剩同站时仍可用)。
+    const alternative = await resolveSourceBook(catalog, context, {
+      excludeBookUrl: catalog.bookUrl, sources, preferAfterSourceUrl: catalog.sourceUrl,
+    });
+    // Never assume two catalogs have the same ordinal positions —— 章节按标题对齐:
+    // 完全无关的章不得匹配,重名章取序号最接近当前章的一条(洞 4)。
+    const alternativeIndex = matchSourceChapter(alternative.chapters, chapter.title, chapterIndex);
+    if (alternativeIndex === null) throw new Error('No matching chapter in the alternative source');
+    const alternativeSource = sources.find((item) => item.url === alternative.sourceUrl && sourceRevision(item) === alternative.sourceRevision);
+    if (!alternativeSource) throw new Error('Alternative source not in pool snapshot');
+    // 洞 2 的持久化半边:把备用源目录**落库**(与 index 路径同一张表/同一写入口),
+    // 这样带回到前端的 sourceSession 才是可续读的会话 —— 下一章直接用它取数,
+    // 不再每章回到故障原源重试。写失败按换源失败处理(fail-closed,仍 503)。
+    await saveSourceCatalog(alternative, context.signal);
+    const text = await chapterText(context, alternative.chapters[alternativeIndex], alternativeSource);
+    return { ...alternative, text };
+  } catch {
+    context.signal.throwIfAborted();
+    throw new SourceReaderError('本章暂不可读,备用书源也未找到相同章节。可重试或尝试「下载全书」。', 'SOURCE_CHAPTER_UNAVAILABLE', 503);
+  }
 }
