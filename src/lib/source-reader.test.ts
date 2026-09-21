@@ -491,8 +491,10 @@ describe('online reader source resolution and budgets', () => {
     });
   });
 
-  it('bounds a miss to 8 requests: title search, author search, 4 inspects, 2 fuzzy pages', async () => {
-    // 改动 3 回归（定量）：miss 路径请求上限 ≤ 1(标题)+1(作者)+4(inspect)+2(模糊补抓) = 8。
+  it('bounds a miss with the same-page fallback inside the previous request ceiling', async () => {
+    // 新增候选收集兜底后重算:标题搜索 1 + 同页兜底切片(MAX_DETAIL_CANDIDATES=4)+ 模糊补抓 ≤2。
+    // 站点吐 23 条详情链接时兜底切片先走,作者搜索仍会触发(它判的是「精确层 0 候选」),
+    // 但两者共用同一切片宽度,请求数不放大 —— 这是防「站点把整站链接都吐出来」的定量红线。
     const target = { title: '改名书', author: '作者A' };
     const titleSearch = 'https://book15.net/books/search.html?kw=' + encodeURIComponent(target.title);
     const authorSearch = 'https://book15.net/books/search.html?kw=' + encodeURIComponent(target.author);
@@ -503,11 +505,51 @@ describe('online reader source resolution and budgets', () => {
     pages.set(titleSearch, { text: links });
     pages.set(authorSearch, { text: links });
     for (let i = 0; i < 23; i++) pages.set(pageUrl(800 + i), { text: unrelatedDetail(800 + i, '无关书' + i, '别人') });
-    await expect(service.resolveSourceBook(target, context())).rejects.toMatchObject({ code: 'SOURCE_NOT_FOUND' });
-    expect(mocks.fetch).toHaveBeenCalledTimes(8);
+    await expect(service.resolveSourceBook(target, context())).rejects.toMatchObject({ code: 'SOURCE_UNAVAILABLE' });
+    expect(mocks.fetch.mock.calls.length).toBeLessThanOrEqual(8);
   });
 
-  it('warns search_no_candidates when the search page yields zero candidates', async () => {
+  it('falls back to same-page detail links when no anchor text matches the title exactly', async () => {
+    // 核心回归:搜索页有详情链接,但锚文本带修饰(【完结】书名)⇒ parseSourceSearch 精确层 0 候选。
+    // 兜底改按详情页形态收候选;身份仍由详情页的 sourceBookMatches(标题/别名 + 作者门)判定。
+    const titleSearch = 'https://book15.net/books/search.html?kw=' + encodeURIComponent(book.title);
+    const decor = (id: number, title: string) => `<a href="/books/details${id}.html" title="${title}">【完结】${title}</a>`;
+    pages.set(titleSearch, {
+      text: decor(41, '测试书') + Array.from({ length: 8 }, (_, i) => `<a href="/books/details${900 + i}.html">无关书${i}</a>`).join(''),
+    });
+    pages.set(pageUrl(41), { text: detail(41) });
+    const catalog = await service.resolveSourceBook(book, context());
+    expect(catalog).toMatchObject({ title: '测试书', author: '作者', bookUrl: pageUrl(41) });
+  });
+
+  it('does not mis-pair a same-title detail page by another author reached through the fallback', async () => {
+    // 误配负控:兜底收到的候选里,同名详情页作者不符 ⇒ 不进 matches,继续找后面的候选。
+    const titleSearch = 'https://book15.net/books/search.html?kw=' + encodeURIComponent(book.title);
+    pages.set(titleSearch, {
+      text: '<a href="/books/details95.html" title="测试书">【完结】测试书</a>'
+        + '<a href="/books/details96.html" title="测试书">测试书(全本)</a>',
+    });
+    pages.set('https://book15.net/books/details95.html', { text: detail(95, '别的作者') });
+    pages.set(pageUrl(96), { text: detail(96) });
+    const catalog = await service.resolveSourceBook(book, context());
+    expect(catalog.bookUrl).toBe(pageUrl(96)); // 作者不符的 95 被作者门挡下,不误配
+  });
+
+  it('never auto-delivers an unrelated detail page reached through the fallback', async () => {
+    // 负控:兜底收到的详情页书名作者都对不上 ⇒ 不自动取书,交回既有判据(404,不放大到 503)。
+    const titleSearch = 'https://book15.net/books/search.html?kw=' + encodeURIComponent(book.title);
+    pages.set(titleSearch, { text: '<a href="/books/details97.html" title="别的书">别的书</a>' });
+    pages.set('https://book15.net/books/details97.html', {
+      text: '<meta property="og:novel:book_name" content="别的书"><meta property="og:novel:author" content="别人">'
+        + '<dd><a href="/chapter/index97-1.html">第一章</a></dd>',
+    });
+    pages.set('https://book15.net/books/search.html?kw=' + encodeURIComponent(book.author), { text: '' });
+    await expect(service.resolveSourceBook(book, context())).rejects.toMatchObject({
+      code: 'SOURCE_NOT_FOUND', status: 404,
+    });
+  });
+
+  it('warns search_no_candidates when no anchor text matches the title exactly', async () => {
     // 只加观测：搜索页抓到（200）但锚点无一匹配 ⇒ 打一条结构化 warn，字段可 JSON.parse。
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     const titleSearch = 'https://book15.net/books/search.html?kw=' + encodeURIComponent(book.title);

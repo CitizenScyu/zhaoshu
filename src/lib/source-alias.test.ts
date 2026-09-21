@@ -44,9 +44,39 @@ describe('source alias parsing', () => {
       .toEqual(['https://book15.net/books/details42.html', 'https://book15.net/books/details43.html']);
   });
 
-  it('still rejects cross-domain detail links from the author search page', () => {
-    expect(() => parseSourceDetailLinks('<a href="https://evil.invalid/books/details42.html">书</a>', 'https://book15.net/'))
-      .toThrow();
+  it('still filters cross-domain detail links from the author search page', () => {
+    // 单点解析失败/跨站只跳过该锚点,不能把整页候选打死(book15 每页 11-13 个 javascript:/跨站链接)。
+    expect(parseSourceDetailLinks(
+      '<a href="https://evil.invalid/books/details42.html">书</a><a href="/books/details7.html">真书</a>',
+      'https://book15.net/',
+    )).toEqual(['https://book15.net/books/details7.html']);
+  });
+
+  it('keeps only detail-shaped links and drops the rest of the page', () => {
+    // book15 的每张页面上都有 javascript: 与 /books/author/、/books/list-t-3.html 一类的非详情链接;
+    // 它们既不进候选,也不再中断解析。
+    const html = '<a href="javascript:addFavorite();">加入收藏</a>'
+      + '<a href="/books/author/蛊真人.html">蛊真人</a>'
+      + '<a href="/books/list-t-3.html">玄幻奇幻</a>'
+      + '<a href="https://m.book15.net/books/details999.html">手机站</a>'
+      + '<a href="/books/details7513.html">蛊真人</a>';
+    expect(parseSourceDetailLinks(html, 'https://book15.net/books/search.html?kw=x'))
+      .toEqual(['https://book15.net/books/details7513.html']);
+  });
+
+  it('ranks anchors whose text matches the expected title ahead of the rest, without dropping the rest', () => {
+    // book15 把同一详情页写三份(图片链接锚文本为空、标题链接、阅读小说链接),标题链接常排在整页中后段;
+    // MAX_DETAIL_CANDIDATES=4 的切片必须先在相关的那些上面走。传 expectedTitle 后命中项排前。
+    const html = Array.from({ length: 6 }, (_, i) => `<a href="/books/details${i}.html" title="无关书${i}">无关书${i}</a>`).join('')
+      + '<a href="/books/details99.html" title="【完结】测试书">【完结】测试书</a>'
+      + '<a href="/books/details98.html" title="测试书">测试书</a>';
+    const ranked = parseSourceDetailLinks(html, 'https://book15.net/books/search.html?kw=x', '测试书');
+    expect(ranked.slice(0, 2)).toEqual([
+      'https://book15.net/books/details98.html', // 精确相等 = 档位 0,排最前
+      'https://book15.net/books/details99.html', // 带成对装饰 = 档位 1(与精确相等同属「最相关」一组)
+    ]);
+    expect(ranked).toHaveLength(8); // 排序不做过滤:对不上的仍按文档序接在后面
+    expect(ranked.slice(2)).toEqual(Array.from({ length: 6 }, (_, i) => `https://book15.net/books/details${i}.html`));
   });
 });
 

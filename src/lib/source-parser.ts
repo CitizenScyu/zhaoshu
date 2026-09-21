@@ -140,6 +140,11 @@ const MIN_EDIT_DISTANCE_TITLE_LENGTH = 4;
 function stripTitleDecorations(value: string): string {
   return value.replace(/[（(][^（()）]*[）)]/gu, '').replace(/[:：].*$/u, '').replace(/[·\s]/gu, '');
 }
+// 书名号/方括号/尖括号里的成对装饰(【完结】书名、[全本]书名);括号内为空(如「书名【1】」)不剥,
+// 那里的内容是书名的一部分。与上面的副标题剥离同属「书名字面之外的修饰」这一层语义。
+function stripTitleWrappers(value: string): string {
+  return value.replace(/[【《〈「(][^】》〉」)]*[】》〉」)]/gu, '');
+}
 
 function editDistance(a: string, b: string): number {
   if (a === b) return 0;
@@ -169,7 +174,7 @@ export function sourceTitleSimilarity(expectedTitle: string, candidate: SourceBo
   for (const actual of candidates) {
     if (!actual) continue;
     if (actual === expected) best = Math.min(best, 0);
-    if (stripTitleDecorations(actual) === stripTitleDecorations(expected)) best = Math.min(best, 1);
+    if (stripTitleWrappers(stripTitleDecorations(actual)) === stripTitleWrappers(stripTitleDecorations(expected))) best = Math.min(best, 1);
     const shorter = actual.length < expected.length ? actual : expected;
     const longer = actual.length < expected.length ? expected : actual;
     if (shorter.length >= MIN_CONTAINMENT_LENGTH && longer.includes(shorter)) best = Math.min(best, 2);
@@ -249,38 +254,51 @@ export function parseSourceSearch(html: string, pageUrl: string, title: string):
   return [...urls];
 }
 
-// 详情页候选收集(标题搜索 0 命中时的同页兜底 + 作者搜索回退):只按链接形态取详情页,不看锚文本相等。
+// 详情页候选收集(标题搜索 0 命中时的同页兜底 + 作者搜索回退):只按链接形态取详情页(同站 + 详情 URL 形态)。
 // 误配防线不在这一层,而在详情页的 sourceBookMatches 身份校验(标题/别名 + 作者门)。
-export const MAX_SOURCE_DETAIL_LINKS = 24;
-// 三道过滤缺一不可:
+//
+// 两道过滤缺一不可:
 // 1) 单个解析不下来的锚点只跳过、不抛。book15 每张页面上都有 11-13 个 `javascript:`
 //    与跨站(百度 / 自家 m.* 手机站)链接;基线实现会在第一个这样的锚点上抛
 //    SourcePolicyError,把整条候选收集打死 —— 这正是「搜索页有结果却 0 候选」的机制之一。
-// 2) 锚文本/title/alt 里出现过期望书名的链接排在前。站点把「图片链接 + 标题链接 + 阅读小说链接」
-//    三份重复指向同一详情页,标题链接常排在整页中后段;这个顺序保证上游 inspect 的
-//    MAX_DETAIL_CANDIDATES 切片够得到真正相关的那些。比较用 sourceTitleSimilarity(与上游
-//    模糊层同源判据)而不是子串测试:短书名做子串测试会把无关的近邻误判进来。
-// 3) 其余同站详情页按文档序接在后(站点改版 / 锚文本带修饰时的最后一道兜底)。
+// 2) 同站(同 origin 或同站备用 host)才算数。
+// 排序:锚文本/title/alt 能对上期望书名的排在前(按相似档位升序,同档保持文档序)—— 站点把
+// 「图片链接 + 标题链接 + 阅读小说链接」三份重复指向同一详情页,标题链接常排在整页中后段;
+// 这个顺序保证上游 inspect 的 MAX_DETAIL_CANDIDATES 切片够得到真正相关的那些。
+// 排序只是顺序,不是过滤器:站点改版 / 锚文本带修饰时对不上的那些按文档序接在后面,
+// 仍走同一套详情页身份校验(常见的「带修饰」形态落档位 1,与精确相等同属最相关一档)。
 // 上限 MAX_SOURCE_DETAIL_LINKS:站点在大页面上吐出几十条链接时不得把预算摊薄。
+export const MAX_SOURCE_DETAIL_LINKS = 24;
 
 export function parseSourceDetailLinks(html: string, pageUrl: string, expectedTitle?: string): string[] {
   const expected = expectedTitle ? normalizeSourceTitle(expectedTitle) : '';
-  const titleMatches: string[] = [];
-  const others: string[] = [];
+  const ranked: { href: string; rank: number; order: number }[] = [];
   const seen = new Set<string>();
   for (const match of html.matchAll(/<a\b([^>]*)>([\s\S]*?)<\/a>/gi)) {
     const tag = attributes(match[1]);
     const href = tag.href;
     if (!href) continue;
-    const url = validateSourceUrl(href, pageUrl);
+    // 单个锚点解析不下来 ≠ 整页没有候选:javascript: 与跨站链接(book15 每页 11-13 个)只跳过。
+    let url: URL;
+    try { url = validateSourceUrl(href, pageUrl); } catch { continue; }
     if (!DETAIL_PATH.test(url.pathname) || !sameSite(url, pageUrl) || seen.has(url.href)) continue;
     seen.add(url.href);
-    // 锚文本里的书名可能只写在 title/alt 属性里(图片链接的锚文本为空),三者都喂给判据。
-    const anchor = `${plainText(match[2])} ${tag.title ?? ''} ${tag.alt ?? ''}`.trim();
-    if (expected && sourceTitleSimilarity(expected, { title: anchor, author: '' }) === 0) titleMatches.push(url.href);
-    else others.push(url.href);
+    // 书名的出处有三处:锚文本、title 属性、图片 alt(图片链接的锚文本为空)。三者**分别**判,
+    // 取最相关的一档 —— 拼成一个串再比会把「锚文本与 title 都是书名」变成「测试书测试书」而全丢。
+    // 判据出处:模糊降级层(L3)的 sourceTitleSimilarity —— 精确相等/别名 = 0,去副标题与书名号 = 1。
+    // 这两档才算「标题直接对上」;包含/编辑距离档(2/3)不足以说明「这一页就是这本书」,不提前。
+    const anchors = [plainText(match[2]), tag.title ?? '', tag.alt ?? ''].filter(Boolean);
+    let rank = 2;
+    for (const anchor of anchors) {
+      if (!expected) { rank = 0; break; }
+      rank = Math.min(rank, sourceTitleSimilarity(expected, { title: anchor, author: '' }));
+      if (rank === 0) break;
+    }
+    ranked.push({ href: url.href, rank: Math.min(rank, 2), order: ranked.length });
   }
-  return [...titleMatches, ...others].slice(0, MAX_SOURCE_DETAIL_LINKS);
+  return ranked.sort((a, b) => a.rank - b.rank || a.order - b.order)
+    .slice(0, MAX_SOURCE_DETAIL_LINKS)
+    .map((entry) => entry.href);
 }
 
 export function parseSourceChapters(html: string, pageUrl: string): SourceChapter[] {

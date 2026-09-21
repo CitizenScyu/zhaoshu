@@ -475,14 +475,14 @@ export async function resolveSourceBook(
           collectSimilar(search);
         }
       } else {
-        const fallback = parseSourceDetailLinks(search.text, search.url, book.title);
-        stat.candidates = fallback.length;
+        const exact = parseSourceSearch(search.text, search.url, book.title);
         // 搜索页抓取成功(无异常)却一个可核验候选都没有 —— 区分「空页 / 反爬页 / 解析错」。
-        // 候选收集两级:parseSourceSearch 仍按锚文本精确相等取;收 0 个时用 parseSourceDetailLinks
-        // 按详情页形态兜底 —— book15 把「图片链接 + 标题链接 + 阅读小说链接」三份重复指向同一详情页,
-        // 锚文本带修饰(【完结】书名 / 空白标点差异)时精确层会全丢。兜底只放宽「候选收集」,
-        // 身份判定仍是详情页层的 sourceBookMatches(标题/别名 + 作者门),误配防线原地不动。
-        if (!fallback.length) {
+        // 候选收集两级:parseSourceSearch 仍按锚文本精确相等取(收 0 个时打下面这条观测);
+        // 再从同一页按详情页形态兜一轮 —— book15 把「图片链接 + 标题链接 + 阅读小说链接」三份
+        // 重复指向同一详情页,锚文本带修饰(【完结】书名 / 空白标点差异)时精确层会全丢。
+        // 兜底只放宽「候选收集」:身份判定仍是详情页层的 sourceBookMatches(标题/别名 + 作者门),
+        // 误配防线原地不动。两轮都走 inspect 的同一个 MAX_DETAIL_CANDIDATES 切片,不增请求上限。
+        if (!exact.length) {
           console.warn('[read-source] search_no_candidates', JSON.stringify({
             event: 'search_no_candidates',
             sourceHost: stat.host,
@@ -492,14 +492,16 @@ export async function resolveSourceBook(
             title: book.title,
             hadChallengeHint: hasChallengeHint(search.text),
           }));
+          candidates = parseSourceDetailLinks(search.text, search.url, book.title);
+        } else {
+          candidates = exact;
         }
-        // 有精确候选时行为逐点不变:不引入新的详情页请求,也不改变既有候选顺序。
-        candidates = fallback;
+        stat.candidates = candidates.length;
       }
       const result = await inspect(candidates, true);
       if (result) return result;
       // 作者搜索回退:标题搜索仍 0 候选(精确层与同页兜底都空)、有作者可搜且作者不是书名本身时
-      // 只有新名），改搜作者。候选不看锚文本，身份靠详情页的标题/别名 + 作者门校验。
+      // (改名书的站点索引只有新名),改搜作者。候选不看锚文本,身份靠详情页的标题/别名 + 作者门校验。
       if (!candidates.length && knownSourceAuthor(book.author) && knownSourceAuthor(book.author) !== normalizeSourceTitle(book.title)) {
         const authorSearch = await sourceContext.page(sourceSearchUrl(source.searchUrl, book.author, source.url));
         const authorCandidates = /^\/books\/details\d+\.html$/.test(new URL(authorSearch.url).pathname)
