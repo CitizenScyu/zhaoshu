@@ -222,7 +222,8 @@ export function migrateProgressAcrossSources(
   const newTotal = newIndex.chapters.length;
   const ratio = Math.max(0, Math.min(1, old.ratio));
   const estimate = estimateIndex(old.chapterIndex, oldTotal, newTotal);
-  const anchor = old.chapterTitle ?? oldIndex.chapters[old.chapterIndex]?.title;
+  // 空标题不是有效锚点(parseReadingProgress 同样把空 chapterTitle 判为无键)⇒ 退回旧目录索引标题。
+  const anchor = old.chapterTitle || oldIndex.chapters[old.chapterIndex]?.title;
   if (anchor) {
     const hits = matchingIndexes(newIndex, anchor);
     if (hits.length === 1) return { position: { chapterIndex: hits[0], partIndex: 0, ratio }, confidence: 'exact' };

@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { catalogPrefixKey, DEFAULT_READER_SETTINGS, parseReaderSettings, parseReadingProgress, readingPercent, readingProgressKey } from './reader-preferences';
+import { catalogPrefixKey, DEFAULT_READER_SETTINGS, migrateProgressAcrossSources, normalizeChapterTitle, parseReaderSettings, parseReadingProgress, readingPercent, readingProgressKey } from './reader-preferences';
+import { normalizeSourceTitle } from './source-parser';
 import type { ReaderIndex, ReaderPart } from './reader-types';
 
 const index: ReaderIndex = {
@@ -199,6 +200,83 @@ describe('online catalog growth keeps a verifiable resume position', () => {
     const after = onlineIndex('rev-2', ['第1章', '第2章', '第3章', '第4章']);
     after.chapters[1] = { ...after.chapters[1], partCount: 1 }; // 新目录里同一章只剩 1 段
     expect(parseReadingProgress(JSON.stringify(saved), after)).toBeNull();
+  });
+});
+
+// M3 手动换源:跨源进度迁移(设计 §5)+ 归一化一致性钉死。
+describe('M3 跨源进度迁移', () => {
+  const pos = (chapterIndex: number, ratio = 0.6) => ({ schema: 1 as const, version: 'rev-1', chapterIndex, partIndex: 0, ratio, chapterTitle: '', updatedAt: 1 });
+  const oldIndex = (titles: string[]): ReaderIndex => onlineIndex('rev-old', titles);
+  const newIndex = (titles: string[]): ReaderIndex => onlineIndex('rev-new', titles);
+
+  it('唯一标题匹配 ⇒ exact,取该索引', () => {
+    const old = oldIndex(['第1章', '第2章', '第3章']);
+    const next = newIndex(['第一话', '第2章', '第3章', '番外']);
+    const result = migrateProgressAcrossSources(
+      { ...pos(1), chapterTitle: '第2章' }, old, next,
+    );
+    expect(result).toMatchObject({ confidence: 'exact', position: { chapterIndex: 1, partIndex: 0, ratio: 0.6 } });
+  });
+
+  it('归一化优先使用 chapterTitle(旧目录索引标题仅作兜底)', () => {
+    const old = oldIndex(['第1章', '第2章']);
+    const next = newIndex(['文首', '第2章', '文末']);
+    // chapterTitle 缺失 ⇒ 用旧目录索引位置标题。
+    expect(migrateProgressAcrossSources(pos(1), old, next)).toMatchObject({ confidence: 'exact', position: { chapterIndex: 1 } });
+  });
+
+  it('重复章名 ⇒ 按序号邻近度破平,confidence 降为 estimated', () => {
+    const old = oldIndex(['第1章', '番外', '第3章', '第4章', '番外']);
+    const next = newIndex(['第1章', '第3章', '番外', '第4章', '番外', '末章']);
+    // 旧目录读到索引 4 的「番外」(第 5/5 章),比例估计 → round(4/4×5)=5,新目录「番外」在索引 2 与 4,取更近的 4。
+    const result = migrateProgressAcrossSources(
+      { ...pos(4), chapterTitle: '番外' }, old, next,
+    );
+    expect(result).toMatchObject({ confidence: 'estimated', position: { chapterIndex: 4 } });
+  });
+
+  it('当前章在新目录不存在 ⇒ 邻章锚定(前邻唯一匹配,推算目标 = 新索引 + 1),estimated', () => {
+    const old = oldIndex(['第1章', '第2章', '第3章']);
+    const next = newIndex(['第1章', '第2章', '尾声']);
+    // 旧索引 2「第3章」新目录没有;前邻「第2章」唯一匹配于索引 1 ⇒ 目标 = 1+1 = 2。
+    const result = migrateProgressAcrossSources(
+      { ...pos(2), chapterTitle: '第3章' }, old, next,
+    );
+    expect(result).toMatchObject({ confidence: 'estimated', position: { chapterIndex: 2 } });
+  });
+
+  it('标题与邻章都无法锚定 ⇒ 比例回退(estimated)', () => {
+    const old = oldIndex(['第1章', '第2章', '第3章', '第4章', '第5章']);
+    const next = newIndex(['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J']);
+    // 旧索引 4 / 4 → round(4/4×9)=9。
+    const result = migrateProgressAcrossSources(
+      { ...pos(4), chapterTitle: '第5章' }, old, next,
+    );
+    expect(result).toMatchObject({ confidence: 'estimated', position: { chapterIndex: 9 } });
+  });
+
+  it('新目录为空 ⇒ null', () => {
+    const old = oldIndex(['第1章', '第2章']);
+    expect(migrateProgressAcrossSources({ ...pos(1), chapterTitle: '第2章' }, old, newIndex([]))).toBeNull();
+  });
+
+  it('产出丢弃字符锚点、ratio 保留并 clamp、partIndex 恒 0', () => {
+    const old = oldIndex(['第1章', '第2章']);
+    const next = newIndex(['第1章', '第2章']);
+    const result = migrateProgressAcrossSources(
+      { ...pos(1, 1.7), chapterTitle: '第2章', textOffset: 40, viewportOffset: 3 } as never, old, next,
+    );
+    expect(result?.position).toEqual({ chapterIndex: 1, partIndex: 0, ratio: 1 });
+    expect(result?.position).not.toHaveProperty('textOffset');
+  });
+});
+
+describe('M3 normalizeChapterTitle 与 source-parser.normalizeSourceTitle 逐字一致', () => {
+  // 一致性钉死:两处实现必须逐字同语义,防语义漂移(设计 §5 风险 5)。
+  it.each([
+    '《测试书》', '  第 1 章  ', 'ＡＢＣ', '第1章', 'fF', '未知书名１２３', '书名\t空 白',
+  ])('同一输入给出同一结果: %s', (value) => {
+    expect(normalizeChapterTitle(value)).toBe(normalizeSourceTitle(value));
   });
 });
 
