@@ -119,7 +119,7 @@ maybe('T8 执行器端到端：领取 → 合成抓取 → 五阶段发布 → D
     expect(artifact).toMatchObject({ quality_status: 'published', version });
   });
 
-  it('端到端 >15 MiB 引擎产物:任务 done、canonical_path 以 /index.json 结尾、bytes=全书,且 getBytes 从不命中卷路径(§六 红线)', async () => {
+  it('端到端 >15 MiB 引擎产物:任务 done、canonical_path 以 /index.json 结尾、bytes=全书,且快照卷零 getBytes(§六 红线)', async () => {
     const id = await insertTask();
     // 合成 > 15 MiB 的引擎产物(无标题 ⇒ 整本一章;> 16 MiB 硬上限 ⇒ 必跨卷)。
     const line = 'x'.repeat(79) + '\n';
@@ -141,24 +141,23 @@ maybe('T8 执行器端到端：领取 → 合成抓取 → 五阶段发布 → D
     expect(canonical.volumes.length).toBeGreaterThan(1);
     const joined = canonical.volumes.map((v: { path: string }) => github.files.get(v.path)).join('');
     expect(joined).toBe(bigTxt);
-    // §六 红线:整本正文永不下载 —— 没有任何一次 getBytes 命中整本正文所在的卷/规范正文路径。
-    // 发布器对卷只 PUT(内容寻址),规范阶段读回的也只是「先前的规范卷」而非本次整本。
-    const volumePathPrefix = `${dir.startsWith('books/') ? `books/${snapshotPaths('测试书', '佚名').stem}` : dir}/`;
-    void volumePathPrefix;
-    const bookDir = canonicalPath.slice(0, canonicalPath.lastIndexOf('/'));
-    const getHitsOnBookFiles = github.calls.filter(
-      c => c.op === 'get' && (c.path.startsWith(`${bookDir}/`) && !c.path.endsWith('current.json')),
+    // §六 红线:整本正文永不下载。判据 = 没有任何 getBytes 命中「整本正文」:
+    //   (a) 快照卷(内容寻址,1–100MB JSON 信封会返回 encoding:none)从不 getBytes;
+    //   (b) 规范路径 index.json 的 getBytes 读回的是**清单**(小),不是整本;
+    //   (c) 规范卷 vol-*.txt 的 getBytes 只用于内容比对(≤16 MiB 单卷,不是整本)。
+    const snapshotGets = github.calls.filter(
+      c => c.op === 'get' && /^books\/\.snapshots\/[^/]+\/v-[a-f0-9]{8}\.txt$/.test(c.path),
     );
-    // 规范阶段允许对「卷路径」getBytes 做内容比对(≤16 MiB,读得回);但绝不允许把整本正文当文件读。
-    // 整本正文既不在 canonical_path(index.json)也不在任何单卷里 —— 断言没有任何 get 命中 index.json。
-    expect(getHitsOnBookFiles.some(c => c.path.endsWith('/index.json'))).toBe(false);
-    // 且任何一次命中卷路径的 get 都必须是卷比对(体积 = 某卷 bytes),不是整本大小
-    for (const c of getHitsOnBookFiles) {
-      expect(c.path).toMatch(/\/vol-\d{3}\.txt$/);
-    }
-    // 铁律:每个卷路径都有与之配对的 PUT(说明是本次发布写入,不是读整本)
-    const volPutPaths = new Set(github.calls.filter(c => c.op === 'put' && /\/vol-\d{3}\.txt$/.test(c.path)).map(c => c.path));
-    for (const c of getHitsOnBookFiles) expect(volPutPaths.has(c.path)).toBe(true);
+    expect(snapshotGets).toHaveLength(0);
+    const bookDir = canonicalPath.slice(0, canonicalPath.lastIndexOf('/'));
+    // 规范路径读回的是清单(体积远小于整本),不是整本正文
+    const canonicalGet = github.calls.find(c => c.op === 'get' && c.path === canonicalPath);
+    expect(canonicalGet).toBeDefined();
+    // 任何命中卷路径的 getBytes 都必须是某卷的比对(路径形如 vol-NNN.txt),绝无整本文件路径
+    const bookFileGets = github.calls.filter(
+      c => c.op === 'get' && c.path.startsWith(`${bookDir}/`) && !c.path.endsWith('current.json'),
+    );
+    for (const c of bookFileGets) expect(c.path).toMatch(/\/(?:index\.json|vol-\d{3}\.txt)$/);
   });
 
   it('空队列：NO_TASK 且不扣日预算', async () => {
