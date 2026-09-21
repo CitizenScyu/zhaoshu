@@ -164,6 +164,20 @@
 .settingSample { margin-top: 34px; padding: 24px 16px; border-top: 1px solid var(--reader-line); border-bottom: 1px solid var(--reader-line); text-align: center; font-family: var(--reader-font); }
 .settings > .locate { display: block; margin: 20px auto; }
 .settingsNote { font-size: 12px; line-height: 1.9; color: var(--reader-muted); }
+/* M3 换源面板:源列表 + 当前源徽标 + miss/unreachable 灰显。 */
+.sources { padding: 22px 24px 30px; overflow: auto; overscroll-behavior: contain; }
+.sourcesIntro { font-size: 13px; line-height: 1.9; color: var(--reader-muted); margin-bottom: 12px; }
+.sourceActions { display: flex; justify-content: flex-end; margin-bottom: 8px; }
+.sourcesError { color: var(--reader-accent); font-size: 13px; line-height: 1.8; margin: 8px 0; }
+.sourcesNote { margin-top: 14px; font-size: 12px; line-height: 1.8; color: var(--reader-muted); }
+.sourceList { display: flex; flex-direction: column; gap: 8px; list-style: none; }
+.sourceItem { display: flex; flex-direction: column; align-items: flex-start; gap: 4px; width: 100%; min-height: 52px; padding: 12px 14px; text-align: left; border: 1px solid var(--reader-line); border-radius: 4px; color: inherit; font: inherit; font-size: 14px; cursor: pointer; }
+.sourceItem > span:last-child { color: var(--reader-muted); font-size: 12px; }
+.sourceItem:hover:not(:disabled), .sourceItem:focus-visible { border-color: var(--reader-accent); }
+.sourceItem[data-status='miss'], .sourceItem[data-status='unreachable'] { opacity: .55; cursor: default; }
+.sourceItem[aria-current='true'] { border-color: var(--reader-accent); background: var(--reader-selected); color: var(--reader-accent); cursor: default; }
+.sourceName { font-weight: 600; }
+.sourceBadge { color: var(--reader-accent); font-size: 11px; border: 1px solid var(--reader-accent); border-radius: 2px; padding: 0 4px; }
 @keyframes open-panel { from { opacity: .3; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
 @media (max-width: 640px) {
   .header { min-height: 62px; gap: 8px; padding: calc(6px + env(safe-area-inset-top)) max(12px, env(safe-area-inset-right)) 6px max(12px, env(safe-area-inset-left)); }
