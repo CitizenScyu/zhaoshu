@@ -197,6 +197,65 @@ describe('reader server: v2 分卷(§七)', () => {
     await expect(server.readerAvailability(fx.task)).resolves.toEqual({ available: false });
   });
 
+  it('清单 Σvolumes.bytes 与全书 bytes 不符 → 502(绝不猜)', async () => {
+    const fx = fixture();
+    // 篡改清单:把声明 bytes 改大,卷偏移不再首尾相接/求和不等 ⇒ parseVolumeManifest 返回 null
+    const bad = { ...fx.manifest, bytes: fx.manifest.bytes + 1 };
+    const resources = volumeResources(fx);
+    resources.set('index.json', () => new Response(stringifyVolumeManifest(bad)));
+    fetchMock.mockImplementation(resourceServer(resources, () => {}));
+    await expect(server.readBookIndex(fx.task)).rejects.toMatchObject({ status: 502 });
+  });
+
+  it('清单某卷 bytes > 16 MiB 硬上限 → 502(防被篡改清单拉超大「卷」)', async () => {
+    const fx = fixture();
+    const bad = {
+      ...fx.manifest,
+      volumes: [
+        { ...fx.manifest.volumes[0], bytes: MAX_READER_BYTES + 1, last_byte: MAX_READER_BYTES + 1 },
+        { ...fx.manifest.volumes[1], first_byte: MAX_READER_BYTES + 1, last_byte: MAX_READER_BYTES + 1 + fx.v2Bytes.byteLength },
+      ],
+      bytes: MAX_READER_BYTES + 1 + fx.v2Bytes.byteLength,
+      chapter_index: [
+        { i: 0, t: '【第1章 合成】', v: 0, s: 0, e: fx.v1Bytes.byteLength, p: 1 },
+        { i: 1, t: '【第2章 合成】', v: 1, s: MAX_READER_BYTES + 1, e: MAX_READER_BYTES + 1 + fx.v2Bytes.byteLength, p: 1 },
+      ],
+    };
+    const resources = volumeResources(fx);
+    resources.set('index.json', () => new Response(stringifyVolumeManifest(bad)));
+    fetchMock.mockImplementation(resourceServer(resources, () => {}));
+    await expect(server.readBookIndex(fx.task)).rejects.toMatchObject({ status: 502 });
+  });
+
+  it('chapter_index 章终点越界(e > bytes)→ 502;章起点不在其卷区间 → 502', async () => {
+    const fx = fixture();
+    // e 越界
+    const outOfRange = {
+      ...fx.manifest,
+      chapter_index: [
+        fx.manifest.chapter_index[0],
+        { ...fx.manifest.chapter_index[1], e: fx.manifest.bytes + 100 },
+      ],
+    };
+    const r1 = volumeResources(fx);
+    r1.set('index.json', () => new Response(stringifyVolumeManifest(outOfRange)));
+    fetchMock.mockImplementation(resourceServer(r1, () => {}));
+    await expect(server.readBookIndex(fx.task)).rejects.toMatchObject({ status: 502 });
+
+    // 章起点 s 落在第 0 卷区间之外(谎报 v=0,但 s 在第 1 卷)
+    const wrongVolume = {
+      ...fx.manifest,
+      chapter_index: [
+        fx.manifest.chapter_index[0],
+        { ...fx.manifest.chapter_index[1], v: 0 },
+      ],
+    };
+    const r2 = volumeResources(fx);
+    r2.set('index.json', () => new Response(stringifyVolumeManifest(wrongVolume)));
+    fetchMock.mockImplementation(resourceServer(r2, () => {}));
+    await expect(server.readBookIndex(fx.task)).rejects.toMatchObject({ status: 502 });
+  });
+
   it('卷缓存:同章重复读只拉一次卷;清单 5 分钟内复用', async () => {
     const fx = fixture();
     const hits: string[] = [];
