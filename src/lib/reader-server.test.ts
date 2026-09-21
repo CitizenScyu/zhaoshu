@@ -122,7 +122,7 @@ function volumeFixture(options: {
 }
 
 /** locateTaskArtifact 的 SQL 返回一条 v2 artifact 行(canonical_path 指向清单)。 */
-function useVolumeArtifact(book: VolumeFixture) {
+function applyVolumeArtifact(book: VolumeFixture) {
   sql.mockResolvedValue([{
     owner: OWNER, repo: REPO, branch: BRANCH,
     canonical_path: book.paths.canonicalPath,
@@ -146,7 +146,7 @@ function volumeResponder(book: VolumeFixture): (input: RequestInfo | URL) => Pro
 
 /** 把分卷夹具接到 SQL 与 fetch 上(artifact 定位走 sql,清单/卷走 raw fetch)。 */
 function mockVolumeArtifact(book: VolumeFixture) {
-  useVolumeArtifact(book);
+  applyVolumeArtifact(book);
   fetchMock.mockImplementation(volumeResponder(book) as never);
 }
 
@@ -355,7 +355,7 @@ describe('reader server file resolution and bounded cache', () => {
     // 同一清单的两次 readBookIndex 必须共享同一个在途 raw 拉取,绝不重复拉清单。
     const book = volumeFixture({ id: 1, maxVolumeBytes: 1024 * 1024, chapters: [{ title: '第一章 合流', text: '并发合流正文。' }] });
     let releaseManifest!: (response: Response) => void;
-    useVolumeArtifact(book);
+    applyVolumeArtifact(book);
     fetchMock.mockImplementationOnce(() => new Promise((resolve) => { releaseManifest = resolve; }));
     const first = server.readBookIndex(book.task);
     const second = server.readBookIndex(book.task);
@@ -392,7 +392,7 @@ describe('reader server file resolution and bounded cache', () => {
     // v2 语义:目录门限不再来自 parseTxtChapters 的章数上限,而是清单派生索引的字节门。
     // 两次并发读同一本书必须**共享同一次清单拉取**,并拿到同一个 422(不得一个成功一个失败)。
     const book = escapedTitleBook();
-    useVolumeArtifact(book);
+    applyVolumeArtifact(book);
     fetchMock.mockImplementation(volumeResponder(book) as never);
     const results = await Promise.allSettled([server.readBookIndex(book.task), server.readBookIndex(book.task)]);
     for (const result of results) {
@@ -417,14 +417,14 @@ describe('reader server file resolution and bounded cache', () => {
     expect(indexJsonBytes(escaped)).toBeGreaterThan(4 * 1024 * 1024);
     expect(indexJsonBytes(plain)).toBeLessThan(4 * 1024 * 1024);
 
-    useVolumeArtifact(escaped);
+    applyVolumeArtifact(escaped);
     fetchMock.mockImplementation(volumeResponder(escaped) as never);
     const failure = await server.readBookIndex(escaped.task).then(() => null, (error: unknown) => error);
     expect(failure).toMatchObject({
       status: 422, message: '章节目录过大,暂时无法在线阅读这本书。',
     });
 
-    useVolumeArtifact(plain);
+    applyVolumeArtifact(plain);
     fetchMock.mockImplementation(volumeResponder(plain) as never);
     const plainIndex = await server.readBookIndex(plain.task);
     expect(plainIndex.chapters).toHaveLength(OVERSIZED_CHAPTERS);
