@@ -375,6 +375,10 @@ export async function resolveSourceBook(
   };
   // 只读观测账本：逐源记录「搜没搜、命中几候选、多少字节」，供整轮 404 汇总（不改控制流）。
   const searchStats: SourceSearchStat[] = [];
+  // 「精确层 0 候选」观测：抓到搜索页却锚文本无一精确命中。**推迟到整轮无果时才发**——
+  // 曾经在精确层一收 0 就无条件发，随后同页兜底 / 作者搜索成功交付时这条告警已经在成功路径上
+  // 打过了，监控按「无候选」告警会误报（41 任审查 P2-①）。payload 在收集时就序列化好，顺序即源序。
+  const pendingNoCandidateWarnings: string[] = [];
   let index = 0;
   for (const source of sources) {
     const isFirst = index === 0;
@@ -493,7 +497,8 @@ export async function resolveSourceBook(
         // 兜底**不**改变作者搜索回退的判据(见上面 exactLayerEmpty):兜底捡到的无关详情链接
         // 只表示「同页有别的书」,不代表「这本书不在本站」。
         if (!exact.length) {
-          console.warn('[read-source] search_no_candidates', JSON.stringify({
+          // 只**登记**，不发：见上方 pendingNoCandidateWarnings 的语义说明（成功交付路径不得误报）。
+          pendingNoCandidateWarnings.push(JSON.stringify({
             event: 'search_no_candidates',
             sourceHost: stat.host,
             searchUrl: stripHash(search.url),
@@ -509,13 +514,26 @@ export async function resolveSourceBook(
         stat.candidates = exact.length;
         stat.fallbackCandidates = fallback.length;
       }
-      const result = await inspect(candidates, true);
+      // 无重叠最坏构成（41 任审查 P2-②）：标题搜索 1 + 同页兜底 4 + 作者搜索 1 + 作者层 inspect 4
+      // + 模糊补抓 2 = 12，恰好顶到全局上限、没有任何余量。一旦库 hints（最多 4 次）或任意 5xx
+      // 触发 MAX_SOURCE_ATTEMPTS=2 重试把计数抬高，作者层 inspect 会在途中被 L2 掐断 ⇒ hadFailure
+      // ⇒ 用户见 503，而真书明明还在作者页后段（41 任 PROBE_B 实测复现：details903 从未被抓）。
+      // 修正：作者回退**即将运行**时，标题页兜底这轮 speculative inspect 不得吃掉作者层所需的预算，
+      // 预留「作者搜索 1 + 作者层 inspect MAX_DETAIL_CANDIDATES」。精确层命中（exactLayerEmpty=false）
+      // 或无需作者回退时不设此限，既有请求构成逐点不变（零回归）。
+      const authorFallbackPending = (exactLayerEmpty || !candidates.length)
+        && knownSourceAuthor(book.author) && knownSourceAuthor(book.author) !== normalizeSourceTitle(book.title);
+      const reserveForAuthor = 1 + MAX_DETAIL_CANDIDATES;
+      const fallbackWidth = authorFallbackPending
+        ? Math.max(0, Math.min(MAX_DETAIL_CANDIDATES, context.totalLimit - context.requests - reserveForAuthor))
+        : MAX_DETAIL_CANDIDATES;
+      const result = await inspect(candidates.slice(0, fallbackWidth), true);
       if (result) return result;
       // 作者搜索回退:标题搜索页的**精确层** 0 候选(搜索页可能仍吐一堆无关详情链接)、有作者可搜
       // 且作者不是书名本身时(改名书的站点索引只有新名),改搜作者。候选不看锚文本,
       // 身份靠详情页的标题/别名 + 作者门校验。
       // `!candidates.length` 保留给「搜索 URL 本身就是详情页」那一支的既有语义。
-      if ((exactLayerEmpty || !candidates.length) && knownSourceAuthor(book.author) && knownSourceAuthor(book.author) !== normalizeSourceTitle(book.title)) {
+      if (authorFallbackPending) {
         const authorSearch = await sourceContext.page(sourceSearchUrl(source.searchUrl, book.author, source.url));
         const authorCandidates = /^\/books\/details\d+\.html$/.test(new URL(authorSearch.url).pathname)
           ? [authorSearch.url]
@@ -594,6 +612,11 @@ export async function resolveSourceBook(
       sourcesTried: searchStats.length,
       perSource: searchStats,
     }));
+  }
+  // 整轮无果（既没交付目录、也没走 SOURCE_SIMILAR/SOURCE_AMBIGUOUS）才发「精确层 0 候选」观测：
+  // 兜底 / 作者回退成功交付的路径在上面已 return，永不到这里 ⇒ 成功路径不再误报（P2-①）。
+  for (const payload of pendingNoCandidateWarnings) {
+    console.warn('[read-source] search_no_candidates', payload);
   }
   throw new SourceReaderError(
     hadFailure ? '书源暂时无法提供这本书，请稍后重试，也可返回书库尝试「下载全书」。' : '没有找到书名和作者相符的可读书源，可返回书库尝试「下载全书」。',

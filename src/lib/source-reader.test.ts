@@ -697,6 +697,88 @@ describe('online reader source resolution and budgets', () => {
     // 汇总与逐源信号是两条独立事件，且都出现。
     expect(warn.mock.calls.some(([tag]) => tag === '[read-source] search_no_candidates')).toBe(true);
   });
+
+  // ---- P2-① / P2-② 回归门禁（fix/search-p2-41）----
+
+  it('P2-①: does not warn search_no_candidates when a fallback delivers the book', async () => {
+    // 精确层 0 候选是常态（锚文本带修饰 / 改名书）；只要兜底或作者回退最终成功交付，就不得出现
+    // 「无候选」告警 —— 否则监控按该事件告警会在成功路径上误报（41 任审查 P2-①）。
+    // 旧实现精确层一收 0 无条件发 ⇒ 本用例在两条成功路径上各抓到 1 条，变红。
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const noCandidates = () => warn.mock.calls.filter(([tag]) => tag === '[read-source] search_no_candidates');
+    // (a) 同页兜底成功交付：锚文本带修饰 ⇒ 精确层 0，兜底按详情页形态捡到真书。
+    const titleSearch = 'https://book15.net/books/search.html?kw=' + encodeURIComponent(book.title);
+    pages.set(titleSearch, {
+      text: '<a href="/books/details41.html" title="测试书">【完结】测试书</a>'
+        + Array.from({ length: 8 }, (_, i) => `<a href="/books/details${900 + i}.html">无关书${i}</a>`).join(''),
+    });
+    pages.set(pageUrl(41), { text: detail(41) });
+    await expect(service.resolveSourceBook(book, context())).resolves.toMatchObject({ bookUrl: pageUrl(41) });
+    expect(noCandidates()).toHaveLength(0);
+    // (b) 作者搜索回退成功交付：站点索引只有新名，靠作者搜索 + 自报别名找到。
+    const target = { title: '旧名', author: '作者甲' };
+    pages.set('https://book15.net/books/search.html?kw=' + encodeURIComponent(target.title), {
+      text: '<a href="/books/details61.html">无关书</a>',
+    });
+    pages.set(pageUrl(61), {
+      text: '<meta property="og:novel:book_name" content="无关书"><meta property="og:novel:author" content="别人">'
+        + '<dd><a href="/chapter/index61-1.html">第一章</a></dd>',
+    });
+    pages.set('https://book15.net/books/search.html?kw=' + encodeURIComponent(target.author), {
+      text: '<a href="/books/details62.html">新名</a>',
+    });
+    pages.set(pageUrl(62), {
+      text: '<meta property="og:novel:book_name" content="新名"><meta property="og:novel:author" content="作者甲">'
+        + '<div>小说简介:【原书名：旧名】改名前的版本。</div>'
+        + '<dd><a href="/chapter/index62-1.html">第一章</a></dd>',
+    });
+    await expect(service.resolveSourceBook(target, context())).resolves.toMatchObject({ title: '新名' });
+    expect(noCandidates()).toHaveLength(0);
+  });
+
+  it('P2-②: no-overlap worst-case composition stays at the request ceiling', async () => {
+    // 标题页与作者页**无重叠**候选（checked 去重为 0）时的最坏构成：
+    //   标题搜索 1 + 同页兜底 inspect 4 + 作者搜索 1 + 作者层 inspect 4 + 模糊补抓 2 = 12 = MAX_SOURCE_REQUESTS。
+    // 钉住 12：恰好顶到全局上限、零余量，是下面那条门禁要修的压力来源；缩小/放大都要显式说明。
+    const target = { title: '改名书', author: '作者A' };
+    const link = (id: number, text: string) => `<a href="/books/details${id}.html">${text}</a>`;
+    const unrel = (id: number) =>
+      `<meta property="og:novel:book_name" content="无关书${id}"><meta property="og:novel:author" content="别人">`
+      + `<dd><a href="/chapter/index${id}-1.html">第一章</a></dd>`;
+    pages.set('https://book15.net/books/search.html?kw=' + encodeURIComponent(target.title),
+      { text: [801, 802, 803, 804].map((id) => link(id, '无关书' + id)).join('') });
+    pages.set('https://book15.net/books/search.html?kw=' + encodeURIComponent(target.author),
+      { text: [901, 902, 903, 904, 905, 906].map((id) => link(id, '无关书' + id)).join('') });
+    for (const id of [801, 802, 803, 804, 901, 902, 903, 904, 905, 906]) pages.set(pageUrl(id), { text: unrel(id) });
+    // 全部抓取成功、身份全不符 ⇒ 完整搜索后的未找到（404），不是书源故障。
+    await expect(service.resolveSourceBook(target, context())).rejects.toMatchObject({ code: 'SOURCE_NOT_FOUND', status: 404 });
+    expect(mocks.fetch.mock.calls.length).toBe(12);
+  });
+
+  it('P2-②: author-layer inspect is not starved by library hints (no-overlap, real book in author window)', async () => {
+    // 库 hints 占 4 点后，若标题页兜底仍按固定 4 展开，作者层 inspect 会在途中被全局上限掐断 ⇒
+    // hadFailure ⇒ 用户见 503，而真书明明还在第 3 个作者候选（41 任 PROBE_B 实测复现，details903 从未被抓）。
+    // 修正后标题页兜底让出预算，作者层够得到真书 ⇒ 必须交付目录，不得 503。
+    const target = { title: '改名书', author: '作者A' };
+    const link = (id: number, text: string) => `<a href="/books/details${id}.html">${text}</a>`;
+    const unrel = (id: number) =>
+      `<meta property="og:novel:book_name" content="无关书${id}"><meta property="og:novel:author" content="别人">`
+      + `<dd><a href="/chapter/index${id}-1.html">第一章</a></dd>`;
+    const renamed = (id: number) =>
+      '<meta property="og:novel:book_name" content="新名"><meta property="og:novel:author" content="作者A">'
+      + '<div>小说简介:【原书名：改名书】改名前的版本。</div>'
+      + `<dd><a href="/chapter/index${id}-1.html">第一章</a></dd>`;
+    hints = [701, 702, 703, 704].map((id) => ({ title: '改名书', author: '作者A', source_url: pageUrl(id) }));
+    pages.set('https://book15.net/books/search.html?kw=' + encodeURIComponent(target.title),
+      { text: [801, 802, 803, 804].map((id) => link(id, '无关书' + id)).join('') });
+    pages.set('https://book15.net/books/search.html?kw=' + encodeURIComponent(target.author),
+      { text: [901, 902, 903, 904, 905, 906].map((id) => link(id, '无关书' + id)).join('') });
+    for (const id of [701, 702, 703, 704, 801, 802, 803, 804, 901, 902, 904, 905, 906]) pages.set(pageUrl(id), { text: unrel(id) });
+    pages.set(pageUrl(903), { text: renamed(903) }); // 真书在第 3 个作者候选
+    await expect(service.resolveSourceBook(target, context()))
+      .resolves.toMatchObject({ title: '新名', author: '作者A', bookUrl: pageUrl(903) });
+    expect(mocks.fetch.mock.calls.length).toBeLessThanOrEqual(12);
+  });
 });
 
 describe('GET /api/read/source/[resource]', () => {
