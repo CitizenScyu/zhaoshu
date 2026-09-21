@@ -33,6 +33,11 @@ export interface ReaderPart {
   taskId: number | null;
   sourceId?: string;
   servedFrom?: string;
+  /**
+   * 目录会话版本(catalog.version)。**只在章内换源成功时出现**:服务端已把备用源目录
+   * 固化(catalog 落库)并把本次正文换成新源,前端据此把阅读目录切成新源(洞 2)。
+   */
+  sourceSession?: string;
   version: string;
   chapterIndex: number;
   partIndex: number;

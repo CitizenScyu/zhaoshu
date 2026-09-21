@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import type { ReaderIndex, ReaderPart, ReadingSession } from '@/lib/reader-types';
-import { readerChapterUrl, readerIndexUrl, readerPartMatches } from '@/lib/reader-session';
+import { readerChapterUrl, readerIndexUrl, readerPartMatches, switchedReaderIndex } from '@/lib/reader-session';
 import { ReaderPartCache, nextReadingPosition, previousReadingPosition } from '@/lib/reader-part-cache';
 import { captureTextAnchor, restoreTextAnchor } from '@/lib/reader-text-anchor';
 import { catalogPrefixKey, parseReaderSettings, parseReadingProgress, readingPercent, READER_SETTINGS_KEY } from '@/lib/reader-preferences';
@@ -84,6 +84,9 @@ export function useReader(session: ReadingSession, apiFetch: ApiFetch, userId: n
   const scrollFrame = useRef<number | null>(null);
   const restoring = useRef(false);
   const scrollIntent = useRef(false);
+  // 洞 2 前端半边:换源成功后阅读中的目录切成新源;同一阅读会话只跟随一次
+  // (用户重载目录后以新源为基线重来,避免两源间来回横跳)。
+  const adoptedSwitch = useRef<string | null>(null);
 
   const [cache] = useState(() => new ReaderPartCache(async (index, position, signal) => {
     const part = await responseJson<ReaderPart>(await apiFetch(readerChapterUrl(index, position), { signal, cache: 'no-store' }));
@@ -165,6 +168,22 @@ export function useReader(session: ReadingSession, apiFetch: ApiFetch, userId: n
     saveProgress();
   }, [captureStablePosition, publishPosition, saveProgress]);
 
+  /**
+   * 洞 2 前端半边:章内换源成功后,服务端在 part 上带出新源的目录会话版本。
+   * 此时把**后续**章节的请求重定向到新源 —— 不重键已渲染的阅读依赖(否则会跳回进度、
+   * 闪一下空状态),只换「后续取的目录」。同一阅读会话只跟随一次:用户重载目录后以新源
+   * 目录为基线重来,避免两源间来回横跳。
+   */
+  const adoptSwitch = useCallback((index: ReaderIndex, part: ReaderPart): ReaderIndex => {
+    const switched = switchedReaderIndex(index, part);
+    if (switched === index) return index;
+    if (!adoptedSwitch.current) adoptedSwitch.current = switched.source!.session;
+    if (adoptedSwitch.current !== switched.source!.session) return index;
+    const current = currentReading.current;
+    if (current && current.index === index) currentReading.current = { ...current, index: switched };
+    return switched;
+  }, []);
+
   const fail = useCallback((error: unknown, target?: ReadingPosition, direction?: 'next' | 'previous') => {
     const status = error instanceof RequestError ? error.status : 0;
     if (status === 401) { cache.clear(); setReading(null); }
@@ -208,13 +227,15 @@ export function useReader(session: ReadingSession, apiFetch: ApiFetch, userId: n
     try {
       const index = await responseJson<ReaderIndex>(await apiFetch(indexUrl, { signal: controller.signal, cache: 'no-store' }));
       if (!Array.isArray(index.chapters) || !index.chapters.length) throw new RequestError('这本书还没有可阅读的正文。', 422);
+      adoptedSwitch.current = null; // 新目录为基线:后续仍可再跟随一次换源
       const saved = parseReadingProgress(storedValue(progressKeyFor(index)), index);
       const position = saved ?? START;
       const part = await cache.get(index, position, controller.signal);
       if (controller.signal.aborted || id !== serial.current) return;
+      const switched = adoptSwitch(index, part);
       setActiveKey(partKey(part));
-      setReading({ index, parts: [part], position, focus: false });
-      setPercent(readingPercent(index, part, position.ratio));
+      setReading({ index: switched, parts: [part], position, focus: false });
+      setPercent(readingPercent(switched, part, position.ratio));
       setNotice(saved ? '已回到上次阅读的位置' : '');
     } catch (error) {
       if (!controller.signal.aborted && id === serial.current) fail(error);
@@ -222,7 +243,7 @@ export function useReader(session: ReadingSession, apiFetch: ApiFetch, userId: n
       if (request.current === controller) request.current = null;
       if (!controller.signal.aborted && id === serial.current) setLoading(false);
     }
-  }, [apiFetch, indexUrl, beginRequest, cache, fail, flushPosition, progressKeyFor]);
+  }, [apiFetch, indexUrl, beginRequest, adoptSwitch, cache, fail, flushPosition, progressKeyFor]);
 
   // 模糊候选点选后的确认重放：换 bookUrl 重载目录（server 端跳过书名/作者匹配）。
   const loadConfirmedBook = useCallback((bookUrl: string) => {
@@ -329,16 +350,19 @@ export function useReader(session: ReadingSession, apiFetch: ApiFetch, userId: n
       retirePrevious();
       const part = await pending;
       if (controller.signal.aborted || id !== serial.current) return;
+      // 换源在飞期间用户又点了别处:结果只对发起它的那次阅读有效(与 extend 同款护栏)。
+      if (currentReading.current !== current) return;
+      const adopted = adoptSwitch(current.index, part);
       setActiveKey(partKey(part));
-      setReading({ index: current.index, parts: [part], position, focus: true });
-      setPercent(readingPercent(current.index, part, position.ratio));
+      setReading({ index: adopted, parts: [part], position, focus: true });
+      setPercent(readingPercent(adopted, part, position.ratio));
     } catch (error) {
       if (!controller.signal.aborted && id === serial.current) fail(error, position);
     } finally {
       if (request.current === controller) request.current = null;
       if (!controller.signal.aborted && id === serial.current) setLoading(false);
     }
-  }, [beginRequest, cache, fail, flushPosition]);
+  }, [adoptSwitch, beginRequest, cache, fail, flushPosition]);
 
   const extend = useCallback(async (direction: 'next' | 'previous', manual = false) => {
     const current = currentReading.current;
@@ -379,13 +403,14 @@ export function useReader(session: ReadingSession, apiFetch: ApiFetch, userId: n
       if (parts.length > WINDOW_SIZE) parts = direction === 'next' ? parts.slice(-WINDOW_SIZE) : parts.slice(0, WINDOW_SIZE);
       const retained = !manual && snapshot && parts.some((candidate) => partKey(candidate) === partKey(snapshot.position));
       const destination = direction === 'previous' ? { ...next, ratio: 1 } : next;
-      setReading({ index: current.index, parts, position: retained ? snapshot.position : destination, sectionOffset: retained ? snapshot.sectionOffset : undefined, focus: false });
+      const adopted = adoptSwitch(current.index, part);
+      setReading({ index: adopted, parts, position: retained ? snapshot.position : destination, sectionOffset: retained ? snapshot.sectionOffset : undefined, focus: false });
     } catch (error) {
       if (!controller.signal.aborted && id === serial.current) fail(error, next, direction);
     } finally {
       if (flowRequest.current === controller) { flowRequest.current = null; setFlowing(false); }
     }
-  }, [loading, cache, captureStablePosition, fail, navigate]);
+  }, [adoptSwitch, loading, cache, captureStablePosition, fail, navigate]);
 
   function onScroll() {
     if (restoring.current || scrollFrame.current !== null) return;

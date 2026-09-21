@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { bookReadingHref, readerChapterUrl, readerIndexUrl, readerPartMatches, readingSessionKey } from './reader-session';
+import { bookReadingHref, readerChapterUrl, readerIndexUrl, readerPartMatches, readingSessionKey, switchedReaderIndex } from './reader-session';
 import { indexProgressKey, readingPercent, parseReadingProgress } from './reader-preferences';
 import type { ReaderIndex, ReaderPart } from './reader-types';
 
@@ -42,6 +42,30 @@ describe('download and source reading sessions', () => {
     expect(readerPartMatches(online, part, position)).toBe(true);
     expect(readerPartMatches(local, part, position)).toBe(false);
     expect(readerPartMatches(online, { ...part, sourceId: 'other-source' }, position)).toBe(false);
+  });
+
+  // 洞 2 的续读链路:章内换源成功后服务端带出新源的目录会话,前端(useReader)据此
+  // 把「仍在生效的目录」切成新源 —— 下一章直接打向新源,不再每章回到故障原源重试。
+  it('章内换源:带 sourceSession 的 part 换出可续读的新目录,且被判定为与目录一致', () => {
+    const newSession = 'b'.repeat(40);
+    // 前端只以服务端给的两个事实为权威:新会话版本 + 新 sourceId(名字沿用,章头显示走 servedFrom)。
+    const expectedSource = { ...online.source, id: 'source-two', session: newSession };
+    const switchedPart: ReaderPart = {
+      ...position, taskId: null, sourceId: 'source-two', servedFrom: '备用源',
+      version: newSession, sourceSession: newSession,
+      partCount: 1, title: '第一章', text: '备用源正文', startByte: 0, endByte: 18,
+    };
+    const adopted = switchedReaderIndex(online, switchedPart);
+    expect(adopted.version).toBe(newSession);
+    expect(adopted.source).toEqual(expectedSource);
+    // 后续章节用新目录拼请求:session 命中新源;前端一致性闸门也放行(换源是唯一例外)。
+    expect(new URL(readerChapterUrl(adopted, position), 'http://localhost').searchParams.get('session'))
+      .toBe(newSession);
+    expect(readerPartMatches(adopted, switchedPart, position)).toBe(true);
+    // 负对照:没有 sourceSession 的 part(未换源)仍按既有语义拒绝跨源/跨版本内容。
+    const plain: ReaderPart = { ...switchedPart, sourceSession: undefined };
+    expect(switchedReaderIndex(online, plain)).toBe(online);
+    expect(readerPartMatches(online, plain, position)).toBe(false);
   });
 
   it('remembers source progress and estimates by chapter when total file bytes are unknown', () => {
