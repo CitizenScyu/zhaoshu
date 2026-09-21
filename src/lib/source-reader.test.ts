@@ -562,6 +562,30 @@ describe('online reader source resolution and budgets', () => {
     expect(catalog.bookUrl).toBe(pageUrl(96)); // 作者不符的 95 被作者门挡下,不误配
   });
 
+  it('PROBE-41: reference SOURCE_SIMILAR scenario on master baseline', async () => {
+    // 任务书 41-S1 §1:在 master(1c3e522)基线上跑这条参照场景,记录真实行为。
+    const titleSearch = 'https://book15.net/books/search.html?kw=' + encodeURIComponent(book.title);
+    const decorDetail = (id: number, title: string, author: string) =>
+      `<meta property="og:novel:book_name" content="${title}"><meta property="og:novel:author" content="${author}">`
+      + '<dd><a href="/chapter/index' + id + '-1.html">第一章</a></dd>'
+      + '<dd><a href="/chapter/index' + id + '-2.html">第二章</a></dd>';
+    pages.set(titleSearch, {
+      text: '<a href="/books/details71.html" title="测试书">【完结】测试书</a>'
+        + '<a href="/books/details72.html" title="全球高武">【完结】全球高武</a>',
+    });
+    pages.set('https://book15.net/books/details71.html', { text: decorDetail(71, '【完结】测试书', '站点挂错的作者') });
+    pages.set('https://book15.net/books/details72.html', { text: decorDetail(72, '全球高武', '别人') });
+    const caught = await service.resolveSourceBook(book, context())
+      .then((catalog) => ({ delivered: catalog }), (error: SourceReaderError & { candidates?: SourceSimilarCandidate[] }) =>
+        ({ code: error.code, status: error.status, message: error.message, candidates: error.candidates }));
+    console.log('PROBE-41-OUTCOME', JSON.stringify(caught));
+    await expect(caught).toMatchObject({
+      code: 'SOURCE_SIMILAR',
+      status: 422,
+      candidates: [{ title: '【完结】测试书', author: '站点挂错的作者', chapters: 2, bookUrl: 'https://book15.net/books/details71.html' }],
+    });
+  });
+
   it('never auto-delivers an unrelated detail page reached through the fallback', async () => {
     // 负控:兜底收到的详情页书名作者都对不上 ⇒ 不自动取书,交回既有判据(404,不放大到 503)。
     const titleSearch = 'https://book15.net/books/search.html?kw=' + encodeURIComponent(book.title);
