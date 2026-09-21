@@ -757,7 +757,6 @@ export async function surveySourceBooks(
     }
     const sourceContext = isFirst ? context : context.child(source.url);
     context.signal.throwIfAborted();
-    const current = options.currentSourceName === source.name;
     try {
       const found = await surveyOneSource(book, source, sourceContext, hints, excludeBookUrl);
       results.push(found ?? { sourceName: source.name, status: 'miss' });
