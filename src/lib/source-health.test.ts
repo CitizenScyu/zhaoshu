@@ -14,6 +14,10 @@ import {
 
 const NOW = Date.parse('2026-09-23T12:00:00.000Z');
 
+// 标签模板替身：签名与 neon 的 sql 调用形态一致，断言的是「真的发出了什么语句」。
+type SqlTag = (strings: TemplateStringsArray, ...values: unknown[]) => Promise<unknown[]>;
+const sqlMock = (impl: SqlTag) => vi.fn<SqlTag>(impl);
+
 describe('source-health (S5-1)', () => {
   beforeEach(() => {
     vi.resetAllMocks();
@@ -29,7 +33,7 @@ describe('source-health (S5-1)', () => {
   });
 
   it('recordCronSuccess 幂等 upsert 到 cron_health', async () => {
-    const sql = vi.fn(async () => []);
+    const sql = sqlMock(async () => []);
     mocks.getSql.mockReturnValue(sql);
     await recordCronSuccess('reclaim');
     expect(sql).toHaveBeenCalledOnce();
@@ -40,7 +44,7 @@ describe('source-health (S5-1)', () => {
   });
 
   it('recordCronSuccess 写失败只记日志、不抛出（监控写入不能打挂 cron 本身）', async () => {
-    const sql = vi.fn(async () => { throw new Error('db down'); });
+    const sql = sqlMock(async () => { throw new Error('db down'); });
     mocks.getSql.mockReturnValue(sql);
     const spy = vi.spyOn(console, 'error').mockImplementation(() => {});
     await expect(recordCronSuccess('drain')).resolves.toBeUndefined();
@@ -49,7 +53,7 @@ describe('source-health (S5-1)', () => {
   });
 
   it('readCronSuccessTimes 一次查询读回两行；缺行归一为 null', async () => {
-    const sql = vi.fn(async () => [{ name: 'drain', last_success_at: '2026-09-23T06:00:00.000Z' }]);
+    const sql = sqlMock(async () => [{ name: 'drain', last_success_at: '2026-09-23T06:00:00.000Z' }]);
     mocks.getSql.mockReturnValue(sql);
     expect(await readCronSuccessTimes()).toEqual({
       reclaim: null, drain: '2026-09-23T06:00:00.000Z',
@@ -58,14 +62,14 @@ describe('source-health (S5-1)', () => {
   });
 
   it('readAdmissionCheckedAgeHours 取 MAX 并换算成小时；空表为 null', async () => {
-    const sql = vi.fn(async () => [{ max_checked_at: new Date(NOW - 5 * 3_600_000).toISOString() }]);
+    const sql = sqlMock(async () => [{ max_checked_at: new Date(NOW - 5 * 3_600_000).toISOString() }]);
     mocks.getSql.mockReturnValue(sql);
     vi.useFakeTimers();
     vi.setSystemTime(NOW);
     expect(await readAdmissionCheckedAgeHours()).toBe(5);
     vi.useRealTimers();
 
-    mocks.getSql.mockReturnValue(vi.fn(async () => [{ max_checked_at: null }]));
+    mocks.getSql.mockReturnValue(sqlMock(async () => [{ max_checked_at: null }]));
     expect(await readAdmissionCheckedAgeHours()).toBeNull();
   });
 
