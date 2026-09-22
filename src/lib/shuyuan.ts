@@ -703,6 +703,32 @@ export async function enableShuyuanSource(url: string): Promise<boolean> {
   return rows.length > 0;
 }
 
+/** 半挂刷新的固定错误码（安全枚举，不是 e.message 原文）：/api/shuyuan 据此回 502 的 code。 */
+export const SHUYUAN_REFRESH_PARTIAL = 'shuyuan_refresh_partial';
+
+/**
+ * 只拉到部分合集 ⇒ 中止本轮刷新。**不放宽判据**：写库是整表替换语义
+ * （refreshWithinBudget 尾部事务先 `DELETE FROM shuyuan_sources` 再整批 INSERT merged），
+ * 带着 2/3 合集继续更新会把缺失那个合集里的源从池中静默删掉——比中止更糟。
+ *
+ * 这里只做可观测化：预期/实到数量与失败合集（仓内自有的合集 id）挂在错误上，
+ * 让「502 + 整轮零更新」在日志里能一眼定位是半挂而不是别的故障。
+ * reason 过 safeReason：合集下载失败的 message 形如 `503 <上游URL>`，不能原样带出去。
+ */
+export class ShuyuanRefreshPartialError extends Error {
+  readonly code = SHUYUAN_REFRESH_PARTIAL;
+  readonly expected: number;
+  readonly actual: number;
+  readonly failures: { id: number; reason: string }[];
+  constructor(expected: number, actual: number, failures: { id: number; reason: string }[]) {
+    super(`仅拉到 ${actual}/${expected} 个书源合集，本次刷新中止，保留既有数据`);
+    this.name = 'ShuyuanRefreshPartialError';
+    this.expected = expected;
+    this.actual = actual;
+    this.failures = failures.map((failure) => ({ id: failure.id, reason: safeReason(failure.reason) }));
+  }
+}
+
 // 固定合集拉取、规则核对、有限探测和写回共用原有预算（现 180s，见 REFRESH_BUDGET_MS）。
 export async function refreshShuyuan(parentSignal?: AbortSignal): Promise<ShuyuanStats> {
   const budget = createDeadline(REFRESH_BUDGET_MS);
@@ -761,7 +787,15 @@ async function refreshWithinBudget(s: Sql, budget: RequestDeadline, signal: Abor
   }
   const expected = Math.min(LATEST_COUNT, entries.length);
   if (collections.length < expected) {
-    throw new Error(`仅拉到 ${collections.length}/${expected} 个书源合集，本次刷新中止，保留既有数据`);
+    // S3-1（静默失败审计）：只挂 1 个合集也不能「带着 2/3 继续更新」——写库是整表替换语义
+    // （尾部事务先 DELETE FROM shuyuan_sources 再整批 INSERT merged），缺失那个合集的源会被
+    // 静默删掉，比中止更糟。判据不放宽，只做可观测：结构化错误 + 一行响亮告警，让
+    // 「502 + 整轮零更新」在日志里能一眼区分是半挂而不是别的故障。
+    const partial = new ShuyuanRefreshPartialError(expected, collections.length, collectionFailures);
+    console.error('shuyuan refresh partial: 仅拉到部分合集，本次刷新中止，保留既有数据', {
+      code: partial.code, expected: partial.expected, actual: partial.actual, failures: partial.failures,
+    });
+    throw partial;
   }
 
   const previousRows = await readRows<StoredSource>(s, s`
@@ -887,7 +921,16 @@ async function refreshWithinBudget(s: Sql, budget: RequestDeadline, signal: Abor
 async function runAdmissionAfterRefresh(
   s: Sql, rows: { url: string; source: Record<string, unknown> }[], budget: RequestDeadline, signal: AbortSignal,
 ): Promise<void> {
-  if (signal.aborted || budget.remainingMs <= ADMISSION_MIN_BUDGET_MS) return;
+  if (signal.aborted) return;
+  if (budget.remainingMs <= ADMISSION_MIN_BUDGET_MS) {
+    // S3-3：整批跳过是静默的——刷新照样 200、池健康度数字齐全，但 source_admission 本轮没更新。
+    // 连续几轮预算不够 ⇒ 准入数据无限期陈旧而表面全绿。沿用 admission batch log 的形状记一行。
+    // 候选池此时还没筛（跳过的正是筛选本身），所以记的是本轮源总数而不是 candidates。
+    console.log('shuyuan admission batch', {
+      sources: rows.length, skipped: 'budget', remainingMs: budget.remainingMs,
+    });
+    return;
+  }
   const declaredHosts = new Set<string>();
   for (const row of rows) {
     try { declaredHosts.add(new URL(row.url).hostname); } catch { /* 上游脏 URL：无法声明 host */ }
