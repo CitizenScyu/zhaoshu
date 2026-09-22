@@ -5,8 +5,8 @@ vi.mock('./db', async (original) => ({
   ...await original<typeof import('./db')>(),
   claimProfileFeedbackForUser: vi.fn(async () => 7),
   getProfileForUser: vi.fn(async () => ({ seeds: [], content: '旧画像', updatedAt: 'v1' })),
-  getProfileFeedbackForUser: vi.fn(async () => [{ title: '合成书', author: '合成作者', status: 'done', note: '喜欢严谨设定' }]),
-  getWithdrawnFeedbackBookTitlesForUser: vi.fn(async () => []),
+  getProfileFeedbackForUser: vi.fn(async () => [{ title: '合成书', author: '合成作者', status: 'done', note: '喜欢严谨设定', feedbackId: 5 }]),
+  getWithdrawnFeedbackBookTitlesForUserRaw: vi.fn(async () => []),
   saveProfileForUser: vi.fn(async () => 'v2'),
   markProfileFeedbackFailedForUser: vi.fn(async () => {}),
 }));

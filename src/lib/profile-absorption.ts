@@ -6,7 +6,9 @@ import {
   getProfileFeedbackQueueForUser,
   getProfileForUser,
   getProfileFeedbackForUser,
-  getWithdrawnFeedbackBookTitlesForUser,
+  getWithdrawnFeedbackBookTitlesForUserRaw,
+  absorbedWatermarkFor,
+  feedbackForPrompt,
   markProfileFeedbackAbsorbedForUser,
   markProfileFeedbackFailedForUser,
 } from './db';
@@ -19,9 +21,12 @@ import { profileAbsorbSystem, profileAbsorbUser } from './prompts';
 // 关键约束：
 //  1. 写路径（/api/feedback）不调用模型；本函数才是那个可能跑数分钟的模型调用，由独立端点/
 //     机会触发，用户不为它同步等待。
-//  2. 合并：一次读取该用户全部「最新有效反馈」（F04 口径：每本书只认最新一行，先取最新再判
-//     信息量）+ 撤回书目，一次模型调用覆盖队列里所有 pending——并发写两本书的反馈不会各触发
-//     一次互相打架的 CAS。
+//  2. 合并：一次读取该用户**最多 MAX_PROFILE_FEEDBACK 条**「最新有效反馈」（F04 口径：
+//     每本书只认最新一行，先取最新再判信息量）+ 撤回书目，一次模型调用覆盖队列里所有
+//     pending——并发写两本书的反馈不会各触发一次互相打架的 CAS。
+//     🔴 订正（F41-F1）：这里**不是**「全部」。两类查询都有 LIMIT（MAX_PROFILE_FEEDBACK），
+//     超额的反馈要下一轮才喂。因此水位只能推到「本轮实喂上界」（F41-F1），绝不能推到
+//     getMaxFeedbackIdForUser 或未经 min 收敛的 pending 上界。
 //  3. 可恢复：失败/冲突都保留 pending_feedback_id，水位不推进，下次机会重放；成功才推进，
 //     且只在 pending 不再更高时清空。
 //  4. 撤回不复活：输入显式带上 withdrawnFeedbackBookTitles（F04 同一查询），异步路径与重建
@@ -86,10 +91,19 @@ export async function absorbPendingProfileFeedback(deps: {
   // 后统一走既有 catch 的 markFailed（清租约 + 退避 + attempts），语义与模型阶段失败一致。
   try {
     let profile = await getProfileForUser(userId);
-    const [feedback, withdrawn] = await Promise.all([
+    const [feedback, withdrawnRows] = await Promise.all([
       getProfileFeedbackForUser(userId),
-      getWithdrawnFeedbackBookTitlesForUser(userId),
+      getWithdrawnFeedbackBookTitlesForUserRaw(userId),
     ]);
+    const withdrawn = withdrawnRows.map((row) => row.title);
+    // F41-F1：本轮实喂上界 = min(informative 实喂 max id, withdrawn 实喂 max id)。
+    // 用它替代旧的 `candidate`（来自 claim 的 pending_feedback_id）作为队列推进上界：
+    // pending 是由 enqueue 用 `max(id)` 记下的**全表**上界，而模型只吃到 LIMIT 50 以内的行，
+    // 两者对不上时旧代码会把第 51+ 行标成已消费。取 min 保证两类中 id 更大的未喂行都不被清。
+    const fedUpperBound = absorbedWatermarkFor(feedback, withdrawnRows);
+    // F41-F1：零行时 `fedUpperBound` 为 0，改用 candidate（pending 上界）——此时队列里没有
+    // 任何待喂行被漏掉，candidate 是这些行自己的高点，推进它不会跳过未喂的行。
+    const advanceTo = fedUpperBound > 0 ? fedUpperBound : candidate;
     // 空画像起步（F15 ③）：没有 profile 行时先建占位行，拿到有效 updated_at 才能走 CAS 保存。
     if (!profile.updatedAt) {
       await ensureProfileForUser(userId, write);
@@ -102,7 +116,7 @@ export async function absorbPendingProfileFeedback(deps: {
 
     // 既无有效反馈、也无撤回信号：这次 pending 对画像零影响，直接推进水位（不调模型）。
     if (!feedback.length && !withdrawn.length) {
-      const completion = await markProfileFeedbackAbsorbedForUser(userId, candidate, 'unchanged', write, leaseToken);
+      const completion = await markProfileFeedbackAbsorbedForUser(userId, advanceTo, 'unchanged', write, leaseToken);
       if (!completion.matched) return { status: 'conflict', pendingFeedbackId: candidate };
       const { pendingFeedbackId } = completion;
       return { status: pendingFeedbackId == null ? 'unchanged' : 'pending', pendingFeedbackId };
@@ -110,14 +124,14 @@ export async function absorbPendingProfileFeedback(deps: {
 
     const { content: raw } = await chatRobust(
       profileAbsorbSystem(),
-      profileAbsorbUser(profile.content, JSON.stringify(feedback), withdrawn),
+      profileAbsorbUser(profile.content, JSON.stringify(feedbackForPrompt(feedback)), withdrawn),
       { temperature: 0.3, signal, onUsage: recordUsageAfterResponse('feedback'), totalTimeoutMs: modelBudgetMs },
     );
     const content = validateProfileContent(raw);
     const applied = content !== profile.content;
     // R3：同一事务先锁定租约，画像 CAS 与队列推进一起提交，旧租约不能先写画像。
     const completion = await completeProfileFeedbackForUser(
-      userId, candidate, applied ? 'applied' : 'unchanged', content, profile.updatedAt, write, leaseToken,
+      userId, advanceTo, applied ? 'applied' : 'unchanged', content, profile.updatedAt, write, leaseToken,
     );
     if (completion.outcome === 'lostLease') {
       return { status: 'conflict', pendingFeedbackId: candidate };

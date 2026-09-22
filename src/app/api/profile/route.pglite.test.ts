@@ -22,17 +22,17 @@ vi.mock('@/lib/db', () => ({
   saveProfileForUser: mocks.saveProfileForUser,
   getFeedbackSnapshotForUser: mocks.getFeedbackSnapshotForUser,
   // 真 SQL：路由拿到的就是查询结果，而不是手写 fixture。
+  // F41-F1：反馈行带 feedback_id（实喂上界计算用），提示词投影在 db.ts 里剥掉。
   getProfileFeedbackForUser: async (userId: number) => {
     const statement = recentInformativeFeedbackForUserQuery(mocks.getSql() as never, userId) as unknown as { text: string; params: unknown[] };
-    return (await pg.query(statement.text, statement.params)).rows;
+    return (await pg.query(statement.text, statement.params)).rows as { title: string; author: string; status: string; note: string; feedback_id: number }[];
   },
-  getWithdrawnFeedbackBookTitlesForUser: async (userId: number) => {
+  // F41-F1：撤回书目查询行的 feedback_id 是实喂上界用的内部字段；
+  // 路由的提示词输入经 db.ts 的 feedbackForPrompt 剥掉它，模型只看到书名。
+  getWithdrawnFeedbackBookTitlesForUserRaw: async (userId: number) => {
     const statement = withdrawnFeedbackBookTitlesForUserQuery(mocks.getSql() as never, userId) as unknown as { text: string; params: unknown[] };
-    return (await pg.query(statement.text, statement.params)).rows.map((row) => row.title as string);
+    return (await pg.query(statement.text, statement.params)).rows as { title: string; feedback_id: number }[];
   },
-  // F15：重建成功后推进反馈吸收水位——真 SQL，走真表。
-  getMaxFeedbackIdForUser: async (userId: number) =>
-    ((await pg.query('SELECT COALESCE(max(id), 0)::int AS max_id FROM feedback WHERE user_id = $1', [userId])).rows[0] as { max_id: number }).max_id,
   markProfileFeedbackAbsorbedForUser: async (userId: number, candidate: number) => {
     await pg.query(`UPDATE profile_feedback_queue
       SET absorbed_feedback_id = GREATEST(absorbed_feedback_id, $2),
@@ -41,6 +41,17 @@ vi.mock('@/lib/db', () => ({
       WHERE user_id = $1`, [userId, candidate]);
     return null;
   },
+  // F41-F1：这两个纯函数（实喂上界 min 收敛 + 提示词投影）走真实现——水位语义正是本测试
+  // 要验的东西，替身掉就等于没测。缺了它们 route 里会拿到 undefined 而 500。
+  absorbedWatermarkFor: (actual: { feedbackId: number }[], withdrawn: { feedbackId: number }[]) => {
+    const bound = (rows: { feedbackId: number }[]) => rows.length ? Math.max(...rows.map((r) => r.feedbackId)) : null;
+    const a = bound(actual); const b = bound(withdrawn);
+    if (a == null) return b ?? 0;
+    if (b == null) return a;
+    return Math.min(a, b);
+  },
+  feedbackForPrompt: (rows: { title: string; author: string; status: string; note: string }[]) =>
+    rows.map(({ title, author, status, note }) => ({ title, author, status, note })),
 }));
 vi.mock('@/lib/llm', async (importOriginal) => ({
   ...await importOriginal<typeof import('@/lib/llm')>(),
@@ -50,10 +61,10 @@ vi.mock('@/lib/llm', async (importOriginal) => ({
 type SqlTag = (parts: TemplateStringsArray, ...values: unknown[]) => { text: string; params: unknown[] };
 type Statement = { text: string; params: unknown[] };
 
+let pg: PGliteLike;
+
 const PGliteCtor = await loadPGlite();
 const maybe = PGliteCtor ? describe : describe.skip;
-
-let pg: PGliteLike;
 
 maybe('真实 PostgreSQL：F04 撤回信号经过真实路由（P1-2）', () => {
   let imported: typeof import('./route');

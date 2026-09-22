@@ -191,10 +191,44 @@ export class FeedbackBookNotFoundError extends Error {
   readonly code = 'BOOK_NOT_FOUND';
 }
 
-export interface ProfileFeedback { title: string; author: string; status: string; note: string }
+export interface ProfileFeedback { title: string; author: string; status: string; note: string; feedbackId: number }
+
+/** F41-F1：撤回书目的查询行——title 给模型，feedback_id 只用于算水位上界（绝不出现在输入里）。 */
+export interface WithdrawnFeedbackTitle { title: string; feedbackId: number }
+
+/**
+ * F41-F1：「实喂上界」= 真正进了模型输入的那批行的最大 feedback id。
+ *
+ * 核心不变量：**任何反馈行除非真喂给模型，不得标记已消耗**。id ASC + LIMIT 50 保证
+ * 「id ≤ batchMax 的该类行必然都在 batch 里」，故 batchMax 是可安全推进的水位上界。
+ * 两类列表（informative / withdrawn）共用一个水位，取 **min**：某一类里 id 更大的
+ * 未喂行，无论如何都不能被这个水位清掉。某类本轮 0 行 → 它不设上界（取另一类）。
+ */
+export function fedFeedbackUpperBound(rows: { feedbackId: number }[] | undefined | null): number | null {
+  if (!rows || !rows.length) return null;
+  return rows.reduce((max, row) => (row.feedbackId > max ? row.feedbackId : max), 0);
+}
+
+/** 合并两类实喂上界：min（null = 该类本轮没喂，不参与取 min）。 */
+export function absorbedWatermarkFor(
+  informative: { feedbackId: number }[] | undefined | null,
+  withdrawn: { feedbackId: number }[] | undefined | null,
+): number {
+  const informativeBound = fedFeedbackUpperBound(informative);
+  const withdrawnBound = fedFeedbackUpperBound(withdrawn);
+  if (informativeBound == null) return withdrawnBound ?? 0;
+  if (withdrawnBound == null) return informativeBound;
+  return Math.min(informativeBound, withdrawnBound);
+}
+
+/** 把喂给模型的反馈投影回旧形状（不含 feedbackId）：提示词输入只含 title/author/status/note。 */
+export function feedbackForPrompt(rows: ProfileFeedback[]): Omit<ProfileFeedback, 'feedbackId'>[] {
+  return rows.map(({ title, author, status, note }) => ({ title, author, status, note }));
+}
 
 // 重新生成画像时并入模型的「本人最新有效反馈」（F04）。查询本身见
 // user-data.recentInformativeFeedbackForUserQuery：按 user_id 隔离 + 每本书取最新一行。
+// F41-F1：行里带 feedbackId——实喂上界计算要用，提示词输入不含它（见 feedbackForPrompt）。
 export async function getProfileFeedbackForUser(userId: number): Promise<ProfileFeedback[]> {
   requireUserId(userId);
   return await recentInformativeFeedbackForUserQuery(getSql(), userId) as ProfileFeedback[];
@@ -202,9 +236,16 @@ export async function getProfileFeedbackForUser(userId: number): Promise<Profile
 
 // 已撤回反馈的书名（F04）：曾 informative、最新已非 informative。空数组表示没有撤回信号，
 // 路由据此不渲染撤回段。查询语义见 user-data.withdrawnFeedbackBookTitlesForUserQuery。
+// F41-F1：返回带 feedbackId 的行（raw 内部用）；需要「只透书名」的地方自行 map，
+// 需要算水位的地方直接用 raw 行。两条调用方见 profile/route.ts 与 profile-absorption.ts。
+export async function getWithdrawnFeedbackBookTitlesForUserRaw(userId: number): Promise<WithdrawnFeedbackTitle[]> {
+  requireUserId(userId);
+  return await withdrawnFeedbackBookTitlesForUserQuery(getSql(), userId) as WithdrawnFeedbackTitle[];
+}
+
 export async function getWithdrawnFeedbackBookTitlesForUser(userId: number): Promise<string[]> {
   requireUserId(userId);
-  const rows = await withdrawnFeedbackBookTitlesForUserQuery(getSql(), userId) as { title: string }[];
+  const rows = await getWithdrawnFeedbackBookTitlesForUserRaw(userId);
   return rows.map((row) => row.title);
 }
 

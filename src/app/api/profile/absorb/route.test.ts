@@ -11,7 +11,7 @@ const mocks = vi.hoisted(() => ({
   getProfileFeedbackFailCountForUser: vi.fn(),
   getProfileForUser: vi.fn(),
   getProfileFeedbackForUser: vi.fn(),
-  getWithdrawnFeedbackBookTitlesForUser: vi.fn(),
+  getWithdrawnFeedbackBookTitlesForUserRaw: vi.fn(),
   completeProfileFeedbackForUser: vi.fn(),
   markProfileFeedbackAbsorbedForUser: vi.fn(),
   markProfileFeedbackFailedForUser: vi.fn(),
@@ -26,7 +26,7 @@ vi.mock('@/lib/db', async (importOriginal) => ({
   getProfileFeedbackFailCountForUser: mocks.getProfileFeedbackFailCountForUser,
   getProfileForUser: mocks.getProfileForUser,
   getProfileFeedbackForUser: mocks.getProfileFeedbackForUser,
-  getWithdrawnFeedbackBookTitlesForUser: mocks.getWithdrawnFeedbackBookTitlesForUser,
+  getWithdrawnFeedbackBookTitlesForUserRaw: mocks.getWithdrawnFeedbackBookTitlesForUserRaw,
   completeProfileFeedbackForUser: mocks.completeProfileFeedbackForUser,
   markProfileFeedbackAbsorbedForUser: mocks.markProfileFeedbackAbsorbedForUser,
   markProfileFeedbackFailedForUser: mocks.markProfileFeedbackFailedForUser,
@@ -59,8 +59,8 @@ beforeEach(() => {
   mocks.getProfileFeedbackFailCountForUser.mockResolvedValue(0);
   mocks.getProfileFeedbackQueueForUser.mockResolvedValue(pendingQueue);
   mocks.getProfileForUser.mockResolvedValue({ seeds: [], content: '旧画像', updatedAt: 'v1' });
-  mocks.getProfileFeedbackForUser.mockResolvedValue([{ title: '书甲', author: '作者', status: 'dropped', note: '讨厌机械降神' }]);
-  mocks.getWithdrawnFeedbackBookTitlesForUser.mockResolvedValue([]);
+  mocks.getProfileFeedbackForUser.mockResolvedValue([{ title: '书甲', author: '作者', status: 'dropped', note: '讨厌机械降神', feedbackId: 4 }]);
+  mocks.getWithdrawnFeedbackBookTitlesForUserRaw.mockResolvedValue([]);
   mocks.chatRobust.mockResolvedValue({ content: '合并后的画像' });
   mocks.completeProfileFeedbackForUser.mockResolvedValue({ outcome: 'matched', updatedAt: 'v2', pendingFeedbackId: null });
   mocks.markProfileFeedbackAbsorbedForUser.mockResolvedValue({ matched: true, pendingFeedbackId: null });
@@ -88,8 +88,8 @@ describe('POST /api/profile/absorb (F15 state machine)', () => {
 
   it('merges every pending feedback into a single model call and reports applied', async () => {
     mocks.getProfileFeedbackForUser.mockResolvedValue([
-      { title: '书甲', author: '作者', status: 'dropped', note: '讨厌机械降神' },
-      { title: '书乙', author: '作者', status: 'done', note: '喜欢严谨设定' },
+      { title: '书甲', author: '作者', status: 'dropped', note: '讨厌机械降神', feedbackId: 4 },
+      { title: '书乙', author: '作者', status: 'done', note: '喜欢严谨设定', feedbackId: 6 },
     ]);
 
     const res = await POST(request('POST'));
@@ -99,7 +99,8 @@ describe('POST /api/profile/absorb (F15 state machine)', () => {
     const prompt = mocks.chatRobust.mock.calls[0][1] as string;
     expect(prompt).toContain('讨厌机械降神');
     expect(prompt).toContain('喜欢严谨设定');
-    expect(mocks.completeProfileFeedbackForUser).toHaveBeenCalledWith(1, 7, 'applied', '合并后的画像', 'v1', expect.any(Function), expect.any(String));
+    // 实喂上界 = min(informative max=6, withdrawn max=0行→不设限) = 6。
+    expect(mocks.completeProfileFeedbackForUser).toHaveBeenCalledWith(1, 6, 'applied', '合并后的画像', 'v1', expect.any(Function), expect.any(String));
     expect(mocks.markProfileFeedbackAbsorbedForUser).not.toHaveBeenCalled();
   });
 
@@ -115,7 +116,7 @@ describe('POST /api/profile/absorb (F15 state machine)', () => {
     // 下一次机会：同步 pending 仍在，模型恢复 → 最终 applied，水位推进。
     const replay = await POST(request('POST'));
     expect(await replay.json()).toMatchObject({ status: 'applied', pendingFeedbackId: null });
-    expect(mocks.completeProfileFeedbackForUser).toHaveBeenLastCalledWith(1, 7, 'applied', '合并后的画像', 'v1', expect.any(Function), expect.any(String));
+    expect(mocks.completeProfileFeedbackForUser).toHaveBeenLastCalledWith(1, 4, 'applied', '合并后的画像', 'v1', expect.any(Function), expect.any(String));
   });
 
   it('reports unchanged when the model returns the profile byte-for-byte, still advancing the watermark', async () => {
@@ -125,7 +126,7 @@ describe('POST /api/profile/absorb (F15 state machine)', () => {
     const res = await POST(request('POST'));
 
     expect(await res.json()).toMatchObject({ status: 'unchanged', pendingFeedbackId: null });
-    expect(mocks.completeProfileFeedbackForUser).toHaveBeenCalledWith(1, 7, 'unchanged', '旧画像', 'v1', expect.any(Function), expect.any(String));
+    expect(mocks.completeProfileFeedbackForUser).toHaveBeenCalledWith(1, 4, 'unchanged', '旧画像', 'v1', expect.any(Function), expect.any(String));
   });
 
   it('reports conflict and keeps pending when another writer wins the profile CAS', async () => {
@@ -161,12 +162,12 @@ describe('POST /api/profile/absorb (F15 state machine)', () => {
 
     expect(await res.json()).toMatchObject({ status: 'applied' });
     expect(mocks.ensureProfileForUser).toHaveBeenCalledWith(1, expect.any(Function));
-    expect(mocks.completeProfileFeedbackForUser).toHaveBeenCalledWith(1, 7, 'applied', '合并后的画像', 'v0', expect.any(Function), expect.any(String));
+    expect(mocks.completeProfileFeedbackForUser).toHaveBeenCalledWith(1, 4, 'applied', '合并后的画像', 'v0', expect.any(Function), expect.any(String));
   });
 
   it('feeds withdrawn titles to the model so old preferences are not revived', async () => {
     mocks.getProfileFeedbackForUser.mockResolvedValue([]);
-    mocks.getWithdrawnFeedbackBookTitlesForUser.mockResolvedValue(['撤回书']);
+    mocks.getWithdrawnFeedbackBookTitlesForUserRaw.mockResolvedValue([{ title: '撤回书', feedbackId: 7 }]);
 
     const res = await POST(request('POST'));
 
@@ -187,7 +188,7 @@ describe('POST /api/profile/absorb (F15 state machine)', () => {
 
   it('does not call the model when there is no informative feedback and no withdrawal', async () => {
     mocks.getProfileFeedbackForUser.mockResolvedValue([]);
-    mocks.getWithdrawnFeedbackBookTitlesForUser.mockResolvedValue([]);
+    mocks.getWithdrawnFeedbackBookTitlesForUserRaw.mockResolvedValue([]);
 
     const res = await POST(request('POST'));
 
