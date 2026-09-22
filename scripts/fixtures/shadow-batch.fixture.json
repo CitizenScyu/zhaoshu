@@ -1,0 +1,23 @@
+[
+  {
+    "bookSourceUrl": "https://both-ok.example.com/",
+    "searchUrl": "https://both-ok.example.com/s?q={{key}}",
+    "ruleSearch": { "bookList": ".list li", "name": "h3@text", "bookUrl": "a@href", "author": ".author@text" },
+    "ruleToc": { "chapterList": "#toc li", "chapterName": "a@text", "chapterUrl": "a@href" },
+    "ruleContent": { "content": "#content@html" }
+  },
+  {
+    "bookSourceUrl": "https://or-rescued.example.com/",
+    "searchUrl": "https://or-rescued.example.com/s?q={{key}}",
+    "ruleSearch": { "bookList": ".list||ul li", "name": "h3@text||.title@text", "bookUrl": "a@href||b@href" },
+    "ruleToc": { "chapterList": "#toc li||.toc a", "chapterName": "a@text", "chapterUrl": "a@href" },
+    "ruleContent": { "content": "#content@html||.body@html" }
+  },
+  {
+    "bookSourceUrl": "https://both-bad.example.com/",
+    "searchUrl": "https://both-bad.example.com/s?q={{key}}",
+    "ruleSearch": { "bookList": ".list li", "name": "h3@text", "bookUrl": "a@href" },
+    "ruleToc": { "chapterList": "#toc li", "chapterName": "a@text", "chapterUrl": "a@href" },
+    "ruleContent": { "content": "@js:document.body.innerHTML" }
+  }
+]
