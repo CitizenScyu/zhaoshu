@@ -90,38 +90,57 @@ export async function absorbPendingProfileFeedback(deps: {
   // 不设退避、租约要等 8 分钟自然过期，期间该用户对浏览器与 drain 都呈现 busy。挪进 try
   // 后统一走既有 catch 的 markFailed（清租约 + 退避 + attempts），语义与模型阶段失败一致。
   try {
-    let profile = await getProfileForUser(userId);
-    const [feedback, withdrawnRows] = await Promise.all([
-      getProfileFeedbackForUser(userId),
-      getWithdrawnFeedbackBookTitlesForUserRaw(userId),
-    ]);
-    const withdrawn = withdrawnRows.map((row) => row.title);
-    // F41-F1：本轮实喂上界 = min(informative 实喂 max id, withdrawn 实喂 max id)。
-    // 用它替代旧的 `candidate`（来自 claim 的 pending_feedback_id）作为队列推进上界：
-    // pending 是由 enqueue 用 `max(id)` 记下的**全表**上界，而模型只吃到 LIMIT 50 以内的行，
-    // 两者对不上时旧代码会把第 51+ 行标成已消费。取 min 保证两类中 id 更大的未喂行都不被清。
-    const fedUpperBound = absorbedWatermarkFor(feedback, withdrawnRows);
-    // F41-F1：零行时 `fedUpperBound` 为 0，改用 candidate（pending 上界）——此时队列里没有
-    // 任何待喂行被漏掉，candidate 是这些行自己的高点，推进它不会跳过未喂的行。
-    const advanceTo = fedUpperBound > 0 ? fedUpperBound : candidate;
-    // 空画像起步（F15 ③）：没有 profile 行时先建占位行，拿到有效 updated_at 才能走 CAS 保存。
+  // 队列当前水位先读一次：它既是幂等恢复点（漏提交的重试从这里续），也是本轮查询的
+  // afterId 下界。用 absorbed_feedback_id 而不是 candidate——candidate 是 enqueue 记的
+  // **全表**上界，直接当查询下界会把未喂行整批跳过（那正是本任务修的漏行 bug）。
+  // F41-F1：absorbed 是 GREATEST 语义的单调水位，等于「到目前确已喂过/已宣认的全部反馈」。
+  // 读队列失败（连接抖动）不该比「没读到」更糟：退回 afterId=0（全量读），水位仍由
+  // 实喂上界决定，只是可能多喂一轮。lease 测试的零行替身里 getSql 会抛——吞掉它。
+  const queueBefore = await getProfileFeedbackQueueForUser(userId).catch(() => null);
+  const lastCommittedUpperBound = queueBefore?.absorbedFeedbackId ?? 0;
+  
+  let profile = await getProfileForUser(userId);
+  const [feedback, withdrawnRows] = await Promise.all([
+    getProfileFeedbackForUser(userId, lastCommittedUpperBound),
+    getWithdrawnFeedbackBookTitlesForUserRaw(userId),
+  ]);
+  const withdrawn = withdrawnRows.map((row) => row.title);
+  // F41-F1：本轮实喂上界 = max(informative 实喂 max id, withdrawn 实喂 max id)。
+  // 🔴 为什么改 min → max：informative 查询现在带 afterId（已喂上界）过滤，返回的是
+  // 「自已喂上界之后新出现/新改口的 informative 行」；withdrawn 查询不带 afterId，返回的是
+  // 「当前全部已撤回书目」。两者回答的是不同问题：
+  //   - 若 withdrawn max < informative max：撤回书目id 更小说明它们在 informative 之后
+  //     没有新动静，用 max 不会清掉它们（它们 id ≤ max，本来就在"已覆盖"范围内）。
+  //   - 若 withdrawn max > informative max：撤回是**更新的证据**，必须告知模型——max 让
+  //     水位跟着撤回走，informative 之后的撤回书目不会被 informative 的上界压掉。
+  // 用 max 之后：水位 = 「本轮喂过的所有行里最大的 id」，任何 id ≤ 它的 informative 行
+  // 都已进过输入（afterId 保证不漏），任何 id ≤ 它的撤回书目也已告知过（查询不带 afterId）。
+  const fedUpperBound = absorbedWatermarkFor(feedback, withdrawnRows);
+  // 空画像起步（F15 ③）：没有 profile 行时先建占位行，拿到有效 updated_at 才能走 CAS 保存。
+  if (!profile.updatedAt) {
+    await ensureProfileForUser(userId, write);
+    profile = await getProfileForUser(userId);
     if (!profile.updatedAt) {
-      await ensureProfileForUser(userId, write);
-      profile = await getProfileForUser(userId);
-      if (!profile.updatedAt) {
-        await markProfileFeedbackFailedForUser(userId, 'failed', 'ProfileRowMissing', write, leaseToken).catch(() => {});
-        return { status: 'failed', pendingFeedbackId: candidate };
-      }
+      await markProfileFeedbackFailedForUser(userId, 'failed', 'ProfileRowMissing', write, leaseToken).catch(() => {});
+      return { status: 'failed', pendingFeedbackId: candidate };
     }
-
-    // 既无有效反馈、也无撤回信号：这次 pending 对画像零影响，直接推进水位（不调模型）。
-    if (!feedback.length && !withdrawn.length) {
-      const completion = await markProfileFeedbackAbsorbedForUser(userId, advanceTo, 'unchanged', write, leaseToken);
-      if (!completion.matched) return { status: 'conflict', pendingFeedbackId: candidate };
-      const { pendingFeedbackId } = completion;
-      return { status: pendingFeedbackId == null ? 'unchanged' : 'pending', pendingFeedbackId };
-    }
-
+  }
+  
+  // 既无有效反馈、也无撤回信号：这次 pending 对画像零影响，直接推进水位（不调模型）。
+  // F41-F1：零行时 `fedUpperBound` 为 0，改用 candidate（pending 上界）。这里推进 candidate
+  // **不会跳过未喂行**：本轮查询带 afterId（= 已喂上界）仍返回空，说明「已喂上界之上没有
+  // 任何 informative 行」；而 withdrawn 查询不带 afterId 仍返回空，说明也没有撤回信号。
+  // 两者皆空 ⇒ 已喂上界之上没有任何可喂的东西，candidate 记的那些行已无需处理。
+  // （残留边界：撤回书目也有 LIMIT 50，单用户撤回书目超过 50 本时水位会被钉在第一批，
+  //  见报告「已知取舍」§9.6——不在本次改动范围内。）
+  const advanceTo = fedUpperBound > 0 ? fedUpperBound : candidate;
+  if (!feedback.length && !withdrawn.length) {
+    const completion = await markProfileFeedbackAbsorbedForUser(userId, advanceTo, 'unchanged', write, leaseToken);
+    if (!completion.matched) return { status: 'conflict', pendingFeedbackId: candidate };
+    const { pendingFeedbackId } = completion;
+    return { status: pendingFeedbackId == null ? 'unchanged' : 'pending', pendingFeedbackId };
+  }
+  
     const { content: raw } = await chatRobust(
       profileAbsorbSystem(),
       profileAbsorbUser(profile.content, JSON.stringify(feedbackForPrompt(feedback)), withdrawn),

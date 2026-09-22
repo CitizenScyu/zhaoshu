@@ -357,6 +357,11 @@ export function feedbackForUserQueries(sql: PersonalQuery, userId: number, raw: 
 // 抬到各自（或更高的）反馈 id，互不覆盖；吸收侧按用户一次性读取全部最新有效反馈，于是两条
 // 反馈必然被同一次吸收覆盖，不存在「一个 CAS 成功、另一个永久不被吸收」。
 //
+// 🔴 F41-F1 不变量（异步吸收水位不越过已喂行）三条腿之一：pending_feedback_id 记的是
+// **全表** max(id)，不是「已喂上界」。吸收侧因此绝不能拿它当推进候选——必须取本轮实喂
+// 上界（见 recentInformativeFeedbackForUserQuery 的 afterId + ORDER BY feedback_id ASC，
+// 以及 user-data.absorb-watermark-invariant.pglite.test.ts）。这里的 HAVING 只保证
+// 「不制造幻影高位」，不保证「高位 = 已喂」，两者别混。
 // HAVING max(id) > expectedVersion：只有本次真的追加了新反馈行才登记。route B 之后
 // 「定位不到 books」几乎不可达，但一旦 INSERT 写 0 行，max(id) 仍等于旧版本，HAVING 落空 →
 // 不产生队列事件（404 路径不留脏 pending）。
@@ -578,7 +583,7 @@ export function ensureProfileForUserQuery(sql: PersonalQuery, userId: number) {
 // 只按 user_id 过滤，书中身份经 books join 取当前拼写；绝不跨用户读取。
 const MAX_PROFILE_FEEDBACK = 50;
 
-export function recentInformativeFeedbackForUserQuery(sql: PersonalQuery, userId: number, limit = MAX_PROFILE_FEEDBACK) {
+export function recentInformativeFeedbackForUserQuery(sql: PersonalQuery, userId: number, limit = MAX_PROFILE_FEEDBACK, afterId = 0) {
   requireUserId(userId);
   // F41-F1：ORDER BY f.id ASC（旧实现按 title, author）。理由有二：
   //  ① **水位可安全推进**：id 升序取前 LIMIT 条 ⇒ 「id ≤ 返回集最大 id 的该类行必然都已
@@ -586,8 +591,14 @@ export function recentInformativeFeedbackForUserQuery(sql: PersonalQuery, userId
   //  ② 反馈是追加式历史，id 升序 = 最早写入的偏好先进画像，最坏情况也只是新偏好晚一轮，
   //     不会像 title 排序那样把某条反馈永久排在 50 名外。
   // 同书多条反馈可能跨批（本轮只喂 50 条里的一部分），可接受：下一轮会补上，且不会漏。
-  // feedback_id 进投影只用于「本轮实喂上界」计算（见 db.ts 的 fedFeedbackUpperBound /
-  // absorbedWatermarkFor），绝不进模型输入——提示词输入经 feedbackForPrompt 剥掉它。
+  // 🔴 F41-F1 不变量（异步吸收水位不越过已喂行）三条腿之一，改本函数前先读完 user-data.ts
+  // 顶部 absorb-watermark-invariant.pglite.test.ts 的说明：
+  //   (a) afterId（= 上一次的实喂上界）排除已喂过的行。没有它，每轮都重读同一批 LIMIT 50，
+  //       实喂上界永远停在第一批——第 51+ 行既进不了画像，队列也永不排空；
+  //   (b) ORDER BY feedback_id ASC ⇒ 未喂行的 id 必然大于返回集最大 id（水位可安全推进）；
+  //   (c) LIMIT 仍在——推进候选取 min(两类实喂 max)，不是 claim 返回的全表 pending 上界。
+  // feedback_id 进投影只用于「本轮实喂上界」计算（见 db.ts 的 absorbedWatermarkFor），
+  // 绝不进模型输入——提示词输入经 feedbackForPrompt 剥掉它。
   return sql`SELECT title, author, status, note, feedback_id FROM (
       SELECT DISTINCT ON (f.book_id) b.title, b.author, f.status, f.note, f.book_id, f.id AS feedback_id
       FROM feedback f JOIN books b ON b.id = f.book_id
@@ -595,6 +606,7 @@ export function recentInformativeFeedbackForUserQuery(sql: PersonalQuery, userId
       ORDER BY f.book_id, f.id DESC
     ) latest
     WHERE latest.status IN (${'done'}, ${'dropped'}) AND btrim(latest.note) <> ''
+      AND feedback_id > ${afterId}
     ORDER BY feedback_id ASC LIMIT ${limit}`;
 }
 
@@ -607,6 +619,9 @@ export function recentInformativeFeedbackForUserQuery(sql: PersonalQuery, userId
 // 与「不得作为既定事实保留」相悖。判定只看本人反馈，绝不跨用户。
 // F41-F1：ORDER BY latest.id ASC + 投影 feedback_id，与上面的 informative 查询同构——水位
 // 取两类实喂上界的 min，两类都必须能推出「id ≤ X 的全部都在返回集里」。
+// 撤回书目**不加 afterId 过滤**：它是「旧画像里可能残留的偏好清单」而不是待办队列——
+// 已撤回的书名每轮都要重新告知模型，直到用户重新给出 informative 反馈（那时该书自然
+// 不再是 withdrawn）。给它加 afterId 会让撤回信号只生效一轮，旧偏好又留在画像里。
 export function withdrawnFeedbackBookTitlesForUserQuery(sql: PersonalQuery, userId: number, limit = MAX_PROFILE_FEEDBACK) {
   requireUserId(userId);
   return sql`SELECT latest.title, latest.id AS feedback_id FROM (
