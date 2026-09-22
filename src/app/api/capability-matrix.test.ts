@@ -21,6 +21,10 @@ vi.mock('@/lib/shuyuan', () => ({
   getShuyuanStats: vi.fn().mockResolvedValue({ total: 0 }),
   disableShuyuanSource: vi.fn().mockResolvedValue(true),
   enableShuyuanSource: vi.fn().mockResolvedValue(true),
+  // route.ts 的 partialCode 拿它做 instanceof：mock 里少了这个导出，任何走到
+  // 502 catch 分支的调用都会 `x instanceof undefined` 抛 TypeError（本测试的
+  // refreshShuyuan 被 mock，不会真抛半挂错误，故这里只需一个可判定的类）。
+  ShuyuanRefreshPartialError: class extends Error { code = 'shuyuan_refresh_partial'; },
 }));
 vi.mock('@/lib/reader-server', async (original) => ({
   ...await original<typeof import('@/lib/reader-server')>(),
