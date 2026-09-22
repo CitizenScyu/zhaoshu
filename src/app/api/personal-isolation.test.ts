@@ -8,6 +8,17 @@ const mocks = vi.hoisted(() => ({
   getProfileForUser: vi.fn(), saveProfileForUser: vi.fn(), recordFeedbackForUser: vi.fn(), getFeedbackSnapshotForUser: vi.fn(),
   getProfileFeedbackForUser: vi.fn(), getWithdrawnFeedbackBookTitlesForUserRaw: vi.fn(),
   getMaxFeedbackIdForUser: vi.fn(), markProfileFeedbackAbsorbedForUser: vi.fn(),
+  // F41-F1：重建路径的两个纯函数（实喂上界 min 收敛 + 提示词投影）走真实现——
+  // 水位语义正是这些隔离用例顺带覆盖的东西，替身掉就等于把 route 里的调用点变成 undefined。
+  absorbedWatermarkFor: (actual: { feedbackId: number }[], withdrawn: { feedbackId: number }[]) => {
+    const bound = (rows: { feedbackId: number }[]) => rows.length ? Math.max(...rows.map((r) => r.feedbackId)) : null;
+    const a = bound(actual); const b = bound(withdrawn);
+    if (a == null) return b ?? 0;
+    if (b == null) return a;
+    return Math.min(a, b);
+  },
+  feedbackForPrompt: (rows: { title: string; author: string; status: string; note: string }[]) =>
+    rows.map(({ title, author, status, note }) => ({ title, author, status, note })),
   getExcludedBookTitlesForUser: vi.fn(), persistRecommendationsForUser: vi.fn(),
   chat: vi.fn(), verify: vi.fn(),
 }));
