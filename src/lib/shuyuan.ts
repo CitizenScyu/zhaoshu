@@ -186,6 +186,8 @@ export async function getReadingPool(signal: AbortSignal): Promise<ReadingPool> 
   // probeSnapshot 时用 canProbe（= validateSourceUrl 的运行时 host 门）过滤引擎源的探测态；门没刷，
   // 引擎源的 reachable 结论会被旧门丢弃、排序失真。engineHosts 读失败 ⇒ 不刷门（既有集合原样保留，
   // fail-closed）且本次降级 builtin-only。开关默认关时完全不碰门、连准入表都不查（零回归 + 省 DB 往返）。
+  // 这条「刷门必须排在 readMeta 之前」的不变量在**刷新路径**同样成立（且更严重）：refreshWithinBudget
+  // 的 readMeta 与探测入队都用 canProbe，冷启动不先刷门会把整批引擎源静默滤出探测队列，见该处注释。
   const engineOk = engineSourcesEnabled() ? await refreshEngineHostGate(signal) : false;
   const { states } = readMeta((await storedMeta(s, signal)).collections);
   const builtin = await builtinReadingSources(s, states, signal);
@@ -802,6 +804,15 @@ async function refreshWithinBudget(s: Sql, budget: RequestDeadline, signal: Abor
     SELECT source_url, last_error, source, disabled_at::text AS disabled_at FROM shuyuan_sources`, signal);
   const previous = new Map(previousRows.map((row) => [row.source_url, row]));
   const oldMeta = await storedMeta(s, signal);
+  // 🔴 host 门必须在 readMeta 解析快照（:380 的 canProbe）与探测入队（:797 的 canProbe）**之前**刷新——
+  // 与 getReadingPool:185-190「刷门要排在 readMeta 之前」是同一个坑的另一处实例。冷启动的 cron
+  // （每 6 小时一次、实例基本不复用）里 supportedHosts 初值只有 builtin：不先刷门，readMeta 会把
+  // 引擎源的既有探测态整批丢弃（reachable 退回 unprobed）、探测入队的 canProbe 会把 1200+ 引擎源
+  // 静默滤掉——reachable 长期偏低不是站点不可达，是压根没探。host 门读的是 source_admission
+  // **持久表**（前几轮准入批次写入，写路径与运行时门无关），故此处拿到的是「上一轮已准入的 host」，
+  // 不依赖本轮随后才发生的写库；读失败 fail-closed 保持既有集合（收窄到内建），退化为现状。
+  // 开关关时保持与今天逐字节相同（不查准入表、不加 DB 往返），与 getReadingPool:191 一致。
+  if (engineSourcesEnabled()) await refreshEngineHostGate(signal);
   const oldStates = readMeta(oldMeta.collections).states;
   const states = new Map<string, ProbeState>();
   const probes: string[] = [];
