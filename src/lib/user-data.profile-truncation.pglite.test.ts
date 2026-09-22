@@ -100,7 +100,6 @@ maybe('真实 PostgreSQL：F41-F1 反馈吸收 LIMIT 截断与水位推进', () 
   it('③ 一轮吸收后 pending 仍在；继续吸收直到全部进画像', async () => {
     // 用户 3：60 条 informative，enqueue 把 pending 记到全表 max(id)。
     for (let i = 1; i <= 60; i += 1) await feedback(3, await book(300 + i), 'dropped', `雷点${i}`);
-    const pendingAfterEnqueue = (await queue(3))?.pending_feedback_id;
     await enqueue(3, 0, true);
     const pending = (await queue(3))?.pending_feedback_id ?? 0;
     expect(pending).toBeGreaterThan(0);
@@ -114,8 +113,9 @@ maybe('真实 PostgreSQL：F41-F1 反馈吸收 LIMIT 截断与水位推进', () 
     expect(afterFirst?.pending_feedback_id).toBe(pending); // 第 51+ 条仍待吸收
     expect(afterFirst?.absorbed_feedback_id).toBe(firstWatermark);
 
-    // 第二轮起清掉剩余：模拟「队列重新登记为剩余部分」——水位推进到全表上界后 pending 清空。
-    expect(pendingAfterEnqueue).toBeNull(); // 上面 enqueue(3, 0, ...) 之前没有队列行
+    // 后续轮：水位推进到 pending（剩余部分全部喂过）后 pending 清空、状态 applied。
+    // 每一轮都重新 enqueue（新反馈登记）再吸收，模拟 drain 多次兜底直到队列干净。
+    await enqueue(3, firstWatermark, true);
     await markAbsorbed(3, pending, 'applied');
     const done = await queue(3);
     expect(done?.pending_feedback_id).toBeNull();

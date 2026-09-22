@@ -98,7 +98,7 @@ async function invoke(phase: LlmUsagePhase, signal?: AbortSignal) {
   // F15：feedback 相位现在由独立的画像吸收路由产生（反馈写路径不再同步调用模型）。
   const { POST } = await import('./profile/absorb/route');
   mocks.getProfileFeedbackQueueForUser.mockResolvedValue({ pendingFeedbackId: 7, absorbedFeedbackId: 0, status: 'pending', attempts: 0, lastError: '', updatedAt: '' });
-  mocks.getProfileFeedbackForUser.mockResolvedValue([{ title: '测试书', author: '作者', status: 'done', note: '喜欢严谨设定' }]);
+  mocks.getProfileFeedbackForUser.mockResolvedValue([{ title: '测试书', author: '作者', status: 'done', note: '喜欢严谨设定', feedbackId: 4 }]);
   return POST(request('profile/absorb', {}, signal));
 }
 
