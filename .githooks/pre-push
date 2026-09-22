@@ -23,11 +23,62 @@
 #
 # 测试那道门的 --no-file-parallelism 写在 package.json 的 test script 里（本机多 worker 会 OOM）。
 #   钩子委托给 `npm run check`，不在这里另起一条 vitest 命令，避免与 CI 跑出两套参数。
+#
+# 第五道（本地独有，2026-09-22 加）：NF_PGLITE_OPTIONAL 拒绝门。
+#   NF_PGLITE_OPTIONAL 是仓库里唯一允许跳过真库用例的开关，CI 里用
+#   `test -z "${NF_PGLITE_OPTIONAL:-}"` 硬断言不许设（ci.yml:64-65）。本地原本没有这一道，
+#   结果在设了该变量的 worktree 里跑 pre-push 会「四道门全绿但真库用例一个没跑」
+#   ——2026-09-17 真的这样逃逸过一次。本地补上同一句话，fail-closed。
+#
+# 第六道（本地独有，2026-09-22 加）：跨仓 worker 契约。
+#   scripts/check-worker-contract.mjs 校验本仓与兄弟仓 ../zhaoshu-books 的导出/fixture
+#   是否仍然匹配。CI 只 checkout 本仓，跑不了（也没法跑）；这道只能放本地，push 前挡住
+#   「改了本仓的契约方却没同步兄弟仓」。兄弟仓不存在时跳过（不拒绝）——不是所有 worktree
+#   都有 zhaoshu-books 在旁边。
+#
+# 复核通道：`sh .githooks/pre-push contracts-only` 只跑第六道，不跑四道门。
+#   给主会话异厂复审/诊断用——真实 push（git push 触发，$1=remote 名）不会进这条路径。
+
+# 第六道抽成函数：contracts-only 通道和正常路径共用同一份逻辑，避免两处漂移。
+run_contracts() {
+  if [ -d ../zhaoshu-books ]; then
+    echo "▶ pre-push：检测到兄弟仓 ../zhaoshu-books，跑跨仓 worker 契约（test:contracts）"
+    if ! npm run test:contracts; then
+      echo "" >&2
+      echo "✖ pre-push：跨仓 worker 契约未通过，本次 push 已中止。" >&2
+      echo "  本仓与 ../zhaoshu-books 的导出或 fixture 对不上了；要么改回本仓的契约方，" >&2
+      echo "  要么先去兄弟仓同步。修完再推；确有紧急情况用 git push --no-verify 跳过，" >&2
+      echo "  并在回报里写明跳过了跨仓契约。" >&2
+      return 1
+    fi
+    echo "✔ pre-push：跨仓 worker 契约通过。"
+  else
+    echo "○ pre-push：跳过跨仓契约——本地无 ../zhaoshu-books（CI 同样因不 checkout 兄弟仓而跳过）。"
+  fi
+  return 0
+}
+
+if [ "${1:-}" = "contracts-only" ]; then
+  # 复核通道：只跑跨仓契约这一道，不跑四道门（真实 push 的 $1 是 remote 名，不是这个）。
+  run_contracts
+  exit $?
+fi
 
 if [ ! -d node_modules ]; then
   echo "✖ pre-push：当前 worktree 没有 node_modules，四道门跑不起来。" >&2
   echo "  请先在本目录执行 npm ci。" >&2
   echo "  （紧急情况可用 git push --no-verify 跳过，但请说明原因。）" >&2
+  exit 1
+fi
+
+# 第五道：本地不许跳过真库用例（与 ci.yml 的断言同源）。
+if [ -n "${NF_PGLITE_OPTIONAL:-}" ]; then
+  echo "✖ pre-push：检测到 NF_PGLITE_OPTIONAL 已设置（值长度 ${#NF_PGLITE_OPTIONAL}），本次 push 已中止。" >&2
+  echo "  NF_PGLITE_OPTIONAL 是仓库里唯一允许跳过 PGlite 真库用例的开关。" >&2
+  echo "  本地 pre-push 不允许开着它推送——会出现「四道门全绿但真库用例一个没跑」的假通过" >&2
+  echo "  （2026-09-17 已真实逃逸过一次）。CI 里同样硬断言不许设（ci.yml）。" >&2
+  echo "  请先 unset NF_PGLITE_OPTIONAL 再推；确有紧急情况用 git push --no-verify 跳过，" >&2
+  echo "  并在回报里写明跳过了真库用例。" >&2
   exit 1
 fi
 
@@ -41,4 +92,9 @@ if ! npm run check; then
   exit 1
 fi
 
-echo "✔ pre-push：四道门全过。"
+# 第六道：跨仓 worker 契约（CI 只 checkout 本仓，跑不了这一道）。
+if ! run_contracts; then
+  exit 1
+fi
+
+echo "✔ pre-push：四道门 + 跨仓契约全过。"
