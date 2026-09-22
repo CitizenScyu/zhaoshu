@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { ensureSchema, getMaxFeedbackIdForUser, getProfileFeedbackForUser, getProfileForUser, getWithdrawnFeedbackBookTitlesForUser, markProfileFeedbackAbsorbedUncheckedForUser, saveProfileForUser } from '@/lib/db';
+import { ensureSchema, getProfileFeedbackForUser, getProfileForUser, getWithdrawnFeedbackBookTitlesForUserRaw, markProfileFeedbackAbsorbedUncheckedForUser, saveProfileForUser, absorbedWatermarkFor, feedbackForPrompt } from '@/lib/db';
 import { chatRobust, configuredTotalTimeoutMs, LlmError, MAX_PROFILE_LENGTH, validateProfileContent } from '@/lib/llm';
 import { recordUsageAfterResponse } from '@/lib/record-llm-usage';
 import {
@@ -113,11 +113,16 @@ export async function POST(req: NextRequest) {
     // withdrawn：曾 informative、最新已撤回的书名——旧画像里可能还留着这些偏好，
     // 必须把「已撤回」这一信号显式喂给模型，否则它会按「仍被证据支持」把旧结论留下。
     // F15：重建也走「与反馈吸收同一份最新反馈」的路径，因此重建成功后要把队列水位推到
-    // 「本次重建已看到的反馈上界」，避免同一批反馈在异步吸收里再跑一次。
-    // 上界必须在读取反馈**之前**取：重建期间新写入的反馈 id 会更高，不会被错误清掉。
-    const absorbedUpTo = resetFromSeeds ? 0 : await access.run(() => getMaxFeedbackIdForUser(userId));
+    // 「本次重建已喂进去的反馈上界」，避免同一批反馈在异步吸收里再跑一次。
+    // F41-F1：上界必须是**实喂上界**（两类里 id 更大的未喂行不得被清），不能是
+    // getMaxFeedbackIdForUser——反馈查询有 LIMIT 50，全表 max id 几乎必然大于本次真喂
+    // 进去的行。用它推水位会把第 51+ 本书标成已消费，而它们从未进过模型输入。
     const feedback = resetFromSeeds ? [] : await access.run(() => getProfileFeedbackForUser(userId));
-    const withdrawn = resetFromSeeds ? [] : await access.run(() => getWithdrawnFeedbackBookTitlesForUser(userId));
+    const withdrawnTitles = resetFromSeeds
+      ? []
+      : await access.run(() => getWithdrawnFeedbackBookTitlesForUserRaw(userId));
+    const withdrawn = withdrawnTitles.map((row) => row.title);
+    const absorbedUpTo = resetFromSeeds ? 0 : absorbedWatermarkFor(feedback, withdrawnTitles);
     const budgetMs = Math.min(access.deadline.modelBudgetMs(MODEL_CEILING_MS), configuredTotalTimeoutMs());
     if (budgetMs <= 0) throw new DeadlineExceededError(MODEL_ROUTE_INTERNAL_BUDGET_MS);
     return access.sse(async (send) => {
@@ -126,7 +131,7 @@ export async function POST(req: NextRequest) {
         resetFromSeeds ? profileSystem() : profileRebuildSystem(),
         resetFromSeeds
           ? profileFromSeedsUser(seedsJson)
-          : profileRebuildUser(seedsJson, profile.content, JSON.stringify(feedback, null, 2), withdrawn),
+          : profileRebuildUser(seedsJson, profile.content, JSON.stringify(feedbackForPrompt(feedback), null, 2), withdrawn),
         { temperature: 0.4, signal: access.signal, onUsage: recordUsageAfterResponse('profile'),
           totalTimeoutMs: budgetMs, onToken: (delta) => send({ type: 'token', content: delta }) },
       ));
@@ -140,7 +145,8 @@ export async function POST(req: NextRequest) {
         return;
       }
       // 重建已把最新有效反馈并入画像 → 推进队列水位（best-effort：失败只会让同一批反馈
-      // 被异步吸收重跑一次，幂等，不影响重建结果）。候选上界在读取反馈前取。
+      // 被异步吸收重跑一次，幂等，不影响重建结果）。F41-F1：absorbedUpTo 是实喂上界
+      // （两类的 min），在读取反馈后立即算出——重建期间新写入的反馈 id 更高，不会被清。
       if (absorbedUpTo > 0) {
         await access.commit((write) => markProfileFeedbackAbsorbedUncheckedForUser(
           userId, absorbedUpTo, content === profile.content ? 'unchanged' : 'applied', write,

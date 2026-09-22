@@ -576,14 +576,22 @@ const MAX_PROFILE_FEEDBACK = 50;
 
 export function recentInformativeFeedbackForUserQuery(sql: PersonalQuery, userId: number, limit = MAX_PROFILE_FEEDBACK) {
   requireUserId(userId);
-  return sql`SELECT title, author, status, note FROM (
-      SELECT DISTINCT ON (f.book_id) b.title, b.author, f.status, f.note, f.book_id
+  // F41-F1：ORDER BY f.id ASC（旧实现按 title, author）。理由有二：
+  //  ① **水位可安全推进**：id 升序取前 LIMIT 条 ⇒ 「id ≤ 返回集最大 id 的该类行必然都已
+  //     在这 LIMIT 条里」。按 title 排序时未喂行的 id 散布任意位置，无法从返回值推出上界。
+  //  ② 反馈是追加式历史，id 升序 = 最早写入的偏好先进画像，最坏情况也只是新偏好晚一轮，
+  //     不会像 title 排序那样把某条反馈永久排在 50 名外。
+  // 同书多条反馈可能跨批（本轮只喂 50 条里的一部分），可接受：下一轮会补上，且不会漏。
+  // feedback_id 进投影只用于「本轮实喂上界」计算（见 db.ts 的 ProfileFeedbackBatch），
+  // 绝不进模型输入——提示词只序列化 title/author/status/note。
+  return sql`SELECT title, author, status, note, feedback_id FROM (
+      SELECT DISTINCT ON (f.book_id) b.title, b.author, f.status, f.note, f.book_id, f.id AS feedback_id
       FROM feedback f JOIN books b ON b.id = f.book_id
       WHERE f.user_id = ${userId}
       ORDER BY f.book_id, f.id DESC
     ) latest
     WHERE latest.status IN (${'done'}, ${'dropped'}) AND btrim(latest.note) <> ''
-    ORDER BY title, author LIMIT ${limit}`;
+    ORDER BY feedback_id ASC LIMIT ${limit}`;
 }
 
 // F04 撤回标记：曾有过 informative 反馈行（done/dropped + note 非空）、但**最新一行已非
@@ -593,10 +601,12 @@ export function recentInformativeFeedbackForUserQuery(sql: PersonalQuery, userId
 //
 // 只回传**书名**（不回传旧 note 原文）：喂旧 note 会把要删除的偏好又当证据送进输入，
 // 与「不得作为既定事实保留」相悖。判定只看本人反馈，绝不跨用户。
+// F41-F1：ORDER BY latest.id ASC + 投影 feedback_id，与上面的 informative 查询同构——水位
+// 取两类实喂上界的 min，两类都必须能推出「id ≤ X 的全部都在返回集里」。
 export function withdrawnFeedbackBookTitlesForUserQuery(sql: PersonalQuery, userId: number, limit = MAX_PROFILE_FEEDBACK) {
   requireUserId(userId);
-  return sql`SELECT latest.title FROM (
-      SELECT DISTINCT ON (f.book_id) b.title, f.status, f.note, f.book_id
+  return sql`SELECT latest.title, latest.id AS feedback_id FROM (
+      SELECT DISTINCT ON (f.book_id) b.title, f.status, f.note, f.book_id, f.id
       FROM feedback f JOIN books b ON b.id = f.book_id
       WHERE f.user_id = ${userId}
       ORDER BY f.book_id, f.id DESC
@@ -607,7 +617,7 @@ export function withdrawnFeedbackBookTitlesForUserQuery(sql: PersonalQuery, user
         WHERE h.user_id = ${userId} AND h.book_id = latest.book_id
           AND h.status IN (${'done'}, ${'dropped'}) AND btrim(h.note) <> ''
       )
-    ORDER BY latest.title LIMIT ${limit}`;
+    ORDER BY latest.id ASC LIMIT ${limit}`;
 }
 
 export function feedbackSnapshotForUserQuery(sql: PersonalQuery, userId: number, title: string, author: string) {

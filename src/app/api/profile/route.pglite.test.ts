@@ -22,17 +22,18 @@ vi.mock('@/lib/db', () => ({
   saveProfileForUser: mocks.saveProfileForUser,
   getFeedbackSnapshotForUser: mocks.getFeedbackSnapshotForUser,
   // 真 SQL：路由拿到的就是查询结果，而不是手写 fixture。
+  // F41-F1：反馈行带 feedback_id（实喂上界计算用），提示词投影在 db.ts 里剥掉。
   getProfileFeedbackForUser: async (userId: number) => {
     const statement = recentInformativeFeedbackForUserQuery(mocks.getSql() as never, userId) as unknown as { text: string; params: unknown[] };
-    return (await pg.query(statement.text, statement.params)).rows;
+    return (await pg.query(statement.text, statement.params)).rows as { title: string; author: string; status: string; note: string; feedback_id: number }[];
   },
-  getWithdrawnFeedbackBookTitlesForUser: async (userId: number) => {
+  // F41-F1：撤回书目返回带 feedbackId 的行（水位实喂上界要用）。
+  getWithdrawnFeedbackBookTitlesForUserRaw: async (userId: number) => {
     const statement = withdrawnFeedbackBookTitlesForUserQuery(mocks.getSql() as never, userId) as unknown as { text: string; params: unknown[] };
-    return (await pg.query(statement.text, statement.params)).rows.map((row) => row.title as string);
+    return (await pg.query(statement.text, statement.params)).rows as { title: string; feedback_id: number }[];
   },
-  // F15：重建成功后推进反馈吸收水位——真 SQL，走真表。
-  getMaxFeedbackIdForUser: async (userId: number) =>
-    ((await pg.query('SELECT COALESCE(max(id), 0)::int AS max_id FROM feedback WHERE user_id = $1', [userId])).rows[0] as { max_id: number }).max_id,
+  getWithdrawnFeedbackBookTitlesForUser: async (userId: number) =>
+    (await withdrawnTitles(userId)).map((row) => row.title as string),
   markProfileFeedbackAbsorbedForUser: async (userId: number, candidate: number) => {
     await pg.query(`UPDATE profile_feedback_queue
       SET absorbed_feedback_id = GREATEST(absorbed_feedback_id, $2),
@@ -50,10 +51,18 @@ vi.mock('@/lib/llm', async (importOriginal) => ({
 type SqlTag = (parts: TemplateStringsArray, ...values: unknown[]) => { text: string; params: unknown[] };
 type Statement = { text: string; params: unknown[] };
 
+let pg: PGliteLike;
+// mocks.getSql() 返回的 tag（beforeEach 里被设成 pg 的事务 tag）；模块级闭包持有它，
+// 让 vi.mock 工厂里的两个撤回书目入口共用同一个查询执行器。
+const pgTag = () => mocks.getSql();
+// F41-F1：撤回书目查询的共享执行器（raw 行 + 只透书名两个入口都用它）。
+const withdrawnTitles = async (userId: number) => {
+  const statement = withdrawnFeedbackBookTitlesForUserQuery(pgTag() as never, userId) as unknown as Statement;
+  return (await pg.query(statement.text, statement.params)).rows as { title: string; feedback_id: number }[];
+};
+
 const PGliteCtor = await loadPGlite();
 const maybe = PGliteCtor ? describe : describe.skip;
-
-let pg: PGliteLike;
 
 maybe('真实 PostgreSQL：F04 撤回信号经过真实路由（P1-2）', () => {
   let imported: typeof import('./route');
