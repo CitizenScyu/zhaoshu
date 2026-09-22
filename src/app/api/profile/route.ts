@@ -122,7 +122,9 @@ export async function POST(req: NextRequest) {
       ? []
       : await access.run(() => getWithdrawnFeedbackBookTitlesForUserRaw(userId));
     const withdrawn = withdrawnTitles.map((row) => row.title);
-    const absorbedUpTo = resetFromSeeds ? 0 : absorbedWatermarkFor(feedback, withdrawnTitles);
+    // 重建路径两类都是全量读：informative 只有 LIMIT 50 之内被真正喂给模型，
+    // withdrawn 超过 50 的部分没有被告知 ⇒ 取 min，别把未覆盖的部分标成已吸收。
+    const absorbedUpTo = resetFromSeeds ? 0 : absorbedWatermarkFor(feedback, withdrawnTitles, 'min');
     const budgetMs = Math.min(access.deadline.modelBudgetMs(MODEL_CEILING_MS), configuredTotalTimeoutMs());
     if (budgetMs <= 0) throw new DeadlineExceededError(MODEL_ROUTE_INTERNAL_BUDGET_MS);
     return access.sse(async (send) => {

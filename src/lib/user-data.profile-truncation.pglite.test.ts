@@ -55,8 +55,8 @@ maybe('真实 PostgreSQL：F41-F1 反馈吸收 LIMIT 截断与水位推进', () 
   }) as unknown as SqlTag;
 
   const run = async (statement: Statement) => (await pg.query(statement.text, statement.params)).rows;
-  const informativeFor = async (userId: number) =>
-    run(recentInformativeFeedbackForUserQuery(baseTag as never, userId) as unknown as Statement);
+  const informativeFor = async (userId: number, afterId = 0) =>
+    run(recentInformativeFeedbackForUserQuery(baseTag as never, userId, 50, afterId) as unknown as Statement);
   const withdrawnFor = async (userId: number) =>
     run(withdrawnFeedbackBookTitlesForUserQuery(baseTag as never, userId) as unknown as Statement);
   const enqueue = (userId: number, expectedVersion: number, queued: boolean) =>
@@ -143,22 +143,26 @@ maybe('真实 PostgreSQL：F41-F1 反馈吸收 LIMIT 截断与水位推进', () 
     expect(afterFirst?.pending_feedback_id).toBe(pending); // 第 51+ 条仍待吸收
     expect(afterFirst?.absorbed_feedback_id).toBe(firstWatermark);
 
-    // 后续轮：水位推进到 pending（剩余部分全部喂过）后 pending 清空、状态 applied。
-    // 每一轮都重新 enqueue（新反馈登记）再吸收，模拟 drain 多次兜底直到队列干净。
+    // 后续轮：afterId = 上一轮水位 ⇒ 查询返回剩下的 10 条，水位推进到它们之上；
+    // pending（全表上界）到这时才被清空。这正是异步路径最终排空队列的机制。
+    const secondFed = (await informativeFor(3, firstWatermark)) as { feedbackId: number }[];
+    expect(secondFed).toHaveLength(10); // 正好是第 51..60 条，没有被漏掉
+    const secondWatermark = absorbedWatermarkFor(secondFed, []);
+    expect(secondWatermark).toBe(pending);
     await enqueue(3, firstWatermark, true);
-    await markAbsorbed(3, pending, 'applied');
+    await markAbsorbed(3, secondWatermark, 'applied');
     const done = await queue(3);
     expect(done?.pending_feedback_id).toBeNull();
     expect(done?.status).toBe('applied');
   });
 
   it('④ 变异锚点：把水位换成全表 max(id) 会让用例 ③ 的第一轮断言变红', async () => {
-    // 这条测试本身就是锚点说明：absorbedWatermarkFor(firstFed, []) === max(firstFed)，
-    // 而 pending 是 max(整个 feedback 表)。若实现改成 getMaxFeedbackIdForUser，
-    // await markAbsorbed(3, pending, ...) 的候选会是 pending 本身，第一轮的
+    // 锚点说明：第一轮实喂上界 = max(前 50 条的 feedback id)，而 pending 是 max(整个 feedback 表)。
+    // 若实现改成 getMaxFeedbackIdForUser，第一轮 markAbsorbed 的候选就是 pending 本身，
     // `expect(afterFirst?.pending_feedback_id).toBe(pending)` 立刻失败（pending 被清）。
     const allMax = ((await pg.query('SELECT COALESCE(max(id),0)::int AS m FROM feedback WHERE user_id = 3', [])).rows[0] as { m: number }).m;
-    const fedOnly = ((await informativeFor(3)) as { feedbackId: number }[]);
-    expect(absorbedWatermarkFor(fedOnly, [])).toBeLessThan(allMax);
+    // 第一轮（afterId=0）只喂 50 条 ⇒ 实喂上界 < 全表上界。这就是「水位不能取全表 max」的证据。
+    const firstBatch = ((await informativeFor(3, 0)) as { feedbackId: number }[]);
+    expect(absorbedWatermarkFor(firstBatch, [])).toBeLessThan(allMax);
   });
 });
