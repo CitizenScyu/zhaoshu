@@ -104,7 +104,9 @@ maybe('真实 PostgreSQL：profile_feedback_queue（F15 待吸收水位）', () 
     expect(row?.pending_feedback_id).toBe(idB); // 两条并发反馈都还在待吸收集合里
     expect(row?.status).toBe('pending');
     // 一次「按用户」的读取就覆盖两条反馈——这是「合并吸收」的数据前提。
-    expect(await informative(1)).toEqual(['并发审查乙', '并发审查甲']);
+    // F41-F1：informative 改按 feedback id 升序（放弃 title 排序，理由见 user-data.ts 注释），
+    // 因此先写入的「并发审查甲」排在前。这条断言的顺序本身是 id ASC 的可见证据。
+    expect(await informative(1)).toEqual(['并发审查甲', '并发审查乙']);
   });
 
   it('成功吸收按候选水位推进；吸收期间新到的更高水位不会被清掉，状态退回 pending', async () => {

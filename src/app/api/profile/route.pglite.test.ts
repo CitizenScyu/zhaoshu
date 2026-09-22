@@ -27,13 +27,12 @@ vi.mock('@/lib/db', () => ({
     const statement = recentInformativeFeedbackForUserQuery(mocks.getSql() as never, userId) as unknown as { text: string; params: unknown[] };
     return (await pg.query(statement.text, statement.params)).rows as { title: string; author: string; status: string; note: string; feedback_id: number }[];
   },
-  // F41-F1：撤回书目返回带 feedbackId 的行（水位实喂上界要用）。
+  // F41-F1：撤回书目查询行的 feedback_id 是实喂上界用的内部字段；
+  // 路由的提示词输入经 db.ts 的 feedbackForPrompt 剥掉它，模型只看到书名。
   getWithdrawnFeedbackBookTitlesForUserRaw: async (userId: number) => {
     const statement = withdrawnFeedbackBookTitlesForUserQuery(mocks.getSql() as never, userId) as unknown as { text: string; params: unknown[] };
     return (await pg.query(statement.text, statement.params)).rows as { title: string; feedback_id: number }[];
   },
-  getWithdrawnFeedbackBookTitlesForUser: async (userId: number) =>
-    (await withdrawnTitles(userId)).map((row) => row.title as string),
   markProfileFeedbackAbsorbedForUser: async (userId: number, candidate: number) => {
     await pg.query(`UPDATE profile_feedback_queue
       SET absorbed_feedback_id = GREATEST(absorbed_feedback_id, $2),
@@ -42,6 +41,17 @@ vi.mock('@/lib/db', () => ({
       WHERE user_id = $1`, [userId, candidate]);
     return null;
   },
+  // F41-F1：这两个纯函数（实喂上界 min 收敛 + 提示词投影）走真实现——水位语义正是本测试
+  // 要验的东西，替身掉就等于没测。缺了它们 route 里会拿到 undefined 而 500。
+  absorbedWatermarkFor: (actual: { feedbackId: number }[], withdrawn: { feedbackId: number }[]) => {
+    const bound = (rows: { feedbackId: number }[]) => rows.length ? Math.max(...rows.map((r) => r.feedbackId)) : null;
+    const a = bound(actual); const b = bound(withdrawn);
+    if (a == null) return b ?? 0;
+    if (b == null) return a;
+    return Math.min(a, b);
+  },
+  feedbackForPrompt: (rows: { title: string; author: string; status: string; note: string }[]) =>
+    rows.map(({ title, author, status, note }) => ({ title, author, status, note })),
 }));
 vi.mock('@/lib/llm', async (importOriginal) => ({
   ...await importOriginal<typeof import('@/lib/llm')>(),
@@ -52,14 +62,6 @@ type SqlTag = (parts: TemplateStringsArray, ...values: unknown[]) => { text: str
 type Statement = { text: string; params: unknown[] };
 
 let pg: PGliteLike;
-// mocks.getSql() 返回的 tag（beforeEach 里被设成 pg 的事务 tag）；模块级闭包持有它，
-// 让 vi.mock 工厂里的两个撤回书目入口共用同一个查询执行器。
-const pgTag = () => mocks.getSql();
-// F41-F1：撤回书目查询的共享执行器（raw 行 + 只透书名两个入口都用它）。
-const withdrawnTitles = async (userId: number) => {
-  const statement = withdrawnFeedbackBookTitlesForUserQuery(pgTag() as never, userId) as unknown as Statement;
-  return (await pg.query(statement.text, statement.params)).rows as { title: string; feedback_id: number }[];
-};
 
 const PGliteCtor = await loadPGlite();
 const maybe = PGliteCtor ? describe : describe.skip;

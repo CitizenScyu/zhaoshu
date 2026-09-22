@@ -97,16 +97,19 @@ maybe('真实 PostgreSQL：F41-F1 反馈吸收 LIMIT 截断与水位推进', () 
     // 用户 2 的 informative 只有 5 条（id 小），撤回书目的 id 在其后（更大）。
     for (let i = 1; i <= 5; i += 1) await feedback(2, await book(100 + i), 'done', `萌点${i}`);
     const infoIds = ((await informativeFor(2)) as { feedback_id: number }[]).map((row) => row.feedback_id);
+    expect(infoIds.length).toBeGreaterThan(0);
     const infoMax = Math.max(...infoIds);
-    // 撤回书目：先是 informative，又改口。id 落在 informative 之后。
+    // 撤回书目：先是 informative，又改口（最新行不再 informative）。id 落在 informative 之后。
     const withdrawnBook = await book(200);
     await feedback(2, withdrawnBook, 'dropped', '旧雷点');
+    await feedback(2, withdrawnBook, 'reading', '');
     const withdrawnRows = (await withdrawnFor(2)) as { title: string; feedback_id: number }[];
+    expect(withdrawnRows.length).toBeGreaterThan(0); // 撤回书目非空
     const withdrawnMax = Math.max(...withdrawnRows.map((row) => row.feedback_id));
     expect(withdrawnMax).toBeGreaterThan(infoMax); // 前提：撤回确实在 informative 之后
     expect(absorbedWatermarkFor(
-      (await informativeFor(2)) as { feedbackId: number }[],
-      withdrawnRows,
+      ((await informativeFor(2)) as { feedback_id: number }[]).map((row) => ({ feedbackId: row.feedback_id })),
+      withdrawnRows.map((row) => ({ feedbackId: row.feedback_id })),
     )).toBe(infoMax);
   });
 

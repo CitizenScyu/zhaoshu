@@ -99,6 +99,7 @@ describe('POST /api/profile/absorb (F15 state machine)', () => {
     const prompt = mocks.chatRobust.mock.calls[0][1] as string;
     expect(prompt).toContain('讨厌机械降神');
     expect(prompt).toContain('喜欢严谨设定');
+    // 实喂上界 = min(informative max=6, withdrawn max=0行→不设限) = 6。
     expect(mocks.completeProfileFeedbackForUser).toHaveBeenCalledWith(1, 6, 'applied', '合并后的画像', 'v1', expect.any(Function), expect.any(String));
     expect(mocks.markProfileFeedbackAbsorbedForUser).not.toHaveBeenCalled();
   });
@@ -115,7 +116,7 @@ describe('POST /api/profile/absorb (F15 state machine)', () => {
     // 下一次机会：同步 pending 仍在，模型恢复 → 最终 applied，水位推进。
     const replay = await POST(request('POST'));
     expect(await replay.json()).toMatchObject({ status: 'applied', pendingFeedbackId: null });
-    expect(mocks.completeProfileFeedbackForUser).toHaveBeenLastCalledWith(1, 6, 'applied', '合并后的画像', 'v1', expect.any(Function), expect.any(String));
+    expect(mocks.completeProfileFeedbackForUser).toHaveBeenLastCalledWith(1, 4, 'applied', '合并后的画像', 'v1', expect.any(Function), expect.any(String));
   });
 
   it('reports unchanged when the model returns the profile byte-for-byte, still advancing the watermark', async () => {
@@ -125,7 +126,7 @@ describe('POST /api/profile/absorb (F15 state machine)', () => {
     const res = await POST(request('POST'));
 
     expect(await res.json()).toMatchObject({ status: 'unchanged', pendingFeedbackId: null });
-    expect(mocks.completeProfileFeedbackForUser).toHaveBeenCalledWith(1, 6, 'unchanged', '旧画像', 'v1', expect.any(Function), expect.any(String));
+    expect(mocks.completeProfileFeedbackForUser).toHaveBeenCalledWith(1, 4, 'unchanged', '旧画像', 'v1', expect.any(Function), expect.any(String));
   });
 
   it('reports conflict and keeps pending when another writer wins the profile CAS', async () => {
@@ -161,7 +162,7 @@ describe('POST /api/profile/absorb (F15 state machine)', () => {
 
     expect(await res.json()).toMatchObject({ status: 'applied' });
     expect(mocks.ensureProfileForUser).toHaveBeenCalledWith(1, expect.any(Function));
-    expect(mocks.completeProfileFeedbackForUser).toHaveBeenCalledWith(1, 6, 'applied', '合并后的画像', 'v0', expect.any(Function), expect.any(String));
+    expect(mocks.completeProfileFeedbackForUser).toHaveBeenCalledWith(1, 4, 'applied', '合并后的画像', 'v0', expect.any(Function), expect.any(String));
   });
 
   it('feeds withdrawn titles to the model so old preferences are not revived', async () => {
