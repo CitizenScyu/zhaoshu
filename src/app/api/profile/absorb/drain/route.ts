@@ -5,6 +5,7 @@ import { authJson } from '@/lib/auth-http';
 import { drainableProfileFeedbackUsers, ensureSchema, getSql } from '@/lib/db';
 import { absorbPendingProfileFeedback } from '@/lib/profile-absorption';
 import { configuredTotalTimeoutMs } from '@/lib/llm';
+import { recordCronSuccess } from '@/lib/source-health';
 import { MODEL_ROUTE_INTERNAL_BUDGET_MS, createDeadline, raceDeadline, type RequestDeadline } from '@/lib/deadline';
 import type { PersonalBatch, PersonalWriter } from '@/lib/personal-write';
 
@@ -81,6 +82,10 @@ export async function GET(req: NextRequest) {
   const deadline = createDeadline(MODEL_ROUTE_INTERNAL_BUDGET_MS);
   try {
     const { results, stoppedForBudget } = await drainProfileFeedbackQueue(deadline);
+    // S5-1：留一次「本轮 drain 跑完」的时间戳，供匿名健康端点 /api/health/sources 判活。
+    // 队列为空时 drain 不写任何行，「本轮跑没跑」在库里原本无迹可寻。注意：这里记的是
+    // 路由未 5xx（cron 成功），与逐用户吸收是否成功无关（后者由 results/stoppedForBudget 表达）。
+    await recordCronSuccess('drain');
     return authJson({ ok: true, drained: results.length, results, stoppedForBudget });
   } catch (e) {
     console.error('profile absorb drain failed', e instanceof Error ? { name: e.name } : e);

@@ -257,5 +257,14 @@ export async function initializeBusinessSchema(s: Sql) {
       ADD COLUMN IF NOT EXISTS lease_expires_at timestamptz,
       ADD COLUMN IF NOT EXISTS fail_count int NOT NULL DEFAULT 0,
       ADD COLUMN IF NOT EXISTS next_eligible_at timestamptz`,
+    // audit-41 S5-1：三条 Vercel cron 失败时零告警通道。shuyuan 用 shuyuan_meta.refreshed_at
+    // 作「上次成功时间」（刷新成功才推进）；reclaim / drain 是无状态 UPDATE/扫描，库里不落任何
+    // 成功时间戳，故单独记一行。没有这行表，健康端点的 crons.*.lastSuccessAt 永远是 null。
+    // 同样走运行时幂等 DDL（同 profile_feedback_queue），不进 migrations/ 的版本化契约。
+    tx`
+    CREATE TABLE IF NOT EXISTS cron_health (
+      name text PRIMARY KEY,
+      last_success_at timestamptz NOT NULL DEFAULT now()
+    )`,
   ]);
 }
