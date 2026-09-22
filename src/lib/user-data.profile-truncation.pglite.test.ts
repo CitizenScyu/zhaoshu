@@ -40,6 +40,19 @@ maybe('真实 PostgreSQL：F41-F1 反馈吸收 LIMIT 截断与水位推进', () 
     });
     return result;
   }) as SqlTag;
+  // initializeBusinessSchema 走 transaction 批量 DDL（与既有 pglite 测试同款适配）。
+  const schemaTag = Object.assign(baseTag, {
+    transaction: async (builder: (tx: SqlTag) => Statement[]) => {
+      const statements = builder(baseTag);
+      await pg.exec('BEGIN');
+      try {
+        const results = [];
+        for (const statement of statements) results.push((await pg.query(statement.text, statement.params)).rows);
+        await pg.exec('COMMIT');
+        return results;
+      } catch (error) { await pg.exec('ROLLBACK').catch(() => {}); throw error; }
+    },
+  }) as unknown as SqlTag;
 
   const run = async (statement: Statement) => (await pg.query(statement.text, statement.params)).rows;
   const informativeFor = async (userId: number) =>
@@ -63,7 +76,7 @@ maybe('真实 PostgreSQL：F41-F1 反馈吸收 LIMIT 截断与水位推进', () 
   beforeAll(async () => {
     pg = new PGliteCtor!();
     await pg.exec('CREATE TABLE users (id int PRIMARY KEY); INSERT INTO users SELECT generate_series(1, 5)');
-    await initializeBusinessSchema(baseTag as never);
+    await initializeBusinessSchema(schemaTag as never);
   }, 60_000);
 
   it('① LIMIT 50 截断真实存在：60 条 informative 只回 50 条，且按 feedback id 升序', async () => {

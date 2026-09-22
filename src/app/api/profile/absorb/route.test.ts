@@ -60,7 +60,7 @@ beforeEach(() => {
   mocks.getProfileFeedbackQueueForUser.mockResolvedValue(pendingQueue);
   mocks.getProfileForUser.mockResolvedValue({ seeds: [], content: '旧画像', updatedAt: 'v1' });
   mocks.getProfileFeedbackForUser.mockResolvedValue([{ title: '书甲', author: '作者', status: 'dropped', note: '讨厌机械降神', feedbackId: 4 }]);
-  mocks.getWithdrawnFeedbackBookTitlesForUser.mockResolvedValue([]);
+  mocks.getWithdrawnFeedbackBookTitlesForUserRaw.mockResolvedValue([]);
   mocks.chatRobust.mockResolvedValue({ content: '合并后的画像' });
   mocks.completeProfileFeedbackForUser.mockResolvedValue({ outcome: 'matched', updatedAt: 'v2', pendingFeedbackId: null });
   mocks.markProfileFeedbackAbsorbedForUser.mockResolvedValue({ matched: true, pendingFeedbackId: null });

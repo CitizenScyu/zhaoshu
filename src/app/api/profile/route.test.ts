@@ -390,7 +390,7 @@ describe('/api/profile writes', () => {
     mocks.getProfileFeedbackForUser.mockResolvedValue([
       { title: '反馈书', author: '作者', status: 'dropped', note: '讨厌机械降神' },
     ]);
-    mocks.getWithdrawnFeedbackBookTitlesForUser.mockResolvedValue([]);
+    mocks.getWithdrawnFeedbackBookTitlesForUserRaw.mockResolvedValue([]);
     await consumeSSE(await POST(request()));
     const input = mocks.chatRobust.mock.calls[0][1] as string;
     expect(input).toContain('反馈书');

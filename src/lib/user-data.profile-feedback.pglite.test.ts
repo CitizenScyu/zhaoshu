@@ -43,9 +43,12 @@ maybe('真实 PostgreSQL：recentInformativeFeedbackForUserQuery（F04 最新有
     },
   }) as unknown as SqlTag;
 
+  // F41-F1：投影多了 feedback_id（内部水位用，不进模型输入）。这里剥掉它，
+  // 让形状断言继续钉「喂给模型的就是 title/author/status/note 四列」。
   const rowsFor = async (userId: number) => {
     const statement = recentInformativeFeedbackForUserQuery(tag as never, userId) as unknown as { text: string; params: unknown[] };
-    return (await pg.query(statement.text, statement.params)).rows;
+    return ((await pg.query(statement.text, statement.params)).rows as { title: string; author: string; status: string; note: string; feedback_id: number }[])
+      .map(({ title, author, status, note }) => ({ title, author, status, note }));
   };
   const withdrawnFor = async (userId: number) => {
     const statement = withdrawnFeedbackBookTitlesForUserQuery(tag as never, userId) as unknown as { text: string; params: unknown[] };
