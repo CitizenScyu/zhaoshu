@@ -80,30 +80,34 @@ export async function absorbPendingProfileFeedback(deps: {
     return { status: 'failed', pendingFeedbackId: candidate };
   }
 
-  let profile = await getProfileForUser(userId);
-  const [feedback, withdrawn] = await Promise.all([
-    getProfileFeedbackForUser(userId),
-    getWithdrawnFeedbackBookTitlesForUser(userId),
-  ]);
-  // 空画像起步（F15 ③）：没有 profile 行时先建占位行，拿到有效 updated_at 才能走 CAS 保存。
-  if (!profile.updatedAt) {
-    await ensureProfileForUser(userId, write);
-    profile = await getProfileForUser(userId);
-    if (!profile.updatedAt) {
-      await markProfileFeedbackFailedForUser(userId, 'failed', 'ProfileRowMissing', write, leaseToken).catch(() => {});
-      return { status: 'failed', pendingFeedbackId: candidate };
-    }
-  }
-
-  // 既无有效反馈、也无撤回信号：这次 pending 对画像零影响，直接推进水位（不调模型）。
-  if (!feedback.length && !withdrawn.length) {
-    const completion = await markProfileFeedbackAbsorbedForUser(userId, candidate, 'unchanged', write, leaseToken);
-    if (!completion.matched) return { status: 'conflict', pendingFeedbackId: candidate };
-    const { pendingFeedbackId } = completion;
-    return { status: pendingFeedbackId == null ? 'unchanged' : 'pending', pendingFeedbackId };
-  }
-
+  // F2 附带修：claim 之后的读库/补行都在 try 内——若在 try 外抛错（如 getProfileForUser
+  // 连接失败、ensureProfileForUser 违约束），租约已领走却不走 markFailed，漏记 attempts、
+  // 不设退避、租约要等 8 分钟自然过期，期间该用户对浏览器与 drain 都呈现 busy。挪进 try
+  // 后统一走既有 catch 的 markFailed（清租约 + 退避 + attempts），语义与模型阶段失败一致。
   try {
+    let profile = await getProfileForUser(userId);
+    const [feedback, withdrawn] = await Promise.all([
+      getProfileFeedbackForUser(userId),
+      getWithdrawnFeedbackBookTitlesForUser(userId),
+    ]);
+    // 空画像起步（F15 ③）：没有 profile 行时先建占位行，拿到有效 updated_at 才能走 CAS 保存。
+    if (!profile.updatedAt) {
+      await ensureProfileForUser(userId, write);
+      profile = await getProfileForUser(userId);
+      if (!profile.updatedAt) {
+        await markProfileFeedbackFailedForUser(userId, 'failed', 'ProfileRowMissing', write, leaseToken).catch(() => {});
+        return { status: 'failed', pendingFeedbackId: candidate };
+      }
+    }
+
+    // 既无有效反馈、也无撤回信号：这次 pending 对画像零影响，直接推进水位（不调模型）。
+    if (!feedback.length && !withdrawn.length) {
+      const completion = await markProfileFeedbackAbsorbedForUser(userId, candidate, 'unchanged', write, leaseToken);
+      if (!completion.matched) return { status: 'conflict', pendingFeedbackId: candidate };
+      const { pendingFeedbackId } = completion;
+      return { status: pendingFeedbackId == null ? 'unchanged' : 'pending', pendingFeedbackId };
+    }
+
     const { content: raw } = await chatRobust(
       profileAbsorbSystem(),
       profileAbsorbUser(profile.content, JSON.stringify(feedback), withdrawn),

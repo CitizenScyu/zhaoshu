@@ -428,9 +428,13 @@ export function claimProfileFeedbackForUserQuery(sql: PersonalQuery, userId: num
 // drain 扫描：找出所有「有 pending 且可领取」的用户（与上面的单用户谓词同一来源）。
 // 只选 id 不带行锁：真正的排他仍由后续对每个用户的 claim UPDATE 决定——扫描与领取之间
 // 若浏览器先领走，claim 落 0 行，drain 跳过该用户即可，不产生双跑。
+// F2 公平排序：updated_at ASC（最久未被动过的行优先），固定 user_id ASC 会让最低 id 的
+// 慢性失败用户每天独占 drain 窗口、其后所有 pending 用户永无兜底。updated_at 被
+// enqueue/成功/失败三类写入触碰：慢性失败用户每次 markFailed 都把自己推到队尾，自然
+// 轮转。零 schema 变更——updated_at 是建表即有的 NOT NULL 列；user_id 只作同刻破平。
 export function drainableProfileFeedbackUsersQuery(sql: PersonalQuery, limit: number) {
   const eligible = leaseEligiblePredicate(sql);
-  return sql`SELECT user_id FROM profile_feedback_queue WHERE ${eligible} ORDER BY user_id LIMIT ${limit}`;
+  return sql`SELECT user_id FROM profile_feedback_queue WHERE ${eligible} ORDER BY updated_at ASC, user_id ASC LIMIT ${limit}`;
 }
 
 // 一次吸收成功（applied/unchanged）后的水位推进：absorbed 取 GREATEST，pending 只在
