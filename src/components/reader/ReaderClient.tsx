@@ -106,7 +106,7 @@ function ReaderSession({ session, from }: Props) {
   const {
     settings, reading, activePart, loading, flowing, failure, percent, notice, storageFailed, focused,
     scroller, article, heading, onScroll, updateSettings, setFocusMode, navigate: requestNavigation,
-    extend, retry, markScrollIntent, setSection, loadConfirmedBook, switchedBookUrl, onSwitchCommitted,
+    extend, retry, markScrollIntent, setSection, loadConfirmedBook, registerSwitchCommitted,
   } = useReader(session, apiFetch, user?.id ?? 0);
   const [panel, setPanel] = useState<'directory' | 'settings' | 'sources' | null>(null);
   const restoreButton = useRef<HTMLButtonElement>(null);
@@ -203,7 +203,9 @@ function ReaderSession({ session, from }: Props) {
   // M3 复审 P1-3:回调注册放进 effect(ref 写入不得在渲染期做,SSR 会抛)。
   // loadIndex 由 useReader 的 effect 里 queueMicrotask 触发,微排在所有 effect 之后,
   // 因此此处的注册必然先于任何一次 loadIndex 成功回调,时序安全。
-  useEffect(() => { onSwitchCommitted.current = commitSwitchedBookUrl; }, [commitSwitchedBookUrl]);
+  // 注册函数是 hook 内部维护 ref 的稳定句柄(不是裸 ref),避免 react-hooks 的
+  // React Compiler 规则判「修改 hook 返回值」error。
+  useEffect(() => { registerSwitchCommitted(commitSwitchedBookUrl); }, [registerSwitchCommitted, commitSwitchedBookUrl]);
 
   function toggleFocus(focusControl = false) {
     const next = !focused;

@@ -92,14 +92,19 @@ describe('首屏返回的阅读状态', () => {
     expect(apiFetch).not.toHaveBeenCalled();
   });
 
-  // M3 复审 P1-3:换源提交的回调句柄必须随 hook 暴露,且初始为 null(还没注册)。
-  // ReaderClient 用它在「目录加载成功后」才把 book_url 写进 URL;句柄缺失会让
-  // onSwitchCommitted.current?.(...) 永远空转,book_url 永不落 URL(刷新丢源)。
-  it('暴露 onSwitchCommitted ref 与 switchedBookUrl,初始未注册', () => {
+  // M3 复审 P1-3:换源提交的回调句柄必须随 hook 暴露,且初始未注册(没人注册时
+  // loadIndex 的 onSwitchCommitted.current?.(...) 空转,book_url 永不落 URL,刷新丢源)。
+  // 暴露的是「注册函数」而非裸 ref:直接写 hook 返回的 ref 会被 react-hooks 的
+  // React Compiler 规则判 error(hook 返回值不可变)。
+  it('暴露 registerSwitchCommitted 注册函数,初始未注册', () => {
     const { reader } = readInitial();
-    expect(reader.onSwitchCommitted).toHaveProperty('current');
-    expect(reader.onSwitchCommitted.current).toBeNull();
-    expect(typeof reader.switchedBookUrl).toBe('function');
+    expect(typeof reader.registerSwitchCommitted).toBe('function');
+    // 初始未注册:没人注册时 loadIndex 的回调空转,book_url 永不落 URL(刷新丢源)。
+    // 注册/清除都不该抛(ReaderClient 在 effect 里注册,卸载时清)。
+    expect(() => {
+      reader.registerSwitchCommitted(() => {});
+      reader.registerSwitchCommitted(null);
+    }).not.toThrow();
   });
 
   // M3 复审 P1-3:switchedBookUrl 从 indexUrl 的 book_url 参数取值;下载会话

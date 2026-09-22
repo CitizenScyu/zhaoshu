@@ -39,7 +39,6 @@ vi.mock('./useReader', async (importOriginal) => {
 });
 
 import ReaderClient from './ReaderClient';
-import { useReader } from './useReader';
 
 const part = (
   chapterIndex: number, partIndex: number, title: string, text: string,

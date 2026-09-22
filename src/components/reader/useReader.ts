@@ -92,7 +92,13 @@ export function useReader(session: ReadingSession, apiFetch: ApiFetch, userId: n
   // 迁移 notice 文案由 loadIndex 消费(设计 §5),用 ref 传递避免额外状态。
   const migrationNotice = useRef<string | null>(null);
   // M3 复审 P1-3:目录加载成功后,回调 UI 层把 book_url 持久化进 URL(失败不写)。
+  // ref 留在 hook 内部维护:直接把它交出去让 UI 层写 .current 会被
+  // react-hooks(lint)的 React Compiler 规则判 error(hook 返回值不可变)。
   const onSwitchCommitted = useRef<((bookUrl: string | undefined) => void) | null>(null);
+  const registerSwitchCommitted = useCallback(
+    (handler: ((bookUrl: string | undefined) => void) | null) => { onSwitchCommitted.current = handler; },
+    [],
+  );
 
   const [cache] = useState(() => new ReaderPartCache(async (index, position, signal) => {
     const part = await responseJson<ReaderPart>(await apiFetch(readerChapterUrl(index, position), { signal, cache: 'no-store' }));
@@ -507,8 +513,12 @@ export function useReader(session: ReadingSession, apiFetch: ApiFetch, userId: n
     settings, reading, activePart, loading, flowing, failure, percent, notice, storageFailed, focused,
     scroller, article, heading, onScroll, updateSettings, setFocusMode, navigate, extend, retry,
     markScrollIntent, loadConfirmedBook, switchedBookUrl,
-    /** M3 复审 P1-3:注册「目录加载成功」回调,供 UI 层在成功后才写 book_url 进 URL。 */
-    onSwitchCommitted,
+    /**
+     * M3 复审 P1-3:注册「目录加载成功」回调,供 UI 层在成功后才写 book_url 进 URL。
+     * 返回的是注册函数(稳定引用),不是裸 ref —— 直接写 hook 返回的 ref 会被
+     * react-hooks 的 React Compiler 规则判 error(hook 返回值不可变)。
+     */
+    registerSwitchCommitted,
     setSection: (part: ReaderPart, element: HTMLElement | null) => {
       if (element) sections.current.set(partKey(part), element); else sections.current.delete(partKey(part));
     },
