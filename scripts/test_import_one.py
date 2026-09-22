@@ -58,10 +58,11 @@ def validated(rec):
 class FakeDb:
     """Neon HTTP SQL 的内存替身；键 = (lower(title), lower(author))。"""
 
-    def __init__(self):
+    def __init__(self, document=None):
         self.rows = {}          # key -> {'id','title','author','labels','chars_labeled'}
         self.calls = []
         self.fail_on_insert = 0
+        self.document = document        # 写语句自定义返回值（默认 None=走真实 RETURNING 形状）
         self._next_id = 1
 
     def seed(self, title, author, **extra):
@@ -75,7 +76,9 @@ class FakeDb:
         query = query.strip()
         self.calls.append((query, params))
         if query.startswith('WITH target'):
-            return {}
+            # 补账语句同样返回 RETURNING 形状(download_tasks.id)，写完才叫写完
+            return {'rows': [{'labeled_book_id': 42, 'created_task_count': 1,
+                              'created_task_id': 100}]}
         if query.startswith('SELECT'):
             title = params[0].lower()
             return {'rows': [dict(row) for row in self.rows.values()
@@ -90,7 +93,35 @@ class FakeDb:
         row.update({'title': params[0], 'author': params[1], 'labels': params[7],
                     'chars_labeled': params[6]})
         self.rows[key] = row
-        return {}
+        if self.document is not None:
+            return self.document
+        # 与 Neon /sql 的真实响应同形：body 是 {"rows": [...]}，写语句的 RETURNING 在
+        # rows[0] 里。返回 {}（空 body 的等价物）正是旧代码的"当成功"路径，现在必须被拒。
+        return {'rows': [{'labeled_book_id': row['id'], 'created_task_count': 1,
+                          'created_task_id': 100}]}
+
+
+class FakeSqlResponse:
+    """urlopen 返回的响应替身：2xx，读出来就是固定 body。"""
+
+    def __init__(self, body):
+        self._body = body.encode('utf-8')
+
+    def read(self):
+        return self._body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+def fake_urlopen(body):
+    """替换 import_one.urllib.request.urlopen：# 不联网——永远 2xx 且 body 固定。"""
+    def _open(request, timeout=None):
+        return FakeSqlResponse(body)
+    return _open
 
 
 class TempDirCase(unittest.TestCase):
@@ -424,6 +455,110 @@ class TestAutoImporter(TempDirCase):
         self.assertNotIn(':p@', text)
         self.assertIn('***', text)
 
+    # ---- 写路径必须自证（P1：2xx 空 body / 无 RETURNING 不得当成导入成功）----
+    def _isolated_marker_path(self):
+        """占位：各用例已用独立 TemporaryDirectory 隔离 marker 文件。"""
+        return None
+
+    def test_write_requires_statement_self_evidence(self):
+        """UPSERT 不按 RETURNING 自证 → 'failed' + 不落标记（旧代码一律 'imported'）。"""
+        for label, document in (
+            ('空 body', {}),
+            ('无 rows', {'rows': []}),
+            ('首行无 labeled_book_id', {'rows': [{'created_task_count': 1}]}),
+            ('id 为 null', {'rows': [{'labeled_book_id': None}]}),
+            ('id 为 0', {'rows': [{'labeled_book_id': 0}]}),
+            ('id 为负', {'rows': [{'labeled_book_id': -3}]}),
+        ):
+            with self.subTest(case=label):
+                with tempfile.TemporaryDirectory() as tmp:
+                    self.dir = Path(tmp)
+                    db = FakeDb(document)
+                    importer = self.importer(db)
+                    self.assertEqual(importer.import_record(record()), 'failed')
+                    self.assertFalse(importer.marker_path.exists())
+                    # 失败可重试：恢复自证后同一本仍能导入成功
+                    db.document = None
+                    self.assertEqual(importer.import_record(record()), 'imported')
+
+    def test_write_accepts_string_id_from_raw_text_output(self):
+        """Neon-Raw-Text-Output: true 下 id 是字符串，同样算自证通过。"""
+        db = FakeDb({'rows': [{'labeled_book_id': '42'}]})
+        importer = self.importer(db)
+        self.assertEqual(importer.import_record(record()), 'imported')
+
+    def test_http_sql_rejects_empty_body_instead_of_returning_empty_dict(self):
+        """2xx 但 body 为空：必须抛，而不是 return {}（旧代码走后者 → 假成功）。"""
+        with mock.patch.object(import_one.urllib.request, 'urlopen',
+                               side_effect=fake_urlopen('')):
+            importer = import_one.AutoImporter('postgresql://u:p@db.example/neondb',
+                                               directory=self.dir, log=lambda *_: None)
+            with self.assertRaises(RuntimeError):
+                importer._http_sql('SELECT 1', [])
+            importer.import_record(record())
+        text = (self.dir / import_one.FAIL_LOG_NAME).read_text(encoding='utf-8')
+        self.assertIn('响应体为空', text)
+        self.assertFalse(importer.marker_path.exists())
+
+    def test_http_sql_rejects_html_and_non_object_and_error_payloads(self):
+        for label, body, needle in (
+            ('HTML 错误页', '<html>502 Bad Gateway</html>', '响应不是 JSON'),
+            ('JSON 数组', '[1,2,3]', '响应不是 JSON 对象'),
+            ('JSON 字符串', '"ok"', '响应不是 JSON 对象'),
+            ('200 带 error 字段', '{"error": {"message": "blocked"}}', 'error 字段'),
+        ):
+            with self.subTest(case=label):
+                with mock.patch.object(import_one.urllib.request, 'urlopen',
+                                       side_effect=fake_urlopen(body)):
+                    importer = import_one.AutoImporter(
+                        'postgresql://u:p@db.example/neondb',
+                        directory=self.dir, log=lambda *_: None)
+                    with self.assertRaises(RuntimeError):
+                        importer._http_sql('SELECT 1', [])
+
+    def test_http_sql_accepts_row_document(self):
+        """正常形状照旧通过，不许因为收紧把合法响应误伤。"""
+        with mock.patch.object(import_one.urllib.request, 'urlopen',
+                               side_effect=fake_urlopen('{"rows": [{"labeled_book_id": 5}]}')):
+            importer = import_one.AutoImporter('postgresql://u:p@db.example/neondb',
+                                               directory=self.dir, log=lambda *_: None)
+            self.assertEqual(importer._http_sql('SELECT 1', []),
+                             {'rows': [{'labeled_book_id': 5}]})
+
+    def test_error_message_never_echoes_the_response_body(self):
+        """响应原文可能含站点内容，异常消息只给原因类别（防敏感内容进 fail log）。"""
+        with mock.patch.object(import_one.urllib.request, 'urlopen',
+                               side_effect=fake_urlopen('<html>secret-page</html>')):
+            importer = import_one.AutoImporter('postgresql://u:p@db.example/neondb',
+                                               directory=self.dir, log=lambda *_: None)
+            importer.import_record(record())
+        text = (self.dir / import_one.FAIL_LOG_NAME).read_text(encoding='utf-8')
+        self.assertNotIn('secret-page', text)
+        self.assertIn('响应不是 JSON', text)
+
+    def test_duplicate_still_repairs_without_returning_shape_checks(self):
+        """补账路径只做 SELECT 自证，RETURNING 形状不影响它（与 TS ensureSystemTask 一致）：
+        补账语句返回空 rows（没新插任务）时仍然是 duplicate，不得被当成写失败。"""
+
+        class FakeDbNoRows(FakeDb):
+            def __call__(self, query, params):
+                if query.strip().startswith('WITH target'):
+                    self.calls.append((query, params))
+                    return {'rows': []}          # 没新插下载任务：正常幂等
+                if query.strip().startswith('SELECT'):
+                    self.calls.append((query, params))
+                    # 身份查（FIND_LABELED_BOOK_SQL）给出已入库的 id；前置孪生拦截
+                    # 返回同作者行也不算孪生（同身份），不会被拦。
+                    return {'rows': [{'id': 7, 'author': '作者甲'}]}
+                return super().__call__(query, params)
+
+        db = FakeDbNoRows()
+        importer = self.importer(db)
+        importer._imported.add(record()['url'])
+        self.assertEqual(importer.import_record(record()), 'duplicate')
+        targets = [c for c in db.calls if c[0].strip().startswith('WITH target')]
+        self.assertTrue(targets)
+
     def test_twin_row_skips_write_without_creating_a_second_row(self):
         db = FakeDb()
         # 存量非不动点行：作者是数字实体写法，解码后与本条作者同身份
@@ -611,9 +746,10 @@ class TestCli(unittest.TestCase):
                 if saved is not None:
                     os.environ['DATABASE_URL'] = saved
 
-    def test_database_failure_does_not_raise_and_logs(self):
-        # 真实 CLI 路径 + 数据库不可达：必须 exit 0（打标侧靠这个不被打断），
-        # 且失败落在 labels-import-fail.log（不联网：urlopen 被替换）。
+    def test_database_failure_does_not_raise_and_exits_nonzero(self):
+        # 真实 CLI 路径 + 数据库不可达：打标侧不被打断（import_record 不抛，标签继续写），
+        # 但 CLI 自身必须 exit 1，让调用方/运维看得见「这批一条都没导进去」。
+        # 失败落在 labels-import-fail.log（不联网：urlopen 被替换）。
         with tempfile.TemporaryDirectory() as tmp:
             path = self._fixture(tmp)
             os.environ['DATABASE_URL'] = 'postgresql://u:p@db.example/neondb'
@@ -621,7 +757,7 @@ class TestCli(unittest.TestCase):
                 with mock.patch.object(import_one.urllib.request, 'urlopen',
                                        side_effect=OSError('connection refused')):
                     self.assertEqual(import_one.main(
-                        ['--file', str(path), '--url', BASE['url']]), 0)
+                        ['--file', str(path), '--url', BASE['url']]), 1)
             finally:
                 os.environ.pop('DATABASE_URL', None)
             log_text = (Path(tmp) / import_one.FAIL_LOG_NAME).read_text(encoding='utf-8')

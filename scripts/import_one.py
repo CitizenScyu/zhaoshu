@@ -26,6 +26,24 @@ phoenix（打标机）刻意不装 PG 驱动（见 labeler.py「入库层」注�
 labels 与系统任务通过同一 SQL 原子写入，与 importer-enqueue.ts 对齐。
 重复标记只补账，不刷新 labeled_at；显式重导与 TS 一样刷新 labeled_at。
 
+## 写入必须自证（否则「标记说写了、库里没有」）
+
+`/sql` 返回 2xx 不等于写成功：空 body / HTML 错误页 / 代理劫持页 / 截断响应都可能
+是 2xx。这些响应一旦被当成功，`_mark_imported` 就会写下 labels-imported.jsonl 标记，
+该书从此**静默缺席书库**（补录按标记跳过，除非人工删标记）。所以：
+
+- `_http_sql` 只接受「2xx + 可解析 JSON 对象 + 无 error 字段」，其余一律抛
+  （官方 @neondatabase/serverless 对 2xx 同样无条件 `.json()`，即 2xx 必是 JSON）；
+- `_write` 按 labeled_book_id 校验 UPSERT 语句确实返回了 labeled_book_id
+  （与 importer-enqueue.ts 的 `positiveIntOrNull(result.labeled_book_id)` 同判据），
+  拿不到就抛 → import_record 记 'failed' → 不落标记 → 下轮 retry_backlog 自动重试。
+  补账路径（build_ensure_system_task）**不套用**该校验：TS 侧 ensureSystemTask 同样
+  不用 labeled_book_id 当门，只靠 SELECT id 与 created_task_id/count 判结果。
+
+**抛的范围**：只有 `_http_sql` / `_write` / 补账这几条写路径会抛；对外入口
+`import_record` 仍吞掉一切异常改写 fail log 并返回 'failed'，`labeler.py` 那层还有
+try/except 兜底——所以「写路径抛」不会变成「打标循环崩」，而是变成「记 failed」。
+
 ## 失败不阻断打标
 
 本模块所有对外入口都不抛异常：失败写 labels-import-fail.log（每行带时间戳，供巡检），
@@ -40,6 +58,8 @@ validate_record 与 normalize_author 的注释（宁缺勿滥，绝不凭空造�
   python3 import_one.py --dry-run --file labels.jsonl
   python3 import_one.py --file labels.jsonl --limit 500     # 补齐未导入的（新→旧）
   python3 import_one.py --file labels.jsonl --url https://book15.net/books/details3168.html
+
+退出码（与 import_labels.mjs 同口径）：0=无失败；1=有 failed 条目。
 """
 import argparse
 import html
@@ -480,6 +500,27 @@ def _env_flag(value, default=True):
     return str(value).strip().lower() not in ('0', 'false', 'no', 'off', 'disable', 'disabled')
 
 
+def _written_book_id(document, action):
+    """UPSERT 语句的自证：结果首行必须给出有效的 labeled_book_id。
+
+    `/sql` 的 2xx body 是 `{"rows": [...]}`；本仓两条写语句都以
+    `SELECT (SELECT id FROM ...) AS labeled_book_id` 收尾，所以「写成功」必须体现为
+    首行有该字段且是正整数。拿不到 = 语句没按预期返回（Neon-Raw-Text-Output 下是
+    字符串，故走 float 再判整数）。判据与 importer-enqueue.ts 的
+    `positiveIntOrNull` 同义：正的安全整数。缺它即抛，让 import_record 记 'failed'，
+    而不是让「标记说写了、库里没有」成立。"""
+    rows = document.get('rows') if isinstance(document, dict) else None
+    row = rows[0] if isinstance(rows, list) and rows else {}
+    book_id = row.get('labeled_book_id') if isinstance(row, dict) else None
+    try:
+        number = float(book_id)
+    except (TypeError, ValueError):
+        number = None
+    if number is None or not float(number).is_integer() or number < 1:
+        raise RuntimeError(f'{action} 未返回 labeled_book_id（语句未自证写入）')
+    return int(number)
+
+
 class AutoImporter:
     """打标产物的即时导入器。所有方法都不抛异常（幂等 + 失败不阻断）。"""
 
@@ -593,19 +634,41 @@ class AutoImporter:
             except Exception:
                 pass
             raise RuntimeError(f'HTTP {error.code}: {detail}') from None
+        # 2xx 不等于写成功：空 body / HTML 错误页 / 代理劫持页 / 截断响应都可能是 2xx，
+        # 而旧代码把它们一律 `return {}` 吞掉 → `_write` 看上去"导成功" → `_mark_imported`
+        # 落标记 → 该书永久静默缺席书库（补录按标记跳过）。判据：2xx 必须是可解析的
+        # JSON 对象且不带 error 字段。依据见文件头「写入必须自证」。异常消息只给原因
+        # 类别，**不带响应原文**（响应里可能含站点内容，不进日志）。
         if not payload.strip():
-            return {}
+            raise RuntimeError('Neon /sql 返回 2xx 但响应体为空')
         try:
-            return json.loads(payload)
+            document = json.loads(payload)
         except json.JSONDecodeError:
-            return {}
+            raise RuntimeError('Neon /sql 返回 2xx 但响应不是 JSON') from None
+        if not isinstance(document, dict):
+            raise RuntimeError('Neon /sql 返回 2xx 但响应不是 JSON 对象')
+        if document.get('error'):
+            raise RuntimeError('Neon /sql 返回 2xx 但响应带 error 字段')
+        return document
 
     def _rows(self, query, params):
         payload = self._sql_exec(query, params)
         return payload.get('rows') or []
 
+    def _exec_write(self, query, params, action):
+        """执行 labels UPSERT，并要求语句按 RETURNING 自证确实写了行。
+
+        自证判据与 src/lib/importer-enqueue.ts 的
+        `positiveIntOrNull(result.labeled_book_id)`（importLabelWithSystemTask 路径）
+        逐字同义：拿不到正的安全整数就抛 → import_record 记 'failed' → 不落标记。
+        **刻意不对补账路径（build_ensure_system_task）做同一校验**：TS 侧
+        ensureSystemTask 只用 SELECT 得到的 id + created_task_id/count 判结果，同样
+        不拿 labeled_book_id 当门；照搬它可少一处「SQL 形状一变就全体记 failed」的误伤。"""
+        return _written_book_id(self._sql_exec(query, params), action)
+
     def _write(self, record):
-        """前置孪生拦截 + UPSERT。返回 'imported' 或 'twin-skipped'。"""
+        """前置孪生拦截 + UPSERT。返回 'imported' 或 'twin-skipped'。
+        写入未获语句自证时抛异常（→ import_record 记 'failed'，不落标记）。"""
         rows = self._rows('SELECT id, author FROM labeled_books WHERE lower(title) = lower($1)',
                           [record['title']])
         twin = find_twin(rows, record['author'])
@@ -614,7 +677,7 @@ class AutoImporter:
                      f'跳过写入（避免凭空多一行）')
             return 'twin-skipped'
         query, params = build_upsert(record)
-        self._sql_exec(query, params)
+        self._exec_write(query, params, '标签 UPSERT')
         return 'imported'
 
     # ---- 对外入口（永不抛异常）----
@@ -761,7 +824,10 @@ def main(argv=None):
         status = importer.import_record(rec)
         counts[status] = counts.get(status, 0) + 1
     print('导入结果: ' + ' / '.join(f'{k} {v}' for k, v in sorted(counts.items())))
-    return 0
+    # 有 failed 即非 0：旧代码无条件 return 0，全批失败也"成功退出"，调用方无法察觉
+    # 「标记说写了、库里没有」。判据与 import_labels.mjs 的 `failed>0 ? 1 : 0` 同口径。
+    # review / skipped / twin-skipped 是**刻意不导入**（留给完整导入器/人工），不计失败。
+    return 1 if counts.get('failed', 0) > 0 else 0
 
 
 if __name__ == '__main__':

@@ -35,7 +35,8 @@ class Wiring(TempDirCase):
             calls.append(q)
             if 'WITH upserted' in q and len(calls) == 2:
                 raise RuntimeError('synthetic task constraint failure')
-            return {'rows': []}
+            return {'rows': [{'labeled_book_id': 1, 'created_task_count': 1,
+                              'created_task_id': 1}]}
         importer = self.importer(execute)
         self.assertEqual(importer.import_record(record()), 'failed')
         self.assertFalse(importer.marker_path.exists())
