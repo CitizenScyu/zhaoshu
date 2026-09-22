@@ -34,6 +34,10 @@ export function refreshSupportedHosts(hosts: Iterable<string>): void {
 }
 
 // 同站备用 host：输入集合内的 host 时返回另一个，否则 null（无备用可换）。
+// 这里的 length 守卫不是「常量恒为 2 所以永假」的装饰：SUPPORTED_SOURCE_HOSTS 是
+// as const 二元组（apex ↔ www 同站别名），但「返回另一个」的 `1 - index` 只在集合恰为
+// 二元组时有唯一解——集合扩到 3 个 host 时 `SUPPORTED_SOURCE_HOSTS[-1]` 会静默给出
+// undefined。守卫把「集合形态不支持换位」归一成「无备用」这一个安全结果。
 export function alternateSourceHost(hostname: string): SupportedSourceHost | null {
   if (SUPPORTED_SOURCE_HOSTS.length !== 2) return null;
   const index = SUPPORTED_SOURCE_HOSTS.indexOf(hostname as SupportedSourceHost);
