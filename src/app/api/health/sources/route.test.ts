@@ -18,6 +18,10 @@ vi.mock('@/lib/shuyuan', async (original) => ({
   getShuyuanPoolHealth: mocks.getShuyuanPoolHealth,
 }));
 
+// 池陈旧用例的年龄直接由阈值常数推导，不在 fixture 里复述数字——复述一次就是下一个
+// 「注释与代码相反」（本仓高发）。阈值本身由 source-health.test.ts / vercel-cron.test.ts 钉住。
+import { SHUYUAN_REFRESH_ALERT_HOURS } from '@/lib/source-health';
+
 import { GET } from './route';
 
 const NOW = Date.parse('2026-09-23T12:00:00.000Z');
@@ -107,13 +111,14 @@ describe('GET /api/health/sources (S5-1 匿名健康端点)', () => {
     expect(raw).toMatch(/^\{"ok":true,"refreshedAtAgeHours":3\.2,/);
   });
 
-  it('池陈旧（> 8h）⇒ ok:false，但字段仍在（200，不 500）', async () => {
-    mocks.getShuyuanPoolHealth.mockResolvedValue(pool(9.5));
+  it(`池陈旧（> ${SHUYUAN_REFRESH_ALERT_HOURS}h 阈值）⇒ ok:false，但字段仍在（200，不 500）`, async () => {
+    const stale = SHUYUAN_REFRESH_ALERT_HOURS + 1;
+    mocks.getShuyuanPoolHealth.mockResolvedValue(pool(stale));
     const res = await GET();
     expect(res.status).toBe(200);
     const payload = await body(res);
     expect(payload.ok).toBe(false);
-    expect(payload.refreshedAtAgeHours).toBe(9.5);
+    expect(payload.refreshedAtAgeHours).toBe(stale);
   });
 
   it('从未刷新（null）⇒ ok:false 且 shuyuan.lastSuccessAt 为 null', async () => {
