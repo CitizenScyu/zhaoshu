@@ -80,24 +80,31 @@ maybe('真实 PostgreSQL：F41-F1 反馈吸收 LIMIT 截断与水位推进', () 
   }, 60_000);
 
   it('① LIMIT 50 截断真实存在：60 条 informative 只回 50 条，且按 feedback id 升序', async () => {
-    // 书名的字典序与写入顺序**刻意相反**：截断审查001 的字典序最小、截断审查060 最大。
-    // 这样 ORDER BY title（旧行为）会从 060 往回取 50 条，而 ORDER BY feedback_id ASC
-    // （本修复）从 001 取到 050。下面的两条断言（第 50 条是谁、升序是否成立）在旧行为下必红。
+    // 书名的字典序与写入顺序**刻意相反**：第 i 本写入时给它「字典序第 (61-i) 小」的名字
+    // （rev060, rev059, ..., rev001）。于是：
+    //   - ORDER BY feedback_id ASC（本修复）→ 取最先写入的 50 本，名字是 rev011..rev060 这批的
+    //     字典序**较大**一半；
+    //   - ORDER BY title, author（旧行为）→ 按字典序取 rev001..rev050，正好是**后写入**的 50 本。
+    // 两者取到的集合不同 → 下面的断言在旧行为下必红（id 升序、首行身份、两批的成员名单）。
     for (let i = 1; i <= 60; i += 1) {
-      await feedback(1, await book(i), 'dropped', `雷点${i}`);
+      await feedback(1, await book(61 - i), 'dropped', `雷点${i}`);
     }
     const rows = (await informativeFor(1)) as { title: string; feedback_id: number }[];
     expect(rows).toHaveLength(50);
     // 升序：第 50 条是写入库中最早那批的最后一个（id 最小的一批先喂）。
     const ids = rows.map((row) => row.feedback_id);
     expect([...ids].sort((a, b) => a - b)).toEqual(ids);
-    // 第 51+ 本书**不在**本轮实喂集里——它们只存在于 feedback 表。
+    // 后写入的 10 本（雷点51..雷点60 = 字典序最小的 rev001..rev010 那批）不在本轮实喂集里。
     const titles = rows.map((row) => row.title);
-    for (let i = 51; i <= 60; i += 1) expect(titles).not.toContain(`截断审查${String(i).padStart(3, '0')}`);
-    // 变异锚点：旧行为（ORDER BY title, author）会按字典序取到 011..060 这批，
-    // 因此「最低 id 的第一本书必须在场」与「最高 id的尾批必须缺席」同时钉住顺序来源。
-    expect(titles).toContain('截断审查001'); // id 最小的行必须被喂（id ASC）
-    expect(titles).not.toContain('截断审查060'); // 字典序最大、id 也最大：旧行为会取它
+    for (let i = 1; i <= 10; i += 1) expect(titles).not.toContain(`截断审查${String(i).padStart(3, '0')}`);
+    // 变异锚点：id ASC 取的是「最先写入的 50 本」（雷点1..雷点50，即字典序较大的那半），
+    // 旧行为 title 排序取的却是字典序较小的 rev001..rev050（=雷点11..雷点60）。
+    // 用 note（雷点序号）判 membership：本批必须含最旧的雷点1、不含最新的雷点60。
+    const notes = rows.map((row) => row.note);
+    expect(notes).toContain('雷点1'); // 最小 feedback id 必被喂
+    expect(notes).not.toContain('雷点60'); // 字典序最小(=rev001)却 id 最大：旧行为会喂它
+    expect(titles).toContain('截断审查060'); // id 最小那本的名字（字典序最大的一半）
+    expect(titles).not.toContain('截断审查001'); // id 最大那本的名字——旧行为会取
   });
 
   it('② 交错：withdrawn 的 id 更大时，水位不得越过 informative 实喂上界', async () => {
