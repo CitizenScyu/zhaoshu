@@ -89,7 +89,7 @@ maybe('真实 PostgreSQL：F41-F1 反馈吸收 LIMIT 截断与水位推进', () 
     for (let i = 1; i <= 60; i += 1) {
       await feedback(1, await book(61 - i), 'dropped', `雷点${i}`);
     }
-    const rows = (await informativeFor(1)) as { title: string; feedback_id: number }[];
+    const rows = (await informativeFor(1)) as { title: string; note: string; feedback_id: number }[];
     expect(rows).toHaveLength(50);
     // 升序：第 50 条是写入库中最早那批的最后一个（id 最小的一批先喂）。
     const ids = rows.map((row) => row.feedback_id);
