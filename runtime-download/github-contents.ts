@@ -4,12 +4,14 @@
 // 但走注入的 GitHubContents 接口，不读全局环境、不在任何错误里带 token/响应体。
 // 404 返回 null（发布器据此判定「文件不存在」）。token 只进 Authorization 头。
 //
-// Accept 头按请求类型分开，**不共用**（曾因共用 raw+json 触发 P0，已对真实 GitHub 证实）：
-//   - 拿 sha / 元数据（currentSha）用 object JSON 信封；
-//   - 拿原始字节（getBytes）用 raw + arrayBuffer。
-// 真实现象：`application/vnd.github.raw+json` 会让 GitHub 返回**文件原始字节而非 JSON 信封**，
-// 对它 res.json() 直接抛 SyntaxError；且 object JSON 信封对 >1MB 文件会降级成 `encoding:"none"`
-// + 空 content（sha 仍在）。故 getBytes 走 raw 字节、currentSha 走 object 只取 sha。
+// Accept 头按请求类型分开，**不共用**（曾因共用 raw+json 触发 P0，已对真实 GitHub 证实）。
+// 订正一条曾坑人的假注释（旧代码注释称 "raw+json still yields the sha field"——**错，与真实
+// GitHub 相反**，这正是「注释与代码相反」缺陷）：
+//   - `application/vnd.github.raw+json` / `application/vnd.github.raw` 都返回**文件原始字节**，
+//     不是 JSON 信封，没有 sha/encoding/content 字段；对它 res.json() 直接抛 SyntaxError。
+//   - 只有 `application/vnd.github.object+json`（或 vnd.github+json）才返回含 `sha` 的 JSON 信封；
+//     它对 >1MB 文件会把 content 降级成 `encoding:"none"`+空，但 **sha 一直在**。
+// 故：currentSha 用 object 信封只取 sha；getBytes 用 raw + arrayBuffer 取原始字节。
 
 import type { GitHubContents } from '../src/lib/download-publisher';
 
