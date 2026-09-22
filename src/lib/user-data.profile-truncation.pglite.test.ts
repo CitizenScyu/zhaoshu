@@ -80,6 +80,9 @@ maybe('真实 PostgreSQL：F41-F1 反馈吸收 LIMIT 截断与水位推进', () 
   }, 60_000);
 
   it('① LIMIT 50 截断真实存在：60 条 informative 只回 50 条，且按 feedback id 升序', async () => {
+    // 书名的字典序与写入顺序**刻意相反**：截断审查001 的字典序最小、截断审查060 最大。
+    // 这样 ORDER BY title（旧行为）会从 060 往回取 50 条，而 ORDER BY feedback_id ASC
+    // （本修复）从 001 取到 050。下面的两条断言（第 50 条是谁、升序是否成立）在旧行为下必红。
     for (let i = 1; i <= 60; i += 1) {
       await feedback(1, await book(i), 'dropped', `雷点${i}`);
     }
@@ -91,6 +94,10 @@ maybe('真实 PostgreSQL：F41-F1 反馈吸收 LIMIT 截断与水位推进', () 
     // 第 51+ 本书**不在**本轮实喂集里——它们只存在于 feedback 表。
     const titles = rows.map((row) => row.title);
     for (let i = 51; i <= 60; i += 1) expect(titles).not.toContain(`截断审查${String(i).padStart(3, '0')}`);
+    // 变异锚点：旧行为（ORDER BY title, author）会按字典序取到 011..060 这批，
+    // 因此「最低 id 的第一本书必须在场」与「最高 id的尾批必须缺席」同时钉住顺序来源。
+    expect(titles).toContain('截断审查001'); // id 最小的行必须被喂（id ASC）
+    expect(titles).not.toContain('截断审查060'); // 字典序最大、id 也最大：旧行为会取它
   });
 
   it('② 交错：withdrawn 的 id 更大时，水位不得越过 informative 实喂上界', async () => {
