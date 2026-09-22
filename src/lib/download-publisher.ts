@@ -19,8 +19,8 @@
 // 本模块不触碰 DB、不做网络请求:GitHub 读写走注入的 GitHubContents,租约走注入的
 // LeaseGuard,合成故障注入测试因此无需真实凭据(红线:不连生产、不真实联网)。
 
-import { createHash } from 'node:crypto';
 import { bookFilename } from './book-file-name';
+import { gitBlobSha } from './artifact-bytes';
 import { MAX_READER_BYTES, parseTxtChapters, splitChapterParts } from './txt-chapters';
 import type { TxtChapter } from './txt-chapters';
 import { VOLUME_MANIFEST_FORMAT, VOLUME_MANIFEST_SCHEMA, stringifyVolumeManifest } from './volume-manifest';
@@ -125,9 +125,8 @@ export interface LeaseGuard {
   check(): Promise<void>;
 }
 
-export function gitBlobSha(text: string): string {
-  return createHash('sha1').update(`blob ${Buffer.byteLength(text, 'utf8')}\0`).update(text, 'utf8').digest('hex');
-}
+/** 内容(git blob)sha40:发布侧与读端、下载端共用同一判据(artifact-bytes)。 */
+export { gitBlobSha };
 
 /**
  * stem 以 `.` 开头时补 `_` 前缀防撞名(隐藏目录/隐藏文件语义)。

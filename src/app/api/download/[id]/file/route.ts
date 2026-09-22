@@ -5,7 +5,13 @@ import { ensureSchema, getSql } from '@/lib/db';
 import { boundedPositiveInteger } from '@/lib/http';
 import { sanitizeBookFilename } from '@/lib/book-file-name';
 import { locateBookFile } from '@/lib/book-file-locator';
-import { artifactContentsUrl, locateTaskArtifact } from '@/lib/artifact-locator';
+import {
+  artifactContentsRoot, artifactContentsUrl, locateTaskArtifact, type ArtifactLocation,
+} from '@/lib/artifact-locator';
+import { BodyReadError, encodeArtifactPath, gitBlobSha, readBoundedBody } from '@/lib/artifact-bytes';
+import { MAX_MANIFEST_BYTES, isVolumeManifestPath, parseVolumeManifest } from '@/lib/volume-manifest';
+import type { VolumeManifest } from '@/lib/volume-manifest';
+import { MAX_READER_BYTES } from '@/lib/txt-chapters';
 
 // 下载完成的任务取回 TXT:文件在 GitHub 私库 CitizenScyu/zhaoshu-books 的 books/ 下
 export const maxDuration = 60;
@@ -37,15 +43,15 @@ function contentsUrl(path: string): string {
 class FileUpstreamError extends Error {
   constructor(
     message: string,
-    readonly code: 'UPSTREAM_RATE_LIMITED' | 'UPSTREAM_ERROR',
+    readonly code: 'UPSTREAM_RATE_LIMITED' | 'UPSTREAM_ERROR' | 'UPSTREAM_TIMEOUT',
     readonly status: number,
   ) {
     super(message);
   }
 }
 
-async function githubResponse(path: string, accept: string, signal: AbortSignal, artifactUrl?: string): Promise<Response | null> {
-  const res = await fetch(artifactUrl ?? contentsUrl(path), {
+async function fetchChecked(url: string, accept: string, signal: AbortSignal): Promise<Response | null> {
+  const res = await fetch(url, {
     headers: ghHeaders(accept),
     cache: 'no-store',
     signal,
@@ -59,6 +65,10 @@ async function githubResponse(path: string, accept: string, signal: AbortSignal,
     throw new FileUpstreamError('文件服务暂不可用，请稍后重试', 'UPSTREAM_ERROR', 502);
   }
   return res;
+}
+
+async function githubResponse(path: string, accept: string, signal: AbortSignal, artifactUrl?: string): Promise<Response | null> {
+  return fetchChecked(artifactUrl ?? contentsUrl(path), accept, signal);
 }
 
 // 在 books/ 目录里按 worker 的命名规则定位文件:先精确匹配,再按书名前缀兜底
@@ -94,6 +104,99 @@ async function readFile(name: string, signal: AbortSignal, artifactUrl?: string)
     throw new FileUpstreamError('文件服务返回了空响应，请稍后重试', 'UPSTREAM_ERROR', 502);
   }
   return res.body;
+}
+
+/** 下载响应头(v2 分卷与旧单文件同款:文件名 .txt、不缓存)。 */
+function downloadHeaders(title: string): Record<string, string> {
+  const downloadName = `${sanitizeBookFilename(title) || 'novel'}.txt`;
+  return {
+    'Content-Type': 'text/plain; charset=utf-8',
+    // filename* 带 UTF-8 编码的中文名,filename 给不支持 RFC 5987 的客户端兜底
+    'Content-Disposition':
+      `attachment; filename="novel.txt"; filename*=UTF-8''${encodeURIComponent(downloadName)}`,
+    'Cache-Control': 'private, no-store',
+    'Vary': 'Cookie, Authorization, X-Owner-Token',
+  };
+}
+
+/** 有界缓冲失败 → 下载端错误(readBoundedBody 只管机制,措辞与状态码在此一处翻译)。 */
+function bodyReadError(error: unknown): unknown {
+  if (!(error instanceof BodyReadError)) return error;
+  switch (error.reason) {
+    case 'too-large': return new FileUpstreamError('文件服务返回的文件异常，请稍后重试', 'UPSTREAM_ERROR', 502);
+    case 'empty': return new FileUpstreamError('文件服务返回了空响应，请稍后重试', 'UPSTREAM_ERROR', 502);
+    case 'invalid-utf8': return new FileUpstreamError('文件服务返回了非 UTF-8 文本，请稍后重试', 'UPSTREAM_ERROR', 502);
+    case 'timeout': return new FileUpstreamError('文件服务响应超时，请稍后重试', 'UPSTREAM_TIMEOUT', 504);
+    default: return new FileUpstreamError('文件服务暂不可用，请稍后重试', 'UPSTREAM_ERROR', 502);
+  }
+}
+
+/**
+ * 取 v2 artifact 的清单(raw 有界,上限与读端同值 MAX_MANIFEST_BYTES)。文件 404 → null;
+ * 内容解析失败 → 502(判据是读端同一份 parseVolumeManifest,绝不猜)。
+ */
+async function readVolumeManifest(root: string, canonicalPath: string, signal: AbortSignal): Promise<VolumeManifest | null> {
+  const res = await fetchChecked(`${root}/${encodeArtifactPath(canonicalPath)}`, 'application/vnd.github.raw', signal);
+  if (!res) return null;
+  let bytes: Buffer;
+  try {
+    bytes = await readBoundedBody(res, MAX_MANIFEST_BYTES);
+  } catch (error) {
+    throw bodyReadError(error);
+  }
+  const manifest = parseVolumeManifest(bytes);
+  if (!manifest) {
+    throw new FileUpstreamError('文件服务返回了无效的章节目录，请稍后重试', 'UPSTREAM_ERROR', 502);
+  }
+  return manifest;
+}
+
+/**
+ * v2 产物下载:按清单顺序逐卷取回并顺序下发。卷级用与读端同一个 `gitBlobSha` 校验
+ * (清单声明 sha ≠ 实取字节 ⇒ 拒绝,绝不下发半新半旧的书)。`pull` 驱动、一次一卷 ⇒
+ * 天然背压,整本正文永不进内存(峰值 ≈ 单卷 16 MiB)。
+ */
+function volumeConcatStream(root: string, manifest: VolumeManifest, signal: AbortSignal): ReadableStream<Uint8Array> {
+  let index = 0;
+  return new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      try {
+        const entry = manifest.volumes[index];
+        if (!entry) {
+          controller.close();
+          return;
+        }
+        const res = await fetchChecked(`${root}/${encodeArtifactPath(entry.path)}`, 'application/vnd.github.raw', signal);
+        if (!res) throw new FileUpstreamError('文件服务缺少分卷，请稍后重试', 'UPSTREAM_ERROR', 502);
+        let bytes: Buffer;
+        try {
+          bytes = await readBoundedBody(res, MAX_READER_BYTES);
+        } catch (error) {
+          throw bodyReadError(error);
+        }
+        if (gitBlobSha(bytes) !== entry.blob_sha) {
+          throw new FileUpstreamError('书籍文件已更新，请重新下载', 'UPSTREAM_ERROR', 409);
+        }
+        index++;
+        controller.enqueue(bytes);
+      } catch (error) {
+        controller.error(error);
+      }
+    },
+  });
+}
+
+/** v2 分卷产物的下载响应:清单 + 各卷拼接成的整本正文(而非清单 JSON)。 */
+async function downloadVolumeBook(artifact: ArtifactLocation, title: string, signal: AbortSignal): Promise<NextResponse> {
+  const root = artifactContentsRoot(artifact);
+  const manifest = await readVolumeManifest(root, artifact.canonical_path, signal);
+  if (!manifest) {
+    return authJson({ error: 'file not found', code: 'FILE_NOT_FOUND' }, { status: 404 });
+  }
+  return new NextResponse(volumeConcatStream(root, manifest, signal), {
+    status: 200,
+    headers: downloadHeaders(title),
+  });
 }
 
 export async function GET(
@@ -141,6 +244,11 @@ export async function GET(
   try {
     signal.throwIfAborted();
     const artifact = task.artifact_id == null ? null : await locateTaskArtifact(getSql(), task.artifact_id);
+    // v2 分卷产物:canonical_path 指向清单(index.json),正文在分卷里 —— 下载必须像阅读端
+    // 一样分流并拼接正文;旧单文件产物(非 index.json)行为逐字不变。
+    if (artifact && isVolumeManifestPath(artifact.canonical_path)) {
+      return await downloadVolumeBook(artifact, task.title, signal);
+    }
     const name = artifact ? artifact.canonical_path : await findBookName(task.title, task.author, signal);
     if (!name) {
       return authJson({ error: 'file not found', code: 'FILE_NOT_FOUND' }, { status: 404 });
@@ -150,18 +258,7 @@ export async function GET(
       return authJson({ error: 'file not found', code: 'FILE_NOT_FOUND' }, { status: 404 });
     }
 
-    const downloadName = `${sanitizeBookFilename(task.title) || 'novel'}.txt`;
-    return new NextResponse(body, {
-      status: 200,
-      headers: {
-        'Content-Type': 'text/plain; charset=utf-8',
-        // filename* 带 UTF-8 编码的中文名,filename 给不支持 RFC 5987 的客户端兜底
-        'Content-Disposition':
-          `attachment; filename="novel.txt"; filename*=UTF-8''${encodeURIComponent(downloadName)}`,
-        'Cache-Control': 'private, no-store',
-        'Vary': 'Cookie, Authorization, X-Owner-Token',
-      },
-    });
+    return new NextResponse(body, { status: 200, headers: downloadHeaders(task.title) });
   } catch (e) {
     console.error(e);
     if (req.signal.aborted && !timeout.aborted) {

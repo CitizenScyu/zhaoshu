@@ -1,5 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { NextRequest } from 'next/server';
+import { createHash } from 'node:crypto';
+import { stringifyVolumeManifest } from '@/lib/volume-manifest';
+import type { VolumeManifest } from '@/lib/volume-manifest';
 
 const { ensureSchema, getSql, sql, fetchMock } = vi.hoisted(() => ({
   ensureSchema: vi.fn(),
@@ -25,6 +28,70 @@ function download(token: string | null = 'file-test-owner', id = '42', signal?: 
 function mockFile(response: Response) {
   fetchMock.mockResolvedValueOnce(Response.json([{ name: bookName }]))
     .mockResolvedValueOnce(response);
+}
+
+const ARTIFACT_ID = '7';
+
+function gitBlobSha(value: Uint8Array | string): string {
+  const buf = typeof value === 'string' ? Buffer.from(value, 'utf8') : Buffer.from(value);
+  return createHash('sha1').update(`blob ${buf.byteLength}\0`).update(buf).digest('hex');
+}
+
+/** 一份合法的 2 卷 v2 清单 + 其卷字节,以及 DB 里的 artifact 行。 */
+function volumeFixture() {
+  const vol1 = '【第1章】\n\n第一卷的正文内容。\n';
+  const vol2 = '【第2章】\n\n第二卷的正文内容。\n';
+  const book = vol1 + vol2;
+  const v1Bytes = Buffer.from(vol1, 'utf8');
+  const v2Bytes = Buffer.from(vol2, 'utf8');
+  const dir = 'books/我的小说-作者';
+  const manifest: VolumeManifest = {
+    schema: 2, format: 'volumes',
+    version: gitBlobSha(book).slice(0, 8), blob_sha: gitBlobSha(book),
+    bytes: Buffer.byteLength(book), chars: 2, chapters: 2, chapters_total: 2,
+    title: '我的小说', author: '作者', generated_at: '2026-09-23T00:00:00.000Z', task_id: 7,
+    volumes: [
+      { path: `${dir}/vol-001.txt`, snapshot_path: `books/.snapshots/x/v-${gitBlobSha(vol1).slice(0, 8)}.txt`,
+        blob_sha: gitBlobSha(vol1), bytes: v1Bytes.byteLength, first_byte: 0, last_byte: v1Bytes.byteLength },
+      { path: `${dir}/vol-002.txt`, snapshot_path: `books/.snapshots/x/v-${gitBlobSha(vol2).slice(0, 8)}.txt`,
+        blob_sha: gitBlobSha(vol2), bytes: v2Bytes.byteLength, first_byte: v1Bytes.byteLength, last_byte: v1Bytes.byteLength + v2Bytes.byteLength },
+    ],
+    chapter_index: [
+      { i: 0, t: '【第1章】', v: 0, s: 0, e: v1Bytes.byteLength, p: 1 },
+      { i: 1, t: '【第2章】', v: 1, s: v1Bytes.byteLength, e: v1Bytes.byteLength + v2Bytes.byteLength, p: 1 },
+    ],
+  };
+  const artifactRow = {
+    owner: 'owner', repo: 'repo', branch: 'main',
+    canonical_path: `${dir}/index.json`, blob_sha: gitBlobSha(book), bytes: Buffer.byteLength(book),
+  };
+  const resources = new Map<string, () => Response>([
+    ['index.json', () => new Response(stringifyVolumeManifest(manifest))],
+    ['vol-001.txt', () => new Response(vol1)],
+    ['vol-002.txt', () => new Response(vol2)],
+  ]);
+  return { manifest, artifactRow, book, vol1, resources };
+}
+
+/** 以 URL 路径末段(百分号编码)为键的资源表;未命中作 404。 */
+function resourceServer(resources: Map<string, () => Response>, hit: (name: string) => void): typeof fetch {
+  return (async (input: RequestInfo | URL) => {
+    const url = String(typeof input === 'string' || input instanceof URL ? input : (input as Request).url);
+    const pathname = new URL(url, 'https://api.github.com').pathname;
+    const name = decodeURIComponent(pathname.slice(pathname.lastIndexOf('/') + 1));
+    hit(name);
+    const factory = resources.get(name);
+    return factory ? factory() : new Response(null, { status: 404 });
+  }) as typeof fetch;
+}
+
+function artifactTask() {
+  return { ...task, title: '我的小说', author: '作者', artifact_id: ARTIFACT_ID };
+}
+
+/** 任务查询 → artifact 行,两步 SQL 都喂给 mock。 */
+function sqlForArtifact(artifactRow: unknown) {
+  sql.mockResolvedValueOnce([artifactTask()]).mockResolvedValueOnce([artifactRow]);
 }
 
 describe('GET /api/download/[id]/file', () => {
@@ -398,5 +465,96 @@ describe('GET /api/download/[id]/file', () => {
     const res = await download('file-test-owner', '42', client.signal);
     expect(res.status).toBe(499);
     expect(await res.json()).toEqual({ error: '请求已取消', code: 'REQUEST_ABORTED' });
+  });
+
+  describe('v2 分卷产物(清单 index.json)', () => {
+    it('下载拼接后的整本正文,而不是清单 JSON', async () => {
+      const fx = volumeFixture();
+      const hits: string[] = [];
+      sqlForArtifact(fx.artifactRow);
+      fetchMock.mockImplementation(resourceServer(fx.resources, (name) => hits.push(name)));
+
+      const res = await download();
+
+      expect(res.status).toBe(200);
+      expect(res.headers.get('Content-Type')).toBe('text/plain; charset=utf-8');
+      expect(res.headers.get('Content-Disposition')).toContain(encodeURIComponent('我的小说.txt'));
+      const text = await res.text();
+      expect(text).toBe(fx.book);
+      expect(text).not.toContain('"schema"');
+      expect(text).not.toContain('chapter_index');
+      // 清单在前,卷按顺序各取一次。
+      expect(hits).toEqual(['index.json', 'vol-001.txt', 'vol-002.txt']);
+    });
+
+    it('逐卷流式下发:消费第一卷之前不拉取第二卷', async () => {
+      const fx = volumeFixture();
+      const hits: string[] = [];
+      sqlForArtifact(fx.artifactRow);
+      fetchMock.mockImplementation(resourceServer(fx.resources, (name) => hits.push(name)));
+
+      const res = await download();
+      // 响应已就绪但还没消费:第二卷绝不会被提前拉取(一次一卷的背压)。
+      expect(hits).not.toContain('vol-002.txt');
+      const text = await res.text();
+      expect(text).toBe(fx.book);
+      expect(hits).toEqual(['index.json', 'vol-001.txt', 'vol-002.txt']);
+    });
+
+    it('卷字节 sha 与清单不符 → 下载中断,绝不下发半新半旧的书', async () => {
+      const fx = volumeFixture();
+      const resources = new Map(fx.resources);
+      resources.set('vol-001.txt', () => new Response('被篡改的卷内容\n'));
+      sqlForArtifact(fx.artifactRow);
+      fetchMock.mockImplementation(resourceServer(resources, () => {}));
+
+      const res = await download();
+
+      expect(res.status).toBe(200);
+      await expect(res.text()).rejects.toThrow();
+    });
+
+    it('清单缺失 → 404 FILE_NOT_FOUND', async () => {
+      const fx = volumeFixture();
+      sqlForArtifact(fx.artifactRow);
+      fetchMock.mockImplementation(resourceServer(new Map(), () => {}));
+
+      const res = await download();
+
+      expect(res.status).toBe(404);
+      expect(await res.json()).toMatchObject({ code: 'FILE_NOT_FOUND' });
+    });
+
+    it('清单解析失败 → 502(与读端同一份 parseVolumeManifest 判据)', async () => {
+      const fx = volumeFixture();
+      const resources = new Map(fx.resources);
+      resources.set('index.json', () => new Response('{not json'));
+      sqlForArtifact(fx.artifactRow);
+      fetchMock.mockImplementation(resourceServer(resources, () => {}));
+
+      const res = await download();
+
+      expect(res.status).toBe(502);
+      expect(await res.json()).toMatchObject({ code: 'UPSTREAM_ERROR' });
+      expect(res.headers.get('Content-Disposition')).toBeNull();
+    });
+
+    it('非 index.json 的 artifact(旧单文件)行为不变:原样流式下发,不拼接', async () => {
+      const raw = '旧版单文件正文\n';
+      const artifactRow = {
+        owner: 'owner', repo: 'repo', branch: 'main',
+        canonical_path: 'books/旧书-作者.txt', blob_sha: gitBlobSha(raw), bytes: Buffer.byteLength(raw),
+      };
+      sql.mockResolvedValueOnce([{ ...task, artifact_id: '9' }]).mockResolvedValueOnce([artifactRow]);
+      fetchMock.mockResolvedValueOnce(new Response(raw));
+
+      const res = await download();
+
+      expect(res.status).toBe(200);
+      expect(await res.text()).toBe(raw);
+      // 只取这一个文件:没有清单、没有分卷。
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(fetchMock.mock.calls[0][0]).toContain(encodeURIComponent('旧书-作者.txt'));
+    });
   });
 });

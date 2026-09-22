@@ -4,9 +4,10 @@ import { locateBookFile } from '@/lib/book-file-locator';
 import {
   artifactContentsRoot, artifactContentsUrl, locateTaskArtifact, type ArtifactLocation,
 } from '@/lib/artifact-locator';
+import { BodyReadError, encodeArtifactPath, gitBlobSha, readBoundedBody } from '@/lib/artifact-bytes';
 import { MAX_READER_BYTES, parseTxtChapters, splitChapterParts } from '@/lib/txt-chapters';
 import type { ByteRange } from '@/lib/txt-chapters';
-import { isVolumeManifestPath, parseVolumeManifest } from '@/lib/volume-manifest';
+import { MAX_MANIFEST_BYTES, isVolumeManifestPath, parseVolumeManifest } from '@/lib/volume-manifest';
 import type { VolumeEntry, VolumeManifest } from '@/lib/volume-manifest';
 import type { ReaderChapter, ReaderIndex, ReaderPart } from '@/lib/reader-types';
 
@@ -17,8 +18,6 @@ const MAX_PENDING_BOOKS = 2;
 const METADATA_TIMEOUT_MS = 15_000;
 const TEXT_TIMEOUT_MS = 60_000;
 const MAX_INDEX_JSON_BYTES = 4 * 1024 * 1024;
-/** 清单(章节/卷索引)raw 拉取上限;20000 章 ≈ 1.7 MB,4 MiB 门内。 */
-const MAX_MANIFEST_BYTES = 4 * 1024 * 1024;
 
 export class ReaderError extends Error {
   constructor(message: string, public readonly status: number) {
@@ -75,20 +74,6 @@ let manifestPending: { key: string; promise: Promise<VolumeManifest> } | undefin
 const volumes = new Map<string, Buffer>();
 const pendingVolumes = new Map<string, Promise<Buffer>>();
 let cachedVolumeBytes = 0;
-
-/**
- * 按段编码 artifact 路径。仓库里写入的段名已百分号编码(如 `%E6%B5%8B...`),
- * 因此先解码再编码,避免二次编码;段内非转义 `%` 时保守地按原样使用。
- */
-function encodeArtifactPath(path: string): string {
-  return path.split('/').map((segment) => {
-    try {
-      return encodeURIComponent(decodeURIComponent(segment));
-    } catch {
-      return encodeURIComponent(segment);
-    }
-  }).join('/');
-}
 
 function getSource(artifact: ArtifactLocation | null = null): Source {
   const token = process.env.GITHUB_TOKEN;
@@ -263,9 +248,22 @@ export async function readerAvailability(task: ReadableTask): Promise<{ availabl
   return { available: file !== null && file.size > 0 && file.size <= MAX_READER_BYTES };
 }
 
+/** 有界缓冲的失败 → 读端错误:措辞与状态码在此一处翻译(readBoundedBody 只管机制)。 */
+function bodyReadFailure(error: unknown, tooLarge: string): unknown {
+  if (!(error instanceof BodyReadError)) return error;
+  switch (error.reason) {
+    case 'too-large': return new ReaderError(tooLarge, 413);
+    case 'empty': return new ReaderError('书籍文件为空。', 422);
+    case 'invalid-utf8': return new ReaderError('TXT 需要使用 UTF-8 编码,请重新下载或转换文件。', 422);
+    case 'timeout': return new ReaderError('读取书籍超时,请重试。', 504);
+    default: return new ReaderError('书籍传输中断,请重试。', 502);
+  }
+}
+
 /**
  * Raw 流式拉取并做有界缓冲。`limit` 是**单文件**上限(卷与旧单文件都是 16 MiB;
  * 清单另给 4 MiB):防被篡改的清单让服务器去拉一个超大「卷」。
+ * 有界缓冲机制在 artifact-bytes.readBoundedBody(与下载端共用),这里只做拉取与错误翻译。
  */
 async function readBounded(source: Source, name: string, limit: number, tooLarge: string): Promise<Buffer> {
   const response = await githubFetch(source, name, true);
@@ -274,47 +272,11 @@ async function readBounded(source: Source, name: string, limit: number, tooLarge
     await response.body?.cancel().catch(() => undefined);
     throw new ReaderError('书籍文件不存在,请返回书库检查下载任务。', 404);
   }
-  if (!response.body) throw new ReaderError('书籍文件为空。', 422);
-  const declaredSize = Number(response.headers.get('content-length'));
-  if (Number.isFinite(declaredSize) && declaredSize > limit) {
-    await response.body.cancel().catch(() => undefined);
-    throw new ReaderError(tooLarge, 413);
-  }
-  const reader = response.body.getReader();
-  const chunks: Uint8Array[] = [];
-  const decoder = new TextDecoder('utf-8', { fatal: true });
-  let size = 0;
   try {
-    while (true) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      size += value.byteLength;
-      if (size > limit) throw new ReaderError(tooLarge, 413);
-      // Validate incrementally without retaining a decoded copy of the file.
-      try {
-        decoder.decode(value, { stream: true });
-      } catch {
-        throw new ReaderError('TXT 需要使用 UTF-8 编码,请重新下载或转换文件。', 422);
-      }
-      chunks.push(value);
-    }
-    try {
-      decoder.decode();
-    } catch {
-      throw new ReaderError('TXT 需要使用 UTF-8 编码,请重新下载或转换文件。', 422);
-    }
+    return await readBoundedBody(response, limit);
   } catch (error) {
-    await reader.cancel().catch(() => undefined);
-    if (error instanceof ReaderError) throw error;
-    if (error instanceof Error && (error.name === 'TimeoutError' || error.name === 'AbortError')) {
-      throw new ReaderError('读取书籍超时,请重试。', 504);
-    }
-    throw new ReaderError('书籍传输中断,请重试。', 502);
-  } finally {
-    reader.releaseLock();
+    throw bodyReadFailure(error, tooLarge);
   }
-  if (!size) throw new ReaderError('书籍文件为空。', 422);
-  return Buffer.concat(chunks, size);
 }
 
 function readBytes(source: Source, file: BookFile): Promise<Buffer> {
@@ -396,7 +358,7 @@ async function getVolume(source: Source, entry: VolumeEntry, bypassCache = false
   }
   const promise = (async () => {
     const bytes = await readBounded(source, entry.path, MAX_READER_BYTES, '卷文件异常,暂时无法阅读。');
-    const sha = createHash('sha1').update(`blob ${bytes.byteLength}\0`).update(bytes).digest('hex');
+    const sha = gitBlobSha(bytes);
     if (sha !== entry.blob_sha) throw new VolumeChangedError(entry.path);
     cacheVolume(key, bytes);
     return bytes;
@@ -606,7 +568,7 @@ async function legacyBook(source: Source, task: ReadableTask): Promise<CachedBoo
     const bytes = await readBytes(source, file);
     // A blob SHA is not a Git ref. Hash the actual raw content so index and
     // chapter reads cannot silently mix revisions if the file changed mid-read.
-    const version = createHash('sha1').update(`blob ${bytes.byteLength}\0`).update(bytes).digest('hex');
+    const version = gitBlobSha(bytes);
     const parsed = parseTxtChapters(bytes);
     if (!parsed.length) throw new ReaderError('书籍文件没有可阅读的正文。', 422);
     const parts = parsed.map((chapter) => splitChapterParts(bytes, chapter));
