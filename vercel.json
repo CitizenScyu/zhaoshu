@@ -2,7 +2,7 @@
   "crons": [
     {
       "path": "/api/shuyuan",
-      "schedule": "0 20 * * *"
+      "schedule": "0 2,8,14,20 * * *"
     },
     {
       "path": "/api/download/reclaim",
