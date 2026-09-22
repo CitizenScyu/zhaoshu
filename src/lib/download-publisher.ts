@@ -36,6 +36,18 @@ export const MAX_VOLUME_BYTES = 8 * 1024 * 1024;
 export const MAX_VOLUME_HARD_BYTES = MAX_READER_BYTES;
 /** 发布侧**内存**上限(整本以字符串持有);超限仍 size_limit、仍零 PUT。二期按章流式写后解除。 */
 export const MAX_BOOK_BYTES = 64 * 1024 * 1024;
+/**
+ * 读端 ReaderIndex 字节上限:与 reader-server 的 `MAX_INDEX_JSON_BYTES`(4 MiB)同值。
+ * 发布侧必须镜像这个门:否则一本书能发布成功(splitBookVolumes 落 index.json),读端却因
+ * 目录索引顶穿 4 MiB 而 422 —— 「能发布读不了」的 P1 缺口(rev41vol2)。发布即拒,
+ * 让失败发生在写盘前,与 size_limit 同档。
+ *
+ * 判据刻意用**读端会看到的索引字节**(ReaderChapter 每章 JSON,键名 index/title/startByte/
+ * endByte/partCount)而非清单自身字节(stringifyVolumeManifest 每章用更短的 i/t/v/s/e/p):
+ * 同一份 chapter_index 序列化成读端形状时**更大**,存在「清单 < 4 MiB 但读端索引 > 4 MiB」的
+ * 窗口。若按清单自身字节设门会漏掉这个窗口,读端仍会 422。这里按读端口径判,与读端严格同门。
+ */
+export const MAX_READER_INDEX_BYTES = 4 * 1024 * 1024;
 
 export type PublicationStage = 'snapshot' | 'manifest' | 'canonical' | 'pointer';
 
@@ -368,6 +380,25 @@ export function buildChapterIndex(
 }
 
 /**
+ * 读端 readBookIndex(清单分支)会把 chapter_index 翻成 ReaderChapter(键名 index/title/
+ * startByte/endByte/partCount)再 JSON.stringify —— 这正是读端 4 MiB 门(readBookIndex 的 422)
+ * 判的对象。这里按**同口径**估算读端会看到的字节,让发布侧与读端严格同门。
+ *
+ * 增量累计、逐条 stringify:不整体建一个大 JSON 字符串,2 万章也只 O(总字节)。与读端
+ * `Buffer.byteLength(JSON.stringify(index))` 的差只在顶层固定开销(taskId/title/author/
+ * version/totalBytes,< 1 KiB),对 4 MiB 门无影响;宁可略保守也不漏放。
+ */
+export function readerIndexBytes(chapterIndex: VolumeChapterEntry[]): number {
+  let bytes = 256; // 顶层固定开销(taskId/title/author/version/totalBytes)的保守估计
+  for (const entry of chapterIndex) {
+    bytes += Buffer.byteLength(JSON.stringify({
+      index: entry.i, title: entry.t, startByte: entry.s, endByte: entry.e, partCount: entry.p,
+    }), 'utf8');
+  }
+  return bytes;
+}
+
+/**
  * 五阶段发布(GitHub 侧)。顺序:
  *   1 快照 逐卷 `<dir>/v-<sha8>.txt`(内容寻址,幂等 PUT;**绝不对卷调 getBytes**)
  *   2 清单 `<dir>/<version>.json`;同内容已存在且 blob_sha 一致 → 保留原字节
@@ -413,6 +444,14 @@ export async function publishBookVersion(
     return { text, entry };
   });
   const chapterIndex = buildChapterIndex(buf, chapters, ranges, maxBookBytes);
+
+  // 0. 读端索引门:镜像 reader-server 的 MAX_INDEX_JSON_BYTES(4 MiB),按读端会看到的
+  //    ReaderIndex 字节判(比清单自身更大,见 MAX_READER_INDEX_BYTES 注释)。2 万章 × 长标题/
+  //    转义标题会把读端目录顶穿 4 MiB ⇒ 发布成功也读不了。在任何 PUT(甚至序列化大清单)
+  //    之前拒绝,与 size_limit 同档(stage 归 manifest:坏的是章节索引体积,不是卷也不是指针)。
+  if (readerIndexBytes(chapterIndex) > MAX_READER_INDEX_BYTES) {
+    throw new PublicationStageError('manifest', 'index_too_large');
+  }
 
   const manifest: VolumeManifest = {
     schema: VOLUME_MANIFEST_SCHEMA,
