@@ -121,9 +121,12 @@ maybe('真实 PostgreSQL：F41-F1 反馈吸收 LIMIT 截断与水位推进', () 
     expect(withdrawnRows.length).toBeGreaterThan(0); // 撤回书目非空
     const withdrawnMax = Math.max(...withdrawnRows.map((row) => row.feedback_id));
     expect(withdrawnMax).toBeGreaterThan(infoMax); // 前提：撤回确实在 informative 之后
+    // 重建路径口径（combine='min'）：两类都全量读，withdrawn 超出 informative 的部分没被告知，
+    // 水位必须停在 informative 实喂上界。默认 combine 是 'max'（异步路径），这里显式钉 min。
     expect(absorbedWatermarkFor(
       ((await informativeFor(2)) as { feedback_id: number }[]).map((row) => ({ feedbackId: row.feedback_id })),
       withdrawnRows.map((row) => ({ feedbackId: row.feedback_id })),
+      'min',
     )).toBe(infoMax);
   });
 
@@ -135,8 +138,8 @@ maybe('真实 PostgreSQL：F41-F1 反馈吸收 LIMIT 截断与水位推进', () 
     expect(pending).toBeGreaterThan(0);
 
     // 第一轮：只喂 50 条 → 水位 = 实喂上界（< pending）→ pending 不得被清空。
-    const firstFed = ((await informativeFor(3)) as { feedbackId: number }[]);
-    const firstWatermark = absorbedWatermarkFor(firstFed, []);
+    const firstFed = ((await informativeFor(3)) as { feedback_id: number }[]);
+    const firstWatermark = absorbedWatermarkFor(firstFed.map((row) => ({ feedbackId: row.feedback_id })), []);
     expect(firstWatermark).toBeLessThan(pending);
     await markAbsorbed(3, firstWatermark, 'applied');
     const afterFirst = await queue(3);
@@ -145,9 +148,11 @@ maybe('真实 PostgreSQL：F41-F1 反馈吸收 LIMIT 截断与水位推进', () 
 
     // 后续轮：afterId = 上一轮水位 ⇒ 查询返回剩下的 10 条，水位推进到它们之上；
     // pending（全表上界）到这时才被清空。这正是异步路径最终排空队列的机制。
-    const secondFed = (await informativeFor(3, firstWatermark)) as { feedbackId: number }[];
+    // afterId = 上一轮水位：查询返回「下一批」而不是重读同一批。
+    // 🔴 删掉 afterId 过滤这条就红——第二轮会再返回 50 行而不是剩下的 10 行。
+    const secondFed = (await informativeFor(3, firstWatermark)) as { feedback_id: number }[];
     expect(secondFed).toHaveLength(10); // 正好是第 51..60 条，没有被漏掉
-    const secondWatermark = absorbedWatermarkFor(secondFed, []);
+    const secondWatermark = absorbedWatermarkFor(secondFed.map((row) => ({ feedbackId: row.feedback_id })), []);
     expect(secondWatermark).toBe(pending);
     await enqueue(3, firstWatermark, true);
     await markAbsorbed(3, secondWatermark, 'applied');
@@ -162,7 +167,7 @@ maybe('真实 PostgreSQL：F41-F1 反馈吸收 LIMIT 截断与水位推进', () 
     // `expect(afterFirst?.pending_feedback_id).toBe(pending)` 立刻失败（pending 被清）。
     const allMax = ((await pg.query('SELECT COALESCE(max(id),0)::int AS m FROM feedback WHERE user_id = 3', [])).rows[0] as { m: number }).m;
     // 第一轮（afterId=0）只喂 50 条 ⇒ 实喂上界 < 全表上界。这就是「水位不能取全表 max」的证据。
-    const firstBatch = ((await informativeFor(3, 0)) as { feedbackId: number }[]);
-    expect(absorbedWatermarkFor(firstBatch, [])).toBeLessThan(allMax);
+    const firstBatch = ((await informativeFor(3, 0)) as { feedback_id: number }[]);
+    expect(absorbedWatermarkFor(firstBatch.map((row) => ({ feedbackId: row.feedback_id })), [])).toBeLessThan(allMax);
   });
 });

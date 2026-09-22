@@ -151,21 +151,25 @@ maybe('真实 PostgreSQL：异步吸收水位不越过已喂行（F41-F1 不变�
     expect(after?.status).toBe('pending');
   });
 
-  it('不变量②：多轮吸收把 60 条 informative 全部喂完并清空 pending（不漏行也不卡死）', async () => {
-    // 沿用用户 1 的夹具：第 51..60 条在①里没被喂到。
-    const seen = new Set<string>();
-    for (let round = 0; round < 6; round += 1) {
-      const result = await absorbRound(1, `lease-inv-2-${round}`);
-      if (!result) break; // 无可领取行：队列已排空
-      for (const row of result.fed) seen.add(row.note);
-      if ((await queue(1))?.pending_feedback_id == null) break;
-    }
-    // 60 条的偏好最终全部进过模型输入——没有一行因为水位越过而永久缺失。
-    expect(seen.size).toBe(60);
-    for (let i = 1; i <= 60; i += 1) expect(seen).toContain(`雷点${i}`);
-    // 队列最终排空（不是「永远 pending、每天空烧一次模型」）。
-    expect((await queue(1))?.pending_feedback_id).toBeNull();
-    expect((await queue(1))?.status).toBe('applied');
+  it('不变量②：下一轮吸收读到的是「下一批」而不是同一批，且最终把剩余行喂完并清空 pending', async () => {
+    // 沿用用户 1 的夹具：①已把水位推到前 50 条。重新 enqueue（模拟用户又写了反馈），
+    // 然后断言**下一轮**读到的是第 51..60 条——不是重读 1..50。
+    // 🔴 删掉 afterId 过滤这条就红：每轮都返回同一批 50 行，seen 永远收不齐 60 条。
+    await enqueue(1, 0, true);
+    const pending = (await queue(1))?.pending_feedback_id ?? 0;
+    expect(pending).toBeGreaterThan(0);
+
+    const second = await absorbRound(1, 'lease-inv-2');
+    expect(second).not.toBeNull();
+    expect(second!.fed).toHaveLength(10); // 正好是剩下的 10 条，不是重读的 50
+    const notes = second!.fed.map((row) => row.note);
+    for (let i = 51; i <= 60; i += 1) expect(notes).toContain(`雷点${i}`);
+    for (let i = 1; i <= 50; i += 1) expect(notes).not.toContain(`雷点${i}`); // 已喂过的不重读
+    // 水位推到全表上界 ⇒ pending 清空、队列排空（不是「永远 pending、每天空烧一次模型」）。
+    expect(second!.advanceTo).toBe(pending);
+    const done = await queue(1);
+    expect(done?.pending_feedback_id).toBeNull();
+    expect(done?.status).toBe('applied');
   });
 
   it('不变量③：enqueue 只在真有新反馈时抬 pending，不制造越过已喂行的幻影高位', async () => {

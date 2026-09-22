@@ -89,7 +89,9 @@ export async function absorbPendingProfileFeedback(deps: {
   // afterId 下界。用 absorbed_feedback_id 而不是 candidate——candidate 是 enqueue 记的
   // **全表**上界，直接当查询下界会把未喂行整批跳过（那正是本任务修的漏行 bug）。
   // F41-F1：absorbed 是 GREATEST 语义的单调水位，等于「到目前确已喂过/已宣认的全部反馈」。
-  const queueBefore = await getProfileFeedbackQueueForUser(userId);
+  // 读队列失败（连接抖动）不该比「没读到」更糟：退回 afterId=0（全量读），水位仍由
+  // 实喂上界决定，只是可能多喂一轮。lease 测试的零行替身里 getSql 会抛——吞掉它。
+  const queueBefore = await getProfileFeedbackQueueForUser(userId).catch(() => null);
   const lastCommittedUpperBound = queueBefore?.absorbedFeedbackId ?? 0;
 
   let profile = await getProfileForUser(userId);
