@@ -582,8 +582,8 @@ export function recentInformativeFeedbackForUserQuery(sql: PersonalQuery, userId
   //  ② 反馈是追加式历史，id 升序 = 最早写入的偏好先进画像，最坏情况也只是新偏好晚一轮，
   //     不会像 title 排序那样把某条反馈永久排在 50 名外。
   // 同书多条反馈可能跨批（本轮只喂 50 条里的一部分），可接受：下一轮会补上，且不会漏。
-  // feedback_id 进投影只用于「本轮实喂上界」计算（见 db.ts 的 ProfileFeedbackBatch），
-  // 绝不进模型输入——提示词只序列化 title/author/status/note。
+  // feedback_id 进投影只用于「本轮实喂上界」计算（见 db.ts 的 fedFeedbackUpperBound /
+  // absorbedWatermarkFor），绝不进模型输入——提示词输入经 feedbackForPrompt 剥掉它。
   return sql`SELECT title, author, status, note, feedback_id FROM (
       SELECT DISTINCT ON (f.book_id) b.title, b.author, f.status, f.note, f.book_id, f.id AS feedback_id
       FROM feedback f JOIN books b ON b.id = f.book_id

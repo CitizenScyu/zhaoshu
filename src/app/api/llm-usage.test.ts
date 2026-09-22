@@ -9,7 +9,7 @@ const mocks = vi.hoisted(() => ({
   getSql: vi.fn(), businessSql: vi.fn(), transaction: vi.fn(),
   getExcludedBookTitlesForUser: vi.fn(), persistRecommendationsForUser: vi.fn(),
   neon: vi.fn(), usageSql: vi.fn(), verifyBatch: vi.fn(), getFeedbackSnapshotForUser: vi.fn(),
-  getProfileFeedbackForUser: vi.fn(), getWithdrawnFeedbackBookTitlesForUser: vi.fn(),
+  getProfileFeedbackForUser: vi.fn(), getWithdrawnFeedbackBookTitlesForUserRaw: vi.fn(),
   // F15：吸收/重建涉及的队列函数。
   getProfileFeedbackQueueForUser: vi.fn(), markProfileFeedbackAbsorbedForUser: vi.fn(),
   markProfileFeedbackFailedForUser: vi.fn(), getMaxFeedbackIdForUser: vi.fn(), ensureProfileForUser: vi.fn(),
@@ -34,7 +34,7 @@ vi.mock('@/lib/db', async (importOriginal) => ({
   getSql: mocks.getSql,
   getFeedbackSnapshotForUser: mocks.getFeedbackSnapshotForUser,
   getProfileFeedbackForUser: mocks.getProfileFeedbackForUser,
-  getWithdrawnFeedbackBookTitlesForUser: mocks.getWithdrawnFeedbackBookTitlesForUser,
+  getWithdrawnFeedbackBookTitlesForUserRaw: mocks.getWithdrawnFeedbackBookTitlesForUserRaw,
   getProfileFeedbackQueueForUser: mocks.getProfileFeedbackQueueForUser,
   markProfileFeedbackAbsorbedForUser: mocks.markProfileFeedbackAbsorbedForUser,
   markProfileFeedbackFailedForUser: mocks.markProfileFeedbackFailedForUser,
@@ -166,7 +166,7 @@ describe('usage instrumentation through all model routes', () => {
     mocks.persistRecommendationsForUser.mockResolvedValue(undefined);
     mocks.getFeedbackSnapshotForUser.mockResolvedValue({ version: 0, status: null, note: '' });
     mocks.getProfileFeedbackForUser.mockResolvedValue([]);
-    mocks.getWithdrawnFeedbackBookTitlesForUser.mockResolvedValue([]);
+    mocks.getWithdrawnFeedbackBookTitlesForUserRaw.mockResolvedValue([]);
     mocks.getProfileFeedbackQueueForUser.mockResolvedValue({ pendingFeedbackId: 7, absorbedFeedbackId: 0, status: 'pending', attempts: 0, lastError: '', updatedAt: '' });
     mocks.markProfileFeedbackAbsorbedForUser.mockResolvedValue({ matched: true, pendingFeedbackId: null });
     mocks.completeProfileFeedbackForUser.mockResolvedValue({ outcome: 'matched', updatedAt: 'v2', pendingFeedbackId: null });

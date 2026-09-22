@@ -13,7 +13,7 @@ vi.setConfig({ testTimeout: 30_000, hookTimeout: 30_000 });
 const mocks = vi.hoisted(() => ({
   ensureSchema: vi.fn(), getProfileForUser: vi.fn(), saveProfileForUser: vi.fn(),
   getSql: vi.fn(), sql: vi.fn(), transaction: vi.fn(), getFeedbackSnapshotForUser: vi.fn(),
-  getProfileFeedbackForUser: vi.fn(), getWithdrawnFeedbackBookTitlesForUser: vi.fn(),
+  getProfileFeedbackForUser: vi.fn(), getWithdrawnFeedbackBookTitlesForUserRaw: vi.fn(),
   getMaxFeedbackIdForUser: vi.fn(), markProfileFeedbackAbsorbedForUser: vi.fn(),
 }));
 vi.mock('@/lib/db', async (importOriginal) => ({ ...await importOriginal<typeof import('@/lib/db')>(), ...mocks, recordFeedbackForUser: async (userId: number, book: { title: string; author: string }, status: string, note: string, expectedVersion: number) => {
@@ -60,7 +60,7 @@ describe('actual SSE failure cannot overwrite a profile', () => {
     mocks.transaction.mockResolvedValue([]);
     mocks.getFeedbackSnapshotForUser.mockResolvedValue({ version: 0, status: null, note: '' });
     mocks.getProfileFeedbackForUser.mockResolvedValue([]);
-    mocks.getWithdrawnFeedbackBookTitlesForUser.mockResolvedValue([]);
+    mocks.getWithdrawnFeedbackBookTitlesForUserRaw.mockResolvedValue([]);
     mocks.getMaxFeedbackIdForUser.mockResolvedValue(0);
     mocks.markProfileFeedbackAbsorbedForUser.mockResolvedValue(null);
   });
