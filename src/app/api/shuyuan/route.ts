@@ -5,7 +5,10 @@ import { requirePermission } from '@/lib/auth';
 import { authJson, withAuthHeaders } from '@/lib/auth-http';
 import { ensureSchema } from '@/lib/db';
 import { readJsonBody, RequestBodyError } from '@/lib/http';
-import { disableShuyuanSource, enableShuyuanSource, getShuyuanStats, refreshShuyuan } from '@/lib/shuyuan';
+import {
+  disableShuyuanSource, enableShuyuanSource, getShuyuanStats, refreshShuyuan,
+  ShuyuanRefreshPartialError,
+} from '@/lib/shuyuan';
 import { parseSourceFilter, parseSourcePage } from '@/lib/shuyuan-view';
 
 // 书源管理：GET 看统计/分页明细（owner）或由 Vercel cron 触发刷新，
@@ -30,6 +33,12 @@ function cronRequest(req: NextRequest): boolean {
   return authorization.startsWith('Bearer ') && equalSecret(authorization.slice(7), expected);
 }
 
+// 半挂刷新（只拉到部分合集 ⇒ 整表替换语义下必须中止）回固定错误码，供 cron 告警与人工排障区分
+// 「半挂」与其它 502。错误码是安全枚举，不是 e.message——原文含上游 URL，仍然不回显（见下方注释）。
+function partialCode(e: unknown): { code: string } | undefined {
+  return e instanceof ShuyuanRefreshPartialError ? { code: e.code } : undefined;
+}
+
 export async function GET(req: NextRequest) {
   const cron = cronRequest(req);
   const auth = cron ? null : await requirePermission(req, 'download');
@@ -52,7 +61,7 @@ export async function GET(req: NextRequest) {
     // 对外文案固定，不回 e.message：shuyuan.ts 的 fetch 失败消息含上游 URL，
     // 原样返回会把源站地址泄给浏览器（audit P2-5）。错误详情进日志。
     console.error('shuyuan stats failed', e instanceof Error ? { message: e.message } : e);
-    return authJson({ error: '书源统计暂不可用，请稍后重试' }, { status: 502 });
+    return authJson({ error: '书源统计暂不可用，请稍后重试', ...partialCode(e) }, { status: 502 });
   }
 }
 
@@ -100,6 +109,6 @@ export async function POST(req: NextRequest) {
   } catch (e) {
     // 同 GET：对外固定文案（POST 的失败消息同样可能含上游 URL），详情进日志。
     console.error('shuyuan refresh failed', e instanceof Error ? { message: e.message } : e);
-    return authJson({ error: '刷新失败' }, { status: 502 });
+    return authJson({ error: '刷新失败', ...partialCode(e) }, { status: 502 });
   }
 }

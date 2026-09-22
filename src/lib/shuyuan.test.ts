@@ -31,11 +31,11 @@ vi.mock('@/lib/db', () => ({ ensureSchema, getSql }));
 import {
   disableShuyuanSource, enableShuyuanSource, getEngineSources, getReadingPool, getShuyuanCounts,
   getShuyuanPoolHealth, getShuyuanStats, getReadingSources, refreshShuyuan,
-  REFRESH_BUDGET_MS, RESPONSE_TIMEOUT_MS,
+  REFRESH_BUDGET_MS, RESPONSE_TIMEOUT_MS, SHUYUAN_REFRESH_PARTIAL, ShuyuanRefreshPartialError,
 } from './shuyuan';
 import { resolveDownloadSource } from './download-source';
 import { sourceRevision } from './source-revision';
-import { rulesHash } from './rule-engine/admission';
+import { ADMISSION_MIN_BUDGET_MS, rulesHash } from './rule-engine/admission';
 import { refreshSupportedHosts, validateSourceUrl, SourcePolicyError } from './source-policy';
 import { SOURCE_PAGE_SIZE, pageCount } from './shuyuan-view';
 import { POST } from '@/app/api/shuyuan/route';
@@ -197,6 +197,67 @@ describe('refreshShuyuan atomic refresh', () => {
     expect(transaction).not.toHaveBeenCalled();
     expect(execute).not.toHaveBeenCalled();
     expect(fetchMock).toHaveBeenCalledTimes(4);
+  });
+
+  // S3-1（静默失败审计）：半挂（只拉到部分合集）必须保持中止——写库是整表替换语义
+  // （尾部事务 DELETE FROM shuyuan_sources + 整批 INSERT merged），带着 2/3 合集继续更新
+  // 会把缺失合集里的源静默删掉。判据不放宽，只补可观测：结构化错误 + 响亮告警。
+  it('S3-1 半挂中止带结构化错误：固定错误码 + expected/actual + 失败合集 id（原因已脱敏）', async () => {
+    responses.set(collectionUrl(12), { body: 'unavailable', status: 503 });
+
+    const error = await refreshShuyuan().catch((e: unknown) => e);
+
+    expect(error).toBeInstanceOf(ShuyuanRefreshPartialError);
+    const partial = error as ShuyuanRefreshPartialError;
+    expect(partial.code).toBe(SHUYUAN_REFRESH_PARTIAL);
+    expect(partial.expected).toBe(3);
+    expect(partial.actual).toBe(2);
+    // 失败合集只带仓内自有标识（合集 id）；reason 过 safeReason ⇒ 上游 URL 已抹除。
+    expect(partial.failures).toEqual([{ id: 12, reason: '503 [redacted-url]' }]);
+    expect(partial.failures[0].reason).not.toContain('yckceo');
+    // 响亮告警：日志里能一眼看出是「半挂」而不是别的 502。
+    expect(console.error).toHaveBeenCalledWith(
+      expect.stringContaining('shuyuan refresh partial'),
+      expect.objectContaining({
+        code: SHUYUAN_REFRESH_PARTIAL, expected: 3, actual: 2,
+        failures: [{ id: 12, reason: '503 [redacted-url]' }],
+      }),
+    );
+    // 语义不变：仍然零写库。
+    expect(transaction).not.toHaveBeenCalled();
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  it('S3-1 半挂经 /api/shuyuan 返回 502 + code:shuyuan_refresh_partial，文案仍固定不回显 e.message', async () => {
+    responses.set(collectionUrl(12), { body: 'unavailable', status: 503 });
+    const req = new NextRequest('http://localhost/api/shuyuan', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer shuyuan-test-owner', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: 'refresh' }),
+    });
+
+    const res = await POST(req);
+
+    expect(res.status).toBe(502);
+    const body = await res.json() as { error: string; code?: string };
+    expect(body).toEqual({ error: '刷新失败', code: 'shuyuan_refresh_partial' });
+    // P2-5 不倒退：错误码是安全枚举，不是 e.message——上游 URL 与数量原文都不出现在响应体里。
+    expect(JSON.stringify(body)).not.toContain('yckceo');
+    expect(body.error).not.toContain('仅拉到');
+  });
+
+  it('S3-1 非半挂的刷新失败不带 code：错误码只标半挂这一种失败', async () => {
+    transaction.mockRejectedValueOnce(new Error('书源事务写入失败'));
+    const req = new NextRequest('http://localhost/api/shuyuan', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer shuyuan-test-owner', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: 'refresh' }),
+    });
+
+    const res = await POST(req);
+
+    expect(res.status).toBe(502);
+    expect(await res.json()).toEqual({ error: '刷新失败' });
   });
 
   it('does not replace existing sources with an empty collection result', async () => {
@@ -554,6 +615,7 @@ describe('refreshShuyuan atomic refresh', () => {
       if (!fixture) throw new Error(`Unexpected network request: ${String(input)}`);
       return new Response(fixture.body, { status: fixture.status ?? 200 });
     });
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {});
 
     await refreshShuyuan();
 
@@ -563,6 +625,13 @@ describe('refreshShuyuan atomic refresh', () => {
       indexUrl, collectionUrl(11), collectionUrl(12), collectionUrl(13),
     ]);
     expect(transaction).toHaveBeenCalledOnce();
+    // S3-3：跳过不再静默——沿用 admission batch log 形状记一行，带 skipped:'budget' 与剩余毫秒数。
+    // 没有这行，连续几轮预算不够只会表现为「刷新 200、池健康度全绿、准入数据无限期陈旧」。
+    expect(log).toHaveBeenCalledWith('shuyuan admission batch', expect.objectContaining({
+      sources: 1, skipped: 'budget', remainingMs: expect.any(Number),
+    }));
+    expect((log.mock.calls.at(-1)![1] as { remainingMs: number }).remainingMs)
+      .toBeLessThanOrEqual(ADMISSION_MIN_BUDGET_MS);
   });
 
   it('统计拒绝未知来源健康声明，未禁用数量不能替代探测可达数量', async () => {
