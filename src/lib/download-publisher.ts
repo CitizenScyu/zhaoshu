@@ -380,22 +380,42 @@ export function buildChapterIndex(
 }
 
 /**
- * 读端 readBookIndex(清单分支)会把 chapter_index 翻成 ReaderChapter(键名 index/title/
- * startByte/endByte/partCount)再 JSON.stringify —— 这正是读端 4 MiB 门(readBookIndex 的 422)
- * 判的对象。这里按**同口径**估算读端会看到的字节,让发布侧与读端严格同门。
+ * 读端 readBookIndex(清单分支)把 chapter_index 翻成 ReaderChapter 后,对**整个 ReaderIndex**
+ * 做 `Buffer.byteLength(JSON.stringify(index))` 并与 MAX_INDEX_JSON_BYTES 比较
+ * (reader-server.ts:469-486)。要让发布侧与读端严格同门,这里必须对**同一个对象、同一次
+ * stringify** 估算,而不是逐章手算字节。
  *
- * 增量累计、逐条 stringify:不整体建一个大 JSON 字符串,2 万章也只 O(总字节)。与读端
- * `Buffer.byteLength(JSON.stringify(index))` 的差只在顶层固定开销(taskId/title/author/
- * version/totalBytes,< 1 KiB),对 4 MiB 门无影响;宁可略保守也不漏放。
+ * 为什么不再逐章求和再加大包开销常量:读端序列化的是**一整个** ReaderIndex —— 顶层 `{…}`
+ * 包裹、`"chapters":` 键、数组的 `[` `]`、以及**每两个相邻章对象之间的逗号**都是字节。
+ * 旧写法逐章 `Buffer.byteLength(JSON.stringify(单章))` 再求和,漏掉了「顶层包裹 + N-1 个
+ * 元素间逗号」,2 万章时系统性低估约 20 KiB,在 4 MiB 门边缘留下「能发布读不了」的残余盲区
+ * (rev41vol2 复审 P1)。逐个手数分隔符正是当初漏加的根因,故这里不再手数。
+ *
+ * 现在直接用**读端真实形状的对象**做一次 stringify:chapters 数组的元素顺序、键名、键序与
+ * 读端逐一相同(读端即 manifest.chapter_index.map(entry => ({index,title,startByte,endByte,
+ * partCount})),reader-server.ts:469-475)⇒ 序列化字节逐字节相等。顶层 wrapper 的五个字段
+ * (taskId/title/author/version/totalBytes)由调用方按写入清单的**真值**传入,不猜常量:
+ * 发布侧此刻已算出 blob_sha 与全书 bytes,等价于读端将看到的 manifest.blob_sha / manifest.bytes;
+ * taskId/title/author 与清单自洽。故估算值恒等于读端同口径字节,既不高估误拒也不低估漏放。
+ *
+ * 内存:一次性构造 ~N 个小对象 + 至多约 4 MiB 的结果串(2 万章量级),相较发布路径早已持有的
+ * 整本 txt(≤ MAX_BOOK_BYTES = 64 MiB)可忽略;且发生在任何 PUT 与清单落地之前。
  */
-export function readerIndexBytes(chapterIndex: VolumeChapterEntry[]): number {
-  let bytes = 256; // 顶层固定开销(taskId/title/author/version/totalBytes)的保守估计
-  for (const entry of chapterIndex) {
-    bytes += Buffer.byteLength(JSON.stringify({
+export function readerIndexBytes(
+  chapterIndex: VolumeChapterEntry[],
+  wrapper: { taskId: number; title: string; author: string; version: string; totalBytes: number },
+): number {
+  const index = {
+    taskId: wrapper.taskId,
+    title: wrapper.title,
+    author: wrapper.author,
+    version: wrapper.version,
+    totalBytes: wrapper.totalBytes,
+    chapters: chapterIndex.map((entry) => ({
       index: entry.i, title: entry.t, startByte: entry.s, endByte: entry.e, partCount: entry.p,
-    }), 'utf8');
-  }
-  return bytes;
+    })),
+  };
+  return Buffer.byteLength(JSON.stringify(index), 'utf8');
 }
 
 /**
@@ -449,7 +469,15 @@ export async function publishBookVersion(
   //    ReaderIndex 字节判(比清单自身更大,见 MAX_READER_INDEX_BYTES 注释)。2 万章 × 长标题/
   //    转义标题会把读端目录顶穿 4 MiB ⇒ 发布成功也读不了。在任何 PUT(甚至序列化大清单)
   //    之前拒绝,与 size_limit 同档(stage 归 manifest:坏的是章节索引体积,不是卷也不是指针)。
-  if (readerIndexBytes(chapterIndex) > MAX_READER_INDEX_BYTES) {
+  //
+  //    wrapper 传写入清单的真值:读端 readBookIndex 用 manifest.blob_sha 当 version、
+  //    manifest.bytes 当 totalBytes、task.id 当 taskId —— 这里的 blobSha(全书 sha40)、bytes、
+  //    candidate.taskId 正是清单将落下的同值。readerIndexBytes 据此组装**读端同形状**的
+  //    ReaderIndex 整体 stringify,估算与读端口径逐字节相等(不再逐章手算而漏掉逗号/包裹)。
+  if (readerIndexBytes(chapterIndex, {
+    taskId: Number(candidate.taskId), title: candidate.title, author: candidate.author,
+    version: blobSha, totalBytes: bytes,
+  }) > MAX_READER_INDEX_BYTES) {
     throw new PublicationStageError('manifest', 'index_too_large');
   }
 

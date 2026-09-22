@@ -13,10 +13,11 @@
 // 本文件:护栏(短标题两侧在门内)+ 缺口成因证明 + 修法护栏(发布即拒)+ 修法不误伤(短标题仍 promoted)。
 import { describe, expect, it } from 'vitest';
 import {
-  publishBookVersion, snapshotPaths, readerIndexBytes, MAX_READER_INDEX_BYTES,
+  publishBookVersion, snapshotPaths, readerIndexBytes, gitBlobSha, MAX_READER_INDEX_BYTES,
   type GitHubContents,
 } from './download-publisher';
 import { parseVolumeManifest } from './volume-manifest';
+import type { VolumeChapterEntry } from './volume-manifest';
 import { parseTxtChapters } from './txt-chapters';
 
 const guardOk = { check: async () => {} };
@@ -25,6 +26,10 @@ const AUTHOR = '佚名';
 const N = 20_000;
 /** 读端 MAX_INDEX_JSON_BYTES / MAX_MANIFEST_BYTES,同值 4 MiB(reader-server.ts)。 */
 const READER_INDEX_GATE = 4 * 1024 * 1024;
+/** 40 hex 占位(version/blob_sha 长度量级);真实发布侧用全书 gitBlobSha。 */
+const VERSION40 = '0'.repeat(40);
+/** readerIndexBytes 的固定 wrapper(与发布侧写入清单的 taskId/title/author 对齐)。 */
+const testWrapper = { taskId: 7, title: TITLE, author: AUTHOR, version: VERSION40, totalBytes: 0 };
 
 /** 最小内存 GitHub(绝不联网):put 落 map,getBytes 从未落盘的路径返回 null。 */
 class MemoryGitHub implements GitHubContents {
@@ -57,6 +62,26 @@ function readerIndexFromManifest(manifest: NonNullable<ReturnType<typeof parseVo
       index: entry.i, title: entry.t, startByte: entry.s, endByte: entry.e, partCount: entry.p,
     })),
   };
+}
+
+/**
+ * 真实读端字节(读端 readBookIndex 清单分支同口径):用整本书 txt 算出 blob_sha 与 bytes,
+ * 组装 **ReaderIndex 整体** 后一次 stringify —— 与 reader-server.ts:469-486 逐字节等价
+ * (包含顶层包裹、每章键名/键序、数组分隔逗号)。**刻意不复用** readerIndexBytes,
+ * 用来独立对拍:readerIndexBytes 与其比较,低估会在此露馅。
+ */
+function readerIndexRealBytes(
+  entries: VolumeChapterEntry[],
+  wrapper: { taskId: number; title: string; author: string; version: string; totalBytes: number },
+): number {
+  const index = {
+    taskId: wrapper.taskId, title: wrapper.title, author: wrapper.author,
+    version: wrapper.version, totalBytes: wrapper.totalBytes,
+    chapters: entries.map((entry) => ({
+      index: entry.i, title: entry.t, startByte: entry.s, endByte: entry.e, partCount: entry.p,
+    })),
+  };
+  return Buffer.byteLength(JSON.stringify(index), 'utf8');
 }
 
 /** 发布一本书,返回解析回来的清单 + 落地的清单 raw 字节 + 读端索引字节。 */
@@ -122,7 +147,7 @@ describe('2 万章清单字节边界:发布 vs 读回(rev41vol2 P1 缺口)', () 
     expect(indexBytes).toBeGreaterThan(READER_INDEX_GATE); // 但目录索引被读端 422 门拒 ⇒ 未修时「读不了」
     // 发布侧门必须按读端等价字节判:同一份 chapter_index 序列化成读端形状更大。
     const entries = chapters.map((c, i) => ({ i, t: c.title, v: 0, s: c.startByte, e: c.endByte, p: 1 }));
-    expect(readerIndexBytes(entries)).toBeGreaterThan(manifestBytes); // 读端形状 > 清单形状
+    expect(readerIndexBytes(entries, testWrapper)).toBeGreaterThan(manifestBytes); // 读端形状 > 清单形状
     expect(MAX_READER_INDEX_BYTES).toBe(READER_INDEX_GATE); // 门与读端严格同值
   });
 
@@ -136,5 +161,62 @@ describe('2 万章清单字节边界:发布 vs 读回(rev41vol2 P1 缺口)', () 
     const outcome = await publishGuarded(0) as { promoted: boolean; volumeCount: number };
     expect(outcome.promoted).toBe(true);
     expect(outcome.volumeCount).toBeGreaterThanOrEqual(1);
+  });
+
+  // rev41vol2 复审 P1:readerIndexBytes 旧写法逐章 stringify 再求和,漏掉了顶层包裹与
+  // 数组元素间逗号,实测恒定低估(2 万章 ≈ -19,882 B / 1.99 万章 ≈ -19,782 B),在 4 MiB 门
+  // 边缘留下「能发布读不了」盲区。下面两条把该判据钉成回归门:估算必须**逐字节等于**读端
+  // 真实序列化字节(不再低估也不高估),且复审构造的 pad=40/n=19900 边界书必须发布即拒。
+
+  it('P1 对拍:readerIndexBytes 逐字节等于读端真实 JSON.stringify(ReaderIndex) 字节', () => {
+    // 覆盖规模:几百 ~ 几千 ~ 8500 ~ 19700 ~ 19900 ~ 20000 章 × 多档标题长度(含转义/超长)。
+    // totalBytes 取该书真实 UTF-8 字节,version 用真实全书 gitBlobSha(40 hex)—— 与发布侧
+    // 写入清单、读端将读到的 wrapper 完全同值,故估算应当与读端**精确相等**。
+    const shapes: Array<{ pad: number; n: number }> = [
+      { pad: 0, n: 300 }, { pad: 6, n: 500 }, { pad: 10, n: 1200 }, { pad: 14, n: 3000 },
+      { pad: 20, n: 6000 }, { pad: 24, n: 8500 }, { pad: 30, n: 9000 }, { pad: 36, n: 19_000 },
+      { pad: 38, n: 19_700 }, { pad: 40, n: 19_900 }, { pad: 42, n: 19_900 }, { pad: 44, n: 20_000 },
+    ];
+    for (const { pad, n } of shapes) {
+      const txt = bookText(pad, n);
+      const chapters = parseTxtChapters(Buffer.from(txt, 'utf8'), 64 * 1024 * 1024);
+      expect(chapters).toHaveLength(n);
+      const entries: VolumeChapterEntry[] = chapters.map((c, i) =>
+        ({ i, t: c.title, v: 0, s: c.startByte, e: c.endByte, p: 1 }));
+      const wrapper = { taskId: 7, title: TITLE, author: AUTHOR, version: gitBlobSha(txt), totalBytes: Buffer.byteLength(txt, 'utf8') };
+      const est = readerIndexBytes(entries, wrapper);
+      const real = readerIndexRealBytes(entries, wrapper);
+      const delta = est - real;
+      const where = `pad=${pad} n=${n}`;
+      if (process.env.VOL_DEBUG) console.log(`对拍 ${where}: est=${est} real=${real} delta=${delta}`);
+      expect(est, `估算不得低估读端真实字节(${where},差 ${delta})`).toBeGreaterThanOrEqual(real);
+      // 既不高估到误拒:差值必须为 0(同对象同 stringify ⇒ 逐字节相等)。
+      expect(delta, `估算不得过度高估(${where},差 ${delta})`).toBe(0);
+    }
+  });
+
+  it('P1 盲区堵死:复审构造 pad=40/n=19900 的书,修后发布即被拒(promoted=false)', async () => {
+    // 这是复审 rev41vol2 A.4 的可达反例:est(old)=4,180,175 < 门 ⇒ 旧代码 promoted=true,
+    // 而读端 real=4,199,957 > 门 ⇒ 读端 422「能发布读不了」。修后估算 == 读端真实,发布门
+    // 在第一个 PUT 前就拒绝(stage=manifest),不再漏放。用 try/catch 捕获以同时打印两侧字节。
+    const pad = 40;
+    const n = 19_900;
+    const txt = bookText(pad, n);
+    const chapters = parseTxtChapters(Buffer.from(txt, 'utf8'), 64 * 1024 * 1024);
+    const entries: VolumeChapterEntry[] = chapters.map((c, i) =>
+      ({ i, t: c.title, v: 0, s: c.startByte, e: c.endByte, p: 1 }));
+    const wrapper = { taskId: 7, title: TITLE, author: AUTHOR, version: gitBlobSha(txt), totalBytes: Buffer.byteLength(txt, 'utf8') };
+    const est = readerIndexBytes(entries, wrapper);
+    const real = readerIndexRealBytes(entries, wrapper);
+    console.log(`P1 盲区 pad=${pad}/n=${n}: 修后估算=${est} 读端真实=${real} gate=${READER_INDEX_GATE}`);
+    expect(real).toBeGreaterThan(READER_INDEX_GATE); // 读端若取这本书必 422:确实是「读不了」形态
+    expect(est).toBeGreaterThan(READER_INDEX_GATE); //  修后估算也 > 门 ⇒ 发布门会拒
+    let err: unknown;
+    try {
+      await publishGuarded(pad, n);
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toMatchObject({ name: 'PublicationStageError', stage: 'manifest' }); // 发布即拒,没 promoted
   });
 });
