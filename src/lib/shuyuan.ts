@@ -43,7 +43,9 @@ const WRITE_RESERVE_MS = 5_000;
 export const RESPONSE_TIMEOUT_MS = 12_000;
 // 刷新总预算：index + 合集 JSON + 失效源探活 共用这一整份预算；
 // 剩余时间不足时不再新增探活（未探测的源不能当作已恢复）。
-export const REFRESH_BUDGET_MS = 90_000;
+// 180s：M1 准入批次（真实搜索 ≤10 源 × 最坏 8.4s/源串行 ≈ 84s）也在预算内，
+// 仍留余量给替换事务与写库；route maxDuration=295s 平台上限内（canProbe 逐探止损）。
+export const REFRESH_BUDGET_MS = 180_000;
 
 export type ShuyuanCollection = { id: number; title: string; count: number };
 
@@ -701,7 +703,7 @@ export async function enableShuyuanSource(url: string): Promise<boolean> {
   return rows.length > 0;
 }
 
-// 固定合集拉取、规则核对、有限探测和写回共用原有 90s 预算。
+// 固定合集拉取、规则核对、有限探测和写回共用原有预算（现 180s，见 REFRESH_BUDGET_MS）。
 export async function refreshShuyuan(parentSignal?: AbortSignal): Promise<ShuyuanStats> {
   const budget = createDeadline(REFRESH_BUDGET_MS);
   const signal = parentSignal ? AbortSignal.any([parentSignal, budget.signal]) : budget.signal;
@@ -877,9 +879,9 @@ async function refreshWithinBudget(s: Sql, budget: RequestDeadline, signal: Abor
 
 /**
  * 准入批次（设计 §4.2）。时序：全量替换事务之后。硬约束：
- * - 剩余预算 ≤ ADMISSION_MIN_BUDGET_MS 即整批跳过，绝不挤占 90s 刷新；
+ * - 剩余预算 ≤ ADMISSION_MIN_BUDGET_MS 即整批跳过，绝不挤占刷新预算（180s）；
  * - 候选池 = 通过 survey 初筛的源（非候选根本不进 M1 准入，故无候选时零 DB 往返）；
- * - runAdmissionBatch 每轮真实搜索 ≤ 5 源，逐探前再查预算。
+ * - runAdmissionBatch 每轮真实搜索 ≤ 10 源，逐探前再查预算。
  * 只写 source_admission，不碰 shuyuan_sources；异常不终结刷新（§6.3：准入异常 → deferred）。
  */
 async function runAdmissionAfterRefresh(

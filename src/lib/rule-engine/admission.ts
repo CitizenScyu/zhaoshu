@@ -28,14 +28,14 @@ export const ADMISSION_MAX_BYTES = 2 * 1024 * 1024;
 export const ADMISSION_MAX_REDIRECTS = 3;
 export const ADMISSION_THROTTLE_MS = 350;
 /** 每轮刷新最多跑几个新源的真实搜索（对齐 PROBE_DISCOVERY_PER_REFRESH 模式，设计 §4.2）。 */
-export const ADMISSION_MAX_PROBES_PER_REFRESH = 5;
+export const ADMISSION_MAX_PROBES_PER_REFRESH = 10;
 /**
  * deferred 态重测间隔（设计 §4.2：软故障/url_invalid 定期重测）。
  * 取 20h 而非 24h：cron 有分钟级抖动/偶发漏触发，严格 24h 判据会把前一日刚测过的
  * deferred 源推迟一整周期才复测；20h 留 4h 余量，保证每个自然日至少复测一次。
  */
 export const ADMISSION_RETEST_INTERVAL_MS = 20 * 3_600_000;
-/** 剩余预算低于此值即整批跳过，绝不挤占 90s 刷新（设计风险台账 #4）。 */
+/** 剩余预算低于此值即整批跳过，绝不挤占刷新预算（设计风险台账 #4）。 */
 export const ADMISSION_MIN_BUDGET_MS = 10_000;
 
 // CHALLENGE_MARKERS 口径对齐 probe-reachability.py:33。cloudflare 字样过宽（正常经 CF CDN
@@ -574,7 +574,7 @@ function planProbeOrder(input: AdmissionBatchInput, nowMs: number): AdmissionPla
 /**
  * 跑一轮准入批次（设计 §4.2）。纯逻辑：不碰 DB，输入既有行、输出要写库的行。
  * 状态机：new → compile_rejected（终态，规则不变不复测）｜new → deferred → (ok|rejected)｜ok。
- * 每轮真实搜索 ≤ maxProbes（默认 5），按 planProbeOrder 的公平序分配名额（N04）；
+ * 每轮真实搜索 ≤ maxProbes（默认 10），按 planProbeOrder 的公平序分配名额（N04）；
  * canProbe 为 false 时停止探测但仍写出可离线得到的结论。
  * N03 祖父条款：新必需组校验收紧时，既有「规则未变 ∧ compile_ok ∧ search_ok=true」的行
  * 不改判 compile 拒（W1 现网池红线），规则一变即按新校验重审。
@@ -643,7 +643,12 @@ export async function runAdmissionBatch(input: AdmissionBatchInput): Promise<Adm
       continue;
     }
     // 本轮没轮到/预算不足：仅在「规则变过或库中无行」时写一条未测行占位，下一轮接着测。
-    if (rulesChanged) {
+    // 例外（防出池）：既有行已实证可搜（search_ok=true ∧ compile_ok=true）时不写占位——
+    // 占位行经 ON CONFLICT DO UPDATE 会把 search_ok=true 覆盖成 null，入池谓词
+    // `search_ok IS TRUE` 即失配、源被打出池（2026-09-21 实证 234.484448.xyz 隔天出池）。
+    // 保留旧行原样（rules_hash 不更新），下一轮 rulesChanged 仍成立、仍优先排队真探，
+    // 复测拿到名额后正常改写——不放松任何判据，只是没轮到时不清掉旧结论。
+    if (rulesChanged && !(previous?.search_ok === true && previous.compile_ok === true)) {
       rows.push({
         source_url: candidate.url, tier: 'M1', compile_ok: true, core_field_mask: compile.coreFieldMask,
         search_ok: null, search_verdict: '', search_checked_at: null, rules_hash: hash,

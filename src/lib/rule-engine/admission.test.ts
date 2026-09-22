@@ -311,7 +311,7 @@ describe('两把锁判别性用例（v3 E3 正例+负例）', () => {
 });
 
 describe('准入状态机 runAdmissionBatch', () => {
-  it('174 源一轮 mock 准入：114 compile-ok / 60 compile 拒（L2 后冻结数字），真实搜索 ≤5，未探测占位可续测', async () => {
+  it('174 源一轮 mock 准入：114 compile-ok / 60 compile 拒（L2 后冻结数字），真实搜索 ≤10（默认名额），未探测占位可续测', async () => {
     const fetchPage = vi.fn<AdmissionTransport>().mockResolvedValue(page('<html><body>no results</body></html>'));
     const declaredHosts = new Set(sources.map((source) => new URL(source.bookSourceUrl).hostname));
     const result = await runAdmissionBatch({
@@ -320,17 +320,20 @@ describe('准入状态机 runAdmissionBatch', () => {
     });
     expect(result.compileOk).toBe(114);
     expect(result.compileRejected).toBe(60);
-    expect(result.probed).toBe(5);
-    expect(fetchPage).toHaveBeenCalledTimes(5);
+    // 默认名额 10：其中 1 个候选（ubook.reader.qq.com）searchUrl 判 url_invalid、
+    // 不发网络请求即落行，实际 fetchPage 9 次。
+    expect(result.probed).toBe(10);
+    expect(fetchPage).toHaveBeenCalledTimes(9);
     // 200 但 bookList 无候选 → no_result（deferred 桶，下轮可复测），不是 ok/rejected。
-    expect(result.verdicts).toEqual({ no_result: 5 });
+    expect(result.verdicts).toEqual({ no_result: 9, url_invalid: 1 });
     for (const row of result.rows.filter((item) => item.search_verdict === 'no_result')) {
       expect(admissionBucket(row.search_verdict)).toBe('deferred');
       expect(row.search_ok).toBe(false);
     }
-    // 全部 174 源都有行（114 通过 + 60 拒），未轮到的通过源写未测占位。
+    // 全部 174 源都有行（114 通过 + 60 拒），未轮到的通过源写未测占位
+    // （114 - 10 已探测 = 104 占位）。
     expect(result.rows).toHaveLength(174);
-    expect(result.rows.filter((row) => row.compile_ok && row.search_ok === null)).toHaveLength(109);
+    expect(result.rows.filter((row) => row.compile_ok && row.search_ok === null)).toHaveLength(104);
     for (const row of result.rows.filter((item) => !item.compile_ok)) {
       expect(row.tier).toBe('T7');
       expect(row.host).not.toBe('');
@@ -468,6 +471,80 @@ describe('准入状态机 runAdmissionBatch', () => {
     });
     expect(result.probed).toBe(0);
     expect(fetchPage).not.toHaveBeenCalled();
+    expect(result.rows[0]).toMatchObject({ compile_ok: true, search_ok: null, search_verdict: '' });
+  });
+
+  // 防出池（勘案 41 清单 1）：占位覆盖曾把入池源（search_ok=true）打成 null 出池。
+  // 2026-09-21 实证 234.484448.xyz：00:05 轮入池、20:27 轮被占位覆盖出池。
+  it('rulesChanged ∧ 既有行 search_ok=true ∧ compile_ok=true ∧ 没轮到名额 → 不写行（不占位覆盖，保住入池资格）', async () => {
+    const url = 'https://pinned.example.com';
+    const source = syntheticSource('https://pinned.example.com/');
+    // 既有行：上一轮真探过 search_ok=true，但 rules_hash 是旧规则（本轮 rulesChanged 成立）。
+    const existing = new Map([[url, sourceRow(url, {
+      tier: 'M1', compile_ok: true, search_ok: true, search_verdict: 'ok',
+      search_checked_at: new Date().toISOString(),
+      rules_hash: '1:stale-old-rules', engine_semantics_version: 1,
+    })]]);
+    // 名额 0（没轮到）→ 旧行为会写 search_ok=null 占位、覆盖出池；修复后不写任何行。
+    const result = await runAdmissionBatch({
+      candidates: [{ url, source }], declaredHosts: new Set(['pinned.example.com']),
+      existing, fetchPage: vi.fn<AdmissionTransport>(), signal: signal(), throttleMs: 0, maxProbes: 0,
+    });
+    expect(result.probed).toBe(0);
+    expect(result.rows).toHaveLength(0); // 关键断言：不写占位 = 不覆盖旧行 = 不出池
+  });
+
+  it('防出池续测：下一轮仍 rulesChanged 且拿到名额 → 正常真探改写（不放松任何判据）', async () => {
+    const url = 'https://pinned2.example.com';
+    const source = syntheticSource('https://pinned2.example.com/');
+    const existing = new Map([[url, sourceRow(url, {
+      tier: 'M1', compile_ok: true, search_ok: true, search_verdict: 'ok',
+      search_checked_at: new Date().toISOString(),
+      rules_hash: '1:stale-old-rules', engine_semantics_version: 1,
+    })]]);
+    const fetchPage = vi.fn<AdmissionTransport>().mockResolvedValue(
+      page('<div class="i"><span class="t">书名</span><a href="/b/1">x</a></div>'));
+    const result = await runAdmissionBatch({
+      candidates: [{ url, source }], declaredHosts: new Set(['pinned2.example.com']),
+      existing, fetchPage, signal: signal(), throttleMs: 0, maxProbes: 1,
+    });
+    expect(result.probed).toBe(1); // rulesChanged ⇒ probeClass=1，拿到名额即真探
+    expect(result.rows).toHaveLength(1);
+    expect(result.rows[0]).toMatchObject({
+      search_ok: true, search_verdict: 'ok', rules_hash: rulesHash(source),
+    });
+  });
+
+  it('防出池边界：既有行 search_ok=true 但 compile_ok=false → 不在保护范围，仍写占位（勘案 §2.2 条件即 compile_ok∧search_ok 双真才保）', async () => {
+    // compile_ok=false 的行本就不满足入池谓词（search_ok IS TRUE 之外还需 JOIN 源表 +
+    // compile_ok），占位覆盖不会改变其池外状态；不扩大保护面，避免占位语义被稀释。
+    const url = 'https://pinned3.example.com';
+    const source = syntheticSource('https://pinned3.example.com/');
+    const existing = new Map([[url, sourceRow(url, {
+      tier: 'M1', compile_ok: false, search_ok: true, search_verdict: 'ok',
+      search_checked_at: new Date().toISOString(),
+      rules_hash: '1:stale-old-rules', engine_semantics_version: 1,
+    })]]);
+    const result = await runAdmissionBatch({
+      candidates: [{ url, source }], declaredHosts: new Set(['pinned3.example.com']),
+      existing, fetchPage: vi.fn<AdmissionTransport>(), signal: signal(), throttleMs: 0, maxProbes: 0,
+    });
+    expect(result.rows).toHaveLength(1); // 双真才保：compile_ok=false → 仍占位（旧语义）
+    expect(result.rows[0]).toMatchObject({ compile_ok: true, search_ok: null });
+    expect(result.probed).toBe(0);
+  });
+
+  it('防出池不放松未测语义：rulesChanged ∧ previous.search_ok=null → 仍写占位（旧行为保留）', async () => {
+    const url = 'https://queue.example.com';
+    const source = syntheticSource('https://queue.example.com/');
+    const existing = new Map([[url, sourceRow(url, {
+      tier: 'M1', compile_ok: true, search_ok: null, rules_hash: '1:stale-old-rules',
+    })]]);
+    const result = await runAdmissionBatch({
+      candidates: [{ url, source }], declaredHosts: new Set(['queue.example.com']),
+      existing, fetchPage: vi.fn<AdmissionTransport>(), signal: signal(), throttleMs: 0, maxProbes: 0,
+    });
+    expect(result.rows).toHaveLength(1); // 未测占位照写——84 队列续测语义不受防出池修复影响
     expect(result.rows[0]).toMatchObject({ compile_ok: true, search_ok: null, search_verdict: '' });
   });
 
@@ -789,7 +866,7 @@ describe('准入状态机 runAdmissionBatch', () => {
       const existing = new Map<string, AdmissionSourceRow>();
       const runOne = async () => runAdmissionBatch({
         candidates, declaredHosts: new Set(hosts), existing, fetchPage: fail,
-        signal: signal(), throttleMs: 0,
+        signal: signal(), throttleMs: 0, maxProbes: 5,
       });
       // 轮 1（全新）：5 个名额。未测优先按输入序 → s0..s4 被探测（500 → deferred 占位），
       // s5 未轮到但「库中无行」→ 写未测占位，不再是恒 null 的黑洞。
@@ -920,19 +997,36 @@ describe('rulesHash 纳入引擎语义版本', () => {
   });
 
   it('预置旧语义 rulesHash 的 search_ok 不会复用，先失效为待探测', async () => {
+    // 注：防出池修复（rulesChanged ∧ 双真 → 不占位）不与此冲突——该场景双真的行没轮到名额时
+    // 不写占位、旧行保留，hash 前缀仍是 0:，下一轮 rulesChanged 仍成立、拿到名额即真探改写；
+    // 本用例的既有行 compile_ok=true ∧ search_ok=true，在 maxProbes=0 下新语义应为「不写行」。
+    // 语义版本翻转（1:→2:）时同理：池源保住旧结论，复测拿名额后按新前缀改写。
+    // 此处以 compile_ok=true 断言旧语义版本翻转路径的旧行为变化：翻转后（旧 hash 0:）
+    // 行不再被占位覆盖——search_ok=true 保留至真探，而非被清成 null。
     const source = syntheticSource('https://search-version.example.com/');
-    const result = await runAdmissionBatch({
+    const existing = new Map([['https://search-version.example.com/', sourceRow('https://search-version.example.com/', {
+      tier: 'M1', compile_ok: true, search_ok: true, search_verdict: 'ok',
+      rules_hash: '0:legacy-content', engine_semantics_version: 0,
+    })]]);
+    const noSlot = await runAdmissionBatch({
       candidates: [{ url: 'https://search-version.example.com/', source }],
       declaredHosts: new Set(['search-version.example.com']),
-      existing: new Map([['https://search-version.example.com/', sourceRow('https://search-version.example.com/', {
-        tier: 'M1', compile_ok: true, search_ok: true, search_verdict: 'ok',
-        rules_hash: '0:legacy-content', engine_semantics_version: 0,
-      })]]),
-      fetchPage: vi.fn<AdmissionTransport>(), signal: signal(), maxProbes: 0,
+      existing, fetchPage: vi.fn<AdmissionTransport>(), signal: signal(), maxProbes: 0,
     });
-    expect(result.rows).toHaveLength(1);
-    expect(result.rows[0]).toMatchObject({
-      compile_ok: true, search_ok: null, search_verdict: '', rules_hash: rulesHash(source),
+    // 防出池：双真行没轮到名额 → 不写占位（旧行的 search_ok=true 保留）。
+    expect(noSlot.rows).toHaveLength(0);
+    expect(noSlot.probed).toBe(0);
+
+    // 拿到名额 → 真探正常改写为新前缀，search_ok 不复用旧结论。
+    const probed = await runAdmissionBatch({
+      candidates: [{ url: 'https://search-version.example.com/', source }],
+      declaredHosts: new Set(['search-version.example.com']),
+      existing, fetchPage: vi.fn<AdmissionTransport>().mockResolvedValue(page('<html>x</html>')),
+      signal: signal(), maxProbes: 1, throttleMs: 0,
+    });
+    expect(probed.rows).toHaveLength(1);
+    expect(probed.rows[0]).toMatchObject({
+      compile_ok: true, search_ok: false, search_verdict: 'no_result', rules_hash: rulesHash(source),
       engine_semantics_version: ENGINE_SEMANTICS_VERSION,
     });
   });
