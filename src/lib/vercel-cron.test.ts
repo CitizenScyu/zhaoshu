@@ -13,8 +13,18 @@ import { readFileSync } from 'node:fs';
 //
 // 门禁只看「分」「时」两段：日/月/周两段最多把触发**减少**到每周/每月一次，
 // 不可能造成「同一天多次触发」，故无需参与计算。
+//
+// 关于「条数」：`b89f575`（2026-09-19）的提交信息写「Hobby 限每项目 2 个 cron」，
+// 经查**不成立**——Vercel 官方文档表（https://vercel.com/docs/cron-jobs/usage-and-pricing，
+// 2026-09-23 抓取）Hobby/Pro/Enterprise 均为 **100 cron jobs / 项目**；且本仓 3 条 cron 的
+// `vercel.json` 已有多次成功上线的生产部署（最新 READY：`7786d38`，2026-09-22T11:57Z，
+// `vercel inspect` 内联 `vercelConfig.crons` 实为 3 条）。故这里的条数上限取文档值 100，
+// 而非误传的 2；cron 频率才是唯一的硬限制。
 
 type Cron = { path: string; schedule: string };
+
+/** Vercel 文档表：Hobby 计划每项目 cron 条数上限（2026-09-23 抓取核实）。 */
+const HOBBY_MAX_CRON_JOBS = 100;
 
 /** 展开单个 crontab 字段为「一天内命中该字段的取值个数」。 */
 function fieldCardinality(field: string, lo: number, hi: number): number {
@@ -57,14 +67,27 @@ describe('vercel.json crons 离线门禁（Vercel Hobby：每条每天最多一�
     expect(config.crons.map((c) => c.path)).toContain('/api/shuyuan');
   });
 
+  it(`cron 条数 ≤ ${HOBBY_MAX_CRON_JOBS}（Hobby 文档上限；「每项目 2 条」系误传）`, () => {
+    expect(
+      config.crons.length,
+      `vercel.json 有 ${config.crons.length} 条 cron，超过 Hobby 文档上限 ${HOBBY_MAX_CRON_JOBS} 条 ` +
+        `（https://vercel.com/docs/cron-jobs/usage-and-pricing，2026-09-23 核实）。` +
+        `注意：b89f575 提交信息里的「每项目限 2 条」是误传——本仓 3 条 cron 已成功部署多次，` +
+        `真正的硬限制是「每条每天一次」（见下一条用例）。`,
+    ).toBeLessThanOrEqual(HOBBY_MAX_CRON_JOBS);
+  });
+
   it.each(config.crons)('$path 每天触发 ≤ 1 次（Hobby 限制，违反即整次部署被拒）', ({ path, schedule }) => {
     const perDay = triggersPerDay(schedule);
     expect(
       perDay,
       `cron「${path}」的 schedule "${schedule}" 每天触发 ${perDay} 次 > 1 次。` +
-        `Vercel Hobby 计划规定每条 cron 每天只能触发一次，` +
-        `否则部署在配置校验阶段就被拒（Vercel / failure / "Deployment failed."，无部署记录）。` +
-        `参见 2026-09-19 b89f575 与 2026-09-23 c26c3b8 两次事故。` +
+        `Vercel 在部署前校验阶段直接拒绝，报错原文：` +
+        `"Hobby accounts are limited to daily cron jobs. This cron expression would run more than once per day."` +
+        `该错误只在 GitHub commit status 上留下 Vercel / failure / "Deployment failed."，` +
+        `Vercel 侧不生成部署记录（vercel ls 查不到），极易被误判成「cron 没触发」。` +
+        `本仓已被此坑击穿两次：2026-09-19 b89f575、2026-09-23 c26c3b8。` +
+        `提交信息不是防线，这条测试才是。` +
         `需要更频繁消化队列请改用外部定时器（如 GitHub Actions 打 /api/shuyuan），不要把小时段写成列表。`,
     ).toBeLessThanOrEqual(1);
   });
