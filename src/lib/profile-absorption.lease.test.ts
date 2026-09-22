@@ -17,7 +17,7 @@ vi.mock('./llm', () => ({
 vi.mock('./record-llm-usage', () => ({ recordUsageAfterResponse: () => () => {} }));
 
 import { absorbPendingProfileFeedback } from './profile-absorption';
-import { getProfileFeedbackForUser, markProfileFeedbackAbsorbedForUser } from './db';
+import { getProfileFeedbackForUser, getProfileForUser, markProfileFeedbackAbsorbedForUser, markProfileFeedbackFailedForUser } from './db';
 
 afterEach(() => vi.clearAllMocks());
 
@@ -46,4 +46,22 @@ it('R3：无有效反馈的零行完成更新也返回 conflict', async () => {
 it.each([null, 9])('R3：匹配成功明确保留 pending=%s', async (pending) => {
   expect(await markProfileFeedbackAbsorbedForUser(1, 7, 'applied', async () => [[{ pending_feedback_id: pending }]], 'lease'))
     .toEqual({ matched: true, pendingFeedbackId: pending });
+});
+
+// F2 附带修：claim 成功之后的读库此前在 try 之外——连接失败/约束错误会裸抛，租约已领走却
+// 不走 markFailed，漏记 attempts、不设退避，租约要等 8 分钟自然过期。挪进 try 后必须与
+// 模型阶段失败同语义（清租约 + 退避 + attempts）。
+it('F2：claim 后读库抛错也记失败退避，租约不裸悬', async () => {
+  vi.spyOn(console, 'error').mockImplementation(() => {});
+  vi.mocked(getProfileForUser).mockRejectedValueOnce(new Error('synthetic read failure'));
+
+  const result = await absorbPendingProfileFeedback({
+    userId: 1, leaseToken: 'lease-read-fail', write: async () => [[]],
+    signal: new AbortController().signal, modelBudgetMs: 1000,
+  });
+
+  expect(result).toEqual({ status: 'failed', pendingFeedbackId: 7 });
+  expect(markProfileFeedbackFailedForUser).toHaveBeenCalledWith(
+    1, 'failed', 'Error', expect.any(Function), 'lease-read-fail',
+  );
 });
