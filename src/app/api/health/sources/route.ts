@@ -64,7 +64,7 @@ export async function GET() {
     health.refreshedAtAgeHours = pool.refreshedAtAgeHours;
     health.admissionCheckedAtAgeHours = admissionCheckedAtAgeHours;
     // shuyuan 的「上次成功时间」就是 refreshed_at（同一条 meta 行，刷新成功才推进）。
-    // 端点只读一次 meta、不额外读时间戳，故由已取到的年龄反推（0.1h 取整，对 8h 阈值无影响）。
+    // 端点只读一次 meta、不额外读时间戳，故由已取到的年龄反推（0.1h 取整，相对 26h 阈值可忽略）。
     health.crons.shuyuan.lastSuccessAt = pool.refreshedAtAgeHours === null
       ? null
       : new Date(Date.now() - pool.refreshedAtAgeHours * 3_600_000).toISOString();
