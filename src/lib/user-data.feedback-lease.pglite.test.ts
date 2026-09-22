@@ -231,6 +231,46 @@ maybe('真实 PostgreSQL：profile_feedback_queue 租约与退避（F15 残留�
     expect(users).not.toContain(3);
   });
 
+  // F2 公平排序：固定 ORDER BY user_id 会让最低 id 的慢性失败用户每天独占 drain 窗口
+  // （295s 预算实际只够一次吸收），其后所有 pending 用户永无兜底。改 updated_at ASC 后
+  // 每次失败都会把失败者推到队尾（markFailed 写 updated_at = now()），自然轮转。
+  it('F2 公平排序：慢性失败的低 id 用户沉底，久候的高 id 用户先出线', async () => {
+    const seed = async (userId: number, title: string) => {
+      const b = await book(title);
+      const id = await feedback(userId, b, 'done', '公平轮转');
+      await enqueue(userId, id - 1, true);
+      return id;
+    };
+    await pg.query('INSERT INTO users (id) VALUES (201), (202)');
+    // 202 先入队并从此无人问津：updated_at 停在入队那一刻，是队里最久未被处理的行。
+    const idHigh = await seed(202, '公平乙久候无人处理');
+    // pg_sleep 让两次写入落在可区分的时刻（PGlite 同一毫秒内会撞同刻，退化为 user_id 破平）。
+    await pg.query('SELECT pg_sleep(0.05)');
+    // 201 入队后被 drain 领走并失败——markFailed 把它的 updated_at 推到最新（队尾）。
+    // 这正是「每天独占窗口的慢性失败者」在旧实现下的状态。
+    const idLow = await seed(201, '公平甲慢性失败');
+    await claim(201, 'token-fair-1', 60_000);
+    await markFailed(201, 'failed', 'ValidationError', 'token-fair-1', profileFeedbackBackoffMs(1));
+    // 退避到期（拨到过去，模拟次日 drain 窗口）：两人此刻都 eligible。
+    await pg.query("UPDATE profile_feedback_queue SET next_eligible_at = now() - interval '1 second' WHERE user_id = 201");
+
+    // 🔴 变异哨兵：旧实现 ORDER BY user_id 下 201 恒先于 202（201 < 202），本断言必红。
+    const order = (await drainable(50)).map((row) => row.user_id);
+    expect(order.indexOf(202)).toBeLessThan(order.indexOf(201));
+    // 「窗口只够处理一个」的饥饿场景：出线者不是慢性失败的 201。
+    expect((await drainable(1)).map((row) => row.user_id)).not.toContain(201);
+
+    // 轮转闭合：202 也失败一轮后 updated_at 变成最新，下一轮换 201 先出线。
+    await claim(202, 'token-fair-2', 60_000);
+    await markFailed(202, 'failed', 'LlmError', 'token-fair-2', profileFeedbackBackoffMs(1));
+    await pg.query("UPDATE profile_feedback_queue SET next_eligible_at = now() - interval '1 second' WHERE user_id IN (201, 202)");
+    const next = (await drainable(50)).map((row) => row.user_id);
+    expect(next.indexOf(201)).toBeLessThan(next.indexOf(202));
+    // 失败保留水位：两人的 pending 都还在，等着被吸收。
+    expect((await queueRow(201)).pending_feedback_id).toBe(idLow);
+    expect((await queueRow(202)).pending_feedback_id).toBe(idHigh);
+  });
+
   const prepareCommit = async (userId: number) => {
     await pg.query('INSERT INTO users (id) VALUES ($1)', [userId]);
     await pg.query(`INSERT INTO profile (id, seeds, content) VALUES ($1, $2::jsonb, '旧画像')`,

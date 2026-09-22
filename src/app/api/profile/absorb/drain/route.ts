@@ -60,19 +60,44 @@ export async function drainProfileFeedbackQueue(deadline: RequestDeadline): Prom
   if (!hasBudget()) return { results, stoppedForBudget: true };
   const userIds = await raceDeadline(deadline.signal, () => drainableProfileFeedbackUsers(DRAIN_USER_LIMIT));
   for (const userId of userIds) {
-    if (!hasBudget()) return { results, stoppedForBudget: true };
+    if (!hasBudget()) {
+      logDrainSummary(results, true);
+      return { results, stoppedForBudget: true };
+    }
     try {
       const result = await raceDeadline(deadline.signal, () => absorbPendingProfileFeedback({
         userId, leaseToken: randomUUID(), write: systemWriter, signal: deadline.signal, modelBudgetMs,
       }));
       results.push({ userId, status: result.status });
+      // F2 可观测：非成功状态（failed/conflict/busy 等）逐用户留痕——GET 响应无人轮询
+      // （前端 fire-and-forget），没有这行日志失败完全无痕。脱敏：只记 userId 与状态。
+      if (result.status !== 'applied' && result.status !== 'unchanged' && result.status !== 'pending') {
+        console.error('profile absorb drain user not applied', { userId, status: result.status });
+      }
     } catch (error) {
       console.error('profile absorb drain user failed', { userId, name: error instanceof Error ? error.name : typeof error });
       results.push({ userId, status: 'failed' });
-      if (deadline.expired) return { results, stoppedForBudget: true };
+      if (deadline.expired) {
+        logDrainSummary(results, true);
+        return { results, stoppedForBudget: true };
+      }
     }
   }
+  logDrainSummary(results, false);
   return { results, stoppedForBudget: false };
+}
+
+// F2 可观测：轮末汇总一行（有 failed/conflict 或预算中断才打，全成功不打扰日志）。
+// GET 恒 200 的响应体没有消费者，这里是 drain 健康态的唯一留痕渠道。
+function logDrainSummary(results: { userId: number; status: string }[], stoppedForBudget: boolean): void {
+  const failed = results.filter((r) => r.status === 'failed' || r.status === 'conflict');
+  if (!failed.length && !stoppedForBudget) return;
+  console.error('profile absorb drain summary', {
+    drained: results.length,
+    failedCount: failed.length,
+    failedUserIds: failed.map((r) => r.userId),
+    stoppedForBudget,
+  });
 }
 
 export async function GET(req: NextRequest) {

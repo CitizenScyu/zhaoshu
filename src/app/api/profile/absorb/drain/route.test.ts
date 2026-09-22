@@ -141,6 +141,49 @@ describe('GET /api/profile/absorb/drain (F15 兜底 drain)', () => {
     });
   });
 
+  // F2 失败可观测：drain 的 GET 响应没有消费者（前端 fire-and-forget），per-user 失败
+  // 与轮末汇总只能靠 console.error 留痕。这里钉住可测的行为断言部分。
+  it('F2：失败用户打 per-user 日志与轮末汇总（脱敏：只有 userId/status，无反馈内容）', async () => {
+    vi.stubEnv('CRON_SECRET', SECRET);
+    mocks.drainableProfileFeedbackUsers.mockResolvedValue([4, 5]);
+    mocks.absorbPendingProfileFeedback
+      .mockRejectedValueOnce(Object.assign(new Error('内容触发 validateProfileContent 抛错的敏感原文'), { name: 'ValidationError' }))
+      .mockResolvedValueOnce({ status: 'failed', pendingFeedbackId: 9 });
+    const errors: unknown[][] = [];
+    vi.spyOn(console, 'error').mockImplementation((...args: unknown[]) => { errors.push(args); });
+
+    const res = await GET(request(SECRET));
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({
+      drained: 2,
+      results: [{ userId: 4, status: 'failed' }, { userId: 5, status: 'failed' }],
+    });
+    const logged = JSON.stringify(errors);
+    // per-user 失败日志与「非成功但非异常」留痕都在；轮末汇总含 failedUserIds。
+    expect(logged).toContain('profile absorb drain user failed');
+    expect(logged).toContain('profile absorb drain user not applied');
+    expect(logged).toContain('profile absorb drain summary');
+    expect(logged).toContain('"failedUserIds":[4,5]');
+    expect(logged).toContain('"stoppedForBudget":false');
+    // 脱敏：错误原文与 mock 的敏感字样绝不进日志。
+    expect(logged).not.toContain('敏感原文');
+    expect(logged).not.toContain('validateProfileContent');
+  });
+
+  it('F2：全部成功时轮末不打汇总日志', async () => {
+    vi.stubEnv('CRON_SECRET', SECRET);
+    mocks.drainableProfileFeedbackUsers.mockResolvedValue([4, 5]);
+    const errors: unknown[][] = [];
+    vi.spyOn(console, 'error').mockImplementation((...args: unknown[]) => { errors.push(args); });
+
+    await GET(request(SECRET));
+
+    const logged = JSON.stringify(errors);
+    expect(logged).not.toContain('profile absorb drain summary');
+    expect(logged).not.toContain('profile absorb drain user not applied');
+  });
+
   it('扫描失败返回受控 500，不回显错误原文', async () => {
     vi.stubEnv('CRON_SECRET', SECRET);
     mocks.drainableProfileFeedbackUsers.mockRejectedValue(new Error('postgres://secret.invalid/db 连接失败'));
