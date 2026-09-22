@@ -1252,4 +1252,59 @@ describe('refreshShuyuan atomic refresh', () => {
       expect(execute.mock.calls[1][0].values[0]).toBe(JSON.stringify([legacy]));
     });
   });
+
+  // B3（source-pipeline-41-review.md）：cron 是典型冷 lambda（每 6 小时一次、实例基本不复用），
+  // 刷新开始时模块级 supportedHosts 初值只有 builtin；若不先刷 host 门就构建探测队列，入队判据
+  // canProbe（:786）= validateSourceUrl 会把 1200+ 引擎源整批**静默滤掉**——reachable 长期偏低不是
+  // 站点不可达，是压根没探。下面钉住「刷新流程先刷 host 门、再 readMeta / 构建探测队列」这条
+  // **顺序**不变量：任何「不刷门」或「门刷在探测之后」的变异都会让它们转红（而不是只钉最终结果）。
+  describe('冷启动 host 门：探测队列不得静默丢弃引擎源', () => {
+    const engineSource = {
+      bookSourceUrl: 'https://engine.example/', bookSourceName: '引擎源',
+      searchUrl: 'https://engine.example/s?q={{key}}',
+      ruleSearch: { bookList: '.i', name: '.t@text', bookUrl: 'a@href' },
+    };
+    const probedUrls = () => fetchMock.mock.calls.map(([url]) => String(url));
+    // source_admission 持久表里已有该 host（前几轮准入批次写入）——这是 host 门的数据源，与「本轮
+    // 随后才发生」的写库无关；engineHosts 的 DISTINCT host 查询据此返回它。
+    const withAdmittedEngineHost = () => execute.mockImplementation(async (query) => {
+      if (query.text.includes('DISTINCT host')) return [{ host: 'engine.example' }];
+      if (query.text.includes('FROM shuyuan_meta')) return [{ collections: [], refreshed_at: '2026-09-14T00:00:00Z' }];
+      if (query.text.startsWith('SELECT count(*)')) return [zeroCounts];
+      return [];
+    });
+    afterEach(() => refreshSupportedHosts([])); // 复位运行时 host 集合
+
+    it('supportedHosts 仅含 builtin（冷启动）时，刷新仍把引擎源放进探测队列', async () => {
+      vi.stubEnv('READING_ENGINE_SOURCES', '1');
+      refreshSupportedHosts([]); // 冷 lambda：模块级门复位到内建集合
+      // 前置自证：此刻门确实是冷的（引擎 host 过不了 validateSourceUrl），否则用例失去判别力。
+      expect(() => validateSourceUrl(engineSource.bookSourceUrl)).toThrow(SourcePolicyError);
+      setCollection(11, [engineSource]);
+      responses.set('https://engine.example/', { body: '离线合成响应' });
+      withAdmittedEngineHost();
+
+      await refreshShuyuan();
+
+      expect(probedUrls()).toContain('https://engine.example/');
+    });
+
+    it('冷启动时引擎源在快照里的既有探测态不被丢弃（门刷在 readMeta 之前）', async () => {
+      vi.stubEnv('READING_ENGINE_SOURCES', '1');
+      refreshSupportedHosts([]);
+      setCollection(11, [engineSource]);
+      seedPrevious([], [{
+        url: 'https://engine.example', status: 'reachable', checked_at: '2026-09-16T00:00:00Z', error: null,
+      }]);
+      // seedPrevious 已占掉前两个 mockResolvedValueOnce（previousRows / storedMeta），DISTINCT host 落其后。
+      withAdmittedEngineHost();
+
+      await refreshShuyuan();
+
+      // 门若刷在 readMeta 之后，readMeta（:378 的 canProbe）会把该条目整条丢弃 ⇒ 这里转红。
+      expect(savedStates()).toContainEqual({
+        url: 'https://engine.example', status: 'reachable', checked_at: '2026-09-16T00:00:00Z', error: null,
+      });
+    });
+  });
 });
