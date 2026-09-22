@@ -2,11 +2,13 @@
 // PGlite 真库语义 + 内存 GitHub + mock adapter：不真实联网、不连生产库。
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { loadPGlite, type PGliteLike } from './fixtures/pglite';
+import { createPGliteSql } from './fixtures/pglite-sql';
+import {
+  createArtifactSchema, createProductionSchema, upgradeToAuthV7,
+} from './fixtures/production-schema';
 import {
   claimDownloadTask, finishDownloadTask, heartbeatDownloadTask, retryDownloadTask, updateDownloadTaskProgress,
 } from './download-task-queue';
-import { authSchemaV7Statement } from './auth-store';
-import { initializeArtifactSchema } from './business-schema';
 import { reserveArtifactPath } from './artifact-registry';
 import {
   createEngineAdapter, runDownloadTask, runWorkerOnce, startLeaseHeartbeat,
@@ -127,67 +129,13 @@ maybe('T3 worker 任务层：租约、单写者、五阶段对账（PGlite + moc
   beforeEach(async () => {
     pg = new PGliteCtor!();
     sql = queryTag(pg);
-    await pg.exec(`
-      CREATE TABLE auth_schema_migrations (version integer PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now());
-      INSERT INTO auth_schema_migrations(version) SELECT generate_series(1, 6);
-      CREATE TABLE users (id integer PRIMARY KEY); INSERT INTO users(id) VALUES (1), (2);
-      CREATE TABLE download_tasks (
-        id serial PRIMARY KEY, book_id integer NOT NULL, title text NOT NULL, author text NOT NULL DEFAULT '',
-        status text NOT NULL DEFAULT 'pending', source_url text NOT NULL DEFAULT '',
-        chapters_total integer NOT NULL DEFAULT 0, chapters_done integer NOT NULL DEFAULT 0,
-        chars_total integer NOT NULL DEFAULT 0, error text NOT NULL DEFAULT '',
-        created_at timestamptz NOT NULL DEFAULT now(), updated_at timestamptz NOT NULL DEFAULT now(),
-        user_id integer NOT NULL CONSTRAINT download_tasks_user_fk REFERENCES users(id)
-      );
-      CREATE TABLE labeled_books (
-        id serial PRIMARY KEY, title text NOT NULL, author text NOT NULL DEFAULT '', source_url text NOT NULL DEFAULT '',
-        title_key text GENERATED ALWAYS AS (lower(btrim(normalize(title, NFKC)))) STORED,
-        author_key text GENERATED ALWAYS AS (lower(btrim(normalize(author, NFKC)))) STORED,
-        UNIQUE (title_key, author_key)
-      );
-    `);
-    // v7 迁移（真语句，不是副本）+ T2 artifact registry DDL
-    {
-      // authSchemaV7Statement 返回 Neon 查询 promise；给它 thenable 壳直接对 PGlite 执行。
-      const tx = (parts: TemplateStringsArray, ...values: unknown[]) => ({
-        then: (resolve: (rows: unknown) => unknown, reject: (e: unknown) => unknown) => {
-          let text = ''; const params: unknown[] = [];
-          parts.forEach((part, index) => { text += part; if (index < values.length) { params.push(values[index]); text += '$' + params.length; } });
-          return pg.query(text, params).then(r => resolve(r.rows), reject) as unknown as Promise<unknown>;
-        },
-      });
-      void (await authSchemaV7Statement(tx as never));
-    }
-    {
-      // PGlite 适配器：标签查询返回行数组；transaction 以真 BEGIN/COMMIT 串行执行语句。
-      type Stmt = { text: string; params: unknown[] };
-      const toStmt = (parts: TemplateStringsArray, values: unknown[]): Stmt => {
-        let text = ''; const params: unknown[] = [];
-        parts.forEach((part, index) => { text += part; if (index < values.length) { params.push(values[index]); text += '$' + params.length; } });
-        return { text, params };
-      };
-      const txTag = (parts: TemplateStringsArray, ...values: unknown[]) => {
-        const stmt = toStmt(parts, values);
-        return { ...stmt, then: (resolve: (rows: unknown) => unknown, reject: (e: unknown) => unknown) =>
-          pg.query(stmt.text, stmt.params).then(r => resolve(r.rows), reject) as unknown as Promise<unknown> };
-      };
-      const txAdapter = Object.assign(txTag, {
-        transaction: async (build: (tx: typeof txTag) => ReturnType<typeof txTag>[]) => {
-          const stmts = build(txTag) as unknown as Stmt[];
-          await pg.exec('BEGIN');
-          try {
-            const rows = [];
-            for (const statement of stmts) rows.push((await pg.query(statement.text, statement.params)).rows);
-            await pg.exec('COMMIT');
-            return rows;
-          } catch (error) {
-            await pg.exec('ROLLBACK').catch(() => {});
-            throw error;
-          }
-        },
-      });
-      await initializeArtifactSchema(txAdapter as never);
-    }
+    // 生产 schema 底座（auth v1–v7 真实 users/权限位/身份 CHECK）→ 0002 身份键 → artifact。
+    // 由 fixtures/production-schema 复用生产初始化入口，**不手抄建表语句**：抄本会漂移，
+    // 漂移过的 title_key 生成式让《余生》类漏匹配在测试里系统性隐形（2026-09-23 复核）。
+    const schemaSql = createPGliteSql(pg);
+    await createProductionSchema(schemaSql as never, statement => pg.exec(statement));
+    await upgradeToAuthV7(schemaSql as never);
+    await createArtifactSchema(schemaSql as never);
     await pg.exec(`
       INSERT INTO labeled_books(title, author, source_url) VALUES ('测试书', '佚名', 'https://book15.net/books/1.html');
       INSERT INTO storage_repositories(id, owner, repo, branch, enabled) VALUES (1, 'fixture', 'private', 'main', true);
