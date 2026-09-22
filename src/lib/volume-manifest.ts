@@ -13,6 +13,12 @@ import { validateArtifactPath } from './artifact-locator';
 export const VOLUME_MANIFEST_SCHEMA = 2;
 export const VOLUME_MANIFEST_FORMAT = 'volumes';
 
+/**
+ * 清单(章节/卷索引)raw 拉取上限;20000 章 ≈ 1.7 MB,4 MiB 门内。
+ * 读端(reader-server)与下载端(download file 路由)同值 —— 判据只此一处。
+ */
+export const MAX_MANIFEST_BYTES = 4 * 1024 * 1024;
+
 export interface VolumeEntry {
   /** 规范区卷路径(books/<stem>/vol-001.txt)。 */
   path: string;
