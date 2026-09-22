@@ -6,9 +6,15 @@ import { getSql } from './db';
 //
 // 阈值集中在这里一处（探针侧在 workflow 里复述同一组数字，两边必须一致）。
 // 判据 =「该 cron 的计划间隔 + 2h 容差」：漏掉一次计划运行后不久即暴露，而不是拖到第二天。
-// 计划间隔取自 vercel.json：shuyuan 每 6h（0 2,8,14,20，4 次/日），reclaim/drain 每日一次
-// （21:00 / 21:30）。⚠️ 改 vercel.json 的 cron 计划时必须同步改这里与 workflow 里的数字。
-export const SHUYUAN_REFRESH_ALERT_HOURS = 8;
+//
+// ⚠️ 不变量：**每条 cron 的告警阈值必须 > 它在 vercel.json 里的实际触发间隔**。
+// Vercel **Hobby** 计划限制「每条 cron 每天只能触发一次」，所以本仓三条 cron（shuyuan /
+// reclaim / drain）的间隔恒为 24h，阈值一律 = 24h + 2h 容差 = 26h。
+// shuyuan 原为 8h —— f474e27 定该值时 cron 还是每 6h 的 `0 2,8,14,20`，但 b561fba（实际上更早）
+// 已把 cron 改回每日一次 `0 2 * * *`，两条线各自都对、合起来 8h 阈值配上 HEALTH_URL 会**每天误报**。
+// 改 vercel.json 的 cron 计划时必须同步改这里与 workflow 里的数字；`src/lib/vercel-cron.test.ts`
+// 有一条离线门禁按表达式真算间隔、比对这里的常数，脱节即红（防下次再靠人记）。
+export const SHUYUAN_REFRESH_ALERT_HOURS = 26;
 export const CRON_ALERT_HOURS = 26;
 
 export type CronName = 'reclaim' | 'drain';

@@ -26,9 +26,10 @@ describe('source-health (S5-1)', () => {
     vi.restoreAllMocks();
   });
 
-  it('阈值常数：shuyuan 6h 计划 + 2h 容差 = 8h；reclaim/drain 每日 + 2h = 26h', () => {
+  it('阈值常数：三条 cron 均为每日一次 + 2h 容差 = 26h（Hobby 下间隔恒为 24h）', () => {
     // 判据钉在常数上：改 vercel.json 的 cron 计划时必须同步改这里（与 workflow 里的数字一致）。
-    expect(SHUYUAN_REFRESH_ALERT_HOURS).toBe(8);
+    // 「阈值必须 > 实际 cron 间隔」这条不变量由 src/lib/vercel-cron.test.ts 按表达式真算把关。
+    expect(SHUYUAN_REFRESH_ALERT_HOURS).toBe(26);
     expect(CRON_ALERT_HOURS).toBe(26);
   });
 

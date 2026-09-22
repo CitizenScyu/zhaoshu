@@ -12,9 +12,11 @@
 #   - 开/关 issue 用的是 Actions 自带的短期 token（下方 `${{ github.token }}`，等价于
 #     `GITHUB_TOKEN`），由平台自动注入、随 job 结束失效，无需用户配置、不是仓库 Secret。
 #
-# 阈值必须与 src/lib/source-health.ts 里的常数一致（改 cron 计划时两处一起改）：
-#   SHUYUAN_REFRESH_ALERT_HOURS = 8  —— shuyuan 每 6h（0 2,8,14,20）+ 2h 容差
-#   CRON_ALERT_HOURS           = 26  —— reclaim / drain 每日一次 + 2h 容差
+# 阈值必须与 src/lib/source-health.ts 里的常数一致（改 cron 计划时两处一起改）。
+# Vercel Hobby 限「每条 cron 每天最多触发一次」，三条 cron 的间隔均为 24h，阈值 = 24h + 2h 容差：
+#   SHUYUAN_REFRESH_ALERT_HOURS = 26 —— shuyuan 每日一次 + 2h 容差
+#   CRON_ALERT_HOURS           = 26 —— reclaim / drain 每日一次 + 2h 容差
+# 离线门禁 src/lib/vercel-cron.test.ts 会按 vercel.json 真算间隔比对这两组常数，脱节即红（防漏改）。
 name: Source health probe
 
 on:
@@ -35,10 +37,15 @@ jobs:
   probe:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    # HEALTH_URL 未配置时按触发源区别对待（github.event_name 由平台注入，'schedule' / 'workflow_dispatch'）：
+    #   - schedule：整 job 跳过。跳过记绿而非失败，消掉「每小时一次 workflow run failed」的通知噪声。
+    #   - workflow_dispatch：仍要跑，让第一步明确 exit 1 并提示去配 Variable。手动触发却静默跳过，
+    #     会让人以为探针跑过且健康 —— 这正是要保住的性质。
+    if: github.event_name == 'workflow_dispatch' || vars.HEALTH_URL != ''
     env:
       HEALTH_BASE: ${{ vars.HEALTH_URL }}
       ISSUE_LABEL: source-health
-      SHUYUAN_REFRESH_ALERT_HOURS: '8'
+      SHUYUAN_REFRESH_ALERT_HOURS: '26'
       CRON_ALERT_HOURS: '26'
     steps:
       - name: 评估健康状态
