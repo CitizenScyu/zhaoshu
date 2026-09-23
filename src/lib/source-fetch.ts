@@ -1,6 +1,7 @@
 // TypeScript port of zhaoshu-books/lib/source-fetch.mjs (batch 10).
 // Keep redirects, body limits and the single request/body timeout in sync.
 import { alternateSourceHost, SourcePolicyError, validateSourceUrl } from './source-policy';
+import { recordHostFailure, recordHostSuccess, type HostFailureKind } from './source-host-health';
 
 export const MAX_SOURCE_REDIRECTS = 3;
 export const MAX_SOURCE_BYTES = 2 * 1024 * 1024;
@@ -72,20 +73,48 @@ async function responseText(response: Response, signal: AbortSignal, maxBytes: n
   }
 }
 
-export async function fetchSourceText(input: string, {
-  signal: parentSignal, timeoutMs = SOURCE_TIMEOUT_MS, connectTimeoutMs = SOURCE_CONNECT_TIMEOUT_MS,
-  maxRedirects = MAX_SOURCE_REDIRECTS, maxBytes = MAX_SOURCE_BYTES,
-  beforeRequest,
-}: {
+// 41-M1.3：算不算 host 的「传输层硬失败」。在换 host 的口径（isTransportError：连接/请求超时、fetch failed）
+// 之外再加 HTTP 5xx（含 Cloudflare 522）：5xx 换 host 不改变结果所以不换，但它正是「这个站现在不行」的信号。
+// 4xx、策略拒绝、解码错误、beforeRequest 的预算/节流中止都不算——那是内容侧或调用方的判定。
+function hostFailureKind(error: unknown): HostFailureKind | null {
+  if (typeof error !== 'object' || error === null) return null;
+  if (error instanceof SourceHttpError) return error.status >= 500 ? 'http_5xx' : null;
+  if (!isTransportError(error)) return null;
+  return error instanceof DOMException ? 'timeout' : 'network';
+}
+
+interface FetchSourceOptions {
   signal: AbortSignal;
   timeoutMs?: number;
   connectTimeoutMs?: number;
   maxRedirects?: number;
   maxBytes?: number;
   beforeRequest?: (signal: AbortSignal) => Promise<void>;
-}) {
-  parentSignal.throwIfAborted();
+}
+
+// 41-M1.3：主机级健康记忆（source-host-health.ts）的唯一记录点——builtin 与引擎两条腿的每次逻辑请求都经过这里。
+// 换 host 兜底算同一次逻辑请求：任一 host 拿到正文即记成功；失败只按传输层硬失败计数（hostFailureKind），
+// 记在初始 URL 的 host 上（apex 与 www 在健康记忆里是同一个站）。父 signal 已中止（调用方取消、切片到点）不计：
+// 那是调用方的时间决定，不是 host 的健康信号。
+export async function fetchSourceText(input: string, options: FetchSourceOptions) {
+  options.signal.throwIfAborted();
   const initial = validateSourceUrl(input);
+  try {
+    const page = await fetchWithHostSwap(initial, options);
+    recordHostSuccess(initial.hostname);
+    return page;
+  } catch (error) {
+    const kind = options.signal.aborted ? null : hostFailureKind(error);
+    if (kind) recordHostFailure(initial.hostname, kind);
+    throw error;
+  }
+}
+
+async function fetchWithHostSwap(initial: URL, {
+  signal: parentSignal, timeoutMs = SOURCE_TIMEOUT_MS, connectTimeoutMs = SOURCE_CONNECT_TIMEOUT_MS,
+  maxRedirects = MAX_SOURCE_REDIRECTS, maxBytes = MAX_SOURCE_BYTES,
+  beforeRequest,
+}: FetchSourceOptions) {
   const swapped = swapHost(initial);
   try {
     return await attemptOnce(initial, {

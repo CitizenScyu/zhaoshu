@@ -189,6 +189,11 @@ export interface ReadingPool {
  * §2.4 全序（先表内各自排好，再按「builtin 恒在引擎源之前」拼接——builtin 是优先级最高的
  * 首键，故拼接即等价于对合并集按全序排序）：
  *   (tier='builtin') DESC → (probe reachable) DESC → tier 升序 → search_checked_at DESC → url 升序。
+ *
+ * 「builtin 恒在前」只有一个例外（41-M1.3）：阅读侧拿到本池后会再过一遍 orderByHostHealth（resolveSourceBook
+ * 的源顺序、章节级换源的候选队列），builtin 的 host 被判 suspect（进程内记忆：连续传输层硬失败 ≥2 次且最近一次
+ * 在窗口内，见 source-host-health.ts）时让位到队尾——只降序不剔除，窗口过期或成功一次即恢复原位。
+ * 本函数产出的池序本身不变，仍是 builtin 恒在前。
  */
 export async function getReadingPool(signal: AbortSignal): Promise<ReadingPool> {
   const s = getSql();
