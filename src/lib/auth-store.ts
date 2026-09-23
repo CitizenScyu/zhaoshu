@@ -385,5 +385,8 @@ export async function assertAuthSchema(sql: Sql): Promise<void> {
     if (error && typeof error === 'object' && 'code' in error && error.code === '42P01') throw new AuthSchemaRequiredError();
     throw error;
   }
-  if (rows[0]?.version !== AUTH_SCHEMA_VERSION) throw new AuthSchemaRequiredError();
+  // 只拦「库落后于代码」：库版本新于代码（灰度/回滚窗口里 DDL 已跑、旧实例还在）不再 503。
+  // 前向保护不靠这里——initializeAuthSchema 的迁移器在库版本 > 7 时 RAISE EXCEPTION
+  // （见上方 DO 块），运行时闸门只读版本、不执行迁移。
+  if ((rows[0]?.version ?? 0) < AUTH_SCHEMA_VERSION) throw new AuthSchemaRequiredError();
 }
