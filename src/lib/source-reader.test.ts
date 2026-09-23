@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { SourceCatalog, SourceReaderError, SourceSimilarCandidate } from './source-reader';
 import { sourceRevision } from './source-revision';
+import { readerPartMatches } from './reader-session';
 
 type Query = { text: string; values: unknown[] };
 const mocks = vi.hoisted(() => ({ getSql: vi.fn(), ensureSchema: vi.fn(), sources: vi.fn(), fetch: vi.fn<typeof fetch>() }));
@@ -895,6 +896,39 @@ describe('GET /api/read/source/[resource]', () => {
     const plain = await (await request('chapter', `session=${part.sourceSession}&version=${part.version}&chapter=0`)).json();
     expect(plain.switchedChapters).toBeUndefined();
     expect(plain.switchedChapterIndex).toBeUndefined();
+  });
+
+  it('H7 必修 A:章名漂移(同章号+主体扩写)时换源响应仍附新目录,重读时前端接受', async () => {
+    // 复审复现:原目录「第1章 风起」,备用目录「第1章 风起与云涌」(matchSourceChapter tier 3)。
+    // 严格相等判据下 attach 静默不附,重读时前端标题防线判不符。
+    mocks.sources.mockResolvedValue([source, backup]);
+    pages.set('https://book15.net/books/search.html?kw=' + encodeURIComponent(book.title), {
+      text: '<a href="/books/details42.html">测试书</a>',
+    });
+    pages.set(pageUrl(), { text: detail(42, '作者', ['第1章 风起', '第2章 落雨']) });
+    pages.set(chapterUrl(), { text: '', status: 404 });
+    pages.set(backupSearch(), { text: '<a href="/books/details777.html">测试书</a>' });
+    pages.set(backupPage, { text: detail(777, '作者', ['第1章 风起与云涌', '第2章 落雨']) });
+    pages.set(backupChapter(777, 1), { text: chapterHtml('备用正文') });
+    const index = await (await request()).json();
+    const partRes = await request('chapter', `session=${index.source.session}&version=${index.version}&chapter=0`);
+    expect(partRes.status).toBe(200);
+    const part = await partRes.json();
+    expect(part.text).toBe('备用正文');
+    // 换源响应必须附上新目录,且本章在新目录的序号为 0。
+    expect(part.switchedChapters).toBeTruthy();
+    expect(part.switchedChapterIndex).toBe(0);
+    expect(part.switchedChapters.map((chapter: { title: string }) => chapter.title))
+      .toEqual(['第1章 风起与云涌', '第2章 落雨']);
+    // 重读同一章:服务端按新目录交付「第1章 风起与云涌」,前端持旧目录必须接受(不判 409)。
+    const reread = await (await request('chapter', `session=${part.sourceSession}&version=${part.version}&chapter=0`)).json();
+    expect(reread.title).toBe('第1章 风起与云涌');
+    const staleIndex = {
+      ...index, version: part.version,
+      source: { ...index.source, id: part.sourceId, session: part.sourceSession },
+    };
+    expect(readerPartMatches(staleIndex, { ...reread, sourceSession: part.sourceSession }, { chapterIndex: 0, partIndex: 0, ratio: 0 }))
+      .toBe(true);
   });
 
   it('gives an actionable error code when no supported book is found', async () => {

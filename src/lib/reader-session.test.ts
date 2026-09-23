@@ -132,6 +132,26 @@ describe('download and source reading sessions', () => {
     expect(readerPartMatches(online, plain, position)).toBe(true);
   });
 
+  it.each([
+    ['第1章 风起', '第一章 风起与云涌', true],
+    ['第一章', '第一章 风起', true],
+    ['第1章', '第1节', true],
+    ['第1章 风起', '第一章 风起', true],
+    ['第一章', '第一章:xxx', true],
+  ])('H7 口径矩阵(必修 A):switched 状态下 %j 对 %j ⇒ readerPartMatches 为 %s(与 matchSourceChapter 同档)', (catalogTitle, deliveredTitle, accept) => {
+    const newSession = 'e'.repeat(40);
+    const stale: ReaderIndex = {
+      ...online, version: newSession,
+      source: { ...online.source!, id: 'source-two', session: newSession },
+      chapters: [{ index: 0, title: catalogTitle, startByte: 0, endByte: 0, partCount: 1 }],
+    };
+    const delivered: ReaderPart = {
+      taskId: null, sourceId: 'source-two', version: newSession, sourceSession: newSession,
+      chapterIndex: 0, partIndex: 0, partCount: 1, title: deliveredTitle, text: '正文', startByte: 0, endByte: 6,
+    };
+    expect(readerPartMatches(stale, delivered, position)).toBe(accept);
+  });
+
   it('remembers source progress and estimates by chapter when total file bytes are unknown', () => {
     const progress = { ...position, schema: 1, version: online.version, updatedAt: 1234 };
     const part: ReaderPart = { ...position, taskId: null, sourceId: online.source!.id, version: online.version,

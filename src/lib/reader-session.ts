@@ -1,6 +1,6 @@
 import type { ReaderChapter, ReaderIndex, ReaderOrigin, ReaderPart, ReadingSession } from './reader-types';
 import type { ReadingPosition } from './reader-preferences';
-import { normalizeChapterTitle } from './source-parser';
+import { chapterTitlesMatch } from './source-parser';
 
 export function bookReadingHref(book: { taskId?: number | null; title: string; author: string; from: ReaderOrigin }): string {
   if (book.taskId && Number.isSafeInteger(book.taskId) && book.taskId > 0) return `/read/${book.taskId}?from=${book.from}`;
@@ -71,12 +71,12 @@ export function readerPartMatches(index: ReaderIndex, part: ReaderPart, position
   const ownership = index.source
     ? part.taskId === null && (part.sourceId === index.source.id || switched)
     : part.taskId === index.taskId && !part.sourceId;
-  // H7 纵深防御:换源状态下额外比对标题(归一化口径)。前端若仍持旧目录(旧响应形状,
-  // 或新目录未被采纳),服务端按新目录序号取回的章可能不是客户端以为的那一章 ——
-  // 标题对不上就当作不匹配,不交付(静默交付另一章比报错更糟)。
-  // 新目录已被采纳时,序号即新目录序号,标题天然一致,此比对不改变结果。
-  const titleOk = !switched || normalizeChapterTitle(part.title)
-    === normalizeChapterTitle(index.chapters[part.chapterIndex]?.title ?? '');
+  // H7 纵深防御:换源状态下额外比对标题,口径与服务端换源对齐章用的是**同一个**分档判据
+  // (chapterTitlesMatch = chapterTier < ∞,source-parser 的唯一实现):放行同章的写法漂移
+  // (「第1章 风起」对「第1章 风起与云涌」),拒绝真正不同的章(「序言」对「第一章」)。
+  // 用归一化严格相等会把服务端认为匹配的合法章节判成不符 → 409(复审必修 A)。
+  // 新目录已被采纳时序号即新目录序号,标题天然同章,此比对不改变结果。
+  const titleOk = !switched || chapterTitlesMatch(index.chapters[part.chapterIndex]?.title ?? '', part.title);
   return ownership && titleOk && (part.version === index.version || switched)
     && part.chapterIndex === position.chapterIndex
     && part.partIndex === position.partIndex && typeof part.text === 'string';
