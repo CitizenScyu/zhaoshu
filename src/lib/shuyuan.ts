@@ -36,6 +36,15 @@ const PROBE_FAILURE_THRESHOLD = 3;
 // 已知失败源为空时，补探正好压在一轮并发里（≤ PROBE_TIMEOUT_MS），不额外吃刷新预算；
 // 已知失败源占满并发时，补探要等下一波，最坏多花一轮 PROBE_TIMEOUT_MS。
 const PROBE_DISCOVERY_PER_REFRESH = PROBE_CONCURRENCY;
+// 每轮刷新最多重探多少个卡在「待核验」(pending) 的源。pending 是一个**死态**：规则变化把源置 pending
+// 后，入队循环原本一律 `status === 'pending' → continue`，既不进失败重探也不进补探 ⇒ 只要上游规则
+// 不再变，它就永远停在 pending（生产实测 944 个 pending 常驻、reachable 0）。这里让它**有界地**回到
+// 探测队列：排在已知失败源重探与补探之后（优先级最低），每轮限名额，避免 944 个 backlog 一次涌入
+// 队列挤占已知失败源的重探。取 4 × 并发：单轮预算最坏可容纳 ~180s/8s × 10 ≈ 200 次探测，40 次
+// pending 重探最坏占 4 波 × 8s = 32s，给已知失败源重探与准入批次留足余量；同时每天 1 次 cron 下
+// 944 个 backlog 约 24 轮（≈24 天）清空，与上游规则变化频率同量级。
+// 顺序保证（probes → discovery → pendingReprobe）让 pending 无论名额多大都饿不到已知失败源重探。
+export const PROBE_PENDING_PER_REFRESH = 4 * PROBE_CONCURRENCY;
 const INSERT_CHUNK = 100;
 const SOURCE_STATUS_LIMIT = 100;
 const WRITE_RESERVE_MS = 5_000;
@@ -821,23 +830,42 @@ async function refreshWithinBudget(s: Sql, budget: RequestDeadline, signal: Abor
   // 还没有任何探测结论的启用源，按名额补探（排在已知失败源之后，理由见 PROBE_DISCOVERY_PER_REFRESH）。
   const discovery: string[] = [];
   let discoverySlots = PROBE_DISCOVERY_PER_REFRESH;
+  // 卡在 pending（规则变化后退回待核验）的源，按名额重探（优先级最低，见 PROBE_PENDING_PER_REFRESH）。
+  // 落在 probes/discovery 之后：pending backlog（生产 944）无论多大都不能饿死已知失败源的重探。
+  const pendingReprobe: string[] = [];
+  let pendingSlots = PROBE_PENDING_PER_REFRESH;
   for (const [url, item] of merged) {
     const old = previous.get(url);
     if (old && !sameRules(old.source, item)) {
       // 规则变了：旧的结论和连续失败计数一起作废，退回待核验。
+      // 注意：置 pending 的分支不再 `continue`——本轮把它并入有界重探队列，打破「永不流转」的死态。
       states.set(url, { url, status: 'pending', checked_at: null, error: null });
+      if (canProbe(url) && !old.disabled_at && pendingSlots > 0) {
+        pendingSlots--;
+        pendingReprobe.push(url);
+      }
       continue;
     }
     const state = oldStates.get(url);
     if (state) states.set(url, state);
-    if (state?.status === 'pending' || !canProbe(url)) continue;
+    if (state?.status === 'pending' || !canProbe(url)) {
+      // 上一轮遗留下来的 pending：同样并入有界重探队列。canProbe 仍是硬门——pending 条目在
+      // readMeta 里即使 host 过不了门也会被保留（:382 的特例），这里不重复 gate 就会把
+      // 已离开 host 门的 pending 源送给 probeWorker，让 validateSourceUrl 抛错当成探测失败。
+      // 禁用源不参与取书，不探。
+      if (state?.status === 'pending' && canProbe(url) && !old?.disabled_at && pendingSlots > 0) {
+        pendingSlots--;
+        pendingReprobe.push(url);
+      }
+      continue;
+    }
     // 已知失败记录（人工写的 last_error，或上一轮探测累计的连续失败计数）每轮都重探，
     // 探到成功才清零计数、回到可达。
     if (old?.last_error || (state?.consecutive_failures ?? 0) > 0) probes.push(url);
     // 没有任何结论的启用源才补探：禁用源不参与取书，探它没有意义。
     else if (!state && !old?.disabled_at && discoverySlots > 0) { discoverySlots--; discovery.push(url); }
   }
-  probes.push(...discovery);
+  probes.push(...discovery, ...pendingReprobe);
 
   // 本轮探测失败、且这个源还没有失败记录时，补一条 last_error——这是 last_error 的自动写点
   // （在此之前只有人工 POST {action:disable} 会写它）。已有值不覆盖：那是历史失败证据。
