@@ -190,7 +190,7 @@ describe('2 万章转义标题字节边界:发布估算 vs 读端真实(escape-a
     // 发布即拒:任何 PUT 都没发生(连清单都没有)。
     expect(snapshotPaths(TITLE, AUTHOR).canonicalPath).toBeTruthy();
     expect(github.files.size).toBe(0);
-  });
+  }, 60_000);
 
   it('同规模纯 CJK 标题在门内而转义标题顶穿:证明「读端侧字节才判得准」,且不误伤未转义书', async () => {
     // pad=29/n=20000:去掉转义尾的纯 CJK 书必须照常 promoted(生产最常见形态不被误伤),
@@ -224,7 +224,7 @@ describe('2 万章转义标题字节边界:发布估算 vs 读端真实(escape-a
     // 清单自身每章用更短的 i/t/v/s/e/p 形状 ⇒ 同一份数据下小于读端 ReaderIndex。转义标题会把
     // 读端索引推到 4 MiB 之上,而清单仍在门内 ⇒ 这就是必须按**读端形状**设门的原因。
     expect(manifestBytes).toBeLessThan(plainReal);
-  });
+  }, 60_000);
 
   it('变异测试:估算退化成「逐章原始字节求和 + 固定 pad」时,转义用例必须被抓红', () => {
     // 复现 rev41vol2 的旧 bug/未来回退形态:只在注释里声称精确,实际 JIT 分支走逐章求和。

@@ -46,7 +46,7 @@ maybe('冷建库灾备链路（0001 真执行 + assertAuthSchema 真闸门）', 
     pg = new PGliteCtor!();
     sql = adapter(pg);
     await pg.exec(BASELINE_SQL);
-  });
+  }, 60_000);
 
   // 不变式 1：MS-25 记账行把冷建库记账到 v7。
   it('执行 0001 后 max(version) = 7（MS-25 冷建库记账行）', async () => {

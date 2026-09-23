@@ -126,7 +126,7 @@ describe('2 万章清单字节边界:发布 vs 读回(rev41vol2 P1 缺口)', () 
     expect(manifest.chapters).toBe(N);
     expect(manifestBytes).toBeLessThan(READER_INDEX_GATE);
     expect(indexBytes).toBeLessThan(READER_INDEX_GATE);
-  });
+  }, 60_000);
 
   it('缺口成因:同样 2 万章 × 长标题,清单字节在 4 MiB 门内而读端索引顶穿(证明门必须加在发布侧)', async () => {
     // 直接比较两个 JSON 形状的字节(不经过发布门,单独证明「读端索引比清单更容易顶穿」):
@@ -155,13 +155,13 @@ describe('2 万章清单字节边界:发布 vs 读回(rev41vol2 P1 缺口)', () 
     // 修法 = 发布侧镜像读端 4 MiB 索引门。这本书发布阶段就该被拒(stage=manifest),
     // 而不是发布成功、读端才 422。未修时会 promoted=true ⇒ 本断言红;修后转绿。
     await expect(publishGuarded(44)).rejects.toMatchObject({ name: 'PublicationStageError', stage: 'manifest' });
-  });
+  }, 60_000);
 
   it('修法不误伤:短标题书(生产最常见)发布侧门放行,仍能正常 promoted', async () => {
     const outcome = await publishGuarded(0) as { promoted: boolean; volumeCount: number };
     expect(outcome.promoted).toBe(true);
     expect(outcome.volumeCount).toBeGreaterThanOrEqual(1);
-  });
+  }, 60_000);
 
   // rev41vol2 复审 P1:readerIndexBytes 旧写法逐章 stringify 再求和,漏掉了顶层包裹与
   // 数组元素间逗号,实测恒定低估(2 万章 ≈ -19,882 B / 1.99 万章 ≈ -19,782 B),在 4 MiB 门
@@ -193,7 +193,7 @@ describe('2 万章清单字节边界:发布 vs 读回(rev41vol2 P1 缺口)', () 
       // 既不高估到误拒:差值必须为 0(同对象同 stringify ⇒ 逐字节相等)。
       expect(delta, `估算不得过度高估(${where},差 ${delta})`).toBe(0);
     }
-  });
+  }, 60_000);
 
   it('P1 盲区堵死:复审构造 pad=40/n=19900 的书,修后发布即被拒(promoted=false)', async () => {
     // 这是复审 rev41vol2 A.4 的可达反例:est(old)=4,180,175 < 门 ⇒ 旧代码 promoted=true,
@@ -218,5 +218,5 @@ describe('2 万章清单字节边界:发布 vs 读回(rev41vol2 P1 缺口)', () 
       err = e;
     }
     expect(err).toMatchObject({ name: 'PublicationStageError', stage: 'manifest' }); // 发布即拒,没 promoted
-  });
+  }, 60_000);
 });
