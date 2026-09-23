@@ -1265,7 +1265,7 @@ describe('M2-2 多源循环：跳源 / 软预算 / 去重 / bookUrl 反查', () 
     expect(catalog.chapters).toHaveLength(1);
   });
 
-  it('章节级 failover 复用父 context：预算累加、openPool 不收窄（验收 7/§3.4）', async () => {
+  it('resolveSourceBook 复用同一个 context：预算累加、二次 openPool 幂等不收窄（验收 7/§3.4；章节级换源的整池 openPool 见 41-M1.1 组 c④ 与 H5a）', async () => {
     mocks.sources.mockResolvedValue([source, engineA]);
     const ctx = context();
     await service.resolveSourceBook(book, ctx);
@@ -1602,7 +1602,7 @@ describe('chapter failover candidate queue (41-FAILOVER-M1)', () => {
     expect(catalogs.get(part.version)?.sourceUrl).toBe(sourceB.url);
   });
 
-  it('A 正文为空，继续尝试 B', async () => {
+  it('A 正文页没有有效正文(parseSourceChapterText 的空正文闸拒收)，继续尝试 B', async () => {
     const catalog = await prepare();
     pages.set(backupChapter(777, 1), { text: chapterHtml('') });
     expect((await read(catalog)).text).toBe('B 正文');
@@ -1631,7 +1631,7 @@ describe('chapter failover candidate queue (41-FAILOVER-M1)', () => {
     const part = await read(catalog, ctx);
     expect(part.text).toBe('B 正文');
     expect(budgets).toContainEqual({ scope: backup.url, limit: 1 });
-    expect(budgets).toContainEqual({ scope: sourceB.url, limit: service.SOURCE_FAILOVER_MAX_REQUESTS });
+    expect(budgets).toContainEqual({ scope: sourceB.url, limit: service.PER_SOURCE_REQUESTS });
     expect(mocks.fetch.mock.calls.some(([input]) => String(input) === bChapter)).toBe(true);
     expect(ctx.signal.aborted).toBe(false);
   });
@@ -1687,7 +1687,7 @@ describe('chapter failover candidate queue (41-FAILOVER-M1)', () => {
     expect(writes).toHaveLength(0);
   });
 
-  // 原「最多尝试三个候选，候选失败原因可追踪」:41-M1.1 把名额改成「只数慢失败、秒回 miss 不占」,
+  // 原「最多尝试三个候选，候选失败原因可追踪」:41-M1.1 把名额改成「只数昂贵失败、SOURCE_NOT_FOUND 不占」,
   // 固定前 3 个的断言作废;名额与原因追踪改由下方 M1.1 组的 c② 与「失败原因分型」两条钉住。
 
   it('软预算已到顶时抛 SOURCE_TIMEOUT，不探测备用源', async () => {
@@ -1713,30 +1713,36 @@ describe('chapter failover candidate queue (41-FAILOVER-M1)', () => {
   });
 });
 
-// ---- 41-M1.1:候选正文翻页 / 当前源切片 / miss-slow 分计 / 脱敏聚合日志 / 标定旋钮 ----
+// ---- 41-M1.1:候选正文翻页 / 当前源切片 / 名额 / 脱敏聚合日志 / 标定旋钮(第二轮并入深审 A F1–F12) ----
 // 本组一律假时钟(setTimeout/clearTimeout/Date):节流槽、切片、单请求超时都按虚拟时间逐个触发，不真等,
 // 断言里的毫秒数就是实现的时间线。当前源放在独立 host(slow.test:没有同站备用 host,传输失败不换 host),
 // 它的时间线只由切片和 8s 单请求超时决定。备用源都在 book15.net 下，与当前源不同站，池序即尝试序。
+// 用例名里的 H1–H8 对应热修任务书「测试」节的 8 个场景(H1 = 上方 41-FAILOVER-M1 组的「引擎候选正文两页」),
+// M1b/M1c/M1d/M3/M4a/M4d 对应深审 A §4 的变异(在本实现上的等价形态见报告)。
 describe('chapter failover M1.1 (41-M1.1)', () => {
   const current = { url: 'https://slow.test/', name: '当前书源', searchUrl: '/books/search.html?kw={{key}}', rules: {} };
+  const currentSearch = 'https://slow.test/books/search.html?kw=' + encodeURIComponent(book.title);
   const currentChapter = 'https://slow.test/chapter/index42-1.html';
   const alt = (n: number) => ({ url: `https://book15.net/alt${n}/`, name: `备用源${n}`, searchUrl: `/alt${n}/search.html?kw={{key}}`, rules: {} });
-  const altSearch = (n: number) => `https://book15.net/alt${n}/search.html?kw=` + encodeURIComponent(book.title);
-  // 引擎备用源：正文按 nextContentUrl 翻页，第 1 页带下一页链接。
-  const pagedEngine = {
-    url: 'https://book15.net/pg/', name: '翻页引擎源', searchUrl: 'https://book15.net/pgs?q={{key}}', tier: 'M1' as const,
-    rules: {
-      ruleSearch: { bookList: '.book', name: '.name@text', author: '.author@text', bookUrl: 'a@href' },
-      ruleBookInfo: { name: '.title@text', author: '.writer@text', tocUrl: '.toc@href' },
-      ruleToc: { chapterList: '.chapter', chapterName: 'a@text', chapterUrl: 'a@href' },
-      ruleContent: { content: '.content@text', nextContentUrl: '.next@href' },
-    },
+  const altSearch = (n: number, keyword = book.title) => `https://book15.net/alt${n}/search.html?kw=` + encodeURIComponent(keyword);
+  // 引擎备用源：正文按 nextContentUrl、目录按 nextTocUrl 翻页。
+  const engineRules = {
+    ruleSearch: { bookList: '.book', name: '.name@text', author: '.author@text', bookUrl: 'a@href' },
+    ruleBookInfo: { name: '.title@text', author: '.writer@text', tocUrl: '.toc@href' },
+    ruleToc: { chapterList: '.chapter', chapterName: 'a@text', chapterUrl: 'a@href', nextTocUrl: '.next-toc@href' },
+    ruleContent: { content: '.content@text', nextContentUrl: '.next@href' },
   };
-  const pagedSecondPage = 'https://book15.net/pg/c/1_2.html';
+  const engineAlt = (n: number) => ({
+    url: `https://book15.net/e${n}/`, name: `引擎源${n}`, searchUrl: `https://book15.net/e${n}s?q={{key}}`, tier: 'M1' as const, rules: engineRules,
+  });
+  const engineToc = (n: number) => `https://book15.net/e${n}/toc/1.html`;
+  const engineChapter = (n: number) => `https://book15.net/e${n}/c/1.html`;
   const headerDelay = new Map<string, number>();
   const bodyDelay = new Map<string, number>();
+  const failOnce = new Map<string, number>();
   let requested: Array<{ url: string; at: number }>;
   let errorSpy: MockInstance<typeof console.error>;
+  let warnSpy: MockInstance<typeof console.warn>;
 
   /** 备用源 n 有这本书且本章可读：搜索 + 详情 + 正文 3 次请求。 */
   const primeHit = (n: number) => {
@@ -1744,21 +1750,24 @@ describe('chapter failover M1.1 (41-M1.1)', () => {
     pages.set(pageUrl(600 + n), { text: detail(600 + n) });
     pages.set(chapterUrl(600 + n), { text: chapterHtml(`备用源${n}正文`) });
   };
-  /** 备用源 n 标题搜索空页 = 本站没有这本书(SOURCE_NOT_FOUND),1 次请求。 */
-  const primeMiss = (n: number) => { pages.set(altSearch(n), { text: '' }); };
-  /** 备用源 n 有书但目录里没有本章(SOURCE_CHAPTER_MISSING),搜索 + 详情 2 次请求。 */
+  /** 备用源 n 确认没有这本书(SOURCE_NOT_FOUND):标题搜索与作者回退都是空页，共 2 次请求。 */
+  const primeMiss = (n: number) => {
+    pages.set(altSearch(n), { text: '' });
+    pages.set(altSearch(n, book.author), { text: '' });
+  };
+  /** 备用源 n 有书但目录里没有本章(SOURCE_CHAPTER_MISSING,昂贵失败),搜索 + 详情 2 次请求。 */
   const primeNoChapter = (n: number) => {
     pages.set(altSearch(n), { text: `<a href="/books/details${600 + n}.html">测试书</a>` });
     pages.set(pageUrl(600 + n), { text: detail(600 + n, '作者', ['无关章节']) });
   };
-  const primePagedEngine = () => {
-    pages.set('https://book15.net/pgs?q=' + encodeURIComponent(book.title), {
-      text: '<div class="book"><span class="name">测试书</span><span class="author">作者</span><a href="/pg/d/1.html">x</a></div>',
+  /** 引擎备用源 n 有这本书：搜索 → 详情 → 目录(第一章)→ 正文。 */
+  const primeEngine = (n: number, content: { text?: string; status?: number } = { text: `<div class="content">引擎源${n}正文</div>` }) => {
+    pages.set(`https://book15.net/e${n}s?q=` + encodeURIComponent(book.title), {
+      text: `<div class="book"><span class="name">测试书</span><span class="author">作者</span><a href="/e${n}/d/1.html">x</a></div>`,
     });
-    pages.set('https://book15.net/pg/d/1.html', { text: '<h1 class="title">测试书</h1><span class="writer">作者</span><a class="toc" href="/pg/toc/1.html">目录</a>' });
-    pages.set('https://book15.net/pg/toc/1.html', { text: '<li class="chapter"><a href="/pg/c/1.html">第一章</a></li>' });
-    pages.set('https://book15.net/pg/c/1.html', { text: '<div class="content">第一页正文</div><a class="next" href="/pg/c/1_2.html">下一页</a>' });
-    pages.set(pagedSecondPage, { text: '<div class="content">第二页正文</div>' });
+    pages.set(`https://book15.net/e${n}/d/1.html`, { text: `<h1 class="title">测试书</h1><span class="writer">作者</span><a class="toc" href="/e${n}/toc/1.html">目录</a>` });
+    pages.set(engineToc(n), { text: `<li class="chapter"><a href="/e${n}/c/1.html">第一章</a></li>` });
+    pages.set(engineChapter(n), content);
   };
   /** 假时钟下一直推进到定时器排空，再交出结果(拒绝原样抛出)。 */
   const drive = async <T>(work: Promise<T>): Promise<T> => {
@@ -1770,7 +1779,7 @@ describe('chapter failover M1.1 (41-M1.1)', () => {
   };
   /** 建好当前源目录并落 catalogs,再把池快照换成 pool;请求记录清零。 */
   const prepareCurrent = async (pool: Array<{ url: string; name: string }>) => {
-    pages.set('https://slow.test/books/search.html?kw=' + encodeURIComponent(book.title), { text: '<a href="/books/details42.html">测试书</a>' });
+    pages.set(currentSearch, { text: '<a href="/books/details42.html">测试书</a>' });
     pages.set('https://slow.test/books/details42.html', { text: detail() });
     const catalog = await drive(service.resolveSourceBook(book, context(), { sources: [current] }));
     catalogs.set(catalog.version, catalog);
@@ -1780,6 +1789,14 @@ describe('chapter failover M1.1 (41-M1.1)', () => {
   };
   const readChapter = (catalog: SourceCatalog, ctx = context()) => drive(service.readSourceChapter(catalog.version, 0, ctx));
   const requestedUrls = () => requested.map(({ url }) => url);
+  /** 包一层 fetch:命中 url 的那一发先执行 hook(改计数、拨时钟等),其余照旧。 */
+  const onRequest = (url: string, hook: () => void) => {
+    const base = mocks.fetch.getMockImplementation()!;
+    mocks.fetch.mockImplementation(async (input, init) => {
+      if (String(input) === url) hook();
+      return base(input, init);
+    });
+  };
   const failoverLines = () => errorSpy.mock.calls.map(([line]) => String(line))
     .filter((line) => line.includes('"event":"source_failover"'));
   /** 恰好一行、结局对得上、字段集固定，且不含书名/作者/源名/URL/host/查询串;返回解析后的字段。 */
@@ -1790,7 +1807,7 @@ describe('chapter failover M1.1 (41-M1.1)', () => {
       ...pool.flatMap((item) => [item.name, item.url, new URL(item.url).host])];
     for (const text of forbidden) expect(lines[0]).not.toContain(text);
     const payload = JSON.parse(lines[0]);
-    expect(Object.keys(payload).sort()).toEqual(['attempted', 'elapsedMs', 'event', 'outcome', 'reasonCounts', 'requests', 'slowAttempts', 'trigger']);
+    expect(Object.keys(payload).sort()).toEqual(['attempted', 'elapsedMs', 'event', 'expensiveAttempts', 'outcome', 'reasonCounts', 'requests', 'trigger']);
     expect(payload).toMatchObject({ event: 'source_failover', outcome });
     return payload;
   };
@@ -1799,14 +1816,20 @@ describe('chapter failover M1.1 (41-M1.1)', () => {
     (await import('./source-policy')).refreshSupportedHosts(['backup.test', 'slow.test']);
     headerDelay.clear();
     bodyDelay.clear();
+    failOnce.clear();
     requested = [];
-    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
     errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
     mocks.fetch.mockImplementation(async (input) => {
       const url = String(input);
       requested.push({ url, at: Date.now() });
       const wait = headerDelay.get(url);
       if (wait) await new Promise((resolve) => setTimeout(resolve, wait));
+      const once = failOnce.get(url);
+      if (once !== undefined) {
+        failOnce.delete(url);
+        return new Response('', { status: once });
+      }
       const fixture = pages.get(url);
       if (!fixture) throw new Error('Unexpected source request');
       if (fixture.status === -2) throw new TypeError('fetch failed');
@@ -1828,6 +1851,8 @@ describe('chapter failover M1.1 (41-M1.1)', () => {
     vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
   });
   afterEach(() => { vi.useRealTimers(); });
+
+  // ---- a. 当前源切片 ----
 
   it('a①: 当前源正文迟迟不完成(>10s)⇒ 约 10s 处放弃，由备用源交付', async () => {
     const pool = [current, alt(1)];
@@ -1858,17 +1883,115 @@ describe('chapter failover M1.1 (41-M1.1)', () => {
   });
 
   it('a③: 当前源正文两页 ⇒ 正常拼接交付(当前源 child 的 L1 不低于翻页上限)', async () => {
-    primePagedEngine();
-    const catalog = await drive(service.resolveSourceBook(book, context(), { sources: [pagedEngine] }));
+    const source = engineAlt(9);
+    primeEngine(9, { text: '<div class="content">第一页正文</div><a class="next" href="/e9/c/1_2.html">下一页</a>' });
+    pages.set('https://book15.net/e9/c/1_2.html', { text: '<div class="content">第二页正文</div>' });
+    const catalog = await drive(service.resolveSourceBook(book, context(), { sources: [source] }));
     catalogs.set(catalog.version, catalog);
-    mocks.sources.mockResolvedValue([pagedEngine, alt(1)]);
+    mocks.sources.mockResolvedValue([source, alt(1)]);
     primeHit(1);
     const part = await readChapter(catalog);
-    expect(part).toMatchObject({ text: '第一页正文\n第二页正文', servedFrom: pagedEngine.name });
+    expect(part).toMatchObject({ text: '第一页正文\n第二页正文', servedFrom: source.name });
     expect(failoverLines()).toEqual([]);
   });
 
-  it('c①: 5 个候选前 4 个秒回 miss、第 5 个成功 ⇒ 成功(秒回 miss 不占名额)', async () => {
+  // ---- 热修任务书 H2–H8(H1 见 41-FAILOVER-M1 组「引擎候选正文两页」)----
+
+  it('H2: 引擎候选目录两页(nextTocUrl,本章在第 2 页)⇒ 成功', async () => {
+    const pool = [current, engineAlt(1)];
+    const catalog = await prepareCurrent(pool);
+    pages.set(currentChapter, { text: '', status: 404 });
+    primeEngine(1);
+    pages.set(engineToc(1), { text: '<li class="chapter"><a href="/e1/c/0.html">序章</a></li><a class="next-toc" href="/e1/toc/2.html">下一页</a>' });
+    pages.set('https://book15.net/e1/toc/2.html', { text: '<li class="chapter"><a href="/e1/c/1.html">第一章</a></li>' });
+    const part = await readChapter(catalog);
+    expect(part).toMatchObject({ text: '引擎源1正文', servedFrom: engineAlt(1).name });
+    expect(requestedUrls()).toContain('https://book15.net/e1/toc/2.html');
+  });
+
+  it('H3: builtin 候选搜索第 1 条同名不同作者、第 2 条才是正书 ⇒ 成功', async () => {
+    const pool = [current, alt(1)];
+    const catalog = await prepareCurrent(pool);
+    pages.set(currentChapter, { text: '', status: 404 });
+    primeHit(1);
+    pages.set(altSearch(1), { text: '<a href="/books/details700.html">测试书</a><a href="/books/details601.html">测试书</a>' });
+    pages.set(pageUrl(700), { text: detail(700, '别的作者') });
+    const part = await readChapter(catalog);
+    expect(part).toMatchObject({ text: '备用源1正文', servedFrom: alt(1).name });
+    expect(requestedUrls()).toContain(pageUrl(700));
+  });
+
+  it('H4: builtin 候选搜索第 1 次 502、重试成功 ⇒ 成功', async () => {
+    const pool = [current, alt(1)];
+    const catalog = await prepareCurrent(pool);
+    pages.set(currentChapter, { text: '', status: 404 });
+    primeHit(1);
+    failOnce.set(altSearch(1), 502);
+    const part = await readChapter(catalog);
+    expect(part).toMatchObject({ text: '备用源1正文', servedFrom: alt(1).name });
+    expect(requestedUrls().filter((url) => url === altSearch(1))).toHaveLength(2);
+  });
+
+  it('H5: builtin 候选是改名书、要靠作者搜索回退 ⇒ 成功', async () => {
+    const pool = [current, alt(1)];
+    const catalog = await prepareCurrent(pool);
+    pages.set(currentChapter, { text: '', status: 404 });
+    // 站点索引只有新名：标题搜索 0 结果;作者搜索命中，详情页简介自报原书名。
+    pages.set(altSearch(1), { text: '' });
+    pages.set(altSearch(1, book.author), { text: '<a href="/books/details601.html">新名</a>' });
+    pages.set(pageUrl(601), {
+      text: '<meta property="og:novel:book_name" content="新名"><meta property="og:novel:author" content="作者">'
+        + '<div>小说简介:【原书名：测试书】改名前的版本。</div><dd><a href="/chapter/index601-1.html">第一章</a></dd>',
+    });
+    pages.set(chapterUrl(601), { text: chapterHtml('改名书正文') });
+    const part = await readChapter(catalog);
+    expect(part).toMatchObject({ text: '改名书正文', servedFrom: alt(1).name });
+  });
+
+  it('H6: builtin 候选搜索/详情/正文各 1.2/2.7/1.2s(合计 >4s、<14s)⇒ 成功', async () => {
+    const pool = [current, alt(1)];
+    const catalog = await prepareCurrent(pool);
+    pages.set(currentChapter, { text: '', status: 404 });
+    primeHit(1);
+    headerDelay.set(altSearch(1), 1_200);
+    headerDelay.set(pageUrl(601), 2_700);
+    headerDelay.set(chapterUrl(601), 1_200);
+    const part = await readChapter(catalog);
+    expect(part).toMatchObject({ text: '备用源1正文', servedFrom: alt(1).name });
+  });
+
+  it('H7(H5a,杀 M4d 之一):当前源 500×2、引擎 A/B 正文 500、引擎 C 完好 ⇒ C 交付(整池 openPool)', async () => {
+    const pool = [current, engineAlt(1), engineAlt(2), engineAlt(3)];
+    const catalog = await prepareCurrent(pool);
+    pages.set(currentChapter, { text: '', status: 500 });
+    primeEngine(1, { text: '', status: 500 });
+    primeEngine(2, { text: '', status: 500 });
+    primeEngine(3);
+    const ctx = context();
+    const part = await readChapter(catalog, ctx);
+    expect(part).toMatchObject({ text: '引擎源3正文', servedFrom: engineAlt(3).name });
+    // 当前源 2 + A 5 + B 5 + C 4 = 16 > 12:不按整池(4 源 ⇒ 24)抬 L2 的话,C 的目录就取不到。
+    expect(ctx.requests).toBe(16);
+    expect(ctx.totalLimit).toBe(24);
+    expect(oneFailoverLine('success', pool)).toMatchObject({
+      trigger: 'SOURCE_HTTP_5XX', attempted: 3, expensiveAttempts: 2, reasonCounts: { SOURCE_HTTP_5XX: 2 },
+    });
+  });
+
+  it('H8(H5b):唯一候选失败之后软预算才越线 ⇒ 503,不是 504', async () => {
+    const pool = [current, alt(1)];
+    const catalog = await prepareCurrent(pool);
+    pages.set(currentChapter, { text: '', status: 404 });
+    primeNoChapter(1);
+    // 候选的详情页那一发之后，墙钟越过软预算(假时钟跳表，待决定时器随之平移、不会误触发)。
+    onRequest(pageUrl(601), () => vi.setSystemTime(Date.now() + service.SOFT_BUDGET_MS));
+    await expect(readChapter(catalog)).rejects.toMatchObject({ code: 'SOURCE_CHAPTER_UNAVAILABLE', status: 503 });
+    expect(oneFailoverLine('exhausted', pool)).toMatchObject({ attempted: 1, reasonCounts: { SOURCE_CHAPTER_MISSING: 1 } });
+  });
+
+  // ---- c. 名额 / 软预算 / L2 ----
+
+  it('c①: 5 个候选前 4 个确认无此书(SOURCE_NOT_FOUND)、第 5 个成功 ⇒ 成功(NOT_FOUND 不占名额)', async () => {
     const pool = [current, alt(1), alt(2), alt(3), alt(4), alt(5)];
     const catalog = await prepareCurrent(pool);
     pages.set(currentChapter, { text: '', status: 404 });
@@ -1879,84 +2002,162 @@ describe('chapter failover M1.1 (41-M1.1)', () => {
     expect(part).toMatchObject({ text: '备用源5正文', servedFrom: alt(5).name });
     const payload = oneFailoverLine('success', pool);
     expect(payload).toMatchObject({
-      trigger: 'SOURCE_HTTP_4XX', attempted: 5, slowAttempts: 0, requests: 7, reasonCounts: { SOURCE_NOT_FOUND: 4 },
+      trigger: 'SOURCE_HTTP_4XX', attempted: 5, expensiveAttempts: 0, requests: 11, reasonCounts: { SOURCE_NOT_FOUND: 4 },
     });
     // elapsedMs 只算换源段：当前源 404 立即返回(换源从 t0 起),到最后一发正文请求为止。
     expect(payload.elapsedMs).toBe(requested.at(-1)!.at - t0);
   });
 
-  it('c②: 4 个候选都是慢失败(>1000ms)⇒ 满 3 个慢名额即停，第 4 个不被尝试', async () => {
+  it('c②: 4 个候选都是昂贵失败 ⇒ 满 3 个名额即停，第 4 个不被尝试', async () => {
     const pool = [current, alt(1), alt(2), alt(3), alt(4)];
     const catalog = await prepareCurrent(pool);
     pages.set(currentChapter, { text: '', status: 404 });
-    for (const n of [1, 2, 3, 4]) {
-      primeMiss(n);
-      headerDelay.set(altSearch(n), 1_500);
-    }
+    for (const n of [1, 2, 3, 4]) primeNoChapter(n);
     await expect(readChapter(catalog)).rejects.toMatchObject({ code: 'SOURCE_CHAPTER_UNAVAILABLE', status: 503, attempted: 3 });
     expect(requestedUrls()).not.toContain(altSearch(4));
     expect(oneFailoverLine('exhausted', pool)).toMatchObject({
-      trigger: 'SOURCE_HTTP_4XX', attempted: 3, slowAttempts: 3, reasonCounts: { SOURCE_NOT_FOUND: 3 },
+      trigger: 'SOURCE_HTTP_4XX', attempted: 3, expensiveAttempts: 3, reasonCounts: { SOURCE_CHAPTER_MISSING: 3 },
     });
   });
 
-  it('c③: 软预算余量不足 1s ⇒ 不再开新候选，走 timeout 出口;恰好 1s 时照开', async () => {
+  it('c③(杀 M4a):软预算余量 7999ms ⇒ 不开新候选、504;恰好 8000ms(一次完整请求)⇒ 照开，切片即余量', async () => {
     const pool = [current, alt(1)];
     const catalog = await prepareCurrent(pool);
     pages.set(currentChapter, { text: '', status: 404 });
     primeHit(1);
-    // 拒绝侧：余量 999ms ⇒ 一个候选都不开。
     const tight = context();
-    vi.setSystemTime(tight.startedAt + service.SOFT_BUDGET_MS - 999);
+    vi.setSystemTime(tight.startedAt + service.SOFT_BUDGET_MS - 7_999);
     await expect(readChapter(catalog, tight)).rejects.toMatchObject({ code: 'SOURCE_TIMEOUT', status: 504 });
     expect(requestedUrls()).toEqual([currentChapter]);
     expect(oneFailoverLine('timeout', pool)).toMatchObject({ trigger: 'SOURCE_HTTP_4XX', attempted: 0, reasonCounts: {} });
-    // 放行侧：余量恰好 1000ms ⇒ 候选照开，切片被余量收窄到 1000ms;装不下搜索+详情+正文,
-    // 切片到点放弃后软预算见底 ⇒ 循环后的 timeout 出口。
     errorSpy.mockClear();
     requested = [];
     const child = vi.spyOn(service.SourceRequestContext.prototype, 'child');
     const edge = context();
-    vi.setSystemTime(edge.startedAt + service.SOFT_BUDGET_MS - 1_000);
-    await expect(readChapter(catalog, edge)).rejects.toMatchObject({ code: 'SOURCE_TIMEOUT', status: 504 });
-    expect(requestedUrls()).toContain(altSearch(1));
-    expect(child.mock.calls).toContainEqual([alt(1).url, { limit: service.SOURCE_FAILOVER_MAX_REQUESTS, sliceMs: 1_000 }]);
-    expect(oneFailoverLine('timeout', pool)).toMatchObject({
-      attempted: 1, slowAttempts: 1, reasonCounts: { SOURCE_SCOPE_EXHAUSTED: 1 },
-    });
+    vi.setSystemTime(edge.startedAt + service.SOFT_BUDGET_MS - 8_000);
+    expect((await readChapter(catalog, edge)).servedFrom).toBe(alt(1).name);
+    expect(child.mock.calls).toContainEqual([alt(1).url, { sliceMs: 8_000 }]);
   });
 
-  it('c③\': 余量充足时候选切片取 min(4s, 余量)', async () => {
-    const pool = [current, alt(1)];
+  it('c③\'(杀 M1c):余量 10s 时候选切片取 min(14s, 余量)=10s,挂起的候选在 10s 处放弃', async () => {
+    const pool = [current, alt(1), alt(2)];
     const catalog = await prepareCurrent(pool);
     pages.set(currentChapter, { text: '', status: 404 });
     primeHit(1);
+    bodyDelay.set(altSearch(1), Number.POSITIVE_INFINITY);
+    primeHit(2);
     const child = vi.spyOn(service.SourceRequestContext.prototype, 'child');
-    const roomy = context();
-    vi.setSystemTime(roomy.startedAt + service.SOFT_BUDGET_MS - 2_500);
-    expect((await readChapter(catalog, roomy)).servedFrom).toBe(alt(1).name);
-    expect(child.mock.calls).toContainEqual([alt(1).url, { limit: service.SOURCE_FAILOVER_MAX_REQUESTS, sliceMs: 2_500 }]);
+    const ctx = context();
+    vi.setSystemTime(ctx.startedAt + service.SOFT_BUDGET_MS - 10_000);
+    await expect(readChapter(catalog, ctx)).rejects.toMatchObject({ code: 'SOURCE_TIMEOUT', status: 504 });
+    expect(child.mock.calls).toContainEqual([alt(1).url, { sliceMs: 10_000 }]);
+    expect(requestedUrls()).not.toContain(altSearch(2));
+    expect(oneFailoverLine('timeout', pool)).toMatchObject({
+      attempted: 1, expensiveAttempts: 1, elapsedMs: 10_000, reasonCounts: { SOURCE_SCOPE_EXHAUSTED: 1 },
+    });
   });
 
-  it('c④: 多个 miss 吃掉请求之后，不会因 L2=12 提前 504(换源开始时按整池 openPool)', async () => {
+  it('c④: 多个 miss 吃掉请求之后，不会因 L2=12 半路停下(换源开始时按整池 openPool)', async () => {
     const pool = [current, ...[1, 2, 3, 4, 5, 6, 7].map((n) => alt(n))];
     const catalog = await prepareCurrent(pool);
     pages.set(currentChapter, { text: '', status: 404 });
-    for (const n of [1, 2, 3, 4, 5, 6]) primeNoChapter(n);
+    for (const n of [1, 2, 3, 4, 5, 6]) primeMiss(n);
     primeHit(7);
     const ctx = context();
     expect(ctx.totalLimit).toBe(12);
     const part = await readChapter(catalog, ctx);
     expect(part).toMatchObject({ text: '备用源7正文', servedFrom: alt(7).name });
-    // 当前源 1 + 6 个 miss×2 + 命中 3 = 16 > 12:不按整池抬 L2 的话，第 6 个 miss 的详情页就撞上 12。
+    // 当前源 1 + 6 个 miss×2 + 命中 3 = 16 > 12:不按整池抬 L2 的话，第 6 个 miss 就把 L2 吃光。
     expect(ctx.requests).toBe(16);
     expect(ctx.totalLimit).toBe(service.MAX_POOL_REQUESTS);
     expect(oneFailoverLine('success', pool)).toMatchObject({
-      attempted: 7, slowAttempts: 0, requests: 15, reasonCounts: { SOURCE_CHAPTER_MISSING: 6 },
+      attempted: 7, expensiveAttempts: 0, requests: 15, reasonCounts: { SOURCE_NOT_FOUND: 6 },
     });
   });
 
+  it('c⑤(杀 M4d):L2 请求数用尽 ⇒ 不再开新候选，按 503 收尾(不是 504)', async () => {
+    const pool = [current, alt(1), alt(2), alt(3)];
+    const catalog = await prepareCurrent(pool);
+    pages.set(currentChapter, { text: '', status: 404 });
+    for (const n of [1, 2, 3]) primeHit(n);
+    const ctx = context();
+    // 当前源那一发把计数顶到 22(模拟多页正文吃掉的点数);四源池 openPool ⇒ 24,
+    // 备用源 1 搜索 + 详情用掉最后 2 点，正文那一发撞 L2。
+    onRequest(currentChapter, () => { ctx.requests = 22; });
+    await expect(readChapter(catalog, ctx)).rejects.toMatchObject({ code: 'SOURCE_CHAPTER_UNAVAILABLE', status: 503, attempted: 1 });
+    expect(ctx.totalLimit).toBe(24);
+    expect(requestedUrls()).not.toContain(chapterUrl(601));
+    expect(requestedUrls()).not.toContain(altSearch(2));
+    expect(oneFailoverLine('exhausted', pool)).toMatchObject({
+      attempted: 1, expensiveAttempts: 1, reasonCounts: { SOURCE_BUDGET_EXCEEDED: 1 },
+    });
+  });
+
+  // ---- F12:切片独立 / 目录+正文共用一片 / 原源取舍 ----
+
+  it('M1b: 候选 A 挂起吃满自己的 14s 切片，不偷 B 的时间;B 以真实延迟 1.2/2.7/1.2s 交付', async () => {
+    const pool = [current, alt(1), alt(2)];
+    const catalog = await prepareCurrent(pool);
+    pages.set(currentChapter, { text: '', status: 404 });
+    primeHit(1);
+    bodyDelay.set(altSearch(1), Number.POSITIVE_INFINITY);
+    primeHit(2);
+    headerDelay.set(altSearch(2), 1_200);
+    headerDelay.set(pageUrl(602), 2_700);
+    headerDelay.set(chapterUrl(602), 1_200);
+    const t0 = Date.now();
+    const part = await readChapter(catalog);
+    expect(part).toMatchObject({ text: '备用源2正文', servedFrom: alt(2).name });
+    expect(requested.find(({ url }) => url === altSearch(2))!.at - t0).toBe(14_000);
+    expect(oneFailoverLine('success', pool)).toMatchObject({
+      attempted: 2, expensiveAttempts: 1, reasonCounts: { SOURCE_SCOPE_EXHAUSTED: 1 },
+    });
+  });
+
+  it('M1d: 目录与正文共用候选的一片切片 —— 目录用掉 12s 后正文只剩 2s,到点放弃，换 B 交付', async () => {
+    const pool = [current, alt(1), alt(2)];
+    const catalog = await prepareCurrent(pool);
+    pages.set(currentChapter, { text: '', status: 404 });
+    primeHit(1);
+    // 每一发都是「头即到、正文 6s」,单请求都在 8s 超时之内;搜索+详情 ≈ 12.35s,正文要到 ≈ 18.35s。
+    for (const url of [altSearch(1), pageUrl(601), chapterUrl(601)]) bodyDelay.set(url, 6_000);
+    primeHit(2);
+    const part = await readChapter(catalog);
+    expect(part).toMatchObject({ text: '备用源2正文', servedFrom: alt(2).name });
+    expect(requestedUrls()).toContain(chapterUrl(601)); // A 的目录在切片内完成，正文确实发出过
+    expect(oneFailoverLine('success', pool)).toMatchObject({ attempted: 2, reasonCounts: { SOURCE_SCOPE_EXHAUSTED: 1 } });
+  });
+
+  it('M3(F6): 他站全部确认无此书 ⇒ 原站带 excludeBookUrl 再试一次、不占名额;他站有昂贵失败 ⇒ 不回原站', async () => {
+    const pool = [current, alt(1)];
+    const catalog = await prepareCurrent(pool);
+    pages.set(currentChapter, { text: '', status: 404 });
+    // 原站把书重新上架到 details43(旧条目 details42 的章节已 404)。
+    pages.set(currentSearch, { text: '<a href="/books/details42.html">测试书</a><a href="/books/details43.html">测试书</a>' });
+    pages.set('https://slow.test/books/details43.html', { text: detail(43) });
+    pages.set('https://slow.test/chapter/index43-1.html', { text: chapterHtml('原站新条目正文') });
+    // 正向：他站确认无此书 ⇒ 回原站找到新条目。
+    primeMiss(1);
+    const part = await readChapter(catalog);
+    expect(part).toMatchObject({ text: '原站新条目正文', servedFrom: current.name });
+    expect(catalogs.get(part.sourceSession!)?.bookUrl).toBe('https://slow.test/books/details43.html');
+    expect(oneFailoverLine('success', pool)).toMatchObject({
+      attempted: 2, expensiveAttempts: 0, reasonCounts: { SOURCE_NOT_FOUND: 1 },
+    });
+    // 反向：他站有书但缺章(昂贵失败)⇒ 不回原站(原站刚失败，再打同站只是原地打转)。
+    vi.setSystemTime(Date.now() + 121_000); // 章节暖缓存 2 分钟过期
+    errorSpy.mockClear();
+    requested = [];
+    primeNoChapter(1);
+    await expect(readChapter(catalog)).rejects.toMatchObject({ code: 'SOURCE_CHAPTER_UNAVAILABLE', status: 503 });
+    expect(requestedUrls()).not.toContain(currentSearch);
+    expect(oneFailoverLine('exhausted', pool)).toMatchObject({ attempted: 1, reasonCounts: { SOURCE_CHAPTER_MISSING: 1 } });
+  });
+
+  // ---- b / F7 / F8:日志、告警与落库 ----
+
   it('b: 失败原因分型为有限枚举码;503 的 attempted/reasons 形状兼容，与日志 reasonCounts 一致', async () => {
+    vi.stubEnv('SOURCE_FAILOVER_MAX_ATTEMPTS', '7'); // 放宽名额，让 5 种失败都跑到
     const pool = [current, alt(1), alt(2), alt(3), alt(4), alt(5)];
     const catalog = await prepareCurrent(pool);
     pages.set(currentChapter, { text: '', status: 404 });
@@ -1978,24 +2179,11 @@ describe('chapter failover M1.1 (41-M1.1)', () => {
       { source: alt(5).name, reason: 'SOURCE_SIMILAR' },
     ]);
     expect(oneFailoverLine('exhausted', pool)).toMatchObject({
-      trigger: 'SOURCE_HTTP_4XX', attempted: 5,
+      trigger: 'SOURCE_HTTP_4XX', attempted: 5, expensiveAttempts: 4,
       reasonCounts: {
         SOURCE_CHAPTER_MISSING: 1, SOURCE_HTTP_4XX: 1, SOURCE_POLICY_REJECTED: 1, SOURCE_NOT_FOUND: 1, SOURCE_SIMILAR: 1,
       },
     });
-  });
-
-  it('b: 正文撞 L2 被转成 504 ⇒ 恰好一行 timeout,原因记 SOURCE_BUDGET_EXCEEDED', async () => {
-    const pool = [current, alt(1)];
-    const catalog = await prepareCurrent(pool);
-    pages.set(currentChapter, { text: '', status: 404 });
-    primeHit(1);
-    const ctx = context();
-    // 二源池 openPool(2) 仍是 12:当前源 1 + 备用源搜索/详情 2 把计数顶到 12,正文那一发撞 L2。
-    ctx.requests = 9;
-    await expect(readChapter(catalog, ctx)).rejects.toMatchObject({ code: 'SOURCE_TIMEOUT', status: 504 });
-    expect(requestedUrls()).not.toContain(chapterUrl(601));
-    expect(oneFailoverLine('timeout', pool)).toMatchObject({ attempted: 1, reasonCounts: { SOURCE_BUDGET_EXCEEDED: 1 } });
   });
 
   it('b: 父 signal 中途中止(deadline/断开)⇒ 原样抛出，也恰好一行 timeout', async () => {
@@ -2040,8 +2228,70 @@ describe('chapter failover M1.1 (41-M1.1)', () => {
     }
   });
 
+  it('F7: 候选 miss 不再各打 source_not_found / search_no_candidates,由结尾的聚合事件替代', async () => {
+    const pool = [current, alt(1), alt(2)];
+    const catalog = await prepareCurrent(pool);
+    pages.set(currentChapter, { text: '', status: 404 });
+    primeMiss(1);
+    // 标题搜索页只有一本无关书：精确层 0 候选(旧行为会登记 search_no_candidates),核验后确认无此书。
+    pages.set(altSearch(1), { text: '<a href="/books/details699.html">无关书</a>' });
+    pages.set(pageUrl(699), {
+      text: '<meta property="og:novel:book_name" content="无关书"><meta property="og:novel:author" content="别人">'
+        + '<dd><a href="/chapter/index699-1.html">第一章</a></dd>',
+    });
+    primeHit(2);
+    expect((await readChapter(catalog)).servedFrom).toBe(alt(2).name);
+    expect(warnSpy.mock.calls.filter(([tag]) => String(tag).startsWith('[read-source]'))).toEqual([]);
+    expect(oneFailoverLine('success', pool)).toMatchObject({ reasonCounts: { SOURCE_NOT_FOUND: 1 } });
+  });
+
+  it('F8: 备用源目录落库失败 ⇒ 立即 503 fail-closed,不再去打后面候选的上游', async () => {
+    const pool = [current, alt(1), alt(2)];
+    const catalog = await prepareCurrent(pool);
+    pages.set(currentChapter, { text: '', status: 404 });
+    primeHit(1);
+    primeHit(2);
+    const baseTransaction = transaction.getMockImplementation()!;
+    transaction.mockImplementation(async (queries: Query[], options: { fetchOptions: { signal: AbortSignal } }) => {
+      if (queries.some((query) => query.text.startsWith('INSERT INTO source_read_catalogs'))) throw new Error('db down');
+      return baseTransaction(queries, options);
+    });
+    await expect(readChapter(catalog)).rejects.toMatchObject({ code: 'SOURCE_CHAPTER_UNAVAILABLE', status: 503, attempted: 1 });
+    expect(requestedUrls()).not.toContain(altSearch(2));
+    expect(oneFailoverLine('exhausted', pool)).toMatchObject({ attempted: 1, reasonCounts: { SOURCE_CATALOG_SAVE_FAILED: 1 } });
+  });
+
+  it('route: 换源软预算见底的 504 也写一行 {code, requests, elapsedMs} 结构化日志(与 503 同款)', async () => {
+    const pool = [current, alt(1)];
+    const catalog = await prepareCurrent(pool);
+    pages.set(currentChapter, { text: '', status: 404 });
+    primeHit(1);
+    // 当前源那一发之后墙钟已走掉 40s 软预算(假时钟跳表，待决定时器随之平移、不会误触发)。
+    onRequest(currentChapter, () => vi.setSystemTime(Date.now() + 40_000));
+    const res = await drive(request('chapter', `session=${catalog.version}&version=${catalog.version}&chapter=0`));
+    expect(res.status).toBe(504);
+    expect(await res.json()).toMatchObject({ code: 'SOURCE_TIMEOUT' });
+    const routeLines = errorSpy.mock.calls.map(([line]) => String(line)).filter((line) => line.startsWith('{"code"'));
+    expect(routeLines).toHaveLength(1);
+    expect(JSON.parse(routeLines[0])).toEqual({ code: 'SOURCE_TIMEOUT', requests: 1, elapsedMs: expect.any(Number) });
+    expect(oneFailoverLine('timeout', pool)).toMatchObject({ attempted: 0 });
+  });
+
+  // ---- d. 标定旋钮 ----
+
+  it('d: sourceFailoverSliceMs 默认 14000,合法值钳在 [4000, 20000],空串/非数字/0/负数回退默认', () => {
+    const read = service.sourceFailoverSliceMs;
+    expect(read({})).toBe(14_000);
+    expect(read({ SOURCE_FAILOVER_SLICE_MS: '6000' })).toBe(6_000);
+    expect(read({ SOURCE_FAILOVER_SLICE_MS: '5' })).toBe(4_000);
+    expect(read({ SOURCE_FAILOVER_SLICE_MS: '20000' })).toBe(20_000);
+    expect(read({ SOURCE_FAILOVER_SLICE_MS: '20001' })).toBe(20_000);
+    for (const invalid of ['', 'abc', '0', '-3']) expect(read({ SOURCE_FAILOVER_SLICE_MS: invalid })).toBe(14_000);
+    vi.stubEnv('SOURCE_FAILOVER_SLICE_MS', '7000'); // 缺省参数读 process.env
+    expect(read()).toBe(7_000);
+  });
+
   it.each([
-    ['sourceFailoverSliceMs', 'SOURCE_FAILOVER_SLICE_MS', 4_000, 20_000],
     ['sourceFailoverMaxAttempts', 'SOURCE_FAILOVER_MAX_ATTEMPTS', 3, 7],
     ['sourceCurrentSliceMs', 'SOURCE_CURRENT_SLICE_MS', 10_000, 20_000],
   ] as const)('d: %s(env %s)合法值生效，空串/非数字/0/负数回退默认，超上限被钳住', (knob, name, fallback, cap) => {
@@ -2052,28 +2302,25 @@ describe('chapter failover M1.1 (41-M1.1)', () => {
     for (const invalid of ['', 'abc', '0', '-3']) expect(read({ [name]: invalid })).toBe(fallback);
     expect(read({ [name]: String(cap + 1) })).toBe(cap);
     expect(read({ [name]: '99999999' })).toBe(cap);
-    // 缺省参数读 process.env。
-    vi.stubEnv(name, '6');
+    vi.stubEnv(name, '6'); // 缺省参数读 process.env
     expect(read()).toBe(6);
   });
 
-  it('d: 三个旋钮都真的接进了换源链路(env 改当前源切片/候选切片/慢名额)', async () => {
+  it('d: 三个旋钮都真的接进了换源链路(env 改当前源切片/候选切片/昂贵名额)', async () => {
     vi.stubEnv('SOURCE_CURRENT_SLICE_MS', '5000');
-    vi.stubEnv('SOURCE_FAILOVER_SLICE_MS', '3000');
+    vi.stubEnv('SOURCE_FAILOVER_SLICE_MS', '6000');
     vi.stubEnv('SOURCE_FAILOVER_MAX_ATTEMPTS', '1');
     const pool = [current, alt(1), alt(2)];
     const catalog = await prepareCurrent(pool);
     pages.set(currentChapter, { text: chapterHtml('当前源正文') });
     bodyDelay.set(currentChapter, 6_000); // 默认 10s 切片下会正常交付;env 调到 5s ⇒ 5s 处放弃
-    for (const n of [1, 2]) {
-      primeMiss(n);
-      headerDelay.set(altSearch(n), 1_500);
-    }
+    primeNoChapter(1);
+    primeNoChapter(2);
     const child = vi.spyOn(service.SourceRequestContext.prototype, 'child');
     const t0 = Date.now();
     await expect(readChapter(catalog)).rejects.toMatchObject({ code: 'SOURCE_CHAPTER_UNAVAILABLE', attempted: 1 });
     expect(requested.find(({ url }) => url === altSearch(1))!.at - t0).toBe(5_000);
-    expect(child.mock.calls).toContainEqual([alt(1).url, { limit: service.SOURCE_FAILOVER_MAX_REQUESTS, sliceMs: 3_000 }]);
-    expect(requestedUrls()).not.toContain(altSearch(2)); // 慢名额 1 个，用完即停
+    expect(child.mock.calls).toContainEqual([alt(1).url, { sliceMs: 6_000 }]);
+    expect(requestedUrls()).not.toContain(altSearch(2)); // 昂贵名额 1 个，用完即停
   });
 });
