@@ -2,10 +2,11 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createHash } from 'node:crypto';
 import corpus from './fixtures/admission-174.json';
 import {
-  ADMISSION_CONN_FAIL_RETEST_MS, ADMISSION_RETEST_INTERVAL_MS, ADMISSION_TIMEOUT_MS, DEFAULT_ADMISSION_MAX_PROBES,
+  ADMISSION_CONN_FAIL_RETEST_MS, ADMISSION_OK_RECHECK_MS, ADMISSION_RECHECK_FAIL_PREFIX,
+  ADMISSION_RETEST_INTERVAL_MS, ADMISSION_TIMEOUT_MS, DEFAULT_ADMISSION_MAX_PROBES,
   DEFAULT_ADMISSION_PROBE_CONCURRENCY, MAX_ADMISSION_PROBE_CONCURRENCY,
   admissionBucket, admissionMaxProbes, admissionProbeConcurrency, compileAdmission,
-  runAdmissionBatch, searchAdmission, rulesHash, type AdmissionSourceRow, type AdmissionTransport,
+  recheckOutcome, runAdmissionBatch, searchAdmission, rulesHash, type AdmissionSourceRow, type AdmissionTransport,
 } from './admission';
 import { createDeadline } from '@/lib/deadline';
 import { ENGINE_SEMANTICS_VERSION, engineVersionedKey } from './compile';
@@ -988,7 +989,7 @@ describe('准入状态机 runAdmissionBatch', () => {
           fetchPage: fetchOk(), signal: signal(), throttleMs: 0, maxProbes: 1,
         });
         expect(result.probed).toBe(1);
-        expect(result.rows[0].source_url).toBe(url); // 未测优先（probeClass 0 < 2）
+        expect(result.rows[0].source_url).toBe(url); // 未测优先（probeClass 0 < 2 < 3）
       });
     });
 
@@ -1074,6 +1075,203 @@ describe('准入状态机 runAdmissionBatch', () => {
       expect(fetchPage.mock.calls[0][0]).toContain('fresh.example.com');
     });
   });
+
+  // 41-B2-OK-RECHECK：ok 源不再永久免检——7 天长周期复核（class 2，名额最后），
+  // 首次失败记 strike（error=recheck_fail:<verdict>，search_ok/verdict 保持 ok，不出池），
+  // 可疑行 20h 后走 class 1 再确认，再失败才写真实结论出池。
+  describe('41-B2-OK-RECHECK：ok 源长周期复核 + 一次失败不出池', () => {
+    const url = 'https://b2.example.com';
+    const source = syntheticSource('https://b2.example.com/');
+    const hash = rulesHash(source);
+    const okPage = () => vi.fn<AdmissionTransport>().mockResolvedValue(
+      page('<div class="i"><span class="t">书名</span><a href="/b/1">x</a></div>'));
+    const okRow = (over: Partial<AdmissionSourceRow> = {}) => sourceRow(url, {
+      tier: 'M1', compile_ok: true, search_ok: true, search_verdict: 'ok', rules_hash: hash, ...over,
+    });
+
+    it('①ok 行 8 天前测过 → 进入探测（class 2）；名额受限时 class 0/1 先拿名额，ok 复核只吃剩余', async () => {
+      expect(ADMISSION_OK_RECHECK_MS).toBe(7 * 24 * 3_600_000);
+      const staleOk = okRow({ search_checked_at: new Date(Date.now() - 8 * 24 * 3_600_000).toISOString() });
+      // 名额 2：未测（class 0）与 deferred 到期（class 1）先占，ok 复核（class 2）吃不到名额。
+      const deferredUrl = 'https://b2-deferred.example.com';
+      const freshUrl = 'https://b2-fresh.example.com';
+      const deferredSource = syntheticSource('https://b2-deferred.example.com/');
+      const limited = await runAdmissionBatch({
+        candidates: [
+          { url, source },
+          { url: deferredUrl, source: deferredSource },
+          { url: freshUrl, source: syntheticSource('https://b2-fresh.example.com/') },
+        ],
+        declaredHosts: new Set(['b2.example.com', 'b2-deferred.example.com', 'b2-fresh.example.com']),
+        existing: new Map([
+          [url, staleOk],
+          [deferredUrl, sourceRow(deferredUrl, {
+            tier: 'M1', compile_ok: true, search_ok: false, search_verdict: 'http_5xx',
+            search_checked_at: new Date(Date.now() - 25 * 3_600_000).toISOString(),
+            rules_hash: rulesHash(deferredSource),
+          })],
+        ]),
+        fetchPage: okPage(), signal: signal(), throttleMs: 0, maxProbes: 2,
+      });
+      const probedHosts = limited.rows.map((row) => row.source_url);
+      expect(probedHosts).toEqual([freshUrl, deferredUrl]); // class 0 先于 class 1，ok 复核落选
+      expect(limited.probed).toBe(2);
+
+      // 名额宽（3）：ok 复核吃到剩余名额，最旧优先语义下同档排最前。
+      const wide = await runAdmissionBatch({
+        candidates: [
+          { url, source },
+          { url: deferredUrl, source: deferredSource },
+          { url: freshUrl, source: syntheticSource('https://b2-fresh.example.com/') },
+        ],
+        declaredHosts: new Set(['b2.example.com', 'b2-deferred.example.com', 'b2-fresh.example.com']),
+        existing: new Map([
+          [url, staleOk],
+          [deferredUrl, sourceRow(deferredUrl, {
+            tier: 'M1', compile_ok: true, search_ok: false, search_verdict: 'http_5xx',
+            search_checked_at: new Date(Date.now() - 25 * 3_600_000).toISOString(),
+            rules_hash: rulesHash(deferredSource),
+          })],
+        ]),
+        fetchPage: okPage(), signal: signal(), throttleMs: 0, maxProbes: 3,
+      });
+      expect(wide.rows.map((row) => row.source_url)).toEqual([freshUrl, deferredUrl, url]);
+      expect(wide.probed).toBe(3);
+    });
+
+    it('②ok 行 3 天前测过 → 未到 7 天窗，不探测', async () => {
+      const result = await runAdmissionBatch({
+        candidates: [{ url, source }], declaredHosts: new Set(['b2.example.com']),
+        existing: new Map([[url, okRow({
+          search_checked_at: new Date(Date.now() - 3 * 24 * 3_600_000).toISOString(),
+        })]]),
+        fetchPage: vi.fn<AdmissionTransport>(), signal: signal(), throttleMs: 0,
+      });
+      expect(result.probed).toBe(0);
+      expect(result.rows).toHaveLength(0);
+    });
+
+    it('③ok 复核首次失败（conn_fail 与 http_5xx）→ strike：search_ok=true、verdict=ok、error 带 recheck_fail: 前缀，仍在池', async () => {
+      for (const [verdict, fetchPage] of [
+        ['conn_fail', vi.fn<AdmissionTransport>().mockRejectedValue(new TypeError('fetch failed'))],
+        ['http_5xx', vi.fn<AdmissionTransport>().mockResolvedValue(page('boom', 500))],
+      ] as const) {
+        const result = await runAdmissionBatch({
+          candidates: [{ url, source }], declaredHosts: new Set(['b2.example.com']),
+          existing: new Map([[url, okRow({
+            search_checked_at: new Date(Date.now() - 8 * 24 * 3_600_000).toISOString(),
+          })]]),
+          fetchPage, signal: signal(), throttleMs: 0,
+        });
+        expect(result.probed, verdict).toBe(1);
+        expect(result.rows[0], verdict).toMatchObject({
+          search_ok: true, search_verdict: 'ok', error: `${ADMISSION_RECHECK_FAIL_PREFIX}${verdict}`,
+        });
+      }
+    });
+
+    it('④可疑行 21 小时后 → class 1 复测；再次失败 → search_ok=false + 真实 verdict（出池）', async () => {
+      const suspicious = okRow({
+        search_checked_at: new Date(Date.now() - 21 * 3_600_000).toISOString(),
+        error: `${ADMISSION_RECHECK_FAIL_PREFIX}conn_fail`,
+      });
+      // class 1 佐证：与未测源抢 1 个名额时未测赢（可疑行不抢 class 0），但先于 ok 长周期复核。
+      const freshUrl = 'https://b2-fresh2.example.com';
+      const order = await runAdmissionBatch({
+        candidates: [
+          { url, source },
+          { url: freshUrl, source: syntheticSource('https://b2-fresh2.example.com/') },
+        ],
+        declaredHosts: new Set(['b2.example.com', 'b2-fresh2.example.com']),
+        existing: new Map([[url, suspicious]]),
+        fetchPage: vi.fn<AdmissionTransport>().mockResolvedValue(page('boom', 500)),
+        signal: signal(), throttleMs: 0, maxProbes: 1,
+      });
+      expect(order.rows[0].source_url).toBe(freshUrl); // class 0 先于可疑行（class 1）
+
+      // 再次失败：strike 耗尽，写真实结论出池。
+      const again = await runAdmissionBatch({
+        candidates: [{ url, source }], declaredHosts: new Set(['b2.example.com']),
+        existing: new Map([[url, suspicious]]),
+        fetchPage: vi.fn<AdmissionTransport>().mockResolvedValue(page('boom', 500)),
+        signal: signal(), throttleMs: 0,
+      });
+      expect(again.probed).toBe(1);
+      expect(again.rows[0]).toMatchObject({ search_ok: false, search_verdict: 'http_5xx', error: '500' });
+    });
+
+    it('④b 可疑行(class 1)与另一个 class 1 到期源抢 1 个名额 → class 1 内最旧者赢,可疑行不混进 class 2', async () => {
+      // 现有 ④ 只证明可疑行输给 class 0,对「class 1 与 class 2 有别」是恒真的(class 0 对谁都赢)。
+      // 本条钉区分:可疑行(21h 前,带 recheck_fail 前缀)与一个更老的 deferred 到期源(class 1)
+      // 抢 1 个名额时,class 1 内按 search_checked_at 最旧优先——deferred 源(25h 前)赢,
+      // 可疑行落选写占位;若可疑行被错判成 class 2(名额最后),结果同样是 deferred 赢,
+      // 所以再加一个 8 天前的干净 ok 行(class 2)做对照:名额放宽到 2 时,可疑行必须排在
+      // class 2 之前拿到第 2 个名额。
+      const suspicious = okRow({
+        search_checked_at: new Date(Date.now() - 21 * 3_600_000).toISOString(),
+        error: `${ADMISSION_RECHECK_FAIL_PREFIX}conn_fail`,
+      });
+      const deferredUrl = 'https://b2-old-deferred.example.com';
+      const deferredSource = syntheticSource('https://b2-old-deferred.example.com/');
+      const okUrl = 'https://b2-old-ok.example.com';
+      const okSource = syntheticSource('https://b2-old-ok.example.com/');
+      const existing = new Map<string, AdmissionSourceRow>([
+        [url, suspicious],
+        [deferredUrl, sourceRow(deferredUrl, {
+          tier: 'M1', compile_ok: true, search_ok: false, search_verdict: 'http_5xx',
+          search_checked_at: new Date(Date.now() - 25 * 3_600_000).toISOString(),
+          rules_hash: rulesHash(deferredSource),
+        })],
+        [okUrl, sourceRow(okUrl, {
+          tier: 'M1', compile_ok: true, search_ok: true, search_verdict: 'ok',
+          search_checked_at: new Date(Date.now() - 8 * 24 * 3_600_000).toISOString(),
+          rules_hash: rulesHash(okSource),
+        })],
+      ]);
+      const candidates = [
+        { url, source },
+        { url: deferredUrl, source: deferredSource },
+        { url: okUrl, source: okSource },
+      ];
+      const hosts = new Set(['b2.example.com', 'b2-old-deferred.example.com', 'b2-old-ok.example.com']);
+      const one = await runAdmissionBatch({
+        candidates, declaredHosts: hosts, existing,
+        fetchPage: okPage(), signal: signal(), throttleMs: 0, maxProbes: 1,
+      });
+      expect(one.rows.filter((row) => row.search_verdict !== '').map((row) => row.source_url))
+        .toEqual([deferredUrl]); // class 1 内最旧者(25h)赢过可疑行(21h)
+      const two = await runAdmissionBatch({
+        candidates, declaredHosts: hosts, existing,
+        fetchPage: okPage(), signal: signal(), throttleMs: 0, maxProbes: 2,
+      });
+      expect(two.rows.filter((row) => row.search_verdict !== '').map((row) => row.source_url))
+        .toEqual([deferredUrl, url]); // 第 2 个名额给可疑行(class 1),class 2 的 ok 复核落选
+    });
+
+    it('⑤可疑行复测成功 → error 清空，回到普通 ok', async () => {
+      const result = await runAdmissionBatch({
+        candidates: [{ url, source }], declaredHosts: new Set(['b2.example.com']),
+        existing: new Map([[url, okRow({
+          search_checked_at: new Date(Date.now() - 21 * 3_600_000).toISOString(),
+          error: `${ADMISSION_RECHECK_FAIL_PREFIX}http_5xx`,
+        })]]),
+        fetchPage: okPage(), signal: signal(), throttleMs: 0,
+      });
+      expect(result.probed).toBe(1);
+      expect(result.rows[0]).toMatchObject({ search_ok: true, search_verdict: 'ok', error: '' });
+    });
+
+    it('recheckOutcome 纯函数：非 ok 行的探测失败照实写（strike 只保护干净 ok 行）', () => {
+      const failed = { verdict: 'http_5xx', candidateCount: 0, status: 500, error: '500' } as const;
+      expect(recheckOutcome(undefined, failed)).toEqual({ search_ok: false, search_verdict: 'http_5xx', error: '500' });
+      const deferredRow = sourceRow(url, { compile_ok: true, search_ok: false, search_verdict: 'http_5xx' });
+      expect(recheckOutcome(deferredRow, failed)).toEqual({ search_ok: false, search_verdict: 'http_5xx', error: '500' });
+      const cleanOk = sourceRow(url, { compile_ok: true, search_ok: true, search_verdict: 'ok' });
+      expect(recheckOutcome(cleanOk, failed)).toEqual({
+        search_ok: true, search_verdict: 'ok', error: `${ADMISSION_RECHECK_FAIL_PREFIX}http_5xx`,
+      });
+    });
+  });
 });
 
 describe('导出面红线（任务 4 结构断言的前置）', () => {
@@ -1156,6 +1354,8 @@ describe('rulesHash 纳入引擎语义版本', () => {
     expect(noSlot.probed).toBe(0);
 
     // 拿到名额 → 真探正常改写为新前缀，search_ok 不复用旧结论。
+    // 41-B2-OK-RECHECK 注：既有行是干净 ok 行，本次真探失败（no_result）只记 strike、
+    // 不出池——search_ok/verdict 保持 ok，error 带 recheck_fail: 前缀；hash 前缀照常翻新。
     const probed = await runAdmissionBatch({
       candidates: [{ url: 'https://search-version.example.com/', source }],
       declaredHosts: new Set(['search-version.example.com']),
@@ -1164,7 +1364,9 @@ describe('rulesHash 纳入引擎语义版本', () => {
     });
     expect(probed.rows).toHaveLength(1);
     expect(probed.rows[0]).toMatchObject({
-      compile_ok: true, search_ok: false, search_verdict: 'no_result', rules_hash: rulesHash(source),
+      compile_ok: true, search_ok: true, search_verdict: 'ok',
+      error: `${ADMISSION_RECHECK_FAIL_PREFIX}no_result`,
+      rules_hash: rulesHash(source),
       engine_semantics_version: ENGINE_SEMANTICS_VERSION,
     });
   });
