@@ -96,27 +96,33 @@ describe('publishBookVersion 的 chapterRanges', () => {
       .toEqual(ranges.map((range) => ({ i: range.index, t: range.title, s: range.startByte, e: range.endByte })));
   });
 
-  const txt = engineBook(MIXED).txt;
-  const good = engineChapterRanges(txt, engineBook(MIXED).records)!;
-  const size = Buffer.byteLength(txt, 'utf8');
+  // 基准边界在用例内现算(不在收集期算):还原逻辑被改坏时是具名用例红,而不是整文件收集失败。
+  const baseline = () => {
+    const { txt, records } = engineBook(MIXED);
+    const good = engineChapterRanges(txt, records);
+    expect(good).not.toBeNull();
+    return { txt, good: good!, size: Buffer.byteLength(txt, 'utf8') };
+  };
   const shift = (ranges: TxtChapter[], index: number, patch: Partial<TxtChapter>) =>
     ranges.map((range, i) => (i === index ? { ...range, ...patch } : range));
-  it.each([
-    ['中间有缺口', shift(good, 1, { startByte: good[1].startByte + 1 })],
-    ['相邻重叠', shift(good, 1, { startByte: good[1].startByte - 1 })],
-    ['没铺到全书末尾', shift(good, 2, { endByte: size - 1 })],
-    ['越过全书末尾', shift(good, 2, { endByte: size + 1 })],
-    ['空章', [...good.slice(0, 2), { ...good[2], endByte: good[2].startByte }]],
+  it.each<[string, (good: TxtChapter[], size: number) => TxtChapter[]]>([
+    ['中间有缺口', (good) => shift(good, 1, { startByte: good[1].startByte + 1 })],
+    ['相邻重叠', (good) => shift(good, 1, { startByte: good[1].startByte - 1 })],
+    ['没铺到全书末尾', (good, size) => shift(good, 2, { endByte: size - 1 })],
+    ['越过全书末尾', (good, size) => shift(good, 2, { endByte: size + 1 })],
+    ['空章', (good) => [...good.slice(0, 2), { ...good[2], endByte: good[2].startByte }]],
     // 第 3 章以「完」(3 字节)开头:边界右移 1 字节正好落在它的 UTF-8 续字节上(铺满、首尾相接都仍成立)。
-    ['起点落在 UTF-8 续字节上', [good[0], { ...good[1], endByte: good[1].endByte + 1 }, { ...good[2], startByte: good[2].startByte + 1 }]],
-  ])('边界%s ⇒ 发布前拒绝(invalid_chapter_ranges),零 GitHub 调用', async (_name, ranges) => {
+    ['起点落在 UTF-8 续字节上', (good) => [good[0], { ...good[1], endByte: good[1].endByte + 1 }, { ...good[2], startByte: good[2].startByte + 1 }]],
+  ])('边界%s ⇒ 发布前拒绝(invalid_chapter_ranges),零 GitHub 调用', async (_name, build) => {
+    const { txt, good, size } = baseline();
     const github = new RecordingGitHub();
-    await expect(publishBookVersion(github, guardOk, candidate(txt, MIXED.length, { chapterRanges: ranges })))
+    await expect(publishBookVersion(github, guardOk, candidate(txt, MIXED.length, { chapterRanges: build(good, size) })))
       .rejects.toMatchObject({ stage: 'manifest', detail: 'invalid_chapter_ranges' });
     expect(github.calls).toBe(0);
   });
 
   it('边界章数 ≠ chaptersDone ⇒ 发布前拒绝(chapter_count_mismatch),零 GitHub 调用', async () => {
+    const { txt, good } = baseline();
     const github = new RecordingGitHub();
     const error = await publishBookVersion(github, guardOk, candidate(txt, MIXED.length + 1, { chapterRanges: good }))
       .catch((caught: unknown) => caught);
