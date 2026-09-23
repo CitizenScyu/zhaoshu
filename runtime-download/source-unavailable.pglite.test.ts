@@ -386,4 +386,26 @@ maybe('41-EXEC-SRCUNAVAIL 第二轮：生产装配（扣额度前预检开）', 
     expect(budget.used()).toBe(0);
     expect(budget.refunds).toHaveLength(1);
   });
+
+  it('⑧ᵖ 预检放行（identity_unverified：源解析失败 code=2，与引擎源池不可用同档）+ 下载期 source_unavailable ⇒ 扣 1 后恰好退还一次', async () => {
+    // 非 https 源地址让真 createResolveSource 在预检与下载两处都抛 ResolveSourceError(2)：预检不判不可达
+    // （resolve 不在可达性阶段）⇒ fail-open 照常 consume；下载器判 code=2 ⇒ source_unavailable ⇒ 退避 + 凭票退还。
+    const id = Number(((await pg.query(
+      `INSERT INTO download_tasks(user_id, book_id, title, author, status, source_url, requested_by, source_kind)
+       VALUES (NULL, 1, '测试书', '佚名', 'pending', 'http://book15.net/books/details1.html', 'system', 'builtin') RETURNING id`,
+    )).rows[0] as { id: number }).id);
+    const budget = ledgerBudget();
+    const logs: LogLine[] = [];
+    const site = book15();
+    expect(await runWired(site, budget, logs)).toBe(DEFAULT_DECISIONS.TASK_DONE);
+    const state = await row(id);
+    expect(state).toMatchObject({ status: 'pending', attempt_count: 2, delay_ms: 15 * MINUTE });
+    expect(state.error).toContain('resolve');
+    expect(budget.used()).toBe(0);
+    expect(budget.refunds).toEqual([`${id}:1`]); // 恰好一次，票据 = 本次领取（任务 id + 租约 generation 1）
+    expect(site.calls).toEqual([]); // 两处都在解析源时失败，一个源站请求都没发
+    expect(logs.map(line => line.fields)).toContainEqual({ taskId: id, reason: 'identity_unverified' });
+    expect(sourceLines(logs).map(line => line.fields?.stage)).toEqual(['resolve']);
+    expect(github.calls).toEqual([]);
+  });
 });
