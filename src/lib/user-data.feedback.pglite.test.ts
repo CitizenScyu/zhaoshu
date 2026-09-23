@@ -67,6 +67,18 @@ maybe('真实 PostgreSQL：feedbackForUserQueries 路线 B（写反馈时补 boo
         lower(btrim(normalize(author, NFKC)))
       ) STORED`);
     await pg.exec(`CREATE UNIQUE INDEX IF NOT EXISTS books_identity_idx ON books (title_key, author_key)`);
+    // 0002 同样给 labeled_books 建身份键（business-schema 刻意不建，同上注释）。
+    // MS-14 把补行 INSERT 的 WHERE 从 lower(btrim(title)) 改成 title_key/author_key 键等值
+    // （联 labeled_books），夹具不给 labeled_books 补这两列会报 42703。
+    await pg.exec(`
+      ALTER TABLE labeled_books ADD COLUMN IF NOT EXISTS title_key text GENERATED ALWAYS AS (
+        lower(btrim(regexp_replace(btrim(normalize(title, NFKC)), '^《(.+)》$', '\\1')))
+      ) STORED`);
+    await pg.exec(`
+      ALTER TABLE labeled_books ADD COLUMN IF NOT EXISTS author_key text GENERATED ALWAYS AS (
+        lower(btrim(normalize(author, NFKC)))
+      ) STORED`);
+    await pg.exec(`CREATE UNIQUE INDEX IF NOT EXISTS labeled_books_identity_idx ON labeled_books (title_key, author_key)`);
   }, 60_000);
 
   const statements = (title: string, author: string, status = 'done', note = '看完了', expected = 0) =>
