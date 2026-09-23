@@ -170,10 +170,12 @@ describe('chapterUrl 缺失/求值空 → 取当前目录页 URL（legado baseUr
 });
 
 describe('导出面快照（M1 任务 4 v3 E5 结构断言）', () => {
-  it('模块导出恰为门面四函数；admissionFetch / validateAdmissionUrl 不在其中', async () => {
+  it('模块导出恰为门面四函数 + 正文翻页上限常量；admissionFetch / validateAdmissionUrl 不在其中', async () => {
     const moduleExports = Object.keys(await import('./api')).sort();
+    // MAX_CONTENT_PAGES 是唯一的常量例外（41-M1.1）：阅读器正文 context 的 L1 上限必须不低于翻页上限，
+    // 共用同一个值防止两边漂移（limit 低于它时引擎正文第 2 页就撞 SOURCE_SCOPE_EXHAUSTED）。
     expect(moduleExports).toEqual([
-      'engineFetchContent', 'engineFetchDetail', 'engineFetchToc', 'engineSearchBook',
+      'MAX_CONTENT_PAGES', 'engineFetchContent', 'engineFetchDetail', 'engineFetchToc', 'engineSearchBook',
     ]);
     expect(moduleExports).not.toContain('admissionFetch');
     expect(moduleExports).not.toContain('validateAdmissionUrl');

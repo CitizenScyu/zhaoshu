@@ -2,7 +2,8 @@
 // 不做身份判定、不做源循环、不做候选排序（这些留在 source-reader.ts）。
 //
 // 边界（§7.3）：`context.page` 是唯一取页入口；本文件无定时器、无重试、无自带请求路径。
-// 结构断言（v3 E5）：本模块导出集合**恰为**门面四函数与其类型；
+// 结构断言（v3 E5）：本模块导出集合**恰为**门面四函数（engineSearchBook / engineFetchDetail / engineFetchToc /
+// engineFetchContent）与其类型，外加正文翻页上限常量 MAX_CONTENT_PAGES（41-M1.1：阅读器正文 context 的 L1 上限复用它）；
 // admissionFetch / validateAdmissionUrl 不在此（它们在 rule-engine/admission.ts 且不导出）。
 import { validateSourceUrl } from '@/lib/source-policy';
 import {
@@ -25,7 +26,7 @@ export interface EngineContentResult { text: string }
 
 /** 翻页安全上限（引擎无定时器，靠页数/章节数上限终止，§7.3）。 */
 const MAX_TOC_PAGES = 20;
-const MAX_CONTENT_PAGES = 20;
+export const MAX_CONTENT_PAGES = 20; // E5 导出例外（41-M1.1）：阅读器正文 context 的 L1 上限复用此值，不另写数字
 const MAX_SEARCH_CANDIDATES = 50;
 const MAX_TITLE_LENGTH = 200;
 
