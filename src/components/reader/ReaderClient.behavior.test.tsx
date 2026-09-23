@@ -12,7 +12,7 @@ import ReaderClient from './ReaderClient';
 // 换源的状态流转正是靠 fetch 参数断言来钉。
 //
 // reader.module.css 桩掉:纯样式,且本机 PostCSS/Tailwind 插件链加载有问题、与渲染断言无关。
-vi.mock('./reader.module.css', () => ({ default: {} }));
+vi.mock('./reader.module.css', () => ({ default: new Proxy({}, { get: (_target, key) => String(key) }) }));
 vi.mock('next/link', () => ({
   default: (props: { children?: unknown; href: unknown }) => createElement('a', { href: props.href }, props.children as ReactNode),
 }));
@@ -34,7 +34,13 @@ vi.mock('@/components/OwnerProvider', async (importOriginal) => {
 // 不改被测代码。
 if (!('ResizeObserver' in globalThis)) {
   (globalThis as unknown as { ResizeObserver: unknown }).ResizeObserver =
-    class { observe() {} unobserve() {} disconnect() {} };
+    class {
+      private cb: () => void;
+      constructor(cb: () => void) { this.cb = cb; }
+      observe() { queueMicrotask(() => this.cb()); }
+      unobserve() {}
+      disconnect() {}
+    };
 }
 if (typeof Element !== 'undefined' && !Element.prototype.scrollIntoView) {
   Element.prototype.scrollIntoView = () => {};
@@ -363,11 +369,44 @@ describe('ReaderClient 换源:按标题对齐回原文(正确行为,非 H7)', ()
     await screen.findByText(/续读正文/);
   });
 
-  // H7/F11 已知 bug:换源采纳后前端仍沿用**旧目录的 chapters**,按旧序号 +1 请求新 session;
-  // 新旧目录序号不一致(如备用站多一个「序言」)时,服务端按新目录该序号返回 ⇒ 重复章/错章,
-  // 且 readerPartMatches 不比对标题会接受。修复另开一条线。这里按**正确行为**断言(换源后下一章
-  // 请求应基于新目录/按标题对齐),当前实现下必然失败 —— 修复后翻绿。
-  it.todo('换源采纳后,下一章请求基于新源目录而非旧目录序号(H7 已知 bug,修复后翻绿)');
+  // H7/F11:换源响应附带新源目录(switchedChapters)与本章在新目录的序号(switchedChapterIndex)时,
+  // 前端一次性替换旧目录并把位置迁过去 —— 之后的「下一章」按**新目录**序号请求。
+  // 备用目录是 [序言, 第一章, 第二章],首章在新目录序号 1;下一章必须请求 chapter=2(第二章),
+  // 而不是旧目录的 chapter=1(那在新目录里是「第一章」,会静默交付重复章)。
+  it('换源采纳后,下一章请求基于新源目录而非旧目录序号(H7)', async () => {
+    const newChapters = [
+      { index: 0, title: '序言', startByte: 0, endByte: 0, partCount: 1 },
+      { index: 1, title: '第一章', startByte: 0, endByte: 0, partCount: 1 },
+      { index: 2, title: '第二章', startByte: 0, endByte: 0, partCount: 1 },
+    ];
+    const apiFetch = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.startsWith('/api/read/source/index')) return json(catalog());
+      const chapter = Number(new URLSearchParams(url.split('?')[1]).get('chapter') ?? '0');
+      if (chapter === 0) {
+        return json(part({
+          version: 'v2', sourceSession: 'v2', sourceId: 'src-2', servedFrom: '源乙',
+          switchedChapters: newChapters, switchedChapterIndex: 1,
+        }));
+      }
+      const title = newChapters[chapter]?.title ?? '未知章';
+      return json(part({ chapterIndex: chapter, title, version: 'v2', sourceId: 'src-2', servedFrom: '源乙', text: title + '\n新目录正文' }));
+    });
+    renderReader(apiFetch);
+
+    await screen.findByText(/正文内容/);
+    const user = userEvent.setup();
+    await user.click(screen.getByRole('button', { name: '下一章 →' }));
+
+    await waitFor(() => {
+      const next = urls(apiFetch).filter((u) => u.includes('/chapter') && !u.includes('chapter=0'));
+      expect(next.length).toBeGreaterThan(0);
+      // 新目录序号 2 = 第二章。预取可能先按替换前的旧序号发出 chapter=1,
+      // 但点击本身的导航必须落在 chapter=2(旧实现只有 chapter=1)。
+      expect(next.some((u) => u.includes('chapter=2') && u.includes('session=v2'))).toBe(true);
+    });
+    await screen.findByText(/新目录正文/);
+  });
 });
 
 describe('ReaderClient 状态流转边界', () => {

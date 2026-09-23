@@ -459,6 +459,13 @@ export function useReader(session: ReadingSession, apiFetch: ApiFetch, userId: n
       ? nextReadingPosition(current.index, current.parts[current.parts.length - 1])
       : previousReadingPosition(current.index, current.parts[0]);
     if (!next) return;
+    // H7:目录刚被替换时,窗口里的段还按旧目录序号标记,「安全滑出」判断会把点击误判成
+    // 滚动翻页并按旧序号取章。目录替换后的第一次移动一律走显式导航(新目录序号)。
+    if (current.parts.some((candidate) => !current.index.chapters[candidate.chapterIndex]
+      || current.index.chapters[candidate.chapterIndex].title !== candidate.title)) {
+      if (manual) await navigate(next);
+      return;
+    }
     if (current.parts.length >= WINDOW_SIZE) {
       const evicted = direction === 'next' ? current.parts[0] : current.parts[current.parts.length - 1];
       const bounds = sections.current.get(partKey(evicted))?.getBoundingClientRect();
