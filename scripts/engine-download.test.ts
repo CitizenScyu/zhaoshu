@@ -222,6 +222,7 @@ describe('书源不可达分类（41-EXEC-SRCUNAVAIL）', () => {
     ['HTTP 503', () => new SourceHttpError(503)],
     ['Cloudflare 522', () => new SourceHttpError(522)],
     ['限速器熔断', () => Object.assign(new Error('源 book15.net 熔断中'), { name: 'CircuitOpenError' })],
+    ['限速器每源日请求上限', () => Object.assign(new Error('源 book15.net 当日请求预算触顶（20000）'), { name: 'DailyRequestBudgetError' })],
   ];
   // 第 n 次请求详情页 URL：builtin/引擎两腿的详情与目录都取同一页（1=详情，2=目录，3=收尾复核目录）。
   const failAt = (f: ReturnType<typeof setup>, stage: 'search' | 'detail' | 'toc' | 'recheck', error: () => unknown) => {

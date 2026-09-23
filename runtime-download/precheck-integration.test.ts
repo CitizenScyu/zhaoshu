@@ -18,7 +18,7 @@ import { downloadBook } from '../scripts/engine-download.mjs';
 import type { SourceAdapter, TaskRow, WorkerStorage } from '../src/lib/download-worker';
 import type { GitHubContents } from '../src/lib/download-publisher';
 import type { DownloadTaskLease } from '../src/lib/download-task-queue';
-import { createIdentityPrecheck } from './identity-precheck';
+import { createIdentityPrecheck, MAX_PRECHECK_CANDIDATES } from './identity-precheck';
 import { createExecutor, DEFAULT_DECISIONS, type DailyBudgetLike, type PrecheckResult } from './executor';
 import { createDownloadExecutor, type RuntimeStorage } from './entry';
 import { assembleEngineModules } from './engine';
@@ -131,6 +131,7 @@ describe('A. 身份预检：先书源可达、后身份（与下载器同源同�
     ['HTTP 503', () => new SourceHttpError(503)],
     ['Cloudflare 522', () => new SourceHttpError(522)],
     ['CircuitOpenError', () => Object.assign(new Error('熔断中'), { name: 'CircuitOpenError' })],
+    ['DailyRequestBudgetError', () => Object.assign(new Error('当日请求预算触顶'), { name: 'DailyRequestBudgetError' })],
     ['HTTP 404', () => new SourceHttpError(404)],
     ['HTTP 403', () => new SourceHttpError(403)],
     ['HTTP 429', () => new SourceHttpError(429)],
@@ -327,5 +328,44 @@ describe('C. entry 装配：默认开、env 关、打包注入上限', () => {
     await w.executor.runOnce();
     expect(w.calls).toContain('GET /books/search.html');
     expect(w.logged.some(line => line.level === 'error' && line.message.includes('日预算上限未接线'))).toBe(true);
+  });
+});
+
+// ---- D. 候选上限（复审 P3）----
+describe('D. 预检候选上限（取下载器同款 50）：只少拦、不错拦', () => {
+  /** 搜索页给出 count 个同名详情页；matchAt 指定哪一个的作者对得上（其余作者不符）。 */
+  function manyCandidates(count: number, matchAt?: number) {
+    vi.stubGlobal('fetch', () => { throw new Error('network forbidden'); });
+    const title = '九鼎狂尊';
+    const calls: string[] = [];
+    const links = Array.from({ length: count }, (_, i) => `<a href="/books/details${i + 1}.html">${title}</a>`).join('');
+    const transport: Transport = async (url, opts) => {
+      calls.push(url);
+      await opts.beforeRequest?.(opts.signal);
+      if (url.includes('/search')) return { url, text: links };
+      const n = Number(/details(\d+)\.html$/.exec(url)?.[1]);
+      const author = n === matchAt ? '上汤豆苗' : '孤神枫';
+      return { url, text: `<meta property="og:novel:book_name" content="${title}"><meta property="og:novel:author" content="${author}">` };
+    };
+    const task = { id: 9, book_id: 1036, title, author: '上汤豆苗', status: 'running', source_url: BOOK, source_kind: 'builtin', source_id: null, requested_by: 'system' } as TaskRow;
+    return { calls, transport, task };
+  }
+  const precheckOn = (transport: Transport) => createIdentityPrecheck({ modules, resolveSource: resolveAs(true), transport, timeoutMs: 1000 });
+
+  it('上限取下载器同款 50（rule-engine/api.ts MAX_SEARCH_CANDIDATES）', () => {
+    expect(MAX_PRECHECK_CANDIDATES).toBe(50);
+  });
+
+  it('候选恰为上限且都对不上 ⇒ 全部看完才判 identity_mismatch（1 次搜索 + 50 次详情）', async () => {
+    const s = manyCandidates(MAX_PRECHECK_CANDIDATES);
+    expect(await precheckOn(s.transport)(s.task)).toEqual({ ok: false, reason: 'identity_mismatch' });
+    expect(s.calls).toHaveLength(1 + MAX_PRECHECK_CANDIDATES);
+  });
+
+  it('候选超过上限、前 50 个都对不上 ⇒ 只看 50 个就停，不下结论（identity_unverified 放行），对得上的第 51 个留给下载器', async () => {
+    const s = manyCandidates(MAX_PRECHECK_CANDIDATES + 1, MAX_PRECHECK_CANDIDATES + 1);
+    expect(await precheckOn(s.transport)(s.task)).toEqual(UNVERIFIED);
+    expect(s.calls).toHaveLength(1 + MAX_PRECHECK_CANDIDATES);
+    expect(s.calls.some(url => url.endsWith(`/details${MAX_PRECHECK_CANDIDATES + 1}.html`))).toBe(false);
   });
 });

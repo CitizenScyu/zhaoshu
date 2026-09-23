@@ -408,4 +408,20 @@ maybe('41-EXEC-SRCUNAVAIL 第二轮：生产装配（扣额度前预检开）', 
     expect(sourceLines(logs).map(line => line.fields?.stage)).toEqual(['resolve']);
     expect(github.calls).toEqual([]);
   });
+
+  it('⑨ᵖ 限速器每源日请求上限（DailyRequestBudgetError，UTC 换日即重置）⇒ source_unavailable：pending + 退避，不落终态、不扣额度', async () => {
+    const id = await insertTask();
+    const budget = ledgerBudget();
+    const logs: LogLine[] = [];
+    // shell SourceRateLimiter.acquire 在发请求前抛出（rate-limiter.mjs DailyRequestBudgetError，name 即类名）。
+    const site = book15({ failSearch: () => Object.assign(new Error('源 book15.net 当日请求预算触顶（20000）'), { name: 'DailyRequestBudgetError' }) });
+    expect(await runWired(site, budget, logs)).toBe(DEFAULT_DECISIONS.TASK_DONE);
+    const state = await row(id);
+    expect(state).toMatchObject({ status: 'pending', attempt_count: 2, delay_ms: 15 * MINUTE });
+    expect(state.error).toContain('source_unavailable');
+    expect(budget.used()).toBe(0);
+    expect(budget.refunds).toEqual([]); // 扣额度前就判出，根本没扣
+    expect(sourceLines(logs).map(line => line.fields)).toEqual([{ reason: 'source_unavailable', stage: 'search', host: 'book15.net', retryAt: state.next_attempt_at }]);
+    expect(github.calls).toEqual([]);
+  });
 });

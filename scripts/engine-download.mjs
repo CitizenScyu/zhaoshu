@@ -15,11 +15,12 @@ const atomic = (path, data) => {
 const knownError = /^(identity_mismatch_or_no_candidate|empty_toc|empty_toc_page|pagination_cycle|toc_limit|unsupported_toc_rule|invalid_chapter|invalid_next_page|empty_content_page|content_page_limit|unsupported_content_rule|max_chapters|size_limit|toc_changed|missing_chapters|interrupted|budget_exhausted|operation_timeout|empty_content)$/;
 
 // 书源不可达（41-EXEC-SRCUNAVAIL）：搜索/详情/目录阶段的传输层失败（连接/请求超时、undici
-// `fetch failed`＝DNS/reset/TLS）、源站 5xx（含 Cloudflare 52x）与限速器熔断（由连续源站失败触发）
-// 归 code=2 source_unavailable，与 resolveSource code=2 同档：可重试、零发布。4xx、策略拒绝、
-// 身份不符与其余异常维持原分类；正文阶段逐章失败照旧收口为 missing_chapters。
+// `fetch failed`＝DNS/reset/TLS）、源站 5xx（含 Cloudflare 52x）、限速器熔断（由连续源站失败触发）
+// 与限速器每源日请求上限（DailyRequestBudgetError，UTC 换日即重置，属瞬时）归 code=2 source_unavailable，
+// 与 resolveSource code=2 同档：可重试、零发布。4xx、策略拒绝、身份不符与其余异常维持原分类；
+// 正文阶段逐章失败照旧收口为 missing_chapters。
 const SOURCE_STAGES = new Set(['search', 'detail', 'toc']);
-const UNREACHABLE_ERROR_NAMES = new Set(['ConnectTimeoutError', 'TimeoutError', 'CircuitOpenError']);
+const UNREACHABLE_ERROR_NAMES = new Set(['ConnectTimeoutError', 'TimeoutError', 'CircuitOpenError', 'DailyRequestBudgetError']);
 export function isSourceUnavailableError(error) {
   const status = error?.status;
   if (typeof status === 'number') return status >= 500 && status <= 599;

@@ -2,7 +2,7 @@
 // 状态文件与 shell runtime/lib/daily-budget.mjs 同一份、同一格式（{date, used} + 换行，UTC 日）；
 // 与兄弟仓真实实现的往返由 scripts/check-worker-contract.mjs 回归。
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createBudgetRefund } from './budget-refund';
@@ -58,5 +58,29 @@ describe('日预算退还（41-EXEC-SRCUNAVAIL）', () => {
     write({ date: '2026-09-23', used: 3 });
     expect(await refund({ key: '17:1', date: TODAY })).toBe('nothing_to_refund');
     expect(JSON.parse(readFileSync(statePath, 'utf8'))).toEqual({ date: '2026-09-23', used: 3 });
+  });
+
+  it('P3 并发同票（判重与写盘之间隔着 await）只退一次：票据在任何 await 之前占住', async () => {
+    write({ date: TODAY, used: 3 });
+    const refund = createBudgetRefund({ statePath, now });
+    const ticket = { key: '14:1', date: TODAY };
+    const outcomes = await Promise.all([refund(ticket), refund({ ...ticket }), refund({ ...ticket })]);
+    expect(outcomes.sort()).toEqual(['duplicate', 'duplicate', 'refunded']);
+    expect(used()).toBe(2);
+  });
+
+  it('P3 原子落盘：先写同目录临时文件再 rename；临时文件写不成 ⇒ 原文件一字不动、上抛、释放票据可再退；成功后不留临时文件', async () => {
+    write({ date: TODAY, used: 3 });
+    const before = readFileSync(statePath, 'utf8');
+    const refund = createBudgetRefund({ statePath, now });
+    const ticket = { key: '14:1', date: TODAY };
+    const temp = `${statePath}.refund.tmp`;
+    mkdirSync(temp); // 占住临时文件路径：模拟写盘中途出错（直接写目标文件的实现不受影响、会照写）
+    await expect(refund(ticket)).rejects.toThrow();
+    expect(readFileSync(statePath, 'utf8')).toBe(before);
+    rmSync(temp, { recursive: true });
+    expect(await refund(ticket)).toBe('refunded'); // 写失败时释放了票据
+    expect(used()).toBe(2);
+    expect(existsSync(temp)).toBe(false);
   });
 });
