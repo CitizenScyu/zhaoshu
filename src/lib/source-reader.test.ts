@@ -779,6 +779,33 @@ describe('online reader source resolution and budgets', () => {
       .resolves.toMatchObject({ title: '新名', author: '作者A', bookUrl: pageUrl(903) });
     expect(mocks.fetch.mock.calls.length).toBeLessThanOrEqual(12);
   });
+
+  it('MS-01: 非首源兜底吃满 L1 后，作者回退靠 remainingFor 让出的余量抓到作者页真书', async () => {
+    // 场景（review-42 MS-01）：改名书在第 2+ 个源上。源 B 标题搜索（1 点）+ 同页兜底 5 条无关详情
+    // （5 点）恰好挤满 L1=PER_SOURCE_REQUESTS=6 —— 若 fallbackWidth 只看 root 的 L2（13d00ad 的
+    // 手写算法），兜底仍会按 4 展开并在第 6 点撞 SOURCE_SCOPE_EXHAUSTED，作者搜索根本发不出去，
+    // 真书丢在作者页里。remainingFor 以 child 视角取窄者 ⇒ 兜底让出余量、作者回退仍可运行。
+    const det = (id: number, title: string, author: string, extra = '') =>
+      `<meta property="og:novel:book_name" content="${title}"><meta property="og:novel:author" content="${author}">` + extra
+      + `<dd><a href="/chapter/index${id}-1.html">第一章</a></dd>`;
+    const target = { title: '改名书', author: '作者A' };
+    mocks.sources.mockResolvedValue([
+      { url: 'https://book15.net/a/', name: '源A', searchUrl: '/a/search.html?kw={{key}}', rules: {} },
+      { url: 'https://book15.net/b/', name: '源B', searchUrl: '/b/search.html?kw={{key}}', rules: {} },
+    ]);
+    pages.set('https://book15.net/a/search.html?kw=' + encodeURIComponent(target.title), { text: '' });
+    pages.set('https://book15.net/a/search.html?kw=' + encodeURIComponent(target.author), { text: '' });
+    // 源 B 标题搜索：同页兜底 5 条无关详情链接（搜索 1 + 兜底 5 ⇒ L1 上限 6 之内挤满，
+    // 剩余 L1 = 0；旧手写 fallbackWidth 算 root 的 L2 ⇒ 兜底仍按 4 展开，作者搜索必撞 L1 闸门）
+    pages.set('https://book15.net/b/search.html?kw=' + encodeURIComponent(target.title),
+      { text: [801, 802, 803, 804, 805].map((i) => `<a href="/books/details${i}.html">无关书</a>`).join('') });
+    pages.set('https://book15.net/b/search.html?kw=' + encodeURIComponent(target.author),
+      { text: '<a href="/books/details9.html">新名</a>' });
+    for (const id of [801, 802, 803, 804, 805]) pages.set('https://book15.net/books/details' + id + '.html', { text: det(id, '无关书' + id, '别人') });
+    pages.set('https://book15.net/books/details9.html', { text: det(9, '新名', '作者A', '<div>小说简介:【原书名：改名书】。</div>') });
+    const catalog = await service.resolveSourceBook(target, context());
+    expect(catalog).toMatchObject({ title: '新名', author: '作者A', bookUrl: 'https://book15.net/books/details9.html' });
+  });
 });
 
 describe('GET /api/read/source/[resource]', () => {
@@ -1499,5 +1526,49 @@ describe('M3 surveySourceBooks 换源扫描', () => {
     const res = await request('alternates', 'author=作者');
     expect(res.status).toBe(400);
     expectPrivate(res);
+  });
+});
+
+// ---- review-42 MS-01/MS-17：两级预算统一成可查询接口 remainingFor ----
+describe('MS-01 两级预算统一接口 remainingFor（root/child 余量语义）', () => {
+  it('root（builtin 首源）只受 L2 全局闸门约束；child 取 L1/L2 窄者', () => {
+    const root = context(); // limit=12, scope=builtin
+    expect(root.scope).toBe(service.BUILTIN_SCOPE);
+    expect(root.totalLimit).toBe(12);
+    const child = root.child('https://book15.net/mirror/');
+    expect(child.limit).toBe(service.PER_SOURCE_REQUESTS); // 6
+    // 消耗前：root 只看 L2=12；child 取 min(L1=6, L2=12)=6
+    expect(root.remainingFor(0)).toBe(12);
+    expect(child.remainingFor(0)).toBe(6);
+    // 预留作者回退所需点数后
+    expect(root.remainingFor(5)).toBe(7);
+    expect(child.remainingFor(5)).toBe(1);
+  });
+
+  it('openPool 抬高 L2 后 root 余量随之放宽，child 仍受 L1 单源闸门封顶', () => {
+    const root = context();
+    root.openPool(3); // 6×3=18
+    expect(root.totalLimit).toBe(18);
+    expect(root.remainingFor(0)).toBe(18);
+    const child = root.child('https://book15.net/mirror/');
+    expect(child.remainingFor(0)).toBe(6); // L1 封顶，不随 L2 放宽
+  });
+
+  it('child 的 L1 计数只随本源请求递减；父与兄弟源不共享该计数', () => {
+    const root = context();
+    const child = root.child('https://book15.net/mirror/', { limit: 3 });
+    expect(child.remainingFor(0)).toBe(3);
+    // 模拟本源已发 2 点（scoped 计数不进 budget.requests，仅用于 L1 判定）
+    (child as unknown as { scoped: { used: number } }).scoped.used = 2;
+    expect(child.remainingFor(0)).toBe(1);
+    expect(root.remainingFor(0)).toBe(12); // 父的余量不受子的 L1 影响
+  });
+
+  it('非首源 L1 耗尽时 remainingFor 归 0 —— 作者回退据此跳过，不再撞闸门（MS-01 症状）', () => {
+    const root = context();
+    const child = root.child('https://book15.net/mirror/'); // L1=6
+    (child as unknown as { scoped: { used: number } }).scoped.used = 6;
+    expect(child.remainingFor(0)).toBe(0);
+    expect(child.remainingFor(5)).toBe(0); // 预留后仍 0，作者回退不会强开
   });
 });

@@ -119,6 +119,22 @@ export class SourceRequestContext {
     });
   }
 
+  /**
+   * 统一余量查询（review-42 MS-01/MS-17）：预留 reserve 点后，本 context 还能发出多少次 page()。
+   * 两级预算取窄者回答：root（builtin 首源）只受 L2 全局闸门约束（totalLimit − requests，
+   * openPool 抬高后随之放宽）；child 还要过 L1 单源闸门（limit − 本源已扣点数）。
+   * **所有「为后续阶段预留预算」的计算必须走这里**，不得在调用方手写
+   * totalLimit − requests —— 第 4 次预算补丁（13d00ad）就是在调用方手写、只看 root 视角，
+   * 漏掉 child 的 L1 闸门，导致非首源的作者回退被单源预算掐断（review-42 MS-01）。
+   * 调用方应传入**实际发请求的 context**（首源 = root，非首源 = 对应 child），而不是循环外的根 context。
+   */
+  remainingFor(reserve: number): number {
+    const scoped = this.scope === BUILTIN_SCOPE
+      ? Number.POSITIVE_INFINITY
+      : this.limit - this.scoped.used;
+    return Math.max(0, Math.min(this.budget.totalLimit - this.budget.requests, scoped) - reserve);
+  }
+
   async page(url: string, attempts = MAX_SOURCE_ATTEMPTS): Promise<{ url: string; text: string }> {
     let lastError: unknown;
     for (let attempt = 0; attempt < attempts; attempt++) {
@@ -462,6 +478,14 @@ export async function resolveSourceBook(
                 hadFailure = true;
                 break;
               }
+              if (error.code === 'SOURCE_SCOPE_EXHAUSTED') {
+                // 本源 L1 点数/切片耗尽（review-42 MS-01 修前症状的另一半）：作者层 inspect 与
+                // 外层 sourceContext 同一个 scope，单源预算用尽即**本源**结束，不是整轮失败。
+                // 旧行为直接 throw，在非首源上把改名书的作者页候选丢弃并跳源。这里记成跳源，
+                // 让外层 SOURCE_SCOPE_EXHAUSTED 分支（:572）继续下一源，保留已收集的 similar 候选。
+                hadFailure = true;
+                break;
+              }
               throw error;
             }
             hadFailure = true;
@@ -525,16 +549,25 @@ export async function resolveSourceBook(
       const authorFallbackPending = (exactLayerEmpty || !candidates.length)
         && knownSourceAuthor(book.author) && knownSourceAuthor(book.author) !== normalizeSourceTitle(book.title);
       const reserveForAuthor = 1 + MAX_DETAIL_CANDIDATES;
+      // 余量统一走 remainingFor（review-42 MS-01/MS-17）：以**实际发请求的 sourceContext 视角**回答，
+      // 首源=root 只看 L2，非首源=child 还要过 L1 单源闸门（取窄者）。第 4 次补丁（13d00ad）在调用方
+      // 手写 context.totalLimit - context.requests（只看 root 视角），非首源上作者回退还没撞 L2 就先
+      // 被 L1 掐断 ⇒ 改名书在第 2+ 个源上仍 503。
       const fallbackWidth = authorFallbackPending
-        ? Math.max(0, Math.min(MAX_DETAIL_CANDIDATES, context.totalLimit - context.requests - reserveForAuthor))
+        ? sourceContext.remainingFor(reserveForAuthor)
         : MAX_DETAIL_CANDIDATES;
-      const result = await inspect(candidates.slice(0, fallbackWidth), true);
+      const result = await inspect(candidates.slice(0, Math.min(MAX_DETAIL_CANDIDATES, fallbackWidth)), true);
       if (result) return result;
       // 作者搜索回退:标题搜索页的**精确层** 0 候选(搜索页可能仍吐一堆无关详情链接)、有作者可搜
       // 且作者不是书名本身时(改名书的站点索引只有新名),改搜作者。候选不看锚文本,
       // 身份靠详情页的标题/别名 + 作者门校验。
       // `!candidates.length` 保留给「搜索 URL 本身就是详情页」那一支的既有语义。
-      if (authorFallbackPending) {
+      // 余量校验（review-42 MS-01）：作者搜索 1 点是硬需求，作者层 inspect 至少要能发出第 1 点
+      // （真书常在作者页前段；后续候选由 inspect 内的 L1/L2 闸门自然封顶，不足整宽是降级不是失败）。
+      // 本源连「作者搜索 + 首个详情」都发不出时跳过本轮作者回退 —— 强开的首个 page() 会抛预算码
+      // （L1 单源耗尽或 L2 全局耗尽），被外层记成跳源/整轮失败，真书丢在作者页里。
+      // 门槛取 min(1, 本源单源上限)：单源上限小于 2 的 child 不强开。
+      if (authorFallbackPending && sourceContext.remainingFor(1) >= 1) {
         const authorSearch = await sourceContext.page(sourceSearchUrl(source.searchUrl, book.author, source.url));
         const authorCandidates = /^\/books\/details\d+\.html$/.test(new URL(authorSearch.url).pathname)
           ? [authorSearch.url]
