@@ -21,7 +21,7 @@
 
 import { bookFilename } from './book-file-name';
 import { gitBlobSha } from './artifact-bytes';
-import { MAX_READER_BYTES, parseTxtChapters, splitChapterParts } from './txt-chapters';
+import { MAX_READER_BYTES, MAX_READER_CHAPTERS, parseTxtChapters, splitChapterParts } from './txt-chapters';
 import type { TxtChapter } from './txt-chapters';
 import { VOLUME_MANIFEST_FORMAT, VOLUME_MANIFEST_SCHEMA, stringifyVolumeManifest } from './volume-manifest';
 import type { VolumeChapterEntry, VolumeEntry, VolumeManifest } from './volume-manifest';
@@ -168,6 +168,12 @@ export interface PublishCandidate {
   chaptersTotal: number;
   charsTotal: number;
   llmSummary?: string;
+  /**
+   * 章节边界(txt 的 UTF-8 字节偏移,首尾相接铺满全书)。引擎腿给的是拼接时的真实边界
+   * (download-worker.ts engineChapterRanges),清单 chapter_index 直接用它 ⇒ 与 chapters
+   * (= chaptersDone)逐章对应。缺省才退回 parseTxtChapters 按标题二次解析(非引擎来源,行为同旧)。
+   */
+  chapterRanges?: readonly TxtChapter[];
 }
 
 export interface PublishOptions {
@@ -319,7 +325,8 @@ function safeCut(buf: Buffer, start: number, limit: number): number {
 
 /**
  * 按章贪心装箱分卷(设计 §六)。
- * 卷边界**永远落在章起点**(`txt-chapters.ts` 保证章节连续无损)⇒ 卷拼接 === 原文逐字节。
+ * 卷边界**永远落在章起点**(两个章节来源都保证章节连续无损:引擎真实边界经 checkedChapterRanges
+ * 核对,或 `txt-chapters.ts` 二次解析)⇒ 卷拼接 === 原文逐字节。
  * 单章 > 软目标时独占一卷;单章 > 硬上限时按行边界(再退 UTF-8 码点)切开,该章跨卷 ——
  * 此时是唯一允许卷边界不落在章起点的情形。
  */
@@ -376,6 +383,30 @@ export function buildChapterIndex(
       p: parts.length,
     };
   });
+}
+
+/**
+ * 调用方给的章节边界在任何 PUT 之前逐项核对:章数不超过读端上限(否则同 index_too_large)、
+ * 0 起、首尾相接、每章非空、到全书末尾止、起点不落在 UTF-8 续字节上,且章数 = chaptersDone。
+ * 读端 parseVolumeManifest 要求 chapter_index.length === chapters,对不上的清单发布了也读不了,
+ * 故发布即拒(不退回解析、不猜)。
+ */
+function checkedChapterRanges(ranges: readonly TxtChapter[], buf: Buffer, chaptersDone: number): TxtChapter[] {
+  if (ranges.length > MAX_READER_CHAPTERS) throw new PublicationStageError('manifest', 'index_too_large');
+  if (ranges.length !== chaptersDone) throw new PublicationStageError('manifest', 'chapter_count_mismatch');
+  const checked: TxtChapter[] = [];
+  let at = 0;
+  for (const [index, range] of ranges.entries()) {
+    if (!range || typeof range.title !== 'string' || range.startByte !== at
+      || !Number.isSafeInteger(range.endByte) || range.endByte <= range.startByte
+      || range.endByte > buf.byteLength || isContinuationByte(buf[range.startByte]!)) {
+      throw new PublicationStageError('manifest', 'invalid_chapter_ranges');
+    }
+    checked.push({ index, title: range.title, startByte: range.startByte, endByte: range.endByte });
+    at = range.endByte;
+  }
+  if (at !== buf.byteLength) throw new PublicationStageError('manifest', 'invalid_chapter_ranges');
+  return checked;
 }
 
 /**
@@ -446,8 +477,11 @@ export async function publishBookVersion(
   const { canonicalPath, dir } = paths;
   const label = `${candidate.title} - ${candidate.author}(${candidate.chaptersDone} 章 / ${candidate.charsTotal} 字)`;
 
-  // 章节必须来自**同一次输入**:与阅读侧 parseTxtChapters 同函数同字节 ⇒ 同结果。
-  const chapters = parseTxtChapters(buf, maxBookBytes);
+  // 章节边界:引擎腿给了拼接时的真实边界就直接用(逐项核对后),chapter_index 与 chapters 逐章
+  // 对应、不并章不拆章;没给才退回与阅读侧同函数同字节的 parseTxtChapters(非引擎来源,行为同旧)。
+  const chapters = candidate.chapterRanges
+    ? checkedChapterRanges(candidate.chapterRanges, buf, candidate.chaptersDone)
+    : parseTxtChapters(buf, maxBookBytes);
   const ranges = splitBookVolumes(buf, chapters, maxVolumeBytes);
   const volumes = ranges.map((range, index) => {
     const text = buf.toString('utf8', range.startByte, range.endByte);
