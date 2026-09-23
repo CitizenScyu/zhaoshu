@@ -152,6 +152,28 @@ describe('download and source reading sessions', () => {
     expect(readerPartMatches(stale, delivered, position)).toBe(accept);
   });
 
+  it('H7 小修 A2:归一化键恰 4 字的章名漂移,前端与服务端判定一致(参数序不对称的角落)', () => {
+    // 「第1章 风」归一化后恰 4 字,「第1章 风起」是其超集。chapterTier 的包含档下限随参数顺序变化:
+    // 旧实现 chapterTitlesMatch(目录标题, 交付标题) 在这个方向判 false,而服务端 attach 用的
+    // matchSourceChapter(目录, 交付标题) 判匹配 —— 于是合法章节被前端 409。
+    const newSession = 'f'.repeat(40);
+    const stale: ReaderIndex = {
+      ...online, version: newSession,
+      source: { ...online.source!, id: 'source-two', session: newSession },
+      chapters: [{ index: 0, title: '第1章 风', startByte: 0, endByte: 0, partCount: 1 }],
+    };
+    const delivered: ReaderPart = {
+      taskId: null, sourceId: 'source-two', version: newSession, sourceSession: newSession,
+      chapterIndex: 0, partIndex: 0, partCount: 1, title: '第1章 风起', text: '正文', startByte: 0, endByte: 6,
+    };
+    expect(readerPartMatches(stale, delivered, position)).toBe(true);
+    // 底线不放宽:反过来(目录是长标题、交付退化成 4 字键)服务端同样不认,前端也必须拒绝。
+    const reversed: ReaderIndex = {
+      ...stale, chapters: [{ index: 0, title: '第1章 风起', startByte: 0, endByte: 0, partCount: 1 }],
+    };
+    expect(readerPartMatches(reversed, { ...delivered, title: '第1章 风' }, position)).toBe(false);
+  });
+
   it('remembers source progress and estimates by chapter when total file bytes are unknown', () => {
     const progress = { ...position, schema: 1, version: online.version, updatedAt: 1234 };
     const part: ReaderPart = { ...position, taskId: null, sourceId: online.source!.id, version: online.version,

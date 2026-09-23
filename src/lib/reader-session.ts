@@ -1,6 +1,6 @@
 import type { ReaderChapter, ReaderIndex, ReaderOrigin, ReaderPart, ReadingSession } from './reader-types';
 import type { ReadingPosition } from './reader-preferences';
-import { chapterTitlesMatch } from './source-parser';
+import { matchSourceChapter } from './source-parser';
 
 export function bookReadingHref(book: { taskId?: number | null; title: string; author: string; from: ReaderOrigin }): string {
   if (book.taskId && Number.isSafeInteger(book.taskId) && book.taskId > 0) return `/read/${book.taskId}?from=${book.from}`;
@@ -71,12 +71,14 @@ export function readerPartMatches(index: ReaderIndex, part: ReaderPart, position
   const ownership = index.source
     ? part.taskId === null && (part.sourceId === index.source.id || switched)
     : part.taskId === index.taskId && !part.sourceId;
-  // H7 纵深防御:换源状态下额外比对标题,口径与服务端换源对齐章用的是**同一个**分档判据
-  // (chapterTitlesMatch = chapterTier < ∞,source-parser 的唯一实现):放行同章的写法漂移
-  // (「第1章 风起」对「第1章 风起与云涌」),拒绝真正不同的章(「序言」对「第一章」)。
-  // 用归一化严格相等会把服务端认为匹配的合法章节判成不符 → 409(复审必修 A)。
+  // H7 纵深防御:换源状态下额外比对标题。调用与服务端 attach **逐字同款**的
+  // matchSourceChapter(目录, 交付章标题, 序号)——参数顺序必须一致:chapterTier 的包含档
+  // 对参数顺序不对称(归一化键恰 4 字时下限不同),顺序相反会让服务端判匹配的章在前端判不符 → 409
+  // (复审小修 A2)。放行同章写法漂移,拒绝真正不同的章(「序言」对「第一章」)。
   // 新目录已被采纳时序号即新目录序号,标题天然同章,此比对不改变结果。
-  const titleOk = !switched || chapterTitlesMatch(index.chapters[part.chapterIndex]?.title ?? '', part.title);
+  const titleOk = !switched || matchSourceChapter(
+    index.chapters.map((chapter) => ({ url: '', title: chapter.title })), part.title, part.chapterIndex,
+  ) !== null;
   return ownership && titleOk && (part.version === index.version || switched)
     && part.chapterIndex === position.chapterIndex
     && part.partIndex === position.partIndex && typeof part.text === 'string';
