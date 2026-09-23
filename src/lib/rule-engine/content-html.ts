@@ -69,16 +69,45 @@ function decodeEntities(text: string): string {
   });
 }
 
-/** 删掉从 `open` 到 `close`（含两端）的片段；找不到闭合时截到末尾。indexOf 线性扫描。 */
-function cutMarked(text: string, open: string, close: string): string {
-  const lower = text.toLowerCase();
-  const start = lower.indexOf(open);
-  if (start < 0) return text;
-  const gt = text.indexOf('>', start + open.length);
-  const contentFrom = gt < 0 ? text.length : gt + 1;
-  const end = lower.indexOf(close, contentFrom);
-  const cut = end < 0 ? text.length : end + close.length + 1;
-  return text.slice(0, start) + text.slice(cut);
+/** 单趟删除 `<tag…>…</tag…>`（大小写不敏感，结束标签允许 `</tag >` 形态）。
+ *  只认标签名后紧跟空白、`>` 或 `/` 的开标签，`<scripts>` 这类更长的名字不误伤。
+ *  找不到闭合时从开标签截到输入末尾。游标只前进，整串只扫一次、只小写一次。 */
+function stripTagBlocks(text: string, lower: string, tag: string): { text: string; lower: string } {
+  const open = `<${tag}`;
+  const close = `</${tag}`;
+  let out = '';
+  let pos = 0;
+  for (let from = 0; ;) {
+    const start = lower.indexOf(open, from);
+    if (start < 0) { out += text.slice(pos); break; }
+    const boundary = lower[start + open.length];
+    if (boundary !== undefined && boundary !== '>' && boundary !== '/' && !/\s/.test(boundary)) { from = start + open.length; continue; }
+    out += text.slice(pos, start);
+    const gt = lower.indexOf('>', start + open.length);
+    if (gt < 0) { pos = text.length; break; }
+    const end = lower.indexOf(close, gt + 1);
+    if (end < 0) { pos = text.length; break; }
+    const endGt = lower.indexOf('>', end + close.length);
+    pos = endGt < 0 ? text.length : endGt + 1;
+    from = pos;
+  }
+  const joined = out;
+  return { text: joined, lower: joined.toLowerCase() };
+}
+
+/** 单趟删除 `<!-- … -->`；找不到闭合时从 `<!--` 截到末尾。游标只前进。 */
+function stripComments(text: string): string {
+  let out = '';
+  let pos = 0;
+  for (let from = 0; ;) {
+    const start = text.indexOf('<!--', from);
+    if (start < 0) return out + text.slice(pos);
+    out += text.slice(pos, start);
+    const end = text.indexOf('-->', start + 4);
+    if (end < 0) return out;
+    pos = end + 3;
+    from = pos;
+  }
 }
 
 /**
@@ -88,39 +117,36 @@ function cutMarked(text: string, open: string, close: string): string {
  * 全部扫描都是线性的（B2）：标签用 `[^<>]*`，注释与 script/style 用 indexOf。
  */
 export function contentHtmlToText(html: string): string {
-  let text = html;
-  // script/style 连同内容整段删除（大小写不敏感）。未闭合时截到末尾。
+  // CR 归一（s4）：只影响 JSON 等原始串路径，parse5 路径的 CR 已被归一。
+  let text = html.replace(/\r\n?/g, '\n');
+  // script/style 连同内容整段删除（单趟游标扫描，大小写不敏感）。未闭合时截到末尾。
+  let lower = text.toLowerCase();
   for (const tag of ['script', 'style']) {
-    const open = `<${tag}`;
-    const close = `</${tag}`;
-    for (let guard = 0; guard < 100_000 && text.toLowerCase().includes(open); guard += 1) {
-      text = cutMarked(text, open, close);
-    }
+    const stripped = stripTagBlocks(text, lower, tag);
+    text = stripped.text;
+    lower = stripped.lower;
   }
-  // 注释：找不到闭合 `-->` 时截到末尾（与 script 同口径）。
-  for (let guard = 0; guard < 100_000 && text.includes('<!--'); guard += 1) {
-    const start = text.indexOf('<!--');
-    const end = text.indexOf('-->', start + 4);
-    text = text.slice(0, start) + text.slice(end < 0 ? text.length : end + 3);
-  }
-  // 标签：块级 → 段落换行，其余只剥标签。`[^<>]*` 不跨 `<`，线性且不吞正文里的 `<`。
-  text = text.replace(/<\/?([a-zA-Z][a-zA-Z0-9]*)(?:\s[^<>]*)?\/?>/g, (whole, name: string) => (
+  // 注释：找不到闭合 `-->` 时截到末尾（与 script 同口径），同样单趟。
+  text = stripComments(text);
+  // 标签：块级 → 段落换行，其余只剥标签。名字允许 `:`/`-`/`_`（接住 `<o:p>` 这类，N1）。
+  // `[^<>]*` 不跨 `<`，线性且不吞正文里的 `<`。
+  text = text.replace(/<\/?([a-zA-Z][a-zA-Z0-9:_-]*)(?:\s[^<>]*)?\/?>/g, (whole, name: string) => (
     BLOCK_TAGS.has(name.toLowerCase()) ? '\n' : ''
   ));
-  // 兜底：不成标签名的 `<…>` 残片，同样不跨 `<`。
-  text = text.replace(/<[^<>]*>/g, '');
   // 先剥标签再解码实体（R4）：页面上的转义文本 `&lt;b&gt;` 不会先变成真标签再被吃掉。
   text = decodeEntities(text);
-  // 零宽字符（U+200B–U+200D）是防爬水印，删除（S6，Legado noPrintRegex 同口径）。
+  // 零宽字符（U+200B–U+200D）是防爬水印，删除（S6，参照 Legado noPrintRegex 的思路，
+  // 其具体码点集合未逐一核对）。
   text = text.replace(/[​‌‍]/g, '');
   const lines = text.split('\n');
-  // 逐行 trim：只剥半角空格/制表/不间断空格（U+00A0），行首全角缩进「　　」(U+3000) 保留。
-  // 只含全角空格的行视为空行参与压缩（S5）。逐字符扫描，避开 `$` 锚定正则的回溯（B2）。
+  // 逐行 trim：剥半角空格/制表/不间断空格（U+00A0）与 em 空格（U+2003）、en 空格（U+2002，s5），
+  // 行首全角缩进「　　」(U+3000) 保留。只含这些空白的行视为空行参与压缩（S5）。
+  const isEdgeSpace = (ch: string) => ch === ' ' || ch === '\t' || ch === ' ' || ch === ' ' || ch === ' ';
   const cleaned = lines.map((line) => {
     let start = 0;
     let end = line.length;
-    while (start < end && (line[start] === ' ' || line[start] === '\t' || line[start] === ' ')) start += 1;
-    while (end > start && (line[end - 1] === ' ' || line[end - 1] === '\t' || line[end - 1] === ' ')) end -= 1;
+    while (start < end && isEdgeSpace(line[start])) start += 1;
+    while (end > start && isEdgeSpace(line[end - 1])) end -= 1;
     const core = line.slice(start, end);
     return /^[　]+$/.test(core) ? '' : core;
   });

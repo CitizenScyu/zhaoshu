@@ -315,6 +315,44 @@ describe('正文转纯文本按规则类型判定（41-HTMLFIX 复审）', () =>
     expect(contentHtmlToText('<p>甲&lt;b&gt;乙&lt;/b&gt;</p>')).toBe('甲<b>乙</b>');
   });
 
+  it('N1 JSON 纯文本正文不被兜底正则吃掉（与基点逐字节相同）', async () => {
+    const plains = [
+      '1<2 且 x>y',
+      '书名是<<斗破苍穹>>',
+      '如果a<b，而 x>y，那么结论成立。',
+      '获得技能<Lv.10>火球术，属性<HP+100>',
+      '他大喊<!>然后离开',
+    ];
+    for (const plain of plains) {
+      const body = JSON.stringify({ data: { content: plain } });
+      expect(await fetch('$.data.content', body)).toBe(plain);
+    }
+  });
+
+  it('N1 <o:p> 与自定义元素 <my-tag> 被剥掉', () => {
+    expect(contentHtmlToText('<p>甲<o:p></o:p>乙</p>')).toBe('甲乙');
+    expect(contentHtmlToText('<p>甲<my-tag>丙</my-tag>乙</p>')).toBe('甲丙乙');
+  });
+
+  it('s2 命名实体大小写不敏感（&AMP; 与 &amp; 同义）', () => {
+    expect(contentHtmlToText('<p>A&AMP;B&Nbsp;C</p>')).toBe('A&B C');
+  });
+
+  it('s3 结束标签 > 前有空白时整段删除，更长的标签名不误伤', () => {
+    expect(contentHtmlToText('<p>前</p><script>var x=1;</script >后')).toBe('前\n后');
+    expect(contentHtmlToText('<p>甲<scripts>丙</scripts>乙</p>')).toBe('甲丙乙');
+  });
+
+  it('s4 CR 归一：CRLF 结尾不残留 \\r，CRLF 空行被压缩', () => {
+    expect(contentHtmlToText('<p>第一段\r\n第二段\r\n</p>')).toBe('第一段\n第二段');
+    expect(contentHtmlToText('<p>甲\r\n\r\n\r\n乙</p>')).toBe('甲\n乙');
+  });
+
+  it('s5 只含 &emsp;/&ensp; 的行按空行压缩', () => {
+    expect(contentHtmlToText('<p>段一</p><p>&emsp;</p><p>段二</p>')).toBe('段一\n段二');
+    expect(contentHtmlToText('<p>段一</p><p>&ensp;&ensp;</p><p>段二</p>')).toBe('段一\n段二');
+  });
+
   it('混合 || 分支（html||text）保守转换：@html 命中时解码', async () => {
     const merged = { ...rules, ruleContent: { content: '.con@html||.other@text' } };
     const source: EngineSource = {
@@ -359,6 +397,14 @@ describe('正文转纯文本性能（41-HTMLFIX 复审 B2：10 万字符病态�
     ['<script> ×n/8 不闭合', '<script>'.repeat(12_500)],
     ['<p>x + 空格×n + y</p>', '<p>x' + ' '.repeat(100_000) + 'y</p>'],
     ['行内 &nbsp; ×n/6', '<p>x' + '&nbsp;'.repeat(16_667) + 'y</p>'],
+    // s1：标签名后跟空白才进入属性段。'<a'.repeat 进不去 [^>]*，测不到属性段的二次复杂度。
+    ['<a x ×25000（属性段）', '<a x'.repeat(25_000)],
+    ['<a  ×33334（属性段）', '<a '.repeat(33_334)],
+    // N2：闭合的 script/style/注释。未闭合输入第一趟就截到末尾，测不到「逐个删除」的二次复杂度。
+    ['<script></script> ×k 闭合', '<p>正文</p>' + '<script></script>'.repeat(Math.floor(100_000 / 17))],
+    ['<style></style> ×k 闭合', '<p>正文</p>' + '<style></style>'.repeat(Math.floor(100_000 / 15))],
+    ['<!----> ×k 闭合', '<p>正文</p>' + '<!---->'.repeat(Math.floor(100_000 / 7))],
+    ['<!-- x --> ×k 闭合', '<p>正文</p>' + '<!-- x -->'.repeat(Math.floor(100_000 / 10))],
   ];
   for (const [name, input] of cases) {
     it(`${name}（len=${input.length}）< 500ms`, () => {
