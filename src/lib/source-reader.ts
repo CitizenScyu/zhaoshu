@@ -120,8 +120,8 @@ export class SourceRequestContext {
   constructor(readonly signal: AbortSignal, limit = MAX_SOURCE_REQUESTS, options: SourceContextOptions = {}) {
     this.scope = options.scope ?? BUILTIN_SCOPE;
     this.limit = limit;
-    // 根 context 的全局上限初值 = 构造 limit：单独用 context(n) 的既有调用路径行为逐点不变
-    //（openPool 只在 M2-2 的 resolveSourceBook 里被调用，M2-1 不改任何现有调用路径）。
+    // 根 context 的全局上限初值 = 构造 limit：不经 openPool 的调用路径（单独用 context(n)）行为逐点不变。
+    // openPool 的调用点：resolveSourceBook（池里含引擎源时）、surveySourceBooks 开头、switchSourceChapter 开头，都只增不减。
     this.budget = options.budget ?? { requests: 0, nextRequestAt: 0, totalLimit: limit, startedAt: Date.now() };
     const sliceController = options.sliceController;
     if (sliceController) {

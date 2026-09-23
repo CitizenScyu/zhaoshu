@@ -2020,6 +2020,36 @@ describe('chapter failover M1.1 (41-M1.1)', () => {
     });
   });
 
+  // 名额豁免集合只有 SOURCE_NOT_FOUND 一个码(c① 钉住)。下面两条钉住它的边界:与它相邻、最容易被误并进
+  // 「不占名额」的两种结局仍算昂贵失败 —— 把任一个也豁免掉，第 4 个候选就会被请求，对应用例变红。
+  /** 4 个候选都以同一原因失败：满 3 个昂贵名额即停，第 4 个一次都不请求。 */
+  const expectQuotaStopsAtThree = async (reason: string, primeFailure: (n: number) => void, noAuthor = false) => {
+    const pool = [current, alt(1), alt(2), alt(3), alt(4)];
+    const catalog = await prepareCurrent(pool);
+    // 无作者书：目录作者未知，候选身份只按书名判定(sourceBookMatches)。
+    if (noAuthor) catalogs.set(catalog.version, { ...catalog, author: '' });
+    pages.set(currentChapter, { text: '', status: 404 });
+    for (const n of [1, 2, 3, 4]) primeFailure(n);
+    await expect(readChapter(catalog)).rejects.toMatchObject({ code: 'SOURCE_CHAPTER_UNAVAILABLE', status: 503, attempted: 3 });
+    expect(requestedUrls()).not.toContain(altSearch(4));
+    expect(oneFailoverLine('exhausted', pool)).toMatchObject({
+      attempted: 3, expensiveAttempts: 3, reasonCounts: { [reason]: 3 },
+    });
+  };
+
+  it('c②\'(豁免集合边界):4 个候选都 SOURCE_UNAVAILABLE(源在、这次没搜成)⇒ 占名额，第 4 个不被请求', async () => {
+    // 搜索页两次尝试都 500:resolveSourceBook 把失败折成 hadFailure ⇒ SOURCE_UNAVAILABLE(不是「确认没这本书」)。
+    await expectQuotaStopsAtThree('SOURCE_UNAVAILABLE', (n) => pages.set(altSearch(n), { text: '', status: 500 }));
+  });
+
+  it('c②\'\'(豁免集合边界):4 个候选都 SOURCE_AMBIGUOUS(无作者书、同站同名两部)⇒ 占名额，第 4 个不被请求', async () => {
+    await expectQuotaStopsAtThree('SOURCE_AMBIGUOUS', (n) => {
+      pages.set(altSearch(n), { text: `<a href="/books/details${710 + n}.html">测试书</a><a href="/books/details${720 + n}.html">测试书</a>` });
+      pages.set(pageUrl(710 + n), { text: detail(710 + n) });
+      pages.set(pageUrl(720 + n), { text: detail(720 + n, '另一作者') });
+    }, true);
+  });
+
   it('c③(杀 M4a):软预算余量 7999ms ⇒ 不开新候选、504;恰好 8000ms(一次完整请求)⇒ 照开，切片即余量', async () => {
     const pool = [current, alt(1)];
     const catalog = await prepareCurrent(pool);
