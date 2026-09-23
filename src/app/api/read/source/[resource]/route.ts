@@ -15,7 +15,8 @@ export const maxDuration = 60;
 const HEADERS = { 'Cache-Control': 'private, no-store', Vary: 'Cookie, Authorization, X-Owner-Token', 'X-Content-Type-Options': 'nosniff' };
 
 function response(body: unknown, status = 200) {
-  return NextResponse.json(body, { status, headers: { ...HEADERS, ...(status === 503 ? { 'Retry-After': '5' } : {}) } });
+  // 503 与 504（换源软预算见底 / 请求超时）都是「稍后重试可能成功」，给同样的退避提示（深审 A O2/O5）。
+  return NextResponse.json(body, { status, headers: { ...HEADERS, ...(status === 503 || status === 504 ? { 'Retry-After': '5' } : {}) } });
 }
 
 export async function GET(req: NextRequest, { params }: { params: Promise<{ resource: string }> }) {
