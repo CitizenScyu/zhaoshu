@@ -174,6 +174,45 @@ describe('download and source reading sessions', () => {
     expect(readerPartMatches(reversed, { ...delivered, title: '第1章 风' }, position)).toBe(false);
   });
 
+  // H7 第四轮 ④:防线判的是「交付的正是交付序号那一章」,preferredIndex(交付序号)负责重名章破平。
+  // 旧判法只要求「目录里有同名章」(命中非空),preferredIndex 只影响选哪一条、不影响放不放行 ——
+  // 去掉它测试照样绿;也放过了 H7 的重复章(见下一条)。
+  it('H7 A2 preferredIndex:目录有重名章时按交付序号破平,交付序号 3 的「请假条」放行', () => {
+    const newSession = 'g'.repeat(40);
+    const stale: ReaderIndex = {
+      ...online, version: newSession,
+      source: { ...online.source!, id: 'source-two', session: newSession },
+      chapters: ['第一章 风起', '请假条', '第二章 云涌', '请假条']
+        .map((title, index) => ({ index, title, startByte: 0, endByte: 0, partCount: 1 })),
+    };
+    const at = { chapterIndex: 3, partIndex: 0, ratio: 0 };
+    const delivered: ReaderPart = {
+      taskId: null, sourceId: 'source-two', version: newSession, sourceSession: newSession,
+      chapterIndex: 3, partIndex: 0, partCount: 1, title: '请假条', text: '正文', startByte: 0, endByte: 6,
+    };
+    // 序号 1 与 3 同档(键相等):按交付序号 3 破平命中 3 ⇒ 放行;不破平会命中 1 ⇒ 误判 409。
+    expect(readerPartMatches(stale, delivered, at)).toBe(true);
+  });
+
+  it('H7 防线:switched 状态下目录「有」同名章但不在交付序号 ⇒ false(旧目录序号 1 交付「第一章」= 重复章)', () => {
+    const newSession = 'h'.repeat(40);
+    // 客户端仍持旧目录 [第一章, 第二章](旧响应形状,未换目录),按旧序号 1 请求新 session;
+    // 服务端按新目录序号 1 交付 —— 备用目录多一个「序言」,序号 1 是「第一章」,即重复章。
+    const stale: ReaderIndex = {
+      ...online, version: newSession,
+      source: { ...online.source!, id: 'source-two', session: newSession },
+      chapters: ['第一章', '第二章'].map((title, index) => ({ index, title, startByte: 0, endByte: 0, partCount: 1 })),
+    };
+    const at = { chapterIndex: 1, partIndex: 0, ratio: 0 };
+    const duplicate: ReaderPart = {
+      taskId: null, sourceId: 'source-two', version: newSession, sourceSession: newSession,
+      chapterIndex: 1, partIndex: 0, partCount: 1, title: '第一章', text: '正文', startByte: 0, endByte: 6,
+    };
+    expect(readerPartMatches(stale, duplicate, at)).toBe(false);
+    // 对照:交付的正是序号 1 那一章(标题写法漂移也算)⇒ 放行。
+    expect(readerPartMatches(stale, { ...duplicate, title: '第2章' }, at)).toBe(true);
+  });
+
   it('remembers source progress and estimates by chapter when total file bytes are unknown', () => {
     const progress = { ...position, schema: 1, version: online.version, updatedAt: 1234 };
     const part: ReaderPart = { ...position, taskId: null, sourceId: online.source!.id, version: online.version,

@@ -47,6 +47,17 @@ export function switchedReaderIndex(index: ReaderIndex, part: ReaderPart): Reade
 }
 
 /**
+ * H7:目录被替换(switchedReaderIndex 采纳了新目录)时,交付段仍按**请求时的旧目录序号**标记
+ * (服务端 readSourceChapter 原样回带请求的 chapterIndex)。把它改记为服务端给的新目录序号
+ * (switchedChapterIndex),让阅读窗口与新目录同一套序号 —— activePart、下一章、续读、预取、
+ * 进度都从段序号算,留着旧序号就会在新目录里落到错章或重复章。目录未替换时原样返回。
+ */
+export function switchedReaderPart(index: ReaderIndex, adopted: ReaderIndex, part: ReaderPart): ReaderPart {
+  if (adopted.chapters === index.chapters || typeof part.switchedChapterIndex !== 'number') return part;
+  return { ...part, chapterIndex: part.switchedChapterIndex };
+}
+
+/**
  * 换源响应附带的新目录(只在形状完整且自洽时采纳):
  * 章节列表非空、每章字段齐全、序号从 0 连续、且本次交付章的新序号落在目录内。
  * 任一条件不满足 ⇒ 返回 null(调用方保留旧目录,退回既有行为,不采纳半份数据)。
@@ -76,9 +87,11 @@ export function readerPartMatches(index: ReaderIndex, part: ReaderPart, position
   // 对参数顺序不对称(归一化键恰 4 字时下限不同),顺序相反会让服务端判匹配的章在前端判不符 → 409
   // (复审小修 A2)。放行同章写法漂移,拒绝真正不同的章(「序言」对「第一章」)。
   // 新目录已被采纳时序号即新目录序号,标题天然同章,此比对不改变结果。
+  // 命中的必须**正是交付序号那一章**(序号兼作重名章的同分破平):只判「目录里有同名章」会放过
+  // 重复章 —— 旧目录 [第一章, 第二章] 在序号 1 交付「第一章」(H7 第四轮)。
   const titleOk = !switched || matchSourceChapter(
     index.chapters.map((chapter) => ({ url: '', title: chapter.title })), part.title, part.chapterIndex,
-  ) !== null;
+  ) === part.chapterIndex;
   return ownership && titleOk && (part.version === index.version || switched)
     && part.chapterIndex === position.chapterIndex
     && part.partIndex === position.partIndex && typeof part.text === 'string';

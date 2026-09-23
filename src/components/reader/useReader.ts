@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import type { ReaderIndex, ReaderPart, ReadingSession } from '@/lib/reader-types';
-import { readerChapterUrl, readerIndexUrl, readerPartMatches, switchedReaderIndex } from '@/lib/reader-session';
+import { readerChapterUrl, readerIndexUrl, readerPartMatches, switchedReaderIndex, switchedReaderPart } from '@/lib/reader-session';
 import { ReaderPartCache, nextReadingPosition, previousReadingPosition } from '@/lib/reader-part-cache';
 import { captureTextAnchor, restoreTextAnchor } from '@/lib/reader-text-anchor';
 import { catalogPrefixKey, migrateProgressAcrossSources, parseReaderSettings, parseReadingProgress, readingPercent, READER_SETTINGS_KEY } from '@/lib/reader-preferences';
@@ -305,11 +305,15 @@ export function useReader(session: ReadingSession, apiFetch: ApiFetch, userId: n
       const part = await cache.get(index, position, controller.signal);
       if (controller.signal.aborted || id !== serial.current) return;
       const switched = adoptSwitch(index, part);
-      // H7:换源附带新目录时,当前位置已迁到新序号(adoptSwitch 写入 currentReading)。
-      const shown = currentReading.current?.index === switched ? currentReading.current.position : position;
-      setActiveKey(partKey(part));
-      setReading({ index: switched, parts: [part], position: shown, focus: false });
-      setPercent(readingPercent(switched, part, shown.ratio));
+      // H7:换源附带新目录时,交付段改记新目录序号(switchedChapterIndex)。首载没有可迁的
+      // currentReading(adoptSwitch 只迁已在读的阅读),位置随交付段落到新序号 —— 否则
+      // activePart/页脚/下一章/续读/预取/进度都按旧段号算,在新目录里落到重复章。
+      const shownPart = switchedReaderPart(index, switched, part);
+      const shown = currentReading.current?.index === switched ? currentReading.current.position
+        : shownPart === part ? position : { ...position, chapterIndex: shownPart.chapterIndex };
+      setActiveKey(partKey(shownPart));
+      setReading({ index: switched, parts: [shownPart], position: shown, focus: false });
+      setPercent(readingPercent(switched, shownPart, shown.ratio));
       const notice = migrationNotice.current;
       migrationNotice.current = null;
       setNotice(notice ?? (saved ? '已回到上次阅读的位置' : ''));
@@ -439,10 +443,12 @@ export function useReader(session: ReadingSession, apiFetch: ApiFetch, userId: n
       // 换源在飞期间用户又点了别处:结果只对发起它的那次阅读有效(与 extend 同款护栏)。
       if (currentReading.current !== current) return;
       const adopted = adoptSwitch(current.index, part);
+      // H7:目录被替换时交付段改记新目录序号,与 adoptSwitch 迁移后的位置同一套序号。
+      const shownPart = switchedReaderPart(current.index, adopted, part);
       const shown = currentReading.current?.index === adopted ? currentReading.current.position : position;
-      setActiveKey(partKey(part));
-      setReading({ index: adopted, parts: [part], position: shown, focus: true });
-      setPercent(readingPercent(adopted, part, shown.ratio));
+      setActiveKey(partKey(shownPart));
+      setReading({ index: adopted, parts: [shownPart], position: shown, focus: true });
+      setPercent(readingPercent(adopted, shownPart, shown.ratio));
     } catch (error) {
       if (!controller.signal.aborted && id === serial.current) fail(error, position);
     } finally {
@@ -459,13 +465,6 @@ export function useReader(session: ReadingSession, apiFetch: ApiFetch, userId: n
       ? nextReadingPosition(current.index, current.parts[current.parts.length - 1])
       : previousReadingPosition(current.index, current.parts[0]);
     if (!next) return;
-    // H7:目录刚被替换时,窗口里的段还按旧目录序号标记,「安全滑出」判断会把点击误判成
-    // 滚动翻页并按旧序号取章。目录替换后的第一次移动一律走显式导航(新目录序号)。
-    if (current.parts.some((candidate) => !current.index.chapters[candidate.chapterIndex]
-      || current.index.chapters[candidate.chapterIndex].title !== candidate.title)) {
-      if (manual) await navigate(next);
-      return;
-    }
     if (current.parts.length >= WINDOW_SIZE) {
       const evicted = direction === 'next' ? current.parts[0] : current.parts[current.parts.length - 1];
       const bounds = sections.current.get(partKey(evicted))?.getBoundingClientRect();
@@ -501,7 +500,7 @@ export function useReader(session: ReadingSession, apiFetch: ApiFetch, userId: n
       // H7:目录被替换时,窗口里其余段仍按旧目录序号取回,与新目录对不上 —— 只留本次交付的这一段,
       // 位置用迁移后的新序号。未替换目录时窗口与位置逐点不变。
       const catalogSwitched = adopted.chapters !== current.index.chapters;
-      const shownParts = catalogSwitched ? [part] : parts;
+      const shownParts = catalogSwitched ? [switchedReaderPart(current.index, adopted, part)] : parts;
       const migrated = currentReading.current?.index === adopted ? currentReading.current.position : destination;
       setReading({
         index: adopted, parts: shownParts,
