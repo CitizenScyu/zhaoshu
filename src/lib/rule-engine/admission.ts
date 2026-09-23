@@ -35,6 +35,14 @@ export const ADMISSION_MAX_PROBES_PER_REFRESH = 10;
  * deferred 源推迟一整周期才复测；20h 留 4h 余量，保证每个自然日至少复测一次。
  */
 export const ADMISSION_RETEST_INTERVAL_MS = 20 * 3_600_000;
+/**
+ * conn_fail 衰减复测窗（41-B1-RETRY）：conn_fail 仍归 rejected 桶（出池、漏斗口径不变），
+ * 但不再是「一次 8s 超时定终身」——search_checked_at 距今超过该窗即回到待复探，下一轮
+ * cron 拿到名额就重探。取 7d 而非 20h：死站每源每周最多吃 1 个探测名额（名额 10/轮 ×
+ * cron 4 轮/天 = 40/天，K 个死站只占 K/7 每天），瞬时抖动误杀的源最迟 7 天回池。
+ * challenge/shell 是站点行为（非网络层），维持终态不衰减。
+ */
+export const ADMISSION_CONN_FAIL_RETEST_MS = 7 * 24 * 3_600_000;
 /** 剩余预算低于此值即整批跳过，绝不挤占刷新预算（设计风险台账 #4）。 */
 export const ADMISSION_MIN_BUDGET_MS = 10_000;
 
@@ -525,10 +533,20 @@ function compileDiagnostics(compile: AdmissionCompile): AdmissionSourceRow['comp
 
 function isRetestDue(row: AdmissionSourceRow, nowMs: number): boolean {
   if (row.search_ok === null) return true; // 未测（含被限流跳过的新源）
-  if (admissionBucket(row.search_verdict) !== 'deferred') return false;
-  if (!row.search_checked_at) return true;
-  const checked = Date.parse(row.search_checked_at);
-  return !Number.isFinite(checked) || nowMs - checked >= ADMISSION_RETEST_INTERVAL_MS;
+  const bucket = admissionBucket(row.search_verdict);
+  if (bucket === 'deferred') {
+    if (!row.search_checked_at) return true;
+    const checked = Date.parse(row.search_checked_at);
+    return !Number.isFinite(checked) || nowMs - checked >= ADMISSION_RETEST_INTERVAL_MS;
+  }
+  // 41-B1-RETRY：conn_fail 的 rejected 终态带时间衰减——超 7 天回到待复探（见常量注释）。
+  // 复探仍可能再判 conn_fail（checked_at 刷新、再等 7 天），但站点恢复后能自动回池。
+  if (row.search_verdict === 'conn_fail') {
+    if (!row.search_checked_at) return true;
+    const checked = Date.parse(row.search_checked_at);
+    return !Number.isFinite(checked) || nowMs - checked >= ADMISSION_CONN_FAIL_RETEST_MS;
+  }
+  return false;
 }
 
 /**
@@ -537,6 +555,8 @@ function isRetestDue(row: AdmissionSourceRow, nowMs: number): boolean {
  * 结论仍有效者不占探测名额（class 2）。同 class 内保持输入序（稳定排序，可复算）。
  * 反例背景：旧版按输入顺序最多探 5 个，前 5 个持续 http_5xx 的源每轮吃满全部名额，
  * 第 6 个源永远 search_ok=null（饿死）。
+ * 41-B1-RETRY 注：conn_fail 衰减到期的行也走 class 1（复测到期），与 deferred 同档——
+ * 它们共享同一个公平轮转，不抢未测源（class 0）的队。
  */
 type ProbeClass = 0 | 1 | 2;
 
@@ -573,7 +593,8 @@ function planProbeOrder(input: AdmissionBatchInput, nowMs: number): AdmissionPla
 
 /**
  * 跑一轮准入批次（设计 §4.2）。纯逻辑：不碰 DB，输入既有行、输出要写库的行。
- * 状态机：new → compile_rejected（终态，规则不变不复测）｜new → deferred → (ok|rejected)｜ok。
+ * 状态机：new → compile_rejected（终态，规则不变不复测）｜new → deferred → (ok|rejected)｜ok
+ * ｜conn_fail（rejected，7 天衰减后回 class 1 复测，41-B1-RETRY）。
  * 每轮真实搜索 ≤ maxProbes（默认 10），按 planProbeOrder 的公平序分配名额（N04）；
  * canProbe 为 false 时停止探测但仍写出可离线得到的结论。
  * N03 祖父条款：新必需组校验收紧时，既有「规则未变 ∧ compile_ok ∧ search_ok=true」的行

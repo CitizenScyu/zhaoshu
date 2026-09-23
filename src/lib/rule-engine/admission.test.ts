@@ -2,8 +2,8 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createHash } from 'node:crypto';
 import corpus from './fixtures/admission-174.json';
 import {
-  ADMISSION_RETEST_INTERVAL_MS, admissionBucket, compileAdmission, runAdmissionBatch, searchAdmission,
-  rulesHash, type AdmissionSourceRow, type AdmissionTransport,
+  ADMISSION_CONN_FAIL_RETEST_MS, ADMISSION_RETEST_INTERVAL_MS, admissionBucket, compileAdmission,
+  runAdmissionBatch, searchAdmission, rulesHash, type AdmissionSourceRow, type AdmissionTransport,
 } from './admission';
 import { ENGINE_SEMANTICS_VERSION, engineVersionedKey } from './compile';
 import { isForbiddenHostAddress, validateSourceUrl } from '@/lib/source-policy';
@@ -437,6 +437,87 @@ describe('准入状态机 runAdmissionBatch', () => {
     });
     expect(beyond.probed).toBe(1);
     expect(beyond.rows[0]).toMatchObject({ search_ok: true, search_verdict: 'ok' });
+  });
+
+  // 41-B1-RETRY：conn_fail 一次 8s 超时不再永久拒。仍归 rejected 桶（出池、漏斗口径不变），
+  // 但带 7 天衰减——超窗即回 class 1 复测。反例背景：跨 cron 轮的瞬时网络抖动曾把可用源
+  // 永久踢出（2026-09-23 opus 源链路复审 B1：conn_fail 比 http_5xx 判得更重，轻重反了）。
+  describe('41-B1-RETRY：conn_fail 衰减复测（一次 8s 超时 ≠ 永久拒）', () => {
+    const url = 'https://b1.example.com';
+    const source = syntheticSource('https://b1.example.com/');
+    const hash = rulesHash(source);
+    const okPage = () => vi.fn<AdmissionTransport>().mockResolvedValue(
+      page('<div class="i"><span class="t">书名</span><a href="/b/1">x</a></div>'));
+    const connFailRow = (daysAgo: number) => new Map([[url, sourceRow(url, {
+      tier: 'M1', compile_ok: true, rules_hash: hash, search_ok: false, search_verdict: 'conn_fail',
+      search_checked_at: new Date(Date.now() - daysAgo * 24 * 3_600_000).toISOString(),
+    })]]);
+
+    it('①首次超时（1 天前）不立即复测：仍 rejected 终态、不占名额', async () => {
+      // 衰减窗内：源保持出池（bucket 不变），但也不反复重探——瞬时抖动不放大为探测风暴。
+      expect(admissionBucket('conn_fail')).toBe('rejected'); // 桶口径不变：出池判定不动
+      const result = await runAdmissionBatch({
+        candidates: [{ url, source }], declaredHosts: new Set(['b1.example.com']),
+        existing: connFailRow(1), fetchPage: vi.fn<AdmissionTransport>(), signal: signal(), throttleMs: 0,
+      });
+      expect(result.probed).toBe(0);
+      expect(result.rows).toHaveLength(0); // 旧行原样保留（search_ok=false 不被占位覆盖）
+    });
+
+    it('②衰减到期（8 天前 > 7 天窗）→ 回到复探队列，站点恢复即回池（ok 改写）', async () => {
+      const result = await runAdmissionBatch({
+        candidates: [{ url, source }], declaredHosts: new Set(['b1.example.com']),
+        existing: connFailRow(8), fetchPage: okPage(), signal: signal(), throttleMs: 0,
+      });
+      expect(result.probed).toBe(1);
+      expect(result.rows).toHaveLength(1);
+      expect(result.rows[0]).toMatchObject({
+        search_ok: true, search_verdict: 'ok', rules_hash: hash,
+      }); // search_ok=true ⇒ 入池谓词恢复，源回池
+    });
+
+    it('③衰减到期但站点仍挂 → 再判 conn_fail，checked_at 刷新、再等一个衰减窗（不放松判据）', async () => {
+      const stillDown = vi.fn<AdmissionTransport>().mockRejectedValue(new TypeError('fetch failed'));
+      const result = await runAdmissionBatch({
+        candidates: [{ url, source }], declaredHosts: new Set(['b1.example.com']),
+        existing: connFailRow(8), fetchPage: stillDown, signal: signal(), throttleMs: 0,
+      });
+      expect(result.verdicts).toEqual({ conn_fail: 1 });
+      expect(result.rows[0]).toMatchObject({ search_ok: false, search_verdict: 'conn_fail' });
+      // checked_at 必须刷新：否则下一轮立刻又判到期、死站每轮都吃名额（衰减失效）。
+      expect(Date.parse(result.rows[0].search_checked_at!))
+        .toBeGreaterThan(Date.now() - ADMISSION_CONN_FAIL_RETEST_MS);
+    });
+
+    it('④挑战/壳页等其它 rejected 终态不衰减：21 天后仍不重测（站点行为 ≠ 网络抖动）', async () => {
+      for (const verdict of ['challenge', 'shell'] as const) {
+        const existing = new Map([[url, sourceRow(url, {
+          tier: 'M1', compile_ok: true, rules_hash: hash, search_ok: false, search_verdict: verdict,
+          search_checked_at: new Date(Date.now() - 21 * 24 * 3_600_000).toISOString(),
+        })]]);
+        const result = await runAdmissionBatch({
+          candidates: [{ url, source }], declaredHosts: new Set(['b1.example.com']),
+          existing, fetchPage: vi.fn<AdmissionTransport>(), signal: signal(), throttleMs: 0,
+        });
+        expect(result.probed, verdict).toBe(0);
+        expect(result.rows, verdict).toHaveLength(0);
+      }
+    });
+
+    it('⑤衰减到期者与未测源抢名额：class 0 未测优先，conn_fail 到期不抢队（N04 公平序不破）', async () => {
+      const fresh = 'https://b1-fresh.example.com';
+      const freshSource = syntheticSource('https://b1-fresh.example.com/');
+      const result = await runAdmissionBatch({
+        candidates: [
+          { url, source },
+          { url: fresh, source: freshSource },
+        ],
+        declaredHosts: new Set(['b1.example.com', 'b1-fresh.example.com']),
+        existing: connFailRow(8), fetchPage: okPage(), signal: signal(), throttleMs: 0, maxProbes: 1,
+      });
+      expect(result.probed).toBe(1);
+      expect(result.rows[0].source_url).toBe(fresh); // 未测（class 0）先于衰减到期（class 1）
+    });
   });
 
   it('compile 拒是终态：规则未变不复测、不重写；规则变才重跑滤网 1', async () => {
