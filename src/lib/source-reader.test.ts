@@ -1315,6 +1315,20 @@ describe('引擎源正文分派（N01）', () => {
     expect(part).toMatchObject({ sourceId: catalog.sourceId, chapterIndex: 0, servedFrom: 'N01引擎源' });
   });
 
+  it('⑥ 引擎源 @html 正文经 readSourceChapter 返回纯文本（不含 <p>）', async () => {
+    const htmlEngineSource = { ...contentEngineSource, rules: { ...contentEngineSource.rules, ruleContent: { content: '#body@html' } } };
+    mocks.sources.mockResolvedValue([htmlEngineSource]);
+    pages.set(n01Search, { text: '<div class="book"><span class="name">测试书</span><span class="author">作者</span><a href="/n01/d/1.html">x</a></div>' });
+    pages.set(n01Detail, { text: '<h1 class="title">测试书</h1><span class="writer">作者</span><a class="toc" href="/n01/toc/1.html">目录</a>' });
+    pages.set(n01Toc, { text: '<li class="chapter"><a href="/n01/c/1.html">第一章</a></li>' });
+    const catalog = await service.resolveSourceBook(book, context());
+    catalogs.set(catalog.version, catalog);
+    pages.set(n01Chapter, { text: '<div id="body"><p>段一</p><p>段二&amp;尾</p></div>' });
+    const part = await service.readSourceChapter(catalog.version, 0, context());
+    expect(part.text).toBe('段一\n段二&尾');
+    expect(part.text).not.toContain('<p>');
+  });
+
   it('反例对照：同一输入 engineFetchContent 直接调成功（不经过 readSourceChapter）', async () => {
     // 反例的另一半：修复前 engineFetchContent 本身就是好的，坏的是 chapterText 的分派缺失。
     const { engineFetchContent } = await import('./rule-engine/api');
