@@ -9,6 +9,7 @@ import {
   MAX_SOURCE_CHAPTERS, sourceSearchUrl, type SourceBookIdentity, type SourceChapter,
 } from '@/lib/source-parser';
 import type { SourceRequestContext } from '@/lib/source-reader';
+import { contentHtmlToText } from './content-html';
 import { createScope, evaluateField, evaluateFieldNodes, insideNode, normalizeBody } from './evaluate';
 import type { CompiledRules, FieldIr, SkippedField } from './types';
 
@@ -151,7 +152,11 @@ export async function engineFetchContent(
     const page = await context.page(next);
     const scope = createScope(normalizeBody(page.text), page.url);
     // 正文是唯一「多节点拼接」字段：@p@text 类规则靠 multi=true 把多段落拼成整章。
-    const content = evaluateText(source.compiled, 'ruleContent.content', scope, true);
+    // @html 类正文规则产出的是原始 HTML（94/174 样本如此），在正文层转纯文本
+    // （41-HTMLFIX）：evaluateText 的 @html 语义不变，简介等其它字段不受影响。
+    // 转换对纯文本恒等，@text 规则产出逐字节不变。
+    const raw = evaluateText(source.compiled, 'ruleContent.content', scope, true);
+    const content = contentHtmlToText(raw);
     if (strict && !content.trim()) throw new Error('empty_content_page');
     if (content) parts.push(content);
     const nextRule = source.compiled.get('ruleContent.nextContentUrl');

@@ -4,6 +4,7 @@ import {
   engineFetchContent, engineFetchDetail, engineFetchToc, engineSearchBook, type EngineSource,
   type EngineSearchResult, type EngineTocResult, type EngineContentResult,
 } from './api';
+import { contentHtmlToText } from './content-html';
 import { compileSource } from './compile';
 
 // 引擎门面单测（M1 任务 4 §7.1）：只做「取页 + 解释」；取页经注入的假 context，
@@ -166,6 +167,62 @@ describe('chapterUrl 缺失/求值空 → 取当前目录页 URL（legado baseUr
       { url: pageUrl, title: '第一章' },
       { url: page2, title: '第二章' },
     ]);
+  });
+});
+
+describe('引擎源正文 @html → 纯文本（41-HTMLFIX）', () => {
+  const htmlSource = (content: string, next = false) => engineSource({
+    ruleContent: next ? { content, nextContentUrl: '.next@href' } : { content },
+  });
+
+  it('① .con@html 规则 + <p> 段落 → 段落换行拼接', async () => {
+    const pages = new Map([[CHAPTER_URL, '<div class="con"><p>段一</p><p>段二</p></div>']]);
+    const result = await engineFetchContent(htmlSource('.con@html'), CHAPTER_URL, fakeContext(pages));
+    expect(result.text).toBe('段一\n段二');
+    expect(result.text).not.toContain('<p>');
+  });
+
+  it('② <br> 与实体（&nbsp; &amp; 十六进制数字实体）正确解码', async () => {
+    const pages = new Map([[CHAPTER_URL, '<div class="con">甲&nbsp;乙<br>丙&amp;丁&#x4e2d;</div>']]);
+    expect((await engineFetchContent(htmlSource('.con@html'), CHAPTER_URL, fakeContext(pages))).text)
+      .toBe('甲 乙\n丙&丁中');
+  });
+
+  it('③ <script> 与 <style> 连同内容整段删除', async () => {
+    const pages = new Map([[CHAPTER_URL,
+      '<div class="con"><script>alert(1)</script><p>正文</p><style>.x{color:red}</style></div>']]);
+    const text = (await engineFetchContent(htmlSource('.con@html'), CHAPTER_URL, fakeContext(pages))).text;
+    expect(text).toBe('正文');
+    expect(text).not.toContain('alert');
+    expect(text).not.toContain('color');
+  });
+
+  it('④ 纯文本正文（无标签，含「1<2」）逐字节不变', async () => {
+    // 基线是 evaluateText 的既有产出（它统一 trim 首尾，行内全角缩进保留），转换必须在其上恒等。
+    const plain = '第一段 1<2 且 a>b\n　　第二段';
+    const pages = new Map([[CHAPTER_URL, `<div class="content">　　${plain}</div>`]]);
+    const source = engineSource({ ruleContent: { content: '.content@text' } });
+    expect((await engineFetchContent(source, CHAPTER_URL, fakeContext(pages))).text).toBe(plain);
+  });
+
+  it('④b 转换函数对纯文本（含裸 <）恒等', () => {
+    const plain = '　　1<2 且 3>1，没有标签。\n　　第二行';
+    expect(contentHtmlToText(plain)).toBe(plain);
+    expect(contentHtmlToText('')).toBe('');
+  });
+
+  it('⑤ 两页正文各自转换后再以换行拼接', async () => {
+    const pages = new Map([
+      [CHAPTER_URL, '<div class="con"><p>甲</p><p>乙</p></div><a class="next" href="/c/2.html">下一页</a>'],
+      ['https://book15.net/c/2.html', '<div class="con"><p>丙&amp;丁</p></div>'],
+    ]);
+    expect((await engineFetchContent(htmlSource('.con@html', true), CHAPTER_URL, fakeContext(pages))).text)
+      .toBe('甲\n乙\n丙&丁');
+  });
+
+  it('行首全角缩进保留，连续空行压成一个', () => {
+    // @html 取的是元素 innerHTML，块级标签前的全角缩进随 innerHTML 保留并转成行首缩进。
+    expect(contentHtmlToText('　　<p>甲</p><p></p><p></p><p>乙</p>')).toBe('　　\n甲\n乙');
   });
 });
 
