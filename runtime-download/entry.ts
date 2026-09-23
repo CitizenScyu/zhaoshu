@@ -18,6 +18,7 @@ import { readBookText } from './read-book-text';
 import { resolveRepositoryId } from './repository';
 import { withoutProcessSignals } from './without-process-signals';
 import { createBudgetRefund } from './budget-refund';
+import { createIdentityPrecheck } from './identity-precheck';
 import { createExecutor, DEFAULT_DECISIONS, type DailyBudgetLike, type DownloadExecutor, type LoopDecisions } from './executor';
 
 export type { DownloadExecutor, DailyBudgetLike, LoopDecisions } from './executor';
@@ -33,6 +34,11 @@ export interface ProductionExecutorOptions {
    * 给出时书源不可达的尝试退还日预算；缺省则照旧计入（装配日志会提示）。
    */
   budgetStatePath?: string;
+  /**
+   * shell 日预算上限（main.mjs 的 config.dailyBookLimit，由打包注入传入）。shell 的 read() 只回
+   * {date, used}，扣额度前预检靠它判断「今天已满就不预检」；缺省时上限未知，预检照跑（装配日志会提示）。
+   */
+  budgetLimit?: number;
   /** 运行包工作目录（out 落地处）；由 shell 的状态目录派生。 */
   workDir: string;
   rateLimiter?: RateLimiterLike;
@@ -105,15 +111,34 @@ export async function createDownloadExecutor(options: ProductionExecutorOptions)
     repositoryId = await resolveRepositoryId(sql, { owner, repo, branch });
   }
 
-  log('info', '执行器装配完成', { repositoryId, branch, owner: options.owner ?? `service-${process.pid}` });
+  // 扣额度前的身份预检默认开；DOWNLOAD_IDENTITY_PRECHECK=0 关（回到引入前行为：书源不可达只在下载中判出、
+  // 事后退还日预算）。与下载腿共用 modules/resolveSource/transport（同一个运行时限速器）。
+  const precheck = env.DOWNLOAD_IDENTITY_PRECHECK === '0'
+    ? undefined
+    : createIdentityPrecheck({ modules, resolveSource, transport });
+
+  // shell 的 read() 只回 {date, used}：用打包注入的上限补齐 DailyBudgetLike 契约（缺省保持未知）。
+  const budget: DailyBudgetLike = {
+    read: async () => {
+      const state = await options.budget.read();
+      return { used: state.used, limit: state.limit ?? options.budgetLimit };
+    },
+    consume: () => options.budget.consume(),
+  };
+
+  log('info', '执行器装配完成', {
+    repositoryId, branch, owner: options.owner ?? `service-${process.pid}`, identityPrecheck: Boolean(precheck),
+  });
   if (!options.budgetStatePath) log('error', '日预算退还未接线：书源不可达仍会计入日预算', {});
+  if (precheck && options.budgetLimit === undefined) log('error', '日预算上限未接线：额度已满时仍会跑身份预检', {});
 
   return createExecutor({
     storage: storage as RuntimeStorage,
     github,
     adapters,
-    budget: options.budget,
+    budget,
     refundBudget: options.budgetStatePath ? createBudgetRefund({ statePath: options.budgetStatePath }) : undefined,
+    precheck,
     log,
     repositoryId,
     branch,

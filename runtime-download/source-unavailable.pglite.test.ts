@@ -13,6 +13,7 @@ import { createEngineAdapter, type SourceAdapter } from '../src/lib/download-wor
 import type { GitHubContents } from '../src/lib/download-publisher';
 import { SourceHttpError } from '../src/lib/source-fetch';
 import { downloadBook } from '../scripts/engine-download.mjs';
+import { createIdentityPrecheck } from './identity-precheck';
 
 const PGliteCtor = await loadPGlite();
 const maybe = PGliteCtor ? describe : describe.skip;
@@ -220,5 +221,169 @@ maybe('41-EXEC-SRCUNAVAIL：书源不可达不落终态、不耗日配额、零�
     expect(lines.map(line => line.fields?.retryAt)).toEqual([deferred.next_attempt_at, null]);
     expect(github.calls).toEqual([]);
     expect(await artifactRows()).toBe(0);
+  });
+});
+
+// 第二轮（整合 41-T5-IDENTITY）：生产装配 = 扣额度前预检开（先书源可达、后身份）。
+// 书源不可达在扣额度前就判出 ⇒ 根本不扣；身份不符 ⇒ 终态且不扣；预检放行后下载中才不可达 ⇒ 第一轮退还路径。
+maybe('41-EXEC-SRCUNAVAIL 第二轮：生产装配（扣额度前预检开）', () => {
+  let pg: PGliteLike;
+  let sql: DownloadSql;
+  let github: MemoryGitHub;
+  let outRoot: string;
+  const modules = assembleEngineModules();
+
+  beforeEach(async () => {
+    pg = new PGliteCtor!();
+    sql = makeSqlTag(pg);
+    await createSchema(pg);
+    github = new MemoryGitHub();
+    outRoot = mkdtempSync(join(tmpdir(), 'execfix41-r2-'));
+  }, 60_000);
+  afterEach(() => rmSync(outRoot, { recursive: true, force: true }));
+
+  const insertTask = async (): Promise<number> => Number(((await pg.query(
+    `INSERT INTO download_tasks(user_id, book_id, title, author, status, source_url, requested_by, source_kind)
+     VALUES (NULL, 1, '测试书', '佚名', 'pending', $1, 'system', 'builtin') RETURNING id`, [BOOK_URL],
+  )).rows[0] as { id: number }).id);
+  const row = async (id: number) => (await pg.query(
+    `SELECT status, error, attempt_count,
+            (extract(epoch FROM (next_attempt_at - updated_at)) * 1000)::float8 AS delay_ms,
+            to_char(next_attempt_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS next_attempt_at
+     FROM download_tasks WHERE id = $1`, [id],
+  )).rows[0] as { status: string; error: string; attempt_count: number; delay_ms: number | null; next_attempt_at: string | null };
+  const dueNow = (id: number) => pg.query(`UPDATE download_tasks SET next_attempt_at = now() - interval '1 second' WHERE id = $1`, [id]);
+
+  /** 合成 book15：搜索页 → 详情/目录同页（第 n 次读详情页可注入失败）→ 正文页。只记请求 URL，不联网。 */
+  function book15(options: { pageAuthor?: string; failSearch?: () => unknown; failBookRead?: { n: number; error: () => unknown } } = {}) {
+    const calls: string[] = [];
+    let bookReads = 0;
+    const transport = async (url: string) => {
+      calls.push(url);
+      if (url.includes('/books/search.html')) {
+        if (options.failSearch) throw options.failSearch();
+        return { url, text: '<a href="/books/details1.html">测试书</a>' };
+      }
+      if (url === BOOK_URL) {
+        bookReads += 1;
+        if (options.failBookRead?.n === bookReads) throw options.failBookRead.error();
+        return {
+          url,
+          text: `<meta property="og:novel:book_name" content="测试书"><meta property="og:novel:author" content="${options.pageAuthor ?? '佚名'}">`
+            + '<div class="d-chapter-list" id="full-catalog"><dd><a href="/chapter/index1-1.html">第1章</a></dd></div>',
+        };
+      }
+      if (url.includes('/chapter/')) return { url, text: '<li class="chapter-content" id="article-content"><p>合成正文。</p></li>' };
+      throw new Error('unexpected url');
+    };
+    return { calls, transport };
+  }
+
+  const runWired = (site: ReturnType<typeof book15>, budget: ReturnType<typeof ledgerBudget>, logs: LogLine[] = []) => createExecutor({
+    storage: createWorkerStorage(sql),
+    github,
+    adapters: [createEngineAdapter({
+      downloadBook: downloadBook as never,
+      modules,
+      resolveSource: createResolveSource(modules) as never,
+      transport: site.transport as never,
+      readBookText: async () => { throw new Error('本组用例不应走到整本读回'); },
+      outRoot,
+      sourceKind: 'builtin',
+      rateMs: 0,
+      timeoutMs: 2000,
+    })],
+    budget,
+    refundBudget: budget.refund,
+    precheck: createIdentityPrecheck({ modules, resolveSource: createResolveSource(modules), transport: site.transport, timeoutMs: 2000 }),
+    log: (level: 'info' | 'error', message: string, fields?: Record<string, unknown>) => { logs.push({ level, message, fields }); },
+    repositoryId: 1,
+    branch: 'main',
+    owner: 'worker-a',
+    decisions: DEFAULT_DECISIONS,
+  }).runOnce();
+  const sourceLines = (logs: LogLine[]) => logs.filter(line => line.fields?.reason === 'source_unavailable');
+
+  it('①ᵖ 搜索连接超时 ⇒ 扣额度前判出：pending + 退避 15m，从未扣额度（无需退还），下载一次都没开', async () => {
+    const id = await insertTask();
+    const budget = ledgerBudget();
+    const logs: LogLine[] = [];
+    const site = book15({ failSearch: () => new DOMException('书源连接超时', 'ConnectTimeoutError') });
+    expect(await runWired(site, budget, logs)).toBe(DEFAULT_DECISIONS.TASK_DONE);
+    const state = await row(id);
+    expect(state).toMatchObject({ status: 'pending', attempt_count: 2 });
+    expect(state.delay_ms).toBe(15 * MINUTE);
+    expect(state.error).toContain('source_unavailable');
+    expect(budget.used()).toBe(0);
+    expect(budget.refunds).toEqual([]); // 没扣过，所以也没有退还
+    expect(site.calls).toHaveLength(1); // 只有预检那一次搜索
+    expect(sourceLines(logs).map(line => line.fields)).toEqual([{ reason: 'source_unavailable', stage: 'search', host: 'book15.net', retryAt: state.next_attempt_at }]);
+    expect(github.calls).toEqual([]);
+  });
+
+  it.each([522, 503])('②ᵖ 源站 HTTP %s ⇒ 同 ①ᵖ', async status => {
+    const id = await insertTask();
+    const budget = ledgerBudget();
+    const site = book15({ failSearch: () => new SourceHttpError(status) });
+    await runWired(site, budget);
+    expect(await row(id)).toMatchObject({ status: 'pending', attempt_count: 2, delay_ms: 15 * MINUTE });
+    expect(budget.used()).toBe(0);
+    expect(budget.refunds).toEqual([]);
+    expect(site.calls).toHaveLength(1);
+  });
+
+  it('③ᵖ 搜索 404 ⇒ 预检放行（不判不可达）→ 下载同样 404 ⇒ 终态 download_failed，额度照扣（语义不变）', async () => {
+    const id = await insertTask();
+    const budget = ledgerBudget();
+    const logs: LogLine[] = [];
+    const site = book15({ failSearch: () => new SourceHttpError(404) });
+    await runWired(site, budget, logs);
+    expect(await row(id)).toMatchObject({ status: 'failed', error: 'download_failed', attempt_count: 1, next_attempt_at: null });
+    expect(budget.used()).toBe(1);
+    expect(budget.refunds).toEqual([]);
+    expect(site.calls).toHaveLength(2); // 预检一次 + 下载一次
+    expect(logs.map(line => line.fields)).toContainEqual({ taskId: id, reason: 'identity_unverified' });
+    expect(sourceLines(logs)).toEqual([]);
+  });
+
+  it('④ᵖ 身份不符 ⇒ 扣额度前拦截：终态 failed(identity_mismatch)，从未扣额度，下载一次都没开', async () => {
+    const id = await insertTask();
+    const budget = ledgerBudget();
+    const logs: LogLine[] = [];
+    const site = book15({ pageAuthor: '另一位作者' });
+    expect(await runWired(site, budget, logs)).toBe(DEFAULT_DECISIONS.TASK_DONE);
+    expect(await row(id)).toMatchObject({ status: 'failed', error: 'identity_mismatch', attempt_count: 1, next_attempt_at: null });
+    expect(budget.used()).toBe(0);
+    expect(budget.refunds).toEqual([]);
+    expect(site.calls).toHaveLength(2); // 预检的搜索 + 详情
+    expect(logs.map(line => line.fields)).toEqual([{ taskId: id, reason: 'identity_mismatch', written: true }]);
+    expect(github.calls).toEqual([]);
+  });
+
+  it('⑦ᵖ 预检放行、下载到目录才不可达（522）⇒ 第一轮路径：扣 1 后退还、pending + 退避，日志阶段 toc', async () => {
+    const id = await insertTask();
+    const budget = ledgerBudget();
+    const logs: LogLine[] = [];
+    // 详情页第 1 次读 = 预检详情，第 2 次 = 下载详情，第 3 次 = 下载目录。
+    const site = book15({ failBookRead: { n: 3, error: () => new SourceHttpError(522) } });
+    await runWired(site, budget, logs);
+    const state = await row(id);
+    expect(state).toMatchObject({ status: 'pending', attempt_count: 2, delay_ms: 15 * MINUTE });
+    expect(state.error).toContain('toc');
+    expect(budget.used()).toBe(0);
+    expect(budget.refunds).toHaveLength(1);
+    expect(sourceLines(logs).map(line => line.fields?.stage)).toEqual(['toc']);
+  });
+
+  it('⑥ᵖ 两条路径共用一条退避阶梯：预检判出 15m → 下载中判出 30m，只有后一次扣过额度且已退还', async () => {
+    const id = await insertTask();
+    const budget = ledgerBudget();
+    await runWired(book15({ failSearch: () => new DOMException('书源连接超时', 'ConnectTimeoutError') }), budget);
+    expect(await row(id)).toMatchObject({ status: 'pending', attempt_count: 2, delay_ms: 15 * MINUTE });
+    await dueNow(id);
+    await runWired(book15({ failBookRead: { n: 3, error: () => new SourceHttpError(503) } }), budget);
+    expect(await row(id)).toMatchObject({ status: 'pending', attempt_count: 3, delay_ms: 30 * MINUTE });
+    expect(budget.used()).toBe(0);
+    expect(budget.refunds).toHaveLength(1);
   });
 });

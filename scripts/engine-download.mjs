@@ -43,6 +43,10 @@ export function downloadOptions(args) {
   return options;
 }
 
+// 身份判据的唯一实现：downloadBook 选候选与执行器扣额度前的身份预检（runtime-download/identity-precheck.ts）共用。
+// 书名、作者都非空，且 canonicalBookKey 全等。不剥「著」、不看 alias，严格程度与原判据逐字一致。
+export const identityMatches = (detail, args) => Boolean(detail.title && detail.author && canonicalBookKey(detail.title, detail.author) === canonicalBookKey(args.title, args.author));
+
 // One shared request slot covers search/detail/toc/content, redirects and alternate hosts.
 // hooks（T3 任务层接缝，全部可选、向后兼容）：
 //   signal      —— 外部租约/截止信号：触发时等价 SIGINT，中断抓取并把 partial 检查点落盘；
@@ -120,7 +124,7 @@ export async function downloadBook(m, args, resolveSource, transport = fetchSour
         if (!builtin) return m.api.engineFetchDetail(engine, candidate.bookUrl, ctx);
         return m.parser.parseSourceIdentity((await ctx.page(candidate.bookUrl)).text);
       });
-      if (detail.title && detail.author && canonicalBookKey(detail.title, detail.author) === canonicalBookKey(args.title, args.author)) { selected = { ...candidate, ...detail }; break; }
+      if (identityMatches(detail, args)) { selected = { ...candidate, ...detail }; break; }
     }
     if (!selected) throw new Error('identity_mismatch_or_no_candidate');
     manifest.bookUrl = selected.bookUrl;

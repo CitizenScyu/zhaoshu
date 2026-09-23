@@ -177,6 +177,32 @@ const hostOf = (url: string): string => {
   try { return new URL(url).hostname; } catch { return ''; }
 };
 
+/**
+ * 书源不可达（source_unavailable）的统一收口：下载腿（runDownloadTask）与执行器扣额度前预检共用。
+ * 未达上限 ⇒ 租约条件放回 pending，按 attempt_count 退避；达上限 ⇒ partial 终态；失租约 ⇒ TaskLeaseLostError。
+ * 返回下次可重试时刻（ISO UTC），null = 已封顶转终态。
+ */
+export async function settleSourceUnavailable(
+  storage: Pick<WorkerStorage, 'defer' | 'finish'>,
+  lease: DownloadTaskLease,
+  stage: string,
+): Promise<{ retryAt: string | null }> {
+  if (lease.attemptCount < SOURCE_RETRY_MAX_ATTEMPTS) {
+    const retryAt = await storage.defer(lease, {
+      delayMs: sourceRetryDelayMs(lease.attemptCount),
+      error: `源不可用（${stage} 阶段，第 ${lease.attemptCount} 次）：source_unavailable，自动退避重试`,
+    });
+    if (!retryAt) throw new TaskLeaseLostError();
+    return { retryAt };
+  }
+  const written = await storage.finish(lease, {
+    status: 'partial',
+    error: `源不可用（${stage} 阶段，已连续 ${lease.attemptCount} 次，停止自动重试）：source_unavailable`,
+  });
+  if (!written) throw new TaskLeaseLostError();
+  return { retryAt: null };
+}
+
 function selectAdapter(adapters: SourceAdapter[], task: TaskRow): SourceAdapter {
   // 引擎腿按任务 source_kind 显式选择；builtin 兜底两条腿都存在时的默认。
   const wanted = task.source_kind === 'engine' ? 'engine' : 'builtin';
@@ -226,20 +252,10 @@ export async function runDownloadTask(
         // 连续 SOURCE_RETRY_MAX_ATTEMPTS 次仍不可达才落 partial 终态。
         const stage = outcome.stage ?? 'unknown';
         const sourceHost = hostOf(task.source_url);
-        if (lease.attemptCount < SOURCE_RETRY_MAX_ATTEMPTS) {
-          const retryAt = await storage.defer(lease, {
-            delayMs: sourceRetryDelayMs(lease.attemptCount),
-            error: `源不可用（${stage} 阶段，第 ${lease.attemptCount} 次）：source_unavailable，自动退避重试`,
-          });
-          if (!retryAt) throw new TaskLeaseLostError();
-          return { processed: true, reason: 'source_unavailable', stage, sourceHost, retryAt };
-        }
-        const written = await storage.finish(lease, {
-          status: 'partial',
-          error: `源不可用（${stage} 阶段，已连续 ${lease.attemptCount} 次，停止自动重试）：source_unavailable`,
-        });
-        if (!written) throw new TaskLeaseLostError();
-        return { processed: true, terminal: 'partial', reason: 'source_unavailable', stage, sourceHost, retryAt: null };
+        const { retryAt } = await settleSourceUnavailable(storage, lease, stage);
+        return retryAt
+          ? { processed: true, reason: 'source_unavailable', stage, sourceHost, retryAt }
+          : { processed: true, terminal: 'partial', reason: 'source_unavailable', stage, sourceHost, retryAt: null };
       }
       const detail = `缺章 ${outcome.chaptersDone}/${outcome.chaptersTotal}：${outcome.reason}`;
       const written = await storage.finish(lease, {
