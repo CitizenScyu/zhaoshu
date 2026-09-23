@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { readFileSync } from 'node:fs';
 import { AUTH_SCHEMA_VERSION, initializeAuthSchema } from './auth-store';
 
 type Query = { text: string };
@@ -134,5 +135,17 @@ describe('auth schema initialization', () => {
     expect(text).toContain('ADD COLUMN IF NOT EXISTS lease_generation bigint NOT NULL DEFAULT 0');
     expect(text).toContain("ADD COLUMN IF NOT EXISTS lease_owner text NOT NULL DEFAULT ''");
     expect(text).toContain('INSERT INTO auth_schema_migrations (version) VALUES (7)');
+  });
+
+  // MS-24b：文档自报的 schema 版本必须与代码常量一致（同 cron 门禁做法，防再次漂移）。
+  // 只从文档提取版本号、与 AUTH_SCHEMA_VERSION 比对；文档里任何一处写错版本都会红。
+  it('docs/auth-deployment.md 自报的当前版本等于 AUTH_SCHEMA_VERSION', () => {
+    const doc = readFileSync('docs/auth-deployment.md', 'utf8');
+    const occurrences = [...doc.matchAll(/schema v(\d+)|版本为 \*\*v(\d+)\*\*|迁移到 `version = (\d+)`|升级到当前版本（\*\*v(\d+)\*\*）/g)];
+    expect(occurrences.length).toBeGreaterThan(0);
+    const versions = occurrences
+      .map((match) => match.slice(1).find((group) => group !== undefined))
+      .map((found) => Number(found));
+    expect(versions.every((version) => version === AUTH_SCHEMA_VERSION)).toBe(true);
   });
 });

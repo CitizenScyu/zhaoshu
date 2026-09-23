@@ -16,6 +16,13 @@ describe('迁移入口与冷启动边界', () => {
     await expect(assertAuthSchema(sql as never)).rejects.toBeInstanceOf(AuthSchemaRequiredError);
     expect(sql).toHaveBeenCalledOnce(); expect(sql.mock.calls[0][0].join('')).toMatch(/^SELECT max\(version\)/);
   });
+  // MS-24a：闸门只拦「库落后于代码」。库版本新于代码（DDL 已跑、旧实例还在的灰度/回滚
+  // 窗口）必须放行，否则「先迁移后部署」这个通常安全的顺序也会全站 503。
+  it.each([7, 8, 99])('库版本 %s ≥ 代码常量时放行（库新代码旧不再 503）', async (version) => {
+    const sql = vi.fn().mockResolvedValue([{ version }]);
+    await expect(assertAuthSchema(sql as never)).resolves.toBeUndefined();
+    expect(sql).toHaveBeenCalledOnce();
+  });
   it('v7 校验只读；连接故障不会被伪装成缺迁移', async () => {
     const sql = vi.fn().mockResolvedValue([{ version: 7 }]);
     await assertAuthSchema(sql as never);

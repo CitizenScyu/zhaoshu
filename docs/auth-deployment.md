@@ -1,30 +1,35 @@
-# A04 个人数据隔离与 schema 交付（当前 auth schema v6）
+# A04 个人数据隔离与 schema 交付（当前 auth schema v7）
 
 > 本文档跨批次累积：§运行版本与部署顺序描述当前版本，其余章节标注了各自的批次语境。
-> 当前版本为 **v6**（A07 邀请码），此前为 v5（A05 下载归属）、v4（A04 个人数据隔离）。
+> 当前版本为 **v7**（下载任务队列：用户任务与系统任务同表），此前为 v6（A07 邀请码）、v5（A05 下载归属）、v4（A04 个人数据隔离）。
 > 历史章节里的“本批”指它们各自的批次，不代表当前版本。
+> 版本号须与 `src/lib/auth-store.ts` 的 `AUTH_SCHEMA_VERSION` 同步（有测试断言守着，漂移即红）。
 
 ## 运行版本与部署顺序
 
-**当前必须一次完成的顺序**：先对目标库执行迁移到 `version = 6`，确认成功后再切换应用代码 / 部署。
+**当前必须一次完成的顺序**：先对目标库执行迁移到 `version = 7`，确认成功后再切换应用代码 / 部署。
 仅部署代码而不迁移会让 `assertAuthSchema` 全站失败：`ensureSchema` 在初始化业务表之前先校验
-`max(version) = 6`，版本不足时抛 `AuthSchemaRequiredError`，所有需要数据库的请求都会 503。
+`max(version) >= 7`，版本不足时抛 `AuthSchemaRequiredError`，所有需要数据库的请求都会 503。
+闸门只拦「库落后于代码」一侧：库版本新于代码（DDL 已跑、旧实例还在的灰度/回滚窗口）不再 503；
+库版本高于代码支持上限的前向保护由迁移器在 `version > 7` 时 `RAISE EXCEPTION` 兜底，不靠运行时闸门。
 
 ```powershell
 # 1) 先迁移（必须显式提供 TEST_DATABASE_URL；脚本不回退业务 DATABASE_URL；缺连接退出码 2）
 $env:TEST_DATABASE_URL = '<目标库连接串>'
 npm run migrate:auth -- --check   # 只读预检：当前版本、约束、索引
-npm run migrate:auth              # 幂等迁移到 v6
-# 2) 确认 preflight/complete 输出里的 version 为 6、users_created_via_invite_fk 已建立
+npm run migrate:auth              # 幂等迁移到 v7
+# 2) 确认 preflight/complete 输出里的 version 为 7、users_created_via_invite_fk 已建立
 # 3) 再切换应用代码 / 部署
 ```
 
-迁移只增不删：v6 只追加 `registration_invites` 表、索引与 `users.created_via_invite_id` 外键，
-v5 及以前的语句一字未动，重复执行是幂等的（`IF NOT EXISTS (SELECT 1 FROM auth_schema_migrations WHERE version = 6)`）。
+迁移只增不删：v7 只追加 `download_tasks` 的系统任务列、约束与索引（requested_by /
+lease_generation 等），v6 只追加 `registration_invites` 表、索引与 `users.created_via_invite_id` 外键，
+v5 及以前的语句一字未动，重复执行是幂等的（`IF NOT EXISTS (SELECT 1 FROM auth_schema_migrations WHERE version = 7)`）。
 回退应用代码不会撤销已建立的表；已产生的邀请码与成员数据必须保留，不能承诺“关掉开关即可回退”。
 
-新版应用连旧库、旧版应用连新库都不受支持：前者 503，后者把 `newer than supported version 6` 当异常抛出
-（`auth_schema_migrations` 里出现比当前代码支持的更高的版本时，迁移块主动 `RAISE EXCEPTION`）。
+新版应用连旧库不受支持（503）；旧版应用连新库**可以**继续服务——闸门只拦库版本落后于代码的一侧，
+不再把「库新代码旧」判成 503。库版本高于代码支持上限（`auth_schema_migrations` 里出现比当前代码
+支持的更高的版本）仍由迁移块主动 `RAISE EXCEPTION`（`newer than supported version 7`）。
 
 ## 当前行为与开关
 
@@ -32,7 +37,7 @@ A04 迁移画像、找书、反馈、推荐、书架、统计与导出的全部 
 
 `AUTH_ACCOUNTS_ENABLED` 默认 false；数据库 `auth_settings.members_enabled` 默认 false、`registration_mode` 默认 closed。A07 已交付注册、邀请码与管理界面（`POST /api/auth/register`、`/api/admin/*`）；部署闸门与成员总闸保持默认关闭，需 owner 在「管理」页显式开启后才生效，且所有管理接口仅 owner 可访问、写请求强制 CSRF 校验。
 
-普通登录、注册和业务请求只校验当前 schema 版本（**v6**）。初始化业务表之前先校验版本，不在请求中删约束、改默认值或自动迁移。旧版本、未知较新版本或缺版本表均不能静默降级到全局查询，也都不能绕过版本闸门执行写操作。
+普通登录、注册和业务请求只校验当前 schema 版本（**v7**）。初始化业务表之前先校验版本，不在请求中删约束、改默认值或自动迁移。旧版本、未知较新版本或缺版本表均不能静默降级到全局查询，也都不能绕过版本闸门执行写操作。
 
 ## 隔离库预检与执行
 
@@ -74,7 +79,7 @@ stats 返回 subject.userId、allowedSections、sectionStates 和 sectionScopes�
 1. 停止旧写入口、离线旧脚本与旧部署实例，排空在途事务。仅关闭账号开关不够：旧 owner 写入口和旧冷启动 DDL 也必须停用。
 2. 对生产数据库制作包含全部 schema、表、序列、约束和认证设置的完整一致备份；记录恢复时间点。在另一隔离恢复库执行完整恢复并核对 ID、行数、微秒版本及外键。只备份几张个人表或只导出 JSON 不能替代完整备份。
 3. 只读预检真实版本、约束、索引、默认值及用户归属；结构漂移或归属不明时先停止迁移并核验。
-4. 按已验收的专用迁移事务升级到当前版本（**v6**），再切换至完整应用代码；校验版本、owner 个人访问、负向权限及一致快照后恢复流量。顺序颠倒（先切代码后迁移）会让全站 503。
+4. 按已验收的专用迁移事务升级到当前版本（**v7**），再切换至完整应用代码；校验版本、owner 个人访问、负向权限及一致快照后恢复流量。顺序颠倒（先切代码后迁移）会让全站 503。
 5. 保持注册和成员闸门关闭，直到 A05–A08 的权限、归属、入口和回退验收完成。
 6. v6 之后仍待真库验收的项：`/api/auth/register` 的 CTE 原子性（同码 20 路并发仅一人成功、用户名冲突不耗码、关闭/作废先提交则注册失败）与邀请码消费的并发排序。本批只有 SQL 文本断言与桩测试，未跑真库。
 
