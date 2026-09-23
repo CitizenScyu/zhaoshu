@@ -1937,6 +1937,20 @@ describe('chapter failover M1.1 (41-M1.1)', () => {
     expect(failoverLines()).toEqual([]);
   });
 
+  it('PAGEFIX⑤b: 换源候选是 cuoceng 同型源 ⇒ 候选正文只取本章 1 页，不串章(候选调用处同样传下一章,41-PAGEFIX)', async () => {
+    const pool = [current, engineAlt(7)];
+    const catalog = await prepareCurrent(pool);
+    pages.set(currentChapter, { text: '', status: 404 });
+    primeEngine(7);
+    // 候选目录两章，与当前源同名;第一章的 .next 指向第二章(下一章)。
+    pages.set(engineToc(7), { text: '<li class="chapter"><a href="/e7/c/1.html">第一章</a></li><li class="chapter"><a href="/e7/c/2.html">第二章</a></li>' });
+    pages.set(engineChapter(7), { text: '<div class="content">引擎源7第一章</div><a class="next" href="/e7/c/2.html">下一章</a>' });
+    pages.set('https://book15.net/e7/c/2.html', { text: '<div class="content">引擎源7第二章</div>' });
+    const part = await readChapter(catalog);
+    expect(part).toMatchObject({ text: '引擎源7第一章', servedFrom: engineAlt(7).name });
+    expect(requestedUrls()).not.toContain('https://book15.net/e7/c/2.html');
+  });
+
   // ---- 热修任务书 H2–H8(H1 见 41-FAILOVER-M1 组「引擎候选正文两页」)----
 
   it('H2: 引擎候选目录两页(nextTocUrl,本章在第 2 页)⇒ 成功', async () => {
