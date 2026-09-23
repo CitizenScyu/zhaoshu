@@ -1501,3 +1501,47 @@ describe('M3 surveySourceBooks 换源扫描', () => {
     expectPrivate(res);
   });
 });
+
+// ---- review-42 MS-01/MS-17：两级预算统一成可查询接口 remainingFor ----
+describe('MS-01 两级预算统一接口 remainingFor（root/child 余量语义）', () => {
+  it('root（builtin 首源）只受 L2 全局闸门约束；child 取 L1/L2 窄者', () => {
+    const root = context(); // limit=12, scope=builtin
+    expect(root.scope).toBe(service.BUILTIN_SCOPE);
+    expect(root.totalLimit).toBe(12);
+    const child = root.child('https://book15.net/mirror/');
+    expect(child.limit).toBe(service.PER_SOURCE_REQUESTS); // 6
+    // 消耗前：root 只看 L2=12；child 取 min(L1=6, L2=12)=6
+    expect(root.remainingFor(0)).toBe(12);
+    expect(child.remainingFor(0)).toBe(6);
+    // 预留作者回退所需点数后
+    expect(root.remainingFor(5)).toBe(7);
+    expect(child.remainingFor(5)).toBe(1);
+  });
+
+  it('openPool 抬高 L2 后 root 余量随之放宽，child 仍受 L1 单源闸门封顶', () => {
+    const root = context();
+    root.openPool(3); // 6×3=18
+    expect(root.totalLimit).toBe(18);
+    expect(root.remainingFor(0)).toBe(18);
+    const child = root.child('https://book15.net/mirror/');
+    expect(child.remainingFor(0)).toBe(6); // L1 封顶，不随 L2 放宽
+  });
+
+  it('child 的 L1 计数只随本源请求递减；父与兄弟源不共享该计数', () => {
+    const root = context();
+    const child = root.child('https://book15.net/mirror/', { limit: 3 });
+    expect(child.remainingFor(0)).toBe(3);
+    // 模拟本源已发 2 点（scoped 计数不进 budget.requests，仅用于 L1 判定）
+    (child as unknown as { scoped: { used: number } }).scoped.used = 2;
+    expect(child.remainingFor(0)).toBe(1);
+    expect(root.remainingFor(0)).toBe(12); // 父的余量不受子的 L1 影响
+  });
+
+  it('非首源 L1 耗尽时 remainingFor 归 0 —— 作者回退据此跳过，不再撞闸门（MS-01 症状）', () => {
+    const root = context();
+    const child = root.child('https://book15.net/mirror/'); // L1=6
+    (child as unknown as { scoped: { used: number } }).scoped.used = 6;
+    expect(child.remainingFor(0)).toBe(0);
+    expect(child.remainingFor(5)).toBe(0); // 预留后仍 0，作者回退不会强开
+  });
+});
