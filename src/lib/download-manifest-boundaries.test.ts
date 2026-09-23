@@ -103,6 +103,8 @@ function memoryStorage() {
     heartbeat: async () => true,
     progress: async () => true,
     finish: async (_lease, result) => { state.finished = result; return true; },
+    // 41-EXEC-SRCUNAVAIL 新增的端口；本文件不走书源不可达退避路径，按「未改期」返回 null 补齐类型。
+    defer: async () => null,
     reserveArtifactPath: async () => 7,
     registerArtifact: async () => true,
   };

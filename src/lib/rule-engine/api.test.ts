@@ -4,6 +4,7 @@ import {
   engineFetchContent, engineFetchDetail, engineFetchToc, engineSearchBook, type EngineSource,
   type EngineSearchResult, type EngineTocResult, type EngineContentResult,
 } from './api';
+import { contentHtmlToText, contentNeedsHtmlToText } from './content-html';
 import { compileSource } from './compile';
 
 // 引擎门面单测（M1 任务 4 §7.1）：只做「取页 + 解释」；取页经注入的假 context，
@@ -167,6 +168,249 @@ describe('chapterUrl 缺失/求值空 → 取当前目录页 URL（legado baseUr
       { url: page2, title: '第二章' },
     ]);
   });
+});
+
+describe('引擎源正文 @html → 纯文本（41-HTMLFIX）', () => {
+  const htmlSource = (content: string, next = false) => engineSource({
+    ruleContent: next ? { content, nextContentUrl: '.next@href' } : { content },
+  });
+
+  it('① .con@html 规则 + <p> 段落 → 段落换行拼接', async () => {
+    const pages = new Map([[CHAPTER_URL, '<div class="con"><p>段一</p><p>段二</p></div>']]);
+    const result = await engineFetchContent(htmlSource('.con@html'), CHAPTER_URL, fakeContext(pages));
+    expect(result.text).toBe('段一\n段二');
+    expect(result.text).not.toContain('<p>');
+  });
+
+  it('② <br> 与实体（&nbsp; &amp; 十六进制数字实体）正确解码', async () => {
+    const pages = new Map([[CHAPTER_URL, '<div class="con">甲&nbsp;乙<br>丙&amp;丁&#x4e2d;</div>']]);
+    expect((await engineFetchContent(htmlSource('.con@html'), CHAPTER_URL, fakeContext(pages))).text)
+      .toBe('甲 乙\n丙&丁中');
+  });
+
+  it('③ <script> 与 <style> 连同内容整段删除', async () => {
+    const pages = new Map([[CHAPTER_URL,
+      '<div class="con"><script>alert(1)</script><p>正文</p><style>.x{color:red}</style></div>']]);
+    const text = (await engineFetchContent(htmlSource('.con@html'), CHAPTER_URL, fakeContext(pages))).text;
+    expect(text).toBe('正文');
+    expect(text).not.toContain('alert');
+    expect(text).not.toContain('color');
+  });
+
+  it('④ 纯文本正文（无标签，含「1<2」）逐字节不变', async () => {
+    // 基线是 evaluateText 的既有产出（它统一 trim 首尾，行内全角缩进保留），转换必须在其上恒等。
+    const plain = '第一段 1<2 且 a>b\n　　第二段';
+    const pages = new Map([[CHAPTER_URL, `<div class="content">　　${plain}</div>`]]);
+    const source = engineSource({ ruleContent: { content: '.content@text' } });
+    expect((await engineFetchContent(source, CHAPTER_URL, fakeContext(pages))).text).toBe(plain);
+  });
+
+  it('⑤ 两页正文各自转换后再以换行拼接', async () => {
+    const pages = new Map([
+      [CHAPTER_URL, '<div class="con"><p>甲</p><p>乙</p></div><a class="next" href="/c/2.html">下一页</a>'],
+      ['https://book15.net/c/2.html', '<div class="con"><p>丙&amp;丁</p></div>'],
+    ]);
+    expect((await engineFetchContent(htmlSource('.con@html', true), CHAPTER_URL, fakeContext(pages))).text)
+      .toBe('甲\n乙\n丙&丁');
+  });
+
+  it('S5 行首全角缩进保留在段落内，空段落与纯缩进行被压掉', () => {
+    // 缩进写在 <p> 内才是段落缩进；标签前的裸缩进单独成行，只含全角空格的行按空行压缩。
+    expect(contentHtmlToText('<p>　　甲</p><p></p><p>乙</p>')).toBe('　　甲\n乙');
+    expect(contentHtmlToText('　　<p>甲</p><p>　　</p><p>乙</p>')).toBe('甲\n乙');
+  });
+});
+
+// ---------------------------------------------------------------- 41-HTMLFIX 复审修复（B1–B4 / S1–S7 / R1–R4）
+describe('正文转纯文本按规则类型判定（41-HTMLFIX 复审）', () => {
+  const htmlSource = (content: string) => engineSource({ ruleContent: { content } });
+  const fetch = async (rule: string, body: string) => (
+    await engineFetchContent(htmlSource(rule), CHAPTER_URL, fakeContext(new Map([[CHAPTER_URL, body]])))
+  ).text;
+
+  it('B1 @text 规则的正文逐字节透传（<+字母、空白、已解码实体都不被改写）', async () => {
+    const cases: [string, string][] = [
+      ['<div class="content">如果a&lt;b，而 x&gt;y，那么结论成立。</div>', '如果a<b，而 x>y，那么结论成立。'],
+      ['<div class="content">获得技能&lt;Lv.10&gt;火球术，属性&lt;HP+100&gt;</div>', '获得技能<Lv.10>火球术，属性<HP+100>'],
+      ['<div class="content">He said &lt;Hello World&gt; and left</div>', 'He said <Hello World> and left'],
+      ['<div class="content">他大喊&lt;!&gt;然后离开</div>', '他大喊<!>然后离开'],
+      ['<div class="content">第一段  \n\n\n第二段 a&lt;b</div>', '第一段  \n\n\n第二段 a<b'],
+      ['<div class="content">符号 &amp;amp; 表示与，a&lt;b 时成立</div>', '符号 &amp; 表示与，a<b 时成立'],
+    ];
+    for (const [body, expected] of cases) {
+      expect(await fetch('.content@text', body)).toBe(expected);
+    }
+  });
+
+  it('B1 不写后缀的正文规则同样透传（字段层默认末端是 @text，evaluate.ts:220）', async () => {
+    expect(await fetch('.content', '<div class="content">a&lt;b 且 x&gt;y</div>')).toBe('a<b 且 x>y');
+  });
+
+  it('B3 无标签的 @html 输出也解码实体', async () => {
+    expect(await fetch('.con@html', '<div class="con">甲&amp;乙&lt;丙&gt;丁&nbsp;戊</div>'))
+      .toBe('甲&乙<丙>丁 戊');
+  });
+
+  it('B3 @p@html 多段（段落内无标签）逐段解码，含 &nbsp; 缩进', async () => {
+    const body = '<div id="nr1"><p>&nbsp;&nbsp;&nbsp;&nbsp;段一&amp;x</p><p>&nbsp;&nbsp;&nbsp;&nbsp;段二</p></div>';
+    expect(await fetch('#nr1@p@html', body)).toBe('段一&x\n段二');
+  });
+
+  it('B3 同书有无内联标签的章节解码结果一致', async () => {
+    const withTag = '<div id="nr1"><p>&nbsp;&nbsp;段一&amp;x</p><p>段二<b>粗</b></p></div>';
+    expect(await fetch('#nr1@p@html', withTag)).toBe('段一&x\n段二粗');
+  });
+
+  it('B4 越界数字实体输出 U+FFFD 且不抛（&#0;、代理区、超 U+10FFFF）', () => {
+    expect(() => contentHtmlToText('<p>x&#99999999;y</p>')).not.toThrow();
+    expect(contentHtmlToText('<p>x&#99999999;y</p>')).toBe('x�y');
+    expect(contentHtmlToText('<p>x&#x110000;y</p>')).toBe('x�y');
+    expect(contentHtmlToText('<p>x&#0;y</p>')).toBe('x�y');
+    expect(contentHtmlToText('<p>x&#xD800;y</p>')).toBe('x�y');
+  });
+
+  it('B4 JSON 正文里的越界实体端到端不抛', async () => {
+    const body = JSON.stringify({ data: { content: '<p>x&#99999999;y&#0;z</p>' } });
+    expect(await fetch('$.data.content', body)).toBe('x�y�z');
+  });
+
+  it('S1 大写十六进制实体 &#X4E2D; 解码', () => {
+    expect(contentHtmlToText('<p>&#X4E2D;</p>')).toBe('中');
+  });
+
+  it('S2 &constructor; 等原型链名字原样保留', () => {
+    expect(contentHtmlToText('<p>A&constructor;B&toString;C&__proto__;D</p>'))
+      .toBe('A&constructor;B&toString;C&__proto__;D');
+  });
+
+  it('S4 未闭合的 <script> 截到末尾，脚本内容不进正文', () => {
+    expect(contentHtmlToText('<p>正文</p><script>var leak = 1;')).toBe('正文');
+  });
+
+  it('S6 零宽字符（U+200B/200C/200D）被删除', () => {
+    expect(contentHtmlToText('<p>段​一‌二‍</p>')).toBe('段一二');
+  });
+
+  it('S7 JSON 正文的 HTML4 命名实体解码', async () => {
+    const body = JSON.stringify({ data: { content: '&ldquo;你好&rdquo;&hellip;&mdash;&middot;' } });
+    expect(await fetch('$.data.content', body)).toBe('“你好”…—·');
+  });
+
+  it('R1 大写块级标签同样换行', () => {
+    expect(contentHtmlToText('<P CLASS="x">段一</P><DIV style="a:b">段二</DIV>')).toBe('段一\n段二');
+    expect(contentHtmlToText('甲<BR>乙<BR/>丙')).toBe('甲\n乙\n丙');
+  });
+
+  it('R2 注释整段删除（含注释内的标签与 >）', () => {
+    expect(contentHtmlToText('<p>甲<!-- 广告 <p>x</p> a>b -->乙</p>')).toBe('甲乙');
+    expect(contentHtmlToText('<p>甲<!-- 未闭合')).toBe('甲');
+  });
+
+  it('R3 行首尾半角空白被规整，全角缩进保留', () => {
+    expect(contentHtmlToText('<p>  段一  </p><p>　　段二</p>')).toBe('段一\n　　段二');
+    expect(contentHtmlToText('<p>甲</p><p>   </p><p>乙</p>')).toBe('甲\n乙');
+  });
+
+  it('R4 先剥标签再解码：转义文本 &lt;b&gt; 保留为字面尖括号', () => {
+    expect(contentHtmlToText('<p>甲&lt;b&gt;乙&lt;/b&gt;</p>')).toBe('甲<b>乙</b>');
+  });
+
+  it('N1 JSON 纯文本正文不被兜底正则吃掉（与基点逐字节相同）', async () => {
+    const plains = [
+      '1<2 且 x>y',
+      '书名是<<斗破苍穹>>',
+      '如果a<b，而 x>y，那么结论成立。',
+      '获得技能<Lv.10>火球术，属性<HP+100>',
+      '他大喊<!>然后离开',
+    ];
+    for (const plain of plains) {
+      const body = JSON.stringify({ data: { content: plain } });
+      expect(await fetch('$.data.content', body)).toBe(plain);
+    }
+  });
+
+  it('N1 <o:p> 与自定义元素 <my-tag> 被剥掉', () => {
+    expect(contentHtmlToText('<p>甲<o:p></o:p>乙</p>')).toBe('甲乙');
+    expect(contentHtmlToText('<p>甲<my-tag>丙</my-tag>乙</p>')).toBe('甲丙乙');
+  });
+
+  it('s2 命名实体大小写不敏感（&AMP; 与 &amp; 同义）', () => {
+    expect(contentHtmlToText('<p>A&AMP;B&Nbsp;C</p>')).toBe('A&B C');
+  });
+
+  it('s3 结束标签 > 前有空白时整段删除，更长的标签名不误伤', () => {
+    expect(contentHtmlToText('<p>前</p><script>var x=1;</script >后')).toBe('前\n后');
+    expect(contentHtmlToText('<p>甲<scripts>丙</scripts>乙</p>')).toBe('甲丙乙');
+  });
+
+  it('s4 CR 归一：CRLF 结尾不残留 \\r，CRLF 空行被压缩', () => {
+    expect(contentHtmlToText('<p>第一段\r\n第二段\r\n</p>')).toBe('第一段\n第二段');
+    expect(contentHtmlToText('<p>甲\r\n\r\n\r\n乙</p>')).toBe('甲\n乙');
+  });
+
+  it('s5 只含 &emsp;/&ensp; 的行按空行压缩', () => {
+    expect(contentHtmlToText('<p>段一</p><p>&emsp;</p><p>段二</p>')).toBe('段一\n段二');
+    expect(contentHtmlToText('<p>段一</p><p>&ensp;&ensp;</p><p>段二</p>')).toBe('段一\n段二');
+  });
+
+  it('混合 || 分支（html||text）保守转换：@html 命中时解码', async () => {
+    const merged = { ...rules, ruleContent: { content: '.con@html||.other@text' } };
+    const source: EngineSource = {
+      url: 'https://book15.net/engine/', name: '引擎源', searchUrl: SEARCH_URL,
+      compiled: compileSource(
+        { url: 'https://book15.net/engine/', searchUrl: SEARCH_URL, rules: merged },
+        { orEnabled: true },
+      ),
+    };
+    const body = '<div class="con">甲&amp;乙</div>';
+    const pages = new Map([[CHAPTER_URL, body]]);
+    expect((await engineFetchContent(source, CHAPTER_URL, fakeContext(pages))).text).toBe('甲&乙');
+  });
+
+  it('规则类型判定：text 类透传，其余转换', () => {
+    const fieldOf = (content: string, orEnabled = false) => compileSource(
+      { url: 'https://book15.net/engine/', searchUrl: SEARCH_URL, rules: { ...rules, ruleContent: { content } } },
+      { orEnabled },
+    ).get('ruleContent.content');
+    expect(contentNeedsHtmlToText(fieldOf('.content@text') as never)).toBe(false);
+    expect(contentNeedsHtmlToText(fieldOf('.content@ownText') as never)).toBe(false);
+    expect(contentNeedsHtmlToText(fieldOf('.content') as never)).toBe(false);
+    expect(contentNeedsHtmlToText(fieldOf('.a@text||.b@ownText', true) as never)).toBe(false);
+    expect(contentNeedsHtmlToText(fieldOf('.con@html') as never)).toBe(true);
+    expect(contentNeedsHtmlToText(fieldOf('#nr1@p@html') as never)).toBe(true);
+    expect(contentNeedsHtmlToText(fieldOf('.con@html||.other@text', true) as never)).toBe(true);
+    expect(contentNeedsHtmlToText(fieldOf('$.data.content') as never)).toBe(true);
+    expect(contentNeedsHtmlToText(undefined)).toBe(false);
+  });
+});
+
+describe('正文转纯文本性能（41-HTMLFIX 复审 B2：10 万字符病态输入）', () => {
+  const time = (input: string) => {
+    const start = performance.now();
+    contentHtmlToText(input);
+    return performance.now() - start;
+  };
+  const cases: [string, string][] = [
+    ['<p> + < ×n', '<p>' + '<'.repeat(100_000)],
+    ['<a ×n/2', '<a'.repeat(50_000)],
+    ['<!-- ×n/4 不闭合', '<!--'.repeat(25_000)],
+    ['<script> ×n/8 不闭合', '<script>'.repeat(12_500)],
+    ['<p>x + 空格×n + y</p>', '<p>x' + ' '.repeat(100_000) + 'y</p>'],
+    ['行内 &nbsp; ×n/6', '<p>x' + '&nbsp;'.repeat(16_667) + 'y</p>'],
+    // s1：标签名后跟空白才进入属性段。'<a'.repeat 进不去 [^>]*，测不到属性段的二次复杂度。
+    ['<a x ×25000（属性段）', '<a x'.repeat(25_000)],
+    ['<a  ×33334（属性段）', '<a '.repeat(33_334)],
+    // N2：闭合的 script/style/注释。未闭合输入第一趟就截到末尾，测不到「逐个删除」的二次复杂度。
+    ['<script></script> ×k 闭合', '<p>正文</p>' + '<script></script>'.repeat(Math.floor(100_000 / 17))],
+    ['<style></style> ×k 闭合', '<p>正文</p>' + '<style></style>'.repeat(Math.floor(100_000 / 15))],
+    ['<!----> ×k 闭合', '<p>正文</p>' + '<!---->'.repeat(Math.floor(100_000 / 7))],
+    ['<!-- x --> ×k 闭合', '<p>正文</p>' + '<!-- x -->'.repeat(Math.floor(100_000 / 10))],
+  ];
+  for (const [name, input] of cases) {
+    it(`${name}（len=${input.length}）< 500ms`, () => {
+      expect(time(input)).toBeLessThan(500);
+    });
+  }
 });
 
 describe('导出面快照（M1 任务 4 v3 E5 结构断言）', () => {

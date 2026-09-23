@@ -28,21 +28,25 @@ export const PER_SOURCE_REQUESTS = 6;
 export const PER_SOURCE_SLICE_MS = 14_000;
 export const SOFT_BUDGET_MS = 45_000;
 export const MAX_POOL_REQUESTS = 30;
-// 章节级换源预算（41-M1.1 第二轮，深审 A F1/F2/F5）：候选 child 用默认单源点数 PER_SOURCE_REQUESTS
-// （翻页、一次 5xx 重试、第二条搜索结果、作者回退都要点数）；切片默认同单源切片 PER_SOURCE_SLICE_MS，
-// 实际取 min(旋钮, 软预算余量)，目录与正文共用一片。名额只数「昂贵失败」：SOURCE_NOT_FOUND 不占。
-// 切片与名额这里是默认值，生效值走 sourceFailoverSliceMs() / sourceFailoverMaxAttempts()（env 标定旋钮）。
-export const SOURCE_FAILOVER_SLICE_MS = PER_SOURCE_SLICE_MS;
+// 章节级换源预算（41-M1.1 第二轮 / 41-M1.2）：候选 child 用默认单源点数 PER_SOURCE_REQUESTS
+// （翻页、一次 5xx 重试、第二条搜索结果、作者回退都要点数）；切片按进展滑动（见 SourceSliceSlide）：
+// 基准取 min(旋钮, 软预算余量)，每次成功请求顺延一个基准，目录与正文共用一片。名额只数「昂贵失败」：
+// SOURCE_NOT_FOUND 不占。切片与名额这里是默认值，生效值走 sourceFailoverSliceMs() / sourceFailoverMaxAttempts()。
+// 候选基准 12s：卡死的候选 12s 就放弃（当前源 12s + 两个卡死候选 24s 后，余量仍 ≥ 起跑门槛 8s，
+// 第三个候选还能开跑）；一直在出数据的候选靠顺延不被砍；12s 也装得下 book15 候选
+// 「apex 卡住 8s + 换 host 0.35s + www 一页 ≤3.6s ≈ 11.95s」这条救援路径。
+export const SOURCE_FAILOVER_SLICE_MS = 12_000;
 export const SOURCE_FAILOVER_MAX_ATTEMPTS = 3;
-/** 软预算余量不足一次完整物理请求就不再开新候选，走 504 超时出口（partial：还有候选没试）。 */
+/** 软预算余量不足一次完整物理请求就不再开新候选，走 504 超时出口（partial：还有候选没试）；也是给原源兜底预留的时间。 */
 export const SOURCE_FAILOVER_MIN_START_MS = SOURCE_TIMEOUT_MS;
 /**
- * 当前源正文切片默认值（41-M1.1）：10s = 一次完整物理请求（SOURCE_TIMEOUT_MS 8s）加节流余量。
- * 不取更短：5–8s 才回的「慢但能用」当前源会被误判进换源，用户反而要多等一整个候选。
+ * 当前源正文切片基准（41-M1.2）：12s = 一次卡住的请求（SOURCE_TIMEOUT_MS 8s）+ 换 host 退避 0.35s
+ * + 另一 host 上实测最慢的一页（≤3.6s）≈ 11.95s，救援路径完整装得下。按进展滑动：多页正文每成功一页顺延一个基准，
+ * 慢但一直在出数据的当前源不被砍，卡住 12s 没有进展才放弃、进换源。
  */
-export const SOURCE_CURRENT_SLICE_MS = 10_000;
-// 标定旋钮的钳位（误配兜底）：候选切片 [4s, 20s]，低于 4s 连搜索+详情+正文的一次正常往返都装不下；
-// 当前源切片 ≤ 20s，用满也给换源留出 ≥ 25s 软预算；昂贵名额 ≤ 7。
+export const SOURCE_CURRENT_SLICE_MS = 12_000;
+// 标定旋钮的钳位（误配兜底）：候选基准 [4s, 20s]，低于 4s 时一页正常的慢请求（详情页实测 ≤3.6s）加节流就可能被砍；
+// 当前源基准 ≤ 20s，卡住的当前源至多占 20s、给换源留出 ≥ 25s 软预算（有进展时的顺延另受上限约束）；昂贵名额 ≤ 7。
 const MIN_TUNED_FAILOVER_SLICE_MS = 4_000;
 const MAX_TUNED_SLICE_MS = 20_000;
 const MAX_TUNED_FAILOVER_ATTEMPTS = 7;
@@ -66,7 +70,7 @@ function tunedValue(raw: string | undefined, fallback: number, max: number, min 
   return Number.isSafeInteger(parsed) && parsed > 0 ? Math.min(Math.max(parsed, min), max) : fallback;
 }
 
-/** 换源单候选切片：env `SOURCE_FAILOVER_SLICE_MS`，默认 14000，钳在 [4000, 20000]。 */
+/** 换源单候选切片基准：env `SOURCE_FAILOVER_SLICE_MS`，默认 12000，钳在 [4000, 20000]。 */
 export function sourceFailoverSliceMs(env: SourceTuningEnv = process.env): number {
   return tunedValue(env.SOURCE_FAILOVER_SLICE_MS, SOURCE_FAILOVER_SLICE_MS, MAX_TUNED_SLICE_MS, MIN_TUNED_FAILOVER_SLICE_MS);
 }
@@ -76,7 +80,7 @@ export function sourceFailoverMaxAttempts(env: SourceTuningEnv = process.env): n
   return tunedValue(env.SOURCE_FAILOVER_MAX_ATTEMPTS, SOURCE_FAILOVER_MAX_ATTEMPTS, MAX_TUNED_FAILOVER_ATTEMPTS);
 }
 
-/** 当前源正文切片：env `SOURCE_CURRENT_SLICE_MS`，默认 10000，上限 20000。 */
+/** 当前源正文切片基准：env `SOURCE_CURRENT_SLICE_MS`，默认 12000，上限 20000。 */
 export function sourceCurrentSliceMs(env: SourceTuningEnv = process.env): number {
   return tunedValue(env.SOURCE_CURRENT_SLICE_MS, SOURCE_CURRENT_SLICE_MS, MAX_TUNED_SLICE_MS);
 }
@@ -102,11 +106,25 @@ interface SharedSourceBudget {
   startedAt: number;
 }
 
+/**
+ * 按进展滑动的切片（41-M1.2）：本 context 或其子孙每完成一次**成功**的上游请求，切片截止时间顺延到
+ * min(now + stepMs, until)，只延后不提前；失败、超时、被中止的请求不顺延。慢但一直在出数据的源不被砍，
+ * 卡住的源在最后一次进展之后 stepMs 到点放弃。until 是绝对时刻（软预算终点减去要保留的兜底时间），
+ * 顺延不会越过它。
+ */
+export interface SourceSliceSlide {
+  stepMs: number;
+  until: number;
+}
+
 interface SourceContextOptions {
   budget?: SharedSourceBudget;
   scope?: string;
   sliceMs?: number;
   sliceController?: AbortController;
+  slide?: SourceSliceSlide;
+  /** 进展逐级上报的上游 context（正文 context → 候选 context 共用一片滑动切片）。 */
+  parent?: SourceRequestContext;
 }
 
 export class SourceRequestContext {
@@ -117,6 +135,10 @@ export class SourceRequestContext {
   private readonly budget: SharedSourceBudget;
   // 本 scope 已扣点数：与 shared.requests 同步递增，但单独记账用于 L1 单源闸门判定。
   private readonly scoped = { used: 0 };
+  private readonly parent?: SourceRequestContext;
+  private readonly slide?: SourceSliceSlide;
+  private sliceDeadline = Number.POSITIVE_INFINITY;
+  private armSlice?: (deadline: number) => void;
 
   constructor(readonly signal: AbortSignal, limit = MAX_SOURCE_REQUESTS, options: SourceContextOptions = {}) {
     this.scope = options.scope ?? BUILTIN_SCOPE;
@@ -124,14 +146,23 @@ export class SourceRequestContext {
     // 根 context 的全局上限初值 = 构造 limit：不经 openPool 的调用路径（单独用 context(n)）行为逐点不变。
     // openPool 的调用点：resolveSourceBook（池里含引擎源时）、surveySourceBooks 开头、switchSourceChapter 开头，都只增不减。
     this.budget = options.budget ?? { requests: 0, nextRequestAt: 0, totalLimit: limit, startedAt: Date.now() };
+    this.parent = options.parent;
     const sliceController = options.sliceController;
     if (sliceController) {
       // 单源切片：到点只 abort 子 signal（原因码 SOURCE_SCOPE_EXHAUSTED），父 signal 不受影响。
-      const timer = setTimeout(
-        () => sliceController.abort(new SourceReaderError('当前书源查询预算已用完，正在尝试下一个书源。', 'SOURCE_SCOPE_EXHAUSTED', 503)),
-        options.sliceMs ?? PER_SOURCE_SLICE_MS,
-      );
-      (timer as { unref?: () => void }).unref?.();
+      // 滑动切片（slide）在每次进展时重新定时，截止时刻记在 sliceDeadline。
+      this.slide = options.slide;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      this.armSlice = (deadline) => {
+        clearTimeout(timer);
+        this.sliceDeadline = deadline;
+        timer = setTimeout(
+          () => sliceController.abort(new SourceReaderError('当前书源查询预算已用完，正在尝试下一个书源。', 'SOURCE_SCOPE_EXHAUSTED', 503)),
+          Math.max(0, deadline - Date.now()),
+        );
+        (timer as { unref?: () => void }).unref?.();
+      };
+      this.armSlice(Date.now() + (options.sliceMs ?? PER_SOURCE_SLICE_MS));
       if (this.signal.aborted) clearTimeout(timer);
       else this.signal.addEventListener('abort', () => clearTimeout(timer), { once: true });
     }
@@ -155,12 +186,27 @@ export class SourceRequestContext {
     this.budget.totalLimit = Math.max(this.budget.totalLimit, opened);
   }
 
-  /** 单源子 context：requests/节流槽共享，limit 与切片独立；signal = any([父 signal, 切片定时器])。 */
-  child(scope: string, opts: { limit?: number; sliceMs?: number } = {}): SourceRequestContext {
+  /**
+   * 单源子 context：requests/节流槽共享，limit 与切片独立；signal = any([父 signal, 切片定时器])。
+   * slide 给定时切片按进展滑动；shareSlice 时不另起切片，signal 直接沿用父 context（与父共用同一片切片）。
+   * 子 context 的进展一律逐级上报给父 context。
+   */
+  child(scope: string, opts: { limit?: number; sliceMs?: number; slide?: SourceSliceSlide; shareSlice?: boolean } = {}): SourceRequestContext {
+    const limit = opts.limit ?? PER_SOURCE_REQUESTS;
+    if (opts.shareSlice) return new SourceRequestContext(this.signal, limit, { budget: this.budget, scope, parent: this });
     const sliceController = new AbortController();
-    return new SourceRequestContext(AbortSignal.any([this.signal, sliceController.signal]), opts.limit ?? PER_SOURCE_REQUESTS, {
-      budget: this.budget, scope, sliceMs: opts.sliceMs, sliceController,
+    return new SourceRequestContext(AbortSignal.any([this.signal, sliceController.signal]), limit, {
+      budget: this.budget, scope, sliceMs: opts.sliceMs, sliceController, slide: opts.slide, parent: this,
     });
+  }
+
+  /** 一次成功的上游请求：滑动切片顺延（只延后、不越过 until），再逐级上报给父 context。 */
+  private noteProgress(): void {
+    if (this.slide && this.armSlice && !this.signal.aborted) {
+      const next = Math.min(Date.now() + this.slide.stepMs, this.slide.until);
+      if (next > this.sliceDeadline) this.armSlice(next);
+    }
+    this.parent?.noteProgress();
   }
 
   /**
@@ -184,7 +230,7 @@ export class SourceRequestContext {
     for (let attempt = 0; attempt < attempts; attempt++) {
       this.signal.throwIfAborted();
       try {
-        return await fetchSourceText(url, {
+        const page = await fetchSourceText(url, {
           signal: this.signal,
           beforeRequest: async (signal) => {
             // L2 全局兜底：池预算用尽即停所有源（错误码与文案与今天逐字相同）。
@@ -202,6 +248,9 @@ export class SourceRequestContext {
             if (at > now) await pause(at - now, signal);
           },
         });
+        // 成功请求 = 源在出数据：滑动切片据此顺延。失败/超时/中止都走下面的 catch，不顺延。
+        this.noteProgress();
+        return page;
       } catch (error) {
         this.signal.throwIfAborted();
         if (error instanceof SourcePolicyError || error instanceof SourceReaderError
@@ -976,10 +1025,15 @@ export async function readSourceChapter(session: string, chapterIndex: number, c
     servedFrom = switched.sourceName;
   } else {
     try {
-      // 当前源正文走有界切片(41-M1.1):死源不再靠 8s 单请求超时 × 重试耗到十几二十秒才换源。
-      // 到点只 abort 这个 child(SOURCE_SCOPE_EXHAUSTED),父 signal 不受影响。L1 上限取引擎翻页上限，
-      // 多页正文不会被单源点数掐断;builtin 只抓 1 页，真正的约束仍是 L2,与改动前走根 context 时一致。
-      const currentContext = context.child(source.url, { limit: MAX_CONTENT_PAGES, sliceMs: sourceCurrentSliceMs() });
+      // 当前源正文走按进展滑动的切片(41-M1.2):死源卡住 12s 没有进展就放弃、进换源,不再靠 8s 单请求超时 ×
+      // 重试耗到十几二十秒;多页正文每成功一页顺延一个基准，慢但一直在出数据的当前源不被砍。顺延上限是软预算
+      // 终点，池里有他源时再扣掉换源的起跑门槛(否则换源一个候选都开不了)。到点只 abort 这个 child
+      // (SOURCE_SCOPE_EXHAUSTED),父 signal 不受影响。L1 上限取引擎翻页上限，多页正文不会被单源点数掐断;
+      // builtin 只抓 1 页，真正的约束仍是 L2,与改动前走根 context 时一致。
+      const baseMs = sourceCurrentSliceMs();
+      const hasOthers = sources.some((item) => item.url !== catalog.sourceUrl);
+      const until = context.startedAt + SOFT_BUDGET_MS - (hasOthers ? SOURCE_FAILOVER_MIN_START_MS : 0);
+      const currentContext = context.child(source.url, { limit: MAX_CONTENT_PAGES, sliceMs: baseMs, slide: { stepMs: baseMs, until } });
       text = await chapterText(currentContext, chapter, source, nextChapterUrlOf(catalog.chapters, chapterIndex));
     } catch (error) {
       // 章节正文失败(含源被停用/服务端判定失效/切片到点):进换源流程。
@@ -1021,14 +1075,16 @@ function failureCode(error: unknown): string {
  * 章节级换源:在目录加载时的池快照里逐个找同书的另一个源,按标题对齐取回本章正文;正文拿到后才把
  * 备用源目录落库,调用方据此把 version/sourceId/servedFrom 换成新源(洞 2)。
  *
- * 队列与名额(41-M1.1 第二轮):先试他源(同站异 URL 的源被 deprioritizeSource 排在队尾);原源只在他源
- * 全部确认无此书(SOURCE_NOT_FOUND)时作为最后一个候选带 excludeBookUrl 再试,不占名额。名额只数
- * 「昂贵失败」(SOURCE_NOT_FOUND 以外),满 sourceFailoverMaxAttempts() 即停。每个候选一个 child:
- * 默认单源点数,切片 min(sourceFailoverSliceMs(), 软预算余量),目录与正文共用这一片。
+ * 队列与名额(41-M1.2):队列固定为 [他源…, 原源]。先试他源(同站异 URL 的源被 deprioritizeSource 排在他源末尾);
+ * 原源**总是**最后一个候选,带 excludeBookUrl 再搜一次,不占名额(深审 A 第二轮 R1)。名额只数「昂贵失败」
+ * (SOURCE_NOT_FOUND 以外),满 sourceFailoverMaxAttempts() 后其余他源不再试,直接轮到原源兜底。
+ * 每个候选一个 child:默认单源点数,切片按进展滑动(SourceSliceSlide):基准 min(sourceFailoverSliceMs(), 余量),
+ * 每次成功请求顺延一个基准,顺延上限 = 软预算终点(原源兜底还在后面时再扣掉 8s);最后一个他源的基准放宽到
+ * 「余量 − 8s」,原源兜底的基准 = 全部余量(R4/P2)。目录与正文共用这一片。
  *
- * 出口:成功;504 SOURCE_TIMEOUT 只有两种 —— 循环顶软预算余量不足一次完整请求(partial:还有候选没试)、
- * 父 signal 中止(原样抛出,route 转 504);其余(候选试完、名额用尽、L2 请求数用尽、目录落库失败)一律
- * 503 SOURCE_CHAPTER_UNAVAILABLE。每个出口恰好一行 source_failover 聚合日志;trigger 是当前源失败的原因码。
+ * 出口:成功;504 SOURCE_TIMEOUT 只有两种 —— 循环顶软预算余量不足一次完整请求、且还有真正的候选没试(partial),
+ * 以及父 signal 中止(原样抛出,route 转 504);其余(候选试完、只剩原源兜底而余量不足、L2 请求数用尽、目录落库失败)
+ * 一律 503 SOURCE_CHAPTER_UNAVAILABLE。每个出口恰好一行 source_failover 聚合日志;trigger 是当前源失败的原因码。
  */
 async function switchSourceChapter(
   catalog: SourceCatalog, chapter: SourceChapter, chapterIndex: number,
@@ -1039,28 +1095,31 @@ async function switchSourceChapter(
   // L2:路由根 context 的全局上限是 12,候选各自 resolveSourceBook(sources:[候选]) 时 openPool(1) 抬不高它。
   // 换源开始时按整个池开一次(只增不减,封顶 30),与整池调用 resolveSourceBook 同口径(深审 A F3)。
   context.openPool(sources.length);
-  const sliceMs = sourceFailoverSliceMs();
+  const baseMs = sourceFailoverSliceMs();
   const maxExpensiveAttempts = sourceFailoverMaxAttempts();
-  // 池快照钉在目录加载时点(N01)。原源刚刚失败,默认不再打它;但他源全部确认无此书时,这本书只可能还在
-  // 原站(重新上架/换了条目,当前 bookUrl 已失效),这时原源排到队尾带 excludeBookUrl 再试一次(深审 A F6)。
-  // 池里没有他源时,原源就是唯一的候选。
+  const softEnd = context.startedAt + SOFT_BUDGET_MS;
+  // 池快照钉在目录加载时点(N01)。原源刚刚失败,先试他源;但原源总是排在最后再试一次:他源没有这本书、只有
+  // 同名异作、或者临时故障时,这本书仍可能在原站(重新上架/换了条目,当前 bookUrl 已失效)。旧实现把原站降到
+  // 队尾而不是排除,这里保持同样的兜底。池里没有他源时,原源就是唯一的候选。
   const ordered = deprioritizeSource(sources, catalog.sourceUrl);
   // 41-M1.3:suspect 站(连续传输层硬失败,见 source-host-health.ts)排到他源队尾 —— 只降序不剔除;记忆为空时原样返回。
   const others = orderByHostHealth(ordered.filter((item) => item.url !== catalog.sourceUrl));
   const originals = ordered.filter((item) => item.url === catalog.sourceUrl);
-  const queue = others.length ? [...others] : [...originals];
-  let originalQueued = !others.length;
+  const queue = [...others, ...originals];
   const failures: Array<{ source: string; reason: string }> = [];
   const reasonCounts: Record<string, number> = {};
   let attempted = 0;
   let expensiveAttempts = 0;
   // 每个出口恰好一行聚合日志:只有结局、计数、耗时和原因码(有限枚举),书名、作者、源名、URL、host、
-  // 查询串一概不进。elapsedMs 与 requests 只算换源这一段。
+  // 查询串一概不进。elapsedMs 与 requests 只算换源这一段。成功换源是「降级但已交付」,不是错误:按本模块
+  // 观测事件的惯例打 warn;exhausted / timeout 才打 error(深审 A O1)。
   const report = (outcome: 'success' | 'exhausted' | 'timeout') => {
-    console.error(JSON.stringify({
+    const line = JSON.stringify({
       event: 'source_failover', outcome, trigger, attempted, expensiveAttempts,
       elapsedMs: Date.now() - startedAt, requests: context.requests - requestsAtStart, reasonCounts,
-    }));
+    });
+    if (outcome === 'success') console.warn(line);
+    else console.error(line);
   };
   const fail = (source: string, reason: string) => {
     reasonCounts[reason] = (reasonCounts[reason] ?? 0) + 1;
@@ -1080,20 +1139,29 @@ async function switchSourceChapter(
   };
   for (let index = 0; index < queue.length; index += 1) {
     const candidate = queue[index];
+    const isOriginal = candidate.url === catalog.sourceUrl;
+    // 昂贵名额用满:其余他源不再试,直接轮到队尾的原源兜底。
+    if (!isOriginal && expensiveAttempts >= maxExpensiveAttempts) continue;
     throwIfCancelled();
-    const remaining = SOFT_BUDGET_MS - (Date.now() - context.startedAt);
+    const remaining = softEnd - Date.now();
     if (remaining < SOURCE_FAILOVER_MIN_START_MS) {
+      // 只剩原源兜底(他源都已处理过)而余量不足:候选已经试完,按 503 收尾(P1b);还有他源没试才是 504(partial)。
+      if (isOriginal && others.length) break;
       report('timeout');
       throw new SourceReaderError('书源查询已取消或超时，可重试或尝试「下载全书」。', 'SOURCE_TIMEOUT', 504);
     }
     // L2 请求数用尽不是超时:不再开新候选,走下面的 503。
     if (context.remainingFor(0) === 0) break;
-    const isOriginal = candidate.url === catalog.sourceUrl;
     attempted += 1;
+    // 切片(R4/P2):原源兜底还在后面时,给它留出一次起跑门槛;最后一个他源可以用到「余量 − 留给原源的」,
+    // 原源兜底用全部余量;其余候选取 min(基准, 余量)。顺延上限同样扣掉留给原源的时间。
+    const reserve = !isOriginal && originals.length ? SOURCE_FAILOVER_MIN_START_MS : 0;
+    const isLast = isOriginal || index === others.length - 1;
+    const sliceMs = isLast ? Math.max(Math.min(baseMs, remaining), remaining - reserve) : Math.min(baseMs, remaining);
     let alternative: SourceCatalog;
     let text: string;
     try {
-      const sourceContext = context.child(candidate.url, { sliceMs: Math.min(sliceMs, remaining) });
+      const sourceContext = context.child(candidate.url, { sliceMs, slide: { stepMs: baseMs, until: softEnd - reserve } });
       alternative = await resolveSourceBook(catalog, sourceContext, {
         excludeBookUrl: catalog.bookUrl, sources: [candidate], deferNotFoundWarnings: true,
       });
@@ -1105,9 +1173,9 @@ async function switchSourceChapter(
       const alternativeSource = sources.find((item) => item.url === alternative.sourceUrl
         && sourceRevision(item) === alternative.sourceRevision);
       if (!alternativeSource) throw new SourceReaderError('Alternative source not in pool snapshot', 'SOURCE_NOT_IN_SNAPSHOT');
-      // 正文 context 是目录 child 的子 context:signal 继承候选切片(目录+正文合计一片)。L1 取引擎翻页上限,
-      // 引擎正文按 nextContentUrl 逐页 page(),上限低于翻页数时第 2 页就撞 SOURCE_SCOPE_EXHAUSTED。
-      const chapterContext = sourceContext.child(candidate.url, { limit: MAX_CONTENT_PAGES, sliceMs: Math.min(sliceMs, remaining) });
+      // 正文 context 不另起切片,直接用候选 context 的 signal(目录+正文共用一片),每页进展照样让这一片顺延。
+      // L1 取引擎翻页上限:引擎正文按 nextContentUrl 逐页 page(),上限低于翻页数时第 2 页就撞 SOURCE_SCOPE_EXHAUSTED。
+      const chapterContext = sourceContext.child(candidate.url, { limit: MAX_CONTENT_PAGES, shareSlice: true });
       text = await chapterText(
         chapterContext, alternative.chapters[alternativeIndex], alternativeSource,
         nextChapterUrlOf(alternative.chapters, alternativeIndex),
@@ -1117,14 +1185,7 @@ async function switchSourceChapter(
       const reason = failureCode(error);
       fail(candidate.name, reason);
       // 名额只数昂贵失败:SOURCE_NOT_FOUND(搜索确认本站没有这本书)不占,原源兜底那一次也不占。
-      if (reason !== 'SOURCE_NOT_FOUND' && !isOriginal) {
-        expensiveAttempts += 1;
-        if (expensiveAttempts >= maxExpensiveAttempts) break;
-      }
-      if (!originalQueued && index === queue.length - 1 && failures.every((item) => item.reason === 'SOURCE_NOT_FOUND')) {
-        queue.push(...originals);
-        originalQueued = true;
-      }
+      if (reason !== 'SOURCE_NOT_FOUND' && !isOriginal) expensiveAttempts += 1;
       continue;
     }
     // 正文拿到后才固化目录,避免失败候选污染可续读会话。落库失败 fail-closed:DB 故障换源救不了,

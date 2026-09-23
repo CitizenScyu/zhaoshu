@@ -10,6 +10,7 @@ import {
   MAX_SOURCE_CHAPTERS, sourceSearchUrl, type SourceBookIdentity, type SourceChapter,
 } from '@/lib/source-parser';
 import type { SourceRequestContext } from '@/lib/source-reader';
+import { contentHtmlToText, contentNeedsHtmlToText } from './content-html';
 import { createScope, evaluateField, evaluateFieldNodes, insideNode, normalizeBody } from './evaluate';
 import type { CompiledRules, FieldIr, SkippedField } from './types';
 
@@ -162,6 +163,8 @@ export async function engineFetchContent(
 ): Promise<EngineContentResult> {
   const parts: string[] = [];
   const visited = new Set<string>();
+  const contentField = field(source.compiled, 'ruleContent.content');
+  const convertContent = contentNeedsHtmlToText(contentField);
   let next = absoluteUrl(chapterUrl, source.url);
   // 下一章按本章 URL 绝对化（legado 以本章 redirectUrl 为基址）；过不了 host 门就不设判据（退回改前行为）。
   const stopAt = next && nextChapterUrl ? absoluteUrl(nextChapterUrl, next) : undefined;
@@ -172,7 +175,12 @@ export async function engineFetchContent(
     const page = await context.page(next);
     const scope = createScope(normalizeBody(page.text), page.url);
     // 正文是唯一「多节点拼接」字段：@p@text 类规则靠 multi=true 把多段落拼成整章。
-    const content = evaluateText(source.compiled, 'ruleContent.content', scope, true);
+    // 是否做 HTML→纯文本按**规则类型**判定（41-HTMLFIX 复审）：全部候选支都是
+    // text/ownText/textNodes（或不写后缀，字段层默认按 @text 求值，evaluate.ts:220）时
+    // 逐字节透传；@html / JSON 路径 / 模板 / 混合 || 分支一律转换，含实体解码。
+    // evaluateText 的 @html 语义不变，简介等其它字段不受影响。
+    const raw = evaluateText(source.compiled, 'ruleContent.content', scope, true);
+    const content = convertContent ? contentHtmlToText(raw) : raw;
     if (strict && !content.trim()) throw new Error('empty_content_page');
     if (content) parts.push(content);
     const nextRule = source.compiled.get('ruleContent.nextContentUrl');

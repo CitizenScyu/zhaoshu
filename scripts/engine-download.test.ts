@@ -8,6 +8,8 @@ import * as api from '../src/lib/rule-engine/api';
 import * as compile from '../src/lib/rule-engine/compile';
 import * as parser from '../src/lib/source-parser';
 import fixtures from '../src/lib/rule-engine/fixtures/smoke-174.json';
+import { SourceHttpError } from '../src/lib/source-fetch';
+import { SourcePolicyError } from '../src/lib/source-policy';
 import { downloadBook, downloadOptions } from './engine-download.mjs';
 
 const dirs: string[] = [];
@@ -240,5 +242,91 @@ describe('engine content pagination stops at the next chapter (41-PAGEFIX)', () 
     expect([0, 1, 2].map(i => readFileSync(join(dir, `${i}.txt`), 'utf8'))).toEqual(['第1章正文', '第2章正文', '第3章正文']);
     // 正文页各请求一次，从不为「下一章」多抓一页。
     expect(calls.filter(url => /\/cc\/b\/\d+\.html$/.test(url))).toEqual([chapter(1), chapter(2), chapter(3)]);
+  });
+});
+
+// 41-EXEC-SRCUNAVAIL：搜索/详情/目录阶段的传输层失败与源站 5xx 归 code=2 source_unavailable
+// （与 resolveSource code=2 同档：可重试、零发布）；4xx、策略拒绝、其余异常与正文阶段维持原分类。
+describe('书源不可达分类（41-EXEC-SRCUNAVAIL）', () => {
+  const BOOK = 'https://book15.net/books/details1.html';
+  // failure_stage 是 catch 里补上的 manifest 字段，JS 推断的字面量类型里没有。
+  const stageOf = (result: { manifest: object }) => (result.manifest as { failure_stage?: string }).failure_stage;
+  const unavailable: [string, () => unknown][] = [
+    ['ConnectTimeoutError', () => new DOMException('书源连接超时', 'ConnectTimeoutError')],
+    ['TimeoutError', () => new DOMException('书源请求及正文读取超时', 'TimeoutError')],
+    ['fetch failed（DNS）', () => new TypeError('fetch failed', { cause: Object.assign(new Error('getaddrinfo ENOTFOUND'), { code: 'ENOTFOUND' }) })],
+    ['fetch failed（reset）', () => new TypeError('fetch failed', { cause: Object.assign(new Error('socket hang up'), { code: 'ECONNRESET' }) })],
+    ['HTTP 500', () => new SourceHttpError(500)],
+    ['HTTP 503', () => new SourceHttpError(503)],
+    ['Cloudflare 522', () => new SourceHttpError(522)],
+    ['限速器熔断', () => Object.assign(new Error('源 book15.net 熔断中'), { name: 'CircuitOpenError' })],
+    ['限速器每源日请求上限', () => Object.assign(new Error('源 book15.net 当日请求预算触顶（20000）'), { name: 'DailyRequestBudgetError' })],
+  ];
+  // 第 n 次请求详情页 URL：builtin/引擎两腿的详情与目录都取同一页（1=详情，2=目录，3=收尾复核目录）。
+  const failAt = (f: ReturnType<typeof setup>, stage: 'search' | 'detail' | 'toc' | 'recheck', error: () => unknown) => {
+    let bookReads = 0;
+    return async (url: string, opts: Parameters<typeof f.transport>[1]) => {
+      if (url === BOOK) bookReads += 1;
+      const hit = stage === 'search' ? url.includes('/search')
+        : url === BOOK && bookReads === { detail: 1, toc: 2, recheck: 3 }[stage];
+      if (hit) throw error();
+      return f.transport(url, opts);
+    };
+  };
+
+  it.each(unavailable.flatMap(([name, error]) => [-1, 0].map(style => [name, style, error] as const)))(
+    '搜索阶段 %s（style %s）⇒ code=2、source_unavailable、零章', async (_name, style, error) => {
+      const f = setup(style);
+      const result = await f.run(failAt(f, 'search', error));
+      expect(result.code).toBe(2);
+      expect(result.manifest.errors).toEqual(['source_unavailable']);
+      expect(stageOf(result)).toBe('search');
+      expect(result.manifest.status).toBe('partial');
+      expect(result.manifest.chapters).toHaveLength(0);
+    });
+
+  it.each((['detail', 'toc', 'recheck'] as const).flatMap(stage => [
+    [stage, 'ConnectTimeoutError', () => new DOMException('书源连接超时', 'ConnectTimeoutError')],
+    [stage, 'Cloudflare 522', () => new SourceHttpError(522)],
+    [stage, 'fetch failed', () => new TypeError('fetch failed')],
+  ] as const))('%s 阶段 %s ⇒ code=2、source_unavailable', async (stage, _name, error) => {
+    const f = setup(-1);
+    const result = await f.run(failAt(f, stage, error));
+    expect(result.code).toBe(2);
+    expect(result.manifest.errors).toEqual(['source_unavailable']);
+    expect(stageOf(result)).toBe(stage === 'recheck' ? 'toc' : stage);
+    expect(result.manifest.status).toBe('partial');
+  });
+
+  it.each([
+    ['HTTP 404', () => new SourceHttpError(404)],
+    ['HTTP 403', () => new SourceHttpError(403)],
+    ['HTTP 429', () => new SourceHttpError(429)],
+    ['策略拒绝', () => new SourcePolicyError('书源跳转次数超限')],
+    ['未归类异常', () => new Error('boom')],
+    ['非传输 TypeError', () => new TypeError('The encoded data was not valid for encoding utf-8')],
+  ])('搜索阶段 %s ⇒ 维持 download_failed（code=1）', async (_name, error) => {
+    const f = setup(-1);
+    const result = await f.run(failAt(f, 'search', error));
+    expect(result.code).toBe(1);
+    expect(result.manifest.errors).toEqual(['download_failed']);
+    expect(stageOf(result)).toBeUndefined();
+  });
+
+  it('身份不符维持 identity_mismatch_or_no_candidate（code=1）', async () => {
+    const f = setup(-1, 'identity');
+    const result = await f.run();
+    expect(result.code).toBe(1);
+    expect(result.manifest.errors).toEqual(['identity_mismatch_or_no_candidate']);
+  });
+
+  it('正文阶段的传输层失败不改判：逐章失败后仍是 missing_chapters（code=1）', async () => {
+    const f = setup(-1);
+    const result = await f.run(async (url, opts) => {
+      if (url.includes('/chapter/')) throw new DOMException('书源连接超时', 'ConnectTimeoutError');
+      return f.transport(url, opts);
+    });
+    expect(result.code).toBe(1);
+    expect(result.manifest.errors).toEqual(['missing_chapters']);
   });
 });
