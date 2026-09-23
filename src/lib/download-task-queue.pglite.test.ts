@@ -8,7 +8,7 @@ import {
   updateDownloadTaskProgress,
 } from './download-task-queue';
 import { loadPGlite, type PGliteLike } from './fixtures/pglite';
-import { createProductionSchemaAtAuthV6, upgradeToAuthV7 } from './fixtures/production-schema';
+import { createProductionSchemaAtAuthV6, seedV6MemberUser, upgradeToAuthV7 } from './fixtures/production-schema';
 import { createPGliteSql } from './fixtures/pglite-sql';
 import { reclaimStaleTasks } from './download-task-reclaim';
 
@@ -57,11 +57,7 @@ async function bootstrapV6(pg: PGliteLike): Promise<void> {
   await createProductionSchemaAtAuthV6(createPGliteSql(pg) as never, pg);
   // 生产 users 有 CHECK（owner 固定 id=1、非 owner 必须 hash+role=member）与权限位列。
   // 旧夹具只建 `users (id integer PRIMARY KEY)`，因此权限位可以随便填也不报错。
-  await pg.exec(`
-    INSERT INTO users (id, username, password_hash, role, can_find, can_read, can_download)
-    VALUES (2, 'member2', 'hash', 'member', true, false, false)
-    ON CONFLICT (id) DO NOTHING
-  `);
+  await seedV6MemberUser(pg);
 }
 
 const PGliteCtor = await loadPGlite();

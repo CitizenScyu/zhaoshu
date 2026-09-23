@@ -9,6 +9,8 @@ import {
   submitBackfillPlan,
 } from './backfill-plan';
 import { loadPGlite, type PGliteLike } from './fixtures/pglite';
+import { createProductionSchemaAtAuthV6, seedV6MemberUser } from './fixtures/production-schema';
+import { createPGliteSql } from './fixtures/pglite-sql';
 
 type SqlTag = (parts: TemplateStringsArray, ...values: unknown[]) => Promise<unknown>;
 
@@ -36,23 +38,14 @@ maybe('T5 历史补账:dry-run 与 apply 一致', () => {
   beforeEach(async () => {
     pg = new PGliteCtor!();
     sql = adapter(pg);
+    // 生产 schema 底座的 v6 形状：download_tasks 带 request_identity_check
+    // （(requested_by='user' AND user_id IS NOT NULL) OR (requested_by='system' AND
+    // user_id IS NULL)），labeled_books 带 0002 身份键。旧夹具手抄的 download_tasks
+    // 无任何 CHECK，于是「补账写出 requested_by='system' 且 user_id 非空」这类违反
+    // 真库约束的行为在测试里不红（2026-09-23 复核）。这里走生产入口，不再手抄。
+    await createProductionSchemaAtAuthV6(createPGliteSql(pg) as never, pg);
+    await seedV6MemberUser(pg);
     await pg.exec(`
-      CREATE TABLE labeled_books (
-        id serial PRIMARY KEY, title text NOT NULL, author text NOT NULL DEFAULT '',
-        source_url text NOT NULL DEFAULT ''
-      );
-      CREATE TABLE download_tasks (
-        id serial PRIMARY KEY, user_id integer, book_id integer NOT NULL,
-        title text NOT NULL, author text NOT NULL DEFAULT '', status text NOT NULL DEFAULT 'pending',
-        source_url text NOT NULL DEFAULT '', requested_by text NOT NULL DEFAULT 'user',
-        source_kind text NOT NULL DEFAULT 'builtin', source_id text,
-        source_revision text NOT NULL DEFAULT '', policy_version text NOT NULL DEFAULT '',
-        enqueue_key text
-      );
-      CREATE UNIQUE INDEX download_tasks_system_active_book_idx ON download_tasks (book_id)
-        WHERE requested_by = 'system' AND status IN ('pending', 'running');
-      CREATE UNIQUE INDEX download_tasks_system_event_idx ON download_tasks (enqueue_key)
-        WHERE requested_by = 'system' AND enqueue_key IS NOT NULL;
       INSERT INTO labeled_books (title, author) VALUES
         ('新书一', '作者甲'), ('新书二', '作者乙'), ('已有任务', '作者丙'), ('已有用户任务', '作者丁');
       -- 已有系统任务的书(事件键命中)→ 不该进补账清单
@@ -60,10 +53,10 @@ maybe('T5 历史补账:dry-run 与 apply 一致', () => {
         VALUES (NULL, 3, '已有任务', 'done', 'system', '3:t5-backfill-v1:', 't5-backfill-v1');
       -- 该书同时还有 user 任务(用户自己的下载请求,不影响补账判断)
       INSERT INTO download_tasks (user_id, book_id, title, status, requested_by)
-        VALUES (1, 3, '已有任务', 'done', 'user');
+        VALUES (2, 3, '已有任务', 'done', 'user');
       -- 只有 user 任务的书仍然要补账(user 任务不是系统产物)
       INSERT INTO download_tasks (user_id, book_id, title, status, requested_by)
-        VALUES (1, 4, '已有用户任务', 'pending', 'user');
+        VALUES (2, 4, '已有用户任务', 'pending', 'user');
     `);
   }, 60_000);
 
@@ -162,5 +155,25 @@ maybe('T5 历史补账:dry-run 与 apply 一致', () => {
       .toEqual([{ book_id: 1 }, { book_id: 2 }, { book_id: 3 }]);
     const replay = await submitBackfillPlan(sql, plan.requested);
     expect(replay.inserted).toBe(0);
+  });
+
+  // C5：旧夹具手抄的 download_tasks 无任何 CHECK，本用例在旧夹具下是**红的**
+  // （那条 INSERT 会成功，rejects 断言失败）。换成生产入口后身份 CHECK 生效，
+  // 这正是「补账写出 requested_by='system' 且 user_id 非空」这类违反真库约束的
+  // 行为开始在测试里变红的地方。
+  it('夹具带真库身份 CHECK：system 任务配非空 user_id 被拒（旧手抄夹具里这行能写进去）', async () => {
+    await expect(pg.query(
+      `INSERT INTO download_tasks (user_id, book_id, title, status, requested_by)
+       VALUES (2, 99, '坏系统任务', 'pending', 'system')`,
+    )).rejects.toMatchObject({ code: '23514' });
+    await expect(pg.query(
+      `INSERT INTO download_tasks (user_id, book_id, title, status, requested_by)
+       VALUES (NULL, 98, '坏用户任务', 'pending', 'user')`,
+    )).rejects.toMatchObject({ code: '23514' });
+    // 对照组：符合身份不变量的行照常写入，说明被拒是 CHECK 的功劳而非别的原因。
+    await expect(pg.query(
+      `INSERT INTO download_tasks (user_id, book_id, title, status, requested_by)
+       VALUES (2, 97, '正常用户任务', 'pending', 'user')`,
+    )).resolves.toBeTruthy();
   });
 });
