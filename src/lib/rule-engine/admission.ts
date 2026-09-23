@@ -46,10 +46,38 @@ export function admissionMaxProbes(env: AdmissionProbesEnv = process.env): numbe
   const parsed = Number.parseInt(env.ADMISSION_MAX_PROBES ?? '', 10);
   return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : DEFAULT_ADMISSION_MAX_PROBES;
 }
-/** env 形状（宽松：process.env 与测试注入对象都可直接代入）。 */
+/** env 形状(宽松:process.env 与测试注入对象都可直接代入)。 */
 interface AdmissionProbesEnv {
   ADMISSION_MAX_PROBES?: string | undefined;
+  ADMISSION_PROBE_CONCURRENCY?: string | undefined;
   [key: string]: string | undefined;
+}
+/**
+ * 探测并发度**默认值**:1 = 与历史逐源串行行为逐行一致(零行为变更)。
+ * 实际生效值走 `admissionProbeConcurrency()`——env `ADMISSION_PROBE_CONCURRENCY` 可覆盖
+ * (非法/≤0/缺失回退本默认,再夹上限)。
+ *
+ * 吞吐算式(41-ADMIT-CONC):单源最坏墙钟 ≈ 8.4s(8s 超时 + 350ms 节流)。并发 c 时
+ * 最坏墙钟 ≈ ceil(名额/c) × 8.4s。c=4、名额 20 ⇒ ceil(20/4)=5 × 8.4s ≈ 42s,远小于
+ * 串行 20×8.4≈168s 的包络;因此开到 c=4 后名额可经 env `ADMISSION_MAX_PROBES` 提到约 60
+ * (ceil(60/4)=15 × 8.4 ≈ 126s,仍落在今天 168s 的包络内)。**默认名额 20 不变**——并发
+ * 与名额是两个独立旋钮,本改造只引入并发、默认不放大名额。
+ */
+export const DEFAULT_ADMISSION_PROBE_CONCURRENCY = 1;
+/**
+ * 并发度硬上限:8。上游是小说站,同站并发易被 429/封;且同 host 互斥(见 runAdmissionBatch)
+ * 已把同站并发压到 1,跨站 8 路已足够吃掉「名额/并发」的墙钟。夹上限防 env 误配(c=100)
+ * 把探测风暴打向上游。
+ */
+export const MAX_ADMISSION_PROBE_CONCURRENCY = 8;
+/**
+ * 探测并发度:env `ADMISSION_PROBE_CONCURRENCY` 生效;非法/≤0/缺失回退默认(=1,串行),
+ * 合法值再夹上限 8。解析口径与 `admissionMaxProbes()` 完全同款(parseInt + SafeInteger + >0)。
+ */
+export function admissionProbeConcurrency(env: AdmissionProbesEnv = process.env): number {
+  const parsed = Number.parseInt(env.ADMISSION_PROBE_CONCURRENCY ?? '', 10);
+  if (!Number.isSafeInteger(parsed) || parsed <= 0) return DEFAULT_ADMISSION_PROBE_CONCURRENCY;
+  return Math.min(parsed, MAX_ADMISSION_PROBE_CONCURRENCY);
 }
 /**
  * deferred 态重测间隔（设计 §4.2：软故障/url_invalid 定期重测）。
@@ -480,6 +508,11 @@ export interface AdmissionBatchInput {
   sleep?: (ms: number, signal: AbortSignal) => Promise<void>;
   /** 每次网络探测前的预算判定；返回 false 即停止继续探测（已写的本地结论不受影响）。 */
   canProbe?: () => boolean;
+  /**
+   * 探测并发度覆盖(测试注入用);缺省走 `admissionProbeConcurrency()`(env 或默认 1=串行)。
+   * 归一后夹在 [1, MAX_ADMISSION_PROBE_CONCURRENCY]。
+   */
+  probeConcurrency?: number;
 }
 
 export interface AdmissionBatchResult {
@@ -614,18 +647,35 @@ function planProbeOrder(input: AdmissionBatchInput, nowMs: number): AdmissionPla
 }
 
 /**
- * 跑一轮准入批次（设计 §4.2）。纯逻辑：不碰 DB，输入既有行、输出要写库的行。
- * 状态机：new → compile_rejected（终态，规则不变不复测）｜new → deferred → (ok|rejected)｜ok
- * ｜conn_fail（rejected，7 天衰减后回 class 1 复测，41-B1-RETRY）。
- * 每轮真实搜索 ≤ maxProbes（默认走 `admissionMaxProbes()`，env 可调），按 planProbeOrder 的公平序分配名额（N04）；
+ * 并发度归一:注入值(测试)或 env 值 → [1, MAX] 整数。非有限值回退默认(=1,串行)。
+ */
+function normalizeAdmissionConcurrency(value: number): number {
+  if (!Number.isFinite(value)) return DEFAULT_ADMISSION_PROBE_CONCURRENCY;
+  return Math.max(1, Math.min(Math.trunc(value), MAX_ADMISSION_PROBE_CONCURRENCY));
+}
+
+/**
+ * 跑一轮准入批次(设计 §4.2)。纯逻辑:不碰 DB,输入既有行、输出要写库的行。
+ * 状态机:new → compile_rejected(终态,规则不变不复测)|new → deferred → (ok|rejected)|ok
+ * |conn_fail(rejected,7 天衰减后回 class 1 复测,41-B1-RETRY)。
+ * 每轮真实搜索 ≤ maxProbes(默认走 `admissionMaxProbes()`,env 可调),按 planProbeOrder 的公平序分配名额(N04);
  * canProbe 为 false 时停止探测但仍写出可离线得到的结论。
- * N03 祖父条款：新必需组校验收紧时，既有「规则未变 ∧ compile_ok ∧ search_ok=true」的行
- * 不改判 compile 拒（W1 现网池红线），规则一变即按新校验重审。
+ * N03 祖父条款:新必需组校验收紧时,既有「规则未变 ∧ compile_ok ∧ search_ok=true」的行
+ * 不改判 compile 拒(W1 现网池红线),规则一变即按新校验重审。
+ *
+ * 41-ADMIT-CONC(受限并发):探测段改为 worker 池(`probeConcurrency`,默认 1=串行)。
+ * 三条不变式钉死与串行版逐行一致:
+ *   (a) 名额与 canProbe 在**任何 await 之前同步领取**——名额按 planProbeOrder 计划序在本地
+ *       循环里扣减,所以「哪些候选被探」与串行版逐元素相同(不许超发);
+ *   (b) 同一 host 同时最多 1 个探测在飞(上游是小说站,同站并发易被 429/封);
+ *   (c) 结果先按计划序落进 `results[index]` 槽、汇总后再按计划顺序输出——不按完成先后,
+ *       保证同输入同输出、写库与测试可复现。
+ * c=1 时 worker 池退化为严格串行,输出与改造前逐行一致(零行为变更)。
  */
 export async function runAdmissionBatch(input: AdmissionBatchInput): Promise<AdmissionBatchResult> {
   const now = input.now ?? (() => new Date());
-  // 每批判定一次语义版本：同一批所有行的版本列必须彼此一致，且与各自 rules_hash 前缀同源
-  // （rulesHash 内部同款默认读 ENGINE_SYNTAX_OR）。
+  // 每批判定一次语义版本:同一批所有行的版本列必须彼此一致,且与各自 rules_hash 前缀同源
+  // (rulesHash 内部同款默认读 ENGINE_SYNTAX_OR)。
   const semanticsVersion = admissionSemanticsVersion();
   const rows: AdmissionSourceRow[] = [];
   const verdicts: Record<string, number> = {};
@@ -635,69 +685,119 @@ export async function runAdmissionBatch(input: AdmissionBatchInput): Promise<Adm
   let probed = 0;
   let probeSlots = Math.max(0, input.maxProbes ?? admissionMaxProbes());
   const canProbe = input.canProbe ?? (() => true);
+  const concurrency = normalizeAdmissionConcurrency(input.probeConcurrency ?? admissionProbeConcurrency());
 
-  for (const { candidate, previous, hash, probeClass } of planProbeOrder(input, now().getTime())) {
+  const plan = planProbeOrder(input, now().getTime());
+  // 结果槽:与计划同序(undefined = 本条第无行输出)。汇总后按计划顺序产出 rows。
+  const results: (AdmissionSourceRow | undefined)[] = new Array(plan.length);
+  // 本轮真探清单(名额已在此同步领取完毕)。index 指回计划序,用于结果归位。
+  const probes: { index: number; candidate: AdmissionCandidate; host: string; compile: AdmissionCompile; hash: string }[] = [];
+
+  for (let index = 0; index < plan.length; index += 1) {
+    const { candidate, previous, hash, probeClass } = plan[index];
     const host = hostOf(candidate.url);
     const compile = compileAdmission(candidate.source);
-    // N03 祖父条款：新校验下会拒、但规则未变且已在池（compile_ok ∧ search_ok=true）→ 维持既有资格。
+    // N03 祖父条款:新校验下会拒、但规则未变且已在池(compile_ok ∧ search_ok=true)→ 维持既有资格。
     const exempt = !compile.ok && isGrandfatheredAdmitted(previous, hash);
 
     if (!compile.ok && !exempt) {
       compileRejected += 1;
-      // 规则未变且上一轮已是 compile 拒 → 终态不重写（§4.2）。
-      // 准入兼容 §2.3 陷阱：这条终态去抖只在「仍然 compile 拒」时生效；引擎默认值救回的源
-      // 走 compile.ok===true 分支，既有行 search_ok===null ⇒ planProbeOrder 判 probeClass=0
-      // （未测优先）⇒ 下一轮即被探测并改写为 compile_ok=true。恢复回路全自动——
-      // **不需要数据迁移，不需要人工 SQL，也不需要清旧终态行**。同理，严禁把候选池
-      // （shuyuan.ts runAdmissionAfterRefresh 的 selectCandidates 过滤）改成「只喂
-      // compile_ok 的源」：那会让 compile 拒的源出评估环、上游补字段后永远回不了池
-      // （反例 15-17 钉死该回路）。
+      // 规则未变且上一轮已是 compile 拒 → 终态不重写(§4.2)。
+      // 准入兼容 §2.3 陷阱:这条终态去抖只在「仍然 compile 拒」时生效;引擎默认值救回的源
+      // 走 compile.ok===true 分支,既有行 search_ok===null ⇒ planProbeOrder 判 probeClass=0
+      // (未测优先)⇒ 下一轮即被探测并改写为 compile_ok=true。恢复回路全自动——
+      // **不需要数据迁移,不需要人工 SQL,也不需要清旧终态行**。同理,严禁把候选池
+      // (shuyuan.ts runAdmissionAfterRefresh 的 selectCandidates 过滤)改成「只喂
+      // compile_ok 的源」:那会让 compile 拒的源出评估环、上游补字段后永远回不了池
+      // (反例 15-17 钉死该回路)。
       if (previous && previous.rules_hash === hash && previous.compile_ok === false) continue;
-      rows.push({
+      results[index] = {
         source_url: candidate.url, tier: 'T7', compile_ok: false, core_field_mask: compile.coreFieldMask,
         search_ok: null, search_verdict: '', search_checked_at: null, rules_hash: hash,
         engine_semantics_version: semanticsVersion, host, error: compile.reason,
         compile_diagnostics: compileDiagnostics(compile),
-      });
+      };
       continue;
     }
     compileOk += 1;
     if (exempt) grandfathered += 1;
 
     const rulesChanged = !previous || previous.rules_hash !== hash;
-    const needsProbe = probeClass <= 1; // 未测 / 规则变 / 复测到期（planProbeOrder 同口径）
-    if (!needsProbe) continue; // 结论仍有效，不重写
+    if (probeClass > 1) continue; // 结论仍有效,不重写(needsProbe=false)
 
+    // 名额与 canProbe 在 await 之前同步领取:名额按计划序扣减,故「被探集合」与串行版逐元素相同。
     if (probeSlots > 0 && canProbe() && !input.signal.aborted) {
       probeSlots -= 1;
       probed += 1;
-      const result = await searchAdmission(candidate.source, {
-        fetchPage: input.fetchPage, declaredHosts: input.declaredHosts, signal: input.signal,
-        throttleMs: input.throttleMs, sleep: input.sleep,
-      });
-      verdicts[result.verdict] = (verdicts[result.verdict] ?? 0) + 1;
-      rows.push({
-        source_url: candidate.url, tier: 'M1', compile_ok: true, core_field_mask: compile.coreFieldMask,
-        search_ok: result.verdict === 'ok', search_verdict: result.verdict,
-        search_checked_at: now().toISOString(), rules_hash: hash,
-        engine_semantics_version: semanticsVersion, host,
-        error: result.error, compile_diagnostics: [],
-      });
+      probes.push({ index, candidate, host, compile, hash });
       continue;
     }
-    // 本轮没轮到/预算不足：仅在「规则变过或库中无行」时写一条未测行占位，下一轮接着测。
-    // 例外（防出池）：既有行已实证可搜（search_ok=true ∧ compile_ok=true）时不写占位——
-    // 占位行经 ON CONFLICT DO UPDATE 会把 search_ok=true 覆盖成 null，入池谓词
-    // `search_ok IS TRUE` 即失配、源被打出池（2026-09-21 实证 234.484448.xyz 隔天出池）。
-    // 保留旧行原样（rules_hash 不更新），下一轮 rulesChanged 仍成立、仍优先排队真探，
-    // 复测拿到名额后正常改写——不放松任何判据，只是没轮到时不清掉旧结论。
+    // 本轮没轮到/预算不足:仅在「规则变过或库中无行」时写一条未测行占位,下一轮接着测。
+    // 例外(防出池):既有行已实证可搜(search_ok=true ∧ compile_ok=true)时不写占位——
+    // 占位行经 ON CONFLICT DO UPDATE 会把 search_ok=true 覆盖成 null,入池谓词
+    // `search_ok IS TRUE` 即失配、源被打出池(2026-09-21 实证 234.484448.xyz 隔天出池)。
+    // 保留旧行原样(rules_hash 不更新),下一轮 rulesChanged 仍成立、仍优先排队真探,
+    // 复测拿到名额后正常改写——不放松任何判据,只是没轮到时不清掉旧结论。
     if (rulesChanged && !(previous?.search_ok === true && previous.compile_ok === true)) {
-      rows.push({
+      results[index] = {
         source_url: candidate.url, tier: 'M1', compile_ok: true, core_field_mask: compile.coreFieldMask,
         search_ok: null, search_verdict: '', search_checked_at: null, rules_hash: hash,
         engine_semantics_version: semanticsVersion, host, error: '', compile_diagnostics: [],
-      });
+      };
     }
   }
+
+  // ---- 受限并发 worker 池 ------------------------------------------------------
+  // inflightHosts:当前在飞的 host(同 host 互斥);claimed:已开跑的探测位。
+  const inflightHosts = new Set<string>();
+  const claimed = new Array<boolean>(probes.length).fill(false);
+  let remaining = probes.length;
+  // 被 host 挡住的 worker 在此等待「任一探测完成」再重扫(全部被挡才等,否则跳过继续找)。
+  const waiters: (() => void)[] = [];
+  const waitForRelease = () => new Promise<void>((resolve) => { waiters.push(resolve); });
+  const releaseWaiters = () => { for (const resolve of waiters.splice(0)) resolve(); };
+
+  async function probeWorker(): Promise<void> {
+    while (true) {
+      // 取下一个 host 不在飞的未领探测(跳过 host 在飞的候选)。
+      let pick = -1;
+      for (let j = 0; j < probes.length; j += 1) {
+        if (claimed[j]) continue;
+        if (inflightHosts.has(probes[j].host)) continue;
+        pick = j;
+        break;
+      }
+      if (pick === -1) {
+        if (remaining === 0) return; // 全部领完/跑完
+        await waitForRelease(); // 剩余全被在飞 host 挡住:等一个完成再重扫
+        continue;
+      }
+      claimed[pick] = true;
+      remaining -= 1;
+      const item = probes[pick];
+      inflightHosts.add(item.host);
+      try {
+        const result = await searchAdmission(item.candidate.source, {
+          fetchPage: input.fetchPage, declaredHosts: input.declaredHosts, signal: input.signal,
+          throttleMs: input.throttleMs, sleep: input.sleep,
+        });
+        verdicts[result.verdict] = (verdicts[result.verdict] ?? 0) + 1;
+        results[item.index] = {
+          source_url: item.candidate.url, tier: 'M1', compile_ok: true, core_field_mask: item.compile.coreFieldMask,
+          search_ok: result.verdict === 'ok', search_verdict: result.verdict,
+          search_checked_at: now().toISOString(), rules_hash: item.hash,
+          engine_semantics_version: semanticsVersion, host: item.host,
+          error: result.error, compile_diagnostics: [],
+        };
+      } finally {
+        inflightHosts.delete(item.host);
+        releaseWaiters();
+      }
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(concurrency, probes.length) }, () => probeWorker()));
+
+  // 汇总:按计划顺序输出(先落槽后汇总 ⇒ 与完成先后无关;undefined 槽即本批无行)。
+  for (const row of results) if (row !== undefined) rows.push(row);
   return { rows, compileOk, compileRejected, probed, verdicts, grandfathered };
 }

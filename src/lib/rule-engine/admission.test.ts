@@ -3,7 +3,8 @@ import { createHash } from 'node:crypto';
 import corpus from './fixtures/admission-174.json';
 import {
   ADMISSION_CONN_FAIL_RETEST_MS, ADMISSION_RETEST_INTERVAL_MS, DEFAULT_ADMISSION_MAX_PROBES,
-  admissionBucket, admissionMaxProbes, compileAdmission,
+  DEFAULT_ADMISSION_PROBE_CONCURRENCY, MAX_ADMISSION_PROBE_CONCURRENCY,
+  admissionBucket, admissionMaxProbes, admissionProbeConcurrency, compileAdmission,
   runAdmissionBatch, searchAdmission, rulesHash, type AdmissionSourceRow, type AdmissionTransport,
 } from './admission';
 import { ENGINE_SEMANTICS_VERSION, engineVersionedKey } from './compile';
@@ -1268,5 +1269,194 @@ describe('落库元数据自洽：engine_semantics_version 与 rulesHash 前缀�
     expect(row.engine_semantics_version).toBe(2);
     expect(row.rules_hash.startsWith('2:')).toBe(true);
     expect(row.engine_semantics_version).toBe(hashVersion(row.rules_hash));
+  });
+});
+// 41-ADMIT-CONC:准入探测受限并发(env ADMISSION_PROBE_CONCURRENCY,默认 1=串行)。
+// 判据三条:(a) 名额/canProbe 在 await 前同步领取(不超发);(b) 同 host 不并发;
+// (c) 输出按计划顺序(与完成先后无关)。c=1 时必须与串行版逐行一致(零行为变更)。
+describe('41-ADMIT-CONC:准入探测受限并发', () => {
+  afterEach(() => { vi.unstubAllEnvs(); vi.useRealTimers(); });
+
+  // fake transport 工厂:按 host 记录调用序/在飞峰值;可给每 host 配结果与延迟。
+  type FetchImpl = (url: string) => Promise<Response>;
+  function tracker(fetchImpl?: FetchImpl) {
+    let inflight = 0;
+    let maxInflight = 0;
+    const byHostInflight = new Map<string, number>();
+    const hostPeak = new Map<string, number>();
+    const calls: string[] = [];
+    const impl = async (input: string): Promise<Response> => {
+      const host = new URL(input).hostname;
+      calls.push(host);
+      inflight += 1;
+      maxInflight = Math.max(maxInflight, inflight);
+      const h = (byHostInflight.get(host) ?? 0) + 1;
+      byHostInflight.set(host, h);
+      hostPeak.set(host, Math.max(hostPeak.get(host) ?? 0, h));
+      await Promise.resolve(); // 让出,确保并发请求真正交叠
+      try {
+        if (fetchImpl) return await fetchImpl(input);
+        return page('<html>no results</html>');
+      } finally {
+        inflight -= 1;
+        byHostInflight.set(host, (byHostInflight.get(host) ?? 1) - 1);
+      }
+    };
+    return {
+      fetchPage: vi.fn<AdmissionTransport>(impl),
+      get maxInflight() { return maxInflight; },
+      get hostPeak() { return hostPeak; },
+      get calls() { return calls; },
+    };
+  }
+
+  const candidatesFor = (hosts: string[]) => hosts.map((host) => ({
+    url: `https://${host}`, source: syntheticSource(`https://${host}/`),
+  }));
+
+  it('并发 c 时同时在飞 ≤ c(fake transport 记录在飞峰值)', async () => {
+    const hosts = ['c0.example.com', 'c1.example.com', 'c2.example.com', 'c3.example.com', 'c4.example.com'];
+    const t = tracker();
+    const result = await runAdmissionBatch({
+      candidates: candidatesFor(hosts),
+      declaredHosts: new Set(hosts), existing: new Map(),
+      fetchPage: t.fetchPage, signal: signal(), throttleMs: 0, maxProbes: 5, probeConcurrency: 2,
+    });
+    expect(result.probed).toBe(5);
+    expect(t.fetchPage).toHaveBeenCalledTimes(5);
+    expect(t.maxInflight).toBeLessThanOrEqual(2);
+    expect(t.maxInflight).toBeGreaterThanOrEqual(2); // 确实并行了(不是退化成串行)
+  });
+
+  it('名额永不超发:名额 5、c=4、10 个候选 ⇒ 恰好 5 次探测', async () => {
+    const hosts = Array.from({ length: 10 }, (_, i) => `n${i}.example.com`);
+    const t = tracker();
+    const result = await runAdmissionBatch({
+      candidates: candidatesFor(hosts),
+      declaredHosts: new Set(hosts), existing: new Map(),
+      fetchPage: t.fetchPage, signal: signal(), throttleMs: 0, maxProbes: 5, probeConcurrency: 4,
+    });
+    expect(result.probed).toBe(5);
+    expect(t.fetchPage).toHaveBeenCalledTimes(5);
+    // 被探的是计划序里最前的 5 个(未测 class 0,输入序)。
+    expect(t.calls).toEqual(['n0.example.com', 'n1.example.com', 'n2.example.com', 'n3.example.com', 'n4.example.com']);
+  });
+
+  it('同 host 不并发:同一 host 两个候选不会同时在飞', async () => {
+    // 两个候选同一 host(不同 url 路径),外加两个别的 host 提供并发度。
+    const dup = [
+      { url: 'https://dup.example.com/a', source: syntheticSource('https://dup.example.com/a') },
+      { url: 'https://dup.example.com/b', source: syntheticSource('https://dup.example.com/b') },
+      { url: 'https://x.example.com', source: syntheticSource('https://x.example.com/') },
+      { url: 'https://y.example.com', source: syntheticSource('https://y.example.com/') },
+    ];
+    const t = tracker();
+    await runAdmissionBatch({
+      candidates: dup,
+      declaredHosts: new Set(['dup.example.com', 'x.example.com', 'y.example.com']),
+      existing: new Map(), fetchPage: t.fetchPage, signal: signal(), throttleMs: 0, maxProbes: 4, probeConcurrency: 4,
+    });
+    expect(t.fetchPage).toHaveBeenCalledTimes(4);
+    expect(t.hostPeak.get('dup.example.com')).toBe(1); // 同 host 峰值 1 = 从不并发
+  });
+
+  it('canProbe 中途转 false ⇒ 不再启动新探测,在飞的完成并写行', async () => {
+    // 名额 ≥ 候选数;canProbe 在第 1 条领取名额后转 false ⇒ 只有第 1 条被启动。
+    // (名额/ canProbe 都在 await 之前同步判定:第 1 条领到名额后,后续候选判 canProbe()=false
+    // 即不再领取、不再启动探测——与串行版「转 false 后不再探测」逐行一致。)
+    const hosts = ['p0.example.com', 'p1.example.com', 'p2.example.com'];
+    let canProbeCalls = 0;
+    const t = tracker();
+    const result = await runAdmissionBatch({
+      candidates: candidatesFor(hosts),
+      declaredHosts: new Set(hosts), existing: new Map(),
+      fetchPage: t.fetchPage, signal: signal(), throttleMs: 0, maxProbes: 5, probeConcurrency: 2,
+      canProbe: () => (canProbeCalls += 1) === 1, // 仅第一条候选领取时判 true,之后转 false
+    });
+    expect(result.probed).toBe(1); // 名额只领了 1 个(领名额与 canProbe 同步)
+    expect(t.fetchPage).toHaveBeenCalledTimes(1); // 只启动 1 个探测
+    // 在飞的完成并写行:该行 search_verdict=no_result。
+    expect(result.rows.filter((r) => r.search_verdict === 'no_result')).toHaveLength(1);
+    // 其余两条走「没轮到」路径:新源 rulesChanged ⇒ 写未测占位。
+    expect(result.rows.filter((r) => r.compile_ok && r.search_ok === null)).toHaveLength(2);
+  });
+
+  it('结果行顺序 = 计划顺序(不同延迟使完成顺序与计划顺序相反)', async () => {
+    const hosts = ['o0.example.com', 'o1.example.com', 'o2.example.com'];
+    // o0 最慢、o2 最快 ⇒ 完成顺序 o2,o1,o0,与计划顺序相反。
+    const delays: Record<string, number> = { 'o0.example.com': 30, 'o1.example.com': 15, 'o2.example.com': 0 };
+    const t = tracker(async (input) => {
+      const host = new URL(input).hostname;
+      await new Promise((resolve) => setTimeout(resolve, delays[host]));
+      return page('<html>no results</html>');
+    });
+    const result = await runAdmissionBatch({
+      candidates: candidatesFor(hosts),
+      declaredHosts: new Set(hosts), existing: new Map(),
+      fetchPage: t.fetchPage, signal: signal(), throttleMs: 0, maxProbes: 3, probeConcurrency: 3,
+    });
+    // 启动顺序=计划序(证明排序不是「碰巧对」——完成顺序另由延迟决定)。
+    expect(t.calls).toEqual(['o0.example.com', 'o1.example.com', 'o2.example.com']);
+    expect(result.rows.map((r) => r.source_url)).toEqual([
+      'https://o0.example.com', 'https://o1.example.com', 'https://o2.example.com',
+    ]);
+  });
+
+  it('c=1 与并发版输出逐行相等(固定输入快照,delay 相反也不影响)', async () => {
+    const hosts = ['q0.example.com', 'q1.example.com', 'q2.example.com'];
+    const fixedNow = () => new Date('2026-09-23T00:00:00Z');
+    const delays: Record<string, number> = { 'q0.example.com': 20, 'q1.example.com': 10, 'q2.example.com': 0 };
+    const mk = () => tracker(async (input) => {
+      const host = new URL(input).hostname;
+      await new Promise((resolve) => setTimeout(resolve, delays[host]));
+      return page('<html>no results</html>');
+    });
+    const t1 = mk();
+    const c1 = await runAdmissionBatch({
+      candidates: candidatesFor(hosts), declaredHosts: new Set(hosts), existing: new Map(),
+      fetchPage: t1.fetchPage, signal: signal(), throttleMs: 0, maxProbes: 3, probeConcurrency: 1, now: fixedNow,
+    });
+    expect(t1.maxInflight).toBe(1); // c=1 严格串行
+    const t4 = mk();
+    const c4 = await runAdmissionBatch({
+      candidates: candidatesFor(hosts), declaredHosts: new Set(hosts), existing: new Map(),
+      fetchPage: t4.fetchPage, signal: signal(), throttleMs: 0, maxProbes: 3, probeConcurrency: 4, now: fixedNow,
+    });
+    // 同输入同名额:并发版与串行版逐行相等(顺序按计划、时间戳用固定 now)。
+    expect(c4.rows).toEqual(c1.rows);
+    expect(c4.probed).toBe(c1.probed);
+    expect(c4.verdicts).toEqual(c1.verdicts);
+  });
+
+  describe('env ADMISSION_PROBE_CONCURRENCY 解析:缺失/非法/0/负数/超上限', () => {
+    it('默认值常量 = 1(串行=零行为变更)', () => {
+      expect(DEFAULT_ADMISSION_PROBE_CONCURRENCY).toBe(1);
+      expect(MAX_ADMISSION_PROBE_CONCURRENCY).toBe(8);
+      expect(admissionProbeConcurrency({})).toBe(1);
+      expect(admissionProbeConcurrency({ ADMISSION_PROBE_CONCURRENCY: '' })).toBe(1);
+      expect(admissionProbeConcurrency({ ADMISSION_PROBE_CONCURRENCY: 'abc' })).toBe(1);
+      expect(admissionProbeConcurrency({ ADMISSION_PROBE_CONCURRENCY: '0' })).toBe(1);
+      expect(admissionProbeConcurrency({ ADMISSION_PROBE_CONCURRENCY: '-3' })).toBe(1);
+    });
+
+    it('合法值生效;超上限夹到 8;3.5 截断为 3(同款 admissionMaxProbes 口径)', () => {
+      expect(admissionProbeConcurrency({ ADMISSION_PROBE_CONCURRENCY: '4' })).toBe(4);
+      expect(admissionProbeConcurrency({ ADMISSION_PROBE_CONCURRENCY: '8' })).toBe(8);
+      expect(admissionProbeConcurrency({ ADMISSION_PROBE_CONCURRENCY: '100' })).toBe(8);
+      expect(admissionProbeConcurrency({ ADMISSION_PROBE_CONCURRENCY: '3.5' })).toBe(3);
+    });
+
+    it('env 覆盖穿透批次:ADMISSION_PROBE_CONCURRENCY=2(stubEnv)⇒ 在飞峰值 ≤2 且确实并行', async () => {
+      vi.stubEnv('ADMISSION_PROBE_CONCURRENCY', '2');
+      const hosts = ['z0.example.com', 'z1.example.com', 'z2.example.com', 'z3.example.com'];
+      const t = tracker();
+      const result = await runAdmissionBatch({
+        candidates: candidatesFor(hosts), declaredHosts: new Set(hosts), existing: new Map(),
+        fetchPage: t.fetchPage, signal: signal(), throttleMs: 0, maxProbes: 4,
+      });
+      expect(result.probed).toBe(4);
+      expect(t.maxInflight).toBeLessThanOrEqual(2);
+      expect(t.maxInflight).toBeGreaterThanOrEqual(2);
+    });
   });
 });
