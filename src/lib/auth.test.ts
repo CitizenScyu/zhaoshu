@@ -263,15 +263,39 @@ describe('account-mode owner-header failure budget', () => {
     }
   });
 
-  it('records wrong owner headers into the shared source and global buckets', async () => {
+  it('records a wrong owner header into the source bucket, and into the global bucket only when the source budget is exhausted', async () => {
     mocks.peekAuthRateLimit.mockResolvedValue({ attempts: 0, retryAfterSeconds: 0 });
     mocks.bumpAuthRateLimit.mockResolvedValue({ attempts: 1, retryAfterSeconds: 900 });
     const result = await verifyOwnerHeader(ownerRequest({ Authorization: 'Bearer wrong' }));
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.response.status).toBe(401);
-    expect(mocks.bumpAuthRateLimit).toHaveBeenCalledTimes(2);
-    const scopes = mocks.bumpAuthRateLimit.mock.calls.map((call) => call[1].scope);
-    expect(scopes).toEqual([OWNER_FAIL_SOURCE_RATE_LIMIT.scope, OWNER_FAIL_GLOBAL_RATE_LIMIT.scope]);
+    // 单来源桶未达上限时只 bump 单来源桶，全局桶不动——单个来源无法独力打满全局桶。
+    expect(mocks.bumpAuthRateLimit).toHaveBeenCalledTimes(1);
+    expect(mocks.bumpAuthRateLimit.mock.calls[0][1].scope).toBe(OWNER_FAIL_SOURCE_RATE_LIMIT.scope);
+  });
+
+  it('counts one global bump when the source budget is exhausted, not one per request', async () => {
+    const limit = OWNER_FAIL_SOURCE_RATE_LIMIT.limit;
+    mocks.peekAuthRateLimit.mockResolvedValue({ attempts: 0, retryAfterSeconds: 0 });
+    // 每次 bump 让单来源桶计数 +1，第 limit 次正好把单来源桶推到上限。
+    for (let i = 1; i <= limit; i++) {
+      mocks.bumpAuthRateLimit.mockResolvedValueOnce({ attempts: i, retryAfterSeconds: 900 });
+    }
+
+    for (let request = 0; request < limit; request++) {
+      const result = await verifyOwnerHeader(ownerRequest({ Authorization: 'Bearer wrong' }));
+      expect(result.ok).toBe(false);
+    }
+
+    const sourceBumps = mocks.bumpAuthRateLimit.mock.calls.filter(
+      (call) => call[1].scope === OWNER_FAIL_SOURCE_RATE_LIMIT.scope,
+    );
+    const globalBumps = mocks.bumpAuthRateLimit.mock.calls.filter(
+      (call) => call[1].scope === OWNER_FAIL_GLOBAL_RATE_LIMIT.scope,
+    );
+    expect(sourceBumps).toHaveLength(limit);
+    // 只有达到上限的那一次向全局桶贡献 1 次——单来源狂发无法把全局桶从 0 打到 100。
+    expect(globalBumps).toHaveLength(1);
   });
 
   it('fails closed when the rate limit store is unavailable', async () => {
