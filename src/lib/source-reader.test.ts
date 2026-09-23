@@ -1895,6 +1895,25 @@ describe('chapter failover M1.1 (41-M1.1)', () => {
     expect(failoverLines()).toEqual([]);
   });
 
+  it('PAGEFIX⑤: cuoceng 同型(每章一页，下一页即下一章)⇒ 第 N 章只取本章 1 页，不串章、不进换源(41-PAGEFIX)', async () => {
+    const source = engineAlt(8);
+    primeEngine(8);
+    // 目录三章;每章一页,.next 指向下一章(末章也指向一个不存在的第 4 章，谁请求它谁就撞 Unexpected source request)。
+    pages.set(engineToc(8), { text: [1, 2, 3].map((n) => `<li class="chapter"><a href="/e8/c/${n}.html">第${n}章</a></li>`).join('') });
+    for (const n of [1, 2, 3]) {
+      pages.set(`https://book15.net/e8/c/${n}.html`, { text: `<div class="content">第${n}章正文</div><a class="next" href="/e8/c/${n + 1}.html">下一章</a>` });
+    }
+    const catalog = await drive(service.resolveSourceBook(book, context(), { sources: [source] }));
+    catalogs.set(catalog.version, catalog);
+    mocks.sources.mockResolvedValue([source]);
+    requested = [];
+    const part = await drive(service.readSourceChapter(catalog.version, 1, context()));
+    expect(part).toMatchObject({ chapterIndex: 1, text: '第2章正文', servedFrom: source.name });
+    expect(requested.length).toBeLessThanOrEqual(3);
+    expect(requestedUrls()).toEqual(['https://book15.net/e8/c/2.html']);
+    expect(failoverLines()).toEqual([]);
+  });
+
   // ---- 热修任务书 H2–H8(H1 见 41-FAILOVER-M1 组「引擎候选正文两页」)----
 
   it('H2: 引擎候选目录两页(nextTocUrl,本章在第 2 页)⇒ 成功', async () => {

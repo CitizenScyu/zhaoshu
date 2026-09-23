@@ -132,7 +132,9 @@ export async function downloadBook(m, args, resolveSource, transport = fetchSour
           if (hash(cached) === prior.sha256 && cached.trim()) text = cached;
         }
         if (text === undefined) text = await operation(async ctx => {
-          if (!builtin) return (await m.api.engineFetchContent(engine, chapter.url, ctx, true)).text;
+          // 41-PAGEFIX:翻页遇下一章即停(legado BookContent 同款);末章回退第 0 章，与阅读端 nextChapterUrlOf 同口径。
+          const nextChapterUrl = manifest.chapters[chapter.index + 1]?.url ?? manifest.chapters[0]?.url;
+          if (!builtin) return (await m.api.engineFetchContent(engine, chapter.url, ctx, true, nextChapterUrl)).text;
           return m.parser.parseSourceChapterText((await ctx.page(chapter.url)).text, chapter.title);
         });
         if (!text.trim()) throw new Error('empty_content');
