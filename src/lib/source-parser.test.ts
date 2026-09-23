@@ -38,8 +38,18 @@ describe('supported source parser', () => {
     expect(parseSourceSearch(html, 'https://book15.net/books/search.html?kw=a', 'a书')).toEqual([bookUrl]);
   });
 
+  // MS-07/MS-16:坏锚点只跳过、不抛(基线会在第一个 javascript: 锚点上把整源打死),
+  // 跨站链接(不落在同站根内)也不算命中 —— 两道口径与 parseSourceDetailLinks 对齐。
+  it('skips unparsable anchors and cross-site links instead of throwing', () => {
+    const html = '<a href="javascript:void(0)">a书</a>'
+      + '<a href="https://baidu.com/books/details42.html">a书</a>'
+      + '<a href="/books/details42.html">a书</a>';
+    expect(parseSourceSearch(html, 'https://book15.net/books/search.html?kw=a', 'a书')).toEqual([bookUrl]);
+  });
+
   it('does not accept cross-domain search hits or directory links', () => {
-    expect(() => parseSourceSearch('<a href="https://evil.invalid/books/details42.html">书</a>', bookUrl, '书')).toThrow();
+    // MS-07/MS-16 后跨站锚点从「抛 SourcePolicyError」改为「跳过」:不再炸整源,只交白卷。
+    expect(parseSourceSearch('<a href="https://evil.invalid/books/details42.html">书</a>', bookUrl, '书')).toEqual([]);
     expect(() => parseSourceChapters('<dd><a href="https://evil.invalid/chapter/index42-1.html">第一章</a></dd>', bookUrl)).toThrow();
   });
 

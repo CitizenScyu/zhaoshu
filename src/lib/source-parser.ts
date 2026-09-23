@@ -271,8 +271,11 @@ export function parseSourceSearch(html: string, pageUrl: string, title: string):
   for (const match of html.matchAll(/<a\b([^>]*)>([\s\S]*?)<\/a>/gi)) {
     const href = attributes(match[1]).href;
     if (!href || normalizeSourceTitle(plainText(match[2])) !== normalizeSourceTitle(title)) continue;
-    const url = validateSourceUrl(href, pageUrl);
-    if (DETAIL_PATH.test(url.pathname)) urls.add(url.href);
+    // 与 parseSourceDetailLinks 同口径:单个解析不下来/跨站的锚点只跳过,不把整源打死。
+    let url: URL;
+    try { url = validateSourceUrl(href, pageUrl); } catch { continue; }
+    if (!sameSite(url, pageUrl) || !DETAIL_PATH.test(url.pathname)) continue;
+    urls.add(url.href);
   }
   return [...urls];
 }
