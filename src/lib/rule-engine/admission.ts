@@ -65,6 +65,20 @@ export const ADMISSION_RETEST_INTERVAL_MS = 20 * 3_600_000;
  * challenge/shell 是站点行为（非网络层），维持终态不衰减。
  */
 export const ADMISSION_CONN_FAIL_RETEST_MS = 7 * 24 * 3_600_000;
+/**
+ * ok 源长周期复核窗（41-B2-OK-RECHECK）：源一旦判 ok 即永久在池，站点改版/上反爬/关站后
+ * 系统仍认为它 search_ok=true，用户每次阅读都白等它一轮切片。ok 行 search_checked_at 距今
+ * ≥ 本窗（或时间戳缺失/非法）即到期复核。取 7d 与 conn_fail 衰减同窗：池内源每周最多吃
+ * 1 个名额，且 ok 复核排在 class 2（名额最后），名额紧时不抢未测与复测源。
+ */
+export const ADMISSION_OK_RECHECK_MS = 7 * 24 * 3_600_000;
+/**
+ * 可疑 ok 的 strike 标记前缀（41-B2-OK-RECHECK）：ok 复核首次失败**不直接出池**——
+ * error 写成 `recheck_fail:<本次真实 verdict>`，search_ok/verdict 保持 ok（源留池）。
+ * 不加列、不加 verdict 字面量：池谓词 `search_ok IS TRUE` 与漏斗口径都不看 error 内容。
+ * 可疑行按 ADMISSION_RETEST_INTERVAL_MS(20h) 到期走 class 1 再确认，再失败才写真实结论出池。
+ */
+export const ADMISSION_RECHECK_FAIL_PREFIX = 'recheck_fail:';
 /** 剩余预算低于此值即整批跳过，绝不挤占刷新预算（设计风险台账 #4）。 */
 export const ADMISSION_MIN_BUDGET_MS = 10_000;
 
@@ -568,19 +582,30 @@ function isRetestDue(row: AdmissionSourceRow, nowMs: number): boolean {
     const checked = Date.parse(row.search_checked_at);
     return !Number.isFinite(checked) || nowMs - checked >= ADMISSION_CONN_FAIL_RETEST_MS;
   }
+  // 41-B2-OK-RECHECK：ok 源不再永久免检。可疑行（error 带 recheck_fail: 前缀）按 20h 窗
+  // 到期（class 1，在池里的可疑源最该早点确认）；干净 ok 行按 7 天长周期复核到期（class 2）。
+  if (row.search_verdict === 'ok') {
+    if (!row.search_checked_at) return true;
+    const checked = Date.parse(row.search_checked_at);
+    const window = row.error.startsWith(ADMISSION_RECHECK_FAIL_PREFIX)
+      ? ADMISSION_RETEST_INTERVAL_MS : ADMISSION_OK_RECHECK_MS;
+    return !Number.isFinite(checked) || nowMs - checked >= window;
+  }
   return false;
 }
 
 /**
  * N04 公平调度：探测优先序（小者先）。**未测过的源优先**（class 0），其次复测到期者
  * 按 search_checked_at **最旧优先**（class 1，天然轮转——上轮刚测过的时间戳最新、排最后），
- * 结论仍有效者不占探测名额（class 2）。同 class 内保持输入序（稳定排序，可复算）。
+ * 结论仍有效者不占探测名额（class 3）。同 class 内保持输入序（稳定排序，可复算）。
  * 反例背景：旧版按输入顺序最多探 5 个，前 5 个持续 http_5xx 的源每轮吃满全部名额，
  * 第 6 个源永远 search_ok=null（饿死）。
  * 41-B1-RETRY 注：conn_fail 衰减到期的行也走 class 1（复测到期），与 deferred 同档——
  * 它们共享同一个公平轮转，不抢未测源（class 0）的队。
+ * 41-B2-OK-RECHECK 注：ok 长周期复核到期走 class 2（名额最后，名额紧时不抢队、名额宽时
+ * 自动巡检）；可疑 ok（error 带 recheck_fail: 前缀）走 class 1（在池里的可疑源最该早点确认）。
  */
-type ProbeClass = 0 | 1 | 2;
+type ProbeClass = 0 | 1 | 2 | 3;
 
 interface AdmissionPlanEntry {
   candidate: AdmissionCandidate;
@@ -598,9 +623,15 @@ function planProbeOrder(input: AdmissionBatchInput, nowMs: number): AdmissionPla
     const previous = input.existing.get(candidate.url);
     const hash = rulesHash(candidate.source);
     const rulesChanged = !previous || previous.rules_hash !== hash;
-    let probeClass: ProbeClass = 2;
+    let probeClass: ProbeClass = 3;
     if (!previous || previous.search_ok === null) probeClass = 0; // 从未测过（含占位行）
-    else if (rulesChanged || isRetestDue(previous, nowMs)) probeClass = 1; // 规则变/复测到期
+    else if (rulesChanged || isRetestDue(previous, nowMs)) {
+      // 41-B2-OK-RECHECK：干净 ok 行的长周期复核排最后（class 2），其余到期者（deferred /
+      // conn_fail 衰减 / 可疑 ok / 规则变）走 class 1。
+      probeClass = !rulesChanged
+        && previous.search_verdict === 'ok'
+        && !previous.error.startsWith(ADMISSION_RECHECK_FAIL_PREFIX) ? 2 : 1;
+    }
     const checked = previous?.search_checked_at ? Date.parse(previous.search_checked_at) : Number.NaN;
     return {
       candidate, index, previous, hash, probeClass,
@@ -616,12 +647,33 @@ function planProbeOrder(input: AdmissionBatchInput, nowMs: number): AdmissionPla
 /**
  * 跑一轮准入批次（设计 §4.2）。纯逻辑：不碰 DB，输入既有行、输出要写库的行。
  * 状态机：new → compile_rejected（终态，规则不变不复测）｜new → deferred → (ok|rejected)｜ok
- * ｜conn_fail（rejected，7 天衰减后回 class 1 复测，41-B1-RETRY）。
+ * ｜conn_fail（rejected，7 天衰减后回 class 1 复测，41-B1-RETRY）
+ * ｜ok（7 天长周期复核，class 2；首次失败记 strike 不出池、20h 后再确认，41-B2-OK-RECHECK）。
  * 每轮真实搜索 ≤ maxProbes（默认走 `admissionMaxProbes()`，env 可调），按 planProbeOrder 的公平序分配名额（N04）；
  * canProbe 为 false 时停止探测但仍写出可离线得到的结论。
  * N03 祖父条款：新必需组校验收紧时，既有「规则未变 ∧ compile_ok ∧ search_ok=true」的行
  * 不改判 compile 拒（W1 现网池红线），规则一变即按新校验重审。
  */
+
+/**
+ * ok 复核的写库结论（41-B2-OK-RECHECK，纯函数）：一次失败不出池。
+ * - 非 ok 行的复核、或复核成功：照实写（error 清空回普通 ok）。
+ * - 干净 ok 行首次复核失败：写 strike 标记（search_ok/verdict 保持 ok，error=`recheck_fail:<真实 verdict>`），
+ *   源留池，20h 后走 class 1 再确认。
+ * - 可疑行（已带 strike）再失败：strike 耗尽，写真实结论出池，之后走既有 deferred/conn_fail 复测回路。
+ */
+export function recheckOutcome(previous: AdmissionSourceRow | undefined, result: AdmissionSearchResult): {
+  search_ok: boolean; search_verdict: string; error: string;
+} {
+  const striking = previous !== undefined
+    && previous.search_ok === true
+    && previous.search_verdict === 'ok'
+    && !previous.error.startsWith(ADMISSION_RECHECK_FAIL_PREFIX);
+  if (result.verdict !== 'ok' && striking) {
+    return { search_ok: true, search_verdict: 'ok', error: `${ADMISSION_RECHECK_FAIL_PREFIX}${result.verdict}` };
+  }
+  return { search_ok: result.verdict === 'ok', search_verdict: result.verdict, error: result.error };
+}
 export async function runAdmissionBatch(input: AdmissionBatchInput): Promise<AdmissionBatchResult> {
   const now = input.now ?? (() => new Date());
   // 每批判定一次语义版本：同一批所有行的版本列必须彼此一致，且与各自 rules_hash 前缀同源
@@ -665,7 +717,7 @@ export async function runAdmissionBatch(input: AdmissionBatchInput): Promise<Adm
     if (exempt) grandfathered += 1;
 
     const rulesChanged = !previous || previous.rules_hash !== hash;
-    const needsProbe = probeClass <= 1; // 未测 / 规则变 / 复测到期（planProbeOrder 同口径）
+    const needsProbe = probeClass <= 2; // 未测 / 规则变 / 复测到期 / ok 长周期复核（planProbeOrder 同口径）
     if (!needsProbe) continue; // 结论仍有效，不重写
 
     if (probeSlots > 0 && canProbe() && !input.signal.aborted) {
@@ -676,12 +728,13 @@ export async function runAdmissionBatch(input: AdmissionBatchInput): Promise<Adm
         throttleMs: input.throttleMs, sleep: input.sleep,
       });
       verdicts[result.verdict] = (verdicts[result.verdict] ?? 0) + 1;
+      // 41-B2-OK-RECHECK：写库结论走 recheckOutcome——干净 ok 行首次复核失败记 strike 不出池。
       rows.push({
         source_url: candidate.url, tier: 'M1', compile_ok: true, core_field_mask: compile.coreFieldMask,
-        search_ok: result.verdict === 'ok', search_verdict: result.verdict,
+        ...recheckOutcome(previous, result),
         search_checked_at: now().toISOString(), rules_hash: hash,
         engine_semantics_version: semanticsVersion, host,
-        error: result.error, compile_diagnostics: [],
+        compile_diagnostics: [],
       });
       continue;
     }
