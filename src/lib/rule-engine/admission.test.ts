@@ -2,7 +2,8 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createHash } from 'node:crypto';
 import corpus from './fixtures/admission-174.json';
 import {
-  ADMISSION_CONN_FAIL_RETEST_MS, ADMISSION_RETEST_INTERVAL_MS, admissionBucket, compileAdmission,
+  ADMISSION_CONN_FAIL_RETEST_MS, ADMISSION_RETEST_INTERVAL_MS, DEFAULT_ADMISSION_MAX_PROBES,
+  admissionBucket, admissionMaxProbes, compileAdmission,
   runAdmissionBatch, searchAdmission, rulesHash, type AdmissionSourceRow, type AdmissionTransport,
 } from './admission';
 import { ENGINE_SEMANTICS_VERSION, engineVersionedKey } from './compile';
@@ -311,7 +312,7 @@ describe('两把锁判别性用例（v3 E3 正例+负例）', () => {
 });
 
 describe('准入状态机 runAdmissionBatch', () => {
-  it('174 源一轮 mock 准入：114 compile-ok / 60 compile 拒（L2 后冻结数字），真实搜索 ≤10（默认名额），未探测占位可续测', async () => {
+  it('174 源一轮 mock 准入：114 compile-ok / 60 compile 拒（L2 后冻结数字），真实搜索 ≤20（默认名额），未探测占位可续测', async () => {
     const fetchPage = vi.fn<AdmissionTransport>().mockResolvedValue(page('<html><body>no results</body></html>'));
     const declaredHosts = new Set(sources.map((source) => new URL(source.bookSourceUrl).hostname));
     const result = await runAdmissionBatch({
@@ -320,20 +321,21 @@ describe('准入状态机 runAdmissionBatch', () => {
     });
     expect(result.compileOk).toBe(114);
     expect(result.compileRejected).toBe(60);
-    // 默认名额 10：其中 1 个候选（ubook.reader.qq.com）searchUrl 判 url_invalid、
-    // 不发网络请求即落行，实际 fetchPage 9 次。
-    expect(result.probed).toBe(10);
-    expect(fetchPage).toHaveBeenCalledTimes(9);
+    // 默认名额 20（41-ADMIT-THROUGHPUT 起）：其中 2 个候选（ubook.reader.qq.com、
+    // www.fnshu.cc）searchUrl host 越出声明集、判 url_invalid 不发网络请求即落行，
+    // 实际 fetchPage 18 次。
+    expect(result.probed).toBe(20);
+    expect(fetchPage).toHaveBeenCalledTimes(18);
     // 200 但 bookList 无候选 → no_result（deferred 桶，下轮可复测），不是 ok/rejected。
-    expect(result.verdicts).toEqual({ no_result: 9, url_invalid: 1 });
+    expect(result.verdicts).toEqual({ no_result: 18, url_invalid: 2 });
     for (const row of result.rows.filter((item) => item.search_verdict === 'no_result')) {
       expect(admissionBucket(row.search_verdict)).toBe('deferred');
       expect(row.search_ok).toBe(false);
     }
     // 全部 174 源都有行（114 通过 + 60 拒），未轮到的通过源写未测占位
-    // （114 - 10 已探测 = 104 占位）。
+    // （114 - 20 已探测 = 94 占位）。
     expect(result.rows).toHaveLength(174);
-    expect(result.rows.filter((row) => row.compile_ok && row.search_ok === null)).toHaveLength(104);
+    expect(result.rows.filter((row) => row.compile_ok && row.search_ok === null)).toHaveLength(94);
     for (const row of result.rows.filter((item) => !item.compile_ok)) {
       expect(row.tier).toBe('T7');
       expect(row.host).not.toBe('');
@@ -640,6 +642,59 @@ describe('准入状态机 runAdmissionBatch', () => {
     });
     expect(result.probed).toBe(3);
     expect(fetchPage).toHaveBeenCalledTimes(3);
+  });
+
+  // 41-ADMIT-THROUGHPUT：名额上限 10→20 并改 env 可调。两组行为各钉一条：
+  // 默认值（不传 maxProbes 时走 admissionMaxProbes() 的默认 20）与 env 覆盖生效。
+  describe('名额上限默认 20 + env ADMISSION_MAX_PROBES 可调（41-ADMIT-THROUGHPUT）', () => {
+    // 不传 maxProbes 的批次用 30 个候选：名额 20 ⇒ 恰探 20 个，10 个不占名额。
+    // 候选数 > 名额数才能钉住「默认不再停在旧值 10」——若实现回退到 10，本组变红。
+    const probeDefault = async () => {
+      const candidates = Array.from({ length: 30 }, (_, index) => ({
+        url: `https://d${index}.example.com`, source: syntheticSource(`https://d${index}.example.com/`),
+      }));
+      const fetchPage = vi.fn<AdmissionTransport>().mockResolvedValue(page('<html>no results</html>'));
+      const result = await runAdmissionBatch({
+        candidates, declaredHosts: new Set(candidates.map(({ url }) => new URL(url).hostname)),
+        existing: new Map(), fetchPage, signal: signal(), throttleMs: 0,
+      });
+      return { result, fetchPage };
+    };
+
+    it('默认（env 缺失）每轮名额 = DEFAULT_ADMISSION_MAX_PROBES = 20', async () => {
+      const { result, fetchPage } = await probeDefault();
+      expect(DEFAULT_ADMISSION_MAX_PROBES).toBe(20);
+      expect(result.probed).toBe(20);
+      expect(fetchPage).toHaveBeenCalledTimes(20);
+    });
+
+    it('admissionMaxProbes：env 合法值生效，非法/≤0/缺失回退默认 20', () => {
+      expect(admissionMaxProbes({ ADMISSION_MAX_PROBES: '5' })).toBe(5);
+      expect(admissionMaxProbes({ ADMISSION_MAX_PROBES: '20' })).toBe(20);
+      // 回退：缺失、空串、非整数、非数字、0、负数——同款 readingPoolLimit() 口径。
+      expect(admissionMaxProbes({})).toBe(DEFAULT_ADMISSION_MAX_PROBES);
+      expect(admissionMaxProbes({ ADMISSION_MAX_PROBES: '' })).toBe(DEFAULT_ADMISSION_MAX_PROBES);
+      expect(admissionMaxProbes({ ADMISSION_MAX_PROBES: 'abc' })).toBe(DEFAULT_ADMISSION_MAX_PROBES);
+      expect(admissionMaxProbes({ ADMISSION_MAX_PROBES: '0' })).toBe(DEFAULT_ADMISSION_MAX_PROBES);
+      expect(admissionMaxProbes({ ADMISSION_MAX_PROBES: '-3' })).toBe(DEFAULT_ADMISSION_MAX_PROBES);
+      // '3.5'：parseInt 截断得 3（同款 readingPoolLimit 口径，不放宽为「非整数即回退」）。
+      expect(admissionMaxProbes({ ADMISSION_MAX_PROBES: '3.5' })).toBe(3);
+    });
+
+    it('env 覆盖穿透批次：ADMISSION_MAX_PROBES=7（stubEnv）⇒ 不传 maxProbes 恰探 7', async () => {
+      vi.stubEnv('ADMISSION_MAX_PROBES', '7');
+      const candidates = Array.from({ length: 30 }, (_, index) => ({
+        url: `https://e${index}.example.com`, source: syntheticSource(`https://e${index}.example.com/`),
+      }));
+      const fetchPage = vi.fn<AdmissionTransport>().mockResolvedValue(page('<html>no results</html>'));
+      const result = await runAdmissionBatch({
+        candidates, declaredHosts: new Set(candidates.map(({ url }) => new URL(url).hostname)),
+        existing: new Map(), fetchPage, signal: signal(), throttleMs: 0,
+      });
+      vi.unstubAllEnvs();
+      expect(result.probed).toBe(7);
+      expect(fetchPage).toHaveBeenCalledTimes(7);
+    });
   });
 
   // ---------------------------------------------------------------- N03 回归
