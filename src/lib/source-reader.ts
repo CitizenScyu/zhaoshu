@@ -966,8 +966,8 @@ async function switchSourceChapter(
       const alternativeSource = sources.find((item) => item.url === alternative.sourceUrl
         && sourceRevision(item) === alternative.sourceRevision);
       if (!alternativeSource) throw new Error('Alternative source not in pool snapshot');
-      // 目录探测与正文各用独立 child：每个阶段遵守单源请求上限，正文仍保留独立切片。
-      const chapterContext = context.child(candidate.url, { limit: 1, sliceMs: SOURCE_FAILOVER_SLICE_MS });
+      // 正文复用目录 child 的父 signal，整个候选受同一 4s 切片约束。
+      const chapterContext = sourceContext.child(candidate.url, { limit: 1, sliceMs: SOURCE_FAILOVER_SLICE_MS });
       // 正文成功后才固化目录，避免失败候选污染可续读会话。
       const text = await chapterText(chapterContext, alternative.chapters[alternativeIndex], alternativeSource);
       if (!text.trim()) throw new Error('Alternative source returned empty chapter text');
