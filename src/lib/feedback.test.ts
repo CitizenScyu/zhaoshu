@@ -34,6 +34,13 @@ describe('feedback snapshot contract', () => {
     expect(readFeedbackSnapshot(null)).toBeNull();
   });
 
+  // MS-32b:原型链污染对照。快照 status 走 hasOwnProperty 判定,
+  // 'constructor'/'toString' 这类原型链上的键不是合法状态,不得借道通过。
+  it('rejects statuses that only exist on the prototype chain', () => {
+    expect(readFeedbackSnapshot({ version: 4, status: 'constructor', note: '' })).toBeNull();
+    expect(readFeedbackSnapshot({ version: 4, status: 'toString', note: '' })).toBeNull();
+  });
+
   it('detects destructive note reductions so the client can confirm before saving', () => {
     expect(feedbackNeedsConfirmation('长反馈', '')).toBe(true);
     expect(feedbackNeedsConfirmation('短', '长一点的反馈')).toBe(false);

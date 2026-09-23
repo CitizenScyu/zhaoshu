@@ -27,7 +27,7 @@ export function readFeedbackSnapshot(value: unknown): FeedbackSnapshot | null {
   if (!value || typeof value !== 'object') return null;
   const data = value as Record<string, unknown>;
   if (!Number.isSafeInteger(data.version) || (data.version as number) < 0 || typeof data.note !== 'string'
-    || (data.status !== null && !Object.hasOwn(FEEDBACK_STATUS_LABELS, String(data.status)))) return null;
+    || (data.status !== null && !Object.prototype.hasOwnProperty.call(FEEDBACK_STATUS_LABELS, String(data.status)))) return null;
   return { version: data.version as number, status: data.status as FeedbackStatus | null, note: data.note };
 }
 
