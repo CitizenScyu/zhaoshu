@@ -1467,7 +1467,7 @@ describe('41-ADMIT-CONC:准入探测受限并发', () => {
     expect(seen.filter((aborted) => aborted)).toEqual([]);
   });
 
-  it('c=1 输出与基点 3059eb5 的固定期望逐行相等(不自比)', async () => {
+  it('结果行顺序 = 计划顺序(不同延迟使完成顺序与计划顺序相反)', async () => {
     const hosts = ['o0.example.com', 'o1.example.com', 'o2.example.com'];
     // o0 最慢、o2 最快 ⇒ 完成顺序 o2,o1,o0,与计划顺序相反。
     const delays: Record<string, number> = { 'o0.example.com': 30, 'o1.example.com': 15, 'o2.example.com': 0 };
