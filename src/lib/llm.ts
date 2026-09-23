@@ -1048,15 +1048,16 @@ export function parseJson(text: string): unknown {
   let t = text.trim();
   const fence = t.match(/```(?:json)?\s*([\s\S]*?)```/);
   if (fence) t = fence[1].trim();
-  // 兜底：截取第一个 { 或 [ 到最后一个 } 或 ]
-  if (!t.startsWith('{') && !t.startsWith('[')) {
-    const first = Math.min(
-      ...[t.indexOf('{'), t.indexOf('[')].filter((i) => i >= 0),
-    );
-    const last = Math.max(t.lastIndexOf('}'), t.lastIndexOf(']'));
-    if (Number.isFinite(first) && last > first) {
-      t = t.slice(first, last + 1);
-    }
+  // 兜底：截取第一个 { 或 [ 到最后一个 } 或 ]。
+  // 无条件执行:对干净 JSON 是恒等操作(首字符即 { 或 [ 时截取不改变内容),
+  // 对尾随废话({"a":1}\n\n希望有帮助)也生效 —— 此前的前置条件会把这类输入
+  // 原样丢给 JSON.parse 而解析失败。
+  const first = Math.min(
+    ...[t.indexOf('{'), t.indexOf('[')].filter((i) => i >= 0),
+  );
+  const last = Math.max(t.lastIndexOf('}'), t.lastIndexOf(']'));
+  if (Number.isFinite(first) && last > first) {
+    t = t.slice(first, last + 1);
   }
   try {
     return JSON.parse(t) as unknown;

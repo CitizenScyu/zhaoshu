@@ -31,6 +31,16 @@ describe('parseJson', () => {
     expect(parseJson(text)).toEqual([{ a: 1 }, { a: 2 }]);
   });
 
+  // MS-28:首字符是 { 或 [ 但尾部拖散文的输入也要能解析 —— 此前的
+  // startsWith 前置条件把这类输入原样丢给 JSON.parse 而失败。
+  it('parses JSON with trailing prose after a leading brace', () => {
+    expect(parseJson('{"a":1}\n\n希望有帮助')).toEqual({ a: 1 });
+  });
+
+  it('parses a top-level array with trailing prose', () => {
+    expect(parseJson('[1,2] trailing')).toEqual([1, 2]);
+  });
+
   it('throws on non-JSON garbage', () => {
     expect(() => parseJson('没有 JSON 在这里')).toThrow();
   });
