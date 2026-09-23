@@ -1572,3 +1572,123 @@ describe('MS-01 两级预算统一接口 remainingFor（root/child 余量语义�
     expect(child.remainingFor(5)).toBe(0); // 预留后仍 0，作者回退不会强开
   });
 });
+
+// 41-FAILOVER-M1：章节级队列换源，所有传输和目录写入均使用本地 fake。
+describe('chapter failover candidate queue (41-FAILOVER-M1)', () => {
+  const sourceB = { ...source, url: 'https://book15.net/b', name: '第二备用源', searchUrl: '/b/search.html?kw={{key}}' };
+  const bSearch = 'https://book15.net/b/search.html?kw=' + encodeURIComponent(book.title);
+  const bPage = pageUrl(889);
+  const bChapter = chapterUrl(889);
+  const prepare = async (aTitles = ['第一章'], bTitles = ['第一章']) => {
+    const catalog = await service.resolveSourceBook(book, context());
+    catalogs.set(catalog.version, catalog);
+    mocks.sources.mockResolvedValue([source, backup, sourceB]);
+    pages.set(chapterUrl(), { text: '', status: 404 });
+    pages.set(backupSearch(), { text: '<a href="/books/details777.html">测试书</a>' });
+    pages.set(backupPage, { text: detail(777, '作者', aTitles) });
+    pages.set(backupChapter(777, 1), { text: chapterHtml('A 正文') });
+    pages.set(bSearch, { text: '<a href="/books/details889.html">测试书</a>' });
+    pages.set(bPage, { text: detail(889, '作者', bTitles) });
+    pages.set(bChapter, { text: chapterHtml('B 正文') });
+    return catalog;
+  };
+  const read = (catalog: SourceCatalog, ctx = context()) => service.readSourceChapter(catalog.version, 0, ctx);
+
+  it('A 缺章，B 成功；只尝试两份备用源', async () => {
+    const catalog = await prepare(['完全不同的章节']);
+    const part = await read(catalog);
+    expect(part).toMatchObject({ text: 'B 正文', servedFrom: sourceB.name, sourceSession: part.version });
+    expect(mocks.fetch.mock.calls.filter(([input]) => [backupSearch(), bSearch].includes(String(input)))).toHaveLength(2);
+    expect(catalogs.get(part.version)?.sourceUrl).toBe(sourceB.url);
+  });
+
+  it('A 正文为空，继续尝试 B', async () => {
+    const catalog = await prepare();
+    pages.set(backupChapter(777, 1), { text: chapterHtml('') });
+    expect((await read(catalog)).text).toBe('B 正文');
+  });
+
+  it('A 目录成功但正文失败，不提前持久化 A', async () => {
+    const catalog = await prepare();
+    pages.set(backupChapter(777, 1), { text: '', status: 404 });
+    const part = await read(catalog);
+    expect(part.text).toBe('B 正文');
+    expect(writes.filter((query) => query.text.startsWith('INSERT INTO source_read_catalogs'))).toHaveLength(1);
+    expect([...catalogs.values()].filter((item) => item.sourceUrl === backup.url)).toHaveLength(0);
+    expect(catalogs.get(part.version)?.sourceUrl).toBe(sourceB.url);
+  });
+
+  it('A 子预算耗尽不影响 B 的完整预算', async () => {
+    const catalog = await prepare();
+    const ctx = context();
+    const originalChild = ctx.child.bind(ctx);
+    const budgets: Array<{ scope: string; limit: number }> = [];
+    ctx.child = (scope, opts) => {
+      const child = originalChild(scope, { ...opts, limit: scope === backup.url ? 1 : opts?.limit });
+      budgets.push({ scope, limit: child.limit });
+      return child;
+    };
+    const part = await read(catalog, ctx);
+    expect(part.text).toBe('B 正文');
+    expect(budgets).toContainEqual({ scope: backup.url, limit: 1 });
+    expect(budgets).toContainEqual({ scope: sourceB.url, limit: service.SOURCE_FAILOVER_MAX_REQUESTS });
+    expect(mocks.fetch.mock.calls.some(([input]) => String(input) === bChapter)).toBe(true);
+    expect(ctx.signal.aborted).toBe(false);
+  });
+
+  it('备用源章节顺序不同，仍按标题对齐', async () => {
+    const catalog = await prepare(['无关序言', '第一章']);
+    pages.set(backupChapter(777, 2), { text: chapterHtml('A 第二位置正文') });
+    const part = await read(catalog);
+    expect(part.text).toBe('A 第二位置正文');
+    expect(part.servedFrom).toBe(backup.name);
+  });
+
+  it('同名不同作者不误换源，继续 B', async () => {
+    const catalog = await prepare();
+    pages.set(backupPage, { text: detail(777, '不同作者') });
+    const part = await read(catalog);
+    expect(part.text).toBe('B 正文');
+    expect(mocks.fetch.mock.calls.some(([input]) => String(input) === backupChapter(777, 1))).toBe(false);
+  });
+
+  it('候选全部失败，保留 SOURCE_CHAPTER_UNAVAILABLE 503', async () => {
+    const catalog = await prepare(['无关章节'], ['另一无关章节']);
+    await expect(read(catalog)).rejects.toMatchObject({ code: 'SOURCE_CHAPTER_UNAVAILABLE', status: 503 });
+    expect(writes).toHaveLength(0);
+  });
+
+  it('最多尝试三个候选，候选失败原因可追踪', async () => {
+    const catalog = await prepare(['无关章节'], ['另一无关章节']);
+    const sourceC = { ...sourceB, url: 'https://book15.net/c', name: '第三备用源', searchUrl: '/c/search.html?kw={{key}}' };
+    const sourceD = { ...sourceB, url: 'https://book15.net/d', name: '第四备用源', searchUrl: '/d/search.html?kw={{key}}' };
+    mocks.sources.mockResolvedValue([source, backup, sourceB, sourceC, sourceD]);
+    pages.set('https://book15.net/c/search.html?kw=' + encodeURIComponent(book.title), { text: '' });
+    const failure = await read(catalog).catch((error: unknown) => error) as { code: string; attempted: number; reasons: unknown[] };
+    expect(failure).toMatchObject({ code: 'SOURCE_CHAPTER_UNAVAILABLE', attempted: 3 });
+    expect(failure.reasons).toHaveLength(3);
+    expect(mocks.fetch.mock.calls.some(([input]) => String(input).includes('/d/search.html'))).toBe(false);
+  });
+
+  it('软预算已到顶时抛 SOURCE_TIMEOUT，不探测备用源', async () => {
+    const catalog = await prepare();
+    const ctx = context();
+    vi.mocked(Date.now).mockReturnValue(ctx.startedAt + service.SOFT_BUDGET_MS);
+    await expect(read(catalog, ctx)).rejects.toMatchObject({ code: 'SOURCE_TIMEOUT', status: 504 });
+    expect(mocks.fetch.mock.calls.some(([input]) => String(input) === backupSearch())).toBe(false);
+  });
+  it('父 signal 在备用源请求中途 abort，不吞为候选失败', async () => {
+    const catalog = await prepare();
+    const controller = new AbortController();
+    const baseFetch = mocks.fetch.getMockImplementation()!;
+    mocks.fetch.mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input) === backupSearch()) {
+        controller.abort(new Error('parent cancelled'));
+        init?.signal?.throwIfAborted();
+      }
+      return baseFetch(input, init);
+    });
+    await expect(read(catalog, new service.SourceRequestContext(controller.signal))).rejects.toThrow('parent cancelled');
+    expect(mocks.fetch.mock.calls.some(([input]) => String(input) === bSearch)).toBe(false);
+  });
+});

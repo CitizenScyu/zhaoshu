@@ -27,6 +27,10 @@ export const PER_SOURCE_REQUESTS = 6;
 export const PER_SOURCE_SLICE_MS = 14_000;
 export const SOFT_BUDGET_MS = 45_000;
 export const MAX_POOL_REQUESTS = 30;
+// 章节级换源预算（报告 §5.4）：每个备用源独立切片 4s、目录探测最多 2 次请求，最多尝试 3 个候选。
+export const SOURCE_FAILOVER_SLICE_MS = 4_000;
+export const SOURCE_FAILOVER_MAX_REQUESTS = 2;
+export const SOURCE_FAILOVER_MAX_ATTEMPTS = 3;
 /** 根 context 的 scope：builtin 首源不受 L1 单源闸门约束（零回归的机械保证）。 */
 export const BUILTIN_SCOPE = 'builtin';
 const MAX_DETAIL_CANDIDATES = 4;
@@ -937,27 +941,51 @@ async function switchSourceChapter(
   catalog: SourceCatalog, chapter: SourceChapter, chapterIndex: number,
   context: SourceRequestContext, sources: ReadingSource[],
 ): Promise<SourceCatalog & { text: string }> {
-  try {
-    // 池快照钉在目录加载时点(N01):备用源的 url+revision 必能在同一快照反查到 ReadingSource,
-    // 避免读取瞬间源池变更导致备用源没有规则可分派;也省一次源池查询。
-    // 洞 3:preferAfterSourceUrl 把当前源的同站候选降到队尾(不是绝对禁止 —— 全网只剩同站时仍可用)。
-    const alternative = await resolveSourceBook(catalog, context, {
-      excludeBookUrl: catalog.bookUrl, sources, preferAfterSourceUrl: catalog.sourceUrl,
-    });
-    // Never assume two catalogs have the same ordinal positions —— 章节按标题对齐:
-    // 完全无关的章不得匹配,重名章取序号最接近当前章的一条(洞 4)。
-    const alternativeIndex = matchSourceChapter(alternative.chapters, chapter.title, chapterIndex);
-    if (alternativeIndex === null) throw new Error('No matching chapter in the alternative source');
-    const alternativeSource = sources.find((item) => item.url === alternative.sourceUrl && sourceRevision(item) === alternative.sourceRevision);
-    if (!alternativeSource) throw new Error('Alternative source not in pool snapshot');
-    // 洞 2 的持久化半边:把备用源目录**落库**(与 index 路径同一张表/同一写入口),
-    // 这样带回到前端的 sourceSession 才是可续读的会话 —— 下一章直接用它取数,
-    // 不再每章回到故障原源重试。写失败按换源失败处理(fail-closed,仍 503)。
-    await saveSourceCatalog(alternative, context.signal);
-    const text = await chapterText(context, alternative.chapters[alternativeIndex], alternativeSource);
-    return { ...alternative, text };
-  } catch {
+  // 池快照钉在目录加载时点(N01)，先按源排序再逐个尝试，避免一次失败阻断后续候选。
+  const ordered = deprioritizeSource(sources, catalog.sourceUrl);
+  const otherSources = ordered.filter((item) => item.url !== catalog.sourceUrl);
+  const candidates = (otherSources.length ? otherSources : ordered).slice(0, SOURCE_FAILOVER_MAX_ATTEMPTS);
+  const failures: Array<{ source: string; reason: string }> = [];
+  for (const candidate of candidates) {
     context.signal.throwIfAborted();
-    throw new SourceReaderError('本章暂不可读,备用书源也未找到相同章节。可重试或尝试「下载全书」。', 'SOURCE_CHAPTER_UNAVAILABLE', 503);
+    if (SOFT_BUDGET_MS - (Date.now() - context.startedAt) <= 0 || context.remainingFor(0) === 0) {
+      throw new SourceReaderError('书源查询已取消或超时，可重试或尝试「下载全书」。', 'SOURCE_TIMEOUT', 504);
+    }
+    try {
+      const sourceContext = context.child(candidate.url, {
+        // builtin 目录探测是搜索+详情两点；引擎还需目录点，沿用其既有三段请求。
+        limit: isBuiltinReadingSource(candidate) ? SOURCE_FAILOVER_MAX_REQUESTS : SOURCE_FAILOVER_MAX_REQUESTS + 1,
+        sliceMs: SOURCE_FAILOVER_SLICE_MS,
+      });
+      const alternative = await resolveSourceBook(catalog, sourceContext, {
+        excludeBookUrl: catalog.bookUrl, sources: [candidate], preferAfterSourceUrl: catalog.sourceUrl,
+      });
+      // Never assume two catalogs have the same ordinal positions —— 章节按标题对齐。
+      const alternativeIndex = matchSourceChapter(alternative.chapters, chapter.title, chapterIndex);
+      if (alternativeIndex === null) throw new Error('No matching chapter in the alternative source');
+      const alternativeSource = sources.find((item) => item.url === alternative.sourceUrl
+        && sourceRevision(item) === alternative.sourceRevision);
+      if (!alternativeSource) throw new Error('Alternative source not in pool snapshot');
+      // 正文复用目录 child 的父 signal，整个候选受同一 4s 切片约束。
+      const chapterContext = sourceContext.child(candidate.url, { limit: 1, sliceMs: SOURCE_FAILOVER_SLICE_MS });
+      // 正文成功后才固化目录，避免失败候选污染可续读会话。
+      const text = await chapterText(chapterContext, alternative.chapters[alternativeIndex], alternativeSource);
+      if (!text.trim()) throw new Error('Alternative source returned empty chapter text');
+      await saveSourceCatalog(alternative, context.signal);
+      return { ...alternative, text };
+    } catch (error) {
+      context.signal.throwIfAborted();
+      if (error instanceof SourceReaderError && error.code === 'SOURCE_BUDGET_EXCEEDED') {
+        throw new SourceReaderError('书源查询已取消或超时，可重试或尝试「下载全书」。', 'SOURCE_TIMEOUT', 504);
+      }
+      failures.push({ source: candidate.name, reason: error instanceof SourceReaderError ? error.code : 'SOURCE_CANDIDATE_FAILED' });
+    }
   }
+  context.signal.throwIfAborted();
+  if (SOFT_BUDGET_MS - (Date.now() - context.startedAt) <= 0 || context.remainingFor(0) === 0) {
+    throw new SourceReaderError('书源查询已取消或超时，可重试或尝试「下载全书」。', 'SOURCE_TIMEOUT', 504);
+  }
+  const unavailable = new SourceReaderError('本章暂不可读,备用书源也未找到相同章节。可重试或尝试「下载全书」。', 'SOURCE_CHAPTER_UNAVAILABLE', 503);
+  Object.assign(unavailable, { attempted: failures.length, reasons: failures });
+  throw unavailable;
 }
