@@ -779,6 +779,33 @@ describe('online reader source resolution and budgets', () => {
       .resolves.toMatchObject({ title: '新名', author: '作者A', bookUrl: pageUrl(903) });
     expect(mocks.fetch.mock.calls.length).toBeLessThanOrEqual(12);
   });
+
+  it('MS-01: 非首源兜底吃满 L1 后，作者回退靠 remainingFor 让出的余量抓到作者页真书', async () => {
+    // 场景（review-42 MS-01）：改名书在第 2+ 个源上。源 B 标题搜索（1 点）+ 同页兜底 5 条无关详情
+    // （5 点）恰好挤满 L1=PER_SOURCE_REQUESTS=6 —— 若 fallbackWidth 只看 root 的 L2（13d00ad 的
+    // 手写算法），兜底仍会按 4 展开并在第 6 点撞 SOURCE_SCOPE_EXHAUSTED，作者搜索根本发不出去，
+    // 真书丢在作者页里。remainingFor 以 child 视角取窄者 ⇒ 兜底让出余量、作者回退仍可运行。
+    const det = (id: number, title: string, author: string, extra = '') =>
+      `<meta property="og:novel:book_name" content="${title}"><meta property="og:novel:author" content="${author}">` + extra
+      + `<dd><a href="/chapter/index${id}-1.html">第一章</a></dd>`;
+    const target = { title: '改名书', author: '作者A' };
+    mocks.sources.mockResolvedValue([
+      { url: 'https://book15.net/a/', name: '源A', searchUrl: '/a/search.html?kw={{key}}', rules: {} },
+      { url: 'https://book15.net/b/', name: '源B', searchUrl: '/b/search.html?kw={{key}}', rules: {} },
+    ]);
+    pages.set('https://book15.net/a/search.html?kw=' + encodeURIComponent(target.title), { text: '' });
+    pages.set('https://book15.net/a/search.html?kw=' + encodeURIComponent(target.author), { text: '' });
+    // 源 B 标题搜索：同页兜底 5 条无关详情链接（搜索 1 + 兜底 5 ⇒ L1 上限 6 之内挤满，
+    // 剩余 L1 = 0；旧手写 fallbackWidth 算 root 的 L2 ⇒ 兜底仍按 4 展开，作者搜索必撞 L1 闸门）
+    pages.set('https://book15.net/b/search.html?kw=' + encodeURIComponent(target.title),
+      { text: [801, 802, 803, 804, 805].map((i) => `<a href="/books/details${i}.html">无关书</a>`).join('') });
+    pages.set('https://book15.net/b/search.html?kw=' + encodeURIComponent(target.author),
+      { text: '<a href="/books/details9.html">新名</a>' });
+    for (const id of [801, 802, 803, 804, 805]) pages.set('https://book15.net/books/details' + id + '.html', { text: det(id, '无关书' + id, '别人') });
+    pages.set('https://book15.net/books/details9.html', { text: det(9, '新名', '作者A', '<div>小说简介:【原书名：改名书】。</div>') });
+    const catalog = await service.resolveSourceBook(target, context());
+    expect(catalog).toMatchObject({ title: '新名', author: '作者A', bookUrl: 'https://book15.net/books/details9.html' });
+  });
 });
 
 describe('GET /api/read/source/[resource]', () => {

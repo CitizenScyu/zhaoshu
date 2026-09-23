@@ -562,14 +562,12 @@ export async function resolveSourceBook(
       // 且作者不是书名本身时(改名书的站点索引只有新名),改搜作者。候选不看锚文本,
       // 身份靠详情页的标题/别名 + 作者门校验。
       // `!candidates.length` 保留给「搜索 URL 本身就是详情页」那一支的既有语义。
-      // 余量校验（review-42 MS-01）：作者搜索 + 作者层 inspect 至少需要 reserveForAuthor 点。
-      // 本源余量不足时跳过本轮作者回退，不要强开 —— 强开的首个 page() 会抛预算码（L1 单源耗尽
-      // 或 L2 全局耗尽），被外层记成跳源/整轮失败，真书丢在作者页里（13d00ad 遗留的症状）。
-      // 单源池（sources.length === 1）时：剩余预算本就只够本源用，作者页候选是同一源的后续请求，
-      // 按既有语义放行（既有用例的请求构成逐点不变）。
-      const authorBudgetOk = sources.length === 1
-        || sourceContext.remainingFor(reserveForAuthor) >= reserveForAuthor;
-      if (authorFallbackPending && authorBudgetOk) {
+      // 余量校验（review-42 MS-01）：作者搜索 1 点是硬需求，作者层 inspect 至少要能发出第 1 点
+      // （真书常在作者页前段；后续候选由 inspect 内的 L1/L2 闸门自然封顶，不足整宽是降级不是失败）。
+      // 本源连「作者搜索 + 首个详情」都发不出时跳过本轮作者回退 —— 强开的首个 page() 会抛预算码
+      // （L1 单源耗尽或 L2 全局耗尽），被外层记成跳源/整轮失败，真书丢在作者页里。
+      // 门槛取 min(1, 本源单源上限)：单源上限小于 2 的 child 不强开。
+      if (authorFallbackPending && sourceContext.remainingFor(1) >= 1) {
         const authorSearch = await sourceContext.page(sourceSearchUrl(source.searchUrl, book.author, source.url));
         const authorCandidates = /^\/books\/details\d+\.html$/.test(new URL(authorSearch.url).pathname)
           ? [authorSearch.url]
