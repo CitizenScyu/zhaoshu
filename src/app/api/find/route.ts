@@ -221,7 +221,7 @@ export async function POST(req: NextRequest) {
     // 立即生效。其它调用点（profile / feedback）刻意不传，保持既有行为中性。
     const fallbackModel = configuredFallbackModel();
     // MS-06：兜底模型 == 主模型时跳过兜底分支。主模型取值与 chat() 用同一解析链
-    // （库覆盖 → 库默认 → LLM_MODEL → 硬编码，见 llm.ts resolveModel）。若兜底就等于主模型，
+    // （库覆盖 → 库默认 → 环境变量 → 硬编码，见 llm.ts resolveModel）。若兜底就等于主模型，
     // 降级等于用同一个模型再跑一遍：白烧 ~120s 最低预算（MODEL_FALLBACK_MIN_BUDGET_MS）
     // 且大概率再超时一次，净负收益。在进入 SSE 之前就拦下，并打告警让线上能看到这个配置组合。
     const primaryModel = await resolveModel();
