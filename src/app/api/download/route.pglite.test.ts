@@ -40,10 +40,10 @@ beforeEach(async () => {
   vi.stubGlobal('fetch', vi.fn(() => { throw new Error('Unexpected network'); }));
   pg = new PGlite();
   await bootstrapV6(pg);
-  sql = (async (parts: TemplateStringsArray, ...params: unknown[]) => {
-    const text = parts.reduce((text, part, i) => text + (i ? `$${i}` : '') + part, '');
-    return (await pg.query(text, params)).rows;
-  }) as typeof sql;
+  // 用带 transaction 的 PGlite 适配器：upgradeToAuthV7 走 sql.transaction(builder) 批内
+  // 执行（与 neon 同形），plain tag 没有 transaction 会抛 "not a function"，v7 升级
+  // 静默失败让 download_tasks 缺 requested_by。
+  sql = createPGliteSql(pg) as unknown as typeof sql;
   await upgradeToAuthV7(sql as never);
   db.getSql.mockReturnValue(sql);
   db.ensureSchema.mockResolvedValue(undefined);

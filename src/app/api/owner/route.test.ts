@@ -20,6 +20,7 @@ vi.mock('@/lib/auth-rate-limit', async (importOriginal) => ({
 }));
 
 import { GET } from './route';
+import { OWNER_FAIL_GLOBAL_RATE_LIMIT, OWNER_FAIL_SOURCE_RATE_LIMIT } from '@/lib/auth-rate-limit';
 
 const SECRET = 'a'.repeat(48);
 
@@ -113,12 +114,39 @@ describe('GET /api/owner in account mode', () => {
     expect(res.headers.get('Vary')).toBe('Cookie, Authorization, X-Owner-Token');
   });
 
-  it('records wrong drafts into the shared buckets', async () => {
+  it('records a wrong draft into the source bucket only (MS-27: global bucket is touched only when a single source exhausts its own budget)', async () => {
     const res = await GET(new NextRequest('http://localhost/api/owner', {
       headers: { Authorization: 'Bearer wrong' },
     }));
     expect(res.status).toBe(401);
-    expect(mocks.bumpAuthRateLimit).toHaveBeenCalledTimes(2);
+    // 单来源桶未达上限时只 bump 单来源桶，全局桶不动——单一来源无法独力打满
+    // 全局桶锁死全站 owner 认证。
+    expect(mocks.bumpAuthRateLimit).toHaveBeenCalledTimes(1);
+    expect(mocks.bumpAuthRateLimit.mock.calls[0][1].scope).toBe(OWNER_FAIL_SOURCE_RATE_LIMIT.scope);
+  });
+
+  it('counts one global bump only when the source budget is exhausted, so many sources still trip the global lock (distributed brute force)', async () => {
+    // 单来源上限 10：把第 10 次 bump 的返回值推到上限，那一次才向全局桶贡献 1 次。
+    const limit = OWNER_FAIL_SOURCE_RATE_LIMIT.limit;
+    mocks.bumpAuthRateLimit.mockResolvedValueOnce({ attempts: 1, retryAfterSeconds: 900 });
+    for (let i = 2; i <= limit; i++) {
+      mocks.bumpAuthRateLimit.mockResolvedValueOnce({ attempts: i, retryAfterSeconds: 900 });
+    }
+    for (let request = 0; request < limit; request++) {
+      const res = await GET(new NextRequest('http://localhost/api/owner', {
+        headers: { Authorization: 'Bearer wrong' },
+      }));
+      expect(res.status).toBe(401);
+    }
+    const sourceBumps = mocks.bumpAuthRateLimit.mock.calls.filter(
+      (call) => call[1].scope === OWNER_FAIL_SOURCE_RATE_LIMIT.scope,
+    );
+    const globalBumps = mocks.bumpAuthRateLimit.mock.calls.filter(
+      (call) => call[1].scope === OWNER_FAIL_GLOBAL_RATE_LIMIT.scope,
+    );
+    expect(sourceBumps).toHaveLength(limit);
+    // 只有达到上限的那一次向全局桶贡献 1 次——单来源狂发无法把全局桶从 0 打到 100。
+    expect(globalBumps).toHaveLength(1);
   });
 
   it('cools down even a correct draft once the threshold is reached', async () => {

@@ -9,7 +9,7 @@ import {
   submitBackfillPlan,
 } from './backfill-plan';
 import { loadPGlite, type PGliteLike } from './fixtures/pglite';
-import { createProductionSchemaAtAuthV6, seedV6MemberUser } from './fixtures/production-schema';
+import { createProductionSchemaAtAuthV6, seedV6MemberUser, upgradeToAuthV7 } from './fixtures/production-schema';
 import { createPGliteSql } from './fixtures/pglite-sql';
 
 type SqlTag = (parts: TemplateStringsArray, ...values: unknown[]) => Promise<unknown>;
@@ -44,6 +44,7 @@ maybe('T5 历史补账:dry-run 与 apply 一致', () => {
     // 无任何 CHECK，于是「补账写出 requested_by='system' 且 user_id 非空」这类违反
     // 真库约束的行为在测试里不红（2026-09-23 复核）。这里走生产入口，不再手抄。
     await createProductionSchemaAtAuthV6(createPGliteSql(pg) as never, pg);
+    await upgradeToAuthV7(createPGliteSql(pg) as never);
     await seedV6MemberUser(pg);
     await pg.exec(`
       INSERT INTO labeled_books (title, author) VALUES
