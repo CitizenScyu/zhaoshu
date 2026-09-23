@@ -8,6 +8,14 @@ import { SCHEMA_MIGRATION_LOCK_ID, SCHEMA_VERSION } from '../src/lib/schema-vers
 export { SCHEMA_VERSION };
 export const MIGRATION_LOCK_ID = SCHEMA_MIGRATION_LOCK_ID;
 export const TARGET_SCHEMA = 'public';
+// 冷建库盘点清单（check-schema 只读比对）。必须覆盖运行时用到的全部业务表，
+// 否则冷库重建后会带着「能跑过 db:check 却缺表」的隐性残缺。
+// 顺序无关，按表名字母序。
+// 注意几个**有意排除**的表（不是遗漏，改这里前先读 business-schema.ts:253 附近）：
+//   - registration_invites / 任何 auth-schema 侧的表：auth schema 的表由
+//     initializeAuthSchema（src/lib/auth-store.ts）单独建，版本记在
+//     auth_schema_migrations 里，不进本（业务 schema）的 EXPECTED_TABLES。
+//     business-schema.ts:253 已就同样的排除留了注释，两处保持一致。
 export const EXPECTED_TABLES = [
   'auth_rate_limits', 'auth_schema_migrations', 'auth_settings', 'books',
   'download_tasks', 'feedback', 'labeled_books', 'llm_usage', 'profile',
