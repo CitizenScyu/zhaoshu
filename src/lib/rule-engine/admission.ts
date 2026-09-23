@@ -27,8 +27,30 @@ export const ADMISSION_TIMEOUT_MS = 8_000;
 export const ADMISSION_MAX_BYTES = 2 * 1024 * 1024;
 export const ADMISSION_MAX_REDIRECTS = 3;
 export const ADMISSION_THROTTLE_MS = 350;
-/** 每轮刷新最多跑几个新源的真实搜索（对齐 PROBE_DISCOVERY_PER_REFRESH 模式，设计 §4.2）。 */
-export const ADMISSION_MAX_PROBES_PER_REFRESH = 10;
+/**
+ * 每轮刷新最多跑几个新源的真实搜索（对齐 PROBE_DISCOVERY_PER_REFRESH 模式，设计 §4.2）。
+ * 名额上限的**默认值**：实际生效值走 `admissionMaxProbes()`——env `ADMISSION_MAX_PROBES`
+ * 可覆盖（非法/≤0/缺失回退本默认），便于不发版调吞吐。env 可调的理由（41-ADMIT-THROUGHPUT）：
+ * 全库 1681 源、准入未测占大头，而 cron 每天只跑一轮 ⇒ 名额直接决定每天探测量。默认 20 的
+ * 安全边际：单源最坏墙钟 ≈ 8.4s（8s 超时 + 350ms 节流）⇒ 20 源最坏 ≈ 168s，加写库与 compile
+ * 余量后总墙钟 ≈ 264s，仍在平台 maxDuration=295s 与 REFRESH_BUDGET_MS=180s 之上的整批
+ * canProbe 止损（`shuyuan.ts` 剩 ≤ ADMISSION_TIMEOUT_MS+WRITE_RESERVE_MS 即停探）保护下。
+ * 提到 25 会顶破 295s，故 20 是当前安全上限。
+ */
+export const DEFAULT_ADMISSION_MAX_PROBES = 20;
+/**
+ * 每轮准入探测名额：env `ADMISSION_MAX_PROBES` 生效；非法/≤0/缺失回退默认（同款
+ * `readingPoolLimit()` 口径）。参数化 env 便于单测注入，不改动真实 process.env。
+ */
+export function admissionMaxProbes(env: AdmissionProbesEnv = process.env): number {
+  const parsed = Number.parseInt(env.ADMISSION_MAX_PROBES ?? '', 10);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : DEFAULT_ADMISSION_MAX_PROBES;
+}
+/** env 形状（宽松：process.env 与测试注入对象都可直接代入）。 */
+interface AdmissionProbesEnv {
+  ADMISSION_MAX_PROBES?: string | undefined;
+  [key: string]: string | undefined;
+}
 /**
  * deferred 态重测间隔（设计 §4.2：软故障/url_invalid 定期重测）。
  * 取 20h 而非 24h：cron 有分钟级抖动/偶发漏触发，严格 24h 判据会把前一日刚测过的
@@ -595,7 +617,7 @@ function planProbeOrder(input: AdmissionBatchInput, nowMs: number): AdmissionPla
  * 跑一轮准入批次（设计 §4.2）。纯逻辑：不碰 DB，输入既有行、输出要写库的行。
  * 状态机：new → compile_rejected（终态，规则不变不复测）｜new → deferred → (ok|rejected)｜ok
  * ｜conn_fail（rejected，7 天衰减后回 class 1 复测，41-B1-RETRY）。
- * 每轮真实搜索 ≤ maxProbes（默认 10），按 planProbeOrder 的公平序分配名额（N04）；
+ * 每轮真实搜索 ≤ maxProbes（默认走 `admissionMaxProbes()`，env 可调），按 planProbeOrder 的公平序分配名额（N04）；
  * canProbe 为 false 时停止探测但仍写出可离线得到的结论。
  * N03 祖父条款：新必需组校验收紧时，既有「规则未变 ∧ compile_ok ∧ search_ok=true」的行
  * 不改判 compile 拒（W1 现网池红线），规则一变即按新校验重审。
@@ -611,7 +633,7 @@ export async function runAdmissionBatch(input: AdmissionBatchInput): Promise<Adm
   let compileRejected = 0;
   let grandfathered = 0;
   let probed = 0;
-  let probeSlots = Math.max(0, input.maxProbes ?? ADMISSION_MAX_PROBES_PER_REFRESH);
+  let probeSlots = Math.max(0, input.maxProbes ?? admissionMaxProbes());
   const canProbe = input.canProbe ?? (() => true);
 
   for (const { candidate, previous, hash, probeClass } of planProbeOrder(input, now().getTime())) {
