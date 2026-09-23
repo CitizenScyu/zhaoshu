@@ -96,13 +96,15 @@ function engineAdapter() {
 }
 
 function memoryStorage() {
-  const state: { finished?: { status: string; error?: string } } = {};
+  const state: { finished?: { status: string; error?: string }; deferred?: { delayMs: number; error?: string } } = {};
   const storage: WorkerStorage = {
     claim: async () => null,
     taskRow: async () => task,
     heartbeat: async () => true,
     progress: async () => true,
     finish: async (_lease, result) => { state.finished = result; return true; },
+    // 合成书源永远可达,不该走到退避放回(41-EXEC-SRCUNAVAIL 的 defer);真走到就记下来,由用例①断言兜住。
+    defer: async (_lease, input) => { state.deferred = input; return '2026-09-24T03:15:00.000Z'; },
     reserveArtifactPath: async () => 7,
     registerArtifact: async () => true,
   };
@@ -128,6 +130,7 @@ describe('v2 清单 chapter_index 用引擎章节边界(41-MANIFESTFIX)', () => 
     const result = await runDownloadTask({ storage, github, adapters: [engineAdapter()], repositoryId: 1, branch: 'main' }, lease);
     expect(result).toMatchObject({ processed: true, terminal: 'done' });
     expect(state.finished).toEqual({ status: 'done', error: '' });
+    expect(state.deferred).toBeUndefined();
 
     const manifest = readManifest(github);
     expect(manifest, '读端 parseVolumeManifest 拒收 = 生产读回 502「无效的章节目录」').not.toBeNull();
