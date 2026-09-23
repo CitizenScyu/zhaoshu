@@ -21,7 +21,8 @@ const MAX_BOOK_BYTES = 64 * 1024 * 1024;
 // 章节缓存的正文格式版本：写进检查点，参与续传判定。engineFetchContent 的输出格式每变一次，这个值加 1；
 // 41-HTMLFIX（@html 正文转纯文本）起为 2，旧检查点没有这个字段，视为 1。格式不同的检查点不续传、全量重抓：
 // 缓存里存的是旧格式正文，续传会把它原样拼进新书（整本 blob 不变 ⇒ 发布器按「同内容」保留旧清单，修复不生效）。
-export const ENGINE_CONTENT_FORMAT = 2;
+// 41-PAGEFIX（正文翻页遇下一章即停）起为 3：修复前缓存的章节可能串入了后续章节的正文，同样必须作废重抓。
+export const ENGINE_CONTENT_FORMAT = 3;
 export function downloadOptions(args) {
   if (!args.source || !args.title?.trim() || !args.author?.trim()) throw new Error('download 需要 --source --title --author');
   const source = new URL(args.source.includes('://') ? args.source : `https://${args.source}`);
