@@ -31,7 +31,7 @@ vi.mock('@/lib/db', () => ({ ensureSchema, getSql }));
 import {
   disableShuyuanSource, enableShuyuanSource, getEngineSources, getReadingPool, getShuyuanCounts,
   getShuyuanPoolHealth, getShuyuanStats, getReadingSources, refreshShuyuan,
-  REFRESH_BUDGET_MS, RESPONSE_TIMEOUT_MS, SHUYUAN_REFRESH_PARTIAL, ShuyuanRefreshPartialError,
+  REFRESH_BUDGET_MS, PROBE_PENDING_PER_REFRESH, RESPONSE_TIMEOUT_MS, SHUYUAN_REFRESH_PARTIAL, ShuyuanRefreshPartialError,
 } from './shuyuan';
 import { resolveDownloadSource } from './download-source';
 import { sourceRevision } from './source-revision';
@@ -1173,7 +1173,126 @@ describe('refreshShuyuan atomic refresh', () => {
     });
   });
 
-  // 归纳：last_error 的自动写点、连续失败阈值、失败计数的持久化与解析等价。
+  // 41-PENDING-WAKE：pending（规则变化退回待核验）是死态——入队循环原一律 `pending → continue`，
+  // 只要上游规则不再变就永不被重探（生产 944 个 pending 常驻、reachable 0）。此处钉住
+  // 「置 pending 的源下一轮能被有界重探并流转」，任何「pending 一律 continue」的变异都会变红。
+  describe('pending 死态唤醒（41-PENDING-WAKE）', () => {
+    const pendingSeed = (extra: Record<string, unknown> = {}) => ({
+      source_url: knownSource.bookSourceUrl, source: knownSource, last_error: '', disabled_at: null, ...extra,
+    });
+    const probedUrls = () => fetchMock.mock.calls.map(([url]) => String(url));
+
+    it('快照里的遗留 pending 下一轮刷新能被重探并流转到 reachable（打破死态）', async () => {
+      // 生产现状的直接模拟：上一轮规则变化写出的 pending 条目留在快照里，本轮上游规则不再变。
+      // 旧逻辑 `state.status === 'pending' → continue` 永远不会探测它 ⇒ 死态；
+      // 新逻辑必须把它放进探测队列并流转出 pending。
+      setCollection(11, [knownSource]);
+      seedPrevious([pendingSeed()], [
+        { url: knownSource.bookSourceUrl, status: 'pending', checked_at: null, error: null },
+      ]);
+      responses.set('https://book15.net/', { body: '离线合成响应' });
+
+      await refreshShuyuan();
+
+      expect(probedUrls()).toContain('https://book15.net/');
+      expect(savedStates()[0]).toMatchObject({
+        url: knownSource.bookSourceUrl, status: 'reachable', error: null, consecutive_failures: 0,
+      });
+    });
+
+    it('规则变化当轮即并入有界重探：pending 不再是吸收态（backlog 也不无限）', async () => {
+      // 同一轮里规则变化 ⇒ 置 pending **并**入队重探。这是生产 backlog 的主要来源：
+      // 若只置 pending 不入队，下一轮才靠遗留 pending 分支慢慢唤醒，周转慢一拍。
+      const changed = { ...knownSource, ruleSearch: { name: '.new-title' } };
+      setCollection(11, [changed]);
+      seedPrevious([pendingSeed()], [
+        { url: knownSource.bookSourceUrl, status: 'reachable', checked_at: '2026-09-16T00:00:00Z', error: null },
+      ]);
+      responses.set('https://book15.net/', { body: '离线合成响应' });
+
+      await refreshShuyuan();
+
+      expect(probedUrls()).toContain('https://book15.net/');
+      expect(savedStates()[0]).toMatchObject({ status: 'reachable', error: null });
+    });
+
+    it('pending 重探失败时按既有 probeWorker 语义累加计数 / 判 failed，不卡在 pending', async () => {
+      setCollection(11, [knownSource]);
+      // 已累计 2 次失败：本轮再失败（第 3 次）应判 failed，而不是写回 pending。
+      seedPrevious([pendingSeed()], [
+        { url: knownSource.bookSourceUrl, status: 'pending', checked_at: null, error: null, consecutive_failures: 2 },
+      ]);
+      responses.set('https://book15.net/', { body: 'unavailable', status: 503 });
+
+      await refreshShuyuan();
+
+      expect(probedUrls()).toContain('https://book15.net/');
+      expect(savedStates()[0]).toMatchObject({ status: 'failed', consecutive_failures: 3 });
+    });
+
+    it('pending 重探不饿死已知失败源重探：名额分配顺序为 probes → discovery → pending', async () => {
+      // 已知失败源（带 last_error）+ 一个 pending 源。
+      const failedUrl = 'https://book15.net/failed';
+      const failedSource = { ...knownSource, bookSourceUrl: failedUrl, bookSourceName: '失败源' };
+      const pendingUrl = knownSource.bookSourceUrl;
+      setCollection(11, [failedSource, knownSource]);
+      seedPrevious([
+        { source_url: failedUrl, source: failedSource, last_error: '历史连接超时', disabled_at: null },
+        pendingSeed(),
+      ], [
+        { url: pendingUrl, status: 'pending', checked_at: null, error: null },
+      ]);
+      responses.set(failedUrl, { body: 'unavailable', status: 503 });
+      responses.set(pendingUrl, { body: 'unavailable', status: 503 });
+
+      await refreshShuyuan();
+
+      const calls = probedUrls().slice(4).map((url) => url.replace(/\/+$/, ''));
+      // 已知失败源必须先于 pending 源被探测（probes 段排在 pendingReprobe 之前）。
+      expect(calls).toEqual([failedUrl, pendingUrl]);
+    });
+
+    it('canProbe 不在门里的 pending 源仍不探（fail-closed 保持）', async () => {
+      // unknownSource 的 host 过不了 validateSourceUrl ⇒ 即便它在快照里是 pending 也不被重探。
+      setCollection(11, [unknownSource]);
+      seedPrevious([], [
+        { url: unknownSource.bookSourceUrl, status: 'pending', checked_at: null, error: null },
+      ]);
+
+      await refreshShuyuan();
+
+      expect(probedUrls()).toEqual([indexUrl, collectionUrl(11), collectionUrl(12), collectionUrl(13)]);
+      // 快照里的 pending 条目仍被原样保留（readMeta 对 pending 放宽 host 门是既有特例），
+      // 但它**不进探测队列**：canProbe 是硬门，fail-closed 保持。
+      expect(savedStates()).toContainEqual({
+        url: unknownSource.bookSourceUrl, status: 'pending', checked_at: null, error: null,
+      });
+    });
+
+    it('每轮 pending 重探数有界：backlog 再大也只重探 PROBE_PENDING_PER_REFRESH 个', async () => {
+      // 构造 50 个 pending 源（远超名额 40），全部可探测（book15 host）。
+      const many = Array.from({ length: 50 }, (_, i) => ({
+        ...knownSource, bookSourceUrl: `https://book15.net/p${i}`, bookSourceName: `P${i}`,
+      }));
+      setCollection(11, many);
+      const rows = many.map((item) => ({
+        source_url: item.bookSourceUrl, source: item, last_error: '', disabled_at: null,
+      }));
+      const entries = many.map((item) => ({
+        url: item.bookSourceUrl, status: 'pending' as const, checked_at: null, error: null,
+      }));
+      seedPrevious(rows, entries);
+      many.forEach((item) => responses.set(item.bookSourceUrl, { body: '离线合成响应' }));
+
+      await refreshShuyuan();
+
+      const probes = probedUrls().filter((url) => url.startsWith('https://book15.net/p'));
+      // 40 = PROBE_PENDING_PER_REFRESH（4 × 并发 10）。变异：去掉名额上限会探测全部 50 个。
+      expect(probes.length).toBe(PROBE_PENDING_PER_REFRESH);
+    });
+  });
+
+  // 归纳：last_error 的自动写点、连续失败计数、失败计数的持久化与解析等价。
   describe('源健康探测：连续失败计数', () => {
     const storedKnown = (lastError: string, disabledAt: string | null = null) => ({
       source_url: knownSource.bookSourceUrl, source: knownSource, last_error: lastError, disabled_at: disabledAt,
