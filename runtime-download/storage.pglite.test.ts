@@ -76,6 +76,25 @@ maybe('T8 storage 绑定：租约条件/心跳/进度/终态/artifact 幂等', (
     expect((await state(id)).status).toBe('pending');
   });
 
+  it('defer：租约条件放回 pending，attempt_count+1、next_attempt_at=now+delay，未到期不可领；失权返回 null', async () => {
+    const id = await insertTask();
+    const storage = createWorkerStorage(sql);
+    const lease = (await storage.claim('owner-a'))!;
+    const retryAt = await storage.defer(lease, { delayMs: 15 * 60_000, error: 'source_unavailable' });
+    expect(retryAt).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/);
+    const row = (await pg.query(
+      `SELECT status, lease_owner, attempt_count, error,
+              (extract(epoch FROM (next_attempt_at - updated_at)) * 1000)::float8 AS delay_ms
+       FROM download_tasks WHERE id = $1`, [id],
+    )).rows[0];
+    expect(row).toMatchObject({ status: 'pending', lease_owner: '', attempt_count: 2, error: 'source_unavailable', delay_ms: 15 * 60_000 });
+    expect(await storage.claim('owner-b')).toBeNull(); // 退避未到期
+    expect(await storage.defer(lease, { delayMs: 1000 })).toBeNull(); // 行已不是本租约的 running
+    await pg.query(`UPDATE download_tasks SET next_attempt_at = now() - interval '1 second' WHERE id = $1`, [id]);
+    expect(await storage.claim('owner-b')).toMatchObject({ id, attemptCount: 2 }); // 到期自动重领
+    await expect(storage.defer(lease, { delayMs: -1 })).rejects.toThrow('delayMs is invalid');
+  });
+
   it('taskRow：读取完整行，缺失返回 null', async () => {
     const id = await insertTask();
     const storage = createWorkerStorage(sql);

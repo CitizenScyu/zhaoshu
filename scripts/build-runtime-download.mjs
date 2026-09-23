@@ -83,6 +83,8 @@ const injection = `${START}
       const { createDownloadExecutor } = await import('../executor/executor.mjs');
       const executor = await createDownloadExecutor({
         budget,
+        // 与上文 createDailyBudget 同一状态文件：书源不可达的尝试凭它退还日预算（41-EXEC-SRCUNAVAIL）。
+        budgetStatePath: join(stateDir, 'daily-budget.json'),
         workDir: join(stateDir, 'download'),
         rateLimiter: new SourceRateLimiter(),
         decisions: LoopDecision,

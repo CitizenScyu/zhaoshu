@@ -180,20 +180,20 @@ maybe('T8 执行器端到端：领取 → 合成抓取 → 五阶段发布 → D
     expect(budget.used()).toBe(1);
   });
 
-  it('code=2 源不可用：可重试的 partial（source_unavailable），零发布', async () => {
+  it('code=2 源不可用：非终态——放回 pending 并排退避（source_unavailable），零发布', async () => {
     const id = await insertTask();
     const executor = createExecutor(deps([engineAdapter({ code: 2, status: 'partial', errors: ['source_unavailable'], total: 0, done: 0, chars: 0 })], fakeBudget()));
     expect(await executor.runOnce()).toBe(DEFAULT_DECISIONS.TASK_DONE);
     const state = await taskState(id);
-    expect(state.status).toBe('partial');
+    expect(state.status).toBe('pending');
     expect(state.error).toContain('source_unavailable');
     expect(github.calls).toHaveLength(0);
   });
 
-  it('code=2 端到端：真实 createResolveSource 抛 ResolveSourceError(2) → 真实 downloadBook → source_unavailable partial', async () => {
+  it('code=2 端到端：真实 createResolveSource 抛 ResolveSourceError(2) → 真实 downloadBook → source_unavailable 退避', async () => {
     // 发现 3：走真实 createResolveSource + 真实 downloadBook（非 stub），钉住 code=2 的
     // 端到端转译（resolve 抛 code 2 → downloadBook failureCode=2 → errors[source_unavailable]
-    // → adapter incomplete → 任务 partial）。非 https URL 触发 ResolveSourceError(2)。
+    // → adapter incomplete → 任务放回 pending 等退避，41-EXEC-SRCUNAVAIL 前是 partial 终态）。非 https URL 触发 ResolveSourceError(2)。
     const rows = await pg.query(
       `INSERT INTO download_tasks(user_id, book_id, title, author, status, source_url, requested_by, source_kind)
        VALUES (NULL, 1, '测试书', '佚名', 'pending', 'http://book15.net/books/1.html', 'system', 'engine') RETURNING id`,
@@ -213,7 +213,8 @@ maybe('T8 执行器端到端：领取 → 合成抓取 → 五阶段发布 → D
     const executor = createExecutor(deps([adapter], fakeBudget()));
     expect(await executor.runOnce()).toBe(DEFAULT_DECISIONS.TASK_DONE);
     const state = await taskState(id);
-    expect(state.status).toBe('partial');
+    expect(state.status).toBe('pending');
+    expect(state.error).toContain('resolve');
     expect(state.error).toContain('source_unavailable');
     expect(github.calls).toHaveLength(0);
     expect((await pg.query('SELECT count(*)::int AS n FROM book_artifacts')).rows[0].n).toBe(0);

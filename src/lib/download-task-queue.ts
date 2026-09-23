@@ -207,3 +207,28 @@ export async function finishDownloadTask(
     RETURNING id` as { id: number }[];
   return rows.length === 1;
 }
+
+/**
+ * Lease-conditioned requeue with backoff for non-terminal failures (source_unavailable):
+ * the row goes back to pending, attempt_count counts the attempt, and claim skips it until
+ * next_attempt_at. Reuses the columns claim already honours; returns that time (ISO UTC),
+ * or null when the lease was lost.
+ */
+export async function deferDownloadTask(
+  sql: DownloadQueueSql,
+  lease: DownloadTaskLease,
+  input: { delayMs: number; error?: string },
+): Promise<string | null> {
+  if (!Number.isSafeInteger(input.delayMs) || input.delayMs < 0) throw new Error('delayMs is invalid');
+  const rows = await sql`
+    UPDATE download_tasks
+    SET status = 'pending', lease_owner = '', attempt_count = attempt_count + 1,
+        next_attempt_at = now() + (${input.delayMs}::bigint * interval '1 millisecond'),
+        error = ${input.error ?? ''}, updated_at = now()
+    WHERE id = ${lease.id} AND status = 'running'
+      AND lease_generation = ${lease.leaseGeneration} AND lease_owner = ${lease.leaseOwner}
+    RETURNING to_char(next_attempt_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS next_attempt_at` as {
+      next_attempt_at: string;
+    }[];
+  return rows[0]?.next_attempt_at ?? null;
+}

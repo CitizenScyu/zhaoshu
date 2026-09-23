@@ -14,6 +14,7 @@
 
 import { createHash } from 'node:crypto';
 import type { DownloadTaskLease } from './download-task-queue';
+import { SOURCE_RETRY_MAX_ATTEMPTS, sourceRetryDelayMs } from './download-task-policy';
 import {
   LeaseLostError, publishBookVersion, PublicationStageError, snapshotPaths,
   type GitHubContents, type PublishOutcome,
@@ -40,7 +41,8 @@ export interface TaskRow {
 
 export type AdapterOutcome =
   | { kind: 'complete'; txt: string; chaptersTotal: number; chaptersDone: number; charsTotal: number }
-  | { kind: 'incomplete'; reason: string; chaptersTotal: number; chaptersDone: number; charsTotal: number }
+  // stage：source_unavailable 时判定所在阶段（resolve/search/detail/toc），只作日志用的固定枚举。
+  | { kind: 'incomplete'; reason: string; chaptersTotal: number; chaptersDone: number; charsTotal: number; stage?: string }
   | { kind: 'failure'; code: string };
 
 export interface SourceAdapterContext {
@@ -67,6 +69,8 @@ export interface WorkerStorage {
   progress(lease: DownloadTaskLease, update: { chaptersDone: number; chaptersTotal: number; charsTotal: number }): Promise<boolean>;
   /** 终态（租约条件）；false = 失租约。 */
   finish(lease: DownloadTaskLease, result: { status: 'done' | 'failed' | 'partial' | 'superseded_by_incomplete'; error?: string }): Promise<boolean>;
+  /** 非终态放回 pending 并退避（租约条件）；返回下次可领取时刻（ISO UTC），null = 失租约。 */
+  defer(lease: DownloadTaskLease, input: { delayMs: number; error?: string }): Promise<string | null>;
   /** T2 发布对账的 DB 前置：写前登记路径声明。 */
   reserveArtifactPath(input: { labeledBookId: number; identityKey: string; repositoryId: number; branch: string; canonicalPath: string }): Promise<number>;
   /** DB 阶段收口：登记已发布产物并把任务指向 artifact_id。 */
@@ -163,7 +167,15 @@ export interface WorkerResult {
   processed: boolean;
   terminal?: 'done' | 'failed' | 'partial' | 'superseded_by_incomplete';
   reason?: string;
+  /** source_unavailable 专用（供执行器打结构化日志）：判定阶段、源 host、下次可重试时刻（null = 已封顶转终态）。 */
+  stage?: string;
+  sourceHost?: string;
+  retryAt?: string | null;
 }
+
+const hostOf = (url: string): string => {
+  try { return new URL(url).hostname; } catch { return ''; }
+};
 
 function selectAdapter(adapters: SourceAdapter[], task: TaskRow): SourceAdapter {
   // 引擎腿按任务 source_kind 显式选择；builtin 兜底两条腿都存在时的默认。
@@ -209,10 +221,27 @@ export async function runDownloadTask(
       // partial 零发布：任何 GitHub PUT 都没发生，DB 只写终态。
       await heartbeat.stop();
       throwIfAbortedUnlessBudget(signal);
-      // 源不可用是「没尝试成抓取」，章数 0/0 读作缺章会误导——按源侧措辞落库。
-      const detail = outcome.reason === 'source_unavailable'
-        ? '源不可用（未尝试抓取）：source_unavailable'
-        : `缺章 ${outcome.chaptersDone}/${outcome.chaptersTotal}：${outcome.reason}`;
+      if (outcome.reason === 'source_unavailable') {
+        // 书源不可达不是终态：放回 pending，按 attempt_count 退避后由 claim 自动重领（零发布）；
+        // 连续 SOURCE_RETRY_MAX_ATTEMPTS 次仍不可达才落 partial 终态。
+        const stage = outcome.stage ?? 'unknown';
+        const sourceHost = hostOf(task.source_url);
+        if (lease.attemptCount < SOURCE_RETRY_MAX_ATTEMPTS) {
+          const retryAt = await storage.defer(lease, {
+            delayMs: sourceRetryDelayMs(lease.attemptCount),
+            error: `源不可用（${stage} 阶段，第 ${lease.attemptCount} 次）：source_unavailable，自动退避重试`,
+          });
+          if (!retryAt) throw new TaskLeaseLostError();
+          return { processed: true, reason: 'source_unavailable', stage, sourceHost, retryAt };
+        }
+        const written = await storage.finish(lease, {
+          status: 'partial',
+          error: `源不可用（${stage} 阶段，已连续 ${lease.attemptCount} 次，停止自动重试）：source_unavailable`,
+        });
+        if (!written) throw new TaskLeaseLostError();
+        return { processed: true, terminal: 'partial', reason: 'source_unavailable', stage, sourceHost, retryAt: null };
+      }
+      const detail = `缺章 ${outcome.chaptersDone}/${outcome.chaptersTotal}：${outcome.reason}`;
       const written = await storage.finish(lease, {
         status: 'partial',
         error: cleanPgText(detail.slice(0, 4000)),
@@ -330,6 +359,7 @@ export interface EngineDownloadLike {
         chapters_total?: number;
         chapters_done?: number;
         chars?: number;
+        failure_stage?: string;
         artifact?: { file: string; sha256: string; bytes: number };
       };
     }>;
@@ -403,7 +433,12 @@ export function createEngineAdapter(options: EngineAdapterOptions): SourceAdapte
       // 按可重试的 incomplete 收口（零发布、候选保留），不与代码缺陷混同在 failed 桶。
       const classified = isBudgetExhausted(context.signal.reason) ? 'budget_exhausted'
         : result.code === 2 ? 'source_unavailable' : reason;
-      if (classified === 'source_unavailable' || classified === 'missing_chapters' || classified === 'toc_changed' || classified === 'budget_exhausted' || classified === 'interrupted' || classified === 'operation_timeout') {
+      if (classified === 'source_unavailable') {
+        // 阶段只收固定小写枚举，防止任何上游文本借此进入日志/错误列。
+        const stage = /^[a-z]+$/.test(manifest.failure_stage ?? '') ? manifest.failure_stage : 'unknown';
+        return { kind: 'incomplete', reason: classified, chaptersTotal, chaptersDone, charsTotal, stage };
+      }
+      if (classified === 'missing_chapters' || classified === 'toc_changed' || classified === 'budget_exhausted' || classified === 'interrupted' || classified === 'operation_timeout') {
         return { kind: 'incomplete', reason: classified, chaptersTotal, chaptersDone, charsTotal };
       }
       return { kind: 'failure', code: classified };

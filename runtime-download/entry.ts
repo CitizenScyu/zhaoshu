@@ -17,6 +17,7 @@ import { assembleEngineModules, createResolveSource, createSourceTransport, type
 import { readBookText } from './read-book-text';
 import { resolveRepositoryId } from './repository';
 import { withoutProcessSignals } from './without-process-signals';
+import { createBudgetRefund } from './budget-refund';
 import { createExecutor, DEFAULT_DECISIONS, type DailyBudgetLike, type DownloadExecutor, type LoopDecisions } from './executor';
 
 export type { DownloadExecutor, DailyBudgetLike, LoopDecisions } from './executor';
@@ -27,6 +28,11 @@ export interface RuntimeStorage extends WorkerStorage {
 
 export interface ProductionExecutorOptions {
   budget: DailyBudgetLike;
+  /**
+   * shell 日预算状态文件（main.mjs 的 join(stateDir,'daily-budget.json')，由打包注入传入）。
+   * 给出时书源不可达的尝试退还日预算；缺省则照旧计入（装配日志会提示）。
+   */
+  budgetStatePath?: string;
   /** 运行包工作目录（out 落地处）；由 shell 的状态目录派生。 */
   workDir: string;
   rateLimiter?: RateLimiterLike;
@@ -100,12 +106,15 @@ export async function createDownloadExecutor(options: ProductionExecutorOptions)
   }
 
   log('info', '执行器装配完成', { repositoryId, branch, owner: options.owner ?? `service-${process.pid}` });
+  if (!options.budgetStatePath) log('error', '日预算退还未接线：书源不可达仍会计入日预算', {});
 
   return createExecutor({
     storage: storage as RuntimeStorage,
     github,
     adapters,
     budget: options.budget,
+    refundBudget: options.budgetStatePath ? createBudgetRefund({ statePath: options.budgetStatePath }) : undefined,
+    log,
     repositoryId,
     branch,
     owner: options.owner ?? `service-${process.pid}`,

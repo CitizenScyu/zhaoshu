@@ -9,7 +9,7 @@
 
 import type { neon } from '@neondatabase/serverless';
 import {
-  claimDownloadTask, finishDownloadTask, heartbeatDownloadTask, updateDownloadTaskProgress,
+  claimDownloadTask, deferDownloadTask, finishDownloadTask, heartbeatDownloadTask, updateDownloadTaskProgress,
   type DownloadTaskLease,
 } from '../src/lib/download-task-queue';
 import { reserveArtifactPath } from '../src/lib/artifact-registry';
@@ -38,6 +38,7 @@ export function createWorkerStorage(sql: DownloadSql): RuntimeWorkerStorage {
     heartbeat: lease => heartbeatDownloadTask(sql, lease),
     progress: (lease, update) => updateDownloadTaskProgress(sql, lease, update),
     finish: (lease, result) => finishDownloadTask(sql, lease, result),
+    defer: (lease, input) => deferDownloadTask(sql, lease, input),
 
     reserveArtifactPath: input => reserveArtifactPath(sql, input),
 
