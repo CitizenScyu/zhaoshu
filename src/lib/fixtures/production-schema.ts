@@ -95,6 +95,22 @@ export async function createProductionSchemaAtAuthV6(sql: ProductionSql, pg: { e
   await pg.exec(`DELETE FROM auth_schema_migrations WHERE version = 7`);
 }
 
+/**
+ * v6 世界的标准用户种子：生产 owner（id=1 由 initializeAuthSchema 写入）+ 一个 member（id=2）。
+ *
+ * 两个 v6 夹具（下载队列测试与 T6 下载 API 测试）都需要同一个 member 行来承接
+ * download_tasks.user_id 外键。收敛到本函数，避免两份 INSERT 漂移——权限位写错会被
+ * 生产 users CHECK 拒绝，手抄时却没人拦。member 权限位刻意只给 can_find：生产 CHECK
+ * （NOT can_read OR can_find / NOT can_download OR (can_find AND can_read)）必须成立。
+ */
+export async function seedV6MemberUser(pg: { query(text: string, params?: unknown[]): Promise<unknown> }): Promise<void> {
+  await pg.query(`
+    INSERT INTO users (id, username, password_hash, role, can_find, can_read, can_download)
+    VALUES (2, 'member2', 'hash', 'member', true, false, false)
+    ON CONFLICT (id) DO NOTHING
+  `);
+}
+
 /** 一张表的结构指纹：列（名/类型/可空/默认）、索引、约束。用于 fixture 与生产的结构齐性断言。 */
 export async function tableFingerprint(
   pg: { query(text: string, params?: unknown[]): Promise<{ rows: Record<string, unknown>[] }> },
