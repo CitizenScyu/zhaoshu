@@ -19,6 +19,7 @@ import {
   type GitHubContents, type PublishOutcome,
 } from './download-publisher';
 import { artifactIdentityKey } from './artifact-registry';
+import type { TxtChapter } from './txt-chapters';
 
 export { LeaseLostError };
 
@@ -39,7 +40,11 @@ export interface TaskRow {
 }
 
 export type AdapterOutcome =
-  | { kind: 'complete'; txt: string; chaptersTotal: number; chaptersDone: number; charsTotal: number }
+  | {
+      kind: 'complete'; txt: string; chaptersTotal: number; chaptersDone: number; charsTotal: number;
+      /** 引擎章节边界（txt 的 UTF-8 字节偏移，首尾相接铺满全书）；给了发布器就不再按标题二次解析。 */
+      chapterRanges?: TxtChapter[];
+    }
   | { kind: 'incomplete'; reason: string; chaptersTotal: number; chaptersDone: number; charsTotal: number }
   | { kind: 'failure'; code: string };
 
@@ -253,6 +258,7 @@ export async function runDownloadTask(
         chaptersDone: outcome.chaptersDone,
         chaptersTotal: outcome.chaptersTotal,
         charsTotal: outcome.charsTotal,
+        chapterRanges: outcome.chapterRanges,
       });
     } catch (error) {
       if (error instanceof LeaseLostError || error instanceof PublicationStageError) throw error;
@@ -331,6 +337,7 @@ export interface EngineDownloadLike {
         chapters_done?: number;
         chars?: number;
         artifact?: { file: string; sha256: string; bytes: number };
+        chapters?: EngineChapterRecord[];
       };
     }>;
 }
@@ -349,6 +356,51 @@ export interface EngineAdapterOptions {
   timeoutMs?: number;
   budgetMs?: number;
   sourceKind?: 'builtin' | 'engine';
+}
+
+/** 引擎清单里单章的记录（engine-download.mjs 每章写 title/chars/sha256/status，这里只取这四个字段）。 */
+export interface EngineChapterRecord {
+  title?: unknown;
+  chars?: unknown;
+  sha256?: unknown;
+  status?: unknown;
+}
+
+/**
+ * 按引擎拼整本的真实方式还原每章在 txt 里的字节边界：engine-download.mjs 把整本拼成逐章
+ * `${title}\n\n${正文}\n\n` 的顺序串接（book.txt 即此串）。逐章核对——标题逐字相符、正文码点数
+ * 等于记录的 chars（`[...text].length` 口径）、正文 sha256 等于记录值、段尾是 `\n\n`，全部走完
+ * 恰好到 txt 结尾；任一不符返回 null（调用方不给边界，发布器退回解析，不猜）。
+ * 章名去掉首尾空白：阅读端按「首行 trim 后等于章名」去掉重复的标题行（ReaderClient）。
+ */
+export function engineChapterRanges(txt: string, chapters: readonly EngineChapterRecord[] | undefined): TxtChapter[] | null {
+  if (!Array.isArray(chapters) || chapters.length === 0) return null;
+  const ranges: TxtChapter[] = [];
+  let at = 0; // UTF-16 下标
+  let byte = 0; // UTF-8 字节偏移
+  for (const [index, chapter] of chapters.entries()) {
+    const record: EngineChapterRecord = chapter ?? {};
+    const { title, chars, sha256 } = record;
+    if (record.status !== 'done' || typeof title !== 'string' || typeof sha256 !== 'string'
+      || typeof chars !== 'number' || !Number.isSafeInteger(chars) || chars < 0) return null;
+    const head = `${title}\n\n`;
+    if (!txt.startsWith(head, at)) return null;
+    const bodyStart = at + head.length;
+    let bodyEnd = bodyStart;
+    // 按码点走 chars 步（代理对算一个），与引擎 [...text].length 同口径。
+    for (let step = 0; step < chars; step++) {
+      if (bodyEnd >= txt.length) return null;
+      bodyEnd += txt.codePointAt(bodyEnd)! > 0xffff ? 2 : 1;
+    }
+    if (!txt.startsWith('\n\n', bodyEnd)) return null;
+    const body = txt.slice(bodyStart, bodyEnd);
+    if (createHash('sha256').update(body).digest('hex') !== sha256) return null;
+    const size = Buffer.byteLength(head, 'utf8') + Buffer.byteLength(body, 'utf8') + 2;
+    ranges.push({ index, title: title.trim(), startByte: byte, endByte: byte + size });
+    byte += size;
+    at = bodyEnd + 2;
+  }
+  return at === txt.length ? ranges : null;
 }
 
 /** engine-download → SourceAdapter 的桥：code=0 完整；其余按 manifest.errors 分类。 */
@@ -391,7 +443,14 @@ export function createEngineAdapter(options: EngineAdapterOptions): SourceAdapte
       if (result.code === 0 && manifest.status === 'done' && manifest.artifact) {
         // 读回整本：book.txt 由 engine-download 在完整校验通过后原子写入。
         const txt = await options.readBookText({ artifact: manifest.artifact }, { out });
-        return { kind: 'complete', txt, chaptersTotal, chaptersDone, charsTotal };
+        // 章节边界取引擎拼接时的真实偏移：发布器若按标题二次解析，源站标题不规整（「13.第13章」
+        // 「完本感言」）就会并章/拆章，清单 chapter_index 与 chapters 对不上，读端判清单无效（生产 502）。
+        // 还原不出或章数对不上就不给，发布器退回解析（行为同旧）。
+        const chapterRanges = engineChapterRanges(txt, manifest.chapters);
+        return {
+          kind: 'complete', txt, chaptersTotal, chaptersDone, charsTotal,
+          ...(chapterRanges && chapterRanges.length === chaptersDone ? { chapterRanges } : {}),
+        };
       }
       const reason = manifest.errors[0] ?? 'incomplete';
       // downloadBook 正常返回但外部租约信号已触发：抓取是被任务层中止的，属失权停止，
