@@ -17,6 +17,11 @@ const knownError = /^(identity_mismatch_or_no_candidate|empty_toc|empty_toc_page
 // 发布侧整本上限(内存约束,分卷 v2)：15 MiB → 64 MiB。阅读侧已无整本上限(按卷懒取)，
 // 这里只卡引擎与发布器把整本当字符串持有的内存峰值；二期按章流式写后解除。
 const MAX_BOOK_BYTES = 64 * 1024 * 1024;
+
+// 章节缓存的正文格式版本：写进检查点，参与续传判定。engineFetchContent 的输出格式每变一次，这个值加 1；
+// 41-HTMLFIX（@html 正文转纯文本）起为 2，旧检查点没有这个字段，视为 1。格式不同的检查点不续传、全量重抓：
+// 缓存里存的是旧格式正文，续传会把它原样拼进新书（整本 blob 不变 ⇒ 发布器按「同内容」保留旧清单，修复不生效）。
+export const ENGINE_CONTENT_FORMAT = 2;
 export function downloadOptions(args) {
   if (!args.source || !args.title?.trim() || !args.author?.trim()) throw new Error('download 需要 --source --title --author');
   const source = new URL(args.source.includes('://') ? args.source : `https://${args.source}`);
@@ -43,7 +48,9 @@ export async function downloadBook(m, args, resolveSource, transport = fetchSour
   const manifestPath = join(dir, 'manifest.json');
   let previous;
   try { previous = JSON.parse(readFileSync(manifestPath, 'utf8')); } catch { /* first attempt */ }
-  const manifest = { schemaVersion: 1, status: 'partial', title: args.title, author: args.author, source: args.source, chapters: previous?.chapters ?? [], errors: [], generated_at: new Date().toISOString() };
+  // 正文格式不同（缺字段按 1）的检查点当作不存在：不续传、不沿用章节记录，全量重抓（见 ENGINE_CONTENT_FORMAT）。
+  if ((previous?.contentFormat ?? 1) !== ENGINE_CONTENT_FORMAT) previous = undefined;
+  const manifest = { schemaVersion: 1, contentFormat: ENGINE_CONTENT_FORMAT, status: 'partial', title: args.title, author: args.author, source: args.source, chapters: previous?.chapters ?? [], errors: [], generated_at: new Date().toISOString() };
   const controller = new AbortController();
   const stop = () => controller.abort(new Error('interrupted'));
   const external = hooks.signal;
