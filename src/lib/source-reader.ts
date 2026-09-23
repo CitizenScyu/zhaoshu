@@ -27,10 +27,24 @@ export const PER_SOURCE_REQUESTS = 6;
 export const PER_SOURCE_SLICE_MS = 14_000;
 export const SOFT_BUDGET_MS = 45_000;
 export const MAX_POOL_REQUESTS = 30;
-// 章节级换源预算（报告 §5.4）：每个备用源独立切片 4s、目录探测最多 2 次请求，最多尝试 3 个候选。
+// 章节级换源预算（报告 §5.4 / 41-M1.1）：每个备用源独立切片 4s、目录探测最多 2 次请求；
+// 名额 3 只数「慢失败」（耗时 ≥ SOURCE_FAILOVER_SLOW_MS），秒回的 miss 不占名额。
+// 切片与名额这里是默认值，生效值走 sourceFailoverSliceMs() / sourceFailoverMaxAttempts()（env 标定旋钮）。
 export const SOURCE_FAILOVER_SLICE_MS = 4_000;
 export const SOURCE_FAILOVER_MAX_REQUESTS = 2;
 export const SOURCE_FAILOVER_MAX_ATTEMPTS = 3;
+/** 失败的候选耗时达到此值才占换源名额；更快的失败多是「本站没有这本书」，不该挤掉后面的源。 */
+export const SOURCE_FAILOVER_SLOW_MS = 1_000;
+/** 软预算余量低于此值就不再开新候选（走超时出口）：装不下一次往返的切片只会白烧请求。 */
+export const SOURCE_FAILOVER_MIN_SLICE_MS = 1_000;
+/**
+ * 当前源正文切片默认值（41-M1.1）：10s = 一次完整物理请求（SOURCE_TIMEOUT_MS 8s）加节流余量。
+ * 不用换源的 4s：5–8s 才回的「慢但能用」当前源会被误判进换源，而候选只有 4s 做搜索+详情+正文。
+ */
+export const SOURCE_CURRENT_SLICE_MS = 10_000;
+// 标定旋钮的钳位上限（误配兜底）：切片 ≤ 20s，当前源即便用满也给换源留出 ≥ 25s 软预算；慢名额 ≤ 7。
+const MAX_TUNED_SLICE_MS = 20_000;
+const MAX_TUNED_FAILOVER_ATTEMPTS = 7;
 /** 根 context 的 scope：builtin 首源不受 L1 单源闸门约束（零回归的机械保证）。 */
 export const BUILTIN_SCOPE = 'builtin';
 const MAX_DETAIL_CANDIDATES = 4;
@@ -40,6 +54,31 @@ const CHAPTER_CACHE_MS = 2 * 60_000;
 const MAX_CACHE_BYTES = 4 * 1024 * 1024;
 const MAX_CACHE_CHAPTERS = 24;
 const PARSER_VERSION = 'book15-v1';
+
+/** env 形状（宽松：process.env 与测试注入对象都可直接代入）。 */
+type SourceTuningEnv = Record<string, string | undefined>;
+
+// 换源标定旋钮（41-M1.1），写法同 admissionMaxProbes()：env 以参数注入便于单测；非法/≤0/缺失回退默认，
+// 超上限钳到上限。不设 env 时与默认常量逐点相同。只调数值、不开关行为（行为开关属 M0，已定推后）。
+function tunedValue(raw: string | undefined, fallback: number, max: number): number {
+  const parsed = Number.parseInt(raw ?? '', 10);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? Math.min(parsed, max) : fallback;
+}
+
+/** 换源单候选切片：env `SOURCE_FAILOVER_SLICE_MS`，默认 4000，上限 20000。 */
+export function sourceFailoverSliceMs(env: SourceTuningEnv = process.env): number {
+  return tunedValue(env.SOURCE_FAILOVER_SLICE_MS, SOURCE_FAILOVER_SLICE_MS, MAX_TUNED_SLICE_MS);
+}
+
+/** 换源慢名额：env `SOURCE_FAILOVER_MAX_ATTEMPTS`，默认 3，上限 7。 */
+export function sourceFailoverMaxAttempts(env: SourceTuningEnv = process.env): number {
+  return tunedValue(env.SOURCE_FAILOVER_MAX_ATTEMPTS, SOURCE_FAILOVER_MAX_ATTEMPTS, MAX_TUNED_FAILOVER_ATTEMPTS);
+}
+
+/** 当前源正文切片：env `SOURCE_CURRENT_SLICE_MS`，默认 10000，上限 20000。 */
+export function sourceCurrentSliceMs(env: SourceTuningEnv = process.env): number {
+  return tunedValue(env.SOURCE_CURRENT_SLICE_MS, SOURCE_CURRENT_SLICE_MS, MAX_TUNED_SLICE_MS);
+}
 
 export class SourceReaderError extends Error {
   constructor(message: string, readonly code: string, readonly status = 404) { super(message); }
@@ -906,16 +945,21 @@ export async function readSourceChapter(session: string, chapterIndex: number, c
     // 暖缓存命中:正文与源状态无关,直接交付(不校验源身份,保持既有缓存语义)。
   } else if (!source) {
     context.signal.throwIfAborted();
-    switched = await switchSourceChapter(catalog, chapter, chapterIndex, context, sources);
+    // 当前源已不在池里(停用/整条下线):换源触发原因记旧实现给这种情形的码 SOURCE_CHANGED(只进日志)。
+    switched = await switchSourceChapter(catalog, chapter, chapterIndex, context, sources, 'SOURCE_CHANGED');
     text = switched.text;
     servedFrom = switched.sourceName;
   } else {
     try {
-      text = await chapterText(context, chapter, source);
-    } catch {
-      // 章节正文失败(含源被停用/服务端判定失效):进换源流程。
+      // 当前源正文走有界切片(41-M1.1):死源不再靠 8s 单请求超时 × 重试耗到十几二十秒才换源。
+      // 到点只 abort 这个 child(SOURCE_SCOPE_EXHAUSTED),父 signal 不受影响。L1 上限取引擎翻页上限，
+      // 多页正文不会被单源点数掐断;builtin 只抓 1 页，真正的约束仍是 L2,与改动前走根 context 时一致。
+      const currentContext = context.child(source.url, { limit: MAX_CONTENT_PAGES, sliceMs: sourceCurrentSliceMs() });
+      text = await chapterText(currentContext, chapter, source);
+    } catch (error) {
+      // 章节正文失败(含源被停用/服务端判定失效/切片到点):进换源流程。
       context.signal.throwIfAborted();
-      switched = await switchSourceChapter(catalog, chapter, chapterIndex, context, sources);
+      switched = await switchSourceChapter(catalog, chapter, chapterIndex, context, sources, failureCode(error));
       text = switched.text;
       servedFrom = switched.sourceName;
     }
@@ -933,61 +977,118 @@ export async function readSourceChapter(session: string, chapterIndex: number, c
 }
 
 /**
+ * 失败 → 有限枚举原因码：换源日志的 trigger / reasonCounts 与 503 的 reasons 共用。
+ * 已带 code 的 SourceReaderError 沿用原码；其余只按错误类型与状态段归类，message 一律不进码
+ * （可能带站点回显或 URL）。认不出的兜底 SOURCE_CANDIDATE_FAILED。
+ */
+function failureCode(error: unknown): string {
+  if (error instanceof SourceReaderError) return error.code;
+  if (error instanceof SourceHttpError) return error.status >= 500 ? 'SOURCE_HTTP_5XX' : 'SOURCE_HTTP_4XX';
+  if (error instanceof SourcePolicyError) return 'SOURCE_POLICY_REJECTED';
+  if (error instanceof DOMException && (error.name === 'TimeoutError' || error.name === 'ConnectTimeoutError')) {
+    return 'SOURCE_REQUEST_TIMEOUT';
+  }
+  if (error instanceof TypeError && /^fetch failed/i.test(error.message)) return 'SOURCE_NETWORK_ERROR';
+  return 'SOURCE_CANDIDATE_FAILED';
+}
+
+/**
  * 章节级换源:在同一池快照里找同书的另一个源,按标题对齐取回本章正文。
  * 返回备用源目录 + 正文 —— 调用方据此把 version/sourceId/servedFrom 换成新源(洞 2)。
  * 找不到(无备用源 / 备用源无同章)时抛既有的 SOURCE_CHAPTER_UNAVAILABLE(503)。
+ *
+ * 名额与预算(41-M1.1):遍历池里全部备用源;秒回的失败(< SOURCE_FAILOVER_SLOW_MS)不占名额,
+ * 慢失败才占,满 sourceFailoverMaxAttempts() 即停。每个候选开跑前看软预算余量:不足
+ * SOURCE_FAILOVER_MIN_SLICE_MS 就走超时出口,否则切片取 min(sourceFailoverSliceMs(), 余量)。
+ * trigger 是当前源失败的原因码(failureCode),只进日志。
  */
 async function switchSourceChapter(
   catalog: SourceCatalog, chapter: SourceChapter, chapterIndex: number,
-  context: SourceRequestContext, sources: ReadingSource[],
+  context: SourceRequestContext, sources: ReadingSource[], trigger: string,
 ): Promise<SourceCatalog & { text: string }> {
+  const startedAt = Date.now();
+  const requestsAtStart = context.requests;
+  // L2:路由根 context 的全局上限是 12,候选走 resolveSourceBook(sources:[候选]) 时 openPool(1) 抬不高它,
+  // 几个秒回 miss 就能先把 L2 吃光、被下面转成 504。换源开始时按整个池开一次(只增不减,封顶 30)。
+  context.openPool(sources.length);
+  const sliceMs = sourceFailoverSliceMs();
+  const maxSlowAttempts = sourceFailoverMaxAttempts();
   // 池快照钉在目录加载时点(N01)，先按源排序再逐个尝试，避免一次失败阻断后续候选。
   const ordered = deprioritizeSource(sources, catalog.sourceUrl);
   const otherSources = ordered.filter((item) => item.url !== catalog.sourceUrl);
-  const candidates = (otherSources.length ? otherSources : ordered).slice(0, SOURCE_FAILOVER_MAX_ATTEMPTS);
+  const candidates = otherSources.length ? otherSources : ordered;
   const failures: Array<{ source: string; reason: string }> = [];
-  for (const candidate of candidates) {
+  const reasonCounts: Record<string, number> = {};
+  let attempted = 0;
+  let slowAttempts = 0;
+  // 每个出口恰好一行聚合日志:只有结局、计数、耗时和原因码(有限枚举),书名、作者、源名、URL、host、
+  // 查询串一概不进。elapsedMs 与 requests 只算换源这一段。
+  const report = (outcome: 'success' | 'exhausted' | 'timeout') => {
+    console.error(JSON.stringify({
+      event: 'source_failover', outcome, trigger, attempted, slowAttempts,
+      elapsedMs: Date.now() - startedAt, requests: context.requests - requestsAtStart, reasonCounts,
+    }));
+  };
+  const timedOut = () => {
+    report('timeout');
+    return new SourceReaderError('书源查询已取消或超时，可重试或尝试「下载全书」。', 'SOURCE_TIMEOUT', 504);
+  };
+  // 父 signal 中止(路由 deadline/客户端断开)也是出口:记一行 timeout,再把中止原因原样抛出(route 转 504)。
+  const throwIfCancelled = () => {
+    if (!context.signal.aborted) return;
+    report('timeout');
     context.signal.throwIfAborted();
-    if (SOFT_BUDGET_MS - (Date.now() - context.startedAt) <= 0 || context.remainingFor(0) === 0) {
-      throw new SourceReaderError('书源查询已取消或超时，可重试或尝试「下载全书」。', 'SOURCE_TIMEOUT', 504);
-    }
+  };
+  for (const candidate of candidates) {
+    throwIfCancelled();
+    const remaining = SOFT_BUDGET_MS - (Date.now() - context.startedAt);
+    if (remaining < SOURCE_FAILOVER_MIN_SLICE_MS || context.remainingFor(0) === 0) throw timedOut();
+    const candidateSliceMs = Math.min(sliceMs, remaining);
+    const candidateStartedAt = Date.now();
+    attempted += 1;
     try {
       const sourceContext = context.child(candidate.url, {
         // builtin 目录探测是搜索+详情两点；引擎还需目录点，沿用其既有三段请求。
         limit: isBuiltinReadingSource(candidate) ? SOURCE_FAILOVER_MAX_REQUESTS : SOURCE_FAILOVER_MAX_REQUESTS + 1,
-        sliceMs: SOURCE_FAILOVER_SLICE_MS,
+        sliceMs: candidateSliceMs,
       });
       const alternative = await resolveSourceBook(catalog, sourceContext, {
         excludeBookUrl: catalog.bookUrl, sources: [candidate], preferAfterSourceUrl: catalog.sourceUrl,
       });
       // Never assume two catalogs have the same ordinal positions —— 章节按标题对齐。
       const alternativeIndex = matchSourceChapter(alternative.chapters, chapter.title, chapterIndex);
-      if (alternativeIndex === null) throw new Error('No matching chapter in the alternative source');
+      if (alternativeIndex === null) {
+        throw new SourceReaderError('No matching chapter in the alternative source', 'SOURCE_CHAPTER_MISSING');
+      }
       const alternativeSource = sources.find((item) => item.url === alternative.sourceUrl
         && sourceRevision(item) === alternative.sourceRevision);
-      if (!alternativeSource) throw new Error('Alternative source not in pool snapshot');
-      // 正文复用目录 child 的父 signal，整个候选受同一 4s 切片约束。L1 上限取引擎翻页上限：引擎正文按
+      if (!alternativeSource) throw new SourceReaderError('Alternative source not in pool snapshot', 'SOURCE_NOT_IN_SNAPSHOT');
+      // 正文复用目录 child 的父 signal，整个候选受同一切片约束。L1 上限取引擎翻页上限：引擎正文按
       // nextContentUrl 逐页 page()，上限低于翻页数时第 2 页就撞 SOURCE_SCOPE_EXHAUSTED、整个候选作废；
       // 耗时由切片兜底，总量由 L2 兜底。
-      const chapterContext = sourceContext.child(candidate.url, { limit: MAX_CONTENT_PAGES, sliceMs: SOURCE_FAILOVER_SLICE_MS });
+      const chapterContext = sourceContext.child(candidate.url, { limit: MAX_CONTENT_PAGES, sliceMs: candidateSliceMs });
       // 正文成功后才固化目录，避免失败候选污染可续读会话。
       const text = await chapterText(chapterContext, alternative.chapters[alternativeIndex], alternativeSource);
-      if (!text.trim()) throw new Error('Alternative source returned empty chapter text');
+      if (!text.trim()) throw new SourceReaderError('Alternative source returned empty chapter text', 'SOURCE_CONTENT_EMPTY');
       await saveSourceCatalog(alternative, context.signal);
+      report('success');
       return { ...alternative, text };
     } catch (error) {
-      context.signal.throwIfAborted();
-      if (error instanceof SourceReaderError && error.code === 'SOURCE_BUDGET_EXCEEDED') {
-        throw new SourceReaderError('书源查询已取消或超时，可重试或尝试「下载全书」。', 'SOURCE_TIMEOUT', 504);
-      }
-      failures.push({ source: candidate.name, reason: error instanceof SourceReaderError ? error.code : 'SOURCE_CANDIDATE_FAILED' });
+      throwIfCancelled();
+      const reason = failureCode(error);
+      reasonCounts[reason] = (reasonCounts[reason] ?? 0) + 1;
+      if (reason === 'SOURCE_BUDGET_EXCEEDED') throw timedOut();
+      failures.push({ source: candidate.name, reason });
+      // 秒回的失败(多是本站没有这本书)不占名额;耗时达到阈值的慢失败才占，满额即停。
+      if (Date.now() - candidateStartedAt < SOURCE_FAILOVER_SLOW_MS) continue;
+      slowAttempts += 1;
+      if (slowAttempts >= maxSlowAttempts) break;
     }
   }
-  context.signal.throwIfAborted();
-  if (SOFT_BUDGET_MS - (Date.now() - context.startedAt) <= 0 || context.remainingFor(0) === 0) {
-    throw new SourceReaderError('书源查询已取消或超时，可重试或尝试「下载全书」。', 'SOURCE_TIMEOUT', 504);
-  }
+  throwIfCancelled();
+  if (SOFT_BUDGET_MS - (Date.now() - context.startedAt) <= 0 || context.remainingFor(0) === 0) throw timedOut();
   const unavailable = new SourceReaderError('本章暂不可读,备用书源也未找到相同章节。可重试或尝试「下载全书」。', 'SOURCE_CHAPTER_UNAVAILABLE', 503);
-  Object.assign(unavailable, { attempted: failures.length, reasons: failures });
+  Object.assign(unavailable, { attempted, reasons: failures });
+  report('exhausted');
   throw unavailable;
 }
