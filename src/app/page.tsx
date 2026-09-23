@@ -59,7 +59,7 @@ function HomeContent() {
     setTab(next);
     const url = new URL(window.location.href);
     url.searchParams.set('tab', next);
-    window.history.replaceState(null, '', url);
+    window.history.replaceState(window.history.state, '', url);
   }
 
   async function signOut() {
