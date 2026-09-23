@@ -4,6 +4,7 @@ import { getReadingSources, type ReadingSource } from './shuyuan';
 import { fetchSourceText, sourceAbortable, SourceHttpError } from './source-fetch';
 import { SourcePolicyError, alternateSourceHost, validateSourceUrl } from './source-policy';
 import { sourceRevision } from './source-revision';
+import { normalizeBookTitle } from './book-identity';
 import {
   engineFetchContent, engineFetchDetail, engineFetchToc, engineSearchBook, type EngineSource,
 } from './rule-engine/api';
@@ -244,7 +245,7 @@ async function hintsFor(book: SourceBookIdentity, signal: AbortSignal): Promise<
   const sql = getSql();
   const rows = await queryRows<SourceBookIdentity & { source_url: string }>(sql`
     SELECT title, author, source_url FROM labeled_books
-    WHERE lower(btrim(title)) = lower(${book.title.trim()}) LIMIT 6`, signal);
+    WHERE title_key = ${normalizeBookTitle(book.title)} LIMIT 6`, signal);
   return rows.filter((row) => sourceBookMatches(book, row)).flatMap((row) => {
     try { return [validateSourceUrl(row.source_url).href]; } catch { return []; }
   });

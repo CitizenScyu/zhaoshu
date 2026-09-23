@@ -328,8 +328,8 @@ export function feedbackForUserQueries(sql: PersonalQuery, userId: number, raw: 
     sql`INSERT INTO books (title, author, meta)
       SELECT title, author, '{}'::jsonb FROM (
         SELECT btrim(title) AS title, btrim(author) AS author, 0 AS pref FROM labeled_books
-         WHERE lower(btrim(title)) = lower(${book.title})
-           AND lower(btrim(author)) = lower(${book.author})
+         WHERE title_key = ${book.title}
+           AND author_key = ${book.author}
         UNION ALL
         SELECT ${book.title}, ${book.author}, 1
       ) c ORDER BY pref LIMIT 1
