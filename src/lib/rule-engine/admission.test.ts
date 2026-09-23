@@ -90,6 +90,20 @@ describe('滤网 1 compileAdmission（纯本地）', () => {
 describe('滤网 2 searchAdmission 判定分桶', () => {
   const declared = (...hosts: string[]) => new Set(hosts);
 
+  it('signal 预先中止 ⇒ 不发请求,并以中止原因 reject(S5 纵深防御)', async () => {
+    // 单独删掉 admissionFetch 里「注册监听后补 if (signal.aborted) controller.abort」那行,
+    // 本测试必须红:已中止的 signal 上注册监听永不触发,传输层会拿到未中止的 probeSignal。
+    const controller = new AbortController();
+    const reason = new Error('budget');
+    controller.abort(reason);
+    const fetchPage = vi.fn<AdmissionTransport>().mockResolvedValue(page('<html>ok</html>'));
+    const settled = await searchAdmission(syntheticSource('https://ok.example.com/'), {
+      fetchPage, declaredHosts: declared('ok.example.com'), signal: controller.signal, throttleMs: 0,
+    }).then(() => 'resolved', (e: unknown) => e);
+    expect(fetchPage).not.toHaveBeenCalled();
+    expect(settled).toBe(reason);
+  });
+
   it('200 且 bookList 解析出候选 → ok', async () => {
     const fetchPage = vi.fn<AdmissionTransport>().mockResolvedValue(
       page('<div class="i"><span class="t">书名</span><a href="/b/1">x</a></div>'));
@@ -1662,10 +1676,12 @@ describe('41-ADMIT-CONC:准入探测受限并发', () => {
       }
       return Promise.resolve(page('<html>no results</html>'));
     });
-    await runAdmissionBatch({
+    const outcome = await runAdmissionBatch({
       candidates: cands, declaredHosts: new Set(['dup.example.com', 'x.example.com']), existing: new Map(),
       fetchPage, signal: controller.signal, throttleMs: 0, maxProbes: 20, now, probeConcurrency: 2,
     }).then(() => 'resolved', () => 'rejected');
+    // 在飞探测遭调用方中止 ⇒ 整批 reject(不许吞掉异常后照常 resolve 并写库)。
+    expect(outcome).toBe('rejected');
     expect(seen.filter((aborted) => aborted)).toEqual([]);
   });
 
@@ -1692,7 +1708,7 @@ describe('41-ADMIT-CONC:准入探测受限并发', () => {
 
   it('c=1 输出与基点 3059eb5 的固定期望逐行相等(不自比)', async () => {
     // 期望值取自基点 3059eb5 同输入的实测输出(固定 now,无延迟):3 行全 no_result,
-    // search_checked_at 固定、rules_hash 前缀 2:。5f3b506 在此输入上碰巧相同,所以本条
+    // search_checked_at 固定、rules_hash 前缀 1:(ENGINE_SYNTAX_OR 未开)。5f3b506 在此输入上碰巧相同,所以本条
     // 单独不区分;区分力由上面三条「逐探止损」断言承担(它们在 5f3b506 上必红)。
     const hosts = ['q0.example.com', 'q1.example.com', 'q2.example.com'];
     const fixedNow = () => new Date('2026-09-23T00:00:00Z');

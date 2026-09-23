@@ -692,6 +692,25 @@ function normalizeAdmissionConcurrency(value: number): number {
 }
 
 /**
+ * ok 复核的写库结论（41-B2-OK-RECHECK，纯函数）：一次失败不出池。
+ * - 非 ok 行的复核、或复核成功：照实写（error 清空回普通 ok）。
+ * - 干净 ok 行首次复核失败：写 strike 标记（search_ok/verdict 保持 ok，error=`recheck_fail:<真实 verdict>`），
+ *   源留池，20h 后走 class 1 再确认。
+ * - 可疑行（已带 strike）再失败：strike 耗尽，写真实结论出池，之后走既有 deferred/conn_fail 复测回路。
+ */
+export function recheckOutcome(previous: AdmissionSourceRow | undefined, result: AdmissionSearchResult): {
+  search_ok: boolean; search_verdict: string; error: string;
+} {
+  const striking = previous !== undefined
+    && previous.search_ok === true
+    && previous.search_verdict === 'ok'
+    && !previous.error.startsWith(ADMISSION_RECHECK_FAIL_PREFIX);
+  if (result.verdict !== 'ok' && striking) {
+    return { search_ok: true, search_verdict: 'ok', error: `${ADMISSION_RECHECK_FAIL_PREFIX}${result.verdict}` };
+  }
+  return { search_ok: result.verdict === 'ok', search_verdict: result.verdict, error: result.error };
+}
+/**
  * 跑一轮准入批次（设计 §4.2）。纯逻辑：不碰 DB，输入既有行、输出要写库的行。
  * 状态机：new → compile_rejected（终态，规则不变不复测）｜new → deferred → (ok|rejected)｜ok
  * ｜conn_fail（rejected，7 天衰减后回 class 1 复测，41-B1-RETRY）
@@ -716,25 +735,6 @@ function normalizeAdmissionConcurrency(value: number): number {
  * c=1 时 worker 池退化为严格串行,输出与改造前逐行一致(零行为变更)。
  */
 
-/**
- * ok 复核的写库结论（41-B2-OK-RECHECK，纯函数）：一次失败不出池。
- * - 非 ok 行的复核、或复核成功：照实写（error 清空回普通 ok）。
- * - 干净 ok 行首次复核失败：写 strike 标记（search_ok/verdict 保持 ok，error=`recheck_fail:<真实 verdict>`），
- *   源留池，20h 后走 class 1 再确认。
- * - 可疑行（已带 strike）再失败：strike 耗尽，写真实结论出池，之后走既有 deferred/conn_fail 复测回路。
- */
-export function recheckOutcome(previous: AdmissionSourceRow | undefined, result: AdmissionSearchResult): {
-  search_ok: boolean; search_verdict: string; error: string;
-} {
-  const striking = previous !== undefined
-    && previous.search_ok === true
-    && previous.search_verdict === 'ok'
-    && !previous.error.startsWith(ADMISSION_RECHECK_FAIL_PREFIX);
-  if (result.verdict !== 'ok' && striking) {
-    return { search_ok: true, search_verdict: 'ok', error: `${ADMISSION_RECHECK_FAIL_PREFIX}${result.verdict}` };
-  }
-  return { search_ok: result.verdict === 'ok', search_verdict: result.verdict, error: result.error };
-}
 export async function runAdmissionBatch(input: AdmissionBatchInput): Promise<AdmissionBatchResult> {
   const now = input.now ?? (() => new Date());
   // 每批判定一次语义版本：同一批所有行的版本列必须彼此一致，且与各自 rules_hash 前缀同源
@@ -813,7 +813,7 @@ export async function runAdmissionBatch(input: AdmissionBatchInput): Promise<Adm
   }
 
   // ---- 受限并发 worker 池 ------------------------------------------------------
-  // inflightHosts:当前在飞的 host(同 host 互斥);claimed:已开跑的探测位。
+  // inflightHosts:当前在飞的 host(同 host 互斥);claimed:已处理的候选(已起探,或判否后写了占位)。
   const inflightHosts = new Set<string>();
   const claimed = new Array<boolean>(probes.length).fill(false);
   let remaining = probes.length;
