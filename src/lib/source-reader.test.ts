@@ -2546,4 +2546,67 @@ describe('chapter failover M1.1 (41-M1.1)', () => {
     expect(part).toMatchObject({ text: '备用源1正文', servedFrom: alt(1).name });
     expect(ms).toBe(8_750);
   });
+
+  // ---- 41-M1.2 复审小修：滑动顺延的上限 until 与给兜底预留的 8s(reserve)——「慢源吃不光预算、兜底一定轮得到」----
+  // 用例里的慢页都是「头即到、正文按虚拟时间延后」:单页 4–7s,落在 8s 单请求超时之内、也不触发 3s 连接段上限;
+  // 每页成功都是一次进展，没有 until 封顶的话切片会一直顺延下去。时间点都避开与切片同一毫秒，免得定时器同刻竞态。
+  /** 引擎源 n 的本章正文做成 count 页，每页响应头即到、正文 delayMs 后才到;返回拼接后的全文。 */
+  const slowEnginePages = (n: number, count: number, delayMs: number) => {
+    const text = primeEngineChapterPages(n, count, 0);
+    for (let p = 1; p <= count; p += 1) bodyDelay.set(p === 1 ? engineChapter(n) : `https://book15.net/e${n}/c/1_${p}.html`, delayMs);
+    return text;
+  };
+
+  it('until①(当前源，池里无他源):一直有进展的慢当前源在软预算终点 45s 处被切断(504),不会顺延过去', async () => {
+    const catalog = await prepareEngineCurrent(9, [engineAlt(9)]);
+    // 12 页 × 4s:第 11 页在 44s 成功，切片顺延到 min(44 + 12, 45) = 45s;第 12 页要到 48s ⇒ 45s 处被切断。
+    // 12 次请求恰好用满 L2=12。没有 until 封顶时切片会顺延到 56s,第 12 页在 48s 交付(越过软预算)。
+    slowEnginePages(9, 12, 4_000);
+    let doneAt = 0;
+    const settled = service.readSourceChapter(catalog.version, 0, context()).then(
+      (part) => { doneAt = Date.now(); return part; },
+      (error: unknown) => { doneAt = Date.now(); throw error; },
+    );
+    await expect(drive(settled)).rejects.toMatchObject({ code: 'SOURCE_TIMEOUT', status: 504 });
+    expect(doneAt - requested[0].at).toBe(45_000);
+    expect(requestedUrls()).toContain('https://book15.net/e9/c/1_12.html'); // 直到被切断前都在出数据
+    // 当前源被切断时软预算已见底：池里只有原源，兜底余量 < 8s ⇒ 一个候选都没开(partial ⇒ 504)。
+    expect(oneFailoverLine('timeout', [engineAlt(9)])).toMatchObject({ trigger: 'SOURCE_SCOPE_EXHAUSTED', attempted: 0 });
+  });
+
+  it('until②(当前源，池里有他源):一直有进展的慢当前源在 45s − 8s = 37s 处被切断，他源仍有 8s 起跑并交付', async () => {
+    const pool = [engineAlt(9), alt(1)];
+    const catalog = await prepareEngineCurrent(9, pool);
+    // 12 页 × 5s:第 7 页在 35s 成功，切片顺延到 min(35 + 12, 37) = 37s;第 8 页要到 40s ⇒ 37s 处被切断。
+    // 他源在 37s 开跑，余量恰为起跑门槛 8s。不给换源留这 8s 的话，当前源会一直滑到 45s,他源就开不了跑(504)。
+    slowEnginePages(9, 12, 5_000);
+    primeHit(1);
+    const part = await readChapter(catalog);
+    expect(part).toMatchObject({ text: '备用源1正文', servedFrom: alt(1).name });
+    expect(requestedUrls()).toContain('https://book15.net/e9/c/1_8.html');
+    expect(requested.find(({ url }) => url === altSearch(1))!.at - requested[0].at).toBe(37_000);
+    expect(oneFailoverLine('success', pool)).toMatchObject({ trigger: 'SOURCE_SCOPE_EXHAUSTED', attempted: 1 });
+  });
+
+  it('reserve(末位他源 + 原源兜底):一直有进展的慢末位他源在 45s − 8s = 37s 处被切断，原源兜底恰在 37s 轮到并交付', async () => {
+    const pool = [current, engineAlt(1)];
+    const catalog = await prepareCurrent(pool);
+    pages.set(currentChapter, { text: '', status: 404 });
+    primeEngine(1);
+    slowEnginePages(1, 6, 7_000);
+    for (const url of ['https://book15.net/e1s?q=' + encodeURIComponent(book.title), 'https://book15.net/e1/d/1.html', engineToc(1)]) {
+      bodyDelay.set(url, 7_000);
+    }
+    primeRelisted();
+    // 他源(末位，P2 放宽)每 7s 成功一次：搜索/详情/目录/正文第 1、2 页在 7.35s…35.35s 成功，第 3 页要到 42.35s。
+    // 它的基准与顺延上限都是「余量 − 留给原源的 8s」= 37s ⇒ 37s 处被切断，原源兜底拿到恰好 8s 的起跑余量。
+    // reserve 若为 0,他源会一直滑到 45s,原源兜底余量不足 8s ⇒ 503,原站新条目永远轮不到。
+    const part = await readChapter(catalog);
+    expect(part).toMatchObject({ text: '原站新条目正文', servedFrom: current.name });
+    expect(requestedUrls()).toContain('https://book15.net/e1/c/1_3.html'); // 他源直到被切断前都在出数据
+    expect(requested.find(({ url }) => url === currentSearch)!.at - requested[0].at).toBe(37_000);
+    expect(oneFailoverLine('success', pool)).toMatchObject({
+      attempted: 2, expensiveAttempts: 1, reasonCounts: { SOURCE_SCOPE_EXHAUSTED: 1 },
+    });
+  });
 });
