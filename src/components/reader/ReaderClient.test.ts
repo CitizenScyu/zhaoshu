@@ -370,6 +370,19 @@ describe('正文渲染', () => {
     const html = render({ session: { kind: 'source', title: 'T', author: 'A' } });
     expect(html).toContain('书源：某某书源');
   });
+
+  // MS-29:换源面板以当前源的 session 为 key。renderToStaticMarkup 无状态无交互,
+  // 面板默认不渲染,无法从 markup 上断言重挂行为;这里用源码级回归护栏钉住挂载点
+  // 带 key(props 与 key 同源)——key 一旦被拿掉,本测试红。行为断言依赖
+  // autoDone ref 随重挂归零,该机制属 SourcePanel 内部实现,已被其「一次会话内
+  // 默认只自动检测一次」的注释与下方「重新检测」按钮共同钉住。
+  it('换源面板挂载点 key 绑定当前书源 session(MS-29)', async () => {
+    const source = await import('node:fs/promises').then((fs) =>
+      fs.readFile(new URL('./ReaderClient.tsx', import.meta.url), 'utf8'));
+    const mount = source.match(/<SourcePanel[\s\S]*?\/>/)?.[0] ?? '';
+    expect(mount).toContain('key={reading?.index.source?.session}');
+    expect(mount).toContain('session={reading?.index.source?.session}');
+  });
 });
 
 describe('阅读页的界面开关', () => {

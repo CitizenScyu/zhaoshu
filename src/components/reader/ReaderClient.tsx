@@ -374,6 +374,7 @@ function ReaderSession({ session, from }: Props) {
       {panel === 'sources' && session.kind === 'source' && (
         <Panel title="切换书源" side="right" onClose={() => setPanel(null)}>
           <SourcePanel
+            key={reading?.index.source?.session}
             apiFetch={apiFetch}
             title={session.title}
             author={session.author}
