@@ -141,18 +141,28 @@ export async function verifyOwnerHeader(req: NextRequest): Promise<AuthResult> {
     return { ok: true, principal: OWNER_PRINCIPAL };
   }
 
+  // 失败预算（设计 §4.4）：先挡单来源，再累计全局。
+  //
+  // 全局桶只在**单来源桶本次耗尽自身预算**时才计入一次。单来源预算耗尽后，
+  // 其后的请求会被上面 peek 的单来源判据直接挡掉（不再走到这里），所以每个来源
+  // 最多向全局桶贡献 1 次——单一 IP 无法靠狂发错误头锁死全站 owner 认证。
+  // 全局桶保留的是它真正的设计意图：挡**分布式**爆破（换 IP 绕过单来源桶），
+  // 多来源各自耗尽预算时仍会逐次累计到全局上限。
   try {
-    await bumpAuthRateLimit(
+    const sourceBump = await bumpAuthRateLimit(
       sql,
       OWNER_FAIL_SOURCE_RATE_LIMIT,
       rateLimitKeyHash(secret, OWNER_FAIL_SOURCE_RATE_LIMIT.scope, source),
     );
-    await bumpAuthRateLimit(
-      sql,
-      OWNER_FAIL_GLOBAL_RATE_LIMIT,
-      rateLimitKeyHash(secret, OWNER_FAIL_GLOBAL_RATE_LIMIT.scope, GLOBAL_RATE_LIMIT_KEY),
-    );
+    if (sourceBump.attempts >= OWNER_FAIL_SOURCE_RATE_LIMIT.limit) {
+      await bumpAuthRateLimit(
+        sql,
+        OWNER_FAIL_GLOBAL_RATE_LIMIT,
+        rateLimitKeyHash(secret, OWNER_FAIL_GLOBAL_RATE_LIMIT.scope, GLOBAL_RATE_LIMIT_KEY),
+      );
+    }
   } catch {
+    // 限速状态不可用时账号模式失败关闭，不把服务故障当密码错误。
     return { ok: false, response: serviceUnavailable('AUTH_RATE_LIMIT_UNAVAILABLE') };
   }
   return { ok: false, response: unauthorized() };
