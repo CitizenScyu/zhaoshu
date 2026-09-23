@@ -9,6 +9,7 @@ const mocks = vi.hoisted(() => ({
   chatRobust: vi.fn(),
   verifyBatch: vi.fn(),
   supplementSourceEvidence: vi.fn(),
+  resolveModel: vi.fn(),
 }));
 vi.mock('@/lib/db', async (original) => ({
   ...await original<typeof import('@/lib/db')>(),
@@ -20,6 +21,9 @@ vi.mock('@/lib/db', async (original) => ({
 vi.mock('@/lib/llm', async (importOriginal) => ({
   ...await importOriginal<typeof import('@/lib/llm')>(),
   chatRobust: async (...args: unknown[]) => ({ content: await mocks.chatRobust(...args) }),
+  // MS-06：路由在进 SSE 前比对主模型与兜底模型，主模型走真实解析链（llm.ts 的 resolveModel，
+  // 其自身的解析优先级由 llm-model.test.ts 覆盖）；这里只替换它，好直接构造「相同/不同」两种配置。
+  resolveModel: mocks.resolveModel,
 }));
 vi.mock('@/lib/douban', () => ({ verifyBatch: mocks.verifyBatch }));
 vi.mock('@/lib/source-verification', () => ({ supplementSourceEvidence: mocks.supplementSourceEvidence }));
@@ -108,6 +112,9 @@ describe('POST /api/find output contract', () => {
     mocks.persistRecommendationsForUser.mockImplementation(async (_userId: number, _query: string, items: unknown[]) => items.length);
     mocks.verifyBatch.mockImplementation(async (candidates: unknown[]) => candidates.map(() => douban));
     mocks.supplementSourceEvidence.mockImplementation(async (candidates) => candidates);
+    // MS-06：默认主模型与兜底模型不同（真实默认主模型是解析链回落值，这里用明确不同的模型），
+    // 让既有用例的兜底传参断言保持原样。
+    mocks.resolveModel.mockResolvedValue('claude-opus-5-88');
   });
   afterEach(() => { vi.unstubAllEnvs(); vi.restoreAllMocks(); });
 
@@ -557,7 +564,9 @@ describe('POST /api/find output contract', () => {
 
   // 兜底模型：找书的两个模型步骤都必须显式带上它（删掉传参本用例必须失败）。换上的快模型
   // 有约 22% 的传输层失败率，不兜底就是「换了速度、赔上可用性」。其它调用点刻意不传。
+  // MS-06 后前提是「主模型与兜底不同」——主模型与兜底相同时按设计跳过（另有专测）。
   it('hands both recall and rerank the configured fallback model', async () => {
+    mocks.resolveModel.mockResolvedValue('gemini-3.1-pro-ely'); // 主模型 ≠ 兜底
     mocks.chatRobust.mockResolvedValue(JSON.stringify({ candidates: [candidate] }));
     await consumeSSE(await POST(request({ step: 'recall', query: '找书' })));
     expect(mocks.chatRobust.mock.calls[0][2]).toMatchObject({ fallbackModel: 'claude-opus-5-88' });
@@ -574,6 +583,32 @@ describe('POST /api/find output contract', () => {
     await consumeSSE(await POST(request({ step: 'recall', query: '找书' })));
     expect(mocks.chatRobust.mock.calls[0][2]).toMatchObject({ fallbackModel: 'other/model' });
     vi.unstubAllEnvs();
+  });
+
+  // MS-06：兜底模型 == 主模型时必须跳过兜底（fallbackModel 不传 = chatRobust 不开兜底分支），
+  // 并打告警。判别力：把路由里的比对删掉（永远传 fallbackModel），本用例必须失败。
+  it('skips the fallback branch and warns when the fallback model equals the primary model', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    mocks.resolveModel.mockResolvedValue('claude-opus-5-88'); // 与兜底缺省值相同
+    mocks.chatRobust.mockResolvedValue(JSON.stringify({ candidates: [candidate] }));
+    await consumeSSE(await POST(request({ step: 'recall', query: '找书' })));
+    const opts = mocks.chatRobust.mock.calls[0][2] as { fallbackModel?: string };
+    expect(opts.fallbackModel).toBeUndefined();
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('fallback model equals primary model'));
+
+    // rerank 步同样跳过。
+    mocks.chatRobust.mockReset();
+    mocks.chatRobust.mockResolvedValue(JSON.stringify({ items: [{ ...item, matchScore: 80 }] }));
+    await consumeSSE(await POST(request({ step: 'rerank', query: '找书', verified: [verified] })));
+    expect((mocks.chatRobust.mock.calls[0][2] as { fallbackModel?: string }).fallbackModel).toBeUndefined();
+  });
+
+  // MS-06 反向护栏：两者不同时兜底必须照常传入——否则这个自检就把兜底功能整个关掉了。
+  it('still hands the fallback model through when it differs from the primary model', async () => {
+    mocks.resolveModel.mockResolvedValue('gemini-3.1-pro-ely');
+    mocks.chatRobust.mockResolvedValue(JSON.stringify({ candidates: [candidate] }));
+    await consumeSSE(await POST(request({ step: 'recall', query: '找书' })));
+    expect(mocks.chatRobust.mock.calls[0][2]).toMatchObject({ fallbackModel: 'claude-opus-5-88' });
   });
 
   // 单次尝试上限：光有「失败后降级」不够——524 实测要吃满 ~126s，一次就能把整步预算啃光，
@@ -714,6 +749,8 @@ describe('POST /api/find rerank 验证票据', () => {
     mocks.verifyBatch.mockImplementation(async (candidates: unknown[]) => candidates.map(() => douban));
     mocks.supplementSourceEvidence.mockImplementation(async (candidates) => candidates);
     mocks.chatRobust.mockResolvedValue(JSON.stringify({ items: [item] }));
+    // MS-06：票据组主模型与兜底模型默认不同，保持「合法票据放行」类用例的兜底传参不变。
+    mocks.resolveModel.mockResolvedValue('claude-opus-5-88');
   });
   afterEach(() => { vi.unstubAllEnvs(); vi.restoreAllMocks(); });
 
