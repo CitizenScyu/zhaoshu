@@ -25,7 +25,7 @@ export interface EngineContentResult { text: string }
 
 /** 翻页安全上限（引擎无定时器，靠页数/章节数上限终止，§7.3）。 */
 const MAX_TOC_PAGES = 20;
-const MAX_CONTENT_PAGES = 20;
+export const MAX_CONTENT_PAGES = 20; // E5 导出例外（41-M1.1）：阅读器正文 context 的 L1 上限复用此值，不另写数字
 const MAX_SEARCH_CANDIDATES = 50;
 const MAX_TITLE_LENGTH = 200;
 

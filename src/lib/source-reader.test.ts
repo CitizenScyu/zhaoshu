@@ -1652,6 +1652,35 @@ describe('chapter failover candidate queue (41-FAILOVER-M1)', () => {
     expect(mocks.fetch.mock.calls.some(([input]) => String(input) === backupChapter(777, 1))).toBe(false);
   });
 
+  it('引擎候选正文两页(第 1 页带下一页链接)⇒ 换源成功，正文包含两页内容(41-M1.1 第 0 项)', async () => {
+    // 引擎正文按 nextContentUrl 逐页 page();候选正文 context 的 L1 上限若低于翻页上限(M1 写的是 1),
+    // 第 2 页必撞 SOURCE_SCOPE_EXHAUSTED,整个候选被判失败。
+    const pagedEngine = {
+      url: 'https://book15.net/pg/', name: '翻页引擎源', searchUrl: 'https://book15.net/pgs?q={{key}}', tier: 'M1' as const,
+      rules: {
+        ruleSearch: { bookList: '.book', name: '.name@text', author: '.author@text', bookUrl: 'a@href' },
+        ruleBookInfo: { name: '.title@text', author: '.writer@text', tocUrl: '.toc@href' },
+        ruleToc: { chapterList: '.chapter', chapterName: 'a@text', chapterUrl: 'a@href' },
+        ruleContent: { content: '.content@text', nextContentUrl: '.next@href' },
+      },
+    };
+    const secondPage = 'https://book15.net/pg/c/1_2.html';
+    const catalog = await service.resolveSourceBook(book, context());
+    catalogs.set(catalog.version, catalog);
+    mocks.sources.mockResolvedValue([source, pagedEngine]);
+    pages.set(chapterUrl(), { text: '', status: 404 });
+    pages.set('https://book15.net/pgs?q=' + encodeURIComponent(book.title), {
+      text: '<div class="book"><span class="name">测试书</span><span class="author">作者</span><a href="/pg/d/1.html">x</a></div>',
+    });
+    pages.set('https://book15.net/pg/d/1.html', { text: '<h1 class="title">测试书</h1><span class="writer">作者</span><a class="toc" href="/pg/toc/1.html">目录</a>' });
+    pages.set('https://book15.net/pg/toc/1.html', { text: '<li class="chapter"><a href="/pg/c/1.html">第一章</a></li>' });
+    pages.set('https://book15.net/pg/c/1.html', { text: '<div class="content">第一页正文</div><a class="next" href="/pg/c/1_2.html">下一页</a>' });
+    pages.set(secondPage, { text: '<div class="content">第二页正文</div>' });
+    const part = await read(catalog);
+    expect(part).toMatchObject({ text: '第一页正文\n第二页正文', servedFrom: pagedEngine.name });
+    expect(mocks.fetch.mock.calls.map(([input]) => String(input))).toContain(secondPage);
+  });
+
   it('候选全部失败，保留 SOURCE_CHAPTER_UNAVAILABLE 503', async () => {
     const catalog = await prepare(['无关章节'], ['另一无关章节']);
     await expect(read(catalog)).rejects.toMatchObject({ code: 'SOURCE_CHAPTER_UNAVAILABLE', status: 503 });

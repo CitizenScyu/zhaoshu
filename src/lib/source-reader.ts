@@ -6,7 +6,7 @@ import { SourcePolicyError, alternateSourceHost, validateSourceUrl } from './sou
 import { sourceRevision } from './source-revision';
 import { normalizeBookTitle } from './book-identity';
 import {
-  engineFetchContent, engineFetchDetail, engineFetchToc, engineSearchBook, type EngineSource,
+  engineFetchContent, engineFetchDetail, engineFetchToc, engineSearchBook, MAX_CONTENT_PAGES, type EngineSource,
 } from './rule-engine/api';
 import { compileSource } from './rule-engine/compile';
 import {
@@ -966,8 +966,10 @@ async function switchSourceChapter(
       const alternativeSource = sources.find((item) => item.url === alternative.sourceUrl
         && sourceRevision(item) === alternative.sourceRevision);
       if (!alternativeSource) throw new Error('Alternative source not in pool snapshot');
-      // 正文复用目录 child 的父 signal，整个候选受同一 4s 切片约束。
-      const chapterContext = sourceContext.child(candidate.url, { limit: 1, sliceMs: SOURCE_FAILOVER_SLICE_MS });
+      // 正文复用目录 child 的父 signal，整个候选受同一 4s 切片约束。L1 上限取引擎翻页上限：引擎正文按
+      // nextContentUrl 逐页 page()，上限低于翻页数时第 2 页就撞 SOURCE_SCOPE_EXHAUSTED、整个候选作废；
+      // 耗时由切片兜底，总量由 L2 兜底。
+      const chapterContext = sourceContext.child(candidate.url, { limit: MAX_CONTENT_PAGES, sliceMs: SOURCE_FAILOVER_SLICE_MS });
       // 正文成功后才固化目录，避免失败候选污染可续读会话。
       const text = await chapterText(chapterContext, alternative.chapters[alternativeIndex], alternativeSource);
       if (!text.trim()) throw new Error('Alternative source returned empty chapter text');
