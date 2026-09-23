@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { chatRobust, configuredAttemptTimeoutMs, configuredFallbackModel, configuredTotalTimeoutMs, parseJson, LlmError } from '@/lib/llm';
+import { chatRobust, configuredAttemptTimeoutMs, configuredFallbackModel, configuredTotalTimeoutMs, parseJson, resolveModel, LlmError } from '@/lib/llm';
 import { recordUsageAfterResponse } from '@/lib/record-llm-usage';
 import { verifyBatch } from '@/lib/douban';
 import { supplementSourceEvidence } from '@/lib/source-verification';
@@ -220,6 +220,17 @@ export async function POST(req: NextRequest) {
     // Vercel 侧是否同样命中尚未验证。每次请求读一次配置，便于运维改 LLM_FALLBACK_MODEL 后
     // 立即生效。其它调用点（profile / feedback）刻意不传，保持既有行为中性。
     const fallbackModel = configuredFallbackModel();
+    // MS-06：兜底模型 == 主模型时跳过兜底分支。主模型取值与 chat() 用同一解析链
+    // （库覆盖 → 库默认 → LLM_MODEL → 硬编码，见 llm.ts resolveModel）。若兜底就等于主模型，
+    // 降级等于用同一个模型再跑一遍：白烧 ~120s 最低预算（MODEL_FALLBACK_MIN_BUDGET_MS）
+    // 且大概率再超时一次，净负收益。在进入 SSE 之前就拦下，并打告警让线上能看到这个配置组合。
+    const primaryModel = await resolveModel();
+    const fallbackEnabled = fallbackModel !== primaryModel;
+    if (!fallbackEnabled) {
+      console.warn(
+        `[find] fallback model equals primary model (${primaryModel}); skipping fallback branch`,
+      );
+    }
     // 单次尝试上限（首字节 + 流内停滞，取同一个值）：524 要吃满 ~126s，不给单次尝试封顶的话
     // 它一次就能把整步预算啃光、兜底永远轮不到。上限只压主模型那一路，兜底只受共享截止时间约束。
     const attemptTimeoutMs = configuredAttemptTimeoutMs();
@@ -272,7 +283,7 @@ export async function POST(req: NextRequest) {
           async (totalTimeoutMs) => (await chatRobust(
             recallSystem(),
             recallUser(profile.content, query, excludedBooks, conditions, excludedBooksOmitted),
-            { temperature: 0.8, signal: access.signal, onUsage: recordUsageAfterResponse('find_recall'), totalTimeoutMs, fallbackModel, ...modelAttemptLimits },
+            { temperature: 0.8, signal: access.signal, onUsage: recordUsageAfterResponse('find_recall'), totalTimeoutMs, fallbackModel: fallbackEnabled ? fallbackModel : undefined, ...modelAttemptLimits },
           )).content,
           (content) => modelList(content, 'candidates', MAX_CANDIDATES),
         ));
@@ -327,7 +338,7 @@ export async function POST(req: NextRequest) {
           async (totalTimeoutMs) => (await chatRobust(
             rerankSystem(),
             rerankUser(profile, query, JSON.stringify(rerankInput(verified)), conditions),
-            { temperature: 0.3, signal: access.signal, onUsage: recordUsageAfterResponse('find_rerank'), totalTimeoutMs, fallbackModel, ...modelAttemptLimits },
+            { temperature: 0.3, signal: access.signal, onUsage: recordUsageAfterResponse('find_rerank'), totalTimeoutMs, fallbackModel: fallbackEnabled ? fallbackModel : undefined, ...modelAttemptLimits },
           )).content,
           (content) => modelList(content, 'items', MAX_RERANKED_ITEMS, { allowEmpty: true }),
         ));
