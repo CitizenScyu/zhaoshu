@@ -2,10 +2,13 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createHash } from 'node:crypto';
 import corpus from './fixtures/admission-174.json';
 import {
-  ADMISSION_CONN_FAIL_RETEST_MS, ADMISSION_RETEST_INTERVAL_MS, DEFAULT_ADMISSION_MAX_PROBES,
-  admissionBucket, admissionMaxProbes, compileAdmission,
-  runAdmissionBatch, searchAdmission, rulesHash, type AdmissionSourceRow, type AdmissionTransport,
+  ADMISSION_CONN_FAIL_RETEST_MS, ADMISSION_OK_RECHECK_MS, ADMISSION_RECHECK_FAIL_PREFIX,
+  ADMISSION_RETEST_INTERVAL_MS, ADMISSION_TIMEOUT_MS, DEFAULT_ADMISSION_MAX_PROBES,
+  DEFAULT_ADMISSION_PROBE_CONCURRENCY, MAX_ADMISSION_PROBE_CONCURRENCY,
+  admissionBucket, admissionMaxProbes, admissionProbeConcurrency, compileAdmission,
+  recheckOutcome, runAdmissionBatch, searchAdmission, rulesHash, type AdmissionSourceRow, type AdmissionTransport,
 } from './admission';
+import { createDeadline } from '@/lib/deadline';
 import { ENGINE_SEMANTICS_VERSION, engineVersionedKey } from './compile';
 import { isForbiddenHostAddress, validateSourceUrl } from '@/lib/source-policy';
 import type { RawSource } from './compile-smoke';
@@ -86,6 +89,20 @@ describe('滤网 1 compileAdmission（纯本地）', () => {
 
 describe('滤网 2 searchAdmission 判定分桶', () => {
   const declared = (...hosts: string[]) => new Set(hosts);
+
+  it('signal 预先中止 ⇒ 不发请求,并以中止原因 reject(S5 纵深防御)', async () => {
+    // 单独删掉 admissionFetch 里「注册监听后补 if (signal.aborted) controller.abort」那行,
+    // 本测试必须红:已中止的 signal 上注册监听永不触发,传输层会拿到未中止的 probeSignal。
+    const controller = new AbortController();
+    const reason = new Error('budget');
+    controller.abort(reason);
+    const fetchPage = vi.fn<AdmissionTransport>().mockResolvedValue(page('<html>ok</html>'));
+    const settled = await searchAdmission(syntheticSource('https://ok.example.com/'), {
+      fetchPage, declaredHosts: declared('ok.example.com'), signal: controller.signal, throttleMs: 0,
+    }).then(() => 'resolved', (e: unknown) => e);
+    expect(fetchPage).not.toHaveBeenCalled();
+    expect(settled).toBe(reason);
+  });
 
   it('200 且 bookList 解析出候选 → ok', async () => {
     const fetchPage = vi.fn<AdmissionTransport>().mockResolvedValue(
@@ -986,7 +1003,7 @@ describe('准入状态机 runAdmissionBatch', () => {
           fetchPage: fetchOk(), signal: signal(), throttleMs: 0, maxProbes: 1,
         });
         expect(result.probed).toBe(1);
-        expect(result.rows[0].source_url).toBe(url); // 未测优先（probeClass 0 < 2）
+        expect(result.rows[0].source_url).toBe(url); // 未测优先（probeClass 0 < 2 < 3）
       });
     });
 
@@ -1072,6 +1089,203 @@ describe('准入状态机 runAdmissionBatch', () => {
       expect(fetchPage.mock.calls[0][0]).toContain('fresh.example.com');
     });
   });
+
+  // 41-B2-OK-RECHECK：ok 源不再永久免检——7 天长周期复核（class 2，名额最后），
+  // 首次失败记 strike（error=recheck_fail:<verdict>，search_ok/verdict 保持 ok，不出池），
+  // 可疑行 20h 后走 class 1 再确认，再失败才写真实结论出池。
+  describe('41-B2-OK-RECHECK：ok 源长周期复核 + 一次失败不出池', () => {
+    const url = 'https://b2.example.com';
+    const source = syntheticSource('https://b2.example.com/');
+    const hash = rulesHash(source);
+    const okPage = () => vi.fn<AdmissionTransport>().mockResolvedValue(
+      page('<div class="i"><span class="t">书名</span><a href="/b/1">x</a></div>'));
+    const okRow = (over: Partial<AdmissionSourceRow> = {}) => sourceRow(url, {
+      tier: 'M1', compile_ok: true, search_ok: true, search_verdict: 'ok', rules_hash: hash, ...over,
+    });
+
+    it('①ok 行 8 天前测过 → 进入探测（class 2）；名额受限时 class 0/1 先拿名额，ok 复核只吃剩余', async () => {
+      expect(ADMISSION_OK_RECHECK_MS).toBe(7 * 24 * 3_600_000);
+      const staleOk = okRow({ search_checked_at: new Date(Date.now() - 8 * 24 * 3_600_000).toISOString() });
+      // 名额 2：未测（class 0）与 deferred 到期（class 1）先占，ok 复核（class 2）吃不到名额。
+      const deferredUrl = 'https://b2-deferred.example.com';
+      const freshUrl = 'https://b2-fresh.example.com';
+      const deferredSource = syntheticSource('https://b2-deferred.example.com/');
+      const limited = await runAdmissionBatch({
+        candidates: [
+          { url, source },
+          { url: deferredUrl, source: deferredSource },
+          { url: freshUrl, source: syntheticSource('https://b2-fresh.example.com/') },
+        ],
+        declaredHosts: new Set(['b2.example.com', 'b2-deferred.example.com', 'b2-fresh.example.com']),
+        existing: new Map([
+          [url, staleOk],
+          [deferredUrl, sourceRow(deferredUrl, {
+            tier: 'M1', compile_ok: true, search_ok: false, search_verdict: 'http_5xx',
+            search_checked_at: new Date(Date.now() - 25 * 3_600_000).toISOString(),
+            rules_hash: rulesHash(deferredSource),
+          })],
+        ]),
+        fetchPage: okPage(), signal: signal(), throttleMs: 0, maxProbes: 2,
+      });
+      const probedHosts = limited.rows.map((row) => row.source_url);
+      expect(probedHosts).toEqual([freshUrl, deferredUrl]); // class 0 先于 class 1，ok 复核落选
+      expect(limited.probed).toBe(2);
+
+      // 名额宽（3）：ok 复核吃到剩余名额，最旧优先语义下同档排最前。
+      const wide = await runAdmissionBatch({
+        candidates: [
+          { url, source },
+          { url: deferredUrl, source: deferredSource },
+          { url: freshUrl, source: syntheticSource('https://b2-fresh.example.com/') },
+        ],
+        declaredHosts: new Set(['b2.example.com', 'b2-deferred.example.com', 'b2-fresh.example.com']),
+        existing: new Map([
+          [url, staleOk],
+          [deferredUrl, sourceRow(deferredUrl, {
+            tier: 'M1', compile_ok: true, search_ok: false, search_verdict: 'http_5xx',
+            search_checked_at: new Date(Date.now() - 25 * 3_600_000).toISOString(),
+            rules_hash: rulesHash(deferredSource),
+          })],
+        ]),
+        fetchPage: okPage(), signal: signal(), throttleMs: 0, maxProbes: 3,
+      });
+      expect(wide.rows.map((row) => row.source_url)).toEqual([freshUrl, deferredUrl, url]);
+      expect(wide.probed).toBe(3);
+    });
+
+    it('②ok 行 3 天前测过 → 未到 7 天窗，不探测', async () => {
+      const result = await runAdmissionBatch({
+        candidates: [{ url, source }], declaredHosts: new Set(['b2.example.com']),
+        existing: new Map([[url, okRow({
+          search_checked_at: new Date(Date.now() - 3 * 24 * 3_600_000).toISOString(),
+        })]]),
+        fetchPage: vi.fn<AdmissionTransport>(), signal: signal(), throttleMs: 0,
+      });
+      expect(result.probed).toBe(0);
+      expect(result.rows).toHaveLength(0);
+    });
+
+    it('③ok 复核首次失败（conn_fail 与 http_5xx）→ strike：search_ok=true、verdict=ok、error 带 recheck_fail: 前缀，仍在池', async () => {
+      for (const [verdict, fetchPage] of [
+        ['conn_fail', vi.fn<AdmissionTransport>().mockRejectedValue(new TypeError('fetch failed'))],
+        ['http_5xx', vi.fn<AdmissionTransport>().mockResolvedValue(page('boom', 500))],
+      ] as const) {
+        const result = await runAdmissionBatch({
+          candidates: [{ url, source }], declaredHosts: new Set(['b2.example.com']),
+          existing: new Map([[url, okRow({
+            search_checked_at: new Date(Date.now() - 8 * 24 * 3_600_000).toISOString(),
+          })]]),
+          fetchPage, signal: signal(), throttleMs: 0,
+        });
+        expect(result.probed, verdict).toBe(1);
+        expect(result.rows[0], verdict).toMatchObject({
+          search_ok: true, search_verdict: 'ok', error: `${ADMISSION_RECHECK_FAIL_PREFIX}${verdict}`,
+        });
+      }
+    });
+
+    it('④可疑行 21 小时后 → class 1 复测；再次失败 → search_ok=false + 真实 verdict（出池）', async () => {
+      const suspicious = okRow({
+        search_checked_at: new Date(Date.now() - 21 * 3_600_000).toISOString(),
+        error: `${ADMISSION_RECHECK_FAIL_PREFIX}conn_fail`,
+      });
+      // class 1 佐证：与未测源抢 1 个名额时未测赢（可疑行不抢 class 0），但先于 ok 长周期复核。
+      const freshUrl = 'https://b2-fresh2.example.com';
+      const order = await runAdmissionBatch({
+        candidates: [
+          { url, source },
+          { url: freshUrl, source: syntheticSource('https://b2-fresh2.example.com/') },
+        ],
+        declaredHosts: new Set(['b2.example.com', 'b2-fresh2.example.com']),
+        existing: new Map([[url, suspicious]]),
+        fetchPage: vi.fn<AdmissionTransport>().mockResolvedValue(page('boom', 500)),
+        signal: signal(), throttleMs: 0, maxProbes: 1,
+      });
+      expect(order.rows[0].source_url).toBe(freshUrl); // class 0 先于可疑行（class 1）
+
+      // 再次失败：strike 耗尽，写真实结论出池。
+      const again = await runAdmissionBatch({
+        candidates: [{ url, source }], declaredHosts: new Set(['b2.example.com']),
+        existing: new Map([[url, suspicious]]),
+        fetchPage: vi.fn<AdmissionTransport>().mockResolvedValue(page('boom', 500)),
+        signal: signal(), throttleMs: 0,
+      });
+      expect(again.probed).toBe(1);
+      expect(again.rows[0]).toMatchObject({ search_ok: false, search_verdict: 'http_5xx', error: '500' });
+    });
+
+    it('④b 可疑行(class 1)与另一个 class 1 到期源抢 1 个名额 → class 1 内最旧者赢,可疑行不混进 class 2', async () => {
+      // 现有 ④ 只证明可疑行输给 class 0,对「class 1 与 class 2 有别」是恒真的(class 0 对谁都赢)。
+      // 本条钉区分:可疑行(21h 前,带 recheck_fail 前缀)与一个更老的 deferred 到期源(class 1)
+      // 抢 1 个名额时,class 1 内按 search_checked_at 最旧优先——deferred 源(25h 前)赢,
+      // 可疑行落选写占位;若可疑行被错判成 class 2(名额最后),结果同样是 deferred 赢,
+      // 所以再加一个 8 天前的干净 ok 行(class 2)做对照:名额放宽到 2 时,可疑行必须排在
+      // class 2 之前拿到第 2 个名额。
+      const suspicious = okRow({
+        search_checked_at: new Date(Date.now() - 21 * 3_600_000).toISOString(),
+        error: `${ADMISSION_RECHECK_FAIL_PREFIX}conn_fail`,
+      });
+      const deferredUrl = 'https://b2-old-deferred.example.com';
+      const deferredSource = syntheticSource('https://b2-old-deferred.example.com/');
+      const okUrl = 'https://b2-old-ok.example.com';
+      const okSource = syntheticSource('https://b2-old-ok.example.com/');
+      const existing = new Map<string, AdmissionSourceRow>([
+        [url, suspicious],
+        [deferredUrl, sourceRow(deferredUrl, {
+          tier: 'M1', compile_ok: true, search_ok: false, search_verdict: 'http_5xx',
+          search_checked_at: new Date(Date.now() - 25 * 3_600_000).toISOString(),
+          rules_hash: rulesHash(deferredSource),
+        })],
+        [okUrl, sourceRow(okUrl, {
+          tier: 'M1', compile_ok: true, search_ok: true, search_verdict: 'ok',
+          search_checked_at: new Date(Date.now() - 8 * 24 * 3_600_000).toISOString(),
+          rules_hash: rulesHash(okSource),
+        })],
+      ]);
+      const candidates = [
+        { url, source },
+        { url: deferredUrl, source: deferredSource },
+        { url: okUrl, source: okSource },
+      ];
+      const hosts = new Set(['b2.example.com', 'b2-old-deferred.example.com', 'b2-old-ok.example.com']);
+      const one = await runAdmissionBatch({
+        candidates, declaredHosts: hosts, existing,
+        fetchPage: okPage(), signal: signal(), throttleMs: 0, maxProbes: 1,
+      });
+      expect(one.rows.filter((row) => row.search_verdict !== '').map((row) => row.source_url))
+        .toEqual([deferredUrl]); // class 1 内最旧者(25h)赢过可疑行(21h)
+      const two = await runAdmissionBatch({
+        candidates, declaredHosts: hosts, existing,
+        fetchPage: okPage(), signal: signal(), throttleMs: 0, maxProbes: 2,
+      });
+      expect(two.rows.filter((row) => row.search_verdict !== '').map((row) => row.source_url))
+        .toEqual([deferredUrl, url]); // 第 2 个名额给可疑行(class 1),class 2 的 ok 复核落选
+    });
+
+    it('⑤可疑行复测成功 → error 清空，回到普通 ok', async () => {
+      const result = await runAdmissionBatch({
+        candidates: [{ url, source }], declaredHosts: new Set(['b2.example.com']),
+        existing: new Map([[url, okRow({
+          search_checked_at: new Date(Date.now() - 21 * 3_600_000).toISOString(),
+          error: `${ADMISSION_RECHECK_FAIL_PREFIX}http_5xx`,
+        })]]),
+        fetchPage: okPage(), signal: signal(), throttleMs: 0,
+      });
+      expect(result.probed).toBe(1);
+      expect(result.rows[0]).toMatchObject({ search_ok: true, search_verdict: 'ok', error: '' });
+    });
+
+    it('recheckOutcome 纯函数：非 ok 行的探测失败照实写（strike 只保护干净 ok 行）', () => {
+      const failed = { verdict: 'http_5xx', candidateCount: 0, status: 500, error: '500' } as const;
+      expect(recheckOutcome(undefined, failed)).toEqual({ search_ok: false, search_verdict: 'http_5xx', error: '500' });
+      const deferredRow = sourceRow(url, { compile_ok: true, search_ok: false, search_verdict: 'http_5xx' });
+      expect(recheckOutcome(deferredRow, failed)).toEqual({ search_ok: false, search_verdict: 'http_5xx', error: '500' });
+      const cleanOk = sourceRow(url, { compile_ok: true, search_ok: true, search_verdict: 'ok' });
+      expect(recheckOutcome(cleanOk, failed)).toEqual({
+        search_ok: true, search_verdict: 'ok', error: `${ADMISSION_RECHECK_FAIL_PREFIX}http_5xx`,
+      });
+    });
+  });
 });
 
 describe('导出面红线（任务 4 结构断言的前置）', () => {
@@ -1154,6 +1368,8 @@ describe('rulesHash 纳入引擎语义版本', () => {
     expect(noSlot.probed).toBe(0);
 
     // 拿到名额 → 真探正常改写为新前缀，search_ok 不复用旧结论。
+    // 41-B2-OK-RECHECK 注：既有行是干净 ok 行，本次真探失败（no_result）只记 strike、
+    // 不出池——search_ok/verdict 保持 ok，error 带 recheck_fail: 前缀；hash 前缀照常翻新。
     const probed = await runAdmissionBatch({
       candidates: [{ url: 'https://search-version.example.com/', source }],
       declaredHosts: new Set(['search-version.example.com']),
@@ -1162,7 +1378,9 @@ describe('rulesHash 纳入引擎语义版本', () => {
     });
     expect(probed.rows).toHaveLength(1);
     expect(probed.rows[0]).toMatchObject({
-      compile_ok: true, search_ok: false, search_verdict: 'no_result', rules_hash: rulesHash(source),
+      compile_ok: true, search_ok: true, search_verdict: 'ok',
+      error: `${ADMISSION_RECHECK_FAIL_PREFIX}no_result`,
+      rules_hash: rulesHash(source),
       engine_semantics_version: ENGINE_SEMANTICS_VERSION,
     });
   });
@@ -1268,5 +1486,292 @@ describe('落库元数据自洽：engine_semantics_version 与 rulesHash 前缀�
     expect(row.engine_semantics_version).toBe(2);
     expect(row.rules_hash.startsWith('2:')).toBe(true);
     expect(row.engine_semantics_version).toBe(hashVersion(row.rules_hash));
+  });
+});
+// 41-ADMIT-CONC:准入探测受限并发(env ADMISSION_PROBE_CONCURRENCY,默认 1=串行)。
+// 判据三条:(a) 名额/canProbe 在 await 前同步领取(不超发);(b) 同 host 不并发;
+// (c) 输出按计划顺序(与完成先后无关)。c=1 时必须与串行版逐行一致(零行为变更)。
+describe('41-ADMIT-CONC:准入探测受限并发', () => {
+  afterEach(() => { vi.unstubAllEnvs(); vi.useRealTimers(); });
+
+  // fake transport 工厂:按 host 记录调用序/在飞峰值;可给每 host 配结果与延迟。
+  type FetchImpl = (url: string) => Promise<Response>;
+  function tracker(fetchImpl?: FetchImpl) {
+    let inflight = 0;
+    let maxInflight = 0;
+    const byHostInflight = new Map<string, number>();
+    const hostPeak = new Map<string, number>();
+    const calls: string[] = [];
+    const impl = async (input: string): Promise<Response> => {
+      const host = new URL(input).hostname;
+      calls.push(host);
+      inflight += 1;
+      maxInflight = Math.max(maxInflight, inflight);
+      const h = (byHostInflight.get(host) ?? 0) + 1;
+      byHostInflight.set(host, h);
+      hostPeak.set(host, Math.max(hostPeak.get(host) ?? 0, h));
+      await Promise.resolve(); // 让出,确保并发请求真正交叠
+      try {
+        if (fetchImpl) return await fetchImpl(input);
+        return page('<html>no results</html>');
+      } finally {
+        inflight -= 1;
+        byHostInflight.set(host, (byHostInflight.get(host) ?? 1) - 1);
+      }
+    };
+    return {
+      fetchPage: vi.fn<AdmissionTransport>(impl),
+      get maxInflight() { return maxInflight; },
+      get hostPeak() { return hostPeak; },
+      get calls() { return calls; },
+    };
+  }
+
+  const candidatesFor = (hosts: string[]) => hosts.map((host) => ({
+    url: `https://${host}`, source: syntheticSource(`https://${host}/`),
+  }));
+
+  it('并发 c 时同时在飞 ≤ c(fake transport 记录在飞峰值)', async () => {
+    const hosts = ['c0.example.com', 'c1.example.com', 'c2.example.com', 'c3.example.com', 'c4.example.com'];
+    const t = tracker();
+    const result = await runAdmissionBatch({
+      candidates: candidatesFor(hosts),
+      declaredHosts: new Set(hosts), existing: new Map(),
+      fetchPage: t.fetchPage, signal: signal(), throttleMs: 0, maxProbes: 5, probeConcurrency: 2,
+    });
+    expect(result.probed).toBe(5);
+    expect(t.fetchPage).toHaveBeenCalledTimes(5);
+    expect(t.maxInflight).toBeLessThanOrEqual(2);
+    expect(t.maxInflight).toBeGreaterThanOrEqual(2); // 确实并行了(不是退化成串行)
+  });
+
+  it('名额永不超发:名额 5、c=4、10 个候选 ⇒ 恰好 5 次探测', async () => {
+    const hosts = Array.from({ length: 10 }, (_, i) => `n${i}.example.com`);
+    const t = tracker();
+    const result = await runAdmissionBatch({
+      candidates: candidatesFor(hosts),
+      declaredHosts: new Set(hosts), existing: new Map(),
+      fetchPage: t.fetchPage, signal: signal(), throttleMs: 0, maxProbes: 5, probeConcurrency: 4,
+    });
+    expect(result.probed).toBe(5);
+    expect(t.fetchPage).toHaveBeenCalledTimes(5);
+    // 被探的是计划序里最前的 5 个(未测 class 0,输入序)。
+    expect(t.calls).toEqual(['n0.example.com', 'n1.example.com', 'n2.example.com', 'n3.example.com', 'n4.example.com']);
+  });
+
+  it('同 host 不并发:同一 host 两个候选不会同时在飞', async () => {
+    // 两个候选同一 host(不同 url 路径),外加两个别的 host 提供并发度。
+    const dup = [
+      { url: 'https://dup.example.com/a', source: syntheticSource('https://dup.example.com/a') },
+      { url: 'https://dup.example.com/b', source: syntheticSource('https://dup.example.com/b') },
+      { url: 'https://x.example.com', source: syntheticSource('https://x.example.com/') },
+      { url: 'https://y.example.com', source: syntheticSource('https://y.example.com/') },
+    ];
+    const t = tracker();
+    await runAdmissionBatch({
+      candidates: dup,
+      declaredHosts: new Set(['dup.example.com', 'x.example.com', 'y.example.com']),
+      existing: new Map(), fetchPage: t.fetchPage, signal: signal(), throttleMs: 0, maxProbes: 4, probeConcurrency: 4,
+    });
+    expect(t.fetchPage).toHaveBeenCalledTimes(4);
+    expect(t.hostPeak.get('dup.example.com')).toBe(1); // 同 host 峰值 1 = 从不并发
+  });
+
+  it('canProbe 随探测耗时转 false ⇒ 逐探止损,之后不再起探并写占位(对照基点 3059eb5 实测值)', async () => {
+    // 判据钉的是基点行为,不是新实现自比:canProbe 依赖时间(每探耗 8s,预算 30s,
+    // 门槛 8s 超时 + 5s 写库预留 = 13s)。5 个候选、名额 20。
+    // 基点 3059eb5 实测:probed=3、请求 3 次、占位 2 条、起探时剩余 [30,22,14]s。
+    // 5f3b506(名额在批次开头一次性领完)实测:probed=5、占位 0——本断言在其上必红。
+    const hosts = ['t0.example.com', 't1.example.com', 't2.example.com', 't3.example.com', 't4.example.com'];
+    const BUDGET = 30_000;
+    let elapsed = 0;
+    const startedAt: number[] = [];
+    const fetchPage = vi.fn<AdmissionTransport>(async () => {
+      startedAt.push(elapsed);
+      elapsed += 8_000;
+      return page('<html>no results</html>');
+    });
+    const result = await runAdmissionBatch({
+      candidates: candidatesFor(hosts), declaredHosts: new Set(hosts), existing: new Map(),
+      fetchPage, signal: signal(), throttleMs: 0, maxProbes: 20,
+      canProbe: () => BUDGET - elapsed > ADMISSION_TIMEOUT_MS + 5_000,
+    });
+    expect(result.probed).toBe(3);
+    expect(fetchPage).toHaveBeenCalledTimes(3);
+    expect(result.rows.filter((r) => r.search_ok === null)).toHaveLength(2);
+    expect(startedAt.map((t) => BUDGET - t)).toEqual([30_000, 22_000, 14_000]);
+  });
+
+  it('两探之间调用方中止 signal ⇒ 不再发起新请求,其余写占位,批次正常返回', async () => {
+    // 基点 3059eb5 实测:请求 1 次、probed=1、占位 2 条。
+    // 5f3b506 实测:请求 3 次(第 2、3 次在中止之后发出)——本断言在其上必红。
+    // now() 第 1 次 = planProbeOrder;第 2 次 = 第 1 探完成后取 search_checked_at,
+    // 恰在两探之间中止。
+    const hosts = ['a0.example.com', 'a1.example.com', 'a2.example.com'];
+    const controller = new AbortController();
+    let nowCalls = 0;
+    const fixed = new Date('2026-09-23T00:00:00Z');
+    const now = () => { nowCalls += 1; if (nowCalls === 2) controller.abort(new Error('budget')); return fixed; };
+    const fetchPage = vi.fn<AdmissionTransport>(async () => page('<html>no results</html>'));
+    const result = await runAdmissionBatch({
+      candidates: candidatesFor(hosts), declaredHosts: new Set(hosts), existing: new Map(),
+      fetchPage, signal: controller.signal, throttleMs: 0, maxProbes: 20, now,
+    });
+    expect(fetchPage).toHaveBeenCalledTimes(1);
+    expect(result.probed).toBe(1);
+    expect(result.rows.filter((r) => r.search_ok === null)).toHaveLength(2);
+    expect(result.rows.map((r) => r.search_verdict || '(placeholder)')).toEqual([
+      'no_result', '(placeholder)', '(placeholder)',
+    ]);
+  });
+
+  it('生产形状:createDeadline(60s)+20 个死站每探 8s 超时 ⇒ 预算内收口并返回全部 20 行', async () => {
+    // canProbe 口径同 shuyuan.ts:990(剩余 > 8s 超时 + 5s 写库预留)。
+    // 基点 3059eb5 实测:resolve、probed=6、20 行(6 条 conn_fail + 14 条占位)。
+    // 5f3b506 实测:reject DeadlineExceededError、起探 8 次——本断言在其上必红。
+    vi.useFakeTimers();
+    const budget = createDeadline(60_000);
+    const hosts = Array.from({ length: 20 }, (_, i) => `d${i}.example.com`);
+    const fetchPage = vi.fn<AdmissionTransport>((_input, init) => new Promise<Response>((_resolve, reject) => {
+      init.signal.addEventListener('abort', () => reject(init.signal.reason), { once: true });
+    }));
+    const batch = runAdmissionBatch({
+      candidates: candidatesFor(hosts), declaredHosts: new Set(hosts), existing: new Map(),
+      fetchPage, signal: budget.signal, throttleMs: 0, maxProbes: 20,
+      canProbe: () => !budget.signal.aborted && budget.remainingMs > ADMISSION_TIMEOUT_MS + 5_000,
+    });
+    const settled = batch.then(
+      (r) => ({ ok: true as const, r }),
+      (e: unknown) => ({ ok: false as const, e }),
+    );
+    await vi.advanceTimersByTimeAsync(200_000);
+    const outcome = await settled;
+    budget.dispose();
+    expect(outcome.ok).toBe(true);
+    if (!outcome.ok) return;
+    expect(outcome.r.probed).toBe(6);
+    expect(outcome.r.rows).toHaveLength(20);
+    expect(outcome.r.rows.filter((r) => r.search_verdict === 'conn_fail')).toHaveLength(6);
+    expect(outcome.r.rows.filter((r) => r.search_ok === null)).toHaveLength(14);
+  });
+
+  it('c>1 时调用方中止 ⇒ 被 host 挡住的 worker 不再发孤儿请求', async () => {
+    // 5f3b506 实测:批次 reject 后,被同 host 挡住的 worker 被唤醒仍发出
+    // fetch#3(callerAborted=true)。逐探判 signal 后该请求必须消失。
+    const controller = new AbortController();
+    const cands = [
+      { url: 'https://dup.example.com/a', source: syntheticSource('https://dup.example.com/a') },
+      { url: 'https://dup.example.com/b', source: syntheticSource('https://dup.example.com/b') },
+      { url: 'https://x.example.com', source: syntheticSource('https://x.example.com/') },
+    ];
+    let nowCalls = 0;
+    const now = () => { nowCalls += 1; if (nowCalls === 2) controller.abort(new Error('budget')); return new Date(); };
+    const seen: boolean[] = [];
+    const fetchPage = vi.fn<AdmissionTransport>((_input, init) => {
+      seen.push(controller.signal.aborted);
+      if (seen.length === 1) {
+        return new Promise<Response>((_resolve, reject) => {
+          init.signal.addEventListener('abort', () => reject(init.signal.reason), { once: true });
+        });
+      }
+      return Promise.resolve(page('<html>no results</html>'));
+    });
+    const outcome = await runAdmissionBatch({
+      candidates: cands, declaredHosts: new Set(['dup.example.com', 'x.example.com']), existing: new Map(),
+      fetchPage, signal: controller.signal, throttleMs: 0, maxProbes: 20, now, probeConcurrency: 2,
+    }).then(() => 'resolved', () => 'rejected');
+    // 在飞探测遭调用方中止 ⇒ 整批 reject(不许吞掉异常后照常 resolve 并写库)。
+    expect(outcome).toBe('rejected');
+    expect(seen.filter((aborted) => aborted)).toEqual([]);
+  });
+
+  it('结果行顺序 = 计划顺序(不同延迟使完成顺序与计划顺序相反)', async () => {
+    const hosts = ['o0.example.com', 'o1.example.com', 'o2.example.com'];
+    // o0 最慢、o2 最快 ⇒ 完成顺序 o2,o1,o0,与计划顺序相反。
+    const delays: Record<string, number> = { 'o0.example.com': 30, 'o1.example.com': 15, 'o2.example.com': 0 };
+    const t = tracker(async (input) => {
+      const host = new URL(input).hostname;
+      await new Promise((resolve) => setTimeout(resolve, delays[host]));
+      return page('<html>no results</html>');
+    });
+    const result = await runAdmissionBatch({
+      candidates: candidatesFor(hosts),
+      declaredHosts: new Set(hosts), existing: new Map(),
+      fetchPage: t.fetchPage, signal: signal(), throttleMs: 0, maxProbes: 3, probeConcurrency: 3,
+    });
+    // 启动顺序=计划序(证明排序不是「碰巧对」——完成顺序另由延迟决定)。
+    expect(t.calls).toEqual(['o0.example.com', 'o1.example.com', 'o2.example.com']);
+    expect(result.rows.map((r) => r.source_url)).toEqual([
+      'https://o0.example.com', 'https://o1.example.com', 'https://o2.example.com',
+    ]);
+  });
+
+  it('c=1 输出与基点 3059eb5 的固定期望逐行相等(不自比)', async () => {
+    // 期望值取自基点 3059eb5 同输入的实测输出(固定 now,无延迟):3 行全 no_result,
+    // search_checked_at 固定、rules_hash 前缀 1:(ENGINE_SYNTAX_OR 未开)。5f3b506 在此输入上碰巧相同,所以本条
+    // 单独不区分;区分力由上面三条「逐探止损」断言承担(它们在 5f3b506 上必红)。
+    const hosts = ['q0.example.com', 'q1.example.com', 'q2.example.com'];
+    const fixedNow = () => new Date('2026-09-23T00:00:00Z');
+    const result = await runAdmissionBatch({
+      candidates: candidatesFor(hosts), declaredHosts: new Set(hosts), existing: new Map(),
+      fetchPage: vi.fn<AdmissionTransport>(async () => page('<html>no results</html>')),
+      signal: signal(), throttleMs: 0, maxProbes: 3, now: fixedNow,
+    });
+    expect(result.probed).toBe(3);
+    expect(result.verdicts).toEqual({ no_result: 3 });
+    expect(result.rows.map((r) => ({
+      url: r.source_url, tier: r.tier, compile_ok: r.compile_ok, search_ok: r.search_ok,
+      verdict: r.search_verdict, checked: r.search_checked_at, error: r.error,
+      hashPrefix: r.rules_hash.slice(0, 2), version: r.engine_semantics_version,
+    }))).toEqual(hosts.map((host) => ({
+      url: `https://${host}`, tier: 'M1', compile_ok: true, search_ok: false,
+      verdict: 'no_result', checked: '2026-09-23T00:00:00.000Z', error: 'bookList 未解析出候选',
+      hashPrefix: '1:', version: 1,
+    })));
+  });
+
+  it('注入值 probeConcurrency=100 被钳到上限 8(在飞峰值 ≤8)', async () => {
+    // S6:env 路径已由 admissionProbeConcurrency 单独钳制;这里补注入值(测试直传)的钳制覆盖。
+    const hosts = Array.from({ length: 10 }, (_, i) => `k${i}.example.com`);
+    const t = tracker();
+    const result = await runAdmissionBatch({
+      candidates: candidatesFor(hosts), declaredHosts: new Set(hosts), existing: new Map(),
+      fetchPage: t.fetchPage, signal: signal(), throttleMs: 0, maxProbes: 10, probeConcurrency: 100,
+    });
+    expect(result.probed).toBe(10);
+    expect(t.maxInflight).toBeLessThanOrEqual(8);
+    expect(t.maxInflight).toBeGreaterThan(1);
+  });
+
+  describe('env ADMISSION_PROBE_CONCURRENCY 解析:缺失/非法/0/负数/超上限', () => {
+    it('默认值常量 = 1(串行=零行为变更)', () => {
+      expect(DEFAULT_ADMISSION_PROBE_CONCURRENCY).toBe(1);
+      expect(MAX_ADMISSION_PROBE_CONCURRENCY).toBe(8);
+      expect(admissionProbeConcurrency({})).toBe(1);
+      expect(admissionProbeConcurrency({ ADMISSION_PROBE_CONCURRENCY: '' })).toBe(1);
+      expect(admissionProbeConcurrency({ ADMISSION_PROBE_CONCURRENCY: 'abc' })).toBe(1);
+      expect(admissionProbeConcurrency({ ADMISSION_PROBE_CONCURRENCY: '0' })).toBe(1);
+      expect(admissionProbeConcurrency({ ADMISSION_PROBE_CONCURRENCY: '-3' })).toBe(1);
+    });
+
+    it('合法值生效;超上限夹到 8;3.5 截断为 3(同款 admissionMaxProbes 口径)', () => {
+      expect(admissionProbeConcurrency({ ADMISSION_PROBE_CONCURRENCY: '4' })).toBe(4);
+      expect(admissionProbeConcurrency({ ADMISSION_PROBE_CONCURRENCY: '8' })).toBe(8);
+      expect(admissionProbeConcurrency({ ADMISSION_PROBE_CONCURRENCY: '100' })).toBe(8);
+      expect(admissionProbeConcurrency({ ADMISSION_PROBE_CONCURRENCY: '3.5' })).toBe(3);
+    });
+
+    it('env 覆盖穿透批次:ADMISSION_PROBE_CONCURRENCY=2(stubEnv)⇒ 在飞峰值 ≤2 且确实并行', async () => {
+      vi.stubEnv('ADMISSION_PROBE_CONCURRENCY', '2');
+      const hosts = ['z0.example.com', 'z1.example.com', 'z2.example.com', 'z3.example.com'];
+      const t = tracker();
+      const result = await runAdmissionBatch({
+        candidates: candidatesFor(hosts), declaredHosts: new Set(hosts), existing: new Map(),
+        fetchPage: t.fetchPage, signal: signal(), throttleMs: 0, maxProbes: 4,
+      });
+      expect(result.probed).toBe(4);
+      expect(t.maxInflight).toBeLessThanOrEqual(2);
+      expect(t.maxInflight).toBeGreaterThanOrEqual(2);
+    });
   });
 });
