@@ -1809,6 +1809,7 @@ describe('chapter failover M1.1 (41-M1.1)', () => {
       if (wait) await new Promise((resolve) => setTimeout(resolve, wait));
       const fixture = pages.get(url);
       if (!fixture) throw new Error('Unexpected source request');
+      if (fixture.status === -2) throw new TypeError('fetch failed');
       const hold = bodyDelay.get(url);
       if (hold === undefined) return new Response(fixture.text, { status: fixture.status ?? 200 });
       // 响应头立即到达、正文按虚拟时间延后(Infinity = 永不完成):3s 连接段上限只管到响应头为止。
@@ -2015,6 +2016,28 @@ describe('chapter failover M1.1 (41-M1.1)', () => {
     primeHit(1);
     expect((await readChapter(catalog)).servedFrom).toBe(alt(1).name);
     expect(oneFailoverLine('success', [current, ...pool])).toMatchObject({ trigger: 'SOURCE_CHANGED', attempted: 1 });
+  });
+
+  it('b: trigger 按错误类型分型:HTTP 5xx / 网络失败 / 连接超时', async () => {
+    const pool = [current, alt(1)];
+    const catalog = await prepareCurrent(pool);
+    primeHit(1);
+    const cases: Array<[string, () => void]> = [
+      ['SOURCE_HTTP_5XX', () => pages.set(currentChapter, { text: '', status: 500 })],
+      ['SOURCE_NETWORK_ERROR', () => pages.set(currentChapter, networkFailure)],
+      // 响应头迟迟不到：3s 连接段上限先到(ConnectTimeoutError),两次尝试约 6s,仍在 10s 切片之内。
+      ['SOURCE_REQUEST_TIMEOUT', () => {
+        pages.set(currentChapter, { text: chapterHtml('当前源正文') });
+        headerDelay.set(currentChapter, 3_500);
+      }],
+    ];
+    for (const [trigger, arrange] of cases) {
+      vi.setSystemTime(Date.now() + 121_000); // 章节暖缓存 2 分钟过期：每轮都真去抓当前源
+      errorSpy.mockClear();
+      arrange();
+      expect((await readChapter(catalog)).servedFrom).toBe(alt(1).name);
+      expect(oneFailoverLine('success', pool)).toMatchObject({ trigger });
+    }
   });
 
   it.each([
