@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import { createElement } from 'react';
 import type { ReactNode } from 'react';
-import { cleanup, render, screen, waitFor } from '@testing-library/react';
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { userEvent } from '@testing-library/user-event';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -12,7 +12,7 @@ import ReaderClient from './ReaderClient';
 // 换源的状态流转正是靠 fetch 参数断言来钉。
 //
 // reader.module.css 桩掉:纯样式,且本机 PostCSS/Tailwind 插件链加载有问题、与渲染断言无关。
-vi.mock('./reader.module.css', () => ({ default: {} }));
+vi.mock('./reader.module.css', () => ({ default: new Proxy({}, { get: (_target, key) => String(key) }) }));
 vi.mock('next/link', () => ({
   default: (props: { children?: unknown; href: unknown }) => createElement('a', { href: props.href }, props.children as ReactNode),
 }));
@@ -34,7 +34,13 @@ vi.mock('@/components/OwnerProvider', async (importOriginal) => {
 // 不改被测代码。
 if (!('ResizeObserver' in globalThis)) {
   (globalThis as unknown as { ResizeObserver: unknown }).ResizeObserver =
-    class { observe() {} unobserve() {} disconnect() {} };
+    class {
+      private cb: () => void;
+      constructor(cb: () => void) { this.cb = cb; }
+      observe() { queueMicrotask(() => this.cb()); }
+      unobserve() {}
+      disconnect() {}
+    };
 }
 if (typeof Element !== 'undefined' && !Element.prototype.scrollIntoView) {
   Element.prototype.scrollIntoView = () => {};
@@ -346,7 +352,7 @@ describe('ReaderClient 换源:换源面板 ok / miss / unreachable 及 partial �
 describe('ReaderClient 换源:按标题对齐回原文(正确行为,非 H7)', () => {
   // 正确行为:同一个位置(章序号)在新源里换了一个标题不同的正文时,按目录对齐后前端应
   // 交付**服务端新源返回的正文**,而不是把旧源残留的正文当成结果。这里只钉「同一序号 + 新
-  // 源响应 ⇒ 新源正文透出」,不去碰「换源后下一章用旧序号」这类 H7 已知 bug(见文末 it.todo)。
+  // 源响应 ⇒ 新源正文透出」,不去碰「换源后下一章用旧序号」这类 H7 问题(见下一组 H7 用例)。
   it('换源后按服务端返回渲染新源正文', async () => {
     const apiFetch = vi.fn(async (input: RequestInfo | URL) => {
       const url = String(input);
@@ -363,11 +369,95 @@ describe('ReaderClient 换源:按标题对齐回原文(正确行为,非 H7)', ()
     await screen.findByText(/续读正文/);
   });
 
-  // H7/F11 已知 bug:换源采纳后前端仍沿用**旧目录的 chapters**,按旧序号 +1 请求新 session;
-  // 新旧目录序号不一致(如备用站多一个「序言」)时,服务端按新目录该序号返回 ⇒ 重复章/错章,
-  // 且 readerPartMatches 不比对标题会接受。修复另开一条线。这里按**正确行为**断言(换源后下一章
-  // 请求应基于新目录/按标题对齐),当前实现下必然失败 —— 修复后翻绿。
-  it.todo('换源采纳后,下一章请求基于新源目录而非旧目录序号(H7 已知 bug,修复后翻绿)');
+});
+
+// H7/F11:换源响应附带新源目录(switchedChapters)与本章在新目录的序号(switchedChapterIndex)时,
+// 前端一次性替换旧目录并把位置迁过去 —— 之后的「下一章」/续读按**新目录**序号请求。
+// 备用目录 [序言, 第一章, 第二章] 比原目录多一个「序言」:首章在新目录序号 1,下一章必须请求
+// chapter=2(第二章);按旧段号 +1 会请求 chapter=1 —— 那在新目录里是「第一章」,即重复章。
+// 断言一律只看**点击之后新增**的请求(先记点击前的请求数);预取关掉(preloadNext=false),
+// 否则命中预取缓存的点击不发请求,点击前的预取又会混进来 —— 恒真用例正是这么来的。
+describe('ReaderClient 换源:H7 新目录序号(点击后请求的真断言)', () => {
+  const newChapters = [
+    { index: 0, title: '序言', startByte: 0, endByte: 0, partCount: 1 },
+    { index: 1, title: '第一章', startByte: 0, endByte: 0, partCount: 1 },
+    { index: 2, title: '第二章', startByte: 0, endByte: 0, partCount: 1 },
+  ];
+  const param = (url: string, key: string) => new URLSearchParams(url.split('?')[1]).get(key);
+  const chapterUrlsSince = (apiFetch: FetchMock, from: number) =>
+    urls(apiFetch).slice(from).filter((u) => u.startsWith('/api/read/source/chapter'));
+
+  // 原源(sess-A)的首章换源成功:交付段按请求的旧序号标记(chapterIndex=0、标题取旧目录),
+  // 与服务端 readSourceChapter 同形;新 session(v2)的请求按新目录序号交付。
+  function switchingFetch() {
+    return vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.startsWith('/api/read/source/index')) return json(catalog());
+      if (param(url, 'session') === 'sess-A') {
+        return json(part({
+          version: 'v2', sourceSession: 'v2', sourceId: 'src-2', servedFrom: '源乙',
+          switchedChapters: newChapters, switchedChapterIndex: 1,
+        }));
+      }
+      const chapter = Number(param(url, 'chapter') ?? '0');
+      const title = newChapters[chapter]?.title ?? '未知章';
+      return json(part({ chapterIndex: chapter, title, version: 'v2', sourceId: 'src-2', servedFrom: '源乙', text: title + '\n新目录正文' }));
+    });
+  }
+
+  beforeEach(() => {
+    window.localStorage.setItem('novel-finder-reading-settings', JSON.stringify({ preloadNext: false }));
+  });
+
+  it('① 页脚先落到迁移后的章,再点「下一章」⇒ 点击只请求新目录「迁移目标+1」且带新 session,不发重复章', async () => {
+    const apiFetch = switchingFetch();
+    renderReader(apiFetch);
+    await screen.findByText(/正文内容/);
+    // 先等显示的章节等于迁移后的目标:新目录序号 1 ⇒ 页脚「第 2 / 3 章」。
+    await screen.findByText('第 2 / 3 章');
+
+    const before = urls(apiFetch).length;
+    const user = userEvent.setup();
+    await user.click(screen.getByRole('button', { name: '下一章 →' }));
+    await screen.findByRole('region', { name: '第二章' });
+
+    const clicked = chapterUrlsSince(apiFetch, before);
+    expect(clicked).toHaveLength(1);
+    expect(param(clicked[0], 'chapter')).toBe('2');
+    expect(param(clicked[0], 'session')).toBe('v2');
+    // 负对照:重复章(新目录序号 1 =「第一章」+ 新 session)一次也不许请求。
+    expect(clicked.filter((u) => param(u, 'chapter') === '1' && param(u, 'session') === 'v2')).toEqual([]);
+  });
+
+  it('② 时序窗口:换源正文一出现就立即点「下一章」(不等任何后续状态)⇒ 不得请求重复章', async () => {
+    const apiFetch = switchingFetch();
+    renderReader(apiFetch);
+    await screen.findByText(/正文内容/);
+
+    const next = screen.getByRole('button', { name: '下一章 →' }) as HTMLButtonElement;
+    expect(next.disabled).toBe(false);
+    const before = urls(apiFetch).length;
+    fireEvent.click(next);
+    await screen.findByRole('region', { name: '第二章' });
+
+    const clicked = chapterUrlsSince(apiFetch, before);
+    expect(clicked.map((u) => param(u, 'chapter'))).toEqual(['2']);
+    expect(clicked.filter((u) => param(u, 'chapter') === '1' && param(u, 'session') === 'v2')).toEqual([]);
+  });
+
+  it('③ 续读:换源刚采纳就点「接着读下一章」⇒ 只请求新目录序号 2,不发重复章', async () => {
+    const apiFetch = switchingFetch();
+    renderReader(apiFetch);
+    await screen.findByText(/正文内容/);
+
+    const before = urls(apiFetch).length;
+    fireEvent.click(screen.getByRole('button', { name: /接着读下一章/ }));
+    await screen.findByRole('region', { name: '第二章' });
+
+    const clicked = chapterUrlsSince(apiFetch, before);
+    expect(clicked.map((u) => param(u, 'chapter'))).toEqual(['2']);
+    expect(param(clicked[0], 'session')).toBe('v2');
+  });
 });
 
 describe('ReaderClient 状态流转边界', () => {

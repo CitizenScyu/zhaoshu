@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto';
 import { afterEach, beforeEach, describe, expect, it, vi, type MockInstance } from 'vitest';
 import type { SourceCatalog, SourceReaderError, SourceSimilarCandidate } from './source-reader';
 import { sourceRevision } from './source-revision';
+import { readerPartMatches } from './reader-session';
 
 type Query = { text: string; values: unknown[] };
 const mocks = vi.hoisted(() => ({ getSql: vi.fn(), ensureSchema: vi.fn(), sources: vi.fn(), fetch: vi.fn<typeof fetch>() }));
@@ -854,6 +855,80 @@ describe('GET /api/read/source/[resource]', () => {
     expect(partRes.status).toBe(200);
     expectPrivate(partRes);
     expect((await partRes.json()).text).toBe('离线测试正文。');
+  });
+
+  it('H7:换源响应附带新目录章节列表与新序号,字段集与 index 一致且不含上游 URL,新目录只来自 DB 读', async () => {
+    // 备用目录是 [序言, 第一章, 第二章]:当前源首章失效后换到备用源,
+    // 响应必须带出备用目录,且本次交付的「第一章」在新目录里是序号 1。
+    mocks.sources.mockResolvedValue([source, backup]);
+    pages.set(chapterUrl(), { text: '', status: 404 });
+    pages.set(backupSearch(), { text: '<a href="/books/details777.html">测试书</a>' });
+    pages.set(backupPage, { text: detail(777, '作者', ['序言', '第一章', '第二章']) });
+    pages.set(backupChapter(777, 2), { text: chapterHtml('备用第一章') });
+    const indexRes = await request();
+    const index = await indexRes.json();
+    const beforeChapter = mocks.fetch.mock.calls.length;
+    const partRes = await request('chapter', `session=${index.source.session}&version=${index.version}&chapter=0`);
+    expect(partRes.status).toBe(200);
+    const part = await partRes.json();
+    expect(part.text).toBe('备用第一章');
+    expect(part.sourceSession).toBe(part.version);
+    expect(part.switchedChapterIndex).toBe(1);
+    expect(part.switchedChapters).toEqual([
+      { index: 0, title: '序言', startByte: 0, endByte: 0, partCount: 1 },
+      { index: 1, title: '第一章', startByte: 0, endByte: 0, partCount: 1 },
+      { index: 2, title: '第二章', startByte: 0, endByte: 0, partCount: 1 },
+    ]);
+    // 字段集与 index 资源的 chapters 完全一致:不含上游 URL 等 index 不暴露的字段。
+    const indexChapters = (await (await request()).json()).chapters as Array<Record<string, unknown>>;
+    for (const chapter of part.switchedChapters as Array<Record<string, unknown>>) {
+      expect(Object.keys(chapter).sort()).toEqual(Object.keys(indexChapters[0]).sort());
+    }
+    expect(JSON.stringify(part.switchedChapters)).not.toContain('backup.test');
+    expect(JSON.stringify(part.switchedChapters)).not.toContain('http');
+    // 新目录只来自 DB 读:chapter 阶段的上游请求里,备用源只出现搜索/详情/章节各一发
+    // (换源本身),没有为附目录再发任何一发。
+    const duringChapter = mocks.fetch.mock.calls.slice(beforeChapter).map(([input]) => String(input));
+    expect(duringChapter.filter((url) => url.startsWith('https://backup.test/'))).toEqual([
+      backupSearch(), backupPage, backupChapter(777, 2),
+    ]);
+    // 负对照:未换源的章节响应不带新目录字段(旧响应形状逐字不变)。
+    const plain = await (await request('chapter', `session=${part.sourceSession}&version=${part.version}&chapter=0`)).json();
+    expect(plain.switchedChapters).toBeUndefined();
+    expect(plain.switchedChapterIndex).toBeUndefined();
+  });
+
+  it('H7 必修 A:章名漂移(同章号+主体扩写)时换源响应仍附新目录,重读时前端接受', async () => {
+    // 复审复现:原目录「第1章 风起」,备用目录「第1章 风起与云涌」(matchSourceChapter tier 3)。
+    // 严格相等判据下 attach 静默不附,重读时前端标题防线判不符。
+    mocks.sources.mockResolvedValue([source, backup]);
+    pages.set('https://book15.net/books/search.html?kw=' + encodeURIComponent(book.title), {
+      text: '<a href="/books/details42.html">测试书</a>',
+    });
+    pages.set(pageUrl(), { text: detail(42, '作者', ['第1章 风起', '第2章 落雨']) });
+    pages.set(chapterUrl(), { text: '', status: 404 });
+    pages.set(backupSearch(), { text: '<a href="/books/details777.html">测试书</a>' });
+    pages.set(backupPage, { text: detail(777, '作者', ['第1章 风起与云涌', '第2章 落雨']) });
+    pages.set(backupChapter(777, 1), { text: chapterHtml('备用正文') });
+    const index = await (await request()).json();
+    const partRes = await request('chapter', `session=${index.source.session}&version=${index.version}&chapter=0`);
+    expect(partRes.status).toBe(200);
+    const part = await partRes.json();
+    expect(part.text).toBe('备用正文');
+    // 换源响应必须附上新目录,且本章在新目录的序号为 0。
+    expect(part.switchedChapters).toBeTruthy();
+    expect(part.switchedChapterIndex).toBe(0);
+    expect(part.switchedChapters.map((chapter: { title: string }) => chapter.title))
+      .toEqual(['第1章 风起与云涌', '第2章 落雨']);
+    // 重读同一章:服务端按新目录交付「第1章 风起与云涌」,前端持旧目录必须接受(不判 409)。
+    const reread = await (await request('chapter', `session=${part.sourceSession}&version=${part.version}&chapter=0`)).json();
+    expect(reread.title).toBe('第1章 风起与云涌');
+    const staleIndex = {
+      ...index, version: part.version,
+      source: { ...index.source, id: part.sourceId, session: part.sourceSession },
+    };
+    expect(readerPartMatches(staleIndex, { ...reread, sourceSession: part.sourceSession }, { chapterIndex: 0, partIndex: 0, ratio: 0 }))
+      .toBe(true);
   });
 
   it('gives an actionable error code when no supported book is found', async () => {

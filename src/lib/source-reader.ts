@@ -952,11 +952,12 @@ export async function surveySourceBooks(
 /** alternates 分支用:session 目录当前源信息;过期/缺失一律降级为无标记(设计 §2,不抛错)。 */
 export async function currentSourceHint(
   session: string, context: SourceRequestContext,
-): Promise<{ currentSourceName?: string; currentBookUrl?: string }> {
+): Promise<{ currentSourceName?: string; currentBookUrl?: string; catalog?: SourceCatalog }> {
   try {
     const [row] = await queryRows<{ payload: SourceCatalog }>(getSql()`
       SELECT payload FROM source_read_catalogs WHERE id = ${session} AND expires_at > now()`, context.signal);
-    return row ? { currentSourceName: row.payload.sourceName, currentBookUrl: row.payload.bookUrl } : {};
+    // catalog 一并带出:H7 换源响应要附新目录(route 层 attachSwitchedCatalog 复用本查询,零额外往返)。
+    return row ? { currentSourceName: row.payload.sourceName, currentBookUrl: row.payload.bookUrl, catalog: row.payload } : {};
   } catch {
     context.signal.throwIfAborted();
     return {};

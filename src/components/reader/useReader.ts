@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import type { ReaderIndex, ReaderPart, ReadingSession } from '@/lib/reader-types';
-import { readerChapterUrl, readerIndexUrl, readerPartMatches, switchedReaderIndex } from '@/lib/reader-session';
+import { readerChapterUrl, readerIndexUrl, readerPartMatches, switchedReaderIndex, switchedReaderPart } from '@/lib/reader-session';
 import { ReaderPartCache, nextReadingPosition, previousReadingPosition } from '@/lib/reader-part-cache';
 import { captureTextAnchor, restoreTextAnchor } from '@/lib/reader-text-anchor';
 import { catalogPrefixKey, migrateProgressAcrossSources, parseReaderSettings, parseReadingProgress, readingPercent, READER_SETTINGS_KEY } from '@/lib/reader-preferences';
@@ -185,6 +185,12 @@ export function useReader(session: ReadingSession, apiFetch: ApiFetch, userId: n
    * 此时把**后续**章节的请求重定向到新源 —— 不重键已渲染的阅读依赖(否则会跳回进度、
    * 闪一下空状态),只换「后续取的目录」。同一阅读会话只跟随一次:用户重载目录后以新源
    * 目录为基线重来,避免两源间来回横跳。
+   *
+   * H7:服务端同时附带新源目录时,用新 chapters 一次性替换旧的,并把阅读位置迁到
+   * 服务端给的新序号(switchedChapterIndex)—— 新旧目录序号错位时(备用站多一个「序言」),
+   * 按旧序号继续请求会静默交付错章或重复章。进度迁移复用 M3 手动换源的
+   * migrateProgressAcrossSources;迁移不中时退到服务端序号(ratio 归零)。
+   * 旧响应形状(不带新目录)时 chapters 与位置都不变,退回既有行为。
    */
   const adoptSwitch = useCallback((index: ReaderIndex, part: ReaderPart): ReaderIndex => {
     const switched = switchedReaderIndex(index, part);
@@ -192,7 +198,27 @@ export function useReader(session: ReadingSession, apiFetch: ApiFetch, userId: n
     if (!adoptedSwitch.current) adoptedSwitch.current = switched.source!.session;
     if (adoptedSwitch.current !== switched.source!.session) return index;
     const current = currentReading.current;
-    if (current && current.index === index) currentReading.current = { ...current, index: switched };
+    if (current && current.index === index) {
+      const catalogSwitched = switched.chapters !== index.chapters;
+      let position = current.position;
+      if (catalogSwitched && progress.current && typeof part.switchedChapterIndex === 'number') {
+        // 迁移锚在服务端序号上:旧进度的章节键留空,强制按「本章在新目录的位置」对齐,
+        // 而不是按旧目录标题重找一遍(服务端已经按标题对齐过一次)。
+        const migrated = migrateProgressAcrossSources(
+          { ...progress.current, chapterIndex: part.switchedChapterIndex, chapterTitle: undefined, catalogPrefix: undefined },
+          { ...index, chapters: switched.chapters }, switched,
+        );
+        position = migrated?.position ?? { chapterIndex: part.switchedChapterIndex, partIndex: 0, ratio: 0 };
+        const chapter = switched.chapters[position.chapterIndex];
+        const catalog = chapter?.title
+          ? { chapterTitle: chapter.title, catalogPrefix: catalogPrefixKey(switched, position.chapterIndex) } : {};
+        progress.current = { schema: 1, version: switched.version, ...position, ...catalog, updatedAt: Date.now() };
+        migrationNotice.current = migrated && migrated.confidence === 'exact'
+          ? '已切换书源,回到原进度'
+          : '已切换书源,按章节进度估算定位(两源目录略有差异)';
+      }
+      currentReading.current = { ...current, index: switched, ...(catalogSwitched ? { position } : {}) };
+    }
     return switched;
   }, []);
 
@@ -279,9 +305,15 @@ export function useReader(session: ReadingSession, apiFetch: ApiFetch, userId: n
       const part = await cache.get(index, position, controller.signal);
       if (controller.signal.aborted || id !== serial.current) return;
       const switched = adoptSwitch(index, part);
-      setActiveKey(partKey(part));
-      setReading({ index: switched, parts: [part], position, focus: false });
-      setPercent(readingPercent(switched, part, position.ratio));
+      // H7:换源附带新目录时,交付段改记新目录序号(switchedChapterIndex)。首载没有可迁的
+      // currentReading(adoptSwitch 只迁已在读的阅读),位置随交付段落到新序号 —— 否则
+      // activePart/页脚/下一章/续读/预取/进度都按旧段号算,在新目录里落到重复章。
+      const shownPart = switchedReaderPart(index, switched, part);
+      const shown = currentReading.current?.index === switched ? currentReading.current.position
+        : shownPart === part ? position : { ...position, chapterIndex: shownPart.chapterIndex };
+      setActiveKey(partKey(shownPart));
+      setReading({ index: switched, parts: [shownPart], position: shown, focus: false });
+      setPercent(readingPercent(switched, shownPart, shown.ratio));
       const notice = migrationNotice.current;
       migrationNotice.current = null;
       setNotice(notice ?? (saved ? '已回到上次阅读的位置' : ''));
@@ -411,9 +443,12 @@ export function useReader(session: ReadingSession, apiFetch: ApiFetch, userId: n
       // 换源在飞期间用户又点了别处:结果只对发起它的那次阅读有效(与 extend 同款护栏)。
       if (currentReading.current !== current) return;
       const adopted = adoptSwitch(current.index, part);
-      setActiveKey(partKey(part));
-      setReading({ index: adopted, parts: [part], position, focus: true });
-      setPercent(readingPercent(adopted, part, position.ratio));
+      // H7:目录被替换时交付段改记新目录序号,与 adoptSwitch 迁移后的位置同一套序号。
+      const shownPart = switchedReaderPart(current.index, adopted, part);
+      const shown = currentReading.current?.index === adopted ? currentReading.current.position : position;
+      setActiveKey(partKey(shownPart));
+      setReading({ index: adopted, parts: [shownPart], position: shown, focus: true });
+      setPercent(readingPercent(adopted, shownPart, shown.ratio));
     } catch (error) {
       if (!controller.signal.aborted && id === serial.current) fail(error, position);
     } finally {
@@ -462,7 +497,17 @@ export function useReader(session: ReadingSession, apiFetch: ApiFetch, userId: n
       const retained = !manual && snapshot && parts.some((candidate) => partKey(candidate) === partKey(snapshot.position));
       const destination = direction === 'previous' ? { ...next, ratio: 1 } : next;
       const adopted = adoptSwitch(current.index, part);
-      setReading({ index: adopted, parts, position: retained ? snapshot.position : destination, sectionOffset: retained ? snapshot.sectionOffset : undefined, focus: false });
+      // H7:目录被替换时,窗口里其余段仍按旧目录序号取回,与新目录对不上 —— 只留本次交付的这一段,
+      // 位置用迁移后的新序号。未替换目录时窗口与位置逐点不变。
+      const catalogSwitched = adopted.chapters !== current.index.chapters;
+      const shownParts = catalogSwitched ? [switchedReaderPart(current.index, adopted, part)] : parts;
+      const migrated = currentReading.current?.index === adopted ? currentReading.current.position : destination;
+      setReading({
+        index: adopted, parts: shownParts,
+        position: catalogSwitched ? migrated : (retained ? snapshot.position : destination),
+        sectionOffset: !catalogSwitched && retained ? snapshot.sectionOffset : undefined,
+        focus: false,
+      });
     } catch (error) {
       if (!controller.signal.aborted && id === serial.current) fail(error, next, direction);
     } finally {

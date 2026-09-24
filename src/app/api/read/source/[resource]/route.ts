@@ -9,6 +9,7 @@ import {
   currentSourceHint, readSourceChapter, resolveSourceBook, saveSourceCatalog, sourceReaderIndex,
   SourceReaderError, SourceRequestContext, surveySourceBooks,
 } from '@/lib/source-reader';
+import { attachSwitchedCatalog } from '@/lib/reader-switch-catalog';
 
 export const runtime = 'nodejs';
 export const maxDuration = 60;
@@ -17,6 +18,24 @@ const HEADERS = { 'Cache-Control': 'private, no-store', Vary: 'Cookie, Authoriza
 function response(body: unknown, status = 200) {
   // 503 与 504（换源软预算见底 / 请求超时）都是「稍后重试可能成功」，给同样的退避提示（深审 A O2/O5）。
   return NextResponse.json(body, { status, headers: { ...HEADERS, ...(status === 503 || status === 504 ? { 'Retry-After': '5' } : {}) } });
+}
+
+/**
+ * H7:换源响应在同一个响应里附上新源目录(只从 source_read_catalogs 读,零上游请求)。
+ * 未换源(part 不带 sourceSession)时 attachSwitchedCatalog 原样返回,响应体与既有逐字相同。
+ * 目录读取复用 currentSourceHint 的同一条 SELECT;读失败按「目录缺失」降级(不附目录),
+ * 不把库故障变成章节读取失败。
+ */
+async function withSwitchedCatalog(part: Awaited<ReturnType<typeof readSourceChapter>>, context: SourceRequestContext) {
+  return attachSwitchedCatalog(part, async (id) => {
+    try {
+      const hint = await currentSourceHint(id, context);
+      return hint.catalog ?? null;
+    } catch {
+      context.signal.throwIfAborted();
+      return null;
+    }
+  });
 }
 
 export async function GET(req: NextRequest, { params }: { params: Promise<{ resource: string }> }) {
@@ -61,7 +80,7 @@ export async function GET(req: NextRequest, { params }: { params: Promise<{ reso
       const result = await surveySourceBooks({ title, author }, context, hint);
       return response(result);
     }
-    return response(await readSourceChapter(session, Number(chapter), context));
+    return response(await withSwitchedCatalog(await readSourceChapter(session, Number(chapter), context), context));
   } catch (error) {
     if (signal.aborted) return response({ error: '书源查询已取消或超时，可重试或尝试「下载全书」。', code: 'SOURCE_TIMEOUT' }, 504);
     if (error instanceof SourceReaderError) {
