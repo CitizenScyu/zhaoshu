@@ -3,7 +3,7 @@ import { spawnSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { checkDeployConfig, triggersPerDay } from './check-deploy-config.mjs';
+import { checkDeployConfig, CROSS_FILE_BUDGETS, triggersPerDay } from './check-deploy-config.mjs';
 
 // 部署配置门禁（MS-09）的反例测试：护栏本身必须有「坏配置一定红」的用例，
 // 否则它会像当年没激活的 pre-push 一样静默失效而没人知道。
@@ -26,6 +26,16 @@ const GOOD_FILES: Record<string, string> = {
   'src/app/api/find/exact/route.ts':
     'export const maxDuration = 30;\nconst EXACT_BUDGET_MS = 25_000;\nexport async function GET() { return EXACT_BUDGET_MS; }\n',
   'next.config.ts': 'const nextConfig = {};\nexport default nextConfig;\n',
+  // 下面几组对应 CROSS_FILE_BUDGETS 的登记项：lib 里定义、由对应路由间接消耗的超时/预算常量。
+  'src/lib/github.ts': 'const DISPATCH_TIMEOUT_MS = 10_000;\n',
+  'src/app/api/download/route.ts': 'export const maxDuration = 60;\nexport async function POST() {}\n',
+  'src/lib/reader-server.ts': 'const METADATA_TIMEOUT_MS = 15_000;\nconst TEXT_TIMEOUT_MS = 60_000;\n',
+  'src/app/api/read/[id]/[resource]/route.ts': 'export const maxDuration = 120;\nexport async function GET() {}\n',
+  'src/lib/source-reader.ts': 'export const SOFT_BUDGET_MS = 45_000;\n',
+  'src/app/api/read/source/[resource]/route.ts': 'export const maxDuration = 60;\nexport async function GET() {}\n',
+  'src/lib/llm.ts': 'export const MODEL_PROBE_TIMEOUT_MS = 30_000;\n',
+  'src/app/api/admin/llm/route.ts': 'export const maxDuration = 60;\nexport async function PUT() {}\n',
+  'src/lib/find-sse.ts': 'export const FIND_FETCH_TIMEOUT_MS = 290_000;\n',
 };
 
 const roots: string[] = [];
@@ -187,7 +197,11 @@ describe('check-deploy-config：函数时限', () => {
     const errors = checkDeployConfig(repo({
       'src/app/api/find/route.ts': GOOD_FILES['src/app/api/find/route.ts'].replace('maxDuration = 295', 'maxDuration = 60'),
     }));
-    expect(errors).toEqual([expect.stringMatching(/MODEL_ROUTE_INTERNAL_BUDGET_MS = 285000ms.*≥ maxDuration 60s/)]);
+    expect(errors).toEqual([
+      expect.stringMatching(/MODEL_ROUTE_INTERNAL_BUDGET_MS = 285000ms.*≥ maxDuration 60s/),
+      // 前端等流式结果的 290s 超时同样越过 60s（CROSS_FILE_BUDGETS 登记项）。
+      expect.stringMatching(/FIND_FETCH_TIMEOUT_MS = 290000ms.*≥ maxDuration 60s/),
+    ]);
   });
 
   it('把模型预算调到 300_000（≥ 295s 路由）判红', () => {
@@ -199,7 +213,10 @@ describe('check-deploy-config：函数时限', () => {
     const errors = checkDeployConfig(repo({
       'src/app/api/find/route.ts': GOOD_FILES['src/app/api/find/route.ts'].replace('export const maxDuration = 295;\n', ''),
     }));
-    expect(errors).toEqual([expect.stringMatching(/使用 MODEL_ROUTE_INTERNAL_BUDGET_MS 却没声明 maxDuration/)]);
+    expect(errors).toEqual([
+      expect.stringMatching(/使用 MODEL_ROUTE_INTERNAL_BUDGET_MS 却没声明 maxDuration/),
+      expect.stringMatching(/src\/app\/api\/find\/route\.ts: 找不到或未声明整数 maxDuration（CROSS_FILE_BUDGETS 登记了 FIND_FETCH_TIMEOUT_MS）/),
+    ]);
   });
 
   it('路由内预算常量 EXACT_BUDGET_MS = 30_000 等于 maxDuration 30s 判红', () => {
@@ -217,6 +234,30 @@ describe('check-deploy-config：函数时限', () => {
   it('跨文件登记的常量被改成非字面量判红（不静默跳过）', () => {
     const errors = checkDeployConfig(repo({ 'src/lib/shuyuan.ts': 'export const REFRESH_BUDGET_MS = 3 * 60_000;\n' }));
     expect(errors).toEqual([expect.stringMatching(/读不到 REFRESH_BUDGET_MS 的数字字面量/)]);
+  });
+
+  // 41-MS09B 盘点补登记：每项把 lib 常量调到恰好等于路由 maxDuration，必须判红。
+  it.each([
+    ['src/app/api/download/route.ts', 'src/lib/github.ts', 'DISPATCH_TIMEOUT_MS', 60],
+    ['src/app/api/read/[id]/[resource]/route.ts', 'src/lib/reader-server.ts', 'TEXT_TIMEOUT_MS', 120],
+    ['src/app/api/read/[id]/[resource]/route.ts', 'src/lib/reader-server.ts', 'METADATA_TIMEOUT_MS', 120],
+    ['src/app/api/read/source/[resource]/route.ts', 'src/lib/source-reader.ts', 'SOFT_BUDGET_MS', 60],
+    ['src/app/api/admin/llm/route.ts', 'src/lib/llm.ts', 'MODEL_PROBE_TIMEOUT_MS', 60],
+    ['src/app/api/find/route.ts', 'src/lib/find-sse.ts', 'FIND_FETCH_TIMEOUT_MS', 295],
+  ])('%s 间接消耗的 %s 里的 %s 调到 ≥ maxDuration %is 判红', (route, file, name, seconds) => {
+    const source = GOOD_FILES[file].replace(new RegExp(`(const ${name} = )[\\d_]+`), `$1${seconds * 1000}`);
+    expect(source).not.toBe(GOOD_FILES[file]);
+    const errors = checkDeployConfig(repo({ [file]: source }));
+    expect(errors).toEqual([expect.stringContaining(`${route}: ${name} = ${seconds * 1000}ms（${file}）≥ maxDuration ${seconds}s`)]);
+  });
+
+  it('登记表里每一项在最小样例仓库里都真的被检查（调到 ≥ maxDuration 必红）', () => {
+    for (const { route, file, name } of CROSS_FILE_BUDGETS) {
+      const seconds = Number(GOOD_FILES[route].match(/maxDuration = (\d+)/)?.[1]);
+      const source = GOOD_FILES[file].replace(new RegExp(`(const ${name} = )[\\d_]+`), `$1${seconds * 1000}`);
+      expect(source, `${file} 里找不到 ${name}`).not.toBe(GOOD_FILES[file]);
+      expect(checkDeployConfig(repo({ [file]: source })), `${name}`).toEqual([expect.stringContaining(`${route}: ${name} = `)]);
+    }
   });
 });
 

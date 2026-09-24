@@ -31,12 +31,25 @@ export const MAX_FUNCTION_SECONDS = 300;
 export const ROUTE_EXTENSIONS = ['tsx', 'ts', 'jsx', 'js'];
 
 /**
- * 路由以外文件里定义、但由该路由独占消耗的预算常量。路由文件内直接定义的
+ * 路由以外文件里定义、但由该路由消耗的超时/预算常量（常量须是顶层数字字面量，否则判红）。路由文件内直接定义的
  * `*_BUDGET_MS` / `*_TIMEOUT_MS` 与引用 MODEL_ROUTE_INTERNAL_BUDGET_MS 的路由会被自动发现，不必登记。
+ * 只登记「本身就能把一次调用拖到这么久」的常量；已被请求 deadline 夹住的子超时（llm.ts 的 chatRobust 上限、
+ * shuyuan.ts 刷新内的单次探测等）不登记。盘点口径与未登记理由见 41-MS09B 报告。
  */
 export const CROSS_FILE_BUDGETS = [
   // refreshShuyuan() 整份刷新共用这一预算，cron 与 owner 手动刷新都走 GET /api/shuyuan。
   { route: 'src/app/api/shuyuan/route.ts', file: 'src/lib/shuyuan.ts', name: 'REFRESH_BUDGET_MS' },
+  // triggerDownloadWorkflow() 的 dispatch 请求实际用的是它；同文件导出的 GITHUB_TIMEOUT_MS 目前没有任何调用方。
+  { route: 'src/app/api/download/route.ts', file: 'src/lib/github.ts', name: 'DISPATCH_TIMEOUT_MS' },
+  // githubFetch() 取正文 / 取元数据的单次请求超时，readBookPart / readBookIndex 都经过它。
+  { route: 'src/app/api/read/[id]/[resource]/route.ts', file: 'src/lib/reader-server.ts', name: 'TEXT_TIMEOUT_MS' },
+  { route: 'src/app/api/read/[id]/[resource]/route.ts', file: 'src/lib/reader-server.ts', name: 'METADATA_TIMEOUT_MS' },
+  // 在线换源阅读的软预算（resolveSourceBook / readSourceChapter / 换源都按它止损）。
+  { route: 'src/app/api/read/source/[resource]/route.ts', file: 'src/lib/source-reader.ts', name: 'SOFT_BUDGET_MS' },
+  // probeModel() 两次尝试共享的墙钟上限，owner 保存模型设置时同步探测。
+  { route: 'src/app/api/admin/llm/route.ts', file: 'src/lib/llm.ts', name: 'MODEL_PROBE_TIMEOUT_MS' },
+  // 前端等 /api/find 流式结果的超时：须短于路由上限，否则平台先掐断连接，前端的超时提示轮不到出现。
+  { route: 'src/app/api/find/route.ts', file: 'src/lib/find-sse.ts', name: 'FIND_FETCH_TIMEOUT_MS' },
 ];
 
 const MODEL_BUDGET = { file: 'src/lib/deadline.ts', name: 'MODEL_ROUTE_INTERNAL_BUDGET_MS' };
