@@ -224,6 +224,16 @@ class TestEngineIdentityVerification(unittest.TestCase):
             expect_title='冰与火之歌', expect_author='乔治·R·R·马丁')
         self.assertEqual(chars, 200)
 
+    def test_author_label_prefix_passes_verification(self):
+        # labelerdiag41 原样：名单 风凌天下 vs 目录 作者：风凌天下 曾被判「作者不符」
+        cli = FakeEngineCli(
+            lambda sub, url: self._toc_proc('九君齐天', '作者：风凌天下')
+            if sub == 'toc' else _content('正' * 200))
+        text, chars = labeler.fetch_book_text_engine(
+            cli, 'https://y/x',
+            expect_title='九君齐天', expect_author='风凌天下')
+        self.assertEqual(chars, 200)
+
 
 class TestBuildEngineCli(unittest.TestCase):
     """_build_engine_cli：开关 + 必要配置齐备才返回 EngineCli，否则降级 None。"""
@@ -287,7 +297,7 @@ class TestMainRejectsIdentityMismatch(unittest.TestCase):
         llm_called = []
 
         def fake_build(http_get, skip_titles=None, include_douban=True, pages=None,
-                       engine_cli=None):
+                       engine_cli=None, book15_breaker=None):
             return [book]
 
         out, err = io.StringIO(), io.StringIO()
@@ -326,7 +336,7 @@ class TestMainRejectsIdentityMismatch(unittest.TestCase):
                 'author': '天蚕土豆', 'engine': True}
 
         def fake_build(http_get, skip_titles=None, include_douban=True, pages=None,
-                       engine_cli=None):
+                       engine_cli=None, book15_breaker=None):
             return [book]
 
         out, err = io.StringIO(), io.StringIO()
@@ -345,6 +355,111 @@ class TestMainRejectsIdentityMismatch(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertIn('失败: boom', err.getvalue())
         self.assertFalse((self.dir / 'labels-rejected.jsonl').exists())
+
+
+class TestFailureClassification(unittest.TestCase):
+    """labelerdiag41 P3：每轮失败按类别计数，轮末单独一行（「完成」行逐字不变）。"""
+
+    def test_classify_failure(self):
+        truncated = None
+        try:
+            json.loads('{"chapters": [{"title": "第一章')
+        except json.JSONDecodeError as e:
+            truncated = e
+        cases = (
+            (truncated, '引擎输出截断'),
+            (UnicodeDecodeError('utf-8', b'\xef', 0, 1, 'unexpected end of data'), '引擎输出截断'),
+            (labeler.EngineIdentityMismatch('引擎目录身份不符: …（作者不符）'), '目录作者不符'),
+            (labeler.EngineIdentityMismatch('引擎目录身份不符: …（标题不兼容）'), '目录标题不符'),
+            (RuntimeError("打标失败: 模型链 ['a'] 全部耗尽, 最后错误: Unterminated string"),
+             'LLM链耗尽'),
+            (RuntimeError('引擎 toc 失败 rc=1: 仅支持 HTTPS 精确域名和默认端口/443'), '非HTTPS源'),
+            (TimeoutError('read'), '书源超时'),
+            (OSError('<urlopen error timed out>'), '书源超时'),
+            (RuntimeError('boom'), '其他'),
+        )
+        for error, kind in cases:
+            with self.subTest(kind=kind, error=str(error)):
+                self.assertEqual(labeler.classify_failure(error), kind)
+
+    def test_format_failure_kinds(self):
+        self.assertEqual(labeler.format_failure_kinds({'其他': 1, 'LLM链耗尽': 3, '书源超时': 1}),
+                         '失败分类: LLM链耗尽 3 / 书源超时 1 / 其他 1')
+
+    def test_main_prints_failure_kinds_after_unchanged_done_line(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        d = Path(tmp.name)
+        (d / '.env').write_text('LLM_API_KEY=test-key-not-real\n', encoding='utf-8')
+        books = [{'url': f'https://www.yingsx.com/book/{i}', 'title': f'书{i}',
+                  'author': '某人', 'engine': True, 'source_host': 'www.yingsx.com'}
+                 for i in range(4)]
+        truncated = json.JSONDecodeError('Unterminated string starting at', '{"a', 1)
+        errors = iter([truncated, truncated,
+                       labeler.EngineIdentityMismatch('引擎目录身份不符: x（作者不符）'),
+                       RuntimeError('boom')])
+
+        def fake_fetch(*a, **k):
+            raise next(errors)
+
+        def fake_build(http_get, skip_titles=None, include_douban=True, pages=None,
+                       engine_cli=None, book15_breaker=None):
+            return list(books)
+
+        out = io.StringIO()
+        with mock.patch.dict(os.environ, {'LABELER_DATA_DIR': str(d)}), \
+                mock.patch.object(labeler.douban_list, 'build_webnovel_queue',
+                                  side_effect=fake_build), \
+                mock.patch.object(labeler, 'fetch_book_text_engine', side_effect=fake_fetch), \
+                mock.patch.object(labeler.time, 'sleep'), \
+                mock.patch.object(sys, 'argv',
+                                  ['labeler.py', '--source', 'webnovel', '--no-db-model']), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            code = labeler.main()
+        self.assertEqual(code, 2)
+        text = out.getvalue()
+        self.assertIn('完成: 成功 0 / 失败 4 / 残本候选跳过 0，结果在 labels.jsonl\n'
+                      '失败分类: 引擎输出截断 2 / 其他 1 / 目录作者不符 1', text)
+
+
+class TestMainWiresBook15Breaker(unittest.TestCase):
+    """labelerdiag41：名单线把按 .env 阈值装配的 book15 熔断器交给队列构建。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dir = Path(self.tmp.name)
+
+    def _run(self, env_text):
+        (self.dir / '.env').write_text('LLM_API_KEY=test-key-not-real\n' + env_text,
+                                       encoding='utf-8')
+        seen = []
+
+        def fake_build(http_get, skip_titles=None, include_douban=True, pages=None,
+                       engine_cli=None, book15_breaker=None):
+            seen.append(book15_breaker)
+            return []
+
+        with mock.patch.dict(os.environ, {'LABELER_DATA_DIR': str(self.dir)}), \
+                mock.patch.object(labeler.douban_list, 'build_webnovel_queue',
+                                  side_effect=fake_build), \
+                mock.patch.object(sys, 'argv',
+                                  ['labeler.py', '--source', 'webnovel',
+                                   '--no-db-model', '--dry-run']), \
+                contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(io.StringIO()):
+            os.environ.pop(labeler.douban_list.BOOK15_BREAKER_ENV, None)
+            labeler.main()
+        self.assertEqual(len(seen), 1)
+        return seen[0]
+
+    def test_default_threshold(self):
+        breaker = self._run('')
+        self.assertIsInstance(breaker, labeler.douban_list.Book15Breaker)
+        self.assertEqual(breaker.threshold, labeler.douban_list.BOOK15_BREAKER_DEFAULT)
+
+    def test_env_threshold(self):
+        self.assertEqual(self._run('LABELER_BOOK15_BREAKER=2\n').threshold, 2)
 
 
 if __name__ == '__main__':

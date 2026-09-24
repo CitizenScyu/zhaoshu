@@ -25,6 +25,59 @@ function run(args: string[], env: Record<string, string | undefined> = {}) {
   return { status: r.status, stdout: r.stdout.trim(), stderr };
 }
 
+// POSIX 管道语义模拟（Windows 管道是同步写，不加夹具复现不了 phoenix 上的 64KB 截断）。
+const pipeShim = pathToFileURL(resolve(scriptsDir, 'fixtures', 'posix-pipe-shim.mjs')).href;
+const stdioExit = pathToFileURL(resolve(scriptsDir, 'stdio-exit.mjs')).href;
+
+function runUnderPipe(nodeArgs: string[], env: Record<string, string | undefined> = {}) {
+  const childEnv = { ...process.env, ...env };
+  for (const [k, v] of Object.entries(env)) if (v === undefined) delete childEnv[k];
+  const r = spawnSync(process.execPath, ['--import', pipeShim, ...nodeArgs], {
+    cwd: repoRoot, env: childEnv, maxBuffer: 1 << 26,
+  });
+  return { status: r.status, stdout: r.stdout as Buffer, stderr: r.stderr.toString('utf8') };
+}
+
+// 200KB+ 的多字节中文 JSON：超过 64KB 管道缓冲，且截断点会切在 UTF-8 字符中间（phoenix 症状同形）。
+const BIG_JSON_SNIPPET = "const big = JSON.stringify({ text: '第一章 正文'.repeat(15000) }) + '\\n';";
+
+describe('engine-fetch 管道输出完整性（labelerdiag41：stdout 截在 64KB）', () => {
+  it('对照：写完立刻 process.exit 在 POSIX 管道语义下截在 65536 字节（夹具有判别力）', () => {
+    const r = runUnderPipe(['--input-type=module', '-e',
+      `${BIG_JSON_SNIPPET} process.stdout.write(big); process.exit(0);`]);
+    expect(r.status).toBe(0);
+    expect(r.stdout.length).toBe(65536);
+    expect(() => JSON.parse(r.stdout.toString('utf8'))).toThrow();
+  }, 60_000);
+
+  it('exitAfterFlush：>64KB 多字节 JSON 经管道完整送达且可解析', () => {
+    const r = runUnderPipe(['--input-type=module', '-e',
+      `import { exitAfterFlush } from '${stdioExit}'; ${BIG_JSON_SNIPPET} process.stdout.write(big); await exitAfterFlush(0);`]);
+    expect(r.status).toBe(0);
+    expect(r.stdout.length).toBeGreaterThan(200_000);
+    expect(JSON.parse(r.stdout.toString('utf8')).text).toHaveLength('第一章 正文'.length * 15000);
+  }, 60_000);
+
+  it('exitAfterFlush：错误分支的 stderr 同样刷完再退，退出码保留', () => {
+    const r = runUnderPipe(['--input-type=module', '-e',
+      `import { exitAfterFlush } from '${stdioExit}'; process.stderr.write('x'.repeat(100000) + 'END\\n'); await exitAfterFlush(2);`]);
+    expect(r.status).toBe(2);
+    expect(r.stderr.trim().endsWith('END')).toBe(true);
+  }, 60_000);
+
+  it('真 CLI 成功路径：stdout 全异步时 doctor --json 不丢输出', () => {
+    const r = runUnderPipe(['--import', hook, cli, 'doctor', '--json'], { DATABASE_URL: undefined, PIPE_SHIM_SYNC_BYTES: '0' });
+    expect(r.status).toBe(0);
+    expect(JSON.parse(r.stdout.toString('utf8'))).toEqual({ ok: true });
+  }, 60_000);
+
+  it('真 CLI 错误路径：stderr 全异步时原因不丢、退出码 2', () => {
+    const r = runUnderPipe(['--import', hook, cli, 'search', '--title', 'X'], { DATABASE_URL: undefined, PIPE_SHIM_SYNC_BYTES: '0' });
+    expect(r.status).toBe(2);
+    expect(r.stderr).toContain('DATABASE_URL');
+  }, 60_000);
+});
+
 describe('engine-fetch CLI 契约', () => {
   it.each(['source', 'out', 'max-chapters', 'rate-ms', 'timeout-ms', 'budget-ms'])('rejects download-only --%s before DB or env access', flag => {
     for (const command of ['search', 'toc', 'content', 'doctor']) {
