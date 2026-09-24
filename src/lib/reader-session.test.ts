@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { bookReadingHref, readerChapterUrl, readerIndexUrl, readerPartMatches, readingSessionKey, switchedReaderIndex } from './reader-session';
+import { bookReadingHref, readerChapterUrl, readerIndexUrl, readerPartMatches, readingSessionKey, switchedReaderIndex, switchedReaderPart } from './reader-session';
 import { indexProgressKey, readingPercent, parseReadingProgress } from './reader-preferences';
 import { nextReadingPosition } from './reader-part-cache';
 import type { ReaderIndex, ReaderPart } from './reader-types';
@@ -109,6 +109,33 @@ describe('download and source reading sessions', () => {
       partCount: 1, title: '第一章', text: '正文', startByte: 0, endByte: 6,
     };
     expect(switchedReaderIndex(online, bare).chapters).toBe(online.chapters);
+  });
+
+  // H7 小修 U4a:交付段改记新目录序号时,标题也必须改记为**新目录 at 章标题** —— 否则段的
+  // (标题, 序号)分属两套目录:序号已是新目录的,标题还是旧目录的,跨目录比对可能自相矛盾。
+  it('H7 U4a:switchedReaderPart 把交付段的标题一并改记为新目录 at 章标题(序号与标题同属新目录)', () => {
+    const newSession = 'i'.repeat(40);
+    const oldCatalog: ReaderIndex = {
+      ...online,
+      chapters: [{ index: 0, title: '第1章 风起', startByte: 0, endByte: 0, partCount: 1 }],
+    };
+    const adopted: ReaderIndex = {
+      ...oldCatalog, version: newSession,
+      source: { ...oldCatalog.source!, id: 'source-two', session: newSession },
+      chapters: [{ index: 0, title: '第1章 风起与云涌', startByte: 0, endByte: 0, partCount: 1 }],
+    };
+    // 服务端按请求的旧序号回带正文,title 仍是**旧目录**标题(章名漂移场景)。
+    const delivered: ReaderPart = {
+      taskId: null, sourceId: 'source-two', version: newSession, sourceSession: newSession,
+      chapterIndex: 0, partIndex: 0, partCount: 1, title: '第1章 风起', text: '备用正文',
+      startByte: 0, endByte: 12, switchedChapters: adopted.chapters, switchedChapterIndex: 0,
+    };
+    const shown = switchedReaderPart(oldCatalog, adopted, delivered);
+    expect(shown.chapterIndex).toBe(0);
+    // 改前只有 chapterIndex=0、title 仍是旧标题「第1章 风起」;此断言在改前为红。
+    expect(shown.title).toBe('第1章 风起与云涌');
+    // (标题, 序号)同属新目录 ⇒ 对本目录的防线比对自洽(不会因旧标题找不到 at 章而误判)。
+    expect(readerPartMatches(adopted, shown, { chapterIndex: 0, partIndex: 0, ratio: 0 })).toBe(true);
   });
 
   it('H7:switched 状态下标题与目录不符 ⇒ readerPartMatches 为 false(不交付错章)', () => {

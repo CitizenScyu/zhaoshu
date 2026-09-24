@@ -460,6 +460,69 @@ describe('ReaderClient 换源:H7 新目录序号(点击后请求的真断言)', 
   });
 });
 
+// H7/U6a:换源不是发生在首载、而是发生在**导航/续读那一次请求返回时**(换源在飞期间用户点了下一章,
+// 或滚动续读恰好触发换源),navigate / extend 两条路径也必须把交付段改记为新目录序号与标题 ——
+// 否则该段仍按旧序号标记,页脚章号与后续导航会在新目录里落到重复章(复审 U6a:这两处此前无网)。
+describe('ReaderClient 换源:H7 在导航/续读处采纳换源(U6a 覆盖 navigate / extend 重打标签)', () => {
+  const newChapters = [
+    { index: 0, title: '序言', startByte: 0, endByte: 0, partCount: 1 },
+    { index: 1, title: '第一章', startByte: 0, endByte: 0, partCount: 1 },
+    { index: 2, title: '第二章 下', startByte: 0, endByte: 0, partCount: 1 },
+  ];
+  const param = (url: string, key: string) => new URLSearchParams(url.split('?')[1]).get(key);
+
+  // 首载(旧目录序号 0)不换源;只有**接下来那一次导航/续读**(序号 1 的请求)才返回换源响应:
+  // 备用目录多一个「序言」,交付的「第二章」在新目录里是序号 2、标题也更名为「第二章 下」。
+  function switchOnSecondFetch() {
+    return vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.startsWith('/api/read/source/index')) return json(catalog());
+      if (param(url, 'session') === 'sess-A') {
+        const chapter = Number(param(url, 'chapter') ?? '0');
+        if (chapter === 0) return json(part({ text: '第一章\n正文内容' }));
+        // 服务端按请求所用的**旧目录**回带标题(「第二章」),同时给出新目录与新序号。
+        return json(part({
+          chapterIndex: 1, title: '第二章', text: '第二章 下\n备用源正文',
+          version: 'v2', sourceSession: 'v2', sourceId: 'src-2', servedFrom: '源乙',
+          switchedChapters: newChapters, switchedChapterIndex: 2,
+        }));
+      }
+      const chapter = Number(param(url, 'chapter') ?? '0');
+      const title = newChapters[chapter]?.title ?? '未知章';
+      return json(part({ chapterIndex: chapter, title, version: 'v2', sourceId: 'src-2', servedFrom: '源乙', text: title + '\n新目录正文' }));
+    });
+  }
+
+  beforeEach(() => {
+    window.localStorage.setItem('novel-finder-reading-settings', JSON.stringify({ preloadNext: false }));
+  });
+
+  it('navigate:换源在「下一章」那一次请求里被采纳 ⇒ 交付段改记新目录序号 2 与标题(页脚第 3 / 3 章)', async () => {
+    const apiFetch = switchOnSecondFetch();
+    renderReader(apiFetch);
+    await screen.findByText(/正文内容/);
+
+    const user = userEvent.setup();
+    await user.click(screen.getByRole('button', { name: '下一章 →' }));
+    // 采纳后交付段是新目录序号 2、标题取新目录「第二章 下」;页脚随之落到第 3 / 3 章,再无下一章。
+    // 若 navigate 处的重打标签被去掉,标题仍是旧目录「第二章」、章号仍是 1(页脚第 2 / 3 章)—— 红。
+    await screen.findByRole('region', { name: '第二章 下' });
+    await screen.findByText('第 3 / 3 章');
+    expect((screen.getByRole('button', { name: '下一章 →' }) as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it('extend:换源在「接着读下一章」那一次请求里被采纳 ⇒ 交付段改记新目录序号 2 与标题(页脚第 3 / 3 章)', async () => {
+    const apiFetch = switchOnSecondFetch();
+    renderReader(apiFetch);
+    await screen.findByText(/正文内容/);
+
+    fireEvent.click(screen.getByRole('button', { name: /接着读下一章/ }));
+    // extend 处的重打标签被去掉 ⇒ 标题仍是旧目录「第二章」、章号仍是 1 —— 红。
+    await screen.findByRole('region', { name: '第二章 下' });
+    await screen.findByText('第 3 / 3 章');
+  });
+});
+
 describe('ReaderClient 状态流转边界', () => {
   it('首屏(目录未回来)loading 态:状态栏说准备中,正文区给「一页书,一段光阴」', () => {
     const apiFetch = vi.fn(() => new Promise<Response>(() => {}));
