@@ -82,7 +82,7 @@ export function isVolumeManifestPath(path: string): boolean {
  * 固定名,发布窗口内或规范阶段中途失败后会出现「清单代次 ≠ 卷代次」,只读它会恒 409(B2-01)。
  * 规范卷只作快照缺失时的回退;无论取自哪条路径,调用方都仍按 blob_sha 校验。
  *
- * 约束:今后若给快照区加 GC,必须保留当前及上一版清单引用的全部快照卷(读者可能仍持上一版
+ * 约束:快照区 GC(snapshot-gc.ts,B2-05)必须保留当前及上一版清单引用的全部快照卷(读者可能仍持上一版
  * 清单读章);删掉被引用的快照会让读端退回规范卷,重新暴露跨版本 409。
  */
 export function volumeReadPaths(entry: VolumeEntry): readonly [snapshot: string, canonical: string] {

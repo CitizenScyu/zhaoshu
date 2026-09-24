@@ -211,6 +211,60 @@ maybe('v7 下载队列：迁移、幂等入队与租约 fencing', () => {
     expect(await finishDownloadTask(sql as never, lease!, { status: 'done' })).toBe(false);
   });
 
+  // B2-03：崩溃在发布中途的 system 任务没有人替它点重试，reclaim 必须把它放回队列（有界、退避、fencing）。
+  async function staleSystemTask(bookId: number, attemptCount: number) {
+    const [{ id }] = (await pg.query(
+      `INSERT INTO download_tasks(user_id, book_id, title, status, requested_by, policy_version, enqueue_key, attempt_count)
+       VALUES (NULL, $1, '崩溃中途', 'pending', 'system', 'p1', $2, $3) RETURNING id`,
+      [bookId, `${bookId}:p1:`, attemptCount],
+    )).rows as { id: number }[];
+    const lease = await claimDownloadTask(sql as never, 'crashed-worker');
+    expect(lease).toMatchObject({ id, attemptCount });
+    await pg.query("UPDATE download_tasks SET updated_at = now() - interval '2 hours' WHERE id = $1", [id]);
+    return { id, lease: lease! };
+  }
+
+  const taskState = async (id: number) => (await pg.query(
+    `SELECT status, attempt_count, lease_generation, lease_owner, error,
+            round(extract(epoch FROM (next_attempt_at - now())) / 60)::int AS delay_min
+     FROM download_tasks WHERE id = $1`, [id],
+  )).rows[0];
+
+  it('B2-03 reclaim：system 任务放回 pending + attempt_count+1 + 15m 退避，旧租约失效，到期前不可领', async () => {
+    const { id, lease } = await staleSystemTask(60, 1);
+    await reclaimStaleTasks(sql as never);
+    expect(await taskState(id)).toMatchObject({
+      status: 'pending', attempt_count: 2, lease_generation: 2, lease_owner: '', delay_min: 15,
+    });
+    expect((await taskState(id)).error).toContain('退避后重新入队');
+    // 僵尸 worker 的租约条件写全部失败：不会与重领者并发发布。
+    expect(await heartbeatDownloadTask(sql as never, lease)).toBe(false);
+    expect(await finishDownloadTask(sql as never, lease, { status: 'failed' })).toBe(false);
+    // 退避未到期不可领；到期后由 claim 重领（generation 再递增）。
+    expect(await claimDownloadTask(sql as never, 'next-worker')).toBeNull();
+    await pg.query("UPDATE download_tasks SET next_attempt_at = now() - interval '1 second' WHERE id = $1", [id]);
+    expect(await claimDownloadTask(sql as never, 'next-worker')).toMatchObject({ id, leaseGeneration: 3, attemptCount: 2 });
+  });
+
+  it('B2-03 reclaim：退避与 sourceRetryDelayMs 同阶梯（第 3 次 ⇒ 1h，第 8 次 ⇒ 封顶 6h）', async () => {
+    const third = await staleSystemTask(61, 3);
+    await reclaimStaleTasks(sql as never);
+    expect(await taskState(third.id)).toMatchObject({ status: 'pending', attempt_count: 4, delay_min: 60 });
+    await pg.query("UPDATE download_tasks SET status = 'done' WHERE id = $1", [third.id]);
+    const eighth = await staleSystemTask(62, 8);
+    await reclaimStaleTasks(sql as never);
+    expect(await taskState(eighth.id)).toMatchObject({ status: 'pending', attempt_count: 9, delay_min: 360 });
+  });
+
+  it('B2-03 reclaim：达上限（attempt_count=16）的 system 任务落 failed，不再入队', async () => {
+    const { id } = await staleSystemTask(63, 16);
+    await reclaimStaleTasks(sql as never);
+    expect(await taskState(id)).toMatchObject({
+      status: 'failed', attempt_count: 16, lease_generation: 2, lease_owner: '', delay_min: null,
+    });
+    expect((await taskState(id)).error).not.toContain('重新入队');
+  });
+
   it('重试新建 attempt 行并记录 retry_of，不复活旧终态行', async () => {
     const [{ id }] = (await pg.query(
       `INSERT INTO download_tasks(user_id, book_id, title, status, requested_by)

@@ -10,6 +10,12 @@ export const SOURCE_RETRY_BASE_DELAY_MS = 15 * 60_000;
 export const SOURCE_RETRY_MAX_DELAY_MS = 6 * 60 * 60_000;
 export const SOURCE_RETRY_MAX_ATTEMPTS = 16;
 
+// 发布可重试失败（B2-03）：GitHub 写入中途失败（网络/限流/5xx）也不是终态——规范阶段半途失败会让
+// 规范卷与 index.json 停在半新半旧，只有重跑才会收敛。worker 进程内失败与崩溃后被 reclaim 回收的
+// system 任务都放回 pending，与书源不可达共用同一 attempt_count 阶梯（sourceRetryDelayMs）和同一上限：
+// attempt_count 记的是「自动放回 pending 的总次数」，不分原因，总数封顶，重试因此有界。
+export const PUBLICATION_RETRY_MAX_ATTEMPTS = SOURCE_RETRY_MAX_ATTEMPTS;
+
 /** 第 attempt 次（1 起，即领取时的 attempt_count）不可达后的退避时长。 */
 export function sourceRetryDelayMs(attempt: number): number {
   const exponent = Math.max(0, Math.min(Math.floor(attempt) - 1, 30));
