@@ -1,4 +1,3 @@
-#!/usr/bin/env node
 // labeled_books 存量作者规范化。执行窗口应暂停导入，先审阅 dry-run 清单。
 //   node scripts/backfill_authors.mjs --env <env文件> [--out <清单.json>]
 //   node scripts/backfill_authors.mjs --env <env文件> --apply [--out <新清单.json>]

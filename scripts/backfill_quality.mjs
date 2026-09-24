@@ -1,4 +1,3 @@
-#!/usr/bin/env node
 // 给没有质量分的已入库书补打分：重抓前 40 万字 → 一次 LLM 调用只问质量四维分。
 // 用法: node scripts/backfill_quality.mjs --env <env文件> --limit 20
 import { neon } from '@neondatabase/serverless';

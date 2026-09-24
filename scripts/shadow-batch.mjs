@@ -1,4 +1,3 @@
-#!/usr/bin/env node
 // P1a 放量前置 3:影子求值批量入口(只读 CLI;简报 p1a-rollout-brief.md §7 第 3 条)。
 //
 // 用途:ENGINE_SYNTAX_OR **保持 off**(生产口径不变)时,对候选源跑一遍编译口径的
