@@ -1,4 +1,3 @@
-#!/usr/bin/env node
 // 生产（或任何显式指定的）库的 auth schema 迁移入口（MS-24）。
 //
 // migrate:auth 只吃 TEST_DATABASE_URL，是隔离库演练工具；docs/auth-deployment.md 又明文禁止
