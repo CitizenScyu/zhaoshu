@@ -248,10 +248,13 @@ export function evaluateBaseline({ report, shape, data, migrations }) {
   } else if (ledgerPresent) {
     // 空记账表视同未登记（复审 baserev41 #1）：否则 baseline 拒、migrate 也拒，这种库无路可走。前提是表的形状与
     // runner 建的完全一致——登记时 CREATE TABLE IF NOT EXISTS 空转，三行就写进这张现成的表；形状不同就拒绝，
-    // 由人确认这张表的来历（不替人删表）。锁内复核会再看一次行数，期间被写入就回滚。
-    const { problems } = compareShape(shape, BASELINE_LEDGER_SHAPE);
-    if (problems.length) {
-      refusals.push(`schema_migrations 为空但结构与 runner 建的不同，不能直接登记进去：${JSON.stringify(problems)}；先查明这张表的来历`);
+    // 由人确认这张表的来历（不替人删表）。「完全一致」含不多出列 / 约束 / 索引（复审 baserev41 #N1），
+    // 与业务表只报 extra 不同。锁内复核会再看一次行数，期间被写入就回滚。
+    const { problems, extra } = compareShape(shape, BASELINE_LEDGER_SHAPE);
+    if (problems.length || extra.length) {
+      const extraNames = extra.map((item) => `${item.kind} ${item.name}`).join(', ');
+      refusals.push(`schema_migrations 为空但结构与 runner 建的不同，不能直接登记进去：${JSON.stringify(problems)}`
+        + `${extra.length ? `；多出 ${extraNames}` : ''}；先查明这张表的来历`);
     }
   }
   for (const version of BASELINE_VERSIONS) {
