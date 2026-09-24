@@ -110,10 +110,32 @@ _AUTHOR_PUNCT_RE = re.compile(
 _AUTHOR_SUFFIX_RE = re.compile(r'(?:等著|编著|校译|校注|合著|著|译|绘|校|主编|编)$')
 # 前导国籍/语种括号段：（美）/【日】/[英]/(英) 等；剥后剩余非空才剥
 _AUTHOR_LEAD_BRACKET_RE = re.compile(r'^[（(【\[][^）)】\]]{0,6}[）)】\]]')
+# 前导「作者」标签（labelerdiag41：引擎源作者规则连标签一起取，「作者：唐家三少」
+# 剥冒号后成「作者唐家三少」≠「唐家三少」，约 15% 失败）。含「作　者」排版空格、
+# 半/全角冒号、冒号可缺省（`<span>作者</span>唐家三少` 取 textContent 无分隔）。
+_AUTHOR_LABEL_RE = re.compile(r'^作\s*者\s*([:：])?\s*')
+
+
+def _strip_author_label(text: str) -> str:
+    """循环剥前导「作者」标签。带冒号 ⇒ 必是标签，剩余为空即作者未知（''）；
+    无冒号 ⇒ 剩余非空才剥（整串就是「作者」时原样保留）。
+
+    误伤取舍：以「作者」起头的真实笔名（如「作者君」）会被剥成「君」。归一化两端
+    对称、且**循环**剥（「作者：作者君」与「作者君」都到「君」），所以同一作者两端
+    写法仍相等；代价只是「作者X」与「X」被视为同一作者——还须书名同时兼容才会命中，
+    概率可忽略，远小于标签前缀造成的系统性误拒。"""
+    while True:
+        m = _AUTHOR_LABEL_RE.match(text)
+        if not m:
+            return text
+        rest = text[m.end():]
+        if not (m.group(1) or rest):
+            return text
+        text = rest
 
 
 def _norm_author(s: str) -> str:
-    """作者身份比对前的归一化：空白（含全角）/分隔标点/尾部著述后缀/前导国籍段/casefold。
+    """作者身份比对前的归一化：前导「作者：」标签/空白（含全角）/分隔标点/尾部著述后缀/前导国籍段/casefold。
 
     与 import 线（import_one.normalize_author）的分工：那条线管**入库身份键**，
     宁 review 不冒进；本函数只管**打标前的候选过滤与 toc 校验**，把两端写法差
@@ -121,6 +143,9 @@ def _norm_author(s: str) -> str:
     乔治·奥威尔），与标点剥离天然衔接；未成对的 & / ; 当普通标点剥。"""
     text = (s or '').casefold()
     text = re.sub(r'&[a-zA-Z]+;', '·', text)      # &middot; 等实体 → 分隔符
+    # 前导「作者：」标签：先于括号段与标点剥离（「作者：（美）乔治」→「（美）乔治」→…；
+    # 标点层会先吃掉冒号，之后就分不清标签和名字了）。
+    text = _strip_author_label(text.strip())
     # 前导括号段（（美）/【日】）：必须在标点剥离**之前**剥，否则括号字符先被标点层
     # 吃掉、内容残片（美）就留在名首了。剥后剩余非空才剥（「（佚名）」保留括号内容）。
     m = _AUTHOR_LEAD_BRACKET_RE.match(text)

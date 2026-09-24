@@ -224,6 +224,16 @@ class TestEngineIdentityVerification(unittest.TestCase):
             expect_title='冰与火之歌', expect_author='乔治·R·R·马丁')
         self.assertEqual(chars, 200)
 
+    def test_author_label_prefix_passes_verification(self):
+        # labelerdiag41 原样：名单 风凌天下 vs 目录 作者：风凌天下 曾被判「作者不符」
+        cli = FakeEngineCli(
+            lambda sub, url: self._toc_proc('九君齐天', '作者：风凌天下')
+            if sub == 'toc' else _content('正' * 200))
+        text, chars = labeler.fetch_book_text_engine(
+            cli, 'https://y/x',
+            expect_title='九君齐天', expect_author='风凌天下')
+        self.assertEqual(chars, 200)
+
 
 class TestBuildEngineCli(unittest.TestCase):
     """_build_engine_cli：开关 + 必要配置齐备才返回 EngineCli，否则降级 None。"""

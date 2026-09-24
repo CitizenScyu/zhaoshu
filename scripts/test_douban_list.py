@@ -1031,6 +1031,59 @@ class TestNormAuthor(unittest.TestCase):
         # 剥前导括号段要求剥后剩余非空：整串就是括号段时先不剥，再走标点剥离
         self.assertEqual(douban_list._norm_author('（佚名）'), '佚名')
 
+    # labelerdiag41：引擎源作者带「作者：」标签（名单 唐家三少 vs 引擎 作者：唐家三少 被判作者不符）
+    LABEL_PAIRS = (
+        ('唐家三少', '作者：唐家三少'),            # 全角冒号（phoenix 日志原样）
+        ('风凌天下', '作者:风凌天下'),              # 半角冒号
+        ('风凌天下', '作者 : 风凌天下'),            # 冒号两侧空格
+        ('风凌天下', '  作者：  风凌天下 '),        # 首尾空白
+        ('风凌天下', '作　者：风凌天下'),           # 「作　者」全角排版空格
+        ('风凌天下', '作者　风凌天下'),         # 无冒号、全角空格分隔
+        ('风凌天下', '作者风凌天下'),               # 无分隔（textContent 拼接形态）
+        ('乔治·奥威尔', '作者：（英）乔治&middot;奥威尔'),  # 与实体/国籍段叠加
+        ('天蚕土豆', '作者：天蚕土豆 著'),          # 与尾缀叠加
+    )
+
+    def test_author_label_prefix_is_stripped(self):
+        for a, b in self.LABEL_PAIRS:
+            with self.subTest(pair=(a, b)):
+                self.assertEqual(douban_list._norm_author(a),
+                                 douban_list._norm_author(b))
+
+    def test_author_label_negative_controls(self):
+        # 标签后是另一个人：剥标签不得让异作者变相等
+        self.assertNotEqual(douban_list._norm_author('唐家三少'),
+                            douban_list._norm_author('作者：天蚕土豆'))
+        # 「作者」只在名首才算标签：名中/名尾出现不剥
+        self.assertEqual(douban_list._norm_author('某作者'), '某作者')
+        self.assertNotEqual(douban_list._norm_author('唐家三少'),
+                            douban_list._norm_author('唐家三少作者'))
+        # 整串只有「作者」：不是标签，原样保留（不会变空而被当作者未知降级收）
+        self.assertEqual(douban_list._norm_author('作者'), '作者')
+        # 只有标签没有名字：作者未知 ⇒ ''（走「候选作者空」降级分支，而非判作者不符）
+        for s in ('作者：', '作者:', '作者 ： '):
+            with self.subTest(s=s):
+                self.assertEqual(douban_list._norm_author(s), '')
+
+    def test_author_label_symmetric_for_real_pen_name(self):
+        # 以「作者」起头的真实笔名：两端同写法仍相等（归一化对称，不会误拒）
+        self.assertEqual(douban_list._norm_author('作者君'),
+                         douban_list._norm_author('作者：作者君'))
+
+
+class TestSearchEngineAuthorLabel(unittest.TestCase):
+    """labelerdiag41：候选阶段不得因「作者：」标签丢掉引擎兜底真命中。"""
+
+    def test_label_prefixed_candidate_is_verified_match(self):
+        cli = FakeEngineCli({'search': _proc(0, json.dumps([
+            {'source': 'www.a.com', 'title': '斗罗大陆', 'author': '作者：唐家三少',
+             'bookUrl': 'https://www.a.com/b/1'}]))})
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            hit = douban_list.search_engine(cli, '斗罗大陆', '唐家三少')
+        self.assertEqual(hit, {'url': 'https://www.a.com/b/1', 'title': '斗罗大陆',
+                               'source': 'www.a.com'})
+        self.assertNotIn('作者不符', out.getvalue())
+
 
 class TestSearchEngineAuthorFilter(unittest.TestCase):
     """N02 第一层：search_engine 候选过滤 + 两遍选择。"""
