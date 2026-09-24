@@ -51,10 +51,31 @@ const MIN_EXPECTED_FILES = 4;
 // 接入时实测 197 例(42+59+88+8),取 180 作下限:留 ~9% 余量,删掉零散几个用例不会误红,
 // 但整块用例(最小的 shadow-batch 也有 8 例)或某个文件级静默失效必然触发。
 // 与 MIN_EXPECTED_FILES 同理:确需下调时请一并说明原因。
+//
+// 【41-MJSGATE-S1 复审整改】这个下限原先比的是 `counts.tests`,而 node:test 的 `counts.tests`
+//   **把 skip 的用例也算进去**——于是全部 `it.skip`、或整段 `describe.skip`,用例数看着没少,
+//   门照样放行,与注释承诺的「整段 describe.skip…必然触发」相反(复审实测:shadow-batch 8 例
+//   全 skip → `tests 197 / skipped 8`,exit 0;4×50 例合成文件全 skip → `tests 200 / skipped 200`,
+//   exit 0,一例没跑仍绿)。现改为比 `counts.passed`(真跑过且通过的),并额外要求
+//   `skipped + todo === 0`(见下),两道一起把「用例消失」的静默失效堵死。
+//
+// skip/todo 计数必须为 0(复审非阻断建议 1 的另一种粒度是「每文件 passed ≥ 1」,这里**两条都加**,
+//   因为它们拦的是不同的失效形态,谁也替代不了谁——见下方 PER-FILE 断言处的说明):
+//   - 全局零跳过拦「一部分用例被 it.skip」(逐文件汇总里 skipped 可见);
+//   - 每条文件 passed ≥ 1 拦「整段 describe.skip 掉某个文件」——这种形态在逐文件汇总里
+//     `tests:0 / passed:0 / skipped:0`(整段 skip 的子用例**根本不进计数**),全局零跳过看不见它,
+//     只有「这文件必须有真实通过」拦得住。基线 skip+todo = 0,故零容忍;合法需要时连同断言与原因一起改。
+//   这两条合起来覆盖复审说的「全部 it.skip」与「整段 describe.skip」两种场景。
+//   仍有的空隙(诚实记下):**文件内部分** describe.skip(如 197 例里只 skip 掉某个 describe 的
+//   十几例),passed 既不为 0、总数也未必掉破 180,这道门看不出来——但那种改动必然出现在 diff 里,
+//   不属于环境导致的静默失效,故不做过度工程。
 const MIN_EXPECTED_TESTS = 180;
 
 // 单测超时(复审非阻断建议 3)。node:test 默认无超时,一个挂起的用例会把 CI job 拖到
 // 25 分钟上限才红;这里给每个用例 60s,超时按失败计,退出码非 0。
+// 注:`run({ timeout })` 对**文件级**子测试同样生效(复审 H2/H3 实测:用例内 pending、
+// 顶层 setInterval 不退出、顶层 await 永久 pending 三种挂起都在超时点变红),所以实际含义是
+// 「每个文件、每个用例各自 60s」,不只是「每个用例 60s」——上句的「每个用例」是不完整的说法。
 const TEST_TIMEOUT_MS = 60_000;
 
 // ---------------------------------------------------------------------------
@@ -182,7 +203,10 @@ if (!rootSummary) {
 }
 
 const counts = rootSummary.counts;
-const totalTests = counts.tests;
+// 【41-MJSGATE-S1】用 passed 而不是 tests:`tests` 把 skip 也算进去,全 skip 时会假装没少。
+// passed = 真正跑过且通过的;failed/cancelled 另算。skipped/todo 必须为 0(下方断言)。
+const totalPassed = counts.passed;
+const totalSkipped = (counts.skipped || 0) + (counts.todo || 0);
 const totalFailed = counts.failed + counts.cancelled;
 
 // 每个被扫描到的文件都必须报出汇总——少一个就说明有文件没被真正加载/执行
@@ -197,11 +221,43 @@ if (silent.length > 0) {
   exitCode = 1;
 }
 
-if (totalTests < MIN_EXPECTED_TESTS) {
+if (totalPassed < MIN_EXPECTED_TESTS) {
   console.error(
-    `✖ scripts 的 node:test 用例只有 ${totalTests} 例(期望 ≥ ${MIN_EXPECTED_TESTS})。\n` +
+    `✖ scripts 的 node:test 用例只有 ${totalPassed} 例真正通过(期望 ≥ ${MIN_EXPECTED_TESTS};` +
+      `skip+todo ${totalSkipped} 例未计入)。\n` +
       '  文件内用例被删、整段 describe.skip、或文件顶层提前 process.exit(0) 都会这样——' +
-      '文件数下限拦不住,故再加一条用例数下限。确需下调请同步改 MIN_EXPECTED_TESTS 并说明原因。',
+      '文件数下限拦不住,故再加一条「实际通过数」下限。确需下调请同步改 MIN_EXPECTED_TESTS 并说明原因。',
+  );
+  exitCode = 1;
+}
+
+// 【41-MJSGATE-S1】逐文件 passed ≥ 1:拦「整段 describe.skip 掉某个文件」。
+//   这种形态在逐文件汇总里是 tests:0 / passed:0 / skipped:0——被 skip 的子用例根本不进计数,
+//   所以全局零跳过(下一条)看不见它,只有「这文件必须有真实通过」拦得住。
+const emptyFiles = targets.filter((target) => {
+  const summary = perFile.get(target);
+  const passed = summary && summary.counts ? summary.counts.passed : 0;
+  return !(passed >= 1);
+});
+if (emptyFiles.length > 0) {
+  console.error(
+    `✖ 以下 ${emptyFiles.length} 个文件汇总里没有任何真正通过的用例(整段 describe.skip、或用例被删空):\n` +
+      emptyFiles.map((t) => `    - ${t}`).join('\n') +
+      '\n  逐文件汇总此时是 tests:0/passed:0/skipped:0(被跳过的子用例不进计数),' +
+      '全局跳过数看不见它,故要求每个文件 passed ≥ 1。确需清空某个文件请连文件一起下线并说明原因。',
+  );
+  exitCode = 1;
+}
+
+// 【41-MJSGATE-S1】全局零跳过:拦「一部分用例被 it.skip」。逐文件汇总里 skipped 可见,
+//   而 passed 会相应变小;但若总量仍在 180 以上,单靠上面的下限拦不住,故这里零容忍。
+//   基线 skip+todo = 0;合法需要 skip 时请连同本断言与原因一起改,别让它悄悄漂白。
+if (totalSkipped > 0) {
+  console.error(
+    `✖ scripts 的 node:test 用例里有 ${totalSkipped} 例被 skip/todo(skipped ${counts.skipped || 0}、` +
+      `todo ${counts.todo || 0};基线为 0)。\n` +
+      '  被跳过的用例不计入「实际通过」,会让下限的判别力缩水。' +
+      '若确实要保留 skip,请连同本断言和原因一起改,别让它悄悄漂白。',
   );
   exitCode = 1;
 }
@@ -209,7 +265,9 @@ if (totalTests < MIN_EXPECTED_TESTS) {
 if (totalFailed > 0) exitCode = 1;
 
 console.log(
-  `▶ 汇总:${perFile.size}/${files.length} 个文件、${totalTests} 例、失败 ${counts.failed}、取消 ${counts.cancelled}(下限:文件 ≥ ${MIN_EXPECTED_FILES}、用例 ≥ ${MIN_EXPECTED_TESTS})`,
+  `▶ 汇总:${perFile.size}/${files.length} 个文件、通过 ${totalPassed}、跳过 ${totalSkipped}、` +
+    `失败 ${counts.failed}、取消 ${counts.cancelled}(下限:文件 ≥ ${MIN_EXPECTED_FILES}、` +
+    `通过 ≥ ${MIN_EXPECTED_TESTS}、每文件通过 ≥ 1、全局 skip+todo = 0)`,
 );
 
 process.exit(exitCode);

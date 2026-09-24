@@ -187,22 +187,49 @@ class TestSplitQueue(unittest.TestCase):
             'https://book15.net/books/detailsB.html'})
 
 
-class TestRealRejectedSample(unittest.TestCase):
-    """真实拒收副本回归（有则跑，无则跳）——副本在仓库外，服务器上不会命中。"""
+class TestSyntheticRejectedSample(unittest.TestCase):
+    """钉子户终态的端到端回归：走真实拒收文件格式 → 计数 → 终态名单。
 
-    SAMPLE = Path(__file__).resolve().parents[2] / 'rejected-from-phoenix-20260918.jsonl'
+    41-PYFIX 变更：原先这类读的是仓库外的真实副本 `rejected-from-phoenix-20260918.jsonl`
+    （`Path(__file__).parents[2]`），「有则跑，无则跳」。问题是那个位置**存在与否取决于 checkout
+    布局**——本机 worktree 有、CI 的干净 checkout 没有——于是同一份代码在 CI 上整类 `skipTest`。
+    接入 Python 门禁后这变成真危害：门禁要「零跳过」，CI 就成了红的（或反过来，为放行而把
+    跳过当绿，正是 P1 要堵的洞）。
+
+    改为自造合成副本：保留全部判别力（达线者必进终态、差一者必不进），不依赖任何仓外文件，
+    也不把真实抓取数据带进仓库。真实副本仍可用于人工排查，但不再是门禁绿的前置条件。
+    """
+
+    # 终态 URL 名单：真实副本里被拒次数 ≥ 阈值的那几本（book15 站点路径，非敏感）。
+    TERMINAL = [
+        'https://book15.net/books/details5950.html',
+        'https://book15.net/books/details4173.html',
+        'https://book15.net/books/details5660.html',
+        'https://book15.net/books/details6520.html',
+        'https://book15.net/books/details7164.html',
+    ]
 
     def setUp(self):
-        if not self.SAMPLE.exists():
-            self.skipTest(f'缺真实副本 {self.SAMPLE}')
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.SAMPLE = Path(self.tmp.name) / 'labels-rejected.jsonl'
+        rows = []
+        for url in self.TERMINAL:
+            # 恰好达线：断言「≥ 阈值」这一侧
+            rows += [{'url': url}] * labeler.REJECT_TERMINAL_THRESHOLD
+        # 差一（阈值 − 1）与只拒一次：断言「< 阈值不进终态」这一侧
+        rows += [{'url': 'https://book15.net/books/detailsX1.html'}] * (
+            labeler.REJECT_TERMINAL_THRESHOLD - 1)
+        rows += [{'url': 'https://book15.net/books/detailsX2.html'}] * 1
+        write_jsonl(self.SAMPLE, rows)
         self.counts = labeler.count_rejections(self.SAMPLE)
 
     def test_known_pinned_books_are_terminal(self):
-        for url in ('https://book15.net/books/details5950.html',
-                    'https://book15.net/books/details4173.html',
-                    'https://book15.net/books/details5660.html',
-                    'https://book15.net/books/details6520.html',
-                    'https://book15.net/books/details7164.html'):
+        for url in self.TERMINAL:
+            with self.subTest(url=url):
+                self.assertGreaterEqual(self.counts.get(url, 0),
+                                        labeler.REJECT_TERMINAL_THRESHOLD)
+                self.assertIn(url, labeler.terminal_urls(self.counts))
             with self.subTest(url=url):
                 self.assertGreaterEqual(self.counts.get(url, 0),
                                         labeler.REJECT_TERMINAL_THRESHOLD)
