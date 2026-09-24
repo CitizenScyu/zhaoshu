@@ -297,6 +297,19 @@ describe('B2-05 快照卷 GC:清单/指针缺失与存储错误一律 fail close
     store.files.set(manifestPath, JSON.stringify(original));
   });
 
+  it('history 里的非 8 位十六进制条目被忽略:不判指针不可读、不要求它有清单', async () => {
+    const { store, b, c } = await threeVersions();
+    const without = await collectSnapshotGarbage(store, stem, { now: LATER });
+    store.files.set(`${paths.dir}/current.json`, JSON.stringify({ current: c.version, history: ['zzzzzzzz', b.version, c.version] }));
+    const report = await collectSnapshotGarbage(store, stem, { now: LATER });
+    expect(report.skipped).toBeNull(); // 非 8hex 条目不会让整份指针读不懂
+    expect(report.liveVersions).toEqual(without.liveVersions);
+    expect(report.orphans).toEqual(without.orphans); // 脏条目不改变孤儿判定
+    // 若实现对脏条目改用 VERSION 之外的严格校验(判 unreadable_pointer),上面断言即红。
+    store.files.set(`${paths.dir}/current.json`, '{not json');
+    expect((await collectSnapshotGarbage(store, stem, { now: LATER })).skipped).toBe('unreadable_pointer');
+  });
+
   it('目录里没有快照卷(旧单文件时代)⇒ 不读任何清单、不跳过、无孤儿', async () => {
     const store = new MemoryStore();
     store.files.set(`${paths.dir}/0badf00d.txt`, '旧整本快照');
