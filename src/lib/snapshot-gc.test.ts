@@ -166,3 +166,159 @@ describe('B2-05 快照卷 GC', () => {
   });
 });
 
+// gcls-41:复审 b203rev §12-2「清单文件整体缺失」窗口 —— 目录有快照卷却读不到应有的清单 ⇒ 整本跳过。
+describe('B2-05 快照卷 GC:清单/指针缺失与存储错误一律 fail closed', () => {
+  const exec = { now: LATER, execute: true as const, isPublishing: async () => false };
+
+  it('volumeCount 照实报告目录里的快照卷数', async () => {
+    const { store } = await threeVersions();
+    const report = await collectSnapshotGarbage(store, stem, { now: LATER });
+    expect(report.volumeCount).toBe(5); // 甲乙丙丁戊
+    expect(report.retained.length + report.orphans.length).toBe(5);
+  });
+
+  it('过期版本 A 的清单文件整体缺失(仍在指针 history 里)⇒ missing_manifest,丙卷不被当孤儿删', async () => {
+    const { store, a } = await threeVersions();
+    store.files.delete(`${paths.dir}/${a.version}.json`);
+    const report = await collectSnapshotGarbage(store, stem, exec);
+    expect(report.skipped).toBe('missing_manifest');
+    expect(report.orphans).toEqual([]);
+    expect(store.deleteFile).not.toHaveBeenCalled();
+    expect(store.files.has(snaps(a)[2])).toBe(true);
+  });
+
+  it('目录有快照卷但所有版本清单都不在 ⇒ missing_manifest', async () => {
+    const { store } = await threeVersions();
+    for (const path of [...store.files.keys()]) if (/\/[a-f0-9]{8}\.json$/.test(path)) store.files.delete(path);
+    expect((await collectSnapshotGarbage(store, stem, exec)).skipped).toBe('missing_manifest');
+    expect(store.deleteFile).not.toHaveBeenCalled();
+  });
+
+  it('目录有快照卷但没有 current.json ⇒ missing_pointer', async () => {
+    const { store } = await threeVersions();
+    store.files.delete(`${paths.dir}/current.json`);
+    expect((await collectSnapshotGarbage(store, stem, exec)).skipped).toBe('missing_pointer');
+    expect(store.deleteFile).not.toHaveBeenCalled();
+  });
+
+  it('列目录看得到、读回却 404(清单或指针)⇒ 整本跳过', async () => {
+    const { store, a } = await threeVersions();
+    const realGet = store.getBytes.bind(store);
+    const gone = new Set([`${paths.dir}/${a.version}.json`]);
+    store.getBytes = async path => (gone.has(path) ? null : realGet(path));
+    expect((await collectSnapshotGarbage(store, stem, exec)).skipped).toBe('missing_manifest');
+    gone.clear();
+    gone.add(`${paths.dir}/current.json`);
+    expect((await collectSnapshotGarbage(store, stem, exec)).skipped).toBe('missing_pointer');
+    expect(store.deleteFile).not.toHaveBeenCalled();
+  });
+
+  it('指针 current 不是 8hex ⇒ unreadable_pointer', async () => {
+    const { store } = await threeVersions();
+    store.files.set(`${paths.dir}/current.json`, JSON.stringify({ current: 'nope', history: [] }));
+    expect((await collectSnapshotGarbage(store, stem, exec)).skipped).toBe('unreadable_pointer');
+  });
+
+  it('读取抛错(网络/限流/5xx)⇒ store_error,只带错误摘要,零删除', async () => {
+    const { store, b } = await threeVersions();
+    const realGet = store.getBytes.bind(store);
+    store.getBytes = async path => {
+      if (path.endsWith(`${b.version}.json`)) throw Object.assign(new Error('github_http_502'), { status: 502 });
+      return realGet(path);
+    };
+    const report = await collectSnapshotGarbage(store, stem, exec);
+    expect(report).toMatchObject({ skipped: 'store_error', detail: 'github_http_502', orphans: [], deleted: [] });
+    expect(store.deleteFile).not.toHaveBeenCalled();
+  });
+
+  it('列目录抛错 ⇒ store_error', async () => {
+    const store = new MemoryStore();
+    store.listFiles = async () => { throw new Error('github_tree_truncated'); };
+    const report = await collectSnapshotGarbage(store, stem, exec);
+    expect(report).toMatchObject({ skipped: 'store_error', detail: 'github_tree_truncated', volumeCount: 0 });
+  });
+
+  it('清单里某项 snapshot_path 缺失/非字符串 ⇒ 整份清单不可读(fail closed),不得跳过该项漏记引用', async () => {
+    const { store, a } = await threeVersions();
+    const manifestPath = `${paths.dir}/${a.version}.json`;
+    const manifest = JSON.parse(store.files.get(manifestPath)!) as { volumes: Record<string, unknown>[] };
+    // 丙卷只被 A 引用:若实现「跳过坏项」而非「整份判不可读」,这条引用会被漏记 ⇒ 丙卷被误判孤儿。
+    delete manifest.volumes[2]!.snapshot_path;
+    store.files.set(manifestPath, JSON.stringify(manifest));
+    const report = await collectSnapshotGarbage(store, stem, exec);
+    expect(report).toMatchObject({ skipped: 'unreadable_manifest', orphans: [], deleted: [] });
+    expect(store.deleteFile).not.toHaveBeenCalled();
+    expect(store.files.has(snaps(a)[2])).toBe(true);
+
+    // 非字符串(这里是数字)同理。
+    manifest.volumes[2]!.snapshot_path = 123 as unknown as string;
+    store.files.set(manifestPath, JSON.stringify(manifest));
+    expect((await collectSnapshotGarbage(store, stem, exec)).skipped).toBe('unreadable_manifest');
+
+    // 规范清单的单项缺字段同样整份判不可读(requireVolumes 路径)。
+    store.files.set(paths.canonicalPath, JSON.stringify({ schema: 2, format: 'volumes', volumes: [{ path: 'books/x/vol-001.txt' }] }));
+    expect((await collectSnapshotGarbage(store, stem, exec)).skipped).toBe('unreadable_canonical');
+    expect(store.deleteFile).not.toHaveBeenCalled();
+  });
+
+  it('规范 index.json 整体不在(读回 null)⇒ 不跳过,只少一个引用来源;仍按指针/保护窗判定', async () => {
+    const { store, a } = await threeVersions();
+    store.files.delete(paths.canonicalPath); // 规范清单整份缺失,不是「读不懂」
+    const report = await collectSnapshotGarbage(store, stem, { now: LATER });
+    expect(report.skipped).toBeNull();
+    // 存活集仍来自指针 current/history(实现现有语义:规范清单只是额外引用来源)。
+    const pointer = JSON.parse(store.files.get(`${paths.dir}/current.json`)!) as { current: string; history: string[] };
+    expect(report.liveVersions).toEqual([...new Set([pointer.current, ...pointer.history.slice(-2)])].sort());
+    // A 的丙卷不被任何人引用 ⇒ 仍是孤儿(不因缺规范清单而误保全,也不整本跳过)。
+    expect(report.orphans).toContain(snaps(a)[2]);
+  });
+
+  it('generated_at 解析不出时间(非法字符串/整个缺失)⇒ 按新近存活,其卷不得列为孤儿', async () => {
+    const { store, a } = await threeVersions();
+    const manifestPath = `${paths.dir}/${a.version}.json`;
+    const original = JSON.parse(store.files.get(manifestPath)!) as Record<string, unknown>;
+    const baseline = await collectSnapshotGarbage(store, stem, { now: LATER });
+    expect(baseline.liveVersions).not.toContain(a.version); // 合法 ISO 且远超 7 天窗 ⇒ 不存活
+    expect(baseline.orphans).toContain(snaps(a)[2]); // A 独占的丙卷此时是孤儿
+
+    store.files.set(manifestPath, JSON.stringify({ ...original, generated_at: 'not-a-date' }));
+    const unparsable = await collectSnapshotGarbage(store, stem, { now: LATER });
+    expect(unparsable.skipped).toBeNull();
+    expect(unparsable.liveVersions).toContain(a.version);
+    expect(unparsable.retained).toContain(snaps(a)[2]);
+    expect(unparsable.orphans).not.toContain(snaps(a)[2]);
+
+    const withoutGeneratedAt = { ...original };
+    delete withoutGeneratedAt.generated_at;
+    store.files.set(manifestPath, JSON.stringify(withoutGeneratedAt));
+    const missing = await collectSnapshotGarbage(store, stem, { now: LATER });
+    expect(missing.liveVersions).toContain(a.version);
+    expect(missing.orphans).not.toContain(snaps(a)[2]);
+
+    store.files.set(manifestPath, JSON.stringify(original));
+  });
+
+  it('history 里的非 8 位十六进制条目被忽略:不判指针不可读、不要求它有清单', async () => {
+    const { store, b, c } = await threeVersions();
+    const without = await collectSnapshotGarbage(store, stem, { now: LATER });
+    store.files.set(`${paths.dir}/current.json`, JSON.stringify({ current: c.version, history: ['zzzzzzzz', b.version, c.version] }));
+    const report = await collectSnapshotGarbage(store, stem, { now: LATER });
+    expect(report.skipped).toBeNull(); // 非 8hex 条目不会让整份指针读不懂
+    expect(report.liveVersions).toEqual(without.liveVersions);
+    expect(report.orphans).toEqual(without.orphans); // 脏条目不改变孤儿判定
+    // 若实现对脏条目改用 VERSION 之外的严格校验(判 unreadable_pointer),上面断言即红。
+    store.files.set(`${paths.dir}/current.json`, '{not json');
+    expect((await collectSnapshotGarbage(store, stem, { now: LATER })).skipped).toBe('unreadable_pointer');
+  });
+
+  it('目录里没有快照卷(旧单文件时代)⇒ 不读任何清单、不跳过、无孤儿', async () => {
+    const store = new MemoryStore();
+    store.files.set(`${paths.dir}/0badf00d.txt`, '旧整本快照');
+    store.files.set(`${paths.dir}/0badf00d.json`, '{broken');
+    const getBytes = vi.spyOn(store, 'getBytes');
+    const report = await collectSnapshotGarbage(store, stem, exec);
+    expect(report).toMatchObject({ skipped: null, volumeCount: 0, orphans: [] });
+    expect(getBytes).not.toHaveBeenCalled();
+  });
+});
+

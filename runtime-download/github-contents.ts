@@ -15,7 +15,7 @@
 
 import type { GitHubContents } from '../src/lib/download-publisher';
 
-const GITHUB_API = 'https://api.github.com';
+export const GITHUB_API = 'https://api.github.com';
 const USER_AGENT = 'zhaoshu-downloader/1.0';
 
 /** object JSON 信封：含 `sha`/`encoding`/`content`；>1MB 时 content 可能降级为空但 sha 一直在。 */
@@ -36,27 +36,38 @@ export interface GitHubContentsOptions {
   timeoutMs?: number;
 }
 
-function apiUrl(repository: string, path: string): { owner: string; repo: string; url: string } {
+export function repoApiBase(repository: string): string {
   const [owner, repo, extra] = repository.split('/');
   if (!owner || !repo || extra !== undefined) throw new Error('GITHUB_REPOSITORY must be owner/repo');
-  return { owner, repo, url: `${GITHUB_API}/repos/${owner}/${repo}/contents/${path}` };
+  return `${GITHUB_API}/repos/${owner}/${repo}`;
+}
+
+function apiUrl(repository: string, path: string): { url: string } {
+  return { url: `${repoApiBase(repository)}/contents/${path}` };
 }
 
 /** 错误只保留 HTTP 状态/类别，绝不透传响应体（可能含服务端回显）。 */
-function httpError(status: number): Error {
+export function httpError(status: number): Error {
   return Object.assign(new Error(`github_http_${status}`), { status });
 }
 
-export function createGitHubContents({ token, repository, branch, fetchImpl = fetch, timeoutMs = 60_000 }: GitHubContentsOptions): GitHubContents {
-  if (!branch) throw new Error('createGitHubContents requires branch');
-  // 共享头不含 Accept：每个调用按用途显式传（见文件头说明），避免 GET/PUT 共用一个媒体类型。
+/**
+ * 带鉴权/超时的 GitHub 请求（contents 读写与快照 GC 列目录共用）。
+ * 共享头不含 Accept：每个调用按用途显式传（见文件头说明），避免 GET/PUT 共用一个媒体类型。
+ */
+export function createGitHubRequest({ token, fetchImpl = fetch, timeoutMs = 60_000 }: Pick<GitHubContentsOptions, 'token' | 'fetchImpl' | 'timeoutMs'>) {
   const headers = {
     Authorization: `Bearer ${token}`,
     'X-GitHub-Api-Version': '2022-11-28',
     'User-Agent': USER_AGENT,
   };
-  const request = (url: string, accept: string, init: RequestInit = {}) =>
+  return (url: string, accept: string, init: RequestInit = {}) =>
     fetchImpl(url, { ...init, headers: { ...headers, Accept: accept, ...(init.headers ?? {}) }, signal: AbortSignal.timeout(timeoutMs) });
+}
+
+export function createGitHubContents({ token, repository, branch, fetchImpl = fetch, timeoutMs = 60_000 }: GitHubContentsOptions): GitHubContents {
+  if (!branch) throw new Error('createGitHubContents requires branch');
+  const request = createGitHubRequest({ token, fetchImpl, timeoutMs });
   // GET 落到 `?ref=<branch>`，与 PUT body 的 branch 同一条，读写不分叉到默认分支。
   const withRef = (url: string) => `${url}?ref=${encodeURIComponent(branch)}`;
 
