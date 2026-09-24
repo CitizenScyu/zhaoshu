@@ -279,13 +279,36 @@ def parse_douban_tag_page(html: str) -> list[dict]:
         if p:
             # pub 形如「有花在野 / 广东旅游出版社」，取第一段；译者/丛书形态同样取第一段。
             # 该版本没列作者时首段就是出版机构（「青岛出版社 / 2020-4 / 59.8」，authfix41）
-            # → 作者未知（''），走引擎「名单无作者 → title 兼容即收」，不拿出版社当人名去拒真作者。
+            # → 作者先置空并打 publisher_only 标记，由 fetch_douban_books 去 subject 页补作者；
+            # 补不到才以「名单无作者」进引擎（受作者歧义护栏约束）。不拿出版社当人名去拒真作者。
             first = p.group(1).split('/')[0].strip()
             author = '' if _PUBLISHER_RE.search(first) else first
-        books.append({'title': t.group(2).strip(),
-                      'author': author,
-                      'douban_url': t.group(1)})
+        book = {'title': t.group(2).strip(), 'author': author, 'douban_url': t.group(1)}
+        if p and not author and first:
+            book['publisher_only'] = True     # fetch_douban_books 据此去 subject 页补作者
+        books.append(book)
     return books
+
+
+def parse_douban_subject_author(html: str) -> str:
+    """豆瓣 subject 页 → 第一作者（取不到返回 ''）。
+
+    两处来源（2026-09-25 实测）：
+      #info 的「<span class="pl"> 作者</span>: <a>天蚕土豆</a>」——常规版本；
+      「作者」卡片 ul.authors-list > li.author > a.name + span.role——tag 页 pub 首段是
+      出版社的版本（偷偷藏不住 35003286、剑来1 35022388），#info 里**没有作者行**，只有这里有。
+    卡片只收 role 含「作者/著」的（译者/绘者不算）。"""
+    m = re.search(r'<span class="pl">\s*作者\s*:?\s*</span>\s*:?([\s\S]*?)</span>', html)
+    if m:
+        a = re.search(r'<a[^>]*>([^<]+)</a>', m.group(1))
+        if a and a.group(1).strip():
+            return re.sub(r'\s+', ' ', a.group(1)).strip()
+    for li in re.finditer(r'<li class="author">([\s\S]*?)</li>', html):
+        name = re.search(r'class="name">([^<]+)</a>', li.group(1))
+        role = re.search(r'<span class="role">([^<]*)</span>', li.group(1))
+        if name and name.group(1).strip() and (not role or re.search(r'作者|著', role.group(1))):
+            return re.sub(r'\s+', ' ', name.group(1)).strip()
+    return ''
 
 
 # ---- book15 搜索结果解析（纯函数，可离线单测）----
@@ -385,6 +408,20 @@ def fetch_douban_books(http_get, pages: int | None = None) -> list[dict]:
                 if key and key not in seen:
                     seen.add(key)
                     books.append(b)
+    # authfix41：pub 首段是出版社的条目去 subject 页补作者（作者卡片）。同样隔 DOUBAN_PAGE_DELAY、
+    # 单次尝试不重试；失败/取不到保持 ''（引擎侧按「名单无作者」走歧义护栏）。标记不外带。
+    for b in [b for b in books if b.pop('publisher_only', False)]:
+        time.sleep(DOUBAN_PAGE_DELAY)
+        try:
+            author = parse_douban_subject_author(http_get(b['douban_url']))
+        except Exception as e:
+            print(f'  豆瓣subject《{b["title"]}》补作者失败: {e}', file=sys.stderr)
+            continue
+        if author:
+            b['author'] = author
+            print(f'  豆瓣subject 补作者: 《{b["title"]}》→ {author}')
+        else:
+            print(f'  豆瓣subject《{b["title"]}》无作者字段，按名单无作者处理')
     return books
 
 
@@ -611,6 +648,8 @@ def search_engine(cli, title: str, author: str = '',
     N02 修复：author 不再只传不用——候选作者非空且归一化后与名单作者不等 → 必拒
     （防同名异作者的正文绑定名单身份，即身份错配污染共享数据）。
     两遍选择：先「title 兼容 + 作者已验证匹配」，再退「title 兼容 + 候选作者空」。
+    名单作者为空（authfix41）：不再「第一个兼容候选即收」，兼容候选作者出现 ≥2 人即判作者歧义跳过
+    （_pick_author_unknown）。
     返回命中 {'url': bookUrl（绝对）, 'title': site_title, 'source': host} 或 None（miss）。
     退出码：0=有候选（逐条校验，跳过 book15.net 源）；1=正常 miss；
     2/未知非零/无法调用 → 抛 EngineUnavailable（调用方本轮降级 book15-only、不重试）。
@@ -651,9 +690,10 @@ def search_engine(cli, title: str, author: str = '',
     # 第一遍：title 兼容 + author 已验证匹配（名单 author 已知且 author_matches 为真）。
     # 第二遍：名单 author 已知但无已验证匹配 → 退「title 兼容 + 候选 author 空」（降级收）。
     # 已验证错配的候选两遍都不收（必拒，防同名异作者正文绑错身份）。
-    # 名单 author 为空 → 照旧行为：title 兼容即收，不看候选 author。
+    # 名单 author 为空 → 收齐全部 title 兼容候选，过作者歧义护栏（_pick_author_unknown）。
     want = _norm_author(author)
     fallback = None
+    unknown_hits: list[tuple[dict, str]] = []
     for c in candidates:
         if not isinstance(c, dict):
             continue
@@ -669,9 +709,10 @@ def search_engine(cli, title: str, author: str = '',
             print(f'  非 HTTPS 源跳过: {site_title}（{c.get("source", "")}）')
             continue
         got = _norm_author(c.get('author') or '')
-        if not want:          # 名单无作者：行为同现状
-            return {'url': book_url, 'title': site_title,
-                    'source': c.get('source', '')}
+        if not want:          # 名单无作者：先收齐，循环后统一判歧义
+            unknown_hits.append(({'url': book_url, 'title': site_title,
+                                  'source': c.get('source', '')}, c.get('author') or ''))
+            continue
         if got and author_matches(author, c.get('author') or ''):
             return {'url': book_url, 'title': site_title,
                     'source': c.get('source', '')}
@@ -682,9 +723,36 @@ def search_engine(cli, title: str, author: str = '',
             # 前导书名是**引擎候选**的（一本名单书常对应多行，authmis41 曾误读成名单书）
             print(f'  作者不符跳过: 候选《{site_title}》（名单《{title}》{author}'
                   f' vs 引擎 {c.get("author")}）')
-    if fallback is not None and want:
+    if not want:
+        return _pick_author_unknown(title, unknown_hits)
+    if fallback is not None:
         print(f'  作者未知命中（降级）: {fallback["title"]}（名单作者 {author}，引擎未给作者）')
     return fallback
+
+
+def _pick_author_unknown(title: str, hits: list[tuple[dict, str]]) -> dict | None:
+    """名单无作者时的选择（authfix41 主会话裁定：错绑比漏收更糟）。
+
+    改前是「第一个 title 兼容候选即收」：《偷偷藏不住》的同名候选有 竹已（真作者）/旺仔/
+    桑稚段嘉许，候选顺序每次搜索都不同（gate.log 有一次旺仔排第一）⇒ 绑哪本看运气。
+    改后：兼容候选的非空作者按 author_matches（任一方向）聚成「同一人」簇——
+      ≥2 簇 ⇒ 作者歧义，跳过并记一行日志；
+      1 簇 ⇒ 收该作者的第一个候选（作者已知的优先于作者空的）；
+      0 簇（候选全无作者）⇒ 收第一个（无从区分，同改前）。"""
+    if not hits:
+        return None
+    clusters: list[str] = []
+    for _, a in hits:
+        if _norm_author(a) and not any(author_matches(r, a) or author_matches(a, r)
+                                       for r in clusters):
+            clusters.append(a)
+    if len(clusters) >= 2:
+        names = '、'.join(clusters[:5]) + ('…' if len(clusters) > 5 else '')
+        print(f'  作者歧义跳过: 《{title}》名单无作者，兼容候选作者 {len(clusters)} 人（{names}）')
+        return None
+    if clusters:
+        return next(hit for hit, a in hits if _norm_author(a))
+    return hits[0][0]
 
 
 def validate_engine(cli) -> None:

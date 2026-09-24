@@ -1614,5 +1614,225 @@ class TestSearchEngineAuthorRules(unittest.TestCase):
         self.assertNotIn('作者不符', out)
 
 
+
+# ---- authfix41 续做（主会话裁定：错绑比漏收更糟）----
+# 豆瓣 subject 页结构按 2026-09-25 实抓缩写（保留真实嵌套与空白形态）。
+# 偷偷藏不住 subject/35003286：#info 里**没有作者行**（tag 页 pub 首段因此是出版社），作者只在作者卡片里。
+SUBJECT_CARD_ONLY_HTML = """<div id="info">
+    <span class="pl">出版社:</span>
+      <a href="https://book.douban.com/press/2818">青岛出版社</a>
+    <br>
+    <span class="pl">出版年:</span> 2020-4<br/>
+    <span class="pl">原作名:</span> 偷偷藏不住<br/>
+</div>
+<div id="authors">
+  <ul class="authors-list from-subject __oneline">
+          <li class="author">
+              <a href="https://book.douban.com/author/4616235/" title="竹已">
+                  <img src="x.png" alt="竹已" class="avatar">
+              </a>
+              <div class="info">
+                  <a href="https://book.douban.com/author/4616235/" title="竹已" class="name">竹已</a>
+                  <span class="role">作者</span>
+              </div>
+          </li>
+      <li class="author fake fake5"></li>
+  </ul>
+</div>"""
+# 斗破苍穹 subject/22933018：常规版本，#info 有作者行
+SUBJECT_INFO_HTML = """<div id="info">
+    <span>
+      <span class="pl"> 作者</span>:
+            <a href="/search/%E5%A4%A9%E8%9A%95%E5%9C%9F%E8%B1%86">天蚕土豆</a>
+    </span><br/>
+    <span class="pl">出版社:</span>
+      <a href="https://book.douban.com/press/2636">湖北少年儿童出版社</a>
+    <br>
+</div>"""
+TAG_PUBLISHER_ONLY_HTML = """<ul class="subject-list">
+<li class="subject-item"><div class="info">
+  <h2><a href="https://book.douban.com/subject/35003286/" title="偷偷藏不住">偷偷藏不住</a></h2>
+  <div class="pub">青岛出版社 / 2020-4 / 59.8</div></div></li>
+<li class="subject-item"><div class="info">
+  <h2><a href="https://book.douban.com/subject/22933018/" title="斗破苍穹">斗破苍穹</a></h2>
+  <div class="pub">天蚕土豆 / 湖北少年儿童出版社 / 2010-7</div></div></li>
+</ul>"""
+SUBJECT_TTCBZ = 'https://book.douban.com/subject/35003286/'
+
+# 偷偷藏不住的引擎候选（phoenix gate.log 335 起那次搜索：旺仔排第一）
+TTCBZ_CANDIDATES = [
+    {'source': 'a.example', 'title': '偷偷藏不住', 'author': '旺仔', 'bookUrl': 'https://a.example/wz'},
+    {'source': 'b.example', 'title': '偷偷藏不住', 'author': '竹已', 'bookUrl': 'https://b.example/zy'},
+    {'source': 'c.example', 'title': '偷偷藏不住', 'author': '桑稚段嘉许', 'bookUrl': 'https://c.example/sz'},
+]
+
+
+class TestParseDoubanSubjectAuthor(unittest.TestCase):
+    def test_author_card_when_info_has_no_author(self):
+        self.assertEqual(douban_list.parse_douban_subject_author(SUBJECT_CARD_ONLY_HTML), '竹已')
+
+    def test_info_author_line(self):
+        self.assertEqual(douban_list.parse_douban_subject_author(SUBJECT_INFO_HTML), '天蚕土豆')
+
+    def test_no_author_anywhere(self):
+        self.assertEqual(douban_list.parse_douban_subject_author('<div id="info"></div>'), '')
+
+    def test_translator_card_is_not_author(self):
+        html = SUBJECT_CARD_ONLY_HTML.replace('<span class="role">作者</span>',
+                                              '<span class="role">译者</span>')
+        self.assertEqual(douban_list.parse_douban_subject_author(html), '')
+
+
+class TestDoubanSubjectBackfill(unittest.TestCase):
+    """只对「pub 首段是出版社」的条目去 subject 页补作者；单次尝试、失败落回名单无作者。"""
+
+    def setUp(self):
+        no_wait(self)
+        self.urls = []
+
+    def _get(self, subject):
+        def http_get(url):
+            self.urls.append(url)
+            if url == douban_list._douban_tag_url('网络小说', 0):
+                return TAG_PUBLISHER_ONLY_HTML
+            if url == SUBJECT_TTCBZ:
+                if isinstance(subject, Exception):
+                    raise subject
+                return subject
+            if url.startswith('https://book.douban.com/subject/'):
+                raise AssertionError(f'不该请求 subject 页: {url}')
+            return '<html></html>'
+        return http_get
+
+    def test_publisher_only_entry_is_backfilled_from_subject(self):
+        with contextlib.redirect_stdout(io.StringIO()):
+            books = douban_list.fetch_douban_books(self._get(SUBJECT_CARD_ONLY_HTML), pages=1)
+        got = {b['title']: b for b in books}
+        self.assertEqual(got['偷偷藏不住']['author'], '竹已')
+        self.assertEqual(got['斗破苍穹']['author'], '天蚕土豆')      # 有作者的条目不请求 subject
+        self.assertEqual(self.urls.count(SUBJECT_TTCBZ), 1)
+        self.assertTrue(all('publisher_only' not in b for b in books))   # 标记不外带进队列
+
+    def test_subject_failure_is_single_attempt_and_leaves_author_empty(self):
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            books = douban_list.fetch_douban_books(
+                self._get(ConnectionError('豆瓣 subject 超时')), pages=1)
+        got = {b['title']: b for b in books}
+        self.assertEqual(got['偷偷藏不住']['author'], '')
+        self.assertEqual(self.urls.count(SUBJECT_TTCBZ), 1)          # 不重试
+        self.assertIn('补作者失败', err.getvalue())
+
+    def test_subject_without_author_leaves_author_empty(self):
+        with contextlib.redirect_stdout(io.StringIO()):
+            books = douban_list.fetch_douban_books(self._get('<div id="info"></div>'), pages=1)
+        self.assertEqual({b['title']: b for b in books}['偷偷藏不住']['author'], '')
+
+    def test_subject_request_is_throttled_like_tag_pages(self):
+        with mock.patch.object(douban_list.time, 'sleep') as sleep, \
+                contextlib.redirect_stdout(io.StringIO()):
+            douban_list.fetch_douban_books(self._get(SUBJECT_CARD_ONLY_HTML), pages=1)
+        # tag 页之间 len(TAGS)-1 次 + subject 1 次，间隔都是 DOUBAN_PAGE_DELAY
+        self.assertEqual(sleep.call_count, len(douban_list.DOUBAN_TAGS))
+        self.assertTrue(all(c.args == (douban_list.DOUBAN_PAGE_DELAY,)
+                            for c in sleep.call_args_list))
+
+
+class TestAuthorUnknownAmbiguityGuard(unittest.TestCase):
+    """名单无作者：兼容候选作者 ≥2 人 ⇒ 作者歧义跳过；一人（或全无作者）才收。"""
+
+    @staticmethod
+    def _search(title, candidates, author=''):
+        cli = FakeEngineCli({'search': _proc(0, _engine_search_stdout(candidates))})
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            hit = douban_list.search_engine(cli, title, author)
+        return hit, buf.getvalue()
+
+    def test_ttcbz_three_authors_is_skipped_not_bound_to_first(self):
+        # 改前：第一个兼容候选即收 ⇒ 绑到旺仔（a.example/wz）；改后：作者歧义跳过
+        hit, out = self._search('偷偷藏不住', TTCBZ_CANDIDATES)
+        self.assertIsNone(hit)
+        self.assertIn('作者歧义跳过: 《偷偷藏不住》名单无作者，兼容候选作者 3 人（旺仔、竹已、桑稚段嘉许）',
+                      out)
+
+    def test_prefix_title_other_author_also_counts(self):
+        # 兼容候选含同名前缀的别的书（偷偷藏不住的喜欢/司格子）同样算第二位作者
+        hit, out = self._search('偷偷藏不住', [
+            TTCBZ_CANDIDATES[1],
+            {'source': 'd.example', 'title': '偷偷藏不住的喜欢', 'author': '司格子',
+             'bookUrl': 'https://d.example/sgz'}])
+        self.assertIsNone(hit)
+        self.assertIn('作者歧义跳过', out)
+
+    def test_single_author_is_accepted_preferring_known_author(self):
+        hit, out = self._search('剑来', [
+            {'source': 'e.example', 'title': '剑来', 'author': '', 'bookUrl': 'https://e.example/0'},
+            {'source': 'a.example', 'title': '剑来', 'author': '烽火戏诸侯',
+             'bookUrl': 'https://a.example/1'},
+            {'source': 'b.example', 'title': '剑来1：少年起微末', 'author': '作者：烽火戏诸侯',
+             'bookUrl': 'https://b.example/2'}])
+        self.assertEqual(hit['url'], 'https://a.example/1')
+        self.assertNotIn('作者歧义', out)
+
+    def test_same_person_written_differently_is_one_author(self):
+        # 聚簇用 author_matches：多署名写法不算第二人
+        hit, _ = self._search('风起陇西', [
+            {'source': 'a.example', 'title': '风起陇西', 'author': '马伯庸',
+             'bookUrl': 'https://a.example/1'},
+            {'source': 'b.example', 'title': '风起陇西', 'author': '马伯庸著 刘巴布编绘',
+             'bookUrl': 'https://b.example/2'}])
+        self.assertEqual(hit['url'], 'https://a.example/1')
+
+    def test_all_candidates_without_author_takes_first(self):
+        hit, _ = self._search('某书', [
+            {'source': 'a.example', 'title': '某书', 'author': '', 'bookUrl': 'https://a.example/1'},
+            {'source': 'b.example', 'title': '某书', 'author': '', 'bookUrl': 'https://b.example/2'}])
+        self.assertEqual(hit['url'], 'https://a.example/1')
+
+    def test_known_list_author_path_unchanged(self):
+        # 名单有作者时不走歧义护栏：三人里挑出竹已
+        hit, out = self._search('偷偷藏不住', TTCBZ_CANDIDATES, author='竹已')
+        self.assertEqual(hit['url'], 'https://b.example/zy')
+        self.assertNotIn('作者歧义', out)
+
+
+class TestPublisherOnlyEndToEnd(unittest.TestCase):
+    """豆瓣出版社条目 → subject 补作者 → 引擎候选（旺仔排第一）→ 绑到竹已；补不到则歧义跳过。"""
+
+    def setUp(self):
+        no_wait(self)
+
+    def _run(self, subject):
+        def http_get(url):
+            if url == douban_list._douban_tag_url('网络小说', 0):
+                return TAG_PUBLISHER_ONLY_HTML
+            if url == SUBJECT_TTCBZ:
+                if isinstance(subject, Exception):
+                    raise subject
+                return subject
+            return NO_RESULT_HTML if url.startswith('/books/search') else '<html></html>'
+
+        def engine(sub, args):
+            title = args[args.index('--title') + 1]
+            if title == '偷偷藏不住':
+                return _proc(0, _engine_search_stdout(TTCBZ_CANDIDATES))
+            return _proc(1)
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
+            queue = douban_list.build_douban_queue(http_get, pages=1,
+                                                   engine_cli=FakeEngineCli(engine))
+        return {q['title']: q for q in queue}, buf.getvalue()
+
+    def test_backfilled_author_binds_true_author(self):
+        got, _ = self._run(SUBJECT_CARD_ONLY_HTML)
+        self.assertEqual(got['偷偷藏不住']['url'], 'https://b.example/zy')
+        self.assertEqual(got['偷偷藏不住']['author'], '竹已')
+
+    def test_backfill_failure_falls_back_to_ambiguity_guard(self):
+        got, out = self._run(ConnectionError('豆瓣 subject 超时'))
+        self.assertNotIn('偷偷藏不住', got)
+        self.assertIn('作者歧义跳过', out)
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)
