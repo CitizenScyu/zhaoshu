@@ -6,7 +6,7 @@ import {
   builtinFallbackSource, builtinUrlPrefixes, engineHosts, type SupportedSourceTier,
 } from '@/lib/supported-sources';
 import {
-  ADMISSION_MAX_REDIRECTS, ADMISSION_MIN_BUDGET_MS, ADMISSION_TIMEOUT_MS, assertAdmissionVersionConsistent,
+  ADMISSION_MAX_REDIRECTS, ADMISSION_MIN_BUDGET_MS, ADMISSION_PROBE_WORST_MS, assertAdmissionVersionConsistent,
   defaultAdmissionTransport, runAdmissionBatch,
   type AdmissionCandidate, type AdmissionSourceRow,
 } from '@/lib/rule-engine/admission';
@@ -992,7 +992,9 @@ async function runAdmissionAfterRefresh(
     const existing = await readAdmissionRows(s, candidates.map((candidate) => candidate.url), signal);
     const result = await runAdmissionBatch({
       candidates, declaredHosts, existing, fetchPage: defaultAdmissionTransport, signal,
-      canProbe: () => !signal.aborted && budget.remainingMs > ADMISSION_TIMEOUT_MS + WRITE_RESERVE_MS,
+      // espfix41：开查询不敏感对照搜索，单探最坏 = 主搜索 + 对照搜索（ADMISSION_PROBE_WORST_MS），止损按它预留。
+      controlQuery: true,
+      canProbe: () => !signal.aborted && budget.remainingMs > ADMISSION_PROBE_WORST_MS + WRITE_RESERVE_MS,
     });
     // 准入兼容 L4（§2.4）：每轮一行漂移计数（不建历史表；要趋势曲线再上日表，Phase 2）。
     console.log('shuyuan admission batch', {

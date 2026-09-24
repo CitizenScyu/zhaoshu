@@ -1775,3 +1775,111 @@ describe('41-ADMIT-CONC:准入探测受限并发', () => {
     });
   });
 });
+
+describe('espfix41:查询不敏感判据(对照搜索)', () => {
+  const host = 'junk.example.com';
+  const url = `https://${host}/`;
+  const declaredHosts = new Set([host]);
+  // 垃圾源形态(按 lbldeploy41 §5 观察合成):无论搜什么都回同一批无关条目。
+  const junkHtml = [1, 2, 3].map((i) => `<div class="i"><span class="t">无关条目${i}</span><a href="/b/${i}">x</a></div>`).join('');
+  const resultsFor = (q: string) => [1, 2].map((i) => `<div class="i"><span class="t">${q}${i}</span><a href="/b/${encodeURIComponent(q)}-${i}">x</a></div>`).join('');
+  const queryOf = (input: string) => new URL(input).searchParams.get('q') ?? '';
+
+  it('反例(改前放行):同一批条目在不开对照时判 ok;开对照后判 query_insensitive', async () => {
+    const fetchPage = vi.fn<AdmissionTransport>().mockImplementation(async () => page(junkHtml));
+    const before = await searchAdmission(syntheticSource(url), { fetchPage, declaredHosts, signal: signal(), throttleMs: 0 });
+    expect(before.verdict).toBe('ok');
+    expect(fetchPage).toHaveBeenCalledOnce();
+    const after = await searchAdmission(syntheticSource(url), {
+      fetchPage, declaredHosts, signal: signal(), throttleMs: 0, controlQuery: true,
+    });
+    expect(after.verdict).toBe('query_insensitive');
+    expect(after.error).toContain('100%');
+    // 第二次请求用对照书名(与主关键词「测试关键字」无公共字的第一个)
+    expect(queryOf(String(fetchPage.mock.calls[2][0]))).toBe('凡人修仙传');
+    expect(admissionBucket('query_insensitive')).toBe('deferred');
+  });
+
+  it('正常站:结果随查询变化 ⇒ 仍判 ok', async () => {
+    const fetchPage = vi.fn<AdmissionTransport>().mockImplementation(async (input) => page(resultsFor(queryOf(input))));
+    const result = await searchAdmission(syntheticSource(url), {
+      fetchPage, declaredHosts, signal: signal(), throttleMs: 0, controlQuery: true,
+    });
+    expect(result.verdict).toBe('ok');
+    expect(fetchPage).toHaveBeenCalledTimes(2);
+  });
+
+  it('正常站:对照书名 0 结果(页上只有热门榜,不在 bookList 里)⇒ 仍判 ok', async () => {
+    const fetchPage = vi.fn<AdmissionTransport>().mockImplementation(async (input) =>
+      page(queryOf(input) === '测试关键字' ? resultsFor('测试关键字') : '<html><body><ul class="hot"><li>热门</li></ul></body></html>'));
+    const result = await searchAdmission(syntheticSource(url), {
+      fetchPage, declaredHosts, signal: signal(), throttleMs: 0, controlQuery: true,
+    });
+    expect(result.verdict).toBe('ok');
+  });
+
+  it('对照搜索网络失败 / 5xx:拿不到证据 ⇒ 维持 ok(不把抖动升级成出池)', async () => {
+    for (const control of [() => Promise.reject(new TypeError('fetch failed')), () => Promise.resolve(page('err', 502))]) {
+      const fetchPage = vi.fn<AdmissionTransport>().mockImplementation(async (input) =>
+        queryOf(input) === '测试关键字' ? page(junkHtml) : control());
+      const result = await searchAdmission(syntheticSource(url), {
+        fetchPage, declaredHosts, signal: signal(), throttleMs: 0, controlQuery: true,
+      });
+      expect(result.verdict).toBe('ok');
+    }
+  });
+
+  it('部分重合低于阈值 ⇒ ok;达到阈值 ⇒ query_insensitive', async () => {
+    const item = (i: number) => `<div class="i"><span class="t">条目${i}</span><a href="/b/${i}">x</a></div>`;
+    const run = async (control: number[]) => {
+      const fetchPage = vi.fn<AdmissionTransport>().mockImplementation(async (input) =>
+        page((queryOf(input) === '测试关键字' ? [1, 2, 3, 4, 5] : control).map(item).join('')));
+      return (await searchAdmission(syntheticSource(url), {
+        fetchPage, declaredHosts, signal: signal(), throttleMs: 0, controlQuery: true,
+      })).verdict;
+    };
+    expect(await run([1, 2, 6, 7, 8])).toBe('ok');                 // Jaccard 2/8
+    expect(await run([1, 2, 3, 4])).toBe('query_insensitive');     // Jaccard 4/5 = 0.8
+  });
+
+  it('对照词避开与主关键词有公共字的候选;全部冲突则不做对照', async () => {
+    const { queryControlKeyword } = await import('./admission');
+    expect(queryControlKeyword('修仙')).toBe('诡秘之主');
+    expect(queryControlKeyword('测试关键字')).toBe('凡人修仙传');
+    expect(queryControlKeyword('凡诡庆斗')).toBeUndefined();
+    const fetchPage = vi.fn<AdmissionTransport>().mockImplementation(async () => page(junkHtml));
+    const result = await searchAdmission(syntheticSource(url, { checkKeyWord: '凡诡庆斗' }), {
+      fetchPage, declaredHosts, signal: signal(), throttleMs: 0, controlQuery: true,
+    });
+    expect(result.verdict).toBe('ok');
+    expect(fetchPage).toHaveBeenCalledOnce();
+  });
+
+  it('两次请求之间补一次同站节流间隔', async () => {
+    const sleep = vi.fn(async () => {});
+    const fetchPage = vi.fn<AdmissionTransport>().mockImplementation(async () => page(junkHtml));
+    await searchAdmission(syntheticSource(url), {
+      fetchPage, declaredHosts, signal: signal(), throttleMs: 350, sleep, controlQuery: true,
+    });
+    expect(sleep).toHaveBeenCalledWith(350, expect.anything());
+  });
+
+  it('批次:在池的干净 ok 行复核判 query_insensitive ⇒ 不走 strike、直接出池(search_ok=false)', async () => {
+    const source = syntheticSource(url);
+    const checked = new Date(Date.parse('2026-09-24T00:00:00Z') - ADMISSION_OK_RECHECK_MS - 1).toISOString();
+    const existing = new Map([[url, sourceRow(url, {
+      compile_ok: true, search_ok: true, search_verdict: 'ok', search_checked_at: checked,
+      rules_hash: rulesHash(source), host,
+    })]]);
+    const fetchPage = vi.fn<AdmissionTransport>().mockImplementation(async () => page(junkHtml));
+    const run = (controlQuery: boolean) => runAdmissionBatch({
+      candidates: [{ url, source }], declaredHosts, existing, fetchPage, signal: signal(), throttleMs: 0,
+      now: () => new Date('2026-09-24T00:00:00Z'), controlQuery,
+    });
+    const before = await run(false);
+    expect(before.rows[0]).toMatchObject({ search_ok: true, search_verdict: 'ok' });
+    const after = await run(true);
+    expect(after.rows[0]).toMatchObject({ search_ok: false, search_verdict: 'query_insensitive' });
+    expect(after.verdicts).toEqual({ query_insensitive: 1 });
+  });
+});
