@@ -5,7 +5,7 @@ import { describe, expect, it } from 'vitest';
 import { initializeBusinessSchema } from '../src/lib/business-schema';
 import { loadPGlite, type PGliteLike } from '../src/lib/fixtures/pglite';
 import { createPGliteClient, createPGliteSql } from '../src/lib/fixtures/pglite-sql';
-import { applyMigration, checkRuntimeColumns, loadMigrations, planMigrations } from './db-migration-lib.mjs';
+import { applyMigration, checkRuntimeColumns, EXPECTED_RUNTIME_COLUMNS, loadMigrations, planMigrations } from './db-migration-lib.mjs';
 import { main, parseProdArgs, plannedLedgerWrites, runProdCheck, runProdMigrate } from './db-prod.mjs';
 import { runAuthMigration } from './migrate-auth-prod.mjs';
 
@@ -132,6 +132,33 @@ describe('planMigrations（纯函数）', () => {
       { table: 'auth_schema_migrations', byVersion: 1, values: '(1),(2),(3),(4)', onConflict: 'DO NOTHING' },
     ]);
   }, 60_000);
+});
+
+describe('checkRuntimeColumns（纯函数，N2）', () => {
+  const rowsOf = () => Object.entries(EXPECTED_RUNTIME_COLUMNS).flatMap(([table, columns]) =>
+    columns.map(([column_name, data_type, is_nullable, column_default]) => ({ table_name: table, column_name, data_type, is_nullable, column_default })));
+
+  it('与契约一致 → ok；表整张不在只记 absentTables（0003 会建）；多出的列只报告', () => {
+    expect(checkRuntimeColumns(rowsOf())).toEqual({ ok: true, problems: [], extra: [], absentTables: [] });
+    expect(checkRuntimeColumns(rowsOf().filter((row) => row.table_name !== 'cron_health')))
+      .toEqual({ ok: true, problems: [], extra: [], absentTables: ['cron_health'] });
+    const extra = checkRuntimeColumns([...rowsOf(), { table_name: 'cron_health', column_name: 'note', data_type: 'text', is_nullable: 'YES', column_default: null }]);
+    expect(extra).toMatchObject({ ok: true, extra: [{ table: 'cron_health', column: 'note' }] });
+  });
+
+  it.each([
+    ['类型', { data_type: 'integer' }],
+    ['可空', { is_nullable: 'YES' }],
+    ['默认值', { column_default: "'x'::text" }],
+  ])('只有%s不同也判不一致', (_label, patch) => {
+    const rows = rowsOf().map((row) => row.table_name === 'source_admission' && row.column_name === 'search_verdict' ? { ...row, ...patch } : row);
+    expect(checkRuntimeColumns(rows)).toMatchObject({ ok: false, problems: [{ table: 'source_admission', column: 'search_verdict', kind: 'mismatch' }] });
+  });
+
+  it('表在而列缺 → missing（0003 不会给已有表补 CREATE TABLE 里的列）', () => {
+    const rows = rowsOf().filter((row) => !(row.table_name === 'source_admission' && row.column_name === 'search_verdict'));
+    expect(checkRuntimeColumns(rows)).toMatchObject({ ok: false, problems: [{ column: 'search_verdict', kind: 'missing' }] });
+  });
 });
 
 const PGliteCtor = await loadPGlite();
