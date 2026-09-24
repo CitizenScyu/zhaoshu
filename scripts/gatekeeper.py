@@ -31,26 +31,42 @@ PROBE_TIMEOUT = 280       # 单次探测超时（CF 524 在 ~125s，280 足够�
 # （复用 labeler 的解析函数，见 resolve_probe_models），彻底消除两处漂移。
 
 EXIT_NO_MODELS = 3        # .env 未给模型链：fail-closed，不放行 labeler
+# 探测链要不要带上数据库 app_settings.label_model（链首）？labeler 启动时走
+# `resolve_models(env, use_db=not args.no_db_model)`，而 LABELER_CMD 未带 `--no-db-model`，
+# 所以 labeler 实际 use_db=True。门卫探测必须用同一条链，否则「探测的就是要跑的」不成立
+# （复审 F2：DB 模型是链里唯一活的时，门卫会永远等窗口）。门卫与 labeler 同目录、同一份 .env，
+# 读库途径（Neon HTTPS）完全一致；读库失败 labeler 自身也是静默回落 env 链，行为相同。
+USE_DB_MODEL = True
 
 
 def resolve_probe_models(env: dict) -> tuple[list[str], str]:
-    """探测模型链 = labeler 实际使用的 .env 模型链，复用 labeler.resolve_models 解析
+    """探测模型链 = labeler 实际运行时使用的模型链，复用 labeler.resolve_models 解析
     （同一个 LLM_MODELS 逗号列表 / 旧 LLM_MODEL 单值兜底逻辑，不另写一套解析）。
 
-    返回 (模型链, 来源键)。来源键取 'LLM_MODELS' / 'LLM_MODEL'；两者都没给（或解析为空）
-    时返回 ([], 'none')，由调用方 fail-closed——刻意**不**退回硬编码旧链：
+    返回 (模型链, 来源键)。来源键取 'LLM_MODELS' / 'LLM_MODEL'（哪把 .env 键让门卫决定放行）；
+    两者都没给（或解析为空）时返回 ([], 'none')，由调用方 fail-closed——刻意**不**退回硬编码旧链：
     静默退回会把「.env 配置缺失/被改坏」这一真实故障伪装成「探测正常」，正是本次要修的失效模式。
 
-    注意判定用**逗号切分后的非空列表**而不是原始字符串的真值：LLM_MODELS 写成 ',' 或
-    ' , , ' 时字符串非空但解析出 0 个模型，若按真值判定就会放行到 labeler.resolve_models，
-    后者静默回落到 labeler.MODELS 常量链——正是本函数要堵的那个洞。"""
+    判定用**逗号切分后的非空列表**而不是原始字符串的真值：LLM_MODELS 写成 ',' 或 ' , , '
+    时字符串非空但解析出 0 个模型，若按真值判定就会放行到 labeler.resolve_models，
+    后者静默回落到 labeler.MODELS 常量链——正是本函数要堵的那个洞。
+
+    旧 LLM_MODEL 分支只认**单值兜底**（值不在 labeler.MODELS 内）：labeler._env_models 的语义是
+    「LLM_MODEL 不在 MODELS 内才按单值兜底，否则 return list(MODELS)」，所以 LLM_MODEL 恰为
+    MODELS 成员时 labeler 会走硬编码常量链。门卫若照单全收，就会拿常量链放行、日志却标来源
+    'LLM_MODEL'——「探测的就是要跑的」虽仍成立（两边都是常量链），但日志读起来像「按 .env 的
+    LLM_MODEL 探测」，且与本文档声称的 fail-closed 不符（复审 F1）。这里明确取 fail-closed：
+    旧 LLM_MODEL 已被 LLM_MODELS 取代，其值落在常量链里说明用户并未在 .env 显式指定要探测什么，
+    此时静默放行常量链只会掩盖配置缺失。"""
+    legacy = (env.get('LLM_MODEL') or '').strip()
     if [m for m in (env.get('LLM_MODELS') or '').split(',') if m.strip()]:
         key = 'LLM_MODELS'
-    elif (env.get('LLM_MODEL') or '').strip():
+    elif legacy and legacy not in labeler.MODELS:
         key = 'LLM_MODEL'
     else:
         return [], 'none'
-    models, _ = labeler.resolve_models(env, use_db=False)
+    # use_db 与 labeler 默认一致：探测的就是 labeler 会跑的链（见 USE_DB_MODEL 说明）。
+    models, _ = labeler.resolve_models(env, use_db=USE_DB_MODEL)
     return (models, key) if models else ([], 'none')
 
 
@@ -101,6 +117,13 @@ def main() -> int:
               f'拒绝放行 labeler（fail-closed）。请在 .env 设置 LLM_MODELS=模型1,模型2,...',
               file=sys.stderr, flush=True)
         return EXIT_NO_MODELS
+    # 不变式（复审 F3）：被探测的链必须**就是**从 .env 解析出的链，而不是任何硬编码常量链。
+    # 少了这条断言，「把 probe 改回探测 labeler.MODELS」这类回归（原始 bug 形态）测试全绿；
+    # 探测链与运行链一旦漂移，门卫就会放行一个 labeler 跑不动的窗口（或反之永远等窗口）。
+    expected_models, _ = labeler.resolve_models(env, use_db=USE_DB_MODEL)
+    assert models == expected_models, (
+        f'探测链与 .env 解析链不一致（探测 {models!r} vs .env {expected_models!r}）；'
+        f'门卫必须探测 labeler 实际会跑的模型链')
     print(f'探测模型链来源: {src_key} -> {",".join(models)}', flush=True)
     consecutive_ok = 0
     round_no = 0
