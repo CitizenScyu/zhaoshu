@@ -257,6 +257,9 @@ describe('online reader source resolution and budgets', () => {
     const next = await service.readSourceChapter(part.sourceSession!, 1, context());
     expect(next.text).toBe('备用源第2章正文');
     expect(next.servedFrom).toBe(backup.name);
+    // 新会话的后续章节:servedFromUrl 取新目录自己的源 url(不再是故障原源)。
+    expect(part.servedFromUrl).toBe(backup.url);
+    expect(next.servedFromUrl).toBe(backup.url);
     expect(mocks.fetch.mock.calls.map(([input]) => String(input))).not.toContain(chapterUrl());
   });
 
@@ -2453,7 +2456,8 @@ describe('chapter failover M1.1 (41-M1.1)', () => {
     const pool = [alt(1)];
     const catalog = await prepareCurrent(pool);
     primeHit(1);
-    expect((await readChapter(catalog)).servedFrom).toBe(alt(1).name);
+    // 41-srcurl:源不在池的换源分支同样把 servedFromUrl 换成新源。
+    expect(await readChapter(catalog)).toMatchObject({ servedFrom: alt(1).name, servedFromUrl: alt(1).url });
     expect(oneFailoverLine('success', [current, ...pool])).toMatchObject({ trigger: 'SOURCE_CHANGED', attempted: 1 });
   });
 
