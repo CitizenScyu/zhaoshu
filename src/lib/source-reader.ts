@@ -113,7 +113,11 @@ export interface SourceSimilarCandidate {
 /** 父子共享的预算状态（设计 §3.1 的 shared）：计数、按 host 分桶的 350ms 节流槽、全局上限、软预算起点。 */
 interface SharedSourceBudget {
   requests: number;
-  /** 节流槽按站分桶：键 = sourceThrottleKey(url)，值 = 该站下一次允许发射的时刻。 */
+  /**
+   * 节流槽按站分桶：键 = sourceThrottleKey(url)，值 = 该站下一次允许发射的时刻。
+   * 默认每个根 context（= 一次 HTTP 请求）新建一张表，只约束本请求的 context 树；
+   * 单源 probe 传入进程级共享表（probeThrottleSlots），同实例内的并发 probe 互相排队。
+   */
   nextRequestAt: Map<string, number>;
   totalLimit: number;
   startedAt: number;
@@ -130,6 +134,19 @@ export function sourceThrottleKey(url: string, env: SourceTuningEnv = process.en
   const hostname = hostnameOf(url);
   const alternate = alternateSourceHost(hostname);
   return alternate && alternate < hostname ? alternate : hostname;
+}
+
+// 41-fanfix N1：扇出时浏览器同时发 N 个独立的 probe 请求，每个请求各自一棵 context 树，
+// 请求级节流表互不相见 ⇒ 同站 probe 会并发打到源站。probe 改用这张模块级表：同一 Node 进程
+// （同一 serverless 实例）内的所有 probe 按站共用 350ms 槽。边界：Vercel 多实例之间不共享，
+// 跨实例的同站并发仍不在此防线内；阅读/换源等非 probe 路径仍用请求级表，不与 probe 互相排队。
+const PROBE_THROTTLE_SLOTS = new Map<string, number>();
+// 表里只留「还没到期」的槽才有意义；超过这个条目数时顺手清掉已过期的，防长驻实例无界增长。
+const THROTTLE_SLOTS_SWEEP_SIZE = 256;
+
+/** probe 的节流表：SOURCE_THROTTLE_PER_HOST=0 回滚时连同进程级共享一起退回请求级单槽（改动前语义）。 */
+function probeThrottleSlots(env: SourceTuningEnv = process.env): Map<string, number> | undefined {
+  return env.SOURCE_THROTTLE_PER_HOST === '0' ? undefined : PROBE_THROTTLE_SLOTS;
 }
 
 /**
@@ -151,6 +168,8 @@ interface SourceContextOptions {
   slide?: SourceSliceSlide;
   /** 进展逐级上报的上游 context（正文 context → 候选 context 共用一片滑动切片）。 */
   parent?: SourceRequestContext;
+  /** 根 context 的节流表；缺省新建请求级表。单源 probe 传进程级共享表（见 PROBE_THROTTLE_SLOTS）。 */
+  throttleSlots?: Map<string, number>;
 }
 
 export class SourceRequestContext {
@@ -171,7 +190,9 @@ export class SourceRequestContext {
     this.limit = limit;
     // 根 context 的全局上限初值 = 构造 limit：不经 openPool 的调用路径（单独用 context(n)）行为逐点不变。
     // openPool 的调用点：resolveSourceBook（池里含引擎源时）、surveySourceBooks 开头、switchSourceChapter 开头，都只增不减。
-    this.budget = options.budget ?? { requests: 0, nextRequestAt: new Map(), totalLimit: limit, startedAt: Date.now() };
+    this.budget = options.budget ?? {
+      requests: 0, nextRequestAt: options.throttleSlots ?? new Map(), totalLimit: limit, startedAt: Date.now(),
+    };
     this.parent = options.parent;
     const sliceController = options.sliceController;
     if (sliceController) {
@@ -269,10 +290,15 @@ export class SourceRequestContext {
             // 同步预占时间槽：同站并发调用各自拿到互不重叠的发射时刻，起始间隔恒为 SOURCE_DELAY_MS。
             // 若像以前那样在 await 之后才写回 nextRequestAt，多个并发 page() 会读到同一个旧值、
             // 一起免等、一起发射，节流对源站失效。槽位在父子 context 间共享、按站分桶（41-fanout P1-C）：
-            // 异站互不等待。进程内分桶只约束本实例，跨实例/跨用户的同站并发不在此防线内。
+            // 异站互不等待。作用范围是**这张节流表**：默认单个 HTTP 请求的 context 树；单源 probe 为
+            // 同一进程内所有 probe 共享（41-fanfix N1）。跨实例的同站并发不在此防线内。
             const now = Date.now();
-            const at = Math.max(now, this.budget.nextRequestAt.get(throttleKey) ?? 0);
-            this.budget.nextRequestAt.set(throttleKey, at + SOURCE_DELAY_MS);
+            const slots = this.budget.nextRequestAt;
+            const at = Math.max(now, slots.get(throttleKey) ?? 0);
+            slots.set(throttleKey, at + SOURCE_DELAY_MS);
+            if (slots.size > THROTTLE_SLOTS_SWEEP_SIZE) {
+              for (const [key, next] of slots) if (next <= now) slots.delete(key);
+            }
             if (at > now) await pause(at - now, signal);
           },
         });
@@ -1048,7 +1074,7 @@ function probeCompileFailure(source: ReadingSource, title: string): Pick<SourceP
 /**
  * 通用单源 probe:给定一个源和一本书(书名 + 可空作者),在 budgetMs 内判定该源有没有这本书。
  * 只读:不写目录缓存、不改健康记忆以外的任何状态(健康记忆照常由 fetch 层记录)。请求数上限沿用单次阅读的
- * 默认 L2(MAX_SOURCE_REQUESTS),节流槽按 host 分桶(本 context 独占,跨请求/跨实例不共享)。
+ * 默认 L2(MAX_SOURCE_REQUESTS),节流槽按 host 分桶且同一进程内所有 probe 共享(41-fanfix N1;跨实例不共享)。
  * signal 是调用方的取消信号(客户端断开);到点与取消都返回 timeout,不抛。非预期异常才抛。
  */
 export async function probeSourceForBook(
@@ -1062,7 +1088,9 @@ export async function probeSourceForBook(
     options.budgetMs ?? SOURCE_PROBE_BUDGET_MS,
   );
   (timer as { unref?: () => void }).unref?.();
-  const context = new SourceRequestContext(AbortSignal.any([signal, budgetController.signal]));
+  const context = new SourceRequestContext(AbortSignal.any([signal, budgetController.signal]), MAX_SOURCE_REQUESTS, {
+    throttleSlots: probeThrottleSlots(),
+  });
   const base = { sourceUrl: source.url, sourceName: source.name };
   const finish = (result: Omit<SourceProbeResult, 'sourceUrl' | 'sourceName' | 'elapsedMs' | 'requests'>): SourceProbeResult => (
     { ...base, ...result, elapsedMs: Date.now() - startedAt, requests: context.requests }

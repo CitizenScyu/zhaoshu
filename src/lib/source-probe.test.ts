@@ -56,6 +56,8 @@ const headerDelay = new Map<string, number>();
 /** 有响应头、正文卡住(直到请求被中止)的 URL。 */
 const stallBody = new Set<string>();
 let requested: string[];
+/** 每次上游请求的发出时刻(虚拟时钟),节流用例用。 */
+let stamps: { url: string; at: number }[];
 
 /** 假时钟下推进到定时器排空再交出结果。 */
 const drive = async <T>(work: Promise<T>): Promise<T> => {
@@ -72,6 +74,7 @@ beforeEach(async () => {
   vi.resetModules();
   vi.clearAllMocks();
   requested = [];
+  stamps = [];
   pages.clear();
   headerDelay.clear();
   stallBody.clear();
@@ -84,6 +87,7 @@ beforeEach(async () => {
   mocks.fetch.mockImplementation(async (input, init) => {
     const url = String(input);
     requested.push(url);
+    stamps.push({ url, at: Date.now() });
     const signal = init?.signal ?? undefined;
     const wait = headerDelay.get(url);
     if (wait !== undefined) {
@@ -223,6 +227,50 @@ describe('probeSourceForBook:超时与编译失败', () => {
     const dynamic = { ...E1, searchUrl: 'https://e1.test/s?q={{key}}&t={{java.time()}}' };
     expect(await probe(dynamic)).toMatchObject({ status: 'compile_failed', code: 'SEARCH_URL_UNSUPPORTED' });
     expect(requested).toEqual([]);
+  });
+});
+
+describe('probeSourceForBook:进程级同站节流(41-fanfix N1)', () => {
+  // 浏览器扇出 = N 个独立 HTTP 请求各自一棵 context 树。节流表若是请求级的,同站 probe 会同一时刻打到源站。
+  const E1b = { ...E1, url: 'https://e1.test/alt/', name: '引擎源1(同站另一行)' };
+  const E2 = { ...E1, url: 'https://e2.test/', name: '引擎源2', searchUrl: 'https://e2.test/s?q={{key}}' };
+  const firstStamp = (host: string, skip = 0) => stamps.filter((item) => new URL(item.url).hostname === host)[skip].at;
+
+  it('两个并发 probe 打同一站 ⇒ 第二个的首个请求排到 350ms 槽之后;异站 probe 不排队', async () => {
+    (await import('./source-policy')).refreshSupportedHosts(['e1.test', 'e2.test']);
+    pages.set(e1.search(), { text: '<div>没有结果</div>' });
+    pages.set('https://e2.test/s?q=' + q(book.title), { text: '<div>没有结果</div>' });
+    const t0 = Date.now();
+    const results = await drive(Promise.all([
+      service.probeSourceForBook(E1, book, new AbortController().signal),
+      service.probeSourceForBook(E1b, book, new AbortController().signal),
+      service.probeSourceForBook(E2, book, new AbortController().signal),
+    ]));
+    expect(results.map((item) => item.status)).toEqual(['no_candidates', 'no_candidates', 'no_candidates']);
+    expect(firstStamp('e1.test') - t0).toBe(0);
+    expect(firstStamp('e1.test', 1) - firstStamp('e1.test')).toBeGreaterThanOrEqual(350);
+    expect(firstStamp('e2.test') - t0).toBe(0);
+  });
+
+  it('阅读路径(非 probe)的独立 context 仍是请求级节流表,关开关时行为不变', async () => {
+    pages.set(e1.search(), { text: '' });
+    const t0 = Date.now();
+    await drive(Promise.all([
+      new service.SourceRequestContext(new AbortController().signal).page(e1.search()),
+      new service.SourceRequestContext(new AbortController().signal).page(e1.search()),
+    ]));
+    expect(stamps.map((item) => item.at - t0)).toEqual([0, 0]);
+  });
+
+  it('SOURCE_THROTTLE_PER_HOST=0 ⇒ probe 也退回请求级单槽(不跨请求共享)', async () => {
+    vi.stubEnv('SOURCE_THROTTLE_PER_HOST', '0');
+    pages.set(e1.search(), { text: '<div>没有结果</div>' });
+    const t0 = Date.now();
+    await drive(Promise.all([
+      service.probeSourceForBook(E1, book, new AbortController().signal),
+      service.probeSourceForBook(E1b, book, new AbortController().signal),
+    ]));
+    expect(stamps.map((item) => item.at - t0)).toEqual([0, 0]);
   });
 });
 
