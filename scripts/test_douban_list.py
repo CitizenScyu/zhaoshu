@@ -800,14 +800,14 @@ class TestSearchEngine(unittest.TestCase):
         hit = douban_list.search_engine(cli, '斗破苍穹', '天蚕土豆')
         self.assertEqual(hit, {'url': 'https://www.yingsx.com/book/1',
                                'title': '斗破苍穹', 'source': 'www.yingsx.com'})
-        # author 非空时随 --author 传入
+        # author 非空时随 --author 传入；恒带 --no-builtin（espfix41：book15 已由 search_book15 负责）
         self.assertEqual(cli.calls[0],
-                         ('search', ['--title', '斗破苍穹', '--author', '天蚕土豆']))
+                         ('search', ['--title', '斗破苍穹', '--author', '天蚕土豆', '--no-builtin']))
 
     def test_author_omitted_when_empty(self):
         cli = FakeEngineCli({'search': _proc(1)})
         douban_list.search_engine(cli, '斗破苍穹')
-        self.assertEqual(cli.calls[0], ('search', ['--title', '斗破苍穹']))
+        self.assertEqual(cli.calls[0], ('search', ['--title', '斗破苍穹', '--no-builtin']))
 
     def test_book15_source_candidate_is_skipped(self):
         # book15 路径已搜过（这是兜底），候选里的 book15.net 条目跳过
@@ -990,6 +990,105 @@ class TestResolveCandidatesEngineFallback(unittest.TestCase):
             skip_titles={'剑来'}, engine_cli=cli)
         self.assertEqual(queue, [])
         self.assertEqual(cli.calls, [])          # 已打标：连 book15 带引擎都不搜
+
+
+JUNK_HOST = '4702.zejfxszmh.cc'
+
+
+def _junk_candidates():
+    """垃圾源对任何书名都回的同一批无关条目（按 lbldeploy41 §5 观察的形态合成，非真实内容）。"""
+    return [{'source': JUNK_HOST, 'title': f'无关条目{i}', 'author': '某某',
+             'bookUrl': f'https://{JUNK_HOST}/book/{i}'} for i in range(3)]
+
+
+def _pool_cli(real_hits: dict):
+    """按书名返回：垃圾源恒回同一批 + 正常源只在 real_hits 里有该书时回命中。记录每次调用参数。"""
+    def results(sub, args):
+        title = args[args.index('--title') + 1]
+        skip = {args[i + 1] for i, a in enumerate(args) if a == '--skip-host'}
+        out = [] if JUNK_HOST in skip else _junk_candidates()
+        if title in real_hits:
+            out.append({'source': 'www.yingsx.com', 'title': title, 'author': '',
+                        'bookUrl': real_hits[title]})
+        return _proc(0, _engine_search_stdout(out)) if out else _proc(1)
+    return FakeEngineCli(results)
+
+
+class TestEngineJunkSource(unittest.TestCase):
+    """espfix41：查询不敏感的垃圾源——本轮识别后经 --skip-host 跳过，不再每本白请求。"""
+
+    def setUp(self):
+        no_wait(self)
+
+    def test_junk_host_skipped_after_streak_and_real_hits_unaffected(self):
+        titles = ['甲书', '乙书', '丙书', '丁书', '戊书']
+        cli = _pool_cli({'丁书': 'https://www.yingsx.com/book/4'})
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            queue = douban_list._resolve_candidates(
+                [{'title': t} for t in titles], lambda url: NO_RESULT_HTML, engine_cli=cli)
+        skip_flags = [JUNK_HOST in c[1] for c in cli.calls]
+        # 前 3 本（JUNK_STREAK）仍搜它，第 3 本后判垃圾，第 4、5 本带 --skip-host
+        self.assertEqual(skip_flags, [False, False, False, True, True])
+        self.assertIn('垃圾源剔除', out.getvalue())
+        # 正常源命中不受影响
+        self.assertEqual([b['url'] for b in queue], ['https://www.yingsx.com/book/4'])
+
+    def test_counterexample_before_fix_junk_requested_every_book(self):
+        # 反例（改前行为）：不带识别器时每本都搜垃圾源（CLI 调用参数里从不出现 --skip-host）
+        cli = _pool_cli({})
+        for t in ['甲书', '乙书', '丙书', '丁书', '戊书']:
+            douban_list.search_engine(cli, t)
+        self.assertFalse(any('--skip-host' in c[1] for c in cli.calls))
+
+    def test_source_with_relevant_result_is_never_flagged(self):
+        # 正常源：结果集随书名变化，或其中有书名兼容条目 → 不判垃圾
+        junk = douban_list.EngineJunkTracker()
+        for t in ['甲书', '乙书', '丙书', '丁书']:
+            junk.observe(t, [{'source': 'good.example', 'title': t,
+                              'bookUrl': 'https://good.example/hot'}])
+        self.assertEqual(junk.hosts, set())
+
+    def test_changing_result_sets_reset_streak(self):
+        junk = douban_list.EngineJunkTracker()
+        junk.observe('甲书', _junk_candidates())
+        junk.observe('乙书', _junk_candidates())
+        junk.observe('丙书', [{'source': JUNK_HOST, 'title': '别的', 'bookUrl': 'https://x/9'}])
+        self.assertEqual(junk.hosts, set())           # 集合变了：连击重置
+        junk.observe('丁书', [{'source': JUNK_HOST, 'title': '别的', 'bookUrl': 'https://x/9'}])
+        junk.observe('戊书', [{'source': JUNK_HOST, 'title': '别的', 'bookUrl': 'https://x/9'}])
+        self.assertEqual(junk.hosts, {JUNK_HOST})
+
+    def test_same_title_repeated_does_not_count(self):
+        junk = douban_list.EngineJunkTracker()
+        for _ in range(5):
+            junk.observe('甲书', _junk_candidates())
+        self.assertEqual(junk.hosts, set())            # 必须是不同书名
+
+    def test_book15_candidates_are_ignored(self):
+        junk = douban_list.EngineJunkTracker()
+        for t in ['甲书', '乙书', '丙书']:
+            junk.observe(t, [{'source': 'book15.net', 'title': 'x', 'bookUrl': 'https://book15.net/1'}])
+        self.assertEqual(junk.hosts, set())
+
+
+class TestBreakerOpenSkipsSearchDelay(unittest.TestCase):
+    """espfix41：book15 熔断后本本不请求 book15，不再睡 SEARCH_DELAY；未熔断时照睡。"""
+
+    def _sleeps(self, breaker):
+        cli = FakeEngineCli({'search': _proc(1)})
+        with mock.patch.object(douban_list, 'SEARCH_DELAY', 1.5),                 mock.patch.object(douban_list.time, 'sleep') as sleep:
+            douban_list._resolve_candidates(
+                [{'title': '甲书'}, {'title': '乙书'}], lambda url: NO_RESULT_HTML,
+                engine_cli=cli, book15_breaker=breaker)
+        return [c.args[0] for c in sleep.call_args_list]
+
+    def test_open_breaker_no_search_delay(self):
+        breaker = douban_list.Book15Breaker(threshold=1)
+        breaker.open = True
+        self.assertEqual(self._sleeps(breaker), [])
+
+    def test_closed_breaker_still_sleeps(self):
+        self.assertEqual(self._sleeps(douban_list.Book15Breaker(threshold=5)), [1.5, 1.5])
 
 
 class TestEngineHttpOnlySkip(unittest.TestCase):

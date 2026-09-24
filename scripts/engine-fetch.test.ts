@@ -126,6 +126,25 @@ describe('engine-fetch CLI 契约', () => {
     expect(r.stderr).toContain('--title');
   }, 60_000);
 
+  it('espfix41：search 接受 --no-builtin / 可重复 --skip-host（解析通过，落到缺 --title）', () => {
+    const r = run(['search', '--no-builtin', '--skip-host', 'a.example', '--skip-host', 'b.example'], { DATABASE_URL: 'postgres://u:p@h/db' });
+    expect(r.status).toBe(2);
+    expect(r.stderr).toContain('--title');
+    expect(r.stderr).not.toContain('未知参数');
+  }, 60_000);
+
+  it('espfix41：--skip-host 缺值、或用在 search 以外 → 退出码 2（DB 之前）', () => {
+    const missing = run(['search', '--title', 'X', '--skip-host'], { DATABASE_URL: 'postgres://u:p@h/db' });
+    expect(missing.status).toBe(2);
+    expect(missing.stderr).toContain('缺少参数值：--skip-host');
+    for (const args of [['toc', '--url', 'https://a.example/1', '--no-builtin'], ['content', '--url', 'https://a.example/1', '--skip-host', 'a.example']]) {
+      const r = run(args, { DATABASE_URL: 'postgres://u:p@h/db' });
+      expect(r.status).toBe(2);
+      expect(r.stderr).toContain('仅用于 search');
+      expect(r.stdout).toBe('');
+    }
+  }, 60_000);
+
   it('toc 缺 --url → 退出码 2', () => {
     const r = run(['toc'], { DATABASE_URL: 'postgres://u:p@h/db' });
     expect(r.status).toBe(2);

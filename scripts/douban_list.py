@@ -466,8 +466,48 @@ def engine_url_supported(url: str) -> bool:
             and port in (None, 443) and '@' not in parts.netloc)
 
 
+# ---- 查询不敏感的垃圾源（espfix41）----
+# 4702.zejfxszmh.cc 这类源对任何书名都回同一批无关条目：书名校验会挡掉，但每本都白请求+解析一次。
+# 单轮内识别：同一 host 对 JUNK_STREAK 个不同书名返回**完全相同**的非空候选 URL 集，且其间没有
+# 任何一条书名兼容 → 判垃圾，本轮后续搜索经 CLI --skip-host 跳过。只影响本轮（下一轮重新观察）；
+# 持久剔除走准入复核的查询不敏感判据（rule-engine/admission.ts）。
+JUNK_STREAK = 3
+
+
+class EngineJunkTracker:
+    """单轮内的查询不敏感源识别器（不跨轮）。hosts = 已判垃圾、本轮跳过的 host。"""
+
+    def __init__(self, streak: int = JUNK_STREAK):
+        self.streak = streak
+        self.hosts: set[str] = set()
+        self._seen: dict[str, tuple[frozenset, set]] = {}   # host → (URL 集, 已见书名键)
+
+    def observe(self, title: str, candidates: list) -> None:
+        key = _norm_title(title)
+        by_host: dict[str, list[dict]] = {}
+        for c in candidates:
+            if isinstance(c, dict) and c.get('source'):
+                by_host.setdefault(c['source'], []).append(c)
+        for host, items in by_host.items():
+            if host in self.hosts or host == 'book15.net':
+                continue
+            urls = frozenset(c.get('bookUrl') or '' for c in items) - {''}
+            if not urls or any(title_compatible(title, c.get('title') or '') for c in items):
+                self._seen.pop(host, None)      # 有相关结果：是正常源，清零
+                continue
+            prev = self._seen.get(host)
+            titles = prev[1] | {key} if prev and prev[0] == urls else {key}
+            self._seen[host] = (urls, titles)
+            if len(titles) >= self.streak:
+                self.hosts.add(host)
+                self._seen.pop(host, None)
+                print(f'  垃圾源剔除（本轮）: {host} 对 {len(titles)} 个不同书名返回同一批'
+                      f' {len(urls)} 条无关结果，后续搜索跳过', flush=True)
+
+
 def search_engine(cli, title: str, author: str = '',
-                  stats: dict | None = None) -> dict | None:
+                  stats: dict | None = None,
+                  junk: EngineJunkTracker | None = None) -> dict | None:
     """book15 miss 后的引擎兜底搜索：调 CLI `search --title …`，title + 作者双校验。
 
     N02 修复：author 不再只传不用——候选作者非空且归一化后与名单作者不等 → 必拒
@@ -476,10 +516,17 @@ def search_engine(cli, title: str, author: str = '',
     返回命中 {'url': bookUrl（绝对）, 'title': site_title, 'source': host} 或 None（miss）。
     退出码：0=有候选（逐条校验，跳过 book15.net 源）；1=正常 miss；
     2/未知非零/无法调用 → 抛 EngineUnavailable（调用方本轮降级 book15-only、不重试）。
-    stats（可选计数字典）：title 兼容但 URL 引擎取不了（非 HTTPS 等）的候选计入 stats['http_only']。"""
+    stats（可选计数字典）：title 兼容但 URL 引擎取不了（非 HTTPS 等）的候选计入 stats['http_only']。
+    espfix41：恒带 --no-builtin（book15 已由 search_book15 搜过或已熔断，其候选这里本来就跳过，
+    CLI 里再搜一遍是纯浪费——book15 宕机时单这一步就 2×8s）；junk（可选）已判垃圾的 host 经
+    --skip-host 跳过，本次候选再喂给 junk.observe 继续识别。"""
     args = ['--title', title]
     if author:
         args += ['--author', author]
+    args.append('--no-builtin')
+    if junk is not None:
+        for host in sorted(junk.hosts):
+            args += ['--skip-host', host]
     try:
         proc = cli.run('search', *args)
     except subprocess.TimeoutExpired:
@@ -500,6 +547,8 @@ def search_engine(cli, title: str, author: str = '',
         return None
     if not isinstance(candidates, list):
         return None
+    if junk is not None:
+        junk.observe(title, candidates)
     # ---- N02 两遍选择（只在引擎路径生效，CLI 调用形态不变）----
     # 第一遍：title 兼容 + author 已验证匹配（名单 author 已知且 _norm_author 相等）。
     # 第二遍：名单 author 已知但无已验证匹配 → 退「title 兼容 + 候选 author 空」（降级收）。
@@ -595,12 +644,16 @@ def _resolve_candidates(candidates: list[dict], http_get, origin: str = '',
     book15_hits = 0
     engine_hits = 0
     engine_stats: dict = {}
+    engine_junk = EngineJunkTracker() if engine_cli is not None else None
     engine_disabled = False
     for b in candidates:
         key = _norm_title(b.get('title', ''))
         if skip_titles and key and key in skip_titles:
             skipped += 1
             continue
+        # espfix41：book15 已熔断 ⇒ 本本不会请求 book15，SEARCH_DELAY（对 book15 的礼貌间隔）不再睡；
+        # 引擎 CLI 内部自带按请求节流，且每本新起进程本身就隔开了对同站的两次搜索。
+        book15_skipped = book15_breaker is not None and book15_breaker.open
         hit = search_book15(http_get, b['title'], breaker=book15_breaker)
         if hit:
             queue.append({'url': hit['url'], 'title': hit['title'],
@@ -616,7 +669,7 @@ def _resolve_candidates(candidates: list[dict], http_get, origin: str = '',
         if engine_cli is not None and not engine_disabled:
             try:
                 engine_hit = search_engine(engine_cli, b['title'], b.get('author', ''),
-                                           stats=engine_stats)
+                                           stats=engine_stats, junk=engine_junk)
             except EngineUnavailable as e:
                 # 环境错误：本轮降级 book15-only，后续候选不再尝试引擎（不连坐重试）
                 print(f'  引擎兜底不可用，本轮降级 book15-only（不重试）: {e}',
@@ -633,7 +686,8 @@ def _resolve_candidates(candidates: list[dict], http_get, origin: str = '',
             engine_hits += 1
         else:
             miss.append(b['title'])
-        time.sleep(SEARCH_DELAY)
+        if not book15_skipped:
+            time.sleep(SEARCH_DELAY)
     # 开关关闭时 engine_hits=0 且 book15_hits==len(queue)，本行逐字复现旧文案（红线）。
     engine_note = f'，引擎兜底命中 {engine_hits} 本' if engine_cli is not None else ''
     if engine_stats.get('http_only'):

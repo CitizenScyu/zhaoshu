@@ -3,7 +3,7 @@
 // 直接取书，不走 serverless、无 55s 限制。每次进程冷启，不做跨进程状态。
 //
 // 用法（labeler 逐级调用；`@/` 别名靠 ts-esm-loader.mjs，故必须带 --import）：
-//   node --import ./scripts/ts-esm-loader.mjs scripts/engine-fetch.mjs search  --title "斗破苍穹" [--author "天蚕土豆"] [--json]
+//   node --import ./scripts/ts-esm-loader.mjs scripts/engine-fetch.mjs search  --title "斗破苍穹" [--author "天蚕土豆"] [--no-builtin] [--skip-host <host>]… [--json]
 //   node --import ./scripts/ts-esm-loader.mjs scripts/engine-fetch.mjs toc     --url <bookUrl>    [--json]
 //   node --import ./scripts/ts-esm-loader.mjs scripts/engine-fetch.mjs content --url <chapterUrl> [--json]
 //   node --import ./scripts/ts-esm-loader.mjs scripts/engine-fetch.mjs doctor --json
@@ -15,6 +15,7 @@
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { exitAfterFlush } from './stdio-exit.mjs';
+import { searchSources, SEARCH_SOURCE_SLICE_MS } from './engine-search-pool.mjs';
 
 // CLI 层宽上限（无 serverless 限制，但仍有界防挂死）。
 const SEARCH_TIMEOUT_MS = 30_000;
@@ -27,7 +28,7 @@ class ExitError extends Error {
 }
 
 function parseArgs(argv) {
-  const args = { _: [], json: false, env: null, title: null, author: null, url: null };
+  const args = { _: [], json: false, env: null, title: null, author: null, url: null, noBuiltin: false, skipHosts: [] };
   for (let i = 0; i < argv.length; i += 1) {
     const a = argv[i];
     if (['--source', '--out', '--max-chapters', '--rate-ms', '--timeout-ms', '--budget-ms'].includes(a)) {
@@ -39,6 +40,13 @@ function parseArgs(argv) {
     else if (a === '--title') args.title = argv[++i] ?? null;
     else if (a === '--author') args.author = argv[++i] ?? null;
     else if (a === '--url') args.url = argv[++i] ?? null;
+    // espfix41：labeler 已自行搜过 book15（或已熔断），--no-builtin 免掉 CLI 里重复的一次；
+    // --skip-host（可重复）跳过本轮已判「查询不敏感」的垃圾源。二者只用于 search。
+    else if (a === '--no-builtin') args.noBuiltin = true;
+    else if (a === '--skip-host') {
+      if (!argv[i + 1] || argv[i + 1].startsWith('--')) throw new ExitError(2, `缺少参数值：${a}`);
+      args.skipHosts.push(argv[++i]);
+    }
     else if (a.startsWith('--')) throw new ExitError(2, `未知参数：${a}`);
     else args._.push(a);
   }
@@ -136,33 +144,39 @@ async function cmdSearch(m, args) {
     // search 的价值就是全池；DB 不可达 ⇒ 退 2，labeler 回退自有 book15 路径。
     throw new ExitError(2, `引擎源池不可用：${safeReason(error)}`);
   }
-  const sources = [builtinSource(m), ...enginePool];
+  const skip = new Set(args.skipHosts);
+  const sources = [...(args.noBuiltin ? [] : [builtinSource(m)]), ...enginePool]
+    .filter((source) => !skip.has(hostOf(source.url)));
   const context = new m.reader.SourceRequestContext(signal, 12);
   context.openPool(POOL_SIZE);
-  const candidates = [];
-  for (const source of sources) {
-    try {
+  // espfix41：改前逐源串行（墙钟=各源之和）；改后按目标站分组、组内串行、组间有界并发，
+  // 每源一个切片子 context（卡死的源 SEARCH_SOURCE_SLICE_MS 放弃）。候选仍按池序输出。
+  const candidates = await searchSources({
+    sources,
+    signal,
+    hostKey: (source) => searchHostOf(m, source, args.title),
+    searchOne: async (source) => {
+      const scoped = context.child(hostOf(source.url), { sliceMs: SEARCH_SOURCE_SLICE_MS });
       if (isBuiltin(source)) {
         const searchUrl = m.parser.sourceSearchUrl(source.searchUrl, args.title, source.url);
-        const page = await context.page(searchUrl);
+        const page = await scoped.page(searchUrl);
         // book15 详情页即目录页；parseSourceSearch 按锚文本=书名精确匹配（身份校验留给 labeler）。
-        for (const bookUrl of m.parser.parseSourceSearch(page.text, page.url, args.title)) {
-          candidates.push({ source: hostOf(source.url), sourceName: source.name, title: args.title, author: '', bookUrl, tocUrl: bookUrl });
-        }
-      } else {
-        const engineSource = engineSourceOf(m, source);
-        const results = await m.api.engineSearchBook(engineSource, args.title, context);
-        for (const r of results) {
-          candidates.push({ source: hostOf(source.url), sourceName: source.name, title: r.title, author: r.author, bookUrl: r.bookUrl });
-        }
+        return m.parser.parseSourceSearch(page.text, page.url, args.title)
+          .map((bookUrl) => ({ source: hostOf(source.url), sourceName: source.name, title: args.title, author: '', bookUrl, tocUrl: bookUrl }));
       }
-    } catch (error) {
-      if (signal.aborted) break; // 整体超时：停止，交付已收集的
-      process.stderr.write(`[warn] 源 ${hostOf(source.url)} 搜索失败：${safeReason(error)}\n`);
-    }
-  }
+      const results = await m.api.engineSearchBook(engineSourceOf(m, source), args.title, scoped);
+      return results.map((r) => ({ source: hostOf(source.url), sourceName: source.name, title: r.title, author: r.author, bookUrl: r.bookUrl }));
+    },
+    onError: (source, error) => process.stderr.write(`[warn] 源 ${hostOf(source.url)} 搜索失败：${safeReason(error)}\n`),
+  });
   if (!candidates.length) throw new ExitError(1, `无候选：${args.title}`);
   emit(args, candidates, () => candidates.map((c) => `[${c.source}] ${c.title}${c.author ? ' / ' + c.author : ''} -> ${c.bookUrl}`).join('\n'));
+}
+
+// 搜索请求实际打向的站（分组键）：searchUrl 展开后的 host；展开失败退回源声明 host。
+function searchHostOf(m, source, title) {
+  try { return hostOf(m.parser.sourceSearchUrl(source.searchUrl, title, source.url)) || hostOf(source.url); }
+  catch { return hostOf(source.url); }
 }
 
 async function resolveSourceForUrl(m, url, signal) {
@@ -270,6 +284,9 @@ async function main() {
   const handler = COMMANDS[command];
   if (!handler) throw new ExitError(2, `未知子命令：${command ?? '(空)'}；支持 doctor|search|toc|content|download`);
 
+  if (command !== 'search' && (args.noBuiltin || args.skipHosts.length)) {
+    throw new ExitError(2, '--no-builtin/--skip-host 仅用于 search');
+  }
   if (command !== 'download') {
     for (const key of ['source', 'out', 'max-chapters', 'rate-ms', 'timeout-ms', 'budget-ms']) {
       if (args[key] !== undefined) throw new ExitError(2, `--${key} 仅用于 download`);

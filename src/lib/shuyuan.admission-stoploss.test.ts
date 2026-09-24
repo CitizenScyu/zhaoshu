@@ -100,11 +100,13 @@ describe('41-ADMIT-CONC-FIX:refreshShuyuan 准入逐探止损(端到端,c 缺省
     const written = insert ? (JSON.parse(insert[0].values[0] as string) as { search_verdict: string }[]) : [];
     const batchLog = log.mock.calls.find(([message]) => message === 'shuyuan admission batch');
     // 基点 3059eb5 实测:resolved、搜索 15 次(末次 t=165s)、20 行(15 conn_fail + 5 占位)、有 batch 日志。
+    // espfix41:开对照搜索后止损按单探最坏 ADMISSION_PROBE_WORST_MS(16.35s)预留,剩 >21.35s 才起探 ⇒
+    // 14 次(末次 t=157s,结束 165s 时仍剩 15s ≥ 写库预留)、14 conn_fail + 6 占位。
     expect(outcome).toBe('resolved');
-    expect(searchStartsAt).toHaveLength(15);
-    expect(searchStartsAt.at(-1)).toBe(165);
+    expect(searchStartsAt).toHaveLength(14);
+    expect(searchStartsAt.at(-1)).toBe(157);
     expect(written).toHaveLength(20);
-    expect(written.filter((row) => row.search_verdict === 'conn_fail')).toHaveLength(15);
-    expect(batchLog?.[1]).toMatchObject({ candidates: 20, probed: 15 });
+    expect(written.filter((row) => row.search_verdict === 'conn_fail')).toHaveLength(14);
+    expect(batchLog?.[1]).toMatchObject({ candidates: 20, probed: 14 });
   });
 });

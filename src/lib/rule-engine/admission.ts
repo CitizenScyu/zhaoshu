@@ -113,6 +113,24 @@ export const ADMISSION_RECHECK_FAIL_PREFIX = 'recheck_fail:';
 /** 剩余预算低于此值即整批跳过，绝不挤占刷新预算（设计风险台账 #4）。 */
 export const ADMISSION_MIN_BUDGET_MS = 10_000;
 
+// ---------------------------------------------------------------- 查询不敏感判据（espfix41）
+// 反例：4702.zejfxszmh.cc 对任何书名都回同一批无关条目。准入只看「checkKeyWord 搜出 ≥1 候选」就判 ok，
+// 它因此进了 engineHosts 池，打标线每本书都白请求+解析它一次（书名校验挡掉，但时间照花）。
+// 判据：主关键词搜出候选后，再用一个与主关键词**无公共字**的对照书名搜一次；两次候选 URL 集的
+// Jaccard ≥ QUERY_INSENSITIVE_OVERLAP ⇒ 搜索结果不随查询变化 ⇒ verdict=query_insensitive（出池）。
+// 正常站：对照书名要么 0 候选、要么是另一批书（含「无结果时展示热门榜」的站——主关键词本身命中，
+// 两批不同），重合度远低于阈值。对照词取与主关键词无公共字者，免得「修仙」vs「凡人修仙传」这类
+// 真实相关结果被误判。
+/** 对照书名候选（按序取第一个与主关键词无公共字的）。 */
+export const QUERY_CONTROL_KEYWORDS = ['凡人修仙传', '诡秘之主', '庆余年', '斗破苍穹'] as const;
+/** 两次搜索候选 URL 集 Jaccard 达到此值即判查询不敏感。 */
+export const QUERY_INSENSITIVE_OVERLAP = 0.8;
+/**
+ * 开启对照搜索后单个探测的最坏墙钟：主搜索 + 节流 + 对照搜索。调用方的逐探预算止损（canProbe）
+ * 必须按这个值预留，否则最后一个探测会越过刷新预算。
+ */
+export const ADMISSION_PROBE_WORST_MS = 2 * ADMISSION_TIMEOUT_MS + ADMISSION_THROTTLE_MS;
+
 // CHALLENGE_MARKERS 口径对齐 probe-reachability.py:33。cloudflare 字样过宽（正常经 CF CDN
 // 的页面 meta 也可能有），单列 weak；强标记要求 status 403/503 或命中弱集合外的 marker。
 const CHALLENGE_MARKERS = [
@@ -235,7 +253,8 @@ export function isGrandfatheredAdmitted(
 
 // ---------------------------------------------------------------- 滤网 2（searchAdmission）
 export type AdmissionVerdict =
-  | 'ok' | 'challenge' | 'conn_fail' | 'http_5xx' | 'http_4xx' | 'shell' | 'url_invalid' | 'no_result';
+  | 'ok' | 'challenge' | 'conn_fail' | 'http_5xx' | 'http_4xx' | 'shell' | 'url_invalid' | 'no_result'
+  | 'query_insensitive';
 
 /** 判定分桶（设计 §4.1 v3 E2）：ok / rejected（站点行为终态）/ deferred（可复测）。 */
 export function admissionBucket(verdict: string): 'ok' | 'rejected' | 'deferred' {
@@ -245,7 +264,7 @@ export function admissionBucket(verdict: string): 'ok' | 'rejected' | 'deferred'
     case 'conn_fail':
     case 'shell':
       return 'rejected';
-    default: // http_5xx / http_4xx / url_invalid / no_result（含空 verdict=未测）
+    default: // http_5xx / http_4xx / url_invalid / no_result / query_insensitive（含空 verdict=未测）
       return 'deferred';
   }
 }
@@ -379,18 +398,30 @@ function errorMessage(error: unknown): string {
   return (error instanceof Error ? error.message : String(error)).slice(0, 200);
 }
 
-/** 用源模板展开一次搜索 URL（复用 sourceSearchUrl 的纯 GET 口径，但走准入门校验）。 */
-function expandAdmissionSearchUrl(source: RawSource, declaredHosts: ReadonlySet<string>): string {
+/** 准入主关键词：legado 标准位置是嵌套 ruleSearch.checkKeyWord（DB 995 源顶层无此字段）；
+ * 顶层 source.checkKeyWord 仅作非标准源兼容，都无才落兜底词。 */
+function admissionKeyword(source: RawSource): string {
+  const nestedKeyword = (source.ruleSearch as Record<string, unknown> | undefined)?.checkKeyWord;
+  return (typeof nestedKeyword === 'string' && nestedKeyword.trim() ? nestedKeyword
+    : typeof source.checkKeyWord === 'string' && source.checkKeyWord.trim() ? source.checkKeyWord
+      : DEFAULT_ADMISSION_KEYWORD).trim();
+}
+
+/** 对照书名：与主关键词无公共字的第一个；都有公共字则 undefined（不做对照判定）。 */
+export function queryControlKeyword(keyword: string): string | undefined {
+  const used = new Set(keyword.replace(/\s/g, ''));
+  return QUERY_CONTROL_KEYWORDS.find((candidate) => ![...candidate].some((ch) => used.has(ch)));
+}
+
+/** 用源模板展开一次搜索 URL（复用 sourceSearchUrl 的纯 GET 口径，但走准入门校验）。
+ * keyword 缺省取 admissionKeyword（主关键词）；对照搜索传对照书名。 */
+function expandAdmissionSearchUrl(
+  source: RawSource, declaredHosts: ReadonlySet<string>, keyword = admissionKeyword(source),
+): string {
   const template = source.searchUrl;
   if (typeof template !== 'string' || template.length > 2048 || !/\{\{key\}\}/.test(template)) {
     throw new SourcePolicyError('书源缺少支持的搜索模板');
   }
-  // legado 标准位置是嵌套 ruleSearch.checkKeyWord（DB 995 源顶层无此字段）；
-  // 顶层 source.checkKeyWord 仅作非标准源兼容，都无才落兜底词。
-  const nestedKeyword = (source.ruleSearch as Record<string, unknown> | undefined)?.checkKeyWord;
-  const keyword = (typeof nestedKeyword === 'string' && nestedKeyword.trim() ? nestedKeyword
-    : typeof source.checkKeyWord === 'string' && source.checkKeyWord.trim() ? source.checkKeyWord
-      : DEFAULT_ADMISSION_KEYWORD).trim();
   const expanded = template.replace(/\{\{key\}\}/g, encodeURIComponent(keyword)).replace(/\{\{page\}\}/g, '1');
   if (/[{}]|@js:|<js>|,\s*\[/i.test(expanded)) throw new SourcePolicyError('不支持该书源的动态搜索规则');
   const base = typeof source.bookSourceUrl === 'string' ? source.bookSourceUrl : undefined;
@@ -399,37 +430,37 @@ function expandAdmissionSearchUrl(source: RawSource, declaredHosts: ReadonlySet<
 
 const MAX_CANDIDATE_SCAN = 50;
 
-/** bookList 求值 → 逐条 name/bookUrl 可解析的候选数（设计 §4.1：≥1 即 ok）。 */
-function countSearchCandidates(source: RawSource, text: string, pageUrl: string): number {
+/** bookList 求值 → 逐条 name/bookUrl 可解析的候选 URL（设计 §4.1：≥1 条即 ok；对照判据比 URL 集）。 */
+function searchCandidateUrls(source: RawSource, text: string, pageUrl: string): string[] {
   const rules = source.ruleSearch;
-  if (!rules || typeof rules !== 'object') return 0;
+  if (!rules || typeof rules !== 'object') return [];
   const bookList = (rules as Record<string, unknown>).bookList;
   const name = (rules as Record<string, unknown>).name;
   const bookUrl = (rules as Record<string, unknown>).bookUrl;
-  if (typeof bookList !== 'string') return 0;
+  if (typeof bookList !== 'string') return [];
   const parseSafe = (rule: unknown) => {
     if (typeof rule !== 'string' || !rule.trim()) return undefined;
     try { return parseFieldRule(rule); } catch { return undefined; }
   };
   const listIr = parseSafe(bookList);
-  if (!listIr) return 0;
+  if (!listIr) return [];
   const nameIr = parseSafe(name);
   const bookUrlIr = parseSafe(bookUrl);
   let scope;
-  try { scope = createScope(normalizeBody(text), pageUrl); } catch { return 0; }
-  if (scope.kind !== 'html') return 0;
+  try { scope = createScope(normalizeBody(text), pageUrl); } catch { return []; }
+  if (scope.kind !== 'html') return [];
   let nodes;
-  try { nodes = evaluateFieldNodes(listIr, scope); } catch { return 0; }
-  let count = 0;
+  try { nodes = evaluateFieldNodes(listIr, scope); } catch { return []; }
+  const urls: string[] = [];
   for (let i = 0; i < nodes.length && i < MAX_CANDIDATE_SCAN; i += 1) {
     const inner = insideNode(scope as HtmlScope, nodes[i]);
     try {
       const title = nameIr ? evaluateField(nameIr, inner) : '';
       const url = bookUrlIr ? evaluateField(bookUrlIr, inner) : '';
-      if (title.trim() && url.trim()) count += 1;
+      if (title.trim() && url.trim()) urls.push(url.trim());
     } catch { /* 单条候选求值失败：跳过，不影响整页判定（§3.4 失败隔离） */ }
   }
-  return count;
+  return urls;
 }
 
 export interface AdmissionSearchResult {
@@ -450,6 +481,8 @@ export async function searchAdmission(source: RawSource, options: {
   throttleMs?: number;
   sleep?: (ms: number, signal: AbortSignal) => Promise<void>;
   timeoutMs?: number;
+  /** 主搜索 ok 后再做一次对照搜索，判查询不敏感（espfix41）。缺省关：纯函数调用方逐字不变。 */
+  controlQuery?: boolean;
 }): Promise<AdmissionSearchResult> {
   let url: string;
   try {
@@ -478,8 +511,20 @@ export async function searchAdmission(source: RawSource, options: {
   }
   if (response.status >= 500) return { verdict: 'http_5xx', candidateCount: 0, status: response.status, error: String(response.status) };
   if (response.status >= 400) return { verdict: 'http_4xx', candidateCount: 0, status: response.status, error: String(response.status) };
-  const candidateCount = countSearchCandidates(source, response.text, response.url);
-  if (candidateCount >= 1) return { verdict: 'ok', candidateCount, status: response.status, error: '' };
+  const urls = searchCandidateUrls(source, response.text, response.url);
+  const candidateCount = urls.length;
+  if (candidateCount >= 1) {
+    if (options.controlQuery) {
+      const overlap = await controlQueryOverlap(source, options, urls);
+      if (overlap !== undefined && overlap >= QUERY_INSENSITIVE_OVERLAP) {
+        return {
+          verdict: 'query_insensitive', candidateCount, status: response.status,
+          error: `对照搜索结果重合 ${Math.round(overlap * 100)}%`,
+        };
+      }
+    }
+    return { verdict: 'ok', candidateCount, status: response.status, error: '' };
+  }
   const marker = STRONG_CHALLENGE_MARKERS.find((item) => low.includes(item));
   if (marker !== undefined) {
     return { verdict: 'challenge', candidateCount: 0, status: response.status, error: marker };
@@ -489,6 +534,43 @@ export async function searchAdmission(source: RawSource, options: {
     return { verdict: 'shell', candidateCount: 0, status: response.status, error: `len=${response.text.length}` };
   }
   return { verdict: 'no_result', candidateCount: 0, status: response.status, error: 'bookList 未解析出候选' };
+}
+
+/**
+ * 对照搜索（espfix41）：用与主关键词无公共字的对照书名再搜一次，返回两次候选 URL 集的 Jaccard。
+ * 拿不到可比结论（无可用对照词、URL 展开失败、网络失败、非 2xx）⇒ undefined，调用方维持 ok——
+ * 对照只负责「拿到证据才出池」，不把一次抖动升级成出池。调用方中止则照常抛出（不写判定）。
+ */
+async function controlQueryOverlap(
+  source: RawSource,
+  options: Parameters<typeof searchAdmission>[1],
+  primary: string[],
+): Promise<number | undefined> {
+  const control = queryControlKeyword(admissionKeyword(source));
+  if (!control) return undefined;
+  let url: string;
+  try {
+    url = expandAdmissionSearchUrl(source, options.declaredHosts, control);
+  } catch {
+    return undefined;
+  }
+  const throttleMs = options.throttleMs ?? ADMISSION_THROTTLE_MS;
+  // 同站第二次请求：admissionFetch 的节流只在单次调用内生效，这里显式补一次间隔。
+  if (throttleMs > 0) await (options.sleep ?? defaultSleep)(throttleMs, options.signal);
+  let response: { url: string; status: number; text: string };
+  try {
+    response = await admissionFetch(url, options);
+  } catch (error) {
+    if (options.signal.aborted) throw error;
+    return undefined;
+  }
+  if (response.status < 200 || response.status >= 300) return undefined;
+  const a = new Set(primary);
+  const b = new Set(searchCandidateUrls(source, response.text, response.url));
+  if (b.size === 0) return 0;
+  let shared = 0;
+  for (const item of b) if (a.has(item)) shared += 1;
+  return shared / (a.size + b.size - shared);
 }
 
 // ---------------------------------------------------------------- 状态机（runAdmissionBatch）
@@ -533,6 +615,12 @@ export interface AdmissionBatchInput {
    * 归一后夹在 [1, MAX_ADMISSION_PROBE_CONCURRENCY]。
    */
   probeConcurrency?: number;
+  /**
+   * 查询不敏感判据（espfix41）：主搜索 ok 后加一次对照搜索，结果不随查询变化即判 query_insensitive 出池。
+   * 生产两条写库路径（shuyuan.ts 刷新批次、scripts/seed-admission.mjs）都开；开启后单探最坏
+   * ADMISSION_PROBE_WORST_MS，canProbe 须按它预留。缺省关（单测的固定页桩对任何查询都回同一页）。
+   */
+  controlQuery?: boolean;
 }
 
 export interface AdmissionBatchResult {
@@ -714,7 +802,9 @@ function normalizeAdmissionConcurrency(value: number): number {
 export function recheckOutcome(previous: AdmissionSourceRow | undefined, result: AdmissionSearchResult): {
   search_ok: boolean; search_verdict: string; error: string;
 } {
-  const striking = previous !== undefined
+  // query_insensitive 是拿到两次搜索结果后的正面证据（不是抖动），不走 strike、直接出池。
+  const striking = result.verdict !== 'query_insensitive'
+    && previous !== undefined
     && previous.search_ok === true
     && previous.search_verdict === 'ok'
     && !previous.error.startsWith(ADMISSION_RECHECK_FAIL_PREFIX);
@@ -868,7 +958,7 @@ export async function runAdmissionBatch(input: AdmissionBatchInput): Promise<Adm
       try {
         const result = await searchAdmission(item.candidate.source, {
           fetchPage: input.fetchPage, declaredHosts: input.declaredHosts, signal: input.signal,
-          throttleMs: input.throttleMs, sleep: input.sleep,
+          throttleMs: input.throttleMs, sleep: input.sleep, controlQuery: input.controlQuery,
         });
         verdicts[result.verdict] = (verdicts[result.verdict] ?? 0) + 1;
         results[item.index] = {
