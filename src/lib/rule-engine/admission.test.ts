@@ -1577,6 +1577,46 @@ describe('41-ADMIT-CONC:准入探测受限并发', () => {
     expect(t.hostPeak.get('dup.example.com')).toBe(1); // 同 host 峰值 1 = 从不并发
   });
 
+  it('同站互斥键取 searchUrl 展开后的 host:bookSourceUrl 不同但 searchUrl 同站的两个源被串行化(41-fanout)', async () => {
+    // a/b 两个源声明 URL 不同站,搜索却都打向 search.example.com;x/y 提供并发度。
+    const shared = { searchUrl: 'https://search.example.com/s?q={{key}}' };
+    const candidates = [
+      { url: 'https://a.example.com', source: syntheticSource('https://a.example.com/', shared) },
+      { url: 'https://b.example.com', source: syntheticSource('https://b.example.com/', shared) },
+      { url: 'https://x.example.com', source: syntheticSource('https://x.example.com/') },
+      { url: 'https://y.example.com', source: syntheticSource('https://y.example.com/') },
+    ];
+    const t = tracker();
+    const result = await runAdmissionBatch({
+      candidates,
+      declaredHosts: new Set(['a.example.com', 'b.example.com', 'search.example.com', 'x.example.com', 'y.example.com']),
+      existing: new Map(), fetchPage: t.fetchPage, signal: signal(), throttleMs: 0, maxProbes: 4, probeConcurrency: 4,
+    });
+    expect(t.fetchPage).toHaveBeenCalledTimes(4);
+    expect(t.maxInflight).toBeGreaterThanOrEqual(2); // 确实并发了(x/y 与 search 站交叠)
+    expect(t.hostPeak.get('search.example.com')).toBe(1); // 真实目标站峰值 1 = 从不并发
+    // 写库的 host 列仍是声明 URL 的 host(互斥键只影响调度)。
+    expect(result.rows.map((row) => row.host)).toEqual(['a.example.com', 'b.example.com', 'x.example.com', 'y.example.com']);
+  });
+
+  it('searchUrl 展开失败的源退回声明 URL host 作互斥键,不影响其余源并发(41-fanout)', async () => {
+    const candidates = [
+      // 动态规则展开失败 ⇒ url_invalid、不发请求;互斥键退回 bad.example.com。
+      { url: 'https://bad.example.com', source: syntheticSource('https://bad.example.com/', { searchUrl: 'https://bad.example.com/s?q={{key}}&t={{java.time()}}' }) },
+      { url: 'https://x.example.com', source: syntheticSource('https://x.example.com/') },
+      { url: 'https://y.example.com', source: syntheticSource('https://y.example.com/') },
+    ];
+    const t = tracker();
+    const result = await runAdmissionBatch({
+      candidates,
+      declaredHosts: new Set(['bad.example.com', 'x.example.com', 'y.example.com']),
+      existing: new Map(), fetchPage: t.fetchPage, signal: signal(), throttleMs: 0, maxProbes: 3, probeConcurrency: 3,
+    });
+    expect(result.verdicts.url_invalid).toBe(1);
+    expect(t.calls.sort()).toEqual(['x.example.com', 'y.example.com']);
+    expect(t.maxInflight).toBe(2);
+  });
+
   it('canProbe 随探测耗时转 false ⇒ 逐探止损,之后不再起探并写占位(对照基点 3059eb5 实测值)', async () => {
     // 判据钉的是基点行为,不是新实现自比:canProbe 依赖时间(每探耗 8s,预算 30s,
     // 门槛 8s 超时 + 5s 写库预留 = 13s)。5 个候选、名额 20。
