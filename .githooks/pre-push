@@ -1,11 +1,11 @@
 #!/bin/sh
-# pre-push：push 之前跑「四道门」——与 .github/workflows/ci.yml 完全同款（npm run check）。
+# pre-push：push 之前跑本地门禁——第一道与 .github/workflows/ci.yml 完全同款（npm run check）。
 #
 # 为什么需要本地这一道：
 #   本仓的工作方式是「本地多 worktree 并行开发 + 主会话统一合并后再 push」，而 GitHub
 #   Actions 只在 push **之后**才触发。也就是说 CI 能证明「已经推上去的没坏」，却挡不住
 #   「合并前忘了跑 tsc / eslint」——2026-09-17 的 t78 加固就差一点在没有跑 tsc 的情况下
-#   被合掉。本地这一道才是真正防住「合并前忘了跑四件套」的那一道。
+#   被合掉。本地这一道才是真正防住「合并前忘了跑检查」的那一道。
 #
 # 安装（一次性，任选其一；本仓推荐原生 hooksPath，**不引入 husky 依赖**）：
 #
@@ -24,14 +24,15 @@
 # 测试那道门的 --no-file-parallelism 写在 package.json 的 test script 里（本机多 worker 会 OOM）。
 #   钩子委托给 `npm run check`，不在这里另起一条 vitest 命令，避免与 CI 跑出两套参数。
 #
-# scripts 的 node:test 用例(41-MJSGATE):scripts/*.test.mjs(4 个文件、197 例,node:test API)
+# scripts 的 node:test 用例(41-MJSGATE):scripts/*.test.mjs(node:test API)
 #   走 package.json 的 test:scripts(scripts/run-mjs-tests.mjs),同样经 `npm run check` 跑,
-#   与 ci.yml 的 test:scripts 步骤同款。runner 内部对文件数做下限断言,避免文件被删后静默变空。
+#   与 ci.yml 的 test:scripts 步骤同款。runner 内部对文件数、用例数做下限断言,避免文件被删、
+#   用例被清后静默变空。
 #
 # 第五道（本地独有，2026-09-22 加）：NF_PGLITE_OPTIONAL 拒绝门。
 #   NF_PGLITE_OPTIONAL 是仓库里唯一允许跳过真库用例的开关，CI 里用
-#   `test -z "${NF_PGLITE_OPTIONAL:-}"` 硬断言不许设（ci.yml:64-65）。本地原本没有这一道，
-#   结果在设了该变量的 worktree 里跑 pre-push 会「四道门全绿但真库用例一个没跑」
+#   `test -z "${NF_PGLITE_OPTIONAL:-}"` 硬断言不许设（ci.yml 的 PGlite 断言步骤）。本地原本
+#   没有这一道，结果在设了该变量的 worktree 里跑 pre-push 会「check 全绿但真库用例一个没跑」
 #   ——2026-09-17 真的这样逃逸过一次。本地补上同一句话，fail-closed。
 #
 # 第六道（本地独有，2026-09-22 加）：跨仓 worker 契约。
@@ -40,7 +41,7 @@
 #   「改了本仓的契约方却没同步兄弟仓」。兄弟仓不存在时跳过（不拒绝）——不是所有 worktree
 #   都有 zhaoshu-books 在旁边。
 #
-# 复核通道：`sh .githooks/pre-push contracts-only` 只跑第六道，不跑四道门。
+# 复核通道：`sh .githooks/pre-push contracts-only` 只跑第六道，不跑 npm run check。
 #   给主会话异厂复审/诊断用——真实 push（git push 触发，$1=remote 名）不会进这条路径。
 
 # 第六道抽成函数：contracts-only 通道和正常路径共用同一份逻辑，避免两处漂移。
@@ -63,13 +64,13 @@ run_contracts() {
 }
 
 if [ "${1:-}" = "contracts-only" ]; then
-  # 复核通道：只跑跨仓契约这一道，不跑四道门（真实 push 的 $1 是 remote 名，不是这个）。
+  # 复核通道：只跑跨仓契约这一道，不跑 npm run check（真实 push 的 $1 是 remote 名，不是这个）。
   run_contracts
   exit $?
 fi
 
 if [ ! -d node_modules ]; then
-  echo "✖ pre-push：当前 worktree 没有 node_modules，四道门跑不起来。" >&2
+  echo "✖ pre-push：当前 worktree 没有 node_modules，门禁跑不起来。" >&2
   echo "  请先在本目录执行 npm ci。" >&2
   echo "  （紧急情况可用 git push --no-verify 跳过，但请说明原因。）" >&2
   exit 1
@@ -79,14 +80,14 @@ fi
 if [ -n "${NF_PGLITE_OPTIONAL:-}" ]; then
   echo "✖ pre-push：检测到 NF_PGLITE_OPTIONAL 已设置（值长度 ${#NF_PGLITE_OPTIONAL}），本次 push 已中止。" >&2
   echo "  NF_PGLITE_OPTIONAL 是仓库里唯一允许跳过 PGlite 真库用例的开关。" >&2
-  echo "  本地 pre-push 不允许开着它推送——会出现「四道门全绿但真库用例一个没跑」的假通过" >&2
+  echo "  本地 pre-push 不允许开着它推送——会出现「check 全绿但真库用例一个没跑」的假通过" >&2
   echo "  （2026-09-17 已真实逃逸过一次）。CI 里同样硬断言不许设（ci.yml）。" >&2
   echo "  请先 unset NF_PGLITE_OPTIONAL 再推；确有紧急情况用 git push --no-verify 跳过，" >&2
   echo "  并在回报里写明跳过了真库用例。" >&2
   exit 1
 fi
 
-echo "▶ pre-push：跑四道门（typecheck / lint / test:scripts / test / build），与 CI 同款"
+echo "▶ pre-push：跑第一道（npm run check = typecheck / lint / check:deploy / test:scripts / test / build），与 CI 同款"
 echo "  （紧急情况可用 git push --no-verify 跳过，跳过了请自己说明原因。）"
 
 if ! npm run check; then
@@ -101,4 +102,4 @@ if ! run_contracts; then
   exit 1
 fi
 
-echo "✔ pre-push：四道门 + 跨仓契约全过。"
+echo "✔ pre-push：门禁（npm run check）+ 跨仓契约全过。"
