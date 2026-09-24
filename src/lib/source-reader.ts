@@ -20,6 +20,7 @@ import type { ReaderIndex, ReaderPart } from './reader-types';
 
 const MAX_SOURCE_REQUESTS = 12;
 const MAX_SOURCE_ATTEMPTS = 2;
+/** 同 host（同站）两次请求起始时刻的最小间隔；不同 host 互不等待（41-fanout P1-C）。 */
 const SOURCE_DELAY_MS = 350;
 // M2 预算三层闸门的常量出处见 multisource-project-plan M0.2 与 m2-scaleout-design §3.1：
 // L1 单源点数/切片（非 builtin 源生效）、L2 全局兜底（openPool 抬高 totalLimit）、
@@ -109,12 +110,26 @@ export interface SourceSimilarCandidate {
   bookUrl: string;
 }
 
-/** 父子共享的预算状态（设计 §3.1 的 shared）：计数、350ms 节流槽、全局上限、软预算起点。 */
+/** 父子共享的预算状态（设计 §3.1 的 shared）：计数、按 host 分桶的 350ms 节流槽、全局上限、软预算起点。 */
 interface SharedSourceBudget {
   requests: number;
-  nextRequestAt: number;
+  /** 节流槽按站分桶：键 = sourceThrottleKey(url)，值 = 该站下一次允许发射的时刻。 */
+  nextRequestAt: Map<string, number>;
   totalLimit: number;
   startedAt: number;
+}
+
+/**
+ * 节流分桶键（41-fanout P1-C，legado ConcurrentRateLimiter 按源限速同构）：同站同一桶，异站互不等待。
+ * 同站备用 host（book15.net ↔ www.book15.net，fetch 层换 host 兜底）归一到同一桶——对源站而言是同一个站。
+ * env `SOURCE_THROTTLE_PER_HOST=0` 回滚为全局单槽（所有请求共用一个桶，即改动前语义）。
+ * 键取 page() 入参 URL 的 hostname；请求中途跳转到别站仍记在入参站的桶上（跳转次数本身有上限）。
+ */
+export function sourceThrottleKey(url: string, env: SourceTuningEnv = process.env): string {
+  if (env.SOURCE_THROTTLE_PER_HOST === '0') return '*';
+  const hostname = hostnameOf(url);
+  const alternate = alternateSourceHost(hostname);
+  return alternate && alternate < hostname ? alternate : hostname;
 }
 
 /**
@@ -156,7 +171,7 @@ export class SourceRequestContext {
     this.limit = limit;
     // 根 context 的全局上限初值 = 构造 limit：不经 openPool 的调用路径（单独用 context(n)）行为逐点不变。
     // openPool 的调用点：resolveSourceBook（池里含引擎源时）、surveySourceBooks 开头、switchSourceChapter 开头，都只增不减。
-    this.budget = options.budget ?? { requests: 0, nextRequestAt: 0, totalLimit: limit, startedAt: Date.now() };
+    this.budget = options.budget ?? { requests: 0, nextRequestAt: new Map(), totalLimit: limit, startedAt: Date.now() };
     this.parent = options.parent;
     const sliceController = options.sliceController;
     if (sliceController) {
@@ -198,7 +213,7 @@ export class SourceRequestContext {
   }
 
   /**
-   * 单源子 context：requests/节流槽共享，limit 与切片独立；signal = any([父 signal, 切片定时器])。
+   * 单源子 context：requests/节流槽（按 host 分桶）共享，limit 与切片独立；signal = any([父 signal, 切片定时器])。
    * slide 给定时切片按进展滑动；shareSlice 时不另起切片，signal 直接沿用父 context（与父共用同一片切片）。
    * 子 context 的进展一律逐级上报给父 context。
    */
@@ -238,6 +253,7 @@ export class SourceRequestContext {
 
   async page(url: string, attempts = MAX_SOURCE_ATTEMPTS): Promise<{ url: string; text: string }> {
     let lastError: unknown;
+    const throttleKey = sourceThrottleKey(url);
     for (let attempt = 0; attempt < attempts; attempt++) {
       this.signal.throwIfAborted();
       try {
@@ -250,12 +266,13 @@ export class SourceRequestContext {
             if (this.scope !== BUILTIN_SCOPE && this.scoped.used >= this.limit) throw new SourceReaderError('当前书源查询预算已用完，正在尝试下一个书源。', 'SOURCE_SCOPE_EXHAUSTED', 503);
             this.budget.requests++;
             this.scoped.used++;
-            // 同步预占时间槽：并发调用各自拿到互不重叠的发射时刻，起始间隔恒为 SOURCE_DELAY_MS。
+            // 同步预占时间槽：同站并发调用各自拿到互不重叠的发射时刻，起始间隔恒为 SOURCE_DELAY_MS。
             // 若像以前那样在 await 之后才写回 nextRequestAt，多个并发 page() 会读到同一个旧值、
-            // 一起免等、一起发射，节流对源站失效。槽位在父子 context 间共享（M2 不做每 host 分桶）。
+            // 一起免等、一起发射，节流对源站失效。槽位在父子 context 间共享、按站分桶（41-fanout P1-C）：
+            // 异站互不等待。进程内分桶只约束本实例，跨实例/跨用户的同站并发不在此防线内。
             const now = Date.now();
-            const at = Math.max(now, this.budget.nextRequestAt);
-            this.budget.nextRequestAt = at + SOURCE_DELAY_MS;
+            const at = Math.max(now, this.budget.nextRequestAt.get(throttleKey) ?? 0);
+            this.budget.nextRequestAt.set(throttleKey, at + SOURCE_DELAY_MS);
             if (at > now) await pause(at - now, signal);
           },
         });

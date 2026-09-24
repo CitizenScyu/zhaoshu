@@ -267,8 +267,9 @@ describe('41-M1.2b T:suspect 的末位他源不享末位放宽(修 W3)', () => {
     requested = [];
     return catalog;
   };
-  // 时间线(虚拟毫秒,t0 = 读章开始):cur 本章 0 → E1 搜索 350(节流槽)→ E2 在 350 起跑(切片起点),首个请求 700,
-  // 8s 总超时从 page() 调用算起 ⇒ 8350 超时、立即重试 → 原源兜底:搜索 → 详情 → 正文,各隔 350。
+  // 时间线(虚拟毫秒,t0 = 读章开始;节流槽按 host 分桶,异站互不等待,41-fanout P1-C):cur 本章 0 → E1 搜索 0
+  // → E2 在 0 起跑(切片起点),首个请求 0,8s 总超时 ⇒ 8000 超时、立即重试(同站槽 350 早已过)
+  // → 原源兜底:搜索 → 详情 → 正文,同站各隔 350。
   const readTimed = async (catalog: SourceCatalog) => {
     const t0 = Date.now();
     const { value: part, finishedAt } = await drive(service.readSourceChapter(catalog.version, 0, context()));
@@ -284,24 +285,24 @@ describe('41-M1.2b T:suspect 的末位他源不享末位放宽(修 W3)', () => {
     health.recordHostFailure('e2.test', 'timeout');
     expect(health.isHostSuspect('e2.test')).toBe(true);
     const { elapsedMs, e2, fallback } = await readTimed(catalog);
-    expect(e2).toEqual([700, 8_350]); // 第 1 次跑满 8s 超时;第 2 次在切片到点(起跑 350 + 12s)被中止
-    expect(fallback).toEqual([12_350]);
-    expect(elapsedMs).toBe(13_050); // 与 W3 复现的 cedf71f 时间线同形(13.4s 实钟)
+    expect(e2).toEqual([0, 8_000]); // 第 1 次跑满 8s 超时;第 2 次在切片到点(起跑 0 + 12s)被中止
+    expect(fallback).toEqual([12_000]);
+    expect(elapsedMs).toBe(12_700); // 与 W3 复现的 cedf71f 时间线同形(当时全局单槽 13.05s,异站不再互等少 350ms)
   });
 
   it('T② 对照:末位他源 E2 健康 ⇒ 仍享末位放宽,两次 8s 卡顿都跑满才轮到原源', async () => {
     const catalog = await arrange();
     const { elapsedMs, e2, fallback } = await readTimed(catalog);
-    expect(e2).toEqual([700, 8_350]);
-    expect(fallback).toEqual([16_350]); // 切片 = 余量 − 8s(留给原源)≈ 36.6s,两次 8s 超时都跑满
-    expect(elapsedMs).toBe(17_050);
+    expect(e2).toEqual([0, 8_000]);
+    expect(fallback).toEqual([16_000]); // 切片 = 余量 − 8s(留给原源)≈ 37s,两次 8s 超时都跑满
+    expect(elapsedMs).toBe(16_700);
   });
 
   // 窗口过期边界 × 末位放宽：E2 的两次硬失败都记在 F,把读章起点拨到「E2 起跑(切片取定)那一刻」恰落在窗口终点
-  // 前 1ms / 终点上。isLast 只在 E2 起跑时(读章 +350)查一次记忆;判定是 now − lastFailureAt < 窗口(严格小于),
+  // 前 1ms / 终点上。isLast 只在 E2 起跑时(读章 +0,异站不等节流槽)查一次记忆;判定是 now − lastFailureAt < 窗口(严格小于),
   // 所以终点前 1ms 仍是 suspect、恰在终点已过期。这里故意不先断言 isHostSuspect:边界要由端到端时间线本身分辨出来
   // (比较符改成 <= 或窗口减 1ms,红的是下面的毫秒断言)。
-  const E2_SLICE_AT = 350;
+  const E2_SLICE_AT = 0;
   const seedE2FailuresAt = async () => {
     const health = await import('./source-host-health');
     const failedAt = Date.now();
@@ -316,9 +317,9 @@ describe('41-M1.2b T:suspect 的末位他源不享末位放宽(修 W3)', () => {
     const sliceAt = failedAt + windowMs - 1;
     vi.setSystemTime(sliceAt - E2_SLICE_AT);
     const { elapsedMs, e2, fallback } = await readTimed(catalog);
-    expect(e2).toEqual([700, 8_350]);
-    expect(fallback).toEqual([12_350]);
-    expect(elapsedMs).toBe(13_050);
+    expect(e2).toEqual([0, 8_000]);
+    expect(fallback).toEqual([12_000]);
+    expect(elapsedMs).toBe(12_700);
   });
 
   it('T④ 失败记在 F,E2 起跑恰在窗口终点 ⇒ 已过期(严格小于),恢复末位放宽(同 T②)', async () => {
@@ -327,9 +328,9 @@ describe('41-M1.2b T:suspect 的末位他源不享末位放宽(修 W3)', () => {
     const sliceAt = failedAt + windowMs;
     vi.setSystemTime(sliceAt - E2_SLICE_AT);
     const { elapsedMs, e2, fallback } = await readTimed(catalog);
-    expect(e2).toEqual([700, 8_350]);
-    expect(fallback).toEqual([16_350]);
-    expect(elapsedMs).toBe(17_050);
+    expect(e2).toEqual([0, 8_000]);
+    expect(fallback).toEqual([16_000]);
+    expect(elapsedMs).toBe(16_700);
   });
 });
 
