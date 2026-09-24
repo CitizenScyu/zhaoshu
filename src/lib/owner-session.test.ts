@@ -95,7 +95,8 @@ describe('owner credential generations', () => {
     const session = new OwnerSession('token', 1);
     // 直接数挂在这个具体 signal 上的监听:被中止的 signal 不能再 addEventListener,
     // 所以替换实例方法而不是打 AbortSignal.prototype 的 spy。
-    const signal = session.controller.signal as AbortSignal;
+    // controller 是 private;测试只看 listener 计数,用断言取它,不改生产可见性。
+    const signal = (session as unknown as { controller: AbortController }).controller.signal;
     let adds = 0;
     let removes = 0;
     const realAdd = signal.addEventListener.bind(signal);
@@ -107,5 +108,4 @@ describe('owner credential generations', () => {
     session.close();
     expect(removes).toBe(adds);
   });
-
 });
