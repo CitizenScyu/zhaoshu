@@ -293,6 +293,25 @@ maybe('PGlite 真库', () => {
     expect(await ledgerPresent(pg)).toBe(false);
   }, 120_000);
 
+  it('锁内复核失败经 db:baseline:prod --apply 报 refused、退出码 2（不能被当成 applied）', async () => {
+    const pg = await migratedUnledgered();
+    const inner = createPGliteClient(pg);
+    // 前置只读核对通过之后、拿到迁移锁的那一刻库被改（模拟并发改动）。
+    const client = {
+      async query(text: string, params?: unknown[]) {
+        if (text.startsWith('SELECT pg_advisory_xact_lock')) await pg.exec('ALTER TABLE users DROP CONSTRAINT users_check2');
+        return await inner.query(text, params);
+      },
+    };
+    const out = capture();
+    expect(await main({ argv: baselineArgv(true), env: { PROD_DATABASE_URL: FAKE_URL }, open: async () => client, probe: okProbe,
+      migrations: await load(), ...out })).toBe(2);
+    const result = JSON.parse(out.lines.at(-1)!);
+    expect(result.status).toBe('refused');
+    expect(result.refusals.join('\n')).toMatch(/users_check2/);
+    expect(await ledgerPresent(pg)).toBe(false);
+  }, 120_000);
+
   it('空库（冷建库）不走 baseline：缺表拒绝；migrate:prod 对空库照常放行', async () => {
     const pg = new PGliteCtor!();
     const client = createPGliteClient(pg);
