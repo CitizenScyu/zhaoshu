@@ -51,10 +51,18 @@ export function switchedReaderIndex(index: ReaderIndex, part: ReaderPart): Reade
  * (服务端 readSourceChapter 原样回带请求的 chapterIndex)。把它改记为服务端给的新目录序号
  * (switchedChapterIndex),让阅读窗口与新目录同一套序号 —— activePart、下一章、续读、预取、
  * 进度都从段序号算,留着旧序号就会在新目录里落到错章或重复章。目录未替换时原样返回。
+ *
+ * U4a:序号改记的同时,把标题也改记为**新目录 at 章标题**。交付段此刻的 title 仍是旧目录标题
+ * (服务端 readSourceChapter 在换源前从请求所用的旧目录取 chapter.title),而序号已属新目录 ——
+ * 标题与序号分属两套目录,后续任何以「本段(标题, 序号)」对新目录做的比对都可能自相矛盾
+ * (服务端对齐到 A、前端按新序号破平却选 B)。改记后 (标题, 序号) 同属新目录,跨目录比对自洽;
+ * 顺带让正文首行(新源章名,等于 at 章标题)能被 bodyText 正确剥掉,不再重复显示章名。
  */
 export function switchedReaderPart(index: ReaderIndex, adopted: ReaderIndex, part: ReaderPart): ReaderPart {
   if (adopted.chapters === index.chapters || typeof part.switchedChapterIndex !== 'number') return part;
-  return { ...part, chapterIndex: part.switchedChapterIndex };
+  const at = part.switchedChapterIndex;
+  const title = adopted.chapters[at]?.title;
+  return { ...part, chapterIndex: at, ...(title ? { title } : {}) };
 }
 
 /**
