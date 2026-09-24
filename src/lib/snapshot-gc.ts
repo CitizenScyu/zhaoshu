@@ -10,14 +10,16 @@
 //          ∪ current.json history 的最近 keepVersions 个(至少 2:当前版 + 上一版)
 //          ∪ generated_at 在 graceMs 之内(或无法判定)的版本清单(新落的被拒候选、在途发布)。
 // 任何一份需要读的清单/指针读不懂 ⇒ 整本书跳过(fail closed),不删任何东西。
+// 同样整本跳过(清单文件整体缺失的窗口,b203rev §12-2):目录里有快照卷却没有指针或没有任何版本清单、
+// 列出来的指针/清单读回 404、指针 current/history 提到的版本清单不在目录里、列目录/读取抛错(网络/限流/5xx)。
 // 版本清单 `<version>.json`、current.json、旧单文件时代的其他文件一律不动。
 //
 // 默认 dry-run(只报告将删什么);真删须显式 `execute: true`,且类型上必须同时给出
 // `isPublishing`:删前确认该书没有在途发布(阶段 1 已写卷、阶段 2 清单未落的窗口里,
 // 新卷看起来就是孤儿)。孤儿被删后,同内容重试会在发布阶段 1 幂等重写,不丢数据。
 //
-// 本模块不联网、不碰 DB:存储走注入的 SnapshotGcStore。仓内没有生产实现(GitHub 侧的
-// 列目录/DELETE 适配器与是否接 cron 由主会话决定)。
+// 本模块不联网、不碰 DB:存储走注入的 SnapshotGcStore。只读生产实现(GitHub 列目录/读清单)见
+// runtime-download/snapshot-gc-store.ts;删除适配器与是否接 cron 未定(见 gcls-41 报告)。
 
 import { SNAPSHOT_DIR } from './download-publisher';
 
@@ -51,13 +53,18 @@ export type SnapshotGcOptions =
     });
 
 export type SnapshotGcSkipReason =
-  | 'unreadable_pointer' | 'unreadable_canonical' | 'unreadable_manifest' | 'missing_manifest' | 'publishing';
+  | 'unreadable_pointer' | 'missing_pointer' | 'unreadable_canonical' | 'unreadable_manifest' | 'missing_manifest'
+  | 'store_error' | 'publishing';
 
 export interface SnapshotGcReport {
   stem: string;
   mode: 'dry-run' | 'execute';
   /** 非 null ⇒ 整本跳过,orphans/deleted 均为空。 */
   skipped: SnapshotGcSkipReason | null;
+  /** skipped='store_error' 时的错误摘要(只取 Error.message,存储适配器保证不含响应体/凭据)。 */
+  detail?: string;
+  /** 目录里的快照卷(v-*.txt)总数;跳过时照实给出,列目录失败为 0。 */
+  volumeCount: number;
   liveVersions: string[];
   /** 仍被存活清单引用而保留的快照卷。 */
   retained: string[];
@@ -123,65 +130,84 @@ export async function collectSnapshotGarbage(
   if (!stem || stem.includes('/') || stem === '.' || stem === '..') throw new Error('snapshot stem is invalid');
   const dir = `${SNAPSHOT_DIR}/${stem}`;
   const report: SnapshotGcReport = {
-    stem, mode: options.execute ? 'execute' : 'dry-run', skipped: null,
+    stem, mode: options.execute ? 'execute' : 'dry-run', skipped: null, volumeCount: 0,
     liveVersions: [], retained: [], orphans: [], deleted: [], failed: [],
   };
-  const skip = (reason: SnapshotGcSkipReason) => ({ ...report, skipped: reason, retained: [], orphans: [] });
+  const skip = (reason: SnapshotGcSkipReason, detail?: string): SnapshotGcReport =>
+    ({ ...report, skipped: reason, retained: [], orphans: [], ...(detail === undefined ? {} : { detail }) });
   const now = options.now ?? Date.now();
   const graceMs = options.graceMs ?? SNAPSHOT_GC_DEFAULT_GRACE_MS;
   const keepVersions = Math.max(SNAPSHOT_GC_MIN_KEEP_VERSIONS, Math.floor(options.keepVersions ?? SNAPSHOT_GC_MIN_KEEP_VERSIONS));
 
-  const files = await store.listFiles(dir);
+  const plan = async (): Promise<SnapshotGcSkipReason | null> => {
+    const files = await store.listFiles(dir);
+    const volumes = files.filter(name => VOLUME_SNAPSHOT_FILE.test(name));
+    report.volumeCount = volumes.length;
+    // 没有分卷快照:无可回收,也不必读任何清单(旧单文件时代的目录走这里)。
+    if (volumes.length === 0) return null;
+    const listedVersions = files.flatMap(name => MANIFEST_FILE.exec(name)?.[1] ?? []);
 
-  const live = new Set<string>();
-  if (files.includes('current.json')) {
-    const bytes = await store.getBytes(`${dir}/current.json`);
-    if (bytes !== null) {
-      const pointer = parsePointer(bytes);
-      if (!pointer) return skip('unreadable_pointer');
-      for (const version of [pointer.current, ...pointer.history.slice(-keepVersions)]) {
-        if (VERSION.test(version)) live.add(version);
-      }
+    // 有快照卷却没有指针(首版发布在规范/指针阶段中断,或指针丢失):不知道谁是当前版,整本不动。
+    if (!files.includes('current.json')) return 'missing_pointer';
+    const pointerBytes = await store.getBytes(`${dir}/current.json`);
+    if (pointerBytes === null) return 'missing_pointer';
+    const pointer = parsePointer(pointerBytes);
+    if (!pointer || !VERSION.test(pointer.current)) return 'unreadable_pointer';
+    // 指针提到的每个版本(含 keepVersions 之外的 history)都应有清单。缺了说明存储已不一致,
+    // 那份清单引用了哪些卷无从得知 —— 不能把它的卷当孤儿。
+    for (const version of [pointer.current, ...pointer.history]) {
+      if (VERSION.test(version) && !listedVersions.includes(version)) return 'missing_manifest';
     }
-  }
+    const live = new Set<string>();
+    for (const version of [pointer.current, ...pointer.history.slice(-keepVersions)]) {
+      if (VERSION.test(version)) live.add(version);
+    }
 
-  const referenced = new Set<string>();
-  const canonical = await store.getBytes(`books/${stem}/index.json`);
-  if (canonical !== null) {
-    const refs = manifestRefs(canonical, true);
-    if (!refs) return skip('unreadable_canonical');
-    refs.refs.forEach(path => referenced.add(path));
-  }
+    const referenced = new Set<string>();
+    const canonical = await store.getBytes(`books/${stem}/index.json`);
+    if (canonical !== null) {
+      const refs = manifestRefs(canonical, true);
+      if (!refs) return 'unreadable_canonical';
+      refs.refs.forEach(path => referenced.add(path));
+    }
 
-  const manifests = new Map<string, ManifestRefs>();
-  for (const name of files) {
-    const version = MANIFEST_FILE.exec(name)?.[1];
-    if (!version) continue;
-    const bytes = await store.getBytes(`${dir}/${name}`);
-    if (bytes === null) continue;
-    const refs = manifestRefs(bytes, false);
-    if (!refs) return skip('unreadable_manifest');
-    manifests.set(version, refs);
-    const generated = refs.generatedAt === undefined ? Number.NaN : Date.parse(refs.generatedAt);
-    // 生成时间读不出按新近算(保守);窗内的被拒候选/在途版本都算存活。
-    if (!Number.isFinite(generated) || now - generated < graceMs) live.add(version);
-  }
+    const manifests = new Map<string, ManifestRefs>();
+    for (const version of listedVersions) {
+      const bytes = await store.getBytes(`${dir}/${version}.json`);
+      // 列出来却读回 404:存储状态不一致,整本不动。
+      if (bytes === null) return 'missing_manifest';
+      const refs = manifestRefs(bytes, false);
+      if (!refs) return 'unreadable_manifest';
+      manifests.set(version, refs);
+      const generated = refs.generatedAt === undefined ? Number.NaN : Date.parse(refs.generatedAt);
+      // 生成时间读不出按新近算(保守);窗内的被拒候选/在途版本都算存活。
+      if (!Number.isFinite(generated) || now - generated < graceMs) live.add(version);
+    }
 
-  for (const version of live) {
-    const refs = manifests.get(version);
-    // 存活版本的清单不在:不知道它引用了哪些卷,整本不动。
-    if (!refs) return skip('missing_manifest');
-    refs.refs.forEach(path => referenced.add(path));
-  }
+    for (const version of live) {
+      const refs = manifests.get(version);
+      // 存活版本的清单不在:不知道它引用了哪些卷,整本不动。
+      if (!refs) return 'missing_manifest';
+      refs.refs.forEach(path => referenced.add(path));
+    }
 
-  report.liveVersions = [...live].sort();
-  for (const name of files) {
-    if (!VOLUME_SNAPSHOT_FILE.test(name)) continue;
-    const path = `${dir}/${name}`;
-    (referenced.has(path) ? report.retained : report.orphans).push(path);
+    report.liveVersions = [...live].sort();
+    for (const name of volumes) {
+      const path = `${dir}/${name}`;
+      (referenced.has(path) ? report.retained : report.orphans).push(path);
+    }
+    report.retained.sort();
+    report.orphans.sort();
+    return null;
+  };
+
+  try {
+    const reason = await plan();
+    if (reason) return skip(reason);
+  } catch (error) {
+    // 列目录/读取抛错(网络、超时、限流、5xx):不知道谁引用了谁,整本不动。
+    return skip('store_error', error instanceof Error ? error.message.slice(0, 120) : 'unknown');
   }
-  report.retained.sort();
-  report.orphans.sort();
 
   if (!options.execute || report.orphans.length === 0) return report;
   if (await options.isPublishing(stem)) return skip('publishing');

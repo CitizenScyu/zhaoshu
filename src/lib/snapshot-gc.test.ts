@@ -166,3 +166,86 @@ describe('B2-05 快照卷 GC', () => {
   });
 });
 
+// gcls-41:复审 b203rev §12-2「清单文件整体缺失」窗口 —— 目录有快照卷却读不到应有的清单 ⇒ 整本跳过。
+describe('B2-05 快照卷 GC:清单/指针缺失与存储错误一律 fail closed', () => {
+  const exec = { now: LATER, execute: true as const, isPublishing: async () => false };
+
+  it('volumeCount 照实报告目录里的快照卷数', async () => {
+    const { store } = await threeVersions();
+    const report = await collectSnapshotGarbage(store, stem, { now: LATER });
+    expect(report.volumeCount).toBe(5); // 甲乙丙丁戊
+    expect(report.retained.length + report.orphans.length).toBe(5);
+  });
+
+  it('过期版本 A 的清单文件整体缺失(仍在指针 history 里)⇒ missing_manifest,丙卷不被当孤儿删', async () => {
+    const { store, a } = await threeVersions();
+    store.files.delete(`${paths.dir}/${a.version}.json`);
+    const report = await collectSnapshotGarbage(store, stem, exec);
+    expect(report.skipped).toBe('missing_manifest');
+    expect(report.orphans).toEqual([]);
+    expect(store.deleteFile).not.toHaveBeenCalled();
+    expect(store.files.has(snaps(a)[2])).toBe(true);
+  });
+
+  it('目录有快照卷但所有版本清单都不在 ⇒ missing_manifest', async () => {
+    const { store } = await threeVersions();
+    for (const path of [...store.files.keys()]) if (/\/[a-f0-9]{8}\.json$/.test(path)) store.files.delete(path);
+    expect((await collectSnapshotGarbage(store, stem, exec)).skipped).toBe('missing_manifest');
+    expect(store.deleteFile).not.toHaveBeenCalled();
+  });
+
+  it('目录有快照卷但没有 current.json ⇒ missing_pointer', async () => {
+    const { store } = await threeVersions();
+    store.files.delete(`${paths.dir}/current.json`);
+    expect((await collectSnapshotGarbage(store, stem, exec)).skipped).toBe('missing_pointer');
+    expect(store.deleteFile).not.toHaveBeenCalled();
+  });
+
+  it('列目录看得到、读回却 404(清单或指针)⇒ 整本跳过', async () => {
+    const { store, a } = await threeVersions();
+    const realGet = store.getBytes.bind(store);
+    const gone = new Set([`${paths.dir}/${a.version}.json`]);
+    store.getBytes = async path => (gone.has(path) ? null : realGet(path));
+    expect((await collectSnapshotGarbage(store, stem, exec)).skipped).toBe('missing_manifest');
+    gone.clear();
+    gone.add(`${paths.dir}/current.json`);
+    expect((await collectSnapshotGarbage(store, stem, exec)).skipped).toBe('missing_pointer');
+    expect(store.deleteFile).not.toHaveBeenCalled();
+  });
+
+  it('指针 current 不是 8hex ⇒ unreadable_pointer', async () => {
+    const { store } = await threeVersions();
+    store.files.set(`${paths.dir}/current.json`, JSON.stringify({ current: 'nope', history: [] }));
+    expect((await collectSnapshotGarbage(store, stem, exec)).skipped).toBe('unreadable_pointer');
+  });
+
+  it('读取抛错(网络/限流/5xx)⇒ store_error,只带错误摘要,零删除', async () => {
+    const { store, b } = await threeVersions();
+    const realGet = store.getBytes.bind(store);
+    store.getBytes = async path => {
+      if (path.endsWith(`${b.version}.json`)) throw Object.assign(new Error('github_http_502'), { status: 502 });
+      return realGet(path);
+    };
+    const report = await collectSnapshotGarbage(store, stem, exec);
+    expect(report).toMatchObject({ skipped: 'store_error', detail: 'github_http_502', orphans: [], deleted: [] });
+    expect(store.deleteFile).not.toHaveBeenCalled();
+  });
+
+  it('列目录抛错 ⇒ store_error', async () => {
+    const store = new MemoryStore();
+    store.listFiles = async () => { throw new Error('github_tree_truncated'); };
+    const report = await collectSnapshotGarbage(store, stem, exec);
+    expect(report).toMatchObject({ skipped: 'store_error', detail: 'github_tree_truncated', volumeCount: 0 });
+  });
+
+  it('目录里没有快照卷(旧单文件时代)⇒ 不读任何清单、不跳过、无孤儿', async () => {
+    const store = new MemoryStore();
+    store.files.set(`${paths.dir}/0badf00d.txt`, '旧整本快照');
+    store.files.set(`${paths.dir}/0badf00d.json`, '{broken');
+    const getBytes = vi.spyOn(store, 'getBytes');
+    const report = await collectSnapshotGarbage(store, stem, exec);
+    expect(report).toMatchObject({ skipped: null, volumeCount: 0, orphans: [] });
+    expect(getBytes).not.toHaveBeenCalled();
+  });
+});
+
