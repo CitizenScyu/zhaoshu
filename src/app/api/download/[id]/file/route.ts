@@ -9,8 +9,8 @@ import {
   artifactContentsRoot, artifactContentsUrl, locateTaskArtifact, type ArtifactLocation,
 } from '@/lib/artifact-locator';
 import { BodyReadError, encodeArtifactPath, gitBlobSha, readBoundedBody } from '@/lib/artifact-bytes';
-import { MAX_MANIFEST_BYTES, isVolumeManifestPath, parseVolumeManifest } from '@/lib/volume-manifest';
-import type { VolumeManifest } from '@/lib/volume-manifest';
+import { MAX_MANIFEST_BYTES, isVolumeManifestPath, parseVolumeManifest, volumeReadPaths } from '@/lib/volume-manifest';
+import type { VolumeEntry, VolumeManifest } from '@/lib/volume-manifest';
 import { MAX_READER_BYTES } from '@/lib/txt-chapters';
 
 // 下载完成的任务取回 TXT:文件在 GitHub 私库 CitizenScyu/zhaoshu-books 的 books/ 下
@@ -151,6 +151,15 @@ async function readVolumeManifest(root: string, canonicalPath: string, signal: A
   return manifest;
 }
 
+/** 按 volumeReadPaths 次序取卷(快照卷 404 才回退规范卷);都缺 → null。 */
+async function fetchVolume(root: string, entry: VolumeEntry, signal: AbortSignal): Promise<Response | null> {
+  for (const path of volumeReadPaths(entry)) {
+    const res = await fetchChecked(`${root}/${encodeArtifactPath(path)}`, 'application/vnd.github.raw', signal);
+    if (res) return res;
+  }
+  return null;
+}
+
 /**
  * v2 产物下载:按清单顺序逐卷取回并顺序下发。卷级用与读端同一个 `gitBlobSha` 校验
  * (清单声明 sha ≠ 实取字节 ⇒ 拒绝,绝不下发半新半旧的书)。`pull` 驱动、一次一卷 ⇒
@@ -166,7 +175,7 @@ function volumeConcatStream(root: string, manifest: VolumeManifest, signal: Abor
           controller.close();
           return;
         }
-        const res = await fetchChecked(`${root}/${encodeArtifactPath(entry.path)}`, 'application/vnd.github.raw', signal);
+        const res = await fetchVolume(root, entry, signal);
         if (!res) throw new FileUpstreamError('文件服务缺少分卷，请稍后重试', 'UPSTREAM_ERROR', 502);
         let bytes: Buffer;
         try {

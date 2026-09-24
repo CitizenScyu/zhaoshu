@@ -7,7 +7,7 @@ import {
 import { BodyReadError, encodeArtifactPath, gitBlobSha, readBoundedBody } from '@/lib/artifact-bytes';
 import { MAX_READER_BYTES, parseTxtChapters, splitChapterParts } from '@/lib/txt-chapters';
 import type { ByteRange } from '@/lib/txt-chapters';
-import { MAX_MANIFEST_BYTES, isVolumeManifestPath, parseVolumeManifest } from '@/lib/volume-manifest';
+import { MAX_MANIFEST_BYTES, isVolumeManifestPath, parseVolumeManifest, volumeReadPaths } from '@/lib/volume-manifest';
 import type { VolumeEntry, VolumeManifest } from '@/lib/volume-manifest';
 import type { ReaderChapter, ReaderIndex, ReaderPart } from '@/lib/reader-types';
 
@@ -329,7 +329,7 @@ function cacheVolume(key: string, bytes: Buffer): void {
   }
 }
 
-/** 卷字节与 git blob sha 不符:命中的可能正是「清单旧、卷新」的漂移窗。 */
+/** 卷字节与 git blob sha 不符:快照卷被篡改/撞短 sha,或回退到的规范卷已是别的版本。 */
 class VolumeChangedError extends Error {
   readonly path: string;
   constructor(path: string) {
@@ -337,6 +337,17 @@ class VolumeChangedError extends Error {
     this.name = 'VolumeChangedError';
     this.path = path;
   }
+}
+
+/** 按 volumeReadPaths 次序取卷:快照卷 404 才回退规范卷,其余错误原样上抛。 */
+async function readVolumeBytes(source: Source, entry: VolumeEntry): Promise<Buffer> {
+  const [snapshot, canonical] = volumeReadPaths(entry);
+  try {
+    return await readBounded(source, snapshot, MAX_READER_BYTES, '卷文件异常,暂时无法阅读。');
+  } catch (error) {
+    if (!(error instanceof ReaderError && error.status === 404)) throw error;
+  }
+  return readBounded(source, canonical, MAX_READER_BYTES, '卷文件异常,暂时无法阅读。');
 }
 
 async function getVolume(source: Source, entry: VolumeEntry, bypassCache = false): Promise<Buffer> {
@@ -357,7 +368,7 @@ async function getVolume(source: Source, entry: VolumeEntry, bypassCache = false
     }
   }
   const promise = (async () => {
-    const bytes = await readBounded(source, entry.path, MAX_READER_BYTES, '卷文件异常,暂时无法阅读。');
+    const bytes = await readVolumeBytes(source, entry);
     const sha = gitBlobSha(bytes);
     if (sha !== entry.blob_sha) throw new VolumeChangedError(entry.path);
     cacheVolume(key, bytes);
