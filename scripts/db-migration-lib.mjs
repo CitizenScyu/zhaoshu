@@ -34,8 +34,9 @@ const migrationsDir = resolve(here, '..', 'migrations');
 export const MIGRATION_FILES = ['0001_baseline.sql', '0002_identity_key.sql', '0003_runtime_tables.sql'];
 
 // 已发布（已登记进某个库的 schema_migrations）的迁移摘要，冻结在这里由测试钉住。
-// v1 = 生产首次 db:migrate 登记的值（见下方 normalizeSqlText 注释）；3c7a20f 曾改了 0001 的一行
-// 记账，摘要随之变成另一枚，生产再跑 db:check / db:migrate 就会被「摘要不匹配」拒绝——
+// v1 = 隔离库首次 db:migrate 登记的值（见下方 normalizeSqlText 注释）；生产从未跑过 runner、没有
+// schema_migrations，由 db:baseline:prod 按同一份字节登记。3c7a20f 曾改了 0001 的一行
+// 记账，摘要随之变成另一枚，已登记的库再跑 db:check / db:migrate 就会被「摘要不匹配」拒绝——
 // 改已发布文件只能新增版本，不能回头改字节。新增迁移发布后把它的摘要追加进来。
 export const PUBLISHED_CHECKSUMS = {
   1: '1b47f1ca7dbe16fc01fa50ff71fa4893af186b5de21aedb88529cf390c5a5db2',
@@ -127,8 +128,8 @@ export async function probeEndpoint(connectionString) {
 }
 
 // 行尾归一：摘要与执行都以 LF 文本为准。
-// 依据：生产库已登记的 v1 摘要是 LF 版（codex-done-28.md:71 记录首次 db:migrate
-// 输出 checksum 1b47f1ca…，等于 0001 的 git blob 摘要）。Windows checkout 因
+// 依据：已登记的 v1 摘要是 LF 版（codex-done-28.md:71 记录隔离库首次 db:migrate
+// 输出 checksum 1b47f1ca…，等于 0001 的 git blob 摘要；那是隔离库，不是生产）。Windows checkout 因
 // core.autocrlf=true 读到 CRLF，不归一会得到另一枚摘要，db:check/db:migrate 会被
 // 「版本 1 摘要不匹配」整批拒绝。归一只影响读取，不改盘上文件、不改已登记的行。
 export const normalizeSqlText = (sql) => sql.replaceAll('\r\n', '\n');
@@ -187,7 +188,8 @@ export const SCHEMA_MIGRATIONS_DDL = `CREATE TABLE IF NOT EXISTS schema_migratio
 
 // 待执行列表整体在一个事务里跑完：中途失败连同已登记的版本一起回滚，不留半成品。
 // 逐条按 version 查 schema_migrations：有行则核 name+checksum 后跳过（不重放 DDL），
-// 无行才执行 SQL 并 INSERT 记账。生产手工跑过的版本因此能被「只补记账」地接纳。
+// 无行才执行 SQL 并 INSERT 记账。已登记库上手工跑过的后续版本因此能被「只补记账」地接纳；
+// 连 v1 都没登记的已有库（生产）不走这里，走 db-baseline.mjs。
 export async function applyMigration(client, migrations, options = {}) {
   const list = migrations == null
     ? await loadMigrations()
@@ -319,7 +321,7 @@ export function evaluateSchema(report, migrations) {
 //   newer-than-code    库里登记了高于代码最新版本的迁移（版本倒退：旧代码对新库）；
 //   unknown-version    库里登记了代码列表里没有、但不高于最新版本的迁移；
 //   out-of-order       某版本未登记，而库里已有更高版本——补执行会乱序，拒绝。
-// 「v1 已登记、v2 只手工跑过 DDL 未登记」的生产形态不属于乱序（待执行的 v2 高于已登记的最高版本 v1）。
+// 「v1 已登记、v2 只手工跑过 DDL 未登记」的形态不属于乱序（待执行的 v2 高于已登记的最高版本 v1）。
 export function planMigrations(recordedRows, migrations) {
   const ordered = [...migrations].sort((left, right) => left.version - right.version);
   const known = new Map(ordered.map((migration) => [migration.version, migration]));

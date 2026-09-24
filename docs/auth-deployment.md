@@ -54,7 +54,7 @@ Remove-Item Env:PROD_DATABASE_URL
 - **灾备冷建库**的完整顺序：`db:migrate:prod --apply`（业务 schema 的生产入口，`0001` 只把 auth 记账到 4）→ 本命令补 auth 的
   5/6/7 三步（下载归属、邀请码表、系统任务队列）→ `db:check:prod`（auth 记账不足 7 时退出码 2）→ 部署应用。
   跳过本命令时应用的 `assertAuthSchema` 会全站 503，`db:check:prod` 也会报 `authVersionOk: false`。
-  业务侧入口与已有生产库的执行顺序见 `docs/migrations.md`「生产 / 灾备入口」；`db:check` / `db:migrate` 只接受测试库。
+  业务侧入口与已有生产库的执行顺序（生产走 `db:baseline:prod`）见 `docs/migrations.md`「生产 / 灾备入口」；`db:check` / `db:migrate` 只接受测试库。
 - dry-run 报 `newer-than-code`（库里记账版本高于代码支持的上限）时，真执行会被拒绝；先核对是否连错库或代码版本过旧。
 - **回滚**：auth 迁移只进不退，没有 down 脚本；真执行失败时整批在同一事务里回滚，不留半成品，修正原因后重跑即可。
   已成功执行后要撤回，只能按「生产收口的前置条件与顺序」第 2 步事先做好的完整备份整库恢复（Neon 上即执行前建的
@@ -104,7 +104,7 @@ stats 返回 subject.userId、allowedSections、sectionStates 和 sectionScopes�
 
 ## 生产收口的前置条件与顺序
 
-本批只执行隔离库演练，不执行生产迁移。生产操作须由主会话另行安排受控连接和维护窗口，不能把生产连接冒充 TEST_DATABASE_URL；生产迁移用上文的 `migrate:auth:prod`，业务 schema 用 `db:check:prod` / `db:migrate:prod`（`docs/migrations.md`）。
+本批只执行隔离库演练，不执行生产迁移。生产操作须由主会话另行安排受控连接和维护窗口，不能把生产连接冒充 TEST_DATABASE_URL；生产迁移用上文的 `migrate:auth:prod`，业务 schema 用 `db:check:prod` / `db:baseline:prod` / `db:migrate:prod`（`docs/migrations.md`；生产库从未登记过业务迁移，先走 `db:baseline:prod` 只补记账）。
 
 1. 停止旧写入口、离线旧脚本与旧部署实例，排空在途事务。仅关闭账号开关不够：旧 owner 写入口和旧冷启动 DDL 也必须停用。
 2. 对生产数据库制作包含全部 schema、表、序列、约束和认证设置的完整一致备份；记录恢复时间点。在另一隔离恢复库执行完整恢复并核对 ID、行数、微秒版本及外键。只备份几张个人表或只导出 JSON 不能替代完整备份。
