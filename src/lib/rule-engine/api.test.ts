@@ -433,3 +433,82 @@ describe('导出面快照（M1 任务 4 v3 E5 结构断言）', () => {
     expect([source.compiled.size > 0, search.bookUrl, toc.chapters.length, content.text]).toEqual([true, '', 0, '']);
   });
 });
+
+// ---------------------------------------------------------------- 41-PAGEFIX：正文翻页遇「下一页 = 下一章」即停
+// legado BookContent.analyzeContent：下一页 getAbsoluteURL 后等于下一章 ⇒ break，不请求那一页。
+// 夹具仿 cuoceng：每章一页，#linkNext 指向下一章。context 记录每次取页，断言请求序列而不只是拼接结果。
+describe('正文翻页遇下一章即停（41-PAGEFIX）', () => {
+  const chapter = (n: number) => `https://book15.net/cc/${n}.html`;
+  const page = (text: string, next?: string) =>
+    `<div id="content">${text}</div>` + (next === undefined ? '' : `<a id="linkNext" href="${next}">下一章</a>`);
+  const cuoceng = engineSource({ ruleContent: { content: '#content@text', nextContentUrl: '#linkNext@href' } });
+  /** 三章一页一章：第 1、2 章的 linkNext 指向下一章（相对地址），第 3 章是末章、没有 linkNext。 */
+  const threeChapters = () => new Map([
+    [chapter(1), page('第1章正文', '/cc/2.html')],
+    [chapter(2), page('第2章正文', '/cc/3.html')],
+    [chapter(3), page('第3章正文')],
+  ]);
+  function recording(pages: Map<string, string>) {
+    const requested: string[] = [];
+    const inner = fakeContext(pages);
+    const context = { page: async (url: string) => { requested.push(url); return inner.page(url); } } as unknown as SourceRequestContext;
+    return { requested, context };
+  }
+
+  it('① cuoceng 同型：读第 N 章只请求本章 1 页，正文不含第 N+1 章（strict 同样不误报）', async () => {
+    for (const strict of [false, true]) {
+      const first = recording(threeChapters());
+      expect(await engineFetchContent(cuoceng, chapter(1), first.context, strict, chapter(2))).toEqual({ text: '第1章正文' });
+      expect(first.requested).toEqual([chapter(1)]);
+      const middle = recording(threeChapters());
+      expect(await engineFetchContent(cuoceng, chapter(2), middle.context, strict, chapter(3))).toEqual({ text: '第2章正文' });
+      expect(middle.requested).toEqual([chapter(2)]);
+    }
+  });
+
+  it('② 真多页章节（下一页是本章第 2 页，第 2 页才指向下一章）⇒ 照常翻页、正确拼接', async () => {
+    const pages = new Map([
+      [chapter(1), page('第1章上半', '/cc/1_2.html')],
+      ['https://book15.net/cc/1_2.html', page('第1章下半', '/cc/2.html')],
+      [chapter(2), page('第2章正文')],
+    ]);
+    for (const strict of [false, true]) {
+      const run = recording(pages);
+      expect(await engineFetchContent(cuoceng, chapter(1), run.context, strict, chapter(2))).toEqual({ text: '第1章上半\n第1章下半' });
+      expect(run.requested).toEqual([chapter(1), 'https://book15.net/cc/1_2.html']);
+    }
+  });
+
+  it('③ 不传 nextChapterUrl（末章 / 旧调用）⇒ 行为与改前相同：照旧沿 linkNext 翻页拼接', async () => {
+    for (const args of [[], [false], [false, undefined]] as const) {
+      const run = recording(threeChapters());
+      expect(await engineFetchContent(cuoceng, chapter(1), run.context, ...args)).toEqual({ text: '第1章正文\n第2章正文\n第3章正文' });
+      expect(run.requested).toEqual([chapter(1), chapter(2), chapter(3)]);
+    }
+    const last = recording(threeChapters());
+    expect(await engineFetchContent(cuoceng, chapter(3), last.context, true)).toEqual({ text: '第3章正文' });
+    expect(last.requested).toEqual([chapter(3)]);
+  });
+
+  it('④ 相对/绝对、带 fragment 的写法规范化后认作同一地址；查询串不同不算同一地址', async () => {
+    const cases: Array<{ next: string; nextChapterUrl: string }> = [
+      { next: '/cc/2.html', nextChapterUrl: 'https://book15.net/cc/2.html' },
+      { next: 'https://book15.net/cc/2.html', nextChapterUrl: '/cc/2.html' },
+      { next: '2.html', nextChapterUrl: 'https://book15.net/cc/2.html#chapter' },
+      { next: 'https://book15.net/cc/2.html#top', nextChapterUrl: '2.html' },
+    ];
+    for (const { next, nextChapterUrl } of cases) {
+      const run = recording(new Map([[chapter(1), page('第1章正文', next)], [chapter(2), page('第2章正文')]]));
+      expect(await engineFetchContent(cuoceng, chapter(1), run.context, true, nextChapterUrl)).toEqual({ text: '第1章正文' });
+      expect(run.requested).toEqual([chapter(1)]);
+    }
+    // 查询串原样保留（legado 同样不规范化）：按查询串区分章节/分页的站点，去掉查询串会把本章第 2 页误判成下一章。
+    const byQuery = (query: string) => `https://book15.net/cc/read?${query}`;
+    const paged = recording(new Map([
+      [byQuery('id=1'), page('第1章上半', 'read?id=1&p=2')],
+      [byQuery('id=1&p=2'), page('第1章下半', 'read?id=2')],
+    ]));
+    expect(await engineFetchContent(cuoceng, byQuery('id=1'), paged.context, true, byQuery('id=2'))).toEqual({ text: '第1章上半\n第1章下半' });
+    expect(paged.requested).toEqual([byQuery('id=1'), byQuery('id=1&p=2')]);
+  });
+});

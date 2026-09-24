@@ -964,7 +964,17 @@ export async function currentSourceHint(
   }
 }
 
-async function chapterText(context: SourceRequestContext, chapter: SourceChapter, source: ReadingSource): Promise<string> {
+/**
+ * 引擎正文翻页的停止哨兵（41-PAGEFIX，legado BookContent.analyzeContent 同款）：下一章 URL；
+ * 末章没有下一章时取第 0 章 URL（legado 同样回退到第 0 章，站点末章的「下一页」常回绕到首章）。
+ */
+function nextChapterUrlOf(chapters: SourceChapter[], index: number): string | undefined {
+  return chapters[index + 1]?.url ?? chapters[0]?.url;
+}
+
+async function chapterText(
+  context: SourceRequestContext, chapter: SourceChapter, source: ReadingSource, nextChapterUrl?: string,
+): Promise<string> {
   // N01 分派：builtin 走 book15 特化解析（逐字不变）；引擎档走 rule-engine 取正文。
   // 取页两侧都经 context.page ⇒ 预算/节流/重试层沿用；builtin 分支零行为变化。
   if (isBuiltinReadingSource(source)) {
@@ -972,7 +982,7 @@ async function chapterText(context: SourceRequestContext, chapter: SourceChapter
     if (new URL(page.url).pathname !== new URL(chapter.url).pathname) throw new SourcePolicyError('章节跳转到了另一页面');
     return parseSourceChapterText(page.text, chapter.title);
   }
-  const { text } = await engineFetchContent(engineSourceOf(source), chapter.url, context);
+  const { text } = await engineFetchContent(engineSourceOf(source), chapter.url, context, false, nextChapterUrl);
   // 引擎只解释规则不做内容判定：builtin 的两道内容闸（空正文 / 单章限长）在这里补齐，错误语义与 builtin
   // 对齐：当前源失败同样进章节级换源；候选失败记 SOURCE_POLICY_REJECTED 后试下一个候选。
   if (!text) throw new SourcePolicyError('书源未提供有效正文');
@@ -1025,7 +1035,7 @@ export async function readSourceChapter(session: string, chapterIndex: number, c
       const hasOthers = sources.some((item) => item.url !== catalog.sourceUrl);
       const until = context.startedAt + SOFT_BUDGET_MS - (hasOthers ? SOURCE_FAILOVER_MIN_START_MS : 0);
       const currentContext = context.child(source.url, { limit: MAX_CONTENT_PAGES, sliceMs: baseMs, slide: { stepMs: baseMs, until } });
-      text = await chapterText(currentContext, chapter, source);
+      text = await chapterText(currentContext, chapter, source, nextChapterUrlOf(catalog.chapters, chapterIndex));
     } catch (error) {
       // 章节正文失败(含源被停用/服务端判定失效/切片到点):进换源流程。
       context.signal.throwIfAborted();
@@ -1167,7 +1177,10 @@ async function switchSourceChapter(
       // 正文 context 不另起切片,直接用候选 context 的 signal(目录+正文共用一片),每页进展照样让这一片顺延。
       // L1 取引擎翻页上限:引擎正文按 nextContentUrl 逐页 page(),上限低于翻页数时第 2 页就撞 SOURCE_SCOPE_EXHAUSTED。
       const chapterContext = sourceContext.child(candidate.url, { limit: MAX_CONTENT_PAGES, shareSlice: true });
-      text = await chapterText(chapterContext, alternative.chapters[alternativeIndex], alternativeSource);
+      text = await chapterText(
+        chapterContext, alternative.chapters[alternativeIndex], alternativeSource,
+        nextChapterUrlOf(alternative.chapters, alternativeIndex),
+      );
     } catch (error) {
       throwIfCancelled();
       const reason = failureCode(error);

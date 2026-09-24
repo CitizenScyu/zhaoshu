@@ -140,15 +140,35 @@ export async function engineFetchToc(
   return { chapters };
 }
 
-/** ruleContent.content 拼接，含 nextContentUrl 翻页；多页以换行连接（§7.1）。 */
+/**
+ * 翻页停止判据的 URL 比较口径（41-PAGEFIX）：绝对化之后去掉 fragment；查询串与尾斜杠原样保留。
+ * legado NetworkUtils.getAbsoluteURL 连 fragment 都不去；fragment 不发往服务端，去掉只会把同一资源认得更准。
+ * 查询串、尾斜杠可能真的区分资源（read.php?id=2 与 ?id=3），规范化会把真第 2 页误判成下一章而截断正文；
+ * 漏判只是退回改前行为，误判才有害，所以只去 fragment。
+ */
+function pageIdentity(url: string): string {
+  const parsed = new URL(url);
+  parsed.hash = '';
+  return parsed.href;
+}
+
+/**
+ * ruleContent.content 拼接，含 nextContentUrl 翻页；多页以换行连接（§7.1）。
+ * nextChapterUrl（41-PAGEFIX，legado BookContent.analyzeContent 同款判据）：「下一页」解析后等于下一章
+ * ⇒ 本章结束，不请求那一页。每章一页的站点（如 cuoceng 的 #linkNext）「下一页」就是下一章，缺这条判据会一路
+ * 翻进后续章节。不传时判据不生效，行为与改前逐字节相同。
+ */
 export async function engineFetchContent(
-  source: EngineSource, chapterUrl: string, context: SourceRequestContext, strict = false,
+  source: EngineSource, chapterUrl: string, context: SourceRequestContext, strict = false, nextChapterUrl?: string,
 ): Promise<EngineContentResult> {
   const parts: string[] = [];
   const visited = new Set<string>();
   const contentField = field(source.compiled, 'ruleContent.content');
   const convertContent = contentNeedsHtmlToText(contentField);
   let next = absoluteUrl(chapterUrl, source.url);
+  // 下一章按本章 URL 绝对化（legado 以本章 redirectUrl 为基址）；过不了 host 门就不设判据（退回改前行为）。
+  const stopAt = next && nextChapterUrl ? absoluteUrl(nextChapterUrl, next) : undefined;
+  const stopKey = stopAt ? pageIdentity(stopAt) : undefined;
   for (let pageIndex = 0; next && pageIndex < MAX_CONTENT_PAGES; pageIndex += 1) {
     if (visited.has(next)) { if (strict) throw new Error('pagination_cycle'); break; }
     visited.add(next);
@@ -168,6 +188,8 @@ export async function engineFetchContent(
     const rawNext = scope.kind === 'html' ? evaluateText(source.compiled, 'ruleContent.nextContentUrl', scope) : '';
     next = absoluteUrl(rawNext, page.url);
     if (strict && rawNext.trim() && !next) throw new Error('invalid_next_page');
+    // 放在 invalid_next_page 之后：命中下一章不是非法链接；置空 next 让循环后的 content_page_limit 不误报。
+    if (next && stopKey && pageIdentity(next) === stopKey) { next = undefined; break; }
   }
   if (strict && next) throw new Error('content_page_limit');
   return { text: parts.join('\n') };

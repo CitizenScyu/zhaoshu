@@ -3,7 +3,7 @@ import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, w
 import { spawnSync } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import * as api from '../src/lib/rule-engine/api';
 import * as compile from '../src/lib/rule-engine/compile';
 import * as parser from '../src/lib/source-parser';
@@ -204,6 +204,44 @@ describe('download offline full books', () => {
     const saved = JSON.parse(readFileSync(result.manifestPath, 'utf8'));
     expect(saved.chapters_done).toBe(2);
     expect(saved.chapters.filter((c: { status: string }) => c.status === 'done')).toHaveLength(2);
+  });
+});
+
+// 41-PAGEFIX:cuoceng 同型源(每章一页,#linkNext 指向下一章;末章回绕到首章)——正文翻页遇下一章即停。
+describe('engine content pagination stops at the next chapter (41-PAGEFIX)', () => {
+  it('⑥ 下载 3 章 ⇒ 每章正文正确、不串章，每章只请求本章 1 页(末章按 legado 回退第 0 章判据停止)', async () => {
+    const out = mkdtempSync(join(tmpdir(), 'pagefix-')); dirs.push(out);
+    const rules = {
+      ruleSearch: { bookList: '.book', name: '.name@text', author: '.author@text', bookUrl: 'a@href' },
+      ruleBookInfo: { name: '.title@text', author: '.writer@text', tocUrl: '.toc@href' },
+      ruleToc: { chapterList: '.chapter', chapterName: 'a@text', chapterUrl: 'a@href' },
+      ruleContent: { content: '#content@text', nextContentUrl: '#linkNext@href' },
+    };
+    const source = { url: 'https://book15.net/cc/', name: 'cuoceng 同型', searchUrl: 'https://book15.net/cc/so/{{key}}.html', rules };
+    const options = downloadOptions({ source: source.url, title: '测试书', author: '作者甲', out, 'rate-ms': 0, 'timeout-ms': 1000 });
+    const chapter = (n: number) => `https://book15.net/cc/b/${n}.html`;
+    const pages = new Map<string, string>([
+      [`https://book15.net/cc/so/${encodeURIComponent('测试书')}.html`, '<div class="book"><span class="name">测试书</span><span class="author">作者甲</span><a href="/cc/b.html">x</a></div>'],
+      ['https://book15.net/cc/b.html', '<h1 class="title">测试书</h1><span class="writer">作者甲</span><a class="toc" href="/cc/b/toc.html">目录</a>'],
+      ['https://book15.net/cc/b/toc.html', [1, 2, 3].map(n => `<li class="chapter"><a href="/cc/b/${n}.html">第${n}章</a></li>`).join('')],
+      // 第 1、2 章的 linkNext 指向下一章;第 3 章(末章)回绕到第 1 章。
+      ...[1, 2, 3].map(n => [chapter(n), `<div id="content">第${n}章正文</div><a id="linkNext" href="/cc/b/${n === 3 ? 1 : n + 1}.html">下一章</a>`] as [string, string]),
+    ]);
+    const calls: string[] = [];
+    const transport = async (url: string, opts: { signal: AbortSignal; beforeRequest?: (signal: AbortSignal) => Promise<void> }) => {
+      calls.push(url); await opts.beforeRequest?.(opts.signal);
+      const text = pages.get(url);
+      if (text === undefined) throw new Error('unexpected request');
+      return { url, text };
+    };
+    vi.stubGlobal('fetch', () => { throw new Error('network forbidden'); });
+    const result = await downloadBook({ api, compile, parser }, options, async () => ({ source, builtin: false }), transport);
+    expect(result.code).toBe(0);
+    expect(result.manifest.status).toBe('done');
+    const dir = dirname(result.manifestPath);
+    expect([0, 1, 2].map(i => readFileSync(join(dir, `${i}.txt`), 'utf8'))).toEqual(['第1章正文', '第2章正文', '第3章正文']);
+    // 正文页各请求一次，从不为「下一章」多抓一页。
+    expect(calls.filter(url => /\/cc\/b\/\d+\.html$/.test(url))).toEqual([chapter(1), chapter(2), chapter(3)]);
   });
 });
 
