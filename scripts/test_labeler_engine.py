@@ -357,6 +357,71 @@ class TestMainRejectsIdentityMismatch(unittest.TestCase):
         self.assertFalse((self.dir / 'labels-rejected.jsonl').exists())
 
 
+class TestFailureClassification(unittest.TestCase):
+    """labelerdiag41 P3：每轮失败按类别计数，轮末单独一行（「完成」行逐字不变）。"""
+
+    def test_classify_failure(self):
+        truncated = None
+        try:
+            json.loads('{"chapters": [{"title": "第一章')
+        except json.JSONDecodeError as e:
+            truncated = e
+        cases = (
+            (truncated, '引擎输出截断'),
+            (UnicodeDecodeError('utf-8', b'\xef', 0, 1, 'unexpected end of data'), '引擎输出截断'),
+            (labeler.EngineIdentityMismatch('引擎目录身份不符: …（作者不符）'), '目录作者不符'),
+            (labeler.EngineIdentityMismatch('引擎目录身份不符: …（标题不兼容）'), '目录标题不符'),
+            (RuntimeError("打标失败: 模型链 ['a'] 全部耗尽, 最后错误: Unterminated string"),
+             'LLM链耗尽'),
+            (RuntimeError('引擎 toc 失败 rc=1: 仅支持 HTTPS 精确域名和默认端口/443'), '非HTTPS源'),
+            (TimeoutError('read'), '书源超时'),
+            (OSError('<urlopen error timed out>'), '书源超时'),
+            (RuntimeError('boom'), '其他'),
+        )
+        for error, kind in cases:
+            with self.subTest(kind=kind, error=str(error)):
+                self.assertEqual(labeler.classify_failure(error), kind)
+
+    def test_format_failure_kinds(self):
+        self.assertEqual(labeler.format_failure_kinds({'其他': 1, 'LLM链耗尽': 3, '书源超时': 1}),
+                         '失败分类: LLM链耗尽 3 / 书源超时 1 / 其他 1')
+
+    def test_main_prints_failure_kinds_after_unchanged_done_line(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        d = Path(tmp.name)
+        (d / '.env').write_text('LLM_API_KEY=test-key-not-real\n', encoding='utf-8')
+        books = [{'url': f'https://www.yingsx.com/book/{i}', 'title': f'书{i}',
+                  'author': '某人', 'engine': True, 'source_host': 'www.yingsx.com'}
+                 for i in range(4)]
+        truncated = json.JSONDecodeError('Unterminated string starting at', '{"a', 1)
+        errors = iter([truncated, truncated,
+                       labeler.EngineIdentityMismatch('引擎目录身份不符: x（作者不符）'),
+                       RuntimeError('boom')])
+
+        def fake_fetch(*a, **k):
+            raise next(errors)
+
+        def fake_build(http_get, skip_titles=None, include_douban=True, pages=None,
+                       engine_cli=None, book15_breaker=None):
+            return list(books)
+
+        out = io.StringIO()
+        with mock.patch.dict(os.environ, {'LABELER_DATA_DIR': str(d)}), \
+                mock.patch.object(labeler.douban_list, 'build_webnovel_queue',
+                                  side_effect=fake_build), \
+                mock.patch.object(labeler, 'fetch_book_text_engine', side_effect=fake_fetch), \
+                mock.patch.object(labeler.time, 'sleep'), \
+                mock.patch.object(sys, 'argv',
+                                  ['labeler.py', '--source', 'webnovel', '--no-db-model']), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            code = labeler.main()
+        self.assertEqual(code, 2)
+        text = out.getvalue()
+        self.assertIn('完成: 成功 0 / 失败 4 / 残本候选跳过 0，结果在 labels.jsonl\n'
+                      '失败分类: 引擎输出截断 2 / 其他 1 / 目录作者不符 1', text)
+
+
 class TestMainWiresBook15Breaker(unittest.TestCase):
     """labelerdiag41：名单线把按 .env 阈值装配的 book15 熔断器交给队列构建。"""
 

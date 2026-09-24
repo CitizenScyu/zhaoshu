@@ -857,6 +857,32 @@ def fetch_book_text_engine(engine_cli, book_url: str,
     return '\n\n'.join(parts), chars
 
 
+# ---- 每轮失败分类（labelerdiag41 P3：巡检要一眼分出是代码缺陷、LLM 渠道还是书源问题）----
+# 旧口径只有「成功 N / 失败 M」，诊断时得逐本翻 gate.log 归类。main 每记一次失败就归一类，
+# 轮末在「完成」行之后单独打一行分类计数（「完成」行逐字不变，门卫按它解析）。
+def classify_failure(error: BaseException) -> str:
+    """主循环 except 捕获的异常 → 失败类别（只看类型与消息，不含任何凭据）。"""
+    msg = str(error)
+    if isinstance(error, EngineIdentityMismatch):
+        return '目录作者不符' if '作者不符' in msg else '目录标题不符'
+    # 先于 JSON 判：模型链耗尽的消息里常带「最后错误: Unterminated string…」
+    if '模型链' in msg and '耗尽' in msg:
+        return 'LLM链耗尽'
+    if isinstance(error, (json.JSONDecodeError, UnicodeDecodeError)):
+        return '引擎输出截断'
+    if 'HTTPS' in msg:
+        return '非HTTPS源'
+    if isinstance(error, TimeoutError) or 'timed out' in msg.lower() or '超时' in msg:
+        return '书源超时'
+    return '其他'
+
+
+def format_failure_kinds(kinds: dict) -> str:
+    """{类别: 次数} → 「失败分类: A 3 / B 1」（按次数降序，同数按类别名）。"""
+    items = sorted(((k, v) for k, v in kinds.items() if v), key=lambda kv: (-kv[1], kv[0]))
+    return '失败分类: ' + ' / '.join(f'{k} {v}' for k, v in items)
+
+
 def _build_engine_cli(env: dict):
     """按 .env 装配并探测 EngineCli；开关关闭/配置缺失/探针失败 → 返回 None。
 
@@ -1207,6 +1233,10 @@ def main() -> int:
         return 0
 
     ok = fail = stub_skipped = 0
+    fail_kinds: dict[str, int] = {}
+
+    def count_failure(kind: str) -> None:
+        fail_kinds[kind] = fail_kinds.get(kind, 0) + 1
     import_failures = 0
 
     def record_stub(book: dict, reason: str) -> None:
@@ -1269,6 +1299,7 @@ def main() -> int:
                 with open(rej_path, 'a', encoding='utf-8') as f:
                     f.write(json.dumps(reject, ensure_ascii=False) + '\n')
                 fail += 1
+                count_failure('字数不足')
                 continue
             # --book 的 title 是详情页路径，不作为可核验的站点书名。
             site_title = '' if args.book else (b.get('title') or '').strip()
@@ -1300,6 +1331,7 @@ def main() -> int:
                 with open(rej_path, 'a', encoding='utf-8') as f:
                     f.write(json.dumps(reject, ensure_ascii=False) + '\n')
                 fail += 1
+                count_failure('书名核验不符')
                 time.sleep(LLM_INTERVAL_SEC)
                 continue
             quality = labels.get('text_quality')
@@ -1319,6 +1351,7 @@ def main() -> int:
                 with open(rej_path, 'a', encoding='utf-8') as f:
                     f.write(json.dumps(reject, ensure_ascii=False) + '\n')
                 fail += 1
+                count_failure('内容质量拒收')
                 time.sleep(LLM_INTERVAL_SEC)
                 continue
             # 引擎兜底条目：source 记引擎源 host（如 www.yingsx.com）、url 记引擎源 bookUrl
@@ -1384,12 +1417,16 @@ def main() -> int:
             with open(rej_path, 'a', encoding='utf-8') as f:
                 f.write(json.dumps(reject, ensure_ascii=False) + '\n')
             fail += 1
+            count_failure(classify_failure(e))
             continue
         except Exception as e:
             print(f'  失败: {e}', file=sys.stderr)
             fail += 1
+            count_failure(classify_failure(e))
         time.sleep(LLM_INTERVAL_SEC)
     print(f'\n完成: 成功 {ok} / 失败 {fail} / 残本候选跳过 {stub_skipped}，结果在 labels.jsonl')
+    if fail:
+        print(format_failure_kinds(fail_kinds))
     # exit 2 = 整轮零成功（渠道坏，门卫据此回等待窗口）；1 = 部分失败；0 = 全成功
     if ok == 0 and fail > 0:
         return 2
