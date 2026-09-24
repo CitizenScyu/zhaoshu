@@ -52,9 +52,11 @@ function json(body: unknown, status = 200, headers: Record<string, string> = {})
 }
 
 const CURRENT = 'https://a.example';
+// 与生产同形:阅读目录的 source.url 是书的详情页(sourceReaderIndex 填 bookUrl),不是候选里的源 url ——
+// 当前源只能按源名认。
 const catalog = (over: Record<string, unknown> = {}) => ({
   taskId: null,
-  source: { id: 'src-1', name: '源甲', url: CURRENT, session: 'sess-A' },
+  source: { id: 'src-1', name: '源甲', url: CURRENT + '/book/1', session: 'sess-A' },
   title: '诡秘之主', author: '爱潜水的乌贼', version: 'v1', totalBytes: 0,
   chapters: [
     { index: 0, title: '第一章', startByte: 0, endByte: 0, partCount: 1 },
@@ -62,9 +64,9 @@ const catalog = (over: Record<string, unknown> = {}) => ({
   ],
   ...over,
 });
-const part = () => ({
+const part = (over: Record<string, unknown> = {}) => ({
   taskId: null, sourceId: 'src-1', servedFrom: '源甲', version: 'v1',
-  chapterIndex: 0, partIndex: 0, partCount: 1, title: '第一章', startByte: 0, endByte: 4, text: '第一章\n正文内容',
+  chapterIndex: 0, partIndex: 0, partCount: 1, title: '第一章', startByte: 0, endByte: 4, text: '第一章\n正文内容', ...over,
 });
 
 const candidate = (name: string, url: string, readable = true) => ({ url, name, tier: 'M1', readable });
@@ -76,7 +78,7 @@ const book = (bookUrl: string) => ({ title: '诡秘之主', author: '爱潜水�
 type ProbeHandler = (sourceUrl: string, init: RequestInit | undefined) => Response | Promise<Response>;
 
 /** index/章节走固定响应;候选列表与单源 probe 交给用例。 */
-function fanoutFetch(sources: unknown[] | Response, onProbe: ProbeHandler) {
+function fanoutFetch(sources: unknown[] | Response, onProbe: ProbeHandler, servedFrom = '源甲') {
   return vi.fn<ApiFetch>(async (input, init) => {
     const url = String(input);
     if (url.startsWith('/api/read/source/index')) {
@@ -92,7 +94,7 @@ function fanoutFetch(sources: unknown[] | Response, onProbe: ProbeHandler) {
       return onProbe(query.get('source')!, init);
     }
     if (url.startsWith('/api/read/source/alternates')) return json({ sources: [], partial: false });
-    return json(part());
+    return json(part({ servedFrom }));
   });
 }
 
@@ -241,6 +243,17 @@ describe('换源面板扇出:九种 status 逐一渲染,只有 readable 的 ok /
     const first = apiFetch.mock.calls.map((call) => String(call[0])).find((url) => url.includes('source=https%3A%2F%2Fok.example'))!;
     const query = new URLSearchParams(first.split('?')[1]);
     expect([query.get('title'), query.get('author'), query.get('source')]).toEqual(['诡秘之主', '爱潜水的乌贼', 'https://ok.example']);
+  });
+});
+
+describe('换源面板扇出:当前源', () => {
+  it('当前源按正在供稿的源名认(章内换源后 servedFrom 是新源):新源标当前且不 probe,原目录源照常 probe', async () => {
+    const sources = [candidate('源甲', CURRENT), candidate('源乙', 'https://b.example')];
+    const apiFetch = fanoutFetch(sources, (url) => json(probe(sources.find((item) => item.url === url)!, { status: 'miss' })), '源乙');
+    await openPanel(apiFetch);
+    await waitFor(() => expect(row('源甲').dataset.probeStatus).toBe('miss'));
+    expect(row('源乙').dataset.probeStatus).toBe('current');
+    expect(probeCalls(apiFetch)).toEqual([CURRENT]);
   });
 });
 

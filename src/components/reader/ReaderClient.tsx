@@ -385,7 +385,7 @@ function ReaderSession({ session, from }: Props) {
             author={session.author}
             session={reading?.index.source?.session}
             currentSourceName={reading?.index.source?.name}
-            currentSourceUrl={reading?.index.source?.url}
+            servingSourceName={activePart?.servedFrom || reading?.index.source?.name}
             probeCache={probeCache}
             onSwitch={switchSource}
           />
@@ -475,7 +475,9 @@ const SOURCE_STATUS_TEXT: Record<SourceAlternateStatus['status'], string> = {
 
 type SourcePanelProps = {
   apiFetch: (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
-  title: string; author: string; session?: string; currentSourceName?: string; currentSourceUrl?: string;
+  title: string; author: string; session?: string; currentSourceName?: string;
+  /** 正在供稿的源名(章内换源后是新源,取 part.servedFrom);扇出面板据此标「当前源」。 */
+  servingSourceName?: string;
   probeCache: ProbeCache;
   onSwitch: (bookUrl: string, sourceUrl?: string) => void;
 };
@@ -483,12 +485,12 @@ type SourcePanelProps = {
 /**
  * 换源面板(41-panel):先试扇出(候选列表 + 逐源并发 probe);扇出未开(404)时退回旧 alternates 面板。
  * 旧面板以当前源 session 为 key(MS-29:源会话一变就重挂重检);扇出面板不随 session 重挂 ——
- * 重挂会把已计数的 probe 再发一遍,当前源标记改由 currentSourceUrl 实时判定。
+ * 重挂会把已计数的 probe 再发一遍,当前源标记改由 servingSourceName 实时判定。
  */
-function SourcePanel({ probeCache, currentSourceUrl, ...props }: SourcePanelProps) {
-  const fanout = useSourceFanout({ apiFetch: props.apiFetch, title: props.title, author: props.author, currentSourceUrl, cache: probeCache });
+function SourcePanel({ probeCache, servingSourceName, ...props }: SourcePanelProps) {
+  const fanout = useSourceFanout({ apiFetch: props.apiFetch, title: props.title, author: props.author, currentSourceName: servingSourceName, cache: probeCache });
   if (fanout.phase === 'disabled') return <LegacySourcePanel key={props.session} {...props} />;
-  return <FanoutSourcePanel fanout={fanout} title={props.title} currentSourceUrl={currentSourceUrl} onSwitch={props.onSwitch} />;
+  return <FanoutSourcePanel fanout={fanout} title={props.title} currentSourceName={servingSourceName} onSwitch={props.onSwitch} />;
 }
 
 // 单源 probe 九种结论的用户文案(ok 行展示书名/章数,不用这里的文案);不认识的状态走兜底文案且不可切换。
@@ -516,8 +518,8 @@ function probeDetail(row: FanoutRow, title: string): string {
   return found ? `${text}(${probeBookText(found, title)})` : text;
 }
 
-function FanoutSourcePanel({ fanout, title, currentSourceUrl, onSwitch }: {
-  fanout: ReturnType<typeof useSourceFanout>; title: string; currentSourceUrl?: string;
+function FanoutSourcePanel({ fanout, title, currentSourceName, onSwitch }: {
+  fanout: ReturnType<typeof useSourceFanout>; title: string; currentSourceName?: string;
   onSwitch: (bookUrl: string, sourceUrl?: string) => void;
 }) {
   const { phase, rows, retryAfter, message, rescan } = fanout;
@@ -536,7 +538,7 @@ function FanoutSourcePanel({ fanout, title, currentSourceUrl, onSwitch }: {
       {rows.length > 0 && <p className={styles.sourcesNote} role="status">已检测 {settled} / {rows.length}</p>}
       {rows.length > 0 && <ul className={styles.sourceList}>
         {rows.map((row) => {
-          const current = row.url === currentSourceUrl;
+          const current = !!currentSourceName && row.name === currentSourceName;
           const result = row.state === 'done' ? row.result : null;
           // 只有 readable 的 ok / similar 可切换;unreadable 与任何不认识的状态一律仅展示。
           const switchable = !!result && result.readable && !current;
@@ -562,7 +564,7 @@ function FanoutSourcePanel({ fanout, title, currentSourceUrl, onSwitch }: {
 }
 
 /** 旧换源面板(设计 §4,扇出未开时的回退):打开即检测,一次会话内默认只自动检测一次;「重新检测」手动刷新。 */
-function LegacySourcePanel({ apiFetch, title, author, session: catalogSession, currentSourceName, onSwitch }: Omit<SourcePanelProps, 'probeCache' | 'currentSourceUrl'>) {
+function LegacySourcePanel({ apiFetch, title, author, session: catalogSession, currentSourceName, onSwitch }: Omit<SourcePanelProps, 'probeCache' | 'servingSourceName'>) {
   const [sources, setSources] = useState<SourceAlternateStatus[] | null>(null);
   const [partial, setPartial] = useState(false);
   const [error, setError] = useState('');

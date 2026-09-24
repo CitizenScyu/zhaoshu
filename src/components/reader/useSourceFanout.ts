@@ -121,14 +121,15 @@ async function probeOne(apiFetch: ApiFetch, title: string, author: string, sourc
  * 换源扇出:挂载即取候选并逐源 probe;卸载(关面板)即 abort 全部在途请求。
  * rescan() 只重测没有定论的行(超时/失败/未测),已有结果的行复用 cache,不重复计数。
  */
-export function useSourceFanout({ apiFetch, title, author, currentSourceUrl, cache }: {
-  apiFetch: ApiFetch; title: string; author: string; currentSourceUrl?: string; cache: ProbeCache;
+export function useSourceFanout({ apiFetch, title, author, currentSourceName, cache }: {
+  apiFetch: ApiFetch; title: string; author: string; currentSourceName?: string; cache: ProbeCache;
 }) {
   const [state, setState] = useState<FanoutState>(INITIAL);
   const [generation, setGeneration] = useState(0);
   // 当前源只在一次扫描开始时读:它不必 probe(已在读),变化也不应让在飞的扫描重来。
-  const current = useRef(currentSourceUrl);
-  useEffect(() => { current.current = currentSourceUrl; }, [currentSourceUrl]);
+  // 按源名比对:阅读目录的 source.url 是书的详情页(sourceReaderIndex 填 bookUrl),不是源 url,见报告「契约缺口」。
+  const current = useRef(currentSourceName);
+  useEffect(() => { current.current = currentSourceName; }, [currentSourceName]);
 
   const scan = useCallback(async (signal: AbortSignal) => {
     const set = (update: (previous: FanoutState) => FanoutState) => { if (!signal.aborted) setState(update); };
@@ -152,7 +153,7 @@ export function useSourceFanout({ apiFetch, title, author, currentSourceUrl, cac
     const rows: FanoutRow[] = candidates.map((source) => {
       const cached = cache.get(probeCacheKey(title, author, source.url));
       if (cached) return { ...source, state: 'done', result: cached };
-      return { ...source, state: source.url === exclude ? 'current' : 'pending' };
+      return { ...source, state: exclude && source.name === exclude ? 'current' : 'pending' };
     });
     set(() => ({ phase: 'running', rows, retryAfter: null, message: '' }));
     const patch = (url: string, row: (source: FanoutCandidate) => FanoutRow) => set((previous) => ({
