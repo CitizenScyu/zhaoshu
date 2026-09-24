@@ -4,7 +4,7 @@ import { getReadingSources, type ReadingSource } from './shuyuan';
 import { fetchSourceText, sourceAbortable, SourceHttpError, SOURCE_CONNECT_TIMEOUT_MS, SOURCE_TIMEOUT_MS } from './source-fetch';
 import { SourcePolicyError, alternateSourceHost, validateSourceUrl } from './source-policy';
 import { sourceRevision } from './source-revision';
-import { orderByHostHealth } from './source-host-health';
+import { isHostSuspect, orderByHostHealth } from './source-host-health';
 import { normalizeBookTitle } from './book-identity';
 import {
   engineFetchContent, engineFetchDetail, engineFetchToc, engineSearchBook, MAX_CONTENT_PAGES, type EngineSource,
@@ -326,6 +326,11 @@ function engineCatalogFrom(
 // 只输出 host、URL、字节数、计数、书名等非敏感字段；绝不输出 Cookie/Authorization/整页 HTML。
 function hostOf(url: string): string {
   try { return new URL(url).host; } catch { return ''; }
+}
+
+/** 健康记忆按 hostname 记、按 hostname 查(与 orderByHostHealth 同一口径);非法 URL 返回空串 ⇒ 视为健康。 */
+function hostnameOf(url: string): string {
+  try { return new URL(url).hostname; } catch { return ''; }
 }
 
 function stripHash(url: string): string {
@@ -1157,8 +1162,10 @@ async function switchSourceChapter(
     attempted += 1;
     // 切片(R4/P2):原源兜底还在后面时,给它留出一次起跑门槛;最后一个他源可以用到「余量 − 留给原源的」,
     // 原源兜底用全部余量;其余候选取 min(基准, 余量)。顺延上限同样扣掉留给原源的时间。
+    // 末位放宽只给健康的他源(41-M1.2b T):suspect host 正是被 M1.3 降到他源末位的那个、最不可能成功,
+    // 不能因为排在末位反而拿到最宽的切片;它照常取 min(基准, 余量),卡住就在基准处放弃，原源兜底更早轮到。
     const reserve = !isOriginal && originals.length ? SOURCE_FAILOVER_MIN_START_MS : 0;
-    const isLast = isOriginal || index === others.length - 1;
+    const isLast = isOriginal || (index === others.length - 1 && !isHostSuspect(hostnameOf(candidate.url)));
     const sliceMs = isLast ? Math.max(Math.min(baseMs, remaining), remaining - reserve) : Math.min(baseMs, remaining);
     let alternative: SourceCatalog;
     let text: string;
