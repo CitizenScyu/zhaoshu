@@ -16,6 +16,7 @@
     "test:contracts": "vite-node scripts/check-worker-contract.mjs",
     "w1:candidates": "node --experimental-strip-types scripts/w1-candidates.mjs",
     "migrate:auth": "node --experimental-strip-types scripts/migrate-user-auth.mjs",
+    "migrate:auth:prod": "node --experimental-strip-types scripts/migrate-auth-prod.mjs",
     "test:auth-db": "node --experimental-strip-types scripts/test-auth-db.mjs",
     "bench:auth": "node scripts/bench-auth.mjs",
     "db:check": "node --experimental-strip-types scripts/check-schema.mjs",

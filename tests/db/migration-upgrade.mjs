@@ -121,10 +121,11 @@ export async function runMigrationUpgradeSuite(connectionString) {
     assert.equal((await manual.query(`SELECT count(*)::int AS n FROM ${assertIdentifier(schemas.manual)}.schema_migrations`)).rows[0].n, 1);
     const manualFirst = await applyMigration(manual, migrations, { schema: schemas.manual });
     assert.equal(manualFirst.status, 'applied');
-    assert.deepEqual(manualFirst.versions.map((item) => [item.version, item.status]), [[1, 'unchanged'], [2, 'applied']]);
+    assert.deepEqual(manualFirst.versions.map((item) => [item.version, item.status]),
+      migrations.map((item) => [item.version, item.version === 1 ? 'unchanged' : 'applied']));
     const manualSecond = await applyMigration(manual, migrations, { schema: schemas.manual });
     assert.equal(manualSecond.status, 'unchanged');
-    assert.deepEqual(manualSecond.versions.map((item) => item.status), ['unchanged', 'unchanged']);
+    assert.deepEqual(manualSecond.versions.map((item) => item.status), migrations.map(() => 'unchanged'));
     fingerprints['manual-0002.sql'] = fingerprint(await assertContract(manual, schemas.manual, migrations));
     await manual.end();
     results.push({ fixture: 'manual-0002.sql', first: manualFirst.status, second: manualSecond.status, historyPreserved: true });
