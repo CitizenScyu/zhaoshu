@@ -16,23 +16,42 @@ import time
 import urllib.request
 from pathlib import Path
 
+import labeler
+
 DIR = Path(__file__).parent
-ENV_PATH = DIR / '.env'
 LABELER_CMD = ['python3', '-u', str(DIR / 'labeler.py'), '--source', 'webnovel', '--limit', '242']
 PROBE_INTERVAL = 600      # 两次探测间隔（秒）
 PASS_N = 2                # 连续通过次数才放行
 FAIL_M = 2                # labeler 退出后若渠道连挂这次数，继续等窗口
 PROBE_CHARS = 250_000     # 与 labeler SEGMENT_CHARS 一致
 PROBE_TIMEOUT = 280       # 单次探测超时（CF 524 在 ~125s，280 足够判死）
-# 与 labeler 一致的模型链；只要链中任意一个模型探测通过，就视为窗口可用。
-MODELS = ['deepseek-v4-flash-bohe', 'grok-4.6-hei', 'deepseek-v4.1-flash-hei', 'glm-5.3-agent']
+# 探测模型链不再硬编码：这里曾经写死 ['deepseek-v4-flash-bohe','grok-4.6-hei',
+# 'deepseek-v4.1-flash-hei','glm-5.3-agent']，与 labeler 实际使用的 .env LLM_MODELS 各自演化，
+# 结果只剩链尾 glm 能过探测——glm 一挂，门卫就永远停在等窗口。现在从 .env 读同一份配置
+# （复用 labeler 的解析函数，见 resolve_probe_models），彻底消除两处漂移。
+
+EXIT_NO_MODELS = 3        # .env 未给模型链：fail-closed，不放行 labeler
 
 
-def load_key() -> str:
-    for line in ENV_PATH.read_text().splitlines():
-        if line.startswith('LLM_API_KEY='):
-            return line.split('=', 1)[1].strip()
-    sys.exit('LLM_API_KEY not found in .env')
+def resolve_probe_models(env: dict) -> tuple[list[str], str]:
+    """探测模型链 = labeler 实际使用的 .env 模型链，复用 labeler.resolve_models 解析
+    （同一个 LLM_MODELS 逗号列表 / 旧 LLM_MODEL 单值兜底逻辑，不另写一套解析）。
+
+    返回 (模型链, 来源键)。来源键取 'LLM_MODELS' / 'LLM_MODEL'；两者都没给（或解析为空）
+    时返回 ([], 'none')，由调用方 fail-closed——刻意**不**退回硬编码旧链：
+    静默退回会把「.env 配置缺失/被改坏」这一真实故障伪装成「探测正常」，正是本次要修的失效模式。
+
+    注意判定用**逗号切分后的非空列表**而不是原始字符串的真值：LLM_MODELS 写成 ',' 或
+    ' , , ' 时字符串非空但解析出 0 个模型，若按真值判定就会放行到 labeler.resolve_models，
+    后者静默回落到 labeler.MODELS 常量链——正是本函数要堵的那个洞。"""
+    if [m for m in (env.get('LLM_MODELS') or '').split(',') if m.strip()]:
+        key = 'LLM_MODELS'
+    elif (env.get('LLM_MODEL') or '').strip():
+        key = 'LLM_MODEL'
+    else:
+        return [], 'none'
+    models, _ = labeler.resolve_models(env, use_db=False)
+    return (models, key) if models else ([], 'none')
 
 
 def probe_one(api_key: str, model: str) -> bool:
@@ -55,10 +74,12 @@ def probe_one(api_key: str, model: str) -> bool:
     return False
 
 
-def probe(api_key: str) -> bool:
-    """对整个模型链各探测一次；任一模型探测通过即视为窗口可用。"""
+def probe(api_key: str, models: list[str]) -> bool:
+    """对整个模型链各探测一次；任一模型探测通过即视为窗口可用。
+    逐模型记录结果（probe_one 内部打印单模型行，这里再打一行汇总），
+    便于事后从 gate.log 看出是「链里哪个模型在扛」。"""
     ok = []
-    for m in MODELS:
+    for m in models:
         good = probe_one(api_key, m)
         ok.append((m, good))
         print(f'  [探测] {m}: {"通过" if good else "失败"}', flush=True)
@@ -69,7 +90,18 @@ def probe(api_key: str) -> bool:
 
 
 def main() -> int:
-    key = load_key()
+    # 与 labeler 同一途径读 .env（含引号剥离/必需键校验），避免两套解析漂移。
+    env = labeler.load_env()
+    key = env['LLM_API_KEY']
+    models, src_key = resolve_probe_models(env)
+    if not models:
+        # fail-closed：配置缺失/被改坏时不放行 labeler。若这里退回硬编码旧链，
+        # 「.env 没有模型链」会被伪装成「探测正常」，正是本门卫要防的静默失效。
+        print(f'错误: .env 未提供模型链（{src_key}）；探测模型表无法确定，'
+              f'拒绝放行 labeler（fail-closed）。请在 .env 设置 LLM_MODELS=模型1,模型2,...',
+              file=sys.stderr, flush=True)
+        return EXIT_NO_MODELS
+    print(f'探测模型链来源: {src_key} -> {",".join(models)}', flush=True)
     consecutive_ok = 0
     round_no = 0
     while True:
@@ -78,7 +110,7 @@ def main() -> int:
         consecutive_ok = 0
         # 等待连续 PASS_N 次通过
         while consecutive_ok < PASS_N:
-            if probe(key):
+            if probe(key, models):
                 consecutive_ok += 1
                 print(f'  探测通过 {consecutive_ok}/{PASS_N}', flush=True)
             else:
@@ -103,7 +135,7 @@ def main() -> int:
         while True:
             alive = False
             for _ in range(FAIL_M):
-                if probe(key):
+                if probe(key, models):
                     alive = True
                     break
                 time.sleep(60)
@@ -120,4 +152,4 @@ def main() -> int:
 
 
 if __name__ == '__main__':
-    main()
+    sys.exit(main())
