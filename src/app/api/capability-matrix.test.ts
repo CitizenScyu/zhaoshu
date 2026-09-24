@@ -21,6 +21,10 @@ vi.mock('@/lib/shuyuan', () => ({
   getShuyuanStats: vi.fn().mockResolvedValue({ total: 0 }),
   disableShuyuanSource: vi.fn().mockResolvedValue(true),
   enableShuyuanSource: vi.fn().mockResolvedValue(true),
+  // 41-fanout：单源 probe 路由的开关与候选池（开关关 ⇒ 鉴权通过者 404，不碰候选池）。
+  sourceFanoutEnabled: vi.fn().mockReturnValue(false),
+  sourceFanoutLimit: vi.fn().mockReturnValue(24),
+  getFanoutPool: vi.fn().mockResolvedValue([]),
   // route.ts 的 partialCode 拿它做 instanceof：mock 里少了这个导出，任何走到
   // 502 catch 分支的调用都会 `x instanceof undefined` 抛 TypeError（本测试的
   // refreshShuyuan 被 mock，不会真抛半挂错误，故这里只需一个可判定的类）。
@@ -54,6 +58,7 @@ import { GET as statsGet } from '@/app/api/stats/route';
 import { GET as exportGet } from '@/app/api/export/route';
 import { GET as readGet } from '@/app/api/read/[id]/[resource]/route';
 import { GET as sourceReadGet } from '@/app/api/read/source/[resource]/route';
+import { GET as sourceProbeGet } from '@/app/api/read/source-probe/route';
 import { GET as downloadGet, POST as downloadPost, DELETE as downloadDelete } from '@/app/api/download/route';
 import { GET as downloadFileGet } from '@/app/api/download/[id]/file/route';
 import { GET as shuyuanGet, POST as shuyuanPost } from '@/app/api/shuyuan/route';
@@ -98,6 +103,8 @@ const ROUTES: { name: string; path: string; method: string; handler: Handler; pa
   { name: 'GET /api/export', path: '/api/export', method: 'GET', handler: exportGet as Handler, requires: 'find' },
   { name: 'GET /api/read/[id]/[resource]', path: '/api/read/1/index', method: 'GET', handler: readGet as Handler, params: { id: '1', resource: 'index' }, requires: 'read' },
   { name: 'GET /api/read/source/[resource]', path: '/api/read/source/index?title=书&author=作者', method: 'GET', handler: sourceReadGet as Handler, params: { resource: 'index' }, requires: 'read' },
+  // 41-fanout：单源 probe（开关默认关 ⇒ 鉴权通过者得 404，仍不是 401/403；鉴权先于开关）。
+  { name: 'GET /api/read/source-probe', path: '/api/read/source-probe', method: 'GET', handler: sourceProbeGet as Handler, requires: 'read' },
   { name: 'GET /api/download', path: '/api/download', method: 'GET', handler: downloadGet as Handler, requires: 'download' },
   { name: 'POST /api/download', path: '/api/download', method: 'POST', handler: downloadPost as Handler, requires: 'download' },
   { name: 'DELETE /api/download', path: '/api/download', method: 'DELETE', handler: downloadDelete as Handler, requires: 'download' },
@@ -180,7 +187,7 @@ describe('§5.2 能力矩阵：逐一直接调用受保护方法', () => {
       'GET /api/recommendations', 'POST /api/shelf', 'DELETE /api/shelf',
       'DELETE /api/shelf/unprocessed',
       'GET /api/feedback', 'POST /api/feedback', 'GET /api/library', 'GET /api/stats', 'GET /api/export',
-      'GET /api/read/[id]/[resource]', 'GET /api/read/source/[resource]',
+      'GET /api/read/[id]/[resource]', 'GET /api/read/source/[resource]', 'GET /api/read/source-probe',
       'GET /api/download', 'POST /api/download', 'DELETE /api/download', 'GET /api/download/[id]/file',
       'GET /api/shuyuan', 'POST /api/shuyuan',
       // T6 新增：管理员只读的下载漏斗聚合（requireOwner，非 §5.2 原表，同 §5.2 方式纳入）。
