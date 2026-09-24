@@ -53,10 +53,15 @@ export async function GET(req: NextRequest, { params }: { params: Promise<{ reso
   const author = cleanString(query.get('author') ?? '', 200);
   // 模糊候选的用户确认路径：前端点选候选后带上 book_url 重放，跳过书名/作者匹配。
   const bookUrl = cleanString(query.get('book_url') ?? '', 2048);
+  // 扇出面板的确认带上源唯一标识（probe 结果的 sourceUrl），按源精确定位规则（41-fanfix N10）；只与 book_url 同用。
+  const sourceUrl = cleanString(query.get('source') ?? '', 2048);
   const chapter = query.get('chapter') ?? '';
   const session = query.get('session') ?? '';
   if ((resource === 'index' || resource === 'alternates') && (!title || (query.get('author') && !author))) {
     return response({ error: '请输入有效的书名和作者。', code: 'SOURCE_BOOK_INVALID' }, 400);
+  }
+  if (query.has('source') && (resource !== 'index' || !bookUrl || !sourceUrl)) {
+    return response({ error: '书源参数只能与候选确认（book_url）一起使用。', code: 'SOURCE_BOOK_INVALID' }, 400);
   }
   if (resource === 'chapter' && (!/^[a-f0-9]{40}$/.test(session) || query.get('version') !== session
     || !/^(0|[1-9]\d*)$/.test(chapter) || !Number.isSafeInteger(Number(chapter))
@@ -69,7 +74,7 @@ export async function GET(req: NextRequest, { params }: { params: Promise<{ reso
   try {
     if (resource === 'index') {
       await raceDeadline(signal, ensureSchema);
-      const catalog = await resolveSourceBook({ title, author }, context, bookUrl ? { bookUrl } : {});
+      const catalog = await resolveSourceBook({ title, author }, context, bookUrl ? { bookUrl, ...(sourceUrl ? { sourceUrl } : {}) } : {});
       await saveSourceCatalog(catalog, signal);
       return response(sourceReaderIndex(catalog));
     }

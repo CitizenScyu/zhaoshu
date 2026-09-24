@@ -1320,6 +1320,69 @@ describe('M2-2 多源循环：跳源 / 软预算 / 去重 / bookUrl 反查', () 
     expect(mocks.fetch).not.toHaveBeenCalled();
   });
 
+  describe('bookUrl + sourceUrl 按源唯一标识确认（41-fanfix N10）', () => {
+    // 同站两个引擎源，详情/目录选择器不同：host 反查只会拿到排在前面的 A 的规则。
+    const engineRuleSet = (title: string, writer: string, chapter: string) => ({
+      ruleSearch: engineRulesA.ruleSearch,
+      ruleBookInfo: { name: `${title}@text`, author: `${writer}@text`, tocUrl: '.toc@href' },
+      ruleToc: { ...engineRulesA.ruleToc, chapterList: chapter },
+    });
+    const sameHostA = {
+      url: 'https://engine.test/', name: '同站 A', searchUrl: 'https://engine.test/s?q={{key}}',
+      tier: 'M1' as const, rules: engineRuleSet('.title', '.writer', '.chapter'),
+    };
+    const sameHostB = {
+      url: 'https://engine.test/b/', name: '同站 B', searchUrl: 'https://engine.test/b/s?q={{key}}',
+      tier: 'M1' as const, rules: engineRuleSet('.bt', '.bw', '.bc'),
+    };
+    const bDetail = 'https://engine.test/b/d/1.html';
+    const primeB = () => {
+      pages.set(bDetail, { text: '<h1 class="bt">B 的书</h1><span class="bw">B 作者</span><a class="toc" href="/b/toc/1.html">目录</a>' });
+      pages.set('https://engine.test/b/toc/1.html', { text: '<li class="bc"><a href="/b/c/1.html">第一章</a></li><li class="bc"><a href="/b/c/2.html">第二章</a></li>' });
+    };
+    beforeEach(async () => {
+      (await import('./source-policy')).refreshSupportedHosts(['engine.test', 'other.test']);
+      mocks.sources.mockResolvedValue([source, sameHostA, sameHostB]);
+    });
+
+    it('带 sourceUrl ⇒ 用该源的规则建目录，不按 host 取到同站的 A', async () => {
+      primeB();
+      const catalog = await service.resolveSourceBook(book, context(), { bookUrl: bDetail, sourceUrl: sameHostB.url });
+      expect(catalog).toMatchObject({ sourceUrl: sameHostB.url, sourceName: '同站 B', title: 'B 的书', author: 'B 作者' });
+      expect(catalog.chapters).toHaveLength(2);
+    });
+
+    it('不带 sourceUrl ⇒ 保持 host 反查（旧确认路径不变）：同站时取池里靠前的 A，A 的规则解析不出目录 ⇒ 404', async () => {
+      primeB();
+      await expect(service.resolveSourceBook(book, context(), { bookUrl: bDetail }))
+        .rejects.toMatchObject({ code: 'SOURCE_NOT_FOUND', status: 404 });
+    });
+
+    it('sourceUrl 不在取书池（扇出里 readable=false 的源）⇒ 404，不发请求', async () => {
+      await expect(service.resolveSourceBook(book, context(), { bookUrl: bDetail, sourceUrl: 'https://engine.test/c/' }))
+        .rejects.toMatchObject({ code: 'SOURCE_NOT_FOUND', status: 404 });
+      expect(mocks.fetch).not.toHaveBeenCalled();
+    });
+
+    it('bookUrl 不属于 sourceUrl 的站 ⇒ 404，不发请求（不能拿 B 的规则解析别站页面）', async () => {
+      await expect(service.resolveSourceBook(book, context(), { bookUrl: 'https://other.test/d/1.html', sourceUrl: sameHostB.url }))
+        .rejects.toMatchObject({ code: 'SOURCE_NOT_FOUND', status: 404 });
+      expect(mocks.fetch).not.toHaveBeenCalled();
+    });
+
+    it('路由 index?book_url=&source= 透传源标识；source 不与 book_url 同用 ⇒ 400', async () => {
+      primeB();
+      const res = await request('index', `title=测试书&author=作者&book_url=${encodeURIComponent(bDetail)}&source=${encodeURIComponent(sameHostB.url)}`);
+      expect(res.status).toBe(200);
+      expect(await res.json()).toMatchObject({ title: 'B 的书', source: { name: '同站 B', url: bDetail } });
+      for (const query of [`title=测试书&source=${encodeURIComponent(sameHostB.url)}`, `title=测试书&book_url=${encodeURIComponent(bDetail)}&source=`]) {
+        const rejected = await request('index', query);
+        expect(rejected.status).toBe(400);
+        expect(await rejected.json()).toMatchObject({ code: 'SOURCE_BOOK_INVALID' });
+      }
+    });
+  });
+
   it('引擎源 identity 回退链：ruleBookInfo 缺 name/author ⇒ 用 ruleSearch 的名字/作者（验收 9）', async () => {
     const engineFallback = {
       url: 'https://book15.net/e-f/', name: '引擎回退', searchUrl: 'https://book15.net/e-f?q={{key}}',

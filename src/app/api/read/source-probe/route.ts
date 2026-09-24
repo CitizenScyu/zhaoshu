@@ -5,7 +5,7 @@ import { ensureSchema } from '@/lib/db';
 import { createDeadline, raceDeadline } from '@/lib/deadline';
 import { cleanString } from '@/lib/sanitize';
 import { getFanoutPool, sourceFanoutEnabled, sourceFanoutLimit } from '@/lib/shuyuan';
-import { SOURCE_PROBE_BUDGET_MS, probeSourceForBook } from '@/lib/source-reader';
+import { SOURCE_PROBE_BUDGET_MS, probeResultForPanel, probeSourceForBook } from '@/lib/source-reader';
 
 // 41-fanout 第一期（服务端）：浏览器换源面板逐源并发的单源入口。一次调用只查一个源，不循环、不遍历池。
 //   GET /api/read/source-probe                              → 扇出候选列表（面板据此决定发哪些 probe）
@@ -60,11 +60,12 @@ export async function GET(req: NextRequest) {
       budgetMs: Math.min(SOURCE_PROBE_BUDGET_MS, deadline.remainingMs),
     });
     // 逐 probe 一行观测（E.4 墙钟/请求数标定用）：只记 host、结果、耗时、请求数，不记书名、作者、URL 路径与查询串。
+    // status 记 probe 本身的判定（上游行为），readable 另记；对外 unreadable 由二者推出。
     console.log(JSON.stringify({
-      event: 'source_probe', status: result.status, sourceHost: hostOf(source.url),
+      event: 'source_probe', status: result.status, readable: source.readable, sourceHost: hostOf(source.url),
       elapsedMs: result.elapsedMs, requests: result.requests, ...(result.code ? { code: result.code } : {}),
     }));
-    return response({ ...result, readable: source.readable });
+    return response(probeResultForPanel(result, source.readable));
   } catch {
     if (signal.aborted) return response({ error: '书源查询已取消或超时，可稍后重试。', code: 'SOURCE_TIMEOUT' }, 504);
     console.error('Source probe request failed');

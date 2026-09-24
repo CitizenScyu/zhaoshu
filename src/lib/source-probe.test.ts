@@ -318,12 +318,33 @@ describe('GET /api/read/source-probe', () => {
     });
   });
 
-  it('单源 probe:引擎源命中 ⇒ 200 + status ok + readable 透传;一次只打这一个源', async () => {
+  it('单源 probe:readable=false 的引擎源命中 ⇒ 200 + status unreadable(found=ok,book 保留供展示);一次只打这一个源', async () => {
     primeEngineHit();
     const res = await call(`title=${q('测试书')}&author=${q('作者')}&source=${q(E1.url)}`);
     expect(res.status).toBe(200);
-    expect(await res.json()).toMatchObject({ status: 'ok', sourceUrl: E1.url, readable: false, book: { bookUrl: e1.detail } });
+    expect(await res.json()).toMatchObject({
+      status: 'unreadable', found: 'ok', sourceUrl: E1.url, readable: false, book: { bookUrl: e1.detail },
+    });
     expect(requested).toEqual([e1.search(), e1.detail, e1.toc]);
+  });
+
+  it('readable=true 的源命中 ⇒ status ok(无 found);readable=false 的 similar ⇒ unreadable(found=similar);未命中不改写', async () => {
+    mocks.pool.mockResolvedValue([{ ...book15, readable: true }, { ...E1, readable: true }]);
+    primeEngineHit();
+    const ok = await (await call(`title=${q('测试书')}&author=${q('作者')}&source=${q(E1.url)}`)).json();
+    expect(ok).toMatchObject({ status: 'ok', readable: true });
+    expect(ok).not.toHaveProperty('found');
+
+    mocks.pool.mockResolvedValue([{ ...book15, readable: false }]);
+    pages.set(book15Search(), { text: '<a href="/books/details43.html">测试书</a>' });
+    pages.set(book15Detail(43), { text: book15DetailHtml(43, '测试书(精品版)') });
+    pages.set(book15Search('作者'), { text: '' });
+    const similar = await (await call(`title=${q('测试书')}&author=${q('作者')}&source=${q(book15.url)}`)).json();
+    expect(similar).toMatchObject({ status: 'unreadable', found: 'similar', readable: false, candidates: [{ bookUrl: book15Detail(43) }] });
+
+    pages.set(e1.search(), { text: '<div>没有结果</div>' });
+    mocks.pool.mockResolvedValue([{ ...E1, readable: false }]);
+    expect(await (await call(`title=${q('测试书')}&source=${q(E1.url)}`)).json()).toMatchObject({ status: 'no_candidates', readable: false });
   });
 
   it('source 不在扇出候选里 ⇒ 404 SOURCE_PROBE_UNKNOWN_SOURCE,不发上游请求', async () => {
