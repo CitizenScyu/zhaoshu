@@ -16,6 +16,7 @@
 import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import ts from 'typescript';
 
 /** Hobby：每条 cron 每天最多触发一次（违反即整次部署被拒）。 */
 export const MAX_CRON_RUNS_PER_DAY = 1;
@@ -23,14 +24,32 @@ export const MAX_CRON_RUNS_PER_DAY = 1;
 export const MAX_CRON_JOBS = 100;
 /** Hobby Fluid Compute 单函数时限上限（秒），出处 README 部署一节。 */
 export const MAX_FUNCTION_SECONDS = 300;
+/**
+ * 路由文件扩展名 = Next 16.3.5 默认 pageExtensions（node_modules/next/dist/server/config-shared.js）。
+ * `.mjs` 不在其中，`route.mjs` 不是路由；next.config 若改 pageExtensions，这里要同步。
+ */
+export const ROUTE_EXTENSIONS = ['tsx', 'ts', 'jsx', 'js'];
 
 /**
- * 路由以外文件里定义、但由该路由独占消耗的预算常量。路由文件内直接定义的
+ * 路由以外文件里定义、但由该路由消耗的超时/预算常量（常量须是顶层数字字面量，否则判红）。路由文件内直接定义的
  * `*_BUDGET_MS` / `*_TIMEOUT_MS` 与引用 MODEL_ROUTE_INTERNAL_BUDGET_MS 的路由会被自动发现，不必登记。
+ * 只登记「本身就能把一次调用拖到这么久」的常量；已被请求 deadline 夹住的子超时（llm.ts 的 chatRobust 上限、
+ * shuyuan.ts 刷新内的单次探测等）不登记。盘点口径与未登记理由见 41-MS09B 报告。
  */
 export const CROSS_FILE_BUDGETS = [
   // refreshShuyuan() 整份刷新共用这一预算，cron 与 owner 手动刷新都走 GET /api/shuyuan。
   { route: 'src/app/api/shuyuan/route.ts', file: 'src/lib/shuyuan.ts', name: 'REFRESH_BUDGET_MS' },
+  // triggerDownloadWorkflow() 的 dispatch 请求实际用的是它；同文件导出的 GITHUB_TIMEOUT_MS 目前没有任何调用方。
+  { route: 'src/app/api/download/route.ts', file: 'src/lib/github.ts', name: 'DISPATCH_TIMEOUT_MS' },
+  // githubFetch() 取正文 / 取元数据的单次请求超时，readBookPart / readBookIndex 都经过它。
+  { route: 'src/app/api/read/[id]/[resource]/route.ts', file: 'src/lib/reader-server.ts', name: 'TEXT_TIMEOUT_MS' },
+  { route: 'src/app/api/read/[id]/[resource]/route.ts', file: 'src/lib/reader-server.ts', name: 'METADATA_TIMEOUT_MS' },
+  // 在线换源阅读的软预算（resolveSourceBook / readSourceChapter / 换源都按它止损）。
+  { route: 'src/app/api/read/source/[resource]/route.ts', file: 'src/lib/source-reader.ts', name: 'SOFT_BUDGET_MS' },
+  // probeModel() 两次尝试共享的墙钟上限，owner 保存模型设置时同步探测。
+  { route: 'src/app/api/admin/llm/route.ts', file: 'src/lib/llm.ts', name: 'MODEL_PROBE_TIMEOUT_MS' },
+  // 前端等 /api/find 流式结果的超时：须短于路由上限，否则平台先掐断连接，前端的超时提示轮不到出现。
+  { route: 'src/app/api/find/route.ts', file: 'src/lib/find-sse.ts', name: 'FIND_FETCH_TIMEOUT_MS' },
 ];
 
 const MODEL_BUDGET = { file: 'src/lib/deadline.ts', name: 'MODEL_ROUTE_INTERNAL_BUDGET_MS' };
@@ -87,15 +106,37 @@ function listRouteFiles(root) {
   const appDir = join(root, 'src', 'app');
   if (!existsSync(appDir)) return [];
   const out = [];
+  const routeName = new RegExp(`^route\\.(?:${ROUTE_EXTENSIONS.join('|')})$`);
   const walk = (dir) => {
     for (const entry of readdirSync(dir, { withFileTypes: true })) {
       const full = join(dir, entry.name);
       if (entry.isDirectory()) walk(full);
-      else if (/^route\.(ts|js|mjs)$/.test(entry.name)) out.push(toPosix(relative(root, full)));
+      else if (routeName.test(entry.name)) out.push(toPosix(relative(root, full)));
     }
   };
   walk(appDir);
   return out.sort();
+}
+
+/**
+ * 同一目录只能有一个 route 文件。Next 16.3.5 对此不报错：Turbopack（app_structure.rs）按 read_dir
+ * 顺序后者覆盖前者，顺序由文件系统决定；webpack 构建排序后后者覆盖；dev 只打 Duplicate page 警告。
+ * 哪一个真正上线无法静态确定，下面的 GET / maxDuration 检查也就可能查错文件。
+ */
+function checkRouteFiles(root, errors) {
+  const byDir = new Map();
+  for (const file of listRouteFiles(root)) {
+    const dir = file.slice(0, file.lastIndexOf('/'));
+    byDir.set(dir, [...(byDir.get(dir) ?? []), file.slice(dir.length + 1)]);
+  }
+  for (const [dir, names] of byDir) {
+    if (names.length > 1) {
+      errors.push(
+        `${dir}: 同一目录有多个 route 文件（${names.join('、')}）。Next 不报错，按目录遍历顺序静默取其一，` +
+          `上线的是哪个无法确定；只保留一个`,
+      );
+    }
+  }
 }
 
 /** 数字字面量（允许 `_` 分隔）→ number；不是纯字面量返回 null。 */
@@ -168,15 +209,20 @@ function checkVercelJson(root, errors) {
       return;
     }
     const pathname = path.split('?')[0].replace(/\/+$/, '');
-    const candidates = ['ts', 'js', 'mjs'].map((ext) => `src/app${pathname}/route.${ext}`);
-    const routeFile = candidates.find((c) => routes.has(c));
-    if (!routeFile) {
-      errors.push(`${where}: path "${path}" 找不到对应路由（期望 ${candidates[0]}）。部署会成功，但 cron 每天静默 404`);
+    const routeDir = `src/app${pathname}`;
+    // 多个同名 route 文件已由 checkRouteFiles 判红；这里每个都查 GET，不猜哪个生效。
+    const routeFiles = ROUTE_EXTENSIONS.map((ext) => `${routeDir}/route.${ext}`).filter((c) => routes.has(c));
+    if (routeFiles.length === 0) {
+      errors.push(
+        `${where}: path "${path}" 找不到对应路由（期望 ${routeDir}/route.ts，或同名 .tsx/.jsx/.js）。部署会成功，但 cron 每天静默 404`,
+      );
       return;
     }
-    const source = readText(root, routeFile);
-    if (!/export\s+(?:async\s+)?function\s+GET\b|export\s+const\s+GET\b|export\s*\{[^}]*\bGET\b[^}]*\}/.test(source)) {
-      errors.push(`${where}: ${routeFile} 没有导出 GET。Vercel cron 以 GET 调用，部署会成功，但 cron 每天静默 405`);
+    for (const routeFile of routeFiles) {
+      const source = readText(root, routeFile);
+      if (!/export\s+(?:async\s+)?function\s+GET\b|export\s+const\s+GET\b|export\s*\{[^}]*\bGET\b[^}]*\}/.test(source)) {
+        errors.push(`${where}: ${routeFile} 没有导出 GET。Vercel cron 以 GET 调用，部署会成功，但 cron 每天静默 405`);
+      }
     }
   });
 }
@@ -253,9 +299,40 @@ function checkFunctionDurations(root, errors) {
 function checkNextConfig(root, errors) {
   const rel = ['next.config.ts', 'next.config.mjs', 'next.config.js'].find((f) => existsSync(join(root, f)));
   if (!rel) return;
-  const source = readText(root, rel);
-  if (/\bignoreBuildErrors\s*:\s*true\b/.test(source)) {
-    errors.push(`${rel}: typescript.ignoreBuildErrors = true 会让带类型错误的代码照样在 Vercel 构建上线，关掉了最后一道类型门`);
+  // 用 TypeScript 解析成 AST 再找属性：注释与字符串里的字样不算，引号键与 `x.ignoreBuildErrors = …` 赋值也认得出。
+  const file = ts.createSourceFile(rel, readText(root, rel), ts.ScriptTarget.Latest, false, rel.endsWith('.ts') ? ts.ScriptKind.TS : ts.ScriptKind.JS);
+  const keyText = (name) =>
+    ts.isIdentifier(name) || ts.isStringLiteralLike(name)
+      ? name.text
+      : ts.isComputedPropertyName(name) && ts.isStringLiteralLike(name.expression)
+        ? name.expression.text
+        : undefined;
+  const unwrap = (expr) =>
+    ts.isParenthesizedExpression(expr) || ts.isAsExpression(expr) || ts.isSatisfiesExpression(expr) || ts.isTypeAssertionExpression(expr)
+      ? unwrap(expr.expression)
+      : expr;
+  const values = [];
+  const visit = (node) => {
+    if (ts.isPropertyAssignment(node) && keyText(node.name) === 'ignoreBuildErrors') values.push(node.initializer);
+    else if (ts.isShorthandPropertyAssignment(node) && node.name.text === 'ignoreBuildErrors') values.push(node.name);
+    else if (
+      ts.isBinaryExpression(node) &&
+      node.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
+      ((ts.isPropertyAccessExpression(node.left) && node.left.name.text === 'ignoreBuildErrors') ||
+        (ts.isElementAccessExpression(node.left) && keyText(node.left.argumentExpression) === 'ignoreBuildErrors'))
+    ) {
+      values.push(node.right);
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(file);
+  for (const value of values.map(unwrap)) {
+    if (value.kind === ts.SyntaxKind.FalseKeyword) continue;
+    errors.push(
+      value.kind === ts.SyntaxKind.TrueKeyword
+        ? `${rel}: typescript.ignoreBuildErrors = true 会让带类型错误的代码照样在 Vercel 构建上线，关掉了最后一道类型门`
+        : `${rel}: ignoreBuildErrors 不是字面量 false（${value.getText(file)}），构建时可能为 true 而关掉类型门；本脚本 fail-closed，改成字面量或删掉`,
+    );
   }
 }
 
@@ -265,6 +342,7 @@ function checkNextConfig(root, errors) {
  */
 export function checkDeployConfig(root) {
   const errors = [];
+  checkRouteFiles(root, errors);
   checkVercelJson(root, errors);
   checkFunctionDurations(root, errors);
   checkNextConfig(root, errors);
