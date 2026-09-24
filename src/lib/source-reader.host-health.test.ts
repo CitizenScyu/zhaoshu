@@ -296,6 +296,30 @@ describe('41-M1.2b T:suspect 的末位他源不享末位放宽(修 W3)', () => {
     expect(fallback).toEqual([16_350]); // 切片 = 余量 − 8s(留给原源)≈ 36.6s,两次 8s 超时都跑满
     expect(elapsedMs).toBe(17_050);
   });
+
+  // 窗口过期边界 × 末位放宽：E2 的两次硬失败都记在 F,把读章起点拨到「E2 起跑(切片取定)那一刻」恰落在窗口终点
+  // 前 1ms / 终点上。isLast 只在 E2 起跑时(读章 +350)查一次记忆;判定是 now − lastFailureAt < 窗口(严格小于),
+  // 所以终点前 1ms 仍是 suspect、恰在终点已过期。
+  const E2_SLICE_AT = 350;
+  const seedE2FailuresAt = async () => {
+    const health = await import('./source-host-health');
+    const failedAt = Date.now();
+    health.recordHostFailure('e2.test', 'timeout', failedAt);
+    health.recordHostFailure('e2.test', 'timeout', failedAt);
+    return { health, failedAt, windowMs: health.sourceHostSuspectMs() };
+  };
+
+  it('T③ 失败记在 F,E2 起跑在窗口终点前 1ms ⇒ 仍是 suspect,末位不放宽(同 T①)', async () => {
+    const catalog = await arrange();
+    const { health, failedAt, windowMs } = await seedE2FailuresAt();
+    const sliceAt = failedAt + windowMs - 1;
+    expect(health.isHostSuspect('e2.test', sliceAt)).toBe(true);
+    vi.setSystemTime(sliceAt - E2_SLICE_AT);
+    const { elapsedMs, e2, fallback } = await readTimed(catalog);
+    expect(e2).toEqual([700, 8_350]);
+    expect(fallback).toEqual([12_350]);
+    expect(elapsedMs).toBe(13_050);
+  });
 });
 
 describe('41-M1.3 零行为变化：记忆为空时请求序列与基点 4e1688b 逐项相同', () => {
