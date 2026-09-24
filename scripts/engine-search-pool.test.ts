@@ -1,7 +1,9 @@
 // engine-search-pool 单测 + mock 延迟模型（espfix41）。全离线：不连库、不对任何书源站发请求。
 // 延迟模型用 fake timers 精确推进，数值口径见 espfix-41-report §1/§4。
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { searchSources, SEARCH_HOST_CONCURRENCY, SEARCH_SOURCE_SLICE_MS } from './engine-search-pool.mjs';
+import {
+  excludeSkippedSources, searchSources, SEARCH_HOST_CONCURRENCY, SEARCH_SOURCE_SLICE_MS, sourceHostOf,
+} from './engine-search-pool.mjs';
 
 afterEach(() => { vi.useRealTimers(); });
 
@@ -218,5 +220,30 @@ describe('mock 延迟模型：每本耗时 改前 vs 改后', () => {
     expect(serial.search).toBeGreaterThanOrEqual(16_350);
     expect(sliced.search).toBeLessThanOrEqual(SEARCH_SOURCE_SLICE_MS);
     console.log(`[model] 有卡死源：串行搜索段 ${serial.search}ms → 并发+切片 ${sliced.search}ms`);
+  });
+});
+
+describe('--skip-host 过滤口径（esprev41 ③）', () => {
+  // 身份 host（url）与请求 host（searchUrl）不同的源：跳过键只认身份 host。
+  const mirror = { name: 'mirror', url: 'https://www.mirror.example', searchUrl: 'https://search.shared.example/s?q={{key}}' };
+  const other = { name: 'other', url: 'https://other.example', searchUrl: 'https://search.shared.example/t?q={{key}}' };
+  const plain = { name: 'plain', url: 'https://plain.example', searchUrl: '/search?q={{key}}' };
+
+  it('按身份 host 跳过，候选 source 字段同口径', () => {
+    expect(sourceHostOf(mirror)).toBe('www.mirror.example');
+    expect(excludeSkippedSources([mirror, other, plain], ['www.mirror.example']).map((s) => s.name))
+      .toEqual(['other', 'plain']);
+  });
+
+  it('不按请求 host 跳过：共用搜索服务器的其余源不被连坐', () => {
+    expect(excludeSkippedSources([mirror, other, plain], ['search.shared.example']).map((s) => s.name))
+      .toEqual(['mirror', 'other', 'plain']);
+  });
+
+  it('无跳过名单时原样返回；url 解析不了的源不会被任何 host 命中', () => {
+    const list = [mirror, plain];
+    expect(excludeSkippedSources(list, [])).toBe(list);
+    expect(excludeSkippedSources([{ name: 'bad', url: 'not a url' }], ['www.mirror.example']).map((s) => s.name))
+      .toEqual(['bad']);
   });
 });
