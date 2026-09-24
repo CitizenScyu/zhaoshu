@@ -180,6 +180,11 @@ export function safeError(error) {
   return result;
 }
 
+// 记账表的唯一建表语句：runner 与 baseline 登记（db-baseline.mjs）共用，两条路径建出的表形状一致。
+export const SCHEMA_MIGRATIONS_DDL = `CREATE TABLE IF NOT EXISTS schema_migrations (
+      version integer PRIMARY KEY, name text NOT NULL, checksum char(64) NOT NULL,
+      applied_at timestamptz NOT NULL DEFAULT now())`;
+
 // 待执行列表整体在一个事务里跑完：中途失败连同已登记的版本一起回滚，不留半成品。
 // 逐条按 version 查 schema_migrations：有行则核 name+checksum 后跳过（不重放 DDL），
 // 无行才执行 SQL 并 INSERT 记账。生产手工跑过的版本因此能被「只补记账」地接纳。
@@ -194,9 +199,7 @@ export async function applyMigration(client, migrations, options = {}) {
     await client.query("SET LOCAL lock_timeout = '10s'");
     await client.query("SET LOCAL statement_timeout = '120s'");
     await client.query('SELECT pg_advisory_xact_lock($1)', [MIGRATION_LOCK_ID]);
-    await client.query(`CREATE TABLE IF NOT EXISTS schema_migrations (
-      version integer PRIMARY KEY, name text NOT NULL, checksum char(64) NOT NULL,
-      applied_at timestamptz NOT NULL DEFAULT now())`);
+    await client.query(SCHEMA_MIGRATIONS_DDL);
     const ordered = [...list].sort((left, right) => left.version - right.version);
     // strict（生产入口用）：拿到锁之后按整张记账表复核一遍，库里有代码不认识的版本、更高的版本
     // 或乱序缺口都拒绝。默认不开：旧代码对库里多出的高版本保持宽容，是回滚路径依赖的行为。
