@@ -1,4 +1,4 @@
-# CI 四道门：typecheck → lint → test → build
+# CI 门禁：typecheck → lint → 部署配置 → test → build
 #
 # 为什么存在：本仓此前唯一类型防线是 `next build`，已实证逃逸过三次问题——
 #   1) 手工移植不完整，53/53 测试全绿，只有 `tsc --noEmit` 报 4×TS2552 能抓；
@@ -54,6 +54,12 @@ jobs:
       # 门 2：lint（eslint 9 flat config，无参数默认 lint 整个目录，实测 243 个文件）。
       - name: lint
         run: npm run lint
+
+      # 部署配置门（review-42 MS-09）：vercel.json cron 频率/路由、maxDuration 上限与路由内部预算、
+      # next.config 构建类型门。纯静态读文件，不联网、不读 .env*。本工作流不走 `npm run check`，
+      # 所以必须单列一步；本地 pre-push 经 `npm run check` 同样会跑。
+      - name: check:deploy
+        run: npm run check:deploy
 
       # 门 3：测试。见下方断言步骤，真库用例被静默跳过就判红。
       # 显式断言 @electric-sql/pglite 可解析：它是 devDependency，只有 npm ci 带上 devDeps 才有。
