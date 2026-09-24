@@ -11,6 +11,9 @@ import { readFileSync } from 'node:fs';
 vi.mock('@/lib/db', () => ({ getSql: () => { throw new Error('vercel-cron 门禁不应触库'); } }));
 
 import { CRON_ALERT_HOURS, SHUYUAN_REFRESH_ALERT_HOURS } from './source-health';
+// 5 段表达式解析与部署配置门禁（scripts/check-deploy-config.mjs，MS-09）共用同一份实现，不复制第二份。
+// 条数上限（Vercel 文档表 100，2026-09-23 抓取核实）也取自同一处常量。
+import { MAX_CRON_JOBS as HOBBY_MAX_CRON_JOBS, triggersPerDay } from '../../scripts/check-deploy-config.mjs';
 
 // 离线 crons 门禁（同坑两犯，必须留闸）：
 //
@@ -33,37 +36,6 @@ import { CRON_ALERT_HOURS, SHUYUAN_REFRESH_ALERT_HOURS } from './source-health';
 // 而非误传的 2；cron 频率才是唯一的硬限制。
 
 type Cron = { path: string; schedule: string };
-
-/** Vercel 文档表：Hobby 计划每项目 cron 条数上限（2026-09-23 抓取核实）。 */
-const HOBBY_MAX_CRON_JOBS = 100;
-
-/** 展开单个 crontab 字段为「一天内命中该字段的取值个数」。 */
-function fieldCardinality(field: string, lo: number, hi: number): number {
-  const values = new Set<number>();
-  for (const part of field.split(',')) {
-    const [rangePart, stepPart] = part.split('/');
-    const step = stepPart === undefined ? 1 : Number(stepPart);
-    if (!Number.isInteger(step) || step < 1) throw new Error(`非法步进: ${part}`);
-    let start = lo;
-    let end = hi;
-    if (rangePart !== '*') {
-      const bounds = rangePart.split('-');
-      start = Number(bounds[0]);
-      end = bounds.length > 1 ? Number(bounds[1]) : start;
-      if (!Number.isInteger(start) || !Number.isInteger(end)) throw new Error(`非法取值: ${part}`);
-    }
-    if (start < lo || end > hi || start > end) throw new Error(`越界取值: ${part}`);
-    for (let v = start; v <= end; v += step) values.add(v);
-  }
-  return values.size;
-}
-
-/** 该 cron 表达式一天内触发几次 = 分钟取值数 × 小时取值数。 */
-function triggersPerDay(schedule: string): number {
-  const fields = schedule.trim().split(/\s+/);
-  if (fields.length !== 5) throw new Error(`cron 字段数应为 5，实为 ${fields.length}: ${schedule}`);
-  return fieldCardinality(fields[0], 0, 59) * fieldCardinality(fields[1], 0, 23);
-}
 
 const config = JSON.parse(readFileSync('vercel.json', 'utf8')) as { crons: Cron[] };
 
