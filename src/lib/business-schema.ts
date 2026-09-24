@@ -249,8 +249,9 @@ export async function initializeBusinessSchema(s: Sql) {
     // F15 残留（租约/退避）：排他领取与失败退避的行状态。幂等补列，老库下一次
     // ensureSchema 生效；默认值让既有行**立即可领取**（lease 空 = 无人持有）、**立即可试**
     // （next_eligible_at 空 = 无退避）——零数据迁移。列语义与使用见 user-data.ts 队列查询。
-    // 该表族一贯走运行时幂等 DDL（同 labeled_books.source_url / app_settings 各列），
-    // 不进 migrations/ 的版本化契约（那里的 EXPECTED_TABLES 也不含本表）。
+    // 该表族走运行时幂等 DDL（同 labeled_books.source_url / app_settings 各列）补老库；冷建库由
+    // migrations/0003_runtime_tables.sql 逐字复刻本表及上面 app_settings / source_admission 的 DDL（MS-25），
+    // 改这里的列必须同步 0003 之后的新迁移——runtime-tables-migration.pglite.test.ts 会逐列比对。
     tx`
     ALTER TABLE profile_feedback_queue
       ADD COLUMN IF NOT EXISTS lease_token text NOT NULL DEFAULT '',
@@ -260,7 +261,7 @@ export async function initializeBusinessSchema(s: Sql) {
     // audit-41 S5-1：三条 Vercel cron 失败时零告警通道。shuyuan 用 shuyuan_meta.refreshed_at
     // 作「上次成功时间」（刷新成功才推进）；reclaim / drain 是无状态 UPDATE/扫描，库里不落任何
     // 成功时间戳，故单独记一行。没有这行表，健康端点的 crons.*.lastSuccessAt 永远是 null。
-    // 同样走运行时幂等 DDL（同 profile_feedback_queue），不进 migrations/ 的版本化契约。
+    // 同样走运行时幂等 DDL（同 profile_feedback_queue）；冷建库由 migrations/0003 建立。
     tx`
     CREATE TABLE IF NOT EXISTS cron_health (
       name text PRIMARY KEY,

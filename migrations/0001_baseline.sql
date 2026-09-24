@@ -207,4 +207,4 @@ DO $$ BEGIN
 END $$;
 CREATE INDEX IF NOT EXISTS llm_usage_phase_created_at_idx ON llm_usage(phase,created_at DESC);
 
-INSERT INTO auth_schema_migrations(version) VALUES(1),(2),(3),(4),(5),(6),(7) ON CONFLICT(version) DO NOTHING;
+INSERT INTO auth_schema_migrations(version) VALUES(1),(2),(3),(4) ON CONFLICT(version) DO NOTHING;

@@ -53,3 +53,18 @@ export function createPGliteSql(pg: PGliteLike) {
   };
   return Object.assign(tag, { transaction });
 }
+
+/**
+ * scripts/db-migration-lib.mjs 的 client 形状（`client.query(text, params?) → { rows }`）在 PGlite 上的等价物。
+ * 迁移文件是整份多语句 SQL，由 runner 不带参数地一次送出（pg 驱动此时走 simple query 协议）；
+ * PGlite 的 query 走扩展协议只收单语句，因此无参数时改用 exec，取最后一条语句的结果行。
+ */
+export function createPGliteClient(pg: PGliteLike) {
+  return {
+    async query(text: string, params?: unknown[]): Promise<{ rows: Record<string, unknown>[] }> {
+      if (params && params.length) return await pg.query(text, params);
+      const results = (await pg.exec(text)) as { rows: Record<string, unknown>[] }[];
+      return { rows: results.at(-1)?.rows ?? [] };
+    },
+  };
+}
