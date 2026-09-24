@@ -58,6 +58,8 @@ const stallBody = new Set<string>();
 let requested: string[];
 /** 每次上游请求的发出时刻(虚拟时钟),节流用例用。 */
 let stamps: { url: string; at: number }[];
+/** 限流计数(scope|key_hash → attempts)。 */
+const rateCounts = new Map<string, number>();
 
 /** 假时钟下推进到定时器排空再交出结果。 */
 const drive = async <T>(work: Promise<T>): Promise<T> => {
@@ -78,7 +80,17 @@ beforeEach(async () => {
   pages.clear();
   headerDelay.clear();
   stallBody.clear();
-  const sql = (parts: TemplateStringsArray, ...values: unknown[]) => ({ text: parts.join('?').replace(/\s+/g, ' ').trim(), values });
+  rateCounts.clear();
+  const sql = (parts: TemplateStringsArray, ...values: unknown[]) => {
+    const text = parts.join('?').replace(/\s+/g, ' ').trim();
+    // 限流计数(auth_rate_limits 原子 UPSERT)直接 await sql``:按 (scope, key_hash) 计数,窗口不滚动。
+    if (text.includes('INSERT INTO auth_rate_limits')) {
+      const key = `${values[0]}|${values[1]}`;
+      rateCounts.set(key, (rateCounts.get(key) ?? 0) + 1);
+      return Promise.resolve([{ attempts: rateCounts.get(key), retry_after_seconds: 321 }]);
+    }
+    return { text, values };
+  };
   const transaction = vi.fn(async (queries: Query[]) => queries.map((query) => {
     if (query.text.includes('FROM labeled_books')) return [];
     throw new Error('probe 不得写库或读其他表: ' + query.text);
@@ -288,6 +300,8 @@ describe('GET /api/read/source-probe', () => {
   beforeEach(async () => {
     vi.stubEnv('APP_OWNER_TOKEN', 'probe-owner');
     vi.stubEnv('SOURCE_FANOUT_ENABLED', '1');
+    // 限流键 HMAC 用的测试假值(≥32 字节),与任何真实配置无关。
+    vi.stubEnv('AUTH_SECURITY_SECRET', 'test-only-source-probe-secret-0123456789');
     mocks.pool.mockResolvedValue(fanout);
     mocks.ensureSchema.mockResolvedValue(undefined);
     ({ GET } = await import('@/app/api/read/source-probe/route'));
@@ -364,5 +378,74 @@ describe('GET /api/read/source-probe', () => {
     const res = await call(`title=${q('测试书')}&source=${q(E1.url)}`);
     expect(res.status).toBe(500);
     expect(await res.json()).toMatchObject({ code: 'SOURCE_INTERNAL' });
+  });
+
+  describe('用户级限流(41-fanfix N7)', () => {
+    const probeQuery = `title=${q('测试书')}&author=${q('作者')}&source=${q(E1.url)}`;
+
+    it('默认阈值:一次默认上限(24 个)的扫描全部放行,不误拒正常扇出', async () => {
+      pages.set(e1.search(), { text: '<div>没有结果</div>' });
+      const statuses: number[] = [];
+      for (let i = 0; i < 24; i++) statuses.push((await call(probeQuery)).status);
+      expect(statuses.every((status) => status === 200)).toBe(true);
+    });
+
+    it('超限 ⇒ 429 SOURCE_PROBE_RATE_LIMITED + Retry-After,不合成候选池、不出网;候选列表不计数', async () => {
+      vi.stubEnv('SOURCE_PROBE_RATE_LIMITS', '2/600');
+      pages.set(e1.search(), { text: '<div>没有结果</div>' });
+      for (let i = 0; i < 3; i++) expect((await call('')).status).toBe(200);
+      expect((await call(probeQuery)).status).toBe(200);
+      expect((await call(probeQuery)).status).toBe(200);
+      mocks.pool.mockClear();
+      const before = requested.length;
+      const res = await call(probeQuery);
+      expect(res.status).toBe(429);
+      expect(res.headers.get('Retry-After')).toBe('321');
+      expect(res.headers.get('Cache-Control')).toBe('private, no-store');
+      expect(await res.json()).toMatchObject({ code: 'SOURCE_PROBE_RATE_LIMITED', retryAfterSeconds: 321 });
+      expect(mocks.pool).not.toHaveBeenCalled();
+      expect(requested).toHaveLength(before);
+    });
+
+    it('多窗口:任一窗口超限即拒;SOURCE_PROBE_RATE_LIMITS=0 关闭限流且不写计数', async () => {
+      vi.stubEnv('SOURCE_PROBE_RATE_LIMITS', '5/600,1/86400');
+      pages.set(e1.search(), { text: '<div>没有结果</div>' });
+      expect((await call(probeQuery)).status).toBe(200);
+      expect((await call(probeQuery)).status).toBe(429);
+      vi.stubEnv('SOURCE_PROBE_RATE_LIMITS', '0');
+      rateCounts.clear();
+      expect((await call(probeQuery)).status).toBe(200);
+      expect(rateCounts.size).toBe(0);
+    });
+
+    it('缺 AUTH_SECURITY_SECRET(无法算限流键)⇒ 503 SOURCE_PROBE_RATE_LIMIT_UNAVAILABLE,不出网', async () => {
+      vi.stubEnv('AUTH_SECURITY_SECRET', '');
+      const res = await call(probeQuery);
+      expect(res.status).toBe(503);
+      expect(await res.json()).toMatchObject({ code: 'SOURCE_PROBE_RATE_LIMIT_UNAVAILABLE' });
+      expect(requested).toEqual([]);
+    });
+  });
+});
+
+describe('source-probe-rate-limit 配置与主体', () => {
+  it('阈值解析:默认两窗;非法配置整体回退默认;0 关闭', async () => {
+    const { sourceProbeRateLimits } = await import('./source-probe-rate-limit');
+    const defaults = [
+      { scope: 'source-probe-600', limit: 60, windowSeconds: 600 },
+      { scope: 'source-probe-86400', limit: 240, windowSeconds: 86400 },
+    ];
+    expect(sourceProbeRateLimits({})).toEqual(defaults);
+    for (const bad of ['abc', '12/0', '0/600', '12/600,x', '12/999999999']) expect(sourceProbeRateLimits({ SOURCE_PROBE_RATE_LIMITS: bad })).toEqual(defaults);
+    expect(sourceProbeRateLimits({ SOURCE_PROBE_RATE_LIMITS: ' 30/60 ' })).toEqual([{ scope: 'source-probe-60', limit: 30, windowSeconds: 60 }]);
+    expect(sourceProbeRateLimits({ SOURCE_PROBE_RATE_LIMITS: '0' })).toEqual([]);
+  });
+
+  it('主体:有用户按用户 id;无用户按平台追加的最后一跳来源 IP', async () => {
+    const { sourceProbeRateLimitSubject } = await import('./source-probe-rate-limit');
+    const req = new NextRequest('http://localhost/api/read/source-probe', { headers: { 'x-forwarded-for': '198.51.100.7, 203.0.113.9' } });
+    const principal = { userId: 7, role: 'member' as const, canFind: false, canRead: true, canDownload: false, authMethod: 'session' as const };
+    expect(sourceProbeRateLimitSubject(req, principal)).toBe('user:7');
+    expect(sourceProbeRateLimitSubject(req, undefined)).toBe('ip:203.0.113.9');
   });
 });
