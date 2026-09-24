@@ -66,10 +66,10 @@ interface AdmissionProbesEnv {
  */
 export const DEFAULT_ADMISSION_PROBE_CONCURRENCY = 1;
 /**
- * 并发度硬上限:8。上游是小说站,同站并发易被 429/封;且同一 bookSourceUrl host 互斥
- * (见 runAdmissionBatch,互斥键取 `hostOf(candidate.url)`)已把同一 bookSourceUrl host
- * 的并发压到 1——注意实际请求打向 searchUrl 展开后的 host,两个源 bookSourceUrl 不同但
- * searchUrl 同站时仍可能同站并发。跨站 8 路已足够吃掉「名额/并发」的墙钟。夹上限防 env
+ * 并发度硬上限:8。上游是小说站,同站并发易被 429/封;同站互斥(见 runAdmissionBatch,
+ * 互斥键取 `admissionMutexHost`:searchUrl 展开后的 host,展开失败退回 bookSourceUrl host,
+ * 41-fanout)把同一目标站的并发压到 1——实际请求打向的就是展开后的 host,两个源 bookSourceUrl
+ * 不同但 searchUrl 同站时也串行。跨站 8 路已足够吃掉「名额/并发」的墙钟。夹上限防 env
  * 误配(c=100)把探测风暴打向上游。
  */
 export const MAX_ADMISSION_PROBE_CONCURRENCY = 8;
@@ -551,6 +551,19 @@ function hostOf(url: string): string {
 }
 
 /**
+ * 准入同站互斥键(41-fanout,archrev41 §5-2):探测请求真正打向的是 searchUrl 展开后的 host,
+ * 不是源声明的 bookSourceUrl host。展开失败(模板非法/动态规则/host 不在声明池)时这个源
+ * 注定判 url_invalid、不发请求,退回声明 URL 的 host 即可。只做互斥键,写库的 host 列不变。
+ */
+function admissionMutexHost(candidate: AdmissionCandidate, declaredHosts: ReadonlySet<string>): string {
+  try {
+    return hostOf(expandAdmissionSearchUrl(candidate.source, declaredHosts)) || hostOf(candidate.url);
+  } catch {
+    return hostOf(candidate.url);
+  }
+}
+
+/**
  * source_admission.rules_hash：内容 identity 沿用目录的 sourceRevision，再加引擎语义版本前缀。
  * 入参形状由调用方按 reader 的 `{url, searchUrl, rules}` 组配——rules 传整个源对象；
  * 源内容或引擎语义任一变化，准入 identity 都会变化。
@@ -727,7 +740,8 @@ export function recheckOutcome(previous: AdmissionSourceRow | undefined, result:
  *       「没轮到/预算不足」占位分支。canProbe 依赖时间(调用方按 `Date.now()` 计剩余预算),
  *       必须逐探判——在批次开头一次性领完会让预算耗尽后仍继续起探,整批撞上预算中止后
  *       被静默丢弃(c=1 默认即回归)。c=1 时 canProbe 的调用序列与串行版逐候选相同;
- *   (b) 同一 bookSourceUrl host 同时最多 1 个探测在飞(上游是小说站,同站并发易被 429/封);
+ *   (b) 同一目标站(searchUrl 展开后的 host,见 admissionMutexHost)同时最多 1 个探测在飞
+ *       (上游是小说站,同站并发易被 429/封);
  *   (c) 结果先按计划序落进 `results[index]` 槽、汇总后再按计划顺序输出——不按完成先后,
  *       保证同输入同输出、写库与测试可复现。
  * 取舍(c>1):host 在飞而被跳过的候选,可能把名额让给计划序靠后的候选。只在 c>1、同 host
@@ -756,7 +770,7 @@ export async function runAdmissionBatch(input: AdmissionBatchInput): Promise<Adm
   // 待探清单(名额尚未领取)。index 指回计划序,用于结果归位;placeholder 是「没轮到/预算不足」
   // 时要写的占位行(undefined = 该候选不写占位,见下方防出池例外)。
   const probes: {
-    index: number; candidate: AdmissionCandidate; host: string; compile: AdmissionCompile; hash: string;
+    index: number; candidate: AdmissionCandidate; host: string; mutexHost: string; compile: AdmissionCompile; hash: string;
     previous: AdmissionSourceRow | undefined; placeholder: AdmissionSourceRow | undefined;
   }[] = [];
 
@@ -809,11 +823,13 @@ export async function runAdmissionBatch(input: AdmissionBatchInput): Promise<Adm
           engine_semantics_version: semanticsVersion, host, error: '', compile_diagnostics: [],
         }
         : undefined;
-    probes.push({ index, candidate, host, compile, hash, previous, placeholder });
+    probes.push({
+      index, candidate, host, mutexHost: admissionMutexHost(candidate, input.declaredHosts), compile, hash, previous, placeholder,
+    });
   }
 
   // ---- 受限并发 worker 池 ------------------------------------------------------
-  // inflightHosts:当前在飞的 host(同 host 互斥);claimed:已处理的候选(已起探,或判否后写了占位)。
+  // inflightHosts:当前在飞的目标站(mutexHost,同站互斥);claimed:已处理的候选(已起探,或判否后写了占位)。
   const inflightHosts = new Set<string>();
   const claimed = new Array<boolean>(probes.length).fill(false);
   let remaining = probes.length;
@@ -828,7 +844,7 @@ export async function runAdmissionBatch(input: AdmissionBatchInput): Promise<Adm
       let pick = -1;
       for (let j = 0; j < probes.length; j += 1) {
         if (claimed[j]) continue;
-        if (inflightHosts.has(probes[j].host)) continue;
+        if (inflightHosts.has(probes[j].mutexHost)) continue;
         pick = j;
         break;
       }
@@ -848,7 +864,7 @@ export async function runAdmissionBatch(input: AdmissionBatchInput): Promise<Adm
       }
       probeSlots -= 1;
       probed += 1;
-      inflightHosts.add(item.host);
+      inflightHosts.add(item.mutexHost);
       try {
         const result = await searchAdmission(item.candidate.source, {
           fetchPage: input.fetchPage, declaredHosts: input.declaredHosts, signal: input.signal,
@@ -865,7 +881,7 @@ export async function runAdmissionBatch(input: AdmissionBatchInput): Promise<Adm
           compile_diagnostics: [],
         };
       } finally {
-        inflightHosts.delete(item.host);
+        inflightHosts.delete(item.mutexHost);
         releaseWaiters();
       }
     }

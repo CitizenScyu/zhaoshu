@@ -31,8 +31,9 @@ const GOOD_FILES: Record<string, string> = {
   'src/app/api/download/route.ts': 'export const maxDuration = 60;\nexport async function POST() {}\n',
   'src/lib/reader-server.ts': 'const METADATA_TIMEOUT_MS = 15_000;\nconst TEXT_TIMEOUT_MS = 60_000;\n',
   'src/app/api/read/[id]/[resource]/route.ts': 'export const maxDuration = 120;\nexport async function GET() {}\n',
-  'src/lib/source-reader.ts': 'export const SOFT_BUDGET_MS = 45_000;\n',
+  'src/lib/source-reader.ts': 'export const SOFT_BUDGET_MS = 45_000;\nexport const SOURCE_PROBE_BUDGET_MS = 15_000;\n',
   'src/app/api/read/source/[resource]/route.ts': 'export const maxDuration = 60;\nexport async function GET() {}\n',
+  'src/app/api/read/source-probe/route.ts': 'export const maxDuration = 25;\nexport async function GET() {}\n',
   'src/lib/llm.ts': 'export const MODEL_PROBE_TIMEOUT_MS = 30_000;\n',
   'src/app/api/admin/llm/route.ts': 'export const maxDuration = 60;\nexport async function PUT() {}\n',
   'src/lib/find-sse.ts': 'export const FIND_FETCH_TIMEOUT_MS = 290_000;\n',
@@ -244,6 +245,7 @@ describe('check-deploy-config：函数时限', () => {
     ['src/app/api/read/source/[resource]/route.ts', 'src/lib/source-reader.ts', 'SOFT_BUDGET_MS', 60],
     ['src/app/api/admin/llm/route.ts', 'src/lib/llm.ts', 'MODEL_PROBE_TIMEOUT_MS', 60],
     ['src/app/api/find/route.ts', 'src/lib/find-sse.ts', 'FIND_FETCH_TIMEOUT_MS', 295],
+    ['src/app/api/read/source-probe/route.ts', 'src/lib/source-reader.ts', 'SOURCE_PROBE_BUDGET_MS', 25],
   ])('%s 间接消耗的 %s 里的 %s 调到 ≥ maxDuration %is 判红', (route, file, name, seconds) => {
     const source = GOOD_FILES[file].replace(new RegExp(`(const ${name} = )[\\d_]+`), `$1${seconds * 1000}`);
     expect(source).not.toBe(GOOD_FILES[file]);

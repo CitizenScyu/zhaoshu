@@ -29,7 +29,7 @@ const { ensureSchema, getSql, sql, execute, transaction, readTransaction } = vi.
 vi.mock('@/lib/db', () => ({ ensureSchema, getSql }));
 
 import {
-  disableShuyuanSource, enableShuyuanSource, getEngineSources, getReadingPool, getShuyuanCounts,
+  disableShuyuanSource, enableShuyuanSource, getEngineSources, getFanoutPool, getReadingPool, getShuyuanCounts,
   getShuyuanPoolHealth, getShuyuanStats, getReadingSources, refreshShuyuan,
   REFRESH_BUDGET_MS, PROBE_PENDING_PER_REFRESH, RESPONSE_TIMEOUT_MS, SHUYUAN_REFRESH_PARTIAL, ShuyuanRefreshPartialError,
 } from './shuyuan';
@@ -984,6 +984,33 @@ describe('refreshShuyuan atomic refresh', () => {
       await expect(getReadingPool(new AbortController().signal)).resolves.toMatchObject({
         enginePoolSize: 4, poolCandidates: 0,
       });
+    });
+
+    // 41-fanout：扇出候选 = 取书池同一合成与全序，只换截断上限；引擎源不受 READING_ENGINE_SOURCES 约束，
+    // readable 标出「也在取书池里」的源（确认/章节路径只认取书池）。
+    it('getFanoutPool：引擎开关关时仍含准入 ok 的引擎源、readable 只标 builtin；SOURCE_FANOUT_LIMIT 截断并夹上限', async () => {
+      const hosts = ['a.example', 'b.example', 'c.example'];
+      const arrange = () => execute.mockResolvedValueOnce(hosts.map((host) => ({ host })))
+        .mockResolvedValueOnce([{ collections: [] }]).mockResolvedValueOnce([])
+        .mockResolvedValueOnce(hosts.map((host) => engineRowAt(host)));
+      arrange();
+      const pool = await getFanoutPool(new AbortController().signal);
+      expect(pool.map((source) => [source.url, source.tier, source.readable])).toEqual([
+        ['https://book15.net/', 'builtin', true],
+        ['https://a.example/', 'M1', false],
+        ['https://b.example/', 'M1', false],
+        ['https://c.example/', 'M1', false],
+      ]);
+      // 引擎开关开 + 取书池上限 2 ⇒ 前 2 个 readable；扇出上限 3 ⇒ 截掉第 4 个。
+      vi.stubEnv('READING_ENGINE_SOURCES', '1');
+      vi.stubEnv('READING_POOL_LIMIT', '2');
+      vi.stubEnv('SOURCE_FANOUT_LIMIT', '3');
+      arrange();
+      expect((await getFanoutPool(new AbortController().signal)).map((source) => source.readable)).toEqual([true, true, false]);
+      // 误配 999 ⇒ 夹到 MAX 60（此处候选只有 4 个，全出）。
+      vi.stubEnv('SOURCE_FANOUT_LIMIT', '999');
+      arrange();
+      expect(await getFanoutPool(new AbortController().signal)).toHaveLength(4);
     });
 
     it('合成条目的 rules 与 shuyuan_sources.source 深相等；sourceRevision 与 rules_hash 同源（§5.2）', async () => {

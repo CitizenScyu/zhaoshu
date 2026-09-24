@@ -41,7 +41,7 @@ const policies: Record<string, Record<string, 'find' | 'read' | 'download' | 'ow
   'profile/absorb': { GET: 'find', POST: 'find' },
   // F15 残留③：吸收 drain 兜底入口，只由 cron 以 CRON_SECRET 调用（与 download/reclaim 同款）。
   'profile/absorb/drain': { GET: 'cron' },
-  'read/[id]/[resource]': { GET: 'read' }, 'read/source/[resource]': { GET: 'read' },
+  'read/[id]/[resource]': { GET: 'read' }, 'read/source/[resource]': { GET: 'read' }, 'read/source-probe': { GET: 'read' },
   recommendations: { GET: 'find' },
   shelf: { POST: 'find', DELETE: 'find' },
   'shelf/unprocessed': { DELETE: 'find' },

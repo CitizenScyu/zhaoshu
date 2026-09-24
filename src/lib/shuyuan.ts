@@ -196,19 +196,8 @@ export interface ReadingPool {
  * 本函数产出的池序本身不变，仍是 builtin 恒在前。
  */
 export async function getReadingPool(signal: AbortSignal): Promise<ReadingPool> {
-  const s = getSql();
   const limit = readingPoolLimit();
-  // 引擎分支：host 门随池合成刷新（设计 §6.1）。必须排在 readMeta **之前**——readMeta 解析
-  // probeSnapshot 时用 canProbe（= validateSourceUrl 的运行时 host 门）过滤引擎源的探测态；门没刷，
-  // 引擎源的 reachable 结论会被旧门丢弃、排序失真。engineHosts 读失败 ⇒ 不刷门（既有集合原样保留，
-  // fail-closed）且本次降级 builtin-only。开关默认关时完全不碰门、连准入表都不查（零回归 + 省 DB 往返）。
-  // 这条「刷门必须排在 readMeta 之前」的不变量在**刷新路径**同样成立（且更严重）：refreshWithinBudget
-  // 的 readMeta 与探测入队都用 canProbe，冷启动不先刷门会把整批引擎源静默滤出探测队列，见该处注释。
-  const engineOk = engineSourcesEnabled() ? await refreshEngineHostGate(signal) : false;
-  const { states } = readMeta((await storedMeta(s, signal)).collections);
-  const builtin = await builtinReadingSources(s, states, signal);
-  const engine = engineOk ? await engineSourcesIncremental(s, states, signal) : [];
-  const eligible = [...builtin, ...engine];
+  const eligible = await eligibleReadingSources(signal, engineSourcesEnabled());
   // builtin 全部排在引擎源之前（§2.4 首键），故 slice 上限作用在合并序列上即等价于
   // 「先取满 builtin、再按引擎源全序补位」——builtin 永远不会被引擎源挤出池。
   const sources = eligible.slice(0, limit);
@@ -217,6 +206,67 @@ export async function getReadingPool(signal: AbortSignal): Promise<ReadingPool> 
     enginePoolSize: sources.filter((source) => source.tier !== undefined && source.tier !== 'builtin').length,
     poolCandidates: Math.max(0, eligible.length - sources.length),
   };
+}
+
+/**
+ * 入池条件合格、按 §2.4 全序排好的全部源（未截断）：取书池与扇出候选（41-fanout）共用同一份合成与排序，
+ * 二者只差截断上限与是否并入引擎源。includeEngine=false 时完全不碰 host 门、不查准入表（零回归 + 省 DB 往返）。
+ */
+async function eligibleReadingSources(signal: AbortSignal, includeEngine: boolean): Promise<ReadingSource[]> {
+  const s = getSql();
+  // 引擎分支：host 门随池合成刷新（设计 §6.1）。必须排在 readMeta **之前**——readMeta 解析
+  // probeSnapshot 时用 canProbe（= validateSourceUrl 的运行时 host 门）过滤引擎源的探测态；门没刷，
+  // 引擎源的 reachable 结论会被旧门丢弃、排序失真。engineHosts 读失败 ⇒ 不刷门（既有集合原样保留，
+  // fail-closed）且本次降级 builtin-only。开关默认关时完全不碰门、连准入表都不查（零回归 + 省 DB 往返）。
+  // 这条「刷门必须排在 readMeta 之前」的不变量在**刷新路径**同样成立（且更严重）：refreshWithinBudget
+  // 的 readMeta 与探测入队都用 canProbe，冷启动不先刷门会把整批引擎源静默滤出探测队列，见该处注释。
+  const engineOk = includeEngine ? await refreshEngineHostGate(signal) : false;
+  const { states } = readMeta((await storedMeta(s, signal)).collections);
+  const builtin = await builtinReadingSources(s, states, signal);
+  const engine = engineOk ? await engineSourcesIncremental(s, states, signal) : [];
+  return [...builtin, ...engine];
+}
+
+/**
+ * 扇出开关（41-fanout 第一期）：浏览器逐源并发 probe 的服务端入口 `/api/read/source-probe`。
+ * **默认关闭**；只有显式 `1`/`true`/`on` 才开（与 READING_ENGINE_SOURCES 同口径）。关闭时路由返回 404。
+ */
+export function sourceFanoutEnabled(): boolean {
+  const raw = process.env.SOURCE_FANOUT_ENABLED?.trim().toLowerCase();
+  return raw === '1' || raw === 'true' || raw === 'on';
+}
+
+/** 扇出候选上限默认 24（legado-arch-41 C.3），硬上限 60：env 误配不得把一次换源放大成对上百个站的扫描。 */
+export const DEFAULT_SOURCE_FANOUT_LIMIT = 24;
+export const MAX_SOURCE_FANOUT_LIMIT = 60;
+
+/** 扇出候选上限：env `SOURCE_FANOUT_LIMIT`；非法/≤0/缺失回退默认，合法值夹到 MAX。与 READING_POOL_LIMIT 解耦。 */
+export function sourceFanoutLimit(): number {
+  const parsed = Number.parseInt(process.env.SOURCE_FANOUT_LIMIT ?? '', 10);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? Math.min(parsed, MAX_SOURCE_FANOUT_LIMIT) : DEFAULT_SOURCE_FANOUT_LIMIT;
+}
+
+/** 扇出候选：取书池的条目 + readable（该源是否也在当前取书池里——阅读/确认路径只认取书池）。 */
+export interface FanoutSource extends ReadingSource {
+  readable: boolean;
+}
+
+/**
+ * 扇出候选集（41-fanout P1-B 服务端）：builtin + 准入 ok 的引擎源（compile_ok ∧ search_ok IS TRUE，第一期不纳未测源），
+ * 与取书池同一份合成与全序，只把截断上限换成 sourceFanoutLimit()。引擎源**不受** READING_ENGINE_SOURCES 约束
+ * （扇出由 SOURCE_FANOUT_ENABLED 单独把门，调用方先判开关）；为此这里总会按准入表刷一次 host 门——与取书池开引擎源时同一数据源。
+ *
+ * readable：取书池 = 同一序列按 readingPoolLimit() 截断（引擎源关闭时只剩 builtin）。阅读的确认路径（index?book_url=）
+ * 与章节路径按取书池反查源，**不在取书池里的源即便 probe 命中也打不开**——面板须据此区分「可切换」与「仅展示」（见 fanout-41-report §6）。
+ */
+export async function getFanoutPool(signal: AbortSignal): Promise<FanoutSource[]> {
+  const eligible = await eligibleReadingSources(signal, true);
+  const readingLimit = readingPoolLimit();
+  const engineOn = engineSourcesEnabled();
+  return eligible.slice(0, sourceFanoutLimit()).map((source, index) => ({
+    ...source,
+    readable: index < readingLimit && (engineOn || source.tier === 'builtin'),
+  }));
 }
 
 /**

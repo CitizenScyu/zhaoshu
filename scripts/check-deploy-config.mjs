@@ -50,6 +50,8 @@ export const CROSS_FILE_BUDGETS = [
   { route: 'src/app/api/admin/llm/route.ts', file: 'src/lib/llm.ts', name: 'MODEL_PROBE_TIMEOUT_MS' },
   // 前端等 /api/find 流式结果的超时：须短于路由上限，否则平台先掐断连接，前端的超时提示轮不到出现。
   { route: 'src/app/api/find/route.ts', file: 'src/lib/find-sse.ts', name: 'FIND_FETCH_TIMEOUT_MS' },
+  // 41-fanout：单源 probe 的内部墙钟预算，只由 /api/read/source-probe 消耗（路由内另有 20s 总预算）。
+  { route: 'src/app/api/read/source-probe/route.ts', file: 'src/lib/source-reader.ts', name: 'SOURCE_PROBE_BUDGET_MS' },
 ];
 
 const MODEL_BUDGET = { file: 'src/lib/deadline.ts', name: 'MODEL_ROUTE_INTERNAL_BUDGET_MS' };

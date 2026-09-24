@@ -1049,7 +1049,8 @@ describe('source budget primitives: child scopes and openPool (M2-1)', () => {
   });
 
   it('keeps one 350ms pacing series shared by the parent and its children', async () => {
-    // 验收 4：M2 不做每 host 分桶，350ms 节流槽父子共享（沿用并发断言，证明没有按源分桶）。
+    // 验收 4：350ms 节流槽父子共享（同站请求即便分属父/子 context 也排同一队，证明没有按 context 分桶）；
+    // 41-fanout P1-C 起按 host 分桶，异站互不等待的断言见 source-reader-pacing.test.ts。
     vi.mocked(Date.now).mockRestore(); // 本用例需要真实时钟测量槽位间隔
     const starts: number[] = [];
     mocks.fetch.mockImplementation(async () => {
@@ -2283,8 +2284,8 @@ describe('chapter failover M1.1 (41-M1.1)', () => {
     const catalog = await prepareCurrent(pool);
     pages.set(currentChapter, { text: '', status: 404 });
     primeHit(1);
-    // 搜索、详情各「头即到、正文 6s」:搜索等 0.35s 节流槽后起跑，6.35s、12.35s 两次成功，截止时间顺延到
-    // 18.35s、24.35s(不滑动时 12s 就被砍)。正文页卡死：两次尝试都没有进展 ⇒ 在 12.35s + 12s = 24.35s 处放弃。
+    // 搜索、详情各「头即到、正文 6s」:搜索立即起跑(异站不等节流槽，41-fanout P1-C),6s、12s 两次成功，截止时间顺延到
+    // 18s、24s(不滑动时 12s 就被砍)。正文页卡死：两次尝试都没有进展 ⇒ 在 12s + 12s = 24s 处放弃。
     bodyDelay.set(altSearch(1), 6_000);
     bodyDelay.set(pageUrl(601), 6_000);
     bodyDelay.set(chapterUrl(601), Number.POSITIVE_INFINITY);
@@ -2293,7 +2294,7 @@ describe('chapter failover M1.1 (41-M1.1)', () => {
     const part = await readChapter(catalog);
     expect(part).toMatchObject({ text: '备用源2正文', servedFrom: alt(2).name });
     expect(requestedUrls()).toContain(chapterUrl(601)); // A 的目录在顺延后的切片内完成，正文确实发出过
-    expect(requested.find(({ url }) => url === altSearch(2))!.at - t0).toBe(24_350);
+    expect(requested.find(({ url }) => url === altSearch(2))!.at - t0).toBe(24_000);
     expect(oneFailoverLine('success', pool)).toMatchObject({ attempted: 2, reasonCounts: { SOURCE_SCOPE_EXHAUSTED: 1 } });
   });
 
@@ -2367,10 +2368,12 @@ describe('chapter failover M1.1 (41-M1.1)', () => {
     const catalog = await prepareCurrent(pool);
     pages.set(currentChapter, { text: '', status: 404 });
     primeHit(1);
+    // 异站不再等节流槽(41-fanout P1-C):备用源搜索立即发出，让它的响应头迟到，父 signal 在请求在飞时中止。
+    headerDelay.set(altSearch(1), 1_000);
     const controller = new AbortController();
-    setTimeout(() => controller.abort(new Error('parent cancelled')), 100); // 备用源搜索还在节流槽里等
+    setTimeout(() => controller.abort(new Error('parent cancelled')), 100); // 备用源搜索还在飞
     await expect(readChapter(catalog, new service.SourceRequestContext(controller.signal))).rejects.toThrow('parent cancelled');
-    expect(requestedUrls()).toEqual([currentChapter]);
+    expect(requestedUrls()).toEqual([currentChapter, altSearch(1)]);
     expect(oneFailoverLine('timeout', pool)).toMatchObject({ attempted: 1, reasonCounts: {} });
   });
 
@@ -2619,7 +2622,7 @@ describe('chapter failover M1.1 (41-M1.1)', () => {
     }
     const { part, ms } = await readTimed(catalog);
     expect(part).toMatchObject({ text, servedFrom: engineAlt(1).name });
-    expect(ms).toBe(14_750); // 当前源 404 之后等 0.35s 节流槽，再 3×1.2 + 6×1.8
+    expect(ms).toBe(14_400); // 当前源 404 之后异站不等节流槽(41-fanout P1-C),3×1.2 + 6×1.8
   });
 
   it('X2s(P2):最后一个他源的首个请求到 12.6s 才成功(节流 0.35s + apex 卡住 8s + 换 www 0.35s + 正文 3.9s)仍交付 —— 末位候选的基准放宽到「余量 − 8s」', async () => {
@@ -2657,7 +2660,7 @@ describe('chapter failover M1.1 (41-M1.1)', () => {
     });
   });
 
-  it('SLICE:候选 A 连接挂死(两次 3s 连接超时后自己失败)、B 每页 0.8s ⇒ B 在 8.75s 交付(与 440d3fb 相同，不变慢)', async () => {
+  it('SLICE:候选 A 连接挂死(两次 3s 连接超时后自己失败)、B 每页 0.8s ⇒ B 在 8.4s 交付(440d3fb 为 8.75s;异站不再等节流槽，只快不慢)', async () => {
     const hangSource = { url: 'https://hang.test/', name: '挂起源', searchUrl: '/books/search.html?kw={{key}}', rules: {} };
     const pool = [current, hangSource, alt(1)];
     const catalog = await prepareCurrent(pool);
@@ -2667,7 +2670,7 @@ describe('chapter failover M1.1 (41-M1.1)', () => {
     for (const url of [altSearch(1), pageUrl(601), chapterUrl(601)]) headerDelay.set(url, 800);
     const { part, ms } = await readTimed(catalog);
     expect(part).toMatchObject({ text: '备用源1正文', servedFrom: alt(1).name });
-    expect(ms).toBe(8_750);
+    expect(ms).toBe(8_400);
   });
 
   // ---- 41-M1.2 复审小修：滑动顺延的上限 until 与给兜底预留的 8s(reserve)——「慢源吃不光预算、兜底一定轮得到」----
