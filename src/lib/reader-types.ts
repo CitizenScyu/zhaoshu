@@ -1,6 +1,6 @@
 /** TXT byte ranges are UTF-8, with an exclusive end. Online directory sizes are unknown (0). */
 export type ReadingSession = { kind: 'download'; taskId: number }
-  | { kind: 'source'; title: string; author: string; bookUrl?: string };
+  | { kind: 'source'; title: string; author: string; bookUrl?: string; sourceUrl?: string };
 
 export type ReaderOrigin = 'library' | 'shelf' | 'find';
 

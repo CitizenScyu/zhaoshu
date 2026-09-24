@@ -16,7 +16,14 @@ export function readerIndexUrl(session: ReadingSession): string {
   const query = new URLSearchParams({ title: session.title, author: session.author });
   // 模糊候选点选后的确认重放：book_url 告诉服务端这是用户已确认的详情页。
   if (session.bookUrl) query.set('book_url', session.bookUrl);
+  // 扇出面板确认时带上源 url（41-fanfix N10）：服务端按源精确定位规则；只能与 book_url 同用，否则 400。
+  if (session.bookUrl && session.sourceUrl) query.set('source', session.sourceUrl);
   return '/api/read/source/index?' + query;
+}
+
+/** 换源确认的目录请求：book_url 必带，source（扇出面板命中行的 sourceUrl）有则带。 */
+export function confirmedIndexUrl(title: string, author: string, bookUrl: string, sourceUrl?: string): string {
+  return readerIndexUrl({ kind: 'source', title, author, bookUrl, ...(sourceUrl ? { sourceUrl } : {}) });
 }
 
 export function readerChapterUrl(index: ReaderIndex, position: ReadingPosition): string {

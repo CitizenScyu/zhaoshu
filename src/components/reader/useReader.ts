@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import type { ReaderIndex, ReaderPart, ReadingSession } from '@/lib/reader-types';
-import { readerChapterUrl, readerIndexUrl, readerPartMatches, switchedReaderIndex, switchedReaderPart } from '@/lib/reader-session';
+import { confirmedIndexUrl, readerChapterUrl, readerIndexUrl, readerPartMatches, switchedReaderIndex, switchedReaderPart } from '@/lib/reader-session';
 import { ReaderPartCache, nextReadingPosition, previousReadingPosition } from '@/lib/reader-part-cache';
 import { captureTextAnchor, restoreTextAnchor } from '@/lib/reader-text-anchor';
 import { catalogPrefixKey, migrateProgressAcrossSources, parseReaderSettings, parseReadingProgress, readingPercent, READER_SETTINGS_KEY } from '@/lib/reader-preferences';
@@ -94,9 +94,10 @@ export function useReader(session: ReadingSession, apiFetch: ApiFetch, userId: n
   // M3 复审 P1-3:目录加载成功后,回调 UI 层把 book_url 持久化进 URL(失败不写)。
   // ref 留在 hook 内部维护:直接把它交出去让 UI 层写 .current 会被
   // react-hooks(lint)的 React Compiler 规则判 error(hook 返回值不可变)。
-  const onSwitchCommitted = useRef<((bookUrl: string | undefined) => void) | null>(null);
+  // 41-panel:扇出面板确认还带 sourceUrl(源 url),与 book_url 一起落 URL,刷新后仍按该源规则建目录。
+  const onSwitchCommitted = useRef<((bookUrl: string | undefined, sourceUrl?: string) => void) | null>(null);
   const registerSwitchCommitted = useCallback(
-    (handler: ((bookUrl: string | undefined) => void) | null) => { onSwitchCommitted.current = handler; },
+    (handler: ((bookUrl: string | undefined, sourceUrl?: string) => void) | null) => { onSwitchCommitted.current = handler; },
     [],
   );
 
@@ -231,6 +232,11 @@ export function useReader(session: ReadingSession, apiFetch: ApiFetch, userId: n
     if (session.kind !== 'source') return undefined;
     return new URLSearchParams(indexUrl.split('?')[1] ?? '').get('book_url') ?? undefined;
   }, [session.kind, indexUrl]);
+  /** 41-panel:与 switchedBookUrl 同源同口径,取 indexUrl 里的 source(扇出面板确认才有)。 */
+  const switchedSourceUrl = useCallback(() => {
+    if (session.kind !== 'source') return undefined;
+    return new URLSearchParams(indexUrl.split('?')[1] ?? '').get('source') ?? undefined;
+  }, [session.kind, indexUrl]);
 
   const fail = useCallback((error: unknown, target?: ReadingPosition, direction?: 'next' | 'previous') => {
     const status = error instanceof RequestError ? error.status : 0;
@@ -318,7 +324,7 @@ export function useReader(session: ReadingSession, apiFetch: ApiFetch, userId: n
       migrationNotice.current = null;
       setNotice(notice ?? (saved ? '已回到上次阅读的位置' : ''));
       // M3 复审 P1-3:目录与首段都拿到才算换源成功,此时才把 book_url 持久化进 URL。
-      onSwitchCommitted.current?.(switchedBookUrl());
+      onSwitchCommitted.current?.(switchedBookUrl(), switchedSourceUrl());
     } catch (error) {
       // M3 复审 P2:失败路径也要清掉暂存的迁移进度 —— 否则下一次 loadIndex(重试)
       // 会把一次已经失败的换源进度再迁移一遍;且失败时 URL 不变(见 switchSource 注释)。
@@ -328,17 +334,18 @@ export function useReader(session: ReadingSession, apiFetch: ApiFetch, userId: n
       if (request.current === controller) request.current = null;
       if (!controller.signal.aborted && id === serial.current) setLoading(false);
     }
-  }, [apiFetch, indexUrl, beginRequest, adoptSwitch, cache, fail, flushPosition, progressKeyFor, switchedBookUrl]);
+  }, [apiFetch, indexUrl, beginRequest, adoptSwitch, cache, fail, flushPosition, progressKeyFor, switchedBookUrl, switchedSourceUrl]);
 
   // 模糊候选点选后的确认重放：换 bookUrl 重载目录（server 端跳过书名/作者匹配）。
-  const loadConfirmedBook = useCallback((bookUrl: string) => {
+  // 41-panel:扇出面板的确认必须带 sourceUrl(服务端按源 url 精确定位规则,同站多源时不再按 host 反查)。
+  const loadConfirmedBook = useCallback((bookUrl: string, sourceUrl?: string) => {
     if (session.kind !== 'source' || !bookUrl) return;
     flushPosition();
     const current = currentReading.current;
     if (current?.index.source && progress.current) {
       pendingMigration.current = { progress: progress.current, fromIndex: current.index };
     }
-    setIndexUrl('/api/read/source/index?' + new URLSearchParams({ title: session.title, author: session.author, book_url: bookUrl }));
+    setIndexUrl(confirmedIndexUrl(session.title, session.author, bookUrl, sourceUrl));
   }, [session, flushPosition]);
 
   useEffect(() => {
@@ -557,7 +564,7 @@ export function useReader(session: ReadingSession, apiFetch: ApiFetch, userId: n
   return {
     settings, reading, activePart, loading, flowing, failure, percent, notice, storageFailed, focused,
     scroller, article, heading, onScroll, updateSettings, setFocusMode, navigate, extend, retry,
-    markScrollIntent, loadConfirmedBook, switchedBookUrl,
+    markScrollIntent, loadConfirmedBook, switchedBookUrl, switchedSourceUrl,
     /**
      * M3 复审 P1-3:注册「目录加载成功」回调,供 UI 层在成功后才写 book_url 进 URL。
      * 返回的是注册函数(稳定引用),不是裸 ref —— 直接写 hook 返回的 ref 会被
