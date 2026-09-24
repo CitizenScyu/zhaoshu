@@ -111,6 +111,22 @@ describe('download and source reading sessions', () => {
     expect(switchedReaderIndex(online, bare).chapters).toBe(online.chapters);
   });
 
+  // 41-srcurl:换源面板按 index.source.sourceUrl 认当前源;章内换源后它必须跟到新源,不能留旧源的。
+  it('章内换源:sourceUrl 跟到 part.servedFromUrl;换源段没带(旧服务端)时去掉旧源的 sourceUrl', () => {
+    const newSession = 'd'.repeat(40);
+    const withUrl: ReaderIndex = { ...online, source: { ...online.source!, sourceUrl: 'https://book15.net/' } };
+    const switchedPart: ReaderPart = {
+      ...position, taskId: null, sourceId: 'source-two', servedFrom: '备用源', servedFromUrl: 'https://backup.test/',
+      version: newSession, sourceSession: newSession, partCount: 1, title: '第一章', text: '正文', startByte: 0, endByte: 6,
+    };
+    expect(switchedReaderIndex(withUrl, switchedPart).source)
+      .toEqual({ ...withUrl.source, id: 'source-two', session: newSession, sourceUrl: 'https://backup.test/' });
+    const adopted = switchedReaderIndex(withUrl, { ...switchedPart, servedFromUrl: undefined });
+    expect(adopted.source).not.toHaveProperty('sourceUrl');
+    // 原 index 不被改写(switchedReaderIndex 是纯函数)。
+    expect(withUrl.source!.sourceUrl).toBe('https://book15.net/');
+  });
+
   // H7 小修 U4a:交付段改记新目录序号时,标题也必须改记为**新目录 at 章标题** —— 否则段的
   // (标题, 序号)分属两套目录:序号已是新目录的,标题还是旧目录的,跨目录比对可能自相矛盾。
   it('H7 U4a:switchedReaderPart 把交付段的标题一并改记为新目录 at 章标题(序号与标题同属新目录)', () => {

@@ -14,7 +14,8 @@ type ApiFetch = (input: RequestInfo | URL, init?: RequestInit) => Promise<Respon
 /** 前端同时在飞的单源 probe 上限;服务端灰度建议 ≤6,这里留余量给同页的章节/预取请求。 */
 export const SOURCE_PROBE_CONCURRENCY = 4;
 
-export interface FanoutCandidate { url: string; name: string; tier: string; readable: boolean }
+/** hostKey:服务端归一后的站键(book15 apex/www 同键);旧服务端不带,前端退回 hostname。 */
+export interface FanoutCandidate { url: string; name: string; tier: string; readable: boolean; hostKey?: string }
 
 export type FanoutRow = FanoutCandidate & (
   | { state: 'pending' | 'probing' | 'skipped' | 'current' }
@@ -24,7 +25,7 @@ export type FanoutRow = FanoutCandidate & (
 
 /**
  * loading:取候选中;disabled:扇出未开(退回旧面板);running/done:扫描中/结束;
- * rate_limited:429 停发(retryAfter 秒);unavailable:503 限流计数不可用;error:候选列表拿不到或鉴权失败。
+ * rate_limited:429 停发(retryAfter 秒);unavailable:单源 probe 503(限流计数不可用)停发;error:候选列表拿不到或鉴权失败。
  */
 export type FanoutPhase = 'loading' | 'disabled' | 'running' | 'done' | 'rate_limited' | 'unavailable' | 'error';
 
@@ -40,6 +41,18 @@ type Outcome =
   | { kind: 'aborted' };
 
 const INITIAL: FanoutState = { phase: 'loading', rows: [], retryAfter: null, message: '' };
+
+/** 正在供稿的源:url = 源 url(目录的 source.sourceUrl / 段的 servedFromUrl),name = 源名;旧服务端不带 url。 */
+export interface ServingSource { name?: string; url?: string }
+
+/**
+ * 候选是不是当前源(41-srcurl):有源 url 就按 url 精确比对 —— 同名不同 url 的两个源不再被一起当成当前源;
+ * 没有 url(未升级的服务端)才退回按源名比对(与旧面板兜底同口径)。
+ */
+export function isCurrentSource(candidate: { url: string; name: string }, current: ServingSource | undefined): boolean {
+  if (current?.url) return candidate.url === current.url;
+  return !!current?.name && candidate.name === current.name;
+}
 
 export function probeCacheKey(title: string, author: string, sourceUrl: string): string {
   return JSON.stringify([title, author, sourceUrl]);
@@ -73,6 +86,7 @@ function parseCandidates(data: unknown): FanoutCandidate[] | null {
     list.push({
       url: item.url, name: typeof item.name === 'string' && item.name ? item.name : item.url,
       tier: typeof item.tier === 'string' ? item.tier : 'builtin', readable: item.readable === true,
+      ...(typeof item.hostKey === 'string' && item.hostKey ? { hostKey: item.hostKey } : {}),
     });
   }
   return list;
@@ -121,15 +135,15 @@ async function probeOne(apiFetch: ApiFetch, title: string, author: string, sourc
  * 换源扇出:挂载即取候选并逐源 probe;卸载(关面板)即 abort 全部在途请求。
  * rescan() 只重测没有定论的行(超时/失败/未测),已有结果的行复用 cache,不重复计数。
  */
-export function useSourceFanout({ apiFetch, title, author, currentSourceName, cache }: {
-  apiFetch: ApiFetch; title: string; author: string; currentSourceName?: string; cache: ProbeCache;
+export function useSourceFanout({ apiFetch, title, author, currentSource, cache }: {
+  apiFetch: ApiFetch; title: string; author: string; currentSource?: ServingSource; cache: ProbeCache;
 }) {
   const [state, setState] = useState<FanoutState>(INITIAL);
   const [generation, setGeneration] = useState(0);
   // 当前源只在一次扫描开始时读:它不必 probe(已在读),变化也不应让在飞的扫描重来。
-  // 按源名比对:阅读目录的 source.url 是书的详情页(sourceReaderIndex 填 bookUrl),不是源 url,见报告「契约缺口」。
-  const current = useRef(currentSourceName);
-  useEffect(() => { current.current = currentSourceName; }, [currentSourceName]);
+  // 按源 url 精确比对(目录 source.sourceUrl / 段 servedFromUrl),缺失时退回源名,见 isCurrentSource。
+  const current = useRef(currentSource);
+  useEffect(() => { current.current = currentSource; }, [currentSource]);
 
   const scan = useCallback(async (signal: AbortSignal) => {
     const set = (update: (previous: FanoutState) => FanoutState) => { if (!signal.aborted) setState(update); };
@@ -145,7 +159,7 @@ export function useSourceFanout({ apiFetch, title, author, currentSourceName, ca
     if (signal.aborted) return;
     // 404 SOURCE_FANOUT_DISABLED(开关关)或旧部署没有这条路由:都退回旧面板,不当错误提示。
     if (res.status === 404) { set(() => ({ ...INITIAL, phase: 'disabled' })); return; }
-    if (res.status === 503) { set(() => ({ ...INITIAL, phase: 'unavailable', message: '换源探测暂时不可用,请稍后再试。' })); return; }
+    // 候选列表不计限流(路由只在带 source 的 probe 上查限流),不会有 503 限流不可用;网关/平台的 5xx 一律走 error。
     const candidates = res.ok ? parseCandidates(data) : null;
     if (!candidates) { set(() => ({ ...INITIAL, phase: 'error', message: errorText(data, '换源候选加载失败,请重试。') })); return; }
 
@@ -153,7 +167,7 @@ export function useSourceFanout({ apiFetch, title, author, currentSourceName, ca
     const rows: FanoutRow[] = candidates.map((source) => {
       const cached = cache.get(probeCacheKey(title, author, source.url));
       if (cached) return { ...source, state: 'done', result: cached };
-      return { ...source, state: exclude && source.name === exclude ? 'current' : 'pending' };
+      return { ...source, state: isCurrentSource(source, exclude) ? 'current' : 'pending' };
     });
     set(() => ({ phase: 'running', rows, retryAfter: null, message: '' }));
     const patch = (url: string, row: (source: FanoutCandidate) => FanoutRow) => set((previous) => ({
@@ -169,8 +183,8 @@ export function useSourceFanout({ apiFetch, title, author, currentSourceName, ca
         if (signal.aborted || (stop && active === 0)) { resolve(); return; }
         for (let i = 0; !stop && i < queue.length && active < SOURCE_PROBE_CONCURRENCY;) {
           const source = queue[i];
-          const host = hostOf(source.url);
-          // 同 host 的候选排在前一个之后发,不同时在飞(跨实例的服务端节流不共享)。
+          const host = source.hostKey || hostOf(source.url);
+          // 同站(服务端站键,缺失时按 hostname)的候选排在前一个之后发,不同时在飞(跨实例的服务端节流不共享)。
           if (host && busyHosts.has(host)) { i++; continue; }
           queue.splice(i, 1);
           active++;

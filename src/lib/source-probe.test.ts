@@ -319,17 +319,28 @@ describe('GET /api/read/source-probe', () => {
     expect((await call('', null)).status).toBe(401);
   });
 
-  it('无 source 参数 ⇒ 候选列表(url/name/tier/readable)与上限', async () => {
+  it('无 source 参数 ⇒ 候选列表(url/name/tier/readable/hostKey)与上限', async () => {
     const res = await call('');
     expect(res.status).toBe(200);
     expect(res.headers.get('Cache-Control')).toBe('private, no-store');
     expect(await res.json()).toEqual({
       limit: 24,
       sources: [
-        { url: book15.url, name: book15.name, tier: 'builtin', readable: true },
-        { url: E1.url, name: E1.name, tier: 'M1', readable: false },
+        { url: book15.url, name: book15.name, tier: 'builtin', readable: true, hostKey: 'book15.net' },
+        { url: E1.url, name: E1.name, tier: 'M1', readable: false, hostKey: 'e1.test' },
       ],
     });
+  });
+
+  it('候选 hostKey 与服务端节流同一站键:book15 apex/www 同键;节流回滚开关(=0)不把它变成全局 *', async () => {
+    mocks.pool.mockResolvedValue([
+      { ...book15, readable: true },
+      { ...book15, url: 'https://www.book15.net/', name: 'book15 www', readable: true },
+      { ...E1, readable: true },
+    ]);
+    vi.stubEnv('SOURCE_THROTTLE_PER_HOST', '0');
+    const { sources } = await (await call('')).json() as { sources: { url: string; hostKey: string }[] };
+    expect(sources.map((item) => item.hostKey)).toEqual(['book15.net', 'book15.net', 'e1.test']);
   });
 
   it('单源 probe:readable=false 的引擎源命中 ⇒ 200 + status unreadable(found=ok,book 保留供展示);一次只打这一个源', async () => {

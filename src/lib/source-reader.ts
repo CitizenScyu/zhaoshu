@@ -131,6 +131,15 @@ interface SharedSourceBudget {
  */
 export function sourceThrottleKey(url: string, env: SourceTuningEnv = process.env): string {
   if (env.SOURCE_THROTTLE_PER_HOST === '0') return '*';
+  return sourceStationKey(url);
+}
+
+/**
+ * 站键：hostname，同站备用 host 归一到同一个（节流分桶的按站部分）。扇出候选列表把它作为 hostKey 下发，
+ * 浏览器据此做同站串行（41-srcurl）；不含 SOURCE_THROTTLE_PER_HOST=0 的全局单槽回滚 —— 那是服务端节流的
+ * 回滚开关，下发成 '*' 会让浏览器把整轮扇出串成单发。
+ */
+export function sourceStationKey(url: string): string {
   const hostname = hostnameOf(url);
   const alternate = alternateSourceHost(hostname);
   return alternate && alternate < hostname ? alternate : hostname;
@@ -849,7 +858,8 @@ export async function saveSourceCatalog(catalog: SourceCatalog, signal: AbortSig
 export function sourceReaderIndex(catalog: SourceCatalog): ReaderIndex {
   const index: ReaderIndex = {
     taskId: null, title: catalog.title, author: catalog.author, version: catalog.version, totalBytes: 0,
-    source: { id: catalog.sourceId, name: catalog.sourceName, url: catalog.bookUrl, session: catalog.version },
+    // url 是书详情页(既有语义);sourceUrl 才是源 url,换源面板据此精确认当前源(41-srcurl)。
+    source: { id: catalog.sourceId, name: catalog.sourceName, url: catalog.bookUrl, sourceUrl: catalog.sourceUrl, session: catalog.version },
     chapters: catalog.chapters.map((chapter, index) => ({ index, title: chapter.title, startByte: 0, endByte: 0, partCount: 1 })),
   };
   if (Buffer.byteLength(JSON.stringify(index), 'utf8') > 4 * 1024 * 1024) {
@@ -876,7 +886,7 @@ async function loadSourceCatalog(session: string, context: SourceRequestContext)
   return { catalog, source, sources };
 }
 
-const chapterCache = new Map<string, { text: string; servedFrom: string; expires: number; bytes: number }>();
+const chapterCache = new Map<string, { text: string; servedFrom: string; servedFromUrl: string; expires: number; bytes: number }>();
 let cacheBytes = 0;
 
 /** 目录加载时随 catalog 一起带出的源归属（N01）：按 builtin/engine 分派正文提取。 */
@@ -1200,12 +1210,12 @@ async function chapterText(
   return text;
 }
 
-function remember(key: string, text: string, servedFrom: string) {
+function remember(key: string, text: string, servedFrom: string, servedFromUrl: string) {
   const old = chapterCache.get(key);
   if (old) cacheBytes -= old.bytes;
   chapterCache.delete(key);
   const bytes = Buffer.byteLength(text, 'utf8');
-  chapterCache.set(key, { text, servedFrom, expires: Date.now() + CHAPTER_CACHE_MS, bytes });
+  chapterCache.set(key, { text, servedFrom, servedFromUrl, expires: Date.now() + CHAPTER_CACHE_MS, bytes });
   cacheBytes += bytes;
   while (chapterCache.size > MAX_CACHE_CHAPTERS || cacheBytes > MAX_CACHE_BYTES) {
     const oldest = chapterCache.keys().next().value!;
@@ -1223,6 +1233,8 @@ export async function readSourceChapter(session: string, chapterIndex: number, c
   const cached = chapterCache.get(key);
   let text = cached && cached.expires > Date.now() ? cached.text : '';
   let servedFrom = cached && cached.expires > Date.now() ? cached.servedFrom : (source?.name ?? catalog.sourceName);
+  // 与 servedFrom 成对的源 url(41-srcurl):换源面板按它精确认当前源,同名不同 url 的源不再被一起当成当前源。
+  let servedFromUrl = cached && cached.expires > Date.now() ? cached.servedFromUrl : (source?.url ?? catalog.sourceUrl);
   // 洞 1:当前源身份失效(池中已无同 URL 版本或源被停用)时不再抛 409,直接进换源;
   // 洞 2:换源成功即把本返回值换成新源的 version/sourceId,并带出新源目录会话 sourceSession。
   let switched: Awaited<ReturnType<typeof switchSourceChapter>> | null = null;
@@ -1234,6 +1246,7 @@ export async function readSourceChapter(session: string, chapterIndex: number, c
     switched = await switchSourceChapter(catalog, chapter, chapterIndex, context, sources, 'SOURCE_CHANGED');
     text = switched.text;
     servedFrom = switched.sourceName;
+    servedFromUrl = switched.sourceUrl;
   } else {
     try {
       // 当前源正文走按进展滑动的切片(41-M1.2):死源卡住 12s 没有进展就放弃、进换源,不再靠 8s 单请求超时 ×
@@ -1252,11 +1265,12 @@ export async function readSourceChapter(session: string, chapterIndex: number, c
       switched = await switchSourceChapter(catalog, chapter, chapterIndex, context, sources, failureCode(error));
       text = switched.text;
       servedFrom = switched.sourceName;
+      servedFromUrl = switched.sourceUrl;
     }
   }
-  remember(key, text, servedFrom);
+  remember(key, text, servedFrom, servedFromUrl);
   return {
-    taskId: null, sourceId: switched?.sourceId ?? catalog.sourceId, servedFrom,
+    taskId: null, sourceId: switched?.sourceId ?? catalog.sourceId, servedFrom, servedFromUrl,
     version: switched?.version ?? catalog.version,
     // 洞 2:换源成功时带出新源的目录会话版本,前端据此改用新源会话续读(不再每章从故障原源重试;
     // 新旧目录序号可能不同,阅读位置按标题迁移由前端负责)。未换源时省略,响应体与既有逐字相同。

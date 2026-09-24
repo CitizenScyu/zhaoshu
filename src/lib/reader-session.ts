@@ -45,10 +45,14 @@ export function readerChapterUrl(index: ReaderIndex, position: ReadingPosition):
 export function switchedReaderIndex(index: ReaderIndex, part: ReaderPart): ReaderIndex {
   if (!index.source || !part.sourceSession || part.sourceSession === index.source.session) return index;
   const chapters = catalogOf(part);
+  const source = { ...index.source, session: part.sourceSession, ...(part.sourceId ? { id: part.sourceId } : {}) };
+  // 源 url 跟到新源(41-srcurl);换源响应没带(旧服务端)时去掉旧源的,免得换源面板把旧源认成当前源。
+  if (part.servedFromUrl) source.sourceUrl = part.servedFromUrl;
+  else delete source.sourceUrl;
   return {
     ...index,
     version: part.version,
-    source: { ...index.source, session: part.sourceSession, ...(part.sourceId ? { id: part.sourceId } : {}) },
+    source,
     ...(chapters ? { chapters } : {}),
   };
 }

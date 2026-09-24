@@ -18,8 +18,8 @@ import { DEFAULT_READER_SETTINGS, indexProgressKey } from '@/lib/reader-preferen
 import type { ReaderSettings, ReaderTheme, ReadingPosition } from '@/lib/reader-preferences';
 import { useReader, partKey } from './useReader';
 import FeedbackPrompt from './FeedbackPrompt';
-import { useSourceFanout } from './useSourceFanout';
-import type { FanoutRow, ProbeCache } from './useSourceFanout';
+import { isCurrentSource, useSourceFanout } from './useSourceFanout';
+import type { FanoutRow, ProbeCache, ServingSource } from './useSourceFanout';
 import { nextReadingPosition, previousReadingPosition } from '@/lib/reader-part-cache';
 import styles from './reader.module.css';
 
@@ -118,6 +118,11 @@ function ReaderSession({ session, from }: Props) {
   const tap = useRef<{ x: number; y: number; time: number } | null>(null);
   const chapter = activePart?.chapterIndex ?? 0;
   const chapters = reading?.index.chapters ?? [];
+  // 正在供稿的源:段上的源名与源 url 成对取(章内换源后是新源);还没有段时取目录的。
+  // 段只带源名(旧服务端)时 url 留空 ⇒ 面板按源名认,不拿目录上可能已过时的 url 去配。
+  const servingSource: ServingSource | undefined = activePart?.servedFrom
+    ? { name: activePart.servedFrom, url: activePart.servedFromUrl }
+    : reading?.index.source && { name: reading.index.source.name, url: reading.index.source.sourceUrl };
   const first = reading?.parts[0];
   const last = reading?.parts[reading.parts.length - 1];
   const before = reading && first ? previousReadingPosition(reading.index, first) : null;
@@ -385,7 +390,7 @@ function ReaderSession({ session, from }: Props) {
             author={session.author}
             session={reading?.index.source?.session}
             currentSourceName={reading?.index.source?.name}
-            servingSourceName={activePart?.servedFrom || reading?.index.source?.name}
+            servingSource={servingSource}
             probeCache={probeCache}
             onSwitch={switchSource}
           />
@@ -476,8 +481,8 @@ const SOURCE_STATUS_TEXT: Record<SourceAlternateStatus['status'], string> = {
 type SourcePanelProps = {
   apiFetch: (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
   title: string; author: string; session?: string; currentSourceName?: string;
-  /** 正在供稿的源名(章内换源后是新源,取 part.servedFrom);扇出面板据此标「当前源」。 */
-  servingSourceName?: string;
+  /** 正在供稿的源(章内换源后是新源,取 part 的 servedFrom/servedFromUrl);扇出面板据此标「当前源」。 */
+  servingSource?: ServingSource;
   probeCache: ProbeCache;
   onSwitch: (bookUrl: string, sourceUrl?: string) => void;
 };
@@ -487,10 +492,10 @@ type SourcePanelProps = {
  * 旧面板以当前源 session 为 key(MS-29:源会话一变就重挂重检);扇出面板不随 session 重挂 ——
  * 重挂会把已计数的 probe 再发一遍,当前源标记改由 servingSourceName 实时判定。
  */
-function SourcePanel({ probeCache, servingSourceName, ...props }: SourcePanelProps) {
-  const fanout = useSourceFanout({ apiFetch: props.apiFetch, title: props.title, author: props.author, currentSourceName: servingSourceName, cache: probeCache });
+function SourcePanel({ probeCache, servingSource, ...props }: SourcePanelProps) {
+  const fanout = useSourceFanout({ apiFetch: props.apiFetch, title: props.title, author: props.author, currentSource: servingSource, cache: probeCache });
   if (fanout.phase === 'disabled') return <LegacySourcePanel key={props.session} {...props} />;
-  return <FanoutSourcePanel fanout={fanout} title={props.title} currentSourceName={servingSourceName} onSwitch={props.onSwitch} />;
+  return <FanoutSourcePanel fanout={fanout} title={props.title} currentSource={servingSource} onSwitch={props.onSwitch} />;
 }
 
 // 单源 probe 九种结论的用户文案(ok 行展示书名/章数,不用这里的文案);不认识的状态走兜底文案且不可切换。
@@ -518,8 +523,8 @@ function probeDetail(row: FanoutRow, title: string): string {
   return found ? `${text}(${probeBookText(found, title)})` : text;
 }
 
-function FanoutSourcePanel({ fanout, title, currentSourceName, onSwitch }: {
-  fanout: ReturnType<typeof useSourceFanout>; title: string; currentSourceName?: string;
+function FanoutSourcePanel({ fanout, title, currentSource, onSwitch }: {
+  fanout: ReturnType<typeof useSourceFanout>; title: string; currentSource?: ServingSource;
   onSwitch: (bookUrl: string, sourceUrl?: string) => void;
 }) {
   const { phase, rows, retryAfter, message, rescan } = fanout;
@@ -538,7 +543,7 @@ function FanoutSourcePanel({ fanout, title, currentSourceName, onSwitch }: {
       {rows.length > 0 && <p className={styles.sourcesNote} role="status">已检测 {settled} / {rows.length}</p>}
       {rows.length > 0 && <ul className={styles.sourceList}>
         {rows.map((row) => {
-          const current = !!currentSourceName && row.name === currentSourceName;
+          const current = isCurrentSource(row, currentSource);
           const result = row.state === 'done' ? row.result : null;
           // 只有 readable 的 ok / similar 可切换;unreadable 与任何不认识的状态一律仅展示。
           const switchable = !!result && result.readable && !current;
@@ -564,7 +569,7 @@ function FanoutSourcePanel({ fanout, title, currentSourceName, onSwitch }: {
 }
 
 /** 旧换源面板(设计 §4,扇出未开时的回退):打开即检测,一次会话内默认只自动检测一次;「重新检测」手动刷新。 */
-function LegacySourcePanel({ apiFetch, title, author, session: catalogSession, currentSourceName, onSwitch }: Omit<SourcePanelProps, 'probeCache' | 'servingSourceName'>) {
+function LegacySourcePanel({ apiFetch, title, author, session: catalogSession, currentSourceName, onSwitch }: Omit<SourcePanelProps, 'probeCache' | 'servingSource'>) {
   const [sources, setSources] = useState<SourceAlternateStatus[] | null>(null);
   const [partial, setPartial] = useState(false);
   const [error, setError] = useState('');
