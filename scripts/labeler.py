@@ -30,6 +30,7 @@ import os
 import re
 import sys
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
@@ -857,6 +858,32 @@ def fetch_book_text_engine(engine_cli, book_url: str,
     return '\n\n'.join(parts), chars
 
 
+# ---- 每轮失败分类（labelerdiag41 P3：巡检要一眼分出是代码缺陷、LLM 渠道还是书源问题）----
+# 旧口径只有「成功 N / 失败 M」，诊断时得逐本翻 gate.log 归类。main 每记一次失败就归一类，
+# 轮末在「完成」行之后单独打一行分类计数（「完成」行逐字不变，门卫按它解析）。
+def classify_failure(error: BaseException) -> str:
+    """主循环 except 捕获的异常 → 失败类别（只看类型与消息，不含任何凭据）。"""
+    msg = str(error)
+    if isinstance(error, EngineIdentityMismatch):
+        return '目录作者不符' if '作者不符' in msg else '目录标题不符'
+    # 先于 JSON 判：模型链耗尽的消息里常带「最后错误: Unterminated string…」
+    if '模型链' in msg and '耗尽' in msg:
+        return 'LLM链耗尽'
+    if isinstance(error, (json.JSONDecodeError, UnicodeDecodeError)):
+        return '引擎输出截断'
+    if 'HTTPS' in msg:
+        return '非HTTPS源'
+    if isinstance(error, TimeoutError) or 'timed out' in msg.lower() or '超时' in msg:
+        return '书源超时'
+    return '其他'
+
+
+def format_failure_kinds(kinds: dict) -> str:
+    """{类别: 次数} → 「失败分类: A 3 / B 1」（按次数降序，同数按类别名）。"""
+    items = sorted(((k, v) for k, v in kinds.items() if v), key=lambda kv: (-kv[1], kv[0]))
+    return '失败分类: ' + ' / '.join(f'{k} {v}' for k, v in items)
+
+
 def _build_engine_cli(env: dict):
     """按 .env 装配并探测 EngineCli；开关关闭/配置缺失/探针失败 → 返回 None。
 
@@ -896,6 +923,162 @@ MERGE_PROMPT_SUFFIX = (
 
 MODEL_RETRY = 2            # 打标时每个模型最多尝试次数
 
+# ---- LLM 输出预算与失败归因（llmchan41 §4）----
+# glm-5.3-agent 坏 JSON 的大头：思考段把 max_tokens=1800 吃光，可见 JSON 截在中途（网关
+# completion_tokens 成片恰好 1800）；另有上游秒回空（char 0）。所以：预算提到 6000 且可按模型覆盖；
+# content 空时从 reasoning_content 兜底取 JSON；截断/空回单独报错并直接换模型（同模型同预算重试
+# 大概率同样结果）；非 2xx 把脱敏截断后的响应体写进日志（此前只有「HTTP Error 400: Bad Request」）。
+DEFAULT_MAX_TOKENS = 6000
+MAX_TOKENS_ENV = 'LABELER_MAX_TOKENS'
+HTTP_BODY_SUMMARY_CHARS = 200
+
+
+class LlmOutputTruncated(RuntimeError):
+    """输出触顶 max_tokens（finish_reason=length 或 completion_tokens≥上限）且拿不到完整 JSON。"""
+
+
+class LlmEmptyReply(RuntimeError):
+    """上游空回：content 为空，reasoning_content 里也没有可用 JSON，且未触顶。"""
+
+
+def resolve_max_tokens(env: dict | None = None) -> dict:
+    """LABELER_MAX_TOKENS → {'*': 默认上限, 模型名: 覆盖}。
+
+    写法：「6000」或「6000,glm-5.3-agent=12000」（逗号分隔，裸数字=默认，模型=数字=覆盖）。
+    非正整数的项忽略并告警，绝不因一个配置项拖垮整轮；缺省 DEFAULT_MAX_TOKENS。"""
+    cfg = {'*': DEFAULT_MAX_TOKENS}
+    raw = str((env or {}).get(MAX_TOKENS_ENV) or '').strip()
+    for item in (p.strip() for p in raw.split(',')):
+        if not item:
+            continue
+        model, _, value = item.rpartition('=')
+        try:
+            limit = int(value.strip())
+        except ValueError:
+            limit = 0
+        if limit <= 0:
+            print(f'  提示: {MAX_TOKENS_ENV} 项「{item}」不是正整数，已忽略', file=sys.stderr)
+            continue
+        cfg[model.strip() or '*'] = limit
+    return cfg
+
+
+def max_tokens_for(model: str, cfg: dict | None) -> int:
+    cfg = cfg or {}
+    return cfg.get(model) or cfg.get('*') or DEFAULT_MAX_TOKENS
+
+
+def _redact(text: str, secrets: tuple = ()) -> str:
+    """日志脱敏：已知秘密原值、URL、Bearer 令牌、sk- 形态密钥一律抹掉。"""
+    for secret in secrets:
+        if secret:
+            text = text.replace(secret, '[redacted]')
+    text = re.sub(r'\S*://\S*', '[redacted-url]', text)
+    text = re.sub(r'(?i)bearer\s+\S+', 'Bearer [redacted]', text)
+    return re.sub(r'\bsk-[A-Za-z0-9_\-]{6,}', 'sk-[redacted]', text)
+
+
+def _http_error_message(error: urllib.error.HTTPError, secrets: tuple = ()) -> str:
+    """非 2xx → 「HTTP Error 400: Bad Request | 响应体: …」（单行、脱敏、截断）。
+    保留「HTTP Error <code>」前缀，旧日志的 grep 口径不变。"""
+    try:
+        body = error.read(4096).decode('utf-8', 'replace')
+    except Exception:       # noqa: BLE001 —— 响应体读不到不能掩盖原错误
+        body = ''
+    summary = ' '.join(_redact(body, secrets).split())[:HTTP_BODY_SUMMARY_CHARS]
+    return f'HTTP Error {error.code}: {error.reason} | 响应体: {summary or "（空）"}'
+
+
+def _read_llm_stream(lines) -> dict:
+    """SSE 流 → {content, reasoning, finish_reason, completion_tokens}（纯函数，可离线单测）。
+    reasoning 兼容 reasoning_content / reasoning 两种字段名；usage 块出现才有 completion_tokens。"""
+    content, reasoning = [], []
+    finish_reason, completion_tokens = None, None
+    for raw in lines:
+        line = (raw.decode('utf-8', 'replace') if isinstance(raw, bytes) else str(raw)).strip()
+        if not line.startswith('data: ') or line == 'data: [DONE]':
+            continue
+        try:
+            chunk = json.loads(line[6:])
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(chunk, dict):
+            continue
+        usage = chunk.get('usage')
+        if isinstance(usage, dict) and isinstance(usage.get('completion_tokens'), int):
+            completion_tokens = usage['completion_tokens']
+        choices = chunk.get('choices')
+        if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+            continue
+        delta = choices[0].get('delta')
+        if isinstance(delta, dict):
+            for key, sink in (('content', content), ('reasoning_content', reasoning),
+                              ('reasoning', reasoning)):
+                if isinstance(delta.get(key), str):
+                    sink.append(delta[key])
+        if choices[0].get('finish_reason'):
+            finish_reason = choices[0]['finish_reason']
+    return {'content': ''.join(content), 'reasoning': ''.join(reasoning),
+            'finish_reason': finish_reason, 'completion_tokens': completion_tokens}
+
+
+def _strip_fence(text: str) -> str:
+    text = text.strip()
+    if text.startswith('```'):
+        parts = text.split('\n', 1)
+        text = parts[1].rsplit('```', 1)[0].strip() if len(parts) > 1 else ''
+    return text
+
+
+def _json_object_in(text: str) -> dict | None:
+    """整段就是 JSON 对象则用它；否则取文本里**最后一个**完整的顶层 JSON 对象
+    （思考段通常是「推理文字 … 最终 JSON」）。没有则 None。"""
+    text = _strip_fence(text)
+    try:
+        value = json.loads(text)
+        return value if isinstance(value, dict) else None   # 整段是对象：同旧口径（含 {}）
+    except json.JSONDecodeError:
+        pass
+    decoder = json.JSONDecoder()
+    found, i = None, text.find('{')
+    while i != -1:
+        try:
+            value, end = decoder.raw_decode(text, i)
+        except json.JSONDecodeError:
+            i = text.find('{', i + 1)
+            continue
+        if isinstance(value, dict) and value:
+            found = value
+        i = text.find('{', end)
+    return found
+
+
+def _labels_from_reply(reply: dict, max_tokens: int) -> tuple[dict, str]:
+    """流式回复 → (标签 dict, 取自 'content'|'reasoning')；失败按原因抛不同异常。"""
+    tokens = reply.get('completion_tokens')
+    truncated = reply.get('finish_reason') == 'length' or (
+        isinstance(tokens, int) and tokens >= max_tokens)
+    budget = (f'finish_reason={reply.get("finish_reason")}，'
+              f'completion_tokens={tokens if tokens is not None else "未知"}/max_tokens={max_tokens}')
+    content = (reply.get('content') or '').strip()
+    if content:
+        labels = _json_object_in(content)
+        if labels is not None:
+            return labels, 'content'
+        if truncated:
+            raise LlmOutputTruncated(f'输出被截断（{budget}，content {len(content)} 字未成完整 JSON）')
+        json.loads(_strip_fence(content))    # 抛出原始解析错误（保持旧日志口径）
+        raise ValueError('标签不是 JSON 对象')
+    reasoning = (reply.get('reasoning') or '').strip()
+    if reasoning:
+        labels = _json_object_in(reasoning)
+        if labels is not None:
+            return labels, 'reasoning'
+    if truncated:
+        raise LlmOutputTruncated(f'输出被截断（{budget}，思考内容耗尽输出预算，content 为空）')
+    raise LlmEmptyReply(f'上游空回（content 为空{"，reasoning 无可用 JSON" if reasoning else ""}，'
+                        f'finish_reason={reply.get("finish_reason")}）')
+
 
 def _log_model(context: str, message: str) -> None:
     stamp = time.strftime('%Y-%m-%d %H:%M:%S')
@@ -904,33 +1087,37 @@ def _log_model(context: str, message: str) -> None:
 
 
 def label_book(text: str, api_key: str, models: list[str],
-               site_title: str = '', site_author: str = '') -> tuple[dict, int]:
+               site_title: str = '', site_author: str = '',
+               max_tokens: dict | None = None) -> tuple[dict, int]:
     """50 万字文本 → (标签 dict, 实际调用次数)。
     两段式：每段 ≤25 万字独立过 CF 100s 线（实测 40 万字单段 prefill 必撞 524）。
     第二段带第一段结论合并，可修正只看开头的误判。
     site_title / site_author 为本次来源站点书目，附加打标验证段供成分判定。
-    models 为后备模型链（如 bohe → grok → ...），逐段内按链逐个尝试。"""
+    models 为后备模型链（如 bohe → grok → ...），逐段内按链逐个尝试。
+    max_tokens = resolve_max_tokens(env) 的结果（按模型的输出上限），None 用默认。"""
     verification = _build_verification(site_title, site_author)
     context = f'书目={site_title or "（未知）"}'
     if len(text) <= SEGMENT_CHARS:
         return _label_once(text, api_key, models, verification,
-                           context=f'{context} 分段=1/1'), 1
+                           context=f'{context} 分段=1/1', max_tokens=max_tokens), 1
     seg1, seg2 = text[:SEGMENT_CHARS], text[SEGMENT_CHARS:]
     labels1 = _label_once(seg1, api_key, models, verification,
-                          context=f'{context} 分段=1/2')
+                          context=f'{context} 分段=1/2', max_tokens=max_tokens)
     merged_user = (
         "【前次阅读结论】\n" + json.dumps(labels1, ensure_ascii=False)
         + "\n\n【后续文本】\n" + seg2 + MERGE_PROMPT_SUFFIX
     )
     labels2 = _label_once(merged_user, api_key, models, verification,
-                          context=f'{context} 分段=2/2')
+                          context=f'{context} 分段=2/2', max_tokens=max_tokens)
     return labels2, 2
 
 
 def _label_once(user_content: str, api_key: str, models: list[str],
-                verification: str = '', *, context: str = '') -> dict:
+                verification: str = '', *, context: str = '',
+                max_tokens: dict | None = None) -> dict:
     """单次 LLM 调用。流式。对链中每个模型最多试 MODEL_RETRY 次，
-    某模型连续 MODEL_RETRY 次失败即切换下一个；全部模型耗尽才算本次失败。"""
+    某模型连续 MODEL_RETRY 次失败即切换下一个；全部模型耗尽才算本次失败。
+    输出被截断 / 上游空回不在同模型上重试（同预算重试大概率同样结果），直接换下一个模型。"""
     if not models:
         raise RuntimeError('模型链为空，无法打标')
     _log_model(context, f'开始分段，模型链从链首 {models[0]} 开始')
@@ -940,9 +1127,10 @@ def _label_once(user_content: str, api_key: str, models: list[str],
         if model != current:
             _log_model(context, f'切换模型: {current} -> {model}')
             current = model
+        limit = max_tokens_for(model, max_tokens)
         for attempt in range(MODEL_RETRY):
             body = json.dumps({
-                'model': model, 'stream': True, 'max_tokens': 1800,
+                'model': model, 'stream': True, 'max_tokens': limit,
                 'messages': [
                     {'role': 'system', 'content': SYSTEM_PROMPT},
                     {'role': 'user', 'content': user_content + verification},
@@ -953,26 +1141,24 @@ def _label_once(user_content: str, api_key: str, models: list[str],
                     LLM_URL, data=body, method='POST',
                     headers={**UA, 'Content-Type': 'application/json',
                              'Authorization': f'Bearer {api_key}'})
-                content = ''
-                _log_model(context, f'请求模型 {model} 尝试 {attempt + 1}/{MODEL_RETRY}')
-                with urllib.request.urlopen(req, timeout=300) as res:
-                    for raw in res:
-                        line = raw.decode('utf-8', 'replace').strip()
-                        if not line.startswith('data: ') or line == 'data: [DONE]':
-                            continue
-                        try:
-                            delta = json.loads(line[6:]).get('choices', [{}])[0].get('delta', {})
-                            content += delta.get('content') or ''
-                        except (json.JSONDecodeError, IndexError):
-                            continue
-                content = content.strip()
-                if content.startswith('```'):
-                    content = content.split('\n', 1)[1].rsplit('```', 1)[0].strip()
-                parsed = json.loads(content)
-                if not isinstance(parsed, dict):
-                    raise ValueError('标签不是 JSON 对象')
-                _log_model(context, f'模型 {model} 尝试 {attempt + 1}/{MODEL_RETRY} 成功')
+                _log_model(context, f'请求模型 {model} 尝试 {attempt + 1}/{MODEL_RETRY}'
+                                    f'（max_tokens={limit}）')
+                try:
+                    with urllib.request.urlopen(req, timeout=300) as res:
+                        reply = _read_llm_stream(res)
+                except urllib.error.HTTPError as http_error:
+                    # 响应体摘要进日志（脱敏+截断）；换成 RuntimeError，不让带未读 body 的异常外泄
+                    raise RuntimeError(_http_error_message(http_error, (api_key,))) from None
+                parsed, origin = _labels_from_reply(reply, limit)
+                note = '（content 为空，取自 reasoning_content）' if origin == 'reasoning' else ''
+                _log_model(context, f'模型 {model} 尝试 {attempt + 1}/{MODEL_RETRY} 成功{note}')
                 return parsed
+            except (LlmOutputTruncated, LlmEmptyReply) as e:
+                last_err = e
+                _log_model(context, f'模型 {model} 尝试 {attempt + 1}/{MODEL_RETRY} 失败: {e}；'
+                                    f'不在同模型重试，直接换下一个')
+                time.sleep(20)
+                break
             except Exception as e:
                 last_err = e
                 _log_model(context, f'模型 {model} 尝试 {attempt + 1}/{MODEL_RETRY} 失败: {e}')
@@ -1097,6 +1283,8 @@ def main() -> int:
     models, model_source = resolve_models(env, use_db=not args.no_db_model)
     print(f'打标模型来源: {model_source}')
     print(f'模型链: {models}')
+    max_tokens = resolve_max_tokens(env)
+    print(f'输出上限 max_tokens: {max_tokens}')
     # 断点续传：已写入 labels.jsonl 的书跳过（按详情页 url 判定）
     done_urls = load_done_urls(data_path('labels.jsonl'))
     # 钉子户终态：历史被拒 ≥ REJECT_TERMINAL_THRESHOLD 次的书同样跳过，
@@ -1152,13 +1340,15 @@ def main() -> int:
             engine_cli = _build_engine_cli(env)
             if engine_cli is not None:
                 print('  引擎兜底已启用：book15 miss 将回落引擎源池')
+            # book15 熔断（labelerdiag41）：整站挂掉时别让每本 3 次全失败把一轮拖成十几小时。
+            book15_breaker = douban_list.Book15Breaker(douban_list.resolve_book15_breaker(env))
             all_books = (douban_list.build_douban_queue(
                              bridged, skip_titles=skip_titles, pages=pages,
-                             engine_cli=engine_cli)
+                             engine_cli=engine_cli, book15_breaker=book15_breaker)
                          if args.source == 'douban'
                          else douban_list.build_webnovel_queue(
                              bridged, skip_titles=skip_titles, pages=pages,
-                             engine_cli=engine_cli))
+                             engine_cli=engine_cli, book15_breaker=book15_breaker))
             print(f'{args.source} 线共 {len(all_books)} 本（搜索命中后）')
         else:
             print('拉取榜单书目...')
@@ -1205,6 +1395,10 @@ def main() -> int:
         return 0
 
     ok = fail = stub_skipped = 0
+    fail_kinds: dict[str, int] = {}
+
+    def count_failure(kind: str) -> None:
+        fail_kinds[kind] = fail_kinds.get(kind, 0) + 1
     import_failures = 0
 
     def record_stub(book: dict, reason: str) -> None:
@@ -1267,12 +1461,14 @@ def main() -> int:
                 with open(rej_path, 'a', encoding='utf-8') as f:
                     f.write(json.dumps(reject, ensure_ascii=False) + '\n')
                 fail += 1
+                count_failure('字数不足')
                 continue
             # --book 的 title 是详情页路径，不作为可核验的站点书名。
             site_title = '' if args.book else (b.get('title') or '').strip()
             labels, calls = label_book(
                 text, env['LLM_API_KEY'], models,
-                site_title=site_title, site_author=b.get('author', ''))
+                site_title=site_title, site_author=b.get('author', ''),
+                max_tokens=max_tokens)
             # 有站点书名时：原字符串匹配 或 JSON 布尔 true 任一通过即入库。
             # --book 保留跳过书名校验；榜单空书名必须拒绝，不能自动放行。
             site_match = labels.get('site_title_match') is True
@@ -1298,6 +1494,7 @@ def main() -> int:
                 with open(rej_path, 'a', encoding='utf-8') as f:
                     f.write(json.dumps(reject, ensure_ascii=False) + '\n')
                 fail += 1
+                count_failure('书名核验不符')
                 time.sleep(LLM_INTERVAL_SEC)
                 continue
             quality = labels.get('text_quality')
@@ -1317,6 +1514,7 @@ def main() -> int:
                 with open(rej_path, 'a', encoding='utf-8') as f:
                     f.write(json.dumps(reject, ensure_ascii=False) + '\n')
                 fail += 1
+                count_failure('内容质量拒收')
                 time.sleep(LLM_INTERVAL_SEC)
                 continue
             # 引擎兜底条目：source 记引擎源 host（如 www.yingsx.com）、url 记引擎源 bookUrl
@@ -1382,12 +1580,16 @@ def main() -> int:
             with open(rej_path, 'a', encoding='utf-8') as f:
                 f.write(json.dumps(reject, ensure_ascii=False) + '\n')
             fail += 1
+            count_failure(classify_failure(e))
             continue
         except Exception as e:
             print(f'  失败: {e}', file=sys.stderr)
             fail += 1
+            count_failure(classify_failure(e))
         time.sleep(LLM_INTERVAL_SEC)
     print(f'\n完成: 成功 {ok} / 失败 {fail} / 残本候选跳过 {stub_skipped}，结果在 labels.jsonl')
+    if fail:
+        print(format_failure_kinds(fail_kinds))
     # exit 2 = 整轮零成功（渠道坏，门卫据此回等待窗口）；1 = 部分失败；0 = 全成功
     if ok == 0 and fail > 0:
         return 2

@@ -992,6 +992,169 @@ class TestResolveCandidatesEngineFallback(unittest.TestCase):
         self.assertEqual(cli.calls, [])          # 已打标：连 book15 带引擎都不搜
 
 
+class TestEngineHttpOnlySkip(unittest.TestCase):
+    """labelerdiag41：兜底候选 URL 引擎取不了（http-only 源等）→ 候选阶段跳过并计数，不白调 toc。"""
+
+    def setUp(self):
+        no_wait(self)
+
+    def test_url_support_predicate(self):
+        for url in ('https://www.a.com/b/1', 'HTTPS://www.a.com/b/1',
+                    'https://www.a.com:443/b/1'):
+            with self.subTest(url=url):
+                self.assertTrue(douban_list.engine_url_supported(url))
+        for url in ('http://www.a.com/b/1', 'https://www.a.com:8443/b/1',
+                    'https://u:p@www.a.com/b/1', 'https://@www.a.com/b',
+                    '/b/1', 'www.a.com/b/1', 'https://', 'https://www.a.com:abc/b',
+                    'ftp://www.a.com/b'):
+            with self.subTest(url=url):
+                self.assertFalse(douban_list.engine_url_supported(url))
+
+    def test_http_candidate_skipped_https_candidate_wins(self):
+        cli = FakeEngineCli({'search': _proc(0, _engine_search_stdout([
+            {'source': 'www.old.com', 'title': '斗破苍穹', 'author': '天蚕土豆',
+             'bookUrl': 'http://www.old.com/book/1'},
+            {'source': 'www.new.com', 'title': '斗破苍穹', 'author': '天蚕土豆',
+             'bookUrl': 'https://www.new.com/book/1'},
+        ]))})
+        stats = {}
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            hit = douban_list.search_engine(cli, '斗破苍穹', '天蚕土豆', stats=stats)
+        self.assertEqual(hit['url'], 'https://www.new.com/book/1')
+        self.assertEqual(stats, {'http_only': 1})
+        self.assertIn('非 HTTPS 源跳过', out.getvalue())
+
+    def test_only_http_candidates_is_a_miss(self):
+        # 名单无作者（第一遍直接收）时同样不能收 http 候选
+        cli = FakeEngineCli({'search': _proc(0, _engine_search_stdout([
+            {'source': 'www.old.com', 'title': '剑来', 'author': '',
+             'bookUrl': 'http://www.old.com/book/9'}]))})
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertIsNone(douban_list.search_engine(cli, '剑来'))
+
+    def test_title_incompatible_http_candidate_not_counted(self):
+        # 计数口径 = 本来会被选中去调 toc 的候选；标题不兼容的本就不收，不计
+        cli = FakeEngineCli({'search': _proc(0, _engine_search_stdout([
+            {'source': 'www.old.com', 'title': '一切从剑来开始', 'author': '',
+             'bookUrl': 'http://www.old.com/book/9'}]))})
+        stats = {}
+        with contextlib.redirect_stdout(io.StringIO()):
+            douban_list.search_engine(cli, '剑来', stats=stats)
+        self.assertEqual(stats, {})
+
+    def test_resolve_candidates_summary_counts_http_skips(self):
+        cli = FakeEngineCli({'search': _proc(0, _engine_search_stdout([
+            {'source': 'www.old.com', 'title': '剑来', 'author': '',
+             'bookUrl': 'http://www.old.com/book/9'}]))})
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            queue = douban_list._resolve_candidates(
+                [{'title': '剑来'}, {'title': '剑来'}], lambda url: NO_RESULT_HTML,
+                engine_cli=cli)
+        self.assertEqual(queue, [])
+        self.assertIn('跳过非 HTTPS 源候选 2 条', out.getvalue())
+
+
+class TestBook15Breaker(unittest.TestCase):
+    """labelerdiag41：book15 整站挂时连续 N 本搜索全失败 → 本轮剩余跳过 book15、直接走引擎兜底。"""
+
+    def setUp(self):
+        no_wait(self)
+        patcher = mock.patch.object(douban_list, 'SEARCH_RETRY_DELAY', 0)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.book15_calls = []
+
+    def _down(self, url):
+        self.book15_calls.append(url)
+        raise ConnectionError('HTTP Error 522')
+
+    @staticmethod
+    def _engine_hits():
+        def results(sub, args):
+            title = args[args.index('--title') + 1]
+            return _proc(0, _engine_search_stdout([
+                {'source': 'www.yingsx.com', 'title': title, 'author': '',
+                 'bookUrl': f'https://www.yingsx.com/{urllib.parse.quote(title)}'}]))
+        return FakeEngineCli(results)
+
+    def _run(self, cands, http_get, breaker, engine_cli=None):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            queue = douban_list._resolve_candidates(
+                cands, http_get, engine_cli=engine_cli, book15_breaker=breaker)
+        return queue, out.getvalue()
+
+    def test_trips_after_threshold_and_skips_book15_for_the_rest(self):
+        cands = [{'title': f'书{i}号'} for i in range(8)]
+        cli = self._engine_hits()
+        breaker = douban_list.Book15Breaker(3)
+        queue, out = self._run(cands, self._down, breaker, engine_cli=cli)
+        # 前 3 本各 SEARCH_RETRY 次请求后熔断，后 5 本一个 book15 请求都不发
+        self.assertEqual(len(self.book15_calls), 3 * douban_list.SEARCH_RETRY)
+        self.assertTrue(breaker.open)
+        self.assertEqual(breaker.skipped, 5)
+        # 8 本全部走到了引擎兜底（熔断不影响兜底）
+        self.assertEqual(len(cli.calls), 8)
+        self.assertEqual(len(queue), 8)
+        self.assertTrue(all(b['engine'] for b in queue))
+        # 熔断事件只打一行；汇总行带熔断跳过数
+        self.assertEqual(out.count('book15 熔断：'), 1)
+        self.assertIn('book15 熔断跳过搜索 5 本', out)
+
+    def test_page_fetched_resets_consecutive_failures(self):
+        # 失败 2 本 → 1 本拿到页面（正常 miss）→ 失败 2 本：从未连续达 3，不熔断。
+        # 失败的书连续 SEARCH_RETRY 次请求都失败；拿到页面的书首次请求即成功。
+        plan = []
+        for ok in (False, False, True, False, False):
+            plan += [True] if ok else [False] * douban_list.SEARCH_RETRY
+        responses = iter(plan)
+        cands = [{'title': f'书{i}号'} for i in range(5)]
+
+        def flaky(url):
+            self.book15_calls.append(url)
+            if not next(responses):
+                raise ConnectionError('timeout')
+            return NO_RESULT_HTML
+
+        breaker = douban_list.Book15Breaker(3)
+        self._run(cands, flaky, breaker)
+        self.assertFalse(breaker.open)
+        self.assertEqual(breaker.skipped, 0)
+
+    def test_normal_miss_is_not_a_failure(self):
+        # 站点在线但搜不到（正常 miss）不计失败：连续 10 本 miss 也不熔断
+        cands = [{'title': f'书{i}号'} for i in range(10)]
+        breaker = douban_list.Book15Breaker(3)
+        _, out = self._run(cands, lambda url: NO_RESULT_HTML, breaker)
+        self.assertFalse(breaker.open)
+        self.assertNotIn('熔断', out)
+
+    def test_threshold_zero_disables(self):
+        cands = [{'title': f'书{i}号'} for i in range(6)]
+        breaker = douban_list.Book15Breaker(0)
+        self._run(cands, self._down, breaker)
+        self.assertFalse(breaker.open)
+        self.assertEqual(len(self.book15_calls), 6 * douban_list.SEARCH_RETRY)
+
+    def test_no_breaker_keeps_summary_line_unchanged(self):
+        # book15_breaker=None（旧调用形态）：汇总行不出现熔断字样
+        _, out = self._run([{'title': '甲书'}], self._down, None)
+        self.assertNotIn('熔断', out)
+
+    def test_resolve_threshold_from_env(self):
+        env_name = douban_list.BOOK15_BREAKER_ENV
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(env_name, None)
+            self.assertEqual(douban_list.resolve_book15_breaker(None), 5)
+            self.assertEqual(douban_list.resolve_book15_breaker({env_name: '3'}), 3)
+            self.assertEqual(douban_list.resolve_book15_breaker({env_name: '0'}), 0)
+            self.assertEqual(douban_list.resolve_book15_breaker({env_name: 'abc'}), 5)
+            self.assertEqual(douban_list.resolve_book15_breaker({env_name: ' '}), 5)
+            os.environ[env_name] = '7'
+            self.assertEqual(douban_list.resolve_book15_breaker({}), 7)
+            self.assertEqual(douban_list.resolve_book15_breaker({env_name: '2'}), 2)
+
+
 # ---- N02：引擎兜底作者身份过滤（同名异作者正文不得绑定名单身份）----
 class TestNormAuthor(unittest.TestCase):
     """_norm_author：身份比对前的作者归一化。
@@ -1030,6 +1193,59 @@ class TestNormAuthor(unittest.TestCase):
     def test_bracket_only_author_is_not_stripped_to_nothing(self):
         # 剥前导括号段要求剥后剩余非空：整串就是括号段时先不剥，再走标点剥离
         self.assertEqual(douban_list._norm_author('（佚名）'), '佚名')
+
+    # labelerdiag41：引擎源作者带「作者：」标签（名单 唐家三少 vs 引擎 作者：唐家三少 被判作者不符）
+    LABEL_PAIRS = (
+        ('唐家三少', '作者：唐家三少'),            # 全角冒号（phoenix 日志原样）
+        ('风凌天下', '作者:风凌天下'),              # 半角冒号
+        ('风凌天下', '作者 : 风凌天下'),            # 冒号两侧空格
+        ('风凌天下', '  作者：  风凌天下 '),        # 首尾空白
+        ('风凌天下', '作　者：风凌天下'),           # 「作　者」全角排版空格
+        ('风凌天下', '作者　风凌天下'),         # 无冒号、全角空格分隔
+        ('风凌天下', '作者风凌天下'),               # 无分隔（textContent 拼接形态）
+        ('乔治·奥威尔', '作者：（英）乔治&middot;奥威尔'),  # 与实体/国籍段叠加
+        ('天蚕土豆', '作者：天蚕土豆 著'),          # 与尾缀叠加
+    )
+
+    def test_author_label_prefix_is_stripped(self):
+        for a, b in self.LABEL_PAIRS:
+            with self.subTest(pair=(a, b)):
+                self.assertEqual(douban_list._norm_author(a),
+                                 douban_list._norm_author(b))
+
+    def test_author_label_negative_controls(self):
+        # 标签后是另一个人：剥标签不得让异作者变相等
+        self.assertNotEqual(douban_list._norm_author('唐家三少'),
+                            douban_list._norm_author('作者：天蚕土豆'))
+        # 「作者」只在名首才算标签：名中/名尾出现不剥
+        self.assertEqual(douban_list._norm_author('某作者'), '某作者')
+        self.assertNotEqual(douban_list._norm_author('唐家三少'),
+                            douban_list._norm_author('唐家三少作者'))
+        # 整串只有「作者」：不是标签，原样保留（不会变空而被当作者未知降级收）
+        self.assertEqual(douban_list._norm_author('作者'), '作者')
+        # 只有标签没有名字：作者未知 ⇒ ''（走「候选作者空」降级分支，而非判作者不符）
+        for s in ('作者：', '作者:', '作者 ： '):
+            with self.subTest(s=s):
+                self.assertEqual(douban_list._norm_author(s), '')
+
+    def test_author_label_symmetric_for_real_pen_name(self):
+        # 以「作者」起头的真实笔名：两端同写法仍相等（归一化对称，不会误拒）
+        self.assertEqual(douban_list._norm_author('作者君'),
+                         douban_list._norm_author('作者：作者君'))
+
+
+class TestSearchEngineAuthorLabel(unittest.TestCase):
+    """labelerdiag41：候选阶段不得因「作者：」标签丢掉引擎兜底真命中。"""
+
+    def test_label_prefixed_candidate_is_verified_match(self):
+        cli = FakeEngineCli({'search': _proc(0, json.dumps([
+            {'source': 'www.a.com', 'title': '斗罗大陆', 'author': '作者：唐家三少',
+             'bookUrl': 'https://www.a.com/b/1'}]))})
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            hit = douban_list.search_engine(cli, '斗罗大陆', '唐家三少')
+        self.assertEqual(hit, {'url': 'https://www.a.com/b/1', 'title': '斗罗大陆',
+                               'source': 'www.a.com'})
+        self.assertNotIn('作者不符', out.getvalue())
 
 
 class TestSearchEngineAuthorFilter(unittest.TestCase):

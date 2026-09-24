@@ -14,6 +14,7 @@
 // 🔴 凭据红线：任何输出（stdout/stderr）不得包含 DATABASE_URL 或密钥（见 safeReason）。
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
+import { exitAfterFlush } from './stdio-exit.mjs';
 
 // CLI 层宽上限（无 serverless 限制，但仍有界防挂死）。
 const SEARCH_TIMEOUT_MS = 30_000;
@@ -293,11 +294,12 @@ async function main() {
   await handler(m, args);
 }
 
+// 🔴 不得直接 process.exit：管道下 >64KB 的 --json 输出会被截断（见 stdio-exit.mjs）。
 main().then(
-  () => process.exit(0),
+  () => exitAfterFlush(0),
   (error) => {
     const code = error instanceof ExitError ? error.code : 1;
     process.stderr.write(`${safeReason(error)}\n`);
-    process.exit(code);
+    return exitAfterFlush(code);
   },
 );
