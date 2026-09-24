@@ -52,8 +52,8 @@ function json(body: unknown, status = 200, headers: Record<string, string> = {})
 }
 
 const CURRENT = 'https://a.example';
-// 与生产同形:阅读目录的 source.url 是书的详情页(sourceReaderIndex 填 bookUrl),不是候选里的源 url ——
-// 当前源只能按源名认。
+// 阅读目录的 source.url 是书的详情页(sourceReaderIndex 填 bookUrl),不是候选里的源 url。默认夹具是**旧服务端**形状
+// (目录无 sourceUrl、段无 servedFromUrl)⇒ 面板按源名认当前源;41-srcurl 的新形状见「当前源」用例组。
 const catalog = (over: Record<string, unknown> = {}) => ({
   taskId: null,
   source: { id: 'src-1', name: '源甲', url: CURRENT + '/book/1', session: 'sess-A' },
@@ -78,7 +78,10 @@ const book = (bookUrl: string) => ({ title: '诡秘之主', author: '爱潜水�
 type ProbeHandler = (sourceUrl: string, init: RequestInit | undefined) => Response | Promise<Response>;
 
 /** index/章节走固定响应;候选列表与单源 probe 交给用例。 */
-function fanoutFetch(sources: unknown[] | Response, onProbe: ProbeHandler, servedFrom = '源甲') {
+function fanoutFetch(
+  sources: unknown[] | Response, onProbe: ProbeHandler, servedFrom = '源甲',
+  shape: { index?: Record<string, unknown>; part?: Record<string, unknown> } = {},
+) {
   return vi.fn<ApiFetch>(async (input, init) => {
     const url = String(input);
     if (url.startsWith('/api/read/source/index')) {
@@ -86,7 +89,7 @@ function fanoutFetch(sources: unknown[] | Response, onProbe: ProbeHandler, serve
       // 确认路径(带 book_url)返回换过源的目录(源 id 不变,便于 part 校验通过)。
       return json(query.get('book_url')
         ? catalog({ source: { id: 'src-1', name: '源乙', url: query.get('source') ?? 'https://x.example', session: 'sess-B' } })
-        : catalog());
+        : catalog(shape.index));
     }
     if (url.startsWith('/api/read/source-probe')) {
       const query = new URLSearchParams(url.split('?')[1] ?? '');
@@ -94,7 +97,7 @@ function fanoutFetch(sources: unknown[] | Response, onProbe: ProbeHandler, serve
       return onProbe(query.get('source')!, init);
     }
     if (url.startsWith('/api/read/source/alternates')) return json({ sources: [], partial: false });
-    return json(part({ servedFrom }));
+    return json(part({ servedFrom, ...shape.part }));
   });
 }
 
@@ -250,6 +253,50 @@ describe('换源面板扇出:当前源', () => {
   it('当前源按正在供稿的源名认(章内换源后 servedFrom 是新源):新源标当前且不 probe,原目录源照常 probe', async () => {
     const sources = [candidate('源甲', CURRENT), candidate('源乙', 'https://b.example')];
     const apiFetch = fanoutFetch(sources, (url) => json(probe(sources.find((item) => item.url === url)!, { status: 'miss' })), '源乙');
+    await openPanel(apiFetch);
+    await waitFor(() => expect(row('源甲').dataset.probeStatus).toBe('miss'));
+    expect(row('源乙').dataset.probeStatus).toBe('current');
+    expect(probeCalls(apiFetch)).toEqual([CURRENT]);
+  });
+
+  // 41-srcurl:目录带 source.sourceUrl、段带 servedFromUrl ⇒ 按源 url 精确认当前源。
+  const withUrls = (sourceUrl: string, servedFromUrl: string) => ({
+    index: { source: { id: 'src-1', name: '源甲', url: CURRENT + '/book/1', sourceUrl, session: 'sess-A' } },
+    part: { servedFromUrl },
+  });
+  const MIRROR = 'https://mirror.example';
+
+  it('同名不同 url 的两个源:只有 url 相符的是当前源,另一个照常 probe 且可切换', async () => {
+    const sources = [candidate('源甲', CURRENT), candidate('源甲', MIRROR)];
+    const apiFetch = fanoutFetch(sources, (url) => json(probe(sources.find((item) => item.url === url)!, {
+      status: 'ok', book: book(url + '/b/1'),
+    })), '源甲', withUrls(CURRENT, CURRENT));
+    await openPanel(apiFetch);
+    await waitFor(() => expect(rows()[1].dataset.probeStatus).toBe('ok'));
+    const [current, mirror] = rows();
+    expect(current.dataset.probeStatus).toBe('current');
+    expect(current.getAttribute('aria-current')).toBe('true');
+    expect(buttonsIn(current)).toEqual([]);
+    expect(mirror.getAttribute('aria-current')).toBeNull();
+    expect(squeeze(mirror.textContent ?? '')).not.toContain(squeeze('当前源'));
+    expect(buttonsIn(mirror).map((b) => squeeze(b.textContent ?? ''))).toEqual([squeeze('切换到此源')]);
+    expect(probeCalls(apiFetch)).toEqual([MIRROR]);
+  });
+
+  it('章内换源后跟到新源 url:servedFromUrl 指向的源标当前,同名的另一 url 与原目录源照常 probe', async () => {
+    const sources = [candidate('源甲', CURRENT), candidate('源乙', 'https://b1.example'), candidate('源乙', 'https://b2.example')];
+    const apiFetch = fanoutFetch(sources, (url) => json(probe(sources.find((item) => item.url === url)!, { status: 'miss' })),
+      '源乙', withUrls(CURRENT, 'https://b2.example'));
+    await openPanel(apiFetch);
+    await waitFor(() => expect(rows()[1].dataset.probeStatus).toBe('miss'));
+    expect(rows().map((item) => item.dataset.probeStatus)).toEqual(['miss', 'miss', 'current']);
+    expect(probeCalls(apiFetch).sort()).toEqual([CURRENT, 'https://b1.example']);
+  });
+
+  it('段只带源名(旧服务端)时不拿目录上的 url 去配:按段的源名认,目录源照常 probe', async () => {
+    const sources = [candidate('源甲', CURRENT), candidate('源乙', 'https://b.example')];
+    const apiFetch = fanoutFetch(sources, (url) => json(probe(sources.find((item) => item.url === url)!, { status: 'miss' })),
+      '源乙', { index: withUrls(CURRENT, CURRENT).index });
     await openPanel(apiFetch);
     await waitFor(() => expect(row('源甲').dataset.probeStatus).toBe('miss'));
     expect(row('源乙').dataset.probeStatus).toBe('current');

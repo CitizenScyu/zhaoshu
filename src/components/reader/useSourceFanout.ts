@@ -41,6 +41,18 @@ type Outcome =
 
 const INITIAL: FanoutState = { phase: 'loading', rows: [], retryAfter: null, message: '' };
 
+/** 正在供稿的源:url = 源 url(目录的 source.sourceUrl / 段的 servedFromUrl),name = 源名;旧服务端不带 url。 */
+export interface ServingSource { name?: string; url?: string }
+
+/**
+ * 候选是不是当前源(41-srcurl):有源 url 就按 url 精确比对 —— 同名不同 url 的两个源不再被一起当成当前源;
+ * 没有 url(未升级的服务端)才退回按源名比对(与旧面板兜底同口径)。
+ */
+export function isCurrentSource(candidate: { url: string; name: string }, current: ServingSource | undefined): boolean {
+  if (current?.url) return candidate.url === current.url;
+  return !!current?.name && candidate.name === current.name;
+}
+
 export function probeCacheKey(title: string, author: string, sourceUrl: string): string {
   return JSON.stringify([title, author, sourceUrl]);
 }
@@ -121,15 +133,15 @@ async function probeOne(apiFetch: ApiFetch, title: string, author: string, sourc
  * 换源扇出:挂载即取候选并逐源 probe;卸载(关面板)即 abort 全部在途请求。
  * rescan() 只重测没有定论的行(超时/失败/未测),已有结果的行复用 cache,不重复计数。
  */
-export function useSourceFanout({ apiFetch, title, author, currentSourceName, cache }: {
-  apiFetch: ApiFetch; title: string; author: string; currentSourceName?: string; cache: ProbeCache;
+export function useSourceFanout({ apiFetch, title, author, currentSource, cache }: {
+  apiFetch: ApiFetch; title: string; author: string; currentSource?: ServingSource; cache: ProbeCache;
 }) {
   const [state, setState] = useState<FanoutState>(INITIAL);
   const [generation, setGeneration] = useState(0);
   // 当前源只在一次扫描开始时读:它不必 probe(已在读),变化也不应让在飞的扫描重来。
-  // 按源名比对:阅读目录的 source.url 是书的详情页(sourceReaderIndex 填 bookUrl),不是源 url,见报告「契约缺口」。
-  const current = useRef(currentSourceName);
-  useEffect(() => { current.current = currentSourceName; }, [currentSourceName]);
+  // 按源 url 精确比对(目录 source.sourceUrl / 段 servedFromUrl),缺失时退回源名,见 isCurrentSource。
+  const current = useRef(currentSource);
+  useEffect(() => { current.current = currentSource; }, [currentSource]);
 
   const scan = useCallback(async (signal: AbortSignal) => {
     const set = (update: (previous: FanoutState) => FanoutState) => { if (!signal.aborted) setState(update); };
@@ -153,7 +165,7 @@ export function useSourceFanout({ apiFetch, title, author, currentSourceName, ca
     const rows: FanoutRow[] = candidates.map((source) => {
       const cached = cache.get(probeCacheKey(title, author, source.url));
       if (cached) return { ...source, state: 'done', result: cached };
-      return { ...source, state: exclude && source.name === exclude ? 'current' : 'pending' };
+      return { ...source, state: isCurrentSource(source, exclude) ? 'current' : 'pending' };
     });
     set(() => ({ phase: 'running', rows, retryAfter: null, message: '' }));
     const patch = (url: string, row: (source: FanoutCandidate) => FanoutRow) => set((previous) => ({
