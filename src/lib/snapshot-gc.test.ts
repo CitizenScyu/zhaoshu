@@ -261,6 +261,18 @@ describe('B2-05 快照卷 GC:清单/指针缺失与存储错误一律 fail close
     expect(store.deleteFile).not.toHaveBeenCalled();
   });
 
+  it('规范 index.json 整体不在(读回 null)⇒ 不跳过,只少一个引用来源;仍按指针/保护窗判定', async () => {
+    const { store, a } = await threeVersions();
+    store.files.delete(paths.canonicalPath); // 规范清单整份缺失,不是「读不懂」
+    const report = await collectSnapshotGarbage(store, stem, { now: LATER });
+    expect(report.skipped).toBeNull();
+    // 存活集仍来自指针 current/history(实现现有语义:规范清单只是额外引用来源)。
+    const pointer = JSON.parse(store.files.get(`${paths.dir}/current.json`)!) as { current: string; history: string[] };
+    expect(report.liveVersions).toEqual([...new Set([pointer.current, ...pointer.history.slice(-2)])].sort());
+    // A 的丙卷不被任何人引用 ⇒ 仍是孤儿(不因缺规范清单而误保全,也不整本跳过)。
+    expect(report.orphans).toContain(snaps(a)[2]);
+  });
+
   it('目录里没有快照卷(旧单文件时代)⇒ 不读任何清单、不跳过、无孤儿', async () => {
     const store = new MemoryStore();
     store.files.set(`${paths.dir}/0badf00d.txt`, '旧整本快照');
