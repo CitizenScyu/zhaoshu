@@ -72,6 +72,22 @@ export class PublicationStageError extends Error {
   }
 }
 
+/**
+ * 发布器自己判出的确定性失败:同一候选重跑必然同样失败(超限、章节索引不合法、指针文件损坏
+ * 需人工处理),自动重试只会空耗。其余阶段失败(GitHub 传输/限流/5xx)可重试。
+ */
+const PERMANENT_STAGE_DETAILS: ReadonlySet<string> = new Set([
+  'size_limit', 'index_too_large', 'chapter_count_mismatch', 'invalid_chapter_ranges', 'current_json_unreadable',
+]);
+
+/**
+ * B2-03:发布失败是否值得自动重新入队。只认 PublicationStageError 且不是确定性失败;
+ * 失租约、版本冲突及其他非阶段错误一律不重试。
+ */
+export function isRetryablePublicationError(error: unknown): error is PublicationStageError {
+  return error instanceof PublicationStageError && !PERMANENT_STAGE_DETAILS.has(error.detail);
+}
+
 /** 同短版本(sha8)不同完整 hash:目录里已有别的整本顶着这个版本号,拒绝写入。 */
 export class ManifestVersionConflictError extends Error {
   readonly code = 'MANIFEST_VERSION_CONFLICT';

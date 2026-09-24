@@ -198,6 +198,15 @@ export async function applyMigration(client, migrations, options = {}) {
       version integer PRIMARY KEY, name text NOT NULL, checksum char(64) NOT NULL,
       applied_at timestamptz NOT NULL DEFAULT now())`);
     const ordered = [...list].sort((left, right) => left.version - right.version);
+    // strict（生产入口用）：拿到锁之后按整张记账表复核一遍，库里有代码不认识的版本、更高的版本
+    // 或乱序缺口都拒绝。默认不开：旧代码对库里多出的高版本保持宽容，是回滚路径依赖的行为。
+    if (options.strict) {
+      const recorded = await client.query('SELECT version, name, checksum FROM schema_migrations ORDER BY version');
+      const plan = planMigrations(recorded.rows, ordered);
+      if (plan.errors.length) {
+        throw new Error(`迁移记账与代码不一致，拒绝继续：${plan.errors.map((item) => item.message).join('；')}`);
+      }
+    }
     const versions = [];
     let anyApplied = false;
     for (const migration of ordered) {
@@ -299,4 +308,116 @@ export function evaluateSchema(report, migrations) {
   const ok = checksumOk && authVersionOk && !missingTables.length && !report.dangerous.length;
   return { ok, missingTables, expectedMigrations, checksumOk,
     authVersion: report.authVersion ?? null, expectedAuthVersion: AUTH_SCHEMA_VERSION, authVersionOk };
+}
+
+// 严格记账比对（纯函数）：生产入口的 dry-run 计划与 apply 锁内复核共用。
+// 与 evaluateSchema 不同，这里还看「库里有、代码里没有」的版本：
+//   checksum-mismatch  已登记版本的 name 或摘要与文件不符（已发布文件被改过，或连错了库）；
+//   newer-than-code    库里登记了高于代码最新版本的迁移（版本倒退：旧代码对新库）；
+//   unknown-version    库里登记了代码列表里没有、但不高于最新版本的迁移；
+//   out-of-order       某版本未登记，而库里已有更高版本——补执行会乱序，拒绝。
+// 「v1 已登记、v2 只手工跑过 DDL 未登记」的生产形态不属于乱序（待执行的 v2 高于已登记的最高版本 v1）。
+export function planMigrations(recordedRows, migrations) {
+  const ordered = [...migrations].sort((left, right) => left.version - right.version);
+  const known = new Map(ordered.map((migration) => [migration.version, migration]));
+  const head = ordered.length ? ordered[ordered.length - 1].version : 0;
+  const recorded = new Map(recordedRows.map((row) => [Number(row.version), row]));
+  const maxRecorded = recorded.size ? Math.max(...recorded.keys()) : 0;
+  const errors = [];
+  for (const [version, row] of [...recorded].sort((left, right) => left[0] - right[0])) {
+    const migration = known.get(version);
+    if (!migration) {
+      errors.push(version > head
+        ? { version, kind: 'newer-than-code', message: `库已登记版本 ${version}，高于代码的最新版本 ${head}（库新代码旧）` }
+        : { version, kind: 'unknown-version', message: `库已登记版本 ${version}（${row.name}）不在代码的迁移列表里` });
+    } else if (row.name !== migration.name || String(row.checksum).trim() !== migration.checksum) {
+      errors.push({ version, kind: 'checksum-mismatch', message: `迁移版本 ${version} 的名称或摘要与库内登记不一致` });
+    }
+  }
+  const unchanged = [];
+  const pending = [];
+  for (const { version, name, checksum } of ordered) {
+    if (recorded.has(version)) { unchanged.push({ version, name, checksum }); continue; }
+    pending.push({ version, name, checksum });
+    if (version < maxRecorded) {
+      errors.push({ version, kind: 'out-of-order', message: `版本 ${version} 未登记，但库里已有更高的版本 ${maxRecorded}` });
+    }
+  }
+  const status = errors.length ? 'refused' : (pending.length ? 'pending' : 'up-to-date');
+  return { status, head, unchanged, pending, errors };
+}
+
+// 0003 四张表的列契约（N2）：[列名, data_type, is_nullable, column_default]，取自 information_schema 的原样渲染。
+// `ADD COLUMN IF NOT EXISTS` 只看列名：生产某列若存在但类型/可空/默认值不同，0003 空转、db:check 也不会发现，
+// 要到运行期 INSERT 才炸。生产入口在迁移前用这份契约只读比对，不一致即拒绝。
+// db-prod.test.ts 用迁移路径与运行时路径各建一个真库钉住它，改 0003 / business-schema.ts 而没同步这里会红。
+export const EXPECTED_RUNTIME_COLUMNS = {
+  app_settings: [
+    ['id', 'integer', 'NO', '1'],
+    ['llm_model', 'text', 'YES', null],
+    ['updated_at', 'timestamp with time zone', 'NO', 'now()'],
+    ['llm_reasoning', 'text', 'YES', null],
+    ['label_model', 'text', 'YES', null],
+    ['label_model_updated_at', 'timestamp with time zone', 'YES', null],
+    ['default_model', 'text', 'YES', null],
+    ['default_model_reasoning', 'text', 'YES', null],
+    ['default_model_updated_at', 'timestamp with time zone', 'YES', null],
+  ],
+  cron_health: [
+    ['name', 'text', 'NO', null],
+    ['last_success_at', 'timestamp with time zone', 'NO', 'now()'],
+  ],
+  profile_feedback_queue: [
+    ['user_id', 'integer', 'NO', null],
+    ['pending_feedback_id', 'integer', 'YES', null],
+    ['absorbed_feedback_id', 'integer', 'NO', '0'],
+    ['status', 'text', 'NO', "'unchanged'::text"],
+    ['attempts', 'integer', 'NO', '0'],
+    ['last_error', 'text', 'NO', "''::text"],
+    ['updated_at', 'timestamp with time zone', 'NO', 'now()'],
+    ['lease_token', 'text', 'NO', "''::text"],
+    ['lease_expires_at', 'timestamp with time zone', 'YES', null],
+    ['fail_count', 'integer', 'NO', '0'],
+    ['next_eligible_at', 'timestamp with time zone', 'YES', null],
+  ],
+  source_admission: [
+    ['id', 'integer', 'NO', "nextval('source_admission_id_seq'::regclass)"],
+    ['source_url', 'text', 'NO', null],
+    ['tier', 'text', 'NO', null],
+    ['compile_ok', 'boolean', 'NO', null],
+    ['core_field_mask', 'jsonb', 'NO', null],
+    ['search_ok', 'boolean', 'YES', null],
+    ['search_verdict', 'text', 'NO', "''::text"],
+    ['search_checked_at', 'timestamp with time zone', 'YES', null],
+    ['rules_hash', 'text', 'NO', null],
+    ['engine_semantics_version', 'integer', 'NO', '0'],
+    ['host', 'text', 'NO', null],
+    ['error', 'text', 'NO', "''::text"],
+    ['compile_diagnostics', 'jsonb', 'NO', "'[]'::jsonb"],
+  ],
+};
+
+// 按列名比对（不比物理列序：老实例的列由 ADD COLUMN 追加，列序本来就可能不同）。
+// 表不存在不算问题（0003 会建）；表在而列缺、或类型/可空/默认值不同都算问题——0003 对已有表
+// 不会补 CREATE TABLE 里的列，也不会改已有列。多出来的列只报告，不拒绝。
+export function checkRuntimeColumns(columns) {
+  const problems = [];
+  const extra = [];
+  const absentTables = [];
+  for (const [table, expectedColumns] of Object.entries(EXPECTED_RUNTIME_COLUMNS)) {
+    const actual = new Map(columns.filter((column) => column.table_name === table).map((column) => [column.column_name, column]));
+    if (!actual.size) { absentTables.push(table); continue; }
+    for (const [column, data_type, is_nullable, column_default] of expectedColumns) {
+      const expected = { data_type, is_nullable, column_default };
+      const found = actual.get(column);
+      if (!found) { problems.push({ table, column, kind: 'missing', expected, actual: null }); continue; }
+      const got = { data_type: found.data_type, is_nullable: found.is_nullable, column_default: found.column_default ?? null };
+      if (got.data_type !== data_type || got.is_nullable !== is_nullable || got.column_default !== column_default) {
+        problems.push({ table, column, kind: 'mismatch', expected, actual: got });
+      }
+    }
+    const declared = new Set(expectedColumns.map(([column]) => column));
+    for (const column of actual.keys()) if (!declared.has(column)) extra.push({ table, column });
+  }
+  return { ok: !problems.length, problems, extra, absentTables };
 }

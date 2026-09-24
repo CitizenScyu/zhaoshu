@@ -1,4 +1,3 @@
-#!/usr/bin/env node
 // labels.jsonl → Neon labeled_books 表。
 // labeler.py 在 phoenix 上只产 jsonl,入库由本地用项目的 @neondatabase/serverless 执行。
 //

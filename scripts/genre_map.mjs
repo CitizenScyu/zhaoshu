@@ -1,4 +1,3 @@
-#!/usr/bin/env node
 // 分类规范化：站点分类 + LLM genre → 标准主分类 + 次级标签。
 // import_labels.mjs 与 backfill_quality.mjs 共用。
 

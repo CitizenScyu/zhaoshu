@@ -22,6 +22,8 @@
     "bench:auth": "node scripts/bench-auth.mjs",
     "db:check": "node --experimental-strip-types scripts/check-schema.mjs",
     "db:migrate": "node --experimental-strip-types scripts/migrate.mjs",
+    "db:check:prod": "node --experimental-strip-types scripts/db-prod.mjs check",
+    "db:migrate:prod": "node --experimental-strip-types scripts/db-prod.mjs migrate",
     "test:db": "node --experimental-strip-types scripts/test-db.mjs"
   },
   "dependencies": {

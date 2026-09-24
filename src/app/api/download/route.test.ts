@@ -35,13 +35,17 @@ function queryText(index: number) {
 // 离线锁定数据库查询的保护条件；不在 mock 中重写 PostgreSQL 的时间/状态判断。
 function expectSafeReclaim(index: number) {
   const query = queryText(index);
-  expect(query).toMatch(/^UPDATE download_tasks SET status = 'failed',/);
-  expect(query).toContain("error = CONCAT(COALESCE(error, ''), ?::text)");
+  // B2-03：未达上限的 system 任务放回 pending 退避，其余（user / 达上限）仍 failed。
+  expect(query).toMatch(/^UPDATE download_tasks SET status = CASE WHEN requested_by = 'system' AND attempt_count < \? THEN 'pending' ELSE 'failed' END,/);
+  expect(query).toContain("error = CONCAT(COALESCE(error, ''), CASE WHEN");
   expect(query).toContain('lease_generation = lease_generation + 1');
   expect(query).toContain("lease_owner = ''");
   expect(query).toContain('updated_at = now()');
   expect(query).toMatch(/WHERE status = 'running' AND updated_at < now\(\) - \(\?::bigint \* interval '1 millisecond'\)$/);
-  expect(sql.mock.calls[index].slice(1)).toEqual(['\nworker 中断自动回收', 30 * 60_000]);
+  expect(sql.mock.calls[index].slice(1)).toEqual([
+    16, 16, 16, 15 * 60_000, 6 * 60 * 60_000, 16,
+    '\nworker 中断自动回收，退避后重新入队', '\nworker 中断自动回收', 30 * 60_000,
+  ]);
 }
 
 const book = { id: 7, title: '测试书', author: '作者', source_url: 'https://book15.net/books/details7.html' };

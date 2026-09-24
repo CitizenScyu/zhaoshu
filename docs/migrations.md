@@ -14,8 +14,7 @@
 
 ## 安全边界
 
-- 命令只接受 `--target=test`，且只读取进程中显式提供的 `TEST_DATABASE_URL`；不会读取 `.env*`，也不会回退到 `DATABASE_URL`。
-- 本轮只面向隔离测试库；**不应用到生产**。
+- `db:check` / `db:migrate` 只接受 `--target=test`，且只读取进程中显式提供的 `TEST_DATABASE_URL`；不会读取 `.env*`，也不会回退到 `DATABASE_URL`。它们只面向隔离测试库，**不应用到生产**；生产与灾备冷建库用下文的 `db:check:prod` / `db:migrate:prod`。
 - 整个待执行列表在单个事务内执行，所有版本的登记与 DDL 一起提交（原子）：要么全成，要么回滚且不登记任何版本。
 - 用事务级 advisory lock（`schema_migrations` 同一把锁）串行化并发迁移，并设置 10 秒锁等待与 120 秒语句预算。
 - `schema_migrations` 同时记录版本和 SHA-256；已登记版本对应的文件摘要变化会阻断执行，提示人工复核。
@@ -54,6 +53,52 @@ npm run test:db    -- --target=test   # 三类起点 + 并发 + 回滚验收
 `db:check` 只读，报告版本、缺表、危险记录、全部列（类型 / nullable / default）、索引与约束，供人工比对三类起点的差异。`db:migrate` 只在同一事务内写 `schema_migrations` 与结构。
 
 `test:db` 在同一个显式测试库内创建随机命名的临时 schema，覆盖空库、旧主应用库、worker 先建库、**手工跑过 0002 的生产形态**（先只 apply 0001，再裸跑 0002 的 DDL 不记账，然后重跑迁移只补记 v2）、重复执行、并发串行、故障回滚和危险 NULL 阻断，结束时删除这些临时 schema。它同样不应指向生产数据库。
+
+## 生产 / 灾备入口（`db:check:prod` / `db:migrate:prod`）
+
+`scripts/db-prod.mjs`，与 `migrate:auth:prod`（见 `docs/auth-deployment.md`）同一套约束；迁移本体就是上文的 runner（`applyMigration`），不另写 SQL。
+
+- **目标显式给出**：`--database-url-env=<变量名>`，只读该变量；不读 `.env*`，不回退 `DATABASE_URL` / `TEST_DATABASE_URL`，也不接受这两个名字本身。与 `migrate:auth:prod` 用同一个变量即可。
+- **`db:check:prod`（只读）**：整段在 `BEGIN READ ONLY` 事务里。逐版本核摘要、缺表、auth 记账版本（同 `db:check`），外加：
+  - 严格记账比对：库里有摘要 / 名称不符的版本、高于代码最新版本的版本、代码不认识的版本、乱序缺口，都判不通过；
+  - 四张运行期表（`app_settings` / `source_admission` / `profile_feedback_queue` / `cron_health`）的列类型 / 可空 / 默认值与 0003 的声明（`EXPECTED_RUNTIME_COLUMNS`）逐列比对，输出里附这四表的原始列行。`ADD COLUMN IF NOT EXISTS` 只看列名，列存在但类型不同时 0003 会空转、运行期 INSERT 才炸，所以迁移前必须先看这一项。
+  - 退出码：0 通过；2 不通过；1 参数 / 连接错误。
+- **`db:migrate:prod`**：默认 **dry-run**（同样只读），列出将执行的迁移（`ledger.pending`）和将写入的记账行（`ledgerWrites`：每个待执行版本一行 `schema_migrations`，`0001` 另写 `auth_schema_migrations` 1–4）。显式 `--apply` 才写：先实测端点（同 `db:migrate`），再在迁移事务的 advisory lock 内按整张记账表复核一次，最后只读复核并输出 `after`。
+  - 上面任何一条严格比对或列契约不通过：dry-run 与 `--apply` 都输出 `status: refused` 与 `refusals[]`，**不写库，退出码 2**。
+  - 没有待执行版本时 `--apply` 输出 `unchanged`，不开写事务。
+- 输出只含目标 host、版本、摘要与列形状，不含连接串；错误信息里的连接 URL 会被替换为 `[REDACTED_DATABASE_URL]`。
+
+### 生产执行顺序（已有库）
+
+连接串只在当前 shell 临时读入，不写文件、不进日志；每步先看输出里的 `host` 是否为目标库。
+
+```powershell
+$env:PROD_DATABASE_URL = '<目标库连接串>'
+# 0) 部署应用（运行期行为不依赖 schema_migrations，可先行）；按 docs/auth-deployment.md「生产收口」第 2 步做备份 / Neon 时间点分支
+# 1) auth：预期 plan.status=up-to-date、before.max=7；有 pending 再 --yes-i-mean-production
+npm run migrate:auth:prod -- --database-url-env=PROD_DATABASE_URL --dry-run
+# 2) 只读核对（含列类型）：预期退出码 2，原因只有 v3（±v2）未登记——expectedMigrations 里 v1 checksumOk=true，
+#    ledger.errors=[]，runtimeColumns.ok=true，missingTables=[]，authVersionOk=true。其余任何一项不符先停。
+npm run db:check:prod -- --database-url-env=PROD_DATABASE_URL
+# 3) dry-run：预期 status=dry-run，ledger.pending 为 [3]（或 [2,3]），ledgerWrites 只有对应的 schema_migrations 行
+npm run db:migrate:prod -- --database-url-env=PROD_DATABASE_URL
+# 4) 执行（低峰）：预期 status=applied，v1 unchanged、v2 unchanged 或 applied、v3 applied，after.ok=true
+npm run db:migrate:prod -- --database-url-env=PROD_DATABASE_URL --apply
+# 5) 复核：退出码 0
+npm run db:check:prod -- --database-url-env=PROD_DATABASE_URL
+Remove-Item Env:PROD_DATABASE_URL
+```
+
+对已有库，`0003` 全部是 `IF NOT EXISTS` / `ON CONFLICT DO NOTHING`，唯一实写是 `schema_migrations` 插入 v3（v2 未登记时再加 v2 一行，DDL 空转）。`ALTER TABLE … ADD COLUMN IF NOT EXISTS` 即便空转也要短暂拿 `ACCESS EXCLUSIVE` 锁，取不到锁 10 秒后整批回滚、不留半成品，低峰重试即可。
+
+### 灾备冷建库顺序（空库）
+
+`db:migrate:prod --apply`（0001→0003，`after.authVersion=4`、`authVersionOk=false` 属预期，输出 `next` 提示）→ `migrate:auth:prod --yes-i-mean-production`（补 auth 5/6/7）→ `db:check:prod` 退出码 0 → 部署应用。每一步之前都可以先跑对应的 dry-run。
+
+### 回滚
+
+- 应用代码：revert 即可。旧代码没有本入口；旧 `db:migrate` / `db:check` 只遍历自己列表里的版本，库里多一行 v3 不影响它们。
+- 库：对已有库 v3 只多一行记账，通常无需回滚；确要撤回用 `DELETE FROM schema_migrations WHERE version = 3`（表结构不动）。`--apply` 失败时整批事务回滚，无半成品。冷建库失败直接丢弃该库 / 分支重来。auth 迁移只进不退，见 `docs/auth-deployment.md`。
 
 ## 三类起点差异
 

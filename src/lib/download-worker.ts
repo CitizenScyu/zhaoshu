@@ -14,9 +14,9 @@
 
 import { createHash } from 'node:crypto';
 import type { DownloadTaskLease } from './download-task-queue';
-import { SOURCE_RETRY_MAX_ATTEMPTS, sourceRetryDelayMs } from './download-task-policy';
+import { PUBLICATION_RETRY_MAX_ATTEMPTS, SOURCE_RETRY_MAX_ATTEMPTS, sourceRetryDelayMs } from './download-task-policy';
 import {
-  LeaseLostError, publishBookVersion, PublicationStageError, snapshotPaths,
+  isRetryablePublicationError, LeaseLostError, publishBookVersion, PublicationStageError, snapshotPaths,
   type GitHubContents, type PublishOutcome,
 } from './download-publisher';
 import { artifactIdentityKey } from './artifact-registry';
@@ -172,7 +172,7 @@ export interface WorkerResult {
   processed: boolean;
   terminal?: 'done' | 'failed' | 'partial' | 'superseded_by_incomplete';
   reason?: string;
-  /** source_unavailable 专用（供执行器打结构化日志）：判定阶段、源 host、下次可重试时刻（null = 已封顶转终态）。 */
+  /** source_unavailable 专用（供执行器打结构化日志）：判定阶段、源 host；retryAt 另用于 publication_retry：下次可重试时刻（null = 已封顶转终态）。 */
   stage?: string;
   sourceHost?: string;
   retryAt?: string | null;
@@ -203,6 +203,34 @@ export async function settleSourceUnavailable(
   const written = await storage.finish(lease, {
     status: 'partial',
     error: `源不可用（${stage} 阶段，已连续 ${lease.attemptCount} 次，停止自动重试）：source_unavailable`,
+  });
+  if (!written) throw new TaskLeaseLostError();
+  return { retryAt: null };
+}
+
+/**
+ * B2-03:发布可重试失败(isRetryablePublicationError)的统一收口,与 settleSourceUnavailable 同一机制:
+ * 未达上限 ⇒ 租约条件放回 pending,按 attempt_count 退避,claim 到期重领后整条链路重跑
+ * (快照卷内容寻址幂等重写、规范卷按 sha 跳过已就位卷、最后补写 index.json ⇒ 半新半旧自愈);
+ * 达上限 ⇒ failed 终态;失租约 ⇒ TaskLeaseLostError(行已归接管者,不写)。
+ */
+export async function settlePublicationFailure(
+  storage: Pick<WorkerStorage, 'defer' | 'finish'>,
+  lease: DownloadTaskLease,
+  error: PublicationStageError,
+): Promise<{ retryAt: string | null }> {
+  const cause = `${error.stage}:${error.detail}`;
+  if (lease.attemptCount < PUBLICATION_RETRY_MAX_ATTEMPTS) {
+    const retryAt = await storage.defer(lease, {
+      delayMs: sourceRetryDelayMs(lease.attemptCount),
+      error: cleanPgText(`发布失败（${cause}，第 ${lease.attemptCount} 次）：自动退避重试`),
+    });
+    if (!retryAt) throw new TaskLeaseLostError();
+    return { retryAt };
+  }
+  const written = await storage.finish(lease, {
+    status: 'failed',
+    error: cleanPgText(`发布失败（${cause}，已连续 ${lease.attemptCount} 次，停止自动重试）`),
   });
   if (!written) throw new TaskLeaseLostError();
   return { retryAt: null };
@@ -306,6 +334,15 @@ export async function runDownloadTask(
         chapterRanges: outcome.chapterRanges,
       });
     } catch (error) {
+      if (isRetryablePublicationError(error)) {
+        // B2-03:GitHub 写入失败(含规范阶段中途失败)放回 pending 退避重跑,不落 failed 终态。
+        await heartbeat.stop();
+        throwIfAbortedUnlessBudget(signal);
+        const { retryAt } = await settlePublicationFailure(storage, lease, error);
+        return retryAt
+          ? { processed: true, reason: 'publication_retry', retryAt }
+          : { processed: true, terminal: 'failed', reason: error.message, retryAt: null };
+      }
       if (error instanceof LeaseLostError || error instanceof PublicationStageError) throw error;
       throw new Error(`publication_failed:${(error as { code?: string })?.code ?? 'unknown'}`);
     }

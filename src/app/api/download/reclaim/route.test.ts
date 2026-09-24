@@ -69,12 +69,15 @@ describe('GET /api/download/reclaim (F16 周期回收)', () => {
     expect(await res.json()).toEqual({ ok: true });
     // 复用与 POST 相同的回收谓词：running 且心跳过期；活跃心跳不在其中。
     const query = queryText(0);
-    expect(query).toMatch(/^UPDATE download_tasks SET status = 'failed',/);
+    expect(query).toMatch(/^UPDATE download_tasks SET status = CASE WHEN requested_by = 'system' AND attempt_count < \? THEN 'pending' ELSE 'failed' END,/);
     expect(query).toContain('lease_generation = lease_generation + 1');
     expect(query).toContain("lease_owner = ''");
     expect(query).toContain("status = 'running' AND updated_at < now()");
     expect(query).toContain("interval '1 millisecond'");
-    expect(sql.mock.calls[0].slice(1)).toEqual(['\nworker 中断自动回收', 30 * 60_000]);
+    expect(sql.mock.calls[0].slice(1)).toEqual([
+      16, 16, 16, 15 * 60_000, 6 * 60 * 60_000, 16,
+      '\nworker 中断自动回收，退避后重新入队', '\nworker 中断自动回收', 30 * 60_000,
+    ]);
   });
 
   it('R1：回收不再把长模型任务挂到 30s 宿主的 after', async () => {
