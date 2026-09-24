@@ -15,12 +15,13 @@
 // 3. 跑完 migrate:auth:prod 后 db:check 通过，ensureSchema 的两步都成功。
 // 4. 闸门单向：库版本 8 放行，降到 6 抛 AuthSchemaRequiredError。
 
+import { readFile } from 'node:fs/promises';
 import { beforeAll, describe, expect, it } from 'vitest';
 import { assertAuthSchema, AuthSchemaRequiredError } from '@/lib/auth-store';
 import { initializeBusinessSchema } from '@/lib/business-schema';
 import { loadPGlite, type PGliteLike } from '@/lib/fixtures/pglite';
 import { createPGliteClient, createPGliteSql } from '@/lib/fixtures/pglite-sql';
-import { applyMigration, evaluateSchema, inspectSchema, loadMigrations, PUBLISHED_CHECKSUMS } from '../../scripts/db-migration-lib.mjs';
+import { applyMigration, checksumOf, evaluateSchema, inspectSchema, loadMigrations, PUBLISHED_CHECKSUMS } from '../../scripts/db-migration-lib.mjs';
 import { runAuthMigration } from '../../scripts/migrate-auth-prod.mjs';
 
 const PGliteCtor = await loadPGlite();
@@ -31,6 +32,16 @@ it('已发布迁移的摘要与冻结值一致（改已发布文件的字节会�
   for (const [version, checksum] of Object.entries(PUBLISHED_CHECKSUMS)) {
     expect(migrations.find((item) => item.version === Number(version))?.checksum, `v${version}`).toBe(checksum);
   }
+}, 60_000);
+
+it('CRLF 检出不改变已发布摘要（Windows core.autocrlf=true 的工作区）', async () => {
+  const migrations = await loadMigrations();
+  for (const [version, checksum] of Object.entries(PUBLISHED_CHECKSUMS)) {
+    const lf = migrations.find((item) => item.version === Number(version))!.sql;
+    expect(checksumOf(lf.replaceAll('\n', '\r\n')), `v${version}`).toBe(checksum);
+  }
+  // 盘上字节也钉成 LF：不经 normalizeSqlText 直接读文件的工具（psql -f 等）拿到的是同一份字节。
+  expect(await readFile(new URL('../../.gitattributes', import.meta.url), 'utf8')).toMatch(/^\/migrations\/\*\.sql\s+text\s+eol=lf\s*$/m);
 }, 60_000);
 
 maybe('冷建库灾备链路（db:migrate → migrate:auth:prod → ensureSchema，全真 SQL）', () => {
