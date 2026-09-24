@@ -5,21 +5,22 @@
 // PUBLISHED_CHECKSUMS 同理——以后的迁移不改这里（baseline 只替 v1–v3 作证）。
 //
 // 每张表出自哪段 SQL 见 db-baseline.mjs 的 BASELINE_TABLE_SOURCES。
-// columns:     [列名, format_type, NOT NULL, 默认值表达式, identity('d'=BY DEFAULT), 生成列表达式]（按列名排序，不比列序）
+// columns:     [列名, format_type, NOT NULL, 默认值表达式, identity('d'=BY DEFAULT), 生成列表达式, 所属序列的 pg_sequence 参数]
+//              （按列名排序，不比列序；序列参数含 identity 的 START WITH 与 serial 的步长 / 上下限 / cache / cycle）
 // constraints: [约束名, contype(p/u/f/c), pg_get_constraintdef]
 // indexes:     [索引名, indexdef]
 export const BASELINE_SHAPE = {
   app_settings: {
     columns: [
-      ["default_model", "text", false, null, null, null],
-      ["default_model_reasoning", "text", false, null, null, null],
-      ["default_model_updated_at", "timestamp with time zone", false, null, null, null],
-      ["id", "integer", true, "1", null, null],
-      ["label_model", "text", false, null, null, null],
-      ["label_model_updated_at", "timestamp with time zone", false, null, null, null],
-      ["llm_model", "text", false, null, null, null],
-      ["llm_reasoning", "text", false, null, null, null],
-      ["updated_at", "timestamp with time zone", true, "now()", null, null],
+      ["default_model", "text", false, null, null, null, null],
+      ["default_model_reasoning", "text", false, null, null, null, null],
+      ["default_model_updated_at", "timestamp with time zone", false, null, null, null, null],
+      ["id", "integer", true, "1", null, null, null],
+      ["label_model", "text", false, null, null, null, null],
+      ["label_model_updated_at", "timestamp with time zone", false, null, null, null, null],
+      ["llm_model", "text", false, null, null, null, null],
+      ["llm_reasoning", "text", false, null, null, null, null],
+      ["updated_at", "timestamp with time zone", true, "now()", null, null, null],
     ],
     constraints: [
       ["app_settings_pkey", "p", "PRIMARY KEY (id)"],
@@ -30,11 +31,11 @@ export const BASELINE_SHAPE = {
   },
   auth_rate_limits: {
     columns: [
-      ["attempts", "integer", true, null, null, null],
-      ["expires_at", "timestamp with time zone", true, null, null, null],
-      ["key_hash", "character(64)", true, null, null, null],
-      ["scope", "text", true, null, null, null],
-      ["window_start", "timestamp with time zone", true, null, null, null],
+      ["attempts", "integer", true, null, null, null, null],
+      ["expires_at", "timestamp with time zone", true, null, null, null, null],
+      ["key_hash", "character(64)", true, null, null, null, null],
+      ["scope", "text", true, null, null, null, null],
+      ["window_start", "timestamp with time zone", true, null, null, null, null],
     ],
     constraints: [
       ["auth_rate_limits_attempts_check", "c", "CHECK ((attempts >= 0))"],
@@ -47,8 +48,8 @@ export const BASELINE_SHAPE = {
   },
   auth_schema_migrations: {
     columns: [
-      ["applied_at", "timestamp with time zone", true, "now()", null, null],
-      ["version", "integer", true, null, null, null],
+      ["applied_at", "timestamp with time zone", true, "now()", null, null, null],
+      ["version", "integer", true, null, null, null, null],
     ],
     constraints: [
       ["auth_schema_migrations_pkey", "p", "PRIMARY KEY (version)"],
@@ -59,10 +60,10 @@ export const BASELINE_SHAPE = {
   },
   auth_settings: {
     columns: [
-      ["id", "integer", true, null, null, null],
-      ["members_enabled", "boolean", true, "false", null, null],
-      ["registration_mode", "text", true, "'closed'::text", null, null],
-      ["updated_at", "timestamp with time zone", true, "now()", null, null],
+      ["id", "integer", true, null, null, null, null],
+      ["members_enabled", "boolean", true, "false", null, null, null],
+      ["registration_mode", "text", true, "'closed'::text", null, null, null],
+      ["updated_at", "timestamp with time zone", true, "now()", null, null, null],
     ],
     constraints: [
       ["auth_settings_id_check", "c", "CHECK ((id = 1))"],
@@ -75,16 +76,16 @@ export const BASELINE_SHAPE = {
   },
   books: {
     columns: [
-      ["author", "text", true, null, null, null],
-      ["author_key", "text", false, null, null, "lower(btrim(NORMALIZE(author, NFKC)))"],
-      ["created_at", "timestamp with time zone", true, "now()", null, null],
-      ["douban_id", "text", false, null, null, null],
-      ["douban_rating", "double precision", false, null, null, null],
-      ["douban_rating_count", "integer", false, null, null, null],
-      ["id", "integer", true, "nextval('books_id_seq'::regclass)", null, null],
-      ["meta", "jsonb", true, "'{}'::jsonb", null, null],
-      ["title", "text", true, null, null, null],
-      ["title_key", "text", false, null, null, "lower(btrim(regexp_replace(btrim(NORMALIZE(title, NFKC)), '^《(.+)》$'::text, '\\1'::text)))"],
+      ["author", "text", true, null, null, null, null],
+      ["author_key", "text", false, null, null, "lower(btrim(NORMALIZE(author, NFKC)))", null],
+      ["created_at", "timestamp with time zone", true, "now()", null, null, null],
+      ["douban_id", "text", false, null, null, null, null],
+      ["douban_rating", "double precision", false, null, null, null, null],
+      ["douban_rating_count", "integer", false, null, null, null, null],
+      ["id", "integer", true, "nextval('books_id_seq'::regclass)", null, null, "type=integer start=1 increment=1 min=1 max=2147483647 cache=1 cycle=f"],
+      ["meta", "jsonb", true, "'{}'::jsonb", null, null, null],
+      ["title", "text", true, null, null, null, null],
+      ["title_key", "text", false, null, null, "lower(btrim(regexp_replace(btrim(NORMALIZE(title, NFKC)), '^《(.+)》$'::text, '\\1'::text)))", null],
     ],
     constraints: [
       ["books_pkey", "p", "PRIMARY KEY (id)"],
@@ -96,8 +97,8 @@ export const BASELINE_SHAPE = {
   },
   cron_health: {
     columns: [
-      ["last_success_at", "timestamp with time zone", true, "now()", null, null],
-      ["name", "text", true, null, null, null],
+      ["last_success_at", "timestamp with time zone", true, "now()", null, null, null],
+      ["name", "text", true, null, null, null, null],
     ],
     constraints: [
       ["cron_health_pkey", "p", "PRIMARY KEY (name)"],
@@ -108,18 +109,18 @@ export const BASELINE_SHAPE = {
   },
   download_tasks: {
     columns: [
-      ["author", "text", true, "''::text", null, null],
-      ["book_id", "integer", true, null, null, null],
-      ["chapters_done", "integer", true, "0", null, null],
-      ["chapters_total", "integer", true, "0", null, null],
-      ["chars_total", "integer", true, "0", null, null],
-      ["created_at", "timestamp with time zone", true, "now()", null, null],
-      ["error", "text", true, "''::text", null, null],
-      ["id", "integer", true, "nextval('download_tasks_id_seq'::regclass)", null, null],
-      ["source_url", "text", true, "''::text", null, null],
-      ["status", "text", true, "'pending'::text", null, null],
-      ["title", "text", true, null, null, null],
-      ["updated_at", "timestamp with time zone", true, "now()", null, null],
+      ["author", "text", true, "''::text", null, null, null],
+      ["book_id", "integer", true, null, null, null, null],
+      ["chapters_done", "integer", true, "0", null, null, null],
+      ["chapters_total", "integer", true, "0", null, null, null],
+      ["chars_total", "integer", true, "0", null, null, null],
+      ["created_at", "timestamp with time zone", true, "now()", null, null, null],
+      ["error", "text", true, "''::text", null, null, null],
+      ["id", "integer", true, "nextval('download_tasks_id_seq'::regclass)", null, null, "type=integer start=1 increment=1 min=1 max=2147483647 cache=1 cycle=f"],
+      ["source_url", "text", true, "''::text", null, null, null],
+      ["status", "text", true, "'pending'::text", null, null, null],
+      ["title", "text", true, null, null, null, null],
+      ["updated_at", "timestamp with time zone", true, "now()", null, null, null],
     ],
     constraints: [
       ["download_tasks_pkey", "p", "PRIMARY KEY (id)"],
@@ -130,12 +131,12 @@ export const BASELINE_SHAPE = {
   },
   feedback: {
     columns: [
-      ["book_id", "integer", true, null, null, null],
-      ["created_at", "timestamp with time zone", true, "now()", null, null],
-      ["id", "integer", true, "nextval('feedback_id_seq'::regclass)", null, null],
-      ["note", "text", true, "''::text", null, null],
-      ["status", "text", true, null, null, null],
-      ["user_id", "integer", true, null, null, null],
+      ["book_id", "integer", true, null, null, null, null],
+      ["created_at", "timestamp with time zone", true, "now()", null, null, null],
+      ["id", "integer", true, "nextval('feedback_id_seq'::regclass)", null, null, "type=integer start=1 increment=1 min=1 max=2147483647 cache=1 cycle=f"],
+      ["note", "text", true, "''::text", null, null, null],
+      ["status", "text", true, null, null, null, null],
+      ["user_id", "integer", true, null, null, null, null],
     ],
     constraints: [
       ["feedback_book_id_fkey", "f", "FOREIGN KEY (book_id) REFERENCES books(id)"],
@@ -149,21 +150,21 @@ export const BASELINE_SHAPE = {
   },
   labeled_books: {
     columns: [
-      ["author", "text", true, "''::text", null, null],
-      ["author_key", "text", false, null, null, "lower(btrim(NORMALIZE(author, NFKC)))"],
-      ["category", "text", true, "''::text", null, null],
-      ["chars_labeled", "integer", true, "0", null, null],
-      ["finish_status", "text", true, "''::text", null, null],
-      ["id", "integer", true, "nextval('labeled_books_id_seq'::regclass)", null, null],
-      ["labeled_at", "timestamp with time zone", true, "now()", null, null],
-      ["labels", "jsonb", true, "'{}'::jsonb", null, null],
-      ["primary_genre", "text", true, "''::text", null, null],
-      ["quality", "double precision", false, null, null, null],
-      ["source_site", "text", true, "''::text", null, null],
-      ["source_url", "text", true, "''::text", null, null],
-      ["sub_tags", "jsonb", true, "'[]'::jsonb", null, null],
-      ["title", "text", true, null, null, null],
-      ["title_key", "text", false, null, null, "lower(btrim(regexp_replace(btrim(NORMALIZE(title, NFKC)), '^《(.+)》$'::text, '\\1'::text)))"],
+      ["author", "text", true, "''::text", null, null, null],
+      ["author_key", "text", false, null, null, "lower(btrim(NORMALIZE(author, NFKC)))", null],
+      ["category", "text", true, "''::text", null, null, null],
+      ["chars_labeled", "integer", true, "0", null, null, null],
+      ["finish_status", "text", true, "''::text", null, null, null],
+      ["id", "integer", true, "nextval('labeled_books_id_seq'::regclass)", null, null, "type=integer start=1 increment=1 min=1 max=2147483647 cache=1 cycle=f"],
+      ["labeled_at", "timestamp with time zone", true, "now()", null, null, null],
+      ["labels", "jsonb", true, "'{}'::jsonb", null, null, null],
+      ["primary_genre", "text", true, "''::text", null, null, null],
+      ["quality", "double precision", false, null, null, null, null],
+      ["source_site", "text", true, "''::text", null, null, null],
+      ["source_url", "text", true, "''::text", null, null, null],
+      ["sub_tags", "jsonb", true, "'[]'::jsonb", null, null, null],
+      ["title", "text", true, null, null, null, null],
+      ["title_key", "text", false, null, null, "lower(btrim(regexp_replace(btrim(NORMALIZE(title, NFKC)), '^《(.+)》$'::text, '\\1'::text)))", null],
     ],
     constraints: [
       ["labeled_books_pkey", "p", "PRIMARY KEY (id)"],
@@ -175,17 +176,17 @@ export const BASELINE_SHAPE = {
   },
   llm_usage: {
     columns: [
-      ["cache_tokens", "bigint", true, "0", null, null],
-      ["completion_tokens", "bigint", true, "0", null, null],
-      ["created_at", "timestamp with time zone", true, "now()", null, null],
-      ["id", "bigint", true, "nextval('llm_usage_id_seq'::regclass)", null, null],
-      ["model", "text", true, null, null, null],
-      ["phase", "text", true, null, null, null],
-      ["prompt_tokens", "bigint", true, "0", null, null],
-      ["request_id", "text", false, null, null, null],
-      ["total_tokens", "bigint", false, null, null, null],
-      ["usage_details", "jsonb", true, "'{}'::jsonb", null, null],
-      ["usage_missing", "boolean", true, "true", null, null],
+      ["cache_tokens", "bigint", true, "0", null, null, null],
+      ["completion_tokens", "bigint", true, "0", null, null, null],
+      ["created_at", "timestamp with time zone", true, "now()", null, null, null],
+      ["id", "bigint", true, "nextval('llm_usage_id_seq'::regclass)", null, null, "type=bigint start=1 increment=1 min=1 max=9223372036854775807 cache=1 cycle=f"],
+      ["model", "text", true, null, null, null, null],
+      ["phase", "text", true, null, null, null, null],
+      ["prompt_tokens", "bigint", true, "0", null, null, null],
+      ["request_id", "text", false, null, null, null, null],
+      ["total_tokens", "bigint", false, null, null, null, null],
+      ["usage_details", "jsonb", true, "'{}'::jsonb", null, null, null],
+      ["usage_missing", "boolean", true, "true", null, null, null],
     ],
     constraints: [
       ["llm_usage_cache_tokens_check", "c", "CHECK ((cache_tokens >= 0))"],
@@ -202,10 +203,10 @@ export const BASELINE_SHAPE = {
   },
   profile: {
     columns: [
-      ["content", "text", true, "''::text", null, null],
-      ["id", "integer", true, null, null, null],
-      ["seeds", "jsonb", true, "'[]'::jsonb", null, null],
-      ["updated_at", "timestamp with time zone", true, "now()", null, null],
+      ["content", "text", true, "''::text", null, null, null],
+      ["id", "integer", true, null, null, null, null],
+      ["seeds", "jsonb", true, "'[]'::jsonb", null, null, null],
+      ["updated_at", "timestamp with time zone", true, "now()", null, null, null],
     ],
     constraints: [
       ["profile_pkey", "p", "PRIMARY KEY (id)"],
@@ -217,17 +218,17 @@ export const BASELINE_SHAPE = {
   },
   profile_feedback_queue: {
     columns: [
-      ["absorbed_feedback_id", "integer", true, "0", null, null],
-      ["attempts", "integer", true, "0", null, null],
-      ["fail_count", "integer", true, "0", null, null],
-      ["last_error", "text", true, "''::text", null, null],
-      ["lease_expires_at", "timestamp with time zone", false, null, null, null],
-      ["lease_token", "text", true, "''::text", null, null],
-      ["next_eligible_at", "timestamp with time zone", false, null, null, null],
-      ["pending_feedback_id", "integer", false, null, null, null],
-      ["status", "text", true, "'unchanged'::text", null, null],
-      ["updated_at", "timestamp with time zone", true, "now()", null, null],
-      ["user_id", "integer", true, null, null, null],
+      ["absorbed_feedback_id", "integer", true, "0", null, null, null],
+      ["attempts", "integer", true, "0", null, null, null],
+      ["fail_count", "integer", true, "0", null, null, null],
+      ["last_error", "text", true, "''::text", null, null, null],
+      ["lease_expires_at", "timestamp with time zone", false, null, null, null, null],
+      ["lease_token", "text", true, "''::text", null, null, null],
+      ["next_eligible_at", "timestamp with time zone", false, null, null, null, null],
+      ["pending_feedback_id", "integer", false, null, null, null, null],
+      ["status", "text", true, "'unchanged'::text", null, null, null],
+      ["updated_at", "timestamp with time zone", true, "now()", null, null, null],
+      ["user_id", "integer", true, null, null, null, null],
     ],
     constraints: [
       ["profile_feedback_queue_pkey", "p", "PRIMARY KEY (user_id)"],
@@ -239,15 +240,15 @@ export const BASELINE_SHAPE = {
   },
   profile_seed_audit: {
     columns: [
-      ["added_titles", "jsonb", true, null, null, null],
-      ["created_at", "timestamp with time zone", true, "now()", null, null],
-      ["id", "bigint", true, "nextval('profile_seed_audit_id_seq'::regclass)", null, null],
-      ["previous_seeds", "jsonb", true, null, null, null],
-      ["previous_version", "text", true, null, null, null],
-      ["removed_titles", "jsonb", true, null, null, null],
-      ["saved_seeds", "jsonb", true, null, null, null],
-      ["saved_version", "text", true, null, null, null],
-      ["user_id", "integer", true, null, null, null],
+      ["added_titles", "jsonb", true, null, null, null, null],
+      ["created_at", "timestamp with time zone", true, "now()", null, null, null],
+      ["id", "bigint", true, "nextval('profile_seed_audit_id_seq'::regclass)", null, null, "type=bigint start=1 increment=1 min=1 max=9223372036854775807 cache=1 cycle=f"],
+      ["previous_seeds", "jsonb", true, null, null, null, null],
+      ["previous_version", "text", true, null, null, null, null],
+      ["removed_titles", "jsonb", true, null, null, null, null],
+      ["saved_seeds", "jsonb", true, null, null, null, null],
+      ["saved_version", "text", true, null, null, null, null],
+      ["user_id", "integer", true, null, null, null, null],
     ],
     constraints: [
       ["profile_seed_audit_pkey", "p", "PRIMARY KEY (id)"],
@@ -259,16 +260,16 @@ export const BASELINE_SHAPE = {
   },
   recommendations: {
     columns: [
-      ["book_id", "integer", true, null, null, null],
-      ["created_at", "timestamp with time zone", true, "now()", null, null],
-      ["hit_likes", "jsonb", false, null, null, null],
-      ["id", "integer", true, "nextval('recommendations_id_seq'::regclass)", null, null],
-      ["match_score", "double precision", false, null, null, null],
-      ["query", "text", true, null, null, null],
-      ["reason", "text", false, null, null, null],
-      ["risks", "text", false, null, null, null],
-      ["status", "text", true, "'new'::text", null, null],
-      ["user_id", "integer", true, null, null, null],
+      ["book_id", "integer", true, null, null, null, null],
+      ["created_at", "timestamp with time zone", true, "now()", null, null, null],
+      ["hit_likes", "jsonb", false, null, null, null, null],
+      ["id", "integer", true, "nextval('recommendations_id_seq'::regclass)", null, null, "type=integer start=1 increment=1 min=1 max=2147483647 cache=1 cycle=f"],
+      ["match_score", "double precision", false, null, null, null, null],
+      ["query", "text", true, null, null, null, null],
+      ["reason", "text", false, null, null, null, null],
+      ["risks", "text", false, null, null, null, null],
+      ["status", "text", true, "'new'::text", null, null, null],
+      ["user_id", "integer", true, null, null, null, null],
     ],
     constraints: [
       ["recommendations_book_id_fkey", "f", "FOREIGN KEY (book_id) REFERENCES books(id)"],
@@ -283,12 +284,12 @@ export const BASELINE_SHAPE = {
   },
   sessions: {
     columns: [
-      ["auth_method", "text", true, null, null, null],
-      ["created_at", "timestamp with time zone", true, "now()", null, null],
-      ["expires_at", "timestamp with time zone", true, null, null, null],
-      ["owner_credential_tag", "character(64)", false, null, null, null],
-      ["token_hash", "character(64)", true, null, null, null],
-      ["user_id", "integer", true, null, null, null],
+      ["auth_method", "text", true, null, null, null, null],
+      ["created_at", "timestamp with time zone", true, "now()", null, null, null],
+      ["expires_at", "timestamp with time zone", true, null, null, null, null],
+      ["owner_credential_tag", "character(64)", false, null, null, null, null],
+      ["token_hash", "character(64)", true, null, null, null, null],
+      ["user_id", "integer", true, null, null, null, null],
     ],
     constraints: [
       ["sessions_auth_method_check", "c", "CHECK ((auth_method = ANY (ARRAY['password'::text, 'owner_token'::text])))"],
@@ -307,9 +308,9 @@ export const BASELINE_SHAPE = {
   },
   shuyuan_meta: {
     columns: [
-      ["collections", "jsonb", true, "'[]'::jsonb", null, null],
-      ["id", "integer", true, "1", null, null],
-      ["refreshed_at", "timestamp with time zone", false, null, null, null],
+      ["collections", "jsonb", true, "'[]'::jsonb", null, null, null],
+      ["id", "integer", true, "1", null, null, null],
+      ["refreshed_at", "timestamp with time zone", false, null, null, null, null],
     ],
     constraints: [
       ["shuyuan_meta_pkey", "p", "PRIMARY KEY (id)"],
@@ -320,14 +321,14 @@ export const BASELINE_SHAPE = {
   },
   shuyuan_sources: {
     columns: [
-      ["disabled_at", "timestamp with time zone", false, null, null, null],
-      ["group_name", "text", true, "''::text", null, null],
-      ["id", "integer", true, "nextval('shuyuan_sources_id_seq'::regclass)", null, null],
-      ["last_error", "text", true, "''::text", null, null],
-      ["name", "text", true, "''::text", null, null],
-      ["source", "jsonb", true, null, null, null],
-      ["source_url", "text", true, null, null, null],
-      ["updated_at", "timestamp with time zone", true, "now()", null, null],
+      ["disabled_at", "timestamp with time zone", false, null, null, null, null],
+      ["group_name", "text", true, "''::text", null, null, null],
+      ["id", "integer", true, "nextval('shuyuan_sources_id_seq'::regclass)", null, null, "type=integer start=1 increment=1 min=1 max=2147483647 cache=1 cycle=f"],
+      ["last_error", "text", true, "''::text", null, null, null],
+      ["name", "text", true, "''::text", null, null, null],
+      ["source", "jsonb", true, null, null, null, null],
+      ["source_url", "text", true, null, null, null, null],
+      ["updated_at", "timestamp with time zone", true, "now()", null, null, null],
     ],
     constraints: [
       ["shuyuan_sources_pkey", "p", "PRIMARY KEY (id)"],
@@ -340,19 +341,19 @@ export const BASELINE_SHAPE = {
   },
   source_admission: {
     columns: [
-      ["compile_diagnostics", "jsonb", true, "'[]'::jsonb", null, null],
-      ["compile_ok", "boolean", true, null, null, null],
-      ["core_field_mask", "jsonb", true, null, null, null],
-      ["engine_semantics_version", "integer", true, "0", null, null],
-      ["error", "text", true, "''::text", null, null],
-      ["host", "text", true, null, null, null],
-      ["id", "integer", true, "nextval('source_admission_id_seq'::regclass)", null, null],
-      ["rules_hash", "text", true, null, null, null],
-      ["search_checked_at", "timestamp with time zone", false, null, null, null],
-      ["search_ok", "boolean", false, null, null, null],
-      ["search_verdict", "text", true, "''::text", null, null],
-      ["source_url", "text", true, null, null, null],
-      ["tier", "text", true, null, null, null],
+      ["compile_diagnostics", "jsonb", true, "'[]'::jsonb", null, null, null],
+      ["compile_ok", "boolean", true, null, null, null, null],
+      ["core_field_mask", "jsonb", true, null, null, null, null],
+      ["engine_semantics_version", "integer", true, "0", null, null, null],
+      ["error", "text", true, "''::text", null, null, null],
+      ["host", "text", true, null, null, null, null],
+      ["id", "integer", true, "nextval('source_admission_id_seq'::regclass)", null, null, "type=integer start=1 increment=1 min=1 max=2147483647 cache=1 cycle=f"],
+      ["rules_hash", "text", true, null, null, null, null],
+      ["search_checked_at", "timestamp with time zone", false, null, null, null, null],
+      ["search_ok", "boolean", false, null, null, null, null],
+      ["search_verdict", "text", true, "''::text", null, null, null],
+      ["source_url", "text", true, null, null, null, null],
+      ["tier", "text", true, null, null, null, null],
     ],
     constraints: [
       ["source_admission_pkey", "p", "PRIMARY KEY (id)"],
@@ -366,9 +367,9 @@ export const BASELINE_SHAPE = {
   },
   source_read_catalogs: {
     columns: [
-      ["expires_at", "timestamp with time zone", true, null, null, null],
-      ["id", "text", true, null, null, null],
-      ["payload", "jsonb", true, null, null, null],
+      ["expires_at", "timestamp with time zone", true, null, null, null, null],
+      ["id", "text", true, null, null, null, null],
+      ["payload", "jsonb", true, null, null, null, null],
     ],
     constraints: [
       ["source_read_catalogs_pkey", "p", "PRIMARY KEY (id)"],
@@ -380,17 +381,17 @@ export const BASELINE_SHAPE = {
   },
   users: {
     columns: [
-      ["can_download", "boolean", true, "false", null, null],
-      ["can_find", "boolean", true, "true", null, null],
-      ["can_read", "boolean", true, "false", null, null],
-      ["created_at", "timestamp with time zone", true, "now()", null, null],
-      ["created_via_invite_id", "integer", false, null, null, null],
-      ["disabled_at", "timestamp with time zone", false, null, null, null],
-      ["id", "integer", true, null, "d", null],
-      ["password_hash", "text", false, null, null, null],
-      ["role", "text", true, "'member'::text", null, null],
-      ["updated_at", "timestamp with time zone", true, "now()", null, null],
-      ["username", "text", true, null, null, null],
+      ["can_download", "boolean", true, "false", null, null, null],
+      ["can_find", "boolean", true, "true", null, null, null],
+      ["can_read", "boolean", true, "false", null, null, null],
+      ["created_at", "timestamp with time zone", true, "now()", null, null, null],
+      ["created_via_invite_id", "integer", false, null, null, null, null],
+      ["disabled_at", "timestamp with time zone", false, null, null, null, null],
+      ["id", "integer", true, null, "d", null, "type=integer start=2 increment=1 min=1 max=2147483647 cache=1 cycle=f"],
+      ["password_hash", "text", false, null, null, null, null],
+      ["role", "text", true, "'member'::text", null, null, null],
+      ["updated_at", "timestamp with time zone", true, "now()", null, null, null],
+      ["username", "text", true, null, null, null, null],
     ],
     constraints: [
       ["users_check", "c", "CHECK ((((id = 1) AND (username = 'owner'::text) AND (role = 'owner'::text) AND (password_hash IS NULL) AND (disabled_at IS NULL) AND can_find AND can_read AND can_download) OR ((id > 1) AND (username <> 'owner'::text) AND (role = 'member'::text) AND (password_hash IS NOT NULL))))"],
@@ -404,6 +405,25 @@ export const BASELINE_SHAPE = {
     indexes: [
       ["users_pkey", "CREATE UNIQUE INDEX users_pkey ON public.users USING btree (id)"],
       ["users_username_key", "CREATE UNIQUE INDEX users_username_key ON public.users USING btree (username)"],
+    ],
+  },
+};
+
+// runner（db-migration-lib.mjs 的 SCHEMA_MIGRATIONS_DDL）建出的记账表形状。baseline 遇到「记账表在但 0 行」时
+// 要求形状与它一致才视同未登记（复审 baserev41 #1），测试同样重跑迁移钉住。
+export const BASELINE_LEDGER_SHAPE = {
+  schema_migrations: {
+    columns: [
+      ["applied_at", "timestamp with time zone", true, "now()", null, null, null],
+      ["checksum", "character(64)", true, null, null, null, null],
+      ["name", "text", true, null, null, null, null],
+      ["version", "integer", true, null, null, null, null],
+    ],
+    constraints: [
+      ["schema_migrations_pkey", "p", "PRIMARY KEY (version)"],
+    ],
+    indexes: [
+      ["schema_migrations_pkey", "CREATE UNIQUE INDEX schema_migrations_pkey ON public.schema_migrations USING btree (version)"],
     ],
   },
 };

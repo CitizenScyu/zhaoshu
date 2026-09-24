@@ -108,15 +108,18 @@ export async function runProdCheck(client, migrations) {
   };
 }
 
-// 从未登记的已有库：没有 schema_migrations，却已有迁移要建的表。对它 --apply 会把 0001 整份在在线表上重跑
-// （ALTER COLUMN / UPDATE / SET NOT NULL），而不是只补记账——生产正是这个形态（prodmig41，2026-09-24）。
-// 冷建库只能是空库；已有库先用 db:baseline:prod 核对并登记。
+// 从未登记的已有库：没有登记任何版本（没有 schema_migrations，或表在但 0 行），却已有迁移要建的表。
+// 对它 --apply 会把 0001 整份在在线表上重跑（ALTER COLUMN / UPDATE / SET NOT NULL），而不是只补记账——
+// 生产正是这个形态（prodmig41，2026-09-24）。空记账表与没有记账表同样处理（复审 baserev41 #1：只看表在不在，
+// 空表会被当成已登记而放行重放）。冷建库只能是空库；已有库先用 db:baseline:prod 核对并登记。
 export function unadoptedRefusal(report) {
   const present = new Set(report.columns.map((column) => column.table_name));
-  if (present.has('schema_migrations')) return [];
-  const existing = EXPECTED_TABLES.filter((table) => present.has(table));
+  const ledgerPresent = present.has('schema_migrations');
+  if (ledgerPresent && report.versions.length) return [];
+  const existing = EXPECTED_TABLES.filter((table) => table !== 'schema_migrations' && present.has(table));
   if (!existing.length) return [];
-  return [`库里没有 schema_migrations，却已有 ${existing.length} 张迁移管理的表（${existing.slice(0, 5).join(', ')}${existing.length > 5 ? ' …' : ''}）：`
+  const ledger = ledgerPresent ? 'schema_migrations 为空（0 行）' : '库里没有 schema_migrations';
+  return [`${ledger}，却已有 ${existing.length} 张迁移管理的表（${existing.slice(0, 5).join(', ')}${existing.length > 5 ? ' …' : ''}）：`
     + '这是从未登记的已有库，不能让 migrate 重跑 0001；先用 db:baseline:prod 核对并登记。冷建库须从空库开始'];
 }
 

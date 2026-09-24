@@ -9,13 +9,14 @@
 //            默认值 / identity / 生成式）、每条约束（名称 + 类型 + 定义）、每个索引（名称 + 定义）；
 //      缺席：0001/0002 删掉的东西（旧全局唯一键、旧表达式索引）必须不在（BASELINE_ABSENT）；
 //      数据：0001/0003 的 INSERT / UPDATE 想达成的行状态（BASELINE_DATA_CHECKS）；
-//      前提：没有 schema_migrations 表（有就交给 db:migrate:prod）、auth 记账 ≥ AUTH_SCHEMA_VERSION、
+//      前提：没有登记任何版本（没有 schema_migrations；或表在但 0 行且形状与 runner 建的一致——视同未登记，
+//            见 evaluateBaseline）、auth 记账 ≥ AUTH_SCHEMA_VERSION、
 //            迁移文件摘要等于 BASELINE_CHECKSUMS（契约只对这三份字节成立）。
 //   2. 全部成立才在 --apply 时于一个事务内拿迁移锁、锁内再核一遍、建 schema_migrations 并登记 v1–v3；
 //      任何一条不成立就拒绝（未写库），绝不部分登记。
 // 库里比契约多出的列 / 约束 / 索引（运行期与 auth v5–v7 后加的）只报告，不拒绝：0001–0003 不删它们。
 import { AUTH_SCHEMA_VERSION } from '../src/lib/auth-store.ts';
-import { BASELINE_SHAPE } from './db-baseline-contract.mjs';
+import { BASELINE_LEDGER_SHAPE, BASELINE_SHAPE } from './db-baseline-contract.mjs';
 import { assertIdentifier, inspectSchema, MIGRATION_LOCK_ID, SCHEMA_MIGRATIONS_DDL, TARGET_SCHEMA } from './db-migration-lib.mjs';
 
 // baseline 只替 v1–v3 作证；之后新增的迁移由 db:migrate:prod 正常执行。
@@ -57,9 +58,10 @@ export const BASELINE_ABSENT = [
     violations: (shape) => shape.constraints.filter((row) => row.table_name === 'recommendations' && row.contype === 'u'
       && row.definition === 'UNIQUE (book_id, query)').map((row) => row.conname) },
   { id: 'recommendations-global-unique-index', source: '0001:106-108',
-    describe: 'recommendations 上不得有 (book_id, query) 唯一索引（含 recommendations_book_query_idx）',
+    describe: 'recommendations 上不得有 (book_id, query) 唯一索引（含 recommendations_book_query_idx 与部分索引）',
+    // 与 0001:107 的 `indexdef ~ 'UNIQUE INDEX .* \(book_id, query\)'` 同一口径（不锚定结尾）：0001 会删的，这里都判违规。
     violations: (shape) => shape.indexes.filter((row) => row.table_name === 'recommendations'
-      && /^CREATE UNIQUE INDEX \S+ ON \S+ USING btree \(book_id, query\)$/.test(row.indexdef)).map((row) => row.index_name) },
+      && /UNIQUE INDEX .* \(book_id, query\)/.test(row.indexdef)).map((row) => row.index_name) },
   { id: 'books-title-author-idx', source: '0002:46',
     describe: 'books_title_author_idx（旧表达式唯一索引）不得存在',
     violations: (shape) => shape.indexes.filter((row) => row.index_name === 'books_title_author_idx').map((row) => row.index_name) },
@@ -116,6 +118,8 @@ export const BASELINE_DATA_CHECKS = [
 
 // 结构快照：只读 pg_catalog。按名称排序，列序不计（老库的列由 ADD COLUMN 追加，物理列序本来就不同）。
 // 约束只取 p/u/f/c/x：PostgreSQL 18 起 NOT NULL 也会以 contype='n' 出现，非空性已由列的 not_null 表达。
+// sequence：列所属序列（identity 或 serial，经 pg_get_serial_sequence）在 pg_sequence 里的全部参数——
+// 0001:5 的 identity `START WITH 2` 等只在这里可见，列的 identity 标记本身不含它（复审 baserev41 #2）。
 /** @returns {Promise<{ columns: Record<string, any>[], constraints: Record<string, any>[], indexes: Record<string, any>[] }>} */
 export async function inspectShape(client, schema = TARGET_SCHEMA) {
   assertIdentifier(schema);
@@ -124,11 +128,18 @@ export async function inspectShape(client, schema = TARGET_SCHEMA) {
       a.attnotnull AS not_null,
       CASE WHEN a.attgenerated = '' THEN pg_get_expr(d.adbin, d.adrelid) END AS column_default,
       NULLIF(a.attidentity, '') AS identity,
-      CASE WHEN a.attgenerated <> '' THEN pg_get_expr(d.adbin, d.adrelid) END AS generated
+      CASE WHEN a.attgenerated <> '' THEN pg_get_expr(d.adbin, d.adrelid) END AS generated,
+      seq.params AS sequence
     FROM pg_attribute a
     JOIN pg_class c ON c.oid = a.attrelid
     JOIN pg_namespace n ON n.oid = c.relnamespace
     LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum
+    LEFT JOIN LATERAL (
+      SELECT format('type=%s start=%s increment=%s min=%s max=%s cache=%s cycle=%s', format_type(s.seqtypid, NULL),
+        s.seqstart, s.seqincrement, s.seqmin, s.seqmax, s.seqcache, s.seqcycle) AS params
+      FROM pg_sequence s
+      WHERE s.seqrelid = to_regclass(pg_get_serial_sequence(format('%I.%I', n.nspname, c.relname), a.attname))
+    ) seq ON true
     WHERE n.nspname = $1 AND c.relkind IN ('r', 'p') AND a.attnum > 0 AND NOT a.attisdropped
     ORDER BY c.relname, a.attname
   `, [schema])).rows;
@@ -154,7 +165,8 @@ export function shapeToContract(shape, tables) {
   for (const table of [...tables].sort()) {
     contract[table] = {
       columns: shape.columns.filter((row) => row.table_name === table)
-        .map((row) => [row.column_name, row.type, row.not_null, row.column_default ?? null, row.identity ?? null, row.generated ?? null]),
+        .map((row) => [row.column_name, row.type, row.not_null, row.column_default ?? null, row.identity ?? null, row.generated ?? null,
+          row.sequence ?? null]),
       constraints: shape.constraints.filter((row) => row.table_name === table)
         .map((row) => [row.conname, row.contype, row.definition]),
       indexes: shape.indexes.filter((row) => row.table_name === table).map((row) => [row.index_name, row.indexdef]),
@@ -163,7 +175,7 @@ export function shapeToContract(shape, tables) {
   return contract;
 }
 
-const COLUMN_FIELDS = ['type', 'not_null', 'column_default', 'identity', 'generated'];
+const COLUMN_FIELDS = ['type', 'not_null', 'column_default', 'identity', 'generated', 'sequence'];
 
 // 纯函数：库的结构快照对照契约。problems 任一条即拒绝；extra 只报告。
 export function compareShape(shape, contract = BASELINE_SHAPE) {
@@ -231,8 +243,16 @@ async function runDataChecks(client, schema, shape) {
 export function evaluateBaseline({ report, shape, data, migrations }) {
   const refusals = [];
   const ledgerPresent = shape.columns.some((row) => row.table_name === 'schema_migrations');
-  if (ledgerPresent) {
+  if (ledgerPresent && report.versions.length) {
     refusals.push(`库里已有 schema_migrations（登记了 ${report.versions.length} 个版本）：已登记的库交给 db:migrate:prod，baseline 只处理从未登记的库`);
+  } else if (ledgerPresent) {
+    // 空记账表视同未登记（复审 baserev41 #1）：否则 baseline 拒、migrate 也拒，这种库无路可走。前提是表的形状与
+    // runner 建的完全一致——登记时 CREATE TABLE IF NOT EXISTS 空转，三行就写进这张现成的表；形状不同就拒绝，
+    // 由人确认这张表的来历（不替人删表）。锁内复核会再看一次行数，期间被写入就回滚。
+    const { problems } = compareShape(shape, BASELINE_LEDGER_SHAPE);
+    if (problems.length) {
+      refusals.push(`schema_migrations 为空但结构与 runner 建的不同，不能直接登记进去：${JSON.stringify(problems)}；先查明这张表的来历`);
+    }
   }
   for (const version of BASELINE_VERSIONS) {
     const migration = migrations.find((item) => item.version === version);
