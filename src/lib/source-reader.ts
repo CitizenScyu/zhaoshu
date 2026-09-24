@@ -373,7 +373,7 @@ function hasChallengeHint(text: string): boolean {
 // candidates = **精确层**（parseSourceSearch 锚文本相等）命中数；fallbackCandidates = 精确层收 0 后
 // 按详情页形态从同页兜到的数。两者分开记：「搜索页有结果却 0 候选」这个 P0 信号靠 candidates 表达，
 // 混成一个数会让它失效（40 任审查 D）。
-interface SourceSearchStat { host: string; searched: boolean; candidates: number; fallbackCandidates: number; bytes: number }
+export interface SourceSearchStat { host: string; searched: boolean; candidates: number; fallbackCandidates: number; bytes: number }
 
 
 async function queryRows<T>(query: ReturnType<ReturnType<typeof getSql>>, signal: AbortSignal, readOnly = true): Promise<T[]> {
@@ -476,6 +476,8 @@ export async function resolveSourceBook(
      * 由换源结尾那一条 source_failover 聚合事件替代（否则每个 miss 候选各发一次，成功换源路径上也误报）。
      */
     deferNotFoundWarnings?: boolean;
+    /** 只读观测出参（41-fanout 单源 probe 用）：逐源搜索账本写进调用方给的数组，不改控制流。 */
+    searchStats?: SourceSearchStat[];
   } = {},
 ): Promise<SourceCatalog> {
   // 41-M1.3：suspect 站（连续传输层硬失败，见 source-host-health.ts）挪到队尾，含 builtin 的 book15 hint 抓取；
@@ -528,7 +530,7 @@ export async function resolveSourceBook(
     if (candidate) similar.set(candidate.bookUrl, candidate);
   };
   // 只读观测账本：逐源记录「搜没搜、命中几候选、多少字节」，供整轮 404 汇总（不改控制流）。
-  const searchStats: SourceSearchStat[] = [];
+  const searchStats: SourceSearchStat[] = options.searchStats ?? [];
   // 「精确层 0 候选」观测：抓到搜索页却锚文本无一精确命中。**推迟到整轮无果时才发**——
   // 曾经在精确层一收 0 就无条件发，随后同页兜底 / 作者搜索成功交付时这条告警已经在成功路径上
   // 打过了，监控按「无候选」告警会误报（41 任审查 P2-①）。payload 在收集时就序列化好，顺序即源序。
@@ -980,6 +982,123 @@ export async function surveySourceBooks(
     for (const entry of results) if (entry.sourceName === options.currentSourceName) entry.current = true;
   }
   return { sources: results, partial };
+}
+
+// ---- 41-fanout:通用单源 probe(浏览器扇出的服务端单元)----
+// 一次只查一个源：直接复用 resolveSourceBook(sources: [source]) —— builtin 走 book15 解析(精确层 parseSourceSearch
+// + 同页兜底 parseSourceDetailLinks + 作者搜索回退 + 模糊降级),引擎源走 rule-engine 门面(ruleSearch.bookList →
+// 详情 → 目录)+ sourceBookMatches 身份校验。匹配与模糊降级规则与阅读路径逐字相同：probe 判 ok 的源，
+// 用返回的 bookUrl 走 index?book_url= 确认路径一定打得开(前提是该源在取书池里，见 getFanoutPool 的 readable)。
+
+/** 单源 probe 的内部墙钟预算默认值;路由另有同名常量供 check-deploy-config 对照 maxDuration。 */
+export const SOURCE_PROBE_BUDGET_MS = 15_000;
+
+/**
+ * 结果类型(面板逐行渲染用):
+ * - ok:身份校验通过且目录非空,book 带详情 URL 与章节数;
+ * - similar:模糊降级层(标题/作者没完全对上但相似,目录可解析),candidates 交用户确认;
+ * - ambiguous:无作者书在本源命中多部同名作品;
+ * - miss:搜索页有候选,但无一过身份校验;
+ * - no_candidates:标题搜索页两层(精确层 + 同页兜底)都解析出 0 个候选;
+ * - unreachable:网络/HTTP/策略/请求数预算导致本源没搜完(code 为有限枚举);
+ * - timeout:内部预算(或调用方中止)到点;
+ * - compile_failed:搜索模板展不开/过不了 host 门,或引擎规则缺必需字段/字段编译不过(code + missingFields)。
+ */
+export type SourceProbeStatus =
+  | 'ok' | 'similar' | 'ambiguous' | 'miss' | 'no_candidates' | 'unreachable' | 'timeout' | 'compile_failed';
+
+export interface SourceProbeResult {
+  status: SourceProbeStatus;
+  sourceUrl: string;
+  sourceName: string;
+  elapsedMs: number;
+  /** 本次 probe 实际发出的上游逻辑请求数(换 host 兜底算同一次)。 */
+  requests: number;
+  book?: { title: string; author: string; alias?: string; bookUrl: string; chapters: number };
+  candidates?: SourceSimilarCandidate[];
+  code?: string;
+  missingFields?: string[];
+}
+
+/**
+ * 引擎源能跑通「搜索 → 详情 → 目录」的最低字段组:与准入 compileAdmission 的 REQUIRED_FIELDS 同口径
+ * (rule-engine/admission.ts),去掉引擎有默认值的 ruleToc.chapterUrl。ruleContent.content 保留:没有它源读不了正文。
+ */
+const PROBE_REQUIRED_ENGINE_FIELDS = [
+  'ruleSearch.bookList', 'ruleSearch.name', 'ruleSearch.bookUrl',
+  'ruleToc.chapterList', 'ruleToc.chapterName', 'ruleContent.content',
+] as const;
+
+function probeCompileFailure(source: ReadingSource, title: string): Pick<SourceProbeResult, 'code' | 'missingFields'> | null {
+  try {
+    sourceSearchUrl(source.searchUrl, title, source.url);
+  } catch (error) {
+    if (error instanceof SourcePolicyError) return { code: 'SEARCH_URL_UNSUPPORTED' };
+    throw error;
+  }
+  if (isBuiltinReadingSource(source)) return null;
+  const { compiled } = engineSourceOf(source);
+  const missingFields = PROBE_REQUIRED_ENGINE_FIELDS.filter((name) => {
+    const ir = compiled.get(name);
+    return !ir || 'skipped' in ir;
+  });
+  return missingFields.length ? { code: 'RULES_UNSUPPORTED', missingFields: [...missingFields] } : null;
+}
+
+/**
+ * 通用单源 probe:给定一个源和一本书(书名 + 可空作者),在 budgetMs 内判定该源有没有这本书。
+ * 只读:不写目录缓存、不改健康记忆以外的任何状态(健康记忆照常由 fetch 层记录)。请求数上限沿用单次阅读的
+ * 默认 L2(MAX_SOURCE_REQUESTS),节流槽按 host 分桶(本 context 独占,跨请求/跨实例不共享)。
+ * signal 是调用方的取消信号(客户端断开);到点与取消都返回 timeout,不抛。非预期异常才抛。
+ */
+export async function probeSourceForBook(
+  source: ReadingSource, book: SourceBookIdentity, signal: AbortSignal,
+  options: { budgetMs?: number } = {},
+): Promise<SourceProbeResult> {
+  const startedAt = Date.now();
+  const budgetController = new AbortController();
+  const timer = setTimeout(
+    () => budgetController.abort(new SourceReaderError('单源探测预算已用完。', 'SOURCE_PROBE_TIMEOUT', 504)),
+    options.budgetMs ?? SOURCE_PROBE_BUDGET_MS,
+  );
+  (timer as { unref?: () => void }).unref?.();
+  const context = new SourceRequestContext(AbortSignal.any([signal, budgetController.signal]));
+  const base = { sourceUrl: source.url, sourceName: source.name };
+  const finish = (result: Omit<SourceProbeResult, 'sourceUrl' | 'sourceName' | 'elapsedMs' | 'requests'>): SourceProbeResult => (
+    { ...base, ...result, elapsedMs: Date.now() - startedAt, requests: context.requests }
+  );
+  try {
+    const compileFailure = probeCompileFailure(source, book.title);
+    if (compileFailure) return finish({ status: 'compile_failed', ...compileFailure });
+    const searchStats: SourceSearchStat[] = [];
+    try {
+      const catalog = await resolveSourceBook(book, context, { sources: [source], deferNotFoundWarnings: true, searchStats });
+      return finish({
+        status: 'ok',
+        book: {
+          title: catalog.title, author: catalog.author, ...(catalog.alias ? { alias: catalog.alias } : {}),
+          bookUrl: catalog.bookUrl, chapters: catalog.chapters.length,
+        },
+      });
+    } catch (error) {
+      if (context.signal.aborted) return finish({ status: 'timeout' });
+      if (error instanceof SourceReaderError) {
+        if (error.code === 'SOURCE_SIMILAR') {
+          const candidates = (error as SourceReaderError & { candidates?: SourceSimilarCandidate[] }).candidates ?? [];
+          return finish({ status: 'similar', candidates });
+        }
+        if (error.code === 'SOURCE_AMBIGUOUS') return finish({ status: 'ambiguous' });
+        if (error.code === 'SOURCE_NOT_FOUND') {
+          const stat = searchStats[0];
+          const empty = stat?.searched === true && stat.candidates + stat.fallbackCandidates === 0;
+          return finish({ status: empty ? 'no_candidates' : 'miss' });
+        }
+      }
+      return finish({ status: 'unreachable', code: failureCode(error) });
+    }
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 /** alternates 分支用:session 目录当前源信息;过期/缺失一律降级为无标记(设计 §2,不抛错)。 */
