@@ -992,6 +992,68 @@ class TestResolveCandidatesEngineFallback(unittest.TestCase):
         self.assertEqual(cli.calls, [])          # 已打标：连 book15 带引擎都不搜
 
 
+class TestEngineHttpOnlySkip(unittest.TestCase):
+    """labelerdiag41：兜底候选 URL 引擎取不了（http-only 源等）→ 候选阶段跳过并计数，不白调 toc。"""
+
+    def setUp(self):
+        no_wait(self)
+
+    def test_url_support_predicate(self):
+        for url in ('https://www.a.com/b/1', 'HTTPS://www.a.com/b/1',
+                    'https://www.a.com:443/b/1'):
+            with self.subTest(url=url):
+                self.assertTrue(douban_list.engine_url_supported(url))
+        for url in ('http://www.a.com/b/1', 'https://www.a.com:8443/b/1',
+                    'https://u:p@www.a.com/b/1', 'https://@www.a.com/b',
+                    '/b/1', 'www.a.com/b/1', 'https://', 'https://www.a.com:abc/b',
+                    'ftp://www.a.com/b'):
+            with self.subTest(url=url):
+                self.assertFalse(douban_list.engine_url_supported(url))
+
+    def test_http_candidate_skipped_https_candidate_wins(self):
+        cli = FakeEngineCli({'search': _proc(0, _engine_search_stdout([
+            {'source': 'www.old.com', 'title': '斗破苍穹', 'author': '天蚕土豆',
+             'bookUrl': 'http://www.old.com/book/1'},
+            {'source': 'www.new.com', 'title': '斗破苍穹', 'author': '天蚕土豆',
+             'bookUrl': 'https://www.new.com/book/1'},
+        ]))})
+        stats = {}
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            hit = douban_list.search_engine(cli, '斗破苍穹', '天蚕土豆', stats=stats)
+        self.assertEqual(hit['url'], 'https://www.new.com/book/1')
+        self.assertEqual(stats, {'http_only': 1})
+        self.assertIn('非 HTTPS 源跳过', out.getvalue())
+
+    def test_only_http_candidates_is_a_miss(self):
+        # 名单无作者（第一遍直接收）时同样不能收 http 候选
+        cli = FakeEngineCli({'search': _proc(0, _engine_search_stdout([
+            {'source': 'www.old.com', 'title': '剑来', 'author': '',
+             'bookUrl': 'http://www.old.com/book/9'}]))})
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertIsNone(douban_list.search_engine(cli, '剑来'))
+
+    def test_title_incompatible_http_candidate_not_counted(self):
+        # 计数口径 = 本来会被选中去调 toc 的候选；标题不兼容的本就不收，不计
+        cli = FakeEngineCli({'search': _proc(0, _engine_search_stdout([
+            {'source': 'www.old.com', 'title': '一切从剑来开始', 'author': '',
+             'bookUrl': 'http://www.old.com/book/9'}]))})
+        stats = {}
+        with contextlib.redirect_stdout(io.StringIO()):
+            douban_list.search_engine(cli, '剑来', stats=stats)
+        self.assertEqual(stats, {})
+
+    def test_resolve_candidates_summary_counts_http_skips(self):
+        cli = FakeEngineCli({'search': _proc(0, _engine_search_stdout([
+            {'source': 'www.old.com', 'title': '剑来', 'author': '',
+             'bookUrl': 'http://www.old.com/book/9'}]))})
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            queue = douban_list._resolve_candidates(
+                [{'title': '剑来'}, {'title': '剑来'}], lambda url: NO_RESULT_HTML,
+                engine_cli=cli)
+        self.assertEqual(queue, [])
+        self.assertIn('跳过非 HTTPS 源候选 2 条', out.getvalue())
+
+
 class TestBook15Breaker(unittest.TestCase):
     """labelerdiag41：book15 整站挂时连续 N 本搜索全失败 → 本轮剩余跳过 book15、直接走引擎兜底。"""
 

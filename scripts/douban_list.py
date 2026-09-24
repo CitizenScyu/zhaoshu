@@ -451,7 +451,23 @@ class EngineCli:
                               timeout=self.timeout, env=child_env)
 
 
-def search_engine(cli, title: str, author: str = '') -> dict | None:
+def engine_url_supported(url: str) -> bool:
+    """引擎 toc/content 能否接这个 URL：只收 HTTPS 完整地址 + 默认端口、无 userinfo
+    （对齐 source-policy.checkSourceUrl 与 engine-fetch 的 --url 用法门）。
+
+    labelerdiag41：http-only 源的兜底候选到 toc 必被拒（「仅支持 HTTPS 精确域名和默认端口/443」），
+    09-22 一天白耗 50 本；在候选阶段就挡掉，让同书的 HTTPS 候选有机会顶上。"""
+    try:
+        parts = urllib.parse.urlsplit(url)
+        port = parts.port
+    except ValueError:
+        return False
+    return (parts.scheme.lower() == 'https' and bool(parts.hostname)
+            and port in (None, 443) and '@' not in parts.netloc)
+
+
+def search_engine(cli, title: str, author: str = '',
+                  stats: dict | None = None) -> dict | None:
     """book15 miss 后的引擎兜底搜索：调 CLI `search --title …`，title + 作者双校验。
 
     N02 修复：author 不再只传不用——候选作者非空且归一化后与名单作者不等 → 必拒
@@ -459,7 +475,8 @@ def search_engine(cli, title: str, author: str = '') -> dict | None:
     两遍选择：先「title 兼容 + 作者已验证匹配」，再退「title 兼容 + 候选作者空」。
     返回命中 {'url': bookUrl（绝对）, 'title': site_title, 'source': host} 或 None（miss）。
     退出码：0=有候选（逐条校验，跳过 book15.net 源）；1=正常 miss；
-    2/未知非零/无法调用 → 抛 EngineUnavailable（调用方本轮降级 book15-only、不重试）。"""
+    2/未知非零/无法调用 → 抛 EngineUnavailable（调用方本轮降级 book15-only、不重试）。
+    stats（可选计数字典）：title 兼容但 URL 引擎取不了（非 HTTPS 等）的候选计入 stats['http_only']。"""
     args = ['--title', title]
     if author:
         args += ['--author', author]
@@ -498,6 +515,11 @@ def search_engine(cli, title: str, author: str = '') -> dict | None:
         site_title = c.get('title') or ''
         book_url = c.get('bookUrl') or ''
         if not book_url or not title_compatible(title, site_title):
+            continue
+        if not engine_url_supported(book_url):
+            if stats is not None:
+                stats['http_only'] = stats.get('http_only', 0) + 1
+            print(f'  非 HTTPS 源跳过: {site_title}（{c.get("source", "")}）')
             continue
         got = _norm_author(c.get('author') or '')
         if not want:          # 名单无作者：行为同现状
@@ -572,6 +594,7 @@ def _resolve_candidates(candidates: list[dict], http_get, origin: str = '',
     skipped = 0
     book15_hits = 0
     engine_hits = 0
+    engine_stats: dict = {}
     engine_disabled = False
     for b in candidates:
         key = _norm_title(b.get('title', ''))
@@ -592,7 +615,8 @@ def _resolve_candidates(candidates: list[dict], http_get, origin: str = '',
         engine_hit = None
         if engine_cli is not None and not engine_disabled:
             try:
-                engine_hit = search_engine(engine_cli, b['title'], b.get('author', ''))
+                engine_hit = search_engine(engine_cli, b['title'], b.get('author', ''),
+                                           stats=engine_stats)
             except EngineUnavailable as e:
                 # 环境错误：本轮降级 book15-only，后续候选不再尝试引擎（不连坐重试）
                 print(f'  引擎兜底不可用，本轮降级 book15-only（不重试）: {e}',
@@ -612,6 +636,8 @@ def _resolve_candidates(candidates: list[dict], http_get, origin: str = '',
         time.sleep(SEARCH_DELAY)
     # 开关关闭时 engine_hits=0 且 book15_hits==len(queue)，本行逐字复现旧文案（红线）。
     engine_note = f'，引擎兜底命中 {engine_hits} 本' if engine_cli is not None else ''
+    if engine_stats.get('http_only'):
+        engine_note += f'（跳过非 HTTPS 源候选 {engine_stats["http_only"]} 条）'
     # 未熔断时本行逐字不变；熔断后补一段「熔断跳过 book15 搜索 N 本」。
     breaker_note = (f'，book15 熔断跳过搜索 {book15_breaker.skipped} 本'
                     if book15_breaker is not None and book15_breaker.open else '')
