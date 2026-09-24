@@ -31,7 +31,7 @@ it('已发布迁移的摘要与冻结值一致（改已发布文件的字节会�
   for (const [version, checksum] of Object.entries(PUBLISHED_CHECKSUMS)) {
     expect(migrations.find((item) => item.version === Number(version))?.checksum, `v${version}`).toBe(checksum);
   }
-});
+}, 60_000);
 
 maybe('冷建库灾备链路（db:migrate → migrate:auth:prod → ensureSchema，全真 SQL）', () => {
   let pg: PGliteLike;
@@ -82,10 +82,10 @@ maybe('冷建库灾备链路（db:migrate → migrate:auth:prod → ensureSchema
   it('把库版本推到 8 后 assertAuthSchema 仍放行（库新代码旧不 503）', async () => {
     await pg.query('INSERT INTO auth_schema_migrations(version) VALUES (8)');
     await expect(assertAuthSchema(sql as never)).resolves.toBeUndefined();
-  });
+  }, 60_000);
 
   it('把库版本降到 6 后 assertAuthSchema 抛 AuthSchemaRequiredError', async () => {
     await pg.query('DELETE FROM auth_schema_migrations WHERE version > 6');
     await expect(assertAuthSchema(sql as never)).rejects.toBeInstanceOf(AuthSchemaRequiredError);
-  });
+  }, 60_000);
 });

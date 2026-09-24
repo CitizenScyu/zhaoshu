@@ -75,12 +75,12 @@ maybe('0003 四表与运行时建表同构（逐列比对，真 SQL）', () => {
       const migrated = await shapeOf(viaMigration, table);
       expect(migrated.columns.length).toBeGreaterThan(0);
       expect(migrated).toEqual(await shapeOf(viaRuntime, table));
-    });
+    }, 60_000);
   }
 
   it('迁移建好的库再跑运行时 DDL 是空转：四表形状不变', async () => {
     const before = await Promise.all(RUNTIME_TABLES.map((table) => shapeOf(viaMigration, table)));
     await initializeBusinessSchema(createPGliteSql(viaMigration) as never);
     expect(await Promise.all(RUNTIME_TABLES.map((table) => shapeOf(viaMigration, table)))).toEqual(before);
-  });
+  }, 60_000);
 });

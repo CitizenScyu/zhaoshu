@@ -48,6 +48,7 @@ export function parseAuthMigrationArgs(argv) {
 }
 
 // 只校验形状并取出 host 供人核对；连接串本身不出本函数的返回值以外的任何地方。
+/** @param {string} envName @param {Record<string, string | undefined>} [env] */
 export function readDatabaseUrl(envName, env = process.env) {
   const value = env[envName]?.trim();
   if (!value) throw new Error(`环境变量 ${envName} 为空；不会回退到 DATABASE_URL，也不会读取 .env 文件`);
@@ -83,7 +84,7 @@ export async function runAuthMigration(sql, mode) {
   const before = await readAuthVersions(sql);
   const plan = planAuthMigration(before);
   const report = { mode, targetVersion: AUTH_SCHEMA_VERSION, before, plan };
-  if (mode === 'dry-run') return { ...report, status: 'dry-run' };
+  if (mode === 'dry-run') return { ...report, status: 'dry-run', after: null };
   if (plan.status === 'newer-than-code') throw new Error(plan.note);
   await initializeAuthSchema(sql);
   await assertAuthSchema(sql);
