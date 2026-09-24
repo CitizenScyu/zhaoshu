@@ -131,6 +131,41 @@ describe('check-deploy-config：cron 路由存在且导出 GET', () => {
     expect(errors).toEqual([expect.stringMatching(/没有导出 GET/)]);
   });
 
+  // Next 16.3.5 对同目录多个 route 文件不报错：Turbopack 按 read_dir 顺序后者覆盖（顺序未定义），
+  // webpack 排序后后者覆盖。哪个生效静态无法确定，只能判红让人删掉多余的一个。
+  it('cron 路由目录同时有 route.ts 与 route.js 判红（.ts 好、.js 坏也不放过）', () => {
+    const errors = checkDeployConfig(repo({
+      'src/app/api/download/reclaim/route.js': 'export const maxDuration = 30;\nexport async function POST() {}\n',
+    }));
+    expect(errors).toEqual([
+      expect.stringMatching(/src\/app\/api\/download\/reclaim: 同一目录有多个 route 文件（route\.js、route\.ts）/),
+      expect.stringMatching(/src\/app\/api\/download\/reclaim\/route\.js 没有导出 GET/),
+    ]);
+  });
+
+  it('非 cron 路由目录有多个 route 文件同样判红', () => {
+    const errors = checkDeployConfig(repo({
+      'src/app/api/find/exact/route.tsx': GOOD_FILES['src/app/api/find/exact/route.ts'],
+    }));
+    expect(errors).toEqual([expect.stringMatching(/src\/app\/api\/find\/exact: 同一目录有多个 route 文件（route\.ts、route\.tsx）/)]);
+  });
+
+  it('cron 路由写成 route.tsx 能被找到（Next 默认 pageExtensions 含 tsx）', () => {
+    const errors = checkDeployConfig(repo({
+      'src/app/api/download/reclaim/route.ts': null,
+      'src/app/api/download/reclaim/route.tsx': GOOD_FILES['src/app/api/download/reclaim/route.ts'],
+    }));
+    expect(errors).toEqual([]);
+  });
+
+  it('cron 路由只有 route.mjs 判红（.mjs 不在 Next 默认 pageExtensions 里，不是路由）', () => {
+    const errors = checkDeployConfig(repo({
+      'src/app/api/download/reclaim/route.ts': null,
+      'src/app/api/download/reclaim/route.mjs': GOOD_FILES['src/app/api/download/reclaim/route.ts'],
+    }));
+    expect(errors).toEqual([expect.stringMatching(/path "\/api\/download\/reclaim" 找不到对应路由/)]);
+  });
+
   it('cron path 不以 / 开头判红', () => {
     const errors = checkDeployConfig(repo({ 'vercel.json': withCrons([{ path: 'api/shuyuan', schedule: '0 2 * * *' }]) }));
     expect(errors).toEqual([expect.stringMatching(/必须以 \/ 开头/)]);
