@@ -69,6 +69,9 @@ function json(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } });
 }
 
+// 41-panel:换源面板先取扇出候选;旧 alternates 面板的用例一律让扇出关(404 SOURCE_FANOUT_DISABLED ⇒ 退回旧面板)。
+const fanoutOff = () => json({ error: '换源扇出未开启。', code: 'SOURCE_FANOUT_DISABLED' }, 404);
+
 const catalog = (over: Record<string, unknown> = {}) => ({
   taskId: null,
   source: { id: 'src-1', name: '源甲', url: 'https://a.example', session: 'sess-A' },
@@ -224,6 +227,7 @@ describe('ReaderClient 换源:换源面板 ok / miss / unreachable 及 partial �
     const apiFetch = vi.fn(async (input: RequestInfo | URL) => {
       const url = String(input);
       if (url.startsWith('/api/read/source/index')) return json(catalog());
+      if (url.startsWith('/api/read/source-probe')) return fanoutOff();
       if (url.startsWith('/api/read/source/alternates')) {
         return json(panelBody([
           { sourceName: '源甲', status: 'ok', current: true, bookUrl: 'https://a.example/1', title: '诡秘之主', author: '乌贼', chapters: 2 },
@@ -261,6 +265,7 @@ describe('ReaderClient 换源:换源面板 ok / miss / unreachable 及 partial �
     const apiFetch = vi.fn(async (input: RequestInfo | URL) => {
       const url = String(input);
       if (url.startsWith('/api/read/source/index')) return json(catalog());
+      if (url.startsWith('/api/read/source-probe')) return fanoutOff();
       if (url.startsWith('/api/read/source/alternates')) {
         return json(panelBody(
           [{ sourceName: '源乙', status: 'ok', current: false, bookUrl: 'https://b.example/2', title: '诡秘之主', author: '乌贼', chapters: 3 }],
@@ -279,6 +284,7 @@ describe('ReaderClient 换源:换源面板 ok / miss / unreachable 及 partial �
     const apiFetch = vi.fn(async (input: RequestInfo | URL) => {
       const url = String(input);
       if (url.startsWith('/api/read/source/index')) return json(catalog());
+      if (url.startsWith('/api/read/source-probe')) return fanoutOff();
       if (url.startsWith('/api/read/source/alternates')) return json({ error: '检测书源失败,请重试。' }, 500);
       return json(part());
     });
@@ -296,6 +302,7 @@ describe('ReaderClient 换源:换源面板 ok / miss / unreachable 及 partial �
           ? catalog({ source: { id: 'src-1', name: '源乙', url: 'https://b.example', session: 'sess-B' } })
           : catalog());
       }
+      if (url.startsWith('/api/read/source-probe')) return fanoutOff();
       if (url.startsWith('/api/read/source/alternates')) {
         return json(panelBody([{ sourceName: '源乙', status: 'ok', current: false, bookUrl: 'https://b.example/2', title: '诡秘之主', author: '乌贼', chapters: 3 }]));
       }
@@ -319,6 +326,7 @@ describe('ReaderClient 换源:换源面板 ok / miss / unreachable 及 partial �
     const apiFetch = vi.fn(async (input: RequestInfo | URL) => {
       const url = String(input);
       if (url.startsWith('/api/read/source/index')) return json(catalog());
+      if (url.startsWith('/api/read/source-probe')) return fanoutOff();
       if (url.startsWith('/api/read/source/alternates')) {
         return json(panelBody([{ sourceName: '源乙', status: 'ok', current: false, bookUrl: 'https://b.example/2', title: '诡秘之主', author: '乌贼', chapters: 3 }]));
       }
@@ -535,6 +543,7 @@ describe('ReaderClient 状态流转边界', () => {
     const apiFetch = vi.fn(async (input: RequestInfo | URL) => {
       const url = String(input);
       if (url.startsWith('/api/read/source/index')) return json(catalog());
+      if (url.startsWith('/api/read/source-probe')) return fanoutOff();
       if (url.startsWith('/api/read/source/alternates')) return json({ sources: [], partial: false });
       return json(part());
     });
