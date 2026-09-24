@@ -136,6 +136,49 @@ describe('ShuyuanTab 启停切换', () => {
   });
 });
 
+describe('ShuyuanTab 请求中止(MS-33)', () => {
+  it('刷新合集后的重新加载带 AbortSignal,且卸载时该 signal 被中止', async () => {
+    const seen: Array<{ url: string; method: string; signal: AbortSignal | null | undefined }> = [];
+    const apiFetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      seen.push({ url: String(input), method: init?.method ?? 'GET', signal: init?.signal });
+      if (init?.method === 'POST') return json({ ok: true });
+      return json(statsPage());
+    });
+    const { unmount } = renderTab(apiFetch);
+    const user = userEvent.setup();
+    await screen.findByRole('button', { name: textIs('全部 100') });
+
+    await user.click(screen.getByRole('button', { name: '刷新合集' }));
+    await waitFor(() => expect(seen.filter((c) => c.method === 'GET').length).toBeGreaterThan(1));
+
+    // 刷新触发的那次列表重载必须带 signal:否则快速连点时旧响应能盖掉新状态。
+    const reload = seen.filter((c) => c.method === 'GET').at(-1)!;
+    expect(reload.signal).toBeInstanceOf(AbortSignal);
+    expect(reload.signal!.aborted).toBe(false);
+
+    unmount();
+    expect(reload.signal!.aborted).toBe(true);
+  });
+
+  it('启停切换后的重新加载同样带 AbortSignal', async () => {
+    const seen: Array<{ method: string; signal: AbortSignal | null | undefined }> = [];
+    const apiFetch = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      seen.push({ method: init?.method ?? 'GET', signal: init?.signal });
+      if (init?.method === 'POST') return json({ disabled: true });
+      return json(statsPage());
+    });
+    renderTab(apiFetch);
+    const user = userEvent.setup();
+    await screen.findByRole('button', { name: textIs('全部 100') });
+
+    await user.click(screen.getByRole('button', { name: '禁用' }));
+    await waitFor(() => expect(seen.filter((c) => c.method === 'GET').length).toBeGreaterThan(1));
+
+    const reload = seen.filter((c) => c.method === 'GET').at(-1)!;
+    expect(reload.signal).toBeInstanceOf(AbortSignal);
+  });
+});
+
 describe('ShuyuanTab 探测状态展示', () => {
   it('已启用但连续探测失败的源:给出「不会参与搜索」的原因提示', async () => {
     const apiFetch = vi.fn(async () => json(statsPage({
