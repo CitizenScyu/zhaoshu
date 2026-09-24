@@ -133,6 +133,25 @@ describe('gcls-41 快照 GC 只读 GitHub 存储', () => {
     expect(gc.rateLimit()).toEqual({ remaining: 4999, resetAt: 1790000000 * 1000 });
   });
 
+  it('书名含保留字符(%)的 stem 可列目录:必须用 <branch>:<已编码 dir> 形,整段编码(N1 式)会双重编码 404', async () => {
+    const store = new PublishStore();
+    const pct = snapshotPaths('100%纯度', '佚名');
+    await publish(store, '100%纯度', ['甲', '乙'], 21);
+    store.files.set(`${pct.dir}/v-deadbeef.txt`, '残卷');
+    const gh = fakeGitHub(store.files);
+    const gc = createSnapshotGcStore({ token: TOKEN, repository: REPO, branch: 'main', fetchImpl: gh.impl });
+    expect(await gc.listStems()).toContain(pct.dir.split('/').pop());
+    const files = await gc.listFiles(pct.dir);
+    expect(files).toContain('current.json');
+    expect(files).toContain('v-deadbeef.txt');
+    // 真实 api.github.com 的对照(一手实测):`main:books%2F...`,即分支冒号与目录斜杠原样、stem 保持发布器口径的 %XX;
+    // 整段 encodeURIComponent(`${branch}:${dir}`) 会把 %25 变 %2525(a%2525),对真实 GitHub 返回 404。
+    const treeCall = gh.calls.find(call => call.url.includes('/git/trees/') && call.url.includes('100%25'))!;
+    expect(treeCall.url).toContain('/git/trees/main:books/.snapshots/100%25%E7%BA%AF');
+    expect(treeCall.url).toContain('%25'); // stem 里的 % 仍是单层 %25,不是 %2525
+    expect(treeCall.url).not.toContain('main%3A');
+  });
+
   it('tree 截断 ⇒ 抛错(不拿半截列表判孤儿);非 2xx 只带状态码,不透传响应体/token', async () => {
     const { store, normal } = await fixture();
     const truncated = fakeGitHub(store.files, { truncate: dir => dir === decodeURIComponent(normal.dir) });
