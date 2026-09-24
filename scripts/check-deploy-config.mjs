@@ -16,6 +16,7 @@
 import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import ts from 'typescript';
 
 /** Hobby：每条 cron 每天最多触发一次（违反即整次部署被拒）。 */
 export const MAX_CRON_RUNS_PER_DAY = 1;
@@ -285,9 +286,40 @@ function checkFunctionDurations(root, errors) {
 function checkNextConfig(root, errors) {
   const rel = ['next.config.ts', 'next.config.mjs', 'next.config.js'].find((f) => existsSync(join(root, f)));
   if (!rel) return;
-  const source = readText(root, rel);
-  if (/\bignoreBuildErrors\s*:\s*true\b/.test(source)) {
-    errors.push(`${rel}: typescript.ignoreBuildErrors = true 会让带类型错误的代码照样在 Vercel 构建上线，关掉了最后一道类型门`);
+  // 用 TypeScript 解析成 AST 再找属性：注释与字符串里的字样不算，引号键与 `x.ignoreBuildErrors = …` 赋值也认得出。
+  const file = ts.createSourceFile(rel, readText(root, rel), ts.ScriptTarget.Latest, false, rel.endsWith('.ts') ? ts.ScriptKind.TS : ts.ScriptKind.JS);
+  const keyText = (name) =>
+    ts.isIdentifier(name) || ts.isStringLiteralLike(name)
+      ? name.text
+      : ts.isComputedPropertyName(name) && ts.isStringLiteralLike(name.expression)
+        ? name.expression.text
+        : undefined;
+  const unwrap = (expr) =>
+    ts.isParenthesizedExpression(expr) || ts.isAsExpression(expr) || ts.isSatisfiesExpression(expr) || ts.isTypeAssertionExpression(expr)
+      ? unwrap(expr.expression)
+      : expr;
+  const values = [];
+  const visit = (node) => {
+    if (ts.isPropertyAssignment(node) && keyText(node.name) === 'ignoreBuildErrors') values.push(node.initializer);
+    else if (ts.isShorthandPropertyAssignment(node) && node.name.text === 'ignoreBuildErrors') values.push(node.name);
+    else if (
+      ts.isBinaryExpression(node) &&
+      node.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
+      ((ts.isPropertyAccessExpression(node.left) && node.left.name.text === 'ignoreBuildErrors') ||
+        (ts.isElementAccessExpression(node.left) && keyText(node.left.argumentExpression) === 'ignoreBuildErrors'))
+    ) {
+      values.push(node.right);
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(file);
+  for (const value of values.map(unwrap)) {
+    if (value.kind === ts.SyntaxKind.FalseKeyword) continue;
+    errors.push(
+      value.kind === ts.SyntaxKind.TrueKeyword
+        ? `${rel}: typescript.ignoreBuildErrors = true 会让带类型错误的代码照样在 Vercel 构建上线，关掉了最后一道类型门`
+        : `${rel}: ignoreBuildErrors 不是字面量 false（${value.getText(file)}），构建时可能为 true 而关掉类型门；本脚本 fail-closed，改成字面量或删掉`,
+    );
   }
 }
 

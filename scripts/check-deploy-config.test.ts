@@ -227,4 +227,31 @@ describe('check-deploy-config：next.config', () => {
     }));
     expect(errors).toEqual([expect.stringMatching(/ignoreBuildErrors = true/)]);
   });
+
+  const withNextConfig = (source: string) => checkDeployConfig(repo({ 'next.config.ts': source }));
+
+  it.each([
+    ['行注释', '// 别写 typescript: { ignoreBuildErrors: true }\nconst nextConfig = {};\nexport default nextConfig;\n'],
+    ['块注释', '/* ignoreBuildErrors: true 会关掉类型门 */\nconst nextConfig = {};\nexport default nextConfig;\n'],
+    ['字符串', 'const note = "ignoreBuildErrors: true";\nconst nextConfig = {};\nexport default nextConfig;\n'],
+    ['模板字符串', 'const note = `typescript: { ignoreBuildErrors: true }`;\nconst nextConfig = {};\nexport default nextConfig;\n'],
+    ['显式 false', 'const nextConfig = { typescript: { ignoreBuildErrors: false } };\nexport default nextConfig;\n'],
+  ])('%s里出现 ignoreBuildErrors: true 不误报', (_label, source) => {
+    expect(withNextConfig(source)).toEqual([]);
+  });
+
+  it.each([
+    ['引号键', "const nextConfig = { typescript: { 'ignoreBuildErrors': true } };\nexport default nextConfig;\n"],
+    ['属性赋值', 'const nextConfig: any = { typescript: {} };\nnextConfig.typescript.ignoreBuildErrors = true;\nexport default nextConfig;\n'],
+    ['as 断言', 'const nextConfig = { typescript: { ignoreBuildErrors: true as boolean } };\nexport default nextConfig;\n'],
+  ])('%s写法的 ignoreBuildErrors: true 判红', (_label, source) => {
+    expect(withNextConfig(source)).toEqual([expect.stringMatching(/ignoreBuildErrors = true/)]);
+  });
+
+  it('ignoreBuildErrors 取非字面量（如环境变量）判红（fail-closed，构建时可能为 true）', () => {
+    const errors = withNextConfig(
+      "const nextConfig = { typescript: { ignoreBuildErrors: process.env.SKIP_TYPES === '1' } };\nexport default nextConfig;\n",
+    );
+    expect(errors).toEqual([expect.stringMatching(/ignoreBuildErrors 不是字面量 false/)]);
+  });
 });
