@@ -66,16 +66,16 @@ npm run test:db    -- --target=test   # 三类起点 + 并发 + 回滚验收
   - 四张运行期表（`app_settings` / `source_admission` / `profile_feedback_queue` / `cron_health`）的列类型 / 可空 / 默认值与 0003 的声明（`EXPECTED_RUNTIME_COLUMNS`）逐列比对，输出里附这四表的原始列行。`ADD COLUMN IF NOT EXISTS` 只看列名，列存在但类型不同时 0003 会空转、运行期 INSERT 才炸，所以迁移前必须先看这一项。
   - 退出码：0 通过；2 不通过；1 参数 / 连接错误。
 - **`db:baseline:prod`**（从未登记的已有库「只补记账」，`scripts/db-baseline.mjs`）：**不执行任何迁移文件里的 SQL**。默认 **dry-run**（`BEGIN READ ONLY`），逐项核对 0001–0003 的效果在库里都已成立：
-  - 结构：`scripts/db-baseline-contract.mjs` 的 `BASELINE_SHAPE`——0001→0003 在空库上真跑出的 20 张表的全部列（类型 / 非空 / 默认值 / identity / 生成列表达式）、约束（名称 + 类型 + 定义）、索引（名称 + 定义），由 `db-baseline.test.ts` 每次重跑迁移钉住；每张表出自哪段 SQL 见 `BASELINE_TABLE_SOURCES`。库里多出来的列 / 约束 / 索引（auth v5–v7、运行期、artifact 后加的）只在 `extra` 里报告，不拒绝。
-  - 删除项（`BASELINE_ABSENT`）：recommendations 的旧全局唯一约束 / 索引（0001:103-108）、`books_title_author_idx` / `labeled_books_title_author_idx`（0002:46-47）必须不在。
+  - 结构：`scripts/db-baseline-contract.mjs` 的 `BASELINE_SHAPE`——0001→0003 在空库上真跑出的 20 张表的全部列（类型 / 非空 / 默认值 / identity / 生成列表达式 / 所属序列的 `pg_sequence` 参数，含 0001:5 identity 的 `START WITH 2`）、约束（名称 + 类型 + 定义）、索引（名称 + 定义），由 `db-baseline.test.ts` 每次重跑迁移钉住；每张表出自哪段 SQL 见 `BASELINE_TABLE_SOURCES`。库里多出来的列 / 约束 / 索引（auth v5–v7、运行期、artifact 后加的）只在 `extra` 里报告，不拒绝。
+  - 删除项（`BASELINE_ABSENT`）：recommendations 的旧全局唯一约束 / 索引（0001:103-108；索引判据与 0001 自身的正则同口径，带 WHERE 的部分唯一索引同样算违规）、`books_title_author_idx` / `labeled_books_title_author_idx`（0002:46-47）必须不在。
   - 数据项（`BASELINE_DATA_CHECKS`）：owner 固定身份、`auth_settings` / `profile` / `shuyuan_meta` / `app_settings` 的 id=1 行、recommendations / feedback 的 `user_id` 与 download_tasks 必填列无 NULL、auth 记账含 1–4、画像归属已迁移。
-  - 前提：库里**没有** `schema_migrations`（有就交给 `db:migrate:prod`）；auth 记账 ≥ 7（不足先跑 `migrate:auth:prod`）；迁移文件摘要等于 `BASELINE_CHECKSUMS`（契约只对那三份字节成立）。
+  - 前提：库里**没有登记任何版本**——没有 `schema_migrations`，或者表在但 0 行（视同未登记，但要求表的形状与 runner 建的完全一致，否则拒绝并请人查明来历；这样空记账表的库不会落进「baseline 拒、migrate 也拒」的死区）；已登记过版本的库交给 `db:migrate:prod`；auth 记账 ≥ 7（不足先跑 `migrate:auth:prod`）；迁移文件摘要等于 `BASELINE_CHECKSUMS`（契约只对那三份字节成立）。
   - 任何一条不成立：输出 `status: refused` 与 `refusals[]`（逐条写明出处行号与差异），**不写库，退出码 2**，绝不部分登记。全部成立时 dry-run 输出 `ledgerWrites`（`schema_migrations` 的 v1–v3 三行）。
   - 显式 `--apply` 才写：先实测端点，再在**一个事务**里拿与 runner 同一把迁移锁、**锁内重新核对一遍**（dry-run 之后库被改就回滚并拒绝），通过才建 `schema_migrations`（与 runner 同一条 DDL）并登记 v1–v3，最后只读复核输出 `after`（应 `ok: true`）。写入只有这张新表和三行记账。
   - 契约由 PGlite（PostgreSQL 18）导出；目标库大版本不同，若 `pg_get_constraintdef` / 生成列表达式的渲染有差异，会表现为 `column-mismatch` / `constraint-mismatch` 拒绝（不会误放行）。此时逐条比对差异是否只是渲染不同，再决定如何处理，不要绕过。
 - **`db:migrate:prod`**：默认 **dry-run**（同样只读），列出将执行的迁移（`ledger.pending`）和将写入的记账行（`ledgerWrites`：每个待执行版本一行 `schema_migrations`，`0001` 另写 `auth_schema_migrations` 1–4）。显式 `--apply` 才写：先实测端点（同 `db:migrate`），再在迁移事务的 advisory lock 内按整张记账表复核一次，最后只读复核并输出 `after`。
   - 上面任何一条严格比对或列契约不通过：dry-run 与 `--apply` 都输出 `status: refused` 与 `refusals[]`，**不写库，退出码 2**。
-  - **没有 `schema_migrations`、却已有迁移管理的表**（从未登记的已有库，例如生产）同样拒绝，提示改走 `db:baseline:prod`。冷建库只能从空库开始。
+  - **没有登记任何版本（没有 `schema_migrations` 或表在但 0 行）、却已有迁移管理的表**（从未登记的已有库，例如生产）同样拒绝，提示改走 `db:baseline:prod`——否则 `--apply` 会把整份 0001 在在线表上重放。冷建库只能从空库开始。
   - 没有待执行版本时 `--apply` 输出 `unchanged`，不开写事务。
 - 输出只含目标 host、版本、摘要与列形状，不含连接串；错误信息里的连接 URL 会被替换为 `[REDACTED_DATABASE_URL]`。
 - `--apply` 失败时先看退出码：**2** = 前置核对拒绝，未写库，按 `refusals` 处理后可直接重跑；**1** = 连接 / 端点 / 执行错误，其中 `code: 55P03` 是锁等待 10 秒超时、整批已回滚，先查谁持锁（`pg_locks` / `pg_stat_activity`）再低峰重试。
