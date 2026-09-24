@@ -176,3 +176,53 @@ describe('POST /api/feedback write-path contract (F15)', () => {
     expect(res.headers.get('Vary')).toBe('Cookie, Authorization, X-Owner-Token');
   });
 });
+
+// MS-32b：note 字段是否「出现过」必须看对象自身的键，不能看原型链。
+// Object.hasOwn 要 ES2022；这里改用 hasOwnProperty 后，行为必须保持：
+// 省略 note = 只改状态、沿用旧备注；显式带 note（含空串）= 用新值。
+describe('POST /api/feedback note 字段的自有键判定(MS-32b)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.stubEnv('APP_OWNER_TOKEN', 'feedback-test-owner');
+    mocks.ensureSchema.mockResolvedValue(undefined);
+    mocks.getSql.mockReturnValue(Object.assign(mocks.sql, { transaction: mocks.transaction }));
+    mocks.transaction.mockResolvedValue([]);
+    mocks.writeResults = batchResults([{ id: 7 }]);
+    mocks.getFeedbackSnapshotForUser.mockResolvedValue({ version: 4, status: 'reading', note: '原来的备注' });
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    vi.restoreAllMocks();
+  });
+
+  function rawRequest(body: string) {
+    return new NextRequest('http://localhost/api/feedback', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer feedback-test-owner', 'Content-Type': 'application/json' },
+      body,
+    });
+  }
+
+  function savedNote(): string | undefined {
+    const insert = mocks.sql.mock.results.find((result) => result.value.text.includes('INSERT INTO feedback'));
+    return insert?.value.values?.[2] as string | undefined;
+  }
+
+  it('请求体省略 note 时沿用当前备注,不把它清空', async () => {
+    const res = await POST(rawRequest(JSON.stringify({
+      title: '测试书', author: '作者', status: 'reading', expectedFeedbackId: 4,
+    })));
+    expect(res.status).toBe(200);
+    expect(savedNote()).toBe('原来的备注');
+  });
+
+  it('请求体显式带空 note 时按空备注保存', async () => {
+    const res = await POST(rawRequest(JSON.stringify({
+      title: '测试书', author: '作者', status: 'reading', note: '', expectedFeedbackId: 4,
+      confirmNoteReduction: true,
+    })));
+    expect(res.status).toBe(200);
+    expect(savedNote()).toBe('');
+  });
+});

@@ -6,6 +6,7 @@
  * 抽成不依赖 DOM 的模块才能在 node 环境用假 Response 驱动真实消费路径——
  * 本仓 vitest 只收 *.test.ts 且没有 jsdom，写在 FindTab 的 JSX/闭包里的判定测不到。
  */
+import { mergeAbortSignals } from '@/lib/abort-merge';
 import { isRecord } from '@/lib/sanitize';
 
 export type SseEvent = Record<string, unknown> & { type: string };
@@ -52,7 +53,10 @@ export async function consumeFindSSE(
 ): Promise<void> {
   if (!response.body) throw new Error('找书响应为空，请重试');
   const reader = response.body.getReader();
-  const race = AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)]);
+  // 不用 AbortSignal.any（Chrome 116 / Safari 17.4 以下没有它，找书会直接抛）。
+  // 手工合并用户中止与超时两个信号，语义与 any 相同：任一中止即中止。
+  const merged = mergeAbortSignals([signal, AbortSignal.timeout(timeoutMs)]);
+  const race = merged.signal;
   const abort = abortRejection(race);
   const decoder = new TextDecoder('utf-8');
   let buf = '';
@@ -87,6 +91,7 @@ export async function consumeFindSSE(
     race.throwIfAborted();
   } finally {
     abort.dispose();
+    merged.dispose();
     try { await reader.cancel(); } catch { /* 已取消或已关闭 */ }
   }
 }

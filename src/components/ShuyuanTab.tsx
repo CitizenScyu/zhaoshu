@@ -18,10 +18,20 @@ export default function ShuyuanTab() {
   const [refreshing, setRefreshing] = useState(false);
   const [toggling, setToggling] = useState('');
   const refreshInFlight = useRef(false);
+  // 手动操作(刷新合集/启停)各自持有的中止控制器。signal 对 load 是必填的,
+  // 所以这两条路径也必须带上;下一次操作或组件卸载时中止上一次,让迟到的旧响应写不回状态。
+  const actionAbort = useRef<AbortController | null>(null);
+  useEffect(() => () => actionAbort.current?.abort(), []);
+  function beginAction(): AbortSignal {
+    actionAbort.current?.abort();
+    const controller = new AbortController();
+    actionAbort.current = controller;
+    return controller.signal;
+  }
 
   const load = useCallback(async (
     target: { filter: ShuyuanSourceFilter; page: number },
-    signal?: AbortSignal,
+    signal: AbortSignal,
   ): Promise<ShuyuanStatsPage | null> => {
     setLoading(true);
     setError('');
@@ -76,7 +86,7 @@ export default function ShuyuanTab() {
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || '刷新失败');
-      retreatToLastPage(await load({ filter, page }), page);
+      retreatToLastPage(await load({ filter, page }, beginAction()), page);
     } catch (e) {
       setError(e instanceof Error ? e.message : '刷新失败');
     } finally {
@@ -100,7 +110,7 @@ export default function ShuyuanTab() {
       // 后端返回「没这一行」= 这个 URL 已不在库里（刷新换过合集）：列表已过期，
       // 重新拉一次让用户看到实况。提示放在 load 之后，否则会被 load 的 setError('') 抹掉。
       const gone = data.disabled === false || data.enabled === false;
-      retreatToLastPage(await load({ filter, page }), page);
+      retreatToLastPage(await load({ filter, page }, beginAction()), page);
       if (gone) setError('这个书源已不在当前合集里，已为你重新加载列表');
     } catch (e) {
       setError(e instanceof Error ? e.message : '操作失败');
