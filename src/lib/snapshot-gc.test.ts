@@ -273,6 +273,30 @@ describe('B2-05 快照卷 GC:清单/指针缺失与存储错误一律 fail close
     expect(report.orphans).toContain(snaps(a)[2]);
   });
 
+  it('generated_at 解析不出时间(非法字符串/整个缺失)⇒ 按新近存活,其卷不得列为孤儿', async () => {
+    const { store, a } = await threeVersions();
+    const manifestPath = `${paths.dir}/${a.version}.json`;
+    const original = JSON.parse(store.files.get(manifestPath)!) as Record<string, unknown>;
+    const baseline = await collectSnapshotGarbage(store, stem, { now: LATER });
+    expect(baseline.liveVersions).not.toContain(a.version); // 合法 ISO 且远超 7 天窗 ⇒ 不存活
+    expect(baseline.orphans).toContain(snaps(a)[2]); // A 独占的丙卷此时是孤儿
+
+    store.files.set(manifestPath, JSON.stringify({ ...original, generated_at: 'not-a-date' }));
+    const unparsable = await collectSnapshotGarbage(store, stem, { now: LATER });
+    expect(unparsable.skipped).toBeNull();
+    expect(unparsable.liveVersions).toContain(a.version);
+    expect(unparsable.retained).toContain(snaps(a)[2]);
+    expect(unparsable.orphans).not.toContain(snaps(a)[2]);
+
+    const { generated_at: _omitted, ...withoutGeneratedAt } = original;
+    store.files.set(manifestPath, JSON.stringify(withoutGeneratedAt));
+    const missing = await collectSnapshotGarbage(store, stem, { now: LATER });
+    expect(missing.liveVersions).toContain(a.version);
+    expect(missing.orphans).not.toContain(snaps(a)[2]);
+
+    store.files.set(manifestPath, JSON.stringify(original));
+  });
+
   it('目录里没有快照卷(旧单文件时代)⇒ 不读任何清单、不跳过、无孤儿', async () => {
     const store = new MemoryStore();
     store.files.set(`${paths.dir}/0badf00d.txt`, '旧整本快照');
