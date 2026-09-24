@@ -1493,7 +1493,6 @@ class TestAuthorMatches(unittest.TestCase):
         'R4': (('[美]乔治·R.R.马丁', '马丁'),                             # 冰与火之歌
                ('[英] 詹姆斯·马修·巴利', '（英）巴利'),                   # 彼得·潘
                ('[英] 詹姆斯·马修·巴利', '(英)巴利'),
-               ('[英] 詹姆斯·马修·巴利', '（英）巴利著；靳锦译'),
                ('乔治·R·R·马丁', '马丁'),
                ('马丁', '乔治&middot;R.R.马丁')),                          # 方向对称 + 实体
     }
@@ -1520,6 +1519,14 @@ class TestAuthorMatches(unittest.TestCase):
         ('马丁', '马丁新'),
         ('金庸', '金庸新 著'), ('金庸', '金庸新；某某'),   # 分段后仍是整段相等
         ('美', '[美] 某某'),                    # 切出来的「美」不得撞单字笔名
+        # authrev41 非阻断 1：多署名串切出的一段不做外文末节匹配——否则同一引擎串
+        # 同时匹配「马丁」和「某某」两个不同名单作者。代价：phoenix 实测的「（英）巴利著；靳锦译」
+        # 这一行不再命中（彼得·潘另有「（英）巴利」「(英)巴利」两行照收，书级不受影响）。
+        ('马丁', '乔治·马丁著 某某编绘'),
+        ('[英] 詹姆斯·马修·巴利', '（英）巴利著；靳锦译'),
+        ('乔治·马丁著 某某编绘', '马丁'),
+        # 拉丁名内的空格不是多署名分隔：切开会让共有名字段的两人相等
+        ('Stephen King', 'Stephen Fry'), ('Author A', 'Author B'),
         ('[英] J.R.R.托尔金', 'J.R.R.Tolkien'),   # R5 中外文异体：不做
         ('威廉.雅各布斯', '(英)W.W.雅各布斯'),
     )
@@ -1587,7 +1594,7 @@ class TestSearchEngineAuthorRules(unittest.TestCase):
                             ('仙剑奇侠传四（全集）', '苏末那', '软星科技原著 执笔：苏末那'),
                             ('它：全2册', '[美] 斯蒂芬·金', '[美]斯蒂芬·金（Stephen King）'),
                             ('冰与火之歌', '[美]乔治·R.R.马丁', '马丁'),
-                            ('彼得·潘', '[英] 詹姆斯·马修·巴利', '（英）巴利著；靳锦译')):
+                            ('彼得·潘', '[英] 詹姆斯·马修·巴利', '（英）巴利著')):
             with self.subTest(title=title):
                 hit, out = self._search(title, a, b)
                 self.assertEqual(hit, {'url': 'https://s.example/b1', 'title': title,
@@ -1752,7 +1759,7 @@ class TestAuthorUnknownAmbiguityGuard(unittest.TestCase):
         # 改前：第一个兼容候选即收 ⇒ 绑到旺仔（a.example/wz）；改后：作者歧义跳过
         hit, out = self._search('偷偷藏不住', TTCBZ_CANDIDATES)
         self.assertIsNone(hit)
-        self.assertIn('作者歧义跳过: 《偷偷藏不住》名单无作者，兼容候选作者 3 人（旺仔、竹已、桑稚段嘉许）',
+        self.assertIn('作者歧义跳过: 《偷偷藏不住》名单无作者，兼容候选作者 3 人（旺仔、桑稚段嘉许、竹已）',
                       out)
 
     def test_prefix_title_other_author_also_counts(self):
@@ -1833,6 +1840,87 @@ class TestPublisherOnlyEndToEnd(unittest.TestCase):
         got, out = self._run(ConnectionError('豆瓣 subject 超时'))
         self.assertNotIn('偷偷藏不住', got)
         self.assertIn('作者歧义跳过', out)
+
+
+# ---- authfix41 整改（authrev41）----
+class TestAuthorMatchesRevision(unittest.TestCase):
+    def test_multi_signature_engine_string_does_not_match_two_list_authors_via_r4(self):
+        # 非阻断 1：R4 只作用于单人署名；「某某」照旧靠分段匹配
+        self.assertFalse(douban_list.author_matches('马丁', '乔治·马丁著 某某编绘'))
+        self.assertTrue(douban_list.author_matches('某某', '乔治·马丁著 某某编绘'))
+        self.assertTrue(douban_list.author_matches('马丁', '乔治·马丁著'))   # 单人署名照旧
+
+    def test_nbsp_is_a_signature_separator(self):
+        # 非阻断 2：&nbsp; 换空白参与切分，两位作者都能对上（改前马伯庸对不上）
+        for a in ('马伯庸', '刘巴布'):
+            with self.subTest(a=a):
+                self.assertTrue(douban_list.author_matches(a, '马伯庸&nbsp;刘巴布'))
+        self.assertFalse(douban_list.author_matches('马伯', '马伯庸&nbsp;刘巴布'))
+
+    def test_list_side_multi_signature_is_split(self):
+        # 非阻断 3：名单侧也切分，任一名单段与引擎任一段相等即真
+        self.assertTrue(douban_list.author_matches('松本清张、稲木皓人', '松本清张'))
+        self.assertTrue(douban_list.author_matches('松本清张、稲木皓人', '稲木皓人 著'))
+        self.assertTrue(douban_list.author_matches('[美] 甲乙, [美] 丙丁', '丙丁'))
+        # A 组原样仍拒
+        self.assertFalse(douban_list.author_matches('松本清张、稲木皓人', '(英)A.L·萨德勒'))
+        self.assertFalse(douban_list.author_matches('松本清张、稲木皓人', '李猛'))
+        # 国籍段不算一段：「[英国] 甲、[英国] 乙」不得因共有「英国」撞上别人
+        self.assertFalse(douban_list.author_matches('[英国] 甲乙、[英国] 丙丁', '[英国] 戊己'))
+
+    def test_list_author_normalizing_to_empty_never_matches(self):
+        # 非阻断 4：名单归一化为空 ⇒ 永不匹配（含引擎侧同样剥成空）
+        for want in ('', '---', '。。。', '作者：', '（）'):
+            for got in ('', '---', '。。。', '天蚕土豆', '作者：天蚕土豆'):
+                with self.subTest(want=want, got=got):
+                    self.assertFalse(douban_list.author_matches(want, got))
+
+
+class TestAmbiguityGuardOrderIndependent(unittest.TestCase):
+    """阻断 1：作者歧义判定与候选顺序无关（author_matches 不传递，不能贪心聚簇）。"""
+
+    @staticmethod
+    def _pick(authors):
+        hits = [({'url': f'https://s{i}.example/b', 'author': a}, a) for i, a in enumerate(authors)]
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            hit = douban_list._pick_author_unknown('同名书', hits)
+        return hit, out.getvalue()
+
+    def _all_orders(self, authors):
+        import itertools
+        return {p: self._pick(list(p)) for p in itertools.permutations(authors)}
+
+    def test_non_transitive_chain_is_skipped_in_every_order(self):
+        # 马伯庸 ~ 马伯庸著 刘巴布编绘 ~ 刘巴布，但 马伯庸 ≁ 刘巴布 ⇒ 3! 排列全部跳过
+        results = self._all_orders(['马伯庸', '马伯庸著 刘巴布编绘', '刘巴布'])
+        self.assertEqual(len(results), 6)
+        for order, (hit, out) in results.items():
+            with self.subTest(order=order):
+                self.assertIsNone(hit)
+                self.assertIn('兼容候选作者 3 人（刘巴布、马伯庸、马伯庸著 刘巴布编绘）', out)
+
+    def test_two_different_martins_are_skipped_in_every_order(self):
+        results = self._all_orders(['马丁', '乔治·马丁', '罗伯特·马丁'])
+        self.assertEqual(len(results), 6)
+        for order, (hit, out) in results.items():
+            with self.subTest(order=order):
+                self.assertIsNone(hit)
+                self.assertIn('作者歧义跳过', out)
+
+    def test_same_person_set_is_accepted_in_every_order(self):
+        # 两两同一人 ⇒ 每种顺序都收（收作者已知的第一个）
+        for authors in (['马丁', '乔治·马丁'], ['马伯庸', '马伯庸著 刘巴布编绘', '马伯庸 著']):
+            results = self._all_orders(authors)
+            for order, (hit, out) in results.items():
+                with self.subTest(order=order):
+                    self.assertIsNotNone(hit)
+                    self.assertEqual(hit['author'], order[0])
+                    self.assertNotIn('作者歧义', out)
+
+    def test_known_author_preferred_over_empty_in_every_order(self):
+        for order, (hit, _) in self._all_orders(['', '竹已', '竹已 著']).items():
+            with self.subTest(order=order):
+                self.assertTrue(hit['author'])
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

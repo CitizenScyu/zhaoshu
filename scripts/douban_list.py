@@ -169,8 +169,10 @@ def _norm_author(s: str) -> str:
 # 三条规则的判据仍是**整段严格相等**，不做子串包含（「金庸」≠「金庸新」、
 # 「唐家三少」≠「唐家三少之子」照旧拒）。中外文异体（「J.R.R.托尔金」vs
 # 「J.R.R.Tolkien」）需音译表，自动推导必误配，不做。
-# 多署名分隔：空白/分号/顿号/逗号/斜杠（HTML 实体须先替换，否则 &middot; 的分号会被切开）
-_AUTHOR_SPLIT_RE = re.compile(r'[\s　;；、，,/]+')
+# 多署名分隔：分号/顿号/逗号/斜杠，以及空白（HTML 实体须先替换，否则 &middot; 的分号会被切开）。
+# 两侧都是拉丁字母/点的空白不切：「Stephen King」「J.R.R. Tolkien」是一个人，切开后
+# 「Stephen King」与「Stephen Fry」会因共有「stephen」段被判同一人（authfix41 整改实测）。
+_AUTHOR_SPLIT_RE = re.compile(r'\s*[;；、，,/][\s;；、，,/]*|(?<![A-Za-z.])[\s　]+|[\s　]+(?![A-Za-z])')
 # 任意位置的括号段：全/半角圆括号、方括号、【】（书名号不算）；内层不含括号
 _AUTHOR_BRACKET_RE = re.compile(r'[（(【\[][^（()）【】\[\]]*[）)】\]]')
 # 署名角色：前导须带冒号（「执笔：苏末那」）；尾部只认多字角色（「软星科技原著」）。
@@ -191,11 +193,26 @@ def _strip_author_brackets(s: str) -> str:
     return s
 
 
+def _author_text(s: str) -> str:
+    """比对前的实体还原：&nbsp; 是空白（参与多署名切分——「马伯庸&nbsp;刘巴布」是两人）；
+    其余实体（&middot; 等）按名内分隔符 · 处理，与 _norm_author 口径一致。"""
+    text = re.sub(r'&(?:nbsp|#160|#xa0);', ' ', s or '', flags=re.IGNORECASE)
+    return re.sub(r'&[a-zA-Z]+;', '·', text)
+
+
 def _author_segments(s: str) -> list[str]:
-    """整串 + 按多署名分隔切出的各段（整串在前；只有一段时不重复）。"""
-    text = re.sub(r'&[a-zA-Z]+;', '·', s or '')
-    parts = [p for p in _AUTHOR_SPLIT_RE.split(text.strip()) if p]
+    """整串 + 按多署名分隔切出的各段（整串在前；只有一段时不重复）。
+    切出来的段剥括号后为空（「[美]」「（英）」这类国籍段）不算一段。"""
+    text = _author_text(s)
+    parts = [p for p in _AUTHOR_SPLIT_RE.split(text.strip())
+             if p and _strip_author_brackets(p).strip()]
     return [text] + (parts if len(parts) > 1 else [])
+
+
+def _is_single_author(s: str) -> bool:
+    """剥括号/前导「作者：」后不含多署名分隔符（「[英] 詹姆斯·马修·巴利」的空格在国籍段后，算单人）。"""
+    core = _strip_author_brackets(_strip_author_label(_author_text(s).strip())).strip()
+    return not _AUTHOR_SPLIT_RE.search(core)
 
 
 def _author_forms(seg: str) -> set[str]:
@@ -211,14 +228,27 @@ def _author_forms(seg: str) -> set[str]:
     return forms
 
 
+def _identity_forms(s: str) -> set[str]:
+    """整串及各多署名分段的可比形态并集；切出来的分段只认 ≥2 字形态
+    （「[美] X」切出的「美」不得撞单字笔名）。"""
+    forms: set[str] = set()
+    for i, seg in enumerate(_author_segments(s)):
+        f = _author_forms(seg)
+        forms |= {x for x in f if len(x) >= 2} if i else f
+    return forms
+
+
 def _foreign_surname_match(long_raw: str, short_raw: str) -> bool:
     """外文名末节匹配（R4）：「乔治·R.R.马丁」vs「马丁」、「詹姆斯·马修·巴利」vs「（英）巴利著」。
 
     护栏：长侧（剥括号/实体替换后）必须含「·」或「•」——中文名没有分节符，
     「金庸」vs「金庸新」、「唐家三少」vs「唐家三少之子」不会走到这里；短侧 = 长侧按
-    分节符切出的**最后一段**（整段严格相等，不是后缀包含）且 ≥2 字。"""
-    long_s = _strip_author_brackets(
-        _strip_author_label(re.sub(r'&[a-zA-Z]+;', '·', long_raw or '').strip()))
+    分节符切出的**最后一段**（整段严格相等，不是后缀包含）且 ≥2 字。
+    两侧都必须是单人署名（_is_single_author）：多署名串切出的一段不做末节匹配，否则
+    「乔治·马丁著 某某编绘」会同时匹配「马丁」和「某某」两个不同名单作者（authrev41）。"""
+    if not (_is_single_author(long_raw) and _is_single_author(short_raw)):
+        return False
+    long_s = _strip_author_brackets(_strip_author_label(_author_text(long_raw).strip()))
     if not _AUTHOR_FOREIGN_MARK_RE.search(long_s):
         return False
     short = _norm_author(_strip_author_brackets(short_raw or ''))
@@ -231,27 +261,22 @@ def _foreign_surname_match(long_raw: str, short_raw: str) -> bool:
 def author_matches(list_author: str, engine_author: str) -> bool:
     """名单作者与引擎作者是否同一人（search_engine 候选过滤与 labeler toc 二次校验共用）。
 
-    先比归一化严格相等（两端同为空也算相等——「作者未知」的语义由调用方先行处理）；
-    不等再对引擎侧整串及多署名各段试：
-      R2 分段/角色标签：任一段（剥「执笔：」「原著」等角色后）归一化 == 名单；
+    名单侧归一化为空（''、「---」「。。。」）⇒ 永不匹配（作者未知的语义由调用方先行处理，
+    这里不能因为两端都剥成空串就判相等）。否则先比归一化严格相等；不等再按两端各自的
+    整串 + 多署名各段比：
+      R2 分段/角色标签：名单任一段与引擎任一段（剥「执笔：」「原著」等角色后）归一化相等；
       R3 剥括号：两端剥所有括号段后归一化相等（剥后须非空）；
-      R4 外文名末节：见 _foreign_surname_match（两个方向都试）。
+      R4 外文名末节：见 _foreign_surname_match（两个方向都试，两侧须单人署名）。
     全部是整段严格相等，不做子串包含。"""
     want = _norm_author(list_author)
-    if want == _norm_author(engine_author):
-        return True
     if not want:
         return False
-    wants = _author_forms(list_author)
-    for i, seg in enumerate(_author_segments(engine_author)):
-        forms = _author_forms(seg)
-        if i:   # 切出来的分段只认 ≥2 字形态（「[美] X」切出的「美」不得撞单字笔名）
-            forms = {f for f in forms if len(f) >= 2}
-        if wants & forms:
-            return True
-        if _foreign_surname_match(list_author, seg) or _foreign_surname_match(seg, list_author):
-            return True
-    return False
+    if want == _norm_author(engine_author):
+        return True
+    if _identity_forms(list_author) & _identity_forms(engine_author):
+        return True
+    return (_foreign_surname_match(list_author, engine_author)
+            or _foreign_surname_match(engine_author, list_author))
 
 
 # ---- 豆瓣 tag 页解析（纯函数，可离线单测）----
@@ -735,22 +760,28 @@ def _pick_author_unknown(title: str, hits: list[tuple[dict, str]]) -> dict | Non
 
     改前是「第一个 title 兼容候选即收」：《偷偷藏不住》的同名候选有 竹已（真作者）/旺仔/
     桑稚段嘉许，候选顺序每次搜索都不同（gate.log 有一次旺仔排第一）⇒ 绑哪本看运气。
-    改后：兼容候选的非空作者按 author_matches（任一方向）聚成「同一人」簇——
-      ≥2 簇 ⇒ 作者歧义，跳过并记一行日志；
-      1 簇 ⇒ 收该作者的第一个候选（作者已知的优先于作者空的）；
-      0 簇（候选全无作者）⇒ 收第一个（无从区分，同改前）。"""
+    改后判定与候选顺序无关：兼容候选的非空作者**两两** author_matches（任一方向）为真
+    （或只有一个非空作者）才收，否则判作者歧义跳过并记一行日志。
+    不用「贪心聚簇」：author_matches 不传递（马伯庸 ~ 马伯庸著 刘巴布编绘 ~ 刘巴布，但
+    马伯庸 ≁ 刘巴布），贪心的簇数随候选顺序变（authrev41 阻断 1）。
+    收时作者已知的候选优先于作者空的；候选全无作者 ⇒ 收第一个（无从区分，同改前）。"""
     if not hits:
         return None
-    clusters: list[str] = []
+    authors: list[str] = []
+    seen: set[str] = set()
     for _, a in hits:
-        if _norm_author(a) and not any(author_matches(r, a) or author_matches(a, r)
-                                       for r in clusters):
-            clusters.append(a)
-    if len(clusters) >= 2:
-        names = '、'.join(clusters[:5]) + ('…' if len(clusters) > 5 else '')
-        print(f'  作者歧义跳过: 《{title}》名单无作者，兼容候选作者 {len(clusters)} 人（{names}）')
+        key = _norm_author(a)
+        if key and key not in seen:
+            seen.add(key)
+            authors.append(a)
+    ambiguous = any(not (author_matches(x, y) or author_matches(y, x))
+                    for k, x in enumerate(authors) for y in authors[k + 1:])
+    if ambiguous:
+        shown = sorted(authors, key=_norm_author)
+        names = '、'.join(shown[:5]) + ('…' if len(shown) > 5 else '')
+        print(f'  作者歧义跳过: 《{title}》名单无作者，兼容候选作者 {len(authors)} 人（{names}）')
         return None
-    if clusters:
+    if authors:
         return next(hit for hit, a in hits if _norm_author(a))
     return hits[0][0]
 
