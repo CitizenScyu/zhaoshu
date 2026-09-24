@@ -187,9 +187,7 @@ console.log(`▶ scripts 的 Python unittest 用例:${files.length} 个文件 �
 //   主动放行带 skipped 的 OK,且 N 含 skipped —— 于是「一个用例被 `@unittest.skip`」乃至
 //   「整个文件全 skip」都 exit 0、汇总照报 367 例全过。现在改成与 mjs 侧 S1 同口径的四条:
 //
-//   1) 结尾锚定:只看**最后一个** `Ran N tests in` 之后的那段文本,不做全文子串匹配。这样
-//      导入期/atexit 伪造的 `Ran…`/`OK` 行只要排在真汇总之前就一律不算数(复审 §可伪造性
-//      的三种伪造都被这条挡住,不必再靠「NO TESTS RAN 恰好挡下」这种巧合)。
+//   1) 结尾锚定:只看**最后一个** `Ran N tests in` 之后的那段文本。
 //   2) 全局零跳过:结尾出现 `skipped=` 且数字 > 0 即判红,并在汇总里单列「跳过 N」。
 //   3) 实际通过数:Ran 里含 skipped 与非通过项,逐文件与总量都按
 //      `实际通过 = Ran − skipped − 其他非通过` 算,要求每文件 ≥ 1、总量 ≥ MIN_EXPECTED_TESTS。
@@ -197,6 +195,15 @@ console.log(`▶ scripts 的 Python unittest 用例:${files.length} 个文件 �
 //      理由——`@unittest.expectedFailure` 只是把「已知失败」登记下来,门禁的价值在于「代码真的
 //      跑过并通过」;预期失败意味着那条用例此刻是失败的,把它算成绿等于让门禁对已知失败免疫。
 //      当前仓内一处都没用(实测 grep 无命中),这里的从严没有误红代价。
+//
+// 【只「锚定最后一个 Ran」还不够,须配合「汇总行恰好一条」】实测反例:某个用例真失败之后,
+//   用 `atexit` 在**真汇总之后再补写** `Ran 9999 tests in …\n\nOK\n`——补写的那条成了「最后一个
+//   Ran」,只看它就 exit 0(老 runner 同样绿,它取第一处但 OK 是子串匹配)。同理只补一行裸 `OK`
+//   也能骗过「取最后一条汇总行」。故再加一条:整段输出里 `OK`/`FAILED`/`NO TESTS RAN` 这类
+//   汇总行**必须恰好一条**。正常 unittest 逐文件跑永远只有一条;出现第二条就说明有人在汇总后
+//   追加内容,一律判红(fail-closed)。两条合起来把「汇总后再补」这类伪造路径关死。
+//   (残余:若伪造者先把真汇总从管道里抹掉、再自己写一条完整的假汇总,本 runner 无法分辨——
+//    那已经不是「解析脆」而是「进程输出不可信」,超出文本解析能保证的范围。)
 const RAN_RE = /^Ran (\d+) tests? in /gm;
 const SUMMARY_RE = /^OK\b[^\n]*$|^(?:FAILED|NO TESTS RAN)\b[^\n]*$/gm;
 
@@ -206,19 +213,23 @@ const countField = (line, name) => {
   return m ? Number(m[1]) : 0;
 };
 
-/** @returns {{ran:number|null, passed:number|null, skipped:number, failed:number, kind:string}} */
+/** @returns {{ran:number|null, passed:number|null, skipped:number, failed:number, kind:string, summaryLines:number}} */
 const parseSummary = (raw) => {
   const text = raw.replace(/\r\n/g, '\n');
+  // 汇总行条数:正常恰好 1 条,>1 视为被追加过(见上方说明)。
+  const summaryLines = [...text.matchAll(SUMMARY_RE)].length;
+  const base = { ran: null, passed: null, skipped: 0, failed: 0, summaryLines };
+
   // 1) 最后一个 `Ran N tests in` —— 它之后才是真汇总。
   const runs = [...text.matchAll(RAN_RE)];
-  if (runs.length === 0) return { ran: null, passed: null, skipped: 0, failed: 0, kind: 'no-ran' };
+  if (runs.length === 0) return { ...base, kind: 'no-ran' };
   const last = runs[runs.length - 1];
   const ran = Number(last[1]);
   const tail = text.slice(last.index + last[0].length);
 
-  // 2) 结尾的汇总行:取最后一个(通常也是唯一一个)。
+  // 2) 结尾的汇总行:取最后一个。
   const lines = [...tail.matchAll(SUMMARY_RE)].map((m) => m[0]);
-  if (lines.length === 0) return { ran, passed: null, skipped: 0, failed: 0, kind: 'no-verdict' };
+  if (lines.length === 0) return { ...base, ran, kind: 'no-verdict' };
   const verdict = lines[lines.length - 1];
 
   // 3) 计数字段。所有名称都是 unittest 的既有字段名(`FAILED (failures=1, errors=2)`、
@@ -232,7 +243,17 @@ const parseSummary = (raw) => {
     skipped + expectedFailures + unexpectedSuccesses + failures + errors;
   const passed = Math.max(0, ran - nonPass);
   const kind = verdict.startsWith('OK') ? 'ok' : verdict.startsWith('NO TESTS RAN') ? 'no-tests' : 'failed';
-  return { ran, passed, skipped, failed: failures + errors, kind, verdict, expectedFailures, unexpectedSuccesses };
+  return {
+    ran,
+    passed,
+    skipped,
+    failed: failures + errors,
+    kind,
+    verdict,
+    expectedFailures,
+    unexpectedSuccesses,
+    summaryLines,
+  };
 };
 
 const failedFiles = [];
@@ -253,6 +274,12 @@ for (const name of files) {
   const reasons = [];
   if (r.error) {
     reasons.push(`启动失败:${r.error.message}`);
+  } else if (s.summaryLines > 1) {
+    // 汇总行超过一条:正常输出只会有一条,多出来的是在真汇总之后追加的内容(见 parseSummary 上方说明)。
+    reasons.push(
+      `输出里有 ${s.summaryLines} 条汇总行(OK/FAILED/NO TESTS RAN),正常只应有一条` +
+        '——疑为真汇总之后被追加了假汇总,判红',
+    );
   } else if (s.ran === null) {
     reasons.push('未识别到 `Ran N tests` 行(进程没跑完 unittest,或输出被截断)');
   } else if (s.kind === 'no-tests') {
