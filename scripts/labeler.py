@@ -828,14 +828,21 @@ class EngineCliError(RuntimeError):
 # ---- 源整站失效提前放弃（giveup41）----
 # 事故（2026-09-25 phoenix）：www.bqquge.org 对所有请求 302 → google，引擎按跨站跳转拒绝，
 # 而逐章循环吞掉一切错误继续下一章，一本书打满上千章、70+ 分钟零产出。改为：
-# - 只有**确定性**错误类别（同一 URL 重试结果不变）参与放弃判定；超时/5xx/未知类别不参与（防误杀）。
+# - 只有**确定性**错误类别（同一 URL 重试结果不变）参与放弃判定；超时/未知类别不参与（防误杀）。
 # - 同一本书在同一源上连续 SOURCE_GIVEUP_STREAK 章同一确定性类别 → 放弃该源（任一章成功或出现别的
 #   结果即清零）；toc 本身就确定性失败 → 直接放弃该源。放弃后按队列条目的 engine_alternates 换源。
+# - 5xx 残留（giveuprev41）：CLI 内 page() 已对 5xx 重试过、labeler 又重试 CHUNK_RETRY 次后该章仍是
+#   http_5xx，才算一章「5xx 章」；连续 SERVER_ERROR_GIVEUP_STREAK 章（比确定性阈值长）→ 放弃。
+#   否则整站 500/502 仍会把整本目录打满。超时仍不参与。
 # - 同一 host 本轮累计放弃 ≥ DEAD_HOST_GIVEUPS 次 → 本轮后续条目/备选凡在该 host 的不再发请求。
 #   （一轮是先搜完全部书名再打标，打标阶段已无「后续搜索」，故本轮跳过落在打标阶段。）
 SOURCE_GIVEUP_STREAK = 5
+SERVER_ERROR_GIVEUP_STREAK = 8
+SERVER_ERROR_KIND = 'http_5xx'
 DEAD_HOST_GIVEUPS = 2
 DETERMINISTIC_ENGINE_ERRORS = frozenset({'policy', 'http_4xx', 'no_source'})
+# 主源与全部备选都在本轮已失效 host 上、一个请求都没发时的放弃 kind（不是 CLI 错误类别）。
+DEAD_HOST_SKIP_KIND = 'dead_host_skipped'
 MIN_BOOK_CHARS = 10_000     # 一本书至少要抓到的字数（不足记「抓取字数不足」）
 
 
@@ -843,7 +850,7 @@ class EngineSourceGaveUp(RuntimeError):
     """放弃某源：host + 触发类别 + 放弃前已抓到的部分正文（text/chars，供调用方决定是否够用）。"""
 
     def __init__(self, host: str, kind: str, detail: str, text: str = '', chars: int = 0):
-        super().__init__(f'源 {host} 确定性失效（{kind}）：{detail}')
+        super().__init__(f'源 {host} 失效（{kind}）：{detail}')
         self.host, self.kind, self.text, self.chars = host, kind, text, chars
 
 
@@ -881,7 +888,8 @@ def fetch_book_text_engine(engine_cli, book_url: str,
                            target_chars: int = TARGET_CHARS,
                            expect_title: str = '',
                            expect_author: str = '',
-                           giveup_streak: int = SOURCE_GIVEUP_STREAK) -> tuple[str, int]:
+                           giveup_streak: int = SOURCE_GIVEUP_STREAK,
+                           server_error_streak: int = SERVER_ERROR_GIVEUP_STREAK) -> tuple[str, int]:
     """引擎源整本（到字数上限）→ (拼接文本, 实际字数)。
 
     toc 失败（无章 / 环境错误，CLI 退出码非 0）→ 抛异常，交主循环计失败（不静默产空文本）。
@@ -890,6 +898,7 @@ def fetch_book_text_engine(engine_cli, book_url: str,
 
     giveup41：toc 确定性失败、或连续 giveup_streak 章同一确定性错误类别 → 抛 EngineSourceGaveUp
     （带已抓到的部分正文）；确定性错误的单章不再重试（重试结果不变，白等退避）。
+    重试后仍 http_5xx 的章连续 server_error_streak 章 → 同样放弃（5xx 章照旧重试）。
 
     N02 二次校验（toc 取回后、逐章 content **之前**）：expect_title/expect_author
     是名单侧身份锚点（队列条目的 title/author）。**双侧非空才比对**——toc 缺自报
@@ -916,7 +925,9 @@ def fetch_book_text_engine(engine_cli, book_url: str,
             f' vs 目录《{toc_title}》/作者 {toc_author}（作者不符）')
     chapters = toc.get('chapters') or []
     parts, chars = [], 0
-    streak_kind, streak = '', 0     # 连续同一确定性错误类别的章数
+    streak_limit = dict.fromkeys(DETERMINISTIC_ENGINE_ERRORS, giveup_streak)
+    streak_limit[SERVER_ERROR_KIND] = server_error_streak
+    streak_kind, streak = '', 0     # 连续同一放弃类别（确定性 / 重试后仍 5xx）的章数
     for ch in chapters:
         if chars >= target_chars:
             break
@@ -925,15 +936,15 @@ def fetch_book_text_engine(engine_cli, book_url: str,
         if not ch_url:
             continue
         text = ''
-        fail_kind = None            # None = CLI 成功；'' = 非确定性/未知失败
+        fail_kind = ''              # 本章最后一次尝试的失败类别；'' = 成功或不计入放弃的失败
         for attempt in range(CHUNK_RETRY):
             try:
                 text = _engine_json(engine_cli, 'content', '--url', ch_url).get('text') or ''
-                fail_kind = None
+                fail_kind = ''
                 break
             except EngineCliError as e:
-                fail_kind = e.kind if e.kind in DETERMINISTIC_ENGINE_ERRORS else ''
-                if fail_kind:
+                fail_kind = e.kind if e.kind in streak_limit else ''
+                if fail_kind in DETERMINISTIC_ENGINE_ERRORS:
                     break           # 确定性错误：重试结果不变，不退避
                 time.sleep(2 * (attempt + 1))
             except Exception:
@@ -942,7 +953,7 @@ def fetch_book_text_engine(engine_cli, book_url: str,
         if fail_kind:
             streak = streak + 1 if fail_kind == streak_kind else 1
             streak_kind = fail_kind
-            if streak >= giveup_streak:
+            if streak >= streak_limit[fail_kind]:
                 raise EngineSourceGaveUp(host, fail_kind, f'连续 {streak} 章 {fail_kind}',
                                          '\n\n'.join(parts), chars)
         else:
@@ -956,10 +967,10 @@ def fetch_book_text_engine(engine_cli, book_url: str,
 
 def fetch_engine_book_with_giveup(engine_cli, book: dict, tracker: SourceGiveupTracker,
                                   giveup_streak: int = SOURCE_GIVEUP_STREAK) -> tuple[str, int, dict]:
-    """引擎队列条目取正文，主源确定性失效时按 engine_alternates 换源 → (text, chars, 实际所用源)。
+    """引擎队列条目取正文，主源失效（确定性错误或持续 5xx）时按 engine_alternates 换源 → (text, chars, 实际所用源)。
 
     实际所用源 = {'url', 'title', 'source'}，调用方据此改写条目的 url/source_host（产物记真实来源）。
-    - 主源：身份不符 / 非确定性失败照旧上抛（行为同改前）；确定性失效 → tracker 记一次放弃、换下一个。
+    - 主源：身份不符 / 其他失败照旧上抛（行为同改前）；EngineSourceGaveUp → tracker 记一次放弃、换下一个。
     - 备选：任何失败都只跳过该备选（身份不符也不写 rejected——备选不是名单选定的那条）。
     - 放弃前已抓够 MIN_BOOK_CHARS 字 → 直接用已抓到的部分，不再换源。
     - host 已在 tracker.dead → 不发请求直接跳过。全部用尽 → 抛 EngineSourceGaveUp。"""
@@ -971,7 +982,7 @@ def fetch_engine_book_with_giveup(engine_cli, book: dict, tracker: SourceGiveupT
         host = src.get('source') or _url_host(src['url'])
         if host in tracker.dead:
             print(f'  跳过本轮已失效源: {host}')
-            last = last or EngineSourceGaveUp(host, 'dead_host', '本轮已判失效')
+            last = last or EngineSourceGaveUp(host, DEAD_HOST_SKIP_KIND, '本轮已判失效')
             continue
         if i > 0:
             print(f'  换源: {host} {src["url"]}')
@@ -1537,7 +1548,7 @@ def main() -> int:
 
     ok = fail = stub_skipped = 0
     fail_kinds: dict[str, int] = {}
-    # giveup41：本轮按 host 累计「源确定性失效」放弃次数，达阈值后后续条目不再请求该 host。
+    # giveup41：本轮按 host 累计「源失效」放弃次数，达阈值后后续条目不再请求该 host。
     source_giveups = SourceGiveupTracker(DEAD_HOST_GIVEUPS)
 
     def count_failure(kind: str) -> None:
@@ -1562,7 +1573,7 @@ def main() -> int:
             if b.get('engine'):
                 # N02：toc 自报身份与名单身份比对（双侧非空才比对），错书在抓正文前拦下。
                 # 引擎条目 url 是绝对 host URL，绝不能走 http_get(BASE + url) 打错站。
-                # giveup41：主源确定性失效（连续多章跨站跳转/4xx 等）提前放弃并换备选源；
+                # giveup41：主源失效（连续多章跨站跳转/4xx，或持续 5xx）提前放弃并换备选源；
                 # 换源成功则条目 url/source_host 改记实际来源（产物与入库记真实来源）。
                 text, chars, used = fetch_engine_book_with_giveup(
                     engine_cli, b, source_giveups, giveup_streak=SOURCE_GIVEUP_STREAK)

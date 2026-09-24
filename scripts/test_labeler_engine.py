@@ -540,8 +540,8 @@ class TestSourceGiveup(unittest.TestCase):
         self.assertEqual(len(_content_calls(cli)), labeler.SOURCE_GIVEUP_STREAK)
 
     def test_jitter_kinds_never_trigger_giveup(self):
-        # 抖动（超时 / 5xx / 未知类别）不参与放弃：照旧重试、逐章继续，不抛
-        for kind in ('timeout', 'http_5xx', 'other', 'empty'):
+        # 抖动（超时 / 未知类别）不参与放弃：照旧重试、逐章继续，不抛（5xx 见 TestServerErrorGiveup）
+        for kind in ('timeout', 'other', 'empty', 'usage', 'pool'):
             with self.subTest(kind=kind):
                 cli = FakeEngineCli(lambda sub, url, k=kind: _toc_on('h.example', 12)
                                     if sub == 'toc' else _kind(k))
@@ -774,6 +774,107 @@ class TestMainSwitchesSourceAndRecordsIt(unittest.TestCase):
         text = out.getvalue()
         self.assertIn('失败分类: 源失效放弃 1', text)
         self.assertIn('源失效（本轮）: www.bqquge.org', text)       # 两本各放弃一次 → 本轮判失效
+
+
+class TestServerErrorGiveup(unittest.TestCase):
+    """giveuprev41：重试后仍 5xx 的章用更长的连续阈值（默认 8）放弃；超时仍不参与。"""
+
+    def setUp(self):
+        patcher = mock.patch.object(labeler.time, 'sleep')
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_default_constant(self):
+        self.assertEqual(labeler.SERVER_ERROR_GIVEUP_STREAK, 8)
+        self.assertGreater(labeler.SERVER_ERROR_GIVEUP_STREAK, labeler.SOURCE_GIVEUP_STREAK)
+
+    def test_whole_site_502_gives_up_at_8th_chapter(self):
+        # 反例：改前整站 502 → 30 章 × CHUNK_RETRY 全打满；改后第 8 章（c7）放弃
+        cli = FakeEngineCli(lambda sub, url: _toc_on('h.example', 30) if sub == 'toc'
+                            else _kind('http_5xx'))
+        with self.assertRaises(labeler.EngineSourceGaveUp) as ctx:
+            labeler.fetch_book_text_engine(cli, 'https://h.example/b')
+        self.assertEqual(ctx.exception.kind, 'http_5xx')
+        self.assertEqual(_content_calls(cli)[-1], ('content', 'https://h.example/c7'))
+        # 5xx 章照旧重试（抖动类仍给重试机会）：8 章 × CHUNK_RETRY 次
+        self.assertEqual(len(_content_calls(cli)), 8 * labeler.CHUNK_RETRY)
+
+    def test_5xx_does_not_use_the_shorter_deterministic_streak(self):
+        # 7 连 5xx 后成功一章：确定性阈值 5 不适用于 5xx → 不放弃
+        good = '正' * 200
+
+        def handler(sub, url):
+            if sub == 'toc':
+                return _toc_on('h.example', 8)
+            return _content(good) if url.endswith('/c7') else _kind('http_5xx')
+
+        text, chars = labeler.fetch_book_text_engine(FakeEngineCli(handler), 'https://h.example/b')
+        self.assertEqual(chars, len(good))
+
+    def test_success_between_5xx_resets(self):
+        # 每 7 章 5xx 夹 1 章成功：永远到不了 8 连
+        good = '正' * 200
+
+        def handler(sub, url):
+            if sub == 'toc':
+                return _toc_on('h.example', 32)
+            return _content(good) if int(url.rsplit('c', 1)[1]) % 8 == 7 else _kind('http_5xx')
+
+        text, chars = labeler.fetch_book_text_engine(FakeEngineCli(handler), 'https://h.example/b')
+        self.assertEqual(chars, 4 * len(good))
+
+    def test_timeout_never_triggers_even_past_8(self):
+        cli = FakeEngineCli(lambda sub, url: _toc_on('h.example', 20) if sub == 'toc'
+                            else _kind('timeout'))
+        text, chars = labeler.fetch_book_text_engine(cli, 'https://h.example/b')
+        self.assertEqual(chars, 0)
+        self.assertEqual(len(_content_calls(cli)), 20 * labeler.CHUNK_RETRY)
+
+    def test_timeout_chapter_between_5xx_resets(self):
+        # 7 章 5xx + 1 章超时 + 7 章 5xx：超时章不计入且打断连续 → 不放弃
+        def handler(sub, url):
+            if sub == 'toc':
+                return _toc_on('h.example', 15)
+            return _kind('timeout') if url.endswith('/c7') else _kind('http_5xx')
+
+        text, chars = labeler.fetch_book_text_engine(FakeEngineCli(handler), 'https://h.example/b')
+        self.assertEqual(chars, 0)
+
+    def test_chapter_counts_only_if_final_attempt_is_5xx(self):
+        # 每章前几次 5xx、最后一次超时 → 该章不算 5xx 章，永不放弃
+        attempts = {}
+
+        def handler(sub, url):
+            if sub == 'toc':
+                return _toc_on('h.example', 12)
+            attempts[url] = attempts.get(url, 0) + 1
+            return _kind('timeout') if attempts[url] == labeler.CHUNK_RETRY else _kind('http_5xx')
+
+        text, chars = labeler.fetch_book_text_engine(FakeEngineCli(handler), 'https://h.example/b')
+        self.assertEqual(chars, 0)
+
+    def test_5xx_and_policy_do_not_add_up(self):
+        def handler(sub, url):
+            if sub == 'toc':
+                return _toc_on('h.example', 20)
+            return _kind('policy' if int(url.rsplit('c', 1)[1]) % 2 else 'http_5xx')
+
+        text, chars = labeler.fetch_book_text_engine(FakeEngineCli(handler), 'https://h.example/b')
+        self.assertEqual(chars, 0)
+
+
+class TestDeadHostSkipKind(unittest.TestCase):
+    def test_all_options_on_dead_hosts_uses_dedicated_kind(self):
+        tracker = labeler.SourceGiveupTracker(2)
+        tracker.dead.update({'www.bqquge.org', 'www.yingsx.com'})
+        cli = _multi_host_cli(set())
+        with contextlib.redirect_stdout(io.StringIO()), \
+                self.assertRaises(labeler.EngineSourceGaveUp) as ctx:
+            labeler.fetch_engine_book_with_giveup(cli, _book(alternates=[ALT]), tracker)
+        self.assertEqual(ctx.exception.kind, labeler.DEAD_HOST_SKIP_KIND)
+        self.assertNotIn(labeler.DEAD_HOST_SKIP_KIND, labeler.DETERMINISTIC_ENGINE_ERRORS)
+        self.assertEqual(cli.calls, [])
+        self.assertEqual(labeler.classify_failure(ctx.exception), '源失效放弃')
 
 
 if __name__ == '__main__':
