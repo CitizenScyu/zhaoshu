@@ -296,23 +296,78 @@ def _search_book15_once(http_get, title: str) -> list[tuple[str, str]]:
     return parse_book15_search(html)
 
 
-def search_book15(http_get, title: str) -> dict | None:
+# ---- book15 搜索熔断（labelerdiag41：book15 整站 522/超时，每本 3 次全失败，一轮白耗十几小时）----
+# 连续 N 本搜索「重试全失败」（网络/5xx/超时，区别于正常 miss）即熔断：本轮剩余候选不再发
+# book15 搜索，直接走引擎兜底（未开兜底则记 miss）。任一次搜索拿到页面即清零计数。
+# 阈值走 .env / 进程环境 LABELER_BOOK15_BREAKER，≤0 关闭熔断；非法值回落默认。
+BOOK15_BREAKER_ENV = 'LABELER_BOOK15_BREAKER'
+BOOK15_BREAKER_DEFAULT = 5
+
+
+def resolve_book15_breaker(env: dict | None = None) -> int:
+    """熔断阈值：env 字典 → 进程环境 → 默认 5；非整数回落默认，≤0 表示关闭。"""
+    raw = ''
+    if env and env.get(BOOK15_BREAKER_ENV) is not None:
+        raw = str(env.get(BOOK15_BREAKER_ENV)).strip()
+    if not raw:
+        raw = (os.environ.get(BOOK15_BREAKER_ENV) or '').strip()
+    if not raw:
+        return BOOK15_BREAKER_DEFAULT
+    try:
+        return int(raw)
+    except ValueError:
+        return BOOK15_BREAKER_DEFAULT
+
+
+class Book15Breaker:
+    """单轮内的 book15 搜索熔断器（不跨轮：下一轮 labeler 进程重新探 book15 是否恢复）。"""
+
+    def __init__(self, threshold: int = BOOK15_BREAKER_DEFAULT):
+        self.threshold = threshold
+        self.consecutive = 0
+        self.open = False
+        self.skipped = 0
+
+    def record(self, failed: bool) -> None:
+        if self.open:
+            return
+        if not failed:
+            self.consecutive = 0
+            return
+        self.consecutive += 1
+        if self.threshold > 0 and self.consecutive >= self.threshold:
+            self.open = True
+            print(f'  book15 熔断：连续 {self.consecutive} 本搜索全失败'
+                  f'（阈值 {self.threshold}，{BOOK15_BREAKER_ENV}），'
+                  f'本轮剩余候选跳过 book15 搜索、直接走引擎兜底', flush=True)
+
+
+def search_book15(http_get, title: str, breaker: Book15Breaker | None = None) -> dict | None:
     """书名 → book15 详情页（带语义校验）。miss / 误匹配 / 全重试失败均返回 None。
 
     http_get 需接受 book15 站内相对路径（与 labeler 抓正文同一约定，
-    便于测试注入与将来换 BASE）。"""
+    便于测试注入与将来换 BASE）。
+    breaker（可选）：已熔断 ⇒ 不发请求直接 None；拿到页面/全重试失败分别记成功/失败。"""
+    if breaker is not None and breaker.open:
+        breaker.skipped += 1
+        return None
     last_err = None
     for attempt in range(SEARCH_RETRY):
         try:
             results = _search_book15_once(http_get, title)
-            for url, site_title in results:
-                if title_compatible(title, site_title):
-                    return {'url': url, 'title': site_title}
-            return None
         except Exception as e:
             last_err = e
             time.sleep(SEARCH_RETRY_DELAY * (attempt + 1))
+            continue
+        if breaker is not None:
+            breaker.record(False)
+        for url, site_title in results:
+            if title_compatible(title, site_title):
+                return {'url': url, 'title': site_title}
+        return None
     print(f'  book15搜索[{title}] {SEARCH_RETRY} 次全失败: {last_err}', file=sys.stderr)
+    if breaker is not None:
+        breaker.record(True)
     return None
 
 
@@ -481,7 +536,8 @@ def validate_engine(cli) -> None:
 
 
 def build_douban_queue(http_get, skip_titles: set | None = None,
-                       pages: int | None = None, engine_cli=None) -> list[dict]:
+                       pages: int | None = None, engine_cli=None,
+                       book15_breaker: Book15Breaker | None = None) -> list[dict]:
     """豆瓣名单 → book15 打标队列 [{url, title, author, category, status, douban_url}]。
 
     与 labeler.fetch_rank_books() 的产出同构（url 为站内相对路径），
@@ -490,11 +546,13 @@ def build_douban_queue(http_get, skip_titles: set | None = None,
     douban_books = fetch_douban_books(http_get, pages=pages)
     print(f'豆瓣名单共 {len(douban_books)} 本（去重后）')
     return _resolve_candidates(douban_books, http_get, origin='豆瓣tag',
-                               skip_titles=skip_titles, engine_cli=engine_cli)
+                               skip_titles=skip_titles, engine_cli=engine_cli,
+                               book15_breaker=book15_breaker)
 
 
 def _resolve_candidates(candidates: list[dict], http_get, origin: str = '',
-                        skip_titles: set | None = None, engine_cli=None) -> list[dict]:
+                        skip_titles: set | None = None, engine_cli=None,
+                        book15_breaker: Book15Breaker | None = None) -> list[dict]:
     """候选名单（[{title, author, ...}]）→ 过 book15 搜索+校验的打标队列。
 
     各名单源共用：命中记队列（category 记来源标记，默认取候选自带 origin，
@@ -505,7 +563,10 @@ def _resolve_candidates(candidates: list[dict], http_get, origin: str = '',
     engine_cli（T5）：非空且 LABELER_ENGINE_FALLBACK 开启时，book15 miss 才回落引擎源池。
     engine_cli=None（开关关闭）时本函数行为**逐字不变**（红线）——不调 CLI、条目无 engine 标记。
     引擎命中的条目带 {'engine': True, 'source_host': host, url=bookUrl（绝对）}；
-    退出码 2（环境错误）→ 本轮禁用引擎、降级 book15-only、不重试（不连坐后续候选）。"""
+    退出码 2（环境错误）→ 本轮禁用引擎、降级 book15-only、不重试（不连坐后续候选）。
+
+    book15_breaker（labelerdiag41）：book15 连续搜索全失败达阈值后，剩余候选不再搜 book15、
+    直接走引擎兜底；None 时行为不变。"""
     queue: list[dict] = []
     miss: list[str] = []
     skipped = 0
@@ -517,7 +578,7 @@ def _resolve_candidates(candidates: list[dict], http_get, origin: str = '',
         if skip_titles and key and key in skip_titles:
             skipped += 1
             continue
-        hit = search_book15(http_get, b['title'])
+        hit = search_book15(http_get, b['title'], breaker=book15_breaker)
         if hit:
             queue.append({'url': hit['url'], 'title': hit['title'],
                           'author': b.get('author', ''),
@@ -551,8 +612,11 @@ def _resolve_candidates(candidates: list[dict], http_get, origin: str = '',
         time.sleep(SEARCH_DELAY)
     # 开关关闭时 engine_hits=0 且 book15_hits==len(queue)，本行逐字复现旧文案（红线）。
     engine_note = f'，引擎兜底命中 {engine_hits} 本' if engine_cli is not None else ''
+    # 未熔断时本行逐字不变；熔断后补一段「熔断跳过 book15 搜索 N 本」。
+    breaker_note = (f'，book15 熔断跳过搜索 {book15_breaker.skipped} 本'
+                    if book15_breaker is not None and book15_breaker.open else '')
     print(f'book15 命中 {book15_hits} 本，未命中 {len(miss)} 本，'
-          f'跳过已打标 {skipped} 本{engine_note}'
+          f'跳过已打标 {skipped} 本{engine_note}{breaker_note}'
           f'{"（" + "、".join(miss[:10]) + ("…" if len(miss) > 10 else "") + "）" if miss else ""}')
     return queue
 
@@ -832,7 +896,8 @@ def fetch_17k_quanben_books(http_get) -> list[dict]:
 
 def build_webnovel_queue(http_get, include_douban: bool = True,
                          skip_titles: set | None = None,
-                         pages: int | None = None, engine_cli=None) -> list[dict]:
+                         pages: int | None = None, engine_cli=None,
+                         book15_breaker: Book15Breaker | None = None) -> list[dict]:
     """网文站名单（主）+ 豆瓣 tag（补充）→ book15 打标队列。
 
     用户指令（2026-09-18）：网文站榜单是对口 book15 的一手来源，优先；
@@ -864,4 +929,4 @@ def build_webnovel_queue(http_get, include_douban: bool = True,
     if include_douban:
         add_batch(fetch_douban_books(http_get, pages=pages), '豆瓣网文tag')
     return _resolve_candidates(candidates, http_get, skip_titles=skip_titles,
-                               engine_cli=engine_cli)
+                               engine_cli=engine_cli, book15_breaker=book15_breaker)

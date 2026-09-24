@@ -297,7 +297,7 @@ class TestMainRejectsIdentityMismatch(unittest.TestCase):
         llm_called = []
 
         def fake_build(http_get, skip_titles=None, include_douban=True, pages=None,
-                       engine_cli=None):
+                       engine_cli=None, book15_breaker=None):
             return [book]
 
         out, err = io.StringIO(), io.StringIO()
@@ -336,7 +336,7 @@ class TestMainRejectsIdentityMismatch(unittest.TestCase):
                 'author': '天蚕土豆', 'engine': True}
 
         def fake_build(http_get, skip_titles=None, include_douban=True, pages=None,
-                       engine_cli=None):
+                       engine_cli=None, book15_breaker=None):
             return [book]
 
         out, err = io.StringIO(), io.StringIO()
@@ -355,6 +355,46 @@ class TestMainRejectsIdentityMismatch(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertIn('失败: boom', err.getvalue())
         self.assertFalse((self.dir / 'labels-rejected.jsonl').exists())
+
+
+class TestMainWiresBook15Breaker(unittest.TestCase):
+    """labelerdiag41：名单线把按 .env 阈值装配的 book15 熔断器交给队列构建。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dir = Path(self.tmp.name)
+
+    def _run(self, env_text):
+        (self.dir / '.env').write_text('LLM_API_KEY=test-key-not-real\n' + env_text,
+                                       encoding='utf-8')
+        seen = []
+
+        def fake_build(http_get, skip_titles=None, include_douban=True, pages=None,
+                       engine_cli=None, book15_breaker=None):
+            seen.append(book15_breaker)
+            return []
+
+        with mock.patch.dict(os.environ, {'LABELER_DATA_DIR': str(self.dir)}), \
+                mock.patch.object(labeler.douban_list, 'build_webnovel_queue',
+                                  side_effect=fake_build), \
+                mock.patch.object(sys, 'argv',
+                                  ['labeler.py', '--source', 'webnovel',
+                                   '--no-db-model', '--dry-run']), \
+                contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(io.StringIO()):
+            os.environ.pop(labeler.douban_list.BOOK15_BREAKER_ENV, None)
+            labeler.main()
+        self.assertEqual(len(seen), 1)
+        return seen[0]
+
+    def test_default_threshold(self):
+        breaker = self._run('')
+        self.assertIsInstance(breaker, labeler.douban_list.Book15Breaker)
+        self.assertEqual(breaker.threshold, labeler.douban_list.BOOK15_BREAKER_DEFAULT)
+
+    def test_env_threshold(self):
+        self.assertEqual(self._run('LABELER_BOOK15_BREAKER=2\n').threshold, 2)
 
 
 if __name__ == '__main__':

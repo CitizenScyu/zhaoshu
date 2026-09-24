@@ -1152,13 +1152,15 @@ def main() -> int:
             engine_cli = _build_engine_cli(env)
             if engine_cli is not None:
                 print('  引擎兜底已启用：book15 miss 将回落引擎源池')
+            # book15 熔断（labelerdiag41）：整站挂掉时别让每本 3 次全失败把一轮拖成十几小时。
+            book15_breaker = douban_list.Book15Breaker(douban_list.resolve_book15_breaker(env))
             all_books = (douban_list.build_douban_queue(
                              bridged, skip_titles=skip_titles, pages=pages,
-                             engine_cli=engine_cli)
+                             engine_cli=engine_cli, book15_breaker=book15_breaker)
                          if args.source == 'douban'
                          else douban_list.build_webnovel_queue(
                              bridged, skip_titles=skip_titles, pages=pages,
-                             engine_cli=engine_cli))
+                             engine_cli=engine_cli, book15_breaker=book15_breaker))
             print(f'{args.source} 线共 {len(all_books)} 本（搜索命中后）')
         else:
             print('拉取榜单书目...')

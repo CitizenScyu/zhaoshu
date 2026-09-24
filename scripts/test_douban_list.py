@@ -992,6 +992,107 @@ class TestResolveCandidatesEngineFallback(unittest.TestCase):
         self.assertEqual(cli.calls, [])          # 已打标：连 book15 带引擎都不搜
 
 
+class TestBook15Breaker(unittest.TestCase):
+    """labelerdiag41：book15 整站挂时连续 N 本搜索全失败 → 本轮剩余跳过 book15、直接走引擎兜底。"""
+
+    def setUp(self):
+        no_wait(self)
+        patcher = mock.patch.object(douban_list, 'SEARCH_RETRY_DELAY', 0)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.book15_calls = []
+
+    def _down(self, url):
+        self.book15_calls.append(url)
+        raise ConnectionError('HTTP Error 522')
+
+    @staticmethod
+    def _engine_hits():
+        def results(sub, args):
+            title = args[args.index('--title') + 1]
+            return _proc(0, _engine_search_stdout([
+                {'source': 'www.yingsx.com', 'title': title, 'author': '',
+                 'bookUrl': f'https://www.yingsx.com/{urllib.parse.quote(title)}'}]))
+        return FakeEngineCli(results)
+
+    def _run(self, cands, http_get, breaker, engine_cli=None):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            queue = douban_list._resolve_candidates(
+                cands, http_get, engine_cli=engine_cli, book15_breaker=breaker)
+        return queue, out.getvalue()
+
+    def test_trips_after_threshold_and_skips_book15_for_the_rest(self):
+        cands = [{'title': f'书{i}号'} for i in range(8)]
+        cli = self._engine_hits()
+        breaker = douban_list.Book15Breaker(3)
+        queue, out = self._run(cands, self._down, breaker, engine_cli=cli)
+        # 前 3 本各 SEARCH_RETRY 次请求后熔断，后 5 本一个 book15 请求都不发
+        self.assertEqual(len(self.book15_calls), 3 * douban_list.SEARCH_RETRY)
+        self.assertTrue(breaker.open)
+        self.assertEqual(breaker.skipped, 5)
+        # 8 本全部走到了引擎兜底（熔断不影响兜底）
+        self.assertEqual(len(cli.calls), 8)
+        self.assertEqual(len(queue), 8)
+        self.assertTrue(all(b['engine'] for b in queue))
+        # 熔断事件只打一行；汇总行带熔断跳过数
+        self.assertEqual(out.count('book15 熔断：'), 1)
+        self.assertIn('book15 熔断跳过搜索 5 本', out)
+
+    def test_page_fetched_resets_consecutive_failures(self):
+        # 失败 2 本 → 1 本拿到页面（正常 miss）→ 失败 2 本：从未连续达 3，不熔断。
+        # 失败的书连续 SEARCH_RETRY 次请求都失败；拿到页面的书首次请求即成功。
+        plan = []
+        for ok in (False, False, True, False, False):
+            plan += [True] if ok else [False] * douban_list.SEARCH_RETRY
+        responses = iter(plan)
+        cands = [{'title': f'书{i}号'} for i in range(5)]
+
+        def flaky(url):
+            self.book15_calls.append(url)
+            if not next(responses):
+                raise ConnectionError('timeout')
+            return NO_RESULT_HTML
+
+        breaker = douban_list.Book15Breaker(3)
+        self._run(cands, flaky, breaker)
+        self.assertFalse(breaker.open)
+        self.assertEqual(breaker.skipped, 0)
+
+    def test_normal_miss_is_not_a_failure(self):
+        # 站点在线但搜不到（正常 miss）不计失败：连续 10 本 miss 也不熔断
+        cands = [{'title': f'书{i}号'} for i in range(10)]
+        breaker = douban_list.Book15Breaker(3)
+        _, out = self._run(cands, lambda url: NO_RESULT_HTML, breaker)
+        self.assertFalse(breaker.open)
+        self.assertNotIn('熔断', out)
+
+    def test_threshold_zero_disables(self):
+        cands = [{'title': f'书{i}号'} for i in range(6)]
+        breaker = douban_list.Book15Breaker(0)
+        self._run(cands, self._down, breaker)
+        self.assertFalse(breaker.open)
+        self.assertEqual(len(self.book15_calls), 6 * douban_list.SEARCH_RETRY)
+
+    def test_no_breaker_keeps_summary_line_unchanged(self):
+        # book15_breaker=None（旧调用形态）：汇总行不出现熔断字样
+        _, out = self._run([{'title': '甲书'}], self._down, None)
+        self.assertNotIn('熔断', out)
+
+    def test_resolve_threshold_from_env(self):
+        env_name = douban_list.BOOK15_BREAKER_ENV
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(env_name, None)
+            self.assertEqual(douban_list.resolve_book15_breaker(None), 5)
+            self.assertEqual(douban_list.resolve_book15_breaker({env_name: '3'}), 3)
+            self.assertEqual(douban_list.resolve_book15_breaker({env_name: '0'}), 0)
+            self.assertEqual(douban_list.resolve_book15_breaker({env_name: 'abc'}), 5)
+            self.assertEqual(douban_list.resolve_book15_breaker({env_name: ' '}), 5)
+            os.environ[env_name] = '7'
+            self.assertEqual(douban_list.resolve_book15_breaker({}), 7)
+            self.assertEqual(douban_list.resolve_book15_breaker({env_name: '2'}), 2)
+
+
 # ---- N02：引擎兜底作者身份过滤（同名异作者正文不得绑定名单身份）----
 class TestNormAuthor(unittest.TestCase):
     """_norm_author：身份比对前的作者归一化。
