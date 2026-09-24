@@ -113,7 +113,11 @@ export interface SourceSimilarCandidate {
 /** 父子共享的预算状态（设计 §3.1 的 shared）：计数、按 host 分桶的 350ms 节流槽、全局上限、软预算起点。 */
 interface SharedSourceBudget {
   requests: number;
-  /** 节流槽按站分桶：键 = sourceThrottleKey(url)，值 = 该站下一次允许发射的时刻。 */
+  /**
+   * 节流槽按站分桶：键 = sourceThrottleKey(url)，值 = 该站下一次允许发射的时刻。
+   * 默认每个根 context（= 一次 HTTP 请求）新建一张表，只约束本请求的 context 树；
+   * 单源 probe 传入进程级共享表（probeThrottleSlots），同实例内的并发 probe 互相排队。
+   */
   nextRequestAt: Map<string, number>;
   totalLimit: number;
   startedAt: number;
@@ -130,6 +134,19 @@ export function sourceThrottleKey(url: string, env: SourceTuningEnv = process.en
   const hostname = hostnameOf(url);
   const alternate = alternateSourceHost(hostname);
   return alternate && alternate < hostname ? alternate : hostname;
+}
+
+// 41-fanfix N1：扇出时浏览器同时发 N 个独立的 probe 请求，每个请求各自一棵 context 树，
+// 请求级节流表互不相见 ⇒ 同站 probe 会并发打到源站。probe 改用这张模块级表：同一 Node 进程
+// （同一 serverless 实例）内的所有 probe 按站共用 350ms 槽。边界：Vercel 多实例之间不共享，
+// 跨实例的同站并发仍不在此防线内；阅读/换源等非 probe 路径仍用请求级表，不与 probe 互相排队。
+const PROBE_THROTTLE_SLOTS = new Map<string, number>();
+// 表里只留「还没到期」的槽才有意义；超过这个条目数时顺手清掉已过期的，防长驻实例无界增长。
+const THROTTLE_SLOTS_SWEEP_SIZE = 256;
+
+/** probe 的节流表：SOURCE_THROTTLE_PER_HOST=0 回滚时连同进程级共享一起退回请求级单槽（改动前语义）。 */
+function probeThrottleSlots(env: SourceTuningEnv = process.env): Map<string, number> | undefined {
+  return env.SOURCE_THROTTLE_PER_HOST === '0' ? undefined : PROBE_THROTTLE_SLOTS;
 }
 
 /**
@@ -151,6 +168,8 @@ interface SourceContextOptions {
   slide?: SourceSliceSlide;
   /** 进展逐级上报的上游 context（正文 context → 候选 context 共用一片滑动切片）。 */
   parent?: SourceRequestContext;
+  /** 根 context 的节流表；缺省新建请求级表。单源 probe 传进程级共享表（见 PROBE_THROTTLE_SLOTS）。 */
+  throttleSlots?: Map<string, number>;
 }
 
 export class SourceRequestContext {
@@ -171,7 +190,9 @@ export class SourceRequestContext {
     this.limit = limit;
     // 根 context 的全局上限初值 = 构造 limit：不经 openPool 的调用路径（单独用 context(n)）行为逐点不变。
     // openPool 的调用点：resolveSourceBook（池里含引擎源时）、surveySourceBooks 开头、switchSourceChapter 开头，都只增不减。
-    this.budget = options.budget ?? { requests: 0, nextRequestAt: new Map(), totalLimit: limit, startedAt: Date.now() };
+    this.budget = options.budget ?? {
+      requests: 0, nextRequestAt: options.throttleSlots ?? new Map(), totalLimit: limit, startedAt: Date.now(),
+    };
     this.parent = options.parent;
     const sliceController = options.sliceController;
     if (sliceController) {
@@ -269,10 +290,15 @@ export class SourceRequestContext {
             // 同步预占时间槽：同站并发调用各自拿到互不重叠的发射时刻，起始间隔恒为 SOURCE_DELAY_MS。
             // 若像以前那样在 await 之后才写回 nextRequestAt，多个并发 page() 会读到同一个旧值、
             // 一起免等、一起发射，节流对源站失效。槽位在父子 context 间共享、按站分桶（41-fanout P1-C）：
-            // 异站互不等待。进程内分桶只约束本实例，跨实例/跨用户的同站并发不在此防线内。
+            // 异站互不等待。作用范围是**这张节流表**：默认单个 HTTP 请求的 context 树；单源 probe 为
+            // 同一进程内所有 probe 共享（41-fanfix N1）。跨实例的同站并发不在此防线内。
             const now = Date.now();
-            const at = Math.max(now, this.budget.nextRequestAt.get(throttleKey) ?? 0);
-            this.budget.nextRequestAt.set(throttleKey, at + SOURCE_DELAY_MS);
+            const slots = this.budget.nextRequestAt;
+            const at = Math.max(now, slots.get(throttleKey) ?? 0);
+            slots.set(throttleKey, at + SOURCE_DELAY_MS);
+            if (slots.size > THROTTLE_SLOTS_SWEEP_SIZE) {
+              for (const [key, next] of slots) if (next <= now) slots.delete(key);
+            }
             if (at > now) await pause(at - now, signal);
           },
         });
@@ -472,6 +498,12 @@ export async function resolveSourceBook(
   options: {
     excludeBookUrl?: string; sources?: ReadingSource[]; preferAfterSourceUrl?: string; bookUrl?: string;
     /**
+     * 确认路径的源唯一标识（41-fanfix N10）：给定时按取书池条目的 url **精确**定位规则，不再按 bookUrl 的 host 反查
+     * （同站多源时 host 反查会拿到别的源的规则）。不在取书池里 ⇒ 404；bookUrl 不属于该源的站 ⇒ 404。
+     * 缺省保持 host 反查（既有模糊候选确认路径不带源标识）。只在带 bookUrl 时有意义。
+     */
+    sourceUrl?: string;
+    /**
      * 内部选项：章节级换源逐个候选调用时置真 —— 收尾的 source_not_found / search_no_candidates 不在这里发，
      * 由换源结尾那一条 source_failover 聚合事件替代（否则每个 miss 候选各发一次，成功换源路径上也误报）。
      */
@@ -492,13 +524,17 @@ export async function resolveSourceBook(
     if (url === options.excludeBookUrl) throw new SourceReaderError('该书源已失效，请重新搜索。', 'SOURCE_NOT_FOUND', 404);
     // 源归属按 host 反查（m2-scaleout §3.7 的铺路）：池内匹配 bookUrl 的 host，避免用
     // builtin 的 url 给引擎源的 bookUrl 算 sourceId/revision。匹配不到保持既有 sources[0]
-    // 回退（单源池下等价），M2 收紧为 404。
+    // 回退（单源池下等价），M2 收紧为 404。带 sourceUrl（扇出面板的确认）时改按源 url 精确定位，
+    // 且 bookUrl 必须属于该源的站；同站多源时 host 反查只会取到池里排在前面的那个源的规则。
     const targetHost = hostOf(url);
-    const source = sources.find((item) => {
+    const sameStation = (item: ReadingSource) => {
       const host = hostOf(item.url);
       // 同站备用 host（book15.net ↔ www.book15.net，fetch 层换 host 兜底）视为同一个源。
       return host === targetHost || (host.length > 0 && alternateSourceHost(targetHost) === host);
-    });
+    };
+    const source = options.sourceUrl !== undefined
+      ? sources.find((item) => item.url === options.sourceUrl && sameStation(item))
+      : sources.find(sameStation);
     // 匹配不到 → 404 让用户重新选择（设计 §3.7：不猜、不回退 sources[0]，避免源标识错配）。
     if (!source) throw new SourceReaderError('没有找到该候选对应的可用书源，请重新搜索。', 'SOURCE_NOT_FOUND', 404);
     if (!isBuiltinReadingSource(source)) {
@@ -1021,6 +1057,26 @@ export interface SourceProbeResult {
 }
 
 /**
+ * 路由对外的 probe 状态（41-fanfix N10）：在 SourceProbeStatus 之上多一个 unreadable ——
+ * 源在扇出候选里、搜到了书（ok 或 similar），但不在取书池（readable=false），确认/阅读路径打不开它。
+ * 选独立状态而不是「ok + readable:false」：面板若只按 status==='ok' 放出「切换」按钮而漏看 readable，
+ * 会给用户一个点了必 404 的入口；未知状态落进面板的默认（不可切换）分支，漏处理也是安全的一侧。
+ * found 记下 probe 原本的判定，book / candidates 原样保留供「仅展示」。
+ */
+export type SourceProbePanelStatus = SourceProbeStatus | 'unreadable';
+
+export interface SourceProbePanelResult extends Omit<SourceProbeResult, 'status'> {
+  status: SourceProbePanelStatus;
+  readable: boolean;
+  found?: 'ok' | 'similar';
+}
+
+export function probeResultForPanel(result: SourceProbeResult, readable: boolean): SourceProbePanelResult {
+  if (readable || (result.status !== 'ok' && result.status !== 'similar')) return { ...result, readable };
+  return { ...result, status: 'unreadable', found: result.status, readable };
+}
+
+/**
  * 引擎源能跑通「搜索 → 详情 → 目录」的最低字段组:与准入 compileAdmission 的 REQUIRED_FIELDS 同口径
  * (rule-engine/admission.ts),去掉引擎有默认值的 ruleToc.chapterUrl。ruleContent.content 保留:没有它源读不了正文。
  */
@@ -1048,7 +1104,7 @@ function probeCompileFailure(source: ReadingSource, title: string): Pick<SourceP
 /**
  * 通用单源 probe:给定一个源和一本书(书名 + 可空作者),在 budgetMs 内判定该源有没有这本书。
  * 只读:不写目录缓存、不改健康记忆以外的任何状态(健康记忆照常由 fetch 层记录)。请求数上限沿用单次阅读的
- * 默认 L2(MAX_SOURCE_REQUESTS),节流槽按 host 分桶(本 context 独占,跨请求/跨实例不共享)。
+ * 默认 L2(MAX_SOURCE_REQUESTS),节流槽按 host 分桶且同一进程内所有 probe 共享(41-fanfix N1;跨实例不共享)。
  * signal 是调用方的取消信号(客户端断开);到点与取消都返回 timeout,不抛。非预期异常才抛。
  */
 export async function probeSourceForBook(
@@ -1062,7 +1118,9 @@ export async function probeSourceForBook(
     options.budgetMs ?? SOURCE_PROBE_BUDGET_MS,
   );
   (timer as { unref?: () => void }).unref?.();
-  const context = new SourceRequestContext(AbortSignal.any([signal, budgetController.signal]));
+  const context = new SourceRequestContext(AbortSignal.any([signal, budgetController.signal]), MAX_SOURCE_REQUESTS, {
+    throttleSlots: probeThrottleSlots(),
+  });
   const base = { sourceUrl: source.url, sourceName: source.name };
   const finish = (result: Omit<SourceProbeResult, 'sourceUrl' | 'sourceName' | 'elapsedMs' | 'requests'>): SourceProbeResult => (
     { ...base, ...result, elapsedMs: Date.now() - startedAt, requests: context.requests }
