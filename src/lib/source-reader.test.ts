@@ -199,6 +199,7 @@ describe('online reader source resolution and budgets', () => {
     const part = await service.readSourceChapter(catalog.version, 0, context());
     expect(part.text).toBe('离线测试正文。');
     expect(part.servedFrom).toBe('刷新后的书源');
+    expect(part.servedFromUrl).toBe(source.url);
 
     // (b) 源整条被停用(池空):不再 409,而是找不到备用源 ⇒ 503 章节不可读。
     // 换一章读(上一章已进暖缓存,缓存语义与源状态无关,不参与本断言)。
@@ -911,10 +912,13 @@ describe('GET /api/read/source/[resource]', () => {
     pages.set(backupPage, { text: detail(777, '作者', ['第1章 风起与云涌', '第2章 落雨']) });
     pages.set(backupChapter(777, 1), { text: chapterHtml('备用正文') });
     const index = await (await request()).json();
+    expect(index.source).toMatchObject({ url: pageUrl(), sourceUrl: source.url });
     const partRes = await request('chapter', `session=${index.source.session}&version=${index.version}&chapter=0`);
     expect(partRes.status).toBe(200);
     const part = await partRes.json();
     expect(part.text).toBe('备用正文');
+    // 41-srcurl:章内换源的段带新源的源 url(与 servedFrom 成对)。
+    expect(part).toMatchObject({ servedFrom: backup.name, servedFromUrl: backup.url });
     // 换源响应必须附上新目录,且本章在新目录的序号为 0。
     expect(part.switchedChapters).toBeTruthy();
     expect(part.switchedChapterIndex).toBe(0);
@@ -923,6 +927,10 @@ describe('GET /api/read/source/[resource]', () => {
     // 重读同一章:服务端按新目录交付「第1章 风起与云涌」,前端持旧目录必须接受(不判 409)。
     const reread = await (await request('chapter', `session=${part.sourceSession}&version=${part.version}&chapter=0`)).json();
     expect(reread.title).toBe('第1章 风起与云涌');
+    expect(reread).toMatchObject({ servedFrom: backup.name, servedFromUrl: backup.url });
+    // 旧会话同一章走暖缓存:缓存里记的是换源后的供稿源,servedFromUrl 与 servedFrom 一起跟到备用源。
+    const cachedOld = await (await request('chapter', `session=${index.source.session}&version=${index.version}&chapter=0`)).json();
+    expect(cachedOld).toMatchObject({ text: '备用正文', servedFrom: backup.name, servedFromUrl: backup.url });
     const staleIndex = {
       ...index, version: part.version,
       source: { ...index.source, id: part.sourceId, session: part.sourceSession },
@@ -1374,7 +1382,8 @@ describe('M2-2 多源循环：跳源 / 软预算 / 去重 / bookUrl 反查', () 
       primeB();
       const res = await request('index', `title=测试书&author=作者&book_url=${encodeURIComponent(bDetail)}&source=${encodeURIComponent(sameHostB.url)}`);
       expect(res.status).toBe(200);
-      expect(await res.json()).toMatchObject({ title: 'B 的书', source: { name: '同站 B', url: bDetail } });
+      // 41-srcurl:source.url 仍是书详情页(既有语义),sourceUrl 是源 url —— 同站 A/B 靠它才分得开。
+      expect(await res.json()).toMatchObject({ title: 'B 的书', source: { name: '同站 B', url: bDetail, sourceUrl: sameHostB.url } });
       for (const query of [`title=测试书&source=${encodeURIComponent(sameHostB.url)}`, `title=测试书&book_url=${encodeURIComponent(bDetail)}&source=`]) {
         const rejected = await request('index', query);
         expect(rejected.status).toBe(400);
