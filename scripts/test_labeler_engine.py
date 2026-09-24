@@ -740,6 +740,23 @@ class TestSourceSwitch(unittest.TestCase):
         self.assertEqual(used['source'], 'www.bqquge.org')
         self.assertFalse(any('yingsx' in (c[1] or '') for c in cli.calls))
 
+    def test_enough_partial_text_does_not_count_as_giveup(self):
+        # 反例：两本都「抓够字数但后段失效」→ 都算成功，host 不记放弃、不被判失效
+        big = '正' * 4000
+
+        def handler(sub, url):
+            if sub == 'toc':
+                return _toc_on(labeler._url_host(url), 30)
+            return _content(big) if int(url.rsplit('c', 1)[1]) < 3 else _proc(1, '', POLICY_STDERR)
+
+        tracker = labeler.SourceGiveupTracker(2)
+        for n in (1, 2):
+            text, chars, used = labeler.fetch_engine_book_with_giveup(
+                FakeEngineCli(handler), _book(f'https://www.bqquge.org/b/{n}'), tracker, giveup_streak=5)
+            self.assertEqual(chars, 12000)
+        self.assertEqual(tracker.counts, {})
+        self.assertEqual(tracker.dead, set())
+
 
 class TestMainSwitchesSourceAndRecordsIt(unittest.TestCase):
     """主循环接线：主源失效换源后 labels.jsonl 记实际来源；无备选的书计「源失效放弃」、不写 rejected。"""

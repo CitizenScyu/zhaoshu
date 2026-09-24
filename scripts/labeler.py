@@ -995,9 +995,9 @@ def fetch_engine_book_with_giveup(engine_cli, book: dict, tracker: SourceGiveupT
             return text, chars, src
         except EngineSourceGaveUp as e:
             print(f'  放弃源: {e}（已抓 {e.chars} 字）')
-            tracker.record(host)
             if e.chars >= MIN_BOOK_CHARS:
-                return e.text, e.chars, src
+                return e.text, e.chars, src     # 已抓够：本书算成功，不给 host 记放弃（giveuprev41 非阻断 4）
+            tracker.record(host)
             last = e
         except Exception as e:
             if i == 0:
