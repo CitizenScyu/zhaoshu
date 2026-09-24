@@ -572,11 +572,11 @@ def search_engine(cli, title: str, author: str = '',
             continue
         got = _norm_author(c.get('author') or '')
         if not want:          # 名单无作者：行为同现状
-            return {'url': book_url, 'title': site_title,
-                    'source': c.get('source', '')}
+            return _with_alternates({'url': book_url, 'title': site_title,
+                                     'source': c.get('source', '')}, title, want, candidates)
         if got and got == want:
-            return {'url': book_url, 'title': site_title,
-                    'source': c.get('source', '')}
+            return _with_alternates({'url': book_url, 'title': site_title,
+                                     'source': c.get('source', '')}, title, want, candidates)
         if not got and fallback is None:
             fallback = {'url': book_url, 'title': site_title,
                         'source': c.get('source', '')}
@@ -584,7 +584,41 @@ def search_engine(cli, title: str, author: str = '',
             print(f'  作者不符跳过: {site_title}（名单 {author} vs 引擎 {c.get("author")}）')
     if fallback is not None and want:
         print(f'  作者未知命中（降级）: {fallback["title"]}（名单作者 {author}，引擎未给作者）')
+        return _with_alternates(fallback, title, want, candidates)
     return fallback
+
+
+# ---- 换源备选（giveup41）----
+# 主候选之外、过同一套判据（title 兼容 / 作者不错配 / 引擎可取的 HTTPS）的其他候选，已验证作者优先。
+# 打标阶段主源整站失效（连续多章确定性错误）时按序换用。静默：不打印、不计 stats——日志与计数
+# 仍只反映主候选的选择过程（与改前逐字一致）。只在有备选时才给 hit 加 alternates 键。
+ENGINE_MAX_ALTERNATES = 3
+
+
+def _engine_alternates(title: str, want: str, candidates: list, chosen_url: str) -> list[dict]:
+    verified, unknown, seen = [], [], {chosen_url}
+    for c in candidates:
+        if not isinstance(c, dict) or c.get('source') == 'book15.net':
+            continue
+        book_url = c.get('bookUrl') or ''
+        site_title = c.get('title') or ''
+        if (not book_url or book_url in seen or not title_compatible(title, site_title)
+                or not engine_url_supported(book_url)):
+            continue
+        got = _norm_author(c.get('author') or '')
+        if want and got and got != want:
+            continue
+        seen.add(book_url)
+        entry = {'url': book_url, 'title': site_title, 'source': c.get('source', '')}
+        (unknown if want and not got else verified).append(entry)
+    return (verified + unknown)[:ENGINE_MAX_ALTERNATES]
+
+
+def _with_alternates(hit: dict, title: str, want: str, candidates: list) -> dict:
+    alternates = _engine_alternates(title, want, candidates, hit['url'])
+    if alternates:
+        hit['alternates'] = alternates
+    return hit
 
 
 def validate_engine(cli) -> None:
@@ -676,13 +710,17 @@ def _resolve_candidates(candidates: list[dict], http_get, origin: str = '',
                       file=sys.stderr)
                 engine_disabled = True
         if engine_hit:
-            queue.append({'url': engine_hit['url'], 'title': engine_hit['title'],
-                          'author': b.get('author', ''),
-                          'category': origin or b.get('origin', ''),
-                          'status': '',
-                          'douban_url': b.get('douban_url', ''),
-                          'engine': True,
-                          'source_host': engine_hit['source']})
+            entry = {'url': engine_hit['url'], 'title': engine_hit['title'],
+                     'author': b.get('author', ''),
+                     'category': origin or b.get('origin', ''),
+                     'status': '',
+                     'douban_url': b.get('douban_url', ''),
+                     'engine': True,
+                     'source_host': engine_hit['source']}
+            if engine_hit.get('alternates'):
+                # giveup41：主源整站失效时打标阶段按序换用（labeler.fetch_engine_book_with_giveup）
+                entry['engine_alternates'] = engine_hit['alternates']
+            queue.append(entry)
             engine_hits += 1
         else:
             miss.append(b['title'])
