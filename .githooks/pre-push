@@ -24,6 +24,10 @@
 # 测试那道门的 --no-file-parallelism 写在 package.json 的 test script 里（本机多 worker 会 OOM）。
 #   钩子委托给 `npm run check`，不在这里另起一条 vitest 命令，避免与 CI 跑出两套参数。
 #
+# scripts 的 node:test 用例(41-MJSGATE):scripts/*.test.mjs(4 个文件、197 例,node:test API)
+#   走 package.json 的 test:scripts(scripts/run-mjs-tests.mjs),同样经 `npm run check` 跑,
+#   与 ci.yml 的 test:scripts 步骤同款。runner 内部对文件数做下限断言,避免文件被删后静默变空。
+#
 # 第五道（本地独有，2026-09-22 加）：NF_PGLITE_OPTIONAL 拒绝门。
 #   NF_PGLITE_OPTIONAL 是仓库里唯一允许跳过真库用例的开关，CI 里用
 #   `test -z "${NF_PGLITE_OPTIONAL:-}"` 硬断言不许设（ci.yml:64-65）。本地原本没有这一道，
@@ -82,7 +86,7 @@ if [ -n "${NF_PGLITE_OPTIONAL:-}" ]; then
   exit 1
 fi
 
-echo "▶ pre-push：跑四道门（typecheck / lint / test / build），与 CI 同款"
+echo "▶ pre-push：跑四道门（typecheck / lint / test:scripts / test / build），与 CI 同款"
 echo "  （紧急情况可用 git push --no-verify 跳过，跳过了请自己说明原因。）"
 
 if ! npm run check; then

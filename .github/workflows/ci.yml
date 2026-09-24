@@ -61,6 +61,13 @@ jobs:
       - name: check:deploy
         run: npm run check:deploy
 
+      # scripts 下的 node:test 用例(.test.mjs,41-MJSGATE):vitest 的 include 只收 .test.ts,
+      #   这 4 个文件(197 例)此前不在任何门禁里;它们用 node:test API,不并入 vitest,单列这一步跑。
+      #   runner scripts/run-mjs-tests.mjs 内部对文件数做下限断言(fail-closed)。本工作流不走
+      #   `npm run check`,所以必须单列一步;本地 pre-push 经 `npm run check` 同样会跑。
+      - name: test:scripts(node:test)
+        run: npm run test:scripts
+
       # 门 3：测试。见下方断言步骤，真库用例被静默跳过就判红。
       # 显式断言 @electric-sql/pglite 可解析：它是 devDependency，只有 npm ci 带上 devDeps 才有。
       # 若这里失败，说明依赖安装方式变了，真库用例会因此消失——必须先修依赖，不能让测试悄悄少跑。
