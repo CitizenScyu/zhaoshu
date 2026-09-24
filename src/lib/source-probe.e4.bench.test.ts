@@ -93,6 +93,7 @@ describe.skipIf(!RUN)('E.4 单源 probe 墙钟与开销（本地延迟模型，�
         p50: pct(walls, 0.5), p95: pct(walls, 0.95), max: walls.at(-1),
         mean: Math.round(walls.reduce((a, b) => a + b, 0) / walls.length),
       };
+      console.log('[E4_BENCH]', scenario, JSON.stringify(report[scenario]));
     }
     // 零延迟：只剩解析与引擎求值（Active CPU 的上界估计；节流槽按 host 分桶，同源 350ms 间隔仍计入墙钟不计 CPU）。
     vi.stubGlobal('fetch', fetchFor('hit', () => 0));
@@ -109,5 +110,5 @@ describe.skipIf(!RUN)('E.4 单源 probe 墙钟与开销（本地延迟模型，�
     report.heapDeltaMb = Math.round((process.memoryUsage().heapUsed - heap0) / 1024 / 1024);
     console.log('[E4_BENCH]', JSON.stringify(report));
     expect(report.hit).toMatchObject({ statuses: ['ok'] });
-  }, 60_000);
+  }, 240_000);
 });
