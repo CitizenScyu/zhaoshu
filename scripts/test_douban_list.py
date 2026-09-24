@@ -1849,6 +1849,11 @@ class TestAuthorMatchesRevision(unittest.TestCase):
         self.assertFalse(douban_list.author_matches('马丁', '乔治·马丁著 某某编绘'))
         self.assertTrue(douban_list.author_matches('某某', '乔治·马丁著 某某编绘'))
         self.assertTrue(douban_list.author_matches('马丁', '乔治·马丁著'))   # 单人署名照旧
+        # 外文名在多署名串末尾时，按「·」切出的末节也是「马丁」——须靠单人署名护栏拦下
+        for engine in ('某某、乔治·马丁', '某某编绘 乔治·马丁', '某某；（美）乔治·马丁'):
+            with self.subTest(engine=engine):
+                self.assertFalse(douban_list.author_matches('马丁', engine))
+                self.assertFalse(douban_list.author_matches(engine, '马丁'))
 
     def test_nbsp_is_a_signature_separator(self):
         # 非阻断 2：&nbsp; 换空白参与切分，两位作者都能对上（改前马伯庸对不上）
