@@ -169,10 +169,18 @@ def _norm_author(s: str) -> str:
 # 三条规则的判据仍是**整段严格相等**，不做子串包含（「金庸」≠「金庸新」、
 # 「唐家三少」≠「唐家三少之子」照旧拒）。中外文异体（「J.R.R.托尔金」vs
 # 「J.R.R.Tolkien」）需音译表，自动推导必误配，不做。
-# 多署名分隔：分号/顿号/逗号/斜杠，以及空白（HTML 实体须先替换，否则 &middot; 的分号会被切开）。
-# 两侧都是拉丁字母/点的空白不切：「Stephen King」「J.R.R. Tolkien」是一个人，切开后
-# 「Stephen King」与「Stephen Fry」会因共有「stephen」段被判同一人（authfix41 整改实测）。
-_AUTHOR_SPLIT_RE = re.compile(r'\s*[;；、，,/][\s;；、，,/]*|(?<![A-Za-z.])[\s　]+|[\s　]+(?![A-Za-z])')
+# 多署名分隔（见 _split_signatures）：分号/顿号/逗号/斜杠恒切（HTML 实体须先替换，否则 &middot;
+# 的分号会被切开；&nbsp; 在 _author_text 里换成斜杠，恒切）。空白**默认不切**——名内空格
+# 很常见：「Stephen King」「J.R.R. 托尔金」「上條 一輝」「司马 迁」都是一个人，切开后
+# 「上條 一輝」与「上條 二輝」会因共有姓氏段被判同一人（authrev41 增量）。空白只在有明确
+# 多署名证据时切：左边以署名角色结尾（「马伯庸著 刘巴布编绘」）、右边以「执笔：」类角色
+# 标签开头，或两边都是带「·」的外文全名（「阿卡迪·斯特鲁伽茨基 鲍里斯·斯特鲁伽茨基」）。
+_AUTHOR_SEP_RE = re.compile(r'[;；、，,/]+')
+_AUTHOR_SPACE_RE = re.compile(r'[\s　]+')
+# 空白左侧 token 以署名角色结尾 ⇒ 该空白是多署名分隔
+_AUTHOR_ROLE_END_RE = re.compile(r'(?:著|译|绘|编|校|注|执笔|口述|整理)$')
+# 单人署名判定前剥掉的尾部角色（「杰西卡·汤森 著」「汤森 著」）
+_AUTHOR_TRAILING_ROLE_RE = re.compile(r'[\s　]*(?:原著|执笔|编绘|口述|整理|编著|主编|著|译|绘|编|校|注)$')
 # 任意位置的括号段：全/半角圆括号、方括号、【】（书名号不算）；内层不含括号
 _AUTHOR_BRACKET_RE = re.compile(r'[（(【\[][^（()）【】\[\]]*[）)】\]]')
 # 署名角色：前导须带冒号（「执笔：苏末那」）；尾部只认多字角色（「软星科技原著」）。
@@ -194,25 +202,54 @@ def _strip_author_brackets(s: str) -> str:
 
 
 def _author_text(s: str) -> str:
-    """比对前的实体还原：&nbsp; 是空白（参与多署名切分——「马伯庸&nbsp;刘巴布」是两人）；
+    """比对前的实体还原：&nbsp; 视为多署名分隔（换成「/」恒切——「马伯庸&nbsp;刘巴布」是两人）；
     其余实体（&middot; 等）按名内分隔符 · 处理，与 _norm_author 口径一致。"""
-    text = re.sub(r'&(?:nbsp|#160|#xa0);', ' ', s or '', flags=re.IGNORECASE)
+    text = re.sub(r'&(?:nbsp|#160|#xa0);', '/', s or '', flags=re.IGNORECASE)
     return re.sub(r'&[a-zA-Z]+;', '·', text)
 
 
+def _space_separates(left: str, right: str) -> bool:
+    """两个空白分隔的 token 之间是否是多署名分隔（规则见 _AUTHOR_SEP_RE 上方注释）。"""
+    return bool(_AUTHOR_ROLE_END_RE.search(left) or _AUTHOR_ROLE_LABEL_RE.match(right)
+                or (_AUTHOR_FOREIGN_MARK_RE.search(left) and _AUTHOR_FOREIGN_MARK_RE.search(right)))
+
+
+def _split_signatures(text: str) -> list[str]:
+    """多署名串 → 各署名段（剥括号后为空的国籍段不算一段）。"""
+    parts: list[str] = []
+    for piece in _AUTHOR_SEP_RE.split(text.strip()):
+        tokens = [t for t in _AUTHOR_SPACE_RE.split(piece.strip()) if t]
+        if not tokens:
+            continue
+        cur = tokens[0]
+        for left, right in zip(tokens, tokens[1:]):
+            if _space_separates(left, right):
+                parts.append(cur)
+                cur = right
+            else:
+                cur += ' ' + right
+        parts.append(cur)
+    return [p for p in parts if _strip_author_brackets(p).strip()]
+
+
 def _author_segments(s: str) -> list[str]:
-    """整串 + 按多署名分隔切出的各段（整串在前；只有一段时不重复）。
-    切出来的段剥括号后为空（「[美]」「（英）」这类国籍段）不算一段。"""
+    """整串 + 按多署名分隔切出的各段（整串在前；只有一段时不重复）。"""
     text = _author_text(s)
-    parts = [p for p in _AUTHOR_SPLIT_RE.split(text.strip())
-             if p and _strip_author_brackets(p).strip()]
+    parts = _split_signatures(text)
     return [text] + (parts if len(parts) > 1 else [])
 
 
 def _is_single_author(s: str) -> bool:
-    """剥括号/前导「作者：」后不含多署名分隔符（「[英] 詹姆斯·马修·巴利」的空格在国籍段后，算单人）。"""
+    """剥括号/前导「作者：」/尾部署名角色后只剩一段署名。尾部角色先剥：「[澳]杰西卡·汤森 著」
+    是单人（否则「著」前的空白按角色规则算分隔，R4 被关掉，authrev41 增量）；多署名串剥掉
+    末尾角色后仍有分隔（「乔治·马丁著 某某编绘」→「乔治·马丁著 某某」），不会被误放行。"""
     core = _strip_author_brackets(_strip_author_label(_author_text(s).strip())).strip()
-    return not _AUTHOR_SPLIT_RE.search(core)
+    while True:
+        stripped = _AUTHOR_TRAILING_ROLE_RE.sub('', core).strip()
+        if stripped == core or not stripped:
+            break
+        core = stripped
+    return len(_split_signatures(core)) <= 1
 
 
 def _author_forms(seg: str) -> set[str]:
