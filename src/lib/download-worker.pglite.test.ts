@@ -291,6 +291,98 @@ maybe('T3 worker 任务层：租约、单写者、五阶段对账（PGlite + moc
     expect((await taskState(retryId)).status).toBe('done');
   });
 
+  // B2-03：GitHub 写入失败（含规范阶段中途失败）放回 pending 退避，到期由 claim 重领、重跑后自愈。
+  const retryState = async (id: number) => (await pg.query(
+    `SELECT status, error, attempt_count, lease_owner,
+            round(extract(epoch FROM (next_attempt_at - now())) / 60)::int AS delay_min
+     FROM download_tasks WHERE id = $1`, [id],
+  )).rows[0] as { status: string; error: string; attempt_count: number; lease_owner: string; delay_min: number | null };
+  const badGateway = () => Object.assign(new Error('bad gateway'), { code: 'http_502' });
+
+  it('B2-03 规范阶段中途失败（卷已换新、index.json 未写）→ pending + 15m 退避；到期重领重跑 → done 且规范收敛到新版', async () => {
+    const oldTxt = completeText('测试书', 3);
+    const firstId = await insertTask();
+    await runDownloadTask(options([scriptAdapter({ kind: 'complete', txt: oldTxt, chaptersTotal: 3, chaptersDone: 3, charsTotal: 3 * 810 })]), (await claimDownloadTask(sql as never, 'worker-a'))!);
+    expect((await taskState(firstId)).status).toBe('done');
+
+    const newTxt = completeText('测试书', 4);
+    const newAdapter = scriptAdapter({ kind: 'complete', txt: newTxt, chaptersTotal: 4, chaptersDone: 4, charsTotal: 4 * 810 });
+    const id = await insertTask();
+    github.failAt = { pathPattern: /\/index\.json$/, op: 'put', error: badGateway() };
+    const result = await runDownloadTask(options([newAdapter]), (await claimDownloadTask(sql as never, 'worker-b'))!);
+    expect(result).toMatchObject({ processed: true, reason: 'publication_retry' });
+    expect(result.terminal).toBeUndefined();
+    expect(typeof result.retryAt).toBe('string');
+    const deferred = await retryState(id);
+    expect(deferred).toMatchObject({ status: 'pending', attempt_count: 2, lease_owner: '', delay_min: 15 });
+    expect(deferred.error).toContain('canonical:http_502');
+    // 半新半旧：规范卷已是新字节，index.json 仍钉旧版（recheck-41 情形 B 的现场）。
+    const { canonicalPath, dir } = snapshotPaths('测试书', '佚名');
+    expect(JSON.parse(github.files.get(canonicalPath)!).blob_sha).toBe(gitBlobSha(oldTxt));
+    expect(github.files.get(canonicalPath.replace(/index\.json$/, 'vol-001.txt'))).toBe(newTxt);
+
+    // 退避未到期不可领；到期后同一行被 claim 重领（不新建行），重跑自愈。
+    github.failAt = undefined;
+    expect(await claimDownloadTask(sql as never, 'worker-c')).toBeNull();
+    await pg.query("UPDATE download_tasks SET next_attempt_at = now() - interval '1 second' WHERE id = $1", [id]);
+    const rerun = await runWorkerOnce(options([newAdapter]), 'worker-c');
+    expect(rerun.terminal).toBe('done');
+    expect((await taskState(id)).status).toBe('done');
+    expect(JSON.parse(github.files.get(canonicalPath)!).blob_sha).toBe(gitBlobSha(newTxt));
+    expect(JSON.parse(github.files.get(`${dir}/current.json`)!).current).toBe(gitBlobSha(newTxt).slice(0, 8));
+    expect((await pg.query('SELECT count(*)::int AS n FROM download_tasks')).rows[0].n).toBe(2);
+  });
+
+  it('B2-03 快照阶段传输失败同样退避；第 3 次失败 ⇒ 1h（与书源不可达同阶梯）', async () => {
+    const id = await insertTask('pending', { attempt_count: 3 });
+    github.failAt = { pathPattern: /\/v-[a-f0-9]{8}\.txt$/, op: 'put', error: badGateway() };
+    const txt = completeText('测试书', 3);
+    const result = await runDownloadTask(options([scriptAdapter({ kind: 'complete', txt, chaptersTotal: 3, chaptersDone: 3, charsTotal: 3 * 810 })]), (await claimDownloadTask(sql as never, 'worker-a'))!);
+    expect(result.reason).toBe('publication_retry');
+    const state = await retryState(id);
+    expect(state).toMatchObject({ status: 'pending', attempt_count: 4, delay_min: 60 });
+    expect(state.error).toContain('snapshot:http_502');
+  });
+
+  it('B2-03 有界：attempt_count 已到上限（16）⇒ failed 终态，不再入队', async () => {
+    const id = await insertTask('pending', { attempt_count: 16 });
+    github.failAt = { pathPattern: /\/index\.json$/, op: 'put', error: badGateway() };
+    const txt = completeText('测试书', 3);
+    const result = await runDownloadTask(options([scriptAdapter({ kind: 'complete', txt, chaptersTotal: 3, chaptersDone: 3, charsTotal: 3 * 810 })]), (await claimDownloadTask(sql as never, 'worker-a'))!);
+    expect(result).toMatchObject({ processed: true, terminal: 'failed', retryAt: null });
+    const state = await retryState(id);
+    expect(state).toMatchObject({ status: 'failed', attempt_count: 16, delay_min: null });
+    expect(state.error).toContain('停止自动重试');
+  });
+
+  it('B2-03 确定性失败（指针文件损坏 current_json_unreadable）不重试：直接 failed', async () => {
+    const id = await insertTask();
+    const { dir } = snapshotPaths('测试书', '佚名');
+    github.files.set(`${dir}/current.json`, '{not json');
+    const txt = completeText('测试书', 3);
+    const result = await runDownloadTask(options([scriptAdapter({ kind: 'complete', txt, chaptersTotal: 3, chaptersDone: 3, charsTotal: 3 * 810 })]), (await claimDownloadTask(sql as never, 'worker-a'))!);
+    expect(result.terminal).toBe('failed');
+    const state = await retryState(id);
+    expect(state).toMatchObject({ status: 'failed', attempt_count: 1, delay_min: null });
+    expect(state.error).toContain('current_json_unreadable');
+  });
+
+  it('B2-03 退避写入时租约已失 ⇒ lease_lost，不写任何状态（不与接管者并发）', async () => {
+    const id = await insertTask();
+    github.failAt = { pathPattern: /\/index\.json$/, op: 'put', error: badGateway() };
+    const lease = await claimDownloadTask(sql as never, 'worker-a');
+    const storageOver = storage({
+      defer: async (held, input) => {
+        await pg.query(`UPDATE download_tasks SET status = 'failed', lease_generation = lease_generation + 1, lease_owner = '' WHERE id = $1`, [id]);
+        return deferDownloadTask(sql as never, held, input);
+      },
+    });
+    const txt = completeText('测试书', 3);
+    const result = await runDownloadTask({ storage: storageOver, github, adapters: [scriptAdapter({ kind: 'complete', txt, chaptersTotal: 3, chaptersDone: 3, charsTotal: 3 * 810 })], repositoryId: 1, branch: 'main' }, lease!);
+    expect(result).toMatchObject({ processed: false, reason: 'lease_lost' });
+    expect(await retryState(id)).toMatchObject({ status: 'failed', attempt_count: 1 });
+  });
+
   it('同内容重试不破坏 manifest：第二次发布保留首次 task_id/generated_at，规范幂等', async () => {
     const id = await insertTask();
     const txt = completeText('测试书', 3);
