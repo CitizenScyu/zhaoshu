@@ -31,6 +31,35 @@ v5 及以前的语句一字未动，重复执行是幂等的（`IF NOT EXISTS (S
 不再把「库新代码旧」判成 503。库版本高于代码支持上限（`auth_schema_migrations` 里出现比当前代码
 支持的更高的版本）仍由迁移块主动 `RAISE EXCEPTION`（`newer than supported version 7`）。
 
+## 生产库迁移入口（`migrate:auth:prod`）
+
+`migrate:auth` 只接受 `TEST_DATABASE_URL`，是隔离库演练工具；生产库（以及灾备冷建库）用
+`scripts/migrate-auth-prod.mjs`。迁移本体与 `migrate:auth` 是同一个 `initializeAuthSchema`（不另写 DDL），
+逐版本按 `auth_schema_migrations` 是否已有该版本行决定执行或跳过，因此幂等、可重复执行。
+
+目标必须显式给出，没有默认值：`--database-url-env=<变量名>` 指定从哪个环境变量读连接串（脚本不读
+`.env*`、不回退 `DATABASE_URL`），再从 `--dry-run`（只读）与 `--yes-i-mean-production`（真执行）里
+**必须且只能**选一个。输出只含目标 host、记账版本与步骤说明，不含连接串或凭据。
+
+```powershell
+# 连接串只在当前 shell 临时读入，不写进文件或日志；变量名自定，这里用 PROD_DATABASE_URL 举例
+$env:PROD_DATABASE_URL = '<目标库连接串>'
+# 1) 只读预检：核对输出里的 host 是否为目标库，看 before.versions 与 plan.pending（将补哪些版本）
+npm run migrate:auth:prod -- --database-url-env=PROD_DATABASE_URL --dry-run
+# 2) 按「生产收口的前置条件与顺序」做完备份后真执行；status=applied（或 unchanged）且 after.max=7
+npm run migrate:auth:prod -- --database-url-env=PROD_DATABASE_URL --yes-i-mean-production
+Remove-Item Env:PROD_DATABASE_URL
+```
+
+- **灾备冷建库**的完整顺序：`db:migrate`（业务 schema，`0001` 只把 auth 记账到 4）→ 本命令补 auth 的
+  5/6/7 三步（下载归属、邀请码表、系统任务队列）→ `db:check`（auth 记账不足 7 时退出码 2）→ 部署应用。
+  跳过本命令时应用的 `assertAuthSchema` 会全站 503，`db:check` 也会报 `authVersionOk: false`。
+- dry-run 报 `newer-than-code`（库里记账版本高于代码支持的上限）时，真执行会被拒绝；先核对是否连错库或代码版本过旧。
+- **回滚**：auth 迁移只进不退，没有 down 脚本；真执行失败时整批在同一事务里回滚，不留半成品，修正原因后重跑即可。
+  已成功执行后要撤回，只能按「生产收口的前置条件与顺序」第 2 步事先做好的完整备份整库恢复（Neon 上即执行前建的
+  分支 / 时间点恢复），不要手工删表或删 `auth_schema_migrations` 记账行——旧版本应用在库新代码旧时仍能服务（闸门单向），
+  通常向前修复比恢复更安全。
+
 ## 当前行为与开关
 
 A04 迁移画像、找书、反馈、推荐、书架、统计与导出的全部 HTTP 方法到 `requirePermission(req, 'find')`。归属只使用服务端 principal.userId；owner 也只访问 userId=1 的个人记录。账号模式关闭时，旧 owner 头认证仍兼容，`/api/owner` 保持零数据库验证，业务查询仍按 userId=1 过滤。
@@ -74,7 +103,7 @@ stats 返回 subject.userId、allowedSections、sectionStates 和 sectionScopes�
 
 ## 生产收口的前置条件与顺序
 
-本批只执行隔离库演练，不执行生产迁移。生产操作须由主会话另行安排受控连接和维护窗口，不能把生产连接冒充 TEST_DATABASE_URL。
+本批只执行隔离库演练，不执行生产迁移。生产操作须由主会话另行安排受控连接和维护窗口，不能把生产连接冒充 TEST_DATABASE_URL；生产迁移用上文的 `migrate:auth:prod`。
 
 1. 停止旧写入口、离线旧脚本与旧部署实例，排空在途事务。仅关闭账号开关不够：旧 owner 写入口和旧冷启动 DDL 也必须停用。
 2. 对生产数据库制作包含全部 schema、表、序列、约束和认证设置的完整一致备份；记录恢复时间点。在另一隔离恢复库执行完整恢复并核对 ID、行数、微秒版本及外键。只备份几张个人表或只导出 JSON 不能替代完整备份。

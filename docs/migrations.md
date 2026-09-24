@@ -6,8 +6,11 @@
 | --- | --- | --- |
 | `0001_baseline.sql` | 1 | 冻结应用提交 `f48299b` 的现有结构；记录**已有**表、列、约束与索引，不引入后续功能字段 |
 | `0002_identity_key.sql` | 2 | 身份键从表达式索引升级为「生成列 + 唯一索引」（task-53 Phase 2） |
+| `0003_runtime_tables.sql` | 3 | 把此前只有运行时 DDL 的 `app_settings` / `source_admission` / `profile_feedback_queue` / `cron_health` 纳入契约（MS-25）；语句逐字取自 `business-schema.ts`，`runtime-tables-migration.pglite.test.ts` 逐列比对两条路径 |
 
-版本号取自文件名数字前缀，`SCHEMA_VERSION` 必须等于列表里的最大版本，否则 `loadMigrations()` 直接报错——常量与文件脱节不会被静默放过。**已发布的文件内容即其摘要**：`0001` 的 sha256 已记入生产 `schema_migrations`，改一个字节会让 `db:check` / `db:migrate` 在已有库上拒绝继续。`0002` 已由生产按同一文件手工执行过 DDL，同样不得再改。
+版本号取自文件名数字前缀，`SCHEMA_VERSION` 必须等于列表里的最大版本，否则 `loadMigrations()` 直接报错——常量与文件脱节不会被静默放过。**已发布的文件内容即其摘要**：`0001` 的 sha256 已记入生产 `schema_migrations`，改一个字节会让 `db:check` / `db:migrate` 在已有库上拒绝继续。`0002` 已由生产按同一文件手工执行过 DDL，同样不得再改。已发布摘要冻结在 `db-migration-lib.mjs` 的 `PUBLISHED_CHECKSUMS`，由 `cold-schema-rebuild.pglite.test.ts` 钉住（3c7a20f 曾改 `0001` 的一行记账，dr41 已恢复原字节）。
+
+`0001` 只把 auth 记账到 4：auth 的 5/6/7 由 `initializeAuthSchema` 执行，冷建库须在 `db:migrate` 之后跑 `migrate:auth:prod`（见 `docs/auth-deployment.md`）。`db:check` 同时判 auth 记账版本，不足 `AUTH_SCHEMA_VERSION` 时退出码 2。
 
 ## 安全边界
 

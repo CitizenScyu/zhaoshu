@@ -4,3 +4,8 @@
 # `#!/bin/sh\r` —— Git Bash 会直接报 `command not found` / `\r: not found`，
 # 钩子静默不生效。这类「钩子以为装好了其实从没跑过」正是本项目最忌讳的护栏消失模式。
 /.githooks/** text eol=lf
+
+# 迁移 SQL 必须是 LF。已发布迁移的 sha256 登记在库的 schema_migrations 里，摘要以 LF 文本为准
+# （生产 v1 = 1b47f1ca…）。db-migration-lib.mjs 的 normalizeSqlText 读时也会把 CRLF 归一，这里让
+# 盘上字节本身就是 LF，用 psql -f 或其它工具直接读文件时也不会得到另一份字节。
+/migrations/*.sql text eol=lf

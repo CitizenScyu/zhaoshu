@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { createClient, EXPECTED_TABLES, inspectSchema, isPooledEndpoint, loadMigrations, parseTarget, requireTestDatabaseUrl, safeError, SCHEMA_VERSION, TARGET_SCHEMA } from './db-migration-lib.mjs';
+import { createClient, evaluateSchema, inspectSchema, isPooledEndpoint, loadMigrations, parseTarget, requireTestDatabaseUrl, safeError, SCHEMA_VERSION, TARGET_SCHEMA } from './db-migration-lib.mjs';
 
 let client;
 try {
@@ -16,24 +16,16 @@ try {
   } finally {
     await client.query('ROLLBACK').catch(() => {});
   }
-  const present = new Set(report.columns.map((item) => item.table_name));
-  const missingTables = EXPECTED_TABLES.filter((table) => !present.has(table));
-  // 对列表里每个版本逐条核对：缺任一版本的行（或摘要不符）都算不通过。
-  const recorded = new Map(report.versions.map((row) => [row.version, row]));
-  const expectedMigrations = migrations.map((migration) => {
-    const row = recorded.get(migration.version);
-    return { version: migration.version, name: migration.name, checksum: migration.checksum,
-      recordedName: row?.name ?? null, recordedChecksum: row?.checksum?.trim() ?? null,
-      checksumOk: Boolean(row) && row.name === migration.name && row.checksum.trim() === migration.checksum };
-  });
+  // 逐版本核对摘要、缺表、auth 记账版本，判定集中在 evaluateSchema（有真库测试钉住）。
+  const verdict = evaluateSchema(report, migrations);
   const head = migrations[migrations.length - 1];
-  const checksumOk = expectedMigrations.every((item) => item.checksumOk);
   console.log(JSON.stringify({ target: 'test', schema: TARGET_SCHEMA, pooledEndpoint: isPooledEndpoint(connectionString),
     expectedVersion: SCHEMA_VERSION, expectedChecksum: head?.checksum ?? null,
-    expectedMigrations, checksumOk,
-    missingTables, dangerous: report.dangerous, versions: report.versions,
+    expectedMigrations: verdict.expectedMigrations, checksumOk: verdict.checksumOk,
+    authVersion: verdict.authVersion, expectedAuthVersion: verdict.expectedAuthVersion, authVersionOk: verdict.authVersionOk,
+    missingTables: verdict.missingTables, dangerous: report.dangerous, versions: report.versions,
     columns: report.columns, indexes: report.indexes, constraints: report.constraints }, null, 2));
-  if (!checksumOk || missingTables.length || report.dangerous.length) process.exitCode = 2;
+  if (!verdict.ok) process.exitCode = 2;
 } catch (error) {
   console.error(JSON.stringify({ status: 'failed', error: safeError(error) }));
   process.exitCode = 1;

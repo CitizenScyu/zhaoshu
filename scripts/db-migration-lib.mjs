@@ -4,6 +4,7 @@ import { basename, dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Client } from '@neondatabase/serverless';
 import { SCHEMA_MIGRATION_LOCK_ID, SCHEMA_VERSION } from '../src/lib/schema-version.ts';
+import { AUTH_SCHEMA_VERSION } from '../src/lib/auth-store.ts';
 
 export { SCHEMA_VERSION };
 export const MIGRATION_LOCK_ID = SCHEMA_MIGRATION_LOCK_ID;
@@ -11,16 +12,18 @@ export const TARGET_SCHEMA = 'public';
 // 冷建库盘点清单（check-schema 只读比对）。必须覆盖运行时用到的全部业务表，
 // 否则冷库重建后会带着「能跑过 db:check 却缺表」的隐性残缺。
 // 顺序无关，按表名字母序。
-// 注意几个**有意排除**的表（不是遗漏，改这里前先读 business-schema.ts:253 附近）：
-//   - registration_invites / 任何 auth-schema 侧的表：auth schema 的表由
-//     initializeAuthSchema（src/lib/auth-store.ts）单独建，版本记在
-//     auth_schema_migrations 里，不进本（业务 schema）的 EXPECTED_TABLES。
-//     business-schema.ts:253 已就同样的排除留了注释，两处保持一致。
+// 注意**有意排除**的表（不是遗漏）：
+//   - registration_invites / 任何 auth-schema 侧 v5 之后的表：由 initializeAuthSchema
+//     （src/lib/auth-store.ts）单独建，版本记在 auth_schema_migrations 里，不进本（业务 schema）
+//     的 EXPECTED_TABLES。0001 只把 auth 记账到 v4，冷建库须再跑 migrate:auth:prod 补 v5-v7；
+//     auth 侧是否到位由 evaluateSchema 的 authVersionOk 判（库版本 ≥ AUTH_SCHEMA_VERSION）。
+// app_settings / cron_health / profile_feedback_queue / source_admission 由 0003 建（MS-25）；
+// 此前它们只有运行时 DDL、不在本清单里，冷建库缺这四张表 db:check 也照样通过。
 export const EXPECTED_TABLES = [
-  'auth_rate_limits', 'auth_schema_migrations', 'auth_settings', 'books',
-  'download_tasks', 'feedback', 'labeled_books', 'llm_usage', 'profile',
-  'profile_seed_audit', 'recommendations', 'schema_migrations', 'sessions',
-  'shuyuan_meta', 'shuyuan_sources', 'source_read_catalogs', 'users',
+  'app_settings', 'auth_rate_limits', 'auth_schema_migrations', 'auth_settings', 'books',
+  'cron_health', 'download_tasks', 'feedback', 'labeled_books', 'llm_usage', 'profile',
+  'profile_feedback_queue', 'profile_seed_audit', 'recommendations', 'schema_migrations', 'sessions',
+  'shuyuan_meta', 'shuyuan_sources', 'source_admission', 'source_read_catalogs', 'users',
 ];
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -28,7 +31,16 @@ const migrationsDir = resolve(here, '..', 'migrations');
 
 // 迁移文件是显式有序列表，不扫目录：目录里多一个 .sql 不该在无人察觉时被执行。
 // version 由文件名前缀解析，SCHEMA_VERSION 必须等于列表里的最大版本（见 loadMigrations）。
-export const MIGRATION_FILES = ['0001_baseline.sql', '0002_identity_key.sql'];
+export const MIGRATION_FILES = ['0001_baseline.sql', '0002_identity_key.sql', '0003_runtime_tables.sql'];
+
+// 已发布（已登记进某个库的 schema_migrations）的迁移摘要，冻结在这里由测试钉住。
+// v1 = 生产首次 db:migrate 登记的值（见下方 normalizeSqlText 注释）；3c7a20f 曾改了 0001 的一行
+// 记账，摘要随之变成另一枚，生产再跑 db:check / db:migrate 就会被「摘要不匹配」拒绝——
+// 改已发布文件只能新增版本，不能回头改字节。新增迁移发布后把它的摘要追加进来。
+export const PUBLISHED_CHECKSUMS = {
+  1: '1b47f1ca7dbe16fc01fa50ff71fa4893af186b5de21aedb88529cf390c5a5db2',
+  2: '839ae90fb54ae667a0c326c79afd4a584c96b015a6e3edbb428f236b7afaf24f',
+};
 export const migrationPaths = MIGRATION_FILES.map((name) => resolve(migrationsDir, name));
 
 export function parseTarget(argv) {
@@ -263,5 +275,28 @@ export async function inspectSchema(client, schema = TARGET_SCHEMA) {
         ORDER BY id
       `)).rows
     : [];
-  return { schema, versions, columns, indexes, constraints, dangerous, checkedColumns: REQUIRED_DOWNLOAD_TASK_COLUMNS };
+  const authVersion = await exists('auth_schema_migrations')
+    ? (await client.query(`SELECT max(version)::int AS version FROM ${assertIdentifier(schema)}.auth_schema_migrations`)).rows[0].version
+    : null;
+  return { schema, versions, authVersion, columns, indexes, constraints, dangerous, checkedColumns: REQUIRED_DOWNLOAD_TASK_COLUMNS };
+}
+
+// db:check 的判定（纯函数，便于在真库测试里直接断言）。三条都要成立才算通过：
+// 1. EXPECTED_TABLES 一张不缺；2. 迁移列表里每个版本都已登记且 name+摘要一致；
+// 3. auth 记账 ≥ AUTH_SCHEMA_VERSION——否则运行时 assertAuthSchema 会 503，检查却说「通过」。
+export function evaluateSchema(report, migrations) {
+  const present = new Set(report.columns.map((item) => item.table_name));
+  const missingTables = EXPECTED_TABLES.filter((table) => !present.has(table));
+  const recorded = new Map(report.versions.map((row) => [row.version, row]));
+  const expectedMigrations = migrations.map((migration) => {
+    const row = recorded.get(migration.version);
+    return { version: migration.version, name: migration.name, checksum: migration.checksum,
+      recordedName: row?.name ?? null, recordedChecksum: row?.checksum?.trim() ?? null,
+      checksumOk: Boolean(row) && row.name === migration.name && row.checksum.trim() === migration.checksum };
+  });
+  const checksumOk = expectedMigrations.every((item) => item.checksumOk);
+  const authVersionOk = (report.authVersion ?? 0) >= AUTH_SCHEMA_VERSION;
+  const ok = checksumOk && authVersionOk && !missingTables.length && !report.dangerous.length;
+  return { ok, missingTables, expectedMigrations, checksumOk,
+    authVersion: report.authVersion ?? null, expectedAuthVersion: AUTH_SCHEMA_VERSION, authVersionOk };
 }
