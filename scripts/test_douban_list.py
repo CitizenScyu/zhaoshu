@@ -120,6 +120,24 @@ class TestParseDoubanTagPage(unittest.TestCase):
         self.assertEqual(books[2]['author'], '')
         self.assertEqual(books[2]['title'], '缺 pub 的条目')
 
+    def test_publisher_first_segment_is_not_author(self):
+        # authfix41（authmis41 C2，phoenix 22 行）：该版本没列作者时 pub 首段就是出版社，
+        # 不能拿出版社当人名去拒引擎真作者 → 作者未知（''）
+        def page(pub):
+            return ('<li class="subject-item"><div class="info"><h2><a href="https://book.douban.com'
+                    f'/subject/9/" title="书">书</a></h2><div class="pub">{pub}</div></div></li>')
+        for pub in ('青岛出版社 / 2020-4 / 59.8', '浙江文艺出版社 / 2020-4 / 40.00元',
+                    '中华书局 / 2010', '某某出版公司 / 2019', '早川書房 / 2025-6-18',
+                    'Penguin Press / 2020', 'Tor Publishing Group / 2021'):
+            with self.subTest(pub=pub):
+                self.assertEqual(douban_list.parse_douban_tag_page(page(pub))[0]['author'], '')
+        # 反例（2026-09-25 tag 页实测形态）：首段是作者的照旧取作者，含「作者 / 日期」无出版社形态
+        for pub, author in (('烽火戏诸侯 / 浙江文艺出版社 / 2020-4', '烽火戏诸侯'),
+                            ('柯山梦 / 2012-8', '柯山梦'), ('饭卡 / 2024', '饭卡'),
+                            ('七月新番', '七月新番'), ('Steven Pressfield / Bantam', 'Steven Pressfield')):
+            with self.subTest(pub=pub):
+                self.assertEqual(douban_list.parse_douban_tag_page(page(pub))[0]['author'], author)
+
     def test_broken_item_is_skipped(self):
         # h2 里没有带 title 的 a：跳过，不拖垮整页
         titles = [b['title'] for b in douban_list.parse_douban_tag_page(DOUBAN_TAG_HTML)]
@@ -533,6 +551,32 @@ class TestParseQidianRank(unittest.TestCase):
         titles = {b['title'] for b in books}
         self.assertNotIn('玄幻', titles)
         self.assertNotIn('仙侠', titles)
+
+    def test_new_genre_words_are_not_authors(self):
+        # authfix41（authmis41 C1，phoenix 133 行）：起点新分类词不在噪声表时被当成作者，
+        # 真作者被顶掉（《神秘复苏》名单作者成了「悬疑灵异」）。条目按 2026-09-25 本地抓的
+        # m.qidian.com/rank/{hotsales,newbook,sign} 原样文本节点缩写。
+        html = """<html><body>
+<div>全站</div><div>现实</div><div>体育</div><div>悬疑灵异</div><div>诸天无限</div><div>轻小说</div>
+<div>15</div><div>还不起学贷的我只好兼职猎魔</div><div>小夕岁</div><div>轻小说</div><div>80万字</div>
+<div>17</div><div>神秘复苏</div><div>佛前献花</div><div>悬疑灵异</div><div>531.57万字</div>
+<div>6</div><div>浪起1931</div><div>草花书生</div><div>诸天无限</div><div>2.47万字</div>
+<div>9</div><div>行商坐医</div><div>山樵守护者</div><div>现实</div><div>12万字</div>
+<div>16</div><div>某体育书</div><div>四仰化三铁</div><div>体育</div><div>15.69万字</div>
+</body></html>"""
+        got = {b['title']: b['author'] for b in douban_list.parse_qidian_rank(html)}
+        self.assertEqual(got, {'还不起学贷的我只好兼职猎魔': '小夕岁', '神秘复苏': '佛前献花',
+                               '浪起1931': '草花书生', '行商坐医': '山樵守护者',
+                               '某体育书': '四仰化三铁'})
+
+    def test_no_genre_word_can_land_in_author_slot(self):
+        # 分类全集逐个钉：任一分类词出现在作者位之后都不得被取作作者
+        for genre in sorted(douban_list.QIDIAN_GENRES):
+            with self.subTest(genre=genre):
+                html = (f'<div>1</div><div>书名甲</div><div>真作者</div><div>{genre}</div>'
+                        '<div>10万字</div>')
+                books = douban_list.parse_qidian_rank(html)
+                self.assertEqual([b['author'] for b in books], ['真作者'])
 
 
 # ---- 纵横移动版完本专区（2026-09-19 调研接入；两种 book-author 形态并存）----
@@ -1428,6 +1472,144 @@ class TestSearchEngineAuthorFilter(unittest.TestCase):
         self.assertEqual(
             buf.getvalue(),
             'book15 命中 0 本，未命中 1 本，跳过已打标 0 本（斗破苍穹）\n')
+
+
+# ---- authfix41：作者比对补结构差规则（样例全部取自 phoenix gate.log round 1 原样，authmis41）----
+class TestAuthorMatches(unittest.TestCase):
+    """author_matches(名单作者, 引擎作者)：归一化严格相等 + R2 分段/角色 + R3 剥括号 + R4 外文末节。"""
+
+    # B 组 8 行形态（名单 → 引擎），修复后必须能对上
+    B_PAIRS = {
+        'R2': (('马伯庸', '马伯庸著 刘巴布编绘'),                        # 风起陇西
+               ('苏末那', '软星科技原著 执笔：苏末那'),                   # 仙剑奇侠传四（全集）
+               ('软星科技', '软星科技原著 执笔：苏末那'),                 # 尾部「原著」角色
+               ('刘巴布', '马伯庸著；刘巴布编绘'),                        # 分号分隔
+               ('刘巴布', '马伯庸、刘巴布'),                              # 顿号
+               ('刘巴布', '马伯庸，刘巴布')),                             # 逗号
+        'R3': (('[美] 斯蒂芬·金', '[美]斯蒂芬·金（Stephen King）'),       # 它：全2册
+               ('[俄] 阿卡迪·斯特鲁伽茨基、[俄] 鲍里斯·斯特鲁伽茨基',
+                '(俄)阿卡迪·斯特鲁伽茨基 鲍里斯·斯特鲁伽茨基'),         # 离世界末日还有十亿年！
+               ('斯蒂芬·金', '斯蒂芬·金【Stephen King】')),
+        'R4': (('[美]乔治·R.R.马丁', '马丁'),                             # 冰与火之歌
+               ('[英] 詹姆斯·马修·巴利', '（英）巴利'),                   # 彼得·潘
+               ('[英] 詹姆斯·马修·巴利', '(英)巴利'),
+               ('[英] 詹姆斯·马修·巴利', '（英）巴利著；靳锦译'),
+               ('乔治·R·R·马丁', '马丁'),
+               ('马丁', '乔治&middot;R.R.马丁')),                          # 方向对称 + 实体
+    }
+
+    # A 组「同名真不同人」（引擎给的是同名书，但作者确实不是名单那位）：必须仍拒
+    A_PAIRS = (
+        ('[日] 东野圭吾', '里拜亚鲸'),          # 幻夜
+        ('紫金陈', '蒋小韫'), ('紫金陈', '蜗牛'),  # 设局
+        ('[美] 斯蒂芬·金', '作家cyQTqh'),        # 它
+        ('松本清张、稲木皓人', '(英)A.L·萨德勒'),  # 德川家康
+        ('松本清张、稲木皓人', '李猛'),
+        ('金庸', 'ywind'),
+    )
+
+    # 护栏反例：子串/后缀包含一律不算（authmis41 实测裸子串规则会误配这些）
+    GUARD_PAIRS = (
+        ('金庸', '金庸新'), ('金庸新', '金庸'), ('古龙', '古龙新'),
+        ('唐家三少', '唐家三少之子'), ('刘慈欣', '慈欣'), ('慈欣', '刘慈欣著'),
+        ('巴利', '巴利·艾柯'),                  # 长侧含 · 但短侧不是末节
+        ('[美] 斯蒂芬·金', '金'),               # 末节只 1 字不认
+        ('三毛', '三毛流浪记'),
+        ('马丁', '马丁新'),
+        ('金庸', '金庸新 著'), ('金庸', '金庸新；某某'),   # 分段后仍是整段相等
+        ('美', '[美] 某某'),                    # 切出来的「美」不得撞单字笔名
+        ('[英] J.R.R.托尔金', 'J.R.R.Tolkien'),   # R5 中外文异体：不做
+        ('威廉.雅各布斯', '(英)W.W.雅各布斯'),
+    )
+
+    def test_b_group_pairs_match(self):
+        for rule, pairs in self.B_PAIRS.items():
+            for a, b in pairs:
+                with self.subTest(rule=rule, pair=(a, b)):
+                    self.assertTrue(douban_list.author_matches(a, b))
+
+    def test_b_group_pairs_were_rejected_by_plain_normalization(self):
+        # 回归前提：这些对在「_norm_author 严格相等」下确实不等（否则测试证明不了新规则）
+        for rule, pairs in self.B_PAIRS.items():
+            for a, b in pairs:
+                with self.subTest(rule=rule, pair=(a, b)):
+                    self.assertNotEqual(douban_list._norm_author(a), douban_list._norm_author(b))
+
+    def test_a_group_same_title_different_person_still_rejected(self):
+        for a, b in self.A_PAIRS:
+            with self.subTest(pair=(a, b)):
+                self.assertFalse(douban_list.author_matches(a, b))
+                self.assertFalse(douban_list.author_matches(b, a))
+
+    def test_containment_guards(self):
+        for a, b in self.GUARD_PAIRS:
+            with self.subTest(pair=(a, b)):
+                self.assertFalse(douban_list.author_matches(a, b))
+
+    def test_plain_normalized_equality_still_matches(self):
+        for a, b in TestNormAuthor.TRUE_PAIRS + TestNormAuthor.LABEL_PAIRS:
+            with self.subTest(pair=(a, b)):
+                self.assertTrue(douban_list.author_matches(a, b))
+
+    def test_bracket_strip_keeps_nonempty_guard(self):
+        # 剥括号后为空的一侧不参与 R3：「（佚名）」不得因两端剥空而相等
+        self.assertFalse(douban_list.author_matches('（佚名）', '（无名氏）'))
+        self.assertFalse(douban_list.author_matches('张三', '（张三）李四'))
+
+    def test_role_label_needs_colon(self):
+        # 前导角色须带冒号才剥：「原著」「执笔」开头的真名不被当标签
+        self.assertFalse(douban_list.author_matches('苏末那', '执笔苏末那X'))
+        self.assertTrue(douban_list.author_matches('苏末那', '执笔 : 苏末那'))
+
+    def test_role_suffix_does_not_overstrip_real_names(self):
+        # 「原著」不进通用尾缀：名以「原」结尾的作者照旧对得上（高原著 → 高原）
+        self.assertTrue(douban_list.author_matches('高原', '高原著'))
+        self.assertFalse(douban_list.author_matches('高', '高原著'))
+
+
+class TestSearchEngineAuthorRules(unittest.TestCase):
+    """authfix41：search_engine 走 author_matches，B 组候选收、A 组照拒。"""
+
+    @staticmethod
+    def _search(title, list_author, cand_author):
+        cli = FakeEngineCli({'search': _proc(0, _engine_search_stdout([
+            {'source': 's.example', 'title': title, 'author': cand_author,
+             'bookUrl': 'https://s.example/b1'}]))})
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            hit = douban_list.search_engine(cli, title, list_author)
+        return hit, buf.getvalue()
+
+    def test_b_group_candidates_are_accepted(self):
+        for title, a, b in (('风起陇西', '马伯庸', '马伯庸著 刘巴布编绘'),
+                            ('仙剑奇侠传四（全集）', '苏末那', '软星科技原著 执笔：苏末那'),
+                            ('它：全2册', '[美] 斯蒂芬·金', '[美]斯蒂芬·金（Stephen King）'),
+                            ('冰与火之歌', '[美]乔治·R.R.马丁', '马丁'),
+                            ('彼得·潘', '[英] 詹姆斯·马修·巴利', '（英）巴利著；靳锦译')):
+            with self.subTest(title=title):
+                hit, out = self._search(title, a, b)
+                self.assertEqual(hit, {'url': 'https://s.example/b1', 'title': title,
+                                       'source': 's.example'})
+                self.assertNotIn('作者不符', out)
+
+    def test_a_group_candidates_still_rejected_with_list_title_in_log(self):
+        for title, a, b in (('幻夜', '[日] 东野圭吾', '里拜亚鲸'), ('设局', '紫金陈', '蒋小韫'),
+                            ('它', '[美] 斯蒂芬·金', '作家cyQTqh'), ('天龙八部', '金庸', '金庸新')):
+            with self.subTest(title=title):
+                hit, out = self._search(title, a, b)
+                self.assertIsNone(hit)
+                # 日志同时给出候选书名与名单书名（authmis41：旧日志只打候选书名，被误读成名单书）
+                self.assertIn(f'作者不符跳过: 候选《{title}》（名单《{title}》{a} vs 引擎 {b}）', out)
+
+    def test_publisher_list_entry_takes_author_unknown_path(self):
+        # R1 连带：豆瓣出版社条目解析成 '' 后走既有「名单无作者 → title 兼容即收」
+        html = ('<li class="subject-item"><div class="info"><h2><a href="https://book.douban.com'
+                '/subject/9/" title="剑来1：少年起微末">剑来1：少年起微末</a></h2>'
+                '<div class="pub">浙江文艺出版社 / 2020-4 / 40.00元</div></div></li>')
+        book = douban_list.parse_douban_tag_page(html)[0]
+        hit, out = self._search(book['title'], book['author'], '烽火戏诸侯')
+        self.assertEqual(hit['url'], 'https://s.example/b1')
+        self.assertNotIn('作者不符', out)
 
 
 if __name__ == '__main__':
