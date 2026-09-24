@@ -288,7 +288,8 @@ describe('B2-05 快照卷 GC:清单/指针缺失与存储错误一律 fail close
     expect(unparsable.retained).toContain(snaps(a)[2]);
     expect(unparsable.orphans).not.toContain(snaps(a)[2]);
 
-    const { generated_at: _omitted, ...withoutGeneratedAt } = original;
+    const withoutGeneratedAt = { ...original };
+    delete withoutGeneratedAt.generated_at;
     store.files.set(manifestPath, JSON.stringify(withoutGeneratedAt));
     const missing = await collectSnapshotGarbage(store, stem, { now: LATER });
     expect(missing.liveVersions).toContain(a.version);
