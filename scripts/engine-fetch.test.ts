@@ -227,4 +227,10 @@ describe('engine-fetch errorKind（giveup41）', () => {
     // 模块未加载（类为空）时不误判为 policy：只认 kind/name
     expect(engineErrorKind(new SourcePolicyError('x'))).toBe('other');
   });
+
+  it('downloadErrorKind：code=2（日限额/瞬时不可用，可重试）不得标 partial，仅 code=1 是 partial', async () => {
+    const { downloadErrorKind } = await import('./engine-error-kind.mjs');
+    expect(downloadErrorKind(2)).toBe('source_unavailable');
+    expect(downloadErrorKind(1)).toBe('partial');
+  });
 });

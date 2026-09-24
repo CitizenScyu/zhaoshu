@@ -17,7 +17,7 @@ import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { exitAfterFlush } from './stdio-exit.mjs';
 import { searchSources, SEARCH_SOURCE_SLICE_MS } from './engine-search-pool.mjs';
-import { engineErrorKind } from './engine-error-kind.mjs';
+import { downloadErrorKind, engineErrorKind } from './engine-error-kind.mjs';
 
 // CLI 层宽上限（无 serverless 限制，但仍有界防挂死）。
 const SEARCH_TIMEOUT_MS = 30_000;
@@ -277,7 +277,7 @@ async function cmdDownload(m, args) {
   const { downloadBook } = await import('./engine-download.mjs');
   const result = await downloadBook(m, args, resolveSourceForUrl);
   process.stdout.write(JSON.stringify(result) + '\n');
-  if (result.code) throw new ExitError(result.code, 'download partial', 'partial');
+  if (result.code) throw new ExitError(result.code, 'download partial', downloadErrorKind(result.code));
 }
 
 const COMMANDS = { doctor: cmdDoctor, download: cmdDownload, search: cmdSearch, toc: cmdToc, content: cmdContent };
