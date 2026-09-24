@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import {
   consumeFindSSE,
   fetchFindResult,
@@ -205,5 +205,23 @@ describe('合法零结果给出排除摘要而不是保存警告', () => {
     const event: SseEvent = { type: 'result', items: [], zeroReason: '全被淘汰。', zeroSuggestion: '重新试。' };
     expect(persistWarning(event)).toBeNull();
     expect(zeroResultNote(event)).toBeTruthy();
+  });
+});
+
+// consumeFindSSE 的超时改为手工计时后,成功路径必须清掉那个定时器。
+// 不清的话,定时器会在流已经读完之后到点,abort 一条早已结束的响应——
+// 与 auth-client.ts:240 记的是同一个坑。
+describe('流读完后不留过期的超时定时器', () => {
+  it('正常读完的流 dispose 掉超时定时器,假时钟推进后 signal 仍不中止', async () => {
+    vi.useFakeTimers();
+    try {
+      const res = sseResponse([frame({ type: 'result', items: [] })]);
+      const pendingBefore = vi.getTimerCount();
+      await consumeFindSSE(res, new AbortController().signal, 60_000, () => {});
+      // 超时定时器必须已被 dispose:读完后不能还挂着一个会在稍后到点的计时器。
+      expect(vi.getTimerCount()).toBe(pendingBefore);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

@@ -88,4 +88,24 @@ describe('owner credential generations', () => {
     session.close();
     await expect(session.fetch('/api/find', { method: 'POST' }, origin)).rejects.toMatchObject({ name: 'AbortError' });
   });
+  // 会话关闭会把中止信号转发给所有在飞请求。合并信号必须在中止时摘掉挂在代际
+  // controller.signal 上的监听,否则每次代际轮换都要在它上面留一个悬空 listener。
+  it('leaves no abort listeners behind after the session closes', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => Response.json({ ok: true })));
+    const session = new OwnerSession('token', 1);
+    // 直接数挂在这个具体 signal 上的监听:被中止的 signal 不能再 addEventListener,
+    // 所以替换实例方法而不是打 AbortSignal.prototype 的 spy。
+    const signal = session.controller.signal as AbortSignal;
+    let adds = 0;
+    let removes = 0;
+    const realAdd = signal.addEventListener.bind(signal);
+    const realRemove = signal.removeEventListener.bind(signal);
+    signal.addEventListener = (...args: Parameters<AbortSignal['addEventListener']>) => { adds += 1; return realAdd(...args); };
+    signal.removeEventListener = (...args: Parameters<AbortSignal['removeEventListener']>) => { removes += 1; return realRemove(...args); };
+    await session.fetch('/api/find', {}, origin);
+    expect(adds).toBe(1);
+    session.close();
+    expect(removes).toBe(adds);
+  });
+
 });
