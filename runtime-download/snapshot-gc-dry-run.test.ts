@@ -116,14 +116,17 @@ const stemOf = (title: string) => snapshotPaths(title, '佚名').dir.split('/').
 describe('gcls-41 快照 GC 只读 GitHub 存储', () => {
   it('列根目录得到编码 stem;列书目录只要 blob 名并记下大小;只发带鉴权的 GET', async () => {
     const { store } = await fixture();
+    const dir = snapshotPaths('普通书', '佚名').dir;
+    store.files.set('books/.snapshots/README.md', '根目录散文件不是书目录');
+    store.files.set(`${dir}/nested/v-00000000.txt`, '子目录里的文件不属于本层');
     const gh = fakeGitHub(store.files);
     const gc = createSnapshotGcStore({ token: TOKEN, repository: REPO, branch: 'main', fetchImpl: gh.impl });
     const stems = await gc.listStems();
     expect(stems.sort()).toEqual(['普通书', '缺清单书', '两版书', '旧书'].map(stemOf).sort());
-    const dir = snapshotPaths('普通书', '佚名').dir;
     const files = await gc.listFiles(dir);
     expect(files).toContain('current.json');
     expect(files).toContain('v-deadbeef.txt');
+    expect(files).not.toContain('nested');
     expect(gc.sizeOf(`${dir}/v-deadbeef.txt`)).toBe(Buffer.byteLength('残卷残卷'));
     expect(await gc.listFiles('books/.snapshots/nope')).toEqual([]);
     expect(gh.calls.every(call => call.method === 'GET' && call.auth === `Bearer ${TOKEN}`)).toBe(true);
