@@ -1939,11 +1939,15 @@ class TestAuthorSpaceSplitRevision(unittest.TestCase):
                 self.assertFalse(douban_list.author_matches(a, b))
                 self.assertFalse(douban_list.author_matches(b, a))
         self.assertTrue(douban_list.author_matches('上條 一輝', '上條一輝'))   # 同一人写法差照旧
+        # 只有一侧带「·」的空白不切：「斯蒂芬·金（Stephen King）」切开会让「King」单独成段
+        self.assertEqual(douban_list._author_segments('[美]斯蒂芬·金（Stephen King）')[1:], [])
+        self.assertFalse(douban_list.author_matches('King', '[美]斯蒂芬·金（Stephen King）'))
 
     def test_real_cjk_multi_signature_strings_still_split(self):
         for engine, parts in (
                 ('马伯庸著 刘巴布编绘', ['马伯庸著', '刘巴布编绘']),          # 角色后缀后的空白
                 ('软星科技原著 执笔：苏末那', ['软星科技原著', '执笔：苏末那']),  # 角色标签前的空白
+                ('刘巴布 执笔：苏末那', ['刘巴布', '执笔：苏末那']),          # 左边不以角色结尾，靠右边标签
                 ('(俄)阿卡迪·斯特鲁伽茨基 鲍里斯·斯特鲁伽茨基',              # 两个外文全名
                  ['(俄)阿卡迪·斯特鲁伽茨基', '鲍里斯·斯特鲁伽茨基']),
                 ('马伯庸、刘巴布', ['马伯庸', '刘巴布']), ('马伯庸/刘巴布', ['马伯庸', '刘巴布']),
@@ -1959,7 +1963,8 @@ class TestAuthorSpaceSplitRevision(unittest.TestCase):
     # B：「名 + 空格 + 著」是单人署名，R4 照常生效
     def test_trailing_role_after_space_is_single_author(self):
         for a, b in (('[澳]杰西卡·汤森 著', '汤森'), ('[美]乔治·R.R.马丁 著', '马丁'),
-                     ('[英] 詹姆斯·马修·巴利 著', '巴利'), ('[英] 詹姆斯·马修·巴利', '（英）巴利 著')):
+                     ('[英] 詹姆斯·马修·巴利 著', '巴利'), ('[英] 詹姆斯·马修·巴利', '（英）巴利 著'),
+                     ('[澳]杰西卡·汤森 著 绘', '汤森')):   # 连续角色词：「著」后的空白按规则会切出「绘」
             with self.subTest(pair=(a, b)):
                 self.assertTrue(douban_list.author_matches(a, b))
                 self.assertTrue(douban_list.author_matches(b, a))
