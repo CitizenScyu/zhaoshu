@@ -65,12 +65,16 @@ function volumeFixture() {
     owner: 'owner', repo: 'repo', branch: 'main',
     canonical_path: `${dir}/index.json`, blob_sha: gitBlobSha(book), bytes: Buffer.byteLength(book),
   };
+  // 发布成功后的仓库现状:清单 + 规范卷 + 快照卷(下载端优先取快照卷,B2-01)。
+  const snapshots = manifest.volumes.map((volume) => volume.snapshot_path.slice(volume.snapshot_path.lastIndexOf('/') + 1));
   const resources = new Map<string, () => Response>([
     ['index.json', () => new Response(stringifyVolumeManifest(manifest))],
     ['vol-001.txt', () => new Response(vol1)],
     ['vol-002.txt', () => new Response(vol2)],
+    [snapshots[0], () => new Response(vol1)],
+    [snapshots[1], () => new Response(vol2)],
   ]);
-  return { manifest, artifactRow, book, vol1, resources };
+  return { manifest, artifactRow, book, vol1, resources, snapshots };
 }
 
 /** 以 URL 路径末段(百分号编码)为键的资源表;未命中作 404。 */
@@ -483,8 +487,8 @@ describe('GET /api/download/[id]/file', () => {
       expect(text).toBe(fx.book);
       expect(text).not.toContain('"schema"');
       expect(text).not.toContain('chapter_index');
-      // 清单在前,卷按顺序各取一次。
-      expect(hits).toEqual(['index.json', 'vol-001.txt', 'vol-002.txt']);
+      // 清单在前,卷按顺序各取一次(取内容寻址快照卷,不取规范卷)。
+      expect(hits).toEqual(['index.json', ...fx.snapshots]);
     });
 
     it('逐卷流式下发:消费第一卷之前不拉取第二卷', async () => {
@@ -495,16 +499,16 @@ describe('GET /api/download/[id]/file', () => {
 
       const res = await download();
       // 响应已就绪但还没消费:第二卷绝不会被提前拉取(一次一卷的背压)。
-      expect(hits).not.toContain('vol-002.txt');
+      expect(hits).not.toContain(fx.snapshots[1]);
       const text = await res.text();
       expect(text).toBe(fx.book);
-      expect(hits).toEqual(['index.json', 'vol-001.txt', 'vol-002.txt']);
+      expect(hits).toEqual(['index.json', ...fx.snapshots]);
     });
 
     it('卷字节 sha 与清单不符 → 下载中断,绝不下发半新半旧的书', async () => {
       const fx = volumeFixture();
       const resources = new Map(fx.resources);
-      resources.set('vol-001.txt', () => new Response('被篡改的卷内容\n'));
+      resources.set(fx.snapshots[0], () => new Response('被篡改的卷内容\n'));
       sqlForArtifact(fx.artifactRow);
       fetchMock.mockImplementation(resourceServer(resources, () => {}));
 
@@ -555,6 +559,72 @@ describe('GET /api/download/[id]/file', () => {
       // 只取这一个文件:没有清单、没有分卷。
       expect(fetchMock).toHaveBeenCalledTimes(1);
       expect(fetchMock.mock.calls[0][0]).toContain(encodeURIComponent('旧书-作者.txt'));
+    });
+
+    describe('跨版本发布窗口(B2-01):卷取内容寻址快照,不取跨版本共享的 vol-00N.txt', () => {
+      /** 第 1 卷被新版覆盖后的字节(sha 与旧清单不符)。 */
+      const NEW_VOL1 = '【第1章】\n\n第一卷修订后的正文。\n';
+      /** 去掉快照卷:模拟快照缺失,只剩规范卷。 */
+      function withoutSnapshots(fx: ReturnType<typeof volumeFixture>) {
+        const resources = new Map(fx.resources);
+        for (const name of fx.snapshots) resources.delete(name);
+        return resources;
+      }
+
+      it('旧清单 + 已被新版覆盖的规范卷 → 仍下发旧版整本(不再 409 中断)', async () => {
+        const fx = volumeFixture();
+        const resources = new Map(fx.resources);
+        resources.set('vol-001.txt', () => new Response(NEW_VOL1));
+        const hits: string[] = [];
+        sqlForArtifact(fx.artifactRow);
+        fetchMock.mockImplementation(resourceServer(resources, (name) => hits.push(name)));
+
+        const res = await download();
+
+        expect(res.status).toBe(200);
+        expect(await res.text()).toBe(fx.book);
+        expect(hits).toEqual(['index.json', ...fx.snapshots]);
+      });
+
+      it('快照卷 404 → 回退规范卷(仍按清单 sha 校验)', async () => {
+        const fx = volumeFixture();
+        const hits: string[] = [];
+        sqlForArtifact(fx.artifactRow);
+        fetchMock.mockImplementation(resourceServer(withoutSnapshots(fx), (name) => hits.push(name)));
+
+        const res = await download();
+
+        expect(res.status).toBe(200);
+        expect(await res.text()).toBe(fx.book);
+        expect(hits).toEqual(['index.json', fx.snapshots[0], 'vol-001.txt', fx.snapshots[1], 'vol-002.txt']);
+      });
+
+      it('快照卷 404 且规范卷已是别的版本 → 下载中断(回退不放过 sha 校验)', async () => {
+        const fx = volumeFixture();
+        const resources = withoutSnapshots(fx);
+        resources.set('vol-001.txt', () => new Response(NEW_VOL1));
+        sqlForArtifact(fx.artifactRow);
+        fetchMock.mockImplementation(resourceServer(resources, () => {}));
+
+        const res = await download();
+
+        expect(res.status).toBe(200);
+        await expect(res.text()).rejects.toThrow();
+      });
+
+      it('快照卷非 404 上游错误 → 下载中断,不回退规范卷', async () => {
+        const fx = volumeFixture();
+        const resources = new Map(fx.resources);
+        resources.set(fx.snapshots[0], () => new Response(null, { status: 500 }));
+        const hits: string[] = [];
+        sqlForArtifact(fx.artifactRow);
+        fetchMock.mockImplementation(resourceServer(resources, (name) => hits.push(name)));
+
+        const res = await download();
+
+        await expect(res.text()).rejects.toThrow();
+        expect(hits).not.toContain('vol-001.txt');
+      });
     });
   });
 });
