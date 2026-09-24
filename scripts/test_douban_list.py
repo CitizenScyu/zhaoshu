@@ -1927,5 +1927,49 @@ class TestAmbiguityGuardOrderIndependent(unittest.TestCase):
             with self.subTest(order=order):
                 self.assertTrue(hit['author'])
 
+# ---- authfix41 整改（authrev41 增量）----
+class TestAuthorSpaceSplitRevision(unittest.TestCase):
+    # A：名内空格不是多署名分隔——切开后共有姓氏段就被判同一人
+    DIFFERENT = (('上條 一輝', '上條 二輝'), ('司马 迁', '司马 光'), ('欧阳 修', '欧阳 询'),
+                 ('夏目 漱石', '夏目 房之介'), ('太宰 治', '太宰 幸'), ('J.R.R. 托尔金', 'J.R.R. 马丁'))
+
+    def test_cjk_name_internal_space_is_not_a_separator(self):
+        for a, b in self.DIFFERENT:
+            with self.subTest(pair=(a, b)):
+                self.assertFalse(douban_list.author_matches(a, b))
+                self.assertFalse(douban_list.author_matches(b, a))
+        self.assertTrue(douban_list.author_matches('上條 一輝', '上條一輝'))   # 同一人写法差照旧
+
+    def test_real_cjk_multi_signature_strings_still_split(self):
+        for engine, parts in (
+                ('马伯庸著 刘巴布编绘', ['马伯庸著', '刘巴布编绘']),          # 角色后缀后的空白
+                ('软星科技原著 执笔：苏末那', ['软星科技原著', '执笔：苏末那']),  # 角色标签前的空白
+                ('(俄)阿卡迪·斯特鲁伽茨基 鲍里斯·斯特鲁伽茨基',              # 两个外文全名
+                 ['(俄)阿卡迪·斯特鲁伽茨基', '鲍里斯·斯特鲁伽茨基']),
+                ('马伯庸、刘巴布', ['马伯庸', '刘巴布']), ('马伯庸/刘巴布', ['马伯庸', '刘巴布']),
+                ('马伯庸&nbsp;刘巴布', ['马伯庸', '刘巴布'])):
+            with self.subTest(engine=engine):
+                self.assertEqual(douban_list._author_segments(engine)[1:], parts)
+                for p in ('马伯庸', '刘巴布') if '马伯庸' in engine else ():
+                    self.assertTrue(douban_list.author_matches(p, engine))
+        self.assertTrue(douban_list.author_matches('苏末那', '软星科技原著 执笔：苏末那'))
+        self.assertTrue(douban_list.author_matches('鲍里斯·斯特鲁伽茨基',
+                                                   '(俄)阿卡迪·斯特鲁伽茨基 鲍里斯·斯特鲁伽茨基'))
+
+    # B：「名 + 空格 + 著」是单人署名，R4 照常生效
+    def test_trailing_role_after_space_is_single_author(self):
+        for a, b in (('[澳]杰西卡·汤森 著', '汤森'), ('[美]乔治·R.R.马丁 著', '马丁'),
+                     ('[英] 詹姆斯·马修·巴利 著', '巴利'), ('[英] 詹姆斯·马修·巴利', '（英）巴利 著')):
+            with self.subTest(pair=(a, b)):
+                self.assertTrue(douban_list.author_matches(a, b))
+                self.assertTrue(douban_list.author_matches(b, a))
+
+    def test_trailing_role_strip_does_not_admit_multi_signature(self):
+        for engine in ('乔治·马丁著 某某编绘', '某某、乔治·马丁 著', '某某编绘 乔治·马丁 著',
+                       '（英）巴利著；靳锦译', '某某 著 乔治·马丁'):
+            with self.subTest(engine=engine):
+                self.assertFalse(douban_list._is_single_author(engine))
+                self.assertFalse(douban_list.author_matches('马丁', engine))
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)
