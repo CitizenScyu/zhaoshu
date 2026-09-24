@@ -42,7 +42,7 @@ interface VolumeFixture {
   bookText: string;
   chapters: { title: string; text: string }[];
   ranges: { startByte: number; endByte: number }[];
-  volumes: { path: string; blobSha: string; bytes: number }[];
+  volumes: { path: string; snapshotPath: string; blobSha: string; bytes: number }[];
   manifest: Record<string, unknown>;
 }
 
@@ -83,6 +83,8 @@ function volumeFixture(options: {
     const sha = createHash('sha1').update(`blob ${volumeBytes.byteLength}\0`).update(volumeBytes).digest('hex');
     return {
       path: paths.canonicalPath.replace(/index\.json$/, `vol-${String(index + 1).padStart(3, '0')}.txt`),
+      // 与发布器同口径:快照卷按**卷**内容寻址(v-<卷 sha8>.txt),读端优先取它(B2-01)。
+      snapshotPath: `books/.snapshots/${stem}/v-${sha.slice(0, 8)}.txt`,
       blobSha: sha,
       bytes: volumeBytes.byteLength,
     };
@@ -112,7 +114,7 @@ function volumeFixture(options: {
       title, author, generated_at: '2026-09-21T00:00:00.000Z', task_id: options.id ?? 1,
       volumes: ranges.map((range, index) => ({
         path: volumes[index]!.path,
-        snapshot_path: `books/.snapshots/${stem}/v-${version}.txt`,
+        snapshot_path: volumes[index]!.snapshotPath,
         blob_sha: volumes[index]!.blobSha, bytes: volumes[index]!.bytes,
         first_byte: range.startByte, last_byte: range.endByte,
       })),
@@ -137,7 +139,7 @@ function volumeResponder(book: VolumeFixture): (input: RequestInfo | URL) => Pro
     const url = String(input);
     const name = decodeURIComponent(url.slice(url.lastIndexOf('/') + 1));
     if (name === 'index.json') return new Response(JSON.stringify(book.manifest));
-    const index = book.volumes.findIndex(volume => volume.path.endsWith(name));
+    const index = book.volumes.findIndex(volume => volume.snapshotPath.endsWith(name) || volume.path.endsWith(name));
     if (index < 0) throw new Error('Unexpected manifest/volume request: ' + name);
     const range = book.ranges[index]!;
     return new Response(Buffer.from(book.bookText, 'utf8').subarray(range.startByte, range.endByte));

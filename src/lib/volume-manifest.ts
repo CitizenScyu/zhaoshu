@@ -20,9 +20,9 @@ export const VOLUME_MANIFEST_FORMAT = 'volumes';
 export const MAX_MANIFEST_BYTES = 4 * 1024 * 1024;
 
 export interface VolumeEntry {
-  /** 规范区卷路径(books/<stem>/vol-001.txt)。 */
+  /** 规范区卷路径(books/<stem>/vol-001.txt)。跨版本共享固定名,读端只作快照缺失时的回退。 */
   path: string;
-  /** 快照区卷路径(books/.snapshots/<stem>/v-<sha8>.txt)。 */
+  /** 快照区卷路径(books/.snapshots/<stem>/v-<sha8>.txt)。内容寻址,读端优先取它。 */
   snapshot_path: string;
   /** 卷文本 git blob sha40(读端逐卷校验)。 */
   blob_sha: string;
@@ -71,6 +71,22 @@ export interface VolumeManifest {
 /** 规范路径是清单而不是单文件产物:所有发布统一 `books/<stem>/index.json`。 */
 export function isVolumeManifestPath(path: string): boolean {
   return /\/index\.json$/.test(path);
+}
+
+/**
+ * 取卷字节的候选路径,按序尝试:前一个 404 才试下一个。读端(reader-server)与下载端
+ * (download file 路由)共用此处,次序只在这里定。
+ *
+ * 先取快照卷 `snapshot_path`:发布阶段 1 写入,先于任何引用它的清单落地,且内容寻址、跨版本
+ * 永不覆盖 ⇒ 字节恒与本清单声明的 blob_sha 一致。规范卷 `path`(vol-00N.txt)是跨版本共享的
+ * 固定名,发布窗口内或规范阶段中途失败后会出现「清单代次 ≠ 卷代次」,只读它会恒 409(B2-01)。
+ * 规范卷只作快照缺失时的回退;无论取自哪条路径,调用方都仍按 blob_sha 校验。
+ *
+ * 约束:今后若给快照区加 GC,必须保留当前及上一版清单引用的全部快照卷(读者可能仍持上一版
+ * 清单读章);删掉被引用的快照会让读端退回规范卷,重新暴露跨版本 409。
+ */
+export function volumeReadPaths(entry: VolumeEntry): readonly [snapshot: string, canonical: string] {
+  return [entry.snapshot_path, entry.path];
 }
 
 const HEX8 = /^[a-f0-9]{8}$/;

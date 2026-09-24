@@ -69,11 +69,20 @@ function resourceServer(resources: Resources, hit: (name: string) => void): type
   }) as typeof fetch;
 }
 
+/** 快照卷文件名(v-<卷 sha8>.txt):读端优先取它(B2-01)。 */
+function snapshotName(fx: ReturnType<typeof fixture>, index: number): string {
+  const path = fx.manifest.volumes[index].snapshot_path;
+  return path.slice(path.lastIndexOf('/') + 1);
+}
+
+/** 发布成功后的仓库现状:清单 + 规范卷 + 快照卷。 */
 function volumeResources(fx: ReturnType<typeof fixture>): Resources {
   return new Map<string, () => Response>([
     ['index.json', () => new Response(stringifyVolumeManifest(fx.manifest))],
     ['vol-001.txt', () => new Response(fx.vol1)],
     ['vol-002.txt', () => new Response(fx.vol2)],
+    [snapshotName(fx, 0), () => new Response(fx.vol1)],
+    [snapshotName(fx, 1), () => new Response(fx.vol2)],
   ]);
 }
 
@@ -122,9 +131,10 @@ describe('reader server: v2 分卷(§七)', () => {
       startByte: fx.v1Bytes.byteLength, endByte: fx.v1Bytes.byteLength + fx.v2Bytes.byteLength,
       text: fx.vol2,
     });
-    // 清单 1 次 + 卷 2 一次;卷 1 从未取用。
-    expect(hits).toEqual(['index.json', 'vol-002.txt']);
+    // 清单 1 次 + 卷 2(快照卷)一次;卷 1 从未取用,规范卷也不取。
+    expect(hits).toEqual(['index.json', snapshotName(fx, 1)]);
     expect(hits).not.toContain('vol-001.txt');
+    expect(hits).not.toContain(snapshotName(fx, 0));
   });
 
   it('expectedVersion 与清单 version 不符 → 409(绝不用别的版本字节)', async () => {
@@ -136,7 +146,7 @@ describe('reader server: v2 分卷(§七)', () => {
   it('篡改卷:卷字节 gitBlobSha ≠ 清单 blob_sha → 409(重取清单确认版本未变后仍拒)', async () => {
     const fx = fixture();
     const resources = volumeResources(fx);
-    resources.set('vol-001.txt', () => new Response('被篡改的卷内容\n')); // sha 不再匹配
+    resources.set(snapshotName(fx, 0), () => new Response('被篡改的卷内容\n')); // sha 不再匹配
     fetchMock.mockImplementation(resourceServer(resources, () => {}));
     await expect(server.readBookPart(fx.task, 0, 0, fx.manifest.blob_sha)).rejects.toMatchObject({ status: 409 });
   });
@@ -262,7 +272,7 @@ describe('reader server: v2 分卷(§七)', () => {
     fetchMock.mockImplementation(resourceServer(volumeResources(fx), name => hits.push(name)));
     await server.readBookPart(fx.task, 0, 0, fx.manifest.blob_sha);
     await server.readBookPart(fx.task, 0, 0, fx.manifest.blob_sha);
-    expect(hits).toEqual(['index.json', 'vol-001.txt']); // 第二读全命中缓存
+    expect(hits).toEqual(['index.json', snapshotName(fx, 0)]); // 第二读全命中缓存
   });
 
   it('清单 raw 上限 4 MiB:声称超限的清单体 → 413(不缓冲整包)', async () => {
@@ -289,5 +299,127 @@ describe('reader server: v2 分卷(§七)', () => {
     expect(hits).toEqual(['legacy.txt']);
     expect(hits).not.toContain('index.json');
     void MAX_READER_BYTES;
+  });
+});
+
+/**
+ * 同一本书的两个版本:第 1 卷改过、第 2 卷不变。规范卷名 vol-00N.txt 跨版本共享,
+ * 快照卷 v-<sha8>.txt 内容寻址、跨版本不覆盖(B2-01)。
+ */
+function twoVersions() {
+  const oldFx = fixture();
+  const newVol1 = `【第1章 合成】\n\n${'修订一'.repeat(40)}\n`;
+  const newBook = newVol1 + oldFx.vol2;
+  const newV1Bytes = Buffer.from(newVol1, 'utf8');
+  const newManifest: VolumeManifest = {
+    ...oldFx.manifest,
+    version: gitBlobSha(newBook).slice(0, 8), blob_sha: gitBlobSha(newBook), bytes: Buffer.byteLength(newBook),
+    volumes: [
+      { ...oldFx.manifest.volumes[0], snapshot_path: `books/.snapshots/${STEM}/v-${gitBlobSha(newVol1).slice(0, 8)}.txt`,
+        blob_sha: gitBlobSha(newVol1), bytes: newV1Bytes.byteLength, last_byte: newV1Bytes.byteLength },
+      { ...oldFx.manifest.volumes[1], first_byte: newV1Bytes.byteLength,
+        last_byte: newV1Bytes.byteLength + oldFx.v2Bytes.byteLength },
+    ],
+    chapter_index: [
+      { i: 0, t: '【第1章 合成】', v: 0, s: 0, e: newV1Bytes.byteLength, p: 1 },
+      { i: 1, t: '【第2章 合成】', v: 1, s: newV1Bytes.byteLength, e: newV1Bytes.byteLength + oldFx.v2Bytes.byteLength, p: 1 },
+    ],
+  };
+  const snapshotName = (manifest: VolumeManifest, index: number) =>
+    manifest.volumes[index].snapshot_path.slice(manifest.volumes[index].snapshot_path.lastIndexOf('/') + 1);
+  // 发布阶段 1 已落两个版本的快照卷(内容寻址,互不覆盖)。
+  const snapshots: [string, () => Response][] = [
+    [snapshotName(oldFx.manifest, 0), () => new Response(oldFx.vol1)],
+    [snapshotName(newManifest, 0), () => new Response(newVol1)],
+    [snapshotName(oldFx.manifest, 1), () => new Response(oldFx.vol2)],
+  ];
+  return { oldFx, oldManifest: oldFx.manifest, newManifest, newVol1, snapshots, snapshotName };
+}
+
+describe('reader server: 跨版本发布窗口不再 409(B2-01,读内容寻址快照卷)', () => {
+  beforeEach(async () => {
+    vi.resetModules();
+    vi.resetAllMocks();
+    vi.stubEnv('GITHUB_TOKEN', 'reader-volume-test-github');
+    vi.stubGlobal('fetch', fetchMock);
+    getSql.mockReturnValue(sql);
+    sql.mockResolvedValue([ARTIFACT]);
+    server = await import('./reader-server');
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+    vi.unstubAllEnvs();
+  });
+
+  it('旧清单 + 新规范卷(规范阶段已覆盖卷、index.json 未落 / 中途失败)→ 读旧版快照卷,返回旧正文', async () => {
+    const v = twoVersions();
+    const hits: string[] = [];
+    fetchMock.mockImplementation(resourceServer(new Map<string, () => Response>([
+      ['index.json', () => new Response(stringifyVolumeManifest(v.oldManifest))],
+      ['vol-001.txt', () => new Response(v.newVol1)], // 规范卷已被新版覆盖
+      ['vol-002.txt', () => new Response(v.oldFx.vol2)],
+      ...v.snapshots,
+    ]), name => hits.push(name)));
+    const part = await server.readBookPart(v.oldFx.task, 0, 0, v.oldManifest.blob_sha);
+    expect(part.text).toBe(v.oldFx.vol1);
+    expect(hits).toEqual(['index.json', v.snapshotName(v.oldManifest, 0)]);
+  });
+
+  it('新清单 + 旧规范卷(清单先于卷可见)→ 读新版快照卷,返回新正文', async () => {
+    const v = twoVersions();
+    fetchMock.mockImplementation(resourceServer(new Map<string, () => Response>([
+      ['index.json', () => new Response(stringifyVolumeManifest(v.newManifest))],
+      ['vol-001.txt', () => new Response(v.oldFx.vol1)], // 规范卷还是旧版
+      ['vol-002.txt', () => new Response(v.oldFx.vol2)],
+      ...v.snapshots,
+    ]), () => {}));
+    const part = await server.readBookPart(v.oldFx.task, 0, 0, v.newManifest.blob_sha);
+    expect(part.text).toBe(v.newVol1);
+  });
+
+  it('快照卷 404 → 回退规范卷 entry.path(仍按清单 sha 校验)', async () => {
+    const v = twoVersions();
+    const hits: string[] = [];
+    fetchMock.mockImplementation(resourceServer(new Map<string, () => Response>([
+      ['index.json', () => new Response(stringifyVolumeManifest(v.oldManifest))],
+      ['vol-001.txt', () => new Response(v.oldFx.vol1)],
+    ]), name => hits.push(name)));
+    const part = await server.readBookPart(v.oldFx.task, 0, 0, v.oldManifest.blob_sha);
+    expect(part.text).toBe(v.oldFx.vol1);
+    expect(hits).toEqual(['index.json', v.snapshotName(v.oldManifest, 0), 'vol-001.txt']);
+  });
+
+  it('快照卷 404 且规范卷已是别的版本 → 仍 409(回退路径不放过 sha 校验)', async () => {
+    const v = twoVersions();
+    fetchMock.mockImplementation(resourceServer(new Map<string, () => Response>([
+      ['index.json', () => new Response(stringifyVolumeManifest(v.oldManifest))],
+      ['vol-001.txt', () => new Response(v.newVol1)],
+    ]), () => {}));
+    await expect(server.readBookPart(v.oldFx.task, 0, 0, v.oldManifest.blob_sha)).rejects.toMatchObject({ status: 409 });
+  });
+
+  it('快照卷非 404 的上游错误(500)→ 502,不回退规范卷(只在「文件不存在」时回退)', async () => {
+    const v = twoVersions();
+    const hits: string[] = [];
+    fetchMock.mockImplementation(resourceServer(new Map<string, () => Response>([
+      ['index.json', () => new Response(stringifyVolumeManifest(v.oldManifest))],
+      [v.snapshotName(v.oldManifest, 0), () => new Response(null, { status: 500 })],
+      ['vol-001.txt', () => new Response(v.oldFx.vol1)],
+    ]), name => hits.push(name)));
+    await expect(server.readBookPart(v.oldFx.task, 0, 0, v.oldManifest.blob_sha)).rejects.toMatchObject({ status: 502 });
+    expect(hits).not.toContain('vol-001.txt');
+  });
+
+  it('缺 snapshot_path 的清单在解析层即被拒 → 502(schema 2 必填;不存在「无快照字段」的可读清单)', async () => {
+    const v = twoVersions();
+    const text = stringifyVolumeManifest(v.oldManifest).replace(/\s*"snapshot_path": "[^"]*",/g, '');
+    expect(text).not.toContain('snapshot_path');
+    fetchMock.mockImplementation(resourceServer(new Map<string, () => Response>([
+      ['index.json', () => new Response(text)],
+      ['vol-001.txt', () => new Response(v.oldFx.vol1)],
+    ]), () => {}));
+    await expect(server.readBookIndex(v.oldFx.task)).rejects.toMatchObject({ status: 502 });
   });
 });
