@@ -14,7 +14,8 @@ type ApiFetch = (input: RequestInfo | URL, init?: RequestInit) => Promise<Respon
 /** 前端同时在飞的单源 probe 上限;服务端灰度建议 ≤6,这里留余量给同页的章节/预取请求。 */
 export const SOURCE_PROBE_CONCURRENCY = 4;
 
-export interface FanoutCandidate { url: string; name: string; tier: string; readable: boolean }
+/** hostKey:服务端归一后的站键(book15 apex/www 同键);旧服务端不带,前端退回 hostname。 */
+export interface FanoutCandidate { url: string; name: string; tier: string; readable: boolean; hostKey?: string }
 
 export type FanoutRow = FanoutCandidate & (
   | { state: 'pending' | 'probing' | 'skipped' | 'current' }
@@ -85,6 +86,7 @@ function parseCandidates(data: unknown): FanoutCandidate[] | null {
     list.push({
       url: item.url, name: typeof item.name === 'string' && item.name ? item.name : item.url,
       tier: typeof item.tier === 'string' ? item.tier : 'builtin', readable: item.readable === true,
+      ...(typeof item.hostKey === 'string' && item.hostKey ? { hostKey: item.hostKey } : {}),
     });
   }
   return list;
@@ -181,8 +183,8 @@ export function useSourceFanout({ apiFetch, title, author, currentSource, cache 
         if (signal.aborted || (stop && active === 0)) { resolve(); return; }
         for (let i = 0; !stop && i < queue.length && active < SOURCE_PROBE_CONCURRENCY;) {
           const source = queue[i];
-          const host = hostOf(source.url);
-          // 同 host 的候选排在前一个之后发,不同时在飞(跨实例的服务端节流不共享)。
+          const host = source.hostKey || hostOf(source.url);
+          // 同站(服务端站键,缺失时按 hostname)的候选排在前一个之后发,不同时在飞(跨实例的服务端节流不共享)。
           if (host && busyHosts.has(host)) { i++; continue; }
           queue.splice(i, 1);
           active++;

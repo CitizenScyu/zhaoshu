@@ -456,6 +456,31 @@ describe('换源面板扇出:调度', () => {
     await waitFor(() => expect(probes.pending.has('https://same.example/b')).toBe(true));
   });
 
+  // 41-srcurl:同站按服务端下发的 hostKey 串行。book15 apex/www 是两个 hostname、同一个站。
+  it('候选带 hostKey ⇒ book15 apex 与 www 按同站串行:前一个落定后才发下一个', async () => {
+    const sources = [
+      { ...candidate('book15', 'https://book15.net/'), hostKey: 'book15.net' },
+      { ...candidate('book15 www', 'https://www.book15.net/'), hostKey: 'book15.net' },
+      { ...candidate('乙', 'https://other.example'), hostKey: 'other.example' },
+    ];
+    const probes = deferredProbes();
+    const apiFetch = fanoutFetch(sources, probes.handler);
+    await openPanel(apiFetch);
+    await waitFor(() => expect([...probes.pending.keys()].sort()).toEqual(['https://book15.net/', 'https://other.example']));
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(probes.pending.has('https://www.book15.net/')).toBe(false);
+    probes.release('https://book15.net/', json(probe(sources[0], { status: 'miss' })));
+    await waitFor(() => expect(probes.pending.has('https://www.book15.net/')).toBe(true));
+  });
+
+  it('候选没有 hostKey(旧服务端)⇒ 退回 hostname:apex 与 www 视为两个 host 同时在飞', async () => {
+    const sources = [candidate('book15', 'https://book15.net/'), candidate('book15 www', 'https://www.book15.net/')];
+    const probes = deferredProbes();
+    const apiFetch = fanoutFetch(sources, probes.handler);
+    await openPanel(apiFetch);
+    await waitFor(() => expect([...probes.pending.keys()].sort()).toEqual(['https://book15.net/', 'https://www.book15.net/']));
+  });
+
   it('关闭面板 ⇒ 在途 probe 全部 abort,之后不再发新 probe', async () => {
     const sources = Array.from({ length: 8 }, (_, i) => candidate(`源${i + 1}号`, `https://s${i + 1}.example`));
     const probes = deferredProbes();

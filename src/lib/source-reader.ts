@@ -131,6 +131,15 @@ interface SharedSourceBudget {
  */
 export function sourceThrottleKey(url: string, env: SourceTuningEnv = process.env): string {
   if (env.SOURCE_THROTTLE_PER_HOST === '0') return '*';
+  return sourceStationKey(url);
+}
+
+/**
+ * 站键：hostname，同站备用 host 归一到同一个（节流分桶的按站部分）。扇出候选列表把它作为 hostKey 下发，
+ * 浏览器据此做同站串行（41-srcurl）；不含 SOURCE_THROTTLE_PER_HOST=0 的全局单槽回滚 —— 那是服务端节流的
+ * 回滚开关，下发成 '*' 会让浏览器把整轮扇出串成单发。
+ */
+export function sourceStationKey(url: string): string {
   const hostname = hostnameOf(url);
   const alternate = alternateSourceHost(hostname);
   return alternate && alternate < hostname ? alternate : hostname;
