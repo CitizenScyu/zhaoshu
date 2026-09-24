@@ -98,17 +98,18 @@ if (listed.error || listed.status !== 0) {
 // git 输出仓库根相对、以 `/` 分隔的路径;统一成平台分隔符便于按目录判断与展示。
 const repoPyFiles = listed.stdout.split('\0').filter(Boolean).map((p) => p.split('/').join(sep));
 
-const isTestModule = (relPath) => {
-  const parts = relPath.split(sep);
-  return basename(relPath).startsWith('test_') && basename(relPath).endsWith('.py');
-};
+const isTestModule = (relPath) =>
+  basename(relPath).startsWith('test_') && basename(relPath).endsWith('.py');
 
 const testFiles = repoPyFiles.filter(isTestModule).sort();
 
 // 认定口径:整个仓库里所有 test_*.py 都必须在 scripts/ 顶层。放别处既不在本门禁里,
 // 也说明位置不符合约定,故 fail-closed(而不是自动纳入)——理由同 run-mjs-tests.mjs:
 // 扫描范围漂移会让契约悄悄变化,该由人来决定挪不挪。
-const misplaced = testFiles.filter((p) => !(p.split(sep).length === 2 && p.split(sep)[0] === 'scripts'));
+const misplaced = testFiles.filter((p) => {
+  const parts = p.split(sep);
+  return !(parts.length === 2 && parts[0] === 'scripts');
+});
 if (misplaced.length > 0) {
   console.error(
     `✖ 发现 ${misplaced.length} 个 test_*.py 不在 scripts/ 顶层(不在本门禁或不符合约定):\n` +
