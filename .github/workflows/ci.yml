@@ -1,4 +1,4 @@
-# CI 门禁：typecheck → lint → 部署配置 → test → build
+# CI 门禁：typecheck → lint → 部署配置 → test:scripts → test:py → test → build
 #
 # 为什么存在：本仓此前唯一类型防线是 `next build`，已实证逃逸过三次问题——
 #   1) 手工移植不完整，53/53 测试全绿，只有 `tsc --noEmit` 报 4×TS2552 能抓；
@@ -67,6 +67,18 @@ jobs:
       #   `npm run check`,所以必须单列一步;本地 pre-push 经 `npm run check` 同样会跑。
       - name: test:scripts(node:test)
         run: npm run test:scripts
+
+      # scripts 下的 Python unittest 用例(scripts/test_*.py,41-PYGATE):
+      #   这 10 个文件(367 例)此前不在任何门禁里;它们用 unittest,不并进 vitest/node:test,
+      #   单列这一步跑。runner scripts/run-py-tests.mjs 内部对文件数、用例数、逐文件用例数做下限
+      #   断言,缺解释器即判红(fail-closed)。本工作流不走 `npm run check`,所以必须单列一步;
+      #   本地 pre-push 经 `npm run check` 同样会跑。
+      #   ubuntu runner 自带 python3,runner 优先用环境变量 PYTHON,否则依次找 python/python3/py。
+      #   用例全离线(不联网、不连库、不读 .env、不调真模型):各文件 docstring 写明网络入口在用例内
+      #   被 mock 替换;runner 另外显式清空 DATABASE_URL/TEST_DATABASE_URL 等会触网触库的变量。
+      #   无第三方依赖(只用标准库 unittest),故此处不装任何 pip 包、不钉版本。
+      - name: test:py(unittest)
+        run: npm run test:py
 
       # 门 3：测试。见下方断言步骤，真库用例被静默跳过就判红。
       # 显式断言 @electric-sql/pglite 可解析：它是 devDependency，只有 npm ci 带上 devDeps 才有。
