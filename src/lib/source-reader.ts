@@ -1,10 +1,10 @@
 import { createHash } from 'node:crypto';
 import { getSql } from './db';
 import { getReadingSources, type ReadingSource } from './shuyuan';
-import { fetchSourceText, sourceAbortable, SourceHttpError, SOURCE_TIMEOUT_MS } from './source-fetch';
+import { fetchSourceText, sourceAbortable, SourceHttpError, SOURCE_CONNECT_TIMEOUT_MS, SOURCE_TIMEOUT_MS } from './source-fetch';
 import { SourcePolicyError, alternateSourceHost, validateSourceUrl } from './source-policy';
 import { sourceRevision } from './source-revision';
-import { orderByHostHealth } from './source-host-health';
+import { isHostSuspect, orderByHostHealth } from './source-host-health';
 import { normalizeBookTitle } from './book-identity';
 import {
   engineFetchContent, engineFetchDetail, engineFetchToc, engineSearchBook, MAX_CONTENT_PAGES, type EngineSource,
@@ -32,13 +32,24 @@ export const MAX_POOL_REQUESTS = 30;
 // （翻页、一次 5xx 重试、第二条搜索结果、作者回退都要点数）；切片按进展滑动（见 SourceSliceSlide）：
 // 基准取 min(旋钮, 软预算余量)，每次成功请求顺延一个基准，目录与正文共用一片。名额只数「昂贵失败」：
 // SOURCE_NOT_FOUND 不占。切片与名额这里是默认值，生效值走 sourceFailoverSliceMs() / sourceFailoverMaxAttempts()。
-// 候选基准 12s：卡死的候选 12s 就放弃（当前源 12s + 两个卡死候选 24s 后，余量仍 ≥ 起跑门槛 8s，
+// 候选基准 12s：卡死的候选 12s 就放弃（当前源 12s + 两个卡死候选 24s 后，余量 9s，
 // 第三个候选还能开跑）；一直在出数据的候选靠顺延不被砍；12s 也装得下 book15 候选
 // 「apex 卡住 8s + 换 host 0.35s + www 一页 ≤3.6s ≈ 11.95s」这条救援路径。
 export const SOURCE_FAILOVER_SLICE_MS = 12_000;
 export const SOURCE_FAILOVER_MAX_ATTEMPTS = 3;
-/** 软预算余量不足一次完整物理请求就不再开新候选，走 504 超时出口（partial：还有候选没试）；也是给原源兜底预留的时间。 */
+/** 原源兜底的起跑门槛：余量不足一次完整物理请求就不再开，只剩它时按 503 收尾(P1b);也是 P2 给原源兜底预留的时间。 */
 export const SOURCE_FAILOVER_MIN_START_MS = SOURCE_TIMEOUT_MS;
+/**
+ * 非原源候选的起跑门槛(41-M1.2b,深审 A 第三轮 G):余量够一次连接 + 响应头(SOURCE_CONNECT_TIMEOUT_MS,3s)就开跑。
+ * 一直出数据、最后才失败的候选能靠滑动切片用掉大半预算，若仍按 8s 门槛，后面一个本来可用的候选会被挡掉(V1)。
+ * 候选切片仍取 min(基准, 余量),开得晚只是试得短，最坏墙钟不变;还有他源没试而余量不足 3s 时才是 504(partial)。
+ */
+export const SOURCE_FAILOVER_CANDIDATE_MIN_START_MS = SOURCE_CONNECT_TIMEOUT_MS;
+/**
+ * 池里有他源时，当前源滑动切片给换源预留的时间(41-M1.2b,深审 A 第三轮 H):与非原源候选的起跑门槛对齐。
+ * 当前源被切断时，第一个候选恰好还能起跑;一直在出数据的当前源最多可以用到软预算终点前 3s(V2:12 页 × 3.2s)。
+ */
+export const SOURCE_CURRENT_FAILOVER_RESERVE_MS = SOURCE_FAILOVER_CANDIDATE_MIN_START_MS;
 /**
  * 当前源正文切片基准（41-M1.2）：12s = 一次卡住的请求（SOURCE_TIMEOUT_MS 8s）+ 换 host 退避 0.35s
  * + 另一 host 上实测最慢的一页（≤3.6s）≈ 11.95s，救援路径完整装得下。按进展滑动：多页正文每成功一页顺延一个基准，
@@ -315,6 +326,11 @@ function engineCatalogFrom(
 // 只输出 host、URL、字节数、计数、书名等非敏感字段；绝不输出 Cookie/Authorization/整页 HTML。
 function hostOf(url: string): string {
   try { return new URL(url).host; } catch { return ''; }
+}
+
+/** 健康记忆按 hostname 记、按 hostname 查(与 orderByHostHealth 同一口径);非法 URL 返回空串 ⇒ 视为健康。 */
+function hostnameOf(url: string): string {
+  try { return new URL(url).hostname; } catch { return ''; }
 }
 
 function stripHash(url: string): string {
@@ -1028,12 +1044,12 @@ export async function readSourceChapter(session: string, chapterIndex: number, c
     try {
       // 当前源正文走按进展滑动的切片(41-M1.2):死源卡住 12s 没有进展就放弃、进换源,不再靠 8s 单请求超时 ×
       // 重试耗到十几二十秒;多页正文每成功一页顺延一个基准，慢但一直在出数据的当前源不被砍。顺延上限是软预算
-      // 终点，池里有他源时再扣掉换源的起跑门槛(否则换源一个候选都开不了)。到点只 abort 这个 child
-      // (SOURCE_SCOPE_EXHAUSTED),父 signal 不受影响。L1 上限取引擎翻页上限，多页正文不会被单源点数掐断;
-      // builtin 只抓 1 页，真正的约束仍是 L2,与改动前走根 context 时一致。
+      // 终点，池里有他源时再扣掉候选的起跑门槛 SOURCE_CURRENT_FAILOVER_RESERVE_MS(3s,否则换源一个候选都开不了)。
+      // 到点只 abort 这个 child(SOURCE_SCOPE_EXHAUSTED),父 signal 不受影响。L1 上限取引擎翻页上限，多页正文
+      // 不会被单源点数掐断;builtin 只抓 1 页，真正的约束仍是 L2,与改动前走根 context 时一致。
       const baseMs = sourceCurrentSliceMs();
       const hasOthers = sources.some((item) => item.url !== catalog.sourceUrl);
-      const until = context.startedAt + SOFT_BUDGET_MS - (hasOthers ? SOURCE_FAILOVER_MIN_START_MS : 0);
+      const until = context.startedAt + SOFT_BUDGET_MS - (hasOthers ? SOURCE_CURRENT_FAILOVER_RESERVE_MS : 0);
       const currentContext = context.child(source.url, { limit: MAX_CONTENT_PAGES, sliceMs: baseMs, slide: { stepMs: baseMs, until } });
       text = await chapterText(currentContext, chapter, source, nextChapterUrlOf(catalog.chapters, chapterIndex));
     } catch (error) {
@@ -1083,7 +1099,7 @@ function failureCode(error: unknown): string {
  * 每次成功请求顺延一个基准,顺延上限 = 软预算终点(原源兜底还在后面时再扣掉 8s);最后一个他源的基准放宽到
  * 「余量 − 8s」,原源兜底的基准 = 全部余量(R4/P2)。目录与正文共用这一片。
  *
- * 出口:成功;504 SOURCE_TIMEOUT 只有两种 —— 循环顶软预算余量不足一次完整请求、且还有真正的候选没试(partial),
+ * 出口:成功;504 SOURCE_TIMEOUT 只有两种 —— 循环顶余量不足起跑门槛(他源 3s、原源 8s)、且还有真正的候选没试(partial),
  * 以及父 signal 中止(原样抛出,route 转 504);其余(候选试完、只剩原源兜底而余量不足、L2 请求数用尽、目录落库失败)
  * 一律 503 SOURCE_CHAPTER_UNAVAILABLE。每个出口恰好一行 source_failover 聚合日志;trigger 是当前源失败的原因码。
  */
@@ -1145,7 +1161,8 @@ async function switchSourceChapter(
     if (!isOriginal && expensiveAttempts >= maxExpensiveAttempts) continue;
     throwIfCancelled();
     const remaining = softEnd - Date.now();
-    if (remaining < SOURCE_FAILOVER_MIN_START_MS) {
+    // 起跑门槛(G):原源兜底要一次完整请求的余量(8s);其余候选够一次连接 + 响应头(3s)就开跑。
+    if (remaining < (isOriginal ? SOURCE_FAILOVER_MIN_START_MS : SOURCE_FAILOVER_CANDIDATE_MIN_START_MS)) {
       // 只剩原源兜底(他源都已处理过)而余量不足:候选已经试完,按 503 收尾(P1b);还有他源没试才是 504(partial)。
       if (isOriginal && others.length) break;
       report('timeout');
@@ -1156,8 +1173,10 @@ async function switchSourceChapter(
     attempted += 1;
     // 切片(R4/P2):原源兜底还在后面时,给它留出一次起跑门槛;最后一个他源可以用到「余量 − 留给原源的」,
     // 原源兜底用全部余量;其余候选取 min(基准, 余量)。顺延上限同样扣掉留给原源的时间。
+    // 末位放宽只给健康的他源(41-M1.2b T):suspect host 正是被 M1.3 降到他源末位的那个、最不可能成功,
+    // 不能因为排在末位反而拿到最宽的切片;它照常取 min(基准, 余量),卡住就在基准处放弃，原源兜底更早轮到。
     const reserve = !isOriginal && originals.length ? SOURCE_FAILOVER_MIN_START_MS : 0;
-    const isLast = isOriginal || index === others.length - 1;
+    const isLast = isOriginal || (index === others.length - 1 && !isHostSuspect(hostnameOf(candidate.url)));
     const sliceMs = isLast ? Math.max(Math.min(baseMs, remaining), remaining - reserve) : Math.min(baseMs, remaining);
     let alternative: SourceCatalog;
     let text: string;

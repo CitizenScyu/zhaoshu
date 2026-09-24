@@ -2182,13 +2182,13 @@ describe('chapter failover M1.1 (41-M1.1)', () => {
     }, true);
   });
 
-  it('c③(杀 M4a):软预算余量 7999ms ⇒ 不开新候选、504;恰好 8000ms(一次完整请求)⇒ 照开，切片即余量', async () => {
+  it('c③(杀 M4a;41-M1.2b G):他源起跑门槛 3s —— 余量 2999ms ⇒ 不开新候选、504;恰好 3000ms ⇒ 照开，切片即余量', async () => {
     const pool = [current, alt(1)];
     const catalog = await prepareCurrent(pool);
     pages.set(currentChapter, { text: '', status: 404 });
     primeHit(1);
     const tight = context();
-    vi.setSystemTime(tight.startedAt + service.SOFT_BUDGET_MS - 7_999);
+    vi.setSystemTime(tight.startedAt + service.SOFT_BUDGET_MS - 2_999);
     await expect(readChapter(catalog, tight)).rejects.toMatchObject({ code: 'SOURCE_TIMEOUT', status: 504 });
     expect(requestedUrls()).toEqual([currentChapter]);
     expect(oneFailoverLine('timeout', pool)).toMatchObject({ trigger: 'SOURCE_HTTP_4XX', attempted: 0, reasonCounts: {} });
@@ -2196,10 +2196,10 @@ describe('chapter failover M1.1 (41-M1.1)', () => {
     requested = [];
     const child = vi.spyOn(service.SourceRequestContext.prototype, 'child');
     const edge = context();
-    vi.setSystemTime(edge.startedAt + service.SOFT_BUDGET_MS - 8_000);
+    vi.setSystemTime(edge.startedAt + service.SOFT_BUDGET_MS - 3_000);
     expect((await readChapter(catalog, edge)).servedFrom).toBe(alt(1).name);
-    // 唯一的他源就是最后一个他源:基准 = max(min(12s, 余量), 余量 − 留给原源的 8s) = 8s。
-    expect(child.mock.calls).toContainEqual([alt(1).url, expect.objectContaining({ sliceMs: 8_000 })]);
+    // 唯一的他源就是最后一个他源:基准 = max(min(12s, 余量), 余量 − 留给原源的 8s) = 余量 3s。
+    expect(child.mock.calls).toContainEqual([alt(1).url, expect.objectContaining({ sliceMs: 3_000 })]);
   });
 
   it('c③\'(杀 M1c):余量 10s 时非末位候选的基准取 min(12s, 余量)=10s,挂起的候选在 10s 处放弃', async () => {
@@ -2442,8 +2442,9 @@ describe('chapter failover M1.1 (41-M1.1)', () => {
     const catalog = await prepareCurrent(pool);
     pages.set(currentChapter, { text: '', status: 404 });
     primeHit(1);
-    // 当前源那一发之后墙钟已走掉 40s 软预算(假时钟跳表，待决定时器随之平移、不会误触发)。
-    onRequest(currentChapter, () => vi.setSystemTime(Date.now() + 40_000));
+    // 当前源那一发之后墙钟已走掉 43s 软预算(假时钟跳表，待决定时器随之平移、不会误触发):他源余量 2s,
+    // 不足候选起跑门槛 3s(41-M1.2b G)⇒ 504。
+    onRequest(currentChapter, () => vi.setSystemTime(Date.now() + 43_000));
     const res = await drive(request('chapter', `session=${catalog.version}&version=${catalog.version}&chapter=0`));
     expect(res.status).toBe(504);
     expect(res.headers.get('Retry-After')).toBe('5'); // 与 503 同一退避提示(深审 A O2/O5)
@@ -2696,17 +2697,18 @@ describe('chapter failover M1.1 (41-M1.1)', () => {
     expect(oneFailoverLine('timeout', [engineAlt(9)])).toMatchObject({ trigger: 'SOURCE_SCOPE_EXHAUSTED', attempted: 0 });
   });
 
-  it('until②(当前源，池里有他源):一直有进展的慢当前源在 45s − 8s = 37s 处被切断，他源仍有 8s 起跑并交付', async () => {
+  it('until②(当前源，池里有他源):一直有进展的慢当前源在 45s − 3s = 42s 处被切断，他源恰有 3s 起跑门槛并交付', async () => {
     const pool = [engineAlt(9), alt(1)];
     const catalog = await prepareEngineCurrent(9, pool);
-    // 12 页 × 5s:第 7 页在 35s 成功，切片顺延到 min(35 + 12, 37) = 37s;第 8 页要到 40s ⇒ 37s 处被切断。
-    // 他源在 37s 开跑，余量恰为起跑门槛 8s。不给换源留这 8s 的话，当前源会一直滑到 45s,他源就开不了跑(504)。
+    // 12 页 × 5s:第 8 页在 40s 成功，切片顺延到 min(40 + 12, 42) = 42s;第 9 页要到 45s ⇒ 42s 处被切断(41-M1.2b H:
+    // 给换源预留的是候选起跑门槛 3s)。他源在 42s 开跑，余量恰为 3s,本章三次请求 0.7s 内交付。
+    // 不给换源留这 3s 的话，当前源会一直滑到 45s,他源就开不了跑(504)。
     slowEnginePages(9, 12, 5_000);
     primeHit(1);
     const part = await readChapter(catalog);
     expect(part).toMatchObject({ text: '备用源1正文', servedFrom: alt(1).name });
-    expect(requestedUrls()).toContain('https://book15.net/e9/c/1_8.html');
-    expect(requested.find(({ url }) => url === altSearch(1))!.at - requested[0].at).toBe(37_000);
+    expect(requestedUrls()).toContain('https://book15.net/e9/c/1_9.html');
+    expect(requested.find(({ url }) => url === altSearch(1))!.at - requested[0].at).toBe(42_000);
     expect(oneFailoverLine('success', pool)).toMatchObject({ trigger: 'SOURCE_SCOPE_EXHAUSTED', attempted: 1 });
   });
 
@@ -2730,5 +2732,44 @@ describe('chapter failover M1.1 (41-M1.1)', () => {
     expect(oneFailoverLine('success', pool)).toMatchObject({
       attempted: 2, expensiveAttempts: 1, reasonCounts: { SOURCE_SCOPE_EXHAUSTED: 1 },
     });
+  });
+
+  // ---- 41-M1.2b:深审 A 第三轮四列探针里违反「三列取优」的两行(V1/V2),在 a02e482 上都是红的 ----
+
+  it('V1 ROUTE-504r2(G):当前源卡住;A、B 一直出数据、最后才失败，吃掉大半预算;C 可用 ⇒ 余量 6.65s 时 C 仍开跑并交付 200(a02e482:<8s ⇒ 504)', async () => {
+    const pool = [current, alt(1), alt(2), alt(3)];
+    const catalog = await prepareCurrent(pool);
+    pages.set(currentChapter, { text: chapterHtml('当前源正文') });
+    bodyDelay.set(currentChapter, Number.POSITIVE_INFINITY);
+    for (const n of [1, 2]) {
+      primeHit(n);
+      // 搜索、详情各 7s 才成功(进展 ⇒ 切片顺延),正文 500×2 ⇒ 最后失败。
+      bodyDelay.set(altSearch(n), 7_000);
+      bodyDelay.set(pageUrl(600 + n), 7_000);
+      pages.set(chapterUrl(600 + n), { text: '', status: 500 });
+    }
+    primeHit(3);
+    const res = await drive(request('chapter', `session=${catalog.version}&version=${catalog.version}&chapter=0`));
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({ text: '备用源3正文', servedFrom: alt(3).name });
+    // 当前源 12s 放弃;A 在 12s…26s 出数据，正文 5xx 于 26.35s 失败;B 从 26.7s 起出数据，38.35s 被自己的切片切断。
+    // C 在 38.35s 开跑，余量 6.65s:不足原源兜底的 8s 门槛，但够他源的起跑门槛 3s。
+    expect(requested.find(({ url }) => url === altSearch(3))!.at - requested[0].at).toBe(38_350);
+    expect(oneFailoverLine('success', pool)).toMatchObject({
+      trigger: 'SOURCE_SCOPE_EXHAUSTED', attempted: 3, expensiveAttempts: 2,
+      reasonCounts: { SOURCE_HTTP_5XX: 1, SOURCE_SCOPE_EXHAUSTED: 1 },
+    });
+  });
+
+  it('V2 X1-xlong2(H):当前引擎源本章 12 页 × 3.2s(合计 38.4s),池里有他源但没有这本书 ⇒ 当前源 38.4s 交付(a02e482:37s 处被砍)', async () => {
+    const pool = [engineAlt(9), alt(1)];
+    const catalog = await prepareEngineCurrent(9, pool);
+    // 滑动上限 = 45s − 3s = 42s:第 11 页在 35.2s 成功后顺延到 42s,第 12 页 38.4s 成功。12 次请求恰好用满 L2=12。
+    const text = slowEnginePages(9, 12, 3_200);
+    primeMiss(1);
+    const { part, ms } = await readTimed(catalog);
+    expect(part).toMatchObject({ text, servedFrom: engineAlt(9).name });
+    expect(ms).toBe(38_400);
+    expect(failoverLines()).toEqual([]);
   });
 });
