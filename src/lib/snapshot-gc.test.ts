@@ -238,6 +238,29 @@ describe('B2-05 快照卷 GC:清单/指针缺失与存储错误一律 fail close
     expect(report).toMatchObject({ skipped: 'store_error', detail: 'github_tree_truncated', volumeCount: 0 });
   });
 
+  it('清单里某项 snapshot_path 缺失/非字符串 ⇒ 整份清单不可读(fail closed),不得跳过该项漏记引用', async () => {
+    const { store, a } = await threeVersions();
+    const manifestPath = `${paths.dir}/${a.version}.json`;
+    const manifest = JSON.parse(store.files.get(manifestPath)!) as { volumes: Record<string, unknown>[] };
+    // 丙卷只被 A 引用:若实现「跳过坏项」而非「整份判不可读」,这条引用会被漏记 ⇒ 丙卷被误判孤儿。
+    delete manifest.volumes[2]!.snapshot_path;
+    store.files.set(manifestPath, JSON.stringify(manifest));
+    const report = await collectSnapshotGarbage(store, stem, exec);
+    expect(report).toMatchObject({ skipped: 'unreadable_manifest', orphans: [], deleted: [] });
+    expect(store.deleteFile).not.toHaveBeenCalled();
+    expect(store.files.has(snaps(a)[2])).toBe(true);
+
+    // 非字符串(这里是数字)同理。
+    manifest.volumes[2]!.snapshot_path = 123 as unknown as string;
+    store.files.set(manifestPath, JSON.stringify(manifest));
+    expect((await collectSnapshotGarbage(store, stem, exec)).skipped).toBe('unreadable_manifest');
+
+    // 规范清单的单项缺字段同样整份判不可读(requireVolumes 路径)。
+    store.files.set(paths.canonicalPath, JSON.stringify({ schema: 2, format: 'volumes', volumes: [{ path: 'books/x/vol-001.txt' }] }));
+    expect((await collectSnapshotGarbage(store, stem, exec)).skipped).toBe('unreadable_canonical');
+    expect(store.deleteFile).not.toHaveBeenCalled();
+  });
+
   it('目录里没有快照卷(旧单文件时代)⇒ 不读任何清单、不跳过、无孤儿', async () => {
     const store = new MemoryStore();
     store.files.set(`${paths.dir}/0badf00d.txt`, '旧整本快照');
