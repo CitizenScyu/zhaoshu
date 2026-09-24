@@ -1,4 +1,3 @@
-#!/usr/bin/env node
 // 部署配置离线门禁（review-42 MS-09）：只读本仓文件做静态校验，不联网、不读 .env*。
 //
 // 为什么需要：typecheck / lint / test / build 四道门全部作用在源码上，部署配置错了照样全绿。
@@ -36,7 +35,10 @@ export const CROSS_FILE_BUDGETS = [
 
 const MODEL_BUDGET = { file: 'src/lib/deadline.ts', name: 'MODEL_ROUTE_INTERNAL_BUDGET_MS' };
 
-/** 展开单个 crontab 字段，返回命中的取值个数；非法写法抛错（fail-closed）。 */
+/**
+ * 展开单个 crontab 字段，返回命中的取值个数；非法写法抛错（fail-closed）。
+ * @param {string} field @param {number} lo @param {number} hi @returns {number}
+ */
 export function fieldCardinality(field, lo, hi) {
   const values = new Set();
   for (const part of field.split(',')) {
@@ -62,6 +64,7 @@ export function fieldCardinality(field, lo, hi) {
  * 该 cron 表达式一天内触发几次 = 分钟取值数 × 小时取值数。
  * 日/月/周三段只会把触发减少到更低频，不可能造成同一天多次，故不参与计算（也借此避开 dom/dow 的 OR 语义）；
  * 但仍校验它们合法，免得坏表达式被当成「每天一次」放过去。
+ * @param {string} schedule @returns {number}
  */
 export function triggersPerDay(schedule) {
   const fields = schedule.trim().split(/\s+/);
@@ -256,7 +259,10 @@ function checkNextConfig(root, errors) {
   }
 }
 
-/** 对仓库根目录 root 跑全部检查，返回错误列表（空 = 通过）。 */
+/**
+ * 对仓库根目录 root 跑全部检查，返回错误列表（空 = 通过）。
+ * @param {string} root @returns {string[]}
+ */
 export function checkDeployConfig(root) {
   const errors = [];
   checkVercelJson(root, errors);
