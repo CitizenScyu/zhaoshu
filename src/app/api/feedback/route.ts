@@ -36,7 +36,8 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: '反馈已在其他页面更新，你的草稿已保留，请比较后再保存。', code: 'FEEDBACK_CONFLICT', current }, { status: 409 });
     }
     // Omitting note expresses a status-only change; it never clears the latest note.
-    const safeNote = body && Object.hasOwn(body, 'note') ? cleanNote : current.note;
+    // hasOwnProperty 而不是 Object.hasOwn：后者是 ES2022，低于浏览器基线（MS-32b）。
+    const safeNote = body && Object.prototype.hasOwnProperty.call(body, 'note') ? cleanNote : current.note;
     if (feedbackNeedsConfirmation(current.note, safeNote) && body?.confirmNoteReduction !== true) {
       return NextResponse.json({ error: '反馈原因将减少，请确认后保存。', code: 'FEEDBACK_CONFIRM_REQUIRED', current }, { status: 409 });
     }
