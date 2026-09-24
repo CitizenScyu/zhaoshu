@@ -26,6 +26,7 @@
     "db:migrate": "node --experimental-strip-types scripts/migrate.mjs",
     "db:check:prod": "node --experimental-strip-types scripts/db-prod.mjs check",
     "db:migrate:prod": "node --experimental-strip-types scripts/db-prod.mjs migrate",
+    "db:baseline:prod": "node --experimental-strip-types scripts/db-prod.mjs baseline",
     "test:db": "node --experimental-strip-types scripts/test-db.mjs"
   },
   "dependencies": {

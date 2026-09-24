@@ -8,6 +8,9 @@
 //   migrate  默认 dry-run：只读列出将执行的迁移与将写入的记账行；显式 --apply 才写。
 //            前置核对不过（摘要不匹配、库版本高于代码、未知版本、乱序、列类型漂移）一律拒绝，退出码 2。
 //            apply 在迁移事务的锁内再按整张记账表复核一次（applyMigration strict），之后只读复核。
+//            没有 schema_migrations 却已有业务表的库（从未登记的已有库，如生产）也拒绝：那要走 baseline。
+//   baseline 默认 dry-run：只读核对 0001–0003 的效果在库里都已成立（db-baseline.mjs），不执行任何迁移 DDL；
+//            显式 --apply 才在迁移锁内复核并建 schema_migrations、登记 v1–v3。只接受从未登记的库。
 //
 // 目标必须显式给出：--database-url-env=<变量名>，脚本不读 .env*，不回退 DATABASE_URL / TEST_DATABASE_URL，
 // 也不接受这两个名字本身。输出只含 host、版本、摘要与列形状，不含连接串；异常经 safeError 脱敏。
@@ -15,18 +18,20 @@
 import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import {
-  applyMigration, checkRuntimeColumns, createClient, evaluateSchema, EXPECTED_RUNTIME_COLUMNS, inspectSchema,
+  applyMigration, checkRuntimeColumns, createClient, evaluateSchema, EXPECTED_RUNTIME_COLUMNS, EXPECTED_TABLES, inspectSchema,
   loadMigrations, planMigrations, probeEndpoint, safeError, SCHEMA_VERSION, TARGET_SCHEMA,
 } from './db-migration-lib.mjs';
+import { applyBaseline, baselineLedgerWrites, verifyBaseline } from './db-baseline.mjs';
 import { readDatabaseUrl } from './migrate-auth-prod.mjs';
 
-const USAGE = '用法: db-prod.mjs check --database-url-env=<变量名> | db-prod.mjs migrate --database-url-env=<变量名> [--apply]（migrate 默认 dry-run）';
+const USAGE = '用法: db-prod.mjs check --database-url-env=<变量名> | db-prod.mjs <migrate|baseline> --database-url-env=<变量名> [--apply]（migrate / baseline 默认 dry-run）';
+const WRITE_COMMANDS = new Set(['migrate', 'baseline']);
 // 应用与隔离库各自的连接变量。生产入口只读运维专用变量，免得 shell 里残留的应用 / 测试连接被误当目标。
 const RESERVED_ENV_NAMES = new Set(['DATABASE_URL', 'TEST_DATABASE_URL']);
 
 export function parseProdArgs(argv) {
   const [command, ...rest] = argv;
-  if (command !== 'check' && command !== 'migrate') throw new Error(`第一个参数必须是 check 或 migrate。${USAGE}`);
+  if (command !== 'check' && !WRITE_COMMANDS.has(command)) throw new Error(`第一个参数必须是 check、migrate 或 baseline。${USAGE}`);
   let envName = null;
   let apply = false;
   let dryRun = false;
@@ -103,6 +108,21 @@ export async function runProdCheck(client, migrations) {
   };
 }
 
+// 从未登记的已有库：没有登记任何版本（没有 schema_migrations，或表在但 0 行），却已有迁移要建的表。
+// 对它 --apply 会把 0001 整份在在线表上重跑（ALTER COLUMN / UPDATE / SET NOT NULL），而不是只补记账——
+// 生产正是这个形态（prodmig41，2026-09-24）。空记账表与没有记账表同样处理（复审 baserev41 #1：只看表在不在，
+// 空表会被当成已登记而放行重放）。冷建库只能是空库；已有库先用 db:baseline:prod 核对并登记。
+export function unadoptedRefusal(report) {
+  const present = new Set(report.columns.map((column) => column.table_name));
+  const ledgerPresent = present.has('schema_migrations');
+  if (ledgerPresent && report.versions.length) return [];
+  const existing = EXPECTED_TABLES.filter((table) => table !== 'schema_migrations' && present.has(table));
+  if (!existing.length) return [];
+  const ledger = ledgerPresent ? 'schema_migrations 为空（0 行）' : '库里没有 schema_migrations';
+  return [`${ledger}，却已有 ${existing.length} 张迁移管理的表（${existing.slice(0, 5).join(', ')}${existing.length > 5 ? ' …' : ''}）：`
+    + '这是从未登记的已有库，不能让 migrate 重跑 0001；先用 db:baseline:prod 核对并登记。冷建库须从空库开始'];
+}
+
 /** @returns {Promise<Record<string, any>>} 形状随 status 变化（refused / dry-run / up-to-date / unchanged / applied） */
 export async function runProdMigrate(client, migrations, mode) {
   const before = await inspectReadOnly(client, migrations);
@@ -115,6 +135,7 @@ export async function runProdMigrate(client, migrations, mode) {
   const refusals = [
     ...before.ledger.errors.map((item) => item.message),
     ...before.runtimeColumns.problems.map(describeColumnProblem),
+    ...unadoptedRefusal(before.report),
   ];
   if (refusals.length) return { ...base, status: 'refused', refusals };
   if (mode === 'dry-run') {
@@ -134,6 +155,39 @@ export async function runProdMigrate(client, migrations, mode) {
     // 冷建库：0001 只把 auth 记账到 4，这里 authVersionOk=false 是预期，下一步 migrate:auth:prod 补 5–7。
     next: after.verdict.authVersionOk ? null : '运行 npm run migrate:auth:prod（同一 --database-url-env）补 auth 记账，再跑 db:check:prod',
   };
+}
+
+// baseline 的只读核对：与 check 同样整段在 READ ONLY 事务里。
+async function verifyBaselineReadOnly(client, migrations) {
+  await client.query('BEGIN READ ONLY');
+  try {
+    await client.query("SET LOCAL statement_timeout = '30s'");
+    return await verifyBaseline(client, migrations);
+  } finally {
+    await client.query('ROLLBACK').catch(() => {});
+  }
+}
+
+function describeBaseline(verdict) {
+  return { authVersion: verdict.authVersion, checked: verdict.checked, problems: verdict.problems, extra: verdict.extra,
+    absent: verdict.absent, data: verdict.data };
+}
+
+/** @returns {Promise<Record<string, any>>} 形状随 status 变化（refused / dry-run / applied） */
+export async function runProdBaseline(client, migrations, mode) {
+  const before = await verifyBaselineReadOnly(client, migrations);
+  const base = { command: 'baseline', mode, ...describeBaseline(before) };
+  if (!before.ok) return { ...base, status: 'refused', refusals: before.refusals };
+  if (mode === 'dry-run') return { ...base, status: 'dry-run', ledgerWrites: baselineLedgerWrites(migrations) };
+  // 锁内再核一遍：dry-run 之后到拿锁之间库被改了，就在这里回滚并拒绝。
+  const applied = await applyBaseline(client, migrations);
+  if (applied.status === 'refused') {
+    return { ...base, ...describeBaseline(applied.verdict), status: 'refused', refusals: applied.verdict.refusals };
+  }
+  const after = await runProdCheck(client, migrations);
+  return { ...base, status: 'applied', versions: applied.versions,
+    after: { ok: after.ok, checksumOk: after.checksumOk, ledger: after.ledger, authVersionOk: after.authVersionOk,
+      missingTables: after.missingTables, runtimeColumnsOk: after.runtimeColumns.ok } };
 }
 
 export function exitCodeOf(result) {
@@ -172,7 +226,9 @@ export async function main({
     }
     const list = migrations ?? await loadMigrations();
     client = await open(connectionString);
-    const result = command === 'check' ? await runProdCheck(client, list) : await runProdMigrate(client, list, mode);
+    const run = { check: () => runProdCheck(client, list), migrate: () => runProdMigrate(client, list, mode),
+      baseline: () => runProdBaseline(client, list, mode) };
+    const result = await run[command]();
     log(JSON.stringify({ phase: 'complete', host, ...result }, null, 2));
     return exitCodeOf(result);
   } catch (error) {

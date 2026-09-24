@@ -6,7 +6,7 @@ import { initializeBusinessSchema } from '../src/lib/business-schema';
 import { loadPGlite, type PGliteLike } from '../src/lib/fixtures/pglite';
 import { createPGliteClient, createPGliteSql } from '../src/lib/fixtures/pglite-sql';
 import { applyMigration, checkRuntimeColumns, EXPECTED_RUNTIME_COLUMNS, loadMigrations, planMigrations } from './db-migration-lib.mjs';
-import { main, parseProdArgs, plannedLedgerWrites, runProdCheck, runProdMigrate } from './db-prod.mjs';
+import { main, parseProdArgs, plannedLedgerWrites, runProdCheck, runProdMigrate, unadoptedRefusal } from './db-prod.mjs';
 import { runAuthMigration } from './migrate-auth-prod.mjs';
 
 type Migration = Awaited<ReturnType<typeof loadMigrations>>[number];
@@ -14,9 +14,9 @@ const FAKE_URL = 'postgresql://u:not-a-secret-marker@ep-fake-123.example.test/db
 
 describe('参数闸门', () => {
   it.each([
-    [[], /check 或 migrate/],
-    [['--database-url-env=PROD_URL'], /check 或 migrate/],
-    [['status', '--database-url-env=PROD_URL'], /check 或 migrate/],
+    [[], /check、migrate 或 baseline/],
+    [['--database-url-env=PROD_URL'], /check、migrate 或 baseline/],
+    [['status', '--database-url-env=PROD_URL'], /check、migrate 或 baseline/],
     [['check'], /--database-url-env/],
     [['migrate', '--apply'], /--database-url-env/],
     [['migrate', '--database-url-env='], /--database-url-env/],
@@ -132,6 +132,26 @@ describe('planMigrations（纯函数）', () => {
       { table: 'auth_schema_migrations', byVersion: 1, values: '(1),(2),(3),(4)', onConflict: 'DO NOTHING' },
     ]);
   }, 60_000);
+});
+
+describe('unadoptedRefusal（纯函数，41-BASELINE）', () => {
+  const report = (tables: string[], versions: { version: number }[] = []) =>
+    ({ columns: tables.map((table_name) => ({ table_name, column_name: 'id' })), versions });
+  it('空库放行（冷建库）；已登记（记账表有行）放行（交给记账比对）；只有业务表没有记账表 → 拒绝并指向 baseline', () => {
+    expect(unadoptedRefusal(report([]))).toEqual([]);
+    expect(unadoptedRefusal(report(['schema_migrations', 'users', 'books'], [{ version: 1 }]))).toEqual([]);
+    expect(unadoptedRefusal(report(['unrelated_table']))).toEqual([]);
+    const refused = unadoptedRefusal(report(['users', 'books']));
+    expect(refused).toHaveLength(1);
+    expect(refused[0]).toMatch(/没有 schema_migrations，却已有 2 张迁移管理的表（books, users）.*db:baseline:prod/);
+  });
+
+  it('复审 #1：记账表存在但 0 行 + 已有业务表 → 同样拒绝（修前放行，会把 0001 在在线表上重放）；只有空记账表的冷库仍放行', () => {
+    const refused = unadoptedRefusal(report(['schema_migrations', 'users', 'books']));
+    expect(refused).toHaveLength(1);
+    expect(refused[0]).toMatch(/schema_migrations 为空（0 行），却已有 2 张迁移管理的表（books, users）.*db:baseline:prod/);
+    expect(unadoptedRefusal(report(['schema_migrations']))).toEqual([]);
+  });
 });
 
 describe('checkRuntimeColumns（纯函数，N2）', () => {
