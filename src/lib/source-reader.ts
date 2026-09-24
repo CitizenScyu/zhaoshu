@@ -4,6 +4,7 @@ import { getReadingSources, type ReadingSource } from './shuyuan';
 import { fetchSourceText, sourceAbortable, SourceHttpError, SOURCE_CONNECT_TIMEOUT_MS, SOURCE_TIMEOUT_MS } from './source-fetch';
 import { SourcePolicyError, alternateSourceHost, validateSourceUrl } from './source-policy';
 import { sourceRevision } from './source-revision';
+import { orderByHostHealth } from './source-host-health';
 import { normalizeBookTitle } from './book-identity';
 import {
   engineFetchContent, engineFetchDetail, engineFetchToc, engineSearchBook, MAX_CONTENT_PAGES, type EngineSource,
@@ -455,9 +456,11 @@ export async function resolveSourceBook(
     deferNotFoundWarnings?: boolean;
   } = {},
 ): Promise<SourceCatalog> {
-  const sources = deprioritizeSource(
+  // 41-M1.3：suspect 站（连续传输层硬失败，见 source-host-health.ts）挪到队尾，含 builtin 的 book15 hint 抓取；
+  // 只降序不剔除，记忆为空时原样返回（顺序与改动前逐字节相同）。
+  const sources = orderByHostHealth(deprioritizeSource(
     options.sources ?? await getReadingSources(context.signal), options.preferAfterSourceUrl,
-  );
+  ));
   // 用户在前端候选列表里点选后的确认路径：URL 即用户决定，跳过书名/作者校验，
   // 只保留结构性防御（域名白名单在 validateSourceUrl、目录可解析、非 excludeBookUrl）。
   if (options.bookUrl) {
@@ -1100,7 +1103,8 @@ async function switchSourceChapter(
   // 同名异作、或者临时故障时,这本书仍可能在原站(重新上架/换了条目,当前 bookUrl 已失效)。旧实现把原站降到
   // 队尾而不是排除,这里保持同样的兜底。池里没有他源时,原源就是唯一的候选。
   const ordered = deprioritizeSource(sources, catalog.sourceUrl);
-  const others = ordered.filter((item) => item.url !== catalog.sourceUrl);
+  // 41-M1.3:suspect 站(连续传输层硬失败,见 source-host-health.ts)排到他源队尾 —— 只降序不剔除;记忆为空时原样返回。
+  const others = orderByHostHealth(ordered.filter((item) => item.url !== catalog.sourceUrl));
   const originals = ordered.filter((item) => item.url === catalog.sourceUrl);
   const queue = [...others, ...originals];
   const failures: Array<{ source: string; reason: string }> = [];

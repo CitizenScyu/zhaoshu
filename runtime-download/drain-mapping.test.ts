@@ -20,6 +20,7 @@ function fakeStorage(over: Partial<WorkerStorage> & { releaseClaim?: (l: Downloa
     heartbeat: async () => true,
     progress: async () => true,
     finish: async () => true,
+    defer: async () => '2026-09-24T03:15:00.000Z',
     reserveArtifactPath: async () => 1,
     registerArtifact: async () => true,
     ...over,

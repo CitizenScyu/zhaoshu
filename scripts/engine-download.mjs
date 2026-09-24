@@ -14,9 +14,28 @@ const atomic = (path, data) => {
 };
 const knownError = /^(identity_mismatch_or_no_candidate|empty_toc|empty_toc_page|pagination_cycle|toc_limit|unsupported_toc_rule|invalid_chapter|invalid_next_page|empty_content_page|content_page_limit|unsupported_content_rule|max_chapters|size_limit|toc_changed|missing_chapters|interrupted|budget_exhausted|operation_timeout|empty_content)$/;
 
+// 书源不可达（41-EXEC-SRCUNAVAIL）：搜索/详情/目录阶段的传输层失败（连接/请求超时、undici
+// `fetch failed`＝DNS/reset/TLS）、源站 5xx（含 Cloudflare 52x）、限速器熔断（由连续源站失败触发）
+// 与限速器每源日请求上限（DailyRequestBudgetError，UTC 换日即重置，属瞬时）归 code=2 source_unavailable，
+// 与 resolveSource code=2 同档：可重试、零发布。4xx、策略拒绝、身份不符与其余异常维持原分类；
+// 正文阶段逐章失败照旧收口为 missing_chapters。
+const SOURCE_STAGES = new Set(['search', 'detail', 'toc']);
+const UNREACHABLE_ERROR_NAMES = new Set(['ConnectTimeoutError', 'TimeoutError', 'CircuitOpenError', 'DailyRequestBudgetError']);
+export function isSourceUnavailableError(error) {
+  const status = error?.status;
+  if (typeof status === 'number') return status >= 500 && status <= 599;
+  if (UNREACHABLE_ERROR_NAMES.has(error?.name)) return true;
+  return error instanceof TypeError && /^fetch failed/i.test(error.message);
+}
+
 // 发布侧整本上限(内存约束,分卷 v2)：15 MiB → 64 MiB。阅读侧已无整本上限(按卷懒取)，
 // 这里只卡引擎与发布器把整本当字符串持有的内存峰值；二期按章流式写后解除。
 const MAX_BOOK_BYTES = 64 * 1024 * 1024;
+
+// 章节缓存的正文格式版本：写进检查点，参与续传判定。engineFetchContent 的输出格式每变一次，这个值加 1；
+// 41-HTMLFIX（@html 正文转纯文本）起为 2，旧检查点没有这个字段，视为 1。格式不同的检查点不续传、全量重抓：
+// 缓存里存的是旧格式正文，续传会把它原样拼进新书（整本 blob 不变 ⇒ 发布器按「同内容」保留旧清单，修复不生效）。
+export const ENGINE_CONTENT_FORMAT = 2;
 export function downloadOptions(args) {
   if (!args.source || !args.title?.trim() || !args.author?.trim()) throw new Error('download 需要 --source --title --author');
   const source = new URL(args.source.includes('://') ? args.source : `https://${args.source}`);
@@ -29,6 +48,10 @@ export function downloadOptions(args) {
   }
   return options;
 }
+
+// 身份判据的唯一实现：downloadBook 选候选与执行器扣额度前的身份预检（runtime-download/identity-precheck.ts）共用。
+// 书名、作者都非空，且 canonicalBookKey 全等。不剥「著」、不看 alias，严格程度与原判据逐字一致。
+export const identityMatches = (detail, args) => Boolean(detail.title && detail.author && canonicalBookKey(detail.title, detail.author) === canonicalBookKey(args.title, args.author));
 
 // One shared request slot covers search/detail/toc/content, redirects and alternate hosts.
 // hooks（T3 任务层接缝，全部可选、向后兼容）：
@@ -43,7 +66,9 @@ export async function downloadBook(m, args, resolveSource, transport = fetchSour
   const manifestPath = join(dir, 'manifest.json');
   let previous;
   try { previous = JSON.parse(readFileSync(manifestPath, 'utf8')); } catch { /* first attempt */ }
-  const manifest = { schemaVersion: 1, status: 'partial', title: args.title, author: args.author, source: args.source, chapters: previous?.chapters ?? [], errors: [], generated_at: new Date().toISOString() };
+  // 正文格式不同（缺字段按 1）的检查点当作不存在：不续传、不沿用章节记录，全量重抓（见 ENGINE_CONTENT_FORMAT）。
+  if ((previous?.contentFormat ?? 1) !== ENGINE_CONTENT_FORMAT) previous = undefined;
+  const manifest = { schemaVersion: 1, contentFormat: ENGINE_CONTENT_FORMAT, status: 'partial', title: args.title, author: args.author, source: args.source, chapters: previous?.chapters ?? [], errors: [], generated_at: new Date().toISOString() };
   const controller = new AbortController();
   const stop = () => controller.abort(new Error('interrupted'));
   const external = hooks.signal;
@@ -55,6 +80,7 @@ export async function downloadBook(m, args, resolveSource, transport = fetchSour
   let nextAt = 0;
   let bytes = 0;
   let failureCode = 1;
+  let stage = 'resolve';
   let lastCheckpoint = 0;
   // T3×P2 reconcile：两个节拍解耦——manifest 落盘按 5s 节流（P2-4 写放大修复），
   // onProgress 每次调用必发（T3 租约数据通道，每章上报；失权发现延迟不随写盘节流放大）。
@@ -93,21 +119,24 @@ export async function downloadBook(m, args, resolveSource, transport = fetchSour
     });
     manifest.sourceRevision = hash(JSON.stringify(source));
     const engine = builtin ? null : { url: source.url, name: source.name, searchUrl: source.searchUrl, compiled: m.compile.compileSource(source) };
+    stage = 'search';
     const candidates = await operation(async ctx => {
       if (!builtin) return m.api.engineSearchBook(engine, args.title, ctx);
       const page = await ctx.page(m.parser.sourceSearchUrl(source.searchUrl, args.title, source.url));
       return m.parser.parseSourceSearch(page.text, page.url, args.title).map(bookUrl => ({ bookUrl }));
     });
     let selected;
+    stage = 'detail';
     for (const candidate of candidates) {
       const detail = await operation(async ctx => {
         if (!builtin) return m.api.engineFetchDetail(engine, candidate.bookUrl, ctx);
         return m.parser.parseSourceIdentity((await ctx.page(candidate.bookUrl)).text);
       });
-      if (detail.title && detail.author && canonicalBookKey(detail.title, detail.author) === canonicalBookKey(args.title, args.author)) { selected = { ...candidate, ...detail }; break; }
+      if (identityMatches(detail, args)) { selected = { ...candidate, ...detail }; break; }
     }
     if (!selected) throw new Error('identity_mismatch_or_no_candidate');
     manifest.bookUrl = selected.bookUrl;
+    stage = 'toc';
     const toc = () => operation(async ctx => {
       if (!builtin) return (await m.api.engineFetchToc(engine, selected.tocUrl ?? selected.bookUrl, ctx, true)).chapters;
       const page = await ctx.page(selected.bookUrl);
@@ -121,6 +150,7 @@ export async function downloadBook(m, args, resolveSource, transport = fetchSour
     await checkpoint();
     if (chapters.length > args['max-chapters']) throw new Error('max_chapters');
     const resume = previous?.sourceRevision === manifest.sourceRevision && previous?.tocHash === manifest.tocHash && previous?.bookUrl === manifest.bookUrl;
+    stage = 'content';
     for (const chapter of manifest.chapters) {
       controller.signal.throwIfAborted();
       try {
@@ -148,6 +178,7 @@ export async function downloadBook(m, args, resolveSource, transport = fetchSour
       }
       await checkpoint(false);
     }
+    stage = 'toc';
     if (hash(JSON.stringify(await toc())) !== manifest.tocHash) throw new Error('toc_changed');
     if (manifest.chapters.some(c => c.status !== 'done')) throw new Error('missing_chapters');
     const txt = manifest.chapters.map(c => `${c.title}\n\n${readFileSync(join(dir, c.file), 'utf8')}\n\n`).join('');
@@ -155,6 +186,9 @@ export async function downloadBook(m, args, resolveSource, transport = fetchSour
     manifest.artifact = { file: 'book.txt', sha256: hash(txt), bytes: Buffer.byteLength(txt) };
     manifest.status = 'done';
   } catch (error) {
+    // 外部中断（停机/租约/总预算）时的请求失败是被中止，不是书源不可达。
+    if (SOURCE_STAGES.has(stage) && !controller.signal.aborted && isSourceUnavailableError(error)) failureCode = 2;
+    if (failureCode === 2) manifest.failure_stage = stage; // 固定枚举，不含上游细节
     manifest.errors.push(failureCode === 2 ? 'source_unavailable' : knownError.test(error.message) ? error.message : 'download_failed');
   } finally {
     clearTimeout(timer); process.off('SIGINT', stop); process.off('SIGTERM', stop);

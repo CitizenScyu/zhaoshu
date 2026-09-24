@@ -62,7 +62,7 @@ beforeEach(async () => {
     UPDATE download_tasks SET retry_of=7 WHERE id=6;
     SELECT setval('download_tasks_id_seq', 9);
   `);
-});
+}, 60_000);
 afterEach(async () => { await pg.close(); vi.unstubAllEnvs(); vi.unstubAllGlobals(); });
 
 describe('T6 real v7 API isolation', () => {

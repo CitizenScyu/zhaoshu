@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
-import { existsSync, readFileSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { bookFilename } from '../src/lib/book-file-name.ts';
 import { DOWNLOAD_TASK_STALE_MS } from '../src/lib/download-task-policy.ts';
@@ -106,4 +107,38 @@ if (!existsSync(workerRoot)) {
     );
   }
   console.log(`Cross-repository runtime anchor contract: ${anchors.length} anchors present in ${shellMainRel}`);
+}
+
+// 第六组：runtime 日预算退还 + 限速器错误名契约（41-EXEC-SRCUNAVAIL）。
+//   runtime-download/budget-refund.ts 与兄弟仓 runtime/lib/daily-budget.mjs 读写同一份状态文件；
+//   scripts/engine-download.mjs 的 isSourceUnavailableError 按 name 识别兄弟仓限速器的两类错误。
+//   任一侧改了文件格式或类名，这里在 push 时就红，而不是上线后静默漏退、或把瞬时错误落成终态。
+const shellBudgetPath = resolve(workerRoot, 'runtime/lib/daily-budget.mjs');
+const shellLimiterPath = resolve(workerRoot, 'runtime/lib/rate-limiter.mjs');
+if (!existsSync(shellBudgetPath) || !existsSync(shellLimiterPath)) {
+  console.log('○ 跳过跨仓 runtime 预算/限速器契约：本地无兄弟仓 runtime/lib');
+} else {
+  const { createDailyBudget } = await import(pathToFileURL(shellBudgetPath).href);
+  const { createBudgetRefund } = await import('../runtime-download/budget-refund.ts');
+  const dir = mkdtempSync(join(tmpdir(), 'budget-contract-'));
+  try {
+    const statePath = join(dir, 'daily-budget.json');
+    const now = () => Date.parse('2026-09-24T03:00:00.000Z');
+    const budget = createDailyBudget({ statePath, limit: 3, now });
+    const first = await budget.consume();
+    await budget.consume();
+    const refund = createBudgetRefund({ statePath, now });
+    assert.equal(await refund({ key: 'contract:1', date: first.date }), 'refunded');
+    assert.deepEqual(await budget.read(), { date: first.date, used: 1 });
+    assert.equal(await refund({ key: 'contract:1', date: first.date }), 'duplicate');
+    assert.deepEqual(await budget.read(), { date: first.date, used: 1 });
+    assert.equal((await budget.consume()).used, 2); // shell 在退还后的文件上照常续扣
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+  const limiter = await import(pathToFileURL(shellLimiterPath).href);
+  const { isSourceUnavailableError } = await import('./engine-download.mjs');
+  assert.ok(isSourceUnavailableError(new limiter.CircuitOpenError('book15.net', Date.now())), 'CircuitOpenError 必须归 source_unavailable');
+  assert.ok(isSourceUnavailableError(new limiter.DailyRequestBudgetError('book15.net', 20_000)), 'DailyRequestBudgetError 必须归 source_unavailable');
+  console.log('Cross-repository runtime budget/limiter contract: refund round-trip + 2 limiter error names passed');
 }

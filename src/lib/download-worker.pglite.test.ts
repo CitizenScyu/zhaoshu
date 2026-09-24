@@ -7,7 +7,7 @@ import {
   createArtifactSchema, createProductionSchema, upgradeToAuthV7,
 } from './fixtures/production-schema';
 import {
-  claimDownloadTask, finishDownloadTask, heartbeatDownloadTask, retryDownloadTask, updateDownloadTaskProgress,
+  claimDownloadTask, deferDownloadTask, finishDownloadTask, heartbeatDownloadTask, retryDownloadTask, updateDownloadTaskProgress,
 } from './download-task-queue';
 import { reserveArtifactPath } from './artifact-registry';
 import {
@@ -80,6 +80,7 @@ maybe('T3 worker 任务层：租约、单写者、五阶段对账（PGlite + moc
     heartbeat: lease => heartbeatDownloadTask(sql as never, lease),
     progress: (lease, update) => updateDownloadTaskProgress(sql as never, lease, update),
     finish: (lease, result) => finishDownloadTask(sql as never, lease, result),
+    defer: (lease, input) => deferDownloadTask(sql as never, lease, input),
     reserveArtifactPath: input => reserveArtifactPath(sql as never, {
       labeledBookId: input.labeledBookId, identityKey: input.identityKey,
       repositoryId: input.repositoryId, branch: input.branch, canonicalPath: input.canonicalPath,

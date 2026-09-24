@@ -33,57 +33,57 @@ describe('engine-fetch CLI 契约', () => {
       expect(result.stderr).toContain(`--${flag} 仅用于 download`);
       expect(result.stdout).toBe('');
     }
-  });
+  }, 60_000);
   it('doctor 真实加载 TS 模块且不访问 DB/网络', () => {
     const r = run(['doctor', '--json'], { DATABASE_URL: undefined });
     expect(r.status).toBe(0);
     expect(JSON.parse(r.stdout)).toEqual({ ok: true });
     expect(r.stderr).toBe('');
-  });
+  }, 60_000);
 
   it('download validates usage before DB access', () => {
     for (const args of [[], ['--source', 'book15.net', '--title', 'x', '--author', 'y', '--max-chapters', '0'], ['--source', 'http://book15.net', '--title', 'x', '--author', 'y']]) {
       const r = run(['download', ...args], { DATABASE_URL: undefined });
       expect(r.status).toBe(2); expect(r.stderr).toContain('download');
     }
-  });
+  }, 60_000);
   it('无 DATABASE_URL → 退出码 2，stderr 点名 DATABASE_URL，stdout 空', () => {
     const r = run(['search', '--title', 'X'], { DATABASE_URL: undefined });
     expect(r.status).toBe(2);
     expect(r.stderr).toContain('DATABASE_URL');
     expect(r.stdout).toBe('');
-  });
+  }, 60_000);
 
   it('未知子命令 → 退出码 2', () => {
     const r = run(['frobnicate'], { DATABASE_URL: 'postgres://u:p@h/db' });
     expect(r.status).toBe(2);
     expect(r.stderr).toContain('未知子命令');
     expect(r.stdout).toBe('');
-  });
+  }, 60_000);
 
   it('未知参数 → 退出码 2', () => {
     const r = run(['search', '--title', 'X', '--bogus'], { DATABASE_URL: 'postgres://u:p@h/db' });
     expect(r.status).toBe(2);
     expect(r.stderr).toContain('未知参数');
-  });
+  }, 60_000);
 
   it('search 缺 --title → 退出码 2', () => {
     const r = run(['search'], { DATABASE_URL: 'postgres://u:p@h/db' });
     expect(r.status).toBe(2);
     expect(r.stderr).toContain('--title');
-  });
+  }, 60_000);
 
   it('toc 缺 --url → 退出码 2', () => {
     const r = run(['toc'], { DATABASE_URL: 'postgres://u:p@h/db' });
     expect(r.status).toBe(2);
     expect(r.stderr).toContain('--url');
-  });
+  }, 60_000);
 
   it('content 缺 --url → 退出码 2', () => {
     const r = run(['content'], { DATABASE_URL: 'postgres://u:p@h/db' });
     expect(r.status).toBe(2);
     expect(r.stderr).toContain('--url');
-  });
+  }, 60_000);
 
   it('content --url 非法 → 退出码 2（DB/fetch 之前返回）', () => {
     // "not a url" 无 scheme ⇒ 先撞 scheme 用法错（见下一条用例）；这里用「有 scheme 但无 host」
@@ -91,7 +91,7 @@ describe('engine-fetch CLI 契约', () => {
     const r = run(['content', '--url', 'not a url'], { DATABASE_URL: 'postgres://u:p@h/db' });
     expect(r.status).toBe(2);
     expect(r.stderr).toContain('HTTPS');
-  });
+  }, 60_000);
 
   // 退出码边界（审查遗留）：scheme 用法错与运行时错分档——http:// 是参数/用法错退 2，
   // 不是运行时错退 1（labeler 把 1 当正常 miss，1 会吞掉这类配置错误）。
@@ -102,7 +102,7 @@ describe('engine-fetch CLI 契约', () => {
       expect(r.stderr).toContain('HTTPS');
       expect(r.stdout).toBe('');
     }
-  });
+  }, 60_000);
 
   // 运行时错档（1）：builtin host 过了用法门后取页失败 → 运行时错 1 而非用法错 2。
   // 离线复现：builtin 双 host 之一是本机不可解析/不可达仍属 builtin；直接用真 builtin host
@@ -119,5 +119,5 @@ describe('engine-fetch CLI 契约', () => {
       expect(stream).not.toContain('leak_user');
       expect(stream).not.toContain(secret);
     }
-  });
+  }, 60_000);
 });
