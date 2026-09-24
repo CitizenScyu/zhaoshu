@@ -24,7 +24,7 @@ export type FanoutRow = FanoutCandidate & (
 
 /**
  * loading:取候选中;disabled:扇出未开(退回旧面板);running/done:扫描中/结束;
- * rate_limited:429 停发(retryAfter 秒);unavailable:503 限流计数不可用;error:候选列表拿不到或鉴权失败。
+ * rate_limited:429 停发(retryAfter 秒);unavailable:单源 probe 503(限流计数不可用)停发;error:候选列表拿不到或鉴权失败。
  */
 export type FanoutPhase = 'loading' | 'disabled' | 'running' | 'done' | 'rate_limited' | 'unavailable' | 'error';
 
@@ -157,7 +157,7 @@ export function useSourceFanout({ apiFetch, title, author, currentSource, cache 
     if (signal.aborted) return;
     // 404 SOURCE_FANOUT_DISABLED(开关关)或旧部署没有这条路由:都退回旧面板,不当错误提示。
     if (res.status === 404) { set(() => ({ ...INITIAL, phase: 'disabled' })); return; }
-    if (res.status === 503) { set(() => ({ ...INITIAL, phase: 'unavailable', message: '换源探测暂时不可用,请稍后再试。' })); return; }
+    // 候选列表不计限流(路由只在带 source 的 probe 上查限流),不会有 503 限流不可用;网关/平台的 5xx 一律走 error。
     const candidates = res.ok ? parseCandidates(data) : null;
     if (!candidates) { set(() => ({ ...INITIAL, phase: 'error', message: errorText(data, '换源候选加载失败,请重试。') })); return; }
 

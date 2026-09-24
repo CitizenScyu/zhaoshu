@@ -397,6 +397,17 @@ describe('换源面板扇出:开关与错误码', () => {
     expect(row('源6号').dataset.probeStatus).toBe('skipped');
   });
 
+  // 41-srcurl:候选列表路由不查限流,产不出 503 限流不可用(panelrev41 M14:该分支不可达,已删)。
+  // 网关/平台给的 503(HTML 或无 error 字段)与其它 5xx 同样走 error:提示可重试、零 probe、不退回旧面板。
+  it('候选列表 5xx(含网关 503)⇒ 候选加载失败提示,零 probe,不退回旧面板', async () => {
+    const apiFetch = fanoutFetch(new Response('<html>Service Unavailable</html>', { status: 503 }), () => { throw new Error('不该 probe'); });
+    await openPanel(apiFetch);
+    await waitFor(() => expect(squeeze(screen.getByRole('alert').textContent ?? '')).toContain(squeeze('换源候选加载失败,请重试。')));
+    expect(probeCalls(apiFetch)).toEqual([]);
+    expect(apiFetch.mock.calls.some((call) => String(call[0]).startsWith('/api/read/source/alternates'))).toBe(false);
+    expect((screen.getByRole('button', { name: '重新检测' }) as HTMLButtonElement).disabled).toBe(false);
+  });
+
   it('504(准备阶段超时)与 200 {status:timeout}(probe 超时)分别渲染,且都不停止扇出', async () => {
     const sources = [candidate('准备超时源', 'https://prep.example'), candidate('探测超时源', 'https://probe.example'), candidate('正常源', 'https://fine.example')];
     const apiFetch = fanoutFetch(sources, (url) => {
