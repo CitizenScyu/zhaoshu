@@ -11,9 +11,14 @@
 //
 // 心跳:设 HEARTBEAT_FILE 时,运行期每 25s 追加一行时间戳(给外部看门狗区分「在跑」与「卡死」)。
 // 看门狗:设 WATCHDOG_MS 时,超过该毫秒仍未结束即向 stderr 告警并以码 2 退出(oneshot 会记为 failed)。
+// 配额闸(41-q402fix):Neon 402 失败时 STATUS_FILE 记 db-quota-exceeded + retryAfter(默认 30 分钟,
+// env DB_QUOTA_BACKOFF_MS);冷却期内再启动不碰库、保留状态文件、退 0;冷却后首次成功在 cron_health 补记。
 import { appendFileSync, readFileSync, writeFileSync } from 'node:fs';
+import { getSql } from '@/lib/db';
+import { dbQuotaBackoffMs, isDbQuotaError, recordDbQuotaSeen } from '@/lib/db-quota';
 import { refreshShuyuan } from '@/lib/shuyuan';
 import { dryRunRefresh } from './dry-run';
+import { buildFailureStatus, quotaGate } from './quota-gate';
 
 const dryRun = process.argv.includes('--dry-run');
 
@@ -27,7 +32,17 @@ function startHeartbeat(): () => void {
   return () => { clearInterval(timer); };
 }
 
+function readStatus(statusFile: string | undefined): string | null {
+  if (!statusFile) return null;
+  try { return readFileSync(statusFile, 'utf8'); } catch { return null; }
+}
+
 async function main() {
+  const gate = quotaGate(readStatus(process.env.STATUS_FILE), Date.now());
+  if (gate.skip) {
+    console.log(JSON.stringify({ mode: 'skipped', reason: 'db_quota_backoff', retryAt: gate.retryAt }));
+    return;
+  }
   const stopHeartbeat = startHeartbeat();
   // 运行开始即清除上一次的失败标记(STATUS_FILE 由调用方设定;刷新成功则保持清除)。
   if (process.env.STATUS_FILE) { try { writeFileSync(process.env.STATUS_FILE, '', 'utf8'); } catch { /* 忽略 */ } }
@@ -52,6 +67,12 @@ async function main() {
       total: stats.total, active: stats.active, unprobed: stats.unprobed,
       reachable: stats.reachable, failed: stats.failed,
     }));
+    // 上次以配额错误收场、这次写库成功:补记发现时刻(失败不影响本次刷新结果)。
+    if (gate.quotaSeenAt) {
+      await recordDbQuotaSeen(getSql(), gate.quotaSeenAt).catch(() => {
+        console.error(JSON.stringify({ event: 'db_quota_record_failed', component: 'shuyuan-refresh' }));
+      });
+    }
   } finally {
     if (watchdog) clearTimeout(watchdog);
     stopHeartbeat();
@@ -59,35 +80,34 @@ async function main() {
 }
 
 // 失败标记:上游/写库失败时写 STATUS_FILE,让外部(或下一任)无需读 journalctl 就能看到
-// 「刷新停摆及其原因」。只写原因与两个单调计数,不写任何连接串/正文。
-function writeFailureStatus(statusFile: string, message: string): void {
-  const now = Date.now();
-  let consecutive = 1;
-  let firstFailedAt = new Date(now).toISOString();
-  try {
-    const prev = JSON.parse(readFileSync(statusFile, 'utf8')) as { consecutive?: number; firstFailedAt?: string };
-    if (Number.isSafeInteger(prev.consecutive) && (prev.consecutive ?? 0) > 0) {
-      consecutive = (prev.consecutive ?? 0) + 1;
-      firstFailedAt = prev.firstFailedAt ?? firstFailedAt;
-    }
-  } catch { /* 首次失败或文件损坏:从 1 起计 */ }
+// 「刷新停摆及其原因」。只写原因与两个单调计数,不写任何连接串/正文;配额失败只写原因码 + retryAfter
+// (计数与状态形态见 quota-gate.ts buildFailureStatus)。
+function writeFailureStatus(statusFile: string, message: string, quotaBackoffMs: number | null): void {
   const safeMessage = message
     .replace(/\S*:\/\/\S*/g, '[redacted-url]')
     .replace(/\S+@\S+/g, '[redacted]')
     .slice(0, 300);
   try {
-    writeFileSync(statusFile, JSON.stringify({
-      state: 'refresh-failed', consecutive, firstFailedAt, lastFailedAt: new Date(now).toISOString(), reason: safeMessage,
-    }, null, 2) + '\n', 'utf8');
+    const status = buildFailureStatus(readStatus(statusFile), safeMessage, Date.now(), quotaBackoffMs);
+    writeFileSync(statusFile, JSON.stringify(status, null, 2) + '\n', 'utf8');
   } catch { /* 状态文件写失败不掩盖真正的失败 */ }
 }
 
 main().then(
   () => process.exit(0),
   (error) => {
-    const message = error instanceof Error ? error.message : String(error);
+    const quota = isDbQuotaError(error);
+    // 配额失败不回显驱动原文(带 Neon 响应体),另打一行结构化日志。
+    const message = quota ? 'database quota exceeded' : error instanceof Error ? error.message : String(error);
     console.error(`shuyuan refresh runner failed: ${message}`);
-    if (process.env.STATUS_FILE) writeFailureStatus(process.env.STATUS_FILE, message);
+    const backoffMs = quota ? dbQuotaBackoffMs() : null;
+    if (backoffMs !== null) {
+      console.error(JSON.stringify({
+        event: 'db_quota_exceeded', component: 'shuyuan-refresh', backoffMs,
+        retryAt: new Date(Date.now() + backoffMs).toISOString(),
+      }));
+    }
+    if (process.env.STATUS_FILE) writeFailureStatus(process.env.STATUS_FILE, message, backoffMs);
     if (process.env.DEBUG_STACK && error instanceof Error && error.stack) console.error(error.stack);
     process.exit(1);
   },

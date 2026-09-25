@@ -16,7 +16,7 @@ export const DB_QUOTA_ERROR_CODE = 'DB_QUOTA_EXCEEDED';
 export const DEFAULT_DB_QUOTA_BACKOFF_MS = 30 * 60_000;
 const MIN_BACKOFF_MS = 60_000;
 // 上限 4h：T8 执行器在冷却期内睡在 runOnce 里，必须短于 drain 单任务看门狗（340 分钟）。
-const MAX_BACKOFF_MS = 4 * 3_600_000;
+export const MAX_DB_QUOTA_BACKOFF_MS = 4 * 3_600_000;
 
 /** cron_health 里记「最近一次发现配额错误」的行名（last_success_at 列存的是发现时刻，不是成功时刻）。 */
 export const DB_QUOTA_HEALTH_ROW = 'db_quota_exceeded';
@@ -55,7 +55,7 @@ export function dbQuotaBackoffMs(env: Record<string, string | undefined> = proce
   if (raw === undefined || !/^\d+$/.test(raw.trim())) return DEFAULT_DB_QUOTA_BACKOFF_MS;
   const value = Number(raw.trim());
   if (!Number.isSafeInteger(value)) return DEFAULT_DB_QUOTA_BACKOFF_MS;
-  return Math.min(MAX_BACKOFF_MS, Math.max(MIN_BACKOFF_MS, value));
+  return Math.min(MAX_DB_QUOTA_BACKOFF_MS, Math.max(MIN_BACKOFF_MS, value));
 }
 
 export interface DbQuotaStatus {
