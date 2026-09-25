@@ -11,20 +11,37 @@ import { requireUserId } from './user-data';
 vi.setConfig({ testTimeout: 30_000, hookTimeout: 30_000 });
 
 describe('迁移入口与冷启动边界', () => {
-  it.each([3, 4, 6, null])('版本 %s 不能被普通请求自动修复', async (version) => {
-    const sql = vi.fn().mockResolvedValue([{ version }]);
+  const ledger = (versions: number[]) => vi.fn().mockResolvedValue(versions.map((version) => ({ version })));
+  // 闸门改为「所需版本 1..7 必须全部在册」（记账连续性），不再只看 max(version)：
+  // 账本中间缺号也拦，避免冷建库缺 v5/v6 DDL 却全站 200（drrev 变异3 / D6）。
+  it.each([
+    ['账本为空', [] as number[]],
+    ['只到 v4（缺 5-7）', [1, 2, 3, 4]],
+    ['中间缺 v6', [1, 2, 3, 4, 5, 7]],
+    ['只有 max=7（缺 1-6）', [7]],
+  ])('%s：普通请求不能自动修复', async (_label, versions) => {
+    const sql = ledger(versions);
     await expect(assertAuthSchema(sql as never)).rejects.toBeInstanceOf(AuthSchemaRequiredError);
-    expect(sql).toHaveBeenCalledOnce(); expect(sql.mock.calls[0][0].join('')).toMatch(/^SELECT max\(version\)/);
-  });
-  // MS-24a：闸门只拦「库落后于代码」。库版本新于代码（DDL 已跑、旧实例还在的灰度/回滚
-  // 窗口）必须放行，否则「先迁移后部署」这个通常安全的顺序也会全站 503。
-  it.each([7, 8, 99])('库版本 %s ≥ 代码常量时放行（库新代码旧不再 503）', async (version) => {
-    const sql = vi.fn().mockResolvedValue([{ version }]);
-    await expect(assertAuthSchema(sql as never)).resolves.toBeUndefined();
     expect(sql).toHaveBeenCalledOnce();
+    expect(sql.mock.calls[0][0].join('')).toMatch(/^SELECT version/);
   });
-  it('v7 校验只读；连接故障不会被伪装成缺迁移', async () => {
-    const sql = vi.fn().mockResolvedValue([{ version: 7 }]);
+  it('缺号错误报出具体缺哪些版本', async () => {
+    await expect(assertAuthSchema(ledger([1, 2, 3, 4, 5, 7]) as never))
+      .rejects.toThrow(/missing versions: 6/);
+  });
+  it('所需版本 1..7 齐全时放行', async () => {
+    await expect(assertAuthSchema(ledger([1, 2, 3, 4, 5, 6, 7]) as never)).resolves.toBeUndefined();
+  });
+  // MS-24a：库版本新于代码（DDL 已跑、旧实例还在的灰度/回滚窗口）必须放行——只要 1..7 都在，
+  // 额外的更高版本（8/99）不影响；否则「先迁移后部署」这个通常安全的顺序也会全站 503。
+  it.each([
+    ['另有 v8', [1, 2, 3, 4, 5, 6, 7, 8]],
+    ['另有 v8、v99', [1, 2, 3, 4, 5, 6, 7, 8, 99]],
+  ])('1..7 齐全且 %s 时放行（库新代码旧不 503）', async (_label, versions) => {
+    await expect(assertAuthSchema(ledger(versions) as never)).resolves.toBeUndefined();
+  });
+  it('校验只读；连接故障不会被伪装成缺迁移', async () => {
+    const sql = ledger([1, 2, 3, 4, 5, 6, 7]);
     await assertAuthSchema(sql as never);
     const error = { code: '08006' }; sql.mockRejectedValueOnce(error);
     await expect(assertAuthSchema(sql as never)).rejects.toBe(error);

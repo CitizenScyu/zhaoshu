@@ -374,19 +374,31 @@ export async function initializeAuthSchema(sql: Sql): Promise<void> {
 
 export class AuthSchemaRequiredError extends Error {
   readonly code = 'AUTH_SCHEMA_MIGRATION_REQUIRED';
-  constructor() { super('personal schema migration is required'); }
+  readonly missingVersions: readonly number[];
+  constructor(missingVersions: readonly number[] = []) {
+    super(missingVersions.length
+      ? `personal schema migration is required (missing versions: ${missingVersions.join(', ')})`
+      : 'personal schema migration is required');
+    this.missingVersions = missingVersions;
+  }
 }
 
 // 普通请求只读取版本；任何迁移、删约束或默认值变更都由专用脚本执行。
 export async function assertAuthSchema(sql: Sql): Promise<void> {
   let rows: { version: number | null }[];
-  try { rows = await sql`SELECT max(version)::int AS version FROM auth_schema_migrations` as { version: number | null }[]; }
+  try { rows = await sql`SELECT version::int AS version FROM auth_schema_migrations` as { version: number | null }[]; }
   catch (error) {
     if (error && typeof error === 'object' && 'code' in error && error.code === '42P01') throw new AuthSchemaRequiredError();
     throw error;
   }
-  // 只拦「库落后于代码」：库版本新于代码（灰度/回滚窗口里 DDL 已跑、旧实例还在）不再 503。
-  // 前向保护不靠这里——initializeAuthSchema 的迁移器在库版本 > 7 时 RAISE EXCEPTION
-  // （见上方 DO 块），运行时闸门只读版本、不执行迁移。
-  if ((rows[0]?.version ?? 0) < AUTH_SCHEMA_VERSION) throw new AuthSchemaRequiredError();
+  // 记账连续性判据：所需版本 1..AUTH_SCHEMA_VERSION 必须**全部在册**，不再只看 max(version)。
+  // 账本中间缺号（迁移器漏插某版、或人为删了某版）此前因 max 达标而被放行，冷建库可能缺
+  // v5/v6 的 DDL 却全站 200；现在缺号即 503，并在错误信息里报出缺哪些版本。判据与
+  // migrate-auth-prod.mjs 的 pending 计算同款（1..N 逐版查在册），运行时闸门只读不迁移。
+  // 只拦「库落后于代码」——额外的更高版本（灰度/回滚窗口里 DDL 已跑、旧实例还在）不在必需
+  // 集里，仍放行不 503；前向保护由 initializeAuthSchema 在库版本 > 7 时 RAISE EXCEPTION 负责。
+  const present = new Set(rows.map((row) => row.version));
+  const missing: number[] = [];
+  for (let version = 1; version <= AUTH_SCHEMA_VERSION; version += 1) if (!present.has(version)) missing.push(version);
+  if (missing.length) throw new AuthSchemaRequiredError(missing);
 }
