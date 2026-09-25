@@ -15,6 +15,7 @@ const catalog = (id: string) => ({
   chapters: Array.from({ length: 1500 }, (_, i) => ({ title: `第${i + 1}章 标题`, url: `https://book15.net/book/${id}/${i}.html` })),
 });
 const rows = new Map<string, unknown>();
+const expiresAt = new Map<string, number>(); // 库里 expires_at（ms）；缺省视为远未过期
 const selects = () => execute.mock.calls.filter(([query]) => query.text.includes('FROM source_read_catalogs')).length;
 const ctx = () => new SourceRequestContext(new AbortController().signal, 4);
 
@@ -22,11 +23,14 @@ beforeEach(() => {
   vi.stubEnv('SHUYUAN_READ_CACHE_TTL_MS', '300000');
   clearSourceCatalogCache();
   rows.clear();
+  expiresAt.clear();
   rows.set('v1', catalog('v1'));
   execute.mockReset().mockImplementation(async (query) => {
     if (query.text.includes('FROM source_read_catalogs')) {
-      const payload = rows.get(query.values[0] as string);
-      return payload ? [{ payload }] : [];
+      const id = query.values[0] as string;
+      const payload = rows.get(id);
+      const expires_ms = expiresAt.get(id) ?? Date.now() + 86_400_000;
+      return payload && expires_ms > Date.now() ? [{ payload, expires_ms }] : [];
     }
     return [];
   });
@@ -71,5 +75,18 @@ describe('目录会话读缓存', () => {
     await currentSourceHint('v1', ctx());
     await currentSourceHint('v1', ctx());
     expect(selects()).toBe(4);
+  });
+
+  it('41-xferfix N1：已缓存的会话在库里 expires_at 之后不再命中（TTL 未到也重读，过期即无目录）', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(new Date('2026-09-25T00:00:00Z'));
+    expiresAt.set('v1', Date.now() + 60_000);
+    expect((await currentSourceHint('v1', ctx())).catalog).toBeTruthy();
+    vi.setSystemTime(Date.now() + 59_999);
+    expect((await currentSourceHint('v1', ctx())).catalog).toBeTruthy();
+    expect(selects()).toBe(1);
+    vi.setSystemTime(Date.now() + 2);
+    expect(await currentSourceHint('v1', ctx())).toEqual({});
+    expect(selects()).toBe(2);
   });
 });

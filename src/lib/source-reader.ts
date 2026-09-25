@@ -976,7 +976,7 @@ export async function saveSourceCatalog(catalog: SourceCatalog, signal: AbortSig
 // xfer41：目录会话读缓存。每读一章（loadSourceCatalog）、每次换源提示（currentSourceHint）都要取整本目录
 // payload（千章级书 ≈200 KB+），是在线阅读的第二个读库大户。目录按 version 不可变（上面 INSERT 冲突只延长
 // expires_at），缓存它没有一致性问题；只缓存命中行（过期/缺失照常 409/降级）。TTL 与池合成读缓存同一旋钮
-// （SHUYUAN_READ_CACHE_TTL_MS，0 = 关，单测默认 0）；已缓存的会话最多比库里晚一个 TTL 过期，内容不变，无害。
+// （SHUYUAN_READ_CACHE_TTL_MS，0 = 关，单测默认 0）；缓存到期取 min(TTL, 库里 expires_at)，过期会话不会多活。
 // 总字节有界（按 JSON 长度计），超限按插入序淘汰。
 const MAX_CATALOG_CACHE_BYTES = 16 * 1024 * 1024;
 const catalogCache = new Map<string, { payload: SourceCatalog; expires: number; bytes: number }>();
@@ -986,15 +986,19 @@ async function readCatalogPayload(session: string, signal: AbortSignal): Promise
   const ttl = shuyuanReadCacheTtlMs();
   const hit = catalogCache.get(session);
   if (hit && hit.expires > Date.now()) return hit.payload;
-  const [row] = await queryRows<{ payload: SourceCatalog }>(getSql()`
-    SELECT payload FROM source_read_catalogs WHERE id = ${session} AND expires_at > now()`, signal);
+  const [row] = await queryRows<{ payload: SourceCatalog; expires_ms: number | null }>(getSql()`
+    SELECT payload, (extract(epoch FROM expires_at) * 1000)::float8 AS expires_ms
+    FROM source_read_catalogs WHERE id = ${session} AND expires_at > now()`, signal);
   if (!row || ttl <= 0) return row?.payload ?? null;
   const old = catalogCache.get(session);
   if (old) catalogCacheBytes -= old.bytes;
   catalogCache.delete(session);
   const bytes = JSON.stringify(row.payload).length;
   if (bytes > MAX_CATALOG_CACHE_BYTES) return row.payload;
-  catalogCache.set(session, { payload: row.payload, expires: Date.now() + ttl, bytes });
+  // 41-xferfix N1：缓存命中不得越过库里的 expires_at（过期会话照常 409，不再晚一个 TTL）。
+  const dbExpires = Number(row.expires_ms);
+  const expires = Math.min(Date.now() + ttl, Number.isFinite(dbExpires) ? dbExpires : Infinity);
+  catalogCache.set(session, { payload: row.payload, expires, bytes });
   catalogCacheBytes += bytes;
   while (catalogCacheBytes > MAX_CATALOG_CACHE_BYTES) {
     const oldest = catalogCache.keys().next().value!;
