@@ -11,7 +11,7 @@ import type { RawSource } from './compile-smoke';
 import {
   createHtmlScope, createJsonScope, evaluateField, evaluateFieldList, evaluateFieldNodes, insideNode,
 } from './evaluate';
-import { evalJsonPathList, parseJsonPath } from './jsonpath';
+import { evalJsonPath, evalJsonPathList, parseJsonPath } from './jsonpath';
 import { parseFieldRule } from './parse';
 
 // jsonbl41：JSON 搜索页 bookList 取不出候选（准入 no_result、真站 200+JSON 含书）。
@@ -147,11 +147,44 @@ describe('根因 3：字面量里的 `{$.x}` 内嵌规则原样输出（legado i
     expect(evaluateField(parseFieldRule(rule), item)).toBe('http://sma.yueyouxs.com/b/9527.html');
   });
 
-  it('内嵌规则求值为空时不替换；全部为空则字面量原样（保守：不改无内嵌规则的字面量）', () => {
+  // jsoninner41：一处都没替换成功时 legado innerRule 返回 ""（RuleAnalyzer.kt:330），调用方再对整条规则
+  // ctx.read（AnalyzeByJSonPath.kt:41-54）——URL 字面量读不到，异常被吞 ⇒ 空串；URL 字段再由
+  // AnalyzeRule.kt:319-324 / BookChapterList.kt:238 回退 baseUrl。故不回退原文（原文是带 {$.nope} 的垃圾 URL）。
+  it('内嵌规则求值为空时不替换；全部为空 ⇒ 空串（对齐 legado，不回退原文）；无内嵌规则的字面量不变', () => {
     const item = createJsonScope({ id: 3 }, 'https://api.example.com/');
     expect(evaluateField(parseFieldRule('https://h.example/{$.id}/{$.nope}.html'), item)).toBe('https://h.example/3/{$.nope}.html');
-    expect(evaluateField(parseFieldRule('https://h.example/{$.nope}.html'), item)).toBe('https://h.example/{$.nope}.html');
+    expect(evaluateField(parseFieldRule('https://h.example/{$.nope}.html'), item)).toBe('');
     expect(evaluateField(parseFieldRule('https://h.example/plain.html'), item)).toBe('https://h.example/plain.html');
+  });
+
+  it('全部失败得空后 `||` 取下一支（原文回退会让垃圾 URL 抢先胜出）', () => {
+    const item = createJsonScope({ id: 3 }, 'https://api.example.com/');
+    expect(evaluateField(parseFieldRule('https://h.example/{$.nope}.html||https://h.example/{$.id}.html', { orEnabled: true }), item))
+      .toBe('https://h.example/3.html');
+  });
+
+  it('chapterUrl 全部内嵌规则失败 ⇒ 章节 url 回退目录页 URL（legado BookChapterList.kt:238 baseUrl）', async () => {
+    const searchUrl = 'https://book15.net/api/search?q={{key}}';
+    const rules = {
+      ruleSearch: { bookList: '$.list', name: '$.n', bookUrl: 'https://book15.net/b/{$.nope}' },
+      ruleToc: { chapterList: '$.list[*]', chapterName: '$.title', chapterUrl: 'https://book15.net/api/chap/{$.nope}.html' },
+      ruleContent: { content: '$.content' },
+    };
+    const source: EngineSource = {
+      url: 'https://book15.net', name: 'JSON 源', searchUrl,
+      compiled: compileSource({ url: 'https://book15.net', searchUrl, rules }),
+    };
+    const tocUrl = 'https://book15.net/api/toc/1';
+    const context = {
+      page: async (url: string) => {
+        if (url === tocUrl) return { url, text: JSON.stringify({ list: [{ title: '第一章' }] }) };
+        if (url.startsWith('https://book15.net/api/search')) return { url, text: JSON.stringify({ list: [{ n: '书' }] }) };
+        throw new Error('Unexpected engine request: ' + url);
+      },
+    } as unknown as SourceRequestContext;
+    expect((await engineFetchToc(source, tocUrl, context)).chapters).toEqual([{ title: '第一章', url: tocUrl }]);
+    // 搜索 bookUrl 全失败 ⇒ 空 ⇒ 本引擎丢弃该条（不请求带 {$.nope} 的垃圾 URL）
+    expect(await engineSearchBook(source, '书', context)).toEqual([]);
   });
 
   // jsonblfix41：复审把「内嵌规则求值为空时继续扫描后续 {$.」列为阻断，建议改 break。
@@ -170,10 +203,9 @@ describe('根因 3：字面量里的 `{$.x}` 内嵌规则原样输出（legado i
 
   it('失败项 `}` 之后余量不足 3 字符时，紧随的 {$. 被跳过（legado 的 inner.length 步进）', () => {
     const item = createJsonScope({ 存在: 5 }, 'https://api.example.com/');
-    // 第二个 {$. 紧贴失败项 `}`（余量 0 < 3）⇒ 被跳过，一处都没替换成功 ⇒ 回退原文。
-    // 改前「失败后从失败项起点 +3 继续扫」会命中它并替换成 5，与本断言相反。
-    expect(evaluateField(parseFieldRule('https://h.example/{$.不存在}{$.存在}.html'), item))
-      .toBe('https://h.example/{$.不存在}{$.存在}.html');
+    // 第二个 {$. 紧贴失败项 `}`（余量 0 < 3）⇒ 被跳过，一处都没替换成功 ⇒ 空串（legado innerRule 返回 ""，
+    // 整条规则 ctx.read 读不到被吞）。改前「失败后从失败项起点 +3 继续扫」会命中它并替换成 5。
+    expect(evaluateField(parseFieldRule('https://h.example/{$.不存在}{$.存在}.html'), item)).toBe('');
   });
 });
 
@@ -228,5 +260,55 @@ describe('列表语义细节（Jayway getList）与 HTML 零变化', () => {
       expect(a).toBe(evaluateField(parseFieldRule('a@href'), insideNode(scope, nodes[i])));
     }
     expect(viaList.map((inner) => evaluateField(parseFieldRule('a@text'), inner))).toEqual(['一', '二']);
+  });
+});
+
+// jsoninner41：内嵌规则扫描与 legado 逐字对齐（jer-chao@c2c4775）。
+// RuleAnalyzer.chompCodeBalanced（:91-126）配平时跳过引号内字符、`[]` 深度非 0 时不数 `{}`、
+// `\` 转义吞下一个字符；innerRule 的 fr 是 AnalyzeByJSonPath.getString（:41），会递归替换内层 {$.。
+describe('内嵌 {$.x} 规则：配平/递归/Jayway 形态对齐 legado', () => {
+  const data = { ok: 5, a: { '}': 7 } };
+  const scope = () => createJsonScope(data, 'https://api.example.com/');
+
+  it('`]` 使 `[]` 深度为负时 `}` 不计数 ⇒ 首个 {$. 不配平，按普通字串跳过', () => {
+    expect(evaluateField(parseFieldRule('{$.a]}{$.ok}'), scope())).toBe('{$.a]}5');
+  });
+
+  it('引号内的 `}` 不计数 ⇒ `{$.a[\'}\']}` 整体是一条内嵌规则', () => {
+    expect(evaluateField(parseFieldRule("{$.a['}']}{$.ok}"), scope())).toBe('75');
+    expect(evaluateField(parseFieldRule('{$.a["}"]}{$.ok}'), scope())).toBe('75');
+  });
+
+  it('`\\` 转义吞下一个字符（含引号）；末尾转义 ⇒ 不配平', () => {
+    expect(evaluateField(parseFieldRule('{$.a\\}}xyz{$.ok}'), scope())).toBe('{$.a\\}}xyz5');
+    // 被转义的 `'` 不开引号 ⇒ 其后的 `}` 照常闭合
+    expect(evaluateField(parseFieldRule("{$.no\\'}xyz{$.ok}"), scope())).toBe("{$.no\\'}xyz5");
+    expect(evaluateField(parseFieldRule('pre{$.ok\\'), scope())).toBe('');
+  });
+
+  it('嵌套内嵌 `{$.a{$.ok}}`：内层先替换，外层得替换后的字串（getString 递归）', () => {
+    expect(evaluateField(parseFieldRule('{$.a{$.ok}}'), scope())).toBe('$.a5');
+    // 内层失败 ⇒ 外层 fr 读 `$.a{$.no}` 失败 ⇒ 一处都没替换 ⇒ 空
+    expect(evaluateField(parseFieldRule('{$.a{$.no}}'), scope())).toBe('');
+  });
+
+  it('顶层 `@.x` / `@[n]` 按 `$` 读（Jayway 顶层 @ 即文档本身）；`@text` 仍空', () => {
+    expect(evaluateField(parseFieldRule('@.ok'), scope())).toBe('5');
+    const arr = createJsonScope([{ t: '第一' }, { t: '第二' }], 'https://api.example.com/');
+    expect(evaluateField(parseFieldRule('@[1].t'), arr)).toBe('第二');
+    expect(evaluateFieldList(parseFieldRule('@[*]'), arr)).toHaveLength(2);
+    expect(evaluateField(parseFieldRule('@text'), scope())).toBe('');
+  });
+
+  it('`.[0]` → `$..[0]`：各层数组（先序、含根）各取下标 0', () => {
+    const json = { l: [1, 2], m: { n: ['x', 'y'] } };
+    const s = createJsonScope(json, 'https://api.example.com/');
+    expect(evaluateField(parseFieldRule('.[0]'), s)).toBe(`1${'\n'}x`);
+    expect(evalJsonPath(parseJsonPath('$..[0]'), [['a'], 'b'])).toEqual([['a'], 'a']);
+  });
+
+  it('`$..[0].t`（非末段）：Jayway walkArray 把后续 token 施于每个数组的**每个元素**（下标被略过）', () => {
+    const json = { l: [{ t: 'a' }, { t: 'b' }] };
+    expect(evalJsonPath(parseJsonPath('$..[0].t'), json)).toEqual(['a', 'b']);
   });
 });
