@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { LLM_USAGE_PHASES, parseLlmUsage, type LlmUsageRecord, type TokenTotals } from './llm-usage';
 
-const mocks = vi.hoisted(() => ({ neon: vi.fn(), sql: vi.fn(), transaction: vi.fn() }));
+const mocks = vi.hoisted(() => ({ neon: vi.fn(), sql: vi.fn(), transaction: vi.fn(), query: vi.fn() }));
 vi.mock('@neondatabase/serverless', () => ({ neon: mocks.neon, neonConfig: {} }));
 
 const zero: TokenTotals = { prompt: 0, completion: 0, total: 0, cache: 0, calls: 0, missingUsageCalls: 0 };
@@ -25,8 +25,11 @@ describe('LLM usage storage and aggregates (mocked Neon HTTP queries)', () => {
     vi.resetModules();
     vi.resetAllMocks();
     vi.stubEnv('DATABASE_URL', 'postgresql://test:test@database.invalid/test');
-    mocks.neon.mockReturnValue(Object.assign(mocks.sql, { transaction: mocks.transaction }));
+    mocks.neon.mockReturnValue(Object.assign(mocks.sql, { transaction: mocks.transaction, query: mocks.query }));
     mocks.sql.mockResolvedValue([]);
+    // 冷启动版本探测走 sql.query（非模板形态）：返回空行 ⇒ businessSchemaCurrent=false ⇒ 照走整批 DDL，
+    // 与本改动前行为一致（这些用例断言的是 ensureSchema 会真正建业务 schema）。
+    mocks.query.mockResolvedValue([]);
     mocks.transaction.mockImplementation(async (builder: (tx: typeof mocks.sql) => unknown[]) => builder(mocks.sql));
     vi.spyOn(console, 'error').mockImplementation(() => {});
   });

@@ -2,7 +2,7 @@ import { neon, neonConfig } from '@neondatabase/serverless';
 import type { ProfileSnapshot, RerankedItem } from '@/lib/types';
 import { LLM_USAGE_PHASES, type LlmUsagePhase, type LlmUsageRecord, type TokenStats, type TokenTotals } from './llm-usage';
 import { assertAuthSchema } from './auth-store';
-import { initializeBusinessSchema } from './business-schema';
+import { initializeBusinessSchema, businessSchemaCurrent } from './business-schema';
 import type { PersonalWriter } from './personal-write';
 import { completeProfileFeedbackForUserQuery } from './user-data';
 import { quotaAwareFetch } from './db-quota-guard';
@@ -45,6 +45,11 @@ let schemaPromise: Promise<void> | null = null;
 async function createSchema() {
   const s = getSql();
   await assertAuthSchema(s);
+  // 冷启动先探版本：结构已是最新就跳过整批幂等 DDL（省一次事务往返，Neon 按传输量计费）。
+  // 探测只在 assertAuthSchema 通过后进行——空库会先在 assertAuthSchema 抛 AuthSchemaRequiredError，
+  // 行为与改动前完全一致。探测为假（全新库/旧库/结构漂移）时照走原 DDL 路径，DDL 幂等，
+  // 并发冷启动不新增风险。
+  if (await businessSchemaCurrent(s)) return;
   await initializeBusinessSchema(s);
 }
 
