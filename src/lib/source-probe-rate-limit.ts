@@ -9,12 +9,16 @@ import { getSql } from './db';
 
 // 41-fanfix N7：单源 probe 的用户级限流。复用登录限速的 auth_rate_limits 计数（数据库时钟、原子 UPSERT、
 // 键为带用途前缀的 HMAC），所以**跨 serverless 实例有效**，不是进程内计数。只计单源 probe；候选列表不出网，不计。
-// 一次换源面板打开 ≈ SOURCE_FANOUT_LIMIT 个 probe（灰度建议 12，默认 24）。
+// 一次换源面板打开 ≈ SOURCE_FANOUT_LIMIT 个 probe（默认 24，上限 MAX_SOURCE_FANOUT_LIMIT=60）。
+// 同一本书重开面板复用前端 probe 缓存（只重测超时/未测行），换书或刷新页面才是整面板重扫。
 
 export type SourceProbeRateLimitWindow = RateLimitWindow & { limit: number };
 
-/** 默认：10 分钟 60 次（12 个 probe 的扫描约 5 次）+ 每日 240 次（fanout-41-report §4 的灰度门槛）。 */
-export const DEFAULT_SOURCE_PROBE_RATE_LIMITS = '60/600,240/86400';
+/**
+ * 默认按扇出上限 60 定（41-readall）：10 分钟 180 次 = 60 源面板整扫 3 次（默认 24 源约 7 次）；每日 720 次 = 60 源 12 次
+ * （24 源 30 次）。旧值 60/600 在 24 源下第三次整扫必被自己限流、在 60 源下一次整扫就用尽。
+ */
+export const DEFAULT_SOURCE_PROBE_RATE_LIMITS = '180/600,720/86400';
 const MAX_WINDOW_SECONDS = 7 * 86_400;
 
 function parseWindows(spec: string): SourceProbeRateLimitWindow[] | null {
@@ -31,7 +35,7 @@ function parseWindows(spec: string): SourceProbeRateLimitWindow[] | null {
 }
 
 /**
- * env `SOURCE_PROBE_RATE_LIMITS`：逗号分隔的 `次数/窗口秒`，如 `60/600,240/86400`。
+ * env `SOURCE_PROBE_RATE_LIMITS`：逗号分隔的 `次数/窗口秒`，如 `180/600,720/86400`。
  * `0` 关闭限流（回滚）；缺失或任一项非法 ⇒ 整体回退默认值（不按半截配置放行）。
  */
 export function sourceProbeRateLimits(env: Record<string, string | undefined> = process.env): SourceProbeRateLimitWindow[] {

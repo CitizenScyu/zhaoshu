@@ -9,7 +9,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { runAdmissionBatch, rulesHash, type AdmissionSourceRow, type AdmissionTransport } from './rule-engine/admission';
 import { loadPGlite, type PGliteLike } from './fixtures/pglite';
 import { createPGliteSql } from './fixtures/pglite-sql';
-import { initializeBusinessSchema } from './business-schema';
+import { createProductionSchema } from './fixtures/production-schema';
 import type { RawSource } from './rule-engine/compile-smoke';
 
 type SqlTag = ReturnType<typeof createPGliteSql>;
@@ -43,8 +43,7 @@ maybe('41-B1-RETRY：conn_fail 衰减复测（pglite 真库往返）', () => {
     pg = new PGliteCtor!();
     sql = createPGliteSql(pg);
     // 先建 users 底座（business-schema 的部分表有 users 外键，pglite 空库没有 auth schema）。
-    await pg.exec('CREATE TABLE IF NOT EXISTS users (id int PRIMARY KEY)');
-    await initializeBusinessSchema(sql as never);
+    await createProductionSchema(sql as never, statement => pg.exec(statement));
   }, 120_000);
 
   /** 与 shuyuan.ts readAdmissionRows 同款读回（timestamptz::text）。 */

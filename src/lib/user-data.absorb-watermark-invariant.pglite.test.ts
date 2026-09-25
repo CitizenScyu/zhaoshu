@@ -1,5 +1,6 @@
 import { beforeAll, describe, expect, it } from 'vitest';
-import { initializeBusinessSchema } from '@/lib/business-schema';
+import { createPGliteSql } from '@/lib/fixtures/pglite-sql';
+import { createProductionSchema, seedProductionMembers } from '@/lib/fixtures/production-schema';
 import { loadPGlite, type PGliteLike } from '@/lib/fixtures/pglite';
 import {
   claimProfileFeedbackForUserQuery,
@@ -128,8 +129,8 @@ maybe('真实 PostgreSQL：异步吸收水位不越过已喂行（F41-F1 不变�
 
   beforeAll(async () => {
     pg = new PGliteCtor!();
-    await pg.exec('CREATE TABLE users (id int PRIMARY KEY); INSERT INTO users SELECT generate_series(1, 5)');
-    await initializeBusinessSchema(schemaTag as never);
+    await createProductionSchema(createPGliteSql(pg) as never, statement => pg.exec(statement));
+    await seedProductionMembers(pg, 5);
   }, 60_000);
 
   it('不变量①：一轮吸收后，未喂进模型的 informative 行仍留在 pending（水位不越过已喂行）', async () => {

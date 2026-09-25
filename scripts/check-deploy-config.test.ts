@@ -4,6 +4,18 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { checkDeployConfig, CROSS_FILE_BUDGETS, triggersPerDay } from './check-deploy-config.mjs';
+import { checkEnvExample } from './check-env-example.mjs';
+
+describe('环境变量样例覆盖', () => {
+  it('真实仓库覆盖所有代码读取键', () => {
+    expect(checkEnvExample(process.cwd())).toEqual([]);
+  });
+
+  it('新增代码读取键但样例遗漏时报告键和文件', () => {
+    const root = repo({ '.env.local.example': '# NODE_ENV=\n', 'src/lib/new-env.ts': 'process.env.' + 'NEW_DEPLOY_KEY' });
+    expect(checkEnvExample(root)).toContain('.env.local.example: 缺少 NEW_DEPLOY_KEY（读取于 src/lib/new-env.ts）');
+  });
+});
 
 // 部署配置门禁（MS-09）的反例测试：护栏本身必须有「坏配置一定红」的用例，
 // 否则它会像当年没激活的 pre-push 一样静默失效而没人知道。

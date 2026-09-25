@@ -1,6 +1,7 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { loadPGlite, type PGliteLike } from '@/lib/fixtures/pglite';
-import { initializeBusinessSchema } from '@/lib/business-schema';
+import { createPGliteSql } from '@/lib/fixtures/pglite-sql';
+import { createProductionSchema, seedProductionMembers } from '@/lib/fixtures/production-schema';
 import {
   addShelfForUserQueries, deleteShelfForUserQuery, exactLibraryBooksForUserQuery,
   feedbackForUserQueries, persistRecommendationsForUserQueries, recommendationsForUserQuery,
@@ -63,16 +64,8 @@ const maybe = PGliteCtor ? describe : describe.skip;
 maybe('真实 PostgreSQL：书架/推荐/库存行级语义（深审残留 A R01–R06）', () => {
   beforeAll(async () => {
     pg = new PGliteCtor!();
-    await pg.exec('CREATE TABLE users (id int PRIMARY KEY); INSERT INTO users SELECT generate_series(1, 10)');
-    await initializeBusinessSchema(sql as never);
-    await pg.exec(`ALTER TABLE books ADD COLUMN title_key text GENERATED ALWAYS AS
-      (lower(btrim(regexp_replace(btrim(normalize(title, NFKC)), '^《(.+)》$', '\\1')))) STORED;
-      ALTER TABLE books ADD COLUMN author_key text GENERATED ALWAYS AS (lower(btrim(normalize(author, NFKC)))) STORED;
-      CREATE UNIQUE INDEX books_identity_idx ON books(title_key, author_key);
-      ALTER TABLE labeled_books ADD COLUMN title_key text GENERATED ALWAYS AS
-      (lower(btrim(regexp_replace(btrim(normalize(title, NFKC)), '^《(.+)》$', '\\1')))) STORED;
-      ALTER TABLE labeled_books ADD COLUMN author_key text GENERATED ALWAYS AS (lower(btrim(normalize(author, NFKC)))) STORED;
-      CREATE UNIQUE INDEX labeled_books_identity_idx ON labeled_books(title_key, author_key)`);
+    await createProductionSchema(createPGliteSql(pg) as never, statement => pg.exec(statement));
+    await seedProductionMembers(pg, 10);
   }, 60_000);
   afterAll(() => pg.close());
 

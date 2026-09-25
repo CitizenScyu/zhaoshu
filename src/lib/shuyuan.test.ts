@@ -30,7 +30,7 @@ vi.mock('@/lib/db', () => ({ ensureSchema, getSql }));
 
 import {
   disableShuyuanSource, enableShuyuanSource, getEngineSources, getFanoutPool, getReadingPool, getShuyuanCounts,
-  getShuyuanPoolHealth, getShuyuanStats, getReadingSources, refreshShuyuan,
+  getShuyuanPoolHealth, getShuyuanStats, getReadingSources, getSourcePools, refreshShuyuan,
   REFRESH_BUDGET_MS, PROBE_PENDING_PER_REFRESH, RESPONSE_TIMEOUT_MS, SHUYUAN_REFRESH_PARTIAL, ShuyuanRefreshPartialError,
 } from './shuyuan';
 import { resolveDownloadSource } from './download-source';
@@ -986,8 +986,8 @@ describe('refreshShuyuan atomic refresh', () => {
       });
     });
 
-    // 41-fanout：扇出候选 = 取书池同一合成与全序，只换截断上限；引擎源不受 READING_ENGINE_SOURCES 约束，
-    // readable 标出「也在取书池里」的源（确认/章节路径只认取书池）。
+    // 41-fanout：扇出候选 = 取书池同一合成与全序，只换截断上限；引擎源不受 READING_ENGINE_SOURCES 约束。
+    // 41-readall：readable 不再看取书池位次（确认/章节路径改按 getSourcePools().selectable 反查），只看引擎开关。
     it('getFanoutPool：引擎开关关时仍含准入 ok 的引擎源、readable 只标 builtin；SOURCE_FANOUT_LIMIT 截断并夹上限', async () => {
       const hosts = ['a.example', 'b.example', 'c.example'];
       const arrange = () => execute.mockResolvedValueOnce(hosts.map((host) => ({ host })))
@@ -1001,16 +1001,58 @@ describe('refreshShuyuan atomic refresh', () => {
         ['https://b.example/', 'M1', false],
         ['https://c.example/', 'M1', false],
       ]);
-      // 引擎开关开 + 取书池上限 2 ⇒ 前 2 个 readable；扇出上限 3 ⇒ 截掉第 4 个。
+      // 引擎开关开 + 取书池上限 2 ⇒ 扇出里第 3 位（取书池外）也 readable（41-readall，改前是 [true, true, false]）；
+      // 扇出上限 3 ⇒ 截掉第 4 个。
       vi.stubEnv('READING_ENGINE_SOURCES', '1');
       vi.stubEnv('READING_POOL_LIMIT', '2');
       vi.stubEnv('SOURCE_FANOUT_LIMIT', '3');
       arrange();
-      expect((await getFanoutPool(new AbortController().signal)).map((source) => source.readable)).toEqual([true, true, false]);
+      expect((await getFanoutPool(new AbortController().signal)).map((source) => source.readable)).toEqual([true, true, true]);
       // 误配 999 ⇒ 夹到 MAX 60（此处候选只有 4 个，全出）。
       vi.stubEnv('SOURCE_FANOUT_LIMIT', '999');
       arrange();
       expect(await getFanoutPool(new AbortController().signal)).toHaveLength(4);
+    });
+
+    // 41-readall：一次合成两份池。traversal（自动遍历）逐条等于 getReadingSources；selectable（用户指定源的反查范围）
+    // 上限取 max(取书池, 扇出)、开关关时只剩 builtin；扇出里 readable 的源必在 selectable 内（面板可切 ⇔ 确认认得）。
+    it('getSourcePools：traversal=取书池前缀、selectable=max(R,F) 截断；readable 与 selectable 同口径', async () => {
+      const hosts = ['a.example', 'b.example', 'c.example', 'd.example'];
+      const arrange = () => execute.mockResolvedValueOnce(hosts.map((host) => ({ host })))
+        .mockResolvedValueOnce([{ collections: [] }]).mockResolvedValueOnce([])
+        .mockResolvedValueOnce(hosts.map((host) => engineRowAt(host)));
+      vi.stubEnv('READING_ENGINE_SOURCES', '1');
+      vi.stubEnv('READING_POOL_LIMIT', '2');
+      vi.stubEnv('SOURCE_FANOUT_LIMIT', '4');
+      arrange();
+      const pools = await getSourcePools(new AbortController().signal);
+      expect(pools.traversal.map((source) => source.url)).toEqual(['https://book15.net/', 'https://a.example/']);
+      expect(pools.selectable.map((source) => source.url)).toEqual([
+        'https://book15.net/', 'https://a.example/', 'https://b.example/', 'https://c.example/',
+      ]);
+      arrange();
+      expect((await getReadingSources(new AbortController().signal)).map((source) => source.url))
+        .toEqual(pools.traversal.map((source) => source.url));
+      arrange();
+      const fanout = await getFanoutPool(new AbortController().signal);
+      const selectableUrls = new Set(pools.selectable.map((source) => source.url));
+      expect(fanout.filter((source) => source.readable).every((source) => selectableUrls.has(source.url))).toBe(true);
+      expect(fanout.every((source) => source.readable)).toBe(true);
+      // 取书池比扇出大（READING_POOL_LIMIT 调高）⇒ selectable 仍覆盖整个取书池：自动遍历能交付的源，确认都认得。
+      vi.stubEnv('READING_POOL_LIMIT', '5');
+      vi.stubEnv('SOURCE_FANOUT_LIMIT', '2');
+      arrange();
+      const wide = await getSourcePools(new AbortController().signal);
+      expect(wide.traversal).toHaveLength(5);
+      expect(wide.selectable.map((source) => source.url)).toEqual(wide.traversal.map((source) => source.url));
+      // 引擎开关关 ⇒ selectable 只剩 builtin，且不查准入表（只读 meta + builtin 两次查询）；非合格源进不来。
+      vi.stubEnv('READING_ENGINE_SOURCES', '0');
+      execute.mockClear();
+      execute.mockResolvedValueOnce([{ collections: [] }]).mockResolvedValueOnce([]);
+      const off = await getSourcePools(new AbortController().signal);
+      expect(off.selectable.map((source) => source.tier)).toEqual(['builtin']);
+      expect(off.traversal.map((source) => source.tier)).toEqual(['builtin']);
+      expect(execute).toHaveBeenCalledTimes(2);
     });
 
     it('合成条目的 rules 与 shuyuan_sources.source 深相等；sourceRevision 与 rules_hash 同源（§5.2）', async () => {
