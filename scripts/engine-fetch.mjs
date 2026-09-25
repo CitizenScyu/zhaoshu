@@ -5,7 +5,7 @@
 // 用法（labeler 逐级调用；`@/` 别名靠 ts-esm-loader.mjs，故必须带 --import）：
 //   node --import ./scripts/ts-esm-loader.mjs scripts/engine-fetch.mjs search  --title "斗破苍穹" [--author "天蚕土豆"] [--no-builtin] [--skip-host <host>]… [--json]
 //   node --import ./scripts/ts-esm-loader.mjs scripts/engine-fetch.mjs toc     --url <bookUrl>    [--json]
-//   node --import ./scripts/ts-esm-loader.mjs scripts/engine-fetch.mjs content --url <chapterUrl> [--json]
+//   node --import ./scripts/ts-esm-loader.mjs scripts/engine-fetch.mjs content --url <chapterUrl> [--stop-urls-file <path>] [--json]
 //   node --import ./scripts/ts-esm-loader.mjs scripts/engine-fetch.mjs doctor --json
 //   （env：--env <file> 或环境变量 DATABASE_URL；--env 剥引号，参照 backfill_quality.mjs）
 //
@@ -28,7 +28,7 @@ class ExitError extends Error {
 }
 
 function parseArgs(argv) {
-  const args = { _: [], json: false, env: null, title: null, author: null, url: null, noBuiltin: false, skipHosts: [] };
+  const args = { _: [], json: false, env: null, title: null, author: null, url: null, noBuiltin: false, skipHosts: [], stopUrlsFile: null };
   for (let i = 0; i < argv.length; i += 1) {
     const a = argv[i];
     if (['--source', '--out', '--max-chapters', '--rate-ms', '--timeout-ms', '--budget-ms'].includes(a)) {
@@ -46,6 +46,11 @@ function parseArgs(argv) {
     else if (a === '--skip-host') {
       if (!argv[i + 1] || argv[i + 1].startsWith('--')) throw new ExitError(2, `缺少参数值：${a}`);
       args.skipHosts.push(argv[++i]);
+    }
+    // lblqual41：content 的翻页停止点清单（每行一个 URL，labeler 写入整本目录）。只用于 content。
+    else if (a === '--stop-urls-file') {
+      if (!argv[i + 1] || argv[i + 1].startsWith('--')) throw new ExitError(2, `缺少参数值：${a}`);
+      args.stopUrlsFile = argv[++i];
     }
     else if (a.startsWith('--')) throw new ExitError(2, `未知参数：${a}`);
     else args._.push(a);
@@ -69,6 +74,14 @@ function loadEnvFile(path) {
     env[key] = value;
   }
   return env;
+}
+
+// 停止点清单：每行一个 https URL，空行/其它行忽略；读不了 ⇒ 用法错退 2（DB 之前）。
+const MAX_STOP_URLS = 20_000;
+function readStopUrls(path) {
+  let raw;
+  try { raw = readFileSync(resolve(path), 'utf8'); } catch { throw new ExitError(2, '--stop-urls-file 无法读取'); }
+  return raw.split(/\r?\n/).map((line) => line.trim()).filter((line) => /^https:\/\//i.test(line)).slice(0, MAX_STOP_URLS);
 }
 
 // 🔴 脱敏：DB/连接错误的原文可能含连接串（含口令）。任何带 `://` 或 `@host` 形态的 token 一律抹掉，
@@ -251,7 +264,9 @@ async function cmdContent(m, args) {
     }
   } else {
     const engineSource = engineSourceOf(m, source);
-    text = (await m.api.engineFetchContent(engineSource, args.url, context)).text;
+    // lblqual41：停止点 = 整本目录。站点「下一页」若是目录里的任一章（cuoceng 的 #linkNext 就是下一章，
+    // 且目录序与下一章链序不同）即停，不再一路翻 20 页串进后续章节。未给清单时行为同改前。
+    text = (await m.api.engineFetchContent(engineSource, args.url, context, false, args.stopUrls)).text;
   }
   if (!text) throw new ExitError(1, `空正文：${args.url}`);
   const out = { source: hostOf(source.url), url: args.url, text };
@@ -287,6 +302,8 @@ async function main() {
   if (command !== 'search' && (args.noBuiltin || args.skipHosts.length)) {
     throw new ExitError(2, '--no-builtin/--skip-host 仅用于 search');
   }
+  if (command !== 'content' && args.stopUrlsFile) throw new ExitError(2, '--stop-urls-file 仅用于 content');
+  if (args.stopUrlsFile) args.stopUrls = readStopUrls(args.stopUrlsFile);
   if (command !== 'download') {
     for (const key of ['source', 'out', 'max-chapters', 'rate-ms', 'timeout-ms', 'budget-ms']) {
       if (args[key] !== undefined) throw new ExitError(2, `--${key} 仅用于 download`);

@@ -2,8 +2,10 @@
 // 参数解析、退出码、stdout 只放数据、凭据不外泄。全部走不依赖外网的路径（无 DATABASE_URL /
 // 参数错 / URL 非法，都在任何 DB/fetch 之前返回）。
 import { spawnSync } from 'node:child_process';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { resolve, dirname } from 'node:path';
+import { resolve, dirname, join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 
 const scriptsDir = dirname(fileURLToPath(import.meta.url));
@@ -143,6 +145,31 @@ describe('engine-fetch CLI 契约', () => {
       expect(r.stderr).toContain('仅用于 search');
       expect(r.stdout).toBe('');
     }
+  }, 60_000);
+
+  // lblqual41：content 的翻页停止点清单。完整翻页语义由 api.test.ts ⑤⑥ 钉住；这里钉 CLI 的参数契约。
+  it('lblqual41：content 接受 --stop-urls-file（解析与读文件都在 DB 之前，落到缺 DATABASE_URL）', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'stop-urls-'));
+    const file = join(dir, 'toc.txt');
+    writeFileSync(file, 'https://a.example/1\r\nhttps://a.example/2\n\nnot-a-url\n');
+    const r = run(['content', '--url', 'https://a.example/1', '--stop-urls-file', file], { DATABASE_URL: undefined });
+    expect(r.status).toBe(2);
+    expect(r.stderr).toContain('DATABASE_URL');
+    expect(r.stderr).not.toContain('未知参数');
+    rmSync(dir, { recursive: true, force: true });
+  }, 60_000);
+
+  it('lblqual41：--stop-urls-file 缺值 / 用在 content 以外 / 文件读不了 → 退出码 2（DB 之前）', () => {
+    const missing = run(['content', '--url', 'https://a.example/1', '--stop-urls-file'], { DATABASE_URL: 'postgres://u:p@h/db' });
+    expect(missing.status).toBe(2);
+    expect(missing.stderr).toContain('缺少参数值：--stop-urls-file');
+    const elsewhere = run(['toc', '--url', 'https://a.example/1', '--stop-urls-file', 'x.txt'], { DATABASE_URL: 'postgres://u:p@h/db' });
+    expect(elsewhere.status).toBe(2);
+    expect(elsewhere.stderr).toContain('仅用于 content');
+    const unreadable = run(['content', '--url', 'https://a.example/1', '--stop-urls-file', join(tmpdir(), 'no-such-dir-lblqual41', 'x.txt')], { DATABASE_URL: 'postgres://u:p@h/db' });
+    expect(unreadable.status).toBe(2);
+    expect(unreadable.stderr).toContain('--stop-urls-file 无法读取');
+    expect(unreadable.stdout).toBe('');
   }, 60_000);
 
   it('toc 缺 --url → 退出码 2', () => {
