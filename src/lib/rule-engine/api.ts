@@ -46,7 +46,8 @@ function evaluateText(
 
 /**
  * 相对→绝对化 + 过运行时 host 门（§3.2/§6.1）；不合法返回 undefined（丢弃，不猜测）。
- * 规则模板里写死 `http://` 的值先升 https（host/端口/路径不变，41-urlfix），再过同一把锁；
+ * 值来自页面抽出的链接（详情页 tocUrl、目录章节/翻页、正文翻页），也可能是规则里写死的
+ * 绝对 URL；其中写死 `http://` 的先升 https（host/端口/路径不变，41-urlfix），再过同一把锁；
  * 因此放行的 host 集合与判据完全不变，只是不让「同 host 只是写错 scheme」白白丢候选。
  */
 function absoluteUrl(value: string, base: string): string | undefined {
