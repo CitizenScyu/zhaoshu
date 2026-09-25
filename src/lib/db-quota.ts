@@ -49,6 +49,12 @@ export function isDbQuotaError(error: unknown, depth = 0): boolean {
   return isDbQuotaError(record.cause, depth + 1) || isDbQuotaError(record.sourceError, depth + 1);
 }
 
+/** 前端：响应是否为服务端配额 503（withDbQuotaGuard 产出）；是则应停止轮询/重试。 */
+export function isDbQuotaResponse(status: number, body: unknown): boolean {
+  return status === 503 && typeof body === 'object' && body !== null
+    && (body as { code?: unknown }).code === DB_QUOTA_ERROR_CODE;
+}
+
 /** env DB_QUOTA_BACKOFF_MS（毫秒）；缺省/非法回落 30 分钟，夹到 [60s, 4h]。 */
 export function dbQuotaBackoffMs(env: Record<string, string | undefined> = process.env): number {
   const raw = env.DB_QUOTA_BACKOFF_MS;

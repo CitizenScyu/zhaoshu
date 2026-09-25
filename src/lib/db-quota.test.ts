@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { neon, neonConfig, NeonDbError } from '@neondatabase/serverless';
 import {
   createDbQuotaLatch, DB_QUOTA_ERROR_CODE, DB_QUOTA_HEALTH_ROW, DbQuotaExceededError,
-  dbQuotaBackoffMs, DEFAULT_DB_QUOTA_BACKOFF_MS, isDbQuotaError, recordDbQuotaSeen,
+  dbQuotaBackoffMs, DEFAULT_DB_QUOTA_BACKOFF_MS, isDbQuotaError, isDbQuotaResponse, recordDbQuotaSeen,
 } from './db-quota';
 
 // 生产 2026-09-25 实测的 402 响应体（dbquota-41-report §1.2；中间字段省略处按原样保留省略）。
@@ -153,5 +153,15 @@ describe('recordDbQuotaSeen', () => {
     expect(calls[0].text).toMatch(/INSERT INTO cron_health/);
     expect(calls[0].text).toMatch(/GREATEST\(cron_health\.last_success_at, EXCLUDED\.last_success_at\)/);
     expect(calls[0].values).toEqual([DB_QUOTA_HEALTH_ROW, '2026-09-25T03:43:00.000Z']);
+  });
+});
+
+describe('isDbQuotaResponse（前端停轮询判据）', () => {
+  it('只认 503 + DB_QUOTA_EXCEEDED', () => {
+    expect(isDbQuotaResponse(503, { code: DB_QUOTA_ERROR_CODE, error: 'x' })).toBe(true);
+    expect(isDbQuotaResponse(500, { code: DB_QUOTA_ERROR_CODE })).toBe(false);
+    expect(isDbQuotaResponse(503, { code: 'STATS_UNAVAILABLE' })).toBe(false);
+    expect(isDbQuotaResponse(503, null)).toBe(false);
+    expect(isDbQuotaResponse(503, 'DB_QUOTA_EXCEEDED')).toBe(false);
   });
 });

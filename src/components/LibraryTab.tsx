@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useRef, useState, type Dispatch, type SetStateAction } from 'react';
 import { useOwner } from '@/components/OwnerProvider';
 import ReadBookLink from '@/components/ReadBookLink';
+import { isDbQuotaResponse } from '@/lib/db-quota';
 
 interface LibraryBook {
   id: number;
@@ -309,6 +310,12 @@ export default function LibraryTab({ view, setView }: {
         try {
           const res = await apiFetch(`/api/download?id=${pollTaskId}`, { signal: controller.signal });
           const data = await res.json();
+          if (isDbQuotaResponse(res.status, data)) {
+            // 数据库额度耗尽（服务端 503 DB_QUOTA_EXCEEDED）：再 10 秒一打只会继续失败，停掉本轮轮询。
+            clearInterval(timer);
+            if (!stale && my === dlRequestId.current) setDlMessage('数据库额度已用尽，下载进度暂停刷新，请稍后再来查看。');
+            return;
+          }
           if (!res.ok) throw new Error(data.error || '查询下载进度失败');
           const next = parseTask(data);
           if (!stale && my === dlRequestId.current && next !== null) {
