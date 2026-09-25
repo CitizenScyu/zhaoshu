@@ -859,7 +859,11 @@ def is_nonbody_toc_title(title: str) -> bool:
 
 # (d) 付费试读章：标题带 APP免费，或正文 ≤ PREVIEW_CHAPTER_MAX 字且以省略号收尾（截断预览）。
 # 丢弃，不计章数与字数；丢完剩下的正文不足 PREVIEW_MIN_TOTAL → 按试读源拒收（见 prepare_book_text）。
+# 正文判据按整本口径（lblfu41，lbladrev 非阻断1）：单看一章会把 101–200 字、以省略号收尾的正常短章
+# （楔子/过场章）当试读丢掉。试读源的截断预览是成批出现的，所以只有「目录里有 APP免费 章」或
+# 「正文判定的章 ≥ PREVIEW_SOURCE_MIN_CHAPTERS」时才认定是试读源、丢正文判定的章；零星一两章照常保留。
 PREVIEW_CHAPTER_MAX = 200
+PREVIEW_SOURCE_MIN_CHAPTERS = PREVIEW_MIN_CHAPTERS
 _PREVIEW_TITLE_RE = re.compile(r'APP\s*免费', re.I)
 _PREVIEW_TAIL_RE = re.compile(r'(?:\.\.\.|…)\s*$')
 
@@ -868,11 +872,20 @@ def is_preview_title(title: str) -> bool:
     return bool(_PREVIEW_TITLE_RE.search(title or ''))
 
 
-def is_preview_chapter(title: str, body: str) -> bool:
-    """试读章判定（纯函数）：标题带 APP免费，或正文 ≤200 字且以 ... / … 结尾。"""
+def is_preview_body(body: str) -> bool:
+    """正文形如截断预览（纯函数）：≤200 字且以 ... / … 结尾。单章命中不等于试读章，见 is_preview_source。"""
     body = (body or '').strip()
-    return is_preview_title(title) or (
-        len(body) <= PREVIEW_CHAPTER_MAX and bool(_PREVIEW_TAIL_RE.search(body)))
+    return len(body) <= PREVIEW_CHAPTER_MAX and bool(_PREVIEW_TAIL_RE.search(body))
+
+
+def is_preview_chapter(title: str, body: str) -> bool:
+    """试读章形态判定（纯函数）：标题带 APP免费，或正文形如截断预览。"""
+    return is_preview_title(title) or is_preview_body(body)
+
+
+def is_preview_source(title_previews: int, body_previews: int) -> bool:
+    """整本是否是试读源：目录里有 APP免费 章，或正文形如截断预览的章成批出现。"""
+    return title_previews > 0 or body_previews >= PREVIEW_SOURCE_MIN_CHAPTERS
 
 
 def prepare_book_text(text: str, clean: bool,
@@ -880,7 +893,8 @@ def prepare_book_text(text: str, clean: bool,
     """拼接好的整本文本 → (预处理后文本, 字数, 拒收原因或 None, 统计)。纯函数，可离线单测。
 
     输入形态同 fetch_book_text / fetch_book_text_engine 的产出：'【章节标题】\\n正文' 以空行相连。
-    clean=True（引擎正文）时：章节标题过 clean_chapter_title，试读章（is_preview_chapter）整章丢弃，
+    clean=True（引擎正文）时：章节标题过 clean_chapter_title，试读章（标题带 APP免费；认定为试读源时
+    再加正文形如截断预览的章，见 is_preview_source）整章丢弃，
     正文逐行先剥段内水印（_strip_inline_noise）再过 _drop_rule；book15 正文在抓取层已清洗过，传 False。
     preview_dropped = 抓取层已丢弃的试读章数（fetch_book_text_engine 的 stats），与本层丢的合计：
     有试读章被丢、且剩余正文不足 PREVIEW_MIN_TOTAL → 按试读源拒收。
@@ -893,10 +907,13 @@ def prepare_book_text(text: str, clean: bool,
     parts, lengths, chars = [], [], 0
     stats = {'chapters_before': len(chapters), 'clean_lines': 0, 'dup_lines': 0,
              'dup_chars': 0, 'chars_before': 0, 'inline_strips': 0, 'preview_chapters': 0}
+    preview_source = clean and is_preview_source(
+        preview_dropped + sum(1 for head, _ in chapters if head and is_preview_title(head[1:-1])),
+        sum(1 for head, body in chapters if head and is_preview_body(body)))
     for head, body in chapters:
         if clean and head:
             title = head[1:-1]
-            if is_preview_chapter(title, body):
+            if is_preview_title(title) or (preview_source and is_preview_body(body)):
                 stats['preview_chapters'] += 1
                 continue
             head = f'【{clean_chapter_title(title)}】'
@@ -1118,7 +1135,7 @@ def fetch_book_text_engine(engine_cli, book_url: str,
     重试后仍 http_5xx 的章连续 server_error_streak 章 → 同样放弃（5xx 章照旧重试）。
 
     lbladfix41：公告/感言类目录条目（is_nonbody_toc_title）与标题带 APP免费 的试读章抓取前跳过，
-    抓回来是截断预览（is_preview_chapter）的章丢弃；都不计字数，条数记进 stats
+    抓回来形如截断预览（is_preview_body）的章在整本认定为试读源（is_preview_source）时丢弃；都不计字数，条数记进 stats
     （nonbody_chapters / preview_chapters，调用方传 dict 才拿得到）。章节标题过 clean_chapter_title。
 
     N02 二次校验（toc 取回后、逐章 content **之前**）：expect_title/expect_author
@@ -1152,6 +1169,7 @@ def fetch_book_text_engine(engine_cli, book_url: str,
     streak_limit = dict.fromkeys(DETERMINISTIC_ENGINE_ERRORS, giveup_streak)
     streak_limit[SERVER_ERROR_KIND] = server_error_streak
     streak_kind, streak = '', 0     # 连续同一放弃类别（确定性 / 重试后仍 5xx）的章数
+    body_previews = []              # 正文形如截断预览的章：(parts 下标, 字数)；≤100 字未收的记 None
     for ch in chapters:
         if chars >= target_chars:
             break
@@ -1189,12 +1207,19 @@ def fetch_book_text_engine(engine_cli, book_url: str,
                                          '\n\n'.join(parts), chars)
         else:
             streak_kind, streak = '', 0
-        if text and is_preview_chapter(title, text):
-            stats['preview_chapters'] += 1      # 截断预览（≤200 字且以省略号收尾）：丢弃，不计字数
-        elif len(text) > 100:
+        if text and is_preview_body(text):
+            # 形如截断预览（≤200 字且以省略号收尾）：先记下，整本抓完再按 is_preview_source 定丢不丢
+            body_previews.append((len(parts), len(text)) if len(text) > 100 else None)
+        if len(text) > 100:
             parts.append(f'【{clean_chapter_title(title)}】\n{text}')
             chars += len(text)
         time.sleep(CHAPTER_DELAY)
+    if is_preview_source(stats['preview_chapters'], len(body_previews)):
+        # 试读源：正文判定的章丢弃，不计字数（≤100 字的本来就不收，这里只补计数）
+        stats['preview_chapters'] += len(body_previews)
+        drop = {i for i, _ in filter(None, body_previews)}
+        chars -= sum(n for _, n in filter(None, body_previews))
+        parts = [p for i, p in enumerate(parts) if i not in drop]
     return '\n\n'.join(parts), chars
 
 
@@ -1444,8 +1469,11 @@ def merge_text_quality(segments: list[dict]) -> tuple[object, list[str]]:
               for seg in segments if isinstance(seg, dict) and seg.get('text_quality') is not None]
     if not judged:
         return None, []
+    # 未知取值（不在枚举里 / 非字符串）不被「正常」段盖掉（lblfu41，lbladrev 非阻断2）：回复没守枚举约定，
+    # 这一段文本正不正常无从判断，静默改判「正常」会让它直接入库；按最严重走拒收路径，与单段时一致。
+    unknown = any(not isinstance(q, str) or q not in _TEXT_QUALITY_SEVERITY for q, _ in judged)
     others = [ev for q, ev in judged if q != TEXT_QUALITY_NORMAL]
-    if any(q == TEXT_QUALITY_NORMAL for q, _ in judged) and not any(others):
+    if not unknown and any(q == TEXT_QUALITY_NORMAL for q, _ in judged) and not any(others):
         return TEXT_QUALITY_NORMAL, []
     worst = max((q for q, _ in judged),
                 key=lambda q: _TEXT_QUALITY_SEVERITY.get(q, _UNKNOWN_QUALITY_SEVERITY)
