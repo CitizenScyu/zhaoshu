@@ -266,6 +266,49 @@ class TestPreviewChapters(unittest.TestCase):
         self.assertIn('清洗去重后仅', reason)
 
 
+# ---------------- A5 选源排序 ----------------
+class _SearchCli:
+    def __init__(self, candidates):
+        self.stdout = json.dumps(candidates, ensure_ascii=False)
+
+    def run(self, subcommand, *args):
+        return _proc(0, self.stdout)
+
+
+def _cand(host, author='萧鼎', title='诛仙'):
+    return {'source': host, 'title': title, 'author': author,
+            'bookUrl': f'https://{host}/book/1'}
+
+
+class TestSourceDeprioritize(unittest.TestCase):
+    def search(self, candidates, author='萧鼎'):
+        return labeler.douban_list.search_engine(_SearchCli(candidates), '诛仙', author)
+
+    def test_yunqi_first_is_demoted_to_last_alternate(self):
+        hit = self.search([_cand('yunqi.qq.com'), _cand('www.kxdu.net'),
+                           _cand('chuangshi.qq.com'), _cand('www.a.com')])
+        self.assertEqual(hit['source'], 'www.kxdu.net')
+        self.assertEqual([a['source'] for a in hit['alternates']],
+                         ['www.a.com', 'yunqi.qq.com', 'chuangshi.qq.com'])
+
+    def test_yunqi_only_candidate_is_still_used(self):
+        # 不拉黑：只有 yunqi 一个源时照用
+        hit = self.search([_cand('yunqi.qq.com')])
+        self.assertEqual(hit['source'], 'yunqi.qq.com')
+        self.assertNotIn('alternates', hit)
+
+    def test_order_of_other_hosts_unchanged(self):
+        # 反例：没有降权源时顺序与改前一致
+        hit = self.search([_cand('www.b.com'), _cand('www.a.com')])
+        self.assertEqual(hit['source'], 'www.b.com')
+        self.assertEqual([a['source'] for a in hit['alternates']], ['www.a.com'])
+
+    def test_unknown_author_path_also_demotes(self):
+        hit = self.search([_cand('yunqi.qq.com'), _cand('www.kxdu.net')], author='')
+        self.assertEqual(hit['source'], 'www.kxdu.net')
+        self.assertEqual([a['source'] for a in hit['alternates']], ['yunqi.qq.com'])
+
+
 class MainHarness(unittest.TestCase):
     """main() 离线跑一本引擎条目：fetch_book_text_engine / label_book 被替换。"""
 
