@@ -13,12 +13,13 @@ import {
 import type { GitHubContents } from '../src/lib/download-publisher';
 import { createWorkerStorage } from './storage';
 import { createGitHubContents } from './github-contents';
-import { assembleEngineModules, createResolveSource, createSourceTransport, type EngineModules, type RateLimiterLike, type ResolvedSource } from './engine';
+import { assembleEngineModules, createResolveSource, createSourceTransport, loadEnginePool, type EngineModules, type RateLimiterLike, type ResolvedSource } from './engine';
 import { readBookText } from './read-book-text';
 import { resolveRepositoryId } from './repository';
 import { withoutProcessSignals } from './without-process-signals';
 import { createBudgetRefund } from './budget-refund';
 import { createIdentityPrecheck } from './identity-precheck';
+import { createBuiltinFallback } from './builtin-fallback';
 import { createExecutor, DEFAULT_DECISIONS, type DailyBudgetLike, type DownloadExecutor, type LoopDecisions } from './executor';
 
 export type { DownloadExecutor, DailyBudgetLike, LoopDecisions } from './executor';
@@ -55,6 +56,7 @@ export interface ProductionExecutorOptions {
   transport?: ReturnType<typeof createSourceTransport>;
   adapters?: SourceAdapter[];
   engineDownload?: EngineDownloadLike;
+  loadEnginePool?: (signal: AbortSignal) => Promise<Array<{ url: string; name: string; searchUrl: unknown }>>;
   repositoryId?: number;
   branch?: string;
 }
@@ -91,16 +93,26 @@ export async function createDownloadExecutor(options: ProductionExecutorOptions)
   const engineDownload = withoutProcessSignals(
     (options.engineDownload ?? downloadBook) as unknown as (...a: unknown[]) => Promise<unknown>,
   ) as unknown as EngineDownloadLike;
+  // book15 不可达时 builtin 任务回退引擎源池（41-T8FB，见 builtin-fallback.ts）。默认开；
+  // DOWNLOAD_ENGINE_FALLBACK=0 关（回到引入前行为：只退避等 book15）。测试注入 adapters 时不装（包的是默认两条腿）。
+  const fallback = options.adapters || env.DOWNLOAD_ENGINE_FALLBACK === '0'
+    ? undefined
+    : createBuiltinFallback({
+      modules, transport, log,
+      loadPool: options.loadEnginePool ?? (signal => loadEnginePool(modules, signal)),
+    });
+  const engineAdapter = createEngineAdapter({
+    downloadBook: engineDownload,
+    modules, resolveSource, transport, readBookText, outRoot, sourceKind: 'engine',
+  });
+  // builtin book15 任务（source_kind='builtin'）走同一 downloadBook 的 source-parser 分支。
+  const builtinAdapter = createEngineAdapter({
+    downloadBook: engineDownload,
+    modules, resolveSource, transport, readBookText, outRoot, sourceKind: 'builtin',
+  });
   const adapters = options.adapters ?? ([
-    createEngineAdapter({
-      downloadBook: engineDownload,
-      modules, resolveSource, transport, readBookText, outRoot, sourceKind: 'engine',
-    }),
-    // builtin book15 任务（source_kind='builtin'）走同一 downloadBook 的 source-parser 分支。
-    createEngineAdapter({
-      downloadBook: engineDownload,
-      modules, resolveSource, transport, readBookText, outRoot, sourceKind: 'builtin',
-    }),
+    engineAdapter,
+    fallback ? fallback.wrapAdapter(builtinAdapter, engineAdapter) : builtinAdapter,
   ]);
 
   let repositoryId = options.repositoryId;
@@ -113,9 +125,11 @@ export async function createDownloadExecutor(options: ProductionExecutorOptions)
 
   // 扣额度前的身份预检默认开；DOWNLOAD_IDENTITY_PRECHECK=0 关（回到引入前行为：书源不可达只在下载中判出、
   // 事后退还日预算）。与下载腿共用 modules/resolveSource/transport（同一个运行时限速器）。
-  const precheck = env.DOWNLOAD_IDENTITY_PRECHECK === '0'
+  const identityPrecheck = env.DOWNLOAD_IDENTITY_PRECHECK === '0'
     ? undefined
     : createIdentityPrecheck({ modules, resolveSource, transport });
+  // 回退开启时预检多一步：book15 不可达就在扣额度前选好引擎源，选不到仍按不可达退避（不扣额度）。
+  const precheck = identityPrecheck && fallback ? fallback.wrapPrecheck(identityPrecheck) : identityPrecheck;
 
   // shell 的 read() 只回 {date, used}：用打包注入的上限补齐 DailyBudgetLike 契约（缺省保持未知）。
   const budget: DailyBudgetLike = {
@@ -128,6 +142,7 @@ export async function createDownloadExecutor(options: ProductionExecutorOptions)
 
   log('info', '执行器装配完成', {
     repositoryId, branch, owner: options.owner ?? `service-${process.pid}`, identityPrecheck: Boolean(precheck),
+    engineFallback: Boolean(fallback),
   });
   if (!options.budgetStatePath) log('error', '日预算退还未接线：书源不可达仍会计入日预算', {});
   if (precheck && options.budgetLimit === undefined) log('error', '日预算上限未接线：额度已满时仍会跑身份预检', {});
