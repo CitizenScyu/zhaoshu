@@ -1,13 +1,19 @@
 /** TXT byte ranges are UTF-8, with an exclusive end. Online directory sizes are unknown (0). */
 export type ReadingSession = { kind: 'download'; taskId: number }
-  | { kind: 'source'; title: string; author: string; bookUrl?: string };
+  | { kind: 'source'; title: string; author: string; bookUrl?: string; sourceUrl?: string };
 
 export type ReaderOrigin = 'library' | 'shelf' | 'find';
 
 export interface ReaderSource {
   id: string;
   name: string;
+  /** 书的详情页(catalog.bookUrl),不是源 url。 */
   url: string;
+  /**
+   * 书源的唯一标识(源 url,= 扇出候选 / probe 结果的 sourceUrl)。换源面板据此精确认「当前源」;
+   * 未升级的服务端不带,前端退回按源名比对。
+   */
+  sourceUrl?: string;
   session: string;
 }
 
@@ -33,6 +39,8 @@ export interface ReaderPart {
   taskId: number | null;
   sourceId?: string;
   servedFrom?: string;
+  /** 本段实际供稿源的源 url(与 servedFrom 成对;章内换源后是新源)。未升级的服务端不带。 */
+  servedFromUrl?: string;
   /**
    * 目录会话版本(catalog.version)。**只在章内换源成功时出现**:服务端已把备用源目录
    * 固化(catalog 落库)并把本次正文换成新源,前端据此把阅读目录切成新源(洞 2)。

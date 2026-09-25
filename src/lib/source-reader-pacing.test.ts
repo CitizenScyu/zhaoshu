@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { SourceRequestContext, sourceThrottleKey } from './source-reader';
+import { SourceRequestContext, sourceStationKey, sourceThrottleKey } from './source-reader';
 import { refreshSupportedHosts } from './source-policy';
 
 // source-reader 的请求节流（SOURCE_DELAY_MS = 350）必须在并发 page() 下仍然成立：
@@ -94,6 +94,9 @@ describe('per-host pacing buckets (41-fanout P1-C)', () => {
   it('apex and www of the same station share one bucket', () => {
     expect(sourceThrottleKey('https://book15.net/a')).toBe(sourceThrottleKey('https://www.book15.net/b'));
     expect(sourceThrottleKey('https://alpha.test/a')).not.toBe(sourceThrottleKey('https://beta.test/a'));
+    // 站键(扇出候选的 hostKey)与节流按站分桶同一口径。
+    expect(sourceStationKey('https://www.book15.net/b')).toBe(sourceThrottleKey('https://book15.net/a'));
+    expect(sourceStationKey('https://www.book15.net/b')).toBe('book15.net');
   });
 
   it('SOURCE_THROTTLE_PER_HOST=0 rolls back to one global slot', async () => {

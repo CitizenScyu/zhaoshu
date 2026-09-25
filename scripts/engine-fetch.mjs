@@ -16,7 +16,7 @@
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { exitAfterFlush } from './stdio-exit.mjs';
-import { searchSources, SEARCH_SOURCE_SLICE_MS } from './engine-search-pool.mjs';
+import { excludeSkippedSources, searchSources, SEARCH_SOURCE_SLICE_MS } from './engine-search-pool.mjs';
 import { downloadErrorKind, engineErrorKind } from './engine-error-kind.mjs';
 
 // CLI 层宽上限（无 serverless 限制，但仍有界防挂死）。
@@ -148,9 +148,9 @@ async function cmdSearch(m, args) {
     // search 的价值就是全池；DB 不可达 ⇒ 退 2，labeler 回退自有 book15 路径。
     throw new ExitError(2, `引擎源池不可用：${safeReason(error)}`, 'pool');
   }
-  const skip = new Set(args.skipHosts);
-  const sources = [...(args.noBuiltin ? [] : [builtinSource(m)]), ...enginePool]
-    .filter((source) => !skip.has(hostOf(source.url)));
+  // --skip-host 按源身份 host 过滤（与下面按请求 host 分组不是同一个键，理由见 excludeSkippedSources）。
+  const sources = excludeSkippedSources(
+    [...(args.noBuiltin ? [] : [builtinSource(m)]), ...enginePool], args.skipHosts);
   const context = new m.reader.SourceRequestContext(signal, 12);
   context.openPool(POOL_SIZE);
   // espfix41：改前逐源串行（墙钟=各源之和）；改后按目标站分组、组内串行、组间有界并发，

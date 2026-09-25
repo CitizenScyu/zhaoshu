@@ -18,6 +18,8 @@ import { DEFAULT_READER_SETTINGS, indexProgressKey } from '@/lib/reader-preferen
 import type { ReaderSettings, ReaderTheme, ReadingPosition } from '@/lib/reader-preferences';
 import { useReader, partKey } from './useReader';
 import FeedbackPrompt from './FeedbackPrompt';
+import { isCurrentSource, useSourceFanout } from './useSourceFanout';
+import type { FanoutRow, ProbeCache, ServingSource } from './useSourceFanout';
 import { nextReadingPosition, previousReadingPosition } from '@/lib/reader-part-cache';
 import styles from './reader.module.css';
 
@@ -109,11 +111,18 @@ function ReaderSession({ session, from }: Props) {
     extend, retry, markScrollIntent, setSection, loadConfirmedBook, registerSwitchCommitted,
   } = useReader(session, apiFetch, user?.id ?? 0);
   const [panel, setPanel] = useState<'directory' | 'settings' | 'sources' | null>(null);
+  // 41-panel:扇出 probe 结果在本阅读会话内复用(关了面板再开不重复出网/计数);换账号时 ReaderSession 重挂即清。
+  const [probeCache] = useState<ProbeCache>(() => new Map());
   const restoreButton = useRef<HTMLButtonElement>(null);
   const focusButton = useRef<HTMLButtonElement>(null);
   const tap = useRef<{ x: number; y: number; time: number } | null>(null);
   const chapter = activePart?.chapterIndex ?? 0;
   const chapters = reading?.index.chapters ?? [];
+  // 正在供稿的源:段上的源名与源 url 成对取(章内换源后是新源);还没有段时取目录的。
+  // 段只带源名(旧服务端)时 url 留空 ⇒ 面板按源名认,不拿目录上可能已过时的 url 去配。
+  const servingSource: ServingSource | undefined = activePart?.servedFrom
+    ? { name: activePart.servedFrom, url: activePart.servedFromUrl }
+    : reading?.index.source && { name: reading.index.source.name, url: reading.index.source.sourceUrl };
   const first = reading?.parts[0];
   const last = reading?.parts[reading.parts.length - 1];
   const before = reading && first ? previousReadingPosition(reading.index, first) : null;
@@ -188,16 +197,18 @@ function ReaderSession({ session, from }: Props) {
   // 复审 P1-3:book_url 只在**目录加载成功后**才写进 URL。确认路径(book_url=...)会让服务端
   // 跳过书名/作者匹配去建目录,一旦该候选建目录失败(404/422/503),URL 若已先被 replace 成
   // 新 book_url,刷新/回退都会重放一个已知失败的候选。失败时 URL 必须保持旧源,用户可重试或换源。
-  function switchSource(bookUrl: string) {
+  // 41-panel:扇出面板的确认带上命中行的 sourceUrl(服务端按源精确定位);旧 alternates 面板不带。
+  function switchSource(bookUrl: string, sourceUrl?: string) {
     if (session.kind !== 'source' || !bookUrl) return;
-    loadConfirmedBook(bookUrl);
+    loadConfirmedBook(bookUrl, sourceUrl);
     setPanel(null);
   }
   // 目录加载成功后把 book_url 持久化进 URL(与 loadIndex 成功对齐)。从 indexUrl 取实参,
   // 保证「写进 URL 的就是服务端刚成功建目录的那个候选」。
-  const commitSwitchedBookUrl = useCallback((bookUrl: string | undefined) => {
+  const commitSwitchedBookUrl = useCallback((bookUrl: string | undefined, sourceUrl?: string) => {
     if (session.kind !== 'source' || !bookUrl) return;
     const query = new URLSearchParams({ title: session.title, author: session.author, from, book_url: bookUrl });
+    if (sourceUrl) query.set('source', sourceUrl);
     if (window.location.search !== '?' + query.toString()) router.replace('/read/source?' + query);
   }, [session, from, router]);
   // M3 复审 P1-3:回调注册放进 effect(ref 写入不得在渲染期做,SSR 会抛)。
@@ -374,12 +385,13 @@ function ReaderSession({ session, from }: Props) {
       {panel === 'sources' && session.kind === 'source' && (
         <Panel title="切换书源" side="right" onClose={() => setPanel(null)}>
           <SourcePanel
-            key={reading?.index.source?.session}
             apiFetch={apiFetch}
             title={session.title}
             author={session.author}
             session={reading?.index.source?.session}
             currentSourceName={reading?.index.source?.name}
+            servingSource={servingSource}
+            probeCache={probeCache}
             onSwitch={switchSource}
           />
         </Panel>
@@ -466,12 +478,98 @@ const SOURCE_STATUS_TEXT: Record<SourceAlternateStatus['status'], string> = {
   ok: '', miss: '该书源没有这本书', unreachable: '该书源暂时无法访问',
 };
 
-/** 换源面板(设计 §4):打开即检测,一次会话内默认只自动检测一次;「重新检测」手动刷新。 */
-function SourcePanel({ apiFetch, title, author, session: catalogSession, currentSourceName, onSwitch }: {
+type SourcePanelProps = {
   apiFetch: (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
   title: string; author: string; session?: string; currentSourceName?: string;
-  onSwitch: (bookUrl: string) => void;
+  /** 正在供稿的源(章内换源后是新源,取 part 的 servedFrom/servedFromUrl);扇出面板据此标「当前源」。 */
+  servingSource?: ServingSource;
+  probeCache: ProbeCache;
+  onSwitch: (bookUrl: string, sourceUrl?: string) => void;
+};
+
+/**
+ * 换源面板(41-panel):先试扇出(候选列表 + 逐源并发 probe);扇出未开(404)时退回旧 alternates 面板。
+ * 旧面板以当前源 session 为 key(MS-29:源会话一变就重挂重检);扇出面板不随 session 重挂 ——
+ * 重挂会把已计数的 probe 再发一遍,当前源标记改由 servingSourceName 实时判定。
+ */
+function SourcePanel({ probeCache, servingSource, ...props }: SourcePanelProps) {
+  const fanout = useSourceFanout({ apiFetch: props.apiFetch, title: props.title, author: props.author, currentSource: servingSource, cache: probeCache });
+  if (fanout.phase === 'disabled') return <LegacySourcePanel key={props.session} {...props} />;
+  return <FanoutSourcePanel fanout={fanout} title={props.title} currentSource={servingSource} onSwitch={props.onSwitch} />;
+}
+
+// 单源 probe 九种结论的用户文案(ok 行展示书名/章数,不用这里的文案);不认识的状态走兜底文案且不可切换。
+const PROBE_STATUS_TEXT: Record<string, string> = {
+  ok: '', similar: '找到相近的书,请确认是哪一本', unreadable: '找到但不可读,该书源暂不支持在线阅读',
+  ambiguous: '该书源有多部同名作品,无法确定是哪一本', miss: '该书源没有这本书', no_candidates: '该书源没有搜到结果',
+  unreachable: '该书源暂时无法访问', timeout: '检测超时', compile_failed: '该书源规则暂不兼容',
+};
+const ROW_STATE_TEXT: Record<Exclude<FanoutRow['state'], 'done' | 'failed'>, string> = {
+  pending: '等待检测', probing: '检测中...', skipped: '未检测(已暂停)', current: '正在阅读',
+};
+
+function probeBookText(book: { title: string; author: string; chapters: number }, title: string): string {
+  return `${book.title || title}${book.author ? ` · ${book.author}` : ''} · ${book.chapters} 章`;
+}
+
+function probeDetail(row: FanoutRow, title: string): string {
+  if (row.state === 'failed') return row.message;
+  if (row.state !== 'done') return ROW_STATE_TEXT[row.state];
+  const { status, book, candidates } = row.result;
+  if (status === 'ok' && book) return probeBookText(book, title);
+  const text = PROBE_STATUS_TEXT[status] ?? '暂不支持的检测结果';
+  // unreadable 仍展示找到的书(仅展示,不给切换入口)。
+  const found = status === 'unreadable' ? book ?? candidates?.[0] : undefined;
+  return found ? `${text}(${probeBookText(found, title)})` : text;
+}
+
+function FanoutSourcePanel({ fanout, title, currentSource, onSwitch }: {
+  fanout: ReturnType<typeof useSourceFanout>; title: string; currentSource?: ServingSource;
+  onSwitch: (bookUrl: string, sourceUrl?: string) => void;
 }) {
+  const { phase, rows, retryAfter, message, rescan } = fanout;
+  const busy = phase === 'loading' || phase === 'running';
+  const settled = rows.filter((row) => row.state === 'done' || row.state === 'failed').length;
+  return (
+    <div className={styles.sources}>
+      <p className={styles.sourcesIntro}>逐个检测各书源能否提供这本书,检测完一个显示一个;可切换的书源点「切换到此源」,尽量保留当前阅读进度。</p>
+      <div className={styles.sourceActions}>
+        <button className={styles.locate} disabled={busy} onClick={rescan}>{busy ? '检测中...' : '重新检测'}</button>
+      </div>
+      {phase === 'rate_limited' && <p className={styles.sourcesError} role="alert">检测过于频繁,请稍后再试{retryAfter ? `（${retryAfter} 秒）` : ''}。</p>}
+      {(phase === 'unavailable' || phase === 'error') && <p className={styles.sourcesError} role="alert">{message}</p>}
+      {phase === 'loading' && <p className={styles.noResults}>正在获取候选书源...</p>}
+      {phase === 'done' && !rows.length && <p className={styles.noResults}>暂无可检测的书源。</p>}
+      {rows.length > 0 && <p className={styles.sourcesNote} role="status">已检测 {settled} / {rows.length}</p>}
+      {rows.length > 0 && <ul className={styles.sourceList}>
+        {rows.map((row) => {
+          const current = isCurrentSource(row, currentSource);
+          const result = row.state === 'done' ? row.result : null;
+          // 只有 readable 的 ok / similar 可切换;unreadable 与任何不认识的状态一律仅展示。
+          const switchable = !!result && result.readable && !current;
+          const book = switchable && result.status === 'ok' ? result.book : undefined;
+          const candidates = switchable && result.status === 'similar' ? result.candidates ?? [] : [];
+          return (
+            <li key={row.url} className={styles.sourceRow} data-probe-status={result ? result.status : row.state} aria-current={current ? 'true' : undefined}>
+              <span className={styles.sourceName}>{row.name}{current && <small className={styles.sourceBadge}>当前源</small>}</span>
+              <span className={styles.sourceDetail}>{probeDetail(row, title)}</span>
+              {book?.bookUrl && <button className={styles.locate} onClick={() => onSwitch(book.bookUrl, result!.sourceUrl)}>切换到此源</button>}
+              {candidates.map((candidate) => (
+                <button key={candidate.bookUrl} className={styles.similarItem} onClick={() => onSwitch(candidate.bookUrl, result!.sourceUrl)}>
+                  <strong>{candidate.title}</strong>
+                  <span>{candidate.author || '佚名'}{candidate.alias ? ` · 原名《${candidate.alias}》` : ''} · {candidate.chapters} 章 · 切换到此源</span>
+                </button>
+              ))}
+            </li>
+          );
+        })}
+      </ul>}
+    </div>
+  );
+}
+
+/** 旧换源面板(设计 §4,扇出未开时的回退):打开即检测,一次会话内默认只自动检测一次;「重新检测」手动刷新。 */
+function LegacySourcePanel({ apiFetch, title, author, session: catalogSession, currentSourceName, onSwitch }: Omit<SourcePanelProps, 'probeCache' | 'servingSource'>) {
   const [sources, setSources] = useState<SourceAlternateStatus[] | null>(null);
   const [partial, setPartial] = useState(false);
   const [error, setError] = useState('');

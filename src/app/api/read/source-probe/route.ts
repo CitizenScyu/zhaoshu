@@ -5,7 +5,7 @@ import { ensureSchema } from '@/lib/db';
 import { createDeadline, raceDeadline } from '@/lib/deadline';
 import { cleanString } from '@/lib/sanitize';
 import { getFanoutPool, sourceFanoutEnabled, sourceFanoutLimit } from '@/lib/shuyuan';
-import { SOURCE_PROBE_BUDGET_MS, probeResultForPanel, probeSourceForBook } from '@/lib/source-reader';
+import { SOURCE_PROBE_BUDGET_MS, probeResultForPanel, probeSourceForBook, sourceStationKey } from '@/lib/source-reader';
 import { SourceProbeRateLimitUnavailableError, checkSourceProbeRateLimit } from '@/lib/source-probe-rate-limit';
 
 // 41-fanout 第一期（服务端）：浏览器换源面板逐源并发的单源入口。一次调用只查一个源，不循环、不遍历池。
@@ -62,9 +62,10 @@ export async function GET(req: NextRequest) {
     }
     const pool = await getFanoutPool(signal);
     if (listOnly) {
+      // hostKey：服务端按站节流用的同一站键（book15 apex/www 归一），面板据此做同站串行（41-srcurl）。
       return response({
         limit: sourceFanoutLimit(),
-        sources: pool.map(({ url, name, tier, readable }) => ({ url, name, tier: tier ?? 'builtin', readable })),
+        sources: pool.map(({ url, name, tier, readable }) => ({ url, name, tier: tier ?? 'builtin', readable, hostKey: sourceStationKey(url) })),
       });
     }
     const source = pool.find((item) => item.url === sourceUrl);

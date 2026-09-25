@@ -376,12 +376,16 @@ describe('正文渲染', () => {
   // 带 key(props 与 key 同源)——key 一旦被拿掉,本测试红。行为断言依赖
   // autoDone ref 随重挂归零,该机制属 SourcePanel 内部实现,已被其「一次会话内
   // 默认只自动检测一次」的注释与下方「重新检测」按钮共同钉住。
+  // 41-panel:key 下沉到旧面板 LegacySourcePanel(扇出未开时的回退);扇出面板刻意不随 session 重挂
+  // (重挂会把已计数的 probe 再发一遍)。session 仍由外层 SourcePanel 透传给旧面板。
   it('换源面板挂载点 key 绑定当前书源 session(MS-29)', async () => {
     const source = await import('node:fs/promises').then((fs) =>
       fs.readFile(new URL('./ReaderClient.tsx', import.meta.url), 'utf8'));
     const mount = source.match(/<SourcePanel[\s\S]*?\/>/)?.[0] ?? '';
-    expect(mount).toContain('key={reading?.index.source?.session}');
     expect(mount).toContain('session={reading?.index.source?.session}');
+    const legacy = source.match(/<LegacySourcePanel[\s\S]*?\/>/)?.[0] ?? '';
+    expect(legacy).toContain('key={props.session}');
+    expect(legacy).toContain('{...props}');
   });
 });
 

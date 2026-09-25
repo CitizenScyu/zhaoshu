@@ -178,6 +178,12 @@
 .sourceItem[aria-current='true'] { border-color: var(--reader-accent); background: var(--reader-selected); color: var(--reader-accent); cursor: default; }
 .sourceName { font-weight: 600; }
 .sourceBadge { color: var(--reader-accent); font-size: 11px; border: 1px solid var(--reader-accent); border-radius: 2px; padding: 0 4px; }
+.sourceRow { display: flex; flex-direction: column; align-items: flex-start; gap: 6px; min-height: 52px; padding: 12px 14px; border: 1px solid var(--reader-line); border-radius: 4px; font-size: 14px; }
+.sourceRow .sourceName { display: flex; align-items: center; gap: 6px; }
+.sourceRow .similarItem { width: 100%; }
+.sourceRow[aria-current='true'] { border-color: var(--reader-accent); background: var(--reader-selected); }
+.sourceRow:not([data-probe-status='ok']):not([data-probe-status='similar']):not([aria-current='true']) { opacity: .7; }
+.sourceDetail { color: var(--reader-muted); font-size: 12px; line-height: 1.7; }
 @keyframes open-panel { from { opacity: .3; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
 @media (max-width: 640px) {
   .header { min-height: 62px; gap: 8px; padding: calc(6px + env(safe-area-inset-top)) max(12px, env(safe-area-inset-right)) 6px max(12px, env(safe-area-inset-left)); }
