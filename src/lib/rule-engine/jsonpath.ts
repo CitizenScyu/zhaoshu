@@ -1,6 +1,7 @@
 // JSONPath 子集：自写解析 + 求值，不引库（§1 决策：jsonpath-plus 的 filter 走 JS 求值，
 // 违反「不执行 JS」红线）。支持构件（设计 §2.2，M1-113 集核心字段口径）：
 //   $.a.b   ['a']   ..b   [*] / .*   [n] / [n,m]   [a:b]   [?(@.x == y)]
+//   ..[n] / ..[n,m] / ..[a:b]（Jayway 扫描 + 数组 token，jsoninner41）
 // $ 后跟非上述语法 → RULE_UNSUPPORTED（编译期拒绝，不猜测）。
 
 import {
@@ -38,6 +39,22 @@ export function parseJsonPath(input: string): JsonPathIr {
           // 递归通配 `$..*` 不在 M1 子集：语义应为「所有层级的所有值」，与 `$.*`（仅一层）不同。
           // 不静默塌缩为 $.*（那会悄悄改语义），显式拒绝（对齐 `$..[*]` 的「递归后缺字段名」）。
           fail('递归通配 `$..*` 不在 M1 子集（递归 .. 后需字段名）');
+        }
+        if (raw[i] === '[') {
+          // `..[n]`：Jayway 的扫描 token 后接数组 token（ArrayIndexToken/ArraySliceToken 都继承
+          // ArrayPathToken）。ScanPathToken.walkArray 对每个数组（先序、含起点）：数组 token 是末段时
+          // 对该数组求下标；不是末段时**跳过下标**，把后续 token 施于该数组的每个元素（json-path 2.10.0
+          // ScanPathToken.java:47-70）。`..[*]`/`..['x']`/过滤器不是数组 token，仍拒绝。
+          const close = raw.indexOf(']', i);
+          if (close < 0) fail('未闭合的 [');
+          const bracket = parseBracket(raw.slice(i + 1, close).trim(), fail);
+          if (bracket.kind !== 'index' && bracket.kind !== 'indexList' && bracket.kind !== 'slice') {
+            fail('递归 .. 后缺少字段名');
+          }
+          i = close + 1;
+          if (i >= n) segments.push({ kind: 'arrayScan', elements: false }, bracket);
+          else segments.push({ kind: 'arrayScan', elements: true });
+          continue;
         }
         const name = readIdent(raw, i);
         if (name === null) fail('递归 .. 后缺少字段名');
@@ -175,6 +192,10 @@ function applySegment(seg: JsonPathSegment, node: Json, out: Json[]): void {
       collectRecursive(node, seg.name, out);
       return;
     }
+    case 'arrayScan': {
+      collectArrays(node, seg.elements, out);
+      return;
+    }
     case 'wildcard': {
       if (Array.isArray(node)) out.push(...node);
       else if (isObject(node)) out.push(...Object.values(node));
@@ -235,6 +256,17 @@ function collectRecursive(node: Json, name: string, out: Json[]): void {
       if (k === name) out.push(v);
       collectRecursive(v, name, out);
     }
+  }
+}
+
+/** Jayway ScanPathToken.walk 的先序：数组先产出自身（或全部元素）再下探元素，对象按属性序下探。 */
+function collectArrays(node: Json, elements: boolean, out: Json[]): void {
+  if (Array.isArray(node)) {
+    if (elements) out.push(...node);
+    else out.push(node);
+    for (const el of node) collectArrays(el, elements, out);
+  } else if (isObject(node)) {
+    for (const v of Object.values(node)) collectArrays(v, elements, out);
   }
 }
 

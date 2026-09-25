@@ -79,7 +79,10 @@ export type JsonPathSegment =
   | { kind: 'index'; index: number } //       [n]（负数从尾）
   | { kind: 'indexList'; indexes: number[] } // [n,m]
   | { kind: 'slice'; start?: number; end?: number } // [a:b]
-  | { kind: 'filterEq'; name: string; value: string | number | boolean }; // [?(@.x==y)]
+  | { kind: 'filterEq'; name: string; value: string | number | boolean } // [?(@.x==y)]
+  // ..[n] / ..[n,m] / ..[a:b]（Jayway ScanPathToken + 数组 token）：elements=false 时产出每个数组本身
+  // （后接下标段），elements=true 时产出每个数组的全部元素（数组 token 不是末段，Jayway 略过下标）。
+  | { kind: 'arrayScan'; elements: boolean };
 
 export interface JsonPathIr {
   segments: JsonPathSegment[];
