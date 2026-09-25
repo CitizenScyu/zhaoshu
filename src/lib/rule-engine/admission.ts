@@ -83,16 +83,26 @@ export function admissionProbeConcurrency(env: AdmissionProbesEnv = process.env)
   return Math.min(parsed, MAX_ADMISSION_PROBE_CONCURRENCY);
 }
 /**
- * deferred 态重测间隔（设计 §4.2：软故障/url_invalid 定期重测）。
+ * deferred 态重测间隔（设计 §4.2：软故障定期重测）。适用 http_4xx/http_5xx/query_insensitive、
+ * 网络期 url_invalid 与可疑 ok；no_result 与本地确定性 url_invalid 另见 ADMISSION_NO_RESULT_RETEST_MS、
+ * isRetestDue（41-srcfix P2）。
  * 取 20h 而非 24h：cron 有分钟级抖动/偶发漏触发，严格 24h 判据会把前一日刚测过的
  * deferred 源推迟一整周期才复测；20h 留 4h 余量，保证每个自然日至少复测一次。
  */
 export const ADMISSION_RETEST_INTERVAL_MS = 20 * 3_600_000;
 /**
+ * no_result 复测窗（41-srcfix P2）：no_result 是「页面拿到了、bookList 解析不出候选」，主因是规则/
+ * 引擎解析缺口（srcfail-41 §2），站点侧抖动少见——规则变 rules_hash 就变、自动重排，引擎语义变
+ * 也随语义版本前缀进 hash；剩下按时间复测只为兜「站点暂时空结果」这一小类。20h 窗下 30 行
+ * no_result 每天吃 30 个名额（名额默认 20/天），把 class 2 的 ok 复核饿死（srclife-41b G1/G2）。
+ * 取 72h：需求降到 1/3，站点恢复最迟晚 3 天回池。http_4xx/5xx、query_insensitive 仍按 20h。
+ */
+export const ADMISSION_NO_RESULT_RETEST_MS = 72 * 3_600_000;
+/**
  * conn_fail 衰减复测窗（41-B1-RETRY）：conn_fail 仍归 rejected 桶（出池、漏斗口径不变），
  * 但不再是「一次 8s 超时定终身」——search_checked_at 距今超过该窗即回到待复探，下一轮
- * cron 拿到名额就重探。取 7d 而非 20h：死站每源每周最多吃 1 个探测名额（名额 10/轮 ×
- * cron 4 轮/天 = 40/天，K 个死站只占 K/7 每天），瞬时抖动误杀的源最迟 7 天回池。
+ * cron 拿到名额就重探。取 7d 而非 20h：死站每源每周最多吃 1 个探测名额（名额默认 20/轮 ×
+ * cron 每日 1 轮，env ADMISSION_MAX_PROBES 可调；K 个死站只占 K/7 每天），瞬时抖动误杀的源最迟 7 天回池。
  * challenge/shell 是站点行为（非网络层），维持终态不衰减。
  */
 export const ADMISSION_CONN_FAIL_RETEST_MS = 7 * 24 * 3_600_000;
@@ -714,13 +724,38 @@ function compileDiagnostics(compile: AdmissionCompile): AdmissionSourceRow['comp
   return compile.failures.map(({ field, diagnostic }) => ({ field, ...diagnostic }));
 }
 
-function isRetestDue(row: AdmissionSourceRow, nowMs: number): boolean {
+/**
+ * 搜索模板在**当前代码 + 当前声明 host 集**下本地展开仍失败（41-srcfix P2）：url_invalid 的本地确定性
+ * 形态（模板缺 {{key}}/动态规则/非 HTTPS/非精确域名/IP/host 未声明）不发请求，同输入必同结论，按时间
+ * 复测纯耗名额。只看 rules_hash 不够：source-policy 判据（如 http→https 升级、搜索 host 放行）或声明
+ * host 集变了，结论会变而 hash 不变。所以不引入判据版本号（要人记得手动递增，漏递增就永不重测），
+ * 而是每轮直接用现行代码重跑这一步纯本地展开——判据怎么变都自动跟上，零网络、不占名额。
+ */
+function searchUrlStillInvalid(source: RawSource, declaredHosts: ReadonlySet<string>): boolean {
+  try {
+    expandAdmissionSearchUrl(source, declaredHosts);
+    return false;
+  } catch {
+    return true;
+  }
+}
+
+/** deferred 各 verdict 的时间复测窗（41-srcfix P2）。 */
+function deferredRetestWindowMs(verdict: string): number {
+  return verdict === 'no_result' ? ADMISSION_NO_RESULT_RETEST_MS : ADMISSION_RETEST_INTERVAL_MS;
+}
+
+function isRetestDue(row: AdmissionSourceRow, nowMs: number, urlStillInvalid: () => boolean): boolean {
   if (row.search_ok === null) return true; // 未测（含被限流跳过的新源）
   const bucket = admissionBucket(row.search_verdict);
   if (bucket === 'deferred') {
+    // url_invalid 且现行判据本地展开仍失败 ⇒ 结论不会变，不按时间复测（规则变走 rulesChanged 重排）。
+    // 本地展开已能通过的 url_invalid：要么判据/声明集变了（该重测），要么当初是网络期策略拒
+    // （跳转越界/超体积，站点行为可变）——两者都按 20h 窗复测。
+    if (row.search_verdict === 'url_invalid' && urlStillInvalid()) return false;
     if (!row.search_checked_at) return true;
     const checked = Date.parse(row.search_checked_at);
-    return !Number.isFinite(checked) || nowMs - checked >= ADMISSION_RETEST_INTERVAL_MS;
+    return !Number.isFinite(checked) || nowMs - checked >= deferredRetestWindowMs(row.search_verdict);
   }
   // 41-B1-RETRY：conn_fail 的 rejected 终态带时间衰减——超 7 天回到待复探（见常量注释）。
   // 复探仍可能再判 conn_fail（checked_at 刷新、再等 7 天），但站点恢复后能自动回池。
@@ -772,7 +807,8 @@ function planProbeOrder(input: AdmissionBatchInput, nowMs: number): AdmissionPla
     const rulesChanged = !previous || previous.rules_hash !== hash;
     let probeClass: ProbeClass = 3;
     if (!previous || previous.search_ok === null) probeClass = 0; // 从未测过（含占位行）
-    else if (rulesChanged || isRetestDue(previous, nowMs)) {
+    else if (rulesChanged
+      || isRetestDue(previous, nowMs, () => searchUrlStillInvalid(candidate.source, input.declaredHosts))) {
       // 41-B2-OK-RECHECK：干净 ok 行的长周期复核排最后（class 2），其余到期者（deferred /
       // conn_fail 衰减 / 可疑 ok / 规则变）走 class 1。
       probeClass = !rulesChanged

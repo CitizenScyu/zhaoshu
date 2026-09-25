@@ -196,16 +196,42 @@ export interface ReadingPool {
  * 本函数产出的池序本身不变，仍是 builtin 恒在前。
  */
 export async function getReadingPool(signal: AbortSignal): Promise<ReadingPool> {
-  const limit = readingPoolLimit();
   const eligible = await eligibleReadingSources(signal, engineSourcesEnabled());
   // builtin 全部排在引擎源之前（§2.4 首键），故 slice 上限作用在合并序列上即等价于
   // 「先取满 builtin、再按引擎源全序补位」——builtin 永远不会被引擎源挤出池。
-  const sources = eligible.slice(0, limit);
+  const sources = traversalOf(eligible);
   return {
     sources,
     enginePoolSize: sources.filter((source) => source.tier !== undefined && source.tier !== 'builtin').length,
     poolCandidates: Math.max(0, eligible.length - sources.length),
   };
+}
+
+/**
+ * 自动遍历的取书池切片（getReadingPool 与 getSourcePools.traversal 共用，二者逐条相同）。
+ *
+ * 同站去重（41-srcfix）：引擎源按 bookSourceUrl 的 hostname 只留全序里最靠前的一份（reachable → tier →
+ * search_checked_at 最新）。同站多副本（合集里同一站的多份规则，如 sma.yueyouxs.com 6 份）同一轮 cron 测完、
+ * checked_at 挨着，会整段排在池首，把 READING_POOL_LIMIT 个名额占成同一个站——站挂了或没这本书，自动遍历一次
+ * 全白跑。只作用于**自动遍历**：selectable（用户点选/章节续读认当前源）与扇出候选不去重，已在读某个副本的
+ * 用户照样反查得到它（去重选中的副本会随复核时间戳换人，放进反查范围就会让在读用户被迫换源）。
+ * 只在 selectable 的窗口（前 selectableSourceLimit() 条）里挑，保证 traversal ⊆ selectable：自动首开选中的源，
+ * 之后章节路径一定按 selectable 认得回来。builtin 不参与（book15 零回归红线）。
+ */
+function traversalOf(eligible: readonly ReadingSource[]): ReadingSource[] {
+  const limit = readingPoolLimit();
+  const seenHosts = new Set<string>();
+  const out: ReadingSource[] = [];
+  for (const source of eligible.slice(0, selectableSourceLimit())) {
+    if (out.length >= limit) break;
+    if (source.tier !== 'builtin') {
+      const host = hostOfUrl(source.url);
+      if (seenHosts.has(host)) continue;
+      seenHosts.add(host);
+    }
+    out.push(source);
+  }
+  return out;
 }
 
 /**
@@ -289,21 +315,21 @@ export function selectableSourceLimit(): number {
 }
 
 export interface SourcePools {
-  /** 自动遍历（无指定源的首开 / 章节级兜底换源）：按 readingPoolLimit() 截断，与 getReadingSources 逐条相同。 */
+  /** 自动遍历（无指定源的首开 / 章节级兜底换源）：traversalOf（同站去重后按 readingPoolLimit() 截断），与 getReadingSources 逐条相同。 */
   traversal: ReadingSource[];
-  /** 用户显式指定源的反查范围：同一序列按 selectableSourceLimit() 截断、再按开关过滤（见 selectableTier）。 */
+  /** 用户显式指定源的反查范围：同一序列按 selectableSourceLimit() 截断、再按开关过滤（见 selectableTier）；不去重。 */
   selectable: SelectableSources;
 }
 
 /**
- * 一次合成同时给出两份池（41-readall）：traversal 是 selectable 的前缀（同一全序），章节路径一次 DB 往返拿齐。
+ * 一次合成同时给出两份池（41-readall）：traversal ⊆ selectable（同一全序、同一窗口，traversal 再做同站去重），章节路径一次 DB 往返拿齐。
  * includeEngine 与取书池同口径（READING_ENGINE_SOURCES）：开关关时不刷 host 门、不查准入表，selectable 只剩 builtin。
  */
 export async function getSourcePools(signal: AbortSignal): Promise<SourcePools> {
   const engineOn = engineSourcesEnabled();
   const eligible = await eligibleReadingSources(signal, engineOn);
   return {
-    traversal: eligible.slice(0, readingPoolLimit()),
+    traversal: traversalOf(eligible),
     selectable: eligible.slice(0, selectableSourceLimit())
       .filter((source) => selectableTier(source, engineOn)) as unknown as SelectableSources,
   };
@@ -1050,7 +1076,8 @@ async function refreshWithinBudget(s: Sql, budget: RequestDeadline, signal: Abor
 /**
  * 准入批次（设计 §4.2）。时序：全量替换事务之后。硬约束：
  * - 剩余预算 ≤ ADMISSION_MIN_BUDGET_MS 即整批跳过，绝不挤占刷新预算（180s）；
- * - 候选池 = 通过 survey 初筛的源（非候选根本不进 M1 准入，故无候选时零 DB 往返）；
+ * - 候选池 = 通过 survey 初筛的源 + 初筛不过但留有 compile_ok 旧行的源（41-srcfix G5，送回改判出池）；
+ *   既有行读一次（按本轮全部源 URL），二者皆空才整批跳过；
  * - runAdmissionBatch 每轮真实搜索 ≤ admissionMaxProbes()（默认 20，env `ADMISSION_MAX_PROBES` 可调），逐探前再查预算。
  * 只写 source_admission，不碰 shuyuan_sources；异常不终结刷新（§6.3：准入异常 → deferred）。
  */
@@ -1072,16 +1099,25 @@ async function runAdmissionAfterRefresh(
     try { declaredHosts.add(new URL(row.url).hostname); } catch { /* 上游脏 URL：无法声明 host */ }
   }
   const candidates: AdmissionCandidate[] = [];
+  const surveyRejected: AdmissionCandidate[] = [];
   for (const row of rows) {
     const source = row.source as RawSource;
-    if (selectCandidates([source]).length !== 1) continue;
-    candidates.push({ url: row.url, source });
+    (selectCandidates([source]).length === 1 ? candidates : surveyRejected).push({ url: row.url, source });
   }
-  if (candidates.length === 0) return;
   try {
-    const existing = await readAdmissionRows(s, candidates.map((candidate) => candidate.url), signal);
+    // 既有行按**全部**本轮源读（不只候选）：初筛不过的源若留着 compile_ok 的旧行（41-srcfix G5：规则改到
+    // 过不了初筛），要把它送回批次改判出池，见下。只回已有准入行（≈候选规模），不读 source 大列。
+    const existing = await readAdmissionRows(s, rows.map((row) => row.url), signal);
+    // G5 冻结行：初筛不过的源本不进评估环，其既有 compile_ok 行（ok 或未测）就再没人复核——池 JOIN 仍命中，
+    // 新规则（可能带 JS/POST）以 ok 身份留池。补送进批次：compileAdmission 第一步即 survey 初筛，改判
+    // T7 compile_ok=false（规则未变且已在池的由 N03 祖父条款接住，与候选同一判据）；下一轮旧行已是
+    // compile_ok=false ⇒ 终态去抖不再重写。这是**扩**评估环而非把候选池收窄成「只喂 compile_ok」
+    // （admission.ts「严禁」注释防的是后者）：compile_ok=false 的旧行照旧不喂，上游改回合规规则时源
+    // 重新过初筛成为普通候选，占位行 search_ok=null ⇒ class 0 未测优先，自动回池。
+    const frozen = surveyRejected.filter((candidate) => existing.get(candidate.url)?.compile_ok === true);
+    if (candidates.length === 0 && frozen.length === 0) return;
     const result = await runAdmissionBatch({
-      candidates, declaredHosts, existing, fetchPage: defaultAdmissionTransport, signal,
+      candidates: [...candidates, ...frozen], declaredHosts, existing, fetchPage: defaultAdmissionTransport, signal,
       // espfix41：开查询不敏感对照搜索，单探最坏 = 主搜索 + 对照搜索（ADMISSION_PROBE_WORST_MS），止损按它预留。
       controlQuery: true,
       canProbe: () => !signal.aborted && budget.remainingMs > ADMISSION_PROBE_WORST_MS + WRITE_RESERVE_MS,
@@ -1089,6 +1125,7 @@ async function runAdmissionAfterRefresh(
     // 准入兼容 L4（§2.4）：每轮一行漂移计数（不建历史表；要趋势曲线再上日表，Phase 2）。
     console.log('shuyuan admission batch', {
       candidates: candidates.length,
+      surveyRejectedExisting: frozen.length,
       compileOk: result.compileOk,
       compileRejected: result.compileRejected,
       grandfathered: result.grandfathered,
