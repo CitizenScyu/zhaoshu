@@ -23,6 +23,7 @@ try {
     expectedVersion: SCHEMA_VERSION, expectedChecksum: head?.checksum ?? null,
     expectedMigrations: verdict.expectedMigrations, checksumOk: verdict.checksumOk,
     authVersion: verdict.authVersion, expectedAuthVersion: verdict.expectedAuthVersion, authVersionOk: verdict.authVersionOk,
+    artifactVersion: verdict.artifactVersion, expectedArtifactVersion: verdict.expectedArtifactVersion, artifactVersionOk: verdict.artifactVersionOk,
     missingTables: verdict.missingTables, dangerous: report.dangerous, versions: report.versions,
     columns: report.columns, indexes: report.indexes, constraints: report.constraints }, null, 2));
   if (!verdict.ok) process.exitCode = 2;

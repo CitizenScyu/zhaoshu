@@ -5,6 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { Client } from '@neondatabase/serverless';
 import { SCHEMA_MIGRATION_LOCK_ID, SCHEMA_VERSION } from '../src/lib/schema-version.ts';
 import { AUTH_SCHEMA_VERSION } from '../src/lib/auth-store.ts';
+import { ARTIFACT_SCHEMA_VERSION } from '../src/lib/artifact-schema.ts';
 
 export { SCHEMA_VERSION };
 export const MIGRATION_LOCK_ID = SCHEMA_MIGRATION_LOCK_ID;
@@ -19,12 +20,23 @@ export const TARGET_SCHEMA = 'public';
 //     auth 侧是否到位由 evaluateSchema 的 authVersionOk 判（库版本 ≥ AUTH_SCHEMA_VERSION）。
 // app_settings / cron_health / profile_feedback_queue / source_admission 由 0003 建（MS-25）；
 // 此前它们只有运行时 DDL、不在本清单里，冷建库缺这四张表 db:check 也照样通过。
+// artifact_schema_migrations / storage_repositories / book_artifacts 由 initializeArtifactSchema
+// （src/lib/artifact-schema.ts，自有 version 1）单独建——同 auth 侧的道理：它是显式迁移、不进
+// 0001–0003，冷建库须再跑 migrate:artifacts:prod。此前它们不在本清单里，冷建库缺这两张业务表
+// `db:check:prod` 仍 rc=0（tempdb41 §缺陷 D1 实测：T8 worker 启动即 relation does not exist）。
 export const EXPECTED_TABLES = [
-  'app_settings', 'auth_rate_limits', 'auth_schema_migrations', 'auth_settings', 'books',
-  'cron_health', 'download_tasks', 'feedback', 'labeled_books', 'llm_usage', 'profile',
+  'app_settings', 'artifact_schema_migrations', 'auth_rate_limits', 'auth_schema_migrations', 'auth_settings',
+  'book_artifacts', 'books', 'cron_health', 'download_tasks', 'feedback', 'labeled_books', 'llm_usage', 'profile',
   'profile_feedback_queue', 'profile_seed_audit', 'recommendations', 'schema_migrations', 'sessions',
-  'shuyuan_meta', 'shuyuan_sources', 'source_admission', 'source_read_catalogs', 'users',
+  'shuyuan_meta', 'shuyuan_sources', 'source_admission', 'source_read_catalogs', 'storage_repositories', 'users',
 ];
+
+// 由自己的显式迁移（不是 0001–0003）建、但同属「冷建库必须补齐、缺了 db:check:prod 就该非 0」的表。
+// artifact 侧与 auth 侧同理：迁移本体在 src/lib/artifact-schema.ts（自有记账表 version 1），
+// 目标必须由 `migrate:artifacts:prod --database-url-env=...` 补齐；db:baseline 的契约只对 0001–0003 的
+// 20 张表成立，故核对「EXPECTED_TABLES 与 0001–0003 契约的表集合」的测试要减掉这份清单。
+export const ARTIFACT_TABLES = ['artifact_schema_migrations', 'book_artifacts', 'storage_repositories'];
+
 
 const here = dirname(fileURLToPath(import.meta.url));
 const migrationsDir = resolve(here, '..', 'migrations');
@@ -292,12 +304,18 @@ export async function inspectSchema(client, schema = TARGET_SCHEMA) {
   const authVersion = await exists('auth_schema_migrations')
     ? (await client.query(`SELECT max(version)::int AS version FROM ${assertIdentifier(schema)}.auth_schema_migrations`)).rows[0].version
     : null;
-  return { schema, versions, authVersion, columns, indexes, constraints, dangerous, checkedColumns: REQUIRED_DOWNLOAD_TASK_COLUMNS };
+  const artifactVersion = await exists('artifact_schema_migrations')
+    ? (await client.query(`SELECT max(version)::int AS version FROM ${assertIdentifier(schema)}.artifact_schema_migrations`)).rows[0].version
+    : null;
+  return { schema, versions, authVersion, artifactVersion, columns, indexes, constraints, dangerous,
+    checkedColumns: REQUIRED_DOWNLOAD_TASK_COLUMNS };
 }
 
-// db:check 的判定（纯函数，便于在真库测试里直接断言）。三条都要成立才算通过：
-// 1. EXPECTED_TABLES 一张不缺；2. 迁移列表里每个版本都已登记且 name+摘要一致；
-// 3. auth 记账 ≥ AUTH_SCHEMA_VERSION——否则运行时 assertAuthSchema 会 503，检查却说「通过」。
+// db:check 的判定（纯函数，便于在真库测试里直接断言）。四条都要成立才算通过：
+// 1. EXPECTED_TABLES 一张不缺（含 artifact 两表与它的记账表）；2. 迁移列表里每个版本都已登记且 name+摘要一致；
+// 3. auth 记账 ≥ AUTH_SCHEMA_VERSION——否则运行时 assertAuthSchema 会 503，检查却说「通过」；
+// 4. artifact 记账 ≥ ARTIFACT_SCHEMA_VERSION——否则 T8 worker 启动即 `relation ... does not exist`
+//    （tempdb41 §缺陷 D1 实测），检查同样不该说「通过」。
 export function evaluateSchema(report, migrations) {
   const present = new Set(report.columns.map((item) => item.table_name));
   const missingTables = EXPECTED_TABLES.filter((table) => !present.has(table));
@@ -310,9 +328,11 @@ export function evaluateSchema(report, migrations) {
   });
   const checksumOk = expectedMigrations.every((item) => item.checksumOk);
   const authVersionOk = (report.authVersion ?? 0) >= AUTH_SCHEMA_VERSION;
-  const ok = checksumOk && authVersionOk && !missingTables.length && !report.dangerous.length;
+  const artifactVersionOk = (report.artifactVersion ?? 0) >= ARTIFACT_SCHEMA_VERSION;
+  const ok = checksumOk && authVersionOk && artifactVersionOk && !missingTables.length && !report.dangerous.length;
   return { ok, missingTables, expectedMigrations, checksumOk,
-    authVersion: report.authVersion ?? null, expectedAuthVersion: AUTH_SCHEMA_VERSION, authVersionOk };
+    authVersion: report.authVersion ?? null, expectedAuthVersion: AUTH_SCHEMA_VERSION, authVersionOk,
+    artifactVersion: report.artifactVersion ?? null, expectedArtifactVersion: ARTIFACT_SCHEMA_VERSION, artifactVersionOk };
 }
 
 // 严格记账比对（纯函数）：生产入口的 dry-run 计划与 apply 锁内复核共用。

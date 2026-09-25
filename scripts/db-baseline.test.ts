@@ -13,7 +13,7 @@ import {
   compareShape, inspectShape, shapeToContract,
 } from './db-baseline.mjs';
 import { BASELINE_LEDGER_SHAPE, BASELINE_SHAPE } from './db-baseline-contract.mjs';
-import { applyMigration, EXPECTED_TABLES, loadMigrations, PUBLISHED_CHECKSUMS, SCHEMA_MIGRATIONS_DDL } from './db-migration-lib.mjs';
+import { applyMigration, ARTIFACT_TABLES, EXPECTED_TABLES, loadMigrations, PUBLISHED_CHECKSUMS, SCHEMA_MIGRATIONS_DDL } from './db-migration-lib.mjs';
 import { main, parseProdArgs, runProdBaseline, runProdCheck, runProdMigrate } from './db-prod.mjs';
 import { runAuthMigration } from './migrate-auth-prod.mjs';
 
@@ -34,11 +34,14 @@ const maybe = PGliteCtor ? describe : describe.skip;
 let cached: Migration[] | undefined;
 const load = async () => (cached ??= await loadMigrations());
 
-// (a) 0001–0003 真跑出的库，auth 补到 7，再去掉记账表：结构与迁移建库完全相同，只是从未登记。
+// (a) 0001–0003 真跑出的库，auth 补到 7、artifact schema 补到 v1，再去掉记账表：结构与生产（迁移管理
+// 的表 + auth 侧 + artifact 侧全齐）相同，只是从未登记。artifact 三表是 41-coldbuild 加的：db:check:prod
+// 现在要求它们存在，而生产本来就有（t8-pilot-41-report.md:24），所以「登记后 check 应通过」的模型必须含它们。
 async function migratedUnledgered(): Promise<PGliteLike> {
   const pg = new PGliteCtor!();
   await applyMigration(createPGliteClient(pg), await load());
   await runAuthMigration(createPGliteSql(pg), 'apply');
+  await initializeArtifactSchema(createPGliteSql(pg) as never);
   await pg.exec('DROP TABLE schema_migrations');
   return pg;
 }
@@ -104,8 +107,8 @@ describe('契约的来源与冻结', () => {
     for (const [version, checksum] of Object.entries(PUBLISHED_CHECKSUMS)) expect(BASELINE_CHECKSUMS[Number(version) as 1 | 2]).toBe(checksum);
   }, 60_000);
 
-  it('契约的表 = 迁移管理的表（EXPECTED_TABLES 去掉记账表）= 出处表的键', () => {
-    const expected = EXPECTED_TABLES.filter((table) => table !== 'schema_migrations').sort();
+  it('契约的表 = 迁移管理的表（EXPECTED_TABLES 去掉记账表与 artifact 三表）= 出处表的键', () => {
+    const expected = EXPECTED_TABLES.filter((table) => table !== 'schema_migrations' && !ARTIFACT_TABLES.includes(table)).sort();
     expect(Object.keys(BASELINE_SHAPE).sort()).toEqual(expected);
     expect(Object.keys(BASELINE_TABLE_SOURCES).sort()).toEqual(expected);
   });

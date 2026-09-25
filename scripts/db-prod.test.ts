@@ -2,11 +2,13 @@
 // 参数闸门、连接变量不回退、输出不含连接串用纯函数 + main 注入测；dry-run 零写入、apply 记账、
 // 重复 apply 空转、摘要被改 / 版本倒退 / 未知版本拒绝、列类型漂移拒绝都在 PGlite 真库上跑真 SQL。
 import { describe, expect, it } from 'vitest';
+import { initializeArtifactSchema } from '../src/lib/artifact-schema';
 import { initializeBusinessSchema } from '../src/lib/business-schema';
 import { loadPGlite, type PGliteLike } from '../src/lib/fixtures/pglite';
 import { createPGliteClient, createPGliteSql } from '../src/lib/fixtures/pglite-sql';
-import { applyMigration, checkRuntimeColumns, EXPECTED_RUNTIME_COLUMNS, loadMigrations, planMigrations } from './db-migration-lib.mjs';
+import { ARTIFACT_TABLES, applyMigration, checkRuntimeColumns, EXPECTED_RUNTIME_COLUMNS, loadMigrations, planMigrations } from './db-migration-lib.mjs';
 import { main, parseProdArgs, plannedLedgerWrites, runProdCheck, runProdMigrate, unadoptedRefusal } from './db-prod.mjs';
+import { runArtifactMigration } from './migrate-artifacts-prod.mjs';
 import { runAuthMigration } from './migrate-auth-prod.mjs';
 
 type Migration = Awaited<ReturnType<typeof loadMigrations>>[number];
@@ -188,11 +190,14 @@ maybe('PGlite 真库', () => {
   let migrations: Migration[];
   const load = async () => (migrations ??= await loadMigrations());
 
-  // 生产形态：v1/v2 由迁移登记，auth 已到 7，四张运行期表由 initializeBusinessSchema 建（v3 未登记）。
+  // 生产形态：v1/v2 由迁移登记，auth 已到 7，artifact schema 已建（生产本来就有，
+  // t8-pilot-41-report.md:24），四张运行期表由 initializeBusinessSchema 建（v3 未登记）。
+  // artifact 三表是 41-coldbuild 加的：db:check:prod 现在要求它们存在，旧形态会误报缺表。
   async function prodLike(): Promise<PGliteLike> {
     const pg = new PGliteCtor!();
     await applyMigration(createPGliteClient(pg), (await load()).filter((item) => item.version < 3));
     await runAuthMigration(createPGliteSql(pg), 'apply');
+    await initializeArtifactSchema(createPGliteSql(pg) as never);
     await initializeBusinessSchema(createPGliteSql(pg) as never);
     return pg;
   }
@@ -268,16 +273,38 @@ maybe('PGlite 真库', () => {
     expect(await ledgerOf(pg)).toEqual(ledgerAfter);
   }, 120_000);
 
-  it('冷建库全链：migrate:prod --apply → auth 只到 4（next 提示）→ migrate:auth:prod → db:check:prod 通过', async () => {
+  it('冷建库全链：migrate:prod --apply → auth 只到 4 / artifact 未建（next 提示）→ 两个补迁移 → db:check:prod 通过', async () => {
     const pg = new PGliteCtor!();
     const client = createPGliteClient(pg);
     const applied = await runProdMigrate(client, await load(), 'apply');
     expect(applied.status).toBe('applied');
-    expect(applied.after).toMatchObject({ checksumOk: true, missingTables: [], authVersion: 4, authVersionOk: false, runtimeColumnsOk: true });
+    expect(applied.after).toMatchObject({ checksumOk: true, missingTables: [...ARTIFACT_TABLES].sort(),
+      authVersion: 4, authVersionOk: false, artifactVersion: null, artifactVersionOk: false, runtimeColumnsOk: true });
     expect(applied.next).toMatch(/migrate:auth:prod/);
+    expect(applied.next).toMatch(/migrate:artifacts:prod/);
+    // 只补 auth、没补 artifact 时仍不通过（冷建库的 artifact 缺口不能被 auth 步骤掩盖）。
     await runAuthMigration(createPGliteSql(pg), 'apply');
+    expect((await runProdCheck(client, await load())).ok).toBe(false);
+    const artifacts = await runArtifactMigration(createPGliteSql(pg), 'apply');
+    expect(artifacts.status).toBe('applied');
     const check = await runProdCheck(client, await load());
-    expect(check).toMatchObject({ ok: true, checksumOk: true, authVersionOk: true, missingTables: [] });
+    expect(check).toMatchObject({ ok: true, checksumOk: true, authVersionOk: true, artifactVersionOk: true, missingTables: [] });
+  }, 180_000);
+
+  it('反例：冷建库缺 artifact schema（没跑 migrate:artifacts:prod）时 db:check:prod 非 0，缺的恰是 artifact 三表', async () => {
+    const pg = new PGliteCtor!();
+    const client = createPGliteClient(pg);
+    await runProdMigrate(client, await load(), 'apply');
+    await runAuthMigration(createPGliteSql(pg), 'apply');
+    const out = capture();
+    // 改前（EXPECTED_TABLES 不含 artifact 表）这里会是 0，改后必须非 0（退出码 2）。
+    expect(await main({ argv: ['check', '--database-url-env=PROD_DATABASE_URL'], env: { PROD_DATABASE_URL: FAKE_URL },
+      open: async () => client, migrations: await load(), ...out })).toBe(2);
+    const report = JSON.parse(out.lines.at(-1)!);
+    expect(report.ok).toBe(false);
+    expect([...report.missingTables].sort()).toEqual([...ARTIFACT_TABLES].sort());
+    expect(report.artifactVersion).toBeNull();
+    expect(report.artifactVersionOk).toBe(false);
   }, 120_000);
 
   describe('拒绝：未写库、退出码 2', () => {
