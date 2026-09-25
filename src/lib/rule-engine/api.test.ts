@@ -533,4 +533,40 @@ describe('正文翻页遇下一章即停（41-PAGEFIX）', () => {
     expect(await engineFetchContent(cuoceng, byQuery('id=1'), paged.context, true, byQuery('id=2'))).toEqual({ text: '第1章上半\n第1章下半' });
     expect(paged.requested).toEqual([byQuery('id=1'), byQuery('id=1&p=2')]);
   });
+
+  // lblqual41：cuoceng《鬼吹灯》目录顺序（附录与正文交错）≠ 站点「下一章」链顺序：第 0 章的 linkNext 指向目录第 3 章。
+  // 只传目录里的下一章（第 1 章）拦不住，一路翻 20 页；传整本目录 ⇒ 命中任一章即停。
+  const interleaved = () => new Map([
+    [chapter(0), page('第0章正文', '/cc/3.html')],
+    [chapter(3), page('第3章正文', '/cc/2.html')],
+    [chapter(2), page('第2章正文', '/cc/4.html')],
+    [chapter(4), page('第4章正文')],
+  ]);
+  const wholeToc = [0, 1, 2, 3, 4].map(chapter);
+
+  it('⑤ 目录顺序与「下一章」链不一致：只传目录下一章 ⇒ 仍串章（对照）；传整本目录 ⇒ 只取本章 1 页', async () => {
+    const single = recording(interleaved());
+    expect(await engineFetchContent(cuoceng, chapter(0), single.context, false, chapter(1)))
+      .toEqual({ text: '第0章正文\n第3章正文\n第2章正文\n第4章正文' });
+    expect(single.requested).toEqual([chapter(0), chapter(3), chapter(2), chapter(4)]);
+    for (const strict of [false, true]) {
+      const all = recording(interleaved());
+      expect(await engineFetchContent(cuoceng, chapter(0), all.context, strict, wholeToc)).toEqual({ text: '第0章正文' });
+      expect(all.requested).toEqual([chapter(0)]);
+    }
+  });
+
+  it('⑥ 传整本目录：本章自身不当停止点，真多页章节照常翻页；相对地址同样规范化', async () => {
+    const pages = new Map([
+      [chapter(1), page('第1章上半', '/cc/1_2.html')],
+      ['https://book15.net/cc/1_2.html', page('第1章下半', '/cc/3.html')],
+    ]);
+    const run = recording(pages);
+    expect(await engineFetchContent(cuoceng, chapter(1), run.context, true, ['/cc/1.html', '2.html', '/cc/3.html']))
+      .toEqual({ text: '第1章上半\n第1章下半' });
+    expect(run.requested).toEqual([chapter(1), 'https://book15.net/cc/1_2.html']);
+    // 空数组 = 不设判据，与不传相同。
+    const none = recording(threeChapters());
+    expect(await engineFetchContent(cuoceng, chapter(1), none.context, false, [])).toEqual({ text: '第1章正文\n第2章正文\n第3章正文' });
+  });
 });
