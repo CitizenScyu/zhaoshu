@@ -149,6 +149,9 @@ describe('refreshShuyuan atomic refresh', () => {
     const refreshedAt = '2026-09-14T01:00:00Z';
     execute.mockResolvedValueOnce([])
       .mockResolvedValueOnce([{ collections: [], refreshed_at: null }])
+      // 41-srcfix G5：准入既有行按本轮全部源读一次（初筛不过的源也要查有没有 compile_ok 冻结行），
+      // 无候选不再零 DB 往返；这里库中无准入行 ⇒ 空。
+      .mockResolvedValueOnce([])
       .mockResolvedValueOnce([{ collections, refreshed_at: refreshedAt }])
       .mockResolvedValueOnce([{ ...zeroCounts, total: 101, enabled: 101, unprobed: 101 }])
       .mockResolvedValueOnce([]);
@@ -180,7 +183,7 @@ describe('refreshShuyuan atomic refresh', () => {
     expect(meta.text).toMatch(/^UPDATE shuyuan_meta SET collections = \?::jsonb, refreshed_at = now\(\) WHERE id = 1$/);
     expect(JSON.parse(meta.values[0] as string)).toEqual(collections.map((collection, i) =>
       i === 0 ? { ...collection, probeSnapshot: { version: 1, entries: [] } } : collection));
-    expect(execute).toHaveBeenCalledTimes(5);
+    expect(execute).toHaveBeenCalledTimes(6); // 含 41-srcfix G5 的准入既有行读（见上方第 3 个桩）
     expect(transaction.mock.calls[0][1]?.fetchOptions?.signal).toBeInstanceOf(AbortSignal);
     expect(execute.mock.calls.every(([query]) => query.text.startsWith('SELECT '))).toBe(true);
   });
@@ -598,6 +601,58 @@ describe('refreshShuyuan atomic refresh', () => {
     expect(fetchMock.mock.calls.map(([input]) => String(input))).toContain(admissionSearchUrl);
     // 证据 3：救回结论写库（compile_ok=true 行 upsert）。
     expect(execute.mock.calls.some(([query]) => query.text.startsWith('INSERT INTO source_admission'))).toBe(true);
+  });
+
+  // 41-srcfix G5：源规则改到过不了 survey 初筛（这里加 <js>）⇒ 改前 runAdmissionAfterRefresh 直接跳过它，
+  // 既有 ok 行永久冻结、池 JOIN 照样命中、带 JS 的新规则以 ok 身份留池。改后送回批次改判 T7 出池。
+  describe('41-srcfix G5：初筛不过的源其 compile_ok 旧行改判出池', () => {
+    const frozenUrl = 'https://frozen.example';
+    const frozenSource = {
+      ...admissionCandidate, bookSourceUrl: `${frozenUrl}/`, bookSourceName: '改坏的源',
+      searchUrl: `${frozenUrl}/s?q={{key}}`,
+      ruleContent: { content: '.c<js>result</js>' },
+    };
+    const admissionRow = (over: Record<string, unknown>) => ({
+      source_url: frozenUrl, tier: 'M1', compile_ok: true, core_field_mask: {},
+      search_ok: true, search_verdict: 'ok', search_checked_at: '2026-09-20T00:00:00Z',
+      rules_hash: rulesHash({ ...frozenSource, ruleContent: { content: '.c' } }), engine_semantics_version: 1,
+      host: 'frozen.example', error: '', compile_diagnostics: [], ...over,
+    });
+    const runWith = async (existingRow: Record<string, unknown>) => {
+      setCollection(11, [frozenSource]);
+      execute.mockImplementation(async (query) => {
+        if (query.text.startsWith('SELECT count(*)')) return [zeroCounts];
+        if (query.text.startsWith('SELECT source_url, tier, compile_ok')) return [existingRow];
+        if (query.text.includes('FROM shuyuan_meta')) return [{ collections: [], refreshed_at: null }];
+        return [];
+      });
+      vi.spyOn(console, 'log').mockImplementation(() => {});
+      await refreshShuyuan();
+      const insert = execute.mock.calls.find(([query]) => query.text.startsWith('INSERT INTO source_admission'));
+      return insert ? JSON.parse(insert[0].values[0] as string) as Record<string, unknown>[] : undefined;
+    };
+
+    it('既有 ok 行 + 新规则初筛不过 ⇒ 写 T7 compile_ok=false、search_ok=null（出池、出 host 门），不发搜索', async () => {
+      const payload = await runWith(admissionRow({}));
+      expect(payload).toEqual([expect.objectContaining({
+        source_url: frozenUrl, tier: 'T7', compile_ok: false, search_ok: null,
+        rules_hash: rulesHash(frozenSource), error: expect.stringContaining('survey'),
+      })]);
+      // 读既有行时带上了这个非候选 URL。
+      const read = execute.mock.calls.find(([query]) => query.text.startsWith('SELECT source_url, tier, compile_ok'))!;
+      expect(String(read[0].values[0])).toContain(frozenUrl);
+      expect(fetchMock.mock.calls.map(([input]) => String(input)).some((url) => url.startsWith(frozenUrl))).toBe(false);
+    });
+
+    it('既有 compile_ok=true 未测僵尸行（search_ok=null）同样改判 T7', async () => {
+      const payload = await runWith(admissionRow({ search_ok: null, search_verdict: '', search_checked_at: null }));
+      expect(payload).toEqual([expect.objectContaining({ source_url: frozenUrl, tier: 'T7', compile_ok: false })]);
+    });
+
+    it('既有行已是 compile_ok=false ⇒ 不送批次、不重写（终态去抖，不放大写库）', async () => {
+      const payload = await runWith(admissionRow({ tier: 'T7', compile_ok: false, search_ok: null, search_verdict: '' }));
+      expect(payload).toBeUndefined();
+    });
   });
 
   it('剩余预算不足时整批跳过准入：不读不写 source_admission、不发搜索请求', async () => {
