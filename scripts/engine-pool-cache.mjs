@@ -22,6 +22,7 @@ export const DEFAULT_ENGINE_POOL_CACHE_TTL_MS = 600_000;
 const MAX_ENGINE_POOL_CACHE_TTL_MS = 3_600_000;
 const CACHE_VERSION = 1;
 
+/** @param {Record<string, string | undefined>} [env] */
 export function enginePoolCacheTtlMs(env = process.env) {
   const raw = env.ENGINE_POOL_CACHE_TTL_MS?.trim();
   const parsed = raw ? Number(raw) : NaN;
@@ -29,7 +30,7 @@ export function enginePoolCacheTtlMs(env = process.env) {
     ? Math.min(parsed, MAX_ENGINE_POOL_CACHE_TTL_MS) : DEFAULT_ENGINE_POOL_CACHE_TTL_MS;
 }
 
-/** 缓存文件路径；无连接串 ⇒ null（不缓存）。 */
+/** 缓存文件路径；无连接串 ⇒ null（不缓存）。 @param {Record<string, string | undefined>} [env] */
 export function enginePoolCachePath(env = process.env) {
   if (!env.DATABASE_URL) return null;
   const key = createHash('sha256').update(env.DATABASE_URL).digest('hex').slice(0, 16);
@@ -61,6 +62,10 @@ function writeAtomic(path, pool, now) {
 /**
  * 取引擎源池 { hosts, sources }：TTL 内命中文件缓存则不碰 DB，否则调 load() 读库并写回。
  * load 必须返回 { hosts: string[], sources: ReadingSource[] }（纯 JSON 数据）。
+ * @template {{ hosts: unknown[], sources: unknown[] }} T
+ * @param {() => Promise<T>} load
+ * @param {{ env?: Record<string, string | undefined>, now?: () => number }} [options]
+ * @returns {Promise<T | { hosts: unknown[], sources: unknown[] }>}
  */
 export async function loadEnginePoolCached(load, { env = process.env, now = Date.now } = {}) {
   const ttlMs = enginePoolCacheTtlMs(env);

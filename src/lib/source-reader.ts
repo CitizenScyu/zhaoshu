@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { getSql } from './db';
 import { getReadingSources, getSourcePools, type ReadingSource, type SelectableSources } from './shuyuan';
+import { shuyuanReadCacheTtlMs } from './read-cache-ttl';
 import { fetchSourceText, sourceAbortable, SourceHttpError, SOURCE_CONNECT_TIMEOUT_MS, SOURCE_TIMEOUT_MS } from './source-fetch';
 import { SourcePolicyError, alternateSourceHost, validateSourceUrl } from './source-policy';
 import { sourceRevision } from './source-revision';
@@ -952,6 +953,43 @@ export async function saveSourceCatalog(catalog: SourceCatalog, signal: AbortSig
   await queryRows(sql`DELETE FROM source_read_catalogs WHERE expires_at < now()`, signal, false);
 }
 
+// xfer41：目录会话读缓存。每读一章（loadSourceCatalog）、每次换源提示（currentSourceHint）都要取整本目录
+// payload（千章级书 ≈200 KB+），是在线阅读的第二个读库大户。目录按 version 不可变（上面 INSERT 冲突只延长
+// expires_at），缓存它没有一致性问题；只缓存命中行（过期/缺失照常 409/降级）。TTL 与池合成读缓存同一旋钮
+// （SHUYUAN_READ_CACHE_TTL_MS，0 = 关，单测默认 0）；已缓存的会话最多比库里晚一个 TTL 过期，内容不变，无害。
+// 总字节有界（按 JSON 长度计），超限按插入序淘汰。
+const MAX_CATALOG_CACHE_BYTES = 16 * 1024 * 1024;
+const catalogCache = new Map<string, { payload: SourceCatalog; expires: number; bytes: number }>();
+let catalogCacheBytes = 0;
+
+async function readCatalogPayload(session: string, signal: AbortSignal): Promise<SourceCatalog | null> {
+  const ttl = shuyuanReadCacheTtlMs();
+  const hit = catalogCache.get(session);
+  if (hit && hit.expires > Date.now()) return hit.payload;
+  const [row] = await queryRows<{ payload: SourceCatalog }>(getSql()`
+    SELECT payload FROM source_read_catalogs WHERE id = ${session} AND expires_at > now()`, signal);
+  if (!row || ttl <= 0) return row?.payload ?? null;
+  const old = catalogCache.get(session);
+  if (old) catalogCacheBytes -= old.bytes;
+  catalogCache.delete(session);
+  const bytes = JSON.stringify(row.payload).length;
+  if (bytes > MAX_CATALOG_CACHE_BYTES) return row.payload;
+  catalogCache.set(session, { payload: row.payload, expires: Date.now() + ttl, bytes });
+  catalogCacheBytes += bytes;
+  while (catalogCacheBytes > MAX_CATALOG_CACHE_BYTES) {
+    const oldest = catalogCache.keys().next().value!;
+    catalogCacheBytes -= catalogCache.get(oldest)!.bytes;
+    catalogCache.delete(oldest);
+  }
+  return row.payload;
+}
+
+/** 测试之间重置目录会话读缓存。 */
+export function clearSourceCatalogCache(): void {
+  catalogCache.clear();
+  catalogCacheBytes = 0;
+}
+
 export function sourceReaderIndex(catalog: SourceCatalog): ReaderIndex {
   const index: ReaderIndex = {
     taskId: null, title: catalog.title, author: catalog.author, version: catalog.version, totalBytes: 0,
@@ -966,11 +1004,8 @@ export function sourceReaderIndex(catalog: SourceCatalog): ReaderIndex {
 }
 
 async function loadSourceCatalog(session: string, context: SourceRequestContext): Promise<LoadedSource> {
-  const sql = getSql();
-  const [row] = await queryRows<{ payload: SourceCatalog }>(sql`
-    SELECT payload FROM source_read_catalogs WHERE id = ${session} AND expires_at > now()`, context.signal);
-  if (!row) throw new SourceReaderError('阅读目录已过期,请重新加载目录。', 'SOURCE_SESSION_EXPIRED', 409);
-  const catalog = row.payload;
+  const catalog = await readCatalogPayload(session, context.signal);
+  if (!catalog) throw new SourceReaderError('阅读目录已过期,请重新加载目录。', 'SOURCE_SESSION_EXPIRED', 409);
   const { traversal, selectable } = await getSourcePools(context.signal);
   // N01:revision 校验用 find() 把命中的源带出供 chapterText 分派(零额外查询)。
   // 旧实现在找不到时抛 SOURCE_CHANGED(409):源记录一刷新(改名/改规则),在途读者的
@@ -1271,10 +1306,9 @@ export async function currentSourceHint(
   session: string, context: SourceRequestContext,
 ): Promise<{ currentSourceName?: string; currentBookUrl?: string; catalog?: SourceCatalog }> {
   try {
-    const [row] = await queryRows<{ payload: SourceCatalog }>(getSql()`
-      SELECT payload FROM source_read_catalogs WHERE id = ${session} AND expires_at > now()`, context.signal);
+    const payload = await readCatalogPayload(session, context.signal);
     // catalog 一并带出:H7 换源响应要附新目录(route 层 attachSwitchedCatalog 复用本查询,零额外往返)。
-    return row ? { currentSourceName: row.payload.sourceName, currentBookUrl: row.payload.bookUrl, catalog: row.payload } : {};
+    return payload ? { currentSourceName: payload.sourceName, currentBookUrl: payload.bookUrl, catalog: payload } : {};
   } catch {
     context.signal.throwIfAborted();
     return {};

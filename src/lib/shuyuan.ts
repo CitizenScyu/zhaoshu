@@ -11,6 +11,7 @@ import {
   type AdmissionCandidate, type AdmissionSourceRow,
 } from '@/lib/rule-engine/admission';
 import { selectCandidates, type RawSource } from '@/lib/rule-engine/compile-smoke';
+import { DEFAULT_SHUYUAN_READ_CACHE_TTL_MS, shuyuanReadCacheTtlMs } from '@/lib/read-cache-ttl';
 import {
   FILTER_COUNT_KEYS, SOURCE_PAGE_SIZE, offsetFor, pageCount,
   type ShuyuanAvailability, type ShuyuanSourceFilter,
@@ -660,16 +661,8 @@ async function storedMeta(s: Sql, signal?: AbortSignal): Promise<MetaRow> {
 //   同样不会被缓存成「空引擎池」。
 // - 刷新路径（refreshWithinBudget 的 storedMeta / fresh host 门）与后台统计（getShuyuanStats/Counts）不走缓存：
 //   前者要拿最新 refreshed_at 做乐观并发守卫，后者是管理面、读己之写优先。
-export const DEFAULT_SHUYUAN_READ_CACHE_TTL_MS = 300_000;
-const MAX_SHUYUAN_READ_CACHE_TTL_MS = 3_600_000;
+export { DEFAULT_SHUYUAN_READ_CACHE_TTL_MS, shuyuanReadCacheTtlMs };
 const READ_CACHE_LOAD_TIMEOUT_MS = 20_000;
-
-export function shuyuanReadCacheTtlMs(): number {
-  const raw = process.env.SHUYUAN_READ_CACHE_TTL_MS?.trim();
-  const parsed = raw ? Number(raw) : NaN;
-  return Number.isSafeInteger(parsed) && parsed >= 0
-    ? Math.min(parsed, MAX_SHUYUAN_READ_CACHE_TTL_MS) : DEFAULT_SHUYUAN_READ_CACHE_TTL_MS;
-}
 
 type ReadCacheEntry = { expiresAt: number; value: Promise<unknown> };
 const readCache = new Map<string, ReadCacheEntry>();
