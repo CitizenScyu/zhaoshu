@@ -98,11 +98,19 @@ export async function engineFetchDetail(
 export async function engineFetchToc(
   source: EngineSource, tocUrl: string, context: SourceRequestContext, strict = false,
 ): Promise<EngineTocResult> {
-  const chapters: SourceChapter[] = [];
-  const seenUrls = new Set<string>();
+  // 原始顺序（含重复）先全收，最后统一去重（41-ctocfu §5）。去重口径对齐 legado **净效果**：
+  // BookChapterList.kt:114-124 先 `chapterList.reverse()` → `LinkedHashSet`（保留反转后的首次出现）
+  // → 再按 `book.getReverseToc()`（默认 false，Book.kt:394）reverse 回来；同 url 的章节因此**保留
+  // 最后一次出现**，位置也落在最后一次出现处。旧实现保留首次出现、位置落在首次出现处——章节数相同
+  // 但顺序不同（docs/legado-semantics/E1 说的「同结果」只覆盖计数与 1 章书退化场景）。
+  // 去重键是 url：BookChapter.kt:87-91 的 equals/hashCode 只比 url。
+  // kxdu.net 形态（页面顶部「最新章节」9 条在目录末尾原样重列）正是靠这条把头部区块挤到末尾，
+  // 让「第一章」回到首位；无重复的页面下该变换是恒等，逐字节不变。
+  const entries: SourceChapter[] = [];
+  const seenUrls = new Set<string>(); // 唯一章节计数（页数/总量上限），与最终去重顺序无关
   const visited = new Set<string>();
   let next = absoluteUrl(tocUrl, source.url);
-  for (let pageIndex = 0; next && pageIndex < MAX_TOC_PAGES && chapters.length <= MAX_SOURCE_CHAPTERS; pageIndex += 1) {
+  for (let pageIndex = 0; next && pageIndex < MAX_TOC_PAGES && seenUrls.size <= MAX_SOURCE_CHAPTERS; pageIndex += 1) {
     if (visited.has(next)) { if (strict) throw new Error('pagination_cycle'); break; }
     visited.add(next);
     const page = await context.page(next);
@@ -124,10 +132,9 @@ export async function engineFetchToc(
         if (strict && (!title || title.length > MAX_TITLE_LENGTH || !chapterUrl || !rawUrl.trim())) throw new Error('invalid_chapter');
         if (!title || title.length > MAX_TITLE_LENGTH || !chapterUrl) continue;
         validChapters += 1;
-        if (seenUrls.has(chapterUrl)) continue;
         seenUrls.add(chapterUrl);
-        chapters.push({ url: chapterUrl, title });
-        if (chapters.length > MAX_SOURCE_CHAPTERS) break;
+        entries.push({ url: chapterUrl, title });
+        if (seenUrls.size > MAX_SOURCE_CHAPTERS) break;
       }
     }
     if (strict && validChapters === 0) throw new Error('empty_toc_page');
@@ -136,8 +143,11 @@ export async function engineFetchToc(
     next = absoluteUrl(rawNext, page.url);
     if (strict && rawNext.trim() && !next) throw new Error('invalid_next_page');
   }
-  if (strict && (next || chapters.length > MAX_SOURCE_CHAPTERS)) throw new Error('toc_limit');
-  return { chapters };
+  if (strict && (next || seenUrls.size > MAX_SOURCE_CHAPTERS)) throw new Error('toc_limit');
+  // 保留每个 url 的**最后一次**出现。最后一次出现的位置严格递增，故按原序过滤即得 legado 净顺序。
+  const lastIndex = new Map<string, number>();
+  entries.forEach((chapter, index) => lastIndex.set(chapter.url, index));
+  return { chapters: entries.filter((chapter, index) => lastIndex.get(chapter.url) === index) };
 }
 
 /**

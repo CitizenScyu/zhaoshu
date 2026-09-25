@@ -7,9 +7,17 @@ import type { SourceCatalog } from './source-reader';
 // 就是实现的时间线。book15 的「宕机」有两种形态：522 响应(连接即回)与连接挂起(3s 连接段超时，生产实测形态)。
 
 type Query = { text: string; values: unknown[] };
-const mocks = vi.hoisted(() => ({ getSql: vi.fn(), sources: vi.fn(), fetch: vi.fn<typeof fetch>() }));
+const mocks = vi.hoisted(() => ({ getSql: vi.fn(), sources: vi.fn(), selectable: vi.fn(), fetch: vi.fn<typeof fetch>() }));
 vi.mock('./db', () => ({ getSql: mocks.getSql, ensureSchema: vi.fn() }));
-vi.mock('./shuyuan', () => ({ getReadingSources: mocks.sources }));
+// 41-readall：用户指定源（确认 / 章节认当前源）走 getSourcePools().selectable；夹具里两份池同为 mocks.sources 的列表，
+// 需要区分「取书池 vs 反查范围」的用例单独覆盖 mocks.selectable。
+vi.mock('./shuyuan', () => ({
+  getReadingSources: mocks.sources,
+  getSourcePools: async (signal: AbortSignal) => {
+    const traversal = await mocks.sources(signal);
+    return { traversal, selectable: (await mocks.selectable(signal)) ?? traversal };
+  },
+}));
 
 let service: typeof import('./source-reader');
 const book = { title: '测试书', author: '作者' };
@@ -95,6 +103,7 @@ const build = (ctx = context()) => drive(service.resolveSourceBook(book, ctx));
 beforeEach(async () => {
   vi.resetModules();
   vi.clearAllMocks();
+  mocks.selectable.mockReset();
   hints = [];
   requested = [];
   pages.clear();
