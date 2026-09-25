@@ -1004,10 +1004,7 @@ async function surveyOneSource(
       if (result.bookUrl === excludeBookUrl || checked.has(result.bookUrl)) continue;
       checked.add(result.bookUrl);
       const detail = await engineFetchDetail(engineSource, result.bookUrl, context);
-      const identity: SourceBookIdentity = {
-        title: detail.title ?? result.title, author: detail.author ?? result.author,
-        ...(detail.alias ? { alias: detail.alias } : {}),
-      };
+      const identity = engineIdentityOf(detail, result);
       if (!sourceBookMatches(book, identity)) continue;
       const toc = await engineFetchToc(engineSource, detail.tocUrl ?? result.bookUrl, context);
       if (!toc.chapters.length) continue;
