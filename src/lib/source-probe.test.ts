@@ -254,6 +254,12 @@ describe('probe ok ⇒ 确认路径(index?book_url=&source=)一定建得出目�
   const confirmEvents = () => vi.mocked(console.warn).mock.calls
     .filter(([tag]) => tag === '[read-source] source_confirm_failed')
     .map(([, payload]) => JSON.parse(String(payload)) as Record<string, unknown>);
+  const fallbackEvents = () => vi.mocked(console.warn).mock.calls
+    .filter(([tag]) => tag === '[read-source] source_confirm_identity_fallback')
+    .map(([, payload]) => JSON.parse(String(payload)) as Record<string, unknown>);
+  /** 确认路径两类观测的原文：不得出现书名/作者（confirmtocrev §6 M5：把书名塞进事件的变异须被杀）。 */
+  const confirmEventText = () => JSON.stringify(vi.mocked(console.warn).mock.calls
+    .filter(([tag]) => String(tag).startsWith('[read-source] source_confirm_')));
 
   it('详情页无书名规则(kxdu.net 形态)⇒ probe ok 且确认成功,书名/作者取请求的书', async () => {
     pages.set(e1.search(), { text: engineListItem('测试书', '作者') });
@@ -265,6 +271,25 @@ describe('probe ok ⇒ 确认路径(index?book_url=&source=)一定建得出目�
     expect(catalog).toMatchObject({ title: '测试书', author: '作者', sourceUrl: NoName.url, bookUrl: e1.detail });
     expect(catalog.chapters).toHaveLength(2);
     expect(confirmEvents()).toEqual([]);
+    // 成功但用了回退：一行 host 级事件，字段集合钉死（多一个 title/bookUrl 字段即红）。
+    expect(fallbackEvents()).toEqual([{
+      event: 'source_confirm_identity_fallback', sourceHost: 'e1.test', tier: 'engine', identityFallback: 'both',
+    }]);
+    expect(confirmEventText()).not.toContain('测试书');
+    expect(confirmEventText()).not.toContain('作者');
+    expect(confirmEventText()).not.toContain('/d/1.html');
+  });
+
+  it('身份回退观测只在请求真的补上值时标记:详情页齐全 ⇒ 不发;只缺作者 ⇒ author;请求无作者 ⇒ 只 title', async () => {
+    primeEngineHit();
+    await confirm(E1, e1.detail);
+    expect(fallbackEvents()).toEqual([]);
+    pages.set(e1.detail, { text: '<h1 class="title">测试书</h1><a class="toc" href="/toc/1.html">目录</a>' });
+    await confirm(E1, e1.detail);
+    pages.set(e1.detail, { text: '<p class="intro">简介</p><a class="toc" href="/toc/1.html">目录</a>' });
+    await confirm(NoName, e1.detail, { title: '测试书', author: '' });
+    expect(fallbackEvents().map((event) => event.identityFallback)).toEqual(['author', 'title']);
+    expect(confirmEventText()).not.toContain('测试书');
   });
 
   it('详情页有书名时仍以详情页为准(用户点选的是站上这本书,不改写成请求书名)', async () => {
@@ -282,6 +307,8 @@ describe('probe ok ⇒ 确认路径(index?book_url=&source=)一定建得出目�
       event: 'source_confirm_failed', sourceHost: 'e1.test', tier: 'engine', reason: 'toc_empty', requests: 2,
     })]);
     expect(JSON.stringify(confirmEvents())).not.toContain('/d/1.html');
+    expect(confirmEventText()).not.toContain('测试书');
+    expect(confirmEventText()).not.toContain('作者');
   });
 
   it('详情页取不出书名、请求也没带书名 ⇒ 404「详情页解析失败」,不再去取目录', async () => {

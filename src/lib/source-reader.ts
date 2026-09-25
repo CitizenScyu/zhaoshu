@@ -517,6 +517,15 @@ function engineIdentityOf(detail: Partial<SourceBookIdentity>, fallback: SourceB
   };
 }
 
+/** 确认路径哪些身份字段真的由请求的书补上（详情页取不到、请求里又有值）；无回退返回 undefined。 */
+function identityFallbackOf(
+  detail: Partial<SourceBookIdentity>, fallback: SourceBookIdentity,
+): 'title' | 'author' | 'both' | undefined {
+  const title = !detail.title && !!fallback.title;
+  const author = !detail.author && !!fallback.author;
+  return title && author ? 'both' : title ? 'title' : author ? 'author' : undefined;
+}
+
 type ConfirmFailureReason = 'detail_unparsed' | 'toc_empty';
 
 function confirmFailure(message: string, reason: ConfirmFailureReason): SourceReaderError {
@@ -579,10 +588,21 @@ async function confirmSourceBook(
       try {
         const detail = await engineFetchDetail(engineSource, url, context);
         // 身份口径与搜索/probe 路径同一个 engineIdentityOf：详情页没有书名规则时取请求的书（见其注释）。
+        // 行为变化（41-confirmtoc，a9135d8 → 3954ae6）：书名与作者**都**回退到请求的书。改前确认路径的作者是
+        // `detail.author ?? ''`，现在详情页取不到作者时记成请求作者 —— 与 probe/搜索路径同口径；代价是
+        // 「详情页无作者规则的同名异作者书」会被记成请求作者（入口只有用户点选，且 probe ok 已过 sourceBookMatches）。
         const identity = engineIdentityOf(detail, book);
         if (!identity.title) throw confirmFailure('该书源的详情页解析失败（取不到书名），请换一个候选。', 'detail_unparsed');
         const toc = await engineFetchToc(engineSource, detail.tocUrl ?? url, context);
         if (!toc.chapters.length) throw confirmFailure('该书源的目录为空（站点可能改版或拦截），请重试或换一个候选。', 'toc_empty');
+        const fallback = identityFallbackOf(detail, book);
+        // 回退成功的确认也要看得见（confirmtocrev §8-1）：请求书与站上书不是同一本时，目录会记成请求的书名，
+        // 线上靠这行按 host 统计。只记 host/tier/回退字段，不带书名、作者、URL 路径。
+        if (fallback) {
+          console.warn('[read-source] source_confirm_identity_fallback', JSON.stringify({
+            event: 'source_confirm_identity_fallback', sourceHost: hostnameOf(bookUrl), tier, identityFallback: fallback,
+          }));
+        }
         return engineCatalogFrom(url, source, identity, toc.chapters);
       } catch (error) {
         context.signal.throwIfAborted();
