@@ -147,7 +147,7 @@ describe('根因 3：字面量里的 `{$.x}` 内嵌规则原样输出（legado i
     expect(evaluateField(parseFieldRule(rule), item)).toBe('http://sma.yueyouxs.com/b/9527.html');
   });
 
-  // jsoninner41：一处都没替换成功时 legado innerRule 返回 ""（RuleAnalyzer.kt:330），调用方再对整条规则
+  // jsoninner41：一处都没替换成功时 legado innerRule 返回 ""（RuleAnalyzer.kt:329），调用方再对整条规则
   // ctx.read（AnalyzeByJSonPath.kt:41-54）——URL 字面量读不到，异常被吞 ⇒ 空串；URL 字段再由
   // AnalyzeRule.kt:319-324 / BookChapterList.kt:238 回退 baseUrl。故不回退原文（原文是带 {$.nope} 的垃圾 URL）。
   it('内嵌规则求值为空时不替换；全部为空 ⇒ 空串（对齐 legado，不回退原文）；无内嵌规则的字面量不变', () => {
