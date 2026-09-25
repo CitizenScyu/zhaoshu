@@ -41,14 +41,29 @@ export function parseAuthMigrationArgs(argv) {
     else if (arg === '--yes-i-mean-production') confirmed = true;
     else throw new Error(`未知参数 ${arg}。${USAGE}`);
   }
-  if (!envName || !/^[A-Z_][A-Z0-9_]*$/.test(envName)) throw new Error(`必须用 --database-url-env=<大写变量名> 显式指定目标。${USAGE}`);
+  assertProdDatabaseUrlEnv(envName, USAGE);
   if (dryRun === confirmed) throw new Error(`--dry-run 与 --yes-i-mean-production 必须且只能给一个。${USAGE}`);
   return { envName, mode: dryRun ? 'dry-run' : 'apply' };
+}
+
+// 应用与隔离库各自的连接变量。生产入口只读运维专用变量，免得 shell 里残留的应用 / 测试连接被误当目标。
+const RESERVED_ENV_NAMES = new Set(['DATABASE_URL', 'TEST_DATABASE_URL']);
+
+// 所有 `--database-url-env` 生产入口（本文件、db-prod、migrate-artifacts-prod、register-storage-repository）
+// 共用的目标变量名闸门（41-bookidfk）：以前各抄一份，本入口漏了拒收 DATABASE_URL / TEST_DATABASE_URL。
+/** @param {string | null} envName @param {string} usage */
+export function assertProdDatabaseUrlEnv(envName, usage = '') {
+  const suffix = usage ? `。${usage}` : '';
+  if (!envName || !/^[A-Z_][A-Z0-9_]*$/.test(envName)) throw new Error(`必须用 --database-url-env=<大写变量名> 显式指定目标${suffix}`);
+  if (RESERVED_ENV_NAMES.has(envName)) {
+    throw new Error(`--database-url-env 不能是 ${envName}：生产入口只读专用变量（例如 PROD_DATABASE_URL），不复用应用或测试库的连接变量`);
+  }
 }
 
 // 只校验形状并取出 host 供人核对；连接串本身不出本函数的返回值以外的任何地方。
 /** @param {string} envName @param {Record<string, string | undefined>} [env] */
 export function readDatabaseUrl(envName, env = process.env) {
+  assertProdDatabaseUrlEnv(envName);
   const value = env[envName]?.trim();
   if (!value) throw new Error(`环境变量 ${envName} 为空；不会回退到 DATABASE_URL，也不会读取 .env 文件`);
   let url;

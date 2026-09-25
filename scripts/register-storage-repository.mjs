@@ -22,7 +22,7 @@
 import { neon } from '@neondatabase/serverless';
 import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { readDatabaseUrl } from './migrate-auth-prod.mjs';
+import { assertProdDatabaseUrlEnv, readDatabaseUrl } from './migrate-auth-prod.mjs';
 import { safeError } from './db-migration-lib.mjs';
 
 // 与 src/lib/github.ts:3 同一缺省；只作为「配置里没给」时的现役值，不是唯一真相。
@@ -48,10 +48,7 @@ export function parseRegisterArgs(argv, env = process.env) {
     else if (arg === '--dry-run') dryRun = true;
     else throw new Error(`未知参数 ${arg}。${USAGE}`);
   }
-  if (!envName || !/^[A-Z_][A-Z0-9_]*$/.test(envName)) throw new Error(`必须用 --database-url-env=<大写变量名> 显式指定目标。${USAGE}`);
-  if (['DATABASE_URL', 'TEST_DATABASE_URL'].includes(envName)) {
-    throw new Error(`--database-url-env 不能是 ${envName}：生产入口只读专用变量（例如 PROD_DATABASE_URL），不复用应用或测试库的连接变量`);
-  }
+  assertProdDatabaseUrlEnv(envName, USAGE);
   if (apply && dryRun) throw new Error(`--apply 与 --dry-run 不能同时给。${USAGE}`);
   const full = (repo ?? env.ZHAOSHU_BOOKS_REPO ?? DEFAULT_REPO).trim();
   const [owner, name, extra] = full.split('/');

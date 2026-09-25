@@ -18,7 +18,7 @@ import { neon } from '@neondatabase/serverless';
 import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { ARTIFACT_SCHEMA_VERSION, initializeArtifactSchema } from '../src/lib/artifact-schema.ts';
-import { readDatabaseUrl } from './migrate-auth-prod.mjs';
+import { assertProdDatabaseUrlEnv, readDatabaseUrl } from './migrate-auth-prod.mjs';
 import { safeError } from './db-migration-lib.mjs';
 
 const USAGE = '用法: migrate-artifacts-prod.mjs --database-url-env=<变量名> (--dry-run | --yes-i-mean-production)';
@@ -40,10 +40,7 @@ export function parseArtifactMigrationArgs(argv) {
     else if (arg === '--yes-i-mean-production') confirmed = true;
     else throw new Error(`未知参数 ${arg}。${USAGE}`);
   }
-  if (!envName || !/^[A-Z_][A-Z0-9_]*$/.test(envName)) throw new Error(`必须用 --database-url-env=<大写变量名> 显式指定目标。${USAGE}`);
-  if (['DATABASE_URL', 'TEST_DATABASE_URL'].includes(envName)) {
-    throw new Error(`--database-url-env 不能是 ${envName}：生产入口只读专用变量（例如 PROD_DATABASE_URL），不复用应用或测试库的连接变量`);
-  }
+  assertProdDatabaseUrlEnv(envName, USAGE);
   if (dryRun === confirmed) throw new Error(`--dry-run 与 --yes-i-mean-production 必须且只能给一个。${USAGE}`);
   return { envName, mode: dryRun ? 'dry-run' : 'apply' };
 }

@@ -22,12 +22,10 @@ import {
   loadMigrations, planMigrations, probeEndpoint, safeError, SCHEMA_VERSION, TARGET_SCHEMA,
 } from './db-migration-lib.mjs';
 import { applyBaseline, baselineLedgerWrites, verifyBaseline } from './db-baseline.mjs';
-import { readDatabaseUrl } from './migrate-auth-prod.mjs';
+import { assertProdDatabaseUrlEnv, readDatabaseUrl } from './migrate-auth-prod.mjs';
 
 const USAGE = '用法: db-prod.mjs check --database-url-env=<变量名> | db-prod.mjs <migrate|baseline> --database-url-env=<变量名> [--apply]（migrate / baseline 默认 dry-run）';
 const WRITE_COMMANDS = new Set(['migrate', 'baseline']);
-// 应用与隔离库各自的连接变量。生产入口只读运维专用变量，免得 shell 里残留的应用 / 测试连接被误当目标。
-const RESERVED_ENV_NAMES = new Set(['DATABASE_URL', 'TEST_DATABASE_URL']);
 
 export function parseProdArgs(argv) {
   const [command, ...rest] = argv;
@@ -43,10 +41,7 @@ export function parseProdArgs(argv) {
     else if (arg === '--dry-run') dryRun = true;
     else throw new Error(`未知参数 ${arg}。${USAGE}`);
   }
-  if (!envName || !/^[A-Z_][A-Z0-9_]*$/.test(envName)) throw new Error(`必须用 --database-url-env=<大写变量名> 显式指定目标。${USAGE}`);
-  if (RESERVED_ENV_NAMES.has(envName)) {
-    throw new Error(`--database-url-env 不能是 ${envName}：生产入口只读专用变量（例如 PROD_DATABASE_URL），不复用应用或测试库的连接变量`);
-  }
+  assertProdDatabaseUrlEnv(envName, USAGE);
   if (command === 'check') {
     if (apply || dryRun) throw new Error(`check 只读，不接受 --apply / --dry-run。${USAGE}`);
     return { command, envName, mode: 'read-only' };
