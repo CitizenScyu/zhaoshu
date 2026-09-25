@@ -18,7 +18,7 @@
 import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import {
-  applyMigration, checkRuntimeColumns, createClient, evaluateSchema, EXPECTED_RUNTIME_COLUMNS, EXPECTED_TABLES, inspectSchema,
+  applyMigration, ARTIFACT_TABLES, checkRuntimeColumns, createClient, evaluateSchema, EXPECTED_RUNTIME_COLUMNS, EXPECTED_TABLES, inspectSchema,
   loadMigrations, planMigrations, probeEndpoint, safeError, SCHEMA_VERSION, TARGET_SCHEMA,
 } from './db-migration-lib.mjs';
 import { applyBaseline, baselineLedgerWrites, verifyBaseline } from './db-baseline.mjs';
@@ -108,11 +108,15 @@ export async function runProdCheck(client, migrations) {
 // 对它 --apply 会把 0001 整份在在线表上重跑（ALTER COLUMN / UPDATE / SET NOT NULL），而不是只补记账——
 // 生产正是这个形态（prodmig41，2026-09-24）。空记账表与没有记账表同样处理（复审 baserev41 #1：只看表在不在，
 // 空表会被当成已登记而放行重放）。冷建库只能是空库；已有库先用 db:baseline:prod 核对并登记。
+// 计数只算「由 0001–0003 建」的表：artifact 三表由 initializeArtifactSchema 单独建、不进 0001–0003
+// （41-bookidfk N2），把它们算进来会把「migrate 会重跑 0001」的拒绝文案夸大，也可能对只缺 artifact schema
+// 的库误触发。present 可能含非 EXPECTED_TABLES 的表（如裸 pg 的 information_schema 视角），过滤掉。
 export function unadoptedRefusal(report) {
   const present = new Set(report.columns.map((column) => column.table_name));
   const ledgerPresent = present.has('schema_migrations');
   if (ledgerPresent && report.versions.length) return [];
-  const existing = EXPECTED_TABLES.filter((table) => table !== 'schema_migrations' && present.has(table));
+  const managed = EXPECTED_TABLES.filter((table) => table !== 'schema_migrations' && !ARTIFACT_TABLES.includes(table));
+  const existing = managed.filter((table) => present.has(table));
   if (!existing.length) return [];
   const ledger = ledgerPresent ? 'schema_migrations 为空（0 行）' : '库里没有 schema_migrations';
   return [`${ledger}，却已有 ${existing.length} 张迁移管理的表（${existing.slice(0, 5).join(', ')}${existing.length > 5 ? ' …' : ''}）：`

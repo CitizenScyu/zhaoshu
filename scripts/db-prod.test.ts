@@ -154,6 +154,17 @@ describe('unadoptedRefusal（纯函数，41-BASELINE）', () => {
     expect(refused[0]).toMatch(/schema_migrations 为空（0 行），却已有 2 张迁移管理的表（books, users）.*db:baseline:prod/);
     expect(unadoptedRefusal(report(['schema_migrations']))).toEqual([]);
   });
+
+  // 41-bookidfk N2：artifact 三表由 initializeArtifactSchema 单独建、不由 0001–0003 建，
+  // 不该被算进「迁移管理的表」——否则只缺 artifact schema 的库会被这条拒绝拦下，且计数夸大。
+  it('N2：artifact 三表不算「迁移管理的表」；只有它们（无业务表、无记账行）→ 放行', () => {
+    expect(unadoptedRefusal(report(ARTIFACT_TABLES))).toEqual([]);
+    // 与业务表混在一起时，计数只算业务表（books, users），不把三张 artifact 表算进去。
+    const refused = unadoptedRefusal(report([...ARTIFACT_TABLES, 'users', 'books']));
+    expect(refused).toHaveLength(1);
+    expect(refused[0]).toMatch(/却已有 2 张迁移管理的表（books, users）/);
+    expect(refused[0]).not.toMatch(/artifact_schema_migrations|book_artifacts|storage_repositories/);
+  });
 });
 
 describe('checkRuntimeColumns（纯函数，N2）', () => {
