@@ -149,6 +149,19 @@ describe('old and new label records', () => {
     assert.equal(validateImportRecord(record({ labels: { ...base.labels, text_quality: false } })).status, 'failed');
   });
 
+  it('accepts only ad-injection rows that labeler downgraded with quality_flag (lbladfix41)', () => {
+    const ad = { ...base.labels, text_quality: '含广告注入', text_quality_evidence: ['首发--无弹出广告'] };
+    const ready = validateImportRecord(record({ quality_flag: 'ad_injection', labels: ad }));
+    assert.equal(ready.status, 'ready');
+    assert.equal(ready.record.labels.text_quality, '含广告注入');
+    assert.deepEqual(ready.record.labels.text_quality_evidence, ['首发--无弹出广告']);
+    for (const text_quality of ['疑似乱码', '大面积重复']) {
+      assert.equal(validateImportRecord(record({ quality_flag: 'ad_injection', labels: { ...base.labels, text_quality } })).status, 'skipped');
+    }
+    assert.equal(validateImportRecord(record({ quality_flag: 'other', labels: ad })).status, 'skipped');
+    assert.equal(validateImportRecord(record({ quality_flag: 'ad_injection', labels: { ...ad, site_title_match: false } })).status, 'review');
+  });
+
   it('fails malformed roots and field types without stringifying them into identities', () => {
     for (const value of [
       null, [], false, {}, { title: 'T', labels: [] }, record({ title: {} }), record({ title: '' }),

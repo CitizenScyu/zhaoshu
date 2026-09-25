@@ -748,6 +748,7 @@ def search_engine(cli, title: str, author: str = '',
         return None
     if junk is not None:
         junk.observe(title, candidates)
+    candidates = _deprioritize_sources(candidates)
     # ---- N02 两遍选择（只在引擎路径生效，CLI 调用形态不变）----
     # 第一遍：title 兼容 + author 已验证匹配（名单 author 已知且 author_matches 为真）。
     # 第二遍：名单 author 已知但无已验证匹配 → 退「title 兼容 + 候选 author 空」（降级收）。
@@ -856,12 +857,37 @@ def _known_author_alternates(title: str, author: str, candidates: list) -> list[
     return verified + unknown
 
 
+# ---- 付费试读源降权（lbladfix41）----
+# yunqi.qq.com 实抓（lbladdiag-41-report §2）：目录大部分章标题带「APP免费」、正文是约 100 字截断预览，
+# 打标只能用免费的前几十章；chuangshi.qq.com 同为腾讯系付费源。不拉黑（有时是唯一来源），
+# 只在同一身份档内排到最后：主候选优先取别的源，备选里也排在末位。
+DEPRIORITIZED_SOURCE_HOSTS = frozenset({'yunqi.qq.com', 'chuangshi.qq.com'})
+
+
+def _is_deprioritized(entry) -> bool:
+    if not isinstance(entry, dict):
+        return False
+    host = entry.get('source') or ''
+    if not host:
+        try:
+            host = urllib.parse.urlsplit(entry.get('bookUrl') or entry.get('url') or '').hostname or ''
+        except ValueError:
+            host = ''
+    return host.lower() in DEPRIORITIZED_SOURCE_HOSTS
+
+
+def _deprioritize_sources(items: list) -> list:
+    """稳定排序：降权 host 的条目挪到末尾，其余顺序不变。"""
+    return sorted(items, key=_is_deprioritized)
+
+
 def _with_alternates(hit: dict | None, pool: list[dict]) -> dict | None:
-    """hit 加上 pool 中（去掉 hit 自身、按 URL 去重、上限 ENGINE_MAX_ALTERNATES）的备选。"""
+    """hit 加上 pool 中（去掉 hit 自身、按 URL 去重、上限 ENGINE_MAX_ALTERNATES）的备选。
+    降权源（DEPRIORITIZED_SOURCE_HOSTS）排在备选末位。"""
     if hit is None:
         return None
     seen, alternates = {hit['url']}, []
-    for entry in pool:
+    for entry in _deprioritize_sources(pool):
         if entry['url'] in seen:
             continue
         seen.add(entry['url'])

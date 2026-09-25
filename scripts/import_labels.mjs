@@ -164,10 +164,15 @@ function validateImportRecord(rec) {
   // 旧数据没有 text_quality 字段时仍可导入，未知新枚举值留待核验。
   const textQuality = labels.text_quality;
   if (textQuality != null && typeof textQuality !== 'string') return failed('text_quality 必须是字符串');
-  if (['疑似乱码', '大面积重复', '含广告注入'].includes(textQuality?.trim())) {
+  // lbladfix41：labeler 对「含广告注入」降级入库时打 quality_flag=ad_injection（书名核验 true 且置信度够），
+  // 只有这一组合放行；与 import_one.py 同口径。
+  const adDowngraded = textQuality?.trim() === '含广告注入' && rec.quality_flag === 'ad_injection';
+  if (!adDowngraded && ['疑似乱码', '大面积重复', '含广告注入'].includes(textQuality?.trim())) {
     return { status: 'skipped', reason: '文本质量异常：' + textQuality };
   }
-  if (textQuality != null && textQuality.trim() !== '正常') return review('无法识别的 text_quality');
+  if (!adDowngraded && textQuality != null && textQuality.trim() !== '正常') {
+    return review('无法识别的 text_quality');
+  }
 
   // 新格式：明确的布尔确认可替代盲猜；false/不确定不能被相似书名掩盖。
   if (labels.site_title_match !== undefined) {
