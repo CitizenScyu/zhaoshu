@@ -293,16 +293,19 @@ export default function LibraryTab({ view, setView }: {
     };
   }, [detailId, apiFetch, updateTask]);
 
-  // pending/running 任务每 10 秒轮询单条进度
+  // pending/running 任务轮询单条进度。任务到终态后 pollTaskId 变 null，effect 清理即停轮询。
   const pollTaskId = task !== null && (task.status === 'pending' || task.status === 'running')
     ? task.id
     : null;
 
+  // 轮询 30 秒一次；页面不可见（切后台标签页）时暂停，省掉无谓的库往返（Neon 按传输量计费），
+  // 回到前台立即拉一次再恢复计时。挂载时若页面可见也立即拉一次，不干等首个间隔。
   useEffect(() => {
     if (pollTaskId === null) return;
     let stale = false;
+    let timer: ReturnType<typeof setInterval> | null = null;
     const controller = new AbortController();
-    const timer = setInterval(() => {
+    const poll = () => {
       if (controller.signal.aborted) return;
       const my = dlRequestId.current;
       void (async () => {
@@ -319,11 +322,27 @@ export default function LibraryTab({ view, setView }: {
           // 单次失败不打断轮询
         }
       })();
-    }, 10000);
+    };
+    const start = () => { if (timer === null) timer = setInterval(poll, 30000); };
+    const stop = () => { if (timer !== null) { clearInterval(timer); timer = null; } };
+    const onVisibility = () => {
+      if (document.hidden) {
+        stop();
+      } else {
+        poll();
+        start();
+      }
+    };
+    if (!document.hidden) {
+      poll();
+      start();
+    }
+    document.addEventListener('visibilitychange', onVisibility);
     return () => {
       stale = true;
       controller.abort();
-      clearInterval(timer);
+      stop();
+      document.removeEventListener('visibilitychange', onVisibility);
     };
   }, [pollTaskId, apiFetch, updateTask]);
 

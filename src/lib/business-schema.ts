@@ -3,6 +3,88 @@ import type { neon } from '@neondatabase/serverless';
 export { initializeArtifactSchema } from './artifact-schema.ts';
 type Sql = ReturnType<typeof neon>;
 
+// —— 冷启动版本探测的真值来源 ——
+// initializeBusinessSchema 里那批幂等 DDL「建成后」的对象清单。探测（businessSchemaCurrent）
+// 据此判断整批 DDL 是否已是空转，是则跳过、省掉一次事务往返（Neon 按传输量计费）。
+//
+// 为什么这三个常量能当「版本」：DDL 全是 CREATE ... IF NOT EXISTS / ADD COLUMN IF NOT EXISTS，
+// 一张表要么和它 CREATE 时的全部列一起存在、要么不存在；唯一能「表在但列缺」的是对既有表的
+// ALTER ADD COLUMN。故只要核验 (1) 所有表/索引存在 (2) 所有增量列存在 (3) 已退役的旧索引不存在，
+// 即等价于「再跑一遍 DDL 什么都不会变」。business-schema.test.ts 的守卫用例把 DDL 真正建/删的
+// 对象集合与这三个常量逐条比对——**改 DDL 不同步这里，测试即红**（这就是「版本判定与 DDL 同步」）。
+
+/** CREATE TABLE / CREATE [UNIQUE] INDEX IF NOT EXISTS 建出的全部关系名（表 + 索引）。 */
+export const BUSINESS_SCHEMA_RELATIONS = [
+  'profile', 'books', 'recommendations', 'recommendations_user_book_query_idx',
+  'feedback', 'feedback_user_book_idx', 'shuyuan_sources', 'shuyuan_meta',
+  'labeled_books', 'download_tasks', 'download_tasks_user_created_idx',
+  'download_tasks_user_active_book_idx', 'download_tasks_system_active_book_idx',
+  'download_tasks_system_event_idx', 'download_tasks_claim_idx',
+  'source_read_catalogs', 'source_read_catalogs_expiry_idx',
+  'profile_seed_audit', 'profile_seed_audit_user_time_idx',
+  'app_settings', 'source_admission', 'source_admission_host_idx',
+  'profile_feedback_queue', 'cron_health',
+] as const;
+
+/** ALTER TABLE ... ADD COLUMN IF NOT EXISTS 给既有表补的全部列（[表, 列]）。 */
+export const BUSINESS_SCHEMA_COLUMNS: readonly (readonly [string, string])[] = [
+  ['labeled_books', 'source_url'], ['labeled_books', 'primary_genre'],
+  ['labeled_books', 'sub_tags'], ['labeled_books', 'quality'],
+  ['app_settings', 'llm_reasoning'], ['app_settings', 'label_model'],
+  ['app_settings', 'label_model_updated_at'], ['app_settings', 'default_model'],
+  ['app_settings', 'default_model_reasoning'], ['app_settings', 'default_model_updated_at'],
+  ['source_admission', 'engine_semantics_version'], ['source_admission', 'compile_diagnostics'],
+  ['profile_feedback_queue', 'lease_token'], ['profile_feedback_queue', 'lease_expires_at'],
+  ['profile_feedback_queue', 'fail_count'], ['profile_feedback_queue', 'next_eligible_at'],
+] as const;
+
+/** DROP INDEX IF EXISTS 退役的旧关系：探测要求它们**不存在**，否则说明 DDL 尚未跑到该批。 */
+export const BUSINESS_SCHEMA_RETIRED_RELATIONS = ['download_tasks_active_book_idx'] as const;
+
+// 名字全是源码内硬编码常量，绝无外部输入；探测 SQL 直接内联它们（非绑定参数），此处做一次
+// 标识符形状校验，既是防线也是文档：任何非标识符名字在模块加载期即抛，绝不进 SQL。
+const IDENT = /^[a-z_][a-z0-9_]*$/;
+for (const name of [
+  ...BUSINESS_SCHEMA_RELATIONS, ...BUSINESS_SCHEMA_RETIRED_RELATIONS,
+  ...BUSINESS_SCHEMA_COLUMNS.flat(),
+]) {
+  if (!IDENT.test(name)) throw new Error(`business schema probe: 非法标识符 ${JSON.stringify(name)}`);
+}
+
+function sqlValues(rows: readonly (readonly string[])[]): string {
+  return rows.map((cells) => `(${cells.map((cell) => `'${cell}'`).join(', ')})`).join(', ');
+}
+
+/**
+ * 冷启动版本探测：单条只读 SELECT，判断「再跑一遍 initializeBusinessSchema 是否纯空转」。
+ * 返回 true ⇒ 整批 DDL 可安全跳过；false ⇒ 走原 DDL 路径（含全新库/旧库/结构漂移）。
+ *
+ * 该查询对缺失对象永不抛错：to_regclass 缺失返回 NULL，information_schema 缺表则 0 匹配，
+ * 都只会让计数不达标而返回 false。唯一会抛的是连接层错误，与原 DDL 路径同样向上冒泡。
+ */
+export async function businessSchemaCurrent(s: Sql): Promise<boolean> {
+  const relations = sqlValues(BUSINESS_SCHEMA_RELATIONS.map((name) => [name]));
+  const columns = sqlValues(BUSINESS_SCHEMA_COLUMNS.map(([table, column]) => [table, column]));
+  const retired = sqlValues(BUSINESS_SCHEMA_RETIRED_RELATIONS.map((name) => [name]));
+  const text = `
+    SELECT (
+      (SELECT count(*)::int FROM (VALUES ${relations}) AS r(name)
+         WHERE to_regclass(quote_ident(current_schema()) || '.' || quote_ident(r.name)) IS NOT NULL)
+        = ${BUSINESS_SCHEMA_RELATIONS.length}
+      AND
+      (SELECT count(*)::int FROM information_schema.columns c
+         JOIN (VALUES ${columns}) AS want(tbl, col)
+           ON c.table_name = want.tbl AND c.column_name = want.col
+         WHERE c.table_schema = current_schema())
+        = ${BUSINESS_SCHEMA_COLUMNS.length}
+      AND
+      NOT EXISTS (SELECT 1 FROM (VALUES ${retired}) AS x(name)
+         WHERE to_regclass(quote_ident(current_schema()) || '.' || quote_ident(x.name)) IS NOT NULL)
+    ) AS current`;
+  const rows = await s.query(text) as { current: boolean }[];
+  return rows[0]?.current === true;
+}
+
 export async function initializeBusinessSchema(s: Sql) {
   // 仅在已完成当前专用迁移后由业务入口调用；声明不含旧全局唯一键或 owner 默认值。
   //
