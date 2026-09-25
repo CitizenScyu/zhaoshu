@@ -889,6 +889,8 @@ def is_nonbody_toc_title(title: str) -> bool:
 # 正文判据按整本口径（lblfu41，lbladrev 非阻断1）：单看一章会把 101–200 字、以省略号收尾的正常短章
 # （楔子/过场章）当试读丢掉。试读源的截断预览是成批出现的，所以只有「目录里有 APP免费 章」或
 # 「正文判定的章 ≥ PREVIEW_SOURCE_MIN_CHAPTERS」时才认定是试读源、丢正文判定的章；零星一两章照常保留。
+# 阈值只数 >100 字的正文判定章（lblfurev 发现 2）：≤100 字的章本来就不收录，不能拿它们凑数把
+# 101–200 字的正常短章拖下水。
 PREVIEW_CHAPTER_MAX = 200
 PREVIEW_SOURCE_MIN_CHAPTERS = PREVIEW_MIN_CHAPTERS
 _PREVIEW_TITLE_RE = re.compile(r'APP\s*免费', re.I)
@@ -910,9 +912,10 @@ def is_preview_chapter(title: str, body: str) -> bool:
     return is_preview_title(title) or is_preview_body(body)
 
 
-def is_preview_source(title_previews: int, body_previews: int) -> bool:
-    """整本是否是试读源：目录里有 APP免费 章，或正文形如截断预览的章成批出现。"""
-    return title_previews > 0 or body_previews >= PREVIEW_SOURCE_MIN_CHAPTERS
+def is_preview_source(known_previews: int, body_previews: int) -> bool:
+    """整本是否是试读源（纯函数）。known_previews = 目录里 APP免费 章数 + 上游已按试读源丢掉的章数，
+    >0 即认定；body_previews = 正文形如截断预览、且 >100 字（会被收录）的章数，成批（≥5）才认定。"""
+    return known_previews > 0 or body_previews >= PREVIEW_SOURCE_MIN_CHAPTERS
 
 
 def prepare_book_text(text: str, clean: bool,
@@ -936,7 +939,8 @@ def prepare_book_text(text: str, clean: bool,
              'dup_chars': 0, 'chars_before': 0, 'inline_strips': 0, 'preview_chapters': 0}
     preview_source = clean and is_preview_source(
         preview_dropped + sum(1 for head, _ in chapters if head and is_preview_title(head[1:-1])),
-        sum(1 for head, body in chapters if head and is_preview_body(body)))
+        sum(1 for head, body in chapters
+            if head and is_preview_body(body) and len(body.strip()) > 100))
     for head, body in chapters:
         if clean and head:
             title = head[1:-1]
@@ -1241,7 +1245,7 @@ def fetch_book_text_engine(engine_cli, book_url: str,
             parts.append(f'【{clean_chapter_title(title)}】\n{text}')
             chars += len(text)
         time.sleep(CHAPTER_DELAY)
-    if is_preview_source(stats['preview_chapters'], len(body_previews)):
+    if is_preview_source(stats['preview_chapters'], sum(1 for p in body_previews if p)):
         # 试读源：正文判定的章丢弃，不计字数（≤100 字的本来就不收，这里只补计数）
         stats['preview_chapters'] += len(body_previews)
         drop = {i for i, _ in filter(None, body_previews)}

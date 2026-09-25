@@ -19,6 +19,7 @@ from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import labeler  # noqa: E402
+from test_labeler_adgate import MainHarness, _good_fetch  # noqa: E402
 
 
 def _proc(returncode=0, stdout='', stderr=''):
@@ -273,6 +274,127 @@ class TestPleaRuleAfterReview(unittest.TestCase):
     def test_plea_dropped(self):
         for line in self.PLEA_DROP:
             self.assertEqual(labeler._drop_rule(line), 'plea', line)
+
+
+# ---------------- 审查后②：≤100 字预览章不计入试读源阈值 ----------------
+TINY_PREVIEW = '夜色沉沉，青云山下的小村里只剩几盏油灯还亮着。' * 2 + '……'   # ≤100 字，本就不收录
+
+
+class TestTinyPreviewNotCounted(unittest.TestCase):
+    def test_sample_shape(self):
+        self.assertLessEqual(len(TINY_PREVIEW), 100)
+
+    def test_fetch_tiny_previews_do_not_drag_short_chapter(self):
+        full = '正文' * 300
+        chapters = [{'url': f'https://k/c{i}', 'title': f'第{i}章 起'} for i in range(12)]
+        bodies = {c['url']: full for c in chapters}
+        for i in range(5):
+            bodies[f'https://k/c{i}'] = TINY_PREVIEW
+        bodies['https://k/c5'] = SHORT_ELLIPSIS
+        stats = {}
+        with mock.patch.object(labeler.time, 'sleep'):
+            text, chars = labeler.fetch_book_text_engine(
+                FakeCli(chapters, bodies), 'https://k/b', stats=stats)
+        self.assertIn(SHORT_ELLIPSIS, text)
+        self.assertEqual(stats['preview_chapters'], 0)
+        self.assertEqual(chars, 6 * len(full) + len(SHORT_ELLIPSIS))
+
+    def test_prepare_tiny_previews_do_not_drag_short_chapter(self):
+        text = '\n\n'.join(
+            [f'【第{i}章 起】\n{TINY_PREVIEW}' for i in range(5)]
+            + [f'【第{i}章 起】\n{_chapter_body(f"章{i}", 80)}' for i in range(5, 10)]
+            + [f'【第10章 夜】\n{SHORT_ELLIPSIS}'])
+        out, _, _, stats = labeler.prepare_book_text(text, clean=True)
+        self.assertIn(SHORT_ELLIPSIS, out)
+
+    def test_five_real_previews_still_make_preview_source(self):
+        # 反例：>100 字的截断预览凑够 5 章仍认定试读源
+        full = '正文' * 300
+        chapters = [{'url': f'https://k/c{i}', 'title': f'第{i}章 起'} for i in range(10)]
+        bodies = {c['url']: (PREVIEW if i < 5 else full) for i, c in enumerate(chapters)}
+        stats = {}
+        with mock.patch.object(labeler.time, 'sleep'):
+            text, _ = labeler.fetch_book_text_engine(
+                FakeCli(chapters, bodies), 'https://k/b', stats=stats)
+        self.assertEqual(stats['preview_chapters'], 5)
+        self.assertNotIn(PREVIEW, text)
+
+
+# ---------------- 审查后③⑥：text_quality 归一与缺失 ----------------
+class TestTextQualityNormalize(unittest.TestCase):
+    def m(self, *segs):
+        return labeler.merge_text_quality(list(segs))
+
+    def test_whitespace_normal_is_normal(self):
+        self.assertEqual(self.m({'text_quality': '正常'}, {'text_quality': '正常 '}), ('正常', []))
+        self.assertEqual(self.m({'text_quality': ' 正常\n'}), ('正常', []))
+        self.assertEqual(self.m({'text_quality': '含广告注入 '}, {'text_quality': '正常'}), ('正常', []))
+
+    def test_missing_or_empty_segment_is_unknown(self):
+        missing = labeler.TEXT_QUALITY_MISSING
+        self.assertEqual(self.m({}, {'text_quality': '正常'})[0], missing)
+        self.assertEqual(self.m({'text_quality': '正常'}, {'text_quality': ''})[0], missing)
+        self.assertEqual(self.m({'text_quality': '正常'}, {'text_quality': '  '})[0], missing)
+        self.assertEqual(self.m({'text_quality': None}, {'text_quality': '正常'})[0], missing)
+        self.assertEqual(self.m(), (None, []))
+
+    def test_normalize_helper(self):
+        n = labeler.normalize_text_quality
+        self.assertEqual(n(' 正常 '), '正常')
+        self.assertEqual(n(None), labeler.TEXT_QUALITY_MISSING)
+        self.assertEqual(n(''), labeler.TEXT_QUALITY_MISSING)
+        self.assertEqual(n(3), 3)
+
+
+class TestMainQualityGateMissing(MainHarness):
+    """⑥ 主会话裁定：模型输出缺 text_quality 或为空串 → 按未知取值拒收（记证据），不按正常入库。"""
+
+    def _labels(self, **over):
+        labels = {'title_guess': '雪中悍刀行', 'site_title_match': True, 'genre': '武侠',
+                  'confidence': 0.9, 'site_title_note': '主角徐凤年、北凉王府设定吻合',
+                  'text_quality_evidence': ['某段原文']}
+        labels.update(over)
+        return labels
+
+    def test_missing_quality_rejected(self):
+        code, _, _ = self.run_main(_good_fetch, self._labels())
+        self.assertEqual(code, 2)
+        self.assertEqual(self.rows('labels.jsonl'), [])
+        rej = self.rows('labels-rejected.jsonl')
+        self.assertEqual(rej[0]['reason'], f'文本质量异常: {labeler.TEXT_QUALITY_MISSING}')
+        self.assertEqual(rej[0]['text_quality_evidence'], ['某段原文'])
+        self.assertNotIn('ad_gate', rej[0])
+
+    def test_empty_quality_rejected(self):
+        code, _, _ = self.run_main(_good_fetch, self._labels(text_quality='  '))
+        self.assertEqual(code, 2)
+        self.assertEqual(self.rows('labels-rejected.jsonl')[0]['reason'],
+                         f'文本质量异常: {labeler.TEXT_QUALITY_MISSING}')
+
+    def test_whitespace_normal_is_imported_normalized(self):
+        code, _, _ = self.run_main(_good_fetch, self._labels(text_quality='正常 '))
+        self.assertEqual(code, 0)
+        self.assertEqual(self.rows('labels.jsonl')[0]['labels']['text_quality'], '正常')
+
+    def test_whitespace_ad_is_downgraded(self):
+        code, _, _ = self.run_main(_good_fetch, self._labels(text_quality=' 含广告注入'))
+        self.assertEqual(code, 0)
+        self.assertEqual(self.rows('labels.jsonl')[0]['quality_flag'], 'ad_injection')
+
+
+# ---------------- 审查后④：日期尾巴不留孤立分隔符 ----------------
+class TestDateTailSeparator(unittest.TestCase):
+    def test_separator_before_date_is_stripped_with_it(self):
+        for raw, want in (('第10章 :2019-05-01', '第10章'),
+                          ('第10章：2019-05-01', '第10章'),
+                          ('第10章 风起 :2019-05-01', '第10章 风起'),
+                          ('第10章 风起 - 2019-05-01', '第10章 风起'),
+                          ('第10章 | 2019-05-01 12:00', '第10章')):
+            self.assertEqual(labeler.clean_chapter_title(raw), want, raw)
+            self.assertEqual(labeler.clean_chapter_title(want), want)
+
+    def test_date_name_still_kept(self):
+        self.assertEqual(labeler.clean_chapter_title('第100章 2012.12.21'), '第100章 2012.12.21')
 
 
 # ---------------- X1 大泼猴同形：源目录自带重复章 ----------------
