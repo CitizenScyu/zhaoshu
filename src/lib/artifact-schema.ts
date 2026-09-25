@@ -94,7 +94,7 @@ export async function initializeArtifactSchema(sql: ReturnType<typeof neon>) {
           WHERE NOT EXISTS (SELECT 1 FROM labeled_books lb WHERE lb.id = t.book_id);
         IF orphan_count > 0 THEN
           RAISE EXCEPTION 'download_tasks has % rows whose book_id is not in labeled_books', orphan_count
-            USING HINT = 'clean orphan download tasks first (docs/artifact-registry.md); the migration does not delete data';
+            USING HINT = 'clean orphan download tasks first (docs/artifact-registry.md Pre-rollout check); the migration does not delete data';
         END IF;
         ALTER TABLE download_tasks ADD CONSTRAINT download_tasks_book_fk
           FOREIGN KEY (book_id) REFERENCES labeled_books(id);

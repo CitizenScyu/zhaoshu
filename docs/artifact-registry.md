@@ -2,8 +2,9 @@
 
 `initializeArtifactSchema(sql)` is an explicit, additive migration exported by
 `business-schema.ts`. Run it only after the existing business tables exist. It uses
-its own `artifact_schema_migrations` version 1, a transaction and a transaction
-advisory lock. It does not modify auth migrations or require T1. It also accepts
+its own `artifact_schema_migrations` ledger (versions 1 and 2), a transaction and a
+transaction advisory lock. Version 2 (41-bookidfk) adds `download_tasks_book_fk`:
+`download_tasks.book_id` → `labeled_books(id)`, see below. It does not modify auth migrations or require T1. It also accepts
 T1's pre-existing nullable bigint `artifact_id` column and adds the foreign key;
 either migration order is supported. Existing dangling IDs fail the migration
 transaction instead of being silently reassigned. The local/test
@@ -23,10 +24,74 @@ must be named explicitly via `--database-url-env`, and neither `DATABASE_URL` no
 `--dry-run` is read-only and reports the current ledger version and the steps that
 would run. `db:check:prod` requires the three artifact tables
 (`artifact_schema_migrations`, `storage_repositories`, `book_artifacts`) and an
-artifact ledger version ≥ 1; a cold-built database that never ran this entry point
+artifact ledger version ≥ `ARTIFACT_SCHEMA_VERSION` (2); a cold-built database that never ran this entry point
 fails the check with `artifactVersionOk: false` instead of silently passing
 (tempdb41 §缺陷 D1: the T8 worker used to start with
 `relation "storage_repositories" does not exist`).
+
+## `download_tasks.book_id` foreign key (v2, 41-bookidfk)
+
+`download_tasks.book_id` shares the `labeled_books` id space with
+`book_artifacts.labeled_book_id` (the ID-space red line in `importer-enqueue.ts` and
+`backfill-plan.ts`). Before v2 nothing enforced it: t8fk-41 found 296 system tasks whose
+`book_id` was a row ordinal (1..296) instead of a `labeled_books.id`. They were enqueued
+silently and only failed after downloading every chapter, when `reserveArtifactPath`
+hit `book_artifacts_labeled_book_id_fkey`. v2 moves that rejection to enqueue time for
+every writer, including unversioned one-off scripts.
+
+- **ON DELETE NO ACTION** (the default), the same as `book_artifacts_labeled_book_id_fkey`.
+  No code path deletes `labeled_books` rows (importers only upsert), and CASCADE would
+  silently erase user download history; SET NULL is impossible (`book_id` is NOT NULL).
+- **Existing orphans abort the migration; nothing is deleted.** `migrate:artifacts:prod`
+  counts rows whose `book_id` is not in `labeled_books` first (read-only, both in
+  `--dry-run` and before apply). If the count is > 0 it reports `plan.status: refused`
+  with the count and the `book_id` range, does not call the migration, and exits with
+  code 2. `initializeArtifactSchema` re-counts under `LOCK TABLE labeled_books,
+  download_tasks IN SHARE ROW EXCLUSIVE MODE` and raises
+  `download_tasks has N rows whose book_id is not in labeled_books` if an orphan slipped
+  in after the dry-run; the whole batch rolls back (no FK, no v2 ledger row).
+- If v2 is recorded but the FK was dropped later, a rerun re-adds it with the same check.
+- In the worker, a `book_artifacts` insert that still hits the `labeled_books` FK (a
+  database that has not run v2) is reported as
+  `LABELED_BOOK_MISSING: labeled_books id=<n> 不存在…` instead of the raw PostgreSQL text.
+
+### Pre-rollout check (operator, per database)
+
+Run read-only first; clean up only after reviewing the rows (take a backup or Neon
+branch before the DELETE). The migration itself never deletes data.
+
+```sql
+-- 1) count and range of orphan tasks (expected 0 before migrate:artifacts:prod)
+SELECT count(*) AS orphan_tasks, min(book_id), max(book_id)
+FROM download_tasks t
+WHERE NOT EXISTS (SELECT 1 FROM labeled_books lb WHERE lb.id = t.book_id);
+
+-- 2) what they are: status / requester / artifact linkage / retry references
+SELECT status, requested_by, count(*) AS n,
+       count(*) FILTER (WHERE artifact_id IS NOT NULL) AS with_artifact,
+       count(*) FILTER (WHERE user_id IS NOT NULL) AS user_tasks
+FROM download_tasks t
+WHERE NOT EXISTS (SELECT 1 FROM labeled_books lb WHERE lb.id = t.book_id)
+GROUP BY 1, 2 ORDER BY 1, 2;
+
+-- 3) rows elsewhere pointing at them (retry_of is ON DELETE SET NULL; artifact_id is the task's own column)
+SELECT count(*) FROM download_tasks r
+WHERE r.retry_of IN (SELECT t.id FROM download_tasks t
+  WHERE NOT EXISTS (SELECT 1 FROM labeled_books lb WHERE lb.id = t.book_id));
+
+-- 4) only after review, in a transaction; check the row count equals query 1 before COMMIT
+BEGIN;
+DELETE FROM download_tasks t
+WHERE NOT EXISTS (SELECT 1 FROM labeled_books lb WHERE lb.id = t.book_id);
+-- COMMIT;  or ROLLBACK;
+```
+
+Then `migrate:artifacts:prod --dry-run` (expect `bookIdIntegrity.orphanTasks: 0`,
+`plan.pending` = `[2]` on a v1 database) → `--yes-i-mean-production` → `db:check:prod`
+(exit 0, `artifactVersion: 2`). Until v2 is applied, `db:check:prod` on an existing v1
+database reports `artifactVersionOk: false` (exit 2) — that is the intended signal.
+
+## Registering the publishing repository
 
 A database built this way has **empty** registry tables. Register the publishing
 repository before starting the T8 worker, otherwise

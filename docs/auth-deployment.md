@@ -53,7 +53,7 @@ Remove-Item Env:PROD_DATABASE_URL
 
 - **灾备冷建库**的完整顺序：`db:migrate:prod --apply`（业务 schema 的生产入口，`0001` 只把 auth 记账到 4）→ 本命令补 auth 的
   5/6/7 三步（下载归属、邀请码表、系统任务队列）→ `migrate:artifacts:prod` 补 artifact schema（`storage_repositories` /
-  `book_artifacts` / `download_tasks.artifact_id` FK，独立入口见 `docs/artifact-registry.md`）→ `register:storage:prod` 登记仓位 →
+  `book_artifacts` / `download_tasks.artifact_id` FK，v2 加 `download_tasks.book_id` → `labeled_books(id)` FK，独立入口见 `docs/artifact-registry.md`）→ `register:storage:prod` 登记仓位 →
   `db:check:prod`（auth 记账不足 7 或 artifact schema 未建时退出码 2）→ 部署应用。
   跳过本命令时应用的 `assertAuthSchema` 会全站 503，`db:check:prod` 也会报 `authVersionOk: false`；
   跳过 `migrate:artifacts:prod` 时 T8 下载 worker 启动即 `relation "storage_repositories" does not exist`，

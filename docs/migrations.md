@@ -64,7 +64,7 @@ npm run test:db    -- --target=test   # 三类起点 + 并发 + 回滚验收
 - **`db:check:prod`（只读）**：整段在 `BEGIN READ ONLY` 事务里。逐版本核摘要、缺表、auth 记账版本（同 `db:check`），外加：
   - 严格记账比对：库里有摘要 / 名称不符的版本、高于代码最新版本的版本、代码不认识的版本、乱序缺口，都判不通过；
   - 四张运行期表（`app_settings` / `source_admission` / `profile_feedback_queue` / `cron_health`）的列类型 / 可空 / 默认值与 0003 的声明（`EXPECTED_RUNTIME_COLUMNS`）逐列比对，输出里附这四表的原始列行。`ADD COLUMN IF NOT EXISTS` 只看列名，列存在但类型不同时 0003 会空转、运行期 INSERT 才炸，所以迁移前必须先看这一项。
-  - artifact 侧：`EXPECTED_TABLES` 含 `artifact_schema_migrations` / `storage_repositories` / `book_artifacts` 三表（缺任一即缺表），并判 artifact 记账版本 ≥ 1（`ARTIFACT_SCHEMA_VERSION`）。这两项由 `src/lib/artifact-schema.ts` 自己的显式迁移建，不走 0001–0003，冷建库须跑 `migrate:artifacts:prod`（41-coldbuild，tempdb41 §缺陷 D1）。基线契约（`db:baseline:prod`）仍只对 0001–0003 的 20 张表成立，不涉及这三张。
+  - artifact 侧：`EXPECTED_TABLES` 含 `artifact_schema_migrations` / `storage_repositories` / `book_artifacts` 三表（缺任一即缺表），并判 artifact 记账版本 ≥ `ARTIFACT_SCHEMA_VERSION`（41-bookidfk 起为 2：v2 = `download_tasks.book_id` → `labeled_books(id)` 外键；只到 v1 的库须先按 `docs/artifact-registry.md`「Pre-rollout check」清孤儿任务再跑 `migrate:artifacts:prod`）。这两项由 `src/lib/artifact-schema.ts` 自己的显式迁移建，不走 0001–0003，冷建库须跑 `migrate:artifacts:prod`（41-coldbuild，tempdb41 §缺陷 D1）。基线契约（`db:baseline:prod`）仍只对 0001–0003 的 20 张表成立，不涉及这三张。
   - 退出码：0 通过；2 不通过；1 参数 / 连接错误。
 - **`db:baseline:prod`**（从未登记的已有库「只补记账」，`scripts/db-baseline.mjs`）：**不执行任何迁移文件里的 SQL**。默认 **dry-run**（`BEGIN READ ONLY`），逐项核对 0001–0003 的效果在库里都已成立：
   - 结构：`scripts/db-baseline-contract.mjs` 的 `BASELINE_SHAPE`——0001→0003 在空库上真跑出的 20 张表的全部列（类型 / 非空 / 默认值 / identity / 生成列表达式 / 所属序列的 `pg_sequence` 参数，含 0001:5 identity 的 `START WITH 2`）、约束（名称 + 类型 + 定义）、索引（名称 + 定义），由 `db-baseline.test.ts` 每次重跑迁移钉住；每张表出自哪段 SQL 见 `BASELINE_TABLE_SOURCES`。库里多出来的列 / 约束 / 索引（auth v5–v7、运行期、artifact 后加的）只在 `extra` 里报告，不拒绝。
@@ -91,7 +91,8 @@ $env:PROD_DATABASE_URL = '<目标库连接串>'
 # 1) auth：预期 plan.status=up-to-date、before.max=7；有 pending 先弄清原因再 --yes-i-mean-production
 npm run migrate:auth:prod -- --database-url-env=PROD_DATABASE_URL --dry-run
 # 2) 只读核对：预期退出码 2，versions=[]、missingTables=["schema_migrations"]、ledger.pending=[1,2,3]、ledger.errors=[]、
-#    authVersionOk=true、artifactVersionOk=true（生产已有 artifact 三表）、runtimeColumns.ok=true。runtimeColumns.extra 非空先停下人工确认。
+#    authVersionOk=true、artifactVersionOk=true（生产已有 artifact 三表；只到 v1 时为 false，先按 docs/artifact-registry.md
+#    「Pre-rollout check」清孤儿后跑 migrate:artifacts:prod 补 v2）、runtimeColumns.ok=true。runtimeColumns.extra 非空先停下人工确认。
 npm run db:check:prod -- --database-url-env=PROD_DATABASE_URL
 # 3) baseline dry-run：预期 status=dry-run、problems=[]、ledgerWrites 为 v1–v3 三行；看一遍 extra
 #    （应只有 auth v5–v7 / 运行期 / artifact 加的东西）。status=refused 就停，按 refusals 逐条核实，不要改用 migrate --apply 绕过。
@@ -112,10 +113,10 @@ Remove-Item Env:PROD_DATABASE_URL
 
 ### 灾备冷建库顺序（空库）
 
-`db:migrate:prod --apply`（0001→0003，`after.authVersion=4`、`authVersionOk=false` 属预期，输出 `next` 提示）→ `migrate:auth:prod --yes-i-mean-production`（补 auth 5/6/7）→ `migrate:artifacts:prod --yes-i-mean-production`（补 artifact schema：`storage_repositories` / `book_artifacts` / `download_tasks.artifact_id` FK；入口见 `docs/artifact-registry.md`）→ `register:storage:prod --apply`（登记发布仓位，否则 T8 worker 反查不到可写仓）→ `db:check:prod` 退出码 0 → 部署应用。每一步之前都可以先跑对应的 dry-run。必须从空库开始：先跑了 auth 迁移的库已有业务表，`db:migrate:prod` 会按「未登记的已有库」拒绝——灾备分支直接丢弃重建即可。
+`db:migrate:prod --apply`（0001→0003，`after.authVersion=4`、`authVersionOk=false` 属预期，输出 `next` 提示）→ `migrate:auth:prod --yes-i-mean-production`（补 auth 5/6/7）→ `migrate:artifacts:prod --yes-i-mean-production`（补 artifact schema：`storage_repositories` / `book_artifacts` / `download_tasks.artifact_id` FK，v2 再加 `download_tasks.book_id` → `labeled_books(id)` FK；冷建库无任务行，孤儿预检为 0；入口见 `docs/artifact-registry.md`）→ `register:storage:prod --apply`（登记发布仓位，否则 T8 worker 反查不到可写仓）→ `db:check:prod` 退出码 0 → 部署应用。每一步之前都可以先跑对应的 dry-run。必须从空库开始：先跑了 auth 迁移的库已有业务表，`db:migrate:prod` 会按「未登记的已有库」拒绝——灾备分支直接丢弃重建即可。
 
 `db:check:prod` 同时判 artifact 侧：缺 `artifact_schema_migrations` / `storage_repositories` / `book_artifacts`
-（`EXPECTED_TABLES` 自 41-coldbuild 起含这三张表）或 artifact 记账版本低于 1 时，退出码 2、`artifactVersionOk: false`，
+（`EXPECTED_TABLES` 自 41-coldbuild 起含这三张表）或 artifact 记账版本低于 `ARTIFACT_SCHEMA_VERSION`（2）时，退出码 2、`artifactVersionOk: false`，
 输出里 `missingTables` 会列出它们。这是 tempdb41 冷建演练踩到的 D1：此前这两张业务表不在清单里，冷建库缺表
 `db:check:prod` 仍 rc=0，而 T8 worker 启动即 `relation "storage_repositories" does not exist`。重建后的
 运行期设置恢复与数据重灌（书源/准入/打标）见 `docs/auth-deployment.md`「从零重建」一节。

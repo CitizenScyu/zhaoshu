@@ -95,7 +95,7 @@ export function planArtifactMigration(state, integrity = { fkPresent: true, orph
     return { status: 'refused', pending, refusals: [
       `${integrity.orphanTasks} 条 download_tasks 的 book_id 不在 labeled_books（book_id 范围 `
       + `${integrity.orphanBookIdMin}..${integrity.orphanBookIdMax}），加 ${BOOK_FK_NAME} 会失败；`
-      + '本迁移不删数据：先按 docs/artifact-registry.md「book_id 外键上线前预检」核对并清理孤儿任务，再重跑',
+      + '本迁移不删数据：先按 docs/artifact-registry.md「Pre-rollout check」核对并清理孤儿任务，再重跑',
     ] };
   }
   return { status: pending.length ? 'pending' : 'up-to-date', pending };
