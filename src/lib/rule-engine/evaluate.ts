@@ -142,10 +142,12 @@ export function evaluateRule(ir: RuleIr, scope: EvalScope, multi = false): EvalR
     case 'template':
       return { kind: 'text', value: renderTemplate(ir.parts, scope) };
     case 'text':
-      // JSON 输入上字面量里的 `{$.x}` 内嵌规则就地替换（如 `http://h/b/{$.id}.html`）；
-      // 没有可替换的内嵌规则则原样返回字面量。
+      // JSON 输入上字面量里的 `{$.x}` 内嵌规则就地替换（如 `http://h/b/{$.id}.html`）。一处都没替换成功时
+      // 对齐 legado：innerRule 返回 "" 后整条规则交 Jayway 读，URL 字面量读不到、异常被吞 ⇒ 空串，
+      // 不回退原文（原文是带 `{$.x}` 的垃圾 URL）。URL 字段的 baseUrl 回退在调用方（api.ts chapterUrl、
+      // source-reader 的 tocUrl）。不含 `{$.` 的字面量照旧原样返回。
       if (scope.kind === 'json' && ir.literal.includes(INNER_JSON_RULE_OPEN)) {
-        return { kind: 'text', value: replaceInnerJsonRules(ir.literal, scope.json) ?? ir.literal };
+        return { kind: 'text', value: jsonRuleString(ir.literal, scope.json) };
       }
       return { kind: 'text', value: ir.literal };
     case 'or':
@@ -226,14 +228,28 @@ function reinterpretedPath(ir: RuleIr): JsonPathIr | null {
   const cached = reinterpretedPaths.get(ir);
   if (cached !== undefined) return cached;
   const source = defaultSyntaxSource(ir);
-  let path: JsonPathIr | null = null;
-  // `@` 开头在 Jayway 里是当前节点语法（如 `@text`，其后必须紧跟 `.`/`[`，否则非法），
-  // 故不前缀，按读取失败处理。
-  if (source !== undefined && !source.startsWith('@')) {
-    try { path = parseJsonPath(jaywayJsonPath(source)); } catch { path = null; }
-  }
+  const path = source === undefined ? null : jaywayPath(source);
   reinterpretedPaths.set(ir, path);
   return path;
+}
+
+/**
+ * 一条规则按 Jayway `JsonPath.read` 的口径编译成本引擎 JSONPath；非法或超出子集 → null（legado 吞异常得空）。
+ * - `$` 开头原样；
+ * - `@` 开头：`readContextToken` 要求 `@` 后紧跟 `.`/`[`，否则非法（如 `@text`）。顶层读取时
+ *   `JsonPath.read` 以文档同时作 document 与 rootDocument（CompiledPath.evaluate → RootPathToken 以 document
+ *   求值），所以 `@.x`/`@[n]` 与 `$.x`/`$[n]` 等价；
+ * - 其余补前缀，见 jaywayJsonPath。
+ */
+function jaywayPath(rule: string): JsonPathIr | null {
+  const source = rule.trim();
+  let path: string;
+  if (source.startsWith('$')) path = source;
+  else if (source.startsWith('@')) {
+    if (source.length > 1 && source[1] !== '.' && source[1] !== '[') return null;
+    path = `$${source.slice(1)}`;
+  } else path = jaywayJsonPath(source);
+  try { return parseJsonPath(path); } catch { return null; }
 }
 
 /**
@@ -248,11 +264,25 @@ function reinterpretedPath(ir: RuleIr): JsonPathIr | null {
  * - `[0]`  → `$.[0]`。Jayway 接受（`readDotToken` 后直接进 `readNextToken` 的 `[` 分支）且语义
  *          等于「根上的下标」`$[0]`；本引擎子集解析器不接受 `$.[0]`（`.` 后缺字段名），
  *          故回写为等价且可解析的 `$[0]`——这是本次唯一真正会改变取值结果的修正。
+ * - `.[0]` → `$..[0]`（扫描 token 后接数组下标 token），子集解析器按 Jayway ScanPathToken 语义收下，
+ *          见 jsonpath.ts 的 arrayScan 段。
  */
 function jaywayJsonPath(source: string): string {
   return source.startsWith('[') ? `$${source}` : `$.${source}`;
 }
 
+/**
+ * legado AnalyzeByJSonPath.getString 的单条规则分支（AnalyzeByJSonPath.kt:37-54，不含 `&&`/`||` 切分）：
+ * 先替换内嵌 `{$.`，一处都没替换成功再把整条规则交 Jayway 读。
+ */
+function jsonRuleString(rule: string, json: unknown): string {
+  const inner = rule.includes(INNER_JSON_RULE_OPEN) ? replaceInnerJsonRules(rule, json) : undefined;
+  if (inner !== undefined) return inner;
+  const path = jaywayPath(rule);
+  return path ? jsonValuesToString(evalJsonPath(path, json)) : '';
+}
+
+/** 默认语法规则在 JSON 输入上的取值：jsonRuleString 的同款流程，Jayway 路径按 IR 缓存。 */
 function jsonModeString(ir: RuleIr, json: unknown): string {
   const source = defaultSyntaxSource(ir) ?? '';
   const inner = source.includes(INNER_JSON_RULE_OPEN) ? replaceInnerJsonRules(source, json) : undefined;
@@ -264,6 +294,8 @@ function jsonModeString(ir: RuleIr, json: unknown): string {
 /**
  * legado RuleAnalyzer.innerRule("{$.")：逐个找 `{$.`、按花括号配平取出内嵌规则并求值，
  * 求值非空才替换；一处都没替换成功返回 undefined（legado 此时返回空串，交由调用方决定回退）。
+ * 内嵌规则的求值函数与 legado 一样是完整的 getString（AnalyzeByJSonPath.kt:41 `innerRule("{$.") { getString(it) }`），
+ * 所以 `{$.a{$.x}}` 先替换内层，外层得到替换后的字串 `$.a<x>`（非空即采用，不再当路径读）。
  *
  * **失败时不中止**：legado 的循环体在「求值为空」或「花括号不配平」时走 `pos += inner.length`
  * 继续扫描（RuleAnalyzer.kt:326「拉出字段不平衡，inner 只是个普通字串，跳到此 inner 后继续匹配」），
@@ -280,9 +312,7 @@ function replaceInnerJsonRules(text: string, json: unknown): string | undefined 
   while (at >= 0) {
     const close = matchingBrace(text, at);
     let value = '';
-    if (close > at) {
-      try { value = jsonValuesToString(evalJsonPath(parseJsonPath(text.slice(at + 1, close)), json)); } catch { value = ''; }
-    }
+    if (close > at) value = jsonRuleString(text.slice(at + 1, close), json);
     if (value !== '') {
       out += text.slice(last, at) + value;
       last = close + 1;
@@ -296,17 +326,39 @@ function replaceInnerJsonRules(text: string, json: unknown): string | undefined 
   return replaced ? out + text.slice(last) : undefined;
 }
 
-/** `open` 处的 `{` 对应的 `}` 下标；不配平返回 -1。 */
+/**
+ * `open` 处的 `{` 对应的 `}` 下标；不配平返回 -1。逐行对齐 legado RuleAnalyzer.chompCodeBalanced('{', '}')
+ * （RuleAnalyzer.kt:91-126，jer-chao@c2c4775）：
+ * - `\` 转义吞掉下一个字符（引号内外都一样）；
+ * - 单/双引号内的字符不参与配平，另一种引号在其中不算开合；
+ * - `[]` 深度非 0 时不数 `{}`；`]` 可把深度减成负数，此后 `{}` 都不再计数（上游同样如此，结果是不配平）。
+ * 上游在串尾是 `\` 时会越界抛异常，这里按不配平处理。
+ */
 function matchingBrace(text: string, open: number): number {
   let depth = 0;
-  for (let i = open; i < text.length; i += 1) {
-    if (text[i] === '{') depth += 1;
-    else if (text[i] === '}') {
-      depth -= 1;
-      if (depth === 0) return i;
+  let braces = 0;
+  let inSingle = false;
+  let inDouble = false;
+  let i = open;
+  do {
+    if (i >= text.length) break;
+    const c = text[i++];
+    if (c === '\\') {
+      i += 1;
+      continue;
     }
-  }
-  return -1;
+    if (c === "'" && !inDouble) inSingle = !inSingle;
+    else if (c === '"' && !inSingle) inDouble = !inDouble;
+    if (inSingle || inDouble) continue;
+    if (c === '[') depth += 1;
+    else if (c === ']') depth -= 1;
+    else if (depth === 0) {
+      if (c === '{') braces += 1;
+      else if (c === '}') braces -= 1;
+    }
+  } while (depth > 0 || braces > 0);
+  // 只有深度 0 处的 `}` 能让 braces 归零，所以循环正常结束时最后读到的字符就是配对的 `}`。
+  return depth > 0 || braces > 0 ? -1 : i - 1;
 }
 
 // ---------------------------------------------------------------- 字段求值（§3.3）
