@@ -199,5 +199,35 @@ class TestPleaRuleFollowups(unittest.TestCase):
             self.assertEqual(labeler._drop_rule(line), 'plea', line)
 
 
+# ---------------- X1 大泼猴同形：源目录自带重复章 ----------------
+class TestSourceDuplicateChapters(unittest.TestCase):
+    """kxdu《大泼猴》目录里 第十章–第四十三章 各出现两次（URL 不同、正文逐字相同，穿插排列），
+    第一百二十二章是改过一个名字的重传版。去重应只删重复副本，改动的那一行保留，章中位数不受影响。"""
+
+    def test_interleaved_duplicate_chapters_deduped(self):
+        bodies = {i: _chapter_body(f'章{i}', 60) for i in range(10, 44)}
+        order = []
+        for i in range(10, 44):          # 穿插：第 i 章首发后，隔一两章再出现一次
+            order.append(i)
+            if i - 2 >= 10:
+                order.append(i - 2)
+        order += [42, 43]
+        revised = bodies[43].replace('章43第5段', '章43第5段（改）')
+        heads = []
+        seen_once = set()
+        for i in order:
+            body = revised if (i == 43 and i in seen_once) else bodies[i]
+            seen_once.add(i)
+            heads.append(f'【第{i}章】\n{body}')
+        out, chars, reason, stats = labeler.prepare_book_text('\n\n'.join(heads), clean=True)
+        self.assertIsNone(reason)
+        # 首发版的原行与重传版的改动行各留一份
+        self.assertEqual(chars, sum(len(b) for b in bodies.values()) + len(_line('章43', 5)) + len('（改）'))
+        dup_chapters = len(order) - len(bodies)
+        self.assertEqual(stats['dup_lines'], dup_chapters * 60 - 1)
+        self.assertIn('章43第5段（改）', out)                 # 重传版改动的行留下
+        self.assertEqual(stats['median_chapter'], len(bodies[10].replace('\n', '')))  # 按去重前章长算
+
+
 if __name__ == '__main__':
     unittest.main()
