@@ -18,16 +18,14 @@
 import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import {
-  applyMigration, checkRuntimeColumns, createClient, evaluateSchema, EXPECTED_RUNTIME_COLUMNS, EXPECTED_TABLES, inspectSchema,
+  applyMigration, ARTIFACT_TABLES, checkRuntimeColumns, createClient, evaluateSchema, EXPECTED_RUNTIME_COLUMNS, EXPECTED_TABLES, inspectSchema,
   loadMigrations, planMigrations, probeEndpoint, safeError, SCHEMA_VERSION, TARGET_SCHEMA,
 } from './db-migration-lib.mjs';
 import { applyBaseline, baselineLedgerWrites, verifyBaseline } from './db-baseline.mjs';
-import { readDatabaseUrl } from './migrate-auth-prod.mjs';
+import { assertProdDatabaseUrlEnv, readDatabaseUrl } from './migrate-auth-prod.mjs';
 
 const USAGE = '用法: db-prod.mjs check --database-url-env=<变量名> | db-prod.mjs <migrate|baseline> --database-url-env=<变量名> [--apply]（migrate / baseline 默认 dry-run）';
 const WRITE_COMMANDS = new Set(['migrate', 'baseline']);
-// 应用与隔离库各自的连接变量。生产入口只读运维专用变量，免得 shell 里残留的应用 / 测试连接被误当目标。
-const RESERVED_ENV_NAMES = new Set(['DATABASE_URL', 'TEST_DATABASE_URL']);
 
 export function parseProdArgs(argv) {
   const [command, ...rest] = argv;
@@ -43,10 +41,7 @@ export function parseProdArgs(argv) {
     else if (arg === '--dry-run') dryRun = true;
     else throw new Error(`未知参数 ${arg}。${USAGE}`);
   }
-  if (!envName || !/^[A-Z_][A-Z0-9_]*$/.test(envName)) throw new Error(`必须用 --database-url-env=<大写变量名> 显式指定目标。${USAGE}`);
-  if (RESERVED_ENV_NAMES.has(envName)) {
-    throw new Error(`--database-url-env 不能是 ${envName}：生产入口只读专用变量（例如 PROD_DATABASE_URL），不复用应用或测试库的连接变量`);
-  }
+  assertProdDatabaseUrlEnv(envName, USAGE);
   if (command === 'check') {
     if (apply || dryRun) throw new Error(`check 只读，不接受 --apply / --dry-run。${USAGE}`);
     return { command, envName, mode: 'read-only' };
@@ -113,11 +108,15 @@ export async function runProdCheck(client, migrations) {
 // 对它 --apply 会把 0001 整份在在线表上重跑（ALTER COLUMN / UPDATE / SET NOT NULL），而不是只补记账——
 // 生产正是这个形态（prodmig41，2026-09-24）。空记账表与没有记账表同样处理（复审 baserev41 #1：只看表在不在，
 // 空表会被当成已登记而放行重放）。冷建库只能是空库；已有库先用 db:baseline:prod 核对并登记。
+// 计数只算「由 0001–0003 建」的表：artifact 三表由 initializeArtifactSchema 单独建、不进 0001–0003
+// （41-bookidfk N2），把它们算进来会把「migrate 会重跑 0001」的拒绝文案夸大，也可能对只缺 artifact schema
+// 的库误触发。present 可能含非 EXPECTED_TABLES 的表（如裸 pg 的 information_schema 视角），过滤掉。
 export function unadoptedRefusal(report) {
   const present = new Set(report.columns.map((column) => column.table_name));
   const ledgerPresent = present.has('schema_migrations');
   if (ledgerPresent && report.versions.length) return [];
-  const existing = EXPECTED_TABLES.filter((table) => table !== 'schema_migrations' && present.has(table));
+  const managed = EXPECTED_TABLES.filter((table) => table !== 'schema_migrations' && !ARTIFACT_TABLES.includes(table));
+  const existing = managed.filter((table) => present.has(table));
   if (!existing.length) return [];
   const ledger = ledgerPresent ? 'schema_migrations 为空（0 行）' : '库里没有 schema_migrations';
   return [`${ledger}，却已有 ${existing.length} 张迁移管理的表（${existing.slice(0, 5).join(', ')}${existing.length > 5 ? ' …' : ''}）：`

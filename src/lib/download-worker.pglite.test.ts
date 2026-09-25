@@ -189,6 +189,21 @@ maybe('T3 worker 任务层：租约、单写者、五阶段对账（PGlite + moc
     expect(github.calls).toHaveLength(0);
   });
 
+  it('41-bookidfk：孤儿任务（book_id 不在 labeled_books）写 book_artifacts 撞外键 → failed 且错误为可读码、零发布', async () => {
+    // 复现 t8fk-41 task 292：库停在 artifact v1（没有 download_tasks_book_fk），旁路入队了 book_id=292。
+    await pg.exec('ALTER TABLE download_tasks DROP CONSTRAINT download_tasks_book_fk');
+    const id = await insertTask();
+    await pg.query('UPDATE download_tasks SET book_id = 292 WHERE id = $1', [id]);
+    const txt = completeText('测试书', 3);
+    const result = await runDownloadTask(options([scriptAdapter({ kind: 'complete', txt, chaptersTotal: 3, chaptersDone: 3, charsTotal: 3 * 810 })]), (await claimDownloadTask(sql as never, 'worker-a'))!);
+    expect(result.terminal).toBe('failed');
+    const state = await taskState(id);
+    expect(state.status).toBe('failed');
+    expect(String(state.error)).toMatch(/^LABELED_BOOK_MISSING: labeled_books id=292 不存在/);
+    expect(String(state.error)).not.toMatch(/violates foreign key constraint/);
+    expect(github.calls).toHaveLength(0);
+  });
+
   it('更差候选不晋升：旧 100 章已发布 → 新 80 章 → superseded_by_incomplete，规范/指针保旧', async () => {
     // 先发布一个旧版
     const firstId = await insertTask();

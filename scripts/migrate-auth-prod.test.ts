@@ -15,8 +15,29 @@ describe('参数闸门：目标与确认都必须显式给出', () => {
     [['--database-url-env=PROD_URL', '--dry-run', '--yes-i-mean-production'], /必须且只能给一个/],
     [['--database-url-env=PROD_URL', '--yes'], /未知参数/],
     [['--database-url-env=A', '--database-url-env=B', '--dry-run'], /只能给一次/],
+    // 41-bookidfk：此前只有 db-prod / migrate-artifacts-prod 拒收这两个名字，本入口漏了（coldbuild-41 §6 第 2 点）。
+    [['--database-url-env=DATABASE_URL', '--dry-run'], /不能是 DATABASE_URL/],
+    [['--database-url-env=TEST_DATABASE_URL', '--yes-i-mean-production'], /不能是 TEST_DATABASE_URL/],
   ])('%j 被拒绝', (argv, message) => {
     expect(() => parseAuthMigrationArgs(argv)).toThrow(message);
+  });
+
+  it('readDatabaseUrl 本身也拒收应用 / 测试库变量名（绕过参数解析直接调用也挡住）', () => {
+    const fake = 'postgresql://u:not-a-secret@ep-fake-123.example.test/db';
+    expect(() => readDatabaseUrl('DATABASE_URL', { DATABASE_URL: fake })).toThrow(/不能是 DATABASE_URL/);
+    expect(() => readDatabaseUrl('TEST_DATABASE_URL', { TEST_DATABASE_URL: fake })).toThrow(/不能是 TEST_DATABASE_URL/);
+  });
+
+  it('四个生产入口共用同一个闸门函数（不再各抄一份）', async () => {
+    const { readFileSync } = await import('node:fs');
+    let literalCopies = 0;
+    for (const file of ['migrate-auth-prod.mjs', 'migrate-artifacts-prod.mjs', 'db-prod.mjs', 'register-storage-repository.mjs']) {
+      const text = readFileSync(new URL(`./${file}`, import.meta.url), 'utf8');
+      expect(text, file).toMatch(/assertProdDatabaseUrlEnv\(/);
+      literalCopies += text.match(/\['DATABASE_URL', 'TEST_DATABASE_URL'\]/g)?.length ?? 0;
+    }
+    // 保留名单只在 migrate-auth-prod.mjs 定义一次。
+    expect(literalCopies).toBe(1);
   });
 
   it('合法组合', () => {

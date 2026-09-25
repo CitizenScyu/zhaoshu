@@ -4,7 +4,7 @@ import { initializeArtifactSchema } from '../src/lib/artifact-schema';
 import { loadPGlite, type PGliteLike } from '../src/lib/fixtures/pglite';
 import { createPGliteSql } from '../src/lib/fixtures/pglite-sql';
 import {
-  DEFAULT_BRANCH, DEFAULT_REPO, inspectRegistration, parseRegisterArgs, planRegistration, runRegistration,
+  DEFAULT_BRANCH, DEFAULT_REPO, insertRepositoryRow, inspectRegistration, parseRegisterArgs, planRegistration, runRegistration,
 } from './register-storage-repository.mjs';
 
 describe('参数解析：目标显式给出，仓库键来自配置/缺省', () => {
@@ -67,9 +67,10 @@ const maybe = PGliteCtor ? describe : describe.skip;
 maybe('runRegistration（PGlite 真库）', () => {
   // artifact schema 的 book_artifacts 对 labeled_books(id) 与 download_tasks 有外键依赖；
   // 本用例只关心 storage_repositories，故建两张最小父表（与迁移 0001 的形状无关，够用即可）。
+  // download_tasks 要有 book_id：artifact v2（41-bookidfk）给它加指向 labeled_books(id) 的外键。
   async function withArtifactSchema(): Promise<PGliteLike> {
     const pg = new PGliteCtor!();
-    await pg.exec('CREATE TABLE labeled_books (id serial PRIMARY KEY); CREATE TABLE download_tasks (id serial PRIMARY KEY);');
+    await pg.exec('CREATE TABLE labeled_books (id serial PRIMARY KEY); CREATE TABLE download_tasks (id serial PRIMARY KEY, book_id int NOT NULL);');
     await initializeArtifactSchema(createPGliteSql(pg) as never);
     return pg;
   }
@@ -103,6 +104,18 @@ maybe('runRegistration（PGlite 真库）', () => {
     await runRegistration(sql, key, 'apply');
     const again = await runRegistration(sql, { ...key, owner: 'citizenscyu', repo: 'ZHAOSHU-BOOKS' }, 'apply');
     expect(again.status).toBe('noop');
+    expect((await pg.query('SELECT count(*)::int AS n FROM storage_repositories')).rows[0].n).toBe(1);
+  }, 60_000);
+
+  // 41-bookidfk N3：SELECT 与 INSERT 之间无事务/锁，并发双跑输的一方会撞唯一索引。
+  // 旧写法抛 23505（退出码 1）；ON CONFLICT DO NOTHING 后是干净的 0 行、不写第二行、不再抛。
+  it('N3 并发：同身份双写，第二次 INSERT 撞唯一索引也不抛、不写第二行（ON CONFLICT DO NOTHING）', async () => {
+    const pg = await withArtifactSchema();
+    const sql = createPGliteSql(pg);
+    const first = await insertRepositoryRow(sql, key);
+    expect(first).toHaveLength(1);
+    // 直接再走一次 INSERT（绕过 inspectRegistration 的 noop 短路），模拟并发下的输方。
+    await expect(insertRepositoryRow(sql, { ...key, owner: 'citizenscyu', repo: 'ZHAOSHU-BOOKS' })).resolves.toEqual([]);
     expect((await pg.query('SELECT count(*)::int AS n FROM storage_repositories')).rows[0].n).toBe(1);
   }, 60_000);
 

@@ -31,9 +31,31 @@ describe('参数闸门：目标与确认都必须显式给出', () => {
 
 describe('planArtifactMigration', () => {
   it('按缺哪个版本算待执行步骤（与 initializeArtifactSchema 逐版本判断同口径）', () => {
-    expect(planArtifactMigration({ tablePresent: false, versions: [], max: null }).pending.map((item) => item.version)).toEqual([1]);
-    expect(planArtifactMigration({ tablePresent: true, versions: [1], max: 1 })).toEqual({ status: 'up-to-date', pending: [] });
-    expect(planArtifactMigration({ tablePresent: true, versions: [1, 2], max: 2 }).status).toBe('newer-than-code');
+    expect(planArtifactMigration({ tablePresent: false, versions: [], max: null }).pending.map((item) => item.version)).toEqual([1, 2]);
+    // 生产当前形态（只到 v1）：待执行的只有 v2（book_id 外键，41-bookidfk）。
+    expect(planArtifactMigration({ tablePresent: true, versions: [1], max: 1 }).pending.map((item) => item.version)).toEqual([2]);
+    expect(planArtifactMigration({ tablePresent: true, versions: [1, 2], max: 2 })).toEqual({ status: 'up-to-date', pending: [] });
+    expect(planArtifactMigration({ tablePresent: true, versions: [1, 2, 3], max: 3 }).status).toBe('newer-than-code');
+  });
+
+  it('外键缺失且有孤儿任务时整份计划 refused（附计数与 book_id 范围）；外键已在则不看孤儿计数', () => {
+    const v1 = { tablePresent: true, versions: [1], max: 1 };
+    const refused = planArtifactMigration(v1, { fkPresent: false, orphanTasks: 296, orphanBookIdMin: 1, orphanBookIdMax: 296 });
+    expect(refused.status).toBe('refused');
+    expect(refused.refusals?.[0]).toMatch(/296 条 download_tasks 的 book_id 不在 labeled_books（book_id 范围 1\.\.296）/);
+    expect(planArtifactMigration(v1, { fkPresent: false, orphanTasks: 0 }).status).toBe('pending');
+    expect(planArtifactMigration(v1, { fkPresent: true, orphanTasks: 3 }).status).toBe('pending');
+  });
+
+  // 41-bookidfk N1：把「max vs 逐版本存在性」的口径差钉死。
+  // 例：库里只有 v2 没有 v1（人为造出的异常态）——本函数按存在性只看上限（max=2 不高于代码 2 → 不拒绝），
+  // 把 v1 列进 pending；与 initializeArtifactSchema 按 `NOT EXISTS version=1` 决定跑 v1 DDL 同口径。
+  // 旧口径曾在此报 newer-than-code（只此一处），v2 重写后已一致。
+  it('N1：库里只有 v2 没有 v1 时按存在性判待执行（不误报 newer-than-code），与迁移器逐版本判断一致', () => {
+    const onlyV2 = { tablePresent: true, versions: [2], max: 2 };
+    const plan = planArtifactMigration(onlyV2);
+    expect(plan.status).toBe('pending');
+    expect(plan.pending.map((item) => item.version)).toEqual([1]);
   });
 });
 
@@ -53,33 +75,34 @@ maybe('runArtifactMigration（PGlite 真库）', () => {
   const tablePresent = async (pg: PGliteLike, table: string) =>
     (await pg.query(`SELECT to_regclass($1) IS NOT NULL AS present`, [table])).rows[0].present;
 
-  it('dry-run 只读：报告将建 artifact schema v1，库一张表都没建', async () => {
+  it('dry-run 只读：报告将建 artifact schema v1+v2，库一张表都没建', async () => {
     const pg = await coldBuiltWithoutArtifacts();
     const sql = createPGliteSql(pg);
     const report = await runArtifactMigration(sql, 'dry-run');
     expect(report.status).toBe('dry-run');
     expect(report.before).toEqual({ tablePresent: false, versions: [], max: null });
-    expect(report.plan.pending.map((item: { version: number }) => item.version)).toEqual([1]);
+    expect(report.plan.pending.map((item: { version: number }) => item.version)).toEqual([1, 2]);
+    expect(report.bookIdIntegrity).toEqual({ fkPresent: false, orphanTasks: 0, orphanBookIdMin: null, orphanBookIdMax: null });
     for (const table of ARTIFACT_TABLES) expect(await tablePresent(pg, table), table).toBe(false);
   }, 60_000);
 
-  it('apply 幂等：首次 applied 到 v1，再跑 unchanged；三张表齐全', async () => {
+  it('apply 幂等：首次 applied 到 v2，再跑 unchanged；三张表齐全', async () => {
     const pg = await coldBuiltWithoutArtifacts();
     const sql = createPGliteSql(pg);
     const first = await runArtifactMigration(sql, 'apply');
     expect(first.status).toBe('applied');
-    expect(first.after?.max).toBe(1);
+    expect(first.after?.max).toBe(2);
     for (const table of ARTIFACT_TABLES) expect(await tablePresent(pg, table), table).toBe(true);
     const second = await runArtifactMigration(sql, 'apply');
     expect(second.status).toBe('unchanged');
-    expect(await versionsOf(pg)).toEqual([1]);
+    expect(await versionsOf(pg)).toEqual([1, 2]);
   }, 60_000);
 
   it('库版本高于代码：dry-run 报 newer-than-code，apply 拒绝执行', async () => {
     const pg = await coldBuiltWithoutArtifacts();
     const sql = createPGliteSql(pg);
     await runArtifactMigration(sql, 'apply');
-    await pg.query('INSERT INTO artifact_schema_migrations(version) VALUES (2)');
+    await pg.query('INSERT INTO artifact_schema_migrations(version) VALUES (3)');
     expect((await runArtifactMigration(sql, 'dry-run')).plan.status).toBe('newer-than-code');
     await expect(runArtifactMigration(sql, 'apply')).rejects.toThrow(/高于代码支持/);
   }, 60_000);
@@ -88,6 +111,6 @@ maybe('runArtifactMigration（PGlite 真库）', () => {
     const pg = await coldBuiltWithoutArtifacts();
     const sql = createPGliteSql(pg);
     await runArtifactMigration(sql, 'apply');
-    expect(await readArtifactVersions(sql)).toEqual({ tablePresent: true, versions: [1], max: 1 });
+    expect(await readArtifactVersions(sql)).toEqual({ tablePresent: true, versions: [1, 2], max: 2 });
   }, 60_000);
 });

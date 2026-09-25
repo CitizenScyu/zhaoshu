@@ -259,8 +259,12 @@ maybe('PGlite 真库', () => {
       ['feedback 有 NULL user_id（0001:119-120）', `ALTER TABLE feedback ALTER COLUMN user_id DROP NOT NULL;
         INSERT INTO books (title, author) VALUES ('t', 'a'); INSERT INTO feedback (book_id, status) VALUES (1, 'liked')`,
         /数据不符（0001:119-120）：feedback\.user_id 无 NULL/],
+      // book_id=1 需先有 labeled_books id=1 行：artifact v2（41-bookidfk）起 download_tasks.book_id
+      // 有指向 labeled_books(id) 的外键，migratedUnledgered 已跑过 initializeArtifactSchema。本用例只关心
+      // title 的 NULL，故先垫一行父表；id 显式给 1（serial 默认从 1 起，显式写更稳）。
       ['download_tasks 必填列有 NULL（0001:159-167）', `ALTER TABLE download_tasks ALTER COLUMN title DROP NOT NULL, ALTER COLUMN user_id DROP NOT NULL;
-        INSERT INTO download_tasks (book_id, title, requested_by) VALUES (7, NULL, 'system')`, /数据不符（0001:159-167）/],
+        INSERT INTO labeled_books (id, title, author) VALUES (1, 't', 'a');
+        INSERT INTO download_tasks (book_id, title, requested_by) VALUES (1, NULL, 'system')`, /数据不符（0001:159-167）/],
       ['shuyuan_meta 缺 id=1 行（0001:139）', 'DELETE FROM shuyuan_meta', /数据不符（0001:139）/],
       ['auth_settings 缺 id=1 行（0001:41）', 'DELETE FROM auth_settings', /数据不符（0001:41）/],
       ['app_settings 缺 id=1 行（0003:26）', 'DELETE FROM app_settings', /数据不符（0003:26）/],

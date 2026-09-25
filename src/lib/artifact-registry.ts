@@ -4,8 +4,11 @@ import { canonicalBookKey } from './book-identity';
 import { validateArtifactPath } from './artifact-locator';
 
 export class ArtifactRegistryError extends Error {
-  constructor(public readonly code: 'ARTIFACT_PATH_COLLISION' | 'ARTIFACT_IDENTITY_CONFLICT' | 'REPOSITORY_NOT_WRITABLE') {
-    super(code);
+  constructor(
+    public readonly code: 'ARTIFACT_PATH_COLLISION' | 'ARTIFACT_IDENTITY_CONFLICT' | 'REPOSITORY_NOT_WRITABLE' | 'LABELED_BOOK_MISSING',
+    detail?: string,
+  ) {
+    super(detail ? `${code}: ${detail}` : code);
   }
 }
 
@@ -58,6 +61,13 @@ export async function reserveArtifactPath(sql: ReturnType<typeof neon>, input: R
     if (error && typeof error === 'object' && 'code' in error && error.code === '23505'
       && 'constraint' in error && error.constraint === 'book_artifacts_path_key') {
       throw new ArtifactRegistryError('ARTIFACT_PATH_COLLISION');
+    }
+    // The task's book_id is outside the labeled_books id space (t8fk-41: row ordinals enqueued as
+    // book_id). The worker stores error.message on the task, so name the cause instead of raw PG text.
+    if (error && typeof error === 'object' && 'code' in error && error.code === '23503'
+      && 'constraint' in error && error.constraint === 'book_artifacts_labeled_book_id_fkey') {
+      throw new ArtifactRegistryError('LABELED_BOOK_MISSING',
+        `labeled_books id=${input.labeledBookId} 不存在（download_tasks.book_id 不在书库 ID 空间）`);
     }
     throw error;
   }

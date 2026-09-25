@@ -52,7 +52,7 @@ export async function upgradeToAuthV7(sql: ProductionSql): Promise<void> {
   await sql.transaction((tx) => [authSchemaV7Statement(tx as never)]);
 }
 
-/** artifact 注册表（storage_repositories / book_artifacts）与 v1 幂等修复。 */
+/** artifact 注册表（storage_repositories / book_artifacts）与 v1 幂等修复；v2 起含 download_tasks.book_id → labeled_books(id) 外键（41-bookidfk）。 */
 export async function createArtifactSchema(sql: ProductionSql): Promise<void> {
   await initializeArtifactSchema(sql);
 }
