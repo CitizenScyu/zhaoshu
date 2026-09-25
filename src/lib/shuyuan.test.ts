@@ -1110,6 +1110,43 @@ describe('refreshShuyuan atomic refresh', () => {
       expect(execute).toHaveBeenCalledTimes(2);
     });
 
+    // 41-srcfix 同站去重：同站多副本同一轮测完、checked_at 挨着，改前会把取书池名额占成同一个站。
+    it('41-srcfix 同站去重：traversal 同 host 只留全序最前一份；selectable/扇出不去重（在读副本仍认得）；traversal ⊆ selectable', async () => {
+      const rows = [
+        engineRowAt('dup.example', { source_url: 'https://dup.example/a', search_checked_at: '2026-09-24T00:00:00Z' }),
+        engineRowAt('dup.example', { source_url: 'https://dup.example/b', search_checked_at: '2026-09-23T00:00:00Z' }),
+        engineRowAt('dup.example', { source_url: 'https://dup.example/c', search_checked_at: '2026-09-22T00:00:00Z' }),
+        engineRowAt('x.example', { search_checked_at: '2026-09-20T00:00:00Z' }),
+      ];
+      const arrange = () => execute.mockResolvedValueOnce([{ host: 'dup.example' }, { host: 'x.example' }])
+        .mockResolvedValueOnce([{ collections: [] }]).mockResolvedValueOnce([]).mockResolvedValueOnce(rows);
+      vi.stubEnv('READING_ENGINE_SOURCES', '1');
+      vi.stubEnv('READING_POOL_LIMIT', '3');
+      arrange();
+      const pools = await getSourcePools(new AbortController().signal);
+      // 改前：[book15, dup/a, dup/b] —— 3 个名额里 2 个是同一个站，x.example 自动遍历永远轮不到。
+      expect(pools.traversal.map((source) => source.url)).toEqual([
+        'https://book15.net/', 'https://dup.example/a', 'https://x.example/',
+      ]);
+      expect(pools.selectable.map((source) => source.url)).toEqual([
+        'https://book15.net/', 'https://dup.example/a', 'https://dup.example/b', 'https://dup.example/c', 'https://x.example/',
+      ]);
+      arrange();
+      await expect(getReadingPool(new AbortController().signal)).resolves.toMatchObject({
+        sources: pools.traversal, enginePoolSize: 2, poolCandidates: 2,
+      });
+      arrange();
+      expect((await getFanoutPool(new AbortController().signal)).map((source) => source.url))
+        .toEqual(pools.selectable.map((source) => source.url));
+      // 窗口：selectable 只到 max(R,F)=3 条 ⇒ traversal 不越窗去捞 x.example（否则首开选中的源章节路径认不回来）。
+      vi.stubEnv('SOURCE_FANOUT_LIMIT', '2');
+      arrange();
+      const narrow = await getSourcePools(new AbortController().signal);
+      const selectableUrls = new Set(narrow.selectable.map((source) => source.url));
+      expect(narrow.traversal.map((source) => source.url)).toEqual(['https://book15.net/', 'https://dup.example/a']);
+      expect(narrow.traversal.every((source) => selectableUrls.has(source.url))).toBe(true);
+    });
+
     it('合成条目的 rules 与 shuyuan_sources.source 深相等；sourceRevision 与 rules_hash 同源（§5.2）', async () => {
       vi.stubEnv('READING_ENGINE_SOURCES', '1');
       execute.mockResolvedValueOnce([{ host: 'engine.example' }]).mockResolvedValueOnce([{ collections: [] }])
