@@ -466,6 +466,105 @@ describe('准入状态机 runAdmissionBatch', () => {
     expect(beyond.rows[0]).toMatchObject({ search_ok: true, search_verdict: 'ok' });
   });
 
+  // 41-srcfix P2：deferred 按 verdict 设复测窗。改前统一 20h ⇒ no_result/url_invalid 每天吃满名额，
+  // class 2 的 ok 复核被饿死（srclife-41b G1/G2）。
+  describe('41-srcfix P2：deferred 按 verdict 分复测窗', () => {
+    const okBody = '<div class="i"><span class="t">书名</span><a href="/b/1">x</a></div>';
+    const deferredRow = (url: string, source: RawSource, verdict: string, hoursAgo: number) =>
+      new Map([[url, sourceRow(url, {
+        tier: 'M1', compile_ok: true, rules_hash: rulesHash(source), search_ok: false, search_verdict: verdict,
+        search_checked_at: fixtureAgoIso(hoursAgo * 3_600_000),
+      })]]);
+    const run = (url: string, source: RawSource, existing: Map<string, AdmissionSourceRow>,
+      declaredHosts: Set<string>, fetchPage: AdmissionTransport = vi.fn<AdmissionTransport>().mockResolvedValue(page(okBody))) =>
+      runAdmissionBatch({
+        candidates: [{ url, source }], declaredHosts, existing, fetchPage,
+        signal: signal(), throttleMs: 0, now: atFixtureNow,
+      });
+
+    it('no_result：21h 不重测（改前 20h 即重测）、73h 重测', async () => {
+      const url = 'https://noresult.example.com';
+      const source = syntheticSource(`${url}/`);
+      const hosts = new Set(['noresult.example.com']);
+      const within = await run(url, source, deferredRow(url, source, 'no_result', 21), hosts);
+      expect(within.probed).toBe(0);
+      expect(within.rows).toHaveLength(0);
+      const beyond = await run(url, source, deferredRow(url, source, 'no_result', 73), hosts);
+      expect(beyond.probed).toBe(1);
+      expect(beyond.rows[0]).toMatchObject({ search_ok: true, search_verdict: 'ok' });
+    });
+
+    it.each(['http_4xx', 'http_5xx', 'query_insensitive'])('%s 保持 20h 窗：19h 不重测、21h 重测', async (verdict) => {
+      const url = 'https://soft.example.com';
+      const source = syntheticSource(`${url}/`);
+      const hosts = new Set(['soft.example.com']);
+      expect((await run(url, source, deferredRow(url, source, verdict, 19), hosts)).probed).toBe(0);
+      expect((await run(url, source, deferredRow(url, source, verdict, 21), hosts)).probed).toBe(1);
+    });
+
+    // 本地确定性 url_invalid：searchUrl host 不在声明集（po.net 型）。同输入必同结论。
+    const crossUrl = 'https://cross.example.com';
+    const crossSource = syntheticSource(`${crossUrl}/`, { searchUrl: 'https://search.other.example/s?q={{key}}' });
+
+    it('本地确定性 url_invalid：规则与判据都没变 ⇒ 不按时间复测、不占名额（改前 21h/30d 都重测且扣名额）', async () => {
+      for (const hoursAgo of [21, 30 * 24]) {
+        const fetchPage = vi.fn<AdmissionTransport>();
+        const result = await run(crossUrl, crossSource, deferredRow(crossUrl, crossSource, 'url_invalid', hoursAgo),
+          new Set(['cross.example.com']), fetchPage);
+        expect(result.probed).toBe(0);
+        expect(result.rows).toHaveLength(0);
+        expect(fetchPage).not.toHaveBeenCalled();
+      }
+      // 名额让给真正该测的源：1 个名额 + 一个到期 http_5xx 源 ⇒ 名额给 http_5xx 源。
+      const softUrl = 'https://soft2.example.com';
+      const softSource = syntheticSource(`${softUrl}/`);
+      const fetchPage = vi.fn<AdmissionTransport>().mockResolvedValue(page(okBody));
+      const result = await runAdmissionBatch({
+        candidates: [{ url: crossUrl, source: crossSource }, { url: softUrl, source: softSource }],
+        declaredHosts: new Set(['cross.example.com', 'soft2.example.com']),
+        existing: new Map([
+          ...deferredRow(crossUrl, crossSource, 'url_invalid', 48),
+          ...deferredRow(softUrl, softSource, 'http_5xx', 21),
+        ]),
+        fetchPage, signal: signal(), throttleMs: 0, now: atFixtureNow, maxProbes: 1,
+      });
+      expect(result.probed).toBe(1);
+      expect(result.rows.map((row) => row.source_url)).toEqual([softUrl]);
+    });
+
+    it('url_invalid 判据变化（rules_hash 不变）⇒ 自动重测：模拟代码层放行后本地展开可过即按 20h 窗重排', async () => {
+      // 判据变化用「声明集纳入搜索 host」模拟（与 urlfix41 的 host 放行 / http→https 升级同一效果：
+      // expandAdmissionSearchUrl 从抛错变成通过），规则一字未改 ⇒ rules_hash 不变。
+      const hosts = new Set(['cross.example.com', 'search.other.example']);
+      const existing = deferredRow(crossUrl, crossSource, 'url_invalid', 21);
+      expect(existing.get(crossUrl)!.rules_hash).toBe(rulesHash(crossSource));
+      const result = await run(crossUrl, crossSource, existing, hosts);
+      expect(result.probed).toBe(1);
+      expect(result.rows[0]).toMatchObject({ search_ok: true, search_verdict: 'ok' });
+      // 仍在 20h 窗内的不急着测（网络期 url_invalid 同款节奏）。
+      expect((await run(crossUrl, crossSource, deferredRow(crossUrl, crossSource, 'url_invalid', 19), hosts)).probed).toBe(0);
+    });
+
+    it('网络期 url_invalid（跳转越出声明集）：本地展开可过 ⇒ 仍按 20h 窗复测', async () => {
+      const url = 'https://redir.example.com';
+      const source = syntheticSource(`${url}/`);
+      const hosts = new Set(['redir.example.com']);
+      expect((await run(url, source, deferredRow(url, source, 'url_invalid', 19), hosts)).probed).toBe(0);
+      expect((await run(url, source, deferredRow(url, source, 'url_invalid', 21), hosts)).probed).toBe(1);
+    });
+
+    it('本地确定性 url_invalid + 规则变（hash 变）⇒ 照常重排探测', async () => {
+      const existing = new Map([[crossUrl, sourceRow(crossUrl, {
+        tier: 'M1', compile_ok: true, rules_hash: 'stale-hash', search_ok: false, search_verdict: 'url_invalid',
+        search_checked_at: fixtureAgoIso(3_600_000),
+      })]]);
+      const fixed = syntheticSource(`${crossUrl}/`);
+      const result = await run(crossUrl, fixed, existing, new Set(['cross.example.com']));
+      expect(result.probed).toBe(1);
+      expect(result.rows[0]).toMatchObject({ search_ok: true, rules_hash: rulesHash(fixed) });
+    });
+  });
+
   // 41-B1-RETRY：conn_fail 一次 8s 超时不再永久拒。仍归 rejected 桶（出池、漏斗口径不变），
   // 但带 7 天衰减——超窗即回 class 1 复测。反例背景：跨 cron 轮的瞬时网络抖动曾把可用源
   // 永久踢出（2026-09-23 opus 源链路复审 B1：conn_fail 比 http_5xx 判得更重，轻重反了）。
