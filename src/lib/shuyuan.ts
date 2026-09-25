@@ -362,7 +362,14 @@ async function refreshEngineHostGate(signal: AbortSignal, fresh = false): Promis
   try {
     // xfer41：池合成路径走读缓存（TTL 内复用上次的 host 集合，仍每次重刷门——幂等、零 DB）；
     // 刷新路径传 fresh=true 直读，探测入队要用最新准入态。
-    refreshSupportedHosts(fresh ? await engineHosts(signal) : await cachedRead('engineHosts', signal, (sig) => engineHosts(sig)));
+    if (fresh) {
+      refreshSupportedHosts(await engineHosts(signal));
+      return true;
+    }
+    // 41-xferfix B1：门被缓存之外改过则先作废缓存（见 syncReadCacheWithGate），再按缓存 host 集刷门并记下快照。
+    syncReadCacheWithGate();
+    refreshSupportedHosts(await cachedRead('engineHosts', signal, (sig) => engineHosts(sig)));
+    gateFromCache = supportedHostList().join(',');
     return true;
   } catch (error) {
     signal.throwIfAborted();
@@ -457,6 +464,7 @@ function hostOfUrl(url: string): string {
 /** 引擎档候选（设计 §5.2 的新增导出；M2-3 的放量/排序在此扩面）。 */
 export async function getEngineSources(signal: AbortSignal): Promise<ReadingSource[]> {
   const s = getSql();
+  syncReadCacheWithGate(); // 调用方（download-source）常先按鲜读刷门再来取池
   const { states } = readMeta((await poolProbeMeta(s, signal)).collections);
   return engineReadingSources(s, states, signal);
 }
@@ -666,10 +674,25 @@ const READ_CACHE_LOAD_TIMEOUT_MS = 20_000;
 
 type ReadCacheEntry = { expiresAt: number; value: Promise<unknown> };
 const readCache = new Map<string, ReadCacheEntry>();
+/** 上次按缓存 engineHosts 刷出的门快照（refreshEngineHostGate 据此识别门被缓存之外改过）；null = 无。 */
+let gateFromCache: string | null = null;
 
 /** 丢弃全部池合成读缓存：本实例写路径之后调用；测试之间重置也用它。 */
 export function invalidateShuyuanReadCache(): void {
   readCache.clear();
+  gateFromCache = null;
+}
+
+/**
+ * 41-xferfix B1：host 门是模块级全局态，缓存之外还有写入方（download-source 按鲜读 engineHosts 刷门、cron 准入尾部）。
+ * 门与上次池合成时的快照不同 ⇒ 有人读到了比缓存新的准入态：此时若沿用缓存，refreshEngineHostGate 会按旧 host 集
+ * 整集重置门（把刚放行的 host 刷掉），缓存的引擎行也缺该源。故整体作废、按库实况重读，结果与未缓存时逐项相同。
+ * 门未被外部改动时照常命中（稳态零额外读）。
+ */
+function syncReadCacheWithGate(): void {
+  const gate = supportedHostList().join(',');
+  if (gateFromCache !== null && gate !== gateFromCache) invalidateShuyuanReadCache();
+  gateFromCache = gate;
 }
 
 async function cachedRead<T>(

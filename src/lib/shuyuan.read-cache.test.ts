@@ -30,7 +30,8 @@ import {
   getReadingSources, getShuyuanPoolHealth, invalidateShuyuanReadCache, refreshShuyuan, shuyuanReadCacheTtlMs,
   writeAdmissionRows,
 } from './shuyuan';
-import { refreshSupportedHosts } from './source-policy';
+import { refreshSupportedHosts, supportedHostList } from './source-policy';
+import { resolveDownloadSource } from './download-source';
 import { rulesHash, type AdmissionSourceRow } from './rule-engine/admission';
 
 const engineItemAt = (host: string) => ({
@@ -221,6 +222,57 @@ describe('池合成读缓存', () => {
     // 投影参数就是当时的门集合（字典序）：第二次带上了 c.example。
     expect(JSON.parse(metaQueries[1].values.at(-1) as string)).toContain('c.example');
     expect(JSON.parse(metaQueries[0].values.at(-1) as string)).not.toContain('c.example');
+  });
+});
+
+// 41-xferfix B1：host 门是模块级全局态，池合成每次按 engineHosts 整集重置它。缓存命中时拿的是旧 host 集，
+// 会把调用方刚按最新准入态放行的 host 抹掉（门被「刷旧」），且缓存的引擎行也没有该源 ⇒ 池里丢源最长一个 TTL。
+// 原则：缓存不得改变「未缓存时」的可见行为——同一场景在 TTL=0 与 TTL=300s 下结果必须一致。
+describe('缓存不得改变未缓存时的可见行为（host 门，41-xferfix B1）', () => {
+  /** 他实例/cron 准入了 c.example（本实例没走写路径，缓存未失效）。 */
+  const admitElsewhere = () => {
+    db.hosts = [...db.hosts, { host: 'c.example' }];
+    db.engine = [...db.engine, engineRowAt('c.example')];
+  };
+
+  it('反例：download-source 刚按最新准入态放行的 host，不被池合成的旧缓存刷掉', async () => {
+    await getReadingSources(signal()); // 缓存 hosts=[a,b] / engineRows=[a,b]
+    admitElsewhere();
+    await expect(resolveDownloadSource('https://c.example/book/1')).resolves
+      .toMatchObject({ kind: 'engine', id: 'https://c.example/' });
+    expect(supportedHostList()).toContain('c.example');
+  });
+
+  it('门未被外部改动时照常命中缓存（download-source 的鲜读与缓存一致 ⇒ 不作废）', async () => {
+    await getReadingSources(signal());
+    await expect(resolveDownloadSource('https://a.example/book/1')).resolves.toMatchObject({ kind: 'engine' });
+    await getReadingSources(signal());
+    expect(counts()).toEqual({ hosts: 2, poolMeta: 1, builtinRows: 1, engineRows: 1 });
+  });
+
+  async function scenario() {
+    const out: unknown[] = [];
+    await getReadingSources(signal());
+    // 评审员场景：调用方放行一个库里并未准入的 host，随后池合成（未缓存时按 DB 实况重置门）。
+    refreshSupportedHosts(['extra.example']);
+    out.push((await getReadingSources(signal())).map((source) => source.url), supportedHostList());
+    admitElsewhere();
+    refreshSupportedHosts(['a.example', 'b.example', 'c.example']);
+    out.push((await getEngineSources(signal())).map((source) => source.url), supportedHostList());
+    return out;
+  }
+
+  it('差分：同一场景 TTL=0 与 TTL=300s 的池与门逐项相同', async () => {
+    vi.stubEnv('SHUYUAN_READ_CACHE_TTL_MS', '0');
+    const uncached = await scenario();
+    db.hosts = [{ host: 'a.example' }, { host: 'b.example' }];
+    db.engine = [engineRowAt('a.example'), engineRowAt('b.example')];
+    refreshSupportedHosts([]);
+    invalidateShuyuanReadCache();
+    vi.stubEnv('SHUYUAN_READ_CACHE_TTL_MS', '300000');
+    expect(await scenario()).toEqual(uncached);
+    expect(uncached[2]).toContain('https://c.example/');
+    expect(uncached[1]).not.toContain('extra.example');
   });
 });
 
