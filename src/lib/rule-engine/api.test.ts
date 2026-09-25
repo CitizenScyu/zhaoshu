@@ -93,6 +93,76 @@ describe('引擎门面四函数（M1 任务 4 §7.1）', () => {
   });
 });
 
+// 41-urlfix：absoluteUrl 的 http→https 升级——页面抽出的链接（目录/正文/翻页）写死 http:// 时，
+// 同 host 升 https 后过同一把 host 门（放行 host 集合与判据不变），而非白名单 host 升级后仍被丢弃。
+describe('absoluteUrl http→https 升级（41-urlfix）', () => {
+  const httpToc = 'http://book15.net/toc/1.html'; // 详情页抽出的 tocUrl 写死 http://
+  const upgradedToc = 'https://book15.net/toc/1.html'; // 升级后的规范 URL
+
+  it('详情页抽出的 http:// tocUrl 升 https 后按规范 URL 请求并被接受', async () => {
+    const pages = new Map([
+      [BOOK_URL, '<h1 class="title">书</h1><span class="writer">作者</span><a class="toc" href="' + httpToc + '">目录</a>'],
+      [upgradedToc, '<li class="chapter"><a href="/c/1.html">第一章</a></li>'],
+    ]);
+    const source = engineSource({ ruleBookInfo: { name: '.title@text', author: '.writer@text', tocUrl: '.toc@href' } });
+    // 详情页解析出的 tocUrl 必须是升级后的 https（host/路径逐字不变）。
+    expect(await engineFetchDetail(source, BOOK_URL, fakeContext(pages))).toEqual({ title: '书', author: '作者', tocUrl: upgradedToc });
+    // 目录页以此为入口请求（fakeContext 用 upgradedToc 作 key，若用 http 原样请求会命中 undefined 抛错）。
+    expect(await engineFetchToc(source, upgradedToc, fakeContext(pages))).toEqual({
+      chapters: [{ url: 'https://book15.net/c/1.html', title: '第一章' }],
+    });
+  });
+
+  it('翻页链接（nextTocUrl）写死 http:// 时同样升 https', async () => {
+    const toc2 = 'https://book15.net/toc/2.html';
+    const pages = new Map([
+      [TOC_URL, '<li class="chapter"><a href="/c/1.html">第一章</a></li><a class="next" href="http://book15.net/toc/2.html">下一页</a>'],
+      [toc2, '<li class="chapter"><a href="/c/2.html">第二章</a></li>'],
+    ]);
+    const source = engineSource({ ruleToc: { chapterList: '.chapter', chapterName: 'a@text', chapterUrl: 'a@href', nextTocUrl: '.next@href' } });
+    expect(await engineFetchToc(source, TOC_URL, fakeContext(pages))).toEqual({
+      chapters: [
+        { url: 'https://book15.net/c/1.html', title: '第一章' },
+        { url: 'https://book15.net/c/2.html', title: '第二章' },
+      ],
+    });
+  });
+
+  it('正文翻页链接（nextContentUrl）写死 http:// 时同样升 https', async () => {
+    const chapter2 = 'https://book15.net/c/2.html';
+    const pages = new Map([
+      [CHAPTER_URL, '<div class="content">第一段</div><a class="next" href="http://book15.net/c/2.html">下一页</a>'],
+      [chapter2, '<div class="content">第二段</div>'],
+    ]);
+    const source = engineSource({ ruleContent: { content: '.content@text', nextContentUrl: '.next@href' } });
+    expect(await engineFetchContent(source, CHAPTER_URL, fakeContext(pages))).toEqual({ text: '第一段\n第二段' });
+  });
+
+  // strict=true（阅读器正文 context 用）下，目录页里 http://同白名单host/ch1 升级成 https 后
+  // 必须被收下，不得因「原 scheme 是 http」抛 invalid_chapter（复审 §7 建议 2 的 strict 反例）。
+  it('strict 模式下目录页 http:// 章节链接升级后不抛 invalid_chapter', async () => {
+    const toc2 = 'https://book15.net/toc/2.html';
+    const pages = new Map([
+      [TOC_URL, '<li class="chapter"><a href="http://book15.net/c/1.html">第一章</a></li><a class="next" href="http://book15.net/toc/2.html">下一页</a>'],
+      [toc2, '<li class="chapter"><a href="http://book15.net/c/2.html">第二章</a></li>'],
+    ]);
+    const source = engineSource({ ruleToc: { chapterList: '.chapter', chapterName: 'a@text', chapterUrl: 'a@href', nextTocUrl: '.next@href' } });
+    expect(await engineFetchToc(source, TOC_URL, fakeContext(pages), true)).toEqual({
+      chapters: [
+        { url: 'https://book15.net/c/1.html', title: '第一章' },
+        { url: 'https://book15.net/c/2.html', title: '第二章' },
+      ],
+    });
+  });
+
+  it('非白名单 host 的 http:// 链接升级后仍被丢弃（不引入新授权）', async () => {
+    const pages = new Map([[BOOK_URL,
+      '<h1 class="title">书</h1><a class="toc" href="http://evil.invalid/toc/1.html">目录</a>']]);
+    const source = engineSource({ ruleBookInfo: { name: '.title@text', tocUrl: '.toc@href' } });
+    expect(await engineFetchDetail(source, BOOK_URL, fakeContext(pages))).toEqual({ title: '书' });
+  });
+});
+
 // ---------------------------------------------------------------- 准入兼容 L1（admission-compat §3.1 反例 2-6）
 // legado 语义（BookChapterList.kt:230-244，取证见 docs/legado-semantics/）：
 // ruleToc.chapterUrl 缺失或求值空 → 章节 url 取当前目录页 URL（baseUrl），不是 href 回退。

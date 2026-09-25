@@ -9,7 +9,9 @@ import { checkEnvExample } from './check-env-example.mjs';
 describe('环境变量样例覆盖', () => {
   it('真实仓库覆盖所有代码读取键', () => {
     expect(checkEnvExample(process.cwd())).toEqual([]);
-  });
+  // 41-urlfix：本用例做全仓源码扫描，全量并发（多 worker 抢 CPU）下偶发超过 vitest 默认 5s
+  // （单跑 ~575ms，见 lblmerge41 报告 L1）。只放宽超时，断言不变。
+  }, 30_000);
 
   it('新增代码读取键但样例遗漏时报告键和文件', () => {
     const root = repo({ '.env.local.example': '# NODE_ENV=\n', 'src/lib/new-env.ts': 'process.env.' + 'NEW_DEPLOY_KEY' });
@@ -272,7 +274,9 @@ describe('check-deploy-config：函数时限', () => {
       expect(source, `${file} 里找不到 ${name}`).not.toBe(GOOD_FILES[file]);
       expect(checkDeployConfig(repo({ [file]: source })), `${name}`).toEqual([expect.stringContaining(`${route}: ${name} = `)]);
     }
-  });
+  // 41-urlfix：本用例对登记表每一项都全量扫描一个样例仓库，全量并发下偶发超过 vitest 默认 5s
+  // （单跑 ~575ms，见 lblmerge41 报告 L1）。只放宽超时，断言不变。
+  }, 30_000);
 });
 
 describe('check-deploy-config：next.config', () => {

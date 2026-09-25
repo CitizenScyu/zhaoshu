@@ -5,7 +5,7 @@
 // 结构断言（v3 E5）：本模块导出集合**恰为**门面四函数（engineSearchBook / engineFetchDetail / engineFetchToc /
 // engineFetchContent）与其类型，外加正文翻页上限常量 MAX_CONTENT_PAGES（41-M1.1：阅读器正文 context 的 L1 上限复用它）；
 // admissionFetch / validateAdmissionUrl 不在此（它们在 rule-engine/admission.ts 且不导出）。
-import { validateSourceUrl } from '@/lib/source-policy';
+import { upgradeSourceTemplateUrl, validateSourceUrl } from '@/lib/source-policy';
 import {
   MAX_SOURCE_CHAPTERS, sourceSearchUrl, type SourceBookIdentity, type SourceChapter,
 } from '@/lib/source-parser';
@@ -44,10 +44,15 @@ function evaluateText(
   return ir ? evaluateField(ir, scope, multi) : '';
 }
 
-/** 相对→绝对化 + 过运行时 host 门（§3.2/§6.1）；不合法返回 undefined（丢弃，不猜测）。 */
+/**
+ * 相对→绝对化 + 过运行时 host 门（§3.2/§6.1）；不合法返回 undefined（丢弃，不猜测）。
+ * 值来自页面抽出的链接（详情页 tocUrl、目录章节/翻页、正文翻页），也可能是规则里写死的
+ * 绝对 URL；其中写死 `http://` 的先升 https（host/端口/路径不变，41-urlfix），再过同一把锁；
+ * 因此放行的 host 集合与判据完全不变，只是不让「同 host 只是写错 scheme」白白丢候选。
+ */
 function absoluteUrl(value: string, base: string): string | undefined {
   if (!value) return undefined;
-  try { return validateSourceUrl(value, base).href; } catch { return undefined; }
+  try { return validateSourceUrl(upgradeSourceTemplateUrl(value), base).href; } catch { return undefined; }
 }
 
 /** ruleSearch.bookList → 逐条 name/author/bookUrl；身份判定不在这里（§7.1）。 */

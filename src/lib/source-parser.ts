@@ -1,5 +1,5 @@
 import { decodeHTML } from 'entities';
-import { alternateSourceHost, validateSourceUrl, SourcePolicyError } from './source-policy';
+import { alternateSourceHost, upgradeSourceTemplateUrl, validateSourceUrl, SourcePolicyError } from './source-policy';
 
 export interface SourceBookIdentity { title: string; author: string; alias?: string }
 export interface SourceChapter { url: string; title: string }
@@ -245,7 +245,8 @@ export function sourceSearchUrl(template: unknown, title: string, base: string):
   // Only plain GET URLs are supported. Never evaluate Legado JavaScript or headers.
   const expanded = template.replace(/\{\{key\}\}/g, encodeURIComponent(title)).replace(/\{\{page\}\}/g, '1');
   if (/[{}]|@js:|<js>|,\s*\[/i.test(expanded)) throw new SourcePolicyError('不支持该书源的动态搜索规则');
-  return validateSourceUrl(expanded, base).href;
+  // 写死 http:// 的模板（站点同 host 有 https）升级后再过锁；host/端口/路径逐字不变（41-urlfix）。
+  return validateSourceUrl(upgradeSourceTemplateUrl(expanded), base).href;
 }
 
 /** 详情页链接形态:book15 的 `/books/details<数字>.html`。候选收集的两条路径共用同一 grammar。 */
