@@ -9,6 +9,9 @@
 //                          判出的根本没扣，下载中判出的退还本次扣减；两处打同一行结构化日志，只含
 //                          原因码/阶段/源 host/下次可重试时刻）
 //   - 异常              → 上抛，由 drain.errorBackoffMs 退避
+//   - 数据库配额错误    → 上抛 DbQuotaExceededError（短文案），并在执行器内布置长冷却（默认 30 分钟，
+//                          env DB_QUOTA_BACKOFF_MS）：冷却期内下一次 runOnce 先睡到期（signal 可中断）
+//                          再碰库。drain 的 errorBackoffMs 不分错误类型、且在 shell 仓，故闸门放这层
 //
 // 单写者/心跳/租约/五阶段发布全部在 T3 的 runWorkerOnce 内，本层只做预算闸门与决策归一。
 // drain 的 signal 用于「停机时不再领新任务」：在途任务由 T3 自身预算与心跳有界，drain 等在途收尾。
@@ -19,6 +22,7 @@ import {
 } from '../src/lib/download-worker';
 import type { GitHubContents } from '../src/lib/download-publisher';
 import type { BudgetRefundOutcome, BudgetTicket } from './budget-refund';
+import { createDbQuotaLatch, DbQuotaExceededError, isDbQuotaError } from '../src/lib/db-quota';
 
 export interface LoopDecisions { NO_TASK: string; BUDGET_EXHAUSTED: string; TASK_DONE: string }
 
@@ -97,15 +101,42 @@ export interface ExecutorDependencies {
   precheck?: PrecheckHook;
   /** 只记任务 id、原因码、阶段、源 host 与时刻，不记书名、作者、URL。 */
   log?: (level: 'info' | 'error', message: string, fields?: Record<string, unknown>) => void;
+  /** 数据库配额错误后的冷却时长；缺省 30 分钟（entry 由 env DB_QUOTA_BACKOFF_MS 取）。 */
+  quotaBackoffMs?: number;
+  /** 配额恢复后补记最近一次发现时刻（cron_health）；缺省不补记。失败只记日志。 */
+  recordQuotaSeen?: (seenAtIso: string) => Promise<void>;
+  // ---- 测试注入缝 ----
+  now?: () => number;
+  /** 冷却等待；signal 中止时须尽快 resolve（不 reject）。 */
+  sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
 }
 
 export interface DownloadExecutor {
   runOnce(signal?: AbortSignal): Promise<string>;
 }
 
+// 冷却等待：到期或 signal 中止即 resolve（停机时不拖住 drain 收尾）。
+function abortableSleep(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve) => {
+    if (signal?.aborted) { resolve(); return; }
+    const done = () => { clearTimeout(timer); signal?.removeEventListener('abort', done); resolve(); };
+    const timer = setTimeout(done, ms);
+    signal?.addEventListener('abort', done, { once: true });
+  });
+}
+
 export function createExecutor(deps: ExecutorDependencies): DownloadExecutor {
   const decisions = deps.decisions ?? DEFAULT_DECISIONS;
   const log = deps.log ?? (() => {});
+  const quota = createDbQuotaLatch({ backoffMs: deps.quotaBackoffMs, now: deps.now });
+  const sleep = deps.sleep ?? abortableSleep;
+  // 结构化日志一行：只含原因码、冷却时长与到期时刻，不含驱动原文（原文带 Neon 响应体）。
+  const armQuota = (where: 'run' | 'task') => {
+    quota.note();
+    log('error', '数据库配额超限，长退避', {
+      reason: 'db_quota_exceeded', where, backoffMs: quota.remainingMs(), retryAt: quota.retryAt(),
+    });
+  };
   const workerOptions = (storage: WorkerStorage): WorkerOptions => ({
     storage,
     github: deps.github,
@@ -118,7 +149,8 @@ export function createExecutor(deps: ExecutorDependencies): DownloadExecutor {
   const logSourceUnavailable = (stage: string, host: string, retryAt: string | null) =>
     log('info', '书源不可达', { reason: 'source_unavailable', stage, host, retryAt });
 
-  return {
+  // 单轮本体（配额闸在下方对外的 runOnce）。
+  const inner: DownloadExecutor = {
     async runOnce(signal) {
       if (signal?.aborted) return decisions.NO_TASK;
 
@@ -237,7 +269,39 @@ export function createExecutor(deps: ExecutorDependencies): DownloadExecutor {
           });
         }
       }
+      // 任务中途（心跳/发布/finish）撞配额：worker 已把异常吞成 failed + reason 文本；任务行多半仍是
+      // running（finish 同样 402），由回收器接管。这里只布置冷却，不再零间隔领下一本。
+      if (result.processed && result.terminal === 'failed' && isDbQuotaError(result.reason)) armQuota('task');
       return decisions.TASK_DONE;
+    },
+  };
+
+  return {
+    async runOnce(signal) {
+      if (signal?.aborted) return decisions.NO_TASK;
+      if (quota.active()) {
+        await sleep(quota.remainingMs(), signal);
+        if (signal?.aborted) return decisions.NO_TASK;
+      }
+      let decision: string;
+      try {
+        decision = await inner.runOnce(signal);
+      } catch (error) {
+        if (!isDbQuotaError(error)) throw error; // drain → ERROR 退避
+        armQuota('run');
+        throw new DbQuotaExceededError({ cause: error }); // drain 日志只见短文案
+      }
+      // 本轮碰库成功且未再撞配额：结束冷却、补记发现时刻（配额期间写不进库，只能此时补）。
+      if (!quota.active()) {
+        const seenAt = quota.takeUnrecorded();
+        if (seenAt) {
+          log('info', '数据库配额恢复', { reason: 'db_quota_recovered', lastSeenAt: seenAt });
+          await deps.recordQuotaSeen?.(seenAt).catch(() => {
+            log('error', '配额发现时刻补记失败', { reason: 'db_quota_record_failed' });
+          });
+        }
+      }
+      return decision;
     },
   };
 }
