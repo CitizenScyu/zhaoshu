@@ -9,7 +9,7 @@
 // - 两把锁共享 source-policy.ts 的 checkSourceUrl（检查项逐条同款，仅 host 白名单来源不同）；
 // - admissionFetch / validateAdmissionUrl **不导出**（任务 4 有导出快照断言）。
 
-import { checkSourceUrl, SourcePolicyError } from '@/lib/source-policy';
+import { checkSourceUrl, upgradeSourceTemplateUrl, SourcePolicyError } from '@/lib/source-policy';
 import { sourceRevision } from '@/lib/source-revision';
 import { sourceAbortable } from '@/lib/source-fetch';
 import { CORE_FIELDS, iterRulePairs, selectCandidates, type RawSource } from './compile-smoke';
@@ -430,7 +430,9 @@ function expandAdmissionSearchUrl(
   const expanded = template.replace(/\{\{key\}\}/g, encodeURIComponent(keyword)).replace(/\{\{page\}\}/g, '1');
   if (/[{}]|@js:|<js>|,\s*\[/i.test(expanded)) throw new SourcePolicyError('不支持该书源的动态搜索规则');
   const base = typeof source.bookSourceUrl === 'string' ? source.bookSourceUrl : undefined;
-  return validateAdmissionUrl(expanded, base, declaredHosts).href;
+  // 写死 http:// 的搜索模板升 https 后再过准入门（host/端口/路径逐字不变，41-urlfix）：
+  // 与运行时 sourceSearchUrl 同一口径，否则「准入通过、阅读期被判死」两把锁漂移。
+  return validateAdmissionUrl(upgradeSourceTemplateUrl(expanded), base, declaredHosts).href;
 }
 
 const MAX_CANDIDATE_SCAN = 50;
