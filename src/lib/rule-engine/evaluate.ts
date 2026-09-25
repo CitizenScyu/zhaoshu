@@ -296,17 +296,39 @@ function replaceInnerJsonRules(text: string, json: unknown): string | undefined 
   return replaced ? out + text.slice(last) : undefined;
 }
 
-/** `open` 处的 `{` 对应的 `}` 下标；不配平返回 -1。 */
+/**
+ * `open` 处的 `{` 对应的 `}` 下标；不配平返回 -1。逐行对齐 legado RuleAnalyzer.chompCodeBalanced('{', '}')
+ * （RuleAnalyzer.kt:91-126，jer-chao@c2c4775）：
+ * - `\` 转义吞掉下一个字符（引号内外都一样）；
+ * - 单/双引号内的字符不参与配平，另一种引号在其中不算开合；
+ * - `[]` 深度非 0 时不数 `{}`；`]` 可把深度减成负数，此后 `{}` 都不再计数（上游同样如此，结果是不配平）。
+ * 上游在串尾是 `\` 时会越界抛异常，这里按不配平处理。
+ */
 function matchingBrace(text: string, open: number): number {
   let depth = 0;
-  for (let i = open; i < text.length; i += 1) {
-    if (text[i] === '{') depth += 1;
-    else if (text[i] === '}') {
-      depth -= 1;
-      if (depth === 0) return i;
+  let braces = 0;
+  let inSingle = false;
+  let inDouble = false;
+  let i = open;
+  do {
+    if (i >= text.length) break;
+    const c = text[i++];
+    if (c === '\\') {
+      i += 1;
+      continue;
     }
-  }
-  return -1;
+    if (c === "'" && !inDouble) inSingle = !inSingle;
+    else if (c === '"' && !inSingle) inDouble = !inDouble;
+    if (inSingle || inDouble) continue;
+    if (c === '[') depth += 1;
+    else if (c === ']') depth -= 1;
+    else if (depth === 0) {
+      if (c === '{') braces += 1;
+      else if (c === '}') braces -= 1;
+    }
+  } while (depth > 0 || braces > 0);
+  // 只有深度 0 处的 `}` 能让 braces 归零，所以循环正常结束时最后读到的字符就是配对的 `}`。
+  return depth > 0 || braces > 0 ? -1 : i - 1;
 }
 
 // ---------------------------------------------------------------- 字段求值（§3.3）
