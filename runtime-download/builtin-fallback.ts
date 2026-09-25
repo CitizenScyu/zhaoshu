@@ -33,6 +33,11 @@ import type { PrecheckHook, PrecheckResult } from './executor';
 export const MAX_FALLBACK_SOURCES = 3;
 /** 每个源最多看几个搜索候选的详情页（列表书名对得上、作者不冲突的才看）。 */
 export const MAX_FALLBACK_DETAILS_PER_SOURCE = 2;
+/**
+ * 每本书最多搜索的引擎源数（按池序，跳过的不计）：给逐书出网封顶。池序已是「探测可达 → tier → 最近搜索验证」，
+ * 靠后的源命中概率低；与 120s 墙钟一起兜住「书不在池里」时一本书的请求量（≤ 30 次搜索 + 少量详情）。
+ */
+export const MAX_FALLBACK_SCAN_SOURCES = 30;
 /** 选源墙钟上限：与身份预检同量级，远小于 30 分钟租约回收阈值（预检期间不发心跳）。 */
 export const FALLBACK_SELECT_BUDGET_MS = 120_000;
 
@@ -113,18 +118,20 @@ export function createBuiltinFallback(options: BuiltinFallbackOptions) {
       return [];
     }
     const picked: string[] = [];
+    let scanned = 0;
     for (const source of pool) {
-      if (picked.length >= maxSources || signal.aborted) break;
+      if (picked.length >= maxSources || scanned >= MAX_FALLBACK_SCAN_SOURCES || signal.aborted) break;
       const host = hostOf(source.url);
       if (!/^https:\/\//i.test(source.url) || !host || builtinHosts.has(host) || isSuspect(host)) continue;
       if (picked.some(url => hostOf(url) === host)) continue;
+      scanned += 1;
       try {
         if (await sourceAbortable(sourceHasBook(source, task, signal), signal)) picked.push(source.url);
       } catch {
         // 单源搜索/详情失败：跳过这个源（fetch 层已按 host 记健康），不影响其余源。
       }
     }
-    log('info', '引擎回退选源', { taskId: task.id, candidates: picked.length, hosts: picked.map(hostOf) });
+    log('info', '引擎回退选源', { taskId: task.id, scanned, candidates: picked.length, hosts: picked.map(hostOf) });
     return picked;
   };
 

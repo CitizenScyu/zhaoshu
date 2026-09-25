@@ -1,6 +1,6 @@
 // 41-T8FB：builtin-fallback 单元层（不连库、不联网）：选源的容错与边界、下载腿的停止条件。
 import { describe, expect, it } from 'vitest';
-import { createBuiltinFallback } from './builtin-fallback';
+import { createBuiltinFallback, MAX_FALLBACK_SCAN_SOURCES } from './builtin-fallback';
 import type { AdapterOutcome, SourceAdapter, TaskRow } from '../src/lib/download-worker';
 import type { PrecheckResult } from './executor';
 
@@ -63,6 +63,13 @@ describe('41-T8FB builtin-fallback', () => {
     const out = await h.fallback.wrapAdapter(adapter({}, []), adapter({}, calls)).download(task(), context());
     expect(calls).toEqual(['a.example', 'b.example', 'c.example']); // 预检选好的源直接用，不再碰 book15
     expect(out).toMatchObject({ kind: 'incomplete', reason: 'source_unavailable' });
+  });
+
+  it('逐书出网封顶：书不在池里时最多搜 MAX_FALLBACK_SCAN_SOURCES 个源', async () => {
+    const pool = Array.from({ length: MAX_FALLBACK_SCAN_SOURCES + 10 }, (_, i) => `https://s${i}.example/`);
+    const h = harness({ pool, noBook: pool.map(hostOf) });
+    expect(await h.fallback.wrapPrecheck(async () => UNAVAILABLE)(task(), signal())).toEqual(UNAVAILABLE);
+    expect(h.searched).toHaveLength(MAX_FALLBACK_SCAN_SOURCES);
   });
 
   it('源池不可用 ⇒ 预检保持 source_unavailable（阶段沿用内层），不放行', async () => {
