@@ -227,12 +227,30 @@ function reinterpretedPath(ir: RuleIr): JsonPathIr | null {
   if (cached !== undefined) return cached;
   const source = defaultSyntaxSource(ir);
   let path: JsonPathIr | null = null;
-  // `@` 开头在 Jayway 里是当前节点语法而非字段名（如 `@text`），不补前缀，按读取失败处理。
+  // `@` 开头在 Jayway 里是当前节点语法（如 `@text`，其后必须紧跟 `.`/`[`，否则非法），
+  // 故不前缀，按读取失败处理。
   if (source !== undefined && !source.startsWith('@')) {
-    try { path = parseJsonPath(`$.${source}`); } catch { path = null; }
+    try { path = parseJsonPath(jaywayJsonPath(source)); } catch { path = null; }
   }
   reinterpretedPaths.set(ir, path);
   return path;
+}
+
+/**
+ * Jayway `PathCompiler.compile`（json-path 主仓 `internal/path/PathCompiler.java`，legado 经
+ * `libs.json.path` 原样使用）的前缀规则：首字符不是 `$`/`@` 时**字面拼接** `"$." + path`，
+ * 没有「以 `.` 开头视为相对当前节点」这一分支。故各形态的上游语义是：
+ * - `x`    → `$.x`（子字段）；
+ * - `.x`   → `$..x`（**递归下降**，非 `$.x`）。这与 `.bookList[*]` → `$..bookList[*]` 同源——
+ *          复审报告把前者判为偏差、后者判为正确，两者其实是同一条规则，此处按上游原样保留；
+ * - `..x`  → `$...x`（递归扫描后紧跟 `.`，Jayway `readDotToken` 对第二个 `.` 抛
+ *          `Character '.' ... is not valid`）⇒ 上游抛错被吞成空串，这里 parse 失败同样得空；
+ * - `[0]`  → `$.[0]`。Jayway 接受（`readDotToken` 后直接进 `readNextToken` 的 `[` 分支）且语义
+ *          等于「根上的下标」`$[0]`；本引擎子集解析器不接受 `$.[0]`（`.` 后缺字段名），
+ *          故回写为等价且可解析的 `$[0]`——这是本次唯一真正会改变取值结果的修正。
+ */
+function jaywayJsonPath(source: string): string {
+  return source.startsWith('[') ? `$${source}` : `$.${source}`;
 }
 
 function jsonModeString(ir: RuleIr, json: unknown): string {
@@ -246,6 +264,13 @@ function jsonModeString(ir: RuleIr, json: unknown): string {
 /**
  * legado RuleAnalyzer.innerRule("{$.")：逐个找 `{$.`、按花括号配平取出内嵌规则并求值，
  * 求值非空才替换；一处都没替换成功返回 undefined（legado 此时返回空串，交由调用方决定回退）。
+ *
+ * **失败时不中止**：legado 的循环体在「求值为空」或「花括号不配平」时走 `pos += inner.length`
+ * 继续扫描（RuleAnalyzer.kt:326「拉出字段不平衡，inner 只是个普通字串，跳到此 inner 后继续匹配」），
+ * 没有 break——所以内嵌规则一处失败不影响后续 `{$.` 被替换。续扫起点对齐该实现：
+ * - 求值为空：chompCodeBalanced 已把 pos 推到 `}` 之后 ⇒ 起点 = close + 1；
+ * - 花括号不配平：pos 仍停在 `{` ⇒ 起点 = at；
+ * 两种情况再各 +inner.length（=3）。因此紧贴失败项 `}` 之后（余量 < 3 字符）的 `{$.` 会被跳过。
  */
 function replaceInnerJsonRules(text: string, json: unknown): string | undefined {
   let out = '';
@@ -264,7 +289,8 @@ function replaceInnerJsonRules(text: string, json: unknown): string | undefined 
       replaced = true;
       at = text.indexOf(INNER_JSON_RULE_OPEN, last);
     } else {
-      at = text.indexOf(INNER_JSON_RULE_OPEN, at + INNER_JSON_RULE_OPEN.length);
+      // 不配平时 matchingBrace 返回 -1，close + 1 <= at，故 max() 退回 at；配平但求值为空时取 close + 1。
+      at = text.indexOf(INNER_JSON_RULE_OPEN, Math.max(at, close + 1) + INNER_JSON_RULE_OPEN.length);
     }
   }
   return replaced ? out + text.slice(last) : undefined;

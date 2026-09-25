@@ -153,9 +153,55 @@ describe('根因 3：字面量里的 `{$.x}` 内嵌规则原样输出（legado i
     expect(evaluateField(parseFieldRule('https://h.example/{$.nope}.html'), item)).toBe('https://h.example/{$.nope}.html');
     expect(evaluateField(parseFieldRule('https://h.example/plain.html'), item)).toBe('https://h.example/plain.html');
   });
+
+  // jsonblfix41：复审把「内嵌规则求值为空时继续扫描后续 {$.」列为阻断，建议改 break。
+  // 复核 legado 原实现（RuleAnalyzer.kt innerRule("{$.", startStep/endStep=1，jer-chao@c2c4775 /
+  // gedoor master / GEd520 fork 三份一致）：循环体**没有 break**——求值为空时走
+  // `pos += inner.length`（注释「拉出字段不平衡，inner 只是个普通字串，跳到此 inner 后继续匹配」），
+  // 即「跳过 3 个字符后继续找下一处」。故「失败即中止」不成立，按 break 改反而会偏离上游。
+  // 下面两条把真实语义钉死：一条是「失败后仍替换后面的 {$.」（break 版会漏替换），
+  // 一条是「紧贴失败项 `}` 之后（余量 < 3 字符）的 {$. 因 3 字符步进被略过」。
+  it('失败的内嵌规则不中止：跳过 3 字符后继续替换后续 {$.（对齐 legado 无 break）', () => {
+    const item = createJsonScope({ 存在: 5 }, 'https://api.example.com/');
+    // 第二个 {$. 距失败项 `}` 之后有 5 个字符（"字面量里的"）≥ 3 ⇒ 被替换（legado 同样替换）。
+    expect(evaluateField(parseFieldRule('https://h.example/{$.不存在}字面量里的{$.存在}'), item))
+      .toBe('https://h.example/{$.不存在}字面量里的5');
+  });
+
+  it('失败项 `}` 之后余量不足 3 字符时，紧随的 {$. 被跳过（legado 的 inner.length 步进）', () => {
+    const item = createJsonScope({ 存在: 5 }, 'https://api.example.com/');
+    // 第二个 {$. 紧贴失败项 `}`（余量 0 < 3）⇒ 被跳过，一处都没替换成功 ⇒ 回退原文。
+    // 改前「失败后从失败项起点 +3 继续扫」会命中它并替换成 5，与本断言相反。
+    expect(evaluateField(parseFieldRule('https://h.example/{$.不存在}{$.存在}.html'), item))
+      .toBe('https://h.example/{$.不存在}{$.存在}.html');
+  });
 });
 
 describe('列表语义细节（Jayway getList）与 HTML 零变化', () => {
+  // jsonblfix41：复审 §1 把「`.x` 无条件补 `$.` 得到递归 `$..x`」列为非阻断偏差。
+  // 复核 Jayway PathCompiler.compile（json-path 主仓）：首字符非 `$`/`@` 时字面拼 `"$." + path`，
+  // **没有**「`.` 开头视为相对当前节点」的分支 ⇒ `.x` 的上游语义就是 `$..x`（递归）。
+  // 故这里**保留**该行为，只修正本引擎子集解析器不接受的两种等价形态（`[0]` → `$[0]`）。
+  it('前缀形态：`x` → `$.x`；`.x` → `$..x`（递归，对齐 Jayway 字面拼接）', () => {
+    const nested = { title: '外层', data: { books: [{ title: '内层' }] } };
+    const bare = createJsonScope(nested, 'https://api.example.com/');
+    // 裸 `title` → `$.title`：只取根上的 title。
+    expect(evaluateField(parseFieldRule('title'), bare)).toBe('外层');
+    // `.title` → `$..title`：递归下降命中所有层级（含内层）。与 `.bookList[*]` → `$..bookList[*]` 同源。
+    expect(evaluateField(parseFieldRule('.title'), bare)).toBe(`外层${'\n'}内层`);
+  });
+
+  it('前缀形态：`[0]` → `$[0]`（根上下标；`$.[0]` 本引擎子集不收，回写等价形式）', () => {
+    const arr = [{ title: '第一' }, { title: '第二' }];
+    const scope = createJsonScope(arr, 'https://api.example.com/');
+    expect(evaluateField(parseFieldRule('[0].title'), scope)).toBe('第一');
+  });
+
+  it('前缀形态：`..x` → `$...x`（Jayway 非法）⇒ 求值空串、不抛', () => {
+    const scope = createJsonScope({ a: { x: 1 } }, 'https://api.example.com/');
+    expect(evaluateField(parseFieldRule('..x'), scope)).toBe('');
+  });
+
   it('确定路径命中对象/标量 → 空列表；不确定路径的命中值不再展平', () => {
     const json = { page: { list: [1, 2] }, groups: [{ books: [{ n: 'a' }] }, { books: [{ n: 'b' }, { n: 'c' }] }] };
     expect(evalJsonPathList(parseJsonPath('$.page'), json)).toEqual([]);
