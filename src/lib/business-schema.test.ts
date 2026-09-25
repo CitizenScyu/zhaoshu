@@ -1,5 +1,10 @@
 import { describe, expect, it, vi } from 'vitest';
-import { initializeBusinessSchema } from './business-schema';
+import {
+  initializeBusinessSchema,
+  BUSINESS_SCHEMA_RELATIONS,
+  BUSINESS_SCHEMA_COLUMNS,
+  BUSINESS_SCHEMA_RETIRED_RELATIONS,
+} from './business-schema';
 
 // 用记录器跑真实的 DDL 序列：断言的是「真的发出去了什么语句」，而不是源码里有没有那段字。
 // 记录器同时区分「在事务批里构造的语句」与「事务外直接发出的语句」：后者每条都是一次
@@ -101,7 +106,60 @@ describe('业务 schema 的运行时 DDL', () => {
   });
 });
 
-// B2（audit-3 P0-2）：活动任务唯一键从全局 book_id 改为 (user_id, book_id)——
+// 冷启动版本探测（41-pollddl）：businessSchemaCurrent 的 SQL 由 BUSINESS_SCHEMA_* 三常量生成，
+// 探测据此判断整批 DDL 是否已空转、可跳过。这里逐条比对「DDL 真正建/删的对象集合」与三常量：
+// 改 initializeBusinessSchema 加表/加索引/ADD COLUMN 而没同步常量，本用例必红——版本判定不会与
+// DDL 脱节（否则探测会漏检新对象，在缺该对象的库上误判「已最新」而跳过 DDL，全站 503）。
+describe('冷启动探测的对象清单与 DDL 同步', () => {
+  function ddlObjects() {
+    const { statements, sql } = recorder();
+    // recorder 的 tag 是同步收集，initializeBusinessSchema 一次事务内构造全部语句即返回。
+    void initializeBusinessSchema(sql as never);
+    const tables = new Set<string>();
+    const indexes = new Set<string>();
+    const dropped = new Set<string>();
+    const columns: [string, string][] = [];
+    for (const text of statements) {
+      const create = /CREATE TABLE IF NOT EXISTS\s+(\w+)/.exec(text);
+      if (create) tables.add(create[1]);
+      const index = /CREATE (?:UNIQUE )?INDEX IF NOT EXISTS\s+(\w+)/.exec(text);
+      if (index) indexes.add(index[1]);
+      const drop = /DROP INDEX IF EXISTS\s+(\w+)/.exec(text);
+      if (drop) dropped.add(drop[1]);
+      const alter = /ALTER TABLE\s+(\w+)/.exec(text);
+      if (alter) {
+        for (const match of text.matchAll(/ADD COLUMN IF NOT EXISTS\s+(\w+)/g)) {
+          columns.push([alter[1], match[1]]);
+        }
+      }
+    }
+    return { tables, indexes, dropped, columns };
+  }
+
+  it('建出的表 + 索引集合 == BUSINESS_SCHEMA_RELATIONS', () => {
+    const { tables, indexes } = ddlObjects();
+    const built = [...tables, ...indexes].sort();
+    expect(built).toEqual([...BUSINESS_SCHEMA_RELATIONS].sort());
+  });
+
+  it('ADD COLUMN 的 (表, 列) 集合 == BUSINESS_SCHEMA_COLUMNS', () => {
+    const { columns } = ddlObjects();
+    const key = (pair: readonly [string, string]) => `${pair[0]}.${pair[1]}`;
+    expect(columns.map(key).sort()).toEqual([...BUSINESS_SCHEMA_COLUMNS].map(key).sort());
+  });
+
+  it('DROP INDEX IF EXISTS 的集合 == BUSINESS_SCHEMA_RETIRED_RELATIONS', () => {
+    const { dropped } = ddlObjects();
+    expect([...dropped].sort()).toEqual([...BUSINESS_SCHEMA_RETIRED_RELATIONS].sort());
+  });
+
+  it('退役关系与在册关系互斥（探测要求前者不存在、后者存在）', () => {
+    const retired = new Set<string>(BUSINESS_SCHEMA_RETIRED_RELATIONS);
+    for (const name of BUSINESS_SCHEMA_RELATIONS) {
+      expect(retired.has(name), `${name} 不能同时在册又退役`).toBe(false);
+    }
+  });
+});
 // 共享书源可多用户同时在途，单用户内仍互斥。删掉 DROP → 老库留着旧全局键，
 // 新语义永远不生效（CREATE IF NOT EXISTS 不报错）；删掉新 CREATE → 单用户去重裸奔。
 describe('下载活动锁的 B2 迁移', () => {
