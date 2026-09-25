@@ -361,8 +361,25 @@ function translateSegment(segment: string, rule: string): RuleIr {
     return { kind: 'text', literal: seg };
   }
 
-  // 6) 默认语法选择器链
-  return buildCssChain(seg, rule, false);
+  // 6) 默认语法选择器链。原文记进侧表：JSON 输入上按 JSONPath 重解释（见 defaultSyntaxSource）。
+  const ir = buildCssChain(seg, rule, false);
+  DEFAULT_SYNTAX_SOURCE.set(ir, seg);
+  return ir;
+}
+
+/**
+ * 默认语法（无 `$`/`@css:`/模板前缀）规则的原文侧表。legado 按**输入内容**定模式
+ * （AnalyzeRule.SourceRule：内容是 JSON 时无前缀规则走 Mode.Json，交 Jayway——路径不以
+ * `$`/`@` 开头即补 `$.`，故 `bookName`→`$.bookName`、`.bookList[*]`→`$..bookList[*]`），
+ * 编译期不知道页面是 HTML 还是 JSON，所以原文要留到求值期。
+ * 用侧表而不是 IR 字段：IR 结构（快照/toEqual 断言、compile 缓存）保持不变；IR 在引擎内
+ * 只按引用传递、不克隆不序列化。显式 `@css:`/`css:` 规则不登记——legado 对它们强制 CSS 模式。
+ */
+const DEFAULT_SYNTAX_SOURCE = new WeakMap<RuleIr, string>();
+
+/** 默认语法规则的原文（已剥 ## 尾缀、已 trim）；显式 CSS 或非 css IR 返回 undefined。 */
+export function defaultSyntaxSource(ir: RuleIr): string | undefined {
+  return DEFAULT_SYNTAX_SOURCE.get(ir);
 }
 
 /**

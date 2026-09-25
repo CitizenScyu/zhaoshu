@@ -1,0 +1,27 @@
+{
+ "code": 0,
+ "pageUtil": {
+  "currentPageNum": 1,
+  "pageList": [
+   {
+    "bookname": "陈立农：总裁的契约逃妻",
+    "authorname": "欢喜恣意",
+    "bookid": 2367674,
+    "updatetime": 1790004404
+   },
+   {
+    "bookname": "宋亚轩：疯批总裁太难缠",
+    "authorname": "气泡菌阿三",
+    "bookid": 8207937,
+    "updatetime": 1700798413
+   },
+   {
+    "bookname": "叶罗丽之总裁的小娇妻",
+    "authorname": "沫焕儿",
+    "bookid": 6279831,
+    "updatetime": 1658241373
+   }
+  ],
+  "totalCount": 44077
+ }
+}

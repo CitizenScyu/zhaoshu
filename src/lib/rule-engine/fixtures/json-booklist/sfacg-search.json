@@ -1,0 +1,20 @@
+{
+ "Status": 200,
+ "Novels": [
+  {
+   "NovelName": "斗破苍穹之魂玉",
+   "AuthorName": "赤月之瞳",
+   "NovelID": 249775
+  },
+  {
+   "NovelName": "斗破苍穹之冰雪绝恋",
+   "AuthorName": "溯源轮回",
+   "NovelID": 136931
+  },
+  {
+   "NovelName": "斗破苍穹之魂清",
+   "AuthorName": "江韶云",
+   "NovelID": 392410
+  }
+ ]
+}

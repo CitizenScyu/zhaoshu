@@ -190,10 +190,12 @@ describe('on 态求值：空值短路（字符串字段）', () => {
     expect(evaluateField(field('ul.list1@li.0@text||https://example.com/abs'), htmlScope())).toBe('甲条目');
   });
 
-  it('jsonpath 支在 JSON 作用域内短路；HTML 支对 JSON 输入照旧抛错不吞', () => {
+  it('jsonpath 支在 JSON 作用域内短路；显式 CSS 支对 JSON 输入照旧抛错不吞', () => {
     const jsonScope = createJsonScope({ a: '', b: '值' }, 'https://api.example/');
     expect(evaluateField(field('$.a||$.b'), jsonScope)).toBe('值');
-    expect(() => evaluateField(field('$.a||div@text'), jsonScope)).toThrow(RuleEngineError);
+    expect(() => evaluateField(field('$.a||@css:div@text'), jsonScope)).toThrow(RuleEngineError);
+    // 默认语法支在 JSON 输入上走 legado Json 模式（`b` → `$.b`，jsonbl41），参与短路
+    expect(evaluateField(field('$.a||b'), jsonScope)).toBe('值');
   });
 
   it('求值异常上抛（坏选择器不因短路被吞，§5.1）', () => {
