@@ -127,7 +127,8 @@ describe('chapterUrl 缺失/求值空 → 取当前目录页 URL（legado baseUr
       '<div class="chapter"><h3>第一章 标题</h3></div><div class="chapter"><h3>第二章 标题</h3></div>']]);
     const src = defaultTocSource({ chapterList: '.chapter', chapterName: 'h3@text', chapterUrl: undefined });
     const result = await engineFetchToc(src, tocUrl, fakeRedirectContext(pages));
-    expect(result.chapters).toEqual([{ url: pageUrl, title: '第一章 标题' }]);
+    // 两条兜底 url 相同 → 只剩 1 条；标题取**最后一次**出现的（legado reverse→LinkedHashSet→reverse 的净效果，41-ctocfu §5）。
+    expect(result.chapters).toEqual([{ url: pageUrl, title: '第二章 标题' }]);
   });
 
   it('反例 3：chapterUrl 存在但求值空（@href 命中无 href 属性的节点）→ 同样回退 page.url', async () => {
@@ -145,14 +146,35 @@ describe('chapterUrl 缺失/求值空 → 取当前目录页 URL（legado baseUr
     expect(result.chapters).toEqual([]); // h3@text 有值但节点无 href 语义，evil 链接被丢
   });
 
-  it('反例 5：兜底后多节点同 url → 按 url 去重只剩 1 章（legado LinkedHashSet 同结果）', async () => {
+  it('反例 5：兜底后多节点同 url → 按 url 去重只剩 1 章；保留最后一次出现（legado 净效果）', async () => {
     const pages = new Map([[pageUrl,
       '<div class="chapter"><h3>第一章</h3></div><div class="chapter"><h3>第二章</h3></div><div class="chapter"><h3>第三章</h3></div>']]);
     const src = defaultTocSource({ chapterList: '.chapter', chapterName: 'h3@text' });
     const result = await engineFetchToc(src, tocUrl, fakeRedirectContext(pages));
     expect(result.chapters).toHaveLength(1);
     expect(result.chapters[0].url).toBe(pageUrl);
+    // 兜底后三条 url 相同、标题不同 → legado（reverse → LinkedHashSet → reverse）保留最后一条。
+    expect(result.chapters[0].title).toBe('第三章');
   });
+
+  // kxdu.net 形态（41-ctocfu §5）：ruleToc.chapterList 同时命中页面顶部「最新章节」区块与正文全目录，
+  // 且该区块在目录末尾被原样重列。legado 净效果保留最后一次出现 ⇒ 顶部副本被挤到末尾，「第一章」回到首位。
+  // 改前（保留首次出现）读到的是倒序的「最新章节」，且「从第一章读」会先读到番外。
+  it('反例 5b：头部「最新章节」区块与末尾重列重复 → 保留末尾一次，第一章回到首位（kxdu.net 形态）', async () => {
+    const pages = new Map([[pageUrl,
+      '<div class="chapterNum"><ul><li><a href="/reader/1/9.html">最新 九</a></li><li><a href="/reader/1/8.html">最新 八</a></li>'
+      + '<li><a href="/reader/1/1.html">第一章</a></li><li><a href="/reader/1/2.html">第二章</a></li>'
+      + '<li><a href="/reader/1/8.html">最新 八</a></li><li><a href="/reader/1/9.html">最新 九</a></li></ul></div>']]);
+    const src = defaultTocSource({ chapterList: '.chapterNum@li', chapterName: 'a@text', chapterUrl: 'a@href' });
+    const result = await engineFetchToc(src, tocUrl, fakeRedirectContext(pages));
+    expect(result.chapters).toEqual([
+      { url: 'https://book15.net/reader/1/1.html', title: '第一章' },
+      { url: 'https://book15.net/reader/1/2.html', title: '第二章' },
+      { url: 'https://book15.net/reader/1/8.html', title: '最新 八' },
+      { url: 'https://book15.net/reader/1/9.html', title: '最新 九' },
+    ]);
+  });
+
 
   it('反例 6：nextTocUrl 翻页时缺 chapterUrl → 每页兜底值是该页的 page.url，不是首页 tocUrl', async () => {
     const page2 = 'https://book15.net/toc-real/2.html';

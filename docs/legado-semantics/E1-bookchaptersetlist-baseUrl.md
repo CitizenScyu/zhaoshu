@@ -39,4 +39,7 @@ elements.forEachIndexed { index, item ->
 
 `src/lib/rule-engine/api.ts` `engineFetchToc`：`ruleToc.chapterUrl` 缺失或求值空时
 章节 url = 当前目录页 `page.url`；规则产出非空但过不了 host 门的 URL 丢弃，不洗成 page.url。
-去重口径 `seenUrls` 按 url 去重，与 legado LinkedHashSet 同结果（1 章书）。
+去重按 url，与 legado 的 `LinkedHashSet` 同结果——**但保留的是最后一次出现**（41-ctocfu §5 更正）：
+legado `BookChapterList.kt:114-124` 的顺序是 `reverse()` → `LinkedHashSet`（保留反转后首次）→ 按
+`getReverseToc()`（默认 false，`Book.kt:394`）再 `reverse()`，净效果等价「保留最后一次出现、就地」。
+旧实现保留首次出现，只在「折叠后条数」与「1 章书退化」上同结果，重复 URL 的**顺序**与 legado 不同。
