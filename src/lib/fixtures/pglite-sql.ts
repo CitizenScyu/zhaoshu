@@ -51,7 +51,10 @@ export function createPGliteSql(pg: PGliteLike) {
       throw error;
     }
   };
-  return Object.assign(tag, { transaction });
+  // 生产 neon 的 `sql.query(text, params)`（非模板形态，见 @neondatabase/serverless 类型）在 PGlite 上的等价物：
+  // 直接返回行数组（与 neon 默认 arrayMode=false 一致）。businessSchemaCurrent 的动态探测 SQL 走这条。
+  const query = async (text: string, params: unknown[] = []) => (await pg.query(text, params)).rows;
+  return Object.assign(tag, { transaction, query });
 }
 
 /**
