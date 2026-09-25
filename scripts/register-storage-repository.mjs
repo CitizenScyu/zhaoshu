@@ -14,7 +14,8 @@
 // 幂等：按 registry 自己的唯一身份索引（lower(owner), lower(repo)）查。
 //   - 已有满足可写判据的行 → 什么都不写（unwritable 的既有行只报告，不擅自改，避免把
 //     人工封存 sealed / read_only 的行悄悄解封）。
-//   - 没有任何同身份行 → INSERT 一行启用中的私库可写仓位。
+//   - 没有任何同身份行 → INSERT 一行启用中的私库可写仓位（INSERT 带 ON CONFLICT DO NOTHING，
+//     并发双跑输的一方不抛 23505、不写第二行，见 insertRepositoryRow 注释）。
 // 默认 dry-run（只读报告会做什么）；显式 --apply 才写。
 //
 // 目标必须显式给出：--database-url-env=<变量名>（脚本不读 .env*，不回退 DATABASE_URL /
@@ -94,15 +95,30 @@ export function planRegistration(state, key) {
     enabled: true, is_private: true, read_only: false } };
 }
 
+// 写入新仓位的唯一写语句。ON CONFLICT DO NOTHING（41-bookidfk N3）：本脚本 SELECT 与 INSERT 之间
+// 没有事务/锁，并发双跑时输的一方会撞 storage_repositories_identity_idx。旧写法直接抛 23505
+// （未写第二行，但退出码 1、报错不干净）；DO NOTHING 把它变成 0 行返回，由调用方按既有行据实报告。
+// 不写冲突目标：本表唯一的唯一约束就是这个身份索引（PK 是 serial，serial 不会撞），语义即所需。
+export async function insertRepositoryRow(sql, key) {
+  return await sql`
+    INSERT INTO storage_repositories (owner, repo, branch, enabled, is_private, read_only)
+    VALUES (${key.owner}, ${key.repo}, ${key.branch}, true, true, false)
+    ON CONFLICT DO NOTHING
+    RETURNING id`;
+}
+
 export async function runRegistration(sql, key, mode) {
   const plan = planRegistration(await inspectRegistration(sql, key), key);
   const base = { mode, repo: `${key.owner}/${key.repo}`, branch: key.branch, ...plan };
   if (mode === 'dry-run' || plan.status !== 'insert') return { ...base, status: plan.status === 'insert' ? 'dry-run' : plan.status };
-  const [{ id }] = await sql`
-    INSERT INTO storage_repositories (owner, repo, branch, enabled, is_private, read_only)
-    VALUES (${key.owner}, ${key.repo}, ${key.branch}, true, true, false)
-    RETURNING id`;
-  return { ...base, status: 'applied', id: Number(id) };
+  const rows = await insertRepositoryRow(sql, key);
+  if (!rows.length) {
+    // 输给了并发：同身份行已由另一进程写入。回读它，仍按「可写→noop / 不可写→refused」报告。
+    const settled = planRegistration(await inspectRegistration(sql, key), key);
+    return { mode, repo: base.repo, branch: base.branch, status: settled.status === 'insert' ? 'noop' : settled.status,
+      existing: settled.existing, reason: settled.reason ?? 'ON CONFLICT DO NOTHING：同身份行已存在（并发写入），本次未写库' };
+  }
+  return { ...base, status: 'applied', id: Number(rows[0].id) };
 }
 
 async function main() {
