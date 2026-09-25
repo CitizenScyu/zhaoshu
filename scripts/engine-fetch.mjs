@@ -11,11 +11,13 @@
 //
 // 退出码契约：0=有结果（doctor=模块装配正常）；1=无候选/无章/空正文（stderr 原因）；2=无法尝试（无 DATABASE_URL、
 //   DB 不可达、参数/URL 非法——含非 https:// scheme；stderr 原因）。stdout 只放数据（--json 时单行 JSON）。
+// 出错时 --json 另在 stderr 第二行写 `{"errorKind":"…"}`（类别见 engine-error-kind.mjs；giveup41）。
 // 🔴 凭据红线：任何输出（stdout/stderr）不得包含 DATABASE_URL 或密钥（见 safeReason）。
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { exitAfterFlush } from './stdio-exit.mjs';
 import { excludeSkippedSources, searchSources, SEARCH_SOURCE_SLICE_MS } from './engine-search-pool.mjs';
+import { downloadErrorKind, engineErrorKind } from './engine-error-kind.mjs';
 
 // CLI 层宽上限（无 serverless 限制，但仍有界防挂死）。
 const SEARCH_TIMEOUT_MS = 30_000;
@@ -24,7 +26,8 @@ const CONTENT_TIMEOUT_MS = 30_000;
 const POOL_SIZE = 4; // 与 DEFAULT_READING_POOL_LIMIT 同量级；仅用于 context.openPool 抬全局兜底上限。
 
 class ExitError extends Error {
-  constructor(code, reason) { super(reason); this.code = code; }
+  // kind：--json 错误行的 errorKind；缺省按退出码（2=用法错，1=无结果）。
+  constructor(code, reason, kind = code === 2 ? 'usage' : 'empty') { super(reason); this.code = code; this.kind = kind; }
 }
 
 function parseArgs(argv) {
@@ -81,7 +84,7 @@ function safeReason(error) {
 // —— 模块与源池装配（env 设好后再动态 import，确保 db.ts 模块初始化读到 DATABASE_URL）——
 
 async function loadModules() {
-  const [api, compile, shuyuan, supported, policy, parser, reader] = await Promise.all([
+  const [api, compile, shuyuan, supported, policy, parser, reader, fetchLayer] = await Promise.all([
     import('../src/lib/rule-engine/api.ts'),
     import('../src/lib/rule-engine/compile.ts'),
     import('../src/lib/shuyuan.ts'),
@@ -89,8 +92,9 @@ async function loadModules() {
     import('../src/lib/source-policy.ts'),
     import('../src/lib/source-parser.ts'),
     import('../src/lib/source-reader.ts'),
+    import('../src/lib/source-fetch.ts'),
   ]);
-  return { api, compile, shuyuan, supported, policy, parser, reader };
+  return { api, compile, shuyuan, supported, policy, parser, reader, fetchLayer };
 }
 
 // builtin book15 条目（ReadingSource 形态；rules 空 ⇒ 走 source-parser 适配器）。
@@ -142,7 +146,7 @@ async function cmdSearch(m, args) {
     enginePool = await loadEnginePool(m, signal);
   } catch (error) {
     // search 的价值就是全池；DB 不可达 ⇒ 退 2，labeler 回退自有 book15 路径。
-    throw new ExitError(2, `引擎源池不可用：${safeReason(error)}`);
+    throw new ExitError(2, `引擎源池不可用：${safeReason(error)}`, 'pool');
   }
   // --skip-host 按源身份 host 过滤（与下面按请求 host 分组不是同一个键，理由见 excludeSkippedSources）。
   const sources = excludeSkippedSources(
@@ -169,7 +173,7 @@ async function cmdSearch(m, args) {
     },
     onError: (source, error) => process.stderr.write(`[warn] 源 ${hostOf(source.url)} 搜索失败：${safeReason(error)}\n`),
   });
-  if (!candidates.length) throw new ExitError(1, `无候选：${args.title}`);
+  if (!candidates.length) throw new ExitError(1, `无候选：${args.title}`, 'miss');
   emit(args, candidates, () => candidates.map((c) => `[${c.source}] ${c.title}${c.author ? ' / ' + c.author : ''} -> ${c.bookUrl}`).join('\n'));
 }
 
@@ -191,10 +195,10 @@ async function resolveSourceForUrl(m, url, signal) {
   try {
     enginePool = await loadEnginePool(m, signal);
   } catch (error) {
-    throw new ExitError(2, `引擎源池不可用：${safeReason(error)}`);
+    throw new ExitError(2, `引擎源池不可用：${safeReason(error)}`, 'pool');
   }
   const source = findSourceByHost(m, enginePool, host);
-  if (!source) throw new ExitError(1, `没有匹配该 URL host 的可用引擎源：${host}`);
+  if (!source) throw new ExitError(1, `没有匹配该 URL host 的可用引擎源：${host}`, 'no_source');
   return { source, builtin: false };
 }
 
@@ -273,7 +277,7 @@ async function cmdDownload(m, args) {
   const { downloadBook } = await import('./engine-download.mjs');
   const result = await downloadBook(m, args, resolveSourceForUrl);
   process.stdout.write(JSON.stringify(result) + '\n');
-  if (result.code) throw new ExitError(result.code, 'download partial');
+  if (result.code) throw new ExitError(result.code, 'download partial', downloadErrorKind(result.code));
 }
 
 const COMMANDS = { doctor: cmdDoctor, download: cmdDownload, search: cmdSearch, toc: cmdToc, content: cmdContent };
@@ -308,8 +312,12 @@ async function main() {
   }
 
   const m = await loadModules();
+  errorClasses = { SourcePolicyError: m.policy.SourcePolicyError, SourceHttpError: m.fetchLayer.SourceHttpError };
   await handler(m, args);
 }
+
+// 模块加载后才有错误类可比对（加载前抛的都是 ExitError，自带 kind）。
+let errorClasses = {};
 
 // 🔴 不得直接 process.exit：管道下 >64KB 的 --json 输出会被截断（见 stdio-exit.mjs）。
 main().then(
@@ -317,6 +325,9 @@ main().then(
   (error) => {
     const code = error instanceof ExitError ? error.code : 1;
     process.stderr.write(`${safeReason(error)}\n`);
+    if (process.argv.includes('--json')) {
+      process.stderr.write(`${JSON.stringify({ errorKind: engineErrorKind(error, errorClasses) })}\n`);
+    }
     return exitAfterFlush(code);
   },
 );

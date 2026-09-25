@@ -193,3 +193,44 @@ describe('engine-fetch CLI 契约', () => {
     }
   }, 60_000);
 });
+
+// giveup41：错误类别契约。labeler 只对确定性类别（policy/http_4xx/no_source）连续 N 章提前放弃，
+// 类别必须由 CLI 结构化给出（不靠 Python 猜文案）；第一行原因文案保持不变（旧 labeler 只取摘要）。
+describe('engine-fetch errorKind（giveup41）', () => {
+  it('--json 出错：stderr 第一行原因不变，第二行是 {"errorKind":…}', () => {
+    const r = run(['content', '--url', 'http://book15.net/book/1.html', '--json'], { DATABASE_URL: 'postgres://u:p@h/db' });
+    expect(r.status).toBe(2);
+    const lines = r.stderr.split('\n');
+    expect(lines[0]).toContain('HTTPS');
+    expect(JSON.parse(lines[lines.length - 1])).toEqual({ errorKind: 'usage' });
+    expect(r.stdout).toBe('');
+  }, 60_000);
+
+  it('非 --json：不输出类别行（人读输出不变）', () => {
+    const r = run(['content', '--url', 'http://book15.net/book/1.html'], { DATABASE_URL: 'postgres://u:p@h/db' });
+    expect(r.status).toBe(2);
+    expect(r.stderr).not.toContain('errorKind');
+  }, 60_000);
+
+  it('engineErrorKind：用真错误类分类（跨站跳转拒绝=policy；4xx 确定性；5xx/429/超时是抖动）', async () => {
+    const { engineErrorKind } = await import('./engine-error-kind.mjs');
+    const { SourcePolicyError } = await import('../src/lib/source-policy');
+    const { SourceHttpError } = await import('../src/lib/source-fetch');
+    const classes = { SourcePolicyError, SourceHttpError };
+    expect(engineErrorKind(new SourcePolicyError('仅支持 HTTPS 精确域名和默认端口/443'), classes)).toBe('policy');
+    for (const status of [400, 403, 404, 410]) expect(engineErrorKind(new SourceHttpError(status), classes)).toBe('http_4xx');
+    for (const status of [408, 425, 429, 500, 502, 503]) expect(engineErrorKind(new SourceHttpError(status), classes)).toBe('http_5xx');
+    expect(engineErrorKind(new DOMException('书源请求及正文读取超时', 'TimeoutError'), classes)).toBe('timeout');
+    expect(engineErrorKind(new DOMException('书源连接超时', 'ConnectTimeoutError'), classes)).toBe('timeout');
+    expect(engineErrorKind(Object.assign(new Error('x'), { kind: 'no_source' }), classes)).toBe('no_source');
+    expect(engineErrorKind(new Error('boom'), classes)).toBe('other');
+    // 模块未加载（类为空）时不误判为 policy：只认 kind/name
+    expect(engineErrorKind(new SourcePolicyError('x'))).toBe('other');
+  });
+
+  it('downloadErrorKind：code=2（日限额/瞬时不可用，可重试）不得标 partial，仅 code=1 是 partial', async () => {
+    const { downloadErrorKind } = await import('./engine-error-kind.mjs');
+    expect(downloadErrorKind(2)).toBe('source_unavailable');
+    expect(downloadErrorKind(1)).toBe('partial');
+  });
+});
