@@ -223,6 +223,19 @@ describe('池合成读缓存', () => {
     expect(JSON.parse(metaQueries[1].values.at(-1) as string)).toContain('c.example');
     expect(JSON.parse(metaQueries[0].values.at(-1) as string)).not.toContain('c.example');
   });
+
+  it('41-xferfix N2：条目有硬上限（引擎开关关时门变化不经整体作废），超限淘汰最旧的门投影', async () => {
+    vi.stubEnv('READING_ENGINE_SOURCES', '0');
+    const gates = Array.from({ length: 70 }, (_, i) => [`g${i}.example`]);
+    for (const gate of gates) { refreshSupportedHosts(gate); await getReadingSources(signal()); }
+    expect(counts().poolMeta).toBe(70);
+    refreshSupportedHosts(gates[69]);
+    await getReadingSources(signal()); // 最新的门仍命中
+    expect(counts().poolMeta).toBe(70);
+    refreshSupportedHosts(gates[0]);
+    await getReadingSources(signal()); // 最旧的已被淘汰 ⇒ 重读
+    expect(counts().poolMeta).toBe(71);
+  });
 });
 
 // 41-xferfix B1：host 门是模块级全局态，池合成每次按 engineHosts 整集重置它。缓存命中时拿的是旧 host 集，

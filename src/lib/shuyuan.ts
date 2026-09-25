@@ -671,6 +671,9 @@ async function storedMeta(s: Sql, signal?: AbortSignal): Promise<MetaRow> {
 //   前者要拿最新 refreshed_at 做乐观并发守卫，后者是管理面、读己之写优先。
 export { DEFAULT_SHUYUAN_READ_CACHE_TTL_MS, shuyuanReadCacheTtlMs };
 const READ_CACHE_LOAD_TIMEOUT_MS = 20_000;
+// 41-xferfix N2：条目硬上限。固定键只有 3 个，poolProbeMeta 按门分键（门变化通常伴随整体作废，见
+// syncReadCacheWithGate；但引擎开关关闭时不经该同步）——代码层兜底，超限按插入序淘汰最旧一条。
+const READ_CACHE_MAX_ENTRIES = 64;
 
 type ReadCacheEntry = { expiresAt: number; value: Promise<unknown> };
 const readCache = new Map<string, ReadCacheEntry>();
@@ -705,6 +708,8 @@ async function cachedRead<T>(
   let entry = readCache.get(key);
   if (!entry || entry.expiresAt <= now) {
     const created: ReadCacheEntry = { expiresAt: now + ttl, value: load(AbortSignal.timeout(READ_CACHE_LOAD_TIMEOUT_MS)) };
+    readCache.delete(key);
+    if (readCache.size >= READ_CACHE_MAX_ENTRIES) readCache.delete(readCache.keys().next().value!);
     readCache.set(key, created);
     created.value.catch(() => { if (readCache.get(key) === created) readCache.delete(key); });
     entry = created;
