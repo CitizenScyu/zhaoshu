@@ -25,10 +25,12 @@
       则静默回落到 .env。启动会打印「打标模型来源: database|environment」。
 """
 import argparse
+import atexit
 import json
 import os
 import re
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -570,6 +572,29 @@ _WATERMARK_SEP_RE = re.compile(
     r'[\s　\-—_=+*|/\\<>·、,，;；:：!！?？。~～^&.'
     r'“”"\'‘’()（）\[\]【】〖〗《》{}]+')
 
+# ---- 作者求票行 / 章末标记 / 纯分隔线（lblqual41）----
+# 实证（bqquge《斗罗大陆III》前 12 章，本机重取）：逐章都有作者写在正文里的求票/感言，
+#   `求收藏、求推荐票！` / `四更啦！求推荐票、求收藏。唐门万岁，书友们万岁！` /
+#   `今天的第二章送上，再次拜求推荐票、拜求收藏支持。今天保底四更哦。冲榜、冲榜…`，
+# 外加每章末尾的 `(本章完)` 和 `－－－－…` 分隔线。这是原书自带的，不是站点注入，但对打标模型
+# 来说与推广注入同形（该书被判「含广告注入」）。判据：「求」紧接收藏/推荐票/月票/订阅/打赏，
+# 且整行无引号（有引号 = 对白，如 `“求收藏！”他在直播间里喊`，一律保留）。
+# 刻意收窄：`求推荐` 后必须是「票」或标点/行尾（挡 `求推荐信`），`收藏` 后不能接家/品/室/馆/夹。
+# 第二道闸（lblqualfix41，复审阻断②）：只凭「整行无引号」会误删无引号的第三人称叙述
+# （`他跪在雪地里向过往的行人求打赏，嗓子已经哑了。` 一类）。作者求票是**对读者说话**的口吻，
+# 所以再要求行内出现呼语/作者口吻词（各位/大家/书友/兄弟们/拜托/谢谢/本书/新书/作者…），
+# 或「求…」出现在行首/行尾（呼告的典型位置）。两者都不满足的叙述行保留。
+PLEA_LINE_MAX_LEN = 150
+_PLEA_RE = re.compile(
+    r'求(?:一下|一波|个|张)?(?:推荐票|推荐(?=[、，,。！!～~\s]|$)|收藏(?![家品室馆夹])|月票|订阅|打赏)')
+_PLEA_QUOTE_RE = re.compile(r'[“”‘’「」『』"]')
+_PLEA_VOICE_RE = re.compile(
+    r'各位|大家|书友|兄弟们|兄弟姐妹|拜托|谢谢|感谢|本书|新书|作者|读者|冲榜|保底|更新|上传|送上|拜求|跪求|求一|求个')
+_PLEA_EDGE_RE = re.compile(
+    r'^(?:求|拜求|跪求|再求|还求)|(?:推荐票|月票|收藏|订阅|打赏)[！!。．…~～、，,\s]*$')
+_CHAPTER_END_RE = re.compile(r'^[（(]\s*本章完\s*[）)]$')
+_SEPARATOR_LINE_RE = re.compile(r'^[－\-—=＝_＿*＊~～·]{5,}$')
+
 _DIV_TOKEN_RE = re.compile(r'</?div\b', re.I)
 
 
@@ -703,6 +728,15 @@ def _drop_rule(line: str) -> str | None:
     # 4) 上游书源水印行（`〖三七中文www.37zw.com〗百度搜索“37zw”访问` 一类）。
     if len(line) <= INJECT_LINE_MAX_LEN and _is_watermark_line(line):
         return 'inject'
+    # 5) 作者求票/求收藏行：整行、无引号，且是作者口吻（呼语/口吻词，或求告词在行首/行尾）。
+    #    无引号的第三人称叙述（求打赏/求订阅出现在句中）不删（lblqualfix41）。
+    # 6) 章末 `(本章完)` 与纯分隔线（lblqual41）。
+    if len(line) <= PLEA_LINE_MAX_LEN and _PLEA_RE.search(line) \
+            and not _PLEA_QUOTE_RE.search(line) \
+            and (_PLEA_VOICE_RE.search(line) or _PLEA_EDGE_RE.search(line)):
+        return 'plea'
+    if _CHAPTER_END_RE.match(line) or _SEPARATOR_LINE_RE.match(line):
+        return 'marker'
     return None
 
 
@@ -729,6 +763,78 @@ def clean_chapter_text(html: str) -> tuple[str, dict]:
         'drop_ratio': (1 - after / before) if before else 0.0,
     }
     return text, stats
+
+
+# ---- 调模型之前的本地预检（lblqual41）----
+# 事故（2026-09-25 phoenix 一轮 6 本拒 5 本）：模型调用全部成功，却被自报的 text_quality 拦下。实证：
+# - cuoceng「大面积重复」是真重复：CLI content 没有翻页停止点，每章都顺着「下一章」翻满 20 页，
+#   相邻两章的返回有 19/20 重叠（根治在 engine-fetch --stop-urls-file，本层去重兜底）；
+# - yunqi「含广告注入」：付费试读源，每章只有约 100 字，标题还带「APP免费」——没有正文可打；
+# - bqquge《斗罗大陆III》「含广告注入」：作者求票行逐章都有，而引擎正文根本不过清洗层。
+# 所以在调模型前：引擎正文逐行过 _drop_rule；跨章去掉重复的长行（串章/分页重叠/重复章节）；
+# 试读截断源和去重后字数不足的书直接跳过，不花模型调用。模型的 text_quality 判定门不动。
+DEDUPE_MIN_LINE = 20        # 只对这么长以上的行去重：短对白（“嗯。”）重复是正常写法
+PREVIEW_MIN_CHAPTERS = 5    # 章数太少不判试读（样本不够）
+PREVIEW_MEDIAN_MAX = 500    # 章正文中位数低于此 → 疑似试读/付费截断（正常网文一章 2000–5000 字）
+PRECHECK_MIN_CHARS = 10_000  # 与主循环「抓取字数不足」同一阈值
+# 试读门是「又短又碎」：中位数低但全书字数已经够打标的，是正常的短章写法，不按试读拒
+# （复审非阻断③：30 章×450 字共 1.3 万字被误判）。阈值与「去重后不足」同一口径。
+PREVIEW_MIN_TOTAL = PRECHECK_MIN_CHARS
+# 章节标题 = 本层自己拼出来的 '【标题】\n'，标题取自 toc，行首必是「第X章/卷/节/回/集/话/部/篇」。
+# 正文里独占一段的「【叮！获得xx点经验值】」一类系统提示/弹幕/法宝名不含章号，不算章节标题
+# （lblqualfix41，复审阻断①：60 章系统流被切成 120 章、中位数腰斩、整本按试读拒收）。
+_CHAPTER_HEAD_RE = re.compile(
+    r'(?:\A|\n\n)(【第[0-9一二三四五六七八九十百千万零〇两\d]+[章节卷回集话部篇][^\n]*】)\n')
+
+
+def prepare_book_text(text: str, clean: bool) -> tuple[str, int, str | None, dict]:
+    """拼接好的整本文本 → (预处理后文本, 字数, 拒收原因或 None, 统计)。纯函数，可离线单测。
+
+    输入形态同 fetch_book_text / fetch_book_text_engine 的产出：'【章节标题】\\n正文' 以空行相连。
+    clean=True（引擎正文）时逐行过 _drop_rule；book15 正文在抓取层已清洗过，传 False。
+    去重：某行（去首尾空白后 ≥ DEDUPE_MIN_LINE 字）在本书前文出现过 → 删；删空的章整章丢
+    （短章在抓取层已按 ≤100 字丢过，这里不再按长度丢）。章节标题行不参与去重。"""
+    pieces = _CHAPTER_HEAD_RE.split(text)
+    chapters = [('', pieces[0])] if pieces[0].strip() else []
+    chapters += list(zip(pieces[1::2], pieces[2::2]))
+    seen: set[str] = set()
+    parts, lengths, chars = [], [], 0
+    stats = {'chapters_before': len(chapters), 'clean_lines': 0, 'dup_lines': 0,
+             'dup_chars': 0, 'chars_before': 0}
+    for head, body in chapters:
+        kept, body_len = [], 0
+        for raw in body.split('\n'):
+            line = raw.strip()
+            if not line:
+                continue
+            stats['chars_before'] += len(line)
+            if clean and _drop_rule(line):
+                stats['clean_lines'] += 1
+                continue
+            body_len += len(line)
+            if len(line) >= DEDUPE_MIN_LINE:
+                if line in seen:
+                    stats['dup_lines'] += 1
+                    stats['dup_chars'] += len(line)
+                    continue
+                seen.add(line)
+            kept.append(line)
+        chapter_text = '\n'.join(kept)
+        # 试读判据看去重**之前**的章长：整章重复（目录里同一章出现两次）去重后是 0，不能拉低中位数。
+        lengths.append(body_len)
+        if chapter_text:
+            parts.append(f'{head}\n{chapter_text}' if head else chapter_text)
+            chars += len(chapter_text)
+    out = '\n\n'.join(parts)
+    lengths.sort()
+    median = lengths[len(lengths) // 2] if lengths else 0
+    stats.update(chapters_after=len(parts), chars_after=chars, median_chapter=median)
+    if len(lengths) >= PREVIEW_MIN_CHAPTERS and median < PREVIEW_MEDIAN_MAX \
+            and chars < PREVIEW_MIN_TOTAL:
+        return out, chars, f'章节正文过短（中位 {median} 字，疑似试读/付费截断）', stats
+    if chars < PRECHECK_MIN_CHARS:
+        return out, chars, f'清洗去重后仅 {chars} 字', stats
+    return out, chars, None, stats
 
 
 def fetch_chapter_text(chapter_url: str, source: BookSource | None = None) -> str:
@@ -1063,6 +1169,71 @@ def _build_engine_cli(env: dict):
     return cli
 
 
+# ---- 引擎正文翻页停止点（lblqual41）----
+# cuoceng 的 nextContentUrl 规则指向「下一章」，CLI content 又不知道目录，于是每章都翻满 20 页串进后续
+# 章节（phoenix 实测一次调用 8.2 s、7.7 万字；目录序还与「下一章」链序不同，只给下一章拦不住）。
+# 这里包一层 CLI：toc 成功后把整本目录写进临时文件，之后对目录内章节的 content 追加
+# --stop-urls-file（翻到目录里任一章即停）。包在 CLI 外面而不是改逐章循环：主源/备选源各自先取 toc，
+# 停止点跟着切换，取文循环本身零改动。
+STOP_URLS_FLAG = '--stop-urls-file'
+# 「不认识该参数」的报错形态（node 的 util.parseArgs / argparse / 自写 CLI 的常见措辞）。
+# 只认这类才降级；新 CLI 自己报的「--stop-urls-file 无法读取」不含这些词，不算旧 CLI。
+_UNKNOWN_OPTION_RE = re.compile(r'未知参数|未知选项|无法识别|unrecognized|unknown option', re.I)
+
+
+class EngineStopUrls:
+    """引擎 CLI 包装：记住最近一次 toc 的整本目录，给该目录内章节的 content 带上停止点清单。
+
+    旧 CLI 不认这个参数（rc=2 且 stderr 点名它，部署顺序颠倒时）→ 本轮降级为不带停止点并重试一次，
+    行为同改前。其余属性/方法原样转给被包装的 CLI。"""
+
+    def __init__(self, cli, directory: str | None = None):
+        self._cli = cli
+        fd, self.path = tempfile.mkstemp(prefix='labeler-stop-urls-', suffix='.txt', dir=directory)
+        os.close(fd)
+        atexit.register(self._cleanup)
+        self._urls: frozenset[str] = frozenset()
+        self.supported = True
+
+    def __getattr__(self, name):
+        return getattr(self._cli, name)
+
+    def _cleanup(self) -> None:
+        try:
+            os.unlink(self.path)
+        except OSError:
+            pass
+
+    def _remember_toc(self, stdout: str) -> None:
+        try:
+            chapters = json.loads(stdout).get('chapters') or []
+            urls = [c['url'] for c in chapters if isinstance(c, dict) and c.get('url')]
+        except (ValueError, AttributeError, TypeError):
+            urls = []
+        with open(self.path, 'w', encoding='utf-8') as f:
+            f.write(''.join(u + '\n' for u in urls))
+        self._urls = frozenset(urls)
+
+    def run(self, subcommand: str, *args: str):
+        url = args[1] if len(args) >= 2 and args[0] == '--url' else None
+        if subcommand == 'content' and self.supported and url in self._urls:
+            proc = self._cli.run(subcommand, *args, STOP_URLS_FLAG, self.path)
+            # 只认「不认识这个参数」类报错（旧 CLI）。新 CLI 自己报的「--stop-urls-file 无法读取」
+            # 也是 rc=2 且 stderr 含该参数名，不能当成旧 CLI 把整轮停止点静默关掉（lblqualfix41，复审非阻断①）。
+            if proc.returncode != 2 or not _UNKNOWN_OPTION_RE.search(proc.stderr or ''):
+                return proc
+            self.supported = False
+            print(f'  提示: 引擎 CLI 不支持 {STOP_URLS_FLAG}（旧版），本轮取正文不带翻页停止点',
+                  file=sys.stderr)
+        proc = self._cli.run(subcommand, *args)
+        if subcommand == 'toc':
+            if proc.returncode == 0:
+                self._remember_toc(proc.stdout)
+            else:
+                self._urls = frozenset()
+        return proc
+
+
 # ---- 打标层（将来可整体搬进主应用）----
 SEGMENT_CHARS = 250_000  # 每段字数上限（~160k tokens，远离 CF 100s prefill 死区）
 
@@ -1359,6 +1530,24 @@ def _read_url_lines(path: Path):
             yield url
 
 
+def _read_rejection_rows(path: Path):
+    """labels-rejected.jsonl → 逐行产出 (url, reason)。文件不存在 / 空行 / 坏行跳过。"""
+    if not path.exists():
+        return
+    for line in path.read_text(encoding='utf-8').splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+            url = rec.get('url') or ''
+            reason = rec.get('reason') or ''
+        except (json.JSONDecodeError, AttributeError):
+            continue
+        if isinstance(url, str) and url:
+            yield url, reason if isinstance(reason, str) else ''
+
+
 def load_done_urls(path: Path) -> set[str]:
     """labels.jsonl → 已成功产出的详情页 url 集合（断点续传口径）。"""
     return set(_read_url_lines(path))
@@ -1374,9 +1563,15 @@ def load_stub_urls(path: Path) -> set[str]:
 
 
 def count_rejections(path: Path) -> dict[str, int]:
-    """labels-rejected.jsonl → {url: 被拒次数}（每行 = 一次拒收）。"""
+    """labels-rejected.jsonl → {url: 被拒次数}（每行 = 一次拒收）。
+
+    本地预检拒收（reason 以「本地预检:」开头）不计入：它是规则判定，不是内容本身的问题，
+    规则一改结论就变；计入的话误杀的合格书会在 5 次后成钉子户、只能人工删行恢复
+    （lblqualfix41，复审非阻断②）。模型判定与字数不足等其余拒收照旧计数。"""
     counts: dict[str, int] = {}
-    for url in _read_url_lines(path):
+    for url, reason in _read_rejection_rows(path):
+        if reason.startswith('本地预检:'):
+            continue
         counts[url] = counts.get(url, 0) + 1
     return counts
 
@@ -1492,6 +1687,7 @@ def main() -> int:
             engine_cli = _build_engine_cli(env)
             if engine_cli is not None:
                 print('  引擎兜底已启用：book15 miss 将回落引擎源池')
+                engine_cli = EngineStopUrls(engine_cli)
             # book15 熔断（labelerdiag41）：整站挂掉时别让每本 3 次全失败把一轮拖成十几小时。
             book15_breaker = douban_list.Book15Breaker(douban_list.resolve_book15_breaker(env))
             all_books = (douban_list.build_douban_queue(
@@ -1618,6 +1814,27 @@ def main() -> int:
                     f.write(json.dumps(reject, ensure_ascii=False) + '\n')
                 fail += 1
                 count_failure('字数不足')
+                continue
+            # lblqual41：调模型前的本地预检——引擎正文补过清洗层、跨章去重；试读截断源与去重后
+            # 字数不足的直接跳过（不调模型、不 sleep LLM_INTERVAL）。见 prepare_book_text。
+            text, chars, precheck_reason, pre = prepare_book_text(text, clean=bool(b.get('engine')))
+            if pre['dup_lines'] or pre['clean_lines']:
+                print(f'  本地预检: 去重 {pre["dup_lines"]} 行/{pre["dup_chars"]} 字，'
+                      f'清洗 {pre["clean_lines"]} 行 → {chars} 字')
+            if precheck_reason:
+                print(f'  本地预检不合格({precheck_reason}),跳过（未调模型）')
+                reject = {
+                    'site_title': '' if args.book else (b.get('title') or '').strip(),
+                    'author': b.get('author', ''),
+                    'category': b.get('category', ''),
+                    'url': BOOK15.absolute(b['url']),
+                    'reason': f'本地预检: {precheck_reason}',
+                }
+                rej_path = data_path('labels-rejected.jsonl')
+                with open(rej_path, 'a', encoding='utf-8') as f:
+                    f.write(json.dumps(reject, ensure_ascii=False) + '\n')
+                fail += 1
+                count_failure('本地预检拒收')
                 continue
             # --book 的 title 是详情页路径，不作为可核验的站点书名。
             site_title = '' if args.book else (b.get('title') or '').strip()

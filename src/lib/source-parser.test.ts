@@ -4,6 +4,7 @@ import {
   parseSourceIdentity, parseSourceChapters, parseSourceChapterText, parseSourceSearch,
   sourceBookMatches, sourceSearchUrl,
 } from './source-parser';
+import { SourcePolicyError } from './source-policy';
 
 const bookUrl = 'https://book15.net/books/details42.html';
 
@@ -27,11 +28,24 @@ describe('supported source parser', () => {
     expect(new URL(result).searchParams.get('page')).toBe('1');
   });
 
-  it.each([undefined, '@js:result', '/search?q={{java.get()}}', 'https://evil.invalid/?q={{key}}', 'http://book15.net/?q={{key}}', '/search?q={{key}},{"method":"POST"}'])(
+  it.each([undefined, '@js:result', '/search?q={{java.get()}}', 'https://evil.invalid/?q={{key}}', '/search?q={{key}},{"method":"POST"}'])(
     'rejects unsupported search rules %j', (rule) => {
       expect(() => sourceSearchUrl(rule, '书', 'https://book15.net/')).toThrow();
     },
   );
+
+  // 41-urlfix：模板里写死 http:// 不再直接判死——同 host 升 https 后按原判据（host 白名单/端口/…）再过一次锁。
+  it('upgrades an http:// search template to https on the same host, keeping the rest byte-identical', () => {
+    expect(sourceSearchUrl('http://book15.net/books/search.html?kw={{key}}&page={{page}}', '书&作者', 'https://book15.net/'))
+      .toBe('https://book15.net/books/search.html?kw=' + encodeURIComponent('书&作者') + '&page=1');
+    // 大小写不敏感；非白名单 host / 非 443 端口 / IP 直连升级后仍被拒（不引入任何新授权）。
+    expect(sourceSearchUrl('HTTP://book15.net/s?q={{key}}', '书', 'https://book15.net/')).toBe('https://book15.net/s?q=' + encodeURIComponent('书'));
+    for (const rule of [
+      'http://evil.invalid/s?q={{key}}', 'http://book15.net:8080/s?q={{key}}', 'http://127.0.0.1/s?q={{key}}',
+    ]) {
+      expect(() => sourceSearchUrl(rule, '书', 'https://book15.net/')).toThrow(SourcePolicyError);
+    }
+  });
 
   it('only returns exact title search hits, deduplicated', () => {
     const html = '<a href="/books/details42.html"><b>Ａ书</b></a><a href="/books/details42.html">a书</a><a href="/books/details43.html">a书续</a>';

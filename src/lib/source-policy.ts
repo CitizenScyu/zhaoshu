@@ -56,6 +56,31 @@ export class SourcePolicyError extends Error {
   }
 }
 
+/**
+ * 模板 URL 的 http→https 升级（41-urlfix）。
+ *
+ * 上游合集里的 URL 模板（searchUrl / bookUrl / tocUrl / 翻页模板）常写死 `http://`，而站点与源声明
+ * 同 host、https 证书可用（srcfail-41 §5 实测：`sma.yueyouxs.com` 搜索模板改 https 后 200 + 合法 JSON；
+ * 库里 17 行 url_invalid 里 7 行的错误正是「来源仅支持 HTTPS 完整地址」）。这类源此前准入连请求都不发，
+ * 「改库里源数据」又会被每天重新拉取的合集覆盖，所以在代码层做规范化。
+ *
+ * 安全性：只改 scheme，host / 端口 / 路径 / 查询串**逐字不变**，然后再交给同一把锁的
+ * `checkSourceUrl` 走完整检查（host 白名单、端口 443、userinfo、IP/私网红线一个不少）。
+ * 因此本函数**不引入任何新的 host 授权**，只是把「注定被 scheme 判死」的模板换成同 host 的 https 再判一次；
+ * 非白名单 host、非 443 端口、IP 直连升级后仍被拒（见 source-policy.test.ts 的反例）。
+ *
+ * 只识别**字面** `http://` 前缀（大小写不敏感）：其它 scheme（ftp:/javascript:/data:…）原样返回，
+ * 交给 `checkSourceUrl` 照旧拒；相对引用（`/search?q=`、`//host/x`）原样返回，仍按基址解析。
+ *
+ * 刻意放在「模板展开后、过锁前」的调用点，而**不改 `checkSourceUrl` 本身**：
+ * ① 跳转 Location 是服务端自己的指示，不属于「源模板」，不走升级（保持改动前语义）；
+ * ② `validateSourceUrl` / `validateAdmissionUrl` 的既有语义与跨仓夹具
+ *    `src/lib/fixtures/source-policy.json`（与 ../zhaoshu-books 逐字 deepEqual）都不需要改。
+ */
+export function upgradeSourceTemplateUrl(value: string): string {
+  return /^http:\/\//i.test(value) ? `https://${value.slice(7)}` : value;
+}
+
 // 相对引用只接受已验证的基址；返回规范 URL，供请求、入队和循环检测使用。
 export function validateSourceUrl(value: unknown, base?: string): URL {
   return checkSourceUrl(value, base, { hostAllowed: (hostname) => supportedHosts.has(hostname) });

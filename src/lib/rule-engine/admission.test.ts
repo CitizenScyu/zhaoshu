@@ -336,6 +336,51 @@ describe('两把锁判别性用例（v3 E3 正例+负例）', () => {
   });
 });
 
+describe('滤网 2 搜索模板 http→https 升级（41-urlfix）', () => {
+  const host = 'up.example.net';
+  const httpSource = (searchUrl: string, over: Partial<RawSource> = {}) =>
+    syntheticSource(`https://${host}/`, { searchUrl, ...over });
+
+  it('写死 http:// 的搜索模板升 https 后放行并真发请求（改前：url_invalid 不发请求）', async () => {
+    const fetchPage = vi.fn<AdmissionTransport>().mockResolvedValue(
+      page('<div class="i"><span class="t">书名</span><a href="/b/1">x</a></div>'));
+    const result = await searchAdmission(httpSource(`http://${host}/s?q={{key}}`), {
+      fetchPage, declaredHosts: new Set([host]), signal: signal(), throttleMs: 0,
+    });
+    expect(result.verdict).not.toBe('url_invalid');
+    expect(fetchPage).toHaveBeenCalledOnce();
+    // 请求真的打到 https，且 host/路径逐字不变。
+    expect(String(fetchPage.mock.calls[0][0])).toBe(`https://${host}/s?q=` + encodeURIComponent('测试关键字'));
+  });
+
+  it('升级只改 scheme，不改判据：非声明 host / 非 443 端口 / IP 直连的 http 模板仍判 url_invalid 且不发请求', async () => {
+    const cases: [string, Set<string>, string][] = [
+      [`http://other.example.net/s?q={{key}}`, new Set([host]), 'host 不在声明集'],
+      [`http://${host}:8080/s?q={{key}}`, new Set([host]), '非 443 端口'],
+      ['http://127.0.0.1/s?q={{key}}', new Set(['127.0.0.1']), 'IP 直连'],
+    ];
+    for (const [searchUrl, declaredHosts, label] of cases) {
+      const fetchPage = vi.fn<AdmissionTransport>();
+      const result = await searchAdmission(httpSource(searchUrl), {
+        fetchPage, declaredHosts, signal: signal(), throttleMs: 0,
+      });
+      expect(result.verdict, label).toBe('url_invalid');
+      expect(fetchPage, label).not.toHaveBeenCalled();
+    }
+  });
+
+  it('非 http 的其它 scheme（ftp:/javascript:）不升级，照旧被拒', async () => {
+    for (const searchUrl of ['ftp://up.example.net/s?q={{key}}', 'javascript:alert(1){{key}}', 'data:text/plain,{{key}}']) {
+      const fetchPage = vi.fn<AdmissionTransport>();
+      const result = await searchAdmission(httpSource(searchUrl), {
+        fetchPage, declaredHosts: new Set([host]), signal: signal(), throttleMs: 0,
+      });
+      expect(result.verdict, searchUrl).toBe('url_invalid');
+      expect(fetchPage, searchUrl).not.toHaveBeenCalled();
+    }
+  });
+});
+
 describe('准入状态机 runAdmissionBatch', () => {
   it('174 源一轮 mock 准入：114 compile-ok / 60 compile 拒（L2 后冻结数字），真实搜索 ≤20（默认名额），未探测占位可续测', async () => {
     const fetchPage = vi.fn<AdmissionTransport>().mockResolvedValue(page('<html><body>no results</body></html>'));
@@ -346,13 +391,14 @@ describe('准入状态机 runAdmissionBatch', () => {
     });
     expect(result.compileOk).toBe(114);
     expect(result.compileRejected).toBe(60);
-    // 默认名额 20（41-ADMIT-THROUGHPUT 起）：其中 2 个候选（ubook.reader.qq.com、
-    // www.fnshu.cc）searchUrl host 越出声明集、判 url_invalid 不发网络请求即落行，
-    // 实际 fetchPage 18 次。
+    // 默认名额 20（41-ADMIT-THROUGHPUT 起）：41-urlfix 起 http→https 升级让 sma.yueyouxs.com 系列
+    // 由「不发请求的 url_invalid」变成真探测，占掉的名额把 1 个原在窗口内的候选挤出前 20
+    // （fnshu.cc 本轮只写未测占位）——故 fetchPage 19 次、只剩 ubook.reader.qq.com 1 条 url_invalid。
+    // probed 仍是 20（url_invalid 也占名额，只是不发请求），未测占位数不变。
     expect(result.probed).toBe(20);
-    expect(fetchPage).toHaveBeenCalledTimes(18);
+    expect(fetchPage).toHaveBeenCalledTimes(19);
     // 200 但 bookList 无候选 → no_result（deferred 桶，下轮可复测），不是 ok/rejected。
-    expect(result.verdicts).toEqual({ no_result: 18, url_invalid: 2 });
+    expect(result.verdicts).toEqual({ no_result: 19, url_invalid: 1 });
     for (const row of result.rows.filter((item) => item.search_verdict === 'no_result')) {
       expect(admissionBucket(row.search_verdict)).toBe('deferred');
       expect(row.search_ok).toBe(false);

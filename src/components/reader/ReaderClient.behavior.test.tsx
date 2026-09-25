@@ -186,7 +186,7 @@ describe('ReaderClient 换源:错误码 ⇒ 用户可见文案与可重试/换�
     expect(screen.getByRole('button', { name: '重试' })).toBeTruthy();
   });
 
-  it('SOURCE_TIMEOUT(504):错误条透出超时文案,「换个书源」不出现(504 不是确认失败码)', async () => {
+  it('SOURCE_TIMEOUT(504):错误条透出超时文案,「重试」与「换个书源」两个出口都在(与 503 对齐,confirmtocrev §8-4)', async () => {
     const message = '书源查询已取消或超时,可重试或尝试「下载全书」。';
     const apiFetch = vi.fn(async (input: RequestInfo | URL) => {
       const url = String(input);
@@ -197,9 +197,32 @@ describe('ReaderClient 换源:错误码 ⇒ 用户可见文案与可重试/换�
 
     const alert = await screen.findByRole('alert');
     expect(squeeze(alert.textContent ?? '')).toContain(squeeze(message));
-    // 504 不在 404/422/503 的确认失败码里,不该摆「换个书源」(误导:重试才有意义)。
-    expect(screen.queryByRole('button', { name: '换个书源' })).toBeNull();
+    // 超时的源重试未必有用;确认路径单请求超时(41-confirmtoc 改前 500、改后 504)的用户须能直接换候选。
+    expect(screen.getByRole('button', { name: '换个书源' })).toBeTruthy();
     expect(screen.getByRole('button', { name: '重试' })).toBeTruthy();
+  });
+
+  it('候选确认超时(index 504 SOURCE_TIMEOUT「该书源响应超时」)⇒ 也给「换个书源」', async () => {
+    const message = '该书源响应超时，请稍后重试或换一个候选。';
+    const apiFetch = vi.fn(async () => json({ error: message, code: 'SOURCE_TIMEOUT' }, 504));
+    renderReader(apiFetch);
+
+    const alert = await screen.findByRole('alert');
+    expect(squeeze(alert.textContent ?? '')).toContain(squeeze(message));
+    expect(screen.getByRole('button', { name: '换个书源' })).toBeTruthy();
+  });
+
+  it('409(目录版本变化)仍只给「重新加载目录」,不摆「换个书源」(放行集合只多 504)', async () => {
+    const apiFetch = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.startsWith('/api/read/source/index')) return json(catalog());
+      return json({ error: '目录已更新。', code: 'SOURCE_CATALOG_CHANGED' }, 409);
+    });
+    renderReader(apiFetch);
+
+    await screen.findByRole('alert');
+    expect(screen.getByRole('button', { name: '重新加载目录' })).toBeTruthy();
+    expect(screen.queryByRole('button', { name: '换个书源' })).toBeNull();
   });
 });
 

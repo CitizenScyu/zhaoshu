@@ -93,6 +93,76 @@ describe('引擎门面四函数（M1 任务 4 §7.1）', () => {
   });
 });
 
+// 41-urlfix：absoluteUrl 的 http→https 升级——页面抽出的链接（目录/正文/翻页）写死 http:// 时，
+// 同 host 升 https 后过同一把 host 门（放行 host 集合与判据不变），而非白名单 host 升级后仍被丢弃。
+describe('absoluteUrl http→https 升级（41-urlfix）', () => {
+  const httpToc = 'http://book15.net/toc/1.html'; // 详情页抽出的 tocUrl 写死 http://
+  const upgradedToc = 'https://book15.net/toc/1.html'; // 升级后的规范 URL
+
+  it('详情页抽出的 http:// tocUrl 升 https 后按规范 URL 请求并被接受', async () => {
+    const pages = new Map([
+      [BOOK_URL, '<h1 class="title">书</h1><span class="writer">作者</span><a class="toc" href="' + httpToc + '">目录</a>'],
+      [upgradedToc, '<li class="chapter"><a href="/c/1.html">第一章</a></li>'],
+    ]);
+    const source = engineSource({ ruleBookInfo: { name: '.title@text', author: '.writer@text', tocUrl: '.toc@href' } });
+    // 详情页解析出的 tocUrl 必须是升级后的 https（host/路径逐字不变）。
+    expect(await engineFetchDetail(source, BOOK_URL, fakeContext(pages))).toEqual({ title: '书', author: '作者', tocUrl: upgradedToc });
+    // 目录页以此为入口请求（fakeContext 用 upgradedToc 作 key，若用 http 原样请求会命中 undefined 抛错）。
+    expect(await engineFetchToc(source, upgradedToc, fakeContext(pages))).toEqual({
+      chapters: [{ url: 'https://book15.net/c/1.html', title: '第一章' }],
+    });
+  });
+
+  it('翻页链接（nextTocUrl）写死 http:// 时同样升 https', async () => {
+    const toc2 = 'https://book15.net/toc/2.html';
+    const pages = new Map([
+      [TOC_URL, '<li class="chapter"><a href="/c/1.html">第一章</a></li><a class="next" href="http://book15.net/toc/2.html">下一页</a>'],
+      [toc2, '<li class="chapter"><a href="/c/2.html">第二章</a></li>'],
+    ]);
+    const source = engineSource({ ruleToc: { chapterList: '.chapter', chapterName: 'a@text', chapterUrl: 'a@href', nextTocUrl: '.next@href' } });
+    expect(await engineFetchToc(source, TOC_URL, fakeContext(pages))).toEqual({
+      chapters: [
+        { url: 'https://book15.net/c/1.html', title: '第一章' },
+        { url: 'https://book15.net/c/2.html', title: '第二章' },
+      ],
+    });
+  });
+
+  it('正文翻页链接（nextContentUrl）写死 http:// 时同样升 https', async () => {
+    const chapter2 = 'https://book15.net/c/2.html';
+    const pages = new Map([
+      [CHAPTER_URL, '<div class="content">第一段</div><a class="next" href="http://book15.net/c/2.html">下一页</a>'],
+      [chapter2, '<div class="content">第二段</div>'],
+    ]);
+    const source = engineSource({ ruleContent: { content: '.content@text', nextContentUrl: '.next@href' } });
+    expect(await engineFetchContent(source, CHAPTER_URL, fakeContext(pages))).toEqual({ text: '第一段\n第二段' });
+  });
+
+  // strict=true（阅读器正文 context 用）下，目录页里 http://同白名单host/ch1 升级成 https 后
+  // 必须被收下，不得因「原 scheme 是 http」抛 invalid_chapter（复审 §7 建议 2 的 strict 反例）。
+  it('strict 模式下目录页 http:// 章节链接升级后不抛 invalid_chapter', async () => {
+    const toc2 = 'https://book15.net/toc/2.html';
+    const pages = new Map([
+      [TOC_URL, '<li class="chapter"><a href="http://book15.net/c/1.html">第一章</a></li><a class="next" href="http://book15.net/toc/2.html">下一页</a>'],
+      [toc2, '<li class="chapter"><a href="http://book15.net/c/2.html">第二章</a></li>'],
+    ]);
+    const source = engineSource({ ruleToc: { chapterList: '.chapter', chapterName: 'a@text', chapterUrl: 'a@href', nextTocUrl: '.next@href' } });
+    expect(await engineFetchToc(source, TOC_URL, fakeContext(pages), true)).toEqual({
+      chapters: [
+        { url: 'https://book15.net/c/1.html', title: '第一章' },
+        { url: 'https://book15.net/c/2.html', title: '第二章' },
+      ],
+    });
+  });
+
+  it('非白名单 host 的 http:// 链接升级后仍被丢弃（不引入新授权）', async () => {
+    const pages = new Map([[BOOK_URL,
+      '<h1 class="title">书</h1><a class="toc" href="http://evil.invalid/toc/1.html">目录</a>']]);
+    const source = engineSource({ ruleBookInfo: { name: '.title@text', tocUrl: '.toc@href' } });
+    expect(await engineFetchDetail(source, BOOK_URL, fakeContext(pages))).toEqual({ title: '书' });
+  });
+});
+
 // ---------------------------------------------------------------- 准入兼容 L1（admission-compat §3.1 反例 2-6）
 // legado 语义（BookChapterList.kt:230-244，取证见 docs/legado-semantics/）：
 // ruleToc.chapterUrl 缺失或求值空 → 章节 url 取当前目录页 URL（baseUrl），不是 href 回退。
@@ -127,7 +197,8 @@ describe('chapterUrl 缺失/求值空 → 取当前目录页 URL（legado baseUr
       '<div class="chapter"><h3>第一章 标题</h3></div><div class="chapter"><h3>第二章 标题</h3></div>']]);
     const src = defaultTocSource({ chapterList: '.chapter', chapterName: 'h3@text', chapterUrl: undefined });
     const result = await engineFetchToc(src, tocUrl, fakeRedirectContext(pages));
-    expect(result.chapters).toEqual([{ url: pageUrl, title: '第一章 标题' }]);
+    // 两条兜底 url 相同 → 只剩 1 条；标题取**最后一次**出现的（legado reverse→LinkedHashSet→reverse 的净效果，41-ctocfu §5）。
+    expect(result.chapters).toEqual([{ url: pageUrl, title: '第二章 标题' }]);
   });
 
   it('反例 3：chapterUrl 存在但求值空（@href 命中无 href 属性的节点）→ 同样回退 page.url', async () => {
@@ -145,14 +216,35 @@ describe('chapterUrl 缺失/求值空 → 取当前目录页 URL（legado baseUr
     expect(result.chapters).toEqual([]); // h3@text 有值但节点无 href 语义，evil 链接被丢
   });
 
-  it('反例 5：兜底后多节点同 url → 按 url 去重只剩 1 章（legado LinkedHashSet 同结果）', async () => {
+  it('反例 5：兜底后多节点同 url → 按 url 去重只剩 1 章；保留最后一次出现（legado 净效果）', async () => {
     const pages = new Map([[pageUrl,
       '<div class="chapter"><h3>第一章</h3></div><div class="chapter"><h3>第二章</h3></div><div class="chapter"><h3>第三章</h3></div>']]);
     const src = defaultTocSource({ chapterList: '.chapter', chapterName: 'h3@text' });
     const result = await engineFetchToc(src, tocUrl, fakeRedirectContext(pages));
     expect(result.chapters).toHaveLength(1);
     expect(result.chapters[0].url).toBe(pageUrl);
+    // 兜底后三条 url 相同、标题不同 → legado（reverse → LinkedHashSet → reverse）保留最后一条。
+    expect(result.chapters[0].title).toBe('第三章');
   });
+
+  // kxdu.net 形态（41-ctocfu §5）：ruleToc.chapterList 同时命中页面顶部「最新章节」区块与正文全目录，
+  // 且该区块在目录末尾被原样重列。legado 净效果保留最后一次出现 ⇒ 顶部副本被挤到末尾，「第一章」回到首位。
+  // 改前（保留首次出现）读到的是倒序的「最新章节」，且「从第一章读」会先读到番外。
+  it('反例 5b：头部「最新章节」区块与末尾重列重复 → 保留末尾一次，第一章回到首位（kxdu.net 形态）', async () => {
+    const pages = new Map([[pageUrl,
+      '<div class="chapterNum"><ul><li><a href="/reader/1/9.html">最新 九</a></li><li><a href="/reader/1/8.html">最新 八</a></li>'
+      + '<li><a href="/reader/1/1.html">第一章</a></li><li><a href="/reader/1/2.html">第二章</a></li>'
+      + '<li><a href="/reader/1/8.html">最新 八</a></li><li><a href="/reader/1/9.html">最新 九</a></li></ul></div>']]);
+    const src = defaultTocSource({ chapterList: '.chapterNum@li', chapterName: 'a@text', chapterUrl: 'a@href' });
+    const result = await engineFetchToc(src, tocUrl, fakeRedirectContext(pages));
+    expect(result.chapters).toEqual([
+      { url: 'https://book15.net/reader/1/1.html', title: '第一章' },
+      { url: 'https://book15.net/reader/1/2.html', title: '第二章' },
+      { url: 'https://book15.net/reader/1/8.html', title: '最新 八' },
+      { url: 'https://book15.net/reader/1/9.html', title: '最新 九' },
+    ]);
+  });
+
 
   it('反例 6：nextTocUrl 翻页时缺 chapterUrl → 每页兜底值是该页的 page.url，不是首页 tocUrl', async () => {
     const page2 = 'https://book15.net/toc-real/2.html';
@@ -510,5 +602,41 @@ describe('正文翻页遇下一章即停（41-PAGEFIX）', () => {
     ]));
     expect(await engineFetchContent(cuoceng, byQuery('id=1'), paged.context, true, byQuery('id=2'))).toEqual({ text: '第1章上半\n第1章下半' });
     expect(paged.requested).toEqual([byQuery('id=1'), byQuery('id=1&p=2')]);
+  });
+
+  // lblqual41：cuoceng《鬼吹灯》目录顺序（附录与正文交错）≠ 站点「下一章」链顺序：第 0 章的 linkNext 指向目录第 3 章。
+  // 只传目录里的下一章（第 1 章）拦不住，一路翻 20 页；传整本目录 ⇒ 命中任一章即停。
+  const interleaved = () => new Map([
+    [chapter(0), page('第0章正文', '/cc/3.html')],
+    [chapter(3), page('第3章正文', '/cc/2.html')],
+    [chapter(2), page('第2章正文', '/cc/4.html')],
+    [chapter(4), page('第4章正文')],
+  ]);
+  const wholeToc = [0, 1, 2, 3, 4].map(chapter);
+
+  it('⑤ 目录顺序与「下一章」链不一致：只传目录下一章 ⇒ 仍串章（对照）；传整本目录 ⇒ 只取本章 1 页', async () => {
+    const single = recording(interleaved());
+    expect(await engineFetchContent(cuoceng, chapter(0), single.context, false, chapter(1)))
+      .toEqual({ text: '第0章正文\n第3章正文\n第2章正文\n第4章正文' });
+    expect(single.requested).toEqual([chapter(0), chapter(3), chapter(2), chapter(4)]);
+    for (const strict of [false, true]) {
+      const all = recording(interleaved());
+      expect(await engineFetchContent(cuoceng, chapter(0), all.context, strict, wholeToc)).toEqual({ text: '第0章正文' });
+      expect(all.requested).toEqual([chapter(0)]);
+    }
+  });
+
+  it('⑥ 传整本目录：本章自身不当停止点，真多页章节照常翻页；相对地址同样规范化', async () => {
+    const pages = new Map([
+      [chapter(1), page('第1章上半', '/cc/1_2.html')],
+      ['https://book15.net/cc/1_2.html', page('第1章下半', '/cc/3.html')],
+    ]);
+    const run = recording(pages);
+    expect(await engineFetchContent(cuoceng, chapter(1), run.context, true, ['/cc/1.html', '2.html', '/cc/3.html']))
+      .toEqual({ text: '第1章上半\n第1章下半' });
+    expect(run.requested).toEqual([chapter(1), 'https://book15.net/cc/1_2.html']);
+    // 空数组 = 不设判据，与不传相同。
+    const none = recording(threeChapters());
+    expect(await engineFetchContent(cuoceng, chapter(1), none.context, false, [])).toEqual({ text: '第1章正文\n第2章正文\n第3章正文' });
   });
 });

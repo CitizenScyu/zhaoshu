@@ -5,7 +5,7 @@
 // 结构断言（v3 E5）：本模块导出集合**恰为**门面四函数（engineSearchBook / engineFetchDetail / engineFetchToc /
 // engineFetchContent）与其类型，外加正文翻页上限常量 MAX_CONTENT_PAGES（41-M1.1：阅读器正文 context 的 L1 上限复用它）；
 // admissionFetch / validateAdmissionUrl 不在此（它们在 rule-engine/admission.ts 且不导出）。
-import { validateSourceUrl } from '@/lib/source-policy';
+import { upgradeSourceTemplateUrl, validateSourceUrl } from '@/lib/source-policy';
 import {
   MAX_SOURCE_CHAPTERS, sourceSearchUrl, type SourceBookIdentity, type SourceChapter,
 } from '@/lib/source-parser';
@@ -44,10 +44,15 @@ function evaluateText(
   return ir ? evaluateField(ir, scope, multi) : '';
 }
 
-/** 相对→绝对化 + 过运行时 host 门（§3.2/§6.1）；不合法返回 undefined（丢弃，不猜测）。 */
+/**
+ * 相对→绝对化 + 过运行时 host 门（§3.2/§6.1）；不合法返回 undefined（丢弃，不猜测）。
+ * 值来自页面抽出的链接（详情页 tocUrl、目录章节/翻页、正文翻页），也可能是规则里写死的
+ * 绝对 URL；其中写死 `http://` 的先升 https（host/端口/路径不变，41-urlfix），再过同一把锁；
+ * 因此放行的 host 集合与判据完全不变，只是不让「同 host 只是写错 scheme」白白丢候选。
+ */
 function absoluteUrl(value: string, base: string): string | undefined {
   if (!value) return undefined;
-  try { return validateSourceUrl(value, base).href; } catch { return undefined; }
+  try { return validateSourceUrl(upgradeSourceTemplateUrl(value), base).href; } catch { return undefined; }
 }
 
 /** ruleSearch.bookList → 逐条 name/author/bookUrl；身份判定不在这里（§7.1）。 */
@@ -98,11 +103,19 @@ export async function engineFetchDetail(
 export async function engineFetchToc(
   source: EngineSource, tocUrl: string, context: SourceRequestContext, strict = false,
 ): Promise<EngineTocResult> {
-  const chapters: SourceChapter[] = [];
-  const seenUrls = new Set<string>();
+  // 原始顺序（含重复）先全收，最后统一去重（41-ctocfu §5）。去重口径对齐 legado **净效果**：
+  // BookChapterList.kt:114-124 先 `chapterList.reverse()` → `LinkedHashSet`（保留反转后的首次出现）
+  // → 再按 `book.getReverseToc()`（默认 false，Book.kt:394）reverse 回来；同 url 的章节因此**保留
+  // 最后一次出现**，位置也落在最后一次出现处。旧实现保留首次出现、位置落在首次出现处——章节数相同
+  // 但顺序不同（docs/legado-semantics/E1 说的「同结果」只覆盖计数与 1 章书退化场景）。
+  // 去重键是 url：BookChapter.kt:87-91 的 equals/hashCode 只比 url。
+  // kxdu.net 形态（页面顶部「最新章节」9 条在目录末尾原样重列）正是靠这条把头部区块挤到末尾，
+  // 让「第一章」回到首位；无重复的页面下该变换是恒等，逐字节不变。
+  const entries: SourceChapter[] = [];
+  const seenUrls = new Set<string>(); // 唯一章节计数（页数/总量上限），与最终去重顺序无关
   const visited = new Set<string>();
   let next = absoluteUrl(tocUrl, source.url);
-  for (let pageIndex = 0; next && pageIndex < MAX_TOC_PAGES && chapters.length <= MAX_SOURCE_CHAPTERS; pageIndex += 1) {
+  for (let pageIndex = 0; next && pageIndex < MAX_TOC_PAGES && seenUrls.size <= MAX_SOURCE_CHAPTERS; pageIndex += 1) {
     if (visited.has(next)) { if (strict) throw new Error('pagination_cycle'); break; }
     visited.add(next);
     const page = await context.page(next);
@@ -124,10 +137,9 @@ export async function engineFetchToc(
         if (strict && (!title || title.length > MAX_TITLE_LENGTH || !chapterUrl || !rawUrl.trim())) throw new Error('invalid_chapter');
         if (!title || title.length > MAX_TITLE_LENGTH || !chapterUrl) continue;
         validChapters += 1;
-        if (seenUrls.has(chapterUrl)) continue;
         seenUrls.add(chapterUrl);
-        chapters.push({ url: chapterUrl, title });
-        if (chapters.length > MAX_SOURCE_CHAPTERS) break;
+        entries.push({ url: chapterUrl, title });
+        if (seenUrls.size > MAX_SOURCE_CHAPTERS) break;
       }
     }
     if (strict && validChapters === 0) throw new Error('empty_toc_page');
@@ -136,8 +148,11 @@ export async function engineFetchToc(
     next = absoluteUrl(rawNext, page.url);
     if (strict && rawNext.trim() && !next) throw new Error('invalid_next_page');
   }
-  if (strict && (next || chapters.length > MAX_SOURCE_CHAPTERS)) throw new Error('toc_limit');
-  return { chapters };
+  if (strict && (next || seenUrls.size > MAX_SOURCE_CHAPTERS)) throw new Error('toc_limit');
+  // 保留每个 url 的**最后一次**出现。最后一次出现的位置严格递增，故按原序过滤即得 legado 净顺序。
+  const lastIndex = new Map<string, number>();
+  entries.forEach((chapter, index) => lastIndex.set(chapter.url, index));
+  return { chapters: entries.filter((chapter, index) => lastIndex.get(chapter.url) === index) };
 }
 
 /**
@@ -157,9 +172,13 @@ function pageIdentity(url: string): string {
  * nextChapterUrl（41-PAGEFIX，legado BookContent.analyzeContent 同款判据）：「下一页」解析后等于下一章
  * ⇒ 本章结束，不请求那一页。每章一页的站点（如 cuoceng 的 #linkNext）「下一页」就是下一章，缺这条判据会一路
  * 翻进后续章节。不传时判据不生效，行为与改前逐字节相同。
+ * 传数组（lblqual41）= 一组停止地址，下一页命中其中任一即停：站点「下一章」链的顺序可能与目录顺序不同
+ * （cuoceng《鬼吹灯》第 0 章的下一章是目录第 3 章），只给目录里的下一章拦不住，调用方可以把整本目录都传进来。
+ * 本章自身地址不参与停止判断（整本目录必然含本章；自指翻页仍按 visited/strict 的环检测处理）。
  */
 export async function engineFetchContent(
-  source: EngineSource, chapterUrl: string, context: SourceRequestContext, strict = false, nextChapterUrl?: string,
+  source: EngineSource, chapterUrl: string, context: SourceRequestContext, strict = false,
+  nextChapterUrl?: string | readonly string[],
 ): Promise<EngineContentResult> {
   const parts: string[] = [];
   const visited = new Set<string>();
@@ -167,8 +186,15 @@ export async function engineFetchContent(
   const convertContent = contentNeedsHtmlToText(contentField);
   let next = absoluteUrl(chapterUrl, source.url);
   // 下一章按本章 URL 绝对化（legado 以本章 redirectUrl 为基址）；过不了 host 门就不设判据（退回改前行为）。
-  const stopAt = next && nextChapterUrl ? absoluteUrl(nextChapterUrl, next) : undefined;
-  const stopKey = stopAt ? pageIdentity(stopAt) : undefined;
+  const stopKeys = new Set<string>();
+  if (next) {
+    for (const url of typeof nextChapterUrl === 'string' ? [nextChapterUrl] : nextChapterUrl ?? []) {
+      const stopAt = url ? absoluteUrl(url, next) : undefined;
+      if (stopAt) stopKeys.add(pageIdentity(stopAt));
+    }
+    // 只对数组剔除本章自身（整本目录必然含本章）；单个地址保持改前语义不变。
+    if (typeof nextChapterUrl !== 'string') stopKeys.delete(pageIdentity(next));
+  }
   for (let pageIndex = 0; next && pageIndex < MAX_CONTENT_PAGES; pageIndex += 1) {
     if (visited.has(next)) { if (strict) throw new Error('pagination_cycle'); break; }
     visited.add(next);
@@ -189,7 +215,7 @@ export async function engineFetchContent(
     next = absoluteUrl(rawNext, page.url);
     if (strict && rawNext.trim() && !next) throw new Error('invalid_next_page');
     // 放在 invalid_next_page 之后：命中下一章不是非法链接；置空 next 让循环后的 content_page_limit 不误报。
-    if (next && stopKey && pageIdentity(next) === stopKey) { next = undefined; break; }
+    if (next && stopKeys.has(pageIdentity(next))) { next = undefined; break; }
   }
   if (strict && next) throw new Error('content_page_limit');
   return { text: parts.join('\n') };

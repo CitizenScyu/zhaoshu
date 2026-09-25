@@ -264,8 +264,9 @@ function ReaderSession({ session, from }: Props) {
           {/* M3 复审 P1-3:确认失败(候选建目录失败 404/422/503,或章节在新源不可读 503
               SOURCE_CHAPTER_UNAVAILABLE)时必须给一个「换个书源」的出口 —— 用户的本意是
               「我要读这本书」,某个候选失败不该把他困死在重试上。SOURCE_CHANGED 是旧实现的
-              死码(服务端已不产出,见 source-reader.ts:634 注释),不再作为条件。 */}
-          {session.kind === 'source' && (failure.status === 404 || failure.status === 422 || failure.status === 503)
+              死码(服务端已不产出,见 source-reader.ts:634 注释),不再作为条件。504(超时,含确认路径单请求超时
+              SOURCE_TIMEOUT)与 503 对齐:超时的源重试未必有用,用户要能直接换候选(confirmtocrev §8-4)。 */}
+          {session.kind === 'source' && (failure.status === 404 || failure.status === 422 || failure.status === 503 || failure.status === 504)
             && <button className={styles.tool} disabled={loading || flowing} onClick={() => showPanel('sources')}>换个书源</button>}
           {session.kind === 'source' && <Link className={styles.tool} href={`/?${new URLSearchParams({ tab: 'library', q: session.title })}`}>去书库下载全书</Link>}
         </div>
