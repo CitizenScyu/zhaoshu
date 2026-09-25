@@ -1474,6 +1474,129 @@ class TestSearchEngineAuthorFilter(unittest.TestCase):
             'book15 命中 0 本，未命中 1 本，跳过已打标 0 本（斗破苍穹）\n')
 
 
+class TestSearchEngineAlternates(unittest.TestCase):
+    """giveup41：主候选之外的合格候选作为换源备选（同一套判据、静默、有上限）。"""
+
+    def test_alternates_follow_same_filters_and_order(self):
+        cli = FakeEngineCli({'search': _proc(0, _engine_search_stdout([
+            {'source': 'book15.net', 'title': '斗破苍穹', 'author': '',
+             'bookUrl': 'https://book15.net/books/details1.html'},             # book15 跳过
+            {'source': 's0.example', 'title': '斗破苍穹', 'author': '天蚕土豆',
+             'bookUrl': 'https://s0.example/b'},                                # 主候选
+            {'source': 's1.example', 'title': '斗破苍穹', 'author': '',
+             'bookUrl': 'https://s1.example/b'},                                # 作者未知：排后
+            {'source': 's2.example', 'title': '斗破苍穹', 'author': '别人',
+             'bookUrl': 'https://s2.example/b'},                                # 作者错配：不收
+            {'source': 's3.example', 'title': '斗破苍穹', 'author': '天蚕土豆',
+             'bookUrl': 'http://s3.example/b'},                                 # 非 HTTPS：不收
+            {'source': 's4.example', 'title': '一切从斗破苍穹开始', 'author': '天蚕土豆',
+             'bookUrl': 'https://s4.example/b'},                                # 标题不兼容：不收
+            {'source': 's5.example', 'title': '斗破苍穹', 'author': '天蚕土豆',
+             'bookUrl': 'https://s5.example/b'},                                # 已验证：排前
+            {'source': 's0.example', 'title': '斗破苍穹', 'author': '天蚕土豆',
+             'bookUrl': 'https://s0.example/b'},                                # 与主候选重复
+        ]))})
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            hit = douban_list.search_engine(cli, '斗破苍穹', '天蚕土豆')
+        self.assertEqual(hit['url'], 'https://s0.example/b')
+        self.assertEqual([a['url'] for a in hit['alternates']],
+                         ['https://s5.example/b', 'https://s1.example/b'])
+        self.assertEqual(hit['alternates'][0],
+                         {'url': 'https://s5.example/b', 'title': '斗破苍穹', 'source': 's5.example'})
+        # 静默：备选收集不新增打印（主候选命中即返回，后面的错配/非 HTTPS 行不打印，同改前）
+        self.assertEqual(buf.getvalue(), '')
+
+    def test_fallback_primary_also_gets_alternates(self):
+        cli = FakeEngineCli({'search': _proc(0, _engine_search_stdout([
+            {'source': 's1.example', 'title': '斗破苍穹', 'author': '',
+             'bookUrl': 'https://s1.example/b'},
+            {'source': 's2.example', 'title': '斗破苍穹', 'author': '',
+             'bookUrl': 'https://s2.example/b'},
+        ]))})
+        with contextlib.redirect_stdout(io.StringIO()):
+            hit = douban_list.search_engine(cli, '斗破苍穹', '天蚕土豆')
+        self.assertEqual(hit['url'], 'https://s1.example/b')
+        self.assertEqual([a['url'] for a in hit['alternates']], ['https://s2.example/b'])
+
+    def test_alternates_are_capped(self):
+        cli = FakeEngineCli({'search': _proc(0, _engine_search_stdout([
+            {'source': f's{i}.example', 'title': '剑来', 'author': '',
+             'bookUrl': f'https://s{i}.example/b'} for i in range(10)]))})
+        hit = douban_list.search_engine(cli, '剑来')
+        self.assertEqual(len(hit['alternates']), douban_list.ENGINE_MAX_ALTERNATES)
+
+    def test_queue_entry_carries_alternates(self):
+        no_wait(self)
+        cli = FakeEngineCli({'search': _proc(0, _engine_search_stdout([
+            {'source': 's1.example', 'title': '斗破苍穹', 'author': '天蚕土豆',
+             'bookUrl': 'https://s1.example/b'},
+            {'source': 's2.example', 'title': '斗破苍穹', 'author': '天蚕土豆',
+             'bookUrl': 'https://s2.example/b'},
+        ]))})
+        with contextlib.redirect_stdout(io.StringIO()):
+            queue = douban_list._resolve_candidates(
+                [{'title': '斗破苍穹', 'author': '天蚕土豆'}],
+                lambda url: NO_RESULT_HTML, engine_cli=cli)
+        self.assertEqual(queue[0]['source_host'], 's1.example')
+        self.assertEqual(queue[0]['engine_alternates'],
+                         [{'url': 'https://s2.example/b', 'title': '斗破苍穹', 'source': 's2.example'}])
+
+    def test_single_candidate_has_no_alternates_key(self):
+        no_wait(self)
+        cli = FakeEngineCli({'search': _proc(0, _engine_search_stdout([
+            {'source': 's1.example', 'title': '斗破苍穹', 'author': '天蚕土豆',
+             'bookUrl': 'https://s1.example/b'}]))})
+        with contextlib.redirect_stdout(io.StringIO()):
+            queue = douban_list._resolve_candidates(
+                [{'title': '斗破苍穹', 'author': '天蚕土豆'}],
+                lambda url: NO_RESULT_HTML, engine_cli=cli)
+        self.assertNotIn('engine_alternates', queue[0])
+
+    # ---- 追平 master（authfix41）后：备选的作者口径与主候选一致 ----
+    def test_alternates_use_author_matches(self):
+        # 主候选放过的结构差（R2 分段/R4 外文末节）备选侧同样放过；真不同人仍排除
+        cli = FakeEngineCli({'search': _proc(0, _engine_search_stdout([
+            {'source': 's0.example', 'title': '冰与火之歌', 'author': '[美]乔治·R.R.马丁',
+             'bookUrl': 'https://s0.example/b'},
+            {'source': 's1.example', 'title': '冰与火之歌', 'author': '马丁',
+             'bookUrl': 'https://s1.example/b'},
+            {'source': 's2.example', 'title': '冰与火之歌', 'author': '马丁新',
+             'bookUrl': 'https://s2.example/b'},
+        ]))})
+        with contextlib.redirect_stdout(io.StringIO()):
+            hit = douban_list.search_engine(cli, '冰与火之歌', '[美]乔治·R.R.马丁')
+        self.assertEqual(hit['url'], 'https://s0.example/b')
+        self.assertEqual([a['url'] for a in hit['alternates']], ['https://s1.example/b'])
+
+    def test_no_list_author_ambiguous_yields_no_hit_and_no_alternates(self):
+        # 名单无作者 + 兼容候选作者两两不相容 → _pick_author_unknown 判歧义：主候选与备选都没有
+        cli = FakeEngineCli({'search': _proc(0, _engine_search_stdout([
+            {'source': 's0.example', 'title': '偷偷藏不住', 'author': '竹已',
+             'bookUrl': 'https://s0.example/b'},
+            {'source': 's1.example', 'title': '偷偷藏不住', 'author': '旺仔',
+             'bookUrl': 'https://s1.example/b'},
+        ]))})
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertIsNone(douban_list.search_engine(cli, '偷偷藏不住'))
+        self.assertIn('作者歧义跳过', out.getvalue())
+
+    def test_no_list_author_consistent_candidates_become_alternates(self):
+        # 名单无作者、作者相容：主候选取作者已知的；其余（作者已知在前、作者空在后）作备选
+        cli = FakeEngineCli({'search': _proc(0, _engine_search_stdout([
+            {'source': 's0.example', 'title': '偷偷藏不住', 'author': '',
+             'bookUrl': 'https://s0.example/b'},
+            {'source': 's1.example', 'title': '偷偷藏不住', 'author': '竹已',
+             'bookUrl': 'https://s1.example/b'},
+            {'source': 's2.example', 'title': '偷偷藏不住', 'author': '竹已著',
+             'bookUrl': 'https://s2.example/b'},
+        ]))})
+        hit = douban_list.search_engine(cli, '偷偷藏不住')
+        self.assertEqual(hit['url'], 'https://s1.example/b')
+        self.assertEqual([a['url'] for a in hit['alternates']],
+                         ['https://s2.example/b', 'https://s0.example/b'])
+
+
 # ---- authfix41：作者比对补结构差规则（样例全部取自 phoenix gate.log round 1 原样，authmis41）----
 class TestAuthorMatches(unittest.TestCase):
     """author_matches(名单作者, 引擎作者)：归一化严格相等 + R2 分段/角色 + R3 剥括号 + R4 外文末节。"""

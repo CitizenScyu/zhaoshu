@@ -1,5 +1,7 @@
 import { beforeAll, describe, expect, it } from 'vitest';
 import { loadPGlite, type PGliteLike } from '@/lib/fixtures/pglite';
+import { createPGliteSql } from '@/lib/fixtures/pglite-sql';
+import { createProductionSchema } from '@/lib/fixtures/production-schema';
 
 // 真实 PostgreSQL（WASM）：LIKE 转义修复（P2-2）的语义验证。
 //
@@ -18,19 +20,7 @@ maybe('真实 PostgreSQL：书库搜索 LIKE 转义', () => {
 
   beforeAll(async () => {
     pg = new PGliteCtor!();
-    await pg.exec(`
-      CREATE TABLE labeled_books (
-        id serial PRIMARY KEY,
-        title text NOT NULL,
-        author text NOT NULL DEFAULT '',
-        category text NOT NULL DEFAULT '',
-        finish_status text NOT NULL DEFAULT '',
-        chars_labeled bigint NOT NULL DEFAULT 0,
-        labels jsonb NOT NULL DEFAULT '{}',
-        labeled_at timestamptz NOT NULL DEFAULT now(),
-        primary_genre text NOT NULL DEFAULT '',
-        quality float8
-      )`);
+    await createProductionSchema(createPGliteSql(pg) as never, statement => pg.exec(statement));
     // 一组刻意设计的行：字面含 % 的、含 _ 的、以及会被未转义通配符误命中的。
     await pg.exec(`
       INSERT INTO labeled_books (title, author, labels) VALUES

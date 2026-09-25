@@ -61,6 +61,26 @@ Remove-Item Env:PROD_DATABASE_URL
   分支 / 时间点恢复），不要手工删表或删 `auth_schema_migrations` 记账行——旧版本应用在库新代码旧时仍能服务（闸门单向），
   通常向前修复比恢复更安全。
 
+## 从零重建（全新空库，不连接生产）
+
+先用隔离的空 PostgreSQL 测试库演练；上线时由运维改用已备份、经核对的目标库，不能把生产连接塞进 `TEST_DATABASE_URL`。以下命令都在仓库根目录运行，脚本不会自动加载 `.env*`：
+
+```powershell
+$env:DR_DATABASE_URL = '<隔离空库连接串>'
+# 第一步：确认目标 host 和零业务表；dry-run 不写库。
+npm run db:check:prod -- --database-url-env=DR_DATABASE_URL
+npm run db:migrate:prod -- --database-url-env=DR_DATABASE_URL
+# 第二步：先创建 0001–0003，auth 暂为 v4；随后单独升级 auth 到 v7。
+npm run db:migrate:prod -- --database-url-env=DR_DATABASE_URL --apply
+npm run migrate:auth:prod -- --database-url-env=DR_DATABASE_URL --dry-run
+npm run migrate:auth:prod -- --database-url-env=DR_DATABASE_URL --yes-i-mean-production
+# 第三步：业务迁移、auth 版本与必需表都通过只读复核。
+npm run db:check:prod -- --database-url-env=DR_DATABASE_URL
+Remove-Item Env:DR_DATABASE_URL
+```
+
+然后按 `.env.local.example` 的分组配置新的部署环境（密码与连接串只写入部署平台的私密配置，不写入仓库），运行 `npm run check:deploy` 核对样例键名覆盖，再部署应用；确认健康请求放行、owner 登录和负向权限生效后再开启流量。上述第二步不能倒序：auth 入口先运行会创建业务表，使空库迁移器拒绝未记账的既存库。`src/lib/runtime-tables-migration.pglite.test.ts` 在隔离 PGlite 真库验证 v4 闸门拒绝、升级 v7 后放行；如果迁移失败，先核对错误并用事前整库备份/分支恢复，不手工删记账行。
+
 ## 当前行为与开关
 
 A04 迁移画像、找书、反馈、推荐、书架、统计与导出的全部 HTTP 方法到 `requirePermission(req, 'find')`。归属只使用服务端 principal.userId；owner 也只访问 userId=1 的个人记录。账号模式关闭时，旧 owner 头认证仍兼容，`/api/owner` 保持零数据库验证，业务查询仍按 userId=1 过滤。
