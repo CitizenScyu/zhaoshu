@@ -55,6 +55,19 @@ export function isDbQuotaResponse(status: number, body: unknown): boolean {
     && (body as { code?: unknown }).code === DB_QUOTA_ERROR_CODE;
 }
 
+const CLIENT_RETRY_MIN_MS = 30_000;
+const CLIENT_RETRY_MAX_MS = 30 * 60_000;
+
+/**
+ * 前端：配额 503 之后多久再探一次。取响应 Retry-After（秒数形态）；缺失/非法/HTTP-date 形态用服务端
+ * 默认冷却；夹到 [30s, 30min]——下限不比正常轮询更密，上限保证额度恢复后最多半小时跟上。
+ */
+export function quotaRetryDelayMs(retryAfter: string | null): number {
+  const seconds = retryAfter !== null && /^\d+$/.test(retryAfter.trim()) ? Number(retryAfter.trim()) : Number.NaN;
+  const ms = Number.isSafeInteger(seconds) ? seconds * 1000 : DEFAULT_DB_QUOTA_BACKOFF_MS;
+  return Math.min(CLIENT_RETRY_MAX_MS, Math.max(CLIENT_RETRY_MIN_MS, ms));
+}
+
 /** env DB_QUOTA_BACKOFF_MS（毫秒）；缺省/非法回落 30 分钟，夹到 [60s, 4h]。 */
 export function dbQuotaBackoffMs(env: Record<string, string | undefined> = process.env): number {
   const raw = env.DB_QUOTA_BACKOFF_MS;

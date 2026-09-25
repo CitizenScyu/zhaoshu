@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { neon, neonConfig, NeonDbError } from '@neondatabase/serverless';
 import {
   createDbQuotaLatch, DB_QUOTA_ERROR_CODE, DB_QUOTA_HEALTH_ROW, DbQuotaExceededError,
-  dbQuotaBackoffMs, DEFAULT_DB_QUOTA_BACKOFF_MS, isDbQuotaError, isDbQuotaResponse, recordDbQuotaSeen,
+  dbQuotaBackoffMs, DEFAULT_DB_QUOTA_BACKOFF_MS, isDbQuotaError, isDbQuotaResponse, quotaRetryDelayMs, recordDbQuotaSeen,
 } from './db-quota';
 
 // 生产 2026-09-25 实测的 402 响应体（dbquota-41-report §1.2；中间字段省略处按原样保留省略）。
@@ -163,5 +163,17 @@ describe('isDbQuotaResponse（前端停轮询判据）', () => {
     expect(isDbQuotaResponse(503, { code: 'STATS_UNAVAILABLE' })).toBe(false);
     expect(isDbQuotaResponse(503, null)).toBe(false);
     expect(isDbQuotaResponse(503, 'DB_QUOTA_EXCEEDED')).toBe(false);
+  });
+});
+
+describe('quotaRetryDelayMs（前端再探间隔）', () => {
+  it('取 Retry-After 秒数；缺失/非法/HTTP-date 用服务端默认冷却；夹到 [30s, 30min]', () => {
+    expect(quotaRetryDelayMs('120')).toBe(120_000);
+    expect(quotaRetryDelayMs(' 600 ')).toBe(600_000);
+    expect(quotaRetryDelayMs(null)).toBe(DEFAULT_DB_QUOTA_BACKOFF_MS);
+    expect(quotaRetryDelayMs('abc')).toBe(DEFAULT_DB_QUOTA_BACKOFF_MS);
+    expect(quotaRetryDelayMs('Wed, 21 Oct 2026 07:28:00 GMT')).toBe(DEFAULT_DB_QUOTA_BACKOFF_MS);
+    expect(quotaRetryDelayMs('5')).toBe(30_000);
+    expect(quotaRetryDelayMs('14400')).toBe(30 * 60_000); // 服务端上限 4h 也不让前端等超过 30 分钟
   });
 });

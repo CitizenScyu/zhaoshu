@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useRef, useState, type Dispatch, type SetStateAction } from 'react';
 import { useOwner } from '@/components/OwnerProvider';
 import ReadBookLink from '@/components/ReadBookLink';
-import { isDbQuotaResponse } from '@/lib/db-quota';
+import { isDbQuotaResponse, quotaRetryDelayMs } from '@/lib/db-quota';
 
 interface LibraryBook {
   id: number;
@@ -301,11 +301,22 @@ export default function LibraryTab({ view, setView }: {
 
   // 轮询 30 秒一次；页面不可见（切后台标签页）时暂停，省掉无谓的库往返（Neon 按传输量计费），
   // 回到前台立即拉一次再恢复计时。挂载时若页面可见也立即拉一次，不干等首个间隔。
+  // 数据库额度耗尽（503 DB_QUOTA_EXCEEDED）时停掉 30 秒轮询，按 Retry-After（≤30 分钟）只再探一次；
+  // 再探非配额即恢复正常轮询，仍是配额就继续等。后台时不探，回前台立即探。
   useEffect(() => {
     if (pollTaskId === null) return;
     let stale = false;
     let timer: ReturnType<typeof setInterval> | null = null;
+    let quotaRetry: ReturnType<typeof setTimeout> | null = null;
+    let quotaPaused = false;
+    let quotaDelayMs = 0;
     const controller = new AbortController();
+    const clearQuotaRetry = () => { if (quotaRetry !== null) { clearTimeout(quotaRetry); quotaRetry = null; } };
+    const scheduleQuotaRetry = () => {
+      clearQuotaRetry();
+      if (stale || document.hidden) return; // 后台不探：onVisibility 回前台时立即探
+      quotaRetry = setTimeout(() => { quotaRetry = null; poll(); }, quotaDelayMs);
+    };
     const poll = () => {
       if (controller.signal.aborted) return;
       const my = dlRequestId.current;
@@ -313,20 +324,30 @@ export default function LibraryTab({ view, setView }: {
         try {
           const res = await apiFetch(`/api/download?id=${pollTaskId}`, { signal: controller.signal });
           const data = await res.json();
+          if (stale) return;
           if (isDbQuotaResponse(res.status, data)) {
-            // 数据库额度耗尽（服务端 503 DB_QUOTA_EXCEEDED）：再 10 秒一打只会继续失败，停掉本轮轮询。
             stop();
-            if (!stale && my === dlRequestId.current) setDlMessage('数据库额度已用尽，下载进度暂停刷新，请稍后再来查看。');
+            quotaPaused = true;
+            quotaDelayMs = quotaRetryDelayMs(res.headers.get('Retry-After'));
+            if (my === dlRequestId.current) setDlMessage('数据库额度已用尽，下载进度暂停刷新，稍后会自动重试。');
+            scheduleQuotaRetry();
             return;
+          }
+          if (quotaPaused) {
+            // 额度恢复：清掉提示、回到正常 30 秒节奏。
+            quotaPaused = false;
+            if (my === dlRequestId.current) setDlMessage('');
+            if (!document.hidden) start();
           }
           if (!res.ok) throw new Error(data.error || '查询下载进度失败');
           const next = parseTask(data);
-          if (!stale && my === dlRequestId.current && next !== null) {
+          if (my === dlRequestId.current && next !== null) {
             updateTask(next);
             if (next.status === 'done' || next.status === 'failed') setDlMessage('');
           }
         } catch {
-          // 单次失败不打断轮询
+          // 单次失败不打断轮询；配额暂停中的再探若网络失败，按同一间隔再排一次。
+          if (quotaPaused) scheduleQuotaRetry();
         }
       })();
     };
@@ -335,9 +356,10 @@ export default function LibraryTab({ view, setView }: {
     const onVisibility = () => {
       if (document.hidden) {
         stop();
+        clearQuotaRetry();
       } else {
         poll();
-        start();
+        if (!quotaPaused) start(); // 配额暂停中：这次 poll 就是再探，结果决定恢复还是继续等
       }
     };
     if (!document.hidden) {
@@ -349,6 +371,7 @@ export default function LibraryTab({ view, setView }: {
       stale = true;
       controller.abort();
       stop();
+      clearQuotaRetry();
       document.removeEventListener('visibilitychange', onVisibility);
     };
   }, [pollTaskId, apiFetch, updateTask]);
