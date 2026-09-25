@@ -21,8 +21,10 @@ name: Source health probe
 
 on:
   schedule:
-    # 健康端点要小时级发现，不必按 cron 的计划点对齐；错开整点避开平台高峰。
-    - cron: '17 * * * *'
+    # 健康端点不必按 cron 的计划点对齐；错开整点避开平台高峰。
+    # xfer41：每小时 → 每 3 小时。每次探测都会在冷实例上合成一遍源池（读库），Neon 免费档传输额度
+    # 09-25 被打爆；告警阈值是 26h，晚最多 3h 发现对「每日 cron 停摆」这类故障可接受。
+    - cron: '17 */3 * * *'
   workflow_dispatch:
 
 permissions:

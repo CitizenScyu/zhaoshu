@@ -19,5 +19,8 @@ export default defineConfig({
   test: {
     include: ['src/**/*.test.ts', 'src/**/*.test.tsx', 'scripts/**/*.test.ts', 'runtime-download/**/*.test.ts'],
     environment: 'node',
+    // 池合成读缓存（shuyuan.ts cachedRead）在单测里默认关闭：各用例按调用顺序/SQL 文本喂 mock 行，
+    // 模块级缓存会让前一用例的行串到后一用例。专测缓存的用例自行 stubEnv 打开并 invalidateShuyuanReadCache()。
+    env: { SHUYUAN_READ_CACHE_TTL_MS: '0' },
   },
 });

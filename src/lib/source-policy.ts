@@ -33,6 +33,11 @@ export function refreshSupportedHosts(hosts: Iterable<string>): void {
   supportedHosts = next;
 }
 
+/** 当前运行时 host 门的只读快照（字典序）。供 DB 读投影按门预筛（shuyuan.ts poolProbeMeta），不改门。 */
+export function supportedHostList(): string[] {
+  return [...supportedHosts].sort();
+}
+
 // 同站备用 host：输入集合内的 host 时返回另一个，否则 null（无备用可换）。
 // 这里的 length 守卫不是「常量恒为 2 所以永假」的装饰：SUPPORTED_SOURCE_HOSTS 是
 // as const 二元组（apex ↔ www 同站别名），但「返回另一个」的 `1 - index` 只在集合恰为

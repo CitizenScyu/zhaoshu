@@ -1,7 +1,7 @@
 import { getSql } from '@/lib/db';
 import { isRecord } from '@/lib/sanitize';
 import { createDeadline, raceDeadline, type RequestDeadline } from '@/lib/deadline';
-import { validateSourceUrl, refreshSupportedHosts } from '@/lib/source-policy';
+import { validateSourceUrl, refreshSupportedHosts, supportedHostList } from '@/lib/source-policy';
 import {
   builtinFallbackSource, builtinUrlPrefixes, engineHosts, type SupportedSourceTier,
 } from '@/lib/supported-sources';
@@ -11,6 +11,7 @@ import {
   type AdmissionCandidate, type AdmissionSourceRow,
 } from '@/lib/rule-engine/admission';
 import { selectCandidates, type RawSource } from '@/lib/rule-engine/compile-smoke';
+import { DEFAULT_SHUYUAN_READ_CACHE_TTL_MS, shuyuanReadCacheTtlMs } from '@/lib/read-cache-ttl';
 import {
   FILTER_COUNT_KEYS, SOURCE_PAGE_SIZE, offsetFor, pageCount,
   type ShuyuanAvailability, type ShuyuanSourceFilter,
@@ -247,7 +248,7 @@ async function eligibleReadingSources(signal: AbortSignal, includeEngine: boolea
   // 这条「刷门必须排在 readMeta 之前」的不变量在**刷新路径**同样成立（且更严重）：refreshWithinBudget
   // 的 readMeta 与探测入队都用 canProbe，冷启动不先刷门会把整批引擎源静默滤出探测队列，见该处注释。
   const engineOk = includeEngine ? await refreshEngineHostGate(signal) : false;
-  const { states } = readMeta((await storedMeta(s, signal)).collections);
+  const { states } = readMeta((await poolProbeMeta(s, signal)).collections);
   const builtin = await builtinReadingSources(s, states, signal);
   const engine = engineOk ? await engineSourcesIncremental(s, states, signal) : [];
   return [...builtin, ...engine];
@@ -383,9 +384,18 @@ async function engineSourcesIncremental(
  * （既有集合原样保留，fail-closed：收窄到内建，绝不放大、绝不空集），且本次池降级为 builtin-only。
  * 绝不让 getReadingPool 抛错（零回归红线）。
  */
-async function refreshEngineHostGate(signal: AbortSignal): Promise<boolean> {
+async function refreshEngineHostGate(signal: AbortSignal, fresh = false): Promise<boolean> {
   try {
-    refreshSupportedHosts(await engineHosts(signal));
+    // xfer41：池合成路径走读缓存（TTL 内复用上次的 host 集合，仍每次重刷门——幂等、零 DB）；
+    // 刷新路径传 fresh=true 直读，探测入队要用最新准入态。
+    if (fresh) {
+      refreshSupportedHosts(await engineHosts(signal));
+      return true;
+    }
+    // 41-xferfix B1：门被缓存之外改过则先作废缓存（见 syncReadCacheWithGate），再按缓存 host 集刷门并记下快照。
+    syncReadCacheWithGate();
+    refreshSupportedHosts(await cachedRead('engineHosts', signal, (sig) => engineHosts(sig)));
+    gateFromCache = supportedHostList().join(',');
     return true;
   } catch (error) {
     signal.throwIfAborted();
@@ -401,13 +411,13 @@ async function builtinReadingSources(
   s: Sql, states: Map<string, ProbeState>, signal: AbortSignal,
 ): Promise<ReadingSource[]> {
   const patterns = builtinUrlPrefixes().map((prefix) => `${prefix}%`);
-  const rows = await readRows<StoredSource & { name: string }>(s, s`
+  const rows = await cachedRead('builtinRows', signal, (sig) => readRows<StoredSource & { name: string }>(s, s`
     SELECT source_url, name, source, disabled_at::text AS disabled_at, last_error
     FROM shuyuan_sources
     WHERE EXISTS (
       SELECT 1 FROM jsonb_array_elements_text(${JSON.stringify(patterns)}::jsonb) AS p(pattern)
       WHERE source_url ILIKE p.pattern)
-    ORDER BY source_url`, signal);
+    ORDER BY source_url`, sig));
   const supported = rows.filter((row) => canProbe(row.source_url));
   const fallback = builtinFallbackSource();
   // The same built-in adapter as the download worker, only when the collection
@@ -449,13 +459,14 @@ function checkedAtMs(value: string | null): number {
 async function engineReadingSources(
   s: Sql, states: Map<string, ProbeState>, signal: AbortSignal,
 ): Promise<ReadingSource[]> {
-  const rows = await readRows<StoredSource & { name: string; tier: string; search_checked_at: string | null }>(s, s`
+  const rows = await cachedRead('engineRows', signal, (sig) => readRows<
+    StoredSource & { name: string; tier: string; search_checked_at: string | null }>(s, s`
     SELECT src.source_url, src.name, src.source, src.disabled_at::text AS disabled_at, src.last_error,
            a.tier, a.search_checked_at::text AS search_checked_at
     FROM shuyuan_sources src
     JOIN source_admission a ON a.source_url = src.source_url
     WHERE a.compile_ok AND a.search_ok IS TRUE
-    ORDER BY src.source_url`, signal);
+    ORDER BY src.source_url`, sig));
   return rows
     .filter((row) => canProbe(row.source_url) && !row.disabled_at && isRecord(row.source)
       && row.source.enabled !== false && states.get(row.source_url)?.status !== 'failed')
@@ -479,7 +490,8 @@ function hostOfUrl(url: string): string {
 /** 引擎档候选（设计 §5.2 的新增导出；M2-3 的放量/排序在此扩面）。 */
 export async function getEngineSources(signal: AbortSignal): Promise<ReadingSource[]> {
   const s = getSql();
-  const { states } = readMeta((await storedMeta(s, signal)).collections);
+  syncReadCacheWithGate(); // 调用方（download-source）常先按鲜读刷门再来取池
+  const { states } = readMeta((await poolProbeMeta(s, signal)).collections);
   return engineReadingSources(s, states, signal);
 }
 
@@ -664,6 +676,109 @@ async function storedMeta(s: Sql, signal?: AbortSignal): Promise<MetaRow> {
   return rows[0] ?? { collections: [], refreshed_at: null };
 }
 
+// —— 池合成读缓存（xfer41：Neon 免费档 5 GB/月传输额度 09-25 耗尽，头号大户就是池合成重复读库）——
+// 在线阅读每章、换源面板每个 probe、health/stats、engine-fetch 每个子命令都会重新合成一次源池：
+// engineHosts + 探测快照 + builtin 行 + 引擎行（含整份规则 JSON），改前单次 ≈270–350 KB。
+// 这里对这四次**只读**查询做进程内 TTL 缓存（缓存的是 DB 行，入池判定/排序每次照常在 JS 里重算）。
+//
+// TTL 默认 300s（env SHUYUAN_READ_CACHE_TTL_MS；0 = 关闭；非法值回落默认；上限 3600s）。取 300s 而不是 30–60s：
+// 读者读一章通常要几分钟，60s 窗口下逐章请求几乎全部落空；而池数据本身一天只变一次（cron 刷新 + 准入批次），
+// 人工禁用/启用与 seed-admission 也都不是秒级敏感——其他实例最多晚 TTL 看到变化。本实例内的写路径
+// （refreshShuyuan 提交后、writeAdmissionRows、disable/enableShuyuanSource）一律 invalidateShuyuanReadCache()，
+// 本实例读己之写不受 TTL 影响。
+//
+// 语义：
+// - 同键并发共用一次加载（single-flight）：换源面板一次 13 个请求落到同一实例时只读一次库。
+// - 加载用独立的超时信号，不绑定首个调用方的请求信号——否则首个调用方断开会让同批等待者一起失败；
+//   每个调用方用自己的 signal 经 raceDeadline 等结果，中止语义对调用方不变。
+// - 失败（reject）不入缓存，下个请求重读；降级分支（engineSourcesIncremental 吞错返回空集）发生在缓存之外，
+//   同样不会被缓存成「空引擎池」。
+// - 刷新路径（refreshWithinBudget 的 storedMeta / fresh host 门）与后台统计（getShuyuanStats/Counts）不走缓存：
+//   前者要拿最新 refreshed_at 做乐观并发守卫，后者是管理面、读己之写优先。
+export { DEFAULT_SHUYUAN_READ_CACHE_TTL_MS, shuyuanReadCacheTtlMs };
+const READ_CACHE_LOAD_TIMEOUT_MS = 20_000;
+// 41-xferfix N2：条目硬上限。固定键只有 3 个，poolProbeMeta 按门分键（门变化通常伴随整体作废，见
+// syncReadCacheWithGate；但引擎开关关闭时不经该同步）——代码层兜底，超限按插入序淘汰最旧一条。
+const READ_CACHE_MAX_ENTRIES = 64;
+
+type ReadCacheEntry = { expiresAt: number; value: Promise<unknown> };
+const readCache = new Map<string, ReadCacheEntry>();
+/** 上次按缓存 engineHosts 刷出的门快照（refreshEngineHostGate 据此识别门被缓存之外改过）；null = 无。 */
+let gateFromCache: string | null = null;
+
+/** 丢弃全部池合成读缓存：本实例写路径之后调用；测试之间重置也用它。 */
+export function invalidateShuyuanReadCache(): void {
+  readCache.clear();
+  gateFromCache = null;
+}
+
+/**
+ * 41-xferfix B1：host 门是模块级全局态，缓存之外还有写入方（download-source 按鲜读 engineHosts 刷门、cron 准入尾部）。
+ * 门与上次池合成时的快照不同 ⇒ 有人读到了比缓存新的准入态：此时若沿用缓存，refreshEngineHostGate 会按旧 host 集
+ * 整集重置门（把刚放行的 host 刷掉），缓存的引擎行也缺该源。故整体作废、按库实况重读，结果与未缓存时逐项相同。
+ * 门未被外部改动时照常命中（稳态零额外读）。
+ */
+function syncReadCacheWithGate(): void {
+  const gate = supportedHostList().join(',');
+  if (gateFromCache !== null && gate !== gateFromCache) invalidateShuyuanReadCache();
+  gateFromCache = gate;
+}
+
+async function cachedRead<T>(
+  key: string, signal: AbortSignal | undefined, load: (signal: AbortSignal | undefined) => Promise<T>,
+): Promise<T> {
+  const ttl = shuyuanReadCacheTtlMs();
+  if (ttl <= 0) return load(signal);
+  signal?.throwIfAborted();
+  const now = Date.now();
+  let entry = readCache.get(key);
+  if (!entry || entry.expiresAt <= now) {
+    const created: ReadCacheEntry = { expiresAt: now + ttl, value: load(AbortSignal.timeout(READ_CACHE_LOAD_TIMEOUT_MS)) };
+    readCache.delete(key);
+    if (readCache.size >= READ_CACHE_MAX_ENTRIES) readCache.delete(readCache.keys().next().value!);
+    readCache.set(key, created);
+    created.value.catch(() => { if (readCache.get(key) === created) readCache.delete(key); });
+    entry = created;
+  }
+  const value = entry.value as Promise<T>;
+  return signal ? raceDeadline(signal, () => value) : value;
+}
+
+/**
+ * 池合成用的探测快照投影（xfer41）：只取「host 门内」源的探测条目，而不是整列 collections（≈159 KB / 1215 条）。
+ *
+ * 等价性：池路径只查 states.get(row.source_url)，且 row 先过 canProbe（= validateSourceUrl：必须 `https://` 开头、
+ * WHATWG hostname ∈ 当前 host 门）。readMeta 对非 pending 条目同样要求 canProbe，pending 条目池路径不区分。
+ * 故只要保证「候选行 URL 对应的条目全部带回」即可，SQL 里按下面的**超集**筛：
+ * - 以 `https://` 开头（大小写不敏感），且
+ * - authority 是纯 [a-z0-9.-]（可带 :443）时，其小写 host ∈ 门——此时 WHATWG hostname 恰为该小写串；
+ * - authority 含其他字符（百分号编码、非 ASCII 等 WHATWG 会改写的形态）时一律带回，交 JS 判。
+ * 同一 URL 的重复条目按同一谓词同进同出，readMeta 的「重复即作废」语义不变；条目保持原序。
+ * 门集合进缓存键：门一变（新准入 host）即换键重读，不会用旧门的投影漏掉新 host 的条目。
+ * collections 列表本身（合集 id/title/count）不带回——池路径不用；refreshed_at 照带。
+ */
+async function poolProbeMeta(s: Sql, signal?: AbortSignal): Promise<MetaRow> {
+  const hosts = supportedHostList();
+  return cachedRead(`poolProbeMeta:${hosts.join(',')}`, signal, async (sig) => {
+    const rows = await readRows<MetaRow>(s, s`
+      SELECT refreshed_at::text AS refreshed_at,
+             jsonb_build_array(jsonb_build_object('probeSnapshot', jsonb_build_object(
+               'version', collections->0->'probeSnapshot'->'version',
+               'entries', COALESCE((
+                 SELECT jsonb_agg(e.entry ORDER BY e.ord)
+                 FROM jsonb_array_elements(CASE
+                   WHEN jsonb_typeof(collections->0->'probeSnapshot'->'entries') = 'array'
+                   THEN collections->0->'probeSnapshot'->'entries' ELSE '[]'::jsonb END) WITH ORDINALITY AS e(entry, ord)
+                 WHERE lower(e.entry->>'url') ~ '^https://'
+                   AND (substring(lower(e.entry->>'url') FROM '^https://([a-z0-9.-]+)(?::443)?(?:[/?#]|$)')
+                          = ANY(ARRAY(SELECT jsonb_array_elements_text(${JSON.stringify(hosts)}::jsonb)))
+                        OR lower(e.entry->>'url') !~ '^https://[a-z0-9.-]+(?::443)?(?:[/?#]|$)')
+               ), '[]'::jsonb)))) AS collections
+      FROM shuyuan_meta WHERE id = 1`, sig);
+    return rows[0] ?? { collections: [], refreshed_at: null };
+  });
+}
+
 async function countsFromStates(s: Sql, states: Map<string, ProbeState>, signal?: AbortSignal): Promise<ShuyuanCounts> {
   const rows = await readRows<ShuyuanCounts>(s, s`
     SELECT count(*)::int AS total,
@@ -694,7 +809,10 @@ export async function getShuyuanCounts(signal?: AbortSignal): Promise<ShuyuanCou
 // admission 漏斗（source_admission 三态聚合，与入池判据同口径）。
 export async function getShuyuanPoolHealth(signal: AbortSignal): Promise<ShuyuanPoolHealth> {
   const s = getSql();
-  const raw = await storedMeta(s, signal);
+  // xfer41：这里只要 refreshed_at（「刷新停更多久」要新鲜值，不走缓存）；池本身的探测态由 getReadingPool 自取。
+  // 改前整列读 collections（≈159 KB），随后 getReadingPool 内部又整列读一遍。
+  const [raw = { refreshed_at: null }] = await readRows<{ refreshed_at: string | null }>(s, s`
+    SELECT refreshed_at::text AS refreshed_at FROM shuyuan_meta WHERE id = 1`, signal);
   const [pool, admissionRows] = await Promise.all([
     getReadingPool(signal),
     // 漏斗是纯观测的增量：source_admission 读失败（schema 未就绪/库抖动）不能连坐
@@ -807,6 +925,7 @@ export async function disableShuyuanSource(url: string, reason: string): Promise
     SET disabled_at = now(), last_error = COALESCE(NULLIF(${reason.slice(0, 200)}, ''), last_error)
     WHERE source_url = ${normalizeUrl(url)}
     RETURNING id`) as { id: number }[];
+  invalidateShuyuanReadCache();
   return rows.length > 0;
 }
 
@@ -834,6 +953,7 @@ export async function enableShuyuanSource(url: string): Promise<boolean> {
     SET disabled_at = NULL
     WHERE source_url = ${normalizeUrl(url)}
     RETURNING id`) as { id: number }[];
+  invalidateShuyuanReadCache();
   return rows.length > 0;
 }
 
@@ -944,7 +1064,7 @@ async function refreshWithinBudget(s: Sql, budget: RequestDeadline, signal: Abor
   // **持久表**（前几轮准入批次写入，写路径与运行时门无关），故此处拿到的是「上一轮已准入的 host」，
   // 不依赖本轮随后才发生的写库；读失败 fail-closed 保持既有集合（收窄到内建），退化为现状。
   // 开关关时保持与今天逐字节相同（不查准入表、不加 DB 往返），与 getReadingPool:191 一致。
-  if (engineSourcesEnabled()) await refreshEngineHostGate(signal);
+  if (engineSourcesEnabled()) await refreshEngineHostGate(signal, true);
   const oldStates = readMeta(oldMeta.collections).states;
   const states = new Map<string, ProbeState>();
   const probes: string[] = [];
@@ -1067,6 +1187,7 @@ async function refreshWithinBudget(s: Sql, budget: RequestDeadline, signal: Abor
     if (isRecord(error) && error.code === '22012') throw new Error('书源在刷新期间发生变化，本次保留原数据，请重新刷新');
     throw error;
   }
+  invalidateShuyuanReadCache();
   // M1 准入库：挂在全量替换事务**之后**（设计 §4.2 v3 E2）。事务已提交，validateAdmissionUrl
   // 读到的「源声明 host 集合」本轮即含新源；滤网 2 不在用户请求路径上跑，只在此 cron 批次。
   await runAdmissionAfterRefresh(s, rows, budget, signal);
@@ -1185,4 +1306,5 @@ export async function writeAdmissionRows(s: Sql, rows: AdmissionSourceRow[]): Pr
       search_checked_at = EXCLUDED.search_checked_at, rules_hash = EXCLUDED.rules_hash,
       engine_semantics_version = EXCLUDED.engine_semantics_version,
       host = EXCLUDED.host, error = EXCLUDED.error, compile_diagnostics = EXCLUDED.compile_diagnostics`;
+  invalidateShuyuanReadCache();
 }

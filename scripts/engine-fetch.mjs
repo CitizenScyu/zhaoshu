@@ -1,6 +1,6 @@
 // 打标线多源化 in-process 引擎 CLI（T4，A2 形态）。labeler 在 phoenix 上 shell out 到本脚本，
 // 复用 M1 引擎库（rule-engine/api.ts 门面四函数）+ book15 内建适配器（source-parser），
-// 直接取书，不走 serverless、无 55s 限制。每次进程冷启，不做跨进程状态。
+// 直接取书，不走 serverless、无 55s 限制。每次进程冷启；跨进程只共享源池文件缓存（engine-pool-cache.mjs，xfer41）。
 //
 // 用法（labeler 逐级调用；`@/` 别名靠 ts-esm-loader.mjs，故必须带 --import）：
 //   node --import ./scripts/ts-esm-loader.mjs scripts/engine-fetch.mjs search  --title "斗破苍穹" [--author "天蚕土豆"] [--no-builtin] [--skip-host <host>]… [--json]
@@ -18,6 +18,7 @@ import { resolve } from 'node:path';
 import { exitAfterFlush } from './stdio-exit.mjs';
 import { excludeSkippedSources, searchSources, SEARCH_SOURCE_SLICE_MS } from './engine-search-pool.mjs';
 import { downloadErrorKind, engineErrorKind } from './engine-error-kind.mjs';
+import { loadEnginePoolCached } from './engine-pool-cache.mjs';
 
 // CLI 层宽上限（无 serverless 限制，但仍有界防挂死）。
 const SEARCH_TIMEOUT_MS = 30_000;
@@ -129,9 +130,18 @@ function engineSourceOf(m, source) {
 
 // 引擎源池：先按 getReadingPool 的合成意图刷新运行时 host 门（否则 canProbe 会把引擎源全滤掉），
 // 再读 getEngineSources。任一步 DB 失败 ⇒ 抛出，由调用方按子命令决定降级/退 2。
+// xfer41：进程内只读一次；跨进程 TTL 内走本机文件缓存（labeler 每章一个进程，见 engine-pool-cache.mjs）。
+// 命中缓存时同样用缓存的 host 集合刷门——后续 validateSourceUrl 与改前同一口径。
+let enginePoolOnce = null;
 async function loadEnginePool(m, signal) {
-  m.policy.refreshSupportedHosts(await m.supported.engineHosts(signal));
-  return await m.shuyuan.getEngineSources(signal);
+  enginePoolOnce ??= loadEnginePoolCached(async () => {
+    const hosts = await m.supported.engineHosts(signal);
+    m.policy.refreshSupportedHosts(hosts);
+    return { hosts, sources: await m.shuyuan.getEngineSources(signal) };
+  }).catch((error) => { enginePoolOnce = null; throw error; });
+  const { hosts, sources } = await enginePoolOnce;
+  m.policy.refreshSupportedHosts(hosts);
+  return sources;
 }
 
 const hostOf = (url) => { try { return new URL(url).hostname; } catch { return ''; } };
