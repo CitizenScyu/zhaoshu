@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { getSql } from './db';
-import { getReadingSources, type ReadingSource } from './shuyuan';
+import { getReadingSources, getSourcePools, type ReadingSource, type SelectableSources } from './shuyuan';
 import { fetchSourceText, sourceAbortable, SourceHttpError, SOURCE_CONNECT_TIMEOUT_MS, SOURCE_TIMEOUT_MS } from './source-fetch';
 import { SourcePolicyError, alternateSourceHost, validateSourceUrl } from './source-policy';
 import { sourceRevision } from './source-revision';
@@ -519,6 +519,21 @@ function engineIdentityOf(detail: Partial<SourceBookIdentity>, fallback: SourceB
 
 type ConfirmFailureReason = 'detail_unparsed' | 'toc_empty';
 
+/**
+ * 调用方显式给定的源列表当作用户指定源的反查范围（resolveSourceBook 的 options.sources）：列表是调用方自己
+ * 从合格池里挑出来的（单源 probe 的 [source] 取自扇出池），授权范围就是它本身。除此之外 SelectableSources
+ * 只由 getSourcePools 产出。
+ */
+function explicitSelectable(sources: ReadingSource[]): SelectableSources {
+  return sources as unknown as SelectableSources;
+}
+
+/** 用户显式指定源的查找（章节续读认当前源）：url+revision 精确相符优先，其次同 URL 换版本；只收 SelectableSources。 */
+function findSelectedSource(selectable: SelectableSources, catalog: Pick<SourceCatalog, 'sourceUrl' | 'sourceRevision'>): ReadingSource | null {
+  return selectable.find((item) => item.url === catalog.sourceUrl && sourceRevision(item) === catalog.sourceRevision)
+    ?? selectable.find((item) => item.url === catalog.sourceUrl) ?? null;
+}
+
 function confirmFailure(message: string, reason: ConfirmFailureReason): SourceReaderError {
   return Object.assign(new SourceReaderError(message, 'SOURCE_NOT_FOUND', 404), { confirmReason: reason });
 }
@@ -549,11 +564,13 @@ function engineConfirmUpstreamError(error: unknown): unknown {
  * 改前这条路径的 404 零观测，生产只能靠时间线猜是哪个源（41-confirmtoc）。
  */
 async function confirmSourceBook(
-  book: SourceBookIdentity, context: SourceRequestContext, sources: ReadingSource[], bookUrl: string,
-  options: { excludeBookUrl?: string; sourceUrl?: string },
+  book: SourceBookIdentity, context: SourceRequestContext, selectable: SelectableSources, bookUrl: string,
+  options: { excludeBookUrl?: string; sourceUrl?: string; preferAfterSourceUrl?: string },
 ): Promise<SourceCatalog> {
   const startedAt = Date.now();
   let tier: 'engine' | 'builtin' | 'unknown' = 'unknown';
+  // 同站多源时 host 反查取排在前面的那个：排序与自动遍历同一套（suspect 站挪队尾、preferAfter 降级），与改动前一致。
+  const sources = orderByHostHealth(deprioritizeSource([...selectable], options.preferAfterSourceUrl));
   try {
     const url = validateSourceUrl(bookUrl).href;
     if (url === options.excludeBookUrl) throw new SourceReaderError('该书源已失效，请重新搜索。', 'SOURCE_NOT_FOUND', 404);
@@ -617,8 +634,8 @@ export async function resolveSourceBook(
   options: {
     excludeBookUrl?: string; sources?: ReadingSource[]; preferAfterSourceUrl?: string; bookUrl?: string;
     /**
-     * 确认路径的源唯一标识（41-fanfix N10）：给定时按取书池条目的 url **精确**定位规则，不再按 bookUrl 的 host 反查
-     * （同站多源时 host 反查会拿到别的源的规则）。不在取书池里 ⇒ 404；bookUrl 不属于该源的站 ⇒ 404。
+     * 确认路径的源唯一标识（41-fanfix N10）：给定时按 selectable 条目的 url **精确**定位规则，不再按 bookUrl 的 host 反查
+     * （同站多源时 host 反查会拿到别的源的规则）。不在 selectable 里（非合格源）⇒ 404；bookUrl 不属于该源的站 ⇒ 404。
      * 缺省保持 host 反查（既有模糊候选确认路径不带源标识）。只在带 bookUrl 时有意义。
      */
     sourceUrl?: string;
@@ -631,14 +648,20 @@ export async function resolveSourceBook(
     searchStats?: SourceSearchStat[];
   } = {},
 ): Promise<SourceCatalog> {
+  // 用户在前端候选列表里点选后的确认路径：URL 即用户决定，跳过书名/作者校验，
+  // 只保留结构性防御（域名白名单在 validateSourceUrl、目录可解析、非 excludeBookUrl）。
+  // 反查范围是 selectable，不是取书池（41-readall）：点选是单源请求、没有遍历成本，READING_POOL_LIMIT 只管自动遍历；
+  // 取书池截断会让面板里排在第 R 位之后、明明搜到书的源点了必 404。显式给 sources 的调用方（单源 probe 的同口径
+  // 确认），列表本身就是它的授权范围。
+  if (options.bookUrl) {
+    const selectable = options.sources ? explicitSelectable(options.sources) : (await getSourcePools(context.signal)).selectable;
+    return confirmSourceBook(book, context, selectable, options.bookUrl, options);
+  }
   // 41-M1.3：suspect 站（连续传输层硬失败，见 source-host-health.ts）挪到队尾，含 builtin 的 book15 hint 抓取；
   // 只降序不剔除，记忆为空时原样返回（顺序与改动前逐字节相同）。
   const sources = orderByHostHealth(deprioritizeSource(
     options.sources ?? await getReadingSources(context.signal), options.preferAfterSourceUrl,
   ));
-  // 用户在前端候选列表里点选后的确认路径：URL 即用户决定，跳过书名/作者校验，
-  // 只保留结构性防御（域名白名单在 validateSourceUrl、目录可解析、非 excludeBookUrl）。
-  if (options.bookUrl) return confirmSourceBook(book, context, sources, options.bookUrl, options);
   // 池预算（设计 §3.1）：只有池里真的含引擎源时才抬高全局兜底上限。builtin-only 池保持
   // 今日预算语义逐点不变（零回归红线）；confirm 路径已在上面 return，不进入这里（§3.7）。
   if (sources.some((source) => !isBuiltinReadingSource(source))) context.openPool(sources.length);
@@ -948,15 +971,18 @@ async function loadSourceCatalog(session: string, context: SourceRequestContext)
     SELECT payload FROM source_read_catalogs WHERE id = ${session} AND expires_at > now()`, context.signal);
   if (!row) throw new SourceReaderError('阅读目录已过期,请重新加载目录。', 'SOURCE_SESSION_EXPIRED', 409);
   const catalog = row.payload;
-  const sources = await getReadingSources(context.signal);
+  const { traversal, selectable } = await getSourcePools(context.signal);
   // N01:revision 校验用 find() 把命中的源带出供 chapterText 分派(零额外查询)。
   // 旧实现在找不到时抛 SOURCE_CHANGED(409):源记录一刷新(改名/改规则),在途读者的
   // 旧 catalog 全书 409,只能手点「重新加载目录」自救。现在两档降级(洞 1):
   // 1) url+revision 精确相符 ⇒ 就是它;2) **同 URL 换版本**(revision 漂移)⇒ 复用池中当前记录,
   //    目录内容未变、源站未变,直接用当前规则继续读;3) 同 URL 也没了 ⇒ source=null,调用方换源。
-  const source = sources.find((item) => item.url === catalog.sourceUrl && sourceRevision(item) === catalog.sourceRevision)
-    ?? sources.find((item) => item.url === catalog.sourceUrl) ?? null;
+  // 当前源是用户选定的，按 selectable 认(41-readall):面板里取书池之外的源切过去后，章节不能被当成「源已下线」换走。
+  const source = findSelectedSource(selectable, catalog);
   validateSourceUrl(catalog.bookUrl);
+  // 章节级换源是自动遍历，候选仍只取取书池；当前源若在池外，补到快照末尾 —— 它仍是队尾的「原源兜底」，
+  // 且 alternativeSource 的快照反查认得它(与当前源在池内时同一语义)。
+  const sources = source && !traversal.some((item) => item.url === source.url) ? [...traversal, source] : traversal;
   return { catalog, source, sources };
 }
 
@@ -968,7 +994,7 @@ interface LoadedSource {
   catalog: SourceCatalog;
   /** 与目录 revision 精确相符的当前源;null = 已停用或规则漂移(调用方走换源)。 */
   source: ReadingSource | null;
-  /** 目录加载时的池快照:章节级 failover 复用(备用的源标识必在同一快照内,确定性反查)。 */
+  /** 目录加载时的池快照(取书池 + 池外的当前源):章节级 failover 复用(备用的源标识必在同一快照内,确定性反查)。 */
   sources: ReadingSource[];
 }
 
@@ -1105,7 +1131,7 @@ export async function surveySourceBooks(
 // 一次只查一个源：直接复用 resolveSourceBook(sources: [source]) —— builtin 走 book15 解析(精确层 parseSourceSearch
 // + 同页兜底 parseSourceDetailLinks + 作者搜索回退 + 模糊降级),引擎源走 rule-engine 门面(ruleSearch.bookList →
 // 详情 → 目录)+ sourceBookMatches 身份校验。匹配与模糊降级规则与阅读路径逐字相同：probe 判 ok 的源，
-// 用返回的 bookUrl 走 index?book_url= 确认路径一定打得开(前提是该源在取书池里，见 getFanoutPool 的 readable)。
+// 用返回的 bookUrl 走 index?book_url= 确认路径一定打得开(前提是 readable:该源在 getSourcePools().selectable 里，见 getFanoutPool)。
 
 /** 单源 probe 的内部墙钟预算默认值;路由另有同名常量供 check-deploy-config 对照 maxDuration。 */
 export const SOURCE_PROBE_BUDGET_MS = 15_000;
@@ -1139,7 +1165,7 @@ export interface SourceProbeResult {
 
 /**
  * 路由对外的 probe 状态（41-fanfix N10）：在 SourceProbeStatus 之上多一个 unreadable ——
- * 源在扇出候选里、搜到了书（ok 或 similar），但不在取书池（readable=false），确认/阅读路径打不开它。
+ * 源在扇出候选里、搜到了书（ok 或 similar），但 readable=false（引擎开关关时的引擎源，见 getFanoutPool），确认/阅读路径打不开它。
  * 选独立状态而不是「ok + readable:false」：面板若只按 status==='ok' 放出「切换」按钮而漏看 readable，
  * 会给用户一个点了必 404 的入口；未知状态落进面板的默认（不可切换）分支，漏处理也是安全的一侧。
  * found 记下 probe 原本的判定，book / candidates 原样保留供「仅展示」。
