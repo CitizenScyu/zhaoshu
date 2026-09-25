@@ -580,10 +580,18 @@ _WATERMARK_SEP_RE = re.compile(
 # 来说与推广注入同形（该书被判「含广告注入」）。判据：「求」紧接收藏/推荐票/月票/订阅/打赏，
 # 且整行无引号（有引号 = 对白，如 `“求收藏！”他在直播间里喊`，一律保留）。
 # 刻意收窄：`求推荐` 后必须是「票」或标点/行尾（挡 `求推荐信`），`收藏` 后不能接家/品/室/馆/夹。
+# 第二道闸（lblqualfix41，复审阻断②）：只凭「整行无引号」会误删无引号的第三人称叙述
+# （`他跪在雪地里向过往的行人求打赏，嗓子已经哑了。` 一类）。作者求票是**对读者说话**的口吻，
+# 所以再要求行内出现呼语/作者口吻词（各位/大家/书友/兄弟们/拜托/谢谢/本书/新书/作者…），
+# 或「求…」出现在行首/行尾（呼告的典型位置）。两者都不满足的叙述行保留。
 PLEA_LINE_MAX_LEN = 150
 _PLEA_RE = re.compile(
     r'求(?:一下|一波|个|张)?(?:推荐票|推荐(?=[、，,。！!～~\s]|$)|收藏(?![家品室馆夹])|月票|订阅|打赏)')
 _PLEA_QUOTE_RE = re.compile(r'[“”‘’「」『』"]')
+_PLEA_VOICE_RE = re.compile(
+    r'各位|大家|书友|兄弟们|兄弟姐妹|拜托|谢谢|感谢|本书|新书|作者|读者|冲榜|保底|更新|上传|送上|拜求|跪求|求一|求个')
+_PLEA_EDGE_RE = re.compile(
+    r'^(?:求|拜求|跪求|再求|还求)|(?:推荐票|月票|收藏|订阅|打赏)[！!。．…~～、，,\s]*$')
 _CHAPTER_END_RE = re.compile(r'^[（(]\s*本章完\s*[）)]$')
 _SEPARATOR_LINE_RE = re.compile(r'^[－\-—=＝_＿*＊~～·]{5,}$')
 
@@ -720,8 +728,12 @@ def _drop_rule(line: str) -> str | None:
     # 4) 上游书源水印行（`〖三七中文www.37zw.com〗百度搜索“37zw”访问` 一类）。
     if len(line) <= INJECT_LINE_MAX_LEN and _is_watermark_line(line):
         return 'inject'
-    # 5) 作者求票/求收藏行（整行、无引号）；6) 章末 `(本章完)` 与纯分隔线（lblqual41）。
-    if len(line) <= PLEA_LINE_MAX_LEN and _PLEA_RE.search(line) and not _PLEA_QUOTE_RE.search(line):
+    # 5) 作者求票/求收藏行：整行、无引号，且是作者口吻（呼语/口吻词，或求告词在行首/行尾）。
+    #    无引号的第三人称叙述（求打赏/求订阅出现在句中）不删（lblqualfix41）。
+    # 6) 章末 `(本章完)` 与纯分隔线（lblqual41）。
+    if len(line) <= PLEA_LINE_MAX_LEN and _PLEA_RE.search(line) \
+            and not _PLEA_QUOTE_RE.search(line) \
+            and (_PLEA_VOICE_RE.search(line) or _PLEA_EDGE_RE.search(line)):
         return 'plea'
     if _CHAPTER_END_RE.match(line) or _SEPARATOR_LINE_RE.match(line):
         return 'marker'
@@ -765,7 +777,14 @@ DEDUPE_MIN_LINE = 20        # 只对这么长以上的行去重：短对白（�
 PREVIEW_MIN_CHAPTERS = 5    # 章数太少不判试读（样本不够）
 PREVIEW_MEDIAN_MAX = 500    # 章正文中位数低于此 → 疑似试读/付费截断（正常网文一章 2000–5000 字）
 PRECHECK_MIN_CHARS = 10_000  # 与主循环「抓取字数不足」同一阈值
-_CHAPTER_HEAD_RE = re.compile(r'(?:\A|\n\n)(【[^\n]*】)\n')
+# 试读门是「又短又碎」：中位数低但全书字数已经够打标的，是正常的短章写法，不按试读拒
+# （复审非阻断③：30 章×450 字共 1.3 万字被误判）。阈值与「去重后不足」同一口径。
+PREVIEW_MIN_TOTAL = PRECHECK_MIN_CHARS
+# 章节标题 = 本层自己拼出来的 '【标题】\n'，标题取自 toc，行首必是「第X章/卷/节/回/集/话/部/篇」。
+# 正文里独占一段的「【叮！获得xx点经验值】」一类系统提示/弹幕/法宝名不含章号，不算章节标题
+# （lblqualfix41，复审阻断①：60 章系统流被切成 120 章、中位数腰斩、整本按试读拒收）。
+_CHAPTER_HEAD_RE = re.compile(
+    r'(?:\A|\n\n)(【第[0-9一二三四五六七八九十百千万零〇两\d]+[章节卷回集话部篇][^\n]*】)\n')
 
 
 def prepare_book_text(text: str, clean: bool) -> tuple[str, int, str | None, dict]:
@@ -810,7 +829,8 @@ def prepare_book_text(text: str, clean: bool) -> tuple[str, int, str | None, dic
     lengths.sort()
     median = lengths[len(lengths) // 2] if lengths else 0
     stats.update(chapters_after=len(parts), chars_after=chars, median_chapter=median)
-    if len(lengths) >= PREVIEW_MIN_CHAPTERS and median < PREVIEW_MEDIAN_MAX:
+    if len(lengths) >= PREVIEW_MIN_CHAPTERS and median < PREVIEW_MEDIAN_MAX \
+            and chars < PREVIEW_MIN_TOTAL:
         return out, chars, f'章节正文过短（中位 {median} 字，疑似试读/付费截断）', stats
     if chars < PRECHECK_MIN_CHARS:
         return out, chars, f'清洗去重后仅 {chars} 字', stats
@@ -1156,6 +1176,9 @@ def _build_engine_cli(env: dict):
 # --stop-urls-file（翻到目录里任一章即停）。包在 CLI 外面而不是改逐章循环：主源/备选源各自先取 toc，
 # 停止点跟着切换，取文循环本身零改动。
 STOP_URLS_FLAG = '--stop-urls-file'
+# 「不认识该参数」的报错形态（node 的 util.parseArgs / argparse / 自写 CLI 的常见措辞）。
+# 只认这类才降级；新 CLI 自己报的「--stop-urls-file 无法读取」不含这些词，不算旧 CLI。
+_UNKNOWN_OPTION_RE = re.compile(r'未知参数|未知选项|无法识别|unrecognized|unknown option', re.I)
 
 
 class EngineStopUrls:
@@ -1195,7 +1218,9 @@ class EngineStopUrls:
         url = args[1] if len(args) >= 2 and args[0] == '--url' else None
         if subcommand == 'content' and self.supported and url in self._urls:
             proc = self._cli.run(subcommand, *args, STOP_URLS_FLAG, self.path)
-            if proc.returncode != 2 or STOP_URLS_FLAG not in (proc.stderr or ''):
+            # 只认「不认识这个参数」类报错（旧 CLI）。新 CLI 自己报的「--stop-urls-file 无法读取」
+            # 也是 rc=2 且 stderr 含该参数名，不能当成旧 CLI 把整轮停止点静默关掉（lblqualfix41，复审非阻断①）。
+            if proc.returncode != 2 or not _UNKNOWN_OPTION_RE.search(proc.stderr or ''):
                 return proc
             self.supported = False
             print(f'  提示: 引擎 CLI 不支持 {STOP_URLS_FLAG}（旧版），本轮取正文不带翻页停止点',
@@ -1505,6 +1530,24 @@ def _read_url_lines(path: Path):
             yield url
 
 
+def _read_rejection_rows(path: Path):
+    """labels-rejected.jsonl → 逐行产出 (url, reason)。文件不存在 / 空行 / 坏行跳过。"""
+    if not path.exists():
+        return
+    for line in path.read_text(encoding='utf-8').splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+            url = rec.get('url') or ''
+            reason = rec.get('reason') or ''
+        except (json.JSONDecodeError, AttributeError):
+            continue
+        if isinstance(url, str) and url:
+            yield url, reason if isinstance(reason, str) else ''
+
+
 def load_done_urls(path: Path) -> set[str]:
     """labels.jsonl → 已成功产出的详情页 url 集合（断点续传口径）。"""
     return set(_read_url_lines(path))
@@ -1520,9 +1563,15 @@ def load_stub_urls(path: Path) -> set[str]:
 
 
 def count_rejections(path: Path) -> dict[str, int]:
-    """labels-rejected.jsonl → {url: 被拒次数}（每行 = 一次拒收）。"""
+    """labels-rejected.jsonl → {url: 被拒次数}（每行 = 一次拒收）。
+
+    本地预检拒收（reason 以「本地预检:」开头）不计入：它是规则判定，不是内容本身的问题，
+    规则一改结论就变；计入的话误杀的合格书会在 5 次后成钉子户、只能人工删行恢复
+    （lblqualfix41，复审非阻断②）。模型判定与字数不足等其余拒收照旧计数。"""
     counts: dict[str, int] = {}
-    for url in _read_url_lines(path):
+    for url, reason in _read_rejection_rows(path):
+        if reason.startswith('本地预检:'):
+            continue
         counts[url] = counts.get(url, 0) + 1
     return counts
 

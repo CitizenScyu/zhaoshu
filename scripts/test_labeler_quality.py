@@ -53,6 +53,12 @@ class TestPleaAndMarkerRule(unittest.TestCase):
         '－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－',
         '---------',
     )
+    # 反例（复审阻断②）：无引号的第三人称叙述，含「求打赏/求订阅」但不是对读者说话，必须保留
+    NARRATION_KEEP = (
+        '他跪在雪地里向过往的行人求打赏，嗓子已经哑了。',
+        '粉丝们求打赏主播的礼物堆了一整桌。',
+        '他求订阅那本杂志已经三年了，书架上摆得满满当当。',
+    )
     # 反例：正文 / 对白，必须保留
     KEEP = (
         '“求收藏！求推荐票！”他在直播间里扯着嗓子喊。',
@@ -74,6 +80,11 @@ class TestPleaAndMarkerRule(unittest.TestCase):
     def test_evidence_marker_lines_are_dropped(self):
         for line in self.EVIDENCE_MARKER:
             self.assertEqual(labeler._drop_rule(line), 'marker', line)
+
+    def test_unquoted_narration_is_kept(self):
+        # 复审阻断②：只凭「整行无引号」会把这三行当求票行整行删掉
+        for line in self.NARRATION_KEEP:
+            self.assertIsNone(labeler._drop_rule(line), line)
 
     def test_prose_and_dialogue_are_kept(self):
         for line in self.KEEP[:-1]:
@@ -137,14 +148,46 @@ class TestPrepareBookText(unittest.TestCase):
         self.assertEqual(stats['median_chapter'], len(a) - a.count('\n'))   # 章长按字数计、不含换行
 
     def test_yunqi_preview_source_is_rejected(self):
-        # yunqi 同形：每章只有约 100 字的试读片段
+        # yunqi 同形：184 章，每章只有约 100 字的试读片段（复审非阻断③补了总字数条件后，
+        # 试读门要「中位数低且全书不足 PREVIEW_MIN_TOTAL」才拒，所以这里章数取到全书不过万字）
         preview = '晨曦洒落，风过竹林，满山青翠如波涛缓缓起伏，又是新的一天。' * 4 + '...'
         self.assertGreater(len(preview), 100)
-        text = '\n\n'.join(f'【第{184 - i}章 标题APP免费】\n{preview}{i}' for i in range(184))
+        text = '\n\n'.join(f'【第{i}章 标题APP免费】\n{preview}{i}' for i in range(60))
         _, _, reason, stats = labeler.prepare_book_text(text, clean=True)
         self.assertIsNotNone(reason)
         self.assertIn('试读', reason)
         self.assertLess(stats['median_chapter'], labeler.PREVIEW_MEDIAN_MAX)
+
+    def test_bracket_system_lines_are_not_chapter_heads(self):
+        # 复审阻断①：60 章×约 900 字的系统流小说，每章中部一条「【叮！获得xx点经验值】」独占一段。
+        # 旧切章把它当章节标题 → 切成 120 章、中位 375 → 整本按「疑似试读」拒收。
+        # 章正文用 30 段各不相同的叙述（每段约 30 字），保证去重不吞字。
+        system_line = '【叮！获得xx点经验值】'
+        chapters = []
+        for i in range(60):
+            body = '\n'.join(_line(f'章{i}', k) for k in range(30))
+            chapters.append(f'【第{i}章 标题】\n{body}\n\n{system_line}\n{body}')
+        text = '\n\n'.join(chapters)
+        out, chars, reason, stats = labeler.prepare_book_text(text, clean=True)
+        self.assertIsNone(reason)
+        self.assertEqual(stats['chapters_before'], 60)          # 不再被切成 120
+        self.assertGreaterEqual(stats['median_chapter'], labeler.PREVIEW_MEDIAN_MAX)
+        self.assertIn(system_line, out)                          # 系统提示是正文，保留
+        self.assertGreater(chars, labeler.PRECHECK_MIN_CHARS)
+
+    def test_short_but_long_enough_book_is_not_preview(self):
+        # 复审非阻断③：30 章×约 450 字、全书过万字是正常短章，不是试读
+        line = _line('甲', 0)
+        n = 14                                             # 每章字数落在试读阈值以下
+        para = '\n'.join(line for _ in range(n))
+        self.assertLess(len(para) - para.count('\n'), labeler.PREVIEW_MEDIAN_MAX)
+        text = '\n\n'.join(
+            '【第{i}章】\n'.format(i=i) + '\n'.join(_line(f'章{i}', k) for k in range(n))
+            for i in range(30))
+        _, chars, reason, stats = labeler.prepare_book_text(text, clean=True)
+        self.assertGreater(chars, labeler.PREVIEW_MIN_TOTAL)
+        self.assertLess(stats['median_chapter'], labeler.PREVIEW_MEDIAN_MAX)
+        self.assertIsNone(reason)
 
     def test_few_short_chapters_are_not_judged_preview(self):
         text = '\n\n'.join(f'【第{i}章】\n{_line("甲", i) * 5}' for i in range(3))
@@ -265,6 +308,27 @@ class TestEngineStopUrls(unittest.TestCase):
         self.assertEqual(contents, [('--url', self.URLS[0], '--stop-urls-file', cli.path),
                                     ('--url', self.URLS[0]), ('--url', self.URLS[1])])
 
+    def test_unreadable_stop_file_is_not_treated_as_old_cli(self):
+        # 复审非阻断①：新 CLI 自己报「--stop-urls-file 无法读取」（rc=2 且 stderr 含参数名）
+        # 不能被当成旧 CLI，否则整轮停止点被静默关掉
+        def handler(sub, args):
+            if sub == 'toc':
+                return _proc(0, _toc_json(self.URLS))
+            if '--stop-urls-file' in args:
+                return _proc(2, '', '--stop-urls-file 无法读取：文件不存在')
+            return _proc(0, '{"text": "正文"}')
+
+        inner, cli = self._wrap(handler)
+        cli.run('toc', '--url', 'https://m.cuoceng.com/b.html')
+        first = cli.run('content', '--url', self.URLS[0])
+        second = cli.run('content', '--url', self.URLS[1])
+        self.assertEqual(first.returncode, 2)
+        self.assertTrue(cli.supported)                       # 没降级
+        contents = [c[1] for c in inner.calls if c[0] == 'content']
+        self.assertEqual(contents, [('--url', self.URLS[0], '--stop-urls-file', cli.path),
+                                    ('--url', self.URLS[1], '--stop-urls-file', cli.path)])
+        self.assertEqual(second.returncode, 2)
+
     def test_other_content_errors_are_not_retried(self):
         def handler(sub, args):
             if sub == 'toc':
@@ -331,8 +395,10 @@ class TestMainPrecheck(unittest.TestCase):
         return code, sent, out.getvalue()
 
     def test_preview_source_is_rejected_without_llm_call(self):
+        # 每章约 100 字、60 章：全书字数要先过 MIN_BOOK_CHARS 才进得到本地预检，
+        # 所以用「短章 × 足够多章」让抓取字数过线、预检再按试读拒
         preview = '晨曦洒落，风过竹林，满山青翠如波涛缓缓起伏，又是新的一天。' * 4 + '...'
-        text = '\n\n'.join(f'【第{184 - i}章 标题APP免费】\n{preview}{i}' for i in range(184))
+        text = '\n\n'.join(f'【第{i}章 标题APP免费】\n{preview}{i}' for i in range(82))
         code, sent, out = self._run_main(text)
         self.assertEqual(code, 2)
         self.assertEqual(sent, [])                       # 没调模型
@@ -342,6 +408,32 @@ class TestMainPrecheck(unittest.TestCase):
         self.assertIn('本地预检不合格', out)
         self.assertIn('失败分类: 本地预检拒收 1', out)
         self.assertFalse((self.dir / 'labels.jsonl').exists())
+
+    def test_precheck_rejections_do_not_pin(self):
+        # 复审非阻断②：本地预检拒收写 rejected，但不应计入钉子户次数（≥5 次即永久跳过）
+        preview = '晨曦洒落，风过竹林，满山青翠如波涛缓缓起伏，又是新的一天。' * 4 + '...'
+        text = '\n\n'.join(f'【第{i}章】\n{preview}{i}' for i in range(82))
+        for _ in range(REJECT_TERMINAL_RUNS := 6):
+            code, sent, _ = self._run_main(text)
+            self.assertEqual(code, 2)
+            self.assertEqual(sent, [])
+        rows = (self.dir / 'labels-rejected.jsonl').read_text(encoding='utf-8').splitlines()
+        self.assertEqual(len(rows), REJECT_TERMINAL_RUNS)
+        counts = labeler.count_rejections(self.dir / 'labels-rejected.jsonl')
+        self.assertEqual(counts, {})
+        self.assertEqual(labeler.terminal_urls(counts), set())
+
+    def test_model_rejections_still_pin(self):
+        # 对照：非本地预检的拒收照旧计数，达到阈值仍成钉子户
+        rej = self.dir / 'labels-rejected.jsonl'
+        url = 'https://yunqi.qq.com/detail/750056'
+        rej.write_text(
+            ''.join(json.dumps({'url': url, 'reason': '模型判定: 含广告注入'},
+                               ensure_ascii=False) + '\n' for _ in range(5)),
+            encoding='utf-8')
+        counts = labeler.count_rejections(rej)
+        self.assertEqual(counts.get(url), 5)
+        self.assertIn(url, labeler.terminal_urls(counts))
 
     def test_overlapping_text_is_deduplicated_before_llm(self):
         bodies = [_chapter_body(f'章{k}', 80) for k in range(6)]
