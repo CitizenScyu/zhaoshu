@@ -138,6 +138,23 @@ describe('absoluteUrl http→https 升级（41-urlfix）', () => {
     expect(await engineFetchContent(source, CHAPTER_URL, fakeContext(pages))).toEqual({ text: '第一段\n第二段' });
   });
 
+  // strict=true（阅读器正文 context 用）下，目录页里 http://同白名单host/ch1 升级成 https 后
+  // 必须被收下，不得因「原 scheme 是 http」抛 invalid_chapter（复审 §7 建议 2 的 strict 反例）。
+  it('strict 模式下目录页 http:// 章节链接升级后不抛 invalid_chapter', async () => {
+    const toc2 = 'https://book15.net/toc/2.html';
+    const pages = new Map([
+      [TOC_URL, '<li class="chapter"><a href="http://book15.net/c/1.html">第一章</a></li><a class="next" href="http://book15.net/toc/2.html">下一页</a>'],
+      [toc2, '<li class="chapter"><a href="http://book15.net/c/2.html">第二章</a></li>'],
+    ]);
+    const source = engineSource({ ruleToc: { chapterList: '.chapter', chapterName: 'a@text', chapterUrl: 'a@href', nextTocUrl: '.next@href' } });
+    expect(await engineFetchToc(source, TOC_URL, fakeContext(pages), true)).toEqual({
+      chapters: [
+        { url: 'https://book15.net/c/1.html', title: '第一章' },
+        { url: 'https://book15.net/c/2.html', title: '第二章' },
+      ],
+    });
+  });
+
   it('非白名单 host 的 http:// 链接升级后仍被丢弃（不引入新授权）', async () => {
     const pages = new Map([[BOOK_URL,
       '<h1 class="title">书</h1><a class="toc" href="http://evil.invalid/toc/1.html">目录</a>']]);
