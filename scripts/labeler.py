@@ -590,14 +590,26 @@ _WATERMARK_SEP_RE = re.compile(
 # （`他跪在雪地里向过往的行人求打赏，嗓子已经哑了。` 一类）。作者求票是**对读者说话**的口吻，
 # 所以再要求行内出现呼语/作者口吻词（各位/大家/书友/兄弟们/拜托/谢谢/本书/新书/作者…），
 # 或「求…」出现在行首/行尾（呼告的典型位置）。两者都不满足的叙述行保留。
+# 再收窄（lblfu41，lblqualrev2 非阻断B/C + §1② B4）：
+# - 口吻词表去掉正文高频词（作者/读者/更新/上传/感谢）：`作者求月票，读者求订阅，场面热闹。` 是叙述；
+# - 行尾锚要求「求…」自成一个分句（行首或标点之后）：`那些网络主播正在直播里求打赏` 是叙述，
+#   `今天三更，求月票！` 才是呼告；
+# - 行内有第三人称（他/她/它）且不以求告开头 → 叙述，保留（作者求票时自称我/小X，不写他/她）；
+# - 补单用的「求票」「求下月票」（`求票啦！`、`各位，求票！` 漏删）。「求票」在叙述里常见（车票/选票：
+#   `排队求票的人…`），所以单用的「求票」只在自成一个分句时才算（行首或标点之后、后面是标点/语气词/行尾）。
 PLEA_LINE_MAX_LEN = 150
 _PLEA_RE = re.compile(
-    r'求(?:一下|一波|个|张)?(?:推荐票|推荐(?=[、，,。！!～~\s]|$)|收藏(?![家品室馆夹])|月票|订阅|打赏)')
+    r'求(?:一下|一波|下|个|张)?(?:推荐票|推荐(?=[、，,。！!～~\s]|$)|收藏(?![家品室馆夹])|月票|订阅|打赏)')
 _PLEA_QUOTE_RE = re.compile(r'[“”‘’「」『』"]')
 _PLEA_VOICE_RE = re.compile(
-    r'各位|大家|书友|兄弟们|兄弟姐妹|拜托|谢谢|感谢|本书|新书|作者|读者|冲榜|保底|更新|上传|送上|拜求|跪求|求一|求个')
-_PLEA_EDGE_RE = re.compile(
-    r'^(?:求|拜求|跪求|再求|还求)|(?:推荐票|月票|收藏|订阅|打赏)[！!。．…~～、，,\s]*$')
+    r'各位|大家|书友|兄弟们|兄弟姐妹|拜托|谢谢|本书|新书|冲榜|保底|送上|拜求|跪求|求一|求个')
+_PLEA_START_RE = re.compile(r'^(?:求|拜求|跪求|再求|还求)')
+_PLEA_CLAUSE_HEAD = r'(?:^|[，,。．！!、；;：:\s～~…])(?:拜求|跪求|再求|还求|求)(?:一下|一波|下|个|张)?'
+_PLEA_END_RE = re.compile(
+    _PLEA_CLAUSE_HEAD + r'(?:推荐票|推荐|收藏|月票|订阅|打赏)[！!。．…~～、，,\s]*$')
+_PLEA_TICKET_RE = re.compile(
+    _PLEA_CLAUSE_HEAD + r'票+(?:啦|了|呀|吧|哦|喔|啊)?(?:[！!。．…~～、，,\s]|$)')
+_PLEA_THIRD_PERSON_RE = re.compile(r'[他她它]')
 _CHAPTER_END_RE = re.compile(r'^[（(]\s*本章完\s*[）)]$')
 _SEPARATOR_LINE_RE = re.compile(r'^[－\-—=＝_＿*＊~～·]{5,}$')
 
@@ -734,12 +746,15 @@ def _drop_rule(line: str) -> str | None:
     # 4) 上游书源水印行（`〖三七中文www.37zw.com〗百度搜索“37zw”访问` 一类）。
     if len(line) <= INJECT_LINE_MAX_LEN and _is_watermark_line(line):
         return 'inject'
-    # 5) 作者求票/求收藏行：整行、无引号，且是作者口吻（呼语/口吻词，或求告词在行首/行尾）。
-    #    无引号的第三人称叙述（求打赏/求订阅出现在句中）不删（lblqualfix41）。
+    # 5) 作者求票/求收藏行：整行、无引号，且是作者口吻（以求告开头；或口吻词 / 句末求告分句，
+    #    且行内没有第三人称）。无引号的第三人称叙述（求打赏/求订阅出现在句中）不删（lblqualfix41/lblfu41）。
     # 6) 章末 `(本章完)` 与纯分隔线（lblqual41）。
-    if len(line) <= PLEA_LINE_MAX_LEN and _PLEA_RE.search(line) \
-            and not _PLEA_QUOTE_RE.search(line) \
-            and (_PLEA_VOICE_RE.search(line) or _PLEA_EDGE_RE.search(line)):
+    if len(line) <= PLEA_LINE_MAX_LEN and not _PLEA_QUOTE_RE.search(line) and (
+            (_PLEA_RE.search(line)
+             and (_PLEA_START_RE.search(line)
+                  or ((_PLEA_VOICE_RE.search(line) or _PLEA_END_RE.search(line))
+                      and not _PLEA_THIRD_PERSON_RE.search(line))))
+            or (_PLEA_TICKET_RE.search(line) and not _PLEA_THIRD_PERSON_RE.search(line))):
         return 'plea'
     if _CHAPTER_END_RE.match(line) or _SEPARATOR_LINE_RE.match(line):
         return 'marker'
@@ -828,9 +843,13 @@ _TITLE_NOISE_PATTERNS = (
                r'[^()（）]{0,10}[)）]'),
     re.compile(r'\s*[（(][^()（）]{0,12}(?:盟主|加更|[一二三四五六七八九十0-9]更)[^()（）]{0,6}[)）]'),
     re.compile(r'\s*APP\s*免费', re.I),
-    re.compile(r'\s*(?:更新时间|更新于|更新)?\s*[:：]?\s*\d{4}[-/.年]\d{1,2}[-/.月]\d{1,2}日?'
+    re.compile(r'\s*(?:更新时间|更新于|更新)\s*[:：]?\s*\d{4}[-/.年]\d{1,2}[-/.月]\d{1,2}日?'
                r'(?:\s*\d{1,2}:\d{2}(?::\d{2})?)?\s*$'),
 )
+# 不带「更新」前缀的日期尾巴：只在剥完还剩章名时才剥。`第100章 2012.12.21` 的日期就是章名本身，
+# 剥掉只剩章号（lblfu41，lbladrev §1 A3）。
+_TITLE_DATE_TAIL_RE = re.compile(
+    r'\s*\d{4}[-/.年]\d{1,2}[-/.月]\d{1,2}日?(?:\s*\d{1,2}:\d{2}(?::\d{2})?)?\s*$')
 
 
 def clean_chapter_title(title: str) -> str:
@@ -838,7 +857,9 @@ def clean_chapter_title(title: str) -> str:
     title = (title or '').strip()
     for pattern in _TITLE_NOISE_PATTERNS:
         title = pattern.sub('', title)
-    return title.strip()
+    title = title.strip()
+    rest = _TITLE_DATE_TAIL_RE.sub('', title).strip()
+    return rest if _CHAPTER_NUMBER_TITLE_RE.sub('', rest).strip() else title
 
 
 # (a) 非正文目录条目：标题不是「第X章/卷…」格式，且命中公告/感言类关键词 → 不抓。
