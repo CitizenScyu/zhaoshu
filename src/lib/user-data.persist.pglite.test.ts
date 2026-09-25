@@ -1,5 +1,6 @@
 import { beforeAll, describe, expect, it } from 'vitest';
-import { initializeBusinessSchema } from '@/lib/business-schema';
+import { createPGliteSql } from '@/lib/fixtures/pglite-sql';
+import { createProductionSchema } from '@/lib/fixtures/production-schema';
 import { loadPGlite, type PGliteLike } from '@/lib/fixtures/pglite';
 import { persistRecommendationsForUserQueries } from '@/lib/user-data';
 
@@ -50,18 +51,7 @@ maybe('真实 PostgreSQL：persistRecommendationsForUserQueries 批量写', () =
     pg = new PGliteCtor!();
     sql = adapt(pg);
     // 建最小 schema：users(1) + business 表 + 身份键（0002 迁移的生成列与唯一索引）。
-    await pg.exec(`CREATE TABLE users (id int PRIMARY KEY, can_find boolean NOT NULL DEFAULT true)`);
-    await pg.query(`INSERT INTO users (id) VALUES (1)`);
-    await initializeBusinessSchema(sql as never);
-    await pg.exec(`
-      ALTER TABLE books ADD COLUMN IF NOT EXISTS title_key text GENERATED ALWAYS AS (
-        lower(btrim(regexp_replace(btrim(normalize(title, NFKC)), '^《(.+)》$', '\\1')))
-      ) STORED`);
-    await pg.exec(`
-      ALTER TABLE books ADD COLUMN IF NOT EXISTS author_key text GENERATED ALWAYS AS (
-        lower(btrim(normalize(author, NFKC)))
-      ) STORED`);
-    await pg.exec(`CREATE UNIQUE INDEX IF NOT EXISTS books_identity_idx ON books (title_key, author_key)`);
+    await createProductionSchema(createPGliteSql(pg) as never, statement => pg.exec(statement));
   }, 60_000);
 
   const items = [

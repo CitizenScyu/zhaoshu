@@ -1,5 +1,6 @@
 import { beforeAll, describe, expect, it } from 'vitest';
-import { initializeBusinessSchema } from '@/lib/business-schema';
+import { createPGliteSql } from '@/lib/fixtures/pglite-sql';
+import { createProductionSchema, seedProductionMembers } from '@/lib/fixtures/production-schema';
 import { loadPGlite, type PGliteLike } from '@/lib/fixtures/pglite';
 import { recentInformativeFeedbackForUserQuery, withdrawnFeedbackBookTitlesForUserQuery } from '@/lib/user-data';
 
@@ -61,8 +62,8 @@ maybe('真实 PostgreSQL：recentInformativeFeedbackForUserQuery（F04 最新有
 
   beforeAll(async () => {
     pg = new PGliteCtor!();
-    await pg.exec('CREATE TABLE users (id int PRIMARY KEY); INSERT INTO users SELECT generate_series(1, 5)');
-    await initializeBusinessSchema(tag as never);
+    await createProductionSchema(createPGliteSql(pg) as never, statement => pg.exec(statement));
+    await seedProductionMembers(pg, 5);
   }, 60_000);
 
   it('撤回/更改反馈取最新状态：最新一行非 done/dropped 或 note 空时，历史那条不再入选', async () => {

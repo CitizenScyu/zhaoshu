@@ -1,5 +1,5 @@
 import { existsSync, readFileSync, readdirSync } from 'node:fs';
-import { join, relative, resolve } from 'node:path';
+import { join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const CODE_EXTENSIONS = /\.(?:[cm]?[jt]sx?|py)$/;
@@ -13,12 +13,12 @@ export function checkEnvExample(root) {
     if (!existsSync(path)) return;
     for (const entry of readdirSync(path, { withFileTypes: true })) {
       const full = join(path, entry.name);
-      if (entry.isDirectory()) scan(full);
+      if (entry.isDirectory() && !['dist', 'node_modules', '.next'].includes(entry.name)) scan(full);
       else if (entry.isFile() && CODE_EXTENSIONS.test(entry.name)) {
         const text = readFileSync(full, 'utf8');
         for (const match of text.matchAll(ENV_READ)) {
           const key = match[1] ?? match[2];
-          if (!documented.has(key) && !missing.has(key)) missing.set(key, relative(root, full));
+          if (!documented.has(key) && !missing.has(key)) missing.set(key, relative(root, full).split(sep).join('/'));
         }
       }
     }

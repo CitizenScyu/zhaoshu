@@ -2,7 +2,9 @@ import { createHash } from 'node:crypto';
 import { PGlite } from '@electric-sql/pglite';
 import { NextRequest } from 'next/server';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
-import { initializeBusinessSchema, initializeArtifactSchema } from './business-schema';
+import { initializeArtifactSchema } from './business-schema';
+import { createPGliteSql } from './fixtures/pglite-sql';
+import { createProductionSchema, seedV6MemberUser } from './fixtures/production-schema';
 import { artifactIdentityKey, reserveArtifactPath } from './artifact-registry';
 import { bookFilename } from './book-file-name';
 import { artifactContentsUrl, locateTaskArtifact } from './artifact-locator';
@@ -36,8 +38,8 @@ describe('artifact registry: real local Postgres and mock private GitHub', () =>
   beforeAll(async () => {
     pg = new PGlite();
     sql = adapt(pg);
-    await pg.exec('CREATE TABLE users(id integer PRIMARY KEY); INSERT INTO users VALUES(1),(2)');
-    await initializeBusinessSchema(sql);
+    await createProductionSchema(createPGliteSql(pg) as never, statement => pg.exec(statement));
+    await seedV6MemberUser(pg);
     await pg.exec("INSERT INTO labeled_books(id,title,author) VALUES(1,'synthetic','author'),(2,'other','author')");
     // A task predating the migration is preserved, including ownership and default counters.
     await pg.exec("INSERT INTO download_tasks(id,user_id,book_id,title,author,status) VALUES(1,1,1,'legacy','author','done')");

@@ -13,7 +13,7 @@ describe('环境变量样例覆盖', () => {
 
   it('新增代码读取键但样例遗漏时报告键和文件', () => {
     const root = repo({ '.env.local.example': '# NODE_ENV=\n', 'src/lib/new-env.ts': 'process.env.' + 'NEW_DEPLOY_KEY' });
-    expect(checkEnvExample(root)).toContain('.env.local.example: 缺少 NEW_DEPLOY_KEY（读取于 src\\lib\\new-env.ts）');
+    expect(checkEnvExample(root)).toContain('.env.local.example: 缺少 NEW_DEPLOY_KEY（读取于 src/lib/new-env.ts）');
   });
 });
 
