@@ -75,7 +75,14 @@ export async function readBookIdIntegrity(sql) {
   return { fkPresent: Boolean(fk), orphanTasks: Number(row.n), orphanBookIdMin: row.lo ?? null, orphanBookIdMax: row.hi ?? null };
 }
 
-// initializeArtifactSchema 按「该版本有没有记账行」判断，而不是按 max；这里用同一口径算待执行步骤。
+// 口径（41-bookidfk N1）：两处都按**逐版本存在性**判断，不用 max——
+//   · initializeArtifactSchema：`NOT EXISTS (… version = N)` 决定要不要跑该版本的 DDL；
+//   · 本函数：下面按版本循环，缺哪个版本就把哪个列进 pending。
+// 上限也是同一判据：本函数 `state.max > ARTIFACT_SCHEMA_VERSION` 拒绝，对应迁移器里
+//   `IF EXISTS (… version > ARTIFACT_SCHEMA_VERSION) THEN RAISE`；max 与「存在更高版本行」等价。
+// 复审 coldbuildrev N1 记的「max vs 有无 version=1 行」口径差在 v2 重写后已消除：库里只有 v2
+//   没有 v1 时两处都不拒绝（本函数把 v1 列进 pending，迁移器补上 v1 记账行），不再出现只此一处
+//   报 newer-than-code 的情形。下列用例 pin 住这条等价。
 // integrity 缺省视同无孤儿（纯函数用例只看版本）；外键缺失且有孤儿时整份计划 refused。
 /**
  * @param {{ tablePresent: boolean, versions: number[], max: number | null }} state

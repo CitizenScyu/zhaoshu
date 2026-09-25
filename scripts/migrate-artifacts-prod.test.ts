@@ -46,6 +46,17 @@ describe('planArtifactMigration', () => {
     expect(planArtifactMigration(v1, { fkPresent: false, orphanTasks: 0 }).status).toBe('pending');
     expect(planArtifactMigration(v1, { fkPresent: true, orphanTasks: 3 }).status).toBe('pending');
   });
+
+  // 41-bookidfk N1：把「max vs 逐版本存在性」的口径差钉死。
+  // 例：库里只有 v2 没有 v1（人为造出的异常态）——本函数按存在性只看上限（max=2 不高于代码 2 → 不拒绝），
+  // 把 v1 列进 pending；与 initializeArtifactSchema 按 `NOT EXISTS version=1` 决定跑 v1 DDL 同口径。
+  // 旧口径曾在此报 newer-than-code（只此一处），v2 重写后已一致。
+  it('N1：库里只有 v2 没有 v1 时按存在性判待执行（不误报 newer-than-code），与迁移器逐版本判断一致', () => {
+    const onlyV2 = { tablePresent: true, versions: [2], max: 2 };
+    const plan = planArtifactMigration(onlyV2);
+    expect(plan.status).toBe('pending');
+    expect(plan.pending.map((item) => item.version)).toEqual([1]);
+  });
 });
 
 const PGliteCtor = await loadPGlite();
