@@ -1443,6 +1443,9 @@ TEXT_QUALITY_NORMAL = '正常'
 TEXT_QUALITY_AD = '含广告注入'
 _TEXT_QUALITY_SEVERITY = {TEXT_QUALITY_NORMAL: 0, TEXT_QUALITY_AD: 1, '大面积重复': 2, '疑似乱码': 3}
 _UNKNOWN_QUALITY_SEVERITY = 4
+# 模型输出缺 text_quality 或给空串（lblfu41 审查后，主会话裁定）：按未知取值处理、走拒收路径，不按正常入库。
+# 只在打标端这样判；导入端 import_one.py 对历史 jsonl 里缺该字段的行照旧放行（回迁重导要兼容）。
+TEXT_QUALITY_MISSING = '（缺失）'
 EVIDENCE_MAX_ITEMS = 3
 EVIDENCE_MAX_CHARS = 50
 
@@ -1494,11 +1497,22 @@ def normalize_evidence(value) -> list[str]:
     return out
 
 
+def normalize_text_quality(value) -> object:
+    """模型给的 text_quality → 归一值（纯函数）：字符串去首尾空白（`正常 ` 算正常，lblfurev 发现 3）；
+    缺失（None）或空串 → TEXT_QUALITY_MISSING；其他类型原样返回（按未知取值处理）。"""
+    if value is None:
+        return TEXT_QUALITY_MISSING
+    if isinstance(value, str):
+        return value.strip() or TEXT_QUALITY_MISSING
+    return value
+
+
 def merge_text_quality(segments: list[dict]) -> tuple[object, list[str]]:
-    """各段标签 → (合并后的 text_quality, 合并后的证据)。没给 text_quality 的段不参与；
-    全都没给 → (None, [])。"""
-    judged = [(seg.get('text_quality'), normalize_evidence(seg.get('text_quality_evidence')))
-              for seg in segments if isinstance(seg, dict) and seg.get('text_quality') is not None]
+    """各段标签 → (合并后的 text_quality, 合并后的证据)。text_quality 先过 normalize_text_quality，
+    某段缺该字段 / 空串按未知取值参与合并；没有任何 dict 段 → (None, [])。"""
+    judged = [(normalize_text_quality(seg.get('text_quality')),
+               normalize_evidence(seg.get('text_quality_evidence')))
+              for seg in segments if isinstance(seg, dict)]
     if not judged:
         return None, []
     # 未知取值（不在枚举里 / 非字符串）不被「正常」段盖掉（lblfu41，lbladrev 非阻断2）：回复没守枚举约定，
@@ -2162,7 +2176,8 @@ def main() -> int:
                 count_failure('书名核验不符')
                 time.sleep(LLM_INTERVAL_SEC)
                 continue
-            quality = labels.get('text_quality')
+            # 归一后写回：`正常 `/` 含广告注入` 按枚举值处理；缺失/空串 → TEXT_QUALITY_MISSING，下面按异常拒收
+            quality = labels['text_quality'] = normalize_text_quality(labels.get('text_quality'))
             evidence = normalize_evidence(labels.get('text_quality_evidence'))
             quality_flag = None
             if quality == TEXT_QUALITY_AD and not args.book and ad_injection_downgradable(labels):
@@ -2170,7 +2185,7 @@ def main() -> int:
                 quality_flag = AD_QUALITY_FLAG
                 print(f'  文本质量: {quality}，书名核验通过且 confidence ≥ {AD_DOWNGRADE_MIN_CONFIDENCE}，'
                       f'降级入库（quality_flag={AD_QUALITY_FLAG}）证据: {evidence or "（无）"}')
-            elif quality and quality != '正常':
+            elif quality != TEXT_QUALITY_NORMAL:
                 print(f'  文本质量异常({quality}),跳过')
                 reject = {
                     'site_title': site_title,
