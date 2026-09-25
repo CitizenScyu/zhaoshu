@@ -88,6 +88,10 @@ BACKLOG_ENV = 'LABELER_IMPORT_BACKLOG'
 
 # 与 import_labels.mjs 的 validateImportRecord 对齐：这些 text_quality 明确不合格 → skip
 BAD_TEXT_QUALITY = ('疑似乱码', '大面积重复', '含广告注入')
+# lbladfix41：labeler 质量门对「含广告注入」降级入库时在行上打 quality_flag=ad_injection
+# （书名核验为 true 且置信度够）；只有这一组合放行，其余不合格取值照旧 skip。
+AD_QUALITY_FLAG = 'ad_injection'
+AD_TEXT_QUALITY = '含广告注入'
 FIELD_STRINGS = ('title', 'site_title', 'author', 'author_encoding',
                  'category', 'status', 'source')
 
@@ -312,10 +316,13 @@ def validate_record(rec):
     text_quality = labels.get('text_quality')
     if text_quality is not None and not isinstance(text_quality, str):
         return failed('text_quality 必须是字符串')
-    if isinstance(text_quality, str) and text_quality.strip() in BAD_TEXT_QUALITY:
-        return {'status': 'skipped', 'reason': '文本质量异常：' + text_quality}
-    if text_quality is not None and text_quality.strip() != '正常':
-        return review('无法识别的 text_quality')
+    ad_downgraded = (isinstance(text_quality, str) and text_quality.strip() == AD_TEXT_QUALITY
+                     and rec.get('quality_flag') == AD_QUALITY_FLAG)
+    if not ad_downgraded:
+        if isinstance(text_quality, str) and text_quality.strip() in BAD_TEXT_QUALITY:
+            return {'status': 'skipped', 'reason': '文本质量异常：' + text_quality}
+        if text_quality is not None and text_quality.strip() != '正常':
+            return review('无法识别的 text_quality')
 
     # 新格式：明确的布尔确认可替代盲猜；false/不确定不能被相似书名掩盖。
     if 'site_title_match' in labels:

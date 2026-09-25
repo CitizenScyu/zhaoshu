@@ -380,5 +380,193 @@ class TestMainPreview(MainHarness):
         self.assertEqual(self.rows('labels-rejected.jsonl')[0]['reason'], '抓取字数不足: 200')
 
 
+# ---------------- B1 提示词 ----------------
+class TestPrompt(unittest.TestCase):
+    def test_prompt_defines_ad_injection_and_asks_evidence(self):
+        p = labeler.SYSTEM_PROMPT
+        self.assertIn('text_quality_evidence', p)
+        self.assertIn('作者感言', p)
+        self.assertIn('章节标题里的推广字样', p)
+        self.assertIn('不算广告注入', p)
+        self.assertIn('50 字', p)
+
+    def test_merge_suffix_judges_quality_on_later_text_only(self):
+        self.assertIn('text_quality', labeler.MERGE_PROMPT_SUFFIX)
+        self.assertIn('不要沿用前次结论', labeler.MERGE_PROMPT_SUFFIX)
+
+
+# ---------------- B2 分段合并 ----------------
+class TestMergeTextQuality(unittest.TestCase):
+    def m(self, *segs):
+        return labeler.merge_text_quality(list(segs))
+
+    def test_normal_plus_ad_without_evidence_is_normal(self):
+        # 诊断 §3：开头公告让第一段判广告、却给不出证据；第二段正常 → 正常
+        self.assertEqual(self.m({'text_quality': '含广告注入'}, {'text_quality': '正常'}),
+                         ('正常', []))
+        self.assertEqual(self.m({'text_quality': '正常'},
+                                {'text_quality': '含广告注入', 'text_quality_evidence': []}),
+                         ('正常', []))
+
+    def test_ad_with_evidence_wins_over_normal(self):
+        q, ev = self.m({'text_quality': '含广告注入', 'text_quality_evidence': ['首发--无弹出广告']},
+                       {'text_quality': '正常'})
+        self.assertEqual((q, ev), ('含广告注入', ['首发--无弹出广告']))
+
+    def test_most_severe_kept_and_evidence_merged(self):
+        q, ev = self.m({'text_quality': '含广告注入', 'text_quality_evidence': ['a', 'b']},
+                       {'text_quality': '大面积重复', 'text_quality_evidence': ['b', 'c', 'd']})
+        self.assertEqual(q, '大面积重复')
+        self.assertEqual(ev, ['a', 'b', 'c'])            # 去重、至多 3 条
+
+    def test_unknown_value_is_most_severe(self):
+        self.assertEqual(self.m({'text_quality': '怪值'}, {'text_quality': '疑似乱码'})[0], '怪值')
+
+    def test_both_normal_and_missing(self):
+        self.assertEqual(self.m({'text_quality': '正常'}, {'text_quality': '正常'}), ('正常', []))
+        self.assertEqual(self.m({}, {}), (None, []))
+        self.assertEqual(self.m({}, {'text_quality': '含广告注入'}), ('含广告注入', []))
+
+    def test_evidence_normalized(self):
+        self.assertEqual(labeler.normalize_evidence('x' * 80), ['x' * 50])
+        self.assertEqual(labeler.normalize_evidence(['a', 1, '', ' b ', 'c', 'd']), ['a', 'b', 'c'])
+        self.assertEqual(labeler.normalize_evidence({'a': 1}), [])
+
+    def test_label_book_two_segments_uses_merged_quality(self):
+        replies = [
+            {'title_guess': '斗罗大陆', 'text_quality': '含广告注入', 'text_quality_evidence': []},
+            {'title_guess': '斗罗大陆', 'text_quality': '正常', 'text_quality_evidence': [],
+             'genre': '玄幻'},
+        ]
+        with mock.patch.object(labeler, '_label_once', side_effect=replies):
+            labels, calls = labeler.label_book('字' * (labeler.SEGMENT_CHARS + 10), 'k', ['m'])
+        self.assertEqual(calls, 2)
+        self.assertEqual(labels['text_quality'], '正常')
+        self.assertEqual(labels['genre'], '玄幻')
+
+    def test_label_book_second_segment_evidence_kept(self):
+        # 反例：第一段正常、第二段给了证据 → 广告判定保留（不被第一段「正常」洗掉）
+        replies = [
+            {'text_quality': '正常'},
+            {'text_quality': '含广告注入', 'text_quality_evidence': ['#百度搜（手打吧）#']},
+        ]
+        with mock.patch.object(labeler, '_label_once', side_effect=replies):
+            labels, _ = labeler.label_book('字' * (labeler.SEGMENT_CHARS + 10), 'k', ['m'])
+        self.assertEqual(labels['text_quality'], '含广告注入')
+        self.assertEqual(labels['text_quality_evidence'], ['#百度搜（手打吧）#'])
+
+
+# ---------------- B3/B4 main 质量门 ----------------
+def _good_fetch(cli, url, stats=None, **k):
+    text = '\n\n'.join(f'【第{i}章 起】\n{_chapter_body(f"章{i}", 60)}' for i in range(8))
+    return text, len(text)
+
+
+def _labels(quality, conf=0.9, match=True, evidence=('首发--无弹出广告(喜欢本书,请收藏)',)):
+    return {'title_guess': '雪中悍刀行', 'site_title_match': match, 'text_quality': quality,
+            'text_quality_evidence': list(evidence), 'genre': '武侠', 'confidence': conf,
+            'site_title_note': '主角徐凤年、北凉王府设定吻合'}
+
+
+class TestMainAdGate(MainHarness):
+    def test_ad_injection_high_confidence_is_imported_with_flag(self):
+        code, sent, out = self.run_main(_good_fetch, _labels('含广告注入'))
+        self.assertEqual(code, 0)
+        self.assertEqual(len(sent), 1)
+        rows = self.rows('labels.jsonl')
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]['quality_flag'], 'ad_injection')
+        self.assertEqual(rows[0]['text_quality_evidence'], ['首发--无弹出广告(喜欢本书,请收藏)'])
+        self.assertEqual(rows[0]['labels']['text_quality'], '含广告注入')
+        self.assertEqual(self.rows('labels-rejected.jsonl'), [])
+        self.assertIn('降级入库', out)
+        # 导入端契约：该行能被自动导入放行
+        import import_one
+        self.assertEqual(import_one.validate_record(rows[0])['status'], 'ready')
+
+    def test_ad_injection_string_confidence_is_parsed(self):
+        code, _, _ = self.run_main(_good_fetch, _labels('含广告注入', conf='0.85'))
+        self.assertEqual(code, 0)
+        self.assertEqual(self.rows('labels.jsonl')[0]['quality_flag'], 'ad_injection')
+
+    def test_ad_injection_low_confidence_still_rejected(self):
+        code, _, _ = self.run_main(_good_fetch, _labels('含广告注入', conf=0.7))
+        self.assertEqual(code, 2)
+        self.assertEqual(self.rows('labels.jsonl'), [])
+        rej = self.rows('labels-rejected.jsonl')
+        self.assertEqual(rej[0]['reason'], '文本质量异常: 含广告注入')
+        self.assertEqual(rej[0]['ad_gate'], 2)
+        self.assertEqual(rej[0]['text_quality_evidence'], ['首发--无弹出广告(喜欢本书,请收藏)'])
+
+    def test_ad_injection_without_json_true_match_still_rejected(self):
+        # title_guess 与站点书名一致能过书名核验，但 site_title_match 不是 JSON true → 不降级
+        code, _, _ = self.run_main(_good_fetch, _labels('含广告注入', match='true'))
+        self.assertEqual(code, 2)
+        self.assertEqual(self.rows('labels-rejected.jsonl')[0]['ad_gate'], 2)
+
+    def test_other_bad_quality_still_rejected(self):
+        for quality in ('大面积重复', '疑似乱码'):
+            with self.subTest(quality=quality):
+                for name in ('labels.jsonl', 'labels-rejected.jsonl'):
+                    (self.dir / name).unlink(missing_ok=True)
+                code, _, _ = self.run_main(_good_fetch, _labels(quality, conf=0.99))
+                self.assertEqual(code, 2)
+                rej = self.rows('labels-rejected.jsonl')
+                self.assertEqual(rej[0]['reason'], f'文本质量异常: {quality}')
+                self.assertNotIn('ad_gate', rej[0])
+                self.assertEqual(self.rows('labels.jsonl'), [])
+
+    def test_normal_row_has_no_flag(self):
+        code, _, _ = self.run_main(_good_fetch, _labels('正常', evidence=()))
+        self.assertEqual(code, 0)
+        row = self.rows('labels.jsonl')[0]
+        self.assertNotIn('quality_flag', row)
+        self.assertNotIn('text_quality_evidence', row)
+
+
+class TestPinCounting(unittest.TestCase):
+    URL = 'https://www.kxdu.net/book/38822'
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = Path(self.tmp.name) / 'labels-rejected.jsonl'
+
+    def write(self, rows):
+        self.path.write_text(''.join(json.dumps(r, ensure_ascii=False) + '\n' for r in rows),
+                             encoding='utf-8')
+
+    def test_old_gate_ad_rejections_do_not_pin(self):
+        self.write([{'url': self.URL, 'reason': '文本质量异常: 含广告注入'}] * 6)
+        counts = labeler.count_rejections(self.path)
+        self.assertEqual(counts, {})
+        self.assertEqual(labeler.terminal_urls(counts), set())
+
+    def test_new_gate_ad_rejections_still_pin(self):
+        self.write([{'url': self.URL, 'reason': '文本质量异常: 含广告注入', 'ad_gate': 2}] * 5)
+        self.assertIn(self.URL, labeler.terminal_urls(labeler.count_rejections(self.path)))
+
+    def test_other_rejections_still_counted(self):
+        self.write([{'url': self.URL, 'reason': '文本质量异常: 大面积重复'}] * 3
+                   + [{'url': self.URL, 'reason': '抓取字数不足: 10'}] * 2)
+        self.assertEqual(labeler.count_rejections(self.path), {self.URL: 5})
+
+
+class TestMainDowngradeDoesNotPin(MainHarness):
+    def test_downgraded_import_is_not_a_rejection(self):
+        # 5 次旧门槛广告拒收 + 1 次降级入库：不成钉子户、也不写新的拒收行
+        rej = self.dir / 'labels-rejected.jsonl'
+        rej.write_text(''.join(json.dumps({'url': self.BOOK['url'],
+                                           'reason': '文本质量异常: 含广告注入'},
+                                          ensure_ascii=False) + '\n' for _ in range(5)),
+                       encoding='utf-8')
+        code, sent, out = self.run_main(_good_fetch, _labels('含广告注入'))
+        self.assertEqual(code, 0)
+        self.assertEqual(len(sent), 1)                     # 没被钉子户挡掉
+        self.assertNotIn('钉子户终态：跳过', out)
+        self.assertEqual(len(rej.read_text(encoding='utf-8').splitlines()), 5)
+        self.assertEqual(labeler.count_rejections(rej), {})
+
+
 if __name__ == '__main__':
     unittest.main()

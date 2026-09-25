@@ -89,7 +89,13 @@ SYSTEM_PROMPT = (
     "protagonist(主角类型一句话)、strengths(爽点/看点,2-4条)、"
     "weaknesses(雷点风险,1-3条)、plot_stage(读到的内容进展到什么阶段,一句话)、"
     "worldbuilding(世界观一句话)、tone(基调)、confidence(0-1)、"
-    "text_quality(文本质量,取值必须是 正常/疑似乱码/大面积重复/含广告注入 之一)、"
+    "text_quality(文本质量,取值必须是 正常/疑似乱码/大面积重复/含广告注入 之一。"
+    "「含广告注入」只指站点或转载站插进正文的推广、网址水印、导流语"
+    "（如「首发--无弹出广告」「百度搜xx阅读最新章节」、整行网址），且在正文中反复出现、打断阅读；"
+    "作者感言/求票/请假公告、章节标题里的推广字样（如「求收藏」「APP免费」）、"
+    "偶发一两处的残留网址都不算广告注入，这些情况判 正常)、"
+    "text_quality_evidence(数组：text_quality 不是 正常 时摘录至多 3 条正文原文片段作证据，"
+    "每条不超过 50 字；正常 时给空数组)、"
     "is_beginning(读到的内容是否为全书开头,true 或 false)、"
     "quality(质量分对象: {\"prose\": 文笔0-10, \"worldbuilding\": 设定0-10, "
     "\"pacing\": 节奏0-10, \"enjoyment\": 读感0-10, \"overall\": 综合0-10}, "
@@ -1369,7 +1375,87 @@ MERGE_PROMPT_SUFFIX = (
     "以上是前一次阅读（全书开头部分）得到的初步结论。现在给出后续文本，"
     "请结合两者输出合并后的最终 JSON 对象（同样只要 JSON，不要多余文字），"
     "修正和补充初步结论中只看开头会误判的字段（如 pace、weaknesses、plot_stage）。"
+    "text_quality 与 text_quality_evidence 只按【后续文本】判断，不要沿用前次结论。"
 )
+
+# ---- 文本质量判定合并（lbladfix41）----
+# 分两段时，旧实现直接用第二段的 JSON，而第二段拿着第一段的完整结论（含 text_quality），开头的公告/感言
+# 让「含广告注入」一路延续到最终结果（lbladdiag-41-report §3）。现在两段各自判 text_quality，代码合并：
+# 任一段「正常」且其余段没给证据 → 正常；否则取最严重的判定，证据合并。未知取值按最严重算（照旧拒收）。
+TEXT_QUALITY_NORMAL = '正常'
+TEXT_QUALITY_AD = '含广告注入'
+_TEXT_QUALITY_SEVERITY = {TEXT_QUALITY_NORMAL: 0, TEXT_QUALITY_AD: 1, '大面积重复': 2, '疑似乱码': 3}
+_UNKNOWN_QUALITY_SEVERITY = 4
+EVIDENCE_MAX_ITEMS = 3
+EVIDENCE_MAX_CHARS = 50
+
+
+# ---- main() 质量门：含广告注入降级入库（lbladfix41）----
+# 判「含广告注入」但书名核验为 JSON true 且 confidence ≥ AD_DOWNGRADE_MIN_CONFIDENCE → 照常入库，
+# labels.jsonl 行上加 quality_flag=ad_injection 与证据（导入端据 quality_flag 放行，见 import_one.py）。
+# 其余非「正常」取值（大面积重复/疑似乱码/未知）照旧拒收。
+AD_DOWNGRADE_MIN_CONFIDENCE = 0.8
+AD_QUALITY_FLAG = 'ad_injection'
+AD_REJECT_REASON = f'文本质量异常: {TEXT_QUALITY_AD}'
+AD_GATE_FIELD = 'ad_gate'       # 新门槛下的广告拒收行带此字段（值=门槛版本），count_rejections 据此区分新旧
+AD_GATE_VERSION = 2
+
+
+def _confidence(value) -> float | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value.strip())
+        except ValueError:
+            return None
+    return None
+
+
+def ad_injection_downgradable(labels: dict) -> bool:
+    """含广告注入能否降级入库：site_title_match 是 JSON true 且 confidence ≥ 0.8。"""
+    conf = _confidence(labels.get('confidence'))
+    return (labels.get('text_quality') == TEXT_QUALITY_AD
+            and labels.get('site_title_match') is True
+            and conf is not None and conf >= AD_DOWNGRADE_MIN_CONFIDENCE)
+
+
+def normalize_evidence(value) -> list[str]:
+    """模型给的 text_quality_evidence → 至多 3 条、每条 ≤50 字的字符串列表（非法值 → []）。"""
+    if isinstance(value, str):
+        value = [value]
+    if not isinstance(value, list):
+        return []
+    out: list[str] = []
+    for item in value:
+        if isinstance(item, str) and item.strip():
+            out.append(item.strip()[:EVIDENCE_MAX_CHARS])
+        if len(out) >= EVIDENCE_MAX_ITEMS:
+            break
+    return out
+
+
+def merge_text_quality(segments: list[dict]) -> tuple[object, list[str]]:
+    """各段标签 → (合并后的 text_quality, 合并后的证据)。没给 text_quality 的段不参与；
+    全都没给 → (None, [])。"""
+    judged = [(seg.get('text_quality'), normalize_evidence(seg.get('text_quality_evidence')))
+              for seg in segments if isinstance(seg, dict) and seg.get('text_quality') is not None]
+    if not judged:
+        return None, []
+    others = [ev for q, ev in judged if q != TEXT_QUALITY_NORMAL]
+    if any(q == TEXT_QUALITY_NORMAL for q, _ in judged) and not any(others):
+        return TEXT_QUALITY_NORMAL, []
+    worst = max((q for q, _ in judged),
+                key=lambda q: _TEXT_QUALITY_SEVERITY.get(q, _UNKNOWN_QUALITY_SEVERITY)
+                if isinstance(q, str) else _UNKNOWN_QUALITY_SEVERITY)
+    evidence: list[str] = []
+    for _, ev in judged:
+        for item in ev:
+            if item not in evidence and len(evidence) < EVIDENCE_MAX_ITEMS:
+                evidence.append(item)
+    return worst, evidence
 
 
 MODEL_RETRY = 2            # 打标时每个模型最多尝试次数
@@ -1542,7 +1628,7 @@ def label_book(text: str, api_key: str, models: list[str],
                max_tokens: dict | None = None) -> tuple[dict, int]:
     """50 万字文本 → (标签 dict, 实际调用次数)。
     两段式：每段 ≤25 万字独立过 CF 100s 线（实测 40 万字单段 prefill 必撞 524）。
-    第二段带第一段结论合并，可修正只看开头的误判。
+    第二段带第一段结论合并，可修正只看开头的误判；text_quality 两段各判、按 merge_text_quality 合并。
     site_title / site_author 为本次来源站点书目，附加打标验证段供成分判定。
     models 为后备模型链（如 bohe → grok → ...），逐段内按链逐个尝试。
     max_tokens = resolve_max_tokens(env) 的结果（按模型的输出上限），None 用默认。"""
@@ -1560,6 +1646,10 @@ def label_book(text: str, api_key: str, models: list[str],
     )
     labels2 = _label_once(merged_user, api_key, models, verification,
                           context=f'{context} 分段=2/2', max_tokens=max_tokens)
+    quality, evidence = merge_text_quality([labels1, labels2])
+    if quality is not None:
+        labels2['text_quality'] = quality
+        labels2['text_quality_evidence'] = evidence
     return labels2, 2
 
 
@@ -1659,7 +1749,7 @@ def _read_url_lines(path: Path):
 
 
 def _read_rejection_rows(path: Path):
-    """labels-rejected.jsonl → 逐行产出 (url, reason)。文件不存在 / 空行 / 坏行跳过。"""
+    """labels-rejected.jsonl → 逐行产出 (url, reason, 行对象)。文件不存在 / 空行 / 坏行跳过。"""
     if not path.exists():
         return
     for line in path.read_text(encoding='utf-8').splitlines():
@@ -1673,7 +1763,7 @@ def _read_rejection_rows(path: Path):
         except (json.JSONDecodeError, AttributeError):
             continue
         if isinstance(url, str) and url:
-            yield url, reason if isinstance(reason, str) else ''
+            yield url, reason if isinstance(reason, str) else '', rec
 
 
 def load_done_urls(path: Path) -> set[str]:
@@ -1695,10 +1785,16 @@ def count_rejections(path: Path) -> dict[str, int]:
 
     本地预检拒收（reason 以「本地预检:」开头）不计入：它是规则判定，不是内容本身的问题，
     规则一改结论就变；计入的话误杀的合格书会在 5 次后成钉子户、只能人工删行恢复
-    （lblqualfix41，复审非阻断②）。模型判定与字数不足等其余拒收照旧计数。"""
+    （lblqualfix41，复审非阻断②）。模型判定与字数不足等其余拒收照旧计数。
+
+    lbladfix41：旧质量门下的「含广告注入」拒收（行上没有 ad_gate 字段）不计入——那道门已换成
+    「书名核验通过且置信度够就降级入库」，旧拒收大多是清洗漏网加硬拒造成的，应按新门槛重试。
+    新门槛下仍被拒的（核验不过或置信度不够）带 ad_gate 字段，照旧计数。降级入库不写 rejected，自然不计。"""
     counts: dict[str, int] = {}
-    for url, reason in _read_rejection_rows(path):
+    for url, reason, rec in _read_rejection_rows(path):
         if reason.startswith('本地预检:'):
+            continue
+        if reason == AD_REJECT_REASON and AD_GATE_FIELD not in rec:
             continue
         counts[url] = counts.get(url, 0) + 1
     return counts
@@ -2007,7 +2103,14 @@ def main() -> int:
                 time.sleep(LLM_INTERVAL_SEC)
                 continue
             quality = labels.get('text_quality')
-            if quality and quality != '正常':
+            evidence = normalize_evidence(labels.get('text_quality_evidence'))
+            quality_flag = None
+            if quality == TEXT_QUALITY_AD and not args.book and ad_injection_downgradable(labels):
+                # lbladfix41：书名核验通过且置信度够 → 降级入库（打 quality_flag），不拒收、不计钉子户
+                quality_flag = AD_QUALITY_FLAG
+                print(f'  文本质量: {quality}，书名核验通过且 confidence ≥ {AD_DOWNGRADE_MIN_CONFIDENCE}，'
+                      f'降级入库（quality_flag={AD_QUALITY_FLAG}）证据: {evidence or "（无）"}')
+            elif quality and quality != '正常':
                 print(f'  文本质量异常({quality}),跳过')
                 reject = {
                     'site_title': site_title,
@@ -2017,8 +2120,12 @@ def main() -> int:
                     'title_guess': guess,
                     'site_title_match': labels.get('site_title_match'),
                     'site_title_note': labels.get('site_title_note'),
+                    'confidence': labels.get('confidence'),
+                    'text_quality_evidence': evidence,
                     'reason': f'文本质量异常: {quality}',
                 }
+                if quality == TEXT_QUALITY_AD:
+                    reject[AD_GATE_FIELD] = AD_GATE_VERSION
                 rej_path = data_path('labels-rejected.jsonl')
                 with open(rej_path, 'a', encoding='utf-8') as f:
                     f.write(json.dumps(reject, ensure_ascii=False) + '\n')
@@ -2043,6 +2150,9 @@ def main() -> int:
                 'chars': chars,
                 'labels': labels,
             }
+            if quality_flag:
+                b_out['quality_flag'] = quality_flag
+                b_out['text_quality_evidence'] = evidence
             print(f'  {chars} 字 | {labels.get("genre")} | conf {labels.get("confidence")} | {calls} 次调用')
             out_path = data_path('labels.jsonl')
             with open(out_path, 'a', encoding='utf-8') as f:

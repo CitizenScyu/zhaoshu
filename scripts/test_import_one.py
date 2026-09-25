@@ -258,6 +258,28 @@ class TestValidateRecord(unittest.TestCase):
                     import_one.validate_record(labels_record(text_quality=quality))['status'],
                     'skipped')
 
+    def test_ad_injection_with_downgrade_flag_is_ready(self):
+        # lbladfix41：labeler 降级入库的行（quality_flag=ad_injection）放行，标签原样保留
+        rec = labels_record(text_quality='含广告注入', text_quality_evidence=['首发--无弹出广告'])
+        rec['quality_flag'] = 'ad_injection'
+        out = import_one.validate_record(rec)
+        self.assertEqual(out['status'], 'ready')
+        self.assertEqual(out['record']['labels']['text_quality'], '含广告注入')
+        self.assertEqual(out['record']['labels']['text_quality_evidence'], ['首发--无弹出广告'])
+
+    def test_downgrade_flag_does_not_release_other_bad_quality(self):
+        # 反例：flag 只放行「含广告注入」；其余不合格取值 / 错误 flag 值 / 书名未确认照旧拦
+        for quality in ('疑似乱码', '大面积重复'):
+            rec = labels_record(text_quality=quality)
+            rec['quality_flag'] = 'ad_injection'
+            self.assertEqual(import_one.validate_record(rec)['status'], 'skipped', quality)
+        rec = labels_record(text_quality='含广告注入')
+        rec['quality_flag'] = 'other'
+        self.assertEqual(import_one.validate_record(rec)['status'], 'skipped')
+        rec = labels_record(text_quality='含广告注入', site_title_match=False)
+        rec['quality_flag'] = 'ad_injection'
+        self.assertEqual(import_one.validate_record(rec)['status'], 'review')
+
     def test_unknown_or_non_string_text_quality(self):
         self.assertEqual(
             import_one.validate_record(labels_record(text_quality='不确定'))['status'],
