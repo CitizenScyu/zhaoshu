@@ -1,5 +1,13 @@
 import type { neon } from '@neondatabase/serverless';
 
+/**
+ * 本函数当前写死的版本（`WHERE version = 1` / `INSERT ... VALUES (1)` / `version > 1` 三处 DDL 字面量）。
+ * 常量与 DDL 的绑定由测试保证（真库跑完 initializeArtifactSchema 后 artifact_schema_migrations 的
+ * max(version) 必须等于它）——DDL 在同一个 DO 块里，插值会被 neon 标签当参数而不下发，故不内联。
+ * 生产入口 scripts/migrate-artifacts-prod.mjs 与 db:check:prod 的 artifact 判据都读这个常量。
+ */
+export const ARTIFACT_SCHEMA_VERSION = 1;
+
 /** Explicit migration only: never run DDL on a reader request. Independent of auth/T1 versions. */
 export async function initializeArtifactSchema(sql: ReturnType<typeof neon>) {
   await sql.transaction(tx => [

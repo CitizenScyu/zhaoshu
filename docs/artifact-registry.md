@@ -9,6 +9,45 @@ either migration order is supported. Existing dangling IDs fail the migration
 transaction instead of being silently reassigned. The local/test
 entry point is `node --experimental-strip-types scripts/migrate-artifacts.mjs`,
 which accepts only the guarded `TEST_DATABASE_URL`; it is not run by requests.
+`ARTIFACT_SCHEMA_VERSION` (`src/lib/artifact-schema.ts`) is the version constant
+`db:check:prod` and the production entry point compare against.
+
+## Production entry point and cold-build
+
+`npm run migrate:artifacts:prod -- --database-url-env=<VAR> (--dry-run | --yes-i-mean-production)`
+(`scripts/migrate-artifacts-prod.mjs`) is the production/DR counterpart of
+`migrate-artifacts.mjs`: same constraint set as `migrate:auth:prod` — the target
+must be named explicitly via `--database-url-env`, and neither `DATABASE_URL` nor
+`TEST_DATABASE_URL` is accepted as that name. The migration body is exactly
+`initializeArtifactSchema` (no DDL is copied), so it is idempotent and repeatable;
+`--dry-run` is read-only and reports the current ledger version and the steps that
+would run. `db:check:prod` requires the three artifact tables
+(`artifact_schema_migrations`, `storage_repositories`, `book_artifacts`) and an
+artifact ledger version ≥ 1; a cold-built database that never ran this entry point
+fails the check with `artifactVersionOk: false` instead of silently passing
+(tempdb41 §缺陷 D1: the T8 worker used to start with
+`relation "storage_repositories" does not exist`).
+
+A database built this way has **empty** registry tables. Register the publishing
+repository before starting the T8 worker, otherwise
+`runtime-download/repository.ts` cannot resolve a writable row:
+
+```powershell
+$env:DR_DATABASE_URL = '<目标库连接串>'
+# dry-run 先看会做什么；仓库键从 --repo/--branch 或 ZHAOSHU_BOOKS_REPO / DOWNLOAD_TARGET_BRANCH 读出
+npm run register:storage:prod -- --database-url-env=DR_DATABASE_URL
+npm run register:storage:prod -- --database-url-env=DR_DATABASE_URL --apply
+```
+
+`scripts/register-storage-repository.mjs` inserts one row matching the registry's
+own writability predicate (`enabled ∧ is_private ∧ ¬read_only ∧ sealed_at IS NULL`,
+the same one `resolveRepositoryId` uses). It is idempotent on the identity index
+`storage_repositories_identity_idx` (case-insensitive `owner`/`repo`, branch-agnostic):
+an existing writable row is a no-op, and an existing row that fails the predicate
+(disabled / public / read-only / sealed) or points at a different branch is reported
+as `refused` (exit code 2) rather than silently edited — do not unseal a repository
+by hand to get past it. No credentials are involved; only `owner`/`repo`/`branch`
+are read from existing configuration.
 
 Readers select the optional `download_tasks.artifact_id` through `to_jsonb`, so a
 pre-migration database and migrated legacy tasks both retain the old protocol.

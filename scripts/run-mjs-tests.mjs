@@ -44,6 +44,8 @@ const repoRoot = dirname(scriptsDir);
 // 下限常量:新增 .test.mjs 时**不需要**改这里;只有删除或改名导致数量掉到 4 以下才触发,
 // 而那正是这条门要拦的情况。4 = 接入时的既有文件数(backfill_authors / import_labels /
 // normalize_author / shadow-batch)。
+// 注:本仓的 vitest 风格用例一律 .test.ts(见 vitest.config.ts 的 include),单列在 `npm test`
+// 那道门里,不重复计入本下限;脚本/迁移入口的用例写 .test.ts 就够,不必塞进本 runner。
 const MIN_EXPECTED_FILES = 4;
 
 // 用例数下限(复审非阻断建议 1)。文件数下限拦不住「文件还在、用例没了」——文件顶层

@@ -13,7 +13,7 @@ import { beforeAll, describe, expect, it } from 'vitest';
 import { initializeBusinessSchema } from '@/lib/business-schema';
 import { loadPGlite, type PGliteLike } from '@/lib/fixtures/pglite';
 import { createPGliteClient, createPGliteSql } from '@/lib/fixtures/pglite-sql';
-import { applyMigration, evaluateSchema, EXPECTED_TABLES, inspectSchema, loadMigrations } from '../../scripts/db-migration-lib.mjs';
+import { applyMigration, ARTIFACT_TABLES, evaluateSchema, EXPECTED_TABLES, inspectSchema, loadMigrations } from '../../scripts/db-migration-lib.mjs';
 import { runAuthMigration } from '../../scripts/migrate-auth-prod.mjs';
 import { assertAuthSchema } from './auth-store';
 
@@ -66,10 +66,11 @@ maybe('0003 四表与运行时建表同构（逐列比对，真 SQL）', () => {
     expect(EXPECTED_TABLES).toEqual(expect.arrayContaining(RUNTIME_TABLES));
   });
 
-  it('没有 0003 的冷建库：db:check 判不通过，缺的恰好是这四张表', () => {
+  it('没有 0003 的冷建库：db:check 判不通过，缺的是这四张表与 artifact 三表', () => {
     expect(beforeRuntimeVerdict.authVersionOk).toBe(true);
     expect(beforeRuntimeVerdict.checksumOk).toBe(true);
-    expect([...beforeRuntimeVerdict.missingTables].sort()).toEqual(RUNTIME_TABLES);
+    // 41-coldbuild：这个库同样没有 artifact schema（没跑 migrate:artifacts:prod），故缺表集合 = 四张运行期表 + artifact 三表。
+    expect([...beforeRuntimeVerdict.missingTables].sort()).toEqual([...RUNTIME_TABLES, ...ARTIFACT_TABLES].sort());
     expect(beforeRuntimeVerdict.ok).toBe(false);
   });
 
