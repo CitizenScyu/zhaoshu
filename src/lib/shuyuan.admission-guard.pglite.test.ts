@@ -7,6 +7,8 @@ import { beforeEach, describe, expect, it } from 'vitest';
 import { rulesHash, type AdmissionSourceRow } from './rule-engine/admission';
 import { writeAdmissionRows } from './shuyuan';
 import { loadPGlite, type PGliteLike } from './fixtures/pglite';
+import { createPGliteSql } from './fixtures/pglite-sql';
+import { createProductionSchema } from './fixtures/production-schema';
 
 type SqlTag = (parts: TemplateStringsArray, ...values: unknown[]) => Promise<Record<string, unknown>[]>;
 
@@ -22,23 +24,6 @@ function adapter(pg: PGliteLike): SqlTag {
   };
 }
 
-// source_admission DDL（与 business-schema.ts 逐字一致；只建这一张表够钉写库路径）。
-const SOURCE_ADMISSION_DDL = `
-  CREATE TABLE source_admission (
-    id serial PRIMARY KEY,
-    source_url text NOT NULL UNIQUE,
-    tier text NOT NULL,
-    compile_ok boolean NOT NULL,
-    core_field_mask jsonb NOT NULL,
-    search_ok boolean,
-    search_verdict text NOT NULL DEFAULT '',
-    search_checked_at timestamptz,
-    rules_hash text NOT NULL,
-    engine_semantics_version integer NOT NULL DEFAULT 0,
-    host text NOT NULL,
-    error text NOT NULL DEFAULT '',
-    compile_diagnostics jsonb NOT NULL DEFAULT '[]'::jsonb
-  )`;
 
 // 用真 rulesHash 产出带版本前缀的 rules_hash（形如 `<version>:<hash>`），避免测试自造前缀口径漂移。
 const SEED_HASH = rulesHash({ bookSourceUrl: 'https://x.example', searchUrl: 's', ruleSearch: { name: 'h1' } });
@@ -72,7 +57,7 @@ maybe('shuyuan writeAdmissionRows 版本自洽守卫（真库 INSERT 路径）',
   beforeEach(async () => {
     pg = new PGliteCtor!();
     sql = adapter(pg);
-    await pg.exec(SOURCE_ADMISSION_DDL);
+    await createProductionSchema(createPGliteSql(pg) as never, statement => pg.exec(statement));
   }, 60_000);
 
   it('同源行（engine_semantics_version = rules_hash 版本前缀）→ 落库', async () => {

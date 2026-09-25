@@ -242,6 +242,88 @@ describe('probeSourceForBook:超时与编译失败', () => {
   });
 });
 
+// 41-confirmtoc:生产 kxdu.net 实测 —— 面板 probe 判 ok(1726 章),点「切换到此源」却 404「无法建立目录」。
+// 该源 ruleBookInfo 不写 name/author(legado 语义:书名取搜索结果行,详情页只补简介/封面),
+// probe 的身份回退到搜索结果,确认路径却硬要详情页书名。probe 判 ok 的候选,确认必须打得开。
+describe('probe ok ⇒ 确认路径(index?book_url=&source=)一定建得出目录(41-confirmtoc)', () => {
+  const noNameRules = { ...engineRules, ruleBookInfo: { intro: '.intro@text', tocUrl: '.toc@href' } };
+  const NoName = { ...E1, name: '无书名规则源', rules: noNameRules };
+  const confirm = (source: Parameters<typeof service.probeSourceForBook>[0], bookUrl: string, identity = book) => drive(service.resolveSourceBook(
+    identity, new service.SourceRequestContext(new AbortController().signal), { bookUrl, sourceUrl: source.url, sources: [source] },
+  ));
+  const confirmEvents = () => vi.mocked(console.warn).mock.calls
+    .filter(([tag]) => tag === '[read-source] source_confirm_failed')
+    .map(([, payload]) => JSON.parse(String(payload)) as Record<string, unknown>);
+
+  it('详情页无书名规则(kxdu.net 形态)⇒ probe ok 且确认成功,书名/作者取请求的书', async () => {
+    pages.set(e1.search(), { text: engineListItem('测试书', '作者') });
+    pages.set(e1.detail, { text: '<p class="intro">简介</p><a class="toc" href="/toc/1.html">目录</a>' });
+    pages.set(e1.toc, { text: '<li class="chapter"><a href="/c/1.html">第一章</a></li><li class="chapter"><a href="/c/2.html">第二章</a></li>' });
+    const probed = await probe(NoName);
+    expect(probed).toMatchObject({ status: 'ok', book: { title: '测试书', bookUrl: e1.detail, chapters: 2 } });
+    const catalog = await confirm(NoName, probed.book!.bookUrl);
+    expect(catalog).toMatchObject({ title: '测试书', author: '作者', sourceUrl: NoName.url, bookUrl: e1.detail });
+    expect(catalog.chapters).toHaveLength(2);
+    expect(confirmEvents()).toEqual([]);
+  });
+
+  it('详情页有书名时仍以详情页为准(用户点选的是站上这本书,不改写成请求书名)', async () => {
+    primeEngineHit();
+    pages.set(e1.detail, { text: '<h1 class="title">测试书(修订版)</h1><a class="toc" href="/toc/1.html">目录</a>' });
+    const catalog = await confirm(E1, e1.detail);
+    expect(catalog).toMatchObject({ title: '测试书(修订版)', author: '作者' });
+  });
+
+  it('目录为空 ⇒ 404 且文案点明「目录为空」;发 source_confirm_failed(host + reason=toc_empty,不带路径)', async () => {
+    pages.set(e1.detail, { text: '<h1 class="title">测试书</h1><a class="toc" href="/toc/1.html">目录</a>' });
+    pages.set(e1.toc, { text: '<div>空</div>' });
+    await expect(confirm(E1, e1.detail)).rejects.toMatchObject({ code: 'SOURCE_NOT_FOUND', status: 404, message: expect.stringContaining('目录为空') });
+    expect(confirmEvents()).toEqual([expect.objectContaining({
+      event: 'source_confirm_failed', sourceHost: 'e1.test', tier: 'engine', reason: 'toc_empty', requests: 2,
+    })]);
+    expect(JSON.stringify(confirmEvents())).not.toContain('/d/1.html');
+  });
+
+  it('详情页取不出书名、请求也没带书名 ⇒ 404「详情页解析失败」,不再去取目录', async () => {
+    pages.set(e1.detail, { text: '<p class="intro">简介</p>' });
+    await expect(confirm(NoName, e1.detail, { title: '', author: '' }))
+      .rejects.toMatchObject({ code: 'SOURCE_NOT_FOUND', message: expect.stringContaining('详情页') });
+    expect(requested).toEqual([e1.detail]);
+    expect(confirmEvents()).toEqual([expect.objectContaining({ reason: 'detail_unparsed', requests: 1 })]);
+  });
+
+  it('上游 5xx ⇒ 503 SOURCE_UNAVAILABLE(可重试,改前原样抛出被 route 落成 500 SOURCE_INTERNAL),观测 reason 记细分码', async () => {
+    pages.set(e1.detail, { text: '', status: 500 });
+    await expect(confirm(E1, e1.detail)).rejects.toMatchObject({ code: 'SOURCE_UNAVAILABLE', status: 503 });
+    expect(confirmEvents()).toEqual([expect.objectContaining({ sourceHost: 'e1.test', tier: 'engine', reason: 'SOURCE_HTTP_5XX' })]);
+  });
+
+  it('书页 4xx ⇒ 404「书页已无法打开」;连接挂起(单请求超时)⇒ 504 SOURCE_TIMEOUT', async () => {
+    pages.set(e1.detail, { text: '', status: 404 });
+    await expect(confirm(E1, e1.detail)).rejects.toMatchObject({ code: 'SOURCE_NOT_FOUND', message: expect.stringContaining('无法打开') });
+    pages.set(e1.detail, { text: '' });
+    headerDelay.set(e1.detail, Number.POSITIVE_INFINITY);
+    await expect(confirm(E1, e1.detail)).rejects.toMatchObject({ code: 'SOURCE_TIMEOUT', status: 504 });
+    expect(confirmEvents().map((event) => event.reason)).toEqual(['SOURCE_HTTP_4XX', 'SOURCE_REQUEST_TIMEOUT']);
+  });
+
+  it('builtin book15 确认失败:文案与错误码逐字不变(零回归),只多一条观测', async () => {
+    pages.set(book15Detail(), { text: '<meta property="og:novel:book_name" content="测试书">' });
+    await expect(confirm(book15, book15Detail())).rejects.toMatchObject({
+      code: 'SOURCE_NOT_FOUND', status: 404, message: '用户选择的书源无法建立目录，请重试或换一个候选。',
+    });
+    expect(confirmEvents()).toEqual([expect.objectContaining({ sourceHost: 'book15.net', tier: 'builtin', reason: 'toc_empty' })]);
+  });
+
+  it('builtin book15 上游 5xx:仍原样抛出(不套引擎源的归类),只多一条观测', async () => {
+    pages.set(book15Detail(), { text: '', status: 500 });
+    pages.set(book15Detail().replace('book15.net', 'www.book15.net'), { text: '', status: 500 });
+    const error = await confirm(book15, book15Detail()).catch((caught: unknown) => caught);
+    expect(error).not.toBeInstanceOf(service.SourceReaderError);
+    expect(confirmEvents()).toEqual([expect.objectContaining({ tier: 'builtin', reason: 'SOURCE_HTTP_5XX' })]);
+  });
+});
+
 describe('probeSourceForBook:进程级同站节流(41-fanfix N1)', () => {
   // 浏览器扇出 = N 个独立 HTTP 请求各自一棵 context 树。节流表若是请求级的,同站 probe 会同一时刻打到源站。
   const E1b = { ...E1, url: 'https://e1.test/alt/', name: '引擎源1(同站另一行)' };

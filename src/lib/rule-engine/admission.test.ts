@@ -28,6 +28,14 @@ const HTML_HEADERS = { 'content-type': 'text/html; charset=utf-8' };
 const page = (body: string, status = 200) => new Response(body, { status, headers: HTML_HEADERS });
 const signal = () => new AbortController().signal;
 
+// 时间夹具「现在」：凡是用固定 search_checked_at 的用例，必须把批次 now 也钉到同一时刻
+// （runAdmissionBatch 的 now 注入），否则「到期/未到期」随真实日期漂移——B2 的 7 天 ok 复核窗
+// 就是这么在 2026-09-25 把 N03 祖父条款两例转红的（夹具 2026-09-18 + 真实 now）。
+const FIXTURE_NOW_MS = Date.parse('2026-09-18T12:00:00Z');
+const atFixtureNow = () => new Date(FIXTURE_NOW_MS);
+/** 相对夹具「现在」的 N 毫秒前时刻（ISO），让「几小时/几天前测过」的意图可读、且不随真实日期漂移。 */
+const fixtureAgoIso = (ms: number) => new Date(FIXTURE_NOW_MS - ms).toISOString();
+
 function sourceRow(url: string, over: Partial<AdmissionSourceRow> = {}): AdmissionSourceRow {
   return {
     source_url: url, tier: 'T7', compile_ok: false, core_field_mask: {}, search_ok: null,
@@ -799,7 +807,8 @@ describe('准入状态机 runAdmissionBatch', () => {
     });
     const admittedRow = (hash: string): [string, AdmissionSourceRow] => [url, sourceRow(url, {
       tier: 'M1', compile_ok: true, search_ok: true, search_verdict: 'ok',
-      search_checked_at: '2026-09-18T00:00:00Z', rules_hash: hash,
+      // 相对夹具「现在」：未到 B2 的 7 天 ok 复核窗（到期与否由钉住的 now 决定，不随真实日期漂移）。
+      search_checked_at: fixtureAgoIso(3 * 3_600_000), rules_hash: hash,
     })];
 
     it('规则未变 ∧ 已在池（compile_ok ∧ search_ok=true）→ 维持既有资格，不写库', async () => {
@@ -809,6 +818,7 @@ describe('准入状态机 runAdmissionBatch', () => {
         candidates: [{ url, source: legacy() }],
         declaredHosts: new Set(['pool.example.com']),
         existing: new Map([admittedRow(hash)]), fetchPage, signal: signal(), throttleMs: 0,
+        now: atFixtureNow,
       });
       expect(result.grandfathered).toBe(1);
       expect(result.compileOk).toBe(1); // 计入 ok（资格维持），不再占用 60 拒里
@@ -822,6 +832,7 @@ describe('准入状态机 runAdmissionBatch', () => {
         candidates: [{ url, source: legacy() }],
         declaredHosts: new Set(['pool.example.com']),
         existing: new Map([admittedRow('old-hash-not-matching')]), fetchPage, signal: signal(), throttleMs: 0,
+        now: atFixtureNow,
       });
       expect(result.grandfathered).toBe(0);
       expect(result.rows[0]).toMatchObject({ compile_ok: false, tier: 'T7' });
@@ -836,10 +847,10 @@ describe('准入状态机 runAdmissionBatch', () => {
           declaredHosts: new Set(['pool.example.com']),
           existing: new Map([[url, sourceRow(url, {
             tier: 'M1', compile_ok: true, search_ok: searchOk, search_verdict: 'no_result',
-            search_checked_at: '2026-09-18T00:00:00Z', rules_hash: hash,
+            search_checked_at: fixtureAgoIso(3 * 3_600_000), rules_hash: hash,
           })]]),
           fetchPage: vi.fn<AdmissionTransport>().mockResolvedValue(page('<html>x</html>')),
-          signal: signal(), throttleMs: 0,
+          signal: signal(), throttleMs: 0, now: atFixtureNow,
         });
         expect(result.grandfathered).toBe(0);
         expect(result.rows[0].compile_ok).toBe(false);
@@ -848,7 +859,7 @@ describe('准入状态机 runAdmissionBatch', () => {
       const fresh = await runAdmissionBatch({
         candidates: [{ url, source: legacy() }],
         declaredHosts: new Set(['pool.example.com']), existing: new Map(),
-        fetchPage: vi.fn<AdmissionTransport>(), signal: signal(), throttleMs: 0,
+        fetchPage: vi.fn<AdmissionTransport>(), signal: signal(), throttleMs: 0, now: atFixtureNow,
       });
       expect(fresh.grandfathered).toBe(0);
       expect(fresh.rows[0].compile_ok).toBe(false);
@@ -870,7 +881,7 @@ describe('准入状态机 runAdmissionBatch', () => {
         existing: new Map([admittedRow(hashA)]),
         fetchPage: vi.fn<AdmissionTransport>().mockResolvedValue(
           page('<div class="i"><span class="t">书名</span><a href="/b/1">x</a></div>')),
-        signal: signal(), throttleMs: 0,
+        signal: signal(), throttleMs: 0, now: atFixtureNow,
       });
       expect(result.grandfathered).toBe(1);
       // b 是新源（无既有行）且缺 chapterUrl：L2 判 compile-ok、直接拿探测名额，不转拒。
@@ -878,6 +889,33 @@ describe('准入状态机 runAdmissionBatch', () => {
       expect(result.rows[0]).toMatchObject({
         source_url: 'https://never-probed.example.com', compile_ok: true, search_ok: true,
       });
+    });
+
+    it('窗口边界钉死（now 注入）：在池干净 ok 行未到 7 天窗 ⇒ 不重写；到期 ⇒ class 2 复核（防日期漂移再次转红）', async () => {
+      const hash = rulesHash(legacy());
+      const fetchPage = vi.fn<AdmissionTransport>().mockResolvedValue(
+        page('<div class="i"><span class="t">书名</span><a href="/b/1">x</a></div>'));
+      const checkedAt = (msAgo: number) => sourceRow(url, {
+        tier: 'M1', compile_ok: true, search_ok: true, search_verdict: 'ok',
+        search_checked_at: fixtureAgoIso(msAgo), rules_hash: hash,
+      });
+      // 6 天前测过 < 7 天窗：结论仍有效，不写行、不复测。
+      const within = await runAdmissionBatch({
+        candidates: [{ url, source: legacy() }], declaredHosts: new Set(['pool.example.com']),
+        existing: new Map([[url, checkedAt(6 * 24 * 3_600_000)]]), fetchPage,
+        signal: signal(), throttleMs: 0, now: atFixtureNow,
+      });
+      expect(within.rows).toHaveLength(0);
+      expect(fetchPage).not.toHaveBeenCalled();
+      // 8 天前测过 > 7 天窗：class 2 长周期复核到期 ⇒ 真探并改写行。
+      const due = await runAdmissionBatch({
+        candidates: [{ url, source: legacy() }], declaredHosts: new Set(['pool.example.com']),
+        existing: new Map([[url, checkedAt(8 * 24 * 3_600_000)]]), fetchPage,
+        signal: signal(), throttleMs: 0, now: atFixtureNow,
+      });
+      expect(due.probed).toBe(1);
+      expect(due.rows).toHaveLength(1);
+      expect(due.rows[0]).toMatchObject({ source_url: url, search_verdict: 'ok' });
     });
   });
 
@@ -894,7 +932,7 @@ describe('准入状态机 runAdmissionBatch', () => {
       const hash = rulesHash(rescued());
       const existing = new Map([[url, sourceRow(url, {
         tier: 'M1', compile_ok: true, search_ok: true, search_verdict: 'ok',
-        search_checked_at: '2026-09-19T00:00:00Z', rules_hash: hash,
+        search_checked_at: fixtureAgoIso(3 * 3_600_000), rules_hash: hash,
       })]]);
       // 注意：当前代码（L2 生效）下 compileAdmission(rescued()) 已 ok，exempt 分支不可达——
       // 回滚态由「既有行不变 + compileAdmission 复判」联合表达：本用例先钉住
@@ -904,7 +942,7 @@ describe('准入状态机 runAdmissionBatch', () => {
       const fetchPage = vi.fn<AdmissionTransport>();
       const steady = await runAdmissionBatch({
         candidates: [{ url, source: rescued() }], declaredHosts: new Set(['rollback.example.com']),
-        existing, fetchPage, signal: signal(), throttleMs: 0,
+        existing, fetchPage, signal: signal(), throttleMs: 0, now: atFixtureNow,
       });
       expect(steady.rows).toHaveLength(0); // probeClass=2（结论仍有效）不重写、不复测
       expect(fetchPage).not.toHaveBeenCalled();
