@@ -15,7 +15,7 @@
     "test:scripts": "node scripts/run-mjs-tests.mjs",
     "test:py": "node scripts/run-py-tests.mjs",
     "check": "npm run typecheck && npm run lint && npm run check:deploy && npm run test:scripts && npm run test:py && npm test && npm run build",
-    "check:deploy": "node scripts/check-deploy-config.mjs",
+    "check:deploy": "node scripts/check-deploy-config.mjs && node scripts/check-env-example.mjs",
     "test:contracts": "vite-node scripts/check-worker-contract.mjs",
     "w1:candidates": "node --experimental-strip-types scripts/w1-candidates.mjs",
     "migrate:auth": "node --experimental-strip-types scripts/migrate-user-auth.mjs",

@@ -111,6 +111,16 @@ export async function seedV6MemberUser(pg: { query(text: string, params?: unknow
   `);
 }
 
+export async function seedProductionMembers(
+  pg: { query(text: string, params?: unknown[]): Promise<unknown> }, count: number,
+): Promise<void> {
+  await pg.query(`
+    INSERT INTO users (id, username, password_hash, role, can_find, can_read, can_download)
+    SELECT id, 'member' || id, 'hash', 'member', true, false, false
+    FROM generate_series(2, $1::int) AS id
+  `, [count]);
+}
+
 /** 一张表的结构指纹：列（名/类型/可空/默认）、索引、约束。用于 fixture 与生产的结构齐性断言。 */
 export async function tableFingerprint(
   pg: { query(text: string, params?: unknown[]): Promise<{ rows: Record<string, unknown>[] }> },

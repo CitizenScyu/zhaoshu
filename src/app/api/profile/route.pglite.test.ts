@@ -1,6 +1,7 @@
 import { beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { NextRequest } from 'next/server';
-import { initializeBusinessSchema } from '@/lib/business-schema';
+import { createPGliteSql } from '@/lib/fixtures/pglite-sql';
+import { createProductionSchema, seedProductionMembers } from '@/lib/fixtures/production-schema';
 import { loadPGlite, type PGliteLike } from '@/lib/fixtures/pglite';
 import { recentInformativeFeedbackForUserQuery, withdrawnFeedbackBookTitlesForUserQuery } from '@/lib/user-data';
 
@@ -102,8 +103,8 @@ maybe('真实 PostgreSQL：F04 撤回信号经过真实路由（P1-2）', () => 
 
   beforeAll(async () => {
     pg = new PGliteCtor!();
-    await pg.exec('CREATE TABLE users (id int PRIMARY KEY); INSERT INTO users SELECT generate_series(1, 5)');
-    await initializeBusinessSchema(tag as never);
+    await createProductionSchema(createPGliteSql(pg) as never, statement => pg.exec(statement));
+    await seedProductionMembers(pg, 5);
     // 书 A：历史 done+note（旧偏好），最新一行撤回（reading）。
     const withdrawn = await book('撤回书 A');
     await feedback(1, withdrawn, 'done', '过时的雷点X');

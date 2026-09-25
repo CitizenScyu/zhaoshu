@@ -6,6 +6,8 @@
 import { beforeEach, describe, expect, it } from 'vitest';
 import { importLabelWithSystemTask, type ImporterSql } from './importer-enqueue';
 import { loadPGlite, type PGliteLike } from './fixtures/pglite';
+import { createPGliteSql } from './fixtures/pglite-sql';
+import { createProductionSchema } from './fixtures/production-schema';
 
 function adapter(pg: PGliteLike): ImporterSql {
   return (async (parts: TemplateStringsArray, ...values: unknown[]) => {
@@ -35,48 +37,7 @@ maybe('T5 × T1 契约兼容(不 import T1 文件)', () => {
   beforeEach(async () => {
     pg = new PGliteCtor!();
     sql = adapter(pg);
-    await pg.exec(`
-      CREATE TABLE users (id integer PRIMARY KEY);
-      INSERT INTO users(id) VALUES (1);
-      CREATE TABLE download_tasks (
-        id serial PRIMARY KEY, book_id integer NOT NULL, title text NOT NULL,
-        author text NOT NULL DEFAULT '', status text NOT NULL DEFAULT 'pending',
-        source_url text NOT NULL DEFAULT '', chapters_total integer NOT NULL DEFAULT 0,
-        chapters_done integer NOT NULL DEFAULT 0, chars_total integer NOT NULL DEFAULT 0,
-        error text NOT NULL DEFAULT '', created_at timestamptz NOT NULL DEFAULT now(),
-        updated_at timestamptz NOT NULL DEFAULT now(),
-        user_id integer CONSTRAINT download_tasks_user_fk REFERENCES users(id),
-        requested_by text NOT NULL DEFAULT 'user', source_kind text NOT NULL DEFAULT 'builtin',
-        source_id text, source_revision text NOT NULL DEFAULT '',
-        policy_version text NOT NULL DEFAULT '', enqueue_key text,
-        attempt_count integer NOT NULL DEFAULT 1, retry_of integer,
-        next_attempt_at timestamptz, lease_generation integer NOT NULL DEFAULT 0,
-        lease_owner text NOT NULL DEFAULT '',
-        CONSTRAINT download_tasks_identity_check CHECK (
-          (requested_by = 'user' AND user_id IS NOT NULL)
-          OR (requested_by = 'system' AND user_id IS NULL))
-      );
-      CREATE UNIQUE INDEX download_tasks_user_active_book_idx ON download_tasks (user_id, book_id)
-        WHERE status IN ('pending', 'running');
-      CREATE UNIQUE INDEX download_tasks_system_active_book_idx ON download_tasks (book_id)
-        WHERE requested_by = 'system' AND status IN ('pending', 'running');
-      CREATE UNIQUE INDEX download_tasks_system_event_idx ON download_tasks (enqueue_key)
-        WHERE requested_by = 'system' AND enqueue_key IS NOT NULL;
-      CREATE TABLE labeled_books (
-        id serial PRIMARY KEY, title text NOT NULL, author text NOT NULL DEFAULT '',
-        category text NOT NULL DEFAULT '', finish_status text NOT NULL DEFAULT '',
-        source_site text NOT NULL DEFAULT '', source_url text NOT NULL DEFAULT '',
-        chars_labeled integer NOT NULL DEFAULT 0, labels jsonb NOT NULL DEFAULT '{}',
-        labeled_at timestamptz NOT NULL DEFAULT now(),
-        primary_genre text NOT NULL DEFAULT '', sub_tags jsonb NOT NULL DEFAULT '[]',
-        quality float8
-      );
-      ALTER TABLE labeled_books ADD COLUMN title_key text GENERATED ALWAYS AS (
-        lower(btrim(regexp_replace(btrim(normalize(title, NFKC)), '^《(.+)》$', '\\1')))) STORED;
-      ALTER TABLE labeled_books ADD COLUMN author_key text GENERATED ALWAYS AS (
-        lower(btrim(normalize(author, NFKC)))) STORED;
-      CREATE UNIQUE INDEX labeled_books_identity_idx ON labeled_books (title_key, author_key);
-    `);
+    await createProductionSchema(createPGliteSql(pg) as never, statement => pg.exec(statement));
   }, 60_000);
 
   it('T1 事件键格式与列契约:导出的键与 T1 systemTaskEnqueueKey 同形', async () => {

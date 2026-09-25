@@ -12,8 +12,9 @@ import {
   type ImportedLabelRecord,
   type ImporterSql,
 } from './importer-enqueue';
-import { authSchemaV7Statement } from './auth-store';
 import { loadPGlite, type PGliteLike } from './fixtures/pglite';
+import { createPGliteSql } from './fixtures/pglite-sql';
+import { createProductionSchema, seedV6MemberUser } from './fixtures/production-schema';
 
 type Row = Record<string, unknown>;
 
@@ -49,57 +50,8 @@ maybe('T5:labels 入库与系统入队同语句', () => {
   beforeEach(async () => {
     pg = new PGliteCtor!();
     sql = adapter(pg);
-    await pg.exec(`
-      CREATE TABLE auth_schema_migrations (version integer PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now());
-      INSERT INTO auth_schema_migrations(version) SELECT generate_series(1, 6);
-      CREATE TABLE users (id integer PRIMARY KEY);
-      INSERT INTO users(id) VALUES (1), (2);
-      CREATE TABLE download_tasks (
-        id serial PRIMARY KEY,
-        book_id integer NOT NULL,
-        title text NOT NULL,
-        author text NOT NULL DEFAULT '',
-        status text NOT NULL DEFAULT 'pending',
-        source_url text NOT NULL DEFAULT '',
-        chapters_total integer NOT NULL DEFAULT 0,
-        chapters_done integer NOT NULL DEFAULT 0,
-        chars_total integer NOT NULL DEFAULT 0,
-        error text NOT NULL DEFAULT '',
-        created_at timestamptz NOT NULL DEFAULT now(),
-        updated_at timestamptz NOT NULL DEFAULT now(),
-        user_id integer NOT NULL CONSTRAINT download_tasks_user_fk REFERENCES users(id)
-      );
-      CREATE INDEX download_tasks_user_created_idx ON download_tasks(user_id, created_at DESC);
-      CREATE UNIQUE INDEX download_tasks_user_active_book_idx ON download_tasks(user_id, book_id)
-        WHERE status IN ('pending', 'running');
-      CREATE TABLE labeled_books (
-        id serial PRIMARY KEY, title text NOT NULL, author text NOT NULL DEFAULT '',
-        category text NOT NULL DEFAULT '', finish_status text NOT NULL DEFAULT '',
-        source_site text NOT NULL DEFAULT '', source_url text NOT NULL DEFAULT '',
-        chars_labeled integer NOT NULL DEFAULT 0, labels jsonb NOT NULL DEFAULT '{}',
-        labeled_at timestamptz NOT NULL DEFAULT now(),
-        primary_genre text NOT NULL DEFAULT '', sub_tags jsonb NOT NULL DEFAULT '[]',
-        quality float8
-      );
-      ALTER TABLE labeled_books ADD COLUMN title_key text GENERATED ALWAYS AS (
-        lower(btrim(regexp_replace(btrim(normalize(title, NFKC)), '^《(.+)》$', '\\1')))
-      ) STORED;
-      ALTER TABLE labeled_books ADD COLUMN author_key text GENERATED ALWAYS AS (
-        lower(btrim(normalize(author, NFKC)))
-      ) STORED;
-      CREATE UNIQUE INDEX labeled_books_identity_idx ON labeled_books (title_key, author_key);
-    `);
-    const tx = (parts: TemplateStringsArray, ...values: unknown[]) => {
-      let text = '';
-      const params: unknown[] = [];
-      parts.forEach((part, index) => {
-        text += part;
-        if (index < values.length) { params.push(values[index]); text += `$${params.length}`; }
-      });
-      return { text, params };
-    };
-    const statement = authSchemaV7Statement(tx as never) as unknown as { text: string; params: unknown[] };
-    await pg.query(statement.text, statement.params);
+    await createProductionSchema(createPGliteSql(pg) as never, statement => pg.exec(statement));
+    await seedV6MemberUser(pg);
   }, 60_000);
 
   async function taskRows(): Promise<Row[]> {
@@ -267,8 +219,7 @@ maybe('T5:labels 入库与系统入队同语句', () => {
   });
 
   it('ID 空间红线:books.id 填进下载任务会被 assertLabeledBookId 拦下', async () => {
-    await pg.exec('CREATE TABLE books (id serial PRIMARY KEY, title text NOT NULL)');
-    await pg.query("INSERT INTO books (title) VALUES ('另一 ID 空间的书')");   // books.id = 1
+    await pg.query("INSERT INTO books (title, author) VALUES ('另一 ID 空间的书', '作者')");
     await expect(assertLabeledBookId(sql, 1)).rejects.toThrow('labeled_book_id_not_in_space');
     for (const bad of [0, -1, 1.5, NaN]) {
       await expect(assertLabeledBookId(sql, bad as number)).rejects.toThrow();

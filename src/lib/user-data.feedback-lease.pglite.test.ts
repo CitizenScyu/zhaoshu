@@ -1,5 +1,6 @@
 import { beforeAll, describe, expect, it } from 'vitest';
-import { initializeBusinessSchema } from '@/lib/business-schema';
+import { createPGliteSql } from '@/lib/fixtures/pglite-sql';
+import { createProductionSchema, seedProductionMembers } from '@/lib/fixtures/production-schema';
 import { loadPGlite, type PGliteLike } from '@/lib/fixtures/pglite';
 import {
   claimProfileFeedbackForUserQuery,
@@ -100,8 +101,8 @@ maybe('真实 PostgreSQL：profile_feedback_queue 租约与退避（F15 残留�
 
   beforeAll(async () => {
     pg = new PGliteCtor!();
-    await pg.exec('CREATE TABLE users (id int PRIMARY KEY); INSERT INTO users SELECT generate_series(1, 5)');
-    await initializeBusinessSchema(schemaTag as never);
+    await createProductionSchema(createPGliteSql(pg) as never, statement => pg.exec(statement));
+    await seedProductionMembers(pg, 5);
   }, 60_000);
 
   it('并发领取反例：两个并发事务同时领取，只有一个拿到', async () => {
@@ -241,7 +242,8 @@ maybe('真实 PostgreSQL：profile_feedback_queue 租约与退避（F15 残留�
       await enqueue(userId, id - 1, true);
       return id;
     };
-    await pg.query('INSERT INTO users (id) VALUES (201), (202)');
+    await pg.query(`INSERT INTO users (id, username, password_hash, role)
+      SELECT id, 'member' || id, 'hash', 'member' FROM (VALUES (201), (202)) AS members(id)`);
     // 202 先入队并从此无人问津：updated_at 停在入队那一刻，是队里最久未被处理的行。
     const idHigh = await seed(202, '公平乙久候无人处理');
     // pg_sleep 让两次写入落在可区分的时刻（PGlite 同一毫秒内会撞同刻，退化为 user_id 破平）。
@@ -272,7 +274,8 @@ maybe('真实 PostgreSQL：profile_feedback_queue 租约与退避（F15 残留�
   });
 
   const prepareCommit = async (userId: number) => {
-    await pg.query('INSERT INTO users (id) VALUES ($1)', [userId]);
+    await pg.query(`INSERT INTO users (id, username, password_hash, role)
+      VALUES ($1::int, 'member' || ($1::int)::text, 'hash', 'member')`, [userId]);
     await pg.query(`INSERT INTO profile (id, seeds, content) VALUES ($1, $2::jsonb, '旧画像')`,
       [userId, JSON.stringify([{ title: '合成种子', author: '合成作者' }])]);
     const b = await book(`原子提交${userId}`);
