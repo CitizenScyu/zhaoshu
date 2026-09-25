@@ -43,6 +43,14 @@ describe('环境变量样例覆盖', () => {
     expect(missesFoo(py, 'scripts/probe.py')).toBe(true);
   });
 
+  it("识别取值辅助函数 requiredEnv(env, '<K>')（字面量键）", () => {
+    expect(missesFoo(`export const f = (env: NodeJS.ProcessEnv) => requiredEnv(env, '${K}');`)).toBe(true);
+  });
+  it('边界：取值辅助函数的键来自变量（requiredEnv(env, name)）时不识别（动态键）', () => {
+    // 静态无法确定要文档化哪个键，故不报；对照上一例的字面量键必报。
+    expect(missesFoo('export const f = (env: NodeJS.ProcessEnv, name: string) => requiredEnv(env, name);')).toBe(false);
+  });
+
   it.each([
     ['process.env.<K>（属性访问，前缀不同）', `export const f = () => process.env.${K};`, true],
     ['x.env.<K>（无关对象的点式 env）', `export const f = (x: { env: Record<string,string> }) => x.env.${K};`, false],
