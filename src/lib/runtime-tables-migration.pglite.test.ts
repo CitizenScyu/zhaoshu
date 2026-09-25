@@ -15,6 +15,7 @@ import { loadPGlite, type PGliteLike } from '@/lib/fixtures/pglite';
 import { createPGliteClient, createPGliteSql } from '@/lib/fixtures/pglite-sql';
 import { applyMigration, evaluateSchema, EXPECTED_TABLES, inspectSchema, loadMigrations } from '../../scripts/db-migration-lib.mjs';
 import { runAuthMigration } from '../../scripts/migrate-auth-prod.mjs';
+import { assertAuthSchema } from './auth-store';
 
 const RUNTIME_TABLES = ['app_settings', 'cron_health', 'profile_feedback_queue', 'source_admission'];
 
@@ -48,7 +49,9 @@ maybe('0003 四表与运行时建表同构（逐列比对，真 SQL）', () => {
 
     viaMigration = new PGliteCtor!();
     await applyMigration(createPGliteClient(viaMigration), migrations);
+    await expect(assertAuthSchema(createPGliteSql(viaMigration) as never)).rejects.toThrow();
     await runAuthMigration(createPGliteSql(viaMigration), 'apply');
+    await expect(assertAuthSchema(createPGliteSql(viaMigration) as never)).resolves.toBeUndefined();
 
     viaRuntime = new PGliteCtor!();
     const withoutRuntimeTables = migrations.filter((item) => item.version < 3);
