@@ -117,7 +117,7 @@ Remove-Item Env:PROD_DATABASE_URL
 
 `db:check:prod` 同时判 artifact 侧：缺 `artifact_schema_migrations` / `storage_repositories` / `book_artifacts`
 （`EXPECTED_TABLES` 自 41-coldbuild 起含这三张表）或 artifact 记账版本低于 `ARTIFACT_SCHEMA_VERSION`（2）时，退出码 2、`artifactVersionOk: false`，
-输出里 `missingTables` 会列出它们。这是 tempdb41 冷建演练踩到的 D1：此前这两张业务表不在清单里，冷建库缺表
+输出里 `missingTables` 会列出它们。这是 tempdb41 冷建演练踩到的 D1：此前这三张表（含记账表 `artifact_schema_migrations`）不在清单里，冷建库缺表
 `db:check:prod` 仍 rc=0，而 T8 worker 启动即 `relation "storage_repositories" does not exist`。重建后的
 运行期设置恢复与数据重灌（书源/准入/打标）见 `docs/auth-deployment.md`「从零重建」一节。
 
