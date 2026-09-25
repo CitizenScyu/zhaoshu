@@ -84,7 +84,7 @@ describe('artifact registry: real local Postgres and mock private GitHub', () =>
   }
 
   it('registers independent migration once, preserves old tasks, and keeps FK protection', async () => {
-    expect((await pg.query('SELECT version FROM artifact_schema_migrations')).rows).toEqual([{ version: 1 }]);
+    expect((await pg.query('SELECT version FROM artifact_schema_migrations ORDER BY version')).rows).toEqual([{ version: 1 }, { version: 2 }]);
     expect((await pg.query('SELECT user_id,artifact_id,chapters_done FROM download_tasks WHERE id=1')).rows)
       .toEqual([{ user_id: 1, artifact_id: null, chapters_done: 0 }]);
     await expect(pg.exec('UPDATE download_tasks SET artifact_id=999 WHERE id=1')).rejects.toMatchObject({ code: '23503' });
@@ -118,17 +118,17 @@ describe('artifact registry: real local Postgres and mock private GitHub', () =>
 
   it('accepts the independently added T1 bigint seam and rejects newer migration versions atomically', async () => {
     await pg.exec(`CREATE SCHEMA t2_migration_order; SET search_path TO t2_migration_order;
-      CREATE TABLE labeled_books(id integer PRIMARY KEY);
-      CREATE TABLE download_tasks(id integer PRIMARY KEY,artifact_id bigint)`);
+      CREATE TABLE labeled_books(id integer PRIMARY KEY); INSERT INTO labeled_books VALUES(1);
+      CREATE TABLE download_tasks(id integer PRIMARY KEY,book_id integer NOT NULL,artifact_id bigint)`);
     try {
       await initializeArtifactSchema(sql);
       expect((await pg.query("SELECT data_type FROM information_schema.columns WHERE table_schema='t2_migration_order' AND table_name='download_tasks' AND column_name='artifact_id'")).rows)
         .toEqual([{ data_type: 'bigint' }]);
-      await expect(pg.exec('INSERT INTO download_tasks VALUES(1,999)')).rejects.toMatchObject({ code: '23503' });
-      await pg.exec('INSERT INTO artifact_schema_migrations(version) VALUES(2)');
+      await expect(pg.exec('INSERT INTO download_tasks VALUES(1,1,999)')).rejects.toMatchObject({ code: '23503' });
+      await pg.exec('INSERT INTO artifact_schema_migrations(version) VALUES(3)');
       await expect(initializeArtifactSchema(sql)).rejects.toThrow('unsupported artifact schema version');
       expect((await pg.query('SELECT version FROM artifact_schema_migrations ORDER BY version')).rows)
-        .toEqual([{ version: 1 }, { version: 2 }]);
+        .toEqual([{ version: 1 }, { version: 2 }, { version: 3 }]);
     } finally {
       await pg.exec('SET search_path TO public; DROP SCHEMA t2_migration_order CASCADE');
     }
@@ -147,7 +147,7 @@ describe('artifact registry: real local Postgres and mock private GitHub', () =>
     expect((await pg.query(`SELECT count(*)::int AS n FROM pg_constraint
       WHERE conrelid='download_tasks'::regclass AND conname='download_tasks_artifact_fk' AND contype='f'`)).rows)
       .toEqual([{ n: 1 }]);
-    expect((await pg.query('SELECT version FROM artifact_schema_migrations')).rows).toEqual([{ version: 1 }]);
+    expect((await pg.query('SELECT version FROM artifact_schema_migrations ORDER BY version')).rows).toEqual([{ version: 1 }, { version: 2 }]);
     expect((await pg.query('SELECT artifact_id FROM download_tasks WHERE id=1')).rows).toEqual([{ artifact_id: id }]);
     expect(await claim()).toBe(id);
     await expect(pg.exec('UPDATE download_tasks SET artifact_id=999 WHERE id=1')).rejects.toMatchObject({ code: '23503' });

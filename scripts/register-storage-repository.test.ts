@@ -67,9 +67,10 @@ const maybe = PGliteCtor ? describe : describe.skip;
 maybe('runRegistration（PGlite 真库）', () => {
   // artifact schema 的 book_artifacts 对 labeled_books(id) 与 download_tasks 有外键依赖；
   // 本用例只关心 storage_repositories，故建两张最小父表（与迁移 0001 的形状无关，够用即可）。
+  // download_tasks 要有 book_id：artifact v2（41-bookidfk）给它加指向 labeled_books(id) 的外键。
   async function withArtifactSchema(): Promise<PGliteLike> {
     const pg = new PGliteCtor!();
-    await pg.exec('CREATE TABLE labeled_books (id serial PRIMARY KEY); CREATE TABLE download_tasks (id serial PRIMARY KEY);');
+    await pg.exec('CREATE TABLE labeled_books (id serial PRIMARY KEY); CREATE TABLE download_tasks (id serial PRIMARY KEY, book_id int NOT NULL);');
     await initializeArtifactSchema(createPGliteSql(pg) as never);
     return pg;
   }

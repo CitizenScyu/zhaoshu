@@ -88,12 +88,14 @@ maybe('冷建库灾备链路（db:migrate → migrate:auth:prod → ensureSchema
     expect(verdict.ok).toBe(false);
   }, 60_000);
 
-  it('migrate:artifacts:prod 补齐 artifact schema v1 后 db:check 通过', async () => {
+  it('migrate:artifacts:prod 补齐 artifact schema（v1 + v2 book_id 外键）后 db:check 通过', async () => {
     const report = await runArtifactMigration(sql, 'apply');
     expect(report.status).toBe('applied');
-    expect(report.after?.max).toBe(1);
+    // 冷建库没有任务行：v2 的孤儿预检为 0，不拒绝。
+    expect(report.bookIdIntegrity.orphanTasks).toBe(0);
+    expect(report.after?.max).toBe(2);
     const verdict = evaluateSchema(await inspectSchema(client), migrations);
-    expect(verdict.artifactVersion).toBe(1);
+    expect(verdict.artifactVersion).toBe(2);
     expect(verdict.artifactVersionOk).toBe(true);
     expect(verdict.ok).toBe(true);
   }, 60_000);

@@ -1,12 +1,12 @@
 import type { neon } from '@neondatabase/serverless';
 
 /**
- * 本函数当前写死的版本（`WHERE version = 1` / `INSERT ... VALUES (1)` / `version > 1` 三处 DDL 字面量）。
+ * 本函数当前写死的版本（`version = 1` / `version = 2` 两段记账与 `version > 2` 上限都是 DDL 字面量）。
  * 常量与 DDL 的绑定由测试保证（真库跑完 initializeArtifactSchema 后 artifact_schema_migrations 的
  * max(version) 必须等于它）——DDL 在同一个 DO 块里，插值会被 neon 标签当参数而不下发，故不内联。
  * 生产入口 scripts/migrate-artifacts-prod.mjs 与 db:check:prod 的 artifact 判据都读这个常量。
  */
-export const ARTIFACT_SCHEMA_VERSION = 1;
+export const ARTIFACT_SCHEMA_VERSION = 2;
 
 /** Explicit migration only: never run DDL on a reader request. Independent of auth/T1 versions. */
 export async function initializeArtifactSchema(sql: ReturnType<typeof neon>) {
@@ -15,8 +15,8 @@ export async function initializeArtifactSchema(sql: ReturnType<typeof neon>) {
     tx`CREATE TABLE IF NOT EXISTS artifact_schema_migrations (
       version integer PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now()
     )`,
-    tx`DO $$ BEGIN
-      IF EXISTS (SELECT 1 FROM artifact_schema_migrations WHERE version > 1) THEN
+    tx`DO $$ DECLARE orphan_count bigint; BEGIN
+      IF EXISTS (SELECT 1 FROM artifact_schema_migrations WHERE version > 2) THEN
         RAISE EXCEPTION 'unsupported artifact schema version';
       END IF;
       IF NOT EXISTS (SELECT 1 FROM artifact_schema_migrations WHERE version = 1) THEN
@@ -79,6 +79,28 @@ export async function initializeArtifactSchema(sql: ReturnType<typeof neon>) {
         AND conname = 'download_tasks_artifact_fk') THEN
         ALTER TABLE download_tasks ADD CONSTRAINT download_tasks_artifact_fk
           FOREIGN KEY (artifact_id) REFERENCES book_artifacts(id);
+      END IF;
+      -- v2 (41-bookidfk): download_tasks.book_id lives in the labeled_books id space, same as
+      -- book_artifacts.labeled_book_id. Without this FK a one-off enqueue of row ordinals as book_id
+      -- sat in the queue until artifact reserve failed (t8fk-41). NO ACTION like book_artifacts: no
+      -- code path deletes labeled_books, and task history must not cascade away. Existing orphans
+      -- abort the whole batch with a count; this migration never deletes rows. Same check repairs a
+      -- dropped FK after v2 was recorded.
+      IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid = 'download_tasks'::regclass
+        AND conname = 'download_tasks_book_fk') THEN
+        -- Importers write labeled_books then download_tasks; lock in that order to avoid deadlock.
+        LOCK TABLE labeled_books, download_tasks IN SHARE ROW EXCLUSIVE MODE;
+        SELECT count(*) INTO orphan_count FROM download_tasks t
+          WHERE NOT EXISTS (SELECT 1 FROM labeled_books lb WHERE lb.id = t.book_id);
+        IF orphan_count > 0 THEN
+          RAISE EXCEPTION 'download_tasks has % rows whose book_id is not in labeled_books', orphan_count
+            USING HINT = 'clean orphan download tasks first (docs/artifact-registry.md); the migration does not delete data';
+        END IF;
+        ALTER TABLE download_tasks ADD CONSTRAINT download_tasks_book_fk
+          FOREIGN KEY (book_id) REFERENCES labeled_books(id);
+      END IF;
+      IF NOT EXISTS (SELECT 1 FROM artifact_schema_migrations WHERE version = 2) THEN
+        INSERT INTO artifact_schema_migrations(version) VALUES (2);
       END IF;
     END $$`,
   ]);
