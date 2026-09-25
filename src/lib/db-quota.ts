@@ -8,7 +8,7 @@
 // 驱动错误形态（@neondatabase/serverless 1.1.0 index.mjs 的 execute，读源码核实）：
 //   非 2xx 且非 400 的响应一律 `new NeonDbError("Server error (HTTP status " + status + "): " + 响应体文本)`，
 //   **不设 code**；生产实测 402 的响应体为 `{"message":"Your account or project has exceeded the quota. …"}`。
-// 所以判定只能看 message：驱动固定措辞 `Server error (HTTP status 402)`，或 Neon 文案 `exceeded the … quota`
+// 所以判定只能看 message：驱动措辞 `Server error (HTTP status N)` 在时只认 N=402；无此措辞时看 Neon 文案 `exceeded the … quota`
 // （后者也覆盖 WebSocket/pg 协议路径的 `exceeded the compute time quota` 之类变体）。
 
 export const DB_QUOTA_ERROR_CODE = 'DB_QUOTA_EXCEEDED';
@@ -21,7 +21,7 @@ export const MAX_DB_QUOTA_BACKOFF_MS = 4 * 3_600_000;
 /** cron_health 里记「最近一次发现配额错误」的行名（last_success_at 列存的是发现时刻，不是成功时刻）。 */
 export const DB_QUOTA_HEALTH_ROW = 'db_quota_exceeded';
 
-const DRIVER_402 = /Server error \(HTTP status 402\)/;
+const DRIVER_STATUS = /Server error \(HTTP status (\d+)\)/;
 const NEON_QUOTA_TEXT = /exceeded the (?:[\w-]+ ){0,3}quota/i;
 const MAX_CAUSE_DEPTH = 4;
 
@@ -40,7 +40,12 @@ export class DbQuotaExceededError extends Error {
  */
 export function isDbQuotaError(error: unknown, depth = 0): boolean {
   if (depth > MAX_CAUSE_DEPTH || error === null || error === undefined) return false;
-  if (typeof error === 'string') return DRIVER_402.test(error) || NEON_QUOTA_TEXT.test(error);
+  if (typeof error === 'string') {
+    // 驱动措辞带状态码时只认 402：别的状态码即使响应体恰含「exceeded the … quota」也不判中
+    // （误判一次 = 本实例自停 30 分钟，宁缺勿滥）。无状态码措辞（pg 协议路径）才看 Neon 文案。
+    const status = DRIVER_STATUS.exec(error);
+    return status ? status[1] === '402' : NEON_QUOTA_TEXT.test(error);
+  }
   if (typeof error !== 'object') return false;
   if (error instanceof DbQuotaExceededError) return true;
   const record = error as { code?: unknown; message?: unknown; cause?: unknown; sourceError?: unknown };

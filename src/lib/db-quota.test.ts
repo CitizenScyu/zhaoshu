@@ -39,6 +39,11 @@ describe('isDbQuotaError（用驱动真实错误形态）', () => {
     expect(isDbQuotaError(await driverError(402, 'payment required'))).toBe(true);
   });
 
+  it('非 402 状态即使响应体含 Neon 配额文案也不判中（审查 §1 边界）', async () => {
+    expect(isDbQuotaError(await driverError(500, QUOTA_BODY))).toBe(false);
+    expect(isDbQuotaError(await driverError(503, QUOTA_BODY))).toBe(false);
+  });
+
   it('其他服务端错误（500/503）、SQL 错误（400）不误判', async () => {
     expect(isDbQuotaError(await driverError(500, 'internal'))).toBe(false);
     expect(isDbQuotaError(await driverError(503, 'unavailable'))).toBe(false);
