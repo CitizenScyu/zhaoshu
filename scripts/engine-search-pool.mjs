@@ -53,3 +53,31 @@ export async function searchSources({ sources, hostKey, searchOne, signal, concu
   await Promise.all(Array.from({ length: width }, () => worker()));
   return slots.flatMap((items) => items ?? []);
 }
+
+/**
+ * 源的身份 host（bookSourceUrl 的 hostname）：CLI 候选的 source 字段、--skip-host 过滤都用它。
+ * @param {{ url: string }} source
+ * @returns {string}
+ */
+export function sourceHostOf(source) {
+  try { return new URL(source.url).hostname; } catch { return ''; }
+}
+
+/**
+ * --skip-host 过滤：按**源身份 host**（声明 host）跳过，与 searchSources 的分组键（searchUrl 展开后
+ * 实际请求的 host）刻意不是同一个键（esprev41 ③，authfix41 定口径——不统一，理由）：
+ *  - 跳过名单来自 labeler 的 EngineJunkTracker，它只看得到候选的 source 字段（= 身份 host）；
+ *    CLI 输出里没有请求 host，改用请求 host 就得扩输出契约、Python/CLI 两端一起改。
+ *  - 两个键管两件事：垃圾判定是「这个源的搜索规则不随查询变化」（源级属性）；分组是「同一台服务器
+ *    不并发」（站级礼貌）。多个源共用一个搜索服务器时，一个源的规则坏不代表其余源也坏，
+ *    按请求 host 跳会把好源连坐。
+ * 两端对跳过键自洽（Python 记的就是 source 字段）；本函数的单测钉住「按身份 host、不按请求 host」。
+ * @template {{ url: string }} S
+ * @param {S[]} sources
+ * @param {Iterable<string>} skipHosts
+ * @returns {S[]}
+ */
+export function excludeSkippedSources(sources, skipHosts) {
+  const skip = new Set(skipHosts);
+  return skip.size ? sources.filter((source) => !skip.has(sourceHostOf(source))) : sources;
+}

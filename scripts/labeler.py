@@ -821,8 +821,8 @@ def fetch_book_text_engine(engine_cli, book_url: str,
     N02 二次校验（toc 取回后、逐章 content **之前**）：expect_title/expect_author
     是名单侧身份锚点（队列条目的 title/author）。**双侧非空才比对**——toc 缺自报
     身份（空串）不触发（向后兼容），名单没给期望值（空串）也不触发。
-    title 用 title_compatible 语义比对；author 用 douban_list._norm_author 归一化后
-    严格相等。不符 → 抛 EngineIdentityMismatch（此时一个 content 调用都没发起，
+    title 用 title_compatible 语义比对；author 用 douban_list.author_matches（与候选
+    过滤同一口径，否则候选阶段放行的多署名/外文末节写法会在这里被拒）。不符 → 抛 EngineIdentityMismatch（此时一个 content 调用都没发起，
     省掉整本抓取）。"""
     toc = _engine_json(engine_cli, 'toc', '--url', book_url)
     toc_title = (toc.get('title') or '').strip()
@@ -831,7 +831,7 @@ def fetch_book_text_engine(engine_cli, book_url: str,
         raise EngineIdentityMismatch(
             f'引擎目录身份不符: 名单《{expect_title}》/作者 {expect_author or "（未知）"}'
             f' vs 目录《{toc_title}》/作者 {toc_author or "（未知）"}（标题不兼容）')
-    if expect_author and toc_author and             douban_list._norm_author(expect_author) != douban_list._norm_author(toc_author):
+    if expect_author and toc_author and not douban_list.author_matches(expect_author, toc_author):
         raise EngineIdentityMismatch(
             f'引擎目录身份不符: 名单《{expect_title}》/作者 {expect_author}'
             f' vs 目录《{toc_title}》/作者 {toc_author}（作者不符）')

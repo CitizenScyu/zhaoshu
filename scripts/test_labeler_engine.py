@@ -234,6 +234,30 @@ class TestEngineIdentityVerification(unittest.TestCase):
             expect_title='九君齐天', expect_author='风凌天下')
         self.assertEqual(chars, 200)
 
+    def test_toc_uses_same_author_rules_as_candidate_filter(self):
+        # authfix41：候选阶段靠 author_matches 放行的写法（多署名/外文末节），toc 二次校验
+        # 必须同口径——否则候选收了、toc 又判「作者不符」，修了等于没修。
+        for title, expect, toc_author in (
+                ('风起陇西', '马伯庸', '马伯庸著 刘巴布编绘'),
+                ('冰与火之歌', '[美]乔治·R.R.马丁', '马丁')):
+            with self.subTest(toc_author=toc_author):
+                cli = FakeEngineCli(
+                    lambda sub, url, t=title, a=toc_author: self._toc_proc(t, a)
+                    if sub == 'toc' else _content('正' * 200))
+                _, chars = labeler.fetch_book_text_engine(
+                    cli, 'https://y/x', expect_title=title, expect_author=expect)
+                self.assertEqual(chars, 200)
+
+    def test_toc_still_rejects_containment(self):
+        # 放宽规则不做子串包含：金庸 vs 金庸新 仍判作者不符
+        cli = FakeEngineCli(
+            lambda sub, url: self._toc_proc('天龙八部', '金庸新') if sub == 'toc'
+            else _content('正' * 200))
+        with self.assertRaises(labeler.EngineIdentityMismatch):
+            labeler.fetch_book_text_engine(cli, 'https://y/x',
+                                           expect_title='天龙八部', expect_author='金庸')
+        self.assertEqual([c[0] for c in cli.calls], ['toc'])
+
 
 class TestBuildEngineCli(unittest.TestCase):
     """_build_engine_cli：开关 + 必要配置齐备才返回 EngineCli，否则降级 None。"""

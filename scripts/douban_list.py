@@ -161,10 +161,167 @@ def _norm_author(s: str) -> str:
     return text
 
 
+# ---- 作者比对（authfix41：归一化严格相等之外，补三条「结构差」规则）----
+# authmis41 对 phoenix 393 行「作者不符跳过」分类：归一化真漏配只剩结构差——
+#   引擎多署名串：「马伯庸著 刘巴布编绘」「软星科技原著 执笔：苏末那」；
+#   非前导括号注：「[美]斯蒂芬·金（Stephen King）」；
+#   外文名只署末节：名单「[美]乔治·R.R.马丁」vs 引擎「马丁」。
+# 三条规则的判据仍是**整段严格相等**，不做子串包含（「金庸」≠「金庸新」、
+# 「唐家三少」≠「唐家三少之子」照旧拒）。中外文异体（「J.R.R.托尔金」vs
+# 「J.R.R.Tolkien」）需音译表，自动推导必误配，不做。
+# 多署名分隔（见 _split_signatures）：分号/顿号/逗号/斜杠恒切（HTML 实体须先替换，否则 &middot;
+# 的分号会被切开；&nbsp; 在 _author_text 里换成斜杠，恒切）。空白**默认不切**——名内空格
+# 很常见：「Stephen King」「J.R.R. 托尔金」「上條 一輝」「司马 迁」都是一个人，切开后
+# 「上條 一輝」与「上條 二輝」会因共有姓氏段被判同一人（authrev41 增量）。空白只在有明确
+# 多署名证据时切：左边以署名角色结尾（「马伯庸著 刘巴布编绘」）、右边以「执笔：」类角色
+# 标签开头，或两边都是带「·」的外文全名（「阿卡迪·斯特鲁伽茨基 鲍里斯·斯特鲁伽茨基」）。
+_AUTHOR_SEP_RE = re.compile(r'[;；、，,/]+')
+_AUTHOR_SPACE_RE = re.compile(r'[\s　]+')
+# 空白左侧 token 以署名角色结尾 ⇒ 该空白是多署名分隔
+_AUTHOR_ROLE_END_RE = re.compile(r'(?:著|译|绘|编|校|注|执笔|口述|整理)$')
+# 单人署名判定前剥掉的尾部角色（「杰西卡·汤森 著」「汤森 著」）
+_AUTHOR_TRAILING_ROLE_RE = re.compile(r'[\s　]*(?:原著|执笔|编绘|口述|整理|编著|主编|著|译|绘|编|校|注)$')
+# 任意位置的括号段：全/半角圆括号、方括号、【】（书名号不算）；内层不含括号
+_AUTHOR_BRACKET_RE = re.compile(r'[（(【\[][^（()）【】\[\]]*[）)】\]]')
+# 署名角色：前导须带冒号（「执笔：苏末那」）；尾部只认多字角色（「软星科技原著」）。
+# 不并进 _norm_author：「原著」作通用尾缀会把「高原著」剥成「高」，只在分段比对里作变体。
+_AUTHOR_ROLE_LABEL_RE = re.compile(
+    r'^(?:执\s*笔|原\s*著|编\s*绘|绘\s*者|译\s*者|主\s*编|编\s*者|著\s*者|口\s*述|整\s*理)\s*[:：]\s*')
+_AUTHOR_ROLE_SUFFIX_RE = re.compile(r'(?:原著|执笔|编绘|口述|整理)$')
+# 外文姓名的分节符（长侧必须含「·」或「•」才视为外文名；切末节时半角/全角点也算分节）
+_AUTHOR_FOREIGN_MARK_RE = re.compile(r'[·•]')
+_AUTHOR_NAME_SEP_RE = re.compile(r'[·•．.]')
 
+
+def _strip_author_brackets(s: str) -> str:
+    """剥所有括号段（循环，处理「[美]斯蒂芬·金（Stephen King）」这类多段）。"""
+    prev = None
+    while prev != s:
+        prev, s = s, _AUTHOR_BRACKET_RE.sub('', s)
+    return s
+
+
+def _author_text(s: str) -> str:
+    """比对前的实体还原：&nbsp; 视为多署名分隔（换成「/」恒切——「马伯庸&nbsp;刘巴布」是两人）；
+    其余实体（&middot; 等）按名内分隔符 · 处理，与 _norm_author 口径一致。"""
+    text = re.sub(r'&(?:nbsp|#160|#xa0);', '/', s or '', flags=re.IGNORECASE)
+    return re.sub(r'&[a-zA-Z]+;', '·', text)
+
+
+def _space_separates(left: str, right: str) -> bool:
+    """两个空白分隔的 token 之间是否是多署名分隔（规则见 _AUTHOR_SEP_RE 上方注释）。"""
+    return bool(_AUTHOR_ROLE_END_RE.search(left) or _AUTHOR_ROLE_LABEL_RE.match(right)
+                or (_AUTHOR_FOREIGN_MARK_RE.search(left) and _AUTHOR_FOREIGN_MARK_RE.search(right)))
+
+
+def _split_signatures(text: str) -> list[str]:
+    """多署名串 → 各署名段（剥括号后为空的国籍段不算一段）。"""
+    parts: list[str] = []
+    for piece in _AUTHOR_SEP_RE.split(text.strip()):
+        tokens = [t for t in _AUTHOR_SPACE_RE.split(piece.strip()) if t]
+        if not tokens:
+            continue
+        cur = tokens[0]
+        for left, right in zip(tokens, tokens[1:]):
+            if _space_separates(left, right):
+                parts.append(cur)
+                cur = right
+            else:
+                cur += ' ' + right
+        parts.append(cur)
+    return [p for p in parts if _strip_author_brackets(p).strip()]
+
+
+def _author_segments(s: str) -> list[str]:
+    """整串 + 按多署名分隔切出的各段（整串在前；只有一段时不重复）。"""
+    text = _author_text(s)
+    parts = _split_signatures(text)
+    return [text] + (parts if len(parts) > 1 else [])
+
+
+def _is_single_author(s: str) -> bool:
+    """剥括号/前导「作者：」/尾部署名角色后只剩一段署名。尾部角色先剥：「[澳]杰西卡·汤森 著」
+    是单人（否则「著」前的空白按角色规则算分隔，R4 被关掉，authrev41 增量）；多署名串剥掉
+    末尾角色后仍有分隔（「乔治·马丁著 某某编绘」→「乔治·马丁著 某某」），不会被误放行。"""
+    core = _strip_author_brackets(_strip_author_label(_author_text(s).strip())).strip()
+    while True:
+        stripped = _AUTHOR_TRAILING_ROLE_RE.sub('', core).strip()
+        if stripped == core or not stripped:
+            break
+        core = stripped
+    return len(_split_signatures(core)) <= 1
+
+
+def _author_forms(seg: str) -> set[str]:
+    """一段署名的可比形态：原样归一化、剥括号后归一化、剥角色标签后归一化（非空）。
+    剥括号/角色后的形态要求 ≥2 字，防「（佚名）」「高原著」这类剥过头后撞短名。"""
+    forms = {_norm_author(seg)}
+    for s in (_strip_author_brackets(seg),
+              _AUTHOR_ROLE_SUFFIX_RE.sub('', _AUTHOR_ROLE_LABEL_RE.sub('', seg.strip()))):
+        v = _norm_author(s)
+        if len(v) >= 2:
+            forms.add(v)
+    forms.discard('')
+    return forms
+
+
+def _identity_forms(s: str) -> set[str]:
+    """整串及各多署名分段的可比形态并集；切出来的分段只认 ≥2 字形态
+    （「[美] X」切出的「美」不得撞单字笔名）。"""
+    forms: set[str] = set()
+    for i, seg in enumerate(_author_segments(s)):
+        f = _author_forms(seg)
+        forms |= {x for x in f if len(x) >= 2} if i else f
+    return forms
+
+
+def _foreign_surname_match(long_raw: str, short_raw: str) -> bool:
+    """外文名末节匹配（R4）：「乔治·R.R.马丁」vs「马丁」、「詹姆斯·马修·巴利」vs「（英）巴利著」。
+
+    护栏：长侧（剥括号/实体替换后）必须含「·」或「•」——中文名没有分节符，
+    「金庸」vs「金庸新」、「唐家三少」vs「唐家三少之子」不会走到这里；短侧 = 长侧按
+    分节符切出的**最后一段**（整段严格相等，不是后缀包含）且 ≥2 字。
+    两侧都必须是单人署名（_is_single_author）：多署名串切出的一段不做末节匹配，否则
+    「乔治·马丁著 某某编绘」会同时匹配「马丁」和「某某」两个不同名单作者（authrev41）。"""
+    if not (_is_single_author(long_raw) and _is_single_author(short_raw)):
+        return False
+    long_s = _strip_author_brackets(_strip_author_label(_author_text(long_raw).strip()))
+    if not _AUTHOR_FOREIGN_MARK_RE.search(long_s):
+        return False
+    short = _norm_author(_strip_author_brackets(short_raw or ''))
+    if len(short) < 2:
+        return False
+    last = _norm_author(_AUTHOR_NAME_SEP_RE.split(long_s.strip().rstrip('·•．.'))[-1])
+    return last == short and _norm_author(long_s) != short
+
+
+def author_matches(list_author: str, engine_author: str) -> bool:
+    """名单作者与引擎作者是否同一人（search_engine 候选过滤与 labeler toc 二次校验共用）。
+
+    名单侧归一化为空（''、「---」「。。。」）⇒ 永不匹配（作者未知的语义由调用方先行处理，
+    这里不能因为两端都剥成空串就判相等）。否则先比归一化严格相等；不等再按两端各自的
+    整串 + 多署名各段比：
+      R2 分段/角色标签：名单任一段与引擎任一段（剥「执笔：」「原著」等角色后）归一化相等；
+      R3 剥括号：两端剥所有括号段后归一化相等（剥后须非空）；
+      R4 外文名末节：见 _foreign_surname_match（两个方向都试，两侧须单人署名）。
+    全部是整段严格相等，不做子串包含。"""
+    want = _norm_author(list_author)
+    if not want:
+        return False
+    if want == _norm_author(engine_author):
+        return True
+    if _identity_forms(list_author) & _identity_forms(engine_author):
+        return True
+    return (_foreign_surname_match(list_author, engine_author)
+            or _foreign_surname_match(engine_author, list_author))
 
 
 # ---- 豆瓣 tag 页解析（纯函数，可离线单测）----
+# 出版机构特征（豆瓣 pub 首段）。只用明确的机构词：「柯山梦 / 2012-8」「饭卡 / 2024」这类
+# 「作者 / 日期」无出版社的形态首段仍是作者，不能按「第二段是日期」反推（2026-09-25 实测 tag 页）。
+_PUBLISHER_RE = re.compile(r'出版|[书書]局|書房|\bpress\b|\bpublish', re.IGNORECASE)
+
+
 def parse_douban_tag_page(html: str) -> list[dict]:
     """豆瓣 tag 页 HTML → [{title, author, douban_url}]。
 
@@ -182,12 +339,38 @@ def parse_douban_tag_page(html: str) -> list[dict]:
         p = re.search(r'<div class="pub">\s*([^<]+?)\s*</div>', block)
         author = ''
         if p:
-            # pub 形如「有花在野 / 广东旅游出版社」，取第一段；译者/丛书形态同样取第一段
-            author = p.group(1).split('/')[0].strip()
-        books.append({'title': t.group(2).strip(),
-                      'author': author,
-                      'douban_url': t.group(1)})
+            # pub 形如「有花在野 / 广东旅游出版社」，取第一段；译者/丛书形态同样取第一段。
+            # 该版本没列作者时首段就是出版机构（「青岛出版社 / 2020-4 / 59.8」，authfix41）
+            # → 作者先置空并打 publisher_only 标记，由 fetch_douban_books 去 subject 页补作者；
+            # 补不到才以「名单无作者」进引擎（受作者歧义护栏约束）。不拿出版社当人名去拒真作者。
+            first = p.group(1).split('/')[0].strip()
+            author = '' if _PUBLISHER_RE.search(first) else first
+        book = {'title': t.group(2).strip(), 'author': author, 'douban_url': t.group(1)}
+        if p and not author and first:
+            book['publisher_only'] = True     # fetch_douban_books 据此去 subject 页补作者
+        books.append(book)
     return books
+
+
+def parse_douban_subject_author(html: str) -> str:
+    """豆瓣 subject 页 → 第一作者（取不到返回 ''）。
+
+    两处来源（2026-09-25 实测）：
+      #info 的「<span class="pl"> 作者</span>: <a>天蚕土豆</a>」——常规版本；
+      「作者」卡片 ul.authors-list > li.author > a.name + span.role——tag 页 pub 首段是
+      出版社的版本（偷偷藏不住 35003286、剑来1 35022388），#info 里**没有作者行**，只有这里有。
+    卡片只收 role 含「作者/著」的（译者/绘者不算）。"""
+    m = re.search(r'<span class="pl">\s*作者\s*:?\s*</span>\s*:?([\s\S]*?)</span>', html)
+    if m:
+        a = re.search(r'<a[^>]*>([^<]+)</a>', m.group(1))
+        if a and a.group(1).strip():
+            return re.sub(r'\s+', ' ', a.group(1)).strip()
+    for li in re.finditer(r'<li class="author">([\s\S]*?)</li>', html):
+        name = re.search(r'class="name">([^<]+)</a>', li.group(1))
+        role = re.search(r'<span class="role">([^<]*)</span>', li.group(1))
+        if name and name.group(1).strip() and (not role or re.search(r'作者|著', role.group(1))):
+            return re.sub(r'\s+', ' ', name.group(1)).strip()
+    return ''
 
 
 # ---- book15 搜索结果解析（纯函数，可离线单测）----
@@ -287,6 +470,20 @@ def fetch_douban_books(http_get, pages: int | None = None) -> list[dict]:
                 if key and key not in seen:
                     seen.add(key)
                     books.append(b)
+    # authfix41：pub 首段是出版社的条目去 subject 页补作者（作者卡片）。同样隔 DOUBAN_PAGE_DELAY、
+    # 单次尝试不重试；失败/取不到保持 ''（引擎侧按「名单无作者」走歧义护栏）。标记不外带。
+    for b in [b for b in books if b.pop('publisher_only', False)]:
+        time.sleep(DOUBAN_PAGE_DELAY)
+        try:
+            author = parse_douban_subject_author(http_get(b['douban_url']))
+        except Exception as e:
+            print(f'  豆瓣subject《{b["title"]}》补作者失败: {e}', file=sys.stderr)
+            continue
+        if author:
+            b['author'] = author
+            print(f'  豆瓣subject 补作者: 《{b["title"]}》→ {author}')
+        else:
+            print(f'  豆瓣subject《{b["title"]}》无作者字段，按名单无作者处理')
     return books
 
 
@@ -513,6 +710,8 @@ def search_engine(cli, title: str, author: str = '',
     N02 修复：author 不再只传不用——候选作者非空且归一化后与名单作者不等 → 必拒
     （防同名异作者的正文绑定名单身份，即身份错配污染共享数据）。
     两遍选择：先「title 兼容 + 作者已验证匹配」，再退「title 兼容 + 候选作者空」。
+    名单作者为空（authfix41）：不再「第一个兼容候选即收」，兼容候选作者出现 ≥2 人即判作者歧义跳过
+    （_pick_author_unknown）。
     返回命中 {'url': bookUrl（绝对）, 'title': site_title, 'source': host} 或 None（miss）。
     退出码：0=有候选（逐条校验，跳过 book15.net 源）；1=正常 miss；
     2/未知非零/无法调用 → 抛 EngineUnavailable（调用方本轮降级 book15-only、不重试）。
@@ -550,12 +749,13 @@ def search_engine(cli, title: str, author: str = '',
     if junk is not None:
         junk.observe(title, candidates)
     # ---- N02 两遍选择（只在引擎路径生效，CLI 调用形态不变）----
-    # 第一遍：title 兼容 + author 已验证匹配（名单 author 已知且 _norm_author 相等）。
+    # 第一遍：title 兼容 + author 已验证匹配（名单 author 已知且 author_matches 为真）。
     # 第二遍：名单 author 已知但无已验证匹配 → 退「title 兼容 + 候选 author 空」（降级收）。
     # 已验证错配的候选两遍都不收（必拒，防同名异作者正文绑错身份）。
-    # 名单 author 为空 → 照旧行为：title 兼容即收，不看候选 author。
+    # 名单 author 为空 → 收齐全部 title 兼容候选，过作者歧义护栏（_pick_author_unknown）。
     want = _norm_author(author)
     fallback = None
+    unknown_hits: list[tuple[dict, str]] = []
     for c in candidates:
         if not isinstance(c, dict):
             continue
@@ -571,20 +771,56 @@ def search_engine(cli, title: str, author: str = '',
             print(f'  非 HTTPS 源跳过: {site_title}（{c.get("source", "")}）')
             continue
         got = _norm_author(c.get('author') or '')
-        if not want:          # 名单无作者：行为同现状
-            return {'url': book_url, 'title': site_title,
-                    'source': c.get('source', '')}
-        if got and got == want:
+        if not want:          # 名单无作者：先收齐，循环后统一判歧义
+            unknown_hits.append(({'url': book_url, 'title': site_title,
+                                  'source': c.get('source', '')}, c.get('author') or ''))
+            continue
+        if got and author_matches(author, c.get('author') or ''):
             return {'url': book_url, 'title': site_title,
                     'source': c.get('source', '')}
         if not got and fallback is None:
             fallback = {'url': book_url, 'title': site_title,
                         'source': c.get('source', '')}
         elif got:
-            print(f'  作者不符跳过: {site_title}（名单 {author} vs 引擎 {c.get("author")}）')
-    if fallback is not None and want:
+            # 前导书名是**引擎候选**的（一本名单书常对应多行，authmis41 曾误读成名单书）
+            print(f'  作者不符跳过: 候选《{site_title}》（名单《{title}》{author}'
+                  f' vs 引擎 {c.get("author")}）')
+    if not want:
+        return _pick_author_unknown(title, unknown_hits)
+    if fallback is not None:
         print(f'  作者未知命中（降级）: {fallback["title"]}（名单作者 {author}，引擎未给作者）')
     return fallback
+
+
+def _pick_author_unknown(title: str, hits: list[tuple[dict, str]]) -> dict | None:
+    """名单无作者时的选择（authfix41 主会话裁定：错绑比漏收更糟）。
+
+    改前是「第一个 title 兼容候选即收」：《偷偷藏不住》的同名候选有 竹已（真作者）/旺仔/
+    桑稚段嘉许，候选顺序每次搜索都不同（gate.log 有一次旺仔排第一）⇒ 绑哪本看运气。
+    改后判定与候选顺序无关：兼容候选的非空作者**两两** author_matches（任一方向）为真
+    （或只有一个非空作者）才收，否则判作者歧义跳过并记一行日志。
+    不用「贪心聚簇」：author_matches 不传递（马伯庸 ~ 马伯庸著 刘巴布编绘 ~ 刘巴布，但
+    马伯庸 ≁ 刘巴布），贪心的簇数随候选顺序变（authrev41 阻断 1）。
+    收时作者已知的候选优先于作者空的；候选全无作者 ⇒ 收第一个（无从区分，同改前）。"""
+    if not hits:
+        return None
+    authors: list[str] = []
+    seen: set[str] = set()
+    for _, a in hits:
+        key = _norm_author(a)
+        if key and key not in seen:
+            seen.add(key)
+            authors.append(a)
+    ambiguous = any(not (author_matches(x, y) or author_matches(y, x))
+                    for k, x in enumerate(authors) for y in authors[k + 1:])
+    if ambiguous:
+        shown = sorted(authors, key=_norm_author)
+        names = '、'.join(shown[:5]) + ('…' if len(shown) > 5 else '')
+        print(f'  作者歧义跳过: 《{title}》名单无作者，兼容候选作者 {len(authors)} 人（{names}）')
+        return None
+    if authors:
+        return next(hit for hit, a in hits if _norm_author(a))
+    return hits[0][0]
 
 
 def validate_engine(cli) -> None:
@@ -725,8 +961,20 @@ QIDIAN_FINISH_STOP = ('首页', '完本小说', '登录后获得更多特色功�
                       'QQ阅读', '红袖添香', '腾讯动漫', '客户端', '触屏版',
                       '帮助与客服', '安装起点读书客户端', '看更多正版好书', '下载')
 # 区块条目里会出现的分类/导航词（既不是书名也不是作者）
-_QD_NOISE = {'玄幻', '仙侠', '都市', '历史', '游戏', '科幻', '悬疑', '奇幻', '武侠',
-             '完本', '完结', '连载', '更多', '男生', '女生', '返回', '取消'}
+# 起点分类全集（authfix41）：榜单页条目是「书名 → 简介 → 作者 → 分类 → 字数」，分类词不在
+# 本集合里就会被 _looks_author 当成作者（phoenix 实测「悬疑灵异」101 行、「诸天无限」16、
+# 「轻小说」14、「现实」2 把真作者顶掉）。宁可多列：分类词本来就不是人名，多列无误伤。
+QIDIAN_GENRES = frozenset({
+    # 男频（m.qidian.com/rank 页分类导航，2026-09-25 实测）
+    '全站', '玄幻', '奇幻', '武侠', '仙侠', '都市', '现实', '军事', '历史', '游戏', '体育',
+    '科幻', '悬疑灵异', '诸天无限', '轻小说',
+    # 旧版/别名分类
+    '悬疑', '灵异', '二次元', '短篇', '无限流', '游戏竞技', '同人', '其他', '言情',
+    # 女频
+    '古代言情', '现代言情', '幻想言情', '玄幻言情', '仙侠奇缘', '浪漫青春', '悬疑推理',
+    '科幻空间', '现实生活', '衍生言情', '纯爱', 'N次元',
+})
+_QD_NOISE = {'完本', '完结', '连载', '更多', '男生', '女生', '返回', '取消'} | QIDIAN_GENRES
 
 
 def _text_nodes(html: str, max_len: int = 50) -> list[str]:
