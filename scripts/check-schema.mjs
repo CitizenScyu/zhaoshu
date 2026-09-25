@@ -22,8 +22,8 @@ try {
   console.log(JSON.stringify({ target: 'test', schema: TARGET_SCHEMA, pooledEndpoint: isPooledEndpoint(connectionString),
     expectedVersion: SCHEMA_VERSION, expectedChecksum: head?.checksum ?? null,
     expectedMigrations: verdict.expectedMigrations, checksumOk: verdict.checksumOk,
-    authVersion: verdict.authVersion, expectedAuthVersion: verdict.expectedAuthVersion, authVersionOk: verdict.authVersionOk,
-    artifactVersion: verdict.artifactVersion, expectedArtifactVersion: verdict.expectedArtifactVersion, artifactVersionOk: verdict.artifactVersionOk,
+    authVersion: verdict.authVersion, expectedAuthVersion: verdict.expectedAuthVersion, authVersionOk: verdict.authVersionOk, authMissingVersions: verdict.authMissingVersions,
+    artifactVersion: verdict.artifactVersion, expectedArtifactVersion: verdict.expectedArtifactVersion, artifactVersionOk: verdict.artifactVersionOk, artifactMissingVersions: verdict.artifactMissingVersions,
     missingTables: verdict.missingTables, dangerous: report.dangerous, versions: report.versions,
     columns: report.columns, indexes: report.indexes, constraints: report.constraints }, null, 2));
   if (!verdict.ok) process.exitCode = 2;

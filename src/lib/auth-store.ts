@@ -1,4 +1,5 @@
 import type { neon, NeonQueryFunctionInTransaction } from '@neondatabase/serverless';
+import { missingLedgerVersions } from './schema-ledger.ts';
 
 export const AUTH_SCHEMA_VERSION = 7;
 
@@ -393,12 +394,10 @@ export async function assertAuthSchema(sql: Sql): Promise<void> {
   }
   // 记账连续性判据：所需版本 1..AUTH_SCHEMA_VERSION 必须**全部在册**，不再只看 max(version)。
   // 账本中间缺号（迁移器漏插某版、或人为删了某版）此前因 max 达标而被放行，冷建库可能缺
-  // v5/v6 的 DDL 却全站 200；现在缺号即 503，并在错误信息里报出缺哪些版本。判据与
-  // migrate-auth-prod.mjs 的 pending 计算同款（1..N 逐版查在册），运行时闸门只读不迁移。
+  // v5/v6 的 DDL 却全站 200；现在缺号即 503，并在错误信息里报出缺哪些版本。判据与 db:check
+  // 的 evaluateSchema 共用 missingLedgerVersions（唯一口径），运行时闸门只读不迁移。
   // 只拦「库落后于代码」——额外的更高版本（灰度/回滚窗口里 DDL 已跑、旧实例还在）不在必需
   // 集里，仍放行不 503；前向保护由 initializeAuthSchema 在库版本 > 7 时 RAISE EXCEPTION 负责。
-  const present = new Set(rows.map((row) => row.version));
-  const missing: number[] = [];
-  for (let version = 1; version <= AUTH_SCHEMA_VERSION; version += 1) if (!present.has(version)) missing.push(version);
+  const missing = missingLedgerVersions(rows.map((row) => row.version), AUTH_SCHEMA_VERSION);
   if (missing.length) throw new AuthSchemaRequiredError(missing);
 }

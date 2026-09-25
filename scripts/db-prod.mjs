@@ -97,8 +97,8 @@ export async function runProdCheck(client, migrations) {
     command: 'check', status: ok ? 'ok' : 'not-ok', ok, schema: TARGET_SCHEMA, expectedVersion: SCHEMA_VERSION,
     versions: report.versions, expectedMigrations: verdict.expectedMigrations, checksumOk: verdict.checksumOk,
     ledger: { status: ledger.status, pending: ledger.pending, errors: ledger.errors },
-    authVersion: verdict.authVersion, expectedAuthVersion: verdict.expectedAuthVersion, authVersionOk: verdict.authVersionOk,
-    artifactVersion: verdict.artifactVersion, expectedArtifactVersion: verdict.expectedArtifactVersion, artifactVersionOk: verdict.artifactVersionOk,
+    authVersion: verdict.authVersion, expectedAuthVersion: verdict.expectedAuthVersion, authVersionOk: verdict.authVersionOk, authMissingVersions: verdict.authMissingVersions,
+    artifactVersion: verdict.artifactVersion, expectedArtifactVersion: verdict.expectedArtifactVersion, artifactVersionOk: verdict.artifactVersionOk, artifactMissingVersions: verdict.artifactMissingVersions,
     missingTables: verdict.missingTables, dangerous: report.dangerous,
     runtimeColumns: { ...runtimeColumns, rows: runtimeColumnRows(report.columns) },
   };
@@ -150,8 +150,8 @@ export async function runProdMigrate(client, migrations, mode) {
     after: {
       ok: after.verdict.ok && !after.ledger.errors.length && after.runtimeColumns.ok,
       checksumOk: after.verdict.checksumOk, missingTables: after.verdict.missingTables,
-      authVersion: after.verdict.authVersion, authVersionOk: after.verdict.authVersionOk,
-      artifactVersion: after.verdict.artifactVersion, artifactVersionOk: after.verdict.artifactVersionOk,
+      authVersion: after.verdict.authVersion, authVersionOk: after.verdict.authVersionOk, authMissingVersions: after.verdict.authMissingVersions,
+      artifactVersion: after.verdict.artifactVersion, artifactVersionOk: after.verdict.artifactVersionOk, artifactMissingVersions: after.verdict.artifactMissingVersions,
       runtimeColumnsOk: after.runtimeColumns.ok,
     },
     // 冷建库：0001 只把 auth 记账到 4，artifact schema 也不在 0001–0003 里。两者都属预期缺，
