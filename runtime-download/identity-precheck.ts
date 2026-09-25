@@ -25,7 +25,7 @@ import type { PrecheckHook, PrecheckResult } from './executor';
 export const IDENTITY_PRECHECK_BUDGET_MS = 120_000;
 
 type Page = { url: string; text: string };
-type Transport = (url: string, options: { signal: AbortSignal; timeoutMs?: number }) => Promise<Page>;
+export type Transport = (url: string, options: { signal: AbortSignal; timeoutMs?: number }) => Promise<Page>;
 type Candidate = { bookUrl: string };
 type Identity = { title?: string; author?: string };
 interface Modules {
@@ -61,6 +61,27 @@ const REACHABILITY_STAGES = new Set(['search', 'detail']);
  */
 export const MAX_PRECHECK_CANDIDATES = 50;
 
+/**
+ * 搜索/详情请求用的最小请求上下文（{ signal, page }）：走执行器共享 transport。与下载器 operation() 同口径：
+ * 逐请求超时以 operation_timeout 中止（不算书源不可达），响应路径被改写视为失败。builtin-fallback 选源共用。
+ */
+export function pageContext(transport: Transport, signal: AbortSignal, timeoutMs: number) {
+  return {
+    signal,
+    page: async (url: string) => {
+      const local = new AbortController();
+      const timer = setTimeout(() => local.abort(new Error('operation_timeout')), timeoutMs);
+      try {
+        const page = await transport(url, { signal: AbortSignal.any([signal, local.signal]), timeoutMs });
+        if (new URL(page.url).pathname !== new URL(url).pathname) throw new Error('response_path_mismatch');
+        return page;
+      } finally {
+        clearTimeout(timer);
+      }
+    },
+  };
+}
+
 export function createIdentityPrecheck(options: IdentityPrecheckOptions): PrecheckHook {
   const m = options.modules as Modules;
   const transport = options.transport as Transport;
@@ -68,21 +89,7 @@ export function createIdentityPrecheck(options: IdentityPrecheckOptions): Preche
 
   // true = 有候选对得上；false = 候选（不超过上限）全看过都对不上；null = 超过上限未看完，不下结论。
   const verify = async (task: TaskRow, signal: AbortSignal, progress: { stage: string }): Promise<boolean | null> => {
-    const ctx = {
-      signal,
-      page: async (url: string) => {
-        // 与下载器 operation() 同口径：逐请求超时以 operation_timeout 中止（不算书源不可达）。
-        const local = new AbortController();
-        const timer = setTimeout(() => local.abort(new Error('operation_timeout')), timeoutMs);
-        try {
-          const page = await transport(url, { signal: AbortSignal.any([signal, local.signal]), timeoutMs });
-          if (new URL(page.url).pathname !== new URL(url).pathname) throw new Error('response_path_mismatch');
-          return page;
-        } finally {
-          clearTimeout(timer);
-        }
-      },
-    };
+    const ctx = pageContext(transport, signal, timeoutMs);
     const { source, builtin } = await options.resolveSource(m, task.source_url, signal) as Resolved;
     const engine = builtin ? null : { url: source.url, name: source.name, searchUrl: source.searchUrl, compiled: m.compile.compileSource(source) };
     let candidates: Candidate[];
