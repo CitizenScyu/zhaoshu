@@ -246,9 +246,18 @@ export function sourceFanoutLimit(): number {
   return Number.isSafeInteger(parsed) && parsed > 0 ? Math.min(parsed, MAX_SOURCE_FANOUT_LIMIT) : DEFAULT_SOURCE_FANOUT_LIMIT;
 }
 
-/** 扇出候选：取书池的条目 + readable（该源是否也在当前取书池里——阅读/确认路径只认取书池）。 */
+/** 扇出候选：取书池的条目 + readable（用户点选后确认/阅读路径能否打开它，与 getSourcePools().selectable 同口径）。 */
 export interface FanoutSource extends ReadingSource {
   readable: boolean;
+}
+
+/**
+ * 用户显式指定源（确认 book_url、章节续读认当前源）的反查范围（41-readall）：已过合格判据的源，只受开关约束——
+ * 引擎开关开 ⇒ 全部；关 ⇒ 只有 builtin。与取书池、扇出候选同一份合成与过滤（compile_ok ∧ search_ok、非 disabled、
+ * probe 非 failed、canProbe host 门），不放宽「谁能当源」，只放宽「排第几位才认」。
+ */
+function selectableTier(source: ReadingSource, engineOn: boolean): boolean {
+  return engineOn || source.tier === 'builtin';
 }
 
 /**
@@ -256,17 +265,48 @@ export interface FanoutSource extends ReadingSource {
  * 与取书池同一份合成与全序，只把截断上限换成 sourceFanoutLimit()。引擎源**不受** READING_ENGINE_SOURCES 约束
  * （扇出由 SOURCE_FANOUT_ENABLED 单独把门，调用方先判开关）；为此这里总会按准入表刷一次 host 门——与取书池开引擎源时同一数据源。
  *
- * readable：取书池 = 同一序列按 readingPoolLimit() 截断（引擎源关闭时只剩 builtin）。阅读的确认路径（index?book_url=）
- * 与章节路径按取书池反查源，**不在取书池里的源即便 probe 命中也打不开**——面板须据此区分「可切换」与「仅展示」（见 fanout-41-report §6）。
+ * readable：确认路径（index?book_url=）与章节路径按 getSourcePools().selectable 反查源（41-readall）——扇出候选全部落在
+ * 其内（上限取 max(取书池, 扇出)），故 readable 只看开关：引擎开关关时引擎源仍是「仅展示」（面板 unreadable）。
  */
 export async function getFanoutPool(signal: AbortSignal): Promise<FanoutSource[]> {
   const eligible = await eligibleReadingSources(signal, true);
-  const readingLimit = readingPoolLimit();
   const engineOn = engineSourcesEnabled();
-  return eligible.slice(0, sourceFanoutLimit()).map((source, index) => ({
+  return eligible.slice(0, sourceFanoutLimit()).map((source) => ({
     ...source,
-    readable: index < readingLimit && (engineOn || source.tier === 'builtin'),
+    readable: selectableTier(source, engineOn),
   }));
+}
+
+/**
+ * 用户显式指定源时的反查范围（类型标记）：只有 getSourcePools 产出。确认路径与章节续读认当前源的查找函数要求这个类型，
+ * 取书池（自动遍历用）传进去编译不过——「按池反查源」的调用点改一处漏一处，是本项目反复出现的模式（41-readall）。
+ */
+export type SelectableSources = readonly ReadingSource[] & { readonly __selectableSources: true };
+
+/** 反查范围上限：取书池与扇出候选的并集（二者是同一全序的前缀），任何一侧能展示/遍历到的源，用户点选都认。 */
+export function selectableSourceLimit(): number {
+  return Math.max(readingPoolLimit(), sourceFanoutLimit());
+}
+
+export interface SourcePools {
+  /** 自动遍历（无指定源的首开 / 章节级兜底换源）：按 readingPoolLimit() 截断，与 getReadingSources 逐条相同。 */
+  traversal: ReadingSource[];
+  /** 用户显式指定源的反查范围：同一序列按 selectableSourceLimit() 截断、再按开关过滤（见 selectableTier）。 */
+  selectable: SelectableSources;
+}
+
+/**
+ * 一次合成同时给出两份池（41-readall）：traversal 是 selectable 的前缀（同一全序），章节路径一次 DB 往返拿齐。
+ * includeEngine 与取书池同口径（READING_ENGINE_SOURCES）：开关关时不刷 host 门、不查准入表，selectable 只剩 builtin。
+ */
+export async function getSourcePools(signal: AbortSignal): Promise<SourcePools> {
+  const engineOn = engineSourcesEnabled();
+  const eligible = await eligibleReadingSources(signal, engineOn);
+  return {
+    traversal: eligible.slice(0, readingPoolLimit()),
+    selectable: eligible.slice(0, selectableSourceLimit())
+      .filter((source) => selectableTier(source, engineOn)) as unknown as SelectableSources,
+  };
 }
 
 /**

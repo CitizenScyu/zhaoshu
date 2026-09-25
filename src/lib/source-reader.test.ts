@@ -6,9 +6,17 @@ import { sourceRevision } from './source-revision';
 import { readerPartMatches } from './reader-session';
 
 type Query = { text: string; values: unknown[] };
-const mocks = vi.hoisted(() => ({ getSql: vi.fn(), ensureSchema: vi.fn(), sources: vi.fn(), fetch: vi.fn<typeof fetch>() }));
+const mocks = vi.hoisted(() => ({ getSql: vi.fn(), ensureSchema: vi.fn(), sources: vi.fn(), selectable: vi.fn(), fetch: vi.fn<typeof fetch>() }));
 vi.mock('./db', () => ({ getSql: mocks.getSql, ensureSchema: mocks.ensureSchema }));
-vi.mock('./shuyuan', () => ({ getReadingSources: mocks.sources }));
+// 41-readall：用户指定源（确认 / 章节认当前源）走 getSourcePools().selectable；夹具里两份池同为 mocks.sources 的列表，
+// 需要区分「取书池 vs 反查范围」的用例单独覆盖 mocks.selectable。
+vi.mock('./shuyuan', () => ({
+  getReadingSources: mocks.sources,
+  getSourcePools: async (signal: AbortSignal) => {
+    const traversal = await mocks.sources(signal);
+    return { traversal, selectable: (await mocks.selectable(signal)) ?? traversal };
+  },
+}));
 
 let service: typeof import('./source-reader');
 let GET: typeof import('@/app/api/read/source/[resource]/route').GET;
@@ -51,6 +59,7 @@ beforeEach(async () => {
   vi.clearAllMocks();
   vi.stubEnv('APP_OWNER_TOKEN', 'source-owner');
   mocks.sources.mockResolvedValue([source]);
+  mocks.selectable.mockReset();
   hints = [];
   writes = [];
   catalogs.clear();
@@ -1369,7 +1378,7 @@ describe('M2-2 多源循环：跳源 / 软预算 / 去重 / bookUrl 反查', () 
         .rejects.toMatchObject({ code: 'SOURCE_NOT_FOUND', status: 404 });
     });
 
-    it('sourceUrl 不在取书池（扇出里 readable=false 的源）⇒ 404，不发请求', async () => {
+    it('sourceUrl 不在 selectable（非合格源 / 引擎开关关时的引擎源）⇒ 404，不发请求', async () => {
       await expect(service.resolveSourceBook(book, context(), { bookUrl: bDetail, sourceUrl: 'https://engine.test/c/' }))
         .rejects.toMatchObject({ code: 'SOURCE_NOT_FOUND', status: 404 });
       expect(mocks.fetch).not.toHaveBeenCalled();
@@ -1554,6 +1563,114 @@ describe('引擎源正文分派（N01）', () => {
     expect(partRes.status).toBe(200);
     expectPrivate(partRes);
     expect((await partRes.json()).text).toBe('Synthetic chapter body.');
+  });
+});
+
+// 41-readall：面板里取书池之外的源（生产：云起书院排扇出第 10 位、READING_POOL_LIMIT=8）搜到书也要能切换、能读章节；
+// 自动遍历（无指定源的首开、章节级兜底换源）仍只走取书池。夹具：取书池 = [builtin]，反查范围 = [builtin, 池外 Y, 池外 Z]。
+describe('用户指定源按 selectable 反查，自动遍历仍只走取书池（41-readall）', () => {
+  const engineRules = {
+    ruleSearch: { bookList: '.book', name: '.name@text', author: '.author@text', bookUrl: 'a@href' },
+    ruleBookInfo: { name: '.title@text', author: '.writer@text', tocUrl: '.toc@href' },
+    ruleToc: { chapterList: '.chapter', chapterName: 'a@text', chapterUrl: 'a@href' },
+    ruleContent: { content: '#body@text' },
+  };
+  const outside = { url: 'https://yunqi.test/', name: '池外源', searchUrl: 'https://yunqi.test/s?q={{key}}', tier: 'M1' as const, rules: engineRules };
+  const other = { url: 'https://zeta.test/', name: '池外源二', searchUrl: 'https://zeta.test/s?q={{key}}', tier: 'M1' as const, rules: engineRules };
+  const yDetail = 'https://yunqi.test/d/1.html';
+  const yChapter = 'https://yunqi.test/c/1.html';
+  const hit = '<div class="book"><span class="name">测试书</span><span class="author">作者</span><a href="/d/1.html">x</a></div>';
+  const requested = () => mocks.fetch.mock.calls.map(([input]) => String(input));
+  const hostsRequested = () => [...new Set(requested().map((url) => new URL(url).hostname))];
+  const primeSite = (origin: string) => {
+    pages.set(`${origin}/s?q=${encodeURIComponent(book.title)}`, { text: hit });
+    pages.set(`${origin}/d/1.html`, { text: '<h1 class="title">测试书</h1><span class="writer">作者</span><a class="toc" href="/toc/1.html">目录</a>' });
+    pages.set(`${origin}/toc/1.html`, { text: '<li class="chapter"><a href="/c/1.html">第一章</a></li><li class="chapter"><a href="/c/2.html">第二章</a></li>' });
+    pages.set(`${origin}/c/1.html`, { text: '<div id="body">池外源正文。</div>' });
+  };
+  const confirmOutside = async () => {
+    const res = await request('index', `title=测试书&author=作者&book_url=${encodeURIComponent(yDetail)}&source=${encodeURIComponent(outside.url)}`);
+    expect(res.status).toBe(200);
+    return res.json();
+  };
+  const readChapter = (index: { version: string }) => request('chapter', `session=${index.version}&version=${index.version}&chapter=0`);
+  // builtin（取书池唯一的源）没有这本书：标题/作者搜索页都是空页。
+  const builtinMiss = () => {
+    for (const keyword of [book.title, book.author]) {
+      pages.set('https://book15.net/books/search.html?kw=' + encodeURIComponent(keyword), { text: '' });
+    }
+  };
+  beforeEach(async () => {
+    (await import('./source-policy')).refreshSupportedHosts(['backup.test', 'yunqi.test', 'zeta.test', 'gated.test']);
+    mocks.sources.mockResolvedValue([source]);
+    mocks.selectable.mockResolvedValue([source, outside, other]);
+  });
+
+  it('池外源 + 搜到的书，用户点选 ⇒ 确认建目录成功；章节按该源读正文，不被当成「源已下线」换走', async () => {
+    primeSite('https://yunqi.test');
+    const index = await confirmOutside();
+    expect(index).toMatchObject({ title: '测试书', source: { name: '池外源', url: yDetail, sourceUrl: outside.url } });
+    expect(index.chapters).toHaveLength(2);
+    mocks.fetch.mockClear();
+    const partRes = await readChapter(index);
+    expect(partRes.status).toBe(200);
+    const part = await partRes.json();
+    expect(part).toMatchObject({ text: '池外源正文。', servedFrom: '池外源', servedFromUrl: outside.url, version: index.version });
+    expect(part.sourceSession).toBeUndefined(); // 没有换源
+    expect(requested()).toEqual([yChapter]);
+  });
+
+  it('非合格源（过了 host 门但不在 selectable）⇒ 仍 404、不发请求；bookUrl 不属于指定源的站 ⇒ 404', async () => {
+    for (const [bookUrl, sourceUrl] of [
+      ['https://gated.test/d/1.html', 'https://gated.test/'],
+      ['https://zeta.test/d/1.html', outside.url],
+    ]) {
+      const res = await request('index', `title=测试书&author=作者&book_url=${encodeURIComponent(bookUrl)}&source=${encodeURIComponent(sourceUrl)}`);
+      expect(res.status).toBe(404);
+      expect(await res.json()).toMatchObject({ code: 'SOURCE_NOT_FOUND' });
+    }
+    // 不带 source 的旧确认（host 反查）同样只认 selectable。
+    const legacy = await request('index', `title=测试书&author=作者&book_url=${encodeURIComponent('https://gated.test/d/1.html')}`);
+    expect(legacy.status).toBe(404);
+    expect(mocks.fetch).not.toHaveBeenCalled();
+  });
+
+  it('无指定源的首开 ⇒ 只遍历取书池：builtin 没有这本书也不去碰池外源（即便它们有）', async () => {
+    primeSite('https://yunqi.test');
+    primeSite('https://zeta.test');
+    builtinMiss();
+    const res = await request();
+    expect(res.status).toBe(404);
+    expect(await res.json()).toMatchObject({ code: 'SOURCE_NOT_FOUND' });
+    expect(hostsRequested()).toEqual(['book15.net']);
+    expect(requested()).toHaveLength(2); // 标题搜索 + 作者搜索回退，恰好取书池这一个源
+  });
+
+  it('池外当前源章节失败 ⇒ 兜底换源只试取书池他源，不碰 selectable 里的池外源', async () => {
+    primeSite('https://yunqi.test');
+    primeSite('https://zeta.test');
+    const index = await confirmOutside();
+    pages.set(yChapter, { text: '', status: 404 });
+    mocks.fetch.mockClear();
+    const partRes = await readChapter(index);
+    expect(partRes.status).toBe(200);
+    const part = await partRes.json();
+    expect(part).toMatchObject({ text: '离线测试正文。', servedFrom: '测试书源', servedFromUrl: source.url });
+    expect(hostsRequested()).not.toContain('zeta.test');
+  });
+
+  it('池外当前源章节失败且取书池他源也没有 ⇒ 当前源仍作为队尾「原源兜底」再搜一次（快照补齐），仍不碰池外他源', async () => {
+    primeSite('https://yunqi.test');
+    primeSite('https://zeta.test');
+    const index = await confirmOutside();
+    pages.set(yChapter, { text: '', status: 404 });
+    builtinMiss();
+    mocks.fetch.mockClear();
+    const partRes = await readChapter(index);
+    expect(partRes.status).toBe(503);
+    expect(await partRes.json()).toMatchObject({ code: 'SOURCE_CHAPTER_UNAVAILABLE' });
+    expect(requested()).toContain(`https://yunqi.test/s?q=${encodeURIComponent(book.title)}`);
+    expect(hostsRequested()).not.toContain('zeta.test');
   });
 });
 

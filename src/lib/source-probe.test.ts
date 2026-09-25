@@ -525,10 +525,13 @@ describe('source-probe-rate-limit 配置与主体', () => {
   it('阈值解析:默认两窗;非法配置整体回退默认;0 关闭', async () => {
     const { sourceProbeRateLimits } = await import('./source-probe-rate-limit');
     const defaults = [
-      { scope: 'source-probe-600', limit: 60, windowSeconds: 600 },
-      { scope: 'source-probe-86400', limit: 240, windowSeconds: 86400 },
+      { scope: 'source-probe-600', limit: 180, windowSeconds: 600 },
+      { scope: 'source-probe-86400', limit: 720, windowSeconds: 86400 },
     ];
     expect(sourceProbeRateLimits({})).toEqual(defaults);
+    // 41-readall：扇出开到上限 60 时，一个用户 10 分钟内整面板扫三次不被自己限流。
+    const { MAX_SOURCE_FANOUT_LIMIT } = await import('./shuyuan');
+    for (const window of sourceProbeRateLimits({})) expect(window.limit).toBeGreaterThanOrEqual(3 * MAX_SOURCE_FANOUT_LIMIT);
     for (const bad of ['abc', '12/0', '0/600', '12/600,x', '12/999999999']) expect(sourceProbeRateLimits({ SOURCE_PROBE_RATE_LIMITS: bad })).toEqual(defaults);
     expect(sourceProbeRateLimits({ SOURCE_PROBE_RATE_LIMITS: ' 30/60 ' })).toEqual([{ scope: 'source-probe-60', limit: 30, windowSeconds: 60 }]);
     expect(sourceProbeRateLimits({ SOURCE_PROBE_RATE_LIMITS: '0' })).toEqual([]);
