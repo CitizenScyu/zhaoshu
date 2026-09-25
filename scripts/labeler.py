@@ -592,24 +592,31 @@ _WATERMARK_SEP_RE = re.compile(
 # 或「求…」出现在行首/行尾（呼告的典型位置）。两者都不满足的叙述行保留。
 # 再收窄（lblfu41，lblqualrev2 非阻断B/C + §1② B4）：
 # - 口吻词表去掉正文高频词（作者/读者/更新/上传/感谢）：`作者求月票，读者求订阅，场面热闹。` 是叙述；
-# - 行尾锚要求「求…」自成一个分句（行首或标点之后）：`那些网络主播正在直播里求打赏` 是叙述，
-#   `今天三更，求月票！` 才是呼告；
-# - 行内有第三人称（他/她/它）且不以求告开头 → 叙述，保留（作者求票时自称我/小X，不写他/她）；
+# - 原「行尾是求票词」锚去掉：`那些网络主播正在直播里求打赏` 是叙述，`今天三更，求月票！` 靠作者口吻信号删；
+# - 行内有第三人称（他/她/它）→ 叙述，保留（作者求票时自称我/小X，不写他/她）；
 # - 补单用的「求票」「求下月票」（`求票啦！`、`各位，求票！` 漏删）。「求票」在叙述里常见（车票/选票：
 #   `排队求票的人…`），所以单用的「求票」只在自成一个分句时才算（行首或标点之后、后面是标点/语气词/行尾）。
+# 统一叙述判定（lblfu41 审查后，lblfurev 发现 1/5）：「众人围上来，求票。」「求收藏的人排成长队。」是叙述。
+# - 行首分支：行首的「求X」本身得是一个完整分句（后面是标点/语气词/行尾），`求收藏的人…` 不算；
+# - 非行首分支（句中求票词 / 单用求票分句）：还得有作者口吻的信号
+#   （呼语/口吻词、`投我`、`三更/加更`、`今天` 一类更新口吻），光有「，求票。」不算；
+# - 两个分支都过第三人称闸（「其他/其它」不算第三人称）。
 PLEA_LINE_MAX_LEN = 150
 _PLEA_RE = re.compile(
     r'求(?:一下|一波|下|个|张)?(?:推荐票|推荐(?=[、，,。！!～~\s]|$)|收藏(?![家品室馆夹])|月票|订阅|打赏)')
 _PLEA_QUOTE_RE = re.compile(r'[“”‘’「」『』"]')
 _PLEA_VOICE_RE = re.compile(
     r'各位|大家|书友|兄弟们|兄弟姐妹|拜托|谢谢|本书|新书|冲榜|保底|送上|拜求|跪求|求一|求个')
-_PLEA_START_RE = re.compile(r'^(?:求|拜求|跪求|再求|还求)')
+_PLEA_AUTHOR_RE = re.compile(
+    _PLEA_VOICE_RE.pattern
+    + r'|投我|投给我|给我投|[一二三四五六七八九十两0-9]更|加更|今天|今日|明天|本章|上架|首订')
+_PLEA_CLAUSE_TAIL = r'(?:啦|了|呀|吧|哦|喔|啊)?(?:[！!。．…~～、，,；;\s]|$)'
+_PLEA_START_RE = re.compile(
+    r'^(?:求|拜求|跪求|再求|还求)(?:一下|一波|下|个|张)?'
+    r'(?:推荐票|推荐|收藏|月票|订阅|打赏|票+|支持|点击)' + _PLEA_CLAUSE_TAIL)
 _PLEA_CLAUSE_HEAD = r'(?:^|[，,。．！!、；;：:\s～~…])(?:拜求|跪求|再求|还求|求)(?:一下|一波|下|个|张)?'
-_PLEA_END_RE = re.compile(
-    _PLEA_CLAUSE_HEAD + r'(?:推荐票|推荐|收藏|月票|订阅|打赏)[！!。．…~～、，,\s]*$')
-_PLEA_TICKET_RE = re.compile(
-    _PLEA_CLAUSE_HEAD + r'票+(?:啦|了|呀|吧|哦|喔|啊)?(?:[！!。．…~～、，,\s]|$)')
-_PLEA_THIRD_PERSON_RE = re.compile(r'[他她它]')
+_PLEA_TICKET_RE = re.compile(_PLEA_CLAUSE_HEAD + r'票+' + _PLEA_CLAUSE_TAIL)
+_PLEA_THIRD_PERSON_RE = re.compile(r'(?<![其吉])[他她它]')
 _CHAPTER_END_RE = re.compile(r'^[（(]\s*本章完\s*[）)]$')
 _SEPARATOR_LINE_RE = re.compile(r'^[－\-—=＝_＿*＊~～·]{5,}$')
 
@@ -746,15 +753,14 @@ def _drop_rule(line: str) -> str | None:
     # 4) 上游书源水印行（`〖三七中文www.37zw.com〗百度搜索“37zw”访问` 一类）。
     if len(line) <= INJECT_LINE_MAX_LEN and _is_watermark_line(line):
         return 'inject'
-    # 5) 作者求票/求收藏行：整行、无引号，且是作者口吻（以求告开头；或口吻词 / 句末求告分句，
-    #    且行内没有第三人称）。无引号的第三人称叙述（求打赏/求订阅出现在句中）不删（lblqualfix41/lblfu41）。
+    # 5) 作者求票/求收藏行：整行、无引号、无第三人称，且是作者口吻：行首就是一个求告分句，
+    #    或行内有求票词 / 单用「求票」分句且带作者口吻信号。叙述行不删（lblqualfix41/lblfu41）。
     # 6) 章末 `(本章完)` 与纯分隔线（lblqual41）。
-    if len(line) <= PLEA_LINE_MAX_LEN and not _PLEA_QUOTE_RE.search(line) and (
-            (_PLEA_RE.search(line)
-             and (_PLEA_START_RE.search(line)
-                  or ((_PLEA_VOICE_RE.search(line) or _PLEA_END_RE.search(line))
-                      and not _PLEA_THIRD_PERSON_RE.search(line))))
-            or (_PLEA_TICKET_RE.search(line) and not _PLEA_THIRD_PERSON_RE.search(line))):
+    if len(line) <= PLEA_LINE_MAX_LEN and not _PLEA_QUOTE_RE.search(line) \
+            and not _PLEA_THIRD_PERSON_RE.search(line) and (
+                _PLEA_START_RE.search(line)
+                or ((_PLEA_RE.search(line) or _PLEA_TICKET_RE.search(line))
+                    and _PLEA_AUTHOR_RE.search(line))):
         return 'plea'
     if _CHAPTER_END_RE.match(line) or _SEPARATOR_LINE_RE.match(line):
         return 'marker'
