@@ -454,12 +454,15 @@ function similarCandidateFrom(page: { text: string; url: string }): SourceSimila
 }
 
 // 用户点选确认后的目录构建：身份校验让位于用户决定，仍要求目录可解析。
-function confirmedCatalogFrom(page: { text: string; url: string }, source: ReadingSource): SourceCatalog | null {
+// 失败时返回原因（只供观测；builtin 对外文案与错误码不因原因而变）。
+function confirmedCatalogFrom(
+  page: { text: string; url: string }, source: ReadingSource,
+): SourceCatalog | 'detail_unparsed' | 'toc_empty' {
   const identity = parseSourceIdentity(page.text);
   if (identity.title.length > 200 || identity.author.length > 200
-    || (identity.alias?.length ?? 0) > 200 || !identity.title) return null;
+    || (identity.alias?.length ?? 0) > 200 || !identity.title) return 'detail_unparsed';
   const chapters = parseSourceChapters(page.text, page.url);
-  if (!chapters.length) return null;
+  if (!chapters.length) return 'toc_empty';
   const sourceId = hash([source.url, page.url]);
   const revisionValue = sourceRevision(source);
   return {
@@ -500,6 +503,113 @@ function deprioritizeSource(sources: ReadingSource[], url: string | undefined): 
   return current.length && rest.length ? [...rest, ...current] : sources;
 }
 
+/**
+ * 引擎源书目身份（41-confirmtoc）：详情页字段取得到就用，取不到回退 fallback —— legado 同款语义，
+ * 书名/作者以搜索结果为准，ruleBookInfo.name/author 只在求值非空时覆盖。不少源根本不写 name
+ * （生产 kxdu.net 的 ruleBookInfo 只补简介/封面/分类）。搜索路径的 fallback 是搜索结果行；确认路径
+ * 没有搜索结果，fallback 是请求的书（面板 probe 判 ok 时，正是这本书与搜索结果行过了 sourceBookMatches）。
+ * fallback 是必填参数：两条路径共用一个口径，确认路径不得比 probe 更严（否则 probe 判 ok 的源点了必 404）。
+ */
+function engineIdentityOf(detail: Partial<SourceBookIdentity>, fallback: SourceBookIdentity): SourceBookIdentity {
+  return {
+    title: detail.title ?? fallback.title, author: detail.author ?? fallback.author,
+    ...(detail.alias ? { alias: detail.alias } : {}),
+  };
+}
+
+type ConfirmFailureReason = 'detail_unparsed' | 'toc_empty';
+
+function confirmFailure(message: string, reason: ConfirmFailureReason): SourceReaderError {
+  return Object.assign(new SourceReaderError(message, 'SOURCE_NOT_FOUND', 404), { confirmReason: reason });
+}
+
+/**
+ * 引擎源确认路径的上游失败归类（41-confirmtoc）：改前 HTTP/网络/单请求超时原样抛出，route 一律落 500
+ * SOURCE_INTERNAL「服务暂时不可用」，用户分不清是站点挂了还是我们坏了。按「可重试与否」映射成 SourceReaderError；
+ * 策略拒绝（422）、预算/切片等已是 SourceReaderError 的原样放行。builtin 不经过这里（零回归红线）。
+ */
+function engineConfirmUpstreamError(error: unknown): unknown {
+  if (error instanceof SourceReaderError || error instanceof SourcePolicyError) return error;
+  const code = failureCode(error);
+  // 观测保留细分码（SOURCE_HTTP_5XX 等），对外 code 是归类后的。
+  const mapped = (message: string, publicCode: string, status: number) =>
+    Object.assign(new SourceReaderError(message, publicCode, status), { confirmReason: code });
+  if (code === 'SOURCE_REQUEST_TIMEOUT') return mapped('该书源响应超时，请稍后重试或换一个候选。', 'SOURCE_TIMEOUT', 504);
+  if (code === 'SOURCE_HTTP_4XX') return mapped('该书源的书页已无法打开，请换一个候选。', 'SOURCE_NOT_FOUND', 404);
+  if (code === 'SOURCE_HTTP_5XX' || code === 'SOURCE_NETWORK_ERROR') {
+    return mapped('该书源暂时无法访问，请稍后重试或换一个候选。', 'SOURCE_UNAVAILABLE', 503);
+  }
+  return error;
+}
+
+/**
+ * 用户在候选列表 / 扇出面板点选后的确认路径（index?book_url=[&source=]）：URL 即用户决定，跳过书名/作者校验，
+ * 只保留结构性防御（域名白名单在 validateSourceUrl、目录可解析、非 excludeBookUrl）。
+ * 每次失败发一行 source_confirm_failed（host + 原因 + 请求数 + 耗时；不带书名、URL 路径、查询串、Cookie）——
+ * 改前这条路径的 404 零观测，生产只能靠时间线猜是哪个源（41-confirmtoc）。
+ */
+async function confirmSourceBook(
+  book: SourceBookIdentity, context: SourceRequestContext, sources: ReadingSource[], bookUrl: string,
+  options: { excludeBookUrl?: string; sourceUrl?: string },
+): Promise<SourceCatalog> {
+  const startedAt = Date.now();
+  let tier: 'engine' | 'builtin' | 'unknown' = 'unknown';
+  try {
+    const url = validateSourceUrl(bookUrl).href;
+    if (url === options.excludeBookUrl) throw new SourceReaderError('该书源已失效，请重新搜索。', 'SOURCE_NOT_FOUND', 404);
+    // 源归属按 host 反查（m2-scaleout §3.7 的铺路）：池内匹配 bookUrl 的 host，避免用
+    // builtin 的 url 给引擎源的 bookUrl 算 sourceId/revision。匹配不到保持既有 sources[0]
+    // 回退（单源池下等价），M2 收紧为 404。带 sourceUrl（扇出面板的确认）时改按源 url 精确定位，
+    // 且 bookUrl 必须属于该源的站；同站多源时 host 反查只会取到池里排在前面的那个源的规则。
+    const targetHost = hostOf(url);
+    const sameStation = (item: ReadingSource) => {
+      const host = hostOf(item.url);
+      // 同站备用 host（book15.net ↔ www.book15.net，fetch 层换 host 兜底）视为同一个源。
+      return host === targetHost || (host.length > 0 && alternateSourceHost(targetHost) === host);
+    };
+    const source = options.sourceUrl !== undefined
+      ? sources.find((item) => item.url === options.sourceUrl && sameStation(item))
+      : sources.find(sameStation);
+    // 匹配不到 → 404 让用户重新选择（设计 §3.7：不猜、不回退 sources[0]，避免源标识错配）。
+    if (!source) throw new SourceReaderError('没有找到该候选对应的可用书源，请重新搜索。', 'SOURCE_NOT_FOUND', 404);
+    if (!isBuiltinReadingSource(source)) {
+      tier = 'engine';
+      // 用户点选即用户决定：跳过书名/作者校验，只保留结构性防御与目录可解析。
+      const engineSource = engineSourceOf(source);
+      try {
+        const detail = await engineFetchDetail(engineSource, url, context);
+        // 身份口径与搜索/probe 路径同一个 engineIdentityOf：详情页没有书名规则时取请求的书（见其注释）。
+        const identity = engineIdentityOf(detail, book);
+        if (!identity.title) throw confirmFailure('该书源的详情页解析失败（取不到书名），请换一个候选。', 'detail_unparsed');
+        const toc = await engineFetchToc(engineSource, detail.tocUrl ?? url, context);
+        if (!toc.chapters.length) throw confirmFailure('该书源的目录为空（站点可能改版或拦截），请重试或换一个候选。', 'toc_empty');
+        return engineCatalogFrom(url, source, identity, toc.chapters);
+      } catch (error) {
+        context.signal.throwIfAborted();
+        throw engineConfirmUpstreamError(error);
+      }
+    }
+    tier = 'builtin';
+    const confirmed = confirmedCatalogFrom(await context.page(url), source);
+    if (typeof confirmed === 'string') {
+      // builtin 对外文案与错误码逐字不变（零回归红线），原因只进观测。
+      throw Object.assign(
+        new SourceReaderError('用户选择的书源无法建立目录，请重试或换一个候选。', 'SOURCE_NOT_FOUND', 404),
+        { confirmReason: confirmed },
+      );
+    }
+    return confirmed;
+  } catch (error) {
+    const reason = context.signal.aborted ? 'timeout'
+      : (error as { confirmReason?: string }).confirmReason ?? failureCode(error);
+    console.warn('[read-source] source_confirm_failed', JSON.stringify({
+      event: 'source_confirm_failed', sourceHost: hostnameOf(bookUrl), tier, reason,
+      requests: context.requests, elapsedMs: Date.now() - startedAt,
+    }));
+    throw error;
+  }
+}
+
 /** Search/detail validation only; never fetches chapter text or evaluates source rules. */
 export async function resolveSourceBook(
   book: SourceBookIdentity,
@@ -528,40 +638,7 @@ export async function resolveSourceBook(
   ));
   // 用户在前端候选列表里点选后的确认路径：URL 即用户决定，跳过书名/作者校验，
   // 只保留结构性防御（域名白名单在 validateSourceUrl、目录可解析、非 excludeBookUrl）。
-  if (options.bookUrl) {
-    const url = validateSourceUrl(options.bookUrl).href;
-    if (url === options.excludeBookUrl) throw new SourceReaderError('该书源已失效，请重新搜索。', 'SOURCE_NOT_FOUND', 404);
-    // 源归属按 host 反查（m2-scaleout §3.7 的铺路）：池内匹配 bookUrl 的 host，避免用
-    // builtin 的 url 给引擎源的 bookUrl 算 sourceId/revision。匹配不到保持既有 sources[0]
-    // 回退（单源池下等价），M2 收紧为 404。带 sourceUrl（扇出面板的确认）时改按源 url 精确定位，
-    // 且 bookUrl 必须属于该源的站；同站多源时 host 反查只会取到池里排在前面的那个源的规则。
-    const targetHost = hostOf(url);
-    const sameStation = (item: ReadingSource) => {
-      const host = hostOf(item.url);
-      // 同站备用 host（book15.net ↔ www.book15.net，fetch 层换 host 兜底）视为同一个源。
-      return host === targetHost || (host.length > 0 && alternateSourceHost(targetHost) === host);
-    };
-    const source = options.sourceUrl !== undefined
-      ? sources.find((item) => item.url === options.sourceUrl && sameStation(item))
-      : sources.find(sameStation);
-    // 匹配不到 → 404 让用户重新选择（设计 §3.7：不猜、不回退 sources[0]，避免源标识错配）。
-    if (!source) throw new SourceReaderError('没有找到该候选对应的可用书源，请重新搜索。', 'SOURCE_NOT_FOUND', 404);
-    if (!isBuiltinReadingSource(source)) {
-      // 用户点选即用户决定：跳过书名/作者校验，只保留结构性防御与目录可解析（沿用现有语义）。
-      const engineSource = engineSourceOf(source);
-      const detail = await engineFetchDetail(engineSource, url, context);
-      const toc = detail.title ? await engineFetchToc(engineSource, detail.tocUrl ?? url, context) : { chapters: [] };
-      if (!detail.title || !toc.chapters.length) {
-        throw new SourceReaderError('用户选择的书源无法建立目录，请重试或换一个候选。', 'SOURCE_NOT_FOUND', 404);
-      }
-      return engineCatalogFrom(url, source, {
-        title: detail.title, author: detail.author ?? '', ...(detail.alias ? { alias: detail.alias } : {}),
-      }, toc.chapters);
-    }
-    const confirmed = confirmedCatalogFrom(await context.page(url), source);
-    if (!confirmed) throw new SourceReaderError('用户选择的书源无法建立目录，请重试或换一个候选。', 'SOURCE_NOT_FOUND', 404);
-    return confirmed;
-  }
+  if (options.bookUrl) return confirmSourceBook(book, context, sources, options.bookUrl, options);
   // 池预算（设计 §3.1）：只有池里真的含引擎源时才抬高全局兜底上限。builtin-only 池保持
   // 今日预算语义逐点不变（零回归红线）；confirm 路径已在上面 return，不进入这里（§3.7）。
   if (sources.some((source) => !isBuiltinReadingSource(source))) context.openPool(sources.length);
@@ -610,10 +687,7 @@ export async function resolveSourceBook(
           checked.add(source.url + result.bookUrl);
           try {
             const detail = await engineFetchDetail(engineSource, result.bookUrl, sourceContext);
-            const identity: SourceBookIdentity = {
-              title: detail.title ?? result.title, author: detail.author ?? result.author,
-              ...(detail.alias ? { alias: detail.alias } : {}),
-            };
+            const identity = engineIdentityOf(detail, result);
             // 引擎只解释规则，不判断「这是不是那本书」——identity 是业务语义，留在调用方（§7.2）。
             if (!sourceBookMatches(book, identity)) continue;
             const toc = await engineFetchToc(engineSource, detail.tocUrl ?? result.bookUrl, sourceContext);
@@ -930,10 +1004,7 @@ async function surveyOneSource(
       if (result.bookUrl === excludeBookUrl || checked.has(result.bookUrl)) continue;
       checked.add(result.bookUrl);
       const detail = await engineFetchDetail(engineSource, result.bookUrl, context);
-      const identity: SourceBookIdentity = {
-        title: detail.title ?? result.title, author: detail.author ?? result.author,
-        ...(detail.alias ? { alias: detail.alias } : {}),
-      };
+      const identity = engineIdentityOf(detail, result);
       if (!sourceBookMatches(book, identity)) continue;
       const toc = await engineFetchToc(engineSource, detail.tocUrl ?? result.bookUrl, context);
       if (!toc.chapters.length) continue;
