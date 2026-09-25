@@ -786,12 +786,98 @@ PREVIEW_MIN_TOTAL = PRECHECK_MIN_CHARS
 _CHAPTER_HEAD_RE = re.compile(
     r'(?:\A|\n\n)(【第[0-9一二三四五六七八九十百千万零〇两\d]+[章节卷回集话部篇][^\n]*】)\n')
 
+# ---- 广告注入门的清洗补洞（lbladfix41，依据 lbladdiag-41-report §2/§4）----
+# 诊断实证：被判「含广告注入」的 8 本里，送模型文本中的「推广」大多不是站点插的推广段，而是
+# (a) 作者公告/感言类目录条目被当章节抓进来；(b) 章节标题里的求票括注、APP免费（标题不过清洗）；
+# (c) 嵌在段落里的盗版站水印（整行规则删不到半行）；(d) 付费试读源的约 100 字预览章。
 
-def prepare_book_text(text: str, clean: bool) -> tuple[str, int, str | None, dict]:
+# (c) 段内水印：只剥匹配到的子串，段落其余正文保留。
+_INLINE_NOISE_PATTERNS = (
+    # kxdu《雪中悍刀行》：`…极土木之盛。 首发--无弹出广告(喜欢本书,请收藏)`，括号内容可空
+    re.compile(r'\s*首发-{1,3}无弹出?广告(?:[(（][^()（）\n]{0,20}[)）])?'),
+    # kxdu《斗罗大陆》：`…孤傲之辈。#百度搜（手打吧）阅读本书最新手打章节#在这个方面…`。
+    # 要求 # 后紧跟「百度」且段内有 手打/章节/阅读本书：都市文里的微博话题（`#某某最新消息#`）不碰。
+    re.compile(r'#\s*百度[^#\n]{0,40}?(?:手打|章节|阅读本书)[^#\n]{0,20}?#'),
+    # `（未完待续）`、`(未完待续。如果您喜欢这部作品，欢迎您来起点投推荐票…)` 一类章尾标记
+    re.compile(r'\s*[（(]\s*未完待续[^()（）\n]{0,80}[)）]'),
+)
+# 整行只有网址（kxdu《鬼吹灯》章尾的 `http://.cn`：域名被剥掉后的残渣，不带括号，水印行规则收不到）
+_BARE_URL_LINE_RE = re.compile(r'^\s*(?:https?://|www\.)[\w.\-/?=&%#:~]*\s*$', re.I)
+
+
+def _strip_inline_noise(line: str) -> str:
+    """段内水印子串剥除（纯函数）。返回剥完后的行（首尾空白已去）；整行是裸网址 → ''。"""
+    if _BARE_URL_LINE_RE.match(line):
+        return ''
+    for pattern in _INLINE_NOISE_PATTERNS:
+        line = pattern.sub('', line)
+    return line.strip()
+
+
+# (b) 章节标题清洗：`第2章 道生（求收藏！）`、`第91章 杀破狼（求月票）APP免费`、`第9章 xx（为盟主加更）`、
+# 标题尾部的更新时间。只动标题，不动章号（切章正则依赖「第X章」前缀）。
+_TITLE_NOISE_PATTERNS = (
+    # 「求」后必须紧跟求票类词：`（求而不得）` 这种章名括注不碰
+    re.compile(r'\s*[（(]\s*(?:跪求|拜求|求)(?:收藏|推荐|月票|票|订阅|打赏|支持|点击|首订|全订)'
+               r'[^()（）]{0,10}[)）]'),
+    re.compile(r'\s*[（(][^()（）]{0,12}(?:盟主|加更|[一二三四五六七八九十0-9]更)[^()（）]{0,6}[)）]'),
+    re.compile(r'\s*APP\s*免费', re.I),
+    re.compile(r'\s*(?:更新时间|更新于|更新)?\s*[:：]?\s*\d{4}[-/.年]\d{1,2}[-/.月]\d{1,2}日?'
+               r'(?:\s*\d{1,2}:\d{2}(?::\d{2})?)?\s*$'),
+)
+
+
+def clean_chapter_title(title: str) -> str:
+    """章节标题 → 去掉求票括注 / APP免费 / 更新时间尾巴后的标题（纯函数，幂等）。"""
+    title = (title or '').strip()
+    for pattern in _TITLE_NOISE_PATTERNS:
+        title = pattern.sub('', title)
+    return title.strip()
+
+
+# (a) 非正文目录条目：标题不是「第X章/卷…」格式，且命中公告/感言类关键词 → 不抓。
+# 有章号前缀的一律保留（正文章节标题恰好带「感言」二字，如 `第八十章 上台感言`）。
+_CHAPTER_NUMBER_TITLE_RE = re.compile(
+    r'^\s*(?:正文\s*)?第[0-9一二三四五六七八九十百千万零〇两]+[章节卷回集话部篇]')
+_NONBODY_TITLE_RE = re.compile(
+    r'感言|公告|上架|推荐一本|请假|通知|冲榜|加更|单章|书友|作品相关|人物列表|月末总结|新书|'
+    r'^\s*关于')
+
+
+def is_nonbody_toc_title(title: str) -> bool:
+    """目录条目是否是作者公告/感言类非正文（纯函数）。"""
+    title = (title or '').strip()
+    return bool(title) and not _CHAPTER_NUMBER_TITLE_RE.match(title) \
+        and bool(_NONBODY_TITLE_RE.search(title))
+
+
+# (d) 付费试读章：标题带 APP免费，或正文 ≤ PREVIEW_CHAPTER_MAX 字且以省略号收尾（截断预览）。
+# 丢弃，不计章数与字数；丢完剩下的正文不足 PREVIEW_MIN_TOTAL → 按试读源拒收（见 prepare_book_text）。
+PREVIEW_CHAPTER_MAX = 200
+_PREVIEW_TITLE_RE = re.compile(r'APP\s*免费', re.I)
+_PREVIEW_TAIL_RE = re.compile(r'(?:\.\.\.|…)\s*$')
+
+
+def is_preview_title(title: str) -> bool:
+    return bool(_PREVIEW_TITLE_RE.search(title or ''))
+
+
+def is_preview_chapter(title: str, body: str) -> bool:
+    """试读章判定（纯函数）：标题带 APP免费，或正文 ≤200 字且以 ... / … 结尾。"""
+    body = (body or '').strip()
+    return is_preview_title(title) or (
+        len(body) <= PREVIEW_CHAPTER_MAX and bool(_PREVIEW_TAIL_RE.search(body)))
+
+
+def prepare_book_text(text: str, clean: bool,
+                      preview_dropped: int = 0) -> tuple[str, int, str | None, dict]:
     """拼接好的整本文本 → (预处理后文本, 字数, 拒收原因或 None, 统计)。纯函数，可离线单测。
 
     输入形态同 fetch_book_text / fetch_book_text_engine 的产出：'【章节标题】\\n正文' 以空行相连。
-    clean=True（引擎正文）时逐行过 _drop_rule；book15 正文在抓取层已清洗过，传 False。
+    clean=True（引擎正文）时：章节标题过 clean_chapter_title，试读章（is_preview_chapter）整章丢弃，
+    正文逐行先剥段内水印（_strip_inline_noise）再过 _drop_rule；book15 正文在抓取层已清洗过，传 False。
+    preview_dropped = 抓取层已丢弃的试读章数（fetch_book_text_engine 的 stats），与本层丢的合计：
+    有试读章被丢、且剩余正文不足 PREVIEW_MIN_TOTAL → 按试读源拒收。
     去重：某行（去首尾空白后 ≥ DEDUPE_MIN_LINE 字）在本书前文出现过 → 删；删空的章整章丢
     （短章在抓取层已按 ≤100 字丢过，这里不再按长度丢）。章节标题行不参与去重。"""
     pieces = _CHAPTER_HEAD_RE.split(text)
@@ -800,14 +886,28 @@ def prepare_book_text(text: str, clean: bool) -> tuple[str, int, str | None, dic
     seen: set[str] = set()
     parts, lengths, chars = [], [], 0
     stats = {'chapters_before': len(chapters), 'clean_lines': 0, 'dup_lines': 0,
-             'dup_chars': 0, 'chars_before': 0}
+             'dup_chars': 0, 'chars_before': 0, 'inline_strips': 0, 'preview_chapters': 0}
     for head, body in chapters:
+        if clean and head:
+            title = head[1:-1]
+            if is_preview_chapter(title, body):
+                stats['preview_chapters'] += 1
+                continue
+            head = f'【{clean_chapter_title(title)}】'
         kept, body_len = [], 0
         for raw in body.split('\n'):
             line = raw.strip()
             if not line:
                 continue
             stats['chars_before'] += len(line)
+            if clean:
+                stripped = _strip_inline_noise(line)
+                if stripped != line:
+                    stats['inline_strips'] += 1
+                line = stripped
+                if not line:
+                    stats['clean_lines'] += 1
+                    continue
             if clean and _drop_rule(line):
                 stats['clean_lines'] += 1
                 continue
@@ -828,7 +928,11 @@ def prepare_book_text(text: str, clean: bool) -> tuple[str, int, str | None, dic
     out = '\n\n'.join(parts)
     lengths.sort()
     median = lengths[len(lengths) // 2] if lengths else 0
+    previews = preview_dropped + stats['preview_chapters']
     stats.update(chapters_after=len(parts), chars_after=chars, median_chapter=median)
+    if previews and chars < PREVIEW_MIN_TOTAL:
+        return out, chars, (f'章节正文过短（试读章 {previews} 章已丢弃，剩余 {chars} 字，'
+                            f'疑似试读/付费截断）'), stats
     if len(lengths) >= PREVIEW_MIN_CHAPTERS and median < PREVIEW_MEDIAN_MAX \
             and chars < PREVIEW_MIN_TOTAL:
         return out, chars, f'章节正文过短（中位 {median} 字，疑似试读/付费截断）', stats
@@ -995,7 +1099,8 @@ def fetch_book_text_engine(engine_cli, book_url: str,
                            expect_title: str = '',
                            expect_author: str = '',
                            giveup_streak: int = SOURCE_GIVEUP_STREAK,
-                           server_error_streak: int = SERVER_ERROR_GIVEUP_STREAK) -> tuple[str, int]:
+                           server_error_streak: int = SERVER_ERROR_GIVEUP_STREAK,
+                           stats: dict | None = None) -> tuple[str, int]:
     """引擎源整本（到字数上限）→ (拼接文本, 实际字数)。
 
     toc 失败（无章 / 环境错误，CLI 退出码非 0）→ 抛异常，交主循环计失败（不静默产空文本）。
@@ -1005,6 +1110,10 @@ def fetch_book_text_engine(engine_cli, book_url: str,
     giveup41：toc 确定性失败、或连续 giveup_streak 章同一确定性错误类别 → 抛 EngineSourceGaveUp
     （带已抓到的部分正文）；确定性错误的单章不再重试（重试结果不变，白等退避）。
     重试后仍 http_5xx 的章连续 server_error_streak 章 → 同样放弃（5xx 章照旧重试）。
+
+    lbladfix41：公告/感言类目录条目（is_nonbody_toc_title）与标题带 APP免费 的试读章抓取前跳过，
+    抓回来是截断预览（is_preview_chapter）的章丢弃；都不计字数，条数记进 stats
+    （nonbody_chapters / preview_chapters，调用方传 dict 才拿得到）。章节标题过 clean_chapter_title。
 
     N02 二次校验（toc 取回后、逐章 content **之前**）：expect_title/expect_author
     是名单侧身份锚点（队列条目的 title/author）。**双侧非空才比对**——toc 缺自报
@@ -1031,6 +1140,9 @@ def fetch_book_text_engine(engine_cli, book_url: str,
             f' vs 目录《{toc_title}》/作者 {toc_author}（作者不符）')
     chapters = toc.get('chapters') or []
     parts, chars = [], 0
+    stats = stats if stats is not None else {}
+    stats.setdefault('nonbody_chapters', 0)
+    stats.setdefault('preview_chapters', 0)
     streak_limit = dict.fromkeys(DETERMINISTIC_ENGINE_ERRORS, giveup_streak)
     streak_limit[SERVER_ERROR_KIND] = server_error_streak
     streak_kind, streak = '', 0     # 连续同一放弃类别（确定性 / 重试后仍 5xx）的章数
@@ -1040,6 +1152,13 @@ def fetch_book_text_engine(engine_cli, book_url: str,
         ch_url = ch.get('url') or ''
         title = (ch.get('title') or '').strip()
         if not ch_url:
+            continue
+        # lbladfix41：公告/感言类目录条目、标题带 APP免费 的试读章在抓取前就跳过（省请求，不计字数）
+        if is_nonbody_toc_title(title):
+            stats['nonbody_chapters'] += 1
+            continue
+        if is_preview_title(title):
+            stats['preview_chapters'] += 1
             continue
         text = ''
         fail_kind = ''              # 本章最后一次尝试的失败类别；'' = 成功或不计入放弃的失败
@@ -1064,22 +1183,26 @@ def fetch_book_text_engine(engine_cli, book_url: str,
                                          '\n\n'.join(parts), chars)
         else:
             streak_kind, streak = '', 0
-        if len(text) > 100:
-            parts.append(f'【{title}】\n{text}')
+        if text and is_preview_chapter(title, text):
+            stats['preview_chapters'] += 1      # 截断预览（≤200 字且以省略号收尾）：丢弃，不计字数
+        elif len(text) > 100:
+            parts.append(f'【{clean_chapter_title(title)}】\n{text}')
             chars += len(text)
         time.sleep(CHAPTER_DELAY)
     return '\n\n'.join(parts), chars
 
 
 def fetch_engine_book_with_giveup(engine_cli, book: dict, tracker: SourceGiveupTracker,
-                                  giveup_streak: int = SOURCE_GIVEUP_STREAK) -> tuple[str, int, dict]:
+                                  giveup_streak: int = SOURCE_GIVEUP_STREAK,
+                                  stats: dict | None = None) -> tuple[str, int, dict]:
     """引擎队列条目取正文，主源失效（确定性错误或持续 5xx）时按 engine_alternates 换源 → (text, chars, 实际所用源)。
 
     实际所用源 = {'url', 'title', 'source'}，调用方据此改写条目的 url/source_host（产物记真实来源）。
     - 主源：身份不符 / 其他失败照旧上抛（行为同改前）；EngineSourceGaveUp → tracker 记一次放弃、换下一个。
     - 备选：任何失败都只跳过该备选（身份不符也不写 rejected——备选不是名单选定的那条）。
     - 放弃前已抓够 MIN_BOOK_CHARS 字 → 直接用已抓到的部分，不再换源。
-    - host 已在 tracker.dead → 不发请求直接跳过。全部用尽 → 抛 EngineSourceGaveUp。"""
+    - host 已在 tracker.dead → 不发请求直接跳过。全部用尽 → 抛 EngineSourceGaveUp。
+    stats（可选）：填入**实际所用源**那一次取文的统计（fetch_book_text_engine 的 stats）。"""
     primary = {'url': book['url'], 'title': book.get('title') or '',
                'source': book.get('source_host') or _url_host(book['url'])}
     options = [primary] + list(book.get('engine_alternates') or [])
@@ -1092,16 +1215,21 @@ def fetch_engine_book_with_giveup(engine_cli, book: dict, tracker: SourceGiveupT
             continue
         if i > 0:
             print(f'  换源: {host} {src["url"]}')
+        attempt_stats: dict = {}
         try:
             text, chars = fetch_book_text_engine(
                 engine_cli, src['url'],
                 expect_title=book.get('title') or '',
                 expect_author=book.get('author') or '',
-                giveup_streak=giveup_streak)
+                giveup_streak=giveup_streak, stats=attempt_stats)
+            if stats is not None:
+                stats.update(attempt_stats)
             return text, chars, src
         except EngineSourceGaveUp as e:
             print(f'  放弃源: {e}（已抓 {e.chars} 字）')
             if e.chars >= MIN_BOOK_CHARS:
+                if stats is not None:
+                    stats.update(attempt_stats)
                 return e.text, e.chars, src     # 已抓够：本书算成功，不给 host 记放弃（giveuprev41 非阻断 4）
             tracker.record(host)
             last = e
@@ -1762,6 +1890,7 @@ def main() -> int:
 
     for i, b in enumerate(queue, 1):
         print(f'[{i}/{len(queue)}] {b.get("title")} ...')
+        fetch_stats: dict = {}      # 引擎取文统计（lbladfix41：跳过的公告条目 / 试读章数）
         try:
             # 引擎兜底条目走 CLI 取正文（toc/content，不过 clean_chapter_text）；
             # rank/分类线走 book15 惰性元数据路径；douban/webnovel 候选已带元数据、--book
@@ -1772,9 +1901,13 @@ def main() -> int:
                 # giveup41：主源失效（连续多章跨站跳转/4xx，或持续 5xx）提前放弃并换备选源；
                 # 换源成功则条目 url/source_host 改记实际来源（产物与入库记真实来源）。
                 text, chars, used = fetch_engine_book_with_giveup(
-                    engine_cli, b, source_giveups, giveup_streak=SOURCE_GIVEUP_STREAK)
+                    engine_cli, b, source_giveups, giveup_streak=SOURCE_GIVEUP_STREAK,
+                    stats=fetch_stats)
                 if used['url'] != b['url']:
                     b['url'], b['source_host'] = used['url'], used['source']
+                if fetch_stats.get('nonbody_chapters') or fetch_stats.get('preview_chapters'):
+                    print(f'  取文跳过: 公告/感言条目 {fetch_stats.get("nonbody_chapters", 0)} 条，'
+                          f'试读章 {fetch_stats.get("preview_chapters", 0)} 章')
             elif not args.book and args.source == 'rank':
                 # 惰性元数据：rank/分类候选只带 {url,title}，这里现抓一次详情页——
                 # og:novel 元数据 + 章节列表 + 全本正文都复用这份 html（共 1 次详情页请求）。
@@ -1800,7 +1933,8 @@ def main() -> int:
                     continue
             else:
                 text, chars = fetch_book_text(b['url'])
-            if chars < MIN_BOOK_CHARS:
+            # 丢过试读章的书字数不足时交给下面的本地预检按试读源拒收（不计钉子户），不在这里记字数不足
+            if chars < MIN_BOOK_CHARS and not fetch_stats.get('preview_chapters'):
                 print(f'  仅抓到 {chars} 字，跳过')
                 reject = {
                     'site_title': '' if args.book else (b.get('title') or '').strip(),
@@ -1817,7 +1951,9 @@ def main() -> int:
                 continue
             # lblqual41：调模型前的本地预检——引擎正文补过清洗层、跨章去重；试读截断源与去重后
             # 字数不足的直接跳过（不调模型、不 sleep LLM_INTERVAL）。见 prepare_book_text。
-            text, chars, precheck_reason, pre = prepare_book_text(text, clean=bool(b.get('engine')))
+            text, chars, precheck_reason, pre = prepare_book_text(
+                text, clean=bool(b.get('engine')),
+                preview_dropped=fetch_stats.get('preview_chapters', 0))
             if pre['dup_lines'] or pre['clean_lines']:
                 print(f'  本地预检: 去重 {pre["dup_lines"]} 行/{pre["dup_chars"]} 字，'
                       f'清洗 {pre["clean_lines"]} 行 → {chars} 字')
