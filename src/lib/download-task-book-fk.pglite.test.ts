@@ -79,6 +79,19 @@ describe('download_tasks.book_id 外键（artifact schema v2）', () => {
     expect(await bookFk(pg)).toEqual([{ confdeltype: 'a', def: 'FOREIGN KEY (book_id) REFERENCES labeled_books(id)' }]);
   }, 60_000);
 
+  // 41-bookidfk N5：artifact-schema.ts 顶部注释称「常量与 DDL 的绑定由测试保证（真库跑完
+  // initializeArtifactSchema 后 artifact_schema_migrations 的 max(version) 必须等于它）」，
+  // 但此前没有任何测试 import 该常量做这条断言（只硬编码 version 1）。这里读常量本身，
+  // 常量一旦与 DDL 字面量偏离（只改常量、不改 DDL，或反之）这条就红。
+  it('N5：真库跑完 initializeArtifactSchema 后 max(version) 等于 ARTIFACT_SCHEMA_VERSION（常量与 DDL 绑定）', async () => {
+    const pg = await productionWithoutArtifacts();
+    await initializeArtifactSchema(lazySql(pg));
+    const versions = await artifactVersions(pg);
+    expect(Math.max(...versions)).toBe(ARTIFACT_SCHEMA_VERSION);
+    // 逐版本存在性判据要求记账行是 1..常量 的连续整数（缺哪个就补哪个）。
+    expect(versions).toEqual(Array.from({ length: ARTIFACT_SCHEMA_VERSION }, (_, i) => i + 1));
+  }, 60_000);
+
   it('反例：旁路插入 book_id 不在 labeled_books 的任务（t8fk 批 A 的形态）在入队时就被拒绝', async () => {
     const pg = await productionWithoutArtifacts();
     await initializeArtifactSchema(lazySql(pg));
