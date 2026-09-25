@@ -1,5 +1,6 @@
 import { beforeAll, describe, expect, it } from 'vitest';
-import { initializeBusinessSchema } from '@/lib/business-schema';
+import { createPGliteSql } from '@/lib/fixtures/pglite-sql';
+import { createProductionSchema, seedProductionMembers } from '@/lib/fixtures/production-schema';
 import { loadPGlite, type PGliteLike } from '@/lib/fixtures/pglite';
 import {
   enqueueProfileFeedbackForUserQuery,
@@ -75,8 +76,8 @@ maybe('真实 PostgreSQL：F41-F1 反馈吸收 LIMIT 截断与水位推进', () 
 
   beforeAll(async () => {
     pg = new PGliteCtor!();
-    await pg.exec('CREATE TABLE users (id int PRIMARY KEY); INSERT INTO users SELECT generate_series(1, 5)');
-    await initializeBusinessSchema(schemaTag as never);
+    await createProductionSchema(createPGliteSql(pg) as never, statement => pg.exec(statement));
+    await seedProductionMembers(pg, 5);
   }, 60_000);
 
   it('① LIMIT 50 截断真实存在：60 条 informative 只回 50 条，且按 feedback id 升序', async () => {

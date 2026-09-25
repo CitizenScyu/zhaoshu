@@ -1,5 +1,6 @@
 import { beforeAll, describe, expect, it } from 'vitest';
-import { initializeBusinessSchema } from '@/lib/business-schema';
+import { createPGliteSql } from '@/lib/fixtures/pglite-sql';
+import { createProductionSchema, seedProductionMembers } from '@/lib/fixtures/production-schema';
 import { loadPGlite, type PGliteLike } from '@/lib/fixtures/pglite';
 import {
   enqueueProfileFeedbackForUserQuery,
@@ -76,8 +77,8 @@ maybe('真实 PostgreSQL：profile_feedback_queue（F15 待吸收水位）', () 
 
   beforeAll(async () => {
     pg = new PGliteCtor!();
-    await pg.exec('CREATE TABLE users (id int PRIMARY KEY); INSERT INTO users SELECT generate_series(1, 5)');
-    await initializeBusinessSchema(tag as never);
+    await createProductionSchema(createPGliteSql(pg) as never, statement => pg.exec(statement));
+    await seedProductionMembers(pg, 5);
   }, 60_000);
 
   it('queued=false 或没有新反馈行时不产生队列事件（404 护栏不留脏 pending）', async () => {

@@ -790,14 +790,90 @@ def fetch_book_text(detail_url: str, target_chars: int = TARGET_CHARS,
 # （引擎 engineFetchContent 已抽干净文本；调研 §4：多源正文优先引擎结果，少依赖 book15
 # 结构的 Python 清洗）。产出与 fetch_book_text 同构：'【章节标题】\n正文'。
 def _engine_json(engine_cli, subcommand: str, *args: str) -> dict:
-    """调引擎 CLI 子命令并解析 JSON stdout；非零退出 → RuntimeError（脱敏摘要）。
+    """调引擎 CLI 子命令并解析 JSON stdout；非零退出 → EngineCliError（RuntimeError 子类，脱敏摘要）。
 
-    凭据红线：stderr 不原样透传——只留单行化 + 截断的错误摘要（CLI 侧另有 safeReason）。"""
+    凭据红线：stderr 不原样透传——只留单行化 + 截断的错误摘要（CLI 侧另有 safeReason）。
+    giveup41：新 CLI 在 --json 出错时于 stderr 末行给 {"errorKind": …}，解析进 EngineCliError.kind
+    （旧 CLI 无此行 → kind=''，行为同改前）；该行不进摘要。"""
     proc = engine_cli.run(subcommand, *args)
     if proc.returncode != 0:
-        summary = ' '.join((proc.stderr or '').split())[:200]
-        raise RuntimeError(f'引擎 {subcommand} 失败 rc={proc.returncode}: {summary}')
+        summary, kind = _split_engine_stderr(proc.stderr)
+        raise EngineCliError(f'引擎 {subcommand} 失败 rc={proc.returncode}: {summary}', kind)
     return json.loads(proc.stdout)
+
+
+def _split_engine_stderr(stderr: str | None) -> tuple[str, str]:
+    """CLI stderr → (单行化截断摘要, errorKind)。末行不是合法的 errorKind JSON 就当普通文本。"""
+    lines = [line for line in (stderr or '').splitlines() if line.strip()]
+    kind = ''
+    if lines and lines[-1].lstrip().startswith('{'):
+        try:
+            payload = json.loads(lines[-1])
+        except ValueError:
+            payload = None
+        if isinstance(payload, dict) and isinstance(payload.get('errorKind'), str):
+            kind = payload['errorKind']
+            lines = lines[:-1]
+    return ' '.join(' '.join(lines).split())[:200], kind
+
+
+class EngineCliError(RuntimeError):
+    """引擎 CLI 非零退出。kind = CLI 给出的 errorKind（见 scripts/engine-error-kind.mjs），旧 CLI 为 ''。"""
+
+    def __init__(self, message: str, kind: str = ''):
+        super().__init__(message)
+        self.kind = kind
+
+
+# ---- 源整站失效提前放弃（giveup41）----
+# 事故（2026-09-25 phoenix）：www.bqquge.org 对所有请求 302 → google，引擎按跨站跳转拒绝，
+# 而逐章循环吞掉一切错误继续下一章，一本书打满上千章、70+ 分钟零产出。改为：
+# - 只有**确定性**错误类别（同一 URL 重试结果不变）参与放弃判定；超时/未知类别不参与（防误杀）。
+# - 同一本书在同一源上连续 SOURCE_GIVEUP_STREAK 章同一确定性类别 → 放弃该源（任一章成功或出现别的
+#   结果即清零）；toc 本身就确定性失败 → 直接放弃该源。放弃后按队列条目的 engine_alternates 换源。
+# - 5xx 残留（giveuprev41）：CLI 内 page() 已对 5xx 重试过、labeler 又重试 CHUNK_RETRY 次后该章仍是
+#   http_5xx，才算一章「5xx 章」；连续 SERVER_ERROR_GIVEUP_STREAK 章（比确定性阈值长）→ 放弃。
+#   否则整站 500/502 仍会把整本目录打满。超时仍不参与。
+# - 同一 host 本轮累计放弃 ≥ DEAD_HOST_GIVEUPS 次 → 本轮后续条目/备选凡在该 host 的不再发请求。
+#   （一轮是先搜完全部书名再打标，打标阶段已无「后续搜索」，故本轮跳过落在打标阶段。）
+SOURCE_GIVEUP_STREAK = 5
+SERVER_ERROR_GIVEUP_STREAK = 8
+SERVER_ERROR_KIND = 'http_5xx'
+DEAD_HOST_GIVEUPS = 2
+DETERMINISTIC_ENGINE_ERRORS = frozenset({'policy', 'http_4xx', 'no_source'})
+# 主源与全部备选都在本轮已失效 host 上、一个请求都没发时的放弃 kind（不是 CLI 错误类别）。
+DEAD_HOST_SKIP_KIND = 'dead_host_skipped'
+MIN_BOOK_CHARS = 10_000     # 一本书至少要抓到的字数（不足记「抓取字数不足」）
+
+
+class EngineSourceGaveUp(RuntimeError):
+    """放弃某源：host + 触发类别 + 放弃前已抓到的部分正文（text/chars，供调用方决定是否够用）。"""
+
+    def __init__(self, host: str, kind: str, detail: str, text: str = '', chars: int = 0):
+        super().__init__(f'源 {host} 失效（{kind}）：{detail}')
+        self.host, self.kind, self.text, self.chars = host, kind, text, chars
+
+
+def _url_host(url: str) -> str:
+    try:
+        return urllib.parse.urlsplit(url).hostname or ''
+    except ValueError:
+        return ''
+
+
+class SourceGiveupTracker:
+    """单轮内按 host 累计放弃次数（不跨轮：站点可能恢复）。dead = 本轮判失效、后续不再请求的 host。"""
+
+    def __init__(self, threshold: int = DEAD_HOST_GIVEUPS):
+        self.threshold = threshold
+        self.counts: dict[str, int] = {}
+        self.dead: set[str] = set()
+
+    def record(self, host: str) -> None:
+        n = self.counts[host] = self.counts.get(host, 0) + 1
+        if n >= self.threshold and host not in self.dead:
+            self.dead.add(host)
+            print(f'  源失效（本轮）: {host} 已累计放弃 {n} 次，本轮后续条目不再请求该源', flush=True)
 
 
 class EngineIdentityMismatch(Exception):
@@ -811,12 +887,18 @@ class EngineIdentityMismatch(Exception):
 def fetch_book_text_engine(engine_cli, book_url: str,
                            target_chars: int = TARGET_CHARS,
                            expect_title: str = '',
-                           expect_author: str = '') -> tuple[str, int]:
+                           expect_author: str = '',
+                           giveup_streak: int = SOURCE_GIVEUP_STREAK,
+                           server_error_streak: int = SERVER_ERROR_GIVEUP_STREAK) -> tuple[str, int]:
     """引擎源整本（到字数上限）→ (拼接文本, 实际字数)。
 
     toc 失败（无章 / 环境错误，CLI 退出码非 0）→ 抛异常，交主循环计失败（不静默产空文本）。
     单章 content 失败（重试后仍空）跳过，隔离不拖垮整本；target_chars/CHUNK_RETRY/CHAPTER_DELAY
     与 book15 路径沿用同一常量。
+
+    giveup41：toc 确定性失败、或连续 giveup_streak 章同一确定性错误类别 → 抛 EngineSourceGaveUp
+    （带已抓到的部分正文）；确定性错误的单章不再重试（重试结果不变，白等退避）。
+    重试后仍 http_5xx 的章连续 server_error_streak 章 → 同样放弃（5xx 章照旧重试）。
 
     N02 二次校验（toc 取回后、逐章 content **之前**）：expect_title/expect_author
     是名单侧身份锚点（队列条目的 title/author）。**双侧非空才比对**——toc 缺自报
@@ -824,7 +906,13 @@ def fetch_book_text_engine(engine_cli, book_url: str,
     title 用 title_compatible 语义比对；author 用 douban_list.author_matches（与候选
     过滤同一口径，否则候选阶段放行的多署名/外文末节写法会在这里被拒）。不符 → 抛 EngineIdentityMismatch（此时一个 content 调用都没发起，
     省掉整本抓取）。"""
-    toc = _engine_json(engine_cli, 'toc', '--url', book_url)
+    host = _url_host(book_url)
+    try:
+        toc = _engine_json(engine_cli, 'toc', '--url', book_url)
+    except EngineCliError as e:
+        if e.kind in DETERMINISTIC_ENGINE_ERRORS:
+            raise EngineSourceGaveUp(host, e.kind, f'目录失败 {e}') from e
+        raise
     toc_title = (toc.get('title') or '').strip()
     toc_author = (toc.get('author') or '').strip()
     if expect_title and toc_title and not douban_list.title_compatible(expect_title, toc_title):
@@ -837,6 +925,9 @@ def fetch_book_text_engine(engine_cli, book_url: str,
             f' vs 目录《{toc_title}》/作者 {toc_author}（作者不符）')
     chapters = toc.get('chapters') or []
     parts, chars = [], 0
+    streak_limit = dict.fromkeys(DETERMINISTIC_ENGINE_ERRORS, giveup_streak)
+    streak_limit[SERVER_ERROR_KIND] = server_error_streak
+    streak_kind, streak = '', 0     # 连续同一放弃类别（确定性 / 重试后仍 5xx）的章数
     for ch in chapters:
         if chars >= target_chars:
             break
@@ -845,17 +936,76 @@ def fetch_book_text_engine(engine_cli, book_url: str,
         if not ch_url:
             continue
         text = ''
+        fail_kind = ''              # 本章最后一次尝试的失败类别；'' = 成功或不计入放弃的失败
         for attempt in range(CHUNK_RETRY):
             try:
                 text = _engine_json(engine_cli, 'content', '--url', ch_url).get('text') or ''
+                fail_kind = ''
                 break
-            except Exception:
+            except EngineCliError as e:
+                fail_kind = e.kind if e.kind in streak_limit else ''
+                if fail_kind in DETERMINISTIC_ENGINE_ERRORS:
+                    break           # 确定性错误：重试结果不变，不退避
                 time.sleep(2 * (attempt + 1))
+            except Exception:
+                fail_kind = ''
+                time.sleep(2 * (attempt + 1))
+        if fail_kind:
+            streak = streak + 1 if fail_kind == streak_kind else 1
+            streak_kind = fail_kind
+            if streak >= streak_limit[fail_kind]:
+                raise EngineSourceGaveUp(host, fail_kind, f'连续 {streak} 章 {fail_kind}',
+                                         '\n\n'.join(parts), chars)
+        else:
+            streak_kind, streak = '', 0
         if len(text) > 100:
             parts.append(f'【{title}】\n{text}')
             chars += len(text)
         time.sleep(CHAPTER_DELAY)
     return '\n\n'.join(parts), chars
+
+
+def fetch_engine_book_with_giveup(engine_cli, book: dict, tracker: SourceGiveupTracker,
+                                  giveup_streak: int = SOURCE_GIVEUP_STREAK) -> tuple[str, int, dict]:
+    """引擎队列条目取正文，主源失效（确定性错误或持续 5xx）时按 engine_alternates 换源 → (text, chars, 实际所用源)。
+
+    实际所用源 = {'url', 'title', 'source'}，调用方据此改写条目的 url/source_host（产物记真实来源）。
+    - 主源：身份不符 / 其他失败照旧上抛（行为同改前）；EngineSourceGaveUp → tracker 记一次放弃、换下一个。
+    - 备选：任何失败都只跳过该备选（身份不符也不写 rejected——备选不是名单选定的那条）。
+    - 放弃前已抓够 MIN_BOOK_CHARS 字 → 直接用已抓到的部分，不再换源。
+    - host 已在 tracker.dead → 不发请求直接跳过。全部用尽 → 抛 EngineSourceGaveUp。"""
+    primary = {'url': book['url'], 'title': book.get('title') or '',
+               'source': book.get('source_host') or _url_host(book['url'])}
+    options = [primary] + list(book.get('engine_alternates') or [])
+    last: Exception | None = None
+    for i, src in enumerate(options):
+        host = src.get('source') or _url_host(src['url'])
+        if host in tracker.dead:
+            print(f'  跳过本轮已失效源: {host}')
+            last = last or EngineSourceGaveUp(host, DEAD_HOST_SKIP_KIND, '本轮已判失效')
+            continue
+        if i > 0:
+            print(f'  换源: {host} {src["url"]}')
+        try:
+            text, chars = fetch_book_text_engine(
+                engine_cli, src['url'],
+                expect_title=book.get('title') or '',
+                expect_author=book.get('author') or '',
+                giveup_streak=giveup_streak)
+            return text, chars, src
+        except EngineSourceGaveUp as e:
+            print(f'  放弃源: {e}（已抓 {e.chars} 字）')
+            if e.chars >= MIN_BOOK_CHARS:
+                return e.text, e.chars, src     # 已抓够：本书算成功，不给 host 记放弃（giveuprev41 非阻断 4）
+            tracker.record(host)
+            last = e
+        except Exception as e:
+            if i == 0:
+                raise
+            print(f'  备选源 {host} 失败，跳过: {e}')
+            last = e
+    raise EngineSourceGaveUp(primary['source'], getattr(last, 'kind', 'other'),
+                             f'{len(options)} 个候选源均不可用（最后: {last}）')
 
 
 # ---- 每轮失败分类（labelerdiag41 P3：巡检要一眼分出是代码缺陷、LLM 渠道还是书源问题）----
@@ -866,6 +1016,8 @@ def classify_failure(error: BaseException) -> str:
     msg = str(error)
     if isinstance(error, EngineIdentityMismatch):
         return '目录作者不符' if '作者不符' in msg else '目录标题不符'
+    if isinstance(error, EngineSourceGaveUp):     # 先于下面按文案猜的分支（消息里可能含 HTTPS）
+        return '源失效放弃'
     # 先于 JSON 判：模型链耗尽的消息里常带「最后错误: Unterminated string…」
     if '模型链' in msg and '耗尽' in msg:
         return 'LLM链耗尽'
@@ -1396,6 +1548,8 @@ def main() -> int:
 
     ok = fail = stub_skipped = 0
     fail_kinds: dict[str, int] = {}
+    # giveup41：本轮按 host 累计「源失效」放弃次数，达阈值后后续条目不再请求该 host。
+    source_giveups = SourceGiveupTracker(DEAD_HOST_GIVEUPS)
 
     def count_failure(kind: str) -> None:
         fail_kinds[kind] = fail_kinds.get(kind, 0) + 1
@@ -1419,10 +1573,12 @@ def main() -> int:
             if b.get('engine'):
                 # N02：toc 自报身份与名单身份比对（双侧非空才比对），错书在抓正文前拦下。
                 # 引擎条目 url 是绝对 host URL，绝不能走 http_get(BASE + url) 打错站。
-                text, chars = fetch_book_text_engine(
-                    engine_cli, b['url'],
-                    expect_title=b.get('title') or '',
-                    expect_author=b.get('author') or '')
+                # giveup41：主源失效（连续多章跨站跳转/4xx，或持续 5xx）提前放弃并换备选源；
+                # 换源成功则条目 url/source_host 改记实际来源（产物与入库记真实来源）。
+                text, chars, used = fetch_engine_book_with_giveup(
+                    engine_cli, b, source_giveups, giveup_streak=SOURCE_GIVEUP_STREAK)
+                if used['url'] != b['url']:
+                    b['url'], b['source_host'] = used['url'], used['source']
             elif not args.book and args.source == 'rank':
                 # 惰性元数据：rank/分类候选只带 {url,title}，这里现抓一次详情页——
                 # og:novel 元数据 + 章节列表 + 全本正文都复用这份 html（共 1 次详情页请求）。
@@ -1448,7 +1604,7 @@ def main() -> int:
                     continue
             else:
                 text, chars = fetch_book_text(b['url'])
-            if chars < 10_000:
+            if chars < MIN_BOOK_CHARS:
                 print(f'  仅抓到 {chars} 字，跳过')
                 reject = {
                     'site_title': '' if args.book else (b.get('title') or '').strip(),
