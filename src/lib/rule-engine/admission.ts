@@ -15,7 +15,7 @@ import { sourceAbortable } from '@/lib/source-fetch';
 import { CORE_FIELDS, iterRulePairs, selectCandidates, type RawSource } from './compile-smoke';
 import { parseFieldRule } from './parse';
 import {
-  createScope, evaluateField, evaluateFieldNodes, insideNode, normalizeBody, type HtmlScope,
+  createScope, evaluateField, evaluateFieldList, normalizeBody,
 } from './evaluate';
 import { RuleEngineError, type RuleDiagnostic } from './types';
 import { engineSourceRevision } from './compile';
@@ -453,12 +453,12 @@ function searchCandidateUrls(source: RawSource, text: string, pageUrl: string): 
   const bookUrlIr = parseSafe(bookUrl);
   let scope;
   try { scope = createScope(normalizeBody(text), pageUrl); } catch { return []; }
-  if (scope.kind !== 'html') return [];
-  let nodes;
-  try { nodes = evaluateFieldNodes(listIr, scope); } catch { return []; }
+  // HTML 与 JSON 搜索页同一路径（JSON 页 bookList 取列表项，见 evaluateFieldList）。
+  let items;
+  try { items = evaluateFieldList(listIr, scope); } catch { return []; }
   const urls: string[] = [];
-  for (let i = 0; i < nodes.length && i < MAX_CANDIDATE_SCAN; i += 1) {
-    const inner = insideNode(scope as HtmlScope, nodes[i]);
+  for (let i = 0; i < items.length && i < MAX_CANDIDATE_SCAN; i += 1) {
+    const inner = items[i];
     try {
       const title = nameIr ? evaluateField(nameIr, inner) : '';
       const url = bookUrlIr ? evaluateField(bookUrlIr, inner) : '';

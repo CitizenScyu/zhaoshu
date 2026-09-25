@@ -241,7 +241,10 @@ describe('evaluate：JSON 输入与输入归一化（§3.1）', () => {
 
   it('输入形态与规则类型不匹配 → RULE_EVAL_FAILED', () => {
     expect(() => evaluateField(field('$.data.list[*].name'), synthScope())).toThrow(RuleEngineError);
-    expect(() => evaluateField(field('div.t2@text'), jsonScope())).toThrow(RuleEngineError);
+    // 显式 @css: 强制 CSS 模式，对 JSON 输入照旧拒绝；默认语法规则在 JSON 输入上走 legado
+    // Json 模式（补 `$.` 交 JSONPath，jsonbl41），`div.t2@text` 读不到值 → 空串而非抛错。
+    expect(() => evaluateField(field('@css:div.t2@text'), jsonScope())).toThrow(RuleEngineError);
+    expect(evaluateField(field('div.t2@text'), jsonScope())).toBe('');
   });
 
   it('normalizeBody：JSON/HTML 判定与 inte_base64 解包', () => {

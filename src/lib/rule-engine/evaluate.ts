@@ -3,8 +3,11 @@
 // / §3.4（失败隔离）。引擎零网络：本文件不引入任何请求路径，页 URL 由调用方经 scope 传入。
 
 import { load, type CheerioAPI } from 'cheerio';
-import { type FieldIr, RuleEngineError, type RuleIr, type RegexSub, type TemplatePart } from './types';
-import { evalJsonPath } from './jsonpath';
+import {
+  type FieldIr, type JsonPathIr, RuleEngineError, type RuleIr, type RegexSub, type TemplatePart,
+} from './types';
+import { evalJsonPath, evalJsonPathList, parseJsonPath } from './jsonpath';
+import { defaultSyntaxSource } from './parse';
 import {
   applyTerminal,
   type CheerioNodes,
@@ -123,7 +126,12 @@ export function insideNode(scope: HtmlScope, node: unknown): HtmlScope {
 export function evaluateRule(ir: RuleIr, scope: EvalScope, multi = false): EvalResult {
   switch (ir.kind) {
     case 'css': {
-      if (scope.kind !== 'html') return evalFailed('HTML 选择器规则不能对 JSON 输入求值');
+      if (scope.kind !== 'html') {
+        // 默认语法规则在 JSON 输入上走 legado Json 模式（见 parse.ts defaultSyntaxSource）；
+        // 显式 @css: 仍是 CSS，照旧拒绝。
+        if (defaultSyntaxSource(ir) === undefined) return evalFailed('HTML 选择器规则不能对 JSON 输入求值');
+        return { kind: 'text', value: jsonModeString(ir, scope.json) };
+      }
       const result = evaluateCssChain(scope.$, scope.nodes, ir.chain, ir.terminal, scope.pageUrl, multi);
       return typeof result === 'string' ? { kind: 'text', value: result } : { kind: 'nodes', nodes: result };
     }
@@ -134,6 +142,11 @@ export function evaluateRule(ir: RuleIr, scope: EvalScope, multi = false): EvalR
     case 'template':
       return { kind: 'text', value: renderTemplate(ir.parts, scope) };
     case 'text':
+      // JSON 输入上字面量里的 `{$.x}` 内嵌规则就地替换（如 `http://h/b/{$.id}.html`）；
+      // 没有可替换的内嵌规则则原样返回字面量。
+      if (scope.kind === 'json' && ir.literal.includes(INNER_JSON_RULE_OPEN)) {
+        return { kind: 'text', value: replaceInnerJsonRules(ir.literal, scope.json) ?? ir.literal };
+      }
       return { kind: 'text', value: ir.literal };
     case 'or':
       // P1a || 组合（空值短路）。列表上下文（evaluateFieldNodes）不走这里——
@@ -199,6 +212,77 @@ function jsonValuesToString(values: unknown[]): string {
   return values.map(jsonValueToString).join(MULTI_JOIN);
 }
 
+// ---------------------------------------------------------------- JSON 模式（legado Mode.Json）
+// 对齐 legado AnalyzeByJSonPath.getString：先替换内嵌 `{$.x}` 规则；一处都没替换成功时，
+// 整条规则交 Jayway 读取——不以 `$`/`@` 开头的路径补 `$.` 前缀。Jayway 解析/读取失败被
+// legado 吞掉返回空串，这里同样返回空串、不抛错。
+
+const INNER_JSON_RULE_OPEN = '{$.';
+
+/** 默认语法规则重解释成的 JSONPath（按 IR 缓存；null=无法解释，求值恒空）。 */
+const reinterpretedPaths = new WeakMap<RuleIr, JsonPathIr | null>();
+
+function reinterpretedPath(ir: RuleIr): JsonPathIr | null {
+  const cached = reinterpretedPaths.get(ir);
+  if (cached !== undefined) return cached;
+  const source = defaultSyntaxSource(ir);
+  let path: JsonPathIr | null = null;
+  // `@` 开头在 Jayway 里是当前节点语法而非字段名（如 `@text`），不补前缀，按读取失败处理。
+  if (source !== undefined && !source.startsWith('@')) {
+    try { path = parseJsonPath(`$.${source}`); } catch { path = null; }
+  }
+  reinterpretedPaths.set(ir, path);
+  return path;
+}
+
+function jsonModeString(ir: RuleIr, json: unknown): string {
+  const source = defaultSyntaxSource(ir) ?? '';
+  const inner = source.includes(INNER_JSON_RULE_OPEN) ? replaceInnerJsonRules(source, json) : undefined;
+  if (inner !== undefined) return inner;
+  const path = reinterpretedPath(ir);
+  return path ? jsonValuesToString(evalJsonPath(path, json)) : '';
+}
+
+/**
+ * legado RuleAnalyzer.innerRule("{$.")：逐个找 `{$.`、按花括号配平取出内嵌规则并求值，
+ * 求值非空才替换；一处都没替换成功返回 undefined（legado 此时返回空串，交由调用方决定回退）。
+ */
+function replaceInnerJsonRules(text: string, json: unknown): string | undefined {
+  let out = '';
+  let last = 0;
+  let replaced = false;
+  let at = text.indexOf(INNER_JSON_RULE_OPEN);
+  while (at >= 0) {
+    const close = matchingBrace(text, at);
+    let value = '';
+    if (close > at) {
+      try { value = jsonValuesToString(evalJsonPath(parseJsonPath(text.slice(at + 1, close)), json)); } catch { value = ''; }
+    }
+    if (value !== '') {
+      out += text.slice(last, at) + value;
+      last = close + 1;
+      replaced = true;
+      at = text.indexOf(INNER_JSON_RULE_OPEN, last);
+    } else {
+      at = text.indexOf(INNER_JSON_RULE_OPEN, at + INNER_JSON_RULE_OPEN.length);
+    }
+  }
+  return replaced ? out + text.slice(last) : undefined;
+}
+
+/** `open` 处的 `{` 对应的 `}` 下标；不配平返回 -1。 */
+function matchingBrace(text: string, open: number): number {
+  let depth = 0;
+  for (let i = open; i < text.length; i += 1) {
+    if (text[i] === '{') depth += 1;
+    else if (text[i] === '}') {
+      depth -= 1;
+      if (depth === 0) return i;
+    }
+  }
+  return -1;
+}
+
 // ---------------------------------------------------------------- 字段求值（§3.3）
 /**
  * 求值一个字符串字段：
@@ -246,6 +330,46 @@ export function evaluateFieldNodes(field: FieldIr, scope: EvalScope): CheerioNod
     if (result.kind === 'nodes' && result.nodes.length > 0) return result.nodes;
   }
   return scope.$([]);
+}
+
+/**
+ * 列表字段逐条求值用的作用域序列（bookList → 每条的 name/author/bookUrl；chapterList 同理）。
+ * - HTML：`evaluateFieldNodes` 的节点集逐个 `insideNode`，与直接调用二者逐字等价；
+ * - JSON：对齐 legado AnalyzeByJSonPath.getList——JSONPath 规则按 `evalJsonPathList` 取列表项，
+ *   默认语法规则补 `$.` 后同样处理（`.bookList[*]` → `$..bookList[*]`），`||` 取首个非空支；
+ *   模板/字面量/显式 CSS 没有列表语义，视为空支。每项各自成为 JSON 作用域。
+ */
+export function evaluateFieldList(field: FieldIr, scope: EvalScope): EvalScope[] {
+  if (scope.kind === 'html') {
+    const nodes = evaluateFieldNodes(field, scope);
+    const scopes: EvalScope[] = [];
+    for (let index = 0; index < nodes.length; index += 1) scopes.push(insideNode(scope, nodes[index]));
+    return scopes;
+  }
+  for (const ir of field.rules) {
+    const items = jsonListItems(ir, scope.json);
+    if (items.length > 0) return items.map((item) => createJsonScope(item, scope.pageUrl));
+  }
+  return [];
+}
+
+function jsonListItems(ir: RuleIr, json: unknown): unknown[] {
+  switch (ir.kind) {
+    case 'jsonpath':
+      return evalJsonPathList(ir.path, json);
+    case 'css': {
+      const path = reinterpretedPath(ir);
+      return path ? evalJsonPathList(path, json) : [];
+    }
+    case 'or':
+      for (const branch of ir.branches) {
+        const items = jsonListItems(branch, json);
+        if (items.length > 0) return items;
+      }
+      return [];
+    default:
+      return [];
+  }
 }
 
 /** 套用 `##pattern##replacement##flags##` 替换（`##p##` 无 replacement 即删除匹配，§3.3）。 */

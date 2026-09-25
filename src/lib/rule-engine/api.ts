@@ -11,7 +11,7 @@ import {
 } from '@/lib/source-parser';
 import type { SourceRequestContext } from '@/lib/source-reader';
 import { contentHtmlToText, contentNeedsHtmlToText } from './content-html';
-import { createScope, evaluateField, evaluateFieldNodes, insideNode, normalizeBody } from './evaluate';
+import { createScope, evaluateField, evaluateFieldList, normalizeBody } from './evaluate';
 import type { CompiledRules, FieldIr, SkippedField } from './types';
 
 export interface EngineSource {
@@ -58,12 +58,12 @@ export async function engineSearchBook(
   const page = await context.page(sourceSearchUrl(source.searchUrl, title, source.url));
   const scope = createScope(normalizeBody(page.text), page.url);
   const list = field(source.compiled, 'ruleSearch.bookList');
-  if (!list || scope.kind !== 'html') return [];
-  const nodes = evaluateFieldNodes(list, scope);
+  if (!list) return [];
+  const items = evaluateFieldList(list, scope);
   const results: EngineSearchResult[] = [];
   const seen = new Set<string>();
-  for (let index = 0; index < nodes.length && results.length < MAX_SEARCH_CANDIDATES; index += 1) {
-    const inner = insideNode(scope, nodes[index]);
+  for (let index = 0; index < items.length && results.length < MAX_SEARCH_CANDIDATES; index += 1) {
+    const inner = items[index];
     const name = evaluateText(source.compiled, 'ruleSearch.name', inner);
     const bookUrl = absoluteUrl(evaluateText(source.compiled, 'ruleSearch.bookUrl', inner), page.url);
     if (!name || !bookUrl || seen.has(bookUrl)) continue;
@@ -110,10 +110,10 @@ export async function engineFetchToc(
     let validChapters = 0;
     const list = field(source.compiled, 'ruleToc.chapterList');
     if (strict && [...source.compiled.entries()].some(([key, value]) => key.startsWith('ruleToc.') && 'skipped' in value)) throw new Error('unsupported_toc_rule');
-    if (list && scope.kind === 'html') {
-      const nodes = evaluateFieldNodes(list, scope);
-      for (let index = 0; index < nodes.length; index += 1) {
-        const inner = insideNode(scope, nodes[index]);
+    if (list) {
+      const items = evaluateFieldList(list, scope);
+      for (let index = 0; index < items.length; index += 1) {
+        const inner = items[index];
         const title = evaluateText(source.compiled, 'ruleToc.chapterName', inner);
         // legado BookChapterList.kt:230-244（Jer-Chao@c2c4775 / vvb2060@5a65aa42，取证见
         // docs/legado-semantics/）：URL 类规则缺失或求值为空 → 章节 url 取当前目录页 URL

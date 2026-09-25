@@ -127,6 +127,27 @@ function parseLiteral(s: string): string | number | boolean {
 }
 
 // ---------------------------------------------------------------- 求值
+/**
+ * Jayway 的「确定路径」判据（Path.isDefinite）：只含 child 与单下标。递归 `..`、通配 `*`、
+ * 多下标、切片、过滤器都会让结果成为「命中列表」。列表字段据此区分：确定路径取到的数组
+ * 本身就是列表（`$.Novels`），不确定路径的命中值逐个成为列表项（`$.books[*]`）。
+ */
+export function isDefinitePath(ir: JsonPathIr): boolean {
+  return ir.segments.every((seg) => seg.kind === 'root' || seg.kind === 'child' || seg.kind === 'index');
+}
+
+/**
+ * 列表字段（bookList/chapterList）在 JSON 输入上的取值，对齐 legado AnalyzeByJSonPath.getList
+ * （`ctx.read<ArrayList<Any>>(rule)`）：确定路径命中数组 → 数组元素；命中对象/标量 → 转型失败
+ * 返回空列表；不确定路径 → 命中值本身即列表项（不再展平）。
+ */
+export function evalJsonPathList(ir: JsonPathIr, root: Json): Json[] {
+  const values = evalJsonPath(ir, root);
+  if (!isDefinitePath(ir)) return values;
+  const only = values[0];
+  return Array.isArray(only) ? only : [];
+}
+
 /** 对 JSON 输入求值，返回命中值列表（可能为空）。求值不抛业务错，越界/缺字段=空。 */
 export function evalJsonPath(ir: JsonPathIr, root: Json): Json[] {
   let current: Json[] = [root];
