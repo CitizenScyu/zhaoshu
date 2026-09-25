@@ -20,7 +20,7 @@ const mocks = vi.hoisted(() => ({
 vi.mock('next/server', async (importOriginal) => ({
   ...await importOriginal<typeof import('next/server')>(), after: mocks.after,
 }));
-vi.mock('@neondatabase/serverless', () => ({ neon: mocks.neon }));
+vi.mock('@neondatabase/serverless', () => ({ neon: mocks.neon, neonConfig: {} }));
 vi.mock('@/lib/db', async (importOriginal) => ({
   ...await importOriginal<typeof import('@/lib/db')>(),
   recordFeedbackForUser: async (userId: number, book: { title: string; author: string }, status: string, note: string, expectedVersion: number) => {

@@ -26,6 +26,7 @@ import { getSql } from '@/lib/db';
 import { MAX_INVITE_CODE_LENGTH, hashInviteCode } from '@/lib/invite-codes';
 import { MIN_PASSWORD_CODEPOINTS, checkPasswordBounds, hashPassword } from '@/lib/password';
 import { buildRegistrationStatement, type SqlTag } from '@/lib/register-statement';
+import { withDbQuotaGuard } from '@/lib/db-quota-guard';
 
 // 用户名 + 密码 + 邀请码合计上限 4 KiB（设计 §4.1）。
 const MAX_REGISTER_BODY_CHARS = 4096;
@@ -62,7 +63,7 @@ type RegisterRow = {
 // 消费（权威判定）仍发生在插用户之前，并发同码注册最多一人成功。语句本体见 lib/register-statement.ts。
 //
 // 配置行 FOR SHARE：owner 的「关闭注册」与本次提交按行锁排序，先提交的关闭生效。
-export async function POST(req: NextRequest) {
+async function handlePOST(req: NextRequest) {
   if (!authAccountsEnabled()) {
     return authError(503, 'ACCOUNTS_DISABLED', 'account features are not enabled');
   }
@@ -231,3 +232,6 @@ export async function POST(req: NextRequest) {
   response.cookies.set(getSessionCookieName(), token, sessionCookieOptions(remember === true));
   return response;
 }
+
+// 数据库配额闸（41-q402fix）：导出的处理器统一经 withDbQuotaGuard 包装（route-guard.test.ts 钉死）。
+export const POST = withDbQuotaGuard(handlePOST);

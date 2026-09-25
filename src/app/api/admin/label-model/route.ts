@@ -9,6 +9,7 @@ import {
   writeLabelModelSetting,
 } from '@/lib/app-settings';
 import { readJsonBody, RequestBodyError } from '@/lib/http';
+import { withDbQuotaGuard } from '@/lib/db-quota-guard';
 
 const MAX_BODY_BYTES = 2 * 1024;
 const UNAVAILABLE = '打标模型设置暂时不可用，请稍后重试。';
@@ -16,7 +17,7 @@ const UNAVAILABLE = '打标模型设置暂时不可用，请稍后重试。';
 // 打标模型：只存名字。labeler.py 跑在 phoenix 上、走的是另一条上游地址，Web 侧既无法
 // 探测也不该知道密钥/地址，所以这里不做保存前验证，只做名字格式校验。留空 = 让打标机
 // 用它自己的 .env（向后兼容的缺省路径）。
-export async function GET(req: NextRequest) {
+async function handleGET(req: NextRequest) {
   const guard = await guardOwnerRead(req);
   if (!guard.ok) return guard.response;
   try {
@@ -26,7 +27,7 @@ export async function GET(req: NextRequest) {
   }
 }
 
-export async function PATCH(req: NextRequest) {
+async function handlePATCH(req: NextRequest) {
   const guard = await guardOwnerWrite(req);
   if (!guard.ok) return guard.response;
 
@@ -57,3 +58,7 @@ export async function PATCH(req: NextRequest) {
     return authError(503, 'SETTINGS_UNAVAILABLE', UNAVAILABLE);
   }
 }
+
+// 数据库配额闸（41-q402fix）：导出的处理器统一经 withDbQuotaGuard 包装（route-guard.test.ts 钉死）。
+export const GET = withDbQuotaGuard(handleGET);
+export const PATCH = withDbQuotaGuard(handlePATCH);

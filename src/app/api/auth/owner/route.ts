@@ -24,11 +24,12 @@ import {
 import { isJsonContentType, verifySameOriginWrite } from '@/lib/csrf';
 import { getSql } from '@/lib/db';
 import { authError, authJson } from '@/lib/auth-http';
+import { withDbQuotaGuard } from '@/lib/db-quota-guard';
 
 const MAX_EXCHANGE_BODY_CHARS = 4096;
 
 // 验证旧口令并兑换 owner Cookie：不保存口令明文，也不把 APP_OWNER_TOKEN 转存为普通密码。
-export async function POST(req: NextRequest) {
+async function handlePOST(req: NextRequest) {
   if (!authAccountsEnabled()) {
     return authError(503, 'ACCOUNTS_DISABLED', 'account features are not enabled');
   }
@@ -143,3 +144,6 @@ export async function POST(req: NextRequest) {
   );
   return response;
 }
+
+// 数据库配额闸（41-q402fix）：导出的处理器统一经 withDbQuotaGuard 包装（route-guard.test.ts 钉死）。
+export const POST = withDbQuotaGuard(handlePOST);

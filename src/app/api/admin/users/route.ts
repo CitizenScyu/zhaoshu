@@ -3,6 +3,7 @@ import { guardOwnerRead } from '@/lib/admin-http';
 import { authError, authJson } from '@/lib/auth-http';
 import { getSql } from '@/lib/db';
 import { boundedPositiveInteger } from '@/lib/http';
+import { withDbQuotaGuard } from '@/lib/db-quota-guard';
 
 const UNAVAILABLE = '用户列表暂时不可用，请稍后重试。';
 const DEFAULT_PAGE_SIZE = 20;
@@ -47,7 +48,7 @@ export function toAdminUser(row: UserRow): AdminUserSummary {
   };
 }
 
-export async function GET(req: NextRequest) {
+async function handleGET(req: NextRequest) {
   const guard = await guardOwnerRead(req);
   if (!guard.ok) return guard.response;
 
@@ -77,3 +78,6 @@ export async function GET(req: NextRequest) {
     return authError(503, 'USERS_UNAVAILABLE', UNAVAILABLE);
   }
 }
+
+// 数据库配额闸（41-q402fix）：导出的处理器统一经 withDbQuotaGuard 包装（route-guard.test.ts 钉死）。
+export const GET = withDbQuotaGuard(handleGET);

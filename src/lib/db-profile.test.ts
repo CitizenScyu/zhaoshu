@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { PersonalWriter } from './personal-write';
 
 const mocks = vi.hoisted(() => ({ neon: vi.fn(), sql: vi.fn() }));
-vi.mock('@neondatabase/serverless', () => ({ neon: mocks.neon }));
+vi.mock('@neondatabase/serverless', () => ({ neon: mocks.neon, neonConfig: {} }));
 
 const version = '2026-09-15 00:00:00.123456+00';
 const nextVersion = '2026-09-15 00:00:00.123457+00';

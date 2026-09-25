@@ -4,12 +4,13 @@ import { authError, authJson } from '@/lib/auth-http';
 import { getSql } from '@/lib/db';
 import { boundedPositiveInteger } from '@/lib/http';
 import { revokeInviteCode } from '@/lib/invite-codes';
+import { withDbQuotaGuard } from '@/lib/db-quota-guard';
 
 const UNAVAILABLE = '邀请码服务暂时不可用，请稍后重试。';
 
 // 作废邀请码：幂等。已使用的码不影响已注册账户，返回 409 让界面说清楚原因，
 // 而不是假装作废成功（设计 §4.3：作废只写 revoked_at，不硬删记录）。
-export async function POST(req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
+async function handlePOST(req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
   const guard = await guardOwnerWrite(req);
   if (!guard.ok) return guard.response;
 
@@ -26,3 +27,6 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
   if (result === 'used') return authError(409, 'INVITE_ALREADY_USED', '邀请码已被使用，无法作废；已注册账户不受影响');
   return authJson({ id, status: result });
 }
+
+// 数据库配额闸（41-q402fix）：导出的处理器统一经 withDbQuotaGuard 包装（route-guard.test.ts 钉死）。
+export const POST = withDbQuotaGuard(handlePOST);

@@ -3,6 +3,7 @@ import { ensureSchema, getSql } from '@/lib/db';
 import { withFindAccess, personalError } from '@/lib/personal-request';
 import { addShelfForUserQueries, shelfExistsForUserQuery } from '@/lib/user-data';
 import { boundedString, readJsonBody } from '@/lib/http';
+import { withDbQuotaGuard } from '@/lib/db-quota-guard';
 
 // 精确找书的「加入书架」（task-77）。
 //
@@ -17,7 +18,7 @@ const MAX_BODY_BYTES = 4 * 1024;
 const MAX_TITLE_LENGTH = 200;
 const MAX_AUTHOR_LENGTH = 200;
 
-export async function POST(req: NextRequest) {
+async function handlePOST(req: NextRequest) {
   return withFindAccess(req, 25_000, async (access) => {
     const body = await access.run(() => readJsonBody(req, MAX_BODY_BYTES, access.signal));
     const title = boundedString(body?.title, MAX_TITLE_LENGTH) ?? '';
@@ -51,3 +52,6 @@ export async function POST(req: NextRequest) {
     }
   });
 }
+
+// 数据库配额闸（41-q402fix）：导出的处理器统一经 withDbQuotaGuard 包装（route-guard.test.ts 钉死）。
+export const POST = withDbQuotaGuard(handlePOST);

@@ -10,9 +10,24 @@ const mocks = vi.hoisted(() => ({
   ensureSchema: vi.fn(),
   getSql: vi.fn(),
   getShuyuanPoolHealth: vi.fn(),
+  latch: null as unknown as import('@/lib/db-quota').DbQuotaLatch,
 }));
 
 vi.mock('@/lib/db', () => ({ ensureSchema: mocks.ensureSchema, getSql: mocks.getSql }));
+// 本实例配额闸是模块级单例：每条用例换一个新闸（委托给 mocks.latch），用例间不串状态。
+vi.mock('@/lib/db-quota-guard', async (original) => {
+  const actual = await original<typeof import('@/lib/db-quota-guard')>();
+  const delegate: import('@/lib/db-quota').DbQuotaLatch = {
+    note: () => mocks.latch.note(),
+    active: () => mocks.latch.active(),
+    remainingMs: () => mocks.latch.remainingMs(),
+    retryAt: () => mocks.latch.retryAt(),
+    recover: () => mocks.latch.recover(),
+    status: () => mocks.latch.status(),
+    takeUnrecorded: () => mocks.latch.takeUnrecorded(),
+  };
+  return { ...actual, dbQuotaLatch: delegate };
+});
 vi.mock('@/lib/shuyuan', async (original) => ({
   ...await original<typeof import('@/lib/shuyuan')>(),
   getShuyuanPoolHealth: mocks.getShuyuanPoolHealth,
@@ -21,6 +36,7 @@ vi.mock('@/lib/shuyuan', async (original) => ({
 // 池陈旧用例的年龄直接由阈值常数推导，不在 fixture 里复述数字——复述一次就是下一个
 // 「注释与代码相反」（本仓高发）。阈值本身由 source-health.test.ts / vercel-cron.test.ts 钉住。
 import { SHUYUAN_REFRESH_ALERT_HOURS } from '@/lib/source-health';
+import { createDbQuotaLatch } from '@/lib/db-quota';
 
 import { GET } from './route';
 
@@ -59,6 +75,7 @@ describe('GET /api/health/sources (S5-1 匿名健康端点)', () => {
     vi.useFakeTimers();
     vi.setSystemTime(NOW);
     // 默认：一切新鲜（池 3.2h；两条 cron 都在阈值内）。
+    mocks.latch = createDbQuotaLatch({ backoffMs: 30 * 60_000 });
     mocks.ensureSchema.mockResolvedValue(undefined);
     mocks.getShuyuanPoolHealth.mockResolvedValue(pool(3.2));
     mocks.getSql.mockReturnValue(sqlStub(
@@ -75,8 +92,9 @@ describe('GET /api/health/sources (S5-1 匿名健康端点)', () => {
   it('键集恰为契约集合（多一个键即缺陷）', async () => {
     const payload = await body(await GET());
     expect(Object.keys(payload).sort()).toEqual(
-      ['admissionCheckedAtAgeHours', 'crons', 'ok', 'refreshedAtAgeHours'],
+      ['admissionCheckedAtAgeHours', 'crons', 'dbQuota', 'ok', 'refreshedAtAgeHours'],
     );
+    expect(Object.keys(payload.dbQuota as object).sort()).toEqual(['lastSeenAt', 'state']);
     expect(Object.keys(payload.crons as object).sort()).toEqual(['drain', 'reclaim', 'shuyuan']);
     for (const cron of Object.values(payload.crons as Record<string, object>)) {
       expect(Object.keys(cron)).toEqual(['lastSuccessAt']);
@@ -107,7 +125,7 @@ describe('GET /api/health/sources (S5-1 匿名健康端点)', () => {
     const raw = JSON.stringify(await body(await GET()));
     expect(raw).not.toMatch(/https?:\/\//);
     expect(raw).not.toMatch(/source_url|sourceUrl|\.com|\.net|\.org/);
-    // 只允许出现契约里的 4 个键名与数字/ISO 文本。
+    // 只允许出现契约里的键名与数字/ISO 文本/状态字面量。
     expect(raw).toMatch(/^\{"ok":true,"refreshedAtAgeHours":3\.2,/);
   });
 
@@ -158,6 +176,116 @@ describe('GET /api/health/sources (S5-1 匿名健康端点)', () => {
         reclaim: { lastSuccessAt: null },
         drain: { lastSuccessAt: null },
       },
+      dbQuota: { state: 'ok', lastSeenAt: null },
     });
+  });
+});
+
+// 41-q402fix：数据库配额告警字段。402 用真驱动产生（替身 fetch，主机 .invalid 不出网）。
+describe('GET /api/health/sources dbQuota（配额告警）', () => {
+  async function neon402(): Promise<Error> {
+    const { neon, neonConfig } = await import('@neondatabase/serverless');
+    neonConfig.fetchFunction = async () => new Response(JSON.stringify({
+      message: 'Your account or project has exceeded the quota. Upgrade your plan to increase limits.',
+    }), { status: 402 });
+    try {
+      await neon('postgresql://user:pass@db.example.invalid/neondb')`SELECT 1`;
+      throw new Error('driver did not throw');
+    } catch (error) {
+      return error as Error;
+    } finally {
+      neonConfig.fetchFunction = undefined;
+    }
+  }
+
+  beforeEach(() => {
+    vi.resetAllMocks();
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW);
+    mocks.latch = createDbQuotaLatch({ backoffMs: 30 * 60_000 });
+    mocks.ensureSchema.mockResolvedValue(undefined);
+    mocks.getShuyuanPoolHealth.mockResolvedValue(pool(3.2));
+    mocks.getSql.mockReturnValue(sqlStub(
+      [{ name: 'reclaim', last_success_at: hoursAgo(5) }, { name: 'drain', last_success_at: hoursAgo(6) }],
+      hoursAgo(5),
+    ));
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
+
+  it('一切正常 ⇒ dbQuota.state=ok、lastSeenAt=null', async () => {
+    expect((await body(await GET())).dbQuota).toEqual({ state: 'ok', lastSeenAt: null });
+  });
+
+  it('探测撞到 402 ⇒ 仍 200 + ok:false，dbQuota.state=exceeded，日志原因码不含驱动原文', async () => {
+    const error = await neon402();
+    mocks.ensureSchema.mockRejectedValue(error);
+    const logged = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const res = await GET();
+    expect(res.status).toBe(200);
+    const payload = await body(res);
+    expect(payload.ok).toBe(false);
+    expect(payload.dbQuota).toEqual({ state: 'exceeded', lastSeenAt: new Date(NOW).toISOString() });
+    expect(JSON.stringify(logged.mock.calls)).toContain('DB_QUOTA_EXCEEDED');
+    expect(JSON.stringify(logged.mock.calls)).not.toMatch(/Upgrade|HTTP status/);
+    expect(JSON.stringify(payload)).not.toMatch(/Upgrade|HTTP status|neon/i);
+  });
+
+  it('本实例仍在冷却 ⇒ exceeded，lastSeenAt 为本实例发现时刻', async () => {
+    mocks.latch = createDbQuotaLatch({ backoffMs: 30 * 60_000, now: () => Date.now() });
+    vi.setSystemTime(NOW - 60_000);
+    mocks.latch.note();
+    vi.setSystemTime(NOW);
+    mocks.ensureSchema.mockRejectedValue(new Error('Server error (HTTP status 402): {"message":"database quota exceeded (local backoff)"}'));
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    expect((await body(await GET())).dbQuota).toEqual({ state: 'exceeded', lastSeenAt: new Date(NOW - 60_000).toISOString() });
+  });
+
+  it('库已恢复：读到 cron_health.db_quota_exceeded 行 ⇒ ok 态但带回最近发现时刻', async () => {
+    mocks.getSql.mockReturnValue(sqlStub([
+      { name: 'reclaim', last_success_at: hoursAgo(5) }, { name: 'drain', last_success_at: hoursAgo(6) },
+      { name: 'db_quota_exceeded', last_success_at: hoursAgo(20) },
+    ], hoursAgo(5)));
+    const payload = await body(await GET());
+    expect(payload.ok).toBe(true); // 配额行不参与 ok 判据
+    expect(payload.dbQuota).toEqual({ state: 'ok', lastSeenAt: hoursAgo(20) });
+  });
+
+  it('库已恢复且本实例有未补记的发现时刻 ⇒ 补记进 cron_health（只一次），并取较晚者', async () => {
+    mocks.latch = createDbQuotaLatch({ backoffMs: 60_000, now: () => Date.now() });
+    vi.setSystemTime(NOW - 2 * 3_600_000);
+    mocks.latch.note();
+    vi.setSystemTime(NOW);
+    const sql = sqlStub([
+      { name: 'reclaim', last_success_at: hoursAgo(5) }, { name: 'drain', last_success_at: hoursAgo(6) },
+      { name: 'db_quota_exceeded', last_success_at: hoursAgo(20) },
+    ], hoursAgo(5));
+    mocks.getSql.mockReturnValue(sql);
+    const isInsert = ([strings]: [TemplateStringsArray, ...unknown[]]) => /INSERT INTO cron_health/.test(strings.join(' '));
+    const payload = await body(await GET());
+    expect(payload.dbQuota).toEqual({ state: 'ok', lastSeenAt: hoursAgo(2) });
+    const inserts = (sql.mock.calls as unknown as [TemplateStringsArray, ...unknown[]][]).filter(isInsert);
+    expect(inserts).toHaveLength(1);
+    expect(inserts[0].slice(1)).toEqual(['db_quota_exceeded', hoursAgo(2)]);
+    await GET();
+    expect((sql.mock.calls as unknown as [TemplateStringsArray, ...unknown[]][]).filter(isInsert)).toHaveLength(1);
+  });
+
+  it('补记失败不影响响应（仍 200，字段照常）', async () => {
+    mocks.latch.note();
+    mocks.latch.recover();
+    const base = sqlStub([{ name: 'reclaim', last_success_at: hoursAgo(5) }, { name: 'drain', last_success_at: hoursAgo(6) }], hoursAgo(5));
+    mocks.getSql.mockReturnValue(vi.fn(async (strings: TemplateStringsArray) => {
+      if (/INSERT INTO cron_health/.test(strings.join(' '))) throw new Error('write failed');
+      return base(strings);
+    }));
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    const res = await GET();
+    expect(res.status).toBe(200);
+    const payload = await body(res);
+    expect(payload.ok).toBe(true);
+    expect(payload.dbQuota).toEqual({ state: 'ok', lastSeenAt: new Date(NOW).toISOString() });
   });
 });

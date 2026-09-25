@@ -10,13 +10,14 @@ import {
   createInviteCodes,
   listInviteCodes,
 } from '@/lib/invite-codes';
+import { withDbQuotaGuard } from '@/lib/db-quota-guard';
 
 const MAX_BODY_BYTES = 2 * 1024;
 const UNAVAILABLE = '邀请码服务暂时不可用，请稍后重试。';
 
 // owner 列出 / 生成邀请码。列表里永远没有原文，只有短提示与状态；原文只在 POST 的响应里
 // 出现这一次（设计 §4.3：库中只存 SHA-256 摘要）。
-export async function GET(req: NextRequest) {
+async function handleGET(req: NextRequest) {
   const guard = await guardOwnerRead(req);
   if (!guard.ok) return guard.response;
   try {
@@ -26,7 +27,7 @@ export async function GET(req: NextRequest) {
   }
 }
 
-export async function POST(req: NextRequest) {
+async function handlePOST(req: NextRequest) {
   const guard = await guardOwnerWrite(req);
   if (!guard.ok) return guard.response;
 
@@ -57,3 +58,7 @@ export async function POST(req: NextRequest) {
     return authError(503, 'INVITES_UNAVAILABLE', UNAVAILABLE);
   }
 }
+
+// 数据库配额闸（41-q402fix）：导出的处理器统一经 withDbQuotaGuard 包装（route-guard.test.ts 钉死）。
+export const GET = withDbQuotaGuard(handleGET);
+export const POST = withDbQuotaGuard(handlePOST);

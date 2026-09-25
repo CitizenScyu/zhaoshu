@@ -4,6 +4,7 @@ import { authJson } from '@/lib/auth-http';
 import { ensureSchema, getSql } from '@/lib/db';
 import { reclaimStaleTasks } from '@/lib/download-task-reclaim';
 import { recordCronSuccess } from '@/lib/source-health';
+import { withDbQuotaGuard } from '@/lib/db-quota-guard';
 
 // F16：每日回收过期下载租约；主要恢复路径仍是 POST 与前端受控重试。
 // R1：反馈吸收由独立 cron /api/profile/absorb/drain 执行，使用自己的 295s 时限。
@@ -23,7 +24,7 @@ function cronAuthorized(req: NextRequest): boolean {
   return authorization.startsWith('Bearer ') && equalSecret(authorization.slice(7), expected);
 }
 
-export async function GET(req: NextRequest) {
+async function handleGET(req: NextRequest) {
   if (!cronAuthorized(req)) {
     return authJson({ error: 'forbidden', code: 'FORBIDDEN' }, { status: 403 });
   }
@@ -39,3 +40,6 @@ export async function GET(req: NextRequest) {
     return authJson({ error: 'db error', code: 'DB_ERROR' }, { status: 500 });
   }
 }
+
+// 数据库配额闸（41-q402fix）：导出的处理器统一经 withDbQuotaGuard 包装（route-guard.test.ts 钉死）。
+export const GET = withDbQuotaGuard(handleGET);

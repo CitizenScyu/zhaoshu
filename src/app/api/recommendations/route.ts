@@ -3,6 +3,7 @@ import { ensureSchema, getSql } from '@/lib/db';
 import { withFindAccess } from '@/lib/personal-request';
 import { hasPermission } from '@/lib/permissions';
 import { recommendationsForUserQuery } from '@/lib/user-data';
+import { withDbQuotaGuard } from '@/lib/db-quota-guard';
 
 export const maxDuration = 60;
 
@@ -17,7 +18,7 @@ function boundedIntegerParam(raw: string, min: number, max: number): number | nu
   return Number.isSafeInteger(value) && value >= min && value <= max ? value : null;
 }
 
-export async function GET(req: NextRequest) {
+async function handleGET(req: NextRequest) {
   return withFindAccess(req, 55_000, async (access) => {
     const { userId } = access.principal;
     // F06：搜索移服务端（?q= 过滤 title/author），并支持分页（?limit=&offset=）。
@@ -45,3 +46,6 @@ export async function GET(req: NextRequest) {
     return NextResponse.json({ recommendations });
   });
 }
+
+// 数据库配额闸（41-q402fix）：导出的处理器统一经 withDbQuotaGuard 包装（route-guard.test.ts 钉死）。
+export const GET = withDbQuotaGuard(handleGET);

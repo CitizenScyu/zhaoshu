@@ -5,6 +5,7 @@ import { hasPermission } from '@/lib/permissions';
 import { ensureSchema, getSql } from '@/lib/db';
 import { isRecord } from '@/lib/sanitize';
 import { boundedPositiveInteger } from '@/lib/http';
+import { withDbQuotaGuard } from '@/lib/db-quota-guard';
 
 // 书库：读取批量打标入库的书（labeled_books），支持分类/流派/基调/完结筛选与排序
 export const maxDuration = 60;
@@ -48,7 +49,7 @@ function escapeLike(value: string): string {
   return value.replace(/([\\%_])/g, '\\$1');
 }
 
-export async function GET(req: NextRequest) {
+async function handleGET(req: NextRequest) {
   const auth = await requirePermission(req, 'find');
   if (!auth.ok) return withAuthHeaders(auth.response);
   // 书库是共享元数据：找书组即可看。完成 TXT 的定位只在有 read 权限时返回，
@@ -176,3 +177,6 @@ export async function GET(req: NextRequest) {
     return authJson({ error: 'internal error', code: 'DB_ERROR' }, { status: 500 });
   }
 }
+
+// 数据库配额闸（41-q402fix）：导出的处理器统一经 withDbQuotaGuard 包装（route-guard.test.ts 钉死）。
+export const GET = withDbQuotaGuard(handleGET);

@@ -8,6 +8,7 @@ import { configuredTotalTimeoutMs } from '@/lib/llm';
 import { recordCronSuccess } from '@/lib/source-health';
 import { MODEL_ROUTE_INTERNAL_BUDGET_MS, createDeadline, raceDeadline, type RequestDeadline } from '@/lib/deadline';
 import type { PersonalBatch, PersonalWriter } from '@/lib/personal-write';
+import { withDbQuotaGuard } from '@/lib/db-quota-guard';
 
 // F15 残留③：待吸收反馈的每日兜底 drain。浏览器触发丢失（关页/刷新失败）或吸收失败后，
 // 这里保证最终一致：pending 且租约过期/退避到期的行，每天一次被同一吸收路径消化。
@@ -100,7 +101,7 @@ function logDrainSummary(results: { userId: number; status: string }[], stoppedF
   });
 }
 
-export async function GET(req: NextRequest) {
+async function handleGET(req: NextRequest) {
   if (!cronAuthorized(req)) {
     return authJson({ error: 'forbidden', code: 'FORBIDDEN' }, { status: 403 });
   }
@@ -119,3 +120,6 @@ export async function GET(req: NextRequest) {
     deadline.dispose();
   }
 }
+
+// 数据库配额闸（41-q402fix）：导出的处理器统一经 withDbQuotaGuard 包装（route-guard.test.ts 钉死）。
+export const GET = withDbQuotaGuard(handleGET);

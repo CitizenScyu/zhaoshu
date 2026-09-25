@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { ensureSchema } from '@/lib/db';
 import { withFindAccess, personalError } from '@/lib/personal-request';
 import { clearNewShelfForUserQuery } from '@/lib/user-data';
+import { withDbQuotaGuard } from '@/lib/db-quota-guard';
 
 // 书架「未处理」堆的批量清理。独立成端点而不是挂在 DELETE /api/shelf?id= 上：
 // 那条按 id 删单条，语义与授权面都很窄；同一个方法上再开一条「按状态批量删」会
@@ -10,7 +11,7 @@ import { clearNewShelfForUserQuery } from '@/lib/user-data';
 // CSRF 由 PersonalRequest.authorize 对非 GET/HEAD/OPTIONS 统一校验。
 export const maxDuration = 60;
 
-export async function DELETE(req: NextRequest) {
+async function handleDELETE(req: NextRequest) {
   return withFindAccess(req, 55_000, async (access) => {
     const { userId } = access.principal;
     try {
@@ -27,3 +28,6 @@ export async function DELETE(req: NextRequest) {
     }
   });
 }
+
+// 数据库配额闸（41-q402fix）：导出的处理器统一经 withDbQuotaGuard 包装（route-guard.test.ts 钉死）。
+export const DELETE = withDbQuotaGuard(handleDELETE);
