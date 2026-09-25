@@ -64,4 +64,17 @@ maybe('businessSchemaCurrent 冷启动探测', () => {
     await pg.query(`DROP INDEX ${retired}`);
     expect(await businessSchemaCurrent(sql as never)).toBe(true);
   }, 60_000);
+
+  // pollddlrev-41 §1.7：单例种子行也纳入探测。表齐但 id=1 行被删 → 探测 false → 走整批 DDL，
+  // 其 INSERT ... ON CONFLICT DO NOTHING 幂等补回该行 → 探测回 true。逐张单例表各验一遍。
+  it('表齐但单例行被删 → 探测 false，执行整批 DDL 后行被幂等补回、探测回 true', async () => {
+    for (const table of ['shuyuan_meta', 'app_settings']) {
+      await pg.query(`DELETE FROM ${table} WHERE id = 1`);
+      expect(await businessSchemaCurrent(sql as never), `${table} 缺行应为 false`).toBe(false);
+      await initializeBusinessSchema(sql as never); // 模拟 ensureSchema 走 DDL 分支
+      const n = (await pg.query(`SELECT count(*)::int AS n FROM ${table} WHERE id = 1`)).rows[0].n;
+      expect(n, `${table} id=1 行应被补回`).toBe(1);
+      expect(await businessSchemaCurrent(sql as never), `${table} 补回后应为 true`).toBe(true);
+    }
+  }, 60_000);
 });

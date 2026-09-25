@@ -41,14 +41,27 @@ export const BUSINESS_SCHEMA_COLUMNS: readonly (readonly [string, string])[] = [
 /** DROP INDEX IF EXISTS 退役的旧关系：探测要求它们**不存在**，否则说明 DDL 尚未跑到该批。 */
 export const BUSINESS_SCHEMA_RETIRED_RELATIONS = ['download_tasks_active_book_idx'] as const;
 
+/**
+ * INSERT ... ON CONFLICT (id) DO NOTHING 种下的单例行（表, 固定 id）。这两行是数据、不是结构，
+ * to_regclass/information_schema 看不见（pollddlrev-41 §1.7）：一旦被删/回迁漏插，读侧降级、写侧
+ * 静默丢失（shuyuan_meta 刷新 UPDATE 0 行、源池被清空且不自愈）。故纳入探测——缺任一行即
+ * current=false，回落到整批 DDL 的幂等种子 INSERT 把行补回。
+ */
+export const BUSINESS_SCHEMA_SINGLETON_ROWS: readonly (readonly [string, number])[] = [
+  ['shuyuan_meta', 1], ['app_settings', 1],
+] as const;
+
 // 名字全是源码内硬编码常量，绝无外部输入；探测 SQL 直接内联它们（非绑定参数），此处做一次
-// 标识符形状校验，既是防线也是文档：任何非标识符名字在模块加载期即抛，绝不进 SQL。
+// 标识符/字面量形状校验，既是防线也是文档：任何非标识符名字或非整数 id 在模块加载期即抛，绝不进 SQL。
 const IDENT = /^[a-z_][a-z0-9_]*$/;
 for (const name of [
   ...BUSINESS_SCHEMA_RELATIONS, ...BUSINESS_SCHEMA_RETIRED_RELATIONS,
-  ...BUSINESS_SCHEMA_COLUMNS.flat(),
+  ...BUSINESS_SCHEMA_COLUMNS.flat(), ...BUSINESS_SCHEMA_SINGLETON_ROWS.map(([table]) => table),
 ]) {
   if (!IDENT.test(name)) throw new Error(`business schema probe: 非法标识符 ${JSON.stringify(name)}`);
+}
+for (const [, id] of BUSINESS_SCHEMA_SINGLETON_ROWS) {
+  if (!Number.isInteger(id)) throw new Error(`business schema probe: 单例行 id 非整数 ${JSON.stringify(id)}`);
 }
 
 function sqlValues(rows: readonly (readonly string[])[]): string {
@@ -56,17 +69,22 @@ function sqlValues(rows: readonly (readonly string[])[]): string {
 }
 
 /**
- * 冷启动版本探测：单条只读 SELECT，判断「再跑一遍 initializeBusinessSchema 是否纯空转」。
- * 返回 true ⇒ 整批 DDL 可安全跳过；false ⇒ 走原 DDL 路径（含全新库/旧库/结构漂移）。
+ * 冷启动版本探测：判断「再跑一遍 initializeBusinessSchema 是否纯空转」。
+ * 返回 true ⇒ 整批 DDL 可安全跳过；false ⇒ 走原 DDL 路径（含全新库/旧库/结构漂移/单例行缺失）。
  *
- * 该查询对缺失对象永不抛错：to_regclass 缺失返回 NULL，information_schema 缺表则 0 匹配，
- * 都只会让计数不达标而返回 false。唯一会抛的是连接层错误，与原 DDL 路径同样向上冒泡。
+ * 分两段、共至多两次只读往返（都远比 ~40 条 DDL 的事务便宜）：
+ *   1) 结构段：表/索引/增量列在册且退役索引不存在。对缺失对象永不抛错（to_regclass 返 NULL、
+ *      information_schema 缺表则 0 匹配），只会让计数不达标而返回 false。
+ *   2) 单例段：仅在结构齐全后才查 shuyuan_meta/app_settings 的 id=1 行。**必须后置**：全新库上这两张
+ *      表尚不存在，若在一条 SELECT 里硬引用它们会在解析期 42P01 抛错，把「全新库冷启动跑 DDL」变成
+ *      「探测抛错」，与改动前行为不一致（pollddlrev-41 §1.6/§1.7）。结构段为真即保证这两表已存在。
+ * 唯一会抛的是连接层错误，与原 DDL 路径同样向上冒泡；ensureSchema 的 catch 会重置 schemaPromise 重试。
  */
 export async function businessSchemaCurrent(s: Sql): Promise<boolean> {
   const relations = sqlValues(BUSINESS_SCHEMA_RELATIONS.map((name) => [name]));
   const columns = sqlValues(BUSINESS_SCHEMA_COLUMNS.map(([table, column]) => [table, column]));
   const retired = sqlValues(BUSINESS_SCHEMA_RETIRED_RELATIONS.map((name) => [name]));
-  const text = `
+  const structuralText = `
     SELECT (
       (SELECT count(*)::int FROM (VALUES ${relations}) AS r(name)
          WHERE to_regclass(quote_ident(current_schema()) || '.' || quote_ident(r.name)) IS NOT NULL)
@@ -81,8 +99,14 @@ export async function businessSchemaCurrent(s: Sql): Promise<boolean> {
       NOT EXISTS (SELECT 1 FROM (VALUES ${retired}) AS x(name)
          WHERE to_regclass(quote_ident(current_schema()) || '.' || quote_ident(x.name)) IS NOT NULL)
     ) AS current`;
-  const rows = await s.query(text) as { current: boolean }[];
-  return rows[0]?.current === true;
+  const structural = await s.query(structuralText) as { current: boolean }[];
+  if (structural[0]?.current !== true) return false;
+
+  const seedClauses = BUSINESS_SCHEMA_SINGLETON_ROWS
+    .map(([table, id]) => `EXISTS (SELECT 1 FROM ${table} WHERE id = ${id})`)
+    .join(' AND ');
+  const seeds = await s.query(`SELECT (${seedClauses}) AS current`) as { current: boolean }[];
+  return seeds[0]?.current === true;
 }
 
 export async function initializeBusinessSchema(s: Sql) {
