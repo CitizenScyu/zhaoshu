@@ -52,8 +52,12 @@ Remove-Item Env:PROD_DATABASE_URL
 ```
 
 - **灾备冷建库**的完整顺序：`db:migrate:prod --apply`（业务 schema 的生产入口，`0001` 只把 auth 记账到 4）→ 本命令补 auth 的
-  5/6/7 三步（下载归属、邀请码表、系统任务队列）→ `db:check:prod`（auth 记账不足 7 时退出码 2）→ 部署应用。
-  跳过本命令时应用的 `assertAuthSchema` 会全站 503，`db:check:prod` 也会报 `authVersionOk: false`。
+  5/6/7 三步（下载归属、邀请码表、系统任务队列）→ `migrate:artifacts:prod` 补 artifact schema（`storage_repositories` /
+  `book_artifacts` / `download_tasks.artifact_id` FK，独立入口见 `docs/artifact-registry.md`）→ `register:storage:prod` 登记仓位 →
+  `db:check:prod`（auth 记账不足 7 或 artifact schema 未建时退出码 2）→ 部署应用。
+  跳过本命令时应用的 `assertAuthSchema` 会全站 503，`db:check:prod` 也会报 `authVersionOk: false`；
+  跳过 `migrate:artifacts:prod` 时 T8 下载 worker 启动即 `relation "storage_repositories" does not exist`，
+  `db:check:prod` 报 `artifactVersionOk: false` 且缺表清单含 artifact 三表。
   业务侧入口与已有生产库的执行顺序（生产走 `db:baseline:prod`）见 `docs/migrations.md`「生产 / 灾备入口」；`db:check` / `db:migrate` 只接受测试库。
 - dry-run 报 `newer-than-code`（库里记账版本高于代码支持的上限）时，真执行会被拒绝；先核对是否连错库或代码版本过旧。
 - **回滚**：auth 迁移只进不退，没有 down 脚本；真执行失败时整批在同一事务里回滚，不留半成品，修正原因后重跑即可。
@@ -70,16 +74,54 @@ $env:DR_DATABASE_URL = '<隔离空库连接串>'
 # 第一步：确认目标 host 和零业务表；dry-run 不写库。
 npm run db:check:prod -- --database-url-env=DR_DATABASE_URL
 npm run db:migrate:prod -- --database-url-env=DR_DATABASE_URL
-# 第二步：先创建 0001–0003，auth 暂为 v4；随后单独升级 auth 到 v7。
+# 第二步：先创建 0001–0003，auth 暂为 v4；随后分别升级 auth 到 v7、建 artifact schema。
 npm run db:migrate:prod -- --database-url-env=DR_DATABASE_URL --apply
 npm run migrate:auth:prod -- --database-url-env=DR_DATABASE_URL --dry-run
 npm run migrate:auth:prod -- --database-url-env=DR_DATABASE_URL --yes-i-mean-production
-# 第三步：业务迁移、auth 版本与必需表都通过只读复核。
+npm run migrate:artifacts:prod -- --database-url-env=DR_DATABASE_URL --dry-run
+npm run migrate:artifacts:prod -- --database-url-env=DR_DATABASE_URL --yes-i-mean-production
+# 第三步：登记发布仓位（storage_repositories 一行）——不登记时 T8 worker 反查不到可写仓，启动即报错。
+#   仓库键从 --repo/--branch 或环境变量 ZHAOSHU_BOOKS_REPO / DOWNLOAD_TARGET_BRANCH 读出（缺省 CitizenScyu/zhaoshu-books / main）。
+npm run register:storage:prod -- --database-url-env=DR_DATABASE_URL
+npm run register:storage:prod -- --database-url-env=DR_DATABASE_URL --apply
+# 第四步：业务迁移、auth 版本、artifact schema 与必需表都通过只读复核（缺任一即退出码 2）。
 npm run db:check:prod -- --database-url-env=DR_DATABASE_URL
 Remove-Item Env:DR_DATABASE_URL
 ```
 
-然后按 `.env.local.example` 的分组配置新的部署环境（密码与连接串只写入部署平台的私密配置，不写入仓库），运行 `npm run check:deploy` 核对样例键名覆盖，再部署应用；确认健康请求放行、owner 登录和负向权限生效后再开启流量。上述第二步不能倒序：auth 入口先运行会创建业务表，使空库迁移器拒绝未记账的既存库。`src/lib/runtime-tables-migration.pglite.test.ts` 在隔离 PGlite 真库验证 v4 闸门拒绝、升级 v7 后放行；如果迁移失败，先核对错误并用事前整库备份/分支恢复，不手工删记账行。
+然后按 `.env.local.example` 的分组配置新的部署环境（密码与连接串只写入部署平台的私密配置，不写入仓库），运行 `npm run check:deploy` 核对样例键名覆盖，再部署应用；确认健康请求放行、owner 登录和负向权限生效后再开启流量。上述第二步不能倒序：auth 入口先运行会创建业务表，使空库迁移器拒绝未记账的既存库。`src/lib/runtime-tables-migration.pglite.test.ts` 在隔离 PGlite 真库验证 v4 闸门拒绝、升级 v7 后放行；`src/lib/cold-schema-rebuild.pglite.test.ts` 跑完整条链（业务迁移 → auth 5/6/7 → artifact → `db:check` 通过）。如果迁移失败，先核对错误并用事前整库备份/分支恢复，不手工删记账行。
+
+### 重建后必须恢复的运行期设置（tempdb41 §缺陷 D2）
+
+冷建库的 `auth_settings` 只有建表时的默认行：`members_enabled = false`、`registration_mode = 'closed'`
+（`src/lib/auth-store.ts:141-148`）。生产既有状态是 `members_enabled = true` / `registration_mode = 'invite'`
+（成员入口开着、仅凭邀请码注册）。**重建后若直接切流量，成员入口会「悄悄关闭」**。切流量前用 owner 账号在
+「管理」页确认这两项，或按既有状态改回（改 `auth_settings` id=1 行；本仓没有专用 CLI，走管理页即可，
+不要手写 SQL 绕过 CSRF/权限校验）。冷建库演练里为验收临时改过 `true`/`invite` 的话，注意这批设置不会随
+数据回迁自动恢复，回迁后要再确认一次（`auth_settings` 不在重灌清单里，见下）。
+
+### 重建后的数据重灌路径（tempdb41 §缺陷 D3）
+
+结构齐了不等于有数据。冷建库后按下面三条重灌（每条都只写目标库；本仓脚本均不读 `.env*`）：
+
+1. **书源 + 准入**：用 `scripts/build-shuyuan-refresh.mjs` 构建刷新运行器产物，放到目标机的运行目录，对目标库
+   **连跑多轮**（每轮一次刷新 + 一次准入批次）。`ADMISSION_MAX_PROBES` 缺省 20（`.env.local.example` 该键注释：
+   20 源最坏 ≈ 264s < 295s 平台上限，25 源会顶破），而一个满池约有 114 个 compile_ok 源需要真搜一遍，
+   **所以一轮探不完，要跑到 `source_admission` 里 compile_ok 的行都被探过为止（经验值 ~6 轮）**。实测口径见
+   `tempdb-41-report.md` §5.2：连跑 7 轮后 `shuyuan_sources` 1681 行、`source_admission` 164 行（search_ok 28）。
+   刷新中途上游 `fetch failed` 会按设计中止并保留既有数据（rc=1），下一轮继续即可。
+2. **打标书库**：把 `labels.jsonl` 类快照按时间顺序（新的覆盖旧的）用 `scripts/import_labels.mjs`（或目标机上的
+   `import_one.py`）导入 `labeled_books`；导入是幂等 upsert（按身份键去重）。**只导入 jsonl 里有的行**——历史
+   人工修过的作者/质量字段若没进 jsonl 就重建不出来。实测见 `tempdb-41-report.md` §5.3（本地 37 + 241 行、
+   目标机 353 行快照 → 入库 299 行；Neon 上最后是 349 行，差的 50 行来自无本地账本的历史导入，回迁时合并）。
+3. **账号 / 画像 / 书架 / 反馈**：**不可重建**。`users`（除固定 owner 行）、`sessions`、`registration_invites`、
+   `profile`、`recommendations`、`feedback` 等都要等原库恢复后回迁合并；`download_tasks` 历史与
+   `book_artifacts`（Neon 上已发布的书）同理——GitHub 上的文件还在，但新库没有登记行，离线读这些书在新库上
+   暂不可用。完整清单见 `tempdb-41-report.md` §9。
+
+owner 访问不依赖库里的行（靠部署平台的 `APP_OWNER_TOKEN`），所以 owner 口令重建后照常可用；
+member 账号不存在，成员无法登录，需重新邀请或等回迁。
+
 
 ## 当前行为与开关
 
