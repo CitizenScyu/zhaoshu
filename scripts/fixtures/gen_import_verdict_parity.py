@@ -59,8 +59,11 @@ ROWS = [
          prompt_version='v1', label_source='text_book15')),
     ('label_source not a string -> failed (both type-check)', 'failed',
      rec('T11', 'T11', 'A11', label_source=1)),
+    ('unknown future top-level field is ignored by both importers (no field whitelist)',
+     'ready', rec('T12', 'T12', 'A12', guess='T12-other',
+                  some_future_field={'nested': [1, 2]}, another=3)),
     ('site_title with surrounding spaces still strips to equal title -> ready', 'ready',
-     rec('T12', '  T12  ', 'A12')),
+     rec('T13', '  T13  ', 'A13')),
 ]
 
 # 已知且刻意的分叉：import_one.py 对「作者含 HTML 实体」一律 review（更保守，避免实体解码

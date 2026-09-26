@@ -278,13 +278,13 @@
   }
  },
  {
-  "why": "site_title with surrounding spaces still strips to equal title -> ready",
+  "why": "unknown future top-level field is ignored by both importers (no field whitelist)",
   "agree": true,
   "py": "ready",
   "mjs": "ready",
   "record": {
    "title": "T12",
-   "site_title": "  T12  ",
+   "site_title": "T12",
    "author": "A12",
    "category": "cat",
    "status": "done",
@@ -292,7 +292,39 @@
    "url": "https://book15.net/books/d.html",
    "chars": 1000,
    "labels": {
-    "title_guess": "T12",
+    "title_guess": "T12-other",
+    "text_quality": "\u6b63\u5e38",
+    "genre": "g",
+    "site_title_match": true,
+    "quality": {
+     "overall": 8
+    }
+   },
+   "some_future_field": {
+    "nested": [
+     1,
+     2
+    ]
+   },
+   "another": 3
+  }
+ },
+ {
+  "why": "site_title with surrounding spaces still strips to equal title -> ready",
+  "agree": true,
+  "py": "ready",
+  "mjs": "ready",
+  "record": {
+   "title": "T13",
+   "site_title": "  T13  ",
+   "author": "A13",
+   "category": "cat",
+   "status": "done",
+   "source": "book15.net",
+   "url": "https://book15.net/books/d.html",
+   "chars": 1000,
+   "labels": {
+    "title_guess": "T13",
     "text_quality": "\u6b63\u5e38",
     "genre": "g",
     "site_title_match": true,
