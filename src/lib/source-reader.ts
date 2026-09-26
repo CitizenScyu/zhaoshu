@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import { getSql } from './db';
 import { getReadingSources, getSourcePools, type ReadingSource, type SelectableSources } from './shuyuan';
 import { shuyuanReadCacheTtlMs } from './read-cache-ttl';
-import { fetchSourceText, sourceAbortable, SourceHttpError, SOURCE_CONNECT_TIMEOUT_MS, SOURCE_TIMEOUT_MS } from './source-fetch';
+import { fetchSourceText, sourceAbortable, SourceHttpError, SOURCE_CONNECT_TIMEOUT_MS, SOURCE_TIMEOUT_MS, type SourcePageRequest } from './source-fetch';
 import { SourcePolicyError, alternateSourceHost, validateSourceUrl } from './source-policy';
 import { sourceRevision } from './source-revision';
 import { isHostSuspect, orderByHostHealth } from './source-host-health';
@@ -183,6 +183,13 @@ interface SourceContextOptions {
   throttleSlots?: Map<string, number>;
 }
 
+/** page() 取页可选覆写（41-postsearch）：request=POST/body/头，responseCharset=响应解码字符集，attempts=重试次数。 */
+export interface SourcePageOptions {
+  request?: SourcePageRequest;
+  responseCharset?: SourcePageRequest['charset'] | 'auto';
+  attempts?: number;
+}
+
 export class SourceRequestContext {
   /** 源归属：根 context 是 builtin，其余由 child(sourceUrl) 指定（M2-2 消费）。 */
   readonly scope: string;
@@ -283,7 +290,8 @@ export class SourceRequestContext {
     return Math.max(0, Math.min(this.budget.totalLimit - this.budget.requests, scoped) - reserve);
   }
 
-  async page(url: string, attempts = MAX_SOURCE_ATTEMPTS): Promise<{ url: string; text: string }> {
+  async page(url: string, opts: SourcePageOptions = {}): Promise<{ url: string; text: string }> {
+    const { request, responseCharset, attempts = MAX_SOURCE_ATTEMPTS } = opts;
     let lastError: unknown;
     const throttleKey = sourceThrottleKey(url);
     for (let attempt = 0; attempt < attempts; attempt++) {
@@ -291,6 +299,8 @@ export class SourceRequestContext {
       try {
         const page = await fetchSourceText(url, {
           signal: this.signal,
+          request,
+          responseCharset,
           beforeRequest: async (signal) => {
             // L2 全局兜底：池预算用尽即停所有源（错误码与文案与今天逐字相同）。
             if (this.budget.requests >= this.budget.totalLimit) throw new SourceReaderError('书源查询预算已用完，请稍后重试或下载全书。', 'SOURCE_BUDGET_EXCEEDED', 503);
@@ -902,7 +912,7 @@ export async function resolveSourceBook(
           if (checked.has(source.url + url) || url === options.excludeBookUrl) continue;
           try {
             // 可选请求不重试（attempts=1）：一次抖动不应吃掉 2 点预算 + 2×8s。
-            collectSimilar(await sourceContext.page(url, 1));
+            collectSimilar(await sourceContext.page(url, { attempts: 1 }));
           } catch (error) {
             context.signal.throwIfAborted();
             if (error instanceof SourceReaderError && error.code === 'SOURCE_BUDGET_EXCEEDED') break;

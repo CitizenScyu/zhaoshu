@@ -7,11 +7,12 @@
 // admissionFetch / validateAdmissionUrl 不在此（它们在 rule-engine/admission.ts 且不导出）。
 import { upgradeSourceTemplateUrl, validateSourceUrl } from '@/lib/source-policy';
 import {
-  MAX_SOURCE_CHAPTERS, sourceSearchUrl, type SourceBookIdentity, type SourceChapter,
+  MAX_SOURCE_CHAPTERS, buildSourceSearchRequest, sourceSearchUrl, type SourceBookIdentity, type SourceChapter,
 } from '@/lib/source-parser';
 import type { SourceRequestContext } from '@/lib/source-reader';
 import { contentHtmlToText, contentNeedsHtmlToText } from './content-html';
 import { createScope, evaluateField, evaluateFieldList, normalizeBody } from './evaluate';
+import { enginePostSearchEnabled } from './compile-smoke';
 import type { CompiledRules, FieldIr, SkippedField } from './types';
 
 export interface EngineSource {
@@ -59,8 +60,19 @@ function absoluteUrl(value: string, base: string): string | undefined {
 export async function engineSearchBook(
   source: EngineSource, title: string, context: SourceRequestContext,
 ): Promise<EngineSearchResult[]> {
-  // 搜索 URL 展开复用 sourceSearchUrl（纯 GET、{{key}}/{{page}} 口径与初筛一致，§7.1）。
-  const page = await context.page(sourceSearchUrl(source.searchUrl, title, source.url));
+  // 搜索 URL 展开：flag 关时复用 sourceSearchUrl（纯 GET、utf-8，逐字不变）；
+  // flag 开时经 buildSourceSearchRequest 支持 POST/body/charset/白名单头（41-postsearch）。
+  let page: { url: string; text: string };
+  if (enginePostSearchEnabled()) {
+    const request = buildSourceSearchRequest(source.searchUrl, title, source.url);
+    page = await context.page(request.url, {
+      request: { method: request.method, body: request.body, headers: request.headers, charset: request.charset },
+      // 显式非 utf-8 字符集直接用；否则 'auto' 按 Content-Type 嗅探（utf-8 站维持原状）。
+      responseCharset: request.charset === 'utf-8' ? 'auto' : request.charset,
+    });
+  } else {
+    page = await context.page(sourceSearchUrl(source.searchUrl, title, source.url));
+  }
   const scope = createScope(normalizeBody(page.text), page.url);
   const list = field(source.compiled, 'ruleSearch.bookList');
   if (!list) return [];
@@ -87,7 +99,7 @@ export async function engineFetchDetail(
   source: EngineSource, bookUrl: string, context: SourceRequestContext,
 ): Promise<Partial<SourceBookIdentity> & { tocUrl?: string }> {
   const target = validateSourceUrl(bookUrl).href;
-  const page = await context.page(target);
+  const page = await context.page(target, { responseCharset: enginePostSearchEnabled() ? 'auto' : undefined });
   const scope = createScope(normalizeBody(page.text), page.url);
   const detail: Partial<SourceBookIdentity> & { tocUrl?: string } = {};
   const title = evaluateText(source.compiled, 'ruleBookInfo.name', scope);
@@ -118,7 +130,7 @@ export async function engineFetchToc(
   for (let pageIndex = 0; next && pageIndex < MAX_TOC_PAGES && seenUrls.size <= MAX_SOURCE_CHAPTERS; pageIndex += 1) {
     if (visited.has(next)) { if (strict) throw new Error('pagination_cycle'); break; }
     visited.add(next);
-    const page = await context.page(next);
+    const page = await context.page(next, { responseCharset: enginePostSearchEnabled() ? 'auto' : undefined });
     const scope = createScope(normalizeBody(page.text), page.url);
     let validChapters = 0;
     const list = field(source.compiled, 'ruleToc.chapterList');
@@ -198,7 +210,7 @@ export async function engineFetchContent(
   for (let pageIndex = 0; next && pageIndex < MAX_CONTENT_PAGES; pageIndex += 1) {
     if (visited.has(next)) { if (strict) throw new Error('pagination_cycle'); break; }
     visited.add(next);
-    const page = await context.page(next);
+    const page = await context.page(next, { responseCharset: enginePostSearchEnabled() ? 'auto' : undefined });
     const scope = createScope(normalizeBody(page.text), page.url);
     // 正文是唯一「多节点拼接」字段：@p@text 类规则靠 multi=true 把多段落拼成整章。
     // 是否做 HTML→纯文本按**规则类型**判定（41-HTMLFIX 复审）：全部候选支都是

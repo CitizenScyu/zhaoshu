@@ -1,5 +1,6 @@
 import { decodeHTML } from 'entities';
 import { alternateSourceHost, upgradeSourceTemplateUrl, validateSourceUrl, SourcePolicyError } from './source-policy';
+import { encodeQueryComponent, normalizeCharset, type SourceCharset } from './source-charset';
 import { foldTraditional } from './zh-variant-fold';
 
 export interface SourceBookIdentity { title: string; author: string; alias?: string }
@@ -274,6 +275,109 @@ export function sourceSearchUrl(template: unknown, title: string, base: string):
   if (/[{}]|@js:|<js>|,\s*\[/i.test(expanded)) throw new SourcePolicyError('不支持该书源的动态搜索规则');
   // 写死 http:// 的模板（站点同 host 有 https）升级后再过锁；host/端口/路径逐字不变（41-urlfix）。
   return validateSourceUrl(upgradeSourceTemplateUrl(expanded), base).href;
+}
+
+// ---- legado searchUrl `url,{options}` 选项支持（41-postsearch，仅在 ENGINE_POST_SEARCH 开时走） ----
+export type SourceSearchMethod = 'GET' | 'POST';
+export interface SourceSearchRequest {
+  url: string;
+  method: SourceSearchMethod;
+  /** POST body（已按 charset 展开 {{key}}；GBK 字节化在发请求层做）。 */
+  body?: string;
+  /** 白名单请求头（Content-Type / Referer / User-Agent）。 */
+  headers?: Record<string, string>;
+  /** 归一后的请求/响应字符集，缺省 utf-8。 */
+  charset: SourceCharset;
+}
+
+const SEARCH_OPTION_KEYS = new Set(['method', 'body', 'charset', 'headers']);
+// 仅允许的安全请求头（小写匹配）；其余静默丢弃，绝不透传 Cookie/Authorization 等。
+const ALLOWED_REQUEST_HEADERS = new Set(['content-type', 'referer', 'user-agent']);
+
+/** 受限容错 JSON：先严格解析，失败再把单引号整体换双引号重试；仍失败返回 null（判不支持，不崩）。 */
+function parseSearchOptions(raw: string): Record<string, unknown> | null {
+  for (const candidate of [raw, raw.replace(/'/g, '"')]) {
+    try {
+      const parsed = JSON.parse(candidate);
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return parsed as Record<string, unknown>;
+    } catch { /* 试下一形态 */ }
+  }
+  return null;
+}
+
+// 禁 JS：@js:/<js>/java.* 一律拒（本引擎从不 eval）。
+function rejectJs(text: string): void {
+  if (/@js:|<js>|\bjava\./i.test(text)) throw new SourcePolicyError('不支持该书源的动态搜索规则（禁 JS）');
+}
+// 展开后仍残留 {{ / }} = 未支持的模板变量（如 {{(page-1)*10}}、{{java.xxx}}）→ 拒，不 eval。
+function rejectUnexpanded(text: string): void {
+  if (/\{\{|\}\}/.test(text)) throw new SourcePolicyError('不支持该书源的搜索模板变量');
+}
+
+// JSON body（以 { 或 [ 起）里 {{key}} 原样替换（整体在发请求层按 charset 字节化）；
+// 表单 body 与 URL 里的 {{key}} 按 charset 百分号编码。{{page}} 恒替为 1（不支持翻页表达式）。
+function expandField(text: string, title: string, charset: SourceCharset, jsonBody: boolean): string {
+  const key = jsonBody ? title : encodeQueryComponent(title, charset);
+  return text.replace(/\{\{key\}\}/g, key).replace(/\{\{page\}\}/g, '1');
+}
+
+/**
+ * 把 searchUrl 解析为结构化搜索请求（GET/POST + body + 白名单头 + charset）。
+ * 无 `,{options}` 时等价于 sourceSearchUrl（纯 GET）。红线：不 eval JS；最终 URL 过同一把
+ * validateSourceUrl（host 白名单 / https / 非 IP / 无 userinfo / 443），POST 不放宽 host 门；
+ * 设备指纹字段（imei/udid 等字面量）原样当模板文本发送，不生成、不伪造。
+ */
+export function buildSourceSearchRequest(template: unknown, title: string, base: string): SourceSearchRequest {
+  if (typeof template !== 'string' || template.length > 2048 || !/\{\{key\}\}/.test(template)) {
+    throw new SourcePolicyError('书源缺少支持的搜索模板');
+  }
+  const head = template.split('##')[0];
+  const optMatch = /,\s*\{/.exec(head);
+  if (!optMatch) return { url: sourceSearchUrl(template, title, base), method: 'GET', charset: 'utf-8' };
+
+  const urlPart = head.slice(0, optMatch.index);
+  const options = parseSearchOptions(head.slice(optMatch.index + 1));
+  if (!options) throw new SourcePolicyError('不支持该书源的搜索选项（非法 JSON）');
+  for (const key of Object.keys(options)) {
+    if (!SEARCH_OPTION_KEYS.has(key)) throw new SourcePolicyError(`不支持该书源的搜索选项：${key}`);
+  }
+
+  let charset: SourceCharset = 'utf-8';
+  if (options.charset != null) {
+    const normalized = normalizeCharset(options.charset);
+    if (!normalized) throw new SourcePolicyError('不支持该书源的搜索字符集');
+    charset = normalized;
+  }
+  const method = String(options.method ?? 'GET').toUpperCase();
+  if (method !== 'GET' && method !== 'POST') throw new SourcePolicyError(`不支持该书源的搜索方法：${method}`);
+
+  rejectJs(urlPart);
+  const url = expandField(urlPart, title, charset, false);
+  rejectUnexpanded(url);
+  const finalUrl = validateSourceUrl(upgradeSourceTemplateUrl(url), base).href;
+  const request: SourceSearchRequest = { url: finalUrl, method: method as SourceSearchMethod, charset };
+
+  if (options.body != null) {
+    if (typeof options.body !== 'string') throw new SourcePolicyError('不支持该书源的搜索 body');
+    rejectJs(options.body);
+    const jsonBody = /^\s*[{[]/.test(options.body);
+    const body = expandField(options.body, title, charset, jsonBody);
+    rejectUnexpanded(body);
+    request.body = body;
+  }
+  if (options.headers != null) {
+    if (typeof options.headers !== 'object' || Array.isArray(options.headers)) {
+      throw new SourcePolicyError('不支持该书源的搜索 headers');
+    }
+    const headers: Record<string, string> = {};
+    for (const [k, v] of Object.entries(options.headers as Record<string, unknown>)) {
+      if (typeof v !== 'string' || !ALLOWED_REQUEST_HEADERS.has(k.toLowerCase())) continue; // 非白名单头丢弃
+      rejectJs(v);
+      headers[k] = v.replace(/\{\{key\}\}/g, encodeQueryComponent(title, charset)).replace(/\{\{page\}\}/g, '1');
+    }
+    if (Object.keys(headers).length) request.headers = headers;
+  }
+  return request;
 }
 
 /** 详情页链接形态:book15 的 `/books/details<数字>.html`。候选收集的两条路径共用同一 grammar。 */
