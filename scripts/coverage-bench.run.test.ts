@@ -145,7 +145,15 @@ it.skipIf(!RUN)('coverage bench 联网实测', async () => {
         const idExact = r.status === 'ok' && r.book
           ? canonicalBookKey(r.book.title || '', r.book.author || '') === canonicalBookKey(b.title, b.author)
           : undefined;
-        rec.perSource.push({ host, name: source.name, status: r.status, readable: source.readable, ms: Date.now() - t0, code: r.code, idExact });
+        // 源返回的书名/作者落盘，供离线逐条复核（covid41：算完 idExact 就丢，raw 无法回看）。
+        // 截断 100 字；缺失存 null。fuzzy 记下是否走了模糊降级（probe 判 ok 时恒 false，旧 raw 无此字段）。
+        const clip = (v: string | undefined) => (v ? v.slice(0, 100) : null);
+        const gotTitle = r.status === 'ok' && r.book ? clip(r.book.title) : null;
+        const gotAuthor = r.status === 'ok' && r.book ? clip(r.book.author) : null;
+        rec.perSource.push({
+          host, name: source.name, status: r.status, readable: source.readable, ms: Date.now() - t0, code: r.code, idExact,
+          gotTitle, gotAuthor, fuzzy: false,
+        });
       } });
     }
   }

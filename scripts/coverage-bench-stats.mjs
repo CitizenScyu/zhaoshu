@@ -4,9 +4,27 @@
 //   unreachable | compile_failed（另有采集侧的 threw）。覆盖判定只认「可切换」：status==='ok' 且 readable===true。
 // 与生产面板同口径：ok 表示搜索→详情→身份校验→目录可取（可切换到该源阅读）；不额外取正文。
 
+/**
+ * 一个「可读且 probe=ok」的 (源,书) 对的命中档：
+ * - exact：数据库权威键 canonicalBookKey 相等（idExact===true）；
+ * - identity：过了阅读面板身份判定 sourceBookMatches（probe 判 ok）但权威键不等（idExact!==true，
+ *   典型是繁体站、作者带「作者：」「著」前后缀）；
+ * - fuzzy：走了模糊降级（raw 里 fuzzy===true）。
+ * 旧 raw.json 没有 idExact/fuzzy 字段时，idExact 缺失按 identity、fuzzy 缺失按非模糊处理。
+ */
+export function matchTier(s) {
+  if (s.fuzzy === true) return 'fuzzy';
+  return s.idExact === true ? 'exact' : 'identity';
+}
+
 /** 一本书是否被覆盖：至少一个「可读且 probe=ok」的源。 */
 export function isCovered(book) {
   return (book.perSource || []).some((s) => s.status === 'ok' && s.readable === true);
+}
+
+/** 一本书是否「可信覆盖」：至少一个 exact 或 identity 档的可读 ok 源（模糊降级不算可信）。 */
+export function isTrusted(book) {
+  return (book.perSource || []).some((s) => s.status === 'ok' && s.readable === true && matchTier(s) !== 'fuzzy');
 }
 
 /** 一本书里「可读且 ok」的源主机列表（去重，保序）。 */
@@ -24,15 +42,22 @@ function rate(covered, total) {
 }
 
 function groupBy(results, key) {
-  /** @type {Record<string, { books: number, covered: number, coverageRate: number }>} */
+  /** @type {Record<string, { books: number, covered: number, coverageRate: number, exact: number, identity: number, fuzzy: number, trusted: number, trustedCoverageRate: number }>} */
   const groups = {};
   for (const b of results) {
     const g = b[key] || '(未分组)';
-    (groups[g] ||= { books: 0, covered: 0, coverageRate: 0 });
+    (groups[g] ||= { books: 0, covered: 0, coverageRate: 0, exact: 0, identity: 0, fuzzy: 0, trusted: 0, trustedCoverageRate: 0 });
     groups[g].books += 1;
     if (isCovered(b)) groups[g].covered += 1;
+    if (isTrusted(b)) groups[g].trusted += 1;
+    for (const s of b.perSource || []) {
+      if (s.status === 'ok' && s.readable === true) groups[g][matchTier(s)] += 1;
+    }
   }
-  for (const g of Object.values(groups)) g.coverageRate = rate(g.covered, g.books);
+  for (const g of Object.values(groups)) {
+    g.coverageRate = rate(g.covered, g.books);
+    g.trustedCoverageRate = rate(g.trusted, g.books);
+  }
   return groups;
 }
 
@@ -95,10 +120,13 @@ export function summarize(results, meta = {}) {
   for (const b of results) {
     for (const s of b.perSource || []) statusTotals[s.status] = (statusTotals[s.status] || 0) + 1;
   }
-  const idExactPairs = results.reduce(
-    (n, b) => n + (b.perSource || []).filter((s) => s.status === 'ok' && s.readable === true && s.idExact === true).length,
-    0,
-  );
+  const tiers = { exact: 0, identity: 0, fuzzy: 0 };
+  for (const b of results) {
+    for (const s of b.perSource || []) {
+      if (s.status === 'ok' && s.readable === true) tiers[matchTier(s)] += 1;
+    }
+  }
+  const trusted = results.filter(isTrusted).length;
   return {
     generatedAt: meta.generatedAt || new Date().toISOString(),
     codeVersion: meta.codeVersion || null,
@@ -109,7 +137,11 @@ export function summarize(results, meta = {}) {
       covered,
       coverageRate: rate(covered, books),
       okPairs: srcStats.reduce((n, s) => n + s.ok, 0),
-      idExactPairs,
+      // idExactPairs 保留：旧 summary 与既有断言依赖该字段，与 tiers.exact 同值。
+      idExactPairs: tiers.exact,
+      tiers,
+      trusted,
+      trustedCoverageRate: rate(trusted, books),
     },
     byTier: groupBy(results, 'tier'),
     byGenre: groupBy(results, 'genre'),
@@ -150,6 +182,17 @@ export function compare(prev, curr) {
       curr: curr.totals?.coverageRate ?? 0,
       delta: Number(((curr.totals?.coverageRate ?? 0) - (prev.totals?.coverageRate ?? 0)).toFixed(4)),
     },
+    trustedCoverageRate: {
+      prev: prev.totals?.trustedCoverageRate ?? 0,
+      curr: curr.totals?.trustedCoverageRate ?? 0,
+      delta: Number(((curr.totals?.trustedCoverageRate ?? 0) - (prev.totals?.trustedCoverageRate ?? 0)).toFixed(4)),
+    },
+    /** @type {{ exact: {prev:number,curr:number,delta:number}, identity: {prev:number,curr:number,delta:number}, fuzzy: {prev:number,curr:number,delta:number} }} */
+    tiers: Object.fromEntries(['exact', 'identity', 'fuzzy'].map((k) => {
+      const p = prev.totals?.tiers?.[k] ?? 0;
+      const c = curr.totals?.tiers?.[k] ?? 0;
+      return [k, { prev: p, curr: c, delta: c - p }];
+    })),
     byTierDelta,
     newlyCovered,
     newlyLost,
@@ -180,16 +223,17 @@ export function renderMarkdown(summary, opts = {}) {
   L.push(`## 总览`);
   L.push('');
   L.push(`- **基准覆盖率 ${pct(t.coverageRate)}**（${t.covered}/${t.books} 本至少一个可切换源）`);
-  L.push(`- 可读 ok 的 (源,书) 对：${t.okPairs}（其中身份精确匹配 ${t.idExactPairs}）`);
+  L.push(`- **可信覆盖率 ${pct(t.trustedCoverageRate)}**（${t.trusted}/${t.books} 本至少一个 exact 或 identity 命中；模糊降级不算可信）`);
+  L.push(`- 可读 ok 的 (源,书) 对：${t.okPairs}，分三档 exact=${t.tiers.exact} / identity=${t.tiers.identity} / fuzzy=${t.tiers.fuzzy}`);
   const sp = summary.singlePoint;
   L.push(`- **单点依赖度 ${pct(sp.ratio)}**：贡献 ok 最多的站点 ${sp.topHost || '无'}（${sp.topHostOk}/${sp.okPairs} 个 ok 对）`);
   L.push(`- 单源命脉书：${sp.soleProviderBooks} 本已覆盖书的唯一可读源就是该站点（占已覆盖 ${pct(sp.soleProviderRate)}）`);
   L.push('');
   L.push(`## 分层覆盖率`);
   L.push('');
-  L.push('| 分层 | 覆盖 | 总数 | 覆盖率 |');
-  L.push('|---|---|---|---|');
-  for (const [tier, s] of Object.entries(summary.byTier)) L.push(`| ${tier} | ${s.covered} | ${s.books} | ${pct(s.coverageRate)} |`);
+  L.push('| 分层 | 覆盖 | 总数 | 覆盖率 | exact | identity | fuzzy | 可信覆盖率 |');
+  L.push('|---|---|---|---|---|---|---|---|');
+  for (const [tier, s] of Object.entries(summary.byTier)) L.push(`| ${tier} | ${s.covered} | ${s.books} | ${pct(s.coverageRate)} | ${s.exact} | ${s.identity} | ${s.fuzzy} | ${pct(s.trustedCoverageRate)} |`);
   L.push('');
   L.push(`## 分题材覆盖率`);
   L.push('');
@@ -221,6 +265,8 @@ export function renderMarkdown(summary, opts = {}) {
     L.push(`## 与上一次对比`);
     L.push('');
     L.push(`- 总覆盖率 ${pct(c.coverageRate.prev)} → ${pct(c.coverageRate.curr)}（${c.coverageRate.delta >= 0 ? '+' : ''}${pct(c.coverageRate.delta)}）`);
+    L.push(`- 可信覆盖率 ${pct(c.trustedCoverageRate.prev)} → ${pct(c.trustedCoverageRate.curr)}（${c.trustedCoverageRate.delta >= 0 ? '+' : ''}${pct(c.trustedCoverageRate.delta)}）`);
+    L.push(`- 三档 (源,书) 对前后差：${['exact', 'identity', 'fuzzy'].map((k) => `${k} ${c.tiers[k].prev}→${c.tiers[k].curr}（${c.tiers[k].delta >= 0 ? '+' : ''}${c.tiers[k].delta}）`).join('、')}`);
     L.push(`- 单点依赖度 ${pct(c.singlePoint.prevRatio)} → ${pct(c.singlePoint.currRatio)}（${c.singlePoint.delta >= 0 ? '+' : ''}${pct(c.singlePoint.delta)}）`);
     if (c.newlyCovered.length) L.push(`- 新覆盖 ${c.newlyCovered.length} 本：${c.newlyCovered.map((x) => x.join('/')).join('、')}`);
     if (c.newlyLost.length) L.push(`- 新丢失 ${c.newlyLost.length} 本：${c.newlyLost.map((x) => x.join('/')).join('、')}`);
