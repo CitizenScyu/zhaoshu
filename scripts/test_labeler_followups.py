@@ -6,7 +6,8 @@
 - L2 lbladrev-41 非阻断2：merge_text_quality 让「正常段」盖掉无证据的未知取值；
 - L3 lbladrev-41 §1 A3：`第100章 2012.12.21` 的日期章名被当更新时间剥成 `第100章`；
 - Q2 lblqualrev2 非阻断B + §1② B4：求票规则的口吻词表 / 行尾锚过宽，误删无引号叙述；
-- Q3 lblqualrev2 非阻断C：「求票啦！」「各位，求票！」漏删。
+- Q3 lblqualrev2 非阻断C：「求票啦！」「各位，求票！」漏删；
+- §7.3 lblfurev41：口吻词「今天/今日/明天/本章/上架/首订」在叙述里高频，收窄为必须与「求」邻接。
 全离线：不联网、不真调 CLI、不调 LLM。
 复跑：PYTHONIOENCODING=utf-8 python -m unittest discover -s scripts -p 'test_labeler_followups.py'
 """
@@ -272,6 +273,60 @@ class TestPleaRuleAfterReview(unittest.TestCase):
             self.assertIsNone(labeler._drop_rule(line), line)
 
     def test_plea_dropped(self):
+        for line in self.PLEA_DROP:
+            self.assertEqual(labeler._drop_rule(line), 'plea', line)
+
+
+class TestPleaMetaWordNarrowing(unittest.TestCase):
+    """lblfurev41 §7.3：口吻词「今天/今日/明天/本章/上架/首订」在正文叙述里也高频，
+    裸放会把叙述行拉进删除。收窄为 `_PLEA_META_PLEA_RE`：元词必须与「求…票类词」**邻接**
+    且求票词后是分句尾，才算作者求票。
+    样本取自 lblfurev-41-report.md §7.3 / §4 及 lblfurev-scratch/probe_flip.py。"""
+    # 6 条审查实测新增误删的叙述 → 收窄后必须保留
+    NARRATION_KEEP = (
+        '今天，村里人聚在祠堂求月票。',
+        '今天求月票的人特别多。',
+        '本章讲述主角如何求推荐票。',
+        '本章里，主角求推荐票给师妹拉票。',
+        '上架之后，读者纷纷求订阅。',
+        '首订那天，书生在街上求打赏。',
+        # 同类：元词与求票词之间有别的成分
+        '上架首日，求订阅的读者很多。',
+        '首订的成绩单上写着求打赏三个字。',
+        '今天在祠堂，村民求月票。',
+        '明天上架，作者求订阅。',
+        '本章更新，求推荐票的读者很多。',
+        '今天更新，求订阅的读者很多。',
+        '今天更新，求月票的人很多。',
+        '今天更新了，主角求月票。',
+    )
+    # 元词与求票词紧邻成句的真求票 → 必须删
+    PLEA_DROP = (
+        '今天求月票！',
+        '本章求收藏！',
+        '上架求订阅！',
+        '首订求月票！',
+        '上架了，求订阅！',
+        '首订了，求订阅！',
+        '上架了，求订阅。',
+        '上架了。求订阅！',
+        '上架了，求订阅',
+        '今天三更，求月票！',
+        '今天求票！',
+        '本章求票啦！',
+        '明天求推荐票！',
+        '今日求收藏！',
+        '首订当天，大家忙着求月票。',
+        '上架第一天，求订阅！',
+        '今天更新，求订阅！',
+        '本章更新，求推荐票！',
+    )
+
+    def test_meta_word_narration_kept(self):
+        for line in self.NARRATION_KEEP:
+            self.assertIsNone(labeler._drop_rule(line), line)
+
+    def test_meta_word_plea_dropped(self):
         for line in self.PLEA_DROP:
             self.assertEqual(labeler._drop_rule(line), 'plea', line)
 
