@@ -2585,6 +2585,65 @@ class TestTocGuardsM1(unittest.TestCase):
     def test_min_titles_raised_to_five(self):
         self.assertGreaterEqual(douban_list.CONTENT_TOC_MIN_TITLES, 5)
 
+    # ---- M1-r（复审第二轮）：结构性判据——只有带章节编号的正文章节参与目录比对 ----
+    def test_m1r_unnumbered_auxiliary_entries_excluded(self):
+        # 不带章节编号的辅助条目（封推感言/三江感言/更新说明/读者必看/新书预告/分卷感言）
+        # 整条不参与目录比对；全部落在停用表之外也拦得住（结构性，非枚举）
+        aux = ['封推感言', '三江感言', '更新说明', '读者必看', '新书预告', '分卷感言']
+        self.assertEqual(douban_list._informative_toc_titles([{'title': t} for t in aux]), [])
+        for t in aux:
+            self.assertNotIn(douban_list._norm_toc_title(t), douban_list._GENERIC_TOC_NORM)  # 表外
+            self.assertFalse(douban_list._split_toc_numbering(t)[0])                          # 不带编号
+
+    def test_m1r_generic_saturated_table_miss_not_merged(self):
+        # 复审 M1-r 反例：6 个表外辅助条目 + 各自 1 条不同情节章 → 信息性章名各只剩 1 → 目录不可判
+        aux = ['封推感言', '三江感言', '更新说明', '读者必看', '新书预告', '分卷感言']
+        a = self._fp(aux + ['第一章 天才陨落'], CM_BODY_X, 'https://a/1')
+        b = self._fp(aux + ['第一章 星空之下'], CM_BODY_Y, 'https://b/1')
+        self.assertEqual(len(set(a['toc'])), 1)             # 仅 1 条信息性章名（<5）
+        self.assertFalse(douban_list.same_book(a, b)[0])    # 转正文，正文不同 → 判否
+
+    def test_m1r_variant_generic_words_not_merged(self):
+        # 复审给的变体：另一批表外辅助词，同样不带编号 → 不参与 → 两本不同书不放行
+        aux = ['公告栏', '更新说明', '关于更新', '作者寄语', '读者必看', '新书预告']
+        a = self._fp(aux + ['第一章 天才陨落'], CM_BODY_X, 'https://a/1')
+        b = self._fp(aux + ['第一章 星空之下'], CM_BODY_Y, 'https://b/1')
+        self.assertFalse(douban_list.same_book(a, b)[0])
+
+    def test_m1r_char_gate_is_load_bearing(self):
+        # 变异：把结构判据还原成「枚举式」（去编号后非空且不在停用表就算信息性，不看是否带编号）
+        # → 6 个相同辅助词重新参与 → 打穿 Jaccard/LCS → 误判同书 → 变红信号
+        aux = ['封推感言', '三江感言', '更新说明', '读者必看', '新书预告', '分卷感言']
+        ta, tb = aux + ['第一章 天才陨落'], aux + ['第一章 星空之下']
+        self.assertFalse(douban_list.same_book(self._fp(ta, CM_BODY_X, 'https://a/1'),
+                                               self._fp(tb, CM_BODY_Y, 'https://b/1'))[0])
+
+        def _enumerative(chapters):
+            out = []
+            for c in chapters:
+                if not isinstance(c, dict):
+                    continue
+                t = douban_list._norm_toc_title(c.get('title') or '')
+                if t and t not in douban_list._GENERIC_TOC_NORM:
+                    out.append(t)
+            return out
+        with mock.patch.object(douban_list, '_informative_toc_titles', _enumerative):
+            a2 = self._fp(ta, CM_BODY_X, 'https://a/1')
+            b2 = self._fp(tb, CM_BODY_Y, 'https://b/1')
+            self.assertTrue(douban_list.same_book(a2, b2)[0])   # 枚举式 → 辅助词打穿 → 误并 → 变红
+
+    def test_m1r_min_chars_gate_load_bearing(self):
+        # 结构闸的字符量下限承重：5 个单字章名（互异数够但总字符量不足）→ 目录不可判、转正文
+        singles_a = [f'第{i}章 {c}' for i, c in enumerate('甲乙丙丁戊', 1)]
+        singles_b = [f'第{i}章 {c}' for i, c in enumerate('甲乙丙丁戊', 1)]   # 章名集合相同
+        a = self._fp(singles_a, CM_BODY_X, 'https://a/1')
+        b = self._fp(singles_b, CM_BODY_Y, 'https://b/1')     # 但正文不同 → 若靠目录会误并
+        self.assertLess(min(sum(len(t) for t in set(a['toc'])),
+                            sum(len(t) for t in set(b['toc']))), douban_list.CONTENT_TOC_MIN_CHARS)
+        self.assertFalse(douban_list.same_book(a, b)[0])       # 字符量不足 → 转正文 → 正文不同 → 判否
+        with mock.patch.object(douban_list, 'CONTENT_TOC_MIN_CHARS', 0):
+            self.assertTrue(douban_list.same_book(a, b)[0])    # 字符闸改坏 → 靠目录误并 → 变红
+
 
 class TestBodyGuardsM2(unittest.TestCase):
     """M2：正文兜底去站点模板行 + 阈值提到 0.60 + 去模板后字数下限 3000，防模板/公版开头打穿。"""

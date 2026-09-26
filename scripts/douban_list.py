@@ -953,6 +953,8 @@ CONTENT_MIN_BODY_CHARS = 3000  # 目录不足、只能靠正文判断时，两�
 CONTENT_TOC_JACCARD = 0.60     # 目录信息性标题集合 Jaccard 下限
 CONTENT_TOC_LCS = 0.60         # 目录前若干信息性标题的有序 LCS 比率下限（M1：与 Jaccard 同时达标）
 CONTENT_TOC_LCS_N = 8          # 参与有序 LCS 的前 N 个信息性标题
+CONTENT_TOC_MIN_CHARS = 10     # 目录判据的第二道结构闸（M1-r）：两侧**互异信息性章名**的总字符量
+#                                都须 ≥ 此值，否则章名信息量不足（如 5 个单字章名）→ 判「目录不可判」转正文
 CONTENT_BODY_JACCARD = 0.60    # 开头正文 n-gram Jaccard 下限（M2：0.30→0.60，且仅目录不足时才用）
 
 _TOC_NUM_RE = re.compile(
@@ -970,9 +972,22 @@ def content_match_enabled() -> bool:
 
 def _norm_toc_title(title: str) -> str:
     """章节标题归一：去「第X章/序/楔子/数字编号」前缀、空白与标点、casefold。"""
+    return _split_toc_numbering(title)[1]
+
+
+def _split_toc_numbering(title: str) -> tuple[bool, str]:
+    """归一章节标题并判断**是否带章节编号/结构前缀**（M1-r 结构性判据）。
+
+    返回 `(had_numbering, name)`：`had_numbering` 表示标题前缀命中了 `_TOC_NUM_RE`
+    （第X章/节/回/卷/话/集/部/篇、阿拉伯或中文数字序号、序/楔子/引子/正文/番外）；
+    `name` 是剥掉编号与标点、casefold 后剩下的章名（可能为空）。
+    不带编号前缀的辅助条目（封推感言/更新说明/读者必看…）→ `had_numbering=False`，
+    整条不参与目录比对，杜绝表外同义词打穿 Jaccard/LCS。"""
     t = unicodedata.normalize('NFKC', (title or '')).strip()
-    t = _TOC_NUM_RE.sub('', t)
-    return _TOC_PUNCT_RE.sub('', t).casefold()
+    stripped = _TOC_NUM_RE.sub('', t)
+    had_numbering = stripped != t          # 前缀被 _TOC_NUM_RE 剥掉过 → 是编号章节
+    name = _TOC_PUNCT_RE.sub('', stripped).casefold()
+    return had_numbering, name
 
 
 # ---- 通用标题停用表（M1）----
@@ -990,14 +1005,19 @@ _GENERIC_TOC_NORM = frozenset(t for t in (_norm_toc_title(w) for w in _GENERIC_T
 
 
 def _informative_toc_titles(chapters) -> list[str]:
-    """章节列表 → 去编号/去通用标题后的**有序**信息性标题（保序、含重复；空串与通用条目剔除）。"""
+    """章节列表 → **仅带章节编号的正文章节**去编号后的有序信息性章名（保序、含重复）。
+
+    M1-r 结构性判据：只有前缀命中章节编号（第X章/节/回/卷…、数字序号）的条目才算「正文
+    章节」并贡献章名；不带编号的辅助条目（封推感言/三江感言/更新说明/读者必看/新书预告/
+    分卷感言…）整条不参与比对——不依赖停用表也拦得住表外同义词。停用表仅作兜底：带编号但
+    章名恰好落在通用词表（上架感言…）的仍剔除。空章名（纯编号、序/楔子/番外）不计。"""
     seq = []
     for c in chapters:
         if not isinstance(c, dict):
             continue
-        t = _norm_toc_title(c.get('title') or '')
-        if t and t not in _GENERIC_TOC_NORM:
-            seq.append(t)
+        had_numbering, name = _split_toc_numbering(c.get('title') or '')
+        if had_numbering and name and name not in _GENERIC_TOC_NORM:
+            seq.append(name)
     return seq
 
 
@@ -1139,7 +1159,10 @@ def same_book(fp_a: dict | None, fp_b: dict | None) -> tuple[bool, dict]:
     set_a, set_b = set(seq_a), set(seq_b)
     toc_sim = _jaccard(set_a, set_b)
     body_sim = _jaccard(fp_a.get('body') or set(), fp_b.get('body') or set())
-    toc_enough = min(len(set_a), len(set_b)) >= CONTENT_TOC_MIN_TITLES
+    # M1-r 结构闸：信息性章名的**互异数**与**总字符量**双下限，任一不足 → 目录不可判、转正文
+    info_chars = min(sum(len(t) for t in set_a), sum(len(t) for t in set_b))
+    toc_enough = (min(len(set_a), len(set_b)) >= CONTENT_TOC_MIN_TITLES
+                  and info_chars >= CONTENT_TOC_MIN_CHARS)
     if toc_enough:
         lcs = _lcs_ratio(seq_a[:CONTENT_TOC_LCS_N], seq_b[:CONTENT_TOC_LCS_N])
         decided = toc_sim >= CONTENT_TOC_JACCARD and lcs >= CONTENT_TOC_LCS
