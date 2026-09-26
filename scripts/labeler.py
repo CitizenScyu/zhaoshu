@@ -33,6 +33,7 @@ import re
 import sys
 import tempfile
 import time
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -2313,8 +2314,8 @@ def merge_text_quality(segments: list[dict]) -> tuple[object, list[str]]:
 
 # ---- 后期落差字段 arc 的解析与证据校验（lblseg41）----
 # 分段模式下模型输出 arc；这里只信「能在送入文本里找到原文」的证据，防止对照组误报（lblab-41 §3.6(c)）：
-# quote 归一空白后必须是**所标段号那段**文本的子串，找不到或段号不对的丢弃；decline 为 mild/severe 时
-# 有效证据须 ≥ ARC_MIN_EVIDENCE 条且覆盖 ≥2 个不同段，否则降为 unknown；缺开头或第 3、4 段都缺 → 强制 unknown。
+# quote 归一（NFKC + 去空白/标点/符号，见 _arc_norm）后必须是**所标段号那段**文本的子串，找不到或段号不对的丢弃；
+# decline 为 mild/severe 时有效证据须 ≥ ARC_MIN_EVIDENCE 条且覆盖 ≥2 个不同段，否则降为 unknown；缺开头或第 3、4 段都缺 → 强制 unknown。
 ARC_DECLINES = ('none', 'mild', 'severe', 'unknown')
 ARC_MIN_EVIDENCE = 2
 ARC_QUOTE_MAX = 50
@@ -2322,16 +2323,24 @@ ARC_QUOTE_MIN = 6           # 归一后短于此的摘录（「他说」这种�
 ARC_EVIDENCE_MAX = 6
 ARC_NOTE_MAX = 200
 _SEG_MARKER_RE = re.compile(r'【第 (\d+) 段：[^】\n]*】')
-_WS_RE = re.compile(r'\s+')
+
+
+def _arc_norm(text: str) -> str:
+    """证据比对口径：NFKC 后去掉空白、标点、符号，只比正文字序（纯函数）。
+
+    小样实测（lblseg-41 §4）：模型逐字摘录时常把全角逗号写成半角（完美世界 2 条真原文因此被丢），
+    只归一空白会把真证据当伪造；标点不承载内容，去掉后仍要求 ≥ ARC_QUOTE_MIN 个正文字连续命中。"""
+    text = unicodedata.normalize('NFKC', text or '')
+    return ''.join(c for c in text if not c.isspace() and unicodedata.category(c)[0] not in 'PZS')
 
 
 def segment_bodies(text: str) -> dict[int, str]:
-    """带段标注的送模文本 → {段号: 该段正文（去掉全部空白）}（纯函数）。未取到的段为空串。"""
+    """带段标注的送模文本 → {段号: 该段正文（_arc_norm 归一后）}（纯函数）。未取到的段为空串。"""
     marks = list(_SEG_MARKER_RE.finditer(text))
     out: dict[int, str] = {}
     for i, m in enumerate(marks):
         end = marks[i + 1].start() if i + 1 < len(marks) else len(text)
-        out[int(m.group(1))] = _WS_RE.sub('', text[m.end():end])
+        out[int(m.group(1))] = _arc_norm(text[m.end():end])
     return out
 
 
@@ -2363,7 +2372,7 @@ def normalize_arc(value, sent_text: str) -> dict:
         seg = _arc_segment_no(item.get('segment')) if isinstance(item, dict) else None
         quote = item.get('quote') if isinstance(item, dict) else None
         quote = quote.strip()[:ARC_QUOTE_MAX] if isinstance(quote, str) else ''
-        norm = _WS_RE.sub('', quote)
+        norm = _arc_norm(quote)
         entry = {'segment': seg, 'quote': quote}
         if seg is None or len(norm) < ARC_QUOTE_MIN or norm not in bodies.get(seg, '') \
                 or entry in evidence or len(evidence) >= ARC_EVIDENCE_MAX:

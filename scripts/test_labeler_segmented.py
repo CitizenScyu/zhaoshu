@@ -429,6 +429,17 @@ class TestNormalizeArc(unittest.TestCase):
         self.assertEqual(arc['decline'], 'mild')
         self.assertEqual([e['segment'] for e in arc['evidence']], [1, 4])
 
+    def test_punctuation_width_insensitive(self):
+        """模型把全角逗号/感叹号写成半角（完美世界实测）：仍算原文；但改一个字就不算。"""
+        arc = labeler.normalize_arc({'decline': 'mild', 'evidence': [
+            {'segment': 3, 'quote': '你们一次又一次的震,震了天上,震地下'},
+            {'segment': 1, 'quote': '"萧炎舔了舔嘴唇" 迟疑了一下'}]}, self.text())
+        self.assertEqual((arc['decline'], arc['checked']['dropped']), ('mild', 0))
+        arc = labeler.normalize_arc({'decline': 'mild', 'evidence': [
+            {'segment': 3, 'quote': '你们一次又一次地震,震了天上,震地下'},
+            {'segment': 1, 'quote': self.Q1}]}, self.text())
+        self.assertEqual((arc['decline'], arc['checked']['dropped']), ('unknown', 1))
+
     def test_forged_quote_dropped_then_unknown(self):
         """伪造（原文里没有）的 quote 被丢弃，剩 1 条 → 降为 unknown（防对照组误报）。"""
         arc = labeler.normalize_arc({'decline': 'severe', 'evidence': [
