@@ -259,6 +259,61 @@ class TestEngineIdentityVerification(unittest.TestCase):
         self.assertEqual([c[0] for c in cli.calls], ['toc'])
 
 
+class TestEngineTocAuthorWriteback(unittest.TestCase):
+    """author17k41：名单作者为空时用已过身份校验的 toc 自报作者回写记录 author。"""
+
+    def setUp(self):
+        patcher = mock.patch.object(labeler.time, 'sleep')
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    @staticmethod
+    def _toc_proc(title, author):
+        out = {'source': 'www.yingsx.com', 'title': title, 'author': author,
+               'chapters': [{'title': 'A', 'url': 'https://y/a'}]}
+        return _proc(0, json.dumps(out, ensure_ascii=False))
+
+    def test_writeback_applies_when_list_author_empty(self):
+        self.assertEqual(labeler.engine_author_writeback('', '唐家三少'), '唐家三少')
+
+    def test_no_writeback_when_list_author_present(self):
+        # 名单有作者 → 恒不回写（行为完全不变）
+        self.assertEqual(labeler.engine_author_writeback('金庸', '唐家三少'), '')
+
+    def test_no_writeback_when_toc_author_empty(self):
+        self.assertEqual(labeler.engine_author_writeback('', ''), '')
+        self.assertEqual(labeler.engine_author_writeback('', '作者：'), '')  # 只有标签→清洗成空
+
+    def test_writeback_normalizes_label_and_suffix(self):
+        # 带「作者：」前缀 / 「著」尾缀被剥；保留大小写与「·」（不做身份比对式强归一）
+        self.assertEqual(labeler.engine_author_writeback('', '作者：唐家三少 著'), '唐家三少')
+        self.assertEqual(labeler.engine_author_writeback('', '乔治·奥威尔'), '乔治·奥威尔')
+
+    def test_toc_author_exposed_in_stats_on_success(self):
+        # 身份校验通过 → toc_author 进 stats，供记录组装层回写
+        cli = FakeEngineCli(
+            lambda sub, url: self._toc_proc('斗罗大陆', '作者：唐家三少')
+            if sub == 'toc' else _content('正' * 200))
+        stats = {}
+        labeler.fetch_book_text_engine(cli, 'https://y/x',
+                                       expect_title='斗罗大陆', stats=stats)
+        self.assertEqual(stats.get('toc_author'), '作者：唐家三少')
+        # 组装层清洗后回写
+        self.assertEqual(labeler.engine_author_writeback('', stats['toc_author']), '唐家三少')
+
+    def test_no_toc_author_in_stats_on_identity_mismatch(self):
+        # 身份不符 → 抛异常、stats 里不出现 toc_author（记录组装根本不会执行 → 不回写）
+        cli = FakeEngineCli(
+            lambda sub, url: self._toc_proc('斗破苍穹', '别人') if sub == 'toc'
+            else _content('正' * 200))
+        stats = {}
+        with self.assertRaises(labeler.EngineIdentityMismatch):
+            labeler.fetch_book_text_engine(cli, 'https://y/x',
+                                           expect_title='斗破苍穹',
+                                           expect_author='天蚕土豆', stats=stats)
+        self.assertNotIn('toc_author', stats)
+
+
 class TestBuildEngineCli(unittest.TestCase):
     """_build_engine_cli：开关 + 必要配置齐备才返回 EngineCli，否则降级 None。"""
 

@@ -615,6 +615,46 @@ class TestAutoImporter(TempDirCase):
         self.assertTrue(any(c[0].startswith('WITH upserted') for c in db.calls))
         self.assertEqual(len(db.rows), 1)
 
+    def test_engine_toc_writeback_author_imports_as_distinct_work(self):
+        """author17k41 §7 反例：引擎 toc 回写作者的记录，遇库里同名、作者不同的书。
+
+        身份键 (title_key, author_key)：作者乙 ≠ 作者甲 且非孪生 → **正确作为另一本书入库**
+        （同名不同作者是不同作品，这正是复合键的语义），不会覆盖/错配到作者甲那行，
+        也不是「凭空多一行的同一本书」。对照 labeler-idempotency-redline：那起事故是
+        **空作者**（author_key=''）与 (书,甲) 不冲突而凭空多行；回写填的是**非空**真作者，
+        要么命中同身份 UPSERT 同一行、要么作为不同作品新行，都不再触发那条红线。"""
+        db = FakeDb()
+        db.seed('同名书', '作者甲')
+        importer = self.importer(db)
+        rec = record(title='同名书', site_title='同名书', author='作者乙',
+                     author_source='engine_toc',
+                     url='https://book15.net/books/details9.html')
+        # 额外的 author_source 字段不破坏校验（不在 FIELD_STRINGS，被忽略）
+        self.assertEqual(import_one.validate_record(rec)['status'], 'ready')
+        self.assertEqual(importer.import_record(rec), 'imported')
+        self.assertEqual(len(db.rows), 2)                       # 甲、乙各一行
+        self.assertEqual(db.rows[('同名书', '作者甲')]['author'], '作者甲')  # 甲行未被改
+
+    def test_engine_toc_writeback_matching_author_is_idempotent(self):
+        """回写作者命中存量同身份 → UPSERT 同一行，重放不新增（幂等）。"""
+        db = FakeDb()
+        db.seed('回写书', '唐家三少')
+        importer = self.importer(db)
+        rec = record(title='回写书', site_title='回写书', author='唐家三少',
+                     author_source='engine_toc')
+        self.assertEqual(importer.import_record(rec), 'imported')
+        self.assertEqual(len(db.rows), 1)
+
+    def test_engine_toc_writeback_still_blocked_by_twin_guard(self):
+        """回写作者不绕开孪生拦截：与存量实体变体同身份 → twin-skipped，不多一行。"""
+        db = FakeDb()
+        db.seed('孪生书', '作&#32773;甲')             # 解码后 = 作者甲
+        importer = self.importer(db)
+        rec = record(title='孪生书', site_title='孪生书', author='作者甲',
+                     author_source='engine_toc')
+        self.assertEqual(importer.import_record(rec), 'twin-skipped')
+        self.assertEqual(len(db.rows), 1)
+
     def test_review_records_are_not_imported(self):
         db = FakeDb()
         importer = self.importer(db)

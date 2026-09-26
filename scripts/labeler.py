@@ -1246,6 +1246,10 @@ def fetch_book_text_engine(engine_cli, book_url: str,
     stats = stats if stats is not None else {}
     stats.setdefault('nonbody_chapters', 0)
     stats.setdefault('preview_chapters', 0)
+    # author17k41：把已通过身份校验（标题兼容）的 toc 自报作者透出给记录组装层，
+    # 供「名单作者为空」时回写（见 main 的 engine_toc 回写）。只读透出，不改取文行为。
+    # 位置在两处 EngineIdentityMismatch 之后 → 出现在 stats 即代表目录身份已过。
+    stats['toc_author'] = toc_author
     streak_limit = dict.fromkeys(DETERMINISTIC_ENGINE_ERRORS, giveup_streak)
     streak_limit[SERVER_ERROR_KIND] = server_error_streak
     streak_kind, streak = '', 0     # 连续同一放弃类别（确定性 / 重试后仍 5xx）的章数
@@ -1379,6 +1383,33 @@ def format_failure_kinds(kinds: dict) -> str:
     """{类别: 次数} → 「失败分类: A 3 / B 1」（按次数降序，同数按类别名）。"""
     items = sorted(((k, v) for k, v in kinds.items() if v), key=lambda kv: (-kv[1], kv[0]))
     return '失败分类: ' + ' / '.join(f'{k} {v}' for k, v in items)
+
+
+def _clean_engine_author(raw: str) -> str:
+    """引擎 toc 自报作者 → 可入库的作者串：剥前导「作者：」标签与尾部「著/等著…」，保名、不 casefold。
+
+    与 douban_list._norm_author 分工：那条是**身份比对**用的强归一（casefold + 去标点 + 剥国籍段），
+    会把「乔治·奥威尔」压成小写去点、不适合直接入库；这里只做面向存储的轻清洗，复用同一套
+    标签/尾缀正则，保证清洗口径与比对口径不打架。全空（如 toc 只给「作者：」）→ '' ⇒ 不回写。"""
+    s = douban_list._strip_author_label((raw or '').strip())
+    while True:
+        stripped = douban_list._AUTHOR_SUFFIX_RE.sub('', s)
+        if stripped == s:
+            break
+        s = stripped
+    return s.strip()
+
+
+def engine_author_writeback(list_author: str, toc_author: str) -> str:
+    """名单作者为空、且 toc 自报作者清洗后非空 → 返回应回写的作者；否则 ''（不回写）。
+
+    条件①名单作者为空 + ③toc_author 清洗后非空 在此判；条件②「目录身份校验已通过」由
+    调用点保证——toc_author 仅在 fetch_book_text_engine 的两处 EngineIdentityMismatch 之后
+    才写进 stats，身份不符会先抛异常、记录组装根本不会执行，故这里拿到的 toc_author 必已过校验。
+    名单作者非空 ⇒ 恒 '' ⇒ 行为完全不变。不触碰作者歧义护栏（搜索阶段已判）。"""
+    if (list_author or '').strip():
+        return ''
+    return _clean_engine_author(toc_author)
 
 
 def _build_engine_cli(env: dict):
@@ -2123,6 +2154,15 @@ def main() -> int:
                     stats=fetch_stats)
                 if used['url'] != b['url']:
                     b['url'], b['source_host'] = used['url'], used['source']
+                # author17k41：名单作者为空时，用已过身份校验（标题兼容）的 toc 自报作者回写
+                # 记录 author，让引擎兜底书也能过 import_one 空作者护栏。名单有作者时**不动**；
+                # 作者歧义护栏在搜索阶段已跑过（到这里的书都已通过），此处不绕开、不重判。
+                # toc_author 仅在目录身份校验通过后才进 fetch_stats（见 fetch_book_text_engine）。
+                engine_author = engine_author_writeback(
+                    b.get('author', ''), fetch_stats.get('toc_author') or '')
+                if engine_author:
+                    b['author'], b['author_source'] = engine_author, 'engine_toc'
+                    print(f'  引擎目录作者回写: {engine_author}（名单作者为空）')
                 if fetch_stats.get('nonbody_chapters') or fetch_stats.get('preview_chapters'):
                     print(f'  取文跳过: 公告/感言条目 {fetch_stats.get("nonbody_chapters", 0)} 条，'
                           f'试读章 {fetch_stats.get("preview_chapters", 0)} 章')
@@ -2276,6 +2316,9 @@ def main() -> int:
             if quality_flag:
                 b_out['quality_flag'] = quality_flag
                 b_out['text_quality_evidence'] = evidence
+            if b.get('author_source'):
+                # author17k41：作者非名单原生（引擎 toc 回写）时留审计标记，供事后追溯
+                b_out['author_source'] = b['author_source']
             print(f'  {chars} 字 | {labels.get("genre")} | conf {labels.get("confidence")} | {calls} 次调用')
             out_path = data_path('labels.jsonl')
             with open(out_path, 'a', encoding='utf-8') as f:
