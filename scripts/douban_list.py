@@ -982,7 +982,11 @@ CONTENT_TOC_LCS = 0.60         # 目录前若干信息性标题的有序 LCS 比
 CONTENT_TOC_LCS_N = 8          # 参与有序 LCS 的前 N 个信息性标题
 CONTENT_TOC_MIN_CHARS = 10     # 目录判据的第二道结构闸（M1-r）：两侧**互异信息性章名**的总字符量
 #                                都须 ≥ 此值，否则章名信息量不足（如 5 个单字章名）→ 判「目录不可判」转正文
-CONTENT_BODY_JACCARD = 0.60    # 开头正文 n-gram Jaccard 下限（M2：0.30→0.60，且仅目录不足时才用）
+CONTENT_TOC_MIN_MATCH = 5      # §12 绝对量门槛：两侧**匹配上（交集）**的信息性章名互异数须 ≥ 此值。
+#                                同名异书至多共享辅助/通用条目，真正共享 ≥5 个情节章名的概率极低——这是
+#                                「宁可少救」的结构闸，不靠继续给停用表加词。
+CONTENT_TOC_MIN_NAME_CHARS = 4 # §12 信息性章名去编号后最短字数：<4 字（如单字/双字章名）信息量不足，不计入
+CONTENT_BODY_JACCARD = 0.60    # 开头正文 n-gram Jaccard 下限（M2：0.30→0.60）
 
 _TOC_NUM_RE = re.compile(
     r'^\s*(?:第\s*[0-9零一二三四五六七八九十百千万两]+\s*[章节節回卷话話集部篇]'
@@ -1017,34 +1021,68 @@ def _split_toc_numbering(title: str) -> tuple[bool, str]:
     return had_numbering, name
 
 
-# ---- 通用标题停用表（M1）----
+# ---- 通用/辅助章节标题识别（M1 + §12）----
 # 上架感言/尾声/后记/公告 等非情节条目在两本**不同**书里也常一字不差，若参与 Jaccard 会把
-# 同名异书误并（rvauthcv M1 反例 C1/C2）。归一后命中即剔除，不计入目录判据。
-# （序章/楔子/番外/引子/正文已被 _TOC_NUM_RE 剥成空串，天然不计，这里再补一份稳妥。）
+# 同名异书误并（rvauthcv M1 反例 C1/C2）。§12：改**子串归类**——只要章名（剥编号后）含下列
+# 任一子串即视为辅助项，不计入目录判据。带编号的「第1章 求月票 / 第2章 求推荐票」也照剔
+# （N1 反例 A），不再靠「有没有编号」区分。
+_AUX_TOC_SUBSTRINGS = (
+    '感言', '求票', '月票', '推荐票', '请假', '請假', '通知', '说明', '說明', '公告', '必看', '必看',
+    '预告', '預告', '番外', '楔子', '序', '引子', '后记', '後記', '尾声', '尾聲', '上架', '加更', '加更',
+    '新书', '新書', '感谢', '感謝', '完本', '完结', '完結', '声明', '聲明', '免责', '免責', '通告',
+    '寄语', '寄語', '作品相关', '作品相關', '正文',
+)
+# 停用表（整词兜底，与子串判据并用）。§12 修复建表 bug：原先用 `_norm_toc_title(w)` 建键，而
+# `_norm_toc_title('番外'/'序'/'楔子'/'引子'/'正文')` 会被 `_TOC_NUM_RE` 整词剥成空串 → 这些键
+# 根本没进表。改用**只去标点+casefold、不剥编号**的 `_norm_generic_toc_word` 建键，使其生效。
 _GENERIC_TOC_WORDS = (
     '上架感言', '完本感言', '新书感言', '完结感言', '感言', '尾声', '尾章', '后记', '後記',
     '前言', '引言', '引子', '序', '序章', '序言', '楔子', '请假条', '请假', '新书', '新書',
     '公告', '通知', '上架', '完本', '完结', '完結', '感谢', '感謝', '作品相关', '作品相關',
     '番外', '番外篇', '写在前面', '寫在前面', '内容简介', '內容簡介', '免责声明', '免責聲明',
     '温馨提示', '溫馨提示', '作者的话', '作者的話', '关于', '關於', '说明', '說明', '声明', '聲明',
+    '正文',
 )
-_GENERIC_TOC_NORM = frozenset(t for t in (_norm_toc_title(w) for w in _GENERIC_TOC_WORDS) if t)
+
+
+def _norm_generic_toc_word(w: str) -> str:
+    """停用词归一：只去标点/空白 + casefold，**不剥编号前缀**（否则 番外/序/楔子/引子/正文 塌成空）。"""
+    return _TOC_PUNCT_RE.sub('', unicodedata.normalize('NFKC', w or '')).casefold()
+
+
+_GENERIC_TOC_NORM = frozenset(
+    t for t in (_norm_generic_toc_word(w) for w in _GENERIC_TOC_WORDS) if t)
+
+
+def _is_auxiliary_toc_name(name: str) -> bool:
+    """章名（剥编号后、已归一）是否辅助/通用条目（§12 子串归类 + 停用表兜底）。"""
+    if name in _GENERIC_TOC_NORM:
+        return True
+    return any(s in name for s in _AUX_TOC_SUBSTRINGS)
 
 
 def _informative_toc_titles(chapters) -> list[str]:
-    """章节列表 → **仅带章节编号的正文章节**去编号后的有序信息性章名（保序、含重复）。
+    """章节列表 → **信息性正文章名**去编号后的有序列表（保序、含重复；§12）。
 
-    M1-r 结构性判据：只有前缀命中章节编号（第X章/节/回/卷…、数字序号）的条目才算「正文
-    章节」并贡献章名；不带编号的辅助条目（封推感言/三江感言/更新说明/读者必看/新书预告/
-    分卷感言…）整条不参与比对——不依赖停用表也拦得住表外同义词。停用表仅作兜底：带编号但
-    章名恰好落在通用词表（上架感言…）的仍剔除。空章名（纯编号、序/楔子/番外）不计。"""
+    信息性章名判据（三者同时满足）：
+      (1) 前缀带章节编号（第X章/节/回/卷…、数字序号）——不带编号的辅助条目整条不参与；
+      (2) 去编号后章名长度 ≥ CONTENT_TOC_MIN_NAME_CHARS（<4 字信息量不足，不计）；
+      (3) 章名不含辅助子串、不落停用表（求月票/更新说明/番外/序… 按**子串**归类，
+          带编号的「第1章 求月票」也剔除，堵 N1）。
+    这样两本不同书至多共享辅助条目，真正共享的情节章名极少——配合 same_book 的交集下限
+    CONTENT_TOC_MIN_MATCH，同名异书无法靠通用/辅助标题打穿目录判据。"""
     seq = []
     for c in chapters:
         if not isinstance(c, dict):
             continue
         had_numbering, name = _split_toc_numbering(c.get('title') or '')
-        if had_numbering and name and name not in _GENERIC_TOC_NORM:
-            seq.append(name)
+        if not (had_numbering and name):
+            continue
+        if len(name) < CONTENT_TOC_MIN_NAME_CHARS:
+            continue
+        if _is_auxiliary_toc_name(name):
+            continue
+        seq.append(name)
     return seq
 
 
@@ -1197,29 +1235,41 @@ def fetch_content_fingerprint(cli, book_url: str,
     return fp
 
 
-def same_book(fp_a: dict | None, fp_b: dict | None) -> tuple[bool, dict]:
-    """两个内容指纹是否同一本书 → (bool, {'toc':Jaccard,'lcs':有序比率,'body':相似度,'basis':判据})。
+def _toc_decides(fp_a: dict, fp_b: dict) -> tuple[bool, bool, float, float]:
+    """目录信号：返回 (judgeable, same, toc_jaccard, lcs)。
 
-    目录为强判据（M1）：两侧**去通用标题后**的信息性标题都 ≥ CONTENT_TOC_MIN_TITLES 时，
-    要求集合 Jaccard ≥ CONTENT_TOC_JACCARD **且**前若干条的有序 LCS 比率 ≥ CONTENT_TOC_LCS，
-    二者同时达标才判同书；目录信息足够但不达标 → 直接判**否**（不下沉到正文，避免同名异书靠
-    正文偶然重合被误并）。任一侧信息性标题不足（纯编号/通用标题饱和）→ 目录**无法判定**，
-    退到正文兜底（M2 侧更严）。缺任一指纹 → 判否（不猜）。"""
-    empty = {'toc': 0.0, 'lcs': 0.0, 'body': 0.0, 'basis': 'none'}
-    if not fp_a or not fp_b:
-        return False, empty
+    judgeable=False 表示目录信息不足、**不可判**（信息性章名太少/字符量不足/交集不够）。
+    §12 绝对量门槛：除 Jaccard/LCS 外，两侧**交集**的信息性章名互异数须 ≥ CONTENT_TOC_MIN_MATCH——
+    同名异书至多共享辅助条目，真正共享 ≥5 个情节章名的概率极低，靠加词的停用表堵不住、靠这道
+    交集下限才堵得住。judgeable 时才比 Jaccard≥CONTENT_TOC_JACCARD 且有序 LCS≥CONTENT_TOC_LCS。"""
     seq_a, seq_b = fp_a.get('toc') or [], fp_b.get('toc') or []
     set_a, set_b = set(seq_a), set(seq_b)
     toc_sim = _jaccard(set_a, set_b)
-    body_sim = _jaccard(fp_a.get('body') or set(), fp_b.get('body') or set())
-    # M1-r 结构闸：信息性章名的**互异数**与**总字符量**双下限，任一不足 → 目录不可判、转正文
+    inter = len(set_a & set_b)
     info_chars = min(sum(len(t) for t in set_a), sum(len(t) for t in set_b))
-    toc_enough = (min(len(set_a), len(set_b)) >= CONTENT_TOC_MIN_TITLES
-                  and info_chars >= CONTENT_TOC_MIN_CHARS)
-    if toc_enough:
-        lcs = _lcs_ratio(seq_a[:CONTENT_TOC_LCS_N], seq_b[:CONTENT_TOC_LCS_N])
-        decided = toc_sim >= CONTENT_TOC_JACCARD and lcs >= CONTENT_TOC_LCS
-        return decided, {'toc': toc_sim, 'lcs': lcs, 'body': body_sim, 'basis': 'toc'}
+    judgeable = (min(len(set_a), len(set_b)) >= CONTENT_TOC_MIN_TITLES
+                 and info_chars >= CONTENT_TOC_MIN_CHARS
+                 and inter >= CONTENT_TOC_MIN_MATCH)
+    if not judgeable:
+        return False, False, toc_sim, 0.0
+    lcs = _lcs_ratio(seq_a[:CONTENT_TOC_LCS_N], seq_b[:CONTENT_TOC_LCS_N])
+    same = toc_sim >= CONTENT_TOC_JACCARD and lcs >= CONTENT_TOC_LCS
+    return True, same, toc_sim, lcs
+
+
+def same_book(fp_a: dict | None, fp_b: dict | None) -> tuple[bool, dict]:
+    """两个内容指纹是否同一本书 → (bool, {'toc':Jaccard,'lcs':有序比率,'body':相似度,'basis':判据})。
+
+    目录为强判据（M1/§12）：`_toc_decides` 可判且判同即认。目录不可判（信息性章名不足/交集
+    <CONTENT_TOC_MIN_MATCH）→ 退正文兜底（M2 侧更严）。缺任一指纹 → 判否（不猜）。
+    （§12 双信号与门在下一提交把此处改为「目录且正文」都成立才放行。）"""
+    empty = {'toc': 0.0, 'lcs': 0.0, 'body': 0.0, 'basis': 'none'}
+    if not fp_a or not fp_b:
+        return False, empty
+    toc_judgeable, toc_same, toc_sim, lcs = _toc_decides(fp_a, fp_b)
+    body_sim = _jaccard(fp_a.get('body') or set(), fp_b.get('body') or set())
+    if toc_judgeable:
+        return toc_same, {'toc': toc_sim, 'lcs': lcs, 'body': body_sim, 'basis': 'toc'}
     # 目录信息不足 → 交正文兜底（同书判定的正文侧约束在 M2 收紧：去模板 + 高阈值 + 字数下限）
     decided = _body_decides(fp_a, fp_b, body_sim)
     return decided, {'toc': toc_sim, 'lcs': 0.0, 'body': body_sim, 'basis': 'body'}

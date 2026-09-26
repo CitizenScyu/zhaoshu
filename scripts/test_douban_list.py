@@ -2312,6 +2312,12 @@ class TestSameBookAndRescue(unittest.TestCase):
         return douban_list.fetch_content_fingerprint(
             _cm_cli({base: _cm_book(titles, body, base)}), base)
 
+    def _fpb(self, titles, base, bodies=None):
+        # 每章各异长正文（去模板后 ≥3000 字），两侧用同一组 bodies → 正文信号「可判且判同」，
+        # 用于隔离出目录信号做承重验证（§12 双信号与门下 body 须同时成立）
+        return douban_list.fetch_content_fingerprint(
+            _cm_cli({base: _cm_book_bodies(titles, bodies or CM_MULTI_X, base)}), base)
+
     def test_same_book_positive_by_toc(self):
         a = self._fp(CM_TITLES_X, CM_BODY_X, 'https://a/1')
         b = self._fp(CM_TITLES_X_ALT, CM_BODY_X, 'https://b/1')
@@ -2349,19 +2355,25 @@ class TestSameBookAndRescue(unittest.TestCase):
 
     # ---- 阈值变异验证：阈值改坏，判定就该翻转（证明阈值是承重的）----
     def test_toc_threshold_is_load_bearing(self):
-        a = self._fp(CM_TITLES_X, CM_BODY_X, 'https://a/1')
-        y = self._fp(CM_TITLES_Y, CM_BODY_Y, 'https://y/1')
-        self.assertFalse(douban_list.same_book(a, y)[0])          # 正常：不同书判否
-        # M1 后目录判据是 Jaccard 与有序 LCS 双闸，两个都改坏才会误判同书
-        with mock.patch.object(douban_list, 'CONTENT_TOC_JACCARD', 0.0), \
-                mock.patch.object(douban_list, 'CONTENT_TOC_LCS', 0.0):
-            self.assertTrue(douban_list.same_book(a, y)[0])       # 双闸改坏(0.0)：误判同书 → 变红信号
-        b = self._fp(CM_TITLES_X_ALT, CM_BODY_X, 'https://b/1')
-        self.assertTrue(douban_list.same_book(a, b)[0])           # 正常：同书判是
+        # body 两侧持平（可判+判同），隔离目录信号。正常同书 → 判是；目录任一阈值改到不可达 → 漏判
+        pos_a = self._fpb(CM_TITLES_X, 'https://a/1')
+        pos_b = self._fpb(CM_TITLES_X_ALT, 'https://b/1')
+        self.assertTrue(douban_list.same_book(pos_a, pos_b)[0])       # 正常：同书判是
         with mock.patch.object(douban_list, 'CONTENT_TOC_JACCARD', 1.01):
-            self.assertFalse(douban_list.same_book(a, b)[0])      # 阈值改到不可达：漏判 → 变红信号
+            self.assertFalse(douban_list.same_book(pos_a, pos_b)[0])  # Jaccard 闸不可达 → 漏判
         with mock.patch.object(douban_list, 'CONTENT_TOC_LCS', 1.01):
-            self.assertFalse(douban_list.same_book(a, b)[0])      # LCS 闸改到不可达：漏判 → 变红信号
+            self.assertFalse(douban_list.same_book(pos_a, pos_b)[0])  # LCS 闸不可达 → 漏判
+        # 误并方向：交集≥5 但整体 Jaccard<0.60（各含 3 条不同的额外情节章）→ 判否；阈值改 0 → 误并
+        extra_a = CM_TITLES_X + ['第6章 东境残阳', '第7章 北溟孤舟', '第8章 万象归墟']
+        extra_b = CM_TITLES_X_ALT + ['第6章 西陲落月', '第7章 南冥断剑', '第8章 太虚碎星']
+        lowj_a = self._fpb(extra_a, 'https://c/1')
+        lowj_b = self._fpb(extra_b, 'https://d/1')
+        self.assertEqual(len(set(lowj_a['toc']) & set(lowj_b['toc'])), 5)   # 交集达标
+        self.assertLess(douban_list._jaccard(set(lowj_a['toc']), set(lowj_b['toc'])),
+                        douban_list.CONTENT_TOC_JACCARD)                     # 但 Jaccard<0.60
+        self.assertFalse(douban_list.same_book(lowj_a, lowj_b)[0])          # 正常：判否
+        with mock.patch.object(douban_list, 'CONTENT_TOC_JACCARD', 0.0):
+            self.assertTrue(douban_list.same_book(lowj_a, lowj_b)[0])       # Jaccard 闸改坏(0) → 误并 → 变红
 
     # ---- search_engine 集成：名单无作者、判歧义时的内容比对救回 ----
     def _candidates(self, specs):
@@ -2579,7 +2591,7 @@ class TestTocGuardsM1(unittest.TestCase):
         seq = douban_list._informative_toc_titles(
             [{'title': t} for t in ['上架感言', '尾声', '后记', '公告', '序章', '楔子', '番外',
                                      '请假条', '新书', '第一章 天才陨落', '第二章 蝼蚁']])
-        self.assertEqual(seq, ['天才陨落', '蝼蚁'])       # 只留信息性标题、保序
+        self.assertEqual(seq, ['天才陨落'])       # 只留信息性标题（'蝼蚁' <4 字被长度闸剔除）、保序
 
     def test_lcs_ratio(self):
         self.assertEqual(douban_list._lcs_ratio(['a', 'b', 'c'], ['a', 'b', 'c']), 1.0)
@@ -2602,7 +2614,8 @@ class TestTocGuardsM1(unittest.TestCase):
 
     def test_shuffled_same_titles_rejected_by_lcs(self):
         # 集合相同但顺序完全打乱（Jaccard=1.0）→ 有序 LCS 低 → 判否（同名异书重排目录防线）
-        titles_a = ['甲章', '乙章', '丙章', '丁章', '戊章', '己章']
+        # 章名取 ≥4 字（过 §12 长度闸），≥6 条（过交集下限）
+        titles_a = ['天才陨落', '蝼蚁之路', '血脉觉醒', '初显锋芒', '风波再起', '万象归墟']
         titles_b = list(reversed(titles_a))
         a = self._fp([f'第{i+1}章 {t}' for i, t in enumerate(titles_a)], CM_BODY_X, 'https://a/1')
         b = self._fp([f'第{i+1}章 {t}' for i, t in enumerate(titles_b)], CM_BODY_Y, 'https://b/1')
@@ -2661,17 +2674,56 @@ class TestTocGuardsM1(unittest.TestCase):
             b2 = self._fp(tb, CM_BODY_Y, 'https://b/1')
             self.assertTrue(douban_list.same_book(a2, b2)[0])   # 枚举式 → 辅助词打穿 → 误并 → 变红
 
-    def test_m1r_min_chars_gate_load_bearing(self):
-        # 结构闸的字符量下限承重：5 个单字章名（互异数够但总字符量不足）→ 目录不可判、转正文
-        singles_a = [f'第{i}章 {c}' for i, c in enumerate('甲乙丙丁戊', 1)]
-        singles_b = [f'第{i}章 {c}' for i, c in enumerate('甲乙丙丁戊', 1)]   # 章名集合相同
-        a = self._fp(singles_a, CM_BODY_X, 'https://a/1')
-        b = self._fp(singles_b, CM_BODY_Y, 'https://b/1')     # 但正文不同 → 若靠目录会误并
-        self.assertLess(min(sum(len(t) for t in set(a['toc'])),
-                            sum(len(t) for t in set(b['toc']))), douban_list.CONTENT_TOC_MIN_CHARS)
-        self.assertFalse(douban_list.same_book(a, b)[0])       # 字符量不足 → 转正文 → 正文不同 → 判否
-        with mock.patch.object(douban_list, 'CONTENT_TOC_MIN_CHARS', 0):
-            self.assertTrue(douban_list.same_book(a, b)[0])    # 字符闸改坏 → 靠目录误并 → 变红
+    def test_toc_min_match_gate_load_bearing(self):
+        # §12 交集下限（CONTENT_TOC_MIN_MATCH=5）承重：两本书各 5 条信息性章名、但只共享 4 条
+        # （第 5 条各不同）→ 交集 4 <5 → 目录不可判 → 转正文 → 正文不同 → 判否。
+        shared = ['天才陨落', '蝼蚁之路', '血脉觉醒', '初显锋芒']
+        ta = [f'第{i+1}章 {t}' for i, t in enumerate(shared + ['风波再起'])]
+        tb = [f'第{i+1}章 {t}' for i, t in enumerate(shared + ['星空之下'])]
+        a = self._fp(ta, CM_BODY_X, 'https://a/1')
+        b = self._fp(tb, CM_BODY_Y, 'https://b/1')
+        self.assertEqual(len(set(a['toc']) & set(b['toc'])), 4)     # 交集 4 <5
+        self.assertFalse(douban_list.same_book(a, b)[0])            # 不可判 → 正文不同 → 判否
+        with mock.patch.object(douban_list, 'CONTENT_TOC_MIN_MATCH', 4):
+            self.assertTrue(douban_list.same_book(a, b)[0])         # 交集闸改坏(4) → 靠目录误并 → 变红
+
+    def test_toc_name_length_gate_filters_short_names(self):
+        # §12 名长闸（CONTENT_TOC_MIN_NAME_CHARS=4）：单/双字章名信息量不足 → 不计入信息性章名
+        singles = [{'title': f'第{i}章 {c}'} for i, c in enumerate('甲乙丙丁戊', 1)]
+        self.assertEqual(douban_list._informative_toc_titles(singles), [])   # 全 <4 字被剔
+        self.assertEqual(douban_list._informative_toc_titles([{'title': '第1章 天'}]), [])
+        self.assertEqual(douban_list._informative_toc_titles([{'title': '第1章 天才陨落'}]),
+                         ['天才陨落'])
+
+    # ---- §12 N1（第三轮复审）：带编号的辅助条目 + 停用表建表 bug ----
+    def test_n1_generic_norm_table_includes_stripped_words(self):
+        # 修复建表 bug：番外/序/楔子/引子/正文 曾因被 _TOC_NUM_RE 剥空而丢键，现须在表中生效
+        for w in ('番外', '序', '楔子', '引子', '正文'):
+            with self.subTest(word=w):
+                self.assertIn(douban_list._norm_generic_toc_word(w), douban_list._GENERIC_TOC_NORM)
+                self.assertTrue(douban_list._is_auxiliary_toc_name(douban_list._norm_generic_toc_word(w)))
+
+    def test_n1_numbered_auxiliary_entries_excluded(self):
+        # 带编号的辅助条目（第1章 求月票…）按**子串**归类为辅助，不计入信息性章名
+        numbered_aux = ['第1章 求月票', '第2章 求推荐票', '第3章 求收藏', '第4章 更新说明',
+                        '第5章 读者必看', '第6章 感谢支持']
+        self.assertEqual(douban_list._informative_toc_titles([{'title': t} for t in numbered_aux]), [])
+
+    def test_n1_repro_a_numbered_aux_plus_one_plot_not_merged(self):
+        # 第三轮 N1 反例 A：6 个带编号辅助条目全同 + 各 1 条不同情节章 → 交集信息性章名=0 → 判否
+        aux = ['第1章 求月票', '第2章 求推荐票', '第3章 求收藏', '第4章 更新说明',
+               '第5章 读者必看', '第6章 感谢支持']
+        a = self._fp(aux + ['第7章 天才陨落'], CM_BODY_X, 'https://a/1')
+        b = self._fp(aux + ['第7章 星空之下'], CM_BODY_Y, 'https://b/1')
+        self.assertLess(len(set(a['toc']) & set(b['toc'])), douban_list.CONTENT_TOC_MIN_MATCH)
+        self.assertFalse(douban_list.same_book(a, b)[0])
+
+    def test_n1_repro_b_structural_prefixes_not_merged(self):
+        # 第三轮 N1 反例 B：第一章 楔子/第二章 序/第三章 引子/第四章 正文/第五章 番外 + 1 情节章 → 判否
+        struct = ['第一章 楔子', '第二章 序', '第三章 引子', '第四章 正文', '第五章 番外']
+        a = self._fp(struct + ['第六章 天才陨落'], CM_BODY_X, 'https://a/1')
+        b = self._fp(struct + ['第六章 星空之下'], CM_BODY_Y, 'https://b/1')
+        self.assertFalse(douban_list.same_book(a, b)[0])
 
 
 class TestBodyGuardsM2(unittest.TestCase):
