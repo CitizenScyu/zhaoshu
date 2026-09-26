@@ -1929,15 +1929,16 @@ def fetch_book_text_segmented(engine_cli, book: dict, tracker: SourceGiveupTrack
                               stats: dict | None = None,
                               clock: Callable[[], float] = time.monotonic
                               ) -> tuple[str, int, dict, dict]:
-    """分布式采样取文（LABELER_SEGMENTED=1）→ (带段标注的拼接原文, 原文字数, 实际所用主源, sampling 诊断)。
+    """分布式采样取文（LABELER_SEGMENTED=1）→ (带段标注的拼接原文, 原文字数, 实际所用源, sampling 诊断)。
 
     候选源 = 名单主源 + engine_alternates（跳过 tracker.dead）；每源目录只取一次，身份校验同
     fetch_book_text_engine（_check_toc_identity）：主源不符照旧抛 EngineIdentityMismatch，备选不符只跳过。
     段窗口按「计划源」（第一个目录可用且身份通过的源）的正文目录定；各段独立判可用性（segment_usable），
-    不可用就换下一个候选源补这一段（上一段成功的源排最前）。整本墙钟 time_budget_s 秒，到时即停，
+    不可用就换下一个候选源补这一段（上一段成功的源排最前）；sampling 里 switched = 该段不是名单主源供给的。
+    整本墙钟 time_budget_s 秒，到时即停，
     已取到的段照用，其余段标「未取到」。所有源都不可用的段：最好一次是真正文只是偏短 → 用它（partial），
-    否则标未取到。一段都没取到 → 抛 EngineSourceGaveUp。
-    stats 同 fetch_book_text_engine：toc_author/toc_title（计划源，已过身份校验）、nonbody_chapters、preview_chapters。"""
+    否则标未取到。一段都没取到 → 抛 EngineSourceGaveUp。实际所用源 = 供给原文字数最多的源。
+    stats 同 fetch_book_text_engine：toc_author/toc_title（实际所用源，已过身份校验）、nonbody_chapters、preview_chapters。"""
     started = clock()
     deadline = started + time_budget_s
     stats = stats if stats is not None else {}
@@ -1992,6 +1993,7 @@ def fetch_book_text_segmented(engine_cli, book: dict, tracker: SourceGiveupTrack
         raise EngineSourceGaveUp(primary['source'], 'no_source',
                                  f'{len(options)} 个候选源目录均不可用')
     pieces, raw_total, seg_diag = [], 0, []
+    served: dict[int, int] = {}     # 候选源下标 → 该源供给的原文字数（定「实际所用源」）
     last_ok = plan_i
     for win in windows:
         order = [last_ok] + [i for i in range(len(options)) if i != last_ok]
@@ -2029,16 +2031,21 @@ def fetch_book_text_segmented(engine_cli, book: dict, tracker: SourceGiveupTrack
         pieces.append(segment_marker(best['window'], win['no'], best['first'], best['last'])
                       + '\n\n' + '\n\n'.join(best['parts']))
         raw_total += best['raw_chars']
+        served[best['src_i']] = served.get(best['src_i'], 0) + best['raw_chars']
         stats['preview_chapters'] += best['preview_skipped']
         seg_diag.append({'no': win['no'], 'source': src.get('source') or _url_host(src['url']),
                          'chapters': f'{best["first"] + 1}-{best["last"] + 1}',
-                         'chars': best['eff_chars'], 'switched': best['src_i'] != plan_i,
+                         'chars': best['eff_chars'], 'switched': best['src_i'] != 0,
                          'partial': not best['ok'], 'tried': tried})
     sampling = {'mode': 'segmented', 'fetch_secs': round(clock() - started, 1),
                 'segments': seg_diag}
     if not raw_total:
         raise EngineSourceGaveUp(primary['source'], 'no_source', '分段取文各段均未取到正文')
-    return '\n\n'.join(pieces), raw_total, options[plan_i], sampling
+    # 实际所用源 = 供给原文最多的源（记录的 url/source 记真实来源；各段来源另见 sampling）
+    used_i = max(served, key=lambda i: (served[i], -i))
+    stats['toc_title'], stats['toc_author'] = tocs[options[used_i]['url']]['toc_title'], \
+        tocs[options[used_i]['url']]['toc_author']
+    return '\n\n'.join(pieces), raw_total, options[used_i], sampling
 
 
 # ---- 每轮失败分类（labelerdiag41 P3：巡检要一眼分出是代码缺陷、LLM 渠道还是书源问题）----

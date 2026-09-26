@@ -267,7 +267,7 @@ class TestFetchSegmented(_NoSleep):
         a_late = [c for c in _content_calls(cli, 'a.example.com') if _idx(c[1]) >= 60]
         self.assertEqual(len(a_late), labeler.SEG_PROBE_CHAPTERS)
         self.assertEqual(sum(1 for c in cli.calls if c[0] == 'toc'), 2)  # 每源目录只取一次
-        self.assertEqual(used['url'], 'https://a.example.com/book')    # 主源仍是计划源
+        self.assertEqual(used['url'], 'https://a.example.com/book')    # 主源供给最多（1、2 段）
 
     def test_preview_pages_abort_fast(self):
         """阳神型：中后段章章返回 ~120 字预览 → 每段只花 3 个请求就换源（不再空转）。"""
@@ -281,6 +281,18 @@ class TestFetchSegmented(_NoSleep):
         self.assertEqual([segs[n]['source'] for n in (2, 3, 4)], ['b.example.com'] * 3)
         a_mid = [c for c in _content_calls(cli, 'a.example.com') if _idx(c[1]) >= 40]
         self.assertEqual(len(a_mid), labeler.SEG_PROBE_CHAPTERS)        # 只在第 2 段试过一次
+
+    def test_used_source_is_the_one_serving_most_text(self):
+        """主源只供开头一小段、其余全由备选供给 → 记录的实际来源是备选（圣墟实测形态）。"""
+        cli = make_cli({
+            'a.example.com': {'n': 100, 'body': lambda i: None if i >= 10 else
+                              _chapter_body('a.example.com', i)},
+            'b.example.com': {'n': 100, 'author': '唐家三少著'},
+        })
+        text, chars, used, sampling, stats = _fetch(cli, _book(alternates=['b.example.com']))
+        self.assertEqual(used['url'], 'https://b.example.com/book')
+        self.assertEqual([s['switched'] for s in sampling['segments']], [False, True, True, True])
+        self.assertEqual(stats['toc_author'], '唐家三少著')     # 回写用实际所用源的目录作者
 
     def test_mid_segment_4xx_stops_after_streak(self):
         """段中途起 4xx（cuoceng 实测形态）：连续 3 章落空即停，不按累计均值拖到几十个请求；
@@ -360,7 +372,7 @@ class TestFetchSegmented(_NoSleep):
         text, chars, used, sampling, _ = _fetch(cli, _book(alternates=['b.example.com']),
                                                 tracker=tracker)
         self.assertEqual(used['url'], 'https://b.example.com/book')
-        self.assertFalse(any(s['switched'] for s in sampling['segments']))
+        self.assertTrue(all(s['switched'] for s in sampling['segments']))   # 相对名单主源
         self.assertIn('a.example.com', tracker.dead)                   # 确定性目录失败记放弃
 
     def test_all_tocs_fail_raises_gaveup(self):
