@@ -1410,6 +1410,12 @@ def fetch_book_text_engine(engine_cli, book_url: str,
     stats = stats if stats is not None else {}
     stats.setdefault('nonbody_chapters', 0)
     stats.setdefault('preview_chapters', 0)
+    # author17k41：把已通过身份校验（标题兼容）的 toc 自报作者/标题透出给记录组装层，
+    # 供「名单作者为空」时回写（见 main 的 engine_toc 回写）。只读透出，不改取文行为。
+    # 位置在两处 EngineIdentityMismatch 之后 → 出现在 stats 即代表目录身份已过。
+    # toc_title 供回写点做「归一后书名完全相等」的收紧判据（rvauthor CE3：只前缀兼容不回写）。
+    stats['toc_author'] = toc_author
+    stats['toc_title'] = toc_title
     streak_limit = dict.fromkeys(DETERMINISTIC_ENGINE_ERRORS, giveup_streak)
     streak_limit[SERVER_ERROR_KIND] = server_error_streak
     streak_kind, streak = '', 0     # 连续同一放弃类别（确定性 / 重试后仍 5xx）的章数
@@ -1546,6 +1552,42 @@ def format_failure_kinds(kinds: dict) -> str:
     """{类别: 次数} → 「失败分类: A 3 / B 1」（按次数降序，同数按类别名）。"""
     items = sorted(((k, v) for k, v in kinds.items() if v), key=lambda kv: (-kv[1], kv[0]))
     return '失败分类: ' + ' / '.join(f'{k} {v}' for k, v in items)
+
+
+def _clean_engine_author(raw: str) -> str:
+    """引擎 toc 自报作者 → 可入库的作者串：剥前导「作者：」标签与尾部「著/等著…」，保名、不 casefold。
+
+    与 douban_list._norm_author 分工：那条是**身份比对**用的强归一（casefold + 去标点 + 剥国籍段），
+    会把「乔治·奥威尔」压成小写去点、不适合直接入库；这里只做面向存储的轻清洗，复用同一套
+    标签/尾缀正则，保证清洗口径与比对口径不打架。全空（如 toc 只给「作者：」）→ '' ⇒ 不回写。
+    占位作者（佚名/未知/暂无/匿名…，对齐 source-parser.ts knownSourceAuthor）→ '' ⇒ 不回写、不入身份。"""
+    s = douban_list._strip_author_label((raw or '').strip())
+    while True:
+        stripped = douban_list._AUTHOR_SUFFIX_RE.sub('', s)
+        if stripped == s:
+            break
+        s = stripped
+    s = s.strip()
+    return '' if douban_list.is_placeholder_author(s) else s
+
+
+def engine_author_writeback(list_author: str, toc_author: str,
+                            list_title: str = '', toc_title: str = '') -> str:
+    """名单作者为空、目录书名与名单书名归一后完全相等、且 toc 作者清洗后非空 → 返回应回写的作者；否则 ''。
+
+    条件①名单作者为空 + ③toc_author 清洗后非空（且非占位作者）在此判；条件②「目录身份校验已通过」
+    由调用点保证——toc_author/toc_title 仅在 fetch_book_text_engine 的两处 EngineIdentityMismatch
+    之后才写进 stats，身份不符会先抛异常。**书名收紧（rvauthor CE3）**：搜索阶段 title_compatible
+    允许前缀兼容（系列卷号），但前缀兼容可能是**另一本书**（《万古仙穹》vs《万古仙穹外传》）；
+    回写把原本 review 的错书变成入库，故此处要求 _norm_title 完全相等才回写，只前缀兼容的保持
+    作者为空、照旧进 review。toc_title 为空（源没自报标题）时无从确认完全相等 → 不回写（保守）。
+    名单作者非空 ⇒ 恒 '' ⇒ 行为完全不变。不触碰作者歧义护栏（搜索阶段已判）。"""
+    if (list_author or '').strip():
+        return ''
+    if douban_list._norm_title(list_title) != douban_list._norm_title(toc_title) \
+            or not (toc_title or '').strip():
+        return ''
+    return _clean_engine_author(toc_author)
 
 
 def _build_engine_cli(env: dict):
@@ -2316,6 +2358,18 @@ def main() -> int:
                     target_chars=engine_target_chars, stats=fetch_stats)
                 if used['url'] != b['url']:
                     b['url'], b['source_host'] = used['url'], used['source']
+                # author17k41：名单作者为空时，用已过身份校验（标题兼容）的 toc 自报作者回写
+                # 记录 author，让引擎兜底书也能过 import_one 空作者护栏。名单有作者时**不动**；
+                # 作者歧义护栏在搜索阶段已跑过（到这里的书都已通过），此处不绕开、不重判。
+                # toc_author/toc_title 仅在目录身份校验通过后才进 fetch_stats（见 fetch_book_text_engine）。
+                # 书名比对用 list_title（名单书名，_resolve_candidates 存下）——engine 条目的 b['title']
+                # 已是候选站点标题，用它会退化成「候选标题 vs 同页 toc 标题」而放过前缀兼容错书（rvauthor 增量）。
+                engine_author = engine_author_writeback(
+                    b.get('author', ''), fetch_stats.get('toc_author') or '',
+                    b.get('list_title') or b.get('title', ''), fetch_stats.get('toc_title') or '')
+                if engine_author:
+                    b['author'], b['author_source'] = engine_author, 'engine_toc'
+                    print(f'  引擎目录作者回写: {engine_author}（名单作者为空）')
                 if fetch_stats.get('nonbody_chapters') or fetch_stats.get('preview_chapters'):
                     print(f'  取文跳过: 公告/感言条目 {fetch_stats.get("nonbody_chapters", 0)} 条，'
                           f'试读章 {fetch_stats.get("preview_chapters", 0)} 章')
@@ -2469,6 +2523,9 @@ def main() -> int:
             if quality_flag:
                 b_out['quality_flag'] = quality_flag
                 b_out['text_quality_evidence'] = evidence
+            if b.get('author_source'):
+                # author17k41：作者非名单原生（引擎 toc 回写）时留审计标记，供事后追溯
+                b_out['author_source'] = b['author_source']
             print(f'  {chars} 字 | {labels.get("genre")} | conf {labels.get("confidence")} | {calls} 次调用')
             out_path = data_path('labels.jsonl')
             with open(out_path, 'a', encoding='utf-8') as f:
