@@ -29,7 +29,7 @@ import import_one           # noqa: E402
 
 # 只从 --env 白名单读这几个键喂给引擎 CLI，值不打印（凭据红线）
 _ENGINE_ENV_KEYS = ('LABELER_ENGINE_FALLBACK', 'LABELER_ENGINE_CLI',
-                    'LABELER_NODE', 'LABELER_ENGINE_HOOK', 'DATABASE_URL')
+                    'LABELER_ENGINE_NODE', 'DATABASE_URL')
 
 
 def load_jsonl(path):

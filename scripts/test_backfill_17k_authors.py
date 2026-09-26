@@ -91,6 +91,24 @@ class TestBackfill17kAuthors(unittest.TestCase):
         self.assertEqual(got, labeler._clean_engine_author('作者：唐家三少 著'))
         self.assertEqual(got, '唐家三少')
 
+    def test_engine_env_keys_subset_of_labeler_reads(self):
+        # rvauthor 41: backfill 白名单里的键必须是 labeler 引擎路径**实际读取**的键，
+        # 否则 .env 里的真值被白名单漏掉，labeler._build_engine_cli 装配失败/静默降级。
+        # 从 labeler.py 源码 + douban_list.ENGINE_FALLBACK_ENV 提取实际键名,断言子集关系,
+        # 让「白名单写错键名」这类遗漏由测试兜住,而不是靠人工比对。
+        import re
+        import douban_list
+        src = Path(labeler.__file__).read_text(encoding='utf-8')
+        reads = set(re.findall(r"env(?:\.get\(|\[)\s*['\"](\w+)['\"]", src))
+        # engine_fallback_enabled 经常量读开关,不在 labeler.py 里以字面量出现
+        reads.add(douban_list.ENGINE_FALLBACK_ENV)
+        whitelist = set(bf._ENGINE_ENV_KEYS)
+        self.assertTrue(whitelist <= reads,
+                        f'白名单含 labeler 不读的键: {sorted(whitelist - reads)}')
+        # 反向也守住:引擎装配真正依赖的键不能被白名单漏掉
+        self.assertTrue({'LABELER_ENGINE_FALLBACK', 'LABELER_ENGINE_CLI',
+                         'LABELER_ENGINE_NODE', 'DATABASE_URL'} <= whitelist)
+
 
 import tempfile           # noqa: E402
 
