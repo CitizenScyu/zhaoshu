@@ -963,6 +963,78 @@ class TestMainWritebackUsesListTitle(unittest.TestCase):
         self.assertEqual(rec['author_source'], 'engine_toc')
 
 
+class TestContentMatchAuditPassthrough(unittest.TestCase):
+    """authcv41：内容比对救回条目的审计链——labels.jsonl 记录透传 content_match 诊断详情，
+    且 toc 作者回写不得把 author_source 从 content_match 覆盖成 engine_toc（另记 toc 回写发生过）。
+    非救回条目不带这些字段。全走主循环真实路径，不直接给 b_out 组装传参。"""
+
+    def _cli(self, toc_title, toc_author):
+        def handler(sub, url):
+            if sub == 'toc':
+                return _proc(0, json.dumps(
+                    {'source': labeler._url_host(url), 'title': toc_title, 'author': toc_author,
+                     'chapters': [{'title': '第一章', 'url': url + '/c1'}]}, ensure_ascii=False))
+            return _content('正' * 11000)
+        return FakeEngineCli(handler)
+
+    def _base_entry(self, author=''):
+        return {'url': 'https://src.example.com/b/x', 'title': '万古仙穹',
+                'list_title': '万古仙穹', 'author': author, 'category': '17K完本',
+                'status': '', 'douban_url': '', 'engine': True,
+                'source_host': 'src.example.com'}
+
+    def _run_main_and_read_record(self, entry, cli):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        d = Path(tmp.name)
+        (d / '.env').write_text('LLM_API_KEY=test-key-not-real\n', encoding='utf-8')
+        labels = {'title_guess': entry['title'], 'site_title_match': True, 'text_quality': '正常'}
+        with mock.patch.dict(os.environ, {'LABELER_DATA_DIR': str(d)}), \
+                mock.patch.object(labeler.douban_list, 'build_webnovel_queue',
+                                  side_effect=lambda *a, **k: [dict(entry)]), \
+                mock.patch.object(labeler, '_build_engine_cli', return_value=cli), \
+                mock.patch.object(labeler, 'label_book', return_value=(labels, 1)), \
+                mock.patch.object(labeler.time, 'sleep'), \
+                mock.patch.object(sys, 'argv', ['labeler.py', '--source', 'webnovel', '--no-db-model']), \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            labeler.main()
+        return json.loads((d / 'labels.jsonl').read_text(encoding='utf-8').splitlines()[0])
+
+    def test_rescued_entry_passes_through_details_and_keeps_marker(self):
+        # 救回条目（作者空、toc 回写补作者）：content_match 详情原样透传，author_source 保持
+        # content_match 不被 engine_toc 覆盖，另记 toc_author_writeback。
+        entry = self._base_entry(author='')
+        entry['author_source'] = 'content_match'
+        entry['content_match'] = {'toc': 0.91, 'body_pairs': 3, 'basis': 'toc+body'}
+        rec = self._run_main_and_read_record(entry, self._cli('万古仙穹', '观棋'))
+        self.assertEqual(rec['author'], '观棋')                       # toc 回写仍补上作者串
+        self.assertEqual(rec['author_source'], 'content_match')       # 标记不被覆盖
+        self.assertEqual(rec['content_match'],
+                         {'toc': 0.91, 'body_pairs': 3, 'basis': 'toc+body'})
+        self.assertTrue(rec['toc_author_writeback'])
+
+    def test_rescued_entry_with_author_needs_no_writeback(self):
+        # 救回条目名单已带作者 → 不触发 toc 回写：content_match 照样透传，author_source 仍是
+        # content_match，无 toc_author_writeback。（toc 作者取与名单一致以过 N02 身份校验）
+        entry = self._base_entry(author='原作者')
+        entry['author_source'] = 'content_match'
+        entry['content_match'] = {'toc': 0.88, 'body_pairs': 2, 'basis': 'toc+body'}
+        rec = self._run_main_and_read_record(entry, self._cli('万古仙穹', '原作者'))
+        self.assertEqual(rec['author'], '原作者')
+        self.assertEqual(rec['author_source'], 'content_match')
+        self.assertEqual(rec['content_match'],
+                         {'toc': 0.88, 'body_pairs': 2, 'basis': 'toc+body'})
+        self.assertNotIn('toc_author_writeback', rec)
+
+    def test_non_rescued_entry_has_no_audit_fields(self):
+        # 非救回条目（普通 engine_toc 回写）：不带 content_match / toc_author_writeback。
+        entry = self._base_entry(author='')
+        rec = self._run_main_and_read_record(entry, self._cli('万古仙穹', '观棋'))
+        self.assertEqual(rec['author_source'], 'engine_toc')
+        self.assertNotIn('content_match', rec)
+        self.assertNotIn('toc_author_writeback', rec)
+
+
 class TestServerErrorGiveup(unittest.TestCase):
     """giveuprev41：重试后仍 5xx 的章用更长的连续阈值（默认 8）放弃；超时仍不参与。"""
 

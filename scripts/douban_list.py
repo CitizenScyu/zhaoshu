@@ -24,6 +24,8 @@ import sys
 import time
 import unicodedata
 import urllib.parse
+from collections import defaultdict
+from math import ceil
 from pathlib import Path
 
 # ---- 豆瓣侧配置 ----
@@ -65,6 +67,32 @@ def _norm_title(title: str) -> str:
     """标题归一化：去空白/书名号/卷号后缀，供语义比对。"""
     t = re.sub(r'[《》\s·、:：\-—_]+', '', (title or '').strip())
     t = _STRIP_RE.sub('', t)
+    return t
+
+
+# M4-r：站点常在书名后挂固定装饰尾缀（全文阅读/最新章节/无弹窗/笔趣阁…）。名单无作者路径
+# 要求书名完全相等，这类尾缀会把真同书误拒。只作为**尾缀**成组剥离，且限定装饰词表——
+# 同人续写尾缀（之XX/外传…）不在表内，故 C6「前缀续写」仍不相等、照拦（不触幂等红线）。
+_SITE_DECOR_SUFFIX = (
+    '全文阅读', '全文免费阅读', '免费阅读', '免費閱讀', '在线阅读', '在線閱讀', '免费在线阅读',
+    '最新章节', '最新章節', '最新章节列表', '章节列表', '章節列表', '无弹窗', '無彈窗',
+    '无广告', '無廣告', '无错阅读', '无删减', 'txt下载', 'TXT下载', 'txt全集下载', 'txt免费下载',
+    '全本', '全本阅读', '手机阅读', '手機閱讀', '手机版', '笔趣阁', '筆趣閣', '小说网', '小說網',
+    '免费小说', '在线阅读网', '全文阅读全文', '正版阅读',
+)
+_SITE_DECOR_RE = re.compile(
+    r'(?:' + '|'.join(re.escape(w) for w in _SITE_DECOR_SUFFIX) + r')+$')
+
+
+def _norm_title_bare(title: str) -> str:
+    """名单无作者路径专用（M4-r）：先归一，再成组剥掉**站点装饰尾缀**（全文阅读/最新章节/
+    笔趣阁…）。装饰词表之外的尾缀（同人续写「之XX」、系列卷号已由 _STRIP_RE 处理）不剥，
+    故前缀同人续写书名仍不相等——C6 红线不变。"""
+    t = _norm_title(title)
+    prev = None
+    while prev != t and t:
+        prev = t
+        t = _SITE_DECOR_RE.sub('', t)
     return t
 
 
@@ -135,6 +163,23 @@ def _strip_author_label(text: str) -> str:
         text = rest
 
 
+_T2S_TRANS = None
+
+
+def _to_simplified(text: str) -> str:
+    """繁转简（authcv41 §8）：复用 import_one._T2S 同一张表，使打标期身份口径与入库身份键
+    （import_one._loose_author_key / find_twin，本就 `_norm_author(_to_simplified(raw))`）对齐。
+    表按 str.translate 缓存一次；import_one 不可用时退化为不转换（不影响原有严格相等判定）。"""
+    global _T2S_TRANS
+    if _T2S_TRANS is None:
+        try:
+            import import_one
+            _T2S_TRANS = str.maketrans(import_one._T2S)
+        except Exception:
+            _T2S_TRANS = {}
+    return text.translate(_T2S_TRANS)
+
+
 def _norm_author(s: str) -> str:
     """作者身份比对前的归一化：前导「作者：」标签/空白（含全角）/分隔标点/尾部著述后缀/前导国籍段/casefold。
 
@@ -159,7 +204,7 @@ def _norm_author(s: str) -> str:
         if stripped == text:
             break
         text = stripped
-    return text
+    return _to_simplified(text)     # authcv41 §8：繁转简，与入库身份键 _loose_author_key 对齐
 
 
 # 占位作者（非真实署名）：对齐 src/lib/source-parser.ts knownSourceAuthor 的 {佚名/未知/未知作者}，
@@ -334,6 +379,47 @@ def author_matches(list_author: str, engine_author: str) -> bool:
 # 出版机构特征（豆瓣 pub 首段）。只用明确的机构词：「柯山梦 / 2012-8」「饭卡 / 2024」这类
 # 「作者 / 日期」无出版社的形态首段仍是作者，不能按「第二段是日期」反推（2026-09-25 实测 tag 页）。
 _PUBLISHER_RE = re.compile(r'出版|[书書]局|書房|\bpress\b|\bpublish', re.IGNORECASE)
+
+
+# ---- 名单作者字段污染识别（authcv41 §7）----
+# 豆瓣/名单偶把「分类名」（悬疑灵异/轻小说）或「出版社」塞进作者字段：gate.log 实测
+# `名单 悬疑灵异` 169 行、`名单 轻小说` 52 行、《偷偷藏不住》名单「青岛出版社」。这类
+# 「作者」不是人名、永不匹配任何候选、恒被拦。识别后降级为「名单无作者」，进入内容聚类
+# 路径（_content_rescue_unknown）安全救回；写回作者只取候选作者，绝不把分类名写进去。
+# 严格从紧防误降级（天蚕土豆/辰东等真名不受影响）：
+#   分类——归一后**整串精确等于**已知分类（PRIMARY_GENRES + 少量繁体/名单分类）才判；
+#   出版社——机构后缀须落在**串尾**（青岛出版社/中国友谊出版公司/Penguin Press），故「出版」
+#   二字、以及「出版社的猫」这类恰好含机构词的真名都不误判。
+_BOGUS_PUBLISHER_RE = re.compile(
+    r'(?:出版社|出版公司|出版集团|出版发行|图书公司|文化传媒|書局|书局'
+    r'|press|publishing|publisher|verlag)\s*$', re.IGNORECASE)
+# 名单特有/繁体分类，并入 import_one.PRIMARY_GENRES（后者已含「悬疑灵异」「轻小说」等简体形态）
+_EXTRA_LIST_GENRES = frozenset({'輕小說', '懸疑靈異', '網遊', '网游'})
+
+
+def _genre_key(s: str) -> str:
+    return re.sub(r'\s+', '', unicodedata.normalize('NFKC', s or '')).casefold()
+
+
+def _known_genre_keys() -> frozenset:
+    """已知分类名的归一键集合（复用 import_one.PRIMARY_GENRES；导入失败则仅用本地补集）。"""
+    names = set(_EXTRA_LIST_GENRES)
+    try:
+        import import_one
+        names |= set(import_one.PRIMARY_GENRES)
+    except Exception:
+        pass
+    return frozenset(_genre_key(n) for n in names)
+
+
+def is_bogus_list_author(author: str) -> bool:
+    """名单作者字段是否是被污染的非人名（分类名整串 / 出版社机构名）→ 应降级为名单无作者。"""
+    s = (author or '').strip()
+    if not s:
+        return False
+    if _genre_key(s) in _known_genre_keys():     # 分类：整串精确匹配
+        return True
+    return bool(_BOGUS_PUBLISHER_RE.search(s))    # 出版社：机构后缀
 
 
 def parse_douban_tag_page(html: str) -> list[dict]:
@@ -733,6 +819,14 @@ def search_engine(cli, title: str, author: str = '',
     espfix41：恒带 --no-builtin（book15 已由 search_book15 搜过或已熔断，其候选这里本来就跳过，
     CLI 里再搜一遍是纯浪费——book15 宕机时单这一步就 2×8s）；junk（可选）已判垃圾的 host 经
     --skip-host 跳过，本次候选再喂给 junk.observe 继续识别。"""
+    # authcv41 §7/M3：名单作者字段被污染（分类名/出版社）→ 降级为名单无作者，交内容聚类救回。
+    # 放在组 args 之前，故也不会把污染值当 --author 传给引擎搜索。bogus_raw 透出到返回 hit，
+    # 由 _resolve_candidates 据此把队列条目 author 置空/采信候选作者，绝不让污染串流到 labeler。
+    bogus_raw = ''
+    if author and is_bogus_list_author(author):
+        print(f'  名单作者疑似污染（分类/出版社），降级为名单无作者: 《{title}》原作者字段「{author}」')
+        bogus_raw = author
+        author = ''
     args = ['--title', title]
     if author:
         args += ['--author', author]
@@ -786,7 +880,13 @@ def search_engine(cli, title: str, author: str = '',
             print(f'  非 HTTPS 源跳过: {site_title}（{c.get("source", "")}）')
             continue
         got = _norm_author(c.get('author') or '')
-        if not want:          # 名单无作者：先收齐，循环后统一判歧义
+        if not want:          # 名单无作者（含 §7 降级）：先收齐，循环后统一判歧义/内容比对
+            # M4：无作者路径要求书名**归一后完全相等**——title_compatible 的前缀命中（系列/同人/
+            # 续写，如《神秘复苏》vs《神秘复苏之从回魂夜开始》）在这条路径一律不收，防降级后单候选
+            # 靠前缀直接放行错书。M4-r：相等前先剥站点装饰尾缀（全文阅读/最新章节/笔趣阁…），
+            # 减少真同书因装饰后缀被误拒；同人续写尾缀不在装饰表内，故 C6 仍不相等、照拦。
+            if _norm_title_bare(title) != _norm_title_bare(site_title):
+                continue
             unknown_hits.append(({'url': book_url, 'title': site_title,
                                   'source': c.get('source', '')}, c.get('author') or ''))
             continue
@@ -802,14 +902,44 @@ def search_engine(cli, title: str, author: str = '',
             print(f'  作者不符跳过: 候选《{site_title}》（名单《{title}》{author}'
                   f' vs 引擎 {c.get("author")}）')
     if not want:
-        # 备选服从歧义护栏：判歧义（None）就没有备选；收了则其余兼容候选两两作者相容，作者已知的在前
-        return _with_alternates(_pick_author_unknown(title, unknown_hits),
-                                [h for h, a in unknown_hits if _norm_author(a)]
-                                + [h for h, a in unknown_hits if not _norm_author(a)])
+        alt_pool = ([h for h, a in unknown_hits if _norm_author(a)]
+                    + [h for h, a in unknown_hits if not _norm_author(a)])
+        # authcv41：判歧义时先试内容比对救回（唯一主簇才放行）；救不回/未启用/引擎缺失
+        # 才落回 _pick_author_unknown（原样打印歧义跳过、维持既有行为）。
+        result = None
+        if content_match_enabled() and cli is not None:
+            result = _content_rescue_unknown(cli, title, unknown_hits)   # 已带采信作者
+        if result is None:
+            # 备选服从歧义护栏：判歧义（None）就没有备选；收了则其余兼容候选两两作者相容，作者已知的在前
+            result = _attach_unknown_author(_pick_author_unknown(title, unknown_hits), unknown_hits)
+        return _with_alternates(_annotate_bogus(result, bogus_raw), alt_pool)
     if fallback is not None:
         print(f'  作者未知命中（降级）: {fallback["title"]}（名单作者 {author}，引擎未给作者）')
         return _with_alternates(fallback, _known_author_alternates(title, author, candidates))
     return fallback
+
+
+def _author_unknown_decision(hits: list[tuple[dict, str]]) -> tuple[dict | None, bool, list[str]]:
+    """名单无作者时的选择判定（不打印）→ (hit_or_None, ambiguous, 去重非空作者原串)。
+
+    判定与候选顺序无关：兼容候选的非空作者**两两** author_matches（任一方向）为真
+    （或只有一个非空作者）才收，否则判歧义（ambiguous=True，hit=None）。见 _pick_author_unknown。"""
+    if not hits:
+        return None, False, []
+    authors: list[str] = []
+    seen: set[str] = set()
+    for _, a in hits:
+        key = _norm_author(a)
+        if key and key not in seen:
+            seen.add(key)
+            authors.append(a)
+    ambiguous = any(not (author_matches(x, y) or author_matches(y, x))
+                    for k, x in enumerate(authors) for y in authors[k + 1:])
+    if ambiguous:
+        return None, True, authors
+    if authors:
+        return next(hit for hit, a in hits if _norm_author(a)), False, authors
+    return hits[0][0], False, authors
 
 
 def _pick_author_unknown(title: str, hits: list[tuple[dict, str]]) -> dict | None:
@@ -822,25 +952,677 @@ def _pick_author_unknown(title: str, hits: list[tuple[dict, str]]) -> dict | Non
     不用「贪心聚簇」：author_matches 不传递（马伯庸 ~ 马伯庸著 刘巴布编绘 ~ 刘巴布，但
     马伯庸 ≁ 刘巴布），贪心的簇数随候选顺序变（authrev41 阻断 1）。
     收时作者已知的候选优先于作者空的；候选全无作者 ⇒ 收第一个（无从区分，同改前）。"""
-    if not hits:
-        return None
-    authors: list[str] = []
-    seen: set[str] = set()
-    for _, a in hits:
-        key = _norm_author(a)
-        if key and key not in seen:
-            seen.add(key)
-            authors.append(a)
-    ambiguous = any(not (author_matches(x, y) or author_matches(y, x))
-                    for k, x in enumerate(authors) for y in authors[k + 1:])
+    hit, ambiguous, authors = _author_unknown_decision(hits)
     if ambiguous:
         shown = sorted(authors, key=_norm_author)
         names = '、'.join(shown[:5]) + ('…' if len(shown) > 5 else '')
         print(f'  作者歧义跳过: 《{title}》名单无作者，兼容候选作者 {len(authors)} 人（{names}）')
+    return hit
+
+
+# ---- 内容比对（authcv41）：用目录 + 开头正文判断两个候选是不是同一本书 ----
+# 动机（gate.log 实测，见 authcv-41-report §2）：作者护栏在「拦同名书」上是对的，但
+# 「名单无作者 + 候选多作者」里有极少数是**假歧义**（候选其实是同一本书，作者串因繁简/
+# 站点噪声虚增，如《凌霄之上！》觀棋 vs 观棋）。内容比对在有可靠依据时把这类救回来，同时
+# 绝不放行真同名书（《长生》42 人这种多簇一律维持跳过）。
+# 红线（任务书）：必须先有「参照本」才能比——名单有作者时参照本是作者与书单一致的候选
+# （但那种候选一旦存在，搜索第一遍就已命中返回、书本不会被拦，故内容比对对「名单有作者」
+# 无可救的被拦书，见 §3 说明）；名单无作者时靠候选间两两聚类。无参照本一律维持既有跳过、
+# 不猜（同名不同书、名单作者是分类/出版社等被污染字段的情形都落在这里，交上游修，见 §6）。
+CONTENT_MATCH_ENV = 'AUTHCV_CONTENT_MATCH'   # =0/false/no/off 关闭（默认开）；回滚即置 0
+CONTENT_MAX_CANDIDATES = 3     # 每次最多取文比对的候选数（成本上限；distinct 作者超此数视为同名书泛滥，不试）
+CONTENT_MAX_CHAPTERS = 3       # 每个候选取前几章正文做指纹
+CONTENT_TOC_MIN_TITLES = 5     # 两侧**去通用标题后**的信息性标题都 ≥ 此数才用目录作判据（M1：3 太松）
+CONTENT_NGRAM = 4              # 正文字符 n-gram 长度
+CONTENT_MIN_BODY_CHARS = 3000  # 目录不足、只能靠正文判断时，两边去模板后正文都须 ≥ 此字数（M2）
+# 阈值依据（authcv-41-report §2/§3、rvauthcv §M1/§M2 反例）：正例=同一本书跨站，章节标题去编号后
+# 高度重合且**有序**、开头正文近乎一致；反例=同名不同书/同站模板，靠通用标题或模板段偶然重合。
+# 目录是强判据但须防「通用标题（上架感言/尾声/后记…）饱和」打穿：故除集合 Jaccard 外再加**有序 LCS**，
+# 二者同时达标才判同书；正文兜底阈值提到 0.60 且要求足够字数。数值取在正反例之间，待现网校准（§6）。
+CONTENT_TOC_JACCARD = 0.60     # 目录信息性标题集合 Jaccard 下限
+CONTENT_TOC_LCS = 0.60         # 目录前若干信息性标题的有序 LCS 比率下限（M1：与 Jaccard 同时达标）
+CONTENT_TOC_LCS_N = 8          # 参与有序 LCS 的前 N 个信息性标题
+CONTENT_TOC_MIN_CHARS = 10     # 目录判据的第二道结构闸（M1-r）：两侧**互异信息性章名**的总字符量
+#                                都须 ≥ 此值，否则章名信息量不足（如 5 个单字章名）→ 判「目录不可判」转正文
+CONTENT_TOC_MIN_MATCH = 5      # §12 绝对量门槛：两侧**匹配上（交集）**的信息性章名互异数须 ≥ 此值。
+#                                同名异书至多共享辅助/通用条目，真正共享 ≥5 个情节章名的概率极低——这是
+#                                「宁可少救」的结构闸，不靠继续给停用表加词。
+CONTENT_TOC_MIN_NAME_CHARS = 4 # §12 信息性章名去编号后最短字数：<4 字（如单字/双字章名）信息量不足，不计入
+CONTENT_BODY_JACCARD = 0.60    # 开头正文 n-gram Jaccard 下限（M2：0.30→0.60）
+
+_TOC_NUM_RE = re.compile(
+    r'^\s*(?:第\s*[0-9零一二三四五六七八九十百千万两]+\s*[章节節回卷话話集部篇]'
+    r'|[0-9]+\s*[\.、,，:：]?|楔子|序[章言曲]?|引子|正文|番外)\s*')
+_TOC_PUNCT_RE = re.compile(
+    r'[\s　·、，。：:；;!！?？\-—_()（）\[\]【】《》「」『』"\'“”‘’.]+')
+_BODY_KEEP_RE = re.compile(r'[^一-鿿㐀-䶿a-zA-Z]+')
+
+
+def content_match_enabled() -> bool:
+    """内容比对开关（默认开）。AUTHCV_CONTENT_MATCH=0/false/no/off 关闭。"""
+    return os.environ.get(CONTENT_MATCH_ENV, '1').strip().lower() not in ('0', 'false', 'no', 'off')
+
+
+def _norm_toc_title(title: str) -> str:
+    """章节标题归一：去「第X章/序/楔子/数字编号」前缀、空白与标点、casefold。"""
+    return _split_toc_numbering(title)[1]
+
+
+def _split_toc_numbering(title: str) -> tuple[bool, str]:
+    """归一章节标题并判断**是否带章节编号/结构前缀**（M1-r 结构性判据）。
+
+    返回 `(had_numbering, name)`：`had_numbering` 表示标题前缀命中了 `_TOC_NUM_RE`
+    （第X章/节/回/卷/话/集/部/篇、阿拉伯或中文数字序号、序/楔子/引子/正文/番外）；
+    `name` 是剥掉编号与标点、casefold 后剩下的章名（可能为空）。
+    不带编号前缀的辅助条目（封推感言/更新说明/读者必看…）→ `had_numbering=False`，
+    整条不参与目录比对，杜绝表外同义词打穿 Jaccard/LCS。"""
+    t = unicodedata.normalize('NFKC', (title or '')).strip()
+    stripped = _TOC_NUM_RE.sub('', t)
+    had_numbering = stripped != t          # 前缀被 _TOC_NUM_RE 剥掉过 → 是编号章节
+    name = _TOC_PUNCT_RE.sub('', stripped).casefold()
+    return had_numbering, name
+
+
+_CN_DIGITS = {'零': 0, '〇': 0, '一': 1, '二': 2, '两': 2, '三': 3, '四': 4,
+              '五': 5, '六': 6, '七': 7, '八': 8, '九': 9}
+_CN_UNITS = {'十': 10, '百': 100, '千': 1000}
+_CHAP_NUM_RE = re.compile(r'第\s*([0-9零〇一二三四五六七八九十百千两]+)\s*[章节節回卷话話集部篇]')
+_CHAP_ARABIC_RE = re.compile(r'^\s*([0-9]+)\s*[\.、,，:：]')
+
+
+def _cn_to_int(s: str) -> int | None:
+    """常见中文数字（含十/百/千，如 十二/一百零三）→ int；解析失败返回 None。"""
+    if not s:
         return None
-    if authors:
-        return next(hit for hit, a in hits if _norm_author(a))
-    return hits[0][0]
+    if s.isdigit():
+        return int(s)
+    total, section, last_unit = 0, 0, 0
+    for ch in s:
+        if ch in _CN_DIGITS:
+            section = section * 10 + _CN_DIGITS[ch] if last_unit else _CN_DIGITS[ch]
+            last_unit = 0
+        elif ch in _CN_UNITS:
+            unit = _CN_UNITS[ch]
+            section = (section or 1) * unit
+            total += section
+            section = 0
+            last_unit = unit
+        else:
+            return None
+    return total + section
+
+
+def _toc_chapter_number(title: str) -> int | None:
+    """章节标题 → 章号（阿拉伯/中文数字，`第X章` 或行首 `12、`）；取不到返回 None，供逐章配对按章号对齐。"""
+    t = unicodedata.normalize('NFKC', (title or '')).strip()
+    m = _CHAP_NUM_RE.search(t)
+    if m:
+        return _cn_to_int(m.group(1))
+    m = _CHAP_ARABIC_RE.match(t)
+    if m:
+        return int(m.group(1))
+    return None
+
+
+# ---- 通用/辅助章节标题识别（M1 + §12）----
+# 上架感言/尾声/后记/公告 等非情节条目在两本**不同**书里也常一字不差，若参与 Jaccard 会把
+# 同名异书误并（rvauthcv M1 反例 C1/C2）。§12：改**子串归类**——只要章名（剥编号后）含下列
+# 任一子串即视为辅助项，不计入目录判据。带编号的「第1章 求月票 / 第2章 求推荐票」也照剔
+# （N1 反例 A），不再靠「有没有编号」区分。
+_AUX_TOC_SUBSTRINGS = (
+    '感言', '求票', '月票', '推荐票', '请假', '請假', '通知', '说明', '說明', '公告', '必看', '必看',
+    '预告', '預告', '番外', '楔子', '序', '引子', '后记', '後記', '尾声', '尾聲', '上架', '加更', '加更',
+    '新书', '新書', '感谢', '感謝', '完本', '完结', '完結', '声明', '聲明', '免责', '免責', '通告',
+    '寄语', '寄語', '作品相关', '作品相關', '正文',
+)
+# 停用表（整词兜底，与子串判据并用）。§12 修复建表 bug：原先用 `_norm_toc_title(w)` 建键，而
+# `_norm_toc_title('番外'/'序'/'楔子'/'引子'/'正文')` 会被 `_TOC_NUM_RE` 整词剥成空串 → 这些键
+# 根本没进表。改用**只去标点+casefold、不剥编号**的 `_norm_generic_toc_word` 建键，使其生效。
+_GENERIC_TOC_WORDS = (
+    '上架感言', '完本感言', '新书感言', '完结感言', '感言', '尾声', '尾章', '后记', '後記',
+    '前言', '引言', '引子', '序', '序章', '序言', '楔子', '请假条', '请假', '新书', '新書',
+    '公告', '通知', '上架', '完本', '完结', '完結', '感谢', '感謝', '作品相关', '作品相關',
+    '番外', '番外篇', '写在前面', '寫在前面', '内容简介', '內容簡介', '免责声明', '免責聲明',
+    '温馨提示', '溫馨提示', '作者的话', '作者的話', '关于', '關於', '说明', '說明', '声明', '聲明',
+    '正文',
+)
+
+
+def _norm_generic_toc_word(w: str) -> str:
+    """停用词归一：只去标点/空白 + casefold，**不剥编号前缀**（否则 番外/序/楔子/引子/正文 塌成空）。"""
+    return _TOC_PUNCT_RE.sub('', unicodedata.normalize('NFKC', w or '')).casefold()
+
+
+_GENERIC_TOC_NORM = frozenset(
+    t for t in (_norm_generic_toc_word(w) for w in _GENERIC_TOC_WORDS) if t)
+
+
+def _is_auxiliary_toc_name(name: str) -> bool:
+    """章名（剥编号后、已归一）是否辅助/通用条目（§12 子串归类 + 停用表兜底）。"""
+    if name in _GENERIC_TOC_NORM:
+        return True
+    return any(s in name for s in _AUX_TOC_SUBSTRINGS)
+
+
+def _informative_toc_titles(chapters) -> list[str]:
+    """章节列表 → **信息性正文章名**去编号后的有序列表（保序、含重复；§12）。
+
+    信息性章名判据（三者同时满足）：
+      (1) 前缀带章节编号（第X章/节/回/卷…、数字序号）——不带编号的辅助条目整条不参与；
+      (2) 去编号后章名长度 ≥ CONTENT_TOC_MIN_NAME_CHARS（<4 字信息量不足，不计）；
+      (3) 章名不含辅助子串、不落停用表（求月票/更新说明/番外/序… 按**子串**归类，
+          带编号的「第1章 求月票」也剔除，堵 N1）。
+    这样两本不同书至多共享辅助条目，真正共享的情节章名极少——配合 same_book 的交集下限
+    CONTENT_TOC_MIN_MATCH，同名异书无法靠通用/辅助标题打穿目录判据。"""
+    seq = []
+    for c in chapters:
+        if not isinstance(c, dict):
+            continue
+        had_numbering, name = _split_toc_numbering(c.get('title') or '')
+        if not (had_numbering and name):
+            continue
+        if len(name) < CONTENT_TOC_MIN_NAME_CHARS:
+            continue
+        if _is_auxiliary_toc_name(name):
+            continue
+        seq.append(name)
+    return seq
+
+
+def _lcs_ratio(a: list, b: list) -> float:
+    """两个序列的最长公共子序列长度 / 较短序列长度（有序对齐比率，0..1）。"""
+    if not a or not b:
+        return 0.0
+    m, n = len(a), len(b)
+    prev = [0] * (n + 1)
+    for i in range(1, m + 1):
+        cur = [0] * (n + 1)
+        ai = a[i - 1]
+        for j in range(1, n + 1):
+            cur[j] = prev[j - 1] + 1 if ai == b[j - 1] else max(prev[j], cur[j - 1])
+        prev = cur
+    return prev[n] / min(m, n)
+
+
+def _char_ngrams(text: str, n: int = CONTENT_NGRAM) -> set[str]:
+    """正文 → 字符 n-gram 集合：只留中日文与拉丁字母（去数字/标点/空白，抗排版噪声）。"""
+    s = _BODY_KEEP_RE.sub('', unicodedata.normalize('NFKC', text or '')).casefold()
+    if not s:
+        return set()
+    if len(s) <= n:
+        return {s}
+    return {s[i:i + n] for i in range(len(s) - n + 1)}
+
+
+def _jaccard(a: set, b: set) -> float:
+    if not a or not b:
+        return 0.0
+    return len(a & b) / len(a | b)
+
+
+def _cli_json(cli, subcommand: str, *args: str):
+    """调 CLI 子命令并解析 JSON；非零退出或坏 JSON → 抛 EngineUnavailable（不含凭据）。"""
+    proc = cli.run(subcommand, *args)
+    if proc.returncode != 0:
+        raise EngineUnavailable(f'引擎 {subcommand} rc={proc.returncode}: {_short_stderr(proc.stderr)}')
+    return json.loads(proc.stdout)
+
+
+# ---- 正文清洗（M2）：比对前剥掉站点模板/广告行，正文兜底才不被打穿 ----
+_BODY_DEDUPE_MIN_LINE = 20     # 只对这么长以上的行做跨章去重（对齐 labeler.DEDUPE_MIN_LINE）
+_LABELER_DROP_RULE = False     # False=未尝试；None=不可用；callable=labeler._drop_rule
+
+# §12/§13 正文模板模糊去重：逐章变化的模板（句中嵌章号/页码/日期，甚至嵌**汉字/字母变量**如
+# 「本章由手打组甲录入」）跨章既不「完全相同」、归一也覆盖不到（任意变量形态）。故改为**行级相似**：
+# 同一本书内，一行只要与**其他章**某行字符 bigram Jaccard ≥ 阈值即视为模板剔除，**无论在章内什么
+# 位置**（§13：不再只取每章边缘若干行——埋在中段的共享模板同样要剔）。性能用**倒排前缀过滤**：
+# 按行长度预筛（长度比 ≥_BODY_LEN_RATIO 才比）+ 按 bigram 文档频次排序、只索引每行最稀有的
+# 前缀 bigram，取候选后再精确校验 Jaccard——不做全量 O(n²)。去模板后**保留全部剩余正文行**
+# （不再按行长挑「最长前 N 段」——那会把长模板行顶成主体、丢掉短情节行），仅按字数封顶。
+_BODY_SIM_BIGRAM = 0.70        # 跨章模糊去重：字符 bigram Jaccard ≥ 此值 → 同一模板行
+_BODY_LEN_RATIO = 0.6          # 长度预筛：两行归一长度比 < 此值直接跳过（bigram Jaccard 不可能达标）
+_BODY_KEEP_MIN_RATIO = 0.30    # §13 结构兜底：某章去模板后剩余正文 < 原章字数此比例 → 该章不参与正文判同
+_BODY_MIN_CHAPTERS = 2         # §13 结构兜底：参与判同的章不足此数 → 正文不可判（与门下即不放行）
+_BODY_MAX_CHARS_PER_CHAPTER = 20000  # 每章参与指纹的正文字数上限（按前 N 字封顶，非按行长挑选）
+# §14 逐章一致：正文判同不再把参与章合并成一个指纹算一次 Jaccard（任何占住一部分正文的共享文本——
+# 模板、公版段落——都能把合并分抬过线）。改为**逐章配对**：两侧参与章按章号（可用时）否则按位置对齐，
+# 每对章单独算去模板后正文 n-gram Jaccard，≥CONTENT_BODY_JACCARD 记一对「匹配章对」；且这些匹配章对的
+# 正文须**互不相同**（防同一段复制到多章顶替多对证据）——同侧两匹配章的 n-gram Jaccard ≥ 此下限视为
+# 同一段，只算一份。至少 _BODY_MIN_PAIRS 个互异匹配章对，正文才判同；对齐后的章对不足 _BODY_MIN_PAIRS
+# → 正文不可判（与门下不放行）。
+_BODY_PAIR_DISTINCT = 0.60     # 匹配章对互异下限：同侧两匹配章 n-gram Jaccard ≥ 此值 → 视为同一段（不重复计数）
+_BODY_MIN_PAIRS = 2            # 放行所需的**互异**匹配章对数下限（<此数 → 正文不判同）
+
+
+def _line_bigrams(line: str) -> frozenset:
+    """行 → 字符 bigram 集合（只留中日文/拉丁，抗排版噪声）；<2 字返回单元素或空集。"""
+    s = _BODY_KEEP_RE.sub('', unicodedata.normalize('NFKC', line or '')).casefold()
+    if not s:
+        return frozenset()
+    if len(s) < 2:
+        return frozenset((s,))
+    return frozenset(s[i:i + 2] for i in range(len(s) - 1))
+
+
+def _norm_line(line: str) -> str:
+    """行归一（NFKC + 只留中日文/拉丁 + casefold），供短行「归一后完全相同」精确剔除用。"""
+    return _BODY_KEEP_RE.sub('', unicodedata.normalize('NFKC', line or '')).casefold()
+
+
+def _lines_similar(bg_a: frozenset, bg_b: frozenset) -> bool:
+    """两行 bigram 集合是否相似（Jaccard ≥ _BODY_SIM_BIGRAM）；带长度比预筛省算。"""
+    if not bg_a or not bg_b:
+        return False
+    lo, hi = sorted((len(bg_a), len(bg_b)))
+    if lo < hi * _BODY_LEN_RATIO:          # 长度差太大 → Jaccard 上界 lo/hi < 阈值，不可能相似
+        return False
+    return len(bg_a & bg_b) / len(bg_a | bg_b) >= _BODY_SIM_BIGRAM
+
+
+def _labeler_drop_rule():
+    """惰性取 labeler 的行级清洗规则（复用其广告/公告/求票判据）；不可用则返回 None。"""
+    global _LABELER_DROP_RULE
+    if _LABELER_DROP_RULE is False:
+        try:
+            import labeler
+            _LABELER_DROP_RULE = labeler._drop_rule
+        except Exception:
+            _LABELER_DROP_RULE = None
+    return _LABELER_DROP_RULE
+
+
+def _prefix_len(n: int) -> int:
+    """前缀过滤：Jaccard≥t 时两集合交集 ≥ t·max(|S|,|T|) ≥ t·|S|，故 S 落在交集外的元素
+    ≤ (1-t)|S|；只索引每行按文档频次升序排的前 |S|-⌈t·|S|⌉+1 个（最稀有）bigram，相似行必在
+    各自前缀里共享至少一个 bigram（前缀过滤定理），既取全候选又避开高频 bigram 的倒排爆炸。"""
+    return max(1, n - ceil(_BODY_SIM_BIGRAM * n) + 1)
+
+
+def _cross_chapter_template_lines(chapter_lines: list[list[str]]) -> set[str]:
+    """（保留供旧调用/测试）全行参与（§13）：返回本书内**与其他章某行模糊相似**
+    （bigram Jaccard≥_BODY_SIM_BIGRAM）的 ≥_BODY_DEDUPE_MIN_LINE 字长行**文本集合**。
+    §14 起模板剔除实际由 `_template_drop_index`（按位置精确定位，含短行拼块）承担；本函数
+    仅为兼容旧断言保留，只覆盖「长行」维度。"""
+    drops = _template_drop_index(chapter_lines)
+    out: set[str] = set()
+    for ci, lines in enumerate(chapter_lines):
+        for li, ln in enumerate(lines):
+            if len(ln) >= _BODY_DEDUPE_MIN_LINE and (ci, li) in drops:
+                out.add(ln)
+    return out
+
+
+def _chapter_segments(lines: list[str]) -> list[tuple[str, tuple[int, ...]]]:
+    """把一章行序列切成参与跨章模板比对的**段**：
+      - ≥_BODY_DEDUPE_MIN_LINE 字的长行 → 单独成段；
+      - 连续的 <_BODY_DEDUPE_MIN_LINE 字短行 → 按序拼成块，块原始长度 ≥_BODY_DEDUPE_MIN_LINE 才成段
+        （§14 必修：站点水印/底纹常被硬折成短行逃过行级检测，拼块后一起做跨章模板检测）。
+    返回 [(seg_text, (line_idx,...)), ...]（seg_text 供 bigram/精确比对，line_idx 供命中后剔除原始行）。"""
+    segs: list[tuple[str, tuple[int, ...]]] = []
+    buf: list[str] = []
+    buf_idx: list[int] = []
+
+    def flush():
+        if buf:
+            text = ''.join(buf)
+            if len(text) >= _BODY_DEDUPE_MIN_LINE:
+                segs.append((text, tuple(buf_idx)))
+        buf.clear()
+        buf_idx.clear()
+
+    for i, ln in enumerate(lines):
+        if len(ln) >= _BODY_DEDUPE_MIN_LINE:
+            flush()
+            segs.append((ln, (i,)))
+        else:
+            buf.append(ln)
+            buf_idx.append(i)
+    flush()
+    return segs
+
+
+def _template_drop_index(chapter_lines: list[list[str]]) -> set[tuple[int, int]]:
+    """跨章模板/串章/分页重叠识别（§13 全行参与 + §14 短行拼块）→ 需剔除的 (章号, 行号) 集合。
+      (1) 段级（长行 + 短行拼块）：段文本在 ≥2 章出现（精确）或与**其他章**某段 bigram Jaccard≥
+          _BODY_SIM_BIGRAM（模糊，倒排前缀过滤避免 O(n²)）→ 该段构成的原始行全部剔；
+      (2) 独立短行：<_BODY_DEDUPE_MIN_LINE 字的行，归一后完全相同且出现在 ≥2 章 → 精确剔
+          （§14 必修：短行水印即便未连成块也剔）。"""
+    segs: list[dict] = []
+    for ci, lines in enumerate(chapter_lines):
+        for text, idxs in _chapter_segments(lines):
+            segs.append({'ci': ci, 'idx': idxs, 'bg': _line_bigrams(text), 'text': text})
+    template_ids: set[int] = set()
+    # (1a) 段文本精确跨章重复
+    text_chapters: dict[str, set[int]] = defaultdict(set)
+    for s in segs:
+        text_chapters[s['text']].add(s['ci'])
+    for i, s in enumerate(segs):
+        if len(text_chapters[s['text']]) >= 2:
+            template_ids.add(i)
+    # (1b) 单章唯一的段建倒排前缀过滤，跨章模糊相似 → 模板
+    fuzzy = [i for i, s in enumerate(segs) if i not in template_ids and s['bg']]
+    df: dict[str, int] = defaultdict(int)
+    for i in fuzzy:
+        for b in segs[i]['bg']:
+            df[b] += 1
+    index: dict[str, list[int]] = defaultdict(list)
+    prefixes: dict[int, frozenset] = {}
+    for i in fuzzy:
+        bg = segs[i]['bg']
+        pref = frozenset(sorted(bg, key=lambda b: (df[b], b))[:_prefix_len(len(bg))])
+        prefixes[i] = pref
+        for b in pref:
+            index[b].append(i)
+    for i in fuzzy:
+        if i in template_ids:
+            continue
+        s = segs[i]
+        na = len(s['bg'])
+        seen: set[int] = set()
+        hit = False
+        for b in prefixes[i]:
+            for j in index[b]:
+                if j == i or j in seen:
+                    continue
+                seen.add(j)
+                o = segs[j]
+                if o['ci'] == s['ci']:
+                    continue                            # 同章不算跨章模板
+                nb = len(o['bg'])
+                lo, hi = (na, nb) if na <= nb else (nb, na)
+                if lo < hi * _BODY_LEN_RATIO:
+                    continue
+                if len(s['bg'] & o['bg']) / len(s['bg'] | o['bg']) >= _BODY_SIM_BIGRAM:
+                    template_ids.add(i)
+                    template_ids.add(j)
+                    hit = True
+                    break
+            if hit:
+                break
+    drops: set[tuple[int, int]] = set()
+    for i in template_ids:
+        for li in segs[i]['idx']:
+            drops.add((segs[i]['ci'], li))
+    # (2) 独立短行：归一后完全相同且出现在 ≥2 章 → 精确剔
+    short_locs: dict[str, list[tuple[int, int]]] = defaultdict(list)
+    short_chaps: dict[str, set[int]] = defaultdict(set)
+    for ci, lines in enumerate(chapter_lines):
+        for li, ln in enumerate(lines):
+            if len(ln) < _BODY_DEDUPE_MIN_LINE:
+                nm = _norm_line(ln)
+                if nm:
+                    short_locs[nm].append((ci, li))
+                    short_chaps[nm].add(ci)
+    for nm, chaps in short_chaps.items():
+        if len(chaps) >= 2:
+            drops.update(short_locs[nm])
+    return drops
+
+
+def _clean_body_chapters(parts: list[str]) -> list[str | None]:
+    """章正文列表 → 每章去模板后的干净正文（保序）；某章去模板后为空或剩余 < 原章字数
+    _BODY_KEEP_MIN_RATIO → None（该章不参与判同）。§13/§14：
+      (1) 跨章模板/短行水印剔除（`_template_drop_index`，按位置精确剔，含短行拼块与短行精确剔）；
+      (2) 复用 labeler 行级清洗 `_drop_rule` 剔广告/公告/求票行（best-effort）；
+      (3) 保留全部剩余正文行（保序、不按行长挑选），仅按 _BODY_MAX_CHARS_PER_CHAPTER 封顶。"""
+    chapter_lines = [[ln.strip() for ln in re.split(r'[\r\n]+', p) if ln.strip()] for p in parts]
+    drops = _template_drop_index(chapter_lines)
+    drop_rule = _labeler_drop_rule()
+    out: list[str | None] = []
+    for ci, lines in enumerate(chapter_lines):
+        orig_chars = sum(len(ln) for ln in lines)
+        kept: list[str] = []
+        for li, ln in enumerate(lines):
+            if (ci, li) in drops:
+                continue                                # 跨章模板 / 短行水印，剔
+            if drop_rule is not None:
+                try:
+                    if drop_rule(ln):
+                        continue                        # labeler 判为广告/公告/求票
+                except Exception:
+                    pass
+            kept.append(ln)
+        kept_chars = sum(len(ln) for ln in kept)
+        if not kept or (orig_chars and kept_chars < orig_chars * _BODY_KEEP_MIN_RATIO):
+            out.append(None)                            # §13：该章去模板后剩余不足 → 不参与判同
+        else:
+            out.append('\n'.join(kept)[:_BODY_MAX_CHARS_PER_CHAPTER])  # 按字数封顶
+    return out
+
+
+def _clean_body_parts(parts: list[str]) -> tuple[str, int]:
+    """（兼容口径）章正文列表 → (去模板后的合并正文, 参与判同的章数)。逐章清洗见
+    `_clean_body_chapters`；合并文本仅供旧断言/日志，判同已改逐章配对（§14 `_body_decides`）。"""
+    chaps = _clean_body_chapters(parts)
+    kept = [c for c in chaps if c is not None]
+    return '\n'.join(kept), len(kept)
+
+
+def fetch_content_fingerprint(cli, book_url: str,
+                              max_chapters: int = CONTENT_MAX_CHAPTERS,
+                              cache: dict | None = None) -> dict | None:
+    """取候选的内容指纹 {'toc': set[标题], 'body': set[n-gram]}；取不到返回 None。
+
+    成本受控（N1）：目录 1 次 + **最多发起 max_chapters 次 content 调用**（按实际发起次数封顶，
+    而非按收到 >100 字的章数——否则前若干章都是公告/空壳短章时会逐章发请求、远超预期）。
+    cache（{url: 指纹}）在一次搜索内复用，同一 URL 不重复取文。任何异常（源失效/坏 JSON/
+    超时）→ None（比对方按「无指纹」处理，绝不因取文失败而误判同书）。"""
+    if cache is not None and book_url in cache:
+        return cache[book_url]
+    fp: dict | None = None
+    try:
+        toc = _cli_json(cli, 'toc', '--url', book_url) or {}
+        chapters = toc.get('chapters') or []
+        toc_seq = _informative_toc_titles(chapters)      # M1：有序、去通用标题、去编号空串
+        body_parts: list[str] = []
+        body_nums: list[int | None] = []                 # §14：各参与章的章号（供逐章配对按章号对齐）
+        content_calls = 0
+        for ch in chapters:
+            if content_calls >= max_chapters:     # N1：按实际发起的 content 调用次数封顶
+                break
+            if not isinstance(ch, dict):
+                continue
+            ch_url = ch.get('url') or ''
+            if not ch_url:
+                continue
+            content_calls += 1
+            try:
+                text = (_cli_json(cli, 'content', '--url', ch_url) or {}).get('text') or ''
+            except Exception:
+                text = ''
+            if len(text) > 100:
+                body_parts.append(text)
+                body_nums.append(_toc_chapter_number(ch.get('title') or ''))
+        cleaned = _clean_body_chapters(body_parts)        # M2/§13/§14：逐章去模板（含短行拼块）
+        by_chapter = [{'num': body_nums[i], 'ngrams': _char_ngrams(txt), 'chars': len(txt)}
+                      for i, txt in enumerate(cleaned) if txt is not None]
+        merged = '\n'.join(txt for txt in cleaned if txt is not None)   # 仅供合并口径日志/旧断言
+        fp = {'toc': toc_seq, 'body': _char_ngrams(merged),
+              'body_chars': len(merged), 'body_chapters': len(by_chapter),
+              'body_by_chapter': by_chapter}
+    except Exception:
+        fp = None
+    if cache is not None:
+        cache[book_url] = fp
+    return fp
+
+
+def _toc_decides(fp_a: dict, fp_b: dict) -> tuple[bool, bool, float, float]:
+    """目录信号：返回 (judgeable, same, toc_jaccard, lcs)。
+
+    judgeable=False 表示目录信息不足、**不可判**（信息性章名太少/字符量不足/交集不够）。
+    §12 绝对量门槛：除 Jaccard/LCS 外，两侧**交集**的信息性章名互异数须 ≥ CONTENT_TOC_MIN_MATCH——
+    同名异书至多共享辅助条目，真正共享 ≥5 个情节章名的概率极低，靠加词的停用表堵不住、靠这道
+    交集下限才堵得住。judgeable 时才比 Jaccard≥CONTENT_TOC_JACCARD 且有序 LCS≥CONTENT_TOC_LCS。"""
+    seq_a, seq_b = fp_a.get('toc') or [], fp_b.get('toc') or []
+    set_a, set_b = set(seq_a), set(seq_b)
+    toc_sim = _jaccard(set_a, set_b)
+    inter = len(set_a & set_b)
+    info_chars = min(sum(len(t) for t in set_a), sum(len(t) for t in set_b))
+    judgeable = (min(len(set_a), len(set_b)) >= CONTENT_TOC_MIN_TITLES
+                 and info_chars >= CONTENT_TOC_MIN_CHARS
+                 and inter >= CONTENT_TOC_MIN_MATCH)
+    if not judgeable:
+        return False, False, toc_sim, 0.0
+    lcs = _lcs_ratio(seq_a[:CONTENT_TOC_LCS_N], seq_b[:CONTENT_TOC_LCS_N])
+    same = toc_sim >= CONTENT_TOC_JACCARD and lcs >= CONTENT_TOC_LCS
+    return True, same, toc_sim, lcs
+
+
+def same_book(fp_a: dict | None, fp_b: dict | None) -> tuple[bool, dict]:
+    """两个内容指纹是否同一本书 → (bool, sim)。
+
+    §12 **双信号与门**：放行必须「目录判同」`_toc_decides` **且**「正文判同」`_body_decides`
+    两者同时成立。任一「不可判」（目录信息性章名不足/交集 <CONTENT_TOC_MIN_MATCH、正文字数不足、
+    取文失败/无指纹）→ 一律不放行。删除了「目录不可判就只看正文」「只凭目录」的单信号放行路径——
+    每个单信号都可能被站点噪声（通用标题、模板正文）单独抬过阈值，双信号与门要求两条证据齐备。
+    原则：宁可少救，不可误放。sim 里 toc_ok/body_ok 分别记两信号是否「可判且判同」。"""
+    empty = {'toc': 0.0, 'lcs': 0.0, 'body': 0.0, 'toc_ok': False, 'body_ok': False, 'basis': 'none'}
+    if not fp_a or not fp_b:
+        return False, empty
+    toc_judgeable, toc_same, toc_sim, lcs = _toc_decides(fp_a, fp_b)
+    body_judgeable, body_same, body_sim, body_pairs = _body_decides(fp_a, fp_b)
+    toc_ok = toc_judgeable and toc_same
+    body_ok = body_judgeable and body_same
+    released = toc_ok and body_ok
+    return released, {'toc': toc_sim, 'lcs': lcs, 'body': body_sim, 'body_pairs': body_pairs,
+                      'toc_ok': toc_ok, 'body_ok': body_ok,
+                      'basis': 'toc+body' if released else 'none'}
+
+
+def _align_chapter_pairs(fp_a: dict, fp_b: dict) -> list[tuple[set, set]]:
+    """两侧参与章按章号（两侧章号都齐全且无重号时）否则按位置对齐 → [(ngrams_a, ngrams_b), ...]（§14）。"""
+    ca = fp_a.get('body_by_chapter') or []
+    cb = fp_b.get('body_by_chapter') or []
+    na = [c.get('num') for c in ca]
+    nb = [c.get('num') for c in cb]
+    if (na and nb and all(n is not None for n in na) and all(n is not None for n in nb)
+            and len(set(na)) == len(na) and len(set(nb)) == len(nb)):
+        mb = {c['num']: c for c in cb}
+        return [(c['ngrams'], mb[c['num']]['ngrams']) for c in ca if c['num'] in mb]
+    return [(ca[i]['ngrams'], cb[i]['ngrams']) for i in range(min(len(ca), len(cb)))]
+
+
+def _body_decides(fp_a: dict, fp_b: dict) -> tuple[bool, bool, float, int]:
+    """正文信号（M2 + §12/§13 + §14 逐章一致）：返回 (judgeable, same, 代表相似度, 互异匹配章对数)。
+
+    §14：删除「参与章合并成一个指纹算一次 Jaccard」路径——共享模板/公版段落只要占住一部分正文就能把
+    合并分抬过线。改为**逐章配对**：两侧参与章按章号（可用）否则按位置对齐，每对章单独算去模板后正文
+    n-gram Jaccard，≥CONTENT_BODY_JACCARD 记一「匹配章对」；再要求匹配章对的正文**互不相同**（同侧两
+    匹配章 n-gram Jaccard≥_BODY_PAIR_DISTINCT 视为同一段、只算一份，防同段复制到多章）。
+    judgeable：两边去模板后正文都 ≥CONTENT_MIN_BODY_CHARS 字、两边参与章都 ≥_BODY_MIN_CHAPTERS、
+    且对齐后的章对 ≥_BODY_MIN_CHAPTERS——否则「不可判」。same：互异匹配章对 ≥_BODY_MIN_PAIRS。"""
+    pairs = _align_chapter_pairs(fp_a, fp_b)
+    judgeable = (min(fp_a.get('body_chars', 0), fp_b.get('body_chars', 0)) >= CONTENT_MIN_BODY_CHARS
+                 and min(fp_a.get('body_chapters', 0), fp_b.get('body_chapters', 0)) >= _BODY_MIN_CHAPTERS
+                 and len(pairs) >= _BODY_MIN_CHAPTERS)
+    sims = [_jaccard(pa, pb) for pa, pb in pairs]
+    rep = max(sims) if sims else 0.0
+    if not judgeable:
+        return False, False, rep, 0
+    # 匹配章对（每对各≥阈值）+ 互异去重（同侧不重复计同一段）
+    kept_a: list[set] = []
+    kept_b: list[set] = []
+    distinct = 0
+    for (pa, pb), j in zip(pairs, sims):
+        if j < CONTENT_BODY_JACCARD:
+            continue
+        if any(_jaccard(pa, ka) >= _BODY_PAIR_DISTINCT for ka in kept_a):
+            continue                                     # 与已计入的匹配章 A 侧同段 → 不重复计
+        if any(_jaccard(pb, kb) >= _BODY_PAIR_DISTINCT for kb in kept_b):
+            continue                                     # B 侧同段 → 不重复计
+        kept_a.append(pa)
+        kept_b.append(pb)
+        distinct += 1
+    return True, (distinct >= _BODY_MIN_PAIRS), rep, distinct
+
+
+def _cluster_by_content(cli, reps: list[dict], cache: dict) -> tuple[list[list[int]], dict]:
+    """reps 两两 same_book → 单链并查集聚类。返回 (簇列表[下标], 最高相似度信息)。"""
+    fps = [fetch_content_fingerprint(cli, r['hit']['url'], cache=cache) for r in reps]
+    n = len(reps)
+    parent = list(range(n))
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    best = {'toc': 0.0, 'body': 0.0, 'body_pairs': 0, 'basis': 'none'}
+    for i in range(n):
+        for j in range(i + 1, n):
+            ok, sim = same_book(fps[i], fps[j])
+            if max(sim['toc'], sim['body']) > max(best['toc'], best['body']):
+                best = sim
+            if ok:
+                parent[find(i)] = find(j)
+    clusters: dict[int, list[int]] = {}
+    for i in range(n):
+        clusters.setdefault(find(i), []).append(i)
+    return list(clusters.values()), best
+
+
+def _distinct_author_reps(unknown_hits: list[tuple[dict, str]]) -> list[dict]:
+    """按归一化作者去重取代表（作者已知优先），上限 CONTENT_MAX_CANDIDATES。"""
+    reps, seen = [], set()
+    for hit, a in unknown_hits:
+        key = _norm_author(a)
+        if key and key not in seen:
+            seen.add(key)
+            reps.append({'hit': hit, 'author': a})
+    return reps[:CONTENT_MAX_CANDIDATES]
+
+
+def _content_rescue_unknown(cli, title: str,
+                            unknown_hits: list[tuple[dict, str]]) -> dict | None:
+    """名单无作者、判歧义时用内容比对救回：候选内容聚为**唯一主簇**才放行，返回代表 hit
+    （作者已知优先，供 label 阶段 toc 回写作者）；多簇/无法判定/作者过多 → None（维持跳过）。"""
+    _, ambiguous, authors = _author_unknown_decision(unknown_hits)
+    if not ambiguous:
+        return None                       # 非歧义：交常规路径，不额外取文
+    if len(authors) > CONTENT_MAX_CANDIDATES:
+        return None                       # 候选作者过多（同名书泛滥）：不试，维持跳过
+    reps = _distinct_author_reps(unknown_hits)
+    if len(reps) < 2:
+        return None
+    clusters, best = _cluster_by_content(cli, reps, cache={})
+    if len(clusters) != 1:                # 未聚成唯一主簇 → 维持跳过
+        return None
+    known = [r for r in reps if _norm_author(r['author'])]
+    chosen = known[0] if known else reps[0]
+    print(f'  内容比对放行: 《{title}》名单无作者，{len(reps)} 个候选内容聚为一簇'
+          f'（双信号 目录≈{best["toc"]:.2f}/正文≈{best["body"]:.2f}，{best.get("body_pairs", 0)} 对互异章），采信作者 {chosen["author"] or "（引擎待定）"}'
+          f'，参照源 {chosen["hit"].get("source", "")}（content_match）')
+    hit = chosen['hit']
+    if chosen['author']:                  # M3：把采信作者回带到 hit，供条目 author 回写（不写污染串）
+        hit['author'] = chosen['author']
+    # §14 审计标记：经内容比对救回的条目透出诊断，供 _resolve_candidates 写入 entry
+    # （author_source=content_match + content_match:{toc, body_pairs, basis}），日后按标记抽查/回滚。
+    hit['content_match'] = {'toc': round(best.get('toc', 0.0), 4),
+                            'body_pairs': best.get('body_pairs', 0),
+                            'basis': best.get('basis', 'toc+body')}
+    return hit
+
+
+def _attach_unknown_author(hit: dict | None, unknown_hits: list[tuple[dict, str]]) -> dict | None:
+    """把名单无作者路径选中 hit 所对应的候选作者回带到 hit['author']（M3，供条目 author 回写）。"""
+    if hit is None:
+        return None
+    for h, a in unknown_hits:
+        if (h is hit or h.get('url') == hit.get('url')) and a:
+            hit['author'] = a
+            break
+    return hit
+
+
+def _annotate_bogus(hit: dict | None, bogus_raw: str) -> dict | None:
+    """§7/M3：污染降级来源的 hit 打标记 + 存原串（仅诊断），供 _resolve_candidates 置空条目 author。"""
+    if hit is not None and bogus_raw:
+        hit['list_author_bogus'] = True
+        hit['list_author_raw'] = bogus_raw
+    return hit
+
 
 
 # ---- 换源备选（giveup41）----
@@ -1012,6 +1794,17 @@ def _resolve_candidates(candidates: list[dict], http_get, origin: str = '',
                      'douban_url': b.get('douban_url', ''),
                      'engine': True,
                      'source_host': engine_hit['source']}
+            # M3：名单作者被污染而降级的条目——author 绝不能是污染原串。原串仅存 list_author_raw
+            # 供诊断；condition author 取内容比对/唯一候选采信的候选作者（无则空，交 labeler toc 回写/review）。
+            if engine_hit.get('list_author_bogus'):
+                entry['list_author_raw'] = engine_hit.get('list_author_raw') or b.get('author', '')
+                entry['author'] = engine_hit.get('author') or ''
+            # §14 审计标记：经内容比对救回（作者不符/无作者被内容比对放行）的条目打标，
+            # 供日后按标记抽查与回滚。诊断字段不入库表——import 两条路径（import_one.validate_record /
+            # import_labels.mjs）都按已知字段名 .get 读取，未知顶层字段被忽略、不拒收。
+            if engine_hit.get('content_match'):
+                entry['author_source'] = 'content_match'
+                entry['content_match'] = engine_hit['content_match']
             if engine_hit.get('alternates'):
                 # giveup41：主源整站失效时打标阶段按序换用（labeler.fetch_engine_book_with_giveup）
                 entry['engine_alternates'] = engine_hit['alternates']
