@@ -78,6 +78,19 @@ class TestBackfill17kAuthors(unittest.TestCase):
             written, _ = self._run([bad], str(d / 'l.jsonl'))
         self.assertEqual(written, [])
 
+    def test_resolve_engine_author_reuses_clean_engine_author(self):
+        # rvauthor CE5：backfill 的引擎作者解析必须与 labeler 回写走同一套清洗，
+        # 否则同一 toc 值两路径写出不同 author_key → 同一本书第二行。
+        import labeler
+        orig = labeler._engine_json
+        labeler._engine_json = lambda cli, sub, *a: {'author': '作者：唐家三少 著'}
+        try:
+            got = bf.resolve_engine_author(object(), 'https://src.example.com/b/1')
+        finally:
+            labeler._engine_json = orig
+        self.assertEqual(got, labeler._clean_engine_author('作者：唐家三少 著'))
+        self.assertEqual(got, '唐家三少')
+
 
 import tempfile           # noqa: E402
 

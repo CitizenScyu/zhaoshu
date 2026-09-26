@@ -22,6 +22,7 @@ import re
 import subprocess
 import sys
 import time
+import unicodedata
 import urllib.parse
 from pathlib import Path
 
@@ -161,7 +162,18 @@ def _norm_author(s: str) -> str:
     return text
 
 
-# ---- 作者比对（authfix41：归一化严格相等之外，补三条「结构差」规则）----
+# 占位作者（非真实署名）：对齐 src/lib/source-parser.ts knownSourceAuthor 的 {佚名/未知/未知作者}，
+# 再并入常见的 暂无/匿名/无名氏。归一化（NFKC+去空白+casefold）后命中即视同空作者
+# （回写不写、身份键不参与匹配）。
+_PLACEHOLDER_AUTHORS = frozenset({
+    '佚名', '未知', '未知作者', '暂无', '暂无作者', '匿名', '无名氏', '佚名氏', '无',
+})
+
+
+def is_placeholder_author(value: str) -> bool:
+    """作者是否为占位串（视同空作者：不回写、不参与孪生/身份判定）。"""
+    norm = re.sub(r'\s+', '', unicodedata.normalize('NFKC', (value or '').strip())).casefold()
+    return norm == '' or norm in _PLACEHOLDER_AUTHORS
 # authmis41 对 phoenix 393 行「作者不符跳过」分类：归一化真漏配只剩结构差——
 #   引擎多署名串：「马伯庸著 刘巴布编绘」「软星科技原著 执笔：苏末那」；
 #   非前导括号注：「[美]斯蒂芬·金（Stephen King）」；

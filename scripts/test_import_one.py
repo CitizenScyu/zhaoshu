@@ -396,6 +396,34 @@ class TestFindTwin(unittest.TestCase):
         self.assertIsNone(import_one.find_twin([], '作者'))
         self.assertIsNone(import_one.find_twin(None, '作者'))
 
+    def test_loose_key_catches_variant_writings_as_twin(self):
+        # rvauthor CE1/CE1b：繁简/中点/国籍段/尾缀「著」/前导「作者：」/名内空格异体 →
+        # 存量与回写身份键不同（UPSERT 撞不上）但是同一人 → 必须判孪生，避免凭空第二行
+        for label, stored, incoming in (
+                ('繁简', '黃易', '黄易'),
+                ('中点/点号', 'J.K.罗琳', 'J·K·罗琳'),
+                ('国籍段', '（美）乔治·奥威尔', '乔治·奥威尔'),
+                ('尾缀著', '唐家三少 著', '唐家三少'),
+                ('前导作者：', '作者：风凌天下', '风凌天下'),
+                ('名内空格', '唐家 三少', '唐家三少')):
+            with self.subTest(label=label):
+                row = {'id': 3, 'author': stored}
+                self.assertEqual(import_one.find_twin([row], incoming), row)
+
+    def test_loose_key_keeps_distinct_authors_distinct(self):
+        # 写法不同但确实是不同的人 → 不判孪生（同名异书照常入库）
+        self.assertIsNone(import_one.find_twin([{'id': 3, 'author': '唐家三少'}], '土豆'))
+        self.assertIsNone(import_one.find_twin([{'id': 3, 'author': '金庸'}], '金庸新'))
+
+    def test_placeholder_author_is_not_matched_by_loose_key(self):
+        # 占位作者宽松键为空 → 不与任何行判孪生
+        self.assertIsNone(import_one.find_twin([{'id': 3, 'author': '佚名'}], '未知'))
+
+    def test_traditional_map_two_strings_aligned(self):
+        # 繁简小表两串必须等长且逐位对应（防手工错位把不同简体字并到一起）
+        self.assertEqual(len(import_one._TRAD), len(import_one._SIMP))
+        self.assertEqual(len(set(import_one._TRAD)), len(import_one._TRAD))  # 繁体侧无重复键
+
 
 # ---- AutoImporter：幂等 / 失败不阻断 / 标记 ----
 class TestAutoImporter(TempDirCase):
@@ -654,6 +682,21 @@ class TestAutoImporter(TempDirCase):
                      author_source='engine_toc')
         self.assertEqual(importer.import_record(rec), 'twin-skipped')
         self.assertEqual(len(db.rows), 1)
+
+    def test_engine_toc_writeback_variant_writing_no_second_row(self):
+        """rvauthor CE1 端到端：库内 '黃易'（繁体），回写 '黄易'（简体）——身份键不同、
+        UPSERT 撞不上，但宽松孪生键相同 → twin-skipped，库里仍 1 行（不再凭空多一行）。"""
+        for stored, incoming in (('黃易', '黄易'), ('唐家三少 著', '唐家三少'),
+                                 ('（美）乔治·奥威尔', '乔治·奥威尔')):
+            with self.subTest(stored=stored):
+                db = FakeDb()
+                db.seed('异体书', stored)
+                importer = self.importer(db)
+                rec = record(title='异体书', site_title='异体书', author=incoming,
+                             author_source='engine_toc',
+                             url='https://book15.net/books/details-variant.html')
+                self.assertEqual(importer.import_record(rec), 'twin-skipped')
+                self.assertEqual(len(db.rows), 1)
 
     def test_review_records_are_not_imported(self):
         db = FakeDb()

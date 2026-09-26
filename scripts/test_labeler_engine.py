@@ -274,23 +274,44 @@ class TestEngineTocAuthorWriteback(unittest.TestCase):
         return _proc(0, json.dumps(out, ensure_ascii=False))
 
     def test_writeback_applies_when_list_author_empty(self):
-        self.assertEqual(labeler.engine_author_writeback('', '唐家三少'), '唐家三少')
+        # 名单作者空 + 书名完全相等 + toc 作者非空 → 回写
+        self.assertEqual(labeler.engine_author_writeback('', '唐家三少', '斗罗大陆', '斗罗大陆'),
+                         '唐家三少')
 
     def test_no_writeback_when_list_author_present(self):
         # 名单有作者 → 恒不回写（行为完全不变）
-        self.assertEqual(labeler.engine_author_writeback('金庸', '唐家三少'), '')
+        self.assertEqual(labeler.engine_author_writeback('金庸', '唐家三少', '书', '书'), '')
 
     def test_no_writeback_when_toc_author_empty(self):
-        self.assertEqual(labeler.engine_author_writeback('', ''), '')
-        self.assertEqual(labeler.engine_author_writeback('', '作者：'), '')  # 只有标签→清洗成空
+        self.assertEqual(labeler.engine_author_writeback('', '', '书', '书'), '')
+        self.assertEqual(labeler.engine_author_writeback('', '作者：', '书', '书'), '')  # 只标签→清洗空
 
     def test_writeback_normalizes_label_and_suffix(self):
         # 带「作者：」前缀 / 「著」尾缀被剥；保留大小写与「·」（不做身份比对式强归一）
-        self.assertEqual(labeler.engine_author_writeback('', '作者：唐家三少 著'), '唐家三少')
-        self.assertEqual(labeler.engine_author_writeback('', '乔治·奥威尔'), '乔治·奥威尔')
+        self.assertEqual(labeler.engine_author_writeback('', '作者：唐家三少 著', '书', '书'), '唐家三少')
+        self.assertEqual(labeler.engine_author_writeback('', '乔治·奥威尔', '书', '书'), '乔治·奥威尔')
 
-    def test_toc_author_exposed_in_stats_on_success(self):
-        # 身份校验通过 → toc_author 进 stats，供记录组装层回写
+    def test_no_writeback_when_only_prefix_compatible_title(self):
+        # rvauthor CE3：书名只前缀兼容（可能是另一本书）→ 不回写，保持作者空进 review
+        self.assertEqual(
+            labeler.engine_author_writeback('', '另一作者', '万古仙穹', '万古仙穹外传'), '')
+        # 完全相等才回写
+        self.assertEqual(
+            labeler.engine_author_writeback('', '观棋', '万古仙穹', '万古仙穹'), '观棋')
+
+    def test_no_writeback_when_toc_title_missing(self):
+        # 源未自报 toc 标题 → 无从确认完全相等 → 不回写（保守）
+        self.assertEqual(labeler.engine_author_writeback('', '观棋', '万古仙穹', ''), '')
+
+    def test_no_writeback_for_placeholder_author(self):
+        # rvauthor 建议 4：占位作者视同空作者，不回写
+        for a in ('佚名', '未知', '未知作者', '暂无', '匿名'):
+            with self.subTest(a=a):
+                self.assertEqual(labeler.engine_author_writeback('', a, '书', '书'), '')
+                self.assertEqual(labeler._clean_engine_author(a), '')
+
+    def test_toc_author_and_title_exposed_in_stats_on_success(self):
+        # 身份校验通过 → toc_author/toc_title 进 stats，供记录组装层回写
         cli = FakeEngineCli(
             lambda sub, url: self._toc_proc('斗罗大陆', '作者：唐家三少')
             if sub == 'toc' else _content('正' * 200))
@@ -298,8 +319,23 @@ class TestEngineTocAuthorWriteback(unittest.TestCase):
         labeler.fetch_book_text_engine(cli, 'https://y/x',
                                        expect_title='斗罗大陆', stats=stats)
         self.assertEqual(stats.get('toc_author'), '作者：唐家三少')
-        # 组装层清洗后回写
-        self.assertEqual(labeler.engine_author_writeback('', stats['toc_author']), '唐家三少')
+        self.assertEqual(stats.get('toc_title'), '斗罗大陆')
+        # 组装层清洗 + 书名相等校验后回写
+        self.assertEqual(
+            labeler.engine_author_writeback('', stats['toc_author'], '斗罗大陆', stats['toc_title']),
+            '唐家三少')
+
+    def test_no_toc_author_in_stats_on_identity_mismatch(self):
+        # 身份不符 → 抛异常、stats 里不出现 toc_author（记录组装根本不会执行 → 不回写）
+        cli = FakeEngineCli(
+            lambda sub, url: self._toc_proc('斗破苍穹', '别人') if sub == 'toc'
+            else _content('正' * 200))
+        stats = {}
+        with self.assertRaises(labeler.EngineIdentityMismatch):
+            labeler.fetch_book_text_engine(cli, 'https://y/x',
+                                           expect_title='斗破苍穹',
+                                           expect_author='天蚕土豆', stats=stats)
+        self.assertNotIn('toc_author', stats)
 
     def test_no_toc_author_in_stats_on_identity_mismatch(self):
         # 身份不符 → 抛异常、stats 里不出现 toc_author（记录组装根本不会执行 → 不回写）

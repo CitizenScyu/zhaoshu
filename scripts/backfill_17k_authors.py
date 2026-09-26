@@ -80,13 +80,14 @@ def build_17k_author_map(http_get):
 
 
 def resolve_engine_author(engine_cli, url):
-    """引擎 toc 自报作者（失败/空 → ''，可降级不抛）。"""
+    """引擎 toc 自报作者，经与 labeler 回写路径**同一套**清洗（rvauthor CE5：两路径口径必须一致，
+    否则同一本书写出不同 author_key → 第二行）。失败/空/占位 → ''（可降级不抛）。"""
     if not engine_cli or not url or not douban_list.engine_url_supported(url):
         return ''
     try:
         import labeler
         toc = labeler._engine_json(engine_cli, 'toc', '--url', url)
-        return (toc.get('author') or '').strip()
+        return labeler._clean_engine_author(toc.get('author') or '')
     except Exception:                       # noqa: BLE001 —— 补作者失败只降级，不影响其余行
         return ''
 
