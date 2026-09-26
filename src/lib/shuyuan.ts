@@ -11,7 +11,7 @@ import {
   defaultAdmissionTransport, runAdmissionBatch,
   type AdmissionCandidate, type AdmissionSourceRow,
 } from '@/lib/rule-engine/admission';
-import { selectCandidates, type RawSource } from '@/lib/rule-engine/compile-smoke';
+import { enginePostSearchEnabled, selectCandidates, type RawSource } from '@/lib/rule-engine/compile-smoke';
 import { DEFAULT_SHUYUAN_READ_CACHE_TTL_MS, shuyuanReadCacheTtlMs } from '@/lib/read-cache-ttl';
 import {
   FILTER_COUNT_KEYS, SOURCE_PAGE_SIZE, offsetFor, pageCount,
@@ -1267,9 +1267,11 @@ async function runAdmissionAfterRefresh(
   }
   const candidates: AdmissionCandidate[] = [];
   const surveyRejected: AdmissionCandidate[] = [];
+  // 41-admpost F2：准入候选筛与 compileAdmission 用同一开关/判据；flag 开时 POST 源同步进候选评估环。
+  const postSearch = enginePostSearchEnabled();
   for (const row of rows) {
     const source = row.source as RawSource;
-    (selectCandidates([source]).length === 1 ? candidates : surveyRejected).push({ url: row.url, source });
+    (selectCandidates([source], { postSearch }).length === 1 ? candidates : surveyRejected).push({ url: row.url, source });
   }
   try {
     // 既有行按**全部**本轮源读（不只候选）：初筛不过的源若留着 compile_ok 的旧行（41-srcfix G5：规则改到

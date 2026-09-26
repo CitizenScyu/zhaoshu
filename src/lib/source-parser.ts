@@ -1,5 +1,5 @@
 import { decodeHTML } from 'entities';
-import { alternateSourceHost, upgradeSourceTemplateUrl, validateSourceUrl, SourcePolicyError } from './source-policy';
+import { alternateSourceHost, checkSourceUrl, upgradeSourceTemplateUrl, validateSourceUrl, SourcePolicyError } from './source-policy';
 import { encodeQueryComponent, normalizeCharset, type SourceCharset } from './source-charset';
 import { foldTraditional } from './zh-variant-fold';
 
@@ -266,7 +266,15 @@ export function parseSourceAlias(html: string): Pick<SourceBookIdentity, 'alias'
   return alias ? { alias } : {};
 }
 
-export function sourceSearchUrl(template: unknown, title: string, base: string): string {
+/**
+ * 搜索请求的 host 门校验器：与 checkSourceUrl 同签名（validateSourceUrl=运行时白名单门，
+ * validateAdmissionUrl=准入声明门，allowAnyHost=候选阶段放开 host 白名单但仍守 https/端口/userinfo/IP 红线）。
+ */
+export type SourceUrlValidator = (value: unknown, base?: string) => URL;
+
+export function sourceSearchUrl(
+  template: unknown, title: string, base: string | undefined, validate: SourceUrlValidator = validateSourceUrl,
+): string {
   if (typeof template !== 'string' || template.length > 2048 || !/\{\{key\}\}/.test(template)) {
     throw new SourcePolicyError('书源缺少支持的搜索模板');
   }
@@ -274,8 +282,11 @@ export function sourceSearchUrl(template: unknown, title: string, base: string):
   const expanded = template.replace(/\{\{key\}\}/g, encodeURIComponent(title)).replace(/\{\{page\}\}/g, '1');
   if (/[{}]|@js:|<js>|,\s*\[/i.test(expanded)) throw new SourcePolicyError('不支持该书源的动态搜索规则');
   // 写死 http:// 的模板（站点同 host 有 https）升级后再过锁；host/端口/路径逐字不变（41-urlfix）。
-  return validateSourceUrl(upgradeSourceTemplateUrl(expanded), base).href;
+  return validate(upgradeSourceTemplateUrl(expanded), base).href;
 }
+
+/** 候选/准入阶段用：放开 host 白名单，但仍守 https/端口/userinfo/IP 红线（41-admpost F1）。 */
+const allowAnyHost: SourceUrlValidator = (value, base) => checkSourceUrl(value, base, { hostAllowed: () => true });
 
 // ---- legado searchUrl `url,{options}` 选项支持（41-postsearch，仅在 ENGINE_POST_SEARCH 开时走） ----
 export type SourceSearchMethod = 'GET' | 'POST';
@@ -327,13 +338,15 @@ function expandField(text: string, title: string, charset: SourceCharset, jsonBo
  * validateSourceUrl（host 白名单 / https / 非 IP / 无 userinfo / 443），POST 不放宽 host 门；
  * 设备指纹字段（imei/udid 等字面量）原样当模板文本发送，不生成、不伪造。
  */
-export function buildSourceSearchRequest(template: unknown, title: string, base: string): SourceSearchRequest {
+export function buildSourceSearchRequest(
+  template: unknown, title: string, base: string | undefined, validate: SourceUrlValidator = validateSourceUrl,
+): SourceSearchRequest {
   if (typeof template !== 'string' || template.length > 2048 || !/\{\{key\}\}/.test(template)) {
     throw new SourcePolicyError('书源缺少支持的搜索模板');
   }
   const head = template.split('##')[0];
   const optMatch = /,\s*\{/.exec(head);
-  if (!optMatch) return { url: sourceSearchUrl(template, title, base), method: 'GET', charset: 'utf-8' };
+  if (!optMatch) return { url: sourceSearchUrl(template, title, base, validate), method: 'GET', charset: 'utf-8' };
 
   const urlPart = head.slice(0, optMatch.index);
   const options = parseSearchOptions(head.slice(optMatch.index + 1));
@@ -354,7 +367,7 @@ export function buildSourceSearchRequest(template: unknown, title: string, base:
   rejectJs(urlPart);
   const url = expandField(urlPart, title, charset, false);
   rejectUnexpanded(url);
-  const finalUrl = validateSourceUrl(upgradeSourceTemplateUrl(url), base).href;
+  const finalUrl = validate(upgradeSourceTemplateUrl(url), base).href;
   const request: SourceSearchRequest = { url: finalUrl, method: method as SourceSearchMethod, charset };
 
   if (options.body != null) {
@@ -378,6 +391,24 @@ export function buildSourceSearchRequest(template: unknown, title: string, base:
     if (Object.keys(headers).length) request.headers = headers;
   }
   return request;
+}
+
+/**
+ * 候选/准入口径（41-admpost F1）：该 searchUrl 能否构造出搜索请求。判据与运行时 `buildSourceSearchRequest`
+ * **完全同源**（同一函数、同样的展开/rejectUnexpanded/类型校验/红线），只把 host 白名单放开为 allow-any——
+ * 候选阶段运行时 host 白名单尚未就绪，host 检查交给准入滤网2（validateAdmissionUrl）与运行时门（validateSourceUrl）。
+ * 用占位书名判「模板能否展开」（{{cookie}} 等展不开一律 false），故与真实书名无关。仅在 ENGINE_POST_SEARCH 开时用于
+ * selectCandidates 的放开分支；关时候选仍走 searchIsPureGet（默认行为逐字不变）。
+ */
+const CANDIDATE_PROBE_TITLE = '书';
+export function searchOptionsConstructible(template: unknown, base: string): boolean {
+  try {
+    buildSourceSearchRequest(template, CANDIDATE_PROBE_TITLE, base, allowAnyHost);
+    return true;
+  } catch (error) {
+    if (error instanceof SourcePolicyError) return false;
+    throw error;
+  }
 }
 
 /** 详情页链接形态:book15 的 `/books/details<数字>.html`。候选收集的两条路径共用同一 grammar。 */

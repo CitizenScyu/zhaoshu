@@ -12,7 +12,9 @@
 import { checkSourceUrl, upgradeSourceTemplateUrl, SourcePolicyError } from '@/lib/source-policy';
 import { sourceRevision } from '@/lib/source-revision';
 import { sourceAbortable } from '@/lib/source-fetch';
-import { CORE_FIELDS, iterRulePairs, selectCandidates, type RawSource } from './compile-smoke';
+import { buildSourceSearchRequest, type SourceSearchRequest, type SourceUrlValidator } from '@/lib/source-parser';
+import { charsetFromContentType, encodeToBytes, type SourceCharset } from '@/lib/source-charset';
+import { CORE_FIELDS, enginePostSearchEnabled, iterRulePairs, selectCandidates, type RawSource } from './compile-smoke';
 import { parseFieldRule } from './parse';
 import {
   createScope, evaluateField, evaluateFieldList, normalizeBody,
@@ -260,10 +262,10 @@ export function compileAdmission(source: RawSource): AdmissionCompile {
   const coreFieldMask: Record<string, boolean> = {};
   for (const field of CORE_FIELDS) coreFieldMask[field] = false;
 
-  if (selectCandidates([source]).length !== 1) {
+  if (selectCandidates([source], { postSearch: enginePostSearchEnabled() }).length !== 1) {
     return {
       ok: false, tier: 'T7', coreFieldMask, failures: [],
-      reason: '未通过 survey 初筛（HTTPS/无JS/纯GET搜索/非听书/含 bookList+content）',
+      reason: '未通过 survey 初筛（HTTPS/无JS/纯GET或POST搜索/非听书/含 bookList+content）',
     };
   }
   const failures: AdmissionCompile['failures'] = [];
@@ -330,11 +332,14 @@ export function admissionBucket(verdict: string): 'ok' | 'rejected' | 'deferred'
   }
 }
 
-/** 可注入的传输层（测试用）。校验函数不可注入——见 admissionFetch 内部。 */
+/** 可注入的传输层（测试用）。校验函数不可注入——见 admissionFetch 内部。
+ *  41-admpost：flag 开时首跳可带 method/body（POST 探测）；重定向后一律 GET、无 body。 */
 export type AdmissionTransport = (input: string, init: {
   signal: AbortSignal;
   redirect: 'manual';
   headers: Record<string, string>;
+  method?: 'GET' | 'POST';
+  body?: BodyInit;
 }) => Promise<Response>;
 
 export const defaultAdmissionTransport: AdmissionTransport = (input, init) => fetch(input, init);
@@ -368,14 +373,15 @@ function defaultSleep(ms: number, signal: AbortSignal): Promise<void> {
   });
 }
 
-async function readCappedBody(response: Response, signal: AbortSignal, maxBytes: number): Promise<string> {
+async function readCappedBody(response: Response, signal: AbortSignal, maxBytes: number, charset: SourceCharset = 'utf-8'): Promise<string> {
   if (Number(response.headers.get('content-length')) > maxBytes) {
     cancelBody(response);
     throw new SourcePolicyError('书源响应体积超限');
   }
   if (!response.body) return '';
   const reader = response.body.getReader();
-  const decoder = new TextDecoder('utf-8');
+  // utf-8 保持现行（非 fatal，宽容）；GBK 类按声明字符集解码（非 fatal，容忍杂散字节）。
+  const decoder = charset === 'utf-8' ? new TextDecoder('utf-8') : new TextDecoder(charset, { fatal: false });
   let bytes = 0;
   let text = '';
   let complete = false;
@@ -400,14 +406,18 @@ async function readCappedBody(response: Response, signal: AbortSignal, maxBytes:
  * 跳转逐跳复验），但**不经过运行时 host 门**，改用 validateAdmissionUrl；不做换 host 重试
  * （alternateSourceHost 是 book15 专有语义，准入对象无备用 host 概念）。
  * HTTP 状态码不抛错——challenge/http_5xx 分桶需要拿到 status 与 body。
+ * 41-admpost：request 携带 method/body/白名单头/charset（flag 开时由 buildAdmissionSearchRequest 产出）。
+ * body 只发首跳（`encodeToBytes` 按 charset 字节化）；重定向一律降级为无 body 的 GET（同 source-fetch 语义）。
+ * 响应按 Content-Type 声明字符集解码，回退到请求声明字符集（GBK 站常不在头里声明）。
  */
-async function admissionFetch(input: string, options: AdmissionFetchOptions): Promise<{ url: string; status: number; text: string }> {
+async function admissionFetch(request: SourceSearchRequest, options: AdmissionFetchOptions): Promise<{ url: string; status: number; text: string }> {
   const {
     fetchPage, declaredHosts, signal, timeoutMs = ADMISSION_TIMEOUT_MS,
     maxRedirects = ADMISSION_MAX_REDIRECTS, maxBytes = ADMISSION_MAX_BYTES,
     throttleMs = ADMISSION_THROTTLE_MS, sleep = defaultSleep,
   } = options;
-  const initial = validateAdmissionUrl(input, undefined, declaredHosts);
+  const initial = validateAdmissionUrl(request.url, undefined, declaredHosts);
+  const bodyBytes = request.body !== undefined ? encodeToBytes(request.body, request.charset) : undefined;
   const controller = new AbortController();
   const onAbort = () => controller.abort(signal.reason);
   signal.addEventListener('abort', onAbort, { once: true });
@@ -430,9 +440,14 @@ async function admissionFetch(input: string, options: AdmissionFetchOptions): Pr
       probeSignal.throwIfAborted();
       await throttle();
       probeSignal.throwIfAborted();
+      // 首跳带 method/body/白名单头；重定向后一律 GET、无 body（不跨跳重放 POST body）。
+      const firstHop = redirects === 0;
+      const headers: Record<string, string> = { 'User-Agent': 'Mozilla/5.0 (compatible; novel-finder-admission/1.0)' };
+      if (firstHop && request.headers) Object.assign(headers, request.headers);
       const response = await fetchPage(current, {
-        signal: probeSignal, redirect: 'manual',
-        headers: { 'User-Agent': 'Mozilla/5.0 (compatible; novel-finder-admission/1.0)' },
+        signal: probeSignal, redirect: 'manual', headers,
+        method: firstHop ? request.method : 'GET',
+        body: firstHop && request.method === 'POST' ? bodyBytes : undefined,
       });
       if ([301, 302, 303, 307, 308].includes(response.status)) {
         const location = response.headers.get('location');
@@ -445,7 +460,9 @@ async function admissionFetch(input: string, options: AdmissionFetchOptions): Pr
         current = next;
         continue;
       }
-      const text = await readCappedBody(response, probeSignal, maxBytes);
+      // 响应解码字符集：Content-Type 声明优先，回退请求声明字符集（GBK 站常不在头里声明）。
+      const charset: SourceCharset = charsetFromContentType(response.headers.get('content-type')) ?? request.charset;
+      const text = await readCappedBody(response, probeSignal, maxBytes, charset);
       probeSignal.throwIfAborted();
       return { url: current, status: response.status, text };
     }
@@ -483,23 +500,28 @@ export function queryControlKeyword(keyword: string): string | undefined {
   return QUERY_CONTROL_KEYWORDS.find((candidate) => ![...candidate].some((ch) => used.has(ch)));
 }
 
-/** 用源模板展开一次搜索 URL（复用 sourceSearchUrl 的纯 GET 口径，但走准入门校验）。
+/** 用源模板构造一次准入搜索请求（走准入门校验 validateAdmissionUrl）。
+ * flag 开：与运行时 buildSourceSearchRequest 同一函数，支持 POST/body/charset/白名单头，host 门=准入声明门。
+ * flag 关：现纯 GET 口径逐字不变（encodeURIComponent + 动态规则拒 + 准入门）。
  * keyword 缺省取 admissionKeyword（主关键词）；对照搜索传对照书名。 */
-function expandAdmissionSearchUrl(
+function buildAdmissionSearchRequest(
   source: RawSource, declaredHosts: ReadonlySet<string>, keyword = admissionKeyword(source),
-): string {
+): SourceSearchRequest {
+  // bookSourceUrl 写死 http:// 的源（41-srcfix 改法2，selectCandidates 已按升级后判定放行）：基址同样升 https
+  // 再过锁，否则 checkSourceUrl 先拒基址、相对 searchUrl 也无从解析。升级只改 scheme，锁本身不变。
+  const base = typeof source.bookSourceUrl === 'string' ? upgradeSourceTemplateUrl(source.bookSourceUrl) : undefined;
+  const validate: SourceUrlValidator = (value, b) => validateAdmissionUrl(value, b, declaredHosts);
+  if (enginePostSearchEnabled()) {
+    // 与运行时 sourceSearchUrl/buildSourceSearchRequest 同一口径（含 http→https 升级），否则「准入通过、阅读期被判死」两把锁漂移。
+    return buildSourceSearchRequest(source.searchUrl, keyword, base, validate);
+  }
   const template = source.searchUrl;
   if (typeof template !== 'string' || template.length > 2048 || !/\{\{key\}\}/.test(template)) {
     throw new SourcePolicyError('书源缺少支持的搜索模板');
   }
   const expanded = template.replace(/\{\{key\}\}/g, encodeURIComponent(keyword)).replace(/\{\{page\}\}/g, '1');
   if (/[{}]|@js:|<js>|,\s*\[/i.test(expanded)) throw new SourcePolicyError('不支持该书源的动态搜索规则');
-  // bookSourceUrl 写死 http:// 的源（41-srcfix 改法2，selectCandidates 已按升级后判定放行）：基址同样升 https
-  // 再过锁，否则 checkSourceUrl 先拒基址、相对 searchUrl 也无从解析。升级只改 scheme，锁本身不变。
-  const base = typeof source.bookSourceUrl === 'string' ? upgradeSourceTemplateUrl(source.bookSourceUrl) : undefined;
-  // 写死 http:// 的搜索模板升 https 后再过准入门（host/端口/路径逐字不变，41-urlfix）：
-  // 与运行时 sourceSearchUrl 同一口径，否则「准入通过、阅读期被判死」两把锁漂移。
-  return validateAdmissionUrl(upgradeSourceTemplateUrl(expanded), base, declaredHosts).href;
+  return { url: validateAdmissionUrl(upgradeSourceTemplateUrl(expanded), base, declaredHosts).href, method: 'GET', charset: 'utf-8' };
 }
 
 const MAX_CANDIDATE_SCAN = 50;
@@ -588,15 +610,15 @@ export async function searchAdmission(source: RawSource, options: {
 async function searchAdmissionOnce(
   source: RawSource, options: Parameters<typeof searchAdmission>[1], keyword: string,
 ): Promise<AdmissionSearchResult> {
-  let url: string;
+  let request: SourceSearchRequest;
   try {
-    url = expandAdmissionSearchUrl(source, options.declaredHosts, keyword);
+    request = buildAdmissionSearchRequest(source, options.declaredHosts, keyword);
   } catch (error) {
     return { verdict: 'url_invalid', candidateCount: 0, error: errorMessage(error) };
   }
   let response: { url: string; status: number; text: string };
   try {
-    response = await admissionFetch(url, options);
+    response = await admissionFetch(request, options);
   } catch (error) {
     if (options.signal.aborted) throw error; // 调用方中止（预算耗尽/取消）：不写判定
     if (error instanceof SourcePolicyError) {
@@ -653,9 +675,9 @@ async function controlQueryOverlap(
 ): Promise<number | undefined> {
   const control = queryControlKeyword(keyword);
   if (!control) return undefined;
-  let url: string;
+  let request: SourceSearchRequest;
   try {
-    url = expandAdmissionSearchUrl(source, options.declaredHosts, control);
+    request = buildAdmissionSearchRequest(source, options.declaredHosts, control);
   } catch {
     return undefined;
   }
@@ -664,7 +686,7 @@ async function controlQueryOverlap(
   if (throttleMs > 0) await (options.sleep ?? defaultSleep)(throttleMs, options.signal);
   let response: { url: string; status: number; text: string };
   try {
-    response = await admissionFetch(url, options);
+    response = await admissionFetch(request, options);
   } catch (error) {
     if (options.signal.aborted) throw error;
     return undefined;
@@ -757,7 +779,7 @@ function hostOf(url: string): string {
  */
 function admissionMutexHost(candidate: AdmissionCandidate, declaredHosts: ReadonlySet<string>): string {
   try {
-    return hostOf(expandAdmissionSearchUrl(candidate.source, declaredHosts)) || hostOf(candidate.url);
+    return hostOf(buildAdmissionSearchRequest(candidate.source, declaredHosts).url) || hostOf(candidate.url);
   } catch {
     return hostOf(candidate.url);
   }
@@ -828,7 +850,7 @@ function compileDiagnostics(compile: AdmissionCompile): AdmissionSourceRow['comp
  */
 function searchUrlStillInvalid(source: RawSource, declaredHosts: ReadonlySet<string>): boolean {
   try {
-    expandAdmissionSearchUrl(source, declaredHosts);
+    buildAdmissionSearchRequest(source, declaredHosts);
     return false;
   } catch {
     return true;
