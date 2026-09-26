@@ -842,6 +842,7 @@ describe('refreshShuyuan atomic refresh', () => {
       bookSourceUrl: 'https://engine.example/', bookSourceName: '引擎源',
       searchUrl: 'https://engine.example/s?q={{key}}',
       ruleSearch: { bookList: '.i', name: '.t@text', bookUrl: 'a@href' },
+      ruleToc: { chapterList: '.ch', chapterName: 'a@text' },
       ruleContent: { content: '.c' },
     };
     const engineRow = (over: Record<string, unknown> = {}) => ({
@@ -963,6 +964,7 @@ describe('refreshShuyuan atomic refresh', () => {
       bookSourceUrl: `https://${host}/`, bookSourceName: host,
       searchUrl: `https://${host}/s?q={{key}}`,
       ruleSearch: { bookList: '.i', name: '.t@text', bookUrl: 'a@href' },
+      ruleToc: { chapterList: '.ch', chapterName: 'a@text' },
       ruleContent: { content: '.c' }, enabled: true,
     });
     const engineRowAt = (host: string, over: Record<string, unknown> = {}) => ({
@@ -1187,6 +1189,36 @@ describe('refreshShuyuan atomic refresh', () => {
       expect((await getFanoutPool(new AbortController().signal)).map((source) => source.url)).toEqual([
         'https://book15.net/', 'https://dup.example/c', 'https://y.example/', 'https://z.example/', 'https://w.example/',
       ]);
+    });
+
+    // 41-swq：sfacg 规则的 searchUrl 指向 host 门外的 m.sfacg.com，准入却记 search_ok；去重腾出名额后补进扇出、每次
+    // probe 必 compile_failed。判据与 probe 同一处（source-usability），进池前筛掉。
+    it('41-swq 运行时用不了的引擎源（门外/动态搜索模板、必需字段缺失）进池前筛掉：不占扇出/取书池/窗口名额，同站后面能用的那份照样选上', async () => {
+      const offGate = (url: string, over: Record<string, unknown> = {}) => engineRowAt('dup.example', {
+        source_url: url, source: { ...engineItemAt('dup.example'), searchUrl: 'https://outside.example/s?q={{key}}' }, ...over,
+      });
+      const noContent: Record<string, unknown> = { ...engineItemAt('nocontent.example') };
+      delete noContent.ruleContent;
+      const rows = [
+        offGate('https://dup.example/bad', { search_checked_at: '2026-09-25T00:00:00Z' }),
+        engineRowAt('dup.example', { source_url: 'https://dup.example/good', search_checked_at: '2026-09-24T00:00:00Z' }),
+        engineRowAt('lone.example', { source_url: 'https://lone.example/', source: { ...engineItemAt('lone.example'), searchUrl: '@js:result' }, search_checked_at: '2026-09-23T00:00:00Z' }),
+        engineRowAt('nocontent.example', { source: noContent, search_checked_at: '2026-09-22T00:00:00Z' }),
+        engineRowAt('y.example', { search_checked_at: '2026-09-19T00:00:00Z' }),
+      ];
+      const hosts = ['dup.example', 'lone.example', 'nocontent.example', 'y.example'];
+      const arrange = () => execute.mockResolvedValueOnce(hosts.map((host) => ({ host })))
+        .mockResolvedValueOnce([{ collections: [] }]).mockResolvedValueOnce([]).mockResolvedValueOnce(rows);
+      vi.stubEnv('READING_ENGINE_SOURCES', '1');
+      vi.stubEnv('READING_POOL_LIMIT', '3');
+      vi.stubEnv('SOURCE_FANOUT_LIMIT', '3');
+      const expected = ['https://book15.net/', 'https://dup.example/good', 'https://y.example/'];
+      arrange();
+      expect((await getFanoutPool(new AbortController().signal)).map((source) => source.url)).toEqual(expected);
+      arrange();
+      const pools = await getSourcePools(new AbortController().signal);
+      expect(pools.traversal.map((source) => source.url)).toEqual(expected);
+      expect(pools.selectable.map((source) => source.url)).toEqual(expected);
     });
 
     it('合成条目的 rules 与 shuyuan_sources.source 深相等；sourceRevision 与 rules_hash 同源（§5.2）', async () => {

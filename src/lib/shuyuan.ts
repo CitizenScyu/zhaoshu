@@ -2,6 +2,7 @@ import { getSql } from '@/lib/db';
 import { isRecord } from '@/lib/sanitize';
 import { createDeadline, raceDeadline, type RequestDeadline } from '@/lib/deadline';
 import { validateSourceUrl, refreshSupportedHosts, supportedHostList } from '@/lib/source-policy';
+import { engineSourceUsable } from '@/lib/source-usability';
 import {
   builtinFallbackSource, builtinUrlPrefixes, engineHosts, type SupportedSourceTier,
 } from '@/lib/supported-sources';
@@ -223,7 +224,9 @@ function traversalOf(eligible: readonly ReadingSource[]): ReadingSource[] {
   return firstPerHost(eligible.slice(0, selectableSourceLimit()), readingPoolLimit());
 }
 
-/** 按全序逐条取，引擎源同 hostname 只留第一份，取满 limit 即停；builtin 不参与去重。traversalOf 与 fanoutOf 共用。 */
+/**
+ * 按全序逐条取，引擎源同 hostname 只留第一份，取满 limit 即停；builtin 不参与去重。traversalOf 与 fanoutOf 共用。
+ */
 function firstPerHost(sources: readonly ReadingSource[], limit: number): ReadingSource[] {
   const seenHosts = new Set<string>();
   const out: ReadingSource[] = [];
@@ -254,7 +257,12 @@ async function eligibleReadingSources(signal: AbortSignal, includeEngine: boolea
   const engineOk = includeEngine ? await refreshEngineHostGate(signal) : false;
   const { states } = readMeta((await poolProbeMeta(s, signal)).collections);
   const builtin = await builtinReadingSources(s, states, signal);
-  const engine = engineOk ? await engineSourcesIncremental(s, states, signal) : [];
+  // 运行时用不了的引擎源（搜索模板过不了 host 门/动态规则，或必需字段编译不过；判据见 source-usability，与 probe 的
+  // compile_failed 同一处）在进池前筛掉：不占取书池/扇出名额、不占 selectable 窗口、也不占同站去重位——同站后面能用
+  // 的那份照样选得上。准入表的 compile_ok/search_ok 是准入当时的结论，与运行时 host 门可能不一致（41-swq 实测：sfacg
+  // 两条规则的 searchUrl 指向门外的 m.sfacg.com，准入记 search_ok，去重腾出名额后补进扇出，每次 probe 必 compile_failed）。
+  // 必须在上面刷门之后筛。这类源搜不出书，也就不会有用户在读它，从 selectable 里拿掉不影响在读。
+  const engine = engineOk ? (await engineSourcesIncremental(s, states, signal)).filter(engineSourceUsable) : [];
   return [...builtin, ...engine];
 }
 

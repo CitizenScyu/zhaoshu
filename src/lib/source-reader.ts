@@ -17,6 +17,7 @@ import {
   sourceBookMatches, sourceSearchUrl, sourceTitleSimilarity,
   type SourceBookIdentity, type SourceChapter,
 } from './source-parser';
+import { missingEngineFields, searchTemplateRejected } from './source-usability';
 import type { ReaderIndex, ReaderPart } from './reader-types';
 
 const MAX_SOURCE_REQUESTS = 12;
@@ -1260,29 +1261,12 @@ export function probeResultForPanel(result: SourceProbeResult, readable: boolean
   return { ...result, status: 'unreadable', found: result.status, readable };
 }
 
-/**
- * 引擎源能跑通「搜索 → 详情 → 目录」的最低字段组:与准入 compileAdmission 的 REQUIRED_FIELDS 同口径
- * (rule-engine/admission.ts),去掉引擎有默认值的 ruleToc.chapterUrl。ruleContent.content 保留:没有它源读不了正文。
- */
-const PROBE_REQUIRED_ENGINE_FIELDS = [
-  'ruleSearch.bookList', 'ruleSearch.name', 'ruleSearch.bookUrl',
-  'ruleToc.chapterList', 'ruleToc.chapterName', 'ruleContent.content',
-] as const;
-
+/** 判据与取书池/扇出的名额筛选共用 source-usability(41-swq),改口径只改那一处。 */
 function probeCompileFailure(source: ReadingSource, title: string): Pick<SourceProbeResult, 'code' | 'missingFields'> | null {
-  try {
-    sourceSearchUrl(source.searchUrl, title, source.url);
-  } catch (error) {
-    if (error instanceof SourcePolicyError) return { code: 'SEARCH_URL_UNSUPPORTED' };
-    throw error;
-  }
+  if (searchTemplateRejected(source, title)) return { code: 'SEARCH_URL_UNSUPPORTED' };
   if (isBuiltinReadingSource(source)) return null;
-  const { compiled } = engineSourceOf(source);
-  const missingFields = PROBE_REQUIRED_ENGINE_FIELDS.filter((name) => {
-    const ir = compiled.get(name);
-    return !ir || 'skipped' in ir;
-  });
-  return missingFields.length ? { code: 'RULES_UNSUPPORTED', missingFields: [...missingFields] } : null;
+  const missingFields = missingEngineFields(source);
+  return missingFields.length ? { code: 'RULES_UNSUPPORTED', missingFields } : null;
 }
 
 /**
