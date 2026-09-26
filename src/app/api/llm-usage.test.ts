@@ -8,6 +8,8 @@ const mocks = vi.hoisted(() => ({
   ensureSchema: vi.fn(), getProfileForUser: vi.fn(), saveProfileForUser: vi.fn(),
   getSql: vi.fn(), businessSql: vi.fn(), transaction: vi.fn(),
   getExcludedBookTitlesForUser: vi.fn(), persistRecommendationsForUser: vi.fn(),
+  // 41-rerankgnd：rerank 的书库标签查询是业务数据，与 usage 存储无关，按业务数据 mock。
+  getLibraryLabelsForCandidates: vi.fn(),
   neon: vi.fn(), usageSql: vi.fn(), verifyBatch: vi.fn(), getFeedbackSnapshotForUser: vi.fn(),
   getProfileFeedbackForUser: vi.fn(), getWithdrawnFeedbackBookTitlesForUserRaw: vi.fn(),
   // F15：吸收/重建涉及的队列函数。
@@ -44,6 +46,7 @@ vi.mock('@/lib/db', async (importOriginal) => ({
   getMaxFeedbackIdForUser: mocks.getMaxFeedbackIdForUser,
   ensureProfileForUser: mocks.ensureProfileForUser,
   getExcludedBookTitlesForUser: mocks.getExcludedBookTitlesForUser,
+  getLibraryLabelsForCandidates: mocks.getLibraryLabelsForCandidates,
   persistRecommendationsForUser: mocks.persistRecommendationsForUser,
 }));
 vi.mock('@/lib/douban', () => ({ verifyBatch: mocks.verifyBatch }));
@@ -163,6 +166,7 @@ describe('usage instrumentation through all model routes', () => {
     mocks.getProfileForUser.mockResolvedValue({ seeds: [{ title: '种子书', kind: 'love' }], content: '原画像', updatedAt: 'v1' });
     mocks.saveProfileForUser.mockResolvedValue('v2');
     mocks.getExcludedBookTitlesForUser.mockResolvedValue([]);
+    mocks.getLibraryLabelsForCandidates.mockResolvedValue([]);
     mocks.persistRecommendationsForUser.mockResolvedValue(undefined);
     mocks.getFeedbackSnapshotForUser.mockResolvedValue({ version: 0, status: null, note: '' });
     mocks.getProfileFeedbackForUser.mockResolvedValue([]);
