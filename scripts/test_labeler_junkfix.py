@@ -214,5 +214,99 @@ class TestPreservedHardNegatives(unittest.TestCase):
         self.assertIn('【叮！恭喜宿主获得新手大礼包】', out)
 
 
+class TestRvjunkCounterexamples(unittest.TestCase):
+    """rvjunk41 异厂审查的每一个误删反例都转成回归（必修 1/2 + 建议 3/4）。"""
+
+    # 必修 1：固定字面无锚子串误删的叙述（现改为强字面无锚 / 弱字面须 ≥2 或搭实体）
+    LITERAL_PROSE_KEEP = (
+        '后面更精彩的情节他已经猜到了七七八八。',
+        '他知道后面更精彩，所以舍不得睡。',
+        '後面更精彩的部分他已經猜到了。',
+        '多多分享你的想法，大家一起讨论。',
+        '老师说要多多分享，他便站了起来。',
+        '手打更新的速度让他很满意。',
+        '这章没有结束的意思，他继续往下翻。',
+        '收藏网址下次再用，他这样提醒自己。',
+        '第一时间看正版的人并不多，他是其中一个。',
+        '看正版内容才对得起作者，他一直这么觉得。',
+        '请点击下一页继续阅读的提示跳了出来，他没理。',
+        '手机阅读是他每天睡前的习惯。',
+    )
+
+    def test_literal_substrings_in_prose_are_kept(self):
+        for line in self.LITERAL_PROSE_KEEP:
+            with self.subTest(line=line):
+                self.assertIsNone(labeler._drop_rule(line))
+
+    def test_bare_source_declaration_not_dropped(self):
+        # _PROMO_SOURCE_URL_RE 的 |$ 笔误已修：裸「本书来自」不再整行删
+        for line in ('本书来自', '本书来自）', '本书来自)', '本书来自民间的一个传说。'):
+            with self.subTest(line=line):
+                self.assertIsNone(labeler._drop_rule(line))
+
+    # 必修 2：站名水印裸子串抠正文（现须带括号/域名/推广信号才剥）
+    SITE_NAME_PROSE_KEEP = (
+        '他走过开心文学社的门口，里面传来朗朗书声。',
+        '开心文学是他最喜欢的一门课。',
+        '精华书阁是城里最老的书店，他常去坐一下午。',
+        '她在精华书阁里找了整整一个下午。',
+        '他在搜趣屋坐了一下午，喝了三壶茶。',
+        '搜趣屋里人声鼎沸，他挤了进去。',
+        '无弹出广告的浏览器让他终于能安心看文章了。',
+        '他特意找了个无弹出广告的浏览器。',
+        '吾爱文学网课是学校新开的选修。',
+        '雅文言情是这本诗集的风格，他很喜欢。',
+        '燃文书库里的藏书他翻了个遍。',
+        '他走進開心文學社，裡頭坐滿了人。',
+        '無彈出廣告的日子讓他很不習慣。',
+    )
+
+    def test_site_names_as_prose_are_not_carved(self):
+        for line in self.SITE_NAME_PROSE_KEEP:
+            with self.subTest(line=line):
+                self.assertEqual(labeler._strip_inline_noise(line), line)
+
+    def test_bounded_site_watermark_still_stripped(self):
+        # 带括号 / 域名 / @ 的站名水印仍要剥（E2 举证形态）
+        self.assertEqual(labeler._strip_inline_noise('[吾爱文学网]'), '')
+        self.assertEqual(labeler._strip_inline_noise('雅文言情.org'), '')
+        self.assertEqual(labeler._strip_inline_noise('@精华书阁'), '')
+        self.assertEqual(labeler._strip_inline_noise('无弹出广告文本小说站。'), '')
+
+    # 建议 3：系统流【…现金红包…领取…】/【…关注公众号领取…】不被两信号删
+    SYSTEM_STREAM_KEEP = (
+        '【红包雨来袭！点击领取现金红包】',
+        '【系统：恭喜获得现金红包×1，请及时领取】',
+        '【叮！现金红包已到账，请领取】',
+        '【限时活动：关注公众号领取新手礼包】',
+        '宿主打开背包，发现一个现金红包静静躺在里面。',
+    )
+
+    def test_system_stream_redpacket_kept(self):
+        for line in self.SYSTEM_STREAM_KEEP:
+            with self.subTest(line=line):
+                self.assertIsNone(labeler._drop_rule(line))
+
+    # 建议 4：无引号叙述「他关注了那个公众号…」不被公众号+关注删
+    def test_weak_entity_prose_kept(self):
+        for line in ('他关注了那个公众号，只为了看每日推送。',
+                     '他建了个QQ群，把同学都拉了进去。',
+                     '客户端崩溃了三次，他终于忍不住重启了电脑。',
+                     '他把客户端卸载了，改用网页版。'):
+            with self.subTest(line=line):
+                self.assertIsNone(labeler._drop_rule(line))
+
+    # 硬正例仍须删（收窄不能放漏）
+    def test_real_promo_still_dropped(self):
+        for line in ('免费看书，关注微信公众号：天涯悦读',
+                     '本书由公众号整理制作。关注VX【书友大本营】，看书领现金红包！',
+                     '(更多的更新，已經在微信公眾號傳了，大家可以去關注閱讀，微信號:fenghuo1985)',
+                     '小主，这个章节后面还有哦，请点击下一页继续阅读，后面更精彩！',
+                     '广个告，我最近在用的看书app，书源多，书籍全，更新快！',
+                     '本站已开通小说订阅功能，您可以订阅自己喜欢的小说…'):
+            with self.subTest(line=line):
+                self.assertEqual(labeler._drop_rule(line), 'inject')
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

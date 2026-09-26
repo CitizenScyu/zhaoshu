@@ -670,51 +670,78 @@ _SEPARATOR_LINE_RE = re.compile(r'^[－\-—=＝_＿*＊~～·]{5,}$')
 _DIV_TOKEN_RE = re.compile(r'</?div\b', re.I)
 
 
-# ---- 整行推广黑名单（junkfix41 §2，依据 junkaudit-41-report §5.1）----
+# ---- 整行推广黑名单（junkfix41 §2，依据 junkaudit-41-report §5.1；rvjunk41 复审收窄）----
 # 历史模型举证的 72 句广告里 71 句在旧规则下漏网：旧 INJECT_PATTERNS 只收「无弹窗全文字
 # 在线阅读」这类**整句标语**，收不到「关注公众号」「看书 app」这类推 app/公众号行。
-# 判据：整行**无对白引号**、行长 ≤ PROMO_LINE_MAX_LEN，且满足下面二者之一：
-#   (a) 固定字面命中（站点公告/分页呼告，正文里不可能出现）；
-#   (b) 「两信号同现」——推广实体词（公众号/微信/app/QT房/红包/下载地址…）
-#       与 呼告或来源词（关注/领取/搜索/本书来自/已开通/更新快/书源多…）同时出现。
-# 引号闸挡住都市文对白（`“你关注我公众号了没？”他问。`）；两信号 + 无引号挡住只含单个
-# 推广词的正文（`原本站在那里`/`他关注着战局`），实体词在网文正文里几乎不出现。
+# 判据：整行**无对白引号、不以【开头**（系统流保护）、行长 ≤ PROMO_LINE_MAX_LEN，且满足其一：
+#   (a) 强字面 `_PROMO_STRONG_RE`（`广个告`/`本站已开通小说订阅`/`txt下载地址`——非自然中文，正文不会出现）；
+#   (b) 弱字面同现：`_PROMO_WEAK_PATTERNS` 里 ≥2 个不同短语（多条分页/推广口号同现＝广告，单条是正文）；
+#   (c) 弱字面 ≥1 且带任一推广实体词（字面 + 实体＝广告）；
+#   (d) 强实体词（app/红包/VX/QT/下载/QQ群/书友大本营…）+ 呼告/来源词（两信号同现）；
+#   (e) 弱实体词（公众号/微信）+ 账号/CTA 标记（`公众号：账号`/`微信號:`/`公众号【】`/`公众号…领取/红包`）。
+# rvjunk41 复审必修：旧 `_PROMO_LITERALS_RE` 无锚子串会误删「后面更精彩的情节…」「多多分享你的想法」
+# 「看正版内容才对得起作者」等叙述；旧「公众号+关注」会误删「他关注了那个公众号…」；均已按上表收窄。
 PROMO_LINE_MAX_LEN = 120
 _PROMO_QUOTE_RE = re.compile(r'[“”‘’「」『』"]')
-# 推广实体词：网文正文里几乎不出现的站点/引流实体
-_PROMO_ENTITY_RE = re.compile(
-    r'公众号|公眾號|微信公众|微信公眾|微信号|微信號|微信\s*[:：]|微信\s*號|VX|Ｖｘ|扣扣号|'
-    r'QQ\s*群|qq\s*群|QT房|看书app|看書app|小说app|小說app|阅读app|閱讀app|下载地址|下載地址|'
-    r'下载app|客户端|客戶端|现金红包|現金紅包|书友大本营|書友大本營|天涯悦读|海棠书屋|海棠書屋',
+# 强字面（无锚子串，安全）：非自然中文的广告标记
+_PROMO_STRONG_RE = re.compile(
+    r'广个告|廣個告|本站已开通小说订阅|本站已開通小說訂閱|txt下载地址|txt下載地址')
+# 弱字面（能出现在正文里，须 ≥2 同现或搭实体词才删）
+_PROMO_WEAK_PATTERNS = tuple(re.compile(p) for p in (
+    r'后面更精彩|後面更精彩', r'多多分享', r'手打更新', r'这章没有结束|這章沒有結束',
+    r'章节后面还有哦|章節後面還有哦', r'收藏网址下次|收藏網址下次',
+    r'第一时间看正版|第一時間看正版', r'看正版内容|看正版內容',
+    r'请点击下一页继续阅读|請點擊下一頁繼續閱讀', r'本书首发来自|本書首發來自',
+    r'手机阅读[:：]|手機閱讀[:：]'))
+# 强推广实体词：网文正文里几乎不出现的引流实体
+_PROMO_STRONG_ENTITY_RE = re.compile(
+    r'看书app|看書app|小说app|小說app|阅读app|閱讀app|下载app|VX|Ｖｘ|扣扣号|QQ\s*群|qq\s*群|'
+    r'QT房|下载地址|下載地址|现金红包|現金紅包|书友大本营|書友大本營|天涯悦读|海棠书屋|海棠書屋|客户端|客戶端',
     re.I)
+# 弱推广实体词：公众号/微信——在正文里也常见，须带账号/CTA 标记
+_PROMO_WEAK_ENTITY_RE = re.compile(r'公众号|公眾號|微信公众|微信公眾|微信号|微信號|微信\s*[:：]')
+# 账号/CTA 标记：账号冒号、账号方括号、或公众号/微信紧邻 领取/红包/回复/即送/搜索
+_PROMO_ACCOUNT_RE = re.compile(
+    r'公[众眾]号\s*[:：]|公[眾众]號\s*[:：]|微信\s*[号號]?\s*[:：]|公[众眾]号\s*[【\[]|'
+    r'(?:公[众眾]号|公[眾众]號|微信)[^。！？\n]{0,6}(?:领取|領取|红包|紅包|回复|回復|即送|搜索|關注即|关注即)')
 # 呼告或来源声明词
 _PROMO_CALL_RE = re.compile(
     r'关注|關注|领取|領取|扫码|掃碼|订阅自己|訂閱自己|本书来自|本書來自|整理制作|整理製作|'
     r'由.{0,6}整理|已开通|已開通|开通了.{0,6}(?:订阅|功能)|開通了.{0,6}(?:訂閱|功能)|'
     r'更新快|书源多|書源多|书籍全|書籍全|免费看书|免費看書|领现金|領現金|看书领|看書領|欢迎.{0,6}关注')
-# 固定字面（整行含即删，同样受无引号 + 行长闸约束）
-_PROMO_LITERALS_RE = re.compile(
-    r'本站已开通小说订阅|本站已開通小說訂閱|请点击下一页继续阅读|請點擊下一頁繼續閱讀|'
-    r'这章没有结束|這章沒有結束|章节后面还有哦|章節後面還有哦|后面更精彩|後面更精彩|'
-    r'手打更新|txt下载地址|txt下載地址|手机阅读[:：]|手機閱讀[:：]|收藏网址下次|收藏網址下次|'
-    r'广个告|廣個告|多多分享|本书首发来自|本書首發來自|第一时间看正版|第一時間看正版|看正版内容|看正版內容')
-# `本书来自 <网址>` 型来源声明：只有后接空白/网址/行尾才算（`这本书来自民间` 是正文，不碰）。
+# `本书来自 <网址>` 型来源声明：只有后接**网址/域名**才算（`这本书来自民间` 是正文，不碰）。
+# rvjunk41 必修：旧写法末尾 `|$` 是笔误，会把裸「本书来自」也删——已去掉，现在必须真的跟网址。
 _PROMO_SOURCE_URL_RE = re.compile(
-    r'本[书書][来來]自\s*(?:https?://|www[.．]|m[.．]|[A-Za-z0-9-]+[.．](?:com|net|org|cc)|[）)]\s*$|$)',
-    re.I)
+    r'本[书書][来來]自\s*(?:https?://|www[.．]|m[.．]|[A-Za-z0-9-]+[.．](?:com|net|org|cc))', re.I)
 
 
 def _is_promo_line(line: str) -> bool:
-    """整行是否是站点推广行（junkfix41）。无对白引号 + 行长受限 + (固定字面 或 两信号同现)。"""
-    if len(line) > PROMO_LINE_MAX_LEN or _PROMO_QUOTE_RE.search(line):
+    """整行是否是站点推广行（junkfix41，rvjunk41 复审收窄）。见上方判据表。"""
+    stripped = line.lstrip()
+    if len(line) > PROMO_LINE_MAX_LEN or _PROMO_QUOTE_RE.search(line) \
+            or stripped.startswith('【'):          # 系统流【…】保护
         return False
-    if _PROMO_LITERALS_RE.search(line) or _PROMO_SOURCE_URL_RE.search(line):
+    if _PROMO_STRONG_RE.search(line) or _PROMO_SOURCE_URL_RE.search(line):
         return True
-    return bool(_PROMO_ENTITY_RE.search(line) and _PROMO_CALL_RE.search(line))
+    weak = sum(1 for p in _PROMO_WEAK_PATTERNS if p.search(line))
+    entity_strong = bool(_PROMO_STRONG_ENTITY_RE.search(line))
+    entity_weak = bool(_PROMO_WEAK_ENTITY_RE.search(line))
+    if weak >= 2:
+        return True
+    if weak >= 1 and (entity_strong or entity_weak):
+        return True
+    if entity_strong and _PROMO_CALL_RE.search(line):
+        return True
+    if entity_weak and _PROMO_ACCOUNT_RE.search(line):
+        return True
+    return False
 
 
 # ---- 段内插入子串 + 乱码占位（junkfix41 §3，依据 junkaudit-41-report §5.2/§5.3）----
 # 只剥匹配到的子串，段落其余正文保留（剥完两侧要能连上：`烈●…app…●帝` → `烈帝`）。
+# 历史站名（rvjunk41 必修：必须有边界，见下方 _INLINE_JUNK_PATTERNS 里的注释）。
+_SITE_NAME_ALT = (r'吾爱文学网|吾愛文學網|雅文言情|燃\^?文\^?书库|燃\^?文\^?書庫|'
+                  r'开心文学|開心文學|精华书阁|精華書閣|搜趣屋')
 _INLINE_JUNK_PATTERNS = (
     # ●…app/下载…● 型插入水印（`烈●31小说app下载地址●帝` → `烈帝`）
     re.compile(r'[●★☆◆▲].{0,20}?(?:app|下载|下載|下\s*[载載])[^●★☆◆▲\n]{0,12}?[●★☆◆▲]', re.I),
@@ -725,11 +752,18 @@ _INLINE_JUNK_PATTERNS = (
                r'[^\n]*$'),
     # 我的QT房間開通了…（烽火官方 QT 房号引流，删到行尾）
     re.compile(r'我的QT房[間间]開通了[^\n]*$'),
-    # 历史站名水印（E2 举证形态）：独立片段，剥掉
-    re.compile(r'\[?\s*(?:吾爱文学网|吾愛文學網|雅文言情(?:\.org)?|燃\^?文\^?书库|燃\^?文\^?書庫|'
-               r'开心文学|開心文學|精华书阁|精華書閣|搜趣屋)\s*\]?(?:\s*\[\s*\])?'),
-    re.compile(r'@\s*精[华華]书[阁閣]'),
-    re.compile(r'无弹出广告(?:文本小说站?)?[。.]?|無彈出廣告(?:文本小說站?)?[。.]?'),
+    # 历史站名水印（E2 举证形态）：rvjunk41 必修——必须**有边界**才剥，不能裸子串抠正文。
+    # 只在 (a) 被括号/方括号包裹、(b) 紧邻域名/推广信号、(c) @前缀 时剥；
+    # 裸站名当普通名词（`他走过开心文学社`/`精华书阁是老书店`/`无弹出广告的浏览器`）一律不动。
+    re.compile(r'[\[【〖（(]\s*(?:' + _SITE_NAME_ALT + r')'
+               r'[^\[\]【】〖〗（）()\n]{0,8}[\]】〗）)]'),
+    re.compile(r'(?:' + _SITE_NAME_ALT + r')\s*'
+               r'(?:[.．](?:org|com|net|cc)|[／/]?\s*(?:最快更新|全网首发|全網首發|最新章节|最新章節))'),
+    re.compile(r'(?:最快更新|全网首发|全網首發)\s*(?:' + _SITE_NAME_ALT + r')'),
+    re.compile(r'@\s*(?:' + _SITE_NAME_ALT + r')'),
+    # 无弹出广告：只在带上下文（文本小说站）时剥；`首发--无弹出广告(...)` 由既有规则处理，
+    # 裸「无弹出广告的浏览器」不碰（rvjunk41 必修）。
+    re.compile(r'无[弹彈]出?广告文本小[说說]站?[。.]?|無[弹彈]出?廣告文本小[说說]站?[。.]?'),
     # (本章未完！) 分页残留（有界括号，`林北也意识(本章未完！)` → `林北也意识`）
     re.compile(r'[（(]\s*本章未完[！!。.]?\s*[）)]'),
     # 行尾裸 www.（句读之后的残尾）
