@@ -8,6 +8,10 @@
 // 用法:
 //   node refresh-runner.mjs              正式刷新(写库)
 //   node refresh-runner.mjs --dry-run    只读干跑(抓上游 + 合并去重,打印计数,不写库)
+//   node refresh-runner.mjs --pool-artifact  只从库生成源池产物写到 SHUYUAN_POOL_ARTIFACT_PATH(不抓上游、不写库;
+//                                         41-poolimpl,phoenix 定时跑:兜住 Vercel 上的禁用/启用等本机发布不到的写,并做心跳)
+//
+// 正式刷新时若 env 开 SHUYUAN_POOL_ARTIFACT 且配了 SHUYUAN_POOL_ARTIFACT_PATH,refreshShuyuan 写库成功后自行发布产物。
 //
 // 心跳:设 HEARTBEAT_FILE 时,运行期每 25s 追加一行时间戳(给外部看门狗区分「在跑」与「卡死」)。
 // 看门狗:设 WATCHDOG_MS 时,超过该毫秒仍未结束即向 stderr 告警并以码 2 退出(oneshot 会记为 failed)。
@@ -16,11 +20,26 @@
 import { appendFileSync, readFileSync, writeFileSync } from 'node:fs';
 import { getSql } from '@/lib/db';
 import { dbQuotaBackoffMs, isDbQuotaError, recordDbQuotaSeen } from '@/lib/db-quota';
-import { refreshShuyuan } from '@/lib/shuyuan';
+import { buildShuyuanPoolArtifact, refreshShuyuan } from '@/lib/shuyuan';
+import { writePoolArtifactFile } from '@/lib/pool-artifact';
 import { dryRunRefresh } from './dry-run';
 import { buildFailureStatus, quotaGate } from './quota-gate';
 
 const dryRun = process.argv.includes('--dry-run');
+const poolArtifactOnly = process.argv.includes('--pool-artifact');
+
+/** 只生成源池产物（不开 SHUYUAN_POOL_ARTIFACT 也可跑：生成是显式动作，开关只管消费）。失败抛出 ⇒ 退 1。 */
+async function generatePoolArtifact(): Promise<void> {
+  const path = process.env.SHUYUAN_POOL_ARTIFACT_PATH?.trim();
+  if (!path) throw new Error('缺少 env SHUYUAN_POOL_ARTIFACT_PATH');
+  const artifact = await buildShuyuanPoolArtifact(AbortSignal.timeout(60_000));
+  const result = await writePoolArtifactFile(path, artifact);
+  console.log(JSON.stringify({
+    mode: 'pool-artifact', result, contentHash: artifact.contentHash, generatedAt: artifact.generatedAt,
+    hosts: artifact.hosts.length, builtin: artifact.builtin.length, engine: artifact.engine.length,
+    probeEntries: artifact.probe.entries.length, bytes: Buffer.byteLength(JSON.stringify(artifact)),
+  }));
+}
 
 function startHeartbeat(): () => void {
   const file = process.env.HEARTBEAT_FILE;
@@ -55,6 +74,10 @@ async function main() {
     : undefined;
   watchdog?.unref?.();
   try {
+    if (poolArtifactOnly) {
+      await generatePoolArtifact();
+      return;
+    }
     if (dryRun) {
       const counts = await dryRunRefresh();
       console.log(JSON.stringify({ mode: 'dry-run', ...counts }));

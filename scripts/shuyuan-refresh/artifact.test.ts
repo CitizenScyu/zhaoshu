@@ -42,4 +42,13 @@ describe('refresh-runner 产物', () => {
     expect(r.stderr).toContain('shuyuan refresh runner failed:');
     expect(r.status).toBe(1);
   });
+
+  it('41-poolimpl --pool-artifact:缺 SHUYUAN_POOL_ARTIFACT_PATH 即失败退 1,只报键名(不碰库)', () => {
+    const env = { ...process.env };
+    delete env.DATABASE_URL;
+    delete env.SHUYUAN_POOL_ARTIFACT_PATH;
+    const r = spawnSync(process.execPath, [dist, '--pool-artifact'], { encoding: 'utf8', env });
+    expect(r.stderr).toContain('shuyuan refresh runner failed: 缺少 env SHUYUAN_POOL_ARTIFACT_PATH');
+    expect(r.status).toBe(1);
+  });
 });
