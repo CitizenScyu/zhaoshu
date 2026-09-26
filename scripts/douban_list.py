@@ -849,7 +849,12 @@ def search_engine(cli, title: str, author: str = '',
             print(f'  非 HTTPS 源跳过: {site_title}（{c.get("source", "")}）')
             continue
         got = _norm_author(c.get('author') or '')
-        if not want:          # 名单无作者：先收齐，循环后统一判歧义
+        if not want:          # 名单无作者（含 §7 降级）：先收齐，循环后统一判歧义/内容比对
+            # M4：无作者路径要求书名**归一后完全相等**——title_compatible 的前缀命中（系列/同人/
+            # 续写，如《神秘复苏》vs《神秘复苏之从回魂夜开始》）在这条路径一律不收，防降级后单候选
+            # 靠前缀直接放行错书。
+            if _norm_title(title) != _norm_title(site_title):
+                continue
             unknown_hits.append(({'url': book_url, 'title': site_title,
                                   'source': c.get('source', '')}, c.get('author') or ''))
             continue

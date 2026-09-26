@@ -1945,14 +1945,23 @@ class TestAuthorUnknownAmbiguityGuard(unittest.TestCase):
         self.assertIn('作者歧义跳过: 《偷偷藏不住》名单无作者，兼容候选作者 3 人（旺仔、桑稚段嘉许、竹已）',
                       out)
 
-    def test_prefix_title_other_author_also_counts(self):
-        # 兼容候选含同名前缀的别的书（偷偷藏不住的喜欢/司格子）同样算第二位作者
+    def test_prefix_title_candidate_excluded_m4(self):
+        # M4：名单无作者路径要求书名完全相等——同名**前缀**候选（偷偷藏不住的喜欢/司格子）
+        # 被排除，不再算作第二位作者；只剩唯一精确同名候选（竹已）→ 直接收，不判歧义
         hit, out = self._search('偷偷藏不住', [
             TTCBZ_CANDIDATES[1],
             {'source': 'd.example', 'title': '偷偷藏不住的喜欢', 'author': '司格子',
              'bookUrl': 'https://d.example/sgz'}])
+        self.assertEqual(hit['url'], 'https://b.example/zy')
+        self.assertNotIn('作者歧义', out)
+        self.assertNotIn('司格子', out)
+
+    def test_prefix_only_candidate_is_dropped_not_released(self):
+        # M4 反例 D 精神：唯一候选是前缀同人续写 → 被排除 → 无候选 → miss（不放行错书）
+        hit, out = self._search('神秘复苏', [
+            {'source': 'e.example', 'title': '神秘复苏之从回魂夜开始', 'author': '某同人作者',
+             'bookUrl': 'https://e.example/tr'}])
         self.assertIsNone(hit)
-        self.assertIn('作者歧义跳过', out)
 
     def test_single_author_is_accepted_preferring_known_author(self):
         hit, out = self._search('剑来', [
@@ -2436,6 +2445,19 @@ class TestBogusListAuthor(unittest.TestCase):
         # 引擎搜索不应把污染作者当 --author 传下去
         search_args = next(a for sub, a in cli.calls if sub == 'search')
         self.assertNotIn('--author', search_args)
+
+    def test_downgrade_plus_prefix_candidate_not_released_c6(self):
+        # rvauthcv 反例 C6：污染作者降级后，唯一候选是前缀同人续写 → M4 要求书名完全相等 → 拦下
+        base = 'https://e.example/tr'
+        cands = [{'source': 'e.example', 'title': '神秘复苏之从回魂夜开始', 'author': '某同人作者',
+                  'bookUrl': base}]
+        cli = _cm_cli({base: _cm_book(CM_TITLES_X, CM_BODY_X, base)}, cands)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            hit = douban_list.search_engine(cli, '神秘复苏', '悬疑灵异')
+        out = buf.getvalue()
+        self.assertIn('降级为名单无作者', out)      # 确实降级了
+        self.assertIsNone(hit)                        # 但前缀续写书不放行
 
     def test_downgrade_is_load_bearing(self):
         # 变异：把分类识别打空 → 不降级 → 名单有作者、候选全不符 → 被拦（回到坏行为）
