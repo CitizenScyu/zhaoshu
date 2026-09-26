@@ -1064,6 +1064,26 @@ def _cli_json(cli, subcommand: str, *args: str):
 _BODY_DEDUPE_MIN_LINE = 20     # 只对这么长以上的行做跨章去重（对齐 labeler.DEDUPE_MIN_LINE）
 _LABELER_DROP_RULE = False     # False=未尝试；None=不可用；callable=labeler._drop_rule
 
+# M2-r：逐章变化的模板（句中嵌章号/页码/日期/URL）跨章不「完全相同」，去重会漏。故做模板
+# 检测前先把可变部分归一成占位符，让「同一模板的不同章实例」跨章归一后一致、可被去重。
+_TEMPLATE_URL_RE = re.compile(r'(?:https?://|www\.)[^\s，。、；;）)】」』]*', re.I)
+_TEMPLATE_DOMAIN_RE = re.compile(r'[a-zA-Z0-9][a-zA-Z0-9-]*(?:\.[a-zA-Z0-9-]+){1,}(?:/[^\s]*)?')
+_TEMPLATE_DIGIT_RE = re.compile(r'[0-9]+')
+_TEMPLATE_CJK_NUM_RE = re.compile(r'[零一二三四五六七八九十百千万亿两〇壹贰叁肆伍陆柒捌玖拾]+')
+
+
+def _normalize_template_line(line: str) -> str:
+    """把行内**可变部分**（URL/域名、阿拉伯数字、中文数字/章号/页码/日期）归一成占位符（M2-r）。
+
+    使「同一站点模板的不同章实例」（如「您正在阅读第 3 章…」逐章变化）跨章归一后一致，
+    从而能被跨章去重识别为模板。归一只用于**模板识别的分组键**，不改动保留下来的原文。"""
+    s = unicodedata.normalize('NFKC', line or '')
+    s = _TEMPLATE_URL_RE.sub('#u#', s)
+    s = _TEMPLATE_DOMAIN_RE.sub('#u#', s)
+    s = _TEMPLATE_DIGIT_RE.sub('#', s)
+    s = _TEMPLATE_CJK_NUM_RE.sub('#', s)
+    return s
+
 
 def _labeler_drop_rule():
     """惰性取 labeler 的行级清洗规则（复用其广告/公告/求票判据）；不可用则返回 None。"""
@@ -1078,20 +1098,26 @@ def _labeler_drop_rule():
 
 
 def _clean_body_parts(parts: list[str]) -> str:
-    """章正文列表 → 去模板后的干净正文（M2）。
-    (1) 跨章去重：同一（≥20 字）长行在 ≥2 章出现视为模板/串章/分页重叠，剔除；
+    """章正文列表 → 去模板后的干净正文（M2 + M2-r）。
+    (1) 跨章去重：把每行**可变部分归一**后（章号/数字/日期/URL），同一归一形态在 ≥2 章出现的
+        ≥20 字长行视为模板/串章/分页重叠而剔除——逐章变化的模板（嵌章号）也能一并识别；
     (2) 复用 labeler 行级清洗 `_drop_rule` 剔广告/公告/求票行（best-effort，导入失败则跳过）。"""
     chapter_lines = [[ln.strip() for ln in re.split(r'[\r\n]+', p) if ln.strip()] for p in parts]
     freq: dict[str, int] = {}
     for lines in chapter_lines:
-        for ln in set(lines):          # 每章内同一行只计一次，避免章内重复夸大跨章频次
-            freq[ln] = freq.get(ln, 0) + 1
+        seen: set[str] = set()
+        for ln in lines:
+            key = _normalize_template_line(ln)   # M2-r：按归一形态计跨章频次
+            if key in seen:                      # 每章内同一（归一后）行只计一次
+                continue
+            seen.add(key)
+            freq[key] = freq.get(key, 0) + 1
     drop_rule = _labeler_drop_rule()
     kept: list[str] = []
     for lines in chapter_lines:
         for ln in lines:
-            if len(ln) >= _BODY_DEDUPE_MIN_LINE and freq.get(ln, 0) >= 2:
-                continue               # 跨章模板行
+            if len(ln) >= _BODY_DEDUPE_MIN_LINE and freq.get(_normalize_template_line(ln), 0) >= 2:
+                continue               # 跨章模板行（归一后重复）
             if drop_rule is not None:
                 try:
                     if drop_rule(ln):

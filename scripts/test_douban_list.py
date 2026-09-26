@@ -2227,6 +2227,13 @@ CM_MULTI_Y = ['第一章林牧穿越焦土荒原寻找失落古城。' * 90,
               '第二章他在幽深密林遭遇成群变异巨兽。' * 90,
               '第三章残破旧刀终于出鞘斩开重重杀阵。' * 90]
 CM_TEMPLATE_LINE = '温馨提示您：本章内容可能存在采集错漏，请留意甄别，本站不承担任何责任。'
+# M2-r：**逐章变化**的站点模板（句中嵌章号），两本书用同一模板但正文不同
+CM_VARYING_TMPL = ('本站郑重提示书友：您当前正在阅读的是本书第%s章的正文内容更新，若在阅读过程中发现'
+                   '章节文字出现错乱、重复、缺失或前后串章等各类异常情况，烦请您立即返回本书目录页面'
+                   '重新点击对应章节进入以刷新页面缓存，本站将持续竭诚为广大书友提供稳定优质且完全'
+                   '免费的在线阅读服务体验，衷心感谢您长期以来对本站的理解厚爱与鼎力支持。')
+CM_VARY_PLOT_X = ['甲主角探远古秘境。' * 160, '甲主角战强敌苦斗。' * 160, '甲主角醒血脉逆天。' * 160]
+CM_VARY_PLOT_Y = ['乙主角闯焦土荒原。' * 160, '乙主角入密林遇兽。' * 160, '乙主角挥旧刀破阵。' * 160]
 
 
 class TestContentFingerprint(unittest.TestCase):
@@ -2695,6 +2702,55 @@ class TestBodyGuardsM2(unittest.TestCase):
 
     def test_body_jaccard_raised_to_060(self):
         self.assertGreaterEqual(douban_list.CONTENT_BODY_JACCARD, 0.60)
+
+    # ---- M2-r（复审第二轮）：逐章变化的模板（嵌章号）归一后跨章去重 ----
+    @staticmethod
+    def _vary_chapters(tmpl, plots):
+        cn = ['一', '二', '三']
+        return [(tmpl % cn[i]) + '\n' + plots[i] for i in range(3)]
+
+    def test_m2r_per_chapter_varying_template_stripped(self):
+        # 复审 M2-r 反例：两本不同书，每章都带「第N章」逐章变化的站点模板 + 各自正文。
+        # 归一章号后模板跨章一致被识别剔除 → 只留各自正文 → 正文不同 → 判否（不再误并）
+        nums = ['第一章', '第二章', '第三章']
+        a = self._fp(nums, self._vary_chapters(CM_VARYING_TMPL, CM_VARY_PLOT_X), 'https://a/1')
+        b = self._fp(nums, self._vary_chapters(CM_VARYING_TMPL, CM_VARY_PLOT_Y), 'https://b/1')
+        self.assertGreaterEqual(a['body_chars'], douban_list.CONTENT_MIN_BODY_CHARS)  # 去模板后正文仍够长
+        self.assertLess(douban_list._jaccard(a['body'], b['body']), douban_list.CONTENT_BODY_JACCARD)
+        self.assertFalse(douban_list.same_book(a, b)[0])
+
+    def test_m2r_normalization_is_load_bearing(self):
+        # 变异：把 _normalize_template_line 改成恒等（还原「只去完全相同行」的旧行为）→ 逐章模板
+        # 因章号不同而各章唯一 → 不被去重 → 模板打穿正文 Jaccard → 两本不同书被误并 → 变红信号
+        nums = ['第一章', '第二章', '第三章']
+        ax = self._vary_chapters(CM_VARYING_TMPL, CM_VARY_PLOT_X)
+        bx = self._vary_chapters(CM_VARYING_TMPL, CM_VARY_PLOT_Y)
+        self.assertFalse(douban_list.same_book(self._fp(nums, ax, 'https://a/1'),
+                                               self._fp(nums, bx, 'https://b/1'))[0])   # 正常：判否
+        with mock.patch.object(douban_list, '_normalize_template_line', lambda s: s):
+            a2 = self._fp(nums, ax, 'https://a/1')
+            b2 = self._fp(nums, bx, 'https://b/1')
+            self.assertGreaterEqual(douban_list._jaccard(a2['body'], b2['body']),
+                                    douban_list.CONTENT_BODY_JACCARD)                   # 模板未去 → 相似度虚高
+            self.assertTrue(douban_list.same_book(a2, b2)[0])                           # 误并 → 变红
+
+    def test_m2r_varying_template_kept_for_same_book(self):
+        # 正例保护：同一本书两站、同款逐章模板 → 归一去模板后各章真实正文一致 → 仍放行
+        nums = ['第一章', '第二章', '第三章']
+        chapters = self._vary_chapters(CM_VARYING_TMPL, CM_VARY_PLOT_X)
+        a = self._fp(nums, chapters, 'https://a/1')
+        b = self._fp(nums, chapters, 'https://b/1')
+        self.assertGreaterEqual(a['body_chars'], douban_list.CONTENT_MIN_BODY_CHARS)
+        self.assertTrue(douban_list.same_book(a, b)[0])
+
+    def test_normalize_template_line_placeholders(self):
+        # 章号/数字/中文数字/URL 归一成占位符；无可变部分的行原样（分组键层面）
+        n = douban_list._normalize_template_line
+        self.assertEqual(n('第3章'), n('第9章'))
+        self.assertEqual(n('第三章'), n('第九章'))
+        self.assertEqual(n('更新于2026-09-27'), n('更新于2025-01-01'))
+        self.assertEqual(n('详见 http://a.example/c/12'), n('详见 http://b.test/c/99'))
+        self.assertNotEqual(n('叶凌霄睁开双眼'), n('林牧握紧旧刀'))   # 无可变部分 → 不同文本不归并
 
 
 class TestBogusDowngradeEndToEnd(unittest.TestCase):
