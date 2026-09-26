@@ -1152,9 +1152,39 @@ describe('引擎源分派（M1 任务 4 §7.2）', () => {
     pages.set(tocUrl, { text: '<li class="chapter"><a href="/c/1.html">第一章</a></li>' });
     await expect(service.resolveSourceBook(book, context())).rejects.toMatchObject({ code: 'SOURCE_NOT_FOUND' });
   });
-});
 
-// M2-2 多源循环（设计 §3.1–§3.7 / §9 任务 M2-2）。
+  // 41-swq：站点搜索是模糊的，同名书常不在前 4 条。改前按站点原序截前 4 条抓详情，第 6 条的真书永远抓不到。
+  it('41-swq 引擎搜索结果先按与请求书的相关度排序再截前 4 条：第 6 条的同名同作者书被抓到', async () => {
+    mocks.sources.mockResolvedValue([engineSource]);
+    const others = [1, 2, 3, 4, 5].map((n) => `<div class="book"><span class="name">测试书外传${n}</span><span class="author">别人</span><a href="/detail/9${n}.html">x</a></div>`);
+    pages.set(searchUrl, { text: [...others, '<div class="book"><span class="name">测试书</span><span class="author">作者</span><a href="/detail/1.html">x</a></div>'].join('') });
+    pages.set(detailUrl, { text: '<h1 class="title">测试书</h1><span class="writer">作者</span><a class="toc" href="/toc/1.html">目录</a>' });
+    pages.set(tocUrl, { text: '<li class="chapter"><a href="/c/1.html">第一章</a></li>' });
+    const catalog = await service.resolveSourceBook(book, context());
+    expect(catalog.bookUrl).toBe(detailUrl);
+    // 排在前面的无关条目一个详情都没抓（真书排第一，有作者 ⇒ 首命中即返回）。
+    expect(mocks.fetch.mock.calls.some(([input]) => String(input).includes('/detail/9'))).toBe(false);
+  });
+
+  // 41-swq 实测：biquge7.xyz 详情页作者整串「作者：木苏里」、noveltri 繁体站作者「木蘇里」——同一个人，改前记 miss。
+  it('41-swq 详情页作者带「作者：」标签 / 繁体字形 ⇒ 判为同一本；不同名字仍判不符', async () => {
+    const wanted = { title: '测试书', author: '木苏里' };
+    mocks.sources.mockResolvedValue([engineSource]);
+    const arrange = (writer: string) => {
+      pages.set(searchUrl, { text: '<div class="book"><span class="name">測試書</span><span class="author"></span><a href="/detail/1.html">x</a></div>' });
+      pages.set(detailUrl, { text: `<h1 class="title">測試書</h1><span class="writer">${writer}</span><a class="toc" href="/toc/1.html">目录</a>` });
+      pages.set(tocUrl, { text: '<li class="chapter"><a href="/c/1.html">第一章</a></li>' });
+    };
+    for (const writer of ['作者：木苏里', '木蘇里', '作者: 木蘇里', '木苏里 著']) {
+      arrange(writer);
+      await expect(service.resolveSourceBook(wanted, context())).resolves.toMatchObject({ bookUrl: detailUrl });
+    }
+    for (const writer of ['作者：木苏', '作者：苏里', '别人 著']) {
+      arrange(writer);
+      await expect(service.resolveSourceBook(wanted, context())).rejects.toMatchObject({ code: 'SOURCE_NOT_FOUND' });
+    }
+  });
+});
 describe('M2-2 多源循环：跳源 / 软预算 / 去重 / bookUrl 反查', () => {
   const search = (kw: string, host = 'https://book15.net') => host + '/books/search.html?kw=' + encodeURIComponent(kw);
   const sourceB = { ...source, url: 'https://book15.net/b', name: '备用书源', searchUrl: '/b/search.html?kw={{key}}' };

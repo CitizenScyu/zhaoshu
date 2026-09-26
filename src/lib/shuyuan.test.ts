@@ -842,6 +842,7 @@ describe('refreshShuyuan atomic refresh', () => {
       bookSourceUrl: 'https://engine.example/', bookSourceName: '引擎源',
       searchUrl: 'https://engine.example/s?q={{key}}',
       ruleSearch: { bookList: '.i', name: '.t@text', bookUrl: 'a@href' },
+      ruleToc: { chapterList: '.ch', chapterName: 'a@text' },
       ruleContent: { content: '.c' },
     };
     const engineRow = (over: Record<string, unknown> = {}) => ({
@@ -963,6 +964,7 @@ describe('refreshShuyuan atomic refresh', () => {
       bookSourceUrl: `https://${host}/`, bookSourceName: host,
       searchUrl: `https://${host}/s?q={{key}}`,
       ruleSearch: { bookList: '.i', name: '.t@text', bookUrl: 'a@href' },
+      ruleToc: { chapterList: '.ch', chapterName: 'a@text' },
       ruleContent: { content: '.c' }, enabled: true,
     });
     const engineRowAt = (host: string, over: Record<string, unknown> = {}) => ({
@@ -1111,7 +1113,7 @@ describe('refreshShuyuan atomic refresh', () => {
     });
 
     // 41-srcfix 同站去重：同站多副本同一轮测完、checked_at 挨着，改前会把取书池名额占成同一个站。
-    it('41-srcfix 同站去重：traversal 同 host 只留全序最前一份；selectable/扇出不去重（在读副本仍认得）；traversal ⊆ selectable', async () => {
+    it('41-srcfix 同站去重：traversal 同 host 只留全序最前一份；selectable 不去重（在读副本仍认得）；traversal ⊆ selectable', async () => {
       const rows = [
         engineRowAt('dup.example', { source_url: 'https://dup.example/a', search_checked_at: '2026-09-24T00:00:00Z' }),
         engineRowAt('dup.example', { source_url: 'https://dup.example/b', search_checked_at: '2026-09-23T00:00:00Z' }),
@@ -1135,9 +1137,10 @@ describe('refreshShuyuan atomic refresh', () => {
       await expect(getReadingPool(new AbortController().signal)).resolves.toMatchObject({
         sources: pools.traversal, enginePoolSize: 2, poolCandidates: 2,
       });
+      // 41-swq：扇出同站去重，与 traversal 同口径选中 dup/a（改前 = selectable 全部 5 条）。
       arrange();
       expect((await getFanoutPool(new AbortController().signal)).map((source) => source.url))
-        .toEqual(pools.selectable.map((source) => source.url));
+        .toEqual(['https://book15.net/', 'https://dup.example/a', 'https://x.example/']);
       // 窗口：selectable 只到 max(R,F)=3 条 ⇒ traversal 不越窗去捞 x.example（否则首开选中的源章节路径认不回来）。
       vi.stubEnv('SOURCE_FANOUT_LIMIT', '2');
       arrange();
@@ -1145,6 +1148,97 @@ describe('refreshShuyuan atomic refresh', () => {
       const selectableUrls = new Set(narrow.selectable.map((source) => source.url));
       expect(narrow.traversal.map((source) => source.url)).toEqual(['https://book15.net/', 'https://dup.example/a']);
       expect(narrow.traversal.every((source) => selectableUrls.has(source.url))).toBe(true);
+    });
+
+    // 41-swq 扇出同站去重：生产快照里梧桐 4 份规则占 24 格中的 4 格（url 的 #片段被抹掉，4 行还探同一条规则），
+    // 去重后同站只留全序最前一份，腾出的名额按全序补给后面的站；总数仍受 SOURCE_FANOUT_LIMIT 约束。
+    it('41-swq 扇出同站去重：同 host 留全序最优一份（reachable 优先）、名额回填后续站、上限不变、越窗补位的源仍在 selectable', async () => {
+      const rows = [
+        engineRowAt('dup.example', { source_url: 'https://dup.example/a', search_checked_at: '2026-09-24T00:00:00Z' }),
+        engineRowAt('dup.example', { source_url: 'https://dup.example/b', search_checked_at: '2026-09-23T00:00:00Z' }),
+        engineRowAt('dup.example', { source_url: 'https://dup.example/c', search_checked_at: '2026-09-20T00:00:00Z' }),
+        engineRowAt('dup.example', { source_url: 'https://dup.example/t7', tier: 'T7', search_checked_at: '2026-09-25T00:00:00Z' }),
+        engineRowAt('y.example', { search_checked_at: '2026-09-19T00:00:00Z' }),
+        engineRowAt('z.example', { search_checked_at: '2026-09-18T00:00:00Z' }),
+        engineRowAt('w.example', { search_checked_at: '2026-09-17T00:00:00Z' }),
+      ];
+      const hosts = ['dup.example', 'y.example', 'z.example', 'w.example'];
+      // dup/c 探测 reachable ⇒ 全序里排在同站其余副本之前（健康度是首键），去重应选它而不是 checked_at 最新的 a。
+      const arrange = () => execute.mockResolvedValueOnce(hosts.map((host) => ({ host })))
+        .mockResolvedValueOnce([reachableMeta('https://dup.example/c')]).mockResolvedValueOnce([]).mockResolvedValueOnce(rows);
+      vi.stubEnv('READING_ENGINE_SOURCES', '1');
+      vi.stubEnv('READING_POOL_LIMIT', '2');
+      vi.stubEnv('SOURCE_FANOUT_LIMIT', '3');
+      arrange();
+      const fanout = await getFanoutPool(new AbortController().signal);
+      // 改前：[book15, dup/c, dup/a] —— 3 格里 2 格是同一个站。
+      expect(fanout.map((source) => source.url)).toEqual([
+        'https://book15.net/', 'https://dup.example/c', 'https://y.example/',
+      ]);
+      expect(fanout.every((source) => source.readable)).toBe(true);
+      // y.example 在全序第 6 位，越过了 selectable 前缀窗口 max(R,F)=3 ——必须显式并进 selectable，否则面板能切、确认 404。
+      arrange();
+      const pools = await getSourcePools(new AbortController().signal);
+      expect(pools.selectable.map((source) => source.url)).toEqual([
+        'https://book15.net/', 'https://dup.example/c', 'https://dup.example/a', 'https://y.example/',
+      ]);
+      expect(pools.traversal.map((source) => source.url)).toEqual(['https://book15.net/', 'https://dup.example/c']);
+      // 上限放宽 ⇒ 每站一格全部列出，T7 副本与其余同站副本都不出现；总数 = 1 builtin + 4 站。
+      vi.stubEnv('SOURCE_FANOUT_LIMIT', '24');
+      arrange();
+      expect((await getFanoutPool(new AbortController().signal)).map((source) => source.url)).toEqual([
+        'https://book15.net/', 'https://dup.example/c', 'https://y.example/', 'https://z.example/', 'https://w.example/',
+      ]);
+    });
+
+    // 41-swq 审查 §2.1：apex 与 www 是同一个站（与 source-host-health hostKey 同口径），去重不能让两份各占一格。
+    it('41-swq 扇出同站去重：apex ↔ www 算同站，只留全序最优一份', async () => {
+      const rows = [
+        engineRowAt('www.dup.example', { search_checked_at: '2026-09-24T00:00:00Z' }),
+        engineRowAt('dup.example', { search_checked_at: '2026-09-23T00:00:00Z' }),
+        engineRowAt('y.example', { search_checked_at: '2026-09-19T00:00:00Z' }),
+        engineRowAt('www.z.example', { search_checked_at: '2026-09-18T00:00:00Z' }),
+      ];
+      const hosts = ['www.dup.example', 'dup.example', 'y.example', 'www.z.example'];
+      execute.mockResolvedValueOnce(hosts.map((host) => ({ host })))
+        .mockResolvedValueOnce([{ collections: [] }]).mockResolvedValueOnce([]).mockResolvedValueOnce(rows);
+      vi.stubEnv('READING_ENGINE_SOURCES', '1');
+      vi.stubEnv('READING_POOL_LIMIT', '2');
+      vi.stubEnv('SOURCE_FANOUT_LIMIT', '24');
+      // 改前：www.dup.example 与 dup.example 各占一格。
+      expect((await getFanoutPool(new AbortController().signal)).map((source) => source.url)).toEqual([
+        'https://book15.net/', 'https://www.dup.example/', 'https://y.example/', 'https://www.z.example/',
+      ]);
+    });
+
+    // 41-swq：sfacg 规则的 searchUrl 指向 host 门外的 m.sfacg.com，准入却记 search_ok；去重腾出名额后补进扇出、每次
+    // probe 必 compile_failed。判据与 probe 同一处（source-usability），进池前筛掉。
+    it('41-swq 运行时用不了的引擎源（门外/动态搜索模板、必需字段缺失）进池前筛掉：不占扇出/取书池/窗口名额，同站后面能用的那份照样选上', async () => {
+      const offGate = (url: string, over: Record<string, unknown> = {}) => engineRowAt('dup.example', {
+        source_url: url, source: { ...engineItemAt('dup.example'), searchUrl: 'https://outside.example/s?q={{key}}' }, ...over,
+      });
+      const noContent: Record<string, unknown> = { ...engineItemAt('nocontent.example') };
+      delete noContent.ruleContent;
+      const rows = [
+        offGate('https://dup.example/bad', { search_checked_at: '2026-09-25T00:00:00Z' }),
+        engineRowAt('dup.example', { source_url: 'https://dup.example/good', search_checked_at: '2026-09-24T00:00:00Z' }),
+        engineRowAt('lone.example', { source_url: 'https://lone.example/', source: { ...engineItemAt('lone.example'), searchUrl: '@js:result' }, search_checked_at: '2026-09-23T00:00:00Z' }),
+        engineRowAt('nocontent.example', { source: noContent, search_checked_at: '2026-09-22T00:00:00Z' }),
+        engineRowAt('y.example', { search_checked_at: '2026-09-19T00:00:00Z' }),
+      ];
+      const hosts = ['dup.example', 'lone.example', 'nocontent.example', 'y.example'];
+      const arrange = () => execute.mockResolvedValueOnce(hosts.map((host) => ({ host })))
+        .mockResolvedValueOnce([{ collections: [] }]).mockResolvedValueOnce([]).mockResolvedValueOnce(rows);
+      vi.stubEnv('READING_ENGINE_SOURCES', '1');
+      vi.stubEnv('READING_POOL_LIMIT', '3');
+      vi.stubEnv('SOURCE_FANOUT_LIMIT', '3');
+      const expected = ['https://book15.net/', 'https://dup.example/good', 'https://y.example/'];
+      arrange();
+      expect((await getFanoutPool(new AbortController().signal)).map((source) => source.url)).toEqual(expected);
+      arrange();
+      const pools = await getSourcePools(new AbortController().signal);
+      expect(pools.traversal.map((source) => source.url)).toEqual(expected);
+      expect(pools.selectable.map((source) => source.url)).toEqual(expected);
     });
 
     it('合成条目的 rules 与 shuyuan_sources.source 深相等；sourceRevision 与 rules_hash 同源（§5.2）', async () => {

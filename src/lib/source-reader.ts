@@ -8,7 +8,7 @@ import { sourceRevision } from './source-revision';
 import { isHostSuspect, orderByHostHealth } from './source-host-health';
 import { normalizeBookTitle } from './book-identity';
 import {
-  engineFetchContent, engineFetchDetail, engineFetchToc, engineSearchBook, MAX_CONTENT_PAGES, type EngineSource,
+  engineFetchContent, engineFetchDetail, engineFetchToc, engineSearchBook, MAX_CONTENT_PAGES, type EngineSearchResult, type EngineSource,
 } from './rule-engine/api';
 import { compileSource } from './rule-engine/compile';
 import {
@@ -17,6 +17,7 @@ import {
   sourceBookMatches, sourceSearchUrl, sourceTitleSimilarity,
   type SourceBookIdentity, type SourceChapter,
 } from './source-parser';
+import { missingEngineFields, searchTemplateRejected } from './source-usability';
 import type { ReaderIndex, ReaderPart } from './reader-types';
 
 const MAX_SOURCE_REQUESTS = 12;
@@ -371,6 +372,24 @@ function engineSourceOf(source: ReadingSource): EngineSource {
     searchUrl: typeof source.searchUrl === 'string' ? source.searchUrl : '',
     compiled: compileSource({ url: source.url, searchUrl: source.searchUrl, rules: source.rules }),
   };
+}
+
+/**
+ * 引擎搜索结果里要逐个抓详情的候选（41-swq）：先按「搜索行与请求书的相关度」稳定排序，再截 MAX_DETAIL_CANDIDATES。
+ * 改前按站点返回顺序截前 4 条：站点搜索是模糊的（按字命中、热门优先，qq 系一次 20 条、quanwenyuedu 48 条），
+ * 同名书排在第 5 条之后就永远抓不到详情，记成 miss。排序只改顺序、不过滤，也不增请求：身份判定仍在详情层的
+ * sourceBookMatches（改名书靠详情页别名才能认出，搜索行对不上的照样按原序排在后面、仍有机会被抓）。
+ * 档位：搜索行书名+作者已对上 → 书名相似档 0..3（sourceTitleSimilarity）→ 不相似；同档保持站点原序。
+ * resolveSourceBook 与 surveyOneSource 两处引擎循环共用，别在任一处再写回 results.slice。
+ */
+function engineDetailCandidates(book: SourceBookIdentity, results: EngineSearchResult[]): EngineSearchResult[] {
+  const NOT_SIMILAR = 4;
+  const rankOf = (result: EngineSearchResult) => (sourceBookMatches(book, result)
+    ? -1 : Math.min(sourceTitleSimilarity(book.title, { title: result.title, author: '' }), NOT_SIMILAR));
+  return results.map((result, order) => ({ result, order, rank: rankOf(result) }))
+    .sort((a, b) => a.rank - b.rank || a.order - b.order)
+    .slice(0, MAX_DETAIL_CANDIDATES)
+    .map(({ result }) => result);
 }
 
 /** 引擎源目录构造：与 catalogFrom 同构，version 用 ENGINE_PARSER_VERSION 区分（设计 §7.2）。 */
@@ -736,7 +755,7 @@ export async function resolveSourceBook(
         const results = await engineSearchBook(engineSource, book.title, sourceContext);
         stat.searched = true;
         stat.candidates = results.length;
-        for (const result of results.slice(0, MAX_DETAIL_CANDIDATES)) {
+        for (const result of engineDetailCandidates(book, results)) {
           if (result.bookUrl === options.excludeBookUrl || checked.has(source.url + result.bookUrl)) continue;
           checked.add(source.url + result.bookUrl);
           try {
@@ -1095,7 +1114,7 @@ async function surveyOneSource(
   if (!isBuiltinReadingSource(source)) {
     const engineSource = engineSourceOf(source);
     const results = await engineSearchBook(engineSource, book.title, context);
-    for (const result of results.slice(0, MAX_DETAIL_CANDIDATES)) {
+    for (const result of engineDetailCandidates(book, results)) {
       if (result.bookUrl === excludeBookUrl || checked.has(result.bookUrl)) continue;
       checked.add(result.bookUrl);
       const detail = await engineFetchDetail(engineSource, result.bookUrl, context);
@@ -1252,29 +1271,12 @@ export function probeResultForPanel(result: SourceProbeResult, readable: boolean
   return { ...result, status: 'unreadable', found: result.status, readable };
 }
 
-/**
- * 引擎源能跑通「搜索 → 详情 → 目录」的最低字段组:与准入 compileAdmission 的 REQUIRED_FIELDS 同口径
- * (rule-engine/admission.ts),去掉引擎有默认值的 ruleToc.chapterUrl。ruleContent.content 保留:没有它源读不了正文。
- */
-const PROBE_REQUIRED_ENGINE_FIELDS = [
-  'ruleSearch.bookList', 'ruleSearch.name', 'ruleSearch.bookUrl',
-  'ruleToc.chapterList', 'ruleToc.chapterName', 'ruleContent.content',
-] as const;
-
+/** 判据与取书池/扇出的名额筛选共用 source-usability(41-swq),改口径只改那一处。 */
 function probeCompileFailure(source: ReadingSource, title: string): Pick<SourceProbeResult, 'code' | 'missingFields'> | null {
-  try {
-    sourceSearchUrl(source.searchUrl, title, source.url);
-  } catch (error) {
-    if (error instanceof SourcePolicyError) return { code: 'SEARCH_URL_UNSUPPORTED' };
-    throw error;
-  }
+  if (searchTemplateRejected(source, title)) return { code: 'SEARCH_URL_UNSUPPORTED' };
   if (isBuiltinReadingSource(source)) return null;
-  const { compiled } = engineSourceOf(source);
-  const missingFields = PROBE_REQUIRED_ENGINE_FIELDS.filter((name) => {
-    const ir = compiled.get(name);
-    return !ir || 'skipped' in ir;
-  });
-  return missingFields.length ? { code: 'RULES_UNSUPPORTED', missingFields: [...missingFields] } : null;
+  const missingFields = missingEngineFields(source);
+  return missingFields.length ? { code: 'RULES_UNSUPPORTED', missingFields } : null;
 }
 
 /**

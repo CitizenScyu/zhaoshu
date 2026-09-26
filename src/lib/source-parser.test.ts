@@ -17,6 +17,55 @@ describe('supported source parser', () => {
     expect(sourceBookMatches({ title: 'A书', author: '佚名' }, { title: 'A书', author: '作者' })).toBe(true);
   });
 
+  // 41-swq：书源身份比对吸收「同一个名字的不同写法」（字段标签、署名后缀、繁简字形、书名状态标记），不同名字仍判不符。
+  it('41-swq 身份归一：作者标签/署名后缀/繁简/书名状态标记判同一本', () => {
+    const wanted = { title: '全球高考', author: '木苏里' };
+    for (const author of ['作者：木苏里', '作者:木苏里', '作者： 木苏里', '木苏里 著', '木苏里著', '木苏里/著', '@木蘇里', '木蘇里']) {
+      expect(sourceBookMatches(wanted, { title: '全球高考', author }), author).toBe(true);
+    }
+    // 繁体书名、状态标记（前后缀、全半角括号）。
+    for (const title of ['全球高考【完结】', '【已完结】全球高考', '全球高考(连载中)', '全球高考（全本）', '[TXT]全球高考']) {
+      expect(sourceBookMatches(wanted, { title, author: '木苏里' }), title).toBe(true);
+    }
+    expect(sourceBookMatches({ title: '末日樂園', author: '須尾俱全' }, { title: '末日乐园', author: '须尾俱全' })).toBe(true);
+    expect(sourceBookMatches({ title: '末日乐园', author: '须尾俱全' }, { title: '末日樂園', author: '作者：須尾俱全' })).toBe(true);
+    // 「作者：佚名」与「佚名」同属未知作者 ⇒ 不设作者门（与既有口径一致）。
+    expect(sourceBookMatches({ title: 'A书', author: '作者：佚名' }, { title: 'A书', author: '某人' })).toBe(true);
+  });
+
+  it('41-swq 身份归一不放宽成错配：相似书名不同作者、别的名字、续作/番外/合集仍判不符', () => {
+    const wanted = { title: '全球高考', author: '木苏里' };
+    for (const author of ['作者：木苏', '苏里', '木苏里二', '作者：别人', '别人 著', '@别人', '']) {
+      expect(sourceBookMatches(wanted, { title: '全球高考', author }), author).toBe(false);
+    }
+    for (const title of ['全球高考2', '全球高考【番外】', '【全集】全球高考', '全球高考(精品)', '全球高考外传', '全球高考风暴']) {
+      expect(sourceBookMatches(wanted, { title, author: '木苏里' }), title).toBe(false);
+    }
+    // 标签本身不是名字：「作者」「作者：」「著」剥不出空串去绕开作者门。
+    expect(sourceBookMatches({ title: 'A书', author: '作者：' }, { title: 'A书', author: '别人' })).toBe(false);
+    expect(sourceBookMatches({ title: 'A书', author: '著' }, { title: 'A书', author: '别人' })).toBe(false);
+    expect(sourceBookMatches({ title: 'A书', author: '张著' }, { title: 'A书', author: '张' })).toBe(false);
+    // 书名只剩状态标记时不剥成空串（空串不与任何东西判等）。
+    expect(sourceBookMatches({ title: '【完结】', author: '' }, { title: '', author: '' })).toBe(false);
+    // 不带冒号的「作者X」不剥（真名以「作者」开头的笔名存在）。
+    expect(sourceBookMatches({ title: 'A书', author: '作者君' }, { title: 'A书', author: '君' })).toBe(false);
+  });
+
+  // 41-swq 审查 §1.1 反例（rvswq-scratch/probe1.mjs 第 1 组、probe2.mjs）：两个不同的字、简体写法相同，不得判同一本。
+  it('41-swq 繁简折叠不把不同的字判等（多前像映射已剔除）', () => {
+    for (const [expected, actual] of [
+      ['李乾', '李干'], ['王後', '王后'], ['赵發', '赵髮'], ['张濛', '张蒙'], ['陈藉', '陈借'],
+      ['周係', '周系'], ['高儘', '高尽'], ['钱嚮', '钱向'], ['孙蘇', '孙甦'],
+      ['小发', '小髮'], ['郎干', '郎幹'], ['阿干', '阿乾'],
+    ]) {
+      expect(sourceBookMatches({ title: 'X', author: expected }, { title: 'X', author: actual }), `${expected} vs ${actual}`).toBe(false);
+    }
+    expect(sourceBookMatches({ title: '长发', author: '甲' }, { title: '长髮', author: '甲' })).toBe(false);
+    // 同一个字的繁简两种写法照常判等。
+    expect(sourceBookMatches({ title: '全球高考', author: '木苏里' }, { title: '全球高考', author: '木蘇里' })).toBe(true);
+    expect(sourceBookMatches({ title: '头发', author: '甲' }, { title: '頭發', author: '甲' })).toBe(true);
+  });
+
   it('decodes metadata entities regardless of attribute ordering', () => {
     expect(parseSourceIdentity(`<meta content='Ａ书' property='og:novel:book_name'><meta property="og:novel:author" content="甲&middot;乙">`))
       .toEqual({ title: 'Ａ书', author: '甲·乙' });

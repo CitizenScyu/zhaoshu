@@ -85,7 +85,12 @@ maybe('xfer41 池合成探测快照投影（PGlite 真库）', () => {
     pg = new PGliteCtor!();
     await pg.exec('CREATE TABLE IF NOT EXISTS users (id int PRIMARY KEY)');
     await initializeBusinessSchema(createPGliteSql(pg) as never);
-    const source = (url: string) => JSON.stringify({ bookSourceUrl: url, bookSourceName: url, searchUrl: `${url}/s?q={{key}}` });
+    // 规则要齐必需字段：缺字段的引擎源在进池前就被 source-usability 筛掉（41-swq），与本组要测的探测态无关。
+    const source = (url: string) => JSON.stringify({
+      bookSourceUrl: url, bookSourceName: url, searchUrl: `${url}/s?q={{key}}`,
+      ruleSearch: { bookList: '.i', name: '.t@text', bookUrl: 'a@href' },
+      ruleToc: { chapterList: '.ch', chapterName: 'a@text' }, ruleContent: { content: '.c' },
+    });
     await pg.query(`INSERT INTO shuyuan_sources (source_url, name, source) VALUES ($1, 'book15', $2::jsonb)`,
       ['https://book15.net', source('https://book15.net')]);
     for (const url of ENGINE_URLS) {
