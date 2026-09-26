@@ -1,5 +1,6 @@
 import { decodeHTML } from 'entities';
 import { alternateSourceHost, upgradeSourceTemplateUrl, validateSourceUrl, SourcePolicyError } from './source-policy';
+import { foldTraditional } from './zh-variant-fold';
 
 export interface SourceBookIdentity { title: string; author: string; alias?: string }
 export interface SourceChapter { url: string; title: string }
@@ -113,18 +114,42 @@ export function matchSourceChapter(chapters: SourceChapter[], expectedTitle: str
   return bestIndex >= 0 ? bestIndex : null;
 }
 
+// 作者字段里站点加的**字段外**修饰（41-swq 实测）：biquge7.xyz 详情页作者整串是「作者：木苏里」、QQ 阅读搜索行是
+// 「火龙果大亨 著」、noveltri 搜索行是「@木蘇里」。只剥这几种已知形态，且剥完必须还剩名字本体——「作者」二字本身、
+// 「著」单字不剥（剥成空串会把「有作者」变成「作者未知」，作者门就被绕开了）。不带冒号的「作者X」不剥：真名以「作者」
+// 开头的笔名存在，冒号才是「字段标签」的证据。
+const AUTHOR_LABEL = /^(?:作者:|@)(?=.)/u;
+const AUTHOR_BYLINE = /^(.{2,}?)\/?著$/u;
+
 export function knownSourceAuthor(value: string): string {
-  const normalized = value.normalize('NFKC').trim().replace(/\s+/gu, '').toLocaleLowerCase();
+  const normalized = value.normalize('NFKC').trim().replace(/\s+/gu, '').toLocaleLowerCase()
+    .replace(AUTHOR_LABEL, '').replace(AUTHOR_BYLINE, '$1');
   return ['', '佚名', '未知', '未知作者'].includes(normalized) ? '' : normalized;
 }
 
+// 书名两侧的**状态标记**（【完结】书名、书名(连载中)）不是书名本体，身份比对前剥掉。只收状态词：
+// 「番外」「全集」「精品」这类可能指向另一部作品/合集的词不在其列（那是模糊层 TITLE_DECORATION 的事，留给用户确认）。
+// 剥完为空（书名本身就是「【完结】」）则保留原样，空串不得与任何东西判等。
+const IDENTITY_TITLE_STATUS = /[[【(](?:已?完结|全本|完本|连载中?|新书|首发|独家|免费|无删减|txt)[\]】)]/gu;
+
+/**
+ * 书源身份比对用的书名键（41-swq）：normalizeSourceTitle → 剥状态标记 → 繁→简字形折叠。
+ * 只用于「是不是同一本书」的判等，不改存储值、不进 DB 身份键（book-identity.ts 与 SQL 权威键逐字对齐）。
+ */
+function identityTitle(value: string): string {
+  const normalized = normalizeSourceTitle(value);
+  const stripped = normalized.replace(IDENTITY_TITLE_STATUS, '');
+  return foldTraditional(stripped || normalized);
+}
+
 export function sourceBookMatches(expected: SourceBookIdentity, actual: SourceBookIdentity): boolean {
-  const title = normalizeSourceTitle(expected.title);
+  const title = identityTitle(expected.title);
   // 站点可能把书上架为新名而在简介里自报原名（【原书名：X】）；标题或别名任一相等即过。
-  const actualTitles = [actual.title, ...(actual.alias ? [actual.alias] : [])].map(normalizeSourceTitle);
-  const author = knownSourceAuthor(expected.author);
+  const actualTitles = [actual.title, ...(actual.alias ? [actual.alias] : [])].map(identityTitle);
+  // 作者门：两侧同一套归一（字段修饰剥离 + 繁简折叠），只吸收「同一个名字的不同写法」，不同名字仍判不符。
+  const author = foldTraditional(knownSourceAuthor(expected.author));
   return Boolean(title && actualTitles.includes(title)
-    && (!author || author === knownSourceAuthor(actual.author)));
+    && (!author || author === foldTraditional(knownSourceAuthor(actual.author))));
 }
 
 // ---- 模糊降级层（L3）的相似度判据 ----
@@ -187,9 +212,11 @@ function editDistance(a: string, b: string): number {
  * 3 = 编辑距离 ≤2（两侧均 ≥4 字才启用）；Infinity = 不相似（负对照锚点：完全无关的书必须落这里）。
  */
 export function sourceTitleSimilarity(expectedTitle: string, candidate: SourceBookIdentity): number {
-  const expected = normalizeSourceTitle(expectedTitle);
+  // 繁简字形折叠（41-swq）：与 sourceBookMatches 同一张表，繁体站上的同名书在模糊层同样按「书名相等」排档。
+  const foldTitle = (value: string) => foldTraditional(normalizeSourceTitle(value));
+  const expected = foldTitle(expectedTitle);
   if (!expected) return Number.POSITIVE_INFINITY;
-  const candidates = [candidate.title, ...(candidate.alias ? [candidate.alias] : [])].map(normalizeSourceTitle);
+  const candidates = [candidate.title, ...(candidate.alias ? [candidate.alias] : [])].map(foldTitle);
   let best = Number.POSITIVE_INFINITY;
   for (const actual of candidates) {
     if (!actual) continue;
