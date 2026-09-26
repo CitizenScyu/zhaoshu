@@ -1547,6 +1547,23 @@ def resolve_engine_target_chars(env: dict | None = None) -> int:
     return value
 
 
+def _check_toc_identity(toc: dict, expect_title: str, expect_author: str) -> tuple[str, str]:
+    """N02 目录身份校验（fetch_book_text_engine 与分段取文共用同一口径）→ (toc_title, toc_author)。
+
+    双侧非空才比对：title 用 title_compatible，author 用 douban_list.author_matches；不符抛 EngineIdentityMismatch。"""
+    toc_title = (toc.get('title') or '').strip()
+    toc_author = (toc.get('author') or '').strip()
+    if expect_title and toc_title and not douban_list.title_compatible(expect_title, toc_title):
+        raise EngineIdentityMismatch(
+            f'引擎目录身份不符: 名单《{expect_title}》/作者 {expect_author or "（未知）"}'
+            f' vs 目录《{toc_title}》/作者 {toc_author or "（未知）"}（标题不兼容）')
+    if expect_author and toc_author and not douban_list.author_matches(expect_author, toc_author):
+        raise EngineIdentityMismatch(
+            f'引擎目录身份不符: 名单《{expect_title}》/作者 {expect_author}'
+            f' vs 目录《{toc_title}》/作者 {toc_author}（作者不符）')
+    return toc_title, toc_author
+
+
 def fetch_book_text_engine(engine_cli, book_url: str,
                            target_chars: int = ENGINE_TARGET_CHARS,
                            expect_title: str = '',
@@ -1584,16 +1601,7 @@ def fetch_book_text_engine(engine_cli, book_url: str,
         if e.kind in DETERMINISTIC_ENGINE_ERRORS:
             raise EngineSourceGaveUp(host, e.kind, f'目录失败 {e}') from e
         raise
-    toc_title = (toc.get('title') or '').strip()
-    toc_author = (toc.get('author') or '').strip()
-    if expect_title and toc_title and not douban_list.title_compatible(expect_title, toc_title):
-        raise EngineIdentityMismatch(
-            f'引擎目录身份不符: 名单《{expect_title}》/作者 {expect_author or "（未知）"}'
-            f' vs 目录《{toc_title}》/作者 {toc_author or "（未知）"}（标题不兼容）')
-    if expect_author and toc_author and not douban_list.author_matches(expect_author, toc_author):
-        raise EngineIdentityMismatch(
-            f'引擎目录身份不符: 名单《{expect_title}》/作者 {expect_author}'
-            f' vs 目录《{toc_title}》/作者 {toc_author}（作者不符）')
+    toc_title, toc_author = _check_toc_identity(toc, expect_title, expect_author)
     chapters = toc.get('chapters') or []
     parts, chars = [], 0
     stats = stats if stats is not None else {}
