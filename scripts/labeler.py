@@ -111,6 +111,28 @@ SYSTEM_PROMPT = (
     "site_title_note(字符串：一句话说明 site_title_match 的判断依据)。"
 )
 
+# lblseg41：分布式采样（LABELER_SEGMENTED=1）时追加在 SYSTEM_PROMPT 之后，记录的 prompt_version 记
+# PROMPT_VERSION_SEGMENTED（v2）；开关关时不追加，SYSTEM_PROMPT 与 v1 逐字不变。
+# 「题材固有套路不算落差」一句针对 lblab-41 §3.6(c) 的对照组误报（凡人修仙传的闭关—斗法循环被判注水）。
+SEGMENTED_PROMPT_SUFFIX = (
+    "\n\n=== 分段采样说明 ===\n"
+    "给定文本不是连续的开头，而是同一本书按目录位置抽取的至多四段节选：第 1 段=开头、第 2 段=约 40% 处、"
+    "第 3 段=约 70% 处、第 4 段=约 90% 处。每段前有一行「【第 N 段：位置，第 a–b 章】」标注；"
+    "标注为「【第 N 段：未取到】」的段没有文本。"
+    "strengths/weaknesses/pace 请综合各段；plot_stage 写最后一段对应的剧情阶段；"
+    "quality 各项按全书整体印象照常打分。\n"
+    "额外输出字段 arc（后期落差，对象）：{\"decline\": \"none|mild|severe|unknown\", "
+    "\"evidence\": [{\"segment\": 段号整数, \"quote\": \"该段正文原文逐字摘录，不超过 50 字\"}], "
+    "\"note\": \"一句话说明\"}。"
+    "decline 含义：none=后段与开头水平相当；mild=后段较开头明显变差（注水、重复桥段、节奏拖沓）但仍可读；"
+    "severe=后段严重崩坏（剧情失控、大段注水、文笔骤降）；unknown=第 3、4 段都未取到或无法判断。"
+    "只比较同一本书前后的变化：题材固有的套路（如修仙文的闭关—斗法—突破循环、爽文的打脸桥段）"
+    "如果开头就已存在、后段只是延续，不算落差，应判 none。"
+    "decline 为 mild 或 severe 时 evidence 至少 2 条且必须来自不同的段（如开头一段对比后段一段），"
+    "quote 必须是所标段号那段里逐字出现的原文，不得改写、概括或拼接；拿不出原文证据就判 none 或 unknown。"
+    "decline 为 none 时 evidence 可为空数组。"
+)
+
 
 def _build_verification(title: str, author: str) -> str:
     """校验段：告知本次抓取来源站点的书名与作者，令 LLM 输出 site_title_match / site_title_note。
@@ -1723,6 +1745,293 @@ def fetch_engine_book_with_giveup(engine_cli, book: dict, tracker: SourceGiveupT
                              f'{len(options)} 个候选源均不可用（最后: {last}）')
 
 
+# ---- 分布式采样 + 按段换源补段（lblseg41，依据 lblab-41-report §3.6–§3.8/§4.1）----
+# 只读开头 8 万字看不到「虎头蛇尾」：分布式采样后模型能在 weaknesses 里点出后期问题（正例 4/4 有原文证据）。
+# 但 1/3 以上源条目中后段不可用（500/1000 章截断、4xx、<300 字预览），11/20 本要换源才拿得齐；
+# 「连续 3 章取空才弃源」对「章章返回百字预览」无效（阳神 728s），故按段统计有效字数判可用性、按段换源，
+# 并给整本取文设墙钟上限。env LABELER_SEGMENTED=1 才开；关时引擎路径逐字不变。book15 路径不受影响。
+SEGMENTED_ENV = 'LABELER_SEGMENTED'
+SEG_TIME_BUDGET_ENV = 'LABELER_SEG_TIME_BUDGET_S'
+SEG_TIME_BUDGET_S = 240
+# 分段模式总量上限：> SEGMENT_CHARS(250 000) 会让 label_book 走两段，违反「一次模型调用」；留 1 万余量
+# （整章取文会略超目标，同 lblab §4 对 240 000 的论证）。
+SEGMENTED_MAX_TOTAL = 240_000
+# (段号, 目录位置, 占 ENGINE_TARGET_CHARS 的比例, 标注)。主会话裁定：8 万时 20k/15k/10k/15k（合计 6 万，
+# 见 lblseg-41-report §2 的算术说明），总量变化按比例缩放。
+SEGMENT_SPECS = (
+    (1, 0.0, 0.25, '开头'),
+    (2, 0.40, 0.1875, '约 40% 处'),
+    (3, 0.70, 0.125, '约 70% 处'),
+    (4, 0.90, 0.1875, '约 90% 处'),
+)
+SEG_MIN_FILL_RATIO = 0.40   # 段有效字数 < 目标 × 此比例 → 该源该段不可用
+SEG_MIN_AVG_CHARS = 300     # 按已请求章数平均的有效字数 < 此值 → 预览页/4xx 特征，该源该段不可用
+SEG_PROBE_CHAPTERS = 3      # 每请求这么多章后即按平均有效字数判早退（不等整段抓完）
+SEG_CHAPTER_ATTEMPTS = 2    # 分段模式单章尝试次数（确定性错误不重试）；时限内少退避
+PROMPT_VERSION_SEGMENTED = 'v2'
+
+
+def resolve_segmented(env: dict | None = None) -> bool:
+    """LABELER_SEGMENTED → 是否开分布式采样。只有 '1' 才开（与 LABELER_ENGINE_FALLBACK 同口径）。"""
+    return str((env or {}).get(SEGMENTED_ENV) or '').strip() == '1'
+
+
+def resolve_seg_time_budget(env: dict | None = None) -> int:
+    """LABELER_SEG_TIME_BUDGET_S → 分段取文每本墙钟上限（秒）。非正整数忽略并告警，回落默认。"""
+    raw = str((env or {}).get(SEG_TIME_BUDGET_ENV) or '').strip()
+    if not raw:
+        return SEG_TIME_BUDGET_S
+    try:
+        value = int(raw)
+    except ValueError:
+        value = 0
+    if value <= 0:
+        print(f'  提示: {SEG_TIME_BUDGET_ENV}=「{raw}」不是正整数，已忽略（用默认 {SEG_TIME_BUDGET_S}）',
+              file=sys.stderr)
+        return SEG_TIME_BUDGET_S
+    return value
+
+
+def segment_plan(total_chars: int) -> list[dict]:
+    """总量 → 四段计划 [{no, frac, target, label}]（纯函数）。总量先夹到 SEGMENTED_MAX_TOTAL。"""
+    total = min(total_chars, SEGMENTED_MAX_TOTAL)
+    return [{'no': no, 'frac': frac, 'target': round(total * ratio), 'label': label}
+            for no, frac, ratio, label in SEGMENT_SPECS]
+
+
+def segment_windows(n: int, plan: list[dict]) -> list[dict]:
+    """正文目录条目数 n + 计划 → 每段加上 [start, end) 目录下标窗口（纯函数）。
+
+    start = int(n × frac)（夹到 n-1），窗口止于下一段起点（末段到目录尾），段间不重叠。
+    章节不足导致窗口为空的段并入前一段（目标字数一并加过去）；开头就为空的往后顺延。n ≤ 0 → []。"""
+    if n <= 0:
+        return []
+    starts = [min(n - 1, int(n * seg['frac'])) for seg in plan]
+    out: list[dict] = []
+    carry = 0
+    for i, seg in enumerate(plan):
+        start = starts[i]
+        end = starts[i + 1] if i + 1 < len(plan) else n
+        if start >= end:
+            if out:
+                out[-1]['target'] += seg['target']
+            else:
+                carry += seg['target']
+            continue
+        out.append({**seg, 'target': seg['target'] + carry, 'start': start, 'end': end})
+        carry = 0
+    return out
+
+
+def segment_usable(result: dict, target: int) -> tuple[bool, str]:
+    """一次「某源某段」取文结果 → (可用?, 不可用原因)（纯函数）。
+
+    result 需含 requested（发出的 content 请求数）、eff_chars（过 prepare_book_text 清洗后的有效字数）、
+    stop（'target' | 'window_end' | 'preview' | 'deadline' | 'cap'）、preview_skipped（按标题跳过的试读章数）。
+    不可用：没发出请求 / 章均有效字数 < SEG_MIN_AVG_CHARS（预览页、4xx 全空）/
+    有效字数 < 目标 × SEG_MIN_FILL_RATIO（窗口里的正文章本来就不够——窗口抓完且没有试读章被跳过——除外）。"""
+    requested = result.get('requested', 0)
+    eff = result.get('eff_chars', 0)
+    if requested <= 0:
+        return False, 'no_request'
+    if eff / requested < SEG_MIN_AVG_CHARS:
+        return False, 'preview'
+    natural_end = result.get('stop') == 'window_end' and not result.get('preview_skipped')
+    if eff < target * SEG_MIN_FILL_RATIO and not natural_end:
+        return False, 'short'
+    return True, ''
+
+
+def _segment_chapter_text(engine_cli, ch_url: str) -> str:
+    """分段模式单章取正文：最多 SEG_CHAPTER_ATTEMPTS 次，确定性错误不重试；失败返回 ''（记为有效 0 字）。"""
+    for attempt in range(SEG_CHAPTER_ATTEMPTS):
+        try:
+            return _engine_json(engine_cli, 'content', '--url', ch_url).get('text') or ''
+        except EngineCliError as e:
+            if e.kind in DETERMINISTIC_ENGINE_ERRORS:
+                return ''
+        except Exception:
+            pass
+        if attempt + 1 < SEG_CHAPTER_ATTEMPTS:
+            time.sleep(2 * (attempt + 1))
+    return ''
+
+
+def _effective_chars(parts: list[str], preview_skipped: int) -> int:
+    """段原文 → 有效字数：复用 prepare_book_text 的清洗/去重/试读章剔除（引擎口径 clean=True）。"""
+    if not parts:
+        return 0
+    return prepare_book_text('\n\n'.join(parts), clean=True, preview_dropped=preview_skipped)[1]
+
+
+def fetch_segment(engine_cli, chapters: list[dict], window: dict, deadline: float,
+                  clock: Callable[[], float] = time.monotonic) -> dict:
+    """从一个源的正文目录 chapters 的 [start, end) 窗口顺序取整章，直到原文字数达 window['target']。
+
+    → {parts, raw_chars, eff_chars, requested, first, last, stop, preview_skipped}；first/last 为目录下标。
+    标题带 APP免费 的章抓取前跳过（不发请求）；每请求 SEG_PROBE_CHAPTERS 章后按章均有效字数
+    < SEG_MIN_AVG_CHARS 早退（stop='preview'），墙钟到 deadline 即停（stop='deadline'）。"""
+    target = window['target']
+    parts: list[str] = []
+    raw = requested = preview_skipped = 0
+    first = last = None
+    stop = 'window_end'
+    for idx in range(window['start'], window['end']):
+        if raw >= target:
+            break
+        if clock() >= deadline:
+            stop = 'deadline'
+            break
+        ch = chapters[idx]
+        title = (ch.get('title') or '').strip()
+        if is_preview_title(title):
+            preview_skipped += 1
+            continue
+        text = _segment_chapter_text(engine_cli, ch['url'])
+        requested += 1
+        if len(text) > 100:
+            parts.append(f'【{clean_chapter_title(title)}】\n{text}')
+            raw += len(text)
+            first = idx if first is None else first
+            last = idx
+        if requested >= SEG_PROBE_CHAPTERS and raw < target \
+                and _effective_chars(parts, preview_skipped) / requested < SEG_MIN_AVG_CHARS:
+            stop = 'preview'
+            break
+        time.sleep(CHAPTER_DELAY)
+    if raw >= target:
+        stop = 'target'
+    return {'parts': parts, 'raw_chars': raw, 'eff_chars': _effective_chars(parts, preview_skipped),
+            'requested': requested, 'first': first, 'last': last, 'stop': stop,
+            'preview_skipped': preview_skipped}
+
+
+def segment_marker(window: dict | None, no: int, first: int | None = None,
+                   last: int | None = None) -> str:
+    """段标注行：取到 → 【第 N 段：位置，第 a–b 章】（章号 = 正文目录序号，1 起）；未取到 → 【第 N 段：未取到】。"""
+    if window is None or first is None:
+        return f'【第 {no} 段：未取到】'
+    return f'【第 {no} 段：{window["label"]}，第 {first + 1}–{last + 1} 章】'
+
+
+def fetch_book_text_segmented(engine_cli, book: dict, tracker: SourceGiveupTracker,
+                              total_chars: int = ENGINE_TARGET_CHARS,
+                              time_budget_s: int = SEG_TIME_BUDGET_S,
+                              stats: dict | None = None,
+                              clock: Callable[[], float] = time.monotonic
+                              ) -> tuple[str, int, dict, dict]:
+    """分布式采样取文（LABELER_SEGMENTED=1）→ (带段标注的拼接原文, 原文字数, 实际所用主源, sampling 诊断)。
+
+    候选源 = 名单主源 + engine_alternates（跳过 tracker.dead）；每源目录只取一次，身份校验同
+    fetch_book_text_engine（_check_toc_identity）：主源不符照旧抛 EngineIdentityMismatch，备选不符只跳过。
+    段窗口按「计划源」（第一个目录可用且身份通过的源）的正文目录定；各段独立判可用性（segment_usable），
+    不可用就换下一个候选源补这一段（上一段成功的源排最前）。整本墙钟 time_budget_s 秒，到时即停，
+    已取到的段照用，其余段标「未取到」。所有源都不可用的段：最好一次是真正文只是偏短 → 用它（partial），
+    否则标未取到。一段都没取到 → 抛 EngineSourceGaveUp。
+    stats 同 fetch_book_text_engine：toc_author/toc_title（计划源，已过身份校验）、nonbody_chapters、preview_chapters。"""
+    started = clock()
+    deadline = started + time_budget_s
+    stats = stats if stats is not None else {}
+    stats.setdefault('nonbody_chapters', 0)
+    stats.setdefault('preview_chapters', 0)
+    expect_title, expect_author = book.get('title') or '', book.get('author') or ''
+    primary = {'url': book['url'], 'title': expect_title,
+               'source': book.get('source_host') or _url_host(book['url'])}
+    options = [primary] + list(book.get('engine_alternates') or [])
+    tocs: dict[str, dict | None] = {}
+
+    def toc_of(i: int) -> dict | None:
+        """第 i 个候选源的正文目录 {chapters, toc_title, toc_author, nonbody}；不可用 → None（缓存）。"""
+        src = options[i]
+        if src['url'] in tocs:
+            return tocs[src['url']]
+        host = src.get('source') or _url_host(src['url'])
+        entry = None
+        if host in tracker.dead:
+            print(f'  跳过本轮已失效源: {host}')
+        elif clock() < deadline:
+            try:
+                toc = _engine_json(engine_cli, 'toc', '--url', src['url'])
+                toc_title, toc_author = _check_toc_identity(toc, expect_title, expect_author)
+                raw = [c for c in (toc.get('chapters') or []) if c.get('url')]
+                body = [c for c in raw if not is_nonbody_toc_title((c.get('title') or '').strip())]
+                entry = {'chapters': body, 'toc_title': toc_title, 'toc_author': toc_author,
+                         'nonbody': len(raw) - len(body)} if body else None
+            except EngineIdentityMismatch:
+                if i == 0:
+                    raise
+                print(f'  备选源 {host} 目录身份不符，跳过')
+            except EngineCliError as e:
+                print(f'  源 {host} 目录失败，跳过: {e}')
+                if e.kind in DETERMINISTIC_ENGINE_ERRORS:
+                    tracker.record(host)
+            except Exception as e:
+                print(f'  源 {host} 目录失败，跳过: {e}')
+        tocs[src['url']] = entry
+        return entry
+
+    plan_i, windows = None, []
+    for i in range(len(options)):
+        entry = toc_of(i)
+        if entry is not None:
+            plan_i = i
+            windows = segment_windows(len(entry['chapters']), segment_plan(total_chars))
+            stats['toc_title'], stats['toc_author'] = entry['toc_title'], entry['toc_author']
+            stats['nonbody_chapters'] += entry['nonbody']
+            break
+    if plan_i is None:
+        raise EngineSourceGaveUp(primary['source'], 'no_source',
+                                 f'{len(options)} 个候选源目录均不可用')
+    pieces, raw_total, seg_diag = [], 0, []
+    last_ok = plan_i
+    for win in windows:
+        order = [last_ok] + [i for i in range(len(options)) if i != last_ok]
+        best, tried = None, []
+        for i in order:
+            if clock() >= deadline:
+                break
+            entry = toc_of(i)
+            if entry is None:
+                continue
+            src_win = next((w for w in segment_windows(len(entry['chapters']), segment_plan(total_chars))
+                            if w['no'] == win['no']), None) if i != plan_i else win
+            if src_win is None:
+                continue
+            src_win = {**src_win, 'target': win['target']}
+            res = fetch_segment(engine_cli, entry['chapters'], src_win, deadline, clock)
+            ok, why = segment_usable(res, win['target'])
+            host = options[i].get('source') or _url_host(options[i]['url'])
+            tried.append(f'{host}:{why or "ok"}')
+            res.update(src_i=i, window=src_win, ok=ok)
+            if ok:
+                best = res
+                last_ok = i
+                break
+            print(f'  第 {win["no"]} 段 {host} 不可用（{why}，有效 {res["eff_chars"]} 字/'
+                  f'{res["requested"]} 章），换源补段')
+            if res['parts'] and res['eff_chars'] / max(res['requested'], 1) >= SEG_MIN_AVG_CHARS \
+                    and (best is None or res['eff_chars'] > best['eff_chars']):
+                best = res              # 真正文但偏短：留作兜底（partial）
+        if best is None:
+            pieces.append(segment_marker(None, win['no']))
+            seg_diag.append({'no': win['no'], 'missing': True, 'tried': tried})
+            continue
+        src = options[best['src_i']]
+        pieces.append(segment_marker(best['window'], win['no'], best['first'], best['last'])
+                      + '\n\n' + '\n\n'.join(best['parts']))
+        raw_total += best['raw_chars']
+        stats['preview_chapters'] += best['preview_skipped']
+        seg_diag.append({'no': win['no'], 'source': src.get('source') or _url_host(src['url']),
+                         'chapters': f'{best["first"] + 1}-{best["last"] + 1}',
+                         'chars': best['eff_chars'], 'switched': best['src_i'] != plan_i,
+                         'partial': not best['ok'], 'tried': tried})
+    sampling = {'mode': 'segmented', 'fetch_secs': round(clock() - started, 1),
+                'segments': seg_diag}
+    if not raw_total:
+        raise EngineSourceGaveUp(primary['source'], 'no_source', '分段取文各段均未取到正文')
+    return '\n\n'.join(pieces), raw_total, options[plan_i], sampling
+
+
 # ---- 每轮失败分类（labelerdiag41 P3：巡检要一眼分出是代码缺陷、LLM 渠道还是书源问题）----
 # 旧口径只有「成功 N / 失败 M」，诊断时得逐本翻 gate.log 归类。main 每记一次失败就归一类，
 # 轮末在「完成」行之后单独打一行分类计数（「完成」行逐字不变，门卫按它解析）。
@@ -1986,6 +2295,79 @@ def merge_text_quality(segments: list[dict]) -> tuple[object, list[str]]:
     return worst, evidence
 
 
+# ---- 后期落差字段 arc 的解析与证据校验（lblseg41）----
+# 分段模式下模型输出 arc；这里只信「能在送入文本里找到原文」的证据，防止对照组误报（lblab-41 §3.6(c)）：
+# quote 归一空白后必须是**所标段号那段**文本的子串，找不到或段号不对的丢弃；decline 为 mild/severe 时
+# 有效证据须 ≥ ARC_MIN_EVIDENCE 条且覆盖 ≥2 个不同段，否则降为 unknown；缺开头或第 3、4 段都缺 → 强制 unknown。
+ARC_DECLINES = ('none', 'mild', 'severe', 'unknown')
+ARC_MIN_EVIDENCE = 2
+ARC_QUOTE_MAX = 50
+ARC_QUOTE_MIN = 6           # 归一后短于此的摘录（「他说」这种）在任何文本里都找得到，不算证据
+ARC_EVIDENCE_MAX = 6
+ARC_NOTE_MAX = 200
+_SEG_MARKER_RE = re.compile(r'【第 (\d+) 段：[^】\n]*】')
+_WS_RE = re.compile(r'\s+')
+
+
+def segment_bodies(text: str) -> dict[int, str]:
+    """带段标注的送模文本 → {段号: 该段正文（去掉全部空白）}（纯函数）。未取到的段为空串。"""
+    marks = list(_SEG_MARKER_RE.finditer(text))
+    out: dict[int, str] = {}
+    for i, m in enumerate(marks):
+        end = marks[i + 1].start() if i + 1 < len(marks) else len(text)
+        out[int(m.group(1))] = _WS_RE.sub('', text[m.end():end])
+    return out
+
+
+def _arc_segment_no(value) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and value.strip().isdigit():
+        return int(value.strip())
+    return None
+
+
+def normalize_arc(value, sent_text: str) -> dict:
+    """模型输出的 arc + 实际送入模型的文本 → 校验后的 arc（纯函数）。
+
+    → {decline, evidence: [{segment, quote}], note, checked: {dropped, forced}}；
+    checked.dropped = 被丢弃的证据条数，checked.forced = 强制降为 unknown 的原因（'' = 未强制）。"""
+    bodies = segment_bodies(sent_text)
+    raw = value if isinstance(value, dict) else {}
+    decline = raw.get('decline')
+    decline = decline.strip().lower() if isinstance(decline, str) else ''
+    if decline not in ARC_DECLINES:
+        decline = 'unknown'
+    items = raw.get('evidence') if isinstance(raw.get('evidence'), list) else []
+    evidence: list[dict] = []
+    dropped = 0
+    for item in items:
+        seg = _arc_segment_no(item.get('segment')) if isinstance(item, dict) else None
+        quote = item.get('quote') if isinstance(item, dict) else None
+        quote = quote.strip()[:ARC_QUOTE_MAX] if isinstance(quote, str) else ''
+        norm = _WS_RE.sub('', quote)
+        entry = {'segment': seg, 'quote': quote}
+        if seg is None or len(norm) < ARC_QUOTE_MIN or norm not in bodies.get(seg, '') \
+                or entry in evidence or len(evidence) >= ARC_EVIDENCE_MAX:
+            dropped += 1
+            continue
+        evidence.append(entry)
+    present = {no for no, body in bodies.items() if body}
+    forced = ''
+    if 1 not in present or not present & {3, 4}:
+        forced = 'missing_segments'
+    elif decline in ('mild', 'severe') and (
+            len(evidence) < ARC_MIN_EVIDENCE or len({e['segment'] for e in evidence}) < 2):
+        forced = 'weak_evidence'
+    if forced:
+        decline = 'unknown'
+    note = raw.get('note')
+    note = note.strip()[:ARC_NOTE_MAX] if isinstance(note, str) else ''
+    return {'decline': decline, 'evidence': evidence, 'note': note,
+            'checked': {'dropped': dropped, 'forced': forced}}
+
 MODEL_RETRY = 2            # 打标时每个模型最多尝试次数
 
 # ---- LLM 输出预算与失败归因（llmchan41 §4）----
@@ -2153,7 +2535,8 @@ def _log_model(context: str, message: str) -> None:
 
 def label_book(text: str, api_key: str, models: list[str],
                site_title: str = '', site_author: str = '',
-               max_tokens: dict | None = None, meta: dict | None = None) -> tuple[dict, int]:
+               max_tokens: dict | None = None, meta: dict | None = None,
+               system_prompt: str = SYSTEM_PROMPT) -> tuple[dict, int]:
     """50 万字文本 → (标签 dict, 实际调用次数)。
     两段式：每段 ≤25 万字独立过 CF 100s 线（实测 40 万字单段 prefill 必撞 524）。
     第二段带第一段结论合并，可修正只看开头的误判；text_quality 两段各判、按 merge_text_quality 合并。
@@ -2167,19 +2550,22 @@ def label_book(text: str, api_key: str, models: list[str],
     context = f'书目={site_title or "（未知）"}'
     if len(text) <= SEGMENT_CHARS:
         labels = _label_once(text, api_key, models, verification,
-                             context=f'{context} 分段=1/1', max_tokens=max_tokens, used=used)
+                             context=f'{context} 分段=1/1', max_tokens=max_tokens, used=used,
+                             system_prompt=system_prompt)
         if meta is not None:
             meta['label_model'] = used.get('label_model', '')
         return labels, 1
     seg1, seg2 = text[:SEGMENT_CHARS], text[SEGMENT_CHARS:]
     labels1 = _label_once(seg1, api_key, models, verification,
-                          context=f'{context} 分段=1/2', max_tokens=max_tokens, used=used)
+                          context=f'{context} 分段=1/2', max_tokens=max_tokens, used=used,
+                          system_prompt=system_prompt)
     merged_user = (
         "【前次阅读结论】\n" + json.dumps(labels1, ensure_ascii=False)
         + "\n\n【后续文本】\n" + seg2 + MERGE_PROMPT_SUFFIX
     )
     labels2 = _label_once(merged_user, api_key, models, verification,
-                          context=f'{context} 分段=2/2', max_tokens=max_tokens, used=used)
+                          context=f'{context} 分段=2/2', max_tokens=max_tokens, used=used,
+                          system_prompt=system_prompt)
     quality, evidence = merge_text_quality([labels1, labels2])
     if quality is not None:
         labels2['text_quality'] = quality
@@ -2191,7 +2577,8 @@ def label_book(text: str, api_key: str, models: list[str],
 
 def _label_once(user_content: str, api_key: str, models: list[str],
                 verification: str = '', *, context: str = '',
-                max_tokens: dict | None = None, used: dict | None = None) -> dict:
+                max_tokens: dict | None = None, used: dict | None = None,
+                system_prompt: str = SYSTEM_PROMPT) -> dict:
     """单次 LLM 调用。流式。对链中每个模型最多试 MODEL_RETRY 次，
     某模型连续 MODEL_RETRY 次失败即切换下一个；全部模型耗尽才算本次失败。
     输出被截断 / 上游空回不在同模型上重试（同预算重试大概率同样结果），直接换下一个模型。
@@ -2210,7 +2597,7 @@ def _label_once(user_content: str, api_key: str, models: list[str],
             body = json.dumps({
                 'model': model, 'stream': True, 'max_tokens': limit,
                 'messages': [
-                    {'role': 'system', 'content': SYSTEM_PROMPT},
+                    {'role': 'system', 'content': system_prompt},
                     {'role': 'user', 'content': user_content + verification},
                 ],
             }).encode('utf-8')
