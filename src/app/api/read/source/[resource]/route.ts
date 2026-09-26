@@ -10,6 +10,7 @@ import {
   SourceReaderError, SourceRequestContext, surveySourceBooks,
 } from '@/lib/source-reader';
 import { attachSwitchedCatalog } from '@/lib/reader-switch-catalog';
+import { withDbQuotaGuard } from '@/lib/db-quota-guard';
 
 export const runtime = 'nodejs';
 export const maxDuration = 60;
@@ -38,7 +39,7 @@ async function withSwitchedCatalog(part: Awaited<ReturnType<typeof readSourceCha
   });
 }
 
-export async function GET(req: NextRequest, { params }: { params: Promise<{ resource: string }> }) {
+async function handleGET(req: NextRequest, { params }: { params: Promise<{ resource: string }> }) {
   const startedAt = Date.now();
   const auth = await requirePermission(req, 'read');
   if (!auth.ok) {
@@ -107,3 +108,6 @@ export async function GET(req: NextRequest, { params }: { params: Promise<{ reso
     deadline.dispose();
   }
 }
+
+// 数据库配额闸（41-q402fix）：导出的处理器统一经 withDbQuotaGuard 包装（route-guard.test.ts 钉死）。
+export const GET = withDbQuotaGuard(handleGET);

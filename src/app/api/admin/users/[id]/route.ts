@@ -3,6 +3,7 @@ import { guardOwnerWrite } from '@/lib/admin-http';
 import { authError, authJson } from '@/lib/auth-http';
 import { getSql } from '@/lib/db';
 import { boundedPositiveInteger, readJsonBody, RequestBodyError } from '@/lib/http';
+import { withDbQuotaGuard } from '@/lib/db-quota-guard';
 
 const MAX_BODY_BYTES = 2 * 1024;
 const UNAVAILABLE = '用户设置暂时不可用，请稍后重试。';
@@ -10,7 +11,7 @@ const UNAVAILABLE = '用户设置暂时不可用，请稍后重试。';
 // owner 修改一个成员的三项能力或禁用状态。id=1 的 owner 行有 CHECK 约束钉死，
 // 界面不提供入口、接口也直接拒绝——绝不在这里给 owner 降权或改名。
 // 权限组合与表上的 CHECK 同一套语义，先在接口层给出可读错误，再让数据库兜底。
-export async function PATCH(req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
+async function handlePATCH(req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
   const guard = await guardOwnerWrite(req);
   if (!guard.ok) return guard.response;
 
@@ -86,3 +87,6 @@ export async function PATCH(req: NextRequest, { params }: { params: Promise<{ id
     return authError(503, 'USERS_UNAVAILABLE', UNAVAILABLE);
   }
 }
+
+// 数据库配额闸（41-q402fix）：导出的处理器统一经 withDbQuotaGuard 包装（route-guard.test.ts 钉死）。
+export const PATCH = withDbQuotaGuard(handlePATCH);

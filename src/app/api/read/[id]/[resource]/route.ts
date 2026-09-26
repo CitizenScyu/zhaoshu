@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { requirePermission } from '@/lib/auth';
 import { withAuthHeaders } from '@/lib/auth-http';
 import { getReadableTask, readBookIndex, readBookPart, readerAvailability, ReaderError } from '@/lib/reader-server';
+import { withDbQuotaGuard } from '@/lib/db-quota-guard';
 
 // One route/function serves both index and chapter requests, so warm instances
 // share a bounded TXT cache. No book content is placed in a public/CDN cache.
@@ -26,7 +27,7 @@ function parseOrdinal(value: string | null): number | null {
   return Number.isSafeInteger(parsed) ? parsed : null;
 }
 
-export async function GET(
+async function handleGET(
   req: NextRequest,
   { params }: { params: Promise<{ id: string; resource: string }> },
 ) {
@@ -63,3 +64,6 @@ export async function GET(
     return privateResponse({ error: '阅读服务暂时不可用，请稍后重试。' }, 500);
   }
 }
+
+// 数据库配额闸（41-q402fix）：导出的处理器统一经 withDbQuotaGuard 包装（route-guard.test.ts 钉死）。
+export const GET = withDbQuotaGuard(handleGET);

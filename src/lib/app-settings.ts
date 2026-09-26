@@ -1,4 +1,15 @@
 import { getSql } from './db';
+import {
+  REASONING_CONFIRMATION_CODE,
+  type LlmModelSource,
+  type ReasoningVerdict,
+  type LlmModelSettings,
+} from './app-settings-shared';
+
+// 常量与纯类型现集中在 app-settings-shared.ts（客户端可安全 import，不拖入 db）。
+// 这里 re-export，服务端既有 import 路径（route.ts / llm.ts / 测试）无需改动。
+export { REASONING_CONFIRMATION_CODE };
+export type { LlmModelSource, ReasoningVerdict, LlmModelSettings };
 
 // 应用级配置表（app_settings，单行 id=1），由 business-schema 的运行时 DDL 建立。
 // 模型配置是应用配置、不是认证数据：这里绝不参与 auth-store 的 AUTH_SCHEMA_VERSION
@@ -9,37 +20,6 @@ export const MAX_MODEL_NAME_LENGTH = 200;
 // 保守字符集：字母数字与 . _ - /（渠道常见形如 vendor/model、claude-opus-5-88）。
 // 空白、控制字符或其他标点一律拒绝，避免把任意内容带进上游请求体。
 const MODEL_NAME_PATTERN = /^[A-Za-z0-9._/-]+$/;
-
-export type LlmModelSource = 'database' | 'environment' | 'default';
-
-// 「是不是推理模型」的判定值。**必须是三态**：一次小探测能证明「是」（真的观测到思维链），
-// 却证明不了「不是」（短提示词本来就不一定触发思维链，2026-09-17 实测旧判据对
-// claude-opus-5-88 报过 false）。'no' 只在将来有「这次探测确实有能力区分」的论证时才可以用，
-// 当前没有任何生产者会返回它；探测结果只能是 'yes' 或 'unknown'。
-export type ReasoningVerdict = 'yes' | 'no' | 'unknown';
-
-// PATCH 在「判为推理模型、但请求体没带确认标志」时用的错误码。放在这里是因为接口与前端
-// 必须用同一个字面量：写在两边各一份，改一处就会让确认块静默失效、退回成普通报错。
-export const REASONING_CONFIRMATION_CODE = 'REASONING_MODEL_REQUIRES_CONFIRMATION';
-
-export interface LlmModelSettings {
-  model: string;
-  /**
-   * 「恢复默认」会回到的模型，也就是 llm_model 没有覆盖值时的生效值。
-   * 解析顺序：库内 default_model → 环境变量 LLM_MODEL → 硬编码 DEFAULT_LLM_MODEL。
-   */
-  defaultModel: string;
-  /** 当前生效模型（model）的来源。数据库覆盖 → 库内默认值 → 环境变量 → 硬编码缺省。 */
-  source: LlmModelSource;
-  /** 默认值（defaultModel）自己的来源，与 source 相互独立（见 resolveDefaultModel）。 */
-  defaultSource: LlmModelSource;
-  /** llm_model 覆盖值的写入时间；没有覆盖时为 null。 */
-  updatedAt: string | null;
-  /** default_model 覆盖值的写入时间；没有覆盖时为 null。 */
-  defaultUpdatedAt: string | null;
-  /** 当前生效模型的推理判定；来源不是数据库时为 null（环境变量里的模型从没探测过）。 */
-  reasoning: ReasoningVerdict | null;
-}
 
 export function isValidModelName(value: unknown): value is string {
   return typeof value === 'string'

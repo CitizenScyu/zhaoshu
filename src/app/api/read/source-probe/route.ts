@@ -7,6 +7,7 @@ import { cleanString } from '@/lib/sanitize';
 import { getFanoutPool, sourceFanoutEnabled, sourceFanoutLimit } from '@/lib/shuyuan';
 import { SOURCE_PROBE_BUDGET_MS, probeResultForPanel, probeSourceForBook, sourceStationKey } from '@/lib/source-reader';
 import { SourceProbeRateLimitUnavailableError, checkSourceProbeRateLimit } from '@/lib/source-probe-rate-limit';
+import { withDbQuotaGuard } from '@/lib/db-quota-guard';
 
 // 41-fanout 第一期（服务端）：浏览器换源面板逐源并发的单源入口。一次调用只查一个源，不循环、不遍历池。
 //   GET /api/read/source-probe                              → 扇出候选列表（面板据此决定发哪些 probe）
@@ -30,7 +31,7 @@ function hostOf(url: string): string {
   try { return new URL(url).hostname; } catch { return ''; }
 }
 
-export async function GET(req: NextRequest) {
+async function handleGET(req: NextRequest) {
   const auth = await requirePermission(req, 'read');
   if (!auth.ok) {
     const rejected = withAuthHeaders(auth.response);
@@ -92,3 +93,6 @@ export async function GET(req: NextRequest) {
     deadline.dispose();
   }
 }
+
+// 数据库配额闸（41-q402fix）：导出的处理器统一经 withDbQuotaGuard 包装（route-guard.test.ts 钉死）。
+export const GET = withDbQuotaGuard(handleGET);

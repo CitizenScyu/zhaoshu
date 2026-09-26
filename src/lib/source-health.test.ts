@@ -57,7 +57,19 @@ describe('source-health (S5-1)', () => {
     const sql = sqlMock(async () => [{ name: 'drain', last_success_at: '2026-09-23T06:00:00.000Z' }]);
     mocks.getSql.mockReturnValue(sql);
     expect(await readCronSuccessTimes()).toEqual({
-      reclaim: null, drain: '2026-09-23T06:00:00.000Z',
+      reclaim: null, drain: '2026-09-23T06:00:00.000Z', dbQuotaSeenAt: null,
+    });
+    expect(sql).toHaveBeenCalledOnce();
+  });
+
+  it('readCronSuccessTimes 同一次查询带回 db_quota_exceeded 行（41-q402fix），不串进 cron 字段', async () => {
+    const sql = sqlMock(async () => [
+      { name: 'reclaim', last_success_at: '2026-09-23T05:00:00.000Z' },
+      { name: 'db_quota_exceeded', last_success_at: '2026-09-25T03:43:00.000Z' },
+    ]);
+    mocks.getSql.mockReturnValue(sql);
+    expect(await readCronSuccessTimes()).toEqual({
+      reclaim: '2026-09-23T05:00:00.000Z', drain: null, dbQuotaSeenAt: '2026-09-25T03:43:00.000Z',
     });
     expect(sql).toHaveBeenCalledOnce();
   });

@@ -12,6 +12,7 @@ import { BodyReadError, encodeArtifactPath, gitBlobSha, readBoundedBody } from '
 import { MAX_MANIFEST_BYTES, isVolumeManifestPath, parseVolumeManifest, volumeReadPaths } from '@/lib/volume-manifest';
 import type { VolumeEntry, VolumeManifest } from '@/lib/volume-manifest';
 import { MAX_READER_BYTES } from '@/lib/txt-chapters';
+import { withDbQuotaGuard } from '@/lib/db-quota-guard';
 
 // 下载完成的任务取回 TXT:文件在 GitHub 私库 CitizenScyu/zhaoshu-books 的 books/ 下
 export const maxDuration = 60;
@@ -208,7 +209,7 @@ async function downloadVolumeBook(artifact: ArtifactLocation, title: string, sig
   });
 }
 
-export async function GET(
+async function handleGET(
   req: NextRequest,
   { params }: { params: Promise<{ id: string }> },
 ) {
@@ -282,3 +283,6 @@ export async function GET(
     return authJson({ error: '文件服务暂不可用，请稍后重试', code: 'UPSTREAM_ERROR' }, { status: 502 });
   }
 }
+
+// 数据库配额闸（41-q402fix）：导出的处理器统一经 withDbQuotaGuard 包装（route-guard.test.ts 钉死）。
+export const GET = withDbQuotaGuard(handleGET);

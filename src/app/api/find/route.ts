@@ -31,6 +31,7 @@ import {
 } from '@/lib/prompts';
 import type { SourceEvidence, VerifiedCandidate } from '@/lib/types';
 import { DeadlineExceededError, MODEL_ROUTE_INTERNAL_BUDGET_MS } from '@/lib/deadline';
+import { withDbQuotaGuard } from '@/lib/db-quota-guard';
 
 export const maxDuration = 295;
 
@@ -167,7 +168,7 @@ function rerankInput(verified: VerifiedCandidate[]) {
   }));
 }
 
-export async function POST(req: NextRequest) {
+async function handlePOST(req: NextRequest) {
   return withFindAccess(req, MODEL_ROUTE_INTERNAL_BUDGET_MS, async (access) => {
     const { userId } = access.principal;
     const deadline = access.deadline;
@@ -419,3 +420,6 @@ export async function POST(req: NextRequest) {
     });
   });
 }
+
+// 数据库配额闸（41-q402fix）：导出的处理器统一经 withDbQuotaGuard 包装（route-guard.test.ts 钉死）。
+export const POST = withDbQuotaGuard(handlePOST);

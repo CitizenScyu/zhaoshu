@@ -10,6 +10,7 @@ import {
   ShuyuanRefreshPartialError,
 } from '@/lib/shuyuan';
 import { parseSourceFilter, parseSourcePage } from '@/lib/shuyuan-view';
+import { withDbQuotaGuard } from '@/lib/db-quota-guard';
 
 // 书源管理：GET 看统计/分页明细（owner）或由 Vercel cron 触发刷新，
 // POST 手动刷新 / 打失效标记 / 重新启用。
@@ -39,7 +40,7 @@ function partialCode(e: unknown): { code: string } | undefined {
   return e instanceof ShuyuanRefreshPartialError ? { code: e.code } : undefined;
 }
 
-export async function GET(req: NextRequest) {
+async function handleGET(req: NextRequest) {
   const cron = cronRequest(req);
   const auth = cron ? null : await requirePermission(req, 'download');
   if (auth && !auth.ok) return withAuthHeaders(auth.response);
@@ -65,7 +66,7 @@ export async function GET(req: NextRequest) {
   }
 }
 
-export async function POST(req: NextRequest) {
+async function handlePOST(req: NextRequest) {
   // 写校验（能力位 + 同源固定头 + JSON 类型）必须在 refresh / 打标之前完成；GET 保持只读语义不加写校验。
   const guard = await guardPermissionWrite(req, 'download');
   if (!guard.ok) return guard.response;
@@ -112,3 +113,7 @@ export async function POST(req: NextRequest) {
     return authJson({ error: '刷新失败', ...partialCode(e) }, { status: 502 });
   }
 }
+
+// 数据库配额闸（41-q402fix）：导出的处理器统一经 withDbQuotaGuard 包装（route-guard.test.ts 钉死）。
+export const GET = withDbQuotaGuard(handleGET);
+export const POST = withDbQuotaGuard(handlePOST);

@@ -14,6 +14,7 @@ import { withFindAccess, personalError, type PersonalRequest } from '@/lib/perso
 import { DeadlineExceededError, MODEL_ROUTE_INTERNAL_BUDGET_MS } from '@/lib/deadline';
 import type { ProfileSnapshot, SeedBook } from '@/lib/types';
 import { removedSeedBooks } from '@/lib/profile-seeds';
+import { withDbQuotaGuard } from '@/lib/db-quota-guard';
 
 export const maxDuration = 295;
 
@@ -40,14 +41,14 @@ async function conflict(access: PersonalRequest, draft?: { seeds: SeedBook[]; co
   }, { status: 409 });
 }
 
-export async function GET(req: NextRequest) {
+async function handleGET(req: NextRequest) {
   return withFindAccess(req, MODEL_ROUTE_INTERNAL_BUDGET_MS, async (access) => {
     await access.run(ensureSchema);
     return NextResponse.json(await access.run(() => getProfileForUser(access.principal.userId)));
   });
 }
 
-export async function PUT(req: NextRequest) {
+async function handlePUT(req: NextRequest) {
   return withFindAccess(req, MODEL_ROUTE_INTERNAL_BUDGET_MS, async (access) => {
     const body = await access.run(() => readJsonBody(req, MAX_BODY_BYTES, access.signal));
     const seeds = body?.seeds;
@@ -90,7 +91,7 @@ export async function PUT(req: NextRequest) {
   });
 }
 
-export async function POST(req: NextRequest) {
+async function handlePOST(req: NextRequest) {
   return withFindAccess(req, MODEL_ROUTE_INTERNAL_BUDGET_MS, async (access) => {
     const body = await access.run(() => readJsonBody(req, MAX_BODY_BYTES, access.signal));
     const expectedUpdatedAt = body?.updatedAt;
@@ -162,3 +163,8 @@ export async function POST(req: NextRequest) {
       ? { status: 502, code: 'LLM_ERROR', message: error.message } : personalError(error));
   });
 }
+
+// 数据库配额闸（41-q402fix）：导出的处理器统一经 withDbQuotaGuard 包装（route-guard.test.ts 钉死）。
+export const GET = withDbQuotaGuard(handleGET);
+export const PUT = withDbQuotaGuard(handlePUT);
+export const POST = withDbQuotaGuard(handlePOST);

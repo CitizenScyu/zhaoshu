@@ -5,6 +5,7 @@ import { downloadStatsForUserQuery, findStatsForUserQuery, shelfStatsForUserQuer
 import { ensureSchema, getLlmUsageStats, getSql } from '@/lib/db';
 import type { TokenStats } from '@/lib/llm-usage';
 import { getShuyuanCounts, getShuyuanPoolHealth, type ShuyuanCounts, type ShuyuanPoolHealth } from '@/lib/shuyuan';
+import { withDbQuotaGuard } from '@/lib/db-quota-guard';
 
 // 项目统计：聚合各表数据做「账本/战果」展示。全部用 SQL 聚合，不拉全表。
 // 每组独立容错：真实空数据为 0，查询失败的整个分区为 null。
@@ -44,7 +45,7 @@ export interface StatsResponse {
   code?: 'STATS_PARTIAL' | 'STATS_UNAVAILABLE';
 }
 
-export async function GET(req: NextRequest) {
+async function handleGET(req: NextRequest) {
   return withFindAccess(req, 55_000, async (access) => {
   const { userId } = access.principal;
   const allowedSections: StatsSection[] = ['library', 'find', 'shelf'];
@@ -187,3 +188,6 @@ export async function GET(req: NextRequest) {
   return NextResponse.json(stats);
   });
 }
+
+// 数据库配额闸（41-q402fix）：导出的处理器统一经 withDbQuotaGuard 包装（route-guard.test.ts 钉死）。
+export const GET = withDbQuotaGuard(handleGET);

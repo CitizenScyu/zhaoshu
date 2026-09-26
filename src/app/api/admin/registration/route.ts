@@ -5,6 +5,7 @@ import { authError, authJson } from '@/lib/auth-http';
 import { isRegistrationMode, readRegistrationSettings, writeRegistrationSettings } from '@/lib/invite-codes';
 import { getSql } from '@/lib/db';
 import { readJsonBody, RequestBodyError } from '@/lib/http';
+import { withDbQuotaGuard } from '@/lib/db-quota-guard';
 
 const MAX_BODY_BYTES = 2 * 1024;
 const UNAVAILABLE = '注册设置暂时不可用，请稍后重试。';
@@ -13,7 +14,7 @@ const UNAVAILABLE = '注册设置暂时不可用，请稍后重试。';
 // 重读这一行，所以「随时关闭」对已经发出的注册请求也是有界的（先提交的关闭生效）。
 // accountsEnabled 是**只读**的部署闸门快照（env AUTH_ACCOUNTS_ENABLED，运行时改不了）：
 // 管理台据此说明「下方开关是否真的生效」，因此没有对应的写入入口。
-export async function GET(req: NextRequest) {
+async function handleGET(req: NextRequest) {
   const guard = await guardOwnerRead(req);
   if (!guard.ok) return guard.response;
   try {
@@ -24,7 +25,7 @@ export async function GET(req: NextRequest) {
   }
 }
 
-export async function PATCH(req: NextRequest) {
+async function handlePATCH(req: NextRequest) {
   const guard = await guardOwnerWrite(req);
   if (!guard.ok) return guard.response;
 
@@ -68,3 +69,7 @@ export async function PATCH(req: NextRequest) {
     return authError(503, 'SETTINGS_UNAVAILABLE', UNAVAILABLE);
   }
 }
+
+// 数据库配额闸（41-q402fix）：导出的处理器统一经 withDbQuotaGuard 包装（route-guard.test.ts 钉死）。
+export const GET = withDbQuotaGuard(handleGET);
+export const PATCH = withDbQuotaGuard(handlePATCH);

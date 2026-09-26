@@ -1,4 +1,5 @@
 import { getSql } from './db';
+import { DB_QUOTA_HEALTH_ROW } from './db-quota';
 
 // 源池 / cron 健康观测（audit-41 S5-1）。三条 Vercel cron（shuyuan / reclaim / drain）
 // 失败时此前零告警通道——2026-09-21 源池停摆 10 小时，靠人肉盯 refreshed_at 才发现。
@@ -23,6 +24,11 @@ export type CronName = 'reclaim' | 'drain';
 export interface CronSuccessTimes {
   reclaim: string | null;
   drain: string | null;
+  /**
+   * 同表另一行（41-q402fix）：最近一次发现数据库配额错误的时刻（库恢复可写后由各进程补记，
+   * 见 db-quota.ts recordDbQuotaSeen）；不是 cron 成功时间，不参与 ok 判据。从未记录为 null。
+   */
+  dbQuotaSeenAt: string | null;
 }
 
 // cron 成功分支调用一次。监控写入失败绝不能把 cron 本身打挂（否则告警系统自己制造故障）：
@@ -39,15 +45,16 @@ export async function recordCronSuccess(name: CronName): Promise<void> {
   }
 }
 
-// 一次查询读回全部 cron 行（表最多两行，不做动态 WHERE IN）。缺行归一为 null。
+// 一次查询读回全部 cron 行（表最多三行，不做动态 WHERE IN）。缺行归一为 null。
 export async function readCronSuccessTimes(): Promise<CronSuccessTimes> {
   const rows = await getSql()`
     SELECT name, last_success_at::text AS last_success_at FROM cron_health` as {
     name: string; last_success_at: string | null;
   }[];
-  const out: CronSuccessTimes = { reclaim: null, drain: null };
+  const out: CronSuccessTimes = { reclaim: null, drain: null, dbQuotaSeenAt: null };
   for (const row of rows) {
     if (row.name === 'reclaim' || row.name === 'drain') out[row.name] = row.last_success_at;
+    else if (row.name === DB_QUOTA_HEALTH_ROW) out.dbQuotaSeenAt = row.last_success_at;
   }
   return out;
 }

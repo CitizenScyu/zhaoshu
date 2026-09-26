@@ -3,10 +3,11 @@ import { withFindAccess, personalError } from '@/lib/personal-request';
 import { hasPermission } from '@/lib/permissions';
 import { personalExportQueries } from '@/lib/user-data';
 import { ensureSchema, getSql } from '@/lib/db';
+import { withDbQuotaGuard } from '@/lib/db-quota-guard';
 
 export const maxDuration = 60;
 
-export async function GET(req: NextRequest) {
+async function handleGET(req: NextRequest) {
   return withFindAccess(req, 55_000, async (access) => {
   const { userId } = access.principal;
 
@@ -48,3 +49,6 @@ export async function GET(req: NextRequest) {
   }
   });
 }
+
+// 数据库配额闸（41-q402fix）：导出的处理器统一经 withDbQuotaGuard 包装（route-guard.test.ts 钉死）。
+export const GET = withDbQuotaGuard(handleGET);

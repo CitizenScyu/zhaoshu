@@ -3,6 +3,7 @@ import { authAccountsEnabled, principalFromSessionRecord, verifyOwnerHeader } fr
 import { findSessionByToken, getSessionTokenFromRequest } from '@/lib/auth-session';
 import { getSql } from '@/lib/db';
 import { authError, authJson } from '@/lib/auth-http';
+import { withDbQuotaGuard } from '@/lib/db-quota-guard';
 
 function ownerUser() {
   return {
@@ -19,7 +20,7 @@ function ownerUser() {
 // 匿名或当前凭据：无 Cookie 时 200 {user:null}；有效时只返回最小用户信息，
 // 绝不返回 token / hash；过期凭据 401，库故障 503，均 no-store。
 // accountsEnabled 是前端选择登录流程所需的部署开关，不是秘密（试登录接口即可探测）。
-export async function GET(req: NextRequest) {
+async function handleGET(req: NextRequest) {
   if (!authAccountsEnabled()) {
     // 旧模式不触碰数据库，也不把任何凭据当作已登录。
     return authJson({ user: null, accountsEnabled: false });
@@ -60,3 +61,6 @@ export async function GET(req: NextRequest) {
     },
   });
 }
+
+// 数据库配额闸（41-q402fix）：导出的处理器统一经 withDbQuotaGuard 包装（route-guard.test.ts 钉死）。
+export const GET = withDbQuotaGuard(handleGET);

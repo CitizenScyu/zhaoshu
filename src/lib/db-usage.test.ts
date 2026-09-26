@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { LLM_USAGE_PHASES, parseLlmUsage, type LlmUsageRecord, type TokenTotals } from './llm-usage';
 
 const mocks = vi.hoisted(() => ({ neon: vi.fn(), sql: vi.fn(), transaction: vi.fn(), query: vi.fn() }));
-vi.mock('@neondatabase/serverless', () => ({ neon: mocks.neon }));
+vi.mock('@neondatabase/serverless', () => ({ neon: mocks.neon, neonConfig: {} }));
 
 const zero: TokenTotals = { prompt: 0, completion: 0, total: 0, cache: 0, calls: 0, missingUsageCalls: 0 };
 const recall = { prompt: 120, completion: 30, total: 150, cache: 50, calls: 2, missingUsageCalls: 1 };

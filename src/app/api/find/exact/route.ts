@@ -12,6 +12,7 @@ import {
   type ExactBook,
   type ExactResponse,
 } from '@/lib/find-exact';
+import { withDbQuotaGuard } from '@/lib/db-quota-guard';
 
 // 精确找书（task-77）：按书名直搜，不是口味召回。
 //
@@ -119,7 +120,7 @@ async function withRatings(
   return items;
 }
 
-export async function POST(req: NextRequest) {
+async function handlePOST(req: NextRequest) {
   return withFindAccess(req, EXACT_BUDGET_MS, async (access) => {
     const body = await access.run(() => readJsonBody(req, MAX_BODY_BYTES, access.signal));
     const title = boundedString(body?.title, MAX_TITLE_LENGTH) ?? '';
@@ -173,3 +174,6 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ source: 'douban', items } satisfies ExactResponse);
   });
 }
+
+// 数据库配额闸（41-q402fix）：导出的处理器统一经 withDbQuotaGuard 包装（route-guard.test.ts 钉死）。
+export const POST = withDbQuotaGuard(handlePOST);

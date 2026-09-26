@@ -22,6 +22,7 @@ import { isJsonContentType, verifySameOriginWrite } from '@/lib/csrf';
 import { getSql } from '@/lib/db';
 import { authError, authJson } from '@/lib/auth-http';
 import { checkPasswordBounds, runDummyKdf, verifyPassword } from '@/lib/password';
+import { withDbQuotaGuard } from '@/lib/db-quota-guard';
 
 // 用户名 + 密码合计请求体上限 4 KiB（设计 §4.1）。
 const MAX_LOGIN_BODY_CHARS = 4096;
@@ -42,7 +43,7 @@ type MemberRow = {
   can_download: boolean;
 };
 
-export async function POST(req: NextRequest) {
+async function handlePOST(req: NextRequest) {
   if (!authAccountsEnabled()) {
     return authError(503, 'ACCOUNTS_DISABLED', 'account features are not enabled');
   }
@@ -177,3 +178,6 @@ export async function POST(req: NextRequest) {
   );
   return response;
 }
+
+// 数据库配额闸（41-q402fix）：导出的处理器统一经 withDbQuotaGuard 包装（route-guard.test.ts 钉死）。
+export const POST = withDbQuotaGuard(handlePOST);

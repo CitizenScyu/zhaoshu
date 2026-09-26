@@ -21,6 +21,7 @@ import { createBudgetRefund } from './budget-refund';
 import { createIdentityPrecheck } from './identity-precheck';
 import { createBuiltinFallback } from './builtin-fallback';
 import { createExecutor, DEFAULT_DECISIONS, type DailyBudgetLike, type DownloadExecutor, type LoopDecisions } from './executor';
+import { dbQuotaBackoffMs, recordDbQuotaSeen } from '../src/lib/db-quota';
 
 export type { DownloadExecutor, DailyBudgetLike, LoopDecisions } from './executor';
 
@@ -147,6 +148,7 @@ export async function createDownloadExecutor(options: ProductionExecutorOptions)
   if (!options.budgetStatePath) log('error', '日预算退还未接线：书源不可达仍会计入日预算', {});
   if (precheck && options.budgetLimit === undefined) log('error', '日预算上限未接线：额度已满时仍会跑身份预检', {});
 
+  const quotaSql = sql;
   return createExecutor({
     storage: storage as RuntimeStorage,
     github,
@@ -160,5 +162,8 @@ export async function createDownloadExecutor(options: ProductionExecutorOptions)
     owner: options.owner ?? `service-${process.pid}`,
     taskTimeoutMs: options.taskTimeoutMs,
     decisions: options.decisions ?? DEFAULT_DECISIONS,
+    // 数据库配额（Neon 402）长退避：默认 30 分钟，env DB_QUOTA_BACKOFF_MS 覆盖；恢复后在 cron_health 补记。
+    quotaBackoffMs: dbQuotaBackoffMs(env),
+    recordQuotaSeen: quotaSql ? (seenAt => recordDbQuotaSeen(quotaSql, seenAt)) : undefined,
   });
 }

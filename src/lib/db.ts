@@ -1,10 +1,11 @@
-import { neon } from '@neondatabase/serverless';
+import { neon, neonConfig } from '@neondatabase/serverless';
 import type { ProfileSnapshot, RerankedItem } from '@/lib/types';
 import { LLM_USAGE_PHASES, type LlmUsagePhase, type LlmUsageRecord, type TokenStats, type TokenTotals } from './llm-usage';
 import { assertAuthSchema } from './auth-store';
 import { initializeBusinessSchema, businessSchemaCurrent } from './business-schema';
 import type { PersonalWriter } from './personal-write';
 import { completeProfileFeedbackForUserQuery } from './user-data';
+import { quotaAwareFetch } from './db-quota-guard';
 import { requireUserId, profileForUserQuery, saveProfileForUserQuery, excludedBooksForUserQuery, persistRecommendationsForUserQueries, feedbackForUserQueries, feedbackSnapshotForUserQuery, recentInformativeFeedbackForUserQuery, withdrawnFeedbackBookTitlesForUserQuery, enqueueProfileFeedbackForUserQuery, profileFeedbackQueueForUserQuery, markProfileFeedbackAbsorbedForUserQuery, markProfileFeedbackFailedForUserQuery, markProfileFeedbackAbsorbedUncheckedForUserQuery, profileFeedbackFailCountForUserQuery, maxFeedbackIdForUserQuery, ensureProfileForUserQuery, claimProfileFeedbackForUserQuery, drainableProfileFeedbackUsersQuery, profileFeedbackBackoffMs } from './user-data';
 export { canonicalBookKey } from './book-identity';
 
@@ -17,6 +18,9 @@ export function getSql() {
     throw new Error('DATABASE_URL is not set');
   }
   if (!sql) {
+    // 配额闸（41-q402fix，见 db-quota-guard.ts）：驱动所有 HTTP 查询都经 neonConfig.fetchFunction 发出，
+    // 且 neon() 没有逐实例的 fetch 选项，只能设全局。
+    neonConfig.fetchFunction = quotaAwareFetch;
     sql = neon(DATABASE_URL);
   }
   return sql;

@@ -18,7 +18,7 @@ const mocks = vi.hoisted(() => ({
   neon: vi.fn(), ensureSchema: vi.fn(), getProfileForUser: vi.fn(), saveProfileForUser: vi.fn(),
   transaction: vi.fn(),
 }));
-vi.mock('@neondatabase/serverless', () => ({ neon: mocks.neon }));
+vi.mock('@neondatabase/serverless', () => ({ neon: mocks.neon, neonConfig: {} }));
 vi.mock('@/lib/db', async (importOriginal) => ({
   ...await importOriginal<typeof import('@/lib/db')>(),
   ensureSchema: mocks.ensureSchema, getProfileForUser: mocks.getProfileForUser,

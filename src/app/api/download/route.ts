@@ -8,6 +8,7 @@ import { boundedPositiveInteger, readJsonBody, RequestBodyError } from '@/lib/ht
 import { isLeaseExpired, reclaimStaleTasks, type DownloadSql } from '@/lib/download-task-reclaim';
 import { SourcePolicyError } from '@/lib/source-policy';
 import { resolveDownloadSource } from '@/lib/download-source';
+import { withDbQuotaGuard } from '@/lib/db-quota-guard';
 
 // 书库下载任务:GET 查任务(最近 20 条 / 单条 / 按书查本人最新一条)、POST 建任务、
 // DELETE 取消 pending/清理 failed/partial。GET 保持只读，过期租约由 POST 与 cron 回收。
@@ -85,7 +86,7 @@ function conflictResponse(existing: ActiveTask | null) {
   );
 }
 
-export async function GET(req: NextRequest) {
+async function handleGET(req: NextRequest) {
   const auth = await requirePermission(req, 'download');
   if (!auth.ok) return withAuthHeaders(auth.response);
   const { searchParams } = new URL(req.url);
@@ -134,7 +135,7 @@ export async function GET(req: NextRequest) {
   }
 }
 
-export async function POST(req: NextRequest) {
+async function handlePOST(req: NextRequest) {
   // 写校验（能力位 + 同源固定头 + JSON 类型）必须在建任务与 triggerDownloadWorkflow 之前完成。
   const guard = await guardPermissionWrite(req, 'download');
   if (!guard.ok) return guard.response;
@@ -211,7 +212,7 @@ export async function POST(req: NextRequest) {
   }
 }
 
-export async function DELETE(req: NextRequest) {
+async function handleDELETE(req: NextRequest) {
   // 与 POST 同款写校验：DELETE 删除任务前先过能力位 + 同源固定头（DELETE 无 JSON 正文要求）。
   const guard = await guardPermissionWrite(req, 'download');
   if (!guard.ok) return guard.response;
@@ -249,3 +250,8 @@ export async function DELETE(req: NextRequest) {
     return authJson({ error: 'db error', code: 'DB_ERROR' }, { status: 500 });
   }
 }
+
+// 数据库配额闸（41-q402fix）：导出的处理器统一经 withDbQuotaGuard 包装（route-guard.test.ts 钉死）。
+export const GET = withDbQuotaGuard(handleGET);
+export const POST = withDbQuotaGuard(handlePOST);
+export const DELETE = withDbQuotaGuard(handleDELETE);

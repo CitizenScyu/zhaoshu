@@ -3,13 +3,14 @@ import { ensureSchema, getSql } from '@/lib/db';
 import { withFindAccess, personalError } from '@/lib/personal-request';
 import { shelfExistsForUserQuery, addShelfForUserQueries, deleteShelfForUserQuery } from '@/lib/user-data';
 import { boundedPositiveInteger, readJsonBody } from '@/lib/http';
+import { withDbQuotaGuard } from '@/lib/db-quota-guard';
 
 // 书架管理：从书库(labeled_books)添加到书架，或从书架移除某条推荐
 export const maxDuration = 60;
 
 const MAX_BODY_BYTES = 4 * 1024;
 
-export async function POST(req: NextRequest) {
+async function handlePOST(req: NextRequest) {
   return withFindAccess(req, 55_000, async (access) => {
     const body = await access.run(() => readJsonBody(req, MAX_BODY_BYTES, access.signal));
     const labeledBookId = boundedPositiveInteger(body?.labeledBookId);
@@ -39,7 +40,7 @@ export async function POST(req: NextRequest) {
   });
 }
 
-export async function DELETE(req: NextRequest) {
+async function handleDELETE(req: NextRequest) {
   return withFindAccess(req, 55_000, async (access) => {
     // F05：按 (user_id, book_id) 移除——传 bookId，而不是某一条 recommendation 的 id。
     // 同一本书可能有多条 query 行，按单行 id 删会残留、刷新重现。
@@ -58,3 +59,7 @@ export async function DELETE(req: NextRequest) {
     }
   });
 }
+
+// 数据库配额闸（41-q402fix）：导出的处理器统一经 withDbQuotaGuard 包装（route-guard.test.ts 钉死）。
+export const POST = withDbQuotaGuard(handlePOST);
+export const DELETE = withDbQuotaGuard(handleDELETE);

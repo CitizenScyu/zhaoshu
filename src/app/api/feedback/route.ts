@@ -5,6 +5,7 @@ import { boundedString, readJsonBody } from '@/lib/http';
 import { withFindAccess } from '@/lib/personal-request';
 import { MODEL_ROUTE_INTERNAL_BUDGET_MS } from '@/lib/deadline';
 import { feedbackNeedsConfirmation, feedbackQueuesProfileAbsorption } from '@/lib/feedback';
+import { withDbQuotaGuard } from '@/lib/db-quota-guard';
 
 export const maxDuration = 295;
 
@@ -12,7 +13,7 @@ const MAX_BODY_BYTES = 8 * 1024;
 
 const VALID: FeedbackStatus[] = ['want', 'reading', 'done', 'dropped'];
 
-export async function POST(req: NextRequest) {
+async function handlePOST(req: NextRequest) {
   return withFindAccess(req, MODEL_ROUTE_INTERNAL_BUDGET_MS, async (access) => {
     const body = await access.run(() => readJsonBody(req, MAX_BODY_BYTES, access.signal));
     const { title, author, status } = body ?? {};
@@ -74,7 +75,7 @@ export async function POST(req: NextRequest) {
   });
 }
 
-export async function GET(req: NextRequest) {
+async function handleGET(req: NextRequest) {
   return withFindAccess(req, MODEL_ROUTE_INTERNAL_BUDGET_MS, async (access) => {
     await access.run(ensureSchema);
     if (req.nextUrl.searchParams.has('title')) {
@@ -95,3 +96,7 @@ export async function GET(req: NextRequest) {
     return NextResponse.json({ feedback: rows });
   });
 }
+
+// 数据库配额闸（41-q402fix）：导出的处理器统一经 withDbQuotaGuard 包装（route-guard.test.ts 钉死）。
+export const POST = withDbQuotaGuard(handlePOST);
+export const GET = withDbQuotaGuard(handleGET);

@@ -17,6 +17,7 @@ import { verifySameOriginWrite } from '@/lib/csrf';
 import { ensureSchema } from '@/lib/db';
 import { readJsonBody, RequestBodyError } from '@/lib/http';
 import { probeModel, resetModelCache } from '@/lib/llm';
+import { withDbQuotaGuard } from '@/lib/db-quota-guard';
 
 // owner 切换 LLM 模型：GET 看当前值与来源，PATCH 保存（保存前先用新模型发一次极小请求验证）。
 //
@@ -45,7 +46,7 @@ const REASONING_CONFIRMATION_MESSAGE =
   + '预算不足时正文还会为空。确认要切换到它，请在同一请求体里带 acknowledgeReasoning: true 重试；'
   + '「恢复默认」不受此限制。';
 
-export async function GET(req: NextRequest) {
+async function handleGET(req: NextRequest) {
   const auth = await requireOwner(req);
   if (!auth.ok) return withAuthHeaders(auth.response);
   try {
@@ -58,7 +59,7 @@ export async function GET(req: NextRequest) {
   }
 }
 
-export async function PATCH(req: NextRequest) {
+async function handlePATCH(req: NextRequest) {
   const auth = await requireOwner(req);
   if (!auth.ok) return withAuthHeaders(auth.response);
   // 浏览器写请求（会话身份，或带 Origin）额外要求固定 CSRF 头与同源 Origin；
@@ -208,3 +209,7 @@ async function saveDefaultModel(
 function withWarning(payload: LlmModelSettings, warning: string): LlmModelSettings & { warning?: string } {
   return warning ? { ...payload, warning } : payload;
 }
+
+// 数据库配额闸（41-q402fix）：导出的处理器统一经 withDbQuotaGuard 包装（route-guard.test.ts 钉死）。
+export const GET = withDbQuotaGuard(handleGET);
+export const PATCH = withDbQuotaGuard(handlePATCH);

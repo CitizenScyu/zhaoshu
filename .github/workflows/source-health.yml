@@ -68,6 +68,10 @@ jobs:
           elif ! jq -e . health.json >/dev/null 2>&1; then
             reason="健康端点返回的不是合法 JSON（HTTP 200）"
           else
+            # 41-q402fix：数据库配额（Neon 402）超限时其余字段因读库失败全为 null，先把真因写在最前面。
+            if [ "$(jq -r '.dbQuota.state // "ok"' health.json)" = "exceeded" ]; then
+              reason="数据库配额超限（最近发现 $(jq -r '.dbQuota.lastSeenAt // "未知"' health.json)），其余判据因读库失败失真; "
+            fi
             now=$(date -u +%s)
             # 单条判据：ISO 时间戳空/不可解析/超阈值都算异常，累加进 reason。
             check_iso() { # $1=标签 $2=ISO 或 null $3=阈值小时

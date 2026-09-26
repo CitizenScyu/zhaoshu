@@ -8,7 +8,7 @@ import type { PersonalWriter } from './personal-write';
 // 这里补中间那段，证明 db.ts 这个 3 行透传不会把归一丢掉，链路无缺口。
 
 const mocks = vi.hoisted(() => ({ neon: vi.fn(), sql: vi.fn() }));
-vi.mock('@neondatabase/serverless', () => ({ neon: mocks.neon }));
+vi.mock('@neondatabase/serverless', () => ({ neon: mocks.neon, neonConfig: {} }));
 
 // 与 db-profile.test.ts 同一套桩：db.ts 的写路径只关心被绑定的 SQL 参数。
 const write: PersonalWriter = async (batch) =>

@@ -10,10 +10,11 @@ import {
 import { verifySameOriginWrite } from '@/lib/csrf';
 import { getSql } from '@/lib/db';
 import { authError, authJson } from '@/lib/auth-http';
+import { withDbQuotaGuard } from '@/lib/db-quota-guard';
 
 // 幂等退出：删除服务端行并清 Cookie；无 Cookie 或未知会话同样返回成功。
 // 数据库删除失败时不清 Cookie，返回“退出尚未完成”，允许重试。
-export async function POST(req: NextRequest) {
+async function handlePOST(req: NextRequest) {
   if (!authAccountsEnabled()) {
     return authError(503, 'ACCOUNTS_DISABLED', 'account features are not enabled');
   }
@@ -34,3 +35,6 @@ export async function POST(req: NextRequest) {
   response.cookies.set(getSessionCookieName(), '', clearedSessionCookieOptions());
   return response;
 }
+
+// 数据库配额闸（41-q402fix）：导出的处理器统一经 withDbQuotaGuard 包装（route-guard.test.ts 钉死）。
+export const POST = withDbQuotaGuard(handlePOST);
