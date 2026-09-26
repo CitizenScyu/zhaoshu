@@ -6,6 +6,7 @@ import { userEvent } from '@testing-library/user-event';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import ReaderClient from './ReaderClient';
+import { readSourceMemory, rememberSource } from '@/lib/source-memory';
 
 // 本仓首个 jsdom 组件测试(见 vitest.config.ts 的 esbuild.jsx=automatic 与 include):
 // 真实 useReader 在 jsdom 下跑起来,只把网络面(apiFetch)、路由、纯样式模块换掉 ——
@@ -575,5 +576,68 @@ describe('ReaderClient 状态流转边界', () => {
     const user = userEvent.setup();
     await user.click(screen.getByRole('button', { name: /换源/ }));
     expect(await screen.findByRole('dialog', { name: '切换书源' })).toBeTruthy();
+  });
+});
+
+describe('ReaderClient 41-srcmem:按书记住上次成功的源', () => {
+  it('有记忆时首次目录请求带 prefer=1 + 记忆里的 book_url/source', async () => {
+    rememberSource('诡秘之主', '爱潜水的乌贼', { sourceUrl: 'https://mem-src', bookUrl: 'https://mem-src/book/9' });
+    const apiFetch = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.startsWith('/api/read/source/index')) return json(catalog());
+      return json(part());
+    });
+    renderReader(apiFetch as unknown as FetchMock);
+    await screen.findByText(/正文内容/);
+    const indexUrl = urls(apiFetch as unknown as FetchMock).find((u) => u.startsWith('/api/read/source/index'))!;
+    const query = new URLSearchParams(indexUrl.split('?')[1]);
+    expect(query.get('prefer')).toBe('1');
+    expect(query.get('book_url')).toBe('https://mem-src/book/9');
+    expect(query.get('source')).toBe('https://mem-src');
+  });
+
+  it('无记忆时首次目录请求不带 prefer/book_url（行为不变）', async () => {
+    const apiFetch = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.startsWith('/api/read/source/index')) return json(catalog());
+      return json(part());
+    });
+    renderReader(apiFetch as unknown as FetchMock);
+    await screen.findByText(/正文内容/);
+    const indexUrl = urls(apiFetch as unknown as FetchMock).find((u) => u.startsWith('/api/read/source/index'))!;
+    const query = new URLSearchParams(indexUrl.split('?')[1]);
+    expect(query.get('prefer')).toBeNull();
+    expect(query.get('book_url')).toBeNull();
+  });
+
+  it('读通后把这次的源记进 localStorage（源坐标取 index.source 的 sourceUrl/url）', async () => {
+    const apiFetch = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.startsWith('/api/read/source/index')) {
+        return json(catalog({ source: { id: 'src-1', name: '源甲', url: 'https://a.example/book/3', sourceUrl: 'https://a.example', session: 'sess-A' } }));
+      }
+      return json(part());
+    });
+    renderReader(apiFetch as unknown as FetchMock);
+    await screen.findByText(/正文内容/);
+    await waitFor(() => {
+      const remembered = readSourceMemory('诡秘之主', '爱潜水的乌贼');
+      expect(remembered).not.toBeNull();
+      expect(remembered!.sourceUrl).toBe('https://a.example');
+      expect(remembered!.bookUrl).toBe('https://a.example/book/3');
+    });
+  });
+
+  it('服务端回 hintCleared 且回落源无 sourceUrl 时，清掉旧记忆', async () => {
+    rememberSource('诡秘之主', '爱潜水的乌贼', { sourceUrl: 'https://stale-src', bookUrl: 'https://stale-src/book/1' });
+    const apiFetch = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      // 首选源失败，服务端静默回落到一个无 sourceUrl 的源（如 builtin），并回 hintCleared。
+      if (url.startsWith('/api/read/source/index')) return json({ ...catalog(), hintCleared: true });
+      return json(part());
+    });
+    renderReader(apiFetch as unknown as FetchMock);
+    await screen.findByText(/正文内容/);
+    await waitFor(() => expect(readSourceMemory('诡秘之主', '爱潜水的乌贼')).toBeNull());
   });
 });
