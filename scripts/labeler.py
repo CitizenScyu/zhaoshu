@@ -26,6 +26,7 @@
 """
 import argparse
 import atexit
+import html
 import json
 import os
 import re
@@ -669,6 +670,83 @@ _SEPARATOR_LINE_RE = re.compile(r'^[－\-—=＝_＿*＊~～·]{5,}$')
 _DIV_TOKEN_RE = re.compile(r'</?div\b', re.I)
 
 
+# ---- 整行推广黑名单（junkfix41 §2，依据 junkaudit-41-report §5.1）----
+# 历史模型举证的 72 句广告里 71 句在旧规则下漏网：旧 INJECT_PATTERNS 只收「无弹窗全文字
+# 在线阅读」这类**整句标语**，收不到「关注公众号」「看书 app」这类推 app/公众号行。
+# 判据：整行**无对白引号**、行长 ≤ PROMO_LINE_MAX_LEN，且满足下面二者之一：
+#   (a) 固定字面命中（站点公告/分页呼告，正文里不可能出现）；
+#   (b) 「两信号同现」——推广实体词（公众号/微信/app/QT房/红包/下载地址…）
+#       与 呼告或来源词（关注/领取/搜索/本书来自/已开通/更新快/书源多…）同时出现。
+# 引号闸挡住都市文对白（`“你关注我公众号了没？”他问。`）；两信号 + 无引号挡住只含单个
+# 推广词的正文（`原本站在那里`/`他关注着战局`），实体词在网文正文里几乎不出现。
+PROMO_LINE_MAX_LEN = 120
+_PROMO_QUOTE_RE = re.compile(r'[“”‘’「」『』"]')
+# 推广实体词：网文正文里几乎不出现的站点/引流实体
+_PROMO_ENTITY_RE = re.compile(
+    r'公众号|公眾號|微信公众|微信公眾|微信号|微信號|微信\s*[:：]|微信\s*號|VX|Ｖｘ|扣扣号|'
+    r'QQ\s*群|qq\s*群|QT房|看书app|看書app|小说app|小說app|阅读app|閱讀app|下载地址|下載地址|'
+    r'下载app|客户端|客戶端|现金红包|現金紅包|书友大本营|書友大本營|天涯悦读|海棠书屋|海棠書屋',
+    re.I)
+# 呼告或来源声明词
+_PROMO_CALL_RE = re.compile(
+    r'关注|關注|领取|領取|扫码|掃碼|订阅自己|訂閱自己|本书来自|本書來自|整理制作|整理製作|'
+    r'由.{0,6}整理|已开通|已開通|开通了.{0,6}(?:订阅|功能)|開通了.{0,6}(?:訂閱|功能)|'
+    r'更新快|书源多|書源多|书籍全|書籍全|免费看书|免費看書|领现金|領現金|看书领|看書領|欢迎.{0,6}关注')
+# 固定字面（整行含即删，同样受无引号 + 行长闸约束）
+_PROMO_LITERALS_RE = re.compile(
+    r'本站已开通小说订阅|本站已開通小說訂閱|请点击下一页继续阅读|請點擊下一頁繼續閱讀|'
+    r'这章没有结束|這章沒有結束|章节后面还有哦|章節後面還有哦|后面更精彩|後面更精彩|'
+    r'手打更新|txt下载地址|txt下載地址|手机阅读[:：]|手機閱讀[:：]|收藏网址下次|收藏網址下次|'
+    r'广个告|廣個告|多多分享|本书首发来自|本書首發來自|第一时间看正版|第一時間看正版|看正版内容|看正版內容')
+# `本书来自 <网址>` 型来源声明：只有后接空白/网址/行尾才算（`这本书来自民间` 是正文，不碰）。
+_PROMO_SOURCE_URL_RE = re.compile(
+    r'本[书書][来來]自\s*(?:https?://|www[.．]|m[.．]|[A-Za-z0-9-]+[.．](?:com|net|org|cc)|[）)]\s*$|$)',
+    re.I)
+
+
+def _is_promo_line(line: str) -> bool:
+    """整行是否是站点推广行（junkfix41）。无对白引号 + 行长受限 + (固定字面 或 两信号同现)。"""
+    if len(line) > PROMO_LINE_MAX_LEN or _PROMO_QUOTE_RE.search(line):
+        return False
+    if _PROMO_LITERALS_RE.search(line) or _PROMO_SOURCE_URL_RE.search(line):
+        return True
+    return bool(_PROMO_ENTITY_RE.search(line) and _PROMO_CALL_RE.search(line))
+
+
+# ---- 段内插入子串 + 乱码占位（junkfix41 §3，依据 junkaudit-41-report §5.2/§5.3）----
+# 只剥匹配到的子串，段落其余正文保留（剥完两侧要能连上：`烈●…app…●帝` → `烈帝`）。
+_INLINE_JUNK_PATTERNS = (
+    # ●…app/下载…● 型插入水印（`烈●31小说app下载地址●帝` → `烈帝`）
+    re.compile(r'[●★☆◆▲].{0,20}?(?:app|下载|下載|下\s*[载載])[^●★☆◆▲\n]{0,12}?[●★☆◆▲]', re.I),
+    # 浏*览*器*搜*索…（星隔反爬水印，删到行尾）
+    re.compile(r'浏[\*＊]览[\*＊]器[\*＊]搜[\*＊]?索[^\n]*$'),
+    # 百度搜索…（带站点签名：中文网/小说网/书屋/全网首发…，删到行尾）
+    re.compile(r'百度搜索[^\n，。！？；、]{2,20}?(?:中文网|小说网|文学网|书屋|书阁|书库|阅读网|全网首发)'
+               r'[^\n]*$'),
+    # 我的QT房間開通了…（烽火官方 QT 房号引流，删到行尾）
+    re.compile(r'我的QT房[間间]開通了[^\n]*$'),
+    # 历史站名水印（E2 举证形态）：独立片段，剥掉
+    re.compile(r'\[?\s*(?:吾爱文学网|吾愛文學網|雅文言情(?:\.org)?|燃\^?文\^?书库|燃\^?文\^?書庫|'
+               r'开心文学|開心文學|精华书阁|精華書閣|搜趣屋)\s*\]?(?:\s*\[\s*\])?'),
+    re.compile(r'@\s*精[华華]书[阁閣]'),
+    re.compile(r'无弹出广告(?:文本小说站?)?[。.]?|無彈出廣告(?:文本小說站?)?[。.]?'),
+    # (本章未完！) 分页残留（有界括号，`林北也意识(本章未完！)` → `林北也意识`）
+    re.compile(r'[（(]\s*本章未完[！!。.]?\s*[）)]'),
+    # 行尾裸 www.（句读之后的残尾）
+    re.compile(r'(?<=[。！？…”』」）)])\s*www[\.．]?\s*$', re.I),
+    # 行尾空括号（水印被剥后残留：`…低下头。（）` → `…低下头。`）
+    re.compile(r'[（(]\s*[）)]\s*$'),
+)
+# 只含 HTML 标签残渣的行整行删（`谷</span>` 一类反爬字体残渣；unescape 后判定）
+_HTML_TAG_RE = re.compile(
+    r'</?(?:span|div|p|br|font|b|i|u|s|strong|em|a|img|tr|td|th|table|h[1-6]|ul|ol|li)\b[^>]*>'
+    r'|</?(?:span|div|p|font|br)>', re.I)
+# 句读之后的半角 `??` 占位删除（`。??在以前` → `。在以前`）。全角 `？？`（`什么？？`）不动，
+# 非句读之后的 `??`（`一??怪异`）不动——只处理「前面是句读」这一形态（audit §5.3）。
+_QMARK_NOISE_RE = re.compile(r'(?<=[。！？；，、：…“”‘’「」『』（）()])\?\?')
+
+
+
 def _clean_warn(message: str) -> None:
     print(f'    [清洗告警] {message}', file=sys.stderr, flush=True)
 
@@ -799,6 +877,9 @@ def _drop_rule(line: str) -> str | None:
     # 4) 上游书源水印行（`〖三七中文www.37zw.com〗百度搜索“37zw”访问` 一类）。
     if len(line) <= INJECT_LINE_MAX_LEN and _is_watermark_line(line):
         return 'inject'
+    # 4b) 整行站点推广行（junkfix41 §2）：无引号 + 行长受限 + (固定字面 或 两信号同现)。
+    if _is_promo_line(line):
+        return 'inject'
     # 5) 作者求票/求收藏行：整行、无引号、无第三人称，且是作者口吻：行首就是一个求告分句，
     #    或行内有求票词 / 单用「求票」分句且带作者口吻信号；或更新元词（今天/本章/上架/首订/加更…）
     #    与「求票词」同属一个分句、且求票词收尾。叙述行不删（lblqualfix41/lblfu41/lblfurev41/jiageng41）。
@@ -881,11 +962,18 @@ _BARE_URL_LINE_RE = re.compile(r'^\s*(?:https?://|www\.)[\w.\-/?=&%#:~]*\s*$', r
 
 
 def _strip_inline_noise(line: str) -> str:
-    """段内水印子串剥除（纯函数）。返回剥完后的行（首尾空白已去）；整行是裸网址 → ''。"""
+    """段内水印子串剥除（纯函数）。返回剥完后的行（首尾空白已去）；整行是裸网址/标签残渣 → ''。"""
     if _BARE_URL_LINE_RE.match(line):
         return ''
-    for pattern in _INLINE_NOISE_PATTERNS:
+    line = html.unescape(line)          # &lt;/span&gt; → </span>（junkfix41 §3）
+    # 只剩标签残渣的行整行删：含已知 HTML 标签，且去掉标签后正文 ≤ 2 字（谷</span> → 谷）
+    if _HTML_TAG_RE.search(line) and len(_HTML_TAG_RE.sub('', line).strip()) <= 2:
+        return ''
+    for pattern in _INLINE_NOISE_PATTERNS:   # 既有：首发--无弹出广告(...) / #百度..# / 未完待续
         line = pattern.sub('', line)
+    for pattern in _INLINE_JUNK_PATTERNS:    # junkfix41 §3 段内插入（在既有之后，避免抢先剥半截）
+        line = pattern.sub('', line)
+    line = _QMARK_NOISE_RE.sub('', line)     # junkfix41 §3：句读后半角 ?? 占位
     return line.strip()
 
 
@@ -946,6 +1034,57 @@ _PREVIEW_TITLE_RE = re.compile(r'APP\s*免费', re.I)
 _PREVIEW_TAIL_RE = re.compile(r'(?:\.\.\.|…)\s*$')
 
 
+# ---- 章级乱码兜底（junkfix41 §4，依据 junkaudit-41-report §5.3）----
+# UTF-8 正文字节被当 GBK 解码 → 整章 `鏉ㄩ棿鎮勬棤…` 不可读（E3 鬼眼 1610 章里第 1564、1566 两章）。
+# 错位高频字集**经验生成**：常用汉字 + 常用标点按 UTF-8 编码、整段按 GBK 解码得到的字符分布
+# （见 junkfix-scratch/calib_mojibake.py）。判据：一章正文里「错位字/汉字比例 > 0.15」的行**过半**
+#   → 判为整章错码。校准（E3 全 1610 章）：正常章命中率最高仅 2.5%，两个真错码章 >50%，分离充分。
+# 命中后先试还原 `s.encode('gbk','ignore').decode('utf-8','ignore')`：还原后错位比例骤降
+# （< 原值一半且 < 5%）→ 用还原文本；否则整章丢弃、不计字数（宁丢不留满屏乱码）。
+_MOJIBAKE_SEED = (
+    '的一是了我不人在他有这个上们来到时大地为子中你说生国年着就那和要她出也'
+    '得里后自以会家可下而过天去能对小多然于心学么之都好看起发当没成只如事把还用'
+    '第样道想作种开美总从无情己面最女但现前些所同日手又行意动方期它头经长儿回位分爱'
+    '，。！？、；：“”（）《》')
+MOJIBAKE_CHARS = frozenset(
+    c for c in _MOJIBAKE_SEED.encode('utf-8').decode('gbk', 'ignore') if '一' <= c <= '鿿')
+MOJIBAKE_LINE_RATIO = 0.15          # 单行「错位字/汉字」超此 → 该行疑似错码
+_MOJI_CJK_RE = re.compile(r'[一-鿿]')
+
+
+def _mojibake_ratio(s: str) -> float:
+    """行内「错位高频字 / 汉字」占比（无汉字返回 0）。"""
+    cjk = _MOJI_CJK_RE.findall(s)
+    if not cjk:
+        return 0.0
+    return sum(1 for c in s if c in MOJIBAKE_CHARS) / len(cjk)
+
+
+def is_mojibake_chapter(lines: list[str]) -> bool:
+    """整章是否 UTF-8→GBK 错位（纯函数）：错位比例 > 阈值的行过半（单行章需该行本身超阈值）。"""
+    body = [ln for ln in lines if ln.strip()]
+    if not body:
+        return False
+    if len(body) == 1:
+        return _mojibake_ratio(body[0]) > MOJIBAKE_LINE_RATIO
+    hot = sum(1 for ln in body if _mojibake_ratio(ln) > MOJIBAKE_LINE_RATIO)
+    return hot > len(body) / 2
+
+
+def demojibake(text: str) -> str | None:
+    """尝试还原 UTF-8→GBK 错位文本（纯函数）。还原后错位比例骤降返回还原文本，否则 None（应丢弃）。"""
+    before = _mojibake_ratio(text)
+    try:
+        restored = text.encode('gbk', 'ignore').decode('utf-8', 'ignore')
+    except Exception:
+        return None
+    if restored.strip() and _mojibake_ratio(restored) < before / 2 \
+            and _mojibake_ratio(restored) < 0.05:
+        return restored
+    return None
+
+
+
 def is_preview_title(title: str) -> bool:
     return bool(_PREVIEW_TITLE_RE.search(title or ''))
 
@@ -985,7 +1124,8 @@ def prepare_book_text(text: str, clean: bool,
     seen: set[str] = set()
     parts, lengths, chars = [], [], 0
     stats = {'chapters_before': len(chapters), 'clean_lines': 0, 'dup_lines': 0,
-             'dup_chars': 0, 'chars_before': 0, 'inline_strips': 0, 'preview_chapters': 0}
+             'dup_chars': 0, 'chars_before': 0, 'inline_strips': 0, 'preview_chapters': 0,
+             'mojibake_chapters': 0}
     preview_source = clean and is_preview_source(
         preview_dropped + sum(1 for head, _ in chapters if head and is_preview_title(head[1:-1])),
         sum(1 for head, body in chapters
@@ -997,6 +1137,13 @@ def prepare_book_text(text: str, clean: bool,
                 stats['preview_chapters'] += 1
                 continue
             head = f'【{clean_chapter_title(title)}】'
+        if clean and is_mojibake_chapter(body.split('\n')):
+            # UTF-8→GBK 错位章：先试还原，还原不了整章丢弃、不计字数（junkfix41 §4）
+            fixed = demojibake(body)
+            if fixed is None:
+                stats['mojibake_chapters'] += 1
+                continue
+            body = fixed
         kept, body_len = [], 0
         for raw in body.split('\n'):
             line = raw.strip()
