@@ -74,12 +74,13 @@ export interface LibraryEvidence {
 
 // 上限（全部按 JSON.stringify 后的字符数计）：临时库实测 weaknesses 平均 70 字/最长 221、
 // strengths 平均 96/最长 291、tone 15、pace 12/最长 52（报告 §1）。单条 28 字能保住一条
-// 雷点的主干（「后宫倾向明显，主角…」），单本 220 约是完整证据的一半，12 本满批 ≈2200。
+// 雷点的主干（「后宫倾向明显，主角…」）。单本 200：临时库 507 本实测压缩后中位 181、p90 196；
+// 整批 2400 = 12 本 × 200，满批正常全带，只在候选数上调或单本上限被改大时才起作用。
 export const LIBRARY_ITEM_MAX_CHARS = 28;
 export const LIBRARY_WEAKNESSES_MAX = 3;
 export const LIBRARY_STRENGTHS_MAX = 2;
-export const LIBRARY_BOOK_MAX_CHARS = 220;
-export const LIBRARY_BATCH_MAX_CHARS = 2200;
+export const LIBRARY_BOOK_MAX_CHARS = 200;
+export const LIBRARY_BATCH_MAX_CHARS = 2400;
 
 // 按码点截断，不切开代理对。
 function clip(value: string, max: number): string {
