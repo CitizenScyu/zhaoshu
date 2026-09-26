@@ -148,7 +148,7 @@ describe('174 源 compile 冒烟', () => {
 });
 
 describe('survey 初筛函数移植（selectCandidates）', () => {
-  it('在合成数据上复现初筛门槛（HTTPS+无JS+纯GET+bookList+content+非听书）', () => {
+  it('在合成数据上复现初筛门槛（HTTPS（http:// 升级后）+无JS+纯GET+bookList+content+非听书）', () => {
     const synthetic: RawSource[] = [
       {
         // 合格
@@ -157,14 +157,15 @@ describe('survey 初筛函数移植（selectCandidates）', () => {
         ruleSearch: { bookList: '.list', name: 'h3@text' },
         ruleContent: { content: '.c@html' },
       },
+      // 41-srcfix 改法2：http:// 源先升 https 再判 ⇒ 合格；无协议（书源名当 URL）仍丢弃。
       { bookSourceUrl: 'http://insecure.example.com', searchUrl: 'http://x/s?key={{key}}', ruleSearch: { bookList: '.l' }, ruleContent: { content: '.c' } },
+      { bookSourceUrl: '爱发电', searchUrl: 'https://x/s?key={{key}}', ruleSearch: { bookList: '.l' }, ruleContent: { content: '.c' } },
       { bookSourceUrl: 'https://js.example.com', searchUrl: 'https://x/s?key={{key}}', ruleSearch: { bookList: '@js:x' }, ruleContent: { content: '.c' } },
       { bookSourceUrl: 'https://nopget.example.com', searchUrl: 'https://x/s?q=1', ruleSearch: { bookList: '.l' }, ruleContent: { content: '.c' } },
       { bookSourceUrl: 'https://nolist.example.com', searchUrl: 'https://x/s?key={{key}}', ruleSearch: {}, ruleContent: { content: '.c' } },
       { bookSourceUrl: 'https://audio.example.com', searchUrl: 'https://x/s?key={{key}}', bookSourceType: 2, ruleSearch: { bookList: '.l' }, ruleContent: { content: '.c' } },
     ];
     const out = selectCandidates(synthetic);
-    expect(out.length).toBe(1);
-    expect(out[0].bookSourceUrl).toBe('https://ok.example.com');
+    expect(out.map((s) => s.bookSourceUrl)).toEqual(['https://ok.example.com', 'http://insecure.example.com']);
   });
 });
