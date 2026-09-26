@@ -128,7 +128,12 @@ function validateImportRecord(rec) {
   const review = (reason) => ({ status: 'review', reason });
   if (!isRecord(rec) || !isRecord(rec.labels)) return failed('记录或 labels 字段不是对象');
 
-  for (const field of ['title', 'site_title', 'author', 'author_encoding', 'category', 'status', 'source']) {
+  // lblmeta41：label_model / prompt_version / label_source 三个打标元数据字段新加到
+  // labels.jsonl。它们**不写库**（labeled_books 无对应列，加列要改表结构），只做类型校验
+  // ——与 import_one.py 的 FIELD_STRINGS 逐条对齐，别让两边对同一批输入的裁决分叉。
+  // 其余未知字段一律忽略（这里不是白名单，是显式字段的类型校验）。
+  for (const field of ['title', 'site_title', 'author', 'author_encoding', 'category', 'status', 'source',
+    'label_model', 'prompt_version', 'label_source']) {
     if (rec[field] != null && typeof rec[field] !== 'string') return failed(field + ' 必须是字符串');
   }
   const normalizedAuthor = normalizeAuthor(rec.author ?? '', {
@@ -150,9 +155,11 @@ function validateImportRecord(rec) {
   if (cleanString(title) !== title || cleanString(listedTitle) !== listedTitle || cleanString(author) !== author) {
     return review('书名或作者含非法字符，不能清洗后自动裁决身份');
   }
-  if (siteTitle && listedTitle && !titleMatches(siteTitle, listedTitle)) {
-    return review('site_title 与 title 不一致，保留原记录待核验');
-  }
+  // lblmeta41：删掉「site_title 与 title 不一致 → review」这条。title(= site_title 优先)
+  // 与 site_title 不一致只说明**扫描时**的记录里 title 曾被 LLM 猜名覆盖过（旧 labeler 写法），
+  // 并不构成本本身份证据不足——身份证据由下面的 site_title_match 与作者校验负责。
+  // 现场 45 条 title≠site_title 全是 site_title_match=true，即被这条误拦。
+  // 注意：身份键仍取 title(= siteTitle 优先)，删这条**不改变**身份键，不新增第二行。
 
   const labels = rec.labels;
   if (labels.title_guess != null && typeof labels.title_guess !== 'string') {

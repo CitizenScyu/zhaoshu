@@ -56,6 +56,9 @@ next-env.d.ts
 .env.pull
 scripts/backfill.env
 labels.jsonl
+# 死源跨轮记忆侧车（labeler 运行时写在数据目录 = 默认脚本同目录；只含 host 名与时间戳）
+labels-dead-hosts.json
+scripts/labels-dead-hosts.json
 
 # python
 __pycache__/

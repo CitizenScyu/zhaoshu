@@ -295,8 +295,10 @@ export class AuthController {
 
       if (response.status === 401) {
         // Cookie 失效的 401 不触发自动 owner 兑换，也不清除旧口令。
-        // 旧模式的 session 接口恒 200，401 只可能来自账号模式：必须同步 accountsEnabled，
-        // 否则登录框退回旧口令入口（GET /api/owner 不换 Cookie），失效 Cookie 留着，下个页面又要口令。
+        // 承重不变量「session 401 ⟺ 账号模式」：api/auth/session/route.ts 旧口令模式恒 200、不看 Cookie，
+        // 401 只可能来自账号模式，所以这里直接同步 accountsEnabled:true；那边若让旧模式也回 401，这里必须一起改。
+        // 不同步的话登录框会退回旧口令入口（GET /api/owner 不换 Cookie），下个页面又要口令。
+        // 服务端同一个 401 会过期失效 Cookie，下一次探测走「无 Cookie」分支。
         this.rotate('cookie');
         this.set({ phase: 'anonymous', user: null, accountsEnabled: true, transport: 'cookie', expired: true });
         return;

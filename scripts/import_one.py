@@ -75,6 +75,8 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
+import douban_list          # 复用作者身份归一（_norm_author），使孪生判定与 author_matches 口径一致
+
 # ---- 配置 ----
 IMPORT_TIMEOUT_SEC = 15          # 单次 HTTP SQL 超时；导入失败绝不能拖住打标循环
 IMPORT_BACKLOG_DEFAULT = 20      # labeler 每轮启动时自动补录的历史欠账条数上限
@@ -93,7 +95,11 @@ BAD_TEXT_QUALITY = ('疑似乱码', '大面积重复', '含广告注入')
 AD_QUALITY_FLAG = 'ad_injection'
 AD_TEXT_QUALITY = '含广告注入'
 FIELD_STRINGS = ('title', 'site_title', 'author', 'author_encoding',
-                 'category', 'status', 'source')
+                 'category', 'status', 'source',
+                 # lblmeta41：打标元数据三字段。**只做类型校验**（非字符串即 failed），
+                 # 不写库——labeled_books 没有对应列，写进去要改表结构；这三项只落在
+                 # labels.jsonl 里供事后按模型/提示词版本分桶回溯（jsonl 本身可重放）。
+                 'label_model', 'prompt_version', 'label_source')
 
 # ---- 分类规范化（genre_map.mjs normalizeGenre 的 python 移植）----
 PRIMARY_GENRES = ('玄幻', '仙侠', '武侠', '都市', '历史', '科幻', '悬疑灵异',
@@ -306,8 +312,11 @@ def validate_record(rec):
     if (clean_string(title) != title or clean_string(listed_title) != listed_title
             or clean_string(author) != author):
         return review('书名或作者含非法字符，不能清洗后自动裁决身份')
-    if site_title and listed_title and not title_matches(site_title, listed_title):
-        return review('site_title 与 title 不一致，保留原记录待核验')
+    # lblmeta41：删掉「site_title 与 title 不一致 → review」。title 与 site_title 不一致只说明
+    # 记录里的 title 曾被 LLM 猜名覆盖过（旧 labeler 写法），不是身份证据不足——身份证据由下面的
+    # site_title_match 与上面的作者校验负责。现场 45 条 title≠site_title 全是 site_title_match=true，
+    # 即被这条误拦。身份键仍是 title(= site_title 优先)，删这条**不改变**身份键、不新增第二行。
+    # 与 import_labels.mjs 的删除逐条对齐。
 
     if labels.get('title_guess') is not None and not isinstance(labels['title_guess'], str):
         return failed('labels.title_guess 必须是字符串')
@@ -484,19 +493,53 @@ FIND_LABELED_BOOK_SQL = r"""
     LIMIT 1"""
 
 
+# 繁→简小映射表（团队授权：仓库无 opencc 等现成工具，用小表并写明覆盖范围）。
+# 覆盖常见姓氏 + 高频人名用字；**不完整**——未覆盖的异体只会「漏判孪生」（多一行，等同改前，
+# 无回归），绝不会把不同作者误判成同一人（只在宽松键完全相等时才判孪生；且每个繁体字都映射到
+# 其唯一对应的简体字，不存在把两个不同简体字并到一处的风险）。
+_TRAD = '張陳劉黃趙吳鄭謝羅韓馮蔣蕭賈鄒孫馬蘇盧葉閻餘鐘範譚陸萬錢湯喬賀賴龐顏嚴溫魯韋畢聶駱齊鄧龔龍顧華婁竇廬麗傑軍國慶學東遠飛風雲鳳曉靜詩書劍愛夢陽賢寶貴靈輝瓊潔嬋語樂憶戀護'
+_SIMP = '张陈刘黄赵吴郑谢罗韩冯蒋萧贾邹孙马苏卢叶阎余钟范谭陆万钱汤乔贺赖庞颜严温鲁韦毕聂骆齐邓龚龙顾华娄窦庐丽杰军国庆学东远飞风云凤晓静诗书剑爱梦阳贤宝贵灵辉琼洁婵语乐忆恋护'
+_T2S = {t: s for t, s in zip(_TRAD, _SIMP)}
+assert len(_TRAD) == len(_SIMP), '繁简映射表两串长度必须相等'
+
+
+def _to_simplified(text):
+    return ''.join(_T2S.get(ch, ch) for ch in text)
+
+
+def _loose_author_key(author):
+    """宽松作者身份键（仅用于孪生判定）：占位/空 → ''。否则繁转简后走 douban_list._norm_author
+    （剥「作者：」标签、剥尾缀「著」、剥前导国籍括注、统一中点/点号、去空白、casefold），
+    与 author_matches / 搜索期身份口径一致。键相同 = 同一人的异体写法（no-op 不新增），
+    键不同 = 不同人（同名异书照常入库）。"""
+    raw = (author or '').strip()
+    if douban_list.is_placeholder_author(raw):
+        return ''
+    return douban_list._norm_author(_to_simplified(raw))
+
+
 def find_twin(rows, author):
     """R02 非不动点孪生行判定（纯函数，便于离线单测）。
 
-    存量行的作者经实体解码后与本次作者同身份、但原文不同 → 该行就是孪生行。
-    与 import_labels.mjs 同判据；实体畸形（缺分号/未知）时本函数更保守（照样拦），
-    宁可少写一条也不凭空多一行。"""
+    存量行的作者与本次作者**归一后同身份、但存量原文与本次身份键不同** → 该行就是孪生行，
+    UPSERT 撞不上（author_key 不同）却是同一本书，写下去会凭空多一行（labeler-idempotency-redline
+    家族）。三档判定，从严到宽：
+      1. 存量原文 lower 与本次相同 → 精确同键，交 ON CONFLICT UPSERT，不算孪生（返回时跳过）；
+      2. 存量按 HTML 实体解码后与本次相同 → 实体变体孪生（原行为）；
+      3. 存量与本次的**宽松身份键**（_loose_author_key：剥标签/尾缀/国籍段、统一中点、去空白、
+         繁转简、casefold）相同 → 繁简/中点/国籍段/尾缀/标签/空白等异体孪生（rvauthor CE1/CE1b）。
+    宽松键为空（占位/空作者）不参与匹配；宽松键**不同**（同名不同人）仍判为不同书，照常入库。
+    实体畸形（缺分号/未知）时本函数更保守（照样拦），宁可少写一条也不凭空多一行。"""
     target = author.lower()
+    loose = _loose_author_key(author)
     for row in rows or []:
         stored = row.get('author') or ''
         if not isinstance(stored, str) or stored.lower() == target:
             continue
         decoded = html.unescape(stored) if '&' in stored else stored
         if decoded.strip().lower() == target:
+            return row
+        if loose and _loose_author_key(stored) == loose:
             return row
     return None
 
@@ -680,8 +723,10 @@ class AutoImporter:
                           [record['title']])
         twin = find_twin(rows, record['author'])
         if twin is not None:
+            # 输出两侧原始作者，便于人工复核宽松键有没有把「同名书不同作者」误合（rvauthor 增量建议 3）
             self.log(f'  自动导入: 与既有非不动点行 id={twin.get("id")} 归一后身份相同，'
-                     f'跳过写入（避免凭空多一行）')
+                     f'跳过写入（避免凭空多一行）；库内作者={twin.get("author")!r} '
+                     f'本次作者={record.get("author")!r}')
             return 'twin-skipped'
         query, params = build_upsert(record)
         self._exec_write(query, params, '标签 UPSERT')

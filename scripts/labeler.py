@@ -26,6 +26,7 @@
 """
 import argparse
 import atexit
+import html
 import json
 import os
 import re
@@ -37,7 +38,7 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Iterable
 
 import douban_list
 
@@ -81,6 +82,11 @@ DB_MODEL_TIMEOUT_SEC = 5    # 读配置失败必须快速回落，不能拖住�
 # 自动导入连续失败升级阈值（审查 B.2）：本轮 SQL 失败达此次数就在 stdout 打醒目告警。
 # 不做进程级 fail-fast（与「失败不阻断打标」一致），但坏配置不能长期静默。
 AUTO_IMPORT_FAILURE_ALERT = 5
+
+# lblmeta41：提示词版本号。改 SYSTEM_PROMPT（含验证段措辞、字段定义）必须同时升这里，
+# 否则 labels.jsonl 里的 prompt_version 会谎报「同一版提示词产出的分数」，事后无法按版本
+# 分桶回溯——模型链本已按可用性在多厂家间回退，单凭 quality 分更分不出。改动即 v2、v3……。
+PROMPT_VERSION = 'v1'
 
 SYSTEM_PROMPT = (
     "你是网文编目员。阅读给定的小说文本（若干章），输出一个 JSON 对象"
@@ -669,6 +675,120 @@ _SEPARATOR_LINE_RE = re.compile(r'^[－\-—=＝_＿*＊~～·]{5,}$')
 _DIV_TOKEN_RE = re.compile(r'</?div\b', re.I)
 
 
+# ---- 整行推广黑名单（junkfix41 §2，依据 junkaudit-41-report §5.1；rvjunk41 复审收窄）----
+# 历史模型举证的 72 句广告里 71 句在旧规则下漏网：旧 INJECT_PATTERNS 只收「无弹窗全文字
+# 在线阅读」这类**整句标语**，收不到「关注公众号」「看书 app」这类推 app/公众号行。
+# 判据：整行**无对白引号、不以【开头**（系统流保护）、行长 ≤ PROMO_LINE_MAX_LEN，且满足其一：
+#   (a) 强字面 `_PROMO_STRONG_RE`（`广个告`/`本站已开通小说订阅`/`txt下载地址`——非自然中文，正文不会出现）；
+#   (b) 弱字面同现：`_PROMO_WEAK_PATTERNS` 里 ≥2 个不同短语（多条分页/推广口号同现＝广告，单条是正文）；
+#   (c) 弱字面 ≥1 且带任一推广实体词（字面 + 实体＝广告）；
+#   (d) 强实体词（app/红包/VX/QT/下载/QQ群/书友大本营…）+ 呼告/来源词（两信号同现）；
+#   (e) 弱实体词（公众号/微信）+ 账号/CTA 标记（`公众号：账号`/`微信號:`/`公众号【】`/`公众号…领取/红包`）。
+# rvjunk41 复审必修：旧 `_PROMO_LITERALS_RE` 无锚子串会误删「后面更精彩的情节…」「多多分享你的想法」
+# 「看正版内容才对得起作者」等叙述；旧「公众号+关注」会误删「他关注了那个公众号…」；均已按上表收窄。
+PROMO_LINE_MAX_LEN = 120
+_PROMO_QUOTE_RE = re.compile(r'[“”‘’「」『』"]')
+# 强字面（无锚子串，安全）：非自然中文的广告标记
+_PROMO_STRONG_RE = re.compile(
+    r'广个告|廣個告|本站已开通小说订阅|本站已開通小說訂閱|txt下载地址|txt下載地址')
+# 弱字面（能出现在正文里，须 ≥2 同现或搭实体词才删）
+_PROMO_WEAK_PATTERNS = tuple(re.compile(p) for p in (
+    r'后面更精彩|後面更精彩', r'多多分享', r'手打更新', r'这章没有结束|這章沒有結束',
+    r'章节后面还有哦|章節後面還有哦', r'收藏网址下次|收藏網址下次',
+    r'第一时间看正版|第一時間看正版', r'看正版内容|看正版內容',
+    r'请点击下一页继续阅读|請點擊下一頁繼續閱讀', r'本书首发来自|本書首發來自',
+    r'手机阅读[:：]|手機閱讀[:：]'))
+# 强推广实体词：网文正文里几乎不出现的引流实体
+_PROMO_STRONG_ENTITY_RE = re.compile(
+    r'看书app|看書app|小说app|小說app|阅读app|閱讀app|下载app|VX|Ｖｘ|扣扣号|QQ\s*群|qq\s*群|'
+    r'QT房|下载地址|下載地址|现金红包|現金紅包|书友大本营|書友大本營|天涯悦读|海棠书屋|海棠書屋|客户端|客戶端',
+    re.I)
+# 弱推广实体词：公众号/微信——在正文里也常见，须带账号/CTA 标记
+_PROMO_WEAK_ENTITY_RE = re.compile(r'公众号|公眾號|微信公众|微信公眾|微信号|微信號|微信\s*[:：]')
+# 账号/CTA 标记：账号冒号、账号方括号、或公众号/微信紧邻 领取/红包/回复/即送/搜索
+_PROMO_ACCOUNT_RE = re.compile(
+    r'公[众眾]号\s*[:：]|公[眾众]號\s*[:：]|微信\s*[号號]?\s*[:：]|公[众眾]号\s*[【\[]|'
+    r'(?:公[众眾]号|公[眾众]號|微信)[^。！？\n]{0,6}(?:领取|領取|红包|紅包|回复|回復|即送|搜索|關注即|关注即)')
+# 呼告或来源声明词
+_PROMO_CALL_RE = re.compile(
+    r'关注|關注|领取|領取|扫码|掃碼|订阅自己|訂閱自己|本书来自|本書來自|整理制作|整理製作|'
+    r'由.{0,6}整理|已开通|已開通|开通了.{0,6}(?:订阅|功能)|開通了.{0,6}(?:訂閱|功能)|'
+    r'更新快|书源多|書源多|书籍全|書籍全|免费看书|免費看書|领现金|領現金|看书领|看書領|欢迎.{0,6}关注')
+# `本书来自 <网址>` 型来源声明：只有后接**网址/域名**才算（`这本书来自民间` 是正文，不碰）。
+# rvjunk41 必修：旧写法末尾 `|$` 是笔误，会把裸「本书来自」也删——已去掉，现在必须真的跟网址。
+_PROMO_SOURCE_URL_RE = re.compile(
+    r'本[书書][来來]自\s*(?:https?://|www[.．]|m[.．]|[A-Za-z0-9-]+[.．](?:com|net|org|cc))', re.I)
+
+
+def _is_promo_line(line: str) -> bool:
+    """整行是否是站点推广行（junkfix41，rvjunk41 复审收窄）。见上方判据表。"""
+    stripped = line.lstrip()
+    if len(line) > PROMO_LINE_MAX_LEN or _PROMO_QUOTE_RE.search(line):
+        return False
+    # 系统流【…】保护：**只豁免泛化的「强实体+呼告」两信号路径**（`【…现金红包…领取】` 一类游戏提示）。
+    # 账号标记 / 强字面 / 弱字面≥2 等更硬的证据仍照删——否则站点用【】包一下推广行即可零成本规避
+    # （rvjunk41 增量复审：旧的「行首【一律放行」会漏掉 `【公众号：天涯悦读】`/`【广个告】…` 等 9 条真广告）。
+    system_stream = stripped.startswith('【')
+    if _PROMO_STRONG_RE.search(line) or _PROMO_SOURCE_URL_RE.search(line):
+        return True
+    weak = sum(1 for p in _PROMO_WEAK_PATTERNS if p.search(line))
+    entity_strong = bool(_PROMO_STRONG_ENTITY_RE.search(line))
+    entity_weak = bool(_PROMO_WEAK_ENTITY_RE.search(line))
+    if weak >= 2:
+        return True
+    if weak >= 1 and (entity_strong or entity_weak):
+        return True
+    if entity_weak and _PROMO_ACCOUNT_RE.search(line):
+        return True
+    if entity_strong and _PROMO_CALL_RE.search(line) and not system_stream:
+        return True
+    return False
+
+
+# ---- 段内插入子串 + 乱码占位（junkfix41 §3，依据 junkaudit-41-report §5.2/§5.3）----
+# 只剥匹配到的子串，段落其余正文保留（剥完两侧要能连上：`烈●…app…●帝` → `烈帝`）。
+# 历史站名（rvjunk41 必修：必须有边界，见下方 _INLINE_JUNK_PATTERNS 里的注释）。
+_SITE_NAME_ALT = (r'吾爱文学网|吾愛文學網|雅文言情|燃\^?文\^?书库|燃\^?文\^?書庫|'
+                  r'开心文学|開心文學|精华书阁|精華書閣|搜趣屋')
+_INLINE_JUNK_PATTERNS = (
+    # ●…app/下载…● 型插入水印（`烈●31小说app下载地址●帝` → `烈帝`）
+    re.compile(r'[●★☆◆▲].{0,20}?(?:app|下载|下載|下\s*[载載])[^●★☆◆▲\n]{0,12}?[●★☆◆▲]', re.I),
+    # 浏*览*器*搜*索…（星隔反爬水印，删到行尾）
+    re.compile(r'浏[\*＊]览[\*＊]器[\*＊]搜[\*＊]?索[^\n]*$'),
+    # 百度搜索…（带站点签名：中文网/小说网/书屋/全网首发…，删到行尾）
+    re.compile(r'百度搜索[^\n，。！？；、]{2,20}?(?:中文网|小说网|文学网|书屋|书阁|书库|阅读网|全网首发)'
+               r'[^\n]*$'),
+    # 我的QT房間開通了…（烽火官方 QT 房号引流，删到行尾）
+    re.compile(r'我的QT房[間间]開通了[^\n]*$'),
+    # 历史站名水印（E2 举证形态）：rvjunk41 必修——必须**有边界**才剥，不能裸子串抠正文。
+    # 只在 (a) 被括号/方括号包裹、(b) 紧邻域名/推广信号、(c) @前缀 时剥；
+    # 裸站名当普通名词（`他走过开心文学社`/`精华书阁是老书店`/`无弹出广告的浏览器`）一律不动。
+    re.compile(r'[\[【〖（(]\s*(?:' + _SITE_NAME_ALT + r')'
+               r'[^\[\]【】〖〗（）()\n]{0,8}[\]】〗）)]'),
+    re.compile(r'(?:' + _SITE_NAME_ALT + r')\s*'
+               r'(?:[.．](?:org|com|net|cc)|[／/]?\s*(?:最快更新|全网首发|全網首發|最新章节|最新章節))'),
+    re.compile(r'(?:最快更新|全网首发|全網首發)\s*(?:' + _SITE_NAME_ALT + r')'),
+    re.compile(r'@\s*(?:' + _SITE_NAME_ALT + r')'),
+    # 无弹出广告：只在带上下文（文本小说站）时剥；`首发--无弹出广告(...)` 由既有规则处理，
+    # 裸「无弹出广告的浏览器」不碰（rvjunk41 必修）。
+    re.compile(r'无[弹彈]出?广告文本小[说說]站?[。.]?|無[弹彈]出?廣告文本小[说說]站?[。.]?'),
+    # (本章未完！) 分页残留（有界括号，`林北也意识(本章未完！)` → `林北也意识`）
+    re.compile(r'[（(]\s*本章未完[！!。.]?\s*[）)]'),
+    # 行尾裸 www.（句读之后的残尾）
+    re.compile(r'(?<=[。！？…”』」）)])\s*www[\.．]?\s*$', re.I),
+    # 行尾空括号（水印被剥后残留：`…低下头。（）` → `…低下头。`）
+    re.compile(r'[（(]\s*[）)]\s*$'),
+)
+# 只含 HTML 标签残渣的行整行删（`谷</span>` 一类反爬字体残渣；unescape 后判定）
+_HTML_TAG_RE = re.compile(
+    r'</?(?:span|div|p|br|font|b|i|u|s|strong|em|a|img|tr|td|th|table|h[1-6]|ul|ol|li)\b[^>]*>'
+    r'|</?(?:span|div|p|font|br)>', re.I)
+# 句读之后的半角 `??` 占位删除（`。??在以前` → `。在以前`）。全角 `？？`（`什么？？`）不动，
+# 非句读之后的 `??`（`一??怪异`）不动——只处理「前面是句读」这一形态（audit §5.3）。
+_QMARK_NOISE_RE = re.compile(r'(?<=[。！？；，、：…“”‘’「」『』（）()])\?\?')
+
+
+
 def _clean_warn(message: str) -> None:
     print(f'    [清洗告警] {message}', file=sys.stderr, flush=True)
 
@@ -799,6 +919,9 @@ def _drop_rule(line: str) -> str | None:
     # 4) 上游书源水印行（`〖三七中文www.37zw.com〗百度搜索“37zw”访问` 一类）。
     if len(line) <= INJECT_LINE_MAX_LEN and _is_watermark_line(line):
         return 'inject'
+    # 4b) 整行站点推广行（junkfix41 §2）：无引号 + 行长受限 + (固定字面 或 两信号同现)。
+    if _is_promo_line(line):
+        return 'inject'
     # 5) 作者求票/求收藏行：整行、无引号、无第三人称，且是作者口吻：行首就是一个求告分句，
     #    或行内有求票词 / 单用「求票」分句且带作者口吻信号；或更新元词（今天/本章/上架/首订/加更…）
     #    与「求票词」同属一个分句、且求票词收尾。叙述行不删（lblqualfix41/lblfu41/lblfurev41/jiageng41）。
@@ -881,11 +1004,18 @@ _BARE_URL_LINE_RE = re.compile(r'^\s*(?:https?://|www\.)[\w.\-/?=&%#:~]*\s*$', r
 
 
 def _strip_inline_noise(line: str) -> str:
-    """段内水印子串剥除（纯函数）。返回剥完后的行（首尾空白已去）；整行是裸网址 → ''。"""
+    """段内水印子串剥除（纯函数）。返回剥完后的行（首尾空白已去）；整行是裸网址/标签残渣 → ''。"""
     if _BARE_URL_LINE_RE.match(line):
         return ''
-    for pattern in _INLINE_NOISE_PATTERNS:
+    line = html.unescape(line)          # &lt;/span&gt; → </span>（junkfix41 §3）
+    # 只剩标签残渣的行整行删：含已知 HTML 标签，且去掉标签后正文 ≤ 2 字（谷</span> → 谷）
+    if _HTML_TAG_RE.search(line) and len(_HTML_TAG_RE.sub('', line).strip()) <= 2:
+        return ''
+    for pattern in _INLINE_NOISE_PATTERNS:   # 既有：首发--无弹出广告(...) / #百度..# / 未完待续
         line = pattern.sub('', line)
+    for pattern in _INLINE_JUNK_PATTERNS:    # junkfix41 §3 段内插入（在既有之后，避免抢先剥半截）
+        line = pattern.sub('', line)
+    line = _QMARK_NOISE_RE.sub('', line)     # junkfix41 §3：句读后半角 ?? 占位
     return line.strip()
 
 
@@ -946,6 +1076,57 @@ _PREVIEW_TITLE_RE = re.compile(r'APP\s*免费', re.I)
 _PREVIEW_TAIL_RE = re.compile(r'(?:\.\.\.|…)\s*$')
 
 
+# ---- 章级乱码兜底（junkfix41 §4，依据 junkaudit-41-report §5.3）----
+# UTF-8 正文字节被当 GBK 解码 → 整章 `鏉ㄩ棿鎮勬棤…` 不可读（E3 鬼眼 1610 章里第 1564、1566 两章）。
+# 错位高频字集**经验生成**：常用汉字 + 常用标点按 UTF-8 编码、整段按 GBK 解码得到的字符分布
+# （见 junkfix-scratch/calib_mojibake.py）。判据：一章正文里「错位字/汉字比例 > 0.15」的行**过半**
+#   → 判为整章错码。校准（E3 全 1610 章）：正常章命中率最高仅 2.5%，两个真错码章 >50%，分离充分。
+# 命中后先试还原 `s.encode('gbk','ignore').decode('utf-8','ignore')`：还原后错位比例骤降
+# （< 原值一半且 < 5%）→ 用还原文本；否则整章丢弃、不计字数（宁丢不留满屏乱码）。
+_MOJIBAKE_SEED = (
+    '的一是了我不人在他有这个上们来到时大地为子中你说生国年着就那和要她出也'
+    '得里后自以会家可下而过天去能对小多然于心学么之都好看起发当没成只如事把还用'
+    '第样道想作种开美总从无情己面最女但现前些所同日手又行意动方期它头经长儿回位分爱'
+    '，。！？、；：“”（）《》')
+MOJIBAKE_CHARS = frozenset(
+    c for c in _MOJIBAKE_SEED.encode('utf-8').decode('gbk', 'ignore') if '一' <= c <= '鿿')
+MOJIBAKE_LINE_RATIO = 0.15          # 单行「错位字/汉字」超此 → 该行疑似错码
+_MOJI_CJK_RE = re.compile(r'[一-鿿]')
+
+
+def _mojibake_ratio(s: str) -> float:
+    """行内「错位高频字 / 汉字」占比（无汉字返回 0）。"""
+    cjk = _MOJI_CJK_RE.findall(s)
+    if not cjk:
+        return 0.0
+    return sum(1 for c in s if c in MOJIBAKE_CHARS) / len(cjk)
+
+
+def is_mojibake_chapter(lines: list[str]) -> bool:
+    """整章是否 UTF-8→GBK 错位（纯函数）：错位比例 > 阈值的行过半（单行章需该行本身超阈值）。"""
+    body = [ln for ln in lines if ln.strip()]
+    if not body:
+        return False
+    if len(body) == 1:
+        return _mojibake_ratio(body[0]) > MOJIBAKE_LINE_RATIO
+    hot = sum(1 for ln in body if _mojibake_ratio(ln) > MOJIBAKE_LINE_RATIO)
+    return hot > len(body) / 2
+
+
+def demojibake(text: str) -> str | None:
+    """尝试还原 UTF-8→GBK 错位文本（纯函数）。还原后错位比例骤降返回还原文本，否则 None（应丢弃）。"""
+    before = _mojibake_ratio(text)
+    try:
+        restored = text.encode('gbk', 'ignore').decode('utf-8', 'ignore')
+    except Exception:
+        return None
+    if restored.strip() and _mojibake_ratio(restored) < before / 2 \
+            and _mojibake_ratio(restored) < 0.05:
+        return restored
+    return None
+
+
+
 def is_preview_title(title: str) -> bool:
     return bool(_PREVIEW_TITLE_RE.search(title or ''))
 
@@ -985,7 +1166,8 @@ def prepare_book_text(text: str, clean: bool,
     seen: set[str] = set()
     parts, lengths, chars = [], [], 0
     stats = {'chapters_before': len(chapters), 'clean_lines': 0, 'dup_lines': 0,
-             'dup_chars': 0, 'chars_before': 0, 'inline_strips': 0, 'preview_chapters': 0}
+             'dup_chars': 0, 'chars_before': 0, 'inline_strips': 0, 'preview_chapters': 0,
+             'mojibake_chapters': 0}
     preview_source = clean and is_preview_source(
         preview_dropped + sum(1 for head, _ in chapters if head and is_preview_title(head[1:-1])),
         sum(1 for head, body in chapters
@@ -997,6 +1179,13 @@ def prepare_book_text(text: str, clean: bool,
                 stats['preview_chapters'] += 1
                 continue
             head = f'【{clean_chapter_title(title)}】'
+        if clean and is_mojibake_chapter(body.split('\n')):
+            # UTF-8→GBK 错位章：先试还原，还原不了整章丢弃、不计字数（junkfix41 §4）
+            fixed = demojibake(body)
+            if fixed is None:
+                stats['mojibake_chapters'] += 1
+                continue
+            body = fixed
         kept, body_len = [], 0
         for raw in body.split('\n'):
             line = raw.strip()
@@ -1158,6 +1347,17 @@ DETERMINISTIC_ENGINE_ERRORS = frozenset({'policy', 'http_4xx', 'no_source'})
 DEAD_HOST_SKIP_KIND = 'dead_host_skipped'
 MIN_BOOK_CHARS = 10_000     # 一本书至少要抓到的字数（不足记「抓取字数不足」）
 
+# ---- 死源跨轮记忆（lblspeed41）----
+# 事故/瓶颈（诊断 lblrate-41 §5.3）：4 个整站失效源（shudugu/bqquge/kxdu/sto66）每轮都要
+# 各失败 DEAD_HOST_GIVEUPS(2) 次才被判死，判定只活一轮，下轮重新累计 —— 每轮几十分钟空抓。
+# 现在把判死结果落一个带时间戳的侧车文件，有效期默认 6 小时；下轮启动直接把这些 host 预置进
+# tracker.dead（零请求）。过期自动重新尝试；站点恢复最多延迟一个有效期才被重新使用，可接受。
+# 文件损坏 / 读写失败 → 静默降级为「不跨轮」（与改前行为一致），绝不让整轮失败。
+DEAD_HOSTS_FILENAME = 'labels-dead-hosts.json'
+DEAD_HOST_TTL_SEC = 6 * 3600        # 侧车有效期（秒）
+DEAD_HOST_TTL_ENV = 'LABELER_DEAD_HOST_TTL_SEC'
+_DEAD_HOSTS_VERSION = 1
+
 
 class EngineSourceGaveUp(RuntimeError):
     """放弃某源：host + 触发类别 + 放弃前已抓到的部分正文（text/chars，供调用方决定是否够用）。"""
@@ -1174,19 +1374,130 @@ def _url_host(url: str) -> str:
         return ''
 
 
-class SourceGiveupTracker:
-    """单轮内按 host 累计放弃次数（不跨轮：站点可能恢复）。dead = 本轮判失效、后续不再请求的 host。"""
+def resolve_dead_host_ttl(env: dict | None = None) -> int:
+    """LABELER_DEAD_HOST_TTL_SEC → 死源侧车有效期（秒）。0 或负数 = **关闭跨轮记忆**（改前行为）；
+    非数字 / 空 → 默认 DEAD_HOST_TTL_SEC。坏配置只回落安全值，不拖垮整轮。"""
+    raw = str((env or {}).get(DEAD_HOST_TTL_ENV) or '').strip()
+    if not raw:
+        return DEAD_HOST_TTL_SEC
+    try:
+        value = int(raw)
+    except ValueError:
+        print(f'  提示: {DEAD_HOST_TTL_ENV}=「{raw}」不是整数，已忽略（用默认 {DEAD_HOST_TTL_SEC}）',
+              file=sys.stderr)
+        return DEAD_HOST_TTL_SEC
+    return value
 
-    def __init__(self, threshold: int = DEAD_HOST_GIVEUPS):
+
+class DeadHostMemory:
+    """死源判定的跨轮侧车（lblspeed41，纯文件读写，可离线单测）。
+
+    文件格式：`{"version": 1, "hosts": {"<host>": <判死时间 unix 秒>}}`。
+    - 每个条目自「上次判死/本轮记入」起 ttl_sec 内有效；每轮启动**看不到未过期条目**即自动重试。
+    - 读取：文件不存在 / 损坏 / 格式不符 / ttl_sec<=0 → 返回空记忆（不跨轮）；只保留未过期条目。
+      若文件里有条目被过滤掉（过期 / 时间戳非法）就即时写回净化后的结果——过期 host 重新启用。
+    - 写入：整文件重写。先写同目录临时文件再 os.replace 原子替换，读者永远看不到半截文件；
+      mkstemp 的 0600 与写入前的 umask 一并在下方说明。任何 OSError 只告警不外抛。
+
+    刻意**不做**的部分：不按 host 记失败**次数**（本类的语义只是「有效期内的坏名单」，
+    次数由单轮的 SourceGiveupTracker 管），不自动恢复（过期即恢复，靠时间戳）。"""
+
+    def __init__(self, path: Path, ttl_sec: int = DEAD_HOST_TTL_SEC, hosts: dict | None = None):
+        self.path = Path(path)
+        self.ttl_sec = ttl_sec
+        self.hosts: dict[str, float] = dict(hosts or {})
+
+    @classmethod
+    def load(cls, path, ttl_sec: int = DEAD_HOST_TTL_SEC, now: float | None = None) -> 'DeadHostMemory':
+        """读侧车 → DeadHostMemory。任何读取 / 解析失败都静默降级为空记忆（不跨轮），绝不让整轮失败。"""
+        now = time.time() if now is None else now
+        mem = cls(path, ttl_sec)
+        if ttl_sec <= 0:
+            return mem                      # 关闸：不读也不写
+        try:
+            payload = json.loads(Path(path).read_text(encoding='utf-8'))
+            raw = payload['hosts']
+            if not isinstance(raw, dict):
+                raise ValueError('hosts 不是对象')
+            entries = {str(h): float(t) for h, t in raw.items() if isinstance(t, (int, float))}
+        except FileNotFoundError:
+            entries = {}
+        except (OSError, ValueError, TypeError, KeyError) as e:
+            print(f'  提示: 死源侧车读取失败（按无跨轮记忆处理）: {e}', file=sys.stderr)
+            entries = {}
+        mem.hosts = {h: t for h, t in entries.items() if now - t < ttl_sec}
+        if mem.hosts != entries:
+            # 判死记录已全部过期（或不合法）→ 落盘净化的结果，别让过期条目继续留着
+            print(f'  提示: 死源侧车 {len(entries) - len(mem.hosts)} 条已过期，重新启用这些源',
+                  file=sys.stderr)
+            mem.save()
+        return mem
+
+    def dead_hosts(self, now: float | None = None) -> set[str]:
+        """当前仍在有效期内的 host 集合。"""
+        now = time.time() if now is None else now
+        return {h for h, t in self.hosts.items() if now - t < self.ttl_sec}
+
+    def add(self, host: str, now: float | None = None) -> None:
+        if host:
+            self.hosts[host] = time.time() if now is None else now
+
+    def save(self) -> None:
+        """原子写侧车（临时文件 + os.replace）。ttl_sec<=0 时不写（关闸）。失败只告警。
+
+        只落 host 名与判死时刻，不含任何 URL / 凭据；读取端也按此结构解析。"""
+        if self.ttl_sec <= 0:
+            return
+        payload = {'version': _DEAD_HOSTS_VERSION, 'hosts': self.hosts}
+        fd = tmp = None
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            fd, tmp = tempfile.mkstemp(dir=str(self.path.parent), prefix='.dead-hosts-')
+            with os.fdopen(fd, 'w', encoding='utf-8') as f:
+                fd = None                   # fdopen 接管后别再由 except 关第二次
+                json.dump(payload, f, ensure_ascii=False)
+            os.replace(tmp, self.path)
+            tmp = None
+        except OSError as e:
+            print(f'  提示: 死源侧车写入失败（不影响本轮）: {e}', file=sys.stderr)
+        finally:
+            # 失败路径不留临时文件；fd 若还没被 fdopen 接管也关掉（Windows 上不关会锁住文件）
+            if tmp is not None:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+
+
+class SourceGiveupTracker:
+    """按 host 累计放弃次数。dead = 判失效、后续不再请求的 host。
+
+    单轮统计在 counts；dead 可由 `dead` 参数预置（lblspeed41 的跨轮记忆：侧车文件里
+    未过期的 host 本轮直接跳过，不发请求）。`on_dead(host)` 在 host **首次**判死时回调一次
+    （用于立即落盘侧车）。"""
+
+    def __init__(self, threshold: int = DEAD_HOST_GIVEUPS,
+                 dead: Iterable[str] = (), on_dead: Callable[[str], None] | None = None):
         self.threshold = threshold
         self.counts: dict[str, int] = {}
-        self.dead: set[str] = set()
+        self.dead: set[str] = set(dead)
+        self.on_dead = on_dead
 
     def record(self, host: str) -> None:
         n = self.counts[host] = self.counts.get(host, 0) + 1
         if n >= self.threshold and host not in self.dead:
             self.dead.add(host)
             print(f'  源失效（本轮）: {host} 已累计放弃 {n} 次，本轮后续条目不再请求该源', flush=True)
+            if self.on_dead is not None:
+                try:
+                    self.on_dead(host)
+                except Exception as e:      # 侧车写入失败不能拖垮整轮（跨轮记忆是优化）
+                    print(f'  提示: 死源侧车写入失败（不影响本轮）: {e}', file=sys.stderr)
 
 
 class EngineIdentityMismatch(Exception):
@@ -1197,17 +1508,59 @@ class EngineIdentityMismatch(Exception):
     专门 catch：写拒收、不调 LLM、不 sleep LLM_INTERVAL。"""
 
 
+# ---- 引擎取文提前止损（lblspeed41）----
+# 瓶颈（诊断 lblrate-41 §5.1）：引擎路径实抓 28–31 万字/本，单本 4–9 分钟，是吞吐天花板。
+# 打标只用样本，用不到全书。各消费方的实际需要（逐条核对见 lblspeed-41-report §2）：
+#   · 抓取门槛 MIN_BOOK_CHARS / 本地预检 PRECHECK_MIN_CHARS = 10 000 字（清洗去重后仍不足即拒收）；
+#   · 试读门要 ≥ PREVIEW_MIN_CHAPTERS(5) 章样本才判；正常网文 2000–5000 字/章；
+#   · 大面积重复/广告注入要「反复出现」才判得出 —— 章数越多越稳；
+#   · label_book：> SEGMENT_CHARS(250 000) 才切两段。旧值 50 万 ⇒ 每本 2 次模型调用 + 2 次 30s 间隔。
+# 取 80 000：对 10 000 留 8 倍余量，对试读门留 4–8 倍章数余量，且 ≤ SEGMENT_CHARS ⇒ 每本 1 次调用。
+# 可回退：LABELER_ENGINE_TARGET_CHARS=500000 恢复旧行为（book15 路径的 TARGET_CHARS 不受影响）。
+ENGINE_TARGET_CHARS = 80_000
+ENGINE_TARGET_CHARS_ENV = 'LABELER_ENGINE_TARGET_CHARS'
+# 质量门硬下限：低于 PRECHECK_MIN_CHARS 时，抓回来的健康书会被「清洗去重后仅 N 字」拒收——
+# 这不是提速而是偷偷改判据。配置值低于它时夹到下限并告警（理由见报告 §2 表 #1/#2）。
+MIN_ENGINE_TARGET_CHARS = PRECHECK_MIN_CHARS
+
+
+def resolve_engine_target_chars(env: dict | None = None) -> int:
+    """LABELER_ENGINE_TARGET_CHARS → 引擎取文字数上限。非正整数忽略并告警；低于质量门下限
+    夹到下限并告警（见 MIN_ENGINE_TARGET_CHARS）；缺省 ENGINE_TARGET_CHARS。
+    任何坏配置都不拖垮整轮，只回落到安全值。"""
+    raw = str((env or {}).get(ENGINE_TARGET_CHARS_ENV) or '').strip()
+    if not raw:
+        return ENGINE_TARGET_CHARS
+    try:
+        value = int(raw)
+    except ValueError:
+        value = 0
+    if value <= 0:
+        print(f'  提示: {ENGINE_TARGET_CHARS_ENV}=「{raw}」不是正整数，已忽略'
+              f'（用默认 {ENGINE_TARGET_CHARS}）', file=sys.stderr)
+        return ENGINE_TARGET_CHARS
+    if value < MIN_ENGINE_TARGET_CHARS:
+        print(f'  提示: {ENGINE_TARGET_CHARS_ENV}={value} 低于质量门下限 '
+              f'{MIN_ENGINE_TARGET_CHARS}，已夹到下限（再低会把健康书按「字数不足」拒收）',
+              file=sys.stderr)
+        return MIN_ENGINE_TARGET_CHARS
+    return value
+
+
 def fetch_book_text_engine(engine_cli, book_url: str,
-                           target_chars: int = TARGET_CHARS,
+                           target_chars: int = ENGINE_TARGET_CHARS,
                            expect_title: str = '',
                            expect_author: str = '',
                            giveup_streak: int = SOURCE_GIVEUP_STREAK,
                            server_error_streak: int = SERVER_ERROR_GIVEUP_STREAK,
                            stats: dict | None = None) -> tuple[str, int]:
-    """引擎源整本（到字数上限）→ (拼接文本, 实际字数)。
+    """引擎源取正文到 target_chars 上限 → (拼接文本, 实际字数)。
+
+    默认 ENGINE_TARGET_CHARS（打标只需样本，见该常量上的理由）；显式传入覆盖，
+    TARGET_CHARS 即恢复「抓满全书」的旧行为。
 
     toc 失败（无章 / 环境错误，CLI 退出码非 0）→ 抛异常，交主循环计失败（不静默产空文本）。
-    单章 content 失败（重试后仍空）跳过，隔离不拖垮整本；target_chars/CHUNK_RETRY/CHAPTER_DELAY
+    单章 content 失败（重试后仍空）跳过，隔离不拖垮整本；CHUNK_RETRY/CHAPTER_DELAY
     与 book15 路径沿用同一常量。
 
     giveup41：toc 确定性失败、或连续 giveup_streak 章同一确定性错误类别 → 抛 EngineSourceGaveUp
@@ -1246,6 +1599,12 @@ def fetch_book_text_engine(engine_cli, book_url: str,
     stats = stats if stats is not None else {}
     stats.setdefault('nonbody_chapters', 0)
     stats.setdefault('preview_chapters', 0)
+    # author17k41：把已通过身份校验（标题兼容）的 toc 自报作者/标题透出给记录组装层，
+    # 供「名单作者为空」时回写（见 main 的 engine_toc 回写）。只读透出，不改取文行为。
+    # 位置在两处 EngineIdentityMismatch 之后 → 出现在 stats 即代表目录身份已过。
+    # toc_title 供回写点做「归一后书名完全相等」的收紧判据（rvauthor CE3：只前缀兼容不回写）。
+    stats['toc_author'] = toc_author
+    stats['toc_title'] = toc_title
     streak_limit = dict.fromkeys(DETERMINISTIC_ENGINE_ERRORS, giveup_streak)
     streak_limit[SERVER_ERROR_KIND] = server_error_streak
     streak_kind, streak = '', 0     # 连续同一放弃类别（确定性 / 重试后仍 5xx）的章数
@@ -1305,8 +1664,11 @@ def fetch_book_text_engine(engine_cli, book_url: str,
 
 def fetch_engine_book_with_giveup(engine_cli, book: dict, tracker: SourceGiveupTracker,
                                   giveup_streak: int = SOURCE_GIVEUP_STREAK,
+                                  target_chars: int = ENGINE_TARGET_CHARS,
                                   stats: dict | None = None) -> tuple[str, int, dict]:
     """引擎队列条目取正文，主源失效（确定性错误或持续 5xx）时按 engine_alternates 换源 → (text, chars, 实际所用源)。
+
+    target_chars 透传给 fetch_book_text_engine（默认 ENGINE_TARGET_CHARS，见该常量的理由）。
 
     实际所用源 = {'url', 'title', 'source'}，调用方据此改写条目的 url/source_host（产物记真实来源）。
     - 主源：身份不符 / 其他失败照旧上抛（行为同改前）；EngineSourceGaveUp → tracker 记一次放弃、换下一个。
@@ -1332,7 +1694,7 @@ def fetch_engine_book_with_giveup(engine_cli, book: dict, tracker: SourceGiveupT
                 engine_cli, src['url'],
                 expect_title=book.get('title') or '',
                 expect_author=book.get('author') or '',
-                giveup_streak=giveup_streak, stats=attempt_stats)
+                giveup_streak=giveup_streak, target_chars=target_chars, stats=attempt_stats)
             if stats is not None:
                 stats.update(attempt_stats)
             return text, chars, src
@@ -1379,6 +1741,42 @@ def format_failure_kinds(kinds: dict) -> str:
     """{类别: 次数} → 「失败分类: A 3 / B 1」（按次数降序，同数按类别名）。"""
     items = sorted(((k, v) for k, v in kinds.items() if v), key=lambda kv: (-kv[1], kv[0]))
     return '失败分类: ' + ' / '.join(f'{k} {v}' for k, v in items)
+
+
+def _clean_engine_author(raw: str) -> str:
+    """引擎 toc 自报作者 → 可入库的作者串：剥前导「作者：」标签与尾部「著/等著…」，保名、不 casefold。
+
+    与 douban_list._norm_author 分工：那条是**身份比对**用的强归一（casefold + 去标点 + 剥国籍段），
+    会把「乔治·奥威尔」压成小写去点、不适合直接入库；这里只做面向存储的轻清洗，复用同一套
+    标签/尾缀正则，保证清洗口径与比对口径不打架。全空（如 toc 只给「作者：」）→ '' ⇒ 不回写。
+    占位作者（佚名/未知/暂无/匿名…，对齐 source-parser.ts knownSourceAuthor）→ '' ⇒ 不回写、不入身份。"""
+    s = douban_list._strip_author_label((raw or '').strip())
+    while True:
+        stripped = douban_list._AUTHOR_SUFFIX_RE.sub('', s)
+        if stripped == s:
+            break
+        s = stripped
+    s = s.strip()
+    return '' if douban_list.is_placeholder_author(s) else s
+
+
+def engine_author_writeback(list_author: str, toc_author: str,
+                            list_title: str = '', toc_title: str = '') -> str:
+    """名单作者为空、目录书名与名单书名归一后完全相等、且 toc 作者清洗后非空 → 返回应回写的作者；否则 ''。
+
+    条件①名单作者为空 + ③toc_author 清洗后非空（且非占位作者）在此判；条件②「目录身份校验已通过」
+    由调用点保证——toc_author/toc_title 仅在 fetch_book_text_engine 的两处 EngineIdentityMismatch
+    之后才写进 stats，身份不符会先抛异常。**书名收紧（rvauthor CE3）**：搜索阶段 title_compatible
+    允许前缀兼容（系列卷号），但前缀兼容可能是**另一本书**（《万古仙穹》vs《万古仙穹外传》）；
+    回写把原本 review 的错书变成入库，故此处要求 _norm_title 完全相等才回写，只前缀兼容的保持
+    作者为空、照旧进 review。toc_title 为空（源没自报标题）时无从确认完全相等 → 不回写（保守）。
+    名单作者非空 ⇒ 恒 '' ⇒ 行为完全不变。不触碰作者歧义护栏（搜索阶段已判）。"""
+    if (list_author or '').strip():
+        return ''
+    if douban_list._norm_title(list_title) != douban_list._norm_title(toc_title) \
+            or not (toc_title or '').strip():
+        return ''
+    return _clean_engine_author(toc_author)
 
 
 def _build_engine_cli(env: dict):
@@ -1747,40 +2145,49 @@ def _log_model(context: str, message: str) -> None:
 
 def label_book(text: str, api_key: str, models: list[str],
                site_title: str = '', site_author: str = '',
-               max_tokens: dict | None = None) -> tuple[dict, int]:
+               max_tokens: dict | None = None, meta: dict | None = None) -> tuple[dict, int]:
     """50 万字文本 → (标签 dict, 实际调用次数)。
     两段式：每段 ≤25 万字独立过 CF 100s 线（实测 40 万字单段 prefill 必撞 524）。
     第二段带第一段结论合并，可修正只看开头的误判；text_quality 两段各判、按 merge_text_quality 合并。
     site_title / site_author 为本次来源站点书目，附加打标验证段供成分判定。
     models 为后备模型链（如 bohe → grok → ...），逐段内按链逐个尝试。
-    max_tokens = resolve_max_tokens(env) 的结果（按模型的输出上限），None 用默认。"""
+    max_tokens = resolve_max_tokens(env) 的结果（按模型的输出上限），None 用默认。
+    meta（lblmeta41）：可选出参。成功时写入 `label_model` = **产出返回标签那一段**实际响应的
+    模型（多段时是末段；模型链会在多厂家间按可用性回退，事后按这个字段才能把 quality 分归因）。"""
+    used: dict = {}
     verification = _build_verification(site_title, site_author)
     context = f'书目={site_title or "（未知）"}'
     if len(text) <= SEGMENT_CHARS:
-        return _label_once(text, api_key, models, verification,
-                           context=f'{context} 分段=1/1', max_tokens=max_tokens), 1
+        labels = _label_once(text, api_key, models, verification,
+                             context=f'{context} 分段=1/1', max_tokens=max_tokens, used=used)
+        if meta is not None:
+            meta['label_model'] = used.get('label_model', '')
+        return labels, 1
     seg1, seg2 = text[:SEGMENT_CHARS], text[SEGMENT_CHARS:]
     labels1 = _label_once(seg1, api_key, models, verification,
-                          context=f'{context} 分段=1/2', max_tokens=max_tokens)
+                          context=f'{context} 分段=1/2', max_tokens=max_tokens, used=used)
     merged_user = (
         "【前次阅读结论】\n" + json.dumps(labels1, ensure_ascii=False)
         + "\n\n【后续文本】\n" + seg2 + MERGE_PROMPT_SUFFIX
     )
     labels2 = _label_once(merged_user, api_key, models, verification,
-                          context=f'{context} 分段=2/2', max_tokens=max_tokens)
+                          context=f'{context} 分段=2/2', max_tokens=max_tokens, used=used)
     quality, evidence = merge_text_quality([labels1, labels2])
     if quality is not None:
         labels2['text_quality'] = quality
         labels2['text_quality_evidence'] = evidence
+    if meta is not None:
+        meta['label_model'] = used.get('label_model', '')
     return labels2, 2
 
 
 def _label_once(user_content: str, api_key: str, models: list[str],
                 verification: str = '', *, context: str = '',
-                max_tokens: dict | None = None) -> dict:
+                max_tokens: dict | None = None, used: dict | None = None) -> dict:
     """单次 LLM 调用。流式。对链中每个模型最多试 MODEL_RETRY 次，
     某模型连续 MODEL_RETRY 次失败即切换下一个；全部模型耗尽才算本次失败。
-    输出被截断 / 上游空回不在同模型上重试（同预算重试大概率同样结果），直接换下一个模型。"""
+    输出被截断 / 上游空回不在同模型上重试（同预算重试大概率同样结果），直接换下一个模型。
+    used（lblmeta41）：可选出参，成功时写 `label_model` = 本次真正响应的模型名。"""
     if not models:
         raise RuntimeError('模型链为空，无法打标')
     _log_model(context, f'开始分段，模型链从链首 {models[0]} 开始')
@@ -1815,6 +2222,8 @@ def _label_once(user_content: str, api_key: str, models: list[str],
                 parsed, origin = _labels_from_reply(reply, limit)
                 note = '（content 为空，取自 reasoning_content）' if origin == 'reasoning' else ''
                 _log_model(context, f'模型 {model} 尝试 {attempt + 1}/{MODEL_RETRY} 成功{note}')
+                if used is not None:
+                    used['label_model'] = model
                 return parsed
             except (LlmOutputTruncated, LlmEmptyReply) as e:
                 last_err = e
@@ -1978,6 +2387,14 @@ def main() -> int:
     print(f'模型链: {models}')
     max_tokens = resolve_max_tokens(env)
     print(f'输出上限 max_tokens: {max_tokens}')
+    # lblspeed41：引擎取文止损与死源跨轮记忆的运行时配置（显式求出再传下去，
+    # 与 REJECT_TERMINAL_THRESHOLD 同理：默认参数在 def 时求值，显式传才是「改配置即生效」）。
+    engine_target_chars = resolve_engine_target_chars(env)
+    dead_host_ttl = resolve_dead_host_ttl(env)
+    print(f'引擎取文字数上限: {engine_target_chars} 字'
+          + ('（LABELER_ENGINE_TARGET_CHARS 覆盖）'
+             if env.get(ENGINE_TARGET_CHARS_ENV) else '（默认，打标只需样本）'))
+    print('死源跨轮记忆: ' + (f'{dead_host_ttl} 秒有效期' if dead_host_ttl > 0 else '关闭'))
     # 断点续传：已写入 labels.jsonl 的书跳过（按详情页 url 判定）
     done_urls = load_done_urls(data_path('labels.jsonl'))
     # 钉子户终态：历史被拒 ≥ REJECT_TERMINAL_THRESHOLD 次的书同样跳过，
@@ -2090,8 +2507,26 @@ def main() -> int:
 
     ok = fail = stub_skipped = 0
     fail_kinds: dict[str, int] = {}
-    # giveup41：本轮按 host 累计「源失效」放弃次数，达阈值后后续条目不再请求该 host。
-    source_giveups = SourceGiveupTracker(DEAD_HOST_GIVEUPS)
+    def _save_dead_hosts(host: str) -> None:
+        """本轮新判死的 host 立即落盘（lblspeed41）：别等轮末——本轮可能被门卫掐断。"""
+        if dead_host_memory is None:
+            return
+        dead_host_memory.add(host, now=time.time())
+        dead_host_memory.save()
+
+    # lblspeed41：本轮按 host 累计「源失效」放弃次数，达阈值后后续条目不再请求该 host。
+    # 跨轮记忆：侧车文件里未过期的 host 直接进 dead（本轮零请求）。文件坏/读写失败静默降级为不跨轮。
+    dead_host_memory = (DeadHostMemory.load(data_path(DEAD_HOSTS_FILENAME),
+                                            ttl_sec=dead_host_ttl, now=time.time())
+                        if dead_host_ttl > 0 else None)
+    source_giveups = SourceGiveupTracker(DEAD_HOST_GIVEUPS,
+                                         on_dead=_save_dead_hosts if dead_host_memory else None)
+    if dead_host_memory is not None:
+        remembered = sorted(dead_host_memory.dead_hosts(now=time.time()))
+        if remembered:
+            source_giveups.dead.update(remembered)
+            print(f'  死源跨轮记忆: {len(remembered)} 个 host 在 {dead_host_ttl // 3600}h 有效期内，'
+                  f'本轮直接跳过（{", ".join(remembered)}）')
 
     def count_failure(kind: str) -> None:
         fail_kinds[kind] = fail_kinds.get(kind, 0) + 1
@@ -2120,9 +2555,21 @@ def main() -> int:
                 # 换源成功则条目 url/source_host 改记实际来源（产物与入库记真实来源）。
                 text, chars, used = fetch_engine_book_with_giveup(
                     engine_cli, b, source_giveups, giveup_streak=SOURCE_GIVEUP_STREAK,
-                    stats=fetch_stats)
+                    target_chars=engine_target_chars, stats=fetch_stats)
                 if used['url'] != b['url']:
                     b['url'], b['source_host'] = used['url'], used['source']
+                # author17k41：名单作者为空时，用已过身份校验（标题兼容）的 toc 自报作者回写
+                # 记录 author，让引擎兜底书也能过 import_one 空作者护栏。名单有作者时**不动**；
+                # 作者歧义护栏在搜索阶段已跑过（到这里的书都已通过），此处不绕开、不重判。
+                # toc_author/toc_title 仅在目录身份校验通过后才进 fetch_stats（见 fetch_book_text_engine）。
+                # 书名比对用 list_title（名单书名，_resolve_candidates 存下）——engine 条目的 b['title']
+                # 已是候选站点标题，用它会退化成「候选标题 vs 同页 toc 标题」而放过前缀兼容错书（rvauthor 增量）。
+                engine_author = engine_author_writeback(
+                    b.get('author', ''), fetch_stats.get('toc_author') or '',
+                    b.get('list_title') or b.get('title', ''), fetch_stats.get('toc_title') or '')
+                if engine_author:
+                    b['author'], b['author_source'] = engine_author, 'engine_toc'
+                    print(f'  引擎目录作者回写: {engine_author}（名单作者为空）')
                 if fetch_stats.get('nonbody_chapters') or fetch_stats.get('preview_chapters'):
                     print(f'  取文跳过: 公告/感言条目 {fetch_stats.get("nonbody_chapters", 0)} 条，'
                           f'试读章 {fetch_stats.get("preview_chapters", 0)} 章')
@@ -2192,10 +2639,11 @@ def main() -> int:
                 continue
             # --book 的 title 是详情页路径，不作为可核验的站点书名。
             site_title = '' if args.book else (b.get('title') or '').strip()
+            llm_meta: dict = {}
             labels, calls = label_book(
                 text, env['LLM_API_KEY'], models,
                 site_title=site_title, site_author=b.get('author', ''),
-                max_tokens=max_tokens)
+                max_tokens=max_tokens, meta=llm_meta)
             # 有站点书名时：原字符串匹配 或 JSON 布尔 true 任一通过即入库。
             # --book 保留跳过书名校验；榜单空书名必须拒绝，不能自动放行。
             site_match = labels.get('site_title_match') is True
@@ -2260,7 +2708,13 @@ def main() -> int:
             # （已是绝对，BOOK15.absolute 对 http 开头原样透传）；book15 条目现状不变。
             is_engine = bool(b.get('engine'))
             b_out = {
-                'title': labels.get('title_guess') or b.get('title', ''),
+                # lblmeta41：记录里的 title 必须是**站点书名**（可核验的权威串），
+                # LLM 的猜名只留在 labels.title_guess 里供对照。旧写法取
+                # `title_guess or b['title']` → 猜名进了身份键，与站点书名不同的猜名
+                # 会让导入端把它当「书名冲突」而拒收（且键随猜名漂移）。
+                # site_title 为空（--book 调试模式；榜单/引擎线不会发生，见上面的 R0 前置）
+                # 时才回落到猜名、再回落到条目自带书名，保持调试路径行为不变。
+                'title': site_title or labels.get('title_guess') or b.get('title', ''),
                 'site_title': site_title,
                 'author': b.get('author', ''),
                 'category': b.get('category', ''),
@@ -2271,11 +2725,21 @@ def main() -> int:
                                if not args.book else 'book15-rank',
                 'url': BOOK15.absolute(b['url']),
                 'chars': chars,
+                # lblmeta41：打标元数据三字段（顶层随记录写进 labels.jsonl）——
+                # label_model：本次真正响应的模型名，取自回退链里成功的那个（见 label_book meta 出参）；
+                # prompt_version：SYSTEM_PROMPT 的版本常量，改提示词必须升版，否则事后无法按版本分桶；
+                # label_source：取文路径，text_engine=引擎源（多源兜底）/ text_book15=book15 站点。
+                'label_model': llm_meta.get('label_model', ''),
+                'prompt_version': PROMPT_VERSION,
+                'label_source': 'text_engine' if is_engine else 'text_book15',
                 'labels': labels,
             }
             if quality_flag:
                 b_out['quality_flag'] = quality_flag
                 b_out['text_quality_evidence'] = evidence
+            if b.get('author_source'):
+                # author17k41：作者非名单原生（引擎 toc 回写）时留审计标记，供事后追溯
+                b_out['author_source'] = b['author_source']
             print(f'  {chars} 字 | {labels.get("genre")} | conf {labels.get("confidence")} | {calls} 次调用')
             out_path = data_path('labels.jsonl')
             with open(out_path, 'a', encoding='utf-8') as f:

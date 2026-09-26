@@ -129,6 +129,36 @@ class TestLabelOnce(LlmCase):
         self.label(fake, ['m1'])
         self.assertEqual(fake.requests, [('m1', labeler.DEFAULT_MAX_TOKENS)])
 
+    def test_used_records_the_model_that_actually_replied(self):
+        # lblmeta41：模型链首失败换到 m2 —— label_model 必须记真正响应的 m2，不是链首
+        fake = FakeLlm({'glm': [_sse(_delta(content='', finish='stop'))],
+                        'm2': [_sse(_delta(content=json.dumps(LABELS)))]})
+        used = {}
+        with mock.patch.object(labeler.urllib.request, 'urlopen', side_effect=fake), \
+                contextlib.redirect_stderr(io.StringIO()):
+            labeler._label_once('正文', FAKE_KEY, ['glm', 'm2'], used=used)
+        self.assertEqual(used['label_model'], 'm2')
+
+    def test_label_book_meta_reports_last_segment_model(self):
+        # 两段式：末段模型 = 返回标签那一段实际响应的模型
+        replies = [{'title_guess': '斗罗大陆', 'text_quality': '正常'}]
+        used = {'label_model': 'm2'}
+        def fake_once(*a, **k):
+            k['used']['label_model'] = 'm1' if k['context'].endswith('1/2') else 'm2'
+            return dict(replies[0])
+        meta = {}
+        with mock.patch.object(labeler, '_label_once', side_effect=fake_once):
+            labeler.label_book('字' * (labeler.SEGMENT_CHARS + 10), 'k', ['m1'],
+                               meta=meta)
+        self.assertEqual(meta['label_model'], 'm2')
+
+    def test_label_book_meta_is_optional(self):
+        # 不传 meta 不改变返回（旧调用点零改动）
+        with mock.patch.object(labeler, '_label_once', return_value={'text_quality': '正常'}):
+            labels, calls = labeler.label_book('正文', 'k', ['m1'])
+        self.assertEqual(calls, 1)
+        self.assertEqual(labels['text_quality'], '正常')
+
     def test_fenced_content_still_parses(self):
         fake = FakeLlm({'m1': [_sse(_delta(content='```json\n'), _delta(content=json.dumps(LABELS)),
                                     _delta(content='\n```', finish='stop'))]})

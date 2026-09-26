@@ -131,8 +131,14 @@ describe('old and new label records', () => {
     }
   });
 
-  it('does not resolve conflicting top-level titles automatically', () => {
-    assert.equal(validateImportRecord(record({ site_title: '另一书', labels: { ...base.labels, site_title_match: true } })).status, 'review');
+  it('lblmeta41: does not review a mismatch on its own when identity is confirmed', () => {
+    // title(=site_title 优先) 与 site_title 不一致本身不再是 review；身份证据由 site_title_match
+    // 负责。base.labels 的 site_title_match 缺省无（legacy 路径）——这里显式给 true。
+    assert.equal(validateImportRecord(record({ site_title: '另一书', labels: { ...base.labels, site_title_match: true } })).status, 'ready');
+    // 身份未确认时一致与否都拦
+    assert.equal(validateImportRecord(record({ site_title: '另一书', labels: { ...base.labels, site_title_match: false } })).status, 'review');
+    // legacy（无 site_title_match）+ 盲猜与站点书名不匹配 → review（旧路径不变）
+    assert.equal(validateImportRecord(record({ site_title: '另一书', labels: { ...base.labels } })).status, 'review');
   });
 
   it('requires a strict true confirmation when site_title_match is present', () => {
@@ -149,8 +155,7 @@ describe('old and new label records', () => {
     assert.equal(validateImportRecord(record({ labels: { ...base.labels, text_quality: false } })).status, 'failed');
   });
 
-  it('accepts only ad-injection rows that labeler downgraded with quality_flag (lbladfix41)', () => {
-    const ad = { ...base.labels, text_quality: '含广告注入', text_quality_evidence: ['首发--无弹出广告'] };
+  it('accepts only ad-injection rows that labeler downgraded with quality_flag (lbladfix41)', () => {    const ad = { ...base.labels, text_quality: '含广告注入', text_quality_evidence: ['首发--无弹出广告'] };
     const ready = validateImportRecord(record({ quality_flag: 'ad_injection', labels: ad }));
     assert.equal(ready.status, 'ready');
     assert.equal(ready.record.labels.text_quality, '含广告注入');
@@ -400,6 +405,31 @@ describe('作者在身份键和 SQL 绑定前规范化', () => {
     assert.equal(calls[0].length, 1);
     assert.equal(calls[1][1], '埃里克·霍弗');
     assert.equal(logs.at(-1), '总数 3 / 入库 1 / 跳过 0 / 待核验 2 / 失败 0');
+  });
+});
+
+// lblmeta41：导入判据对照测试（JS 侧）。与 python 侧（scripts/test_import_one.py 的
+// TestVerdictParity）读**同一份**共享输入 fixtures/import-verdict-parity.json。
+// 判据在两条兄弟路径各写一份，只跑各自用例证明不了「两边对同一批输入结论相同」；
+// 共享输入能把漂移暴露出来（agree=false 的行 = 已知刻意分叉，已在 why 里写明理由）。
+describe('import verdict parity with import_one.py', () => {
+  const rows = JSON.parse(readFileSync(
+    fileURLToPath(new URL('./fixtures/import-verdict-parity.json', import.meta.url)), 'utf8'));
+
+  it('每行 mjs 侧结论等于声明值', () => {
+    assert.ok(rows.length >= 10);
+    for (const row of rows) {
+      const record_ = structuredClone(row.record);
+      assert.equal(validateImportRecord(record_).status, row.mjs, row.why);
+    }
+  });
+
+  it('agree=true 的行两侧用同一结论', () => {
+    for (const row of rows) if (row.agree) assert.equal(row.py, row.mjs, row.why);
+  });
+
+  it('agree=false 的行必须写明 KNOWN DIVERGENCE 理由', () => {
+    for (const row of rows) if (!row.agree) assert.match(row.why, /DIVERGENCE/);
   });
 });
 

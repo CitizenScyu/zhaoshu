@@ -1,8 +1,13 @@
-import type { NextRequest } from 'next/server';
+import { NextResponse, type NextRequest } from 'next/server';
 import { authAccountsEnabled, principalFromSessionRecord, verifyOwnerHeader } from '@/lib/auth';
-import { findSessionByToken, getSessionTokenFromRequest } from '@/lib/auth-session';
+import {
+  clearedSessionCookieOptions,
+  findSessionByToken,
+  getSessionCookieName,
+  getSessionTokenFromRequest,
+} from '@/lib/auth-session';
 import { getSql } from '@/lib/db';
-import { authError, authJson } from '@/lib/auth-http';
+import { authError, authJson, withAuthHeaders } from '@/lib/auth-http';
 import { withDbQuotaGuard } from '@/lib/db-quota-guard';
 
 function ownerUser() {
@@ -17,8 +22,18 @@ function ownerUser() {
   };
 }
 
+// 失效 Cookie 的 401：状态码与正文原样保留（前端靠 401 判定账号模式），补 no-store，
+// 并按登出同一套属性过期 Cookie，免得浏览器每个页面都带着它再撞一次 401。
+function expireSessionCookie(response: Response): NextResponse {
+  const wrapped = withAuthHeaders(response);
+  const cleared = new NextResponse(wrapped.body, { status: wrapped.status, headers: wrapped.headers });
+  cleared.cookies.set(getSessionCookieName(), '', clearedSessionCookieOptions());
+  return cleared;
+}
+
 // 匿名或当前凭据：无 Cookie 时 200 {user:null}；有效时只返回最小用户信息，
-// 绝不返回 token / hash；过期凭据 401，库故障 503，均 no-store。
+// 绝不返回 token / hash；过期凭据 401（并过期该 Cookie），库故障 503，均 no-store。
+// 旧口令模式恒 200：前端 auth-client 把本接口的 401 当作「必然是账号模式」，改这里须同步那边。
 // accountsEnabled 是前端选择登录流程所需的部署开关，不是秘密（试登录接口即可探测）。
 async function handleGET(req: NextRequest) {
   if (!authAccountsEnabled()) {
@@ -47,7 +62,10 @@ async function handleGET(req: NextRequest) {
     return authError(503, 'AUTH_DB_UNAVAILABLE', 'authentication service unavailable');
   }
   const result = principalFromSessionRecord(record);
-  if (!result.ok) return result.response;
+  if (!result.ok) {
+    // 只清 401（会话无效/过期/代际不符）；403 是成员闸门关闭，会话本身仍有效。
+    return result.response.status === 401 ? expireSessionCookie(result.response) : result.response;
+  }
   return authJson({
     accountsEnabled: true,
     user: {

@@ -22,7 +22,21 @@ import { engineSourceRevision } from './compile';
 import { engineSemanticsVersion, engineSyntaxOrEnabled } from './syntax-flags';
 
 // ---------------------------------------------------------------- 常量
-export const DEFAULT_ADMISSION_KEYWORD = '斗破苍穹';
+/**
+ * 探测词兜底候选（41-srcfix 改法1）：源没填 checkKeyWord 时按序取；源填了的，其自带词排第一、本列表接在后面。
+ * 单值「斗破苍穹」探全品类站点常搜不到（srcpool-41 §5.2：bsxiaoshuo/book.qq.com 等 no_result 源均无 checkKeyWord）。
+ * 次序：首词保持历史值（首次尝试与改前逐字一致）→「我的」（泛用子串，书名含它的书几乎每站都有）→ 另一品类名作。
+ * 每个词都必须有 QUERY_CONTROL_KEYWORDS 里与之无公共字的对照词，否则该词命中后对照判据失效（有单测钉死）。
+ */
+export const DEFAULT_ADMISSION_KEYWORDS = ['斗破苍穹', '我的', '诡秘之主'] as const;
+export const DEFAULT_ADMISSION_KEYWORD = DEFAULT_ADMISSION_KEYWORDS[0];
+/**
+ * 单个源一次探测最多试几个词（含源自带 checkKeyWord）。只有 no_result（页面拿到了、0 候选）才换下一个词；
+ * challenge/conn_fail/4xx/5xx/url_invalid 换词无意义，立即返回。整源只占 1 个探测名额（名额按源计，不按请求计）；
+ * 预算按「每次尝试前」逐次判定：runAdmissionBatch 把 canProbe 作 canRetryKeyword 传入，调用方的 canProbe 按
+ * ADMISSION_PROBE_WORST_MS（单词一次尝试 + 对照）预留，所以任何一次尝试开始时剩余预算都够它跑完最坏情形。
+ */
+export const ADMISSION_MAX_KEYWORD_TRIES = 3;
 export const ADMISSION_TIMEOUT_MS = 8_000;
 export const ADMISSION_MAX_BYTES = 2 * 1024 * 1024;
 export const ADMISSION_MAX_REDIRECTS = 3;
@@ -50,7 +64,27 @@ export function admissionMaxProbes(env: AdmissionProbesEnv = process.env): numbe
 interface AdmissionProbesEnv {
   ADMISSION_MAX_PROBES?: string | undefined;
   ADMISSION_PROBE_CONCURRENCY?: string | undefined;
+  ADMISSION_UPGRADED_MAX_PROBES?: string | undefined;
   [key: string]: string | undefined;
+}
+/**
+ * http 升级源首探名额**默认值**（41-srcfix 改法2 放量控制）：bookSourceUrl 为 http:// 的源经升级新进候选池约 199 个，
+ * 全是「未测」class 0，会排在一切复测（class 1）与 ok 复核（class 2）之前把名额吃满好几天。给它们的**首次探测**
+ * 单独设每轮上限（占总名额内，不另加名额）：默认 10 = 默认总名额 20 的一半，另一半照常留给既有积压与复测。
+ * 只管首探——测过一次后它们与普通源同一套复测/复核节奏，不再受此限。
+ */
+export const DEFAULT_ADMISSION_UPGRADED_MAX_PROBES = 10;
+/**
+ * http 升级源每轮首探上限：env `ADMISSION_UPGRADED_MAX_PROBES` 生效。与 admissionMaxProbes 同款解析，但**允许 0**
+ * （= 本轮一个都不首探，相当于放量暂停开关）；非法/负数/缺失回退默认。
+ */
+export function admissionUpgradedMaxProbes(env: AdmissionProbesEnv = process.env): number {
+  const parsed = Number.parseInt(env.ADMISSION_UPGRADED_MAX_PROBES ?? '', 10);
+  return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : DEFAULT_ADMISSION_UPGRADED_MAX_PROBES;
+}
+/** 源声明 URL 是写死 http:// 的（经改法2 升级才进候选池）。 */
+export function isUpgradedHttpSource(source: RawSource): boolean {
+  return /^http:\/\//i.test(String(source.bookSourceUrl ?? ''));
 }
 /**
  * 探测并发度**默认值**:1 = 与历史逐源串行行为逐行一致(零行为变更)。
@@ -103,9 +137,20 @@ export const ADMISSION_NO_RESULT_RETEST_MS = 72 * 3_600_000;
  * 但不再是「一次 8s 超时定终身」——search_checked_at 距今超过该窗即回到待复探，下一轮
  * cron 拿到名额就重探。取 7d 而非 20h：死站每源每周最多吃 1 个探测名额（名额默认 20/轮 ×
  * cron 每日 1 轮，env ADMISSION_MAX_PROBES 可调；K 个死站只占 K/7 每天），瞬时抖动误杀的源最迟 7 天回池。
- * challenge/shell 是站点行为（非网络层），维持终态不衰减。
+ * shell 是站点行为（非网络层），维持终态不衰减；challenge 见 ADMISSION_CHALLENGE_RETEST_MS。
  */
 export const ADMISSION_CONN_FAIL_RETEST_MS = 7 * 24 * 3_600_000;
+/**
+ * challenge 有限复测（41-srcfix 改法1）：challenge 仍归 rejected 桶（出池、漏斗口径不变），但不再「一次 403
+ * 定终身」——Cloudflare 质询常是偶发（swprobe-41 §6：noveltri 生产出网实测可通）。与 no_result 同取 72h 窗；
+ * 每源连续判 challenge 计 strike（写在 error 前缀里，不加列），达 ADMISSION_CHALLENGE_MAX_STRIKES 即回到终态、
+ * 不再按时间复测，免得反复打一个真拒人的站。规则一变（rules_hash 变）照常重排，strike 从头计。
+ * 预算：死挡站每源最多 MAX_STRIKES-1 次复测，间隔 72h ⇒ 13 行 challenge 平摊每天 < 5 个名额，一周后归零。
+ */
+export const ADMISSION_CHALLENGE_RETEST_MS = 72 * 3_600_000;
+export const ADMISSION_CHALLENGE_MAX_STRIKES = 3;
+/** challenge 行 error 的 strike 前缀：`challenge_strike:<n>:<原因>`。无前缀的旧 challenge 行按 1 次计。 */
+export const ADMISSION_CHALLENGE_STRIKE_PREFIX = 'challenge_strike:';
 /**
  * ok 源长周期复核窗（41-B2-OK-RECHECK）：源一旦判 ok 即永久在池，站点改版/上反爬/关站后
  * 系统仍认为它 search_ok=true，用户每次阅读都白等它一轮切片。ok 行 search_checked_at 距今
@@ -141,8 +186,9 @@ export const QUERY_CONTROL_KEYWORDS = ['凡人修仙传', '诡秘之主', '庆�
 /** 两次搜索候选 URL 集 Jaccard 达到此值即判查询不敏感。 */
 export const QUERY_INSENSITIVE_OVERLAP = 0.8;
 /**
- * 开启对照搜索后单个探测的最坏墙钟：主搜索 + 节流 + 对照搜索。调用方的逐探预算止损（canProbe）
- * 必须按这个值预留，否则最后一个探测会越过刷新预算。
+ * 开启对照搜索后**单个探测词一次尝试**的最坏墙钟：主搜索 + 节流 + 对照搜索。调用方的逐探预算止损（canProbe）
+ * 必须按这个值预留，否则最后一个探测会越过刷新预算。探测词兜底（ADMISSION_MAX_KEYWORD_TRIES）的后续尝试
+ * 在起跑前再判一次 canProbe（同一预留），故本值口径不变、不按词数放大。
  */
 export const ADMISSION_PROBE_WORST_MS = 2 * ADMISSION_TIMEOUT_MS + ADMISSION_THROTTLE_MS;
 
@@ -416,10 +462,19 @@ function errorMessage(error: unknown): string {
 /** 准入主关键词：legado 标准位置是嵌套 ruleSearch.checkKeyWord（DB 995 源顶层无此字段）；
  * 顶层 source.checkKeyWord 仅作非标准源兼容，都无才落兜底词。 */
 function admissionKeyword(source: RawSource): string {
+  return admissionKeywords(source)[0];
+}
+
+/**
+ * 探测词序列（41-srcfix 改法1）：源自带词（若有）+ DEFAULT_ADMISSION_KEYWORDS，去重后截到
+ * ADMISSION_MAX_KEYWORD_TRIES。首项即 admissionKeyword（主关键词口径不变）。
+ */
+export function admissionKeywords(source: RawSource): string[] {
   const nestedKeyword = (source.ruleSearch as Record<string, unknown> | undefined)?.checkKeyWord;
-  return (typeof nestedKeyword === 'string' && nestedKeyword.trim() ? nestedKeyword
-    : typeof source.checkKeyWord === 'string' && source.checkKeyWord.trim() ? source.checkKeyWord
-      : DEFAULT_ADMISSION_KEYWORD).trim();
+  const own = typeof nestedKeyword === 'string' && nestedKeyword.trim() ? nestedKeyword.trim()
+    : typeof source.checkKeyWord === 'string' && source.checkKeyWord.trim() ? source.checkKeyWord.trim() : '';
+  const all = own ? [own, ...DEFAULT_ADMISSION_KEYWORDS] : [...DEFAULT_ADMISSION_KEYWORDS];
+  return [...new Set(all)].slice(0, ADMISSION_MAX_KEYWORD_TRIES);
 }
 
 /** 对照书名：与主关键词无公共字的第一个；都有公共字则 undefined（不做对照判定）。 */
@@ -439,7 +494,9 @@ function expandAdmissionSearchUrl(
   }
   const expanded = template.replace(/\{\{key\}\}/g, encodeURIComponent(keyword)).replace(/\{\{page\}\}/g, '1');
   if (/[{}]|@js:|<js>|,\s*\[/i.test(expanded)) throw new SourcePolicyError('不支持该书源的动态搜索规则');
-  const base = typeof source.bookSourceUrl === 'string' ? source.bookSourceUrl : undefined;
+  // bookSourceUrl 写死 http:// 的源（41-srcfix 改法2，selectCandidates 已按升级后判定放行）：基址同样升 https
+  // 再过锁，否则 checkSourceUrl 先拒基址、相对 searchUrl 也无从解析。升级只改 scheme，锁本身不变。
+  const base = typeof source.bookSourceUrl === 'string' ? upgradeSourceTemplateUrl(source.bookSourceUrl) : undefined;
   // 写死 http:// 的搜索模板升 https 后再过准入门（host/端口/路径逐字不变，41-urlfix）：
   // 与运行时 sourceSearchUrl 同一口径，否则「准入通过、阅读期被判死」两把锁漂移。
   return validateAdmissionUrl(upgradeSourceTemplateUrl(expanded), base, declaredHosts).href;
@@ -488,8 +545,12 @@ export interface AdmissionSearchResult {
 }
 
 /**
- * 滤网 2：真实搜索一次（设计 §4.1）。传输层可注入；校验函数不可注入。
+ * 滤网 2：真实搜索（设计 §4.1）。传输层可注入；校验函数不可注入。
  * 返回分桶 verdict，由调用方（runAdmissionBatch）决定状态转移与写库。
+ * keywordFallback（41-srcfix 改法1）：主关键词 no_result 时按 admissionKeywords 换下一个词再搜，最多
+ * ADMISSION_MAX_KEYWORD_TRIES 个；每次换词前先问 canRetryKeyword（预算），判否即以已得的 no_result 收尾。
+ * 对照搜索（controlQuery）只在某个词命中后跑一次，对照词按**命中的那个词**选（与它无公共字），
+ * 所以查询不敏感判据与单词时逐条同款：固定列表站在首词就命中、照常被对照抓出，不会因换词被放过。
  */
 export async function searchAdmission(source: RawSource, options: {
   fetchPage: AdmissionTransport;
@@ -500,10 +561,36 @@ export async function searchAdmission(source: RawSource, options: {
   timeoutMs?: number;
   /** 主搜索 ok 后再做一次对照搜索，判查询不敏感（espfix41）。缺省关：纯函数调用方逐字不变。 */
   controlQuery?: boolean;
+  /** 探测词兜底（41-srcfix 改法1）。缺省关：纯函数调用方逐字不变（只试主关键词）。 */
+  keywordFallback?: boolean;
+  /** 每次换词前的预算判定；缺省恒 true。返回 false 即不再换词。 */
+  canRetryKeyword?: () => boolean;
 }): Promise<AdmissionSearchResult> {
+  const keywords = options.keywordFallback ? admissionKeywords(source) : [admissionKeyword(source)];
+  let result: AdmissionSearchResult | undefined;
+  let tried = 0;
+  for (const keyword of keywords) {
+    if (tried > 0) {
+      if (options.canRetryKeyword && !options.canRetryKeyword()) break;
+      const throttleMs = options.throttleMs ?? ADMISSION_THROTTLE_MS;
+      // 同站下一次请求：admissionFetch 的节流只在单次调用内生效，这里显式补一次间隔（同对照搜索）。
+      if (throttleMs > 0) await (options.sleep ?? defaultSleep)(throttleMs, options.signal);
+    }
+    tried += 1;
+    result = await searchAdmissionOnce(source, options, keyword);
+    if (result.verdict !== 'no_result') return result;
+  }
+  // 走到这里必是 no_result（至少试过主关键词）；试过多个词时把词数写进 error，便于排查。
+  return tried > 1 ? { ...result!, error: `${result!.error}（试 ${tried} 词）` } : result!;
+}
+
+/** 用一个探测词跑一次主搜索（+ 命中后的对照搜索）。 */
+async function searchAdmissionOnce(
+  source: RawSource, options: Parameters<typeof searchAdmission>[1], keyword: string,
+): Promise<AdmissionSearchResult> {
   let url: string;
   try {
-    url = expandAdmissionSearchUrl(source, options.declaredHosts);
+    url = expandAdmissionSearchUrl(source, options.declaredHosts, keyword);
   } catch (error) {
     return { verdict: 'url_invalid', candidateCount: 0, error: errorMessage(error) };
   }
@@ -532,7 +619,7 @@ export async function searchAdmission(source: RawSource, options: {
   const candidateCount = urls.length;
   if (candidateCount >= 1) {
     if (options.controlQuery) {
-      const overlap = await controlQueryOverlap(source, options, urls);
+      const overlap = await controlQueryOverlap(source, options, urls, keyword);
       if (overlap !== undefined && overlap >= QUERY_INSENSITIVE_OVERLAP) {
         return {
           verdict: 'query_insensitive', candidateCount, status: response.status,
@@ -554,7 +641,7 @@ export async function searchAdmission(source: RawSource, options: {
 }
 
 /**
- * 对照搜索（espfix41）：用与主关键词无公共字的对照书名再搜一次，返回两次候选 URL 集的 Jaccard。
+ * 对照搜索（espfix41）：用与**本次命中的探测词**无公共字的对照书名再搜一次，返回两次候选 URL 集的 Jaccard。
  * 拿不到可比结论（无可用对照词、URL 展开失败、网络失败、非 2xx）⇒ undefined，调用方维持 ok——
  * 对照只负责「拿到证据才出池」，不把一次抖动升级成出池。调用方中止则照常抛出（不写判定）。
  */
@@ -562,8 +649,9 @@ async function controlQueryOverlap(
   source: RawSource,
   options: Parameters<typeof searchAdmission>[1],
   primary: string[],
+  keyword: string,
 ): Promise<number | undefined> {
-  const control = queryControlKeyword(admissionKeyword(source));
+  const control = queryControlKeyword(keyword);
   if (!control) return undefined;
   let url: string;
   try {
@@ -638,6 +726,13 @@ export interface AdmissionBatchInput {
    * ADMISSION_PROBE_WORST_MS，canProbe 须按它预留。缺省关（单测的固定页桩对任何查询都回同一页）。
    */
   controlQuery?: boolean;
+  /**
+   * 探测词兜底（41-srcfix 改法1）：主关键词 no_result 时换词再搜（≤ ADMISSION_MAX_KEYWORD_TRIES）。整源仍只占
+   * 1 个名额；换词前按 canProbe 逐次判预算。生产两条写库路径都开；缺省关（单测固定页桩逐字不变）。
+   */
+  keywordFallback?: boolean;
+  /** http 升级源每轮首探上限覆盖（测试注入用）；缺省走 `admissionUpgradedMaxProbes()`。 */
+  upgradedMaxProbes?: number;
 }
 
 export interface AdmissionBatchResult {
@@ -745,6 +840,23 @@ function deferredRetestWindowMs(verdict: string): number {
   return verdict === 'no_result' ? ADMISSION_NO_RESULT_RETEST_MS : ADMISSION_RETEST_INTERVAL_MS;
 }
 
+/** challenge 行已累计的 strike 数（41-srcfix 改法1）：非 challenge 行 0；无前缀的旧 challenge 行按 1。 */
+export function challengeStrikes(row: Pick<AdmissionSourceRow, 'search_verdict' | 'error'>): number {
+  if (row.search_verdict !== 'challenge') return 0;
+  if (!row.error.startsWith(ADMISSION_CHALLENGE_STRIKE_PREFIX)) return 1;
+  const n = Number.parseInt(row.error.slice(ADMISSION_CHALLENGE_STRIKE_PREFIX.length), 10);
+  return Number.isSafeInteger(n) && n > 0 ? n : 1;
+}
+
+/**
+ * 本轮判 challenge 时写库的 error（41-srcfix 改法1）：同规则（rules_hash 未变）上一轮也是 challenge ⇒ strike 累加，
+ * 否则从 1 计。原因（状态码/标记）保留在前缀之后。
+ */
+function challengeError(previous: AdmissionSourceRow | undefined, hash: string, reason: string): string {
+  const prior = previous && previous.rules_hash === hash ? challengeStrikes(previous) : 0;
+  return `${ADMISSION_CHALLENGE_STRIKE_PREFIX}${prior + 1}:${reason}`;
+}
+
 function isRetestDue(row: AdmissionSourceRow, nowMs: number, urlStillInvalid: () => boolean): boolean {
   if (row.search_ok === null) return true; // 未测（含被限流跳过的新源）
   const bucket = admissionBucket(row.search_verdict);
@@ -763,6 +875,13 @@ function isRetestDue(row: AdmissionSourceRow, nowMs: number, urlStillInvalid: ()
     if (!row.search_checked_at) return true;
     const checked = Date.parse(row.search_checked_at);
     return !Number.isFinite(checked) || nowMs - checked >= ADMISSION_CONN_FAIL_RETEST_MS;
+  }
+  // 41-srcfix 改法1：challenge 有限复测——strike 未满按 72h 窗到期，满了回终态（见常量注释）。
+  if (row.search_verdict === 'challenge') {
+    if (challengeStrikes(row) >= ADMISSION_CHALLENGE_MAX_STRIKES) return false;
+    if (!row.search_checked_at) return true;
+    const checked = Date.parse(row.search_checked_at);
+    return !Number.isFinite(checked) || nowMs - checked >= ADMISSION_CHALLENGE_RETEST_MS;
   }
   // 41-B2-OK-RECHECK：ok 源不再永久免检。可疑行（error 带 recheck_fail: 前缀）按 20h 窗
   // 到期（class 1，在池里的可疑源最该早点确认）；干净 ok 行按 7 天长周期复核到期（class 2）。
@@ -860,6 +979,7 @@ export function recheckOutcome(previous: AdmissionSourceRow | undefined, result:
  * 跑一轮准入批次（设计 §4.2）。纯逻辑：不碰 DB，输入既有行、输出要写库的行。
  * 状态机：new → compile_rejected（终态，规则不变不复测）｜new → deferred → (ok|rejected)｜ok
  * ｜conn_fail（rejected，7 天衰减后回 class 1 复测，41-B1-RETRY）
+ * ｜challenge（rejected，72h 后回 class 1 复测，累计 ADMISSION_CHALLENGE_MAX_STRIKES 次即终态，41-srcfix）
  * ｜ok（7 天长周期复核，class 2；首次失败记 strike 不出池、20h 后再确认，41-B2-OK-RECHECK）。
  * 每轮真实搜索 ≤ maxProbes（默认走 `admissionMaxProbes()`，env 可调），按 planProbeOrder 的公平序分配名额（N04）；
  * canProbe 为 false 时停止探测但仍写出可离线得到的结论。
@@ -894,6 +1014,8 @@ export async function runAdmissionBatch(input: AdmissionBatchInput): Promise<Adm
   let grandfathered = 0;
   let probed = 0;
   let probeSlots = Math.max(0, input.maxProbes ?? admissionMaxProbes());
+  // 41-srcfix 改法2 放量控制：http 升级源的首探（class 0）另受每轮上限，占总名额内。
+  let upgradedSlots = Math.max(0, input.upgradedMaxProbes ?? admissionUpgradedMaxProbes());
   const canProbe = input.canProbe ?? (() => true);
   const concurrency = normalizeAdmissionConcurrency(input.probeConcurrency ?? admissionProbeConcurrency());
 
@@ -905,6 +1027,8 @@ export async function runAdmissionBatch(input: AdmissionBatchInput): Promise<Adm
   const probes: {
     index: number; candidate: AdmissionCandidate; host: string; mutexHost: string; compile: AdmissionCompile; hash: string;
     previous: AdmissionSourceRow | undefined; placeholder: AdmissionSourceRow | undefined;
+    /** http 升级源的首探（未测过）：受 upgradedSlots 限额。 */
+    upgradedFirst: boolean;
   }[] = [];
 
   for (let index = 0; index < plan.length; index += 1) {
@@ -958,6 +1082,7 @@ export async function runAdmissionBatch(input: AdmissionBatchInput): Promise<Adm
         : undefined;
     probes.push({
       index, candidate, host, mutexHost: admissionMutexHost(candidate, input.declaredHosts), compile, hash, previous, placeholder,
+      upgradedFirst: probeClass === 0 && isUpgradedHttpSource(candidate.source),
     });
   }
 
@@ -991,24 +1116,34 @@ export async function runAdmissionBatch(input: AdmissionBatchInput): Promise<Adm
       const item = probes[pick];
       // 名额 + canProbe + signal 在每次起探前同步判定(41-ADMIT-CONC-FIX)。判否走「没轮到」占位。
       // 此判定到 searchAdmission 注册 abort 监听之间没有 await,不会漏掉中途中止。
-      if (!(probeSlots > 0 && canProbe() && !input.signal.aborted)) {
+      // 升级源首探额度用完 ⇒ 同样走「没轮到」占位（短路在 canProbe 之前：不额外调用预算判定）。
+      if (!(probeSlots > 0 && (!item.upgradedFirst || upgradedSlots > 0) && canProbe() && !input.signal.aborted)) {
         if (item.placeholder) results[item.index] = item.placeholder;
         continue;
       }
       probeSlots -= 1;
+      if (item.upgradedFirst) upgradedSlots -= 1;
       probed += 1;
       inflightHosts.add(item.mutexHost);
       try {
         const result = await searchAdmission(item.candidate.source, {
           fetchPage: input.fetchPage, declaredHosts: input.declaredHosts, signal: input.signal,
           throttleMs: input.throttleMs, sleep: input.sleep, controlQuery: input.controlQuery,
+          // 41-srcfix 改法1：换词不另占名额，但每次换词前与起探同一口径判预算/中止。
+          keywordFallback: input.keywordFallback,
+          canRetryKeyword: () => canProbe() && !input.signal.aborted,
         });
         verdicts[result.verdict] = (verdicts[result.verdict] ?? 0) + 1;
+        // 41-B2-OK-RECHECK:写库结论走 recheckOutcome——干净 ok 行首次复核失败记 strike 不出池。
+        // 必须用 item.previous:worker 是独立函数,闭包拿不到外层循环的 previous。
+        const outcome = recheckOutcome(item.previous, result);
+        // 41-srcfix 改法1：challenge 结论带 strike 计数（有限复测的上限判据，见 challengeStrikes）。
+        if (outcome.search_verdict === 'challenge') {
+          outcome.error = challengeError(item.previous, item.hash, outcome.error);
+        }
         results[item.index] = {
           source_url: item.candidate.url, tier: 'M1', compile_ok: true, core_field_mask: item.compile.coreFieldMask,
-          // 41-B2-OK-RECHECK:写库结论走 recheckOutcome——干净 ok 行首次复核失败记 strike 不出池。
-          // 必须用 item.previous:worker 是独立函数,闭包拿不到外层循环的 previous。
-          ...recheckOutcome(item.previous, result),
+          ...outcome,
           search_checked_at: now().toISOString(), rules_hash: item.hash,
           engine_semantics_version: semanticsVersion, host: item.host,
           compile_diagnostics: [],
