@@ -96,6 +96,14 @@ it.skipIf(!RUN)('coverage bench 联网实测', async () => {
   process.env.SOURCE_FANOUT_ENABLED = process.env.SOURCE_FANOUT_ENABLED || '1';
   process.env.SOURCE_FANOUT_LIMIT = process.env.SOURCE_FANOUT_LIMIT || '60';
 
+  // 出网走代理（如 mihomo 127.0.0.1:7891）：引擎 fetch 用全局 fetch，设 undici 全局 dispatcher 即可。
+  const proxy = process.env.COVBENCH_PROXY || process.env.HTTPS_PROXY || process.env.HTTP_PROXY;
+  if (proxy) {
+    const { setGlobalDispatcher, ProxyAgent } = await import('undici');
+    setGlobalDispatcher(new ProxyAgent(proxy));
+    console.error(`[proxy] ${proxy}`);
+  }
+
   const PG = (await loadPGlite())!;
   const pg = new PG();
   await pg.exec('CREATE TABLE IF NOT EXISTS users (id int PRIMARY KEY)');
