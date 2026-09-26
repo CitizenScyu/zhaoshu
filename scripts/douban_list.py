@@ -802,14 +802,43 @@ def search_engine(cli, title: str, author: str = '',
             print(f'  作者不符跳过: 候选《{site_title}》（名单《{title}》{author}'
                   f' vs 引擎 {c.get("author")}）')
     if not want:
+        alt_pool = ([h for h, a in unknown_hits if _norm_author(a)]
+                    + [h for h, a in unknown_hits if not _norm_author(a)])
+        # authcv41：判歧义时先试内容比对救回（唯一主簇才放行）；救不回/未启用/引擎缺失
+        # 才落回 _pick_author_unknown（原样打印歧义跳过、维持既有行为）。
+        if content_match_enabled() and cli is not None:
+            rescued = _content_rescue_unknown(cli, title, unknown_hits)
+            if rescued is not None:
+                return _with_alternates(rescued, alt_pool)
         # 备选服从歧义护栏：判歧义（None）就没有备选；收了则其余兼容候选两两作者相容，作者已知的在前
-        return _with_alternates(_pick_author_unknown(title, unknown_hits),
-                                [h for h, a in unknown_hits if _norm_author(a)]
-                                + [h for h, a in unknown_hits if not _norm_author(a)])
+        return _with_alternates(_pick_author_unknown(title, unknown_hits), alt_pool)
     if fallback is not None:
         print(f'  作者未知命中（降级）: {fallback["title"]}（名单作者 {author}，引擎未给作者）')
         return _with_alternates(fallback, _known_author_alternates(title, author, candidates))
     return fallback
+
+
+def _author_unknown_decision(hits: list[tuple[dict, str]]) -> tuple[dict | None, bool, list[str]]:
+    """名单无作者时的选择判定（不打印）→ (hit_or_None, ambiguous, 去重非空作者原串)。
+
+    判定与候选顺序无关：兼容候选的非空作者**两两** author_matches（任一方向）为真
+    （或只有一个非空作者）才收，否则判歧义（ambiguous=True，hit=None）。见 _pick_author_unknown。"""
+    if not hits:
+        return None, False, []
+    authors: list[str] = []
+    seen: set[str] = set()
+    for _, a in hits:
+        key = _norm_author(a)
+        if key and key not in seen:
+            seen.add(key)
+            authors.append(a)
+    ambiguous = any(not (author_matches(x, y) or author_matches(y, x))
+                    for k, x in enumerate(authors) for y in authors[k + 1:])
+    if ambiguous:
+        return None, True, authors
+    if authors:
+        return next(hit for hit, a in hits if _norm_author(a)), False, authors
+    return hits[0][0], False, authors
 
 
 def _pick_author_unknown(title: str, hits: list[tuple[dict, str]]) -> dict | None:
@@ -822,25 +851,200 @@ def _pick_author_unknown(title: str, hits: list[tuple[dict, str]]) -> dict | Non
     不用「贪心聚簇」：author_matches 不传递（马伯庸 ~ 马伯庸著 刘巴布编绘 ~ 刘巴布，但
     马伯庸 ≁ 刘巴布），贪心的簇数随候选顺序变（authrev41 阻断 1）。
     收时作者已知的候选优先于作者空的；候选全无作者 ⇒ 收第一个（无从区分，同改前）。"""
-    if not hits:
-        return None
-    authors: list[str] = []
-    seen: set[str] = set()
-    for _, a in hits:
-        key = _norm_author(a)
-        if key and key not in seen:
-            seen.add(key)
-            authors.append(a)
-    ambiguous = any(not (author_matches(x, y) or author_matches(y, x))
-                    for k, x in enumerate(authors) for y in authors[k + 1:])
+    hit, ambiguous, authors = _author_unknown_decision(hits)
     if ambiguous:
         shown = sorted(authors, key=_norm_author)
         names = '、'.join(shown[:5]) + ('…' if len(shown) > 5 else '')
         print(f'  作者歧义跳过: 《{title}》名单无作者，兼容候选作者 {len(authors)} 人（{names}）')
+    return hit
+
+
+# ---- 内容比对（authcv41）：用目录 + 开头正文判断两个候选是不是同一本书 ----
+# 动机（gate.log 实测，见 authcv-41-report §2）：作者护栏在「拦同名书」上是对的，但
+# 「名单无作者 + 候选多作者」里有极少数是**假歧义**（候选其实是同一本书，作者串因繁简/
+# 站点噪声虚增，如《凌霄之上！》觀棋 vs 观棋）。内容比对在有可靠依据时把这类救回来，同时
+# 绝不放行真同名书（《长生》42 人这种多簇一律维持跳过）。
+# 红线（任务书）：必须先有「参照本」才能比——名单有作者时参照本是作者与书单一致的候选
+# （但那种候选一旦存在，搜索第一遍就已命中返回、书本不会被拦，故内容比对对「名单有作者」
+# 无可救的被拦书，见 §3 说明）；名单无作者时靠候选间两两聚类。无参照本一律维持既有跳过、
+# 不猜（同名不同书、名单作者是分类/出版社等被污染字段的情形都落在这里，交上游修，见 §6）。
+CONTENT_MATCH_ENV = 'AUTHCV_CONTENT_MATCH'   # =0/false/no/off 关闭（默认开）；回滚即置 0
+CONTENT_MAX_CANDIDATES = 3     # 每次最多取文比对的候选数（成本上限；distinct 作者超此数视为同名书泛滥，不试）
+CONTENT_MAX_CHAPTERS = 3       # 每个候选取前几章正文做指纹
+CONTENT_TOC_MIN_TITLES = 3     # 两侧目录都 ≥ 此数才用目录作判据，否则退正文
+CONTENT_NGRAM = 4              # 正文字符 n-gram 长度
+# 阈值依据（authcv-41-report §2/§3）：正例=同一本书跨站，章节标题去编号后高度重合、开头正文
+# 近乎一致；反例=同名不同书，标题集合几乎不相交、正文无关。目录是强判据（同书跨站标题集合
+# 重合度远高于阈值，不同书远低于），正文仅在目录不足时兜底。阈值取在正反例之间留足余量，
+# 具体数值待 phoenix 现网校准（§6）。
+CONTENT_TOC_JACCARD = 0.60     # 目录标题集合 Jaccard 下限
+CONTENT_BODY_JACCARD = 0.30    # 开头正文 n-gram Jaccard 下限（目录不足时才用）
+
+_TOC_NUM_RE = re.compile(
+    r'^\s*(?:第\s*[0-9零一二三四五六七八九十百千万两]+\s*[章节節回卷话話集部篇]'
+    r'|[0-9]+\s*[\.、,，:：]?|楔子|序[章言曲]?|引子|正文|番外)\s*')
+_TOC_PUNCT_RE = re.compile(
+    r'[\s　·、，。：:；;!！?？\-—_()（）\[\]【】《》「」『』"\'“”‘’.]+')
+_BODY_KEEP_RE = re.compile(r'[^一-鿿㐀-䶿a-zA-Z]+')
+
+
+def content_match_enabled() -> bool:
+    """内容比对开关（默认开）。AUTHCV_CONTENT_MATCH=0/false/no/off 关闭。"""
+    return os.environ.get(CONTENT_MATCH_ENV, '1').strip().lower() not in ('0', 'false', 'no', 'off')
+
+
+def _norm_toc_title(title: str) -> str:
+    """章节标题归一：去「第X章/序/楔子/数字编号」前缀、空白与标点、casefold。"""
+    t = unicodedata.normalize('NFKC', (title or '')).strip()
+    t = _TOC_NUM_RE.sub('', t)
+    return _TOC_PUNCT_RE.sub('', t).casefold()
+
+
+def _char_ngrams(text: str, n: int = CONTENT_NGRAM) -> set[str]:
+    """正文 → 字符 n-gram 集合：只留中日文与拉丁字母（去数字/标点/空白，抗排版噪声）。"""
+    s = _BODY_KEEP_RE.sub('', unicodedata.normalize('NFKC', text or '')).casefold()
+    if not s:
+        return set()
+    if len(s) <= n:
+        return {s}
+    return {s[i:i + n] for i in range(len(s) - n + 1)}
+
+
+def _jaccard(a: set, b: set) -> float:
+    if not a or not b:
+        return 0.0
+    return len(a & b) / len(a | b)
+
+
+def _cli_json(cli, subcommand: str, *args: str):
+    """调 CLI 子命令并解析 JSON；非零退出或坏 JSON → 抛 EngineUnavailable（不含凭据）。"""
+    proc = cli.run(subcommand, *args)
+    if proc.returncode != 0:
+        raise EngineUnavailable(f'引擎 {subcommand} rc={proc.returncode}: {_short_stderr(proc.stderr)}')
+    return json.loads(proc.stdout)
+
+
+def fetch_content_fingerprint(cli, book_url: str,
+                              max_chapters: int = CONTENT_MAX_CHAPTERS,
+                              cache: dict | None = None) -> dict | None:
+    """取候选的内容指纹 {'toc': set[标题], 'body': set[n-gram]}；取不到返回 None。
+
+    成本受控：目录 1 次 + 前 max_chapters 章正文；cache（{url: 指纹}）在一次搜索内复用，
+    同一 URL 不重复取文。任何异常（源失效/坏 JSON/超时）→ None（比对方按「无指纹」处理，
+    绝不因取文失败而误判同书）。"""
+    if cache is not None and book_url in cache:
+        return cache[book_url]
+    fp: dict | None = None
+    try:
+        toc = _cli_json(cli, 'toc', '--url', book_url) or {}
+        chapters = toc.get('chapters') or []
+        toc_titles = {_norm_toc_title(c.get('title') or '')
+                      for c in chapters if isinstance(c, dict)}
+        toc_titles.discard('')
+        body_parts: list[str] = []
+        for ch in chapters:
+            if len(body_parts) >= max_chapters:
+                break
+            if not isinstance(ch, dict):
+                continue
+            ch_url = ch.get('url') or ''
+            if not ch_url:
+                continue
+            try:
+                text = (_cli_json(cli, 'content', '--url', ch_url) or {}).get('text') or ''
+            except Exception:
+                text = ''
+            if len(text) > 100:
+                body_parts.append(text)
+        fp = {'toc': toc_titles, 'body': _char_ngrams(' '.join(body_parts))}
+    except Exception:
+        fp = None
+    if cache is not None:
+        cache[book_url] = fp
+    return fp
+
+
+def same_book(fp_a: dict | None, fp_b: dict | None) -> tuple[bool, dict]:
+    """两个内容指纹是否同一本书 → (bool, {'toc':相似度,'body':相似度,'basis':判据})。
+
+    目录为强判据：两侧目录都 ≥ CONTENT_TOC_MIN_TITLES 时**只**看目录 Jaccard——同名不同书
+    的章节标题集合几乎不相交，靠正文偶然重合（常见套路开头）误并的风险由此杜绝；目录数据
+    不足时才退到正文 n-gram Jaccard。缺任一指纹 → 判否（不猜）。"""
+    empty = {'toc': 0.0, 'body': 0.0, 'basis': 'none'}
+    if not fp_a or not fp_b:
+        return False, empty
+    toc_sim = _jaccard(fp_a['toc'], fp_b['toc'])
+    body_sim = _jaccard(fp_a['body'], fp_b['body'])
+    both_toc = min(len(fp_a['toc']), len(fp_b['toc'])) >= CONTENT_TOC_MIN_TITLES
+    if both_toc:
+        decided = toc_sim >= CONTENT_TOC_JACCARD
+        basis = 'toc'
+    else:
+        decided = body_sim >= CONTENT_BODY_JACCARD
+        basis = 'body'
+    return decided, {'toc': toc_sim, 'body': body_sim, 'basis': basis}
+
+
+def _cluster_by_content(cli, reps: list[dict], cache: dict) -> tuple[list[list[int]], dict]:
+    """reps 两两 same_book → 单链并查集聚类。返回 (簇列表[下标], 最高相似度信息)。"""
+    fps = [fetch_content_fingerprint(cli, r['hit']['url'], cache=cache) for r in reps]
+    n = len(reps)
+    parent = list(range(n))
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    best = {'toc': 0.0, 'body': 0.0, 'basis': 'none'}
+    for i in range(n):
+        for j in range(i + 1, n):
+            ok, sim = same_book(fps[i], fps[j])
+            if max(sim['toc'], sim['body']) > max(best['toc'], best['body']):
+                best = sim
+            if ok:
+                parent[find(i)] = find(j)
+    clusters: dict[int, list[int]] = {}
+    for i in range(n):
+        clusters.setdefault(find(i), []).append(i)
+    return list(clusters.values()), best
+
+
+def _distinct_author_reps(unknown_hits: list[tuple[dict, str]]) -> list[dict]:
+    """按归一化作者去重取代表（作者已知优先），上限 CONTENT_MAX_CANDIDATES。"""
+    reps, seen = [], set()
+    for hit, a in unknown_hits:
+        key = _norm_author(a)
+        if key and key not in seen:
+            seen.add(key)
+            reps.append({'hit': hit, 'author': a})
+    return reps[:CONTENT_MAX_CANDIDATES]
+
+
+def _content_rescue_unknown(cli, title: str,
+                            unknown_hits: list[tuple[dict, str]]) -> dict | None:
+    """名单无作者、判歧义时用内容比对救回：候选内容聚为**唯一主簇**才放行，返回代表 hit
+    （作者已知优先，供 label 阶段 toc 回写作者）；多簇/无法判定/作者过多 → None（维持跳过）。"""
+    _, ambiguous, authors = _author_unknown_decision(unknown_hits)
+    if not ambiguous:
+        return None                       # 非歧义：交常规路径，不额外取文
+    if len(authors) > CONTENT_MAX_CANDIDATES:
+        return None                       # 候选作者过多（同名书泛滥）：不试，维持跳过
+    reps = _distinct_author_reps(unknown_hits)
+    if len(reps) < 2:
         return None
-    if authors:
-        return next(hit for hit, a in hits if _norm_author(a))
-    return hits[0][0]
+    clusters, best = _cluster_by_content(cli, reps, cache={})
+    if len(clusters) != 1:                # 未聚成唯一主簇 → 维持跳过
+        return None
+    known = [r for r in reps if _norm_author(r['author'])]
+    chosen = known[0] if known else reps[0]
+    sim = max(best['toc'], best['body'])
+    print(f'  内容比对放行: 《{title}》名单无作者，{len(reps)} 个候选内容聚为一簇'
+          f'（{best["basis"]} 相似度≈{sim:.2f}），采信作者 {chosen["author"] or "（引擎待定）"}'
+          f'，参照源 {chosen["hit"].get("source", "")}（content_match）')
+    return chosen['hit']
+
 
 
 # ---- 换源备选（giveup41）----
