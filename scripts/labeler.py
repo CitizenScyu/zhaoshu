@@ -1869,11 +1869,11 @@ def fetch_segment(engine_cli, chapters: list[dict], window: dict, deadline: floa
     """从一个源的正文目录 chapters 的 [start, end) 窗口顺序取整章，直到原文字数达 window['target']。
 
     → {parts, raw_chars, eff_chars, requested, first, last, stop, preview_skipped}；first/last 为目录下标。
-    标题带 APP免费 的章抓取前跳过（不发请求）；每请求 SEG_PROBE_CHAPTERS 章后按章均有效字数
-    < SEG_MIN_AVG_CHARS 早退（stop='preview'），墙钟到 deadline 即停（stop='deadline'）。"""
+    标题带 APP免费 的章抓取前跳过（不发请求）；请求满 SEG_PROBE_CHAPTERS 章后，连续这么多章落空
+    或累计章均有效字数 < SEG_MIN_AVG_CHARS 即早退（stop='preview'），墙钟到 deadline 即停（stop='deadline'）。"""
     target = window['target']
     parts: list[str] = []
-    raw = requested = preview_skipped = 0
+    raw = requested = preview_skipped = miss_streak = 0
     first = last = None
     stop = 'window_end'
     for idx in range(window['start'], window['end']):
@@ -1889,13 +1889,22 @@ def fetch_segment(engine_cli, chapters: list[dict], window: dict, deadline: floa
             continue
         text = _segment_chapter_text(engine_cli, ch['url'])
         requested += 1
+        part = f'【{clean_chapter_title(title)}】\n{text}'
+        # 单章「落空」= 没取到（≤100 字）或自身有效字数 < SEG_MIN_AVG_CHARS（预览/水印页）
+        if len(text) > 100 and _effective_chars([part], preview_skipped) >= SEG_MIN_AVG_CHARS:
+            miss_streak = 0
+        else:
+            miss_streak += 1
         if len(text) > 100:
-            parts.append(f'【{clean_chapter_title(title)}】\n{text}')
+            parts.append(part)
             raw += len(text)
             first = idx if first is None else first
             last = idx
-        if requested >= SEG_PROBE_CHAPTERS and raw < target \
-                and _effective_chars(parts, preview_skipped) / requested < SEG_MIN_AVG_CHARS:
+        # 早退两条（lblseg41 小样：cuoceng 段中途起 4xx，只看累计均值会白发 41 个请求）：
+        # 连续 SEG_PROBE_CHAPTERS 章落空；或累计章均有效字数 < SEG_MIN_AVG_CHARS
+        if requested >= SEG_PROBE_CHAPTERS and raw < target and (
+                miss_streak >= SEG_PROBE_CHAPTERS
+                or _effective_chars(parts, preview_skipped) / requested < SEG_MIN_AVG_CHARS):
             stop = 'preview'
             break
         time.sleep(CHAPTER_DELAY)

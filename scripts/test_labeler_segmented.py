@@ -282,6 +282,21 @@ class TestFetchSegmented(_NoSleep):
         a_mid = [c for c in _content_calls(cli, 'a.example.com') if _idx(c[1]) >= 40]
         self.assertEqual(len(a_mid), labeler.SEG_PROBE_CHAPTERS)        # 只在第 2 段试过一次
 
+    def test_mid_segment_4xx_stops_after_streak(self):
+        """段中途起 4xx（cuoceng 实测形态）：连续 3 章落空即停，不按累计均值拖到几十个请求；
+        已取到的 3 章 9000 字 ≥ 目标 40% → 该段仍可用，不换源。"""
+        cli = make_cli({
+            'a.example.com': {'n': 100, 'body': lambda i: None if i >= 43 else
+                              _chapter_body('a.example.com', i)},
+            'b.example.com': {'n': 100},
+        })
+        text, chars, used, sampling, _ = _fetch(cli, _book(alternates=['b.example.com']))
+        a_seg2 = [c for c in _content_calls(cli, 'a.example.com') if 40 <= _idx(c[1]) < 70]
+        self.assertEqual(len(a_seg2), 6)
+        seg2 = sampling['segments'][1]
+        self.assertEqual((seg2['source'], seg2['chapters'], seg2['switched']),
+                         ('a.example.com', '41-43', False))
+
     def test_app_free_titles_skipped_without_requests(self):
         """目录标题带 APP免费 的试读章不发请求；整段都是 → 该段 no_request → 换源。"""
         cli = make_cli({
