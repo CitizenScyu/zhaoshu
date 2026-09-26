@@ -38,6 +38,7 @@ const engineItemAt = (host: string) => ({
   bookSourceUrl: `https://${host}/`, bookSourceName: host,
   searchUrl: `https://${host}/s?q={{key}}`,
   ruleSearch: { bookList: '.i', name: '.t@text', bookUrl: 'a@href' },
+  ruleToc: { chapterList: '.ch', chapterName: 'a@text' },
   ruleContent: { content: '.c' }, enabled: true,
 });
 const engineRowAt = (host: string, over: Record<string, unknown> = {}) => ({
