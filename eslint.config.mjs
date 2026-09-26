@@ -62,6 +62,9 @@ const eslintConfig = defineConfig([
     // 打进来的第三方依赖(minified:单行 500+ 列、this 别名、无 displayName),
     // 把 pre-push 门(与 CI 同款 `npm run lint`)整体挡红。源码 lint 不受影响。
     "shuyuan-refresh/dist/**",
+    // runtime-download 构建产物(.gitignore 已排除)。残留时 `npm run lint` 会把
+    // 打出的 bundle 当源码 lint——实测 merge-wt 里报了 24 个 error。源码 lint 不受影响。
+    "runtime-download/build/**",
     // 子代理 worktree 目录:每个并行代理的完整 checkout 副本(含各自 dist 产物、
     // 临时 .tmp.test.ts)。不忽略则 `npm run lint` 会把每个 worktree 里的源码再 lint
     // 一遍,把 pre-push 门(与 CI 同款 `npm run lint`)整体挡红,而 CI 干净 checkout
