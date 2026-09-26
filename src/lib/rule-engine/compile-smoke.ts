@@ -2,6 +2,7 @@
 // 并对核心字段口径跑 parseFieldRule。供 admission-smoke.test.ts 消费。
 // 设计依据：m1-engine-design.md v3 §8.2；移植逻辑参考 .rule-survey/survey.py。
 
+import { upgradeSourceTemplateUrl } from '@/lib/source-policy';
 import { parseFieldRule } from './parse';
 import { RuleEngineError, type RuleDiagnostic } from './types';
 
@@ -66,11 +67,16 @@ function searchIsPureGet(su: unknown): boolean {
   return true;
 }
 
-/** 复现主会话初筛（survey.py select_candidates），预期 174 条。 */
+/**
+ * 复现主会话初筛（survey.py select_candidates），预期 174 条。
+ * 41-srcfix 改法2：bookSourceUrl 写死 `http://` 的源先经 upgradeSourceTemplateUrl 升 https 再判——只改 scheme，
+ * host/端口/userinfo 逐字不变，之后准入与运行时照旧过同一把 checkSourceUrl 锁（端口/IP/userinfo 仍被拒）。
+ * 无协议（书源名当 URL）与其它 scheme 升级后仍非 https，照旧丢弃。
+ */
 export function selectCandidates(data: RawSource[]): RawSource[] {
   const out: RawSource[] = [];
   for (const s of data) {
-    if (!String(s.bookSourceUrl ?? '').startsWith('https://')) continue;
+    if (!upgradeSourceTemplateUrl(String(s.bookSourceUrl ?? '')).startsWith('https://')) continue;
     if (!rulesNoJs(s)) continue;
     if (!searchIsPureGet(s.searchUrl)) continue;
     const rs = (s.ruleSearch ?? {}) as Record<string, unknown>;

@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createHash } from 'node:crypto';
 import corpus from './fixtures/admission-174.json';
 import {
+  ADMISSION_CHALLENGE_MAX_STRIKES, ADMISSION_CHALLENGE_STRIKE_PREFIX,
   ADMISSION_CONN_FAIL_RETEST_MS, ADMISSION_OK_RECHECK_MS, ADMISSION_RECHECK_FAIL_PREFIX,
   ADMISSION_RETEST_INTERVAL_MS, ADMISSION_TIMEOUT_MS, DEFAULT_ADMISSION_MAX_PROBES,
   DEFAULT_ADMISSION_PROBE_CONCURRENCY, MAX_ADMISSION_PROBE_CONCURRENCY,
@@ -661,10 +662,11 @@ describe('准入状态机 runAdmissionBatch', () => {
         .toBeGreaterThan(Date.now() - ADMISSION_CONN_FAIL_RETEST_MS);
     });
 
-    it('④挑战/壳页等其它 rejected 终态不衰减：21 天后仍不重测（站点行为 ≠ 网络抖动）', async () => {
-      for (const verdict of ['challenge', 'shell'] as const) {
+    it('④壳页 rejected 终态不衰减；challenge 满 strike 同样终态：21 天后仍不重测（站点行为 ≠ 网络抖动）', async () => {
+      // 41-srcfix 改法1：challenge 改为有限复测（见下方「challenge 有限复测」），strike 满额后才回到本条的终态语义。
+      for (const [verdict, error] of [['shell', ''], ['challenge', `${ADMISSION_CHALLENGE_STRIKE_PREFIX}${ADMISSION_CHALLENGE_MAX_STRIKES}:403`]] as const) {
         const existing = new Map([[url, sourceRow(url, {
-          tier: 'M1', compile_ok: true, rules_hash: hash, search_ok: false, search_verdict: verdict,
+          tier: 'M1', compile_ok: true, rules_hash: hash, search_ok: false, search_verdict: verdict, error,
           search_checked_at: new Date(Date.now() - 21 * 24 * 3_600_000).toISOString(),
         })]]);
         const result = await runAdmissionBatch({
