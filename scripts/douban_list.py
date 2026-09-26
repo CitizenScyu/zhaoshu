@@ -1226,9 +1226,22 @@ Y17K_BASE = 'https://www.17k.com'
 #   带图：  href=//www.17k.com/book/N.html ...><img .../><span>书名</span></a>（8 个 id）
 # 原正则 `>([^<]*)</a>` 吃不到第二种（`[^>]*>` 后紧跟 `<img`）→ 漏收 8 本真书。
 # 改为捕获锚点内部 HTML，再剥标签：两种形态都取到纯书名。
+# author17k41（2026-09-26 实测）：头部精品书卡的 href 内嵌制表符（`book/\t3038645.html`），
+# 旧正则 `book/(\d+)\.html` 吃不到 → 漏收约 11 本真完本书。放宽为容忍 book/ 与 .html 间的空白
+# （clean 锚点零空白仍匹配，行为不变）。这些书卡正是页面唯一带作者的位置（见 _extract_17k_authors）。
 _Y17K_BOOK_RE = re.compile(
-    r'href="//www\.17k\.com/book/(\d+)\.html"[^>]*>(.*?)</a>', re.S)
+    r'href="//www\.17k\.com/book/\s*(\d+)\s*\.html"[^>]*>(.*?)</a>', re.S)
 _Y17K_TAG_RE = re.compile(r'<[^>]*>')
+# 完本页作者来源（author17k41 调研，2026-09-26 实测）：
+#   只有头部「精品专区」书卡带作者，形态 `作者：<a href="//user.17k.com/see/...">作者名</a>`
+#   （既有 <span> 也有 <p class="author"> 两种外层）。主列表的纯书名锚点无作者。
+#   详情页 /book/<id>.html、search.17k.com、wap./www. 的检索页对无 cookie 请求一律返回
+#   阿里云 WAF 的 acw_sc__v2 JS 挑战；api.17k.com 需 appKey 签名；m./sou. 子域 DNS 不解析。
+#   ⇒ 没有可用的「按 book id/书名」免 WAF、免鉴权的作者接口，只就地解析页面已有作者，
+#   补不到保持空串（不硬造）。作者锚点专用 user.17k.com，据此与书名锚点区分。
+_Y17K_ANY_ANCHOR_RE = re.compile(
+    r'href="//(www|user)\.17k\.com/(?:book/\s*(\d+)\s*\.html|see/[^"]*)"[^>]*>(.*?)</a>', re.S)
+_Y17K_AUTHOR_LABEL_RE = re.compile(r'作\s*者\s*[:：]\s*$')
 # 页面有 48 条被截断的标题（结尾 ...），按前缀搜 book15 命中率低且易误配 → 丢弃
 _17K_TRUNCATED_RE = re.compile(r'(?:\.{2,}|…+|。{2,})\s*$')
 # 推广前缀：「骁骑校大作：匹夫的逆袭！」「失落叶月恒系列力作：天行」→ 取冒号后的真书名
@@ -1253,8 +1266,36 @@ def _clean_17k_title(title: str) -> str:
     return text
 
 
+def _extract_17k_authors(html: str) -> dict[str, str]:
+    """完本页「精品专区」就地作者：{book_id: author}（补不到的 id 不入表）。
+
+    页面唯一带作者的位置是头部书卡：`…<a href="//www.17k.com/book/ID.html">书名</a>…
+    作者：<a href="//user.17k.com/see/…">作者名</a>`。按文档顺序扫描 book/user 两类锚点，
+    user 锚点若紧跟「作者：」标签，就归给最近一个 book 锚点的 id。主列表的纯书名锚点无
+    作者标签，天然不入表。作者名剥标签/空白，空则不记（不硬造）。"""
+    authors: dict[str, str] = {}
+    last_bid = ''
+    for m in _Y17K_ANY_ANCHOR_RE.finditer(html):
+        kind, bid, inner = m.group(1), m.group(2), m.group(3)
+        if kind == 'www' and bid:
+            last_bid = bid
+            continue
+        if kind != 'user' or not last_bid or last_bid in authors:
+            continue
+        # 该 user 锚点前是否紧跟「作者：」标签（匹配始于 href=，前面还挂着截断的
+        # 开标签 <a …，先去掉再剥完整标签，才能让「作者：」落到串尾）
+        prefix = re.sub(r'<[^>]*$', '', html[max(0, m.start() - 40):m.start()])
+        prefix = _Y17K_TAG_RE.sub('', prefix)
+        if not _Y17K_AUTHOR_LABEL_RE.search(prefix):
+            continue
+        name = _Y17K_TAG_RE.sub('', inner).strip()
+        if name:
+            authors[last_bid] = name
+    return authors
+
+
 def parse_17k_quanben(html: str) -> list[dict]:
-    """17K 完本页 → [{title, author, origin}]（页面无作者，author 空）。
+    """17K 完本页 → [{title, author, origin}]（页面只有头部书卡带作者，其余 author 空）。
 
     同一本书在页面上有多个锚点（实测）：
     - **纯文本**锚点：`<a href=…>书名</a>`（权威书名，页面后段）；
@@ -1264,7 +1305,11 @@ def parse_17k_quanben(html: str) -> list[dict]:
     取法：按 book id 分组，**优先纯文本锚点**（旧行为，推广/简介锚点被天然跳过）；
     该 id 没有任何纯文本锚点时，才回退用带标签锚点剥标签后的文本——覆盖审查 C.1 指出的
     「8 个 id 书名只在 `<span>` 里」的漏收（例：`挣大钱斗极品：重生好媳妇`）。
-    再按归一化书名跨 id 去重。宁缺勿滥：简介句仍被 _clean_17k_title 的标点/长度闸挡掉。"""
+    再按归一化书名跨 id 去重。宁缺勿滥：简介句仍被 _clean_17k_title 的标点/长度闸挡掉。
+
+    author17k41（2026-09-26）：接入 _extract_17k_authors 就地补作者——头部书卡有「作者：」
+    标签的 id 补上作者，其余保持空串（详情页/检索接口被 WAF 或需鉴权，无免拦来源，不硬造）。"""
+    authors = _extract_17k_authors(html)
     order: list[str] = []
     plain: dict[str, str] = {}
     wrapped: dict[str, str] = {}
@@ -1288,7 +1333,7 @@ def parse_17k_quanben(html: str) -> list[dict]:
         if not title or not key or key in seen:
             continue
         seen.add(key)
-        books.append({'title': title, 'author': '',
+        books.append({'title': title, 'author': authors.get(bid, ''),
                       'origin': '17K完本', 'douban_url': ''})
     return books
 

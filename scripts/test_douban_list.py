@@ -719,6 +719,53 @@ class TestParse17kQuanben(unittest.TestCase):
         self.assertEqual(seen, [douban_list.Y17K_BASE + '/quanben/'])
 
 
+# 头部「精品专区」书卡带作者（author17k41 实测：href 内有制表符、外层 <p class="author">
+# 或 <span>，作者链接专用 //user.17k.com/see/…；同页另有「看过」等 user 锚点不带「作者：」标签）。
+Y17K_AUTHOR_HTML = """<html><body>
+<div class="wrap"><a href="//www.17k.com/book/\t3038645.html" target="_blank"><img src="\tx.jpg\t"/></a>
+<h3><a href="//www.17k.com/book/\t3038645.html" target="_blank">\t第九特区\t</a></h3>
+<p class="author">作者：<a href="//user.17k.com/see/www/?userId=\t26716073" target="_blank">\t伪戒 \t</a></p>
+<span class="icon"></span><a target="_blank" href="//user.17k.com/see/www/?userId=\t26716073">看过</a></div>
+<div class="cell"><a href="//www.17k.com/book/1198584.html" target="_blank">万古仙穹</a>
+<span class="book-author">作者：<a href="//user.17k.com/see/www/?userId=9">观棋</a></span></div>
+<a href="//www.17k.com/book/101834.html" target="_blank">乱世王妃</a>
+</body></html>"""
+
+
+class TestParse17kAuthors(unittest.TestCase):
+    """17K 完本页就地补作者（author17k41）：头部书卡有「作者：」的补上，其余保持空串。
+
+    调研结论：详情页/搜索接口均被阿里云 WAF（acw_sc__v2）拦或需 appKey，无免拦的
+    按 id/书名作者接口，故只解析页面已有作者、补不到不硬造（保持空串，不改护栏语义）。"""
+
+    def test_author_backfilled_from_book_card(self):
+        by_title = {b['title']: b['author']
+                    for b in douban_list.parse_17k_quanben(Y17K_AUTHOR_HTML)}
+        # href 内含制表符仍能定位到书卡作者（成功补全）
+        self.assertEqual(by_title['第九特区'], '伪戒')
+
+    def test_author_not_borrowed_across_cards(self):
+        # 「看过」等非「作者：」的 user 锚点不得被当成作者；作者只归本卡书
+        authors = douban_list._extract_17k_authors(Y17K_AUTHOR_HTML)
+        self.assertEqual(authors.get('3038645'), '伪戒')
+        self.assertNotIn('看过', authors.values())
+
+    def test_missing_author_degrades_to_empty_string(self):
+        # 页面无「作者：」标签的书（乱世王妃）→ author 空串，护栏语义不变
+        by_title = {b['title']: b['author']
+                    for b in douban_list.parse_17k_quanben(Y17K_AUTHOR_HTML)}
+        self.assertEqual(by_title['乱世王妃'], '')
+
+    def test_span_wrapped_author_label_form(self):
+        # <span class="book-author">作者：<a>…</a></span> 形态也能取到
+        by_title = {b['title']: b['author']
+                    for b in douban_list.parse_17k_quanben(Y17K_AUTHOR_HTML)}
+        self.assertEqual(by_title['万古仙穹'], '观棋')
+
+    def test_no_author_anchors_yields_empty_map(self):
+        self.assertEqual(douban_list._extract_17k_authors(Y17K_QUANBEN_HTML), {})
+
+
 class TestBuildWebnovelQueue(unittest.TestCase):
     """多源合并：完本经典优先（起点/纵横/17K）、起点榜单次之、豆瓣补充。"""
 
@@ -1375,6 +1422,19 @@ class TestNormAuthor(unittest.TestCase):
         # 以「作者」起头的真实笔名：两端同写法仍相等（归一化对称，不会误拒）
         self.assertEqual(douban_list._norm_author('作者君'),
                          douban_list._norm_author('作者：作者君'))
+
+    def test_engine_toc_double_label_still_matches(self):
+        # author17k41 / lblrate-41 §4：引擎 toc N02 校验的误杀形态「作者：X vs 作者：作者：X」
+        # （两端都带「作者：」、一端叠加两层）。author_matches 须循环剥标签后判同一人，
+        # 否则每条要白抓一次目录再拒（曾误杀 43 条）。含与尾缀「著」叠加。
+        for a, b in (
+            ('作者：唐家三少', '作者：作者：唐家三少'),
+            ('作者：风凌天下', '作者：风凌天下 著'),
+            ('唐家三少', '作者：作者：唐家三少'),
+        ):
+            with self.subTest(pair=(a, b)):
+                self.assertTrue(douban_list.author_matches(a, b))
+                self.assertTrue(douban_list.author_matches(b, a))
 
 
 class TestSearchEngineAuthorLabel(unittest.TestCase):
