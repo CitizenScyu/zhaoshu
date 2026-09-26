@@ -217,6 +217,46 @@ describe('AuthController dual mode', () => {
     expect(tokens.value).toBe('legacy-owner');
   });
 
+  // 回归（41-authdup）：会话 401 只可能来自账号模式（旧模式 /api/auth/session 恒 200）。
+  // 401 分支曾把 accountsEnabled 留在初值 false，登录框退化成旧口令入口，口令走 GET /api/owner、
+  // 不兑换 Cookie，失效 Cookie 原样留着——阅读页（另一个 OwnerProvider）再问 session 仍 401，又要口令。
+  it('knows the accounts mode after a cookie 401 so the owner entry exchanges a fresh cookie', async () => {
+    const calls = stubFetch({
+      'GET /api/auth/session': () => json(401, { code: 'UNAUTHORIZED' }),
+      'POST /api/auth/owner': () => json(200, { user: OWNER }),
+      'GET /api/owner': () => json(200, { ok: true }),
+    });
+    const { instance, tokens } = controller();
+    await instance.start();
+    expect(instance.state).toMatchObject({ phase: 'anonymous', expired: true, accountsEnabled: true });
+    await instance.loginOwner('owner-secret', false);
+    expect(calls.map((call) => `${call.method} ${call.url}`)).toEqual(['GET /api/auth/session', 'POST /api/auth/owner']);
+    expect(instance.state).toMatchObject({ phase: 'authenticated', transport: 'cookie', accountsEnabled: true });
+    expect(tokens.value).toBe('');
+  });
+
+  it('does not ask for the owner token again on the next page after a stale-cookie login', async () => {
+    // 同一浏览器的 Cookie 罐：失效 Cookie → 401；只有兑换接口会换上新 Cookie。
+    let cookie: 'stale' | 'valid' = 'stale';
+    stubFetch({
+      'GET /api/auth/session': () => (cookie === 'valid'
+        ? json(200, { user: OWNER, accountsEnabled: true })
+        : json(401, { code: 'UNAUTHORIZED' })),
+      'POST /api/auth/owner': () => { cookie = 'valid'; return json(200, { user: OWNER }); },
+      'GET /api/owner': () => json(200, { ok: true }),
+    });
+    const tokens = store();
+    const page = (): AuthController => new AuthController({ origin: () => ORIGIN, storage: tokens });
+    const home = page();
+    await home.start();
+    await home.loginOwner('owner-secret', false);
+    // 阅读页是独立的 OwnerProvider / AuthController，只共享浏览器 Cookie 与存储。
+    const reader = page();
+    await reader.start();
+    expect(reader.state).toMatchObject({ phase: 'authenticated', transport: 'cookie' });
+    expect(reader.state.user).toMatchObject({ id: 1, role: 'owner' });
+  });
+
   it('locks the interface and keeps the stored token when the session service fails', async () => {
     stubFetch({ 'GET /api/auth/session': () => json(503, { code: 'AUTH_DB_UNAVAILABLE' }) });
     const { instance, tokens } = controller({ stored: 'legacy-owner' });

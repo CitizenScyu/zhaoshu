@@ -295,8 +295,10 @@ export class AuthController {
 
       if (response.status === 401) {
         // Cookie 失效的 401 不触发自动 owner 兑换，也不清除旧口令。
+        // 旧模式的 session 接口恒 200，401 只可能来自账号模式：必须同步 accountsEnabled，
+        // 否则登录框退回旧口令入口（GET /api/owner 不换 Cookie），失效 Cookie 留着，下个页面又要口令。
         this.rotate('cookie');
-        this.set({ phase: 'anonymous', user: null, transport: 'cookie', expired: true });
+        this.set({ phase: 'anonymous', user: null, accountsEnabled: true, transport: 'cookie', expired: true });
         return;
       }
       if (response.status === 503) {
