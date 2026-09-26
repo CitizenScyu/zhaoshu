@@ -2942,6 +2942,176 @@ class TestBodyGuardsM2(unittest.TestCase):
             self.assertGreaterEqual(a2['body_chapters'], 1)
 
 
+class TestPerChapterAndShortlineS14(unittest.TestCase):
+    """§14：正文判同改逐章配对（≥2 互异匹配章对，删合并指纹）+ 短行拼块/独立短行精确剔除。"""
+
+    def _fp(self, titles, bodies, base):
+        return douban_list.fetch_content_fingerprint(
+            _cm_cli({base: _cm_book_bodies(titles, bodies, base)}), base)
+
+    S14_SHARED = ['第1章 风起微末', '第2章 血战孤城', '第3章 剑指苍穹',
+                  '第4章 问鼎九霄', '第5章 星海归途']       # 5 条共享信息性章名 → 目录侧过线
+
+    # <!-- FILL:S14 -->
+
+    def test_toc_chapter_number(self):
+        self.assertEqual(douban_list._toc_chapter_number('第一章 天才陨落'), 1)
+        self.assertEqual(douban_list._toc_chapter_number('第12章 风波'), 12)
+        self.assertEqual(douban_list._toc_chapter_number('第十二章 风波'), 12)
+        self.assertEqual(douban_list._toc_chapter_number('第一百零三回 大结局'), 103)
+        self.assertEqual(douban_list._toc_chapter_number('第二十章'), 20)
+        self.assertEqual(douban_list._toc_chapter_number('12、开端'), 12)
+        self.assertIsNone(douban_list._toc_chapter_number('楔子'))
+        self.assertIsNone(douban_list._toc_chapter_number('封推感言'))
+
+    def test_chapter_number_alignment_then_position_fallback(self):
+        # 两侧章号齐全且无重号 → 按章号对齐（顺序打乱也对得上）
+        ca = [{'num': 3, 'ngrams': {'c'}, 'chars': 3000}, {'num': 1, 'ngrams': {'a'}, 'chars': 3000},
+              {'num': 2, 'ngrams': {'b'}, 'chars': 3000}]
+        cb = [{'num': 1, 'ngrams': {'a'}, 'chars': 3000}, {'num': 2, 'ngrams': {'b'}, 'chars': 3000},
+              {'num': 3, 'ngrams': {'c'}, 'chars': 3000}]
+        pairs = douban_list._align_chapter_pairs({'body_by_chapter': ca}, {'body_by_chapter': cb})
+        self.assertEqual(len(pairs), 3)
+        self.assertTrue(all(pa == pb for pa, pb in pairs))     # 1↔1,2↔2,3↔3 全对上
+        # 章号不全 → 退位置对齐
+        ca2 = [{'num': None, 'ngrams': {'c'}, 'chars': 3000}, {'num': None, 'ngrams': {'a'}, 'chars': 3000}]
+        cb2 = [{'num': 1, 'ngrams': {'a'}, 'chars': 3000}, {'num': 2, 'ngrams': {'c'}, 'chars': 3000}]
+        pairs2 = douban_list._align_chapter_pairs({'body_by_chapter': ca2}, {'body_by_chapter': cb2})
+        self.assertEqual(pairs2, [({'c'}, {'a'}), ({'a'}, {'c'})])
+
+    def test_body_decides_requires_two_distinct_matching_pairs(self):
+        # §14 逐章配对直测：同段复制到多章只算 1 份（互不相同判据）；<2 → 不判同
+        seg = douban_list._char_ngrams('这一段被复制到多个章节用来伪造多对匹配证据啊' * 50)
+        other = douban_list._char_ngrams('这是真正独立的另一段正文内容与其他各不相同呀' * 50)
+        third = douban_list._char_ngrams('第三段完全独有的正文内容甲乙丙丁戊己庚辛壬癸' * 50)
+
+        def fp(c1, c2, c3):
+            return {'toc': [], 'body': set(), 'body_chars': 9000, 'body_chapters': 3,
+                    'body_by_chapter': [{'num': 1, 'ngrams': c1, 'chars': 3000},
+                                        {'num': 2, 'ngrams': c2, 'chars': 3000},
+                                        {'num': 3, 'ngrams': c3, 'chars': 3000}]}
+        # 三对章都匹配、但全是同一段 → 互异去重后仅 1 份 → 不判同
+        judge, same, _s, pairs = douban_list._body_decides(fp(seg, seg, seg), fp(seg, seg, seg))
+        self.assertTrue(judge)
+        self.assertEqual(pairs, 1)
+        self.assertFalse(same)
+        # 对照：三段互异 → 3 份 ≥2 → 判同
+        j2, s2, _s2, p2 = douban_list._body_decides(fp(seg, other, third), fp(seg, other, third))
+        self.assertTrue(s2)
+        self.assertGreaterEqual(p2, douban_list._BODY_MIN_PAIRS)
+
+    def test_single_shared_chapter_not_enough_repro_probe5b(self):
+        # §14 必修反例（第五轮 probe5b）：两本不同书共享一段逐字相同长正文（公版/引子），
+        # 但该段在本书内只占 1 章（跨章模板剔不掉）→ 旧合并指纹被这一段抬过线误放。
+        # 逐章配对：仅 1 对章匹配 <2 → 正文不判同 → 判否。目录侧用 5 条共享情节章名过线以隔离正文防线。
+        pub = '却说天下大势分久必合合久必分周末七国分争并入于秦及秦灭之后楚汉纷争又并入于汉' * 80
+        a = self._fp(self.S14_SHARED, [pub, '主角深入幽谷遭群敌合围浴血苦战终杀出重围' * 45,
+                                       '主角登临绝巅俯瞰苍茫群山立誓要踏平宿敌宗门' * 45], 'https://a/1')
+        b = self._fp(self.S14_SHARED, [pub, '女主穿越荒原追寻失落古城历经艰险终见曙光' * 45,
+                                       '女主潜入敌营盗取秘宝反被围困命悬一线险死还生' * 45], 'https://b/1')
+        self.assertGreaterEqual(min(a['body_chars'], b['body_chars']),
+                                douban_list.CONTENT_MIN_BODY_CHARS)   # 正文够长（判据不靠字数）
+        self.assertGreaterEqual(min(a['body_chapters'], b['body_chapters']),
+                                douban_list._BODY_MIN_CHAPTERS)       # 参与章≥2（对齐后有多对章可比）
+        ok, sim = douban_list.same_book(a, b)
+        self.assertTrue(sim['toc_ok'])                                # 目录侧确实过线
+        self.assertLess(sim['body_pairs'], douban_list._BODY_MIN_PAIRS)
+        self.assertFalse(ok)                                          # 单章共享段 → 判否
+
+    def test_single_shared_chapter_pairs_gate_is_load_bearing(self):
+        # 承重：把互异匹配章对下限改到 1 → 单章共享段就足以误放（说明 ≥2 这道闸承重）
+        pub = '却说天下大势分久必合合久必分周末七国分争并入于秦及秦灭之后楚汉纷争又并入于汉' * 80
+        a = self._fp(self.S14_SHARED, [pub, '主角深入幽谷遭群敌合围浴血苦战终杀出重围' * 45,
+                                       '主角登临绝巅俯瞰苍茫群山立誓要踏平宿敌宗门' * 45], 'https://a/1')
+        b = self._fp(self.S14_SHARED, [pub, '女主穿越荒原追寻失落古城历经艰险终见曙光' * 45,
+                                       '女主潜入敌营盗取秘宝反被围困命悬一线险死还生' * 45], 'https://b/1')
+        self.assertFalse(douban_list.same_book(a, b)[0])
+        with mock.patch.object(douban_list, '_BODY_MIN_PAIRS', 1):
+            self.assertTrue(douban_list.same_book(a, b)[0])           # 闸改坏(1) → 误并 → 变红
+
+    def test_shortline_watermark_folded_stripped_repro_probe5(self):
+        # §14 必修反例（第五轮 probe5 变体 A/B）：站点水印/底纹被硬折成 16/19 字短行铺满正文，
+        # 旧「≥20 字才参与模板检测」使其整段逃检、占满正文主体 → 两本不同书 body 冲高误放。
+        # §14 短行拼块 + 独立短行精确剔除 → 水印被识别剔除 → 只剩各自短情节 → 正文不判同 → 判否。
+        watermark = '本站所有内容均来自热心网友分享上传请您于阅读后二十四小时内自觉删除并购买正版书籍谢谢配合与理解支持'
+
+        def fold(text, width):
+            return [text[i:i + width] for i in range(0, len(text), width)]
+
+        for width in (16, 19):
+            def mk(prefix):
+                bodies = []
+                for ci in range(3):
+                    wm = []
+                    for _ in range(6):
+                        wm += fold(watermark, width)
+                    plot = '%s第%d章独有情节句%d' % (prefix, ci, ci)
+                    bodies.append('\n'.join(wm + [plot]))
+                return bodies
+            a = self._fp(self.S14_SHARED, mk('甲'), 'https://a/1')
+            b = self._fp(self.S14_SHARED, mk('乙'), 'https://b/1')
+            with self.subTest(width=width):
+                self.assertTrue(douban_list.same_book(a, b)[0] is False)   # 水印被剔 → 判否
+
+    def test_shortline_exact_dedup_across_chapters(self):
+        # §14 独立短行精确剔除：<20 字短行归一后完全相同且出现在 ≥2 章 → 剔（拼块<20 也兜底）
+        wm = ['本站水印甲乙丙', '阅读后请删除', '支持正版书籍']      # 每行 <20 字
+        real = '这一章真正独有的长正文情节内容与其他毫不相同啊啊' * 6
+        chA = wm + [real + '甲']
+        chB = wm + [real + '乙']
+        text, part = douban_list._clean_body_parts(['\n'.join(chA), '\n'.join(chB)])
+        for line in wm:
+            self.assertNotIn(line, text.split('\n'))          # 短行水印被剔
+
+    def test_shortline_block_fuzzy_dedup_across_chapters(self):
+        # §14 短行拼块：短行本身跨章略有差异（嵌章号，精确剔不掉）但连续短行拼块 ≥20 字 →
+        # 块级模糊识别（bigram Jaccard≥阈值）剔除该块构成的全部短行。
+        def chap(ci):
+            wm = ['本站第%d卷' % ci, '温馨提示您', '阅读后请及时', '删除并支持正版']   # 拼块 >20，含变化章号
+            real = '%d章真正独有的长正文情节甲乙丙丁戊己庚辛' % ci * 4
+            return '\n'.join(wm + [real])
+        text, part = douban_list._clean_body_parts([chap(0), chap(1)])
+        self.assertNotIn('温馨提示您', text.split('\n'))       # 拼块内短行被剔
+        self.assertNotIn('删除并支持正版', text.split('\n'))
+
+    def test_shortline_min_line_gate_is_load_bearing(self):
+        # 承重（漏判方向）：短行拼块/精确剔依赖对 <20 字短行的处理。**真同书**两站各章都被短行水印
+        # 铺满 + 各章独有真实情节：正常短行水印被剔 → 各章只剩互异情节 → 逐章配对成立 → 放行；
+        # 关掉短行处理（拼块阈值+精确剔都失效）→ 水印残留占满各章 n-gram → 同书各章反被「互不相同」
+        # 判据视为雷同（共享水印）→ 逐章配对失败 → 漏判（变红）。
+        watermark = '本站所有内容均来自热心网友分享上传请您于阅读后二十四小时内自觉删除并购买正版书籍谢谢配合支持'
+
+        def fold(text, width):
+            return [text[i:i + width] for i in range(0, len(text), width)]
+
+        def same_book_bodies():
+            bodies = []
+            for ci, plot in enumerate(['主角踏入试炼秘境独战群敌' * 200,
+                                       '女主穿越焦土荒原寻古城' * 200,
+                                       '少年觉醒沉睡血脉逆天' * 200]):
+                wm = []
+                for _ in range(6):
+                    wm += fold(watermark, 16)
+                bodies.append('\n'.join(wm + [plot]))
+            return bodies
+        same = same_book_bodies()
+        # 正常：短行水印被剔 → 各章独有情节 → 真同书放行
+        self.assertTrue(douban_list.same_book(
+            self._fp(CM_TITLES_X, same, 'https://a/1'),
+            self._fp(CM_TITLES_X_ALT, same, 'https://b/1'))[0])
+        # 关掉短行处理（拼块只留长行 + 精确剔归一置空）→ 水印残留 → 同书各章雷同 → 漏判
+        orig_segments = douban_list._chapter_segments
+
+        def only_long(lines):
+            return [(t, idx) for (t, idx) in orig_segments(lines)
+                    if len(idx) == 1 and len(lines[idx[0]]) >= douban_list._BODY_DEDUPE_MIN_LINE]
+        with mock.patch.object(douban_list, '_chapter_segments', only_long), \
+                mock.patch.object(douban_list, '_norm_line', lambda ln: ''):
+            a2 = self._fp(CM_TITLES_X, same, 'https://a/1')
+            b2 = self._fp(CM_TITLES_X_ALT, same, 'https://b/1')
+            self.assertFalse(douban_list.same_book(a2, b2)[0])    # 短行处理关掉 → 漏判 → 变红
+
+
 class TestBogusDowngradeEndToEnd(unittest.TestCase):
     """M3 端到端：名单解析(污染作者) → search_engine 降级 → _resolve_candidates 建条目 →
     labeler.engine_author_writeback → import_one 判定；断言分类名/出版社名绝不出现在最终作者。"""
@@ -2999,6 +3169,50 @@ class TestBogusDowngradeEndToEnd(unittest.TestCase):
         self.assertEqual(wb, '')
         status, _, _ = import_one.normalize_author(entry['author'])
         self.assertEqual(status, 'review')                        # 空作者 → review，绝不入库为污染串
+
+    def test_content_match_audit_fields_on_rescued_entry(self):
+        # §14 审计标记：经内容比对救回的条目带 author_source=content_match + content_match 诊断字段
+        base_a, base_b = 'https://a.example/1', 'https://b.example/1'
+        books = {base_a: _cm_book_bodies(CM_TITLES_X, CM_MULTI_X, base_a),
+                 base_b: _cm_book_bodies(CM_TITLES_X_ALT, CM_MULTI_X, base_b)}
+        cands = [{'source': 'a.example', 'title': '神秘复苏', 'author': '长安天', 'bookUrl': base_a},
+                 {'source': 'b.example', 'title': '神秘复苏', 'author': '長安天', 'bookUrl': base_b}]
+        queue, out = self._resolve('悬疑灵异', cands, books)
+        entry = queue[0]
+        self.assertEqual(entry['author_source'], 'content_match')
+        cm = entry['content_match']
+        self.assertEqual(cm['basis'], 'toc+body')
+        self.assertGreaterEqual(cm['body_pairs'], douban_list._BODY_MIN_PAIRS)
+        self.assertGreaterEqual(cm['toc'], douban_list.CONTENT_TOC_JACCARD)
+
+    def test_no_audit_fields_when_not_content_rescued(self):
+        # 名单有作者、候选作者已验证匹配（非内容比对路径）→ 条目不打 content_match 审计标记
+        base_a = 'https://a.example/1'
+        books = {base_a: _cm_book(CM_TITLES_X, CM_BODY_X, base_a)}
+        cands = [{'source': 'a.example', 'title': '神秘复苏', 'author': '长安天', 'bookUrl': base_a}]
+        def http_get(url):
+            return NO_RESULT_HTML if url.startswith('/books/search') else '<html></html>'
+        cli = _cm_cli(books, cands)
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            queue = douban_list._resolve_candidates(
+                [{'title': '神秘复苏', 'author': '长安天', 'douban_url': 'https://d/1'}],
+                http_get, origin='测试', engine_cli=cli)
+        self.assertEqual(len(queue), 1)
+        self.assertNotIn('author_source', queue[0])
+        self.assertNotIn('content_match', queue[0])
+
+    def test_import_ignores_unknown_audit_fields(self):
+        # §14：审计字段不入库表——import_one.validate_record 按已知字段名 .get 读取，
+        # 未知顶层字段被忽略、不改变裁决、不拒收（import_labels.mjs 同理，见 §14 报告，属性访问无严格 schema）。
+        import import_one
+        base = {'title': '神秘复苏', 'url': 'https://a.example/x', 'author': '长安天',
+                'labels': {'genre': '玄幻', 'site_title_match': True, 'quality': {'overall': 'good'}}}
+        v1 = import_one.validate_record(dict(base))
+        v2 = import_one.validate_record({**base, 'author_source': 'content_match',
+                                         'content_match': {'toc': 0.75, 'body_pairs': 3, 'basis': 'toc+body'}})
+        self.assertEqual(v1['status'], v2['status'])              # 未知字段不改变裁决
+        self.assertEqual(v1['status'], 'ready')                   # 且确实是可导入
+        self.assertEqual(v1['record'], v2['record'])             # 入库记录逐字一致（审计字段未渗入库）
 
 
 if __name__ == '__main__':
