@@ -263,6 +263,17 @@ class TestTrackerOnDeadCallback(unittest.TestCase):
         tracker = labeler.SourceGiveupTracker(2, dead={'a.example'}, on_dead=fired.append)
         self.assertEqual(tracker.dead, {'a.example'})
 
+    def test_already_dead_host_never_refreshes_timestamp(self):
+        """rvspeed-41 §2.3：预置进 dead 的 host 本轮再放弃也不触发 on_dead（时间戳不刷新）。
+
+        ttl 因此严格从**首次判死**起算，不会因反复判死而延长。"""
+        fired = []
+        tracker = labeler.SourceGiveupTracker(2, dead={'a.example'}, on_dead=fired.append)
+        for _ in range(5):
+            tracker.record('a.example')            # 本轮反复放弃
+        self.assertEqual(fired, [])                # 一次都没回调
+        self.assertEqual(tracker.counts, {'a.example': 5})
+
     def test_callback_exception_is_swallowed(self):
         def boom(host):
             raise OSError('no write')
