@@ -207,5 +207,259 @@ class TestSegmentUsable(unittest.TestCase):
             (False, 'no_request'))
 
 
+def _content_calls(cli, host=None):
+    return [c for c in cli.calls if c[0] == 'content'
+            and (host is None or labeler._url_host(c[1]) == host)]
+
+
+def _fetch(cli, book, **kw):
+    tracker = kw.pop('tracker', None) or labeler.SourceGiveupTracker(labeler.DEAD_HOST_GIVEUPS)
+    stats = {}
+    with contextlib.redirect_stdout(io.StringIO()):
+        text, chars, used, sampling = labeler.fetch_book_text_segmented(
+            cli, book, tracker, stats=stats, **kw)
+    return text, chars, used, sampling, stats
+
+
+class TestFetchSegmented(_NoSleep):
+    def test_primary_serves_all_four_segments(self):
+        cli = make_cli({'a.example.com': {'n': 100}})
+        text, chars, used, sampling, stats = _fetch(cli, _book())
+        segs = sampling['segments']
+        self.assertEqual([s['no'] for s in segs], [1, 2, 3, 4])
+        self.assertEqual([s['chapters'] for s in segs], ['1-7', '41-45', '71-74', '91-95'])
+        self.assertFalse(any(s['switched'] or s['partial'] for s in segs))
+        self.assertEqual(chars, 21 * 3000)
+        self.assertEqual(len(_content_calls(cli)), 21)
+        self.assertEqual(sum(1 for c in cli.calls if c[0] == 'toc'), 1)
+        self.assertEqual(used['url'], 'https://a.example.com/book')
+        self.assertEqual((stats['toc_title'], stats['toc_author']), (TITLE, AUTHOR))
+        for marker in ('【第 1 段：开头，第 1–7 章】', '【第 2 段：约 40% 处，第 41–45 章】',
+                       '【第 3 段：约 70% 处，第 71–74 章】', '【第 4 段：约 90% 处，第 91–95 章】'):
+            self.assertIn(marker, text)
+        self.assertLess(text.index('第 1 段'), text.index('第 2 段'))
+        self.assertLess(text.index('第 3 段'), text.index('第 4 段'))
+
+    def test_markers_survive_prepare_and_chapters_still_split(self):
+        """段标注行过 prepare_book_text 不被清洗掉；章节标题仍能切章（标注与章之间空一行）。"""
+        cli = make_cli({'a.example.com': {'n': 100}})
+        text, *_ = _fetch(cli, _book())
+        out, n, reason, pre = labeler.prepare_book_text(text, clean=True)
+        self.assertIsNone(reason)
+        self.assertEqual(sorted(labeler.segment_bodies(out)), [1, 2, 3, 4])
+        self.assertEqual(pre['chapters_after'], 21 + 1)   # 21 章 + 开头标注行所在的前导块
+
+    def test_late_4xx_switches_source_for_that_segment(self):
+        """主源第 60 章起 4xx（付费墙）：第 3 段请求 3 章即判不可用，换备选补段；第 4 段直接用备选。"""
+        cli = make_cli({
+            'a.example.com': {'n': 100, 'body': lambda i: None if i >= 60 else
+                              _chapter_body('a.example.com', i)},
+            'b.example.com': {'n': 100},
+        })
+        text, chars, used, sampling, _ = _fetch(cli, _book(alternates=['b.example.com']))
+        segs = {s['no']: s for s in sampling['segments']}
+        self.assertEqual(segs[1]['source'], 'a.example.com')
+        self.assertEqual(segs[2]['source'], 'a.example.com')
+        self.assertEqual((segs[3]['source'], segs[3]['switched']), ('b.example.com', True))
+        self.assertEqual((segs[4]['source'], segs[4]['switched']), ('b.example.com', True))
+        self.assertEqual(segs[3]['tried'], ['a.example.com:preview', 'b.example.com:ok'])
+        self.assertEqual(segs[4]['tried'], ['b.example.com:ok'])        # 上一段成功的源排最前
+        a_late = [c for c in _content_calls(cli, 'a.example.com') if _idx(c[1]) >= 60]
+        self.assertEqual(len(a_late), labeler.SEG_PROBE_CHAPTERS)
+        self.assertEqual(sum(1 for c in cli.calls if c[0] == 'toc'), 2)  # 每源目录只取一次
+        self.assertEqual(used['url'], 'https://a.example.com/book')    # 主源仍是计划源
+
+    def test_preview_pages_abort_fast(self):
+        """阳神型：中后段章章返回 ~120 字预览 → 每段只花 3 个请求就换源（不再空转）。"""
+        cli = make_cli({
+            'a.example.com': {'n': 100, 'body': lambda i: (f'预览{i}' + '字' * 110 + '……')
+                              if i >= 40 else _chapter_body('a.example.com', i)},
+            'b.example.com': {'n': 100},
+        })
+        text, chars, used, sampling, _ = _fetch(cli, _book(alternates=['b.example.com']))
+        segs = {s['no']: s for s in sampling['segments']}
+        self.assertEqual([segs[n]['source'] for n in (2, 3, 4)], ['b.example.com'] * 3)
+        a_mid = [c for c in _content_calls(cli, 'a.example.com') if _idx(c[1]) >= 40]
+        self.assertEqual(len(a_mid), labeler.SEG_PROBE_CHAPTERS)        # 只在第 2 段试过一次
+
+    def test_app_free_titles_skipped_without_requests(self):
+        """目录标题带 APP免费 的试读章不发请求；整段都是 → 该段 no_request → 换源。"""
+        cli = make_cli({
+            'a.example.com': {'n': 100, 'titles': lambda i: f'第{i + 1}章 标题' + (
+                'APP免费' if i >= 40 else '')},
+            'b.example.com': {'n': 100},
+        })
+        text, chars, used, sampling, stats = _fetch(cli, _book(alternates=['b.example.com']))
+        self.assertFalse([c for c in _content_calls(cli, 'a.example.com') if _idx(c[1]) >= 40])
+        segs = {s['no']: s for s in sampling['segments']}
+        self.assertEqual(segs[2]['tried'], ['a.example.com:no_request', 'b.example.com:ok'])
+
+    def test_all_sources_fail_marks_segment_missing(self):
+        cli = make_cli({
+            'a.example.com': {'n': 100, 'body': lambda i: None if i >= 60 else
+                              _chapter_body('a.example.com', i)},
+            'b.example.com': {'n': 100, 'body': lambda i: None if i >= 60 else
+                              _chapter_body('b.example.com', i)},
+        })
+        text, chars, used, sampling, _ = _fetch(cli, _book(alternates=['b.example.com']))
+        segs = {s['no']: s for s in sampling['segments']}
+        self.assertTrue(segs[3]['missing'] and segs[4]['missing'])
+        self.assertIn('【第 3 段：未取到】', text)
+        self.assertIn('【第 4 段：未取到】', text)
+        self.assertEqual(labeler.normalize_arc({'decline': 'none'}, text)['decline'], 'unknown')
+
+    def test_short_real_text_used_as_partial(self):
+        """窗口里只有 1 章真正文（其余是试读章）、又没有备选源 → 用这 1 章（partial），不标未取到。"""
+        cli = make_cli({'a.example.com': {'n': 100, 'titles': lambda i: f'第{i + 1}章 标题' + (
+            'APP免费' if i >= 91 else '')}})
+        text, chars, used, sampling, stats = _fetch(cli, _book())
+        seg4 = sampling['segments'][3]
+        self.assertEqual((seg4['chapters'], seg4['partial']), ('91-91', True))
+        self.assertIn('【第 4 段：约 90% 处，第 91–91 章】', text)
+        self.assertEqual(stats['preview_chapters'], 9)
+
+    def test_primary_identity_mismatch_raises_without_content(self):
+        cli = make_cli({'a.example.com': {'n': 100, 'title': '完全不同的书'},
+                        'b.example.com': {'n': 100}})
+        with self.assertRaises(labeler.EngineIdentityMismatch):
+            _fetch(cli, _book(alternates=['b.example.com']))
+        self.assertEqual(_content_calls(cli), [])
+
+    def test_alternate_identity_mismatch_is_skipped(self):
+        """备选源身份不符只跳过，不拿它补段（新源必须过同样的身份校验）。"""
+        cli = make_cli({
+            'a.example.com': {'n': 100, 'body': lambda i: None if i >= 60 else
+                              _chapter_body('a.example.com', i)},
+            'b.example.com': {'n': 100, 'author': '别的作者'},
+            'c.example.com': {'n': 100},
+        })
+        text, chars, used, sampling, _ = _fetch(
+            cli, _book(alternates=['b.example.com', 'c.example.com']))
+        segs = {s['no']: s for s in sampling['segments']}
+        self.assertEqual((segs[3]['source'], segs[4]['source']), ('c.example.com', 'c.example.com'))
+        self.assertEqual(_content_calls(cli, 'b.example.com'), [])
+
+    def test_primary_toc_fail_plans_on_alternate(self):
+        cli = make_cli({'a.example.com': {'n': 100, 'toc_fail': True}, 'b.example.com': {'n': 50}})
+        tracker = labeler.SourceGiveupTracker(1)
+        text, chars, used, sampling, _ = _fetch(cli, _book(alternates=['b.example.com']),
+                                                tracker=tracker)
+        self.assertEqual(used['url'], 'https://b.example.com/book')
+        self.assertFalse(any(s['switched'] for s in sampling['segments']))
+        self.assertIn('a.example.com', tracker.dead)                   # 确定性目录失败记放弃
+
+    def test_all_tocs_fail_raises_gaveup(self):
+        cli = make_cli({'a.example.com': {'n': 100, 'toc_fail': True}})
+        with self.assertRaises(labeler.EngineSourceGaveUp):
+            _fetch(cli, _book())
+
+    def test_time_budget_stops_fetching(self):
+        """每个 CLI 请求耗 10s、时限 60s：到时即停，已取到的段照用，其余段标未取到；
+        最后一个请求在时限前发出（总耗时 ≤ 时限 + 单请求）。"""
+        now = [0.0]
+        inner = make_cli({'a.example.com': {'n': 100}})
+
+        class SlowCli:
+            calls = inner.calls
+
+            def run(self, sub, *args):
+                now[0] += 10
+                return inner.run(sub, *args)
+
+        text, chars, used, sampling, _ = _fetch(SlowCli(), _book(), time_budget_s=60,
+                                                clock=lambda: now[0])
+        self.assertLessEqual(now[0], 60 + 10)
+        segs = {s['no']: s for s in sampling['segments']}
+        self.assertFalse(segs[1].get('missing'))
+        self.assertTrue(segs[4].get('missing'))
+        self.assertIn('【第 4 段：未取到】', text)
+
+
+class TestNormalizeArc(unittest.TestCase):
+    Q1 = '萧炎舔了舔嘴唇迟疑了一下方才缓缓的道'
+    Q3 = '你们一次又一次的震，震了天上，震地下'
+    Q4 = '那就更好办了，省的我一一去寻找，走'
+
+    def text(self, missing=()):
+        bodies = {1: f'【第1章 开始】\n前文。{self.Q1}。后文。', 2: '【第401章 中】\n中段正文若干。',
+                  3: f'【第701章 转】\n前面。{self.Q3}！后面。', 4: f'【第901章 末】\n{self.Q4}。尾声。'}
+        return '\n\n'.join(f'【第 {n} 段：未取到】' if n in missing
+                           else f'【第 {n} 段：位置，第 1–2 章】\n\n{bodies[n]}' for n in (1, 2, 3, 4))
+
+    def test_valid_decline_kept(self):
+        arc = labeler.normalize_arc({'decline': 'severe', 'note': '后期注水',
+                                     'evidence': [{'segment': 1, 'quote': self.Q1},
+                                                  {'segment': 3, 'quote': self.Q3}]}, self.text())
+        self.assertEqual(arc['decline'], 'severe')
+        self.assertEqual(len(arc['evidence']), 2)
+        self.assertEqual(arc['checked'], {'dropped': 0, 'forced': ''})
+        self.assertEqual(arc['note'], '后期注水')
+
+    def test_whitespace_normalized_match(self):
+        arc = labeler.normalize_arc({'decline': 'mild', 'evidence': [
+            {'segment': 1, 'quote': '萧炎舔了舔 嘴唇\n迟疑了一下'},
+            {'segment': '4', 'quote': self.Q4}]}, self.text())
+        self.assertEqual(arc['decline'], 'mild')
+        self.assertEqual([e['segment'] for e in arc['evidence']], [1, 4])
+
+    def test_forged_quote_dropped_then_unknown(self):
+        """伪造（原文里没有）的 quote 被丢弃，剩 1 条 → 降为 unknown（防对照组误报）。"""
+        arc = labeler.normalize_arc({'decline': 'severe', 'evidence': [
+            {'segment': 1, 'quote': self.Q1},
+            {'segment': 3, 'quote': '中后段套路重复明显且注水严重'}]}, self.text())
+        self.assertEqual(arc['decline'], 'unknown')
+        self.assertEqual(arc['checked'], {'dropped': 1, 'forced': 'weak_evidence'})
+        self.assertEqual(len(arc['evidence']), 1)
+
+    def test_quote_attributed_to_wrong_segment_dropped(self):
+        arc = labeler.normalize_arc({'decline': 'mild', 'evidence': [
+            {'segment': 1, 'quote': self.Q1}, {'segment': 2, 'quote': self.Q3}]}, self.text())
+        self.assertEqual((arc['decline'], arc['checked']['dropped']), ('unknown', 1))
+
+    def test_two_quotes_same_segment_not_enough(self):
+        arc = labeler.normalize_arc({'decline': 'severe', 'evidence': [
+            {'segment': 3, 'quote': self.Q3}, {'segment': 3, 'quote': '前面。' + self.Q3[:8]}]},
+            self.text())
+        self.assertEqual(len(arc['evidence']), 2)
+        self.assertEqual((arc['decline'], arc['checked']['forced']), ('unknown', 'weak_evidence'))
+
+    def test_quote_from_marker_or_too_short_not_evidence(self):
+        arc = labeler.normalize_arc({'decline': 'mild', 'evidence': [
+            {'segment': 1, 'quote': '前文'}, {'segment': 3, 'quote': '第 3 段：位置'},
+            {'segment': True, 'quote': self.Q1}, 'bad', {'segment': 4}]}, self.text())
+        self.assertEqual(arc['evidence'], [])
+        self.assertEqual(arc['checked']['dropped'], 5)
+        self.assertEqual(arc['decline'], 'unknown')
+
+    def test_missing_late_segments_forces_unknown(self):
+        for decline in ('none', 'mild'):
+            arc = labeler.normalize_arc({'decline': decline, 'evidence': [
+                {'segment': 1, 'quote': self.Q1}, {'segment': 2, 'quote': '中段正文若干'}]},
+                self.text(missing=(3, 4)))
+            self.assertEqual((arc['decline'], arc['checked']['forced']),
+                             ('unknown', 'missing_segments'), decline)
+        # 只缺第 3 段、第 4 段在 → 仍可判
+        arc = labeler.normalize_arc({'decline': 'none'}, self.text(missing=(3,)))
+        self.assertEqual(arc['decline'], 'none')
+
+    def test_missing_head_forces_unknown(self):
+        arc = labeler.normalize_arc({'decline': 'none'}, self.text(missing=(1,)))
+        self.assertEqual(arc['decline'], 'unknown')
+
+    def test_garbage_values(self):
+        for value in (None, 'severe', [], {'decline': 'BAD'}, {'decline': 3}):
+            arc = labeler.normalize_arc(value, self.text())
+            self.assertEqual(arc['decline'], 'unknown', value)
+            self.assertEqual(arc['evidence'], [])
+        self.assertEqual(labeler.normalize_arc({'decline': ' None '}, self.text())['decline'], 'none')
+
+    def test_quote_truncated_to_50(self):
+        long = self.Q3 + '后面。'
+        body = f'【第 1 段：x】\n\n{self.Q1}\n\n【第 3 段：x】\n\n' + long * 3
+        arc = labeler.normalize_arc({'decline': 'none', 'evidence': [
+            {'segment': 3, 'quote': long * 3}]}, body)
+        self.assertEqual(len(arc['evidence'][0]['quote']), labeler.ARC_QUOTE_MAX)
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)
