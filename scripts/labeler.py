@@ -2790,6 +2790,12 @@ def main() -> int:
           + ('（LABELER_ENGINE_TARGET_CHARS 覆盖）'
              if env.get(ENGINE_TARGET_CHARS_ENV) else '（默认，打标只需样本）'))
     print('死源跨轮记忆: ' + (f'{dead_host_ttl} 秒有效期' if dead_host_ttl > 0 else '关闭'))
+    # lblseg41：分布式采样 + 按段换源补段（只作用于引擎条目；默认关，关时引擎路径逐字不变）
+    segmented = resolve_segmented(env)
+    seg_time_budget = resolve_seg_time_budget(env)
+    if segmented:
+        print(f'引擎取文: 分布式采样（四段，每本取文时限 {seg_time_budget} 秒，'
+              f'prompt_version={PROMPT_VERSION_SEGMENTED}）')
     # 断点续传：已写入 labels.jsonl 的书跳过（按详情页 url 判定）
     done_urls = load_done_urls(data_path('labels.jsonl'))
     # 钉子户终态：历史被拒 ≥ REJECT_TERMINAL_THRESHOLD 次的书同样跳过，
@@ -2939,6 +2945,7 @@ def main() -> int:
     for i, b in enumerate(queue, 1):
         print(f'[{i}/{len(queue)}] {b.get("title")} ...')
         fetch_stats: dict = {}      # 引擎取文统计（lbladfix41：跳过的公告条目 / 试读章数）
+        sampling: dict | None = None    # lblseg41：分段取文诊断；非 None ⇔ 本书走了分布式采样
         try:
             # 引擎兜底条目走 CLI 取正文（toc/content，不过 clean_chapter_text）；
             # rank/分类线走 book15 惰性元数据路径；douban/webnovel 候选已带元数据、--book
@@ -2948,9 +2955,20 @@ def main() -> int:
                 # 引擎条目 url 是绝对 host URL，绝不能走 http_get(BASE + url) 打错站。
                 # giveup41：主源失效（连续多章跨站跳转/4xx，或持续 5xx）提前放弃并换备选源；
                 # 换源成功则条目 url/source_host 改记实际来源（产物与入库记真实来源）。
-                text, chars, used = fetch_engine_book_with_giveup(
-                    engine_cli, b, source_giveups, giveup_streak=SOURCE_GIVEUP_STREAK,
-                    target_chars=engine_target_chars, stats=fetch_stats)
+                if segmented:
+                    # lblseg41：四段分布式采样，每段不可用就换源补这一段（见 fetch_book_text_segmented）
+                    text, chars, used, sampling = fetch_book_text_segmented(
+                        engine_cli, b, source_giveups, total_chars=engine_target_chars,
+                        time_budget_s=seg_time_budget, stats=fetch_stats)
+                    print('  分段取文: ' + ' / '.join(
+                        f'第{s["no"]}段 未取到' if s.get('missing') else
+                        f'第{s["no"]}段 {s["source"]} 第{s["chapters"]}章 {s["chars"]}字'
+                        + ('（换源）' if s['switched'] else '') + ('（偏短）' if s['partial'] else '')
+                        for s in sampling['segments']) + f'，{sampling["fetch_secs"]}s')
+                else:
+                    text, chars, used = fetch_engine_book_with_giveup(
+                        engine_cli, b, source_giveups, giveup_streak=SOURCE_GIVEUP_STREAK,
+                        target_chars=engine_target_chars, stats=fetch_stats)
                 if used['url'] != b['url']:
                     b['url'], b['source_host'] = used['url'], used['source']
                 # author17k41：名单作者为空时，用已过身份校验（标题兼容）的 toc 自报作者回写
@@ -3046,7 +3064,11 @@ def main() -> int:
             labels, calls = label_book(
                 text, env['LLM_API_KEY'], models,
                 site_title=site_title, site_author=b.get('author', ''),
-                max_tokens=max_tokens, meta=llm_meta)
+                max_tokens=max_tokens, meta=llm_meta,
+                **({'system_prompt': SYSTEM_PROMPT + SEGMENTED_PROMPT_SUFFIX} if sampling else {}))
+            if sampling:
+                # lblseg41：arc 证据只认送入文本里找得到的原文（text 即本次送模文本），不足即降 unknown
+                labels['arc'] = normalize_arc(labels.get('arc'), text)
             # 有站点书名时：原字符串匹配 或 JSON 布尔 true 任一通过即入库。
             # --book 保留跳过书名校验；榜单空书名必须拒绝，不能自动放行。
             site_match = labels.get('site_title_match') is True
@@ -3133,13 +3155,16 @@ def main() -> int:
                 # prompt_version：SYSTEM_PROMPT 的版本常量，改提示词必须升版，否则事后无法按版本分桶；
                 # label_source：取文路径，text_engine=引擎源（多源兜底）/ text_book15=book15 站点。
                 'label_model': llm_meta.get('label_model', ''),
-                'prompt_version': PROMPT_VERSION,
+                'prompt_version': PROMPT_VERSION_SEGMENTED if sampling else PROMPT_VERSION,
                 'label_source': 'text_engine' if is_engine else 'text_book15',
                 'labels': labels,
             }
             if quality_flag:
                 b_out['quality_flag'] = quality_flag
                 b_out['text_quality_evidence'] = evidence
+            if sampling:
+                # lblseg41：分段取文诊断（每段源/章范围/有效字数/是否换源）；导入端忽略顶层未知字段
+                b_out['sampling'] = sampling
             if b.get('author_source'):
                 # author17k41：作者非名单原生（引擎 toc 回写）时留审计标记，供事后追溯
                 b_out['author_source'] = b['author_source']
