@@ -2865,13 +2865,74 @@ class TestBodyGuardsM2(unittest.TestCase):
                               _bg('林牧握紧手中卷刃旧刀杀意在胸中渐浓')))          # 不同正文 → 不相似
         self.assertFalse(_sim(_bg(''), _bg('任意')))                                # 空集不相似
 
-    def test_body_top_segments_cap(self):
-        # §12 去模板后每章只留最长的前 N 段：真正文长段保留、短句噪声段丢弃
+    def test_all_remaining_lines_kept_no_length_selection(self):
+        # §13：删掉「每章取最长前 5 段」——去模板后**保留全部剩余正文行**（不再按行长挑选，
+        # 免得长模板行顶成主体、丢掉短情节行）。单章无跨章模板 → 长短行全部保留。
         long_seg = '这一段是真正的正文内容相当长足以进入指纹参与比对不会被当作噪声' * 8
-        parts = ['\n'.join([long_seg] + [f'短句{i}' for i in range(20)])]
-        kept = douban_list._clean_body_parts(parts).split('\n')
-        self.assertLessEqual(len(kept), douban_list._BODY_TOP_SEGMENTS)
+        shorts = [f'第{i}段短情节句子内容各不相同甲乙丙丁' for i in range(20)]
+        parts = ['\n'.join([long_seg] + shorts)]
+        text, participating = douban_list._clean_body_parts(parts)
+        kept = text.split('\n')
+        self.assertEqual(participating, 1)
+        self.assertGreater(len(kept), 5)                 # 远多于旧的 5 段上限
         self.assertIn(long_seg, kept)
+        for s in shorts:                                 # 短行不再被按长度丢弃
+            self.assertIn(s, kept)
+
+    def test_mid_chapter_template_stripped_regardless_of_position(self):
+        # §13 必修：埋在**章内中段**（非前后各 10 行）的共享模板同样要剔——全行参与，不再只取边缘。
+        tmpl = '本站温馨提示您本章内容由热心网友采集整理仅供学习交流请于阅读后自觉删除并支持正版'
+        pad = ['无关铺垫文句%d各章互不相同用于把模板挤出边缘窗口甲乙丙丁戊' % k for k in range(15)]
+        # 模板埋在第 16 行（远离前后各 10 行的边缘窗口）
+        chA = [(pad[k] + 'A%d' % k) for k in range(15)] + [tmpl] + ['甲书独有正文情节' * 20]
+        chB = [(pad[k] + 'B%d' % k) for k in range(15)] + [tmpl] + ['乙书独有正文情节' * 20]
+        parts = ['\n'.join(chA), '\n'.join(chB)]
+        text, _ = douban_list._clean_body_parts(parts)
+        self.assertNotIn(tmpl, text.split('\n'))         # 中段共享模板被剔除
+
+    def test_required_repro_mid_template_not_merged(self):
+        # 第四轮必修反例：两本不同书、同站模板埋在第 11 行起、长模板行本会被「取最长前 5 段」顶成主体。
+        # §13 全行去模板后 → body 指纹只剩各自情节 → 正文不可判/不判同 → 判否（幂等红线）。
+        shared = ['第12章 拍卖会风波', '第30章 秘境开启', '第45章 宗门大比',
+                  '第58章 万兽围城', '第70章 苍穹试炼']
+        seg = ('本站内容均由热心网友从互联网公开渠道收集整理而来仅供个人学习交流与试读使用请于'
+               '下载后二十四小时内自觉删除若您喜欢本书请支持正版并购买实体书籍谢谢您的配合与理解')
+
+        def mk(prefix, extra):
+            titles = shared + [extra]
+            bodies = []
+            for ci in range(len(titles)):
+                head = ['%s首%d段填充文句风雷霜雪云雾山河%d' % (prefix, ci, k) for k in range(10)]
+                tail = ['%s尾%d段填充文句剑刀枪棍拳掌%d' % (prefix, ci, k) for k in range(12)]
+                tpl = [seg + seg[30:120]]                # 长模板行埋在第 11 行起
+                plot = ['%s书%d章独有情节此段专属本书本章与其他毫不相同的真实正文内容甲乙丙' % (prefix, ci) * 3]
+                bodies.append('\n'.join(head + tpl + tail + plot))
+            return titles, bodies
+
+        ta, ba = mk('甲本', '第99章 青锋归鞘')
+        tb, bb = mk('乙本', '第99章 玉殿封神')
+        a = self._fp(ta, ba, 'https://a/1')
+        b = self._fp(tb, bb, 'https://b/1')
+        self.assertFalse(douban_list.same_book(a, b)[0])          # 模板去掉后 → 判否
+
+    def test_body_min_chapters_gate_load_bearing(self):
+        # §13 结构兜底：去模板后剩余 <30% 的章不参与；参与章 <_BODY_MIN_CHAPTERS → 正文不可判。
+        # 构造两本书：只有 1 章有真实正文、其余章全是共享模板（去模板后为空 → 不参与）→ 参与章=1 → 不放行。
+        tmpl = '本站提示本章内容由网友采集仅供学习交流请支持正版并于阅读后自觉删除谢谢配合理解万分'
+        real = '这一章是真正独有的长正文内容与其他书其他章都不一样情节独特' * 20
+        # 3 章：前 2 章纯模板（跨章重复→去空→不参与），第 3 章真实正文
+        pa = ['\n'.join([tmpl]), '\n'.join([tmpl]), '\n'.join([real + '甲'])]
+        pb = ['\n'.join([tmpl]), '\n'.join([tmpl]), '\n'.join([real + '乙'])]
+        a = self._fp(['第一章', '第二章', '第三章'], pa, 'https://a/1')
+        b = self._fp(['第一章', '第二章', '第三章'], pb, 'https://b/1')
+        self.assertLess(a['body_chapters'], douban_list._BODY_MIN_CHAPTERS)   # 参与章不足
+        self.assertFalse(douban_list.same_book(a, b)[0])                      # 正文不可判 → 不放行
+        with mock.patch.object(douban_list, '_BODY_MIN_CHAPTERS', 1), \
+                mock.patch.object(douban_list, '_BODY_KEEP_MIN_RATIO', 0.0):
+            a2 = self._fp(['第一章', '第二章', '第三章'], pa, 'https://a/1')
+            b2 = self._fp(['第一章', '第二章', '第三章'], pb, 'https://b/1')
+            # 闸放开后单章即可判：此时 body_chars 仍须够长才可判，这里 real 足够 → 承重可见
+            self.assertGreaterEqual(a2['body_chapters'], 1)
 
 
 class TestBogusDowngradeEndToEnd(unittest.TestCase):

@@ -24,6 +24,8 @@ import sys
 import time
 import unicodedata
 import urllib.parse
+from collections import defaultdict
+from math import ceil
 from pathlib import Path
 
 # ---- 豆瓣侧配置 ----
@@ -1129,14 +1131,18 @@ def _cli_json(cli, subcommand: str, *args: str):
 _BODY_DEDUPE_MIN_LINE = 20     # 只对这么长以上的行做跨章去重（对齐 labeler.DEDUPE_MIN_LINE）
 _LABELER_DROP_RULE = False     # False=未尝试；None=不可用；callable=labeler._drop_rule
 
-# §12 正文模板模糊去重：逐章变化的模板（句中嵌章号/页码/日期，甚至嵌**汉字/字母变量**如
+# §12/§13 正文模板模糊去重：逐章变化的模板（句中嵌章号/页码/日期，甚至嵌**汉字/字母变量**如
 # 「本章由手打组甲录入」）跨章既不「完全相同」、归一也覆盖不到（任意变量形态）。故改为**行级相似**：
-# 同一本书内，一行若与**其他章节**某候选行的字符 bigram Jaccard ≥ 阈值即视为模板剔除。限长 +
-# 只取每章前后各若干行作候选，避免 O(n²) 爆炸。去模板后每章再只留最长的若干段，模板短句难占主体。
+# 同一本书内，一行只要与**其他章**某行字符 bigram Jaccard ≥ 阈值即视为模板剔除，**无论在章内什么
+# 位置**（§13：不再只取每章边缘若干行——埋在中段的共享模板同样要剔）。性能用**倒排前缀过滤**：
+# 按行长度预筛（长度比 ≥_BODY_LEN_RATIO 才比）+ 按 bigram 文档频次排序、只索引每行最稀有的
+# 前缀 bigram，取候选后再精确校验 Jaccard——不做全量 O(n²)。去模板后**保留全部剩余正文行**
+# （不再按行长挑「最长前 N 段」——那会把长模板行顶成主体、丢掉短情节行），仅按字数封顶。
 _BODY_SIM_BIGRAM = 0.70        # 跨章模糊去重：字符 bigram Jaccard ≥ 此值 → 同一模板行
-_BODY_EDGE_LINES = 10          # 每章只取前后各 N 行（≥_BODY_DEDUPE_MIN_LINE）作模板候选（限成本）
-_BODY_TOP_SEGMENTS = 5         # 去模板后每章只留最长的前 N 段参与比对
 _BODY_LEN_RATIO = 0.6          # 长度预筛：两行归一长度比 < 此值直接跳过（bigram Jaccard 不可能达标）
+_BODY_KEEP_MIN_RATIO = 0.30    # §13 结构兜底：某章去模板后剩余正文 < 原章字数此比例 → 该章不参与正文判同
+_BODY_MIN_CHAPTERS = 2         # §13 结构兜底：参与判同的章不足此数 → 正文不可判（与门下即不放行）
+_BODY_MAX_CHARS_PER_CHAPTER = 20000  # 每章参与指纹的正文字数上限（按前 N 字封顶，非按行长挑选）
 
 
 def _line_bigrams(line: str) -> frozenset:
@@ -1171,40 +1177,105 @@ def _labeler_drop_rule():
     return _LABELER_DROP_RULE
 
 
-def _clean_body_parts(parts: list[str]) -> str:
-    """章正文列表 → 去模板后的干净正文（M2 + §12 行级模糊去重 + 每章取最长若干段）。
-    (1) 跨章模糊去重：把每行与**其他章**的模板候选行比字符 bigram Jaccard，≥_BODY_SIM_BIGRAM 的
-        ≥20 字长行视为模板/串章/分页重叠而剔除——逐章变化、嵌任意变量（章号/汉字/字母）的模板
-        都能识别，不依赖归一覆盖到具体变量形态；
-    (2) 复用 labeler 行级清洗 `_drop_rule` 剔广告/公告/求票行（best-effort，导入失败则跳过）；
-    (3) 去模板后每章只留**最长的前 _BODY_TOP_SEGMENTS 段**——模板短句很难占正文主体。"""
-    chapter_lines = [[ln.strip() for ln in re.split(r'[\r\n]+', p) if ln.strip()] for p in parts]
-    # 模板候选：每章前后各 _BODY_EDGE_LINES 行里 ≥min 的行的 (章号, bigram)
-    candidates: list[tuple[int, frozenset]] = []
+def _prefix_len(n: int) -> int:
+    """前缀过滤：Jaccard≥t 时两集合交集 ≥ t·max(|S|,|T|) ≥ t·|S|，故 S 落在交集外的元素
+    ≤ (1-t)|S|；只索引每行按文档频次升序排的前 |S|-⌈t·|S|⌉+1 个（最稀有）bigram，相似行必在
+    各自前缀里共享至少一个 bigram（前缀过滤定理），既取全候选又避开高频 bigram 的倒排爆炸。"""
+    return max(1, n - ceil(_BODY_SIM_BIGRAM * n) + 1)
+
+
+def _cross_chapter_template_lines(chapter_lines: list[list[str]]) -> set[str]:
+    """全行参与（§13）：返回本书内**与其他章某行模糊相似**（bigram Jaccard≥_BODY_SIM_BIGRAM）的
+    ≥_BODY_DEDUPE_MIN_LINE 字长行集合——无论在章内什么位置。用倒排前缀过滤取候选后精确校验，
+    避免全量 O(n²)：逐字相同的跨章重复行直接判模板；其余按最稀有前缀 bigram 建倒排、只精算候选对。"""
+    # 去重收集长行：line → {bigram 集, 出现的章号集}
+    info: dict[str, dict] = {}
     for ci, lines in enumerate(chapter_lines):
-        edge = lines[:_BODY_EDGE_LINES] + lines[-_BODY_EDGE_LINES:]
-        for ln in edge:
-            if len(ln) >= _BODY_DEDUPE_MIN_LINE:
-                candidates.append((ci, _line_bigrams(ln)))
-    drop_rule = _labeler_drop_rule()
-    cleaned: list[str] = []
-    for ci, lines in enumerate(chapter_lines):
-        kept: list[str] = []
         for ln in lines:
             if len(ln) >= _BODY_DEDUPE_MIN_LINE:
-                bg = _line_bigrams(ln)
-                if any(cj != ci and _lines_similar(bg, cbg) for cj, cbg in candidates):
-                    continue           # 与其他章某模板候选行相似 → 跨章模板，剔
+                rec = info.get(ln)
+                if rec is None:
+                    rec = info[ln] = {'bg': _line_bigrams(ln), 'chapters': set()}
+                rec['chapters'].add(ci)
+    templates: set[str] = set()
+    fuzzy: list[tuple[str, frozenset, int]] = []      # (line, bigram, 单一章号) 待模糊比对
+    for ln, rec in info.items():
+        if len(rec['chapters']) >= 2:
+            templates.add(ln)                          # 同一行出现在 ≥2 章 → 跨章重复模板
+        elif rec['bg']:
+            fuzzy.append((ln, rec['bg'], next(iter(rec['chapters']))))
+    # 倒排前缀过滤：按全局文档频次升序给每行 bigram 排序，只索引最稀有的前缀
+    df: dict[str, int] = defaultdict(int)
+    for _, bg, _ci in fuzzy:
+        for b in bg:
+            df[b] += 1
+    index: dict[str, list[int]] = defaultdict(list)
+    prefixes: list[frozenset] = []
+    for idx, (_ln, bg, _ci) in enumerate(fuzzy):
+        pref = sorted(bg, key=lambda b: (df[b], b))[:_prefix_len(len(bg))]
+        prefixes.append(frozenset(pref))
+        for b in pref:
+            index[b].append(idx)
+    for idx, (ln, bg, ci) in enumerate(fuzzy):
+        if ln in templates:
+            continue
+        na = len(bg)
+        seen: set[int] = set()
+        for b in prefixes[idx]:
+            for jdx in index[b]:
+                if jdx == idx or jdx in seen:
+                    continue
+                seen.add(jdx)
+                ojln, obg, oci = fuzzy[jdx]
+                if oci == ci:
+                    continue                            # 同章不算跨章模板
+                nb = len(obg)
+                lo, hi = (na, nb) if na <= nb else (nb, na)
+                if lo < hi * _BODY_LEN_RATIO:
+                    continue                            # 长度差过大 → Jaccard 不可能达标
+                if len(bg & obg) / len(bg | obg) >= _BODY_SIM_BIGRAM:
+                    templates.add(ln)
+                    templates.add(ojln)
+                    break
+            if ln in templates:
+                break
+    return templates
+
+
+def _clean_body_parts(parts: list[str]) -> tuple[str, int]:
+    """章正文列表 → (去模板后的干净正文, 参与判同的章数)（M2 + §12/§13）。
+    (1) 全行跨章模糊去重（§13）：一行只要与**其他章**某行字符 bigram Jaccard≥_BODY_SIM_BIGRAM 即
+        视为模板/串章/分页重叠剔除，**无论章内位置**——逐章变化、嵌任意变量（章号/汉字/字母）的
+        模板都能识别，不依赖归一覆盖到具体变量形态；
+    (2) 复用 labeler 行级清洗 `_drop_rule` 剔广告/公告/求票行（best-effort，导入失败则跳过）；
+    (3) 去模板后**保留全部剩余正文行**（保序、不按行长挑选），仅按 _BODY_MAX_CHARS_PER_CHAPTER 封顶；
+    (4) 结构兜底（§13）：某章去模板后剩余正文 < 原章字数 _BODY_KEEP_MIN_RATIO → 该章不参与；返回
+        参与判同的章数，供 _body_decides 在「参与章 <_BODY_MIN_CHAPTERS」时判「正文不可判」。"""
+    chapter_lines = [[ln.strip() for ln in re.split(r'[\r\n]+', p) if ln.strip()] for p in parts]
+    templates = _cross_chapter_template_lines(chapter_lines)
+    drop_rule = _labeler_drop_rule()
+    cleaned: list[str] = []
+    participating = 0
+    for lines in chapter_lines:
+        orig_chars = sum(len(ln) for ln in lines)
+        kept: list[str] = []
+        for ln in lines:
+            if len(ln) >= _BODY_DEDUPE_MIN_LINE and ln in templates:
+                continue                                # 跨章模板行，剔
             if drop_rule is not None:
                 try:
                     if drop_rule(ln):
-                        continue        # labeler 判为广告/公告/求票
+                        continue                        # labeler 判为广告/公告/求票
                 except Exception:
                     pass
             kept.append(ln)
-        kept.sort(key=len, reverse=True)        # 每章只留最长前 N 段
-        cleaned.extend(kept[:_BODY_TOP_SEGMENTS])
-    return '\n'.join(cleaned)
+        kept_chars = sum(len(ln) for ln in kept)
+        if not kept or (orig_chars and kept_chars < orig_chars * _BODY_KEEP_MIN_RATIO):
+            continue                                    # §13：该章去模板后剩余不足 → 不参与判同
+        participating += 1
+        chap_text = '\n'.join(kept)[:_BODY_MAX_CHARS_PER_CHAPTER]   # 按字数封顶，非按行长挑选
+        cleaned.append(chap_text)
+    return '\n'.join(cleaned), participating
 
 
 def fetch_content_fingerprint(cli, book_url: str,
@@ -1240,8 +1311,9 @@ def fetch_content_fingerprint(cli, book_url: str,
                 text = ''
             if len(text) > 100:
                 body_parts.append(text)
-        body_text = _clean_body_parts(body_parts)      # M2：去站点模板行 + 复用 labeler 行级清洗
-        fp = {'toc': toc_seq, 'body': _char_ngrams(body_text), 'body_chars': len(body_text)}
+        body_text, body_chapters = _clean_body_parts(body_parts)   # M2/§13：去模板 + 参与章数
+        fp = {'toc': toc_seq, 'body': _char_ngrams(body_text),
+              'body_chars': len(body_text), 'body_chapters': body_chapters}
     except Exception:
         fp = None
     if cache is not None:
@@ -1293,12 +1365,15 @@ def same_book(fp_a: dict | None, fp_b: dict | None) -> tuple[bool, dict]:
 
 
 def _body_decides(fp_a: dict, fp_b: dict) -> tuple[bool, bool, float]:
-    """正文信号（M2 + §12）：返回 (judgeable, same, body_jaccard)。
+    """正文信号（M2 + §12/§13）：返回 (judgeable, same, body_jaccard)。
 
-    judgeable：两边**去模板后**正文都须 ≥ CONTENT_MIN_BODY_CHARS 字，否则「不可判」（拿不准）。
-    same：n-gram Jaccard ≥ CONTENT_BODY_JACCARD。二者都为真，正文信号才算「可判且判同」。"""
+    judgeable：两边**去模板后**正文都须 ≥ CONTENT_MIN_BODY_CHARS 字，**且**两边参与判同的章数都
+    ≥ _BODY_MIN_CHAPTERS（§13：去模板后剩余不足的章已不计入，参与章太少说明正文多是模板/噪声）——
+    否则「不可判」（拿不准）。same：n-gram Jaccard ≥ CONTENT_BODY_JACCARD。二者都为真，正文信号
+    才算「可判且判同」。"""
     body_sim = _jaccard(fp_a.get('body') or set(), fp_b.get('body') or set())
-    judgeable = min(fp_a.get('body_chars', 0), fp_b.get('body_chars', 0)) >= CONTENT_MIN_BODY_CHARS
+    judgeable = (min(fp_a.get('body_chars', 0), fp_b.get('body_chars', 0)) >= CONTENT_MIN_BODY_CHARS
+                 and min(fp_a.get('body_chapters', 0), fp_b.get('body_chapters', 0)) >= _BODY_MIN_CHAPTERS)
     return judgeable, (body_sim >= CONTENT_BODY_JACCARD), body_sim
 
 
