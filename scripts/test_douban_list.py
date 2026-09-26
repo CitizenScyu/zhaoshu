@@ -1994,6 +1994,28 @@ class TestAuthorUnknownAmbiguityGuard(unittest.TestCase):
         self.assertEqual(hit['url'], 'https://b.example/zy')
         self.assertNotIn('作者歧义', out)
 
+    # ---- M4-r（复审第二轮，非阻断）：无作者路径相等前先剥站点装饰尾缀 ----
+    def test_m4r_norm_title_bare_strips_site_decoration(self):
+        nb = douban_list._norm_title_bare
+        self.assertEqual(nb('神秘复苏 全文阅读'), nb('神秘复苏'))
+        self.assertEqual(nb('神秘复苏最新章节'), nb('神秘复苏'))
+        self.assertEqual(nb('神秘复苏笔趣阁'), nb('神秘复苏'))
+        self.assertEqual(nb('神秘复苏全文阅读最新章节'), nb('神秘复苏'))   # 多个装饰尾缀成组剥
+        # 同人续写尾缀不在装饰表 → 仍不相等（C6 前缀续写照拦，幂等红线不变）
+        self.assertNotEqual(nb('神秘复苏之从回魂夜开始'), nb('神秘复苏'))
+
+    def test_m4r_decorated_title_no_author_now_accepted(self):
+        # 真同书、站点标题加装饰尾缀、名单无作者 → 不再因尾缀误拒（唯一无作者候选被收）
+        cands = [{'source': 'a.example', 'title': '剑来 全文阅读', 'author': '',
+                  'bookUrl': 'https://a.example/1'}]
+        hit, _ = self._search('剑来', cands)
+        self.assertIsNotNone(hit)
+        self.assertEqual(hit['url'], 'https://a.example/1')
+        # 变异：清空装饰词表 → 尾缀不剥 → 书名不等 → 回到误拒（证明尾缀规则承重）
+        with mock.patch.object(douban_list, '_SITE_DECOR_RE', __import__('re').compile(r'(?!x)x')):
+            hit2, _ = self._search('剑来', cands)
+            self.assertIsNone(hit2)
+
 
 class TestPublisherOnlyEndToEnd(unittest.TestCase):
     """豆瓣出版社条目 → subject 补作者 → 引擎候选（旺仔排第一）→ 绑到竹已；补不到则歧义跳过。"""
