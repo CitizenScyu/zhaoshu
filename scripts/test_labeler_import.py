@@ -469,5 +469,37 @@ class TestEnvQuoting(MainHarness):
         self.assertTrue(parsed.hostname)
 
 
+class TestWrittenTitleIsSiteTitle(MainHarness):
+    """lblmeta41：labels.jsonl 的顶层 title 必须是**站点书名**，不是 LLM 猜名。
+
+    旧写法 `title_guess or b['title']` 让猜名进了身份键：猜名与站点书名不同时，
+    导入端的一致性命中「site_title 与 title 不一致」→ review（现场 45 条即此形态），
+    而且 (title_key, author_key) 会随模型每次猜的版本漂移。"""
+    def _labels_with_guess(self, guess):
+        def fake(text, key, models, site_title='', **kw):
+            return {**labels_for(site_title), 'title_guess': guess}, 1
+        return fake
+
+    def test_record_title_is_site_title_not_guess(self):
+        self.books = [{'url': '/books/detailsA.html', 'title': '站点书名甲'}]
+        self.write_env()
+        out = io.StringIO()
+        with mock.patch.dict(os.environ, {'LABELER_DATA_DIR': str(self.dir)}), \
+                mock.patch.object(labeler, 'fetch_rank_books', return_value=list(self.books)), \
+                mock.patch.object(labeler, 'fetch_book_text',
+                                  return_value=('正文' * 30000, 60000)), \
+                mock.patch.object(labeler, 'label_book',
+                                  side_effect=self._labels_with_guess('模型猜的另一个名字')), \
+                mock.patch.object(labeler, 'time', mock.Mock()), \
+                mock.patch.object(sys, 'argv', ['labeler.py', '--no-db-model']), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            self.stub_http({labeler.BOOK15.absolute(b['url']): _detail_page() for b in self.books})
+            self.assertEqual(labeler.main(), 0)
+        rec = self.labels_jsonl()[0]
+        self.assertEqual(rec['title'], '站点书名甲')          # 顶层 = 站点书名（身份键用它）
+        self.assertEqual(rec['site_title'], '站点书名甲')
+        self.assertEqual(rec['labels']['title_guess'], '模型猜的另一个名字')   # 猜名只留在 labels
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

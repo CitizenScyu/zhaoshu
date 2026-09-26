@@ -2691,7 +2691,13 @@ def main() -> int:
             # （已是绝对，BOOK15.absolute 对 http 开头原样透传）；book15 条目现状不变。
             is_engine = bool(b.get('engine'))
             b_out = {
-                'title': labels.get('title_guess') or b.get('title', ''),
+                # lblmeta41：记录里的 title 必须是**站点书名**（可核验的权威串），
+                # LLM 的猜名只留在 labels.title_guess 里供对照。旧写法取
+                # `title_guess or b['title']` → 猜名进了身份键，与站点书名不同的猜名
+                # 会让导入端把它当「书名冲突」而拒收（且键随猜名漂移）。
+                # site_title 为空（--book 调试模式；榜单/引擎线不会发生，见上面的 R0 前置）
+                # 时才回落到猜名、再回落到条目自带书名，保持调试路径行为不变。
+                'title': site_title or labels.get('title_guess') or b.get('title', ''),
                 'site_title': site_title,
                 'author': b.get('author', ''),
                 'category': b.get('category', ''),
