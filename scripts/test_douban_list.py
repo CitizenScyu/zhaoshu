@@ -2810,19 +2810,26 @@ class TestBodyGuardsM2(unittest.TestCase):
         self.assertFalse(douban_list.same_book(a, b)[0])
 
     def test_m2r_normalization_is_load_bearing(self):
-        # §12：跨章模糊去重（bigram Jaccard≥_BODY_SIM_BIGRAM）承重。逐章变化的模板（嵌章号）各章
-        # 唯一，靠模糊相似识别并剔除；把相似阈值改到不可达 → 模板残留 → 模板打穿正文 Jaccard → 变红。
+        # §12/§14 跨章模糊去重（bigram Jaccard≥_BODY_SIM_BIGRAM）承重，两个方向都验证：
+        # (1) 不同书 + 同款逐章模板：正常模板被剥 → 合并正文各异；阈值改到不可达 → 模板残留 → 合并正文虚高。
         ax = self._vary_chapters(CM_VARYING_TMPL, CM_VARY_PLOT_X)
         bx = self._vary_chapters(CM_VARYING_TMPL, CM_VARY_PLOT_Y)
         self.assertLess(douban_list._jaccard(self._fp(CM_TITLES_X, ax, 'https://a/1')['body'],
                                              self._fp(CM_TITLES_X_ALT, bx, 'https://b/1')['body']),
                         douban_list.CONTENT_BODY_JACCARD)                    # 正常：模板被剥 → 正文各异
         with mock.patch.object(douban_list, '_BODY_SIM_BIGRAM', 1.01):
-            a2 = self._fp(CM_TITLES_X, ax, 'https://a/1')
-            b2 = self._fp(CM_TITLES_X_ALT, bx, 'https://b/1')
-            self.assertGreaterEqual(douban_list._jaccard(a2['body'], b2['body']),
-                                    douban_list.CONTENT_BODY_JACCARD)       # 模板未去 → 相似度虚高
-            self.assertTrue(douban_list.same_book(a2, b2)[0])              # 目录持平 + 正文虚高 → 误并 → 变红
+            self.assertGreaterEqual(
+                douban_list._jaccard(self._fp(CM_TITLES_X, ax, 'https://a/1')['body'],
+                                     self._fp(CM_TITLES_X_ALT, bx, 'https://b/1')['body']),
+                douban_list.CONTENT_BODY_JACCARD)                           # 模板未去 → 合并相似度虚高
+        # (2) 真同书 + 同款逐章模板：正常去模板后各章互异 → 逐章配对成立 → 放行；阈值改到不可达 →
+        #     模板残留占满各章 n-gram → 章间被「互不相同」判据视为雷同 → 逐章配对失败 → 漏判（变红）。
+        same = self._vary_chapters(CM_VARYING_TMPL, CM_VARY_PLOT_X)
+        self.assertTrue(douban_list.same_book(self._fp(CM_TITLES_X, same, 'https://a/1'),
+                                              self._fp(CM_TITLES_X_ALT, same, 'https://b/1'))[0])
+        with mock.patch.object(douban_list, '_BODY_SIM_BIGRAM', 1.01):
+            self.assertFalse(douban_list.same_book(self._fp(CM_TITLES_X, same, 'https://a/1'),
+                                                   self._fp(CM_TITLES_X_ALT, same, 'https://b/1'))[0])
 
     def test_m2r_varying_template_kept_for_same_book(self):
         # 正例保护：同一本书两站、同款逐章模板 + 目录一致 → 归一去模板后各章真实正文一致 → 双信号成立 → 放行
