@@ -1031,6 +1031,48 @@ def _cli_json(cli, subcommand: str, *args: str):
     return json.loads(proc.stdout)
 
 
+# ---- 正文清洗（M2）：比对前剥掉站点模板/广告行，正文兜底才不被打穿 ----
+_BODY_DEDUPE_MIN_LINE = 20     # 只对这么长以上的行做跨章去重（对齐 labeler.DEDUPE_MIN_LINE）
+_LABELER_DROP_RULE = False     # False=未尝试；None=不可用；callable=labeler._drop_rule
+
+
+def _labeler_drop_rule():
+    """惰性取 labeler 的行级清洗规则（复用其广告/公告/求票判据）；不可用则返回 None。"""
+    global _LABELER_DROP_RULE
+    if _LABELER_DROP_RULE is False:
+        try:
+            import labeler
+            _LABELER_DROP_RULE = labeler._drop_rule
+        except Exception:
+            _LABELER_DROP_RULE = None
+    return _LABELER_DROP_RULE
+
+
+def _clean_body_parts(parts: list[str]) -> str:
+    """章正文列表 → 去模板后的干净正文（M2）。
+    (1) 跨章去重：同一（≥20 字）长行在 ≥2 章出现视为模板/串章/分页重叠，剔除；
+    (2) 复用 labeler 行级清洗 `_drop_rule` 剔广告/公告/求票行（best-effort，导入失败则跳过）。"""
+    chapter_lines = [[ln.strip() for ln in re.split(r'[\r\n]+', p) if ln.strip()] for p in parts]
+    freq: dict[str, int] = {}
+    for lines in chapter_lines:
+        for ln in set(lines):          # 每章内同一行只计一次，避免章内重复夸大跨章频次
+            freq[ln] = freq.get(ln, 0) + 1
+    drop_rule = _labeler_drop_rule()
+    kept: list[str] = []
+    for lines in chapter_lines:
+        for ln in lines:
+            if len(ln) >= _BODY_DEDUPE_MIN_LINE and freq.get(ln, 0) >= 2:
+                continue               # 跨章模板行
+            if drop_rule is not None:
+                try:
+                    if drop_rule(ln):
+                        continue        # labeler 判为广告/公告/求票
+                except Exception:
+                    pass
+            kept.append(ln)
+    return '\n'.join(kept)
+
+
 def fetch_content_fingerprint(cli, book_url: str,
                               max_chapters: int = CONTENT_MAX_CHAPTERS,
                               cache: dict | None = None) -> dict | None:
@@ -1064,7 +1106,8 @@ def fetch_content_fingerprint(cli, book_url: str,
                 text = ''
             if len(text) > 100:
                 body_parts.append(text)
-        fp = {'toc': toc_seq, 'body': _char_ngrams(' '.join(body_parts))}
+        body_text = _clean_body_parts(body_parts)      # M2：去站点模板行 + 复用 labeler 行级清洗
+        fp = {'toc': toc_seq, 'body': _char_ngrams(body_text), 'body_chars': len(body_text)}
     except Exception:
         fp = None
     if cache is not None:
@@ -1098,7 +1141,10 @@ def same_book(fp_a: dict | None, fp_b: dict | None) -> tuple[bool, dict]:
 
 
 def _body_decides(fp_a: dict, fp_b: dict, body_sim: float) -> bool:
-    """正文兜底判定（M2 在本函数收紧；M1 阶段先按阈值判）。"""
+    """正文兜底判定（M2）：两边**去模板后**正文都须 ≥ CONTENT_MIN_BODY_CHARS 字，且 n-gram
+    Jaccard ≥ CONTENT_BODY_JACCARD 才判同书；字数不足（拿不准）一律判否，与「无参照本不猜」一致。"""
+    if min(fp_a.get('body_chars', 0), fp_b.get('body_chars', 0)) < CONTENT_MIN_BODY_CHARS:
+        return False
     return body_sim >= CONTENT_BODY_JACCARD
 
 

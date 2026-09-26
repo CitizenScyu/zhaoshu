@@ -2203,6 +2203,23 @@ def _cm_cli(books, candidates=None):
     return FakeEngineCli(dispatch)
 
 
+def _cm_book_bodies(titles, bodies, base):
+    """每章各自不同正文的书（M2 正文兜底测试用）：chapters[i].url → bodies[i]。"""
+    chapters = [{'title': t, 'url': f'{base}/c{i}'} for i, t in enumerate(titles)]
+    contents = {f'{base}/c{i}': bodies[i] for i in range(min(len(titles), len(bodies)))}
+    return {'toc': {'title': '书', 'chapters': chapters}, 'contents': contents}
+
+
+# 每章约 1600 字、彼此不同的长正文（去模板后 > CONTENT_MIN_BODY_CHARS）
+CM_MULTI_X = ['第一章里叶凌霄踏入试炼秘境遭遇强敌围攻。' * 90,
+              '第二章他于绝境中顿悟剑意反手击溃追兵。' * 90,
+              '第三章沉睡血脉骤然觉醒天地为之变色。' * 90]
+CM_MULTI_Y = ['第一章林牧穿越焦土荒原寻找失落古城。' * 90,
+              '第二章他在幽深密林遭遇成群变异巨兽。' * 90,
+              '第三章残破旧刀终于出鞘斩开重重杀阵。' * 90]
+CM_TEMPLATE_LINE = '温馨提示您：本章内容可能存在采集错漏，请留意甄别，本站不承担任何责任。'
+
+
 class TestContentFingerprint(unittest.TestCase):
     def test_norm_toc_title_strips_numbering(self):
         self.assertEqual(douban_list._norm_toc_title('第一章 天才陨落'), '天才陨落')
@@ -2219,11 +2236,13 @@ class TestContentFingerprint(unittest.TestCase):
         self.assertEqual(douban_list._char_ngrams('  1234  ！！'), set())   # 只留中日文/拉丁
 
     def test_fingerprint_from_engine(self):
-        books = {'https://a.example/x': _cm_book(CM_TITLES_X, CM_BODY_X, 'https://a.example/x')}
+        base = 'https://a.example/x'
+        books = {base: _cm_book_bodies(CM_TITLES_X, CM_MULTI_X + CM_MULTI_X, base)}
         cli = _cm_cli(books)
-        fp = douban_list.fetch_content_fingerprint(cli, 'https://a.example/x')
+        fp = douban_list.fetch_content_fingerprint(cli, base)
         self.assertEqual(fp['toc'], ['天才陨落', '蝼蚁之路', '血脉觉醒', '初显锋芒', '风波再起'])
-        self.assertTrue(fp['body'])
+        self.assertTrue(fp['body'])                 # 每章正文各异 → 去模板后非空
+        self.assertGreater(fp['body_chars'], 0)
 
     def test_fingerprint_none_on_engine_failure(self):
         cli = _cm_cli({})                       # 无此书 → toc rc=1 → None（不猜同书）
@@ -2276,11 +2295,14 @@ class TestSameBookAndRescue(unittest.TestCase):
         self.assertFalse(douban_list.same_book(None, None)[0])
 
     def test_short_toc_falls_back_to_body(self):
-        # 目录不足 3 条 → 用正文 n-gram：同正文放行，异正文不放行
-        short = ['第一章 独章', '第二章 又一章']
-        a = self._fp(short, CM_BODY_X, 'https://a/1')
-        b = self._fp(['第1章 独章', '第2章 又一章'], CM_BODY_X, 'https://b/1')
-        c = self._fp(['第一章 别的', '第二章 别的二'], CM_BODY_Y, 'https://c/1')
+        # 目录信息不足（纯编号，信息性标题为空）→ 用去模板正文：同书(长且相同)放行、异书不放行
+        nums = ['第一章', '第二章', '第三章']
+        a = douban_list.fetch_content_fingerprint(
+            _cm_cli({'https://a/1': _cm_book_bodies(nums, CM_MULTI_X, 'https://a/1')}), 'https://a/1')
+        b = douban_list.fetch_content_fingerprint(
+            _cm_cli({'https://b/1': _cm_book_bodies(nums, CM_MULTI_X, 'https://b/1')}), 'https://b/1')
+        c = douban_list.fetch_content_fingerprint(
+            _cm_cli({'https://c/1': _cm_book_bodies(nums, CM_MULTI_Y, 'https://c/1')}), 'https://c/1')
         ok_ab, sim_ab = douban_list.same_book(a, b)
         ok_ac, _ = douban_list.same_book(a, c)
         self.assertEqual(sim_ab['basis'], 'body')
@@ -2540,6 +2562,58 @@ class TestTocGuardsM1(unittest.TestCase):
 
     def test_min_titles_raised_to_five(self):
         self.assertGreaterEqual(douban_list.CONTENT_TOC_MIN_TITLES, 5)
+
+
+class TestBodyGuardsM2(unittest.TestCase):
+    """M2：正文兜底去站点模板行 + 阈值提到 0.60 + 去模板后字数下限 3000，防模板/公版开头打穿。"""
+
+    def _fp(self, titles, bodies, base):
+        return douban_list.fetch_content_fingerprint(
+            _cm_cli({base: _cm_book_bodies(titles, bodies, base)}), base)
+
+    def test_c3_site_template_stripped_not_merged(self):
+        # rvauthcv 反例 C3：目录不足 + 两本不同书正文都是同站模板块 → 去模板后正文空 → 判否
+        nums = ['第一章', '第二章', '第三章']
+        tmpl = [CM_TEMPLATE_LINE] * 3
+        a = self._fp(nums, tmpl, 'https://a/1')
+        b = self._fp(nums, tmpl, 'https://b/1')
+        self.assertLess(a['body_chars'], douban_list.CONTENT_MIN_BODY_CHARS)  # 模板被剥光
+        self.assertFalse(douban_list.same_book(a, b)[0])
+
+    def test_template_stripped_real_content_kept(self):
+        # 模板行(跨章重复)剥掉，但每章各自的真实正文保留 → 同书仍能判同
+        nums = ['第一章', '第二章', '第三章']
+        with_tmpl_x = [CM_TEMPLATE_LINE + '\n' + body for body in CM_MULTI_X]
+        a = self._fp(nums, with_tmpl_x, 'https://a/1')
+        b = self._fp(nums, with_tmpl_x, 'https://b/1')
+        ok, sim = douban_list.same_book(a, b)
+        self.assertTrue(ok)
+        self.assertGreaterEqual(a['body_chars'], douban_list.CONTENT_MIN_BODY_CHARS)
+
+    def test_short_body_not_enough_to_decide(self):
+        # 去模板后正文不足 3000 字 → 即便相同也判否（拿不准不放行）
+        nums = ['第一章', '第二章']
+        short = ['第一章真实但很短的正文内容。', '第二章同样很短的一点正文。']
+        a = self._fp(nums, short, 'https://a/1')
+        b = self._fp(nums, short, 'https://b/1')
+        self.assertLess(a['body_chars'], douban_list.CONTENT_MIN_BODY_CHARS)
+        self.assertFalse(douban_list.same_book(a, b)[0])
+
+    def test_body_threshold_is_load_bearing(self):
+        nums = ['第一章', '第二章', '第三章']
+        a = self._fp(nums, CM_MULTI_X, 'https://a/1')
+        c = self._fp(nums, CM_MULTI_Y, 'https://c/1')
+        self.assertFalse(douban_list.same_book(a, c)[0])          # 正常：异书判否
+        with mock.patch.object(douban_list, 'CONTENT_BODY_JACCARD', 0.0), \
+                mock.patch.object(douban_list, 'CONTENT_MIN_BODY_CHARS', 0):
+            self.assertTrue(douban_list.same_book(a, c)[0])       # 阈值+字数闸都改坏 → 误判 → 变红
+        b = self._fp(nums, CM_MULTI_X, 'https://b/1')
+        self.assertTrue(douban_list.same_book(a, b)[0])           # 正常：同书判是
+        with mock.patch.object(douban_list, 'CONTENT_MIN_BODY_CHARS', 10 ** 9):
+            self.assertFalse(douban_list.same_book(a, b)[0])      # 字数下限改到不可达 → 漏判 → 变红
+
+    def test_body_jaccard_raised_to_060(self):
+        self.assertGreaterEqual(douban_list.CONTENT_BODY_JACCARD, 0.60)
 
 
 if __name__ == '__main__':
