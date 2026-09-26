@@ -2159,5 +2159,202 @@ class TestAuthorSpaceSplitRevision(unittest.TestCase):
                 self.assertFalse(douban_list._is_single_author(engine))
                 self.assertFalse(douban_list.author_matches('马丁', engine))
 
+# ---- authcv41：内容比对（目录 + 开头正文判定同书）----
+# 正例：同一本书跨两站，章节标题去编号后集合相同、开头正文一致（作者串因繁简虚增，
+#   如《凌霄之上》观棋 vs 觀棋）→ 应聚为唯一主簇、放行。
+# 反例：同名不同书，章节标题集合不相交 → 多簇、维持歧义跳过。
+CM_TITLES_X = ['第一章 天才陨落', '第二章 蝼蚁之路', '第三章 血脉觉醒',
+               '第四章 初显锋芒', '第五章 风波再起']
+CM_TITLES_X_ALT = ['第1章 天才陨落', '第2章 蝼蚁之路', '第3章 血脉觉醒',
+                   '第4章 初显锋芒', '第5章 风波再起']          # 同书、编号写法不同
+CM_TITLES_Y = ['第一章 星空之下', '第二章 荒原孤影', '第三章 古城疑云',
+               '第四章 迷雾深处', '第五章 短兵相接']            # 同名不同书
+CM_BODY_X = '叶凌霄睁开双眼，发现自己重回三年前那个风雨交加的夜晚，命运的齿轮再度转动。' * 6
+CM_BODY_Y = '林牧站在荒原尽头，望着远方燃烧的城池，握紧了手中早已卷刃的旧刀。' * 6
+
+
+def _cm_book(titles, body, base):
+    """一本书的引擎响应片段：toc（章节标题+URL）+ 各章正文。"""
+    chapters = [{'title': t, 'url': f'{base}/c{i}'} for i, t in enumerate(titles)]
+    contents = {f'{base}/c{i}': body for i in range(len(titles))}
+    return {'toc': {'title': '书', 'chapters': chapters}, 'contents': contents}
+
+
+def _cm_cli(books, candidates=None):
+    """按 --url 分发 toc/content 的 FakeEngineCli（callable 形态）；search 返回 candidates。"""
+    def _url_of(args):
+        return args[args.index('--url') + 1] if '--url' in args else ''
+
+    def dispatch(subcommand, args):
+        if subcommand == 'search':
+            return _proc(0, _engine_search_stdout(candidates or []))
+        url = _url_of(args)
+        if subcommand == 'toc':
+            book = books.get(url)
+            if not book:
+                return _proc(1, '')
+            return _proc(0, json.dumps(book['toc'], ensure_ascii=False))
+        if subcommand == 'content':
+            for b in books.values():
+                if url in b['contents']:
+                    return _proc(0, json.dumps({'text': b['contents'][url]}, ensure_ascii=False))
+            return _proc(1, '')
+        return _proc(1, '')
+    return FakeEngineCli(dispatch)
+
+
+class TestContentFingerprint(unittest.TestCase):
+    def test_norm_toc_title_strips_numbering(self):
+        self.assertEqual(douban_list._norm_toc_title('第一章 天才陨落'), '天才陨落')
+        self.assertEqual(douban_list._norm_toc_title('第1章 天才陨落'), '天才陨落')
+        self.assertEqual(douban_list._norm_toc_title('楔子：开端'), '开端')
+        self.assertEqual(douban_list._norm_toc_title('序章'), '')
+        self.assertEqual(douban_list._norm_toc_title('番外 后日谈'), '后日谈')
+
+    def test_jaccard_and_ngrams(self):
+        self.assertEqual(douban_list._jaccard(set(), {'a'}), 0.0)
+        self.assertEqual(douban_list._jaccard({'a', 'b'}, {'a', 'b'}), 1.0)
+        self.assertEqual(douban_list._jaccard({'a', 'b'}, {'b', 'c'}), 1 / 3)
+        self.assertTrue(douban_list._char_ngrams('天才陨落风波'))
+        self.assertEqual(douban_list._char_ngrams('  1234  ！！'), set())   # 只留中日文/拉丁
+
+    def test_fingerprint_from_engine(self):
+        books = {'https://a.example/x': _cm_book(CM_TITLES_X, CM_BODY_X, 'https://a.example/x')}
+        cli = _cm_cli(books)
+        fp = douban_list.fetch_content_fingerprint(cli, 'https://a.example/x')
+        self.assertEqual(fp['toc'], {'天才陨落', '蝼蚁之路', '血脉觉醒', '初显锋芒', '风波再起'})
+        self.assertTrue(fp['body'])
+
+    def test_fingerprint_none_on_engine_failure(self):
+        cli = _cm_cli({})                       # 无此书 → toc rc=1 → None（不猜同书）
+        self.assertIsNone(douban_list.fetch_content_fingerprint(cli, 'https://a.example/x'))
+
+    def test_fingerprint_cache_reused(self):
+        books = {'https://a.example/x': _cm_book(CM_TITLES_X, CM_BODY_X, 'https://a.example/x')}
+        cli = _cm_cli(books)
+        cache = {}
+        douban_list.fetch_content_fingerprint(cli, 'https://a.example/x', cache=cache)
+        n1 = len(cli.calls)
+        douban_list.fetch_content_fingerprint(cli, 'https://a.example/x', cache=cache)
+        self.assertEqual(len(cli.calls), n1)    # 命中缓存：不再发引擎调用
+
+
+class TestSameBookAndRescue(unittest.TestCase):
+    def _fp(self, titles, body, base='https://x/1'):
+        return douban_list.fetch_content_fingerprint(
+            _cm_cli({base: _cm_book(titles, body, base)}), base)
+
+    def test_same_book_positive_by_toc(self):
+        a = self._fp(CM_TITLES_X, CM_BODY_X, 'https://a/1')
+        b = self._fp(CM_TITLES_X_ALT, CM_BODY_X, 'https://b/1')
+        ok, sim = douban_list.same_book(a, b)
+        self.assertTrue(ok)
+        self.assertEqual(sim['basis'], 'toc')
+        self.assertGreaterEqual(sim['toc'], douban_list.CONTENT_TOC_JACCARD)
+
+    def test_same_title_different_book_negative(self):
+        a = self._fp(CM_TITLES_X, CM_BODY_X, 'https://a/1')
+        y = self._fp(CM_TITLES_Y, CM_BODY_Y, 'https://y/1')
+        ok, sim = douban_list.same_book(a, y)
+        self.assertFalse(ok)                      # 目录不相交 + 正文无关 → 不同书
+        self.assertLess(sim['toc'], douban_list.CONTENT_TOC_JACCARD)
+
+    def test_missing_fingerprint_never_matches(self):
+        a = self._fp(CM_TITLES_X, CM_BODY_X, 'https://a/1')
+        self.assertFalse(douban_list.same_book(a, None)[0])
+        self.assertFalse(douban_list.same_book(None, None)[0])
+
+    def test_short_toc_falls_back_to_body(self):
+        # 目录不足 3 条 → 用正文 n-gram：同正文放行，异正文不放行
+        short = ['第一章 独章', '第二章 又一章']
+        a = self._fp(short, CM_BODY_X, 'https://a/1')
+        b = self._fp(['第1章 独章', '第2章 又一章'], CM_BODY_X, 'https://b/1')
+        c = self._fp(['第一章 别的', '第二章 别的二'], CM_BODY_Y, 'https://c/1')
+        ok_ab, sim_ab = douban_list.same_book(a, b)
+        ok_ac, _ = douban_list.same_book(a, c)
+        self.assertEqual(sim_ab['basis'], 'body')
+        self.assertTrue(ok_ab)
+        self.assertFalse(ok_ac)
+
+    # ---- 阈值变异验证：阈值改坏，判定就该翻转（证明阈值是承重的）----
+    def test_toc_threshold_is_load_bearing(self):
+        a = self._fp(CM_TITLES_X, CM_BODY_X, 'https://a/1')
+        y = self._fp(CM_TITLES_Y, CM_BODY_Y, 'https://y/1')
+        self.assertFalse(douban_list.same_book(a, y)[0])          # 正常：不同书判否
+        with mock.patch.object(douban_list, 'CONTENT_TOC_JACCARD', 0.0):
+            self.assertTrue(douban_list.same_book(a, y)[0])       # 阈值改坏(0.0)：误判同书 → 变红信号
+        b = self._fp(CM_TITLES_X_ALT, CM_BODY_X, 'https://b/1')
+        self.assertTrue(douban_list.same_book(a, b)[0])           # 正常：同书判是
+        with mock.patch.object(douban_list, 'CONTENT_TOC_JACCARD', 1.01):
+            self.assertFalse(douban_list.same_book(a, b)[0])      # 阈值改到不可达：漏判 → 变红信号
+
+    # ---- search_engine 集成：名单无作者、判歧义时的内容比对救回 ----
+    def _candidates(self, specs):
+        return [{'source': host, 'title': title, 'author': author, 'bookUrl': url}
+                for host, title, author, url in specs]
+
+    def test_rescue_false_ambiguity_same_book(self):
+        # 《凌霄之上》同一本书两站：作者 观棋 vs 觀棋(繁简→归一后仍不等→判歧义)，但内容同→放行
+        base_a, base_b = 'https://a.example/1', 'https://b.example/1'
+        books = {base_a: _cm_book(CM_TITLES_X, CM_BODY_X, base_a),
+                 base_b: _cm_book(CM_TITLES_X_ALT, CM_BODY_X, base_b)}
+        cands = self._candidates([('a.example', '凌霄之上', '观棋', base_a),
+                                  ('b.example', '凌霄之上', '觀棋', base_b)])
+        cli = _cm_cli(books, cands)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            hit = douban_list.search_engine(cli, '凌霄之上', '')
+        out = buf.getvalue()
+        self.assertIsNotNone(hit)
+        self.assertIn(hit['url'], (base_a, base_b))
+        self.assertIn('内容比对放行', out)
+        self.assertIn('content_match', out)
+        self.assertNotIn('作者歧义跳过', out)
+
+    def test_no_rescue_same_title_different_books(self):
+        # 同名不同书：内容多簇 → 维持作者歧义跳过，绝不放行
+        base_a, base_y = 'https://a.example/1', 'https://y.example/1'
+        books = {base_a: _cm_book(CM_TITLES_X, CM_BODY_X, base_a),
+                 base_y: _cm_book(CM_TITLES_Y, CM_BODY_Y, base_y)}
+        cands = self._candidates([('a.example', '长生', '甲作者', base_a),
+                                  ('y.example', '长生', '乙作者', base_y)])
+        cli = _cm_cli(books, cands)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            hit = douban_list.search_engine(cli, '长生', '')
+        out = buf.getvalue()
+        self.assertIsNone(hit)
+        self.assertIn('作者歧义跳过', out)
+        self.assertNotIn('内容比对放行', out)
+
+    def test_env_switch_off_disables_rescue(self):
+        base_a, base_b = 'https://a.example/1', 'https://b.example/1'
+        books = {base_a: _cm_book(CM_TITLES_X, CM_BODY_X, base_a),
+                 base_b: _cm_book(CM_TITLES_X_ALT, CM_BODY_X, base_b)}
+        cands = self._candidates([('a.example', '凌霄之上', '观棋', base_a),
+                                  ('b.example', '凌霄之上', '觀棋', base_b)])
+        cli = _cm_cli(books, cands)
+        buf = io.StringIO()
+        with mock.patch.dict(os.environ, {'AUTHCV_CONTENT_MATCH': '0'}), \
+                contextlib.redirect_stdout(buf):
+            hit = douban_list.search_engine(cli, '凌霄之上', '')
+        out = buf.getvalue()
+        self.assertIsNone(hit)                    # 关掉开关 → 回退原歧义跳过
+        self.assertIn('作者歧义跳过', out)
+        # 关掉后不应发起任何 toc/content 取文（成本回滚干净）
+        self.assertFalse(any(c[0] in ('toc', 'content') for c in cli.calls))
+
+    def test_too_many_authors_skips_content_probe(self):
+        # distinct 作者 > 上限（同名书泛滥，如《长生》42 人）→ 不取文、维持跳过
+        specs = [(f'h{i}.example', '长生', f'作者{i}', f'https://h{i}.example/1') for i in range(6)]
+        cli = _cm_cli({}, self._candidates(specs))
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            hit = douban_list.search_engine(cli, '长生', '')
+        self.assertIsNone(hit)
+        self.assertIn('作者歧义跳过', buf.getvalue())
+        self.assertFalse(any(c[0] in ('toc', 'content') for c in cli.calls))
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)
