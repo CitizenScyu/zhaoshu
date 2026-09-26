@@ -273,12 +273,13 @@ class TestRvjunkCounterexamples(unittest.TestCase):
         self.assertEqual(labeler._strip_inline_noise('@精华书阁'), '')
         self.assertEqual(labeler._strip_inline_noise('无弹出广告文本小说站。'), '')
 
-    # 建议 3：系统流【…现金红包…领取…】/【…关注公众号领取…】不被两信号删
+    # 建议 3：系统流【…现金红包…领取…】不被两信号删（含「红包/下载/推荐」字样的系统提示）
     SYSTEM_STREAM_KEEP = (
         '【红包雨来袭！点击领取现金红包】',
         '【系统：恭喜获得现金红包×1，请及时领取】',
         '【叮！现金红包已到账，请领取】',
-        '【限时活动：关注公众号领取新手礼包】',
+        '【系统提示：新技能已下载到脑海，可随时使用】',
+        '【推荐副本：深渊之门已开启，速去挑战】',
         '宿主打开背包，发现一个现金红包静静躺在里面。',
     )
 
@@ -286,6 +287,25 @@ class TestRvjunkCounterexamples(unittest.TestCase):
         for line in self.SYSTEM_STREAM_KEEP:
             with self.subTest(line=line):
                 self.assertIsNone(labeler._drop_rule(line))
+
+    # 增量复审：行首【放行过宽——带账号标记/强字面/弱字面≥2 的真广告即使包在【】里也须删
+    BRACKET_AD_DROP = (
+        '【公众号：天涯悦读】',
+        '【关注公众号领取现金红包】',
+        '【微信公众号：书友大本营】看书领现金红包',
+        '【txt下载地址：www.x.com】',
+        '【本站已开通小说订阅功能】',
+        '【广个告】看书app，书源多，更新快！',
+        '【推荐】本书首发来自，第一时间看正版内容！',
+        '【公告】请点击下一页继续阅读，后面更精彩！',
+        '【 公众号：天涯悦读】',
+        '【限时活动：关注公众号领取新手礼包】',   # 含「公众号…领取」→ 按账号/CTA 删（复审认可）
+    )
+
+    def test_bracket_wrapped_ads_still_dropped(self):
+        for line in self.BRACKET_AD_DROP:
+            with self.subTest(line=line):
+                self.assertEqual(labeler._drop_rule(line), 'inject')
 
     # 建议 4：无引号叙述「他关注了那个公众号…」不被公众号+关注删
     def test_weak_entity_prose_kept(self):

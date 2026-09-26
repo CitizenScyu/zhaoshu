@@ -718,9 +718,12 @@ _PROMO_SOURCE_URL_RE = re.compile(
 def _is_promo_line(line: str) -> bool:
     """整行是否是站点推广行（junkfix41，rvjunk41 复审收窄）。见上方判据表。"""
     stripped = line.lstrip()
-    if len(line) > PROMO_LINE_MAX_LEN or _PROMO_QUOTE_RE.search(line) \
-            or stripped.startswith('【'):          # 系统流【…】保护
+    if len(line) > PROMO_LINE_MAX_LEN or _PROMO_QUOTE_RE.search(line):
         return False
+    # 系统流【…】保护：**只豁免泛化的「强实体+呼告」两信号路径**（`【…现金红包…领取】` 一类游戏提示）。
+    # 账号标记 / 强字面 / 弱字面≥2 等更硬的证据仍照删——否则站点用【】包一下推广行即可零成本规避
+    # （rvjunk41 增量复审：旧的「行首【一律放行」会漏掉 `【公众号：天涯悦读】`/`【广个告】…` 等 9 条真广告）。
+    system_stream = stripped.startswith('【')
     if _PROMO_STRONG_RE.search(line) or _PROMO_SOURCE_URL_RE.search(line):
         return True
     weak = sum(1 for p in _PROMO_WEAK_PATTERNS if p.search(line))
@@ -730,9 +733,9 @@ def _is_promo_line(line: str) -> bool:
         return True
     if weak >= 1 and (entity_strong or entity_weak):
         return True
-    if entity_strong and _PROMO_CALL_RE.search(line):
-        return True
     if entity_weak and _PROMO_ACCOUNT_RE.search(line):
+        return True
+    if entity_strong and _PROMO_CALL_RE.search(line) and not system_stream:
         return True
     return False
 
