@@ -460,8 +460,13 @@ async function admissionFetch(request: SourceSearchRequest, options: AdmissionFe
         current = next;
         continue;
       }
-      // 响应解码字符集：Content-Type 声明优先，回退请求声明字符集（GBK 站常不在头里声明）。
-      const charset: SourceCharset = charsetFromContentType(response.headers.get('content-type')) ?? request.charset;
+      // 响应解码字符集：**受 enginePostSearchEnabled() 门控**（M1 修复）。flag 开时 Content-Type
+      // 声明优先、回退请求声明字符集（GBK 站常不在头里声明），与运行时 responseCharset:'auto' 一致；
+      // flag 关时恒 utf-8——与基线 f57e191（硬编码 TextDecoder('utf-8')）逐字等价，纯 GET 源的
+      // 准入响应解码不因站点声明 charset=gbk 而改变分桶（rvadmpost §2 M1 反例）。
+      const charset: SourceCharset = enginePostSearchEnabled()
+        ? (charsetFromContentType(response.headers.get('content-type')) ?? request.charset)
+        : 'utf-8';
       const text = await readCappedBody(response, probeSignal, maxBytes, charset);
       probeSignal.throwIfAborted();
       return { url: current, status: response.status, text };

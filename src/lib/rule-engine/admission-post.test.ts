@@ -160,3 +160,46 @@ describe('41-admpost item2：准入探测 POST/charset 分类', () => {
     expect(bodies[1]).toBeUndefined();
   });
 });
+
+// ------- M1 修复：响应解码字符集受 enginePostSearchEnabled() 门控（rvadmpost §2 M1 反例）-------
+// 纯 GET 源（flag 关时的唯一候选形态）+ 站点在 Content-Type 里声明 charset=gbk 的 GBK 页面。
+// 基线 f57e191 恒 utf-8 解码：gbk 字节按 utf-8 解出乱码、不命中强反爬标记 → no_result（deferred）。
+// 修复前的 :464（无 flag 门）会在 flag 关时也嗅探 gbk、解出「安全验证」→ challenge（rejected 终态），
+// 改变准入分桶且发生在 flag 打开之前。修复后 flag 关恒 utf-8（与基线逐字等价）、flag 开才按 gbk 解码。
+const getSource = (host: string): RawSource => ({
+  bookSourceUrl: `https://${host}/`, bookSourceName: 'GET 源',
+  searchUrl: `https://${host}/s?q={{key}}`, checkKeyWord: '剑来',
+  ruleSearch: { bookList: '.i', name: '.t@text', bookUrl: 'a@href', author: '.a@text' },
+  ruleToc: { chapterList: '.toc@li', chapterName: 'a@text', chapterUrl: 'a@href' },
+  ruleContent: { content: '.c' },
+});
+const gbkChallengePage = () =>
+  encodeToBytes('<html><body><p>安全验证</p></body></html>', 'gbk');
+
+describe('41-admpost M1：GET 源准入响应解码的 flag 门控', () => {
+  afterEach(() => { delete process.env.ENGINE_POST_SEARCH; });
+
+  it('flag 关 + GBK 声明 + 强标记页：恒 utf-8 解码 → no_result（与基线 f57e191 同分类，不误判 challenge）', async () => {
+    delete process.env.ENGINE_POST_SEARCH;
+    const fetchPage = vi.fn<AdmissionTransport>().mockResolvedValue(
+      new Response(gbkChallengePage(), { status: 200, headers: { 'content-type': 'text/html; charset=gbk' } }),
+    );
+    const result = await searchAdmission(getSource('gbk-off.example.com'), {
+      fetchPage, declaredHosts: declared('gbk-off.example.com'), signal: signal(), throttleMs: 0,
+    });
+    // utf-8 解出的乱码不含「安全验证」明文 → 不命中 STRONG_CHALLENGE_MARKERS → 落 no_result。
+    expect(result.verdict).toBe('no_result');
+  });
+
+  it('flag 开 + GBK 声明 + 强标记页：按 gbk 解码 → 命中「安全验证」→ challenge', async () => {
+    process.env.ENGINE_POST_SEARCH = '1';
+    const fetchPage = vi.fn<AdmissionTransport>().mockResolvedValue(
+      new Response(gbkChallengePage(), { status: 200, headers: { 'content-type': 'text/html; charset=gbk' } }),
+    );
+    const result = await searchAdmission(getSource('gbk-on.example.com'), {
+      fetchPage, declaredHosts: declared('gbk-on.example.com'), signal: signal(), throttleMs: 0,
+    });
+    expect(result.verdict).toBe('challenge');
+    expect(result.error).toBe('安全验证');
+  });
+});
