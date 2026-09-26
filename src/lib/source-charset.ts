@@ -72,8 +72,11 @@ export function encodeQueryComponent(text: string, charset: SourceCharset): stri
  * 把整段文本按 charset 编成字节，用于 POST body 发送。utf-8 直接走 TextEncoder；
  * GBK/gb18030 按双字节表编码（ASCII 单字节透传），表外字符回退 UTF-8 字节。
  * 表单 body（{{key}} 已是 ASCII 百分号编码）任何 charset 下字节相同；JSON body 的 CJK 才靠此得到正确字节。
+ *
+ * 返回 `Uint8Array<ArrayBuffer>`（非共享缓冲）：两条路径都产出独立 ArrayBuffer，
+ * 以匹配 fetch/Response 的 `BodyInit` 类型（`Uint8Array<ArrayBufferLike>` 不被接受）。
  */
-export function encodeToBytes(text: string, charset: SourceCharset): Uint8Array {
+export function encodeToBytes(text: string, charset: SourceCharset): Uint8Array<ArrayBuffer> {
   if (charset === 'utf-8') return new TextEncoder().encode(text);
   const map = gbkMap();
   const out: number[] = [];
