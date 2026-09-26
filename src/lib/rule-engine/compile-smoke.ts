@@ -3,6 +3,7 @@
 // 设计依据：m1-engine-design.md v3 §8.2；移植逻辑参考 .rule-survey/survey.py。
 
 import { upgradeSourceTemplateUrl } from '@/lib/source-policy';
+import { searchOptionsConstructible } from '@/lib/source-parser';
 import { parseFieldRule } from './parse';
 import { RuleEngineError, type RuleDiagnostic } from './types';
 
@@ -72,43 +73,25 @@ function searchIsPureGet(su: unknown): boolean {
   return true;
 }
 
-const POST_OPTION_KEYS = new Set(['method', 'body', 'charset', 'headers']);
-
-/**
- * 放开口径（41-postsearch，仅 ENGINE_POST_SEARCH 开时）：searchUrl 含 `,{options}` 但选项键
- * ⊆ {method,body,charset,headers}、无 webView、选项文本无 @js:/<js>/java.*。单引号非严格 JSON 做受限容错；
- * 解析不了 → 判「不支持」（返回 false，不崩）。webView 与未知键仍拒。
- */
-function searchOptionsSupported(su: unknown): boolean {
-  if (typeof su !== 'string' || !su.includes('{{key}}')) return false;
-  const base = su.split('##')[0];
-  const optMatch = /,\s*\{/.exec(base);
-  if (!optMatch) return false; // 无选项 → 归 searchIsPureGet 判
-  const urlPart = base.slice(0, optMatch.index);
-  const optionsRaw = base.slice(optMatch.index + 1);
-  if (/@js:|<js>|\bjava\./i.test(urlPart) || /@js:|<js>|\bjava\.|webView/i.test(optionsRaw)) return false;
-  let parsed: unknown = null;
-  for (const candidate of [optionsRaw, optionsRaw.replace(/'/g, '"')]) {
-    try { parsed = JSON.parse(candidate); break; } catch { /* 试下一形态 */ }
-  }
-  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return false;
-  const keys = Object.keys(parsed as Record<string, unknown>);
-  return keys.length > 0 && keys.every((k) => POST_OPTION_KEYS.has(k));
-}
-
 /**
  * 复现主会话初筛（survey.py select_candidates），预期 174 条。
  * 41-srcfix 改法2：bookSourceUrl 写死 `http://` 的源先经 upgradeSourceTemplateUrl 升 https 再判——只改 scheme，
  * host/端口/userinfo 逐字不变，之后准入与运行时照旧过同一把 checkSourceUrl 锁（端口/IP/userinfo 仍被拒）。
  * 无协议（书源名当 URL）与其它 scheme 升级后仍非 https，照旧丢弃。
+ *
+ * 41-admpost F1：postSearch 开时的放开分支改用 `searchOptionsConstructible`——与运行时 `buildSourceSearchRequest`
+ * **同一判据函数**（展开 {{key}} + rejectUnexpanded + 类型校验，只放开 host 白名单），消除「候选放行 / 运行时抛」的
+ * 22 源分歧（{{cookie}} 等展不开的模板、空 charset、非串 body、非对象 headers 一律判不支持）。postSearch 关时逐字不变。
  */
 export function selectCandidates(data: RawSource[], options: { postSearch?: boolean } = {}): RawSource[] {
   const out: RawSource[] = [];
   for (const s of data) {
-    if (!upgradeSourceTemplateUrl(String(s.bookSourceUrl ?? '')).startsWith('https://')) continue;
+    const upgradedBase = upgradeSourceTemplateUrl(String(s.bookSourceUrl ?? ''));
+    if (!upgradedBase.startsWith('https://')) continue;
     if (!rulesNoJs(s)) continue;
-    // 默认口径 = 纯 GET；postSearch 开时额外放行「仅 method/body/charset/headers 选项」的源（webView/未知键仍拒）。
-    if (!searchIsPureGet(s.searchUrl) && !(options.postSearch && searchOptionsSupported(s.searchUrl))) continue;
+    // 默认口径 = 纯 GET；postSearch 开时额外放行「可构造出 POST/GET 请求」的源（与运行时同一判据，webView/未知键/展不开仍拒）。
+    if (!searchIsPureGet(s.searchUrl)
+      && !(options.postSearch && searchOptionsConstructible(s.searchUrl, upgradedBase))) continue;
     const rs = (s.ruleSearch ?? {}) as Record<string, unknown>;
     const rc = (s.ruleContent ?? {}) as Record<string, unknown>;
     if (!(rs && typeof rs === 'object' && rs.bookList)) continue;
