@@ -214,16 +214,20 @@ export async function getReadingPool(signal: AbortSignal): Promise<ReadingPool> 
  * 同站去重（41-srcfix）：引擎源按 bookSourceUrl 的 hostname 只留全序里最靠前的一份（reachable → tier →
  * search_checked_at 最新）。同站多副本（合集里同一站的多份规则，如 sma.yueyouxs.com 6 份）同一轮 cron 测完、
  * checked_at 挨着，会整段排在池首，把 READING_POOL_LIMIT 个名额占成同一个站——站挂了或没这本书，自动遍历一次
- * 全白跑。只作用于**自动遍历**：selectable（用户点选/章节续读认当前源）与扇出候选不去重，已在读某个副本的
- * 用户照样反查得到它（去重选中的副本会随复核时间戳换人，放进反查范围就会让在读用户被迫换源）。
+ * 全白跑。selectable（用户点选/章节续读认当前源）不去重，已在读某个副本的用户照样反查得到它（去重选中的副本
+ * 会随复核时间戳换人，放进反查范围就会让在读用户被迫换源）。扇出候选另有同口径去重（fanoutOf，41-swq）。
  * 只在 selectable 的窗口（前 selectableSourceLimit() 条）里挑，保证 traversal ⊆ selectable：自动首开选中的源，
  * 之后章节路径一定按 selectable 认得回来。builtin 不参与（book15 零回归红线）。
  */
 function traversalOf(eligible: readonly ReadingSource[]): ReadingSource[] {
-  const limit = readingPoolLimit();
+  return firstPerHost(eligible.slice(0, selectableSourceLimit()), readingPoolLimit());
+}
+
+/** 按全序逐条取，引擎源同 hostname 只留第一份，取满 limit 即停；builtin 不参与去重。traversalOf 与 fanoutOf 共用。 */
+function firstPerHost(sources: readonly ReadingSource[], limit: number): ReadingSource[] {
   const seenHosts = new Set<string>();
   const out: ReadingSource[] = [];
-  for (const source of eligible.slice(0, selectableSourceLimit())) {
+  for (const source of sources) {
     if (out.length >= limit) break;
     if (source.tier !== 'builtin') {
       const host = hostOfUrl(source.url);
@@ -293,15 +297,27 @@ function selectableTier(source: ReadingSource, engineOn: boolean): boolean {
  * （扇出由 SOURCE_FANOUT_ENABLED 单独把门，调用方先判开关）；为此这里总会按准入表刷一次 host 门——与取书池开引擎源时同一数据源。
  *
  * readable：确认路径（index?book_url=）与章节路径按 getSourcePools().selectable 反查源（41-readall）——扇出候选全部落在
- * 其内（上限取 max(取书池, 扇出)），故 readable 只看开关：引擎开关关时引擎源仍是「仅展示」（面板 unreadable）。
+ * 其内（selectable 显式并入 fanoutOf 的选中项），故 readable 只看开关：引擎开关关时引擎源仍是「仅展示」（面板 unreadable）。
  */
 export async function getFanoutPool(signal: AbortSignal): Promise<FanoutSource[]> {
   const eligible = await eligibleReadingSources(signal, true);
   const engineOn = engineSourcesEnabled();
-  return eligible.slice(0, sourceFanoutLimit()).map((source) => ({
+  return fanoutOf(eligible).map((source) => ({
     ...source,
     readable: selectableTier(source, engineOn),
   }));
+}
+
+/**
+ * 扇出候选切片（41-swq 同站去重）：引擎源按 bookSourceUrl 的 hostname 只留全序里最靠前的一份，腾出的名额按全序
+ * 往后补给别的站，总数仍 ≤ sourceFanoutLimit()。选哪一份 = §2.4 全序本身（probe reachable → tier M1 先于 T7 →
+ * search_checked_at 最新 → url），即「健康度 → 准入档位 → 准入结论新鲜度」，与 traversalOf 同口径。
+ * 改前按条目截断：同站多份规则（梧桐 4 份、quanwenyuedu/esjzone/qq 系各 2 份）占满 24 格只剩约 15 个站；且
+ * bookSourceUrl 的 `#…` 片段被 validateSourceUrl 抹掉，同站副本的 url 相同，路由按 url 反查永远落到第一份——
+ * 面板上 4 行梧桐实际探测的是同一条规则。builtin 不参与（book15 零回归红线）。
+ */
+function fanoutOf(eligible: readonly ReadingSource[]): ReadingSource[] {
+  return firstPerHost(eligible, sourceFanoutLimit());
 }
 
 /**
@@ -310,7 +326,10 @@ export async function getFanoutPool(signal: AbortSignal): Promise<FanoutSource[]
  */
 export type SelectableSources = readonly ReadingSource[] & { readonly __selectableSources: true };
 
-/** 反查范围上限：取书池与扇出候选的并集（二者是同一全序的前缀），任何一侧能展示/遍历到的源，用户点选都认。 */
+/**
+ * 反查范围的前缀窗口：全序前 max(取书池, 扇出) 条。扇出同站去重后可能越过窗口往后补位，getSourcePools 另把那几条
+ * 并进 selectable——任何一侧能展示/遍历到的源，用户点选都认。
+ */
 export function selectableSourceLimit(): number {
   return Math.max(readingPoolLimit(), sourceFanoutLimit());
 }
@@ -318,21 +337,24 @@ export function selectableSourceLimit(): number {
 export interface SourcePools {
   /** 自动遍历（无指定源的首开 / 章节级兜底换源）：traversalOf（同站去重后按 readingPoolLimit() 截断），与 getReadingSources 逐条相同。 */
   traversal: ReadingSource[];
-  /** 用户显式指定源的反查范围：同一序列按 selectableSourceLimit() 截断、再按开关过滤（见 selectableTier）；不去重。 */
+  /** 用户显式指定源的反查范围：同一序列前 selectableSourceLimit() 条 ∪ 扇出选中项（保持全序）、再按开关过滤（见 selectableTier）；不去重。 */
   selectable: SelectableSources;
 }
 
 /**
  * 一次合成同时给出两份池（41-readall）：traversal ⊆ selectable（同一全序、同一窗口，traversal 再做同站去重），章节路径一次 DB 往返拿齐。
+ * 扇出候选 ⊆ selectable（41-swq）：扇出同站去重会越过前缀窗口往后补别的站，那些条目必须认得，否则面板上能切的源点了必 404。
  * includeEngine 与取书池同口径（READING_ENGINE_SOURCES）：开关关时不刷 host 门、不查准入表，selectable 只剩 builtin。
  */
 export async function getSourcePools(signal: AbortSignal): Promise<SourcePools> {
   const engineOn = engineSourcesEnabled();
   const eligible = await eligibleReadingSources(signal, engineOn);
+  const window = selectableSourceLimit();
+  const fanout = new Set(fanoutOf(eligible));
   return {
     traversal: traversalOf(eligible),
-    selectable: eligible.slice(0, selectableSourceLimit())
-      .filter((source) => selectableTier(source, engineOn)) as unknown as SelectableSources,
+    selectable: eligible.filter((source, index) => (index < window || fanout.has(source))
+      && selectableTier(source, engineOn)) as unknown as SelectableSources,
   };
 }
 

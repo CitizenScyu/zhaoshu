@@ -1111,7 +1111,7 @@ describe('refreshShuyuan atomic refresh', () => {
     });
 
     // 41-srcfix 同站去重：同站多副本同一轮测完、checked_at 挨着，改前会把取书池名额占成同一个站。
-    it('41-srcfix 同站去重：traversal 同 host 只留全序最前一份；selectable/扇出不去重（在读副本仍认得）；traversal ⊆ selectable', async () => {
+    it('41-srcfix 同站去重：traversal 同 host 只留全序最前一份；selectable 不去重（在读副本仍认得）；traversal ⊆ selectable', async () => {
       const rows = [
         engineRowAt('dup.example', { source_url: 'https://dup.example/a', search_checked_at: '2026-09-24T00:00:00Z' }),
         engineRowAt('dup.example', { source_url: 'https://dup.example/b', search_checked_at: '2026-09-23T00:00:00Z' }),
@@ -1135,9 +1135,10 @@ describe('refreshShuyuan atomic refresh', () => {
       await expect(getReadingPool(new AbortController().signal)).resolves.toMatchObject({
         sources: pools.traversal, enginePoolSize: 2, poolCandidates: 2,
       });
+      // 41-swq：扇出同站去重，与 traversal 同口径选中 dup/a（改前 = selectable 全部 5 条）。
       arrange();
       expect((await getFanoutPool(new AbortController().signal)).map((source) => source.url))
-        .toEqual(pools.selectable.map((source) => source.url));
+        .toEqual(['https://book15.net/', 'https://dup.example/a', 'https://x.example/']);
       // 窗口：selectable 只到 max(R,F)=3 条 ⇒ traversal 不越窗去捞 x.example（否则首开选中的源章节路径认不回来）。
       vi.stubEnv('SOURCE_FANOUT_LIMIT', '2');
       arrange();
@@ -1145,6 +1146,47 @@ describe('refreshShuyuan atomic refresh', () => {
       const selectableUrls = new Set(narrow.selectable.map((source) => source.url));
       expect(narrow.traversal.map((source) => source.url)).toEqual(['https://book15.net/', 'https://dup.example/a']);
       expect(narrow.traversal.every((source) => selectableUrls.has(source.url))).toBe(true);
+    });
+
+    // 41-swq 扇出同站去重：生产快照里梧桐 4 份规则占 24 格中的 4 格（url 的 #片段被抹掉，4 行还探同一条规则），
+    // 去重后同站只留全序最前一份，腾出的名额按全序补给后面的站；总数仍受 SOURCE_FANOUT_LIMIT 约束。
+    it('41-swq 扇出同站去重：同 host 留全序最优一份（reachable 优先）、名额回填后续站、上限不变、越窗补位的源仍在 selectable', async () => {
+      const rows = [
+        engineRowAt('dup.example', { source_url: 'https://dup.example/a', search_checked_at: '2026-09-24T00:00:00Z' }),
+        engineRowAt('dup.example', { source_url: 'https://dup.example/b', search_checked_at: '2026-09-23T00:00:00Z' }),
+        engineRowAt('dup.example', { source_url: 'https://dup.example/c', search_checked_at: '2026-09-20T00:00:00Z' }),
+        engineRowAt('dup.example', { source_url: 'https://dup.example/t7', tier: 'T7', search_checked_at: '2026-09-25T00:00:00Z' }),
+        engineRowAt('y.example', { search_checked_at: '2026-09-19T00:00:00Z' }),
+        engineRowAt('z.example', { search_checked_at: '2026-09-18T00:00:00Z' }),
+        engineRowAt('w.example', { search_checked_at: '2026-09-17T00:00:00Z' }),
+      ];
+      const hosts = ['dup.example', 'y.example', 'z.example', 'w.example'];
+      // dup/c 探测 reachable ⇒ 全序里排在同站其余副本之前（健康度是首键），去重应选它而不是 checked_at 最新的 a。
+      const arrange = () => execute.mockResolvedValueOnce(hosts.map((host) => ({ host })))
+        .mockResolvedValueOnce([reachableMeta('https://dup.example/c')]).mockResolvedValueOnce([]).mockResolvedValueOnce(rows);
+      vi.stubEnv('READING_ENGINE_SOURCES', '1');
+      vi.stubEnv('READING_POOL_LIMIT', '2');
+      vi.stubEnv('SOURCE_FANOUT_LIMIT', '3');
+      arrange();
+      const fanout = await getFanoutPool(new AbortController().signal);
+      // 改前：[book15, dup/c, dup/a] —— 3 格里 2 格是同一个站。
+      expect(fanout.map((source) => source.url)).toEqual([
+        'https://book15.net/', 'https://dup.example/c', 'https://y.example/',
+      ]);
+      expect(fanout.every((source) => source.readable)).toBe(true);
+      // y.example 在全序第 6 位，越过了 selectable 前缀窗口 max(R,F)=3 ——必须显式并进 selectable，否则面板能切、确认 404。
+      arrange();
+      const pools = await getSourcePools(new AbortController().signal);
+      expect(pools.selectable.map((source) => source.url)).toEqual([
+        'https://book15.net/', 'https://dup.example/c', 'https://dup.example/a', 'https://y.example/',
+      ]);
+      expect(pools.traversal.map((source) => source.url)).toEqual(['https://book15.net/', 'https://dup.example/c']);
+      // 上限放宽 ⇒ 每站一格全部列出，T7 副本与其余同站副本都不出现；总数 = 1 builtin + 4 站。
+      vi.stubEnv('SOURCE_FANOUT_LIMIT', '24');
+      arrange();
+      expect((await getFanoutPool(new AbortController().signal)).map((source) => source.url)).toEqual([
+        'https://book15.net/', 'https://dup.example/c', 'https://y.example/', 'https://z.example/', 'https://w.example/',
+      ]);
     });
 
     it('合成条目的 rules 与 shuyuan_sources.source 深相等；sourceRevision 与 rules_hash 同源（§5.2）', async () => {
