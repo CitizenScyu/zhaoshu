@@ -1,0 +1,362 @@
+[
+ {
+  "why": "baseline ready: guess equals site title, strict true match",
+  "agree": true,
+  "py": "ready",
+  "mjs": "ready",
+  "record": {
+   "title": "T1",
+   "site_title": "T1",
+   "author": "A1",
+   "category": "cat",
+   "status": "done",
+   "source": "book15.net",
+   "url": "https://book15.net/books/d.html",
+   "chars": 1000,
+   "labels": {
+    "title_guess": "T1",
+    "text_quality": "\u6b63\u5e38",
+    "genre": "g",
+    "site_title_match": true,
+    "quality": {
+     "overall": 8
+    }
+   }
+  }
+ },
+ {
+  "why": "lblmeta41: guess != site title but site_title_match true -> ready (was review)",
+  "agree": true,
+  "py": "ready",
+  "mjs": "ready",
+  "record": {
+   "title": "T2-guess",
+   "site_title": "T2",
+   "author": "A2",
+   "category": "cat",
+   "status": "done",
+   "source": "book15.net",
+   "url": "https://book15.net/books/d.html",
+   "chars": 1000,
+   "labels": {
+    "title_guess": "T2-guess",
+    "text_quality": "\u6b63\u5e38",
+    "genre": "g",
+    "site_title_match": true,
+    "quality": {
+     "overall": 8
+    }
+   }
+  }
+ },
+ {
+  "why": "lblmeta41: title equals site title but site_title_match false -> review (gate kept)",
+  "agree": true,
+  "py": "review",
+  "mjs": "review",
+  "record": {
+   "title": "T3",
+   "site_title": "T3",
+   "author": "A3",
+   "category": "cat",
+   "status": "done",
+   "source": "book15.net",
+   "url": "https://book15.net/books/d.html",
+   "chars": 1000,
+   "labels": {
+    "title_guess": "T3",
+    "text_quality": "\u6b63\u5e38",
+    "genre": "g",
+    "site_title_match": false,
+    "quality": {
+     "overall": 8
+    }
+   }
+  }
+ },
+ {
+  "why": "lblmeta41: mismatch AND site_title_match false -> review (gate dominates mismatch)",
+  "agree": true,
+  "py": "review",
+  "mjs": "review",
+  "record": {
+   "title": "T4-guess",
+   "site_title": "T4",
+   "author": "A4",
+   "category": "cat",
+   "status": "done",
+   "source": "book15.net",
+   "url": "https://book15.net/books/d.html",
+   "chars": 1000,
+   "labels": {
+    "title_guess": "T4-guess",
+    "text_quality": "\u6b63\u5e38",
+    "genre": "g",
+    "site_title_match": false,
+    "quality": {
+     "overall": 8
+    }
+   }
+  }
+ },
+ {
+  "why": "legacy without site_title_match: guess != title -> review (blind-guess path unchanged)",
+  "agree": true,
+  "py": "review",
+  "mjs": "review",
+  "record": {
+   "title": "T5",
+   "site_title": "T5",
+   "author": "A5",
+   "category": "cat",
+   "status": "done",
+   "source": "book15.net",
+   "url": "https://book15.net/books/d.html",
+   "chars": 1000,
+   "labels": {
+    "title_guess": "T5-other",
+    "text_quality": "\u6b63\u5e38",
+    "genre": "g",
+    "quality": {
+     "overall": 8
+    }
+   }
+  }
+ },
+ {
+  "why": "legacy without site_title_match: guess equals title -> ready",
+  "agree": true,
+  "py": "ready",
+  "mjs": "ready",
+  "record": {
+   "title": "T6",
+   "site_title": "T6",
+   "author": "A6",
+   "category": "cat",
+   "status": "done",
+   "source": "book15.net",
+   "url": "https://book15.net/books/d.html",
+   "chars": 1000,
+   "labels": {
+    "title_guess": "T6",
+    "text_quality": "\u6b63\u5e38",
+    "genre": "g",
+    "quality": {
+     "overall": 8
+    }
+   }
+  }
+ },
+ {
+  "why": "empty author -> review (idempotency red line, unchanged)",
+  "agree": true,
+  "py": "review",
+  "mjs": "review",
+  "record": {
+   "title": "T7",
+   "site_title": "T7",
+   "author": "",
+   "category": "cat",
+   "status": "done",
+   "source": "book15.net",
+   "url": "https://book15.net/books/d.html",
+   "chars": 1000,
+   "labels": {
+    "title_guess": "T7",
+    "text_quality": "\u6b63\u5e38",
+    "genre": "g",
+    "site_title_match": true,
+    "quality": {
+     "overall": 8
+    }
+   }
+  }
+ },
+ {
+  "why": "known-bad text_quality -> skipped",
+  "agree": true,
+  "py": "skipped",
+  "mjs": "skipped",
+  "record": {
+   "title": "T8",
+   "site_title": "T8",
+   "author": "A8",
+   "category": "cat",
+   "status": "done",
+   "source": "book15.net",
+   "url": "https://book15.net/books/d.html",
+   "chars": 1000,
+   "labels": {
+    "title_guess": "T8",
+    "text_quality": "\u7591\u4f3c\u4e71\u7801",
+    "genre": "g",
+    "site_title_match": true,
+    "quality": {
+     "overall": 8
+    }
+   }
+  }
+ },
+ {
+  "why": "unknown author_encoding -> review (same code path both sides)",
+  "agree": true,
+  "py": "review",
+  "mjs": "review",
+  "record": {
+   "title": "T9",
+   "site_title": "T9",
+   "author": "A9",
+   "category": "cat",
+   "status": "done",
+   "source": "book15.net",
+   "url": "https://book15.net/books/d.html",
+   "chars": 1000,
+   "labels": {
+    "title_guess": "T9-guess",
+    "text_quality": "\u6b63\u5e38",
+    "genre": "g",
+    "site_title_match": true,
+    "quality": {
+     "overall": 8
+    }
+   },
+   "author_encoding": "v2"
+  }
+ },
+ {
+  "why": "lblmeta41 metadata fields accepted as strings",
+  "agree": true,
+  "py": "ready",
+  "mjs": "ready",
+  "record": {
+   "title": "T10",
+   "site_title": "T10",
+   "author": "A10",
+   "category": "cat",
+   "status": "done",
+   "source": "book15.net",
+   "url": "https://book15.net/books/d.html",
+   "chars": 1000,
+   "labels": {
+    "title_guess": "T10-other",
+    "text_quality": "\u6b63\u5e38",
+    "genre": "g",
+    "site_title_match": true,
+    "quality": {
+     "overall": 8
+    }
+   },
+   "label_model": "m1",
+   "prompt_version": "v1",
+   "label_source": "text_book15"
+  }
+ },
+ {
+  "why": "label_source not a string -> failed (both type-check)",
+  "agree": true,
+  "py": "failed",
+  "mjs": "failed",
+  "record": {
+   "title": "T11",
+   "site_title": "T11",
+   "author": "A11",
+   "category": "cat",
+   "status": "done",
+   "source": "book15.net",
+   "url": "https://book15.net/books/d.html",
+   "chars": 1000,
+   "labels": {
+    "title_guess": "T11",
+    "text_quality": "\u6b63\u5e38",
+    "genre": "g",
+    "site_title_match": true,
+    "quality": {
+     "overall": 8
+    }
+   },
+   "label_source": 1
+  }
+ },
+ {
+  "why": "unknown future top-level field is ignored by both importers (no field whitelist)",
+  "agree": true,
+  "py": "ready",
+  "mjs": "ready",
+  "record": {
+   "title": "T12",
+   "site_title": "T12",
+   "author": "A12",
+   "category": "cat",
+   "status": "done",
+   "source": "book15.net",
+   "url": "https://book15.net/books/d.html",
+   "chars": 1000,
+   "labels": {
+    "title_guess": "T12-other",
+    "text_quality": "\u6b63\u5e38",
+    "genre": "g",
+    "site_title_match": true,
+    "quality": {
+     "overall": 8
+    }
+   },
+   "some_future_field": {
+    "nested": [
+     1,
+     2
+    ]
+   },
+   "another": 3
+  }
+ },
+ {
+  "why": "site_title with surrounding spaces still strips to equal title -> ready",
+  "agree": true,
+  "py": "ready",
+  "mjs": "ready",
+  "record": {
+   "title": "T13",
+   "site_title": "  T13  ",
+   "author": "A13",
+   "category": "cat",
+   "status": "done",
+   "source": "book15.net",
+   "url": "https://book15.net/books/d.html",
+   "chars": 1000,
+   "labels": {
+    "title_guess": "T13",
+    "text_quality": "\u6b63\u5e38",
+    "genre": "g",
+    "site_title_match": true,
+    "quality": {
+     "overall": 8
+    }
+   }
+  }
+ },
+ {
+  "why": "KNOWN DIVERGENCE: author with HTML entity -- py review (conservative), mjs ready (decodes book15)",
+  "agree": false,
+  "py": "review",
+  "mjs": "ready",
+  "record": {
+   "title": "T13",
+   "site_title": "T13",
+   "author": "A&amp;13",
+   "category": "cat",
+   "status": "done",
+   "source": "book15.net",
+   "url": "https://book15.net/books/d.html",
+   "chars": 1000,
+   "labels": {
+    "title_guess": "T13-other",
+    "text_quality": "\u6b63\u5e38",
+    "genre": "g",
+    "site_title_match": true,
+    "quality": {
+     "overall": 8
+    }
+   }
+  }
+ }
+]

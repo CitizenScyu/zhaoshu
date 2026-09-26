@@ -469,5 +469,99 @@ class TestEnvQuoting(MainHarness):
         self.assertTrue(parsed.hostname)
 
 
+class TestWrittenTitleIsSiteTitle(MainHarness):
+    """lblmeta41：labels.jsonl 的顶层 title 必须是**站点书名**，不是 LLM 猜名。
+
+    旧写法 `title_guess or b['title']` 让猜名进了身份键：猜名与站点书名不同时，
+    导入端的一致性命中「site_title 与 title 不一致」→ review（现场 45 条即此形态），
+    而且 (title_key, author_key) 会随模型每次猜的版本漂移。"""
+    def _labels_with_guess(self, guess):
+        def fake(text, key, models, site_title='', **kw):
+            return {**labels_for(site_title), 'title_guess': guess}, 1
+        return fake
+
+    def test_record_title_is_site_title_not_guess(self):
+        self.books = [{'url': '/books/detailsA.html', 'title': '站点书名甲'}]
+        self.write_env()
+        out = io.StringIO()
+        with mock.patch.dict(os.environ, {'LABELER_DATA_DIR': str(self.dir)}), \
+                mock.patch.object(labeler, 'fetch_rank_books', return_value=list(self.books)), \
+                mock.patch.object(labeler, 'fetch_book_text',
+                                  return_value=('正文' * 30000, 60000)), \
+                mock.patch.object(labeler, 'label_book',
+                                  side_effect=self._labels_with_guess('模型猜的另一个名字')), \
+                mock.patch.object(labeler, 'time', mock.Mock()), \
+                mock.patch.object(sys, 'argv', ['labeler.py', '--no-db-model']), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            self.stub_http({labeler.BOOK15.absolute(b['url']): _detail_page() for b in self.books})
+            self.assertEqual(labeler.main(), 0)
+        rec = self.labels_jsonl()[0]
+        self.assertEqual(rec['title'], '站点书名甲')          # 顶层 = 站点书名（身份键用它）
+        self.assertEqual(rec['site_title'], '站点书名甲')
+        self.assertEqual(rec['labels']['title_guess'], '模型猜的另一个名字')   # 猜名只留在 labels
+
+
+class TestLabelMetadataFields(MainHarness):
+    """lblmeta41：记录里带 label_model / prompt_version / label_source 三字段。
+
+    label_model 从 label_book 的 meta 出参透传（回退链里真正响应的那个）；
+    label_source 区分引擎源与 book15；prompt_version 是常量，改提示词必须升版。"""
+    def test_fields_written_for_book15_entry(self):
+        code, _, _, _ = self.run_main(['--no-db-model'])
+        self.assertEqual(code, 0)
+        rec = self.labels_jsonl()[0]
+        self.assertEqual(rec['prompt_version'], labeler.PROMPT_VERSION)
+        self.assertEqual(rec['label_source'], 'text_book15')
+        # run_main 的 label_book 桩不写 meta → 值为空串（不是缺字段）
+        self.assertIn('label_model', rec)
+
+    def test_label_source_is_engine_for_engine_entries(self):
+        # 引擎条目：label_source 必须是 text_engine
+        book = {'url': 'https://yunqi.qq.com/detail/750056', 'title': '诛仙',
+                'author': '萧鼎', 'engine': True, 'source_host': 'yunqi.qq.com'}
+        self.write_env()
+        # 每章正文各异（本地预检会按「跨章重复行」去重，同一段重复会判不合格）
+        text = '\n\n'.join(
+            f'【第{i}章 起】\n' + ''.join(chr(0x4e00 + (i * 37 + j) % 2000) for j in range(3000))
+            for i in range(7))
+        out = io.StringIO()
+        with mock.patch.dict(os.environ, {'LABELER_DATA_DIR': str(self.dir)}), \
+                mock.patch.object(labeler.douban_list, 'build_webnovel_queue',
+                                  side_effect=lambda *a, **k: [dict(book)]), \
+                mock.patch.object(labeler, 'fetch_book_text_engine',
+                                  return_value=(text, len(text))), \
+                mock.patch.object(labeler, 'label_book',
+                                  side_effect=lambda text, *a, **k: (
+                                      {**labels_for(book['title'])}, 1)), \
+                mock.patch.object(labeler.time, 'sleep'), \
+                mock.patch.object(sys, 'argv',
+                                  ['labeler.py', '--source', 'webnovel', '--no-db-model']), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            code = labeler.main()
+        self.assertEqual(code, 0, out.getvalue())
+        rec = self.labels_jsonl()[0]
+        self.assertEqual(rec['label_source'], 'text_engine')
+
+    def test_label_model_comes_from_label_book_meta(self):
+        self.books = [{'url': '/books/detailsA.html', 'title': '书甲'}]
+
+        def fake_label(text, key, models, site_title='', **kw):
+            kw['meta']['label_model'] = 'grok-4.6-hei'
+            return dict(labels_for(site_title)), 1
+
+        self.write_env()
+        with mock.patch.dict(os.environ, {'LABELER_DATA_DIR': str(self.dir)}), \
+                mock.patch.object(labeler, 'fetch_rank_books', return_value=list(self.books)), \
+                mock.patch.object(labeler, 'fetch_book_text',
+                                  return_value=('正文' * 30000, 60000)), \
+                mock.patch.object(labeler, 'label_book', side_effect=fake_label), \
+                mock.patch.object(labeler, 'time', mock.Mock()), \
+                mock.patch.object(sys, 'argv', ['labeler.py', '--no-db-model']), \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            self.stub_http({labeler.BOOK15.absolute(b['url']): _detail_page() for b in self.books})
+            self.assertEqual(labeler.main(), 0)
+        self.assertEqual(self.labels_jsonl()[0]['label_model'], 'grok-4.6-hei')
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

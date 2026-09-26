@@ -95,7 +95,11 @@ BAD_TEXT_QUALITY = ('疑似乱码', '大面积重复', '含广告注入')
 AD_QUALITY_FLAG = 'ad_injection'
 AD_TEXT_QUALITY = '含广告注入'
 FIELD_STRINGS = ('title', 'site_title', 'author', 'author_encoding',
-                 'category', 'status', 'source')
+                 'category', 'status', 'source',
+                 # lblmeta41：打标元数据三字段。**只做类型校验**（非字符串即 failed），
+                 # 不写库——labeled_books 没有对应列，写进去要改表结构；这三项只落在
+                 # labels.jsonl 里供事后按模型/提示词版本分桶回溯（jsonl 本身可重放）。
+                 'label_model', 'prompt_version', 'label_source')
 
 # ---- 分类规范化（genre_map.mjs normalizeGenre 的 python 移植）----
 PRIMARY_GENRES = ('玄幻', '仙侠', '武侠', '都市', '历史', '科幻', '悬疑灵异',
@@ -308,8 +312,11 @@ def validate_record(rec):
     if (clean_string(title) != title or clean_string(listed_title) != listed_title
             or clean_string(author) != author):
         return review('书名或作者含非法字符，不能清洗后自动裁决身份')
-    if site_title and listed_title and not title_matches(site_title, listed_title):
-        return review('site_title 与 title 不一致，保留原记录待核验')
+    # lblmeta41：删掉「site_title 与 title 不一致 → review」。title 与 site_title 不一致只说明
+    # 记录里的 title 曾被 LLM 猜名覆盖过（旧 labeler 写法），不是身份证据不足——身份证据由下面的
+    # site_title_match 与上面的作者校验负责。现场 45 条 title≠site_title 全是 site_title_match=true，
+    # 即被这条误拦。身份键仍是 title(= site_title 优先)，删这条**不改变**身份键、不新增第二行。
+    # 与 import_labels.mjs 的删除逐条对齐。
 
     if labels.get('title_guess') is not None and not isinstance(labels['title_guess'], str):
         return failed('labels.title_guess 必须是字符串')
