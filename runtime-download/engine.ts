@@ -66,7 +66,8 @@ const isBuiltinHost = (m: EngineModules, host: string) => m.supported.BUILTIN_SO
 
 /** 引擎源池：先刷新运行时 host 门，再读 getEngineSources（同 engine-fetch.mjs loadEnginePool）。 */
 export async function loadEnginePool(m: EngineModules, signal: AbortSignal): Promise<ReadingSourceLike[]> {
-  m.policy.refreshSupportedHosts(await m.supported.engineHosts(signal));
+  // 41-poolimpl：host 门与池同源（源池产物优先、失败回退库；开关关时即 engineHosts 鲜读）。
+  m.policy.refreshSupportedHosts(await m.shuyuan.getPoolEngineHosts(signal));
   return (await m.shuyuan.getEngineSources(signal)) as unknown as ReadingSourceLike[];
 }
 
