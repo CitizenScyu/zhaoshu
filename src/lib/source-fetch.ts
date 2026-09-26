@@ -2,6 +2,7 @@
 // Keep redirects, body limits and the single request/body timeout in sync.
 import { alternateSourceHost, SourcePolicyError, validateSourceUrl } from './source-policy';
 import { recordHostFailure, recordHostSuccess, type HostFailureKind } from './source-host-health';
+import { charsetFromContentType, encodeToBytes, type SourceCharset } from './source-charset';
 
 export const MAX_SOURCE_REDIRECTS = 3;
 export const MAX_SOURCE_BYTES = 2 * 1024 * 1024;
@@ -47,14 +48,17 @@ export function sourceAbortable<T>(promise: PromiseLike<T>, signal: AbortSignal)
   });
 }
 
-async function responseText(response: Response, signal: AbortSignal, maxBytes: number) {
+async function responseText(response: Response, signal: AbortSignal, maxBytes: number, charset: SourceCharset = 'utf-8') {
   if (Number(response.headers.get('content-length')) > maxBytes) {
     cancelBody(response);
     throw new SourcePolicyError('书源响应体积超限');
   }
   if (!response.body) return '';
   const reader = response.body.getReader();
-  const decoder = new TextDecoder('utf-8', { fatal: true });
+  // utf-8 保持 fatal:true（改前语义，非法字节抛错、不换 host）；GBK 类 fatal:false 容忍杂散字节。
+  const decoder = charset === 'utf-8'
+    ? new TextDecoder('utf-8', { fatal: true })
+    : new TextDecoder(charset, { fatal: false });
   let bytes = 0;
   let text = '';
   let complete = false;
@@ -83,6 +87,18 @@ function hostFailureKind(error: unknown): HostFailureKind | null {
   return error instanceof DOMException ? 'timeout' : 'network';
 }
 
+/**
+ * 引擎 POST 搜索（41-postsearch）的请求覆写：method/body/白名单头 + 请求体字符集。
+ * 仅 ENGINE_POST_SEARCH 开时由 buildSourceSearchRequest 产出并传入；缺省 = 现有 GET/utf-8 路径。
+ * body 只发在首跳；重定向一律降级为无 body 的 GET（避免跨 host 重放 POST body，且合乎浏览器 303 语义）。
+ */
+export interface SourcePageRequest {
+  method?: 'GET' | 'POST';
+  body?: string;
+  headers?: Record<string, string>;
+  charset: SourceCharset;
+}
+
 interface FetchSourceOptions {
   signal: AbortSignal;
   timeoutMs?: number;
@@ -90,6 +106,10 @@ interface FetchSourceOptions {
   maxRedirects?: number;
   maxBytes?: number;
   beforeRequest?: (signal: AbortSignal) => Promise<void>;
+  /** POST/body/头覆写；缺省纯 GET。 */
+  request?: SourcePageRequest;
+  /** 响应解码字符集：显式字符集、或 'auto'（按 Content-Type，回退 utf-8）；缺省 utf-8（改前语义）。 */
+  responseCharset?: SourceCharset | 'auto';
 }
 
 // 41-M1.3：主机级健康记忆（source-host-health.ts）的唯一记录点——builtin 与引擎两条腿的每次逻辑请求都经过这里。
@@ -113,12 +133,12 @@ export async function fetchSourceText(input: string, options: FetchSourceOptions
 async function fetchWithHostSwap(initial: URL, {
   signal: parentSignal, timeoutMs = SOURCE_TIMEOUT_MS, connectTimeoutMs = SOURCE_CONNECT_TIMEOUT_MS,
   maxRedirects = MAX_SOURCE_REDIRECTS, maxBytes = MAX_SOURCE_BYTES,
-  beforeRequest,
+  beforeRequest, request, responseCharset,
 }: FetchSourceOptions) {
   const swapped = swapHost(initial);
   try {
     return await attemptOnce(initial, {
-      signal: parentSignal, timeoutMs, connectTimeoutMs, maxRedirects, maxBytes, beforeRequest,
+      signal: parentSignal, timeoutMs, connectTimeoutMs, maxRedirects, maxBytes, beforeRequest, request, responseCharset,
     });
   } catch (error) {
     // 4xx/5xx/策略拒绝：源站行为或响应侧判定，换 host 不改变结果，原样上抛；
@@ -128,7 +148,7 @@ async function fetchWithHostSwap(initial: URL, {
     await sourceHostSwapDelay(parentSignal);
     parentSignal.throwIfAborted();
     return await attemptOnce(swapped, {
-      signal: parentSignal, timeoutMs, connectTimeoutMs, maxRedirects, maxBytes, beforeRequest,
+      signal: parentSignal, timeoutMs, connectTimeoutMs, maxRedirects, maxBytes, beforeRequest, request, responseCharset,
       skipFirstBeforeRequest: true,
     });
   }
@@ -154,7 +174,7 @@ function swapHost(url: URL): URL | null {
 }
 
 async function attemptOnce(start: URL, {
-  signal: parentSignal, timeoutMs, connectTimeoutMs, maxRedirects, maxBytes, beforeRequest,
+  signal: parentSignal, timeoutMs, connectTimeoutMs, maxRedirects, maxBytes, beforeRequest, request, responseCharset,
   skipFirstBeforeRequest = false,
 }: {
   signal: AbortSignal;
@@ -163,6 +183,8 @@ async function attemptOnce(start: URL, {
   maxRedirects: number;
   maxBytes: number;
   beforeRequest?: (signal: AbortSignal) => Promise<void>;
+  request?: SourcePageRequest;
+  responseCharset?: SourceCharset | 'auto';
   /** 换 host 重试的首次请求：与失败的那次是同一逻辑请求，预算/节流不重复扣。 */
   skipFirstBeforeRequest?: boolean;
 }) {
@@ -173,6 +195,8 @@ async function attemptOnce(start: URL, {
   parentSignal.addEventListener('abort', onAbort, { once: true });
   const timer = setTimeout(() => controller.abort(new DOMException('书源请求及正文读取超时', 'TimeoutError')), timeoutMs);
   const signal = controller.signal;
+  // POST/body/头只用于首个 HTTP 跳；重定向后一律降级为无 body 的 GET。
+  const bodyBytes = request?.body !== undefined ? encodeToBytes(request.body, request.charset) : undefined;
   let response: Response | undefined;
   try {
     for (let redirects = 0; ; redirects += 1) {
@@ -185,9 +209,13 @@ async function attemptOnce(start: URL, {
       const connectTimer = setTimeout(() => {
         controller.abort(new DOMException('书源连接超时', 'ConnectTimeoutError'));
       }, connectTimeoutMs);
+      const firstHop = redirects === 0;
+      const headers: Record<string, string> = { 'User-Agent': 'Mozilla/5.0 (compatible; novel-finder-reader/1.0)' };
+      if (firstHop && request?.headers) Object.assign(headers, request.headers);
       const pending = fetch(current, {
-        redirect: 'manual', cache: 'no-store', signal,
-        headers: { 'User-Agent': 'Mozilla/5.0 (compatible; novel-finder-reader/1.0)' },
+        redirect: 'manual', cache: 'no-store', signal, headers,
+        method: firstHop ? request?.method ?? 'GET' : 'GET',
+        body: (firstHop && request?.method === 'POST' ? bodyBytes : undefined) as BodyInit | undefined,
       });
       void pending.then((late) => { if (signal.aborted) cancelBody(late, signal.reason); }, () => {});
       try {
@@ -208,7 +236,13 @@ async function attemptOnce(start: URL, {
         continue;
       }
       if (!response.ok) throw new SourceHttpError(response.status, parseRetryAfterMs(response.headers.get('retry-after')));
-      const text = await responseText(response, signal, maxBytes);
+      // 解码字符集：显式字符集优先；'auto' 按 Content-Type 嗅探（回退 utf-8）；缺省 utf-8（改前语义）。
+      const charset: SourceCharset = responseCharset && responseCharset !== 'auto'
+        ? responseCharset
+        : responseCharset === 'auto'
+          ? charsetFromContentType(response.headers.get('content-type')) ?? 'utf-8'
+          : 'utf-8';
+      const text = await responseText(response, signal, maxBytes, charset);
       signal.throwIfAborted();
       return { url: current, text };
     }
