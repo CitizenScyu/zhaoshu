@@ -88,6 +88,12 @@ function clip(value: string, max: number): string {
   return chars.length > max ? `${chars.slice(0, max - 1).join('')}…` : chars.join('');
 }
 
+// 进提示词前的轻量净化：去掉换行/控制字符、折叠连续空白。标签文本是书库数据、不是指令，
+// 这里只做格式清理（防换行伪造提示词结构），语义边界另由 rerankSystem 第 13 条声明。
+function sanitizeEvidenceText(value: string): string {
+  return value.replace(/[\u0000-\u001f\u007f]/g, ' ').replace(/\s+/g, ' ').trim();
+}
+
 // 存量里 labels.weaknesses/strengths 既有数组也有整段字符串（临时库 22/461 行是字符串）。
 function textList(value: unknown): string[] {
   const list = Array.isArray(value) ? value : typeof value === 'string' ? [value] : [];
@@ -114,7 +120,7 @@ export function compactLibraryEvidence(row: LibraryLabelRow): LibraryEvidence | 
   }
   const pushItems = (field: 'weaknesses' | 'strengths', items: string[], max: number) => {
     for (const item of items.slice(0, max)) {
-      const text = clip(item, LIBRARY_ITEM_MAX_CHARS);
+      const text = clip(sanitizeEvidenceText(item), LIBRARY_ITEM_MAX_CHARS);
       tryAdd(
         () => { (evidence[field] ??= []).push(text); },
         () => { evidence[field]!.pop(); if (evidence[field]!.length === 0) delete evidence[field]; },
@@ -125,7 +131,7 @@ export function compactLibraryEvidence(row: LibraryLabelRow): LibraryEvidence | 
   for (const field of ['tone', 'pace'] as const) {
     const value = row[field];
     if (typeof value === 'string' && value.trim()) {
-      tryAdd(() => { evidence[field] = clip(value, LIBRARY_ITEM_MAX_CHARS); }, () => { delete evidence[field]; });
+      tryAdd(() => { evidence[field] = clip(sanitizeEvidenceText(value), LIBRARY_ITEM_MAX_CHARS); }, () => { delete evidence[field]; });
     }
   }
   pushItems('strengths', textList(row.strengths), LIBRARY_STRENGTHS_MAX);
@@ -145,9 +151,18 @@ const VETO_GROUPS: { label: string; terms: string[] }[] = [
 
 // 画像行里出现这些限定词，说明不是无条件的一票否决（「少量后宫可以接受」），整行交给模型。
 const PROFILE_QUALIFIER = /不介意|可接受|能接受|可以接受|不排斥|不反感|除非|除外|例外|也行|都行|无所谓|少量|轻度|适度/;
-// 标签侧的否定 / 弱化：词前 3 字、词后 6 字窗口（后窗要容下「倾向不明显」这类中间隔两字的写法）。
-const LABEL_NEGATION_BEFORE = /[无没非不零拒避]/;
-const LABEL_WEAKENING_AFTER = /不明显|较少|很少|极少|偏少|淡|弱|克制|有限/;
+
+// 标签侧的否定 / 弱化 / 限定标记（结构性判据，不再靠固定窗口）：命中词所在子句里只要出现任一标记，
+// 就不把这个子句算命中，整条交给模型判断。这样「没有任何后宫元素」「不含任何后宫情节」「反后宫」
+// 「接受度因人而异」都能被识别为非硬命中，而不是靠逐种写法打补丁。
+// 宁可漏否决，不可误否决：单字标记（如「别」也命中「特别」、「弱」也命中「薄弱」、「反」也命中「反复」）
+// 会顺带放过一些真雷点，这是刻意选的安全方向——误杀（把好书硬删且不可见）代价远大于漏杀（退回模型判断）。
+const LABEL_SUPPRESS =
+  /[无没非不未零拒避反免别少缺略稍淡弱]|偶尔|轻微|克制|有限|接受度|因人而异|视人|看人|可接受|可选|部分|疑似|争议/;
+
+// 子句切分：中英文句读与换行。子句是否定作用域的近似——把否定/弱化限制在同一子句内，
+// 「前期无后宫，中期后宫扩张过快」的后半句仍能命中。
+const CLAUSE_SEP = /[。！？；，、,;!?\r\n]+/;
 
 const HEADING = /^\s*#{1,6}\s*(.*)$/;
 
@@ -158,7 +173,10 @@ export function profileHardDislikes(profile: string): string[] {
   for (const line of profile.split(/\r?\n/)) {
     const heading = line.match(HEADING);
     if (heading) {
-      inSection = heading[1].includes('雷点') && !heading[1].includes('萌点');
+      // 「雷点」是标准写法；「排雷」「不看」是常见变体。多认几种节标题只会多否决候选（安全方向），
+      // 含「萌点」的节一律不认（保守）。
+      const title = heading[1];
+      inSection = (title.includes('雷点') || title.includes('排雷') || title.includes('不看')) && !title.includes('萌点');
       continue;
     }
     if (!inSection || PROFILE_QUALIFIER.test(line)) continue;
@@ -171,20 +189,19 @@ export function profileHardDislikes(profile: string): string[] {
   return [...hits];
 }
 
-// 文本里第一处「干净」命中（前无否定、后无弱化）的位置；没有返回 -1。
-function cleanHitAt(text: string, term: string): number {
-  const lower = text.toLowerCase();
-  for (let at = lower.indexOf(term); at !== -1; at = lower.indexOf(term, at + 1)) {
-    const before = lower.slice(Math.max(0, at - 3), at);
-    const after = lower.slice(at + term.length, at + term.length + 6);
-    if (!LABEL_NEGATION_BEFORE.test(before) && !LABEL_WEAKENING_AFTER.test(after)) return at;
+// 文本里第一个「干净」命中的子句：子句含命中词、且整个子句不含任何否定/弱化/限定标记。
+// 返回该子句原文（供理由片段），没有返回 null。按子句判断而非固定窗口，才能覆盖
+// 「没有任何后宫」「不含任何后宫情节」这类否定词与命中词隔多字的写法。
+function cleanClause(text: string, term: string): string | null {
+  const clauses = text.split(CLAUSE_SEP);
+  const lowerClauses = text.toLowerCase().split(CLAUSE_SEP); // 与原文等长切分，索引对齐
+  for (let i = 0; i < lowerClauses.length; i += 1) {
+    const clause = lowerClauses[i];
+    if (!clause.includes(term)) continue;
+    if (LABEL_SUPPRESS.test(clause)) continue;
+    return clauses[i].trim();
   }
-  return -1;
-}
-
-// 理由里引用的原文片段：从命中词前几个字起截，保证片段里看得到命中词。
-function snippetAround(text: string, at: number): string {
-  return clip(text.slice(Math.max(0, at - 6)), LIBRARY_ITEM_MAX_CHARS);
+  return null;
 }
 
 export interface LibraryVeto {
@@ -201,12 +218,16 @@ export function libraryVeto(dislikes: string[], row: LibraryLabelRow): LibraryVe
     if (!dislikes.includes(group.label)) continue;
     for (const term of group.terms) {
       for (const text of weaknesses) {
-        const at = cleanHitAt(text, term);
-        if (at !== -1) {
-          return { dislike: group.label, reason: `书库标签的雷点风险写着「${snippetAround(text, at)}」，命中你画像里的雷点「${group.label}」` };
+        const clause = cleanClause(text, term);
+        if (clause) {
+          return { dislike: group.label, reason: `书库标签的雷点风险写着「${clip(clause, LIBRARY_ITEM_MAX_CHARS)}」，命中你画像里的雷点「${group.label}」` };
         }
       }
-      const tag = tags.find((text) => cleanHitAt(text, term) !== -1);
+      // sub_tags 是短标签，整值判断：标签里含任一否定/弱化标记（「反后宫」「非后宫」）就不参与否决。
+      const tag = tags.find((text) => {
+        const lower = text.toLowerCase();
+        return lower.includes(term) && !LABEL_SUPPRESS.test(lower);
+      });
       if (tag) {
         return { dislike: group.label, reason: `书库题材标签「${clip(tag, LIBRARY_ITEM_MAX_CHARS)}」命中你画像里的雷点「${group.label}」` };
       }
