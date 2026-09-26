@@ -5,6 +5,7 @@ import { ensureSchema } from '@/lib/db';
 import { createDeadline, raceDeadline } from '@/lib/deadline';
 import { cleanString } from '@/lib/sanitize';
 import { SourcePolicyError } from '@/lib/source-policy';
+import { sourceBookMatches } from '@/lib/source-parser';
 import {
   currentSourceHint, readSourceChapter, resolveSourceBook, saveSourceCatalog, sourceReaderIndex,
   SourceReaderError, SourceRequestContext, surveySourceBooks,
@@ -93,6 +94,13 @@ async function handleGET(req: NextRequest, { params }: { params: Promise<{ resou
       if (hinted) {
         try {
           const catalog = await resolveSourceBook({ title, author }, context, { bookUrl, sourceUrl });
+          // 书身份校验（srcmem41b，审查 §3-1 主会话裁定必修）：prefer 分支此前盲信 bookUrl。源站在 30 天 TTL 内
+          // 把该 detail URL 改指另一本书时，旧行为（无记忆、整池按书名搜）会给对的书，prefer 命中却给错的书。
+          // 命中记忆取到目录后，用 sourceBookMatches（与换源/身份键同一套判等口径）核对书名/作者与请求一致；
+          // 不一致视同首选源失败，静默回落整池搜索并回 hintCleared。只动 prefer 分支，不改无 prefer 的显式点选路径。
+          if (!sourceBookMatches({ title, author }, catalog)) {
+            throw new SourceReaderError('首选源指向的书与请求不一致，已回落整池搜索。', 'SOURCE_NOT_FOUND', 404);
+          }
           await saveSourceCatalog(catalog, signal);
           return response(sourceReaderIndex(catalog));
         } catch (error) {

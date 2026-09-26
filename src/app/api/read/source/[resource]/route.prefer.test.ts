@@ -51,7 +51,8 @@ describe('GET /api/read/source/index — 首选源软提示 prefer', () => {
   afterEach(() => { vi.restoreAllMocks(); });
 
   it('提示源用上了：返回该源目录，不带 hintCleared', async () => {
-    resolveSourceBook.mockResolvedValueOnce({ marker: 'hinted' });
+    // srcmem41b：命中记忆后服务端会用 sourceBookMatches 核对目录与请求同书，故 catalog 必须带上匹配的书名/作者。
+    resolveSourceBook.mockResolvedValueOnce({ marker: 'hinted', title: '剑来', author: '烽火戏诸侯' });
     const res = await request(HINT);
     const body = await res.json();
     expect(res.status).toBe(200);
@@ -60,6 +61,33 @@ describe('GET /api/read/source/index — 首选源软提示 prefer', () => {
     expect(resolveSourceBook).toHaveBeenCalledTimes(1);
     // 提示走 confirm 路径：带 bookUrl + sourceUrl。
     expect(resolveSourceBook.mock.calls[0][2]).toEqual({ bookUrl: 'https://src/book/1', sourceUrl: 'https://src' });
+  });
+
+  it('记忆指向同源另一本书（书名不符）：视同首选源失败，静默回落整池搜索 + hintCleared', async () => {
+    // srcmem41b（审查 §3-1 必修）：源站在 TTL 内把该 bookUrl 改指别的书 —— prefer 命中的目录书名/作者与请求不一致，
+    // 此时应回落整池按书名重搜（会给对的书），而不是盲信返回别的书。
+    resolveSourceBook
+      .mockResolvedValueOnce({ marker: 'wrong-book', title: '大奉打更人', author: '卖报小郎君' })
+      .mockResolvedValueOnce({ marker: 'fallback' });
+    const res = await request(HINT);
+    const body = await res.json();
+    expect(res.status).toBe(200);
+    expect(body.marker).toBe('fallback');
+    expect(body.hintCleared).toBe(true);
+    expect(resolveSourceBook).toHaveBeenCalledTimes(2);
+    // 回落是整池按书名搜：不再带 bookUrl。
+    expect(resolveSourceBook.mock.calls[1][2]).toEqual({});
+  });
+
+  it('记忆指向正确的书（书名/作者相符）：直接用，不回落', async () => {
+    // 作者门也过：请求作者非空时两侧作者需同一套归一后相等。
+    resolveSourceBook.mockResolvedValueOnce({ marker: 'hinted', title: '剑来', author: '烽火戏诸侯' });
+    const res = await request(HINT);
+    const body = await res.json();
+    expect(res.status).toBe(200);
+    expect(body.marker).toBe('hinted');
+    expect(body.hintCleared).toBeUndefined();
+    expect(resolveSourceBook).toHaveBeenCalledTimes(1);
   });
 
   it('提示源不在池内（404）：静默回落整池搜索，回 hintCleared，且回落不带 bookUrl', async () => {
