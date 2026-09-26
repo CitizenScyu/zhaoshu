@@ -127,6 +127,7 @@ async function run() {
     signal: new AbortController().signal,
     maxProbes: candidates.length,
     controlQuery: true, // espfix41：与刷新批次同口径，查询不敏感的垃圾源不种进池
+    keywordFallback: true, // 41-srcfix 改法1：与刷新批次同口径，主关键词 no_result 时换词再搜
   });
 
   // 写库前自查：行内 engine_semantics_version 必须与 rules_hash 的版本前缀同源（共享判据）。

@@ -1,7 +1,7 @@
 import { getSql } from '@/lib/db';
 import { isRecord } from '@/lib/sanitize';
 import { createDeadline, raceDeadline, type RequestDeadline } from '@/lib/deadline';
-import { validateSourceUrl, refreshSupportedHosts, supportedHostList } from '@/lib/source-policy';
+import { validateSourceUrl, refreshSupportedHosts, supportedHostList, upgradeSourceTemplateUrl } from '@/lib/source-policy';
 import {
   builtinFallbackSource, builtinUrlPrefixes, engineHosts, type SupportedSourceTier,
 } from '@/lib/supported-sources';
@@ -467,15 +467,23 @@ async function engineReadingSources(
     JOIN source_admission a ON a.source_url = src.source_url
     WHERE a.compile_ok AND a.search_ok IS TRUE
     ORDER BY src.source_url`, sig));
+  // 41-srcfix 改法2：库键 source_url 仍是上游原样（http:// 源不改键，source_admission 不会出新旧两行），
+  // 运行时身份 url 取升 https 后的形态——搜索基址、目录/正文相对链接、目录缓存 sourceUrl 全部由它派生，
+  // 所以 http 源的每个请求都走 https。只改 scheme，过的仍是同一把 validateSourceUrl 锁。
+  // 同一站点合集里常同时收录 http:// 与 https:// 两份（1522 源里 57 对），升级后 url 撞车会让按 url 反查源
+  // 歧义：撞车时留库键本就是 https 的那份（与改前的池逐条相同），http 副本让位。
+  const native = new Set(rows.map((row) => row.source_url).filter((url) => upgradeSourceTemplateUrl(url) === url));
   return rows
-    .filter((row) => canProbe(row.source_url) && !row.disabled_at && isRecord(row.source)
-      && row.source.enabled !== false && states.get(row.source_url)?.status !== 'failed')
+    .filter((row) => canProbe(upgradeSourceTemplateUrl(row.source_url)) && !row.disabled_at && isRecord(row.source)
+      && row.source.enabled !== false && states.get(row.source_url)?.status !== 'failed'
+      && (upgradeSourceTemplateUrl(row.source_url) === row.source_url
+        || !native.has(upgradeSourceTemplateUrl(row.source_url))))
     .sort((a, b) => probeRank(states, b.source_url) - probeRank(states, a.source_url)
       || tierRank(a.tier) - tierRank(b.tier)
       || checkedAtMs(b.search_checked_at) - checkedAtMs(a.search_checked_at)
       || a.source_url.localeCompare(b.source_url))
     .map((row) => ({
-      url: validateSourceUrl(row.source_url).href,
+      url: validateSourceUrl(upgradeSourceTemplateUrl(row.source_url)).href,
       name: row.name.slice(0, 200) || hostOfUrl(row.source_url),
       searchUrl: typeof row.source.searchUrl === 'string' ? row.source.searchUrl : '',
       rules: row.source,
@@ -1241,6 +1249,8 @@ async function runAdmissionAfterRefresh(
       candidates: [...candidates, ...frozen], declaredHosts, existing, fetchPage: defaultAdmissionTransport, signal,
       // espfix41：开查询不敏感对照搜索，单探最坏 = 主搜索 + 对照搜索（ADMISSION_PROBE_WORST_MS），止损按它预留。
       controlQuery: true,
+      // 41-srcfix 改法1：探测词兜底，换词前按同一 canProbe 预留判预算（单词一次尝试最坏 = ADMISSION_PROBE_WORST_MS）。
+      keywordFallback: true,
       canProbe: () => !signal.aborted && budget.remainingMs > ADMISSION_PROBE_WORST_MS + WRITE_RESERVE_MS,
     });
     // 准入兼容 L4（§2.4）：每轮一行漂移计数（不建历史表；要趋势曲线再上日表，Phase 2）。
