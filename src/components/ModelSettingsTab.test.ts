@@ -8,8 +8,8 @@ import {
   reasoningLabel,
   savedNotice,
 } from './ModelSettingsTab';
-import { REASONING_CONFIRMATION_CODE } from '@/lib/app-settings';
-import type { LlmModelSettings } from '@/lib/app-settings';
+import { REASONING_CONFIRMATION_CODE } from '@/lib/app-settings-shared';
+import type { LlmModelSettings } from '@/lib/app-settings-shared';
 
 // 回归护栏（判据说谎）：页面文案只能转述三态判定。'unknown' 一旦被写成「否」，
 // 保存推理模型时 owner 就会看到「不是推理模型」——那正是 2026-09-17 修掉的说谎。

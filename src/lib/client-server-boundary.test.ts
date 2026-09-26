@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { readFileSync, readdirSync, statSync, existsSync } from 'node:fs';
 import path from 'node:path';
+import { builtinModules } from 'node:module';
 
 // 客户端/服务端模块边界守卫（41-q402build）。
 //
@@ -17,6 +18,22 @@ import path from 'node:path';
 
 const SRC_ROOT = path.resolve(__dirname, '..'); // src/lib/*.test.ts -> src
 const FORBIDDEN = ['lib/db.ts', 'lib/db-quota-guard.ts'].map((p) => path.join(SRC_ROOT, p));
+
+// Node 内置模块名集合（含 `node:` 前缀写法与裸名写法）。
+// 用 node:module 的 builtinModules 判定，别手写清单：漏一个名字就等于留一个放行口。
+// 这里不处理 `node:test` 等带 `node:` 前缀但不在 builtinModules 裸表里的项——见 :crypto 早退。
+const NODE_BUILTIN_NAMES = new Set<string>(builtinModules);
+
+// 判断某个 specifier 是否是 Node 内置模块。
+// - `node:xxx`：直接判前缀（builtinModules 里多数同时有裸名，但 `node:test` 等只有前缀写法）。
+// - `xxx`：裸名，且命中 builtinModules（'fs'、'crypto'、'async_hooks' …）。
+// - `xxx/yyy`：内置子路径（如 'fs/promises'、'stream/web'），取首段判定。
+// 非内置的第三方包（react、next …）一律返回 false。
+function isNodeBuiltin(spec: string): boolean {
+  if (spec.startsWith('node:')) return true; // node:crypto / node:fs / node:test …
+  const head = spec.split('/')[0];
+  return NODE_BUILTIN_NAMES.has(head);
+}
 
 function walk(dir: string): string[] {
   const out: string[] = [];
@@ -83,16 +100,22 @@ describe('客户端组件不得静态触达服务端 db 模块', () => {
     expect(clientRoots.some((f) => f.endsWith(path.join('components', 'ModelSettingsTab.tsx')))).toBe(true);
   });
 
-  it('从所有 use client 模块出发的运行时引入闭包不触达 db.ts / db-quota-guard.ts', () => {
+  it('从所有 use client 模块出发的运行时引入闭包不触达 db.ts / db-quota-guard.ts，且不静态引入任何 Node 内置模块', () => {
     const visited = new Set<string>();
     const queue = [...clientRoots];
     // 记录抵达违规文件的最短路径，失败时便于定位（列出上一跳）。
     const via = new Map<string, string>();
+    // 记录每个客户端闭包内被静态引入的 Node 内置模块 → 引入它的文件（首个命中即可）。
+    const builtinHits = new Map<string, string>();
     while (queue.length) {
       const file = queue.shift()!;
       if (visited.has(file)) continue;
       visited.add(file);
       for (const spec of runtimeSpecs(readFileSync(file, 'utf8'))) {
+        if (isNodeBuiltin(spec)) {
+          if (!builtinHits.has(spec)) builtinHits.set(spec, file);
+          continue;
+        }
         const resolved = resolveSpec(spec, file);
         if (!resolved || visited.has(resolved)) continue;
         if (!via.has(resolved)) via.set(resolved, file);
@@ -102,5 +125,13 @@ describe('客户端组件不得静态触达服务端 db 模块', () => {
     const breached = FORBIDDEN.filter((f) => visited.has(f));
     const detail = breached.map((f) => `${path.relative(SRC_ROOT, f)} <= ${path.relative(SRC_ROOT, via.get(f) ?? '?')}`);
     expect(breached, `客户端闭包触达服务端模块：\n${detail.join('\n')}`).toEqual([]);
+
+    const builtinDetail = [...builtinHits].map(
+      ([spec, file]) => `${spec} <= ${path.relative(SRC_ROOT, file)}`,
+    );
+    expect(
+      builtinDetail,
+      `'use client' 静态闭包内不得出现 Node 内置模块（Turbopack 打包到浏览器会报 "chunking context does not support external modules"）：\n${builtinDetail.join('\n')}`,
+    ).toEqual([]);
   });
 });
