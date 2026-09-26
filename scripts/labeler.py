@@ -83,6 +83,11 @@ DB_MODEL_TIMEOUT_SEC = 5    # 读配置失败必须快速回落，不能拖住�
 # 不做进程级 fail-fast（与「失败不阻断打标」一致），但坏配置不能长期静默。
 AUTO_IMPORT_FAILURE_ALERT = 5
 
+# lblmeta41：提示词版本号。改 SYSTEM_PROMPT（含验证段措辞、字段定义）必须同时升这里，
+# 否则 labels.jsonl 里的 prompt_version 会谎报「同一版提示词产出的分数」，事后无法按版本
+# 分桶回溯——模型链本已按可用性在多厂家间回退，单凭 quality 分更分不出。改动即 v2、v3……。
+PROMPT_VERSION = 'v1'
+
 SYSTEM_PROMPT = (
     "你是网文编目员。阅读给定的小说文本（若干章），输出一个 JSON 对象"
     "（不要 markdown 代码块，不要多余文字），字段："
@@ -2140,40 +2145,49 @@ def _log_model(context: str, message: str) -> None:
 
 def label_book(text: str, api_key: str, models: list[str],
                site_title: str = '', site_author: str = '',
-               max_tokens: dict | None = None) -> tuple[dict, int]:
+               max_tokens: dict | None = None, meta: dict | None = None) -> tuple[dict, int]:
     """50 万字文本 → (标签 dict, 实际调用次数)。
     两段式：每段 ≤25 万字独立过 CF 100s 线（实测 40 万字单段 prefill 必撞 524）。
     第二段带第一段结论合并，可修正只看开头的误判；text_quality 两段各判、按 merge_text_quality 合并。
     site_title / site_author 为本次来源站点书目，附加打标验证段供成分判定。
     models 为后备模型链（如 bohe → grok → ...），逐段内按链逐个尝试。
-    max_tokens = resolve_max_tokens(env) 的结果（按模型的输出上限），None 用默认。"""
+    max_tokens = resolve_max_tokens(env) 的结果（按模型的输出上限），None 用默认。
+    meta（lblmeta41）：可选出参。成功时写入 `label_model` = **产出返回标签那一段**实际响应的
+    模型（多段时是末段；模型链会在多厂家间按可用性回退，事后按这个字段才能把 quality 分归因）。"""
+    used: dict = {}
     verification = _build_verification(site_title, site_author)
     context = f'书目={site_title or "（未知）"}'
     if len(text) <= SEGMENT_CHARS:
-        return _label_once(text, api_key, models, verification,
-                           context=f'{context} 分段=1/1', max_tokens=max_tokens), 1
+        labels = _label_once(text, api_key, models, verification,
+                             context=f'{context} 分段=1/1', max_tokens=max_tokens, used=used)
+        if meta is not None:
+            meta['label_model'] = used.get('label_model', '')
+        return labels, 1
     seg1, seg2 = text[:SEGMENT_CHARS], text[SEGMENT_CHARS:]
     labels1 = _label_once(seg1, api_key, models, verification,
-                          context=f'{context} 分段=1/2', max_tokens=max_tokens)
+                          context=f'{context} 分段=1/2', max_tokens=max_tokens, used=used)
     merged_user = (
         "【前次阅读结论】\n" + json.dumps(labels1, ensure_ascii=False)
         + "\n\n【后续文本】\n" + seg2 + MERGE_PROMPT_SUFFIX
     )
     labels2 = _label_once(merged_user, api_key, models, verification,
-                          context=f'{context} 分段=2/2', max_tokens=max_tokens)
+                          context=f'{context} 分段=2/2', max_tokens=max_tokens, used=used)
     quality, evidence = merge_text_quality([labels1, labels2])
     if quality is not None:
         labels2['text_quality'] = quality
         labels2['text_quality_evidence'] = evidence
+    if meta is not None:
+        meta['label_model'] = used.get('label_model', '')
     return labels2, 2
 
 
 def _label_once(user_content: str, api_key: str, models: list[str],
                 verification: str = '', *, context: str = '',
-                max_tokens: dict | None = None) -> dict:
+                max_tokens: dict | None = None, used: dict | None = None) -> dict:
     """单次 LLM 调用。流式。对链中每个模型最多试 MODEL_RETRY 次，
     某模型连续 MODEL_RETRY 次失败即切换下一个；全部模型耗尽才算本次失败。
-    输出被截断 / 上游空回不在同模型上重试（同预算重试大概率同样结果），直接换下一个模型。"""
+    输出被截断 / 上游空回不在同模型上重试（同预算重试大概率同样结果），直接换下一个模型。
+    used（lblmeta41）：可选出参，成功时写 `label_model` = 本次真正响应的模型名。"""
     if not models:
         raise RuntimeError('模型链为空，无法打标')
     _log_model(context, f'开始分段，模型链从链首 {models[0]} 开始')
@@ -2208,6 +2222,8 @@ def _label_once(user_content: str, api_key: str, models: list[str],
                 parsed, origin = _labels_from_reply(reply, limit)
                 note = '（content 为空，取自 reasoning_content）' if origin == 'reasoning' else ''
                 _log_model(context, f'模型 {model} 尝试 {attempt + 1}/{MODEL_RETRY} 成功{note}')
+                if used is not None:
+                    used['label_model'] = model
                 return parsed
             except (LlmOutputTruncated, LlmEmptyReply) as e:
                 last_err = e
@@ -2623,10 +2639,11 @@ def main() -> int:
                 continue
             # --book 的 title 是详情页路径，不作为可核验的站点书名。
             site_title = '' if args.book else (b.get('title') or '').strip()
+            llm_meta: dict = {}
             labels, calls = label_book(
                 text, env['LLM_API_KEY'], models,
                 site_title=site_title, site_author=b.get('author', ''),
-                max_tokens=max_tokens)
+                max_tokens=max_tokens, meta=llm_meta)
             # 有站点书名时：原字符串匹配 或 JSON 布尔 true 任一通过即入库。
             # --book 保留跳过书名校验；榜单空书名必须拒绝，不能自动放行。
             site_match = labels.get('site_title_match') is True
@@ -2708,6 +2725,13 @@ def main() -> int:
                                if not args.book else 'book15-rank',
                 'url': BOOK15.absolute(b['url']),
                 'chars': chars,
+                # lblmeta41：打标元数据三字段（顶层随记录写进 labels.jsonl）——
+                # label_model：本次真正响应的模型名，取自回退链里成功的那个（见 label_book meta 出参）；
+                # prompt_version：SYSTEM_PROMPT 的版本常量，改提示词必须升版，否则事后无法按版本分桶；
+                # label_source：取文路径，text_engine=引擎源（多源兜底）/ text_book15=book15 站点。
+                'label_model': llm_meta.get('label_model', ''),
+                'prompt_version': PROMPT_VERSION,
+                'label_source': 'text_engine' if is_engine else 'text_book15',
                 'labels': labels,
             }
             if quality_flag:
