@@ -4,7 +4,7 @@ import { createDeadline, raceDeadline, type RequestDeadline } from '@/lib/deadli
 import { validateSourceUrl, refreshSupportedHosts, supportedHostList, upgradeSourceTemplateUrl } from '@/lib/source-policy';
 import { engineSourceUsable } from '@/lib/source-usability';
 import {
-  builtinFallbackSource, builtinUrlPrefixes, engineHosts, type SupportedSourceTier,
+  BUILTIN_SOURCE_HOSTS, builtinFallbackSource, builtinUrlPrefixes, engineHosts, type SupportedSourceTier,
 } from '@/lib/supported-sources';
 import {
   ADMISSION_MAX_REDIRECTS, ADMISSION_MIN_BUDGET_MS, ADMISSION_PROBE_WORST_MS, assertAdmissionVersionConsistent,
@@ -836,13 +836,17 @@ export async function getPoolEngineHosts(signal?: AbortSignal): Promise<string[]
 
 /**
  * 从库合成一份源池产物（鲜读，不走缓存）：engineHosts + builtin 行 + 引擎行 + 探测快照中这些行 URL 的条目。
- * 探测条目按行 URL 过滤是池路径所需的超集——池只按行的 source_url 查 states，canProbe/门判定在消费侧 readMeta 里照做；
+ * 探测快照走池合成同一条 SQL 投影（readPoolProbeMeta），门取「内建 host ∪ 本次 engineHosts」的小写集——是生成后
+ * 消费侧门的超集（refreshSupportedHosts 只会再滤掉不规范 host），所以不会漏条目；且不整列读 collections（≈159 KB）。
+ * 再按行 URL 过滤：池只按行的 source_url 查 states，canProbe/门判定在消费侧 readMeta 里照做；
  * 同一 URL 的重复条目同进同出，readMeta「重复即作废」语义不变，条目保持原序。
  */
 export async function buildShuyuanPoolArtifact(signal: AbortSignal): Promise<PoolArtifact> {
   const s = getSql();
-  const [hosts, meta, builtin, engine] = await Promise.all([
-    engineHosts(signal), storedMeta(s, signal), readBuiltinRows(s, signal), readEngineRows(s, signal),
+  const hosts = await engineHosts(signal);
+  const projectionHosts = [...new Set([...BUILTIN_SOURCE_HOSTS, ...hosts].map((host) => host.trim().toLowerCase()))].sort();
+  const [meta, builtin, engine] = await Promise.all([
+    readPoolProbeMeta(s, projectionHosts, signal), readBuiltinRows(s, signal), readEngineRows(s, signal),
   ]);
   const urls = new Set([...builtin, ...engine].map((row) => row.source_url));
   const list = Array.isArray(meta.collections) ? meta.collections : [];
