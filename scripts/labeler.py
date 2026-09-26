@@ -590,14 +590,33 @@ _WATERMARK_SEP_RE = re.compile(
 # （`他跪在雪地里向过往的行人求打赏，嗓子已经哑了。` 一类）。作者求票是**对读者说话**的口吻，
 # 所以再要求行内出现呼语/作者口吻词（各位/大家/书友/兄弟们/拜托/谢谢/本书/新书/作者…），
 # 或「求…」出现在行首/行尾（呼告的典型位置）。两者都不满足的叙述行保留。
+# 再收窄（lblfu41，lblqualrev2 非阻断B/C + §1② B4）：
+# - 口吻词表去掉正文高频词（作者/读者/更新/上传/感谢）：`作者求月票，读者求订阅，场面热闹。` 是叙述；
+# - 原「行尾是求票词」锚去掉：`那些网络主播正在直播里求打赏` 是叙述，`今天三更，求月票！` 靠作者口吻信号删；
+# - 行内有第三人称（他/她/它）→ 叙述，保留（作者求票时自称我/小X，不写他/她）；
+# - 补单用的「求票」「求下月票」（`求票啦！`、`各位，求票！` 漏删）。「求票」在叙述里常见（车票/选票：
+#   `排队求票的人…`），所以单用的「求票」只在自成一个分句时才算（行首或标点之后、后面是标点/语气词/行尾）。
+# 统一叙述判定（lblfu41 审查后，lblfurev 发现 1/5）：「众人围上来，求票。」「求收藏的人排成长队。」是叙述。
+# - 行首分支：行首的「求X」本身得是一个完整分句（后面是标点/语气词/行尾），`求收藏的人…` 不算；
+# - 非行首分支（句中求票词 / 单用求票分句）：还得有作者口吻的信号
+#   （呼语/口吻词、`投我`、`三更/加更`、`今天` 一类更新口吻），光有「，求票。」不算；
+# - 两个分支都过第三人称闸（「其他/其它」不算第三人称）。
 PLEA_LINE_MAX_LEN = 150
 _PLEA_RE = re.compile(
-    r'求(?:一下|一波|个|张)?(?:推荐票|推荐(?=[、，,。！!～~\s]|$)|收藏(?![家品室馆夹])|月票|订阅|打赏)')
+    r'求(?:一下|一波|下|个|张)?(?:推荐票|推荐(?=[、，,。！!～~\s]|$)|收藏(?![家品室馆夹])|月票|订阅|打赏)')
 _PLEA_QUOTE_RE = re.compile(r'[“”‘’「」『』"]')
 _PLEA_VOICE_RE = re.compile(
-    r'各位|大家|书友|兄弟们|兄弟姐妹|拜托|谢谢|感谢|本书|新书|作者|读者|冲榜|保底|更新|上传|送上|拜求|跪求|求一|求个')
-_PLEA_EDGE_RE = re.compile(
-    r'^(?:求|拜求|跪求|再求|还求)|(?:推荐票|月票|收藏|订阅|打赏)[！!。．…~～、，,\s]*$')
+    r'各位|大家|书友|兄弟们|兄弟姐妹|拜托|谢谢|本书|新书|冲榜|保底|送上|拜求|跪求|求一|求个')
+_PLEA_AUTHOR_RE = re.compile(
+    _PLEA_VOICE_RE.pattern
+    + r'|投我|投给我|给我投|[一二三四五六七八九十两0-9]更|加更|今天|今日|明天|本章|上架|首订')
+_PLEA_CLAUSE_TAIL = r'(?:啦|了|呀|吧|哦|喔|啊)?(?:[！!。．…~～、，,；;\s]|$)'
+_PLEA_START_RE = re.compile(
+    r'^(?:求|拜求|跪求|再求|还求)(?:一下|一波|下|个|张)?'
+    r'(?:推荐票|推荐|收藏|月票|订阅|打赏|票+|支持|点击)' + _PLEA_CLAUSE_TAIL)
+_PLEA_CLAUSE_HEAD = r'(?:^|[，,。．！!、；;：:\s～~…])(?:拜求|跪求|再求|还求|求)(?:一下|一波|下|个|张)?'
+_PLEA_TICKET_RE = re.compile(_PLEA_CLAUSE_HEAD + r'票+' + _PLEA_CLAUSE_TAIL)
+_PLEA_THIRD_PERSON_RE = re.compile(r'(?<![其吉])[他她它]')
 _CHAPTER_END_RE = re.compile(r'^[（(]\s*本章完\s*[）)]$')
 _SEPARATOR_LINE_RE = re.compile(r'^[－\-—=＝_＿*＊~～·]{5,}$')
 
@@ -734,12 +753,14 @@ def _drop_rule(line: str) -> str | None:
     # 4) 上游书源水印行（`〖三七中文www.37zw.com〗百度搜索“37zw”访问` 一类）。
     if len(line) <= INJECT_LINE_MAX_LEN and _is_watermark_line(line):
         return 'inject'
-    # 5) 作者求票/求收藏行：整行、无引号，且是作者口吻（呼语/口吻词，或求告词在行首/行尾）。
-    #    无引号的第三人称叙述（求打赏/求订阅出现在句中）不删（lblqualfix41）。
+    # 5) 作者求票/求收藏行：整行、无引号、无第三人称，且是作者口吻：行首就是一个求告分句，
+    #    或行内有求票词 / 单用「求票」分句且带作者口吻信号。叙述行不删（lblqualfix41/lblfu41）。
     # 6) 章末 `(本章完)` 与纯分隔线（lblqual41）。
-    if len(line) <= PLEA_LINE_MAX_LEN and _PLEA_RE.search(line) \
-            and not _PLEA_QUOTE_RE.search(line) \
-            and (_PLEA_VOICE_RE.search(line) or _PLEA_EDGE_RE.search(line)):
+    if len(line) <= PLEA_LINE_MAX_LEN and not _PLEA_QUOTE_RE.search(line) \
+            and not _PLEA_THIRD_PERSON_RE.search(line) and (
+                _PLEA_START_RE.search(line)
+                or ((_PLEA_RE.search(line) or _PLEA_TICKET_RE.search(line))
+                    and _PLEA_AUTHOR_RE.search(line))):
         return 'plea'
     if _CHAPTER_END_RE.match(line) or _SEPARATOR_LINE_RE.match(line):
         return 'marker'
@@ -828,9 +849,14 @@ _TITLE_NOISE_PATTERNS = (
                r'[^()（）]{0,10}[)）]'),
     re.compile(r'\s*[（(][^()（）]{0,12}(?:盟主|加更|[一二三四五六七八九十0-9]更)[^()（）]{0,6}[)）]'),
     re.compile(r'\s*APP\s*免费', re.I),
-    re.compile(r'\s*(?:更新时间|更新于|更新)?\s*[:：]?\s*\d{4}[-/.年]\d{1,2}[-/.月]\d{1,2}日?'
-               r'(?:\s*\d{1,2}:\d{2}(?::\d{2})?)?\s*$'),
+    re.compile(r'\s*(?:(?:更新时间|更新于|更新)\s*[:：]?|[:：|｜\-—–])\s*'
+               r'\d{4}[-/.年]\d{1,2}[-/.月]\d{1,2}日?(?:\s*\d{1,2}:\d{2}(?::\d{2})?)?\s*$'),
 )
+# 带「更新」前缀或分隔符（`:`/`｜`/`-`，lblfurev 发现 4）的日期尾巴是站点时间戳，连同分隔符一起剥。
+# 只隔空格的日期尾巴：只在剥完还剩章名时才剥。`第100章 2012.12.21` 的日期就是章名本身，
+# 剥掉只剩章号（lblfu41，lbladrev §1 A3）。
+_TITLE_DATE_TAIL_RE = re.compile(
+    r'\s*\d{4}[-/.年]\d{1,2}[-/.月]\d{1,2}日?(?:\s*\d{1,2}:\d{2}(?::\d{2})?)?\s*$')
 
 
 def clean_chapter_title(title: str) -> str:
@@ -838,7 +864,9 @@ def clean_chapter_title(title: str) -> str:
     title = (title or '').strip()
     for pattern in _TITLE_NOISE_PATTERNS:
         title = pattern.sub('', title)
-    return title.strip()
+    title = title.strip()
+    rest = _TITLE_DATE_TAIL_RE.sub('', title).strip()
+    return rest if _CHAPTER_NUMBER_TITLE_RE.sub('', rest).strip() else title
 
 
 # (a) 非正文目录条目：标题不是「第X章/卷…」格式，且命中公告/感言类关键词 → 不抓。
@@ -859,7 +887,13 @@ def is_nonbody_toc_title(title: str) -> bool:
 
 # (d) 付费试读章：标题带 APP免费，或正文 ≤ PREVIEW_CHAPTER_MAX 字且以省略号收尾（截断预览）。
 # 丢弃，不计章数与字数；丢完剩下的正文不足 PREVIEW_MIN_TOTAL → 按试读源拒收（见 prepare_book_text）。
+# 正文判据按整本口径（lblfu41，lbladrev 非阻断1）：单看一章会把 101–200 字、以省略号收尾的正常短章
+# （楔子/过场章）当试读丢掉。试读源的截断预览是成批出现的，所以只有「目录里有 APP免费 章」或
+# 「正文判定的章 ≥ PREVIEW_SOURCE_MIN_CHAPTERS」时才认定是试读源、丢正文判定的章；零星一两章照常保留。
+# 阈值只数 >100 字的正文判定章（lblfurev 发现 2）：≤100 字的章本来就不收录，不能拿它们凑数把
+# 101–200 字的正常短章拖下水。
 PREVIEW_CHAPTER_MAX = 200
+PREVIEW_SOURCE_MIN_CHAPTERS = PREVIEW_MIN_CHAPTERS
 _PREVIEW_TITLE_RE = re.compile(r'APP\s*免费', re.I)
 _PREVIEW_TAIL_RE = re.compile(r'(?:\.\.\.|…)\s*$')
 
@@ -868,11 +902,21 @@ def is_preview_title(title: str) -> bool:
     return bool(_PREVIEW_TITLE_RE.search(title or ''))
 
 
-def is_preview_chapter(title: str, body: str) -> bool:
-    """试读章判定（纯函数）：标题带 APP免费，或正文 ≤200 字且以 ... / … 结尾。"""
+def is_preview_body(body: str) -> bool:
+    """正文形如截断预览（纯函数）：≤200 字且以 ... / … 结尾。单章命中不等于试读章，见 is_preview_source。"""
     body = (body or '').strip()
-    return is_preview_title(title) or (
-        len(body) <= PREVIEW_CHAPTER_MAX and bool(_PREVIEW_TAIL_RE.search(body)))
+    return len(body) <= PREVIEW_CHAPTER_MAX and bool(_PREVIEW_TAIL_RE.search(body))
+
+
+def is_preview_chapter(title: str, body: str) -> bool:
+    """试读章形态判定（纯函数）：标题带 APP免费，或正文形如截断预览。"""
+    return is_preview_title(title) or is_preview_body(body)
+
+
+def is_preview_source(known_previews: int, body_previews: int) -> bool:
+    """整本是否是试读源（纯函数）。known_previews = 目录里 APP免费 章数 + 上游已按试读源丢掉的章数，
+    >0 即认定；body_previews = 正文形如截断预览、且 >100 字（会被收录）的章数，成批（≥5）才认定。"""
+    return known_previews > 0 or body_previews >= PREVIEW_SOURCE_MIN_CHAPTERS
 
 
 def prepare_book_text(text: str, clean: bool,
@@ -880,7 +924,8 @@ def prepare_book_text(text: str, clean: bool,
     """拼接好的整本文本 → (预处理后文本, 字数, 拒收原因或 None, 统计)。纯函数，可离线单测。
 
     输入形态同 fetch_book_text / fetch_book_text_engine 的产出：'【章节标题】\\n正文' 以空行相连。
-    clean=True（引擎正文）时：章节标题过 clean_chapter_title，试读章（is_preview_chapter）整章丢弃，
+    clean=True（引擎正文）时：章节标题过 clean_chapter_title，试读章（标题带 APP免费；认定为试读源时
+    再加正文形如截断预览的章，见 is_preview_source）整章丢弃，
     正文逐行先剥段内水印（_strip_inline_noise）再过 _drop_rule；book15 正文在抓取层已清洗过，传 False。
     preview_dropped = 抓取层已丢弃的试读章数（fetch_book_text_engine 的 stats），与本层丢的合计：
     有试读章被丢、且剩余正文不足 PREVIEW_MIN_TOTAL → 按试读源拒收。
@@ -893,10 +938,14 @@ def prepare_book_text(text: str, clean: bool,
     parts, lengths, chars = [], [], 0
     stats = {'chapters_before': len(chapters), 'clean_lines': 0, 'dup_lines': 0,
              'dup_chars': 0, 'chars_before': 0, 'inline_strips': 0, 'preview_chapters': 0}
+    preview_source = clean and is_preview_source(
+        preview_dropped + sum(1 for head, _ in chapters if head and is_preview_title(head[1:-1])),
+        sum(1 for head, body in chapters
+            if head and is_preview_body(body) and len(body.strip()) > 100))
     for head, body in chapters:
         if clean and head:
             title = head[1:-1]
-            if is_preview_chapter(title, body):
+            if is_preview_title(title) or (preview_source and is_preview_body(body)):
                 stats['preview_chapters'] += 1
                 continue
             head = f'【{clean_chapter_title(title)}】'
@@ -1118,7 +1167,7 @@ def fetch_book_text_engine(engine_cli, book_url: str,
     重试后仍 http_5xx 的章连续 server_error_streak 章 → 同样放弃（5xx 章照旧重试）。
 
     lbladfix41：公告/感言类目录条目（is_nonbody_toc_title）与标题带 APP免费 的试读章抓取前跳过，
-    抓回来是截断预览（is_preview_chapter）的章丢弃；都不计字数，条数记进 stats
+    抓回来形如截断预览（is_preview_body）的章在整本认定为试读源（is_preview_source）时丢弃；都不计字数，条数记进 stats
     （nonbody_chapters / preview_chapters，调用方传 dict 才拿得到）。章节标题过 clean_chapter_title。
 
     N02 二次校验（toc 取回后、逐章 content **之前**）：expect_title/expect_author
@@ -1152,6 +1201,7 @@ def fetch_book_text_engine(engine_cli, book_url: str,
     streak_limit = dict.fromkeys(DETERMINISTIC_ENGINE_ERRORS, giveup_streak)
     streak_limit[SERVER_ERROR_KIND] = server_error_streak
     streak_kind, streak = '', 0     # 连续同一放弃类别（确定性 / 重试后仍 5xx）的章数
+    body_previews = []              # 正文形如截断预览的章：(parts 下标, 字数)；≤100 字未收的记 None
     for ch in chapters:
         if chars >= target_chars:
             break
@@ -1189,12 +1239,19 @@ def fetch_book_text_engine(engine_cli, book_url: str,
                                          '\n\n'.join(parts), chars)
         else:
             streak_kind, streak = '', 0
-        if text and is_preview_chapter(title, text):
-            stats['preview_chapters'] += 1      # 截断预览（≤200 字且以省略号收尾）：丢弃，不计字数
-        elif len(text) > 100:
+        if text and is_preview_body(text):
+            # 形如截断预览（≤200 字且以省略号收尾）：先记下，整本抓完再按 is_preview_source 定丢不丢
+            body_previews.append((len(parts), len(text)) if len(text) > 100 else None)
+        if len(text) > 100:
             parts.append(f'【{clean_chapter_title(title)}】\n{text}')
             chars += len(text)
         time.sleep(CHAPTER_DELAY)
+    if is_preview_source(stats['preview_chapters'], sum(1 for p in body_previews if p)):
+        # 试读源：正文判定的章丢弃，不计字数（≤100 字的本来就不收，这里只补计数）
+        stats['preview_chapters'] += len(body_previews)
+        drop = {i for i, _ in filter(None, body_previews)}
+        chars -= sum(n for _, n in filter(None, body_previews))
+        parts = [p for i, p in enumerate(parts) if i not in drop]
     return '\n\n'.join(parts), chars
 
 
@@ -1386,6 +1443,9 @@ TEXT_QUALITY_NORMAL = '正常'
 TEXT_QUALITY_AD = '含广告注入'
 _TEXT_QUALITY_SEVERITY = {TEXT_QUALITY_NORMAL: 0, TEXT_QUALITY_AD: 1, '大面积重复': 2, '疑似乱码': 3}
 _UNKNOWN_QUALITY_SEVERITY = 4
+# 模型输出缺 text_quality 或给空串（lblfu41 审查后，主会话裁定）：按未知取值处理、走拒收路径，不按正常入库。
+# 只在打标端这样判；导入端 import_one.py 对历史 jsonl 里缺该字段的行照旧放行（回迁重导要兼容）。
+TEXT_QUALITY_MISSING = '（缺失）'
 EVIDENCE_MAX_ITEMS = 3
 EVIDENCE_MAX_CHARS = 50
 
@@ -1437,15 +1497,29 @@ def normalize_evidence(value) -> list[str]:
     return out
 
 
+def normalize_text_quality(value) -> object:
+    """模型给的 text_quality → 归一值（纯函数）：字符串去首尾空白（`正常 ` 算正常，lblfurev 发现 3）；
+    缺失（None）或空串 → TEXT_QUALITY_MISSING；其他类型原样返回（按未知取值处理）。"""
+    if value is None:
+        return TEXT_QUALITY_MISSING
+    if isinstance(value, str):
+        return value.strip() or TEXT_QUALITY_MISSING
+    return value
+
+
 def merge_text_quality(segments: list[dict]) -> tuple[object, list[str]]:
-    """各段标签 → (合并后的 text_quality, 合并后的证据)。没给 text_quality 的段不参与；
-    全都没给 → (None, [])。"""
-    judged = [(seg.get('text_quality'), normalize_evidence(seg.get('text_quality_evidence')))
-              for seg in segments if isinstance(seg, dict) and seg.get('text_quality') is not None]
+    """各段标签 → (合并后的 text_quality, 合并后的证据)。text_quality 先过 normalize_text_quality，
+    某段缺该字段 / 空串按未知取值参与合并；没有任何 dict 段 → (None, [])。"""
+    judged = [(normalize_text_quality(seg.get('text_quality')),
+               normalize_evidence(seg.get('text_quality_evidence')))
+              for seg in segments if isinstance(seg, dict)]
     if not judged:
         return None, []
+    # 未知取值（不在枚举里 / 非字符串）不被「正常」段盖掉（lblfu41，lbladrev 非阻断2）：回复没守枚举约定，
+    # 这一段文本正不正常无从判断，静默改判「正常」会让它直接入库；按最严重走拒收路径，与单段时一致。
+    unknown = any(not isinstance(q, str) or q not in _TEXT_QUALITY_SEVERITY for q, _ in judged)
     others = [ev for q, ev in judged if q != TEXT_QUALITY_NORMAL]
-    if any(q == TEXT_QUALITY_NORMAL for q, _ in judged) and not any(others):
+    if not unknown and any(q == TEXT_QUALITY_NORMAL for q, _ in judged) and not any(others):
         return TEXT_QUALITY_NORMAL, []
     worst = max((q for q, _ in judged),
                 key=lambda q: _TEXT_QUALITY_SEVERITY.get(q, _UNKNOWN_QUALITY_SEVERITY)
@@ -2102,7 +2176,8 @@ def main() -> int:
                 count_failure('书名核验不符')
                 time.sleep(LLM_INTERVAL_SEC)
                 continue
-            quality = labels.get('text_quality')
+            # 归一后写回：`正常 `/` 含广告注入` 按枚举值处理；缺失/空串 → TEXT_QUALITY_MISSING，下面按异常拒收
+            quality = labels['text_quality'] = normalize_text_quality(labels.get('text_quality'))
             evidence = normalize_evidence(labels.get('text_quality_evidence'))
             quality_flag = None
             if quality == TEXT_QUALITY_AD and not args.book and ad_injection_downgradable(labels):
@@ -2110,7 +2185,7 @@ def main() -> int:
                 quality_flag = AD_QUALITY_FLAG
                 print(f'  文本质量: {quality}，书名核验通过且 confidence ≥ {AD_DOWNGRADE_MIN_CONFIDENCE}，'
                       f'降级入库（quality_flag={AD_QUALITY_FLAG}）证据: {evidence or "（无）"}')
-            elif quality and quality != '正常':
+            elif quality != TEXT_QUALITY_NORMAL:
                 print(f'  文本质量异常({quality}),跳过')
                 reject = {
                     'site_title': site_title,

@@ -424,8 +424,11 @@ class TestMergeTextQuality(unittest.TestCase):
 
     def test_both_normal_and_missing(self):
         self.assertEqual(self.m({'text_quality': '正常'}, {'text_quality': '正常'}), ('正常', []))
-        self.assertEqual(self.m({}, {}), (None, []))
-        self.assertEqual(self.m({}, {'text_quality': '含广告注入'}), ('含广告注入', []))
+        # lblfu41 审查后⑥（主会话裁定）：某段缺 text_quality 按未知取值参与合并（不再「不参与」），
+        # 结果走拒收路径；没有任何段 → (None, [])
+        self.assertEqual(self.m({}, {}), (labeler.TEXT_QUALITY_MISSING, []))
+        self.assertEqual(self.m({}, {'text_quality': '含广告注入'}), (labeler.TEXT_QUALITY_MISSING, []))
+        self.assertEqual(self.m(), (None, []))
 
     def test_evidence_normalized(self):
         self.assertEqual(labeler.normalize_evidence('x' * 80), ['x' * 50])
