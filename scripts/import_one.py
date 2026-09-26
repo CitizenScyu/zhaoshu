@@ -95,7 +95,11 @@ BAD_TEXT_QUALITY = ('疑似乱码', '大面积重复', '含广告注入')
 AD_QUALITY_FLAG = 'ad_injection'
 AD_TEXT_QUALITY = '含广告注入'
 FIELD_STRINGS = ('title', 'site_title', 'author', 'author_encoding',
-                 'category', 'status', 'source')
+                 'category', 'status', 'source',
+                 # lblmeta41：打标元数据三字段。**只做类型校验**（非字符串即 failed），
+                 # 不写库——labeled_books 没有对应列，写进去要改表结构；这三项只落在
+                 # labels.jsonl 里供事后按模型/提示词版本分桶回溯（jsonl 本身可重放）。
+                 'label_model', 'prompt_version', 'label_source')
 
 # ---- 分类规范化（genre_map.mjs normalizeGenre 的 python 移植）----
 PRIMARY_GENRES = ('玄幻', '仙侠', '武侠', '都市', '历史', '科幻', '悬疑灵异',

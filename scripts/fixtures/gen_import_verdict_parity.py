@@ -54,6 +54,11 @@ ROWS = [
      rec('T8', 'T8', 'A8', quality=GARBLED)),
     ('unknown author_encoding -> review (same code path both sides)', 'review',
      rec('T9', 'T9', 'A9', author_encoding='v2', guess='T9-guess')),
+    ('lblmeta41 metadata fields accepted as strings', 'ready',
+     rec('T10', 'T10', 'A10', guess='T10-other', label_model='m1',
+         prompt_version='v1', label_source='text_book15')),
+    ('label_source not a string -> failed (both type-check)', 'failed',
+     rec('T11', 'T11', 'A11', label_source=1)),
     ('site_title with surrounding spaces still strips to equal title -> ready', 'ready',
      rec('T12', '  T12  ', 'A12')),
 ]

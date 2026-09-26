@@ -128,7 +128,12 @@ function validateImportRecord(rec) {
   const review = (reason) => ({ status: 'review', reason });
   if (!isRecord(rec) || !isRecord(rec.labels)) return failed('记录或 labels 字段不是对象');
 
-  for (const field of ['title', 'site_title', 'author', 'author_encoding', 'category', 'status', 'source']) {
+  // lblmeta41：label_model / prompt_version / label_source 三个打标元数据字段新加到
+  // labels.jsonl。它们**不写库**（labeled_books 无对应列，加列要改表结构），只做类型校验
+  // ——与 import_one.py 的 FIELD_STRINGS 逐条对齐，别让两边对同一批输入的裁决分叉。
+  // 其余未知字段一律忽略（这里不是白名单，是显式字段的类型校验）。
+  for (const field of ['title', 'site_title', 'author', 'author_encoding', 'category', 'status', 'source',
+    'label_model', 'prompt_version', 'label_source']) {
     if (rec[field] != null && typeof rec[field] !== 'string') return failed(field + ' 必须是字符串');
   }
   const normalizedAuthor = normalizeAuthor(rec.author ?? '', {
