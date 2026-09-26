@@ -6,6 +6,7 @@ import { initializeBusinessSchema, businessSchemaCurrent } from './business-sche
 import type { PersonalWriter } from './personal-write';
 import { completeProfileFeedbackForUserQuery } from './user-data';
 import { quotaAwareFetch } from './db-quota-guard';
+import { libraryLabelsForCandidatesQuery, type LibraryLabelRow } from './library-grounding';
 import { requireUserId, profileForUserQuery, saveProfileForUserQuery, excludedBooksForUserQuery, persistRecommendationsForUserQueries, feedbackForUserQueries, feedbackSnapshotForUserQuery, recentInformativeFeedbackForUserQuery, withdrawnFeedbackBookTitlesForUserQuery, enqueueProfileFeedbackForUserQuery, profileFeedbackQueueForUserQuery, markProfileFeedbackAbsorbedForUserQuery, markProfileFeedbackFailedForUserQuery, markProfileFeedbackAbsorbedUncheckedForUserQuery, profileFeedbackFailCountForUserQuery, maxFeedbackIdForUserQuery, ensureProfileForUserQuery, claimProfileFeedbackForUserQuery, drainableProfileFeedbackUsersQuery, profileFeedbackBackoffMs } from './user-data';
 export { canonicalBookKey } from './book-identity';
 
@@ -180,6 +181,12 @@ export async function saveProfileForUser(
 export async function getExcludedBookTitlesForUser(userId: number): Promise<{ title: string; author: string }[]> {
   requireUserId(userId);
   return await excludedBooksForUserQuery(getSql(), userId) as { title: string; author: string }[];
+}
+
+// 重排接地（41-rerankgnd）：整批候选一次查书库标签，无候选不发查询。
+export async function getLibraryLabelsForCandidates(candidates: { title: string; author: string }[]): Promise<LibraryLabelRow[]> {
+  if (!candidates.length) return [];
+  return await libraryLabelsForCandidatesQuery(getSql(), candidates) as LibraryLabelRow[];
 }
 
 // 返回**实际写入的推荐行数**：调用方（/api/find）必须与本批期望本数比对，

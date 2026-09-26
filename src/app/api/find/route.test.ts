@@ -5,6 +5,7 @@ const mocks = vi.hoisted(() => ({
   ensureSchema: vi.fn(),
   getProfileForUser: vi.fn(),
   getExcludedBookTitlesForUser: vi.fn(),
+  getLibraryLabelsForCandidates: vi.fn(),
   persistRecommendationsForUser: vi.fn(),
   chatRobust: vi.fn(),
   verifyBatch: vi.fn(),
@@ -16,6 +17,7 @@ vi.mock('@/lib/db', async (original) => ({
   ensureSchema: mocks.ensureSchema,
   getProfileForUser: mocks.getProfileForUser,
   getExcludedBookTitlesForUser: mocks.getExcludedBookTitlesForUser,
+  getLibraryLabelsForCandidates: mocks.getLibraryLabelsForCandidates,
   persistRecommendationsForUser: mocks.persistRecommendationsForUser,
 }));
 vi.mock('@/lib/llm', async (importOriginal) => ({
@@ -28,7 +30,9 @@ vi.mock('@/lib/llm', async (importOriginal) => ({
 vi.mock('@/lib/douban', () => ({ verifyBatch: mocks.verifyBatch }));
 vi.mock('@/lib/source-verification', () => ({ supplementSourceEvidence: mocks.supplementSourceEvidence }));
 import { LlmError } from '@/lib/llm';
-import { rerankSystem } from '@/lib/prompts';
+import { createHash } from 'node:crypto';
+import { rerankSystem, rerankUser } from '@/lib/prompts';
+import { LIBRARY_BATCH_MAX_CHARS, LIBRARY_BOOK_MAX_CHARS } from '@/lib/library-grounding';
 import { issueVerifyTicket, ticketSigningKey, VERIFY_TICKET_TTL_MS, type IssueVerifyTicketInput } from '@/lib/verify-ticket';
 import { isRecord } from '@/lib/sanitize';
 import type { VerifiedCandidate } from '@/lib/types';
@@ -108,6 +112,8 @@ describe('POST /api/find output contract', () => {
     mocks.ensureSchema.mockResolvedValue(undefined);
     mocks.getProfileForUser.mockResolvedValue({ seeds: [], content: '画像' });
     mocks.getExcludedBookTitlesForUser.mockResolvedValue([]);
+    // 41-rerankgnd：默认书库无命中（重排接地默认开，但既有用例的提示词因此与接入前逐字节一致）。
+    mocks.getLibraryLabelsForCandidates.mockResolvedValue([]);
     // F09：persist 返回实际写入行数；默认按输入本数成功写入。
     mocks.persistRecommendationsForUser.mockImplementation(async (_userId: number, _query: string, items: unknown[]) => items.length);
     mocks.verifyBatch.mockImplementation(async (candidates: unknown[]) => candidates.map(() => douban));
@@ -743,6 +749,8 @@ describe('POST /api/find rerank 验证票据', () => {
     mocks.ensureSchema.mockResolvedValue(undefined);
     mocks.getProfileForUser.mockResolvedValue({ seeds: [], content: '画像' });
     mocks.getExcludedBookTitlesForUser.mockResolvedValue([]);
+    // 41-rerankgnd：默认书库无命中（重排接地默认开，但既有用例的提示词因此与接入前逐字节一致）。
+    mocks.getLibraryLabelsForCandidates.mockResolvedValue([]);
     // F09 起 /api/find 会比对「实际写入行数 vs 期望本数」，不符即 persisted=false。
     // 故 mock 必须返回条数（与文件顶部 beforeEach 同款），否则合法票据用例会被误判为写库失败。
     mocks.persistRecommendationsForUser.mockImplementation(async (_userId: number, _query: string, items: unknown[]) => items.length);
@@ -841,5 +849,163 @@ describe('POST /api/find rerank 验证票据', () => {
     expect(await res.text()).toMatch(/VERIFY_TICKET_UNAVAILABLE|AUTH_SECURITY_SECRET_REQUIRED/);
     expect(mocks.persistRecommendationsForUser).not.toHaveBeenCalled();
     expect(mocks.chatRobust).not.toHaveBeenCalled();
+  });
+});
+
+// 41-rerankgnd：书库标签接入重排。基线哈希取自接入前（4c94e3c）的 rerankSystem() 与
+// rerankUser('画像','找书','[]','')——开关关闭 / 书库无命中时，送给模型的提示词必须与它逐字节一致。
+const BASELINE_RERANK_SYSTEM_SHA256 = 'd06377bdf2cae82ee334353ae423d81247d3340eaad4d83a7ba24aefe0760d06';
+const BASELINE_RERANK_USER_EMPTY_SHA256 = '90062ff419befc9dbc580b1a1cf77a5ac36de8617d1e5fc06148d540be6b4343';
+const sha256 = (text: string) => createHash('sha256').update(text).digest('hex');
+
+describe('POST /api/find rerank 书库标签接地', () => {
+  const second = { ...candidate, title: '后宫书', author: '作者乙', douban };
+  const labelRow = (title: string, author: string, patch: Record<string, unknown> = {}) => ({
+    title_key: title, author_key: author,
+    weaknesses: ['文笔粗糙'], strengths: ['战斗热血'], tone: '热血', pace: '快', sub_tags: ['东方玄幻'], quality: 6.8,
+    ...patch,
+  });
+  const HAREM_HATER = '## 萌点\n- 群像\n## 雷点（一票否决）\n- 后宫（证据：弃某书）';
+
+  function embeddedCandidates(prompt: string): Record<string, unknown>[] {
+    const embedded = /# 候选书[^\n]*\n\n([\s\S]*?)\n\n请重排输出最终推荐/.exec(prompt)?.[1];
+    return JSON.parse(embedded!) as Record<string, unknown>[];
+  }
+
+  beforeEach(() => {
+    vi.resetAllMocks();
+    vi.stubEnv('APP_OWNER_TOKEN', 'find-test-owner');
+    vi.stubEnv('AUTH_SECURITY_SECRET', TEST_SECRET);
+    mocks.ensureSchema.mockResolvedValue(undefined);
+    mocks.getProfileForUser.mockResolvedValue({ seeds: [], content: '画像' });
+    mocks.getExcludedBookTitlesForUser.mockResolvedValue([]);
+    mocks.getLibraryLabelsForCandidates.mockResolvedValue([]);
+    mocks.persistRecommendationsForUser.mockImplementation(async (_userId: number, _query: string, items: unknown[]) => items.length);
+    mocks.chatRobust.mockResolvedValue(JSON.stringify({ items: [item] }));
+    mocks.resolveModel.mockResolvedValue('claude-opus-5-88');
+  });
+  afterEach(() => { vi.unstubAllEnvs(); vi.restoreAllMocks(); });
+
+  it('基线哈希自检：rerankSystem()/rerankUser 空书单与接入前一致', () => {
+    expect(sha256(rerankSystem())).toBe(BASELINE_RERANK_SYSTEM_SHA256);
+    expect(sha256(rerankSystem({ libraryEvidence: false }))).toBe(BASELINE_RERANK_SYSTEM_SHA256);
+    expect(sha256(rerankUser('画像', '找书', '[]', ''))).toBe(BASELINE_RERANK_USER_EMPTY_SHA256);
+  });
+
+  it.each(['0', 'false', 'off'])('开关关闭（%s）：不查书库，提示词与接入前逐字节一致', async (off) => {
+    vi.stubEnv('RERANK_LIBRARY_GROUNDING', off);
+    mocks.getProfileForUser.mockResolvedValue({ seeds: [], content: HAREM_HATER });
+    // 即便书库里有会被否决的行，关闭时也完全不碰。
+    mocks.getLibraryLabelsForCandidates.mockResolvedValue([labelRow('测试书', '作者甲', { weaknesses: ['后宫过多'] })]);
+    const events = await consumeSSE(await POST(request({ step: 'rerank', query: '找书', verified: [verified] })));
+    expect(mocks.getLibraryLabelsForCandidates).not.toHaveBeenCalled();
+    const [system, user] = mocks.chatRobust.mock.calls[0] as string[];
+    expect(sha256(system)).toBe(BASELINE_RERANK_SYSTEM_SHA256);
+    // 投影 = 接入前 rerankInput 的五个键（douban 是票据里 sanitizeVerified 规整后的形状）。
+    const sanitizedDouban = { status: 'verified', found: true, doubanId: '123', rating: 8, ratingCount: null };
+    expect(user).toBe(rerankUser(HAREM_HATER, '找书', JSON.stringify([
+      { title: verified.title, author: verified.author, category: verified.category, wordCount: verified.wordCount, douban: sanitizedDouban },
+    ]), ''));
+    const result = lastEvent<Record<string, unknown>>(events, 'result');
+    expect(Object.keys(result)).toEqual(['type', 'step', 'items', 'persisted']);
+  });
+
+  it('开关开、书库未命中：一次批量查询，提示词仍与接入前逐字节一致', async () => {
+    await consumeSSE(await POST(request({ step: 'rerank', query: '找书', verified: [verified, second] })));
+    expect(mocks.getLibraryLabelsForCandidates).toHaveBeenCalledTimes(1);
+    expect(mocks.getLibraryLabelsForCandidates.mock.calls[0][0]).toHaveLength(2);
+    const [system, user] = mocks.chatRobust.mock.calls[0] as string[];
+    expect(sha256(system)).toBe(BASELINE_RERANK_SYSTEM_SHA256);
+    expect(user).not.toContain('library');
+    expect(embeddedCandidates(user).map((c) => Object.keys(c))).toEqual([
+      ['title', 'author', 'category', 'wordCount', 'douban'], ['title', 'author', 'category', 'wordCount', 'douban'],
+    ]);
+  });
+
+  it('命中书库：只有命中的那本多出 library 字段，系统提示词声明第六类字段与证明力边界', async () => {
+    mocks.getLibraryLabelsForCandidates.mockResolvedValue([labelRow('测试书', '作者甲')]);
+    await consumeSSE(await POST(request({ step: 'rerank', query: '找书', verified: [verified, second] })));
+    const [system, user] = mocks.chatRobust.mock.calls[0] as string[];
+    const [hit, miss] = embeddedCandidates(user);
+    expect(Object.keys(hit)).toEqual(['title', 'author', 'category', 'wordCount', 'douban', 'library']);
+    expect(hit.library).toEqual({ quality: 6.8, weaknesses: ['文笔粗糙'], tone: '热血', pace: '快', strengths: ['战斗热血'] });
+    expect(miss).not.toHaveProperty('library');
+    expect(sha256(system)).not.toBe(BASELINE_RERANK_SYSTEM_SHA256);
+    expect(system).toBe(rerankSystem({ libraryEvidence: true }));
+    expect(system).toContain('六类字段');
+    expect(system).toContain('13. 书库打标证据（library）');
+    expect(system).toContain('不证明完结');
+    expect(system).not.toContain('只有五类字段');
+  });
+
+  it('整批书库证据受上限约束（12 本长标签）', async () => {
+    const long = (c: string) => c.repeat(80);
+    const batch = Array.from({ length: 12 }, (_, i) => ({ ...verified, title: `书${i}` }));
+    mocks.getLibraryLabelsForCandidates.mockResolvedValue(batch.map((b) => labelRow(b.title, b.author, {
+      weaknesses: [long('雷'), long('坑'), long('烂')], strengths: [long('爽'), long('甜')], tone: long('调'), pace: long('速'),
+    })));
+    mocks.chatRobust.mockResolvedValue(JSON.stringify({ items: [{ ...item, title: '书0' }] }));
+    await consumeSSE(await POST(request({ step: 'rerank', query: '找书', verified: batch })));
+    const libraries = embeddedCandidates(mocks.chatRobust.mock.calls[0][1] as string)
+      .map((c) => c.library).filter(Boolean);
+    expect(libraries.length).toBeGreaterThan(0);
+    for (const library of libraries) expect(JSON.stringify(library).length).toBeLessThanOrEqual(LIBRARY_BOOK_MAX_CHARS);
+    expect(libraries.reduce((sum: number, l) => sum + JSON.stringify(l).length, 0)).toBeLessThanOrEqual(LIBRARY_BATCH_MAX_CHARS);
+  });
+
+  it('确定性否决（正例）：画像雷点「后宫」× weaknesses 明确含后宫 → 不送模型、不入推荐，结果带理由', async () => {
+    mocks.getProfileForUser.mockResolvedValue({ seeds: [], content: HAREM_HATER });
+    mocks.getLibraryLabelsForCandidates.mockResolvedValue([
+      // 子句判据：「后宫过多」子句干净即否决，同条另一子句含弱化词（薄弱）不影响。
+      labelRow('后宫书', '作者乙', { weaknesses: ['后宫过多，逻辑薄弱'] }),
+      labelRow('测试书', '作者甲'),
+    ]);
+    // 模型若把被否决的书编回来，也不得回流进结果。
+    mocks.chatRobust.mockResolvedValue(JSON.stringify({ items: [item, { ...item, title: '后宫书', author: '作者乙' }] }));
+    const events = await consumeSSE(await POST(request({ step: 'rerank', query: '找书', verified: [verified, second] })));
+    const user = mocks.chatRobust.mock.calls[0][1] as string;
+    expect(embeddedCandidates(user).map((c) => c.title)).toEqual(['测试书']);
+    const result = lastEvent<{ items: { title: string }[]; vetoed: { title: string; author: string; reason: string }[] }>(events, 'result');
+    expect(result.items.map((i) => i.title)).toEqual(['测试书']);
+    expect(result.vetoed).toEqual([{ title: '后宫书', author: '作者乙', reason: expect.stringContaining('后宫过多') }]);
+    expect(result.vetoed[0].reason).toContain('雷点「后宫」');
+    expect(mocks.persistRecommendationsForUser.mock.calls[0][2].map((i: { title: string }) => i.title)).toEqual(['测试书']);
+  });
+
+  it.each([
+    ['萌点里的后宫不算雷点', '## 萌点\n- 后宫爽文\n## 雷点\n- 降智', { weaknesses: ['后宫过多'] }],
+    ['限定语气交给模型', '## 雷点\n- 后宫少量可以接受', { weaknesses: ['后宫过多'] }],
+    ['标签是否定语境', HAREM_HATER, { weaknesses: ['无后宫，感情线薄弱'] }],
+    ['标签是弱化语境', HAREM_HATER, { weaknesses: ['后宫倾向不明显'] }],
+    ['只在 strengths 里出现', HAREM_HATER, { weaknesses: ['文笔粗糙'], strengths: ['后宫互动有趣'] }],
+  ])('确定性否决（反例：%s）：不否决，候选带 library 交给模型', async (_name, profile, patch) => {
+    mocks.getProfileForUser.mockResolvedValue({ seeds: [], content: profile });
+    mocks.getLibraryLabelsForCandidates.mockResolvedValue([labelRow('测试书', '作者甲', patch)]);
+    const events = await consumeSSE(await POST(request({ step: 'rerank', query: '找书', verified: [verified] })));
+    const [candidateSent] = embeddedCandidates(mocks.chatRobust.mock.calls[0][1] as string);
+    expect(candidateSent.title).toBe('测试书');
+    expect(candidateSent).toHaveProperty('library');
+    expect(lastEvent<Record<string, unknown>>(events, 'result')).not.toHaveProperty('vetoed');
+  });
+
+  it('全部候选被确定性否决：不调模型，走合法零结果并说明原因', async () => {
+    mocks.getProfileForUser.mockResolvedValue({ seeds: [], content: HAREM_HATER });
+    mocks.getLibraryLabelsForCandidates.mockResolvedValue([labelRow('测试书', '作者甲', { sub_tags: ['都市', '后宫'] })]);
+    const events = await consumeSSE(await POST(request({ step: 'rerank', query: '找书', verified: [verified] })));
+    expect(mocks.chatRobust).not.toHaveBeenCalled();
+    expect(mocks.persistRecommendationsForUser).not.toHaveBeenCalled();
+    const result = lastEvent<{ items: unknown[]; zeroReason: string; vetoed: unknown[] }>(events, 'result');
+    expect(result.items).toEqual([]);
+    expect(result.zeroReason).toContain('书库标签确定性判定');
+    expect(result.vetoed).toEqual([{ title: '测试书', author: '作者甲', reason: expect.stringContaining('题材标签「后宫」') }]);
+  });
+
+  it('查书库失败：记告警后按未命中继续，提示词与接入前一致', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    mocks.getLibraryLabelsForCandidates.mockRejectedValue(new Error('library offline'));
+    const events = await consumeSSE(await POST(request({ step: 'rerank', query: '找书', verified: [verified] })));
+    expect(lastEvent<{ items: unknown[] }>(events, 'result').items).toHaveLength(1);
+    expect(sha256(mocks.chatRobust.mock.calls[0][0] as string)).toBe(BASELINE_RERANK_SYSTEM_SHA256);
+    expect(warn).toHaveBeenCalledWith('[find] library grounding skipped', { name: 'Error', message: 'library offline' });
   });
 });
