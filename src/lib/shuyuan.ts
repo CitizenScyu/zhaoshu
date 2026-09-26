@@ -225,7 +225,8 @@ function traversalOf(eligible: readonly ReadingSource[]): ReadingSource[] {
 }
 
 /**
- * 按全序逐条取，引擎源同 hostname 只留第一份，取满 limit 即停；builtin 不参与去重。traversalOf 与 fanoutOf 共用。
+ * 按全序逐条取，引擎源同站（siteKeyOfUrl：apex ↔ www 算一个站）只留第一份，取满 limit 即停；builtin 不参与去重。
+ * traversalOf 与 fanoutOf 共用。
  */
 function firstPerHost(sources: readonly ReadingSource[], limit: number): ReadingSource[] {
   const seenHosts = new Set<string>();
@@ -233,7 +234,7 @@ function firstPerHost(sources: readonly ReadingSource[], limit: number): Reading
   for (const source of sources) {
     if (out.length >= limit) break;
     if (source.tier !== 'builtin') {
-      const host = hostOfUrl(source.url);
+      const host = siteKeyOfUrl(source.url);
       if (seenHosts.has(host)) continue;
       seenHosts.add(host);
     }
@@ -523,6 +524,13 @@ async function engineReadingSources(
 
 function hostOfUrl(url: string): string {
   try { return new URL(url).hostname; } catch { return ''; }
+}
+
+// 同站键：与 source-host-health 的 hostKey 同一口径（apex ↔ www 是一个站，book15.net ↔ www.book15.net 键同为 apex），
+// 推广到所有引擎源 host——源合集里同站常以 apex 与 www 两份规则并存。
+function siteKeyOfUrl(url: string): string {
+  const host = hostOfUrl(url).toLowerCase();
+  return host.startsWith('www.') ? host.slice(4) : host;
 }
 
 /** 引擎档候选（设计 §5.2 的新增导出；M2-3 的放量/排序在此扩面）。 */

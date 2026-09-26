@@ -1191,6 +1191,26 @@ describe('refreshShuyuan atomic refresh', () => {
       ]);
     });
 
+    // 41-swq 审查 §2.1：apex 与 www 是同一个站（与 source-host-health hostKey 同口径），去重不能让两份各占一格。
+    it('41-swq 扇出同站去重：apex ↔ www 算同站，只留全序最优一份', async () => {
+      const rows = [
+        engineRowAt('www.dup.example', { search_checked_at: '2026-09-24T00:00:00Z' }),
+        engineRowAt('dup.example', { search_checked_at: '2026-09-23T00:00:00Z' }),
+        engineRowAt('y.example', { search_checked_at: '2026-09-19T00:00:00Z' }),
+        engineRowAt('www.z.example', { search_checked_at: '2026-09-18T00:00:00Z' }),
+      ];
+      const hosts = ['www.dup.example', 'dup.example', 'y.example', 'www.z.example'];
+      execute.mockResolvedValueOnce(hosts.map((host) => ({ host })))
+        .mockResolvedValueOnce([{ collections: [] }]).mockResolvedValueOnce([]).mockResolvedValueOnce(rows);
+      vi.stubEnv('READING_ENGINE_SOURCES', '1');
+      vi.stubEnv('READING_POOL_LIMIT', '2');
+      vi.stubEnv('SOURCE_FANOUT_LIMIT', '24');
+      // 改前：www.dup.example 与 dup.example 各占一格。
+      expect((await getFanoutPool(new AbortController().signal)).map((source) => source.url)).toEqual([
+        'https://book15.net/', 'https://www.dup.example/', 'https://y.example/', 'https://www.z.example/',
+      ]);
+    });
+
     // 41-swq：sfacg 规则的 searchUrl 指向 host 门外的 m.sfacg.com，准入却记 search_ok；去重腾出名额后补进扇出、每次
     // probe 必 compile_failed。判据与 probe 同一处（source-usability），进池前筛掉。
     it('41-swq 运行时用不了的引擎源（门外/动态搜索模板、必需字段缺失）进池前筛掉：不占扇出/取书池/窗口名额，同站后面能用的那份照样选上', async () => {
