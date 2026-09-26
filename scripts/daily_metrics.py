@@ -96,11 +96,80 @@ NGINX_LINE_RE = re.compile(
 # ======================================================================
 # 只读 SQL 客户端（Neon HTTP SQL 通道）
 # ======================================================================
+# ---- 只读守卫（两道，结构性优先）----
+#
+# 第一道：**登记白名单**。脚本永远只发自己手写的常量 SQL，不接受任何外部输入。
+# 把全部语句集中放在这里，query() 按**去注释+归一空白后**的文本精确匹配放行，
+# 未登记一律拒。这是最硬的一道：新增/改动查询必须同时改这里，漏登记就会当场抛，
+# 而不是静默发出去。
+_RAW_STATEMENTS = (
+    'SELECT count(*) AS n FROM labeled_books',
+    "SELECT count(*) AS n FROM labeled_books WHERE labeled_at > now() - interval '24 hours'",
+    "SELECT count(*) AS n FROM labeled_books WHERE labeled_at > now() - interval '48 hours' "
+    "AND labeled_at <= now() - interval '24 hours'",
+    'SELECT count(*) AS n FROM source_admission WHERE compile_ok AND search_ok',
+    'SELECT count(*) AS n FROM source_admission WHERE compile_ok',
+    'SELECT host, count(*) AS n FROM source_admission WHERE compile_ok AND search_ok '
+    'GROUP BY host ORDER BY n DESC',
+    'SELECT pg_database_size(current_database()) AS n',
+    'SELECT datname, tup_returned, tup_fetched, xact_commit, blks_read, blks_hit '
+    'FROM pg_stat_database WHERE datname = current_database()',
+    "SELECT count(*) AS n FROM recommendations WHERE created_at > now() - interval '24 hours'",
+    "SELECT count(*) AS n FROM recommendations WHERE status <> 'new'",
+    "SELECT count(*) AS n FROM feedback WHERE created_at > now() - interval '24 hours'",
+    "SELECT count(*) AS n FROM download_tasks WHERE status = 'done' "
+    "AND updated_at > now() - interval '24 hours'",
+    "SELECT count(*) AS n FROM download_tasks WHERE status = 'failed' "
+    "AND updated_at > now() - interval '24 hours'",
+    "SELECT count(*) AS n FROM download_tasks WHERE status = 'pending'",
+)
+
+
+def _normalize_sql(text):
+    """去注释（行 + 块，非嵌套）、折叠空白、去首尾空白与一个尾分号。
+
+    与 _guard 同款归一——白名单登记与 query() 匹配必须用同一把尺子，
+    否则空白/换行差异会造成「登记了却匹配不上」的假阴性。"""
+    stripped = re.sub(r'--[^\n]*', ' ', text)
+    stripped = re.sub(r'/\*.*?\*/', ' ', stripped, flags=re.S)
+    return re.sub(r'\s+', ' ', stripped).strip().rstrip(';').strip()
+
+
+# 登记集：归一后的文本精确匹配放行（见 _RAW_STATEMENTS）。
+_ALLOWED_SQL = frozenset(_normalize_sql(s) for s in _RAW_STATEMENTS)
+
+# 第二道：关键字/函数黑名单（去注释后按**整词**匹配）。
+# 为什么还要这一道：白名单靠「新增查询必须同步登记」，而黑名单是**反向**防线——
+# 万一有人把某条登记 SQL 改成了写语句（改登记的同时漏看内容），黑名单仍能拦住。
+# 两者正交，一起挡。黑名单只求宁枉勿纵（安全侧），误伤字符串里的关键字可接受。
+_FORBIDDEN_WORDS = (
+    'insert', 'update', 'delete', 'merge', 'truncate', 'drop', 'alter',
+    'create', 'grant', 'revoke', 'copy', 'call', 'do', 'lock', 'into',
+    'vacuum', 'analyze', 'reindex', 'refresh',
+)
+_FORBIDDEN_PHRASES = (
+    'for update', 'for share', 'for no key update', 'for key share',
+)
+_FORBIDDEN_FUNCS = (
+    'pg_terminate_backend', 'pg_cancel_backend', 'nextval', 'setval',
+    'lo_import', 'lo_export', 'lo_unlink', 'lo_create', 'pg_read_file',
+    'pg_read_binary_file', 'pg_ls_dir', 'set_config', 'pg_advisory_lock',
+    'pg_advisory_lock_shared', 'pg_advisory_xact_lock',
+    'pg_advisory_xact_lock_shared', 'pg_try_advisory_lock', 'dblink',
+)
+
+_WORD_BOUNDARY = r'\b'
+_FORBIDDEN_WORD_RE = re.compile(r'\b(?:' + '|'.join(_FORBIDDEN_WORDS) + r')\b')
+_FORBIDDEN_FUNC_RE = re.compile(r'\b(?:' + '|'.join(
+    re.escape(name) for name in _FORBIDDEN_FUNCS) + r')')
+
+
 class ReadOnlySql:
     """沿 Neon HTTP SQL 协议的只读客户端。
 
-    `query()` 只放行 SELECT/WITH，禁多语句——fail-closed：哪怕本脚本将来被改错，
-    也发不出 UPDATE/DELETE。写语句进不了这条路径。"""
+    只读保证（两道守卫，见上）：query() 只放行**登记白名单**里的常量 SQL
+    （归一后精确匹配），未登记一律拒；再叠一层整词黑名单（写动词 / 行锁 / 副作用
+    函数）。**结构性**优先：白名单约束「能发什么」，不靠语法启发式猜「什么是写」。"""
 
     def __init__(self, database_url, timeout=SQL_TIMEOUT_SEC):
         parsed = urllib.parse.urlsplit(database_url)
@@ -112,14 +181,18 @@ class ReadOnlySql:
 
     @staticmethod
     def _guard(query):
-        """去掉行注释后判定：必须单语句、以 SELECT/WITH 开头。"""
-        stripped = re.sub(r'--[^\n]*', ' ', query)
-        stripped = re.sub(r'/\*.*?\*/', ' ', stripped, flags=re.S)
-        body = stripped.strip().rstrip(';').strip()
+        """两道守卫：登记白名单（精确）→ 整词黑名单（兜底）。
+
+        返回归一后的语句文本；不通过抛 ValueError。"""
+        body = _normalize_sql(query)
         if ';' in body:
             raise ValueError('只读通道禁止多语句')
-        if not body.lower().startswith(('select', 'with')):
-            raise ValueError('只读通道只放行 SELECT/WITH')
+        if body not in _ALLOWED_SQL:
+            raise ValueError('只读通道只放行已登记的常量语句')
+        if _FORBIDDEN_WORD_RE.search(body):
+            raise ValueError('只读通道拒绝写动词/行锁关键字')
+        if _FORBIDDEN_FUNC_RE.search(body):
+            raise ValueError('只读通道拒绝副作用函数')
         return body
 
     def query(self, sql, params=None):
@@ -221,15 +294,23 @@ def parse_nginx_logs(paths, now=None, window_hours=WINDOW_HOURS,
     """解析 nginx combined 日志（支持 .gz）→ 近 window 小时请求数与字节合计。
 
     only_path：只统计该请求路径（如 '/sql'），None 表示全部。
+
+    返回 {'requests', 'bytes', 'available', 'opened'}：
+      available=False 表示**传入的日志路径一个都打不开**——此时 bytes/requests
+      是 null 而非 0。区分「今天真的没流量（0）」与「没量到（日志缺失/路径配错）」，
+      后者把 shim 下线伪装成 0 字节，与本脚本「算不了写 null+原因」的判据相反。
+      部分文件缺失仍按实到的部分统计（available=True）。
     """
     now = now or datetime.now(timezone.utc)
     cutoff = now - timedelta(hours=window_hours)
     total_bytes = 0
     requests = 0
+    opened = 0
     for path in paths:
         opener = gzip.open if str(path).endswith('.gz') else open
         try:
             with opener(path, 'rt', encoding='utf-8', errors='replace') as handle:
+                opened += 1
                 for line in handle:
                     match = NGINX_LINE_RE.match(line)
                     if not match:
@@ -249,7 +330,10 @@ def parse_nginx_logs(paths, now=None, window_hours=WINDOW_HOURS,
                         total_bytes += int(size)
         except OSError:
             continue
-    return {'requests': requests, 'bytes': total_bytes}
+    if opened == 0:
+        return {'requests': None, 'bytes': None, 'available': False, 'opened': 0}
+    return {'requests': requests, 'bytes': total_bytes,
+            'available': True, 'opened': opened}
 
 
 def classify_review_backlog(lines, imported_urls, validate_record):
@@ -317,13 +401,30 @@ def read_imported_urls(path):
 # ======================================================================
 # 指标采集（连库 + 读文件）
 # ======================================================================
+# 报错脱敏：错误原文只进 JSON 的 error 字段（渲染层显示「—（查询失败）」），
+# 且先截断到 200 字、去掉可能出现的连接串/host。DB 驱动与 shim 的报错通常不含
+# 连接串（连接串在请求头里，不在 SQL 里），但这条不假设——按最坏情况清一遍。
+_CONN_STRING_RE = re.compile(r'(?:postgres(?:ql)?|https?)://\S+', re.I)
+_HOSTPORT_RE = re.compile(r'\b(?:[a-z0-9-]+\.)+[a-z]{2,}(?::\d{2,5})?\b', re.I)
+_IPPORT_RE = re.compile(r'\b\d{1,3}(?:\.\d{1,3}){3}(?::\d{2,5})?\b')
+
+
+def redact_error(error, limit=200):
+    """把异常/字符串清成可安全进产物的短文本：去连接串、去 host、截断。"""
+    text = str(error)
+    text = _CONN_STRING_RE.sub('<conn>', text)
+    text = _IPPORT_RE.sub('<host>', text)
+    text = _HOSTPORT_RE.sub('<host>', text)
+    return text[:limit]
+
+
 def _count(sql, query, params=None):
-    """跑 COUNT 查询，失败记 None（不抛）。"""
+    """跑 COUNT 查询，失败记 {'error': 脱敏后原因}（不抛）。"""
     try:
         value = sql.scalar(query, params)
         return int(value) if value is not None else None
     except Exception as error:                  # noqa: BLE001 - 采集层吞异常记 null
-        return {'error': str(error)[:200]}
+        return {'error': redact_error(error)}
 
 
 def collect_metrics(sql, labeler_dir, nginx_logs, now=None):
@@ -347,7 +448,7 @@ def collect_metrics(sql, labeler_dir, nginx_logs, now=None):
         library['imported_marked'] = len(imported)
         validate_record, import_error = _load_validate_record(labeler)
         if validate_record is None:
-            library['review_backlog'] = {'error': import_error}
+            library['review_backlog'] = {'error': redact_error(import_error)}
         else:
             backlog = classify_review_backlog(lines, imported, validate_record)
             library['review_backlog_unimported'] = backlog['unimported']
@@ -355,7 +456,7 @@ def collect_metrics(sql, labeler_dir, nginx_logs, now=None):
             library['review_backlog_by_reason'] = backlog['review_reasons']
             library['backlog_other'] = backlog['other']
     except OSError as error:
-        library['review_backlog'] = {'error': f'读 labels.jsonl 失败: {error}'}
+        library['review_backlog'] = {'error': redact_error(f'读 labels.jsonl 失败: {error}')}
     metrics['library'] = library
 
     # ---- 2. 打标效率 ----
@@ -373,7 +474,7 @@ def collect_metrics(sql, labeler_dir, nginx_logs, now=None):
         labeling['chars_sample_n_24h'] = len(chars)
         labeling['skip_reasons_top5'] = gate['skips'].most_common(5)
     except OSError as error:
-        labeling['error'] = f'读 gate.log 失败: {error}'
+        labeling['error'] = redact_error(f'读 gate.log 失败: {error}')
     # token：gate.log 不记 token；llm_usage 表不含打标 phase（见报告 §1.1/§1.2）
     labeling['avg_llm_tokens_per_book_24h'] = None
     labeling['avg_llm_tokens_note'] = '待打标侧记 token 后再算（gate.log 无 token；llm_usage 无打标 phase）'
@@ -396,7 +497,7 @@ def collect_metrics(sql, labeler_dir, nginx_logs, now=None):
                                           if total and top else None)
         sources['pool_max_host_share_note'] = '口径=源池内 host 占比，非搜索/阅读命中占比'
     except Exception as error:                  # noqa: BLE001
-        sources['pool_host_top5'] = {'error': str(error)[:200]}
+        sources['pool_host_top5'] = {'error': redact_error(error)}
     # 命中占比：无按源命中日志（见报告 §1.5）
     sources['hit_max_host_share'] = None
     sources['hit_max_host_share_note'] = '无按源搜索/阅读命中日志，无法算'
@@ -416,10 +517,13 @@ def collect_metrics(sql, labeler_dir, nginx_logs, now=None):
         database['pg_stat'] = stats[0] if stats else None
         database['pg_stat_note'] = '累计口径（stats_reset 为空），非 24h 窗口'
     except Exception as error:                  # noqa: BLE001
-        database['pg_stat'] = {'error': str(error)[:200]}
+        database['pg_stat'] = {'error': redact_error(error)}
     transfer = parse_nginx_logs(nginx_logs, now=now, only_path='/sql')
     database['transfer_24h_bytes'] = transfer['bytes']
     database['transfer_24h_requests'] = transfer['requests']
+    database['transfer_available'] = transfer['available']
+    if not transfer['available']:
+        database['transfer_note'] = '日志文件一个都打不开（缺失/权限/路径配错），非「今日零流量」'
     database['transfer_method'] = 'nginx shim access log 响应体字节合计（POST /sql）'
     metrics['database'] = database
 
@@ -465,7 +569,19 @@ def _load_validate_record(labeler_dir):
 # ======================================================================
 # 渲染（纯函数，离线可测）
 # ======================================================================
+_FAILED_MARK = '—（查询失败）'
+# 「没量到」的展示（日志不可读），与「查到 0」区分开。
+_NO_DATA_MARK = '—（无数据：日志不可读）'
+
+
+def _is_error(value):
+    """采集失败标记：{'error': …} dict（DB 报错原文只进 JSON，不进 markdown）。"""
+    return isinstance(value, dict) and 'error' in value
+
+
 def _fmt_num(value):
+    if _is_error(value):
+        return _FAILED_MARK
     if isinstance(value, int):
         return f'{value:,}'
     if isinstance(value, float):
@@ -476,6 +592,8 @@ def _fmt_num(value):
 
 
 def _fmt_bytes(value):
+    if _is_error(value):
+        return _FAILED_MARK
     if not isinstance(value, (int, float)) or value is None:
         return '—（null）'
     size = float(value)
@@ -571,11 +689,19 @@ def render_markdown(metrics, previous=None, day=None):
     lines += ['## 4. 数据库', '', '| 指标 | 值 | 环比昨日 |', '|---|---|---|']
     lines.append(row('库大小', _get(metrics, 'database', 'size_bytes'),
                      _get(previous, 'database', 'size_bytes'), fmt=_fmt_bytes))
-    lines.append(row('近24h 传输量（/sql 响应体）',
-                     _get(metrics, 'database', 'transfer_24h_bytes'),
-                     _get(previous, 'database', 'transfer_24h_bytes'), fmt=_fmt_bytes))
-    lines.append(f'| 近24h /sql 请求数 | {_fmt_num(_get(metrics, "database", "transfer_24h_requests"))} |'
-                 f'{_get(metrics, "database", "transfer_method") or ""} |')
+    transfer_available = _get(metrics, 'database', 'transfer_available')
+    if transfer_available is False:
+        # 日志一个都打不开：显式区分「没量到」与「今日零流量」
+        note = _get(metrics, 'database', 'transfer_note') or '日志不可读'
+        lines.append(f'| 近24h 传输量（/sql 响应体） | {_NO_DATA_MARK} |{note} |')
+        lines.append(f'| 近24h /sql 请求数 | {_NO_DATA_MARK} |— |')
+    else:
+        lines.append(row('近24h 传输量（/sql 响应体）',
+                         _get(metrics, 'database', 'transfer_24h_bytes'),
+                         _get(previous, 'database', 'transfer_24h_bytes'), fmt=_fmt_bytes))
+        lines.append(f'| 近24h /sql 请求数 | '
+                     f'{_fmt_num(_get(metrics, "database", "transfer_24h_requests"))} |'
+                     f'{_get(metrics, "database", "transfer_method") or ""} |')
     lines.append('')
 
     lines += ['## 5. 推荐', '', '| 指标 | 值 | 环比昨日 |', '|---|---|---|']

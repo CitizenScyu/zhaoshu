@@ -27,25 +27,143 @@ def _noop_validate(rec):
 
 
 class ReadOnlySqlGuard(unittest.TestCase):
-    """只读守卫：SQL 层必须拒写、拒多语句。"""
+    """只读守卫（两道）：登记白名单精确放行 + 关键字/函数黑名单兜底。
 
-    def test_accepts_select_and_with(self):
-        self.assertTrue(dm.ReadOnlySql._guard('SELECT 1'))
-        self.assertTrue(dm.ReadOnlySql._guard('  with x as (select 1) select * from x  '))
-        self.assertTrue(dm.ReadOnlySql._guard('SELECT 1;'))  # 单个尾分号允许
+    结构性优先：query() 只发本模块登记的常量 SQL，未登记一律拒。
+    """
+
+    def test_all_registered_statements_pass(self):
+        """原 14 条实际发出的语句必须全部放行。"""
+        self.assertEqual(len(dm._RAW_STATEMENTS), 14)
+        for raw in dm._RAW_STATEMENTS:
+            normalized = dm.ReadOnlySql._guard(raw)
+            self.assertIn(normalized, dm._ALLOWED_SQL)
+
+    def test_registered_statements_tolerate_whitespace_and_comments(self):
+        """登记 SQL 的空白/换行/注释差异不造成假阴性（同一把归一尺子）。"""
+        raw = dm._RAW_STATEMENTS[0]
+        for variant in (f'  {raw}  ', f'{raw};', raw.replace(' ', '\n'),
+                        f'-- c\n{raw}', f'/* c */ {raw}'):
+            self.assertEqual(dm.ReadOnlySql._guard(variant),
+                             dm._normalize_sql(raw))
+
+    def test_unregistered_select_is_rejected(self):
+        """未登记的（哪怕纯读）也必须拒——白名单是结构性约束，不是语法判断。"""
+        for sql in ('SELECT 1', 'SELECT * FROM users',
+                    'WITH x AS (SELECT 1) SELECT * FROM x'):
+            with self.assertRaises(ValueError):
+                dm.ReadOnlySql._guard(sql)
 
     def test_rejects_writes(self):
         for sql in ('UPDATE t SET a=1', 'DELETE FROM t', 'INSERT INTO t VALUES (1)',
-                    'DROP TABLE t', 'TRUNCATE t', 'ALTER TABLE t ADD c int'):
+                    'DROP TABLE t', 'TRUNCATE t', 'ALTER TABLE t ADD c int',
+                    'UPDATE labeled_books SET author = \'\' WHERE id = 1'):
+            with self.assertRaises(ValueError):
+                dm.ReadOnlySql._guard(sql)
+
+    def test_rejects_data_modifying_cte(self):
+        """审查表 1.2：数据修改型 CTE 曾被放行，现必须拒。"""
+        for sql in (
+            'WITH x AS (DELETE FROM labeled_books RETURNING *) SELECT count(*) FROM x',
+            'WITH x AS (SELECT 1) DELETE FROM t',
+            'WITH x AS (UPDATE labeled_books SET title = \'x\' RETURNING *) SELECT * FROM x',
+            'WITH x AS (INSERT INTO t VALUES (1) RETURNING *) SELECT * FROM x',
+            'WITH x AS (MERGE INTO t USING s ON t.id = s.id WHEN MATCHED THEN DELETE '
+            'RETURNING *) SELECT * FROM x',
+        ):
+            with self.assertRaises(ValueError):
+                dm.ReadOnlySql._guard(sql)
+
+    def test_rejects_row_locks(self):
+        """审查表 1.2：SELECT … FOR UPDATE/SHARE 曾被放行，现必须拒。"""
+        for sql in ('SELECT * FROM t FOR UPDATE',
+                    'SELECT * FROM t FOR UPDATE OF t SKIP LOCKED',
+                    'SELECT * FROM t FOR SHARE',
+                    'SELECT * FROM t FOR NO KEY UPDATE',
+                    'SELECT * FROM t FOR KEY SHARE'):
+            with self.assertRaises(ValueError):
+                dm.ReadOnlySql._guard(sql)
+
+    def test_rejects_side_effect_functions(self):
+        """审查表 1.2：副作用函数曾被放行，现必须拒。"""
+        for sql in (
+            'SELECT pg_terminate_backend(1)',
+            'SELECT pg_cancel_backend(1)',
+            'SELECT nextval(\'s\')', "SELECT setval('s', 1)",
+            "SELECT lo_import('/etc/passwd')", 'SELECT lo_export(1, \'/tmp/x\')',
+            "SELECT lo_unlink(1)", "SELECT pg_read_file('/etc/passwd')",
+            "SELECT pg_read_binary_file('/etc/passwd')", "SELECT pg_ls_dir('/')",
+            "SELECT set_config('a', 'b', false)",
+            'SELECT pg_advisory_lock(1)', 'SELECT pg_advisory_xact_lock(1)',
+            "SELECT dblink_exec('c', 'DELETE FROM t')",
+        ):
+            with self.assertRaises(ValueError):
+                dm.ReadOnlySql._guard(sql)
+
+    def test_rejects_leading_comment_wrapped_writes(self):
+        """审查表 1.2：注释包裹/前导空白/大小写混写的写语句必须拒。"""
+        for sql in ('/*x*/ DELETE FROM t', '--hi\nDROP TABLE t',
+                    '   INSERT INTO t VALUES (1)', 'DeLeTe FROM t',
+                    '/* a /* b */ DELETE FROM t'):
             with self.assertRaises(ValueError):
                 dm.ReadOnlySql._guard(sql)
 
     def test_rejects_multi_statement(self):
+        for sql in ('SELECT 1; DELETE FROM t', 'SELECT 1; --c\nDELETE FROM t'):
+            with self.assertRaises(ValueError):
+                dm.ReadOnlySql._guard(sql)
+
+    def test_rejects_other_dangerous_forms(self):
+        for sql in ('COPY t TO STDOUT', 'DO $$ BEGIN END $$', '', '   ',
+                    '-- only a comment', 'VACUUM t', 'GRANT ALL ON t TO x',
+                    'REVOKE ALL ON t FROM x', 'CALL p()', 'LOCK TABLE t',
+                    'CREATE TABLE t (id int)', 'REINDEX TABLE t',
+                    'ANALYZE t', 'REFRESH MATERIALIZED VIEW v'):
+            with self.assertRaises(ValueError):
+                dm.ReadOnlySql._guard(sql)
+
+    def test_semicolon_inside_string_still_rejected(self):
+        """字符串内分号被误杀（假阳性）——安全侧有意保留。"""
+        for sql in ("SELECT ';'", 'SELECT $$ a; b $$'):
+            with self.assertRaises(ValueError):
+                dm.ReadOnlySql._guard(sql)
+
+    def test_select_into_rejected(self):
         with self.assertRaises(ValueError):
-            dm.ReadOnlySql._guard('SELECT 1; DELETE FROM t')
-        # 注释里的分号不算多语句
-        self.assertEqual(dm.ReadOnlySql._guard('SELECT 1 -- ; not a statement'),
-                         'SELECT 1')
+            dm.ReadOnlySql._guard('SELECT 1 INTO x')
+
+    def test_commented_registered_statement_passes(self):
+        """注释里的分号不算多语句（登记语句本身带注释也必须能过）。"""
+        raw = dm._RAW_STATEMENTS[0]
+        self.assertEqual(dm.ReadOnlySql._guard(f'{raw} -- ; not a statement'),
+                         dm._normalize_sql(raw))
+
+
+class RedactError(unittest.TestCase):
+    """O4：错误原文脱敏——去连接串/host、截断到 200 字。"""
+
+    def test_strips_connection_string(self):
+        text = dm.redact_error(
+            'failed: postgresql://u:secret@db.144-24-10-250.sslip.io:5432/zhaoshu')
+        self.assertNotIn('secret', text)
+        self.assertNotIn('postgresql://', text)
+        self.assertIn('<conn>', text)
+
+    def test_strips_host_and_ip(self):
+        self.assertNotIn('db.internal', dm.redact_error('connect to db.internal:5432 failed'))
+        self.assertNotIn('10.0.0.5', dm.redact_error('timeout 10.0.0.5:5432'))
+
+    def test_truncates(self):
+        self.assertLessEqual(len(dm.redact_error('x' * 500)), 200)
+
+    def test_count_returns_redacted_error(self):
+        class BoomSql:
+            def scalar(self, query, params=None):
+                raise RuntimeError('postgresql://u:pw@h/db unreachable')
+        got = dm._count(BoomSql(), 'SELECT count(*)')
+        self.assertIn('error', got)
+        self.assertNotIn('pw', got['error'])
+        self.assertNotIn('postgresql://', got['error'])
 
 
 class EnvWhitelist(unittest.TestCase):
@@ -161,9 +279,27 @@ class ParseNginx(unittest.TestCase):
             self.assertEqual(got['requests'], 2)
             self.assertEqual(got['bytes'], 630)
 
-    def test_missing_file_is_skipped(self):
+    def test_all_files_missing_returns_unavailable_not_zero(self):
+        """M2：日志一个都打不开 → null+原因，不是 0（否则把「没量到」伪装成「今日零流量」）。"""
         got = dm.parse_nginx_logs(('/nonexistent/a.log',), now=self.NOW)
-        self.assertEqual(got, {'requests': 0, 'bytes': 0})
+        self.assertEqual(got['bytes'], None)
+        self.assertEqual(got['requests'], None)
+        self.assertFalse(got['available'])
+        self.assertEqual(got['opened'], 0)
+
+    def test_partial_missing_still_counts_available_ones(self):
+        """部分文件缺失：仍按实到的部分统计，available=True。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            rows = [
+                '127.0.0.1 - - [26/Sep/2026:23:00:00 +0800] "POST /sql HTTP/1.1" 200 600 "-" "node"',
+            ]
+            path = self._write(tmp, 'access.log', rows)
+            got = dm.parse_nginx_logs(('/nonexistent/a.log', str(path)),
+                                      now=self.NOW, only_path='/sql')
+            self.assertEqual(got['requests'], 1)
+            self.assertEqual(got['bytes'], 600)
+            self.assertTrue(got['available'])
+            self.assertEqual(got['opened'], 1)
 
     def test_timestamp_is_local_cst_not_utc(self):
         """回归：日志时间戳是 phoenix 本地 CST(+0800)，必须按 +08:00 解析。
@@ -285,6 +421,34 @@ class RenderMarkdown(unittest.TestCase):
         md = dm.render_markdown(self._metrics())
         self.assertNotIn('↑', md)
         self.assertNotIn('↓', md)
+
+    def test_error_dict_renders_failed_not_raw(self):
+        """O4：DB 报错原文不进 markdown——含 error 键的 dict 显示「—（查询失败）」。"""
+        metrics = self._metrics()
+        metrics['library']['labeled_books_total'] = {
+            'error': 'boom: connection to db.internal:5432 failed'}
+        md = dm.render_markdown(metrics)
+        self.assertIn(dm._FAILED_MARK, md)
+        self.assertNotIn('boom', md)
+        self.assertNotIn('db.internal', md)
+        self.assertNotIn("'error'", md)
+
+    def test_error_dict_via_bytes_fmt(self):
+        metrics = self._metrics()
+        metrics['database']['size_bytes'] = {'error': 'x'}
+        md = dm.render_markdown(metrics)
+        self.assertNotIn("'error'", md)
+
+    def test_transfer_unavailable_renders_no_data_mark(self):
+        """M2：日志不可读时渲染「无数据」而非 0.0 B。"""
+        metrics = self._metrics()
+        metrics['database']['transfer_available'] = False
+        metrics['database']['transfer_24h_bytes'] = None
+        metrics['database']['transfer_24h_requests'] = None
+        metrics['database']['transfer_note'] = '日志文件一个都打不开'
+        md = dm.render_markdown(metrics)
+        self.assertIn(dm._NO_DATA_MARK, md)
+        self.assertNotIn('0.0 B', md)
 
 
 class LoadPrevious(unittest.TestCase):
