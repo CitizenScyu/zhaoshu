@@ -133,7 +133,7 @@ describe('改法1 探测词兜底', () => {
   });
 
   it('换词之间补同站节流间隔', async () => {
-    const sleep = vi.fn(async () => {});
+    const sleep = vi.fn<(ms: number, signal: AbortSignal) => Promise<void>>(async () => {});
     const stub = site(() => page(EMPTY));
     await searchAdmission(source(url), {
       fetchPage: stub.fetchPage, declaredHosts: hosts, signal: signal(), throttleMs: 350, sleep, keywordFallback: true,
