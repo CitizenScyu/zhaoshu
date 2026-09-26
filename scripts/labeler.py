@@ -2552,7 +2552,15 @@ def main() -> int:
                     b.get('author', ''), fetch_stats.get('toc_author') or '',
                     b.get('list_title') or b.get('title', ''), fetch_stats.get('toc_title') or '')
                 if engine_author:
-                    b['author'], b['author_source'] = engine_author, 'engine_toc'
+                    b['author'] = engine_author
+                    if b.get('author_source') == 'content_match':
+                        # authcv41：内容比对救回的条目再经 toc 作者回写补作者串时，
+                        # author_source 保持 content_match 不被 engine_toc 覆盖——否则
+                        # 「这条是内容比对救回的」这一事实丢失，日后无从按标记抽查/回滚。
+                        # 另记 toc 回写也发生过，供追溯（不改救回标记的语义）。
+                        b['toc_author_writeback'] = True
+                    else:
+                        b['author_source'] = 'engine_toc'
                     print(f'  引擎目录作者回写: {engine_author}（名单作者为空）')
                 if fetch_stats.get('nonbody_chapters') or fetch_stats.get('preview_chapters'):
                     print(f'  取文跳过: 公告/感言条目 {fetch_stats.get("nonbody_chapters", 0)} 条，'
@@ -2710,6 +2718,14 @@ def main() -> int:
             if b.get('author_source'):
                 # author17k41：作者非名单原生（引擎 toc 回写）时留审计标记，供事后追溯
                 b_out['author_source'] = b['author_source']
+            if b.get('content_match'):
+                # authcv41：内容比对救回条目原样透传诊断详情（toc/body_pairs/basis），
+                # 只在救回条目出现。诊断字段不入库表——import 两条路径（import_one.validate_record /
+                # import_labels.mjs validateImportRecord）都按已知字段名 .get 读取，未知顶层字段被忽略、不拒收。
+                b_out['content_match'] = b['content_match']
+            if b.get('toc_author_writeback'):
+                # 内容比对救回条目又经 toc 作者回写补串时留痕（author_source 仍是 content_match）
+                b_out['toc_author_writeback'] = b['toc_author_writeback']
             print(f'  {chars} 字 | {labels.get("genre")} | conf {labels.get("confidence")} | {calls} 次调用')
             out_path = data_path('labels.jsonl')
             with open(out_path, 'a', encoding='utf-8') as f:
