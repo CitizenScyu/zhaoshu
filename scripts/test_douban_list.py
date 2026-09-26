@@ -2169,8 +2169,8 @@ CM_TITLES_X_ALT = ['第1章 天才陨落', '第2章 蝼蚁之路', '第3章 血�
                    '第4章 初显锋芒', '第5章 风波再起']          # 同书、编号写法不同
 CM_TITLES_Y = ['第一章 星空之下', '第二章 荒原孤影', '第三章 古城疑云',
                '第四章 迷雾深处', '第五章 短兵相接']            # 同名不同书
-CM_BODY_X = '叶凌霄睁开双眼，发现自己重回三年前那个风雨交加的夜晚，命运的齿轮再度转动。' * 6
-CM_BODY_Y = '林牧站在荒原尽头，望着远方燃烧的城池，握紧了手中早已卷刃的旧刀。' * 6
+CM_BODY_X = '叶凌霄睁开双眼，发现自己重回三年前那个风雨交加的夜晚，命运的齿轮再度转动。' * 120
+CM_BODY_Y = '林牧站在荒原尽头，望着远方燃烧的城池，握紧了手中早已卷刃的旧刀，杀意渐浓。' * 120
 
 
 def _cm_book(titles, body, base):
@@ -2222,7 +2222,7 @@ class TestContentFingerprint(unittest.TestCase):
         books = {'https://a.example/x': _cm_book(CM_TITLES_X, CM_BODY_X, 'https://a.example/x')}
         cli = _cm_cli(books)
         fp = douban_list.fetch_content_fingerprint(cli, 'https://a.example/x')
-        self.assertEqual(fp['toc'], {'天才陨落', '蝼蚁之路', '血脉觉醒', '初显锋芒', '风波再起'})
+        self.assertEqual(fp['toc'], ['天才陨落', '蝼蚁之路', '血脉觉醒', '初显锋芒', '风波再起'])
         self.assertTrue(fp['body'])
 
     def test_fingerprint_none_on_engine_failure(self):
@@ -2292,12 +2292,16 @@ class TestSameBookAndRescue(unittest.TestCase):
         a = self._fp(CM_TITLES_X, CM_BODY_X, 'https://a/1')
         y = self._fp(CM_TITLES_Y, CM_BODY_Y, 'https://y/1')
         self.assertFalse(douban_list.same_book(a, y)[0])          # 正常：不同书判否
-        with mock.patch.object(douban_list, 'CONTENT_TOC_JACCARD', 0.0):
-            self.assertTrue(douban_list.same_book(a, y)[0])       # 阈值改坏(0.0)：误判同书 → 变红信号
+        # M1 后目录判据是 Jaccard 与有序 LCS 双闸，两个都改坏才会误判同书
+        with mock.patch.object(douban_list, 'CONTENT_TOC_JACCARD', 0.0), \
+                mock.patch.object(douban_list, 'CONTENT_TOC_LCS', 0.0):
+            self.assertTrue(douban_list.same_book(a, y)[0])       # 双闸改坏(0.0)：误判同书 → 变红信号
         b = self._fp(CM_TITLES_X_ALT, CM_BODY_X, 'https://b/1')
         self.assertTrue(douban_list.same_book(a, b)[0])           # 正常：同书判是
         with mock.patch.object(douban_list, 'CONTENT_TOC_JACCARD', 1.01):
             self.assertFalse(douban_list.same_book(a, b)[0])      # 阈值改到不可达：漏判 → 变红信号
+        with mock.patch.object(douban_list, 'CONTENT_TOC_LCS', 1.01):
+            self.assertFalse(douban_list.same_book(a, b)[0])      # LCS 闸改到不可达：漏判 → 变红信号
 
     # ---- search_engine 集成：名单无作者、判歧义时的内容比对救回 ----
     def _candidates(self, specs):
@@ -2491,8 +2495,51 @@ class TestNormAuthorSimplified(unittest.TestCase):
             self.assertNotEqual(douban_list._norm_author('風雲'), douban_list._norm_author('风云'))
 
 
-if __name__ == '__main__':
-    unittest.main(verbosity=2)
+class TestTocGuardsM1(unittest.TestCase):
+    """M1：通用标题停用表 + 目录信息量下限(5) + 有序 LCS 双闸，防同名异书被通用标题打穿。"""
+
+    def _fp(self, titles, body, base):
+        return douban_list.fetch_content_fingerprint(
+            _cm_cli({base: _cm_book(titles, body, base)}), base)
+
+    def test_generic_titles_filtered(self):
+        seq = douban_list._informative_toc_titles(
+            [{'title': t} for t in ['上架感言', '尾声', '后记', '公告', '序章', '楔子', '番外',
+                                     '请假条', '新书', '第一章 天才陨落', '第二章 蝼蚁']])
+        self.assertEqual(seq, ['天才陨落', '蝼蚁'])       # 只留信息性标题、保序
+
+    def test_lcs_ratio(self):
+        self.assertEqual(douban_list._lcs_ratio(['a', 'b', 'c'], ['a', 'b', 'c']), 1.0)
+        self.assertAlmostEqual(douban_list._lcs_ratio(['a', 'b', 'c', 'd', 'e'],
+                                                      ['e', 'd', 'c', 'b', 'a']), 0.2)
+        self.assertEqual(douban_list._lcs_ratio([], ['a']), 0.0)
+
+    def test_c1_generic_saturated_not_merged(self):
+        # rvauthcv 反例 C1：通用标题饱和 + 1 个不同的情节标题 + 不同正文 → 判否
+        a = self._fp(['上架感言', '尾声', '后记', '第一章 天才陨落'], CM_BODY_X, 'https://a/1')
+        b = self._fp(['上架感言', '尾声', '后记', '第一章 星空之下'], CM_BODY_Y, 'https://b/1')
+        self.assertFalse(douban_list.same_book(a, b)[0])
+
+    def test_c2_pure_numbering_plus_generic_not_merged(self):
+        # rvauthcv 反例 C2：纯「第X章」+ 通用词 → 信息性标题塌成空 → 不靠目录判相似；正文不同 → 判否
+        a = self._fp(['第一章', '第二章', '第三章', '上架感言', '尾声', '后记'], CM_BODY_X, 'https://a/1')
+        b = self._fp(['第1章', '第2章', '第3章', '上架感言', '尾声', '后记'], CM_BODY_Y, 'https://b/1')
+        self.assertEqual(a['toc'], [])                     # 信息性标题为空
+        self.assertFalse(douban_list.same_book(a, b)[0])
+
+    def test_shuffled_same_titles_rejected_by_lcs(self):
+        # 集合相同但顺序完全打乱（Jaccard=1.0）→ 有序 LCS 低 → 判否（同名异书重排目录防线）
+        titles_a = ['甲章', '乙章', '丙章', '丁章', '戊章', '己章']
+        titles_b = list(reversed(titles_a))
+        a = self._fp([f'第{i+1}章 {t}' for i, t in enumerate(titles_a)], CM_BODY_X, 'https://a/1')
+        b = self._fp([f'第{i+1}章 {t}' for i, t in enumerate(titles_b)], CM_BODY_Y, 'https://b/1')
+        ok, sim = douban_list.same_book(a, b)
+        self.assertEqual(sim['toc'], 1.0)                  # 集合完全相同
+        self.assertLess(sim['lcs'], douban_list.CONTENT_TOC_LCS)
+        self.assertFalse(ok)
+
+    def test_min_titles_raised_to_five(self):
+        self.assertGreaterEqual(douban_list.CONTENT_TOC_MIN_TITLES, 5)
 
 
 if __name__ == '__main__':

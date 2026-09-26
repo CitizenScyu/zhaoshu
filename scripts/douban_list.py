@@ -934,14 +934,17 @@ def _pick_author_unknown(title: str, hits: list[tuple[dict, str]]) -> dict | Non
 CONTENT_MATCH_ENV = 'AUTHCV_CONTENT_MATCH'   # =0/false/no/off 关闭（默认开）；回滚即置 0
 CONTENT_MAX_CANDIDATES = 3     # 每次最多取文比对的候选数（成本上限；distinct 作者超此数视为同名书泛滥，不试）
 CONTENT_MAX_CHAPTERS = 3       # 每个候选取前几章正文做指纹
-CONTENT_TOC_MIN_TITLES = 3     # 两侧目录都 ≥ 此数才用目录作判据，否则退正文
+CONTENT_TOC_MIN_TITLES = 5     # 两侧**去通用标题后**的信息性标题都 ≥ 此数才用目录作判据（M1：3 太松）
 CONTENT_NGRAM = 4              # 正文字符 n-gram 长度
-# 阈值依据（authcv-41-report §2/§3）：正例=同一本书跨站，章节标题去编号后高度重合、开头正文
-# 近乎一致；反例=同名不同书，标题集合几乎不相交、正文无关。目录是强判据（同书跨站标题集合
-# 重合度远高于阈值，不同书远低于），正文仅在目录不足时兜底。阈值取在正反例之间留足余量，
-# 具体数值待 phoenix 现网校准（§6）。
-CONTENT_TOC_JACCARD = 0.60     # 目录标题集合 Jaccard 下限
-CONTENT_BODY_JACCARD = 0.30    # 开头正文 n-gram Jaccard 下限（目录不足时才用）
+CONTENT_MIN_BODY_CHARS = 3000  # 目录不足、只能靠正文判断时，两边去模板后正文都须 ≥ 此字数（M2）
+# 阈值依据（authcv-41-report §2/§3、rvauthcv §M1/§M2 反例）：正例=同一本书跨站，章节标题去编号后
+# 高度重合且**有序**、开头正文近乎一致；反例=同名不同书/同站模板，靠通用标题或模板段偶然重合。
+# 目录是强判据但须防「通用标题（上架感言/尾声/后记…）饱和」打穿：故除集合 Jaccard 外再加**有序 LCS**，
+# 二者同时达标才判同书；正文兜底阈值提到 0.60 且要求足够字数。数值取在正反例之间，待现网校准（§6）。
+CONTENT_TOC_JACCARD = 0.60     # 目录信息性标题集合 Jaccard 下限
+CONTENT_TOC_LCS = 0.60         # 目录前若干信息性标题的有序 LCS 比率下限（M1：与 Jaccard 同时达标）
+CONTENT_TOC_LCS_N = 8          # 参与有序 LCS 的前 N 个信息性标题
+CONTENT_BODY_JACCARD = 0.60    # 开头正文 n-gram Jaccard 下限（M2：0.30→0.60，且仅目录不足时才用）
 
 _TOC_NUM_RE = re.compile(
     r'^\s*(?:第\s*[0-9零一二三四五六七八九十百千万两]+\s*[章节節回卷话話集部篇]'
@@ -961,6 +964,47 @@ def _norm_toc_title(title: str) -> str:
     t = unicodedata.normalize('NFKC', (title or '')).strip()
     t = _TOC_NUM_RE.sub('', t)
     return _TOC_PUNCT_RE.sub('', t).casefold()
+
+
+# ---- 通用标题停用表（M1）----
+# 上架感言/尾声/后记/公告 等非情节条目在两本**不同**书里也常一字不差，若参与 Jaccard 会把
+# 同名异书误并（rvauthcv M1 反例 C1/C2）。归一后命中即剔除，不计入目录判据。
+# （序章/楔子/番外/引子/正文已被 _TOC_NUM_RE 剥成空串，天然不计，这里再补一份稳妥。）
+_GENERIC_TOC_WORDS = (
+    '上架感言', '完本感言', '新书感言', '完结感言', '感言', '尾声', '尾章', '后记', '後記',
+    '前言', '引言', '引子', '序', '序章', '序言', '楔子', '请假条', '请假', '新书', '新書',
+    '公告', '通知', '上架', '完本', '完结', '完結', '感谢', '感謝', '作品相关', '作品相關',
+    '番外', '番外篇', '写在前面', '寫在前面', '内容简介', '內容簡介', '免责声明', '免責聲明',
+    '温馨提示', '溫馨提示', '作者的话', '作者的話', '关于', '關於', '说明', '說明', '声明', '聲明',
+)
+_GENERIC_TOC_NORM = frozenset(t for t in (_norm_toc_title(w) for w in _GENERIC_TOC_WORDS) if t)
+
+
+def _informative_toc_titles(chapters) -> list[str]:
+    """章节列表 → 去编号/去通用标题后的**有序**信息性标题（保序、含重复；空串与通用条目剔除）。"""
+    seq = []
+    for c in chapters:
+        if not isinstance(c, dict):
+            continue
+        t = _norm_toc_title(c.get('title') or '')
+        if t and t not in _GENERIC_TOC_NORM:
+            seq.append(t)
+    return seq
+
+
+def _lcs_ratio(a: list, b: list) -> float:
+    """两个序列的最长公共子序列长度 / 较短序列长度（有序对齐比率，0..1）。"""
+    if not a or not b:
+        return 0.0
+    m, n = len(a), len(b)
+    prev = [0] * (n + 1)
+    for i in range(1, m + 1):
+        cur = [0] * (n + 1)
+        ai = a[i - 1]
+        for j in range(1, n + 1):
+            cur[j] = prev[j - 1] + 1 if ai == b[j - 1] else max(prev[j], cur[j - 1])
+        prev = cur
+    return prev[n] / min(m, n)
 
 
 def _char_ngrams(text: str, n: int = CONTENT_NGRAM) -> set[str]:
@@ -1002,9 +1046,7 @@ def fetch_content_fingerprint(cli, book_url: str,
     try:
         toc = _cli_json(cli, 'toc', '--url', book_url) or {}
         chapters = toc.get('chapters') or []
-        toc_titles = {_norm_toc_title(c.get('title') or '')
-                      for c in chapters if isinstance(c, dict)}
-        toc_titles.discard('')
+        toc_seq = _informative_toc_titles(chapters)      # M1：有序、去通用标题、去编号空串
         body_parts: list[str] = []
         content_calls = 0
         for ch in chapters:
@@ -1022,7 +1064,7 @@ def fetch_content_fingerprint(cli, book_url: str,
                 text = ''
             if len(text) > 100:
                 body_parts.append(text)
-        fp = {'toc': toc_titles, 'body': _char_ngrams(' '.join(body_parts))}
+        fp = {'toc': toc_seq, 'body': _char_ngrams(' '.join(body_parts))}
     except Exception:
         fp = None
     if cache is not None:
@@ -1031,24 +1073,33 @@ def fetch_content_fingerprint(cli, book_url: str,
 
 
 def same_book(fp_a: dict | None, fp_b: dict | None) -> tuple[bool, dict]:
-    """两个内容指纹是否同一本书 → (bool, {'toc':相似度,'body':相似度,'basis':判据})。
+    """两个内容指纹是否同一本书 → (bool, {'toc':Jaccard,'lcs':有序比率,'body':相似度,'basis':判据})。
 
-    目录为强判据：两侧目录都 ≥ CONTENT_TOC_MIN_TITLES 时**只**看目录 Jaccard——同名不同书
-    的章节标题集合几乎不相交，靠正文偶然重合（常见套路开头）误并的风险由此杜绝；目录数据
-    不足时才退到正文 n-gram Jaccard。缺任一指纹 → 判否（不猜）。"""
-    empty = {'toc': 0.0, 'body': 0.0, 'basis': 'none'}
+    目录为强判据（M1）：两侧**去通用标题后**的信息性标题都 ≥ CONTENT_TOC_MIN_TITLES 时，
+    要求集合 Jaccard ≥ CONTENT_TOC_JACCARD **且**前若干条的有序 LCS 比率 ≥ CONTENT_TOC_LCS，
+    二者同时达标才判同书；目录信息足够但不达标 → 直接判**否**（不下沉到正文，避免同名异书靠
+    正文偶然重合被误并）。任一侧信息性标题不足（纯编号/通用标题饱和）→ 目录**无法判定**，
+    退到正文兜底（M2 侧更严）。缺任一指纹 → 判否（不猜）。"""
+    empty = {'toc': 0.0, 'lcs': 0.0, 'body': 0.0, 'basis': 'none'}
     if not fp_a or not fp_b:
         return False, empty
-    toc_sim = _jaccard(fp_a['toc'], fp_b['toc'])
-    body_sim = _jaccard(fp_a['body'], fp_b['body'])
-    both_toc = min(len(fp_a['toc']), len(fp_b['toc'])) >= CONTENT_TOC_MIN_TITLES
-    if both_toc:
-        decided = toc_sim >= CONTENT_TOC_JACCARD
-        basis = 'toc'
-    else:
-        decided = body_sim >= CONTENT_BODY_JACCARD
-        basis = 'body'
-    return decided, {'toc': toc_sim, 'body': body_sim, 'basis': basis}
+    seq_a, seq_b = fp_a.get('toc') or [], fp_b.get('toc') or []
+    set_a, set_b = set(seq_a), set(seq_b)
+    toc_sim = _jaccard(set_a, set_b)
+    body_sim = _jaccard(fp_a.get('body') or set(), fp_b.get('body') or set())
+    toc_enough = min(len(set_a), len(set_b)) >= CONTENT_TOC_MIN_TITLES
+    if toc_enough:
+        lcs = _lcs_ratio(seq_a[:CONTENT_TOC_LCS_N], seq_b[:CONTENT_TOC_LCS_N])
+        decided = toc_sim >= CONTENT_TOC_JACCARD and lcs >= CONTENT_TOC_LCS
+        return decided, {'toc': toc_sim, 'lcs': lcs, 'body': body_sim, 'basis': 'toc'}
+    # 目录信息不足 → 交正文兜底（同书判定的正文侧约束在 M2 收紧：去模板 + 高阈值 + 字数下限）
+    decided = _body_decides(fp_a, fp_b, body_sim)
+    return decided, {'toc': toc_sim, 'lcs': 0.0, 'body': body_sim, 'basis': 'body'}
+
+
+def _body_decides(fp_a: dict, fp_b: dict, body_sim: float) -> bool:
+    """正文兜底判定（M2 在本函数收紧；M1 阶段先按阈值判）。"""
+    return body_sim >= CONTENT_BODY_JACCARD
 
 
 def _cluster_by_content(cli, reps: list[dict], cache: dict) -> tuple[list[list[int]], dict]:
