@@ -153,6 +153,18 @@ export function sourceBookMatches(expected: SourceBookIdentity, actual: SourceBo
     && (!author || author === foldTraditional(knownSourceAuthor(actual.author))));
 }
 
+// 组合键分隔符：NUL 不出现在归一化后的书名/作者里，避免 'a,b'+'c' 与 'a'+'b,c' 撞键。
+const IDENTITY_KEY_SEPARATOR = ' ';
+
+/**
+ * 书源身份键（41-srcmem，「按书记住上次成功的源」用）：书名走 identityTitle（状态标记剥离 + 繁简折叠），
+ * 作者走 knownSourceAuthor + 繁简折叠 —— 与 sourceBookMatches 判等**逐字同一套口径**（裁定 #3：不另起一套）。
+ * 只做浏览器端记忆的稳定键，不进 DB 身份键（那条与 SQL 权威键对齐，见 book-identity.ts）。
+ */
+export function sourceBookIdentityKey(title: string, author: string): string {
+  return `${identityTitle(title)}${IDENTITY_KEY_SEPARATOR}${foldTraditional(knownSourceAuthor(author))}`;
+}
+
 // ---- 模糊降级层（L3）的相似度判据 ----
 // 从宽但有底线：完全无关的书（共享字符太少、既不包含也不近似）不得进入候选。
 // 分值越小越靠前；Number.POSITIVE_INFINITY 表示「不相似，淘汰」。

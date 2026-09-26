@@ -39,6 +39,16 @@ async function withSwitchedCatalog(part: Awaited<ReturnType<typeof readSourceCha
   });
 }
 
+/**
+ * 41-srcmem：首选源"软提示"（prefer=1）失败后是否静默回落整池搜索。
+ * 只要是"这个源没被用上"这类失败——SourceReaderError（源不在池内 404、bookUrl 失效 404、
+ * 目录空 404、站点不可达 503、单请求超时 504、内容被拒 422）与 SourcePolicyError（host/SSRF 门）——
+ * 都回落。整体中止 / 超时（signal.aborted）与非预期错误不在此列，照常上抛（不为一条陈旧记忆多烧一轮预算）。
+ */
+function isRecoverableHintFailure(error: unknown): boolean {
+  return error instanceof SourceReaderError || error instanceof SourcePolicyError;
+}
+
 async function handleGET(req: NextRequest, { params }: { params: Promise<{ resource: string }> }) {
   const startedAt = Date.now();
   const auth = await requirePermission(req, 'read');
@@ -75,9 +85,25 @@ async function handleGET(req: NextRequest, { params }: { params: Promise<{ resou
   try {
     if (resource === 'index') {
       await raceDeadline(signal, ensureSchema);
-      const catalog = await resolveSourceBook({ title, author }, context, bookUrl ? { bookUrl, ...(sourceUrl ? { sourceUrl } : {}) } : {});
+      // 41-srcmem：首选源软提示（prefer=1，只与 book_url+source 同用）。先按现有 confirm 路径试这个源
+      // （其内部已校验源在 selectable 池内 + validateSourceUrl 过 host/SSRF 门 + 按 sourceUrl 精确定位规则）；
+      // 用上了就返回，用不上就静默回落整池搜索、并回 hintCleared 让前端清掉这条记忆（裁定 #2）。
+      // 提示不可信、不绕过准入：所有校验都在 confirmSourceBook 里，与用户点选路径同一套。
+      const hinted = query.get('prefer') === '1' && !!bookUrl && !!sourceUrl;
+      if (hinted) {
+        try {
+          const catalog = await resolveSourceBook({ title, author }, context, { bookUrl, sourceUrl });
+          await saveSourceCatalog(catalog, signal);
+          return response(sourceReaderIndex(catalog));
+        } catch (error) {
+          if (signal.aborted || !isRecoverableHintFailure(error)) throw error;
+          // 落到下面的整池搜索（bookUrl 不再带 ⇒ 按 title/author 重新选源）。
+        }
+      }
+      // 显式点选确认（无 prefer）仍带 bookUrl 走 confirm 路径、失败 404，行为逐字不变。
+      const catalog = await resolveSourceBook({ title, author }, context, bookUrl && !hinted ? { bookUrl, ...(sourceUrl ? { sourceUrl } : {}) } : {});
       await saveSourceCatalog(catalog, signal);
-      return response(sourceReaderIndex(catalog));
+      return response(hinted ? { ...sourceReaderIndex(catalog), hintCleared: true } : sourceReaderIndex(catalog));
     }
     if (resource === 'alternates') {
       await raceDeadline(signal, ensureSchema);

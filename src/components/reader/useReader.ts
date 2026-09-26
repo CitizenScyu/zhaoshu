@@ -2,9 +2,10 @@
 
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import type { ReaderIndex, ReaderPart, ReadingSession } from '@/lib/reader-types';
-import { confirmedIndexUrl, readerChapterUrl, readerIndexUrl, readerPartMatches, switchedReaderIndex, switchedReaderPart } from '@/lib/reader-session';
+import { confirmedIndexUrl, isPreferredSourceIndexUrl, preferredSourceIndexUrl, readerChapterUrl, readerIndexUrl, readerPartMatches, switchedReaderIndex, switchedReaderPart } from '@/lib/reader-session';
 import { ReaderPartCache, nextReadingPosition, previousReadingPosition } from '@/lib/reader-part-cache';
 import { captureTextAnchor, restoreTextAnchor } from '@/lib/reader-text-anchor';
+import { forgetSource, readSourceMemory, rememberSource } from '@/lib/source-memory';
 import { catalogPrefixKey, migrateProgressAcrossSources, parseReaderSettings, parseReadingProgress, readingPercent, READER_SETTINGS_KEY } from '@/lib/reader-preferences';
 import { migrateLegacyIndexProgressKey } from '@/lib/user-scope';
 import type { ReaderSettings, ReadingPosition, ReadingProgress } from '@/lib/reader-preferences';
@@ -56,7 +57,16 @@ function canPrefetch(): boolean {
 
 export function useReader(session: ReadingSession, apiFetch: ApiFetch, userId: number) {
   // 确认路径（模糊候选点选后）会换 bookUrl 重放；初始 indexUrl 仍由 session 派生。
-  const [indexUrl, setIndexUrl] = useState(() => readerIndexUrl(session));
+  // 41-srcmem：source 类且非点选深链（session 无 bookUrl）时，若记忆里有这本书上次读通的源，
+  // 初始就带 prefer=1 请求那个源（服务端再校验 + 失败静默回落）。ReaderSession 只在客户端 auth
+  // ready 后挂载（SSR 不渲染该子树），useState 初始化器读 localStorage 安全、无 SSR 失配、也不会多拉一次。
+  const [indexUrl, setIndexUrl] = useState(() => {
+    if (session.kind === 'source' && !session.bookUrl) {
+      const remembered = readSourceMemory(session.title, session.author);
+      if (remembered) return preferredSourceIndexUrl(session.title, session.author, remembered.bookUrl, remembered.sourceUrl);
+    }
+    return readerIndexUrl(session);
+  });
   // 进度键按当前用户固定：卸载清理时仍写回旧用户，不会写进下一个身份的键。
   const progressKeyFor = useCallback((index: ReaderIndex) => migrateLegacyIndexProgressKey(index, userId), [userId]);
   const [settings, setSettings] = useState(() => parseReaderSettings(storedValue(READER_SETTINGS_KEY)));
@@ -278,9 +288,13 @@ export function useReader(session: ReadingSession, apiFetch: ApiFetch, userId: n
     const { controller, id, retirePrevious } = beginRequest();
     retirePrevious();
     cache.clear();
+    // 41-srcmem：本次是否首选源软提示请求。命中失败时服务端静默回落整池搜索并回 hintCleared，
+    // 此时清掉这条陈旧记忆（新读通的源随后由 effect 覆盖写入）；且软提示成功不写 URL（保持 URL 干净，记忆为准）。
+    const hinted = isPreferredSourceIndexUrl(indexUrl);
     try {
-      const index = await responseJson<ReaderIndex>(await apiFetch(indexUrl, { signal: controller.signal, cache: 'no-store' }));
+      const index = await responseJson<ReaderIndex & { hintCleared?: boolean }>(await apiFetch(indexUrl, { signal: controller.signal, cache: 'no-store' }));
       if (!Array.isArray(index.chapters) || !index.chapters.length) throw new RequestError('这本书还没有可阅读的正文。', 422);
+      if (hinted && index.hintCleared && session.kind === 'source') forgetSource(session.title, session.author);
       adoptedSwitch.current = null; // 新目录为基线:后续仍可再跟随一次换源
       let saved = parseReadingProgress(storedValue(progressKeyFor(index)), index);
       // M3 手动换源:迁移只在**新键无已存进度**时进行(用户之前在这个源读过 ⇒ 尊重该源自己的进度)。
@@ -324,7 +338,9 @@ export function useReader(session: ReadingSession, apiFetch: ApiFetch, userId: n
       migrationNotice.current = null;
       setNotice(notice ?? (saved ? '已回到上次阅读的位置' : ''));
       // M3 复审 P1-3:目录与首段都拿到才算换源成功,此时才把 book_url 持久化进 URL。
-      onSwitchCommitted.current?.(switchedBookUrl(), switchedSourceUrl());
+      // 41-srcmem:首选源软提示成功不写 URL —— URL 保持 title/author 纯净,首选源由记忆驱动,
+      // 刷新时仍走同一条软提示路径(失败静默回落),不退化成"刷新重放一个可能已失效的候选"。
+      if (!hinted) onSwitchCommitted.current?.(switchedBookUrl(), switchedSourceUrl());
     } catch (error) {
       // M3 复审 P2:失败路径也要清掉暂存的迁移进度 —— 否则下一次 loadIndex(重试)
       // 会把一次已经失败的换源进度再迁移一遍;且失败时 URL 不变(见 switchSource 注释)。
@@ -334,7 +350,7 @@ export function useReader(session: ReadingSession, apiFetch: ApiFetch, userId: n
       if (request.current === controller) request.current = null;
       if (!controller.signal.aborted && id === serial.current) setLoading(false);
     }
-  }, [apiFetch, indexUrl, beginRequest, adoptSwitch, cache, fail, flushPosition, progressKeyFor, switchedBookUrl, switchedSourceUrl]);
+  }, [apiFetch, indexUrl, beginRequest, adoptSwitch, cache, fail, flushPosition, progressKeyFor, session, switchedBookUrl, switchedSourceUrl]);
 
   // 模糊候选点选后的确认重放：换 bookUrl 重载目录（server 端跳过书名/作者匹配）。
   // 41-panel:扇出面板的确认必须带 sourceUrl(服务端按源 url 精确定位规则,同站多源时不再按 host 反查)。
@@ -372,6 +388,16 @@ export function useReader(session: ReadingSession, apiFetch: ApiFetch, userId: n
     const timer = setTimeout(() => setNotice(''), 5000);
     return () => clearTimeout(timer);
   }, [notice]);
+
+  // 41-srcmem:记住这本书这次读通的源。监听"最终供稿源"的坐标(源 url + 详情页 url)变化,
+  // 一处覆盖首开选源 / 面板换源 / 章内自动 failover 三种落点(reading.index.source 三种情形都会更新)。
+  // 依赖是原始值,只在源真的换了时才写;卷/滚动/翻章等 reading 换引用但源不变时不触发。
+  const servingSourceUrl = reading?.index.source?.sourceUrl;
+  const servingBookUrl = reading?.index.source?.url;
+  useEffect(() => {
+    if (session.kind !== 'source' || !servingSourceUrl || !servingBookUrl) return;
+    rememberSource(session.title, session.author, { sourceUrl: servingSourceUrl, bookUrl: servingBookUrl });
+  }, [session, servingSourceUrl, servingBookUrl]);
 
   const activePart = reading?.parts.find((part) => partKey(part) === activeKey) ?? reading?.parts[0];
   useEffect(() => {
