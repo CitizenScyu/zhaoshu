@@ -66,6 +66,23 @@ ROWS = [
      rec('T13', '  T13  ', 'A13')),
 ]
 
+# lblmeta41 审查建议的边界行（两边判定必须一致）：
+# 1) site_title_match 是字符串 "true"——两侧都做类型严格判定（只认布尔 True），不是真值 →
+#    review。若哪天一方改成真值判定，这里就会红。
+# 2) title_guess 为空串——空串是合法字符串（类型校验通过），显式 match=true 时 → ready；
+#    无 site_title_match 走盲猜时，空串 normalize 后为空 → 无法匹配 → review。两侧同判。
+# 3) title 与 site_title 仅繁简不同——NFKC **不**折叠繁简，盲猜路径两侧都判 → review。
+BOUNDARY = [
+    ('lblmeta41 boundary: site_title_match is the string "true" -> review (type-strict, not truthy)',
+     'review', rec('T14', 'T14', 'A14', match='true')),
+    ('lblmeta41 boundary: empty title_guess with explicit match true -> ready (empty string is a valid string)',
+     'ready', rec('T15', 'T15', 'A15', guess='')),
+    ('lblmeta41 boundary: empty title_guess without site_title_match -> review (empty cannot match a title)',
+     'review', rec('T16', 'T16', 'A16', guess='', match=None)),
+    ('lblmeta41 boundary: title vs site_title differ only by traditional/simplified, blind guess -> review (NFKC does not fold)',  # noqa: E501
+     'review', rec('書名', '书名', 'A17', guess='書名', match=None)),
+]
+
 # 已知且刻意的分叉：import_one.py 对「作者含 HTML 实体」一律 review（更保守，避免实体解码
 # 与 JS 侧漂移造出第二行，见其 normalize_author docstring）；import_labels.mjs 是完整导入器，
 # 对 book15 来源的实体作者会解码后入库。这是**既有**设计差异，不是本次 title/判据统一的目标，
@@ -76,7 +93,7 @@ DIVERGENT = [
 ]
 
 rows = []
-for why, expected, record in ROWS:
+for why, expected, record in ROWS + BOUNDARY:
     rows.append({'why': why, 'agree': True, 'py': expected, 'mjs': expected, 'record': record})
 for why, py, mjs, record in DIVERGENT:
     rows.append({'why': why, 'agree': False, 'py': py, 'mjs': mjs, 'record': record})

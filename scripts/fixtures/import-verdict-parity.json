@@ -335,6 +335,104 @@
   }
  },
  {
+  "why": "lblmeta41 boundary: site_title_match is the string \"true\" -> review (type-strict, not truthy)",
+  "agree": true,
+  "py": "review",
+  "mjs": "review",
+  "record": {
+   "title": "T14",
+   "site_title": "T14",
+   "author": "A14",
+   "category": "cat",
+   "status": "done",
+   "source": "book15.net",
+   "url": "https://book15.net/books/d.html",
+   "chars": 1000,
+   "labels": {
+    "title_guess": "T14",
+    "text_quality": "\u6b63\u5e38",
+    "genre": "g",
+    "site_title_match": "true",
+    "quality": {
+     "overall": 8
+    }
+   }
+  }
+ },
+ {
+  "why": "lblmeta41 boundary: empty title_guess with explicit match true -> ready (empty string is a valid string)",
+  "agree": true,
+  "py": "ready",
+  "mjs": "ready",
+  "record": {
+   "title": "T15",
+   "site_title": "T15",
+   "author": "A15",
+   "category": "cat",
+   "status": "done",
+   "source": "book15.net",
+   "url": "https://book15.net/books/d.html",
+   "chars": 1000,
+   "labels": {
+    "title_guess": "",
+    "text_quality": "\u6b63\u5e38",
+    "genre": "g",
+    "site_title_match": true,
+    "quality": {
+     "overall": 8
+    }
+   }
+  }
+ },
+ {
+  "why": "lblmeta41 boundary: empty title_guess without site_title_match -> review (empty cannot match a title)",
+  "agree": true,
+  "py": "review",
+  "mjs": "review",
+  "record": {
+   "title": "T16",
+   "site_title": "T16",
+   "author": "A16",
+   "category": "cat",
+   "status": "done",
+   "source": "book15.net",
+   "url": "https://book15.net/books/d.html",
+   "chars": 1000,
+   "labels": {
+    "title_guess": "",
+    "text_quality": "\u6b63\u5e38",
+    "genre": "g",
+    "quality": {
+     "overall": 8
+    }
+   }
+  }
+ },
+ {
+  "why": "lblmeta41 boundary: title vs site_title differ only by traditional/simplified, blind guess -> review (NFKC does not fold)",
+  "agree": true,
+  "py": "review",
+  "mjs": "review",
+  "record": {
+   "title": "\u66f8\u540d",
+   "site_title": "\u4e66\u540d",
+   "author": "A17",
+   "category": "cat",
+   "status": "done",
+   "source": "book15.net",
+   "url": "https://book15.net/books/d.html",
+   "chars": 1000,
+   "labels": {
+    "title_guess": "\u66f8\u540d",
+    "text_quality": "\u6b63\u5e38",
+    "genre": "g",
+    "quality": {
+     "overall": 8
+    }
+   }
+  }
+ },
+ {
   "why": "KNOWN DIVERGENCE: author with HTML entity -- py review (conservative), mjs ready (decodes book15)",
   "agree": false,
   "py": "review",
