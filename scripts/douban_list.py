@@ -735,9 +735,10 @@ class EngineCli:
         返回 CompletedProcess，错误解释仍统一由调用方处理。"""
         return self.run('doctor')
 
-    def run(self, subcommand: str, *args: str):
+    def run(self, subcommand: str, *args: str, timeout: float | None = None):
         """调 CLI 子命令（自动补 --json）。返回 CompletedProcess（returncode/stdout/stderr）。
 
+        timeout：本次调用超时秒数（None = self.timeout；打标分段取文按剩余预算收紧）。
         DATABASE_URL 从当前 env 复制的副本里注入子进程，不落任何参数或日志。"""
         cmd = [self.node, '--import', self._import_target(), self.script_path,
                subcommand, *args, '--json']
@@ -745,7 +746,7 @@ class EngineCli:
         if self._database_url:
             child_env['DATABASE_URL'] = self._database_url
         return subprocess.run(cmd, capture_output=True, text=True,
-                              timeout=self.timeout, env=child_env)
+                              timeout=self.timeout if timeout is None else timeout, env=child_env)
 
 
 def engine_url_supported(url: str) -> bool:

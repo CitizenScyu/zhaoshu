@@ -40,10 +40,12 @@ class FakeEngineCli:
     def __init__(self, handler):
         self.handler = handler
         self.calls = []
+        self.timeouts = []      # 每次调用传入的 timeout（None = 未传，用 CLI 默认）
 
-    def run(self, subcommand, *args):
+    def run(self, subcommand, *args, **kw):
         url = args[1] if len(args) >= 2 and args[0] == '--url' else None
         self.calls.append((subcommand, url))
+        self.timeouts.append(kw.get('timeout'))
         return self.handler(subcommand, url)
 
 
@@ -53,8 +55,18 @@ def _chapter_body(host: str, i: int, n: int = 3000) -> str:
     return head + '正' * (n - len(head) - len(tail)) + tail
 
 
+def _chapter_title(i: int) -> str:
+    """默认章名：带编号 + 信息性章名（各源同名，按段换源的目录比对才对得上；rvlblseg 必修 1）。"""
+    return f'第{i + 1}章 情节名目{i:04d}'
+
+
+def _numbered_title(i: int) -> str:
+    """纯编号章名（无信息性章名）。"""
+    return f'第{i + 1}章'
+
+
 def _toc_proc(host, n, title=TITLE, author=AUTHOR, titles=None):
-    chapters = [{'title': (titles(i) if titles else f'第{i + 1}章'), 'url': f'https://{host}/c{i}'}
+    chapters = [{'title': (titles or _chapter_title)(i), 'url': f'https://{host}/c{i}'}
                 for i in range(n)]
     return _proc(0, json.dumps({'source': host, 'title': title, 'author': author,
                                 'chapters': chapters}, ensure_ascii=False))
@@ -282,17 +294,20 @@ class TestFetchSegmented(_NoSleep):
         a_mid = [c for c in _content_calls(cli, 'a.example.com') if _idx(c[1]) >= 40]
         self.assertEqual(len(a_mid), labeler.SEG_PROBE_CHAPTERS)        # 只在第 2 段试过一次
 
-    def test_used_source_is_the_one_serving_most_text(self):
-        """主源只供开头一小段、其余全由备选供给 → 记录的实际来源是备选（圣墟实测形态）。"""
+    def test_record_source_stays_plan_source(self):
+        """主源只供开头一小段、其余全由备选供给（圣墟实测形态）→ 返回的源仍是计划源（主源），
+        记录 url 不被补段源改写（rvlblseg 必修 2）；各段真实来源只记在 sampling。"""
         cli = make_cli({
             'a.example.com': {'n': 100, 'body': lambda i: None if i >= 10 else
                               _chapter_body('a.example.com', i)},
             'b.example.com': {'n': 100, 'author': '唐家三少著'},
         })
         text, chars, used, sampling, stats = _fetch(cli, _book(alternates=['b.example.com']))
-        self.assertEqual(used['url'], 'https://b.example.com/book')
+        self.assertEqual(used['url'], 'https://a.example.com/book')
         self.assertEqual([s['switched'] for s in sampling['segments']], [False, True, True, True])
-        self.assertEqual(stats['toc_author'], '唐家三少著')     # 回写用实际所用源的目录作者
+        self.assertEqual([s['url'] for s in sampling['segments']],
+                         ['https://a.example.com/book'] + ['https://b.example.com/book'] * 3)
+        self.assertEqual(stats['toc_author'], AUTHOR)       # 回写用计划源的目录作者
 
     def test_mid_segment_4xx_stops_after_streak(self):
         """段中途起 4xx（cuoceng 实测形态）：连续 3 章落空即停，不按累计均值拖到几十个请求；
@@ -312,7 +327,7 @@ class TestFetchSegmented(_NoSleep):
     def test_app_free_titles_skipped_without_requests(self):
         """目录标题带 APP免费 的试读章不发请求；整段都是 → 该段 no_request → 换源。"""
         cli = make_cli({
-            'a.example.com': {'n': 100, 'titles': lambda i: f'第{i + 1}章 标题' + (
+            'a.example.com': {'n': 100, 'titles': lambda i: _chapter_title(i) + (
                 'APP免费' if i >= 40 else '')},
             'b.example.com': {'n': 100},
         })
@@ -389,9 +404,9 @@ class TestFetchSegmented(_NoSleep):
         class SlowCli:
             calls = inner.calls
 
-            def run(self, sub, *args):
-                now[0] += 10
-                return inner.run(sub, *args)
+            def run(self, sub, *args, **kw):
+                now[0] += min(10, kw.get('timeout') or 10)
+                return inner.run(sub, *args, **kw)
 
         text, chars, used, sampling, _ = _fetch(SlowCli(), _book(), time_budget_s=60,
                                                 clock=lambda: now[0])
@@ -456,7 +471,7 @@ class TestNormalizeArc(unittest.TestCase):
 
     def test_two_quotes_same_segment_not_enough(self):
         arc = labeler.normalize_arc({'decline': 'severe', 'evidence': [
-            {'segment': 3, 'quote': self.Q3}, {'segment': 3, 'quote': '前面。' + self.Q3[:8]}]},
+            {'segment': 3, 'quote': self.Q3}, {'segment': 3, 'quote': '前面。' + self.Q3[:11]}]},
             self.text())
         self.assertEqual(len(arc['evidence']), 2)
         self.assertEqual((arc['decline'], arc['checked']['forced']), ('unknown', 'weak_evidence'))
