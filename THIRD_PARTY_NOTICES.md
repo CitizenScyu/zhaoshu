@@ -5,10 +5,10 @@
 ## OpenCC
 
 - 使用位置：`src/lib/zh-variant-fold.ts`（繁→简单字折叠表，仅用于书源身份比对）
-- 来源：OpenCC <https://github.com/BYVoid/OpenCC>，`data/dictionary/TSCharacters.txt`
+- 来源：OpenCC <https://github.com/BYVoid/OpenCC>，`data/dictionary/TSCharacters.txt` 与 `data/dictionary/STCharacters.txt`
 - 版权：Copyright (c) 2010-2020 Carbo Kuo and contributors
 - 许可证：Apache License 2.0
-- 修改说明：只取「单字 → 单字」条目，多候选取第一个，链式映射解到终点，共 3221 对，内嵌为字符串常量。
+- 修改说明：只取 TSCharacters「单字 → 单字」条目，多候选取第一个，链式映射解到终点；再按 STCharacters 剔除多前像（简体本身也是独立繁体字的整组不折，其余只留首选繁体前像），保留 2884 对一对一映射，内嵌为字符串常量。生成脚本 `scripts/gen-zh-variant-fold.mjs`。
 
 Apache License 2.0 全文如下。
 

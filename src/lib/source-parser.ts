@@ -146,7 +146,7 @@ export function sourceBookMatches(expected: SourceBookIdentity, actual: SourceBo
   const title = identityTitle(expected.title);
   // 站点可能把书上架为新名而在简介里自报原名（【原书名：X】）；标题或别名任一相等即过。
   const actualTitles = [actual.title, ...(actual.alias ? [actual.alias] : [])].map(identityTitle);
-  // 作者门：两侧同一套归一（字段修饰剥离 + 繁简折叠），只吸收「同一个名字的不同写法」，不同名字仍判不符。
+  // 作者门：两侧同一套归一（字段修饰剥离 + 一对一繁简折叠），只吸收「同一个名字的不同写法」，不同名字仍判不符。
   const author = foldTraditional(knownSourceAuthor(expected.author));
   return Boolean(title && actualTitles.includes(title)
     && (!author || author === foldTraditional(knownSourceAuthor(actual.author))));

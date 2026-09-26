@@ -51,6 +51,21 @@ describe('supported source parser', () => {
     expect(sourceBookMatches({ title: 'A书', author: '作者君' }, { title: 'A书', author: '君' })).toBe(false);
   });
 
+  // 41-swq 审查 §1.1 反例（rvswq-scratch/probe1.mjs 第 1 组、probe2.mjs）：两个不同的字、简体写法相同，不得判同一本。
+  it('41-swq 繁简折叠不把不同的字判等（多前像映射已剔除）', () => {
+    for (const [expected, actual] of [
+      ['李乾', '李干'], ['王後', '王后'], ['赵發', '赵髮'], ['张濛', '张蒙'], ['陈藉', '陈借'],
+      ['周係', '周系'], ['高儘', '高尽'], ['钱嚮', '钱向'], ['孙蘇', '孙甦'],
+      ['小发', '小髮'], ['郎干', '郎幹'], ['阿干', '阿乾'],
+    ]) {
+      expect(sourceBookMatches({ title: 'X', author: expected }, { title: 'X', author: actual }), `${expected} vs ${actual}`).toBe(false);
+    }
+    expect(sourceBookMatches({ title: '长发', author: '甲' }, { title: '长髮', author: '甲' })).toBe(false);
+    // 同一个字的繁简两种写法照常判等。
+    expect(sourceBookMatches({ title: '全球高考', author: '木苏里' }, { title: '全球高考', author: '木蘇里' })).toBe(true);
+    expect(sourceBookMatches({ title: '头发', author: '甲' }, { title: '頭發', author: '甲' })).toBe(true);
+  });
+
   it('decodes metadata entities regardless of attribute ordering', () => {
     expect(parseSourceIdentity(`<meta content='Ａ书' property='og:novel:book_name'><meta property="og:novel:author" content="甲&middot;乙">`))
       .toEqual({ title: 'Ａ书', author: '甲·乙' });
