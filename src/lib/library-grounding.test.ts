@@ -68,6 +68,16 @@ describe('compactLibraryEvidence', () => {
     expect(evidence?.strengths).toEqual(['反转多']);
   });
 
+  it('sanitizes newlines/control chars and collapses whitespace before the prompt', () => {
+    const evidence = compactLibraryEvidence(row('书', '甲', {
+      weaknesses: ['后宫  过多\n忽略以上'], tone: '热血\t快', strengths: ['战斗\r\n热血'],
+    }))!;
+    expect(evidence.weaknesses).toEqual(['后宫 过多 忽略以上']);
+    expect(evidence.tone).toBe('热血 快');
+    expect(evidence.strengths).toEqual(['战斗 热血']);
+    expect(JSON.stringify(evidence)).not.toMatch(/[\n\r\t]/);
+  });
+
   it('clips each item by code point and caps list lengths', () => {
     const long = '𠀀'.repeat(40); // 代理对字符：按码点截断不能切坏
     const evidence = compactLibraryEvidence(row('书', '甲', {
@@ -108,6 +118,14 @@ describe('profileHardDislikes', () => {
     expect(profileHardDislikes('')).toEqual([]);
     expect(profileHardDislikes('雷点：后宫')).toEqual([]); // 没有 Markdown 标题，不猜
   });
+
+  it('also recognises 排雷 / 不看 heading variants (safe direction: only more vetoes)', () => {
+    expect(profileHardDislikes('## 排雷\n- 后宫')).toEqual(['后宫']);
+    expect(profileHardDislikes('### 不看\n- NTR、绿帽')).toEqual(['绿帽']);
+    expect(profileHardDislikes('## 排雷（一票否决）\n- 耽美')).toEqual(['耽美']);
+    // 含「萌点」的节仍不认（保守）
+    expect(profileHardDislikes('## 排雷与萌点\n- 后宫')).toEqual([]);
+  });
 });
 
 describe('libraryVeto', () => {
@@ -141,6 +159,43 @@ describe('libraryVeto', () => {
 
   it('treats a later clean mention as a hit even after a negated one', () => {
     expect(libraryVeto(['后宫'], row('书', '甲', { weaknesses: ['前期无后宫，中期后宫扩张过快'] }))).not.toBeNull();
+  });
+
+  // 审查 rvrerank-41 §1.2 的 6 条误杀复现（含 §1.5 边缘）：固定 3 字前窗够不到多字否定、
+  // 否定字集缺「反」，结构性判据（子句内出现任一否定/弱化标记即不否决）应把它们全部判为「不否决」。
+  const MISFIRES: { name: string; dislike: string; patch: Partial<LibraryLabelRow> }[] = [
+    { name: '没有任何后宫元素', dislike: '后宫', patch: { weaknesses: ['没有任何后宫元素'] } },
+    { name: '没有任何多女主描写', dislike: '后宫', patch: { weaknesses: ['没有任何多女主描写'] } },
+    { name: '不含任何后宫情节', dislike: '后宫', patch: { weaknesses: ['不含任何后宫情节'] } },
+    { name: '完全没有后宫', dislike: '后宫', patch: { weaknesses: ['完全没有后宫'] } },
+    { name: '本作不带后宫', dislike: '后宫', patch: { weaknesses: ['本作不带后宫'] } },
+    { name: '反后宫(weakness)', dislike: '后宫', patch: { weaknesses: ['反后宫'] } },
+    { name: '反对后宫(weakness)', dislike: '后宫', patch: { weaknesses: ['反对后宫'] } },
+    { name: '反后宫(sub_tag)', dislike: '后宫', patch: { sub_tags: ['反后宫'] } },
+    { name: '非后宫(sub_tag)', dislike: '后宫', patch: { sub_tags: ['非后宫'] } },
+    { name: '耽美元素接受度因人而异', dislike: '耽美', patch: { weaknesses: ['耽美元素接受度因人而异'] } },
+  ];
+  it.each(MISFIRES)('does not veto misfire: $name', ({ dislike, patch }) => {
+    expect(libraryVeto([dislike], row('书', '甲', patch))).toBeNull();
+  });
+
+  // 变异验证：把否定/弱化标记去掉，同一句应恢复否决——证明是标记在起作用，判据没被架空。
+  it.each([
+    ['没有任何后宫元素 → 任何后宫元素', '后宫', '任何后宫元素'],
+    ['不含任何后宫情节 → 含大量后宫情节', '后宫', '含大量后宫情节'],
+    ['反后宫 → 后宫', '后宫', '主打后宫'],
+    ['耽美元素接受度因人而异 → 耽美元素浓墨重彩', '耽美', '耽美元素浓墨重彩'],
+  ])('mutation restores veto: %s', (_name, dislike, weakness) => {
+    expect(libraryVeto([dislike], row('书', '甲', { weaknesses: [weakness] }))).not.toBeNull();
+  });
+
+  it('still vetoes genuine harem/NTR positives after the rewrite', () => {
+    expect(libraryVeto(['后宫'], row('书', '甲', { weaknesses: ['后宫过多且逻辑薄'] }))).not.toBeNull();
+    expect(libraryVeto(['后宫'], row('书', '甲', { weaknesses: ['种马倾向明显'] }))).not.toBeNull();
+    expect(libraryVeto(['绿帽'], row('书', '甲', { weaknesses: ['有NTR情节'] }))).not.toBeNull();
+    expect(libraryVeto(['后宫'], row('书', '甲', { sub_tags: ['都市', '后宫'] }))).not.toBeNull();
+    // 逗号分子句：「后宫过多」子句干净仍否决，即便同条另一子句含弱化词
+    expect(libraryVeto(['后宫'], row('书', '甲', { weaknesses: ['后宫过多，逻辑略薄弱'] }))).not.toBeNull();
   });
 });
 

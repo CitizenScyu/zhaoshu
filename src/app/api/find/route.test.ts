@@ -956,7 +956,8 @@ describe('POST /api/find rerank 书库标签接地', () => {
   it('确定性否决（正例）：画像雷点「后宫」× weaknesses 明确含后宫 → 不送模型、不入推荐，结果带理由', async () => {
     mocks.getProfileForUser.mockResolvedValue({ seeds: [], content: HAREM_HATER });
     mocks.getLibraryLabelsForCandidates.mockResolvedValue([
-      labelRow('后宫书', '作者乙', { weaknesses: ['后宫过多且逻辑薄弱'] }),
+      // 子句判据：「后宫过多」子句干净即否决，同条另一子句含弱化词（薄弱）不影响。
+      labelRow('后宫书', '作者乙', { weaknesses: ['后宫过多，逻辑薄弱'] }),
       labelRow('测试书', '作者甲'),
     ]);
     // 模型若把被否决的书编回来，也不得回流进结果。
