@@ -154,7 +154,7 @@ export function sourceBookMatches(expected: SourceBookIdentity, actual: SourceBo
 }
 
 // 组合键分隔符：NUL 不出现在归一化后的书名/作者里，避免 'a,b'+'c' 与 'a'+'b,c' 撞键。
-const IDENTITY_KEY_SEPARATOR = ' ';
+const IDENTITY_KEY_SEPARATOR = '\u0000';
 
 /**
  * 书源身份键（41-srcmem，「按书记住上次成功的源」用）：书名走 identityTitle（状态标记剥离 + 繁简折叠），
