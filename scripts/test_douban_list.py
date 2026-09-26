@@ -2256,6 +2256,11 @@ CM_VARYING_TMPL = ('本站郑重提示书友：您当前正在阅读的是本书
                    '免费的在线阅读服务体验，衷心感谢您长期以来对本站的理解厚爱与鼎力支持。')
 CM_VARY_PLOT_X = ['甲主角探远古秘境。' * 160, '甲主角战强敌苦斗。' * 160, '甲主角醒血脉逆天。' * 160]
 CM_VARY_PLOT_Y = ['乙主角闯焦土荒原。' * 160, '乙主角入密林遇兽。' * 160, '乙主角挥旧刀破阵。' * 160]
+# §12 N2：模板句里嵌**不可归一变量**（手打组甲/乙/丙——汉字，非数字/URL），旧「归一后完全相同」
+# 覆盖不到；模糊去重（bigram Jaccard）能识别只差一字的逐章模板。
+CM_VAR_TMPL_HAND = ('本站郑重提示各位书友本章内容由本站热心读者手打组%s负责录入校对完成若在阅读过程中'
+                    '发现任何文字错漏或章节串行敬请返回本书目录页重新进入以刷新页面缓存衷心感谢诸位'
+                    '书友长期以来对本站的理解厚爱与鼎力支持祝各位阅读愉快')
 
 
 def _fp_dual(titles, base, bodies=None):
@@ -2805,18 +2810,19 @@ class TestBodyGuardsM2(unittest.TestCase):
         self.assertFalse(douban_list.same_book(a, b)[0])
 
     def test_m2r_normalization_is_load_bearing(self):
-        # 变异：把 _normalize_template_line 改成恒等（还原「只去完全相同行」的旧行为）→ 逐章模板
-        # 因章号不同而各章唯一 → 不被去重 → 模板打穿正文 Jaccard；配合目录持平 → 两本不同书被误并 → 变红
+        # §12：跨章模糊去重（bigram Jaccard≥_BODY_SIM_BIGRAM）承重。逐章变化的模板（嵌章号）各章
+        # 唯一，靠模糊相似识别并剔除；把相似阈值改到不可达 → 模板残留 → 模板打穿正文 Jaccard → 变红。
         ax = self._vary_chapters(CM_VARYING_TMPL, CM_VARY_PLOT_X)
         bx = self._vary_chapters(CM_VARYING_TMPL, CM_VARY_PLOT_Y)
-        self.assertFalse(douban_list.same_book(self._fp(CM_TITLES_X, ax, 'https://a/1'),
-                                               self._fp(CM_TITLES_X_ALT, bx, 'https://b/1'))[0])   # 正常：判否
-        with mock.patch.object(douban_list, '_normalize_template_line', lambda s: s):
+        self.assertLess(douban_list._jaccard(self._fp(CM_TITLES_X, ax, 'https://a/1')['body'],
+                                             self._fp(CM_TITLES_X_ALT, bx, 'https://b/1')['body']),
+                        douban_list.CONTENT_BODY_JACCARD)                    # 正常：模板被剥 → 正文各异
+        with mock.patch.object(douban_list, '_BODY_SIM_BIGRAM', 1.01):
             a2 = self._fp(CM_TITLES_X, ax, 'https://a/1')
             b2 = self._fp(CM_TITLES_X_ALT, bx, 'https://b/1')
             self.assertGreaterEqual(douban_list._jaccard(a2['body'], b2['body']),
-                                    douban_list.CONTENT_BODY_JACCARD)                   # 模板未去 → 相似度虚高
-            self.assertTrue(douban_list.same_book(a2, b2)[0])                           # 误并 → 变红
+                                    douban_list.CONTENT_BODY_JACCARD)       # 模板未去 → 相似度虚高
+            self.assertTrue(douban_list.same_book(a2, b2)[0])              # 目录持平 + 正文虚高 → 误并 → 变红
 
     def test_m2r_varying_template_kept_for_same_book(self):
         # 正例保护：同一本书两站、同款逐章模板 + 目录一致 → 归一去模板后各章真实正文一致 → 双信号成立 → 放行
@@ -2826,14 +2832,46 @@ class TestBodyGuardsM2(unittest.TestCase):
         self.assertGreaterEqual(a['body_chars'], douban_list.CONTENT_MIN_BODY_CHARS)
         self.assertTrue(douban_list.same_book(a, b)[0])
 
-    def test_normalize_template_line_placeholders(self):
-        # 章号/数字/中文数字/URL 归一成占位符；无可变部分的行原样（分组键层面）
-        n = douban_list._normalize_template_line
-        self.assertEqual(n('第3章'), n('第9章'))
-        self.assertEqual(n('第三章'), n('第九章'))
-        self.assertEqual(n('更新于2026-09-27'), n('更新于2025-01-01'))
-        self.assertEqual(n('详见 http://a.example/c/12'), n('详见 http://b.test/c/99'))
-        self.assertNotEqual(n('叶凌霄睁开双眼'), n('林牧握紧旧刀'))   # 无可变部分 → 不同文本不归并
+    # ---- §12 N2（第三轮复审）：模板嵌不可归一变量（手打组甲/乙/丙）→ 模糊去重 ----
+    def test_n2_repro_template_variable_stripped_not_merged(self):
+        # 第三轮 N2 反例：两本不同书，逐章模板只差一个汉字（手打组甲/乙/丙）+ 各自不同正文。
+        # 模糊去重按 bigram 相似识别并剔模板 → 只留各异正文 → body Jaccard 低 → 判否
+        nums = ['第一章', '第二章', '第三章']
+        ca = [(CM_VAR_TMPL_HAND % h) + '\n' + CM_VARY_PLOT_X[i] for i, h in enumerate('甲乙丙')]
+        cb = [(CM_VAR_TMPL_HAND % h) + '\n' + CM_VARY_PLOT_Y[i] for i, h in enumerate('甲乙丙')]
+        a = self._fp(nums, ca, 'https://a/1')
+        b = self._fp(nums, cb, 'https://b/1')
+        self.assertGreaterEqual(a['body_chars'], douban_list.CONTENT_MIN_BODY_CHARS)     # 正文（去模板后）够长
+        self.assertLess(douban_list._jaccard(a['body'], b['body']),
+                        douban_list.CONTENT_BODY_JACCARD)                                # 模板被剥 → 正文各异
+        self.assertFalse(douban_list.same_book(a, b)[0])                                 # 判否
+
+    def test_n2_fuzzy_dedup_is_load_bearing(self):
+        # 承重：模糊阈值改到不可达 → 手打组模板不被识别 → 残留 → 两本不同书 body Jaccard 虚高
+        nums = ['第一章', '第二章', '第三章']
+        ca = [(CM_VAR_TMPL_HAND % h) + '\n' + CM_VARY_PLOT_X[i] for i, h in enumerate('甲乙丙')]
+        cb = [(CM_VAR_TMPL_HAND % h) + '\n' + CM_VARY_PLOT_Y[i] for i, h in enumerate('甲乙丙')]
+        with mock.patch.object(douban_list, '_BODY_SIM_BIGRAM', 1.01):
+            a = self._fp(nums, ca, 'https://a/1')
+            b = self._fp(nums, cb, 'https://b/1')
+            self.assertGreaterEqual(douban_list._jaccard(a['body'], b['body']),
+                                    douban_list.CONTENT_BODY_JACCARD)                    # 模板残留 → 虚高 → 变红
+
+    def test_line_bigrams_and_similarity(self):
+        _sim, _bg = douban_list._lines_similar, douban_list._line_bigrams
+        self.assertTrue(_sim(_bg('本章内容由手打组甲负责录入校对完成感谢支持'),
+                             _bg('本章内容由手打组乙负责录入校对完成感谢支持')))   # 只差一字 → 相似
+        self.assertFalse(_sim(_bg('叶凌霄睁开双眼命运的齿轮再度转动起来'),
+                              _bg('林牧握紧手中卷刃旧刀杀意在胸中渐浓')))          # 不同正文 → 不相似
+        self.assertFalse(_sim(_bg(''), _bg('任意')))                                # 空集不相似
+
+    def test_body_top_segments_cap(self):
+        # §12 去模板后每章只留最长的前 N 段：真正文长段保留、短句噪声段丢弃
+        long_seg = '这一段是真正的正文内容相当长足以进入指纹参与比对不会被当作噪声' * 8
+        parts = ['\n'.join([long_seg] + [f'短句{i}' for i in range(20)])]
+        kept = douban_list._clean_body_parts(parts).split('\n')
+        self.assertLessEqual(len(kept), douban_list._BODY_TOP_SEGMENTS)
+        self.assertIn(long_seg, kept)
 
 
 class TestBogusDowngradeEndToEnd(unittest.TestCase):

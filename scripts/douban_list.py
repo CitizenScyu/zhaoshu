@@ -1129,25 +1129,34 @@ def _cli_json(cli, subcommand: str, *args: str):
 _BODY_DEDUPE_MIN_LINE = 20     # 只对这么长以上的行做跨章去重（对齐 labeler.DEDUPE_MIN_LINE）
 _LABELER_DROP_RULE = False     # False=未尝试；None=不可用；callable=labeler._drop_rule
 
-# M2-r：逐章变化的模板（句中嵌章号/页码/日期/URL）跨章不「完全相同」，去重会漏。故做模板
-# 检测前先把可变部分归一成占位符，让「同一模板的不同章实例」跨章归一后一致、可被去重。
-_TEMPLATE_URL_RE = re.compile(r'(?:https?://|www\.)[^\s，。、；;）)】」』]*', re.I)
-_TEMPLATE_DOMAIN_RE = re.compile(r'[a-zA-Z0-9][a-zA-Z0-9-]*(?:\.[a-zA-Z0-9-]+){1,}(?:/[^\s]*)?')
-_TEMPLATE_DIGIT_RE = re.compile(r'[0-9]+')
-_TEMPLATE_CJK_NUM_RE = re.compile(r'[零一二三四五六七八九十百千万亿两〇壹贰叁肆伍陆柒捌玖拾]+')
+# §12 正文模板模糊去重：逐章变化的模板（句中嵌章号/页码/日期，甚至嵌**汉字/字母变量**如
+# 「本章由手打组甲录入」）跨章既不「完全相同」、归一也覆盖不到（任意变量形态）。故改为**行级相似**：
+# 同一本书内，一行若与**其他章节**某候选行的字符 bigram Jaccard ≥ 阈值即视为模板剔除。限长 +
+# 只取每章前后各若干行作候选，避免 O(n²) 爆炸。去模板后每章再只留最长的若干段，模板短句难占主体。
+_BODY_SIM_BIGRAM = 0.70        # 跨章模糊去重：字符 bigram Jaccard ≥ 此值 → 同一模板行
+_BODY_EDGE_LINES = 10          # 每章只取前后各 N 行（≥_BODY_DEDUPE_MIN_LINE）作模板候选（限成本）
+_BODY_TOP_SEGMENTS = 5         # 去模板后每章只留最长的前 N 段参与比对
+_BODY_LEN_RATIO = 0.6          # 长度预筛：两行归一长度比 < 此值直接跳过（bigram Jaccard 不可能达标）
 
 
-def _normalize_template_line(line: str) -> str:
-    """把行内**可变部分**（URL/域名、阿拉伯数字、中文数字/章号/页码/日期）归一成占位符（M2-r）。
+def _line_bigrams(line: str) -> frozenset:
+    """行 → 字符 bigram 集合（只留中日文/拉丁，抗排版噪声）；<2 字返回单元素或空集。"""
+    s = _BODY_KEEP_RE.sub('', unicodedata.normalize('NFKC', line or '')).casefold()
+    if not s:
+        return frozenset()
+    if len(s) < 2:
+        return frozenset((s,))
+    return frozenset(s[i:i + 2] for i in range(len(s) - 1))
 
-    使「同一站点模板的不同章实例」（如「您正在阅读第 3 章…」逐章变化）跨章归一后一致，
-    从而能被跨章去重识别为模板。归一只用于**模板识别的分组键**，不改动保留下来的原文。"""
-    s = unicodedata.normalize('NFKC', line or '')
-    s = _TEMPLATE_URL_RE.sub('#u#', s)
-    s = _TEMPLATE_DOMAIN_RE.sub('#u#', s)
-    s = _TEMPLATE_DIGIT_RE.sub('#', s)
-    s = _TEMPLATE_CJK_NUM_RE.sub('#', s)
-    return s
+
+def _lines_similar(bg_a: frozenset, bg_b: frozenset) -> bool:
+    """两行 bigram 集合是否相似（Jaccard ≥ _BODY_SIM_BIGRAM）；带长度比预筛省算。"""
+    if not bg_a or not bg_b:
+        return False
+    lo, hi = sorted((len(bg_a), len(bg_b)))
+    if lo < hi * _BODY_LEN_RATIO:          # 长度差太大 → Jaccard 上界 lo/hi < 阈值，不可能相似
+        return False
+    return len(bg_a & bg_b) / len(bg_a | bg_b) >= _BODY_SIM_BIGRAM
 
 
 def _labeler_drop_rule():
@@ -1163,26 +1172,29 @@ def _labeler_drop_rule():
 
 
 def _clean_body_parts(parts: list[str]) -> str:
-    """章正文列表 → 去模板后的干净正文（M2 + M2-r）。
-    (1) 跨章去重：把每行**可变部分归一**后（章号/数字/日期/URL），同一归一形态在 ≥2 章出现的
-        ≥20 字长行视为模板/串章/分页重叠而剔除——逐章变化的模板（嵌章号）也能一并识别；
-    (2) 复用 labeler 行级清洗 `_drop_rule` 剔广告/公告/求票行（best-effort，导入失败则跳过）。"""
+    """章正文列表 → 去模板后的干净正文（M2 + §12 行级模糊去重 + 每章取最长若干段）。
+    (1) 跨章模糊去重：把每行与**其他章**的模板候选行比字符 bigram Jaccard，≥_BODY_SIM_BIGRAM 的
+        ≥20 字长行视为模板/串章/分页重叠而剔除——逐章变化、嵌任意变量（章号/汉字/字母）的模板
+        都能识别，不依赖归一覆盖到具体变量形态；
+    (2) 复用 labeler 行级清洗 `_drop_rule` 剔广告/公告/求票行（best-effort，导入失败则跳过）；
+    (3) 去模板后每章只留**最长的前 _BODY_TOP_SEGMENTS 段**——模板短句很难占正文主体。"""
     chapter_lines = [[ln.strip() for ln in re.split(r'[\r\n]+', p) if ln.strip()] for p in parts]
-    freq: dict[str, int] = {}
-    for lines in chapter_lines:
-        seen: set[str] = set()
-        for ln in lines:
-            key = _normalize_template_line(ln)   # M2-r：按归一形态计跨章频次
-            if key in seen:                      # 每章内同一（归一后）行只计一次
-                continue
-            seen.add(key)
-            freq[key] = freq.get(key, 0) + 1
+    # 模板候选：每章前后各 _BODY_EDGE_LINES 行里 ≥min 的行的 (章号, bigram)
+    candidates: list[tuple[int, frozenset]] = []
+    for ci, lines in enumerate(chapter_lines):
+        edge = lines[:_BODY_EDGE_LINES] + lines[-_BODY_EDGE_LINES:]
+        for ln in edge:
+            if len(ln) >= _BODY_DEDUPE_MIN_LINE:
+                candidates.append((ci, _line_bigrams(ln)))
     drop_rule = _labeler_drop_rule()
-    kept: list[str] = []
-    for lines in chapter_lines:
+    cleaned: list[str] = []
+    for ci, lines in enumerate(chapter_lines):
+        kept: list[str] = []
         for ln in lines:
-            if len(ln) >= _BODY_DEDUPE_MIN_LINE and freq.get(_normalize_template_line(ln), 0) >= 2:
-                continue               # 跨章模板行（归一后重复）
+            if len(ln) >= _BODY_DEDUPE_MIN_LINE:
+                bg = _line_bigrams(ln)
+                if any(cj != ci and _lines_similar(bg, cbg) for cj, cbg in candidates):
+                    continue           # 与其他章某模板候选行相似 → 跨章模板，剔
             if drop_rule is not None:
                 try:
                     if drop_rule(ln):
@@ -1190,7 +1202,9 @@ def _clean_body_parts(parts: list[str]) -> str:
                 except Exception:
                     pass
             kept.append(ln)
-    return '\n'.join(kept)
+        kept.sort(key=len, reverse=True)        # 每章只留最长前 N 段
+        cleaned.extend(kept[:_BODY_TOP_SEGMENTS])
+    return '\n'.join(cleaned)
 
 
 def fetch_content_fingerprint(cli, book_url: str,
