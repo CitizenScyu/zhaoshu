@@ -305,10 +305,19 @@ class TestValidateRecord(unittest.TestCase):
         rec['labels']['title_guess'] = '另一本书'
         self.assertEqual(import_one.validate_record(rec)['status'], 'review')
 
-    def test_conflicting_site_and_listed_title_is_review(self):
-        self.assertEqual(
-            import_one.validate_record(record(title='另一本', site_title='测试书'))['status'],
-            'review')
+    def test_conflicting_site_and_listed_title_is_not_review_on_its_own(self):
+        # lblmeta41：title 与 site_title 不一致不再直接判 review。BASE 的 site_title_match=true，
+        # 因此这条从「书名冲突 → review」变成「身份证据够 → ready」。
+        rec = record(title='另一本', site_title='测试书')
+        self.assertEqual(import_one.validate_record(rec)['status'], 'ready')
+        # 但身份证据不足（site_title_match=false）时一致与否都拦：false 仍是 review
+        rec['labels']['site_title_match'] = False
+        self.assertEqual(import_one.validate_record(rec)['status'], 'review')
+        # site_title_match 缺失 + 盲猜不匹配 → 仍是 review（旧路径不变）
+        rec = record(title='另一本', site_title='测试书')
+        rec['labels'].pop('site_title_match')
+        rec['labels']['title_guess'] = '另一本'
+        self.assertEqual(import_one.validate_record(rec)['status'], 'review')
 
     def test_missing_title_fails(self):
         self.assertEqual(import_one.validate_record(record(title='', site_title=''))['status'],
@@ -868,6 +877,42 @@ class TestCli(unittest.TestCase):
             log_text = (Path(tmp) / import_one.FAIL_LOG_NAME).read_text(encoding='utf-8')
             self.assertIn('connection refused', log_text)
             self.assertNotIn('db.example', log_text)
+
+
+class TestVerdictParity(unittest.TestCase):
+    """lblmeta41：导入判据的对照测试（python 侧）。
+
+    共享输入 scripts/fixtures/import-verdict-parity.json 由 gen_import_verdict_parity.py
+    生成（生成脚本自己先断言 python 侧），JS 侧（import_labels.test.mjs）读**同一份**文件、
+    对上 mjs 侧结论。两边的用例各自跑到同一批记录上，才算证明「两边对同一批输入结论相同」。
+    只共享输入、不共享实现——实现仍是两份（自动导入更保守），差异只能靠这里暴露。"""
+    def _rows(self):
+        path = Path(__file__).resolve().parent / 'fixtures' / 'import-verdict-parity.json'
+        return json.loads(path.read_text(encoding='utf-8'))
+
+    def test_each_row_matches_its_declared_verdict(self):
+        rows = self._rows()
+        self.assertGreaterEqual(len(rows), 10)
+        for row in rows:
+            with self.subTest(why=row['why']):
+                got = import_one.validate_record(json.loads(json.dumps(row['record'])))['status']
+                self.assertEqual(got, row['py'], row['why'])
+
+    def test_agreed_rows_use_one_shared_verdict(self):
+        # agree=true 的行：py/mjs 值必须相同（判据对齐），否则等于宣称对齐却没对齐
+        seen = 0
+        for row in self._rows():
+            if row['agree']:
+                seen += 1
+                with self.subTest(why=row['why']):
+                    self.assertEqual(row['py'], row['mjs'], row['why'])
+        self.assertGreaterEqual(seen, 10)   # 防「agree 行被删空」让本用例静默变空
+
+    def test_known_divergence_is_explicit(self):
+        # agree=false 的行必须在 why 里写明理由（KNOWN DIVERGENCE），否则是悄悄漂移
+        for row in self._rows():
+            if not row['agree']:
+                self.assertIn('DIVERGENCE', row['why'])
 
 
 if __name__ == '__main__':

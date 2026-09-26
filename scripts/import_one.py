@@ -308,8 +308,11 @@ def validate_record(rec):
     if (clean_string(title) != title or clean_string(listed_title) != listed_title
             or clean_string(author) != author):
         return review('书名或作者含非法字符，不能清洗后自动裁决身份')
-    if site_title and listed_title and not title_matches(site_title, listed_title):
-        return review('site_title 与 title 不一致，保留原记录待核验')
+    # lblmeta41：删掉「site_title 与 title 不一致 → review」。title 与 site_title 不一致只说明
+    # 记录里的 title 曾被 LLM 猜名覆盖过（旧 labeler 写法），不是身份证据不足——身份证据由下面的
+    # site_title_match 与上面的作者校验负责。现场 45 条 title≠site_title 全是 site_title_match=true，
+    # 即被这条误拦。身份键仍是 title(= site_title 优先)，删这条**不改变**身份键、不新增第二行。
+    # 与 import_labels.mjs 的删除逐条对齐。
 
     if labels.get('title_guess') is not None and not isinstance(labels['title_guess'], str):
         return failed('labels.title_guess 必须是字符串')
