@@ -107,7 +107,8 @@ describe('LLM usage storage and aggregates (mocked Neon HTTP queries)', () => {
   it('retries failed usage initialization and leaves the main schema usable', async () => {
     mocks.sql.mockImplementation((parts: TemplateStringsArray) => {
       if (parts.join('').includes('llm_usage')) throw new Error('usage DDL unavailable');
-      if (parts.join('').includes('SELECT max(version)')) return [{ version: 7 }];
+      // 认证闸门读记账连续性（1..7 全在册）；喂齐全账本让 assertAuthSchema 放行。
+      if (parts.join('').includes('FROM auth_schema_migrations')) return [1, 2, 3, 4, 5, 6, 7].map((version) => ({ version }));
       return [];
     });
     const { ensureSchema, recordLlmUsage } = await import('./db');

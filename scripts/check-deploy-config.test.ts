@@ -17,6 +17,50 @@ describe('环境变量样例覆盖', () => {
     const root = repo({ '.env.local.example': '# NODE_ENV=\n', 'src/lib/new-env.ts': 'process.env.' + 'NEW_DEPLOY_KEY' });
     expect(checkEnvExample(root)).toContain('.env.local.example: 缺少 NEW_DEPLOY_KEY（读取于 src/lib/new-env.ts）');
   });
+
+  // drrev 发现B / D5：env 对象当形参传入后的读取写法，原正则漏掉，导致样例漏键仍判绿。
+  // 每例只搭 .env.local.example（只文档化 NODE_ENV）+ 一个源文件，独立验证识别与边界。
+  // 源码里的 env 读取用 `${K}` 插值拼出，避免本测试文件自身被真实仓库扫描时误命中。
+  const K = 'FOO_KEY';
+  function envRepo(file: string, source: string): string {
+    return repo({ '.env.local.example': '# NODE_ENV=\n', [file]: source });
+  }
+  const missesFoo = (source: string, file = 'src/lib/probe.ts') =>
+    checkEnvExample(envRepo(file, source)).some(e => e.includes(`缺少 ${K}`));
+
+  it.each([
+    ['点式 env.<K>', `export const f = (env: Record<string,string>) => env.${K};`],
+    ['方括号 env["<K>"]', `export const f = (env: Record<string,string>) => env["${K}"];`],
+    ["方括号 env['<K>']", `export const f = (env) => env['${K}'];`],
+    ['解构 const { <K> } = env', `export const f = (env) => { const { ${K} } = env; return ${K}; };`],
+    ['比较（读取，非写入）env.<K> === ', `export const f = (env) => env.${K} === '0';`],
+  ])('识别形参式 env 读取：%s', (_label, source) => {
+    expect(missesFoo(source)).toBe(true);
+  });
+
+  it("识别 Python env.get('<K>') 与 env['<K>']", () => {
+    const py = `def f(env: dict):\n    return env.get('${K}') or env['${K}']\n`;
+    expect(missesFoo(py, 'scripts/probe.py')).toBe(true);
+  });
+
+  it("识别取值辅助函数 requiredEnv(env, '<K>')（字面量键）", () => {
+    expect(missesFoo(`export const f = (env: NodeJS.ProcessEnv) => requiredEnv(env, '${K}');`)).toBe(true);
+  });
+  it('边界：取值辅助函数的键来自变量（requiredEnv(env, name)）时不识别（动态键）', () => {
+    // 静态无法确定要文档化哪个键，故不报；对照上一例的字面量键必报。
+    expect(missesFoo('export const f = (env: NodeJS.ProcessEnv, name: string) => requiredEnv(env, name);')).toBe(false);
+  });
+
+  it.each([
+    ['process.env.<K>（属性访问，前缀不同）', `export const f = () => process.env.${K};`, true],
+    ['x.env.<K>（无关对象的点式 env）', `export const f = (x: { env: Record<string,string> }) => x.env.${K};`, false],
+    ["child_env['<K>']（派生变量名）", `export const f = (child_env) => child_env['${K}'];`, false],
+    ['写入 env.<K> =（代码自设，非部署者提供）', `export const f = (env) => { env.${K} = '1'; };`, false],
+    ['delete env.<K>（删除，非读取）', `export const f = (env) => { delete env.${K}; };`, false],
+  ])('边界：%s', (_label, source, expected) => {
+    // process.env 前缀仍应被识别（既有能力）；其余四例不应报为独立 env 读取。
+    expect(missesFoo(source)).toBe(expected);
+  });
 });
 
 // 部署配置门禁（MS-09）的反例测试：护栏本身必须有「坏配置一定红」的用例，

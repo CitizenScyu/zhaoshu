@@ -126,4 +126,15 @@ maybe('冷建库灾备链路（db:migrate → migrate:auth:prod → ensureSchema
     await pg.query('DELETE FROM auth_schema_migrations WHERE version > 6');
     await expect(assertAuthSchema(sql as never)).rejects.toBeInstanceOf(AuthSchemaRequiredError);
   }, 60_000);
+
+  it('账本中间缺号（缺 v6）：db:check verdict 与运行期闸门同判据、同缺失集', async () => {
+    // 造中间缺号 {1,2,3,4,5,7}：先补回 v7，再删 v6。
+    await pg.query('INSERT INTO auth_schema_migrations(version) VALUES (7) ON CONFLICT DO NOTHING');
+    await pg.query('DELETE FROM auth_schema_migrations WHERE version = 6');
+    const verdict = evaluateSchema(await inspectSchema(client), migrations);
+    expect(verdict.authVersionOk).toBe(false);
+    expect(verdict.authMissingVersions).toEqual([6]);
+    // 运行期闸门对同一账本抛错，且报出的缺失版本与 db:check 完全一致（唯一口径）。
+    await expect(assertAuthSchema(sql as never)).rejects.toMatchObject({ missingVersions: [6] });
+  }, 60_000);
 });
