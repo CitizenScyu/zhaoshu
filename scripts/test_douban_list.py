@@ -2638,5 +2638,64 @@ class TestBodyGuardsM2(unittest.TestCase):
         self.assertGreaterEqual(douban_list.CONTENT_BODY_JACCARD, 0.60)
 
 
+class TestBogusDowngradeEndToEnd(unittest.TestCase):
+    """M3 端到端：名单解析(污染作者) → search_engine 降级 → _resolve_candidates 建条目 →
+    labeler.engine_author_writeback → import_one 判定；断言分类名/出版社名绝不出现在最终作者。"""
+
+    def setUp(self):
+        no_wait(self)
+
+    def _resolve(self, list_author, engine_candidates, books):
+        def http_get(url):
+            return NO_RESULT_HTML if url.startswith('/books/search') else '<html></html>'
+        cli = _cm_cli(books, engine_candidates)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
+            queue = douban_list._resolve_candidates(
+                [{'title': '神秘复苏', 'author': list_author, 'douban_url': 'https://d/1'}],
+                http_get, origin='测试', engine_cli=cli)
+        return queue, buf.getvalue()
+
+    def test_polluted_author_never_reaches_entry_or_final_author(self):
+        import import_one
+        import labeler
+        base_a, base_b = 'https://a.example/1', 'https://b.example/1'
+        books = {base_a: _cm_book(CM_TITLES_X, CM_BODY_X, base_a),
+                 base_b: _cm_book(CM_TITLES_X_ALT, CM_BODY_X, base_b)}
+        cands = [{'source': 'a.example', 'title': '神秘复苏', 'author': '长安天', 'bookUrl': base_a},
+                 {'source': 'b.example', 'title': '神秘复苏', 'author': '長安天', 'bookUrl': base_b}]
+        queue, out = self._resolve('悬疑灵异', cands, books)
+        self.assertEqual(len(queue), 1)
+        entry = queue[0]
+        self.assertEqual(entry['list_author_raw'], '悬疑灵异')     # 原串仅存诊断字段
+        self.assertNotEqual(entry['author'], '悬疑灵异')
+        self.assertTrue(entry['author'])                          # 采信候选作者（长安天/長安天）
+        # labeler toc 二次校验拿 entry author（非污染）比对 → 与候选同一人 → 不会误拒
+        self.assertTrue(douban_list.author_matches(entry['author'], '长安天'))
+        # 回写 + import 判定：最终作者绝不含污染串
+        wb = labeler.engine_author_writeback(entry['author'], '长安天', entry['list_title'], '神秘复苏')
+        final = wb or entry['author']
+        self.assertNotIn('悬疑灵异', final)
+        _, val, _ = import_one.normalize_author(final)
+        self.assertNotIn('悬疑灵异', val)
+
+    def test_polluted_single_candidate_toc_no_author_stays_review(self):
+        import import_one
+        import labeler
+        base = 'https://a.example/1'
+        books = {base: _cm_book(CM_TITLES_X, CM_BODY_X, base)}
+        cands = [{'source': 'a.example', 'title': '神秘复苏', 'author': '', 'bookUrl': base}]
+        queue, out = self._resolve('悬疑灵异', cands, books)
+        self.assertEqual(len(queue), 1)
+        entry = queue[0]
+        self.assertEqual(entry['author'], '')                     # 候选无作者 → 条目 author 空（不写污染串）
+        self.assertEqual(entry['list_author_raw'], '悬疑灵异')
+        # toc 无作者时回写：list_author='' + toc_author='' → '' → 不写污染
+        wb = labeler.engine_author_writeback(entry['author'], '', entry['list_title'], '神秘复苏')
+        self.assertEqual(wb, '')
+        status, _, _ = import_one.normalize_author(entry['author'])
+        self.assertEqual(status, 'review')                        # 空作者 → review，绝不入库为污染串
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

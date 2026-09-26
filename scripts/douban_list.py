@@ -791,10 +791,13 @@ def search_engine(cli, title: str, author: str = '',
     espfix41：恒带 --no-builtin（book15 已由 search_book15 搜过或已熔断，其候选这里本来就跳过，
     CLI 里再搜一遍是纯浪费——book15 宕机时单这一步就 2×8s）；junk（可选）已判垃圾的 host 经
     --skip-host 跳过，本次候选再喂给 junk.observe 继续识别。"""
-    # authcv41 §7：名单作者字段被污染（分类名/出版社）→ 降级为名单无作者，交内容聚类救回。
-    # 放在组 args 之前，故也不会把污染值当 --author 传给引擎搜索。
+    # authcv41 §7/M3：名单作者字段被污染（分类名/出版社）→ 降级为名单无作者，交内容聚类救回。
+    # 放在组 args 之前，故也不会把污染值当 --author 传给引擎搜索。bogus_raw 透出到返回 hit，
+    # 由 _resolve_candidates 据此把队列条目 author 置空/采信候选作者，绝不让污染串流到 labeler。
+    bogus_raw = ''
     if author and is_bogus_list_author(author):
         print(f'  名单作者疑似污染（分类/出版社），降级为名单无作者: 《{title}》原作者字段「{author}」')
+        bogus_raw = author
         author = ''
     args = ['--title', title]
     if author:
@@ -874,12 +877,13 @@ def search_engine(cli, title: str, author: str = '',
                     + [h for h, a in unknown_hits if not _norm_author(a)])
         # authcv41：判歧义时先试内容比对救回（唯一主簇才放行）；救不回/未启用/引擎缺失
         # 才落回 _pick_author_unknown（原样打印歧义跳过、维持既有行为）。
+        result = None
         if content_match_enabled() and cli is not None:
-            rescued = _content_rescue_unknown(cli, title, unknown_hits)
-            if rescued is not None:
-                return _with_alternates(rescued, alt_pool)
-        # 备选服从歧义护栏：判歧义（None）就没有备选；收了则其余兼容候选两两作者相容，作者已知的在前
-        return _with_alternates(_pick_author_unknown(title, unknown_hits), alt_pool)
+            result = _content_rescue_unknown(cli, title, unknown_hits)   # 已带采信作者
+        if result is None:
+            # 备选服从歧义护栏：判歧义（None）就没有备选；收了则其余兼容候选两两作者相容，作者已知的在前
+            result = _attach_unknown_author(_pick_author_unknown(title, unknown_hits), unknown_hits)
+        return _with_alternates(_annotate_bogus(result, bogus_raw), alt_pool)
     if fallback is not None:
         print(f'  作者未知命中（降级）: {fallback["title"]}（名单作者 {author}，引擎未给作者）')
         return _with_alternates(fallback, _known_author_alternates(title, author, candidates))
@@ -1211,7 +1215,29 @@ def _content_rescue_unknown(cli, title: str,
     print(f'  内容比对放行: 《{title}》名单无作者，{len(reps)} 个候选内容聚为一簇'
           f'（{best["basis"]} 相似度≈{sim:.2f}），采信作者 {chosen["author"] or "（引擎待定）"}'
           f'，参照源 {chosen["hit"].get("source", "")}（content_match）')
-    return chosen['hit']
+    hit = chosen['hit']
+    if chosen['author']:                  # M3：把采信作者回带到 hit，供条目 author 回写（不写污染串）
+        hit['author'] = chosen['author']
+    return hit
+
+
+def _attach_unknown_author(hit: dict | None, unknown_hits: list[tuple[dict, str]]) -> dict | None:
+    """把名单无作者路径选中 hit 所对应的候选作者回带到 hit['author']（M3，供条目 author 回写）。"""
+    if hit is None:
+        return None
+    for h, a in unknown_hits:
+        if (h is hit or h.get('url') == hit.get('url')) and a:
+            hit['author'] = a
+            break
+    return hit
+
+
+def _annotate_bogus(hit: dict | None, bogus_raw: str) -> dict | None:
+    """§7/M3：污染降级来源的 hit 打标记 + 存原串（仅诊断），供 _resolve_candidates 置空条目 author。"""
+    if hit is not None and bogus_raw:
+        hit['list_author_bogus'] = True
+        hit['list_author_raw'] = bogus_raw
+    return hit
 
 
 
@@ -1384,6 +1410,11 @@ def _resolve_candidates(candidates: list[dict], http_get, origin: str = '',
                      'douban_url': b.get('douban_url', ''),
                      'engine': True,
                      'source_host': engine_hit['source']}
+            # M3：名单作者被污染而降级的条目——author 绝不能是污染原串。原串仅存 list_author_raw
+            # 供诊断；condition author 取内容比对/唯一候选采信的候选作者（无则空，交 labeler toc 回写/review）。
+            if engine_hit.get('list_author_bogus'):
+                entry['list_author_raw'] = engine_hit.get('list_author_raw') or b.get('author', '')
+                entry['author'] = engine_hit.get('author') or ''
             if engine_hit.get('alternates'):
                 # giveup41：主源整站失效时打标阶段按序换用（labeler.fetch_engine_book_with_giveup）
                 entry['engine_alternates'] = engine_hit['alternates']
