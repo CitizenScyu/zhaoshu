@@ -2238,6 +2238,17 @@ class TestContentFingerprint(unittest.TestCase):
         douban_list.fetch_content_fingerprint(cli, 'https://a.example/x', cache=cache)
         self.assertEqual(len(cli.calls), n1)    # 命中缓存：不再发引擎调用
 
+    def test_content_calls_capped_by_attempts_not_hits(self):
+        # N1 反例 R1：500 章、每章正文 ≤100 字（都不计入 body）→ content 调用仍 ≤ CONTENT_MAX_CHAPTERS
+        base = 'https://a.example/x'
+        chapters = [{'title': f'第{i}章', 'url': f'{base}/c{i}'} for i in range(500)]
+        contents = {f'{base}/c{i}': '短' for i in range(500)}
+        books = {base: {'toc': {'title': '书', 'chapters': chapters}, 'contents': contents}}
+        cli = _cm_cli(books)
+        douban_list.fetch_content_fingerprint(cli, base)
+        content_calls = sum(1 for sub, _ in cli.calls if sub == 'content')
+        self.assertLessEqual(content_calls, douban_list.CONTENT_MAX_CHAPTERS)
+
 
 class TestSameBookAndRescue(unittest.TestCase):
     def _fp(self, titles, body, base='https://x/1'):

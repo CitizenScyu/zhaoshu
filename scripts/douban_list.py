@@ -992,9 +992,10 @@ def fetch_content_fingerprint(cli, book_url: str,
                               cache: dict | None = None) -> dict | None:
     """取候选的内容指纹 {'toc': set[标题], 'body': set[n-gram]}；取不到返回 None。
 
-    成本受控：目录 1 次 + 前 max_chapters 章正文；cache（{url: 指纹}）在一次搜索内复用，
-    同一 URL 不重复取文。任何异常（源失效/坏 JSON/超时）→ None（比对方按「无指纹」处理，
-    绝不因取文失败而误判同书）。"""
+    成本受控（N1）：目录 1 次 + **最多发起 max_chapters 次 content 调用**（按实际发起次数封顶，
+    而非按收到 >100 字的章数——否则前若干章都是公告/空壳短章时会逐章发请求、远超预期）。
+    cache（{url: 指纹}）在一次搜索内复用，同一 URL 不重复取文。任何异常（源失效/坏 JSON/
+    超时）→ None（比对方按「无指纹」处理，绝不因取文失败而误判同书）。"""
     if cache is not None and book_url in cache:
         return cache[book_url]
     fp: dict | None = None
@@ -1005,14 +1006,16 @@ def fetch_content_fingerprint(cli, book_url: str,
                       for c in chapters if isinstance(c, dict)}
         toc_titles.discard('')
         body_parts: list[str] = []
+        content_calls = 0
         for ch in chapters:
-            if len(body_parts) >= max_chapters:
+            if content_calls >= max_chapters:     # N1：按实际发起的 content 调用次数封顶
                 break
             if not isinstance(ch, dict):
                 continue
             ch_url = ch.get('url') or ''
             if not ch_url:
                 continue
+            content_calls += 1
             try:
                 text = (_cli_json(cli, 'content', '--url', ch_url) or {}).get('text') or ''
             except Exception:
