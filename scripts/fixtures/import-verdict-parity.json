@@ -224,6 +224,60 @@
   }
  },
  {
+  "why": "lblmeta41 metadata fields accepted as strings",
+  "agree": true,
+  "py": "ready",
+  "mjs": "ready",
+  "record": {
+   "title": "T10",
+   "site_title": "T10",
+   "author": "A10",
+   "category": "cat",
+   "status": "done",
+   "source": "book15.net",
+   "url": "https://book15.net/books/d.html",
+   "chars": 1000,
+   "labels": {
+    "title_guess": "T10-other",
+    "text_quality": "\u6b63\u5e38",
+    "genre": "g",
+    "site_title_match": true,
+    "quality": {
+     "overall": 8
+    }
+   },
+   "label_model": "m1",
+   "prompt_version": "v1",
+   "label_source": "text_book15"
+  }
+ },
+ {
+  "why": "label_source not a string -> failed (both type-check)",
+  "agree": true,
+  "py": "failed",
+  "mjs": "failed",
+  "record": {
+   "title": "T11",
+   "site_title": "T11",
+   "author": "A11",
+   "category": "cat",
+   "status": "done",
+   "source": "book15.net",
+   "url": "https://book15.net/books/d.html",
+   "chars": 1000,
+   "labels": {
+    "title_guess": "T11",
+    "text_quality": "\u6b63\u5e38",
+    "genre": "g",
+    "site_title_match": true,
+    "quality": {
+     "overall": 8
+    }
+   },
+   "label_source": 1
+  }
+ },
+ {
   "why": "site_title with surrounding spaces still strips to equal title -> ready",
   "agree": true,
   "py": "ready",
@@ -271,60 +325,6 @@
      "overall": 8
     }
    }
-  }
- },
- {
-  "why": "lblmeta41 metadata fields accepted as strings",
-  "agree": true,
-  "py": "ready",
-  "mjs": "ready",
-  "record": {
-   "title": "T10",
-   "site_title": "T10",
-   "author": "A10",
-   "category": "cat",
-   "status": "done",
-   "source": "book15.net",
-   "url": "https://book15.net/books/d10.html",
-   "chars": 1000,
-   "labels": {
-    "title_guess": "T10-other",
-    "text_quality": "\u6b63\u5e38",
-    "genre": "g",
-    "site_title_match": true,
-    "quality": {
-     "overall": 8
-    }
-   },
-   "label_model": "m1",
-   "prompt_version": "v1",
-   "label_source": "text_book15"
-  }
- },
- {
-  "why": "label_source not a string -> failed (both type-check it)",
-  "agree": true,
-  "py": "failed",
-  "mjs": "failed",
-  "record": {
-   "title": "T10",
-   "site_title": "T10",
-   "author": "A10",
-   "category": "cat",
-   "status": "done",
-   "source": "book15.net",
-   "url": "https://book15.net/books/d10.html",
-   "chars": 1000,
-   "labels": {
-    "title_guess": "T10-other",
-    "text_quality": "\u6b63\u5e38",
-    "genre": "g",
-    "site_title_match": true,
-    "quality": {
-     "overall": 8
-    }
-   },
-   "label_source": 1
   }
  }
 ]
