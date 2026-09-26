@@ -64,7 +64,27 @@ export function admissionMaxProbes(env: AdmissionProbesEnv = process.env): numbe
 interface AdmissionProbesEnv {
   ADMISSION_MAX_PROBES?: string | undefined;
   ADMISSION_PROBE_CONCURRENCY?: string | undefined;
+  ADMISSION_UPGRADED_MAX_PROBES?: string | undefined;
   [key: string]: string | undefined;
+}
+/**
+ * http 升级源首探名额**默认值**（41-srcfix 改法2 放量控制）：bookSourceUrl 为 http:// 的源经升级新进候选池约 199 个，
+ * 全是「未测」class 0，会排在一切复测（class 1）与 ok 复核（class 2）之前把名额吃满好几天。给它们的**首次探测**
+ * 单独设每轮上限（占总名额内，不另加名额）：默认 10 = 默认总名额 20 的一半，另一半照常留给既有积压与复测。
+ * 只管首探——测过一次后它们与普通源同一套复测/复核节奏，不再受此限。
+ */
+export const DEFAULT_ADMISSION_UPGRADED_MAX_PROBES = 10;
+/**
+ * http 升级源每轮首探上限：env `ADMISSION_UPGRADED_MAX_PROBES` 生效。与 admissionMaxProbes 同款解析，但**允许 0**
+ * （= 本轮一个都不首探，相当于放量暂停开关）；非法/负数/缺失回退默认。
+ */
+export function admissionUpgradedMaxProbes(env: AdmissionProbesEnv = process.env): number {
+  const parsed = Number.parseInt(env.ADMISSION_UPGRADED_MAX_PROBES ?? '', 10);
+  return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : DEFAULT_ADMISSION_UPGRADED_MAX_PROBES;
+}
+/** 源声明 URL 是写死 http:// 的（经改法2 升级才进候选池）。 */
+export function isUpgradedHttpSource(source: RawSource): boolean {
+  return /^http:\/\//i.test(String(source.bookSourceUrl ?? ''));
 }
 /**
  * 探测并发度**默认值**:1 = 与历史逐源串行行为逐行一致(零行为变更)。
@@ -711,6 +731,8 @@ export interface AdmissionBatchInput {
    * 1 个名额；换词前按 canProbe 逐次判预算。生产两条写库路径都开；缺省关（单测固定页桩逐字不变）。
    */
   keywordFallback?: boolean;
+  /** http 升级源每轮首探上限覆盖（测试注入用）；缺省走 `admissionUpgradedMaxProbes()`。 */
+  upgradedMaxProbes?: number;
 }
 
 export interface AdmissionBatchResult {
@@ -992,6 +1014,8 @@ export async function runAdmissionBatch(input: AdmissionBatchInput): Promise<Adm
   let grandfathered = 0;
   let probed = 0;
   let probeSlots = Math.max(0, input.maxProbes ?? admissionMaxProbes());
+  // 41-srcfix 改法2 放量控制：http 升级源的首探（class 0）另受每轮上限，占总名额内。
+  let upgradedSlots = Math.max(0, input.upgradedMaxProbes ?? admissionUpgradedMaxProbes());
   const canProbe = input.canProbe ?? (() => true);
   const concurrency = normalizeAdmissionConcurrency(input.probeConcurrency ?? admissionProbeConcurrency());
 
@@ -1003,6 +1027,8 @@ export async function runAdmissionBatch(input: AdmissionBatchInput): Promise<Adm
   const probes: {
     index: number; candidate: AdmissionCandidate; host: string; mutexHost: string; compile: AdmissionCompile; hash: string;
     previous: AdmissionSourceRow | undefined; placeholder: AdmissionSourceRow | undefined;
+    /** http 升级源的首探（未测过）：受 upgradedSlots 限额。 */
+    upgradedFirst: boolean;
   }[] = [];
 
   for (let index = 0; index < plan.length; index += 1) {
@@ -1056,6 +1082,7 @@ export async function runAdmissionBatch(input: AdmissionBatchInput): Promise<Adm
         : undefined;
     probes.push({
       index, candidate, host, mutexHost: admissionMutexHost(candidate, input.declaredHosts), compile, hash, previous, placeholder,
+      upgradedFirst: probeClass === 0 && isUpgradedHttpSource(candidate.source),
     });
   }
 
@@ -1089,11 +1116,13 @@ export async function runAdmissionBatch(input: AdmissionBatchInput): Promise<Adm
       const item = probes[pick];
       // 名额 + canProbe + signal 在每次起探前同步判定(41-ADMIT-CONC-FIX)。判否走「没轮到」占位。
       // 此判定到 searchAdmission 注册 abort 监听之间没有 await,不会漏掉中途中止。
-      if (!(probeSlots > 0 && canProbe() && !input.signal.aborted)) {
+      // 升级源首探额度用完 ⇒ 同样走「没轮到」占位（短路在 canProbe 之前：不额外调用预算判定）。
+      if (!(probeSlots > 0 && (!item.upgradedFirst || upgradedSlots > 0) && canProbe() && !input.signal.aborted)) {
         if (item.placeholder) results[item.index] = item.placeholder;
         continue;
       }
       probeSlots -= 1;
+      if (item.upgradedFirst) upgradedSlots -= 1;
       probed += 1;
       inflightHosts.add(item.mutexHost);
       try {
