@@ -149,10 +149,15 @@ let lastUrlHit: { url: string; etag: string; artifact: PoolArtifact } | null = n
 /** 本实例最近一次写库的时刻：generatedAt 早于它的产物本实例不采信（读己之写，见 noteLocalPoolWrite）。 */
 let localWriteAt = 0;
 
-/** 丢弃进程内产物记忆（本实例写路径发布新产物后、测试之间）。ETag 记忆一并清掉。 */
+/**
+ * 丢弃进程内产物记忆（本实例写路径发布新产物后、测试之间）。ETag 记忆一并清掉。
+ * 同时解除「本实例写库」守卫：发布成功时文件内容 = 写后库态（'unchanged' 也是——内容与写后库态同 hash，只是
+ * generatedAt 沿用旧值，不解除的话本进程要白白回退库读到下一次心跳重写）。
+ */
 export function resetPoolArtifactMemo(): void {
   memo = null;
   lastUrlHit = null;
+  localWriteAt = 0;
 }
 
 /**
