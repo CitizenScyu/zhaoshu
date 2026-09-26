@@ -2,8 +2,8 @@
 
 import { useCallback, useEffect, useState } from 'react';
 import { useOwner } from '@/components/OwnerProvider';
-import { REASONING_CONFIRMATION_CODE } from '@/lib/app-settings';
-import type { LlmModelSettings, LlmModelSource, ReasoningVerdict } from '@/lib/app-settings';
+import { REASONING_CONFIRMATION_CODE } from '@/lib/app-settings-shared';
+import type { LlmModelSettings, LlmModelSource, ReasoningVerdict } from '@/lib/app-settings-shared';
 
 const SOURCE_LABELS: Record<LlmModelSource, string> = {
   database: '数据库设置',
