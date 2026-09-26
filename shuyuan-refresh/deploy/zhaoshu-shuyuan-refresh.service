@@ -12,6 +12,9 @@ EnvironmentFile=/etc/zhaoshu-shuyuan/env
 Environment=HEARTBEAT_FILE=/opt/zhaoshu-shuyuan-refresh/heartbeat.log
 Environment=STATUS_FILE=/opt/zhaoshu-shuyuan-refresh/last-run.status
 Environment=WATCHDOG_MS=150000
+# 41-poolimpl：刷新写库成功后发布源池产物（开关 + 路径；非秘密）。
+Environment=SHUYUAN_POOL_ARTIFACT=1
+Environment=SHUYUAN_POOL_ARTIFACT_PATH=/var/www/zhaoshu-pool/pool-artifact.json
 ExecStart=/opt/node24/bin/node /opt/zhaoshu-shuyuan-refresh/refresh-runner.mjs
 TimeoutStartSec=180
 Nice=10

@@ -1,0 +1,17 @@
+[Unit]
+Description=zhaoshu shuyuan pool artifact (phoenix; refresh-runner --pool-artifact, 41-poolimpl)
+Documentation=file:/opt/zhaoshu-shuyuan-refresh/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+# 与刷新同一 env 文件（只含 DATABASE_URL）；产物路径不是秘密，直接写在单元里。
+EnvironmentFile=/etc/zhaoshu-shuyuan/env
+Environment=SHUYUAN_POOL_ARTIFACT_PATH=/var/www/zhaoshu-pool/pool-artifact.json
+Environment=WATCHDOG_MS=90000
+# 内容未变且未超 6h 心跳时不写文件（ETag 不变，Vercel 侧 304）。
+ExecStart=/opt/node24/bin/node /opt/zhaoshu-shuyuan-refresh/refresh-runner.mjs --pool-artifact
+TimeoutStartSec=120
+Nice=10
