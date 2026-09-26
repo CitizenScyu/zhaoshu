@@ -461,5 +461,127 @@ class TestNormalizeArc(unittest.TestCase):
         self.assertEqual(len(arc['evidence'][0]['quote']), labeler.ARC_QUOTE_MAX)
 
 
+class TestMainLoop(unittest.TestCase):
+    """主循环接线：开关关 → 与改前逐字一致；开 → 分段取文 + v2 + arc + sampling。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dir = Path(self.tmp.name)
+
+    def run_main(self, env_lines, cli, label_fn):
+        (self.dir / '.env').write_text('LLM_API_KEY=test-key-not-real\n' + env_lines,
+                                       encoding='utf-8')
+        book = _book(alternates=['b.example.com'])
+
+        def fake_build(http_get, skip_titles=None, include_douban=True, pages=None,
+                       engine_cli=None, book15_breaker=None):
+            return [json.loads(json.dumps(book))]
+        label_mock = mock.Mock(side_effect=label_fn)
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.dict(os.environ, {'LABELER_DATA_DIR': str(self.dir)}), \
+                mock.patch.object(labeler.douban_list, 'build_webnovel_queue',
+                                  side_effect=fake_build), \
+                mock.patch.object(labeler, '_build_engine_cli', return_value=cli), \
+                mock.patch.object(labeler, 'label_book', label_mock), \
+                mock.patch.object(labeler.time, 'sleep'), \
+                mock.patch.object(sys, 'argv',
+                                  ['labeler.py', '--source', 'webnovel', '--no-db-model']), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = labeler.main()
+        lines = (self.dir / 'labels.jsonl').read_text(encoding='utf-8').splitlines() \
+            if (self.dir / 'labels.jsonl').exists() else []
+        return code, [json.loads(x) for x in lines], label_mock, out.getvalue()
+
+    @staticmethod
+    def base_labels():
+        return {'title_guess': TITLE, 'site_title_match': True, 'text_quality': '正常',
+                'confidence': 0.9, 'genre': '玄幻'}
+
+    def test_switch_off_is_unchanged(self):
+        cli = make_cli({'a.example.com': {'n': 100}, 'b.example.com': {'n': 100}})
+        code, recs, label_mock, out = self.run_main('', cli, lambda *a, **k: (self.base_labels(), 1))
+        self.assertEqual(code, 0)
+        rec = recs[0]
+        self.assertEqual(rec['prompt_version'], 'v1')
+        self.assertNotIn('sampling', rec)
+        self.assertNotIn('arc', rec['labels'])
+        # 仍是「从开头顺序读到 8 万」：只取主源第 0..26 章
+        self.assertEqual(sorted(_idx(c[1]) for c in _content_calls(cli)), list(range(27)))
+        self.assertEqual(rec['chars'], 27 * 3000)
+        # label_book 调用形态与改前一致：不传 system_prompt
+        self.assertEqual(set(label_mock.call_args.kwargs),
+                         {'site_title', 'site_author', 'max_tokens', 'meta'})
+        self.assertNotIn('分布式采样', out)
+
+    def test_switch_on_segments_and_arc(self):
+        cli = make_cli({
+            'a.example.com': {'n': 100, 'body': lambda i: None if i >= 60 else
+                              _chapter_body('a.example.com', i)},
+            'b.example.com': {'n': 100},
+        })
+        seen = {}
+
+        def label_fn(text, *a, **k):
+            seen['text'], seen['kwargs'] = text, k
+            labels = self.base_labels()
+            q1 = _chapter_body('a.example.com', 0)[:30]
+            q4 = _chapter_body('b.example.com', 90)[:30]
+            labels['arc'] = {'decline': 'mild', 'note': '后段注水',
+                             'evidence': [{'segment': 1, 'quote': q1}, {'segment': 4, 'quote': q4},
+                                          {'segment': 3, 'quote': '模型编造的一句话不在原文里'}]}
+            return labels, 1
+
+        code, recs, label_mock, out = self.run_main('LABELER_SEGMENTED=1\n', cli, label_fn)
+        self.assertEqual(code, 0)
+        rec = recs[0]
+        self.assertEqual(rec['prompt_version'], 'v2')
+        self.assertTrue(seen['kwargs']['system_prompt'].startswith(labeler.SYSTEM_PROMPT))
+        self.assertIn('arc', seen['kwargs']['system_prompt'])
+        self.assertIn('【第 4 段：约 90% 处，第 91–95 章】', seen['text'])
+        arc = rec['labels']['arc']
+        self.assertEqual(arc['decline'], 'mild')
+        self.assertEqual([e['segment'] for e in arc['evidence']], [1, 4])
+        self.assertEqual(arc['checked']['dropped'], 1)
+        segs = rec['sampling']['segments']
+        self.assertEqual([s['source'] for s in segs],
+                         ['a.example.com', 'a.example.com', 'b.example.com', 'b.example.com'])
+        self.assertEqual(rec['url'], 'https://a.example.com/book')
+        self.assertEqual(rec['label_source'], 'text_engine')
+        self.assertIn('分布式采样', out)
+        self.assertIn('第3段 b.example.com', out)
+
+    def test_switch_on_forged_evidence_becomes_unknown(self):
+        cli = make_cli({'a.example.com': {'n': 100}, 'b.example.com': {'n': 100}})
+
+        def label_fn(text, *a, **k):
+            labels = self.base_labels()
+            labels['arc'] = {'decline': 'severe', 'evidence': [
+                {'segment': 1, 'quote': '开头紧凑悬念十足引人入胜'},
+                {'segment': 4, 'quote': '后期套路重复注水严重拖沓'}]}
+            return labels, 1
+
+        code, recs, *_ = self.run_main('LABELER_SEGMENTED=1\n', cli, label_fn)
+        arc = recs[0]['labels']['arc']
+        self.assertEqual((arc['decline'], arc['evidence'], arc['checked']['dropped']),
+                         ('unknown', [], 2))
+
+    def test_imports_ignore_new_fields(self):
+        """import_one 的记录校验：labels.arc 与顶层 sampling 不导致 failed（未知字段忽略）。"""
+        import import_one
+        rec = {'title': TITLE, 'site_title': TITLE, 'author': AUTHOR, 'category': '玄幻',
+               'status': '完本', 'source': 'a.example.com', 'url': 'https://a.example.com/book',
+               'prompt_version': 'v2', 'label_model': 'm', 'label_source': 'text_engine',
+               'sampling': {'mode': 'segmented', 'segments': []},
+               'labels': {**self.base_labels(),
+                          'quality': {'prose': 7, 'worldbuilding': 7, 'pacing': 7,
+                                      'enjoyment': 7, 'overall': 7},
+                          'arc': {'decline': 'unknown', 'evidence': [], 'note': '',
+                                  'checked': {'dropped': 0, 'forced': ''}}}}
+        verdict = import_one.validate_record(rec)
+        self.assertEqual(verdict['status'], 'ready', verdict)
+        self.assertEqual(verdict['record']['labels']['arc']['decline'], 'unknown')
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)
