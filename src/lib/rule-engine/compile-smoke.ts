@@ -25,6 +25,11 @@ export const CORE_FIELDS = [
 
 const RULE_GROUPS = ['ruleSearch', 'ruleBookInfo', 'ruleContent', 'ruleToc', 'ruleExplore'] as const;
 
+/** ENGINE_POST_SEARCH 开关（41-postsearch）：开时引擎搜索支持 POST/body/charset、口径放开安全选项源。默认关，关时行为逐字不变。 */
+export function enginePostSearchEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env.ENGINE_POST_SEARCH === '1' || env.ENGINE_POST_SEARCH === 'true';
+}
+
 export interface RawSource {
   bookSourceUrl?: unknown;
   bookSourceName?: unknown;
@@ -67,18 +72,43 @@ function searchIsPureGet(su: unknown): boolean {
   return true;
 }
 
+const POST_OPTION_KEYS = new Set(['method', 'body', 'charset', 'headers']);
+
+/**
+ * 放开口径（41-postsearch，仅 ENGINE_POST_SEARCH 开时）：searchUrl 含 `,{options}` 但选项键
+ * ⊆ {method,body,charset,headers}、无 webView、选项文本无 @js:/<js>/java.*。单引号非严格 JSON 做受限容错；
+ * 解析不了 → 判「不支持」（返回 false，不崩）。webView 与未知键仍拒。
+ */
+function searchOptionsSupported(su: unknown): boolean {
+  if (typeof su !== 'string' || !su.includes('{{key}}')) return false;
+  const base = su.split('##')[0];
+  const optMatch = /,\s*\{/.exec(base);
+  if (!optMatch) return false; // 无选项 → 归 searchIsPureGet 判
+  const urlPart = base.slice(0, optMatch.index);
+  const optionsRaw = base.slice(optMatch.index + 1);
+  if (/@js:|<js>|\bjava\./i.test(urlPart) || /@js:|<js>|\bjava\.|webView/i.test(optionsRaw)) return false;
+  let parsed: unknown = null;
+  for (const candidate of [optionsRaw, optionsRaw.replace(/'/g, '"')]) {
+    try { parsed = JSON.parse(candidate); break; } catch { /* 试下一形态 */ }
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return false;
+  const keys = Object.keys(parsed as Record<string, unknown>);
+  return keys.length > 0 && keys.every((k) => POST_OPTION_KEYS.has(k));
+}
+
 /**
  * 复现主会话初筛（survey.py select_candidates），预期 174 条。
  * 41-srcfix 改法2：bookSourceUrl 写死 `http://` 的源先经 upgradeSourceTemplateUrl 升 https 再判——只改 scheme，
  * host/端口/userinfo 逐字不变，之后准入与运行时照旧过同一把 checkSourceUrl 锁（端口/IP/userinfo 仍被拒）。
  * 无协议（书源名当 URL）与其它 scheme 升级后仍非 https，照旧丢弃。
  */
-export function selectCandidates(data: RawSource[]): RawSource[] {
+export function selectCandidates(data: RawSource[], options: { postSearch?: boolean } = {}): RawSource[] {
   const out: RawSource[] = [];
   for (const s of data) {
     if (!upgradeSourceTemplateUrl(String(s.bookSourceUrl ?? '')).startsWith('https://')) continue;
     if (!rulesNoJs(s)) continue;
-    if (!searchIsPureGet(s.searchUrl)) continue;
+    // 默认口径 = 纯 GET；postSearch 开时额外放行「仅 method/body/charset/headers 选项」的源（webView/未知键仍拒）。
+    if (!searchIsPureGet(s.searchUrl) && !(options.postSearch && searchOptionsSupported(s.searchUrl))) continue;
     const rs = (s.ruleSearch ?? {}) as Record<string, unknown>;
     const rc = (s.ruleContent ?? {}) as Record<string, unknown>;
     if (!(rs && typeof rs === 'object' && rs.bookList)) continue;
