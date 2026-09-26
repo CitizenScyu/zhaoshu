@@ -336,6 +336,47 @@ def author_matches(list_author: str, engine_author: str) -> bool:
 _PUBLISHER_RE = re.compile(r'出版|[书書]局|書房|\bpress\b|\bpublish', re.IGNORECASE)
 
 
+# ---- 名单作者字段污染识别（authcv41 §7）----
+# 豆瓣/名单偶把「分类名」（悬疑灵异/轻小说）或「出版社」塞进作者字段：gate.log 实测
+# `名单 悬疑灵异` 169 行、`名单 轻小说` 52 行、《偷偷藏不住》名单「青岛出版社」。这类
+# 「作者」不是人名、永不匹配任何候选、恒被拦。识别后降级为「名单无作者」，进入内容聚类
+# 路径（_content_rescue_unknown）安全救回；写回作者只取候选作者，绝不把分类名写进去。
+# 严格从紧防误降级（天蚕土豆/辰东等真名不受影响）：
+#   分类——归一后**整串精确等于**已知分类（PRIMARY_GENRES + 少量繁体/名单分类）才判；
+#   出版社——机构后缀须落在**串尾**（青岛出版社/中国友谊出版公司/Penguin Press），故「出版」
+#   二字、以及「出版社的猫」这类恰好含机构词的真名都不误判。
+_BOGUS_PUBLISHER_RE = re.compile(
+    r'(?:出版社|出版公司|出版集团|出版发行|图书公司|文化传媒|書局|书局'
+    r'|press|publishing|publisher|verlag)\s*$', re.IGNORECASE)
+# 名单特有/繁体分类，并入 import_one.PRIMARY_GENRES（后者已含「悬疑灵异」「轻小说」等简体形态）
+_EXTRA_LIST_GENRES = frozenset({'輕小說', '懸疑靈異', '網遊', '网游'})
+
+
+def _genre_key(s: str) -> str:
+    return re.sub(r'\s+', '', unicodedata.normalize('NFKC', s or '')).casefold()
+
+
+def _known_genre_keys() -> frozenset:
+    """已知分类名的归一键集合（复用 import_one.PRIMARY_GENRES；导入失败则仅用本地补集）。"""
+    names = set(_EXTRA_LIST_GENRES)
+    try:
+        import import_one
+        names |= set(import_one.PRIMARY_GENRES)
+    except Exception:
+        pass
+    return frozenset(_genre_key(n) for n in names)
+
+
+def is_bogus_list_author(author: str) -> bool:
+    """名单作者字段是否是被污染的非人名（分类名整串 / 出版社机构名）→ 应降级为名单无作者。"""
+    s = (author or '').strip()
+    if not s:
+        return False
+    if _genre_key(s) in _known_genre_keys():     # 分类：整串精确匹配
+        return True
+    return bool(_BOGUS_PUBLISHER_RE.search(s))    # 出版社：机构后缀
+
+
 def parse_douban_tag_page(html: str) -> list[dict]:
     """豆瓣 tag 页 HTML → [{title, author, douban_url}]。
 
@@ -733,6 +774,11 @@ def search_engine(cli, title: str, author: str = '',
     espfix41：恒带 --no-builtin（book15 已由 search_book15 搜过或已熔断，其候选这里本来就跳过，
     CLI 里再搜一遍是纯浪费——book15 宕机时单这一步就 2×8s）；junk（可选）已判垃圾的 host 经
     --skip-host 跳过，本次候选再喂给 junk.observe 继续识别。"""
+    # authcv41 §7：名单作者字段被污染（分类名/出版社）→ 降级为名单无作者，交内容聚类救回。
+    # 放在组 args 之前，故也不会把污染值当 --author 传给引擎搜索。
+    if author and is_bogus_list_author(author):
+        print(f'  名单作者疑似污染（分类/出版社），降级为名单无作者: 《{title}》原作者字段「{author}」')
+        author = ''
     args = ['--title', title]
     if author:
         args += ['--author', author]

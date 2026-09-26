@@ -2356,5 +2356,65 @@ class TestSameBookAndRescue(unittest.TestCase):
         self.assertFalse(any(c[0] in ('toc', 'content') for c in cli.calls))
 
 
+class TestBogusListAuthor(unittest.TestCase):
+    def test_genre_and_publisher_are_bogus(self):
+        for a in ('悬疑灵异', '轻小说', '玄幻', '仙侠', '言情', '輕小說', '懸疑靈異', '网游',
+                  '青岛出版社', '中国友谊出版公司', '浙江文艺出版社', '某某书局',
+                  'Penguin Press', 'HarperCollins Publishing'):
+            with self.subTest(author=a):
+                self.assertTrue(douban_list.is_bogus_list_author(a))
+
+    def test_real_authors_not_downgraded(self):
+        # 反例：真人作者（含笔名恰好像普通词的），绝不能误降级
+        for a in ('天蚕土豆', '辰东', '出版', '唐家三少', '爱潜水的乌贼', '烽火戏诸侯',
+                  '出版社的猫', '玄幻大师', '', '   '):
+            with self.subTest(author=a):
+                self.assertFalse(douban_list.is_bogus_list_author(a))
+
+    def test_bogus_author_reuses_import_one_genres(self):
+        # 复用 import_one.PRIMARY_GENRES：其中每个分类都应判污染
+        import import_one
+        for g in import_one.PRIMARY_GENRES:
+            if g == '其他':          # 「其他」太泛，不宜作污染判据——确认它不在补集里也未被 PRIMARY 命中前先看
+                continue
+            with self.subTest(genre=g):
+                self.assertTrue(douban_list.is_bogus_list_author(g))
+
+    def test_polluted_author_downgraded_and_rescued(self):
+        # 名单作者=「悬疑灵异」（分类污染），两站实为同一本书 → 降级为名单无作者 → 内容聚类放行，
+        # 采信候选作者（长安天），绝不把「悬疑灵异」写进去
+        base_a, base_b = 'https://a.example/1', 'https://b.example/1'
+        books = {base_a: _cm_book(CM_TITLES_X, CM_BODY_X, base_a),
+                 base_b: _cm_book(CM_TITLES_X_ALT, CM_BODY_X, base_b)}
+        cands = [{'source': 'a.example', 'title': '神秘复苏', 'author': '长安天', 'bookUrl': base_a},
+                 {'source': 'b.example', 'title': '神秘复苏', 'author': '長安天', 'bookUrl': base_b}]
+        cli = _cm_cli(books, cands)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            hit = douban_list.search_engine(cli, '神秘复苏', '悬疑灵异')
+        out = buf.getvalue()
+        self.assertIsNotNone(hit)
+        self.assertIn('降级为名单无作者', out)
+        self.assertIn('内容比对放行', out)
+        # 引擎搜索不应把污染作者当 --author 传下去
+        search_args = next(a for sub, a in cli.calls if sub == 'search')
+        self.assertNotIn('--author', search_args)
+
+    def test_downgrade_is_load_bearing(self):
+        # 变异：把分类识别打空 → 不降级 → 名单有作者、候选全不符 → 被拦（回到坏行为）
+        base_a = 'https://a.example/1'
+        books = {base_a: _cm_book(CM_TITLES_X, CM_BODY_X, base_a)}
+        cands = [{'source': 'a.example', 'title': '神秘复苏', 'author': '长安天', 'bookUrl': base_a}]
+        with mock.patch.object(douban_list, '_known_genre_keys', return_value=frozenset()), \
+                mock.patch.object(douban_list, '_BOGUS_PUBLISHER_RE',
+                                  __import__('re').compile(r'(?!x)x')):
+            cli = _cm_cli(books, cands)
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                hit = douban_list.search_engine(cli, '神秘复苏', '悬疑灵异')
+            self.assertIsNone(hit)                    # 识别失效 → 恢复被拦
+            self.assertNotIn('降级为名单无作者', buf.getvalue())
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)
