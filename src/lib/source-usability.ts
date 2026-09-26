@@ -2,8 +2,9 @@
 // 准入表的 compile_ok/search_ok 是准入当时的结论；这里按**当前**引擎语义与 host 门重算，二者可能不一致
 // （41-swq 实测：sfacg 两条规则 searchUrl 指向门外的 m.sfacg.com，准入记 search_ok，运行时必拒）。
 import { compileSource } from './rule-engine/compile';
+import { enginePostSearchEnabled } from './rule-engine/compile-smoke';
 import { engineSyntaxOrEnabled } from './rule-engine/syntax-flags';
-import { sourceSearchUrl } from './source-parser';
+import { buildSourceSearchRequest, sourceSearchUrl } from './source-parser';
 import { SourcePolicyError } from './source-policy';
 
 /**
@@ -17,10 +18,15 @@ export const REQUIRED_ENGINE_FIELDS = [
 
 interface RuleSource { url: string; searchUrl: unknown; rules: Record<string, unknown> }
 
-/** 搜索模板按运行时口径（含 host 门）展不开时返回 true。非 SourcePolicyError 的异常照常抛。 */
+/**
+ * 搜索模板按运行时口径（含 host 门）展不开时返回 true。非 SourcePolicyError 的异常照常抛。
+ * 与 engineSearchBook 同一分支：ENGINE_POST_SEARCH 开时走 buildSourceSearchRequest（`url,{options}` POST 源可用），
+ * 关时走 sourceSearchUrl（纯 GET，选项模板照旧判不可用）。
+ */
 export function searchTemplateRejected(source: RuleSource, title: string): boolean {
   try {
-    sourceSearchUrl(source.searchUrl, title, source.url);
+    if (enginePostSearchEnabled()) buildSourceSearchRequest(source.searchUrl, title, source.url);
+    else sourceSearchUrl(source.searchUrl, title, source.url);
     return false;
   } catch (error) {
     if (error instanceof SourcePolicyError) return true;
