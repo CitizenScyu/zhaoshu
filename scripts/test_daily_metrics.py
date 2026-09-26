@@ -165,6 +165,29 @@ class ParseNginx(unittest.TestCase):
         got = dm.parse_nginx_logs(('/nonexistent/a.log',), now=self.NOW)
         self.assertEqual(got, {'requests': 0, 'bytes': 0})
 
+    def test_timestamp_is_local_cst_not_utc(self):
+        """回归：日志时间戳是 phoenix 本地 CST(+0800)，必须按 +08:00 解析。
+
+        按 UTC 误读会让窗口整体偏移 8h —— 2026-09-26 实测把传输量从 684 MB
+        算成 1.9 GB。这里 now=UTC 12:00，本地 12:00 的日志应正好落在窗口内
+        （若误按 UTC 解析，它会变成 UTC 12:00 也仍在窗内……故取边界值 8 小时差）。
+        """
+        # 本地 2026-09-27 08:00（CST）= UTC 2026-09-27 00:00。
+        # now 取 UTC 2026-09-27 00:10 ⇒ 该行恰在窗口内（10 分钟前）；
+        # 若误按 UTC 解析成未来 8 小时前…… 直接用差 8h 的另一侧验证。
+        now = datetime(2026, 9, 27, 0, 10, tzinfo=timezone.utc)
+        with tempfile.TemporaryDirectory() as tmp:
+            rows = [
+                # 本地 2026-09-27 07:00 = UTC 2026-09-26 23:00 ⇒ 距 now 1h10m，在窗口内
+                '127.0.0.1 - - [27/Sep/2026:07:00:00 +0800] "POST /sql HTTP/1.1" 200 100 "-" "n"',
+                # 本地 2026-09-26 06:00 = UTC 2026-09-25 22:00 ⇒ 距 now 26h，在窗口外
+                '127.0.0.1 - - [26/Sep/2026:06:00:00 +0800] "POST /sql HTTP/1.1" 200 200 "-" "n"',
+            ]
+            path = self._write(tmp, 'access.log', rows)
+            got = dm.parse_nginx_logs((str(path),), now=now, only_path='/sql')
+            self.assertEqual(got['requests'], 1)
+            self.assertEqual(got['bytes'], 100)
+
 
 class ReviewBacklog(unittest.TestCase):
     """review 积压分类：复用官方判据桩，跳过已导入，按原因计数。"""

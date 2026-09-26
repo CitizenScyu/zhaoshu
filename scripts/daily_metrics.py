@@ -52,6 +52,11 @@ ENV_ALLOWED_KEYS = ('DATABASE_URL',)
 SQL_TIMEOUT_SEC = 30
 WINDOW_HOURS = 24
 
+# phoenix 生产机时区 = CST（UTC+8，`date` 实测）。gate.log 的时间戳与 nginx 日志的
+# `+0800` 都是该本地时间——**必须带 tzinfo 解析**再与 now(UTC) 比较，否则窗口整体偏移
+# 8 小时（2026-09-26 实测：按 UTC 误读会把传输量从 684 MB 算成 1.9 GB）。
+LOCAL_TZ = timezone(timedelta(hours=8))
+
 # ---- gate.log 行格式（2026-09-26 实测样本）----
 #   [2026-09-27 00:28:12] [pid=3276683] [书目=… ] …
 #     80993 字 | 现代言情/青春校园/暗恋成长 | conf 0.99 | 1 次调用
@@ -186,7 +191,7 @@ def parse_gate_log(text, now=None, window_hours=WINDOW_HOURS):
         if match:
             try:
                 current_ts = datetime.strptime(
-                    match.group(1), '%Y-%m-%d %H:%M:%S').replace(tzinfo=timezone.utc)
+                    match.group(1), '%Y-%m-%d %H:%M:%S').replace(tzinfo=LOCAL_TZ)
             except ValueError:
                 pass
         if not in_window():
@@ -234,7 +239,7 @@ def parse_nginx_logs(paths, now=None, window_hours=WINDOW_HOURS,
                         continue
                     try:
                         when = datetime.strptime(
-                            stamp, '%d/%b/%Y:%H:%M:%S').replace(tzinfo=timezone.utc)
+                            stamp, '%d/%b/%Y:%H:%M:%S').replace(tzinfo=LOCAL_TZ)
                     except ValueError:
                         continue
                     if when < cutoff:
@@ -481,8 +486,8 @@ def _fmt_bytes(value):
     return f'{size:.1f} TB'
 
 
-def _arrow(current, previous, lower_is_better=False):
-    """对比箭头：有前值且同类型才比，否则空串。"""
+def _arrow(current, previous, lower_is_better=False, fmt=_fmt_num):
+    """对比箭头：有前值且同类型才比，否则空串。delta 用与主值同款格式化。"""
     if current is None or previous is None:
         return ''
     if not isinstance(current, (int, float)) or not isinstance(previous, (int, float)):
@@ -492,7 +497,7 @@ def _arrow(current, previous, lower_is_better=False):
         return '（持平）'
     up = delta > 0
     good = (not up) if lower_is_better else up
-    return f'（{"↑" if up else "↓"}{abs(delta):,} {"好" if good else "差"}）'
+    return f'（{"↑" if up else "↓"}{fmt(abs(delta))} {"好" if good else "差"}）'
 
 
 def _get(metrics, *path):
@@ -513,7 +518,7 @@ def render_markdown(metrics, previous=None, day=None):
              f'生成于 {metrics.get("generated_at", "")}）', '']
 
     def row(label, value, prev_value=None, lower=False, fmt=_fmt_num):
-        arrow = _arrow(value, prev_value, lower_is_better=lower)
+        arrow = _arrow(value, prev_value, lower_is_better=lower, fmt=fmt)
         return f'| {label} | {fmt(value)} |{arrow} |'
 
     lines += ['## 1. 书库', '', '| 指标 | 值 | 环比昨日 |', '|---|---|---|']
