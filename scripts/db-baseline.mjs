@@ -16,6 +16,7 @@
 //      任何一条不成立就拒绝（未写库），绝不部分登记。
 // 库里比契约多出的列 / 约束 / 索引（运行期与 auth v5–v7 后加的）只报告，不拒绝：0001–0003 不删它们。
 import { AUTH_SCHEMA_VERSION } from '../src/lib/auth-store.ts';
+import { missingLedgerVersions } from '../src/lib/schema-ledger.ts';
 import { BASELINE_LEDGER_SHAPE, BASELINE_SHAPE } from './db-baseline-contract.mjs';
 import { assertIdentifier, inspectSchema, MIGRATION_LOCK_ID, SCHEMA_MIGRATIONS_DDL, TARGET_SCHEMA } from './db-migration-lib.mjs';
 
@@ -263,9 +264,13 @@ export function evaluateBaseline({ report, shape, data, migrations }) {
       refusals.push(`迁移文件 v${version} 的摘要与 baseline 契约登记的 ${BASELINE_CHECKSUMS[version].slice(0, 12)}… 不一致：契约只对那份字节成立`);
     }
   }
+  // baseline 入场核对与运行期闸门（assertAuthSchema）、db:check（evaluateSchema）共用同一「记账连续性」
+  // 判据 missingLedgerVersions：max 判据会放行「中间缺号」库（如 {1..5,7}，max=7）而运行期 503，本处改用
+  // 全集判据消灭这个「baseline 说通过、运行期 503」的同型口子（F2-2）。缺号明细进拒绝信息。
   const authVersion = report.authVersion ?? null;
-  if ((authVersion ?? 0) < AUTH_SCHEMA_VERSION) {
-    refusals.push(`auth 记账版本 ${authVersion ?? '无'} 低于 ${AUTH_SCHEMA_VERSION}：先跑 migrate:auth:prod，再做 baseline`);
+  const authMissing = missingLedgerVersions(report.authVersions ?? [], AUTH_SCHEMA_VERSION);
+  if (authMissing.length) {
+    refusals.push(`auth 记账缺版本 ${authMissing.join(', ')}（需 1..${AUTH_SCHEMA_VERSION} 全部在册）：先跑 migrate:auth:prod，再做 baseline`);
   }
   const { problems, extra } = compareShape(shape);
   for (const problem of problems) refusals.push(`结构不符（${BASELINE_TABLE_SOURCES[problem.table] ?? '?'}）：${JSON.stringify(problem)}`);
