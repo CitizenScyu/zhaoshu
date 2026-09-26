@@ -37,7 +37,7 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Iterable
 
 import douban_list
 
@@ -1158,6 +1158,17 @@ DETERMINISTIC_ENGINE_ERRORS = frozenset({'policy', 'http_4xx', 'no_source'})
 DEAD_HOST_SKIP_KIND = 'dead_host_skipped'
 MIN_BOOK_CHARS = 10_000     # 一本书至少要抓到的字数（不足记「抓取字数不足」）
 
+# ---- 死源跨轮记忆（lblspeed41）----
+# 事故/瓶颈（诊断 lblrate-41 §5.3）：4 个整站失效源（shudugu/bqquge/kxdu/sto66）每轮都要
+# 各失败 DEAD_HOST_GIVEUPS(2) 次才被判死，判定只活一轮，下轮重新累计 —— 每轮几十分钟空抓。
+# 现在把判死结果落一个带时间戳的侧车文件，有效期默认 6 小时；下轮启动直接把这些 host 预置进
+# tracker.dead（零请求）。过期自动重新尝试；站点恢复最多延迟一个有效期才被重新使用，可接受。
+# 文件损坏 / 读写失败 → 静默降级为「不跨轮」（与改前行为一致），绝不让整轮失败。
+DEAD_HOSTS_FILENAME = 'labels-dead-hosts.json'
+DEAD_HOST_TTL_SEC = 6 * 3600        # 侧车有效期（秒）
+DEAD_HOST_TTL_ENV = 'LABELER_DEAD_HOST_TTL_SEC'
+_DEAD_HOSTS_VERSION = 1
+
 
 class EngineSourceGaveUp(RuntimeError):
     """放弃某源：host + 触发类别 + 放弃前已抓到的部分正文（text/chars，供调用方决定是否够用）。"""
@@ -1174,19 +1185,130 @@ def _url_host(url: str) -> str:
         return ''
 
 
-class SourceGiveupTracker:
-    """单轮内按 host 累计放弃次数（不跨轮：站点可能恢复）。dead = 本轮判失效、后续不再请求的 host。"""
+def resolve_dead_host_ttl(env: dict | None = None) -> int:
+    """LABELER_DEAD_HOST_TTL_SEC → 死源侧车有效期（秒）。0 或负数 = **关闭跨轮记忆**（改前行为）；
+    非数字 / 空 → 默认 DEAD_HOST_TTL_SEC。坏配置只回落安全值，不拖垮整轮。"""
+    raw = str((env or {}).get(DEAD_HOST_TTL_ENV) or '').strip()
+    if not raw:
+        return DEAD_HOST_TTL_SEC
+    try:
+        value = int(raw)
+    except ValueError:
+        print(f'  提示: {DEAD_HOST_TTL_ENV}=「{raw}」不是整数，已忽略（用默认 {DEAD_HOST_TTL_SEC}）',
+              file=sys.stderr)
+        return DEAD_HOST_TTL_SEC
+    return value
 
-    def __init__(self, threshold: int = DEAD_HOST_GIVEUPS):
+
+class DeadHostMemory:
+    """死源判定的跨轮侧车（lblspeed41，纯文件读写，可离线单测）。
+
+    文件格式：`{"version": 1, "hosts": {"<host>": <判死时间 unix 秒>}}`。
+    - 每个条目自「上次判死/本轮记入」起 ttl_sec 内有效；每轮启动**看不到未过期条目**即自动重试。
+    - 读取：文件不存在 / 损坏 / 格式不符 / ttl_sec<=0 → 返回空记忆（不跨轮）；只保留未过期条目。
+      若文件里有条目被过滤掉（过期 / 时间戳非法）就即时写回净化后的结果——过期 host 重新启用。
+    - 写入：整文件重写。先写同目录临时文件再 os.replace 原子替换，读者永远看不到半截文件；
+      mkstemp 的 0600 与写入前的 umask 一并在下方说明。任何 OSError 只告警不外抛。
+
+    刻意**不做**的部分：不按 host 记失败**次数**（本类的语义只是「有效期内的坏名单」，
+    次数由单轮的 SourceGiveupTracker 管），不自动恢复（过期即恢复，靠时间戳）。"""
+
+    def __init__(self, path: Path, ttl_sec: int = DEAD_HOST_TTL_SEC, hosts: dict | None = None):
+        self.path = Path(path)
+        self.ttl_sec = ttl_sec
+        self.hosts: dict[str, float] = dict(hosts or {})
+
+    @classmethod
+    def load(cls, path, ttl_sec: int = DEAD_HOST_TTL_SEC, now: float | None = None) -> 'DeadHostMemory':
+        """读侧车 → DeadHostMemory。任何读取 / 解析失败都静默降级为空记忆（不跨轮），绝不让整轮失败。"""
+        now = time.time() if now is None else now
+        mem = cls(path, ttl_sec)
+        if ttl_sec <= 0:
+            return mem                      # 关闸：不读也不写
+        try:
+            payload = json.loads(Path(path).read_text(encoding='utf-8'))
+            raw = payload['hosts']
+            if not isinstance(raw, dict):
+                raise ValueError('hosts 不是对象')
+            entries = {str(h): float(t) for h, t in raw.items() if isinstance(t, (int, float))}
+        except FileNotFoundError:
+            entries = {}
+        except (OSError, ValueError, TypeError, KeyError) as e:
+            print(f'  提示: 死源侧车读取失败（按无跨轮记忆处理）: {e}', file=sys.stderr)
+            entries = {}
+        mem.hosts = {h: t for h, t in entries.items() if now - t < ttl_sec}
+        if mem.hosts != entries:
+            # 判死记录已全部过期（或不合法）→ 落盘净化的结果，别让过期条目继续留着
+            print(f'  提示: 死源侧车 {len(entries) - len(mem.hosts)} 条已过期，重新启用这些源',
+                  file=sys.stderr)
+            mem.save()
+        return mem
+
+    def dead_hosts(self, now: float | None = None) -> set[str]:
+        """当前仍在有效期内的 host 集合。"""
+        now = time.time() if now is None else now
+        return {h for h, t in self.hosts.items() if now - t < self.ttl_sec}
+
+    def add(self, host: str, now: float | None = None) -> None:
+        if host:
+            self.hosts[host] = time.time() if now is None else now
+
+    def save(self) -> None:
+        """原子写侧车（临时文件 + os.replace）。ttl_sec<=0 时不写（关闸）。失败只告警。
+
+        只落 host 名与判死时刻，不含任何 URL / 凭据；读取端也按此结构解析。"""
+        if self.ttl_sec <= 0:
+            return
+        payload = {'version': _DEAD_HOSTS_VERSION, 'hosts': self.hosts}
+        fd = tmp = None
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            fd, tmp = tempfile.mkstemp(dir=str(self.path.parent), prefix='.dead-hosts-')
+            with os.fdopen(fd, 'w', encoding='utf-8') as f:
+                fd = None                   # fdopen 接管后别再由 except 关第二次
+                json.dump(payload, f, ensure_ascii=False)
+            os.replace(tmp, self.path)
+            tmp = None
+        except OSError as e:
+            print(f'  提示: 死源侧车写入失败（不影响本轮）: {e}', file=sys.stderr)
+        finally:
+            # 失败路径不留临时文件；fd 若还没被 fdopen 接管也关掉（Windows 上不关会锁住文件）
+            if tmp is not None:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+
+
+class SourceGiveupTracker:
+    """按 host 累计放弃次数。dead = 判失效、后续不再请求的 host。
+
+    单轮统计在 counts；dead 可由 `dead` 参数预置（lblspeed41 的跨轮记忆：侧车文件里
+    未过期的 host 本轮直接跳过，不发请求）。`on_dead(host)` 在 host **首次**判死时回调一次
+    （用于立即落盘侧车）。"""
+
+    def __init__(self, threshold: int = DEAD_HOST_GIVEUPS,
+                 dead: Iterable[str] = (), on_dead: Callable[[str], None] | None = None):
         self.threshold = threshold
         self.counts: dict[str, int] = {}
-        self.dead: set[str] = set()
+        self.dead: set[str] = set(dead)
+        self.on_dead = on_dead
 
     def record(self, host: str) -> None:
         n = self.counts[host] = self.counts.get(host, 0) + 1
         if n >= self.threshold and host not in self.dead:
             self.dead.add(host)
             print(f'  源失效（本轮）: {host} 已累计放弃 {n} 次，本轮后续条目不再请求该源', flush=True)
+            if self.on_dead is not None:
+                try:
+                    self.on_dead(host)
+                except Exception as e:      # 侧车写入失败不能拖垮整轮（跨轮记忆是优化）
+                    print(f'  提示: 死源侧车写入失败（不影响本轮）: {e}', file=sys.stderr)
 
 
 class EngineIdentityMismatch(Exception):
@@ -1197,17 +1319,59 @@ class EngineIdentityMismatch(Exception):
     专门 catch：写拒收、不调 LLM、不 sleep LLM_INTERVAL。"""
 
 
+# ---- 引擎取文提前止损（lblspeed41）----
+# 瓶颈（诊断 lblrate-41 §5.1）：引擎路径实抓 28–31 万字/本，单本 4–9 分钟，是吞吐天花板。
+# 打标只用样本，用不到全书。各消费方的实际需要（逐条核对见 lblspeed-41-report §2）：
+#   · 抓取门槛 MIN_BOOK_CHARS / 本地预检 PRECHECK_MIN_CHARS = 10 000 字（清洗去重后仍不足即拒收）；
+#   · 试读门要 ≥ PREVIEW_MIN_CHAPTERS(5) 章样本才判；正常网文 2000–5000 字/章；
+#   · 大面积重复/广告注入要「反复出现」才判得出 —— 章数越多越稳；
+#   · label_book：> SEGMENT_CHARS(250 000) 才切两段。旧值 50 万 ⇒ 每本 2 次模型调用 + 2 次 30s 间隔。
+# 取 80 000：对 10 000 留 8 倍余量，对试读门留 4–8 倍章数余量，且 ≤ SEGMENT_CHARS ⇒ 每本 1 次调用。
+# 可回退：LABELER_ENGINE_TARGET_CHARS=500000 恢复旧行为（book15 路径的 TARGET_CHARS 不受影响）。
+ENGINE_TARGET_CHARS = 80_000
+ENGINE_TARGET_CHARS_ENV = 'LABELER_ENGINE_TARGET_CHARS'
+# 质量门硬下限：低于 PRECHECK_MIN_CHARS 时，抓回来的健康书会被「清洗去重后仅 N 字」拒收——
+# 这不是提速而是偷偷改判据。配置值低于它时夹到下限并告警（理由见报告 §2 表 #1/#2）。
+MIN_ENGINE_TARGET_CHARS = PRECHECK_MIN_CHARS
+
+
+def resolve_engine_target_chars(env: dict | None = None) -> int:
+    """LABELER_ENGINE_TARGET_CHARS → 引擎取文字数上限。非正整数忽略并告警；低于质量门下限
+    夹到下限并告警（见 MIN_ENGINE_TARGET_CHARS）；缺省 ENGINE_TARGET_CHARS。
+    任何坏配置都不拖垮整轮，只回落到安全值。"""
+    raw = str((env or {}).get(ENGINE_TARGET_CHARS_ENV) or '').strip()
+    if not raw:
+        return ENGINE_TARGET_CHARS
+    try:
+        value = int(raw)
+    except ValueError:
+        value = 0
+    if value <= 0:
+        print(f'  提示: {ENGINE_TARGET_CHARS_ENV}=「{raw}」不是正整数，已忽略'
+              f'（用默认 {ENGINE_TARGET_CHARS}）', file=sys.stderr)
+        return ENGINE_TARGET_CHARS
+    if value < MIN_ENGINE_TARGET_CHARS:
+        print(f'  提示: {ENGINE_TARGET_CHARS_ENV}={value} 低于质量门下限 '
+              f'{MIN_ENGINE_TARGET_CHARS}，已夹到下限（再低会把健康书按「字数不足」拒收）',
+              file=sys.stderr)
+        return MIN_ENGINE_TARGET_CHARS
+    return value
+
+
 def fetch_book_text_engine(engine_cli, book_url: str,
-                           target_chars: int = TARGET_CHARS,
+                           target_chars: int = ENGINE_TARGET_CHARS,
                            expect_title: str = '',
                            expect_author: str = '',
                            giveup_streak: int = SOURCE_GIVEUP_STREAK,
                            server_error_streak: int = SERVER_ERROR_GIVEUP_STREAK,
                            stats: dict | None = None) -> tuple[str, int]:
-    """引擎源整本（到字数上限）→ (拼接文本, 实际字数)。
+    """引擎源取正文到 target_chars 上限 → (拼接文本, 实际字数)。
+
+    默认 ENGINE_TARGET_CHARS（打标只需样本，见该常量上的理由）；显式传入覆盖，
+    TARGET_CHARS 即恢复「抓满全书」的旧行为。
 
     toc 失败（无章 / 环境错误，CLI 退出码非 0）→ 抛异常，交主循环计失败（不静默产空文本）。
-    单章 content 失败（重试后仍空）跳过，隔离不拖垮整本；target_chars/CHUNK_RETRY/CHAPTER_DELAY
+    单章 content 失败（重试后仍空）跳过，隔离不拖垮整本；CHUNK_RETRY/CHAPTER_DELAY
     与 book15 路径沿用同一常量。
 
     giveup41：toc 确定性失败、或连续 giveup_streak 章同一确定性错误类别 → 抛 EngineSourceGaveUp
@@ -1305,8 +1469,11 @@ def fetch_book_text_engine(engine_cli, book_url: str,
 
 def fetch_engine_book_with_giveup(engine_cli, book: dict, tracker: SourceGiveupTracker,
                                   giveup_streak: int = SOURCE_GIVEUP_STREAK,
+                                  target_chars: int = ENGINE_TARGET_CHARS,
                                   stats: dict | None = None) -> tuple[str, int, dict]:
     """引擎队列条目取正文，主源失效（确定性错误或持续 5xx）时按 engine_alternates 换源 → (text, chars, 实际所用源)。
+
+    target_chars 透传给 fetch_book_text_engine（默认 ENGINE_TARGET_CHARS，见该常量的理由）。
 
     实际所用源 = {'url', 'title', 'source'}，调用方据此改写条目的 url/source_host（产物记真实来源）。
     - 主源：身份不符 / 其他失败照旧上抛（行为同改前）；EngineSourceGaveUp → tracker 记一次放弃、换下一个。
@@ -1332,7 +1499,7 @@ def fetch_engine_book_with_giveup(engine_cli, book: dict, tracker: SourceGiveupT
                 engine_cli, src['url'],
                 expect_title=book.get('title') or '',
                 expect_author=book.get('author') or '',
-                giveup_streak=giveup_streak, stats=attempt_stats)
+                giveup_streak=giveup_streak, target_chars=target_chars, stats=attempt_stats)
             if stats is not None:
                 stats.update(attempt_stats)
             return text, chars, src
@@ -1978,6 +2145,14 @@ def main() -> int:
     print(f'模型链: {models}')
     max_tokens = resolve_max_tokens(env)
     print(f'输出上限 max_tokens: {max_tokens}')
+    # lblspeed41：引擎取文止损与死源跨轮记忆的运行时配置（显式求出再传下去，
+    # 与 REJECT_TERMINAL_THRESHOLD 同理：默认参数在 def 时求值，显式传才是「改配置即生效」）。
+    engine_target_chars = resolve_engine_target_chars(env)
+    dead_host_ttl = resolve_dead_host_ttl(env)
+    print(f'引擎取文字数上限: {engine_target_chars} 字'
+          + ('（LABELER_ENGINE_TARGET_CHARS 覆盖）'
+             if env.get(ENGINE_TARGET_CHARS_ENV) else '（默认，打标只需样本）'))
+    print('死源跨轮记忆: ' + (f'{dead_host_ttl} 秒有效期' if dead_host_ttl > 0 else '关闭'))
     # 断点续传：已写入 labels.jsonl 的书跳过（按详情页 url 判定）
     done_urls = load_done_urls(data_path('labels.jsonl'))
     # 钉子户终态：历史被拒 ≥ REJECT_TERMINAL_THRESHOLD 次的书同样跳过，
@@ -2090,8 +2265,26 @@ def main() -> int:
 
     ok = fail = stub_skipped = 0
     fail_kinds: dict[str, int] = {}
-    # giveup41：本轮按 host 累计「源失效」放弃次数，达阈值后后续条目不再请求该 host。
-    source_giveups = SourceGiveupTracker(DEAD_HOST_GIVEUPS)
+    def _save_dead_hosts(host: str) -> None:
+        """本轮新判死的 host 立即落盘（lblspeed41）：别等轮末——本轮可能被门卫掐断。"""
+        if dead_host_memory is None:
+            return
+        dead_host_memory.add(host, now=time.time())
+        dead_host_memory.save()
+
+    # lblspeed41：本轮按 host 累计「源失效」放弃次数，达阈值后后续条目不再请求该 host。
+    # 跨轮记忆：侧车文件里未过期的 host 直接进 dead（本轮零请求）。文件坏/读写失败静默降级为不跨轮。
+    dead_host_memory = (DeadHostMemory.load(data_path(DEAD_HOSTS_FILENAME),
+                                            ttl_sec=dead_host_ttl, now=time.time())
+                        if dead_host_ttl > 0 else None)
+    source_giveups = SourceGiveupTracker(DEAD_HOST_GIVEUPS,
+                                         on_dead=_save_dead_hosts if dead_host_memory else None)
+    if dead_host_memory is not None:
+        remembered = sorted(dead_host_memory.dead_hosts(now=time.time()))
+        if remembered:
+            source_giveups.dead.update(remembered)
+            print(f'  死源跨轮记忆: {len(remembered)} 个 host 在 {dead_host_ttl // 3600}h 有效期内，'
+                  f'本轮直接跳过（{", ".join(remembered)}）')
 
     def count_failure(kind: str) -> None:
         fail_kinds[kind] = fail_kinds.get(kind, 0) + 1
@@ -2120,7 +2313,7 @@ def main() -> int:
                 # 换源成功则条目 url/source_host 改记实际来源（产物与入库记真实来源）。
                 text, chars, used = fetch_engine_book_with_giveup(
                     engine_cli, b, source_giveups, giveup_streak=SOURCE_GIVEUP_STREAK,
-                    stats=fetch_stats)
+                    target_chars=engine_target_chars, stats=fetch_stats)
                 if used['url'] != b['url']:
                     b['url'], b['source_host'] = used['url'], used['source']
                 if fetch_stats.get('nonbody_chapters') or fetch_stats.get('preview_chapters'):
