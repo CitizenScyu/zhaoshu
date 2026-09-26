@@ -1258,29 +1258,34 @@ def _toc_decides(fp_a: dict, fp_b: dict) -> tuple[bool, bool, float, float]:
 
 
 def same_book(fp_a: dict | None, fp_b: dict | None) -> tuple[bool, dict]:
-    """两个内容指纹是否同一本书 → (bool, {'toc':Jaccard,'lcs':有序比率,'body':相似度,'basis':判据})。
+    """两个内容指纹是否同一本书 → (bool, sim)。
 
-    目录为强判据（M1/§12）：`_toc_decides` 可判且判同即认。目录不可判（信息性章名不足/交集
-    <CONTENT_TOC_MIN_MATCH）→ 退正文兜底（M2 侧更严）。缺任一指纹 → 判否（不猜）。
-    （§12 双信号与门在下一提交把此处改为「目录且正文」都成立才放行。）"""
-    empty = {'toc': 0.0, 'lcs': 0.0, 'body': 0.0, 'basis': 'none'}
+    §12 **双信号与门**：放行必须「目录判同」`_toc_decides` **且**「正文判同」`_body_decides`
+    两者同时成立。任一「不可判」（目录信息性章名不足/交集 <CONTENT_TOC_MIN_MATCH、正文字数不足、
+    取文失败/无指纹）→ 一律不放行。删除了「目录不可判就只看正文」「只凭目录」的单信号放行路径——
+    每个单信号都可能被站点噪声（通用标题、模板正文）单独抬过阈值，双信号与门要求两条证据齐备。
+    原则：宁可少救，不可误放。sim 里 toc_ok/body_ok 分别记两信号是否「可判且判同」。"""
+    empty = {'toc': 0.0, 'lcs': 0.0, 'body': 0.0, 'toc_ok': False, 'body_ok': False, 'basis': 'none'}
     if not fp_a or not fp_b:
         return False, empty
     toc_judgeable, toc_same, toc_sim, lcs = _toc_decides(fp_a, fp_b)
+    body_judgeable, body_same, body_sim = _body_decides(fp_a, fp_b)
+    toc_ok = toc_judgeable and toc_same
+    body_ok = body_judgeable and body_same
+    released = toc_ok and body_ok
+    return released, {'toc': toc_sim, 'lcs': lcs, 'body': body_sim,
+                      'toc_ok': toc_ok, 'body_ok': body_ok,
+                      'basis': 'toc+body' if released else 'none'}
+
+
+def _body_decides(fp_a: dict, fp_b: dict) -> tuple[bool, bool, float]:
+    """正文信号（M2 + §12）：返回 (judgeable, same, body_jaccard)。
+
+    judgeable：两边**去模板后**正文都须 ≥ CONTENT_MIN_BODY_CHARS 字，否则「不可判」（拿不准）。
+    same：n-gram Jaccard ≥ CONTENT_BODY_JACCARD。二者都为真，正文信号才算「可判且判同」。"""
     body_sim = _jaccard(fp_a.get('body') or set(), fp_b.get('body') or set())
-    if toc_judgeable:
-        return toc_same, {'toc': toc_sim, 'lcs': lcs, 'body': body_sim, 'basis': 'toc'}
-    # 目录信息不足 → 交正文兜底（同书判定的正文侧约束在 M2 收紧：去模板 + 高阈值 + 字数下限）
-    decided = _body_decides(fp_a, fp_b, body_sim)
-    return decided, {'toc': toc_sim, 'lcs': 0.0, 'body': body_sim, 'basis': 'body'}
-
-
-def _body_decides(fp_a: dict, fp_b: dict, body_sim: float) -> bool:
-    """正文兜底判定（M2）：两边**去模板后**正文都须 ≥ CONTENT_MIN_BODY_CHARS 字，且 n-gram
-    Jaccard ≥ CONTENT_BODY_JACCARD 才判同书；字数不足（拿不准）一律判否，与「无参照本不猜」一致。"""
-    if min(fp_a.get('body_chars', 0), fp_b.get('body_chars', 0)) < CONTENT_MIN_BODY_CHARS:
-        return False
-    return body_sim >= CONTENT_BODY_JACCARD
+    judgeable = min(fp_a.get('body_chars', 0), fp_b.get('body_chars', 0)) >= CONTENT_MIN_BODY_CHARS
+    return judgeable, (body_sim >= CONTENT_BODY_JACCARD), body_sim
 
 
 def _cluster_by_content(cli, reps: list[dict], cache: dict) -> tuple[list[list[int]], dict]:
@@ -1337,9 +1342,8 @@ def _content_rescue_unknown(cli, title: str,
         return None
     known = [r for r in reps if _norm_author(r['author'])]
     chosen = known[0] if known else reps[0]
-    sim = max(best['toc'], best['body'])
     print(f'  内容比对放行: 《{title}》名单无作者，{len(reps)} 个候选内容聚为一簇'
-          f'（{best["basis"]} 相似度≈{sim:.2f}），采信作者 {chosen["author"] or "（引擎待定）"}'
+          f'（双信号 目录≈{best["toc"]:.2f}/正文≈{best["body"]:.2f}），采信作者 {chosen["author"] or "（引擎待定）"}'
           f'，参照源 {chosen["hit"].get("source", "")}（content_match）')
     hit = chosen['hit']
     if chosen['author']:                  # M3：把采信作者回带到 hit，供条目 author 回写（不写污染串）
