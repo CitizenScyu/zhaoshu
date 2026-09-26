@@ -3080,7 +3080,8 @@ def main() -> int:
                 # giveup41：主源失效（连续多章跨站跳转/4xx，或持续 5xx）提前放弃并换备选源；
                 # 换源成功则条目 url/source_host 改记实际来源（产物与入库记真实来源）。
                 if segmented:
-                    # lblseg41：四段分布式采样，每段不可用就换源补这一段（见 fetch_book_text_segmented）
+                    # lblseg41：四段分布式采样，每段不可用就换源补这一段（见 fetch_book_text_segmented）。
+                    # used 恒为计划源（口径同开关关）：补段源不改写记录 url，各段来源只进 sampling（rvlblseg 必修 2）
                     text, chars, used, sampling = fetch_book_text_segmented(
                         engine_cli, b, source_giveups, total_chars=engine_target_chars,
                         time_budget_s=seg_time_budget, stats=fetch_stats)
