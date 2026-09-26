@@ -146,10 +146,23 @@ let memo: Memo | null = null;
 /** URL 来源上次成功的响应：下次带 If-None-Match（nginx 静态文件自带 ETag），未变时 304 只回几百字节。 */
 let lastUrlHit: { url: string; etag: string; artifact: PoolArtifact } | null = null;
 
+/** 本实例最近一次写库的时刻：generatedAt 早于它的产物本实例不采信（读己之写，见 noteLocalPoolWrite）。 */
+let localWriteAt = 0;
+
 /** 丢弃进程内产物记忆（本实例写路径发布新产物后、测试之间）。ETag 记忆一并清掉。 */
 export function resetPoolArtifactMemo(): void {
   memo = null;
   lastUrlHit = null;
+}
+
+/**
+ * 本实例写过库（refresh 提交、准入写回、禁用/启用；shuyuan.ts invalidateShuyuanReadCache 调用）：此后只采信
+ * generatedAt 不早于此刻的产物，更早的一律回退库读——改前本实例写后立即可见，产物化不能把它变成「晚一个生成周期」。
+ * 其他实例的可见延迟与改前同量级（改前晚一个读缓存 TTL，改后晚一个产物生成周期，见 poolimpl-41-report §4）。
+ */
+export function noteLocalPoolWrite(now = Date.now()): void {
+  localWriteAt = Math.max(localWriteAt, now);
+  memo = null;
 }
 
 /**
@@ -162,9 +175,13 @@ export function currentPoolArtifact(): Promise<PoolArtifact | null> {
   if (!poolArtifactEnabled()) return Promise.resolve(null);
   const ttl = shuyuanReadCacheTtlMs();
   const now = Date.now();
-  if (ttl <= 0) return loadPoolArtifact();
+  if (ttl <= 0) return loadPoolArtifact().then(notOlderThanLocalWrite);
   if (!memo || memo.expiresAt <= now) memo = { expiresAt: now + ttl, value: loadPoolArtifact() };
-  return memo.value;
+  return memo.value.then(notOlderThanLocalWrite);
+}
+
+function notOlderThanLocalWrite(artifact: PoolArtifact | null): PoolArtifact | null {
+  return artifact && Date.parse(artifact.generatedAt) >= localWriteAt ? artifact : null;
 }
 
 async function loadPoolArtifact(): Promise<PoolArtifact | null> {
