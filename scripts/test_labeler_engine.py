@@ -304,8 +304,8 @@ class TestEngineTocAuthorWriteback(unittest.TestCase):
         self.assertEqual(labeler.engine_author_writeback('', '观棋', '万古仙穹', ''), '')
 
     def test_no_writeback_for_placeholder_author(self):
-        # rvauthor 建议 4：占位作者视同空作者，不回写
-        for a in ('佚名', '未知', '未知作者', '暂无', '匿名'):
+        # rvauthor 建议 4：占位作者视同空作者，不回写（含繁体形态 無名氏/暫無/無）
+        for a in ('佚名', '未知', '未知作者', '暂无', '匿名', '無名氏', '暫無', '無'):
             with self.subTest(a=a):
                 self.assertEqual(labeler.engine_author_writeback('', a, '书', '书'), '')
                 self.assertEqual(labeler._clean_engine_author(a), '')
@@ -324,18 +324,6 @@ class TestEngineTocAuthorWriteback(unittest.TestCase):
         self.assertEqual(
             labeler.engine_author_writeback('', stats['toc_author'], '斗罗大陆', stats['toc_title']),
             '唐家三少')
-
-    def test_no_toc_author_in_stats_on_identity_mismatch(self):
-        # 身份不符 → 抛异常、stats 里不出现 toc_author（记录组装根本不会执行 → 不回写）
-        cli = FakeEngineCli(
-            lambda sub, url: self._toc_proc('斗破苍穹', '别人') if sub == 'toc'
-            else _content('正' * 200))
-        stats = {}
-        with self.assertRaises(labeler.EngineIdentityMismatch):
-            labeler.fetch_book_text_engine(cli, 'https://y/x',
-                                           expect_title='斗破苍穹',
-                                           expect_author='天蚕土豆', stats=stats)
-        self.assertNotIn('toc_author', stats)
 
     def test_no_toc_author_in_stats_on_identity_mismatch(self):
         # 身份不符 → 抛异常、stats 里不出现 toc_author（记录组装根本不会执行 → 不回写）
@@ -906,6 +894,73 @@ class TestMainSwitchesSourceAndRecordsIt(unittest.TestCase):
         text = out.getvalue()
         self.assertIn('失败分类: 源失效放弃 1', text)
         self.assertIn('源失效（本轮）: www.bqquge.org', text)       # 两本各放弃一次 → 本轮判失效
+
+
+class TestMainWritebackUsesListTitle(unittest.TestCase):
+    """rvauthor 增量必修：回写书名收紧要走真实路径。引擎条目由 _resolve_candidates 构造
+    （名单书名进 list_title、候选站点标题进 title），主循环回写点用 list_title 与 toc 标题比
+    「完全相等」——只前缀兼容的错书不回写。不直接给 engine_author_writeback 传参。"""
+
+    def _cli(self, toc_title, toc_author):
+        def handler(sub, url):
+            if sub == 'toc':
+                return _proc(0, json.dumps(
+                    {'source': labeler._url_host(url), 'title': toc_title, 'author': toc_author,
+                     'chapters': [{'title': '第一章', 'url': url + '/c1'}]}, ensure_ascii=False))
+            return _content('正' * 11000)
+        return FakeEngineCli(handler)
+
+    def _resolve_entry(self, cli, list_title, cand_title, cand_url='https://src.example.com/b/x'):
+        """真实跑 _resolve_candidates（stub 掉搜索）建引擎条目。"""
+        with mock.patch.object(labeler.douban_list, 'search_book15', return_value=None), \
+                mock.patch.object(labeler.douban_list, 'search_engine',
+                                  return_value={'url': cand_url, 'title': cand_title,
+                                                'source': 'src.example.com'}), \
+                mock.patch.object(labeler.douban_list.time, 'sleep'):
+            queue = labeler.douban_list._resolve_candidates(
+                [{'title': list_title, 'author': '', 'origin': '17K完本', 'douban_url': ''}],
+                http_get=lambda *a, **k: '', origin='17K完本', engine_cli=cli)
+        return queue[0]
+
+    def test_entry_preserves_list_title(self):
+        # 条目 title = 候选站点标题；名单书名另存 list_title（否则回写点无从比对）
+        entry = self._resolve_entry(self._cli('万古仙穹外传', '另一作者'), '万古仙穹', '万古仙穹外传')
+        self.assertEqual(entry['title'], '万古仙穹外传')
+        self.assertEqual(entry['list_title'], '万古仙穹')
+        self.assertTrue(entry['engine'])
+
+    def _run_main_and_read_record(self, entry, cli):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        d = Path(tmp.name)
+        (d / '.env').write_text('LLM_API_KEY=test-key-not-real\n', encoding='utf-8')
+        labels = {'title_guess': entry['title'], 'site_title_match': True, 'text_quality': '正常'}
+        with mock.patch.dict(os.environ, {'LABELER_DATA_DIR': str(d)}), \
+                mock.patch.object(labeler.douban_list, 'build_webnovel_queue',
+                                  side_effect=lambda *a, **k: [dict(entry)]), \
+                mock.patch.object(labeler, '_build_engine_cli', return_value=cli), \
+                mock.patch.object(labeler, 'label_book', return_value=(labels, 1)), \
+                mock.patch.object(labeler.time, 'sleep'), \
+                mock.patch.object(sys, 'argv', ['labeler.py', '--source', 'webnovel', '--no-db-model']), \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            labeler.main()
+        return json.loads((d / 'labels.jsonl').read_text(encoding='utf-8').splitlines()[0])
+
+    def test_prefix_compatible_wrong_book_is_not_written_back(self):
+        # 名单《万古仙穹》命中候选《万古仙穹外传》（另一本）→ toc 标题≠名单书名 → 不回写，作者留空
+        cli = self._cli('万古仙穹外传', '另一作者')
+        entry = self._resolve_entry(cli, '万古仙穹', '万古仙穹外传')
+        rec = self._run_main_and_read_record(entry, cli)
+        self.assertEqual(rec['author'], '')
+        self.assertNotIn('author_source', rec)
+
+    def test_exact_title_match_writes_back(self):
+        # 名单《万古仙穹》命中同名候选，toc 标题=名单书名 → 回写 toc 作者
+        cli = self._cli('万古仙穹', '观棋')
+        entry = self._resolve_entry(cli, '万古仙穹', '万古仙穹')
+        rec = self._run_main_and_read_record(entry, cli)
+        self.assertEqual(rec['author'], '观棋')
+        self.assertEqual(rec['author_source'], 'engine_toc')
 
 
 class TestServerErrorGiveup(unittest.TestCase):

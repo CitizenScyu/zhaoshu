@@ -2169,9 +2169,11 @@ def main() -> int:
                 # 记录 author，让引擎兜底书也能过 import_one 空作者护栏。名单有作者时**不动**；
                 # 作者歧义护栏在搜索阶段已跑过（到这里的书都已通过），此处不绕开、不重判。
                 # toc_author/toc_title 仅在目录身份校验通过后才进 fetch_stats（见 fetch_book_text_engine）。
+                # 书名比对用 list_title（名单书名，_resolve_candidates 存下）——engine 条目的 b['title']
+                # 已是候选站点标题，用它会退化成「候选标题 vs 同页 toc 标题」而放过前缀兼容错书（rvauthor 增量）。
                 engine_author = engine_author_writeback(
                     b.get('author', ''), fetch_stats.get('toc_author') or '',
-                    b.get('title', ''), fetch_stats.get('toc_title') or '')
+                    b.get('list_title') or b.get('title', ''), fetch_stats.get('toc_title') or '')
                 if engine_author:
                     b['author'], b['author_source'] = engine_author, 'engine_toc'
                     print(f'  引擎目录作者回写: {engine_author}（名单作者为空）')

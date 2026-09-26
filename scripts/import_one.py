@@ -716,8 +716,10 @@ class AutoImporter:
                           [record['title']])
         twin = find_twin(rows, record['author'])
         if twin is not None:
+            # 输出两侧原始作者，便于人工复核宽松键有没有把「同名书不同作者」误合（rvauthor 增量建议 3）
             self.log(f'  自动导入: 与既有非不动点行 id={twin.get("id")} 归一后身份相同，'
-                     f'跳过写入（避免凭空多一行）')
+                     f'跳过写入（避免凭空多一行）；库内作者={twin.get("author")!r} '
+                     f'本次作者={record.get("author")!r}')
             return 'twin-skipped'
         query, params = build_upsert(record)
         self._exec_write(query, params, '标签 UPSERT')

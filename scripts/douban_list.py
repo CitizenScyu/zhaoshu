@@ -163,10 +163,12 @@ def _norm_author(s: str) -> str:
 
 
 # 占位作者（非真实署名）：对齐 src/lib/source-parser.ts knownSourceAuthor 的 {佚名/未知/未知作者}，
-# 再并入常见的 暂无/匿名/无名氏。归一化（NFKC+去空白+casefold）后命中即视同空作者
+# 再并入常见的 暂无/匿名/无名氏 及其繁体形态（無名氏/暫無/無，rvauthor 增量建议 2——本清单不做
+# 繁转简，故繁体形态直接列出）。归一化（NFKC+去空白+casefold）后命中即视同空作者
 # （回写不写、身份键不参与匹配）。
 _PLACEHOLDER_AUTHORS = frozenset({
     '佚名', '未知', '未知作者', '暂无', '暂无作者', '匿名', '无名氏', '佚名氏', '无',
+    '無名氏', '暫無', '暫無作者', '無',
 })
 
 
@@ -1001,6 +1003,9 @@ def _resolve_candidates(candidates: list[dict], http_get, origin: str = '',
                 engine_disabled = True
         if engine_hit:
             entry = {'url': engine_hit['url'], 'title': engine_hit['title'],
+                     # 名单书名（rvauthor 增量必修）：engine_hit['title'] 是候选站点标题，会覆盖
+                     # 名单书名；打标回写要用名单书名与 toc 标题比「完全相等」，故在条目里另存一份。
+                     'list_title': b.get('title', ''),
                      'author': b.get('author', ''),
                      'category': origin or b.get('origin', ''),
                      'status': '',
