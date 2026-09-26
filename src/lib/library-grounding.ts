@@ -144,7 +144,7 @@ const VETO_GROUPS: { label: string; terms: string[] }[] = [
 
 // 画像行里出现这些限定词，说明不是无条件的一票否决（「少量后宫可以接受」），整行交给模型。
 const PROFILE_QUALIFIER = /不介意|可接受|能接受|可以接受|不排斥|不反感|除非|除外|例外|也行|都行|无所谓|少量|轻度|适度/;
-// 标签侧的否定 / 弱化：词前 3 字、词后 4 字窗口。
+// 标签侧的否定 / 弱化：词前 3 字、词后 6 字窗口（后窗要容下「倾向不明显」这类中间隔两字的写法）。
 const LABEL_NEGATION_BEFORE = /[无没非不零拒避]/;
 const LABEL_WEAKENING_AFTER = /不明显|较少|很少|极少|偏少|淡|弱|克制|有限/;
 
@@ -175,7 +175,7 @@ function cleanHitAt(text: string, term: string): number {
   const lower = text.toLowerCase();
   for (let at = lower.indexOf(term); at !== -1; at = lower.indexOf(term, at + 1)) {
     const before = lower.slice(Math.max(0, at - 3), at);
-    const after = lower.slice(at + term.length, at + term.length + 4);
+    const after = lower.slice(at + term.length, at + term.length + 6);
     if (!LABEL_NEGATION_BEFORE.test(before) && !LABEL_WEAKENING_AFTER.test(after)) return at;
   }
   return -1;
