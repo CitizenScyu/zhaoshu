@@ -3,6 +3,7 @@ import {
   consumeFindSSE,
   fetchFindResult,
   persistWarning,
+  vetoedBooks,
   zeroResultNote,
   type SseEvent,
 } from './find-sse';
@@ -223,5 +224,82 @@ describe('流读完后不留过期的超时定时器', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+
+// 41-veto-visible：书库标签确定性命中画像雷点的书被重排前移出，服务端随 result 帧带 vetoed，
+// 前端此前直接丢弃。这里钉「怎么解析」与「畸形输入不炸」，渲染另在 FindTab.test.tsx。
+describe('被画像雷点否决的书：vetoed 帧的解析', () => {
+  it('正常数组：逐项取 title/author/reason，短路词与理由都保留', () => {
+    const books = vetoedBooks({
+      type: 'result',
+      items: [{ title: '留下的书' }],
+      vetoed: [{ title: '后宫书', author: '作者乙', reason: '书库题材标签「后宫」命中你画像里的雷点「后宫」' }],
+    });
+    expect(books).toEqual([
+      { title: '后宫书', author: '作者乙', reason: '书库题材标签「后宫」命中你画像里的雷点「后宫」' },
+    ]);
+  });
+
+  it('合法零结果帧（items 为空）里照样解析——全被否决时用户最需要看到理由', () => {
+    const books = vetoedBooks({
+      type: 'result', items: [], zeroReason: '……', zeroSuggestion: '……',
+      vetoed: [{ title: '书甲', author: '甲', reason: '子句' }],
+    });
+    expect(books.map((b) => b.title)).toEqual(['书甲']);
+  });
+
+  it('与 persisted=false 同帧时互不干扰（写库失败不等于没有排除项）', () => {
+    const books = vetoedBooks({
+      type: 'result', items: [{ title: 'x' }], persisted: false,
+      vetoed: [{ title: '书乙', author: '乙', reason: 'r' }],
+    });
+    expect(books).toHaveLength(1);
+  });
+
+  it('字段缺失 / 非 result 帧 / 非数组：一律空数组（旧客户端旧事件行为不变）', () => {
+    expect(vetoedBooks({ type: 'result', items: [] })).toEqual([]);
+    expect(vetoedBooks({ type: 'progress', step: 'verify' })).toEqual([]);
+    expect(vetoedBooks({ type: 'result', items: [], vetoed: null })).toEqual([]);
+    expect(vetoedBooks({ type: 'result', items: [], vetoed: '后宫' })).toEqual([]);
+    expect(vetoedBooks({ type: 'result', items: [], vetoed: {} })).toEqual([]);
+  });
+
+  it('畸形项不炸整段：缺 title 丢弃该项，非字符串 author/reason 退化为空串', () => {
+    const books = vetoedBooks({
+      type: 'result', items: [],
+      vetoed: [
+        { author: '无书名作者', reason: '被丢掉' },
+        { title: '', author: '甲', reason: '空书名也丢掉' },
+        'not-an-object',
+        { title: ' 有效书 ', author: 42, reason: null },
+      ],
+    });
+    expect(books).toEqual([{ title: '有效书', author: '', reason: '' }]);
+  });
+
+  it('上界收敛：条数截到 20，字段按码点截断且不切开代理对', () => {
+    const many = Array.from({ length: 30 }, (_, i) => ({ title: `书${i}`, author: '甲', reason: 'r' }));
+    expect(vetoedBooks({ type: 'result', items: [], vetoed: many })).toHaveLength(20);
+
+    const books = vetoedBooks({
+      type: 'result', items: [],
+      vetoed: [{ title: '📚'.repeat(80), author: '甲', reason: '理'.repeat(400) }],
+    });
+    const [b] = books;
+    // 截断标记是「…」而非乱码：按码点切，代理对不被劈开。
+    expect(b.title.endsWith('…')).toBe(true);
+    expect(Array.from(b.title)).toHaveLength(60);
+    expect(b.reason.endsWith('…')).toBe(true);
+    expect(Array.from(b.reason)).toHaveLength(120);
+    expect(b.title).not.toContain('�');
+  });
+
+  it('端到端：vetoed 经真实 SSE 消费路径后仍可解析（不是只骗过纯函数）', async () => {
+    const res = sseResponse([
+      frame({ type: 'result', step: 'rerank', items: [{ title: 'x' }], vetoed: [{ title: '后宫书', author: '乙', reason: '标签含后宫' }] }),
+    ]);
+    const event = await fetchFindResult(new AbortController().signal, () => Promise.resolve(res), 1000, () => {});
+    expect(vetoedBooks(event)).toEqual([{ title: '后宫书', author: '乙', reason: '标签含后宫' }]);
   });
 });

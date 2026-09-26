@@ -160,3 +160,47 @@ export function zeroResultNote(event: SseEvent): string | null {
   const suggestion = typeof event.zeroSuggestion === 'string' ? event.zeroSuggestion.trim() : '';
   return [reason, suggestion].filter(Boolean).join(' ') || null;
 }
+
+/* ---------- 41-veto-visible：被画像雷点否决的书 ---------- */
+
+/** 结果帧里一本「因画像雷点被自动排除」的书。 */
+export interface VetoedBook {
+  title: string;
+  author: string;
+  reason: string;
+}
+
+// SSE 是服务端直下的数据，客户端展示前必须自己设上界：没上界就把「服务端说了算」交给
+// 不受控的数组长度与字符串长度。条数与每本字段都按码点截断（不切开代理对）。
+const VETOED_MAX_ITEMS = 20;
+const VETOED_TITLE_MAX = 60;
+const VETOED_AUTHOR_MAX = 40;
+const VETOED_REASON_MAX = 120;
+
+function clipChars(value: string, max: number): string {
+  const chars = Array.from(value.trim());
+  return chars.length > max ? `${chars.slice(0, max - 1).join('')}…` : chars.join('');
+}
+
+/**
+ * 解析 result 帧顶层的 vetoed 数组——服务端在 rerank 收尾（有结果与合法零结果两条路径）都随
+ * result 帧带上它，前端此前直接丢弃，于是被否决的书只是「消失」、用户看不到原因。
+ *
+ * 畸形容忍：非 result 帧 / 字段缺失 / 非数组都返回空数组（旧客户端、旧事件、开关关都走这里，
+ * 行为与接入前一致）。单项缺 title 就丢弃这一项（连书名都没有就无从展示）；author/reason
+ * 非字符串退化为空串，其余字段仍可用。作者可能的筛除、理由过长都在这里收口。
+ */
+export function vetoedBooks(event: SseEvent): VetoedBook[] {
+  if (event.type !== 'result' || !Array.isArray(event.vetoed)) return [];
+  const books: VetoedBook[] = [];
+  for (const raw of event.vetoed.slice(0, VETOED_MAX_ITEMS)) {
+    if (!isRecord(raw)) continue;
+    if (typeof raw.title !== 'string' || raw.title.trim() === '') continue;
+    books.push({
+      title: clipChars(raw.title, VETOED_TITLE_MAX),
+      author: typeof raw.author === 'string' ? clipChars(raw.author, VETOED_AUTHOR_MAX) : '',
+      reason: typeof raw.reason === 'string' ? clipChars(raw.reason, VETOED_REASON_MAX) : '',
+    });
+  }
+  return books;
+}
