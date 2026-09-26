@@ -34,8 +34,22 @@ describe('环境变量样例覆盖', () => {
     ["方括号 env['<K>']", `export const f = (env) => env['${K}'];`],
     ['解构 const { <K> } = env', `export const f = (env) => { const { ${K} } = env; return ${K}; };`],
     ['比较（读取，非写入）env.<K> === ', `export const f = (env) => env.${K} === '0';`],
+    ['可选链 env?.<K>（F3-1）', `export const f = (env) => env?.${K};`],
   ])('识别形参式 env 读取：%s', (_label, source) => {
     expect(missesFoo(source)).toBe(true);
+  });
+
+  // F3-1：过去漏认的四种写法，各补一例（均应被识别为读取）。
+  it.each([
+    ["方括号 process.env['<K>']", `export const f = () => process.env['${K}'];`],
+    ['可选链 process.env?.<K>', `export const f = () => process.env?.${K};`],
+    ['解构 const { <K> } = process.env', `export const f = () => { const { ${K} } = process.env; return ${K}; };`],
+  ])('识别 F3-1 新写法：%s', (_label, source) => {
+    expect(missesFoo(source)).toBe(true);
+  });
+
+  it("识别 F3-1：Python os.getenv('<K>')", () => {
+    expect(missesFoo(`def f():\n    return os.getenv('${K}')\n`, 'scripts/probe.py')).toBe(true);
   });
 
   it("识别 Python env.get('<K>') 与 env['<K>']", () => {
@@ -57,8 +71,14 @@ describe('环境变量样例覆盖', () => {
     ["child_env['<K>']（派生变量名）", `export const f = (child_env) => child_env['${K}'];`, false],
     ['写入 env.<K> =（代码自设，非部署者提供）', `export const f = (env) => { env.${K} = '1'; };`, false],
     ['delete env.<K>（删除，非读取）', `export const f = (env) => { delete env.${K}; };`, false],
+    // F3-2：方括号写入 `env['<K>'] =` 与复合赋值都算写入，不应报（过去只排除点式写入）。
+    ["写入 env['<K>'] =（方括号写入，F3-2）", `export const f = (env) => { env['${K}'] = '1'; };`, false],
+    ['复合赋值 env.<K> +=（写入，F3-2）', `export const f = (env) => { env.${K} += 'x'; };`, false],
+    ["复合赋值 env['<K>'] +=（方括号写入，F3-2）", `export const f = (env) => { env['${K}'] += 'x'; };`, false],
+    // 反向守住：方括号比较 `env['<K>'] ===` 仍是读取，别被写入排除误伤。
+    ["比较 env['<K>'] ===（方括号读取）", `export const f = (env) => env['${K}'] === '0';`, true],
   ])('边界：%s', (_label, source, expected) => {
-    // process.env 前缀仍应被识别（既有能力）；其余四例不应报为独立 env 读取。
+    // process.env 前缀仍应被识别（既有能力）；其余不应报为独立 env 读取（写入 / 派生变量 / 无关对象）。
     expect(missesFoo(source)).toBe(expected);
   });
 });

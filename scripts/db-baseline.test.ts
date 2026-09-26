@@ -270,7 +270,10 @@ maybe('PGlite 真库', () => {
       ['app_settings 缺 id=1 行（0003:26）', 'DELETE FROM app_settings', /数据不符（0003:26）/],
       ['profile 缺 id=1 行（0001:78）', 'DELETE FROM profile', /数据不符（0001:78）/],
       ['auth 记账缺 v2（0001:210）', 'DELETE FROM auth_schema_migrations WHERE version = 2', /数据不符（0001:210）/],
-      ['auth 记账低于 7', 'DELETE FROM auth_schema_migrations WHERE version = 7', /auth 记账版本 6 低于 7/],
+      ['auth 记账缺最高版本 v7（max 判据放行、连续性判据拒绝）', 'DELETE FROM auth_schema_migrations WHERE version = 7', /auth 记账缺版本 7（需 1\.\.7 全部在册）/],
+      // F2-2：中间缺号（max 仍是 7，旧 max<7 判据会放行）。这里删 v5——不在 auth-ledger-1-4 数据核对（只看 1..4）
+      // 覆盖范围内，故唯一触发的就是入场核对的连续性判据，直接证明「缺中间版本被拒」。
+      ['auth 记账缺中间版本 v5（F2-2：唯连续性判据能挡）', 'DELETE FROM auth_schema_migrations WHERE version = 5', /auth 记账缺版本 5（需 1\.\.7 全部在册）/],
       ['空记账表但形状与 runner 建的不同（复审 #1）', 'CREATE TABLE schema_migrations (version integer PRIMARY KEY, name text NOT NULL, checksum text NOT NULL, applied_at timestamptz NOT NULL DEFAULT now())',
         /schema_migrations 为空但结构与 runner 建的不同.*"column":"checksum"/],
       ['空记账表多一列可空列（复审 #N1：extra 也算形状不同）', `${SCHEMA_MIGRATIONS_DDL}; ALTER TABLE schema_migrations ADD COLUMN note text`,
@@ -358,7 +361,7 @@ maybe('PGlite 真库', () => {
     const client = createPGliteClient(pg);
     const report = await runProdBaseline(client, await load(), 'dry-run');
     expect(report.status).toBe('refused');
-    expect(report.refusals.join('\n')).toMatch(/auth 记账版本 无 低于 7/);
+    expect(report.refusals.join('\n')).toMatch(/auth 记账缺版本 1, 2, 3, 4, 5, 6, 7（需 1\.\.7 全部在册）/);
     expect(report.problems).toHaveLength(20);
     expect((await runProdMigrate(client, await load(), 'dry-run')).status).toBe('dry-run');
   }, 60_000);
