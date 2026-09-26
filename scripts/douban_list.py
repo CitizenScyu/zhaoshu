@@ -135,6 +135,23 @@ def _strip_author_label(text: str) -> str:
         text = rest
 
 
+_T2S_TRANS = None
+
+
+def _to_simplified(text: str) -> str:
+    """繁转简（authcv41 §8）：复用 import_one._T2S 同一张表，使打标期身份口径与入库身份键
+    （import_one._loose_author_key / find_twin，本就 `_norm_author(_to_simplified(raw))`）对齐。
+    表按 str.translate 缓存一次；import_one 不可用时退化为不转换（不影响原有严格相等判定）。"""
+    global _T2S_TRANS
+    if _T2S_TRANS is None:
+        try:
+            import import_one
+            _T2S_TRANS = str.maketrans(import_one._T2S)
+        except Exception:
+            _T2S_TRANS = {}
+    return text.translate(_T2S_TRANS)
+
+
 def _norm_author(s: str) -> str:
     """作者身份比对前的归一化：前导「作者：」标签/空白（含全角）/分隔标点/尾部著述后缀/前导国籍段/casefold。
 
@@ -159,7 +176,7 @@ def _norm_author(s: str) -> str:
         if stripped == text:
             break
         text = stripped
-    return text
+    return _to_simplified(text)     # authcv41 §8：繁转简，与入库身份键 _loose_author_key 对齐
 
 
 # 占位作者（非真实署名）：对齐 src/lib/source-parser.ts knownSourceAuthor 的 {佚名/未知/未知作者}，

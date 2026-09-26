@@ -2416,5 +2416,73 @@ class TestBogusListAuthor(unittest.TestCase):
             self.assertNotIn('降级为名单无作者', buf.getvalue())
 
 
+class TestNormAuthorSimplified(unittest.TestCase):
+    """authcv41 §8：_norm_author 繁转简，口径与 import_one 入库身份键对齐。
+    覆盖范围 = import_one._T2S 那张常用字表（约 130 字，含多数姓氏/常用名字）；
+    表未收的字（觀/偽/篤 等）不桥接，见 test_reused_table_coverage_gap。"""
+
+    # 全部用字均在 import_one._T2S 表内
+    def test_traditional_simplified_norm_equal(self):
+        for trad, simp in (('餘華', '余华'), ('張愛玲', '张爱玲'), ('風雲', '风云'),
+                           ('顧曉夢', '顾晓梦'), ('龍傑', '龙杰'), ('陳靜', '陈静')):
+            with self.subTest(pair=(trad, simp)):
+                self.assertEqual(douban_list._norm_author(trad), douban_list._norm_author(simp))
+
+    def test_author_matches_bridges_traditional(self):
+        for trad, simp in (('餘華', '余华'), ('張愛玲', '张爱玲'), ('風雲', '风云'), ('龍傑', '龙杰')):
+            with self.subTest(pair=(trad, simp)):
+                self.assertTrue(douban_list.author_matches(trad, simp))
+                self.assertTrue(douban_list.author_matches(simp, trad))
+
+    def test_aligned_with_import_one_loose_key(self):
+        # 与入库身份键同口径：非占位作者，_norm_author(raw) == _loose_author_key(raw)
+        import import_one
+        for a in ('餘華', '张爱玲', '風雲', '唐家三少', '作者：天蚕土豆', '[美]乔治·R.R.马丁'):
+            with self.subTest(author=a):
+                self.assertEqual(douban_list._norm_author(a), import_one._loose_author_key(a))
+
+    def test_distinct_authors_still_distinct_after_conversion(self):
+        # 反例说明：繁转简只统一「同一姓名的繁/简写法」，不会把不同的人并到一起
+        self.assertNotEqual(douban_list._norm_author('風雲'), douban_list._norm_author('風靈'))
+        self.assertNotEqual(douban_list._norm_author('張愛玲'), douban_list._norm_author('張愛民'))
+        self.assertFalse(douban_list.author_matches('餘華', '张伟'))
+
+    def test_reused_table_coverage_gap(self):
+        # 诚实记录：复用的表未收 觀/偽/篤 等字，故 gate.log 里的《凌霄之上》觀棋/观棋、偽戒/伪戒、
+        # 中下馬篤/中下马笃 这几例**仍不桥接**（属表覆盖问题，不扩表见 §8）
+        import import_one
+        for ch in ('觀', '偽', '篤'):
+            self.assertNotIn(ch, import_one._T2S)
+        self.assertFalse(douban_list.author_matches('觀棋', '观棋'))
+
+    def test_traditional_ambiguity_dissolved_no_rescue_needed(self):
+        # 名单无作者、两站作者是同名的繁/简（餘華 vs 余华）→ 归一后同一人 → 不再判歧义、
+        # 直接收（无需内容比对、不取文）
+        cands = [{'source': 'a.example', 'title': '活着', 'author': '餘華',
+                  'bookUrl': 'https://a.example/1'},
+                 {'source': 'b.example', 'title': '活着', 'author': '余华',
+                  'bookUrl': 'https://b.example/1'}]
+        cli = FakeEngineCli({'search': _proc(0, _engine_search_stdout(cands))})
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            hit = douban_list.search_engine(cli, '活着', '')
+        out = buf.getvalue()
+        self.assertIsNotNone(hit)
+        self.assertNotIn('作者歧义跳过', out)
+        self.assertNotIn('内容比对放行', out)
+        self.assertFalse(any(c[0] in ('toc', 'content') for c in cli.calls))
+
+    def test_conversion_is_load_bearing(self):
+        # 变异：关掉繁转简表 → 繁/简同名判不相等（回到 authcv 之前的假不符）
+        self.assertTrue(douban_list.author_matches('餘華', '余华'))
+        with mock.patch.object(douban_list, '_T2S_TRANS', {}):
+            self.assertFalse(douban_list.author_matches('餘華', '余华'))
+            self.assertNotEqual(douban_list._norm_author('風雲'), douban_list._norm_author('风云'))
+
+
+if __name__ == '__main__':
+    unittest.main(verbosity=2)
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)
