@@ -12,7 +12,7 @@ import { shouldRememberQuery } from '@/lib/find-retention';
 import { createElapsedTicker, recallProgressSuffix, retryLabel, retryStep, showRetry, type FindPhase, type FindStep } from '@/lib/find-progress';
 // SSE 消费与落定判定放在纯模块里：本仓 vitest 只收 *.test.ts 且没有 jsdom，写在 JSX 闭包里的
 // 超时/落定判定测不到（见 find-sse.test.ts）。
-import { FIND_FETCH_TIMEOUT_MS, fetchFindResult, persistWarning, zeroResultNote, type SseEvent } from '@/lib/find-sse';
+import { FIND_FETCH_TIMEOUT_MS, fetchFindResult, persistWarning, vetoedBooks, zeroResultNote, type SseEvent, type VetoedBook } from '@/lib/find-sse';
 // 精确找书（task-77）：模式、状态机、文案全部在纯模块里，本文件只做 JSX 与请求编排。
 import {
   EMPTY_EXACT_STATE,
@@ -72,6 +72,7 @@ export default function FindTab() {
   const [error, setError] = useState('');
   const [persistNote, setPersistNote] = useState(''); // result 帧 persisted=false：结果没存下来，必须说给用户
   const [emptyNote, setEmptyNote] = useState(''); // F13：合法零结果的排除原因摘要/放宽建议
+  const [vetoed, setVetoed] = useState<VetoedBook[]>([]); // 41-veto-visible：因画像雷点被自动排除的书
   const [recallSeconds, setRecallSeconds] = useState(0); // recall 阶段已等待秒数
   const [retryFrom, setRetryFrom] = useState<FindStep | null>(null); // 失败后可从哪一步起重试
   const request = useRef<AbortController | null>(null);
@@ -141,6 +142,7 @@ export default function FindTab() {
     setRetryFrom(null);
     setPersistNote('');
     setEmptyNote('');
+    setVetoed([]);
     setPhase(start);
     let recalled: Candidate[] = start === 'recall' ? [] : candidates;
     let verified: VerifiedCandidate[] = start === 'rerank' ? verifiedRef.current : [];
@@ -214,6 +216,7 @@ export default function FindTab() {
       setResults(resultEvent.items as RerankedItem[]);
       setPersistNote(persistWarning(resultEvent) ?? '');
       setEmptyNote(zeroResultNote(resultEvent) ?? '');
+      setVetoed(vetoedBooks(resultEvent));
       setPhase('done');
     } catch (e) {
       if (controller.signal.aborted) return;
@@ -406,6 +409,10 @@ export default function FindTab() {
           ))}
         </div>
       )}
+      {/* 41-veto-visible：书库标签确定性命中画像雷点的书在重排前就被移出，不是模型淘汰。
+          不展示的话用户只看到书凭空消失，以为找漏了。默认折叠：这是「为什么没有」的补充，
+          不该抢占推荐列表的注意力；没有排除项就整块不渲染（旧行为不变）。 */}
+      {phase === 'done' && <VetoedList books={vetoed} />}
       </div>
 
       <div hidden={mode !== 'exact'}>
@@ -414,6 +421,30 @@ export default function FindTab() {
         />
       </div>
     </div>
+  );
+}
+
+// 41-veto-visible：被画像雷点自动排除的书。默认折叠，只在有排除项时出现。
+// 独立成组件是为了能在 FindTab.test.tsx 里直接从 'react-dom/server' 渲染它——
+// 本仓 JSX 用 classic runtime，razor 落地时若依赖文件顶部的自动导入会在测试里报
+// "React is not defined"（先例：ExactBookCard）。
+export function VetoedList({ books }: { books: VetoedBook[] }) {
+  if (books.length === 0) return null;
+  return (
+    <details className="mt-6 text-xs" style={{ color: 'var(--ink-faint)' }}>
+      <summary className="cursor-pointer select-none" style={{ color: 'var(--ink-soft)' }}>
+        已按你的雷点排除 {books.length} 本
+      </summary>
+      <ul className="mt-2 flex flex-col gap-1.5 pl-4">
+        {books.map((v, i) => (
+          <li key={`${v.title}-${i}`} className="leading-6">
+            <span style={{ color: 'var(--ink)' }}>{v.title}</span>
+            {v.author ? <span>{` · ${v.author}`}</span> : null}
+            {v.reason ? <span>{` — ${v.reason}`}</span> : null}
+          </li>
+        ))}
+      </ul>
+    </details>
   );
 }
 
