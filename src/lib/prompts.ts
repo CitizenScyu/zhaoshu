@@ -53,7 +53,14 @@ ${readBooks.map((b) => `- 《${b.title}》${b.author ? ' ' + b.author : ''}`).jo
 请召回候选书单。`;
 }
 
-export function rerankSystem() {
+// 重排接地（41-rerankgnd）：只有本批至少一本候选带书库证据（library）时才传 libraryEvidence，
+// 第 11 条的字段清单扩成六类并追加第 13 条；否则逐字节等于接入前的提示词（测试以 sha256 钉住）。
+const RERANK_FIELDS_BASE = '11. 候选项只有五类字段可用：身份（title/author）、category、wordCount（召回模型的待核验描述）、豆瓣验证结果（status/doubanId/rating/ratingCount/url/note）和书源补验结果（status/matchedBy/code/source）。不要引用或输出候选里没有的字段，也不要臆造外部来源；豆瓣证据按第 7 条、书源证据按第 8 条原样遵守，不得改写或扩大其证明力。';
+const RERANK_FIELDS_LIBRARY = '11. 候选项只有六类字段可用：身份（title/author）、category、wordCount（召回模型的待核验描述）、豆瓣验证结果（status/doubanId/rating/ratingCount/url/note）、书源补验结果（status/matchedBy/code/source）和书库打标证据（library：quality/weaknesses/tone/pace/strengths）。不要引用或输出候选里没有的字段，也不要臆造外部来源；豆瓣证据按第 7 条、书源证据按第 8 条、书库证据按第 13 条原样遵守，不得改写或扩大其证明力。';
+const RERANK_LIBRARY_RULE = `
+13. 书库打标证据（library）来自本站打标模型通读该书若干章后的标注：weaknesses=雷点风险、strengths=看点、tone=基调、pace=节奏、quality=0-10 综合分（部分字段可能被截断或省略）。它是关于这本书内容的直接证据，比召回阶段的 category/wordCount 描述更可信：画像雷点命中 weaknesses 的直接淘汰，萌点命中 strengths/tone/pace 的可以加分，risks 应优先引用 weaknesses。但它只覆盖读到的章节，不证明完结、字数、后期走向或全书质量；quality 只做参考，不得单独决定去留。没有 library 字段只说明书库未收录这本，不代表任何负面。`;
+
+export function rerankSystem({ libraryEvidence = false }: { libraryEvidence?: boolean } = {}) {
   return `你是一位严格的选书顾问。你将拿到用户的口味画像、本次找书需求、以及一批经过初步验证的候选书（部分带豆瓣评分，豆瓣未收录是正常现象，很多网文没有实体出版）。
 
 你的任务：为"这位具体用户"（不是大众）重排打分，挑出最值得开的几本。
@@ -69,8 +76,8 @@ export function rerankSystem() {
 8. 书源补验结果（sourceEvidence）只证明"这本书在某在线书源里存在、且书名与作者匹配"：status=matched 表示目录已匹配（matchedBy 说明按 title+author 匹配），它**不**证明评分、完结、字数、质量或全书可用；不得把 matched 当作加分以外的质量/完结证明。status=not_found / unavailable 只说明本轮没匹配上（或没查成），**不代表**这本书不存在，更不能仅凭它就压低 matchScore 或标 hallucinationRisk。
 9. 完结、字数、无雷、不烂尾等属性，除非候选现有证据明确支持，否则只能表述为待核验的模型推断，不能作为事实。
 10. 如需比较参考作品，只能引用本次输入、画像证据或候选中已经出现的作品，不得发明作品。
-11. 候选项只有五类字段可用：身份（title/author）、category、wordCount（召回模型的待核验描述）、豆瓣验证结果（status/doubanId/rating/ratingCount/url/note）和书源补验结果（status/matchedBy/code/source）。不要引用或输出候选里没有的字段，也不要臆造外部来源；豆瓣证据按第 7 条、书源证据按第 8 条原样遵守，不得改写或扩大其证明力。
-12. 如果所有候选都命中硬雷点或都不可用，就老实输出空书单 {"items":[]}，不要为凑数保留命中雷点的书。
+${libraryEvidence ? RERANK_FIELDS_LIBRARY : RERANK_FIELDS_BASE}
+12. 如果所有候选都命中硬雷点或都不可用，就老实输出空书单 {"items":[]}，不要为凑数保留命中雷点的书。${libraryEvidence ? RERANK_LIBRARY_RULE : ''}
 
 只输出 JSON，格式：
 {"items":[{"title":"书名","author":"作者","category":"题材流派","wordCount":"字数状态","matchScore":85,"hitLikes":["命中的萌点"],"risks":"风险与雷点提示","reason":"一句话结论","hallucinationRisk":false}]}

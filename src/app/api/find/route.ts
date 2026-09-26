@@ -7,9 +7,17 @@ import {
   ensureSchema,
   canonicalBookKey,
   getExcludedBookTitlesForUser,
+  getLibraryLabelsForCandidates,
   getProfileForUser,
   persistRecommendationsForUser,
 } from '@/lib/db';
+import {
+  libraryGroundingEnabled,
+  planLibraryGrounding,
+  type LibraryEvidence,
+  type LibraryGroundingPlan,
+  type LibraryLabelRow,
+} from '@/lib/library-grounding';
 import { boundedString, readJsonBody } from '@/lib/http';
 import {
   bookKey,
@@ -161,11 +169,28 @@ function compactSourceEvidence(evidence: SourceEvidence) {
   };
 }
 
-function rerankInput(verified: VerifiedCandidate[]) {
-  return verified.map(({ title, author, category, wordCount, douban, sourceEvidence }) => ({
-    title, author, category, wordCount, douban,
-    ...(sourceEvidence ? { sourceEvidence: compactSourceEvidence(sourceEvidence) } : {}),
-  }));
+function rerankInput(verified: VerifiedCandidate[], library?: Map<string, LibraryEvidence>) {
+  return verified.map(({ title, author, category, wordCount, douban, sourceEvidence }) => {
+    // 41-rerankgnd：命中书库才带 library 字段（放最后，未命中的候选投影与接入前逐字节一致）。
+    const evidence = library?.get(bookKey(title, author));
+    return {
+      title, author, category, wordCount, douban,
+      ...(sourceEvidence ? { sourceEvidence: compactSourceEvidence(sourceEvidence) } : {}),
+      ...(evidence ? { library: evidence } : {}),
+    };
+  });
+}
+
+// 41-rerankgnd：书库标签是加分项，查库失败不拖垮重排——记一行（只记 name/message）后按「全部未命中」继续。
+// 截止与取消不在这里吞：外层 access.run 在任务结束后还会 assertActive，超时/断开照常上抛。
+async function libraryGrounding(verified: VerifiedCandidate[], profile: string): Promise<LibraryGroundingPlan> {
+  let rows: LibraryLabelRow[] = [];
+  try {
+    rows = await getLibraryLabelsForCandidates(verified);
+  } catch (error) {
+    console.warn('[find] library grounding skipped', error instanceof Error ? { name: error.name, message: error.message } : error);
+  }
+  return planLibraryGrounding(verified, rows, profile);
 }
 
 async function handlePOST(req: NextRequest) {
@@ -334,17 +359,29 @@ async function handlePOST(req: NextRequest) {
         const verified = rerankVerified!;
         emit({ type: 'phase', step: 'rerank', total: verified.length });
         const { content: profile } = await atomicRead(() => getProfileForUser(userId));
-        const raw = await atomicRead(() => modelStep(
+        // 41-rerankgnd：开关开着才查书库（一次批量查询）。确定性否决的候选在重排前移出——
+        // 不送模型、不写推荐，理由随结果事件的 vetoed 回给前端。开关关 → grounding=null，
+        // 下面每一处都退回接入前的原样行为。
+        const grounding = libraryGroundingEnabled()
+          ? await atomicRead(() => libraryGrounding(verified, profile))
+          : null;
+        const rankable = grounding?.vetoedKeys.size
+          ? verified.filter((v) => !grounding.vetoedKeys.has(bookKey(v.title, v.author)))
+          : verified;
+        const vetoed = grounding?.vetoed.length ? { vetoed: grounding.vetoed } : {};
+        const libraryEvidence = (grounding?.evidence.size ?? 0) > 0;
+        // 全部候选被书库标签确定性否决：不调模型，直接走 F13 合法零结果。
+        const raw = rankable.length === 0 ? [] : await atomicRead(() => modelStep(
           ms(),
           async (totalTimeoutMs) => (await chatRobust(
-            rerankSystem(),
-            rerankUser(profile, query, JSON.stringify(rerankInput(verified)), conditions),
+            rerankSystem({ libraryEvidence }),
+            rerankUser(profile, query, JSON.stringify(rerankInput(rankable, grounding?.evidence)), conditions),
             { temperature: 0.3, signal: access.signal, onUsage: recordUsageAfterResponse('find_rerank'), totalTimeoutMs, fallbackModel: fallbackEnabled ? fallbackModel : undefined, ...modelAttemptLimits },
           )).content,
           (content) => modelList(content, 'items', MAX_RERANKED_ITEMS, { allowEmpty: true }),
         ));
-        // 用书名+作者关联，避免同名作品回填到错误的豆瓣条目。
-        const byBook = new Map(verified.map((v) => [bookKey(v.title, v.author), v]));
+        // 用书名+作者关联，避免同名作品回填到错误的豆瓣条目。只认送进模型的那批（被否决的不回流）。
+        const byBook = new Map(rankable.map((v) => [bookKey(v.title, v.author), v]));
         const items = sanitizeRerankedItems(raw)
           .filter((it) => byBook.has(bookKey(it.title, it.author)))
           .map((it) => {
@@ -379,10 +416,14 @@ async function handlePOST(req: NextRequest) {
           }
           const doubanVerified = verified.filter((v) => v.douban?.status === 'verified').length;
           const sourceMatched = verified.filter((v) => v.sourceEvidence?.status === 'matched').length;
-          const zeroReason = `本轮 ${verified.length} 本候选全被重排淘汰：命中你画像里的硬性雷点，或可用证据不足。`
-            + `（其中豆瓣已收录 ${doubanVerified} 本、书源已匹配 ${sourceMatched} 本）`;
+          const vetoedCount = grounding?.vetoed.length ?? 0;
+          const zeroReason = vetoedCount === verified.length
+            ? `本轮 ${verified.length} 本候选全部由书库标签确定性判定命中你画像里的硬性雷点，已在重排前排除（理由见每本说明）。`
+            : `本轮 ${verified.length} 本候选全被重排淘汰：命中你画像里的硬性雷点，或可用证据不足。`
+              + `（其中豆瓣已收录 ${doubanVerified} 本、书源已匹配 ${sourceMatched} 本）`
+              + (vetoedCount > 0 ? `其中 ${vetoedCount} 本由书库标签确定性判定命中雷点，在重排前已排除。` : '');
           const zeroSuggestion = '没有自动放宽任何硬约束；可修改本次条件或换个说法再试。';
-          emit({ type: 'result', step: 'rerank', items: [], zeroReason, zeroSuggestion });
+          emit({ type: 'result', step: 'rerank', items: [], zeroReason, zeroSuggestion, ...vetoed });
           return;
         }
 
@@ -406,7 +447,7 @@ async function handlePOST(req: NextRequest) {
           if (personalError(e).status !== 500) throw e;
           console.error('persist failed', e instanceof Error ? { message: e.message, name: e.name } : e);
         }
-        emit({ type: 'result', step: 'rerank', items, persisted });
+        emit({ type: 'result', step: 'rerank', items, persisted, ...vetoed });
         return;
       }
 
