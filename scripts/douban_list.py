@@ -112,10 +112,10 @@ def _fold_variants(text: str) -> str:
     scripts/gen-zh-variant-t2s.py，数据源 OpenCC，见 THIRD_PARTY_NOTICES.md）。
     为什么 Python 侧要内嵌一份：phoenix 打标目录只放 4 个 .py 运行文件，运行时读不到 TS。
 
-    只用于**书名比较**（_norm_title*），不改任何写入值。作者侧另有一张口径不同的表
-    （_to_simplified ← import_one._T2S，与入库身份键同表），**不并这张大表**——并了会让
-    「打标期比对」与「入库期身份键」脱钩。是否把作者侧也换成本表，是另一件要同时改
-    import_one 与孪生判定的事，本次不做（见报告 §6）。
+    只用于**书名比较**（_norm_title*），不改任何写入值。作者侧另有一张更大的折叠表
+    （_AUTHOR_FOLD_TRANS = 本表 + 7 个姓名补充，见其上方注释与 authkey42）：作者比对只看
+    整段严格相等、不做前缀/包含，故那 7 个补充不会像书名侧那样制造前缀误命中；书名侧则维持
+    严格一对一以免造出假等价类。
 
     逐字折叠是单射，故不会因为折叠凭空造出新的前缀/包含关系（_title_compatible 的
     前缀判据在折叠后的串上仍是原先那对真前缀）。"""
@@ -266,6 +266,14 @@ _REGION_LABEL_WORDS = frozenset({
 # 剥冒号后成「作者唐家三少」≠「唐家三少」，约 15% 失败）。含「作　者」排版空格、
 # 半/全角冒号、冒号可缺省（`<span>作者</span>唐家三少` 取 textContent 无分隔）。
 _AUTHOR_LABEL_RE = re.compile(r'^作\s*者\s*([:：])?\s*')
+# 前导外文原名括注（authkey42）：「（Stephen King）斯蒂芬·金」这类把外文原名放在中文名
+# **前面**的写法。括注内容只含拉丁字母/空格/点/连字符/撇号（且含 ≥1 字母；casefold 后为小写）。
+# 只在**比较口径**（_norm_author 及经它落地的入库孪生键）里剥，且剥后须仍剩含中文的非空串，
+# 才剥这一段——「（佚名）」「（土豆）」等中文括注不匹配（内含非拉丁字符），行为不变。
+# 短括注（内容 ≤6 字，如「（King）某某」）此前已被 strip_region_label 的 {0,6} 宽度剥掉；
+# 本条专治 strip_region_label 剥不掉的**长**外文括注（「Stephen King」12 字 > 6）。
+_LEADING_FOREIGN_PAREN_RE = re.compile(r"^[（(【\[〔]\s*[a-z][a-z .\-']*\s*[）)】\]〕]")
+_HAN_CHAR_RE = re.compile(r'[一-鿿㐀-䶿]')
 
 
 def _strip_author_label(text: str) -> str:
@@ -286,21 +294,26 @@ def _strip_author_label(text: str) -> str:
         text = rest
 
 
-_T2S_TRANS = None
+# 作者侧繁简折叠表（authkey42）：与书名侧同一张 OpenCC 一对一大表（_TITLE_FOLD_TRANS），
+# 外加 7 个补充映射。为什么要补充而不是「照搬书名表」：书名表为守严格一对一，**故意剔除了**
+# 简体字本身另有含义/来源的几个字（葉→叶、餘→余、鐘→钟、範→范、萬→万、傑→杰、雲→云——
+# 因为 叶(xié)/余/范/万/杰/云 在简体里都是独立常用字，并进书名折叠会让书名比对造出假等价类）。
+# 但作者姓名里这 7 个繁体字**必须**桥接到其简体姓氏：否则「葉問」折不成「叶问」、「餘華」折
+# 不成「余华」（书名表有「問→问」却没「葉→叶」，两表任一单用都桥不通「葉問/叶问」）。作者比对
+# 只看整段严格相等、不做前缀/包含，故这 7 个补充不会像书名侧那样制造前缀误命中。
+# 单射性：合并表里唯一的「两源一目标」是 鍾/鐘→钟——这是简体标准里 鍾(姓)与 鐘(钟表)同并为
+# 钟 的**正确**多对一，不会把不同的人并到一起（简体写法本就都是「钟」）；除此之外无重复目标，
+# 且没有任何目标字又作为源字出现（无链式折叠）。乾/干 均不在表内，故「乾隆」≠「干隆」。
+# 详见 authkey-42-report.md §2、单测 TestAuthorFoldTableInjective。
+_AUTHOR_FOLD_EXTRA = {'葉': '叶', '餘': '余', '鐘': '钟', '範': '范', '萬': '万', '傑': '杰', '雲': '云'}
+_AUTHOR_FOLD_TRANS = {**_TITLE_FOLD_TRANS, **str.maketrans(_AUTHOR_FOLD_EXTRA)}
 
 
 def _to_simplified(text: str) -> str:
-    """繁转简（authcv41 §8）：复用 import_one._T2S 同一张表，使打标期身份口径与入库身份键
-    （import_one._loose_author_key / find_twin，本就 `_norm_author(_to_simplified(raw))`）对齐。
-    表按 str.translate 缓存一次；import_one 不可用时退化为不转换（不影响原有严格相等判定）。"""
-    global _T2S_TRANS
-    if _T2S_TRANS is None:
-        try:
-            import import_one
-            _T2S_TRANS = str.maketrans(import_one._T2S)
-        except Exception:
-            _T2S_TRANS = {}
-    return text.translate(_T2S_TRANS)
+    """繁转简（authkey42）：用作者侧折叠表 `_AUTHOR_FOLD_TRANS`（书名侧一对一大表 + 7 个姓名
+    补充，见该表上方注释）。使打标期身份口径（_norm_author）与入库身份键（import_one.
+    _loose_author_key / find_twin，两者本就落到 `_norm_author`）落在同一张表上。"""
+    return text.translate(_AUTHOR_FOLD_TRANS)
 
 
 def strip_region_label(s: str) -> str:
@@ -411,7 +424,12 @@ def _norm_author(s: str) -> str:
       前导国别标注改用 strip_region_label 循环剥（支持叠段、〔〕、段尾带「著」）；
       尾部「著 + 译者名 + 译」结构先剥掉（译者不是作者）。
       整串只剩标注（`[日]`/`〔清〕`）**不在这里判空**——那会让两端都变成空串而误判相等；
-      由 is_single_region_label 识别后**直接拒收**（引擎路径跳过 / book15 路径置空走 review）。"""
+      由 is_single_region_label 识别后**直接拒收**（引擎路径跳过 / book15 路径置空走 review）。
+
+    authkey42 增量（只改比较口径）：
+      前导外文原名括注（「（Stephen King）斯蒂芬·金」）在剥国别标注后剥掉（见
+      _LEADING_FOREIGN_PAREN_RE，剥后须仍含中文）；繁转简改用作者侧折叠大表
+      _AUTHOR_FOLD_TRANS（书名侧一对一表 + 7 个姓名补充）。"""
     text = (s or '').casefold()
     text = re.sub(r'&[a-zA-Z]+;', '·', text)      # &middot; 等实体 → 分隔符
     # 前导「作者：」标签：先于括号段与标点剥离（「作者：（美）乔治」→「（美）乔治」→…；
@@ -419,6 +437,13 @@ def _norm_author(s: str) -> str:
     text = _strip_author_label(text.strip())
     # 前导国别/朝代标注段（可叠、可带〔〕、可带段尾「著」）。
     text = strip_region_label(text)
+    # 前导外文原名括注（authkey42）：「（Stephen King）斯蒂芬·金」→「斯蒂芬·金」。
+    # 只在剥后仍剩含中文的非空串时才剥（护住「（佚名）」及整串就是外文名的情况）。
+    m = _LEADING_FOREIGN_PAREN_RE.match(text)
+    if m:
+        rest = text[m.end():].strip()
+        if rest and _HAN_CHAR_RE.search(rest):
+            text = rest
     # 尾部「著 + 译者名 + 译」：译者不参与作者身份比较。
     text = _strip_trailing_translators(text)
     text = _AUTHOR_PUNCT_RE.sub('', text)
@@ -428,7 +453,7 @@ def _norm_author(s: str) -> str:
         if stripped == text:
             break
         text = stripped
-    return _to_simplified(text)     # authcv41 §8：繁转简，与入库身份键 _loose_author_key 对齐
+    return _to_simplified(text)     # authkey42：繁转简（作者侧折叠大表），与入库身份键 _loose_author_key 对齐
 
 
 # 占位作者（非真实署名）：对齐 src/lib/source-parser.ts knownSourceAuthor 的 {佚名/未知/未知作者}，

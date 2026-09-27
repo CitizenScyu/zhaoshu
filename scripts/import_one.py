@@ -493,29 +493,21 @@ FIND_LABELED_BOOK_SQL = r"""
     LIMIT 1"""
 
 
-# 繁→简小映射表（团队授权：仓库无 opencc 等现成工具，用小表并写明覆盖范围）。
-# 覆盖常见姓氏 + 高频人名用字；**不完整**——未覆盖的异体只会「漏判孪生」（多一行，等同改前，
-# 无回归），绝不会把不同作者误判成同一人（只在宽松键完全相等时才判孪生；且每个繁体字都映射到
-# 其唯一对应的简体字，不存在把两个不同简体字并到一处的风险）。
-_TRAD = '張陳劉黃趙吳鄭謝羅韓馮蔣蕭賈鄒孫馬蘇盧葉閻餘鐘範譚陸萬錢湯喬賀賴龐顏嚴溫魯韋畢聶駱齊鄧龔龍顧華婁竇廬麗傑軍國慶學東遠飛風雲鳳曉靜詩書劍愛夢陽賢寶貴靈輝瓊潔嬋語樂憶戀護'
-_SIMP = '张陈刘黄赵吴郑谢罗韩冯蒋萧贾邹孙马苏卢叶阎余钟范谭陆万钱汤乔贺赖庞颜严温鲁韦毕聂骆齐邓龚龙顾华娄窦庐丽杰军国庆学东远飞风云凤晓静诗书剑爱梦阳贤宝贵灵辉琼洁婵语乐忆恋护'
-_T2S = {t: s for t, s in zip(_TRAD, _SIMP)}
-assert len(_TRAD) == len(_SIMP), '繁简映射表两串长度必须相等'
-
-
-def _to_simplified(text):
-    return ''.join(_T2S.get(ch, ch) for ch in text)
+# 繁→简折叠（authkey42）：作者身份键的繁转简改由 douban_list 侧的作者折叠大表统一提供
+# （douban_list._norm_author 末尾已做 _to_simplified，用 _AUTHOR_FOLD_TRANS = 书名侧 OpenCC
+# 一对一大表 + 7 个姓名补充）。此前 import_one 自带的小表已删除——打标期与入库期从此落在
+# **同一张表**上（见 authkey-42-report.md §1/§2）。
 
 
 def _loose_author_key(author):
-    """宽松作者身份键（仅用于孪生判定）：占位/空 → ''。否则繁转简后走 douban_list._norm_author
-    （剥「作者：」标签、剥尾缀「著」、剥前导国籍括注、统一中点/点号、去空白、casefold），
-    与 author_matches / 搜索期身份口径一致。键相同 = 同一人的异体写法（no-op 不新增），
-    键不同 = 不同人（同名异书照常入库）。"""
+    """宽松作者身份键（仅用于孪生判定）：占位/空 → ''。否则直接走 douban_list._norm_author
+    （剥「作者：」标签、剥尾缀「著」、剥前导国籍括注/前导外文原名括注、统一中点/点号、去空白、
+    繁转简用作者折叠大表、casefold），与 author_matches / 搜索期身份口径**同表同函数**。
+    键相同 = 同一人的异体写法（no-op 不新增），键不同 = 不同人（同名异书照常入库）。"""
     raw = (author or '').strip()
     if douban_list.is_placeholder_author(raw):
         return ''
-    return douban_list._norm_author(_to_simplified(raw))
+    return douban_list._norm_author(raw)
 
 
 def find_twin(rows, author):
