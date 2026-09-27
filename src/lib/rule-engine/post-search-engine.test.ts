@@ -37,7 +37,11 @@ describe('engineSearchBook × ENGINE_POST_SEARCH 开关', () => {
     expect(results).toEqual([{ title: '剑来', author: '烽火', bookUrl: 'https://book15.net/d/1.html' }]);
     expect(calls[0].url).toBe('https://book15.net/s');
     expect(calls[0].opts).toEqual({
-      request: { method: 'POST', body: `k=${encodeQueryComponent('剑来', 'gbk')}`, headers: undefined, charset: 'gbk' },
+      // postct42：源未声明 CT → buildSourceSearchRequest 补表单 CT（带声明 charset）。
+      request: {
+        method: 'POST', body: `k=${encodeQueryComponent('剑来', 'gbk')}`,
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded; charset=gb2312' }, charset: 'gbk',
+      },
       responseCharset: 'gbk',
     });
   });
