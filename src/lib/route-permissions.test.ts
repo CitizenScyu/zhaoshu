@@ -46,6 +46,8 @@ const policies: Record<string, Record<string, 'find' | 'read' | 'download' | 'ow
   shelf: { POST: 'find', DELETE: 'find' },
   'shelf/unprocessed': { DELETE: 'find' },
   shuyuan: { GET: 'download', POST: 'download' },
+  // 42-admbudget：独立准入轮，只由 Vercel cron 以 CRON_SECRET 调用（见 shuyuan/admission/route.test.ts）。
+  'shuyuan/admission': { GET: 'cron' },
   stats: { GET: 'find' },
 };
 const loaders = import.meta.glob('../app/api/**/route.ts');

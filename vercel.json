@@ -5,6 +5,10 @@
       "schedule": "0 2 * * *"
     },
     {
+      "path": "/api/shuyuan/admission",
+      "schedule": "0 14 * * *"
+    },
+    {
       "path": "/api/download/reclaim",
       "schedule": "0 21 * * *"
     },

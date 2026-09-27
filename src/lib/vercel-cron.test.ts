@@ -50,6 +50,8 @@ function intervalHours(schedule: string): number {
  *  不在本文件复述数字）。新增 cron 必须在此登记，否则用例会报「没有对应的告警阈值」。 */
 const ALERT_HOURS_BY_PATH: Record<string, number> = {
   '/api/shuyuan': SHUYUAN_REFRESH_ALERT_HOURS,
+  // 42-admbudget 独立准入轮：不记 cron_health 成功行（健康端点键集合钉死），活性看 admissionCheckedAtAgeHours。
+  '/api/shuyuan/admission': CRON_ALERT_HOURS,
   '/api/download/reclaim': CRON_ALERT_HOURS,
   '/api/profile/absorb/drain': CRON_ALERT_HOURS,
 };

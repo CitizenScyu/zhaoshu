@@ -63,6 +63,16 @@ export const RESPONSE_TIMEOUT_MS = 12_000;
 // 占位下轮续测，刷新本身不被挤挂）仍留余量给替换事务与写库；route maxDuration=295s
 // 平台上限内（41-ADMIT-THROUGHPUT：264s 最坏总墙钟 < 295s，25 源会顶破故默认 20）。
 export const REFRESH_BUDGET_MS = 180_000;
+// 42-admbudget：独立准入轮（/api/shuyuan/admission，vercel.json `0 14 * * *`，与 02 点刷新错开 12h）自带的整份预算。
+// 路由 maxDuration=295s；读源表 + 批次 + 写回 + 刷 host 门 + 发布源池产物都在本预算内，留 55s 给 ensureSchema、
+// 租约与平台余量。批次内 canProbe 照旧按 ADMISSION_PROBE_WORST_MS + WRITE_RESERVE_MS 逐探止损。
+export const ADMISSION_ROUND_BUDGET_MS = 240_000;
+// 准入租约时长：须 ≥ 任一持有者的最长存活（独立轮路由 295s、刷新尾部 ≤ REFRESH_BUDGET_MS），持有者被平台杀掉
+// 也最迟到期自动释放；不主动释放（两处触发相隔 12h，5 分钟租约不会挡住下一轮）。
+export const ADMISSION_LEASE_TTL_MS = 300_000;
+// 租约借 cron_health 一行（不改 schema）：last_success_at 存的是**租约到期时刻**，不是成功时刻——
+// 与 db-quota.ts 的 db_quota_exceeded 行同一借用法；readCronSuccessTimes 只认已知行名，不受影响。
+export const ADMISSION_LEASE_ROW = 'admission_lease';
 
 export type ShuyuanCollection = { id: number; title: string; count: number };
 
@@ -165,6 +175,16 @@ export interface ReadingSource {
  */
 export function engineSourcesEnabled(): boolean {
   const raw = process.env.READING_ENGINE_SOURCES?.trim().toLowerCase();
+  return raw === '1' || raw === 'true' || raw === 'on';
+}
+
+/**
+ * 42-admbudget 开关 ADMISSION_OWN_CRON：开时 /api/shuyuan/admission 每天独立跑一轮准入（自带整份预算），
+ * 刷新尾部准入与它共用同一把租约（ADMISSION_LEASE_ROW）防并发重复探测。默认关：独立轮路由空转返回，
+ * 刷新尾部不查租约、与今天逐字相同。只有显式 1/true/on 才开（与 READING_ENGINE_SOURCES 同口径）。
+ */
+export function admissionOwnCronEnabled(env: Record<string, string | undefined> = process.env): boolean {
+  const raw = env.ADMISSION_OWN_CRON?.trim().toLowerCase();
   return raw === '1' || raw === 'true' || raw === 'on';
 }
 
@@ -1343,13 +1363,14 @@ async function refreshWithinBudget(s: Sql, budget: RequestDeadline, signal: Abor
 /**
  * 准入批次（设计 §4.2）。时序：全量替换事务之后。硬约束：
  * - 剩余预算 ≤ ADMISSION_MIN_BUDGET_MS 即整批跳过，绝不挤占刷新预算（180s）；
+ * - ADMISSION_OWN_CRON 开时先领准入租约，领不到（独立轮正在跑）即整批跳过（42-admbudget）；
  * - 候选池 = 通过 survey 初筛的源 + 初筛不过但留有 compile_ok 旧行的源（41-srcfix G5，送回改判出池）；
  *   既有行读一次（按本轮全部源 URL），二者皆空才整批跳过；
  * - runAdmissionBatch 每轮真实搜索 ≤ admissionMaxProbes()（默认 20，env `ADMISSION_MAX_PROBES` 可调），逐探前再查预算。
  * 只写 source_admission，不碰 shuyuan_sources；异常不终结刷新（§6.3：准入异常 → deferred）。
  */
 async function runAdmissionAfterRefresh(
-  s: Sql, rows: { url: string; source: Record<string, unknown> }[], budget: RequestDeadline, signal: AbortSignal,
+  s: Sql, rows: AdmissionInputRow[], budget: RequestDeadline, signal: AbortSignal,
 ): Promise<void> {
   if (signal.aborted) return;
   if (budget.remainingMs <= ADMISSION_MIN_BUDGET_MS) {
@@ -1361,6 +1382,72 @@ async function runAdmissionAfterRefresh(
     });
     return;
   }
+  // 开关关时不查租约（与今天逐字相同）：没有独立轮就没有第二个准入入口可撞。
+  if (admissionOwnCronEnabled() && !(await claimAdmissionLease(s, 'refresh', rows.length))) return;
+  await admitRows(s, rows, budget, signal);
+}
+
+type AdmissionInputRow = { url: string; source: Record<string, unknown> };
+
+/** 一轮准入的结果摘要（只含计数，可直接作 cron 响应体；不含任何源 URL）。 */
+export type AdmissionRoundSummary =
+  | { skipped: 'disabled' | 'lease' | 'no_candidates' | 'failed' }
+  | {
+    sources: number; candidates: number; surveyRejectedExisting: number; compileOk: number;
+    compileRejected: number; probed: number; written: number;
+  };
+
+/**
+ * 领准入租约（42-admbudget）：刷新尾部与独立轮两处准入入口互斥，防同一批源被并发重复探测。
+ * 单条语句原子领取：行不存在 → 插入；已过期 → 抢占；未过期 → WHERE 不成立、RETURNING 空 ⇒ 未领到。
+ * 时间全用库端 now()，不受函数实例时钟影响。领取失败（库抖动）按未领到处理——fail-closed：
+ * 本轮不探，下一轮再来，绝不在拿不准互斥时并发探测。
+ */
+async function claimAdmissionLease(s: Sql, trigger: 'refresh' | 'round', sources?: number): Promise<boolean> {
+  try {
+    const rows = await s`
+      INSERT INTO cron_health (name, last_success_at)
+      VALUES (${ADMISSION_LEASE_ROW}, now() + ${ADMISSION_LEASE_TTL_MS}::int * interval '1 millisecond')
+      ON CONFLICT (name) DO UPDATE SET last_success_at = EXCLUDED.last_success_at
+        WHERE cron_health.last_success_at <= now()
+      RETURNING name` as unknown[];
+    if (rows.length > 0) return true;
+    // 独立轮领租约时还没读源表，没有 sources 计数可记。
+    console.log('shuyuan admission batch', { ...(sources === undefined ? {} : { sources }), skipped: 'lease', trigger });
+  } catch (error) {
+    console.error('shuyuan admission lease failed', { trigger, reason: safeReason(error) });
+  }
+  return false;
+}
+
+/**
+ * 独立准入轮（42-admbudget，/api/shuyuan/admission 调用；调用方负责 ADMISSION_OWN_CRON 开关）。
+ * 不依赖刷新剩下的预算：自带 ADMISSION_ROUND_BUDGET_MS 整份预算，源集合从 shuyuan_sources 读
+ * （= 上一次刷新整表替换写入的同一批上游源，与刷新尾部的 rows 同口径，含禁用源）。
+ * 先领租约再读源表：领不到就不白读 1.7K 行 source 大列。写回后与刷新尾部一样发布源池产物。
+ */
+export async function runAdmissionRound(parentSignal?: AbortSignal): Promise<AdmissionRoundSummary> {
+  const budget = createDeadline(ADMISSION_ROUND_BUDGET_MS);
+  const signal = parentSignal ? AbortSignal.any([parentSignal, budget.signal]) : budget.signal;
+  try {
+    const s = getSql();
+    if (!(await claimAdmissionLease(s, 'round'))) return { skipped: 'lease' };
+    const stored = await readRows<{ source_url: string; source: Record<string, unknown> }>(s, s`
+      SELECT source_url, source FROM shuyuan_sources ORDER BY id`, signal);
+    const rows = stored.map((row) => ({ url: row.source_url, source: row.source }));
+    const summary = await admitRows(s, rows, budget, signal);
+    const artifact = 'written' in summary && summary.written > 0 ? await publishPoolArtifact(signal) : 'skipped';
+    // 独立轮收尾一行：观测「这一轮用了多少、还剩多少」——验证它确实拿的是整份预算而非刷新剩余。
+    console.log('shuyuan admission round', { ...summary, artifact, remainingMs: budget.remainingMs });
+    return summary;
+  } finally {
+    budget.dispose();
+  }
+}
+
+async function admitRows(
+  s: Sql, rows: AdmissionInputRow[], budget: RequestDeadline, signal: AbortSignal,
+): Promise<AdmissionRoundSummary> {
   const declaredHosts = new Set<string>();
   for (const row of rows) {
     try { declaredHosts.add(new URL(row.url).hostname); } catch { /* 上游脏 URL：无法声明 host */ }
@@ -1373,6 +1460,7 @@ async function runAdmissionAfterRefresh(
     const source = row.source as RawSource;
     (selectCandidates([source], { postSearch }).length === 1 ? candidates : surveyRejected).push({ url: row.url, source });
   }
+  let summary: AdmissionRoundSummary;
   try {
     // 既有行按**全部**本轮源读（不只候选）：初筛不过的源若留着 compile_ok 的旧行（41-srcfix G5：规则改到
     // 过不了初筛），要把它送回批次改判出池，见下。只回已有准入行（≈候选规模），不读 source 大列。
@@ -1384,7 +1472,7 @@ async function runAdmissionAfterRefresh(
     // （admission.ts「严禁」注释防的是后者）：compile_ok=false 的旧行照旧不喂，上游改回合规规则时源
     // 重新过初筛成为普通候选，占位行 search_ok=null ⇒ class 0 未测优先，自动回池。
     const frozen = surveyRejected.filter((candidate) => existing.get(candidate.url)?.compile_ok === true);
-    if (candidates.length === 0 && frozen.length === 0) return;
+    if (candidates.length === 0 && frozen.length === 0) return { skipped: 'no_candidates' };
     const result = await runAdmissionBatch({
       candidates: [...candidates, ...frozen], declaredHosts, existing, fetchPage: defaultAdmissionTransport, signal,
       // espfix41：开查询不敏感对照搜索，单探最坏 = 主搜索 + 对照搜索（ADMISSION_PROBE_WORST_MS），止损按它预留。
@@ -1403,25 +1491,31 @@ async function runAdmissionAfterRefresh(
       probed: result.probed,
     });
     if (result.rows.length > 0) await writeAdmissionRows(s, result.rows);
+    summary = {
+      sources: rows.length, candidates: candidates.length, surveyRejectedExisting: frozen.length,
+      compileOk: result.compileOk, compileRejected: result.compileRejected, probed: result.probed,
+      written: result.rows.length,
+    };
   } catch (error) {
     // 准入失败只影响本轮准入（§6.3）：该批 next round 重来，刷新本身已成功。
-    if (signal.aborted) return;
+    if (signal.aborted) return { skipped: 'failed' };
     console.error('shuyuan admission batch failed', {
       candidates: candidates.length,
       reason: safeReason(error),
     });
-    return;
+    return { skipped: 'failed' };
   }
   // host 集合动态化（设计 §6.1）：准入写库后重算 ok 态 host 并入运行时门；
   // DB 失败/预算中止 → 保持既有集合（fail-closed：收窄到内建，绝不放大）。
   try {
     refreshSupportedHosts(await engineHosts(signal));
   } catch (error) {
-    if (signal.aborted) return;
+    if (signal.aborted) return summary;
     console.error('shuyuan supported host refresh failed', {
       reason: safeReason(error),
     });
   }
+  return summary;
 }
 
 async function readAdmissionRows(s: Sql, urls: string[], signal: AbortSignal): Promise<Map<string, AdmissionSourceRow>> {
