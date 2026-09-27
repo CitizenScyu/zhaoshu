@@ -34,6 +34,7 @@ interface SourceHealth {
     shuyuan: { lastSuccessAt: string | null };
     reclaim: { lastSuccessAt: string | null };
     drain: { lastSuccessAt: string | null };
+    admission: { lastSuccessAt: string | null };
   };
   dbQuota: { state: 'ok' | 'exceeded'; lastSeenAt: string | null };
 }
@@ -48,6 +49,7 @@ function emptyHealth(): SourceHealth {
       shuyuan: { lastSuccessAt: null },
       reclaim: { lastSuccessAt: null },
       drain: { lastSuccessAt: null },
+      admission: { lastSuccessAt: null },
     },
     dbQuota: { state: 'ok', lastSeenAt: null },
   };
@@ -86,6 +88,9 @@ async function handleGET() {
       : new Date(Date.now() - pool.refreshedAtAgeHours * 3_600_000).toISOString();
     health.crons.reclaim.lastSuccessAt = crons.reclaim;
     health.crons.drain.lastSuccessAt = crons.drain;
+    // 准入成功行（42-admhealth）：两个准入入口（02:00 刷新尾部 / 14:00 独立轮）共记同一行。
+    // 只透传，不参与 ok 判据（ok 判据保持池新鲜度 + 三条 cron，阈值差异在探针侧按 30h 单独判）。
+    health.crons.admission.lastSuccessAt = crons.admission;
     health.ok = poolFresh(pool.refreshedAtAgeHours)
       && isFresh(crons.reclaim, CRON_ALERT_HOURS)
       && isFresh(crons.drain, CRON_ALERT_HOURS);

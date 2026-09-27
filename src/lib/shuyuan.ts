@@ -1,4 +1,5 @@
 import { getSql } from '@/lib/db';
+import { recordCronSuccess } from '@/lib/source-health';
 import { isRecord } from '@/lib/sanitize';
 import { createDeadline, raceDeadline, type RequestDeadline } from '@/lib/deadline';
 import { validateSourceUrl, refreshSupportedHosts, supportedHostList, upgradeSourceTemplateUrl } from '@/lib/source-policy';
@@ -1439,6 +1440,7 @@ export async function runAdmissionRound(parentSignal?: AbortSignal): Promise<Adm
     const artifact = 'written' in summary && summary.written > 0 ? await publishPoolArtifact(signal) : 'skipped';
     // 独立轮收尾一行：观测「这一轮用了多少、还剩多少」——验证它确实拿的是整份预算而非刷新剩余。
     console.log('shuyuan admission round', { ...summary, artifact, remainingMs: budget.remainingMs });
+    // 42-admhealth：成功行在 admitRows 尾部记（两个入口共用一处），这里不重复。
     return summary;
   } finally {
     budget.dispose();
@@ -1515,6 +1517,9 @@ async function admitRows(
       reason: safeReason(error),
     });
   }
+  // 42-admhealth：admitRows 走到这里即真正跑完一轮（两个入口——刷新尾部与独立轮——都经此函数，
+  // 同记 name='admission' 一行，任一成功即刷新）。recordCronSuccess 自吞异常，不打挂调用方。
+  await recordCronSuccess('admission');
   return summary;
 }
 

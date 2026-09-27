@@ -8,7 +8,7 @@ const mocks = vi.hoisted(() => ({ getSql: vi.fn() }));
 vi.mock('@/lib/db', () => ({ getSql: mocks.getSql }));
 
 import {
-  CRON_ALERT_HOURS, SHUYUAN_REFRESH_ALERT_HOURS,
+  ADMISSION_ALERT_HOURS, CRON_ALERT_HOURS, SHUYUAN_REFRESH_ALERT_HOURS,
   hoursSince, readAdmissionCheckedAgeHours, readCronSuccessTimes, recordCronSuccess,
 } from './source-health';
 
@@ -31,6 +31,8 @@ describe('source-health (S5-1)', () => {
     // 「阈值必须 > 实际 cron 间隔」这条不变量由 src/lib/vercel-cron.test.ts 按表达式真算把关。
     expect(SHUYUAN_REFRESH_ALERT_HOURS).toBe(26);
     expect(CRON_ALERT_HOURS).toBe(26);
+    // 42-admhealth：准入一天两轮（任一成功即刷新），30h = 一轮失败后最坏间隔 24h + 漂移余量。
+    expect(ADMISSION_ALERT_HOURS).toBe(30);
   });
 
   it('recordCronSuccess 幂等 upsert 到 cron_health', async () => {
@@ -57,7 +59,7 @@ describe('source-health (S5-1)', () => {
     const sql = sqlMock(async () => [{ name: 'drain', last_success_at: '2026-09-23T06:00:00.000Z' }]);
     mocks.getSql.mockReturnValue(sql);
     expect(await readCronSuccessTimes()).toEqual({
-      reclaim: null, drain: '2026-09-23T06:00:00.000Z', dbQuotaSeenAt: null,
+      reclaim: null, drain: '2026-09-23T06:00:00.000Z', admission: null, dbQuotaSeenAt: null,
     });
     expect(sql).toHaveBeenCalledOnce();
   });
@@ -69,9 +71,19 @@ describe('source-health (S5-1)', () => {
     ]);
     mocks.getSql.mockReturnValue(sql);
     expect(await readCronSuccessTimes()).toEqual({
-      reclaim: '2026-09-23T05:00:00.000Z', drain: null, dbQuotaSeenAt: '2026-09-25T03:43:00.000Z',
+      reclaim: '2026-09-23T05:00:00.000Z', drain: null, admission: null, dbQuotaSeenAt: '2026-09-25T03:43:00.000Z',
     });
     expect(sql).toHaveBeenCalledOnce();
+  });
+
+  it('readCronSuccessTimes 带回 admission 成功行（42-admhealth），租约行 admission_lease 不串进来', async () => {
+    const sql = sqlMock(async () => [
+      { name: 'admission', last_success_at: '2026-09-27T14:02:00.000Z' },
+      { name: 'admission_lease', last_success_at: '2026-09-27T14:59:29.000Z' },
+    ]);
+    mocks.getSql.mockReturnValue(sql);
+    expect(await readCronSuccessTimes()).toMatchObject({ admission: '2026-09-27T14:02:00.000Z' });
+    expect((await readCronSuccessTimes()).dbQuotaSeenAt).toBeNull();
   });
 
   it('readAdmissionCheckedAgeHours 取 MAX 并换算成小时；空表为 null', async () => {

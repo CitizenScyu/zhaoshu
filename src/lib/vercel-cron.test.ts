@@ -10,7 +10,7 @@ import { readFileSync } from 'node:fs';
 // 本文件仍然不触网、不读 .env*。
 vi.mock('@/lib/db', () => ({ getSql: () => { throw new Error('vercel-cron 门禁不应触库'); } }));
 
-import { CRON_ALERT_HOURS, SHUYUAN_REFRESH_ALERT_HOURS } from './source-health';
+import { ADMISSION_ALERT_HOURS, CRON_ALERT_HOURS, SHUYUAN_REFRESH_ALERT_HOURS } from './source-health';
 // 5 段表达式解析与部署配置门禁（scripts/check-deploy-config.mjs，MS-09）共用同一份实现，不复制第二份。
 // 条数上限（Vercel 文档表 100，2026-09-23 抓取核实）也取自同一处常量。
 import { MAX_CRON_JOBS as HOBBY_MAX_CRON_JOBS, triggersPerDay } from '../../scripts/check-deploy-config.mjs';
@@ -50,8 +50,9 @@ function intervalHours(schedule: string): number {
  *  不在本文件复述数字）。新增 cron 必须在此登记，否则用例会报「没有对应的告警阈值」。 */
 const ALERT_HOURS_BY_PATH: Record<string, number> = {
   '/api/shuyuan': SHUYUAN_REFRESH_ALERT_HOURS,
-  // 42-admbudget 独立准入轮：不记 cron_health 成功行（健康端点键集合钉死），活性看 admissionCheckedAtAgeHours。
-  '/api/shuyuan/admission': CRON_ALERT_HOURS,
+  // 42-admhealth 独立准入轮成功时写 cron_health name='admission' 成功行（admitRows 尾部，与刷新尾部共记），
+  // 探针按 ADMISSION_ALERT_HOURS 判龄。此处登记的是该轮自身 cron 计划（每日一次）对应的阈值下界。
+  '/api/shuyuan/admission': ADMISSION_ALERT_HOURS,
   '/api/download/reclaim': CRON_ALERT_HOURS,
   '/api/profile/absorb/drain': CRON_ALERT_HOURS,
 };

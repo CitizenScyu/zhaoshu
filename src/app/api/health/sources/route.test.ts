@@ -95,7 +95,7 @@ describe('GET /api/health/sources (S5-1 匿名健康端点)', () => {
       ['admissionCheckedAtAgeHours', 'crons', 'dbQuota', 'ok', 'refreshedAtAgeHours'],
     );
     expect(Object.keys(payload.dbQuota as object).sort()).toEqual(['lastSeenAt', 'state']);
-    expect(Object.keys(payload.crons as object).sort()).toEqual(['drain', 'reclaim', 'shuyuan']);
+    expect(Object.keys(payload.crons as object).sort()).toEqual(['admission', 'drain', 'reclaim', 'shuyuan']);
     for (const cron of Object.values(payload.crons as Record<string, object>)) {
       expect(Object.keys(cron)).toEqual(['lastSuccessAt']);
     }
@@ -111,6 +111,21 @@ describe('GET /api/health/sources (S5-1 匿名健康端点)', () => {
     expect(crons.drain.lastSuccessAt).toBe(hoursAgo(6));
     // shuyuan 的 lastSuccessAt 由 refreshedAtAgeHours 反推。
     expect(Date.parse(crons.shuyuan.lastSuccessAt as string)).toBe(NOW - 3.2 * 3_600_000);
+    // admission（42-admhealth）只透传 cron_health 行，不参与 ok 判据。
+    expect(crons.admission.lastSuccessAt).toBeNull();
+  });
+
+  it('admission 行（42-admhealth）：cron_health 有该行时透传，且超龄也不拉低 ok（阈值在探针侧单独判）', async () => {
+    mocks.getSql.mockReturnValue(sqlStub(
+      [
+        { name: 'reclaim', last_success_at: hoursAgo(5) }, { name: 'drain', last_success_at: hoursAgo(6) },
+        { name: 'admission', last_success_at: hoursAgo(40) },
+      ],
+      hoursAgo(5),
+    ));
+    const payload = await body(await GET());
+    expect(payload.ok).toBe(true);
+    expect((payload.crons as Record<string, { lastSuccessAt: string | null }>).admission.lastSuccessAt).toBe(hoursAgo(40));
   });
 
   it('响应带 no-store，且不需要任何鉴权头（匿名可读）', async () => {
@@ -175,6 +190,7 @@ describe('GET /api/health/sources (S5-1 匿名健康端点)', () => {
         shuyuan: { lastSuccessAt: null },
         reclaim: { lastSuccessAt: null },
         drain: { lastSuccessAt: null },
+        admission: { lastSuccessAt: null },
       },
       dbQuota: { state: 'ok', lastSeenAt: null },
     });
