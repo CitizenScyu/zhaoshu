@@ -1785,6 +1785,9 @@ SEG_MIN_REQUEST_S = 1.0     # 剩余预算不足此秒数就不再发请求（�
 SEG_FILL_MAX_CHAPTERS = 4   # 每组正文参照（书首 / 近窗）候选源逐章配对抓的章数上限（计入预算，rvlblseg R2-6）
 SEG_FILL_VERIFY_MAX = 8     # 单候选源核验抓章总数上限（书首组 + 近窗组各 ≤SEG_FILL_MAX_CHAPTERS，rvlblseg R3）
 SEG_FILL_TITLE_MAX_MISMATCH = 0.20  # 补段候选窗口章标题与计划源目录同章号章名不一致比例上限（超过弃该候选，rvlblseg R3）
+SEG_FILL_PAIR_MIN_CHARS = 500  # 补段与门（rvlblseg R5 必修 F1）：逐对章「可判」的单章去模板正文字数下限——
+#                                两侧该章都 ≥ 此数才算「可判且可据以判不匹配」（低于则该章太短、不据它否决，宁缺）。
+#                                取值远低于典型章长（真同书章不会被误判不可判），又高于预览/残段（避免拿短碴当否决证据）。
 PROMPT_VERSION_SEGMENTED = 'v2'
 
 
@@ -2188,10 +2191,23 @@ def fill_source_identity(engine_cli, plan: dict, cand: dict,
     plan_fp = _fingerprint_from_hits(plan['chapters'], ref_hits)
     cand_hits = _fetch_candidate_hits(engine_cli, cand, ref_nums,
                                       deadline, clock, ch_cache)
-    judge, same, _, _ = douban_list._body_decides(
-        plan_fp, _fingerprint_from_hits(cand['chapters'], cand_hits))
+    cand_fp = _fingerprint_from_hits(cand['chapters'], cand_hits)
+    judge, same, _, _ = douban_list._body_decides(plan_fp, cand_fp)
     if not (judge and same):
         return 'body', ref_mode, ref_nums
+    # 与门（rvlblseg R5 必修 F1）：`_body_decides` 只数「≥2 互异匹配章对」，属「任一信号过线即放行」——
+    # 分歧点落在参照章之内（L−1、L）时前面若干章仍匹配、凑够 2 对即放行，分歧章及其后正文被拼入。
+    # 逐对明细再加两道否决（不改 _body_decides）：
+    #   (a) 任一「可判且不匹配」章对（两侧该章都 ≥SEG_FILL_PAIR_MIN_CHARS 字、Jaccard <阈值）→ 拒；
+    #   (b) 章号最大的参照章（最靠近窗口）必须可判且匹配，否则拒（窗口边界章不一致 = 分歧点已到）。
+    # 三条（含原有 ≥2 互异匹配章对）同时满足才放行。
+    pairs = douban_list.body_pair_details(plan_fp, cand_fp, SEG_FILL_PAIR_MIN_CHARS)
+    if any(p['judgeable'] and not p['same'] for p in pairs):
+        return 'body', ref_mode, ref_nums            # (a) 参照章内出现可判不匹配 → 分歧点在参照之内
+    top_num = max(ref_nums) if ref_nums else None
+    top = next((p for p in pairs if p['num'] == top_num), None)
+    if top is None or not (top['judgeable'] and top['same']):
+        return 'body', ref_mode, ref_nums            # (b) 最靠近窗口的参照章不可判或不匹配 → 拒
     return '', ref_mode, ref_nums
 
 

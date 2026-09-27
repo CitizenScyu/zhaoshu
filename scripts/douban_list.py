@@ -1538,6 +1538,34 @@ def _body_decides(fp_a: dict, fp_b: dict) -> tuple[bool, bool, float, int]:
     return True, (distinct >= _BODY_MIN_PAIRS), rep, distinct
 
 
+def body_pair_details(fp_a: dict, fp_b: dict, min_chars: int) -> list[dict]:
+    """逐对章正文相似度明细（只读辅助，供补段与门；不改 `_body_decides`/`_align_chapter_pairs` 行为）。
+
+    复用 `_align_chapter_pairs` 的**对齐口径**（两侧章号齐全无重号→按章号，否则按位置）与 `_jaccard`；
+    正文已在 `body_by_chapter` 里经 `_clean_body_chapters` 去模板。逐对返回（按 A 侧参与章顺序）
+    {'num': A 侧章号, 'judgeable': 两侧该章去模板后正文都 ≥min_chars 字, 'jaccard': 去模板正文 n-gram
+    Jaccard, 'same': judgeable 且 jaccard ≥CONTENT_BODY_JACCARD}。调用方（fill_source_identity 与门）用它
+    逐对判「可判且不匹配」——`_body_decides` 只数「≥2 互异匹配章对」，看不到「某可判章对不匹配」这一否决信号。"""
+    ca = fp_a.get('body_by_chapter') or []
+    cb = fp_b.get('body_by_chapter') or []
+    na = [c.get('num') for c in ca]
+    nb = [c.get('num') for c in cb]
+    if (na and nb and all(n is not None for n in na) and all(n is not None for n in nb)
+            and len(set(na)) == len(na) and len(set(nb)) == len(nb)):
+        mb = {c['num']: c for c in cb}
+        aligned = [(c, mb[c['num']]) for c in ca if c['num'] in mb]      # 按章号对齐（同 _align_chapter_pairs）
+    else:
+        aligned = [(ca[i], cb[i]) for i in range(min(len(ca), len(cb)))]  # 退化按位置对齐
+    out: list[dict] = []
+    for pa, pb in aligned:
+        judgeable = min(pa.get('chars', 0), pb.get('chars', 0)) >= min_chars
+        j = _jaccard(pa.get('ngrams') or set(), pb.get('ngrams') or set())
+        out.append({'num': pa.get('num'), 'judgeable': judgeable, 'jaccard': j,
+                    'same': judgeable and j >= CONTENT_BODY_JACCARD})
+    return out
+
+
+
 def _cluster_by_content(cli, reps: list[dict], cache: dict) -> tuple[list[list[int]], dict]:
     """reps 两两 same_book → 单链并查集聚类。返回 (簇列表[下标], 最高相似度信息)。"""
     fps = [fetch_content_fingerprint(cli, r['hit']['url'], cache=cache) for r in reps]
