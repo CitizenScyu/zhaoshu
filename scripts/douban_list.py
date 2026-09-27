@@ -1348,6 +1348,9 @@ _TOC_AD_SUFFIXES = (
     _TOC_AD_BRACKET_OPEN + _TOC_AD_BRACKET_BODY
     + r'(?:第\s*[0-9一二三四五六七八九十两]+\s*更|[0-9二三四五两]\s*合\s*一)'
     + _TOC_AD_BRACKET_BODY + _TOC_AD_BRACKET_CLOSE,
+    # 同上但括号被站点换成空格：www.quanwenyuedu.io《大魏宫廷》「第1230章:千里驰援!从天而降的援军! 二 二合一」
+    # 「第187章:魏韩对峙 三 二合一」（同书 book.qq.com 为「（二）【二合一】」）。须前有空白，「天地二合一」类章名不动。
+    r'(?<=\s)[0-9二三四五两]\s*合\s*一',
 )
 _TOC_AD_SUFFIX_RES = tuple(re.compile(r'(?:' + p + r')\s*$', re.I) for p in _TOC_AD_SUFFIXES)
 
