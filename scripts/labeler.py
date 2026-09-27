@@ -1821,6 +1821,8 @@ SEG_FILL_PAIR_MIN_CHARS = 500  # 补段与门（rvlblseg R5 必修 F1）：逐�
 SEG_ANCHOR_HEAD_CHARS = 200     # 防护 C：计划源该章正文/预览取开头这么多字作探针（book.qq.com 付费章预览 ≈197 字）
 SEG_ANCHOR_HEAD_MIN_GRAMS = 30  # 防护 C：探针 4-gram 少于此数 → 该章不可比（不据它放行）
 SEG_ANCHOR_HEAD_CONTAIN = 0.50  # 防护 C：探针 4-gram 被锚章正文包含的比例下限（真书实测见 lblsegfix-42-report §2）
+SEG_ANCHOR_HEAD_TRIES = 3       # 防护 C：首/末端各最多探几章找可比探针（真书：book.qq.com《唐砖》「第647章 三节求保底，
+                                # 明日继续」这类作者附言章空正文、无预览，跳过它再看下一章）
 PROMPT_VERSION_SEGMENTED = 'v2'
 
 
@@ -2373,20 +2375,25 @@ def _anchor_head_guard(engine_cli, plan: dict, anchor_hits: list[dict], deadline
     → (过？, 核对章号)。
 
     防的是：锚源后段目录不变（防护 B 与段位置标题核对都看不出）而正文换成另一本书。核对送模章中**首章与末章**
-    （有章号者；换书一旦发生通常延续到书尾，末章兜住「送模区间中途换书」）：计划源探针 4-gram 数
+    （有章号者；换书一旦发生通常延续到书尾，末章兜住「送模区间中途换书」；该章计划源探针不可比则往里顺延，
+    每端至多 SEG_ANCHOR_HEAD_TRIES 章）：计划源探针 4-gram 数
     ≥SEG_ANCHOR_HEAD_MIN_GRAMS 才算可比，可比章被锚章正文包含的比例须 ≥SEG_ANCHOR_HEAD_CONTAIN；
     须 ≥1 章可比且可比章**全部**过线，否则拒（计划源该段 4xx、无预览可比 → 不可判一律拒）。"""
     numbered = [h for h in anchor_hits if h.get('num') is not None and len(h.get('text') or '') > 100]
-    picks = numbered[:1] + numbered[-1:] if len(numbered) > 1 else numbered
     checked: list = []
-    for h in picks:
-        probe = _plan_head_probe(engine_cli, plan, h['num'], deadline, clock, plan_ch_cache, plan_head_cache)
-        if len(probe) < SEG_ANCHOR_HEAD_MIN_GRAMS:
-            continue
-        body = douban_list._char_ngrams(douban_list._to_simplified(h['text']))
-        checked.append(h['num'])
-        if len(probe & body) / len(probe) < SEG_ANCHOR_HEAD_CONTAIN:
-            return False, checked
+    for side in (numbered, numbered[::-1]):
+        # 每端从最外一章往里找首个可比章（至多 SEG_ANCHOR_HEAD_TRIES 章），核它一章即止；两端相遇就不重复核
+        for h in side[:SEG_ANCHOR_HEAD_TRIES]:
+            if h['num'] in checked:
+                break
+            probe = _plan_head_probe(engine_cli, plan, h['num'], deadline, clock, plan_ch_cache, plan_head_cache)
+            if len(probe) < SEG_ANCHOR_HEAD_MIN_GRAMS:
+                continue
+            body = douban_list._char_ngrams(douban_list._to_simplified(h['text']))
+            checked.append(h['num'])
+            if len(probe & body) / len(probe) < SEG_ANCHOR_HEAD_CONTAIN:
+                return False, checked
+            break
     return bool(checked), checked
 
 
@@ -2548,14 +2555,15 @@ def fetch_book_text_segmented(engine_cli, book: dict, tracker: SourceGiveupTrack
                     if not a_why and not _anchor_window_toc_ok(plan['chapters'], win, entry['chapters']):
                         a_why = 'toc_window'
                     if not a_why:
-                        # 防护 C 预探：计划源本段首个送模章的开头探针；取不到可比探针（4xx/无预览）即不抓锚段
-                        first_num = next(
-                            (n for n in (douban_list._toc_chapter_number(c.get('title') or '')
-                                         for c in entry['chapters'][src_win['start']:src_win['end']]
-                                         if not is_preview_title((c.get('title') or '').strip()))
-                             if n is not None), None)
-                        if len(_plan_head_probe(engine_cli, plan, first_num, deadline, clock,
-                                                plan_ch_cache, plan_head_cache)) < SEG_ANCHOR_HEAD_MIN_GRAMS:
+                        # 防护 C 预探：计划源本段前 SEG_ANCHOR_HEAD_TRIES 个送模章号里须有可比开头探针；
+                        # 都取不到（4xx/无预览）即不抓锚段
+                        win_nums = [n for n in (douban_list._toc_chapter_number(c.get('title') or '')
+                                                for c in entry['chapters'][src_win['start']:src_win['end']]
+                                                if not is_preview_title((c.get('title') or '').strip()))
+                                    if n is not None][:SEG_ANCHOR_HEAD_TRIES]
+                        if not any(len(_plan_head_probe(engine_cli, plan, n, deadline, clock, plan_ch_cache,
+                                                        plan_head_cache)) >= SEG_ANCHOR_HEAD_MIN_GRAMS
+                                   for n in win_nums):
                             a_why = 'head_noref'
                     if a_why:
                         print(f'  备选源 {host} 不能作锚（{a_why}），不用它补段')
