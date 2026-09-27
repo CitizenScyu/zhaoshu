@@ -17,13 +17,19 @@ import { DB_QUOTA_HEALTH_ROW } from './db-quota';
 // 有一条离线门禁按表达式真算间隔、比对这里的常数，脱节即红（防下次再靠人记）。
 export const SHUYUAN_REFRESH_ALERT_HOURS = 26;
 export const CRON_ALERT_HOURS = 26;
+// 42-admhealth：准入成功行 name='admission' 的判龄阈值。一天两轮（02:00 刷新尾部 + 14:00 独立轮）
+// 任一成功即刷新该行，正常刷新间隔 12h；30h = 一轮整体失败后的最坏间隔（24h）+ Hobby cron 小时级
+// 漂移与探针采样（3h 一次）余量。比 26h 宽是为了「一轮失败不告警、两轮都失败才告警」。
+export const ADMISSION_ALERT_HOURS = 30;
 
-export type CronName = 'reclaim' | 'drain';
+export type CronName = 'reclaim' | 'drain' | 'admission';
 
 /** 各 cron 上次成功时间（ISO-8601 文本；null = 从未记录到一次成功）。 */
 export interface CronSuccessTimes {
   reclaim: string | null;
   drain: string | null;
+  /** 准入上次成功（42-admhealth）：02:00 刷新尾部与 14:00 独立轮两个入口共记同一行。 */
+  admission: string | null;
   /**
    * 同表另一行（41-q402fix）：最近一次发现数据库配额错误的时刻（库恢复可写后由各进程补记，
    * 见 db-quota.ts recordDbQuotaSeen）；不是 cron 成功时间，不参与 ok 判据。从未记录为 null。
@@ -33,6 +39,7 @@ export interface CronSuccessTimes {
 
 // cron 成功分支调用一次。监控写入失败绝不能把 cron 本身打挂（否则告警系统自己制造故障）：
 // 吞掉异常、只记一行日志。写失败时健康端点会看到该 cron 的 lastSuccessAt 陈旧，这本身也是信号。
+// 42-admhealth：name='admission' 由 shuyuan.ts 准入轮成功分支调（见 runAdmissionRound / admitRows 尾部）。
 export async function recordCronSuccess(name: CronName): Promise<void> {
   try {
     await getSql()`
@@ -51,9 +58,9 @@ export async function readCronSuccessTimes(): Promise<CronSuccessTimes> {
     SELECT name, last_success_at::text AS last_success_at FROM cron_health` as {
     name: string; last_success_at: string | null;
   }[];
-  const out: CronSuccessTimes = { reclaim: null, drain: null, dbQuotaSeenAt: null };
+  const out: CronSuccessTimes = { reclaim: null, drain: null, admission: null, dbQuotaSeenAt: null };
   for (const row of rows) {
-    if (row.name === 'reclaim' || row.name === 'drain') out[row.name] = row.last_success_at;
+    if (row.name === 'reclaim' || row.name === 'drain' || row.name === 'admission') out[row.name] = row.last_success_at;
     else if (row.name === DB_QUOTA_HEALTH_ROW) out.dbQuotaSeenAt = row.last_success_at;
   }
   return out;

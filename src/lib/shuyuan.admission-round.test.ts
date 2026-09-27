@@ -53,9 +53,15 @@ function deadSource(i: number) {
 
 let lease: 'claimed' | 'held' | 'error';
 let stored: { source_url: string; source: Record<string, unknown> }[];
+// 42-admhealth：cron_health 成功行写入（recordCronSuccess('admission')）的替身开关。
+let admissionSuccessWrite: 'ok' | 'fail';
 
 const queries = () => execute.mock.calls.map(([query]) => query);
-const leaseQueries = () => queries().filter((query) => query.text.startsWith('INSERT INTO cron_health'));
+// 租约行 = INSERT INTO cron_health 且首参数是租约行名（带 now()+TTL）；成功行 = 同表但首参数 'admission'（now() upsert）。
+const leaseQueries = () => queries().filter((query) => query.text.startsWith('INSERT INTO cron_health')
+  && query.values[0] === ADMISSION_LEASE_ROW);
+const successQueries = () => queries().filter((query) => query.text.startsWith('INSERT INTO cron_health')
+  && query.values[0] === 'admission');
 const searches = () => fetchMock.mock.calls.filter(([input]) => SEARCH.test(String(input)));
 const logged = (log: { mock: { calls: unknown[][] } }, message: string) =>
   log.mock.calls.filter(([m]) => m === message).map(([, payload]) => payload);
@@ -64,8 +70,14 @@ beforeEach(() => {
   vi.clearAllMocks();
   lease = 'claimed';
   stored = [];
+  admissionSuccessWrite = 'ok';
   execute.mockReset().mockImplementation(async (query) => {
     if (query.text.startsWith('INSERT INTO cron_health')) {
+      // 42-admhealth：成功行 upsert（name='admission'，VALUES (?, now())，无租约 TTL 表达式）与租约行区分。
+      if (query.values[0] === 'admission') {
+        if (admissionSuccessWrite === 'fail') throw new Error('database unavailable');
+        return [];
+      }
       if (lease === 'error') throw new Error('database unavailable');
       return lease === 'claimed' ? [{ name: ADMISSION_LEASE_ROW }] : [];
     }
@@ -152,6 +164,54 @@ describe('runAdmissionRound：独立预算', () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
+  it('真正跑完一轮（源表空、no_candidates）⇒ 不记 admission 成功行（42-admhealth）', async () => {
+    await runAdmissionRound();
+    expect(successQueries()).toHaveLength(0);
+  });
+
+  it('跑完一轮有候选并写回 ⇒ 记 admission 成功行（42-admhealth）', async () => {
+    vi.useFakeTimers();
+    stored = [{ source_url: 'https://dead0.example/', source: deadSource(0) }];
+    vi.stubEnv('ADMISSION_MAX_PROBES', '1');
+    fetchMock.mockImplementation((_input, options) => new Promise<Response>((_resolve, reject) => {
+      options!.signal!.addEventListener('abort', () => reject(options!.signal!.reason), { once: true });
+    }));
+    const settled = runAdmissionRound();
+    await vi.advanceTimersByTimeAsync(ADMISSION_ROUND_BUDGET_MS + 60_000);
+    const summary = await settled;
+    vi.useRealTimers();
+    expect('skipped' in summary).toBe(false);
+    const success = successQueries();
+    expect(success).toHaveLength(1);
+    // 成功行是 now() upsert，不是租约的「now() + TTL」——两者都借 cron_health 表，语义必须分开。
+    expect(success[0].text).toContain('ON CONFLICT (name) DO UPDATE SET last_success_at = now()');
+    expect(success[0].text).not.toContain('interval');
+  });
+
+  it('成功行写入失败 ⇒ 轮本身结果不变（记录失败不打挂准入，42-admhealth）', async () => {
+    vi.useFakeTimers();
+    stored = [{ source_url: 'https://dead0.example/', source: deadSource(0) }];
+    vi.stubEnv('ADMISSION_MAX_PROBES', '1');
+    admissionSuccessWrite = 'fail';
+    fetchMock.mockImplementation((_input, options) => new Promise<Response>((_resolve, reject) => {
+      options!.signal!.addEventListener('abort', () => reject(options!.signal!.reason), { once: true });
+    }));
+    const settled = runAdmissionRound();
+    await vi.advanceTimersByTimeAsync(ADMISSION_ROUND_BUDGET_MS + 60_000);
+    const summary = await settled;
+    vi.useRealTimers();
+    expect('skipped' in summary).toBe(false);
+    expect(summary).toMatchObject({ sources: 1, candidates: 1, written: 1 });
+  });
+
+  it('租约被占（skipped:lease）⇒ 不记成功行', async () => {
+    lease = 'held';
+    stored = [{ source_url: 'https://dead0.example/', source: deadSource(0) }];
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    await runAdmissionRound();
+    expect(successQueries()).toHaveLength(0);
+  });
+
   it('租约被占 ⇒ 整轮跳过：不读源表、不探、不写', async () => {
     lease = 'held';
     stored = [{ source_url: 'https://dead0.example/', source: deadSource(0) }];
@@ -160,9 +220,7 @@ describe('runAdmissionRound：独立预算', () => {
     expect(fetchMock).not.toHaveBeenCalled();
     expect(queries().map((query) => query.text)).toEqual([expect.stringMatching(/^INSERT INTO cron_health/)]);
     expect(logged(log, 'shuyuan admission batch')).toEqual([{ skipped: 'lease', trigger: 'round' }]);
-  });
-
-  it('租约领取报错 ⇒ fail-closed 当作没领到，不探', async () => {
+  });  it('租约领取报错 ⇒ fail-closed 当作没领到，不探', async () => {
     lease = 'error';
     stored = [{ source_url: 'https://dead0.example/', source: deadSource(0) }];
     vi.spyOn(console, 'log').mockImplementation(() => {});
@@ -199,11 +257,20 @@ describe('刷新尾部准入与租约', () => {
     expect(searches().length).toBeGreaterThan(0);
   });
 
+  it('开关关：尾部跑完准入 ⇒ 也记 admission 成功行（42-admhealth：两个入口同记一行）', async () => {
+    const { outcome } = await runRefresh();
+    expect(outcome).toBe('resolved');
+    const success = successQueries();
+    expect(success).toHaveLength(1);
+    expect(success[0].values).toEqual(['admission']);
+  });
+
   it('开关开 + 领到租约：照常探测', async () => {
     vi.stubEnv('ADMISSION_OWN_CRON', '1');
     const { outcome } = await runRefresh();
     expect(outcome).toBe('resolved');
     expect(leaseQueries()).toHaveLength(1);
+    expect(successQueries()).toHaveLength(1);
     expect(searches().length).toBeGreaterThan(0);
   });
 
@@ -214,6 +281,8 @@ describe('刷新尾部准入与租约', () => {
     expect(outcome).toBe('resolved');
     expect(searches()).toHaveLength(0);
     expect(queries().some((query) => query.text.startsWith('INSERT INTO source_admission'))).toBe(false);
+    // 跳过（没真正跑准入）⇒ 不记成功行。
+    expect(successQueries()).toHaveLength(0);
     expect(logged(log, 'shuyuan admission batch')).toEqual([{ sources: 2, skipped: 'lease', trigger: 'refresh' }]);
   });
 });

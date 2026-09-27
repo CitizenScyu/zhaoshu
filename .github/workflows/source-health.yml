@@ -16,7 +16,10 @@
 # Vercel Hobby 限「每条 cron 每天最多触发一次」，三条 cron 的间隔均为 24h，阈值 = 24h + 2h 容差：
 #   SHUYUAN_REFRESH_ALERT_HOURS = 26 —— shuyuan 每日一次 + 2h 容差
 #   CRON_ALERT_HOURS           = 26 —— reclaim / drain 每日一次 + 2h 容差
-# 离线门禁 src/lib/vercel-cron.test.ts 会按 vercel.json 真算间隔比对这两组常数，脱节即红（防漏改）。
+#   ADMISSION_ALERT_HOURS      = 30 —— admission 一天两轮（02:00 刷新尾部 / 14:00 独立轮，任一成功
+#                                        即刷新成功行），30h = 一轮整体失败后的最坏间隔 24h + 漂移余量；
+#                                        一轮失败不告警，两轮都失败才告警（42-admhealth）。
+# 离线门禁 src/lib/vercel-cron.test.ts 会按 vercel.json 真算间隔比对这几组常数，脱节即红（防漏改）。
 name: Source health probe
 
 on:
@@ -49,6 +52,7 @@ jobs:
       ISSUE_LABEL: source-health
       SHUYUAN_REFRESH_ALERT_HOURS: '26'
       CRON_ALERT_HOURS: '26'
+      ADMISSION_ALERT_HOURS: '30'
     steps:
       - name: 评估健康状态
         id: assess
@@ -97,6 +101,9 @@ jobs:
             check_iso "shuyuan" "$(jq -r '.crons.shuyuan.lastSuccessAt' health.json)" "$SHUYUAN_REFRESH_ALERT_HOURS"
             check_iso "reclaim" "$(jq -r '.crons.reclaim.lastSuccessAt' health.json)" "$CRON_ALERT_HOURS"
             check_iso "drain" "$(jq -r '.crons.drain.lastSuccessAt' health.json)" "$CRON_ALERT_HOURS"
+            # 42-admhealth：准入成功行（02:00 刷新尾部与 14:00 独立轮共记）。部署后首轮成功前是 null，
+            # check_iso 对 null 的处理与其他项一致（「从未记录到成功」告警）——首次告警窗口见任务报告。
+            check_iso "admission" "$(jq -r '.crons.admission.lastSuccessAt' health.json)" "$ADMISSION_ALERT_HOURS"
             if [ "$(jq -r '.ok' health.json)" != "true" ] && [ -z "$reason" ]; then
               reason="端点自报 ok=false，但未匹配到具体原因（阈值口径可能与 src/lib/source-health.ts 漂移）"
             fi
