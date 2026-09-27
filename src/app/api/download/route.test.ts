@@ -14,7 +14,10 @@ vi.mock('@/lib/supported-sources', async (original) => ({
   ...await original<typeof import('@/lib/supported-sources')>(),
   engineHosts: vi.fn(async () => ['www.yingsx.com']),
 }));
-vi.mock('@/lib/shuyuan', () => ({ getEngineSources: vi.fn(async () => []) }));
+vi.mock('@/lib/shuyuan', () => ({
+  getEngineSources: vi.fn(async () => []),
+  getPoolEngineHosts: vi.fn(async () => ['www.yingsx.com']),
+}));
 
 import { getEngineSources } from '@/lib/shuyuan';
 import { refreshSupportedHosts } from '@/lib/source-policy';

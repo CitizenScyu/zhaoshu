@@ -135,7 +135,8 @@ function engineSourceOf(m, source) {
 let enginePoolOnce = null;
 async function loadEnginePool(m, signal) {
   enginePoolOnce ??= loadEnginePoolCached(async () => {
-    const hosts = await m.supported.engineHosts(signal);
+    // 41-poolimpl：host 门与池同源——源池产物优先（phoenix 本地文件，零 DB），失败回退库（开关关时即 engineHosts）。
+    const hosts = await m.shuyuan.getPoolEngineHosts(signal);
     m.policy.refreshSupportedHosts(hosts);
     return { hosts, sources: await m.shuyuan.getEngineSources(signal) };
   }).catch((error) => { enginePoolOnce = null; throw error; });

@@ -4,7 +4,7 @@ import { createDeadline, raceDeadline, type RequestDeadline } from '@/lib/deadli
 import { validateSourceUrl, refreshSupportedHosts, supportedHostList, upgradeSourceTemplateUrl } from '@/lib/source-policy';
 import { engineSourceUsable } from '@/lib/source-usability';
 import {
-  builtinFallbackSource, builtinUrlPrefixes, engineHosts, type SupportedSourceTier,
+  BUILTIN_SOURCE_HOSTS, builtinFallbackSource, builtinUrlPrefixes, engineHosts, type SupportedSourceTier,
 } from '@/lib/supported-sources';
 import {
   ADMISSION_MAX_REDIRECTS, ADMISSION_MIN_BUDGET_MS, ADMISSION_PROBE_WORST_MS, assertAdmissionVersionConsistent,
@@ -13,6 +13,10 @@ import {
 } from '@/lib/rule-engine/admission';
 import { enginePostSearchEnabled, selectCandidates, type RawSource } from '@/lib/rule-engine/compile-smoke';
 import { DEFAULT_SHUYUAN_READ_CACHE_TTL_MS, shuyuanReadCacheTtlMs } from '@/lib/read-cache-ttl';
+import {
+  createPoolArtifact, currentPoolArtifact, noteLocalPoolWrite, poolArtifactEnabled, resetPoolArtifactMemo,
+  writePoolArtifactFile, type PoolArtifact, type PoolArtifactEngineRow, type PoolArtifactSourceRow,
+} from '@/lib/pool-artifact';
 import {
   FILTER_COUNT_KEYS, SOURCE_PAGE_SIZE, offsetFor, pageCount,
   type ShuyuanAvailability, type ShuyuanSourceFilter,
@@ -425,7 +429,8 @@ async function refreshEngineHostGate(signal: AbortSignal, fresh = false): Promis
     }
     // 41-xferfix B1：门被缓存之外改过则先作废缓存（见 syncReadCacheWithGate），再按缓存 host 集刷门并记下快照。
     syncReadCacheWithGate();
-    refreshSupportedHosts(await cachedRead('engineHosts', signal, (sig) => engineHosts(sig)));
+    refreshSupportedHosts(await cachedRead('engineHosts', signal,
+      (sig) => artifactOr((artifact) => artifact.hosts, () => engineHosts(sig))));
     gateFromCache = supportedHostList().join(',');
     return true;
   } catch (error) {
@@ -441,14 +446,8 @@ async function refreshEngineHostGate(signal: AbortSignal, fresh = false): Promis
 async function builtinReadingSources(
   s: Sql, states: Map<string, ProbeState>, signal: AbortSignal,
 ): Promise<ReadingSource[]> {
-  const patterns = builtinUrlPrefixes().map((prefix) => `${prefix}%`);
-  const rows = await cachedRead('builtinRows', signal, (sig) => readRows<StoredSource & { name: string }>(s, s`
-    SELECT source_url, name, source, disabled_at::text AS disabled_at, last_error
-    FROM shuyuan_sources
-    WHERE EXISTS (
-      SELECT 1 FROM jsonb_array_elements_text(${JSON.stringify(patterns)}::jsonb) AS p(pattern)
-      WHERE source_url ILIKE p.pattern)
-    ORDER BY source_url`, sig));
+  const rows = await cachedRead('builtinRows', signal,
+    (sig) => artifactOr((artifact) => artifact.builtin, () => readBuiltinRows(s, sig)));
   const supported = rows.filter((row) => canProbe(row.source_url));
   const fallback = builtinFallbackSource();
   // The same built-in adapter as the download worker, only when the collection
@@ -463,6 +462,18 @@ async function builtinReadingSources(
       url: validateSourceUrl(row.source_url).href, name: row.name.slice(0, 200) || fallback.name,
       searchUrl: row.source.searchUrl ?? fallback.searchUrl, rules: row.source, tier: 'builtin' as const,
     }));
+}
+
+/** builtin 候选行（注册表内建 URL 前缀，不再硬编码 ILIKE 字面量）；池合成与产物生成共用同一查询。 */
+function readBuiltinRows(s: Sql, signal?: AbortSignal): Promise<PoolArtifactSourceRow[]> {
+  const patterns = builtinUrlPrefixes().map((prefix) => `${prefix}%`);
+  return readRows<PoolArtifactSourceRow>(s, s`
+    SELECT source_url, name, source, disabled_at::text AS disabled_at, last_error
+    FROM shuyuan_sources
+    WHERE EXISTS (
+      SELECT 1 FROM jsonb_array_elements_text(${JSON.stringify(patterns)}::jsonb) AS p(pattern)
+      WHERE source_url ILIKE p.pattern)
+    ORDER BY source_url`, signal);
 }
 
 /** probe 优先序：可达 = 2、其余 = 1（可达优先，§2.4）。 */
@@ -490,14 +501,8 @@ function checkedAtMs(value: string | null): number {
 async function engineReadingSources(
   s: Sql, states: Map<string, ProbeState>, signal: AbortSignal,
 ): Promise<ReadingSource[]> {
-  const rows = await cachedRead('engineRows', signal, (sig) => readRows<
-    StoredSource & { name: string; tier: string; search_checked_at: string | null }>(s, s`
-    SELECT src.source_url, src.name, src.source, src.disabled_at::text AS disabled_at, src.last_error,
-           a.tier, a.search_checked_at::text AS search_checked_at
-    FROM shuyuan_sources src
-    JOIN source_admission a ON a.source_url = src.source_url
-    WHERE a.compile_ok AND a.search_ok IS TRUE
-    ORDER BY src.source_url`, sig));
+  const rows = await cachedRead('engineRows', signal,
+    (sig) => artifactOr((artifact) => artifact.engine, () => readEngineRows(s, sig)));
   // 41-srcfix 改法2：库键 source_url 仍是上游原样（http:// 源不改键，source_admission 不会出新旧两行），
   // 运行时身份 url 取升 https 后的形态——搜索基址、目录/正文相对链接、目录缓存 sourceUrl 全部由它派生，
   // 所以 http 源的每个请求都走 https。只改 scheme，过的仍是同一把 validateSourceUrl 锁。
@@ -520,6 +525,17 @@ async function engineReadingSources(
       rules: row.source,
       tier: (row.tier === 'T7' ? 'T7' : 'M1') as SupportedSourceTier,
     }));
+}
+
+/** 引擎候选行：shuyuan_sources JOIN source_admission ok 态；池合成与产物生成共用同一查询。 */
+function readEngineRows(s: Sql, signal?: AbortSignal): Promise<PoolArtifactEngineRow[]> {
+  return readRows<PoolArtifactEngineRow>(s, s`
+    SELECT src.source_url, src.name, src.source, src.disabled_at::text AS disabled_at, src.last_error,
+           a.tier, a.search_checked_at::text AS search_checked_at
+    FROM shuyuan_sources src
+    JOIN source_admission a ON a.source_url = src.source_url
+    WHERE a.compile_ok AND a.search_ok IS TRUE
+    ORDER BY src.source_url`, signal);
 }
 
 function hostOfUrl(url: string): string {
@@ -752,8 +768,17 @@ const readCache = new Map<string, ReadCacheEntry>();
 /** 上次按缓存 engineHosts 刷出的门快照（refreshEngineHostGate 据此识别门被缓存之外改过）；null = 无。 */
 let gateFromCache: string | null = null;
 
-/** 丢弃全部池合成读缓存：本实例写路径之后调用；测试之间重置也用它。 */
+/**
+ * 丢弃全部池合成读缓存：本实例写路径之后调用；测试之间重置也用它。
+ * 41-poolimpl：同时记下「本实例刚写过库」——比这次写更早生成的源池产物本实例不再采信（回退库读直到新产物发布），
+ * 保住「本实例读己之写」（产物最多晚一个生成周期，改前本实例写后立即可见）。
+ */
 export function invalidateShuyuanReadCache(): void {
+  clearReadCache();
+  noteLocalPoolWrite();
+}
+
+function clearReadCache(): void {
   readCache.clear();
   gateFromCache = null;
 }
@@ -766,7 +791,7 @@ export function invalidateShuyuanReadCache(): void {
  */
 function syncReadCacheWithGate(): void {
   const gate = supportedHostList().join(',');
-  if (gateFromCache !== null && gate !== gateFromCache) invalidateShuyuanReadCache();
+  if (gateFromCache !== null && gate !== gateFromCache) clearReadCache();
   gateFromCache = gate;
 }
 
@@ -790,6 +815,73 @@ async function cachedRead<T>(
   return signal ? raceDeadline(signal, () => value) : value;
 }
 
+// —— 源池产物（41-poolimpl，设计 poolart-41-report §2）：池合成四份输入行「产物优先、失败回退库」——
+// 产物只替换 DB 行的来源，入池判定/排序/去重/host 门照旧在上面的 JS 里重算；外层 cachedRead 的 TTL、single-flight、
+// 失败不入缓存等语义不变。开关 SHUYUAN_POOL_ARTIFACT 默认关：关时直接走库读 loader，与改前逐字相同。
+
+/** 产物可用 ⇒ 取其中对应的行；开关关/产物不可用（缺失/过期/损坏/早于本实例写库）⇒ 库读。 */
+async function artifactOr<T>(pick: (artifact: PoolArtifact) => T, load: () => Promise<T>): Promise<T> {
+  if (!poolArtifactEnabled()) return load();
+  const artifact = await currentPoolArtifact();
+  return artifact ? pick(artifact) : load();
+}
+
+/**
+ * 引擎 host 门的鲜读入口（download-source / engine-fetch / runtime-download 刷门用）：产物优先，否则直读准入表
+ * （开关关时即 engineHosts(signal)，与改前相同）。与 getEngineSources 取自同一份产物，门与池行口径一致。
+ */
+export async function getPoolEngineHosts(signal?: AbortSignal): Promise<string[]> {
+  return artifactOr((artifact) => artifact.hosts, () => engineHosts(signal));
+}
+
+/**
+ * 从库合成一份源池产物（鲜读，不走缓存）：engineHosts + builtin 行 + 引擎行 + 探测快照中这些行 URL 的条目。
+ * 探测快照走池合成同一条 SQL 投影（readPoolProbeMeta），门取「内建 host ∪ 本次 engineHosts」的小写集——是生成后
+ * 消费侧门的超集（refreshSupportedHosts 只会再滤掉不规范 host），所以不会漏条目；且不整列读 collections（≈159 KB）。
+ * 再按行 URL 过滤：池只按行的 source_url 查 states，canProbe/门判定在消费侧 readMeta 里照做；
+ * 同一 URL 的重复条目同进同出，readMeta「重复即作废」语义不变，条目保持原序。
+ */
+export async function buildShuyuanPoolArtifact(signal: AbortSignal): Promise<PoolArtifact> {
+  const s = getSql();
+  const hosts = await engineHosts(signal);
+  const projectionHosts = [...new Set([...BUILTIN_SOURCE_HOSTS, ...hosts].map((host) => host.trim().toLowerCase()))].sort();
+  const [meta, builtin, engine] = await Promise.all([
+    readPoolProbeMeta(s, projectionHosts, signal), readBuiltinRows(s, signal), readEngineRows(s, signal),
+  ]);
+  const urls = new Set([...builtin, ...engine].map((row) => row.source_url));
+  const list = Array.isArray(meta.collections) ? meta.collections : [];
+  const snapshot = isRecord(list[0]) && isRecord(list[0].probeSnapshot) ? list[0].probeSnapshot : {};
+  const entries = Array.isArray(snapshot.entries) ? snapshot.entries : [];
+  return createPoolArtifact({
+    refreshedAt: meta.refreshed_at,
+    hosts: [...hosts].sort(),
+    builtin,
+    engine,
+    probe: {
+      version: snapshot.version ?? null,
+      entries: entries.filter((entry) => isRecord(entry) && typeof entry.url === 'string' && urls.has(entry.url)),
+    },
+  });
+}
+
+/**
+ * 写库成功后在本机发布产物：仅当开关开且配置了 SHUYUAN_POOL_ARTIFACT_PATH（phoenix 这类有持久盘的进程）才做，
+ * Vercel 上无此 env ⇒ 'skipped'，零额外读。绝不让写路径失败：生成/写文件出错只告警（下一轮 phoenix 定时生成兜底）。
+ */
+export async function publishPoolArtifact(signal?: AbortSignal): Promise<'written' | 'unchanged' | 'skipped' | 'failed'> {
+  const path = process.env.SHUYUAN_POOL_ARTIFACT_PATH?.trim();
+  if (!poolArtifactEnabled() || !path) return 'skipped';
+  try {
+    const artifact = await buildShuyuanPoolArtifact(signal ?? AbortSignal.timeout(READ_CACHE_LOAD_TIMEOUT_MS));
+    const result = await writePoolArtifactFile(path, artifact);
+    resetPoolArtifactMemo();
+    return result;
+  } catch (error) {
+    console.error('shuyuan pool artifact publish failed', { reason: safeReason(error) });
+    return 'failed';
+  }
+}
+
 /**
  * 池合成用的探测快照投影（xfer41）：只取「host 门内」源的探测条目，而不是整列 collections（≈159 KB / 1215 条）。
  *
@@ -805,24 +897,28 @@ async function cachedRead<T>(
  */
 async function poolProbeMeta(s: Sql, signal?: AbortSignal): Promise<MetaRow> {
   const hosts = supportedHostList();
-  return cachedRead(`poolProbeMeta:${hosts.join(',')}`, signal, async (sig) => {
-    const rows = await readRows<MetaRow>(s, s`
-      SELECT refreshed_at::text AS refreshed_at,
-             jsonb_build_array(jsonb_build_object('probeSnapshot', jsonb_build_object(
-               'version', collections->0->'probeSnapshot'->'version',
-               'entries', COALESCE((
-                 SELECT jsonb_agg(e.entry ORDER BY e.ord)
-                 FROM jsonb_array_elements(CASE
-                   WHEN jsonb_typeof(collections->0->'probeSnapshot'->'entries') = 'array'
-                   THEN collections->0->'probeSnapshot'->'entries' ELSE '[]'::jsonb END) WITH ORDINALITY AS e(entry, ord)
-                 WHERE lower(e.entry->>'url') ~ '^https://'
-                   AND (substring(lower(e.entry->>'url') FROM '^https://([a-z0-9.-]+)(?::443)?(?:[/?#]|$)')
-                          = ANY(ARRAY(SELECT jsonb_array_elements_text(${JSON.stringify(hosts)}::jsonb)))
-                        OR lower(e.entry->>'url') !~ '^https://[a-z0-9.-]+(?::443)?(?:[/?#]|$)')
-               ), '[]'::jsonb)))) AS collections
-      FROM shuyuan_meta WHERE id = 1`, sig);
-    return rows[0] ?? { collections: [], refreshed_at: null };
-  });
+  return cachedRead(`poolProbeMeta:${hosts.join(',')}`, signal, (sig) => artifactOr(
+    (artifact) => ({ refreshed_at: artifact.refreshedAt, collections: [{ probeSnapshot: artifact.probe }] }),
+    () => readPoolProbeMeta(s, hosts, sig)));
+}
+
+async function readPoolProbeMeta(s: Sql, hosts: string[], sig?: AbortSignal): Promise<MetaRow> {
+  const rows = await readRows<MetaRow>(s, s`
+    SELECT refreshed_at::text AS refreshed_at,
+           jsonb_build_array(jsonb_build_object('probeSnapshot', jsonb_build_object(
+             'version', collections->0->'probeSnapshot'->'version',
+             'entries', COALESCE((
+               SELECT jsonb_agg(e.entry ORDER BY e.ord)
+               FROM jsonb_array_elements(CASE
+                 WHEN jsonb_typeof(collections->0->'probeSnapshot'->'entries') = 'array'
+                 THEN collections->0->'probeSnapshot'->'entries' ELSE '[]'::jsonb END) WITH ORDINALITY AS e(entry, ord)
+               WHERE lower(e.entry->>'url') ~ '^https://'
+                 AND (substring(lower(e.entry->>'url') FROM '^https://([a-z0-9.-]+)(?::443)?(?:[/?#]|$)')
+                        = ANY(ARRAY(SELECT jsonb_array_elements_text(${JSON.stringify(hosts)}::jsonb)))
+                      OR lower(e.entry->>'url') !~ '^https://[a-z0-9.-]+(?::443)?(?:[/?#]|$)')
+             ), '[]'::jsonb)))) AS collections
+    FROM shuyuan_meta WHERE id = 1`, sig);
+  return rows[0] ?? { collections: [], refreshed_at: null };
 }
 
 async function countsFromStates(s: Sql, states: Map<string, ProbeState>, signal?: AbortSignal): Promise<ShuyuanCounts> {
@@ -972,6 +1068,7 @@ export async function disableShuyuanSource(url: string, reason: string): Promise
     WHERE source_url = ${normalizeUrl(url)}
     RETURNING id`) as { id: number }[];
   invalidateShuyuanReadCache();
+  if (rows.length > 0) await publishPoolArtifact(); // 41-poolimpl：UPDATE 成功且命中行才重发产物
   return rows.length > 0;
 }
 
@@ -1000,6 +1097,7 @@ export async function enableShuyuanSource(url: string): Promise<boolean> {
     WHERE source_url = ${normalizeUrl(url)}
     RETURNING id`) as { id: number }[];
   invalidateShuyuanReadCache();
+  if (rows.length > 0) await publishPoolArtifact(); // 41-poolimpl：同 disableShuyuanSource
   return rows.length > 0;
 }
 
@@ -1237,6 +1335,8 @@ async function refreshWithinBudget(s: Sql, budget: RequestDeadline, signal: Abor
   // M1 准入库：挂在全量替换事务**之后**（设计 §4.2 v3 E2）。事务已提交，validateAdmissionUrl
   // 读到的「源声明 host 集合」本轮即含新源；滤网 2 不在用户请求路径上跑，只在此 cron 批次。
   await runAdmissionAfterRefresh(s, rows, budget, signal);
+  // 41-poolimpl：全量替换已提交、准入批次已写回（或按 §6.3 降级跳过，库仍自洽）之后才发布源池产物；事务失败走不到这里。
+  await publishPoolArtifact(signal);
   return getShuyuanStats(signal);
 }
 

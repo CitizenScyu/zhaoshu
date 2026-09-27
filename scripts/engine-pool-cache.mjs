@@ -13,6 +13,8 @@
 //   文件权限 0600。内容只是公开书源规则与 host 名，不含凭据。
 // - 读坏（不存在/损坏/过期/版本不符/时钟回拨）一律当未命中，重读 DB 并覆盖；写失败静默（缓存只是优化，
 //   不能让取书失败）。DB 读失败不写缓存，照旧抛给调用方（engine-fetch 按子命令退 2）。
+// - 41-poolimpl：load() 本身已是「源池产物优先、失败回退库」（shuyuan.getPoolEngineHosts / getEngineSources），
+//   本缓存照旧叠在外层：产物可用时省的是每进程解析产物，产物不可用而回退库时仍把库读压到每 TTL 一次。
 import { createHash, randomBytes } from 'node:crypto';
 import { readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
