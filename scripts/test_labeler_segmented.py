@@ -1270,6 +1270,43 @@ class TestAnchorFill(_NoSleep):
             caches={}, plan_ch_cache={40: '预览' * 60 + '……'})
         self.assertEqual((why, nums), ('noref', []))
 
+    @staticmethod
+    def _renumbered(body_of):
+        """锚源 b 形如 quanwenyuedu《斗破苍穹》：下标 30/31 多两条作者感言，其后章按正文编号（比计划源目录号小 5），
+        章名与计划源同名。正文按「对应计划源下标」取 body_of(计划源下标)。"""
+        def title(i):
+            if i < 30:
+                return _chapter_title(i)
+            if i < 32:
+                return f'第{i + 1}章 作者感言{i}'
+            return f'第{i - 2 + 1 - 5}章 情节名目{i - 2:04d}'
+
+        def body(i):
+            if i < 30:
+                return body_of(i)
+            if i < 32:
+                return '感言' * 80
+            return body_of(i - 2)
+        return {'n': 102, 'titles': title, 'body': body}
+
+    def test_anchor_renumbered_aligned_by_name(self):
+        """锚源章号与计划源对不上（多插两章 + 按正文重编号）：按防护 B 的章名对齐偏移取章、核标题、核预览开头
+        → 第 2/3/4 段取到的正是计划源本段窗口对应章（不是锚源同章号章，也不是锚源自己的段窗口）。"""
+        cli, text, used, segs = self._run(self._renumbered(_BOOK_A))
+        for no, start in ((2, 40), (3, 70), (4, 90)):
+            self.assertEqual((segs[no]['source'], segs[no].get('ref')), ('b.example.com', 'anchor'), no)
+            self.assertEqual(segs[no]['chapters'].split('-')[0], str(start + 2 + 1), no)   # 锚源下标 = 计划源 + 2
+            self.assertTrue(segs[no]['head_nums'], no)
+            self.assertIn(_seeded_head(1, start), text)             # 计划源本段首章的开头原文
+
+    def test_anchor_renumbered_misaligned_body_blocked(self):
+        """章名对得上但锚源正文从下标 30 起错一章（章名 k 挂着第 k+1 章正文）：标题核对看不出，防护 C 按对位
+        比预览开头 → 对不上 → 第 2/3/4 段 MISSING。"""
+        cli, text, used, segs = self._run(self._renumbered(lambda i: _BOOK_A(i + 1 if i >= 30 else i)))
+        for no in (2, 3, 4):
+            self.assertTrue(segs[no].get('missing'), no)
+            self.assertIn('b.example.com:anchor_head', segs[no]['tried'])
+
 
 class TestAnchorWindowToc(unittest.TestCase):
     """防护 B：按章名对齐后比窗口目录；两站目录条数略有出入（窗口起点错开）不误拒，换书 / 对不齐一律拒。"""

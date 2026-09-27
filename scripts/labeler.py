@@ -1966,7 +1966,7 @@ def fetch_segment(engine_cli, chapters: list[dict], window: dict, deadline: floa
     target = window['target']
     first_segment = window.get('no') == 1
     parts: list[str] = []
-    hits: list[dict] = []       # 每章 {'num': 章号, 'text': 正文}（>100 字才计），供 same_book 正文信号（R2-6）
+    hits: list[dict] = []       # 每章 {'num': 章号, 'text': 正文, 'idx': 目录下标}（>100 字才计），供 same_book 正文信号（R2-6）
     raw = requested = preview_skipped = miss_streak = 0
     first = last = None
     stop = 'window_end'
@@ -1993,7 +1993,7 @@ def fetch_segment(engine_cli, chapters: list[dict], window: dict, deadline: floa
         miss_streak = 0 if hit else miss_streak + 1
         if len(text) > 100:
             parts.append(part)
-            hits.append({'num': douban_list._toc_chapter_number(title), 'text': text})
+            hits.append({'num': douban_list._toc_chapter_number(title), 'text': text, 'idx': idx})
             raw += len(text)
             first = idx if first is None else first
             last = idx
@@ -2318,29 +2318,59 @@ def anchor_identity(engine_cli, plan: dict, cand: dict, deadline: float,
 
 
 def _anchor_window_toc_ok(plan_chapters: list[dict], win: dict, anchor_chapters: list[dict]) -> bool:
-    """换锚防护 B（lblsegfix42）：锚源目录在**本段窗口**与计划源目录有序一致 → 过？
+    """换锚防护 B（lblsegfix42）：锚源目录在**本段窗口**与计划源目录有序一致 → 过？（见 _anchor_align）"""
+    return _anchor_align(plan_chapters, win, anchor_chapters) is not None
+
+
+def _anchor_align(plan_chapters: list[dict], win: dict, anchor_chapters: list[dict]) -> int | None:
+    """换锚防护 B（lblsegfix42）：锚源目录在**本段窗口**与计划源目录有序一致 → 对齐偏移 off
+    （锚源目录下标 = 计划源目录下标 + off），不一致/不可判 → None。
 
     防的是：锚源整本目录判同、可读区正文也判同，但后段窗口目录换成另一本书/错乱。计划源窗口
     [start, end) 取其首个信息性章名，在锚源目录里找同名章（多处同名取离窗口起点最近者）对齐起点，
     截等长切片，两切片过 `douban_list._toc_decides`（Jaccard/有序 LCS/交集下限，不放宽）。
     按章名对齐而非按下标：两站目录条数略有出入时窗口起点会错开，按下标比有序 LCS 会误拒。
-    窗口无信息性章名、锚源找不到对齐章、切片不可判 → False（不可判一律拒）。"""
+    真书上两站章号也常对不上（book.qq.com《斗破苍穹》目录第 634 章 = 正文「第六百零六章」，quanwenyuedu
+    按正文编号；quanwenyuedu《唐砖》分卷重排章号），所以锚段取章、段位置标题核对、防护 C 都按这个偏移
+    对位，不按章号。窗口无信息性章名、锚源找不到对齐章、切片不可判 → None（不可判一律拒）。"""
     plan_slice = plan_chapters[win['start']:win['end']]
     names = [_norm_toc_name(c.get('title') or '') for c in plan_slice]
     first_off = next((k for k, n in enumerate(names) if n), None)
     if first_off is None:
-        return False
+        return None
     anchor_names = [_norm_toc_name(c.get('title') or '') for c in anchor_chapters]
     hits = [k for k, n in enumerate(anchor_names) if n == names[first_off]]
     if not hits:
-        return False
+        return None
     pos = min(hits, key=lambda k: abs(k - (win['start'] + first_off)))
-    start = max(0, pos - first_off)
+    start = pos - first_off
+    if start < 0:
+        return None
     a_slice = anchor_chapters[start:start + len(plan_slice)]
     judge, same, _, _ = douban_list._toc_decides(
         {'toc': douban_list._informative_toc_titles(plan_slice)},
         {'toc': douban_list._informative_toc_titles(a_slice)})
-    return judge and same
+    return start - win['start'] if judge and same else None
+
+
+def _anchor_title_mismatch(plan_chapters: list[dict], anchor_chapters: list[dict], a_window: dict,
+                           off: int) -> float | None:
+    """锚段的段位置标题核对（lblsegfix42）：同 _seg_title_mismatch 口径（信息性章名归一后比、分母 0 → None
+    不可判），只是按防护 B 的对齐偏移对位（锚源下标 idx ↔ 计划源下标 idx - off），不按章号——两站章号错位时
+    按章号比会拿不同章互比。"""
+    total = mismatch = 0
+    for idx in range(a_window['start'], min(a_window['end'], len(anchor_chapters))):
+        p_idx = idx - off
+        if not 0 <= p_idx < len(plan_chapters):
+            continue
+        pn = _norm_toc_name(plan_chapters[p_idx].get('title') or '')
+        cn = _norm_toc_name(anchor_chapters[idx].get('title') or '')
+        if not pn or not cn:
+            continue
+        total += 1
+        if pn != cn:
+            mismatch += 1
+    return (mismatch / total) if total else None
 
 
 def _head_probe(text: str) -> set:
@@ -2370,27 +2400,34 @@ def _plan_head_probe(engine_cli, plan: dict, num, deadline: float, clock: Callab
 
 def _anchor_head_guard(engine_cli, plan: dict, anchor_hits: list[dict], deadline: float,
                        clock: Callable[[], float], plan_ch_cache: dict,
-                       plan_head_cache: dict) -> tuple[bool, list]:
+                       plan_head_cache: dict, off: int = 0) -> tuple[bool, list]:
     """换锚防护 C（lblsegfix42）：锚源本段**实际送模章**的开头须与计划源同章号章（多为付费墙预览）开头一致
     → (过？, 核对章号)。
 
     防的是：锚源后段目录不变（防护 B 与段位置标题核对都看不出）而正文换成另一本书。核对送模章中**首章与末章**
     （有章号者；换书一旦发生通常延续到书尾，末章兜住「送模区间中途换书」；该章计划源探针不可比则往里顺延，
-    每端至多 SEG_ANCHOR_HEAD_TRIES 章）：计划源探针 4-gram 数
+    每端至多 SEG_ANCHOR_HEAD_TRIES 章；锚章按防护 B 偏移 off 对位到计划源目录下标 idx - off，取该计划源章的章号）：
+    计划源探针 4-gram 数
     ≥SEG_ANCHOR_HEAD_MIN_GRAMS 才算可比，可比章被锚章正文包含的比例须 ≥SEG_ANCHOR_HEAD_CONTAIN；
     须 ≥1 章可比且可比章**全部**过线，否则拒（计划源该段 4xx、无预览可比 → 不可判一律拒）。"""
-    numbered = [h for h in anchor_hits if h.get('num') is not None and len(h.get('text') or '') > 100]
+    numbered = []
+    for h in anchor_hits:
+        p_idx = h['idx'] - off
+        if len(h.get('text') or '') > 100 and 0 <= p_idx < len(plan['chapters']):
+            p_num = douban_list._toc_chapter_number(plan['chapters'][p_idx].get('title') or '')
+            if p_num is not None:
+                numbered.append((p_num, h['text']))
     checked: list = []
     for side in (numbered, numbered[::-1]):
         # 每端从最外一章往里找首个可比章（至多 SEG_ANCHOR_HEAD_TRIES 章），核它一章即止；两端相遇就不重复核
-        for h in side[:SEG_ANCHOR_HEAD_TRIES]:
-            if h['num'] in checked:
+        for p_num, text in side[:SEG_ANCHOR_HEAD_TRIES]:
+            if p_num in checked:
                 break
-            probe = _plan_head_probe(engine_cli, plan, h['num'], deadline, clock, plan_ch_cache, plan_head_cache)
+            probe = _plan_head_probe(engine_cli, plan, p_num, deadline, clock, plan_ch_cache, plan_head_cache)
             if len(probe) < SEG_ANCHOR_HEAD_MIN_GRAMS:
                 continue
-            body = douban_list._char_ngrams(douban_list._to_simplified(h['text']))
-            checked.append(h['num'])
+            body = douban_list._char_ngrams(douban_list._to_simplified(text))
+            checked.append(p_num)
             if len(probe & body) / len(probe) < SEG_ANCHOR_HEAD_CONTAIN:
                 return False, checked
             break
@@ -2552,15 +2589,20 @@ def fetch_book_text_segmented(engine_cli, book: dict, tracker: SourceGiveupTrack
                     # 计划源正文判同成立，就作锚补本段；另须过防护 B（窗口目录有序一致）与 C（预览开头一致）。
                     a_why, a_nums = anchor_identity(engine_cli, plan, entry, deadline, clock,
                                                     fill_caches, plan_ch_cache)
-                    if not a_why and not _anchor_window_toc_ok(plan['chapters'], win, entry['chapters']):
+                    a_off = None if a_why else _anchor_align(plan['chapters'], win, entry['chapters'])
+                    if not a_why and a_off is None:
                         a_why = 'toc_window'
                     if not a_why:
-                        # 防护 C 预探：计划源本段前 SEG_ANCHOR_HEAD_TRIES 个送模章号里须有可比开头探针；
-                        # 都取不到（4xx/无预览）即不抓锚段
-                        win_nums = [n for n in (douban_list._toc_chapter_number(c.get('title') or '')
-                                                for c in entry['chapters'][src_win['start']:src_win['end']]
-                                                if not is_preview_title((c.get('title') or '').strip()))
-                                    if n is not None][:SEG_ANCHOR_HEAD_TRIES]
+                        # 锚段按对齐偏移取计划源本段窗口的对应章（两站章号/条数可能错位，不用锚源自己的段窗口）
+                        src_win = {**src_win, 'start': win['start'] + a_off,
+                                   'end': min(win['end'] + a_off, len(entry['chapters']))}
+                        # 防护 C 预探：计划源本段前 SEG_ANCHOR_HEAD_TRIES 个送模章（锚源对位章非 APP免费 类）里
+                        # 须有可比开头探针；都取不到（4xx/无预览）即不抓锚段
+                        win_nums = [n for n in (
+                            douban_list._toc_chapter_number(plan['chapters'][k - a_off].get('title') or '')
+                            for k in range(src_win['start'], src_win['end'])
+                            if not is_preview_title((entry['chapters'][k].get('title') or '').strip()))
+                            if n is not None][:SEG_ANCHOR_HEAD_TRIES]
                         if not any(len(_plan_head_probe(engine_cli, plan, n, deadline, clock, plan_ch_cache,
                                                         plan_head_cache)) >= SEG_ANCHOR_HEAD_MIN_GRAMS
                                    for n in win_nums):
@@ -2575,8 +2617,9 @@ def fetch_book_text_segmented(engine_cli, book: dict, tracker: SourceGiveupTrack
                 # 段位置标题核对（rvlblseg R3 重点 2 + R4 必修 3）：补段候选**实际送模章**标题须与计划源目录
                 # 同章号章名一致；不一致比例过高**或不可判（分母 0）**→ 弃该候选（不可判一律拒，同 same_book 口径）。
                 if (ok or ref_mode == 'anchor') and res['first'] is not None:   # 锚段兜底（partial）也要核
-                    tm = _seg_title_mismatch(plan['chapters'], entry['chapters'],
-                                             {'start': res['first'], 'end': res['last'] + 1})
+                    sent = {'start': res['first'], 'end': res['last'] + 1}
+                    tm = (_anchor_title_mismatch(plan['chapters'], entry['chapters'], sent, a_off)
+                          if ref_mode == 'anchor' else _seg_title_mismatch(plan['chapters'], entry['chapters'], sent))
                     if tm is None or tm > SEG_FILL_TITLE_MAX_MISMATCH:
                         tried.append(f'{host}:title_pos')
                         print(f'  第 {win["no"]} 段 {host} 送模章标题与计划源目录不符/不可判，弃')
@@ -2585,7 +2628,7 @@ def fetch_book_text_segmented(engine_cli, book: dict, tracker: SourceGiveupTrack
                 if ref_mode == 'anchor' and res['first'] is not None:
                     # 换锚防护 C（lblsegfix42）：锚源送模首/末章开头须与计划源同章号预览开头一致（锚后段换书拦截）。
                     head_ok, head_nums = _anchor_head_guard(engine_cli, plan, res['hits'], deadline, clock,
-                                                            plan_ch_cache, plan_head_cache)
+                                                            plan_ch_cache, plan_head_cache, a_off)
                     if not head_ok:
                         tried.append(f'{host}:anchor_head')
                         print(f'  第 {win["no"]} 段 {host} 锚段正文开头与计划源预览不符/不可判，弃')
