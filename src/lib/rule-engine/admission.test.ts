@@ -2143,6 +2143,33 @@ describe('admbackoff42：连续失败计数前缀 parseFailCount / applyFailCoun
     expect(parseFailCount(`${ADMISSION_FAIL_COUNT_PREFIX}abc:x`)).toEqual({ count: 1, rest: `${ADMISSION_FAIL_COUNT_PREFIX}abc:x` });
   });
 
+  it('S2：只认 /^\\d+$/ 纯数字串，parseInt 可吞的怪形态按 n=1 原样（rest 保留完整原串）', () => {
+    // 2e3 / +3 / -1：parseInt 会分别吞成 2/3/-1，收紧后一律不识别 ⇒ count=1、rest 原样，
+    // 保证被吞的段（'e3' 等）不会静默丢进 rest。
+    expect(parseFailCount(`${ADMISSION_FAIL_COUNT_PREFIX}2e3:x`)).toEqual({ count: 1, rest: `${ADMISSION_FAIL_COUNT_PREFIX}2e3:x` });
+    expect(parseFailCount(`${ADMISSION_FAIL_COUNT_PREFIX}+3:x`)).toEqual({ count: 1, rest: `${ADMISSION_FAIL_COUNT_PREFIX}+3:x` });
+    expect(parseFailCount(`${ADMISSION_FAIL_COUNT_PREFIX}-1:x`)).toEqual({ count: 1, rest: `${ADMISSION_FAIL_COUNT_PREFIX}-1:x` });
+    // 前导空白同样不认（parseInt 会跳空白吃到 3）
+    expect(parseFailCount(`${ADMISSION_FAIL_COUNT_PREFIX} 3:x`)).toEqual({ count: 1, rest: `${ADMISSION_FAIL_COUNT_PREFIX} 3:x` });
+    // 空数字段（fail_count::x）：/^\d+$/ 不匹配空串 ⇒ count=1 原样
+    expect(parseFailCount(`${ADMISSION_FAIL_COUNT_PREFIX}:x`)).toEqual({ count: 1, rest: `${ADMISSION_FAIL_COUNT_PREFIX}:x` });
+  });
+
+  it('S2：前导零仍是合法数字（03 ⇒ 3）；超大数走 isSafeInteger 与 exp 夹 40 双重上界', () => {
+    // 03 命中 /^\d+$/，parseInt('03')=3 ⇒ count=3、rest 剥出。真实写路径不产前导零，
+    // 但即便出现，按十进制值解读也无害（窗仍有限）。
+    expect(parseFailCount(`${ADMISSION_FAIL_COUNT_PREFIX}03:x`)).toEqual({ count: 3, rest: 'x' });
+    // 超大数上界一：> MAX_SAFE_INTEGER（parseInt 因浮点四舍五入落到非安全整数）⇒ isSafeInteger 拒绝 ⇒ count=1 原样，
+    // 决不产生 NaN/Infinity 或「永不/永远到期」。
+    expect(parseFailCount(`${ADMISSION_FAIL_COUNT_PREFIX}9007199254740993:x`))
+      .toEqual({ count: 1, rest: `${ADMISSION_FAIL_COUNT_PREFIX}9007199254740993:x` });
+    // 超大数上界二：= MAX_SAFE_INTEGER 是合法安全整数 ⇒ count 照取；退避窗的第二道上界由 backoffWindowMs
+    // 内部 exp = min(n-1, 40) 夹住（admission.ts），故窗 = min(startMs·2^40, maxMs) 恒收敛到各 verdict 上限
+    // （有限、不溢出）。backoffWindowMs 未导出，此处只钉 parseFailCount 侧；窗上界见 isRetestDue 端到端 C8/C9。
+    expect(parseFailCount(`${ADMISSION_FAIL_COUNT_PREFIX}${Number.MAX_SAFE_INTEGER}:x`))
+      .toEqual({ count: Number.MAX_SAFE_INTEGER, rest: 'x' });
+  });
+
   const HASH = 'h1';
   const prevFail = (verdict: string, error: string, rules_hash = HASH): AdmissionSourceRow =>
     sourceRow('https://x.example.com/', { search_ok: false, search_verdict: verdict, error, rules_hash });
