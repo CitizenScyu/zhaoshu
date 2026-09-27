@@ -2776,50 +2776,105 @@ def _build_engine_cli(env: dict):
 # 章节（phoenix 实测一次调用 8.2 s、7.7 万字；目录序还与「下一章」链序不同，只给下一章拦不住）。
 # 这里包一层 CLI：toc 成功后把整本目录写进临时文件，之后对目录内章节的 content 追加
 # --stop-urls-file（翻到目录里任一章即停）。包在 CLI 外面而不是改逐章循环：主源/备选源各自先取 toc，
-# 停止点跟着切换，取文循环本身零改动。
+# 停止点按章节 host 各记一份（stophost42），取文循环本身零改动。
 STOP_URLS_FLAG = '--stop-urls-file'
 # 「不认识该参数」的报错形态（node 的 util.parseArgs / argparse / 自写 CLI 的常见措辞）。
 # 只认这类才降级；新 CLI 自己报的「--stop-urls-file 无法读取」不含这些词，不算旧 CLI。
 _UNKNOWN_OPTION_RE = re.compile(r'未知参数|未知选项|无法识别|unrecognized|unknown option', re.I)
 
 
+def _url_host(url) -> str | None:
+    try:
+        return urllib.parse.urlsplit(url).netloc.lower() or None
+    except (ValueError, AttributeError, TypeError):
+        return None
+
+
 class EngineStopUrls:
-    """引擎 CLI 包装：记住最近一次 toc 的整本目录，给该目录内章节的 content 带上停止点清单。
+    """引擎 CLI 包装：按章节 URL 的 host 各记该 host 最近一次 toc 的目录，给目录内章节的 content 带上
+    该 host 的停止点清单。
+
+    按 host 分开记（stophost42）：跨源补段时主源/备选源交替取 toc，只记最近一次会让后一个源的目录
+    覆盖前一个源，回头对前一个源取核验章就不带停止点（segrerun42 实测斗破段 4 cuoceng 6 条 NOSTOP）。
+    每个 host 一个临时文件，最多 MAX_HOSTS 个，超出按最久未用淘汰（toc 与命中的 content 都算用）并删文件。
 
     旧 CLI 不认这个参数（rc=2 且 stderr 点名它，部署顺序颠倒时）→ 本轮降级为不带停止点并重试一次，
     行为同改前。其余属性/方法原样转给被包装的 CLI。"""
 
+    MAX_HOSTS = 32
+
     def __init__(self, cli, directory: str | None = None):
         self._cli = cli
-        fd, self.path = tempfile.mkstemp(prefix='labeler-stop-urls-', suffix='.txt', dir=directory)
-        os.close(fd)
+        self._directory = directory
+        # host → (停止点文件路径, 该 host 最近一次 toc 的章节 URL 集合)；插入序即 LRU 序，末尾最近用。
+        self._hosts: dict[str, tuple[str, frozenset[str]]] = {}
+        self._last_host: str | None = None
         atexit.register(self._cleanup)
-        self._urls: frozenset[str] = frozenset()
         self.supported = True
 
     def __getattr__(self, name):
         return getattr(self._cli, name)
 
-    def _cleanup(self) -> None:
-        try:
-            os.unlink(self.path)
-        except OSError:
-            pass
+    @property
+    def path(self) -> str | None:
+        """兼容旧接口：最近一次用到（toc 写入或 content 命中）的 host 的停止点文件；还没有则 None。"""
+        entry = self._hosts.get(self._last_host) if self._last_host else None
+        return entry[0] if entry else None
 
-    def _remember_toc(self, stdout: str) -> None:
+    def _cleanup(self) -> None:
+        for host in list(self._hosts):
+            self._forget(host)
+
+    def _forget(self, host: str | None) -> None:
+        entry = self._hosts.pop(host, None) if host else None
+        if entry:
+            try:
+                os.unlink(entry[0])
+            except OSError:
+                pass
+
+    def _touch(self, host: str) -> None:
+        self._hosts[host] = self._hosts.pop(host)
+        self._last_host = host
+
+    def _store(self, host: str, urls: list[str]) -> None:
+        entry = self._hosts.pop(host, None)
+        if entry:
+            path = entry[0]
+        else:
+            fd, path = tempfile.mkstemp(prefix='labeler-stop-urls-', suffix='.txt', dir=self._directory)
+            os.close(fd)
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write(''.join(u + '\n' for u in urls))
+        self._hosts[host] = (path, frozenset(urls))
+        self._last_host = host
+        while len(self._hosts) > self.MAX_HOSTS:
+            self._forget(next(iter(self._hosts)))
+
+    def _remember_toc(self, toc_url, stdout: str) -> None:
         try:
             chapters = json.loads(stdout).get('chapters') or []
             urls = [c['url'] for c in chapters if isinstance(c, dict) and c.get('url')]
         except (ValueError, AttributeError, TypeError):
             urls = []
-        with open(self.path, 'w', encoding='utf-8') as f:
-            f.write(''.join(u + '\n' for u in urls))
-        self._urls = frozenset(urls)
+        by_host: dict[str, list[str]] = {}
+        for u in urls:
+            host = _url_host(u)
+            if host:
+                by_host.setdefault(host, []).append(u)
+        if not by_host:
+            # 目录空/解析不了：同失败的 toc，忘掉该 toc 所在 host 的旧书。
+            self._forget(_url_host(toc_url))
+        for host, host_urls in by_host.items():
+            self._store(host, host_urls)
 
     def run(self, subcommand: str, *args: str, **kw):
         url = args[1] if len(args) >= 2 and args[0] == '--url' else None
-        if subcommand == 'content' and self.supported and url in self._urls:
-            proc = self._cli.run(subcommand, *args, STOP_URLS_FLAG, self.path, **kw)
+        host = _url_host(url) if url else None
+        entry = self._hosts.get(host) if host else None
+        if subcommand == 'content' and self.supported and entry and url in entry[1]:
+            self._touch(host)
+            proc = self._cli.run(subcommand, *args, STOP_URLS_FLAG, entry[0], **kw)
             # 只认「不认识这个参数」类报错（旧 CLI）。新 CLI 自己报的「--stop-urls-file 无法读取」
             # 也是 rc=2 且 stderr 含该参数名，不能当成旧 CLI 把整轮停止点静默关掉（lblqualfix41，复审非阻断①）。
             if proc.returncode != 2 or not _UNKNOWN_OPTION_RE.search(proc.stderr or ''):
@@ -2830,9 +2885,9 @@ class EngineStopUrls:
         proc = self._cli.run(subcommand, *args, **kw)
         if subcommand == 'toc':
             if proc.returncode == 0:
-                self._remember_toc(proc.stdout)
+                self._remember_toc(url, proc.stdout)
             else:
-                self._urls = frozenset()
+                self._forget(host)
         return proc
 
 
