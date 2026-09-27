@@ -2585,10 +2585,12 @@ def main() -> int:
         # 语义 = 「本轮最多打 limit 本**未完成**的书」。stub_urls 折进 done 侧一并跳过（P1）。
         queue, skipped_done, skipped_pinned = split_queue(
             all_books, done_urls | stub_urls, pinned, deferred=deferred_urls)
-        # 后移计数：冷却期内被拒且真的进了本轮待处理队列（未完成、非钉子户）的本数。
+        queue = queue[:args.limit]
+        # 后移计数：冷却期内被拒、且在切 --limit 后仍真正进入本轮待处理队列的本数。
+        # 必须切片**之后**统计——后移的书都在队尾，limit 一截多半先被剔掉，所以「本轮待处理
+        # N 本，其中 M 本后移」里的 M 必须与切片后的 N 同口径，否则 M 可能 > N，「其中」不成立。
         deferred_in_queue = sum(
             1 for b in queue if BOOK15.absolute(b['url']) in deferred_urls)
-        queue = queue[:args.limit]
         # X = 本轮跳过总数（已完成 + 钉子户终态，互斥不重叠），Y = 其中因钉子户终态跳过的。
         print(f'本轮处理 {len(queue)} 本（跳过已完成 {len(skipped_done) + len(skipped_pinned)} 本'
               f'（含钉子户 {len(skipped_pinned)} 本））')
