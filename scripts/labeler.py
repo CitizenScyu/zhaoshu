@@ -2844,8 +2844,16 @@ class EngineStopUrls:
         else:
             fd, path = tempfile.mkstemp(prefix='labeler-stop-urls-', suffix='.txt', dir=self._directory)
             os.close(fd)
-        with open(path, 'w', encoding='utf-8') as f:
-            f.write(''.join(u + '\n' for u in urls))
+        # 旧 entry 已摘出 _hosts，写失败时 atexit 遍历不到它 → 当场删文件再上抛，不留孤儿（rvstophost42 M1）。
+        try:
+            with open(path, 'w', encoding='utf-8') as f:
+                f.write(''.join(u + '\n' for u in urls))
+        except BaseException:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+            raise
         self._hosts[host] = (path, frozenset(urls))
         self._last_host = host
         while len(self._hosts) > self.MAX_HOSTS:

@@ -476,6 +476,27 @@ class TestEngineStopUrlsPerHost(unittest.TestCase):
         self.assertIn('--stop-urls-file', contents[0])
         self.assertEqual(contents[1:], [('--url', self.A[0]), ('--url', self.B[0])])
 
+    def test_write_failure_leaves_no_orphan_file(self):
+        # rvstophost42 M1：写停止点文件失败时，旧 entry 已摘出 _hosts，文件必须当场删掉并照样上抛
+        a2 = ['https://m.cuoceng.com/c/0.html']
+        self.tocs = {'https://m.cuoceng.com/b.html': self.A, 'https://m.cuoceng.com/c.html': a2,
+                     'https://www.biquge.example/9/': self.B}
+        inner, cli = self._wrap()
+        cli.run('toc', '--url', 'https://m.cuoceng.com/b.html')
+        old_file = cli.path
+        with mock.patch('labeler.open', side_effect=OSError('disk full'), create=True):
+            with self.assertRaises(OSError):
+                cli.run('toc', '--url', 'https://m.cuoceng.com/c.html')     # 已有 host 覆盖写失败
+            with self.assertRaises(OSError):
+                cli.run('toc', '--url', 'https://www.biquge.example/9/')    # 新 host 首次写失败
+        self.assertFalse(os.path.exists(old_file))
+        self.assertNotIn('m.cuoceng.com', cli._hosts)
+        self.assertNotIn('www.biquge.example', cli._hosts)
+        self.assertEqual(os.listdir(self.tmp.name), [])
+        self.assertIsNone(cli.path)
+        cli.run('content', '--url', self.A[0])
+        self.assertIsNone(self._stop_file(inner))
+
     def test_url_not_in_any_list_has_no_stop(self):
         self.tocs = {'https://m.cuoceng.com/b.html': self.A}
         inner, cli = self._wrap()
