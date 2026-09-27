@@ -167,6 +167,115 @@ export const ADMISSION_OK_RECHECK_MS = 7 * 24 * 3_600_000;
  * 可疑行按 ADMISSION_RETEST_INTERVAL_MS(20h) 到期走 class 1 再确认，再失败才写真实结论出池。
  */
 export const ADMISSION_RECHECK_FAIL_PREFIX = 'recheck_fail:';
+
+// ---------------------------------------------------------------- 失败重测指数退避（admbackoff42，设计 T3）
+// 问题（任务书「推动哪个数字」）：09-27 起独立轮每轮名额 200，1–2 天清完 548 个从未测过的源；
+// 之后死站按固定窗（conn_fail 7d、http/query_insensitive 20h、no_result 72h）会永远每窗吃一个探测名额。
+// 目标：稳态每天失败重测 < 30 次，且规则变更或站点恢复后仍能回池（不搞永久黑名单）。
+// 机制：连续失败次数 n 越大，重测窗越长——window(n) = min(起步窗 × 2^(n-1), 上限)。
+//   - n=1 逐字等于旧固定窗（起步窗 = 旧窗）：第一次失败后的行为完全不变（任务书约束 3）；
+//   - 只有「重复失败」才拉长；成功一次 / rules_hash 变化即清零（任务书约束 1）。
+// 计数载体：沿用 challenge_strike:/recheck_fail: 那种 error 列前缀（不改 schema、不加列）——失败行 error
+//   写 `fail_count:<n>:<原 error>`。n=1 不写前缀（旧行/首败逐字不变），n≥2 才带前缀。连续失败按 search_ok=false
+//   计（跨 verdict 也算连续，任务书只以「成功/规则变」为清零点）；challenge 自带 strike 计数、走独立回路，
+//   不写 fail_count（但它作为一次失败仍计入下一个非 challenge 失败的 n，见 applyFailCountPrefix）。
+// 上限按 verdict 分（任务书约束 2）：conn_fail 死站信号最强 → 上限最长（56d）；http_4xx/5xx 多为
+//   临时服务端错误 → 上限较短（7d）；no_result/query_insensitive 多为规则缺口或站点不按查询搜索
+//   → 上限居中（28d）。challenge/shell 是站点行为终态、不退避（challenge 现有 strike 机制不改、shell 永久
+//   rejected）；url_invalid 等其余 deferred verdict 维持旧固定窗、不退避（见 backoffSpec / deferredRetestWindowMs）。
+
+/** 连续失败计数前缀（admbackoff42）：失败行 error 列最外层可选前缀 `fail_count:<n>:<原 error>`。
+ * 仅 n≥2 时出现（n=1 逐字不写，旧行/首败行为不变）。成功一次或 rules_hash 变化即不再带前缀
+ * （计数清零）。与 recheck_fail:/challenge_strike: 前缀在解析上可共存（parseFailCount 只剥最外层 fail_count:）。 */
+export const ADMISSION_FAIL_COUNT_PREFIX = 'fail_count:';
+/** conn_fail 退避上限：56 天（8 周）。conn_fail = 死站/被墙信号最强（admphx42 §2 实测 phoenix↔Vercel
+ * 100% 同死），起步窗即最长（= 旧 ADMISSION_CONN_FAIL_RETEST_MS = 7d），翻倍到 8 周封顶：
+ * 7d→14d→28d→56d，第 4 次失败起稳定 56d 一测。 */
+export const ADMISSION_CONN_FAIL_MAX_MS = 56 * 24 * 3_600_000;
+/** http_4xx/5xx 退避上限：7 天。起步窗 = 旧 deferred 窗 20h（ADMISSION_RETEST_INTERVAL_MS）；服务端错误
+ * 多为临时，封顶最短留最多恢复余地：20h→40h→80h→160h→7d 截断。 */
+export const ADMISSION_HTTP_ERR_MAX_MS = 7 * 24 * 3_600_000;
+/** no_result 退避上限：28 天（4 周）。起步窗 = 旧 no_result 窗 72h（ADMISSION_NO_RESULT_RETEST_MS，非 20h）；
+ * 多为规则缺口/站点无此书，比 http 错误更"稳定坏"故封顶更长，但保留回池路（站点补书/改规则后 hash 变即清零）。 */
+export const ADMISSION_NO_RESULT_MAX_MS = 28 * 24 * 3_600_000;
+/** query_insensitive 退避上限：28 天（4 周）。起步窗 = 旧 deferred 窗 20h（ADMISSION_RETEST_INTERVAL_MS）；
+ * 站点不按查询搜索是稳定的结构性问题，封顶同 no_result（4 周），站点改成真搜索后 hash 变即清零回池。 */
+export const ADMISSION_QUERY_INSENSITIVE_MAX_MS = 28 * 24 * 3_600_000;
+
+/**
+ * 各 verdict 的退避参数：起步窗（= 旧固定窗，n=1 逐字相等）+ 上限。返回 undefined 的 verdict
+ * 不退避、维持旧固定窗（url_invalid 等 deferred verdict 走 deferredRetestWindowMs；challenge 走自身
+ * strike 机制；shell 永久 rejected 不重测）。集中声明便于核对与单测。
+ * 注意起步窗必须逐字等于各 verdict 的旧固定窗：conn_fail=ADMISSION_CONN_FAIL_RETEST_MS(7d)、
+ * http_4xx/5xx 与 query_insensitive=ADMISSION_RETEST_INTERVAL_MS(20h)、no_result=ADMISSION_NO_RESULT_RETEST_MS(72h)。
+ */
+function backoffSpec(verdict: string): { startMs: number; maxMs: number } | undefined {
+  switch (verdict) {
+    case 'conn_fail':
+      return { startMs: ADMISSION_CONN_FAIL_RETEST_MS, maxMs: ADMISSION_CONN_FAIL_MAX_MS };
+    case 'http_4xx':
+    case 'http_5xx':
+      return { startMs: ADMISSION_RETEST_INTERVAL_MS, maxMs: ADMISSION_HTTP_ERR_MAX_MS };
+    case 'no_result':
+      return { startMs: ADMISSION_NO_RESULT_RETEST_MS, maxMs: ADMISSION_NO_RESULT_MAX_MS };
+    case 'query_insensitive':
+      return { startMs: ADMISSION_RETEST_INTERVAL_MS, maxMs: ADMISSION_QUERY_INSENSITIVE_MAX_MS };
+    default:
+      return undefined;
+  }
+}
+
+/**
+ * 退避窗：min(起步窗 × 2^(n-1), 上限)。n≥1；n=1 即起步窗（= 旧固定窗）。不退避的 verdict
+ * 返回 undefined，由调用方回退旧固定窗。指数先把 n-1 夹到 [0,40] 防 2^n 溢出（2^40 起步窗已
+ * 远超任何上限，截断后与直接取上限等值）。
+ */
+function backoffWindowMs(verdict: string, n: number): number | undefined {
+  const spec = backoffSpec(verdict);
+  if (!spec) return undefined;
+  const exp = Math.max(0, Math.min(n - 1, 40));
+  return Math.min(spec.startMs * 2 ** exp, spec.maxMs);
+}
+
+/**
+ * 从 error 列剥出连续失败计数（admbackoff42）：命中最外层 `fail_count:<n>:` 前缀即返回 n 与
+ * 去前缀后的 rest；无前缀（旧数据 / n=1 / recheck_fail:/challenge_strike: 行）返回 count=1、rest 原样——
+ * 任务书约束 5「旧行无前缀按 n=1」。只剥最外层：写库时 fail_count: 始终在最外层，故与
+ * recheck_fail: 共存时形如 `fail_count:2:recheck_fail:conn_fail`，剥后 rest=`recheck_fail:conn_fail`
+ * 仍可被 ok 复核逻辑识别；单独 `recheck_fail:...`/`challenge_strike:...` 无 fail_count 前缀则原样返回（count=1）。
+ */
+export function parseFailCount(error: string): { count: number; rest: string } {
+  if (error.startsWith(ADMISSION_FAIL_COUNT_PREFIX)) {
+    const after = error.slice(ADMISSION_FAIL_COUNT_PREFIX.length);
+    const sep = after.indexOf(':');
+    if (sep >= 0) {
+      const parsed = Number.parseInt(after.slice(0, sep), 10);
+      if (Number.isSafeInteger(parsed) && parsed > 0) return { count: parsed, rest: after.slice(sep + 1) };
+    }
+  }
+  return { count: 1, rest: error };
+}
+
+/**
+ * 失败行加连续失败计数前缀（admbackoff42，纯函数）。仅对退避表内 verdict 的真失败行（search_ok=false）
+ * 生效——非退避 verdict（url_invalid/challenge/shell）、成功、占位、strike-保留的 ok 都原样返回（不加前缀、
+ * 计数清零语义）。n = 前一行也是失败（search_ok=false）且 rules_hash 未变时 = 前一行计数 +1，否则 =1
+ * （新失败 / 成功后首败 / 规则变化后首败都从 1 起）。n=1 逐字不加前缀（约束 3：首败行为不变）。
+ */
+export function applyFailCountPrefix(
+  outcome: { search_ok: boolean; search_verdict: string; error: string },
+  previous: AdmissionSourceRow | undefined,
+  currentHash: string,
+): { search_ok: boolean; search_verdict: string; error: string } {
+  if (outcome.search_ok !== false) return outcome; // 只给真失败行计数
+  if (!backoffSpec(outcome.search_verdict)) return outcome; // 非退避 verdict：维持现状
+  const prevIsFailureSameSeq =
+    previous !== undefined && previous.search_ok === false && previous.rules_hash === currentHash;
+  if (!prevIsFailureSameSeq) return outcome; // 首败 n=1：error 逐字不变（约束 3）
+  const n = parseFailCount(previous.error).count + 1;
+  return { ...outcome, error: `${ADMISSION_FAIL_COUNT_PREFIX}${n}:${outcome.error}` };
+}
+
 /** 剩余预算低于此值即整批跳过，绝不挤占刷新预算（设计风险台账 #4）。 */
 export const ADMISSION_MIN_BUDGET_MS = 10_000;
 
@@ -894,14 +1003,22 @@ function isRetestDue(row: AdmissionSourceRow, nowMs: number, urlStillInvalid: ()
     if (row.search_verdict === 'url_invalid' && urlStillInvalid()) return false;
     if (!row.search_checked_at) return true;
     const checked = Date.parse(row.search_checked_at);
-    return !Number.isFinite(checked) || nowMs - checked >= deferredRetestWindowMs(row.search_verdict);
+    // admbackoff42：http_4xx/5xx/no_result/query_insensitive 按连续失败次数指数退避（起步窗 = 旧
+    // deferredRetestWindowMs 结果，n=1 逐字相等）；url_invalid 等不在退避表 ⇒ backoffWindowMs 返回
+    // undefined，回退旧固定窗，行为不变。
+    const window = backoffWindowMs(row.search_verdict, parseFailCount(row.error).count)
+      ?? deferredRetestWindowMs(row.search_verdict);
+    return !Number.isFinite(checked) || nowMs - checked >= window;
   }
   // 41-B1-RETRY：conn_fail 的 rejected 终态带时间衰减——超 7 天回到待复探（见常量注释）。
   // 复探仍可能再判 conn_fail（checked_at 刷新、再等 7 天），但站点恢复后能自动回池。
+  // admbackoff42：连续失败越多窗越长（起步 7d，n=1 逐字相等；上限 56d），压制死站重测名额占用。
   if (row.search_verdict === 'conn_fail') {
     if (!row.search_checked_at) return true;
     const checked = Date.parse(row.search_checked_at);
-    return !Number.isFinite(checked) || nowMs - checked >= ADMISSION_CONN_FAIL_RETEST_MS;
+    const window = backoffWindowMs('conn_fail', parseFailCount(row.error).count)
+      ?? ADMISSION_CONN_FAIL_RETEST_MS;
+    return !Number.isFinite(checked) || nowMs - checked >= window;
   }
   // 41-srcfix 改法1：challenge 有限复测——strike 未满按 72h 窗到期，满了回终态（见常量注释）。
   if (row.search_verdict === 'challenge') {
@@ -1168,6 +1285,9 @@ export async function runAdmissionBatch(input: AdmissionBatchInput): Promise<Adm
         if (outcome.search_verdict === 'challenge') {
           outcome.error = challengeError(item.previous, item.hash, outcome.error);
         }
+        // admbackoff42：退避表内 verdict 的连续失败行加 fail_count:<n>: 前缀（n≥2 才写，首败逐字不变）。
+        // challenge 已在上面写了自己的 strike 前缀、且不在退避表，applyFailCountPrefix 会原样返回。
+        Object.assign(outcome, applyFailCountPrefix(outcome, item.previous, item.hash));
         results[item.index] = {
           source_url: item.candidate.url, tier: 'M1', compile_ok: true, core_field_mask: item.compile.coreFieldMask,
           ...outcome,
