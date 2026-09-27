@@ -249,8 +249,14 @@ export function parseFailCount(error: string): { count: number; rest: string } {
     const after = error.slice(ADMISSION_FAIL_COUNT_PREFIX.length);
     const sep = after.indexOf(':');
     if (sep >= 0) {
-      const parsed = Number.parseInt(after.slice(0, sep), 10);
-      if (Number.isSafeInteger(parsed) && parsed > 0) return { count: parsed, rest: after.slice(sep + 1) };
+      const digits = after.slice(0, sep);
+      // 只认纯十进制数字串（admbackoff42 S2）：Number.parseInt 会接受 `2e3`（吞成 2）、`+3`、`3abc`、
+      // 前导空白等形态，与「无计数」处理不一致；真实写路径只产纯整数，这些形态仅人工 SQL 可造。
+      // 收紧为 /^\d+$/ 全段匹配，不匹配即按无前缀处理（count=1、rest 原样，与缺前缀一致）。
+      if (/^\d+$/.test(digits)) {
+        const parsed = Number.parseInt(digits, 10);
+        if (Number.isSafeInteger(parsed) && parsed > 0) return { count: parsed, rest: after.slice(sep + 1) };
+      }
     }
   }
   return { count: 1, rest: error };
@@ -261,6 +267,13 @@ export function parseFailCount(error: string): { count: number; rest: string } {
  * 生效——非退避 verdict（url_invalid/challenge/shell）、成功、占位、strike-保留的 ok 都原样返回（不加前缀、
  * 计数清零语义）。n = 前一行也是失败（search_ok=false）且 rules_hash 未变时 = 前一行计数 +1，否则 =1
  * （新失败 / 成功后首败 / 规则变化后首败都从 1 起）。n=1 逐字不加前缀（约束 3：首败行为不变）。
+ *
+ * challenge 那一击不计入 n（admbackoff42 S1，与代码实际行为一致）：challenge 行 error 是
+ * `challenge_strike:<k>:...`，parseFailCount 不识别该前缀 ⇒ 恒返回 count=1。故上一轮为 challenge、
+ * 本轮转退避 verdict 时 n = 1 + 1 = 2，与 challenge 已累计的 strike 数 k 无关，也不并入 challenge
+ * 之前的 fail_count（challenge 行覆写了 error，之前的 fail_count 前缀已不在链上）。即：challenge
+ * 只作「1 次前置失败」的基数参与下一击，其 strike 计数与更早的 fail_count 都不叠加进 n。低估一档
+ * ⇒ 退避窗偏短、多测一次，不会压死源，方向安全（见 rvadmbackoff-42-report §66/§138）。
  */
 export function applyFailCountPrefix(
   outcome: { search_ok: boolean; search_verdict: string; error: string },
