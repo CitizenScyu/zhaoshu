@@ -6,6 +6,10 @@ import {
   ADMISSION_CONN_FAIL_RETEST_MS, ADMISSION_OK_RECHECK_MS, ADMISSION_RECHECK_FAIL_PREFIX,
   ADMISSION_RETEST_INTERVAL_MS, ADMISSION_TIMEOUT_MS, DEFAULT_ADMISSION_MAX_PROBES,
   DEFAULT_ADMISSION_PROBE_CONCURRENCY, MAX_ADMISSION_PROBE_CONCURRENCY,
+  ADMISSION_FAIL_COUNT_PREFIX, ADMISSION_NO_RESULT_RETEST_MS,
+  ADMISSION_CONN_FAIL_MAX_MS, ADMISSION_HTTP_ERR_MAX_MS,
+  ADMISSION_NO_RESULT_MAX_MS, ADMISSION_QUERY_INSENSITIVE_MAX_MS,
+  parseFailCount, applyFailCountPrefix,
   admissionBucket, admissionMaxProbes, admissionProbeConcurrency, compileAdmission,
   recheckOutcome, runAdmissionBatch, searchAdmission, rulesHash, type AdmissionSourceRow, type AdmissionTransport,
 } from './admission';
@@ -2108,3 +2112,158 @@ describe('espfix41:查询不敏感判据(对照搜索)', () => {
     expect(after.verdicts).toEqual({ query_insensitive: 1 });
   });
 });
+
+// admbackoff42 T3：失败重测按连续失败次数指数退避。设计依据 admbackoff-42-task.md 约束 1–6、
+// admphx-42-report §3.4/§4-T3（其 §3.4 窗口数与现码差异见报告 §1，以现码为准）。
+describe('admbackoff42：连续失败计数前缀 parseFailCount / applyFailCountPrefix（纯函数）', () => {
+  it('无前缀（旧数据/首败）按 n=1，rest 原样（约束 5）', () => {
+    expect(parseFailCount('')).toEqual({ count: 1, rest: '' });
+    expect(parseFailCount('connect ETIMEDOUT')).toEqual({ count: 1, rest: 'connect ETIMEDOUT' });
+  });
+
+  it('fail_count:<n>: 前缀剥出 n 与 rest', () => {
+    expect(parseFailCount(`${ADMISSION_FAIL_COUNT_PREFIX}2:connect ETIMEDOUT`)).toEqual({ count: 2, rest: 'connect ETIMEDOUT' });
+    expect(parseFailCount(`${ADMISSION_FAIL_COUNT_PREFIX}37:500`)).toEqual({ count: 37, rest: '500' });
+  });
+
+  it('与 challenge_strike:/recheck_fail: 前缀共存：无 fail_count 时 count=1 原样，有则只剥最外层（约束 5 并存）', () => {
+    // 其它前缀不被误判为 fail_count
+    expect(parseFailCount(`${ADMISSION_CHALLENGE_STRIKE_PREFIX}2:403`))
+      .toEqual({ count: 1, rest: `${ADMISSION_CHALLENGE_STRIKE_PREFIX}2:403` });
+    expect(parseFailCount(`${ADMISSION_RECHECK_FAIL_PREFIX}conn_fail`))
+      .toEqual({ count: 1, rest: `${ADMISSION_RECHECK_FAIL_PREFIX}conn_fail` });
+    // 两前缀同时出现：fail_count 在最外层，剥后 rest 仍是可识别的 recheck_fail: 串
+    expect(parseFailCount(`${ADMISSION_FAIL_COUNT_PREFIX}3:${ADMISSION_RECHECK_FAIL_PREFIX}conn_fail`))
+      .toEqual({ count: 3, rest: `${ADMISSION_RECHECK_FAIL_PREFIX}conn_fail` });
+  });
+
+  it('非法计数（0/负/非数字）按 n=1 原样（不制造「永远到期/永不到期」）', () => {
+    expect(parseFailCount(`${ADMISSION_FAIL_COUNT_PREFIX}0:x`)).toEqual({ count: 1, rest: `${ADMISSION_FAIL_COUNT_PREFIX}0:x` });
+    expect(parseFailCount(`${ADMISSION_FAIL_COUNT_PREFIX}-2:x`)).toEqual({ count: 1, rest: `${ADMISSION_FAIL_COUNT_PREFIX}-2:x` });
+    expect(parseFailCount(`${ADMISSION_FAIL_COUNT_PREFIX}abc:x`)).toEqual({ count: 1, rest: `${ADMISSION_FAIL_COUNT_PREFIX}abc:x` });
+  });
+
+  const HASH = 'h1';
+  const prevFail = (verdict: string, error: string, rules_hash = HASH): AdmissionSourceRow =>
+    sourceRow('https://x.example.com/', { search_ok: false, search_verdict: verdict, error, rules_hash });
+  const outcomeOf = (verdict: string, error = 'boom') => ({ search_ok: false, search_verdict: verdict, error });
+
+  it('首败逐字不加前缀（约束 3）：无前一行、前一行成功都算 n=1', () => {
+    expect(applyFailCountPrefix(outcomeOf('conn_fail'), undefined, HASH)).toEqual(outcomeOf('conn_fail'));
+    const okPrev = sourceRow('https://x.example.com/', { search_ok: true, search_verdict: 'ok', rules_hash: HASH });
+    expect(applyFailCountPrefix(outcomeOf('conn_fail'), okPrev, HASH)).toEqual(outcomeOf('conn_fail'));
+  });
+
+  it('连续失败同 hash：n = 前一行计数 +1（约束 1）', () => {
+    expect(applyFailCountPrefix(outcomeOf('conn_fail'), prevFail('conn_fail', ''), HASH).error)
+      .toBe(`${ADMISSION_FAIL_COUNT_PREFIX}2:boom`);
+    expect(applyFailCountPrefix(outcomeOf('http_5xx'), prevFail('http_5xx', `${ADMISSION_FAIL_COUNT_PREFIX}4:500`), HASH).error)
+      .toBe(`${ADMISSION_FAIL_COUNT_PREFIX}5:boom`);
+  });
+
+  it('rules_hash 变化清零（约束 1）：前一行是失败也回 n=1', () => {
+    expect(applyFailCountPrefix(outcomeOf('conn_fail'), prevFail('conn_fail', `${ADMISSION_FAIL_COUNT_PREFIX}9:x`, 'OLD'), HASH))
+      .toEqual(outcomeOf('conn_fail'));
+  });
+
+  it('跨 verdict 也算连续失败：前一 challenge（search_ok=false）计一次 ⇒ conn_fail 起 n=2', () => {
+    expect(applyFailCountPrefix(outcomeOf('conn_fail'), prevFail('challenge', `${ADMISSION_CHALLENGE_STRIKE_PREFIX}2:403`), HASH).error)
+      .toBe(`${ADMISSION_FAIL_COUNT_PREFIX}2:boom`);
+  });
+
+  it('非退避 verdict / 成功行不加前缀（challenge 走自身 strike、url_invalid 不退避、strike-ok 是成功）', () => {
+    expect(applyFailCountPrefix(outcomeOf('url_invalid'), prevFail('url_invalid', `${ADMISSION_FAIL_COUNT_PREFIX}3:x`), HASH))
+      .toEqual(outcomeOf('url_invalid'));
+    const challengeOut = outcomeOf('challenge', `${ADMISSION_CHALLENGE_STRIKE_PREFIX}2:403`);
+    expect(applyFailCountPrefix(challengeOut, prevFail('challenge', ''), HASH)).toEqual(challengeOut);
+    const strikeOk = { search_ok: true, search_verdict: 'ok', error: `${ADMISSION_RECHECK_FAIL_PREFIX}conn_fail` };
+    expect(applyFailCountPrefix(strikeOk, prevFail('conn_fail', `${ADMISSION_FAIL_COUNT_PREFIX}2:x`), HASH)).toEqual(strikeOk);
+  });
+});
+
+describe('admbackoff42：isRetestDue 按连续失败次数指数退避（窗口边界，经 runAdmissionBatch）', () => {
+  const okBody = '<div class="i"><span class="t">书名</span><a href="/b/1">x</a></div>';
+  const HOUR = 3_600_000;
+  // 起步窗必须逐字等于各 verdict 的旧固定窗（约束 3）；上限按 verdict 分（约束 2）。
+  const specs = [
+    { verdict: 'conn_fail', start: ADMISSION_CONN_FAIL_RETEST_MS, cap: ADMISSION_CONN_FAIL_MAX_MS },
+    { verdict: 'http_4xx', start: ADMISSION_RETEST_INTERVAL_MS, cap: ADMISSION_HTTP_ERR_MAX_MS },
+    { verdict: 'http_5xx', start: ADMISSION_RETEST_INTERVAL_MS, cap: ADMISSION_HTTP_ERR_MAX_MS },
+    { verdict: 'no_result', start: ADMISSION_NO_RESULT_RETEST_MS, cap: ADMISSION_NO_RESULT_MAX_MS },
+    { verdict: 'query_insensitive', start: ADMISSION_RETEST_INTERVAL_MS, cap: ADMISSION_QUERY_INSENSITIVE_MAX_MS },
+  ];
+  const win = (start: number, cap: number, n: number) => Math.min(start * 2 ** Math.min(n - 1, 40), cap);
+
+  const runAge = (verdict: string, n: number, ageMs: number) => {
+    const url = `https://bo-${verdict.replace(/_/g, '')}-${n}.example.com`;
+    const host = new URL(url).hostname;
+    const source = syntheticSource(`${url}/`);
+    // n=1 无前缀（旧行/首败行为逐字不变）；n≥2 带 fail_count 前缀。
+    const error = n >= 2 ? `${ADMISSION_FAIL_COUNT_PREFIX}${n}:orig` : 'orig';
+    const existing = new Map([[url, sourceRow(url, {
+      tier: 'M1', compile_ok: true, rules_hash: rulesHash(source), search_ok: false,
+      search_verdict: verdict, error, search_checked_at: fixtureAgoIso(ageMs),
+    })]]);
+    return runAdmissionBatch({
+      candidates: [{ url, source }], declaredHosts: new Set([host]), existing,
+      fetchPage: vi.fn<AdmissionTransport>().mockResolvedValue(page(okBody)),
+      signal: signal(), throttleMs: 0, now: atFixtureNow,
+    });
+  };
+
+  for (const { verdict, start, cap } of specs) {
+    describe(verdict, () => {
+      // n=1/2/5/大 n（截断到上限）四档：窗内不占名额、窗外重探。n=1 的窗即旧固定窗 ⇒ 首败行为不变。
+      it.each([1, 2, 5, 100])('n=%i：窗内(win-1h)不重测、窗外(win+1h)重测', async (n) => {
+        const window = win(start, cap, n);
+        expect((await runAge(verdict, n, window - HOUR)).probed).toBe(0);
+        expect((await runAge(verdict, n, window + HOUR)).probed).toBe(1);
+      });
+      it('n=1 起步窗逐字等于旧固定窗；大 n 截断到上限', () => {
+        expect(win(start, cap, 1)).toBe(start);
+        expect(win(start, cap, 100)).toBe(cap);
+      });
+    });
+  }
+
+  it('端到端：conn_fail 行到期(>7d)再探仍失败 ⇒ 写库 error 带 fail_count:2:（写侧接线已生效）', async () => {
+    const url = 'https://bo-e2e.example.com';
+    const host = new URL(url).hostname;
+    const source = syntheticSource(`${url}/`);
+    const existing = new Map([[url, sourceRow(url, {
+      tier: 'M1', compile_ok: true, rules_hash: rulesHash(source), search_ok: false,
+      search_verdict: 'conn_fail', error: 'connect ETIMEDOUT',
+      search_checked_at: fixtureAgoIso(8 * 24 * HOUR),
+    })]]);
+    const result = await runAdmissionBatch({
+      candidates: [{ url, source }], declaredHosts: new Set([host]), existing,
+      fetchPage: vi.fn<AdmissionTransport>().mockRejectedValue(new TypeError('fetch failed')),
+      signal: signal(), throttleMs: 0, now: atFixtureNow,
+    });
+    expect(result.probed).toBe(1);
+    expect(result.rows[0].search_verdict).toBe('conn_fail');
+    expect(result.rows[0].error.startsWith(`${ADMISSION_FAIL_COUNT_PREFIX}2:`)).toBe(true);
+    expect(parseFailCount(result.rows[0].error)).toMatchObject({ count: 2 });
+  });
+
+  it('端到端：成功一次清零 ⇒ 下一轮从 n=1 起步窗（21h 未到 20h*2 窗不重测，但 20h+ 到期）', async () => {
+    // 一个带 fail_count:3: 的 http_5xx 行成功复探 ⇒ 写回 ok（error 清空、无 fail_count）。
+    const url = 'https://bo-reset.example.com';
+    const host = new URL(url).hostname;
+    const source = syntheticSource(`${url}/`);
+    const existing = new Map([[url, sourceRow(url, {
+      tier: 'M1', compile_ok: true, rules_hash: rulesHash(source), search_ok: false,
+      search_verdict: 'http_5xx', error: `${ADMISSION_FAIL_COUNT_PREFIX}3:500`,
+      search_checked_at: fixtureAgoIso(5 * 24 * HOUR), // 远超 n=3 窗（80h），必到期
+    })]]);
+    const result = await runAdmissionBatch({
+      candidates: [{ url, source }], declaredHosts: new Set([host]), existing,
+      fetchPage: vi.fn<AdmissionTransport>().mockResolvedValue(page(okBody)),
+      signal: signal(), throttleMs: 0, now: atFixtureNow,
+    });
+    expect(result.rows[0]).toMatchObject({ search_ok: true, search_verdict: 'ok' });
+    expect(result.rows[0].error).not.toContain(ADMISSION_FAIL_COUNT_PREFIX);
+  });
+});
+
+
