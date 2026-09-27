@@ -305,28 +305,30 @@ class TestFetchSegmented(_NoSleep):
         self.assertEqual(sorted(labeler.segment_bodies(out)), [1, 2, 3, 4])
         self.assertEqual(pre['chapters_after'], 21 + 1)   # 21 章 + 开头标注行所在的前导块
 
-    def test_late_4xx_switches_source_for_that_segment(self):
-        """主源第 60 章起 4xx（付费墙）：第 3 段请求 3 章即判不可用，换备选补段；第 4 段直接用备选。
-        备选 b 与主源 a 是同一本书（同章号正文一致）→ 过 same_book 双信号，可补段（rvlblseg R2-6）。"""
+    def test_late_4xx_switches_source_near_boundary(self):
+        """主源在第 3 段窗口起点(ch71)起 4xx：第 3 段窗口内计划源全不可读，但紧邻窗口起点前 ch70 可读 →
+        向前探到近邻参照(nearest_prior)、与备选 b 同章号判同 → b 补第 3 段（已声明的接受残余：分歧点落在
+        计划源最后可读章 ch70 与窗口起点 ch71 之间）。第 4 段分歧点距其窗口起点 >4 章 → 探不到参照 → 拒补、
+        标未取到（改结构后的覆盖代价：计划源死得离窗口太远的段宁缺不混入）。b 与 a 同书（同章号正文一致）。"""
         cli = make_cli({
-            'a.example.com': {'n': 100, 'body': lambda i: None if i >= 60 else _book_body(i)},
+            'a.example.com': {'n': 100, 'body': lambda i: None if i >= 70 else _book_body(i)},
             'b.example.com': {'n': 100},
         })
         text, chars, used, sampling, _ = _fetch(cli, _book(alternates=['b.example.com']))
         segs = {s['no']: s for s in sampling['segments']}
-        self.assertEqual(segs[1]['source'], 'a.example.com')
-        self.assertEqual(segs[2]['source'], 'a.example.com')
-        self.assertEqual((segs[3]['source'], segs[3]['switched']), ('b.example.com', True))
-        self.assertEqual((segs[4]['source'], segs[4]['switched']), ('b.example.com', True))
-        self.assertEqual(segs[3]['tried'], ['a.example.com:preview', 'b.example.com:ok'])
-        self.assertEqual(segs[4]['tried'], ['b.example.com:ok'])        # 上一段成功的源排最前
-        a_late = [c for c in _content_calls(cli, 'a.example.com') if _idx(c[1]) >= 60]
-        self.assertEqual(len(a_late), labeler.SEG_PROBE_CHAPTERS)
+        self.assertEqual((segs[1]['source'], segs[2]['source']), ('a.example.com', 'a.example.com'))
+        self.assertEqual((segs[3]['source'], segs[3]['switched'], segs[3].get('ref')),
+                         ('b.example.com', True, 'nearest_prior'))
+        self.assertTrue(segs[3].get('ref_nums'))                # 记录了近邻参照章号
+        self.assertTrue(segs[4].get('missing'))                 # 分歧点距第 4 段窗口 >4 章 → 宁缺
         self.assertEqual(sum(1 for c in cli.calls if c[0] == 'toc'), 2)  # 每源目录只取一次
-        self.assertEqual(used['url'], 'https://a.example.com/book')    # 主源供给最多（1、2 段）
+        self.assertEqual(used['url'], 'https://a.example.com/book')    # 记录源恒为计划源
+        self.assertNotIn('【第 3 段：未取到】', text)
 
     def test_preview_pages_abort_fast(self):
-        """阳神型：中后段章章返回 ~120 字预览 → 每段只花 3 个请求就换源（不再空转）。"""
+        """阳神型：第 2 段起章章返回 ~120 字预览 → 每段只花 SEG_PROBE_CHAPTERS 个请求就判不可用。
+        第 2 段窗口起点前 ch40 仍可读 → 向前探近邻参照补第 2 段(nearest_prior)；第 3/4 段分歧点距窗口
+        >4 章 → 探不到参照、标未取到（覆盖代价）。"""
         cli = make_cli({
             'a.example.com': {'n': 100, 'body': lambda i: (f'预览{i}' + '字' * 110 + '……')
                               if i >= 40 else _book_body(i)},
@@ -334,23 +336,26 @@ class TestFetchSegmented(_NoSleep):
         })
         text, chars, used, sampling, _ = _fetch(cli, _book(alternates=['b.example.com']))
         segs = {s['no']: s for s in sampling['segments']}
-        self.assertEqual([segs[n]['source'] for n in (2, 3, 4)], ['b.example.com'] * 3)
-        a_mid = [c for c in _content_calls(cli, 'a.example.com') if _idx(c[1]) >= 40]
-        self.assertEqual(len(a_mid), labeler.SEG_PROBE_CHAPTERS)        # 只在第 2 段试过一次
+        self.assertEqual((segs[2]['source'], segs[2].get('ref')), ('b.example.com', 'nearest_prior'))
+        self.assertTrue(segs[3].get('missing') and segs[4].get('missing'))
+        a_mid = [c for c in _content_calls(cli, 'a.example.com') if 40 <= _idx(c[1]) < 60]
+        self.assertEqual(len(a_mid), labeler.SEG_PROBE_CHAPTERS)        # 第 2 段只探一次预览
 
     def test_record_source_stays_plan_source(self):
-        """主源只供开头一小段、其余全由备选供给（圣墟实测形态）→ 返回的源仍是计划源（主源），
-        记录 url 不被补段源改写（rvlblseg 必修 2）；各段真实来源只记在 sampling。
-        备选 b 与 a 同书（同章号正文一致）→ 过 same_book 双信号补段。"""
+        """主源只供开头两段、第 3 段起 4xx（分歧点落在第 2/3 段窗口之间）→ 第 3 段由备选 b 近邻参照补，
+        第 4 段分歧点距窗口 >4 章标未取到；返回的源仍是计划源（主源），记录 url 不被补段源改写
+        （rvlblseg 必修 2），各段真实来源只记在 sampling。b 与 a 同书（同章号正文一致）。"""
         cli = make_cli({
-            'a.example.com': {'n': 100, 'body': lambda i: None if i >= 10 else _book_body(i)},
+            'a.example.com': {'n': 100, 'body': lambda i: None if i >= 70 else _book_body(i)},
             'b.example.com': {'n': 100, 'author': '唐家三少著'},
         })
         text, chars, used, sampling, stats = _fetch(cli, _book(alternates=['b.example.com']))
         self.assertEqual(used['url'], 'https://a.example.com/book')
-        self.assertEqual([s['switched'] for s in sampling['segments']], [False, True, True, True])
-        self.assertEqual([s['url'] for s in sampling['segments']],
-                         ['https://a.example.com/book'] + ['https://b.example.com/book'] * 3)
+        self.assertEqual([s.get('switched') for s in sampling['segments']],
+                         [False, False, True, None])
+        self.assertEqual([s.get('url') for s in sampling['segments']],
+                         ['https://a.example.com/book', 'https://a.example.com/book',
+                          'https://b.example.com/book', None])
         self.assertEqual(stats['toc_author'], AUTHOR)       # 回写用计划源的目录作者
 
     def test_mid_segment_4xx_stops_after_streak(self):
@@ -362,16 +367,17 @@ class TestFetchSegmented(_NoSleep):
             'b.example.com': {'n': 100},
         })
         text, chars, used, sampling, _ = _fetch(cli, _book(alternates=['b.example.com']))
-        a_seg2 = [c for c in _content_calls(cli, 'a.example.com') if 40 <= _idx(c[1]) < 70]
+        a_seg2 = [c for c in _content_calls(cli, 'a.example.com') if 40 <= _idx(c[1]) < 50]
         self.assertEqual(len(a_seg2), 6)
         seg2 = sampling['segments'][1]
         self.assertEqual((seg2['source'], seg2['chapters'], seg2['switched']),
                          ('a.example.com', '41-43', False))
 
     def test_app_free_titles_skipped_without_requests(self):
-        """目录标题带 APP免费 的试读章不发请求；整段都是 → 该段 no_request → 换源。
-        第 2 段窗口（章 41–70）整段是试读章：标题挂「番外…APP免费」（含辅助子串 → 不计入目录信号，
-        计划源 a 目录仍与备选 b 大量重合 → 过 same_book 目录信号补段，rvlblseg R2-6）。"""
+        """目录标题带 APP免费 的试读章不发请求；整段都是 → 该段 no_request。
+        第 2 段窗口（章 41–70）整段是试读章：标题挂「番外…APP免费」（辅助子串）→ 计划源该窗口内**同章号章名
+        全为辅助/不可判**，段位置标题核对分母为 0 → 不可判一律拒（必修 3），该段宁缺（覆盖代价：整段标题
+        不可信的段不补）。第 3/4 段计划源章名正常 → 主源 a 照常供给。"""
         cli = make_cli({
             'a.example.com': {'n': 100, 'titles': lambda i: (
                 f'第{i + 1}章 番外{i}APP免费' if 40 <= i < 70 else _chapter_title(i))},
@@ -380,7 +386,9 @@ class TestFetchSegmented(_NoSleep):
         text, chars, used, sampling, stats = _fetch(cli, _book(alternates=['b.example.com']))
         self.assertFalse([c for c in _content_calls(cli, 'a.example.com') if 40 <= _idx(c[1]) < 70])
         segs = {s['no']: s for s in sampling['segments']}
-        self.assertEqual(segs[2]['tried'], ['a.example.com:no_request', 'b.example.com:ok'])
+        self.assertEqual(segs[2]['tried'], ['a.example.com:no_request', 'b.example.com:title_pos'])
+        self.assertTrue(segs[2].get('missing'))
+        self.assertEqual((segs[3]['source'], segs[4]['source']), ('a.example.com', 'a.example.com'))
 
     def test_all_sources_fail_marks_segment_missing(self):
         cli = make_cli({
@@ -414,19 +422,22 @@ class TestFetchSegmented(_NoSleep):
         self.assertEqual(_content_calls(cli), [])
 
     def test_alternate_identity_mismatch_is_skipped(self):
-        """备选源身份不符只跳过，改用下一个（新源必须过 same_book 双信号）：b 目录身份过关（同书名）但正文
-        是同名下的另一本书 → 正文信号判否、只花身份核验的抓章、不补段；c 与 a 同书 → 用 c 补段（R2-6）。"""
+        """备选源身份不符只跳过，改用下一个（新源必须过 same_book 双信号）：主源 a 在第 3 段窗口起点(ch71)
+        起 4xx，向前探到 ch70 近邻参照；b 目录身份过关（同书名）但正文是同名下的另一本书 → 近邻参照正文信号
+        判否、只花身份核验的抓章、不补段；c 与 a 同书 → 用 c 补第 3 段（nearest_prior）。第 4 段分歧点距
+        窗口 >4 章 → 探不到参照、标未取到（覆盖代价）。"""
         cli = make_cli({
-            'a.example.com': {'n': 100, 'body': lambda i: None if i >= 60 else _book_body(i)},
+            'a.example.com': {'n': 100, 'body': lambda i: None if i >= 70 else _book_body(i)},
             'b.example.com': {'n': 100, 'body': _other_body},
             'c.example.com': {'n': 100},
         })
         text, chars, used, sampling, _ = _fetch(
             cli, _book(alternates=['b.example.com', 'c.example.com']))
         segs = {s['no']: s for s in sampling['segments']}
-        self.assertEqual((segs[3]['source'], segs[4]['source']), ('c.example.com', 'c.example.com'))
+        self.assertEqual((segs[3]['source'], segs[3].get('ref')), ('c.example.com', 'nearest_prior'))
+        self.assertTrue(segs[4].get('missing'))
         self.assertIn('b.example.com:identity_body', segs[3]['tried'])
-        # b 只被抓了身份核验的 ≤SEG_FILL_MAX_CHAPTERS 章，从未拿它补任何段
+        # b 只被抓了近邻参照核验的 ≤SEG_FILL_MAX_CHAPTERS 章，从未拿它补任何段
         self.assertEqual(len(_content_calls(cli, 'b.example.com')), labeler.SEG_FILL_MAX_CHAPTERS)
 
     def test_primary_toc_fail_plans_on_alternate(self):
@@ -491,17 +502,31 @@ def _generic_then(uniq):
 
 
 class TestFillSourceIdentity(unittest.TestCase):
-    """补段源身份核验（rvlblseg R3 收口）：书名折叠 + 目录信号 + 段位置标题 + 正文**双参照**（书首组 + 近窗组）
-    与门。每组候选抓同章号正文走 same_book 正文信号，各须可判且判同（各 ≥2 互异章对），任一组不过即拒。"""
+    """补段源身份核验（rvlblseg R4 收口，改结构）：书名折叠 + 目录信号（零请求先判）+ 正文判同**落在
+    目标窗口内、或紧邻窗口起点之前**（_plan_window_reference：窗口内有计划源可读章 → window；窗口内不可读
+    但向前 ≤4 章能探到可读章 → nearest_prior；分歧区在窗口前即断裂、探不到 → reject）。段位置标题核对
+    _seg_title_mismatch 在 fetch_segment 之后按实际送模章做，分母 0 → None → 一律拒（必修 3）。"""
 
     WIN = {'no': 2, 'start': 40}           # 第 2 段（约 40% 处），窗口起点 = 目录第 41 章
 
-    def _fill(self, cli, cand, plan=None, plan_ref_hits=None, win=None, caches=None):
-        return labeler.fill_source_identity(
-            cli, plan or _plan_entry(),
-            plan_ref_hits if plan_ref_hits is not None else _ref_hits(),
-            cand, win or self.WIN,
-            deadline=float('inf'), caches=caches if caches is not None else {})
+    def _fill(self, cli, cand, plan=None, win=None, caches=None,
+              plan_window_hits=None, plan_ch_cache=None):
+        reason, _ref, _nums = labeler.fill_source_identity(
+            cli, plan or _plan_entry(), cand, win or self.WIN,
+            deadline=float('inf'), caches=caches if caches is not None else {},
+            plan_window_hits=plan_window_hits,
+            plan_ch_cache=plan_ch_cache if plan_ch_cache is not None else {})
+        return reason
+
+    def _fill_ref(self, cli, cand, **kw):
+        """返回 (reason, ref_mode) 供参照模式断言。"""
+        plan = kw.get('plan') or _plan_entry()
+        reason, ref, _nums = labeler.fill_source_identity(
+            cli, plan, cand, kw.get('win') or self.WIN, deadline=float('inf'),
+            caches=kw.get('caches') if kw.get('caches') is not None else {},
+            plan_window_hits=kw.get('plan_window_hits'),
+            plan_ch_cache=kw.get('plan_ch_cache') if kw.get('plan_ch_cache') is not None else {})
+        return reason, ref
 
     def test_fold_title_traditional_and_decor(self):
         """书名比较做繁简折叠 + 去站点装饰尾缀：斗罗大陆 == 斗羅大陸 == 斗罗大陆最新章节；续作仍不等。"""
@@ -511,16 +536,43 @@ class TestFillSourceIdentity(unittest.TestCase):
         self.assertEqual(f('斗罗大陆最新章节'), f('斗罗大陆'))
         self.assertNotEqual(f('斗罗大陆IV终极斗罗'), f('斗罗大陆'))
 
-    def test_same_book_passes(self):
-        """同一本书的另一个源（同章号正文一致）→ 书首组 + 近窗组双双判同。"""
-        cli = make_cli({'b.example.com': {'n': 100}})   # 默认 _book_body
-        self.assertEqual(self._fill(cli, _entry('b.example.com')), '')
+    def test_nearest_prior_same_book_passes(self):
+        """rvlblseg R4 必修 2（改结构）：目标窗口内计划源不可读，但紧邻窗口起点之前 ≤4 章可读 →
+        向前探到近邻参照（nearest_prior），与候选同章号正文判同 → 真同书放行（已声明的接受残余：
+        分歧点落在计划源最后可读章与窗口起点之间）。"""
+        cli = make_cli({'b.example.com': {'n': 100}})   # 默认 _book_body，同书
+        # 计划源窗口内(41+)全不可读，但 37–40 已读到（进 plan_ch_cache）→ 向前探命中缓存、不重抓
+        cache = {n: _book_body(n - 1) for n in (37, 38, 39, 40)}
+        reason, ref = self._fill_ref(cli, _entry('b.example.com'), plan_ch_cache=cache)
+        self.assertEqual(reason, '')
+        self.assertEqual(ref, 'nearest_prior')
+
+    def test_window_reference_same_book_fills(self):
+        """rvlblseg R4 必修 2：计划源在**目标段窗口内**有可读章（plan_window_hits）→ 用窗口内同章号章判同，
+        真同书候选放行（ref=window），不退回书首组。"""
+        cli = make_cli({'b.example.com': {'n': 100}})   # 同书正文
+        win_hits = _ref_hits(nums=[41, 42, 43, 44])     # 计划源第 2 段窗口内读到 41–44 章
+        reason, ref = self._fill_ref(cli, _entry('b.example.com'),
+                                     plan_window_hits=win_hits)
+        self.assertEqual(reason, '')
+        self.assertEqual(ref, 'window')
+
+    def test_window_reference_diverged_rejected(self):
+        """rvlblseg R4 必修 2：窗口内计划源可读章 vs 候选同章号正文换书 → window 判否，拒补段。"""
+        cli = make_cli({'b.example.com': {'n': 100, 'body': _other_body}})
+        win_hits = _ref_hits(nums=[41, 42, 43, 44])
+        reason, ref = self._fill_ref(cli, _entry('b.example.com'),
+                                     plan_window_hits=win_hits)
+        self.assertEqual(reason, 'body')
+        self.assertEqual(ref, 'window')
 
     def test_traditional_variant_same_book_fills(self):
-        """繁简书名真同书（斗羅大陸）：正文 n-gram 比较前繁转简 → 双参照判同（rvlblseg R3-1.4 误拒修复）。"""
+        """繁简书名真同书（斗羅大陸）：正文 n-gram 比较前繁转简 → 窗口内参照判同（rvlblseg R3-1.4 误拒修复）。"""
         cli = make_cli({'b.example.com': {'n': 100, 'title': '斗羅大陸'}})
+        win_hits = _ref_hits(nums=[41, 42, 43, 44])
         self.assertEqual(self._fill(cli, _entry('b.example.com', title='斗羅大陸'),
-                                    plan=_plan_entry(title='斗罗大陆')), '')
+                                    plan=_plan_entry(title='斗罗大陆'),
+                                    plan_window_hits=win_hits), '')
 
     def test_title_fold_mismatch_rejected_without_fetch(self):
         """续作 / 异名书：书名折叠不等 → 直接拒、零正文请求。"""
@@ -530,28 +582,65 @@ class TestFillSourceIdentity(unittest.TestCase):
         self.assertEqual(_content_calls(cli, 'b.example.com'), [])
 
     def test_same_name_different_book_body_rejected(self):
-        """同名、目录也雷同，但正文另一本书（r2_b 形态）→ 书首组正文信号判否，不补段。"""
+        """同名、目录也雷同，但正文另一本书（r2_b 形态）→ 窗口内正文信号判否，不补段。"""
         cli = make_cli({'b.example.com': {'n': 100, 'body': _other_body}})
-        self.assertEqual(self._fill(cli, _entry('b.example.com')), 'body')
+        self.assertEqual(self._fill(cli, _entry('b.example.com'),
+                                    plan_window_hits=_ref_hits(nums=[41, 42, 43, 44])), 'body')
 
-    def test_head_same_tail_different_rejected(self):
-        """rvlblseg R3 头同尾异：计划源中段有可用章（近窗组，章号 4–7）时，「书首同、近窗换书」的候选被拦。
-        候选前 3 章 = 同书、第 4 章起 = 另一本书 → 书首组勉强判同、近窗组判否 → 与门拒。"""
-        cli = make_cli({'b.example.com': {'n': 100,
-                        'body': lambda i: _book_body(i) if i < 3 else _other_body(i)}})
-        self.assertEqual(self._fill(cli, _entry('b.example.com')), 'body')
+    def test_dead_zone_before_window_rejects(self):
+        """rvlblseg R4 必修 2（红线，改结构，第四轮 E1 结构性拦截）：计划源在窗口起点之前已进死区
+        （46 起 4xx），目标窗口内也无可读章 → 向前探最近可读章遇 4xx 即停、探不到参照 → ref=reject，
+        不拿分歧点之前的书首/近窗组给后段背书，候选正文一次都不抓。"""
+        cli = make_cli({'plan': {'n': 100, 'body': lambda i: _book_body(i) if i < 45 else None},
+                        'b.example.com': {'n': 100,
+                            'body': lambda i: _book_body(i) if i < 45 else _other_body(i)}})
+        reason, ref = self._fill_ref(cli, _entry('b.example.com'), win={'no': 3, 'start': 70})
+        self.assertEqual(reason, 'body')
+        self.assertEqual(ref, 'reject')
+        self.assertEqual(_content_calls(cli, 'b.example.com'), [])
 
     def test_title_position_mismatch_via_helper(self):
-        """段位置标题核对 _seg_title_mismatch：同章号信息性章名不一致计入分母，辅助/预览标题跳过。"""
+        """段位置标题核对 _seg_title_mismatch：同章号信息性章名不一致计入分母，辅助/预览标题跳过。
+        rvlblseg R4 必修 3：无可比章（分母 0）→ **None（不可判）**，调用方按「一律拒」处理。"""
         plan = _plan_entry()['chapters']
         cand_ok = _plan_entry()['chapters']
         self.assertEqual(labeler._seg_title_mismatch(plan, cand_ok, {'start': 40, 'end': 46}), 0.0)
         cand_diff = _plan_entry(titles=lambda i: f'第{i + 1}章 迥异篇目{i:04d}')['chapters']
         self.assertGreater(labeler._seg_title_mismatch(plan, cand_diff, {'start': 40, 'end': 46}), 0.20)
-        # 计划源该段挂 APP免费/番外 等辅助标题 → 跳过、不据此判不一致（分母 0 → 0.0）
+        # 计划源该段挂 APP免费/番外 等辅助标题 → 跳过、不据此判 → 分母 0 → None（不可判，必修 3）
         plan_aux = _plan_entry(titles=lambda i: (f'第{i + 1}章 番外{i}APP免费'
                                                  if 40 <= i < 46 else _chapter_title(i)))['chapters']
-        self.assertEqual(labeler._seg_title_mismatch(plan_aux, cand_diff, {'start': 40, 'end': 46}), 0.0)
+        self.assertIsNone(labeler._seg_title_mismatch(plan_aux, cand_diff, {'start': 40, 'end': 46}))
+
+    def test_title_mismatch_skips_unnumbered_chapters(self):
+        """rvlblseg R4 必修 1：候选/计划源含无章号章（楔子/序章 → num=None）时不崩溃、不参与同章号比对。"""
+        plan = ([{'title': '楔子 少年初见', 'url': 'u'}]
+                + [{'title': _chapter_title(i), 'url': 'u'} for i in range(1, 100)])
+        cand = ([{'title': '序章', 'url': 'u'}]
+                + [{'title': _chapter_title(i), 'url': 'u'} for i in range(1, 100)])
+        # 不抛异常；num=None 的首条不计入分母
+        self.assertEqual(labeler._seg_title_mismatch(plan, cand, {'start': 0, 'end': 6}), 0.0)
+
+    def test_plan_window_reference_skips_none_num(self):
+        """rvlblseg R4 必修 1：plan_window_hits 含 num=None 章（楔子/序章）时，_plan_window_reference
+        不崩溃、无编号章不参与按章号取参照。"""
+        cli = make_cli({'b.example.com': {'n': 100}})
+        hits = [{'num': None, 'text': _book_body(0)}] + _ref_hits(nums=[41, 42, 43, 44])
+        groups, ref = labeler._plan_window_reference(
+            cli, _plan_entry(), hits, self.WIN, float('inf'), lambda: 0.0, {})
+        self.assertNotIn(None, [h['num'] for h in groups])
+        self.assertEqual(ref, 'window')
+
+    def test_plan_window_reference_nearest_prior_skips_none_num(self):
+        """rvlblseg R4 必修 1：向前探时遇 num=None 的无编号章跳过、继续向前，不崩溃。"""
+        cli = make_cli({'b.example.com': {'n': 100}})
+        # 计划源目录：窗口起点前一条是「楔子」（num=None）→ 探测须跳过它继续向前
+        plan = _plan_entry(titles=lambda i: ('楔子 少年初见' if i == 39 else _chapter_title(i)))
+        cache = {n: _book_body(n - 1) for n in (37, 38, 39)}     # 40 号位是楔子无章号
+        groups, ref = labeler._plan_window_reference(
+            cli, plan, None, self.WIN, float('inf'), lambda: 0.0, cache)
+        self.assertNotIn(None, [h['num'] for h in groups])
+        self.assertEqual(ref, 'nearest_prior')
 
     def test_shared_generic_toc_rejected_without_fetch(self):
         """同名、仅共享 5 条站方通用条目（关于本书/人物介绍…，r2_d）→ 目录 Jaccard 远低于阈值 → 目录信号判否，
@@ -562,19 +651,27 @@ class TestFillSourceIdentity(unittest.TestCase):
         self.assertEqual(_content_calls(cli, 'b.example.com'), [])
 
     def test_first_segment_uses_head_group_only(self):
-        """第 1 段窗口在书首、无近窗组：只用书首组判同（同书可过）。"""
+        """第 1 段窗口在书首：用窗口内章（书首即窗口）判同（同书可过，ref=window）。"""
         cli = make_cli({'b.example.com': {'n': 100}})
-        self.assertEqual(self._fill(cli, _entry('b.example.com'), win={'no': 1, 'start': 0}), '')
+        reason, ref = self._fill_ref(cli, _entry('b.example.com'), win={'no': 1, 'start': 0},
+                                     plan_window_hits=_ref_hits(nums=[1, 2, 3, 4]))
+        self.assertEqual(reason, '')
+        self.assertEqual(ref, 'window')
 
     def test_no_reference_rejects(self):
-        """计划源无可用参照章（第 1 段 short → hits 不作参照，rvlblseg R3 重点 3）→ 书首组不可判 → 拒、不接管。"""
+        """计划源无任何可用参照章（窗口内空 + 窗口起点即书首、无从向前探）→ ref=reject → 拒、不接管，
+        候选正文一次都不抓。"""
         cli = make_cli({'b.example.com': {'n': 100}})
-        self.assertEqual(self._fill(cli, _entry('b.example.com'), plan_ref_hits=[]), 'body')
+        reason, ref = self._fill_ref(cli, _entry('b.example.com'),
+                                     win={'no': 1, 'start': 0}, plan_window_hits=[])
+        self.assertEqual(reason, 'body')
+        self.assertEqual(ref, 'reject')
+        self.assertEqual(_content_calls(cli, 'b.example.com'), [])
 
     def test_candidate_chapters_capped(self):
-        """候选源核验抓章总数（书首组 + 近窗组）≤ SEG_FILL_VERIFY_MAX，且每组 ≤ SEG_FILL_MAX_CHAPTERS。"""
+        """候选源核验抓章总数 ≤ SEG_FILL_VERIFY_MAX。"""
         cli = make_cli({'b.example.com': {'n': 100}})
-        self._fill(cli, _entry('b.example.com'))
+        self._fill(cli, _entry('b.example.com'), plan_window_hits=_ref_hits(nums=[41, 42, 43, 44]))
         self.assertLessEqual(len(_content_calls(cli, 'b.example.com')), labeler.SEG_FILL_VERIFY_MAX)
 
     def test_candidate_fetch_counts_against_budget(self):
@@ -592,10 +689,11 @@ class TestFillSourceIdentity(unittest.TestCase):
         cli = make_cli({'b.example.com': {'n': 100}})
         caches = {}
         cand = _entry('b.example.com')
-        self._fill(cli, cand, caches=caches)
+        wh = _ref_hits(nums=[41, 42, 43, 44])
+        self._fill(cli, cand, caches=caches, plan_window_hits=wh)
         n1 = len(_content_calls(cli, 'b.example.com'))
-        self._fill(cli, cand, caches=caches, win={'no': 3, 'start': 70})
-        self.assertEqual(len(_content_calls(cli, 'b.example.com')), n1)   # 章号 1..7 已缓存
+        self._fill(cli, cand, caches=caches, win={'no': 3, 'start': 70}, plan_window_hits=wh)
+        self.assertEqual(len(_content_calls(cli, 'b.example.com')), n1)   # 章号 41..44 已缓存
 
     def test_names_use_douban_informative_titles(self):
         """目录章名口径 = douban_list._informative_toc_titles：纯编号/短章名/辅助条目不计。"""
@@ -671,7 +769,9 @@ class TestFillIdentityEndToEnd(_NoSleep):
         self.assert_no_fill(cli, book, 'toc')
 
     def test_same_title_same_toc_empty_author_fills(self):
-        """同名、目录对得上、正文逐章一致（同一本书） → 可以补段（作者字段不再参与判定，rvlblseg R2-6）。"""
+        """同名、目录对得上、正文逐章一致（同一本书） → 可以补段（作者字段不再参与判定，rvlblseg R2-6）。
+        主源 a 在 ch41 起 4xx → 第 2 段向前探近邻参照(nearest_prior)判同、b 补第 2 段；第 3/4 段分歧点距窗口
+        >4 章 → 探不到参照、标未取到（改结构后的覆盖代价）。"""
         cli = make_cli({
             'a.example.com': {'n': 100, 'title': '斗罗大陆', 'body': _a_late_4xx},
             'b.example.com': {'n': 100, 'title': '斗罗大陆', 'author': ''},
@@ -680,7 +780,8 @@ class TestFillIdentityEndToEnd(_NoSleep):
         book['engine_alternates'][0]['title'] = '斗罗大陆'
         text, chars, used, sampling, _ = _fetch(cli, book)
         segs = {s['no']: s for s in sampling['segments']}
-        self.assertEqual([segs[n]['source'] for n in (2, 3, 4)], ['b.example.com'] * 3)
+        self.assertEqual((segs[2]['source'], segs[2].get('ref')), ('b.example.com', 'nearest_prior'))
+        self.assertTrue(segs[3].get('missing') and segs[4].get('missing'))
         self.assertEqual(used['url'], 'https://a.example.com/book')
 
     def test_same_name_different_book_body_rejected(self):
@@ -715,8 +816,9 @@ class TestFillIdentityEndToEnd(_NoSleep):
         self.assert_no_fill(cli, book, 'toc')
 
     def test_traditional_variant_same_book_fills(self):
-        """繁简真同书：备选书名 斗羅大陸（繁体），章名与正文都与简体主源一致 → 书名折叠后判同、双信号齐过 → 补段。
-        身份闸对繁简放宽（_check_toc_identity title_fold），同名异书仍由 same_book 正文信号兜住。"""
+        """繁简真同书：备选书名 斗羅大陸（繁体），章名与正文都与简体主源一致 → 书名折叠后判同、双信号齐过。
+        主源 a 在 ch41 起 4xx（分歧点落在第 1/2 段窗口之间）→ 第 2 段向前探近邻参照(nearest_prior)补，
+        繁体正文经繁简折叠后判同 → b 补第 2 段；第 3/4 段分歧点距窗口 >4 章 → 探不到参照、标未取到（覆盖代价）。"""
         cli = make_cli({
             'a.example.com': {'n': 100, 'title': '斗罗大陆', 'body': _a_late_4xx},
             'b.example.com': {'n': 100, 'title': '斗羅大陸'},
@@ -725,23 +827,26 @@ class TestFillIdentityEndToEnd(_NoSleep):
         book['engine_alternates'][0]['title'] = '斗羅大陸'
         text, chars, used, sampling, _ = _fetch(cli, book)
         segs = {s['no']: s for s in sampling['segments']}
-        self.assertEqual([segs[n]['source'] for n in (2, 3, 4)], ['b.example.com'] * 3)
+        self.assertEqual((segs[2]['source'], segs[2].get('ref')), ('b.example.com', 'nearest_prior'))
+        self.assertTrue(segs[3].get('missing') and segs[4].get('missing'))
         self.assertEqual(used['url'], 'https://a.example.com/book')
 
     def test_title_position_mismatch_end_to_end(self):
         """段位置标题核对（端到端）：备选正文是同书正文、目录整体也对得上，但**第 2 段窗口内章名**与计划源
         同章号大面积不一致（盗版站该段换了另一套章名）→ 送模章标题核对不过，弃该候选、该段未取到；
-        其余段章名一致 → 照常补段。"""
+        计划源正文在第 2、3 段窗口内各局部 4xx（窗口起点前一章可读）→ 两段都靠近邻参照判同，第 3 段章名一致
+        → 照常补段。"""
         diff = lambda i: (f'第{i + 1}章 迥异篇目{i:04d}' if 40 <= i < 46 else _chapter_title(i))
+        a_dead = lambda i: None if (40 <= i < 45) or (70 <= i < 74) else _book_body(i)
         cli = make_cli({
-            'a.example.com': {'n': 100, 'body': _a_late_4xx},
+            'a.example.com': {'n': 100, 'body': a_dead},
             'b.example.com': {'n': 100, 'titles': diff},   # 正文仍 _book_body（同书），仅第 2 段窗口章名不同
         })
         text, chars, used, sampling, _ = _fetch(cli, _book(alternates=['b.example.com']))
         segs = {s['no']: s for s in sampling['segments']}
         self.assertTrue(segs[2].get('missing'))
         self.assertIn('b.example.com:title_pos', segs[2]['tried'])
-        self.assertEqual(segs[3]['source'], 'b.example.com')   # 第 3 段章名一致 → 照常补段
+        self.assertEqual((segs[3]['source'], segs[3].get('ref')), ('b.example.com', 'nearest_prior'))
 
     def test_numbered_plan_toc_disables_fill(self):
         """计划源目录纯编号（无信息性章名）→ 身份无从核，不按段换源：备选连目录都不取，后段标未取到。"""
@@ -859,13 +964,14 @@ class TestFirstSegmentShortChapters(_NoSleep):
                         'b.example.com': {'n': 100}})
         with self.assertRaises(labeler.EngineSourceGaveUp):
             _fetch(cli, _book(alternates=['b.example.com']))
-        a_seg1 = [c for c in _content_calls(cli, 'a.example.com') if _idx(c[1]) < 40]
+        # 只数第 1 段窗口本身的请求（<10）：后段补段判同会向前探计划源近邻章（idx 36–39 等），不算第 1 段
+        a_seg1 = [c for c in _content_calls(cli, 'a.example.com') if _idx(c[1]) < 30]
         self.assertEqual(len(a_seg1), labeler.SEG_PROBE_CHAPTERS)
         cli = make_cli({'a.example.com': {'n': 100, 'body': lambda i: f'短章{i}' + '字' * 150},
                         'b.example.com': {'n': 100}})
         with self.assertRaises(labeler.EngineSourceGaveUp):
             _fetch(cli, _book(alternates=['b.example.com']))
-        a_seg1 = [c for c in _content_calls(cli, 'a.example.com') if _idx(c[1]) < 40]
+        a_seg1 = [c for c in _content_calls(cli, 'a.example.com') if _idx(c[1]) < 30]
         self.assertEqual(len(a_seg1), labeler.SEG_FIRST_PROBE_CHAPTERS)
 
     def test_usable_first_segment_by_cumulative_chars(self):
@@ -1072,8 +1178,10 @@ class TestMainLoop(unittest.TestCase):
         self.assertNotIn('分布式采样', out)
 
     def test_switch_on_segments_and_arc(self):
+        # 主源 a 在第 4 段窗口起点(ch91)起 4xx：前三段 a 供给，第 4 段窗口内计划源不可读、但紧邻 ch90 可读
+        # → 向前探近邻参照补第 4 段(nearest_prior)，b 与 a 同书。
         cli = make_cli({
-            'a.example.com': {'n': 100, 'body': lambda i: None if i >= 60 else _book_body(i)},
+            'a.example.com': {'n': 100, 'body': lambda i: None if i >= 90 else _book_body(i)},
             'b.example.com': {'n': 100},
         })
         seen = {}
@@ -1101,11 +1209,12 @@ class TestMainLoop(unittest.TestCase):
         self.assertEqual(arc['checked']['dropped'], 1)
         segs = rec['sampling']['segments']
         self.assertEqual([s['source'] for s in segs],
-                         ['a.example.com', 'a.example.com', 'b.example.com', 'b.example.com'])
+                         ['a.example.com', 'a.example.com', 'a.example.com', 'b.example.com'])
+        self.assertEqual(segs[3].get('ref'), 'nearest_prior')
         self.assertEqual(rec['url'], 'https://a.example.com/book')
         self.assertEqual(rec['label_source'], 'text_engine')
         self.assertIn('分布式采样', out)
-        self.assertIn('第3段 b.example.com', out)
+        self.assertIn('第4段 b.example.com', out)
 
     def test_switch_on_forged_evidence_becomes_unknown(self):
         cli = make_cli({'a.example.com': {'n': 100}, 'b.example.com': {'n': 100}})
@@ -1123,10 +1232,12 @@ class TestMainLoop(unittest.TestCase):
                          ('unknown', [], 2))
 
     def test_switch_on_record_url_is_plan_source_and_queue_skips(self):
-        """rvlblseg ce8：备选供给大半原文时，记录 url/source 仍是计划源（名单主源）；
-        下一轮 split_queue 认得出、不重打标；补段来源只在 sampling。"""
+        """rvlblseg ce8：备选补某段时，记录 url/source 仍是计划源（名单主源）；
+        下一轮 split_queue 认得出、不重打标；补段来源只在 sampling。
+        主源 a 在 ch41 起 4xx（分歧点落在第 1/2 段窗口之间）→ b 近邻参照补第 2 段，第 3/4 段分歧点距窗口
+        >4 章 → 标未取到（覆盖代价）。"""
         cli = make_cli({
-            'a.example.com': {'n': 100, 'body': lambda i: None if i >= 10 else _book_body(i)},
+            'a.example.com': {'n': 100, 'body': lambda i: None if i >= 40 else _book_body(i)},
             'b.example.com': {'n': 100},
         })
         code, recs, *_ = self.run_main('LABELER_SEGMENTED=1\n', cli,
@@ -1134,8 +1245,8 @@ class TestMainLoop(unittest.TestCase):
         self.assertEqual(code, 0)
         rec = recs[0]
         self.assertEqual((rec['url'], rec['source']), ('https://a.example.com/book', 'a.example.com'))
-        self.assertEqual([s['source'] for s in rec['sampling']['segments']],
-                         ['a.example.com'] + ['b.example.com'] * 3)
+        self.assertEqual([s.get('source') for s in rec['sampling']['segments']],
+                         ['a.example.com', 'b.example.com', None, None])
         done = labeler.load_done_urls(self.dir / 'labels.jsonl')
         todo, skipped, _ = labeler.split_queue([_book(alternates=['b.example.com'])], done, set())
         self.assertEqual((len(todo), len(skipped)), (0, 1))

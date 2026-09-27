@@ -2055,11 +2055,13 @@ def _norm_toc_name(title: str) -> str:
 
 
 def _seg_title_mismatch(plan_chapters: list[dict], cand_chapters: list[dict],
-                        cand_window: dict) -> float:
+                        cand_window: dict) -> float | None:
     """候选源某段窗口内各章标题 vs 计划源目录**同章号**章名（归一后）不一致比例（rvlblseg R3 重点 2）。
 
-    计划源目录通常比正文完整，只比对目录、不额外抓取。计划源目录无对应章号、或两侧章名归一后为空的候选章
-    不计入分母；无可比章 → 0.0（不据此拒）。"""
+    计划源目录通常比正文完整，只比对目录、不额外抓取。计划源目录无对应章号（`num is None` 的楔子/序章/
+    无编号标题不参与，rvlblseg R4 必修 1）、或两侧章名归一后为空的候选章不计入分母；
+    无可比章（分母为 0）→ **None（不可判）**，调用方按「不可判一律拒」处理（与 same_book 口径一致，
+    rvlblseg R4 必修 3）——旧口径返回 0.0 会当作「全对」放行纯编号后段的换书候选。"""
     plan_name: dict[int, str] = {}
     for c in plan_chapters:
         num = douban_list._toc_chapter_number(c.get('title') or '')
@@ -2076,49 +2078,96 @@ def _seg_title_mismatch(plan_chapters: list[dict], cand_chapters: list[dict],
         total += 1
         if pn != cn:
             mismatch += 1
-    return (mismatch / total) if total else 0.0
+    return (mismatch / total) if total else None
 
 
-def _reference_groups(plan_ref_hits: list[dict], plan_chapters: list[dict],
-                      win: dict) -> list[list[dict]]:
-    """计划源已取可用章 → 正文参照分组（rvlblseg R3 重点 1）：书首组（章号最小的 ≤SEG_FILL_MAX_CHAPTERS 章）
-    + 近窗组（章号 ≤ 段窗口起点、离窗口最近的 ≤SEG_FILL_MAX_CHAPTERS 章）。第 1 段（窗口在书首）只有书首组。
-    近窗组与书首组重合时仍分别返回（判同要求各组各自 ≥2 互异章对）。"""
-    real = sorted((h for h in plan_ref_hits if len(h.get('text') or '') > 100),
-                  key=lambda h: h['num'])
-    head = real[:SEG_FILL_MAX_CHAPTERS]
-    if win.get('no') == 1 or not real:
-        return [head]
-    start_idx = min(win.get('start', 0), len(plan_chapters) - 1)
-    start_num = douban_list._toc_chapter_number(plan_chapters[start_idx].get('title') or '') \
-        if plan_chapters else None
-    if start_num is None:
-        near = real[-SEG_FILL_MAX_CHAPTERS:]
-    else:
-        near = [h for h in real if h['num'] <= start_num][-SEG_FILL_MAX_CHAPTERS:]
-    return [head, near] if near else [head]
+def _sorted_real_hits(*hit_lists) -> list[dict]:
+    """合并若干 hits 列表 → 按章号升序、去重（同章号保留首条）的可用章（rvlblseg R4 必修 1）。
+
+    统一跳过 `num is None`（楔子/序章/无编号标题不参与「按章号取参照」，否则 int 与 None 排序崩溃）
+    与正文 ≤100 字的空/预览章。"""
+    out: list[dict] = []
+    seen: set[int] = set()
+    flat = [h for lst in hit_lists for h in (lst or [])]
+    for h in sorted((h for h in flat
+                     if h.get('num') is not None and len(h.get('text') or '') > 100),
+                    key=lambda h: h['num']):
+        if h['num'] not in seen:
+            seen.add(h['num'])
+            out.append(h)
+    return out
 
 
-def fill_source_identity(engine_cli, plan: dict, plan_ref_hits: list[dict], cand: dict,
+def _plan_window_reference(engine_cli, plan: dict, plan_window_hits: list[dict] | None,
+                           win: dict, deadline: float, clock: Callable[[], float],
+                           plan_ch_cache: dict) -> tuple[list[dict], str]:
+    """补段判同的计划源参照章 + 参照模式（rvlblseg R4 必修 2 红线，改结构）→ (参照章 hits, ref_mode)。
+
+    核心红线：**判同样本必须落在目标段窗口内、或紧邻窗口起点之前**，不再拿远处书首/近窗组给分歧点
+    之后的正文背书（第四轮复审 E1：计划源读到 41–45 后 4xx，旧「近窗组」永远落在 42–45，给窗口
+    71–90 的换书候选背书 → 混入）。
+      - `'window'`：计划源在**目标段窗口内**已读到可读章（plan_window_hits，调用方已滤掉预览/空章）→
+        直接用它们与候选**同章号**章判同；第 1 段窗口即书首，同样走窗口内章。
+      - `'nearest_prior'`：窗口内无计划源可读章 → 从窗口起点**向前探 ≤SEG_FILL_MAX_CHAPTERS 章、
+        遇 4xx/预览即停**，抓计划源正文，探到的最近可读章作参照（计入 240s 预算；命中 plan_ch_cache
+        不重抓）。分歧区在窗口起点之前即断裂时探不到章 → 落到 reject。
+      - `'reject'`：一章可读参照都探不到 → 拒补段、宁缺（异书混入 0 优先于覆盖率）。
+    所有取章号处经 douban_list._toc_chapter_number；`num is None`（楔子/序章）不参与按章号配对（必修 1）。"""
+    in_window = _sorted_real_hits(plan_window_hits)
+    if in_window:
+        return in_window[:SEG_FILL_MAX_CHAPTERS], 'window'
+    chapters = plan.get('chapters') or []
+    start = win.get('start', 0)
+    prior: list[dict] = []
+    for off in range(1, SEG_FILL_MAX_CHAPTERS + 1):
+        idx = start - off
+        if idx < 0:
+            break
+        num = douban_list._toc_chapter_number(chapters[idx].get('title') or '')
+        if num is None:
+            continue                    # 无编号章不参与按章号配对（必修 1），继续向前探
+        if num in plan_ch_cache:
+            text = plan_ch_cache[num]
+        else:
+            if deadline - clock() < SEG_MIN_REQUEST_S:
+                break
+            text = _segment_chapter_text(engine_cli, chapters[idx]['url'], deadline, clock)
+            plan_ch_cache[num] = text
+        if len(text) <= 100 or is_preview_body(text):
+            break                       # 遇 4xx/预览即停：分歧区无参照，宁缺
+        prior.append({'num': num, 'text': text})
+    real = _sorted_real_hits(prior)
+    return (real[:SEG_FILL_MAX_CHAPTERS], 'nearest_prior') if real else ([], 'reject')
+
+
+def fill_source_identity(engine_cli, plan: dict, cand: dict,
                          win: dict, deadline: float,
                          clock: Callable[[], float] = time.monotonic,
-                         caches: dict | None = None) -> str:
-    """补段源身份核验（rvlblseg R3 收口）→ 不通过原因（'' = 通过）。
+                         caches: dict | None = None,
+                         plan_window_hits: list[dict] | None = None,
+                         plan_ch_cache: dict | None = None) -> tuple[str, str, list]:
+    """补段源身份核验（rvlblseg R4 收口）→ (不通过原因, 参照模式, 参照章号)；原因 '' = 通过。
 
-    第三轮复审判定原实现（只拿计划源第 1 段 ≤4 章与候选比）判别样本与补段目标位置脱节——「备选前 2 章
-    与计划源逐字相同、其后换书」即全过。主会话裁定改为**双参照与门**：
-      (1) 书名繁简折叠相等（_fold_title），否则 'title'（零正文请求）；
-      (2) 目录信号 douban_list._toc_decides 可判且判同，否则 'toc'（零正文请求，r2_b/r2_d 在此即拒）；
-      (3) 正文双参照（_reference_groups：书首组 + 近窗组，取自计划源**已取到且可用**的章，不额外抓计划源正文）
-          各组候选抓同章号正文、走 douban_list.same_book 的正文信号（_body_decides），**每组都须可判且判同**
-          （各 ≥2 互异章对），任一组不可判或不判同 → 'body'。「头同尾异」只要计划源在中段有已取可用章，
-          近窗组即落在分歧区把它拦下（第 1 段窗口在书首、无近窗组）。
-    段位置标题核对（rvlblseg R3 重点 2）不在此做——放在 fetch_segment 之后按**实际送模章**核对（_seg_title_mismatch）。
-    caches：{'cand_toc': {id: 原因}, 'cand_ch': {id: {num: text}}} 跨段复用，候选抓章总数 ≤SEG_FILL_VERIFY_MAX。"""
+    第四轮复审判定：拿书首/近窗组（都在分歧点之前）给后段背书，「头同尾异」仍能混入。主会话裁定改为
+    **判同样本必须落在目标段窗口内、或紧邻窗口起点之前**（见 `_plan_window_reference`）：
+      (1) 书名繁简折叠相等（_fold_title），否则 ('title', '')（零正文请求，续作/异名书在此即拒）；
+      (2) 目录信号 douban_list._toc_decides 可判且判同，否则 ('toc', '')（零正文请求，r2_b/r2_d 在此即拒）；
+      (3) 正文判同：`_plan_window_reference` 取**目标窗口内**计划源章（plan_window_hits），窗口内不可读时
+          **向前探 ≤SEG_FILL_MAX_CHAPTERS 章、遇 4xx/预览即停**抓计划源正文作近邻参照（ref='nearest_prior'）；
+          一章都探不到 → ref='reject' 直接拒（'body'）。取到参照后与候选**同章号**正文逐章配对（≥2 互异章对）；
+          不判同 → ('body', ref_mode)。
+    先判书名/目录（零请求）再取参照：续作/同名异书在花任何抓章预算前即被拦，只有过前两关的候选才向前探参照。
+    ref_mode 回给调用方：'nearest_prior' 记进 sampling（附参照章号）；'reject' 表示结构上不该补（附 'body'）。
+    段位置标题核对（重点 2）仍在 fetch_segment 之后按**实际送模章**做（_seg_title_mismatch，不可判即拒）。
+    caches：{'cand_toc': {id: 原因}, 'cand_ch': {id: {num: text}}} 跨段复用，候选抓章 ≤SEG_FILL_VERIFY_MAX；
+    plan_ch_cache：计划源 num→text，窗口内已读章 + 向前探到的章都进缓存，跨段/跨候选不重抓（并入既有预算）。"""
     caches = caches if caches is not None else {}
+    plan_ch_cache = plan_ch_cache if plan_ch_cache is not None else {}
+    # (1) 书名繁简折叠：最便宜，先判，零正文请求（续作/异名书在此即拒）。
     plan_title = _fold_title(plan.get('title') or '')
     if not plan_title or _fold_title(cand.get('title') or '') != plan_title:
-        return 'title'
+        return 'title', '', []
+    # (2) 目录信号（douban_list._toc_decides）：只比目录、零正文请求（r2_b/r2_d 在此即拒）。
     toc_cache = caches.setdefault('cand_toc', {})
     if id(cand) not in toc_cache:
         judge, same, _, _ = douban_list._toc_decides(
@@ -2126,17 +2175,24 @@ def fill_source_identity(engine_cli, plan: dict, plan_ref_hits: list[dict], cand
             {'toc': douban_list._informative_toc_titles(cand['chapters'])})
         toc_cache[id(cand)] = '' if (judge and same) else 'toc'
     if toc_cache[id(cand)]:
-        return toc_cache[id(cand)]
+        return toc_cache[id(cand)], '', []
+    # (3) 正文判同：取**目标窗口内**计划源章（plan_window_hits），窗口内不可读时向前探最近可读章
+    #     （nearest_prior，遇 4xx/预览即停）；一章都探不到 → reject 直接拒。取到参照后与候选**同章号**
+    #     正文逐章配对（≥2 互异章对）。
+    ref_hits, ref_mode = _plan_window_reference(engine_cli, plan, plan_window_hits, win,
+                                                deadline, clock, plan_ch_cache)
+    ref_nums = [h['num'] for h in ref_hits]
+    if ref_mode == 'reject' or not ref_hits:
+        return 'body', 'reject', ref_nums
     ch_cache = caches.setdefault('cand_ch', {}).setdefault(id(cand), {})
-    for grp in _reference_groups(plan_ref_hits, plan['chapters'], win):
-        plan_fp = _fingerprint_from_hits(plan['chapters'], grp)
-        cand_hits = _fetch_candidate_hits(engine_cli, cand, [h['num'] for h in grp],
-                                          deadline, clock, ch_cache)
-        judge, same, _, _ = douban_list._body_decides(
-            plan_fp, _fingerprint_from_hits(cand['chapters'], cand_hits))
-        if not (judge and same):
-            return 'body'
-    return ''
+    plan_fp = _fingerprint_from_hits(plan['chapters'], ref_hits)
+    cand_hits = _fetch_candidate_hits(engine_cli, cand, ref_nums,
+                                      deadline, clock, ch_cache)
+    judge, same, _, _ = douban_list._body_decides(
+        plan_fp, _fingerprint_from_hits(cand['chapters'], cand_hits))
+    if not (judge and same):
+        return 'body', ref_mode, ref_nums
+    return '', ref_mode, ref_nums
 
 
 def fetch_book_text_segmented(engine_cli, book: dict, tracker: SourceGiveupTracker,
@@ -2220,10 +2276,13 @@ def fetch_book_text_segmented(engine_cli, book: dict, tracker: SourceGiveupTrack
         raise EngineSourceGaveUp(primary['source'], 'no_source',
                                  f'{len(options)} 个候选源目录均不可用')
     plan = tocs[options[plan_i]['url']]
-    # 补段源身份 = 书名折叠 + 目录信号 + 段位置标题 + 正文双参照与门（rvlblseg R3）：正文参照取自计划源
-    # **已取到且可用**的段（书首组 + 近窗组），不额外抓计划源正文。
-    plan_ref_hits: list[dict] = []      # 计划源可用段已取到的 [{'num','text'}]（供 _reference_groups，R3 重点 1/3）
+    # 补段源身份 = 书名折叠 + 目录信号 + 段位置标题 + 正文判同（rvlblseg R4 必修 2/4）：判同样本必须落在
+    # **目标段窗口内、或紧邻窗口起点之前**——计划源该段先取，其窗口内读到的可读章即为该段判同参照；
+    # 窗口内不可读时由 fill_source_identity 向前探最近可读章（nearest_prior），探不到即拒补段。
+    plan_ch_cache: dict = {}            # 计划源 num→text：窗口内已读章 + 向前探到的章，跨段/跨候选不重抓
     fill_caches: dict = {}              # {'cand_toc': {id: 原因}, 'cand_ch': {id: {num: text}}}：跨段复用，候选抓章 ≤上限
+    plan_host = options[plan_i].get('source') or _url_host(options[plan_i]['url'])
+    plan_alive = True                   # 计划源是否还能出正文；某段正文全 4xx/预览（付费墙）后置否，后续段不再重复探计划源
     no_fill = len(plan['names']) < douban_list.CONTENT_TOC_MIN_MATCH
     if no_fill:
         # 计划源纯编号目录：目录信号不可判 → same_book 必判否（rvlblseg R2-6 裁定 3）→ 不换源、标缺段。
@@ -2232,51 +2291,75 @@ def fetch_book_text_segmented(engine_cli, book: dict, tracker: SourceGiveupTrack
     pieces, raw_total, seg_diag = [], 0, []
     last_ok = plan_i
     for win in windows:
-        order = [plan_i] if no_fill else [last_ok] + [i for i in range(len(options)) if i != last_ok]
         best, tried = None, []
-        for i in order:
-            if deadline - clock() < SEG_MIN_REQUEST_S:
-                break
-            entry = toc_of(i)
-            if entry is None:
-                continue
-            host = options[i].get('source') or _url_host(options[i]['url'])
-            src_win = win if i == plan_i else next(
-                (w for w in segment_windows(len(entry['chapters']), segment_plan(total_chars))
-                 if w['no'] == win['no']), None)
-            if src_win is None:
-                continue
-            src_win = {**src_win, 'target': win['target']}
-            if i != plan_i:
-                reason = fill_source_identity(engine_cli, plan, plan_ref_hits, entry,
-                                              win, deadline, clock, fill_caches)
+        # 1) 计划源该段先取（既「可用即不换源」，也取该窗口内的判同参照，rvlblseg R4 必修 2/4）。
+        #    计划源已判死（付费墙）则不再重复探——但仍会在补段判同里向前探紧邻窗口的可读章。
+        plan_win_hits: list[dict] = []
+        if plan_alive and deadline - clock() >= SEG_MIN_REQUEST_S:
+            p_res = fetch_segment(engine_cli, plan['chapters'], {**win}, deadline, clock)
+            p_ok, p_why = segment_usable(p_res, win['target'], first_segment=win['no'] == 1)
+            # 计划源本段窗口内真实可读章（滤掉预览/空章）作窗口内判同参照，并入 plan_ch_cache 供向前探复用。
+            plan_win_hits = [h for h in p_res['hits'] if h.get('num') is not None
+                             and len(h.get('text') or '') > 100 and not is_preview_body(h['text'])]
+            for h in plan_win_hits:
+                plan_ch_cache.setdefault(h['num'], h['text'])
+            tried.append(f'{plan_host}:{p_why or "ok"}')
+            p_res.update(src_i=plan_i, window={**win}, ok=p_ok)
+            if p_ok:
+                best = p_res
+                last_ok = plan_i
+            else:
+                if p_why == 'preview':
+                    plan_alive = False          # 正文全 4xx/预览：付费墙从此段起，后续段不再探计划源
+                if p_res['parts'] and p_res['eff_chars'] / max(p_res['requested'], 1) >= SEG_MIN_AVG_CHARS:
+                    best = p_res                # 计划源真正文但偏短：留作兜底（partial）
+        # 2) 计划源该段不可用 且 允许换源 → 候选补段（判同样本落在本窗口内或紧邻窗口起点之前）。
+        if (best is None or not best.get('ok')) and not no_fill:
+            cand_order = [last_ok] + [i for i in range(len(options)) if i not in (last_ok, plan_i)]
+            for i in cand_order:
+                if i == plan_i:
+                    continue
+                if deadline - clock() < SEG_MIN_REQUEST_S:
+                    break
+                entry = toc_of(i)
+                if entry is None:
+                    continue
+                host = options[i].get('source') or _url_host(options[i]['url'])
+                src_win = next(
+                    (w for w in segment_windows(len(entry['chapters']), segment_plan(total_chars))
+                     if w['no'] == win['no']), None)
+                if src_win is None:
+                    continue
+                src_win = {**src_win, 'target': win['target']}
+                reason, ref_mode, ref_nums = fill_source_identity(
+                    engine_cli, plan, entry, win, deadline, clock, fill_caches,
+                    plan_window_hits=plan_win_hits, plan_ch_cache=plan_ch_cache)
                 if reason:
-                    print(f'  备选源 {host} 补段身份核验未过（{reason}），不用它补段')
+                    print(f'  备选源 {host} 补段身份核验未过（{reason}/{ref_mode}），不用它补段')
                     tried.append(f'{host}:identity_{reason}')
                     continue
-            res = fetch_segment(engine_cli, entry['chapters'], src_win, deadline, clock)
-            ok, why = segment_usable(res, win['target'], first_segment=win['no'] == 1)
-            if i == plan_i and ok:
-                plan_ref_hits.extend(res['hits'])   # 计划源可用段已取章 → 正文参照（rvlblseg R3 重点 1/3）
-            # 段位置标题核对（rvlblseg R3 重点 2）：补段候选**实际送模章**（[first,last]）标题须与计划源
-            # 目录同章号章名一致，不一致比例过高 → 弃该候选（该源另一本书的后段章名对不上）。
-            if ok and i != plan_i and res['first'] is not None and _seg_title_mismatch(
-                    plan['chapters'], entry['chapters'],
-                    {'start': res['first'], 'end': res['last'] + 1}) > SEG_FILL_TITLE_MAX_MISMATCH:
-                tried.append(f'{host}:title_pos')
-                print(f'  第 {win["no"]} 段 {host} 送模章标题与计划源目录不符，弃')
-                continue
-            tried.append(f'{host}:{why or "ok"}')
-            res.update(src_i=i, window=src_win, ok=ok)
-            if ok:
-                best = res
-                last_ok = i
-                break
-            print(f'  第 {win["no"]} 段 {host} 不可用（{why}，有效 {res["eff_chars"]} 字/'
-                  f'{res["requested"]} 章），换源补段')
-            if res['parts'] and res['eff_chars'] / max(res['requested'], 1) >= SEG_MIN_AVG_CHARS \
-                    and (best is None or res['eff_chars'] > best['eff_chars']):
-                best = res              # 真正文但偏短：留作兜底（partial）
+                res = fetch_segment(engine_cli, entry['chapters'], src_win, deadline, clock)
+                ok, why = segment_usable(res, win['target'], first_segment=win['no'] == 1)
+                # 段位置标题核对（rvlblseg R3 重点 2 + R4 必修 3）：补段候选**实际送模章**标题须与计划源目录
+                # 同章号章名一致；不一致比例过高**或不可判（分母 0）**→ 弃该候选（不可判一律拒，同 same_book 口径）。
+                if ok and res['first'] is not None:
+                    tm = _seg_title_mismatch(plan['chapters'], entry['chapters'],
+                                             {'start': res['first'], 'end': res['last'] + 1})
+                    if tm is None or tm > SEG_FILL_TITLE_MAX_MISMATCH:
+                        tried.append(f'{host}:title_pos')
+                        print(f'  第 {win["no"]} 段 {host} 送模章标题与计划源目录不符/不可判，弃')
+                        continue
+                tried.append(f'{host}:{why or "ok"}')
+                res.update(src_i=i, window=src_win, ok=ok, ref=ref_mode, ref_nums=ref_nums)
+                if ok:
+                    best = res
+                    last_ok = i
+                    break
+                print(f'  第 {win["no"]} 段 {host} 不可用（{why}，有效 {res["eff_chars"]} 字/'
+                      f'{res["requested"]} 章），换源补段')
+                if res['parts'] and res['eff_chars'] / max(res['requested'], 1) >= SEG_MIN_AVG_CHARS \
+                        and (best is None or res['eff_chars'] > best['eff_chars']):
+                    best = res              # 真正文但偏短：留作兜底（partial）
         if best is None:
             pieces.append(segment_marker(None, win['no']))
             seg_diag.append({'no': win['no'], 'missing': True, 'tried': tried})
@@ -2286,11 +2369,16 @@ def fetch_book_text_segmented(engine_cli, book: dict, tracker: SourceGiveupTrack
                       + '\n\n' + '\n\n'.join(best['parts']))
         raw_total += best['raw_chars']
         stats['preview_chapters'] += best['preview_skipped']
-        seg_diag.append({'no': win['no'], 'source': src.get('source') or _url_host(src['url']),
-                         'url': src['url'],
-                         'chapters': f'{best["first"] + 1}-{best["last"] + 1}',
-                         'chars': best['eff_chars'], 'switched': best['src_i'] != 0,
-                         'partial': not best['ok'], 'tried': tried})
+        seg_entry = {'no': win['no'], 'source': src.get('source') or _url_host(src['url']),
+                     'url': src['url'],
+                     'chapters': f'{best["first"] + 1}-{best["last"] + 1}',
+                     'chars': best['eff_chars'], 'switched': best['src_i'] != 0,
+                     'partial': not best['ok'], 'tried': tried}
+        if best.get('ref') == 'nearest_prior':
+            # 补段判同用了紧邻窗口起点之前的计划源章（窗口内计划源不可读）——如实记进 sampling 及参照章号。
+            seg_entry['ref'] = 'nearest_prior'
+            seg_entry['ref_nums'] = best.get('ref_nums') or []
+        seg_diag.append(seg_entry)
     sampling = {'mode': 'segmented', 'fetch_secs': round(clock() - started, 1),
                 'segments': seg_diag}
     if not raw_total:
