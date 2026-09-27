@@ -19,6 +19,7 @@ from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import import_one  # noqa: E402
+import douban_list  # noqa: E402
 
 
 # ---- 基线记录（labeler.py 写进 labels.jsonl 的形态）----
@@ -428,10 +429,22 @@ class TestFindTwin(unittest.TestCase):
         # 占位作者宽松键为空 → 不与任何行判孪生
         self.assertIsNone(import_one.find_twin([{'id': 3, 'author': '佚名'}], '未知'))
 
-    def test_traditional_map_two_strings_aligned(self):
-        # 繁简小表两串必须等长且逐位对应（防手工错位把不同简体字并到一起）
-        self.assertEqual(len(import_one._TRAD), len(import_one._SIMP))
-        self.assertEqual(len(set(import_one._TRAD)), len(import_one._TRAD))  # 繁体侧无重复键
+    def test_loose_key_delegates_to_douban_norm_author(self):
+        # authkey42：入库身份键改为委托 douban_list._norm_author（作者侧折叠大表），
+        # 与打标线同口径；不再自带 _TRAD/_SIMP 小表。非占位作者两者输出必须一致。
+        self.assertFalse(hasattr(import_one, '_TRAD'))
+        self.assertFalse(hasattr(import_one, '_SIMP'))
+        self.assertFalse(hasattr(import_one, '_T2S'))
+        for a in ('黃易', '张爱玲', '風雲', '唐家三少', '作者：天蚕土豆'):
+            with self.subTest(author=a):
+                self.assertEqual(import_one._loose_author_key(a), douban_list._norm_author(a))
+
+    def test_loose_key_bridges_big_table_variants_as_twin(self):
+        # authkey42：换大表后，旧小表漏收的繁体字（觀→观、篤→笃）现在也判孪生
+        for stored, incoming in (('觀棋', '观棋'), ('中下馬篤', '中下马笃')):
+            with self.subTest(pair=(stored, incoming)):
+                row = {'id': 5, 'author': stored}
+                self.assertEqual(import_one.find_twin([row], incoming), row)
 
 
 # ---- AutoImporter：幂等 / 失败不阻断 / 标记 ----
