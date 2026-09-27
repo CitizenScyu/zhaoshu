@@ -472,10 +472,16 @@ def _entry(host, title=TITLE, titles=_chapter_title, toc_author='', n=100):
             'names': set(labeler.douban_list._informative_toc_titles(ch))}
 
 
-def _plan_fp(body=_book_body, titles=_chapter_title, k=7, n=100):
-    """计划源第 1 段已取 k 章 → same_book 口径指纹（章号 1..k）。"""
+def _plan_entry(titles=_chapter_title, n=100, title=TITLE):
+    """计划源目录条目（供 fill_source_identity 单测的 plan 参数）。"""
     ch = [{'title': titles(i), 'url': f'https://plan/c{i}'} for i in range(n)]
-    return labeler._fingerprint_from_hits(ch, [{'num': i + 1, 'text': body(i)} for i in range(k)])
+    return {'title': title, 'chapters': ch}
+
+
+def _ref_hits(body=_book_body, k=7, nums=None):
+    """计划源**可用段已取到**的章 → [{'num','text'}]（默认章号 1..k，供正文参照分组）。"""
+    nums = list(nums) if nums is not None else list(range(1, k + 1))
+    return [{'num': n, 'text': body(n - 1)} for n in nums]
 
 
 def _generic_then(uniq):
@@ -485,12 +491,18 @@ def _generic_then(uniq):
 
 
 class TestFillSourceIdentity(unittest.TestCase):
-    """补段源身份核验（rvlblseg R2-6 结构性收口）：书名繁简折叠相等 + douban_list.same_book 双信号与门
-    （目录判同 + 计划源已取章节与候选同章号正文逐章配对判同），不再靠「集合交集 ≥5」的单信号。"""
+    """补段源身份核验（rvlblseg R3 收口）：书名折叠 + 目录信号 + 段位置标题 + 正文**双参照**（书首组 + 近窗组）
+    与门。每组候选抓同章号正文走 same_book 正文信号，各须可判且判同（各 ≥2 互异章对），任一组不过即拒。"""
 
-    def _fill(self, cli, cand, plan_fp=None, title=TITLE, **kw):
-        return labeler.fill_source_identity(cli, {'title': title}, plan_fp or _plan_fp(), cand,
-                                            deadline=float('inf'), cand_fp_cache={}, **kw)
+    WIN = {'no': 2, 'start': 40}           # 第 2 段（约 40% 处），窗口起点 = 目录第 41 章
+    SRC_WIN = {'start': 40, 'end': 46}     # 候选窗口（供段位置标题核对）
+
+    def _fill(self, cli, cand, plan=None, plan_ref_hits=None, win=None, src_win=None, caches=None):
+        return labeler.fill_source_identity(
+            cli, plan or _plan_entry(),
+            plan_ref_hits if plan_ref_hits is not None else _ref_hits(),
+            cand, win or self.WIN, src_win or self.SRC_WIN,
+            deadline=float('inf'), caches=caches if caches is not None else {})
 
     def test_fold_title_traditional_and_decor(self):
         """书名比较做繁简折叠 + 去站点装饰尾缀：斗罗大陆 == 斗羅大陸 == 斗罗大陆最新章节；续作仍不等。"""
@@ -501,49 +513,86 @@ class TestFillSourceIdentity(unittest.TestCase):
         self.assertNotEqual(f('斗罗大陆IV终极斗罗'), f('斗罗大陆'))
 
     def test_same_book_passes(self):
-        """同一本书的另一个源（同章号正文一致）→ 双信号齐过。"""
+        """同一本书的另一个源（同章号正文一致）→ 书首组 + 近窗组双双判同。"""
         cli = make_cli({'b.example.com': {'n': 100}})   # 默认 _book_body
         self.assertEqual(self._fill(cli, _entry('b.example.com')), '')
 
     def test_traditional_variant_same_book_fills(self):
-        """繁简书名真同书（斗羅大陸，带真实章名与重合正文）不再被误拒。"""
+        """繁简书名真同书（斗羅大陸）：正文 n-gram 比较前繁转简 → 双参照判同（rvlblseg R3-1.4 误拒修复）。"""
         cli = make_cli({'b.example.com': {'n': 100, 'title': '斗羅大陸'}})
-        self.assertEqual(self._fill(cli, _entry('b.example.com', title='斗羅大陸'), title='斗罗大陆'), '')
+        self.assertEqual(self._fill(cli, _entry('b.example.com', title='斗羅大陸'),
+                                    plan=_plan_entry(title='斗罗大陆')), '')
 
     def test_title_fold_mismatch_rejected_without_fetch(self):
         """续作 / 异名书：书名折叠不等 → 直接拒、零正文请求。"""
         cli = make_cli({'b.example.com': {'n': 100, 'title': '斗罗大陆IV终极斗罗'}})
-        self.assertEqual(self._fill(cli, _entry('b.example.com', title='斗罗大陆IV终极斗罗')), 'title')
+        self.assertEqual(self._fill(cli, _entry('b.example.com', title='斗罗大陆IV终极斗罗'),
+                                    plan=_plan_entry(title='斗罗大陆')), 'title')
         self.assertEqual(_content_calls(cli, 'b.example.com'), [])
 
     def test_same_name_different_book_body_rejected(self):
-        """同名、目录也雷同，但正文另一本书（r2_b 形态）→ 正文信号判否，不补段。"""
+        """同名、目录也雷同，但正文另一本书（r2_b 形态）→ 书首组正文信号判否，不补段。"""
         cli = make_cli({'b.example.com': {'n': 100, 'body': _other_body}})
         self.assertEqual(self._fill(cli, _entry('b.example.com')), 'body')
 
+    def test_head_same_tail_different_rejected(self):
+        """rvlblseg R3 头同尾异：计划源中段有可用章（近窗组，章号 4–7）时，「书首同、近窗换书」的候选被拦。
+        候选前 3 章 = 同书、第 4 章起 = 另一本书 → 书首组勉强判同、近窗组判否 → 与门拒。"""
+        cli = make_cli({'b.example.com': {'n': 100,
+                        'body': lambda i: _book_body(i) if i < 3 else _other_body(i)}})
+        self.assertEqual(self._fill(cli, _entry('b.example.com')), 'body')
+
+    def test_title_position_mismatch_rejected(self):
+        """段位置标题核对：目录整体对得上（Jaccard 过阈值）但补段窗口内章名与计划源同章号大面积不一致 → 弃候选。"""
+        diff = lambda i: (f'第{i + 1}章 迥异篇目{i:04d}' if 40 <= i < 46 else _chapter_title(i))
+        cli = make_cli({'b.example.com': {'n': 100, 'titles': diff}})
+        self.assertEqual(self._fill(cli, _entry('b.example.com', titles=diff)), 'title_pos')
+
     def test_shared_generic_toc_rejected_without_fetch(self):
-        """同名、仅共享 5 条站方通用条目（关于本书/人物介绍…，r2_d）→ 目录 Jaccard 远低于阈值 →
-        目录信号判否，连候选正文都不抓。"""
+        """同名、仅共享 5 条站方通用条目（关于本书/人物介绍…，r2_d）→ 目录 Jaccard 远低于阈值 → 目录信号判否，
+        连候选正文都不抓。"""
         cli = make_cli({'b.example.com': {'n': 100, 'titles': _generic_then('乙情节')}})
         cand = _entry('b.example.com', titles=_generic_then('乙情节'))
-        plan_fp = _plan_fp(titles=_generic_then('甲情节'))
-        self.assertEqual(self._fill(cli, cand, plan_fp=plan_fp), 'toc')
+        self.assertEqual(self._fill(cli, cand, plan=_plan_entry(titles=_generic_then('甲情节'))), 'toc')
         self.assertEqual(_content_calls(cli, 'b.example.com'), [])
 
+    def test_first_segment_uses_head_group_only(self):
+        """第 1 段窗口在书首、无近窗组：只用书首组判同（同书可过）。"""
+        cli = make_cli({'b.example.com': {'n': 100}})
+        self.assertEqual(self._fill(cli, _entry('b.example.com'),
+                                    win={'no': 1, 'start': 0}, src_win={'start': 0, 'end': 6}), '')
+
+    def test_no_reference_rejects(self):
+        """计划源无可用参照章（第 1 段 short → hits 不作参照，rvlblseg R3 重点 3）→ 书首组不可判 → 拒、不接管。"""
+        cli = make_cli({'b.example.com': {'n': 100}})
+        self.assertEqual(self._fill(cli, _entry('b.example.com'), plan_ref_hits=[]), 'body')
+
     def test_candidate_chapters_capped(self):
-        """候选源为正文信号额外抓的章数 ≤ SEG_FILL_MAX_CHAPTERS（计划源已取 7 章也只抓上限章）。"""
+        """候选源核验抓章总数（书首组 + 近窗组）≤ SEG_FILL_VERIFY_MAX，且每组 ≤ SEG_FILL_MAX_CHAPTERS。"""
         cli = make_cli({'b.example.com': {'n': 100}})
         self._fill(cli, _entry('b.example.com'))
-        self.assertEqual(len(_content_calls(cli, 'b.example.com')), labeler.SEG_FILL_MAX_CHAPTERS)
+        self.assertLessEqual(len(_content_calls(cli, 'b.example.com')), labeler.SEG_FILL_VERIFY_MAX)
 
     def test_candidate_fetch_counts_against_budget(self):
         """判同的候选抓章计入 240s 预算：剩余预算只够 2 次请求就停（_fetch_candidate_hits）。"""
         now = [0.0]
         cli = _TimedCli(now, lambda i: (10, True))    # 每次请求 10s
         cand = _entry('a.example.com')
-        labeler._fetch_candidate_hits(cli, cand, [1, 2, 3, 4], deadline=15.0, clock=lambda: now[0])
+        labeler._fetch_candidate_hits(cli, cand, [1, 2, 3, 4], deadline=15.0,
+                                      clock=lambda: now[0], ch_cache={})
         self.assertEqual(len(_content_calls(cli, 'a.example.com')), 2)
         self.assertLessEqual(now[0], 15.0)
+
+    def test_candidate_ch_cache_avoids_refetch(self):
+        """跨段复用候选抓章缓存：同章号第二次核验不再发请求。"""
+        cli = make_cli({'b.example.com': {'n': 100}})
+        caches = {}
+        cand = _entry('b.example.com')
+        self._fill(cli, cand, caches=caches)
+        n1 = len(_content_calls(cli, 'b.example.com'))
+        self._fill(cli, cand, caches=caches,
+                   win={'no': 3, 'start': 70}, src_win={'start': 70, 'end': 74})
+        self.assertEqual(len(_content_calls(cli, 'b.example.com')), n1)   # 章号 1..7 已缓存
 
     def test_names_use_douban_informative_titles(self):
         """目录章名口径 = douban_list._informative_toc_titles：纯编号/短章名/辅助条目不计。"""
