@@ -158,8 +158,9 @@ export async function downloadBook(m, args, resolveSource, transport = fetchSour
     // dlstop42：停止点 = 整本目录（与阅读器 readerstop42 / 生产打标 EngineStopUrls 同口径）。站点「下一章」
     // 链的顺序可能与目录顺序不同（cuoceng 第 N 章的 linkNext 指向目录非相邻章），只传目录下一章拦不住，
     // 会静默把几章并进一个章文件；engineFetchContent 对数组命中其中任一即停，且自动剔除本章自身（真·章内
-    // 分页不受影响）。只构造一次、循环外，逐章共享。
-    const stopUrls = manifest.chapters.map(c => c.url);
+    // 分页不受影响）。单章书保持旧口径（字符串、含本章自身）：末章「下一页」常回绕首章，单章时即回绕自身，
+    // 数组口径剔除本章后自指翻页会触发 pagination_cycle。只构造一次、循环外，逐章共享。
+    const stopUrls = manifest.chapters.length > 1 ? manifest.chapters.map(c => c.url) : manifest.chapters[0]?.url;
     for (const chapter of manifest.chapters) {
       controller.signal.throwIfAborted();
       try {
