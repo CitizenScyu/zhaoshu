@@ -1306,14 +1306,64 @@ def _split_toc_numbering(title: str) -> tuple[bool, str]:
 
     返回 `(had_numbering, name)`：`had_numbering` 表示标题前缀命中了 `_TOC_NUM_RE`
     （第X章/节/回/卷/话/集/部/篇、阿拉伯或中文数字序号、序/楔子/引子/正文/番外）；
-    `name` 是剥掉编号与标点、casefold 后剩下的章名（可能为空）。
+    `name` 是剥掉编号、尾部广告/求票后缀（_strip_toc_ad_suffix，lblsegfix42）与标点、casefold 后剩下的
+    章名（可能为空）。
     不带编号前缀的辅助条目（封推感言/更新说明/读者必看…）→ `had_numbering=False`，
     整条不参与目录比对，杜绝表外同义词打穿 Jaccard/LCS。"""
     t = unicodedata.normalize('NFKC', (title or '')).strip()
     stripped = _TOC_NUM_RE.sub('', t)
     had_numbering = stripped != t          # 前缀被 _TOC_NUM_RE 剥掉过 → 是编号章节
-    name = _TOC_PUNCT_RE.sub('', stripped).casefold()
+    name = _TOC_PUNCT_RE.sub('', _strip_toc_ad_suffix(stripped)).casefold()
     return had_numbering, name
+
+
+# ---- 章名尾部广告/求票后缀（lblsegfix42）----
+# 同一本书跨站目录逐字相同，但一侧章名尾部粘着站点广告或作者求票附言，去编号后章名不等 → 目录 Jaccard
+# 被打穿（lblsegreal42 实测：yunqi.qq.com 候选 LCS=1.0 而 Jaccard 0.02–0.27 被拒）；带「求月票」类尾巴的
+# 章还会被 _is_auxiliary_toc_name 按子串整条剔掉，两侧剔掉的不是同一批章。比对前只剥**尾部**、循环剥到
+# 不再变（「坑太多（求月票）APP免费」两层），章名中间的字不动；剥完只剩标点/空串就保留原串。
+# 每条的样例出处 = lblsegreal42-scratch/toc_cache.json 里真实目录（host《书名》章名）。
+# 表达式写 NFKC 之后的形态（全角括号/冒号/叹号已折成半角），同时列全角以防调用方未折。
+_TOC_AD_BRACKET_OPEN = r'[(（【\[『「]'
+_TOC_AD_BRACKET_BODY = r'[^()（）【】\[\]『』「」]*'
+_TOC_AD_BRACKET_CLOSE = r'[)）】\]』」]'
+_TOC_AD_SUFFIXES = (
+    # yunqi.qq.com《唐砖》「第134章 离开APP免费」、《万族之劫》「第129章 坑太多（求月票）APP免费」：
+    # 付费章标记直接粘在章名尾（同书 book.qq.com 目录无此尾巴）。
+    r'APP\s*免费',
+    # yunqi.qq.com《唐砖》「第1605章 起点填坑节，《唐砖》即将到来！更新时间：2022-11-25 15:59:10」、
+    # 《请勿高考时渡劫》「第132章 后悔之事（求月底月票）更新时间：2026-09-27 19:00:00APP免费」。
+    r'更新时间[:：]\s*\d{4}-\d{1,2}-\d{1,2}(?:\s*\d{1,2}:\d{2}(?::\d{2})?)?',
+    # 括号里的求票/订阅/致谢/加更附言：book.qq.com《万族之劫》「第6章 铁翼鸟再现（求推荐，求收藏）」
+    # 「第131章 斗智斗勇（求月票，求订阅）」「第130章 赢的人都憋屈（两万更求订阅月票）」；
+    # book.qq.com《超神机械师》「第1048章 多方行动，风云际会（感谢青宁子盟主的十万赏！）」
+    # 「第261章 进化！（感谢蓝色的大包子萌主打赏~）」（m.cuoceng.com 同书同尾）；
+    # book.qq.com《大魏宫廷》「第154章 上蔡见闻『打赏加更1/13』」。
+    _TOC_AD_BRACKET_OPEN + _TOC_AD_BRACKET_BODY
+    + r'(?:求|月票|订阅|推荐|收藏|加更|盟主|萌主|打赏|感谢)'
+    + _TOC_AD_BRACKET_BODY + _TOC_AD_BRACKET_CLOSE,
+    # 括号里的更新序号：book.qq.com《凡人修仙传》「第1855章 魔界之战 迷蜃幻境（第一更）」、
+    # 《斗破苍穹》「第321章 最后的胜利者！【迟来的第三更！抱歉！】」、《大魏宫廷》「第1138章 发难【二合一】」、
+    # 《超神机械师》「第510章 黑星归来！（二合一）」。
+    _TOC_AD_BRACKET_OPEN + _TOC_AD_BRACKET_BODY
+    + r'(?:第\s*[0-9一二三四五六七八九十两]+\s*更|[0-9二三四五两]\s*合\s*一)'
+    + _TOC_AD_BRACKET_BODY + _TOC_AD_BRACKET_CLOSE,
+)
+_TOC_AD_SUFFIX_RES = tuple(re.compile(r'(?:' + p + r')\s*$', re.I) for p in _TOC_AD_SUFFIXES)
+
+
+def _strip_toc_ad_suffix(name: str) -> str:
+    """章名（已去编号前缀）→ 剥掉尾部广告/求票后缀（_TOC_AD_SUFFIXES，循环剥到不再变）。
+
+    只动尾部；剥完去标点后为空（整条章名就是一个附言，如「（求月票）」）→ 原样返回，交给辅助条目判据。"""
+    s = (name or '').rstrip()
+    while True:
+        prev = s
+        for rx in _TOC_AD_SUFFIX_RES:
+            s = rx.sub('', s).rstrip()
+        if s == prev:
+            break
+    return s if _TOC_PUNCT_RE.sub('', s) else name
 
 
 _CN_DIGITS = {'零': 0, '〇': 0, '一': 1, '二': 2, '两': 2, '三': 3, '四': 4,
