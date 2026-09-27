@@ -297,8 +297,14 @@ export function sourceSearchUrl(
   return validate(upgradeSourceTemplateUrl(expanded), base).href;
 }
 
-/** 候选/准入阶段用：放开 host 白名单，但仍守 https/端口/userinfo/IP 红线（41-admpost F1）。 */
-const allowAnyHost: SourceUrlValidator = (value, base) => checkSourceUrl(value, base, { hostAllowed: () => true });
+/** 候选/准入阶段用：放开 host 白名单，但仍守 https/端口/userinfo/IP 红线（41-admpost F1）。
+ *  写成 function 声明而非 module-scope 箭头常量：Turbopack 16.3.5 会因「模块顶层箭头常量体里
+ *  调用 import 进来的函数」而把本模块误判进浏览器 chunking、在 `next build` 处 panic
+ *  （Failed to write app endpoint /page：does not support external modules node:async_hooks）。
+ *  语义与箭头常量完全一致，仅规避该 codegen 缺陷（41-mergeap 实测）。 */
+function allowAnyHost(value: unknown, base?: string): URL {
+  return checkSourceUrl(value, base, { hostAllowed: () => true });
+}
 
 // ---- legado searchUrl `url,{options}` 选项支持（41-postsearch，仅在 ENGINE_POST_SEARCH 开时走） ----
 export type SourceSearchMethod = 'GET' | 'POST';
