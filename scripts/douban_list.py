@@ -239,9 +239,10 @@ _AUTHOR_PUNCT_RE = re.compile(
 _AUTHOR_SUFFIX_RE = re.compile(r'(?:等著|编著|校译|校注|合著|著|译|绘|校|主编|编)$')
 # 前导国别/朝代括号段：（美）/【日】/[英]/(英)/〔清〕 等。四种括号形态都算（〔〕补入，
 # 41-authtag：古籍/政务类国别标注用它，此前不认 → 「〔清〕曹雪芹」整串归一后仍带括号）。
-# 内容限 ≤4 字：「〔清〕」「[加拿大]」≤4，而「（Stephen King）」超长不会误剥。
-_AUTHOR_LEAD_BRACKET_RE = re.compile(r'^\s*[（(【\[〔]\s*[^）)】\]〕]{0,4}\s*[）)】\]〕]')
-_AUTHOR_BRACKET_INNER_RE = re.compile(r'[（(【\[〔]\s*([^）)】\]〕]{0,4})\s*[）)】\]〕]')
+# 宽度沿用改造前的 {0,6}（`（沙特阿拉伯）某某` 这类长国名照旧能剥），**不在这里收紧**——
+# 收紧会导致既有行为回退。识别「是不是国别标注」由 `_is_region_label` 单独判（那里限 4 字）。
+_AUTHOR_LEAD_BRACKET_RE = re.compile(r'^\s*[（(【\[〔]\s*[^）)】\]〕]{0,6}\s*[）)】\]〕]')
+_AUTHOR_BRACKET_INNER_RE = re.compile(r'[（(【\[〔]\s*([^）)】\]〕]{0,6})\s*[）)】\]〕]')
 _CJK_ONLY_RE = re.compile(r'^[一-鿿]+$')
 # 单字国别/朝代缩写字（「[日]」「〔清〕」这类）。只用于**整串只剩一段标注**的识别
 # （is_single_region_label），不参与「前导标注 + 姓名」的剥离（那是结构判据）。

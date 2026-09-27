@@ -3258,6 +3258,14 @@ class TestRegionLabelAuthor(unittest.TestCase):
             with self.subTest(raw=raw):
                 self.assertEqual(douban_list.strip_region_label(raw), raw)
 
+    def test_long_country_names_still_stripped(self):
+        # 回归（防行为回退）：改造前的剥括号宽度是 {0,6}，长国名照旧能剥；
+        # 识别「是不是标注」的 4 字闸只在 is_single_region_label / _is_region_label 里
+        self.assertEqual(douban_list.strip_region_label('（沙特阿拉伯）某某'), '某某')
+        self.assertEqual(douban_list._norm_author('（乌兹别克斯坦）某某'), '某某')
+        # 超过 6 字的括注不是国别标注形态（是外文原名），照旧不剥
+        self.assertEqual(douban_list.strip_region_label('（Stephen King）某某'), '（Stephen King）某某')
+
     def test_only_region_label_is_bogus(self):
         # 整串只剩标注 ⇒ 判污染（→ 降级为名单无作者，交内容比对救回）
         for raw in ('[日]', '[日] ', '[日]　', '（美）', '〔清〕', '【法】', '（美） 著', '[清]著'):
