@@ -3392,63 +3392,102 @@ class TestCleanListAuthor(unittest.TestCase):
         self.assertTrue(douban_list.is_bogus_list_author(douban_list.clean_list_author('[日]')))
 
 
-class TestRegionBogusDowngradeEndToEnd(unittest.TestCase):
-    """端到端：《幻夜》名单作者「[日]」→ search_engine 判污染降级 → 内容比对救回 → 入库作者是真名或空，
-    绝不出现「[日]」；而「[日] 东野圭吾」这种带真名的**不得**被降级。"""
+class TestRegionBareLabelRejected(unittest.TestCase):
+    """M1（rvauthtag-41 §2）：名单作者整串只剩国别/朝代标注（[日]/〔清〕/（宋））⇒ **不收**。
+
+    这条不是「名单作者被污染」的降级——标注本身就是信息：真作者是外国人或古人，引擎源上同名
+    的中文网文作者几乎一定是**另一本**书。旧实现按污染降级为「名单无作者」、交内容比对救回，
+    会把同名异书错绑（审查反例：《幻夜》[日] vs 引擎 里拜亚鲸）。故引擎路径直接跳过不收；
+    book15 路径置空 author（保留 list_author_raw 诊断）走 review，不自动入库。"""
 
     def setUp(self):
         no_wait(self)
 
-    def _resolve(self, list_author, engine_candidates, books):
+    def _resolve(self, list_author, engine_candidates, books, title='幻夜'):
         def http_get(url):
             return NO_RESULT_HTML if url.startswith('/books/search') else '<html></html>'
         cli = _cm_cli(books, engine_candidates)
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
             queue = douban_list._resolve_candidates(
-                [{'title': '幻夜', 'author': list_author, 'douban_url': 'https://d/1'}],
+                [{'title': title, 'author': list_author, 'douban_url': 'https://d/1'}],
                 http_get, origin='测试', engine_cli=cli)
-        return queue, buf.getvalue()
+        return queue, buf.getvalue(), cli
 
-    def test_bare_region_label_downgraded_and_rescued(self):
-        # 名单【日】、两站内容同 → 降级为无作者 → 内容比对聚唯一主簇 → 采信候选真作者
+    def test_region_only_not_rescued_even_when_engine_content_matches(self):
+        # 反向断言：即便引擎上两站内容同一本书（原本必被内容比对救回），只剩标注 ⇒ 照样不收
         base_a, base_b = 'https://a.example/1', 'https://b.example/1'
         books = {base_a: _cm_book_bodies(CM_TITLES_X, CM_MULTI_X, base_a),
                  base_b: _cm_book_bodies(CM_TITLES_X_ALT, CM_MULTI_X, base_b)}
         cands = [{'source': 'a.example', 'title': '幻夜', 'author': '东野圭吾', 'bookUrl': base_a},
                  {'source': 'b.example', 'title': '幻夜', 'author': '東野圭吾', 'bookUrl': base_b}]
-        queue, out = self._resolve('[日]', cands, books)
-        self.assertIn('降级为名单无作者', out)
-        self.assertEqual(len(queue), 1)
-        entry = queue[0]
-        self.assertEqual(entry['list_author_raw'], '[日]')       # 原串只进诊断字段
-        self.assertIn(entry['author'], ('东野圭吾', '東野圭吾'))   # 采信候选作者，绝不含「[日]」
-        self.assertNotIn('[日]', entry['author'])
+        queue, out, _ = self._resolve('[日]', cands, books)
+        self.assertEqual(queue, [])                       # 不收，而不是降级救回
+        self.assertIn('国别标注名单作者拒收 1 本', out)
+        self.assertNotIn('内容比对放行', out)
 
-    def test_bare_region_label_not_passed_as_engine_author(self):
+    def test_reviewer_counterexample_region_only_vs_webnovel_author(self):
+        # rvauthtag-41 §4.1 反例：引擎源上《幻夜》唯一候选是中文网文作者（gate.log 真实出现的
+        # 里拜亚鲸）——旧代码收下这条并绑上名单身份；新代码必须拒收。〔清〕/（宋）同理。
+        base = 'https://www.example-webnovel.com/hy'
+        books = {base: _cm_book(CM_TITLES_X, CM_BODY_X, base)}
+        for raw_author, engine_author in (('[日]', '里拜亚鲸'),
+                                          ('〔清〕', '某网文作者'),
+                                          ('（宋）', '某网文作者')):
+            with self.subTest(list_author=raw_author):
+                cands = [{'source': 'www.example-webnovel.com', 'title': '幻夜',
+                          'author': engine_author, 'bookUrl': base}]
+                queue, out, _ = self._resolve(raw_author, cands, books)
+                self.assertEqual(queue, [])
+                self.assertIn('国别标注名单作者拒收 1 本', out)
+        # 对照：带真名的「[日] 东野圭吾」照旧按作者匹配走（见 test_full_name_with_region_label_*）
+
+    def test_region_only_never_reaches_engine(self):
+        # 直接跳过、不调引擎：既省一次搜索，也堵死「任何调用方拿只剩标注的名单作者走引擎」
         base = 'https://e.example/tr'
         cands = [{'source': 'e.example', 'title': '幻夜', 'author': '东野圭吾', 'bookUrl': base}]
-        def http_get(url):
-            return NO_RESULT_HTML if url.startswith('/books/search') else '<html></html>'
-        cli = _cm_cli({base: _cm_book(CM_TITLES_X, CM_BODY_X, base)}, cands)
-        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-            douban_list._resolve_candidates(
-                [{'title': '幻夜', 'author': '[日]', 'douban_url': 'https://d/1'}],
-                http_get, origin='测试', engine_cli=cli)
-        search_args = next(a for sub, a in cli.calls if sub == 'search')
-        self.assertNotIn('--author', search_args)
+        queue, out, cli = self._resolve('[日]', cands, {base: _cm_book(CM_TITLES_X, CM_BODY_X, base)})
+        self.assertEqual(queue, [])
+        self.assertFalse(any(sub == 'search' for sub, _ in cli.calls))
+
+    def test_search_engine_rejects_region_only_author(self):
+        # 纵深防御：search_engine 自身也拒（labeler 等直接调用方不会绕过 _resolve_candidates）
+        cands = [{'source': 'e.example', 'title': '幻夜', 'author': '东野圭吾',
+                  'bookUrl': 'https://e.example/tr'}]
+        cli = _cm_cli({}, cands)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            hit = douban_list.search_engine(cli, '幻夜', '[日]')
+        self.assertIsNone(hit)
+        self.assertIn('拒绝引擎兜底', buf.getvalue())
+        self.assertFalse(any(sub == 'search' for sub, _ in cli.calls))
 
     def test_full_name_with_region_label_is_not_downgraded(self):
-        # 红线：带真名的「[日] 东野圭吾」不降级，直接按作者匹配收
+        # 红线反例：带真名的「[日] 东野圭吾」不受影响，直接按作者匹配收
         base = 'https://f.example/x'
         cands = [{'source': 'f.example', 'title': '幻夜', 'author': '东野圭吾', 'bookUrl': base}]
-        queue, out = self._resolve('[日] 东野圭吾', cands, {})
-        self.assertNotIn('降级为名单无作者', out)
+        queue, out, _ = self._resolve('[日] 东野圭吾', cands, {})
+        self.assertNotIn('拒收', out)
         self.assertEqual(len(queue), 1)
         self.assertEqual(queue[0]['author'], '东野圭吾')          # 清洗后存真名（剥掉国别标注）
 
-    def test_bare_region_label_survives_book15_path(self):
-        # book15 命中路径同样享受降级：条目 author 置空 + 原串进 list_author_raw
+    def test_engine_off_path_unchanged(self):
+        # 红线：engine_cli=None（开关关闭）时本函数行为逐字不变——bare region label 不走
+        # 「拒收」分支，照旧归入 miss（那条路径本来也不收，只是汇总口径不变）
+        def http_get(url):
+            return NO_RESULT_HTML
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
+            queue = douban_list._resolve_candidates(
+                [{'title': '幻夜', 'author': '[日]', 'douban_url': 'https://d/1'}],
+                http_get, origin='测试')
+        self.assertEqual(queue, [])
+        self.assertNotIn('拒收', buf.getvalue())
+        self.assertIn('未命中 1 本', buf.getvalue())
+
+    def test_bare_region_label_book15_path_goes_review(self):
+        # book15 命中路径：查得到书但不自动入库——author 置空（import 按空作者判 review），
+        # 原串仅进 list_author_raw 诊断（不把「[日]」当作者写进去）
         html = book15_search_html('幻夜', '/books/details1.html')
         def http_get(url):
             return html if url.startswith('/books/search') else '<html></html>'
@@ -3459,6 +3498,8 @@ class TestRegionBogusDowngradeEndToEnd(unittest.TestCase):
         self.assertEqual(len(queue), 1)
         self.assertEqual(queue[0]['author'], '')
         self.assertEqual(queue[0]['list_author_raw'], '[日]')
+        # 不写 author_source：这条书**没**被内容比对救回，入库由 import 判 review
+        self.assertNotIn('author_source', queue[0])
 
 
 class TestTitleTraditionalFold(unittest.TestCase):

@@ -342,19 +342,20 @@ def _is_region_label(inner: str) -> bool:
 
 
 def is_single_region_label(s: str) -> bool:
-    """整串是否**只剩国别/朝代标注**（没有任何姓名）→ 判「名单作者被污染」，降级为无作者。
+    """整串是否**只剩国别/朝代标注**（没有任何姓名）——这类名单作者**不可作收书依据**。
 
     为什么必须单独判：`_norm_author('[日]')` 的剥括号步骤有「剥后剩余非空才剥」的护栏
     （那条护栏是给「（佚名）」留的），于是整串只有标注时括号会被标点层吃掉、**残留单字
     「日」**——一个看似完全合法的作者名，既不空、也不占位、也不被判污染，拿去和引擎作者
-    严格相等必然不匹配 → 整本被拦（deploylbl41c-report §5 补核二 #1/#2：《幻夜》[日]、
-    《魔戒》[英]）。
+    严格相等必然不匹配。
 
-    处置：交 search_engine 走既有的**作者污染降级**路径（_annotate_bogus → 条目
-    author 置空/采信候选作者 + list_author_raw 仅存诊断），让内容比对接手，
-    而不是拿「[日]」去和引擎作者比。
+    M1（审查裁定）：判真后**既不降级为「名单无作者」、也不拿去比对**，而是当作「这本书的作者
+    身份未知，但**确定不是引擎源上的那个中文网文作者**」——直接不收（引擎路径跳过、
+    book15 路径置空走 review，见 `_resolve_candidates` / `search_engine`）。早先的「降级为
+    无作者、交内容比对救回」是错的：标注说明真作者是外国人或古人，引擎源上同名的中文网文
+    作者几乎一定是**另一本**书（审查反例：《幻夜》[日] vs 引擎 里拜亚鲸）。
 
-    边界（防误降级）：整串只能是一段括号标注（尾随署名尾缀除外）且内容是国别/朝代
+    边界（防误判）：整串只能是一段括号标注（尾随署名尾缀除外）且内容是国别/朝代
     标注（见 _is_region_label）。故「[英] J.R.R.托尔金」「（美）乔治·R·R·马丁」
     「天蚕土豆（土豆）」「（佚名）」都不算（括号外还有名字，或括号内不是标注）。"""
     text = (s or '').strip()
@@ -410,7 +411,7 @@ def _norm_author(s: str) -> str:
       前导国别标注改用 strip_region_label 循环剥（支持叠段、〔〕、段尾带「著」）；
       尾部「著 + 译者名 + 译」结构先剥掉（译者不是作者）。
       整串只剩标注（`[日]`/`〔清〕`）**不在这里判空**——那会让两端都变成空串而误判相等；
-      由 search_engine 用 is_single_region_label 降级为「名单无作者」（见调用点）。"""
+      由 is_single_region_label 识别后**直接拒收**（引擎路径跳过 / book15 路径置空走 review）。"""
     text = (s or '').casefold()
     text = re.sub(r'&[a-zA-Z]+;', '·', text)      # &middot; 等实体 → 分隔符
     # 前导「作者：」标签：先于括号段与标点剥离（「作者：（美）乔治」→「（美）乔治」→…；
@@ -629,8 +630,9 @@ def clean_list_author(value: str) -> str:
       尾部「著 + 译者名 + 译」的译者段（`_strip_trailing_translators`）；
       尾部单字署名角色（`_AUTHOR_SUFFIX_RE`：著/译/绘/校/编…），与 labeler._clean_engine_author
       对引擎作者做的是同一件事。
-    整串只剩标注（`[日]`）时原样返回，由 `is_bogus_list_author` 判污染后置空（见
-    _resolve_candidates），绝不让「[日]」流进 labels.jsonl。
+    整串只剩标注（`[日]`）时原样返回，由 `is_single_region_label` 识别后**直接拒收**（引擎
+    路径跳过 / book15 路径置空走 review，见 _resolve_candidates / search_engine），
+    绝不让「[日]」流进 labels.jsonl。
 
     为什么写清洗后的真名（而非原串）：入库身份键是 (title_key, author_key)，SQL 侧的
     author_key 只做 lower+btrim+NFKC，不剥国籍段——原串「[日] 东野圭吾」与真名「东野圭吾」
@@ -646,11 +648,6 @@ def clean_list_author(value: str) -> str:
         if stripped == cleaned or not stripped:
             break
         cleaned = stripped
-    return cleaned or s
-    s = (value or '').strip()
-    if not s:
-        return ''
-    cleaned = _strip_trailing_translators(strip_region_label(s)).strip()
     return cleaned or s
 
 
@@ -1079,13 +1076,22 @@ def search_engine(cli, title: str, author: str = '',
     espfix41：恒带 --no-builtin（book15 已由 search_book15 搜过或已熔断，其候选这里本来就跳过，
     CLI 里再搜一遍是纯浪费——book15 宕机时单这一步就 2×8s）；junk（可选）已判垃圾的 host 经
     --skip-host 跳过，本次候选再喂给 junk.observe 继续识别。"""
-    # authcv41 §7/M3 + 41-authtag：名单作者字段被污染（分类名/出版社/只剩国别标注）→ 降级为
-    # 名单无作者，交内容聚类救回（《幻夜》[日]、《魔戒》[英]）。放在组 args 之前，故也不会把
-    # 污染值当 --author 传给引擎搜索。bogus_raw 透出到返回 hit，由 _resolve_candidates 据此
-    # 把队列条目 author 置空/采信候选作者，绝不让污染串流到 labeler。
+    # authcv41 §7/M3：名单作者字段被污染（分类名/出版社）→ 降级为名单无作者，交内容聚类救回。
+    # 放在组 args 之前，故也不会把污染值当 --author 传给引擎搜索。bogus_raw 透出到返回 hit，由
+    # _resolve_candidates 据此把队列条目 author 置空/采信候选作者，绝不让污染串流到 labeler。
+    # （「只剩国别标注」是**另一类**，见下方 M1 分支，不降级。）
     bogus_raw = ''
+    # M1（审查必修）：整串只剩国别/朝代标注（[日]/〔清〕/（宋））⇒ **不降级、直接拒**。
+    # 标注说明真作者是外国人或古人；引擎源上同名的中文网文作者几乎一定是**另一本**书，降级后
+    # 交内容比对救回会把同名异书错绑（审查反例：《幻夜》[日] vs 引擎 里拜亚鲸）。旧行为本就是
+    # 「作者不符跳过」，本判据把它恢复成确定拒收——结构上堵死：任何调用方拿只剩标注的名单作者
+    # 走引擎都收不到东西。（_resolve_candidates 另在调用前直接跳过，省一次引擎开销。）
+    if author and is_single_region_label(author):
+        print(f'  名单作者只剩国别/朝代标注（{author}），疑同名异书，拒绝引擎兜底: 《{title}》'
+              f'（拒收原因 list_author_bare_region_label）')
+        return None
     if author and is_bogus_list_author(author):
-        print(f'  名单作者疑似污染（分类/出版社/国别标注），降级为名单无作者: 《{title}》原作者字段「{author}」')
+        print(f'  名单作者疑似污染（分类名/出版社），降级为名单无作者: 《{title}》原作者字段「{author}」')
         bogus_raw = author
         author = ''
     args = ['--title', title]
@@ -2012,6 +2018,7 @@ def _resolve_candidates(candidates: list[dict], http_get, origin: str = '',
     skipped = 0
     book15_hits = 0
     engine_hits = 0
+    bare_region_rejected = 0
     engine_stats: dict = {}
     engine_junk = EngineJunkTracker() if engine_cli is not None else None
     engine_disabled = False
@@ -2021,15 +2028,27 @@ def _resolve_candidates(candidates: list[dict], http_get, origin: str = '',
             skipped += 1
             continue
         # 41-authtag：名单作者先清洗（剥前导国别/朝代标注 + 尾部译者段）再进任何一条路径。
-        # 清洗后仍被判污染（分类/出版社/只剩国别标注，如《幻夜》[日]）⇒ 条目作者置空、
-        # 原串只进 list_author_raw 供诊断，绝不让污染串流到 labeler/入库（同 M3 口径）。
-        list_author = clean_list_author(b.get('author', ''))
-        list_author_bogus = is_bogus_list_author(list_author)
+        # 清洗后仍被判污染（分类名/出版社）⇒ 条目作者置空、原串只进 list_author_raw 供诊断，
+        # 绝不让污染串流到 labeler/入库（同 M3 口径）。
+        #
+        # M1（审查必修）：**整串只剩国别/朝代标注**（[日]/〔清〕/（宋））另作一类，**不降级**。
+        # 标注本身就是信息——说明真作者是外国人或古人；引擎源上同名的中文网文作者几乎一定是
+        # **另一本**书。此前按「名单作者污染」降级为无作者、交内容比对救回，会把同名的另一本
+        # 错绑（审查反例：《幻夜》[日] vs 引擎 里拜亚鲸）。处置：
+        #   book15 命中 —— 条目 author 置空（无引擎 toc 回写，import 按空作者判 review），
+        #                  原串仅进 list_author_raw 诊断；
+        #   引擎兜底   —— 整本**不收**（下方 bare_region_label 分支直接跳过，不调引擎）。
+        raw_author = b.get('author', '')
+        list_author = clean_list_author(raw_author)
+        bare_region_label = is_single_region_label(list_author)
+        list_author_bogus = is_bogus_list_author(list_author) and not bare_region_label
         if list_author_bogus:
             # 降级日志（口径与 search_engine 内那段一致，便于两侧测试与运维日志互认）
-            print(f'  名单作者疑似污染（分类/出版社/国别标注），降级为名单无作者: '
-                  f'《{b.get("title", "")}》原作者字段「{b.get("author", "")}」')
+            print(f'  名单作者疑似污染（分类名/出版社），降级为名单无作者: '
+                  f'《{b.get("title", "")}》原作者字段「{raw_author}」')
             list_author = ''          # 交引擎按「名单无作者」走歧义护栏/内容比对
+        elif bare_region_label:
+            list_author = ''          # book15 路径置空走 review（引擎路径另行直接跳过）
         # espfix41：book15 已熔断 ⇒ 本本不会请求 book15，SEARCH_DELAY（对 book15 的礼貌间隔）不再睡；
         # 引擎 CLI 内部自带按请求节流，且每本新起进程本身就隔开了对同站的两次搜索。
         book15_skipped = book15_breaker is not None and book15_breaker.open
@@ -2040,13 +2059,26 @@ def _resolve_candidates(candidates: list[dict], http_get, origin: str = '',
                      'category': origin or b.get('origin', ''),
                      'status': '',
                      'douban_url': b.get('douban_url', '')}
-            if list_author_bogus:
-                entry['list_author_raw'] = b.get('author', '')
+            if bare_region_label or list_author_bogus:
+                entry['list_author_raw'] = raw_author
             queue.append(entry)
             book15_hits += 1
             time.sleep(SEARCH_DELAY)
             continue
         # book15 miss：开关开启且引擎未被禁用时回落引擎源池
+        # M1（审查必修）：名单作者整串只剩国别/朝代标注（[日]/〔清〕/（宋））⇒ 引擎路径**不收**。
+        # 降级为「名单无作者」再交内容比对救回，会把引擎源上同名的**另一本**中文网文错绑（审查
+        # 反例：《幻夜》[日] vs 引擎 里拜亚鲸）。book15 未命中已说明本库没有；此处直接跳过、不调
+        # 引擎，避免花代价换来错绑。拒收原因写进日志（list_author_bare_region_label）。
+        # 只在 engine_cli 非空时生效：开关关闭时本函数行为逐字不变（红线）——那条路径本就不收，
+        # 只是归入 miss 汇总。
+        if bare_region_label and engine_cli is not None:
+            bare_region_rejected += 1
+            print(f'  名单作者只剩国别/朝代标注（{raw_author}），疑同名异书，引擎兜底不收: '
+                  f'《{b.get("title", "")}》（拒收原因 list_author_bare_region_label）')
+            if not book15_skipped:
+                time.sleep(SEARCH_DELAY)
+            continue
         engine_hit = None
         if engine_cli is not None and not engine_disabled:
             try:
@@ -2070,10 +2102,10 @@ def _resolve_candidates(candidates: list[dict], http_get, origin: str = '',
                      'source_host': engine_hit['source']}
             # M3：名单作者被污染而降级的条目——author 绝不能是污染原串。原串仅存 list_author_raw
             # 供诊断；此处 author 取内容比对/唯一候选采信的候选作者（无则空，交 labeler toc 回写/review）。
-            # 41-authtag：判污染的时机上移到本函数开头（清洗后判），book15 命中路径同样享受；
-            # 故这里用 list_author_bogus 而非 engine_hit 的标记，两条路径口径一致。
+            # 41-authtag：判污染的时机上移到本函数开头（清洗后判）；M1 后只剩国别标注的条目已
+            # 在此之前直接跳过，故这里只剩「分类名/出版社」这一类。
             if list_author_bogus:
-                entry['list_author_raw'] = engine_hit.get('list_author_raw') or b.get('author', '')
+                entry['list_author_raw'] = engine_hit.get('list_author_raw') or raw_author
                 entry['author'] = engine_hit.get('author') or ''
             # §14 审计标记：经内容比对救回（作者不符/无作者被内容比对放行）的条目打标，
             # 供日后按标记抽查与回滚。诊断字段不入库表——import 两条路径（import_one.validate_record /
@@ -2097,8 +2129,11 @@ def _resolve_candidates(candidates: list[dict], http_get, origin: str = '',
     # 未熔断时本行逐字不变；熔断后补一段「熔断跳过 book15 搜索 N 本」。
     breaker_note = (f'，book15 熔断跳过搜索 {book15_breaker.skipped} 本'
                     if book15_breaker is not None and book15_breaker.open else '')
+    # M1：只剩国别标注的条目在引擎兜底前直接拒收；有拒收才补这一段（无则本行逐字不变）。
+    region_note = (f'，国别标注名单作者拒收 {bare_region_rejected} 本'
+                   if bare_region_rejected else '')
     print(f'book15 命中 {book15_hits} 本，未命中 {len(miss)} 本，'
-          f'跳过已打标 {skipped} 本{engine_note}{breaker_note}'
+          f'跳过已打标 {skipped} 本{engine_note}{breaker_note}{region_note}'
           f'{"（" + "、".join(miss[:10]) + ("…" if len(miss) > 10 else "") + "）" if miss else ""}')
     return queue
 
