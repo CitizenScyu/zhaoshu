@@ -259,7 +259,7 @@ describe('下载器逐章停止点 = 整本目录（dlstop42）', () => {
   const source = { url: 'https://book15.net/cc/', name: 'cuoceng 同型', searchUrl: 'https://book15.net/cc/so/{{key}}.html', rules };
   const chapter = (n: number) => `https://book15.net/cc/b/${n}.html`;
   const tocPage = (ns: number[]) => ns.map(n => `<li class="chapter"><a href="/cc/b/${n}.html">第${n}章</a></li>`).join('');
-  const body = (text: string, next: string | undefined) =>
+  const body = (text: string, next?: string) =>
     `<div id="content">${text}</div>` + (next === undefined ? '' : `<a id="linkNext" href="${next}">下一章</a>`);
 
   /** 夹具书:目录序 [0,1,2,3,4],正文页「下一章」链 0→3→2→4→(无)。第 0 章的下一章链指向目录第 3 章(非相邻)。 */
