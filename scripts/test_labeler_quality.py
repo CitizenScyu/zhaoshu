@@ -359,6 +359,135 @@ class TestEngineStopUrls(unittest.TestCase):
             self.assertEqual(args[2:], ('--stop-urls-file', cli.path))
 
 
+class TestEngineStopUrlsPerHost(unittest.TestCase):
+    """stophost42：跨源补段时主源/备选源交替取 toc，停止点按章节 host 各记一份。"""
+    A = ['https://m.cuoceng.com/b/0.html', 'https://m.cuoceng.com/b/1.html']
+    B = ['https://www.biquge.example/9/0.html', 'https://www.biquge.example/9/1.html']
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.tocs = {}                                        # toc url → 章节 URL 列表
+
+    def _handler(self, sub, args):
+        if sub == 'toc':
+            return _proc(0, _toc_json(self.tocs[args[1]]))
+        if sub == 'content' and '--stop-urls-file' in args and self.old_cli:
+            return _proc(2, '', '未知参数：--stop-urls-file')
+        return _proc(0, '{"text": "x"}')
+
+    def _wrap(self, old_cli=False):
+        self.old_cli = old_cli
+        inner = RecordingCli(self._handler)
+        return inner, labeler.EngineStopUrls(inner, directory=self.tmp.name)
+
+    def _stop_file(self, inner):
+        args = inner.calls[-1][1]
+        return args[args.index('--stop-urls-file') + 1] if '--stop-urls-file' in args else None
+
+    def test_back_to_earlier_source_keeps_its_stop_file(self):
+        self.tocs = {'https://m.cuoceng.com/b.html': self.A, 'https://www.biquge.example/9/': self.B}
+        inner, cli = self._wrap()
+        cli.run('toc', '--url', 'https://m.cuoceng.com/b.html')
+        cli.run('toc', '--url', 'https://www.biquge.example/9/')
+        cli.run('content', '--url', self.A[1])
+        a_file = self._stop_file(inner)
+        self.assertIsNotNone(a_file)
+        self.assertEqual(Path(a_file).read_text(encoding='utf-8').split(), self.A)
+        self.assertEqual(cli.path, a_file)                   # path=最近用到的 host 的文件
+        cli.run('content', '--url', self.B[0])
+        b_file = self._stop_file(inner)
+        self.assertNotEqual(a_file, b_file)
+        self.assertEqual(Path(b_file).read_text(encoding='utf-8').split(), self.B)
+
+    def test_same_host_second_toc_wins(self):
+        a2 = ['https://m.cuoceng.com/c/0.html', 'https://m.cuoceng.com/c/1.html']
+        self.tocs = {'https://m.cuoceng.com/b.html': self.A, 'https://m.cuoceng.com/c.html': a2}
+        inner, cli = self._wrap()
+        cli.run('toc', '--url', 'https://m.cuoceng.com/b.html')
+        cli.run('toc', '--url', 'https://m.cuoceng.com/c.html')
+        cli.run('content', '--url', self.A[0])
+        self.assertIsNone(self._stop_file(inner))             # 旧目录的章不再带
+        cli.run('content', '--url', a2[0])
+        self.assertEqual(Path(self._stop_file(inner)).read_text(encoding='utf-8').split(), a2)
+        self.assertEqual(len(os.listdir(self.tmp.name)), 1)   # 同 host 复用一个文件
+
+    def test_toc_spanning_hosts_is_split_by_chapter_host(self):
+        self.tocs = {'https://m.cuoceng.com/b.html': [self.A[0], self.B[0]]}
+        inner, cli = self._wrap()
+        cli.run('toc', '--url', 'https://m.cuoceng.com/b.html')
+        cli.run('content', '--url', self.B[0])
+        self.assertEqual(Path(self._stop_file(inner)).read_text(encoding='utf-8').split(), [self.B[0]])
+        cli.run('content', '--url', self.A[0])
+        self.assertEqual(Path(self._stop_file(inner)).read_text(encoding='utf-8').split(), [self.A[0]])
+
+    def test_lru_evicts_least_recently_used_host_and_deletes_file(self):
+        n = labeler.EngineStopUrls.MAX_HOSTS + 1
+        self.assertEqual(n, 33)
+        chap = [f'https://h{i}.example/b/0.html' for i in range(n)]
+        self.tocs = {f'https://h{i}.example/b.html': [chap[i]] for i in range(n)}
+        inner, cli = self._wrap()
+        for i in range(n - 1):
+            cli.run('toc', '--url', f'https://h{i}.example/b.html')
+        cli.run('content', '--url', chap[0])                  # h0 被用过 → 最久未用变成 h1
+        h0_file = self._stop_file(inner)
+        cli.run('content', '--url', chap[1])
+        h1_file = self._stop_file(inner)
+        cli.run('content', '--url', chap[0])                  # 再用一次 h0，最久未用是 h2
+        cli.run('toc', '--url', f'https://h{n - 1}.example/b.html')
+        self.assertEqual(len(os.listdir(self.tmp.name)), 32)
+        cli.run('content', '--url', chap[2])
+        self.assertIsNone(self._stop_file(inner))             # h2 被淘汰
+        for i in (0, 1, n - 1):
+            cli.run('content', '--url', chap[i])
+            self.assertIsNotNone(self._stop_file(inner))
+        self.assertTrue(os.path.exists(h0_file) and os.path.exists(h1_file))
+        files = {os.path.join(self.tmp.name, f) for f in os.listdir(self.tmp.name)}
+        self.assertEqual(len(files), 32)
+        cli._cleanup()
+        self.assertEqual(os.listdir(self.tmp.name), [])
+
+    def test_evicted_file_is_deleted(self):
+        n = labeler.EngineStopUrls.MAX_HOSTS + 1
+        chap = [f'https://h{i}.example/b/0.html' for i in range(n)]
+        self.tocs = {f'https://h{i}.example/b.html': [chap[i]] for i in range(n)}
+        inner, cli = self._wrap()
+        cli.run('toc', '--url', 'https://h0.example/b.html')
+        cli.run('content', '--url', chap[0])
+        h0_file = self._stop_file(inner)
+        for i in range(1, n):
+            cli.run('toc', '--url', f'https://h{i}.example/b.html')
+        self.assertFalse(os.path.exists(h0_file))
+        cli.run('content', '--url', chap[0])
+        self.assertIsNone(self._stop_file(inner))
+
+    def test_old_cli_degrades_across_hosts(self):
+        self.tocs = {'https://m.cuoceng.com/b.html': self.A, 'https://www.biquge.example/9/': self.B}
+        inner, cli = self._wrap(old_cli=True)
+        cli.run('toc', '--url', 'https://m.cuoceng.com/b.html')
+        cli.run('toc', '--url', 'https://www.biquge.example/9/')
+        with contextlib.redirect_stderr(io.StringIO()):
+            first = cli.run('content', '--url', self.A[0])
+            cli.run('content', '--url', self.B[0])
+        self.assertEqual(first.returncode, 0)
+        self.assertFalse(cli.supported)
+        contents = [c[1] for c in inner.calls if c[0] == 'content']
+        self.assertEqual(len(contents), 3)                    # 带停止点一次被拒 + 重试 + B 不再带
+        self.assertIn('--stop-urls-file', contents[0])
+        self.assertEqual(contents[1:], [('--url', self.A[0]), ('--url', self.B[0])])
+
+    def test_url_not_in_any_list_has_no_stop(self):
+        self.tocs = {'https://m.cuoceng.com/b.html': self.A}
+        inner, cli = self._wrap()
+        self.assertIsNone(cli.path)
+        cli.run('toc', '--url', 'https://m.cuoceng.com/b.html')
+        for url in ('https://m.cuoceng.com/b/99.html', 'https://other.example/0.html', 'not a url'):
+            cli.run('content', '--url', url)
+            self.assertIsNone(self._stop_file(inner))
+        cli.run('search', '--title', '鬼吹灯')
+        self.assertEqual(inner.calls[-1], ('search', ('--title', '鬼吹灯')))
+
+
 class TestMainPrecheck(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
