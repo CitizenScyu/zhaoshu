@@ -1161,6 +1161,142 @@ class TestFirstSegmentShortChapters(_NoSleep):
             (False, 'short'))
 
 
+# ---- lblsegfix42：付费墙计划源换锚补段 ----
+# 真书形态（lblsegreal42）：计划源 book.qq.com 第 1 段免费，后段章正文是 ~197 字预览（is_preview_body 命中），
+# 窗口内与向前探 4 章都拿不到可判参照 → ref_mode='reject'。换锚：在计划源可读区与计划源正文判同成立的候选作锚，
+# 另过防护 B（窗口目录有序一致）与 C（锚段首/末章开头 vs 计划源同章号预览开头）。
+_HEAD_POOL = sorted(set(''.join(_PLOT + _OTHER)) - set('。'))
+
+
+def _seeded_head(seed: int, i: int, n: int = 150) -> str:
+    """章开头 n 字：按 (书, 章) 伪随机排字 → 4-gram 几乎全唯一（预览探针可比，异书/异章几乎不重合）。"""
+    return ''.join(_HEAD_POOL[(seed * 131 + i * 977 + k * k * 31 + k * 7) % len(_HEAD_POOL)]
+                   for k in range(n))
+
+
+def _headed_body(seed: int, pool_body):
+    """正文 = 伪随机开头 150 字 + 。 + 原夹具正文（逐章各异、同书跨源一致）。"""
+    return lambda i: _seeded_head(seed, i) + '。' + pool_body(i, 3000 - 151)
+
+
+_BOOK_A = _headed_body(1, _book_body)       # 本书
+_BOOK_X = _headed_body(2, _other_body)      # 另一本书（开头与正文都不同）
+
+
+def _paywall(body, free_upto: int = 10):
+    """计划源付费墙：前 free_upto 章全文，其后每章只给开头 150 字 + 省略号（形如 book.qq.com 预览）。"""
+    return lambda i: body(i) if i < free_upto else body(i)[:150] + '……'
+
+
+class TestAnchorFill(_NoSleep):
+    """换锚补段端到端：正例、无锚拒补、锚源后段换书（目录换 / 正文换）被拦、计划源 4xx 无预览 → 拒。"""
+
+    def _run(self, b_spec, a_body=None):
+        cli = make_cli({
+            'a.example.com': {'n': 100, 'body': a_body or _paywall(_BOOK_A)},
+            'b.example.com': {'n': 100, **b_spec},
+        })
+        text, chars, used, sampling, _ = _fetch(cli, _book(alternates=['b.example.com']))
+        return cli, text, used, {s['no']: s for s in sampling['segments']}
+
+    def test_anchor_fills_paywalled_segments(self):
+        """正例：a 只有前 10 章可读（第 1 段读 ch1–7），后段全是预览 → 窗口内 + 向前 4 章皆预览 → reject；
+        b 在 a 可读区 ch4–7 过全称与门 → 作锚补第 2/3/4 段，记录 ref=anchor、ref_src=b、参照章号与预览核对章号。"""
+        cli, text, used, segs = self._run({'body': _BOOK_A})
+        self.assertEqual(segs[1]['source'], 'a.example.com')
+        self.assertEqual(segs[1]['ref_src'], 'https://a.example.com/book')
+        for no in (2, 3, 4):
+            self.assertEqual((segs[no]['source'], segs[no].get('ref'), segs[no]['ref_src']),
+                             ('b.example.com', 'anchor', 'https://b.example.com/book'), no)
+            self.assertEqual(segs[no]['ref_nums'], [4, 5, 6, 7], no)   # 计划源可读区以 L=ch7 收尾
+            self.assertTrue(segs[no]['head_nums'], no)                # 防护 C 核对过计划源预览
+            self.assertIn('b.example.com:identity_body', segs[no]['tried'])
+        self.assertEqual(used['url'], 'https://a.example.com/book')    # 记录源恒为计划源
+        self.assertNotIn('【第 2 段：未取到】', text)
+
+    def test_no_anchor_rejects(self):
+        """无锚拒补：b 同名、目录一致，但正文是另一本书 → 在 a 可读区判否 → 不作锚，第 2/3/4 段 MISSING。"""
+        cli, text, used, segs = self._run({'body': _BOOK_X})
+        for no in (2, 3, 4):
+            self.assertTrue(segs[no].get('missing'), no)
+        self.assertIn('b.example.com:anchor_body', segs[2]['tried'])
+        self.assertNotIn('女帝苏璃', text)
+        # b 只被抓锚核验的 ≤SEG_FILL_MAX_CHAPTERS 章（缓存跨段复用），从未抓它的段窗口
+        self.assertEqual(len(_content_calls(cli, 'b.example.com')), labeler.SEG_FILL_MAX_CHAPTERS)
+
+    def test_anchor_switching_toc_later_blocked(self):
+        """锚源后段换书（目录也换）：b 前 90 章 = 本书，ch91 起目录与正文都是另一本书（整本目录仍判同：
+        换书部分只占 10%）→ 第 2/3 段照常换锚补，第 4 段被防护 B（窗口目录有序一致）拦下 → MISSING，
+        另一本书正文绝不进送模文本。"""
+        cli, text, used, segs = self._run({
+            'titles': lambda i: _chapter_title(i) if i < 90 else f'第{i + 1}章 别的故事{i:04d}',
+            'body': lambda i: _BOOK_A(i) if i < 90 else _BOOK_X(i)})
+        for no in (2, 3):
+            self.assertEqual((segs[no]['source'], segs[no].get('ref')), ('b.example.com', 'anchor'), no)
+        self.assertTrue(segs[4].get('missing'))
+        self.assertIn('b.example.com:anchor_toc_window', segs[4]['tried'])
+        self.assertNotIn('女帝苏璃', text)
+
+    def test_anchor_switching_body_later_blocked(self):
+        """锚源后段换书（目录不变、正文换）：目录层面（防护 B、段位置标题核对）看不出 → 由防护 C 拦：
+        锚段首/末章开头与计划源同章号预览开头不符 → 弃，第 3/4 段 MISSING。"""
+        cli, text, used, segs = self._run({'body': lambda i: _BOOK_A(i) if i < 70 else _BOOK_X(i)})
+        self.assertEqual((segs[2]['source'], segs[2].get('ref')), ('b.example.com', 'anchor'))
+        for no in (3, 4):
+            self.assertTrue(segs[no].get('missing'), no)
+            self.assertIn('b.example.com:anchor_head', segs[no]['tried'])
+        self.assertNotIn('女帝苏璃', text)
+
+    def test_anchor_switch_mid_segment_caught_by_last_chapter(self):
+        """送模区间中途换书：b 从第 3 段窗口第 3 章（ch73）起正文换书 → 首章开头仍对得上，末章对不上 → 弃。"""
+        cli, text, used, segs = self._run({'body': lambda i: _BOOK_A(i) if i < 72 else _BOOK_X(i)})
+        self.assertTrue(segs[3].get('missing'))
+        self.assertIn('b.example.com:anchor_head', segs[3]['tried'])
+        self.assertNotIn('女帝苏璃', text)
+
+    def test_plan_4xx_without_preview_rejects(self):
+        """计划源后段直接 4xx（无预览可比）：锚核验虽过，防护 C 无探针 → 不可判一律拒，且不抓锚段正文。"""
+        cli, text, used, segs = self._run(
+            {'body': _BOOK_A}, a_body=lambda i: _BOOK_A(i) if i < 10 else None)
+        for no in (2, 3, 4):
+            self.assertTrue(segs[no].get('missing'), no)
+            self.assertIn('b.example.com:anchor_head_noref', segs[no]['tried'])
+        self.assertEqual(len(_content_calls(cli, 'b.example.com')), labeler.SEG_FILL_MAX_CHAPTERS)
+
+    def test_no_readable_reference_is_noref(self):
+        """计划源可读区为空（连第 1 段都没读到可判章）→ anchor_identity 返回 noref，不作锚。"""
+        why, nums = labeler.anchor_identity(
+            make_cli({}), _plan_entry(), _entry('b.example.com'), float('inf'),
+            caches={}, plan_ch_cache={40: '预览' * 60 + '……'})
+        self.assertEqual((why, nums), ('noref', []))
+
+
+class TestAnchorWindowToc(unittest.TestCase):
+    """防护 B：按章名对齐后比窗口目录；两站目录条数略有出入（窗口起点错开）不误拒，换书 / 对不齐一律拒。"""
+
+    WIN = {'no': 3, 'start': 70, 'end': 90}
+
+    def test_same_toc(self):
+        self.assertTrue(labeler._anchor_window_toc_ok(
+            _plan_entry()['chapters'], self.WIN, _entry('b.example.com')['chapters']))
+
+    def test_offset_toc_aligned_by_name(self):
+        """锚源目录多 5 条（前面多了卷首语类条目）→ 按首个信息性章名对齐，仍判一致。"""
+        shifted = [{'title': f'卷首语{k}', 'url': f'https://b/x{k}'} for k in range(5)] \
+            + _entry('b.example.com')['chapters']
+        self.assertTrue(labeler._anchor_window_toc_ok(_plan_entry()['chapters'], self.WIN, shifted))
+
+    def test_switched_toc_rejected(self):
+        other = _entry('b.example.com', titles=lambda i: _chapter_title(i) if i < 75
+                       else f'第{i + 1}章 别的故事{i:04d}')['chapters']
+        self.assertFalse(labeler._anchor_window_toc_ok(_plan_entry()['chapters'], self.WIN, other))
+
+    def test_numbered_only_window_rejected(self):
+        plan = _plan_entry(titles=lambda i: _numbered_title(i) if i >= 70 else _chapter_title(i))
+        self.assertFalse(labeler._anchor_window_toc_ok(
+            plan['chapters'], self.WIN, _entry('b.example.com')['chapters']))
+
+
 class TestNormalizeArc(unittest.TestCase):
     Q1 = '萧炎舔了舔嘴唇迟疑了一下方才缓缓的道'
     Q3 = '你们一次又一次的震，震了天上，震地下'
