@@ -39,6 +39,8 @@ export const ROUTE_EXTENSIONS = ['tsx', 'ts', 'jsx', 'js'];
 export const CROSS_FILE_BUDGETS = [
   // refreshShuyuan() 整份刷新共用这一预算，cron 与 owner 手动刷新都走 GET /api/shuyuan。
   { route: 'src/app/api/shuyuan/route.ts', file: 'src/lib/shuyuan.ts', name: 'REFRESH_BUDGET_MS' },
+  // 42-admbudget：runAdmissionRound() 独立准入轮的整份预算，cron 走 GET /api/shuyuan/admission。
+  { route: 'src/app/api/shuyuan/admission/route.ts', file: 'src/lib/shuyuan.ts', name: 'ADMISSION_ROUND_BUDGET_MS' },
   // triggerDownloadWorkflow() 的 dispatch 请求实际用的是它；同文件导出的 GITHUB_TIMEOUT_MS 目前没有任何调用方。
   { route: 'src/app/api/download/route.ts', file: 'src/lib/github.ts', name: 'DISPATCH_TIMEOUT_MS' },
   // githubFetch() 取正文 / 取元数据的单次请求超时，readBookPart / readBookIndex 都经过它。
