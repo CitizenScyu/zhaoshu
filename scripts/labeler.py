@@ -26,6 +26,7 @@
 """
 import argparse
 import atexit
+import datetime
 import html
 import json
 import os
@@ -73,6 +74,18 @@ UA = {'User-Agent': 'Mozilla/5.0 (compatible; zhaoshu-labeler/1.0)'}
 # 恢复方式刻意保持简单：**不做自动恢复**。人工删掉 labels-rejected.jsonl 里该书的行
 # 即重新并入候选；也可用 --book 单本模式强制重试（--book 不受本名单约束）。
 REJECT_TERMINAL_THRESHOLD = 5
+# lblreplay42：被拒冷却——重启后别再从名单头磨同一批书。
+# 实测（deploylbl41c-report.md §87–95）：名单头部正是作者冲突最密集的一批（绝代兵王、九鼎、
+# 逆徒出山、表妹万福……），每次重启后约 40 分钟 0 产出都在磨这批书。根因是断点续传认不出
+# 它们（被拒的书不写 labels.jsonl，不在 done_urls 里），被拒次数又不到 REJECT_TERMINAL_THRESHOLD，
+# 于是每轮从队首重跑。
+# 这里给它们第三种排序：近 REJECT_COOLDOWN_SEC 秒内被拒过的书**不跳过，移到队尾**
+# （两组各自保持原相对顺序）；冷却外、以及时间未知的旧拒绝行（没有 rejected_at 字段）
+# 一律按「很久以前」处理，不后移。done 与钉子户的语义完全不变。
+# cooldown ≤ 0 = 关闭：队列顺序与改前逐项相同。
+REJECT_COOLDOWN_SEC = 86400
+REJECT_COOLDOWN_ENV = 'LABELER_REJECT_COOLDOWN_S'
+REJECTED_AT_FIELD = 'rejected_at'
 # 打标模型后备链：先 bohe，失败依次换 grok-4.6-hei → deepseek-v4.1-flash-hei → glm-5.3-agent。
 # 可用 .env 的 LLM_MODELS=模型1,模型2,... 覆盖；无 LLM_MODELS 时兜底用旧 LLM_MODEL 单值。
 MODELS = ['deepseek-v4-flash-bohe', 'grok-4.6-hei', 'deepseek-v4.1-flash-hei', 'glm-5.3-agent']
@@ -1389,6 +1402,21 @@ def resolve_dead_host_ttl(env: dict | None = None) -> int:
     return value
 
 
+def resolve_reject_cooldown(env: dict | None = None) -> int:
+    """LABELER_REJECT_COOLDOWN_S → 被拒冷却（秒）。0 或负数 = **关闭后移**（改前队列顺序）；
+    非数字 / 空 → 默认 REJECT_COOLDOWN_SEC。坏配置只回落安全值，不拖垮整轮。"""
+    raw = str((env or {}).get(REJECT_COOLDOWN_ENV) or '').strip()
+    if not raw:
+        return REJECT_COOLDOWN_SEC
+    try:
+        value = int(raw)
+    except ValueError:
+        print(f'  提示: {REJECT_COOLDOWN_ENV}=「{raw}」不是整数，已忽略（用默认 {REJECT_COOLDOWN_SEC}）',
+              file=sys.stderr)
+        return REJECT_COOLDOWN_SEC
+    return value
+
+
 class DeadHostMemory:
     """死源判定的跨轮侧车（lblspeed41，纯文件读写，可离线单测）。
 
@@ -2279,6 +2307,17 @@ def _read_url_lines(path: Path):
             yield url
 
 
+def write_rejection(path: Path, record: dict) -> None:
+    """追加一行拒收记录（labels-rejected.jsonl）。lblreplay42：统一打上 ISO UTC 时间戳
+    `rejected_at`，供 split_queue 的「被拒冷却后移」判定；**已有该字段时不覆盖**（调用方显式
+    带值的情况保持原样）。时间戳缺失的旧行被当作「很久以前」，不参与后移。"""
+    rec = dict(record)
+    if not rec.get(REJECTED_AT_FIELD):
+        rec[REJECTED_AT_FIELD] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    with open(path, 'a', encoding='utf-8') as f:
+        f.write(json.dumps(rec, ensure_ascii=False) + '\n')
+
+
 def _read_rejection_rows(path: Path):
     """labels-rejected.jsonl → 逐行产出 (url, reason, 行对象)。文件不存在 / 空行 / 坏行跳过。"""
     if not path.exists():
@@ -2339,16 +2378,64 @@ def terminal_urls(counts: dict[str, int],
     return {url for url, n in counts.items() if n >= threshold}
 
 
+def _parse_iso_utc(raw) -> 'datetime.datetime | None':
+    """ISO 8601（含末尾 Z）→ aware datetime；非法 / 缺失 → None（按「时间未知」处理）。"""
+    if not isinstance(raw, str):
+        return None
+    text = raw.strip()
+    if not text:
+        return None
+    if text.endswith(('Z', 'z')):
+        text = text[:-1] + '+00:00'
+    try:
+        parsed = datetime.datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=datetime.timezone.utc)
+    return parsed
+
+
+def recent_rejection_urls(path: Path, cooldown_sec: int,
+                          now: float | None = None) -> set[str]:
+    """labels-rejected.jsonl → 冷却期内被拒过的 url 集合（lblreplay42 队尾后移用）。
+
+    cooldown_sec ≤ 0 → 空集（关闸，队列顺序回到改前）。每个 url 取**最近一次**拒收时间：
+    - 时间戳缺失 / 非法 / 位于未来（时钟偏移，不可信）→ 该行忽略，按「时间未知」处理，不后移；
+      旧拒绝行没有 rejected_at 字段，天然落进这一类——正合「旧行视为很久以前」的判据。
+    - 恰好等于 cooldown_sec 视为已过冷却（闭区间取「冷却内」= (0, cooldown) 开区间）。
+    一个 url 只要**有任意一次**拒收落在冷却内就后移（不必是全部）。"""
+    if cooldown_sec <= 0:
+        return set()
+    now_ts = time.time() if now is None else now
+    latest: dict[str, float] = {}
+    for url, _reason, rec in _read_rejection_rows(path):
+        parsed = _parse_iso_utc(rec.get(REJECTED_AT_FIELD))
+        if parsed is None:
+            continue
+        ts = parsed.timestamp()
+        if ts > latest.get(url, float('-inf')):
+            latest[url] = ts
+    return {url for url, ts in latest.items() if 0 <= now_ts - ts < cooldown_sec}
+
+
 def split_queue(books: list[dict], done_urls: set[str],
                 pinned: set[str],
-                source: BookSource | None = None) -> tuple[list[dict], list[dict], list[dict]]:
+                source: BookSource | None = None,
+                deferred: set[str] | None = None) -> tuple[list[dict], list[dict], list[dict]]:
     """榜单 → (待处理, 已完成跳过, 钉子户终态跳过)。
 
     两个跳过名单**互斥**：已在 labels.jsonl 的书优先算「已完成」，不再算「钉子户」——
     它被拒过是历史，后来已成功，不该继续占用终态名额。
-    书的站内相对路径经书源适配器归一到绝对 URL 后与跳过名单比对。"""
+    书的站内相对路径经书源适配器归一到绝对 URL 后与跳过名单比对。
+
+    lblreplay42：`deferred`（冷却期内被拒过的 url）里的书**不跳过**，但排到待处理队尾——
+    两组各自保持原相对顺序（稳定分区）。重启后不再从名单头磨同一批刚被拒的书。
+    done / pinned 的判定与优先级完全不变（仍是先判 done、再判 pinned、最后才看 deferred）。"""
     src = source or BOOK15
+    deferred = deferred or set()
     todo: list[dict] = []
+    tail: list[dict] = []
     skipped_done: list[dict] = []
     skipped_pinned: list[dict] = []
     for b in books:
@@ -2357,9 +2444,11 @@ def split_queue(books: list[dict], done_urls: set[str],
             skipped_done.append(b)
         elif url in pinned:
             skipped_pinned.append(b)
+        elif url in deferred:
+            tail.append(b)
         else:
             todo.append(b)
-    return todo, skipped_done, skipped_pinned
+    return todo + tail, skipped_done, skipped_pinned
 
 
 def main() -> int:
@@ -2391,10 +2480,15 @@ def main() -> int:
     # 与 REJECT_TERMINAL_THRESHOLD 同理：默认参数在 def 时求值，显式传才是「改配置即生效」）。
     engine_target_chars = resolve_engine_target_chars(env)
     dead_host_ttl = resolve_dead_host_ttl(env)
+    # lblreplay42：被拒冷却（近 cooldown 秒内被拒过的书移到队尾，不跳过）。显式求出再传下去，
+    # 与 dead_host_ttl 同理：默认参数在 def 时求值，显式传才是「改配置即生效」。
+    reject_cooldown = resolve_reject_cooldown(env)
     print(f'引擎取文字数上限: {engine_target_chars} 字'
           + ('（LABELER_ENGINE_TARGET_CHARS 覆盖）'
              if env.get(ENGINE_TARGET_CHARS_ENV) else '（默认，打标只需样本）'))
     print('死源跨轮记忆: ' + (f'{dead_host_ttl} 秒有效期' if dead_host_ttl > 0 else '关闭'))
+    print('被拒冷却后移: ' + (f'{reject_cooldown} 秒内被拒过的书移到队尾'
+                              if reject_cooldown > 0 else '关闭'))
     # 断点续传：已写入 labels.jsonl 的书跳过（按详情页 url 判定）
     done_urls = load_done_urls(data_path('labels.jsonl'))
     # 钉子户终态：历史被拒 ≥ REJECT_TERMINAL_THRESHOLD 次的书同样跳过，
@@ -2406,6 +2500,9 @@ def main() -> int:
     # 残本候选终态（P1）：历史命中残本判据的书与 done_urls 同口径跳过，
     # 不再每轮占住 --limit 名额把正常书挡死。空文件 / 未开分类时为空集，行为不变。
     stub_urls = load_stub_urls(data_path('labels-stub.jsonl'))
+    # lblreplay42：近 cooldown 秒内被拒过的书 → 不跳过，但排到待处理队尾（见 split_queue）。
+    # 关闸（≤0）时为空集，队列顺序与改前逐项相同。
+    deferred_urls = recent_rejection_urls(data_path('labels-rejected.jsonl'), reject_cooldown)
 
     # T5 引擎兜底 CLI：仅 douban/webnovel 名单线用（下方分支按 .env 装配）；
     # rank / --book 线保持 None，取正文只走 book15，行为不变。
@@ -2487,11 +2584,18 @@ def main() -> int:
         # 做完进 done_urls，之后每轮 queue=[] 却仍全量搜索。先剔除已完成/钉子户/残本再取上限，
         # 语义 = 「本轮最多打 limit 本**未完成**的书」。stub_urls 折进 done 侧一并跳过（P1）。
         queue, skipped_done, skipped_pinned = split_queue(
-            all_books, done_urls | stub_urls, pinned)
+            all_books, done_urls | stub_urls, pinned, deferred=deferred_urls)
+        # 后移计数：冷却期内被拒且真的进了本轮待处理队列（未完成、非钉子户）的本数。
+        deferred_in_queue = sum(
+            1 for b in queue if BOOK15.absolute(b['url']) in deferred_urls)
         queue = queue[:args.limit]
         # X = 本轮跳过总数（已完成 + 钉子户终态，互斥不重叠），Y = 其中因钉子户终态跳过的。
         print(f'本轮处理 {len(queue)} 本（跳过已完成 {len(skipped_done) + len(skipped_pinned)} 本'
               f'（含钉子户 {len(skipped_pinned)} 本））')
+        # lblreplay42 启动日志：本轮待处理数、其中被后移数、冷却秒数。deploy 后看这一行。
+        print(f'被拒冷却后移: 本轮待处理 {len(queue)} 本，其中 {deferred_in_queue} 本'
+              f'因 {reject_cooldown} 秒内被拒过后移'
+              if reject_cooldown > 0 else '被拒冷却后移: 关闭')
         for b in skipped_pinned:
             print(f'  钉子户终态：跳过（历史被拒 {rejection_counts[BOOK15.absolute(b["url"])]} 次）'
                   f' {b.get("title")} | {b["url"]}')
@@ -2617,8 +2721,7 @@ def main() -> int:
                     'reason': f'抓取字数不足: {chars}',
                 }
                 rej_path = data_path('labels-rejected.jsonl')
-                with open(rej_path, 'a', encoding='utf-8') as f:
-                    f.write(json.dumps(reject, ensure_ascii=False) + '\n')
+                write_rejection(rej_path, reject)
                 fail += 1
                 count_failure('字数不足')
                 continue
@@ -2640,8 +2743,7 @@ def main() -> int:
                     'reason': f'本地预检: {precheck_reason}',
                 }
                 rej_path = data_path('labels-rejected.jsonl')
-                with open(rej_path, 'a', encoding='utf-8') as f:
-                    f.write(json.dumps(reject, ensure_ascii=False) + '\n')
+                write_rejection(rej_path, reject)
                 fail += 1
                 count_failure('本地预检拒收')
                 continue
@@ -2674,8 +2776,7 @@ def main() -> int:
                     'reason': reason,
                 }
                 rej_path = data_path('labels-rejected.jsonl')
-                with open(rej_path, 'a', encoding='utf-8') as f:
-                    f.write(json.dumps(reject, ensure_ascii=False) + '\n')
+                write_rejection(rej_path, reject)
                 fail += 1
                 count_failure('书名核验不符')
                 time.sleep(LLM_INTERVAL_SEC)
@@ -2706,8 +2807,7 @@ def main() -> int:
                 if quality == TEXT_QUALITY_AD:
                     reject[AD_GATE_FIELD] = AD_GATE_VERSION
                 rej_path = data_path('labels-rejected.jsonl')
-                with open(rej_path, 'a', encoding='utf-8') as f:
-                    f.write(json.dumps(reject, ensure_ascii=False) + '\n')
+                write_rejection(rej_path, reject)
                 fail += 1
                 count_failure('内容质量拒收')
                 time.sleep(LLM_INTERVAL_SEC)
@@ -2799,8 +2899,7 @@ def main() -> int:
                 'reason': str(e),
             }
             rej_path = data_path('labels-rejected.jsonl')
-            with open(rej_path, 'a', encoding='utf-8') as f:
-                f.write(json.dumps(reject, ensure_ascii=False) + '\n')
+            write_rejection(rej_path, reject)
             fail += 1
             count_failure(classify_failure(e))
             continue
