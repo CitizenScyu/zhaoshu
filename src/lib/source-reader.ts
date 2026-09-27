@@ -1352,15 +1352,26 @@ export async function currentSourceHint(
 }
 
 /**
- * 引擎正文翻页的停止哨兵（41-PAGEFIX，legado BookContent.analyzeContent 同款）：下一章 URL；
- * 末章没有下一章时取第 0 章 URL（legado 同样回退到第 0 章，站点末章的「下一页」常回绕到首章）。
+ * 引擎正文翻页的停止哨兵（41-PAGEFIX → readerstop42）：停止点 = 整本目录（与生产打标 EngineStopUrls 同口径）。
+ * 站点「下一章」链的顺序可能与目录顺序不同（lblqual41：cuoceng《鬼吹灯》第 0 章的下一章是目录第 3 章），
+ * 只传目录里的下一章拦不住，会一路翻满 MAX_CONTENT_PAGES 把约 20 章拼进一章；engineFetchContent 对数组
+ * 命中其中任一即停，且自动把本章自身从停止点剔除（真·章内分页不受影响）。
+ * 目录只有 0/1 章时保持旧口径（不设判据 / 传本章地址），行为与改前一致。
+ * URL 数组按 chapters 实例缓存：目录会话在内存缓存命中时同一实例复用，顺序翻章不重复构造 O(n) 数组。
  */
-function nextChapterUrlOf(chapters: SourceChapter[], index: number): string | undefined {
-  return chapters[index + 1]?.url ?? chapters[0]?.url;
+const tocStopUrlsCache = new WeakMap<SourceChapter[], readonly string[]>();
+function tocStopUrls(chapters: SourceChapter[]): string | readonly string[] | undefined {
+  if (chapters.length <= 1) return chapters[0]?.url;
+  let urls = tocStopUrlsCache.get(chapters);
+  if (!urls) {
+    urls = chapters.map((chapter) => chapter.url);
+    tocStopUrlsCache.set(chapters, urls);
+  }
+  return urls;
 }
 
 async function chapterText(
-  context: SourceRequestContext, chapter: SourceChapter, source: ReadingSource, nextChapterUrl?: string,
+  context: SourceRequestContext, chapter: SourceChapter, source: ReadingSource, stopUrls?: string | readonly string[],
 ): Promise<string> {
   // N01 分派：builtin 走 book15 特化解析（逐字不变）；引擎档走 rule-engine 取正文。
   // 取页两侧都经 context.page ⇒ 预算/节流/重试层沿用；builtin 分支零行为变化。
@@ -1369,7 +1380,7 @@ async function chapterText(
     if (new URL(page.url).pathname !== new URL(chapter.url).pathname) throw new SourcePolicyError('章节跳转到了另一页面');
     return parseSourceChapterText(page.text, chapter.title);
   }
-  const { text } = await engineFetchContent(engineSourceOf(source), chapter.url, context, false, nextChapterUrl);
+  const { text } = await engineFetchContent(engineSourceOf(source), chapter.url, context, false, stopUrls);
   // 引擎只解释规则不做内容判定：builtin 的两道内容闸（空正文 / 单章限长）在这里补齐，错误语义与 builtin
   // 对齐：当前源失败同样进章节级换源；候选失败记 SOURCE_POLICY_REJECTED 后试下一个候选。
   if (!text) throw new SourcePolicyError('书源未提供有效正文');
@@ -1425,7 +1436,7 @@ export async function readSourceChapter(session: string, chapterIndex: number, c
       const hasOthers = sources.some((item) => item.url !== catalog.sourceUrl);
       const until = context.startedAt + SOFT_BUDGET_MS - (hasOthers ? SOURCE_CURRENT_FAILOVER_RESERVE_MS : 0);
       const currentContext = context.child(source.url, { limit: MAX_CONTENT_PAGES, sliceMs: baseMs, slide: { stepMs: baseMs, until } });
-      text = await chapterText(currentContext, chapter, source, nextChapterUrlOf(catalog.chapters, chapterIndex));
+      text = await chapterText(currentContext, chapter, source, tocStopUrls(catalog.chapters));
     } catch (error) {
       // 章节正文失败(含源被停用/服务端判定失效/切片到点):进换源流程。
       context.signal.throwIfAborted();
@@ -1573,7 +1584,7 @@ async function switchSourceChapter(
       const chapterContext = sourceContext.child(candidate.url, { limit: MAX_CONTENT_PAGES, shareSlice: true });
       text = await chapterText(
         chapterContext, alternative.chapters[alternativeIndex], alternativeSource,
-        nextChapterUrlOf(alternative.chapters, alternativeIndex),
+        tocStopUrls(alternative.chapters),
       );
     } catch (error) {
       throwIfCancelled();
