@@ -985,6 +985,11 @@ def _short_stderr(stderr: str | None, limit: int = 200) -> str:
     return text[:limit]
 
 
+# 从打标 .env 转发给引擎子进程的键（白名单，不做通配）：源池产物开关与路径。
+# 引擎读产物免一次库读；路径坏/产物缺时引擎自动回退查库（phxengine42 §7/§8）。
+ENGINE_FORWARD_ENV_KEYS = ('SHUYUAN_POOL_ARTIFACT', 'SHUYUAN_POOL_ARTIFACT_PATH')
+
+
 class EngineCli:
     """封装 engine-fetch.mjs 子进程调用（labeler 在 phoenix 上 shell out）。
 
@@ -994,15 +999,21 @@ class EngineCli:
     file:// URI（Linux/phoenix 亦合法）。
 
     凭据红线：DATABASE_URL 只经**子进程 env** 注入（db.ts 模块初始化读它），
-    绝不进命令行参数、日志或异常消息；stdout/stderr 只在调用方按需截断摘要。"""
+    绝不进命令行参数、日志或异常消息；stdout/stderr 只在调用方按需截断摘要。
+
+    forward_env：调用方的 .env 字典；只取 ENGINE_FORWARD_ENV_KEYS 白名单里有值的键，
+    同样只经子进程 env 注入（打标 .env 不 export，不转发引擎就读不到源池产物开关）。"""
 
     def __init__(self, node: str, script_path: str, database_url: str,
-                 hook_path: str | None = None, timeout: int = ENGINE_CLI_TIMEOUT):
+                 hook_path: str | None = None, timeout: int = ENGINE_CLI_TIMEOUT,
+                 forward_env: dict | None = None):
         self.node = node or 'node'
         self.script_path = script_path
         # hook 默认取 engine-fetch.mjs 同目录的 ts-esm-loader.mjs
         self.hook_path = hook_path or str(Path(script_path).parent / 'ts-esm-loader.mjs')
         self._database_url = database_url
+        self._forward_env = {k: forward_env[k] for k in ENGINE_FORWARD_ENV_KEYS
+                             if forward_env and (forward_env.get(k) or '').strip()}
         self.timeout = timeout
 
     def _import_target(self) -> str:
@@ -1021,12 +1032,13 @@ class EngineCli:
         """调 CLI 子命令（自动补 --json）。返回 CompletedProcess（returncode/stdout/stderr）。
 
         timeout：本次调用超时秒数（None = self.timeout；打标分段取文按剩余预算收紧）。
-        DATABASE_URL 从当前 env 复制的副本里注入子进程，不落任何参数或日志。"""
+        DATABASE_URL 与白名单转发键从当前 env 复制的副本里注入子进程，不落任何参数或日志。"""
         cmd = [self.node, '--import', self._import_target(), self.script_path,
                subcommand, *args, '--json']
         child_env = dict(os.environ)
         if self._database_url:
             child_env['DATABASE_URL'] = self._database_url
+        child_env.update(self._forward_env)
         return subprocess.run(cmd, capture_output=True, text=True,
                               timeout=self.timeout if timeout is None else timeout, env=child_env)
 
