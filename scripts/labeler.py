@@ -34,6 +34,7 @@ import re
 import sys
 import tempfile
 import time
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -122,6 +123,31 @@ SYSTEM_PROMPT = (
     "site_title_match(布尔值 true/false：判断正文内容是否确实是用户消息「验证段」中"
     "所给站点书名的作品，依据内容特征而非字面字符串，规则见验证段)、"
     "site_title_note(字符串：一句话说明 site_title_match 的判断依据)。"
+)
+
+# lblseg41：分布式采样（LABELER_SEGMENTED=1）时追加在 SYSTEM_PROMPT 之后，记录的 prompt_version 记
+# PROMPT_VERSION_SEGMENTED（v2）；开关关时不追加，SYSTEM_PROMPT 与 v1 逐字不变。
+# 「题材固有循环、后段没更重复不算落差」针对 lblab-41 §3.6(c) 的对照组误报（凡人修仙传）；「后段更重复/加码/注水
+# 即使仍好看也判 mild」针对小样第 1 轮正例漏报（斗破/大主宰被「延续开头套路」一句带成 none，lblseg-41 §4）。
+SEGMENTED_PROMPT_SUFFIX = (
+    "\n\n=== 分段采样说明 ===\n"
+    "给定文本不是连续的开头，而是同一本书按目录位置抽取的至多四段节选：第 1 段=开头、第 2 段=约 40% 处、"
+    "第 3 段=约 70% 处、第 4 段=约 90% 处。每段前有一行「【第 N 段：位置，第 a–b 章】」标注；"
+    "标注为「【第 N 段：未取到】」的段没有文本。"
+    "strengths/weaknesses/pace 请综合各段；plot_stage 写最后一段对应的剧情阶段；"
+    "quality 各项按全书整体印象照常打分。\n"
+    "额外输出字段 arc（后期落差，对象）：{\"decline\": \"none|mild|severe|unknown\", "
+    "\"evidence\": [{\"segment\": 段号整数, \"quote\": \"该段正文原文逐字摘录，12–50 字，不摘章节标题\"}], "
+    "\"note\": \"一句话说明\"}。"
+    "decline 含义：none=后段与开头水平相当；mild=后段较开头明显变差（注水、重复桥段、节奏拖沓）但仍可读；"
+    "severe=后段严重崩坏（剧情失控、大段注水、文笔骤降）；unknown=第 3、4 段都未取到或无法判断。"
+    "判断标准是「后段相对开头是否变差」，不是「有没有套路」：后段出现开头没有或明显更重的问题——"
+    "同类桥段/打脸/口号式台词反复、战力与设定不断加码导致审美疲劳、描写变粗、情节注水拖沓——"
+    "即使整体仍好看也判 mild；后段与开头的写法、密度、新意大体相当才判 none。"
+    "题材固有的循环（如修仙文的闭关—斗法—突破）如果开头就同样密集、后段并没有更重复，不算落差。"
+    "decline 为 mild 或 severe 时 evidence 至少 2 条且必须来自不同的段（如开头一段对比后段一段），"
+    "quote 必须是所标段号那段里逐字出现的原文，不得改写、概括或拼接；拿不出原文证据就判 none 或 unknown。"
+    "decline 为 none 时 evidence 可为空数组。"
 )
 
 
@@ -1304,13 +1330,15 @@ def fetch_book_text(detail_url: str, target_chars: int = TARGET_CHARS,
 # 改调 engine CLI：toc 拿章节清单 → 逐章 content → 拼接。正文**不过 clean_chapter_text**
 # （引擎 engineFetchContent 已抽干净文本；调研 §4：多源正文优先引擎结果，少依赖 book15
 # 结构的 Python 清洗）。产出与 fetch_book_text 同构：'【章节标题】\n正文'。
-def _engine_json(engine_cli, subcommand: str, *args: str) -> dict:
+def _engine_json(engine_cli, subcommand: str, *args: str, timeout: float | None = None) -> dict:
     """调引擎 CLI 子命令并解析 JSON stdout；非零退出 → EngineCliError（RuntimeError 子类，脱敏摘要）。
 
     凭据红线：stderr 不原样透传——只留单行化 + 截断的错误摘要（CLI 侧另有 safeReason）。
     giveup41：新 CLI 在 --json 出错时于 stderr 末行给 {"errorKind": …}，解析进 EngineCliError.kind
-    （旧 CLI 无此行 → kind=''，行为同改前）；该行不进摘要。"""
-    proc = engine_cli.run(subcommand, *args)
+    （旧 CLI 无此行 → kind=''，行为同改前）；该行不进摘要。
+    timeout（可选）：本次调用的超时秒数，覆盖 CLI 的默认超时（分段取文按剩余预算收紧）；None = 不传。"""
+    proc = engine_cli.run(subcommand, *args) if timeout is None \
+        else engine_cli.run(subcommand, *args, timeout=timeout)
     if proc.returncode != 0:
         summary, kind = _split_engine_stderr(proc.stderr)
         raise EngineCliError(f'引擎 {subcommand} 失败 rc={proc.returncode}: {summary}', kind)
@@ -1575,6 +1603,29 @@ def resolve_engine_target_chars(env: dict | None = None) -> int:
     return value
 
 
+def _check_toc_identity(toc: dict, expect_title: str, expect_author: str,
+                        title_fold: bool = False) -> tuple[str, str]:
+    """N02 目录身份校验（fetch_book_text_engine 与分段取文共用同一口径）→ (toc_title, toc_author)。
+
+    双侧非空才比对：title 用 title_compatible，author 用 douban_list.author_matches；不符抛 EngineIdentityMismatch。
+    title_fold=True（分段取文用）：书名比较前先繁简折叠（_fold_title，rvlblseg R2：斗罗大陆 vs 斗羅大陸 是同书，
+    不该在身份闸就误拒；分段补段另有 same_book 双信号兜底，身份闸对繁简放宽是安全的）。"""
+    toc_title = (toc.get('title') or '').strip()
+    toc_author = (toc.get('author') or '').strip()
+    title_ok = (douban_list.title_compatible(expect_title, toc_title)
+                or (title_fold and _fold_title(expect_title) == _fold_title(toc_title)
+                    and bool(_fold_title(expect_title))))
+    if expect_title and toc_title and not title_ok:
+        raise EngineIdentityMismatch(
+            f'引擎目录身份不符: 名单《{expect_title}》/作者 {expect_author or "（未知）"}'
+            f' vs 目录《{toc_title}》/作者 {toc_author or "（未知）"}（标题不兼容）')
+    if expect_author and toc_author and not douban_list.author_matches(expect_author, toc_author):
+        raise EngineIdentityMismatch(
+            f'引擎目录身份不符: 名单《{expect_title}》/作者 {expect_author}'
+            f' vs 目录《{toc_title}》/作者 {toc_author}（作者不符）')
+    return toc_title, toc_author
+
+
 def fetch_book_text_engine(engine_cli, book_url: str,
                            target_chars: int = ENGINE_TARGET_CHARS,
                            expect_title: str = '',
@@ -1612,16 +1663,7 @@ def fetch_book_text_engine(engine_cli, book_url: str,
         if e.kind in DETERMINISTIC_ENGINE_ERRORS:
             raise EngineSourceGaveUp(host, e.kind, f'目录失败 {e}') from e
         raise
-    toc_title = (toc.get('title') or '').strip()
-    toc_author = (toc.get('author') or '').strip()
-    if expect_title and toc_title and not douban_list.title_compatible(expect_title, toc_title):
-        raise EngineIdentityMismatch(
-            f'引擎目录身份不符: 名单《{expect_title}》/作者 {expect_author or "（未知）"}'
-            f' vs 目录《{toc_title}》/作者 {toc_author or "（未知）"}（标题不兼容）')
-    if expect_author and toc_author and not douban_list.author_matches(expect_author, toc_author):
-        raise EngineIdentityMismatch(
-            f'引擎目录身份不符: 名单《{expect_title}》/作者 {expect_author}'
-            f' vs 目录《{toc_title}》/作者 {toc_author}（作者不符）')
+    toc_title, toc_author = _check_toc_identity(toc, expect_title, expect_author)
     chapters = toc.get('chapters') or []
     parts, chars = [], 0
     stats = stats if stats is not None else {}
@@ -1741,6 +1783,901 @@ def fetch_engine_book_with_giveup(engine_cli, book: dict, tracker: SourceGiveupT
             last = e
     raise EngineSourceGaveUp(primary['source'], getattr(last, 'kind', 'other'),
                              f'{len(options)} 个候选源均不可用（最后: {last}）')
+
+
+# ---- 分布式采样 + 按段换源补段（lblseg41，依据 lblab-41-report §3.6–§3.8/§4.1）----
+# 只读开头 8 万字看不到「虎头蛇尾」：分布式采样后模型能在 weaknesses 里点出后期问题（正例 4/4 有原文证据）。
+# 但 1/3 以上源条目中后段不可用（500/1000 章截断、4xx、<300 字预览），11/20 本要换源才拿得齐；
+# 「连续 3 章取空才弃源」对「章章返回百字预览」无效（阳神 728s），故按段统计有效字数判可用性、按段换源，
+# 并给整本取文设墙钟上限。env LABELER_SEGMENTED=1 才开；关时引擎路径逐字不变。book15 路径不受影响。
+SEGMENTED_ENV = 'LABELER_SEGMENTED'
+SEG_TIME_BUDGET_ENV = 'LABELER_SEG_TIME_BUDGET_S'
+SEG_TIME_BUDGET_S = 240
+# 分段模式总量上限：> SEGMENT_CHARS(250 000) 会让 label_book 走两段，违反「一次模型调用」；留 1 万余量
+# （整章取文会略超目标，同 lblab §4 对 240 000 的论证）。
+SEGMENTED_MAX_TOTAL = 240_000
+# (段号, 目录位置, 占 ENGINE_TARGET_CHARS 的比例, 标注)。主会话裁定：8 万时 20k/15k/10k/15k（合计 6 万，
+# 见 lblseg-41-report §2 的算术说明），总量变化按比例缩放。
+SEGMENT_SPECS = (
+    (1, 0.0, 0.25, '开头'),
+    (2, 0.40, 0.1875, '约 40% 处'),
+    (3, 0.70, 0.125, '约 70% 处'),
+    (4, 0.90, 0.1875, '约 90% 处'),
+)
+SEG_MIN_FILL_RATIO = 0.40   # 段有效字数 < 目标 × 此比例 → 该源该段不可用
+SEG_MIN_AVG_CHARS = 300     # 按已请求章数平均的有效字数 < 此值 → 预览页/4xx 特征，该源该段不可用
+SEG_PROBE_CHAPTERS = 3      # 每请求这么多章后即按平均有效字数判早退（不等整段抓完）
+SEG_FIRST_PROBE_CHAPTERS = 10  # 第 1 段按章均早退前至少请求的章数（开头常有楔子/序幕类真短章）
+SEG_CHAPTER_ATTEMPTS = 2    # 分段模式单章尝试次数（确定性错误不重试）；时限内少退避
+SEG_MIN_REQUEST_S = 1.0     # 剩余预算不足此秒数就不再发请求（单请求超时 = min(CLI 超时, 剩余预算)）
+SEG_FILL_MAX_CHAPTERS = 4   # 每组正文参照（书首 / 近窗）候选源逐章配对抓的章数上限（计入预算，rvlblseg R2-6）
+SEG_FILL_VERIFY_MAX = 8     # 单候选源核验抓章总数上限（书首组 + 近窗组各 ≤SEG_FILL_MAX_CHAPTERS，rvlblseg R3）
+SEG_FILL_TITLE_MAX_MISMATCH = 0.20  # 补段候选窗口章标题与计划源目录同章号章名不一致比例上限（超过弃该候选，rvlblseg R3）
+SEG_FILL_PAIR_MIN_CHARS = 500  # 补段与门（rvlblseg R5 必修 F1）：逐对章「可判」的单章去模板正文字数下限——
+#                                两侧该章都 ≥ 此数才算「可判且可据以判不匹配」（低于则该章太短、不据它否决，宁缺）。
+#                                取值远低于典型章长（真同书章不会被误判不可判），又高于预览/残段（避免拿短碴当否决证据）。
+# 换锚（lblsegfix42）：计划源后段是付费墙预览、判同参照为 reject 时，改用「在计划源可读区与计划源正文判同成立」
+# 的候选作锚补段。锚在本段另须过两道防护：B 窗口目录有序一致（_anchor_window_toc_ok）、C 预览开头一致（下列常量）。
+SEG_ANCHOR_HEAD_CHARS = 200     # 防护 C：计划源该章正文/预览取开头这么多字作探针（book.qq.com 付费章预览 ≈197 字）
+SEG_ANCHOR_HEAD_MIN_GRAMS = 30  # 防护 C：探针 4-gram 少于此数 → 该章不可比（不据它放行）
+SEG_ANCHOR_HEAD_CONTAIN = 0.50  # 防护 C：探针 4-gram 被锚章正文包含的比例下限（真书实测见 lblsegfix-42-report §2）
+SEG_ANCHOR_HEAD_TRIES = 3       # 防护 C：首/末端各最多探几章找可比探针（真书：book.qq.com《唐砖》「第647章 三节求保底，
+                                # 明日继续」这类作者附言章空正文、无预览，跳过它再看下一章）
+PROMPT_VERSION_SEGMENTED = 'v2'
+
+
+def resolve_segmented(env: dict | None = None) -> bool:
+    """LABELER_SEGMENTED → 是否开分布式采样。只有 '1' 才开（与 LABELER_ENGINE_FALLBACK 同口径）。"""
+    return str((env or {}).get(SEGMENTED_ENV) or '').strip() == '1'
+
+
+def resolve_seg_time_budget(env: dict | None = None) -> int:
+    """LABELER_SEG_TIME_BUDGET_S → 分段取文每本墙钟上限（秒）。非正整数忽略并告警，回落默认。"""
+    raw = str((env or {}).get(SEG_TIME_BUDGET_ENV) or '').strip()
+    if not raw:
+        return SEG_TIME_BUDGET_S
+    try:
+        value = int(raw)
+    except ValueError:
+        value = 0
+    if value <= 0:
+        print(f'  提示: {SEG_TIME_BUDGET_ENV}=「{raw}」不是正整数，已忽略（用默认 {SEG_TIME_BUDGET_S}）',
+              file=sys.stderr)
+        return SEG_TIME_BUDGET_S
+    return value
+
+
+def segment_plan(total_chars: int) -> list[dict]:
+    """总量 → 四段计划 [{no, frac, target, label}]（纯函数）。总量先夹到 SEGMENTED_MAX_TOTAL。"""
+    total = min(total_chars, SEGMENTED_MAX_TOTAL)
+    return [{'no': no, 'frac': frac, 'target': round(total * ratio), 'label': label}
+            for no, frac, ratio, label in SEGMENT_SPECS]
+
+
+def segment_windows(n: int, plan: list[dict]) -> list[dict]:
+    """正文目录条目数 n + 计划 → 每段加上 [start, end) 目录下标窗口（纯函数）。
+
+    start = int(n × frac)（夹到 n-1），窗口止于下一段起点（末段到目录尾），段间不重叠。
+    章节不足导致窗口为空的段并入前一段（目标字数一并加过去）；开头就为空的往后顺延。n ≤ 0 → []。"""
+    if n <= 0:
+        return []
+    starts = [min(n - 1, int(n * seg['frac'])) for seg in plan]
+    out: list[dict] = []
+    carry = 0
+    for i, seg in enumerate(plan):
+        start = starts[i]
+        end = starts[i + 1] if i + 1 < len(plan) else n
+        if start >= end:
+            if out:
+                out[-1]['target'] += seg['target']
+            else:
+                carry += seg['target']
+            continue
+        out.append({**seg, 'target': seg['target'] + carry, 'start': start, 'end': end})
+        carry = 0
+    return out
+
+
+def segment_usable(result: dict, target: int, first_segment: bool = False) -> tuple[bool, str]:
+    """一次「某源某段」取文结果 → (可用?, 不可用原因)（纯函数）。
+
+    result 需含 requested（发出的 content 请求数）、eff_chars（过 prepare_book_text 清洗后的有效字数）、
+    stop（'target' | 'window_end' | 'preview' | 'deadline' | 'cap'）、preview_skipped（按标题跳过的试读章数）。
+    不可用：没发出请求 / 章均有效字数 < SEG_MIN_AVG_CHARS（预览页、4xx 全空）/
+    有效字数 < 目标 × SEG_MIN_FILL_RATIO（窗口里的正文章本来就不够——窗口抓完且没有试读章被跳过——除外）。
+    first_segment（第 1 段）不看章均：开头常有真短章（楔子/序幕约 250 字/章，rvlblseg ce5），
+    只看累计有效字数是否达目标 × SEG_MIN_FILL_RATIO。"""
+    requested = result.get('requested', 0)
+    eff = result.get('eff_chars', 0)
+    if requested <= 0:
+        return False, 'no_request'
+    if not first_segment and eff / requested < SEG_MIN_AVG_CHARS:
+        return False, 'preview'
+    natural_end = result.get('stop') == 'window_end' and not result.get('preview_skipped')
+    if eff < target * SEG_MIN_FILL_RATIO and not natural_end:
+        return False, 'short'
+    return True, ''
+
+
+def _budget_timeout(engine_cli, deadline: float, clock: Callable[[], float]) -> float | None:
+    """剩余预算 → 本次 CLI 请求的超时秒数 min(CLI 超时, 剩余)；剩余 < SEG_MIN_REQUEST_S → None（不再发请求）。"""
+    remaining = deadline - clock()
+    if remaining < SEG_MIN_REQUEST_S:
+        return None
+    return min(float(getattr(engine_cli, 'timeout', douban_list.ENGINE_CLI_TIMEOUT)), remaining)
+
+
+class SegmentBudgetExhausted(Exception):
+    """分段取文墙钟预算已耗尽（不再发请求）。"""
+
+
+def _budget_engine_json(engine_cli, deadline: float, clock: Callable[[], float],
+                        subcommand: str, *args: str) -> dict:
+    """带预算的 _engine_json：超时收到 min(CLI 超时, 剩余预算)，只在预算更紧时才传 timeout（其余逐字同改前）。
+    预算已耗尽 → 抛 SegmentBudgetExhausted（不发请求）。"""
+    timeout = _budget_timeout(engine_cli, deadline, clock)
+    if timeout is None:
+        raise SegmentBudgetExhausted()
+    cli_timeout = float(getattr(engine_cli, 'timeout', douban_list.ENGINE_CLI_TIMEOUT))
+    return _engine_json(engine_cli, subcommand, *args,
+                        timeout=timeout if timeout < cli_timeout else None)
+
+
+def _segment_chapter_text(engine_cli, ch_url: str, deadline: float = float('inf'),
+                          clock: Callable[[], float] = time.monotonic) -> str:
+    """分段模式单章取正文：最多 SEG_CHAPTER_ATTEMPTS 次，确定性错误不重试；失败返回 ''（记为有效 0 字）。
+
+    每次请求的超时 = min(CLI 超时, 剩余预算)，退避也计入预算（退避后预算不够再发一次就不再重试）。"""
+    for attempt in range(SEG_CHAPTER_ATTEMPTS):
+        try:
+            return _budget_engine_json(engine_cli, deadline, clock,
+                                       'content', '--url', ch_url).get('text') or ''
+        except SegmentBudgetExhausted:
+            return ''
+        except EngineCliError as e:
+            if e.kind in DETERMINISTIC_ENGINE_ERRORS:
+                return ''
+        except Exception:
+            pass
+        if attempt + 1 < SEG_CHAPTER_ATTEMPTS:
+            backoff = 2 * (attempt + 1)
+            if deadline - clock() < backoff + SEG_MIN_REQUEST_S:
+                return ''
+            time.sleep(backoff)
+    return ''
+
+
+def _effective_chars(parts: list[str], preview_skipped: int) -> int:
+    """段原文 → 有效字数：复用 prepare_book_text 的清洗/去重/试读章剔除（引擎口径 clean=True）。"""
+    if not parts:
+        return 0
+    return prepare_book_text('\n\n'.join(parts), clean=True, preview_dropped=preview_skipped)[1]
+
+
+def fetch_segment(engine_cli, chapters: list[dict], window: dict, deadline: float,
+                  clock: Callable[[], float] = time.monotonic) -> dict:
+    """从一个源的正文目录 chapters 的 [start, end) 窗口顺序取整章，直到原文字数达 window['target']。
+
+    → {parts, raw_chars, eff_chars, requested, first, last, stop, preview_skipped}；first/last 为目录下标。
+    标题带 APP免费 的章抓取前跳过（不发请求）；请求满 SEG_PROBE_CHAPTERS 章后，连续这么多章落空
+    或累计章均有效字数 < SEG_MIN_AVG_CHARS 即早退（stop='preview'），墙钟到 deadline 即停（stop='deadline'）。
+    第 1 段（window['no'] == 1）「落空」只认没取到或形如截断预览，章均早退要请求满 SEG_FIRST_PROBE_CHAPTERS
+    章才判（开头真短章不误弃，rvlblseg ce5）。"""
+    target = window['target']
+    first_segment = window.get('no') == 1
+    parts: list[str] = []
+    hits: list[dict] = []       # 每章 {'num': 章号, 'text': 正文, 'idx': 目录下标}（>100 字才计），供 same_book 正文信号（R2-6）
+    raw = requested = preview_skipped = miss_streak = 0
+    first = last = None
+    stop = 'window_end'
+    for idx in range(window['start'], window['end']):
+        if raw >= target:
+            break
+        if deadline - clock() < SEG_MIN_REQUEST_S:
+            stop = 'deadline'
+            break
+        ch = chapters[idx]
+        title = (ch.get('title') or '').strip()
+        if is_preview_title(title):
+            preview_skipped += 1
+            continue
+        text = _segment_chapter_text(engine_cli, ch['url'], deadline, clock)
+        requested += 1
+        part = f'【{clean_chapter_title(title)}】\n{text}'
+        # 单章「落空」= 没取到（≤100 字）或自身有效字数 < SEG_MIN_AVG_CHARS（预览/水印页）；
+        # 第 1 段只认没取到或形如截断预览
+        if first_segment:
+            hit = len(text) > 100 and not is_preview_body(text)
+        else:
+            hit = len(text) > 100 and _effective_chars([part], preview_skipped) >= SEG_MIN_AVG_CHARS
+        miss_streak = 0 if hit else miss_streak + 1
+        if len(text) > 100:
+            parts.append(part)
+            hits.append({'num': douban_list._toc_chapter_number(title), 'text': text, 'idx': idx})
+            raw += len(text)
+            first = idx if first is None else first
+            last = idx
+        # 早退两条（lblseg41 小样：cuoceng 段中途起 4xx，只看累计均值会白发 41 个请求）：
+        # 连续 SEG_PROBE_CHAPTERS 章落空；或累计章均有效字数 < SEG_MIN_AVG_CHARS（第 1 段请求满
+        # SEG_FIRST_PROBE_CHAPTERS 章才看这条：开头几章真短章不误弃，章章百字的预览源仍有界早退）
+        if requested >= SEG_PROBE_CHAPTERS and raw < target and (
+                miss_streak >= SEG_PROBE_CHAPTERS
+                or (requested >= (SEG_FIRST_PROBE_CHAPTERS if first_segment else SEG_PROBE_CHAPTERS)
+                    and _effective_chars(parts, preview_skipped) / requested < SEG_MIN_AVG_CHARS)):
+            stop = 'preview'
+            break
+        time.sleep(CHAPTER_DELAY)
+    if raw >= target:
+        stop = 'target'
+    return {'parts': parts, 'hits': hits, 'raw_chars': raw,
+            'eff_chars': _effective_chars(parts, preview_skipped),
+            'requested': requested, 'first': first, 'last': last, 'stop': stop,
+            'preview_skipped': preview_skipped}
+
+
+def segment_marker(window: dict | None, no: int, first: int | None = None,
+                   last: int | None = None) -> str:
+    """段标注行：取到 → 【第 N 段：位置，第 a–b 章】（章号 = 正文目录序号，1 起）；未取到 → 【第 N 段：未取到】。"""
+    if window is None or first is None:
+        return f'【第 {no} 段：未取到】'
+    return f'【第 {no} 段：{window["label"]}，第 {first + 1}–{last + 1} 章】'
+
+
+def _fold_title(title: str) -> str:
+    """书名比较前归一：_norm_title_bare 去站点装饰尾缀 + 繁简折叠（复用 douban_list._to_simplified）。
+    只用于比较，不改写记录（rvlblseg R2：斗罗大陆 vs 斗羅大陸 曾被严格相等误拒）。"""
+    return douban_list._to_simplified(douban_list._norm_title_bare(title or ''))
+
+
+def _fingerprint_from_hits(chapters: list[dict], hits: list[dict]) -> dict:
+    """已取到的章节 → same_book 口径内容指纹（不发请求，结构同 douban_list.fetch_content_fingerprint）。
+
+    chapters：该源正文目录（供 _informative_toc_titles 目录信号）；hits：已取到的
+    [{'num': 章号, 'text': 正文}]（>100 字才计）。正文逐章去模板（_clean_body_chapters）后按章号建指纹，
+    供 same_book 的正文逐章配对。正文 n-gram 比较前繁转简（rvlblseg R3-1.4：_char_ngrams 本身不繁转简，
+    同书繁体正文与简体计划源 n-gram 几乎不重合、same_book 误拒；此处对齐 _fold_title 的繁简折叠口径）。"""
+    toc_seq = douban_list._informative_toc_titles(chapters)
+    parts = [h['text'] for h in hits if len(h.get('text') or '') > 100]
+    nums = [h['num'] for h in hits if len(h.get('text') or '') > 100]
+    cleaned = douban_list._clean_body_chapters(parts)
+    by_chapter = [{'num': nums[i],
+                   'ngrams': douban_list._char_ngrams(douban_list._to_simplified(txt)),
+                   'chars': len(txt)}
+                  for i, txt in enumerate(cleaned) if txt is not None]
+    merged = '\n'.join(txt for txt in cleaned if txt is not None)
+    return {'toc': toc_seq, 'body': douban_list._char_ngrams(douban_list._to_simplified(merged)),
+            'body_chars': len(merged), 'body_chapters': len(by_chapter),
+            'body_by_chapter': by_chapter}
+
+
+def _fetch_candidate_hits(engine_cli, cand: dict, nums: list, deadline: float,
+                          clock: Callable[[], float], ch_cache: dict,
+                          cap: int = SEG_FILL_VERIFY_MAX) -> list[dict]:
+    """候选源按 nums 抓「同章号」正文 → hits（>100 字才计）。命中 ch_cache（num→text）不重抓；
+    该候选累计已抓章数达 cap 就不再发请求；剩余预算不足或某章号目录里没有则跳过。计入 240s 预算。"""
+    by_num: dict[int, dict] = {}
+    for ch in cand['chapters']:
+        num = douban_list._toc_chapter_number(ch.get('title') or '')
+        if num is not None and num not in by_num:
+            by_num[num] = ch
+    hits: list[dict] = []
+    for num in nums:
+        if num in ch_cache:
+            text = ch_cache[num]
+        else:
+            if len(ch_cache) >= cap:
+                continue
+            ch = by_num.get(num) if num is not None else None
+            if ch is None:
+                ch_cache[num] = ''
+                continue
+            if deadline - clock() < SEG_MIN_REQUEST_S:
+                continue
+            text = _segment_chapter_text(engine_cli, ch['url'], deadline, clock)
+            ch_cache[num] = text
+        if len(text) > 100:
+            hits.append({'num': num, 'text': text})
+    return hits
+
+
+def _norm_toc_name(title: str) -> str:
+    """章标题 → 去编号后的**信息性**章名（繁简折叠 + 去标点/空白）；无编号/太短/辅助条目/纯编号 → ''。
+
+    只比对信息性章名（口径同 douban_list._informative_toc_titles）：计划源后段常挂预览/番外/APP免费 等
+    辅助标题（非真实章名），拿它们和候选真实章名比会全判不一致而误弃——这类位置直接跳过、交给正文信号。"""
+    had, name = douban_list._split_toc_numbering(title or '')
+    if not (had and name) or len(name) < douban_list.CONTENT_TOC_MIN_NAME_CHARS \
+            or douban_list._is_auxiliary_toc_name(name):
+        return ''
+    return douban_list._to_simplified(douban_list._norm_generic_toc_word(name))
+
+
+def _seg_title_mismatch(plan_chapters: list[dict], cand_chapters: list[dict],
+                        cand_window: dict) -> float | None:
+    """候选源某段窗口内各章标题 vs 计划源目录**同章号**章名（归一后）不一致比例（rvlblseg R3 重点 2）。
+
+    计划源目录通常比正文完整，只比对目录、不额外抓取。计划源目录无对应章号（`num is None` 的楔子/序章/
+    无编号标题不参与，rvlblseg R4 必修 1）、或两侧章名归一后为空的候选章不计入分母；
+    无可比章（分母为 0）→ **None（不可判）**，调用方按「不可判一律拒」处理（与 same_book 口径一致，
+    rvlblseg R4 必修 3）——旧口径返回 0.0 会当作「全对」放行纯编号后段的换书候选。"""
+    plan_name: dict[int, str] = {}
+    for c in plan_chapters:
+        num = douban_list._toc_chapter_number(c.get('title') or '')
+        if num is not None and num not in plan_name:
+            plan_name[num] = _norm_toc_name(c.get('title') or '')
+    total = mismatch = 0
+    for idx in range(cand_window['start'], min(cand_window['end'], len(cand_chapters))):
+        c = cand_chapters[idx]
+        num = douban_list._toc_chapter_number(c.get('title') or '')
+        pn = plan_name.get(num) if num is not None else None
+        cn = _norm_toc_name(c.get('title') or '')
+        if not pn or not cn:
+            continue
+        total += 1
+        if pn != cn:
+            mismatch += 1
+    return (mismatch / total) if total else None
+
+
+def _sorted_real_hits(*hit_lists) -> list[dict]:
+    """合并若干 hits 列表 → 按章号升序、去重（同章号保留首条）的可用章（rvlblseg R4 必修 1）。
+
+    统一跳过 `num is None`（楔子/序章/无编号标题不参与「按章号取参照」，否则 int 与 None 排序崩溃）
+    与正文 ≤100 字的空/预览章。"""
+    out: list[dict] = []
+    seen: set[int] = set()
+    flat = [h for lst in hit_lists for h in (lst or [])]
+    for h in sorted((h for h in flat
+                     if h.get('num') is not None and len(h.get('text') or '') > 100),
+                    key=lambda h: h['num']):
+        if h['num'] not in seen:
+            seen.add(h['num'])
+            out.append(h)
+    return out
+
+
+def _judgeable_hits(hits: list[dict]) -> list[dict]:
+    """参照集只保留计划源侧「可判」章：去模板后正文 ≥ SEG_FILL_PAIR_MIN_CHARS 字（rvlblseg R7）。
+
+    去模板口径同 `_fingerprint_from_hits`（整组一起清洗，跨章模板才识别得出）。太短到不可判的章
+    既不该进参照集（补段全称与门无从据它判候选侧），也不该定义 L——L = 计划源**最后一个可判章**，
+    「分歧点 > L」才是已接受残余。传入 hits 需已按章号升序（`_sorted_real_hits`）。"""
+    cleaned = douban_list._clean_body_chapters([h.get('text') or '' for h in hits])
+    return [h for h, body in zip(hits, cleaned)
+            if body is not None and len(body) >= SEG_FILL_PAIR_MIN_CHARS]
+
+
+def _plan_window_reference(engine_cli, plan: dict, plan_window_hits: list[dict] | None,
+                           win: dict, deadline: float, clock: Callable[[], float],
+                           plan_ch_cache: dict) -> tuple[list[dict], str]:
+    """补段判同的计划源参照章 + 参照模式（rvlblseg R4 必修 2 红线，R7 改结构以 L 收尾）→ (参照章 hits, ref_mode)。
+
+    核心红线：**判同样本必须落在目标段窗口内、或紧邻窗口起点之前，且必须以 L（计划源最后一个可判章）
+    收尾**——否则分歧点落在 (max(参照), L] 区间时全称与门看不到它（第六轮复审 R6 必修 1：window 模式
+    旧取窗口**最前** 4 章 in_window[:4]，计划源读到窗口第 5 章及以后时 L 超出参照集 → 分歧点 ≤ L 仍漏）。
+      - `'window'`：计划源在**目标段窗口内**已读到可判章（plan_window_hits，调用方已滤预览/空章，此处再滤
+        「去模板 ≥SEG_FILL_PAIR_MIN_CHARS」的可判章）→ 取**最后** ≤SEG_FILL_MAX_CHAPTERS 章（以 L 收尾）
+        与候选**同章号**章判同；第 1 段窗口即书首，同样走窗口内章。
+      - `'nearest_prior'`：窗口内无计划源可判章 → 从窗口起点**向前探 ≤SEG_FILL_MAX_CHAPTERS 章、
+        遇 4xx/预览即停**，抓计划源正文，探到的最近可判章作参照（计入 240s 预算；命中 plan_ch_cache
+        不重抓）；连续读到窗口起点时 max(参照)=L，无 window 模式的间隙。探不到可判章 → reject。
+      - `'reject'`：一章可判参照都探不到 → 拒补段、宁缺（异书混入 0 优先于覆盖率）。
+    所有取章号处经 douban_list._toc_chapter_number；`num is None`（楔子/序章）不参与按章号配对（必修 1）。"""
+    in_window = _judgeable_hits(_sorted_real_hits(plan_window_hits))
+    if in_window:
+        return in_window[-SEG_FILL_MAX_CHAPTERS:], 'window'   # 以 L（窗口内最后一个可判章）收尾
+    chapters = plan.get('chapters') or []
+    start = win.get('start', 0)
+    prior: list[dict] = []
+    for off in range(1, SEG_FILL_MAX_CHAPTERS + 1):
+        idx = start - off
+        if idx < 0:
+            break
+        num = douban_list._toc_chapter_number(chapters[idx].get('title') or '')
+        if num is None:
+            continue                    # 无编号章不参与按章号配对（必修 1），继续向前探
+        if num in plan_ch_cache:
+            text = plan_ch_cache[num]
+        else:
+            if deadline - clock() < SEG_MIN_REQUEST_S:
+                break
+            text = _segment_chapter_text(engine_cli, chapters[idx]['url'], deadline, clock)
+            plan_ch_cache[num] = text
+        if len(text) <= 100 or is_preview_body(text):
+            break                       # 遇 4xx/预览即停：分歧区无参照，宁缺
+        prior.append({'num': num, 'text': text})
+    real = _judgeable_hits(_sorted_real_hits(prior))   # 只计入可判章（以最靠近窗口的可判章收尾）
+    return (real[-SEG_FILL_MAX_CHAPTERS:], 'nearest_prior') if real else ([], 'reject')
+
+
+def fill_source_identity(engine_cli, plan: dict, cand: dict,
+                         win: dict, deadline: float,
+                         clock: Callable[[], float] = time.monotonic,
+                         caches: dict | None = None,
+                         plan_window_hits: list[dict] | None = None,
+                         plan_ch_cache: dict | None = None) -> tuple[str, str, list]:
+    """补段源身份核验（rvlblseg R4 收口）→ (不通过原因, 参照模式, 参照章号)；原因 '' = 通过。
+
+    第四轮复审判定：拿书首/近窗组（都在分歧点之前）给后段背书，「头同尾异」仍能混入。主会话裁定改为
+    **判同样本必须落在目标段窗口内、或紧邻窗口起点之前**（见 `_plan_window_reference`）：
+      (1) 书名繁简折叠相等（_fold_title），否则 ('title', '')（零正文请求，续作/异名书在此即拒）；
+      (2) 目录信号 douban_list._toc_decides 可判且判同，否则 ('toc', '')（零正文请求，r2_b/r2_d 在此即拒）；
+      (3) 正文判同：`_plan_window_reference` 取**目标窗口内**计划源可判章（plan_window_hits，以 L 收尾），
+          窗口内不可判时**向前探 ≤SEG_FILL_MAX_CHAPTERS 章、遇 4xx/预览即停**抓计划源正文作近邻参照
+          （ref='nearest_prior'）；一章都探不到 → ref='reject' 直接拒（'body'）。取到参照后与候选**同章号**
+          正文逐章配对，须**全称与门**成立才放行（rvlblseg R7 必修，只改本处、不动 `_body_decides`）：
+          ≥2 互异匹配章对（`_body_decides` 下限）**且**参照集中每一「计划源侧可判」章在候选侧都存在、可判
+          （≥SEG_FILL_PAIR_MIN_CHARS）且匹配；任一缺失/不可判/不匹配 → ('body', ref_mode)。参照集以 L 收尾
+          ⇒ 分歧点 ≤ L 必使某参照章（含 L）在候选侧不匹配/缺失/不可判 → 结构上封死。逐对明细由只读辅助
+          `douban_list.body_pair_details` 给出（第五轮的 (a)(b) 两条被全称门覆盖，已删）。
+    先判书名/目录（零请求）再取参照：续作/同名异书在花任何抓章预算前即被拦，只有过前两关的候选才向前探参照。
+    ref_mode 回给调用方：'nearest_prior' 记进 sampling（附参照章号）；'reject' 表示结构上不该补（附 'body'）。
+    段位置标题核对（重点 2）仍在 fetch_segment 之后按**实际送模章**做（_seg_title_mismatch，不可判即拒）。
+    caches：{'cand_toc': {id: 原因}, 'cand_ch': {id: {num: text}}} 跨段复用，候选抓章 ≤SEG_FILL_VERIFY_MAX；
+    plan_ch_cache：计划源 num→text，窗口内已读章 + 向前探到的章都进缓存，跨段/跨候选不重抓（并入既有预算）。"""
+    caches = caches if caches is not None else {}
+    plan_ch_cache = plan_ch_cache if plan_ch_cache is not None else {}
+    # (1)(2) 书名折叠 + 目录信号：零正文请求（lblsegfix42 抽成 _title_toc_gate 供换锚复用，逻辑未改）。
+    why = _title_toc_gate(plan, cand, caches)
+    if why:
+        return why, '', []
+    # (3) 正文判同：取**目标窗口内**计划源章（plan_window_hits），窗口内不可读时向前探最近可读章
+    #     （nearest_prior，遇 4xx/预览即停）；一章都探不到 → reject 直接拒。取到参照后与候选**同章号**
+    #     正文逐章配对（≥2 互异章对）。
+    ref_hits, ref_mode = _plan_window_reference(engine_cli, plan, plan_window_hits, win,
+                                                deadline, clock, plan_ch_cache)
+    ref_nums = [h['num'] for h in ref_hits]
+    if ref_mode == 'reject' or not ref_hits:
+        return 'body', 'reject', ref_nums
+    if not _body_gate(engine_cli, plan, cand, ref_hits, deadline, clock, caches):
+        return 'body', ref_mode, ref_nums
+    return '', ref_mode, ref_nums
+
+
+def _title_toc_gate(plan: dict, cand: dict, caches: dict) -> str:
+    """补段身份前两关（fill_source_identity (1)(2)，lblsegfix42 抽出供换锚复用，逻辑逐字未改）→ 原因，'' = 过。"""
+    # (1) 书名繁简折叠：最便宜，先判，零正文请求（续作/异名书在此即拒）。
+    plan_title = _fold_title(plan.get('title') or '')
+    if not plan_title or _fold_title(cand.get('title') or '') != plan_title:
+        return 'title'
+    # (2) 目录信号（douban_list._toc_decides）：只比目录、零正文请求（r2_b/r2_d 在此即拒）。
+    toc_cache = caches.setdefault('cand_toc', {})
+    if id(cand) not in toc_cache:
+        judge, same, _, _ = douban_list._toc_decides(
+            {'toc': douban_list._informative_toc_titles(plan['chapters'])},
+            {'toc': douban_list._informative_toc_titles(cand['chapters'])})
+        toc_cache[id(cand)] = '' if (judge and same) else 'toc'
+    return toc_cache[id(cand)]
+
+
+def _body_gate(engine_cli, plan: dict, cand: dict, ref_hits: list[dict], deadline: float,
+               clock: Callable[[], float], caches: dict) -> bool:
+    """补段正文判同（fill_source_identity (3) 后半，lblsegfix42 抽出供换锚复用，逻辑逐字未改）→ 过？
+
+    候选按 ref_hits 章号抓**同章号**正文（≤SEG_FILL_VERIFY_MAX，缓存于 caches['cand_ch']），
+    须 `_body_decides` 判同**且**全称与门成立。"""
+    ref_nums = [h['num'] for h in ref_hits]
+    ch_cache = caches.setdefault('cand_ch', {}).setdefault(id(cand), {})
+    plan_fp = _fingerprint_from_hits(plan['chapters'], ref_hits)
+    cand_hits = _fetch_candidate_hits(engine_cli, cand, ref_nums,
+                                      deadline, clock, ch_cache)
+    cand_fp = _fingerprint_from_hits(cand['chapters'], cand_hits)
+    judge, same, _, _ = douban_list._body_decides(plan_fp, cand_fp)
+    if not (judge and same):
+        return False                                 # 保留「≥2 互异匹配章对」下限（`_body_decides`）
+    # 全称与门（rvlblseg R7 必修，改结构）：参照集已**以 L 收尾**（`_plan_window_reference`），此处再要求
+    # 参照集中**每一「计划源侧可判」章**（去模板 ≥SEG_FILL_PAIR_MIN_CHARS）在候选侧都**存在、可判且匹配**；
+    # 任一缺失 / 不可判 / 不匹配 → 拒。分歧点 ≤ L ⇒ L（及分歧点之后的参照章）在候选侧必与计划源不同
+    # ⇒ 被这道全称门拦下，结构上封死「分歧点 ≤ L 仍拼入」（R6 必修 1 window 间隙 + R6 必修 2 短章逃逸）。
+    # 逐对明细由只读辅助 `douban_list.body_pair_details` 给出；原 (a)(b) 两条被本条覆盖，删去不叠加。
+    pairs = {p['num']: p for p in douban_list.body_pair_details(plan_fp, cand_fp, SEG_FILL_PAIR_MIN_CHARS)}
+    for pc in plan_fp.get('body_by_chapter') or []:
+        if (pc.get('chars') or 0) < SEG_FILL_PAIR_MIN_CHARS:
+            continue                                 # 计划源侧该章太短、不可判 → 不据它否决（宁缺，非放行）
+        p = pairs.get(pc.get('num'))
+        if p is None or not (p['judgeable'] and p['same']):
+            return False                             # 候选侧缺失 / 不可判 / 不匹配 → 拒
+    return True
+
+
+def _plan_readable_reference(plan_ch_cache: dict) -> list[dict]:
+    """换锚核验参照（lblsegfix42）：计划源**可读区**已取到的章（plan_ch_cache 中 >100 字且非预览）
+    按章号升序、只留可判章（`_judgeable_hits`），取最后 ≤SEG_FILL_MAX_CHAPTERS 章——以计划源可读区的
+    L（最后一个可判章）收尾，L 定义与 `_plan_window_reference` 相同。"""
+    hits = [{'num': num, 'text': text} for num, text in plan_ch_cache.items()
+            if len(text or '') > 100 and not is_preview_body(text)]
+    return _judgeable_hits(_sorted_real_hits(hits))[-SEG_FILL_MAX_CHAPTERS:]
+
+
+def anchor_identity(engine_cli, plan: dict, cand: dict, deadline: float,
+                    clock: Callable[[], float] = time.monotonic,
+                    caches: dict | None = None,
+                    plan_ch_cache: dict | None = None) -> tuple[str, list]:
+    """换锚核验（lblsegfix42）→ (不通过原因, 参照章号)；原因 '' = 该候选可作锚。
+
+    锚 = 在**计划源可读区**与计划源正文判同成立的候选（锚链可追溯：只认计划源自己的正文作证，
+    不认「锚证锚」）：书名折叠 + 目录信号（`_title_toc_gate`，同补段）+ `_body_gate`（`_body_decides`
+    + 全称与门，SEG_FILL_PAIR_MIN_CHARS 不放宽），参照 = `_plan_readable_reference`（以可读区 L 收尾）。
+    可读区一章可判参照都没有 → ('noref', [])。结果按 (候选, 参照章号) 缓存，跨段不重核。
+    锚只证明「锚源在计划源可读区与计划源同书」；它在后段是否仍是同一本书由调用方的防护 B/C 逐段把关。"""
+    caches = caches if caches is not None else {}
+    why = _title_toc_gate(plan, cand, caches)
+    if why:
+        return why, []
+    if id(cand) in caches.get('body_fail', ()):
+        return 'body', []               # 本书已有一段在计划源正文上判它不同 → 不作锚（零请求）
+    ref_hits = _plan_readable_reference(plan_ch_cache or {})
+    ref_nums = [h['num'] for h in ref_hits]
+    if not ref_hits:
+        return 'noref', []
+    key = (id(cand), tuple(ref_nums))
+    done = caches.setdefault('anchor', {})
+    if key not in done:
+        done[key] = '' if _body_gate(engine_cli, plan, cand, ref_hits, deadline, clock, caches) else 'body'
+    return done[key], ref_nums
+
+
+def _anchor_window_toc_ok(plan_chapters: list[dict], win: dict, anchor_chapters: list[dict]) -> bool:
+    """换锚防护 B（lblsegfix42）：锚源目录在**本段窗口**与计划源目录有序一致 → 过？（见 _anchor_align）"""
+    return _anchor_align(plan_chapters, win, anchor_chapters) is not None
+
+
+def _anchor_align(plan_chapters: list[dict], win: dict, anchor_chapters: list[dict]) -> int | None:
+    """换锚防护 B（lblsegfix42）：锚源目录在**本段窗口**与计划源目录有序一致 → 对齐偏移 off
+    （锚源目录下标 = 计划源目录下标 + off），不一致/不可判 → None。
+
+    防的是：锚源整本目录判同、可读区正文也判同，但后段窗口目录换成另一本书/错乱。计划源窗口
+    [start, end) 取其首个信息性章名，在锚源目录里找同名章（多处同名取离窗口起点最近者）对齐起点，
+    截等长切片，两切片过 `douban_list._toc_decides`（Jaccard/有序 LCS/交集下限，不放宽）。
+    按章名对齐而非按下标：两站目录条数略有出入时窗口起点会错开，按下标比有序 LCS 会误拒。
+    真书上两站章号也常对不上（book.qq.com《斗破苍穹》目录第 634 章 = 正文「第六百零六章」，quanwenyuedu
+    按正文编号；quanwenyuedu《唐砖》分卷重排章号），所以锚段取章、段位置标题核对、防护 C 都按这个偏移
+    对位，不按章号。窗口无信息性章名、锚源找不到对齐章、切片不可判 → None（不可判一律拒）。"""
+    plan_slice = plan_chapters[win['start']:win['end']]
+    names = [_norm_toc_name(c.get('title') or '') for c in plan_slice]
+    first_off = next((k for k, n in enumerate(names) if n), None)
+    if first_off is None:
+        return None
+    anchor_names = [_norm_toc_name(c.get('title') or '') for c in anchor_chapters]
+    hits = [k for k, n in enumerate(anchor_names) if n == names[first_off]]
+    if not hits:
+        return None
+    pos = min(hits, key=lambda k: abs(k - (win['start'] + first_off)))
+    start = pos - first_off
+    if start < 0:
+        return None
+    a_slice = anchor_chapters[start:start + len(plan_slice)]
+    judge, same, _, _ = douban_list._toc_decides(
+        {'toc': douban_list._informative_toc_titles(plan_slice)},
+        {'toc': douban_list._informative_toc_titles(a_slice)})
+    return start - win['start'] if judge and same else None
+
+
+def _anchor_title_mismatch(plan_chapters: list[dict], anchor_chapters: list[dict], a_window: dict,
+                           off: int) -> float | None:
+    """锚段的段位置标题核对（lblsegfix42）：同 _seg_title_mismatch 口径（信息性章名归一后比、分母 0 → None
+    不可判），只是按防护 B 的对齐偏移对位（锚源下标 idx ↔ 计划源下标 idx - off），不按章号——两站章号错位时
+    按章号比会拿不同章互比。"""
+    total = mismatch = 0
+    for idx in range(a_window['start'], min(a_window['end'], len(anchor_chapters))):
+        p_idx = idx - off
+        if not 0 <= p_idx < len(plan_chapters):
+            continue
+        pn = _norm_toc_name(plan_chapters[p_idx].get('title') or '')
+        cn = _norm_toc_name(anchor_chapters[idx].get('title') or '')
+        if not pn or not cn:
+            continue
+        total += 1
+        if pn != cn:
+            mismatch += 1
+    return (mismatch / total) if total else None
+
+
+def _head_probe(text: str) -> set:
+    """计划源某章正文/预览 → 开头探针 4-gram（去尾部省略号、取前 SEG_ANCHOR_HEAD_CHARS 字、繁转简）。"""
+    head = _PREVIEW_TAIL_RE.sub('', (text or '').strip())[:SEG_ANCHOR_HEAD_CHARS]
+    return douban_list._char_ngrams(douban_list._to_simplified(head))
+
+
+def _plan_head_probe(engine_cli, plan: dict, num, deadline: float, clock: Callable[[], float],
+                     plan_ch_cache: dict, plan_head_cache: dict) -> set:
+    """计划源第 num 章的开头探针（防护 C 用）。付费墙章也要取：~200 字预览恰是本章开头。
+    先查 plan_ch_cache / plan_head_cache，未命中才抓（计入预算，结果进 plan_head_cache）；取不到 → 空集。"""
+    if num is None:
+        return set()
+    text = plan_ch_cache.get(num)
+    if text is None:
+        text = plan_head_cache.get(num)
+    if text is None:
+        ch = next((c for c in plan['chapters']
+                   if douban_list._toc_chapter_number(c.get('title') or '') == num), None)
+        if ch is None or deadline - clock() < SEG_MIN_REQUEST_S:
+            return set()
+        text = _segment_chapter_text(engine_cli, ch['url'], deadline, clock)
+        plan_head_cache[num] = text
+    return _head_probe(text)
+
+
+def _anchor_head_guard(engine_cli, plan: dict, anchor_hits: list[dict], deadline: float,
+                       clock: Callable[[], float], plan_ch_cache: dict,
+                       plan_head_cache: dict, off: int = 0) -> tuple[bool, list]:
+    """换锚防护 C（lblsegfix42）：锚源本段**实际送模章**的开头须与计划源同章号章（多为付费墙预览）开头一致
+    → (过？, 核对章号)。
+
+    防的是：锚源后段目录不变（防护 B 与段位置标题核对都看不出）而正文换成另一本书。核对送模章中**首章与末章**
+    （有章号者；换书一旦发生通常延续到书尾，末章兜住「送模区间中途换书」；该章计划源探针不可比则往里顺延，
+    每端至多 SEG_ANCHOR_HEAD_TRIES 章；锚章按防护 B 偏移 off 对位到计划源目录下标 idx - off，取该计划源章的章号）：
+    计划源探针 4-gram 数
+    ≥SEG_ANCHOR_HEAD_MIN_GRAMS 才算可比，可比章被锚章正文包含的比例须 ≥SEG_ANCHOR_HEAD_CONTAIN；
+    须 ≥1 章可比且可比章**全部**过线，否则拒（计划源该段 4xx、无预览可比 → 不可判一律拒）。"""
+    numbered = []
+    for h in anchor_hits:
+        p_idx = h['idx'] - off
+        if len(h.get('text') or '') > 100 and 0 <= p_idx < len(plan['chapters']):
+            p_num = douban_list._toc_chapter_number(plan['chapters'][p_idx].get('title') or '')
+            if p_num is not None:
+                numbered.append((p_num, h['text']))
+    checked: list = []
+    for side in (numbered, numbered[::-1]):
+        # 每端从最外一章往里找首个可比章（至多 SEG_ANCHOR_HEAD_TRIES 章），核它一章即止；两端相遇就不重复核
+        for p_num, text in side[:SEG_ANCHOR_HEAD_TRIES]:
+            if p_num in checked:
+                break
+            probe = _plan_head_probe(engine_cli, plan, p_num, deadline, clock, plan_ch_cache, plan_head_cache)
+            if len(probe) < SEG_ANCHOR_HEAD_MIN_GRAMS:
+                continue
+            body = douban_list._char_ngrams(douban_list._to_simplified(text))
+            checked.append(p_num)
+            if len(probe & body) / len(probe) < SEG_ANCHOR_HEAD_CONTAIN:
+                return False, checked
+            break
+    return bool(checked), checked
+
+
+def fetch_book_text_segmented(engine_cli, book: dict, tracker: SourceGiveupTracker,
+                              total_chars: int = ENGINE_TARGET_CHARS,
+                              time_budget_s: int = SEG_TIME_BUDGET_S,
+                              stats: dict | None = None,
+                              clock: Callable[[], float] = time.monotonic
+                              ) -> tuple[str, int, dict, dict]:
+    """分布式采样取文（LABELER_SEGMENTED=1）→ (带段标注的拼接原文, 原文字数, 计划源, sampling 诊断)。
+
+    候选源 = 名单主源 + engine_alternates（跳过 tracker.dead）；每源目录只取一次，目录身份校验同
+    fetch_book_text_engine（_check_toc_identity）：主源不符照旧抛 EngineIdentityMismatch，备选不符只跳过。
+    「计划源」= 第一个目录可用且身份通过的源（主源正常时就是主源；主源目录失败时同开关关的整本换源）。
+    段窗口按计划源的正文目录定；各段独立判可用性（segment_usable），不可用就换候选源补这一段（上一段成功的
+    源排最前）。补段源另须过 fill_source_identity（书名繁简折叠相等 + douban_list.same_book 双信号与门：
+    目录判同 + 计划源已取章节与候选同章号正文逐章配对判同，rvlblseg R2-6）；计划源纯编号目录时目录信号
+    不可判、same_book 必判否，不做按段换源，取不到的段标未取到。
+    sampling 里每段记 source/url（该段真实来源），switched = 该段不是名单主源供给的。
+    整本墙钟 time_budget_s 秒（单请求超时与退避都计入，见 _budget_engine_json），到时即停，
+    已取到的段照用，其余段标「未取到」。所有源都不可用的段：最好一次是真正文只是偏短 → 用它（partial），
+    否则标未取到。一段都没取到 → 抛 EngineSourceGaveUp。
+    返回的源恒为计划源（rvlblseg 必修 2）：调用方据此改写记录 url/source_host，口径同开关关——
+    补段源不改写记录 url，否则下轮 split_queue 按队列 url 认不出、重打标覆盖旧标签；补段来源只进 sampling。
+    stats 同 fetch_book_text_engine：toc_author/toc_title（计划源，已过身份校验）、nonbody_chapters、preview_chapters。"""
+    started = clock()
+    deadline = started + time_budget_s
+    stats = stats if stats is not None else {}
+    stats.setdefault('nonbody_chapters', 0)
+    stats.setdefault('preview_chapters', 0)
+    expect_title, expect_author = book.get('title') or '', book.get('author') or ''
+    primary = {'url': book['url'], 'title': expect_title,
+               'source': book.get('source_host') or _url_host(book['url'])}
+    options = [primary] + list(book.get('engine_alternates') or [])
+    tocs: dict[str, dict | None] = {}
+
+    def toc_of(i: int) -> dict | None:
+        """第 i 个候选源的正文目录 {chapters, names, title, toc_title, toc_author, nonbody}；不可用 → None（缓存）。"""
+        src = options[i]
+        if src['url'] in tocs:
+            return tocs[src['url']]
+        host = src.get('source') or _url_host(src['url'])
+        entry = None
+        if host in tracker.dead:
+            print(f'  跳过本轮已失效源: {host}')
+        else:
+            try:
+                toc = _budget_engine_json(engine_cli, deadline, clock, 'toc', '--url', src['url'])
+                toc_title, toc_author = _check_toc_identity(toc, expect_title, expect_author,
+                                                            title_fold=True)
+                raw = [c for c in (toc.get('chapters') or []) if c.get('url')]
+                body = [c for c in raw if not is_nonbody_toc_title((c.get('title') or '').strip())]
+                entry = {'chapters': body, 'names': set(douban_list._informative_toc_titles(body)),
+                         'title': toc_title or src.get('title') or '',
+                         'toc_title': toc_title, 'toc_author': toc_author,
+                         'nonbody': len(raw) - len(body)} if body else None
+            except SegmentBudgetExhausted:
+                pass
+            except EngineIdentityMismatch:
+                if i == 0:
+                    raise
+                print(f'  备选源 {host} 目录身份不符，跳过')
+            except EngineCliError as e:
+                print(f'  源 {host} 目录失败，跳过: {e}')
+                if e.kind in DETERMINISTIC_ENGINE_ERRORS:
+                    tracker.record(host)
+            except Exception as e:
+                print(f'  源 {host} 目录失败，跳过: {e}')
+        tocs[src['url']] = entry
+        return entry
+
+    plan_i, windows = None, []
+    for i in range(len(options)):
+        entry = toc_of(i)
+        if entry is not None:
+            plan_i = i
+            windows = segment_windows(len(entry['chapters']), segment_plan(total_chars))
+            stats['toc_title'], stats['toc_author'] = entry['toc_title'], entry['toc_author']
+            stats['nonbody_chapters'] += entry['nonbody']
+            break
+    if plan_i is None:
+        raise EngineSourceGaveUp(primary['source'], 'no_source',
+                                 f'{len(options)} 个候选源目录均不可用')
+    plan = tocs[options[plan_i]['url']]
+    # 补段源身份 = 书名折叠 + 目录信号 + 段位置标题 + 正文判同（rvlblseg R4 必修 2/4）：判同样本必须落在
+    # **目标段窗口内、或紧邻窗口起点之前**——计划源该段先取，其窗口内读到的可读章即为该段判同参照；
+    # 窗口内不可读时由 fill_source_identity 向前探最近可读章（nearest_prior），探不到即拒补段。
+    plan_ch_cache: dict = {}            # 计划源 num→text：窗口内已读章 + 向前探到的章，跨段/跨候选不重抓
+    plan_head_cache: dict = {}          # 计划源 num→text（含付费墙预览）：换锚防护 C 的开头探针来源（lblsegfix42）
+    fill_caches: dict = {}              # {'cand_toc': {id: 原因}, 'cand_ch': {id: {num: text}}}：跨段复用，候选抓章 ≤上限
+    plan_host = options[plan_i].get('source') or _url_host(options[plan_i]['url'])
+    plan_alive = True                   # 计划源是否还能出正文；某段正文全 4xx/预览（付费墙）后置否，后续段不再重复探计划源
+    no_fill = len(plan['names']) < douban_list.CONTENT_TOC_MIN_MATCH
+    if no_fill:
+        # 计划源纯编号目录：目录信号不可判 → same_book 必判否（rvlblseg R2-6 裁定 3）→ 不换源、标缺段。
+        print(f'  计划源目录信息性章名不足 {douban_list.CONTENT_TOC_MIN_MATCH} 个（纯编号目录），'
+              f'目录信号不可判、补段源无从核，不按段换源')
+    pieces, raw_total, seg_diag = [], 0, []
+    last_ok = plan_i
+    for win in windows:
+        best, tried = None, []
+        # 1) 计划源该段先取（既「可用即不换源」，也取该窗口内的判同参照，rvlblseg R4 必修 2/4）。
+        #    计划源已判死（付费墙）则不再重复探——但仍会在补段判同里向前探紧邻窗口的可读章。
+        plan_win_hits: list[dict] = []
+        if plan_alive and deadline - clock() >= SEG_MIN_REQUEST_S:
+            p_res = fetch_segment(engine_cli, plan['chapters'], {**win}, deadline, clock)
+            p_ok, p_why = segment_usable(p_res, win['target'], first_segment=win['no'] == 1)
+            # 计划源本段窗口内真实可读章（滤掉预览/空章）作窗口内判同参照，并入 plan_ch_cache 供向前探复用。
+            plan_win_hits = [h for h in p_res['hits'] if h.get('num') is not None
+                             and len(h.get('text') or '') > 100 and not is_preview_body(h['text'])]
+            for h in plan_win_hits:
+                plan_ch_cache.setdefault(h['num'], h['text'])
+            for h in p_res['hits']:
+                if h.get('num') is not None:
+                    plan_head_cache.setdefault(h['num'], h['text'])   # 预览也留：换锚防护 C 的探针
+            tried.append(f'{plan_host}:{p_why or "ok"}')
+            p_res.update(src_i=plan_i, window={**win}, ok=p_ok)
+            if p_ok:
+                best = p_res
+                last_ok = plan_i
+            else:
+                if p_why == 'preview':
+                    plan_alive = False          # 正文全 4xx/预览：付费墙从此段起，后续段不再探计划源
+                if p_res['parts'] and p_res['eff_chars'] / max(p_res['requested'], 1) >= SEG_MIN_AVG_CHARS:
+                    best = p_res                # 计划源真正文但偏短：留作兜底（partial）
+        # 2) 计划源该段不可用 且 允许换源 → 候选补段（判同样本落在本窗口内或紧邻窗口起点之前）。
+        if (best is None or not best.get('ok')) and not no_fill:
+            cand_order = [last_ok] + [i for i in range(len(options)) if i not in (last_ok, plan_i)]
+            for i in cand_order:
+                if i == plan_i:
+                    continue
+                if deadline - clock() < SEG_MIN_REQUEST_S:
+                    break
+                entry = toc_of(i)
+                if entry is None:
+                    continue
+                host = options[i].get('source') or _url_host(options[i]['url'])
+                src_win = next(
+                    (w for w in segment_windows(len(entry['chapters']), segment_plan(total_chars))
+                     if w['no'] == win['no']), None)
+                if src_win is None:
+                    continue
+                src_win = {**src_win, 'target': win['target']}
+                reason, ref_mode, ref_nums = fill_source_identity(
+                    engine_cli, plan, entry, win, deadline, clock, fill_caches,
+                    plan_window_hits=plan_win_hits, plan_ch_cache=plan_ch_cache)
+                if reason:
+                    print(f'  备选源 {host} 补段身份核验未过（{reason}/{ref_mode}），不用它补段')
+                    tried.append(f'{host}:identity_{reason}')
+                    if reason == 'body' and ref_mode != 'reject':
+                        # 已在计划源正文上判否的候选（同名异书/异版）永不作锚，也不再为它抓核验章
+                        fill_caches.setdefault('body_fail', set()).add(id(entry))
+                    if not (reason == 'body' and ref_mode == 'reject'):
+                        continue
+                    # 换锚（lblsegfix42）：计划源本段参照全是预览/4xx（reject）→ 该候选若在计划源可读区与
+                    # 计划源正文判同成立，就作锚补本段；另须过防护 B（窗口目录有序一致）与 C（预览开头一致）。
+                    a_why, a_nums = anchor_identity(engine_cli, plan, entry, deadline, clock,
+                                                    fill_caches, plan_ch_cache)
+                    a_off = None if a_why else _anchor_align(plan['chapters'], win, entry['chapters'])
+                    if not a_why and a_off is None:
+                        a_why = 'toc_window'
+                    if not a_why:
+                        # 锚段按对齐偏移取计划源本段窗口的对应章（两站章号/条数可能错位，不用锚源自己的段窗口）
+                        src_win = {**src_win, 'start': win['start'] + a_off,
+                                   'end': min(win['end'] + a_off, len(entry['chapters']))}
+                        # 防护 C 预探：计划源本段前 SEG_ANCHOR_HEAD_TRIES 个送模章（锚源对位章非 APP免费 类）里
+                        # 须有可比开头探针；都取不到（4xx/无预览）即不抓锚段
+                        win_nums = [n for n in (
+                            douban_list._toc_chapter_number(plan['chapters'][k - a_off].get('title') or '')
+                            for k in range(src_win['start'], src_win['end'])
+                            if not is_preview_title((entry['chapters'][k].get('title') or '').strip()))
+                            if n is not None][:SEG_ANCHOR_HEAD_TRIES]
+                        if not any(len(_plan_head_probe(engine_cli, plan, n, deadline, clock, plan_ch_cache,
+                                                        plan_head_cache)) >= SEG_ANCHOR_HEAD_MIN_GRAMS
+                                   for n in win_nums):
+                            a_why = 'head_noref'
+                    if a_why:
+                        print(f'  备选源 {host} 不能作锚（{a_why}），不用它补段')
+                        tried.append(f'{host}:anchor_{a_why}')
+                        continue
+                    ref_mode, ref_nums = 'anchor', a_nums
+                res = fetch_segment(engine_cli, entry['chapters'], src_win, deadline, clock)
+                ok, why = segment_usable(res, win['target'], first_segment=win['no'] == 1)
+                # 段位置标题核对（rvlblseg R3 重点 2 + R4 必修 3）：补段候选**实际送模章**标题须与计划源目录
+                # 同章号章名一致；不一致比例过高**或不可判（分母 0）**→ 弃该候选（不可判一律拒，同 same_book 口径）。
+                if (ok or ref_mode == 'anchor') and res['first'] is not None:   # 锚段兜底（partial）也要核
+                    sent = {'start': res['first'], 'end': res['last'] + 1}
+                    tm = (_anchor_title_mismatch(plan['chapters'], entry['chapters'], sent, a_off)
+                          if ref_mode == 'anchor' else _seg_title_mismatch(plan['chapters'], entry['chapters'], sent))
+                    if tm is None or tm > SEG_FILL_TITLE_MAX_MISMATCH:
+                        tried.append(f'{host}:title_pos')
+                        print(f'  第 {win["no"]} 段 {host} 送模章标题与计划源目录不符/不可判，弃')
+                        continue
+                head_nums: list = []
+                if ref_mode == 'anchor' and res['first'] is not None:
+                    # 换锚防护 C（lblsegfix42）：锚源送模首/末章开头须与计划源同章号预览开头一致（锚后段换书拦截）。
+                    head_ok, head_nums = _anchor_head_guard(engine_cli, plan, res['hits'], deadline, clock,
+                                                            plan_ch_cache, plan_head_cache, a_off)
+                    if not head_ok:
+                        tried.append(f'{host}:anchor_head')
+                        print(f'  第 {win["no"]} 段 {host} 锚段正文开头与计划源预览不符/不可判，弃')
+                        continue
+                tried.append(f'{host}:{why or "ok"}')
+                res.update(src_i=i, window=src_win, ok=ok, ref=ref_mode, ref_nums=ref_nums,
+                           head_nums=head_nums)
+                if ok:
+                    best = res
+                    last_ok = i
+                    break
+                print(f'  第 {win["no"]} 段 {host} 不可用（{why}，有效 {res["eff_chars"]} 字/'
+                      f'{res["requested"]} 章），换源补段')
+                if res['parts'] and res['eff_chars'] / max(res['requested'], 1) >= SEG_MIN_AVG_CHARS \
+                        and (best is None or res['eff_chars'] > best['eff_chars']):
+                    best = res              # 真正文但偏短：留作兜底（partial）
+        if best is None:
+            pieces.append(segment_marker(None, win['no']))
+            seg_diag.append({'no': win['no'], 'missing': True, 'tried': tried})
+            continue
+        src = options[best['src_i']]
+        pieces.append(segment_marker(best['window'], win['no'], best['first'], best['last'])
+                      + '\n\n' + '\n\n'.join(best['parts']))
+        raw_total += best['raw_chars']
+        stats['preview_chapters'] += best['preview_skipped']
+        seg_entry = {'no': win['no'], 'source': src.get('source') or _url_host(src['url']),
+                     'url': src['url'],
+                     'chapters': f'{best["first"] + 1}-{best["last"] + 1}',
+                     'chars': best['eff_chars'], 'switched': best['src_i'] != 0,
+                     'partial': not best['ok'], 'tried': tried}
+        if best.get('ref') == 'nearest_prior':
+            # 补段判同用了紧邻窗口起点之前的计划源章（窗口内计划源不可读）——如实记进 sampling 及参照章号。
+            seg_entry['ref'] = 'nearest_prior'
+            seg_entry['ref_nums'] = best.get('ref_nums') or []
+        if best.get('ref') == 'anchor':
+            # 换锚补段（lblsegfix42）：判同参照 = 锚源本身（锚已在计划源可读区 ref_nums 章与计划源判同），
+            # head_nums = 防护 C 核对过的计划源预览章号。
+            seg_entry['ref'] = 'anchor'
+            seg_entry['ref_nums'] = best.get('ref_nums') or []
+            seg_entry['head_nums'] = best.get('head_nums') or []
+            seg_entry['ref_src'] = src['url']
+        else:
+            seg_entry['ref_src'] = options[plan_i]['url']   # 计划源自供或以计划源正文作参照补段
+        seg_diag.append(seg_entry)
+    sampling = {'mode': 'segmented', 'fetch_secs': round(clock() - started, 1),
+                'segments': seg_diag}
+    if not raw_total:
+        raise EngineSourceGaveUp(primary['source'], 'no_source', '分段取文各段均未取到正文')
+    return '\n\n'.join(pieces), raw_total, options[plan_i], sampling
 
 
 # ---- 每轮失败分类（labelerdiag41 P3：巡检要一眼分出是代码缺陷、LLM 渠道还是书源问题）----
@@ -1879,10 +2816,10 @@ class EngineStopUrls:
             f.write(''.join(u + '\n' for u in urls))
         self._urls = frozenset(urls)
 
-    def run(self, subcommand: str, *args: str):
+    def run(self, subcommand: str, *args: str, **kw):
         url = args[1] if len(args) >= 2 and args[0] == '--url' else None
         if subcommand == 'content' and self.supported and url in self._urls:
-            proc = self._cli.run(subcommand, *args, STOP_URLS_FLAG, self.path)
+            proc = self._cli.run(subcommand, *args, STOP_URLS_FLAG, self.path, **kw)
             # 只认「不认识这个参数」类报错（旧 CLI）。新 CLI 自己报的「--stop-urls-file 无法读取」
             # 也是 rc=2 且 stderr 含该参数名，不能当成旧 CLI 把整轮停止点静默关掉（lblqualfix41，复审非阻断①）。
             if proc.returncode != 2 or not _UNKNOWN_OPTION_RE.search(proc.stderr or ''):
@@ -1890,7 +2827,7 @@ class EngineStopUrls:
             self.supported = False
             print(f'  提示: 引擎 CLI 不支持 {STOP_URLS_FLAG}（旧版），本轮取正文不带翻页停止点',
                   file=sys.stderr)
-        proc = self._cli.run(subcommand, *args)
+        proc = self._cli.run(subcommand, *args, **kw)
         if subcommand == 'toc':
             if proc.returncode == 0:
                 self._remember_toc(proc.stdout)
@@ -2005,6 +2942,94 @@ def merge_text_quality(segments: list[dict]) -> tuple[object, list[str]]:
                 evidence.append(item)
     return worst, evidence
 
+
+# ---- 后期落差字段 arc 的解析与证据校验（lblseg41）----
+# 分段模式下模型输出 arc；这里只信「能在送入文本里找到原文」的证据，防止对照组误报（lblab-41 §3.6(c)）：
+# quote 归一（NFKC + 去空白/标点/符号，见 _arc_norm）后必须是**所标段号那段**文本的子串，找不到或段号不对的丢弃；
+# decline 为 mild/severe 时有效证据须 ≥ ARC_MIN_EVIDENCE 条且覆盖 ≥2 个不同段，否则降为 unknown；缺开头或第 3、4 段都缺 → 强制 unknown。
+ARC_DECLINES = ('none', 'mild', 'severe', 'unknown')
+ARC_MIN_EVIDENCE = 2
+ARC_QUOTE_MAX = 50
+ARC_QUOTE_MIN = 12          # 归一后短于此的摘录不算证据：6 字常见短语（「他的心中一片宁静」）跨段都找得到
+#                             （rvlblseg ce1b），12 字起才像是真从该段摘的
+ARC_EVIDENCE_MAX = 6
+ARC_NOTE_MAX = 200
+_SEG_MARKER_RE = re.compile(r'【第 (\d+) 段：[^】\n]*】')
+_TITLE_LINE_RE = re.compile(r'【[^】\n]*】')   # 整行就是一个【…】：章节标题行（fetch_segment 的拼法）
+
+
+def _arc_norm(text: str) -> str:
+    """证据比对口径：NFKC 后去掉空白、标点、符号，只比正文字序（纯函数）。
+
+    小样实测（lblseg-41 §4）：模型逐字摘录时常把全角逗号写成半角（完美世界 2 条真原文因此被丢），
+    只归一空白会把真证据当伪造；标点不承载内容，去掉后仍要求 ≥ ARC_QUOTE_MIN 个正文字连续命中。"""
+    text = unicodedata.normalize('NFKC', text or '')
+    return ''.join(c for c in text if not c.isspace() and unicodedata.category(c)[0] not in 'PZS')
+
+
+def segment_bodies(text: str) -> dict[int, str]:
+    """带段标注的送模文本 → {段号: 该段正文（_arc_norm 归一后）}（纯函数）。未取到的段为空串。
+
+    章节标题行（整行一个【…】）不算正文：换成换行分隔（归一后的 quote 不含空白，故既匹配不到标题、
+    也不能跨章拼接；rvlblseg ce1b 标题行曾被当证据）。"""
+    marks = list(_SEG_MARKER_RE.finditer(text))
+    out: dict[int, str] = {}
+    for i, m in enumerate(marks):
+        end = marks[i + 1].start() if i + 1 < len(marks) else len(text)
+        out[int(m.group(1))] = ''.join(
+            '\n' if _TITLE_LINE_RE.fullmatch(line.strip()) else _arc_norm(line)
+            for line in text[m.end():end].split('\n')).strip('\n')
+    return out
+
+
+def _arc_segment_no(value) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and value.strip().isdigit():
+        return int(value.strip())
+    return None
+
+
+def normalize_arc(value, sent_text: str) -> dict:
+    """模型输出的 arc + 实际送入模型的文本 → 校验后的 arc（纯函数）。
+
+    → {decline, evidence: [{segment, quote}], note, checked: {dropped, forced}}；
+    checked.dropped = 被丢弃的证据条数，checked.forced = 强制降为 unknown 的原因（'' = 未强制）。"""
+    bodies = segment_bodies(sent_text)
+    raw = value if isinstance(value, dict) else {}
+    decline = raw.get('decline')
+    decline = decline.strip().lower() if isinstance(decline, str) else ''
+    if decline not in ARC_DECLINES:
+        decline = 'unknown'
+    items = raw.get('evidence') if isinstance(raw.get('evidence'), list) else []
+    evidence: list[dict] = []
+    dropped = 0
+    for item in items:
+        seg = _arc_segment_no(item.get('segment')) if isinstance(item, dict) else None
+        quote = item.get('quote') if isinstance(item, dict) else None
+        quote = quote.strip()[:ARC_QUOTE_MAX] if isinstance(quote, str) else ''
+        norm = _arc_norm(quote)
+        entry = {'segment': seg, 'quote': quote}
+        if seg is None or len(norm) < ARC_QUOTE_MIN or norm not in bodies.get(seg, '') \
+                or entry in evidence or len(evidence) >= ARC_EVIDENCE_MAX:
+            dropped += 1
+            continue
+        evidence.append(entry)
+    present = {no for no, body in bodies.items() if body.replace('\n', '')}
+    forced = ''
+    if 1 not in present or not present & {3, 4}:
+        forced = 'missing_segments'
+    elif decline in ('mild', 'severe') and (
+            len(evidence) < ARC_MIN_EVIDENCE or len({e['segment'] for e in evidence}) < 2):
+        forced = 'weak_evidence'
+    if forced:
+        decline = 'unknown'
+    note = raw.get('note')
+    note = note.strip()[:ARC_NOTE_MAX] if isinstance(note, str) else ''
+    return {'decline': decline, 'evidence': evidence, 'note': note,
+            'checked': {'dropped': dropped, 'forced': forced}}
 
 MODEL_RETRY = 2            # 打标时每个模型最多尝试次数
 
@@ -2173,7 +3198,8 @@ def _log_model(context: str, message: str) -> None:
 
 def label_book(text: str, api_key: str, models: list[str],
                site_title: str = '', site_author: str = '',
-               max_tokens: dict | None = None, meta: dict | None = None) -> tuple[dict, int]:
+               max_tokens: dict | None = None, meta: dict | None = None,
+               system_prompt: str = SYSTEM_PROMPT) -> tuple[dict, int]:
     """50 万字文本 → (标签 dict, 实际调用次数)。
     两段式：每段 ≤25 万字独立过 CF 100s 线（实测 40 万字单段 prefill 必撞 524）。
     第二段带第一段结论合并，可修正只看开头的误判；text_quality 两段各判、按 merge_text_quality 合并。
@@ -2187,19 +3213,22 @@ def label_book(text: str, api_key: str, models: list[str],
     context = f'书目={site_title or "（未知）"}'
     if len(text) <= SEGMENT_CHARS:
         labels = _label_once(text, api_key, models, verification,
-                             context=f'{context} 分段=1/1', max_tokens=max_tokens, used=used)
+                             context=f'{context} 分段=1/1', max_tokens=max_tokens, used=used,
+                             system_prompt=system_prompt)
         if meta is not None:
             meta['label_model'] = used.get('label_model', '')
         return labels, 1
     seg1, seg2 = text[:SEGMENT_CHARS], text[SEGMENT_CHARS:]
     labels1 = _label_once(seg1, api_key, models, verification,
-                          context=f'{context} 分段=1/2', max_tokens=max_tokens, used=used)
+                          context=f'{context} 分段=1/2', max_tokens=max_tokens, used=used,
+                          system_prompt=system_prompt)
     merged_user = (
         "【前次阅读结论】\n" + json.dumps(labels1, ensure_ascii=False)
         + "\n\n【后续文本】\n" + seg2 + MERGE_PROMPT_SUFFIX
     )
     labels2 = _label_once(merged_user, api_key, models, verification,
-                          context=f'{context} 分段=2/2', max_tokens=max_tokens, used=used)
+                          context=f'{context} 分段=2/2', max_tokens=max_tokens, used=used,
+                          system_prompt=system_prompt)
     quality, evidence = merge_text_quality([labels1, labels2])
     if quality is not None:
         labels2['text_quality'] = quality
@@ -2211,7 +3240,8 @@ def label_book(text: str, api_key: str, models: list[str],
 
 def _label_once(user_content: str, api_key: str, models: list[str],
                 verification: str = '', *, context: str = '',
-                max_tokens: dict | None = None, used: dict | None = None) -> dict:
+                max_tokens: dict | None = None, used: dict | None = None,
+                system_prompt: str = SYSTEM_PROMPT) -> dict:
     """单次 LLM 调用。流式。对链中每个模型最多试 MODEL_RETRY 次，
     某模型连续 MODEL_RETRY 次失败即切换下一个；全部模型耗尽才算本次失败。
     输出被截断 / 上游空回不在同模型上重试（同预算重试大概率同样结果），直接换下一个模型。
@@ -2230,7 +3260,7 @@ def _label_once(user_content: str, api_key: str, models: list[str],
             body = json.dumps({
                 'model': model, 'stream': True, 'max_tokens': limit,
                 'messages': [
-                    {'role': 'system', 'content': SYSTEM_PROMPT},
+                    {'role': 'system', 'content': system_prompt},
                     {'role': 'user', 'content': user_content + verification},
                 ],
             }).encode('utf-8')
@@ -2489,6 +3519,12 @@ def main() -> int:
     print('死源跨轮记忆: ' + (f'{dead_host_ttl} 秒有效期' if dead_host_ttl > 0 else '关闭'))
     print('被拒冷却后移: ' + (f'{reject_cooldown} 秒内被拒过的书移到队尾'
                               if reject_cooldown > 0 else '关闭'))
+    # lblseg41：分布式采样 + 按段换源补段（只作用于引擎条目；默认关，关时引擎路径逐字不变）
+    segmented = resolve_segmented(env)
+    seg_time_budget = resolve_seg_time_budget(env)
+    if segmented:
+        print(f'引擎取文: 分布式采样（四段，每本取文时限 {seg_time_budget} 秒，'
+              f'prompt_version={PROMPT_VERSION_SEGMENTED}）')
     # 断点续传：已写入 labels.jsonl 的书跳过（按详情页 url 判定）
     done_urls = load_done_urls(data_path('labels.jsonl'))
     # 钉子户终态：历史被拒 ≥ REJECT_TERMINAL_THRESHOLD 次的书同样跳过，
@@ -2650,6 +3686,7 @@ def main() -> int:
     for i, b in enumerate(queue, 1):
         print(f'[{i}/{len(queue)}] {b.get("title")} ...')
         fetch_stats: dict = {}      # 引擎取文统计（lbladfix41：跳过的公告条目 / 试读章数）
+        sampling: dict | None = None    # lblseg41：分段取文诊断；非 None ⇔ 本书走了分布式采样
         try:
             # 引擎兜底条目走 CLI 取正文（toc/content，不过 clean_chapter_text）；
             # rank/分类线走 book15 惰性元数据路径；douban/webnovel 候选已带元数据、--book
@@ -2659,9 +3696,21 @@ def main() -> int:
                 # 引擎条目 url 是绝对 host URL，绝不能走 http_get(BASE + url) 打错站。
                 # giveup41：主源失效（连续多章跨站跳转/4xx，或持续 5xx）提前放弃并换备选源；
                 # 换源成功则条目 url/source_host 改记实际来源（产物与入库记真实来源）。
-                text, chars, used = fetch_engine_book_with_giveup(
-                    engine_cli, b, source_giveups, giveup_streak=SOURCE_GIVEUP_STREAK,
-                    target_chars=engine_target_chars, stats=fetch_stats)
+                if segmented:
+                    # lblseg41：四段分布式采样，每段不可用就换源补这一段（见 fetch_book_text_segmented）。
+                    # used 恒为计划源（口径同开关关）：补段源不改写记录 url，各段来源只进 sampling（rvlblseg 必修 2）
+                    text, chars, used, sampling = fetch_book_text_segmented(
+                        engine_cli, b, source_giveups, total_chars=engine_target_chars,
+                        time_budget_s=seg_time_budget, stats=fetch_stats)
+                    print('  分段取文: ' + ' / '.join(
+                        f'第{s["no"]}段 未取到' if s.get('missing') else
+                        f'第{s["no"]}段 {s["source"]} 第{s["chapters"]}章 {s["chars"]}字'
+                        + ('（换源）' if s['switched'] else '') + ('（偏短）' if s['partial'] else '')
+                        for s in sampling['segments']) + f'，{sampling["fetch_secs"]}s')
+                else:
+                    text, chars, used = fetch_engine_book_with_giveup(
+                        engine_cli, b, source_giveups, giveup_streak=SOURCE_GIVEUP_STREAK,
+                        target_chars=engine_target_chars, stats=fetch_stats)
                 if used['url'] != b['url']:
                     b['url'], b['source_host'] = used['url'], used['source']
                 # author17k41：名单作者为空时，用已过身份校验（标题兼容）的 toc 自报作者回写
@@ -2755,7 +3804,11 @@ def main() -> int:
             labels, calls = label_book(
                 text, env['LLM_API_KEY'], models,
                 site_title=site_title, site_author=b.get('author', ''),
-                max_tokens=max_tokens, meta=llm_meta)
+                max_tokens=max_tokens, meta=llm_meta,
+                **({'system_prompt': SYSTEM_PROMPT + SEGMENTED_PROMPT_SUFFIX} if sampling else {}))
+            if sampling:
+                # lblseg41：arc 证据只认送入文本里找得到的原文（text 即本次送模文本），不足即降 unknown
+                labels['arc'] = normalize_arc(labels.get('arc'), text)
             # 有站点书名时：原字符串匹配 或 JSON 布尔 true 任一通过即入库。
             # --book 保留跳过书名校验；榜单空书名必须拒绝，不能自动放行。
             site_match = labels.get('site_title_match') is True
@@ -2840,13 +3893,16 @@ def main() -> int:
                 # prompt_version：SYSTEM_PROMPT 的版本常量，改提示词必须升版，否则事后无法按版本分桶；
                 # label_source：取文路径，text_engine=引擎源（多源兜底）/ text_book15=book15 站点。
                 'label_model': llm_meta.get('label_model', ''),
-                'prompt_version': PROMPT_VERSION,
+                'prompt_version': PROMPT_VERSION_SEGMENTED if sampling else PROMPT_VERSION,
                 'label_source': 'text_engine' if is_engine else 'text_book15',
                 'labels': labels,
             }
             if quality_flag:
                 b_out['quality_flag'] = quality_flag
                 b_out['text_quality_evidence'] = evidence
+            if sampling:
+                # lblseg41：分段取文诊断（每段源/章范围/有效字数/是否换源）；导入端忽略顶层未知字段
+                b_out['sampling'] = sampling
             if b.get('author_source'):
                 # author17k41：作者非名单原生（引擎 toc 回写）时留审计标记，供事后追溯
                 b_out['author_source'] = b['author_source']

@@ -3661,5 +3661,87 @@ class TestTitleTraditionalFold(unittest.TestCase):
         self.assertIn(douban_list._norm_title('魔道祖师'), done)
 
 
+
+class TestTocAdSuffixStrip(unittest.TestCase):
+    """lblsegfix42：目录比对前剥章名尾部广告/求票后缀（_strip_toc_ad_suffix）。
+
+    真书夹具 fixtures/toc-ad-suffix-realbooks.json 取自 lblsegreal42 实拉目录：同书 yunqi.qq.com 候选章名
+    尾部粘「APP免费」、计划源 book.qq.com 章名带「（求月票）」类尾巴，修前目录被判不同。"""
+
+    FIXTURE = Path(__file__).resolve().parent / 'fixtures' / 'toc-ad-suffix-realbooks.json'
+
+    def _decide(self, plan, cand):
+        return douban_list._toc_decides(
+            {'toc': douban_list._informative_toc_titles([{'title': t} for t in plan])},
+            {'toc': douban_list._informative_toc_titles([{'title': t} for t in cand])})
+
+    def test_suffix_table_positive(self):
+        cases = {
+            '第134章 离开APP免费': '离开',
+            '第129章 坑太多（求月票）APP免费': '坑太多',
+            '第6章 铁翼鸟再现（求推荐，求收藏）': '铁翼鸟再现',
+            '第131章 斗智斗勇（求月票，求订阅）': '斗智斗勇',
+            '第1048章 多方行动，风云际会（感谢青宁子盟主的十万赏！）': '多方行动,风云际会',   # NFKC 后半角逗号不在去标点表（既有口径）
+            '第261章 进化！（感谢蓝色的大包子萌主打赏~）': '进化',
+            '第154章 上蔡见闻『打赏加更1/13』': '上蔡见闻',
+            '第1855章 魔界之战 迷蜃幻境（第一更）': '魔界之战迷蜃幻境',
+            '第321章 最后的胜利者！【迟来的第三更！抱歉！】': '最后的胜利者',
+            '第1138章 发难【二合一】': '发难',
+            '第1230章:千里驰援!从天而降的援军! 二 二合一': '千里驰援从天而降的援军二',
+            '第187章:魏韩对峙 三 二合一': '魏韩对峙三',
+            '第1605章 起点填坑节，《唐砖》即将到来！更新时间：2022-11-25 15:59:10': '起点填坑节,唐砖即将到来',
+            '第132章 后悔之事（求月底月票）更新时间：2026-09-27 19:00:00APP免费': '后悔之事',
+        }
+        for title, want in cases.items():
+            with self.subTest(title=title):
+                self.assertEqual(douban_list._split_toc_numbering(title), (True, want))
+
+    def test_suffix_table_negative(self):
+        cases = {
+            '第5章 求生（上）': '求生上',                 # 分部标记不是广告，保留
+            '第7章 大战(二)': '大战二',
+            '第9章 APP免费的秘密': 'app免费的秘密',       # 只剥尾部，章名中间不动
+            '第3章 求月票的少年与剑': '求月票的少年与剑',   # 不带括号的「求」不剥（整条交给辅助判据）
+            '第12章 （求月票）': '求月票',                # 剥完为空 → 保留原串
+            '第2章 APP免费': 'app免费',
+            '第8章 天地二合一': '天地二合一',             # 无括号且前无空白：章名本身，不剥
+            '第8章 二合一': '二合一',                     # 剥完为空 → 保留原串
+        }
+        for title, want in cases.items():
+            with self.subTest(title=title):
+                self.assertEqual(douban_list._split_toc_numbering(title), (True, want))
+        # 剥完为空保留原串后仍按辅助条目剔除（求月票 含辅助子串）
+        self.assertEqual(douban_list._informative_toc_titles([{'title': '第12章 （求月票）'}]), [])
+
+    def test_realbook_yunqi_pairs_flip_to_same(self):
+        data = json.loads(self.FIXTURE.read_text(encoding='utf-8'))
+        self.assertEqual(len(data['same_book']), 5)
+        for pair in data['same_book']:
+            with self.subTest(book=pair['book']):
+                self.assertTrue(any('APP免费' in t for t in pair['cand']))   # 夹具确含广告尾缀
+                judge, same, jac, lcs = self._decide(pair['plan'], pair['cand'])
+                self.assertTrue(judge and same, (pair['book'], jac, lcs))
+
+    def test_realbook_diff_books_stay_different(self):
+        # 真异书 3 对（前传/续作 vs 正传）：剥尾缀后仍判不同（OFF 路径 same_book 目录信号同一函数）
+        data = json.loads(self.FIXTURE.read_text(encoding='utf-8'))
+        self.assertEqual(len(data['diff_book']), 3)
+        for pair in data['diff_book']:
+            with self.subTest(pair=pair['pair']):
+                judge, same, _, _ = self._decide(pair['plan'], pair['cand'])
+                self.assertFalse(same)
+
+    def test_shared_tails_do_not_merge_different_books(self):
+        # 两本不同书只共享求票尾巴：修前带尾巴的章被辅助子串整条剔掉，修后露出真实章名——仍判不同
+        tails = ['（求月票）', '（求订阅）', '（第一更）', '（感谢盟主）', '【二合一】', '（求推荐，求收藏）']
+        a = [f'第{i + 1}章 {n}{tails[i % len(tails)]}' for i, n in enumerate(
+            ['天才陨落', '星空之下', '古戒秘密', '炼药大师', '离开乌坦', '魔兽山脉', '云岚宗门', '三年之约'])]
+        b = [f'第{i + 1}章 {n}{tails[i % len(tails)]}' for i, n in enumerate(
+            ['山村少年', '七玄门下', '神秘小瓶', '长春功法', '墨府风云', '血色禁地', '升仙大会', '黄枫谷中'])]
+        judge, same, jac, _ = self._decide(a, b)
+        self.assertFalse(same)
+        self.assertEqual(jac, 0.0)
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)
