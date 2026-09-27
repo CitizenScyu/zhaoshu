@@ -948,6 +948,98 @@ class TestFillIdentityAndGate(_NoSleep):
         self.assertEqual(_poll_other(text), 0)                # 真同书，不含异书特征句
 
 
+def _short_escape_body(short_chars):
+    """候选正文（nearest_prior 短章逃逸形态，i2/i2b）：ch1..38 同书、ch39 = 另一本书但仅 short_chars 字、
+    ch40 回同书、ch41+ 异书。计划源(_a_late_4xx) ch39 可判(3000)，全称与门要求候选 ch39 也可判且匹配。"""
+    def b(i):
+        ch = i + 1
+        if ch <= 38:
+            return _book_body(i)
+        if ch == 39:
+            return _other_body(i, short_chars)
+        if ch == 40:
+            return _book_body(i)
+        return _other_body(i)
+    return b
+
+
+class TestFillIdentityWindowPath(_NoSleep):
+    """rvlblseg R7：补齐 ref=window 路径的与门端到端回归（第六轮复审指出上轮 4 条新测全落 nearest_prior）。
+    R7 结构：window 参照集改取窗口内计划源可判章的**最后** ≤4 章（以 L 收尾），全称与门要求参照集每章
+    （计划源侧可判）在候选侧都可判且匹配 → 分歧点 ≤ L 必在 L 章暴露 → 拒补。夹具：计划源读入 seg2 窗口
+    若干章后判 short（<40% target）触发补段且 ref=window；短章逃逸两条走 nearest_prior。"""
+
+    def _run_np(self, b_body):
+        """nearest_prior 形态：a 读 ch1..40（ch41 起 4xx）→ ref=nearest_prior[37,38,39,40]。"""
+        cli = make_cli({'a.example.com': {'n': 100, 'body': _a_late_4xx},
+                        'b.example.com': {'n': 100, 'body': b_body}})
+        text, chars, used, sampling, _ = _fetch(cli, _book(alternates=['b.example.com']))
+        return text, {s['no']: s for s in sampling['segments']}
+
+    def test_window_gap_diverge_at_L_rejected(self):
+        """i1_window_gap W-GAP：计划源窗口内读 ch41..45（5×800=4000<6000 short）→ ref=window 收尾于 L=45；
+        候选同到 ch44、ch45(=L)起换书。旧版参照截到窗口最前 4 章 [41..44] 看不到 ch45 → 泄漏；
+        R7 参照 = 末 4 章 [42..45] 含 L → ch45 不匹配 → 拒补，异书正文不混入。"""
+        a = lambda i: _book_body(i, 800) if i < 45 else None
+        b = lambda i: _book_body(i, 800) if (i + 1) <= 44 else _other_body(i, 800)
+        cli = make_cli({'a.example.com': {'n': 100, 'body': a},
+                        'b.example.com': {'n': 100, 'body': b}})
+        text, chars, used, sampling, _ = _fetch(cli, _book(alternates=['b.example.com']))
+        segs = {s['no']: s for s in sampling['segments']}
+        self.assertNotEqual(segs[2].get('source'), 'b.example.com')   # b 被拒，seg2 退回计划源短读
+        self.assertIn('b.example.com:identity_body', segs[2]['tried'])
+        self.assertEqual(_poll_other(text), 0)
+
+    def test_window_bigtotal_2000char_diverge_rejected(self):
+        """i1h total=240000（短阈值 18000，窗口 ch81..140）：计划源读 ch1..85 @2000 → 窗口读 5 章=10000<18000
+        short → ref=window 收尾于 L=85；候选同到 ch84、ch85(=L)起换书 → ch85 不匹配 → 拒补。"""
+        a = lambda i: _book_body(i, 2000) if i < 85 else None
+        b = lambda i: _book_body(i, 2000) if (i + 1) <= 84 else _other_body(i, 2000)
+        cli = make_cli({'a.example.com': {'n': 200, 'body': a},
+                        'b.example.com': {'n': 200, 'body': b}})
+        text, chars, used, sampling, _ = _fetch(cli, _book(alternates=['b.example.com']),
+                                                total_chars=240_000)
+        segs = {s['no']: s for s in sampling['segments']}
+        self.assertNotEqual(segs[2].get('source'), 'b.example.com')   # b 被拒，seg2 退回计划源短读
+        self.assertIn('b.example.com:identity_body', segs[2]['tried'])
+        self.assertEqual(_poll_other(text), 0)
+
+    def test_short_escape_candidate_499char_rejected(self):
+        """i2b 499 字分歧章：候选 ch39 = 异书但仅 499 字(<500 不可判)。旧版 ch39「不可判」→ 与门 (a) 看不到
+        分歧、ch40 匹配即放行 → 泄漏；R7 全称与门：计划源 ch39 可判(3000)而候选 ch39 不可判 → 拒补。"""
+        text, segs = self._run_np(_short_escape_body(499))
+        self.assertTrue(segs[2].get('missing'))
+        self.assertIn('b.example.com:identity_body', segs[2]['tried'])
+        self.assertEqual(_poll_other(text), 0)
+
+    def test_short_escape_v1_candidate_300char_rejected(self):
+        """i2 V1 形态：候选 ch39 = 异书但仅 300 字(<500 不可判) → 同上，拒补、异书不混入。"""
+        text, segs = self._run_np(_short_escape_body(300))
+        self.assertTrue(segs[2].get('missing'))
+        self.assertIn('b.example.com:identity_body', segs[2]['tried'])
+        self.assertEqual(_poll_other(text), 0)
+
+    def test_window_same_book_with_ad_noise_still_fills(self):
+        """window 路径硬正例（如实报）：真同书镜像，计划源窗口内读 ch41..45(5×800 short)→ ref=window[42..45]；
+        候选 b 全本同书、唯 L 章(ch45)尾部塞带标点的站点广告 → 用多样化正文 Jaccard 仍过阈 →
+        与门不误拒、seg2 由 b 补、异书混入 0。"""
+        def a(i):
+            return _diverse_body(i, 800) if i < 45 else None
+
+        def b(i):
+            base = _diverse_body(i, 800)
+            if i == 44:                                    # ch45 = L：尾部塞 800 字带标点广告
+                return base + '。' + (_AD_LINE * (800 // len(_AD_LINE) + 1))[:800]
+            return base
+        cli = make_cli({'a.example.com': {'n': 100, 'body': a},
+                        'b.example.com': {'n': 100, 'body': b}})
+        text, chars, used, sampling, _ = _fetch(cli, _book(alternates=['b.example.com']))
+        segs = {s['no']: s for s in sampling['segments']}
+        self.assertEqual(segs[2].get('source'), 'b.example.com')      # 真同书：seg2 由 b 补
+        self.assertNotEqual(segs[2].get('ref'), 'nearest_prior')      # 计划源读入窗口 → 走 window 分支
+        self.assertEqual(_poll_other(text), 0)
+
+
 class _TimedCli(FakeEngineCli):
     """带 timeout 属性的 CLI 桩：cost(sub, idx) → (耗时秒, 成功?)；传了 timeout 且耗时超过 → 超时失败。"""
 
