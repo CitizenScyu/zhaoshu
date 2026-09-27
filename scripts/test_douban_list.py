@@ -986,6 +986,78 @@ class TestEngineCliInvocation(unittest.TestCase):
         self.assertEqual(captured['env']['DATABASE_URL'],
                          'postgresql://user:pw@host/db')
 
+    @staticmethod
+    def _capture_env(cli):
+        captured = {}
+
+        def fake_run(cmd, **kwargs):
+            captured['cmd'] = cmd
+            captured['env'] = kwargs.get('env')
+            return _proc(0)
+
+        with mock.patch.object(douban_list.subprocess, 'run', fake_run):
+            cli.run('search', '--title', '斗破苍穹')
+        return captured
+
+    def test_forward_env_injects_pool_artifact_keys(self):
+        # artifactfwd42 a) .env 字典有两键 → 子进程 env 有，且不进命令行
+        env = {'SHUYUAN_POOL_ARTIFACT': '1',
+               'SHUYUAN_POOL_ARTIFACT_PATH': '/var/www/zhaoshu-pool/pool-artifact.json'}
+        cli = douban_list.EngineCli(node='node', script_path='/repo/scripts/engine-fetch.mjs',
+                                    database_url='x', forward_env=env)
+        got = self._capture_env(cli)
+        self.assertEqual(got['env']['SHUYUAN_POOL_ARTIFACT'], '1')
+        self.assertEqual(got['env']['SHUYUAN_POOL_ARTIFACT_PATH'],
+                         '/var/www/zhaoshu-pool/pool-artifact.json')
+        self.assertFalse(any('pool-artifact' in str(part) for part in got['cmd']))
+
+    def test_forward_env_absent_or_blank_not_injected(self):
+        # b) 没有（缺键 / 空串 / 纯空白 / 不传字典）→ 子进程 env 无这两键，也不出现空串
+        cases = [None, {}, {'SHUYUAN_POOL_ARTIFACT': '', 'SHUYUAN_POOL_ARTIFACT_PATH': '  '}]
+        for env in cases:
+            with self.subTest(env=env), mock.patch.dict(os.environ, {}, clear=False):
+                for k in douban_list.ENGINE_FORWARD_ENV_KEYS:
+                    os.environ.pop(k, None)
+                cli = douban_list.EngineCli(node='node',
+                                            script_path='/repo/scripts/engine-fetch.mjs',
+                                            database_url='x', forward_env=env)
+                got = self._capture_env(cli)
+                for k in douban_list.ENGINE_FORWARD_ENV_KEYS:
+                    self.assertNotIn(k, got['env'])
+
+    def test_forward_env_only_whitelisted_keys(self):
+        # c) 只转发白名单：.env 字典里的其他键（含假秘密、LLM key）不进子进程 env
+        self.assertEqual(douban_list.ENGINE_FORWARD_ENV_KEYS,
+                         ('SHUYUAN_POOL_ARTIFACT', 'SHUYUAN_POOL_ARTIFACT_PATH'))
+        env = {'SHUYUAN_POOL_ARTIFACT': '1', 'FAKE_SECRET_X': 'fake-not-real',
+               'LLM_API_KEY': 'test-key-not-real', 'SHUYUAN_POOL_OTHER': 'y'}
+        with mock.patch.dict(os.environ, {}, clear=False):
+            for k in env:
+                if k != 'SHUYUAN_POOL_ARTIFACT':
+                    os.environ.pop(k, None)
+            cli = douban_list.EngineCli(node='node', script_path='/repo/scripts/engine-fetch.mjs',
+                                        database_url='x', forward_env=env)
+            got = self._capture_env(cli)
+        self.assertEqual(got['env']['SHUYUAN_POOL_ARTIFACT'], '1')
+        for k in ('FAKE_SECRET_X', 'LLM_API_KEY', 'SHUYUAN_POOL_OTHER'):
+            self.assertNotIn(k, got['env'])
+        self.assertFalse(any('fake-not-real' in str(part) for part in got['cmd']))
+
+    def test_forward_env_keeps_database_url_behavior(self):
+        # d) DATABASE_URL 原有行为不变：构造参数注入；forward_env 里的 DATABASE_URL 不走转发
+        env = {'DATABASE_URL': 'postgresql://other:pw2@elsewhere/db',
+               'SHUYUAN_POOL_ARTIFACT': '1'}
+        cli = douban_list.EngineCli(node='node', script_path='/repo/scripts/engine-fetch.mjs',
+                                    database_url='postgresql://user:pw@host/db',
+                                    forward_env=env)
+        got = self._capture_env(cli)
+        self.assertEqual(got['env']['DATABASE_URL'], 'postgresql://user:pw@host/db')
+        self.assertFalse(any('postgres' in str(part) for part in got['cmd']))
+        # 其他宿主 env 原样继承
+        with mock.patch.dict(os.environ, {'ZS_HOST_ONLY_X': 'keep'}):
+            got = self._capture_env(cli)
+        self.assertEqual(got['env']['ZS_HOST_ONLY_X'], 'keep')
+
     def test_hook_defaults_to_sibling_of_script(self):
         cli = douban_list.EngineCli(node='node',
                                     script_path='/repo/scripts/engine-fetch.mjs',

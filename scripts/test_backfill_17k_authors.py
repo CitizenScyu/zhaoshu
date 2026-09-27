@@ -102,12 +102,15 @@ class TestBackfill17kAuthors(unittest.TestCase):
         reads = set(re.findall(r"env(?:\.get\(|\[)\s*['\"](\w+)['\"]", src))
         # engine_fallback_enabled 经常量读开关,不在 labeler.py 里以字面量出现
         reads.add(douban_list.ENGINE_FALLBACK_ENV)
+        # artifactfwd42：源池产物两键经 forward_env 由 EngineCli 按常量白名单读
+        reads |= set(douban_list.ENGINE_FORWARD_ENV_KEYS)
         whitelist = set(bf._ENGINE_ENV_KEYS)
         self.assertTrue(whitelist <= reads,
                         f'白名单含 labeler 不读的键: {sorted(whitelist - reads)}')
         # 反向也守住:引擎装配真正依赖的键不能被白名单漏掉
         self.assertTrue({'LABELER_ENGINE_FALLBACK', 'LABELER_ENGINE_CLI',
                          'LABELER_ENGINE_NODE', 'DATABASE_URL'} <= whitelist)
+        self.assertTrue(set(douban_list.ENGINE_FORWARD_ENV_KEYS) <= whitelist)
 
 
 import tempfile           # noqa: E402
