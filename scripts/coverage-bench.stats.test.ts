@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { summarize, compare, sourceStats, singlePointDependency, isCovered, okHosts } from './coverage-bench-stats.mjs';
+import { summarize, compare, sourceStats, singlePointDependency, isCovered, okHosts, matchTier } from './coverage-bench-stats.mjs';
 
 // 假结果：4 本书 × 若干源。q.io 命中 A、B；x.net 命中 B（可读）与 D（不可读，不算覆盖）；C 全灭。
 const RESULTS = [
@@ -36,7 +36,10 @@ describe('coverage-bench stats', () => {
     expect(s.totals.coverageRate).toBe(0.5);
     expect(s.totals.okPairs).toBe(3); // A:q, B:q, B:x
     expect(s.totals.idExactPairs).toBe(2); // A:q, B:q（B:x idExact=false）
-    expect(s.byTier.popular).toMatchObject({ books: 2, covered: 2, coverageRate: 1 });
+    expect(s.totals.tiers).toEqual({ exact: 2, identity: 1, fuzzy: 0 });
+    expect(s.totals.trusted).toBe(2);
+    expect(s.totals.trustedCoverageRate).toBe(0.5);
+    expect(s.byTier.popular).toMatchObject({ books: 2, covered: 2, coverageRate: 1, exact: 2, identity: 1, fuzzy: 0, trusted: 2, trustedCoverageRate: 1 });
     expect(s.byTier.library).toMatchObject({ books: 2, covered: 0, coverageRate: 0 });
     expect(s.byGenre['玄幻'].coverageRate).toBe(1);
     expect(s.uncovered.map((b: { title: string }) => b.title).sort()).toEqual(['C书', 'D书']);
@@ -81,5 +84,75 @@ describe('coverage-bench stats', () => {
     expect(c.newlyLost).toEqual([]);
     const qDelta = c.bySourceDelta.find((r) => r.host === 'q.io');
     expect(qDelta?.delta).toBe(1); // q.io ok 1 → 2
+    expect(c.tiers.exact).toEqual({ prev: 1, curr: 2, delta: 1 }); // A:q 从 miss 变 ok 精确
+    expect(c.tiers.identity).toEqual({ prev: 1, curr: 1, delta: 0 });
+    expect(c.tiers.fuzzy).toEqual({ prev: 0, curr: 0, delta: 0 });
+    expect(c.trustedCoverageRate).toEqual({ prev: 0.25, curr: 0.5, delta: 0.25 });
+  });
+
+  it('三档分类：exact / identity / fuzzy', () => {
+    const book = { title: 'E书', author: '戊', tier: 'popular', genre: '玄幻', perSource: [
+      { host: 'a.io', status: 'ok', readable: true, idExact: true },
+      { host: 'b.io', status: 'ok', readable: true, idExact: false },
+      { host: 'c.io', status: 'ok', readable: true, fuzzy: true },
+      { host: 'd.io', status: 'ok', readable: false, idExact: true }, // 不可读，不计档
+      { host: 'e.io', status: 'miss', readable: true },
+    ] };
+    expect(matchTier(book.perSource[0])).toBe('exact');
+    expect(matchTier(book.perSource[1])).toBe('identity');
+    expect(matchTier(book.perSource[2])).toBe('fuzzy');
+    const s = summarize([book]);
+    expect(s.totals.tiers).toEqual({ exact: 1, identity: 1, fuzzy: 1 });
+    expect(s.totals.okPairs).toBe(3);
+    expect(s.totals.covered).toBe(1);
+    expect(s.totals.trusted).toBe(1); // exact 与 identity 都算可信
+    expect(s.totals.trustedCoverageRate).toBe(1);
+    // 只有模糊降级的书不算可信覆盖
+    const fuzzyOnly = { title: 'F书', author: '己', tier: 'library', genre: '科幻', perSource: [
+      { host: 'c.io', status: 'ok', readable: true, fuzzy: true },
+    ] };
+    const s2 = summarize([fuzzyOnly]);
+    expect(s2.totals.covered).toBe(1);
+    expect(s2.totals.trusted).toBe(0);
+    expect(s2.totals.trustedCoverageRate).toBe(0);
+  });
+
+  it('可信覆盖率：至少一本 exact 或 identity 命中 / 总书数', () => {
+    const mk = (title: string, tier: string, perSource: unknown[]) => ({ title, author: '某', tier, genre: '玄幻', perSource });
+    const books = [
+      mk('甲', 'popular', [{ host: 'a.io', status: 'ok', readable: true, idExact: true }]),
+      mk('乙', 'popular', [{ host: 'b.io', status: 'ok', readable: true, idExact: false }]),
+      mk('丙', 'library', [{ host: 'c.io', status: 'ok', readable: true, fuzzy: true }]),
+      mk('丁', 'library', [{ host: 'd.io', status: 'miss', readable: true }]),
+    ];
+    const s = summarize(books);
+    expect(s.totals.books).toBe(4);
+    expect(s.totals.covered).toBe(3);
+    expect(s.totals.trusted).toBe(2);
+    expect(s.totals.trustedCoverageRate).toBe(0.5);
+    expect(s.byTier.popular.trustedCoverageRate).toBe(1);
+    expect(s.byTier.library.trustedCoverageRate).toBe(0);
+    expect(s.byTier.library.fuzzy).toBe(1);
+  });
+
+  it('旧格式 raw 兼容：缺 idExact/fuzzy/gotTitle 字段按 null 处理', () => {
+    const legacy = [
+      { title: '旧书', author: '旧', tier: 'popular', genre: '都市', perSource: [
+        { host: 'q.io', status: 'ok', readable: true, ms: 100 }, // 无 idExact、无 fuzzy
+        { host: 'w.com', status: 'miss', readable: true },
+      ] },
+    ];
+    expect(matchTier(legacy[0].perSource[0])).toBe('identity'); // idExact 缺失 → 非精确
+    const s = summarize(legacy);
+    expect(s.totals.tiers).toEqual({ exact: 0, identity: 1, fuzzy: 0 });
+    expect(s.totals.okPairs).toBe(1);
+    expect(s.totals.trusted).toBe(1);
+    expect(s.totals.trustedCoverageRate).toBe(1);
+    // 旧 summary 没有 tiers/trusted 字段时，compare 按 0 处理不抛
+    const curr = summarize(RESULTS);
+    const c = compare({ totals: { coverageRate: 0.5 }, byTier: {}, uncovered: [], bySource: [], singlePoint: { ratio: 0 } }, curr);
+    expect(c.tiers.exact).toEqual({ prev: 0, curr: 2, delta: 2 });
+    expect(c.tiers.fuzzy).toEqual({ prev: 0, curr: 0, delta: 0 });
+    expect(c.trustedCoverageRate.prev).toBe(0);
   });
 });

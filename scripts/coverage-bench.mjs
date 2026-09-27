@@ -6,7 +6,10 @@
 //   node scripts/coverage-bench.mjs summarize <raw.json> [--out summary.json] [--md report.md] [--label 名] [--prev 上次summary.json]
 //   node scripts/coverage-bench.mjs compare <prevSummary.json> <currSummary.json> [--md out.md]
 //
-// raw.json：数组，或 { meta, results: [...] }；每本 { title, author, tier, genre, perSource:[{host,name,status,readable,ms,idExact}] }。
+// raw.json：数组，或 { meta, results: [...] }；每本 { title, author, tier, genre, perSource:[
+//   { host, name, status, readable, ms, idExact, gotTitle, gotAuthor, fuzzy }] }。
+// gotTitle/gotAuthor/fuzzy 为可选新字段（旧 raw 缺失按 null/false 处理，向后兼容）。
+// ok 对分三档：exact（idExact=true）/ identity（ok 但非精确）/ fuzzy（fuzzy=true，走了模糊降级）。
 import { readFileSync, writeFileSync } from 'node:fs';
 import { summarize, compare, renderMarkdown } from './coverage-bench-stats.mjs';
 
