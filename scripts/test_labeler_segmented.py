@@ -862,6 +862,92 @@ class TestFillIdentityEndToEnd(_NoSleep):
         self.assertFalse([c for c in cli.calls if labeler._url_host(c[1]) == 'b.example.com'])
 
 
+_AD_LINE = '本站永久域名请记住并推荐给书友多多支持正版订阅谢谢大家的厚爱与陪伴一路相随。'
+_DIV_POOL = ('风云雷电山河湖海剑气刀光血月妖魔仙神魂魄天地玄黄宇宙洪荒'
+             '少年白发红颜青丝古道西风瘦马小桥流水人家断肠天涯明月清泉')
+
+
+def _diverge_after(keep_upto):
+    """b 侧正文：章号 ≤keep_upto 与计划源逐字相同（_book_body），其后换另一本书（_other_body）。
+    分歧点 = ch(keep_upto+1)。参照 = nearest_prior[37,38,39,40]：keep_upto=38→分歧 ch39=L−1（F1/d=2），
+    =39→分歧 ch40=L（d=1）。"""
+    return lambda i: _book_body(i) if (i + 1) <= keep_upto else _other_body(i)
+
+
+def _diverse_body(i, n=2000):
+    """逐章各异的伪随机中文正文（n-gram 集丰富，贴近真实章节，非重复短句夹具）；同 i 稳定复现
+    → 同书跨源同章一致。用于「真同书 + 参照章带广告噪声」硬正例：真实章节噪声不该把 Jaccard 打崩。"""
+    import random
+    r = random.Random(90_000 + i)
+    head = f'第{i}章起。'
+    return head + ''.join(r.choice(_DIV_POOL) for _ in range(n - len(head)))
+
+
+def _poll_other(text):
+    """异书特征句命中数（_OTHER 情节句出现在送模文本里的条数）→ >0 即混书。"""
+    return sum(1 for s in _OTHER if s in text)
+
+
+class TestFillIdentityAndGate(_NoSleep):
+    """rvlblseg R5 必修 F1（改结构=与门）端到端回归：`_body_decides` 只数「≥2 互异匹配章对」，分歧点落在
+    参照章之内（L−1、L）时前若干章仍匹配、凑够 2 对即被旧逻辑放行 → 分歧章及其后异书正文被拼入。
+    与门加两道否决：(a) 任一可判且不匹配章对 → 拒；(b) 最靠近窗口的参照章必须可判且匹配。
+    夹具：a 读 ch1..40（ch41 起 4xx）→ seg2 窗口(41+)不可读 → 向前探近邻参照 nearest_prior=[37,38,39,40]。"""
+
+    def _run(self, b_body, **b_spec):
+        cli = make_cli({
+            'a.example.com': {'n': 100, 'body': _a_late_4xx},
+            'b.example.com': dict({'n': 100, 'body': b_body}, **b_spec),
+        })
+        text, chars, used, sampling, _ = _fetch(cli, _book(alternates=['b.example.com']))
+        return text, {s['no']: s for s in sampling['segments']}
+
+    def test_f1_diverge_at_L_minus_1_rejected(self):
+        """必修 F1 == 边界 d=2：b 与 a 同到 ch38、ch39(=L−1)起换书。参照 [37,38,39,40] 里 37/38 匹配、
+        39/40 可判且不匹配 → 与门条件 (a) 否决 → 拒补段，异书正文不混入（旧逻辑：2 对匹配即放行 → 泄漏）。"""
+        text, segs = self._run(_diverge_after(38))
+        self.assertTrue(segs[2].get('missing'))
+        self.assertIn('b.example.com:identity_body', segs[2]['tried'])
+        self.assertEqual(_poll_other(text), 0)
+        self.assertNotIn('b.example.com', text)
+
+    def test_diverge_at_L_rejected(self):
+        """边界 d=1：b 与 a 同到 ch39、ch40(=L，最靠近窗口的参照章)起换书。参照 37/38/39 匹配、ch40 可判且
+        不匹配 → 与门条件 (a) 与 (b) 同时否决 → 拒补段（旧逻辑：3 对匹配即放行 → 泄漏）。"""
+        text, segs = self._run(_diverge_after(39))
+        self.assertTrue(segs[2].get('missing'))
+        self.assertIn('b.example.com:identity_body', segs[2]['tried'])
+        self.assertEqual(_poll_other(text), 0)
+
+    def test_deep_diverge_stays_rejected(self):
+        """边界 d=3：b 与 a 只同到 ch37、ch38 起换书 → 参照里只有 1 对匹配 → `_body_decides` 本就判否
+        （与门前已安全，回归护栏防未来放松）。"""
+        text, segs = self._run(_diverge_after(37))
+        self.assertTrue(segs[2].get('missing'))
+        self.assertEqual(_poll_other(text), 0)
+
+    def test_same_book_with_ad_noise_still_fills(self):
+        """新硬正例（如实报）：真同书镜像，唯独**最靠近窗口的参照章 ch40** 正文尾部塞 800 字站点广告。
+        用**多样化正文**（贴近真实章节）：广告噪声后同章 Jaccard 仍 ≥阈值 → 与门不误拒、seg2 照常补段。
+        （用重复短句夹具则噪声会把稀疏 n-gram 集的并集撑大、Jaccard 崩 → 那是夹具假象，见 §11 覆盖率代价。）"""
+        def a_body(i):
+            return _diverse_body(i) if i < 40 else None       # a 读 1..40，ch41 起 4xx
+
+        def b_body(i):
+            base = _diverse_body(i)                            # b 全本真同书镜像
+            if i == 39:                                        # ch40：尾部塞 800 字广告
+                return base + '\n' + (_AD_LINE * (800 // len(_AD_LINE) + 1))[:800]
+            return base
+        cli = make_cli({
+            'a.example.com': {'n': 100, 'body': a_body},
+            'b.example.com': {'n': 100, 'body': b_body},
+        })
+        text, chars, used, sampling, _ = _fetch(cli, _book(alternates=['b.example.com']))
+        segs = {s['no']: s for s in sampling['segments']}
+        self.assertEqual((segs[2]['source'], segs[2].get('ref')), ('b.example.com', 'nearest_prior'))
+        self.assertEqual(_poll_other(text), 0)                # 真同书，不含异书特征句
+
+
 class _TimedCli(FakeEngineCli):
     """带 timeout 属性的 CLI 桩：cost(sub, idx) → (耗时秒, 成功?)；传了 timeout 且耗时超过 → 超时失败。"""
 

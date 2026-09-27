@@ -2157,8 +2157,10 @@ def fill_source_identity(engine_cli, plan: dict, cand: dict,
       (2) 目录信号 douban_list._toc_decides 可判且判同，否则 ('toc', '')（零正文请求，r2_b/r2_d 在此即拒）；
       (3) 正文判同：`_plan_window_reference` 取**目标窗口内**计划源章（plan_window_hits），窗口内不可读时
           **向前探 ≤SEG_FILL_MAX_CHAPTERS 章、遇 4xx/预览即停**抓计划源正文作近邻参照（ref='nearest_prior'）；
-          一章都探不到 → ref='reject' 直接拒（'body'）。取到参照后与候选**同章号**正文逐章配对（≥2 互异章对）；
-          不判同 → ('body', ref_mode)。
+          一章都探不到 → ref='reject' 直接拒（'body'）。取到参照后与候选**同章号**正文逐章配对，须**三条与门**
+          同时成立才放行（rvlblseg R5 必修 F1，只改本处、不动 `_body_decides`）：≥2 互异匹配章对（`_body_decides`）
+          且无任何「可判且不匹配」章对（否则分歧点已落在参照之内）且最靠近窗口的参照章可判且匹配；任一不成
+          立 → ('body', ref_mode)。逐对明细由只读辅助 `douban_list.body_pair_details` 给出。
     先判书名/目录（零请求）再取参照：续作/同名异书在花任何抓章预算前即被拦，只有过前两关的候选才向前探参照。
     ref_mode 回给调用方：'nearest_prior' 记进 sampling（附参照章号）；'reject' 表示结构上不该补（附 'body'）。
     段位置标题核对（重点 2）仍在 fetch_segment 之后按**实际送模章**做（_seg_title_mismatch，不可判即拒）。
