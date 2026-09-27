@@ -2101,24 +2101,36 @@ def _sorted_real_hits(*hit_lists) -> list[dict]:
     return out
 
 
+def _judgeable_hits(hits: list[dict]) -> list[dict]:
+    """参照集只保留计划源侧「可判」章：去模板后正文 ≥ SEG_FILL_PAIR_MIN_CHARS 字（rvlblseg R7）。
+
+    去模板口径同 `_fingerprint_from_hits`（整组一起清洗，跨章模板才识别得出）。太短到不可判的章
+    既不该进参照集（补段全称与门无从据它判候选侧），也不该定义 L——L = 计划源**最后一个可判章**，
+    「分歧点 > L」才是已接受残余。传入 hits 需已按章号升序（`_sorted_real_hits`）。"""
+    cleaned = douban_list._clean_body_chapters([h.get('text') or '' for h in hits])
+    return [h for h, body in zip(hits, cleaned)
+            if body is not None and len(body) >= SEG_FILL_PAIR_MIN_CHARS]
+
+
 def _plan_window_reference(engine_cli, plan: dict, plan_window_hits: list[dict] | None,
                            win: dict, deadline: float, clock: Callable[[], float],
                            plan_ch_cache: dict) -> tuple[list[dict], str]:
-    """补段判同的计划源参照章 + 参照模式（rvlblseg R4 必修 2 红线，改结构）→ (参照章 hits, ref_mode)。
+    """补段判同的计划源参照章 + 参照模式（rvlblseg R4 必修 2 红线，R7 改结构以 L 收尾）→ (参照章 hits, ref_mode)。
 
-    核心红线：**判同样本必须落在目标段窗口内、或紧邻窗口起点之前**，不再拿远处书首/近窗组给分歧点
-    之后的正文背书（第四轮复审 E1：计划源读到 41–45 后 4xx，旧「近窗组」永远落在 42–45，给窗口
-    71–90 的换书候选背书 → 混入）。
-      - `'window'`：计划源在**目标段窗口内**已读到可读章（plan_window_hits，调用方已滤掉预览/空章）→
-        直接用它们与候选**同章号**章判同；第 1 段窗口即书首，同样走窗口内章。
-      - `'nearest_prior'`：窗口内无计划源可读章 → 从窗口起点**向前探 ≤SEG_FILL_MAX_CHAPTERS 章、
-        遇 4xx/预览即停**，抓计划源正文，探到的最近可读章作参照（计入 240s 预算；命中 plan_ch_cache
-        不重抓）。分歧区在窗口起点之前即断裂时探不到章 → 落到 reject。
-      - `'reject'`：一章可读参照都探不到 → 拒补段、宁缺（异书混入 0 优先于覆盖率）。
+    核心红线：**判同样本必须落在目标段窗口内、或紧邻窗口起点之前，且必须以 L（计划源最后一个可判章）
+    收尾**——否则分歧点落在 (max(参照), L] 区间时全称与门看不到它（第六轮复审 R6 必修 1：window 模式
+    旧取窗口**最前** 4 章 in_window[:4]，计划源读到窗口第 5 章及以后时 L 超出参照集 → 分歧点 ≤ L 仍漏）。
+      - `'window'`：计划源在**目标段窗口内**已读到可判章（plan_window_hits，调用方已滤预览/空章，此处再滤
+        「去模板 ≥SEG_FILL_PAIR_MIN_CHARS」的可判章）→ 取**最后** ≤SEG_FILL_MAX_CHAPTERS 章（以 L 收尾）
+        与候选**同章号**章判同；第 1 段窗口即书首，同样走窗口内章。
+      - `'nearest_prior'`：窗口内无计划源可判章 → 从窗口起点**向前探 ≤SEG_FILL_MAX_CHAPTERS 章、
+        遇 4xx/预览即停**，抓计划源正文，探到的最近可判章作参照（计入 240s 预算；命中 plan_ch_cache
+        不重抓）；连续读到窗口起点时 max(参照)=L，无 window 模式的间隙。探不到可判章 → reject。
+      - `'reject'`：一章可判参照都探不到 → 拒补段、宁缺（异书混入 0 优先于覆盖率）。
     所有取章号处经 douban_list._toc_chapter_number；`num is None`（楔子/序章）不参与按章号配对（必修 1）。"""
-    in_window = _sorted_real_hits(plan_window_hits)
+    in_window = _judgeable_hits(_sorted_real_hits(plan_window_hits))
     if in_window:
-        return in_window[:SEG_FILL_MAX_CHAPTERS], 'window'
+        return in_window[-SEG_FILL_MAX_CHAPTERS:], 'window'   # 以 L（窗口内最后一个可判章）收尾
     chapters = plan.get('chapters') or []
     start = win.get('start', 0)
     prior: list[dict] = []
@@ -2139,8 +2151,8 @@ def _plan_window_reference(engine_cli, plan: dict, plan_window_hits: list[dict] 
         if len(text) <= 100 or is_preview_body(text):
             break                       # 遇 4xx/预览即停：分歧区无参照，宁缺
         prior.append({'num': num, 'text': text})
-    real = _sorted_real_hits(prior)
-    return (real[:SEG_FILL_MAX_CHAPTERS], 'nearest_prior') if real else ([], 'reject')
+    real = _judgeable_hits(_sorted_real_hits(prior))   # 只计入可判章（以最靠近窗口的可判章收尾）
+    return (real[-SEG_FILL_MAX_CHAPTERS:], 'nearest_prior') if real else ([], 'reject')
 
 
 def fill_source_identity(engine_cli, plan: dict, cand: dict,
@@ -2155,12 +2167,14 @@ def fill_source_identity(engine_cli, plan: dict, cand: dict,
     **判同样本必须落在目标段窗口内、或紧邻窗口起点之前**（见 `_plan_window_reference`）：
       (1) 书名繁简折叠相等（_fold_title），否则 ('title', '')（零正文请求，续作/异名书在此即拒）；
       (2) 目录信号 douban_list._toc_decides 可判且判同，否则 ('toc', '')（零正文请求，r2_b/r2_d 在此即拒）；
-      (3) 正文判同：`_plan_window_reference` 取**目标窗口内**计划源章（plan_window_hits），窗口内不可读时
-          **向前探 ≤SEG_FILL_MAX_CHAPTERS 章、遇 4xx/预览即停**抓计划源正文作近邻参照（ref='nearest_prior'）；
-          一章都探不到 → ref='reject' 直接拒（'body'）。取到参照后与候选**同章号**正文逐章配对，须**三条与门**
-          同时成立才放行（rvlblseg R5 必修 F1，只改本处、不动 `_body_decides`）：≥2 互异匹配章对（`_body_decides`）
-          且无任何「可判且不匹配」章对（否则分歧点已落在参照之内）且最靠近窗口的参照章可判且匹配；任一不成
-          立 → ('body', ref_mode)。逐对明细由只读辅助 `douban_list.body_pair_details` 给出。
+      (3) 正文判同：`_plan_window_reference` 取**目标窗口内**计划源可判章（plan_window_hits，以 L 收尾），
+          窗口内不可判时**向前探 ≤SEG_FILL_MAX_CHAPTERS 章、遇 4xx/预览即停**抓计划源正文作近邻参照
+          （ref='nearest_prior'）；一章都探不到 → ref='reject' 直接拒（'body'）。取到参照后与候选**同章号**
+          正文逐章配对，须**全称与门**成立才放行（rvlblseg R7 必修，只改本处、不动 `_body_decides`）：
+          ≥2 互异匹配章对（`_body_decides` 下限）**且**参照集中每一「计划源侧可判」章在候选侧都存在、可判
+          （≥SEG_FILL_PAIR_MIN_CHARS）且匹配；任一缺失/不可判/不匹配 → ('body', ref_mode)。参照集以 L 收尾
+          ⇒ 分歧点 ≤ L 必使某参照章（含 L）在候选侧不匹配/缺失/不可判 → 结构上封死。逐对明细由只读辅助
+          `douban_list.body_pair_details` 给出（第五轮的 (a)(b) 两条被全称门覆盖，已删）。
     先判书名/目录（零请求）再取参照：续作/同名异书在花任何抓章预算前即被拦，只有过前两关的候选才向前探参照。
     ref_mode 回给调用方：'nearest_prior' 记进 sampling（附参照章号）；'reject' 表示结构上不该补（附 'body'）。
     段位置标题核对（重点 2）仍在 fetch_segment 之后按**实际送模章**做（_seg_title_mismatch，不可判即拒）。
@@ -2196,20 +2210,19 @@ def fill_source_identity(engine_cli, plan: dict, cand: dict,
     cand_fp = _fingerprint_from_hits(cand['chapters'], cand_hits)
     judge, same, _, _ = douban_list._body_decides(plan_fp, cand_fp)
     if not (judge and same):
-        return 'body', ref_mode, ref_nums
-    # 与门（rvlblseg R5 必修 F1）：`_body_decides` 只数「≥2 互异匹配章对」，属「任一信号过线即放行」——
-    # 分歧点落在参照章之内（L−1、L）时前面若干章仍匹配、凑够 2 对即放行，分歧章及其后正文被拼入。
-    # 逐对明细再加两道否决（不改 _body_decides）：
-    #   (a) 任一「可判且不匹配」章对（两侧该章都 ≥SEG_FILL_PAIR_MIN_CHARS 字、Jaccard <阈值）→ 拒；
-    #   (b) 章号最大的参照章（最靠近窗口）必须可判且匹配，否则拒（窗口边界章不一致 = 分歧点已到）。
-    # 三条（含原有 ≥2 互异匹配章对）同时满足才放行。
-    pairs = douban_list.body_pair_details(plan_fp, cand_fp, SEG_FILL_PAIR_MIN_CHARS)
-    if any(p['judgeable'] and not p['same'] for p in pairs):
-        return 'body', ref_mode, ref_nums            # (a) 参照章内出现可判不匹配 → 分歧点在参照之内
-    top_num = max(ref_nums) if ref_nums else None
-    top = next((p for p in pairs if p['num'] == top_num), None)
-    if top is None or not (top['judgeable'] and top['same']):
-        return 'body', ref_mode, ref_nums            # (b) 最靠近窗口的参照章不可判或不匹配 → 拒
+        return 'body', ref_mode, ref_nums            # 保留「≥2 互异匹配章对」下限（`_body_decides`）
+    # 全称与门（rvlblseg R7 必修，改结构）：参照集已**以 L 收尾**（`_plan_window_reference`），此处再要求
+    # 参照集中**每一「计划源侧可判」章**（去模板 ≥SEG_FILL_PAIR_MIN_CHARS）在候选侧都**存在、可判且匹配**；
+    # 任一缺失 / 不可判 / 不匹配 → 拒。分歧点 ≤ L ⇒ L（及分歧点之后的参照章）在候选侧必与计划源不同
+    # ⇒ 被这道全称门拦下，结构上封死「分歧点 ≤ L 仍拼入」（R6 必修 1 window 间隙 + R6 必修 2 短章逃逸）。
+    # 逐对明细由只读辅助 `douban_list.body_pair_details` 给出；原 (a)(b) 两条被本条覆盖，删去不叠加。
+    pairs = {p['num']: p for p in douban_list.body_pair_details(plan_fp, cand_fp, SEG_FILL_PAIR_MIN_CHARS)}
+    for pc in plan_fp.get('body_by_chapter') or []:
+        if (pc.get('chars') or 0) < SEG_FILL_PAIR_MIN_CHARS:
+            continue                                 # 计划源侧该章太短、不可判 → 不据它否决（宁缺，非放行）
+        p = pairs.get(pc.get('num'))
+        if p is None or not (p['judgeable'] and p['same']):
+            return 'body', ref_mode, ref_nums        # 候选侧缺失 / 不可判 / 不匹配 → 拒
     return '', ref_mode, ref_nums
 
 
