@@ -2249,6 +2249,80 @@ describe('chapter failover M1.1 (41-M1.1)', () => {
     expect(requestedUrls()).not.toContain('https://book15.net/e7/c/2.html');
   });
 
+  // ---- readerstop42：阅读器停止点 = 整本目录（与生产打标 EngineStopUrls 同口径）----
+  // 站点「下一章」链顺序可能和目录不同（lblqual41 cuoceng《鬼吹灯》第 0 章的下一章是目录第 3 章），
+  // 只传目录里的下一章拦不住。改后当前源与换源候选都传全部章节 URL。
+
+  it('RSTOP①: 每章一页、下一页链指向目录中非相邻章 ⇒ 只取本章 1 页，不串章（整本目录作停止点）', async () => {
+    const engineSource = engineAlt(6);
+    // 目录四章（顺序 1..4）；每章一页，但「下一页」链按站点自己的顺序跳：1 → 3 → 2 → 4（谁被串章谁就多翻页）。
+    pages.set(`https://book15.net/e6s?q=` + encodeURIComponent(book.title), {
+      text: `<div class="book"><span class="name">测试书</span><span class="author">作者</span><a href="/e6/d/1.html">x</a></div>`,
+    });
+    pages.set(`https://book15.net/e6/d/1.html`, { text: '<h1 class="title">测试书</h1><span class="writer">作者</span><a class="toc" href="/e6/toc/1.html">目录</a>' });
+    pages.set(engineToc(6), { text: [1, 2, 3, 4].map((n) => `<li class="chapter"><a href="/e6/c/${n}.html">第一章</a></li>`).join('') });
+    const linkNext: Record<number, number> = { 1: 3, 3: 2, 2: 4 };
+    for (const n of [1, 2, 3, 4]) {
+      const next = linkNext[n];
+      pages.set(`https://book15.net/e6/c/${n}.html`, {
+        text: `<div class="content">第${n}章正文</div>` + (next ? `<a class="next" href="/e6/c/${next}.html">下一页</a>` : ''),
+      });
+    }
+    const catalog = await prepareEngineCurrent(6, [engineSource], false);
+    // 读第 1 章：旧口径（只传目录下一章=第 2 章）拦不住指向第 3 章的链，会串满 4 章。
+    const part = await readChapter(catalog);
+    expect(part).toMatchObject({ chapterIndex: 0, text: '第1章正文', servedFrom: engineSource.name });
+    expect(requestedUrls()).toEqual(['https://book15.net/e6/c/1.html']);
+    expect(failoverLines()).toEqual([]);
+  });
+
+  it('RSTOP②: 真·章内分页（下一页不在目录里）⇒ 仍按原逻辑翻页拼接；翻到目录内某章才停', async () => {
+    const engineSource = engineAlt(5);
+    pages.set(`https://book15.net/e5s?q=` + encodeURIComponent(book.title), {
+      text: `<div class="book"><span class="name">测试书</span><span class="author">作者</span><a href="/e5/d/1.html">x</a></div>`,
+    });
+    pages.set(`https://book15.net/e5/d/1.html`, { text: '<h1 class="title">测试书</h1><span class="writer">作者</span><a class="toc" href="/e5/toc/1.html">目录</a>' });
+    pages.set(engineToc(5), { text: [1, 2].map((n) => `<li class="chapter"><a href="/e5/c/${n}.html">第一章</a></li>`).join('') });
+    // 第 1 章两页：1.html → 1_2.html（不在目录里）→ 指向第 2 章（在目录里）即停。
+    pages.set('https://book15.net/e5/c/1.html', { text: '<div class="content">第1章上半</div><a class="next" href="/e5/c/1_2.html">下一页</a>' });
+    pages.set('https://book15.net/e5/c/1_2.html', { text: '<div class="content">第1章下半</div><a class="next" href="/e5/c/2.html">下一页</a>' });
+    pages.set('https://book15.net/e5/c/2.html', { text: '<div class="content">第2章正文</div>' });
+    const catalog = await prepareEngineCurrent(5, [engineSource], false);
+    const part = await readChapter(catalog);
+    expect(part).toMatchObject({ text: '第1章上半\n第1章下半', servedFrom: engineSource.name });
+    expect(requestedUrls()).toEqual(['https://book15.net/e5/c/1.html', 'https://book15.net/e5/c/1_2.html']);
+    expect(failoverLines()).toEqual([]);
+  });
+
+  it('RSTOP③: 目录只有本章一章 ⇒ 停止点 = 本章地址（单地址语义与改前一致），链尾无下一页照常停', async () => {
+    const engineSource = engineAlt(4);
+    // 单章目录：tocStopUrls 退回传 chapters[0].url（单个地址，引擎对单地址不做本章剔除）。
+    const catalog = await prepareEngineCurrent(4, [engineSource]);
+    const part = await readChapter(catalog);
+    expect(part).toMatchObject({ text: '引擎源4正文', servedFrom: engineSource.name });
+    expect(requestedUrls()).toEqual(['https://book15.net/e4/c/1.html']);
+  });
+
+  it('RSTOP④: 换源候选目录与「下一章」链序不同 ⇒ 候选也传整本目录，只取本章 1 页', async () => {
+    const pool = [current, engineAlt(3)];
+    const catalog = await prepareCurrent(pool);
+    pages.set(currentChapter, { text: '', status: 404 });
+    primeEngine(3);
+    // 候选目录三章；读第 1 章（与当前源第一章标题对齐），但候选站点第 1 章的下一页指向目录第 3 章（非相邻）。
+    pages.set(engineToc(3), { text: [1, 2, 3].map((n) => `<li class="chapter"><a href="/e3/c/${n}.html">第${n}章</a></li>`).join('') });
+    for (const n of [1, 2, 3]) {
+      const next = n === 1 ? 3 : n + 1;
+      pages.set(`https://book15.net/e3/c/${n}.html`, {
+        text: `<div class="content">引擎源3第${n}章</div>` + (next <= 3 ? `<a class="next" href="/e3/c/${next}.html">下一页</a>` : ''),
+      });
+    }
+    const part = await readChapter(catalog);
+    expect(part).toMatchObject({ text: '引擎源3第1章', servedFrom: engineAlt(3).name });
+    expect(requestedUrls()).toContain('https://book15.net/e3/c/1.html');
+    expect(requestedUrls()).not.toContain('https://book15.net/e3/c/2.html');
+    expect(requestedUrls()).not.toContain('https://book15.net/e3/c/3.html');
+  });
+
   // ---- 热修任务书 H2–H8(H1 见 41-FAILOVER-M1 组「引擎候选正文两页」)----
 
   it('H2: 引擎候选目录两页(nextTocUrl,本章在第 2 页)⇒ 成功', async () => {
@@ -2752,9 +2826,9 @@ describe('chapter failover M1.1 (41-M1.1)', () => {
     }
     return texts.join('\n');
   };
-  /** 当前源是引擎源 n:先用它建好目录，再把池快照换成 pool;请求记录清零。 */
-  const prepareEngineCurrent = async (n: number, pool: Array<{ url: string; name: string }>) => {
-    primeEngine(n);
+  /** 当前源是引擎源 n:先用它建好目录，再把池快照换成 pool;请求记录清零。prime 传入 false 时不预置搜索/详情/目录/正文夹具。 */
+  const prepareEngineCurrent = async (n: number, pool: Array<{ url: string; name: string }>, prime = true) => {
+    if (prime) primeEngine(n);
     const catalog = await drive(service.resolveSourceBook(book, context(), { sources: [engineAlt(n)] }));
     catalogs.set(catalog.version, catalog);
     mocks.sources.mockResolvedValue(pool);
