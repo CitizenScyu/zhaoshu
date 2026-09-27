@@ -325,15 +325,17 @@ def _is_region_label(inner: str) -> bool:
     """括号里那截是不是国别/朝代标注（「日」「英」「清」「美国」「清代」「加拿大」…）。
 
     判据按**结构**为主、词表为辅（纯枚举会被「换个国名就漏」反复打穿）：
-      全为汉字、≤4 字，且满足其一——单字且在 `_REGION_SINGLE_CHARS`；以「国 / 朝 / 代」
-      结尾；或落在 `_REGION_LABEL_WORDS`（少数不含这三个字的国名/朝代，口径从紧）。
-    反例（必须判否，防误降级）：「佚名」「张三」「土豆」这类 2~4 字真名字——既不以
-    国/朝/代结尾、也不在词表内；单字也只在白名单里才认（「陈」「周」是常见姓氏，不认）。"""
+      全为汉字、≤4 字，且满足其一——单字且在 `_REGION_SINGLE_CHARS`；形如「<X>国 / <X>朝 /
+      <X>代」且 X 是**单字国别/朝代字**（美国←美、清朝←清、唐代←唐）；或整串落在
+      `_REGION_LABEL_WORDS`（不带国/朝/代三字的国名与朝代）。
+    `X` 必须是单字白名单成员，不是「任意前缀 + 国」——否则真名会被误判：
+    「李建国」「王国强」都以「国」结尾，但它们的前缀「李建」「王国」不是国别字，
+    照这条判据判否。同理单字也只在白名单里才认（「陈」「周」是常见姓氏，不认）。"""
     if not _CJK_ONLY_RE.match(inner) or len(inner) > 4:
         return False
     if len(inner) == 1:
         return inner in _REGION_SINGLE_CHARS
-    if inner.endswith(('国', '朝', '代')):
+    if inner[-1] in '国朝代' and inner[:-1] in _REGION_SINGLE_CHARS:
         return True
     return inner in _REGION_LABEL_WORDS
 

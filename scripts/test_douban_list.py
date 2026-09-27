@@ -3280,6 +3280,18 @@ class TestRegionLabelAuthor(unittest.TestCase):
             with self.subTest(raw=raw):
                 self.assertFalse(douban_list.is_single_region_label(raw))
 
+    def test_names_ending_in_guo_chao_dai_are_not_labels(self):
+        # 最要紧的一组反例：「X国/朝/代」形式只在前缀是**单字国别/朝代字**时才算标注。
+        # 「李建国」「王国强」这类真名照旧不是；「陈国安」「赵国栋」同理
+        for raw in ('李建国', '王国强', '陈国安', '赵国栋', '宋朝'[:0] or '李朝'):
+            with self.subTest(raw=raw):
+                self.assertFalse(douban_list._is_region_label(raw))
+                self.assertFalse(douban_list.is_single_region_label('（%s）' % raw))
+        # 正例：<单字国别/朝代字> + 国/朝/代
+        for raw in ('美国', '英国', '清朝', '唐代', '隋朝', '汉朝'):
+            with self.subTest(raw=raw):
+                self.assertTrue(douban_list._is_region_label(raw))
+
     def test_norm_author_of_bare_region_label_is_load_bearing_guard(self):
         # 诚实记录守卫：整串只剩标注时 `_norm_author` 剥括号有「剥后非空才剥」护栏（给
         # 「（佚名）」用的），故残留单字「日」——这正是必须靠 is_single_region_label 兜，
