@@ -388,10 +388,11 @@ export function buildSourceSearchRequest(
   const finalUrl = validate(upgradeSourceTemplateUrl(url), base).href;
   const request: SourceSearchRequest = { url: finalUrl, method: method as SourceSearchMethod, charset };
 
+  let jsonBody = false;
   if (options.body != null) {
     if (typeof options.body !== 'string') throw new SourcePolicyError('不支持该书源的搜索 body');
     rejectJs(options.body);
-    const jsonBody = /^\s*[{[]/.test(options.body);
+    jsonBody = /^\s*[{[]/.test(options.body);
     const body = expandField(options.body, title, charset, jsonBody);
     rejectUnexpanded(body);
     request.body = body;
@@ -408,7 +409,23 @@ export function buildSourceSearchRequest(
     }
     if (Object.keys(headers).length) request.headers = headers;
   }
+  applyDefaultContentType(request, options.charset, jsonBody);
   return request;
+}
+
+/**
+ * POST 有 body 却没声明 Content-Type 时补默认头（postct42）。body 以字节发出，fetch 不会自动加 CT，
+ * 站点（多为 PHP）拿不到 `$_POST`、当空搜索返回无结果页；legado 客户端会自己补，DB 里的源普遍不声明。
+ * 表单 body → `application/x-www-form-urlencoded`，JSON body（以 { 或 [ 起，与 expandField 同判据）→
+ * `application/json`；源声明了 charset 就带 `; charset=<声明值>`（声明值已过 normalizeCharset，只可能是已知别名）。
+ * 源显式声明的 CT（任何大小写）一律不覆盖；GET、无 body 的 POST 不加。准入与运行时都经 buildSourceSearchRequest，一处生效。
+ */
+function applyDefaultContentType(request: SourceSearchRequest, declaredCharset: unknown, jsonBody: boolean): void {
+  if (request.method !== 'POST' || !request.body) return;
+  if (request.headers && Object.keys(request.headers).some((k) => k.toLowerCase() === 'content-type')) return;
+  const type = jsonBody ? 'application/json' : 'application/x-www-form-urlencoded';
+  const charset = typeof declaredCharset === 'string' ? `; charset=${declaredCharset.trim()}` : '';
+  request.headers = { ...request.headers, 'Content-Type': `${type}${charset}` };
 }
 
 /**

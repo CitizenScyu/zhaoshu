@@ -479,8 +479,12 @@ class NullSql(unittest.TestCase):
                 '  80993 字 | 言情 | conf 0.99 | 1 次调用\n'
                 '  → 已写入书库\n', encoding='utf-8')
             # 用真 import_one（若同目录可见）或回落到 error；两种都不抛
+            # 固定 now 在 fixture 时间戳之后 1 小时（同为 LOCAL_TZ 语义），
+            # 否则 datetime.now() 一过 24h 窗口本用例必红（定时炸弹）。
+            fixture_now = datetime(2026, 9, 27, 1, 31, 34,
+                                   tzinfo=timezone(timedelta(hours=8)))
             metrics = dm.collect_metrics(dm._NullSql(), labeler,
-                                         ('/nonexistent.log',))
+                                         ('/nonexistent.log',), now=fixture_now)
             self.assertIsInstance(metrics, dict)
             self.assertIn('library', metrics)
             self.assertIn('labeling', metrics)
