@@ -26,6 +26,21 @@ export function confirmedIndexUrl(title: string, author: string, bookUrl: string
   return readerIndexUrl({ kind: 'source', title, author, bookUrl, ...(sourceUrl ? { sourceUrl } : {}) });
 }
 
+/**
+ * 41-srcmem「按书记住上次成功的源」：用记忆里的首选源建目录请求。
+ * 形状与 confirmedIndexUrl 同（book_url + source），额外带 prefer=1 告诉服务端这是**软提示**：
+ * 首选源失败时静默回落整池搜索、并回 hintCleared，而不是像用户点选那样直接 404（见 route 的 prefer 分支）。
+ */
+export function preferredSourceIndexUrl(title: string, author: string, bookUrl: string, sourceUrl: string): string {
+  const query = new URLSearchParams({ title, author, book_url: bookUrl, source: sourceUrl, prefer: '1' });
+  return '/api/read/source/index?' + query;
+}
+
+/** indexUrl 是否为首选源软提示请求（带 prefer=1）：loadIndex 据此决定失败静默回落 / 成功不写 URL。 */
+export function isPreferredSourceIndexUrl(indexUrl: string): boolean {
+  return new URLSearchParams(indexUrl.split('?')[1] ?? '').get('prefer') === '1';
+}
+
 export function readerChapterUrl(index: ReaderIndex, position: ReadingPosition): string {
   const query = new URLSearchParams({ chapter: String(position.chapterIndex), part: String(position.partIndex), version: index.version });
   if (index.source) query.set('session', index.source.session);

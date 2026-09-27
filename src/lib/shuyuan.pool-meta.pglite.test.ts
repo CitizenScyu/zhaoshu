@@ -13,7 +13,13 @@ type Statement = { text: string; params: unknown[] };
 const { getSql } = vi.hoisted(() => ({ getSql: vi.fn() }));
 vi.mock('@/lib/db', () => ({ ensureSchema: vi.fn(), getSql }));
 
-import { getFanoutPool, getReadingSources, invalidateShuyuanReadCache } from './shuyuan';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import {
+  buildShuyuanPoolArtifact, getEngineSources, getFanoutPool, getReadingSources, getSourcePools, invalidateShuyuanReadCache,
+} from './shuyuan';
+import { resetPoolArtifactMemo } from './pool-artifact';
 import { refreshSupportedHosts } from './source-policy';
 
 /** neon 形状的惰性标签：`sql\`\`` 只描述语句，await 或 transaction([...]) 时才执行；执行结果记入 log。 */
@@ -142,6 +148,41 @@ maybe('xfer41 池合成探测快照投影（PGlite 真库）', () => {
     const projectedBytes = JSON.stringify(row).length;
     expect(fullBytes).toBeGreaterThan(100_000);
     expect(projectedBytes).toBeLessThan(fullBytes / 50);
+  });
+
+  it('41-poolimpl：真库生成的产物喂回池合成，四种池与门跟库读逐条相同、且零 DB 语句（含大写/百分号/:443/重复条目）', async () => {
+    const signal = () => new AbortController().signal;
+    const snapshot = async () => {
+      refreshSupportedHosts([]);
+      return JSON.stringify({
+        reading: (await getReadingSources(signal())).map((s) => s.url),
+        fanout: (await getFanoutPool(signal())).map((s) => [s.url, s.readable]),
+        selectable: [...(await getSourcePools(signal())).selectable].map((s) => s.url),
+        engine: (await getEngineSources(signal())).map((s) => [s.url, s.tier, s.name]),
+      });
+    };
+    const fromDb = await snapshot();
+    const dir = mkdtempSync(join(tmpdir(), 'poolimpl41-pglite-'));
+    try {
+      const artifact = await buildShuyuanPoolArtifact(signal());
+      // 生成走投影：不整列读 collections，探测条目只剩行 URL 对应的（1200 条 filler 不进产物）。
+      expect(log.some((entry) => entry.text.includes('SELECT collections, refreshed_at'))).toBe(false);
+      expect((artifact.probe.entries as { url: string }[]).map((entry) => entry.url)).toEqual([
+        'https://book15.net', 'https://a.example', 'https://B.example/path', 'https://c.example:443/x',
+        'https://d.example', 'https://d.example', 'https://e%2Eexample',
+      ]);
+      const path = join(dir, 'pool.json');
+      writeFileSync(path, JSON.stringify(artifact));
+      vi.stubEnv('SHUYUAN_POOL_ARTIFACT', '1');
+      vi.stubEnv('SHUYUAN_POOL_ARTIFACT_PATH', path);
+      resetPoolArtifactMemo();
+      log.length = 0;
+      expect(await snapshot()).toBe(fromDb);
+      expect(log).toEqual([]);
+    } finally {
+      resetPoolArtifactMemo();
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it('无快照 / 快照形状非法：投影与整列读一样得到「无探测态」，不报错', async () => {

@@ -4,15 +4,19 @@ import { createDeadline, raceDeadline, type RequestDeadline } from '@/lib/deadli
 import { validateSourceUrl, refreshSupportedHosts, supportedHostList, upgradeSourceTemplateUrl } from '@/lib/source-policy';
 import { engineSourceUsable } from '@/lib/source-usability';
 import {
-  builtinFallbackSource, builtinUrlPrefixes, engineHosts, type SupportedSourceTier,
+  BUILTIN_SOURCE_HOSTS, builtinFallbackSource, builtinUrlPrefixes, engineHosts, type SupportedSourceTier,
 } from '@/lib/supported-sources';
 import {
   ADMISSION_MAX_REDIRECTS, ADMISSION_MIN_BUDGET_MS, ADMISSION_PROBE_WORST_MS, assertAdmissionVersionConsistent,
   defaultAdmissionTransport, runAdmissionBatch,
   type AdmissionCandidate, type AdmissionSourceRow,
 } from '@/lib/rule-engine/admission';
-import { selectCandidates, type RawSource } from '@/lib/rule-engine/compile-smoke';
+import { enginePostSearchEnabled, selectCandidates, type RawSource } from '@/lib/rule-engine/compile-smoke';
 import { DEFAULT_SHUYUAN_READ_CACHE_TTL_MS, shuyuanReadCacheTtlMs } from '@/lib/read-cache-ttl';
+import {
+  createPoolArtifact, currentPoolArtifact, noteLocalPoolWrite, poolArtifactEnabled, resetPoolArtifactMemo,
+  writePoolArtifactFile, type PoolArtifact, type PoolArtifactEngineRow, type PoolArtifactSourceRow,
+} from '@/lib/pool-artifact';
 import {
   FILTER_COUNT_KEYS, SOURCE_PAGE_SIZE, offsetFor, pageCount,
   type ShuyuanAvailability, type ShuyuanSourceFilter,
@@ -59,6 +63,16 @@ export const RESPONSE_TIMEOUT_MS = 12_000;
 // 占位下轮续测，刷新本身不被挤挂）仍留余量给替换事务与写库；route maxDuration=295s
 // 平台上限内（41-ADMIT-THROUGHPUT：264s 最坏总墙钟 < 295s，25 源会顶破故默认 20）。
 export const REFRESH_BUDGET_MS = 180_000;
+// 42-admbudget：独立准入轮（/api/shuyuan/admission，vercel.json `0 14 * * *`，与 02 点刷新错开 12h）自带的整份预算。
+// 路由 maxDuration=295s；读源表 + 批次 + 写回 + 刷 host 门 + 发布源池产物都在本预算内，留 55s 给 ensureSchema、
+// 租约与平台余量。批次内 canProbe 照旧按 ADMISSION_PROBE_WORST_MS + WRITE_RESERVE_MS 逐探止损。
+export const ADMISSION_ROUND_BUDGET_MS = 240_000;
+// 准入租约时长：须 ≥ 任一持有者的最长存活（独立轮路由 295s、刷新尾部 ≤ REFRESH_BUDGET_MS），持有者被平台杀掉
+// 也最迟到期自动释放；不主动释放（两处触发相隔 12h，5 分钟租约不会挡住下一轮）。
+export const ADMISSION_LEASE_TTL_MS = 300_000;
+// 租约借 cron_health 一行（不改 schema）：last_success_at 存的是**租约到期时刻**，不是成功时刻——
+// 与 db-quota.ts 的 db_quota_exceeded 行同一借用法；readCronSuccessTimes 只认已知行名，不受影响。
+export const ADMISSION_LEASE_ROW = 'admission_lease';
 
 export type ShuyuanCollection = { id: number; title: string; count: number };
 
@@ -161,6 +175,16 @@ export interface ReadingSource {
  */
 export function engineSourcesEnabled(): boolean {
   const raw = process.env.READING_ENGINE_SOURCES?.trim().toLowerCase();
+  return raw === '1' || raw === 'true' || raw === 'on';
+}
+
+/**
+ * 42-admbudget 开关 ADMISSION_OWN_CRON：开时 /api/shuyuan/admission 每天独立跑一轮准入（自带整份预算），
+ * 刷新尾部准入与它共用同一把租约（ADMISSION_LEASE_ROW）防并发重复探测。默认关：独立轮路由空转返回，
+ * 刷新尾部不查租约、与今天逐字相同。只有显式 1/true/on 才开（与 READING_ENGINE_SOURCES 同口径）。
+ */
+export function admissionOwnCronEnabled(env: Record<string, string | undefined> = process.env): boolean {
+  const raw = env.ADMISSION_OWN_CRON?.trim().toLowerCase();
   return raw === '1' || raw === 'true' || raw === 'on';
 }
 
@@ -425,7 +449,8 @@ async function refreshEngineHostGate(signal: AbortSignal, fresh = false): Promis
     }
     // 41-xferfix B1：门被缓存之外改过则先作废缓存（见 syncReadCacheWithGate），再按缓存 host 集刷门并记下快照。
     syncReadCacheWithGate();
-    refreshSupportedHosts(await cachedRead('engineHosts', signal, (sig) => engineHosts(sig)));
+    refreshSupportedHosts(await cachedRead('engineHosts', signal,
+      (sig) => artifactOr((artifact) => artifact.hosts, () => engineHosts(sig))));
     gateFromCache = supportedHostList().join(',');
     return true;
   } catch (error) {
@@ -441,14 +466,8 @@ async function refreshEngineHostGate(signal: AbortSignal, fresh = false): Promis
 async function builtinReadingSources(
   s: Sql, states: Map<string, ProbeState>, signal: AbortSignal,
 ): Promise<ReadingSource[]> {
-  const patterns = builtinUrlPrefixes().map((prefix) => `${prefix}%`);
-  const rows = await cachedRead('builtinRows', signal, (sig) => readRows<StoredSource & { name: string }>(s, s`
-    SELECT source_url, name, source, disabled_at::text AS disabled_at, last_error
-    FROM shuyuan_sources
-    WHERE EXISTS (
-      SELECT 1 FROM jsonb_array_elements_text(${JSON.stringify(patterns)}::jsonb) AS p(pattern)
-      WHERE source_url ILIKE p.pattern)
-    ORDER BY source_url`, sig));
+  const rows = await cachedRead('builtinRows', signal,
+    (sig) => artifactOr((artifact) => artifact.builtin, () => readBuiltinRows(s, sig)));
   const supported = rows.filter((row) => canProbe(row.source_url));
   const fallback = builtinFallbackSource();
   // The same built-in adapter as the download worker, only when the collection
@@ -463,6 +482,18 @@ async function builtinReadingSources(
       url: validateSourceUrl(row.source_url).href, name: row.name.slice(0, 200) || fallback.name,
       searchUrl: row.source.searchUrl ?? fallback.searchUrl, rules: row.source, tier: 'builtin' as const,
     }));
+}
+
+/** builtin 候选行（注册表内建 URL 前缀，不再硬编码 ILIKE 字面量）；池合成与产物生成共用同一查询。 */
+function readBuiltinRows(s: Sql, signal?: AbortSignal): Promise<PoolArtifactSourceRow[]> {
+  const patterns = builtinUrlPrefixes().map((prefix) => `${prefix}%`);
+  return readRows<PoolArtifactSourceRow>(s, s`
+    SELECT source_url, name, source, disabled_at::text AS disabled_at, last_error
+    FROM shuyuan_sources
+    WHERE EXISTS (
+      SELECT 1 FROM jsonb_array_elements_text(${JSON.stringify(patterns)}::jsonb) AS p(pattern)
+      WHERE source_url ILIKE p.pattern)
+    ORDER BY source_url`, signal);
 }
 
 /** probe 优先序：可达 = 2、其余 = 1（可达优先，§2.4）。 */
@@ -490,14 +521,8 @@ function checkedAtMs(value: string | null): number {
 async function engineReadingSources(
   s: Sql, states: Map<string, ProbeState>, signal: AbortSignal,
 ): Promise<ReadingSource[]> {
-  const rows = await cachedRead('engineRows', signal, (sig) => readRows<
-    StoredSource & { name: string; tier: string; search_checked_at: string | null }>(s, s`
-    SELECT src.source_url, src.name, src.source, src.disabled_at::text AS disabled_at, src.last_error,
-           a.tier, a.search_checked_at::text AS search_checked_at
-    FROM shuyuan_sources src
-    JOIN source_admission a ON a.source_url = src.source_url
-    WHERE a.compile_ok AND a.search_ok IS TRUE
-    ORDER BY src.source_url`, sig));
+  const rows = await cachedRead('engineRows', signal,
+    (sig) => artifactOr((artifact) => artifact.engine, () => readEngineRows(s, sig)));
   // 41-srcfix 改法2：库键 source_url 仍是上游原样（http:// 源不改键，source_admission 不会出新旧两行），
   // 运行时身份 url 取升 https 后的形态——搜索基址、目录/正文相对链接、目录缓存 sourceUrl 全部由它派生，
   // 所以 http 源的每个请求都走 https。只改 scheme，过的仍是同一把 validateSourceUrl 锁。
@@ -520,6 +545,17 @@ async function engineReadingSources(
       rules: row.source,
       tier: (row.tier === 'T7' ? 'T7' : 'M1') as SupportedSourceTier,
     }));
+}
+
+/** 引擎候选行：shuyuan_sources JOIN source_admission ok 态；池合成与产物生成共用同一查询。 */
+function readEngineRows(s: Sql, signal?: AbortSignal): Promise<PoolArtifactEngineRow[]> {
+  return readRows<PoolArtifactEngineRow>(s, s`
+    SELECT src.source_url, src.name, src.source, src.disabled_at::text AS disabled_at, src.last_error,
+           a.tier, a.search_checked_at::text AS search_checked_at
+    FROM shuyuan_sources src
+    JOIN source_admission a ON a.source_url = src.source_url
+    WHERE a.compile_ok AND a.search_ok IS TRUE
+    ORDER BY src.source_url`, signal);
 }
 
 function hostOfUrl(url: string): string {
@@ -752,8 +788,17 @@ const readCache = new Map<string, ReadCacheEntry>();
 /** 上次按缓存 engineHosts 刷出的门快照（refreshEngineHostGate 据此识别门被缓存之外改过）；null = 无。 */
 let gateFromCache: string | null = null;
 
-/** 丢弃全部池合成读缓存：本实例写路径之后调用；测试之间重置也用它。 */
+/**
+ * 丢弃全部池合成读缓存：本实例写路径之后调用；测试之间重置也用它。
+ * 41-poolimpl：同时记下「本实例刚写过库」——比这次写更早生成的源池产物本实例不再采信（回退库读直到新产物发布），
+ * 保住「本实例读己之写」（产物最多晚一个生成周期，改前本实例写后立即可见）。
+ */
 export function invalidateShuyuanReadCache(): void {
+  clearReadCache();
+  noteLocalPoolWrite();
+}
+
+function clearReadCache(): void {
   readCache.clear();
   gateFromCache = null;
 }
@@ -766,7 +811,7 @@ export function invalidateShuyuanReadCache(): void {
  */
 function syncReadCacheWithGate(): void {
   const gate = supportedHostList().join(',');
-  if (gateFromCache !== null && gate !== gateFromCache) invalidateShuyuanReadCache();
+  if (gateFromCache !== null && gate !== gateFromCache) clearReadCache();
   gateFromCache = gate;
 }
 
@@ -790,6 +835,73 @@ async function cachedRead<T>(
   return signal ? raceDeadline(signal, () => value) : value;
 }
 
+// —— 源池产物（41-poolimpl，设计 poolart-41-report §2）：池合成四份输入行「产物优先、失败回退库」——
+// 产物只替换 DB 行的来源，入池判定/排序/去重/host 门照旧在上面的 JS 里重算；外层 cachedRead 的 TTL、single-flight、
+// 失败不入缓存等语义不变。开关 SHUYUAN_POOL_ARTIFACT 默认关：关时直接走库读 loader，与改前逐字相同。
+
+/** 产物可用 ⇒ 取其中对应的行；开关关/产物不可用（缺失/过期/损坏/早于本实例写库）⇒ 库读。 */
+async function artifactOr<T>(pick: (artifact: PoolArtifact) => T, load: () => Promise<T>): Promise<T> {
+  if (!poolArtifactEnabled()) return load();
+  const artifact = await currentPoolArtifact();
+  return artifact ? pick(artifact) : load();
+}
+
+/**
+ * 引擎 host 门的鲜读入口（download-source / engine-fetch / runtime-download 刷门用）：产物优先，否则直读准入表
+ * （开关关时即 engineHosts(signal)，与改前相同）。与 getEngineSources 取自同一份产物，门与池行口径一致。
+ */
+export async function getPoolEngineHosts(signal?: AbortSignal): Promise<string[]> {
+  return artifactOr((artifact) => artifact.hosts, () => engineHosts(signal));
+}
+
+/**
+ * 从库合成一份源池产物（鲜读，不走缓存）：engineHosts + builtin 行 + 引擎行 + 探测快照中这些行 URL 的条目。
+ * 探测快照走池合成同一条 SQL 投影（readPoolProbeMeta），门取「内建 host ∪ 本次 engineHosts」的小写集——是生成后
+ * 消费侧门的超集（refreshSupportedHosts 只会再滤掉不规范 host），所以不会漏条目；且不整列读 collections（≈159 KB）。
+ * 再按行 URL 过滤：池只按行的 source_url 查 states，canProbe/门判定在消费侧 readMeta 里照做；
+ * 同一 URL 的重复条目同进同出，readMeta「重复即作废」语义不变，条目保持原序。
+ */
+export async function buildShuyuanPoolArtifact(signal: AbortSignal): Promise<PoolArtifact> {
+  const s = getSql();
+  const hosts = await engineHosts(signal);
+  const projectionHosts = [...new Set([...BUILTIN_SOURCE_HOSTS, ...hosts].map((host) => host.trim().toLowerCase()))].sort();
+  const [meta, builtin, engine] = await Promise.all([
+    readPoolProbeMeta(s, projectionHosts, signal), readBuiltinRows(s, signal), readEngineRows(s, signal),
+  ]);
+  const urls = new Set([...builtin, ...engine].map((row) => row.source_url));
+  const list = Array.isArray(meta.collections) ? meta.collections : [];
+  const snapshot = isRecord(list[0]) && isRecord(list[0].probeSnapshot) ? list[0].probeSnapshot : {};
+  const entries = Array.isArray(snapshot.entries) ? snapshot.entries : [];
+  return createPoolArtifact({
+    refreshedAt: meta.refreshed_at,
+    hosts: [...hosts].sort(),
+    builtin,
+    engine,
+    probe: {
+      version: snapshot.version ?? null,
+      entries: entries.filter((entry) => isRecord(entry) && typeof entry.url === 'string' && urls.has(entry.url)),
+    },
+  });
+}
+
+/**
+ * 写库成功后在本机发布产物：仅当开关开且配置了 SHUYUAN_POOL_ARTIFACT_PATH（phoenix 这类有持久盘的进程）才做，
+ * Vercel 上无此 env ⇒ 'skipped'，零额外读。绝不让写路径失败：生成/写文件出错只告警（下一轮 phoenix 定时生成兜底）。
+ */
+export async function publishPoolArtifact(signal?: AbortSignal): Promise<'written' | 'unchanged' | 'skipped' | 'failed'> {
+  const path = process.env.SHUYUAN_POOL_ARTIFACT_PATH?.trim();
+  if (!poolArtifactEnabled() || !path) return 'skipped';
+  try {
+    const artifact = await buildShuyuanPoolArtifact(signal ?? AbortSignal.timeout(READ_CACHE_LOAD_TIMEOUT_MS));
+    const result = await writePoolArtifactFile(path, artifact);
+    resetPoolArtifactMemo();
+    return result;
+  } catch (error) {
+    console.error('shuyuan pool artifact publish failed', { reason: safeReason(error) });
+    return 'failed';
+  }
+}
+
 /**
  * 池合成用的探测快照投影（xfer41）：只取「host 门内」源的探测条目，而不是整列 collections（≈159 KB / 1215 条）。
  *
@@ -805,24 +917,28 @@ async function cachedRead<T>(
  */
 async function poolProbeMeta(s: Sql, signal?: AbortSignal): Promise<MetaRow> {
   const hosts = supportedHostList();
-  return cachedRead(`poolProbeMeta:${hosts.join(',')}`, signal, async (sig) => {
-    const rows = await readRows<MetaRow>(s, s`
-      SELECT refreshed_at::text AS refreshed_at,
-             jsonb_build_array(jsonb_build_object('probeSnapshot', jsonb_build_object(
-               'version', collections->0->'probeSnapshot'->'version',
-               'entries', COALESCE((
-                 SELECT jsonb_agg(e.entry ORDER BY e.ord)
-                 FROM jsonb_array_elements(CASE
-                   WHEN jsonb_typeof(collections->0->'probeSnapshot'->'entries') = 'array'
-                   THEN collections->0->'probeSnapshot'->'entries' ELSE '[]'::jsonb END) WITH ORDINALITY AS e(entry, ord)
-                 WHERE lower(e.entry->>'url') ~ '^https://'
-                   AND (substring(lower(e.entry->>'url') FROM '^https://([a-z0-9.-]+)(?::443)?(?:[/?#]|$)')
-                          = ANY(ARRAY(SELECT jsonb_array_elements_text(${JSON.stringify(hosts)}::jsonb)))
-                        OR lower(e.entry->>'url') !~ '^https://[a-z0-9.-]+(?::443)?(?:[/?#]|$)')
-               ), '[]'::jsonb)))) AS collections
-      FROM shuyuan_meta WHERE id = 1`, sig);
-    return rows[0] ?? { collections: [], refreshed_at: null };
-  });
+  return cachedRead(`poolProbeMeta:${hosts.join(',')}`, signal, (sig) => artifactOr(
+    (artifact) => ({ refreshed_at: artifact.refreshedAt, collections: [{ probeSnapshot: artifact.probe }] }),
+    () => readPoolProbeMeta(s, hosts, sig)));
+}
+
+async function readPoolProbeMeta(s: Sql, hosts: string[], sig?: AbortSignal): Promise<MetaRow> {
+  const rows = await readRows<MetaRow>(s, s`
+    SELECT refreshed_at::text AS refreshed_at,
+           jsonb_build_array(jsonb_build_object('probeSnapshot', jsonb_build_object(
+             'version', collections->0->'probeSnapshot'->'version',
+             'entries', COALESCE((
+               SELECT jsonb_agg(e.entry ORDER BY e.ord)
+               FROM jsonb_array_elements(CASE
+                 WHEN jsonb_typeof(collections->0->'probeSnapshot'->'entries') = 'array'
+                 THEN collections->0->'probeSnapshot'->'entries' ELSE '[]'::jsonb END) WITH ORDINALITY AS e(entry, ord)
+               WHERE lower(e.entry->>'url') ~ '^https://'
+                 AND (substring(lower(e.entry->>'url') FROM '^https://([a-z0-9.-]+)(?::443)?(?:[/?#]|$)')
+                        = ANY(ARRAY(SELECT jsonb_array_elements_text(${JSON.stringify(hosts)}::jsonb)))
+                      OR lower(e.entry->>'url') !~ '^https://[a-z0-9.-]+(?::443)?(?:[/?#]|$)')
+             ), '[]'::jsonb)))) AS collections
+    FROM shuyuan_meta WHERE id = 1`, sig);
+  return rows[0] ?? { collections: [], refreshed_at: null };
 }
 
 async function countsFromStates(s: Sql, states: Map<string, ProbeState>, signal?: AbortSignal): Promise<ShuyuanCounts> {
@@ -972,6 +1088,7 @@ export async function disableShuyuanSource(url: string, reason: string): Promise
     WHERE source_url = ${normalizeUrl(url)}
     RETURNING id`) as { id: number }[];
   invalidateShuyuanReadCache();
+  if (rows.length > 0) await publishPoolArtifact(); // 41-poolimpl：UPDATE 成功且命中行才重发产物
   return rows.length > 0;
 }
 
@@ -1000,6 +1117,7 @@ export async function enableShuyuanSource(url: string): Promise<boolean> {
     WHERE source_url = ${normalizeUrl(url)}
     RETURNING id`) as { id: number }[];
   invalidateShuyuanReadCache();
+  if (rows.length > 0) await publishPoolArtifact(); // 41-poolimpl：同 disableShuyuanSource
   return rows.length > 0;
 }
 
@@ -1237,19 +1355,22 @@ async function refreshWithinBudget(s: Sql, budget: RequestDeadline, signal: Abor
   // M1 准入库：挂在全量替换事务**之后**（设计 §4.2 v3 E2）。事务已提交，validateAdmissionUrl
   // 读到的「源声明 host 集合」本轮即含新源；滤网 2 不在用户请求路径上跑，只在此 cron 批次。
   await runAdmissionAfterRefresh(s, rows, budget, signal);
+  // 41-poolimpl：全量替换已提交、准入批次已写回（或按 §6.3 降级跳过，库仍自洽）之后才发布源池产物；事务失败走不到这里。
+  await publishPoolArtifact(signal);
   return getShuyuanStats(signal);
 }
 
 /**
  * 准入批次（设计 §4.2）。时序：全量替换事务之后。硬约束：
  * - 剩余预算 ≤ ADMISSION_MIN_BUDGET_MS 即整批跳过，绝不挤占刷新预算（180s）；
+ * - ADMISSION_OWN_CRON 开时先领准入租约，领不到（独立轮正在跑）即整批跳过（42-admbudget）；
  * - 候选池 = 通过 survey 初筛的源 + 初筛不过但留有 compile_ok 旧行的源（41-srcfix G5，送回改判出池）；
  *   既有行读一次（按本轮全部源 URL），二者皆空才整批跳过；
  * - runAdmissionBatch 每轮真实搜索 ≤ admissionMaxProbes()（默认 20，env `ADMISSION_MAX_PROBES` 可调），逐探前再查预算。
  * 只写 source_admission，不碰 shuyuan_sources；异常不终结刷新（§6.3：准入异常 → deferred）。
  */
 async function runAdmissionAfterRefresh(
-  s: Sql, rows: { url: string; source: Record<string, unknown> }[], budget: RequestDeadline, signal: AbortSignal,
+  s: Sql, rows: AdmissionInputRow[], budget: RequestDeadline, signal: AbortSignal,
 ): Promise<void> {
   if (signal.aborted) return;
   if (budget.remainingMs <= ADMISSION_MIN_BUDGET_MS) {
@@ -1261,16 +1382,85 @@ async function runAdmissionAfterRefresh(
     });
     return;
   }
+  // 开关关时不查租约（与今天逐字相同）：没有独立轮就没有第二个准入入口可撞。
+  if (admissionOwnCronEnabled() && !(await claimAdmissionLease(s, 'refresh', rows.length))) return;
+  await admitRows(s, rows, budget, signal);
+}
+
+type AdmissionInputRow = { url: string; source: Record<string, unknown> };
+
+/** 一轮准入的结果摘要（只含计数，可直接作 cron 响应体；不含任何源 URL）。 */
+export type AdmissionRoundSummary =
+  | { skipped: 'disabled' | 'lease' | 'no_candidates' | 'failed' }
+  | {
+    sources: number; candidates: number; surveyRejectedExisting: number; compileOk: number;
+    compileRejected: number; probed: number; written: number;
+  };
+
+/**
+ * 领准入租约（42-admbudget）：刷新尾部与独立轮两处准入入口互斥，防同一批源被并发重复探测。
+ * 单条语句原子领取：行不存在 → 插入；已过期 → 抢占；未过期 → WHERE 不成立、RETURNING 空 ⇒ 未领到。
+ * 时间全用库端 now()，不受函数实例时钟影响。领取失败（库抖动）按未领到处理——fail-closed：
+ * 本轮不探，下一轮再来，绝不在拿不准互斥时并发探测。
+ */
+async function claimAdmissionLease(s: Sql, trigger: 'refresh' | 'round', sources?: number): Promise<boolean> {
+  try {
+    const rows = await s`
+      INSERT INTO cron_health (name, last_success_at)
+      VALUES (${ADMISSION_LEASE_ROW}, now() + ${ADMISSION_LEASE_TTL_MS}::int * interval '1 millisecond')
+      ON CONFLICT (name) DO UPDATE SET last_success_at = EXCLUDED.last_success_at
+        WHERE cron_health.last_success_at <= now()
+      RETURNING name` as unknown[];
+    if (rows.length > 0) return true;
+    // 独立轮领租约时还没读源表，没有 sources 计数可记。
+    console.log('shuyuan admission batch', { ...(sources === undefined ? {} : { sources }), skipped: 'lease', trigger });
+  } catch (error) {
+    console.error('shuyuan admission lease failed', { trigger, reason: safeReason(error) });
+  }
+  return false;
+}
+
+/**
+ * 独立准入轮（42-admbudget，/api/shuyuan/admission 调用；调用方负责 ADMISSION_OWN_CRON 开关）。
+ * 不依赖刷新剩下的预算：自带 ADMISSION_ROUND_BUDGET_MS 整份预算，源集合从 shuyuan_sources 读
+ * （= 上一次刷新整表替换写入的同一批上游源，与刷新尾部的 rows 同口径，含禁用源）。
+ * 先领租约再读源表：领不到就不白读 1.7K 行 source 大列。写回后与刷新尾部一样发布源池产物。
+ */
+export async function runAdmissionRound(parentSignal?: AbortSignal): Promise<AdmissionRoundSummary> {
+  const budget = createDeadline(ADMISSION_ROUND_BUDGET_MS);
+  const signal = parentSignal ? AbortSignal.any([parentSignal, budget.signal]) : budget.signal;
+  try {
+    const s = getSql();
+    if (!(await claimAdmissionLease(s, 'round'))) return { skipped: 'lease' };
+    const stored = await readRows<{ source_url: string; source: Record<string, unknown> }>(s, s`
+      SELECT source_url, source FROM shuyuan_sources ORDER BY id`, signal);
+    const rows = stored.map((row) => ({ url: row.source_url, source: row.source }));
+    const summary = await admitRows(s, rows, budget, signal);
+    const artifact = 'written' in summary && summary.written > 0 ? await publishPoolArtifact(signal) : 'skipped';
+    // 独立轮收尾一行：观测「这一轮用了多少、还剩多少」——验证它确实拿的是整份预算而非刷新剩余。
+    console.log('shuyuan admission round', { ...summary, artifact, remainingMs: budget.remainingMs });
+    return summary;
+  } finally {
+    budget.dispose();
+  }
+}
+
+async function admitRows(
+  s: Sql, rows: AdmissionInputRow[], budget: RequestDeadline, signal: AbortSignal,
+): Promise<AdmissionRoundSummary> {
   const declaredHosts = new Set<string>();
   for (const row of rows) {
     try { declaredHosts.add(new URL(row.url).hostname); } catch { /* 上游脏 URL：无法声明 host */ }
   }
   const candidates: AdmissionCandidate[] = [];
   const surveyRejected: AdmissionCandidate[] = [];
+  // 41-admpost F2：准入候选筛与 compileAdmission 用同一开关/判据；flag 开时 POST 源同步进候选评估环。
+  const postSearch = enginePostSearchEnabled();
   for (const row of rows) {
     const source = row.source as RawSource;
-    (selectCandidates([source]).length === 1 ? candidates : surveyRejected).push({ url: row.url, source });
+    (selectCandidates([source], { postSearch }).length === 1 ? candidates : surveyRejected).push({ url: row.url, source });
   }
+  let summary: AdmissionRoundSummary;
   try {
     // 既有行按**全部**本轮源读（不只候选）：初筛不过的源若留着 compile_ok 的旧行（41-srcfix G5：规则改到
     // 过不了初筛），要把它送回批次改判出池，见下。只回已有准入行（≈候选规模），不读 source 大列。
@@ -1282,7 +1472,7 @@ async function runAdmissionAfterRefresh(
     // （admission.ts「严禁」注释防的是后者）：compile_ok=false 的旧行照旧不喂，上游改回合规规则时源
     // 重新过初筛成为普通候选，占位行 search_ok=null ⇒ class 0 未测优先，自动回池。
     const frozen = surveyRejected.filter((candidate) => existing.get(candidate.url)?.compile_ok === true);
-    if (candidates.length === 0 && frozen.length === 0) return;
+    if (candidates.length === 0 && frozen.length === 0) return { skipped: 'no_candidates' };
     const result = await runAdmissionBatch({
       candidates: [...candidates, ...frozen], declaredHosts, existing, fetchPage: defaultAdmissionTransport, signal,
       // espfix41：开查询不敏感对照搜索，单探最坏 = 主搜索 + 对照搜索（ADMISSION_PROBE_WORST_MS），止损按它预留。
@@ -1301,25 +1491,31 @@ async function runAdmissionAfterRefresh(
       probed: result.probed,
     });
     if (result.rows.length > 0) await writeAdmissionRows(s, result.rows);
+    summary = {
+      sources: rows.length, candidates: candidates.length, surveyRejectedExisting: frozen.length,
+      compileOk: result.compileOk, compileRejected: result.compileRejected, probed: result.probed,
+      written: result.rows.length,
+    };
   } catch (error) {
     // 准入失败只影响本轮准入（§6.3）：该批 next round 重来，刷新本身已成功。
-    if (signal.aborted) return;
+    if (signal.aborted) return { skipped: 'failed' };
     console.error('shuyuan admission batch failed', {
       candidates: candidates.length,
       reason: safeReason(error),
     });
-    return;
+    return { skipped: 'failed' };
   }
   // host 集合动态化（设计 §6.1）：准入写库后重算 ok 态 host 并入运行时门；
   // DB 失败/预算中止 → 保持既有集合（fail-closed：收窄到内建，绝不放大）。
   try {
     refreshSupportedHosts(await engineHosts(signal));
   } catch (error) {
-    if (signal.aborted) return;
+    if (signal.aborted) return summary;
     console.error('shuyuan supported host refresh failed', {
       reason: safeReason(error),
     });
   }
+  return summary;
 }
 
 async function readAdmissionRows(s: Sql, urls: string[], signal: AbortSignal): Promise<Map<string, AdmissionSourceRow>> {

@@ -11,6 +11,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   DEFAULT_ENGINE_POOL_CACHE_TTL_MS, enginePoolCachePath, enginePoolCacheTtlMs, loadEnginePoolCached,
 } from './engine-pool-cache.mjs';
+import { createPoolArtifact } from '../src/lib/pool-artifact';
 
 const scriptsDir = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(scriptsDir, '..');
@@ -129,6 +130,29 @@ describe('engine-fetch CLI 端到端：新鲜缓存 ⇒ 子命令不碰 DB', () 
     const r = runCli(['search', '--title', '不存在的书', '--no-builtin', '--skip-host', 'a.example']);
     expect(r.status).toBe(1);
     expect(r.kind).toBe('miss');
+  }, 60_000);
+
+  it('41-poolimpl：源池产物开 + 本地产物文件 ⇒ 缓存关、假库不可达也照常按产物池得出结论（零 DB）；产物坏了 ⇒ 回退库（pool 退 2）', () => {
+    const artifactPath = join(dir, 'pool-artifact.json');
+    writeFileSync(artifactPath, JSON.stringify(createPoolArtifact({
+      refreshedAt: null, hosts: ['a.example'], builtin: [],
+      engine: [{ source_url: 'https://a.example', name: 'a', source: { searchUrl: 'https://a.example/s?q={{key}}' },
+        disabled_at: null, last_error: '', tier: 'M1', search_checked_at: null }],
+      probe: { version: 1, entries: [] },
+    })));
+    const on = { ENGINE_POOL_CACHE_TTL_MS: '0', SHUYUAN_POOL_ARTIFACT: '1', SHUYUAN_POOL_ARTIFACT_PATH: artifactPath };
+    const hit = runCli(['toc', '--url', 'https://zzz.example/book/1'], on);
+    expect(hit.status).toBe(1);
+    expect(hit.kind).toBe('no_source');
+    const miss = runCli(['search', '--title', '不存在的书', '--no-builtin', '--skip-host', 'a.example'], on);
+    expect(miss.status).toBe(1);
+    expect(miss.kind).toBe('miss');
+    writeFileSync(artifactPath, '{broken');
+    const broken = runCli(['toc', '--url', 'https://zzz.example/book/1'], on);
+    expect(broken.status).toBe(2);
+    expect(broken.kind).toBe('pool');
+    expect(broken.stderr).toContain('falling back to db');
+    expect(broken.stderr).not.toContain('fake:fake');
   }, 60_000);
 
   it('ENGINE_POOL_CACHE_TTL_MS=0 ⇒ 忽略缓存，照旧读 DB（假库 ⇒ pool 退 2）', () => {

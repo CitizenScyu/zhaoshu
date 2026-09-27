@@ -1,0 +1,12 @@
+[Unit]
+Description=zhaoshu shuyuan pool artifact every 30 minutes (phoenix)
+
+[Timer]
+# 兜住刷新之外的写（Vercel 上的人工禁用/启用、seed-admission 等本机发布不到的写）并做心跳；
+# 每轮 4 条 /sql 读（≈230 KB，phoenix 本机进出），与阅读/打标放量无关。
+OnCalendar=*-*-* *:07,37:00
+Persistent=true
+RandomizedDelaySec=60
+
+[Install]
+WantedBy=timers.target

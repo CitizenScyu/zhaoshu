@@ -95,8 +95,9 @@ const GOOD_FILES: Record<string, string> = {
     ],
   }),
   'src/lib/deadline.ts': 'export const MODEL_ROUTE_INTERNAL_BUDGET_MS = 285_000;\n',
-  'src/lib/shuyuan.ts': 'export const REFRESH_BUDGET_MS = 180_000;\n',
+  'src/lib/shuyuan.ts': 'export const REFRESH_BUDGET_MS = 180_000;\nexport const ADMISSION_ROUND_BUDGET_MS = 240_000;\n',
   'src/app/api/shuyuan/route.ts': 'export const maxDuration = 295;\nexport async function GET() {}\n',
+  'src/app/api/shuyuan/admission/route.ts': 'export const maxDuration = 295;\nexport async function GET() {}\n',
   'src/app/api/download/reclaim/route.ts': 'export const maxDuration = 30;\nexport async function GET() {}\n',
   'src/app/api/find/route.ts':
     "import { MODEL_ROUTE_INTERNAL_BUDGET_MS } from '@/lib/deadline';\nexport const maxDuration = 295;\n" +
@@ -306,13 +307,20 @@ describe('check-deploy-config：函数时限', () => {
   });
 
   it('跨文件登记的 REFRESH_BUDGET_MS 超过 /api/shuyuan 的 maxDuration 判红', () => {
-    const errors = checkDeployConfig(repo({ 'src/lib/shuyuan.ts': 'export const REFRESH_BUDGET_MS = 295_000;\n' }));
+    const errors = checkDeployConfig(repo({ 'src/lib/shuyuan.ts': GOOD_FILES['src/lib/shuyuan.ts'].replace('180_000', '295_000') }));
     expect(errors).toEqual([expect.stringMatching(/src\/app\/api\/shuyuan\/route\.ts: REFRESH_BUDGET_MS = 295000ms/)]);
   });
 
   it('跨文件登记的常量被改成非字面量判红（不静默跳过）', () => {
-    const errors = checkDeployConfig(repo({ 'src/lib/shuyuan.ts': 'export const REFRESH_BUDGET_MS = 3 * 60_000;\n' }));
+    const errors = checkDeployConfig(repo({ 'src/lib/shuyuan.ts': GOOD_FILES['src/lib/shuyuan.ts'].replace('180_000', '3 * 60_000') }));
     expect(errors).toEqual([expect.stringMatching(/读不到 REFRESH_BUDGET_MS 的数字字面量/)]);
+  });
+
+  it('42-admbudget：独立准入轮预算 ADMISSION_ROUND_BUDGET_MS 调到 ≥ /api/shuyuan/admission 的 maxDuration 判红', () => {
+    const errors = checkDeployConfig(repo({ 'src/lib/shuyuan.ts': GOOD_FILES['src/lib/shuyuan.ts'].replace('240_000', '295_000') }));
+    expect(errors).toEqual([
+      expect.stringMatching(/src\/app\/api\/shuyuan\/admission\/route\.ts: ADMISSION_ROUND_BUDGET_MS = 295000ms/),
+    ]);
   });
 
   // 41-MS09B 盘点补登记：每项把 lib 常量调到恰好等于路由 maxDuration，必须判红。

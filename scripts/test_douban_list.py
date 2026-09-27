@@ -2396,13 +2396,15 @@ class TestSameBookAndRescue(unittest.TestCase):
                 for host, title, author, url in specs]
 
     def test_rescue_false_ambiguity_same_book(self):
-        # 《凌霄之上》同一本书两站：作者 观棋 vs 觀棋(繁简→归一后仍不等→判歧义)，但内容同→放行
-        # §12：目录一致(共享信息性章名) + 每章各异长正文一致 → 双信号成立
+        # 《凌霄之上》同一本书两站作者字段**不一致**（观棋 vs 青衫醉，真不同串、归一后不等→判歧义），
+        # 但内容同→放行。§12：目录一致(共享信息性章名) + 每章各异长正文一致 → 双信号成立。
+        # （authkey42 起繁简写法如 觀棋/观棋 已由作者折叠大表直接桥接、不再走内容救回，见
+        #  TestAuthorFoldBigTable.test_traditional_variants_bridge_without_content_probe。）
         base_a, base_b = 'https://a.example/1', 'https://b.example/1'
         books = {base_a: _cm_book_bodies(CM_TITLES_X, CM_MULTI_X, base_a),
                  base_b: _cm_book_bodies(CM_TITLES_X_ALT, CM_MULTI_X, base_b)}
         cands = self._candidates([('a.example', '凌霄之上', '观棋', base_a),
-                                  ('b.example', '凌霄之上', '觀棋', base_b)])
+                                  ('b.example', '凌霄之上', '青衫醉', base_b)])
         cli = _cm_cli(books, cands)
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
@@ -2435,7 +2437,7 @@ class TestSameBookAndRescue(unittest.TestCase):
         books = {base_a: _cm_book(CM_TITLES_X, CM_BODY_X, base_a),
                  base_b: _cm_book(CM_TITLES_X_ALT, CM_BODY_X, base_b)}
         cands = self._candidates([('a.example', '凌霄之上', '观棋', base_a),
-                                  ('b.example', '凌霄之上', '觀棋', base_b)])
+                                  ('b.example', '凌霄之上', '青衫醉', base_b)])
         cli = _cm_cli(books, cands)
         buf = io.StringIO()
         with mock.patch.dict(os.environ, {'AUTHCV_CONTENT_MATCH': '0'}), \
@@ -2484,13 +2486,13 @@ class TestBogusListAuthor(unittest.TestCase):
                 self.assertTrue(douban_list.is_bogus_list_author(g))
 
     def test_polluted_author_downgraded_and_rescued(self):
-        # 名单作者=「悬疑灵异」（分类污染），两站实为同一本书 → 降级为名单无作者 → 内容聚类放行，
-        # 采信候选作者（长安天），绝不把「悬疑灵异」写进去
+        # 名单作者=「悬疑灵异」（分类污染），两站实为同一本书、作者字段不一致（长安天 vs 青墨，
+        # 真不同串）→ 降级为名单无作者 → 内容聚类放行，采信候选作者，绝不把「悬疑灵异」写进去
         base_a, base_b = 'https://a.example/1', 'https://b.example/1'
         books = {base_a: _cm_book_bodies(CM_TITLES_X, CM_MULTI_X, base_a),
                  base_b: _cm_book_bodies(CM_TITLES_X_ALT, CM_MULTI_X, base_b)}
         cands = [{'source': 'a.example', 'title': '神秘复苏', 'author': '长安天', 'bookUrl': base_a},
-                 {'source': 'b.example', 'title': '神秘复苏', 'author': '長安天', 'bookUrl': base_b}]
+                 {'source': 'b.example', 'title': '神秘复苏', 'author': '青墨', 'bookUrl': base_b}]
         cli = _cm_cli(books, cands)
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
@@ -2533,11 +2535,10 @@ class TestBogusListAuthor(unittest.TestCase):
 
 
 class TestNormAuthorSimplified(unittest.TestCase):
-    """authcv41 §8：_norm_author 繁转简，口径与 import_one 入库身份键对齐。
-    覆盖范围 = import_one._T2S 那张常用字表（约 130 字，含多数姓氏/常用名字）；
-    表未收的字（觀/偽/篤 等）不桥接，见 test_reused_table_coverage_gap。"""
+    """authkey42：_norm_author 繁转简改用作者侧折叠大表 douban_list._AUTHOR_FOLD_TRANS
+    （书名侧 OpenCC 一对一大表 + 7 个姓名补充），口径与 import_one 入库身份键对齐。
+    覆盖远大于旧 83 字小表：觀→观、篤→笃 等此前漏的字已桥接（见 test_big_table_closes_gap）。"""
 
-    # 全部用字均在 import_one._T2S 表内
     def test_traditional_simplified_norm_equal(self):
         for trad, simp in (('餘華', '余华'), ('張愛玲', '张爱玲'), ('風雲', '风云'),
                            ('顧曉夢', '顾晓梦'), ('龍傑', '龙杰'), ('陳靜', '陈静')):
@@ -2563,13 +2564,16 @@ class TestNormAuthorSimplified(unittest.TestCase):
         self.assertNotEqual(douban_list._norm_author('張愛玲'), douban_list._norm_author('張愛民'))
         self.assertFalse(douban_list.author_matches('餘華', '张伟'))
 
-    def test_reused_table_coverage_gap(self):
-        # 诚实记录：复用的表未收 觀/偽/篤 等字，故 gate.log 里的《凌霄之上》觀棋/观棋、偽戒/伪戒、
-        # 中下馬篤/中下马笃 这几例**仍不桥接**（属表覆盖问题，不扩表见 §8）
-        import import_one
-        for ch in ('觀', '偽', '篤'):
-            self.assertNotIn(ch, import_one._T2S)
-        self.assertFalse(douban_list.author_matches('觀棋', '观棋'))
+    def test_big_table_closes_gap(self):
+        # authkey42：换大表后，旧小表漏收、gate.log 里出现过的 觀棋/观棋、中下馬篤/中下马笃
+        # 现在桥接（觀→观、篤→笃 在大表内）。
+        for trad, simp in (('觀棋', '观棋'), ('中下馬篤', '中下马笃')):
+            with self.subTest(pair=(trad, simp)):
+                self.assertTrue(douban_list.author_matches(trad, simp))
+        # 诚实记录残余缺口：偽 仍不在大表内（简体 伪 另有来源被剔除），偽戒/伪戒 仍不桥接。
+        # 作者比对只做整段严格相等、不做子串包含，故漏判只多一行（等同改前），绝不误并不同人。
+        self.assertNotIn('偽', douban_list._AUTHOR_FOLD_TRANS)
+        self.assertFalse(douban_list.author_matches('偽戒', '伪戒'))
 
     def test_traditional_ambiguity_dissolved_no_rescue_needed(self):
         # 名单无作者、两站作者是同名的繁/简（餘華 vs 余华）→ 归一后同一人 → 不再判歧义、
@@ -2591,9 +2595,104 @@ class TestNormAuthorSimplified(unittest.TestCase):
     def test_conversion_is_load_bearing(self):
         # 变异：关掉繁转简表 → 繁/简同名判不相等（回到 authcv 之前的假不符）
         self.assertTrue(douban_list.author_matches('餘華', '余华'))
-        with mock.patch.object(douban_list, '_T2S_TRANS', {}):
+        with mock.patch.object(douban_list, '_AUTHOR_FOLD_TRANS', {}):
             self.assertFalse(douban_list.author_matches('餘華', '余华'))
             self.assertNotEqual(douban_list._norm_author('風雲'), douban_list._norm_author('风云'))
+
+
+class TestAuthorFoldTableInjective(unittest.TestCase):
+    """authkey42 §2：作者侧折叠大表 _AUTHOR_FOLD_TRANS 的单射性护栏。
+    大表 = 书名侧一对一 OpenCC 大表 ∪ 7 个姓名补充。折叠两侧同时做，只有「同一个字的
+    繁/简两种写法」应被折到一个字；不同的字绝不判等。任何目标字有重复、或目标字又作为
+    源字出现（链式折叠），都可能凭空造出「假等价类」把不同的人并成一行——故这里守死。"""
+
+    def _keys_to_chars(self, trans):
+        # str.translate 表以 ord 为键、目标可能是 int/str/None；这里只看「单字→单字」项
+        pairs = {}
+        for src_ord, dst in trans.items():
+            src = chr(src_ord)
+            if isinstance(dst, int):
+                pairs[src] = chr(dst)
+            elif isinstance(dst, str) and len(dst) == 1:
+                pairs[src] = dst
+        return pairs
+
+    def test_seven_supplements_present_and_correct(self):
+        pairs = self._keys_to_chars(douban_list._AUTHOR_FOLD_TRANS)
+        for trad, simp in douban_list._AUTHOR_FOLD_EXTRA.items():
+            self.assertEqual(pairs.get(trad), simp, f'{trad}→{simp} 补充缺失/错映射')
+
+    def test_only_legitimate_many_to_one_is_zhong(self):
+        # 目标字唯一允许的多对一是 鍾/鐘→钟（简体标准并字，非不同的人）；其余目标必须唯一
+        pairs = self._keys_to_chars(douban_list._AUTHOR_FOLD_TRANS)
+        targets = {}
+        for src, dst in pairs.items():
+            targets.setdefault(dst, []).append(src)
+        collisions = {dst: srcs for dst, srcs in targets.items() if len(srcs) > 1}
+        self.assertIn('钟', collisions, '预期 鍾/鐘→钟 的合并应存在')
+        self.assertEqual(set(collisions.get('钟', [])), {'鍾', '鐘'})
+        self.assertEqual(set(collisions) - {'钟'}, set(),
+                         f'出现计划外的多对一（会造假等价类）: '
+                         f'{ {d: s for d, s in collisions.items() if d != "钟"} }')
+
+    def test_no_chained_folding_target_never_a_source(self):
+        # 没有任何目标字又作为源字出现，否则折叠不是幂等（会二次折叠、绕过单射论证）
+        pairs = self._keys_to_chars(douban_list._AUTHOR_FOLD_TRANS)
+        srcs = set(pairs)
+        chained = sorted(dst for dst in set(pairs.values()) if dst in srcs)
+        self.assertEqual(chained, [], f'目标字仍是源字（链式折叠）: {chained[:10]}')
+
+    def test_fold_is_idempotent(self):
+        # translate 一次与两次结果相同（单射 + 无链式折叠的直接后果）
+        for s in ('葉問', '餘華', '鍾繇', '鐘無艷', '風雲變幻', '龍傑萬範'):
+            once = douban_list._to_simplified(s)
+            self.assertEqual(douban_list._to_simplified(once), once, f'{s} 折叠非幂等')
+
+    def test_qianlong_not_merged_with_ganlong(self):
+        # 乾/干 均不在表内 → 乾隆 ≠ 干隆（不同的人不得因折叠被并）
+        self.assertNotIn('乾', self._keys_to_chars(douban_list._AUTHOR_FOLD_TRANS))
+        self.assertNotEqual(douban_list._norm_author('乾隆'), douban_list._norm_author('干隆'))
+        self.assertFalse(douban_list.author_matches('乾隆', '干隆'))
+
+
+class TestAuthorHardCasesAuthkey42(unittest.TestCase):
+    """authkey42：任务书写死的硬正例（必须判同一人）/ 硬反例（必须判不同人），
+    含新增的「前导外文括注」剥离（（Stephen King）斯蒂芬·金 → 斯蒂芬·金）。"""
+
+    def test_hard_positives(self):
+        for a, b in (('葉問', '叶问'),
+                     ('金庸', '金庸'),
+                     ('[美]斯蒂芬·金', '斯蒂芬·金'),
+                     ('（Stephen King）斯蒂芬·金', '斯蒂芬·金'),
+                     ('餘華', '余华')):
+            with self.subTest(pair=(a, b)):
+                self.assertTrue(douban_list.author_matches(a, b), f'{a} 应与 {b} 判同一人')
+
+    def test_hard_negatives(self):
+        for a, b in (('Stephen King', 'Stephen Fry'),
+                     ('Author A', 'Author B'),
+                     ('唐家三少', '土豆')):
+            with self.subTest(pair=(a, b)):
+                self.assertFalse(douban_list.author_matches(a, b), f'{a} 不应与 {b} 判同一人')
+
+    def test_leading_foreign_paren_stripped_only_when_han_remains(self):
+        # 前导括注仅在「括内纯拉丁 且 剥后仍有中文」时才剥；括内是中文的（佚名）/（土豆）不受影响
+        self.assertEqual(douban_list._norm_author('（Stephen King）斯蒂芬·金'),
+                         douban_list._norm_author('斯蒂芬·金'))
+        # 括内为中文 → 不匹配「前导外文括注」规则，规则不触发（（佚名）/（土豆）行为不变）
+        self.assertIsNone(douban_list._LEADING_FOREIGN_PAREN_RE.match('（佚名）'))
+        self.assertIsNone(douban_list._LEADING_FOREIGN_PAREN_RE.match('（土豆）土豆'))
+
+    def test_leading_foreign_paren_same_han_different_foreign_collapse_documented(self):
+        # 诚实记录（任务书允许）：剥前导外文括注后仅剩中文名，两条中文名相同即判同一人，
+        # 即便括注里的外文名不同。这是「剥离」的直接后果，可接受但须知悉。
+        self.assertTrue(douban_list.author_matches('（Stephen King）斯蒂芬·金',
+                                                    '（Stephen Fry）斯蒂芬·金'))
+
+    def test_trailing_foreign_paren_not_regressed(self):
+        # 尾部外文括注（斯蒂芬·金（Stephen King））此前靠 R3 剥括判同一人；本次只加前导剥离，
+        # 尾部行为不得变差：与「斯蒂芬·金」仍判同一人。
+        self.assertTrue(douban_list.author_matches('斯蒂芬·金（Stephen King）', '斯蒂芬·金'))
 
 
 class TestTocGuardsM1(unittest.TestCase):
@@ -3176,7 +3275,7 @@ class TestBogusDowngradeEndToEnd(unittest.TestCase):
         books = {base_a: _cm_book_bodies(CM_TITLES_X, CM_MULTI_X, base_a),
                  base_b: _cm_book_bodies(CM_TITLES_X_ALT, CM_MULTI_X, base_b)}
         cands = [{'source': 'a.example', 'title': '神秘复苏', 'author': '长安天', 'bookUrl': base_a},
-                 {'source': 'b.example', 'title': '神秘复苏', 'author': '長安天', 'bookUrl': base_b}]
+                 {'source': 'b.example', 'title': '神秘复苏', 'author': '青墨', 'bookUrl': base_b}]
         queue, out = self._resolve('悬疑灵异', cands, books)
         entry = queue[0]
         self.assertEqual(entry['author_source'], 'content_match')
@@ -3213,6 +3312,353 @@ class TestBogusDowngradeEndToEnd(unittest.TestCase):
         self.assertEqual(v1['status'], v2['status'])              # 未知字段不改变裁决
         self.assertEqual(v1['status'], 'ready')                   # 且确实是可导入
         self.assertEqual(v1['record'], v2['record'])             # 入库记录逐字一致（审计字段未渗入库）
+
+
+# ---- 41-authtag：名单作者国别/朝代标注（误拒根因）----
+# 现场（deploylbl41c-report §5 补核二）：抽 10 条「作者不符被拒」里 2 条是外文译作的名单
+# 作者位只剩国别标注（《幻夜》=「[日]」应为东野圭吾、《魔戒》=「[英]」应为托尔金）。
+# 豆瓣 tag 页原件（authmis-41/dtag_悬疑小说.html）里作者位本就是「[日] 东野圭吾」这种
+# 「国别标注 + 姓名」的整串 —— 名字没被别处截断，是**比对口径**不认这类前缀。
+class TestRegionLabelAuthor(unittest.TestCase):
+    """前导国别/朝代标注的剥离 + 「整串只剩标注」判污染。"""
+
+    def test_strip_region_label_keeps_the_name(self):
+        for raw, want in (
+                ('[日] 东野圭吾', '东野圭吾'),
+                ('[日]东野圭吾', '东野圭吾'),
+                ('（美）乔治·R·R·马丁', '乔治·R·R·马丁'),
+                ('【法】大仲马', '大仲马'),
+                ('〔清〕曹雪芹', '曹雪芹'),
+                ('（清）曹雪芹', '曹雪芹'),
+                ('[加拿大] 某某', '某某'),
+                ('[美][英] 某某', '某某'),          # 叠两段标注
+        ):
+            with self.subTest(raw=raw):
+                self.assertEqual(douban_list.strip_region_label(raw), want)
+
+    def test_bracket_variants_all_recognised(self):
+        # 41-authtag：〔〕此前不在 `_AUTHOR_LEAD_BRACKET_RE` 里 → 「〔清〕曹雪芹」整串
+        # 归一后仍带括号、与「曹雪芹」不等。四种括号形态必须都能剥。
+        for raw in ('[清]曹雪芹', '（清）曹雪芹', '(清)曹雪芹', '【清】曹雪芹', '〔清〕曹雪芹'):
+            with self.subTest(raw=raw):
+                self.assertTrue(douban_list.author_matches(raw, '曹雪芹'))
+                self.assertTrue(douban_list.author_matches('曹雪芹', raw))
+
+    def test_norm_author_strips_region_label_with_trailing_role(self):
+        # 「〔清〕曹雪芹 著」：标注段与尾缀「著」叠加 —— 剥标注后尾缀循环仍能剥净
+        for raw, want in (('〔清〕曹雪芹 著', '曹雪芹'), ('[日] 东野圭吾 著', '东野圭吾'),
+                          ('（清）曹雪芹 高鹗 著', '曹雪芹高鹗')):
+            with self.subTest(raw=raw):
+                self.assertEqual(douban_list._norm_author(raw), want)
+
+    def test_real_names_with_brackets_are_not_touched(self):
+        # 防误伤：括号在名字**后面**（笔名注记）不是国别标注，strip_region_label 不动它
+        for raw in ('天蚕土豆（土豆）', '木苏里（墨香铜臭）', '（佚名）', '斯蒂芬·金（Stephen King）'):
+            with self.subTest(raw=raw):
+                self.assertEqual(douban_list.strip_region_label(raw), raw)
+
+    def test_long_country_names_still_stripped(self):
+        # 回归（防行为回退）：改造前的剥括号宽度是 {0,6}，长国名照旧能剥；
+        # 识别「是不是标注」的 4 字闸只在 is_single_region_label / _is_region_label 里
+        self.assertEqual(douban_list.strip_region_label('（沙特阿拉伯）某某'), '某某')
+        self.assertEqual(douban_list._norm_author('（乌兹别克斯坦）某某'), '某某')
+        # 超过 6 字的括注不是国别标注形态（是外文原名），照旧不剥
+        self.assertEqual(douban_list.strip_region_label('（Stephen King）某某'), '（Stephen King）某某')
+
+    def test_only_region_label_is_bogus(self):
+        # 整串只剩标注 ⇒ 判污染（→ 降级为名单无作者，交内容比对救回）
+        for raw in ('[日]', '[日] ', '[日]　', '（美）', '〔清〕', '【法】', '（美） 著', '[清]著'):
+            with self.subTest(raw=raw):
+                self.assertTrue(douban_list.is_single_region_label(raw))
+                self.assertTrue(douban_list.is_bogus_list_author(raw))
+
+    def test_region_labelled_full_names_are_not_bogus(self):
+        # 反例（关键红线）：标注 + 真名**不是**污染，绝不能被降级掉
+        for raw in ('[日] 东野圭吾', '[英] J.R.R.托尔金', '（美）乔治·R·R·马丁',
+                    '〔清〕曹雪芹', '天蚕土豆', '辰东', '', '   '):
+            with self.subTest(raw=raw):
+                self.assertFalse(douban_list.is_single_region_label(raw))
+                self.assertFalse(douban_list.is_bogus_list_author(raw))
+
+    def test_short_real_names_are_not_region_labels(self):
+        # 防误伤（从紧）：单字国别白名单不含常见姓氏、2~4 字真名不以国/朝/代结尾且不在词表
+        for raw in ('（张三）', '〔李四〕', '（佚名）', '（无）', '（辰东）', '（陈）', '（周）',
+                    '（土豆）'):
+            with self.subTest(raw=raw):
+                self.assertFalse(douban_list.is_single_region_label(raw))
+
+    def test_names_ending_in_guo_chao_dai_are_not_labels(self):
+        # 最要紧的一组反例：「X国/朝/代」形式只在前缀是**单字国别/朝代字**时才算标注。
+        # 「李建国」「王国强」这类真名照旧不是；「陈国安」「赵国栋」同理
+        for raw in ('李建国', '王国强', '陈国安', '赵国栋', '宋朝'[:0] or '李朝'):
+            with self.subTest(raw=raw):
+                self.assertFalse(douban_list._is_region_label(raw))
+                self.assertFalse(douban_list.is_single_region_label('（%s）' % raw))
+        # 正例：<单字国别/朝代字> + 国/朝/代
+        for raw in ('美国', '英国', '清朝', '唐代', '隋朝', '汉朝'):
+            with self.subTest(raw=raw):
+                self.assertTrue(douban_list._is_region_label(raw))
+
+    def test_norm_author_of_bare_region_label_is_load_bearing_guard(self):
+        # 诚实记录守卫：整串只剩标注时 `_norm_author` 剥括号有「剥后非空才剥」护栏（给
+        # 「（佚名）」用的），故残留单字「日」——这正是必须靠 is_single_region_label 兜，
+        # 而**不能**在 _norm_author 里剥成空串的原因：两端都剥空会误判相等。
+        self.assertEqual(douban_list._norm_author('[日]'), '日')
+        self.assertFalse(douban_list.author_matches('[日]', '东野圭吾'))
+        self.assertFalse(douban_list.author_matches('[日]', ''))   # 名单侧归一为空 ⇒ 永不匹配
+
+
+class TestTranslatorSuffixAuthor(unittest.TestCase):
+    """尾部「著 + 译者名 + 译」的译者段剥离（译者不是这本书的作者）。"""
+
+    def test_translator_tail_stripped(self):
+        for raw, want in (
+                ('(美)某某 著 某某 译', '某某'),
+                ('（美）某某 著 某某 译', '某某'),
+                ('[日] 东野圭吾 著 刘子倩 译', '东野圭吾'),
+                ('[英]J.R.R.托尔金 著；靳锦 译', 'jrr托尔金'),   # 分号形态（_norm_author 归一小写）
+                ('某某 著 某某译', '某某'),
+        ):
+            with self.subTest(raw=raw):
+                self.assertEqual(douban_list._norm_author(raw), want)
+
+    def test_author_matches_bridges_translator_forms(self):
+        # 名单侧带译者 / 引擎侧不带（或反之）→ 仍判同一人
+        for a, b in (('(美)某某 著 某某 译', '某某'), ('某某', '(美)某某 著 某某 译'),
+                     ('[日] 东野圭吾 著 刘子倩 译', '东野圭吾'),
+                     ('[日] 东野圭吾', '[日] 东野圭吾 著 刘子倩 译')):
+            with self.subTest(pair=(a, b)):
+                self.assertTrue(douban_list.author_matches(a, b))
+
+    def test_single_token_names_untouched(self):
+        # 切不成节的（无空格）原样返回：不做冒进猜测（既有行为不变）
+        for raw in ('巴利著；靳锦译', '甲 译', '高原著', 'Stephen King', '天蚕土豆'):
+            with self.subTest(raw=raw):
+                self.assertEqual(douban_list._strip_trailing_translators(raw), raw)
+
+    def test_translator_never_becomes_author(self):
+        # 译者名不得被当作者：剥完只剩译者名时也返回原串（交由上层按作者未知/污染处置），
+        # 绝不让「某某 译」里的译者名冒充作者——故这里**不应该**与译者名判为同一人
+        self.assertNotEqual(douban_list._norm_author('某某 著 某某 译'), '某某译')
+        self.assertEqual(douban_list._norm_author('某某 著 某某 译'), '某某')
+
+
+class TestCleanListAuthor(unittest.TestCase):
+    """clean_list_author：入库前的作者清洗（只剥与「作者是谁」无关的成分，不改写入口径的其余部分）。"""
+
+    def test_strips_region_and_translator_keeps_original_case(self):
+        for raw, want in (
+                ('[日] 东野圭吾', '东野圭吾'),
+                ('[英] J.R.R.托尔金 著', 'J.R.R.托尔金'),      # 保留原大小写与中点（不是 casefold 形态）
+                ('(美)某某 著 某某 译', '某某'),
+                ('〔清〕曹雪芹', '曹雪芹'),
+                ('[日] 东野圭吾 著 刘子倩 译', '东野圭吾'),
+        ):
+            with self.subTest(raw=raw):
+                self.assertEqual(douban_list.clean_list_author(raw), want)
+
+    def test_clean_result_survives_storage_guard(self):
+        # 清洗结果必须能过 import 的作者护栏（非空、非占位）——否则清洗等于把能救的一条判死
+        import import_one
+        for raw in ('[日] 东野圭吾', '[英] J.R.R.托尔金 著', '〔清〕曹雪芹', '(美)某某 著 某某 译'):
+            with self.subTest(raw=raw):
+                cleaned = douban_list.clean_list_author(raw)
+                status, value, _ = import_one.normalize_author(cleaned)
+                self.assertEqual(status, 'ready')
+                self.assertEqual(value, cleaned)
+
+    def test_aligned_with_import_loose_key(self):
+        # 与入库身份键同口径：清洗结果归一化后 == import_one._loose_author_key(原串)。
+        # 这是「不给同一本书造第二行」的依据——两条键必须落在一起。
+        import import_one
+        for raw in ('[日] 东野圭吾', '[英] J.R.R.托尔金 著', '〔清〕曹雪芹', '(美)某某 著 某某 译',
+                    '[日] 东野圭吾 著 刘子倩 译'):
+            with self.subTest(raw=raw):
+                self.assertEqual(douban_list._norm_author(douban_list.clean_list_author(raw)),
+                                 import_one._loose_author_key(raw))
+
+    def test_real_names_unchanged(self):
+        for raw in ('天蚕土豆', '辰东', 'priest', '乔治·奥威尔', '天蚕土豆（土豆）'):
+            with self.subTest(raw=raw):
+                self.assertEqual(douban_list.clean_list_author(raw), raw)
+
+    def test_empty_or_region_only_returns_input(self):
+        # 剥完为空（或整串只剩标注）⇒ 原样返回，由 is_bogus_list_author 判污染后置空；
+        # 绝不在清洗层写空串（空作者 import 判 review = 白丢一条本可救的书）
+        self.assertEqual(douban_list.clean_list_author('[日]'), '[日]')
+        self.assertEqual(douban_list.clean_list_author('〔清〕'), '〔清〕')
+        self.assertEqual(douban_list.clean_list_author(''), '')
+        self.assertTrue(douban_list.is_bogus_list_author(douban_list.clean_list_author('[日]')))
+
+
+class TestRegionBareLabelRejected(unittest.TestCase):
+    """M1（rvauthtag-41 §2）：名单作者整串只剩国别/朝代标注（[日]/〔清〕/（宋））⇒ **不收**。
+
+    这条不是「名单作者被污染」的降级——标注本身就是信息：真作者是外国人或古人，引擎源上同名
+    的中文网文作者几乎一定是**另一本**书。旧实现按污染降级为「名单无作者」、交内容比对救回，
+    会把同名异书错绑（审查反例：《幻夜》[日] vs 引擎 里拜亚鲸）。故引擎路径直接跳过不收；
+    book15 路径置空 author（保留 list_author_raw 诊断）走 review，不自动入库。"""
+
+    def setUp(self):
+        no_wait(self)
+
+    def _resolve(self, list_author, engine_candidates, books, title='幻夜'):
+        def http_get(url):
+            return NO_RESULT_HTML if url.startswith('/books/search') else '<html></html>'
+        cli = _cm_cli(books, engine_candidates)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
+            queue = douban_list._resolve_candidates(
+                [{'title': title, 'author': list_author, 'douban_url': 'https://d/1'}],
+                http_get, origin='测试', engine_cli=cli)
+        return queue, buf.getvalue(), cli
+
+    def test_region_only_not_rescued_even_when_engine_content_matches(self):
+        # 反向断言：即便引擎上两站内容同一本书（原本必被内容比对救回），只剩标注 ⇒ 照样不收
+        base_a, base_b = 'https://a.example/1', 'https://b.example/1'
+        books = {base_a: _cm_book_bodies(CM_TITLES_X, CM_MULTI_X, base_a),
+                 base_b: _cm_book_bodies(CM_TITLES_X_ALT, CM_MULTI_X, base_b)}
+        cands = [{'source': 'a.example', 'title': '幻夜', 'author': '东野圭吾', 'bookUrl': base_a},
+                 {'source': 'b.example', 'title': '幻夜', 'author': '東野圭吾', 'bookUrl': base_b}]
+        queue, out, _ = self._resolve('[日]', cands, books)
+        self.assertEqual(queue, [])                       # 不收，而不是降级救回
+        self.assertIn('国别标注名单作者拒收 1 本', out)
+        self.assertNotIn('内容比对放行', out)
+
+    def test_reviewer_counterexample_region_only_vs_webnovel_author(self):
+        # rvauthtag-41 §4.1 反例：引擎源上《幻夜》唯一候选是中文网文作者（gate.log 真实出现的
+        # 里拜亚鲸）——旧代码收下这条并绑上名单身份；新代码必须拒收。〔清〕/（宋）同理。
+        base = 'https://www.example-webnovel.com/hy'
+        books = {base: _cm_book(CM_TITLES_X, CM_BODY_X, base)}
+        for raw_author, engine_author in (('[日]', '里拜亚鲸'),
+                                          ('〔清〕', '某网文作者'),
+                                          ('（宋）', '某网文作者')):
+            with self.subTest(list_author=raw_author):
+                cands = [{'source': 'www.example-webnovel.com', 'title': '幻夜',
+                          'author': engine_author, 'bookUrl': base}]
+                queue, out, _ = self._resolve(raw_author, cands, books)
+                self.assertEqual(queue, [])
+                self.assertIn('国别标注名单作者拒收 1 本', out)
+        # 对照：带真名的「[日] 东野圭吾」照旧按作者匹配走（见 test_full_name_with_region_label_*）
+
+    def test_region_only_never_reaches_engine(self):
+        # 直接跳过、不调引擎：既省一次搜索，也堵死「任何调用方拿只剩标注的名单作者走引擎」
+        base = 'https://e.example/tr'
+        cands = [{'source': 'e.example', 'title': '幻夜', 'author': '东野圭吾', 'bookUrl': base}]
+        queue, out, cli = self._resolve('[日]', cands, {base: _cm_book(CM_TITLES_X, CM_BODY_X, base)})
+        self.assertEqual(queue, [])
+        self.assertFalse(any(sub == 'search' for sub, _ in cli.calls))
+
+    def test_search_engine_rejects_region_only_author(self):
+        # 纵深防御：search_engine 自身也拒（labeler 等直接调用方不会绕过 _resolve_candidates）
+        cands = [{'source': 'e.example', 'title': '幻夜', 'author': '东野圭吾',
+                  'bookUrl': 'https://e.example/tr'}]
+        cli = _cm_cli({}, cands)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            hit = douban_list.search_engine(cli, '幻夜', '[日]')
+        self.assertIsNone(hit)
+        self.assertIn('拒绝引擎兜底', buf.getvalue())
+        self.assertFalse(any(sub == 'search' for sub, _ in cli.calls))
+
+    def test_full_name_with_region_label_is_not_downgraded(self):
+        # 红线反例：带真名的「[日] 东野圭吾」不受影响，直接按作者匹配收
+        base = 'https://f.example/x'
+        cands = [{'source': 'f.example', 'title': '幻夜', 'author': '东野圭吾', 'bookUrl': base}]
+        queue, out, _ = self._resolve('[日] 东野圭吾', cands, {})
+        self.assertNotIn('拒收', out)
+        self.assertEqual(len(queue), 1)
+        self.assertEqual(queue[0]['author'], '东野圭吾')          # 清洗后存真名（剥掉国别标注）
+
+    def test_engine_off_path_unchanged(self):
+        # 红线：engine_cli=None（开关关闭）时本函数行为逐字不变——bare region label 不走
+        # 「拒收」分支，照旧归入 miss（那条路径本来也不收，只是汇总口径不变）
+        def http_get(url):
+            return NO_RESULT_HTML
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
+            queue = douban_list._resolve_candidates(
+                [{'title': '幻夜', 'author': '[日]', 'douban_url': 'https://d/1'}],
+                http_get, origin='测试')
+        self.assertEqual(queue, [])
+        self.assertNotIn('拒收', buf.getvalue())
+        self.assertIn('未命中 1 本', buf.getvalue())
+
+    def test_bare_region_label_book15_path_goes_review(self):
+        # book15 命中路径：查得到书但不自动入库——author 置空（import 按空作者判 review），
+        # 原串仅进 list_author_raw 诊断（不把「[日]」当作者写进去）
+        html = book15_search_html('幻夜', '/books/details1.html')
+        def http_get(url):
+            return html if url.startswith('/books/search') else '<html></html>'
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            queue = douban_list._resolve_candidates(
+                [{'title': '幻夜', 'author': '[日]', 'douban_url': 'https://d/1'}],
+                http_get, origin='测试')
+        self.assertEqual(len(queue), 1)
+        self.assertEqual(queue[0]['author'], '')
+        self.assertEqual(queue[0]['list_author_raw'], '[日]')
+        # 不写 author_source：这条书**没**被内容比对救回，入库由 import 判 review
+        self.assertNotIn('author_source', queue[0])
+
+
+class TestTitleTraditionalFold(unittest.TestCase):
+    """41-authtag：书名繁简折叠（只改比较口径，不改写入值）。"""
+
+    def test_traditional_and_simplified_titles_match(self):
+        # deploylbl41c §5 补核二 #3：《魔道祖師》名单书名是繁体，与简体源书名应判同一本
+        self.assertTrue(douban_list.title_compatible('魔道祖師', '魔道祖师'))
+        self.assertTrue(douban_list.title_compatible('魔道祖师', '魔道祖師'))
+        self.assertEqual(douban_list._norm_title('魔道祖師'),
+                         douban_list._norm_title('魔道祖师'))
+
+    def test_bare_equal_after_fold(self):
+        # 无作者路径要求「归一后完全相等」，折叠必须在 _norm_title_bare 里生效
+        self.assertEqual(douban_list._norm_title_bare('魔道祖師'), '魔道祖师')
+        self.assertTrue(douban_list.title_compatible('魔道祖師', '魔道祖师 全文阅读'))
+
+    def test_distinct_titles_stay_distinct(self):
+        # 反例：折叠不得把不同书并成一本（前缀兼容对同人续写仍判否——「魔道祖师之XX」是**另一本**）
+        self.assertFalse(douban_list.title_compatible('斗破苍穹', '武动乾坤'))
+        self.assertFalse(douban_list.title_compatible('魔道祖師', '万道祖师'))
+        self.assertNotEqual(douban_list._norm_title('魔道祖師'), douban_list._norm_title('万道祖师'))
+        # 诚实记录：前缀兼容层本来就会把「同人续写」判为兼容（那是既有设计，靠 LLM 验证段兜）；
+        # 折叠是单射、不改变这层语义。
+        self.assertTrue(douban_list.title_compatible('魔道祖師', '魔道祖师之陈情令外传'))
+
+    def test_fold_does_not_touch_stored_value(self):
+        # 红线：折叠只作用于比较用的归一结果，原串不动（写库书名仍是繁体原样）
+        raw = '魔道祖師'
+        self.assertEqual(raw, '魔道祖師')
+        self.assertEqual(douban_list._fold_variants(raw), '魔道祖师')
+        self.assertEqual(raw, '魔道祖師')                          # _fold_variants 不改入参
+
+    def test_fold_table_matches_ts_source(self):
+        # 内嵌表必须与 src/lib/zh-variant-fold.ts 一致（生成脚本 --check 模式下同判据）
+        import re as _re
+        src = (Path(__file__).resolve().parent.parent / 'src' / 'lib' / 'zh-variant-fold.ts') \
+            .read_text(encoding='utf-8')
+        joined = ''.join(_re.findall(r"'([^']*)'", src[src.index('const PAIRS = ['):
+                                                     src.index("].join('');")]))
+        pairs = {joined[i]: joined[i + 1] for i in range(0, len(joined), 2)}
+        self.assertEqual(len(pairs), 2884)
+        self.assertEqual(len(douban_list._TITLE_FOLD_TRAD), len(pairs))
+        trad, simp = douban_list._TITLE_FOLD_TRAD, douban_list._TITLE_FOLD_SIMP
+        for ch, s in zip(trad, simp):
+            self.assertEqual(pairs[ch], s)
+
+    def test_fold_does_not_break_prefix_guard(self):
+        # 前缀兼容的前置条件「短侧 ≥2 字」在折叠后仍成立；折叠是单射，不造新前缀
+        self.assertFalse(douban_list.title_compatible('雨', '雨季不再来'))
+        self.assertEqual(douban_list._fold_variants('雨'), '雨')
+
+    def test_fold_used_by_load_done_titles(self):
+        # 已打标书名集合（labels.jsonl）与名单书名：繁简写法不得因为键不同而重复打标
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'labels.jsonl'
+            path.write_text(json.dumps({'title': '魔道祖師', 'site_title': '魔道祖師'},
+                                       ensure_ascii=False) + '\n', encoding='utf-8')
+            done = douban_list.load_done_titles(path)
+        self.assertIn(douban_list._norm_title('魔道祖师'), done)
 
 
 if __name__ == '__main__':
