@@ -2100,7 +2100,7 @@ def _reference_groups(plan_ref_hits: list[dict], plan_chapters: list[dict],
 
 
 def fill_source_identity(engine_cli, plan: dict, plan_ref_hits: list[dict], cand: dict,
-                         win: dict, src_win: dict, deadline: float,
+                         win: dict, deadline: float,
                          clock: Callable[[], float] = time.monotonic,
                          caches: dict | None = None) -> str:
     """补段源身份核验（rvlblseg R3 收口）→ 不通过原因（'' = 通过）。
@@ -2109,11 +2109,11 @@ def fill_source_identity(engine_cli, plan: dict, plan_ref_hits: list[dict], cand
     与计划源逐字相同、其后换书」即全过。主会话裁定改为**双参照与门**：
       (1) 书名繁简折叠相等（_fold_title），否则 'title'（零正文请求）；
       (2) 目录信号 douban_list._toc_decides 可判且判同，否则 'toc'（零正文请求，r2_b/r2_d 在此即拒）；
-      (3) 段位置标题核对：候选窗口章标题与计划源目录同章号章名不一致比例 >SEG_FILL_TITLE_MAX_MISMATCH → 'title_pos'；
-      (4) 正文双参照（_reference_groups：书首组 + 近窗组，取自计划源**已取到且可用**的章，不额外抓计划源正文）
+      (3) 正文双参照（_reference_groups：书首组 + 近窗组，取自计划源**已取到且可用**的章，不额外抓计划源正文）
           各组候选抓同章号正文、走 douban_list.same_book 的正文信号（_body_decides），**每组都须可判且判同**
           （各 ≥2 互异章对），任一组不可判或不判同 → 'body'。「头同尾异」只要计划源在中段有已取可用章，
           近窗组即落在分歧区把它拦下（第 1 段窗口在书首、无近窗组）。
+    段位置标题核对（rvlblseg R3 重点 2）不在此做——放在 fetch_segment 之后按**实际送模章**核对（_seg_title_mismatch）。
     caches：{'cand_toc': {id: 原因}, 'cand_ch': {id: {num: text}}} 跨段复用，候选抓章总数 ≤SEG_FILL_VERIFY_MAX。"""
     caches = caches if caches is not None else {}
     plan_title = _fold_title(plan.get('title') or '')
@@ -2127,8 +2127,6 @@ def fill_source_identity(engine_cli, plan: dict, plan_ref_hits: list[dict], cand
         toc_cache[id(cand)] = '' if (judge and same) else 'toc'
     if toc_cache[id(cand)]:
         return toc_cache[id(cand)]
-    if _seg_title_mismatch(plan['chapters'], cand['chapters'], src_win) > SEG_FILL_TITLE_MAX_MISMATCH:
-        return 'title_pos'
     ch_cache = caches.setdefault('cand_ch', {}).setdefault(id(cand), {})
     for grp in _reference_groups(plan_ref_hits, plan['chapters'], win):
         plan_fp = _fingerprint_from_hits(plan['chapters'], grp)
@@ -2251,7 +2249,7 @@ def fetch_book_text_segmented(engine_cli, book: dict, tracker: SourceGiveupTrack
             src_win = {**src_win, 'target': win['target']}
             if i != plan_i:
                 reason = fill_source_identity(engine_cli, plan, plan_ref_hits, entry,
-                                              win, src_win, deadline, clock, fill_caches)
+                                              win, deadline, clock, fill_caches)
                 if reason:
                     print(f'  备选源 {host} 补段身份核验未过（{reason}），不用它补段')
                     tried.append(f'{host}:identity_{reason}')
@@ -2260,6 +2258,14 @@ def fetch_book_text_segmented(engine_cli, book: dict, tracker: SourceGiveupTrack
             ok, why = segment_usable(res, win['target'], first_segment=win['no'] == 1)
             if i == plan_i and ok:
                 plan_ref_hits.extend(res['hits'])   # 计划源可用段已取章 → 正文参照（rvlblseg R3 重点 1/3）
+            # 段位置标题核对（rvlblseg R3 重点 2）：补段候选**实际送模章**（[first,last]）标题须与计划源
+            # 目录同章号章名一致，不一致比例过高 → 弃该候选（该源另一本书的后段章名对不上）。
+            if ok and i != plan_i and res['first'] is not None and _seg_title_mismatch(
+                    plan['chapters'], entry['chapters'],
+                    {'start': res['first'], 'end': res['last'] + 1}) > SEG_FILL_TITLE_MAX_MISMATCH:
+                tried.append(f'{host}:title_pos')
+                print(f'  第 {win["no"]} 段 {host} 送模章标题与计划源目录不符，弃')
+                continue
             tried.append(f'{host}:{why or "ok"}')
             res.update(src_i=i, window=src_win, ok=ok)
             if ok:

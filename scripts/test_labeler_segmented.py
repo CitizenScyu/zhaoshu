@@ -495,13 +495,12 @@ class TestFillSourceIdentity(unittest.TestCase):
     与门。每组候选抓同章号正文走 same_book 正文信号，各须可判且判同（各 ≥2 互异章对），任一组不过即拒。"""
 
     WIN = {'no': 2, 'start': 40}           # 第 2 段（约 40% 处），窗口起点 = 目录第 41 章
-    SRC_WIN = {'start': 40, 'end': 46}     # 候选窗口（供段位置标题核对）
 
-    def _fill(self, cli, cand, plan=None, plan_ref_hits=None, win=None, src_win=None, caches=None):
+    def _fill(self, cli, cand, plan=None, plan_ref_hits=None, win=None, caches=None):
         return labeler.fill_source_identity(
             cli, plan or _plan_entry(),
             plan_ref_hits if plan_ref_hits is not None else _ref_hits(),
-            cand, win or self.WIN, src_win or self.SRC_WIN,
+            cand, win or self.WIN,
             deadline=float('inf'), caches=caches if caches is not None else {})
 
     def test_fold_title_traditional_and_decor(self):
@@ -542,11 +541,17 @@ class TestFillSourceIdentity(unittest.TestCase):
                         'body': lambda i: _book_body(i) if i < 3 else _other_body(i)}})
         self.assertEqual(self._fill(cli, _entry('b.example.com')), 'body')
 
-    def test_title_position_mismatch_rejected(self):
-        """段位置标题核对：目录整体对得上（Jaccard 过阈值）但补段窗口内章名与计划源同章号大面积不一致 → 弃候选。"""
-        diff = lambda i: (f'第{i + 1}章 迥异篇目{i:04d}' if 40 <= i < 46 else _chapter_title(i))
-        cli = make_cli({'b.example.com': {'n': 100, 'titles': diff}})
-        self.assertEqual(self._fill(cli, _entry('b.example.com', titles=diff)), 'title_pos')
+    def test_title_position_mismatch_via_helper(self):
+        """段位置标题核对 _seg_title_mismatch：同章号信息性章名不一致计入分母，辅助/预览标题跳过。"""
+        plan = _plan_entry()['chapters']
+        cand_ok = _plan_entry()['chapters']
+        self.assertEqual(labeler._seg_title_mismatch(plan, cand_ok, {'start': 40, 'end': 46}), 0.0)
+        cand_diff = _plan_entry(titles=lambda i: f'第{i + 1}章 迥异篇目{i:04d}')['chapters']
+        self.assertGreater(labeler._seg_title_mismatch(plan, cand_diff, {'start': 40, 'end': 46}), 0.20)
+        # 计划源该段挂 APP免费/番外 等辅助标题 → 跳过、不据此判不一致（分母 0 → 0.0）
+        plan_aux = _plan_entry(titles=lambda i: (f'第{i + 1}章 番外{i}APP免费'
+                                                 if 40 <= i < 46 else _chapter_title(i)))['chapters']
+        self.assertEqual(labeler._seg_title_mismatch(plan_aux, cand_diff, {'start': 40, 'end': 46}), 0.0)
 
     def test_shared_generic_toc_rejected_without_fetch(self):
         """同名、仅共享 5 条站方通用条目（关于本书/人物介绍…，r2_d）→ 目录 Jaccard 远低于阈值 → 目录信号判否，
@@ -559,8 +564,7 @@ class TestFillSourceIdentity(unittest.TestCase):
     def test_first_segment_uses_head_group_only(self):
         """第 1 段窗口在书首、无近窗组：只用书首组判同（同书可过）。"""
         cli = make_cli({'b.example.com': {'n': 100}})
-        self.assertEqual(self._fill(cli, _entry('b.example.com'),
-                                    win={'no': 1, 'start': 0}, src_win={'start': 0, 'end': 6}), '')
+        self.assertEqual(self._fill(cli, _entry('b.example.com'), win={'no': 1, 'start': 0}), '')
 
     def test_no_reference_rejects(self):
         """计划源无可用参照章（第 1 段 short → hits 不作参照，rvlblseg R3 重点 3）→ 书首组不可判 → 拒、不接管。"""
@@ -590,8 +594,7 @@ class TestFillSourceIdentity(unittest.TestCase):
         cand = _entry('b.example.com')
         self._fill(cli, cand, caches=caches)
         n1 = len(_content_calls(cli, 'b.example.com'))
-        self._fill(cli, cand, caches=caches,
-                   win={'no': 3, 'start': 70}, src_win={'start': 70, 'end': 74})
+        self._fill(cli, cand, caches=caches, win={'no': 3, 'start': 70})
         self.assertEqual(len(_content_calls(cli, 'b.example.com')), n1)   # 章号 1..7 已缓存
 
     def test_names_use_douban_informative_titles(self):
@@ -724,6 +727,21 @@ class TestFillIdentityEndToEnd(_NoSleep):
         segs = {s['no']: s for s in sampling['segments']}
         self.assertEqual([segs[n]['source'] for n in (2, 3, 4)], ['b.example.com'] * 3)
         self.assertEqual(used['url'], 'https://a.example.com/book')
+
+    def test_title_position_mismatch_end_to_end(self):
+        """段位置标题核对（端到端）：备选正文是同书正文、目录整体也对得上，但**第 2 段窗口内章名**与计划源
+        同章号大面积不一致（盗版站该段换了另一套章名）→ 送模章标题核对不过，弃该候选、该段未取到；
+        其余段章名一致 → 照常补段。"""
+        diff = lambda i: (f'第{i + 1}章 迥异篇目{i:04d}' if 40 <= i < 46 else _chapter_title(i))
+        cli = make_cli({
+            'a.example.com': {'n': 100, 'body': _a_late_4xx},
+            'b.example.com': {'n': 100, 'titles': diff},   # 正文仍 _book_body（同书），仅第 2 段窗口章名不同
+        })
+        text, chars, used, sampling, _ = _fetch(cli, _book(alternates=['b.example.com']))
+        segs = {s['no']: s for s in sampling['segments']}
+        self.assertTrue(segs[2].get('missing'))
+        self.assertIn('b.example.com:title_pos', segs[2]['tried'])
+        self.assertEqual(segs[3]['source'], 'b.example.com')   # 第 3 段章名一致 → 照常补段
 
     def test_numbered_plan_toc_disables_fill(self):
         """计划源目录纯编号（无信息性章名）→ 身份无从核，不按段换源：备选连目录都不取，后段标未取到。"""
