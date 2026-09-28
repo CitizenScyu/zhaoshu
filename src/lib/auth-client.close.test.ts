@@ -31,6 +31,12 @@ function pendingBody(status = 200) {
   };
 }
 
+// 对应 AuthForm 在 await 后才执行 finish：取消必须拒绝，不能进入成功续体。
+function completion(promise: Promise<void>) {
+  const success = vi.fn();
+  return { success, result: promise.then(() => { success(); return null; }, (error: unknown) => error) };
+}
+
 beforeEach(() => vi.useFakeTimers());
 afterEach(() => { vi.useRealTimers(); vi.unstubAllGlobals(); vi.restoreAllMocks(); });
 
@@ -51,6 +57,7 @@ describe('认证操作的关闭与代际守卫', () => {
     fetch.mockResolvedValueOnce(body.response);
     const pending = operation === 'login' ? instance.login('synthetic_old', 'synthetic_password', false)
       : operation === 'owner' ? instance.loginOwner('synthetic_owner', false) : instance.start();
+    const completed = completion(pending);
     await vi.advanceTimersByTimeAsync(0);
     expect(body.read).toHaveBeenCalledOnce();
     if (invalidation !== 'external') instance.close();
@@ -61,7 +68,13 @@ describe('认证操作的关闭与代际守卫', () => {
     const observed: number[] = [];
     instance.subscribe(() => { if (instance.state.user) observed.push(instance.state.user.id); });
     body.finish({ user: oldUser, accountsEnabled: true });
-    await pending;
+    const outcome = await completed.result;
+    if (operation === 'login' || operation === 'owner') {
+      expect(outcome).toMatchObject({ name: 'AbortError' });
+      expect(completed.success).not.toHaveBeenCalled();
+    } else {
+      expect(outcome).toBeNull();
+    }
     await next;
     expect(storage.write).not.toHaveBeenCalled();
     expect(notify).not.toHaveBeenCalled();
@@ -85,12 +98,14 @@ describe('认证操作的关闭与代际守卫', () => {
     let resolve!: (response: Response) => void;
     fetch.mockReturnValueOnce(new Promise(done => { resolve = done; }));
     const pending = operation === 'logout' ? instance.logout() : instance.loginOwner('synthetic_new_owner', false);
+    const completed = completion(pending);
     await vi.advanceTimersByTimeAsync(0);
     expect(fetch).toHaveBeenCalledOnce();
     instance.close();
     const generation = instance.session.id;
     resolve(json({ ok: true }));
-    await pending;
+    expect(await completed.result).toMatchObject({ name: 'AbortError' });
+    expect(completed.success).not.toHaveBeenCalled();
     expect(storage.write).not.toHaveBeenCalled();
     expect(storage.clear).not.toHaveBeenCalled();
     expect(notify).not.toHaveBeenCalled();
@@ -103,12 +118,14 @@ describe('认证操作的关闭与代际守卫', () => {
     const body = pendingBody(401);
     fetch.mockResolvedValueOnce(body.response);
     const pending = instance.login('synthetic_old', 'synthetic_password', false);
+    const completed = completion(pending);
     await vi.advanceTimersByTimeAsync(0);
     expect(body.read).toHaveBeenCalledOnce();
     instance.close();
     const restarted = instance.start();
     body.finish({ error: 'synthetic old rejection' });
-    await expect(pending).resolves.toBeUndefined();
+    expect(await completed.result).toMatchObject({ name: 'AbortError' });
+    expect(completed.success).not.toHaveBeenCalled();
     await restarted;
     expect(instance.state.user?.id).toBe(newUser.id);
     expect(storage.clear).toHaveBeenCalledOnce();
@@ -140,8 +157,13 @@ describe('认证操作的关闭与代际守卫', () => {
     const { instance, storage, notify, fetch } = fixture();
     instance.close();
     const generation = instance.session.id;
-    await Promise.all([instance.login('synthetic', 'synthetic', false), instance.loginOwner('synthetic', false),
-      instance.logout(), instance.refresh(), instance.handleExternalChange()]);
+    const actions = [instance.login('synthetic', 'synthetic', false), instance.loginOwner('synthetic', false),
+      instance.logout()].map(completion);
+    for (const action of actions) {
+      expect(await action.result).toMatchObject({ name: 'AbortError' });
+      expect(action.success).not.toHaveBeenCalled();
+    }
+    await Promise.all([instance.refresh(), instance.handleExternalChange()]);
     instance.setLegacySessionOnly(true);
     expect(fetch).not.toHaveBeenCalled();
     expect(storage.write).not.toHaveBeenCalled();
@@ -158,10 +180,13 @@ describe('认证操作的关闭与代际守卫', () => {
     await vi.advanceTimersByTimeAsync(0);
     expect(body.read).toHaveBeenCalledOnce();
     const oldLogin = instance.login('synthetic_old', 'synthetic_password', false);
+    const completed = completion(oldLogin);
     instance.close();
     const restarted = instance.start();
     body.finish({ user: oldUser, accountsEnabled: true });
-    await Promise.all([start, oldLogin, restarted]);
+    await Promise.all([start, completed.result, restarted]);
+    expect(await completed.result).toMatchObject({ name: 'AbortError' });
+    expect(completed.success).not.toHaveBeenCalled();
     expect(fetch).toHaveBeenCalledTimes(2);
     expect(fetch.mock.calls.every(([request]) => new URL(request.url).pathname === '/api/auth/session')).toBe(true);
     expect(instance.state.user?.id).toBe(newUser.id);
@@ -182,9 +207,11 @@ describe('认证操作的关闭与代际守卫', () => {
 
   it('合法排队的退出再登录仍按顺序执行，不被前一步rotate误取消', async () => {
     const { instance, fetch } = fixture();
-    const logout = instance.logout();
-    const login = instance.login('synthetic_new', 'synthetic_password', false);
-    await Promise.all([logout, login]);
+    const logout = completion(instance.logout());
+    const login = completion(instance.login('synthetic_new', 'synthetic_password', false));
+    await Promise.all([logout.result, login.result]);
+    expect(logout.success).toHaveBeenCalledOnce();
+    expect(login.success).toHaveBeenCalledOnce();
     expect(fetch.mock.calls.map(([request]) => new URL(request.url).pathname))
       .toEqual(['/api/auth/logout', '/api/auth/login']);
     expect(instance.state.user?.id).toBe(newUser.id);

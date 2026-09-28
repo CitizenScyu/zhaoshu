@@ -248,10 +248,25 @@ export class AuthController {
       : `anonymous|${transport}`;
   }
 
-  private enqueue(operation: () => Promise<void>): Promise<void> {
+  private enqueue(operation: () => Promise<void>, rejectCancelled = false): Promise<void> {
     // 生命周期变化也作废尚未开始的旧操作；合法队列内的登录/退出 rotate 不改变此值。
     const lifecycle = this.lifecycle;
-    const guarded = () => this.closed || lifecycle !== this.lifecycle ? Promise.resolve() : operation();
+    const cancelled = () => this.closed || lifecycle !== this.lifecycle;
+    const abort = () => new DOMException('认证操作已取消。', 'AbortError');
+    const guarded = async () => {
+      if (cancelled()) {
+        if (rejectCancelled) throw abort();
+        return;
+      }
+      try {
+        await operation();
+      } catch (error) {
+        if (rejectCancelled && cancelled()) throw abort();
+        throw error;
+      }
+      // 显式动作的调用方会在 resolve 后跳转/报成功；失效动作必须走其 AbortError 分支。
+      if (rejectCancelled && cancelled()) throw abort();
+    };
     const run = this.queue.then(guarded, guarded);
     this.queue = run.catch(() => {});
     return run;
@@ -529,7 +544,7 @@ export class AuthController {
       this.options.storage.clear();
       this.set({ phase: user ? 'authenticated' : 'anonymous', user, accountsEnabled: true, transport: 'cookie', expired: false });
       this.broadcast();
-    });
+    }, true);
   }
 
   /**
@@ -587,7 +602,7 @@ export class AuthController {
         sessionOnly,
         expired: false,
       });
-    });
+    }, true);
   }
 
   /** 旧模式下切换“仅本次会话保存”。 */
@@ -625,7 +640,7 @@ export class AuthController {
       this.rotate('cookie');
       this.set({ phase: 'anonymous', user: null, expired: false });
       this.broadcast();
-    });
+    }, true);
   }
 
   /**
