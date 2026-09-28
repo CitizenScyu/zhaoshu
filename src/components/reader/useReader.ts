@@ -478,7 +478,10 @@ export function useReader(session: ReadingSession, apiFetch: ApiFetch, userId: n
       const adopted = adoptSwitch(current.index, part);
       // H7:目录被替换时交付段改记新目录序号,与 adoptSwitch 迁移后的位置同一套序号。
       const shownPart = switchedReaderPart(current.index, adopted, part);
-      const shown = currentReading.current?.index === adopted ? currentReading.current.position : position;
+      // 只有换源替换目录时才采用迁移位置；原目录也与 currentReading.index 相等，
+      // 普通跳章若仅比较目录身份，会把旧章位置带进新章，跳过滚动恢复与进度保存。
+      const shown = adopted.chapters !== current.index.chapters && currentReading.current?.index === adopted
+        ? currentReading.current.position : position;
       setActiveKey(partKey(shownPart));
       setReading({ index: adopted, parts: [shownPart], position: shown, focus: true });
       setPercent(readingPercent(adopted, shownPart, shown.ratio));
