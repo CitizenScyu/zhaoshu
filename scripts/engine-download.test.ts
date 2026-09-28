@@ -245,6 +245,93 @@ describe('engine content pagination stops at the next chapter (41-PAGEFIX)', () 
   });
 });
 
+// dlstop42:下载器停止点 = 整本目录(manifest.chapters 全部 url)。三个场景对齐 rvreaderstop42 §1 的非阻断 1:
+// a) 站点「下一章」链指向目录**非相邻**章(cuoceng《鬼吹灯》型,目录序 0→3→2→4)⇒ 只传目录下一章拦不住,
+//    整本目录下每章文件只含本章;b) 真·章内分页(下一页不在目录)⇒ 仍拼页;c) 单章书行为不变(停止点含本章自身
+//    也无害:engineFetchContent 对数组剔除本章,循环内不会导航回本章)。
+describe('下载器逐章停止点 = 整本目录（dlstop42）', () => {
+  const rules = {
+    ruleSearch: { bookList: '.book', name: '.name@text', author: '.author@text', bookUrl: 'a@href' },
+    ruleBookInfo: { name: '.title@text', author: '.writer@text', tocUrl: '.toc@href' },
+    ruleToc: { chapterList: '.chapter', chapterName: 'a@text', chapterUrl: 'a@href' },
+    ruleContent: { content: '#content@text', nextContentUrl: '#linkNext@href' },
+  };
+  const source = { url: 'https://book15.net/cc/', name: 'cuoceng 同型', searchUrl: 'https://book15.net/cc/so/{{key}}.html', rules };
+  const chapter = (n: number) => `https://book15.net/cc/b/${n}.html`;
+  const tocPage = (ns: number[]) => ns.map(n => `<li class="chapter"><a href="/cc/b/${n}.html">第${n}章</a></li>`).join('');
+  const body = (text: string, next?: string) =>
+    `<div id="content">${text}</div>` + (next === undefined ? '' : `<a id="linkNext" href="${next}">下一章</a>`);
+
+  /** 夹具书:目录序 [0,1,2,3,4],正文页「下一章」链 0→3→2→4→(无)。第 0 章的下一章链指向目录第 3 章(非相邻)。 */
+  function interleavedPages(): Map<string, string> {
+    return new Map<string, string>([
+      [`https://book15.net/cc/so/${encodeURIComponent('测试书')}.html`, '<div class="book"><span class="name">测试书</span><span class="author">作者甲</span><a href="/cc/b.html">x</a></div>'],
+      ['https://book15.net/cc/b.html', '<h1 class="title">测试书</h1><span class="writer">作者甲</span><a class="toc" href="/cc/b/toc.html">目录</a>'],
+      ['https://book15.net/cc/b/toc.html', tocPage([0, 1, 2, 3, 4])],
+      [chapter(0), body('第0章正文', '/cc/b/3.html')],
+      [chapter(3), body('第3章正文', '/cc/b/2.html')],
+      [chapter(2), body('第2章正文', '/cc/b/4.html')],
+      [chapter(4), body('第4章正文')],
+      [chapter(1), body('第1章正文')],
+    ]);
+  }
+
+  async function runDownload(pages: Map<string, string>) {
+    const out = mkdtempSync(join(tmpdir(), 'dlstop-')); dirs.push(out);
+    const options = downloadOptions({ source: source.url, title: '测试书', author: '作者甲', out, 'rate-ms': 0, 'timeout-ms': 1000 });
+    const calls: string[] = [];
+    const transport = async (url: string, opts: { signal: AbortSignal; beforeRequest?: (signal: AbortSignal) => Promise<void> }) => {
+      calls.push(url); await opts.beforeRequest?.(opts.signal);
+      const text = pages.get(url);
+      if (text === undefined) throw new Error('unexpected request');
+      return { url, text };
+    };
+    vi.stubGlobal('fetch', () => { throw new Error('network forbidden'); });
+    const result = await downloadBook({ api, compile, parser }, options, async () => ({ source, builtin: false }), transport);
+    return { result, calls, dir: dirname(result.manifestPath) };
+  }
+  const chapterCalls = (calls: string[]) => calls.filter(url => /\/cc\/b\/\d+(_\d+)?\.html$/.test(url));
+
+  it('a) 目录序≠下一章链序:每章文件只含本章正文,每章只请求本章 1 页', async () => {
+    const { result, calls, dir } = await runDownload(interleavedPages());
+    expect(result.code).toBe(0);
+    expect(result.manifest.status).toBe('done');
+    // 目录序 [0,1,2,3,4]:第 0/1/2/3 章的 linkNext 都指向目录里的某章(0→3、3→2、2→4),必须在第 0 页后即停。
+    expect([0, 1, 2, 3, 4].map(i => readFileSync(join(dir, `${i}.txt`), 'utf8'))).toEqual(['第0章正文', '第1章正文', '第2章正文', '第3章正文', '第4章正文']);
+    expect(chapterCalls(calls)).toEqual([chapter(0), chapter(1), chapter(2), chapter(3), chapter(4)]);
+    // 整本拼接:book.txt 也只有五章各自身。
+    expect(readFileSync(join(dir, 'book.txt'), 'utf8')).toBe(
+      ['第0章', '第1章', '第2章', '第3章', '第4章'].map((t, i) => `${t}\n\n第${i}章正文\n\n`).join(''));
+  });
+
+  it('b) 真章内分页(下一页不在目录)⇒ 仍照常拼页', async () => {
+    const pages = interleavedPages();
+    // 第 1 章拆成两页:第 1 页 linkNext 指向 1_2.html(目录里没有),第 2 页才指向第 2 章。
+    pages.set(chapter(1), body('第1章上半', '/cc/b/1_2.html'));
+    pages.set('https://book15.net/cc/b/1_2.html', body('第1章下半', '/cc/b/2.html'));
+    const { result, calls, dir } = await runDownload(pages);
+    expect(result.code).toBe(0);
+    expect(readFileSync(join(dir, '1.txt'), 'utf8')).toBe('第1章上半\n第1章下半');
+    // 第 1 章请求两页(本章 + 章内第 2 页),其余章仍各 1 页。
+    expect(chapterCalls(calls)).toEqual([chapter(0), chapter(1), 'https://book15.net/cc/b/1_2.html', chapter(2), chapter(3), chapter(4)]);
+  });
+
+  it('c) 单章书:行为不变(正常完成,不因停止点含本章自身而中断)', async () => {
+    const pages = new Map<string, string>([
+      [`https://book15.net/cc/so/${encodeURIComponent('测试书')}.html`, '<div class="book"><span class="name">测试书</span><span class="author">作者甲</span><a href="/cc/b.html">x</a></div>'],
+      ['https://book15.net/cc/b.html', '<h1 class="title">测试书</h1><span class="writer">作者甲</span><a class="toc" href="/cc/b/toc.html">目录</a>'],
+      ['https://book15.net/cc/b/toc.html', tocPage([7])],
+      // 唯一章的 linkNext 回绕到自身(站点末章常回绕首章;这里首章=本章)。
+      [chapter(7), body('第7章正文', '/cc/b/7.html')],
+    ]);
+    const { result, calls, dir } = await runDownload(pages);
+    expect(result.code).toBe(0);
+    expect(result.manifest.status).toBe('done');
+    expect(readFileSync(join(dir, '0.txt'), 'utf8')).toBe('第7章正文');
+    expect(chapterCalls(calls)).toEqual([chapter(7)]);
+  });
+});
+
 // 41-EXEC-SRCUNAVAIL：搜索/详情/目录阶段的传输层失败与源站 5xx 归 code=2 source_unavailable
 // （与 resolveSource code=2 同档：可重试、零发布）；4xx、策略拒绝、其余异常与正文阶段维持原分类。
 describe('书源不可达分类（41-EXEC-SRCUNAVAIL）', () => {

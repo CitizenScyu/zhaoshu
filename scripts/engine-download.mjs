@@ -36,7 +36,10 @@ const MAX_BOOK_BYTES = 64 * 1024 * 1024;
 // 41-HTMLFIX（@html 正文转纯文本）起为 2，旧检查点没有这个字段，视为 1。格式不同的检查点不续传、全量重抓：
 // 缓存里存的是旧格式正文，续传会把它原样拼进新书（整本 blob 不变 ⇒ 发布器按「同内容」保留旧清单，修复不生效）。
 // 41-PAGEFIX（正文翻页遇下一章即停）起为 3：修复前缓存的章节可能串入了后续章节的正文，同样必须作废重抓。
-export const ENGINE_CONTENT_FORMAT = 3;
+// dlstop42（下载停止点改整本目录）起为 4：同 3 的理由——3 时代只传目录下一章，cuoceng 型「下一章」链指向
+// 目录非相邻章时拦不住，链长 < MAX_CONTENT_PAGES 且各页有正文 ⇒ strict 不抛、几章静默并进一个章文件；
+// 旧检查点里的这类章节必须作废重抓，修复才对在途 partial 生效。
+export const ENGINE_CONTENT_FORMAT = 4;
 export function downloadOptions(args) {
   if (!args.source || !args.title?.trim() || !args.author?.trim()) throw new Error('download 需要 --source --title --author');
   const source = new URL(args.source.includes('://') ? args.source : `https://${args.source}`);
@@ -152,6 +155,12 @@ export async function downloadBook(m, args, resolveSource, transport = fetchSour
     if (chapters.length > args['max-chapters']) throw new Error('max_chapters');
     const resume = previous?.sourceRevision === manifest.sourceRevision && previous?.tocHash === manifest.tocHash && previous?.bookUrl === manifest.bookUrl;
     stage = 'content';
+    // dlstop42：停止点 = 整本目录（与阅读器 readerstop42 / 生产打标 EngineStopUrls 同口径）。站点「下一章」
+    // 链的顺序可能与目录顺序不同（cuoceng 第 N 章的 linkNext 指向目录非相邻章），只传目录下一章拦不住，
+    // 会静默把几章并进一个章文件；engineFetchContent 对数组命中其中任一即停，且自动剔除本章自身（真·章内
+    // 分页不受影响）。单章书保持旧口径（字符串、含本章自身）：末章「下一页」常回绕首章，单章时即回绕自身，
+    // 数组口径剔除本章后自指翻页会触发 pagination_cycle。只构造一次、循环外，逐章共享。
+    const stopUrls = manifest.chapters.length > 1 ? manifest.chapters.map(c => c.url) : manifest.chapters[0]?.url;
     for (const chapter of manifest.chapters) {
       controller.signal.throwIfAborted();
       try {
@@ -163,9 +172,7 @@ export async function downloadBook(m, args, resolveSource, transport = fetchSour
           if (hash(cached) === prior.sha256 && cached.trim()) text = cached;
         }
         if (text === undefined) text = await operation(async ctx => {
-          // 41-PAGEFIX:翻页遇下一章即停(legado BookContent 同款);末章回退第 0 章，与阅读端 nextChapterUrlOf 同口径。
-          const nextChapterUrl = manifest.chapters[chapter.index + 1]?.url ?? manifest.chapters[0]?.url;
-          if (!builtin) return (await m.api.engineFetchContent(engine, chapter.url, ctx, true, nextChapterUrl)).text;
+          if (!builtin) return (await m.api.engineFetchContent(engine, chapter.url, ctx, true, stopUrls)).text;
           return m.parser.parseSourceChapterText((await ctx.page(chapter.url)).text, chapter.title);
         });
         if (!text.trim()) throw new Error('empty_content');
