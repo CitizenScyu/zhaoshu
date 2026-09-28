@@ -9,6 +9,7 @@ import { isRecord } from '@/lib/sanitize';
 import { feedbackProfileUpdateMessage, type FeedbackProfileStatus } from '@/lib/feedback';
 import { EMPTY_HISTORY, historyKeyFor, historySnapshot, rememberQuery, subscribeHistory } from '@/lib/recent-queries';
 import { shouldRememberQuery } from '@/lib/find-retention';
+import { fetchExactSearch } from '@/lib/exact-search-request';
 import { createElapsedTicker, recallProgressSuffix, retryLabel, retryStep, showRetry, type FindPhase, type FindStep } from '@/lib/find-progress';
 // SSE 消费与落定判定放在纯模块里：本仓 vitest 只收 *.test.ts 且没有 jsdom，写在 JSX 闭包里的
 // 超时/落定判定测不到（见 find-sse.test.ts）。
@@ -468,13 +469,12 @@ function ExactSearchSection({ onFallback }: { onFallback: (query: string) => voi
     request.current = controller;
     dispatch({ type: 'submit', title: q });
     try {
-      const res = await apiFetch('/api/find/exact', {
-        signal: controller.signal,
+      const { response: res, payload } = await fetchExactSearch(controller.signal, (signal) => apiFetch('/api/find/exact', {
+        signal,
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ title: q, author: author.trim() }),
-      });
-      const payload: unknown = await res.json().catch(() => null);
+      }));
       if (controller.signal.aborted) return;
       if (!res.ok) {
         const message = isRecord(payload) && typeof payload.error === 'string' && payload.error
