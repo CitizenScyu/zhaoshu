@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { setImmediate as nextTurn } from 'node:timers/promises';
 import { consumeFindSSE, fetchFindResult } from './find-sse';
 
 function deferred<T>() {
@@ -51,6 +52,24 @@ describe('找书整步共享请求预算', () => {
     controller.abort();
     await failed;
     expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('响应头已到但尚未交给 reader 时取消，正文仍恰好取消一次', async () => {
+    // 让原生微任务调度重现 headers adoption 与 await 续体之间的边界。
+    vi.useRealTimers();
+    const controller = new AbortController();
+    const headers = deferred<Response>();
+    const response = streamingResponse();
+    const cancel = vi.spyOn(response.body!, 'cancel');
+    const pending = fetchFindResult(controller.signal, () => headers.promise, 1000, () => {});
+    const failed = expect(pending).rejects.toThrow('找书已取消');
+    await nextTurn();
+    void headers.promise.then(() => queueMicrotask(() => controller.abort()));
+    headers.resolve(response);
+    await failed;
+    await nextTurn();
+    expect(cancel).toHaveBeenCalledTimes(1);
+    expect(response.body?.locked).toBe(false);
   });
 
   it('调用前已经取消时不启动 transport', async () => {

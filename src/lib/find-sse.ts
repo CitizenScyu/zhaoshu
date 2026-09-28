@@ -158,6 +158,14 @@ export async function fetchFindResult(
   const requestSignal = merged.signal;
   const abort = abortRejection(requestSignal);
   let acceptingResponse = true;
+  let response: Response | undefined;
+  let consumerOwnsBody = false;
+  let responseDiscarded = false;
+  const discardResponse = (unused: Response) => {
+    if (responseDiscarded) return;
+    responseDiscarded = true;
+    void unused.body?.cancel().catch(() => {});
+  };
   try {
     if (requestSignal.aborted) throw abortError(requestSignal);
     const pending = Promise.resolve().then(() => {
@@ -165,11 +173,13 @@ export async function fetchFindResult(
       return doFetch(requestSignal);
     });
     // 非协作 transport 可能在超时后才返回 Response；那时仍须释放它的正文。
-    void pending.then(response => {
-      if (!acceptingResponse || requestSignal.aborted) void response.body?.cancel().catch(() => {});
+    void pending.then(arrived => {
+      response = arrived;
+      if (!acceptingResponse || requestSignal.aborted) discardResponse(arrived);
     }, () => {});
     const res = await Promise.race([pending, abort.promise]);
     if (requestSignal.aborted) throw abortError(requestSignal);
+    consumerOwnsBody = true;
     if (!res.ok || !/text\/event-stream/i.test(res.headers.get('content-type') ?? '')) {
       const data = await readErrorBody(res, requestSignal);
       const e = new Error(typeof data.error === 'string' && data.error ? data.error : '找书失败，请重试');
@@ -192,6 +202,8 @@ export async function fetchFindResult(
     throw error instanceof Error ? error : new Error('找书失败，请重试');
   } finally {
     acceptingResponse = false;
+    // 响应头已被 race 接收，但 await 续体前发生取消时，尚无 reader 负责这条正文。
+    if (response && !consumerOwnsBody) discardResponse(response);
     abort.dispose();
     merged.dispose();
     timeout.dispose();
