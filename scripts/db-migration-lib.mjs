@@ -44,7 +44,7 @@ const migrationsDir = resolve(here, '..', 'migrations');
 
 // 迁移文件是显式有序列表，不扫目录：目录里多一个 .sql 不该在无人察觉时被执行。
 // version 由文件名前缀解析，SCHEMA_VERSION 必须等于列表里的最大版本（见 loadMigrations）。
-export const MIGRATION_FILES = ['0001_baseline.sql', '0002_identity_key.sql', '0003_runtime_tables.sql'];
+export const MIGRATION_FILES = ['0001_baseline.sql', '0002_identity_key.sql', '0003_runtime_tables.sql', '0004_admission_lease_generation.sql'];
 
 // 已发布（已登记进某个库的 schema_migrations）的迁移摘要，冻结在这里由测试钉住。
 // v1 = 隔离库首次 db:migrate 登记的值（见下方 normalizeSqlText 注释）；生产从未跑过 runner、没有
@@ -398,6 +398,7 @@ export const EXPECTED_RUNTIME_COLUMNS = {
   cron_health: [
     ['name', 'text', 'NO', null],
     ['last_success_at', 'timestamp with time zone', 'NO', 'now()'],
+    ['lease_generation', 'bigint', 'NO', '0'],
   ],
   profile_feedback_queue: [
     ['user_id', 'integer', 'NO', null],

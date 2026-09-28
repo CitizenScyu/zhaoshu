@@ -145,8 +145,11 @@ maybe('PGlite 真库', () => {
     expect(dry).toMatchObject({ status: 'dry-run', problems: [] });
     // auth v5–v7 给 download_tasks / users 加的列、约束、索引不在 0001–0003 里：只报告，不拒绝。
     expect(new Set(dry.extra.map((item: { table: string }) => item.table))).toEqual(new Set(['download_tasks', 'users']));
-    expect(dry.checked).toEqual({ tables: 20, columns: 154, constraints: 48, indexes: 35, absent: 4, data: 10 });
-    expect(dry.ledgerWrites).toEqual(list.map(({ version, name, checksum }) => ({ table: 'schema_migrations', version, name, checksum })));
+    // fencefix42：0004 给 cron_health 加 lease_generation 列并进契约 ⇒ 契约列数 154→155（extra 报告集合同步加 cron_health）。
+    expect(dry.checked).toEqual({ tables: 20, columns: 155, constraints: 48, indexes: 35, absent: 4, data: 10 });
+    // fencefix42：baseline 只登记 v1–v3；0004 在登记后由 migrate:prod 执行（见下方 migrate 断言）。
+    expect(dry.ledgerWrites).toEqual(list.filter(({ version }) => version <= 3)
+      .map(({ version, name, checksum }) => ({ table: 'schema_migrations', version, name, checksum })));
     expect(await fingerprint(pg)).toEqual(before);
     expect(await ledgerPresent(pg)).toBe(false);
 
@@ -154,11 +157,14 @@ maybe('PGlite 真库', () => {
     expect(await main({ argv: baselineArgv(true), env: { PROD_DATABASE_URL: FAKE_URL }, open: async () => client, probe: okProbe,
       migrations: list, ...out })).toBe(0);
     const applied = JSON.parse(out.lines.at(-1)!);
-    expect(applied).toMatchObject({ status: 'applied', after: { ok: true, checksumOk: true, authVersionOk: true, missingTables: [] } });
+    // fencefix42：baseline 只登记 v1–v3；0004 尚未记账 ⇒ after.checksumOk=false 是**预期中间态**
+    // （ok 仍 true：缺表无、auth 齐）。下方 migrate:prod 补记 0004 后才恢复 up-to-date。
+    expect(applied).toMatchObject({ status: 'applied', after: { ok: false, checksumOk: false, authVersionOk: true, missingTables: [] } });
     expect(out.lines.join('\n')).not.toContain('not-a-secret-marker');
 
     const ledger = (await pg.query('SELECT version, name, checksum FROM schema_migrations ORDER BY version')).rows;
-    expect(ledger.map((row) => [row.version, row.name, String(row.checksum).trim()])).toEqual(list.map((item) => [item.version, item.name, item.checksum]));
+    expect(ledger.map((row) => [row.version, row.name, String(row.checksum).trim()])).toEqual(list.filter((item) => item.version <= 3)
+      .map((item) => [item.version, item.name, item.checksum]));
     // 除新建的记账表外，库里一个字节不变（结构、行数、auth 记账行含 applied_at）。
     const after = await fingerprint(pg);
     expect({ ...after, shape: { ...after.shape, columns: after.shape.columns.filter((row) => row.table_name !== 'schema_migrations'),
@@ -168,13 +174,17 @@ maybe('PGlite 真库', () => {
 
     expect(await main({ argv: ['check', '--database-url-env=PROD_DATABASE_URL'], env: { PROD_DATABASE_URL: FAKE_URL },
       open: async () => client, migrations: list, log: () => {} })).toBe(0);
+    // fencefix42：0004 的 DDL 已随 applyMigration 执行（列已在库），但记账表刚被 baseline 重建为 v1–v3，
+    // v4 未登记 ⇒ migrate:prod dry-run 报 pending（待记账），apply 后才 up-to-date。
+    expect((await runProdMigrate(client, list, 'dry-run')).status).toBe('dry-run');
+    expect(await runProdMigrate(client, list, 'apply')).toMatchObject({ status: 'applied' });
     expect((await runProdMigrate(client, list, 'dry-run')).status).toBe('up-to-date');
 
     // (c) 登记之后再跑 baseline：已有记账表 → 拒绝，退出码 2，记账不变。
     const again = await runProdBaseline(client, list, 'apply');
     expect(again.status).toBe('refused');
-    expect(again.refusals.join('\n')).toMatch(/已有 schema_migrations（登记了 3 个版本）/);
-    expect((await pg.query('SELECT count(*)::int AS n FROM schema_migrations')).rows[0].n).toBe(3);
+    expect(again.refusals.join('\n')).toMatch(/已有 schema_migrations（登记了 4 个版本）/);
+    expect((await pg.query('SELECT count(*)::int AS n FROM schema_migrations')).rows[0].n).toBe(4);
   }, 180_000);
 
   it('按生产演化路径建的库（旧应用表 → auth v1–v7 → 运行期 DDL → 手工 0002 → artifact → 用量表）：baseline 通过，登记后 check 退出 0', async () => {

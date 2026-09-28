@@ -36,6 +36,9 @@ export const BUSINESS_SCHEMA_COLUMNS: readonly (readonly [string, string])[] = [
   ['source_admission', 'engine_semantics_version'], ['source_admission', 'compile_diagnostics'],
   ['profile_feedback_queue', 'lease_token'], ['profile_feedback_queue', 'lease_expires_at'],
   ['profile_feedback_queue', 'fail_count'], ['profile_feedback_queue', 'next_eligible_at'],
+  // fencefix42：准入租约显式代次（fencing token）。cron_health 借行存租约到期时刻，再加一列
+  // BIGINT 代次——每次成功领取原子 +1，持有者拿「代次字符串」作为写事务的 fence 凭据。
+  ['cron_health', 'lease_generation'],
 ] as const;
 
 /** DROP INDEX IF EXISTS 退役的旧关系：探测要求它们**不存在**，否则说明 DDL 尚未跑到该批。 */
@@ -373,5 +376,13 @@ export async function initializeBusinessSchema(s: Sql) {
       name text PRIMARY KEY,
       last_success_at timestamptz NOT NULL DEFAULT now()
     )`,
+    // fencefix42：准入租约代次列（fencing token，见 BUSINESS_SCHEMA_COLUMNS 同名条目）。
+    // BIGINT 而非 JS number：代次在 JS 侧一律以十进制字符串往返（超 2^53 仍可精确比较），
+    // 数据库侧递增，超过 BIGINT 上限由领取语句失败关闭（溢出即 UPDATE 失败，见 shuyuan.ts）。
+    // 老库（0003 建的 cron_health 无此列）下一次 ensureSchema 走本幂等 DDL 补列，既有行
+    // 取默认 0，第一次新版领取推进为 1。
+    tx`
+    ALTER TABLE cron_health
+      ADD COLUMN IF NOT EXISTS lease_generation bigint NOT NULL DEFAULT 0`,
   ]);
 }
