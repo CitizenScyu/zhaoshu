@@ -308,6 +308,8 @@ export default function FindTab() {
           value={query}
           onChange={(e) => setQuery(e.target.value)}
           onKeyDown={(e) => {
+            // 输入法确认候选不算提交；229 兼容部分浏览器已结束 composition 的确认回车。
+            if (e.nativeEvent.isComposing || e.keyCode === 229) return;
             if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) run();
           }}
         />
@@ -502,7 +504,10 @@ function ExactSearchSection({ onFallback }: { onFallback: (query: string) => voi
           placeholder="书名，例如：诡秘之主"
           value={title}
           onChange={(e) => setTitle(e.target.value)}
-          onKeyDown={(e) => { if (e.key === 'Enter') void search(); }}
+          onKeyDown={(e) => {
+            if (e.nativeEvent.isComposing || e.keyCode === 229) return;
+            if (e.key === 'Enter') void search();
+          }}
         />
         <input
           className="paper-input text-sm"
@@ -510,7 +515,10 @@ function ExactSearchSection({ onFallback }: { onFallback: (query: string) => voi
           placeholder="作者（选填，同名书多时用来区分）"
           value={author}
           onChange={(e) => setAuthor(e.target.value)}
-          onKeyDown={(e) => { if (e.key === 'Enter') void search(); }}
+          onKeyDown={(e) => {
+            if (e.nativeEvent.isComposing || e.keyCode === 229) return;
+            if (e.key === 'Enter') void search();
+          }}
         />
         <div className="flex flex-wrap items-center gap-3">
           <button
