@@ -16,6 +16,7 @@ export default async function ReaderPage({ params, searchParams }: {
   const { taskId } = await params;
   const id = Number(taskId);
   if (!/^[1-9]\d*$/.test(taskId) || !Number.isSafeInteger(id) || id > 2_147_483_647) notFound();
-  const from = (await searchParams).from === 'shelf' ? 'shelf' : 'library';
+  const origin = (await searchParams).from;
+  const from = origin === 'shelf' || origin === 'find' ? origin : 'library';
   return <ReaderClient key={id} session={{ kind: 'download', taskId: id }} from={from} />;
 }
