@@ -13,6 +13,11 @@ class AuthResponseError extends Error {
   constructor(readonly response: Response) { super('authorization failed'); }
 }
 
+// SSE 心跳间隔（infrasyn-42 M4）：自托管 nginx 的 proxy_read_timeout（300s）内没有下行帧就会被掐连接，
+// 模型长思考期间流可能 100s+ 无帧。注释帧 `: ping\n\n` 对 EventSource 不可见（规范按行首冒号忽略），
+// 只用于保活。Vercel 现网同样无害（多 4–19 帧注释字节，见任务书遗留节）。
+const SSE_PING_MS = 15_000;
+
 export function personalError(error: unknown): { status: number; code: string; message: string } {
   if (error && typeof error === 'object' && 'code' in error && error.code === 'AUTH_SCHEMA_MIGRATION_REQUIRED') {
     return { status: 503, code: 'AUTH_SCHEMA_MIGRATION_REQUIRED', message: '个人数据迁移尚未就绪，请联系维护者。' };
@@ -40,6 +45,8 @@ export class PersonalRequest {
   private readonly cancellation = new AbortController();
   private streaming = false;
   private originalToken: string | null = null;
+  /** sse() 的 cancel 回调要能停掉 start 里起的心跳定时器（见 sse 内注释）。 */
+  private lastSseCancelCleanup: (() => void) | null = null;
   principal!: Readonly<Principal>;
 
   constructor(readonly request: NextRequest, budgetMs: number) {
@@ -101,6 +108,24 @@ export class PersonalRequest {
     const stream = new ReadableStream<Uint8Array>({
       start: async (controller) => {
         const emit = (event: unknown) => { this.assertActive(); controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`)); };
+        // M4 心跳：每 15s 发一帧注释行保活。ping 不经 emit——不触发 deadline 检查（assertActive 语义不变）。
+        // 定时器 unref（Node 下不挂住进程退出）；enqueue 抛错（controller 已关）吞掉并立即清定时器。
+        const ping = encoder.encode(': ping\n\n');
+        let pingTimer: ReturnType<typeof setInterval> | undefined;
+        const stopPing = () => {
+          if (pingTimer === undefined) return;
+          clearInterval(pingTimer);
+          pingTimer = undefined;
+        };
+        pingTimer = setInterval(() => {
+          try {
+            controller.enqueue(ping);
+          } catch {
+            stopPing();
+          }
+        }, SSE_PING_MS);
+        pingTimer.unref?.();
+        this.lastSseCancelCleanup = stopPing;
         try { await work(emit); }
         catch (error) {
           if (!this.cancellation.signal.aborted) {
@@ -108,11 +133,18 @@ export class PersonalRequest {
             controller.enqueue(encoder.encode(`data: ${JSON.stringify({ type: 'error', code: mapped.code, message: mapped.message })}\n\n`));
           }
         } finally {
+          stopPing();
           this.deadline.dispose();
           try { controller.close(); } catch { /* 客户端可能已经关闭流。 */ }
         }
       },
-      cancel: () => { this.cancellation.abort(new DOMException('stream cancelled', 'AbortError')); this.deadline.dispose(); },
+      cancel: () => {
+        // cancel 时 start 的 finally 可能还没跑到（work 仍挂起）：心跳定时器也在这里停。
+        // 若 finally 后到，stopPing 幂等（pingTimer 已 undefined 就不动）。
+        this.lastSseCancelCleanup?.();
+        this.cancellation.abort(new DOMException('stream cancelled', 'AbortError'));
+        this.deadline.dispose();
+      },
     });
     return new Response(stream, { headers: { 'Content-Type': 'text/event-stream; charset=utf-8', 'X-Accel-Buffering': 'no' } });
   }

@@ -32,6 +32,18 @@ function markQuotaHit(): void {
 
 type FetchLike = (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
 
+/** getSql 外呼的缺省超时上限（infrasyn-42 §9 M1）：无调用方 signal 的数据库 HTTP 请求最多挂 60s。 */
+export const DEFAULT_DB_FETCH_TIMEOUT_MS = 60_000;
+
+/** env DB_FETCH_TIMEOUT_MS（毫秒）；缺省/非法/≤0 回落 60s。不设上限夹逼——运维要调大是明确决定。 */
+export function dbFetchTimeoutMs(env: Record<string, string | undefined> = process.env): number {
+  const raw = env.DB_FETCH_TIMEOUT_MS;
+  if (raw === undefined || !/^\d+$/.test(raw.trim())) return DEFAULT_DB_FETCH_TIMEOUT_MS;
+  const value = Number(raw.trim());
+  if (!Number.isSafeInteger(value) || value <= 0) return DEFAULT_DB_FETCH_TIMEOUT_MS;
+  return value;
+}
+
 // 本地合成的 402：响应体不含任何上游文本，驱动据此抛出的错误与真 402 同形（isDbQuotaError 判中）。
 function localQuotaResponse(): Response {
   return new Response(JSON.stringify({ message: 'database quota exceeded (local backoff)' }), {
@@ -48,7 +60,17 @@ export function createQuotaAwareFetch(
       markQuotaHit();
       return localQuotaResponse();
     }
-    const response = await baseFetch(input, init);
+    // M1（infrasyn-42 §9 / infrarun §2）：无调用方 signal 的外呼兜底 60s 超时。已有 signal 的调用
+    // 原样透传、不合并（不做 AbortSignal.any）——上层预算/取消语义保持不变。超时抛出的 TimeoutError
+    // 发生在 baseFetch 内部，不会走到下面的 402 分支，也不布置冷却、不打 db_quota_exceeded 日志。
+    // AbortSignal.timeout：本文件虽纯服务端，但 db.ts 静态引入本模块、supported-sources 又经动态
+    // import('./db') 被客户端可达（eslint no-restricted-properties 据此判红）。浏览器基线下
+    // AbortSignal.timeout 会抛——但这条代码路径只在 neon 驱动的 fetchFunction 里执行（Node 服务端），
+    // 客户端 bundle 里不会被调用；用 abort-merge 的 timeoutSignal 反而引入「谁 dispose」的难题
+    // （fetch 内部无结束钩子），故此处豁免：eslint-disable-next-line。
+    // eslint-disable-next-line no-restricted-properties -- 服务端专用路径；见上
+    const effectiveInit = init?.signal ? init : { ...init, signal: AbortSignal.timeout(dbFetchTimeoutMs()) };
+    const response = await baseFetch(input, effectiveInit);
     if (response.status === 402) {
       markQuotaHit();
       if (latch.note()) {

@@ -29,3 +29,18 @@ describe('global security response headers (MS-11)', () => {
     expect(headers.some((entry) => entry.source === '/:path*')).toBe(true);
   });
 });
+
+// M5（infrasyn-42 §9/§10.2/§10.10）：standalone 输出是 phoenix 自托管 web 单元的入口
+// （.next/standalone/server.js）；headers 规则保持三条不动。
+describe('standalone output (M5)', () => {
+  it('output === "standalone"', () => {
+    expect(nextConfig.output).toBe('standalone');
+  });
+
+  it('security headers are still exactly the three baseline entries', async () => {
+    const headers = typeof nextConfig.headers === 'function' ? await nextConfig.headers() : [];
+    const applied = headers.find((entry) => entry.source === '/:path*');
+    expect(applied?.headers).toHaveLength(3);
+    expect(Object.keys(nextConfig)).not.toContain('turbopack'); // 临时放宽不进仓（worktree 构建记忆）
+  });
+});
