@@ -302,19 +302,20 @@ export class AuthController {
     const reason = new DOMException('认证响应超时。', 'TimeoutError');
     // 哨兵对象：读体可能合法产出任何 JSON 值（含 null），只有唯一的哨兵能表示超时。
     const TIMEOUT = Symbol('auth-body-timeout');
+    const reader = response.body?.getReader();
     let timer: ReturnType<typeof setTimeout> | undefined;
     const expired = new Promise<typeof TIMEOUT>((resolve) => {
       timer = setTimeout(() => {
         deadline.abort(reason);
+        // reader.cancel 让挂起的 read() 立即以 done 收场，流正常关闭；
+        // 无 body 的合成 Response（text() 路径）本来就不挂起，跳过。
+        if (reader) void reader.cancel(reason).catch(() => {});
         resolve(TIMEOUT);
       }, timeoutMs);
     });
     try {
-      const text = await Promise.race([this.readBodyText(response), expired]);
-      if (text === TIMEOUT) {
-        void response.body?.cancel(reason).catch(() => {});
-        throw reason;
-      }
+      const text = await Promise.race([this.readBodyText(response, reader), expired]);
+      if (text === TIMEOUT) throw reason;
       try {
         return JSON.parse(text);
       } catch {
@@ -326,9 +327,8 @@ export class AuthController {
   }
 
   /** 逐块读完整条正文（无长度上限：认证响应都是小 JSON，且等响应头阶段已过了同源校验）。 */
-  private async readBodyText(response: Response): Promise<string> {
-    if (!response.body) return response.text();
-    const reader = response.body.getReader();
+  private async readBodyText(response: Response, reader: ReadableStreamDefaultReader<Uint8Array> | undefined): Promise<string> {
+    if (!reader) return response.text();
     const decoder = new TextDecoder();
     let text = '';
     for (;;) {
