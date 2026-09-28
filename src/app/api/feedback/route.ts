@@ -25,12 +25,9 @@ async function handlePOST(req: NextRequest) {
     const body = await access.run(() => readJsonBody(req, MAX_BODY_BYTES, access.signal));
     const { title, author, status } = body ?? {};
     const cleanTitle = boundedString(title, 200) ?? '';
-    // undefined/null/''/纯空格都算「不知道作者」（佚名兜底）；除此之外的非字符串
-    // （数字、对象等）或超长才是非法输入。区分依据：客户端根本不该发这些形态。
-    if (author !== undefined && author !== null && typeof author !== 'string') {
-      return invalidAuthorResponse();
-    }
-    if (typeof author === 'string' && author.trim().length > 200) {
+    // 与 exact/shelf 同一判定式：null/undefined 先归一成 ''（佚名兜底），剩下的非字符串
+    // （数字、对象等）或 trim 后超长才是非法输入——客户端根本不该发这些形态。
+    if (boundedString(author ?? '', 200) === null) {
       return invalidAuthorResponse();
     }
     const cleanAuthor = boundedString(author, 200) || '佚名';
