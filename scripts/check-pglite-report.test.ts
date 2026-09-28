@@ -1,7 +1,7 @@
-import { describe, expect, it } from 'vitest';
-import { spawnSync } from 'node:child_process';
+import { describe, expect, it, vi } from 'vitest';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { writeFileSync, unlinkSync } from 'node:fs';
+import { existsSync, writeFileSync, unlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { resolve, join } from 'node:path';
 import { checkPgliteReport, discoverPgliteTests } from './check-pglite-report.mjs';
@@ -62,6 +62,37 @@ describe('PGlite 报告完整性', () => {
     const input = { ...report(), numPendingTests: 1 };
     input.testResults.push({ name: 'scripts/coverage-bench.run.test.ts', status: 'passed', assertionResults: [{ status: 'pending' }] });
     expect(checkPgliteReport(input, expected, root)).toEqual({ files: 3, passed: 3 });
+  });
+
+  it.each(['src/third.PGLITE.test.ts', 'src/fourth.pglite.integration.test.ts', 'tests/PGlite/example.test.tsx'])(
+    '兼容旧门禁识别的名称 %s，不能静默忽略其跳过', name => {
+      const input = report([...expected, name]);
+      input.testResults.at(-1)!.assertionResults = [{ status: 'pending' }];
+      expect(() => checkPgliteReport(input, [...expected, name], root)).toThrow(/跳过、待办或失败/);
+      expect(() => checkPgliteReport(input, expected, root)).toThrow(/清单之外/);
+    },
+  );
+
+  it('Git 清单保留大小写、间隔后缀和 Vitest include 外的 PGlite 文件', () => {
+    // 用独立临时索引验证真实 git 发现；不改工作树、当前分支索引或 Git 对象。
+    const index = join(tmpdir(), `pglite-index-${randomUUID()}`);
+    const names = [...expected, 'src/third.PGLITE.test.ts', 'src/fourth.pglite.integration.test.ts', 'tests/PGlite/example.test.tsx'];
+    const blob = execFileSync('git', ['rev-parse', 'HEAD:package.json'], { cwd: root, encoding: 'utf8' }).trim();
+    vi.stubEnv('GIT_INDEX_FILE', index);
+    try {
+      execFileSync('git', ['read-tree', '--empty'], { cwd: root });
+      execFileSync('git', ['update-index', '--index-info'], {
+        cwd: root, input: names.map(name => `100644 ${blob}\t${name}\n`).join(''),
+      });
+      const found = discoverPgliteTests(root);
+      for (const name of names) expect(found).toContain(name);
+      const input = report(found);
+      input.testResults.find(result => result.name === 'src/third.PGLITE.test.ts')!.assertionResults = [{ status: 'pending' }];
+      expect(() => checkPgliteReport(input, found, root)).toThrow(/跳过、待办或失败/);
+    } finally {
+      vi.unstubAllEnvs();
+      if (existsSync(index)) unlinkSync(index);
+    }
   });
 
   it('拒绝清单之外的 PGlite 文件', () => {

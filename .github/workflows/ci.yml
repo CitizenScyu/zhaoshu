@@ -95,7 +95,7 @@ jobs:
 
       # 2026-09-17 邀请码 bug 的逃逸模式：真库用例整文件静默 skip，Tests 显示 skipped、退出码 0，
       # `npm test` 依然全绿。仓库已用「缺依赖即抛错」堵住（src/lib/fixtures/pglite.ts），
-      # 这里再加一层结果断言：按 Git 清单核对全部 *.pglite.test.ts(x)，每文件必须唯一出现、
+      # 这里再加一层结果断言：按 Git 清单核对相对路径含 PGlite 的全部 *.test.ts(x)，每文件必须唯一出现、
       # 零跳过且有通过。仅要求最早的两个文件会让其余用例整文件漏跑时仍放行。
       - name: 断言真库用例没有被静默跳过
         run: node scripts/check-pglite-report.mjs .vitest-report.json

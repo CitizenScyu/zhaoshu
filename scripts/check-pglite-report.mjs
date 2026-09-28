@@ -4,16 +4,19 @@ import { dirname, isAbsolute, relative, resolve, sep } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
-const isPgliteTest = (name) => /\.pglite\.test\.tsx?$/.test(name);
+// 保留旧门禁对 PGlite 名称的大小写与位置兼容性；只判断仓库相对路径，
+// 不让工作树目录名（例如 pglite-report-gate-wt）把所有普通用例也归入此类。
+const isPgliteTest = (name) => /\.test\.tsx?$/.test(name) && /pglite/i.test(name);
 
 // 与 node:test / Python 门禁一样，清点已跟踪及尚未提交的用例；不扫描依赖或读取环境文件。
 export function discoverPgliteTests(root = repoRoot) {
   const listed = spawnSync('git', [
     '-C', root, 'ls-files', '--cached', '--others', '--exclude-standard', '-z',
-    '*.pglite.test.ts', '*.pglite.test.tsx',
+    '*.test.ts', '*.test.tsx',
   ], { encoding: 'utf8', timeout: 10_000 });
   if (listed.error || listed.status !== 0) throw new Error('无法用 git 清点 PGlite 测试文件，拒绝放行');
-  const files = [...new Set(listed.stdout.split('\0').filter(Boolean))].sort();
+  // 全仓清点：移入 Vitest include 之外的 PGlite 测试也必须报告，不能同时从两边消失。
+  const files = [...new Set(listed.stdout.split('\0').filter(isPgliteTest))].sort();
   // 保留原门禁的最低底线；实际覆盖要求是下面逐文件核对，不能仅靠此数量放行。
   if (files.length < 2) throw new Error('仓库 PGlite 测试文件不足 2 个，拒绝放行');
   return files;
