@@ -108,6 +108,7 @@ export default function AdminTab() {
 
   async function saveRegistration() {
     if (!registrationDraft || busy) return;
+    const submittedDraft = registrationDraft;
     setBusy('registration');
     setError(''); setNotice('');
     try {
@@ -115,14 +116,15 @@ export default function AdminTab() {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          membersEnabled: registrationDraft.membersEnabled,
-          registrationMode: registrationDraft.registrationMode,
+          membersEnabled: submittedDraft.membersEnabled,
+          registrationMode: submittedDraft.registrationMode,
         }),
       });
       const data = await res.json();
       if (!res.ok) throw new Error(errorText(data, '注册设置保存失败'));
       setRegistration(data as RegistrationSettings);
-      setRegistrationDraft(data as RegistrationSettings);
+      // 保存期间表单仍可编辑；只更新尚未被后续输入替换的提交快照。
+      setRegistrationDraft(current => current === submittedDraft ? data as RegistrationSettings : current);
       setNotice(`已保存：${data.registrationMode === 'closed' ? '注册关闭' : MODE_LABELS[data.registrationMode as RegistrationMode]}，成员功能${data.membersEnabled ? '已启用' : '已停用'}`);
     } catch (e) {
       setError(e instanceof Error ? e.message : '注册设置保存失败');
