@@ -167,8 +167,8 @@ export default function FindTab() {
       if (start === 'recall') {
         recalled = await fetchStepResult<Candidate[]>(
           controller.signal,
-          () => apiFetch('/api/find', {
-            signal: controller.signal, method: 'POST',
+          (signal) => apiFetch('/api/find', {
+            signal, method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: stepBody('recall'),
           }),
@@ -184,8 +184,8 @@ export default function FindTab() {
         setPhase('verify');
         const verifyEvent = await fetchFindResult(
           controller.signal,
-          () => apiFetch('/api/find', {
-            signal: controller.signal, method: 'POST',
+          (signal) => apiFetch('/api/find', {
+            signal, method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: stepBody('verify', { candidates: recalled }),
           }),
@@ -204,8 +204,8 @@ export default function FindTab() {
       setPhase('rerank');
       const resultEvent = await fetchFindResult(
         controller.signal,
-        () => apiFetch('/api/find', {
-          signal: controller.signal, method: 'POST',
+        (signal) => apiFetch('/api/find', {
+          signal, method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: stepBody('rerank', { ticket: ticketRef.current }),
         }),
@@ -244,7 +244,7 @@ export default function FindTab() {
   // 超时/断流的落地判定都在 @/lib/find-sse 里（见 find-sse.test.ts）。
   async function fetchStepResult<T>(
     signal: AbortSignal,
-    doFetch: () => Promise<Response>,
+    doFetch: (signal: AbortSignal) => Promise<Response>,
     field: 'candidates' | 'verified' | 'items',
   ): Promise<T> {
     const event = await fetchFindResult(signal, doFetch, FIND_FETCH_TIMEOUT_MS, onFindProgress);

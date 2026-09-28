@@ -51,16 +51,34 @@ export async function consumeFindSSE(
   timeoutMs: number,
   onEvent: (event: SseEvent) => void,
 ): Promise<void> {
-  if (!response.body) throw new Error('找书响应为空，请重试');
-  const reader = response.body.getReader();
   // 不用 AbortSignal.any / AbortSignal.timeout:它们要 Chrome 116 / Safari 17.4 以上,
   // 低于这个基线的浏览器里找书会直接抛。手工合并用户中止与超时两个信号,语义与 any 相同:
   // 任一中止即中止。超时用自带 clearTimeout 的 timeoutSignal,流一结束就 dispose,
   // 不在成功路径上留下还能中止已结束请求的定时器(同坑见 auth-client.ts:240)。
   const timeout = timeoutSignal(timeoutMs);
   const merged = mergeAbortSignals([signal, timeout.signal]);
-  const race = merged.signal;
-  const abort = abortRejection(race);
+  try {
+    await consumeFindStream(response, merged.signal, onEvent);
+  } finally {
+    merged.dispose();
+    timeout.dispose();
+  }
+}
+
+function releaseReader(reader: ReadableStreamDefaultReader<Uint8Array>): void {
+  // cancel 的底层收尾可能不响应；不得让它再次挂住已到期/取消的请求。
+  void reader.cancel().catch(() => {});
+  reader.releaseLock();
+}
+
+async function consumeFindStream(
+  response: Response,
+  signal: AbortSignal,
+  onEvent: (event: SseEvent) => void | false,
+): Promise<void> {
+  if (!response.body) throw new Error('找书响应为空，请重试');
+  const reader = response.body.getReader();
+  const abort = abortRejection(signal);
   const decoder = new TextDecoder('utf-8');
   let buf = '';
   try {
@@ -71,6 +89,7 @@ export async function consumeFindSSE(
       const read = reader.read();
       read.catch(() => { /* 中止后不再有人关心这次读取的结局 */ });
       const { value, done } = await Promise.race([read, abort.promise]);
+      if (signal.aborted) throw abortError(signal);
       if (done) break;
       buf += decoder.decode(value, { stream: true });
       let boundary: number;
@@ -88,15 +107,38 @@ export async function consumeFindSSE(
           (e as Error & { code?: string }).code = typeof data.code === 'string' ? data.code : undefined;
           throw e;
         }
-        onEvent(data as SseEvent);
+        if (onEvent(data as SseEvent) === false) return;
       }
     }
-    race.throwIfAborted();
+    if (signal.aborted) throw abortError(signal);
   } finally {
     abort.dispose();
-    merged.dispose();
-    timeout.dispose();
-    try { await reader.cancel(); } catch { /* 已取消或已关闭 */ }
+    releaseReader(reader);
+  }
+}
+
+async function readErrorBody(response: Response, signal: AbortSignal): Promise<Record<string, unknown>> {
+  if (!response.body) return {};
+  const reader = response.body.getReader();
+  const abort = abortRejection(signal);
+  const decoder = new TextDecoder();
+  let text = '';
+  try {
+    for (;;) {
+      const { value, done } = await Promise.race([reader.read(), abort.promise]);
+      if (done) break;
+      text += decoder.decode(value, { stream: true });
+    }
+    if (signal.aborted) throw abortError(signal);
+    const data: unknown = JSON.parse(text + decoder.decode());
+    return isRecord(data) ? data : {};
+  } catch {
+    if (signal.aborted) throw abortError(signal);
+    // 与原 json().catch 一致：坏 JSON 或正文读取失败使用通用错误。
+    return {};
+  } finally {
+    abort.dispose();
+    releaseReader(reader);
   }
 }
 
@@ -106,37 +148,54 @@ export async function consumeFindSSE(
  */
 export async function fetchFindResult(
   signal: AbortSignal,
-  doFetch: () => Promise<Response>,
+  doFetch: (signal: AbortSignal) => Promise<Response>,
   timeoutMs: number,
   onProgress: (event: SseEvent) => void,
 ): Promise<SseEvent> {
-  const res = await doFetch();
-  signal.throwIfAborted();
-  if (!res.ok || !/text\/event-stream/i.test(res.headers.get('content-type') ?? '')) {
-    const data = (await res.json().catch(() => ({}))) as { error?: string; code?: string };
-    signal.throwIfAborted();
-    // 错误码必须挂上：调用方要靠它区分可恢复的重试起点（例如票据失效要回到 verify 重新出票，
-    // 而不是拿同一张废票在 rerank 空转）。
-    const e = new Error(data.error || '找书失败，请重试');
-    (e as Error & { code?: string }).code = typeof data.code === 'string' ? data.code : undefined;
-    throw e;
-  }
-  return await new Promise<SseEvent>((resolve, reject) => {
-    let settled = false;
-    void consumeFindSSE(res, signal, timeoutMs, (event) => {
+  // 一个预算覆盖响应头、错误正文和 SSE；不能在收到响应头后重新计时。
+  const timeout = timeoutSignal(timeoutMs);
+  const merged = mergeAbortSignals([signal, timeout.signal]);
+  const requestSignal = merged.signal;
+  const abort = abortRejection(requestSignal);
+  let acceptingResponse = true;
+  try {
+    if (requestSignal.aborted) throw abortError(requestSignal);
+    const pending = Promise.resolve().then(() => {
+      if (requestSignal.aborted) throw abortError(requestSignal);
+      return doFetch(requestSignal);
+    });
+    // 非协作 transport 可能在超时后才返回 Response；那时仍须释放它的正文。
+    void pending.then(response => {
+      if (!acceptingResponse || requestSignal.aborted) void response.body?.cancel().catch(() => {});
+    }, () => {});
+    const res = await Promise.race([pending, abort.promise]);
+    if (requestSignal.aborted) throw abortError(requestSignal);
+    if (!res.ok || !/text\/event-stream/i.test(res.headers.get('content-type') ?? '')) {
+      const data = await readErrorBody(res, requestSignal);
+      const e = new Error(typeof data.error === 'string' && data.error ? data.error : '找书失败，请重试');
+      (e as Error & { code?: string }).code = typeof data.code === 'string' ? data.code : undefined;
+      throw e;
+    }
+    let result: SseEvent | undefined;
+    await consumeFindStream(res, requestSignal, (event) => {
       if (event.type === 'result') {
-        settled = true;
-        resolve(event);
+        result = event;
+        return false; // result 是本步终帧，结束读流并清理，不等代理关闭连接。
       } else {
         onProgress(event);
       }
-    }).then(() => {
-      // 流**正常结束**却没见到 result 帧（半包 / 代理吞尾 / 后端只发了 phase）：
-      // 必须落地成失败。否则这个 Promise 永不 settle，按钮永远停在「寻径中…」，
-      // 重试入口不出现，用户只能刷新页面。
-      if (!settled) reject(new Error('找书响应不完整，请重试'));
-    }).catch((e) => reject(e instanceof Error ? e : new Error('找书失败，请重试')));
-  });
+    });
+    if (!result) throw new Error('找书响应不完整，请重试');
+    return result;
+  } catch (error) {
+    if (requestSignal.aborted) throw abortError(requestSignal);
+    throw error instanceof Error ? error : new Error('找书失败，请重试');
+  } finally {
+    acceptingResponse = false;
+    abort.dispose();
+    merged.dispose();
+    timeout.dispose();
+  }
 }
 
 /**
