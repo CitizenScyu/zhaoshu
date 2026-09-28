@@ -22,8 +22,15 @@ async function handlePOST(req: NextRequest) {
   return withFindAccess(req, 25_000, async (access) => {
     const body = await access.run(() => readJsonBody(req, MAX_BODY_BYTES, access.signal));
     const title = boundedString(body?.title, MAX_TITLE_LENGTH) ?? '';
+    // author 输入边界（authval42）：非字符串或超长与「缺失」性质不同——静默改成佚名会把
+    // 书架错挂到 (title, 佚名) 身份键上（books 落错行），所以显式 400 拒绝，零查询零写入。
+    // 缺失/null/空串/纯空格仍是「不知道作者」，照旧走佚名兜底。
+    const rawAuthor = body?.author ?? '';
+    if (boundedString(rawAuthor, MAX_AUTHOR_LENGTH) === null) {
+      return NextResponse.json({ error: 'invalid author', code: 'INVALID_AUTHOR' }, { status: 400 });
+    }
     // 与 /api/shelf 同款兜底：缺作者的书在 books 里按「佚名」建身份。
-    const author = boundedString(body?.author, MAX_AUTHOR_LENGTH) || '佚名';
+    const author = boundedString(rawAuthor, MAX_AUTHOR_LENGTH) || '佚名';
     if (!title) {
       return NextResponse.json({ error: 'missing title', code: 'MISSING_TITLE' }, { status: 400 });
     }

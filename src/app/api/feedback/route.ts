@@ -13,11 +13,21 @@ const MAX_BODY_BYTES = 8 * 1024;
 
 const VALID: FeedbackStatus[] = ['want', 'reading', 'done', 'dropped'];
 
+// author 输入边界（authval42）：非字符串或超长与「缺失」性质不同——静默改成佚名会把
+// 反馈错挂到 (title, 佚名) 身份键上（books 落错行），所以显式 400 拒绝。
+// 缺失/null/空串/纯空格仍是「不知道作者」，照旧走佚名兜底。
+function invalidAuthorResponse() {
+  return NextResponse.json({ error: 'invalid author', code: 'INVALID_AUTHOR' }, { status: 400 });
+}
+
 async function handlePOST(req: NextRequest) {
   return withFindAccess(req, MODEL_ROUTE_INTERNAL_BUDGET_MS, async (access) => {
     const body = await access.run(() => readJsonBody(req, MAX_BODY_BYTES, access.signal));
     const { title, author, status } = body ?? {};
     const cleanTitle = boundedString(title, 200) ?? '';
+    if (author !== undefined && boundedString(author, 200) === null) {
+      return invalidAuthorResponse();
+    }
     const cleanAuthor = boundedString(author, 200) || '佚名';
     const cleanNote = boundedString(body?.note ?? '', 1_000);
     if (!cleanTitle || cleanNote === null ||
@@ -77,16 +87,23 @@ async function handlePOST(req: NextRequest) {
 
 async function handleGET(req: NextRequest) {
   return withFindAccess(req, MODEL_ROUTE_INTERNAL_BUDGET_MS, async (access) => {
-    await access.run(ensureSchema);
+    // 按书查询分支先验证输入再碰库（authval42）：非法 author 在 ensureSchema 之前就 400，
+    // 零查询；无 title 参数的列表路径行为不变。
     if (req.nextUrl.searchParams.has('title')) {
       const title = boundedString(req.nextUrl.searchParams.get('title'), 200) ?? '';
-      const author = boundedString(req.nextUrl.searchParams.get('author') ?? '', 200) || '佚名';
+      const rawAuthor = req.nextUrl.searchParams.get('author') ?? '';
+      if (boundedString(rawAuthor, 200) === null) {
+        return invalidAuthorResponse();
+      }
+      const author = boundedString(rawAuthor, 200) || '佚名';
       if (!title) return NextResponse.json({ error: '无效的书名或作者' }, { status: 400 });
+      await access.run(ensureSchema);
       const current = await access.run(() => getFeedbackSnapshotForUser(access.principal.userId, title, author));
       return NextResponse.json({ current }, {
         headers: { 'Cache-Control': 'private, no-store', Vary: 'Authorization, X-Owner-Token' },
       });
     }
+    await access.run(ensureSchema);
     const sql = getSql();
     const rows = await access.run(async () => sql`
       SELECT f.id, f.status, f.note, f.created_at, b.title, b.author
