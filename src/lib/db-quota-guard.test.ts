@@ -92,9 +92,10 @@ describe('createQuotaAwareFetch 外呼超时（infrasyn-42 M1）', () => {
     let seen: AbortSignal | undefined;
     const latch = createDbQuotaLatch({ backoffMs: 30 * 60_000 });
     const base = vi.fn(async (_input: unknown, init?: RequestInit) => {
-      seen = init?.signal;
+      const signal = init?.signal ?? null;
+      seen = signal ?? undefined;
       return new Promise<Response>((resolve) => {
-        init?.signal?.addEventListener('abort', () => resolve(new Response('late', { status: 200 })), { once: true });
+        signal?.addEventListener('abort', () => resolve(new Response('late', { status: 200 })), { once: true });
       });
     });
     const fetchFn = createQuotaAwareFetch(latch, base);
@@ -109,11 +110,15 @@ describe('createQuotaAwareFetch 外呼超时（infrasyn-42 M1）', () => {
 
   it('有 signal 调用 ⇒ baseFetch 收到的是原 signal 同一对象', async () => {
     const latch = createDbQuotaLatch({ backoffMs: 30 * 60_000 });
-    const base = vi.fn(async () => new Response(okBody, { status: 200 }));
+    const signals: Array<AbortSignal | undefined> = [];
+    const base = vi.fn(async (_input: unknown, init?: RequestInit) => {
+      signals.push(init?.signal ?? undefined);
+      return new Response(okBody, { status: 200 });
+    });
     const fetchFn = createQuotaAwareFetch(latch, base);
     const controller = new AbortController();
     await fetchFn('https://db.example.invalid', { signal: controller.signal });
-    expect(base.mock.calls[0][1]?.signal).toBe(controller.signal);
+    expect(signals[0]).toBe(controller.signal);
   });
 
   it('超时抛 TimeoutError：不布置冷却、无 db_quota_exceeded 日志', async () => {
