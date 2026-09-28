@@ -425,6 +425,145 @@ describe('AuthController dual mode', () => {
     expect(failure).toBeInstanceOf(AuthError);
     expect(failure).toMatchObject({ status: 503 });
   });
+
+  // ---------- 响应正文超时（42-authbody）：头已到、正文永远不来 ----------
+
+  /** 「响应头已回、正文永不结束」的 Response：真实计时下 15s（测试里用短上限）也等不来。 */
+  function hangingBodyResponse(status = 200): Response {
+    return new Response(new ReadableStream({ start() { /* 永不 enqueue、永不 close */ } }), {
+      status,
+      headers: { 'Content-Type': 'application/json' },
+    });
+  }
+
+  it('recovers the queue when the session response body never arrives', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => hangingBodyResponse()));
+    const { instance } = controller({ requestTimeoutMs: 50 });
+    const start = instance.start();
+    const later = instance.refresh('visible');
+    // 修复前：start 的 json() 无限挂起，排队的 later 永远轮不上，phase 卡 loading。
+    const outcome = await Promise.race([
+      Promise.all([start, later]).then(() => 'SETTLED' as const),
+      sleep(3_000).then(() => 'STUCK' as const),
+    ]);
+    expect(outcome).toBe('SETTLED');
+    expect(instance.state.phase).toBe('unavailable');
+  });
+
+  it('lets a queued login run after a hanging session body timed out', async () => {
+    let sessionHung = true;
+    const calls = stubFetch({
+      'GET /api/auth/session': () => (sessionHung ? hangingBodyResponse() : json(200, { user: MEMBER, accountsEnabled: true })),
+      'POST /api/auth/login': () => json(200, { user: MEMBER }),
+    });
+    const { instance } = controller({ requestTimeoutMs: 50 });
+    const start = instance.start();
+    const login = instance.login('reader', 'secret', false);
+    const outcome = await Promise.race([
+      Promise.all([start, login]).then(() => 'SETTLED' as const),
+      sleep(3_000).then(() => 'STUCK' as const),
+    ]);
+    expect(outcome).toBe('SETTLED');
+    // 队列恢复后 login 正常执行；state 机收尾为正常登录态，不是半套身份。
+    expect(instance.state).toMatchObject({ phase: 'authenticated', transport: 'cookie' });
+    expect(calls.some((call) => call.url === '/api/auth/login')).toBe(true);
+  });
+
+  it('surfaces a login failure when the login body never arrives, without half-applying', async () => {
+    stubFetch({
+      'GET /api/auth/session': () => json(200, { user: null, accountsEnabled: true }),
+      'POST /api/auth/login': () => hangingBodyResponse(),
+    });
+    const { instance } = controller({ requestTimeoutMs: 50 });
+    await instance.start();
+    const before = instance.state;
+    const login = instance.login('reader', 'secret', false);
+    const outcome = await Promise.race([
+      login.then(() => 'RESOLVED' as const, () => 'REJECTED' as const),
+      sleep(3_000).then(() => 'STUCK' as const),
+    ]);
+    expect(outcome).toBe('REJECTED');
+    // 读体超时不算登录成功：不 rotate、不清存储、不落半套身份。
+    expect(instance.state).toEqual(before);
+  });
+
+  it('treats an owner-exchange whose body never arrives as unavailable and keeps the token', async () => {
+    stubFetch({
+      'GET /api/auth/session': () => json(200, { user: null, accountsEnabled: true }),
+      'POST /api/auth/owner': () => hangingBodyResponse(),
+    });
+    const { instance, tokens } = controller({ stored: 'legacy-owner', requestTimeoutMs: 50 });
+    const start = instance.start();
+    const outcome = await Promise.race([
+      start.then(() => 'SETTLED' as const),
+      sleep(3_000).then(() => 'STUCK' as const),
+    ]);
+    expect(outcome).toBe('SETTLED');
+    expect(instance.state.phase).toBe('unavailable');
+    // 可恢复的旧口令不被清掉。
+    expect(tokens.value).toBe('legacy-owner');
+  });
+
+  it('keeps reading normal JSON bodies through the bounded reader', async () => {
+    // 分块 + 多字节字符跨块边界：证明逐块 decode(stream:true) 与 JSON.parse 组合无损。
+    const full = JSON.stringify({ user: MEMBER, accountsEnabled: true });
+    const split = Math.floor(full.length / 2);
+    const chunks = [full.slice(0, split), full.slice(split)].map((piece) => new TextEncoder().encode(piece));
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(
+      new ReadableStream({
+        start(controller) {
+          for (const chunk of chunks) controller.enqueue(chunk);
+          controller.close();
+        },
+      }),
+      { status: 200, headers: { 'Content-Type': 'application/json' } },
+    )));
+    const { instance } = controller({ requestTimeoutMs: 2_000 });
+    await instance.start();
+    expect(instance.state).toMatchObject({ phase: 'authenticated', transport: 'cookie' });
+    expect(instance.state.user).toMatchObject({ id: 4, username: 'reader' });
+  });
+
+  it('treats a body that is not JSON as before (null semantics)', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('not json at all', {
+      status: 200, headers: { 'Content-Type': 'application/json' },
+    })));
+    const { instance } = controller({ requestTimeoutMs: 2_000 });
+    await instance.start();
+    // 解析失败 → body=null → 与旧 response.json().catch(()=>null) 一致：无 user、
+    // accountsEnabled 也读不到（false），落回旧口令模式的 anonymous。
+    expect(instance.state).toMatchObject({ phase: 'anonymous', accountsEnabled: false });
+  });
+
+  it('leaves no timer behind after a successful JSON read', async () => {
+    stubFetch({ 'GET /api/auth/session': () => json(200, { user: MEMBER, accountsEnabled: true }) });
+    const { instance } = controller({ requestTimeoutMs: 100 });
+    await instance.start();
+    // 成功路径：等响应头与读体两段计时器都必须清掉。这些用例走真实计时，
+    // vi.getTimerCount 需要 fake timers 才可用——先开假时钟再断言（无真定时器可挂）。
+    vi.useFakeTimers();
+    try {
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('does not leak the body-read timer when the controller is closed mid-read', async () => {
+    // start 之后立刻 close：读体还在挂起时整个代际被关闭。收尾后不应残留读体定时器。
+    vi.stubGlobal('fetch', vi.fn(async () => hangingBodyResponse()));
+    const { instance } = controller({ requestTimeoutMs: 60 });
+    const start = instance.start();
+    instance.close();
+    await Promise.race([start, sleep(3_000).then(() => 'STUCK' as const)]);
+    await sleep(150);
+    vi.useFakeTimers();
+    try {
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });
 
 describe('H02 semantics in cookie mode', () => {
