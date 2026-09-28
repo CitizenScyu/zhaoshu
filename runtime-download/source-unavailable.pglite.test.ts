@@ -4,7 +4,7 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
 import { createSchema, loadPGlite, makeSqlTag, type PGliteLike } from './testing/pglite';
 import { createWorkerStorage, type DownloadSql } from './storage';
 import { createExecutor, DEFAULT_DECISIONS } from './executor';
@@ -52,19 +52,39 @@ type LogLine = { level: string; message: string; fields?: Record<string, unknown
 
 maybe('41-EXEC-SRCUNAVAIL：书源不可达不落终态、不耗日配额、零发布', () => {
   let pg: PGliteLike;
+  let pgToClose: PGliteLike | undefined;
   let sql: DownloadSql;
   let github: MemoryGitHub;
-  let outRoot: string;
+  let outRoot = '';
   const modules = assembleEngineModules();
 
   beforeEach(async () => {
     pg = new PGliteCtor!();
+    pgToClose = pg;
     sql = makeSqlTag(pg);
     await createSchema(pg);
     github = new MemoryGitHub();
     outRoot = mkdtempSync(join(tmpdir(), 'execfix41-'));
   }, 60_000);
-  afterEach(() => rmSync(outRoot, { recursive: true, force: true }));
+  afterEach(async () => {
+    const current = pgToClose;
+    pgToClose = undefined;
+    try {
+      if (current) {
+        await current.close();
+        expect(current).toHaveProperty('closed', true);
+      }
+    } finally {
+      const directory = outRoot;
+      outRoot = '';
+      if (directory) {
+        const target = resolve(directory);
+        expect(dirname(target)).toBe(resolve(tmpdir()));
+        expect(basename(target)).toMatch(/^execfix41-[A-Za-z0-9]+$/);
+        rmSync(target, { recursive: true, force: true });
+      }
+    }
+  });
 
   const insertTask = async (): Promise<number> => Number(((await pg.query(
     `INSERT INTO download_tasks(user_id, book_id, title, author, status, source_url, requested_by, source_kind)
@@ -228,19 +248,39 @@ maybe('41-EXEC-SRCUNAVAIL：书源不可达不落终态、不耗日配额、零�
 // 书源不可达在扣额度前就判出 ⇒ 根本不扣；身份不符 ⇒ 终态且不扣；预检放行后下载中才不可达 ⇒ 第一轮退还路径。
 maybe('41-EXEC-SRCUNAVAIL 第二轮：生产装配（扣额度前预检开）', () => {
   let pg: PGliteLike;
+  let pgToClose: PGliteLike | undefined;
   let sql: DownloadSql;
   let github: MemoryGitHub;
-  let outRoot: string;
+  let outRoot = '';
   const modules = assembleEngineModules();
 
   beforeEach(async () => {
     pg = new PGliteCtor!();
+    pgToClose = pg;
     sql = makeSqlTag(pg);
     await createSchema(pg);
     github = new MemoryGitHub();
     outRoot = mkdtempSync(join(tmpdir(), 'execfix41-r2-'));
   }, 60_000);
-  afterEach(() => rmSync(outRoot, { recursive: true, force: true }));
+  afterEach(async () => {
+    const current = pgToClose;
+    pgToClose = undefined;
+    try {
+      if (current) {
+        await current.close();
+        expect(current).toHaveProperty('closed', true);
+      }
+    } finally {
+      const directory = outRoot;
+      outRoot = '';
+      if (directory) {
+        const target = resolve(directory);
+        expect(dirname(target)).toBe(resolve(tmpdir()));
+        expect(basename(target)).toMatch(/^execfix41-r2-[A-Za-z0-9]+$/);
+        rmSync(target, { recursive: true, force: true });
+      }
+    }
+  });
 
   const insertTask = async (): Promise<number> => Number(((await pg.query(
     `INSERT INTO download_tasks(user_id, book_id, title, author, status, source_url, requested_by, source_kind)

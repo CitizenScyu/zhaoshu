@@ -4,7 +4,7 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { tmpdir } from 'node:os';
 import { mkdtempSync, rmSync } from 'node:fs';
-import { join } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
 import { createSchema, loadPGlite, makeSqlTag, type PGliteLike } from './testing/pglite';
 import { createWorkerStorage, type DownloadSql } from './storage';
 import { createExecutor, DEFAULT_DECISIONS, type DailyBudgetLike } from './executor';
@@ -65,12 +65,27 @@ function engineAdapter(mode: Partial<FakeManifest>, txt = '整本合成正文'):
 
 maybe('T8 执行器端到端：领取 → 合成抓取 → 五阶段发布 → DB 终态', () => {
   let pg: PGliteLike;
+  let pgToClose: PGliteLike | undefined;
   let sql: DownloadSql;
   let github: MemoryGitHub;
   const tmpDirs: string[] = [];
 
-  afterEach(() => {
-    while (tmpDirs.length) rmSync(tmpDirs.pop()!, { recursive: true, force: true });
+  afterEach(async () => {
+    const current = pgToClose;
+    pgToClose = undefined;
+    try {
+      if (current) {
+        await current.close();
+        expect(current).toHaveProperty('closed', true);
+      }
+    } finally {
+      while (tmpDirs.length) {
+        const target = resolve(tmpDirs.pop()!);
+        expect(dirname(target)).toBe(resolve(tmpdir()));
+        expect(basename(target)).toMatch(/^t8-resolve-[A-Za-z0-9]+$/);
+        rmSync(target, { recursive: true, force: true });
+      }
+    }
   });
 
   const insertTask = async (status = 'pending', sourceKind = 'engine'): Promise<number> => {
@@ -86,6 +101,7 @@ maybe('T8 执行器端到端：领取 → 合成抓取 → 五阶段发布 → D
 
   beforeEach(async () => {
     pg = new PGliteCtor!();
+    pgToClose = pg;
     sql = makeSqlTag(pg);
     await createSchema(pg);
     github = new MemoryGitHub();

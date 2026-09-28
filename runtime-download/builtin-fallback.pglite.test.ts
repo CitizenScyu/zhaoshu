@@ -9,7 +9,7 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
 import { createSchema, loadPGlite, makeSqlTag, type PGliteLike } from './testing/pglite';
 import { createWorkerStorage, type DownloadSql } from './storage';
 import { createDownloadExecutor } from './entry';
@@ -72,20 +72,38 @@ const listing = (host: string, author = AUTHOR, listAuthor = author) => ({
 
 maybe('41-T8FB：builtin 任务 book15 不可达时回退引擎源池', () => {
   let pg: PGliteLike;
+  let pgToClose: PGliteLike | undefined;
   let sql: DownloadSql;
   let github: MemoryGitHub;
-  let workDir: string;
+  let workDir = '';
 
   beforeEach(async () => {
     pg = new PGliteCtor!();
+    pgToClose = pg;
     sql = makeSqlTag(pg);
     await createSchema(pg);
     github = new MemoryGitHub();
     workDir = mkdtempSync(join(tmpdir(), 't8fb41-'));
   }, 60_000);
-  afterEach(() => {
-    recordHostSuccess('book15.net'); // 清掉进程内 host 健康记忆，用例互不影响
-    rmSync(workDir, { recursive: true, force: true });
+  afterEach(async () => {
+    const current = pgToClose;
+    pgToClose = undefined;
+    try {
+      if (current) {
+        await current.close();
+        expect(current).toHaveProperty('closed', true);
+      }
+    } finally {
+      recordHostSuccess('book15.net'); // 清掉进程内 host 健康记忆，用例互不影响
+      const directory = workDir;
+      workDir = ''; // setup 失败时没有本例目录，不能复用上一例的路径。
+      if (directory) {
+        const target = resolve(directory);
+        expect(dirname(target)).toBe(resolve(tmpdir()));
+        expect(basename(target)).toMatch(/^t8fb41-[A-Za-z0-9]+$/);
+        rmSync(target, { recursive: true, force: true });
+      }
+    }
   });
 
   const insertTask = async (): Promise<number> => Number(((await pg.query(

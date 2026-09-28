@@ -1,5 +1,5 @@
 // T8 验收：storage 绑定（WorkerStorage 的运行时实现）。PGlite 真库语义，不连生产。
-import { beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { createSchema, loadPGlite, makeSqlTag, type PGliteLike } from './testing/pglite';
 import { createWorkerStorage, type DownloadSql } from './storage';
 import { artifactIdentityKey } from '../src/lib/artifact-registry';
@@ -9,6 +9,7 @@ const maybe = PGliteCtor ? describe : describe.skip;
 
 maybe('T8 storage 绑定：租约条件/心跳/进度/终态/artifact 幂等', () => {
   let pg: PGliteLike;
+  let pgToClose: PGliteLike | undefined;
   let sql: DownloadSql;
 
   const insertTask = async (status = 'pending', bookId = 1): Promise<number> => {
@@ -26,9 +27,19 @@ maybe('T8 storage 绑定：租约条件/心跳/进度/终态/artifact 幂等', (
 
   beforeEach(async () => {
     pg = new PGliteCtor!();
+    pgToClose = pg; // 在 schema 初始化前登记，初始化失败也会关闭。
     sql = makeSqlTag(pg);
     await createSchema(pg);
   }, 60_000);
+
+  afterEach(async () => {
+    const current = pgToClose;
+    pgToClose = undefined;
+    if (current) {
+      await current.close();
+      expect(current).toHaveProperty('closed', true);
+    }
+  });
 
   it('claim：领取 pending → running + generation+1；无 pending 时返回 null', async () => {
     const storage = createWorkerStorage(sql);
