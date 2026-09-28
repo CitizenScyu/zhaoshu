@@ -309,6 +309,90 @@ describe('refreshShuyuan atomic refresh', () => {
     expect(execute.mock.calls.every(([query]) => query.text.startsWith('SELECT '))).toBe(true);
   });
 
+  // 41-srcinput：单条非法记录（非对象 / bookSourceUrl 非字符串 / 归一后空）不得中止整轮，
+  // 也不得进入写库行集——它们在合并阶段被逐条跳过，合法记录照常入库。
+  it('单条非法记录被跳过：合法源照常入库，非法形态不进 INSERT 行集', async () => {
+    setCollection(11, [
+      { bookSourceUrl: 'https://valid.example/1', bookSourceName: '合法一' },
+      null, // 非对象
+      42, // 数字
+      'https://valid.example/str', // 字符串条目
+      { bookSourceName: '缺 bookSourceUrl' }, // 对象但缺字段
+      { bookSourceUrl: 12345, bookSourceName: 'URL 非字符串' },
+      { bookSourceUrl: '   ', bookSourceName: 'URL 归一后为空' },
+      { bookSourceUrl: 'https://valid.example/2/', bookSourceName: '合法二（尾斜杠）' },
+    ]);
+
+    const selectResponses: unknown[][] = [
+      [], // SELECT ... FROM shuyuan_sources（快照既有行）
+      [{ collections: [], refreshed_at: null }], // 合并前读 shuyuan_meta
+      [], // 准入读既有 source_admission
+      [{ collections: [{ id: 11, title: '合集 11', count: 8 }], refreshed_at: '2026-09-14T01:00:00Z' }], // 收尾读 shuyuan_meta
+      [{ ...zeroCounts, total: 2, enabled: 2, unprobed: 2 }], // 计数
+      [], // 收尾读
+    ];
+    let selectIdx = 0;
+    execute.mockImplementation(async (query) => {
+      if (query.text.startsWith('INSERT INTO cron_health') && query.values[0] === ADMISSION_LEASE_ROW) {
+        return [{ name: ADMISSION_LEASE_ROW, generation: '1' }];
+      }
+      if (query.text.startsWith('SET LOCAL') || query.text.startsWith('WITH guard')
+        || query.text.startsWith('SELECT name FROM cron_health')) return [];
+      return selectResponses[selectIdx++] ?? [];
+    });
+
+    await expect(refreshShuyuan()).resolves.toMatchObject({ total: 2, enabled: 2 });
+
+    const inserted = savedRows().map((row) => row.url).sort();
+    expect(inserted).toEqual(['https://valid.example/1', 'https://valid.example/2']);
+  });
+
+  // 41-srcinput：重复记录按归一化 URL 去重（首见优先），重复条不产生第二行、不报错。
+  // 集合内重复（首尾空白/尾斜杠差异）与跨合集重复都覆盖。
+  it('重复记录按归一化 URL 去重：首见优先，跨合集与同合集变形都只有一行', async () => {
+    setCollection(11, [
+      { bookSourceUrl: 'https://dup.example/a/', bookSourceName: '首见版本' },
+      { bookSourceUrl: ' https://dup.example/a ', bookSourceName: '同合集变形（空白+无斜杠）' },
+    ]);
+    setCollection(12, [
+      { bookSourceUrl: 'https://dup.example/a', bookSourceName: '跨合集重复' },
+      { bookSourceUrl: 'https://dup.example/b', bookSourceName: '独有源' },
+    ]);
+
+    const selectResponses: unknown[][] = [
+      [], // SELECT ... FROM shuyuan_sources（快照既有行）
+      [{ collections: [], refreshed_at: null }], // 合并前读 shuyuan_meta
+      [], // 准入读既有 source_admission
+      [{
+        collections: [
+          { id: 11, title: '合集 11', count: 2 },
+          { id: 12, title: '合集 12', count: 2 },
+          { id: 13, title: '合集 13', count: 0 },
+        ],
+        refreshed_at: '2026-09-14T01:00:00Z',
+      }], // 收尾读 shuyuan_meta
+      [{ ...zeroCounts, total: 2, enabled: 2, unprobed: 2 }], // 计数
+      [], // 收尾读
+    ];
+    let selectIdx = 0;
+    execute.mockImplementation(async (query) => {
+      if (query.text.startsWith('INSERT INTO cron_health') && query.values[0] === ADMISSION_LEASE_ROW) {
+        return [{ name: ADMISSION_LEASE_ROW, generation: '1' }];
+      }
+      if (query.text.startsWith('SET LOCAL') || query.text.startsWith('WITH guard')
+        || query.text.startsWith('SELECT name FROM cron_health')) return [];
+      return selectResponses[selectIdx++] ?? [];
+    });
+
+    await expect(refreshShuyuan()).resolves.toMatchObject({ total: 2, enabled: 2 });
+
+    const inserted = savedRows();
+    expect(inserted).toHaveLength(2);
+    const dup = inserted.find((row) => row.url === 'https://dup.example/a');
+    // 首见优先：合集按 entries 顺序拉取，第一条的名称胜出。
+    expect(dup?.source).toMatchObject({ bookSourceName: '首见版本' });
+  });
+
   it('上游合集整体不可达时降级：不抛错、不写库、返回库中既有统计并响亮告警', async () => {
     // 判别性构造：传输层对索引页之外的合集请求一律抛 undici 网络错误形态（ECONNRESET 那一类），
     // 三个合集全部拉不到 ⇒ merged.size === 0，正是生产 09-15 之后每轮 cron 走到的分支。
