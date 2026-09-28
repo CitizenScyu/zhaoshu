@@ -193,8 +193,9 @@ describe('StatsTab 手动刷新可取消', () => {
     releaseFns[1](statsBody());
     await waitFor(() => expect(seenSignals[1].aborted).toBe(false));
     // 第二次刷新：refresh 先 abort 上一条（signal[1]），再发新请求（signal[2]）。
-    await waitFor(() => screen.getByRole('button', { name: textIs('刷新统计') }).disabled === false);
-    await user.click(screen.getByRole('button', { name: textIs('刷新统计') }));
+    const refreshButton = () => screen.getByRole('button', { name: textIs('刷新统计') }) as HTMLButtonElement;
+    await waitFor(() => expect(refreshButton().disabled).toBe(false));
+    await user.click(refreshButton());
     await waitFor(() => expect(seenSignals.length).toBe(3));
     expect(seenSignals[1].aborted).toBe(true); // 前一条被后一条中止
     expect(seenSignals[2].aborted).toBe(false);
