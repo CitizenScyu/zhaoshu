@@ -6,7 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import LibraryTab, { createLibraryView } from './LibraryTab';
 
 const mocks = vi.hoisted(() => ({ apiFetch: vi.fn() }));
-vi.mock('@/components/OwnerProvider', () => ({ useOwner: () => ({ apiFetch: mocks.apiFetch }) }));
+vi.mock('@/components/OwnerProvider', () => ({ useOwner: () => ({ apiFetch: mocks.apiFetch, can: () => true }) }));
 vi.mock('@/components/ReadBookLink', () => ({ default: () => null }));
 
 function json(body: unknown, status = 200) {

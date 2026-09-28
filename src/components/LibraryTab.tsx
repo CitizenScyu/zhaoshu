@@ -162,7 +162,8 @@ export default function LibraryTab({ view, setView }: {
   view: LibraryView;
   setView: Dispatch<SetStateAction<LibraryView>>;
 }) {
-  const { apiFetch } = useOwner();
+  const { apiFetch, can } = useOwner();
+  const canDownload = can('download');
   const [books, setBooks] = useState<LibraryBook[] | null>(null);
   const [facets, setFacets] = useState<Facets>({ categories: [], finishStates: [] });
   const [total, setTotal] = useState(0);
@@ -275,12 +276,17 @@ export default function LibraryTab({ view, setView }: {
   // 进入详情页时按 bookId 查「本人」在这本书上的最新任务；共享可读定位（sharedReadTaskId）
   // 只用于在线阅读，不再拿去查强制 user_id 的 /api/download（F18）。
   useEffect(() => {
-    if (detailId === null) return;
-    const my = dlRequestId.current;
+    // 权限变更也作废此前的查询/操作响应，避免撤权后的旧任务重新出现。
+    const my = ++dlRequestId.current;
     let stale = false;
     const controller = new AbortController();
     queueMicrotask(() => {
       if (controller.signal.aborted) return;
+      setTask(null);
+      setDlError('');
+      setDlMessage('');
+      setDlBusy(false);
+      if (!canDownload || detailId === null) return;
       void (async () => {
         try {
           const res = await apiFetch(`/api/download?bookId=${detailId}`, { signal: controller.signal });
@@ -298,10 +304,10 @@ export default function LibraryTab({ view, setView }: {
       stale = true;
       controller.abort();
     };
-  }, [detailId, apiFetch, updateTask]);
+  }, [detailId, canDownload, apiFetch, updateTask]);
 
   // pending/running 任务轮询单条进度。任务到终态后 pollTaskId 变 null，effect 清理即停轮询。
-  const pollTaskId = task !== null && (task.status === 'pending' || task.status === 'running')
+  const pollTaskId = canDownload && task !== null && (task.status === 'pending' || task.status === 'running')
     ? task.id
     : null;
 
@@ -408,7 +414,7 @@ export default function LibraryTab({ view, setView }: {
 
   async function startDownload() {
     // 心跳过期的 running 视为可重试：POST 会先回收僵尸租约再建任务。
-    if (task?.requestedBy === 'system' || !detail || dlBusy || task?.status === 'done' || (task?.status === 'running' && !task.leaseExpired)) return;
+    if (!canDownload || task?.requestedBy === 'system' || !detail || dlBusy || task?.status === 'done' || (task?.status === 'running' && !task.leaseExpired)) return;
     const my = ++dlRequestId.current;
     setDlBusy(true);
     setDlError('');
@@ -462,7 +468,7 @@ export default function LibraryTab({ view, setView }: {
   }
 
   async function removeDownload() {
-    if (task?.requestedBy === 'system') return;
+    if (!canDownload || task?.requestedBy === 'system') return;
     if (!task || dlBusy || (task.status !== 'pending' && task.status !== 'failed' && task.status !== 'partial'
       && task.status !== 'superseded_by_incomplete')) return;
     const failureMessage = task.status === 'failed' ? '清理失败' : '取消失败';
@@ -490,15 +496,18 @@ export default function LibraryTab({ view, setView }: {
   }
 
   async function retrieveFile() {
-    if (task?.requestedBy === 'system') return;
+    if (!canDownload || task?.requestedBy === 'system') return;
     if (!task) return;
+    const my = dlRequestId.current;
     try {
       const res = await apiFetch(`/api/download/${task.id}/file`);
+      if (my !== dlRequestId.current) return;
       if (!res.ok) {
         const data = await res.json().catch(() => ({}));
         throw new Error(data.error || '文件取回失败');
       }
       const blob = await res.blob();
+      if (my !== dlRequestId.current) return;
       const name = fileNameFrom(res.headers.get('Content-Disposition') ?? '', `${task.title || 'novel'}.txt`);
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
@@ -507,7 +516,7 @@ export default function LibraryTab({ view, setView }: {
       a.click();
       URL.revokeObjectURL(url);
     } catch (e) {
-      window.alert(e instanceof Error ? e.message : '文件取回失败');
+      if (my === dlRequestId.current) window.alert(e instanceof Error ? e.message : '文件取回失败');
     }
   }
 
@@ -565,15 +574,19 @@ export default function LibraryTab({ view, setView }: {
           {/* 下载全书 */}
           <div className="mt-5 pt-4 border-t border-dashed" style={{ borderColor: 'var(--line)' }}>
             <div className="mb-3">
-              <ReadBookLink taskId={task?.status === 'done' ? task.id : detail.sharedReadTaskId} title={detail.title} author={detail.author} from="library" />
+              <ReadBookLink taskId={canDownload && task?.status === 'done' ? task.id : detail.sharedReadTaskId} title={detail.title} author={detail.author} from="library" />
             </div>
-            {dlError && (
+            {canDownload && dlError && (
               <p role="alert" className="text-xs mb-2" style={{ color: 'var(--cinnabar)' }}>✗ {dlError}</p>
             )}
-            {dlMessage && (
+            {canDownload && dlMessage && (
               <p role="status" className="text-xs mb-2" style={{ color: 'var(--dai)' }}>{dlMessage}</p>
             )}
-            {task === null ? (
+            {!canDownload ? (
+              <p role="status" className="text-sm" style={{ color: 'var(--ink-soft)' }}>
+                当前账号尚未获得下载权限，请联系管理员开通后再试。
+              </p>
+            ) : task === null ? (
               <button className="seal-button text-sm" onClick={() => void startDownload()} disabled={dlBusy}>
                 {dlBusy ? '提交中…' : '⬇ 下载全书'}
               </button>
