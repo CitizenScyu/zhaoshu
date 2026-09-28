@@ -51,6 +51,7 @@ setTimeout(() => {
   console.log(`--- t=2500ms 收割 ---`);
   console.log('fetchCalls =', fetchCalls.length, 'aborted =', fetchCalls.map((c) => c.signal.aborted));
   console.log('phase =', instance.state.phase);
-  console.log('AUTH_STUCK_REPRODUCED');
+  // 修复判据：signal 被超时 abort + start/refresh 均 settle + phase 离开 loading
+  console.log(instance.state.phase !== 'loading' ? 'AUTH_FIXED' : 'AUTH_STUCK_REPRODUCED');
   process.exit(0);
 }, 2500);

@@ -135,11 +135,22 @@ export interface AuthControllerOptions {
   /** 跨标签广播“认证已变化”，只送非秘密通知。 */
   notify?: () => void;
   /**
-   * 认证请求等响应头的上限，默认 15s。可配置是为了让超时路径能用**真实计时**被测到：
+   * 认证请求等响应头与读正文各自的上限，默认 15s。可配置是为了让超时路径能用**真实计时**被测到：
    * `AbortSignal.timeout()` 的内建定时器既不受 fake timers 控制、也不计入 `vi.getTimerCount()`，
    * 只靠假时钟无法证明「成功路径上不再留下定时器」。
    */
   requestTimeoutMs?: number;
+}
+
+/**
+ * request() 的产物。只判状态码的调用点拿 `response` 用（不装任何读体定时器）；
+ * 真要消费正文必须走 `readJson()`——它给读体自带一段同样上限的计时。响应头到了、
+ * 正文永远不来时，没有这第二段计时的 `json()` 会无限挂起，把排在后面的认证操作
+ * 全部卡死（authPhase 永远 loading）。
+ */
+interface AuthReply {
+  readonly response: Response;
+  readonly readJson: () => Promise<unknown>;
 }
 
 /**
@@ -243,31 +254,93 @@ export class AuthController {
    * signal 的 abort 会取消这条尚未 drain 的流，浏览器于是给已经成功的请求记一条
    * 假的 `net::ERR_ABORTED`。把 abort 的作用域收回它真正该管的那个等待，成功路径上
    * 就不会再留下能中止已结束请求的定时器；服务端不响应时的 15s 超时语义不变。
+   *
+   * 返回 AuthReply：响应头超时语义不变（fetch reject）；正文超时由 readJson() 用
+   * 一段新计时管——abort 那条还没 drain 的流来打断挂起的 `json()`，这样 15s 上限
+   * 对「头已到、正文永远不来」的服务端也成立，队列能继续走。
    */
   private async request(
     input: string,
     init: RequestInit,
     transport: AuthTransport,
     token = '',
-  ): Promise<Response> {
+  ): Promise<AuthReply> {
     const deadline = new AbortController();
     const timer = setTimeout(
       () => deadline.abort(new DOMException('认证请求超时。', 'TimeoutError')),
       this.options.requestTimeoutMs ?? SESSION_TIMEOUT_MS,
     );
+    let response: Response;
     try {
       const request = createOwnerRequest(input, {
         cache: 'no-store',
         signal: deadline.signal,
         ...init,
       }, token, this.options.origin(), transport);
-      return await fetch(request);
+      response = await fetch(request);
     } finally {
       clearTimeout(timer);
     }
+    return {
+      response,
+      readJson: () => this.readJsonBounded(response, deadline),
+    };
   }
 
-  private post(path: string, body: unknown): Promise<Response> {
+  /**
+   * 有界读体：给「消费认证响应正文」单独一段与等响应头同样长的计时。
+   *
+   * 到点三管齐下：abort 发请求的 controller（浏览器里 signal 会取消流）、cancel
+   * 自己拿的 reader、resolve 一个哨兵。第三步是保底——node/undici 的 `json()`
+   * 只认流的终止，外部 cancel 一条已被 `json()` 锁定的流是 no-op，叫不醒挂起的
+   * 读取；所以这里**不用** `response.json()`，改用 reader 自己读、与超时赛跑，
+   * 谁先落定听谁的。流完整读完再 `JSON.parse`；超时则 cancel reader 并按
+   * 「等不来正文」抛出。成功读完清定时器，不残留。解析失败维持原语义（当 null）。
+   */
+  private async readJsonBounded(response: Response, deadline: AbortController): Promise<unknown> {
+    const timeoutMs = this.options.requestTimeoutMs ?? SESSION_TIMEOUT_MS;
+    const reason = new DOMException('认证响应超时。', 'TimeoutError');
+    // 哨兵对象：读体可能合法产出任何 JSON 值（含 null），只有唯一的哨兵能表示超时。
+    const TIMEOUT = Symbol('auth-body-timeout');
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const expired = new Promise<typeof TIMEOUT>((resolve) => {
+      timer = setTimeout(() => {
+        deadline.abort(reason);
+        resolve(TIMEOUT);
+      }, timeoutMs);
+    });
+    try {
+      const text = await Promise.race([this.readBodyText(response), expired]);
+      if (text === TIMEOUT) {
+        void response.body?.cancel(reason).catch(() => {});
+        throw reason;
+      }
+      try {
+        return JSON.parse(text);
+      } catch {
+        return null;
+      }
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+    }
+  }
+
+  /** 逐块读完整条正文（无长度上限：认证响应都是小 JSON，且等响应头阶段已过了同源校验）。 */
+  private async readBodyText(response: Response): Promise<string> {
+    if (!response.body) return response.text();
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let text = '';
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      if (value) text += decoder.decode(value, { stream: true });
+    }
+    text += decoder.decode();
+    return text;
+  }
+
+  private post(path: string, body: unknown): Promise<AuthReply> {
     return this.request(path, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -283,9 +356,9 @@ export class AuthController {
     return this.enqueue(async () => {
       if (reason === 'start') this.set({ phase: 'loading' });
       const generation = this.sessionValue.id;
-      let response: Response;
+      let reply: AuthReply;
       try {
-        response = await this.request('/api/auth/session', { method: 'GET' }, 'cookie');
+        reply = await this.request('/api/auth/session', { method: 'GET' }, 'cookie');
       } catch {
         // 网络不确定：保持界面锁定，不清除可恢复的旧口令，也不切换身份。
         if (this.sessionValue.id === generation) this.set({ phase: 'unavailable' });
@@ -293,6 +366,7 @@ export class AuthController {
       }
       if (this.sessionValue.id !== generation) return;
 
+      const response = reply.response;
       if (response.status === 401) {
         // Cookie 失效的 401 不触发自动 owner 兑换，也不清除旧口令。
         // 承重不变量「session 401 ⟺ 账号模式」：api/auth/session/route.ts 旧口令模式恒 200、不看 Cookie，
@@ -312,8 +386,14 @@ export class AuthController {
         return;
       }
 
-      const body = await response.json().catch(() => null) as
-        { user?: unknown; accountsEnabled?: unknown } | null;
+      // 只有会话探测的 2xx 路径才消费正文，读体挂死在这里也只算「等不到会话」。
+      let body: { user?: unknown; accountsEnabled?: unknown } | null;
+      try {
+        body = await reply.readJson() as { user?: unknown; accountsEnabled?: unknown } | null;
+      } catch {
+        if (this.sessionValue.id === generation) this.set({ phase: 'unavailable' });
+        return;
+      }
       if (this.sessionValue.id !== generation) return;
       const accountsEnabled = body?.accountsEnabled === true;
       const user = parseAuthUser(body?.user);
@@ -359,16 +439,23 @@ export class AuthController {
 
   /** 返回 true 表示已经应用了结果（成功或明确的 401）；false 表示服务不可用。 */
   private async exchangeOwnerToken(token: string, remember: boolean, generation: number): Promise<boolean> {
-    let response: Response;
+    let reply: AuthReply;
     try {
-      response = await this.post('/api/auth/owner', { token, remember });
+      reply = await this.post('/api/auth/owner', { token, remember });
     } catch {
       if (this.sessionValue.id === generation) this.set({ phase: 'unavailable' });
       return true;
     }
     if (this.sessionValue.id !== generation) return true;
-    if (response.ok) {
-      const body = await response.json().catch(() => null) as { user?: unknown } | null;
+    if (reply.response.ok) {
+      // 兑换的 2xx 要读 user；等不来正文按「服务不可用」收尾，不清可恢复的旧口令。
+      let body: { user?: unknown } | null;
+      try {
+        body = await reply.readJson() as { user?: unknown } | null;
+      } catch {
+        this.set({ phase: 'unavailable' });
+        return true;
+      }
       const user = parseAuthUser(body?.user);
       this.rotate('cookie');
       this.options.storage.clear();
@@ -382,7 +469,7 @@ export class AuthController {
       this.broadcast();
       return true;
     }
-    if (response.status === 503) {
+    if (reply.response.status === 503) {
       // 兑换失败不自动切成其他身份，也不清掉可恢复的旧口令。
       this.set({ phase: 'unavailable' });
       return true;
@@ -396,11 +483,17 @@ export class AuthController {
   /** 用户名 + 密码登录（账号模式）。 */
   login(username: string, password: string, remember: boolean): Promise<void> {
     return this.enqueue(async () => {
-      const response = await this.post('/api/auth/login', {
+      const reply = await this.post('/api/auth/login', {
         username: username.trim().toLowerCase(), password, remember,
       });
-      if (!response.ok) throw await this.describeFailure(response, '登录失败，请稍后重试');
-      const body = await response.json().catch(() => null) as { user?: unknown } | null;
+      if (!reply.response.ok) throw await this.describeFailure(reply, '登录失败，请稍后重试');
+      // 2xx 要读 user；等不来正文按「暂时失败」抛错，界面保持可重试。
+      let body: { user?: unknown } | null;
+      try {
+        body = await reply.readJson() as { user?: unknown } | null;
+      } catch {
+        throw new AuthError('登录结果未能送达，请稍后重试', 503);
+      }
       const user = parseAuthUser(body?.user);
       this.rotate('cookie');
       this.options.storage.clear();
@@ -417,9 +510,15 @@ export class AuthController {
       const token = draft.trim();
       if (!token) throw new AuthError('请先输入访问口令', 400);
       if (this.stateValue.accountsEnabled) {
-        const response = await this.post('/api/auth/owner', { token, remember: !sessionOnly });
-        if (!response.ok) throw await this.describeFailure(response, '暂时无法验证口令，请稍后重试');
-        const body = await response.json().catch(() => null) as { user?: unknown } | null;
+        const reply = await this.post('/api/auth/owner', { token, remember: !sessionOnly });
+        if (!reply.response.ok) throw await this.describeFailure(reply, '暂时无法验证口令，请稍后重试');
+        // 2xx 要读 user；等不来正文按「暂时失败」抛错，不落半套身份。
+        let body: { user?: unknown } | null;
+        try {
+          body = await reply.readJson() as { user?: unknown } | null;
+        } catch {
+          throw new AuthError('暂时无法验证口令，请稍后重试', 503);
+        }
         const user = parseAuthUser(body?.user);
         this.rotate('cookie');
         this.options.storage.clear();
@@ -427,12 +526,15 @@ export class AuthController {
         this.broadcast();
         return;
       }
-      let response: Response;
+      let legacy: AuthReply;
       try {
-        response = await this.request('/api/owner', { method: 'GET' }, 'owner-header', token);
+        legacy = await this.request('/api/owner', { method: 'GET' }, 'owner-header', token);
       } catch {
         throw new AuthError('暂时无法验证口令，请稍后重试', 503);
       }
+      // 旧模式只判状态码、从不读正文：不装读体定时器（AuthReply.response 直接用），
+      // 也不给成功路径留任何 timer（既有回归用例盯着这条）。
+      const response = legacy.response;
       if (response.status === 401) throw new AuthError('口令不正确，当前口令未更改', 401);
       if (!response.ok) throw new AuthError('暂时无法验证口令，请稍后重试', response.status);
       this.options.storage.write(token, sessionOnly);
@@ -466,13 +568,14 @@ export class AuthController {
         this.set({ phase: 'anonymous', user: null, sessionOnly: false, expired: false });
         return;
       }
-      let response: Response;
+      let reply: AuthReply;
       try {
-        response = await this.post('/api/auth/logout', undefined);
+        reply = await this.post('/api/auth/logout', undefined);
       } catch {
         throw new AuthError('退出尚未完成，请重试', 503);
       }
-      if (!response.ok) throw new AuthError('退出尚未完成，请重试', response.status);
+      // 登出只判状态码、从不读正文：不装读体定时器，成功路径不残留 timer。
+      if (!reply.response.ok) throw new AuthError('退出尚未完成，请重试', reply.response.status);
       this.options.storage.clear();
       this.rotate('cookie');
       this.set({ phase: 'anonymous', user: null, expired: false });
@@ -496,8 +599,11 @@ export class AuthController {
     });
   }
 
-  private async describeFailure(response: Response, fallback: string): Promise<AuthError> {
-    const body = await response.json().catch(() => null) as { error?: unknown; code?: unknown } | null;
+  private async describeFailure(reply: AuthReply, fallback: string): Promise<AuthError> {
+    const response = reply.response;
+    // 错误正文只是给文案加细节；等不来正文（读体超时被 readJson 抛出）也退回 fallback，
+    // 不让「读 401 的 body」把队列挂死。
+    const body = await reply.readJson().catch(() => null) as { error?: unknown; code?: unknown } | null;
     const code = typeof body?.code === 'string' ? body.code : undefined;
     if (response.status === 401) return new AuthError('用户名或密码不正确', 401, code);
     if (response.status === 403 && code === 'MEMBERS_DISABLED') {
