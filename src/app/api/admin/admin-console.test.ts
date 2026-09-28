@@ -25,10 +25,14 @@ import { GET as registrationGet, PATCH as registrationPatch } from './registrati
 import { GET as invitesGet, POST as invitesPost } from './invites/route';
 import { POST as inviteRevoke } from './invites/[id]/revoke/route';
 import { GET as usersGet } from './users/route';
+import * as usersRoute from './users/route';
 import { PATCH as userPatch } from './users/[id]/route';
 import { GET as labelGet, PATCH as labelPatch } from './label-model/route';
 
 const OWNER_TOKEN = 'admin-console-owner-token';
+it('用户路由只导出 Next.js 支持的处理器', () => {
+  expect(Object.keys(usersRoute)).toEqual(['GET']);
+});
 type Handler = (req: NextRequest, ctx: { params: Promise<Record<string, string>> }) => Promise<Response>;
 
 let db: ReturnType<typeof mockSql>;

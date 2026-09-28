@@ -1,3 +1,4 @@
+import { labelText } from './label-text';
 import { NextRequest } from 'next/server';
 import { requirePermission } from '@/lib/auth';
 import { authJson, withAuthHeaders } from '@/lib/auth-http';
@@ -26,17 +27,6 @@ interface LabeledBook {
   labeled_at: string;
   shared_read_task_id: number | null;
   my_download_task_id: number | null;
-}
-
-// 标签字段的安全提取（labels 来自离线脚本，字段宽松）
-export function labelText(labels: unknown, key: string, maxLength = 600): string {
-  if (!isRecord(labels)) return '';
-  const v = labels[key];
-  if (typeof v === 'string') return v.slice(0, maxLength);
-  if (Array.isArray(v)) {
-    return v.filter((x): x is string => typeof x === 'string').slice(0, 6).join('；').slice(0, maxLength);
-  }
-  return '';
 }
 
 const SORTS = new Set(['quality', 'recent', 'oldest', 'title']);

@@ -23,6 +23,11 @@ vi.mock('@/lib/profile-absorption', () => ({
 }));
 
 import { GET, maxDuration } from './route';
+import * as drainRoute from './route';
+
+it('drain 路由只导出 Next.js 支持的处理器与配置', () => {
+  expect(Object.keys(drainRoute).sort()).toEqual(['GET', 'maxDuration']);
+});
 
 const SECRET = 'absorb-drain-test-secret';
 

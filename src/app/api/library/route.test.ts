@@ -6,6 +6,11 @@ const mocks = vi.hoisted(() => ({ ensureSchema: vi.fn(), getSql: vi.fn(), sessio
 vi.mock('@/lib/db', () => mocks);
 vi.mock('@/lib/auth-session', async (original) => ({ ...await original<typeof import('@/lib/auth-session')>(), findSessionByToken: mocks.session }));
 import { GET } from './route';
+import * as libraryRoute from './route';
+
+it('书库路由只导出 Next.js 支持的处理器与配置', () => {
+  expect(Object.keys(libraryRoute).sort()).toEqual(['GET', 'maxDuration']);
+});
 
 let db: ReturnType<typeof mockSql>;
 
