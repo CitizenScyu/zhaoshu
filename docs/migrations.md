@@ -7,6 +7,7 @@
 | `0001_baseline.sql` | 1 | 冻结应用提交 `f48299b` 的现有结构；记录**已有**表、列、约束与索引，不引入后续功能字段 |
 | `0002_identity_key.sql` | 2 | 身份键从表达式索引升级为「生成列 + 唯一索引」（task-53 Phase 2） |
 | `0003_runtime_tables.sql` | 3 | 把此前只有运行时 DDL 的 `app_settings` / `source_admission` / `profile_feedback_queue` / `cron_health` 纳入契约（MS-25）；语句逐字取自 `business-schema.ts`，`runtime-tables-migration.pglite.test.ts` 逐列比对两条路径 |
+| `0004_admission_lease_generation.sql` | 4 | `cron_health` 加 `lease_generation bigint NOT NULL DEFAULT 0`（fencefix42 fencing token）：准入租约显式代次列，幂等 `ADD COLUMN IF NOT EXISTS`，老库既有行默认 0；运行期 `initializeBusinessSchema` 有同款 DDL（应用启动即可补列，不依赖迁移先行）；代次生命周期前提见「回滚」一节 |
 
 版本号取自文件名数字前缀，`SCHEMA_VERSION` 必须等于列表里的最大版本，否则 `loadMigrations()` 直接报错——常量与文件脱节不会被静默放过。**已发布的文件内容即其摘要**：`0001` 的 sha256（`1b47f1ca…`）已记入隔离库 / 灾备演练库的 `schema_migrations`，`db:baseline:prod` 也按这三份字节登记生产；改一个字节会让 `db:check` / `db:migrate` 在已登记的库上拒绝继续。`0002` 已由生产按同一文件手工执行过 DDL，同样不得再改。
 
@@ -90,16 +91,20 @@ $env:PROD_DATABASE_URL = '<目标库连接串>'
 # 0) 部署应用（运行期行为不依赖 schema_migrations，可先行）；按 docs/auth-deployment.md「生产收口」第 2 步做备份 / Neon 时间点分支
 # 1) auth：预期 plan.status=up-to-date、before.max=7；有 pending 先弄清原因再 --yes-i-mean-production
 npm run migrate:auth:prod -- --database-url-env=PROD_DATABASE_URL --dry-run
-# 2) 只读核对：预期退出码 2，versions=[]、missingTables=["schema_migrations"]、ledger.pending=[1,2,3]、ledger.errors=[]、
+# 2) 只读核对：预期退出码 2，versions=[]、missingTables=["schema_migrations"]、ledger.pending=[1,2,3,4]、ledger.errors=[]、
 #    authVersionOk=true、artifactVersionOk=true（生产已有 artifact 三表；只到 v1 时为 false，先按 docs/artifact-registry.md
-#    「Pre-rollout check」清孤儿后跑 migrate:artifacts:prod 补 v2）、runtimeColumns.ok=true。runtimeColumns.extra 非空先停下人工确认。
+#    「Pre-rollout check」清孤儿后跑 migrate:artifacts:prod 补 v2）、runtimeColumns.ok=true（v4 待执行时允许
+#    cron_health 缺 lease_generation 列进入迁移）。runtimeColumns.extra 非空先停下人工确认。
 npm run db:check:prod -- --database-url-env=PROD_DATABASE_URL
-# 3) baseline dry-run：预期 status=dry-run、problems=[]、ledgerWrites 为 v1–v3 三行；看一遍 extra
-#    （应只有 auth v5–v7 / 运行期 / artifact 加的东西）。status=refused 就停，按 refusals 逐条核实，不要改用 migrate --apply 绕过。
+# 3) baseline dry-run：预期 status=dry-run、problems=[]、ledgerWrites 为 v1–v3 三行（baseline 只登记 v1–v3，
+#    见 scripts/db-baseline.mjs 的 BASELINE_VERSIONS）；看一遍 extra（应只有 auth v5–v7 / 运行期 / artifact 加的东西）。
+#    status=refused 就停，按 refusals 逐条核实，不要改用 migrate --apply 绕过。
 npm run db:baseline:prod -- --database-url-env=PROD_DATABASE_URL
-# 4) 登记：预期 status=applied、after.ok=true
+# 4) 登记：预期 status=applied、after.ok=false（v4 尚未执行 / 未记账，check 应报 pending——这是预期中间态）
 npm run db:baseline:prod -- --database-url-env=PROD_DATABASE_URL --apply
-# 5) 复核：退出码 0；db:migrate:prod dry-run 应为 status=up-to-date
+# 5) 补 v4：预期 status=applied、after.ok=true（执行 0004 给 cron_health 补 lease_generation 列）
+npm run db:migrate:prod -- --database-url-env=PROD_DATABASE_URL --apply
+# 6) 复核：退出码 0；db:migrate:prod dry-run 应为 status=up-to-date
 npm run db:check:prod -- --database-url-env=PROD_DATABASE_URL
 npm run db:migrate:prod -- --database-url-env=PROD_DATABASE_URL
 Remove-Item Env:PROD_DATABASE_URL
@@ -113,7 +118,7 @@ Remove-Item Env:PROD_DATABASE_URL
 
 ### 灾备冷建库顺序（空库）
 
-`db:migrate:prod --apply`（0001→0003，`after.authVersion=4`、`authVersionOk=false` 属预期，输出 `next` 提示）→ `migrate:auth:prod --yes-i-mean-production`（补 auth 5/6/7）→ `migrate:artifacts:prod --yes-i-mean-production`（补 artifact schema：`storage_repositories` / `book_artifacts` / `download_tasks.artifact_id` FK，v2 再加 `download_tasks.book_id` → `labeled_books(id)` FK；冷建库无任务行，孤儿预检为 0；入口见 `docs/artifact-registry.md`）→ `register:storage:prod --apply`（登记发布仓位，否则 T8 worker 反查不到可写仓）→ `db:check:prod` 退出码 0 → 部署应用。每一步之前都可以先跑对应的 dry-run。必须从空库开始：先跑了 auth 迁移的库已有业务表，`db:migrate:prod` 会按「未登记的已有库」拒绝——灾备分支直接丢弃重建即可。
+`db:migrate:prod --apply`（0001→0004，`after.authVersion=4`、`authVersionOk=false` 属预期，输出 `next` 提示）→ `migrate:auth:prod --yes-i-mean-production`（补 auth 5/6/7）→ `migrate:artifacts:prod --yes-i-mean-production`（补 artifact schema：`storage_repositories` / `book_artifacts` / `download_tasks.artifact_id` FK，v2 再加 `download_tasks.book_id` → `labeled_books(id)` FK；冷建库无任务行，孤儿预检为 0；入口见 `docs/artifact-registry.md`）→ `register:storage:prod --apply`（登记发布仓位，否则 T8 worker 反查不到可写仓）→ `db:check:prod` 退出码 0 → 部署应用。每一步之前都可以先跑对应的 dry-run。必须从空库开始：先跑了 auth 迁移的库已有业务表，`db:migrate:prod` 会按「未登记的已有库」拒绝——灾备分支直接丢弃重建即可。
 
 `db:check:prod` 同时判 artifact 侧：缺 `artifact_schema_migrations` / `storage_repositories` / `book_artifacts`
 （`EXPECTED_TABLES` 自 41-coldbuild 起含这三张表）或 artifact 记账版本低于 `ARTIFACT_SCHEMA_VERSION`（2）时，退出码 2、`artifactVersionOk: false`，
@@ -126,6 +131,12 @@ Remove-Item Env:PROD_DATABASE_URL
 - 应用代码：revert 即可。旧代码没有本入口；旧 `db:migrate` / `db:check` 只遍历自己列表里的版本，库里多出的记账行不影响它们。
 - baseline：唯一写入是新建的 `schema_migrations` 表与 v1–v3 三行，业务表一个字节不动；确要撤回就删掉这张记账表（`DROP TABLE schema_migrations`），库回到登记前的状态。`--apply` 中途失败整批回滚，不会留下空表或部分登记。
 - migrate：对已登记库，新版本多出记账行和该版本自己的 DDL；确要撤回某版本记账用 `DELETE FROM schema_migrations WHERE version = <N>`（表结构不动）。`--apply` 失败时整批事务回滚，无半成品。冷建库失败直接丢弃该库 / 分支重来。auth 迁移只进不退，见 `docs/auth-deployment.md`。
+- **0004（`cron_health.lease_generation`）专属前提**：代次是准入写围栏（fencing）的唯一凭证，以下操作会重新打开「过期持有者迟到覆盖新结果」的写窗口，均为禁区——
+  - 不得删除租约行（`cron_health` 里 `name='admission_lease'`）重建：删行重插会把代次回置 1，可能低于旧持有者手里的句柄代次，旧句柄重新变为「有效」。确要清理只能保留行原样。
+  - 不得手工归零 / 回拨 `lease_generation`（理由同上）。
+  - 备份恢复后须先排空全部旧持有者再开放准入：恢复出的代次是备份时点的，旧进程可能仍持更高代次句柄；确认 Vercel 准入 cron（`/api/shuyuan/admission`）与 phoenix `zhaoshu-admission.timer` 都没有在跑旧代码的轮次（等待租约 TTL 自然过期即 ≥ `ADMISSION_LEASE_TTL_MS`），再恢复入口。
+  - 新旧 writer 不可混跑：无围栏的旧代码（901971c 之前）与带围栏新代码并发写 `source_admission` 时，旧代码不受代次门禁约束。回退应用代码前，先停全部准入入口（Vercel cron + phoenix timer）再退；同理，`scripts/seed-admission.mjs` 是无围栏直写（见其头注），使用前先排空准入轮次。
+  - 迁移本身可安全回滚记账（`DELETE … WHERE version=4` 不动表结构，列留在库里无害——运行期 DDL 与 0004 都不会重置既有代次）；要撤回的只是「应用代码的新写路径」，不是这一列。
 
 ## 三类起点差异
 

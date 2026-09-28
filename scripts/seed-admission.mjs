@@ -12,6 +12,11 @@
 // rulesHash），行格式与 rules_hash 与 cron 准入批次逐字一致。只写 source_admission，
 // 不碰 shuyuan_sources / shuyuan_meta。
 //
+// ⚠ 无围栏直写（fencecore42 已知边界）：本脚本不走 writeAdmissionRows 的租约/代次门禁，
+// 与任何在跑的准入轮（Vercel cron /api/shuyuan/admission、phoenix zhaoshu-admission.timer、
+// 刷新尾部）并发时，双方的写都不受围栏约束，可能互相覆盖。使用前先停/避开准入轮次
+// （等一轮跑完、租约 TTL 过期即可），或仅在准入入口都停用的时间窗内执行。
+//
 // 凭据纪律：不打印 DATABASE_URL 或任何密钥；汇总只输出 host / verdict 计数。
 //
 // TS 加载：经 scripts/ts-esm-loader.mjs（唯一 TS shim：esbuild 钩子，--import 与 register() 两用）import 仓库 TS——
