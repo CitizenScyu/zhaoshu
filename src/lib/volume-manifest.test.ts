@@ -12,7 +12,7 @@ import { MAX_READER_BYTES } from './txt-chapters';
 
 const HEX40 = 'a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0';
 
-/** 合法基线:2 卷、2 章、偏移首尾相接,blob_sha 前 8 位 === version。 */
+/** 合法基线:2 卷首尾相接，2 章有间隙及未索引尾部，blob_sha 前 8 位 === version。 */
 function baseManifest(): VolumeManifest {
   return {
     schema: VOLUME_MANIFEST_SCHEMA,
@@ -74,6 +74,20 @@ describe('isVolumeManifestPath', () => {
 });
 
 describe('parseVolumeManifest 正例', () => {
+  it('保留有章间空隙和未索引尾部的合法稀疏清单', () => {
+    const manifest = parseVolumeManifest(encode(baseManifest()));
+    expect(manifest?.chapter_index.map(({ s, e }) => [s, e])).toEqual([[0, 1500], [2000, 2500]]);
+    expect(manifest?.bytes).toBe(3000);
+  });
+
+  it.each([1500, 2000])('相邻章边界相接仍合法，分界 %i 可在卷内或卷边界', (boundary) => {
+    const raw = baseManifest();
+    raw.chapter_index[0].e = boundary;
+    raw.chapter_index[1].s = boundary;
+    raw.chapter_index[1].v = boundary === 2000 ? 1 : 0;
+    expect(parseVolumeManifest(encode(raw))?.chapter_index).toEqual(raw.chapter_index);
+  });
+
   it('解析合法清单为强类型', () => {
     const manifest = parseVolumeManifest(encode(baseManifest()));
     expect(manifest).not.toBeNull();
@@ -94,6 +108,18 @@ describe('parseVolumeManifest 正例', () => {
 });
 
 describe('parseVolumeManifest 反例(一律 null)', () => {
+  it.each([
+    { label: '同一范围重复映射', ranges: [[0, 1500], [0, 1500]] },
+    { label: '后章与前章部分重叠', ranges: [[0, 1500], [1499, 2000]] },
+    { label: '互不重叠但章节顺序倒置', ranges: [[2000, 2500], [0, 1500]] },
+  ])('$label', ({ ranges }) => {
+    const raw = baseManifest();
+    raw.chapter_index = raw.chapter_index.map((chapter, index) => ({
+      ...chapter, s: ranges[index][0], e: ranges[index][1], v: ranges[index][0] < 2000 ? 0 : 1,
+    }));
+    expect(parseVolumeManifest(encode(raw))).toBeNull();
+  });
+
   it('非法 JSON', () => {
     expect(parseVolumeManifest(encode('{not json'))).toBeNull();
   });

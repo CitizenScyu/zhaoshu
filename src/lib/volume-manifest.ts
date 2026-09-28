@@ -138,7 +138,8 @@ function parseChapter(value: unknown): VolumeChapterEntry | null {
  * 解析并全量校验清单字节。任一校验项不成立返回 null(调用方 502),绝不猜:
  * schema/format;version 8hex、blob_sha 40hex;volumes ≥ 1 且逐卷 path/sha/bytes 合规;
  * 偏移首尾相接单调且 Σvolumes.bytes === bytes;chapter_index.length === chapters、
- * i 连续、v ∈ [0,volumes.length)、0 < s < e ≤ bytes、p ≥ 1,章起点落在其卷区间内。
+ * i 连续、v ∈ [0,volumes.length)、0 ≤ s < e ≤ bytes、p ≥ 1,章起点落在其卷区间内,
+ * 章节范围按序且互不重叠(允许章间空隙和未索引的首尾字节)。
  */
 export function parseVolumeManifest(bytes: Uint8Array): VolumeManifest | null {
   let value: unknown;
@@ -188,6 +189,9 @@ export function parseVolumeManifest(bytes: Uint8Array): VolumeManifest | null {
     if (entry.v >= volumes.length) return null;
     if (entry.s >= entry.e || entry.e > raw.bytes) return null;
     if (entry.s < volumes[entry.v].first_byte || entry.s >= volumes[entry.v].last_byte) return null;
+    // 卷 SHA 只能证明字节正确，不能证明目录映射正确；重叠/逆序会把别章正文当成功返回。
+    const previous = chapterIndex[chapterIndex.length - 1];
+    if (previous && entry.s < previous.e) return null;
     chapterIndex.push(entry);
   }
   if (chapterIndex.length !== raw.chapters) return null;

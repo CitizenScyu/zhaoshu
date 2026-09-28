@@ -104,6 +104,20 @@ describe('reader server: v2 分卷(§七)', () => {
     vi.unstubAllEnvs();
   });
 
+  it.each(['重叠', '逆序'])('章节映射%s即返回502，不把正确SHA的卷切成错误正文', async (kind) => {
+    const fx = fixture();
+    const [first, second] = fx.manifest.chapter_index;
+    fx.manifest.chapter_index = kind === '重叠'
+      ? [first, { ...second, v: first.v, s: first.s, e: first.e }]
+      : [{ ...second, i: 0 }, { ...first, i: 1 }];
+    // 正文和全书/卷SHA完全未改；仅清单的章节映射损坏。
+    const hits: string[] = [];
+    fetchMock.mockImplementation(resourceServer(volumeResources(fx), name => hits.push(name)));
+    await expect(server.readBookIndex(fx.task)).rejects.toMatchObject({ status: 502 });
+    await expect(server.readBookPart(fx.task, 1, 0, fx.manifest.blob_sha)).rejects.toMatchObject({ status: 502 });
+    expect(hits).toEqual(['index.json', 'index.json']);
+  });
+
   it('readBookIndex 只取清单 1 次、绝不含任何卷取用;version 用全书 blob_sha、偏移为全书口径', async () => {
     const fx = fixture();
     const hits: string[] = [];
