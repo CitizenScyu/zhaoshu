@@ -7,7 +7,7 @@ export type ReaderOrigin = 'library' | 'shelf' | 'find';
 export interface ReaderSource {
   id: string;
   name: string;
-  /** 书的详情页(catalog.bookUrl),不是源 url。 */
+  /** 书的详情页(catalog.bookUrl),不是源 url；旧换源响应缺地址时为空。 */
   url: string;
   /**
    * 书源的唯一标识(源 url,= 扇出候选 / probe 结果的 sourceUrl)。换源面板据此精确认「当前源」;
@@ -46,6 +46,8 @@ export interface ReaderPart {
    * 固化(catalog 落库)并把本次正文换成新源,前端据此把阅读目录切成新源(洞 2)。
    */
   sourceSession?: string;
+  /** 自动换源成功后的书详情页，由已通过源策略与书身份校验的新目录提供。 */
+  sourceBookUrl?: string;
   /**
    * 换源响应附带的新源目录(形状与 index 资源的 ReaderIndex.chapters 完全一致)。
    * **只在章内换源成功时出现**:前端据此一次性替换旧目录并迁移阅读位置(H7),

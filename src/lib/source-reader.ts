@@ -1452,7 +1452,7 @@ export async function readSourceChapter(session: string, chapterIndex: number, c
     version: switched?.version ?? catalog.version,
     // 洞 2:换源成功时带出新源的目录会话版本,前端据此改用新源会话续读(不再每章从故障原源重试;
     // 新旧目录序号可能不同,阅读位置按标题迁移由前端负责)。未换源时省略,响应体与既有逐字相同。
-    ...(switched ? { sourceSession: switched.version } : {}),
+    ...(switched ? { sourceSession: switched.version, sourceBookUrl: switched.bookUrl } : {}),
     chapterIndex,
     partIndex: 0, partCount: 1, title: chapter.title, startByte: 0, endByte: Buffer.byteLength(text, 'utf8'), text,
   };

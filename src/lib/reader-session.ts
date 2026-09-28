@@ -61,6 +61,9 @@ export function switchedReaderIndex(index: ReaderIndex, part: ReaderPart): Reade
   if (!index.source || !part.sourceSession || part.sourceSession === index.source.session) return index;
   const chapters = catalogOf(part);
   const source = { ...index.source, session: part.sourceSession, ...(part.sourceId ? { id: part.sourceId } : {}) };
+  // 详情页必须随源一起切换。旧响应未提供新地址时留空，让成功源记忆跳过本次，
+  // 避免把新 sourceUrl 与旧书详情页组合持久化；阅读仍由 session 正常续接。
+  source.url = typeof part.sourceBookUrl === 'string' ? part.sourceBookUrl : '';
   // 源 url 跟到新源(41-srcurl);换源响应没带(旧服务端)时去掉旧源的,免得换源面板把旧源认成当前源。
   if (part.servedFromUrl) source.sourceUrl = part.servedFromUrl;
   else delete source.sourceUrl;

@@ -50,7 +50,7 @@ describe('download and source reading sessions', () => {
   it('章内换源:带 sourceSession 的 part 换出可续读的新目录,且被判定为与目录一致', () => {
     const newSession = 'b'.repeat(40);
     // 前端只以服务端给的两个事实为权威:新会话版本 + 新 sourceId(名字沿用,章头显示走 servedFrom)。
-    const expectedSource = { ...online.source, id: 'source-two', session: newSession };
+    const expectedSource = { ...online.source, url: '', id: 'source-two', session: newSession };
     const switchedPart: ReaderPart = {
       ...position, taskId: null, sourceId: 'source-two', servedFrom: '备用源',
       version: newSession, sourceSession: newSession,
@@ -120,11 +120,14 @@ describe('download and source reading sessions', () => {
       version: newSession, sourceSession: newSession, partCount: 1, title: '第一章', text: '正文', startByte: 0, endByte: 6,
     };
     expect(switchedReaderIndex(withUrl, switchedPart).source)
-      .toEqual({ ...withUrl.source, id: 'source-two', session: newSession, sourceUrl: 'https://backup.test/' });
+      .toEqual({ ...withUrl.source, url: '', id: 'source-two', session: newSession, sourceUrl: 'https://backup.test/' });
+    expect(switchedReaderIndex(withUrl, { ...switchedPart, sourceBookUrl: 'https://backup.test/book' }).source)
+      .toMatchObject({ url: 'https://backup.test/book', sourceUrl: 'https://backup.test/' });
     const adopted = switchedReaderIndex(withUrl, { ...switchedPart, servedFromUrl: undefined });
     expect(adopted.source).not.toHaveProperty('sourceUrl');
     // 原 index 不被改写(switchedReaderIndex 是纯函数)。
     expect(withUrl.source!.sourceUrl).toBe('https://book15.net/');
+    expect(withUrl.source!.url).toBe(online.source!.url);
   });
 
   // H7 小修 U4a:交付段改记新目录序号时,标题也必须改记为**新目录 at 章标题** —— 否则段的

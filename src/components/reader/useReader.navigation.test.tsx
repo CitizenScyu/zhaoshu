@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { useReader, partKey } from './useReader';
 import { indexProgressKey, READER_SETTINGS_KEY } from '@/lib/reader-preferences';
 import type { ReaderIndex, ReaderPart, ReadingSession } from '@/lib/reader-types';
+import { readSourceMemory } from '@/lib/source-memory';
 
 type Reader = ReturnType<typeof useReader>;
 type ApiFetch = Parameters<typeof useReader>[1];
@@ -82,6 +83,61 @@ function mockFetch(index: ReaderIndex, switchKind: 'none' | 'legacy' | 'catalog'
 }
 
 describe('章节导航的位置、滚动与进度一致性', () => {
+  it.each([true, false])('自动换源后保存成对坐标并恢复进度（响应含新书地址：%s）', async (withBookUrl) => {
+    const indexA = catalog(true);
+    indexA.source!.url = 'https://a.example/book';
+    indexA.source!.sourceUrl = 'https://a.example';
+    const indexB: ReaderIndex = { ...indexA, version: 'b'.repeat(40),
+      source: { id: 'source-b', name: '合成源乙', url: 'https://b.example/book', sourceUrl: 'https://b.example', session: 'b'.repeat(40) },
+      chapters: [{ index: 0, title: '序言', startByte: 0, endByte: 0, partCount: 1 }, ...indexA.chapters.map(c => ({ ...c, index: c.index + 1 }))],
+    };
+    const session: ReadingSession = { kind: 'source', title: indexA.title, author: indexA.author };
+    const apiFetch = vi.fn<ApiFetch>(async input => {
+      const url = new URL(String(input), 'https://synthetic.invalid');
+      if (url.pathname.endsWith('/index')) {
+        if (!url.searchParams.has('prefer')) return Response.json(indexA);
+        // 与服务端软提示一致：坐标不匹配时回落整池，不能假装读到了乙源。
+        return url.searchParams.get('source') === indexB.source!.sourceUrl && url.searchParams.get('book_url') === indexB.source!.url
+          ? Response.json(indexB) : Response.json({ ...indexA, hintCleared: true });
+      }
+      const chapterIndex = Number(url.searchParams.get('chapter'));
+      const fromB = url.searchParams.get('session') === indexB.version;
+      const index = fromB ? indexB : indexA;
+      const switching = !fromB && chapterIndex === 1;
+      return Response.json({ taskId: null, version: switching ? indexB.version : index.version,
+        sourceId: switching ? indexB.source!.id : index.source!.id, chapterIndex, partIndex: 0, partCount: 1,
+        title: index.chapters[chapterIndex].title, startByte: 0, endByte: 100, text: '合成正文',
+        ...(switching ? { sourceSession: indexB.version, servedFromUrl: indexB.source!.sourceUrl,
+          switchedChapters: indexB.chapters, switchedChapterIndex: 2,
+          ...(withBookUrl ? { sourceBookUrl: indexB.source!.url } : {}),
+        } : {}),
+      });
+    });
+    const first = mountReader(session, apiFetch);
+    const savedB = () => JSON.parse(window.localStorage.getItem(indexProgressKey(indexB, USER_ID)) ?? 'null');
+    await waitFor(() => expect(first.reader().loading).toBe(false));
+    await act(async () => { await first.reader().navigate({ chapterIndex: 1, partIndex: 0, ratio: 0 }); });
+    await waitFor(() => expect(savedB()?.chapterIndex).toBe(2));
+    expect(first.reader().failure).toBeNull();
+    expect(first.reader().activePart?.chapterIndex).toBe(2);
+    expect(first.reader().reading?.index.source?.id).toBe('source-b');
+    const remembered = readSourceMemory(indexA.title, indexA.author);
+    expect(remembered).toMatchObject(withBookUrl
+      ? { sourceUrl: 'https://b.example', bookUrl: 'https://b.example/book' }
+      : { sourceUrl: 'https://a.example', bookUrl: 'https://a.example/book' });
+    if (!withBookUrl) return; // 旧协议照常阅读，但不伪造新源的成功坐标。
+    cleanup();
+    const second = mountReader(session, apiFetch);
+    await waitFor(() => expect(second.reader().loading).toBe(false));
+    const lastIndexUrl = apiFetch.mock.calls.map(([url]) => String(url)).filter(url => url.includes('/index?')).at(-1)!;
+    const query = new URL(lastIndexUrl, 'https://synthetic.invalid').searchParams;
+    expect(query.get('source')).toBe('https://b.example');
+    expect(query.get('book_url')).toBe('https://b.example/book');
+    expect(second.reader().reading?.index.source?.id).toBe('source-b');
+    expect(second.reader().activePart?.chapterIndex).toBe(2);
+    expect(savedB()?.chapterIndex).toBe(2);
+  });
+
   it.each([
     { label: '下载阅读普通跳章', source: false, switchKind: 'none' as const, expectedChapter: 1, expectedRatio: 0 },
     { label: '在线阅读未换源跳章', source: true, switchKind: 'none' as const, expectedChapter: 1, expectedRatio: 0 },

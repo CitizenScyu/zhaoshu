@@ -886,6 +886,7 @@ describe('GET /api/read/source/[resource]', () => {
     const part = await partRes.json();
     expect(part.text).toBe('备用第一章');
     expect(part.sourceSession).toBe(part.version);
+    expect(part.sourceBookUrl).toBe(backupPage);
     expect(part.switchedChapterIndex).toBe(1);
     expect(part.switchedChapters).toEqual([
       { index: 0, title: '序言', startByte: 0, endByte: 0, partCount: 1 },
@@ -909,6 +910,7 @@ describe('GET /api/read/source/[resource]', () => {
     const plain = await (await request('chapter', `session=${part.sourceSession}&version=${part.version}&chapter=0`)).json();
     expect(plain.switchedChapters).toBeUndefined();
     expect(plain.switchedChapterIndex).toBeUndefined();
+    expect(plain.sourceBookUrl).toBeUndefined();
   });
 
   it('H7 必修 A:章名漂移(同章号+主体扩写)时换源响应仍附新目录,重读时前端接受', async () => {
