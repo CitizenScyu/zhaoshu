@@ -65,7 +65,6 @@ export function createQuotaAwareFetch(
     // 发生在 baseFetch 内部，不会走到下面的 402 分支，也不布置冷却、不打 db_quota_exceeded 日志。
     // 该模块仅服务端可达，Node 支持 AbortSignal.timeout；客户端依赖图另有边界测试。
     // 使用带自动计时的原生 signal，避免引入需要外部 dispose 的计时器。
-    // eslint-disable-next-line no-restricted-properties -- 服务端专用路径；见上
     const effectiveInit = init?.signal ? init : { ...init, signal: AbortSignal.timeout(dbFetchTimeoutMs()) };
     const response = await baseFetch(input, effectiveInit);
     if (response.status === 402) {
