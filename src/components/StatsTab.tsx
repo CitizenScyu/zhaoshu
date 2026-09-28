@@ -1,6 +1,6 @@
 'use client';
 
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { useOwner } from '@/components/OwnerProvider';
 import { TokenStatTile, TokenUsageDetails } from '@/components/TokenStats';
 import type { StatsResponse as Stats } from '@/app/api/stats/route';
@@ -133,6 +133,19 @@ export default function StatsTab() {
     }
   }, [apiFetch]);
 
+  // 手动刷新与首次 effect 共用同一可取消生命周期：每次刷新先中止上一条在途
+  // 请求（迟到结果不再渲染、不再触发 /api/admin/download-stats 连锁），离开
+  // 页面时同样收尾。ref 挂控制器，避免刷新按钮闭包拿到过期实例。
+  const refreshControllerRef = useRef<AbortController | null>(null);
+  const refresh = useCallback(() => {
+    refreshControllerRef.current?.abort();
+    const controller = new AbortController();
+    refreshControllerRef.current = controller;
+    void load(controller.signal);
+  }, [load]);
+  // 卸载时中止最后一条手动刷新在途请求（effect 的 cleanup 只管自己那一条）。
+  useEffect(() => () => refreshControllerRef.current?.abort(), []);
+
   useEffect(() => {
     const controller = new AbortController();
     queueMicrotask(() => {
@@ -160,7 +173,7 @@ export default function StatsTab() {
       <div className="flex flex-wrap items-center gap-4">
         <h2 className="text-lg font-bold">统计</h2>
         <span className="chip text-xs">账本 · 战果</span>
-        <button type="button" className="chip text-xs" onClick={() => void load()} disabled={loading}>
+        <button type="button" className="chip text-xs" onClick={refresh} disabled={loading}>
           {loading ? '读取中…' : '刷新统计'}
         </button>
       </div>
