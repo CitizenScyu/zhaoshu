@@ -367,6 +367,32 @@ class TestBuildEngineCli(unittest.TestCase):
         self.assertEqual(cli.script_path, '/repo/scripts/engine-fetch.mjs')
         validate.assert_called_once_with(cli)
 
+    def test_built_cli_forwards_pool_artifact_keys_only(self):
+        # artifactfwd42：.env 字典里的源池产物两键经 EngineCli 转发给子进程，其余键不转发
+        env = {labeler.douban_list.ENGINE_FALLBACK_ENV: '1',
+               'LABELER_ENGINE_CLI': '/repo/scripts/engine-fetch.mjs',
+               'DATABASE_URL': 'postgres://user:pw@host/db',
+               'SHUYUAN_POOL_ARTIFACT': '1',
+               'SHUYUAN_POOL_ARTIFACT_PATH': '/var/www/zhaoshu-pool/pool-artifact.json',
+               'FAKE_SECRET_X': 'fake-not-real'}
+        with mock.patch.object(labeler.douban_list, 'validate_engine'):
+            cli = labeler._build_engine_cli(env)
+        captured = {}
+
+        def fake_run(cmd, **kwargs):
+            captured['env'] = kwargs.get('env')
+            return _proc(0, '{}')
+
+        with mock.patch.dict(os.environ, {}, clear=False), \
+                mock.patch.object(labeler.douban_list.subprocess, 'run', fake_run):
+            os.environ.pop('FAKE_SECRET_X', None)
+            cli.run('doctor')
+        self.assertEqual(captured['env']['SHUYUAN_POOL_ARTIFACT'], '1')
+        self.assertEqual(captured['env']['SHUYUAN_POOL_ARTIFACT_PATH'],
+                         '/var/www/zhaoshu-pool/pool-artifact.json')
+        self.assertEqual(captured['env']['DATABASE_URL'], 'postgres://user:pw@host/db')
+        self.assertNotIn('FAKE_SECRET_X', captured['env'])
+
     def test_probe_failure_disables_engine_with_clear_error(self):
         env = {labeler.douban_list.ENGINE_FALLBACK_ENV: '1',
                'LABELER_ENGINE_CLI': '/repo/scripts/engine-fetch.mjs',

@@ -2761,7 +2761,7 @@ def _build_engine_cli(env: dict):
         return None
     node = (env.get('LABELER_ENGINE_NODE') or 'node').strip() or 'node'
     cli = douban_list.EngineCli(node=node, script_path=cli_path,
-                                database_url=database_url)
+                                database_url=database_url, forward_env=env)
     try:
         douban_list.validate_engine(cli)
     except douban_list.EngineUnavailable as e:
