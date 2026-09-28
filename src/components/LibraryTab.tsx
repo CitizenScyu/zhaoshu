@@ -171,6 +171,7 @@ export default function LibraryTab({ view, setView }: {
   const [detail, setDetail] = useState<LibraryBook | null>(null);
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(true);
+  const [reloadVersion, setReloadVersion] = useState(0);
   const [task, setTask] = useState<DownloadTask | null>(null);
   const [dlError, setDlError] = useState('');
   const [dlMessage, setDlMessage] = useState('');
@@ -254,7 +255,7 @@ export default function LibraryTab({ view, setView }: {
       if (signal?.aborted || my !== reqId.current) return;
       setError(e instanceof Error ? e.message : '书库加载失败');
     } finally {
-      if (my === reqId.current) setLoading(false);
+      if (!signal?.aborted && my === reqId.current) setLoading(false);
     }
   }, [apiFetch]);
 
@@ -264,7 +265,12 @@ export default function LibraryTab({ view, setView }: {
       if (!controller.signal.aborted) void load(page, search, category, tag, finish, sort, controller.signal);
     });
     return () => controller.abort();
-  }, [load, page, search, category, tag, finish, sort]);
+  }, [load, page, search, category, tag, finish, sort, reloadVersion]);
+
+  // 重试也走同一个 effect，沿用条件切换和卸载时的取消/过期响应保护。
+  function retryLoad() {
+    if (!loading) setReloadVersion((current) => current + 1);
+  }
 
   // 进入详情页时按 bookId 查「本人」在这本书上的最新任务；共享可读定位（sharedReadTaskId）
   // 只用于在线阅读，不再拿去查强制 user_id 的 /api/download（F18）。
@@ -637,7 +643,12 @@ export default function LibraryTab({ view, setView }: {
           className="flex w-full min-w-0 items-center gap-2 sm:w-auto"
           onSubmit={(e) => {
             e.preventDefault();
-            updateView({ page: 1, search: query.trim() });
+            const nextSearch = query.trim();
+            if (page === 1 && search === nextSearch) {
+              if (error) retryLoad();
+            } else {
+              updateView({ page: 1, search: nextSearch });
+            }
           }}
         >
           <input
@@ -660,7 +671,7 @@ export default function LibraryTab({ view, setView }: {
             {SORTS.map(([v, l]) => <option key={v} value={v}>{l}</option>)}
           </select>
         </label>
-        {total > 0 && (
+        {!loading && !error && total > 0 && (
           <span className="text-xs" style={{ color: 'var(--ink-faint)' }}>共 {total} 本</span>
         )}
       </div>
@@ -714,15 +725,25 @@ export default function LibraryTab({ view, setView }: {
       </div>
 
       {error && (
-        <p role="alert" className="mt-4 text-sm" style={{ color: 'var(--cinnabar)' }}>✗ {error}</p>
+        <div role="alert" className="mt-4 flex flex-wrap items-center gap-3 text-sm" style={{ color: 'var(--cinnabar)' }}>
+          <p>✗ {error}</p>
+          <button type="button" className="chip" onClick={retryLoad} disabled={loading}>重试加载</button>
+        </div>
+      )}
+      {error && books !== null && books.length > 0 && (
+        <p className="mt-2 text-sm" style={{ color: 'var(--ink-soft)' }}>
+          以下为上次加载的结果，尚未按当前条件更新。
+        </p>
       )}
       {shelfMsg && (
         <p role="status" className="mt-3 text-sm" style={{ color: 'var(--ink-soft)' }}>{shelfMsg}</p>
       )}
-      {loading && !books && (
-        <p role="status" className="mt-6 text-sm" style={{ color: 'var(--ink-faint)' }}>读取中…</p>
+      {loading && (
+        <p role="status" className="mt-6 text-sm" style={{ color: 'var(--ink-faint)' }}>
+          {books !== null && books.length > 0 ? '正在更新书库，以下为上次结果…' : '读取中…'}
+        </p>
       )}
-      {books && books.length === 0 && !loading && (
+      {books && books.length === 0 && !loading && !error && (
         <p className="mt-6 text-sm" style={{ color: 'var(--ink-faint)' }}>
           {hasFilter ? '没有符合条件的书。' : '书库还是空的——离线打标跑完后，标签书会出现在这里。'}
         </p>
@@ -787,7 +808,7 @@ export default function LibraryTab({ view, setView }: {
         </div>
       )}
 
-      {totalPages > 1 && (
+      {!loading && !error && totalPages > 1 && (
         <div className="mt-5 flex flex-wrap items-center justify-center gap-3 text-sm">
           <button className="chip" disabled={page <= 1} onClick={() => setView((current) => ({ ...current, page: Math.max(1, current.page - 1) }))}>
             上一页
@@ -798,7 +819,7 @@ export default function LibraryTab({ view, setView }: {
           </button>
         </div>
       )}
-      {total > maxPage * pageSize && (
+      {!loading && !error && total > maxPage * pageSize && (
         <p className="mt-3 text-xs" style={{ color: 'var(--ink-soft)' }}>
           最多浏览前 {maxPage} 页，请使用搜索或筛选缩小范围。
         </p>
