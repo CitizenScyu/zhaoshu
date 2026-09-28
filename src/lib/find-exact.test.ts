@@ -99,6 +99,33 @@ describe('文案选择', () => {
 });
 
 describe('响应解析', () => {
+  it.each([
+    {},
+    { source: 'library' },
+    { source: 'library', items: null },
+    { source: 'douban', items: {} },
+    { source: 'none', items: '[]' },
+    { source: 'douban', items: [{ author: '合成作者' }] },
+    { source: 'library', items: [null, 42, { title: '   ' }] },
+  ])('does not report a malformed response as a confirmed miss: %j', (payload) => {
+    const result = parseExactResponse(payload);
+    expect(result).toEqual({
+      source: 'none', items: [], unavailable: true, note: EXACT_UNAVAILABLE_NOTE,
+    });
+    const state = exactReducer({ ...EMPTY_EXACT_STATE, title: '合成书名' }, { type: 'settle', result });
+    expect(showExactEmpty(state)).toBe(true);
+    expect(exactEmptyMessage(result)).toBe(EXACT_UNAVAILABLE_NOTE);
+  });
+
+  it('preserves a confirmed empty response and an explicitly unavailable response', () => {
+    const miss = { source: 'none', items: [], note: EXACT_DOUBAN_MISS_NOTE };
+    expect(parseExactResponse(miss)).toEqual(miss);
+    expect(exactEmptyMessage(parseExactResponse(miss))).toBe(EXACT_DOUBAN_MISS_NOTE);
+    const unavailable = { source: 'none', items: [], unavailable: true, note: EXACT_UNAVAILABLE_NOTE };
+    expect(parseExactResponse(unavailable)).toEqual(unavailable);
+    expect(exactEmptyMessage(parseExactResponse(unavailable))).toBe(EXACT_UNAVAILABLE_NOTE);
+  });
+
   it('仅保留本地 TXT 的合法阅读定位，旧响应和非法定位安全回退', () => {
     const item = { title: '已有正文', author: '测试作者', source: 'library', readAvailability: 'txt' };
     expect(parseExactResponse({ source: 'library', items: [{ ...item, sharedReadTaskId: 88 }] }).items[0].sharedReadTaskId).toBe(88);

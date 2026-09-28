@@ -153,8 +153,14 @@ export function exactEmptyMessage(result: ExactResponse): string {
  * 而不是渲染出半条结果或谎报「没这本书」。
  */
 export function parseExactResponse(payload: unknown): ExactResponse {
-  if (!isRecord(payload)) return { source: 'none', items: [], unavailable: true, note: EXACT_UNAVAILABLE_NOTE };
-  const items = Array.isArray(payload.items) ? payload.items.flatMap(toExactBook) : [];
+  if (!isRecord(payload) || !Array.isArray(payload.items)) {
+    return { source: 'none', items: [], unavailable: true, note: EXACT_UNAVAILABLE_NOTE };
+  }
+  const items = payload.items.flatMap(toExactBook);
+  // 只有服务端明确返回空数组才代表查无结果；非空但全部无效是响应损坏。
+  if (payload.items.length > 0 && items.length === 0) {
+    return { source: 'none', items: [], unavailable: true, note: EXACT_UNAVAILABLE_NOTE };
+  }
   const declared = payload.source;
   const source: ExactSource =
     declared === 'library' || declared === 'douban' || declared === 'none'
