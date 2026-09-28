@@ -13,6 +13,7 @@ import {
   type ExactResponse,
 } from '@/lib/find-exact';
 import { withDbQuotaGuard } from '@/lib/db-quota-guard';
+import { hasPermission } from '@/lib/permissions';
 
 // 精确找书（task-77）：按书名直搜，不是口味召回。
 //
@@ -54,6 +55,7 @@ interface LibraryRow {
   author_match: boolean;
   has_txt: boolean;
   has_online_source: boolean;
+  shared_read_task_id?: number | null;
 }
 
 // douban_id 进 URL 前先确认是纯数字：库里这一列由 verifyBook 写入，但它是 text 列，
@@ -62,7 +64,7 @@ function doubanUrlFor(id: string | null | undefined): string | undefined {
   return typeof id === 'string' && /^\d+$/.test(id) ? `https://book.douban.com/subject/${id}/` : undefined;
 }
 
-function toLibraryItem(row: LibraryRow): ExactBook {
+function toLibraryItem(row: LibraryRow, canRead: boolean): ExactBook {
   const meta = isRecord(row.meta) ? row.meta : {};
   const url = doubanUrlFor(row.douban_id);
   // F10：可读性只据数据推导，不承诺。有完成 TXT → 'txt'；书库行有在线书源 URL →
@@ -76,6 +78,9 @@ function toLibraryItem(row: LibraryRow): ExactBook {
     metadataSource: row.metadata_source === 'labeled_books' ? 'labeled_books' : 'books',
     authorMatch: row.author_match === true,
     readAvailability,
+    ...(canRead && readAvailability === 'txt' && typeof row.shared_read_task_id === 'number'
+      && Number.isInteger(row.shared_read_task_id) && row.shared_read_task_id > 0 && row.shared_read_task_id <= 2_147_483_647
+      ? { sharedReadTaskId: row.shared_read_task_id } : {}),
     ...(url ? { doubanId: row.douban_id as string, doubanUrl: url } : {}),
     rating: typeof row.douban_rating === 'number' ? row.douban_rating : null,
     ratingCount: typeof row.douban_rating_count === 'number' ? row.douban_rating_count : null,
@@ -131,12 +136,20 @@ async function handlePOST(req: NextRequest) {
     const { userId } = access.principal;
     await access.run(ensureSchema);
     const sql = getSql();
+    const canRead = hasPermission(access.principal, 'read');
+    // 注册表是独立部署能力，旧库仍使用 legacy 文件定位；此处不建表、不探测远端文件。
+    const registry = canRead ? await access.run(async () => sql`
+      SELECT to_regclass('book_artifacts') IS NOT NULL
+        AND to_regclass('storage_repositories') IS NOT NULL AS available
+    `) as { available: boolean }[] : [];
 
     // 1) 本地书库：免费即时，命中就不再打豆瓣。
     const rows = await access.run(async () =>
-      exactLibraryBooksForUserQuery(sql, userId, title, author)) as unknown as LibraryRow[];
+      exactLibraryBooksForUserQuery(sql, userId, title, author, {
+        canRead, artifactRegistryAvailable: registry[0]?.available === true,
+      })) as unknown as LibraryRow[];
     if (rows.length > 0) {
-      const response: ExactResponse = { source: 'library', items: rows.map(toLibraryItem) };
+      const response: ExactResponse = { source: 'library', items: rows.map((row) => toLibraryItem(row, canRead)) };
       return NextResponse.json(response);
     }
 

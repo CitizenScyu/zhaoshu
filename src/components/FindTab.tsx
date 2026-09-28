@@ -650,7 +650,7 @@ function ExactBookCard({ item, index }: { item: ExactBook; index: number }) {
             {/* F10：只有确认有正文（已完成 TXT / 有在线书源）才给「直接阅读」；仅有元数据
                 记录的命中不给，避免对无正文记录承诺可读。 */}
             {(item.readAvailability === 'txt' || item.readAvailability === 'online') && (
-              <ReadBookLink title={item.title} author={item.author} from="find" label="直接阅读" />
+              <ReadBookLink taskId={item.sharedReadTaskId} title={item.title} author={item.author} from="find" label="直接阅读" />
             )}
           </div>
 

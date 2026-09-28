@@ -8,8 +8,12 @@ const mocks = vi.hoisted(() => ({
   searchBooks: vi.fn(),
   fetchSubjectRating: vi.fn(),
   chatRobust: vi.fn(),
+  session: vi.fn(),
 }));
 vi.mock('@/lib/db', () => ({ ensureSchema: mocks.ensureSchema, getSql: mocks.getSql }));
+vi.mock('@/lib/auth-session', async (original) => ({
+  ...await original<typeof import('@/lib/auth-session')>(), findSessionByToken: mocks.session,
+}));
 // 只替换两个外部调用；user-data 的查询构造器用真实现，好让「身份键口径」这条断言
 // 落在真正的 SQL 文本/参数上，而不是落在一个被 mock 掉的壳上。
 vi.mock('@/lib/douban', () => ({
@@ -143,6 +147,36 @@ describe('POST /api/find/exact', () => {
     const body = await (await POST(request({ title: '同名书', author: '作者甲' }))).json();
     expect(body.items.map((item: { author: string; authorMatch: boolean; readAvailability: string }) => [item.author, item.authorMatch, item.readAvailability]))
       .toEqual([['作者甲', true, 'unknown'], ['作者乙', false, 'unknown']]);
+  });
+
+  it.each([false, true])('共享 TXT 定位只给有 read 权限的成员（canRead=%s）', async (canRead) => {
+    vi.stubEnv('AUTH_ACCOUNTS_ENABLED', 'true');
+    mocks.session.mockResolvedValue({ userId: 2, role: 'member', canFind: true, canRead, canDownload: false,
+      authMethod: 'password', membersEnabled: true });
+    sql.mockImplementation((query) => query.text.includes('to_regclass') ? [{ available: true }]
+      : query.text.includes('FROM books') ? [{ metadata_source: 'books', id: 7, title: '已有TXT', author: '测试作者',
+        has_txt: true, has_online_source: false, shared_read_task_id: 88,
+        owner: 'synthetic-private-owner', canonical_path: 'synthetic/private.txt' }] : []);
+    const req = new NextRequest('http://localhost/api/find/exact', {
+      method: 'POST', headers: { Cookie: 'nf-dev-session=exact-member', Origin: 'http://localhost',
+        'x-nf-csrf': '1', 'Content-Type': 'application/json' }, body: JSON.stringify({ title: '已有TXT' }),
+    });
+    const response = await POST(req);
+    expect(response.status).toBe(200);
+    const body = await response.json();
+    expect(body.items[0].sharedReadTaskId).toBe(canRead ? 88 : undefined);
+    expect(body.items[0]).not.toHaveProperty('owner');
+    expect(body.items[0]).not.toHaveProperty('canonical_path');
+    expect(db.queries.some((query) => query.text.includes('to_regclass'))).toBe(canRead);
+    expect(mocks.searchBooks).not.toHaveBeenCalled();
+  });
+
+  it('注册表未迁移时不查询新表，保留旧协议任务定位', async () => {
+    libraryRows([{ metadata_source: 'books', id: 7, title: '旧TXT', author: '测试作者',
+      has_txt: true, has_online_source: false, shared_read_task_id: 91 }]);
+    const body = await (await POST(request({ title: '旧TXT' }))).json();
+    expect(body.items[0].sharedReadTaskId).toBe(91);
+    expect(db.queries.find((query) => query.text.includes('FROM books'))?.text).not.toContain('FROM book_artifacts');
   });
 
   it('returns every douban candidate so same-title books can be told apart', async () => {

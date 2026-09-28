@@ -665,15 +665,39 @@ export function feedbackSnapshotForUserQuery(sql: PersonalQuery, userId: number,
 // 输入只归一一次（identityOf），与所有其他 books 身份查询同源。
 const MAX_EXACT_LIBRARY_HITS = 5;
 
-export function exactLibraryBooksForUserQuery(sql: PersonalQuery, userId: number, title: string, author: string) {
+export function exactLibraryBooksForUserQuery(
+  sql: PersonalQuery, userId: number, title: string, author: string,
+  readAccess: { canRead?: boolean; artifactRegistryAvailable?: boolean } = {},
+) {
   requireUserId(userId);
   const book = identityOf(title, author);
+  // 与 reader-server 共享阅读口径一致：done 的 legacy 文件仍交阅读器按原协议定位；
+  // 有注册指针的任务必须指向 published 产物，不能拿失效指针回退成同名 legacy 文件。
+  // artifact 表独立迁移；未建表时只选择无指针任务，不让旧部署的精确搜索查询不存在的表。
+  // 路径条件对应 validateArtifactPath；仓库/分支合法性由现有 schema 约束保证，不向响应带出定位字段。
+  const readableArtifact = readAccess.artifactRegistryAvailable ? sql`(
+    to_jsonb(dt)->>'artifact_id' IS NULL OR EXISTS (
+      SELECT 1 FROM book_artifacts a JOIN storage_repositories r ON r.id = a.repository_id
+      WHERE a.id = (to_jsonb(dt)->>'artifact_id')::bigint AND a.quality_status = 'published'
+        AND a.id BETWEEN 1 AND 9007199254740991 AND a.labeled_book_id = dt.book_id
+        AND a.canonical_path !~ ${'[\\\\\\x00-\\x1f\\x7f]'}
+        AND NOT EXISTS (SELECT 1 FROM unnest(string_to_array(a.canonical_path, '/')) AS segment
+          WHERE segment IN ('', '.', '..'))
+    ))` : sql`to_jsonb(dt)->>'artifact_id' IS NULL`;
+  const booksReadTask = readAccess.canRead ? sql`(SELECT dt.id FROM download_tasks dt
+    WHERE lower(btrim(dt.title)) = lower(btrim(b.title))
+      AND lower(COALESCE(NULLIF(btrim(dt.author), ''), '佚名')) = lower(COALESCE(NULLIF(btrim(b.author), ''), '佚名'))
+      AND dt.status = 'done' AND ${readableArtifact}
+    ORDER BY dt.id DESC LIMIT 1)` : sql`NULL::integer`;
+  const labeledReadTask = readAccess.canRead ? sql`(SELECT dt.id FROM download_tasks dt
+    WHERE dt.book_id = lb.id AND dt.status = 'done' AND ${readableArtifact}
+    ORDER BY dt.id DESC LIMIT 1)` : sql`NULL::integer`;
   // on_shelf 只影响「加入书架」按钮的初始态；books 没有 user 归属，user 维度由
   // recommendations 提供（与 excludedBooksForUserQuery 同源），labeled_books 经身份键
   // 关联到对应 books 行后再查推荐。这里**不**限定 status：书架上任何状态都算「已在书架」，
   // 与 shelfExistsForUserQuery 的口径一致。
   return sql`SELECT metadata_source, id, title, author, douban_id, douban_rating, douban_rating_count, meta,
-      on_shelf, author_match, has_txt, has_online_source
+      on_shelf, author_match, has_txt, has_online_source, shared_read_task_id
     FROM (
       SELECT 'books'::text AS metadata_source, 1 AS source_rank,
         b.id, b.title, b.author, b.douban_id, b.douban_rating, b.douban_rating_count, b.meta,
@@ -684,7 +708,8 @@ export function exactLibraryBooksForUserQuery(sql: PersonalQuery, userId: number
             AND lower(COALESCE(NULLIF(btrim(dt.author), ''), '佚名')) = lower(COALESCE(NULLIF(btrim(b.author), ''), '佚名'))
             AND dt.status = 'done') AS has_txt,
         EXISTS (SELECT 1 FROM labeled_books lb
-          WHERE lb.title_key = b.title_key AND lb.author_key = b.author_key AND lb.source_url <> '') AS has_online_source
+          WHERE lb.title_key = b.title_key AND lb.author_key = b.author_key AND lb.source_url <> '') AS has_online_source,
+        ${booksReadTask} AS shared_read_task_id
       FROM books b WHERE b.title_key = ${book.title}
       UNION ALL
       SELECT 'labeled_books'::text, 0,
@@ -693,7 +718,8 @@ export function exactLibraryBooksForUserQuery(sql: PersonalQuery, userId: number
           WHERE b2.title_key = lb.title_key AND b2.author_key = lb.author_key AND r.user_id = ${userId}),
         (${book.author} = '' OR lb.author_key = ${book.author}),
         EXISTS (SELECT 1 FROM download_tasks dt WHERE dt.book_id = lb.id AND dt.status = 'done'),
-        (lb.source_url <> '')
+        (lb.source_url <> ''),
+        ${labeledReadTask}
       -- 同一身份只出一条：两表都有时以 books 行（带豆瓣元数据）为准，labeled_books
       -- 只补 on_shelf/has_txt/has_online_source；只有 labeled_books 的书才会走这一支。
       FROM labeled_books lb WHERE lb.title_key = ${book.title}

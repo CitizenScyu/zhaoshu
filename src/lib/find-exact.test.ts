@@ -99,6 +99,16 @@ describe('文案选择', () => {
 });
 
 describe('响应解析', () => {
+  it('仅保留本地 TXT 的合法阅读定位，旧响应和非法定位安全回退', () => {
+    const item = { title: '已有正文', author: '测试作者', source: 'library', readAvailability: 'txt' };
+    expect(parseExactResponse({ source: 'library', items: [{ ...item, sharedReadTaskId: 88 }] }).items[0].sharedReadTaskId).toBe(88);
+    for (const sharedReadTaskId of [undefined, null, 0, -1, 1.5, 2_147_483_648, '88', NaN]) {
+      expect(parseExactResponse({ source: 'library', items: [{ ...item, sharedReadTaskId }] }).items[0]).not.toHaveProperty('sharedReadTaskId');
+    }
+    expect(parseExactResponse({ source: 'douban', items: [{ ...item, source: 'douban', sharedReadTaskId: 88 }] }).items[0]).not.toHaveProperty('sharedReadTaskId');
+    expect(parseExactResponse({ source: 'library', items: [{ ...item, readAvailability: 'online', sharedReadTaskId: 88 }] }).items[0]).not.toHaveProperty('sharedReadTaskId');
+  });
+
   it('treats a non-object payload as unreachable rather than as an empty library', () => {
     for (const payload of [null, undefined, 42, 'oops', []]) {
       expect(parseExactResponse(payload)).toEqual({

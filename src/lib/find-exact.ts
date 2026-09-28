@@ -51,6 +51,8 @@ export interface ExactBook {
   authorMatch?: boolean;
   /** 可读性；library 命中必带，douban 为 'unknown'。 */
   readAvailability?: ExactReadAvailability;
+  /** 仅有 read 权限时返回的共享完成任务定位；旧响应缺省时沿用书源入口。 */
+  sharedReadTaskId?: number;
   doubanId?: string;
   doubanUrl?: string;
   rating?: number | null;
@@ -182,6 +184,9 @@ function toExactBook(value: unknown): ExactBook[] {
     ...(metadataSource ? { metadataSource } : {}),
     ...(typeof value.authorMatch === 'boolean' ? { authorMatch: value.authorMatch } : {}),
     ...(readAvailability ? { readAvailability } : {}),
+    ...(value.source === 'library' && readAvailability === 'txt' && typeof value.sharedReadTaskId === 'number'
+      && Number.isInteger(value.sharedReadTaskId) && value.sharedReadTaskId > 0 && value.sharedReadTaskId <= 2_147_483_647
+      ? { sharedReadTaskId: value.sharedReadTaskId } : {}),
     ...(typeof value.doubanId === 'string' && value.doubanId ? { doubanId: value.doubanId } : {}),
     ...(typeof value.doubanUrl === 'string' && value.doubanUrl ? { doubanUrl: value.doubanUrl } : {}),
     rating: typeof value.rating === 'number' && Number.isFinite(value.rating) ? value.rating : null,
