@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import { createElement } from 'react';
 import type { ReactNode } from 'react';
-import { cleanup, render, screen, waitFor } from '@testing-library/react';
+import { act, cleanup, render, screen, waitFor } from '@testing-library/react';
 import { userEvent } from '@testing-library/user-event';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -305,6 +305,57 @@ describe('换源面板扇出:当前源', () => {
 });
 
 describe('换源面板扇出:确认切换必须带 source', () => {
+  it.each(['失败', '目录在途', '正文在途'])('同一候选%s后重新选择会再次确认，旧响应不覆盖且probe复用', async (stage) => {
+    const choices = [candidate('合成备用源', 'https://retry.example')];
+    const normal = fanoutFetch(choices, () => json(probe(choices[0], { status: 'ok', book: book('https://retry.example/book') })));
+    let confirmations = 0;
+    let firstSignal: AbortSignal | undefined;
+    let releaseOld: ((response: Response) => void) | undefined;
+    const apiFetch = vi.fn<ApiFetch>(async (input, init) => {
+      const url = String(input);
+      if (url.startsWith('/api/read/source/index') && url.includes('book_url=')) {
+        confirmations++;
+        if (confirmations === 1) {
+          firstSignal = init?.signal ?? undefined;
+          if (stage === '失败') return json({ error: '合成临时故障', code: 'SOURCE_UNAVAILABLE' }, 503);
+          if (stage === '目录在途') return new Promise<Response>(resolve => { releaseOld = resolve; });
+        }
+      }
+      if (url.includes('/chapter?') && url.includes('session=sess-B')) {
+        if (stage === '正文在途' && confirmations === 1) return new Promise<Response>(resolve => { releaseOld = resolve; });
+        return json(part({ text: '重试成功正文' }));
+      }
+      return normal(input, init);
+    });
+    const user = await openPanel(apiFetch);
+    await waitFor(() => expect(buttonsIn(row('合成备用源')).length).toBe(1));
+    await user.click(buttonsIn(row('合成备用源'))[0]);
+    if (stage === '失败') await screen.findByText('合成临时故障');
+    else await waitFor(() => expect(releaseOld).toBeTypeOf('function'));
+    expect(confirmations).toBe(1);
+    expect(mocks.replace).not.toHaveBeenCalled();
+    // 头部换源入口在确认在途时也可用；面板重挂使用已有成功probe结果。
+    await user.click(screen.getByRole('button', { name: '换源' }));
+    await waitFor(() => expect(buttonsIn(row('合成备用源')).length).toBe(1));
+    await user.click(buttonsIn(row('合成备用源'))[0]);
+    await waitFor(() => expect(confirmations).toBe(2));
+    if (stage !== '失败') expect(firstSignal?.aborted).toBe(true);
+    await screen.findByText('重试成功正文');
+    await waitFor(() => expect(mocks.replace).toHaveBeenCalledTimes(1));
+    expect(probeCalls(normal)).toEqual(['https://retry.example']);
+    if (releaseOld) {
+      await act(async () => { releaseOld!(stage === '目录在途'
+        ? json(catalog({ title: '迟到旧目录' })) : json(part({ text: '迟到旧正文' }))); });
+      expect(screen.queryByText('迟到旧目录')).toBeNull();
+      expect(screen.queryByText('迟到旧正文')).toBeNull();
+      expect(screen.getByText('重试成功正文')).toBeTruthy();
+      expect(mocks.replace).toHaveBeenCalledTimes(1);
+    }
+    const query = new URLSearchParams(String(mocks.replace.mock.calls[0][0]).split('?')[1]);
+    expect(query.get('source')).toBe('https://retry.example');
+    expect(query.get('book_url')).toBe('https://retry.example/book');
+  });
+
   const sources = [candidate('命中源', 'https://ok.example'), candidate('相似源', 'https://similar.example')];
   const handler: ProbeHandler = (url) => json(url === 'https://ok.example'
     ? probe(sources[0], { status: 'ok', book: book('https://ok.example/b/1') })

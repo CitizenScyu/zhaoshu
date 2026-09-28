@@ -67,6 +67,7 @@ export function useReader(session: ReadingSession, apiFetch: ApiFetch, userId: n
     }
     return readerIndexUrl(session);
   });
+  const [confirmationAttempt, setConfirmationAttempt] = useState(0);
   // 进度键按当前用户固定：卸载清理时仍写回旧用户，不会写进下一个身份的键。
   const progressKeyFor = useCallback((index: ReaderIndex) => migrateLegacyIndexProgressKey(index, userId), [userId]);
   const [settings, setSettings] = useState(() => parseReaderSettings(storedValue(READER_SETTINGS_KEY)));
@@ -293,6 +294,7 @@ export function useReader(session: ReadingSession, apiFetch: ApiFetch, userId: n
     const hinted = isPreferredSourceIndexUrl(indexUrl);
     try {
       const index = await responseJson<ReaderIndex & { hintCleared?: boolean }>(await apiFetch(indexUrl, { signal: controller.signal, cache: 'no-store' }));
+      if (controller.signal.aborted || id !== serial.current) return;
       if (!Array.isArray(index.chapters) || !index.chapters.length) throw new RequestError('这本书还没有可阅读的正文。', 422);
       if (hinted && index.hintCleared && session.kind === 'source') forgetSource(session.title, session.author);
       adoptedSwitch.current = null; // 新目录为基线:后续仍可再跟随一次换源
@@ -344,8 +346,10 @@ export function useReader(session: ReadingSession, apiFetch: ApiFetch, userId: n
     } catch (error) {
       // M3 复审 P2:失败路径也要清掉暂存的迁移进度 —— 否则下一次 loadIndex(重试)
       // 会把一次已经失败的换源进度再迁移一遍;且失败时 URL 不变(见 switchSource 注释)。
-      pendingMigration.current = null;
-      if (!controller.signal.aborted && id === serial.current) fail(error);
+      if (!controller.signal.aborted && id === serial.current) {
+        pendingMigration.current = null;
+        fail(error);
+      }
     } finally {
       if (request.current === controller) request.current = null;
       if (!controller.signal.aborted && id === serial.current) setLoading(false);
@@ -362,6 +366,8 @@ export function useReader(session: ReadingSession, apiFetch: ApiFetch, userId: n
       pendingMigration.current = { progress: progress.current, fromIndex: current.index };
     }
     setIndexUrl(confirmedIndexUrl(session.title, session.author, bookUrl, sourceUrl));
+    // 显式重选同一候选也要重试确认；URL 未变不能成为跳过请求的依据。
+    setConfirmationAttempt(value => value + 1);
   }, [session, flushPosition]);
 
   useEffect(() => {
@@ -372,7 +378,7 @@ export function useReader(session: ReadingSession, apiFetch: ApiFetch, userId: n
       request.current?.abort(); flowRequest.current?.abort(); cache.clear(); saveProgress();
       if (scrollFrame.current !== null) cancelAnimationFrame(scrollFrame.current);
     };
-  }, [loadIndex, cache, saveProgress]);
+  }, [loadIndex, cache, saveProgress, confirmationAttempt]);
 
   useEffect(() => {
     const onHidden = () => {
