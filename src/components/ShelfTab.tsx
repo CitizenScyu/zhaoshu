@@ -150,7 +150,9 @@ export default function ShelfTab() {
       // F05：按书移除（book_id），服务端删除该用户这本书的全部推荐行；不再传单条推荐 id。
       const res = await apiFetch(`/api/shelf?bookId=${item.book_id}`, { method: 'DELETE' });
       const data = await res.json().catch(() => ({}));
-      if (!res.ok) throw new Error(data.error || '移除失败');
+      // 删除已提交但响应丢失，或另一页已移除时，目标已经达成；刷新以恢复本地视图。
+      const alreadyRemoved = res.status === 404 && data.code === 'RECOMMENDATION_NOT_FOUND';
+      if (!res.ok && !alreadyRemoved) throw new Error(data.error || '移除失败');
       setRemoveDraft(null);
       setNoteSaved(null);
       await load();
