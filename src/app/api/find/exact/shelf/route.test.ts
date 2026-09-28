@@ -46,6 +46,34 @@ describe('POST /api/find/exact/shelf', () => {
     expect(db.transaction).not.toHaveBeenCalled();
   });
 
+  // author 输入边界（authval42）：非字符串或超长不再静默改成佚名（会错挂身份键、
+  // books 落错行），而是 400 零查询零写入。200 字符仍是合法上限。
+  it.each([
+    ['非字符串数字', 42],
+    ['201 字符串', 'a'.repeat(201)],
+  ])('rejects invalid author (%s) with zero queries and zero writes', async (_label, author) => {
+    const res = await POST(request({ title: '诡秘之主', author }));
+    expect(res.status).toBe(400);
+    expect(await res.json()).toEqual({ error: 'invalid author', code: 'INVALID_AUTHOR' });
+    expect(mocks.ensureSchema).not.toHaveBeenCalled();
+    expect(sql).not.toHaveBeenCalled();
+    expect(db.transaction).not.toHaveBeenCalled();
+  });
+
+  it('accepts an author of exactly 200 characters', async () => {
+    const res = await POST(request({ title: '诡秘之主', author: 'a'.repeat(200) }));
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ ok: true, bookId: 42 });
+  });
+
+  it.each([undefined, null, '', '   '])('falls back to 佚名 for a missing author %j', async (author) => {
+    const res = await POST(request({ title: '诡秘之主', author }));
+    expect(res.status).toBe(200);
+    const insertBook = db.queries.find((query: RecordedQuery) => query.text.includes('INSERT INTO books'));
+    // F09：展示列存原始拼写；空/缺失作者按既有口径走佚名兜底。
+    expect(insertBook?.values).toContain('佚名');
+  });
+
   // 豆瓣候选没有 labeled_books 行（这正是不能复用 /api/shelf 的原因），
   // 所以这里断言走的是通用 (title, author) 写入路径，且身份归一在 user-data 里做。
   it('adds a douban-found book to the shelf through the shared identity path', async () => {

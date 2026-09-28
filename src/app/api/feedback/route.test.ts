@@ -51,6 +51,15 @@ function request(status: string, note: string, extra: Record<string, unknown> = 
   });
 }
 
+// authval42 定向用例：需要精确控制 author 原始值（非字符串/超长/缺失形态）。
+function rawBody(body: Record<string, unknown>) {
+  return new NextRequest('http://localhost/api/feedback', {
+    method: 'POST',
+    headers: { Authorization: 'Bearer feedback-test-owner', 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+}
+
 // 与 db.ts 的批次形状一致：索引 0 route B 补 books、索引 4 是 feedback INSERT、
 // 索引 6（最后）是 F15 的待吸收事件登记。
 function batchResults(insert: unknown[]) {
@@ -164,6 +173,53 @@ describe('POST /api/feedback write-path contract (F15)', () => {
     expect((await POST(request('done', '原因', { expectedFeedbackId: -1 }))).status).toBe(400);
     expect(mocks.ensureSchema).not.toHaveBeenCalled();
     expect(mocks.transaction).not.toHaveBeenCalled();
+  });
+
+  // author 输入边界（authval42）：非字符串或超长不再静默改成佚名（会错挂身份键、
+  // books 落错行），而是 400 零查询零写入；缺失/null/空串/纯空格仍走佚名兜底。
+  it.each([
+    ['非字符串数字', 42],
+    ['201 字符串', 'a'.repeat(201)],
+  ])('rejects invalid author (%s) with zero queries and zero writes', async (_label, author) => {
+    const res = await POST(rawBody({ title: '测试书', author, status: 'done', note: '原因' }));
+    expect(res.status).toBe(400);
+    expect(await res.json()).toEqual({ error: 'invalid author', code: 'INVALID_AUTHOR' });
+    expect(mocks.ensureSchema).not.toHaveBeenCalled();
+    expect(mocks.getFeedbackSnapshotForUser).not.toHaveBeenCalled();
+    expect(mocks.transaction).not.toHaveBeenCalled();
+  });
+
+  it('accepts an author of exactly 200 characters', async () => {
+    const res = await POST(rawBody({ title: '测试书', author: 'a'.repeat(200), status: 'done', note: '原因' }));
+    expect(res.status).toBe(200);
+  });
+
+  it.each([undefined, null, '', '   '])('falls back to 佚名 for a missing author %j', async (author) => {
+    const res = await POST(rawBody({ title: '测试书', author, status: 'done', note: '原因' }));
+    expect(res.status).toBe(200);
+    const insert = mocks.sql.mock.results.find((result) => result.value.text.includes('INSERT INTO books'));
+    // 缺失/空作者按既有口径走佚名兜底，身份键不再错挂。
+    expect(insert?.value.values).toContain('佚名');
+  });
+
+  it('rejects an invalid author on the by-book GET before any schema or query work', async () => {
+    const res = await GET(new NextRequest('http://localhost/api/feedback?title=书&author=' + 'a'.repeat(201), {
+      headers: { Authorization: 'Bearer feedback-test-owner' },
+    }));
+    expect(res.status).toBe(400);
+    expect(await res.json()).toEqual({ error: 'invalid author', code: 'INVALID_AUTHOR' });
+    expect(mocks.ensureSchema).not.toHaveBeenCalled();
+    expect(mocks.getFeedbackSnapshotForUser).not.toHaveBeenCalled();
+    expect(mocks.getSql).not.toHaveBeenCalled();
+  });
+
+  it('keeps the by-book GET working for a 200-character author', async () => {
+    mocks.getFeedbackSnapshotForUser.mockResolvedValue({ version: 0, status: null, note: '' });
+    const res = await GET(new NextRequest('http://localhost/api/feedback?title=书&author=' + 'a'.repeat(200), {
+      headers: { Authorization: 'Bearer feedback-test-owner' },
+    }));
+    expect(res.status).toBe(200);
+    expect(mocks.getFeedbackSnapshotForUser).toHaveBeenCalledWith(1, '书', 'a'.repeat(200));
   });
 
   it('exposes a private read endpoint for FindTab to start from the latest note', async () => {
