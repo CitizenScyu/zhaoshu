@@ -318,7 +318,8 @@ describe('写路径之后读到新值（本实例失效缓存）', () => {
       search_verdict: 'ok', search_checked_at: null, rules_hash: hash,
       engine_semantics_version: Number(hash.split(':', 1)[0]), host: 'c.example', error: '', compile_diagnostics: [],
     };
-    await writeAdmissionRows(getSql(), [row]);
+    transaction.mockResolvedValueOnce([[], [], [], [{ lease_valid: true, written: 1 }]]);
+    await writeAdmissionRows(getSql(), [row], { leaseName: 'admission_lease', generation: '1' });
     expect((await getReadingSources(signal())).map((source) => source.url)).toContain('https://c.example/');
   });
 

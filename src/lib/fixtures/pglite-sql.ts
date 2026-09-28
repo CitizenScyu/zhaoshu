@@ -47,10 +47,10 @@ export function createPGliteSql(pg: PGliteLike) {
     };
     return result as unknown as PGliteTagResult;
   };
-  const transaction = async (build: (query: typeof tag) => PGliteTagResult[]) => {
+  const transaction = async (build: PGliteTagResult[] | ((query: typeof tag) => PGliteTagResult[])) => {
     // builder 收到的 tag 结果**不会被 await**——惰性 tag 在此零 SQL（与生产 neon 同语义），
     // 批内语句统一在 BEGIN 后按序执行。build() 只做 toStatement 拼装。
-    const statements = build(tag);
+    const statements = typeof build === 'function' ? build(tag) : build;
     await pg.exec('BEGIN');
     try {
       const rows = [];

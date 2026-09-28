@@ -10,19 +10,8 @@ import { loadPGlite, type PGliteLike } from './fixtures/pglite';
 import { createPGliteSql } from './fixtures/pglite-sql';
 import { createProductionSchema } from './fixtures/production-schema';
 
-type SqlTag = (parts: TemplateStringsArray, ...values: unknown[]) => Promise<Record<string, unknown>[]>;
-
-function adapter(pg: PGliteLike): SqlTag {
-  return async (parts, ...values) => {
-    let text = '';
-    const params: unknown[] = [];
-    parts.forEach((part, index) => {
-      text += part;
-      if (index < values.length) { params.push(values[index]); text += `$${params.length}`; }
-    });
-    return (await pg.query(text, params)).rows;
-  };
-}
+type SqlTag = ReturnType<typeof createPGliteSql>;
+const lease = { leaseName: 'admission_lease' as const, generation: '1' };
 
 
 // 用真 rulesHash 产出带版本前缀的 rules_hash（形如 `<version>:<hash>`），避免测试自造前缀口径漂移。
@@ -56,15 +45,17 @@ maybe('shuyuan writeAdmissionRows 版本自洽守卫（真库 INSERT 路径）',
 
   beforeEach(async () => {
     pg = new PGliteCtor!();
-    sql = adapter(pg);
+    sql = createPGliteSql(pg);
     await createProductionSchema(createPGliteSql(pg) as never, statement => pg.exec(statement));
+    await sql`INSERT INTO cron_health (name, last_success_at, lease_generation)
+      VALUES ('admission_lease', now() + interval '1 hour', 1)`;
   }, 60_000);
 
   it('同源行（engine_semantics_version = rules_hash 版本前缀）→ 落库', async () => {
     // 前置自证：版本前缀确实是整数，否则测试用例本身失去判别力。
     expect(Number.isInteger(SEED_VERSION)).toBe(true);
-    await writeAdmissionRows(sql as unknown as Parameters<typeof writeAdmissionRows>[0], [row()]);
-    const rows = await sql`SELECT source_url, engine_semantics_version, rules_hash FROM source_admission`;
+    expect(await writeAdmissionRows(sql as unknown as Parameters<typeof writeAdmissionRows>[0], [row()], lease)).toEqual({ written: 1 });
+    const rows = await sql`SELECT source_url, engine_semantics_version, rules_hash FROM source_admission` as Record<string, unknown>[];
     expect(rows).toHaveLength(1);
     expect(rows[0]).toMatchObject({
       source_url: 'https://x.example',
@@ -76,18 +67,18 @@ maybe('shuyuan writeAdmissionRows 版本自洽守卫（真库 INSERT 路径）',
   it('伪造错配行（engine_semantics_version ≠ 版本前缀）→ 抛错且整批不落库', async () => {
     const mismatched = row({ engine_semantics_version: SEED_VERSION + 99 });
     await expect(
-      writeAdmissionRows(sql as unknown as Parameters<typeof writeAdmissionRows>[0], [mismatched]),
+      writeAdmissionRows(sql as unknown as Parameters<typeof writeAdmissionRows>[0], [mismatched], lease),
     ).rejects.toThrow(/版本自查失败/);
-    const rows = await sql`SELECT count(*)::int AS n FROM source_admission`;
+    const rows = await sql`SELECT count(*)::int AS n FROM source_admission` as { n: number }[];
     expect(rows[0].n).toBe(0);
   });
 
   it('rules_hash 无版本前缀 → 抛错且不落库', async () => {
     const noPrefix = row({ rules_hash: 'no-version-prefix' });
     await expect(
-      writeAdmissionRows(sql as unknown as Parameters<typeof writeAdmissionRows>[0], [noPrefix]),
+      writeAdmissionRows(sql as unknown as Parameters<typeof writeAdmissionRows>[0], [noPrefix], lease),
     ).rejects.toThrow(/版本自查失败/);
-    const rows = await sql`SELECT count(*)::int AS n FROM source_admission`;
+    const rows = await sql`SELECT count(*)::int AS n FROM source_admission` as { n: number }[];
     expect(rows[0].n).toBe(0);
   });
 
@@ -96,9 +87,9 @@ maybe('shuyuan writeAdmissionRows 版本自洽守卫（真库 INSERT 路径）',
   it('版本值是版本前缀的真子串（前缀 12 vs 版本 1）→ 抛错且不落库', async () => {
     const subset = row({ rules_hash: '12:deadbeef', engine_semantics_version: 1 });
     await expect(
-      writeAdmissionRows(sql as unknown as Parameters<typeof writeAdmissionRows>[0], [subset]),
+      writeAdmissionRows(sql as unknown as Parameters<typeof writeAdmissionRows>[0], [subset], lease),
     ).rejects.toThrow(/版本自查失败/);
-    const rows = await sql`SELECT count(*)::int AS n FROM source_admission`;
+    const rows = await sql`SELECT count(*)::int AS n FROM source_admission` as { n: number }[];
     expect(rows[0].n).toBe(0);
   });
 
@@ -106,9 +97,9 @@ maybe('shuyuan writeAdmissionRows 版本自洽守卫（真库 INSERT 路径）',
   it('版本值是版本前缀的超串（前缀 1 vs 版本 12）→ 抛错且不落库', async () => {
     const superset = row({ rules_hash: '1:deadbeef', engine_semantics_version: 12 });
     await expect(
-      writeAdmissionRows(sql as unknown as Parameters<typeof writeAdmissionRows>[0], [superset]),
+      writeAdmissionRows(sql as unknown as Parameters<typeof writeAdmissionRows>[0], [superset], lease),
     ).rejects.toThrow(/版本自查失败/);
-    const rows = await sql`SELECT count(*)::int AS n FROM source_admission`;
+    const rows = await sql`SELECT count(*)::int AS n FROM source_admission` as { n: number }[];
     expect(rows[0].n).toBe(0);
   });
 });

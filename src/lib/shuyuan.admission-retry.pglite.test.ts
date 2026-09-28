@@ -13,6 +13,7 @@ import { createProductionSchema } from './fixtures/production-schema';
 import type { RawSource } from './rule-engine/compile-smoke';
 
 type SqlTag = ReturnType<typeof createPGliteSql>;
+const lease = { leaseName: 'admission_lease' as const, generation: '1' };
 
 const HTML_HEADERS = { 'content-type': 'text/html; charset=utf-8' };
 const page = (body: string, status = 200) => new Response(body, { status, headers: HTML_HEADERS });
@@ -44,6 +45,8 @@ maybe('41-B1-RETRY：conn_fail 衰减复测（pglite 真库往返）', () => {
     sql = createPGliteSql(pg);
     // 先建 users 底座（business-schema 的部分表有 users 外键，pglite 空库没有 auth schema）。
     await createProductionSchema(sql as never, statement => pg.exec(statement));
+    await sql`INSERT INTO cron_health (name, last_success_at, lease_generation)
+      VALUES ('admission_lease', now() + interval '1 hour', 1)`;
   }, 120_000);
 
   /** 与 shuyuan.ts readAdmissionRows 同款读回（timestamptz::text）。 */
@@ -115,7 +118,7 @@ maybe('41-B1-RETRY：conn_fail 衰减复测（pglite 真库往返）', () => {
     // 走生产写库路径 upsert（writeAdmissionRows 在 shuyuan.ts，此处用同款 SQL 形状直写会
     // 引入第二份副本；直接 import writeAdmissionRows 即单一真源）。
     const { writeAdmissionRows } = await import('./shuyuan');
-    await writeAdmissionRows(sql as unknown as Parameters<typeof writeAdmissionRows>[0], result.rows);
+    await writeAdmissionRows(sql as unknown as Parameters<typeof writeAdmissionRows>[0], result.rows, lease);
 
     const after = (await readRows()).get(URL_UNDER_TEST)!;
     expect(after.search_ok).toBe(true); // 入池谓词 compile_ok ∧ search_ok IS TRUE 恢复
@@ -131,7 +134,7 @@ maybe('41-B1-RETRY：conn_fail 衰减复测（pglite 真库往返）', () => {
     expect(result.verdicts).toEqual({ conn_fail: 1 });
 
     const { writeAdmissionRows } = await import('./shuyuan');
-    await writeAdmissionRows(sql as unknown as Parameters<typeof writeAdmissionRows>[0], result.rows);
+    await writeAdmissionRows(sql as unknown as Parameters<typeof writeAdmissionRows>[0], result.rows, lease);
 
     const after = (await readRows()).get(URL_UNDER_TEST)!;
     expect(after.search_ok).toBe(false);

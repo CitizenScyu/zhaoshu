@@ -1,5 +1,4 @@
 import { getSql } from '@/lib/db';
-import { recordCronSuccess } from '@/lib/source-health';
 import { isRecord } from '@/lib/sanitize';
 import { createDeadline, raceDeadline, type RequestDeadline } from '@/lib/deadline';
 import { validateSourceUrl, refreshSupportedHosts, supportedHostList, upgradeSourceTemplateUrl } from '@/lib/source-policy';
@@ -1402,8 +1401,9 @@ async function runAdmissionAfterRefresh(
   // 但 phoenix runner（entry.ts --admission）不看开关、不受 Vercel env 约束——开关关时它仍会跑一轮准入。
   // 若尾部按开关跳过领约，就会与 runner 同批并发探测同一批源。故无条件领约：领不到（runner 持约中）静默 return，
   // 与开关开时领不到的行为一致（不抛错、不计失败）。开关关且无并发时能领到、照常 admitRows（行为等同改前）。
-  if (!(await claimAdmissionLease(s, 'refresh', rows.length))) return;
-  await admitRows(s, rows, budget, signal);
+  const lease = await claimAdmissionLease(s, 'refresh', rows.length);
+  if (!lease) return;
+  await admitRows(s, rows, budget, signal, {}, lease);
 }
 
 type AdmissionInputRow = { url: string; source: Record<string, unknown> };
@@ -1413,32 +1413,53 @@ type AdmissionTrigger = 'refresh' | 'round' | 'runner';
 /** 一轮准入的结果摘要（只含计数，可直接作 cron 响应体；不含任何源 URL）。 */
 export type AdmissionRoundSummary =
   | { skipped: 'disabled' | 'lease' | 'no_candidates' | 'failed' }
+  | { skipped: 'lease_lost'; written: 0 }
   | {
     sources: number; candidates: number; surveyRejectedExisting: number; compileOk: number;
     compileRejected: number; probed: number; written: number;
   };
 
 /**
- * 领准入租约（42-admbudget）：刷新尾部与独立轮两处准入入口互斥，防同一批源被并发重复探测。
+ * 领准入租约（42-admbudget；fencecore42 改造为返回代次句柄）。
  * 单条语句原子领取：行不存在 → 插入；已过期 → 抢占；未过期 → WHERE 不成立、RETURNING 空 ⇒ 未领到。
  * 时间全用库端 now()，不受函数实例时钟影响。领取失败（库抖动）按未领到处理——fail-closed：
  * 本轮不探，下一轮再来，绝不在拿不准互斥时并发探测。
+ *
+ * fencecore42：成功领取原子递增 lease_generation 并 RETURNING——返回句柄（generation 十进制字符串，
+ * 禁转 JS Number 防 2^53 精度丢失），最终准入写事务用它做 fencing 校验（见 writeAdmissionRows）。
+ * 旧代次/溢出（generation+1 超 bigint 上限则领取失败关闭）一律拿不到句柄。
  */
-async function claimAdmissionLease(s: Sql, trigger: AdmissionTrigger, sources?: number): Promise<boolean> {
+export type LeaseHandle = { leaseName: typeof ADMISSION_LEASE_ROW; generation: string };
+
+/** 不接受 Number、零、前导零、符号或越界代次；拷贝后再跨 await 使用。 */
+function checkedLeaseHandle(value: unknown): LeaseHandle | null {
+  if (!isRecord(value) || value.leaseName !== ADMISSION_LEASE_ROW
+    || typeof value.generation !== 'string' || !/^[1-9][0-9]{0,18}$/.test(value.generation)
+    || BigInt(value.generation) > BigInt('9223372036854775807')) return null;
+  return { leaseName: ADMISSION_LEASE_ROW, generation: value.generation };
+}
+
+async function claimAdmissionLease(s: Sql, trigger: AdmissionTrigger, sources?: number): Promise<LeaseHandle | null> {
   try {
     const rows = await s`
-      INSERT INTO cron_health (name, last_success_at)
-      VALUES (${ADMISSION_LEASE_ROW}, now() + ${admissionLeaseTtlMs()}::int * interval '1 millisecond')
-      ON CONFLICT (name) DO UPDATE SET last_success_at = EXCLUDED.last_success_at
+      INSERT INTO cron_health (name, last_success_at, lease_generation)
+      VALUES (${ADMISSION_LEASE_ROW}, now() + ${admissionLeaseTtlMs()}::int * interval '1 millisecond', 1)
+      ON CONFLICT (name) DO UPDATE SET
+        last_success_at = EXCLUDED.last_success_at,
+        lease_generation = cron_health.lease_generation + 1
         WHERE cron_health.last_success_at <= now()
-      RETURNING name` as unknown[];
-    if (rows.length > 0) return true;
+          AND cron_health.lease_generation >= 0
+          AND cron_health.lease_generation < 9223372036854775807
+      RETURNING name, lease_generation::text AS generation` as { name: string; generation: string | null }[];
+    const lease = rows.length === 1
+      ? checkedLeaseHandle({ leaseName: rows[0].name, generation: rows[0].generation }) : null;
+    if (lease) return lease;
     // 独立轮领租约时还没读源表，没有 sources 计数可记。
     console.log('shuyuan admission batch', { ...(sources === undefined ? {} : { sources }), skipped: 'lease', trigger });
   } catch (error) {
     console.error('shuyuan admission lease failed', { trigger, reason: safeReason(error) });
   }
-  return false;
+  return null;
 }
 
 /**
@@ -1452,11 +1473,13 @@ export async function runAdmissionRound(parentSignal?: AbortSignal): Promise<Adm
   const signal = parentSignal ? AbortSignal.any([parentSignal, budget.signal]) : budget.signal;
   try {
     const s = getSql();
-    if (!(await claimAdmissionLease(s, 'round'))) return { skipped: 'lease' };
+    const lease = await claimAdmissionLease(s, 'round');
+    if (!lease) return { skipped: 'lease' };
     const stored = await readRows<{ source_url: string; source: Record<string, unknown> }>(s, s`
       SELECT source_url, source FROM shuyuan_sources ORDER BY id`, signal);
     const rows = stored.map((row) => ({ url: row.source_url, source: row.source }));
-    const summary = await admitRows(s, rows, budget, signal);
+    const summary = await admitRows(s, rows, budget, signal, {}, lease);
+    if (signal.aborted) return { skipped: 'failed' };
     const artifact = 'written' in summary && summary.written > 0 ? await publishPoolArtifact(signal) : 'skipped';
     // 独立轮收尾一行：观测「这一轮用了多少、还剩多少」——验证它确实拿的是整份预算而非刷新剩余。
     console.log('shuyuan admission round', { ...summary, artifact, remainingMs: budget.remainingMs });
@@ -1479,11 +1502,13 @@ export async function runAdmissionRunnerRound(budgetMs: number): Promise<Admissi
   const budget = createDeadline(budgetMs);
   try {
     const s = getSql();
-    if (!(await claimAdmissionLease(s, 'runner'))) return { skipped: 'lease' };
+    const lease = await claimAdmissionLease(s, 'runner');
+    if (!lease) return { skipped: 'lease' };
     const stored = await readRows<{ source_url: string; source: Record<string, unknown> }>(s, s`
       SELECT source_url, source FROM shuyuan_sources ORDER BY id`, budget.signal);
     const rows = stored.map((row) => ({ url: row.source_url, source: row.source }));
-    const summary = await admitRows(s, rows, budget, budget.signal, { okPrefix: ADMISSION_PHOENIX_OK_PREFIX });
+    const summary = await admitRows(s, rows, budget, budget.signal, { okPrefix: ADMISSION_PHOENIX_OK_PREFIX }, lease);
+    if (budget.signal.aborted) return { skipped: 'failed' };
     console.log('shuyuan admission round', { ...summary, trigger: 'runner', artifact: 'skipped', remainingMs: budget.remainingMs });
     return summary;
   } finally {
@@ -1493,8 +1518,11 @@ export async function runAdmissionRunnerRound(budgetMs: number): Promise<Admissi
 
 async function admitRows(
   s: Sql, rows: AdmissionInputRow[], budget: RequestDeadline, signal: AbortSignal,
-  options: { okPrefix?: string } = {},
+  options: { okPrefix?: string },
+  lease: LeaseHandle, // fencecore42：必填——无句柄不得写准入（fencing token 从领取方传入）
 ): Promise<AdmissionRoundSummary> {
+  const handle = checkedLeaseHandle(lease);
+  if (!handle) return { skipped: 'lease_lost', written: 0 };
   const declaredHosts = new Set<string>();
   for (const row of rows) {
     try { declaredHosts.add(new URL(row.url).hostname); } catch { /* 上游脏 URL：无法声明 host */ }
@@ -1519,7 +1547,10 @@ async function admitRows(
     // （admission.ts「严禁」注释防的是后者）：compile_ok=false 的旧行照旧不喂，上游改回合规规则时源
     // 重新过初筛成为普通候选，占位行 search_ok=null ⇒ class 0 未测优先，自动回池。
     const frozen = surveyRejected.filter((candidate) => existing.get(candidate.url)?.compile_ok === true);
-    if (candidates.length === 0 && frozen.length === 0) return { skipped: 'no_candidates' };
+    if (candidates.length === 0 && frozen.length === 0) {
+      const write = await writeAdmissionRows(s, [], handle, signal);
+      return 'skipped' in write ? write : { skipped: 'no_candidates' };
+    }
     const result = await runAdmissionBatch({
       candidates: [...candidates, ...frozen], declaredHosts, existing, fetchPage: defaultAdmissionTransport, signal,
       // espfix41：开查询不敏感对照搜索，单探最坏 = 主搜索 + 对照搜索（ADMISSION_PROBE_WORST_MS），止损按它预留。
@@ -1539,11 +1570,12 @@ async function admitRows(
       grandfathered: result.grandfathered,
       probed: result.probed,
     });
-    if (result.rows.length > 0) await writeAdmissionRows(s, result.rows);
+    const write = await writeAdmissionRows(s, result.rows, handle, signal);
+    if ('skipped' in write) return write;
     summary = {
       sources: rows.length, candidates: candidates.length, surveyRejectedExisting: frozen.length,
       compileOk: result.compileOk, compileRejected: result.compileRejected, probed: result.probed,
-      written: result.rows.length,
+      written: write.written,
     };
   } catch (error) {
     // 准入失败只影响本轮准入（§6.3）：该批 next round 重来，刷新本身已成功。
@@ -1559,14 +1591,15 @@ async function admitRows(
   try {
     refreshSupportedHosts(await engineHosts(signal));
   } catch (error) {
-    if (signal.aborted) return summary;
+    if (signal.aborted) return { skipped: 'failed' };
     console.error('shuyuan supported host refresh failed', {
       reason: safeReason(error),
     });
   }
-  // 42-admhealth：admitRows 走到这里即真正跑完一轮（两个入口——刷新尾部与独立轮——都经此函数，
-  // 同记 name='admission' 一行，任一成功即刷新）。recordCronSuccess 自吞异常，不打挂调用方。
-  await recordCronSuccess('admission');
+  // 业务已提交；健康故障不能撤销准入，但健康更新本身仍须同句柄、锁后校验。
+  if (signal.aborted) return { skipped: 'failed' };
+  await recordAdmissionSuccess(s, handle, signal);
+  if (signal.aborted) return { skipped: 'failed' };
   return summary;
 }
 
@@ -1582,25 +1615,93 @@ async function readAdmissionRows(s: Sql, urls: string[], signal: AbortSignal): P
   return new Map(rows.map((row) => [row.source_url, row]));
 }
 
-export async function writeAdmissionRows(s: Sql, rows: AdmissionSourceRow[]): Promise<void> {
+export type AdmissionWriteResult = { written: number } | { skipped: 'lease_lost'; written: 0 };
+
+/**
+ * fencecore42：最终准入写带 fencing——同一非交互事务内「锁租约行 FOR UPDATE + 代次等值 + 锁后
+ * clock_timestamp() 有效期」三重门禁通过才允许整批 UPSERT（guard CTE 门禁产出输入，TOCTOU 无门）。
+ * 旧 holder（租约被抢或已过期）在写前被拒：整批零写入。事务含有限 lock_timeout/statement_timeout，
+ * 失败整批回滚，不重放旧结果。与刷新替换事务（shuyuan.ts:1350 同型结构）一致走 s.transaction([...])。
+ */
+export async function writeAdmissionRows(
+  s: Sql, rows: AdmissionSourceRow[], lease: LeaseHandle, signal?: AbortSignal,
+): Promise<AdmissionWriteResult> {
+  const handle = checkedLeaseHandle(lease);
+  if (!handle) return { skipped: 'lease_lost', written: 0 };
+  signal?.throwIfAborted();
   // 写库前自查：行内 engine_semantics_version 必须与 rules_hash 版本前缀同源（复审 P3 单一真源，
   // 与 scripts/seed-admission.mjs 共用同一判据）。错配即抛、整批不落库，暴露上游口径分裂。
   assertAdmissionVersionConsistent(rows);
-  await s`
+  const batch = s`
+    WITH guard AS MATERIALIZED (
+      SELECT 1 FROM cron_health
+      WHERE name = ${handle.leaseName} AND lease_generation = ${handle.generation}::bigint
+        AND last_success_at > clock_timestamp()
+    ), written AS (
     INSERT INTO source_admission
       (source_url, tier, compile_ok, core_field_mask, search_ok, search_verdict, search_checked_at, rules_hash,
        engine_semantics_version, host, error, compile_diagnostics)
     SELECT source_url, tier, compile_ok, core_field_mask, search_ok, search_verdict, search_checked_at, rules_hash,
            engine_semantics_version, host, error, compile_diagnostics
-    FROM jsonb_to_recordset(${JSON.stringify(rows)}::jsonb)
+    FROM guard CROSS JOIN jsonb_to_recordset(${JSON.stringify(rows)}::jsonb)
       AS t(source_url text, tier text, compile_ok boolean, core_field_mask jsonb, search_ok boolean,
            search_verdict text, search_checked_at timestamptz, rules_hash text,
            engine_semantics_version integer, host text, error text, compile_diagnostics jsonb)
+    WHERE true
     ON CONFLICT (source_url) DO UPDATE SET
       tier = EXCLUDED.tier, compile_ok = EXCLUDED.compile_ok, core_field_mask = EXCLUDED.core_field_mask,
       search_ok = EXCLUDED.search_ok, search_verdict = EXCLUDED.search_verdict,
       search_checked_at = EXCLUDED.search_checked_at, rules_hash = EXCLUDED.rules_hash,
       engine_semantics_version = EXCLUDED.engine_semantics_version,
-      host = EXCLUDED.host, error = EXCLUDED.error, compile_diagnostics = EXCLUDED.compile_diagnostics`;
-  invalidateShuyuanReadCache();
+      host = EXCLUDED.host, error = EXCLUDED.error, compile_diagnostics = EXCLUDED.compile_diagnostics
+    RETURNING 1
+    )
+    SELECT EXISTS (SELECT 1 FROM guard) AS lease_valid,
+           (SELECT count(*)::int FROM written) AS written`;
+  const commit = async (): Promise<AdmissionWriteResult> => {
+    signal?.throwIfAborted();
+    const results = await s.transaction([
+      s`SET LOCAL lock_timeout = '5s'`,
+      s`SET LOCAL statement_timeout = '30s'`,
+      // 独立语句先取得同行锁；下一条 guard 才读取锁后的当前时刻。
+      s`SELECT name FROM cron_health WHERE name = ${handle.leaseName} FOR UPDATE`,
+      batch,
+    ], { isolationLevel: 'ReadCommitted', arrayMode: false, fullResults: false,
+      fetchOptions: signal ? { signal } : undefined });
+    const result = results[3]?.[0] as { lease_valid?: unknown; written?: unknown } | undefined;
+    if (results[3]?.length !== 1 || typeof result?.lease_valid !== 'boolean'
+      || typeof result.written !== 'number' || !Number.isSafeInteger(result.written) || result.written < 0
+      || (!result.lease_valid && result.written !== 0)) throw new Error('invalid admission write result');
+    // 取消只能停止等待。若底层随后确认提交，仍清缓存；不把晚提交回报成本轮成功。
+    if (result.written > 0) invalidateShuyuanReadCache();
+    return result.lease_valid ? { written: result.written } : { skipped: 'lease_lost', written: 0 };
+  };
+  const result = signal ? await raceDeadline(signal, commit) : await commit();
+  signal?.throwIfAborted();
+  return result;
+}
+
+async function recordAdmissionSuccess(s: Sql, lease: LeaseHandle, signal: AbortSignal): Promise<void> {
+  const handle = checkedLeaseHandle(lease);
+  if (!handle || signal.aborted) return;
+  try {
+    await raceDeadline(signal, async () => {
+      signal.throwIfAborted();
+      await s.transaction([
+        s`SET LOCAL lock_timeout = '5s'`,
+        s`SET LOCAL statement_timeout = '30s'`,
+        s`SELECT name FROM cron_health WHERE name = ${handle.leaseName} FOR UPDATE`,
+        s`WITH guard AS MATERIALIZED (
+          SELECT 1 FROM cron_health
+          WHERE name = ${handle.leaseName} AND lease_generation = ${handle.generation}::bigint
+            AND last_success_at > clock_timestamp()
+        )
+        INSERT INTO cron_health (name, last_success_at)
+        SELECT 'admission', clock_timestamp() FROM guard
+        ON CONFLICT (name) DO UPDATE SET last_success_at = EXCLUDED.last_success_at`,
+      ], { isolationLevel: 'ReadCommitted', fetchOptions: { signal } });
+    });
+  } catch (error) {
+    if (!signal.aborted) console.error('cron health write failed', { name: 'admission', reason: safeReason(error) });
+  }
 }
