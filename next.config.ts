@@ -11,6 +11,10 @@ const securityHeaders = [
 ];
 
 const nextConfig: NextConfig = {
+  // 自托管入口（infrasyn-42 M5）：构建产出 .next/standalone/server.js，phoenix 的
+  // zhaoshu-web.service 以它为入口（standalone 不含 public 与 .next/static，须手拷）。
+  // Vercel 构建兼容此键、行为不变。
+  output: "standalone",
   async headers() {
     return [
       {
