@@ -33,6 +33,7 @@ import {
   admissionLeaseTtlMs, admissionOwnCronEnabled, refreshShuyuan, runAdmissionRound, runAdmissionRunnerRound,
 } from './shuyuan';
 import { ADMISSION_PHOENIX_OK_PREFIX, ADMISSION_PROBE_WORST_MS } from './rule-engine/admission';
+import * as poolArtifact from './pool-artifact';
 
 const WRITE_RESERVE_MS = 5_000; // shuyuan.ts 同名常量（未导出）；止损门 = 剩余 > 单探最坏 + 写库预留
 const indexUrl = 'https://www.yckceo.com/yuedu/shuyuans/index.html';
@@ -57,11 +58,11 @@ let stored: { source_url: string; source: Record<string, unknown> }[];
 let admissionSuccessWrite: 'ok' | 'fail';
 
 const queries = () => execute.mock.calls.map(([query]) => query);
-// 租约行 = INSERT INTO cron_health 且首参数是租约行名（带 now()+TTL）；成功行 = 同表但首参数 'admission'（now() upsert）。
+// 租约领取是单句 INSERT；健康写由锁后的 guard CTE 产出 admission 行。
 const leaseQueries = () => queries().filter((query) => query.text.startsWith('INSERT INTO cron_health')
   && query.values[0] === ADMISSION_LEASE_ROW);
-const successQueries = () => queries().filter((query) => query.text.startsWith('INSERT INTO cron_health')
-  && query.values[0] === 'admission');
+const successQueries = () => queries().filter((query) => query.text.startsWith('WITH guard')
+  && query.text.includes('INSERT INTO cron_health'));
 const searches = () => fetchMock.mock.calls.filter(([input]) => SEARCH.test(String(input)));
 const logged = (log: { mock: { calls: unknown[][] } }, message: string) =>
   log.mock.calls.filter(([m]) => m === message).map(([, payload]) => payload);
@@ -72,6 +73,10 @@ beforeEach(() => {
   stored = [];
   admissionSuccessWrite = 'ok';
   execute.mockReset().mockImplementation(async (query) => {
+    if (query.text.startsWith('WITH guard') && query.text.includes('INSERT INTO cron_health')) {
+      if (admissionSuccessWrite === 'fail') throw new Error('database unavailable');
+      return [];
+    }
     if (query.text.startsWith('INSERT INTO cron_health')) {
       // 42-admhealth：成功行 upsert（name='admission'，VALUES (?, now())，无租约 TTL 表达式）与租约行区分。
       if (query.values[0] === 'admission') {
@@ -79,13 +84,21 @@ beforeEach(() => {
         return [];
       }
       if (lease === 'error') throw new Error('database unavailable');
-      return lease === 'claimed' ? [{ name: ADMISSION_LEASE_ROW }] : [];
+      return lease === 'claimed' ? [{ name: ADMISSION_LEASE_ROW, generation: '1' }] : [];
     }
     if (query.text.startsWith('SELECT source_url, source FROM shuyuan_sources ORDER BY id')) return stored;
     if (query.text.startsWith('SELECT count(*)')) return [zeroCounts];
     return [];
   });
-  transaction.mockReset().mockResolvedValue([]);
+  transaction.mockReset().mockImplementation(async (batch) => {
+      if (!batch[2]?.text.startsWith('SELECT name FROM cron_health')) return [];
+      const results = [];
+      for (const query of batch) results.push(await execute(query));
+      if (batch[3].text.includes('INSERT INTO source_admission')) {
+        results[3] = [{ lease_valid: true, written: JSON.parse(batch[3].values[2] as string).length }];
+      }
+      return results;
+    });
   readTransaction.mockReset().mockImplementation(async (queries) => Promise.all(queries.map((query) => execute(query))));
   ensureSchema.mockResolvedValue(undefined);
   getSql.mockReturnValue(Object.assign(sql, { transaction: (queries: Query[], options?: TransactionOptions) =>
@@ -169,8 +182,8 @@ describe('runAdmissionRunnerRound（phoenix runner）', () => {
     const summary = await settled;
     vi.useRealTimers();
     expect(summary).toMatchObject({ sources: 2, candidates: 2, probed: 2, written: 2 });
-    const insert = queries().find((query) => query.text.startsWith('INSERT INTO source_admission'))!;
-    const rows = JSON.parse(insert.values[0] as string) as { source_url: string; search_ok: boolean | null; search_verdict: string; error: string }[];
+    const insert = queries().find((query) => query.text.includes('INSERT INTO source_admission'))!;
+    const rows = JSON.parse(insert.values[2] as string) as { source_url: string; search_ok: boolean | null; search_verdict: string; error: string }[];
     const byUrl = Object.fromEntries(rows.map((row) => [row.source_url, row]));
     expect(byUrl['https://dead0.example/']).toMatchObject({ search_ok: true, search_verdict: 'ok', error: ADMISSION_PHOENIX_OK_PREFIX });
     expect(byUrl['https://dead1.example/']).toMatchObject({ search_ok: false, search_verdict: 'conn_fail' });
@@ -220,13 +233,74 @@ describe('runAdmissionRunnerRound（phoenix runner）', () => {
     await vi.advanceTimersByTimeAsync(ADMISSION_ROUND_BUDGET_MS + 60_000);
     await settled;
     vi.useRealTimers();
-    const insert = queries().find((query) => query.text.startsWith('INSERT INTO source_admission'))!;
-    const [row] = JSON.parse(insert.values[0] as string) as { search_ok: boolean | null; search_verdict: string; error: string }[];
+    const insert = queries().find((query) => query.text.includes('INSERT INTO source_admission'))!;
+    const [row] = JSON.parse(insert.values[2] as string) as { search_ok: boolean | null; search_verdict: string; error: string }[];
     expect(row).toMatchObject({ search_ok: true, search_verdict: 'ok', error: '' });
   });
 });
 
 describe('runAdmissionRound：独立预算', () => {
+  it.each([{}, { name: ADMISSION_LEASE_ROW, generation: 1 }, { name: 'admission', generation: '1' }])(
+    'claim RETURNING 非法句柄 %j 时失败关闭、不读源表', async (returned) => {
+      execute.mockResolvedValueOnce([returned]);
+      expect(await runAdmissionRound()).toEqual({ skipped: 'lease' });
+      expect(queries()).toHaveLength(1);
+      expect(transaction).not.toHaveBeenCalled();
+    },
+  );
+
+  it('数据库实际 written=0 时不按探测输入数报成功写入、不发布', async () => {
+    stored = [{ source_url: 'https://dead0.example/', source: deadSource(0) }];
+    fetchMock.mockRejectedValue(new Error('synthetic offline'));
+    transaction.mockResolvedValueOnce([[], [], [], [{ lease_valid: true, written: 0 }]]);
+    const publish = vi.spyOn(poolArtifact, 'writePoolArtifactFile');
+    expect(await runAdmissionRound()).toMatchObject({ candidates: 1, written: 0 });
+    expect(successQueries()).toHaveLength(1);
+    expect(publish).not.toHaveBeenCalled();
+  });
+
+  it('空源表在最终 guard 丢约时返回 lease_lost，不能伪装 no_candidates', async () => {
+    transaction.mockResolvedValueOnce([[], [], [], [{ lease_valid: false, written: 0 }]]);
+    expect(await runAdmissionRound()).toEqual({ skipped: 'lease_lost', written: 0 });
+    expect(successQueries()).toHaveLength(0);
+  });
+
+  it('取消先于最终 SQL 响应：晚完成不能恢复成功、推进健康或发布', async () => {
+    stored = [{ source_url: 'https://dead0.example/', source: deadSource(0) }];
+    fetchMock.mockRejectedValue(new Error('synthetic offline'));
+    const controller = new AbortController();
+    let entered!: () => void;
+    const started = new Promise<void>((resolve) => { entered = resolve; });
+    let complete!: (value: unknown[][]) => void;
+    const pendingSql = new Promise<unknown[][]>((resolve) => { complete = resolve; });
+    transaction.mockImplementationOnce(async () => { entered(); return pendingSql; });
+    const publish = vi.spyOn(poolArtifact, 'writePoolArtifactFile');
+    const pending = runAdmissionRound(controller.signal);
+    await started;
+    controller.abort();
+    expect(await pending).toEqual({ skipped: 'failed' });
+    complete([[], [], [], [{ lease_valid: true, written: 1 }]]);
+    await pendingSql;
+    await Promise.resolve();
+    expect(transaction).toHaveBeenCalledTimes(1);
+    expect(successQueries()).toHaveLength(0);
+    expect(publish).not.toHaveBeenCalled();
+  });
+
+  it('取消发生于产物发布等待期间时不返回成功 summary', async () => {
+    stored = [{ source_url: 'https://dead0.example/', source: deadSource(0) }];
+    fetchMock.mockRejectedValue(new Error('synthetic offline'));
+    vi.stubEnv('SHUYUAN_POOL_ARTIFACT', '1');
+    vi.stubEnv('SHUYUAN_POOL_ARTIFACT_PATH', 'synthetic-pool.json');
+    const controller = new AbortController();
+    vi.spyOn(poolArtifact, 'writePoolArtifactFile').mockImplementation(async () => {
+      controller.abort();
+      return 'written';
+    });
+    expect(await runAdmissionRound(controller.signal)).toEqual({ skipped: 'failed' });
+    expect(poolArtifact.writePoolArtifactFile).toHaveBeenCalledTimes(1);
+  });
+
   it('预算与刷新无关：40 个死站探出的次数 > 整份刷新预算能容纳的上限，且全部在自己的 240s 内止损', async () => {
     vi.useFakeTimers();
     vi.stubEnv('ADMISSION_MAX_PROBES', '40');
@@ -253,8 +327,8 @@ describe('runAdmissionRound：独立预算', () => {
     expect(startsAt.length).toBeGreaterThan(refreshCeiling);
     expect(startsAt.at(-1)!).toBeLessThanOrEqual(ADMISSION_ROUND_BUDGET_MS - ADMISSION_PROBE_WORST_MS - WRITE_RESERVE_MS);
     expect(summary).toMatchObject({ sources: 40, candidates: 40, probed: startsAt.length, written: 40 });
-    const insert = queries().find((query) => query.text.startsWith('INSERT INTO source_admission'));
-    expect(JSON.parse(insert!.values[0] as string)).toHaveLength(40);
+    const insert = queries().find((query) => query.text.includes('INSERT INTO source_admission'));
+    expect(JSON.parse(insert!.values[2] as string)).toHaveLength(40);
     const [round] = logged(log, 'shuyuan admission round') as { remainingMs: number; artifact: string }[];
     expect(round).toMatchObject({ probed: startsAt.length, written: 40, artifact: 'skipped' });
     expect(round.remainingMs).toBeGreaterThanOrEqual(WRITE_RESERVE_MS);
@@ -270,7 +344,9 @@ describe('runAdmissionRound：独立预算', () => {
     expect(claim.values).toEqual([ADMISSION_LEASE_ROW, ADMISSION_LEASE_TTL_MS]);
     expect(claim.text).toContain("now() + ?::int * interval '1 millisecond'");
     expect(claim.text).toContain('ON CONFLICT (name) DO UPDATE SET last_success_at = EXCLUDED.last_success_at');
-    expect(claim.text).toMatch(/WHERE cron_health\.last_success_at <= now\(\) RETURNING name$/);
+    expect(claim.text).toContain('WHERE cron_health.last_success_at <= now()');
+    expect(claim.text).toContain('lease_generation = cron_health.lease_generation + 1');
+    expect(claim.text).toContain('RETURNING name, lease_generation::text AS generation');
     // TTL 须覆盖任一持有者的最长存活（路由 maxDuration 295s）。
     expect(ADMISSION_LEASE_TTL_MS).toBeGreaterThanOrEqual(295_000);
   });
@@ -300,7 +376,8 @@ describe('runAdmissionRound：独立预算', () => {
     const success = successQueries();
     expect(success).toHaveLength(1);
     // 成功行是 now() upsert，不是租约的「now() + TTL」——两者都借 cron_health 表，语义必须分开。
-    expect(success[0].text).toContain('ON CONFLICT (name) DO UPDATE SET last_success_at = now()');
+    expect(success[0].text).toContain('ON CONFLICT (name) DO UPDATE SET last_success_at = EXCLUDED.last_success_at');
+    expect(success[0].text).toContain("SELECT 'admission', clock_timestamp() FROM guard");
     expect(success[0].text).not.toContain('interval');
   });
 
@@ -381,7 +458,7 @@ describe('刷新尾部准入与租约', () => {
     // 刷新本身照常成功（准入异常/跳过不终结刷新）。
     expect(outcome).toBe('resolved');
     expect(searches()).toHaveLength(0);
-    expect(queries().some((query) => query.text.startsWith('INSERT INTO source_admission'))).toBe(false);
+    expect(queries().some((query) => query.text.includes('INSERT INTO source_admission'))).toBe(false);
     // 跳过（没真正跑准入）⇒ 不记成功行。
     expect(successQueries()).toHaveLength(0);
     expect(logged(log, 'shuyuan admission batch')).toEqual([{ sources: 2, skipped: 'lease', trigger: 'refresh' }]);
@@ -392,7 +469,7 @@ describe('刷新尾部准入与租约', () => {
     expect(outcome).toBe('resolved');
     const success = successQueries();
     expect(success).toHaveLength(1);
-    expect(success[0].values).toEqual(['admission']);
+    expect(success[0].values).toEqual([ADMISSION_LEASE_ROW, '1']);
   });
 
   it('开关开 + 领到租约：照常探测', async () => {
@@ -410,7 +487,7 @@ describe('刷新尾部准入与租约', () => {
     const { outcome, log } = await runRefresh();
     expect(outcome).toBe('resolved');
     expect(searches()).toHaveLength(0);
-    expect(queries().some((query) => query.text.startsWith('INSERT INTO source_admission'))).toBe(false);
+    expect(queries().some((query) => query.text.includes('INSERT INTO source_admission'))).toBe(false);
     // 跳过（没真正跑准入）⇒ 不记成功行。
     expect(successQueries()).toHaveLength(0);
     expect(logged(log, 'shuyuan admission batch')).toEqual([{ sources: 2, skipped: 'lease', trigger: 'refresh' }]);

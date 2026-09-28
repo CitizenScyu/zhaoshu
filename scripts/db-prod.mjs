@@ -132,9 +132,15 @@ export async function runProdMigrate(client, migrations, mode) {
     runtimeColumns: { ok: before.runtimeColumns.ok, problems: before.runtimeColumns.problems, extra: before.runtimeColumns.extra,
       absentTables: before.runtimeColumns.absentTables },
   };
+  // 0004 专门为既有 cron_health 补此列；待执行时允许缺列进入迁移，
+  // 已存在但形状错误、或已登记 v4 后丢列仍拒绝。check 本身始终要求完整新结构。
+  const addsLeaseGeneration = before.ledger.pending.some((item) =>
+    item.version === 4 && item.name === '0004_admission_lease_generation.sql');
+  const columnProblems = before.runtimeColumns.problems.filter((item) => !(addsLeaseGeneration
+    && item.kind === 'missing' && item.table === 'cron_health' && item.column === 'lease_generation'));
   const refusals = [
     ...before.ledger.errors.map((item) => item.message),
-    ...before.runtimeColumns.problems.map(describeColumnProblem),
+    ...columnProblems.map(describeColumnProblem),
     ...unadoptedRefusal(before.report),
   ];
   if (refusals.length) return { ...base, status: 'refused', refusals };

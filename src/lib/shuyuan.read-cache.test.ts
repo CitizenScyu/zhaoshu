@@ -291,6 +291,43 @@ describe('缓存不得改变未缓存时的可见行为（host 门，41-xferfix 
 });
 
 describe('写路径之后读到新值（本实例失效缓存）', () => {
+  it('丢约或正常空提交不清缓存；取消后 SQL 晚确认提交才清缓存', async () => {
+    const lease = { leaseName: 'admission_lease' as const, generation: '1' };
+    expect(await getReadingSources(signal())).toHaveLength(3);
+    db.hosts = [...db.hosts, { host: 'c.example' }];
+    db.engine = [...db.engine, engineRowAt('c.example')];
+    transaction.mockResolvedValueOnce([[], [], [], [{ lease_valid: false, written: 0 }]]);
+    expect(await writeAdmissionRows(getSql(), [], lease)).toEqual({ skipped: 'lease_lost', written: 0 });
+    expect(await getReadingSources(signal())).toHaveLength(3);
+    transaction.mockResolvedValueOnce([[], [], [], [{ lease_valid: true, written: 0 }]]);
+    expect(await writeAdmissionRows(getSql(), [], lease)).toEqual({ written: 0 });
+    expect(await getReadingSources(signal())).toHaveLength(3);
+
+    const hash = rulesHash(engineItemAt('c.example'));
+    const row: AdmissionSourceRow = {
+      source_url: 'https://c.example', tier: 'M1', compile_ok: true, core_field_mask: {}, search_ok: true,
+      search_verdict: 'ok', search_checked_at: null, rules_hash: hash,
+      engine_semantics_version: Number(hash.split(':', 1)[0]), host: 'c.example', error: '', compile_diagnostics: [],
+    };
+    let complete!: (value: unknown[][]) => void;
+    let entered!: () => void;
+    const started = new Promise<void>((resolve) => { entered = resolve; });
+    const pendingSql = new Promise<unknown[][]>((resolve) => { complete = resolve; });
+    transaction.mockImplementationOnce(async () => { entered(); return pendingSql; });
+    const controller = new AbortController();
+    const pending = writeAdmissionRows(getSql(), [row], lease, controller.signal);
+    const cancelled = expect(pending).rejects.toThrow();
+    await started;
+    controller.abort();
+    await cancelled;
+    expect(await getReadingSources(signal())).toHaveLength(3);
+    complete([[], [], [], [{ lease_valid: true, written: 1 }]]);
+    await pendingSql;
+    await Promise.resolve();
+    await Promise.resolve();
+    expect((await getReadingSources(signal())).map((source) => source.url)).toContain('https://c.example/');
+  });
+
   it('disableShuyuanSource ⇒ 下一次池合成重读，被禁用源出池', async () => {
     expect(await getReadingSources(signal())).toHaveLength(3);
     db.engine = [engineRowAt('a.example', { disabled_at: '2026-09-25T00:00:00Z' }), engineRowAt('b.example')];

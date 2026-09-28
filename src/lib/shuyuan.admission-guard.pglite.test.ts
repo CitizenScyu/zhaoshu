@@ -3,7 +3,7 @@
 // 真实写库路径的透传：同源行落库、伪造错配（engine_semantics_version ≠ rules_hash 版本前缀）
 // 抛错且整批不落库——把「by construction」的一致性钉死在写库边界，不再只靠 --selftest 直调函数。
 
-import { beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { rulesHash, type AdmissionSourceRow } from './rule-engine/admission';
 import { writeAdmissionRows } from './shuyuan';
 import { loadPGlite, type PGliteLike } from './fixtures/pglite';
@@ -50,6 +50,77 @@ maybe('shuyuan writeAdmissionRows 版本自洽守卫（真库 INSERT 路径）',
     await sql`INSERT INTO cron_health (name, last_success_at, lease_generation)
       VALUES ('admission_lease', now() + interval '1 hour', 1)`;
   }, 60_000);
+
+  afterEach(async () => { await pg.close(); });
+
+  const lost = { skipped: 'lease_lost', written: 0 };
+  const write = (sql: SqlTag, rows: AdmissionSourceRow[], handle: unknown = lease) =>
+    writeAdmissionRows(sql as never, rows, handle as never);
+
+  it('运行期缺句柄、错误名称、非 canonical/越界/Number 代次全部拒绝且不发 SQL', async () => {
+    const unexpectedSql = vi.fn(() => { throw new Error('invalid handle reached SQL'); });
+    const invalid = [undefined, null, {}, { ...lease, leaseName: 'admission' },
+      ...['0', '-1', '+1', '01', '1.0', '1e3', ' 1', '1 ', '', '9223372036854775808', 1, 9007199254740992]
+        .map((generation) => ({ ...lease, generation }))];
+    for (const handle of invalid) {
+      expect(await writeAdmissionRows(unexpectedSql as never, [row()], handle as never)).toEqual(lost);
+      expect(await writeAdmissionRows(unexpectedSql as never, [], handle as never)).toEqual(lost);
+    }
+    expect(unexpectedSql).not.toHaveBeenCalled();
+  });
+
+  it('空批次仍判权：有效是 written=0；旧代次、过期、丢行均明确 lease_lost', async () => {
+    expect(await write(sql, [])).toEqual({ written: 0 });
+    expect(await write(sql, [], { ...lease, generation: '2' })).toEqual(lost);
+    await sql`UPDATE cron_health SET last_success_at = clock_timestamp() - interval '1 second'`;
+    expect(await write(sql, [])).toEqual(lost);
+    await sql`DELETE FROM cron_health`;
+    expect(await write(sql, [row()])).toEqual(lost);
+  });
+
+  it('超 JS 安全整数的相邻代次不合并；BIGINT 上限仍可作为有效现有句柄', async () => {
+    await sql`UPDATE cron_health SET lease_generation = 9007199254740993`;
+    expect(await write(sql, [row()], { ...lease, generation: '9007199254740992' })).toEqual(lost);
+    expect(await write(sql, [row()], { ...lease, generation: '9007199254740993' })).toEqual({ written: 1 });
+    await sql`UPDATE cron_health SET lease_generation = 9223372036854775807`;
+    expect(await write(sql, [row()], { ...lease, generation: '9223372036854775807' })).toEqual({ written: 1 });
+  });
+
+  it.each([
+    ['phoenix_ok:', ''], ['', 'phoenix_ok:'],
+  ])('迟到旧结果 %s 不能覆盖新结果 %s（单连接顺序反例）', async (oldError, newError) => {
+    await sql`UPDATE cron_health SET lease_generation = 2`;
+    expect(await write(sql, [row({ error: newError })], { ...lease, generation: '2' })).toEqual({ written: 1 });
+    expect(await write(sql, [row({ error: oldError })])).toEqual(lost);
+    const rows = await sql`SELECT error FROM source_admission` as { error: string }[];
+    expect(rows).toEqual([{ error: newError }]);
+  });
+
+  it('缺 generation 列按 SQL 错误拒绝，绝不退回无围栏写入', async () => {
+    await sql`ALTER TABLE cron_health DROP COLUMN lease_generation`;
+    await expect(write(sql, [row()])).rejects.toMatchObject({ code: '42703' });
+    expect((await pg.query('SELECT * FROM source_admission')).rows).toEqual([]);
+  });
+
+  it('RETURNING 统计实际写数：触发器跳过一行时不能按输入两行记成功', async () => {
+    await pg.exec(`CREATE FUNCTION skip_admission() RETURNS trigger LANGUAGE plpgsql AS $$
+      BEGIN IF NEW.source_url = 'https://skip.example' THEN RETURN NULL; END IF; RETURN NEW; END $$;
+      CREATE TRIGGER skip_admission BEFORE INSERT ON source_admission FOR EACH ROW EXECUTE FUNCTION skip_admission();`);
+    expect(await write(sql, [row(), row({ source_url: 'https://skip.example' })])).toEqual({ written: 1 });
+    expect((await pg.query('SELECT * FROM source_admission')).rows).toHaveLength(1);
+  });
+
+  it('批中约束失败整批回滚；任意 22012 不冒充 lease_lost', async () => {
+    await sql`ALTER TABLE source_admission ADD CHECK (host <> 'reject.example')`;
+    await expect(write(sql, [row(), row({ source_url: 'https://second.example', host: 'reject.example' })]))
+      .rejects.toMatchObject({ code: '23514' });
+    expect((await pg.query('SELECT * FROM source_admission')).rows).toEqual([]);
+    await pg.exec(`CREATE FUNCTION fail_admission() RETURNS trigger LANGUAGE plpgsql AS $$
+      BEGIN PERFORM 1 / 0; RETURN NEW; END $$;
+      CREATE TRIGGER fail_admission BEFORE INSERT ON source_admission FOR EACH ROW EXECUTE FUNCTION fail_admission();`);
+    await expect(write(sql, [row()])).rejects.toMatchObject({ code: '22012' });
+    expect((await pg.query('SELECT * FROM source_admission')).rows).toEqual([]);
+  });
 
   it('同源行（engine_semantics_version = rules_hash 版本前缀）→ 落库', async () => {
     // 前置自证：版本前缀确实是整数，否则测试用例本身失去判别力。

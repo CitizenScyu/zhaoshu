@@ -87,4 +87,23 @@ maybe('0003 四表与运行时建表同构（逐列比对，真 SQL）', () => {
     await initializeBusinessSchema(createPGliteSql(viaMigration) as never);
     expect(await Promise.all(RUNTIME_TABLES.map((table) => shapeOf(viaMigration, table)))).toEqual(before);
   }, 60_000);
+
+  it('0004 给旧行补默认代次；直接重跑迁移 SQL 和运行期 DDL 都不重置既有代次', async () => {
+    const pg = new PGliteCtor!();
+    try {
+      const migrations = await loadMigrations();
+      await applyMigration(createPGliteClient(pg), migrations.filter(({ version }) => version <= 3));
+      await pg.query(`INSERT INTO cron_health (name, last_success_at) VALUES ('admission_lease', now())`);
+      const migration = migrations.find(({ version }) => version === 4)!;
+      await pg.exec(migration.sql);
+      expect((await pg.query(`SELECT lease_generation::text AS generation FROM cron_health`)).rows)
+        .toEqual([{ generation: '0' }]);
+      await pg.query(`UPDATE cron_health SET lease_generation = 9007199254740993`);
+      await pg.exec(migration.sql);
+      await runAuthMigration(createPGliteSql(pg), 'apply');
+      await initializeBusinessSchema(createPGliteSql(pg) as never);
+      expect((await pg.query(`SELECT lease_generation::text AS generation FROM cron_health`)).rows)
+        .toEqual([{ generation: '9007199254740993' }]);
+    } finally { await pg.close(); }
+  }, 60_000);
 });

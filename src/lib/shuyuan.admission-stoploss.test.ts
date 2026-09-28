@@ -41,11 +41,19 @@ describe('41-ADMIT-CONC-FIX:refreshShuyuan 准入逐探止损(端到端,c 缺省
     // admlfix42：刷新尾部无条件领准入租约；默认领到（返回租约行）使准入照常跑。
     execute.mockReset().mockImplementation(async (query) => {
       if (query.text.startsWith('INSERT INTO cron_health') && query.values[0] === ADMISSION_LEASE_ROW) {
-        return [{ name: ADMISSION_LEASE_ROW }];
+        return [{ name: ADMISSION_LEASE_ROW, generation: '1' }];
       }
       return query.text.startsWith('SELECT count(*)') ? [zeroCounts] : [];
     });
-    transaction.mockReset().mockResolvedValue([]);
+    transaction.mockReset().mockImplementation(async (batch) => {
+      if (!batch[2]?.text.startsWith('SELECT name FROM cron_health')) return [];
+      const results = [];
+      for (const query of batch) results.push(await execute(query));
+      if (batch[3].text.includes('INSERT INTO source_admission')) {
+        results[3] = [{ lease_valid: true, written: JSON.parse(batch[3].values[2] as string).length }];
+      }
+      return results;
+    });
     readTransaction.mockReset().mockImplementation(async (queries) => Promise.all(queries.map((query) => execute(query))));
     ensureSchema.mockResolvedValue(undefined);
     getSql.mockReturnValue(Object.assign(sql, { transaction: (queries: Query[], options?: TransactionOptions) =>
@@ -102,8 +110,8 @@ describe('41-ADMIT-CONC-FIX:refreshShuyuan 准入逐探止损(端到端,c 缺省
     );
     await vi.advanceTimersByTimeAsync(REFRESH_BUDGET_MS + 60_000);
     const outcome = await settled;
-    const insert = execute.mock.calls.find(([query]) => query.text.startsWith('INSERT INTO source_admission'));
-    const written = insert ? (JSON.parse(insert[0].values[0] as string) as { search_verdict: string }[]) : [];
+    const insert = execute.mock.calls.find(([query]) => query.text.includes('INSERT INTO source_admission'));
+    const written = insert ? (JSON.parse(insert[0].values[2] as string) as { search_verdict: string }[]) : [];
     const batchLog = log.mock.calls.find(([message]) => message === 'shuyuan admission batch');
     // 基点 3059eb5 实测:resolved、搜索 15 次(末次 t=165s)、20 行(15 conn_fail + 5 占位)、有 batch 日志。
     // espfix41:开对照搜索后止损按单探最坏 ADMISSION_PROBE_WORST_MS(16.35s)预留,剩 >21.35s 才起探 ⇒

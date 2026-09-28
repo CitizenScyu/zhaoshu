@@ -129,7 +129,7 @@ describe('planMigrations（纯函数）', () => {
   it('plannedLedgerWrites：每个待执行版本一行记账，0001 自带的 auth 记账 1–4 一并列出', async () => {
     const migrations = await loadMigrations();
     const writes = plannedLedgerWrites(planMigrations([], migrations).pending, migrations);
-    expect(writes.filter((item) => item.table === 'schema_migrations').map((item) => item.version)).toEqual([1, 2, 3]);
+    expect(writes.filter((item) => item.table === 'schema_migrations').map((item) => item.version)).toEqual([1, 2, 3, 4]);
     expect(writes.filter((item) => item.table === 'auth_schema_migrations')).toEqual([
       { table: 'auth_schema_migrations', byVersion: 1, values: '(1),(2),(3),(4)', onConflict: 'DO NOTHING' },
     ]);
@@ -234,28 +234,28 @@ maybe('PGlite 真库', () => {
     await applyMigration(createPGliteClient(viaMigration), await load());
     const migrated = await runProdCheck(createPGliteClient(viaMigration), await load());
     expect(migrated.runtimeColumns).toMatchObject({ ok: true, problems: [], extra: [], absentTables: [] });
-    expect(migrated.runtimeColumns.rows).toHaveLength(35);
+    expect(migrated.runtimeColumns.rows).toHaveLength(36);
   }, 120_000);
 
-  it('dry-run 零写入：生产形态只列出 v3 与它的记账行，库指纹不变', async () => {
+  it('dry-run 零写入：生产形态列出 v3/v4 与记账行，库指纹不变', async () => {
     const pg = await prodLike();
     const before = await fingerprint(pg);
     const report = await runProdMigrate(createPGliteClient(pg), await load(), 'dry-run');
     expect(report.status).toBe('dry-run');
-    expect(report.ledger.pending.map((item: { version: number }) => item.version)).toEqual([3]);
-    expect(report.ledgerWrites).toEqual([{ table: 'schema_migrations', version: 3, name: '0003_runtime_tables.sql',
-      checksum: (await load()).find((item) => item.version === 3)!.checksum }]);
+    expect(report.ledger.pending.map((item: { version: number }) => item.version)).toEqual([3, 4]);
+    expect(report.ledgerWrites).toEqual((await load()).filter(({ version }) => version >= 3)
+      .map(({ version, name, checksum }) => ({ table: 'schema_migrations', version, name, checksum })));
     expect(await fingerprint(pg)).toEqual(before);
   }, 120_000);
 
   it('dry-run 零写入：空库（冷建库）不建 schema_migrations、不建任何表', async () => {
     const pg = new PGliteCtor!();
     const report = await runProdMigrate(createPGliteClient(pg), await load(), 'dry-run');
-    expect(report.ledger.pending.map((item: { version: number }) => item.version)).toEqual([1, 2, 3]);
+    expect(report.ledger.pending.map((item: { version: number }) => item.version)).toEqual([1, 2, 3, 4]);
     expect((await pg.query(`SELECT count(*)::int AS n FROM information_schema.tables WHERE table_schema = 'public'`)).rows[0].n).toBe(0);
   }, 60_000);
 
-  it('apply：只补 v3 记账，v1/v2 行原样；随后 db:check:prod 退出码 0；再 apply 空转', async () => {
+  it('apply：补 v3/v4 记账，v1/v2 行原样；随后 db:check:prod 退出码 0；再 apply 空转', async () => {
     const pg = await prodLike();
     const client = createPGliteClient(pg);
     const list = await load();
@@ -266,7 +266,7 @@ maybe('PGlite 真库', () => {
     const applied = await runProdMigrate(client, list, 'apply');
     expect(applied.status).toBe('applied');
     expect(applied.versions.map((item: { version: number; status: string }) => [item.version, item.status]))
-      .toEqual([[1, 'unchanged'], [2, 'unchanged'], [3, 'applied']]);
+      .toEqual([[1, 'unchanged'], [2, 'unchanged'], [3, 'applied'], [4, 'applied']]);
     expect(applied.after).toMatchObject({ ok: true, checksumOk: true, authVersionOk: true, runtimeColumnsOk: true });
     const ledgerAfter = await ledgerOf(pg);
     expect(ledgerAfter.slice(0, 2)).toEqual(ledgerBefore);
@@ -349,8 +349,8 @@ maybe('PGlite 真库', () => {
 
     it('库版本高于代码（版本倒退）', async () => {
       const pg = await prodLike();
-      await pg.query(`INSERT INTO schema_migrations(version, name, checksum) VALUES (4, '0004_future.sql', $1)`, ['d'.repeat(64)]);
-      await expectRefused(pg, await load(), /库已登记版本 4，高于代码的最新版本 3/);
+      await pg.query(`INSERT INTO schema_migrations(version, name, checksum) VALUES (5, '0005_future.sql', $1)`, ['d'.repeat(64)]);
+      await expectRefused(pg, await load(), /库已登记版本 5，高于代码的最新版本 4/);
     }, 120_000);
 
     it('库里有代码不认识的版本', async () => {
@@ -366,6 +366,23 @@ maybe('PGlite 真库', () => {
       await expectRefused(pg, await load(), /source_admission\.search_verdict 与 0003 声明不一致/);
     }, 120_000);
 
+    it.each([
+      'ALTER COLUMN lease_generation TYPE integer',
+      'ALTER COLUMN lease_generation DROP NOT NULL',
+      'ALTER COLUMN lease_generation SET DEFAULT 1',
+    ])('待迁 v4 只可补缺列，错误既有列仍拒绝：%s', async (mutation) => {
+      const pg = await prodLike();
+      await pg.exec(`ALTER TABLE cron_health ${mutation}`);
+      await expectRefused(pg, await load(), /cron_health\.lease_generation/);
+    }, 120_000);
+
+    it('v4 已记账但 generation 列丢失时拒绝，不把结构损坏当作待迁移', async () => {
+      const pg = await prodLike();
+      await applyMigration(createPGliteClient(pg), await load());
+      await pg.exec('ALTER TABLE cron_health DROP COLUMN lease_generation');
+      await expectRefused(pg, await load(), /cron_health\.lease_generation/);
+    }, 120_000);
+
     it('锁内复核：前置核对之后库里冒出更高版本，applyMigration strict 整批回滚', async () => {
       const pg = await prodLike();
       const client = createPGliteClient(pg);
@@ -374,7 +391,7 @@ maybe('PGlite 真库', () => {
       await expect(applyMigration(client, await load(), { strict: true })).rejects.toThrow(/高于代码的最新版本/);
       expect(await ledgerOf(pg)).toEqual(before);
       // 默认（非 strict）保持旧行为：多出的高版本被忽略——回滚路径依赖这一点。
-      expect((await applyMigration(client, await load())).versions.at(-1)).toMatchObject({ version: 3, status: 'applied' });
+      expect((await applyMigration(client, await load())).versions.at(-1)).toMatchObject({ version: 4, status: 'applied' });
     }, 120_000);
   });
 });

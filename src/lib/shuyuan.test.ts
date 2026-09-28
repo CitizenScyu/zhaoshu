@@ -90,11 +90,19 @@ describe('refreshShuyuan atomic refresh', () => {
     // 使准入照常跑（等价于改前开关关时直落 admitRows 的路径）；其余查询维持原样。
     execute.mockReset().mockImplementation(async (query) => {
       if (query.text.startsWith('INSERT INTO cron_health') && query.values[0] === ADMISSION_LEASE_ROW) {
-        return [{ name: ADMISSION_LEASE_ROW }];
+        return [{ name: ADMISSION_LEASE_ROW, generation: '1' }];
       }
       return query.text.startsWith('SELECT count(*)') ? [zeroCounts] : [];
     });
-    transaction.mockReset().mockResolvedValue([]);
+    transaction.mockReset().mockImplementation(async (batch) => {
+      if (!batch[2]?.text.startsWith('SELECT name FROM cron_health')) return [];
+      const results = [];
+      for (const query of batch) results.push(await execute(query));
+      if (batch[3].text.includes('INSERT INTO source_admission')) {
+        results[3] = [{ lease_valid: true, written: JSON.parse(batch[3].values[2] as string).length }];
+      }
+      return results;
+    });
     readTransaction.mockReset().mockImplementation(async (queries, options) => {
       expect(options?.fetchOptions?.signal).toBeInstanceOf(AbortSignal);
       return Promise.all(queries.map((query) => execute(query)));
@@ -170,8 +178,10 @@ describe('refreshShuyuan atomic refresh', () => {
     let selectIdx = 0;
     execute.mockImplementation(async (query) => {
       if (query.text.startsWith('INSERT INTO cron_health') && query.values[0] === ADMISSION_LEASE_ROW) {
-        return [{ name: ADMISSION_LEASE_ROW }];
+        return [{ name: ADMISSION_LEASE_ROW, generation: '1' }];
       }
+      if (query.text.startsWith('SET LOCAL') || query.text.startsWith('WITH guard')
+        || query.text.startsWith('SELECT name FROM cron_health')) return [];
       return selectResponses[selectIdx++] ?? [];
     });
 
@@ -180,7 +190,7 @@ describe('refreshShuyuan atomic refresh', () => {
       sources: [], sourcesLimit: 100,
     });
 
-    expect(transaction).toHaveBeenCalledOnce();
+    expect(transaction).toHaveBeenCalledTimes(2); // 刷新替换 + 空准入批次判权。
     const queries = transaction.mock.calls[0][0];
     expect(queries).toHaveLength(8);
     expect(queries[0].text).toBe("SET LOCAL lock_timeout = '5s'");
@@ -202,14 +212,15 @@ describe('refreshShuyuan atomic refresh', () => {
     expect(meta.text).toMatch(/^UPDATE shuyuan_meta SET collections = \?::jsonb, refreshed_at = now\(\) WHERE id = 1$/);
     expect(JSON.parse(meta.values[0] as string)).toEqual(collections.map((collection, i) =>
       i === 0 ? { ...collection, probeSnapshot: { version: 1, entries: [] } } : collection));
-    // 6 次 SELECT 读 + 1 次准入租约 INSERT（admlfix42：刷新尾部无条件领约）。
-    expect(execute).toHaveBeenCalledTimes(7);
+    // 6 次读 + 1 次 claim + 4 句空准入批次判权事务。
+    expect(execute).toHaveBeenCalledTimes(11);
     expect(transaction.mock.calls[0][1]?.fetchOptions?.signal).toBeInstanceOf(AbortSignal);
     const isLease = (query: Query) =>
       query.text.startsWith('INSERT INTO cron_health') && query.values[0] === ADMISSION_LEASE_ROW;
     expect(execute.mock.calls.filter(([query]) => isLease(query))).toHaveLength(1);
-    // 除那一次租约 INSERT 外，其余全是 SELECT（替换事务本身走 transaction，不计入 execute）。
-    expect(execute.mock.calls.filter(([query]) => !isLease(query))
+    const fenceQueries = new Set(transaction.mock.calls[1][0]);
+    // 排除 claim 和围栏事务，剩余只有读查询；刷新替换仍不独立执行。
+    expect(execute.mock.calls.filter(([query]) => !isLease(query) && !fenceQueries.has(query))
       .every(([query]) => query.text.startsWith('SELECT '))).toBe(true);
   });
 
@@ -571,9 +582,9 @@ describe('refreshShuyuan atomic refresh', () => {
 
     await refreshShuyuan();
 
-    const insertIndex = execute.mock.calls.findIndex(([query]) => query.text.startsWith('INSERT INTO source_admission'));
+    const insertIndex = execute.mock.calls.findIndex(([query]) => query.text.includes('INSERT INTO source_admission'));
     expect(insertIndex).toBeGreaterThan(-1);
-    const payload = JSON.parse(execute.mock.calls[insertIndex][0].values[0] as string) as { source_url: string; search_verdict: string }[];
+    const payload = JSON.parse(execute.mock.calls[insertIndex][0].values[2] as string) as { source_url: string; search_verdict: string }[];
     expect(payload).toEqual([expect.objectContaining({ source_url: 'https://new.example', search_verdict: 'ok' })]);
     // 时序：替换事务在前，准入写库在后（事务提交后才探测/写库）。
     expect(transaction.mock.invocationCallOrder[0]).toBeLessThan(execute.mock.invocationCallOrder[insertIndex]);
@@ -589,7 +600,7 @@ describe('refreshShuyuan atomic refresh', () => {
     execute.mockImplementation(async (query) => {
       if (query.text.startsWith('SELECT count(*)')) return [zeroCounts];
       if (query.text.startsWith('INSERT INTO cron_health') && query.values[0] === ADMISSION_LEASE_ROW) {
-        return [{ name: ADMISSION_LEASE_ROW }]; // admlfix42：刷新尾部无条件领约，默认领到。
+        return [{ name: ADMISSION_LEASE_ROW, generation: '1' }]; // admlfix42：刷新尾部无条件领约，默认领到。
       }
       if (query.text.startsWith('SELECT source_url, tier, compile_ok')) {
         return [{
@@ -598,7 +609,7 @@ describe('refreshShuyuan atomic refresh', () => {
           rules_hash: rulesHash(admissionCandidate), host: 'new.example', error: '历史拒因',
         }];
       }
-      if (query.text.startsWith('INSERT INTO source_admission')) return [];
+      if (query.text.includes('INSERT INTO source_admission')) return [];
       if (query.text.includes('SELECT DISTINCT host FROM source_admission')) return [];
       if (query.text.startsWith('SELECT source_url, last_error')) return [];
       if (query.text.startsWith('SELECT source_url AS url, name')) return [{ ...zeroCounts }];
@@ -628,7 +639,7 @@ describe('refreshShuyuan atomic refresh', () => {
     // 既有行 rules_hash 与候选一致（终态去抖只拦「仍然拒」，不拦「救回后待测」）。
     expect(fetchMock.mock.calls.map(([input]) => String(input))).toContain(admissionSearchUrl);
     // 证据 3：救回结论写库（compile_ok=true 行 upsert）。
-    expect(execute.mock.calls.some(([query]) => query.text.startsWith('INSERT INTO source_admission'))).toBe(true);
+    expect(execute.mock.calls.some(([query]) => query.text.includes('INSERT INTO source_admission'))).toBe(true);
   });
 
   // 41-srcfix G5：源规则改到过不了 survey 初筛（这里加 <js>）⇒ 改前 runAdmissionAfterRefresh 直接跳过它，
@@ -651,7 +662,7 @@ describe('refreshShuyuan atomic refresh', () => {
       execute.mockImplementation(async (query) => {
         if (query.text.startsWith('SELECT count(*)')) return [zeroCounts];
         if (query.text.startsWith('INSERT INTO cron_health') && query.values[0] === ADMISSION_LEASE_ROW) {
-          return [{ name: ADMISSION_LEASE_ROW }]; // admlfix42：刷新尾部无条件领约，默认领到。
+          return [{ name: ADMISSION_LEASE_ROW, generation: '1' }]; // admlfix42：刷新尾部无条件领约，默认领到。
         }
         if (query.text.startsWith('SELECT source_url, tier, compile_ok')) return [existingRow];
         if (query.text.includes('FROM shuyuan_meta')) return [{ collections: [], refreshed_at: null }];
@@ -659,8 +670,8 @@ describe('refreshShuyuan atomic refresh', () => {
       });
       vi.spyOn(console, 'log').mockImplementation(() => {});
       await refreshShuyuan();
-      const insert = execute.mock.calls.find(([query]) => query.text.startsWith('INSERT INTO source_admission'));
-      return insert ? JSON.parse(insert[0].values[0] as string) as Record<string, unknown>[] : undefined;
+      const insert = execute.mock.calls.find(([query]) => query.text.includes('INSERT INTO source_admission'));
+      return insert ? JSON.parse(insert[0].values[2] as string) as Record<string, unknown>[] : undefined;
     };
 
     it('既有 ok 行 + 新规则初筛不过 ⇒ 写 T7 compile_ok=false、search_ok=null（出池、出 host 门），不发搜索', async () => {
@@ -682,7 +693,7 @@ describe('refreshShuyuan atomic refresh', () => {
 
     it('既有行已是 compile_ok=false ⇒ 不送批次、不重写（终态去抖，不放大写库）', async () => {
       const payload = await runWith(admissionRow({ tier: 'T7', compile_ok: false, search_ok: null, search_verdict: '' }));
-      expect(payload).toBeUndefined();
+      expect(payload).toEqual([]);
     });
   });
 

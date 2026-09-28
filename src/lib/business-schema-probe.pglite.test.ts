@@ -50,6 +50,16 @@ maybe('businessSchemaCurrent 冷启动探测', () => {
     expect(await businessSchemaCurrent(sql as never)).toBe(true);
   }, 60_000);
 
+  it('旧库缺 generation 列时 schema-current 拒绝；运行期 DDL 补列后恢复', async () => {
+    await pg.query('ALTER TABLE cron_health DROP COLUMN lease_generation');
+    expect(await businessSchemaCurrent(sql as never)).toBe(false);
+    await initializeBusinessSchema(sql as never);
+    expect(await businessSchemaCurrent(sql as never)).toBe(true);
+    const columns = (await pg.query(`SELECT data_type, is_nullable, column_default FROM information_schema.columns
+      WHERE table_schema = 'public' AND table_name = 'cron_health' AND column_name = 'lease_generation'`)).rows;
+    expect(columns).toEqual([{ data_type: 'bigint', is_nullable: 'NO', column_default: '0' }]);
+  }, 60_000);
+
   it('缺任一表/索引即翻回 false（关系判据是载荷位）', async () => {
     await pg.query('DROP INDEX download_tasks_claim_idx');
     expect(await businessSchemaCurrent(sql as never)).toBe(false);

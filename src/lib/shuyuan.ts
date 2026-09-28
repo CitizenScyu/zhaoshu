@@ -1481,6 +1481,7 @@ export async function runAdmissionRound(parentSignal?: AbortSignal): Promise<Adm
     const summary = await admitRows(s, rows, budget, signal, {}, lease);
     if (signal.aborted) return { skipped: 'failed' };
     const artifact = 'written' in summary && summary.written > 0 ? await publishPoolArtifact(signal) : 'skipped';
+    if (signal.aborted) return { skipped: 'failed' };
     // 独立轮收尾一行：观测「这一轮用了多少、还剩多少」——验证它确实拿的是整份预算而非刷新剩余。
     console.log('shuyuan admission round', { ...summary, artifact, remainingMs: budget.remainingMs });
     // 42-admhealth：成功行在 admitRows 尾部记（两个入口共用一处），这里不重复。

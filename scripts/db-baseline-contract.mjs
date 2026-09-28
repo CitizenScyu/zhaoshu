@@ -97,11 +97,8 @@ export const BASELINE_SHAPE = {
   },
   cron_health: {
     columns: [
-    // fencefix42：lease_generation 由 0004 迁移加入，不在 v1–v3 契约里（本文件只替 v1–v3 作证）。
-    // 它在「迁移全量跑完」的库上必然存在（BASELINE_SHAPE 由真跑导出，见下），但 baseline 对它
-    // 走 extra 报告而非拒绝（0004 后加的列与 auth v5–v7 同理，见 compareShape 的 extra 通道）。
+      // v4 的 lease_generation 不属于 v1–v3 契约；已存在时由 compareShape 报 extra。
       ["last_success_at", "timestamp with time zone", true, "now()", null, null, null],
-      ["lease_generation", "bigint", true, "0", null, null, null],
       ["name", "text", true, null, null, null, null],
     ],
     constraints: [

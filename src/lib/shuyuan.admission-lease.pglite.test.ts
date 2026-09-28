@@ -1,40 +1,16 @@
 // 42-admbudget：准入租约（cron_health 行 admission_lease）在 PGlite 真库上的语义。
 // mock 测试只钉语句形状；ON CONFLICT … WHERE 的「未过期不抢、过期才抢」要真 Postgres 才看得见。
 // 走 runAdmissionRound 的真实入口（getSql 换成 PGlite 惰性标签），不复述 SQL。
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { loadPGlite, type PGliteLike } from './fixtures/pglite';
 import { createPGliteSql } from './fixtures/pglite-sql';
 import { createProductionSchema } from './fixtures/production-schema';
-
-type Statement = { text: string; params: unknown[] };
 
 const { getSql } = vi.hoisted(() => ({ getSql: vi.fn() }));
 vi.mock('@/lib/db', () => ({ ensureSchema: vi.fn(), getSql }));
 
 import { ADMISSION_LEASE_ROW, ADMISSION_LEASE_TTL_MS, runAdmissionRound, runAdmissionRunnerRound } from './shuyuan';
 import { readCronSuccessTimes } from './source-health';
-
-/** neon 形状的惰性标签：`sql\`\`` 只描述语句，await 或 transaction([...]) 时才执行（同 shuyuan.pool-meta.pglite.test.ts）。 */
-function lazySql(pg: PGliteLike) {
-  const run = async ({ text, params }: Statement) => (await pg.query(text, params)).rows;
-  const tag = (parts: TemplateStringsArray, ...values: unknown[]) => {
-    let text = '';
-    const params: unknown[] = [];
-    parts.forEach((part, index) => {
-      text += part;
-      if (index < values.length) { params.push(values[index]); text += `$${params.length}`; }
-    });
-    const statement = { text, params };
-    return { ...statement, then: (ok: (rows: unknown[]) => unknown, fail: (e: unknown) => unknown) => run(statement).then(ok, fail) };
-  };
-  return Object.assign(tag, {
-    transaction: async (queries: Statement[]) => {
-      const out: unknown[][] = [];
-      for (const query of queries) out.push(await run(query));
-      return out;
-    },
-  });
-}
 
 const PGliteCtor = await loadPGlite();
 const maybe = PGliteCtor ? describe : describe.skip;
@@ -45,9 +21,39 @@ maybe('42-admbudget 准入租约（PGlite 真库）', () => {
   beforeEach(async () => {
     pg = new PGliteCtor!();
     await createProductionSchema(createPGliteSql(pg) as never, (statement) => pg.exec(statement));
-    getSql.mockReturnValue(lazySql(pg));
+    getSql.mockReturnValue(createPGliteSql(pg));
     vi.spyOn(console, 'log').mockImplementation(() => {});
   }, 120_000);
+
+  afterEach(async () => { await pg.close(); vi.restoreAllMocks(); });
+
+  it('代次只在成功 claim 原子加一；超过 JS 安全整数仍精确，BIGINT 耗尽不更改行', async () => {
+    await pg.query(`INSERT INTO cron_health (name, last_success_at, lease_generation)
+      VALUES ('admission_lease', now() - interval '1 second', 9007199254740992)`);
+    expect(await runAdmissionRound()).toEqual({ skipped: 'no_candidates' });
+    const generation = async () => (await pg.query(`SELECT lease_generation::text AS generation FROM cron_health
+      WHERE name = 'admission_lease'`)).rows[0].generation;
+    expect(await generation()).toBe('9007199254740993');
+    expect(await runAdmissionRound()).toEqual({ skipped: 'lease' });
+    expect(await generation()).toBe('9007199254740993');
+    await pg.query(`UPDATE cron_health SET last_success_at = now() - interval '1 second'
+      WHERE name = 'admission_lease'`);
+    expect(await runAdmissionRound()).toEqual({ skipped: 'no_candidates' });
+    expect(await generation()).toBe('9007199254740994');
+    await pg.query(`UPDATE cron_health SET last_success_at = now() - interval '1 second',
+      lease_generation = 9223372036854775807 WHERE name = 'admission_lease'`);
+    expect(await runAdmissionRound()).toEqual({ skipped: 'lease' });
+    expect(await generation()).toBe('9223372036854775807');
+    expect(await leaseRemainingMs()).toBeLessThan(0);
+  });
+
+  it('缺 generation 列时 claim 失败关闭，不尝试准入', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    await pg.query('ALTER TABLE cron_health DROP COLUMN lease_generation');
+    expect(await runAdmissionRound()).toEqual({ skipped: 'lease' });
+    expect((await pg.query('SELECT * FROM source_admission')).rows).toEqual([]);
+    expect((await pg.query('SELECT * FROM cron_health')).rows).toEqual([]);
+  });
 
   async function leaseRemainingMs(): Promise<number> {
     const rows = (await pg.query(
