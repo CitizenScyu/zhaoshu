@@ -10,6 +10,10 @@
 //   node refresh-runner.mjs --dry-run    只读干跑(抓上游 + 合并去重,打印计数,不写库)
 //   node refresh-runner.mjs --pool-artifact  只从库生成源池产物写到 SHUYUAN_POOL_ARTIFACT_PATH(不抓上游、不写库;
 //                                         41-poolimpl,phoenix 定时跑:兜住 Vercel 上的禁用/启用等本机发布不到的写,并做心跳)
+//   node refresh-runner.mjs --admission   源准入探测一轮(admrunner42:领租约 → 读 shuyuan_sources → 探测 → 写 source_admission;
+//                                         ok 行带 phoenix_ok: 前缀留池外等 Vercel 复测,不发布产物;不抓上游)。
+//                                         预算 = ADMISSION_BUDGET_MS(默认 WATCHDOG_MS − 30s,再无则 240s);租约 TTL 走
+//                                         ADMISSION_LEASE_TTL_MS,须 ≥ 预算。
 //
 // 正式刷新时若 env 开 SHUYUAN_POOL_ARTIFACT 且配了 SHUYUAN_POOL_ARTIFACT_PATH,refreshShuyuan 写库成功后自行发布产物。
 //
@@ -20,13 +24,38 @@
 import { appendFileSync, readFileSync, writeFileSync } from 'node:fs';
 import { getSql } from '@/lib/db';
 import { dbQuotaBackoffMs, isDbQuotaError, recordDbQuotaSeen } from '@/lib/db-quota';
-import { buildShuyuanPoolArtifact, refreshShuyuan } from '@/lib/shuyuan';
+import { ADMISSION_ROUND_BUDGET_MS, buildShuyuanPoolArtifact, refreshShuyuan, runAdmissionRunnerRound } from '@/lib/shuyuan';
 import { writePoolArtifactFile } from '@/lib/pool-artifact';
 import { dryRunRefresh } from './dry-run';
 import { buildFailureStatus, quotaGate } from './quota-gate';
 
 const dryRun = process.argv.includes('--dry-run');
 const poolArtifactOnly = process.argv.includes('--pool-artifact');
+const admissionOnly = process.argv.includes('--admission');
+
+/** 正整数 env,否则 undefined。 */
+function positiveIntEnv(name: string): number | undefined {
+  const value = Number.parseInt(process.env[name] ?? '', 10);
+  return Number.isSafeInteger(value) && value > 0 ? value : undefined;
+}
+
+/**
+ * 准入轮预算(admrunner42):显式 ADMISSION_BUDGET_MS > WATCHDOG_MS 减 30s 写库预留(看门狗是硬杀退 2,
+ * 预算要先于它止损、把结论写完)> Vercel 独立轮同款 ADMISSION_ROUND_BUDGET_MS。
+ */
+function admissionBudgetMs(): number {
+  const explicit = positiveIntEnv('ADMISSION_BUDGET_MS');
+  if (explicit !== undefined) return explicit;
+  const watchdog = positiveIntEnv('WATCHDOG_MS');
+  if (watchdog !== undefined && watchdog > 30_000) return watchdog - 30_000;
+  return ADMISSION_ROUND_BUDGET_MS;
+}
+
+/** 准入一轮(admrunner42)。缺 DATABASE_URL 由 getSql 抛「DATABASE_URL is not set」(只含键名)⇒ 退 1。 */
+async function runAdmission(): Promise<void> {
+  const summary = await runAdmissionRunnerRound(admissionBudgetMs());
+  console.log(JSON.stringify({ mode: 'admission', ...summary }));
+}
 
 /** 只生成源池产物（不开 SHUYUAN_POOL_ARTIFACT 也可跑：生成是显式动作，开关只管消费）。失败抛出 ⇒ 退 1。 */
 async function generatePoolArtifact(): Promise<void> {
@@ -76,6 +105,10 @@ async function main() {
   try {
     if (poolArtifactOnly) {
       await generatePoolArtifact();
+      return;
+    }
+    if (admissionOnly) {
+      await runAdmission();
       return;
     }
     if (dryRun) {

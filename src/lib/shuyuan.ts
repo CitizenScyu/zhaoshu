@@ -8,8 +8,8 @@ import {
   BUILTIN_SOURCE_HOSTS, builtinFallbackSource, builtinUrlPrefixes, engineHosts, type SupportedSourceTier,
 } from '@/lib/supported-sources';
 import {
-  ADMISSION_MAX_REDIRECTS, ADMISSION_MIN_BUDGET_MS, ADMISSION_PROBE_WORST_MS, assertAdmissionVersionConsistent,
-  defaultAdmissionTransport, runAdmissionBatch,
+  ADMISSION_MAX_REDIRECTS, ADMISSION_MIN_BUDGET_MS, ADMISSION_PHOENIX_OK_PREFIX, ADMISSION_PROBE_WORST_MS,
+  assertAdmissionVersionConsistent, defaultAdmissionTransport, runAdmissionBatch,
   type AdmissionCandidate, type AdmissionSourceRow,
 } from '@/lib/rule-engine/admission';
 import { enginePostSearchEnabled, selectCandidates, type RawSource } from '@/lib/rule-engine/compile-smoke';
@@ -70,7 +70,14 @@ export const REFRESH_BUDGET_MS = 180_000;
 export const ADMISSION_ROUND_BUDGET_MS = 240_000;
 // 准入租约时长：须 ≥ 任一持有者的最长存活（独立轮路由 295s、刷新尾部 ≤ REFRESH_BUDGET_MS），持有者被平台杀掉
 // 也最迟到期自动释放；不主动释放（两处触发相隔 12h，5 分钟租约不会挡住下一轮）。
+// admrunner42：本值只是**默认**；phoenix runner 轮预算更长（40 探并发 4，最坏 ~10 分钟），其 systemd 单元经
+// env ADMISSION_LEASE_TTL_MS 调到 900000（≥ 单元 WATCHDOG_MS）。Vercel 不设该 env ⇒ 默认值，行为不变。
 export const ADMISSION_LEASE_TTL_MS = 300_000;
+/** 准入租约 TTL（admrunner42）：env `ADMISSION_LEASE_TTL_MS` 正整数即用，缺失/非法回默认 ADMISSION_LEASE_TTL_MS。 */
+export function admissionLeaseTtlMs(env: NodeJS.ProcessEnv = process.env): number {
+  const parsed = Number.parseInt(env.ADMISSION_LEASE_TTL_MS ?? '', 10);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : ADMISSION_LEASE_TTL_MS;
+}
 // 租约借 cron_health 一行（不改 schema）：last_success_at 存的是**租约到期时刻**，不是成功时刻——
 // 与 db-quota.ts 的 db_quota_exceeded 行同一借用法；readCronSuccessTimes 只认已知行名，不受影响。
 export const ADMISSION_LEASE_ROW = 'admission_lease';
@@ -548,14 +555,16 @@ async function engineReadingSources(
     }));
 }
 
-/** 引擎候选行：shuyuan_sources JOIN source_admission ok 态；池合成与产物生成共用同一查询。 */
+/** 引擎候选行：shuyuan_sources JOIN source_admission ok 态；池合成与产物生成共用同一查询。
+ * admrunner42：phoenix_ok: 行（runner 探 ok、Vercel 未确认）不入池——谓词与 supported-sources.ts engineHosts、
+ * readAdmissionFunnel 的 ok 桶同款。 */
 function readEngineRows(s: Sql, signal?: AbortSignal): Promise<PoolArtifactEngineRow[]> {
   return readRows<PoolArtifactEngineRow>(s, s`
     SELECT src.source_url, src.name, src.source, src.disabled_at::text AS disabled_at, src.last_error,
            a.tier, a.search_checked_at::text AS search_checked_at
     FROM shuyuan_sources src
     JOIN source_admission a ON a.source_url = src.source_url
-    WHERE a.compile_ok AND a.search_ok IS TRUE
+    WHERE a.compile_ok AND a.search_ok IS TRUE AND (a.error IS NULL OR a.error NOT LIKE 'phoenix_ok:%')
     ORDER BY src.source_url`, signal);
 }
 
@@ -1004,15 +1013,20 @@ export async function getShuyuanPoolHealth(signal: AbortSignal): Promise<Shuyuan
   };
 }
 
-/** 准入漏斗聚合（§6.3）：三桶谓词与入池判据 / admissionBucket 同口径。 */
+/** 准入漏斗聚合（§6.3）：三桶谓词与入池判据 / admissionBucket 同口径。
+ * admrunner42：phoenix_ok: 行从 ok 桶挪到 deferred 桶（在池外等 Vercel 确认，与「search_ok 未真」同一处境），
+ * 三桶仍互斥完备；url_defaulted 是 ok 桶的子集，同步排除。 */
 function readAdmissionFunnel(s: Sql, signal: AbortSignal): Promise<ShuyuanAdmissionFunnel[]> {
   return readRows<ShuyuanAdmissionFunnel>(s, s`
-    SELECT count(*) FILTER (WHERE compile_ok AND search_ok IS TRUE)::int AS ok,
+    SELECT count(*) FILTER (WHERE compile_ok AND search_ok IS TRUE
+             AND (error IS NULL OR error NOT LIKE 'phoenix_ok:%'))::int AS ok,
            count(*) FILTER (WHERE NOT compile_ok
              OR search_verdict IN ('challenge', 'conn_fail', 'shell'))::int AS rejected,
-           count(*) FILTER (WHERE compile_ok AND search_ok IS NOT TRUE
+           count(*) FILTER (WHERE compile_ok
+             AND (search_ok IS NOT TRUE OR error LIKE 'phoenix_ok:%')
              AND search_verdict NOT IN ('challenge', 'conn_fail', 'shell'))::int AS deferred,
            count(*) FILTER (WHERE compile_ok AND search_ok IS TRUE
+             AND (error IS NULL OR error NOT LIKE 'phoenix_ok:%')
              AND (core_field_mask->>'ruleToc.chapterUrl') IS DISTINCT FROM 'true')::int AS url_defaulted,
            count(*) FILTER (WHERE NOT compile_ok
              AND (core_field_mask->>'ruleToc.chapterList') IS DISTINCT FROM 'true')::int AS miss_chapter_list,
@@ -1389,6 +1403,8 @@ async function runAdmissionAfterRefresh(
 }
 
 type AdmissionInputRow = { url: string; source: Record<string, unknown> };
+/** 准入入口标识（日志用）：refresh=刷新尾部、round=Vercel 独立轮、runner=phoenix runner（admrunner42）。 */
+type AdmissionTrigger = 'refresh' | 'round' | 'runner';
 
 /** 一轮准入的结果摘要（只含计数，可直接作 cron 响应体；不含任何源 URL）。 */
 export type AdmissionRoundSummary =
@@ -1404,11 +1420,11 @@ export type AdmissionRoundSummary =
  * 时间全用库端 now()，不受函数实例时钟影响。领取失败（库抖动）按未领到处理——fail-closed：
  * 本轮不探，下一轮再来，绝不在拿不准互斥时并发探测。
  */
-async function claimAdmissionLease(s: Sql, trigger: 'refresh' | 'round', sources?: number): Promise<boolean> {
+async function claimAdmissionLease(s: Sql, trigger: AdmissionTrigger, sources?: number): Promise<boolean> {
   try {
     const rows = await s`
       INSERT INTO cron_health (name, last_success_at)
-      VALUES (${ADMISSION_LEASE_ROW}, now() + ${ADMISSION_LEASE_TTL_MS}::int * interval '1 millisecond')
+      VALUES (${ADMISSION_LEASE_ROW}, now() + ${admissionLeaseTtlMs()}::int * interval '1 millisecond')
       ON CONFLICT (name) DO UPDATE SET last_success_at = EXCLUDED.last_success_at
         WHERE cron_health.last_success_at <= now()
       RETURNING name` as unknown[];
@@ -1447,8 +1463,33 @@ export async function runAdmissionRound(parentSignal?: AbortSignal): Promise<Adm
   }
 }
 
+/**
+ * phoenix runner 准入轮（admrunner42，scripts/shuyuan-refresh/entry.ts `--admission` 调用）。
+ * 与 runAdmissionRound 同一条流水（租约 → 读 shuyuan_sources → admitRows → 写 source_admission），差别只在：
+ * - 预算由调用方给（runner 单元 WATCHDOG_MS 兜底），租约 TTL 走 env ADMISSION_LEASE_TTL_MS（≥ 预算）；
+ * - ok 结论带 ADMISSION_PHOENIX_OK_PREFIX（池外待 Vercel 确认，见 admission.ts 常量注释）；
+ * - **不**发布源池产物（phoenix 的 pool-artifact timer 每 30 分钟自会生成，且 phoenix_ok: 行本就不入池）。
+ * admitRows 尾部的 refreshSupportedHosts 在 runner 进程里只刷本进程内存（无消费者），无害、语义不改。
+ */
+export async function runAdmissionRunnerRound(budgetMs: number): Promise<AdmissionRoundSummary> {
+  const budget = createDeadline(budgetMs);
+  try {
+    const s = getSql();
+    if (!(await claimAdmissionLease(s, 'runner'))) return { skipped: 'lease' };
+    const stored = await readRows<{ source_url: string; source: Record<string, unknown> }>(s, s`
+      SELECT source_url, source FROM shuyuan_sources ORDER BY id`, budget.signal);
+    const rows = stored.map((row) => ({ url: row.source_url, source: row.source }));
+    const summary = await admitRows(s, rows, budget, budget.signal, { okPrefix: ADMISSION_PHOENIX_OK_PREFIX });
+    console.log('shuyuan admission round', { ...summary, trigger: 'runner', artifact: 'skipped', remainingMs: budget.remainingMs });
+    return summary;
+  } finally {
+    budget.dispose();
+  }
+}
+
 async function admitRows(
   s: Sql, rows: AdmissionInputRow[], budget: RequestDeadline, signal: AbortSignal,
+  options: { okPrefix?: string } = {},
 ): Promise<AdmissionRoundSummary> {
   const declaredHosts = new Set<string>();
   for (const row of rows) {
@@ -1482,6 +1523,8 @@ async function admitRows(
       // 41-srcfix 改法1：探测词兜底，换词前按同一 canProbe 预留判预算（单词一次尝试最坏 = ADMISSION_PROBE_WORST_MS）。
       keywordFallback: true,
       canProbe: () => !signal.aborted && budget.remainingMs > ADMISSION_PROBE_WORST_MS + WRITE_RESERVE_MS,
+      // admrunner42：只有 phoenix runner 传 okPrefix；Vercel 两条路径不传 ⇒ 展开为空对象，输入形状逐字不变。
+      ...(options.okPrefix ? { okPrefix: options.okPrefix } : {}),
     });
     // 准入兼容 L4（§2.4）：每轮一行漂移计数（不建历史表；要趋势曲线再上日表，Phase 2）。
     console.log('shuyuan admission batch', {
