@@ -51,4 +51,14 @@ describe('refresh-runner 产物', () => {
     expect(r.stderr).toContain('shuyuan refresh runner failed: 缺少 env SHUYUAN_POOL_ARTIFACT_PATH');
     expect(r.status).toBe(1);
   });
+
+  it('admrunner42 --admission:缺 DATABASE_URL 即失败退 1,只报键名(不回显值、不碰库)', () => {
+    const env = { ...process.env };
+    delete env.DATABASE_URL;
+    const r = spawnSync(process.execPath, [dist, '--admission'], { encoding: 'utf8', env });
+    // getSql 只抛键名「DATABASE_URL is not set」,不回显任何连接串。
+    expect(r.stderr).toContain('shuyuan refresh runner failed: DATABASE_URL is not set');
+    expect(/postgres:\/\//.test(r.stderr)).toBe(false);
+    expect(r.status).toBe(1);
+  });
 });
