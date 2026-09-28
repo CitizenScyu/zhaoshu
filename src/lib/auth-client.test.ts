@@ -451,9 +451,8 @@ describe('AuthController dual mode', () => {
   });
 
   it('lets a queued login run after a hanging session body timed out', async () => {
-    let sessionHung = true;
     const calls = stubFetch({
-      'GET /api/auth/session': () => (sessionHung ? hangingBodyResponse() : json(200, { user: MEMBER, accountsEnabled: true })),
+      'GET /api/auth/session': () => hangingBodyResponse(),
       'POST /api/auth/login': () => json(200, { user: MEMBER }),
     });
     const { instance } = controller({ requestTimeoutMs: 50 });
@@ -506,9 +505,10 @@ describe('AuthController dual mode', () => {
 
   it('keeps reading normal JSON bodies through the bounded reader', async () => {
     // 分块 + 多字节字符跨块边界：证明逐块 decode(stream:true) 与 JSON.parse 组合无损。
-    const full = JSON.stringify({ user: MEMBER, accountsEnabled: true });
-    const split = Math.floor(full.length / 2);
-    const chunks = [full.slice(0, split), full.slice(split)].map((piece) => new TextEncoder().encode(piece));
+    const full = new TextEncoder().encode(JSON.stringify({ user: { ...MEMBER, username: '合成读者' }, accountsEnabled: true }));
+    const split = full.indexOf(0xe5) + 1; // 「合」的 UTF-8 首字节后切开，不能先切字符串再编码。
+    expect(split).toBeGreaterThan(1);
+    const chunks = [full.slice(0, split), full.slice(split)];
     vi.stubGlobal('fetch', vi.fn(async () => new Response(
       new ReadableStream({
         start(controller) {
@@ -521,7 +521,7 @@ describe('AuthController dual mode', () => {
     const { instance } = controller({ requestTimeoutMs: 2_000 });
     await instance.start();
     expect(instance.state).toMatchObject({ phase: 'authenticated', transport: 'cookie' });
-    expect(instance.state.user).toMatchObject({ id: 4, username: 'reader' });
+    expect(instance.state.user).toMatchObject({ id: 4, username: '合成读者' });
   });
 
   it('treats a body that is not JSON as before (null semantics)', async () => {
@@ -536,13 +536,12 @@ describe('AuthController dual mode', () => {
   });
 
   it('leaves no timer behind after a successful JSON read', async () => {
-    stubFetch({ 'GET /api/auth/session': () => json(200, { user: MEMBER, accountsEnabled: true }) });
-    const { instance } = controller({ requestTimeoutMs: 100 });
-    await instance.start();
-    // 成功路径：等响应头与读体两段计时器都必须清掉。这些用例走真实计时，
-    // vi.getTimerCount 需要 fake timers 才可用——先开假时钟再断言（无真定时器可挂）。
+    // 必须在操作之前接管时钟，事后才开启的假时钟看不到先前真实 timer。
     vi.useFakeTimers();
     try {
+      stubFetch({ 'GET /api/auth/session': () => json(200, { user: MEMBER, accountsEnabled: true }) });
+      const { instance } = controller({ requestTimeoutMs: 100 });
+      await instance.start();
       expect(vi.getTimerCount()).toBe(0);
     } finally {
       vi.useRealTimers();
@@ -550,15 +549,21 @@ describe('AuthController dual mode', () => {
   });
 
   it('does not leak the body-read timer when the controller is closed mid-read', async () => {
-    // start 之后立刻 close：读体还在挂起时整个代际被关闭。收尾后不应残留读体定时器。
-    vi.stubGlobal('fetch', vi.fn(async () => hangingBodyResponse()));
-    const { instance } = controller({ requestTimeoutMs: 60 });
-    const start = instance.start();
-    instance.close();
-    await Promise.race([start, sleep(3_000).then(() => 'STUCK' as const)]);
-    await sleep(150);
     vi.useFakeTimers();
     try {
+      const response = hangingBodyResponse();
+      const getReader = vi.spyOn(response.body!, 'getReader');
+      vi.stubGlobal('fetch', vi.fn(async () => response));
+      const { instance } = controller({ requestTimeoutMs: 60 });
+      const start = instance.start();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(getReader).toHaveBeenCalledOnce(); // 真实正文 reader 已接手，再关闭代际。
+      expect(vi.getTimerCount()).toBe(1);
+      instance.close();
+      const closedState = instance.state;
+      await vi.advanceTimersByTimeAsync(60);
+      await start;
+      expect(instance.state).toBe(closedState);
       expect(vi.getTimerCount()).toBe(0);
     } finally {
       vi.useRealTimers();

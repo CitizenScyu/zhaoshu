@@ -172,6 +172,7 @@ export class AuthController {
   private queue: Promise<unknown> = Promise.resolve();
   private notifyHandler: (() => void) | null;
   private closed = false;
+  private lifecycle = 0;
 
   constructor(private readonly options: AuthControllerOptions) {
     this.sessionValue = new OwnerSession('', 0, 'cookie');
@@ -184,7 +185,7 @@ export class AuthController {
   }
 
   private broadcast(): void {
-    this.notifyHandler?.();
+    if (!this.closed) this.notifyHandler?.();
   }
 
   get state(): AuthState {
@@ -209,6 +210,7 @@ export class AuthController {
   /** 中止当前代际；React Strict Mode 重放后 start() 会重新建立代际。 */
   close(): void {
     this.closed = true;
+    this.lifecycle += 1;
     this.rotate(this.stateValue.transport, this.sessionValue.transport === 'owner-header' ? this.sessionValue.token : '');
   }
 
@@ -217,6 +219,8 @@ export class AuthController {
    * 迟到响应因此进不了新代际。
    */
   async handleExternalChange(): Promise<void> {
+    if (this.closed) return;
+    this.lifecycle += 1;
     this.rotate(this.stateValue.transport, this.sessionValue.transport === 'owner-header' ? this.sessionValue.token : '');
     await this.refresh('broadcast');
   }
@@ -233,14 +237,22 @@ export class AuthController {
     for (const listener of [...this.listeners]) listener();
   }
 
+  /** 关闭或外部身份变化后，旧请求不得再清存储、广播或切换代际。 */
+  private isCurrent(generation: number): boolean {
+    return !this.closed && this.sessionValue.id === generation;
+  }
+
   private identity(user: AuthUser | null, transport: AuthTransport): string {
     return user
       ? `${transport}|${user.id}|${user.role}|${user.canFind}${user.canRead}${user.canDownload}`
       : `anonymous|${transport}`;
   }
 
-  private enqueue<T>(operation: () => Promise<T>): Promise<T> {
-    const run = this.queue.then(operation, operation);
+  private enqueue(operation: () => Promise<void>): Promise<void> {
+    // 生命周期变化也作废尚未开始的旧操作；合法队列内的登录/退出 rotate 不改变此值。
+    const lifecycle = this.lifecycle;
+    const guarded = () => this.closed || lifecycle !== this.lifecycle ? Promise.resolve() : operation();
+    const run = this.queue.then(guarded, guarded);
     this.queue = run.catch(() => {});
     return run;
   }
@@ -331,13 +343,18 @@ export class AuthController {
     if (!reader) return response.text();
     const decoder = new TextDecoder();
     let text = '';
-    for (;;) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      if (value) text += decoder.decode(value, { stream: true });
+    try {
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        if (value) text += decoder.decode(value, { stream: true });
+      }
+      text += decoder.decode();
+      return text;
+    } finally {
+      // 超时已由外层发起 cancel；不等底层 cancel 完成也能释放自己的读锁。
+      reader.releaseLock();
     }
-    text += decoder.decode();
-    return text;
   }
 
   private post(path: string, body: unknown): Promise<AuthReply> {
@@ -354,17 +371,19 @@ export class AuthController {
    */
   async refresh(reason: 'start' | 'visible' | 'broadcast' | 'unauthorized' | 'forbidden' = 'visible'): Promise<void> {
     return this.enqueue(async () => {
-      if (reason === 'start') this.set({ phase: 'loading' });
+      if (this.closed) return;
       const generation = this.sessionValue.id;
+      if (reason === 'start') this.set({ phase: 'loading' });
+      if (!this.isCurrent(generation)) return;
       let reply: AuthReply;
       try {
         reply = await this.request('/api/auth/session', { method: 'GET' }, 'cookie');
       } catch {
         // 网络不确定：保持界面锁定，不清除可恢复的旧口令，也不切换身份。
-        if (this.sessionValue.id === generation) this.set({ phase: 'unavailable' });
+        if (this.isCurrent(generation)) this.set({ phase: 'unavailable' });
         return;
       }
-      if (this.sessionValue.id !== generation) return;
+      if (!this.isCurrent(generation)) return;
 
       const response = reply.response;
       if (response.status === 401) {
@@ -391,10 +410,10 @@ export class AuthController {
       try {
         body = await reply.readJson() as { user?: unknown; accountsEnabled?: unknown } | null;
       } catch {
-        if (this.sessionValue.id === generation) this.set({ phase: 'unavailable' });
+        if (this.isCurrent(generation)) this.set({ phase: 'unavailable' });
         return;
       }
-      if (this.sessionValue.id !== generation) return;
+      if (!this.isCurrent(generation)) return;
       const accountsEnabled = body?.accountsEnabled === true;
       const user = parseAuthUser(body?.user);
 
@@ -431,7 +450,7 @@ export class AuthController {
         const exchanged = await this.exchangeOwnerToken(stored, false, generation);
         if (exchanged) return;
       }
-      if (this.sessionValue.id !== generation && this.stateValue.transport !== 'cookie') return;
+      if (!this.isCurrent(generation)) return;
       this.rotate('cookie');
       this.set({ phase: 'anonymous', user: null, accountsEnabled: true, transport: 'cookie', expired: false });
     });
@@ -443,19 +462,20 @@ export class AuthController {
     try {
       reply = await this.post('/api/auth/owner', { token, remember });
     } catch {
-      if (this.sessionValue.id === generation) this.set({ phase: 'unavailable' });
+      if (this.isCurrent(generation)) this.set({ phase: 'unavailable' });
       return true;
     }
-    if (this.sessionValue.id !== generation) return true;
+    if (!this.isCurrent(generation)) return true;
     if (reply.response.ok) {
       // 兑换的 2xx 要读 user；等不来正文按「服务不可用」收尾，不清可恢复的旧口令。
       let body: { user?: unknown } | null;
       try {
         body = await reply.readJson() as { user?: unknown } | null;
       } catch {
-        this.set({ phase: 'unavailable' });
+        if (this.isCurrent(generation)) this.set({ phase: 'unavailable' });
         return true;
       }
+      if (!this.isCurrent(generation)) return true;
       const user = parseAuthUser(body?.user);
       this.rotate('cookie');
       this.options.storage.clear();
@@ -483,17 +503,27 @@ export class AuthController {
   /** 用户名 + 密码登录（账号模式）。 */
   login(username: string, password: string, remember: boolean): Promise<void> {
     return this.enqueue(async () => {
+      if (this.closed) return;
+      // 在队列开始执行时取代际：前一个合法登录/退出引起的 rotate 不作废后续操作。
+      const generation = this.sessionValue.id;
       const reply = await this.post('/api/auth/login', {
         username: username.trim().toLowerCase(), password, remember,
       });
-      if (!reply.response.ok) throw await this.describeFailure(reply, '登录失败，请稍后重试');
+      if (!this.isCurrent(generation)) return;
+      if (!reply.response.ok) {
+        const failure = await this.describeFailure(reply, '登录失败，请稍后重试');
+        if (this.isCurrent(generation)) throw failure;
+        return;
+      }
       // 2xx 要读 user；等不来正文按「暂时失败」抛错，界面保持可重试。
       let body: { user?: unknown } | null;
       try {
         body = await reply.readJson() as { user?: unknown } | null;
       } catch {
+        if (!this.isCurrent(generation)) return;
         throw new AuthError('登录结果未能送达，请稍后重试', 503);
       }
+      if (!this.isCurrent(generation)) return;
       const user = parseAuthUser(body?.user);
       this.rotate('cookie');
       this.options.storage.clear();
@@ -507,18 +537,27 @@ export class AuthController {
    */
   loginOwner(draft: string, sessionOnly: boolean): Promise<void> {
     return this.enqueue(async () => {
+      if (this.closed) return;
+      const generation = this.sessionValue.id;
       const token = draft.trim();
       if (!token) throw new AuthError('请先输入访问口令', 400);
       if (this.stateValue.accountsEnabled) {
         const reply = await this.post('/api/auth/owner', { token, remember: !sessionOnly });
-        if (!reply.response.ok) throw await this.describeFailure(reply, '暂时无法验证口令，请稍后重试');
+        if (!this.isCurrent(generation)) return;
+        if (!reply.response.ok) {
+          const failure = await this.describeFailure(reply, '暂时无法验证口令，请稍后重试');
+          if (this.isCurrent(generation)) throw failure;
+          return;
+        }
         // 2xx 要读 user；等不来正文按「暂时失败」抛错，不落半套身份。
         let body: { user?: unknown } | null;
         try {
           body = await reply.readJson() as { user?: unknown } | null;
         } catch {
+          if (!this.isCurrent(generation)) return;
           throw new AuthError('暂时无法验证口令，请稍后重试', 503);
         }
+        if (!this.isCurrent(generation)) return;
         const user = parseAuthUser(body?.user);
         this.rotate('cookie');
         this.options.storage.clear();
@@ -530,8 +569,10 @@ export class AuthController {
       try {
         legacy = await this.request('/api/owner', { method: 'GET' }, 'owner-header', token);
       } catch {
+        if (!this.isCurrent(generation)) return;
         throw new AuthError('暂时无法验证口令，请稍后重试', 503);
       }
+      if (!this.isCurrent(generation)) return;
       // 旧模式只判状态码、从不读正文：不装读体定时器（AuthReply.response 直接用），
       // 也不给成功路径留任何 timer（既有回归用例盯着这条）。
       const response = legacy.response;
@@ -551,7 +592,7 @@ export class AuthController {
 
   /** 旧模式下切换“仅本次会话保存”。 */
   setLegacySessionOnly(value: boolean): void {
-    if (this.stateValue.transport !== 'owner-header') return;
+    if (this.closed || this.stateValue.transport !== 'owner-header') return;
     this.options.storage.write(this.sessionValue.token, value);
     this.set({ sessionOnly: value });
   }
@@ -562,6 +603,8 @@ export class AuthController {
    */
   logout(): Promise<void> {
     return this.enqueue(async () => {
+      if (this.closed) return;
+      const generation = this.sessionValue.id;
       if (this.stateValue.transport === 'owner-header') {
         this.options.storage.clear();
         this.rotate('owner-header');
@@ -572,8 +615,10 @@ export class AuthController {
       try {
         reply = await this.post('/api/auth/logout', undefined);
       } catch {
+        if (!this.isCurrent(generation)) return;
         throw new AuthError('退出尚未完成，请重试', 503);
       }
+      if (!this.isCurrent(generation)) return;
       // 登出只判状态码、从不读正文：不装读体定时器，成功路径不残留 timer。
       if (!reply.response.ok) throw new AuthError('退出尚未完成，请重试', reply.response.status);
       this.options.storage.clear();
@@ -590,9 +635,9 @@ export class AuthController {
   fetch(input: RequestInfo | URL, init: RequestInit = {}): Promise<Response> {
     const session = this.sessionValue;
     return session.fetch(input, init, this.options.origin()).then((response) => {
-      if (response.status === 401 && session.id === this.sessionValue.id) {
+      if (response.status === 401 && this.isCurrent(session.id)) {
         void this.refresh('unauthorized').catch(() => {});
-      } else if (response.status === 403) {
+      } else if (response.status === 403 && this.isCurrent(session.id)) {
         void this.refresh('forbidden').catch(() => {});
       }
       return response;
