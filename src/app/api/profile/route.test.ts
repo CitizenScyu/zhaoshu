@@ -136,6 +136,34 @@ describe('/api/profile writes', () => {
     expect(mocks.saveProfileForUser).toHaveBeenCalledWith(1, seeds, '', previousVersion, expect.any(Function));
   });
 
+  it.each([
+    ['author', 200, '作者'], ['reason', 1_000, '喜欢或弃书的原因'],
+  ] as const)('rejects an oversized seed %s before database access or writes', async (field, limit, label) => {
+    const res = await PUT(request('PUT', {
+      seeds: [...seeds, { title: '另一合成书', kind: 'drop', [field]: ` ${'字'.repeat(limit + 1)} ` }],
+      updatedAt: previousVersion,
+    }));
+    expect(res.status).toBe(400);
+    expect(await res.json()).toEqual({ error: `第 2 本种子书的${label}不能超过 ${limit} 字，请缩短后重试` });
+    expect(mocks.ensureSchema).not.toHaveBeenCalled();
+    expect(mocks.getProfileForUser).not.toHaveBeenCalled();
+    expect(mocks.saveProfileForUser).not.toHaveBeenCalled();
+    expect(mocks.transaction).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['普通作者', '普通原因'],
+    ['字'.repeat(200), '字'.repeat(1_000)],
+    [' '.repeat(201), ' '.repeat(1_001)],
+  ])('preserves valid and whitespace-only optional seed fields %#', async (author, reason) => {
+    const input = [{ ...seeds[0], author: ` ${author} `, reason: ` ${reason} ` }];
+    const res = await PUT(request('PUT', { seeds: input, updatedAt: previousVersion, confirmSeedRemoval: true }));
+    expect(res.status).toBe(200);
+    const expected = [{ ...seeds[0], author: author.trim() || undefined, reason: reason.trim() || undefined }];
+    expect((await res.json()).seeds).toEqual(JSON.parse(JSON.stringify(expected)));
+    expect(mocks.saveProfileForUser).toHaveBeenCalledWith(1, expected, '原画像', previousVersion, expect.any(Function));
+  });
+
   it('requires explicit confirmation before removing a seed, returning the missing title and retained draft', async () => {
     const res = await PUT(request('PUT', { seeds: [], updatedAt: previousVersion }));
     expect(res.status).toBe(409);

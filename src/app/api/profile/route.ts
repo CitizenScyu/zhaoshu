@@ -9,7 +9,7 @@ import {
   profileRebuildUser,
 } from '@/lib/prompts';
 import { boundedString, readJsonBody } from '@/lib/http';
-import { hasInvalidDatabaseCharacters, sanitizeSeeds } from '@/lib/sanitize';
+import { hasInvalidDatabaseCharacters, isRecord, sanitizeSeeds } from '@/lib/sanitize';
 import { withFindAccess, personalError, type PersonalRequest } from '@/lib/personal-request';
 import { DeadlineExceededError, MODEL_ROUTE_INTERNAL_BUDGET_MS } from '@/lib/deadline';
 import type { ProfileSnapshot, SeedBook } from '@/lib/types';
@@ -54,6 +54,18 @@ async function handlePUT(req: NextRequest) {
     const seeds = body?.seeds;
     if (!body || !Array.isArray(seeds) || seeds.length > MAX_SEEDS) {
       return NextResponse.json({ error: `seeds must be an array of at most ${MAX_SEEDS}` }, { status: 400 });
+    }
+    // sanitizeSeeds 会把超长可选字段归为空；人工保存必须先拒绝，避免成功后丢掉原文。
+    // 与 cleanString 使用相同的 trim/长度语义，纯空白字段仍允许归为空。
+    for (const [index, seed] of seeds.entries()) {
+      if (!isRecord(seed)) continue;
+      for (const [field, label, limit] of [['author', '作者', 200], ['reason', '喜欢或弃书的原因', 1_000]] as const) {
+        if (typeof seed[field] === 'string' && seed[field].trim().length > limit) {
+          return NextResponse.json({
+            error: `第 ${index + 1} 本种子书的${label}不能超过 ${limit} 字，请缩短后重试`,
+          }, { status: 400 });
+        }
+      }
     }
     if (typeof body.content === 'string' && boundedString(body.content, MAX_PROFILE_LENGTH) === null) {
       return NextResponse.json({ error: 'content is too long' }, { status: 400 });

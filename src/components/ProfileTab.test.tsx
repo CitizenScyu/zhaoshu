@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { useReducer } from 'react';
-import { cleanup, render, screen, waitFor } from '@testing-library/react';
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { userEvent } from '@testing-library/user-event';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -48,7 +48,7 @@ const profile = (over: Record<string, unknown> = {}) => ({
 });
 
 beforeEach(() => vi.clearAllMocks());
-afterEach(() => cleanup());
+afterEach(() => { cleanup(); vi.restoreAllMocks(); });
 
 describe('ProfileTab:读取画像', () => {
   it('GET /api/profile 成功:渲染画像正文与种子书单,load 派发写入 saved', async () => {
@@ -137,6 +137,42 @@ describe('ProfileTab:人工修订画像', () => {
 });
 
 describe('ProfileTab:种子书单', () => {
+  it.each([
+    ['author', '作者', 200], ['reason', '喜欢或弃书的原因', 1_000],
+  ] as const)('%s 超长保存被拒后保留全部粘贴内容及未保存状态，可以修改后重试', async (field, label, limit) => {
+    vi.spyOn(window, 'confirm').mockReturnValue(true);
+    const message = `第 1 本种子书的${label}不能超过 ${limit} 字，请缩短后重试`;
+    let server = profile();
+    const apiFetch = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      if (init?.method === 'PUT') {
+        const body = JSON.parse(String(init.body));
+        if (body.seeds[0][field].trim().length > limit) return json({ error: message }, 400);
+        server = profile({ seeds: body.seeds, updatedAt: '2026-09-21T00:00:00.000Z' });
+      }
+      return json(server);
+    });
+    renderTab(apiFetch);
+    const user = userEvent.setup();
+    await screen.findByText('诡秘之主');
+    await user.click(screen.getByRole('button', { name: '编辑书单' }));
+    const pasted = '字'.repeat(limit + 1);
+    fireEvent.change(screen.getByRole('textbox', { name: label }), { target: { value: pasted } });
+    await user.click(screen.getByRole('button', { name: '保存种子' }));
+    expect(await screen.findByText(`✗ ${message}，草稿已保留。`)).toBeTruthy();
+    expect((screen.getByRole('textbox', { name: label }) as HTMLInputElement).value).toBe(pasted);
+    expect(screen.getByText('未保存')).toBeTruthy();
+    expect(screen.queryByText('✓ 种子已保存')).toBeNull();
+    fireEvent.change(screen.getByRole('textbox', { name: label }), { target: { value: '缩短后的内容' } });
+    await waitFor(() => expect((screen.getByRole('button', { name: '保存种子' }) as HTMLButtonElement).disabled).toBe(false));
+    await user.click(screen.getByRole('button', { name: '保存种子' }));
+    expect(await screen.findByText('✓ 种子已保存')).toBeTruthy();
+    expect(screen.queryByText('未保存')).toBeNull();
+    const puts = apiFetch.mock.calls.filter(([, init]) => init?.method === 'PUT');
+    expect(puts).toHaveLength(2);
+    expect(JSON.parse(String(puts[0][1]?.body)).seeds[0][field]).toBe(pasted);
+    expect(JSON.parse(String(puts[1][1]?.body)).seeds[0][field]).toBe('缩短后的内容');
+  });
+
   it('「编辑书单」→ 加一本最爱 → 「保存种子」发 PUT(seeds 里带新书)', async () => {
     const apiFetch = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
       if (init?.method === 'PUT') {
