@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 // 下载进度轮询（41-pollddl）：30 秒间隔 + 页面不可见暂停 + 回前台立即拉一次 + 终态停轮询。
 import { useState } from 'react';
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import LibraryTab, { createLibraryView, type LibraryView } from './LibraryTab';
@@ -25,7 +25,7 @@ const BOOK = {
 };
 
 let pollStatus: string;
-function makeApiFetch() {
+function makeApiFetch(poll?: () => Promise<Response>) {
   return vi.fn<ApiFetch>(async (input) => {
     const url = String(input);
     if (url.startsWith('/api/library')) {
@@ -35,6 +35,7 @@ function makeApiFetch() {
       return json({ id: 100, bookId: 7, title: '测试书', status: 'running', chaptersTotal: 10, chaptersDone: 1, charsTotal: 0, error: null, updatedAt: '' });
     }
     if (url.includes('/api/download?id=')) {
+      if (poll) return poll();
       return json({ id: 100, bookId: 7, title: '测试书', status: pollStatus, chaptersTotal: 10, chaptersDone: 5, charsTotal: 0, error: null, updatedAt: '' });
     }
     return json({}, 404);
@@ -79,6 +80,66 @@ afterEach(() => {
 });
 
 describe('LibraryTab 下载进度轮询', () => {
+  function pendingResponse() {
+    let resolve!: (response: Response) => void;
+    let reject!: (error: Error) => void;
+    const promise = new Promise<Response>((done, fail) => { resolve = done; reject = fail; });
+    return { promise, resolve, reject };
+  }
+
+  function progress(chaptersDone: number) {
+    return json({ id: 100, bookId: 7, title: '测试书', status: 'running', chaptersTotal: 10, chaptersDone });
+  }
+
+  function quotaResponse() {
+    return new Response(JSON.stringify({ code: 'DB_QUOTA_EXCEEDED' }), {
+      status: 503, headers: { 'Content-Type': 'application/json', 'Retry-After': '120' },
+    });
+  }
+
+  it.each(['progress', 'quota'] as const)('旧 %s 响应不能覆盖回前台新进度或改变正常轮询', async (oldResult) => {
+    const older = pendingResponse();
+    const newer = pendingResponse();
+    const poll = vi.fn<() => Promise<Response>>().mockReturnValueOnce(older.promise)
+      .mockReturnValueOnce(newer.promise).mockImplementation(async () => progress(8));
+    const apiFetch = makeApiFetch(poll);
+    await openDetailInProgress(apiFetch);
+    await act(async () => { setHidden(true); setHidden(false); });
+    expect(idCalls(apiFetch)).toBe(2);
+    await act(async () => newer.resolve(progress(7)));
+    expect(screen.getByText('下载中 7/10 章')).toBeTruthy();
+    await act(async () => older.resolve(oldResult === 'quota' ? quotaResponse() : progress(2)));
+    expect(screen.getByText('下载中 7/10 章')).toBeTruthy();
+    expect(screen.queryByText(/数据库额度已用尽/)).toBeNull();
+    await act(async () => { await vi.advanceTimersByTimeAsync(30_000); });
+    expect(idCalls(apiFetch)).toBe(3);
+    expect(screen.getByText('下载中 8/10 章')).toBeTruthy();
+  });
+
+  it.each(['progress', 'failure'] as const)('新配额暂停后，旧 %s 不能恢复轮询或推迟原重试时间', async (oldResult) => {
+    const older = pendingResponse();
+    const newer = pendingResponse();
+    const poll = vi.fn<() => Promise<Response>>().mockReturnValueOnce(older.promise)
+      .mockReturnValueOnce(newer.promise).mockImplementation(async () => progress(8));
+    const apiFetch = makeApiFetch(poll);
+    await openDetailInProgress(apiFetch);
+    await act(async () => { setHidden(true); setHidden(false); });
+    await act(async () => newer.resolve(quotaResponse()));
+    await act(async () => { await vi.advanceTimersByTimeAsync(60_000); });
+    expect(idCalls(apiFetch)).toBe(2);
+    await act(async () => {
+      if (oldResult === 'failure') older.reject(new Error('合成旧请求失败'));
+      else older.resolve(progress(2));
+    });
+    expect(screen.getByText(/数据库额度已用尽/)).toBeTruthy();
+    await act(async () => { await vi.advanceTimersByTimeAsync(59_000); });
+    expect(idCalls(apiFetch)).toBe(2);
+    await act(async () => { await vi.advanceTimersByTimeAsync(1_000); });
+    expect(idCalls(apiFetch)).toBe(3);
+    expect(screen.getByText('下载中 8/10 章')).toBeTruthy();
+    expect(screen.queryByText(/数据库额度已用尽/)).toBeNull();
+  });
+
   it('间隔为 30 秒：10 秒不触发、30 秒触发一次', async () => {
     const apiFetch = makeApiFetch();
     await openDetailInProgress(apiFetch);

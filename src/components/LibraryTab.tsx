@@ -322,6 +322,7 @@ export default function LibraryTab({ view, setView }: {
     let quotaRetry: ReturnType<typeof setTimeout> | null = null;
     let quotaPaused = false;
     let quotaDelayMs = 0;
+    let pollVersion = 0;
     const controller = new AbortController();
     const clearQuotaRetry = () => { if (quotaRetry !== null) { clearTimeout(quotaRetry); quotaRetry = null; } };
     const scheduleQuotaRetry = () => {
@@ -332,11 +333,15 @@ export default function LibraryTab({ view, setView }: {
     const poll = () => {
       if (controller.signal.aborted) return;
       const my = dlRequestId.current;
+      // 同一任务的定时刷新和回前台刷新可能并发，只接受最后发出的请求。
+      const version = ++pollVersion;
+      const current = () => !stale && !controller.signal.aborted
+        && version === pollVersion && my === dlRequestId.current;
       void (async () => {
         try {
           const res = await apiFetch(`/api/download?id=${pollTaskId}`, { signal: controller.signal });
           const data = await res.json();
-          if (stale) return;
+          if (!current()) return;
           if (isDbQuotaResponse(res.status, data)) {
             stop();
             quotaPaused = true;
@@ -359,7 +364,7 @@ export default function LibraryTab({ view, setView }: {
           }
         } catch {
           // 单次失败不打断轮询；配额暂停中的再探若网络失败，按同一间隔再排一次。
-          if (quotaPaused) scheduleQuotaRetry();
+          if (current() && quotaPaused) scheduleQuotaRetry();
         }
       })();
     };
