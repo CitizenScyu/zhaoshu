@@ -167,6 +167,25 @@ export const ADMISSION_OK_RECHECK_MS = 7 * 24 * 3_600_000;
  * 可疑行按 ADMISSION_RETEST_INTERVAL_MS(20h) 到期走 class 1 再确认，再失败才写真实结论出池。
  */
 export const ADMISSION_RECHECK_FAIL_PREFIX = 'recheck_fail:';
+/**
+ * phoenix runner 探测出的 ok 行标记前缀（admrunner42，设计 admphx42 §3.3 方案 B）：runner 侧探得 ok 时
+ * search_ok=true、verdict='ok' 照常，但 error 写成 `phoenix_ok:`（无尾巴），表示「phoenix 出网能搜到，
+ * Vercel 出网尚未确认」。**池谓词全部排除这类行**（`error NOT LIKE 'phoenix_ok:%'`，见 shuyuan.ts
+ * readEngineRows/readAdmissionFunnel 与 supported-sources.ts engineHosts）：源要进池仍须 Vercel 侧复测一次。
+ * Vercel 侧：isRetestDue 把它按 ADMISSION_RETEST_INTERVAL_MS(20h) 判到期、planProbeOrder 排 class 1；
+ * 复测 ok ⇒ 写干净 ok 行（前缀洗掉，进池）；复测失败 ⇒ **直接写真实结论**（不走 recheck_fail: 宽限——
+ * phoenix_ok: 行本来就不在池里，没有「留池」可言）。
+ *
+ * 与其它 error 前缀的共存关系（error 列只有一个最外层前缀）：
+ * | 前缀              | 只出现在                         | 与 phoenix_ok: 关系                          |
+ * | phoenix_ok:       | search_ok=true, verdict=ok       | —                                            |
+ * | recheck_fail:     | search_ok=true, verdict=ok       | 互斥：phoenix_ok: 行失败直接出池，不写 strike  |
+ * | fail_count:       | search_ok=false                  | 互斥：applyFailCountPrefix 只处理失败行        |
+ * | challenge_strike: | search_ok=false, verdict=challenge | 互斥：同上                                  |
+ * 解析一律 startsWith，parseFailCount 不改（它只剥 fail_count:，对 phoenix_ok: 行原样返回、count 按无前缀算）。
+ * 只由 runner 经 AdmissionBatchInput.okPrefix 传入；Vercel 两条路径不传 ⇒ 输出逐字不变。
+ */
+export const ADMISSION_PHOENIX_OK_PREFIX = 'phoenix_ok:';
 
 // ---------------------------------------------------------------- 失败重测指数退避（admbackoff42，设计 T3）
 // 问题（任务书「推动哪个数字」）：09-27 起独立轮每轮名额 200，1–2 天清完 548 个从未测过的源；
@@ -882,6 +901,11 @@ export interface AdmissionBatchInput {
   keywordFallback?: boolean;
   /** http 升级源每轮首探上限覆盖（测试注入用）；缺省走 `admissionUpgradedMaxProbes()`。 */
   upgradedMaxProbes?: number;
+  /**
+   * 探得干净 ok（error 为空）时写进 error 列的标记前缀（admrunner42）。只有 phoenix runner 传
+   * ADMISSION_PHOENIX_OK_PREFIX；缺省不传 ⇒ 输出行逐字不变（Vercel 两条路径）。
+   */
+  okPrefix?: string;
 }
 
 export interface AdmissionBatchResult {
@@ -1042,10 +1066,11 @@ function isRetestDue(row: AdmissionSourceRow, nowMs: number, urlStillInvalid: ()
   }
   // 41-B2-OK-RECHECK：ok 源不再永久免检。可疑行（error 带 recheck_fail: 前缀）按 20h 窗
   // 到期（class 1，在池里的可疑源最该早点确认）；干净 ok 行按 7 天长周期复核到期（class 2）。
+  // admrunner42：phoenix_ok: 行（runner 探 ok、待 Vercel 确认，不在池）同样 20h 窗、class 1。
   if (row.search_verdict === 'ok') {
     if (!row.search_checked_at) return true;
     const checked = Date.parse(row.search_checked_at);
-    const window = row.error.startsWith(ADMISSION_RECHECK_FAIL_PREFIX)
+    const window = row.error.startsWith(ADMISSION_RECHECK_FAIL_PREFIX) || row.error.startsWith(ADMISSION_PHOENIX_OK_PREFIX)
       ? ADMISSION_RETEST_INTERVAL_MS : ADMISSION_OK_RECHECK_MS;
     return !Number.isFinite(checked) || nowMs - checked >= window;
   }
@@ -1086,10 +1111,11 @@ function planProbeOrder(input: AdmissionBatchInput, nowMs: number): AdmissionPla
     else if (rulesChanged
       || isRetestDue(previous, nowMs, () => searchUrlStillInvalid(candidate.source, input.declaredHosts))) {
       // 41-B2-OK-RECHECK：干净 ok 行的长周期复核排最后（class 2），其余到期者（deferred /
-      // conn_fail 衰减 / 可疑 ok / 规则变）走 class 1。
+      // conn_fail 衰减 / 可疑 ok / 规则变 / phoenix_ok: 待确认，admrunner42）走 class 1。
       probeClass = !rulesChanged
         && previous.search_verdict === 'ok'
-        && !previous.error.startsWith(ADMISSION_RECHECK_FAIL_PREFIX) ? 2 : 1;
+        && !previous.error.startsWith(ADMISSION_RECHECK_FAIL_PREFIX)
+        && !previous.error.startsWith(ADMISSION_PHOENIX_OK_PREFIX) ? 2 : 1;
     }
     const checked = previous?.search_checked_at ? Date.parse(previous.search_checked_at) : Number.NaN;
     return {
@@ -1117,6 +1143,8 @@ function normalizeAdmissionConcurrency(value: number): number {
  * - 干净 ok 行首次复核失败：写 strike 标记（search_ok/verdict 保持 ok，error=`recheck_fail:<真实 verdict>`），
  *   源留池，20h 后走 class 1 再确认。
  * - 可疑行（已带 strike）再失败：strike 耗尽，写真实结论出池，之后走既有 deferred/conn_fail 复测回路。
+ * - phoenix_ok: 行（admrunner42，runner 探 ok 待 Vercel 确认、不在池）：复测失败直接写真实结论（不给 strike——
+ *   没有「留池」可言）；复测成功写干净 ok（error 空，前缀洗掉，进池）。
  */
 export function recheckOutcome(previous: AdmissionSourceRow | undefined, result: AdmissionSearchResult): {
   search_ok: boolean; search_verdict: string; error: string;
@@ -1126,11 +1154,24 @@ export function recheckOutcome(previous: AdmissionSourceRow | undefined, result:
     && previous !== undefined
     && previous.search_ok === true
     && previous.search_verdict === 'ok'
-    && !previous.error.startsWith(ADMISSION_RECHECK_FAIL_PREFIX);
+    && !previous.error.startsWith(ADMISSION_RECHECK_FAIL_PREFIX)
+    && !previous.error.startsWith(ADMISSION_PHOENIX_OK_PREFIX);
   if (result.verdict !== 'ok' && striking) {
     return { search_ok: true, search_verdict: 'ok', error: `${ADMISSION_RECHECK_FAIL_PREFIX}${result.verdict}` };
   }
   return { search_ok: result.verdict === 'ok', search_verdict: result.verdict, error: result.error };
+}
+
+/**
+ * 既有行是否为「Vercel 已确认的在池 ok」（admrunner42）：search_ok=true、verdict ok、error 不带 phoenix_ok:
+ * 前缀且规则未变。runner（okPrefix 路径）对这类行探得 ok 时保留原 error，不打 phoenix_ok: 把在池源踢出池。
+ */
+function isVercelConfirmedOk(previous: AdmissionSourceRow | undefined, hash: string): boolean {
+  return previous !== undefined
+    && previous.rules_hash === hash
+    && previous.search_ok === true
+    && previous.search_verdict === 'ok'
+    && !previous.error.startsWith(ADMISSION_PHOENIX_OK_PREFIX);
 }
 /**
  * 跑一轮准入批次（设计 §4.2）。纯逻辑：不碰 DB，输入既有行、输出要写库的行。
@@ -1294,6 +1335,12 @@ export async function runAdmissionBatch(input: AdmissionBatchInput): Promise<Adm
         // 41-B2-OK-RECHECK:写库结论走 recheckOutcome——干净 ok 行首次复核失败记 strike 不出池。
         // 必须用 item.previous:worker 是独立函数,闭包拿不到外层循环的 previous。
         const outcome = recheckOutcome(item.previous, result);
+        // admrunner42：runner 探得干净 ok 时打 okPrefix（phoenix_ok:，池外待 Vercel 确认）。例外：该源已是
+        // Vercel 确认过的在池行（search_ok=true、无 phoenix_ok: 前缀、规则未变）——runner 的复核 ok 不能把
+        // 在池源踢出池，保留原 error（干净 ok 仍干净；带 recheck_fail: strike 的仍留 strike，由 Vercel 定夺）。
+        if (input.okPrefix && outcome.search_verdict === 'ok' && outcome.error === '') {
+          outcome.error = isVercelConfirmedOk(item.previous, item.hash) ? item.previous!.error : input.okPrefix;
+        }
         // 41-srcfix 改法1：challenge 结论带 strike 计数（有限复测的上限判据，见 challengeStrikes）。
         if (outcome.search_verdict === 'challenge') {
           outcome.error = challengeError(item.previous, item.hash, outcome.error);

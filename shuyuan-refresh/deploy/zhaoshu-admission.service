@@ -1,0 +1,22 @@
+[Unit]
+Description=zhaoshu source admission probe (phoenix runner, admrunner42; reuses repo admitRows)
+Documentation=file:/opt/zhaoshu-shuyuan-refresh/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+# 只读 DATABASE_URL 一个键(见 /etc/zhaoshu-shuyuan/env 的键清单)。
+EnvironmentFile=/etc/zhaoshu-shuyuan/env
+# admrunner42 任务书写死:每轮 40 探、并发 4;租约 TTL ≥ 看门狗(持有者被杀也最迟 15 分钟释放)。
+Environment=ADMISSION_MAX_PROBES=40
+Environment=ADMISSION_PROBE_CONCURRENCY=4
+Environment=ADMISSION_LEASE_TTL_MS=900000
+Environment=WATCHDOG_MS=900000
+Environment=HEARTBEAT_FILE=/opt/zhaoshu-shuyuan-refresh/admission-heartbeat.log
+Environment=STATUS_FILE=/opt/zhaoshu-shuyuan-refresh/admission-last-run.status
+ExecStart=/opt/node24/bin/node /opt/zhaoshu-shuyuan-refresh/refresh-runner.mjs --admission
+# 看门狗 900s 退 2 先于 systemd 硬杀。
+TimeoutStartSec=960
+Nice=10

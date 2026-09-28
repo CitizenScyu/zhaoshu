@@ -69,13 +69,15 @@ interface AdmissionHostRow { host: string }
  * 只回 host 列，不读 source 大列、出站字节不增。
  * 故意**不**跟取书池一样滤 disabled/probe failed：刷新路径的探测入队也用这道门（canProbe），
  * 按 probe 态收窄会让判死的源永远重探不到、恢复不了。
+ * admrunner42：phoenix_ok: 行（phoenix runner 探 ok、Vercel 未确认）不放行——与 shuyuan.ts readEngineRows /
+ * readAdmissionFunnel ok 桶同一谓词，池与门口径一致。
  */
 export async function engineHosts(signal?: AbortSignal): Promise<string[]> {
   const { getSql } = await import('./db');
   const sql = getSql();
   const query = sql`
     SELECT DISTINCT host FROM source_admission a
-    WHERE a.compile_ok AND a.search_ok IS TRUE AND a.host <> ''
+    WHERE a.compile_ok AND a.search_ok IS TRUE AND (a.error IS NULL OR a.error NOT LIKE 'phoenix_ok:%') AND a.host <> ''
       AND EXISTS (SELECT 1 FROM shuyuan_sources src WHERE src.source_url = a.source_url)`;
   const [rows] = await sql.transaction([query], {
     readOnly: true, ...(signal ? { fetchOptions: { signal } } : {}),

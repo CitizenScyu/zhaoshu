@@ -1,0 +1,11 @@
+[Unit]
+Description=zhaoshu source admission probe every 2h (phoenix runner, admrunner42)
+
+[Timer]
+# 每 2 小时一轮(01:17、03:17 … 23:17 UTC),错开 Vercel 独立轮(14:00 UTC)与刷新(20:00/20:30 UTC)的整点。
+OnCalendar=*-*-* 01/2:17:00 UTC
+Persistent=true
+RandomizedDelaySec=120
+
+[Install]
+WantedBy=timers.target

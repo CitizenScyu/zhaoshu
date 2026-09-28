@@ -30,9 +30,9 @@ vi.mock('@/lib/db', () => ({ ensureSchema, getSql }));
 
 import {
   ADMISSION_LEASE_ROW, ADMISSION_LEASE_TTL_MS, ADMISSION_ROUND_BUDGET_MS, REFRESH_BUDGET_MS,
-  admissionOwnCronEnabled, refreshShuyuan, runAdmissionRound,
+  admissionLeaseTtlMs, admissionOwnCronEnabled, refreshShuyuan, runAdmissionRound, runAdmissionRunnerRound,
 } from './shuyuan';
-import { ADMISSION_PROBE_WORST_MS } from './rule-engine/admission';
+import { ADMISSION_PHOENIX_OK_PREFIX, ADMISSION_PROBE_WORST_MS } from './rule-engine/admission';
 
 const WRITE_RESERVE_MS = 5_000; // shuyuan.ts 同名常量（未导出）；止损门 = 剩余 > 单探最坏 + 写库预留
 const indexUrl = 'https://www.yckceo.com/yuedu/shuyuans/index.html';
@@ -107,6 +107,122 @@ describe('admissionOwnCronEnabled', () => {
     for (const off of [undefined, '', '0', 'false', 'yes', 'enabled']) {
       expect(admissionOwnCronEnabled({ ADMISSION_OWN_CRON: off })).toBe(false);
     }
+  });
+});
+
+// admrunner42：租约 TTL env 化——默认逐字 300_000（Vercel 不设 env 行为不变），phoenix 单元设 900000。
+describe('admissionLeaseTtlMs', () => {
+  it('f) 默认 300_000；env 正整数即用；非法/0/负数/空白回默认', () => {
+    expect(ADMISSION_LEASE_TTL_MS).toBe(300_000);
+    expect(admissionLeaseTtlMs({})).toBe(300_000);
+    expect(admissionLeaseTtlMs({ ADMISSION_LEASE_TTL_MS: '900000' })).toBe(900_000);
+    expect(admissionLeaseTtlMs({ ADMISSION_LEASE_TTL_MS: '1' })).toBe(1);
+    for (const bad of [undefined, '', ' ', '0', '-5', 'abc', 'NaN', '9007199254740993']) {
+      expect(admissionLeaseTtlMs({ ADMISSION_LEASE_TTL_MS: bad }), String(bad)).toBe(300_000);
+    }
+    // '1.5' 被 parseInt 截成 1（与其它 *_MS env 的解析口径一致，不额外拒绝）。
+    expect(admissionLeaseTtlMs({ ADMISSION_LEASE_TTL_MS: '1.5' })).toBe(1);
+  });
+
+  it('租约语句吃 env 值：设 900000 时 VALUES 参数是 900000；不设时是默认 300000', async () => {
+    vi.stubEnv('ADMISSION_LEASE_TTL_MS', '900000');
+    await runAdmissionRound();
+    expect(leaseQueries().at(-1)!.values).toEqual([ADMISSION_LEASE_ROW, 900_000]);
+    vi.unstubAllEnvs();
+    execute.mockClear();
+    await runAdmissionRound();
+    expect(leaseQueries().at(-1)!.values).toEqual([ADMISSION_LEASE_ROW, ADMISSION_LEASE_TTL_MS]);
+  });
+});
+
+// admrunner42：phoenix runner 轮（entry.ts --admission）：同一把租约、同一条流水；ok 行带 phoenix_ok:；不发布产物。
+describe('runAdmissionRunnerRound（phoenix runner）', () => {
+  // 候选 URL 回显查询词（href=/b/<q>）：主搜索与对照搜索关键词不同 ⇒ 候选 URL 不同 ⇒ Jaccard 0，
+  // 判 ok 而非 query_insensitive（模拟真正随查询变化的站点；静态页会被对照判据判 query_insensitive）。
+  const okResponse = (input: RequestInfo | URL) => {
+    const q = new URL(String(input)).searchParams.get('q') ?? '';
+    const html = `<div class="i"><span class="t">${q}</span><a href="/b/${encodeURIComponent(q)}">x</a><span class="a">作者</span></div>`;
+    return new Response(html, { status: 200, headers: { 'content-type': 'text/html' } });
+  };
+
+  it('ok 站写 phoenix_ok: 前缀、死站写真实 verdict；不发布产物；记 admission 成功行', async () => {
+    vi.useFakeTimers();
+    vi.stubEnv('ADMISSION_MAX_PROBES', '2');
+    vi.stubEnv('SHUYUAN_POOL_ARTIFACT', '1');
+    vi.stubEnv('SHUYUAN_POOL_ARTIFACT_PATH', 'D:/nonexistent/pool.json');
+    stored = [
+      { source_url: 'https://dead0.example/', source: deadSource(0) },
+      { source_url: 'https://dead1.example/', source: deadSource(1) },
+    ];
+    fetchMock.mockImplementation((input, options) => {
+      const url = String(input);
+      if (!SEARCH.test(url)) return Promise.reject(new Error(`Unexpected network request: ${url}`));
+      // dead0 探 ok（页面含候选），dead1 永远挂到超时 ⇒ conn_fail。
+      if (url.startsWith('https://dead0.')) return Promise.resolve(okResponse(input));
+      return new Promise<Response>((_resolve, reject) => {
+        options!.signal!.addEventListener('abort', () => reject(options!.signal!.reason), { once: true });
+      });
+    });
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const settled = runAdmissionRunnerRound(120_000);
+    await vi.advanceTimersByTimeAsync(120_000 + 60_000);
+    const summary = await settled;
+    vi.useRealTimers();
+    expect(summary).toMatchObject({ sources: 2, candidates: 2, probed: 2, written: 2 });
+    const insert = queries().find((query) => query.text.startsWith('INSERT INTO source_admission'))!;
+    const rows = JSON.parse(insert.values[0] as string) as { source_url: string; search_ok: boolean | null; search_verdict: string; error: string }[];
+    const byUrl = Object.fromEntries(rows.map((row) => [row.source_url, row]));
+    expect(byUrl['https://dead0.example/']).toMatchObject({ search_ok: true, search_verdict: 'ok', error: ADMISSION_PHOENIX_OK_PREFIX });
+    expect(byUrl['https://dead1.example/']).toMatchObject({ search_ok: false, search_verdict: 'conn_fail' });
+    expect(byUrl['https://dead1.example/'].error.startsWith(ADMISSION_PHOENIX_OK_PREFIX)).toBe(false);
+    // 不发布产物：没有产物生成的库读（shuyuan_meta 投影），收尾行 artifact='skipped'、trigger='runner'。
+    expect(queries().some((query) => query.text.includes('FROM shuyuan_meta'))).toBe(false);
+    const [round] = logged(log, 'shuyuan admission round') as { artifact: string; trigger: string }[];
+    expect(round).toMatchObject({ artifact: 'skipped', trigger: 'runner', written: 2 });
+    expect(successQueries()).toHaveLength(1);
+    // 租约先于读源表。
+    const order = queries().map((query) => query.text);
+    expect(order.findIndex((text) => text.startsWith('INSERT INTO cron_health')))
+      .toBeLessThan(order.findIndex((text) => text.startsWith('SELECT source_url, source FROM shuyuan_sources')));
+  });
+
+  it('租约被占 ⇒ 整轮跳过（trigger=runner），不读源表、不探、不记成功行', async () => {
+    lease = 'held';
+    stored = [{ source_url: 'https://dead0.example/', source: deadSource(0) }];
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {});
+    expect(await runAdmissionRunnerRound(60_000)).toEqual({ skipped: 'lease' });
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(queries().map((query) => query.text)).toEqual([expect.stringMatching(/^INSERT INTO cron_health/)]);
+    expect(logged(log, 'shuyuan admission batch')).toEqual([{ skipped: 'lease', trigger: 'runner' }]);
+    expect(successQueries()).toHaveLength(0);
+  });
+
+  it('租约领取报错 ⇒ fail-closed，不探', async () => {
+    lease = 'error';
+    stored = [{ source_url: 'https://dead0.example/', source: deadSource(0) }];
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    expect(await runAdmissionRunnerRound(60_000)).toEqual({ skipped: 'lease' });
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(console.error).toHaveBeenCalledWith('shuyuan admission lease failed', { trigger: 'runner', reason: expect.any(String) });
+  });
+
+  it('Vercel 独立轮（runAdmissionRound）对同一 ok 站不带前缀（okPrefix 缺省，改前逐字）', async () => {
+    vi.useFakeTimers();
+    vi.stubEnv('ADMISSION_MAX_PROBES', '1');
+    stored = [{ source_url: 'https://dead0.example/', source: deadSource(0) }];
+    fetchMock.mockImplementation((input) => {
+      const url = String(input);
+      if (!SEARCH.test(url)) return Promise.reject(new Error(`Unexpected network request: ${url}`));
+      return Promise.resolve(okResponse(input));
+    });
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    const settled = runAdmissionRound();
+    await vi.advanceTimersByTimeAsync(ADMISSION_ROUND_BUDGET_MS + 60_000);
+    await settled;
+    vi.useRealTimers();
+    const insert = queries().find((query) => query.text.startsWith('INSERT INTO source_admission'))!;
+    const [row] = JSON.parse(insert.values[0] as string) as { search_ok: boolean | null; search_verdict: string; error: string }[];
+    expect(row).toMatchObject({ search_ok: true, search_verdict: 'ok', error: '' });
   });
 });
 
