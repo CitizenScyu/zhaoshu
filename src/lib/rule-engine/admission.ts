@@ -182,7 +182,7 @@ export const ADMISSION_RECHECK_FAIL_PREFIX = 'recheck_fail:';
  * | recheck_fail:     | search_ok=true, verdict=ok       | 互斥：phoenix_ok: 行失败直接出池，不写 strike  |
  * | fail_count:       | search_ok=false                  | 互斥：applyFailCountPrefix 只处理失败行        |
  * | challenge_strike: | search_ok=false, verdict=challenge | 互斥：同上                                  |
- * 解析一律 startsWith，parseFailCount 不改（它只剥 fail_count:，对 phoenix_ok: 行返回 count 0）。
+ * 解析一律 startsWith，parseFailCount 不改（它只剥 fail_count:，对 phoenix_ok: 行原样返回、count 按无前缀算）。
  * 只由 runner 经 AdmissionBatchInput.okPrefix 传入；Vercel 两条路径不传 ⇒ 输出逐字不变。
  */
 export const ADMISSION_PHOENIX_OK_PREFIX = 'phoenix_ok:';

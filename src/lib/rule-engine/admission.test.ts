@@ -6,7 +6,7 @@ import {
   ADMISSION_CONN_FAIL_RETEST_MS, ADMISSION_OK_RECHECK_MS, ADMISSION_RECHECK_FAIL_PREFIX,
   ADMISSION_RETEST_INTERVAL_MS, ADMISSION_TIMEOUT_MS, DEFAULT_ADMISSION_MAX_PROBES,
   DEFAULT_ADMISSION_PROBE_CONCURRENCY, MAX_ADMISSION_PROBE_CONCURRENCY,
-  ADMISSION_FAIL_COUNT_PREFIX, ADMISSION_NO_RESULT_RETEST_MS,
+  ADMISSION_FAIL_COUNT_PREFIX, ADMISSION_NO_RESULT_RETEST_MS, ADMISSION_PHOENIX_OK_PREFIX,
   ADMISSION_CONN_FAIL_MAX_MS, ADMISSION_HTTP_ERR_MAX_MS,
   ADMISSION_NO_RESULT_MAX_MS, ADMISSION_QUERY_INSENSITIVE_MAX_MS,
   parseFailCount, applyFailCountPrefix,
@@ -1473,6 +1473,146 @@ describe('准入状态机 runAdmissionBatch', () => {
       expect(recheckOutcome(cleanOk, failed)).toEqual({
         search_ok: true, search_verdict: 'ok', error: `${ADMISSION_RECHECK_FAIL_PREFIX}http_5xx`,
       });
+    });
+  });
+
+  // admrunner42：phoenix runner 探得 ok 写 phoenix_ok: 前缀（池外待 Vercel 确认）；Vercel 侧对前缀行
+  // 20h 到期 class 1，复测 ok 洗前缀、复测失败直接写真实 verdict（不给 recheck_fail: 宽限）。
+  describe('admrunner42：okPrefix（phoenix_ok:）与 Vercel 复测洗前缀', () => {
+    const url = 'https://phx.example.com';
+    const source = syntheticSource('https://phx.example.com/');
+    const hash = rulesHash(source);
+    const okPage = () => vi.fn<AdmissionTransport>().mockResolvedValue(
+      page('<div class="i"><span class="t">书名</span><a href="/b/1">x</a></div>'));
+    const deadUrl = 'https://phx-dead.example.com';
+    const deadSource = syntheticSource('https://phx-dead.example.com/');
+    const hosts = new Set(['phx.example.com', 'phx-dead.example.com']);
+    const okPrefixed = (over: Partial<AdmissionSourceRow> = {}) => sourceRow(url, {
+      tier: 'M1', compile_ok: true, search_ok: true, search_verdict: 'ok', rules_hash: hash,
+      error: ADMISSION_PHOENIX_OK_PREFIX, ...over,
+    });
+    /** 一个 ok 站 + 一个 http_5xx 站，按 host 分派页面。 */
+    const mixedPage = () => vi.fn<AdmissionTransport>().mockImplementation(async (request) => {
+      const target = typeof request === 'string' ? request : (request as { url: string }).url;
+      return target.includes('phx-dead') ? page('boom', 500)
+        : page('<div class="i"><span class="t">书名</span><a href="/b/1">x</a></div>');
+    });
+    const batch = (over: Partial<Parameters<typeof runAdmissionBatch>[0]> = {}) => runAdmissionBatch({
+      candidates: [{ url, source }, { url: deadUrl, source: deadSource }],
+      declaredHosts: hosts, existing: new Map(), fetchPage: mixedPage(),
+      signal: signal(), throttleMs: 0, now: atFixtureNow, ...over,
+    });
+
+    it('前缀常量集中声明，且与 fail_count:/recheck_fail:/challenge_strike: 字面互异', () => {
+      expect(ADMISSION_PHOENIX_OK_PREFIX).toBe('phoenix_ok:');
+      expect(new Set([
+        ADMISSION_PHOENIX_OK_PREFIX, ADMISSION_FAIL_COUNT_PREFIX, ADMISSION_RECHECK_FAIL_PREFIX, ADMISSION_CHALLENGE_STRIKE_PREFIX,
+      ]).size).toBe(4);
+      // parseFailCount 不改：对 phoenix_ok: 行按「无 fail_count 前缀」原样返回（count 1 = 既有语义）。
+      expect(parseFailCount(ADMISSION_PHOENIX_OK_PREFIX)).toEqual({ count: 1, rest: ADMISSION_PHOENIX_OK_PREFIX });
+    });
+
+    it('a) okPrefix 缺省 ⇒ 输出行与显式 undefined / 改前形状逐字一致（ok 行 error 空，失败行真实 error）', async () => {
+      const plain = await batch();
+      const explicit = await batch({ okPrefix: undefined });
+      expect(explicit.rows).toEqual(plain.rows);
+      expect(plain.rows.map((row) => [row.source_url, row.search_ok, row.search_verdict, row.error])).toEqual([
+        [url, true, 'ok', ''],
+        [deadUrl, false, 'http_5xx', '500'],
+      ]);
+      expect(plain).toMatchObject({ probed: 2, compileOk: 2, compileRejected: 0 });
+    });
+
+    it('b) 传 okPrefix ⇒ ok 行 error=前缀（search_ok/verdict 照常），失败行不带前缀，其余字段与不传时逐字相同', async () => {
+      const plain = await batch();
+      const prefixed = await batch({ okPrefix: ADMISSION_PHOENIX_OK_PREFIX });
+      expect(prefixed.rows.map((row) => [row.source_url, row.search_ok, row.search_verdict, row.error])).toEqual([
+        [url, true, 'ok', ADMISSION_PHOENIX_OK_PREFIX],
+        [deadUrl, false, 'http_5xx', '500'],
+      ]);
+      // 只有 ok 行的 error 不同，其它字段（tier/hash/version/host/checked_at…）逐字一致。
+      expect(prefixed.rows.map((row) => ({ ...row, error: row.source_url === url ? '' : row.error }))).toEqual(plain.rows);
+    });
+
+    it('b2) runner 复核 Vercel 已确认的在池 ok 行：探得 ok 保留原 error（不打前缀把在池源踢出池）', async () => {
+      // 干净 ok 行 8 天前测过（class 2 到期）：runner 探 ok ⇒ 仍是干净 ok（error 空），不变成 phoenix_ok:。
+      const cleanOk = okPrefixed({ error: '', search_checked_at: fixtureAgoIso(8 * 24 * 3_600_000) });
+      const kept = await batch({
+        candidates: [{ url, source }], existing: new Map([[url, cleanOk]]), okPrefix: ADMISSION_PHOENIX_OK_PREFIX,
+        fetchPage: okPage(),
+      });
+      expect(kept.probed).toBe(1);
+      expect(kept.rows[0]).toMatchObject({ search_ok: true, search_verdict: 'ok', error: '' });
+      // 带 recheck_fail: strike 的在池行：runner 探 ok 保留 strike（由 Vercel 定夺是否洗掉）。
+      const strike = okPrefixed({
+        error: `${ADMISSION_RECHECK_FAIL_PREFIX}http_5xx`, search_checked_at: fixtureAgoIso(21 * 3_600_000),
+      });
+      const keptStrike = await batch({
+        candidates: [{ url, source }], existing: new Map([[url, strike]]), okPrefix: ADMISSION_PHOENIX_OK_PREFIX,
+        fetchPage: okPage(),
+      });
+      expect(keptStrike.rows[0]).toMatchObject({ search_ok: true, search_verdict: 'ok', error: `${ADMISSION_RECHECK_FAIL_PREFIX}http_5xx` });
+      // 规则变了的在池 ok 行：旧确认作废，runner 探 ok 打前缀等 Vercel 重新确认。
+      const changed = okPrefixed({ error: '', rules_hash: 'stale', search_checked_at: fixtureAgoIso(3_600_000) });
+      const rehash = await batch({
+        candidates: [{ url, source }], existing: new Map([[url, changed]]), okPrefix: ADMISSION_PHOENIX_OK_PREFIX,
+        fetchPage: okPage(),
+      });
+      expect(rehash.rows[0]).toMatchObject({ search_ok: true, search_verdict: 'ok', error: ADMISSION_PHOENIX_OK_PREFIX });
+      // runner 对在池 ok 行探失败：与 Vercel 同款 recheck_fail: strike（不出池）。
+      const struck = await batch({
+        candidates: [{ url, source }], existing: new Map([[url, cleanOk]]), okPrefix: ADMISSION_PHOENIX_OK_PREFIX,
+        fetchPage: vi.fn<AdmissionTransport>().mockResolvedValue(page('boom', 500)),
+      });
+      expect(struck.rows[0]).toMatchObject({ search_ok: true, search_verdict: 'ok', error: `${ADMISSION_RECHECK_FAIL_PREFIX}http_5xx` });
+    });
+
+    it('d) Vercel 复测（不传 okPrefix）：前缀行 ok ⇒ 干净 ok 行（前缀洗掉）；失败 ⇒ 直接写真实 verdict，不写 recheck_fail:', async () => {
+      const due = okPrefixed({ search_checked_at: fixtureAgoIso(21 * 3_600_000) });
+      const washed = await batch({ candidates: [{ url, source }], existing: new Map([[url, due]]), fetchPage: okPage() });
+      expect(washed.probed).toBe(1);
+      expect(washed.rows[0]).toMatchObject({ search_ok: true, search_verdict: 'ok', error: '' });
+      for (const [verdict, fetchPage, error] of [
+        ['http_5xx', vi.fn<AdmissionTransport>().mockResolvedValue(page('boom', 500)), '500'],
+        ['conn_fail', vi.fn<AdmissionTransport>().mockRejectedValue(new TypeError('fetch failed')), 'fetch failed'],
+      ] as const) {
+        const failed = await batch({ candidates: [{ url, source }], existing: new Map([[url, due]]), fetchPage });
+        expect(failed.rows[0], verdict).toMatchObject({ search_ok: false, search_verdict: verdict, error });
+        expect(failed.rows[0].error, verdict).not.toContain(ADMISSION_RECHECK_FAIL_PREFIX);
+      }
+      // recheckOutcome 纯函数同款：前缀行不算「干净 ok」，失败不 strike。
+      const failed = { verdict: 'http_5xx', candidateCount: 0, status: 500, error: '500' } as const;
+      expect(recheckOutcome(okPrefixed(), failed)).toEqual({ search_ok: false, search_verdict: 'http_5xx', error: '500' });
+    });
+
+    it('e) isRetestDue/planProbeOrder：前缀行 19h 未到期、21h 到期且归 class 1（输给 class 0、赢过 class 2 干净 ok）', async () => {
+      const fresh = await batch({
+        candidates: [{ url, source }], existing: new Map([[url, okPrefixed({ search_checked_at: fixtureAgoIso(19 * 3_600_000) })]]),
+        fetchPage: vi.fn<AdmissionTransport>(),
+      });
+      expect(fresh.probed).toBe(0);
+      expect(fresh.rows).toHaveLength(0);
+
+      const due = okPrefixed({ search_checked_at: fixtureAgoIso(21 * 3_600_000) });
+      const cleanUrl = 'https://phx-clean.example.com';
+      const cleanSource = syntheticSource('https://phx-clean.example.com/');
+      const neverUrl = 'https://phx-never.example.com';
+      const neverSource = syntheticSource('https://phx-never.example.com/');
+      const existing = new Map<string, AdmissionSourceRow>([
+        [url, due],
+        // 干净 ok、比前缀行更旧（8 天）：若前缀行被错判 class 2，最旧优先会让它输给这行。
+        [cleanUrl, sourceRow(cleanUrl, {
+          tier: 'M1', compile_ok: true, search_ok: true, search_verdict: 'ok', rules_hash: rulesHash(cleanSource),
+          search_checked_at: fixtureAgoIso(8 * 24 * 3_600_000),
+        })],
+      ]);
+      const candidates = [{ url, source }, { url: cleanUrl, source: cleanSource }, { url: neverUrl, source: neverSource }];
+      const declaredHosts = new Set(['phx.example.com', 'phx-clean.example.com', 'phx-never.example.com']);
+      const probedUrls = (rows: AdmissionSourceRow[]) => rows.filter((row) => row.search_verdict !== '').map((row) => row.source_url);
+      const one = await batch({ candidates, existing, declaredHosts, fetchPage: okPage(), maxProbes: 1 });
+      expect(probedUrls(one.rows)).toEqual([neverUrl]); // class 0 先于前缀行
+      const two = await batch({ candidates, existing, declaredHosts, fetchPage: okPage(), maxProbes: 2 });
+      expect(probedUrls(two.rows)).toEqual([neverUrl, url]); // 前缀行 class 1，赢过更旧的 class 2 干净 ok
     });
   });
 });
