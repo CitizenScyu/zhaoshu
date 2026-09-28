@@ -11,7 +11,7 @@ type Statement = { text: string; params: unknown[] };
 const { getSql } = vi.hoisted(() => ({ getSql: vi.fn() }));
 vi.mock('@/lib/db', () => ({ ensureSchema: vi.fn(), getSql }));
 
-import { ADMISSION_LEASE_ROW, ADMISSION_LEASE_TTL_MS, runAdmissionRound } from './shuyuan';
+import { ADMISSION_LEASE_ROW, ADMISSION_LEASE_TTL_MS, runAdmissionRound, runAdmissionRunnerRound } from './shuyuan';
 import { readCronSuccessTimes } from './source-health';
 
 /** neon 形状的惰性标签：`sql\`\`` 只描述语句，await 或 transaction([...]) 时才执行（同 shuyuan.pool-meta.pglite.test.ts）。 */
@@ -82,5 +82,22 @@ maybe('42-admbudget 准入租约（PGlite 真库）', () => {
     const times = await readCronSuccessTimes();
     expect(Object.keys(times)).not.toContain(ADMISSION_LEASE_ROW);
     expect(Object.values(times).every((value) => value === null)).toBe(true);
+  });
+
+  // admrunner42：phoenix runner 轮与 Vercel 独立轮共用同一把租约（同一行、同一语句），且 TTL 走 env。
+  it('runner 轮与独立轮互斥：runner 持有（env TTL 900s）时独立轮领不到；反之亦然', async () => {
+    vi.stubEnv('ADMISSION_LEASE_TTL_MS', '900000');
+    try {
+      expect(await runAdmissionRunnerRound(60_000)).toEqual({ skipped: 'no_candidates' });
+      const remaining = await leaseRemainingMs();
+      expect(remaining).toBeGreaterThan(900_000 - 60_000);
+      expect(remaining).toBeLessThanOrEqual(900_000);
+      expect(await runAdmissionRound()).toEqual({ skipped: 'lease' });
+    } finally {
+      vi.unstubAllEnvs();
+    }
+    await pg.query(`UPDATE cron_health SET last_success_at = now() - interval '1 second' WHERE name = $1`, [ADMISSION_LEASE_ROW]);
+    expect(await runAdmissionRound()).toEqual({ skipped: 'no_candidates' });
+    expect(await runAdmissionRunnerRound(60_000)).toEqual({ skipped: 'lease' });
   });
 });
