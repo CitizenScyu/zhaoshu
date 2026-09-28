@@ -179,9 +179,8 @@ console.log(`▶ scripts 的 Python unittest 用例:${files.length} 个文件 �
 //     FAILED (failures=1, errors=2, ...)     ← 有失败/错误
 //     NO TESTS RAN                           ← 一个用例都没跑到(此时退出码 5)
 //
-// 为什么不用「退出码兜底」:退出码对**全部跳过**(exit 0)和**全部预期失败**(exit 0)都是绿,
-// 正是 P1 要堵的两种;而 `discover` 找不到文件时又是 `Ran 0 tests` + exit 0(见文件头第 1 条)。
-// 所以判据必须是这行汇总文本本身。
+// 退出码与汇总缺一不可：全部跳过、全部预期失败和未发现用例都可能 exit 0，必须另查汇总；
+// 反过来，进程也可能在输出 OK 后异常结束（例如退出阶段失败），不能仅靠汇总判绿。
 //
 // 【P1 的根因与修法】原先 `RAN_RE` 取**第一处** `Ran N`、`OK_RE` 用 `\(skipped=\d+\)` 分支
 //   主动放行带 skipped 的 OK,且 N 含 skipped —— 于是「一个用例被 `@unittest.skip`」乃至
@@ -274,6 +273,13 @@ for (const name of files) {
   const reasons = [];
   if (r.error) {
     reasons.push(`启动失败:${r.error.message}`);
+  } else if (r.signal) {
+    reasons.push(`子进程被信号 ${r.signal} 终止，即使已输出 OK 也不能通过`);
+  } else if (r.status !== 0) {
+    reasons.push(
+      `${typeof r.status === 'number' ? `子进程退出码 ${r.status}` : '未获得子进程退出码'}，` +
+        '即使已输出 OK 也不能通过',
+    );
   } else if (s.summaryLines > 1) {
     // 汇总行超过一条:正常输出只会有一条,多出来的是在真汇总之后追加的内容(见 parseSummary 上方说明)。
     reasons.push(
