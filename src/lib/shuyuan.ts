@@ -74,7 +74,7 @@ export const ADMISSION_ROUND_BUDGET_MS = 240_000;
 // env ADMISSION_LEASE_TTL_MS 调到 900000（≥ 单元 WATCHDOG_MS）。Vercel 不设该 env ⇒ 默认值，行为不变。
 export const ADMISSION_LEASE_TTL_MS = 300_000;
 /** 准入租约 TTL（admrunner42）：env `ADMISSION_LEASE_TTL_MS` 正整数即用，缺失/非法回默认 ADMISSION_LEASE_TTL_MS。 */
-export function admissionLeaseTtlMs(env: NodeJS.ProcessEnv = process.env): number {
+export function admissionLeaseTtlMs(env: Record<string, string | undefined> = process.env): number {
   const parsed = Number.parseInt(env.ADMISSION_LEASE_TTL_MS ?? '', 10);
   return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : ADMISSION_LEASE_TTL_MS;
 }
