@@ -46,8 +46,9 @@ env:`ADMISSION_MAX_PROBES=40`、`ADMISSION_PROBE_CONCURRENCY=4`、`ADMISSION_LEA
 
 准入写围栏(fencecore42,901971c 起):每轮领取租约时原子递增 `cron_health.lease_generation`,
 最终写库在同一事务里校验代次+锁后有效期,旧轮迟到写整批拒绝(`{"skipped":"lease_lost","written":0}`)。
-数据库没有该列时 fail-closed(每轮 `{"skipped":"lease"}`,准入零推进):应用启动的运行期 DDL
-(`initializeBusinessSchema` 同款 `ADD COLUMN IF NOT EXISTS`)会自动补列,不要求迁移先行;
+数据库没有该列时 fail-closed(每轮 `{"skipped":"lease"}`,准入零推进):应用内的运行期 DDL
+(`initializeBusinessSchema` 同款 `ADD COLUMN IF NOT EXISTS`,属惰性 schema 初始化,应用走到该
+初始化时补列、不要求迁移先行,但不保证每次启动都执行)可能已补列;
 要按迁移记账收口,则先 `db:baseline:prod`(只登记 v1–v3)再 `db:migrate:prod --apply` 补 v4,
 步骤与预期输出见 `docs/migrations.md`「生产执行顺序」。
 
@@ -57,7 +58,8 @@ env:`ADMISSION_MAX_PROBES=40`、`ADMISSION_PROBE_CONCURRENCY=4`、`ADMISSION_LEA
 
 关掉后不需要清库:已写的 `phoenix_ok:` 行留池外,由 Vercel 轮在 20h 窗内自然洗掉或改判。
 若还要退代码,回滚打包产物 + Vercel 部署到改前提交即可(前缀行在旧代码下会被当 ok 入池——先等 20h 让 Vercel 洗完再退)。
-退代码前同样先停 Vercel 侧准入 cron:无围栏旧 writer 与新 writer 混跑不受代次门禁约束(前提清单见 `docs/migrations.md`「回滚」)。
+退代码前先停**全部**准入触发入口(本 timer、Vercel 独立轮 cron、Vercel 刷新尾部;清单见
+`docs/migrations.md`「回滚」):确实未包含围栏实现的旧版本与带围栏新代码混跑时,旧写不受代次门禁约束。
 
 ## 自测
 

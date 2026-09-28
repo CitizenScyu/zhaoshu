@@ -7,7 +7,7 @@
 | `0001_baseline.sql` | 1 | 冻结应用提交 `f48299b` 的现有结构；记录**已有**表、列、约束与索引，不引入后续功能字段 |
 | `0002_identity_key.sql` | 2 | 身份键从表达式索引升级为「生成列 + 唯一索引」（task-53 Phase 2） |
 | `0003_runtime_tables.sql` | 3 | 把此前只有运行时 DDL 的 `app_settings` / `source_admission` / `profile_feedback_queue` / `cron_health` 纳入契约（MS-25）；语句逐字取自 `business-schema.ts`，`runtime-tables-migration.pglite.test.ts` 逐列比对两条路径 |
-| `0004_admission_lease_generation.sql` | 4 | `cron_health` 加 `lease_generation bigint NOT NULL DEFAULT 0`（fencefix42 fencing token）：准入租约显式代次列，幂等 `ADD COLUMN IF NOT EXISTS`，老库既有行默认 0；运行期 `initializeBusinessSchema` 有同款 DDL（应用启动即可补列，不依赖迁移先行）；代次生命周期前提见「回滚」一节 |
+| `0004_admission_lease_generation.sql` | 4 | `cron_health` 加 `lease_generation bigint NOT NULL DEFAULT 0`（fencefix42 fencing token）：准入租约显式代次列，幂等 `ADD COLUMN IF NOT EXISTS`，老库既有行默认 0；运行期 `initializeBusinessSchema` 有同款 DDL（属惰性 schema 初始化：应用走到该初始化时即补列、不依赖迁移先行，但不保证每次启动都执行）；代次生命周期前提见「回滚」一节 |
 
 版本号取自文件名数字前缀，`SCHEMA_VERSION` 必须等于列表里的最大版本，否则 `loadMigrations()` 直接报错——常量与文件脱节不会被静默放过。**已发布的文件内容即其摘要**：`0001` 的 sha256（`1b47f1ca…`）已记入隔离库 / 灾备演练库的 `schema_migrations`，`db:baseline:prod` 也按这三份字节登记生产；改一个字节会让 `db:check` / `db:migrate` 在已登记的库上拒绝继续。`0002` 已由生产按同一文件手工执行过 DDL，同样不得再改。
 
@@ -93,8 +93,12 @@ $env:PROD_DATABASE_URL = '<目标库连接串>'
 npm run migrate:auth:prod -- --database-url-env=PROD_DATABASE_URL --dry-run
 # 2) 只读核对：预期退出码 2，versions=[]、missingTables=["schema_migrations"]、ledger.pending=[1,2,3,4]、ledger.errors=[]、
 #    authVersionOk=true、artifactVersionOk=true（生产已有 artifact 三表；只到 v1 时为 false，先按 docs/artifact-registry.md
-#    「Pre-rollout check」清孤儿后跑 migrate:artifacts:prod 补 v2）、runtimeColumns.ok=true（v4 待执行时允许
-#    cron_health 缺 lease_generation 列进入迁移）。runtimeColumns.extra 非空先停下人工确认。
+#    「Pre-rollout check」清孤儿后跑 migrate:artifacts:prod 补 v2）。
+#    runtimeColumns 分情形，check 与 migrate 口径不同：check 始终要求完整新结构——cron_health 缺
+#    lease_generation 列时 runtimeColumns.ok=false（退出码 2 的原因之一，不因 v4 待执行而豁免）；
+#    只有 db:migrate:prod 对「v4 待执行」的库特判允许这一缺列进入迁移（addsLeaseGeneration——apply
+#    0004 正会补上它）。应用若已按运行期惰性 schema 初始化补过列，则此处 runtimeColumns.ok=true，
+#    缺列时按 3)→6) 走完由 0004 补上。runtimeColumns.extra 非空先停下人工确认。
 npm run db:check:prod -- --database-url-env=PROD_DATABASE_URL
 # 3) baseline dry-run：预期 status=dry-run、problems=[]、ledgerWrites 为 v1–v3 三行（baseline 只登记 v1–v3，
 #    见 scripts/db-baseline.mjs 的 BASELINE_VERSIONS）；看一遍 extra（应只有 auth v5–v7 / 运行期 / artifact 加的东西）。
@@ -102,9 +106,12 @@ npm run db:check:prod -- --database-url-env=PROD_DATABASE_URL
 npm run db:baseline:prod -- --database-url-env=PROD_DATABASE_URL
 # 4) 登记：预期 status=applied、after.ok=false（v4 尚未执行 / 未记账，check 应报 pending——这是预期中间态）
 npm run db:baseline:prod -- --database-url-env=PROD_DATABASE_URL --apply
-# 5) 补 v4：预期 status=applied、after.ok=true（执行 0004 给 cron_health 补 lease_generation 列）
+# 5) v4 dry-run 计划核查：预期 ledger.pending=[4]、ledgerWrites 为 v4 一行（缺列时也须能走到这里，
+#    否则先解决 refusal 再继续）
+npm run db:migrate:prod -- --database-url-env=PROD_DATABASE_URL
+# 6) 补 v4：预期 status=applied、after.ok=true（执行 0004 给 cron_health 补 lease_generation 列）
 npm run db:migrate:prod -- --database-url-env=PROD_DATABASE_URL --apply
-# 6) 复核：退出码 0；db:migrate:prod dry-run 应为 status=up-to-date
+# 7) 复核：退出码 0（此时 cron_health 必有 lease_generation，runtimeColumns.ok=true）；db:migrate:prod dry-run 应为 status=up-to-date
 npm run db:check:prod -- --database-url-env=PROD_DATABASE_URL
 npm run db:migrate:prod -- --database-url-env=PROD_DATABASE_URL
 Remove-Item Env:PROD_DATABASE_URL
@@ -128,14 +135,14 @@ Remove-Item Env:PROD_DATABASE_URL
 
 ### 回滚
 
-- 应用代码：revert 即可。旧代码没有本入口；旧 `db:migrate` / `db:check` 只遍历自己列表里的版本，库里多出的记账行不影响它们。
+- 应用代码：revert 即可（前提见下条 0004 专属条款：回退前先停全部准入触发入口）。旧代码没有本入口；旧 `db:migrate` / `db:check` 只遍历自己列表里的版本，库里多出的记账行不影响它们。
 - baseline：唯一写入是新建的 `schema_migrations` 表与 v1–v3 三行，业务表一个字节不动；确要撤回就删掉这张记账表（`DROP TABLE schema_migrations`），库回到登记前的状态。`--apply` 中途失败整批回滚，不会留下空表或部分登记。
 - migrate：对已登记库，新版本多出记账行和该版本自己的 DDL；确要撤回某版本记账用 `DELETE FROM schema_migrations WHERE version = <N>`（表结构不动）。`--apply` 失败时整批事务回滚，无半成品。冷建库失败直接丢弃该库 / 分支重来。auth 迁移只进不退，见 `docs/auth-deployment.md`。
 - **0004（`cron_health.lease_generation`）专属前提**：代次是准入写围栏（fencing）的唯一凭证，以下操作会重新打开「过期持有者迟到覆盖新结果」的写窗口，均为禁区——
-  - 不得删除租约行（`cron_health` 里 `name='admission_lease'`）重建：删行重插会把代次回置 1，可能低于旧持有者手里的句柄代次，旧句柄重新变为「有效」。确要清理只能保留行原样。
-  - 不得手工归零 / 回拨 `lease_generation`（理由同上）。
-  - 备份恢复后须先排空全部旧持有者再开放准入：恢复出的代次是备份时点的，旧进程可能仍持更高代次句柄；确认 Vercel 准入 cron（`/api/shuyuan/admission`）与 phoenix `zhaoshu-admission.timer` 都没有在跑旧代码的轮次（等待租约 TTL 自然过期即 ≥ `ADMISSION_LEASE_TTL_MS`），再恢复入口。
-  - 新旧 writer 不可混跑：无围栏的旧代码（901971c 之前）与带围栏新代码并发写 `source_admission` 时，旧代码不受代次门禁约束。回退应用代码前，先停全部准入入口（Vercel cron + phoenix timer）再退；同理，`scripts/seed-admission.mjs` 是无围栏直写（见其头注），使用前先排空准入轮次。
+  - 不得删除租约行（`cron_health` 里 `name='admission_lease'`）重建：删行重插会把代次回置 1 并从头重数，此后新领取会**复用与旧代次相同的数值**，旧持有者手里未作废的句柄可能重新通过等值校验。确要清理只能保留行原样。
+  - 不得手工归零 / 回拨 `lease_generation`（理由同上：数值复用，不是数值高低本身）。
+  - 备份恢复后须先排空全部旧持有者再开放准入：恢复出的代次是备份时点的，旧进程可能仍持更高代次句柄。**租约 TTL 过期不构成排空**——过期持有者可能仍有未完成的 SQL / 网络请求在途，TTL 过期不证明它不能再写。正确顺序：先停**全部**准入触发入口（Vercel 独立轮 `/api/shuyuan/admission`、Vercel 刷新 `/api/shuyuan` 尾部、phoenix `zhaoshu-admission.timer` 与刷新单元、以及人工 `seed-admission.mjs`），再逐一确认旧实例已终止、在途准入任务与事务已结束（进程列表 / 连接与活动查询归零），最后才恢复入口。
+  - 新旧 writer 不可混跑：**确实未包含围栏实现的旧版本**（按功能核实——围栏在 fencefix/fencecore 线引入，442b3cd 起的提交已含围栏）与带围栏新代码并发写 `source_admission` 时，旧代码不受代次门禁约束。回退应用代码前，先按上款停全部准入触发入口再退；`scripts/seed-admission.mjs` 同属绕过门禁的直写（见其头注），使用前按同款顺序排空。
   - 迁移本身可安全回滚记账（`DELETE … WHERE version=4` 不动表结构，列留在库里无害——运行期 DDL 与 0004 都不会重置既有代次）；要撤回的只是「应用代码的新写路径」，不是这一列。
 
 ## 三类起点差异
