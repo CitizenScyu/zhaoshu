@@ -1,7 +1,9 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { neon, neonConfig } from '@neondatabase/serverless';
 import { createDbQuotaLatch, DB_QUOTA_ERROR_CODE, type DbQuotaLatch } from './db-quota';
-import { createQuotaAwareFetch, dbQuotaResponse, requestHitDbQuota, withDbQuotaGuard } from './db-quota-guard';
+import {
+  createQuotaAwareFetch, dbFetchTimeoutMs, dbQuotaResponse, requestHitDbQuota, withDbQuotaGuard,
+} from './db-quota-guard';
 
 // 41-q402fix：Vercel 侧配额闸。全部经真驱动（neonConfig.fetchFunction = 配额感知 fetch，底层 fetch 用替身，
 // 主机 .invalid 不出网），断言的是「驱动实际抛什么、路由实际回什么」。
@@ -71,6 +73,70 @@ describe('createQuotaAwareFetch（请求咽喉）', () => {
     const h = setup(() => 500);
     await expect(h.sql`SELECT 1`).rejects.toThrow(/HTTP status 500/);
     expect(h.latch.active()).toBe(false);
+  });
+});
+
+describe('createQuotaAwareFetch 外呼超时（infrasyn-42 M1）', () => {
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllEnvs();
+    vi.restoreAllMocks();
+  });
+
+  // Node 的 AbortSignal.timeout 内建定时器不走 vitest fake timers 接管的全局 setTimeout
+  // （node:internal/abort_controller 持有内建绑定，实测 advanceTimersByTime 推不动它，
+  // 也不计入 vi.getTimerCount），所以这两个用例用真实时钟 + 缩短的 env 覆盖（300ms）来断言
+  // 「到点真的会 abort」，整个用例 <1s。
+  it('无 signal 调用 ⇒ baseFetch 收到 AbortSignal，到默认 60s 才 abort（用 300ms 覆盖实测）', async () => {
+    vi.stubEnv('DB_FETCH_TIMEOUT_MS', '300');
+    let seen: AbortSignal | undefined;
+    const latch = createDbQuotaLatch({ backoffMs: 30 * 60_000 });
+    const base = vi.fn(async (_input: unknown, init?: RequestInit) => {
+      seen = init?.signal;
+      return new Promise<Response>((resolve) => {
+        init?.signal?.addEventListener('abort', () => resolve(new Response('late', { status: 200 })), { once: true });
+      });
+    });
+    const fetchFn = createQuotaAwareFetch(latch, base);
+    const pending = fetchFn('https://db.example.invalid');
+    await vi.waitUntil(() => seen !== undefined, { timeout: 1_000 });
+    expect(seen).toBeInstanceOf(AbortSignal);
+    expect(seen!.aborted).toBe(false);
+    const settled = await pending;
+    expect(settled.status).toBe(200); // baseFetch 自己等 abort 后收尾
+    expect(seen!.aborted).toBe(true); // 但 signal 确实在超时上限到了后 aborted
+  });
+
+  it('有 signal 调用 ⇒ baseFetch 收到的是原 signal 同一对象', async () => {
+    const latch = createDbQuotaLatch({ backoffMs: 30 * 60_000 });
+    const base = vi.fn(async () => new Response(okBody, { status: 200 }));
+    const fetchFn = createQuotaAwareFetch(latch, base);
+    const controller = new AbortController();
+    await fetchFn('https://db.example.invalid', { signal: controller.signal });
+    expect(base.mock.calls[0][1]?.signal).toBe(controller.signal);
+  });
+
+  it('超时抛 TimeoutError：不布置冷却、无 db_quota_exceeded 日志', async () => {
+    vi.stubEnv('DB_FETCH_TIMEOUT_MS', '150');
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const latch = createDbQuotaLatch({ backoffMs: 30 * 60_000, now: () => 0 });
+    // 挂起的 fetch：超时上限到点 AbortSignal.timeout 触发，baseFetch 按其 reason 拒绝（TimeoutError）。
+    const base = vi.fn((_input: unknown, init?: RequestInit) => new Promise<Response>((_, reject) => {
+      init?.signal?.addEventListener('abort', () => reject(init.signal!.reason), { once: true });
+    }));
+    const fetchFn = createQuotaAwareFetch(latch, base);
+    const error = await fetchFn('https://db.example.invalid').then(() => null, (e: unknown) => e as Error);
+    expect(error).toMatchObject({ name: 'TimeoutError' });
+    expect(latch.active()).toBe(false); // 超时不是配额：不布置冷却
+    expect(log).not.toHaveBeenCalled(); // 也不打 db_quota_exceeded
+  });
+
+  it('env 覆盖生效；非法值回默认 60s', () => {
+    expect(dbFetchTimeoutMs({ DB_FETCH_TIMEOUT_MS: '5000' })).toBe(5000);
+    expect(dbFetchTimeoutMs({ DB_FETCH_TIMEOUT_MS: '0' })).toBe(60_000);
+    expect(dbFetchTimeoutMs({ DB_FETCH_TIMEOUT_MS: '-100' })).toBe(60_000);
+    expect(dbFetchTimeoutMs({ DB_FETCH_TIMEOUT_MS: 'abc' })).toBe(60_000);
+    expect(dbFetchTimeoutMs({})).toBe(60_000);
   });
 });
 
