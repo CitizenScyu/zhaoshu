@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import { readFileSync, readdirSync, statSync, existsSync } from 'node:fs';
 import path from 'node:path';
 import { builtinModules } from 'node:module';
+import ts from 'typescript';
 
 // 客户端/服务端模块边界守卫（41-q402build）。
 //
@@ -10,14 +11,12 @@ import { builtinModules } from 'node:module';
 // 报 “chunking context does not support external modules (request: node:async_hooks)”。
 // 合并 825a4fd 时 ModelSettingsTab 值引入 app-settings（→db）就是这样弄挂了 next build。
 //
-// 用 `import 'server-only'` 阻断在本仓不可行：supported-sources.ts 特意用**动态** import('./db')
-// 把 db 挡在静态客户端 bundle 外（见该文件顶部注释），而 supported-sources 又在客户端闭包内，
-// server-only 会把这条本就安全的动态路径也判成违规。故改用静态扫描：只跟随**静态、含运行时
-// 语义**的 import/export-from 边（跳过 `import type`、纯类型具名、以及 `import('...')` 动态导入），
-// 从所有 'use client' 模块出发做闭包，断言不触达 db.ts / db-quota-guard.ts。
+// 动态 import 仍由打包器解析，不能当作客户端/服务端隔离边界。
+// 用 TypeScript AST 跟随运行时 import/export、动态 import 和 require；只跳过纯类型。
+// 从所有 use client 入口遍历依赖，拒绝数据库与 Node 内置模块。
 
 const SRC_ROOT = path.resolve(__dirname, '..'); // src/lib/*.test.ts -> src
-const FORBIDDEN = ['lib/db.ts', 'lib/db-quota-guard.ts'].map((p) => path.join(SRC_ROOT, p));
+const FORBIDDEN = ['lib/db.ts', 'lib/db-quota-guard.ts', 'lib/supported-sources-server.ts'].map((p) => path.join(SRC_ROOT, p));
 
 // Node 内置模块名集合（含 `node:` 前缀写法与裸名写法）。
 // 用 node:module 的 builtinModules 判定，别手写清单：漏一个名字就等于留一个放行口。
@@ -45,12 +44,6 @@ function walk(dir: string): string[] {
   return out;
 }
 
-// 去掉块注释与行注释，避免命中注释里的示例 import（如 supported-sources.ts 的 “不得静态 import './db'”）。
-// 行注释用前导非冒号守卫，别误删字符串里的 `https://`。
-function stripComments(code: string): string {
-  return code.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:])\/\/[^\n]*/g, '$1');
-}
-
 function resolveSpec(spec: string, fromFile: string): string | null {
   let base: string;
   if (spec.startsWith('@/')) base = path.join(SRC_ROOT, spec.slice(2));
@@ -64,25 +57,31 @@ function resolveSpec(spec: string, fromFile: string): string | null {
   return null;
 }
 
-// 返回该文件的运行时引入 specifier（跳过纯类型与动态导入）。
+// AST 区分类型导入、动态导入和注释/字符串，避免正则漏过动态依赖。
 function runtimeSpecs(code: string): string[] {
-  let clean = stripComments(code);
+  const source = ts.createSourceFile('boundary.tsx', code, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
   const specs: string[] = [];
-  // 副作用导入 `import '...'`；先收集，再从正文剔除，免得干扰下面的 from 匹配。
-  for (const m of clean.matchAll(/(?:^|\n)[ \t]*import[ \t]+['"]([^'"]+)['"][ \t]*;?/g)) specs.push(m[1]);
-  clean = clean.replace(/(?:^|\n)[ \t]*import[ \t]+['"][^'"]+['"][ \t]*;?/g, '\n');
-  // `import ... from '...'` / `export ... from '...'`（含跨行具名列表）。
-  for (const m of clean.matchAll(/(?:^|\n)[ \t]*(?:import|export)\b([\s\S]*?)\bfrom[ \t]*['"]([^'"]+)['"]/g)) {
-    const clause = m[1];
-    if (/^\s*type\b/.test(clause)) continue; // import type / export type ... 整条擦除
-    const braced = clause.match(/\{([\s\S]*)\}/);
-    if (braced) {
-      const parts = braced[1].split(',').map((s) => s.trim()).filter(Boolean);
-      // 具名列表里全是 `type X` ⇒ 整体擦除；只要有一个值导入就算运行时边。
-      if (parts.length > 0 && parts.every((p) => /^type\b/.test(p))) continue;
+  const visit = (node: ts.Node) => {
+    if (ts.isImportDeclaration(node) && ts.isStringLiteralLike(node.moduleSpecifier)) {
+      const clause = node.importClause;
+      const bindings = clause?.namedBindings;
+      const typesOnly = clause?.isTypeOnly || (!clause?.name && bindings && ts.isNamedImports(bindings)
+        && bindings.elements.length > 0 && bindings.elements.every((item) => item.isTypeOnly));
+      if (!typesOnly) specs.push(node.moduleSpecifier.text);
+    } else if (ts.isExportDeclaration(node) && node.moduleSpecifier && ts.isStringLiteralLike(node.moduleSpecifier)) {
+      const clause = node.exportClause;
+      const typesOnly = node.isTypeOnly || (clause && ts.isNamedExports(clause)
+        && clause.elements.length > 0 && clause.elements.every((item) => item.isTypeOnly));
+      if (!typesOnly) specs.push(node.moduleSpecifier.text);
+    } else if (ts.isCallExpression(node) && node.arguments.length >= 1
+      && (node.expression.kind === ts.SyntaxKind.ImportKeyword
+        || (ts.isIdentifier(node.expression) && node.expression.text === 'require'))
+      && ts.isStringLiteralLike(node.arguments[0])) {
+      specs.push(node.arguments[0].text);
     }
-    specs.push(m[2]);
-  }
+    ts.forEachChild(node, visit);
+  };
+  visit(source);
   return specs;
 }
 
@@ -90,9 +89,25 @@ function isClientModule(code: string): boolean {
   return /^\s*(?:\/\*[\s\S]*?\*\/\s*)*['"]use client['"]/.test(code);
 }
 
-describe('客户端组件不得静态触达服务端 db 模块', () => {
+describe('客户端组件不得触达服务端 db 模块', () => {
   const allFiles = walk(SRC_ROOT);
   const clientRoots = allFiles.filter((f) => isClientModule(readFileSync(f, 'utf8')));
+
+  it('动态导入仍进入客户端依赖图，纯类型与注释不进入', () => {
+    expect(runtimeSpecs(`
+      import type { Sql } from './types-only';
+      import { type Shape } from './also-types';
+      export type { Entry } from './export-types';
+      import DefaultValue, { type Other } from './runtime-default';
+      export { type Shape, value } from './runtime-export';
+      const load = () => import('./db');
+      const withOptions = () => import('./dynamic-options', { with: { type: 'json' } });
+      const required = require('node:async_hooks');
+      // import('./comment-only')
+      const example = "import('./string-only')";
+      type Lazy = import('./type-query').Value;
+    `)).toEqual(['./runtime-default', './runtime-export', './db', './dynamic-options', 'node:async_hooks']);
+  });
 
   it('存在客户端入口，且包含 page.tsx 与 ModelSettingsTab', () => {
     expect(clientRoots.length).toBeGreaterThan(0);
@@ -100,12 +115,12 @@ describe('客户端组件不得静态触达服务端 db 模块', () => {
     expect(clientRoots.some((f) => f.endsWith(path.join('components', 'ModelSettingsTab.tsx')))).toBe(true);
   });
 
-  it('从所有 use client 模块出发的运行时引入闭包不触达 db.ts / db-quota-guard.ts，且不静态引入任何 Node 内置模块', () => {
+  it('从所有 use client 模块出发的运行时引入闭包不触达 db.ts / db-quota-guard.ts，且不引入任何 Node 内置模块', () => {
     const visited = new Set<string>();
     const queue = [...clientRoots];
     // 记录抵达违规文件的最短路径，失败时便于定位（列出上一跳）。
     const via = new Map<string, string>();
-    // 记录每个客户端闭包内被静态引入的 Node 内置模块 → 引入它的文件（首个命中即可）。
+    // 记录每个客户端闭包内被引入的 Node 内置模块 → 引入它的文件（首个命中即可）。
     const builtinHits = new Map<string, string>();
     while (queue.length) {
       const file = queue.shift()!;
@@ -131,7 +146,7 @@ describe('客户端组件不得静态触达服务端 db 模块', () => {
     );
     expect(
       builtinDetail,
-      `'use client' 静态闭包内不得出现 Node 内置模块（Turbopack 打包到浏览器会报 "chunking context does not support external modules"）：\n${builtinDetail.join('\n')}`,
+      `'use client' 运行时闭包内不得出现 Node 内置模块（Turbopack 打包到浏览器会报 "chunking context does not support external modules"）：\n${builtinDetail.join('\n')}`,
     ).toEqual([]);
   });
 });

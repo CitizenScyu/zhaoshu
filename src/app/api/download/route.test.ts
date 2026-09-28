@@ -10,10 +10,6 @@ const { ensureSchema, getSql, sql, triggerDownloadWorkflow } = vi.hoisted(() => 
 
 vi.mock('@/lib/db', () => ({ ensureSchema, getSql }));
 vi.mock('@/lib/github', () => ({ triggerDownloadWorkflow }));
-vi.mock('@/lib/supported-sources', async (original) => ({
-  ...await original<typeof import('@/lib/supported-sources')>(),
-  engineHosts: vi.fn(async () => ['www.yingsx.com']),
-}));
 vi.mock('@/lib/shuyuan', () => ({
   getEngineSources: vi.fn(async () => []),
   getPoolEngineHosts: vi.fn(async () => ['www.yingsx.com']),

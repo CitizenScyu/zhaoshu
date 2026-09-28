@@ -11,7 +11,7 @@ import { createProductionSchema } from './fixtures/production-schema';
 const db = vi.hoisted(() => ({ sql: undefined as unknown }));
 vi.mock('./db', () => ({ getSql: () => db.sql }));
 
-import { engineHosts } from './supported-sources';
+import { engineHosts } from './supported-sources-server';
 
 const PGliteCtor = await loadPGlite();
 const maybe = PGliteCtor ? describe : describe.skip;

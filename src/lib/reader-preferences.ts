@@ -181,7 +181,7 @@ export function readingPercent(index: ReaderIndex, part: ReaderPart, ratio: numb
 // 客户端章标题归一化:**直接复用** `source-parser.ts` 的 `normalizeChapterTitle`
 // (NFKC / trim / 去全角书名号 / 去空白 / 小写 / 章号折叠「第一章」=「第1章」/ 去尾部标点),
 // 不在客户端再写第二套折叠逻辑,避免两份实现漂移(复审 P1-1)。
-// source-parser 的依赖链(source-policy / supported-sources 均 client-safe,db 仅动态 import)
+// source-parser 的依赖链(source-policy / supported-sources 均为无数据库依赖的客户端安全模块)
 // 可安全静态 import 进客户端包;测试文件同时 import 两边做一致性钉死。
 import { normalizeChapterTitle } from './source-parser';
 export { normalizeChapterTitle };

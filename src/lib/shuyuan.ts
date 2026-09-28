@@ -1,10 +1,11 @@
 import { getSql } from '@/lib/db';
+import { engineHosts } from '@/lib/supported-sources-server';
 import { isRecord } from '@/lib/sanitize';
 import { createDeadline, raceDeadline, type RequestDeadline } from '@/lib/deadline';
 import { validateSourceUrl, refreshSupportedHosts, supportedHostList, upgradeSourceTemplateUrl } from '@/lib/source-policy';
 import { engineSourceUsable } from '@/lib/source-usability';
 import {
-  BUILTIN_SOURCE_HOSTS, builtinFallbackSource, builtinUrlPrefixes, engineHosts, type SupportedSourceTier,
+  BUILTIN_SOURCE_HOSTS, builtinFallbackSource, builtinUrlPrefixes, type SupportedSourceTier,
 } from '@/lib/supported-sources';
 import {
   ADMISSION_MAX_REDIRECTS, ADMISSION_MIN_BUDGET_MS, ADMISSION_PHOENIX_OK_PREFIX, ADMISSION_PROBE_WORST_MS,

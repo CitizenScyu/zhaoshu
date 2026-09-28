@@ -14,7 +14,7 @@ vi.mock('@/lib/db', () => ({ ensureSchema: vi.fn(), getSql }));
 vi.mock('./db', () => ({ ensureSchema: vi.fn(), getSql }));
 
 import { buildShuyuanPoolArtifact, getShuyuanPoolHealth, invalidateShuyuanReadCache } from './shuyuan';
-import { engineHosts } from './supported-sources';
+import { engineHosts } from './supported-sources-server';
 import { refreshSupportedHosts } from './source-policy';
 import { ADMISSION_PHOENIX_OK_PREFIX, ADMISSION_RECHECK_FAIL_PREFIX } from './rule-engine/admission';
 
