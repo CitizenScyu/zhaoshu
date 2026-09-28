@@ -63,6 +63,12 @@ export function createQuotaAwareFetch(
     // M1（infrasyn-42 §9 / infrarun §2）：无调用方 signal 的外呼兜底 60s 超时。已有 signal 的调用
     // 原样透传、不合并（不做 AbortSignal.any）——上层预算/取消语义保持不变。超时抛出的 TimeoutError
     // 发生在 baseFetch 内部，不会走到下面的 402 分支，也不布置冷却、不打 db_quota_exceeded 日志。
+    // AbortSignal.timeout：本文件虽纯服务端，但 db.ts 静态引入本模块、supported-sources 又经动态
+    // import('./db') 被客户端可达（eslint no-restricted-properties 据此判红）。浏览器基线下
+    // AbortSignal.timeout 会抛——但这条代码路径只在 neon 驱动的 fetchFunction 里执行（Node 服务端），
+    // 客户端 bundle 里不会被调用；用 abort-merge 的 timeoutSignal 反而引入「谁 dispose」的难题
+    // （fetch 内部无结束钩子），故此处豁免：eslint-disable-next-line。
+    // eslint-disable-next-line no-restricted-properties -- 服务端专用路径；见上
     const effectiveInit = init?.signal ? init : { ...init, signal: AbortSignal.timeout(dbFetchTimeoutMs()) };
     const response = await baseFetch(input, effectiveInit);
     if (response.status === 402) {

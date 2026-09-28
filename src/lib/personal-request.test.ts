@@ -20,17 +20,6 @@ describe('sse() 心跳（M4）', () => {
   beforeEach(() => { vi.useFakeTimers(); });
   afterEach(() => { vi.useRealTimers(); });
 
-  async function readAvailable(res: Response, ms: number): Promise<string> {
-    // 从响应流里读出 ms 虚拟时间内到达的所有字节。
-    const reader = (res.body as ReadableStream<Uint8Array>).getReader();
-    const decoder = new TextDecoder();
-    let text = '';
-    const pump = reader.read().then((r) => { if (!r.done) text += decoder.decode(r.value); });
-    await vi.advanceTimersByTimeAsync(ms);
-    await Promise.race([pump, new Promise((r) => setTimeout(r, 0).unref?.() ?? r(0))]);
-    return text;
-  }
-
   it('work 挂起 30s ⇒ 两帧 `: ping\\n\\n`；data: 帧与改前逐字一致', async () => {
     const req = makeRequest();
     const access = new PersonalRequest(req, 285_000);
