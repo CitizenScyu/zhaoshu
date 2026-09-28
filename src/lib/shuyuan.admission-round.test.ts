@@ -1,8 +1,8 @@
 // 42-admbudget：独立准入轮 runAdmissionRound 与刷新尾部准入的互斥租约。
 // harness 照抄 shuyuan.admission-stoploss.test.ts（mock sql 标签 → execute，按语句文本分派返回）。
 // 钉四件事：① 独立轮用自己的 ADMISSION_ROUND_BUDGET_MS，探得比整份刷新预算能容纳的还多；
-// ② 租约领不到 / 领取报错 ⇒ 一个都不探（fail-closed）；③ 刷新尾部开关开时领不到租约就跳过；
-// ④ 开关关时刷新尾部不发任何租约语句（与改前逐字相同）。
+// ② 租约领不到 / 领取报错 ⇒ 一个都不探（fail-closed）；③ 刷新尾部无条件领约（admlfix42：与开关解耦），
+// 领不到就跳过；④ 开关开/关时刷新尾部都发租约语句、行为一致（开关只管独立 HTTP 入口的启停）。
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 type Query = { text: string; values: unknown[] };
@@ -366,14 +366,28 @@ describe('刷新尾部准入与租约', () => {
     return { outcome: await settled, log };
   }
 
-  it('开关关（缺省）：尾部不发任何租约语句，照常探测（与改前逐字相同）', async () => {
+  it('b) 开关关（缺省）：尾部始终领约，领到即照常探测（admlfix42：与开关解耦，不再跳过租约）', async () => {
     const { outcome } = await runRefresh();
     expect(outcome).toBe('resolved');
-    expect(leaseQueries()).toHaveLength(0);
+    // 改后：开关关也发一次租约语句（无条件领约），领到（缺省 lease=claimed）后照常探测。
+    expect(leaseQueries()).toHaveLength(1);
+    expect(leaseQueries()[0].values).toEqual([ADMISSION_LEASE_ROW, ADMISSION_LEASE_TTL_MS]);
     expect(searches().length).toBeGreaterThan(0);
   });
 
-  it('开关关：尾部跑完准入 ⇒ 也记 admission 成功行（42-admhealth：两个入口同记一行）', async () => {
+  it('a) 开关关 + 租约被 runner 占着：尾部 skipped:lease、不探不写行（admlfix42 新互斥）', async () => {
+    lease = 'held';
+    const { outcome, log } = await runRefresh();
+    // 刷新本身照常成功（准入异常/跳过不终结刷新）。
+    expect(outcome).toBe('resolved');
+    expect(searches()).toHaveLength(0);
+    expect(queries().some((query) => query.text.startsWith('INSERT INTO source_admission'))).toBe(false);
+    // 跳过（没真正跑准入）⇒ 不记成功行。
+    expect(successQueries()).toHaveLength(0);
+    expect(logged(log, 'shuyuan admission batch')).toEqual([{ sources: 2, skipped: 'lease', trigger: 'refresh' }]);
+  });
+
+  it('开关关：尾部领到租约跑完准入 ⇒ 也记 admission 成功行（42-admhealth：两个入口同记一行）', async () => {
     const { outcome } = await runRefresh();
     expect(outcome).toBe('resolved');
     const success = successQueries();

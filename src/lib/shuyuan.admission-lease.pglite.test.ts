@@ -100,4 +100,25 @@ maybe('42-admbudget 准入租约（PGlite 真库）', () => {
     expect(await runAdmissionRound()).toEqual({ skipped: 'no_candidates' });
     expect(await runAdmissionRunnerRound(60_000)).toEqual({ skipped: 'lease' });
   });
+
+  // admlfix42 §4b：持有方成功结束**不主动释放**租约（有意设计，短窗防双跑），持约至 TTL 到期时刻；
+  // 取证一律用库端 now()，不以「进程已退出」推定租约已释放。全用真库时钟，不 mock 时间。
+  it('§4b 持约至到期：holder 成功结束后租约保留至 expiry，DB 时钟过期后另一入口才可领', async () => {
+    vi.stubEnv('ADMISSION_LEASE_TTL_MS', '900000');
+    try {
+      // ① 持有方（runner）成功跑完一轮（源表空 ⇒ no_candidates，= 正常结束、非中途异常）。
+      expect(await runAdmissionRunnerRound(60_000)).toEqual({ skipped: 'no_candidates' });
+      // 成功结束后租约仍在：last_success_at 存的是到期时刻，剩余接近整份 TTL（未被释放）。
+      const remaining = await leaseRemainingMs();
+      expect(remaining).toBeGreaterThan(900_000 - 60_000);
+      expect(remaining).toBeLessThanOrEqual(900_000);
+      // ② 未到期：另一入口（独立轮）领不到——证明 runner 成功退出后短窗内仍互斥。
+      expect(await runAdmissionRound()).toEqual({ skipped: 'lease' });
+    } finally {
+      vi.unstubAllEnvs();
+    }
+    // ③ 以库端 now() 判定过期（把到期时刻推到过去），过期后另一入口即可领——租约靠时刻自动释放，无显式 release。
+    await pg.query(`UPDATE cron_health SET last_success_at = now() - interval '1 second' WHERE name = $1`, [ADMISSION_LEASE_ROW]);
+    expect(await runAdmissionRound()).toEqual({ skipped: 'no_candidates' });
+  });
 });

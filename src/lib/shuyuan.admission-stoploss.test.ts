@@ -27,7 +27,7 @@ const { ensureSchema, getSql, sql, execute, transaction, readTransaction } = vi.
 
 vi.mock('@/lib/db', () => ({ ensureSchema, getSql }));
 
-import { refreshShuyuan, REFRESH_BUDGET_MS } from './shuyuan';
+import { refreshShuyuan, REFRESH_BUDGET_MS, ADMISSION_LEASE_ROW } from './shuyuan';
 
 const indexUrl = 'https://www.yckceo.com/yuedu/shuyuans/index.html';
 const collectionUrl = (id: number) => `https://www.yckceo.com/yuedu/shuyuans/json/id/${id}.json`;
@@ -38,7 +38,13 @@ const fetchMock = vi.fn<typeof fetch>();
 describe('41-ADMIT-CONC-FIX:refreshShuyuan 准入逐探止损(端到端,c 缺省=1)', () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    execute.mockReset().mockImplementation(async (query) => query.text.startsWith('SELECT count(*)') ? [zeroCounts] : []);
+    // admlfix42：刷新尾部无条件领准入租约；默认领到（返回租约行）使准入照常跑。
+    execute.mockReset().mockImplementation(async (query) => {
+      if (query.text.startsWith('INSERT INTO cron_health') && query.values[0] === ADMISSION_LEASE_ROW) {
+        return [{ name: ADMISSION_LEASE_ROW }];
+      }
+      return query.text.startsWith('SELECT count(*)') ? [zeroCounts] : [];
+    });
     transaction.mockReset().mockResolvedValue([]);
     readTransaction.mockReset().mockImplementation(async (queries) => Promise.all(queries.map((query) => execute(query))));
     ensureSchema.mockResolvedValue(undefined);
