@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { join, relative, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { bookFilename } from '../src/lib/book-file-name.ts';
 import { DOWNLOAD_TASK_STALE_MS } from '../src/lib/download-task-policy.ts';
@@ -115,8 +115,12 @@ if (!existsSync(workerRoot)) {
 //   任一侧改了文件格式或类名，这里在 push 时就红，而不是上线后静默漏退、或把瞬时错误落成终态。
 const shellBudgetPath = resolve(workerRoot, 'runtime/lib/daily-budget.mjs');
 const shellLimiterPath = resolve(workerRoot, 'runtime/lib/rate-limiter.mjs');
-if (!existsSync(shellBudgetPath) || !existsSync(shellLimiterPath)) {
-  console.log('○ 跳过跨仓 runtime 预算/限速器契约：本地无兄弟仓 runtime/lib');
+// 兄弟仓整体缺席由 pre-push 的目录检查决定跳过；进入此处时 runtime 已通过前组检查。
+// 这两个文件分别是 shell 的静态依赖与打包器注入的依赖，缺失不能按可选契约放行。
+const missingRuntimeFiles = [shellBudgetPath, shellLimiterPath].filter(file => !existsSync(file));
+if (missingRuntimeFiles.length) {
+  throw new Error(`跨仓 runtime 契约失败：缺少必需文件 ${missingRuntimeFiles
+    .map(file => relative(workerRoot, file).replaceAll('\\', '/')).join(', ')}`);
 } else {
   const { createDailyBudget } = await import(pathToFileURL(shellBudgetPath).href);
   const { createBudgetRefund } = await import('../runtime-download/budget-refund.ts');
