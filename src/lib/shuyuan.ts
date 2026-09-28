@@ -188,8 +188,9 @@ export function engineSourcesEnabled(): boolean {
 
 /**
  * 42-admbudget 开关 ADMISSION_OWN_CRON：开时 /api/shuyuan/admission 每天独立跑一轮准入（自带整份预算），
- * 刷新尾部准入与它共用同一把租约（ADMISSION_LEASE_ROW）防并发重复探测。默认关：独立轮路由空转返回，
- * 刷新尾部不查租约、与今天逐字相同。只有显式 1/true/on 才开（与 READING_ENGINE_SOURCES 同口径）。
+ * 刷新尾部准入与它共用同一把租约（ADMISSION_LEASE_ROW）防并发重复探测。默认关：独立轮路由空转返回。
+ * admlfix42：刷新尾部**始终**参与租约（与本开关解耦），本开关只管独立 HTTP 入口的启停。
+ * 只有显式 1/true/on 才开（与 READING_ENGINE_SOURCES 同口径）。
  */
 export function admissionOwnCronEnabled(env: Record<string, string | undefined> = process.env): boolean {
   const raw = env.ADMISSION_OWN_CRON?.trim().toLowerCase();
@@ -1378,7 +1379,7 @@ async function refreshWithinBudget(s: Sql, budget: RequestDeadline, signal: Abor
 /**
  * 准入批次（设计 §4.2）。时序：全量替换事务之后。硬约束：
  * - 剩余预算 ≤ ADMISSION_MIN_BUDGET_MS 即整批跳过，绝不挤占刷新预算（180s）；
- * - ADMISSION_OWN_CRON 开时先领准入租约，领不到（独立轮正在跑）即整批跳过（42-admbudget）；
+ * - 始终先领准入租约，领不到（另一入口——独立轮或 phoenix runner——正在跑）即整批跳过（admlfix42：与开关解耦）；
  * - 候选池 = 通过 survey 初筛的源 + 初筛不过但留有 compile_ok 旧行的源（41-srcfix G5，送回改判出池）；
  *   既有行读一次（按本轮全部源 URL），二者皆空才整批跳过；
  * - runAdmissionBatch 每轮真实搜索 ≤ admissionMaxProbes()（默认 20，env `ADMISSION_MAX_PROBES` 可调），逐探前再查预算。
@@ -1397,8 +1398,11 @@ async function runAdmissionAfterRefresh(
     });
     return;
   }
-  // 开关关时不查租约（与今天逐字相同）：没有独立轮就没有第二个准入入口可撞。
-  if (admissionOwnCronEnabled() && !(await claimAdmissionLease(s, 'refresh', rows.length))) return;
+  // 刷新尾部始终参与共享租约，与 ADMISSION_OWN_CRON 开关解耦（admlfix42）：开关只管独立 HTTP 入口的启停，
+  // 但 phoenix runner（entry.ts --admission）不看开关、不受 Vercel env 约束——开关关时它仍会跑一轮准入。
+  // 若尾部按开关跳过领约，就会与 runner 同批并发探测同一批源。故无条件领约：领不到（runner 持约中）静默 return，
+  // 与开关开时领不到的行为一致（不抛错、不计失败）。开关关且无并发时能领到、照常 admitRows（行为等同改前）。
+  if (!(await claimAdmissionLease(s, 'refresh', rows.length))) return;
   await admitRows(s, rows, budget, signal);
 }
 
