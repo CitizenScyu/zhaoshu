@@ -574,6 +574,16 @@ function explicitSelectable(sources: ReadingSource[]): SelectableSources {
   return sources as unknown as SelectableSources;
 }
 
+/**
+ * 上游已对本站限流（53-ratelimit）：429 或带 Retry-After 的 5xx。站点明确说了「现在别来」，
+ * 继续打其余候选/作者回退只是把同一站再 429 一遍，还白烧全局预算（挤掉备用源）。
+ * 这些循环的 catch 用它把「continue 下一候选」收紧成「break 跳源」，与 SOURCE_SCOPE_EXHAUSTED
+ * 同路径；Retry-After 的退避窗本身不在请求内等待（软预算 45s 等不起分钟级窗口），交给下一请求。
+ */
+function isSourceThrottled(error: unknown): boolean {
+  return error instanceof SourceHttpError && (error.status === 429 || error.retryAfterMs !== undefined);
+}
+
 /** 用户显式指定源的查找（章节续读认当前源）：url+revision 精确相符优先，其次同 URL 换版本；只收 SelectableSources。 */
 function findSelectedSource(selectable: SelectableSources, catalog: Pick<SourceCatalog, 'sourceUrl' | 'sourceRevision'>): ReadingSource | null {
   return selectable.find((item) => item.url === catalog.sourceUrl && sourceRevision(item) === catalog.sourceRevision)
@@ -741,6 +751,9 @@ export async function resolveSourceBook(
   for (const source of sources) {
     const isFirst = index === 0;
     index += 1;
+    // 上游限流（53-ratelimit）：本源详情/候选层已收到 429（或带 Retry-After 的 5xx）时置位，
+    // 用它拦住后面的作者回退——站点已明说「现在别来」，换词再搜只是再吃一个 429。
+    let sourceThrottled = false;
     // 软预算 + 切片余量两段式判据（设计 §3.2）：只从第 2 个源起生效，builtin 首源不受约束。
     // 剩余不足一片切片就不开新源——那次源注定被切片砍掉，只白白消耗墙钟与已扣点数。
     // 判据与常量都在实现里（elapsed + slice > soft ⇔ remaining < slice），测试只做两侧反向断言。
@@ -789,6 +802,9 @@ export async function resolveSourceBook(
               if (error.code === 'SOURCE_SCOPE_EXHAUSTED') { hadFailure = true; break; }
               throw error;
             }
+            // 上游限流（429/带 Retry-After 的 5xx）：继续打其余候选只会再 429 一遍并白烧全局预算，
+            // 与单源耗尽同路径跳源（53-ratelimit）。
+            if (isSourceThrottled(error)) { hadFailure = true; sourceThrottled = true; break; }
             hadFailure = true;
           }
         }
@@ -796,7 +812,8 @@ export async function resolveSourceBook(
         // 仍以详情层 sourceBookMatches（标题/别名 + 作者门）确认，不能按作者搜索词认领书。
         // 余量至少「作者搜索 1 点 + 首个详情 1 点 + 目录 1 点」才回退（remainingFor：首源=root 只看
         // L2，非首源 child 还要过 L1），不足则跳过——强开会把预算码抛给外层记成整轮失败。
-        if (authorFallbackPending && !matches.size && sourceContext.remainingFor(2) >= 1) {
+        // 上游限流后不再作者回退：站点已明说「现在别来」，换词再搜只是再吃一个 429（53-ratelimit）。
+        if (authorFallbackPending && !sourceThrottled && !matches.size && sourceContext.remainingFor(2) >= 1) {
           const authorResults = await engineSearchBook(engineSource, book.author, sourceContext);
           stat.fallbackCandidates += authorResults.length;
           for (const result of engineDetailCandidates(book, authorResults)) {
@@ -818,6 +835,8 @@ export async function resolveSourceBook(
                 if (error.code === 'SOURCE_SCOPE_EXHAUSTED') { hadFailure = true; break; }
                 throw error;
               }
+              // 上游限流：同上，跳源止损（53-ratelimit）。
+              if (isSourceThrottled(error)) { hadFailure = true; sourceThrottled = true; break; }
               hadFailure = true;
             }
           }
@@ -861,6 +880,9 @@ export async function resolveSourceBook(
               }
               throw error;
             }
+            // 上游限流（429/带 Retry-After 的 5xx）：详情/作者回退的逐候选继续只会把同一站再 429
+            // 一遍并白烧全局预算（挤掉备用源），与单源耗尽同路径跳源（53-ratelimit）。
+            if (isSourceThrottled(error)) { hadFailure = true; sourceThrottled = true; break; }
             hadFailure = true;
           }
         }
@@ -940,7 +962,8 @@ export async function resolveSourceBook(
       // 本源连「作者搜索 + 首个详情」都发不出时跳过本轮作者回退 —— 强开的首个 page() 会抛预算码
       // （L1 单源耗尽或 L2 全局耗尽），被外层记成跳源/整轮失败，真书丢在作者页里。
       // 门槛取 min(1, 本源单源上限)：单源上限小于 2 的 child 不强开。
-      if (authorFallbackPending && sourceContext.remainingFor(1) >= 1) {
+      // 上游限流后不再作者回退（同引擎分支，53-ratelimit）。
+      if (authorFallbackPending && !sourceThrottled && sourceContext.remainingFor(1) >= 1) {
         const authorSearch = await sourceContext.page(sourceSearchUrl(source.searchUrl, book.author, source.url));
         const authorCandidates = /^\/books\/details\d+\.html$/.test(new URL(authorSearch.url).pathname)
           ? [authorSearch.url]
@@ -958,6 +981,8 @@ export async function resolveSourceBook(
           } catch (error) {
             context.signal.throwIfAborted();
             if (error instanceof SourceReaderError && error.code === 'SOURCE_BUDGET_EXCEEDED') break;
+            // 上游限流：可选层同理不再继续打本站（53-ratelimit）。
+            if (isSourceThrottled(error)) break;
             // 可选层失败不记账：只有决定「这本书在不在」的关键路径失败才算 partial，
             // 为凑候选而失败的抓取不否决任何东西。
           }
