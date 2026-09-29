@@ -65,7 +65,7 @@ function StatTile({
 }
 
 export default function StatsTab() {
-  const { apiFetch } = useOwner();
+  const { apiFetch, sessionId, isCurrentSession } = useOwner();
   const [stats, setStats] = useState<Stats | null>(null);
   const [queue, setQueue] = useState<DownloadObservation | null>(null);
   const [queueError, setQueueError] = useState('');
@@ -73,17 +73,28 @@ export default function StatsTab() {
   const [loading, setLoading] = useState(true);
   const [exporting, setExporting] = useState(false);
   const [exportError, setExportError] = useState('');
+  const exportControllerRef = useRef<AbortController | null>(null);
+  useEffect(() => () => exportControllerRef.current?.abort(), []);
 
   async function exportData() {
+    if (!isCurrentSession(sessionId) || exportControllerRef.current) return;
+    const controller = new AbortController();
+    exportControllerRef.current = controller;
+    const current = () => !controller.signal.aborted && isCurrentSession(sessionId);
     setExporting(true);
     setExportError('');
     try {
-      const res = await apiFetch('/api/export', { cache: 'no-store' });
+      const res = await apiFetch('/api/export', { cache: 'no-store', signal: controller.signal });
+      if (!current()) return;
       if (!res.ok) {
         const data = await res.json().catch(() => null);
+        if (!current()) return;
         throw new Error(data?.error || '数据导出失败，请稍后重试');
       }
-      const url = URL.createObjectURL(await res.blob());
+      const blob = await res.blob();
+      // 真实认证代际可能已变而 React 尚未重挂，迟到正文不能继续触发下载。
+      if (!current()) return;
+      const url = URL.createObjectURL(blob);
       const link = document.createElement('a');
       link.href = url;
       link.download = res.headers.get('Content-Disposition')?.match(/filename="([^"]+)"/)?.[1]
@@ -97,41 +108,46 @@ export default function StatsTab() {
         window.setTimeout(() => URL.revokeObjectURL(url), 1_000);
       }
     } catch (e) {
-      setExportError(e instanceof Error ? e.message : '数据导出失败，请稍后重试');
+      if (current()) setExportError(e instanceof Error ? e.message : '数据导出失败，请稍后重试');
     } finally {
-      setExporting(false);
+      if (exportControllerRef.current === controller) exportControllerRef.current = null;
+      if (current()) setExporting(false);
     }
   }
 
   const load = useCallback(async (signal?: AbortSignal) => {
+    const current = () => !signal?.aborted && isCurrentSession(sessionId);
+    if (!current()) return;
     setLoading(true);
     setError('');
     setQueue(null);
     setQueueError('');
     try {
       const res = await apiFetch('/api/stats', { signal });
+      if (!current()) return;
       const data = await res.json();
+      if (!current()) return;
       if (!res.ok) throw new Error(data.error || '统计加载失败');
-      if (signal?.aborted) return;
       setStats(data as Stats);
       if (data.allowedSections?.includes('tokens')) {
         try {
           const response = await apiFetch('/api/admin/download-stats', { signal });
+          if (!current()) return;
           if (!response.ok) throw new Error('下载队列统计暂不可用');
           const observation = await response.json();
-          if (!signal?.aborted) setQueue(observation);
+          if (current()) setQueue(observation);
         } catch {
-          if (!signal?.aborted) setQueueError('下载队列统计暂不可用，请刷新重试');
+          if (current()) setQueueError('下载队列统计暂不可用，请刷新重试');
         }
       }
     } catch (e) {
-      if (signal?.aborted) return;
+      if (!current()) return;
       setStats(null);
       setError(e instanceof Error ? e.message : '统计加载失败');
     } finally {
-      if (!signal?.aborted) setLoading(false);
+      if (current()) setLoading(false);
     }
-  }, [apiFetch]);
+  }, [apiFetch, sessionId, isCurrentSession]);
 
   // 手动刷新与首次 effect 共用同一可取消生命周期：每次刷新先中止上一条在途
   // 请求（迟到结果不再渲染、不再触发 /api/admin/download-stats 连锁），离开

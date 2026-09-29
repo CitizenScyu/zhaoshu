@@ -72,7 +72,7 @@ function renderTab(apiFetch: FetchMock) {
     ready: true, status: 'ready', user: { id: 5 }, permissions: { find: true, read: true, download: true },
     authMethod: 'session', accountsEnabled: true, expired: false, sessionId: 1, sessionOnly: false,
     setSessionOnly: vi.fn(), submitToken: vi.fn(), login: vi.fn(), logout: vi.fn(), refresh: vi.fn(),
-    apiFetch, can: () => true,
+    apiFetch, can: () => true, isCurrentSession: () => true,
   };
   return render(<StatsTab />);
 }
