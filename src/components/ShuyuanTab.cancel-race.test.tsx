@@ -1,6 +1,12 @@
 // @vitest-environment jsdom
-// cancel53 竞态复现：先用真实组件 + 可控兑现顺序的合成 apiFetch，验证任务书 4 项场景在原版真实失败。
-// 每条用例只做「复现」：断言当前版本的错误行为（失败红），修复后同文件用例应转绿（见 fix 标注的断言方向）。
+// cancel53 竞态回归：真实组件 + 可控兑现顺序的合成 apiFetch。
+// 断言的是最终视图/请求语义（不锁死「必须发哪个 GET」的实现细节）：
+//   场景1 矩阵 refresh/toggle × 响应头等待/读体等待——卸载后 POST signal 必须已中止、
+//         兑现后不得再发新列表 GET；
+//   场景2  旧操作兑现时视图已切走——迟到的请求只允许服务于当前视图，旧视图数据不得覆盖；
+//   场景2b A→B→A——切回旧视图后，旧一轮 A 的迟到响应不得覆盖新一轮 A 的数据（需代际守卫）；
+//   场景3  行为保留：启停成功后重载可见实际状态（无实际取消，不涉回滚语义）；
+//   场景4  新视图先完成、旧操作后失败/gone——迟到的错误与提示不得覆盖新视图状态。
 import { cleanup, render, screen, waitFor, act } from '@testing-library/react';
 import { userEvent } from '@testing-library/user-event';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -38,6 +44,10 @@ function statsPage(over: Record<string, unknown> = {}) {
     ...over,
   };
 }
+const disabledSource = {
+  url: 'https://a.example', name: '源甲', disabled: true, availability: 'reachable',
+  lastError: '', checkedAt: null, probeError: null,
+};
 
 type Manual<T> = { promise: Promise<T>; resolve: (value: T) => void; reject: (reason?: unknown) => void };
 
@@ -84,6 +94,12 @@ async function resolveFirstLoad(calls: Recorded[]) {
   });
 }
 
+/** 让已兑现 promise 的后续微任务链走完（组件里的多段 await 各占一拍）。 */
+async function drain() {
+  await act(async () => {});
+  await act(async () => {});
+}
+
 function renderTab(apiFetch: ApiFetch & { mock: { calls: unknown[][] } }) {
   mocks.owner = {
     ready: true, status: 'ready', user: null, permissions: { find: false, read: false, download: false },
@@ -94,40 +110,63 @@ function renderTab(apiFetch: ApiFetch & { mock: { calls: unknown[][] } }) {
   return render(<ShuyuanTab />);
 }
 
+/** 点按钮发起手动操作并等到 POST 记录入账，返回 POST 的 Recorded。 */
+async function startAction(calls: Recorded[], button: string) {
+  const user = userEvent.setup();
+  await user.click(screen.getByRole('button', { name: button }));
+  const post = await waitFor(() => {
+    const found = calls.find((c) => c.method === 'POST');
+    expect(found).toBeTruthy();
+    return found!;
+  });
+  return post;
+}
+
+const okHeaders = { ok: true, status: 200 } as unknown as Response;
+
 beforeEach(() => vi.clearAllMocks());
 afterEach(() => cleanup());
 
-describe('场景1:POST/读体期间卸载,旧响应兑现后不得发起新列表 GET', () => {
-  it('refresh:POST 响应体兑现前卸载——兑现后不得出现新的列表 GET', async () => {
+// 场景1 矩阵：refresh/toggle × 响应头等待/读体等待。卸载后两件事必须成立：
+// ① POST 收到的 signal 已中止（请求本体接入 actionAbort——卸载不该让请求继续跑完全程）；
+// ② 旧操作兑现后不得再发新的列表 GET（卸载后的组件不发新请求）。
+describe.each([
+  { name: 'refresh·响应头等待窗口', action: '刷新合集', window: 'headers' as const },
+  { name: 'refresh·读体等待窗口', action: '刷新合集', window: 'body' as const },
+  { name: 'toggle·响应头等待窗口', action: '禁用', window: 'headers' as const },
+  { name: 'toggle·读体等待窗口', action: '禁用', window: 'body' as const },
+])('场景1:$name 卸载', ({ action, window }) => {
+  it('卸载后 POST signal 已中止,兑现后无新 GET', async () => {
     const { apiFetch, calls } = makeScriptedFetch();
     const { unmount } = renderTab(apiFetch);
-    const user = userEvent.setup();
 
     await resolveFirstLoad(calls);
     await screen.findByRole('button', { name: textIs('全部 100') });
 
-    // 点刷新:POST 挂起(未兑现)。
-    await user.click(screen.getByRole('button', { name: '刷新合集' }));
-    await waitFor(() => expect(calls.length).toBe(2));
-    expect(calls[1].method).toBe('POST');
-
-    // POST 期间卸载。
+    const post = await startAction(calls, action);
+    if (window === 'body') {
+      // 读体窗口：响应头已兑现、组件正 await res.json() 时卸载。
+      await act(async () => { post.headers.resolve(okHeaders); });
+    }
     unmount();
 
-    // 旧 POST 兑现成功(响应头+读体都完成)。
-    await act(async () => {
-      calls[1].headers.resolve({ ok: true, status: 200 } as unknown as Response);
-      calls[1].body.resolve({ ok: true });
-    });
-    await act(async () => {}); // 让微任务队列走完
+    // ① 卸载即中止 POST 请求本体（真实 AbortSignal 的 aborted 标志）。
+    expect(post.signal?.aborted).toBe(true);
 
-    // 关键断言:兑现后没有新 GET 被发起(总调用数仍是 2:首屏 GET + POST)。
-    expect(calls.length).toBe(2);
+    // ② 旧操作完整兑现成功后，不再发新的列表 GET（总调用数不变）。
+    const before = calls.length;
+    await act(async () => {
+      if (window === 'headers') post.headers.resolve(okHeaders);
+      post.body.resolve({ ok: true, disabled: true });
+    });
+    await drain();
+    expect(calls.length).toBe(before);
+    expect(calls.filter((c) => c.method === 'GET')).toHaveLength(1); // 只有首屏 GET
   });
 });
 
 describe('场景2:旧筛选上的手动操作未完成时切筛选,新列表先返回,旧操作后兑现', () => {
-  it('toggle:旧 POST 闭包持有旧 filter/page,兑现后不得覆盖新视图', async () => {
+  it('toggle:旧 POST 兑现后的任何迟到请求只允许服务当前视图,旧视图数据不得覆盖', async () => {
     const { apiFetch, calls } = makeScriptedFetch();
     renderTab(apiFetch);
     const user = userEvent.setup();
@@ -136,81 +175,119 @@ describe('场景2:旧筛选上的手动操作未完成时切筛选,新列表先�
     await screen.findByRole('button', { name: textIs('全部 100') });
 
     // 在 all 筛选下点「禁用」:POST 挂起。
-    await user.click(screen.getByRole('button', { name: '禁用' }));
-    await waitFor(() => expect(calls.length).toBe(2));
-    expect(calls[1].method).toBe('POST');
+    const post = await startAction(calls, '禁用');
 
-    // 用户切到「已禁用」筛选:effect 发新 GET(calls[2]),挂起。
+    // 用户切到「已禁用」筛选:effect 发新 GET,先返回(disabled 视图 10 条)。
     await user.click(screen.getByRole('button', { name: textIs('已禁用 10') }));
-    await waitFor(() => expect(calls.length).toBe(3));
-    expect(calls[2].method).toBe('GET');
-    expect(calls[2].url).toBe('/api/shuyuan?filter=disabled&page=1');
-
-    // 新列表先返回(disabled 筛选下 10 条,第 1 页)。
+    await waitFor(() => expect(calls.filter((c) => c.method === 'GET')).toHaveLength(2));
     const disabledView = statsPage({
-      total: 10, enabled: 0, disabled: 10, filter: 'disabled',
-      sources: [{ url: 'https://a.example', name: '源甲', disabled: true, availability: 'reachable', lastError: '', checkedAt: null, probeError: null }],
+      total: 10, enabled: 0, disabled: 10, filter: 'disabled', sources: [disabledSource],
     });
+    const viewGet = calls.filter((c) => c.method === 'GET')[1];
     await act(async () => {
-      calls[2].headers.resolve(json(disabledView));
-      calls[2].body.resolve(disabledView);
+      viewGet.headers.resolve(json(disabledView));
+      viewGet.body.resolve(disabledView);
     });
     await screen.findByText(textIs('已禁用的书源'));
     await screen.findByText(textIs('共 10 条,第 1 / 1 页'));
 
-    // 旧 POST 现在兑现成功:它将用旧闭包的 {filter:'all', page:1} 发起 load。
+    // 旧 POST 现在兑现:它闭包里还是 {filter:'all', page:1}。
+    const getsBefore = calls.filter((c) => c.method === 'GET').length;
     await act(async () => {
-      calls[1].headers.resolve({ ok: true, status: 200 } as unknown as Response);
-      calls[1].body.resolve({ disabled: true });
+      post.headers.resolve(okHeaders);
+      post.body.resolve({ disabled: true });
     });
-    // 旧操作发起的 GET 已发出(行为本身允许),但它拿旧 filter。
-    await waitFor(() => expect(calls.filter((c) => c.method === 'GET').length).toBe(3));
-    const stale = calls[3];
-    expect(stale.url).toBe('/api/shuyuan?filter=all&page=1');
+    await drain();
 
-    // 关键断言(修复后):旧操作不得覆盖当前视图——stale 响应兑现不得把 stats 写回 all 视图。
-    // 原版行为:load 无视图代守卫,stale 响应兑现会把 stats 写回 all 视图 ⇒ 真实失败。
-    await act(async () => {
-      stale.headers.resolve(json(statsPage()));
-      stale.body.resolve(statsPage());
-    });
-    // 检查页脚:应仍显示 disabled 视图(共 10 条),而非 all 视图(共 100 条)。
-    const footer = screen.getByText(textIs('共 10 条,第 1 / 1 页'));
-    expect(footer).toBeTruthy();
+    // 断言语义而非实现:旧操作兑现后若还发 GET,只允许刷新**当前**视图(disabled);
+    // 不允许再拿旧闭包的 filter=all 去发。也不写回旧视图数据——页脚仍是 disabled。
+    const lateGets = calls.filter((c) => c.method === 'GET').slice(getsBefore);
+    for (const g of lateGets) expect(g.url).toBe('/api/shuyuan?filter=disabled&page=1');
+    expect(screen.getByText(textIs('共 10 条,第 1 / 1 页'))).toBeTruthy();
   });
 });
 
-describe('场景3:仅取消客户端请求,服务端写入已发生——不宣称回滚,当前视图可见实际状态', () => {
-  it('toggle POST 已成功(写入已发生),客户端中止不得回滚显示;视图恢复应能看到实际状态', async () => {
-    // 行为保留项:这条只验证既有语义没被修复破坏——写入成功后刷新列表可见实际状态。
+describe('场景2b:A→B→A——切回旧视图后,旧一轮 A 的迟到响应不得覆盖新一轮 A', () => {
+  it('refresh 的重载在 all 上挂起,经 disabled 绕回 all 后,旧响应(代际过期)不写回', async () => {
     const { apiFetch, calls } = makeScriptedFetch();
     renderTab(apiFetch);
     const user = userEvent.setup();
+
     await resolveFirstLoad(calls);
     await screen.findByRole('button', { name: textIs('全部 100') });
 
-    await user.click(screen.getByRole('button', { name: '禁用' }));
-    await waitFor(() => expect(calls[1]?.method).toBe('POST'));
+    // 刷新:POST 兑现后组件用当时的 {all,1} 发重载 GET,让它挂起(模拟慢响应)。
+    const post = await startAction(calls, '刷新合集');
     await act(async () => {
-      calls[1].headers.resolve({ ok: true, status: 200 } as unknown as Response);
-      calls[1].body.resolve({ disabled: true });
+      post.headers.resolve(okHeaders);
+      post.body.resolve({ ok: true });
     });
-    await waitFor(() => expect(calls.filter((c) => c.method === 'GET').length).toBe(2));
+    await waitFor(() => expect(calls.filter((c) => c.method === 'GET')).toHaveLength(2));
+    const staleReload = calls.filter((c) => c.method === 'GET')[1];
+    expect(staleReload.url).toBe('/api/shuyuan?filter=all&page=1');
 
-    // 重载返回禁用后的列表:源显示「已禁用」。
-    const afterToggle = statsPage({
-      sources: [{ url: 'https://a.example', name: '源甲', disabled: true, availability: 'reachable', lastError: '', checkedAt: null, probeError: null }],
+    // A→B:切 disabled,effect GET 兑现,disabled 视图可见。
+    await user.click(screen.getByRole('button', { name: textIs('已禁用 10') }));
+    await waitFor(() => expect(calls.filter((c) => c.method === 'GET')).toHaveLength(3));
+    const disabledView = statsPage({
+      total: 10, enabled: 0, disabled: 10, filter: 'disabled', sources: [disabledSource],
     });
+    const bGet = calls.filter((c) => c.method === 'GET')[2];
     await act(async () => {
-      calls[2].headers.resolve(json(afterToggle));
-      calls[2].body.resolve(afterToggle);
+      bGet.headers.resolve(json(disabledView));
+      bGet.body.resolve(disabledView);
+    });
+    await screen.findByText(textIs('共 10 条,第 1 / 1 页'));
+
+    // B→A:切回 all,effect 发新一轮 A 的 GET,先兑现(刷新后总数 120)。
+    // 注:disabled 视图的分页 total=10 也会顶到「全部」标签上(count-label 任务的已知缺陷),
+    // 这里按当前行为选按钮,不锁死标签语义。
+    await user.click(screen.getByRole('button', { name: /^全部/ }));
+    await waitFor(() => expect(calls.filter((c) => c.method === 'GET')).toHaveLength(4));
+    const freshA = statsPage({ total: 120, enabled: 108, disabled: 12 });
+    const aGet = calls.filter((c) => c.method === 'GET')[3];
+    await act(async () => {
+      aGet.headers.resolve(json(freshA));
+      aGet.body.resolve(freshA);
+    });
+    await screen.findByText(textIs('共 120 条,第 1 / 6 页'));
+
+    // 旧一轮 A 的重载现在才兑现(total=999 作标记):值比较会放行(都是 all/1),
+    // 只有代际守卫能拒绝——不得把页脚覆盖回旧数据。
+    await act(async () => {
+      staleReload.headers.resolve(json(statsPage({ total: 999 })));
+      staleReload.body.resolve(statsPage({ total: 999 }));
+    });
+    await drain();
+    expect(screen.getByText(textIs('共 120 条,第 1 / 6 页'))).toBeTruthy();
+  });
+});
+
+describe('场景3(行为保留):启停成功后重载可见实际状态', () => {
+  it('toggle 成功(服务端写入已发生)后,重载列表显示已禁用——保留既有语义', async () => {
+    const { apiFetch, calls } = makeScriptedFetch();
+    renderTab(apiFetch);
+    await resolveFirstLoad(calls);
+    await screen.findByRole('button', { name: textIs('全部 100') });
+
+    const post = await startAction(calls, '禁用');
+    await act(async () => {
+      post.headers.resolve(okHeaders);
+      post.body.resolve({ disabled: true });
+    });
+    await waitFor(() => expect(calls.filter((c) => c.method === 'GET')).toHaveLength(2));
+    const afterToggle = statsPage({ sources: [disabledSource] });
+    const reload = calls.filter((c) => c.method === 'GET')[1];
+    await act(async () => {
+      reload.headers.resolve(json(afterToggle));
+      reload.body.resolve(afterToggle);
     });
     expect(screen.getByText('已禁用')).toBeTruthy();
   });
 });
 
-describe('场景4:旧请求失败/finally 不得迟到覆盖新交互状态', () => {
-  it('refresh 的 finally 迟到:setRefreshing(false) 不得影响新操作;旧失败 setError 不得覆盖新视图', async () => {
+describe('场景4:新视图先完成,旧操作后失败/后兑现——迟到状态不得覆盖新视图', () => {
+  it('refresh 迟到失败:切筛选并加载完成后,旧 POST 的 500 不得把错误盖到新视图上', async () => {
     const { apiFetch, calls } = makeScriptedFetch();
     renderTab(apiFetch);
     const user = userEvent.setup();
@@ -218,27 +295,61 @@ describe('场景4:旧请求失败/finally 不得迟到覆盖新交互状态', ()
     await screen.findByRole('button', { name: textIs('全部 100') });
 
     // 第一次刷新:POST 挂起。
-    await user.click(screen.getByRole('button', { name: '刷新合集' }));
-    await waitFor(() => expect(calls[1]?.method).toBe('POST'));
+    const post = await startAction(calls, '刷新合集');
 
-    // POST 兑现 500(旧操作将失败 setError)。
-    await act(async () => {
-      calls[1].headers.resolve({ ok: false, status: 500 } as unknown as Response);
-      calls[1].body.resolve({ error: '上游不可达' });
-    });
-    // 失败后的 load 不应发生(POST 失败即抛)。
-    await waitFor(() => expect(screen.getByRole('alert').textContent).toContain('上游不可达'));
-
-    // 新交互:切筛选(新视图加载成功),旧错误应被清掉。
+    // 新交互先行:切筛选,新视图完整加载。
     await user.click(screen.getByRole('button', { name: textIs('已禁用 10') }));
-    await waitFor(() => expect(calls.length).toBeGreaterThanOrEqual(3));
-    const disabledView = statsPage({ total: 10, enabled: 0, disabled: 10, filter: 'disabled' });
+    await waitFor(() => expect(calls.filter((c) => c.method === 'GET')).toHaveLength(2));
+    const disabledView = statsPage({
+      total: 10, enabled: 0, disabled: 10, filter: 'disabled', sources: [disabledSource],
+    });
+    const viewGet = calls.filter((c) => c.method === 'GET')[1];
     await act(async () => {
-      const last = calls.at(-1)!;
-      last.headers.resolve(json(disabledView));
-      last.body.resolve(disabledView);
+      viewGet.headers.resolve(json(disabledView));
+      viewGet.body.resolve(disabledView);
     });
     await screen.findByText(textIs('共 10 条,第 1 / 1 页'));
+
+    // 旧 POST 现在才失败(500):迟到的错误不得写回已切换的新视图。
+    await act(async () => {
+      post.headers.resolve({ ok: false, status: 500 } as unknown as Response);
+      post.body.resolve({ error: '上游不可达' });
+    });
+    await drain();
     expect(screen.queryByRole('alert')).toBeNull();
+    expect(screen.getByText(textIs('共 10 条,第 1 / 1 页'))).toBeTruthy();
+  });
+
+  it('toggle 迟到 gone 提示:视图切换后,旧 POST 的 gone 不得把提示盖到新视图上', async () => {
+    const { apiFetch, calls } = makeScriptedFetch();
+    renderTab(apiFetch);
+    const user = userEvent.setup();
+    await resolveFirstLoad(calls);
+    await screen.findByRole('button', { name: textIs('全部 100') });
+
+    // 在 all 筛选下点「禁用」:POST 挂起。
+    const post = await startAction(calls, '禁用');
+
+    // 新交互先行:切到 disabled 并完整加载。
+    await user.click(screen.getByRole('button', { name: textIs('已禁用 10') }));
+    await waitFor(() => expect(calls.filter((c) => c.method === 'GET')).toHaveLength(2));
+    const disabledView = statsPage({
+      total: 10, enabled: 0, disabled: 10, filter: 'disabled', sources: [disabledSource],
+    });
+    const viewGet = calls.filter((c) => c.method === 'GET')[1];
+    await act(async () => {
+      viewGet.headers.resolve(json(disabledView));
+      viewGet.body.resolve(disabledView);
+    });
+    await screen.findByText(textIs('共 10 条,第 1 / 1 页'));
+
+    // 旧 POST 现在才兑现 gone(URL 已不在合集):迟到的提示不得写回新视图。
+    await act(async () => {
+      post.headers.resolve(okHeaders);
+      post.body.resolve({ disabled: false });
+    });
+    await drain();
+    expect(screen.queryByRole('alert')).toBeNull();
+    expect(screen.getByText(textIs('共 10 条,第 1 / 1 页'))).toBeTruthy();
   });
 });

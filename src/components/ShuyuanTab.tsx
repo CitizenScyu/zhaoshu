@@ -28,28 +28,30 @@ export default function ShuyuanTab() {
     actionAbort.current = controller;
     return controller.signal;
   }
-  // 当前视图(filter,page)的镜像。load 用它判断「自己是否还属于当前视图」:
-  // 不能只看启动先后——旧操作闭包里的视图参数可以在新列表加载完之后才兑现,
-  // 比新视图请求更晚启动的旧响应照样覆盖新视图,必须按参数是否仍是当前视图来判。
-  // 写入放 effect(渲染期禁写 ref):filter/page 变化后的渲染提交后才更新镜像,
-  // 新视图自己的 load 一定读得到新值;旧视图迟到兑现时读到的已是新值,正确拒绝写回。
+  // 当前视图(filter,page)的镜像 + 代际计数。filter/page 每变一次,代际 +1:
+  // 只比 filter/page 防不住 A→B→A(切回旧视图后,旧操作的迟到响应再次通过比较、
+  // 覆盖新一次的 A 加载),代际不等一律视为过期。写入放 effect(渲染期禁写 ref)。
+  // 本 effect 声明在 load effect 之前:换视图的渲染提交后先记账,再由 load effect 发起新加载。
   const viewRef = useRef({ filter, page });
+  const viewGen = useRef(0);
   useEffect(() => {
     viewRef.current = { filter, page };
+    viewGen.current += 1;
   }, [filter, page]);
 
   const load = useCallback(async (
     target: { filter: ShuyuanSourceFilter; page: number },
     signal: AbortSignal,
   ): Promise<ShuyuanStatsPage | null> => {
-    // 启动、写回、收尾同一口径:已中止或非当前视图的加载不动 loading/error、不写 stats——
-    // 迟到的旧视图响应/失败提示不得覆盖用户已经切过去的新视图,loading 由仍属当前视图的加载负责收尾。
-    const isCurrent = () => !signal.aborted
+    // 视图代守卫,启动/写回/收尾同一口径:启动时已过期(被中止、代际已翻、或目标
+    // 不再是当前视图)的加载**直接不发请求**;迟到兑现的旧响应/失败提示不得覆盖
+    // 用户已经切过去的新视图,loading 由仍属当前视图的加载负责收尾。
+    const gen = viewGen.current;
+    const isCurrent = () => !signal.aborted && viewGen.current === gen
       && viewRef.current.filter === target.filter && viewRef.current.page === target.page;
-    if (isCurrent()) {
-      setLoading(true);
-      setError('');
-    }
+    if (!isCurrent()) return null;
+    setLoading(true);
+    setError('');
     try {
       const res = await apiFetch(`/api/shuyuan?filter=${target.filter}&page=${target.page}`, { signal });
       const data = await res.json();
@@ -93,51 +95,62 @@ export default function ShuyuanTab() {
     refreshInFlight.current = true;
     setRefreshing(true);
     setError('');
-    // POST 一开始就领 action signal(而非成功后才领):卸载/下一次操作发生在 POST 等待或
-    // 读体期间时,这里兑现后不再发 load——卸载后的组件不该再发新请求,旧操作也不该
-    // 抢在用户已切换的新视图上继续加载。请求本体(apiFetch 不带 signal)不在此中止:
-    // 服务端写入是否发生不受影响,取消只挡住「回写与重载」。
+    // POST 一开始就领 action signal(而非成功后才领),并直接传给请求本体:卸载/下一次
+    // 操作发生在 POST 等待或读体期间时,请求随之中止,兑现后也不再发 load——卸载后的
+    // 组件不该再发新请求,旧操作也不该抢在用户已切换的新视图上继续加载。
+    // 客户端 abort 只是停止等待,服务端写入是否发生不受它影响。
     const signal = beginAction();
+    const gen = viewGen.current;
     try {
       const res = await apiFetch('/api/shuyuan', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ action: 'refresh' }),
+        signal,
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || '刷新失败');
-      if (signal.aborted) return;
+      if (!isActionCurrent(signal, gen)) return;
       retreatToLastPage(await load({ filter, page }, signal), page);
     } catch (e) {
-      if (!signal.aborted) setError(e instanceof Error ? e.message : '刷新失败');
+      if (isActionCurrent(signal, gen)) setError(e instanceof Error ? e.message : '刷新失败');
     } finally {
       setRefreshing(false);
       refreshInFlight.current = false;
     }
   }
 
+  // 手动操作(刷新合集/启停)与视图代际的同口径守卫:操作期间用户切了筛选/页码
+  // (视图代际已翻)或操作被中止/组件卸载时,迟到的错误提示与 gone 提示都不得
+  // 写回新视图的 error 状态。load 内部的守卫与此同源(viewGen)。
+  function isActionCurrent(signal: AbortSignal, gen: number) {
+    return !signal.aborted && viewGen.current === gen;
+  }
+
   async function toggle(source: ShuyuanSourceStatus) {
     if (toggling) return;
     setToggling(source.url);
     setError('');
-    // 同 refresh:signal 覆盖整个操作周期,POST 兑现时若已被中止/视图已换,不再重载。
+    // 同 refresh:signal 覆盖整个操作周期并传给请求本体,POST 兑现时若已被中止/视图已换,不再重载。
     const signal = beginAction();
+    const gen = viewGen.current;
     try {
       const res = await apiFetch('/api/shuyuan', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ action: source.disabled ? 'enable' : 'disable', url: source.url }),
+        signal,
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || '操作失败');
-      if (signal.aborted) return;
+      if (!isActionCurrent(signal, gen)) return;
       // 后端返回「没这一行」= 这个 URL 已不在库里（刷新换过合集）：列表已过期，
       // 重新拉一次让用户看到实况。提示放在 load 之后，否则会被 load 的 setError('') 抹掉。
       const gone = data.disabled === false || data.enabled === false;
       retreatToLastPage(await load({ filter, page }, signal), page);
-      if (gone && !signal.aborted) setError('这个书源已不在当前合集里，已为你重新加载列表');
+      if (gone && isActionCurrent(signal, gen)) setError('这个书源已不在当前合集里，已为你重新加载列表');
     } catch (e) {
-      if (!signal.aborted) setError(e instanceof Error ? e.message : '操作失败');
+      if (isActionCurrent(signal, gen)) setError(e instanceof Error ? e.message : '操作失败');
     } finally {
       setToggling('');
     }
