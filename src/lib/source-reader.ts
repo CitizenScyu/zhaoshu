@@ -1109,11 +1109,23 @@ async function loadSourceCatalog(session: string, context: SourceRequestContext)
   //    目录内容未变、源站未变,直接用当前规则继续读;3) 同 URL 也没了 ⇒ source=null,调用方换源。
   // 当前源是用户选定的，按 selectable 认(41-readall):面板里取书池之外的源切过去后，章节不能被当成「源已下线」换走。
   const source = findSelectedSource(selectable, catalog);
-  validateSourceUrl(catalog.bookUrl);
+  // cc53：目录 bookUrl 的 host 被撤出运行时门（准入撤销后 refreshSupportedHosts 整集重置收窄）时，
+  // 这条校验会抛 SourcePolicyError ⇒ 路由层 422 SOURCE_REJECTED，且抛点在 readSourceChapter 的
+  // 正文 try 之外，换源流程永远到不了 —— 池里明明有可用源，在途会话却每章 422 卡到目录 24h 过期
+  // （有可恢复源却永久卡住）。改为与源停用同语义：校验失败 ⇒ 当前源身份失效（source=null），交给
+  // 章节级换源；原源兜底重试在 page() 处同样过门，出门 host 只会记一次失败原因，不会被请求。
+  // 门内源行为逐点不变（结构性防御保留：非 https/非 443/userinfo/私网 IP 仍一律拒，只是拒后可自救）。
+  let bookUrlAllowed = true;
+  try {
+    validateSourceUrl(catalog.bookUrl);
+  } catch {
+    bookUrlAllowed = false;
+  }
+  const effective = bookUrlAllowed ? source : null;
   // 章节级换源是自动遍历，候选仍只取取书池；当前源若在池外，补到快照末尾 —— 它仍是队尾的「原源兜底」，
   // 且 alternativeSource 的快照反查认得它(与当前源在池内时同一语义)。
-  const sources = source && !traversal.some((item) => item.url === source.url) ? [...traversal, source] : traversal;
-  return { catalog, source, sources };
+  const sources = effective && !traversal.some((item) => item.url === effective.url) ? [...traversal, effective] : traversal;
+  return { catalog, source: effective, sources };
 }
 
 // 只缓存附加目录前的响应快照，正文与供稿源身份保持一致；整本目录仍由路由从目录缓存/DB读取。
