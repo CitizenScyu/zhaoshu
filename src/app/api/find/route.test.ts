@@ -690,6 +690,70 @@ describe('POST /api/find output contract', () => {
     expect(mocks.chatRobust).toHaveBeenCalledTimes(2);
   });
 
+  it('recovers recall when every first-answer author is blank', async () => {
+    mocks.chatRobust.mockResolvedValueOnce(JSON.stringify({ candidates: [{ ...candidate, author: ' ' }] }))
+      .mockResolvedValueOnce(JSON.stringify({ candidates: [candidate] }));
+    const events = await consumeSSE(await POST(request({ step: 'recall', query: '找书' })));
+    expect(lastEvent<{ candidates: unknown[] }>(events, 'result').candidates).toHaveLength(1);
+    expect(mocks.chatRobust).toHaveBeenCalledTimes(2);
+  });
+
+  it('recovers rerank invalid fields once and persists only the valid second answer', async () => {
+    mocks.chatRobust.mockResolvedValueOnce(JSON.stringify({ items: [{ ...item, matchScore: null }] }))
+      .mockResolvedValueOnce(JSON.stringify({ items: [item] }));
+    const events = await consumeSSE(await POST(request({ step: 'rerank', query: '找书', verified: [verified] })));
+    expect(lastEvent<{ items: unknown[] }>(events, 'result').items).toHaveLength(1);
+    expect(mocks.chatRobust).toHaveBeenCalledTimes(2);
+    expect(mocks.persistRecommendationsForUser).toHaveBeenCalledOnce();
+  });
+
+  it('does not recover recall candidates removed by the hard exclusion filter', async () => {
+    mocks.getExcludedBookTitlesForUser.mockResolvedValue([{ title: candidate.title, author: candidate.author }]);
+    mocks.chatRobust.mockResolvedValue(JSON.stringify({ candidates: [candidate] }));
+    const events = await consumeSSE(await POST(request({ step: 'recall', query: '找书' })));
+    expect(lastEvent(events, 'error')).toBeTruthy();
+    expect(mocks.chatRobust).toHaveBeenCalledOnce();
+  });
+
+  it('recovers when every rerank identity is outside the rankable set', async () => {
+    mocks.chatRobust.mockResolvedValueOnce(JSON.stringify({ items: [{ ...item, title: '未验证书' }] }))
+      .mockResolvedValueOnce(JSON.stringify({ items: [item] }));
+    const events = await consumeSSE(await POST(request({ step: 'rerank', query: '找书', verified: [verified] })));
+    expect(lastEvent<{ items: unknown[] }>(events, 'result').items).toHaveLength(1);
+    expect(mocks.chatRobust).toHaveBeenCalledTimes(2);
+    expect(mocks.persistRecommendationsForUser).toHaveBeenCalledOnce();
+  });
+
+  it('keeps a matching zero-score item without retrying a partly unmatched response', async () => {
+    mocks.chatRobust.mockResolvedValue(JSON.stringify({ items: [{ ...item, title: '未验证书' }, { ...item, matchScore: 0 }] }));
+    const events = await consumeSSE(await POST(request({ step: 'rerank', query: '找书', verified: [verified] })));
+    expect(lastEvent<{ items: { matchScore: number }[] }>(events, 'result').items.map(i => i.matchScore)).toEqual([0]);
+    expect(mocks.chatRobust).toHaveBeenCalledOnce();
+  });
+
+  it('keeps valid items from a mixed response without retrying to fill the list', async () => {
+    mocks.chatRobust.mockResolvedValue(JSON.stringify({ candidates: [{ ...candidate, author: '' }, candidate] }));
+    const events = await consumeSSE(await POST(request({ step: 'recall', query: '找书' })));
+    expect(lastEvent<{ candidates: unknown[] }>(events, 'result').candidates).toHaveLength(1);
+    expect(mocks.chatRobust).toHaveBeenCalledOnce();
+  });
+
+  it('bounds invalid-field recovery to two calls and keeps invalid items out of persistence', async () => {
+    mocks.chatRobust.mockResolvedValue(JSON.stringify({ items: [{ ...item, matchScore: null }] }));
+    const events = await consumeSSE(await POST(request({ step: 'rerank', query: '找书', verified: [verified] })));
+    expect(lastEvent(events, 'error')).toBeTruthy();
+    expect(mocks.chatRobust).toHaveBeenCalledTimes(2);
+    expect(mocks.persistRecommendationsForUser).not.toHaveBeenCalled();
+  });
+
+  it('does not retry invalid fields when the remaining budget is below the recovery floor', async () => {
+    vi.stubEnv('LLM_TOTAL_TIMEOUT_MS', '1000');
+    mocks.chatRobust.mockResolvedValue(JSON.stringify({ candidates: [{ ...candidate, author: '' }] }));
+    const events = await consumeSSE(await POST(request({ step: 'recall', query: '找书' })));
+    expect(lastEvent(events, 'error')).toBeTruthy();
+    expect(mocks.chatRobust).toHaveBeenCalledOnce();
+  });
+
   it('recovers a rerank step whose first answer is not JSON', async () => {
     mocks.chatRobust
       .mockResolvedValueOnce('这里是我的分析（非 JSON）。')

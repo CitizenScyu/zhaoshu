@@ -311,9 +311,15 @@ async function handlePOST(req: NextRequest) {
             recallUser(profile.content, query, excludedBooks, conditions, excludedBooksOmitted),
             { temperature: 0.8, signal: access.signal, onUsage: recordUsageAfterResponse('find_recall'), totalTimeoutMs, fallbackModel: fallbackEnabled ? fallbackModel : undefined, ...modelAttemptLimits },
           )).content,
-          (content) => modelList(content, 'candidates', MAX_CANDIDATES),
+          (content) => {
+            const candidates = sanitizeCandidates(modelList(content, 'candidates', MAX_CANDIDATES));
+            // 全部条目字段无效属于格式错误，复用 modelStep 的一次恢复与共享预算。
+            // 书架/画像排除仍在恢复边界外，不为业务过滤后的零结果重调模型。
+            if (candidates.length === 0) throw new LlmError('召回结果为空，换个说法试试', false);
+            return candidates;
+          },
         ));
-        const candidates = sanitizeCandidates(raw)
+        const candidates = raw
           .filter((candidate) =>
             !excludedKeys.has(bookKey(candidate.title, candidate.author)) &&
             !excludedTitles.has(bookKey(candidate.title, '')));
@@ -370,6 +376,8 @@ async function handlePOST(req: NextRequest) {
           : verified;
         const vetoed = grounding?.vetoed.length ? { vetoed: grounding.vetoed } : {};
         const libraryEvidence = (grounding?.evidence.size ?? 0) > 0;
+        // 只认实际送入重排的身份；模型自创身份与非法字段同属输出格式错误。
+        const byBook = new Map(rankable.map((v) => [bookKey(v.title, v.author), v]));
         // 全部候选被书库标签确定性否决：不调模型，直接走 F13 合法零结果。
         const raw = rankable.length === 0 ? [] : await atomicRead(() => modelStep(
           ms(),
@@ -378,10 +386,18 @@ async function handlePOST(req: NextRequest) {
             rerankUser(profile, query, JSON.stringify(rerankInput(rankable, grounding?.evidence)), conditions),
             { temperature: 0.3, signal: access.signal, onUsage: recordUsageAfterResponse('find_rerank'), totalTimeoutMs, fallbackModel: fallbackEnabled ? fallbackModel : undefined, ...modelAttemptLimits },
           )).content,
-          (content) => modelList(content, 'items', MAX_RERANKED_ITEMS, { allowEmpty: true }),
+          (content) => {
+            const items = modelList(content, 'items', MAX_RERANKED_ITEMS, { allowEmpty: true });
+            // 明确空书单是 F13 合法结果；仅非空且字段全无效时走原有格式恢复。
+            // 部分身份匹配仍收容；书库否决在调用前完成，不因业务过滤重试。
+            if (items.length > 0 && !sanitizeRerankedItems(items)
+              .some((item) => byBook.has(bookKey(item.title, item.author)))) {
+              throw new LlmError('重排结果为空，换个说法试试', false);
+            }
+            return items;
+          },
         ));
         // 用书名+作者关联，避免同名作品回填到错误的豆瓣条目。只认送进模型的那批（被否决的不回流）。
-        const byBook = new Map(rankable.map((v) => [bookKey(v.title, v.author), v]));
         const items = sanitizeRerankedItems(raw)
           .filter((it) => byBook.has(bookKey(it.title, it.author)))
           .map((it) => {
