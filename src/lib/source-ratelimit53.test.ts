@@ -124,10 +124,10 @@ describe('53-ratelimit：429 的候选层与作者回退行为（builtin 档）'
 });
 
 describe('53-ratelimit：503 与 Retry-After 的退避', () => {
-  it('page() 对 5xx 立即重试一次，无视 Retry-After（疑似缺陷复现）', async () => {
+  it('page() 对带有效 Retry-After 的 503 首次响应即停止重试', async () => {
     pages.set(pageUrl(), { status: 503, headers: { 'retry-after': '60' } });
     await expect(context().page(pageUrl())).rejects.toMatchObject({ status: 503 });
-    expect(callsTo('book15.net')).toBe(2); // MAX_SOURCE_ATTEMPTS=2：Retry-After 窗口内重打
+    expect(callsTo('book15.net')).toBe(1);
   });
 });
 
@@ -161,7 +161,7 @@ describe('53-ratelimit：引擎档候选循环', () => {
     pages.set(eDetail(2), { text: engineDetailHtml(2) });
     pages.set('https://e1.test/t2.html', { text: engineToc(2) });
     await expect(service.resolveSourceBook(book, context())).rejects.toMatchObject({ code: 'SOURCE_UNAVAILABLE', status: 503 });
-    expect(callsTo('e1.test')).toBe(3); // 搜索 1 + 503 立即重试一次（既有 attempts=2 语义）×2 后止损，d2 不再打
+    expect(callsTo('e1.test')).toBe(2); // 搜索 1 + 503 首次响应即止损，d2 不再打。
   });
 });
 

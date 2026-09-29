@@ -133,7 +133,9 @@ interface FetchSourceOptions {
   connectTimeoutMs?: number;
   maxRedirects?: number;
   maxBytes?: number;
-  beforeRequest?: (signal: AbortSignal) => Promise<void>;
+  beforeRequest?: (signal: AbortSignal, url?: string) => Promise<void>;
+  /** 每次物理发射前的同步门，含同站兜底；独立于 beforeRequest 的点数/节流扣账。 */
+  beforeFetch?: (signal: AbortSignal, url: string) => void;
   /** POST/body/头覆写；缺省纯 GET。 */
   request?: SourcePageRequest;
   /** 显式字符集、或auto（HTTP声明→有界HTML head meta→UTF8）；缺省仍为UTF8。 */
@@ -161,12 +163,12 @@ export async function fetchSourceText(input: string, options: FetchSourceOptions
 async function fetchWithHostSwap(initial: URL, {
   signal: parentSignal, timeoutMs = SOURCE_TIMEOUT_MS, connectTimeoutMs = SOURCE_CONNECT_TIMEOUT_MS,
   maxRedirects = MAX_SOURCE_REDIRECTS, maxBytes = MAX_SOURCE_BYTES,
-  beforeRequest, request, responseCharset,
+  beforeRequest, beforeFetch, request, responseCharset,
 }: FetchSourceOptions) {
   const swapped = swapHost(initial);
   try {
     return await attemptOnce(initial, {
-      signal: parentSignal, timeoutMs, connectTimeoutMs, maxRedirects, maxBytes, beforeRequest, request, responseCharset,
+      signal: parentSignal, timeoutMs, connectTimeoutMs, maxRedirects, maxBytes, beforeRequest, beforeFetch, request, responseCharset,
     });
   } catch (error) {
     // 4xx/5xx/策略拒绝：源站行为或响应侧判定，换 host 不改变结果，原样上抛；
@@ -176,7 +178,7 @@ async function fetchWithHostSwap(initial: URL, {
     await sourceHostSwapDelay(parentSignal);
     parentSignal.throwIfAborted();
     return await attemptOnce(swapped, {
-      signal: parentSignal, timeoutMs, connectTimeoutMs, maxRedirects, maxBytes, beforeRequest, request, responseCharset,
+      signal: parentSignal, timeoutMs, connectTimeoutMs, maxRedirects, maxBytes, beforeRequest, beforeFetch, request, responseCharset,
       skipFirstBeforeRequest: true,
     });
   }
@@ -202,7 +204,7 @@ function swapHost(url: URL): URL | null {
 }
 
 async function attemptOnce(start: URL, {
-  signal: parentSignal, timeoutMs, connectTimeoutMs, maxRedirects, maxBytes, beforeRequest, request, responseCharset,
+  signal: parentSignal, timeoutMs, connectTimeoutMs, maxRedirects, maxBytes, beforeRequest, beforeFetch, request, responseCharset,
   skipFirstBeforeRequest = false,
 }: {
   signal: AbortSignal;
@@ -210,7 +212,8 @@ async function attemptOnce(start: URL, {
   connectTimeoutMs: number;
   maxRedirects: number;
   maxBytes: number;
-  beforeRequest?: (signal: AbortSignal) => Promise<void>;
+  beforeRequest?: (signal: AbortSignal, url?: string) => Promise<void>;
+  beforeFetch?: (signal: AbortSignal, url: string) => void;
   request?: SourcePageRequest;
   responseCharset?: SourceCharset | 'auto';
   /** 换 host 重试的首次请求：与失败的那次是同一逻辑请求，预算/节流不重复扣。 */
@@ -231,10 +234,12 @@ async function attemptOnce(start: URL, {
     for (let redirects = 0; ; redirects += 1) {
       signal.throwIfAborted();
       if (redirects > 0 || !skipFirstBeforeRequest) {
-        try { await beforeRequest?.(signal); }
+        try { await beforeRequest?.(signal, current); }
         catch (error) { (error as BeforeRequestFailure).fromBeforeRequest = true; throw error; }
       }
       signal.throwIfAborted();
+      try { beforeFetch?.(signal, current); }
+      catch (error) { (error as BeforeRequestFailure).fromBeforeRequest = true; throw error; }
       const connectTimer = setTimeout(() => {
         controller.abort(new DOMException('书源连接超时', 'ConnectTimeoutError'));
       }, connectTimeoutMs);
@@ -266,7 +271,7 @@ async function attemptOnce(start: URL, {
         current = next;
         continue;
       }
-      if (!received.ok) throw new SourceHttpError(received.status, parseRetryAfterMs(received.headers.get('retry-after')));
+      if (!received.ok) throw new SourceHttpError(received.status, parseRetryAfterMs(received.headers.get('retry-after')), new URL(current).hostname);
       // 仅auto且无有效HTTP声明的HTML响应考虑head meta；不改变显式或缺省解码。
       const contentType = received.headers.get('content-type');
       const httpCharset = responseCharset === 'auto' ? charsetFromContentType(contentType) : null;
@@ -288,8 +293,8 @@ async function attemptOnce(start: URL, {
 
 export class SourceHttpError extends Error {
   // retryAfterMs：源站 Retry-After 头（429/503 等）解析成的毫秒退避；缺省/不可解析为 undefined。
-  // 只保留状态与退避量，绝不透传响应体（可能含服务端回显）。
-  constructor(readonly status: number, readonly retryAfterMs?: number) { super('书源 HTTP ' + status); }
+  // 仅额外记录实际响应host供冷却归属；不带URL路径/查询串或响应体（可能含回显）。
+  constructor(readonly status: number, readonly retryAfterMs?: number, readonly responseHost?: string) { super('书源 HTTP ' + status); }
 }
 
 /**

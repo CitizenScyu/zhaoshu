@@ -103,6 +103,11 @@ export class SourceReaderError extends Error {
   constructor(message: string, readonly code: string, readonly status = 404) { super(message); }
 }
 
+/** 本地冷却拒绝不代表又收到一次 HTTP 503，不能累加 host 的传输失败。 */
+class SourceCooldownError extends SourceReaderError {
+  constructor() { super('当前书源要求稍后重试，正在尝试下一个书源。', 'SOURCE_SCOPE_EXHAUSTED', 503); }
+}
+
 /** 模糊降级层交给用户确认的候选（已拉过详情页、目录可解析、按相似度排序）。 */
 export interface SourceSimilarCandidate {
   title: string;
@@ -121,6 +126,8 @@ interface SharedSourceBudget {
    * 单源 probe 传入进程级共享表（probeThrottleSlots），同实例内的并发 probe 互相排队。
    */
   nextRequestAt: Map<string, number>;
+  /** 仅本请求树共享的同站冷却绝对期限；条目数不超过本树实际请求数，生命周期随 root 结束。 */
+  cooldownUntil: Map<string, number>;
   totalLimit: number;
   startedAt: number;
 }
@@ -209,7 +216,7 @@ export class SourceRequestContext {
     // 根 context 的全局上限初值 = 构造 limit：不经 openPool 的调用路径（单独用 context(n)）行为逐点不变。
     // openPool 的调用点：resolveSourceBook（池里含引擎源时）、surveySourceBooks 开头、switchSourceChapter 开头，都只增不减。
     this.budget = options.budget ?? {
-      requests: 0, nextRequestAt: options.throttleSlots ?? new Map(), totalLimit: limit, startedAt: Date.now(),
+      requests: 0, nextRequestAt: options.throttleSlots ?? new Map(), cooldownUntil: new Map(), totalLimit: limit, startedAt: Date.now(),
     };
     this.parent = options.parent;
     const sliceController = options.sliceController;
@@ -290,6 +297,16 @@ export class SourceRequestContext {
     return Math.max(0, Math.min(this.budget.totalLimit - this.budget.requests, scoped) - reserve);
   }
 
+  private checkCooldown(url: string, signal: AbortSignal): void {
+    signal.throwIfAborted();
+    const key = sourceStationKey(url);
+    const until = this.budget.cooldownUntil.get(key);
+    if (until === undefined) return;
+    // 不等待整个窗口：root 没有切片，长等待会挤掉异站备用源。绝对期限不钳短、不传给 setTimeout。
+    if (Date.now() < until) throw new SourceCooldownError();
+    this.budget.cooldownUntil.delete(key);
+  }
+
   async page(url: string, opts: SourcePageOptions = {}): Promise<{ url: string; text: string }> {
     const { request, responseCharset, attempts = MAX_SOURCE_ATTEMPTS } = opts;
     let lastError: unknown;
@@ -301,7 +318,9 @@ export class SourceRequestContext {
           signal: this.signal,
           request,
           responseCharset,
-          beforeRequest: async (signal) => {
+          beforeRequest: async (signal, targetUrl) => {
+            // 新调用先检查窗口，冷却中的请求不预扣点数、不占节流槽。
+            this.checkCooldown(targetUrl ?? url, signal);
             // L2 全局兜底：池预算用尽即停所有源（错误码与文案与今天逐字相同）。
             if (this.budget.requests >= this.budget.totalLimit) throw new SourceReaderError('书源查询预算已用完，请稍后重试或下载全书。', 'SOURCE_BUDGET_EXCEEDED', 503);
             // L1 单源点数：只放弃当前源（跳源），父/兄弟源的计数不回退；builtin 首源不受此闸门约束。
@@ -322,12 +341,23 @@ export class SourceRequestContext {
             }
             if (at > now) await pause(at - now, signal);
           },
+          // 预排队者醒来、重定向及换 host 兜底的每次物理发射前都重查；不重复扣点。
+          beforeFetch: (signal, targetUrl) => this.checkCooldown(targetUrl, signal),
         });
         // 成功请求 = 源在出数据：滑动切片据此顺延。失败/超时/中止都走下面的 catch，不顺延。
         this.noteProgress();
         return page;
       } catch (error) {
         this.signal.throwIfAborted();
+        if (isSourceThrottled(error)) {
+          if (error instanceof SourceHttpError && positiveRetryAfter(error)) {
+            // 只归属真正返回响应的站（可能经过重定向），保留最长期限，不被迟到响应缩短。
+            const key = sourceStationKey(error.responseHost ? `https://${error.responseHost}/` : url);
+            const until = Date.now() + error.retryAfterMs!;
+            this.budget.cooldownUntil.set(key, Math.max(until, this.budget.cooldownUntil.get(key) ?? 0));
+          }
+          throw error;
+        }
         if (error instanceof SourcePolicyError || error instanceof SourceReaderError
           || (error instanceof SourceHttpError && error.status < 500)) throw error;
         lastError = error;
@@ -575,13 +605,18 @@ function explicitSelectable(sources: ReadingSource[]): SelectableSources {
 }
 
 /**
- * 上游已对本站限流（53-ratelimit）：429 或带 Retry-After 的 5xx。站点明确说了「现在别来」，
+ * 上游已对本站限流（53-ratelimit）：429 或带有效正 Retry-After 的 503。站点明确说了「现在别来」，
  * 继续打其余候选/作者回退只是把同一站再 429 一遍，还白烧全局预算（挤掉备用源）。
  * 这些循环的 catch 用它把「continue 下一候选」收紧成「break 跳源」，与 SOURCE_SCOPE_EXHAUSTED
- * 同路径；Retry-After 的退避窗本身不在请求内等待（软预算 45s 等不起分钟级窗口），交给下一请求。
+ * 同路径；共享窗口由 context 在物理发射前复查，不等待到期占住备用源的时间。
  */
+function positiveRetryAfter(error: SourceHttpError): boolean {
+  return typeof error.retryAfterMs === 'number' && Number.isFinite(error.retryAfterMs) && error.retryAfterMs > 0;
+}
+
 function isSourceThrottled(error: unknown): boolean {
-  return error instanceof SourceHttpError && (error.status === 429 || error.retryAfterMs !== undefined);
+  return error instanceof SourceCooldownError || (error instanceof SourceHttpError
+    && (error.status === 429 || (error.status === 503 && positiveRetryAfter(error))));
 }
 
 /** 用户显式指定源的查找（章节续读认当前源）：url+revision 精确相符优先，其次同 URL 换版本；只收 SelectableSources。 */
@@ -799,10 +834,10 @@ export async function resolveSourceBook(
               // 全局兜底耗尽 ⇒ 交给外层统一 break（保留已收集，走既有 503 分桶）。
               if (error.code === 'SOURCE_BUDGET_EXCEEDED') throw error;
               // 单源点数/切片耗尽 ⇒ 该源本轮放弃，跳下一个源（hadFailure 置位，空结果最终 503 不 404）。
-              if (error.code === 'SOURCE_SCOPE_EXHAUSTED') { hadFailure = true; break; }
+              if (error.code === 'SOURCE_SCOPE_EXHAUSTED') { hadFailure = true; sourceThrottled ||= isSourceThrottled(error); break; }
               throw error;
             }
-            // 上游限流（429/带 Retry-After 的 5xx）：继续打其余候选只会再 429 一遍并白烧全局预算，
+            // 上游限流（429/带有效正 Retry-After 的 503）：继续打其余候选会白烧全局预算，
             // 与单源耗尽同路径跳源（53-ratelimit）。
             if (isSourceThrottled(error)) { hadFailure = true; sourceThrottled = true; break; }
             hadFailure = true;
@@ -832,7 +867,7 @@ export async function resolveSourceBook(
               context.signal.throwIfAborted();
               if (error instanceof SourceReaderError) {
                 if (error.code === 'SOURCE_BUDGET_EXCEEDED') throw error;
-                if (error.code === 'SOURCE_SCOPE_EXHAUSTED') { hadFailure = true; break; }
+                if (error.code === 'SOURCE_SCOPE_EXHAUSTED') { hadFailure = true; sourceThrottled ||= isSourceThrottled(error); break; }
                 throw error;
               }
               // 上游限流：同上，跳源止损（53-ratelimit）。
@@ -876,11 +911,12 @@ export async function resolveSourceBook(
                 // 旧行为直接 throw，在非首源上把改名书的作者页候选丢弃并跳源。这里记成跳源，
                 // 让外层 SOURCE_SCOPE_EXHAUSTED 分支（:572）继续下一源，保留已收集的 similar 候选。
                 hadFailure = true;
+                sourceThrottled ||= isSourceThrottled(error);
                 break;
               }
               throw error;
             }
-            // 上游限流（429/带 Retry-After 的 5xx）：详情/作者回退的逐候选继续只会把同一站再 429
+            // 上游限流（429/带有效正 Retry-After 的 503）：详情/作者回退的逐候选继续只会把同一站再请求
             // 一遍并白烧全局预算（挤掉备用源），与单源耗尽同路径跳源（53-ratelimit）。
             if (isSourceThrottled(error)) { hadFailure = true; sourceThrottled = true; break; }
             hadFailure = true;
