@@ -59,6 +59,12 @@ export default function ShelfTab() {
   const [noteSaved, setNoteSaved] = useState<{ id: number; text: string } | null>(null);
   const removeDraftRef = useRef<{ id: number; text: string } | null>(null);
   useEffect(() => { removeDraftRef.current = removeDraft; }, [removeDraft]);
+  // 手动操作(移除/清理)的全链路取消器:反馈保存→删除→重载是一整个动作,离页即作废。
+  // 没有它,迟到的 JSON 兑现后 doRemove 会拿着稳定 apiFetch 继续走完剩下的 DELETE 和
+  // 重载——AuthController.fetch 每次选当前会话,身份已换时就以新用户身份发连续写入。
+  // abort 同时中止在途 POST/DELETE;取消不宣称服务端已提交的写入被回滚。
+  const operationAbort = useRef<AbortController | null>(null);
+  useEffect(() => () => operationAbort.current?.abort(), []);
 
   const busy = updating || loading || removing || clearing;
 
@@ -128,6 +134,10 @@ export default function ShelfTab() {
     const draft = removeDraft?.id === item.id ? removeDraft.text.trim() : '';
     // 上次已经存过这条原因就不再 POST：重试只补 DELETE，避免反复插入新 feedback 撞 409。
     let noteIsSaved = noteSaved?.id === item.id;
+    // 本操作全链路持同一取消器;重试是全新操作,领新的 controller。
+    const controller = new AbortController();
+    operationAbort.current = controller;
+    const current = () => !controller.signal.aborted;
     try {
       if (draft && !noteIsSaved) {
         // 先存原因再移除：反馈挂在书上而不是推荐行上，移除后画像仍能用上这一句。
@@ -139,8 +149,10 @@ export default function ShelfTab() {
             title: item.title, author: item.author, status: item.status,
             note: draft, expectedFeedbackId: item.feedback_id ?? 0,
           }),
+          signal: controller.signal,
         });
         const data = await saved.json().catch(() => ({}));
+        if (!current()) return;
         if (!saved.ok || data.ok !== true) {
           throw new Error(typeof data.error === 'string' ? data.error : '原因未能保存，这本书已留在书架');
         }
@@ -148,21 +160,24 @@ export default function ShelfTab() {
         setNoteSaved({ id: item.id, text: draft });
       }
       // F05：按书移除（book_id），服务端删除该用户这本书的全部推荐行；不再传单条推荐 id。
-      const res = await apiFetch(`/api/shelf?bookId=${item.book_id}`, { method: 'DELETE' });
+      const res = await apiFetch(`/api/shelf?bookId=${item.book_id}`, { method: 'DELETE', signal: controller.signal });
       const data = await res.json().catch(() => ({}));
+      if (!current()) return;
       // 删除已提交但响应丢失，或另一页已移除时，目标已经达成；刷新以恢复本地视图。
       const alreadyRemoved = res.status === 404 && data.code === 'RECOMMENDATION_NOT_FOUND';
       if (!res.ok && !alreadyRemoved) throw new Error(data.error || '移除失败');
       setRemoveDraft(null);
       setNoteSaved(null);
-      await load();
+      await load(controller.signal);
     } catch (error) {
+      if (!current()) return;
       const message = error instanceof Error ? error.message : '移除失败';
       // 失败后重新武装这一条并把草稿留在眼前；原因已经落库的要说实话——字没丢，重试只补移除。
       if (noteIsSaved || draft) setArmed(removeTarget(item.id));
       setError(noteIsSaved ? `原因已记下，但这本书还没移出：${message}` : message);
     } finally {
-      setRemoving(false);
+      if (operationAbort.current === controller) operationAbort.current = null;
+      if (current()) setRemoving(false);
     }
   }
 
@@ -171,17 +186,23 @@ export default function ShelfTab() {
     setClearing(true);
     setError('');
     setFeedbackMessage('');
+    // 与 doRemove 同一套全链路取消器:清理→重载是一个动作,离页即作废。
+    const controller = new AbortController();
+    operationAbort.current = controller;
+    const current = () => !controller.signal.aborted;
     try {
-      const res = await apiFetch('/api/shelf/unprocessed', { method: 'DELETE' });
+      const res = await apiFetch('/api/shelf/unprocessed', { method: 'DELETE', signal: controller.signal });
       const data = await res.json().catch(() => ({}));
+      if (!current()) return;
       if (!res.ok) throw new Error(data.error || '清理失败');
       const cleared = typeof data.cleared === 'number' ? data.cleared : 0;
       setFeedbackMessage(cleared > 0 ? `已清空 ${cleared} 条未处理推荐` : '没有可清理的未处理推荐');
-      await load();
+      await load(controller.signal);
     } catch (error) {
-      setError(error instanceof Error ? error.message : '清理失败');
+      if (current()) setError(error instanceof Error ? error.message : '清理失败');
     } finally {
-      setClearing(false);
+      if (operationAbort.current === controller) operationAbort.current = null;
+      if (current()) setClearing(false);
     }
   }
 

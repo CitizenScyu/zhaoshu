@@ -18,7 +18,12 @@ const item = {
   status: 'want', note: '', feedback_id: 3, created_at: '2026-09-28T00:00:00Z',
   match_score: null, hit_likes: [], risks: null, reason: null, meta: {},
 };
-const newItem = { ...item, id: 12, status: 'new' as const, feedback_id: 0, note: null };
+// 注意与 item 必须是不同的书(title/author):foldShelfItems 按 canonicalBookKey 折卡,
+// 同书两行会并成一张且新行当主卡,new 状态不会出现选填原因入口。
+const newItem = {
+  ...item, id: 12, book_id: 33, title: '另一本合成书', author: '另一位合成作者',
+  status: 'new' as const, feedback_id: 0, note: null,
+};
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -26,15 +31,14 @@ function deferred<T>() {
   return { promise, resolve };
 }
 
-interface Recorded { url: string; method: string; signal?: AbortSignal; body?: unknown }
+interface Recorded { url: string; method: string; signal: AbortSignal | null | undefined; body?: unknown }
 
 /** 合成 apiFetch:记录每次调用(含 signal 与请求体),按需挂起/兑现各端点。 */
 function makeApi() {
   const calls: Recorded[] = [];
   const deletes: { user: number; book: number }[] = [];
-  let currentUser = 2;
   const state = {
-    calls, deletes, currentUser,
+    calls, deletes, currentUser: 2,
     feedbackBody: deferred<unknown>(),
     deleteBody: deferred<unknown>(),
     clearBody: deferred<unknown>(),
@@ -52,11 +56,11 @@ function makeApi() {
       return { ok: true, json: () => state.feedbackBody.promise } as unknown as Response;
     }
     if (url === '/api/shelf?bookId=22' && init?.method === 'DELETE') {
-      deletes.push({ user: currentUser, book: 22 });
+      deletes.push({ user: state.currentUser, book: 22 });
       return { ok: true, json: () => state.deleteBody.promise } as unknown as Response;
     }
     if (url === '/api/shelf/unprocessed' && init?.method === 'DELETE') {
-      deletes.push({ user: currentUser, book: 0 });
+      deletes.push({ user: state.currentUser, book: 0 });
       return { ok: true, json: () => state.clearBody.promise } as unknown as Response;
     }
     throw new Error(`unexpected ${url} ${init?.method ?? 'GET'}`);
@@ -64,22 +68,25 @@ function makeApi() {
   return state;
 }
 
-const drain = () => act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
+/** 书架渲染后点一次「✕ 移除」并等草稿入口出现(item 需满足 note 为空的已表态书)。 */
+async function armRemovalWithNote() {
+  render(<ShelfTab />);
+  fireEvent.click(await screen.findByRole('button', { name: '将合成测试书移出书架' }));
+  await screen.findByRole('textbox', { name: /^移出前记一句/ });
+}
 
 beforeEach(() => { vi.resetAllMocks(); });
 afterEach(() => { cleanup(); });
 
-async function armRemoval() {
-  render(<ShelfTab />);
-  fireEvent.click(await screen.findByRole('button', { name: '将合成测试书移出书架' }));
+async function fillReason() {
+  fireEvent.change(screen.getByRole('textbox', { name: /^移出前记一句/ }), { target: { value: '合成原因' } });
 }
 
 describe('移除链路:反馈保存→删除→重载', () => {
   it('反馈JSON等待期离页并切换用户:迟到兑现不再以新用户发DELETE、不拉新列表,POST signal已中止', async () => {
     const api = makeApi();
-    await armRemoval();
-    fireEvent.change(screen.getByRole('textbox', { name: '移出前记一句（选填，帮「找书」更准）' }),
-      { target: { value: '合成原因' } });
+    await armRemovalWithNote();
+    fillReason();
     fireEvent.click(screen.getByRole('button', { name: '再次点击确认将合成测试书移出书架' }));
     await waitFor(() => expect(api.calls.filter((c) => c.method === 'POST')).toHaveLength(1));
 
@@ -88,7 +95,7 @@ describe('移除链路:反馈保存→删除→重载', () => {
     api.currentUser = 3;
     await act(async () => { api.feedbackBody.resolve({ ok: true }); await new Promise((r) => setTimeout(r, 0)); });
 
-    expect(api.deletes).toEqual([]); // 不得出现 {user:3,book:22}
+    expect(api.deletes).toEqual([]); // 守卫生效时根本不发 DELETE;若守卫缺失,桩将以 state.currentUser=3 记为 {user:3,book:22}
     const gets = api.calls.filter((c) => c.method === 'GET').length;
     expect(gets).toBe(1); // 只有首屏那一次,卸载后没有新列表请求
     expect(api.calls.find((c) => c.method === 'POST')?.signal?.aborted).toBe(true);
@@ -96,9 +103,8 @@ describe('移除链路:反馈保存→删除→重载', () => {
 
   it('DELETE等待期离页:迟到成功不重载列表,DELETE signal已中止', async () => {
     const api = makeApi();
-    await armRemoval();
-    fireEvent.change(screen.getByRole('textbox', { name: '移出前记一句（选填，帮「找书」更准）' }),
-      { target: { value: '合成原因' } });
+    await armRemovalWithNote();
+    fillReason();
     fireEvent.click(screen.getByRole('button', { name: '再次点击确认将合成测试书移出书架' }));
     await act(async () => { api.feedbackBody.resolve({ ok: true }); await new Promise((r) => setTimeout(r, 0)); });
     await waitFor(() => expect(api.deletes).toHaveLength(1));
@@ -112,15 +118,14 @@ describe('移除链路:反馈保存→删除→重载', () => {
 
   it('不离页的正常移除仍走完整链:原因落库→DELETE→重载(行为保留)', async () => {
     const api = makeApi();
-    await armRemoval();
-    fireEvent.change(screen.getByRole('textbox', { name: '移出前记一句（选填，帮「找书」更准）' }),
-      { target: { value: '合成原因' } });
+    await armRemovalWithNote();
+    fillReason();
     fireEvent.click(screen.getByRole('button', { name: '再次点击确认将合成测试书移出书架' }));
     await act(async () => { api.feedbackBody.resolve({ ok: true }); await new Promise((r) => setTimeout(r, 0)); });
     await act(async () => { api.deleteBody.resolve({ ok: true }); await new Promise((r) => setTimeout(r, 0)); });
     await waitFor(() => expect(api.calls.filter((c) => c.method === 'GET')).toHaveLength(2));
 
-    // 重载后列表只剩未处理那条;未中止的 signal 全程可用。
+    // 桩恒返回两条,断言只验证链路语义:两次 GET(首屏+重载)、一次 A 身份 DELETE、全程未中止。
     expect(api.deletes).toEqual([{ user: 2, book: 22 }]);
     expect(api.calls.filter((c) => c.method === 'DELETE')[0].signal?.aborted).toBe(false);
   });
@@ -147,6 +152,7 @@ describe('清理未处理:DELETE→重载', () => {
     fireEvent.click(await screen.findByRole('button', { name: '清空全部未处理推荐' }));
     fireEvent.click(screen.getByRole('button', { name: '再次点击确认清空全部未处理推荐' }));
     await act(async () => { api.clearBody.resolve({ cleared: 1 }); await new Promise((r) => setTimeout(r, 0)); });
+    expect(screen.getByRole('status').textContent).toContain('已清空 1 条未处理推荐');
     await waitFor(() => expect(api.calls.filter((c) => c.method === 'GET')).toHaveLength(2));
     expect(api.deletes).toEqual([{ user: 2, book: 0 }]);
   });
