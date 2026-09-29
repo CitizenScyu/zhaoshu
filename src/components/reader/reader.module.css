@@ -186,7 +186,7 @@
 .sourceDetail { color: var(--reader-muted); font-size: 12px; line-height: 1.7; }
 @keyframes open-panel { from { opacity: .3; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
 @media (max-width: 640px) {
-  .header { min-height: 62px; gap: 8px; padding: calc(6px + env(safe-area-inset-top)) max(12px, env(safe-area-inset-right)) 6px max(12px, env(safe-area-inset-left)); }
+  .header { min-height: 62px; flex-wrap: wrap; gap: 8px; padding: calc(6px + env(safe-area-inset-top)) max(12px, env(safe-area-inset-right)) 6px max(12px, env(safe-area-inset-left)); }
   .back { font-size: 12px; }
   .bookIdentity { display: none; }
   .tools { margin-left: auto; gap: 6px; }
