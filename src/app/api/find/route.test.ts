@@ -576,11 +576,33 @@ describe('POST /api/find output contract', () => {
     mocks.chatRobust.mockResolvedValue(JSON.stringify({ candidates: [candidate] }));
     await consumeSSE(await POST(request({ step: 'recall', query: '找书' })));
     expect(mocks.chatRobust.mock.calls[0][2]).toMatchObject({ fallbackModel: 'claude-opus-5-88' });
+    expect(mocks.resolveModel).toHaveBeenCalledTimes(1);
 
     mocks.chatRobust.mockReset();
     mocks.chatRobust.mockResolvedValue(JSON.stringify({ items: [{ ...item, matchScore: 80 }] }));
     await consumeSSE(await POST(request({ step: 'rerank', query: '找书', verified: [verified] })));
     expect(mocks.chatRobust.mock.calls[0][2]).toMatchObject({ fallbackModel: 'claude-opus-5-88' });
+    expect(mocks.resolveModel).toHaveBeenCalledTimes(2);
+  });
+
+  it('verify completes even when model configuration would never settle', async () => {
+    let release!: (model: string) => void;
+    mocks.resolveModel.mockReturnValue(new Promise<string>((resolve) => { release = resolve; }));
+    const pending = POST(request({ step: 'verify', query: '找书', candidates: [candidate] }));
+    try {
+      await vi.waitFor(() => expect(mocks.verifyBatch).toHaveBeenCalledOnce(), { timeout: 500 });
+      const events = await consumeSSE(await pending);
+      const result = lastEvent<{ verified: unknown[]; ticket: string }>(events, 'result');
+      expect(result.verified).toHaveLength(1);
+      expect(result.ticket).toEqual(expect.any(String));
+      expect(mocks.supplementSourceEvidence).toHaveBeenCalledOnce();
+      expect(mocks.resolveModel).not.toHaveBeenCalled();
+      expect(mocks.chatRobust).not.toHaveBeenCalled();
+    } finally {
+      // 失败路径释放合成 promise，不留下悬挂的测试请求。
+      release('fake-model');
+      await pending;
+    }
   });
 
   it('uses LLM_FALLBACK_MODEL when it is configured', async () => {

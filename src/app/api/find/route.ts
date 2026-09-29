@@ -245,21 +245,23 @@ async function handlePOST(req: NextRequest) {
     // 只能当量级；其中约一半是本机→Cloudflare 某边缘 IP 的 TLS 路径问题、与模型无关，生产
     // Vercel 侧是否同样命中尚未验证。每次请求读一次配置，便于运维改 LLM_FALLBACK_MODEL 后
     // 立即生效。其它调用点（profile / feedback）刻意不传，保持既有行为中性。
-    const fallbackModel = configuredFallbackModel();
+    // verify 只做外部证据核验，不依赖模型配置；冷缓存设置读取不应阻塞验证进度。
+    const usesModel = step === 'recall' || step === 'rerank';
+    const fallbackModel = usesModel ? configuredFallbackModel() : undefined;
     // MS-06：兜底模型 == 主模型时跳过兜底分支。主模型取值与 chat() 用同一解析链
     // （库覆盖 → 库默认 → 环境变量 → 硬编码，见 llm.ts resolveModel）。若兜底就等于主模型，
     // 降级等于用同一个模型再跑一遍：白烧 ~120s 最低预算（MODEL_FALLBACK_MIN_BUDGET_MS）
     // 且大概率再超时一次，净负收益。在进入 SSE 之前就拦下，并打告警让线上能看到这个配置组合。
-    const primaryModel = await resolveModel();
-    const fallbackEnabled = fallbackModel !== primaryModel;
-    if (!fallbackEnabled) {
+    const primaryModel = usesModel ? await resolveModel() : undefined;
+    const fallbackEnabled = usesModel && fallbackModel !== primaryModel;
+    if (usesModel && !fallbackEnabled) {
       console.warn(
         `[find] fallback model equals primary model (${primaryModel}); skipping fallback branch`,
       );
     }
     // 单次尝试上限（首字节 + 流内停滞，取同一个值）：524 要吃满 ~126s，不给单次尝试封顶的话
     // 它一次就能把整步预算啃光、兜底永远轮不到。上限只压主模型那一路，兜底只受共享截止时间约束。
-    const attemptTimeoutMs = configuredAttemptTimeoutMs();
+    const attemptTimeoutMs = usesModel ? configuredAttemptTimeoutMs() : undefined;
     const modelAttemptLimits = { idleTimeoutMs: attemptTimeoutMs, firstByteTimeoutMs: attemptTimeoutMs };
     const ms = () => {
       access.assertActive();
