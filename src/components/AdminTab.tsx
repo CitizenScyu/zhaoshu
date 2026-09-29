@@ -343,7 +343,7 @@ export default function AdminTab() {
                 对外实际生效：{MODE_LABELS[effectiveMode]}（部署闸门或成员总闸未开，注册接口对匿名访问一律返回关闭）
               </p>
             )}
-            <button type="button" className="seal-button text-sm" disabled={!dirty || busy === 'registration'} onClick={() => void saveRegistration()}>
+            <button type="button" className="seal-button text-sm" disabled={!dirty || Boolean(busy)} onClick={() => void saveRegistration()}>
               {busy === 'registration' ? '保存中…' : '保存注册设置'}
             </button>
           </>
@@ -377,7 +377,7 @@ export default function AdminTab() {
               <option value="never">不过期</option>
             </select>
           </label>
-          <button type="button" className="ink-button text-xs !px-4 min-h-11" disabled={busy === 'invites-create'} onClick={() => void createInvites()}>
+          <button type="button" className="ink-button text-xs !px-4 min-h-11" disabled={Boolean(busy)} onClick={() => void createInvites()}>
             {busy === 'invites-create' ? '生成中…' : '生成邀请码'}
           </button>
         </div>
@@ -420,7 +420,7 @@ export default function AdminTab() {
                   <button
                     type="button"
                     className="ink-button text-xs !px-3"
-                    disabled={invite.status !== 'active' || busy === `invite-${invite.id}`}
+                    disabled={invite.status !== 'active' || Boolean(busy)}
                     onClick={() => void revokeInvite(invite.id)}
                   >
                     作废
@@ -457,7 +457,7 @@ export default function AdminTab() {
                       aria-label={`${user.username} ${field}`}
                       checked={user[field]}
                       // owner 行由表 CHECK 钉死，界面不提供入口。
-                      disabled={user.role === 'owner' || busy === `user-${user.id}`}
+                      disabled={user.role === 'owner' || Boolean(busy)}
                       onChange={(event) => void setUser(user.id, { [field]: event.target.checked })}
                     />
                   </td>
@@ -466,7 +466,7 @@ export default function AdminTab() {
                   <button
                     type="button"
                     className="ink-button text-xs !px-3"
-                    disabled={user.role === 'owner' || busy === `user-${user.id}`}
+                    disabled={user.role === 'owner' || Boolean(busy)}
                     onClick={() => void setUser(user.id, { disabled: !user.disabled })}
                   >
                     {user.disabled ? '已禁用 · 点击启用' : '启用中 · 点击禁用'}
@@ -511,11 +511,11 @@ export default function AdminTab() {
             spellCheck={false}
             disabled={busy === 'label-model'}
           />
-          <button type="submit" className="ink-button text-xs !px-4" disabled={busy === 'label-model' || !labelDraft.trim()}>保存</button>
+          <button type="submit" className="ink-button text-xs !px-4" disabled={Boolean(busy) || !labelDraft.trim()}>保存</button>
           <button
             type="button"
             className="seal-button text-sm"
-            disabled={busy === 'label-model' || !labelModel?.model}
+            disabled={Boolean(busy) || !labelModel?.model}
             onClick={() => void saveLabelModel(null)}
           >
             清除（回退 .env）
