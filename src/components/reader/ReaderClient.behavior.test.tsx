@@ -100,7 +100,7 @@ function ownerWith(apiFetch: ApiFetch) {
     permissions: { find: true, read: true, download: true }, authMethod: 'session', accountsEnabled: true,
     expired: false, sessionId: 1, sessionOnly: false, setSessionOnly: vi.fn(),
     submitToken: vi.fn(), login: vi.fn(), logout: vi.fn(), refresh: vi.fn(),
-    apiFetch, can: (permission: string) => permission === 'read',
+    apiFetch, can: (permission: string) => permission === 'read', isCurrentSession: () => true,
   };
 }
 

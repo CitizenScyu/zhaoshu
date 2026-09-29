@@ -1,6 +1,7 @@
 'use client';
 
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { useOwner } from '@/components/OwnerProvider';
 import type { SourceProbePanelResult } from '@/lib/source-reader';
 
 // 41-panel:浏览器换源面板的扇出调度(接口约定见 fanout-41-report §6)。
@@ -138,6 +139,7 @@ async function probeOne(apiFetch: ApiFetch, title: string, author: string, sourc
 export function useSourceFanout({ apiFetch, title, author, currentSource, cache }: {
   apiFetch: ApiFetch; title: string; author: string; currentSource?: ServingSource; cache: ProbeCache;
 }) {
+  const { sessionId, isCurrentSession } = useOwner();
   const [state, setState] = useState<FanoutState>(INITIAL);
   const [generation, setGeneration] = useState(0);
   // 当前源只在一次扫描开始时读:它不必 probe(已在读),变化也不应让在飞的扫描重来。
@@ -146,17 +148,20 @@ export function useSourceFanout({ apiFetch, title, author, currentSource, cache 
   useEffect(() => { current.current = currentSource; }, [currentSource]);
 
   const scan = useCallback(async (signal: AbortSignal) => {
-    const set = (update: (previous: FanoutState) => FanoutState) => { if (!signal.aborted) setState(update); };
+    const valid = () => !signal.aborted && isCurrentSession(sessionId);
+    if (!valid()) return;
+    const set = (update: (previous: FanoutState) => FanoutState) => { if (valid()) setState(update); };
     let res: Response;
     let data: unknown;
     try {
       res = await apiFetch('/api/read/source-probe', { signal, cache: 'no-store' });
+      if (!valid()) return;
       data = await res.json().catch(() => null);
     } catch {
       set(() => ({ ...INITIAL, phase: 'error', message: '换源候选加载失败,请重试。' }));
       return;
     }
-    if (signal.aborted) return;
+    if (!valid()) return;
     // 404 SOURCE_FANOUT_DISABLED(开关关)或旧部署没有这条路由:都退回旧面板,不当错误提示。
     if (res.status === 404) { set(() => ({ ...INITIAL, phase: 'disabled' })); return; }
     // 候选列表不计限流(路由只在带 source 的 probe 上查限流),不会有 503 限流不可用;网关/平台的 5xx 一律走 error。
@@ -180,7 +185,7 @@ export function useSourceFanout({ apiFetch, title, author, currentSource, cache 
     let stop: Extract<Outcome, { kind: 'stop' }> | null = null;
     await new Promise<void>((resolve) => {
       const pump = () => {
-        if (signal.aborted || (stop && active === 0)) { resolve(); return; }
+        if (!valid() || (stop && active === 0)) { resolve(); return; }
         for (let i = 0; !stop && i < queue.length && active < SOURCE_PROBE_CONCURRENCY;) {
           const source = queue[i];
           const host = source.hostKey || hostOf(source.url);
@@ -193,6 +198,9 @@ export function useSourceFanout({ apiFetch, title, author, currentSource, cache 
           void probeOne(apiFetch, title, author, source, signal).then((outcome) => {
             active--;
             if (host) busyHosts.delete(host);
+            // 旧会话 transport 中止也会使 probe 落定；React 卸载前本地 signal 仍可为活。
+            // 此时既不能写回缓存，也不能把取消当失败而在新会话继续 pump。
+            if (!valid()) { resolve(); return; }
             if (outcome.kind === 'result') {
               // 超时不缓存:下次「重新检测」可以再试;其它结论(含 miss)同一会话内复用。
               if (outcome.result.status !== 'timeout') cache.set(probeCacheKey(title, author, source.url), outcome.result);
@@ -210,7 +218,7 @@ export function useSourceFanout({ apiFetch, title, author, currentSource, cache 
       };
       pump();
     });
-    if (signal.aborted) return;
+    if (!valid()) return;
     const halted = stop as Extract<Outcome, { kind: 'stop' }> | null;
     if (!halted) { set((previous) => ({ ...previous, phase: 'done' })); return; }
     // 停发:队列里没发出去的行标「未检测」;不自动重试(429 要求等 Retry-After 秒)。
@@ -219,7 +227,7 @@ export function useSourceFanout({ apiFetch, title, author, currentSource, cache 
       phase: halted.phase, retryAfter: halted.retryAfter ?? null, message: halted.message,
       rows: previous.rows.map((item) => (skipped.has(item.url) ? { ...item, state: 'skipped' } : item)),
     }));
-  }, [apiFetch, title, author, cache]);
+  }, [apiFetch, title, author, cache, sessionId, isCurrentSession]);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -228,9 +236,10 @@ export function useSourceFanout({ apiFetch, title, author, currentSource, cache 
   }, [scan, generation]);
 
   const rescan = useCallback(() => {
+    if (!isCurrentSession(sessionId)) return;
     setState(INITIAL);
     setGeneration((value) => value + 1);
-  }, []);
+  }, [sessionId, isCurrentSession]);
 
   return { ...state, rescan };
 }
