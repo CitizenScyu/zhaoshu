@@ -259,6 +259,51 @@ describe('邀请码管理', () => {
 });
 
 describe('用户管理', () => {
+  it('列表用一次只读批次返回总数与分页行，保留字段和参数', async () => {
+    db.resolve.mockImplementation(async (query) => query.text.includes('count(*)') ? [{ total: 21 }] : [{
+      id: 21, username: '合成用户', role: 'member', can_find: true, can_read: true, can_download: false,
+      disabled_at: null, created_at: '2026-09-30', invite_hint: null,
+    }]);
+    const res = await call(usersGet as Handler, owner('GET', '/api/admin/users?page=2'));
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({
+      users: [{ id: 21, username: '合成用户', role: 'member', canFind: true, canRead: true, canDownload: false,
+        disabled: false, createdAt: '2026-09-30', inviteHint: null }],
+      page: 2, pageSize: 20, total: 21,
+    });
+    expect(db.transaction).toHaveBeenCalledExactlyOnceWith(expect.any(Function), { readOnly: true });
+    expect(db.queries).toHaveLength(2);
+    expect(db.queries[0].text).toBe('SELECT count(*)::int AS total FROM users');
+    expect(db.queries[1].values).toEqual([20, 20]);
+    expect(db.queries[1].text).toContain('ORDER BY u.id ASC');
+  });
+
+  it('空页仍返回全量总数，页大小上限不变', async () => {
+    db.resolve.mockImplementation(async query => query.text.includes('count(*)') ? [{ total: 21 }] : []);
+    const res = await call(usersGet as Handler, owner('GET', '/api/admin/users?page=3&pageSize=999'));
+    expect(await res.json()).toEqual({ users: [], page: 3, pageSize: 100, total: 21 });
+    expect(db.queries[1].values).toEqual([100, 200]);
+    expect(db.transaction).toHaveBeenCalledOnce();
+  });
+
+  it.each(['count', 'rows'])('列表批次%s失败不返回部分用户数据', async (failed) => {
+    db.resolve.mockImplementation(async query => {
+      if ((query.text.includes('count(*)') ? 'count' : 'rows') === failed) throw new Error('synthetic failure');
+      return [{ total: 21 }];
+    });
+    const res = await call(usersGet as Handler, owner('GET', '/api/admin/users'));
+    expect(res.status).toBe(503);
+    expect(await res.json()).toEqual({ code: 'USERS_UNAVAILABLE', error: '用户列表暂时不可用，请稍后重试。' });
+    expect(db.transaction).toHaveBeenCalledOnce();
+  });
+
+  it('未授权列表请求不创建批次或查询', async () => {
+    const res = await call(usersGet as Handler, owner('GET', '/api/admin/users', undefined, { Authorization: '' }));
+    expect(res.status).toBe(401);
+    expect(db.transaction).not.toHaveBeenCalled();
+    expect(db.queries).toHaveLength(0);
+  });
+
   it('列表不查询密码哈希或会话 token', async () => {
     db.resolve.mockResolvedValue([]);
     const res = await call(usersGet as Handler, owner('GET', '/api/admin/users'));

@@ -21,15 +21,18 @@ async function handleGET(req: NextRequest) {
 
   try {
     const sql = getSql();
-    const counts = await sql`SELECT count(*)::int AS total FROM users` as { total: number }[];
-    const rows = await sql`
+    // 两条独立只读查询同进同退，复用现有事务批次以省去一次 HTTP 往返。
+    const [counts, rows] = await sql.transaction((tx) => [
+      tx`SELECT count(*)::int AS total FROM users`,
+      tx`
       SELECT u.id, u.username, u.role, u.can_find, u.can_read, u.can_download,
              u.disabled_at::text AS disabled_at, u.created_at::text AS created_at,
              i.code_hint AS invite_hint
       FROM users u
       LEFT JOIN registration_invites i ON i.id = u.created_via_invite_id
       ORDER BY u.id ASC
-      LIMIT ${pageSize} OFFSET ${(page - 1) * pageSize}` as UserRow[];
+      LIMIT ${pageSize} OFFSET ${(page - 1) * pageSize}`,
+    ], { readOnly: true }) as [{ total: number }[], UserRow[]];
     return authJson({
       users: rows.map(toAdminUser),
       page,
