@@ -4,8 +4,10 @@ import { userEvent } from '@testing-library/user-event';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import AdminTab from './AdminTab';
 
-const mocks = vi.hoisted(() => ({ apiFetch: vi.fn() }));
-vi.mock('./OwnerProvider', () => ({ useOwner: () => ({ apiFetch: mocks.apiFetch }) }));
+const mocks = vi.hoisted(() => ({ apiFetch: vi.fn(), isCurrentSession: () => true }));
+vi.mock('./OwnerProvider', () => ({ useOwner: () => ({
+  apiFetch: mocks.apiFetch, sessionId: 1, isCurrentSession: mocks.isCurrentSession,
+}) }));
 
 const INITIAL = { membersEnabled: true, accountsEnabled: true, registrationMode: 'closed', updatedAt: null };
 type Draft = Pick<typeof INITIAL, 'membersEnabled' | 'registrationMode'>;

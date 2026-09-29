@@ -1,6 +1,6 @@
 'use client';
 
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { useOwner } from '@/components/OwnerProvider';
 import ModelSettingsTab from '@/components/ModelSettingsTab';
 import type { InviteCodeSummary, RegistrationMode } from '@/lib/invite-codes';
@@ -53,7 +53,21 @@ function errorText(data: unknown, fallback: string): string {
 // owner 管理台：注册开关、邀请码、用户与打标模型。全部走 /api/admin/*（仅 owner，
 // 写请求自动带 CSRF 头）。主模型沿用既有组件，功能不回退。
 export default function AdminTab() {
-  const { apiFetch } = useOwner();
+  const { apiFetch, sessionId, isCurrentSession } = useOwner();
+  const actions = useRef(new Set<AbortController>());
+  useEffect(() => () => {
+    for (const controller of actions.current) controller.abort();
+    actions.current.clear();
+  }, []);
+  function beginAction() {
+    const controller = new AbortController();
+    actions.current.add(controller);
+    return controller;
+  }
+  function isCurrentAction(controller: AbortController) {
+    // 认证控制器可能先于 React 重挂换代，旧处理器必须核对渲染时的代际。
+    return !controller.signal.aborted && isCurrentSession(sessionId);
+  }
 
   const [registration, setRegistration] = useState<RegistrationSettings | null>(null);
   const [registrationDraft, setRegistrationDraft] = useState<RegistrationSettings | null>(null);
@@ -70,6 +84,8 @@ export default function AdminTab() {
   const [notice, setNotice] = useState('');
 
   const refresh = useCallback(async (signal?: AbortSignal) => {
+    const current = () => !signal?.aborted && isCurrentSession(sessionId);
+    if (!current()) return;
     setLoading(true);
     setError('');
     try {
@@ -79,13 +95,18 @@ export default function AdminTab() {
         apiFetch('/api/admin/invites', { signal }),
         apiFetch('/api/admin/label-model', { signal }),
       ]);
+      if (!current()) return;
       const reg = await regRes.json();
+      if (!current()) return;
       if (!regRes.ok) throw new Error(errorText(reg, '注册设置加载失败'));
       const userData = await usersRes.json();
+      if (!current()) return;
       if (!usersRes.ok) throw new Error(errorText(userData, '用户列表加载失败'));
       const inviteData = await invitesRes.json();
+      if (!current()) return;
       if (!invitesRes.ok) throw new Error(errorText(inviteData, '邀请码加载失败'));
       const label = await labelRes.json();
+      if (!current()) return;
       if (!labelRes.ok) throw new Error(errorText(label, '打标模型加载失败'));
       setRegistration(reg as RegistrationSettings);
       setRegistrationDraft(reg as RegistrationSettings);
@@ -93,12 +114,12 @@ export default function AdminTab() {
       setInvites((inviteData as { invites: InviteCodeSummary[] }).invites ?? []);
       setLabelModel(label as LabelModelSetting);
     } catch (e) {
-      if (signal?.aborted) return;
+      if (!current()) return;
       setError(e instanceof Error ? e.message : '管理数据加载失败');
     } finally {
-      if (!signal?.aborted) setLoading(false);
+      if (current()) setLoading(false);
     }
-  }, [apiFetch]);
+  }, [apiFetch, sessionId, isCurrentSession, setError]);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -107,122 +128,154 @@ export default function AdminTab() {
   }, [refresh]);
 
   async function saveRegistration() {
-    if (!registrationDraft || busy) return;
+    if (!isCurrentSession(sessionId) || !registrationDraft || busy) return;
+    const controller = beginAction();
     const submittedDraft = registrationDraft;
     setBusy('registration');
     setError(''); setNotice('');
     try {
       const res = await apiFetch('/api/admin/registration', {
         method: 'PATCH',
+        signal: controller.signal,
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           membersEnabled: submittedDraft.membersEnabled,
           registrationMode: submittedDraft.registrationMode,
         }),
       });
+      if (!isCurrentAction(controller)) return;
       const data = await res.json();
+      if (!isCurrentAction(controller)) return;
       if (!res.ok) throw new Error(errorText(data, '注册设置保存失败'));
       setRegistration(data as RegistrationSettings);
       // 保存期间表单仍可编辑；只更新尚未被后续输入替换的提交快照。
       setRegistrationDraft(current => current === submittedDraft ? data as RegistrationSettings : current);
       setNotice(`已保存：${data.registrationMode === 'closed' ? '注册关闭' : MODE_LABELS[data.registrationMode as RegistrationMode]}，成员功能${data.membersEnabled ? '已启用' : '已停用'}`);
     } catch (e) {
-      setError(e instanceof Error ? e.message : '注册设置保存失败');
+      if (isCurrentAction(controller)) setError(e instanceof Error ? e.message : '注册设置保存失败');
     } finally {
-      setBusy('');
+      actions.current.delete(controller);
+      if (isCurrentAction(controller)) setBusy('');
     }
   }
 
   async function setUser(id: number, patch: Partial<Pick<AdminUser, 'canFind' | 'canRead' | 'canDownload' | 'disabled'>>) {
-    if (busy) return;
+    if (!isCurrentSession(sessionId) || busy) return;
+    const controller = beginAction();
     setBusy(`user-${id}`);
     setError(''); setNotice('');
     try {
       const res = await apiFetch(`/api/admin/users/${id}`, {
         method: 'PATCH',
+        signal: controller.signal,
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(patch),
       });
+      if (!isCurrentAction(controller)) return;
       const data = await res.json();
+      if (!isCurrentAction(controller)) return;
       if (!res.ok) throw new Error(errorText(data, '用户设置保存失败'));
       const next = (data as { user: AdminUser }).user;
       setUsers((current) => current.map((user) => (user.id === id ? { ...user, ...next } : user)));
       setNotice(`已更新 ${next.username}`);
     } catch (e) {
-      setError(e instanceof Error ? e.message : '用户设置保存失败');
+      if (isCurrentAction(controller)) setError(e instanceof Error ? e.message : '用户设置保存失败');
     } finally {
-      setBusy('');
+      actions.current.delete(controller);
+      if (isCurrentAction(controller)) setBusy('');
     }
   }
 
   async function createInvites() {
-    if (busy) return;
+    if (!isCurrentSession(sessionId) || busy) return;
+    const controller = beginAction();
     setBusy('invites-create');
     setError(''); setNotice(''); setCreated([]);
     try {
       const res = await apiFetch('/api/admin/invites', {
         method: 'POST',
+        signal: controller.signal,
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ count: batchCount, ttlDays }),
       });
+      if (!isCurrentAction(controller)) return;
       const data = await res.json();
+      if (!isCurrentAction(controller)) return;
       if (!res.ok) throw new Error(errorText(data, '邀请码生成失败'));
       setCreated((data as { invites: CreatedInvite[] }).invites ?? []);
       setNotice('已生成邀请码：原文只显示这一次，请立即复制。');
-      const listRes = await apiFetch('/api/admin/invites');
-      if (listRes.ok) setInvites(((await listRes.json()) as { invites: InviteCodeSummary[] }).invites ?? []);
+      const listRes = await apiFetch('/api/admin/invites', { signal: controller.signal });
+      if (!isCurrentAction(controller)) return;
+      if (listRes.ok) {
+        const list = await listRes.json() as { invites: InviteCodeSummary[] };
+        if (isCurrentAction(controller)) setInvites(list.invites ?? []);
+      }
     } catch (e) {
-      setError(e instanceof Error ? e.message : '邀请码生成失败');
+      if (isCurrentAction(controller)) setError(e instanceof Error ? e.message : '邀请码生成失败');
     } finally {
-      setBusy('');
+      actions.current.delete(controller);
+      if (isCurrentAction(controller)) setBusy('');
     }
   }
 
   async function revokeInvite(id: number) {
-    if (busy) return;
+    if (!isCurrentSession(sessionId) || busy) return;
+    const controller = beginAction();
     setBusy(`invite-${id}`);
     setError(''); setNotice('');
     try {
-      const res = await apiFetch(`/api/admin/invites/${id}/revoke`, { method: 'POST' });
+      const res = await apiFetch(`/api/admin/invites/${id}/revoke`, { method: 'POST', signal: controller.signal });
+      if (!isCurrentAction(controller)) return;
       const data = await res.json();
+      if (!isCurrentAction(controller)) return;
       if (!res.ok) throw new Error(errorText(data, '作废失败'));
       setInvites((current) => current.map((invite) => (invite.id === id ? { ...invite, status: 'revoked', revokedAt: new Date().toISOString() } : invite)));
       setNotice('邀请码已作废');
     } catch (e) {
-      setError(e instanceof Error ? e.message : '作废失败');
+      if (isCurrentAction(controller)) setError(e instanceof Error ? e.message : '作废失败');
     } finally {
-      setBusy('');
+      actions.current.delete(controller);
+      if (isCurrentAction(controller)) setBusy('');
     }
   }
 
   async function saveLabelModel(model: string | null) {
-    if (busy) return;
+    if (!isCurrentSession(sessionId) || busy) return;
+    const controller = beginAction();
     setBusy('label-model');
     setError(''); setNotice('');
     try {
       const res = await apiFetch('/api/admin/label-model', {
         method: 'PATCH',
+        signal: controller.signal,
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ model }),
       });
+      if (!isCurrentAction(controller)) return;
       const data = await res.json();
+      if (!isCurrentAction(controller)) return;
       if (!res.ok) throw new Error(errorText(data, '打标模型保存失败'));
       setLabelModel(data as LabelModelSetting);
       setLabelDraft('');
       setNotice(model === null ? '已清除，打标机回退到它自己的 .env' : `打标模型已设为 ${model}（下次运行 labeler.py 时生效）`);
     } catch (e) {
-      setError(e instanceof Error ? e.message : '打标模型保存失败');
+      if (isCurrentAction(controller)) setError(e instanceof Error ? e.message : '打标模型保存失败');
     } finally {
-      setBusy('');
+      actions.current.delete(controller);
+      if (isCurrentAction(controller)) setBusy('');
     }
   }
 
   async function copy(text: string) {
+    if (!isCurrentSession(sessionId)) return;
+    const controller = beginAction();
     try {
       await navigator.clipboard.writeText(text);
-      setNotice('已复制到剪贴板');
+      if (isCurrentAction(controller)) setNotice('已复制到剪贴板');
     } catch {
-      setError('复制失败，请手动选中复制');
+      if (isCurrentAction(controller)) setError('复制失败，请手动选中复制');
+    } finally {
+      actions.current.delete(controller);
     }
   }
 
