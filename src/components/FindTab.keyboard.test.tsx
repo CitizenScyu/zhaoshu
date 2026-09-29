@@ -5,7 +5,8 @@ import FindTab from './FindTab';
 
 const mocks = vi.hoisted(() => ({ apiFetch: vi.fn() }));
 vi.mock('@/components/OwnerProvider', () => ({
-  useOwner: () => ({ apiFetch: mocks.apiFetch, user: { id: 7 }, ready: true, can: () => true }),
+  useOwner: () => ({ apiFetch: mocks.apiFetch, user: { id: 7 }, ready: true, can: () => true,
+    sessionId: 1, isCurrentSession: (id: number) => id === 1 }),
 }));
 
 function result(fields: Record<string, unknown>) {

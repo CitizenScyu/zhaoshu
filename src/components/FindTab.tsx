@@ -56,7 +56,7 @@ const CHIP_TOTAL = 6; // chips 总数上限（最近 + 随机示例）
 type Phase = FindPhase;
 
 export default function FindTab() {
-  const { apiFetch, user } = useOwner();
+  const { apiFetch, user, sessionId, isCurrentSession } = useOwner();
   const userId = user?.id ?? 0;
   // 默认仍是口味推荐：精确找书是新增入口，不改变现有用户习惯。
   const [mode, setMode] = useState<FindMode>('taste');
@@ -111,6 +111,7 @@ export default function FindTab() {
   );
 
   async function run() {
+    if (!isCurrentSession(sessionId)) return;
     const q = query.trim();
     if (!q || phase === 'recall' || phase === 'verify' || phase === 'rerank') return;
     // F12：勾选「仅本次有效」= session 契约——本次需求只用于本轮匹配，不写搜索历史、
@@ -127,11 +128,13 @@ export default function FindTab() {
   // 失败重试：从失败那一步重来。recall/verify 已成功的产物直接从 state/ref 接力，
   // 不再为前面的步骤重复付 LLM 钱；全新查询仍从 recall 起。
   function retry() {
+    if (!isCurrentSession(sessionId)) return;
     if (!retryFrom || phase === 'recall' || phase === 'verify' || phase === 'rerank') return;
     void runFrom(retryFrom);
   }
 
   async function runFrom(start: FindStep) {
+    if (!isCurrentSession(sessionId)) return;
     const ctx = runCtxRef.current;
     if (!ctx) return;
     const { q, conditions, retention } = ctx;
@@ -161,6 +164,16 @@ export default function FindTab() {
     }
     const controller = new AbortController();
     request.current = controller;
+    const current = () => !controller.signal.aborted && isCurrentSession(sessionId);
+    const reportProgress = (event: SseEvent) => { if (current()) onFindProgress(event); };
+    // fetchFindResult 在微任务中调用 doFetch；必须在真正发送时再次核对原代际。
+    const fetchStep = (signal: AbortSignal, step: FindStep, extra: Record<string, unknown> = {}) => {
+      if (!current()) return Promise.reject(new DOMException('找书会话已结束', 'AbortError'));
+      return apiFetch('/api/find', {
+        signal, method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: stepBody(step, extra),
+      });
+    };
     let at: FindStep = start; // 当前在跑哪一步：失败时据此决定重试起点
 
     try {
@@ -168,13 +181,11 @@ export default function FindTab() {
       if (start === 'recall') {
         recalled = await fetchStepResult<Candidate[]>(
           controller.signal,
-          (signal) => apiFetch('/api/find', {
-            signal, method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: stepBody('recall'),
-          }),
+          (signal) => fetchStep(signal, 'recall'),
           'candidates',
+          reportProgress,
         );
+        if (!current()) return;
         setCandidates(recalled);
       }
 
@@ -185,14 +196,11 @@ export default function FindTab() {
         setPhase('verify');
         const verifyEvent = await fetchFindResult(
           controller.signal,
-          (signal) => apiFetch('/api/find', {
-            signal, method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: stepBody('verify', { candidates: recalled }),
-          }),
+          (signal) => fetchStep(signal, 'verify', { candidates: recalled }),
           FIND_FETCH_TIMEOUT_MS,
-          onFindProgress,
+          reportProgress,
         );
+        if (!current()) return;
         if (!Array.isArray(verifyEvent.verified)) throw new Error('找书结果不完整，请重试');
         verified = verifyEvent.verified as VerifiedCandidate[];
         ticketRef.current = typeof verifyEvent.ticket === 'string' ? verifyEvent.ticket : '';
@@ -205,14 +213,11 @@ export default function FindTab() {
       setPhase('rerank');
       const resultEvent = await fetchFindResult(
         controller.signal,
-        (signal) => apiFetch('/api/find', {
-          signal, method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: stepBody('rerank', { ticket: ticketRef.current }),
-        }),
+        (signal) => fetchStep(signal, 'rerank', { ticket: ticketRef.current }),
         FIND_FETCH_TIMEOUT_MS,
-        onFindProgress,
+        reportProgress,
       );
+      if (!current()) return;
       if (!Array.isArray(resultEvent.items)) throw new Error('找书结果不完整，请重试');
       setResults(resultEvent.items as RerankedItem[]);
       setPersistNote(persistWarning(resultEvent) ?? '');
@@ -220,7 +225,7 @@ export default function FindTab() {
       setVetoed(vetoedBooks(resultEvent));
       setPhase('done');
     } catch (e) {
-      if (controller.signal.aborted) return;
+      if (!current()) return;
       // SSE 断线/超时/后端 error 帧都带可识别 code，提示里给用户可操作重试入口。
       const code = (e as Error & { code?: string }).code;
       const base = e instanceof Error ? e.message : '未知错误';
@@ -247,8 +252,9 @@ export default function FindTab() {
     signal: AbortSignal,
     doFetch: (signal: AbortSignal) => Promise<Response>,
     field: 'candidates' | 'verified' | 'items',
+    onProgress: (event: SseEvent) => void,
   ): Promise<T> {
-    const event = await fetchFindResult(signal, doFetch, FIND_FETCH_TIMEOUT_MS, onFindProgress);
+    const event = await fetchFindResult(signal, doFetch, FIND_FETCH_TIMEOUT_MS, onProgress);
     if (!Array.isArray(event[field])) throw new Error('找书结果不完整，请重试');
     return event[field] as T;
   }
