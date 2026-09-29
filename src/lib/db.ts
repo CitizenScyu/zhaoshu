@@ -261,7 +261,9 @@ export function feedbackForPrompt(rows: ProfileFeedback[]): Omit<ProfileFeedback
 // 否则 LIMIT 50 会把水位永久钉在第一批。见 user-data.absorb-watermark-invariant.pglite.test.ts。
 export async function getProfileFeedbackForUser(userId: number, afterId = 0): Promise<ProfileFeedback[]> {
   requireUserId(userId);
-  return await recentInformativeFeedbackForUserQuery(getSql(), userId, undefined, afterId) as ProfileFeedback[];
+  const rows = await recentInformativeFeedbackForUserQuery(getSql(), userId, undefined, afterId) as
+    (Omit<ProfileFeedback, 'feedbackId'> & { feedback_id: number })[];
+  return rows.map(({ feedback_id, ...feedback }) => ({ ...feedback, feedbackId: feedback_id }));
 }
 
 // 已撤回反馈的书名（F04）：曾 informative、最新已非 informative。空数组表示没有撤回信号，
@@ -270,7 +272,9 @@ export async function getProfileFeedbackForUser(userId: number, afterId = 0): Pr
 // 需要算水位的地方直接用 raw 行。两条调用方见 profile/route.ts 与 profile-absorption.ts。
 export async function getWithdrawnFeedbackBookTitlesForUserRaw(userId: number): Promise<WithdrawnFeedbackTitle[]> {
   requireUserId(userId);
-  return await withdrawnFeedbackBookTitlesForUserQuery(getSql(), userId) as WithdrawnFeedbackTitle[];
+  const rows = await withdrawnFeedbackBookTitlesForUserQuery(getSql(), userId) as
+    { title: string; feedback_id: number }[];
+  return rows.map(({ title, feedback_id }) => ({ title, feedbackId: feedback_id }));
 }
 
 export async function getWithdrawnFeedbackBookTitlesForUser(userId: number): Promise<string[]> {
