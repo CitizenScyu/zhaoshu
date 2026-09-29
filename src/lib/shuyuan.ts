@@ -1056,14 +1056,14 @@ export async function getShuyuanStats(
   const s = getSql();
   const rawMeta = await storedMeta(s, signal);
   const { collections, states } = readMeta(rawMeta.collections);
-  const counts = await countsFromStates(s, states, signal);
+  const countsPending = countsFromStates(s, states, signal);
   const filter = list?.filter ?? 'all';
   const page = list?.page ?? 1;
   const pageSize = list ? SOURCE_PAGE_SIZE : SOURCE_STATUS_LIMIT;
   // 筛选谓词写成 7 个绑定参数的布尔式，而不是拼 SQL 片段：filter 会决定谓词形状，
   // 但它始终只是一个被比较的值，不进 SQL 文本。分支与 countsFromStates 的
   // FILTER (WHERE ...) 逐条对齐，所以卡片上的数字就是点进去看到的条数。
-  const rows = await readRows<{
+  const rowsPending = readRows<{
     url: string; name: string; disabled: boolean; availability: ShuyuanAvailability;
     last_error: string; checked_at: string | null; probe_error: string | null;
   }>(s, s`
@@ -1082,7 +1082,16 @@ export async function getShuyuanStats(
        OR (${filter} = 'failed' AND p.status = 'failed')
     ORDER BY COALESCE(p.status = 'pending', false) DESC,
              (last_error <> '' OR disabled_at IS NOT NULL) DESC, source_url
-    LIMIT ${pageSize} OFFSET ${offsetFor(page, pageSize)}`, signal);
+    LIMIT ${pageSize} OFFSET ${offsetFor(page, pageSize)}`, signal).then(
+    (value) => ({ ok: true as const, value }),
+    (error: unknown) => ({ ok: false as const, error }),
+  );
+  // 两读共享 meta；立即接住 rows 失败，但仍先交付 counts 错误，不等慢 rows。
+  // counts 失败时已发出的只读 rows 可继续，仍走原 signal 与配额记账。
+  const counts = await countsPending;
+  const rowsOutcome = await rowsPending;
+  if (!rowsOutcome.ok) throw rowsOutcome.error;
+  const rows = rowsOutcome.value;
   const stats: ShuyuanStats = {
     ...counts, collections, refreshedAt: rawMeta.refreshed_at, sourcesLimit: pageSize,
     sources: rows.map((row) => ({
