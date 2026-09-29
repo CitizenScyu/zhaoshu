@@ -1344,7 +1344,11 @@ describe('refreshShuyuan atomic refresh', () => {
           rejection_codes: { unsupported_operator: 3 } },
       });
       // 漏斗谓词与入池判据同口径：ok 必须含 compile_ok ∧ search_ok IS TRUE。
-      const funnel = execute.mock.calls.find(([query]) => query.text.includes('FROM source_admission'))![0];
+      // 4280bda 起 engineHosts 门查询也含 FROM source_admission（SELECT DISTINCT host ... a.compile_ok AND
+      // a.search_ok IS TRUE），故选择器必须按漏斗聚合的独有特征定位——顶层 count(*) FILTER（门查询无聚合、
+      // 带表别名），不靠调用先后顺序（门与漏斗经 Promise.all 并发，顺序无契约）。
+      const funnel = execute.mock.calls.find(([query]) => query.text.includes('count(*) FILTER'))![0];
+      expect(funnel.text).toContain('FROM source_admission');
       expect(funnel.text).toContain('compile_ok AND search_ok IS TRUE');
       expect(funnel.text).toContain("search_verdict IN ('challenge', 'conn_fail', 'shell')");
       // 准入兼容 L4（反例 18）：三个观测列都由既有 core_field_mask 列派生（零 schema 改动）。
@@ -1374,7 +1378,8 @@ describe('refreshShuyuan atomic refresh', () => {
         ok: 3, deferred: 0, rejected: 0, url_defaulted: 1, miss_chapter_list: 2, miss_chapter_name: 1,
         rejection_codes: {},
       });
-      const funnel = execute.mock.calls.find(([query]) => query.text.includes('FROM source_admission'))![0];
+      // 同上：按漏斗聚合特征（count(*) FILTER）定位，门查询（SELECT DISTINCT host）不参与匹配。
+      const funnel = execute.mock.calls.find(([query]) => query.text.includes('count(*) FILTER'))![0];
       expect(funnel.text).toContain('AS url_defaulted');
       expect(funnel.text).toContain('AS miss_chapter_list');
       expect(funnel.text).toContain('AS miss_chapter_name');
