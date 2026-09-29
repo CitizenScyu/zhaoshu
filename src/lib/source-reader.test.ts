@@ -913,6 +913,43 @@ describe('GET /api/read/source/[resource]', () => {
     expect(plain.sourceBookUrl).toBeUndefined();
   });
 
+  it.each([false, true])('SRCREL53: 旧会话暖缓存保留新源目录，备用源下线=%s', async (removed) => {
+    mocks.sources.mockResolvedValue([source, backup]);
+    pages.set(chapterUrl(), { text: '', status: 404 });
+    pages.set(backupSearch(), { text: '<a href="/books/details777.html">测试书</a>' });
+    pages.set(backupPage, { text: detail(777, '作者', ['序言', '第一章', '第二章']) });
+    pages.set(backupChapter(777, 2), { text: chapterHtml('备用第一章') });
+    pages.set(backupChapter(777, 3), { text: chapterHtml('备用第二章') });
+    const index = await (await request()).json();
+    const query = `session=${index.source.session}&version=${index.version}&chapter=0`;
+    const first = await (await request('chapter', query)).json();
+    expect(first.switchedChapterIndex).toBe(1);
+    if (removed) mocks.sources.mockResolvedValue([source]);
+    const beforeWarm = mocks.fetch.mock.calls.length;
+    const warm = await (await request('chapter', query)).json();
+    expect(mocks.fetch).toHaveBeenCalledTimes(beforeWarm);
+    expect(warm).toEqual(first);
+    if (!removed) {
+      const next = await service.readSourceChapter(warm.sourceSession, warm.switchedChapterIndex + 1, context());
+      expect(next.text).toBe('备用第二章');
+      expect(mocks.fetch.mock.calls.slice(beforeWarm).map(([url]) => String(url)))
+        .toEqual([backupChapter(777, 3)]);
+    }
+  });
+
+  it('SRCREL53: 调用者修改返回身份不会污染暖缓存快照', async () => {
+    const catalog = await service.resolveSourceBook(book, context());
+    catalogs.set(catalog.version, catalog);
+    const first = await service.readSourceChapter(catalog.version, 0, context());
+    const expected = { ...first };
+    first.version = 'caller-mutated';
+    first.sourceSession = 'caller-mutated';
+    const warm = await service.readSourceChapter(catalog.version, 0, context());
+    expect(warm).toEqual(expected);
+    warm.version = 'second-mutation';
+    expect(await service.readSourceChapter(catalog.version, 0, context())).toEqual(expected);
+  });
+
   it('H7 必修 A:章名漂移(同章号+主体扩写)时换源响应仍附新目录,重读时前端接受', async () => {
     // 复审复现:原目录「第1章 风起」,备用目录「第1章 风起与云涌」(matchSourceChapter tier 3)。
     // 严格相等判据下 attach 静默不附,重读时前端标题防线判不符。
@@ -1498,6 +1535,50 @@ describe('引擎源正文分派（N01）', () => {
     catalogs.set(catalog.version, catalog);
     return catalog;
   };
+
+  it.each([false, true])('SRCREL53: 正文空后页不缓存半章，备用源=%s', async (hasBackup) => {
+    const paged = { ...contentEngineSource, rules: { ...contentEngineSource.rules,
+      ruleContent: { content: '#body@text', nextContentUrl: '.next@href' } } };
+    const catalog = await primeEngineCatalog();
+    mocks.sources.mockResolvedValue(hasBackup ? [paged, backup] : [paged]);
+    pages.set(n01Chapter, { text: '<div id="body">前半章</div><a class="next" href="/n01/c/1_2.html">下页</a>' });
+    pages.set('https://book15.net/n01/c/1_2.html', { text: '<div>请稍后重试</div>' });
+    if (hasBackup) {
+      pages.set(backupSearch(), { text: '<a href="/books/details777.html">测试书</a>' });
+      pages.set(backupPage, { text: detail(777) });
+      pages.set(backupChapter(777, 1), { text: chapterHtml('备用完整章节') });
+      const part = await service.readSourceChapter(catalog.version, 0, context());
+      expect(part).toMatchObject({ text: '备用完整章节', servedFromUrl: backup.url });
+      expect(part.sourceSession).toBe(part.version);
+    } else {
+      await expect(service.readSourceChapter(catalog.version, 0, context()))
+        .rejects.toMatchObject({ code: 'SOURCE_CHAPTER_UNAVAILABLE', status: 503 });
+      pages.set('https://book15.net/n01/c/1_2.html', { text: '<div id="body">后半章</div>' });
+      const beforeRetry = mocks.fetch.mock.calls.length;
+      expect((await service.readSourceChapter(catalog.version, 0, context())).text).toBe('前半章\n后半章');
+      expect(mocks.fetch.mock.calls.slice(beforeRetry).map(([url]) => String(url)))
+        .toEqual([n01Chapter, 'https://book15.net/n01/c/1_2.html']);
+    }
+  });
+
+  it('SRCREL53: 确认目录空后页返回已知错误且不落库，恢复后完整交付', async () => {
+    await primeEngineCatalog();
+    writes = [];
+    const paged = { ...contentEngineSource, rules: { ...contentEngineSource.rules,
+      ruleToc: { ...contentEngineSource.rules.ruleToc, nextTocUrl: '.next@href' } } };
+    mocks.sources.mockResolvedValue([paged]);
+    pages.set(n01Toc, { text: '<li class="chapter"><a href="/n01/c/1.html">第一章</a></li><a class="next" href="/n01/toc/2.html">下页</a>' });
+    pages.set('https://book15.net/n01/toc/2.html', { text: '<div>请稍后重试</div>' });
+    const query = `title=测试书&author=作者&book_url=${encodeURIComponent(n01Detail)}&source=${encodeURIComponent(paged.url)}`;
+    const failed = await request('index', query);
+    expect(failed.status).toBe(422);
+    expect(await failed.json()).toMatchObject({ code: 'SOURCE_REJECTED' });
+    expect(writes).toEqual([]);
+    pages.set('https://book15.net/n01/toc/2.html', { text: '<li class="chapter"><a href="/n01/c/2.html">第二章</a></li>' });
+    const recovered = await request('index', query);
+    expect(recovered.status).toBe(200);
+    expect((await recovered.json()).chapters).toHaveLength(2);
+  });
 
   it('引擎源目录 + #body@text 正文 → readSourceChapter 成功（对齐 N01 反例）', async () => {
     const catalog = await primeEngineCatalog();

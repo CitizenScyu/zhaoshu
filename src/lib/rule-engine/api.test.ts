@@ -54,6 +54,39 @@ describe('引擎门面四函数（M1 任务 4 §7.1）', () => {
     ]);
   });
 
+  it.each([false, true])('SRCREL53: 目录空后页拒绝，空页还有下一页=%s', async (continues) => {
+    const source = engineSource({ ruleToc: { chapterList: '.chapter', chapterName: 'a@text', chapterUrl: 'a@href', nextTocUrl: '.next@href' } });
+    const pages = new Map([
+      [TOC_URL, '<li class="chapter"><a href="/c/1.html">第一章</a></li><a class="next" href="/toc/2.html">下一页</a>'],
+      ['https://book15.net/toc/2.html', '<div>内容暂不可用</div>' + (continues ? '<a class="next" href="/toc/3.html">下一页</a>' : '')],
+    ]);
+    await expect(engineFetchToc(source, TOC_URL, fakeContext(pages))).rejects.toMatchObject({ name: 'SourcePolicyError' });
+    await expect(engineFetchToc(source, TOC_URL, fakeContext(pages), true)).rejects.toThrow('empty_toc_page');
+  });
+
+  it.each([false, true])('SRCREL53: 正文空后页拒绝，空页还有下一页=%s', async (continues) => {
+    const source = engineSource({ ruleContent: { content: '.content@text', nextContentUrl: '.next@href' } });
+    const pages = new Map([
+      [CHAPTER_URL, '<div class="content">前半章</div><a class="next" href="/c/1_2.html">下一页</a>'],
+      ['https://book15.net/c/1_2.html', '<div class="content">   </div>' + (continues ? '<a class="next" href="/c/1_3.html">下一页</a>' : '')],
+    ]);
+    await expect(engineFetchContent(source, CHAPTER_URL, fakeContext(pages))).rejects.toMatchObject({ name: 'SourcePolicyError' });
+    await expect(engineFetchContent(source, CHAPTER_URL, fakeContext(pages), true)).rejects.toThrow('empty_content_page');
+  });
+
+  it('SRCREL53: 后页重复合法章节不算空页，空首页仍由调用方判定', async () => {
+    const source = engineSource({ ruleToc: { chapterList: '.chapter', chapterName: 'a@text', chapterUrl: 'a@href', nextTocUrl: '.next@href' } });
+    const chapter = '<li class="chapter"><a href="/c/1.html">第一章</a></li>';
+    expect(await engineFetchToc(source, TOC_URL, fakeContext(new Map([
+      [TOC_URL, chapter + '<a class="next" href="/toc/2.html">下一页</a>'],
+      ['https://book15.net/toc/2.html', chapter],
+    ])))).toEqual({ chapters: [{ title: '第一章', url: CHAPTER_URL }] });
+    expect(await engineFetchToc(source, TOC_URL, fakeContext(new Map([[TOC_URL, '<div>空</div>']]))))
+      .toEqual({ chapters: [] });
+    expect(await engineFetchContent(source, CHAPTER_URL, fakeContext(new Map([[CHAPTER_URL, '<div>空</div>']]))))
+      .toEqual({ text: '' });
+  });
+
   it('engineFetchDetail 解释 ruleBookInfo（含 tocUrl 绝对化）', async () => {
     const pages = new Map([[BOOK_URL,
       '<h1 class="title">测试书</h1><span class="writer">作者</span><a class="toc" href="/toc/1.html">目录</a>']]);

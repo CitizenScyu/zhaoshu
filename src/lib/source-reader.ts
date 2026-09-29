@@ -1074,7 +1074,8 @@ async function loadSourceCatalog(session: string, context: SourceRequestContext)
   return { catalog, source, sources };
 }
 
-const chapterCache = new Map<string, { text: string; servedFrom: string; servedFromUrl: string; expires: number; bytes: number }>();
+// 只缓存附加目录前的响应快照，正文与供稿源身份保持一致；整本目录仍由路由从目录缓存/DB读取。
+const chapterCache = new Map<string, { part: ReaderPart; expires: number; bytes: number }>();
 let cacheBytes = 0;
 
 /** 目录加载时随 catalog 一起带出的源归属（N01）：按 builtin/engine 分派正文提取。 */
@@ -1388,12 +1389,12 @@ async function chapterText(
   return text;
 }
 
-function remember(key: string, text: string, servedFrom: string, servedFromUrl: string) {
+function remember(key: string, part: ReaderPart) {
   const old = chapterCache.get(key);
   if (old) cacheBytes -= old.bytes;
   chapterCache.delete(key);
-  const bytes = Buffer.byteLength(text, 'utf8');
-  chapterCache.set(key, { text, servedFrom, servedFromUrl, expires: Date.now() + CHAPTER_CACHE_MS, bytes });
+  const bytes = Buffer.byteLength(part.text, 'utf8');
+  chapterCache.set(key, { part: { ...part }, expires: Date.now() + CHAPTER_CACHE_MS, bytes });
   cacheBytes += bytes;
   while (chapterCache.size > MAX_CACHE_CHAPTERS || cacheBytes > MAX_CACHE_BYTES) {
     const oldest = chapterCache.keys().next().value!;
@@ -1409,16 +1410,19 @@ export async function readSourceChapter(session: string, chapterIndex: number, c
   if (!chapter) throw new SourceReaderError('章节不存在。', 'SOURCE_CHAPTER_INVALID', 400);
   const key = catalog.version + ':' + chapterIndex;
   const cached = chapterCache.get(key);
-  let text = cached && cached.expires > Date.now() ? cached.text : '';
-  let servedFrom = cached && cached.expires > Date.now() ? cached.servedFrom : (source?.name ?? catalog.sourceName);
+  if (cached && cached.expires > Date.now()) {
+    // 暖正文仍不依赖源在线状态；保留滑动TTL，并用副本隔离调用方写入。
+    remember(key, cached.part);
+    return { ...cached.part };
+  }
+  let text: string;
+  let servedFrom = source?.name ?? catalog.sourceName;
   // 与 servedFrom 成对的源 url(41-srcurl):换源面板按它精确认当前源,同名不同 url 的源不再被一起当成当前源。
-  let servedFromUrl = cached && cached.expires > Date.now() ? cached.servedFromUrl : (source?.url ?? catalog.sourceUrl);
+  let servedFromUrl = source?.url ?? catalog.sourceUrl;
   // 洞 1:当前源身份失效(池中已无同 URL 版本或源被停用)时不再抛 409,直接进换源;
   // 洞 2:换源成功即把本返回值换成新源的 version/sourceId,并带出新源目录会话 sourceSession。
   let switched: Awaited<ReturnType<typeof switchSourceChapter>> | null = null;
-  if (text) {
-    // 暖缓存命中:正文与源状态无关,直接交付(不校验源身份,保持既有缓存语义)。
-  } else if (!source) {
+  if (!source) {
     context.signal.throwIfAborted();
     // 当前源已不在池里(停用/整条下线):换源触发原因记旧实现给这种情形的码 SOURCE_CHANGED(只进日志)。
     switched = await switchSourceChapter(catalog, chapter, chapterIndex, context, sources, 'SOURCE_CHANGED');
@@ -1446,8 +1450,7 @@ export async function readSourceChapter(session: string, chapterIndex: number, c
       servedFromUrl = switched.sourceUrl;
     }
   }
-  remember(key, text, servedFrom, servedFromUrl);
-  return {
+  const part: ReaderPart = {
     taskId: null, sourceId: switched?.sourceId ?? catalog.sourceId, servedFrom, servedFromUrl,
     version: switched?.version ?? catalog.version,
     // 洞 2:换源成功时带出新源的目录会话版本,前端据此改用新源会话续读(不再每章从故障原源重试;
@@ -1456,6 +1459,8 @@ export async function readSourceChapter(session: string, chapterIndex: number, c
     chapterIndex,
     partIndex: 0, partCount: 1, title: chapter.title, startByte: 0, endByte: Buffer.byteLength(text, 'utf8'), text,
   };
+  remember(key, part);
+  return part;
 }
 
 /**

@@ -5,7 +5,7 @@
 // 结构断言（v3 E5）：本模块导出集合**恰为**门面四函数（engineSearchBook / engineFetchDetail / engineFetchToc /
 // engineFetchContent）与其类型，外加正文翻页上限常量 MAX_CONTENT_PAGES（41-M1.1：阅读器正文 context 的 L1 上限复用它）；
 // admissionFetch / validateAdmissionUrl 不在此（它们在 rule-engine/admission.ts 且不导出）。
-import { upgradeSourceTemplateUrl, validateSourceUrl } from '@/lib/source-policy';
+import { SourcePolicyError, upgradeSourceTemplateUrl, validateSourceUrl } from '@/lib/source-policy';
 import {
   MAX_SOURCE_CHAPTERS, buildSourceSearchRequest, sourceSearchUrl, type SourceBookIdentity, type SourceChapter,
 } from '@/lib/source-parser';
@@ -155,6 +155,8 @@ export async function engineFetchToc(
       }
     }
     if (strict && validChapters === 0) throw new Error('empty_toc_page');
+    // 已声明并跟随的后页缺内容，不能把前页目录作为完整成功；不改变首页/章节URL兜底语义。
+    if (pageIndex > 0 && validChapters === 0) throw new SourcePolicyError('书源目录后续页未提供有效章节，请重试或更换书源');
     // 只有当前页确实是 HTML 时才解析翻页 URL；否则链结束（避免对 JSON 输入跑 CSS 规则）。
     const rawNext = scope.kind === 'html' ? evaluateText(source.compiled, 'ruleToc.nextTocUrl', scope) : '';
     next = absoluteUrl(rawNext, page.url);
@@ -220,6 +222,8 @@ export async function engineFetchContent(
     const raw = evaluateText(source.compiled, 'ruleContent.content', scope, true);
     const content = convertContent ? contentHtmlToText(raw) : raw;
     if (strict && !content.trim()) throw new Error('empty_content_page');
+    // 阻止验证码/改版空后页把半章送入成功缓存；调用方据此走既有章节换源流程。
+    if (pageIndex > 0 && !content.trim()) throw new SourcePolicyError('书源正文后续页内容缺失，请重试或更换书源');
     if (content) parts.push(content);
     const nextRule = source.compiled.get('ruleContent.nextContentUrl');
     if (strict && nextRule && 'skipped' in nextRule) throw new Error('unsupported_content_rule');
