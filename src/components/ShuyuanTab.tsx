@@ -14,6 +14,8 @@ export default function ShuyuanTab() {
   const [filter, setFilter] = useState<ShuyuanSourceFilter>('all');
   const [page, setPage] = useState(1);
   const [error, setError] = useState('');
+  const [readFailed, setReadFailed] = useState(false);
+  const [loadAttempt, setLoadAttempt] = useState(0);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [toggling, setToggling] = useState('');
@@ -61,9 +63,11 @@ export default function ShuyuanTab() {
       // 迟到的旧响应会把它盖掉。与下面 catch/finally 的守卫同一口径。
       if (!isCurrent()) return null;
       setStats(data as ShuyuanStatsPage);
+      setReadFailed(false);
       return data as ShuyuanStatsPage;
     } catch (e) {
       if (!isCurrent()) return null;
+      setReadFailed(true);
       setError(e instanceof Error ? e.message : '书源加载失败');
       return null;
     } finally {
@@ -77,7 +81,7 @@ export default function ShuyuanTab() {
       if (!controller.signal.aborted) void load({ filter, page }, controller.signal);
     });
     return () => controller.abort();
-  }, [filter, page, load]);
+  }, [filter, page, load, loadAttempt]);
 
   const totalPages = stats ? pageCount(stats.total, stats.pageSize) : 1;
 
@@ -198,6 +202,16 @@ export default function ShuyuanTab() {
 
       {loading && !stats && (
         <p role="status" className="mt-6 text-sm" style={{ color: 'var(--ink-faint)' }}>读取中…</p>
+      )}
+
+      {!stats && readFailed && (
+        <button type="button" className="ink-button text-xs mt-3" disabled={loading || refreshing}
+          onClick={() => {
+            if (loading || refreshing || !isCurrentSession(sessionId)) return;
+            setLoading(true); setLoadAttempt((value) => value + 1);
+          }}>
+          重新读取列表
+        </button>
       )}
 
       {stats && (
