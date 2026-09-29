@@ -24,7 +24,7 @@ npm install
 npm run dev
 ```
 
-开发环境默认服务在 http://localhost:3000。
+开发环境默认服务在 http://localhost:3000。本地测试与构建的验证说明见 [docs/local-validation.md](docs/local-validation.md)。
 
 ### 认证与权限
 
