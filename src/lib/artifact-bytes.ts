@@ -47,7 +47,7 @@ export class BodyReadError extends Error {
  * 防被篡改的内容让服务器去拉一个超大文件。增量 UTF-8 校验不保留解码副本;任一步失败都
  * 取消上游流并释放锁。返回 `Buffer` 而非流,是因为调用方都要在此后做 sha / JSON 校验。
  */
-export async function readBoundedBody(response: Response, limit: number): Promise<Buffer> {
+export async function readBoundedBody(response: Response, limit: number, signal?: AbortSignal): Promise<Buffer> {
   if (!response.body) throw new BodyReadError('empty');
   const declaredSize = Number(response.headers.get('content-length'));
   if (Number.isFinite(declaredSize) && declaredSize > limit) {
@@ -55,12 +55,18 @@ export async function readBoundedBody(response: Response, limit: number): Promis
     throw new BodyReadError('too-large');
   }
   const reader = response.body.getReader();
+  let cancelling: Promise<void> | undefined;
+  const abort = () => { cancelling ??= reader.cancel(signal?.reason).catch(() => undefined); };
+  signal?.addEventListener('abort', abort, { once: true });
+  if (signal?.aborted) abort();
   const chunks: Uint8Array[] = [];
   const decoder = new TextDecoder('utf-8', { fatal: true });
   let size = 0;
   try {
     while (true) {
+      signal?.throwIfAborted();
       const { value, done } = await reader.read();
+      signal?.throwIfAborted();
       if (done) break;
       size += value.byteLength;
       if (size > limit) throw new BodyReadError('too-large');
@@ -85,6 +91,9 @@ export async function readBoundedBody(response: Response, limit: number): Promis
     }
     throw new BodyReadError('interrupted', { cause: error });
   } finally {
+    signal?.removeEventListener('abort', abort);
+    // 不把取消中仍未释放的上游流算作已完成；共享读取名额在此之后才释放。
+    await cancelling;
     reader.releaseLock();
   }
   if (!size) throw new BodyReadError('empty');

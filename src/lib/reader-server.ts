@@ -1,3 +1,4 @@
+import { readerPending, type ReaderPending } from '@/lib/reader-pending';
 import { createHash } from 'node:crypto';
 import { getSql } from '@/lib/db';
 import { locateBookFile } from '@/lib/book-file-locator';
@@ -34,6 +35,12 @@ export interface ReadableTask {
   artifact_id?: string | number | null;
 }
 
+function waitForReader<T>(pending: ReaderPending<T>, signal?: AbortSignal): Promise<T> {
+  signal?.throwIfAborted();
+  if (pending.signal.aborted) throw new ReaderError('正在结束上次读取,请稍后重试。', 503);
+  return pending.wait(signal);
+}
+
 interface BookFile {
   name: string;
   sha: string;
@@ -41,6 +48,7 @@ interface BookFile {
 }
 
 interface Source {
+  signal?: AbortSignal;
   key: string;
   /** contents API 根(无路径);相对路径追加到它后面。 */
   baseUrl: string;
@@ -68,11 +76,11 @@ interface CachedManifest {
 }
 
 let directory: Directory | undefined;
-let directoryPending: { key: string; promise: Promise<Directory> } | undefined;
+let directoryPending: { key: string; pending: ReaderPending<Directory> } | undefined;
 let cachedManifest: CachedManifest | undefined;
-let manifestPending: { key: string; promise: Promise<VolumeManifest> } | undefined;
+let manifestPending: { key: string; pending: ReaderPending<VolumeManifest> } | undefined;
 const volumes = new Map<string, Buffer>();
-const pendingVolumes = new Map<string, Promise<Buffer>>();
+const pendingVolumes = new Map<string, ReaderPending<Buffer>>();
 let cachedVolumeBytes = 0;
 
 function getSource(artifact: ArtifactLocation | null = null): Source {
@@ -111,8 +119,9 @@ function fileUrl(source: Source, name: string): string {
   return `${source.baseUrl}/${encodeArtifactPath(name)}`;
 }
 
-async function githubFetch(source: Source, name?: string, raw = false): Promise<Response> {
+async function githubFetch(source: Source, name?: string, raw = false, requestSignal?: AbortSignal): Promise<Response> {
   try {
+    source.signal?.throwIfAborted();
     const response = await fetch(name === undefined ? source.baseUrl : fileUrl(source, name), {
       headers: {
         Authorization: `Bearer ${source.token}`,
@@ -122,8 +131,12 @@ async function githubFetch(source: Source, name?: string, raw = false): Promise<
         'User-Agent': 'novel-finder-reader/1.0',
       },
       cache: 'no-store',
-      signal: AbortSignal.timeout(raw ? TEXT_TIMEOUT_MS : METADATA_TIMEOUT_MS),
+      signal: requestSignal ?? AbortSignal.any([AbortSignal.timeout(raw ? TEXT_TIMEOUT_MS : METADATA_TIMEOUT_MS), ...(source.signal ? [source.signal] : [])]),
     });
+    if (source.signal?.aborted) {
+      await response.body?.cancel(source.signal.reason).catch(() => undefined);
+      source.signal.throwIfAborted();
+    }
     if (response.status === 404) return response;
     if (!response.ok) {
       await response.body?.cancel().catch(() => undefined);
@@ -166,8 +179,10 @@ function parseFile(value: unknown): BookFile | null {
 
 async function getDirectory(source: Source): Promise<Directory> {
   if (directory?.sourceKey === source.key && directory.expiresAt > Date.now()) return directory;
-  if (directoryPending?.key === source.key) return directoryPending.promise;
-  const promise = (async () => {
+  source.signal?.throwIfAborted();
+  if (directoryPending?.key === source.key) return waitForReader(directoryPending.pending, source.signal);
+  const pending = readerPending(async (signal) => {
+    source = { ...source, signal };
     const response = await githubFetch(source);
     if (response.status === 404) {
       await response.body?.cancel().catch(() => undefined);
@@ -181,15 +196,12 @@ async function getDirectory(source: Source): Promise<Directory> {
       files: value.map(parseFile).filter((file): file is BookFile => file !== null),
       truncated: value.length >= 1000,
     };
+    source.signal?.throwIfAborted();
     directory = result;
     return result;
-  })();
-  directoryPending = { key: source.key, promise };
-  try {
-    return await promise;
-  } finally {
-    if (directoryPending?.promise === promise) directoryPending = undefined;
-  }
+  }, () => { if (directoryPending?.pending === pending) directoryPending = undefined; });
+  directoryPending = { key: source.key, pending };
+  return pending.wait(source.signal);
 }
 
 async function locateFile(source: Source, task: ReadableTask): Promise<BookFile | null> {
@@ -203,6 +215,7 @@ async function locateFile(source: Source, task: ReadableTask): Promise<BookFile 
     }
     const file = parseFile(await githubJson(response));
     if (!file || file.name !== expected) throw new ReaderError('书籍文件信息有误,请稍后重试。', 502);
+    source.signal?.throwIfAborted();
     if (listing.files.length < 1100) listing.files.push(file);
     return file;
   });
@@ -225,15 +238,15 @@ export async function getReadableTask(taskId: number, viewerId: number): Promise
     ...(task.artifact_id != null ? { artifact_id: task.artifact_id } : {}) };
 }
 
-async function taskSource(task: ReadableTask): Promise<Source> {
-  // 若上一次取元数据时目录已被标脏,先清空再重建(旧实现用 await 调度点达成的效果)。
-  // 不这样做的话,「目录缓存失效 → 立刻重取」在同一微任务里会看到脏缓存。
-  if (directory === undefined || directory.expiresAt <= Date.now()) directoryPending = undefined;
-  return getSource(task.artifact_id == null ? null : await locateTaskArtifact(getSql(), task.artifact_id));
+async function taskSource(task: ReadableTask, signal?: AbortSignal): Promise<Source> {
+  signal?.throwIfAborted();
+  const source = getSource(task.artifact_id == null ? null : await locateTaskArtifact(getSql(), task.artifact_id));
+  signal?.throwIfAborted();
+  return { ...source, signal };
 }
 
-export async function readerAvailability(task: ReadableTask): Promise<{ available: boolean }> {
-  const source = await taskSource(task);
+export async function readerAvailability(task: ReadableTask, signal?: AbortSignal): Promise<{ available: boolean }> {
+  const source = await taskSource(task, signal);
   if (source.manifestPath !== undefined) {
     // v2:可取 + 可解析即为可读,不再有大小门槛(读代价是 O(卷))。
     try {
@@ -266,14 +279,16 @@ function bodyReadFailure(error: unknown, tooLarge: string): unknown {
  * 有界缓冲机制在 artifact-bytes.readBoundedBody(与下载端共用),这里只做拉取与错误翻译。
  */
 async function readBounded(source: Source, name: string, limit: number, tooLarge: string): Promise<Buffer> {
-  const response = await githubFetch(source, name, true);
+  // 同一期限覆盖响应头和正文；流替身/异常传输不传播 fetch abort 时也取消 reader。
+  source = { ...source, signal: AbortSignal.any([AbortSignal.timeout(TEXT_TIMEOUT_MS), ...(source.signal ? [source.signal] : [])]) };
+  const response = await githubFetch(source, name, true, source.signal);
   if (response.status === 404) {
     directory = undefined;
     await response.body?.cancel().catch(() => undefined);
     throw new ReaderError('书籍文件不存在,请返回书库检查下载任务。', 404);
   }
   try {
-    return await readBoundedBody(response, limit);
+    return await readBoundedBody(response, limit, source.signal);
   } catch (error) {
     throw bodyReadFailure(error, tooLarge);
   }
@@ -293,26 +308,20 @@ async function readManifest(source: Source, force = false): Promise<VolumeManife
     && cachedManifest.manifestPath === source.manifestPath && cachedManifest.expiresAt > Date.now()) {
     return cachedManifest.manifest;
   }
-  if (manifestPending?.key === key && !force) return manifestPending.promise;
+  source.signal?.throwIfAborted();
+  if (manifestPending?.key === key && !force) return waitForReader(manifestPending.pending, source.signal);
   const path = source.manifestPath as string;
-  const promise = (async () => {
+  const pending = readerPending(async (signal) => {
+    source = { ...source, signal };
     const bytes = await readBounded(source, path, MAX_MANIFEST_BYTES, '章节目录异常,暂时无法在线阅读这本书。');
     const manifest = parseVolumeManifest(bytes);
     if (!manifest) throw new ReaderError('章节目录格式有误,请稍后重试。', 502);
+    source.signal?.throwIfAborted();
     cachedManifest = { sourceKey: source.key, manifestPath: path, expiresAt: Date.now() + DIRECTORY_TTL_MS, manifest };
     return manifest;
-  })().catch((error: unknown) => {
-    if (error instanceof ReaderError && error.status === 404) {
-      throw new ReaderError('书籍文件不存在,请返回书库检查下载任务。', 404);
-    }
-    throw error;
-  });
-  if (!force) manifestPending = { key, promise };
-  try {
-    return await promise;
-  } finally {
-    if (manifestPending?.key === key && manifestPending.promise === promise) manifestPending = undefined;
-  }
+  }, () => { if (manifestPending?.pending === pending) manifestPending = undefined; });
+  if (!force) manifestPending = { key, pending };
+  return pending.wait(source.signal);
 }
 
 function cacheVolume(key: string, bytes: Buffer): void {
@@ -352,6 +361,7 @@ async function readVolumeBytes(source: Source, entry: VolumeEntry): Promise<Buff
 
 async function getVolume(source: Source, entry: VolumeEntry, bypassCache = false): Promise<Buffer> {
   // 缓存键含 blob sha ⇒ 换版天然不串;卷是内容寻址字节,永不复用别的版本。
+  source.signal?.throwIfAborted();
   const key = `${entry.path}@${entry.blob_sha}`;
   if (!bypassCache) {
     const existing = volumes.get(key);
@@ -362,25 +372,22 @@ async function getVolume(source: Source, entry: VolumeEntry, bypassCache = false
       return existing;
     }
     const pending = pendingVolumes.get(key);
-    if (pending) return pending;
+    if (pending) return waitForReader(pending, source.signal);
     if (pendingVolumes.size >= MAX_PENDING_BOOKS) {
       throw new ReaderError('正在准备其他书籍,请稍后重试。', 503);
     }
   }
-  const promise = (async () => {
+  const pending = readerPending(async (signal) => {
+    source = { ...source, signal };
     const bytes = await readVolumeBytes(source, entry);
     const sha = gitBlobSha(bytes);
     if (sha !== entry.blob_sha) throw new VolumeChangedError(entry.path);
+    source.signal?.throwIfAborted();
     cacheVolume(key, bytes);
     return bytes;
-  })();
-  if (bypassCache) return promise;
-  pendingVolumes.set(key, promise);
-  try {
-    return await promise;
-  } finally {
-    pendingVolumes.delete(key);
-  }
+  }, () => { if (pendingVolumes.get(key) === pending) pendingVolumes.delete(key); });
+  if (!bypassCache) pendingVolumes.set(key, pending);
+  return pending.wait(source.signal);
 }
 
 /** 按 [start, end) 全书偏移取字节:遍历重叠卷,逐卷校验卷级 sha,拼重叠片段(正常 1 卷)。 */
@@ -408,6 +415,7 @@ async function recoverVolumeDrift(source: Source, manifest: VolumeManifest, erro
   try {
     refreshed = await readManifest(source, true);
   } catch {
+    source.signal?.throwIfAborted();
     refreshed = null;
   }
   if (refreshed && refreshed.version !== manifest.version) {
@@ -435,8 +443,8 @@ function chapterParts(bytes: Buffer): ByteRange[] {
     undefined, Math.max(bytes.byteLength, MAX_READER_BYTES));
 }
 
-export async function readBookIndex(task: ReadableTask): Promise<ReaderIndex> {
-  const source = await taskSource(task);
+export async function readBookIndex(task: ReadableTask, signal?: AbortSignal): Promise<ReaderIndex> {
+  const source = await taskSource(task, signal);
   if (source.manifestPath !== undefined) {
     const manifest = await readManifest(source);
     const chapters: ReaderChapter[] = manifest.chapter_index.map((entry) => ({
@@ -481,8 +489,9 @@ export async function readBookPart(
   chapterIndex: number,
   partIndex: number,
   expectedVersion: string,
+  signal?: AbortSignal,
 ): Promise<ReaderPart> {
-  const source = await taskSource(task);
+  const source = await taskSource(task, signal);
   if (source.manifestPath !== undefined) {
     const manifest = await readManifest(source);
     // 客户端持有的版本是清单声明的全书 blob sha(40 hex)。
@@ -542,7 +551,7 @@ interface CachedBook {
 }
 
 const books = new Map<string, CachedBook>();
-const pendingBooks = new Map<string, Promise<CachedBook>>();
+const pendingBooks = new Map<string, ReaderPending<CachedBook>>();
 let cachedBytes = 0;
 
 function cacheBook(key: string, book: CachedBook) {
@@ -560,7 +569,9 @@ function cacheBook(key: string, book: CachedBook) {
 }
 
 async function legacyBook(source: Source, task: ReadableTask): Promise<CachedBook> {
+  source.signal?.throwIfAborted();
   const file = await locateFile(source, task);
+  source.signal?.throwIfAborted();
   if (!file) throw new ReaderError('书籍文件不存在,请返回书库检查下载任务。', 404);
   const key = `${source.key}/${file.name}:${file.sha}`;
   const existing = books.get(key);
@@ -571,33 +582,33 @@ async function legacyBook(source: Source, task: ReadableTask): Promise<CachedBoo
     return existing;
   }
   const pending = pendingBooks.get(key);
-  if (pending) return pending;
+  if (pending) return waitForReader(pending, source.signal);
   if (pendingBooks.size >= MAX_PENDING_BOOKS) {
     throw new ReaderError('正在准备其他书籍,请稍后重试。', 503);
   }
-  const promise = (async () => {
-    const bytes = await readBytes(source, file);
-    // A blob SHA is not a Git ref. Hash the actual raw content so index and
-    // chapter reads cannot silently mix revisions if the file changed mid-read.
-    const version = gitBlobSha(bytes);
-    const parsed = parseTxtChapters(bytes);
-    if (!parsed.length) throw new ReaderError('书籍文件没有可阅读的正文。', 422);
-    const parts = parsed.map((chapter) => splitChapterParts(bytes, chapter));
-    const chapters = parsed.map((chapter, index) => ({ ...chapter, partCount: parts[index].length }));
-    const book: CachedBook = { bytes, version, chapters, parts };
-    if (version !== file.sha) directory = undefined;
-    cacheBook(`${source.key}/${file.name}:${version}`, book);
-    return book;
-  })().catch((error) => {
-    // Normalize before sharing the promise so concurrent readers receive the
-    // same public status when the parser rejects an unsupported TXT.
-    if (error instanceof RangeError) throw new ReaderError(error.message, 422);
-    throw error;
-  });
-  pendingBooks.set(key, promise);
-  try {
-    return await promise;
-  } finally {
-    pendingBooks.delete(key);
-  }
+  const work = readerPending(async (signal) => {
+    source = { ...source, signal };
+    try {
+      const bytes = await readBytes(source, file);
+      // A blob SHA is not a Git ref. Hash the actual raw content so index and
+      // chapter reads cannot silently mix revisions if the file changed mid-read.
+      const version = gitBlobSha(bytes);
+      const parsed = parseTxtChapters(bytes);
+      if (!parsed.length) throw new ReaderError('书籍文件没有可阅读的正文。', 422);
+      const parts = parsed.map((chapter) => splitChapterParts(bytes, chapter));
+      const chapters = parsed.map((chapter, index) => ({ ...chapter, partCount: parts[index].length }));
+      const book: CachedBook = { bytes, version, chapters, parts };
+      if (version !== file.sha) directory = undefined;
+      source.signal?.throwIfAborted();
+      cacheBook(`${source.key}/${file.name}:${version}`, book);
+      return book;
+    } catch (error) {
+      // Normalize before sharing the promise so concurrent readers receive the
+      // same public status when the parser rejects an unsupported TXT.
+      if (error instanceof RangeError) throw new ReaderError(error.message, 422);
+      throw error;
+    }
+  }, () => { if (pendingBooks.get(key) === work) pendingBooks.delete(key); });
+  pendingBooks.set(key, work);
+  return work.wait(source.signal);
 }

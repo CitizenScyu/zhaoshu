@@ -53,11 +53,14 @@ async function handleGET(
     return privateResponse({ error: '无效的章节、段落或文件版本。' }, 400);
   }
   try {
+    req.signal.throwIfAborted();
     const task = await getReadableTask(taskId, auth.principal.userId);
-    if (resource === 'availability') return privateResponse(await readerAvailability(task));
-    if (resource === 'index') return privateResponse(await readBookIndex(task));
-    return privateResponse(await readBookPart(task, chapter!, part!, version));
+    req.signal.throwIfAborted();
+    if (resource === 'availability') return privateResponse(await readerAvailability(task, req.signal));
+    if (resource === 'index') return privateResponse(await readBookIndex(task, req.signal));
+    return privateResponse(await readBookPart(task, chapter!, part!, version, req.signal));
   } catch (error) {
+    if (req.signal.aborted) return privateResponse({ error: '请求已取消。' }, 499);
     if (error instanceof ReaderError) return privateResponse({ error: error.message }, error.status);
     // Avoid logging upstream bodies, tokens, connection strings, or book text.
     console.error('Reader request failed');
