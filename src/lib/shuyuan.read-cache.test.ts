@@ -296,11 +296,11 @@ describe('写路径之后读到新值（本实例失效缓存）', () => {
     expect(await getReadingSources(signal())).toHaveLength(3);
     db.hosts = [...db.hosts, { host: 'c.example' }];
     db.engine = [...db.engine, engineRowAt('c.example')];
-    transaction.mockResolvedValueOnce([[], [], [], [{ lease_valid: false, written: 0 }]]);
-    expect(await writeAdmissionRows(getSql(), [], lease)).toEqual({ skipped: 'lease_lost', written: 0 });
+    transaction.mockResolvedValueOnce([[], [], [], [], [{ lease_valid: false, written: 0 }]]);
+    expect(await writeAdmissionRows(getSql(), [], lease, [])).toEqual({ skipped: 'lease_lost', written: 0 });
     expect(await getReadingSources(signal())).toHaveLength(3);
-    transaction.mockResolvedValueOnce([[], [], [], [{ lease_valid: true, written: 0 }]]);
-    expect(await writeAdmissionRows(getSql(), [], lease)).toEqual({ written: 0 });
+    transaction.mockResolvedValueOnce([[], [], [], [], [{ lease_valid: true, written: 0 }]]);
+    expect(await writeAdmissionRows(getSql(), [], lease, [])).toEqual({ written: 0 });
     expect(await getReadingSources(signal())).toHaveLength(3);
 
     const hash = rulesHash(engineItemAt('c.example'));
@@ -315,13 +315,13 @@ describe('写路径之后读到新值（本实例失效缓存）', () => {
     const pendingSql = new Promise<unknown[][]>((resolve) => { complete = resolve; });
     transaction.mockImplementationOnce(async () => { entered(); return pendingSql; });
     const controller = new AbortController();
-    const pending = writeAdmissionRows(getSql(), [row], lease, controller.signal);
+    const pending = writeAdmissionRows(getSql(), [row], lease, [{ url: row.source_url, source: engineItemAt('c.example') }], controller.signal);
     const cancelled = expect(pending).rejects.toThrow();
     await started;
     controller.abort();
     await cancelled;
     expect(await getReadingSources(signal())).toHaveLength(3);
-    complete([[], [], [], [{ lease_valid: true, written: 1 }]]);
+    complete([[], [], [], [], [{ lease_valid: true, written: 1 }]]);
     await pendingSql;
     await Promise.resolve();
     await Promise.resolve();
@@ -355,8 +355,9 @@ describe('写路径之后读到新值（本实例失效缓存）', () => {
       search_verdict: 'ok', search_checked_at: null, rules_hash: hash,
       engine_semantics_version: Number(hash.split(':', 1)[0]), host: 'c.example', error: '', compile_diagnostics: [],
     };
-    transaction.mockResolvedValueOnce([[], [], [], [{ lease_valid: true, written: 1 }]]);
-    await writeAdmissionRows(getSql(), [row], { leaseName: 'admission_lease', generation: '1' });
+    transaction.mockResolvedValueOnce([[], [], [], [], [{ lease_valid: true, written: 1 }]]);
+    await writeAdmissionRows(getSql(), [row], { leaseName: 'admission_lease', generation: '1' },
+      [{ url: row.source_url, source: engineItemAt('c.example') }]);
     expect((await getReadingSources(signal())).map((source) => source.url)).toContain('https://c.example/');
   });
 

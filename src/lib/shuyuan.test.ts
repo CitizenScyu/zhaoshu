@@ -95,11 +95,12 @@ describe('refreshShuyuan atomic refresh', () => {
       return query.text.startsWith('SELECT count(*)') ? [zeroCounts] : [];
     });
     transaction.mockReset().mockImplementation(async (batch) => {
-      if (!batch[2]?.text.startsWith('SELECT name FROM cron_health')) return [];
+      if (!batch.some((query) => query.text.startsWith('SELECT name FROM cron_health'))) return [];
       const results = [];
       for (const query of batch) results.push(await execute(query));
-      if (batch[3].text.includes('INSERT INTO source_admission')) {
-        results[3] = [{ lease_valid: true, written: JSON.parse(batch[3].values[2] as string).length }];
+      const writeIndex = batch.findIndex((query) => query.text.includes('INSERT INTO source_admission'));
+      if (writeIndex >= 0) {
+        results[writeIndex] = [{ lease_valid: true, written: JSON.parse(batch[writeIndex].values[2] as string).length }];
       }
       return results;
     });
@@ -180,7 +181,7 @@ describe('refreshShuyuan atomic refresh', () => {
       if (query.text.startsWith('INSERT INTO cron_health') && query.values[0] === ADMISSION_LEASE_ROW) {
         return [{ name: ADMISSION_LEASE_ROW, generation: '1' }];
       }
-      if (query.text.startsWith('SET LOCAL') || query.text.startsWith('WITH guard')
+      if (query.text.startsWith('SET LOCAL') || query.text.startsWith('LOCK TABLE') || query.text.startsWith('WITH guard')
         || query.text.startsWith('SELECT name FROM cron_health')) return [];
       return selectResponses[selectIdx++] ?? [];
     });
@@ -212,8 +213,8 @@ describe('refreshShuyuan atomic refresh', () => {
     expect(meta.text).toMatch(/^UPDATE shuyuan_meta SET collections = \?::jsonb, refreshed_at = now\(\) WHERE id = 1$/);
     expect(JSON.parse(meta.values[0] as string)).toEqual(collections.map((collection, i) =>
       i === 0 ? { ...collection, probeSnapshot: { version: 1, entries: [] } } : collection));
-    // 6 次读 + 1 次 claim + 4 句空准入批次判权事务。
-    expect(execute).toHaveBeenCalledTimes(11);
+    // 6 次读 + 1 次 claim + 5 句空准入批次判权事务（含源快照锁）。
+    expect(execute).toHaveBeenCalledTimes(12);
     expect(transaction.mock.calls[0][1]?.fetchOptions?.signal).toBeInstanceOf(AbortSignal);
     const isLease = (query: Query) =>
       query.text.startsWith('INSERT INTO cron_health') && query.values[0] === ADMISSION_LEASE_ROW;
@@ -336,7 +337,7 @@ describe('refreshShuyuan atomic refresh', () => {
       if (query.text.startsWith('INSERT INTO cron_health') && query.values[0] === ADMISSION_LEASE_ROW) {
         return [{ name: ADMISSION_LEASE_ROW, generation: '1' }];
       }
-      if (query.text.startsWith('SET LOCAL') || query.text.startsWith('WITH guard')
+      if (query.text.startsWith('SET LOCAL') || query.text.startsWith('LOCK TABLE') || query.text.startsWith('WITH guard')
         || query.text.startsWith('SELECT name FROM cron_health')) return [];
       return selectResponses[selectIdx++] ?? [];
     });
@@ -379,7 +380,7 @@ describe('refreshShuyuan atomic refresh', () => {
       if (query.text.startsWith('INSERT INTO cron_health') && query.values[0] === ADMISSION_LEASE_ROW) {
         return [{ name: ADMISSION_LEASE_ROW, generation: '1' }];
       }
-      if (query.text.startsWith('SET LOCAL') || query.text.startsWith('WITH guard')
+      if (query.text.startsWith('SET LOCAL') || query.text.startsWith('LOCK TABLE') || query.text.startsWith('WITH guard')
         || query.text.startsWith('SELECT name FROM cron_health')) return [];
       return selectResponses[selectIdx++] ?? [];
     });

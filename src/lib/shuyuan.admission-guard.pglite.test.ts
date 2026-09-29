@@ -15,7 +15,9 @@ const lease = { leaseName: 'admission_lease' as const, generation: '1' };
 
 
 // 用真 rulesHash 产出带版本前缀的 rules_hash（形如 `<version>:<hash>`），避免测试自造前缀口径漂移。
-const SEED_HASH = rulesHash({ bookSourceUrl: 'https://x.example', searchUrl: 's', ruleSearch: { name: 'h1' } });
+const SEED_SOURCE = { bookSourceUrl: 'https://x.example', searchUrl: 's', ruleSearch: { name: 'h1' } };
+const SEED_HASH = rulesHash(SEED_SOURCE);
+const snapshots = (rows: AdmissionSourceRow[]) => rows.map((row) => ({ url: row.source_url, source: SEED_SOURCE }));
 const SEED_VERSION = Number(SEED_HASH.split(':', 1)[0]);
 
 function row(overrides: Partial<AdmissionSourceRow> = {}): AdmissionSourceRow {
@@ -49,13 +51,17 @@ maybe('shuyuan writeAdmissionRows 版本自洽守卫（真库 INSERT 路径）',
     await createProductionSchema(createPGliteSql(pg) as never, statement => pg.exec(statement));
     await sql`INSERT INTO cron_health (name, last_success_at, lease_generation)
       VALUES ('admission_lease', now() + interval '1 hour', 1)`;
+    for (const url of ['https://x.example', 'https://skip.example', 'https://second.example']) {
+      await sql`INSERT INTO shuyuan_sources (source_url, name, group_name, source)
+        VALUES (${url}, '合成源', '', ${JSON.stringify(SEED_SOURCE)}::jsonb)`;
+    }
   }, 60_000);
 
   afterEach(async () => { await pg.close(); });
 
   const lost = { skipped: 'lease_lost', written: 0 };
   const write = (sql: SqlTag, rows: AdmissionSourceRow[], handle: unknown = lease) =>
-    writeAdmissionRows(sql as never, rows, handle as never);
+    writeAdmissionRows(sql as never, rows, handle as never, snapshots(rows));
 
   it('运行期缺句柄、错误名称、非 canonical/越界/Number 代次全部拒绝且不发 SQL', async () => {
     const unexpectedSql = vi.fn(() => { throw new Error('invalid handle reached SQL'); });
@@ -63,8 +69,8 @@ maybe('shuyuan writeAdmissionRows 版本自洽守卫（真库 INSERT 路径）',
       ...['0', '-1', '+1', '01', '1.0', '1e3', ' 1', '1 ', '', '9223372036854775808', 1, 9007199254740992]
         .map((generation) => ({ ...lease, generation }))];
     for (const handle of invalid) {
-      expect(await writeAdmissionRows(unexpectedSql as never, [row()], handle as never)).toEqual(lost);
-      expect(await writeAdmissionRows(unexpectedSql as never, [], handle as never)).toEqual(lost);
+      expect(await writeAdmissionRows(unexpectedSql as never, [row()], handle as never, snapshots([row()]))).toEqual(lost);
+      expect(await writeAdmissionRows(unexpectedSql as never, [], handle as never, [])).toEqual(lost);
     }
     expect(unexpectedSql).not.toHaveBeenCalled();
   });
@@ -125,7 +131,7 @@ maybe('shuyuan writeAdmissionRows 版本自洽守卫（真库 INSERT 路径）',
   it('同源行（engine_semantics_version = rules_hash 版本前缀）→ 落库', async () => {
     // 前置自证：版本前缀确实是整数，否则测试用例本身失去判别力。
     expect(Number.isInteger(SEED_VERSION)).toBe(true);
-    expect(await writeAdmissionRows(sql as unknown as Parameters<typeof writeAdmissionRows>[0], [row()], lease)).toEqual({ written: 1 });
+    expect(await writeAdmissionRows(sql as unknown as Parameters<typeof writeAdmissionRows>[0], [row()], lease, snapshots([row()]))).toEqual({ written: 1 });
     const rows = await sql`SELECT source_url, engine_semantics_version, rules_hash FROM source_admission` as Record<string, unknown>[];
     expect(rows).toHaveLength(1);
     expect(rows[0]).toMatchObject({
@@ -135,10 +141,52 @@ maybe('shuyuan writeAdmissionRows 版本自洽守卫（真库 INSERT 路径）',
     });
   });
 
+  it('刷新已提交新规则：有效旧租约不能新添旧成功资格；未变化源仍正常写', async () => {
+    await sql`UPDATE shuyuan_sources SET source = ${JSON.stringify({ ...SEED_SOURCE, ruleSearch: { name: 'h2' } })}::jsonb
+      WHERE source_url = 'https://x.example'`;
+    expect(await write(sql, [row(), row({ source_url: 'https://second.example' })])).toEqual({ written: 1 });
+    expect((await pg.query('SELECT source_url FROM source_admission')).rows)
+      .toEqual([{ source_url: 'https://second.example' }]);
+  });
+
+  it('规则已变或源已删除时跳过晚写，既有成功行原样保留', async () => {
+    expect(await write(sql, [row()])).toEqual({ written: 1 });
+    const before = (await pg.query('SELECT * FROM source_admission')).rows;
+    await sql`UPDATE shuyuan_sources SET source = ${JSON.stringify({ ...SEED_SOURCE, bookSourceName: '仅名字变化' })}::jsonb
+      WHERE source_url = 'https://x.example'`;
+    expect(await write(sql, [row({ search_ok: false, search_verdict: 'no_result' })])).toEqual({ written: 0 });
+    expect((await pg.query('SELECT * FROM source_admission')).rows).toEqual(before);
+    await sql`DELETE FROM shuyuan_sources WHERE source_url = 'https://x.example'`;
+    expect(await write(sql, [row()])).toEqual({ written: 0 });
+    expect((await pg.query('SELECT * FROM source_admission')).rows).toEqual(before);
+  });
+
+  it('jsonb 键序不同但内容相同仍写入，当前新规则的真实 hash/快照仍可写', async () => {
+    const reordered = { ruleSearch: { name: 'h1' }, searchUrl: 's', bookSourceUrl: 'https://x.example' };
+    expect(rulesHash(reordered)).not.toBe(SEED_HASH);
+    await sql`UPDATE shuyuan_sources SET source = ${JSON.stringify(reordered)}::jsonb WHERE source_url = 'https://x.example'`;
+    expect(await write(sql, [row()])).toEqual({ written: 1 });
+    const updated = { ...SEED_SOURCE, ruleSearch: { name: 'h2' } };
+    await sql`UPDATE shuyuan_sources SET source = ${JSON.stringify(updated)}::jsonb WHERE source_url = 'https://x.example'`;
+    const stored = (await pg.query('SELECT source FROM shuyuan_sources WHERE source_url=$1', ['https://x.example'])).rows[0].source;
+    const hash = rulesHash(stored);
+    expect(await writeAdmissionRows(sql as never, [row({ rules_hash: hash })], lease,
+      [{ url: 'https://x.example', source: stored as Record<string, unknown> }])).toEqual({ written: 1 });
+    expect((await pg.query('SELECT rules_hash FROM source_admission')).rows).toEqual([{ rules_hash: hash }]);
+  });
+
+  it('缺探测快照或结果 hash 不对应快照时拒绝，不允许用写前新规则冒充旧探测', async () => {
+    await expect(writeAdmissionRows(sql as never, [row()], lease, [])).rejects.toThrow('source snapshot mismatch');
+    await expect(writeAdmissionRows(sql as never, [row()], lease,
+      [{ url: 'https://x.example', source: { ...SEED_SOURCE, searchUrl: 'changed' } }]))
+      .rejects.toThrow('source snapshot mismatch');
+    expect((await pg.query('SELECT * FROM source_admission')).rows).toEqual([]);
+  });
+
   it('伪造错配行（engine_semantics_version ≠ 版本前缀）→ 抛错且整批不落库', async () => {
     const mismatched = row({ engine_semantics_version: SEED_VERSION + 99 });
     await expect(
-      writeAdmissionRows(sql as unknown as Parameters<typeof writeAdmissionRows>[0], [mismatched], lease),
+      writeAdmissionRows(sql as unknown as Parameters<typeof writeAdmissionRows>[0], [mismatched], lease, snapshots([mismatched])),
     ).rejects.toThrow(/版本自查失败/);
     const rows = await sql`SELECT count(*)::int AS n FROM source_admission` as { n: number }[];
     expect(rows[0].n).toBe(0);
@@ -147,7 +195,7 @@ maybe('shuyuan writeAdmissionRows 版本自洽守卫（真库 INSERT 路径）',
   it('rules_hash 无版本前缀 → 抛错且不落库', async () => {
     const noPrefix = row({ rules_hash: 'no-version-prefix' });
     await expect(
-      writeAdmissionRows(sql as unknown as Parameters<typeof writeAdmissionRows>[0], [noPrefix], lease),
+      writeAdmissionRows(sql as unknown as Parameters<typeof writeAdmissionRows>[0], [noPrefix], lease, snapshots([noPrefix])),
     ).rejects.toThrow(/版本自查失败/);
     const rows = await sql`SELECT count(*)::int AS n FROM source_admission` as { n: number }[];
     expect(rows[0].n).toBe(0);
@@ -158,7 +206,7 @@ maybe('shuyuan writeAdmissionRows 版本自洽守卫（真库 INSERT 路径）',
   it('版本值是版本前缀的真子串（前缀 12 vs 版本 1）→ 抛错且不落库', async () => {
     const subset = row({ rules_hash: '12:deadbeef', engine_semantics_version: 1 });
     await expect(
-      writeAdmissionRows(sql as unknown as Parameters<typeof writeAdmissionRows>[0], [subset], lease),
+      writeAdmissionRows(sql as unknown as Parameters<typeof writeAdmissionRows>[0], [subset], lease, snapshots([subset])),
     ).rejects.toThrow(/版本自查失败/);
     const rows = await sql`SELECT count(*)::int AS n FROM source_admission` as { n: number }[];
     expect(rows[0].n).toBe(0);
@@ -168,7 +216,7 @@ maybe('shuyuan writeAdmissionRows 版本自洽守卫（真库 INSERT 路径）',
   it('版本值是版本前缀的超串（前缀 1 vs 版本 12）→ 抛错且不落库', async () => {
     const superset = row({ rules_hash: '1:deadbeef', engine_semantics_version: 12 });
     await expect(
-      writeAdmissionRows(sql as unknown as Parameters<typeof writeAdmissionRows>[0], [superset], lease),
+      writeAdmissionRows(sql as unknown as Parameters<typeof writeAdmissionRows>[0], [superset], lease, snapshots([superset])),
     ).rejects.toThrow(/版本自查失败/);
     const rows = await sql`SELECT count(*)::int AS n FROM source_admission` as { n: number }[];
     expect(rows[0].n).toBe(0);

@@ -9,7 +9,7 @@ import {
 } from '@/lib/supported-sources';
 import {
   ADMISSION_MAX_REDIRECTS, ADMISSION_MIN_BUDGET_MS, ADMISSION_PHOENIX_OK_PREFIX, ADMISSION_PROBE_WORST_MS,
-  assertAdmissionVersionConsistent, defaultAdmissionTransport, runAdmissionBatch,
+  assertAdmissionVersionConsistent, defaultAdmissionTransport, rulesHash, runAdmissionBatch,
   type AdmissionCandidate, type AdmissionSourceRow,
 } from '@/lib/rule-engine/admission';
 import { enginePostSearchEnabled, selectCandidates, type RawSource } from '@/lib/rule-engine/compile-smoke';
@@ -1525,6 +1525,8 @@ async function admitRows(
 ): Promise<AdmissionRoundSummary> {
   const handle = checkedLeaseHandle(lease);
   if (!handle) return { skipped: 'lease_lost', written: 0 };
+  // 在探测前固定快照；写前不得重读新规则冒充本轮已经测过的对象。
+  const sourceSnapshots = rows.map(({ url, source }) => ({ url, source: structuredClone(source) }));
   const declaredHosts = new Set<string>();
   for (const row of rows) {
     try { declaredHosts.add(new URL(row.url).hostname); } catch { /* 上游脏 URL：无法声明 host */ }
@@ -1550,7 +1552,7 @@ async function admitRows(
     // 重新过初筛成为普通候选，占位行 search_ok=null ⇒ class 0 未测优先，自动回池。
     const frozen = surveyRejected.filter((candidate) => existing.get(candidate.url)?.compile_ok === true);
     if (candidates.length === 0 && frozen.length === 0) {
-      const write = await writeAdmissionRows(s, [], handle, signal);
+      const write = await writeAdmissionRows(s, [], handle, sourceSnapshots, signal);
       return 'skipped' in write ? write : { skipped: 'no_candidates' };
     }
     const result = await runAdmissionBatch({
@@ -1572,7 +1574,7 @@ async function admitRows(
       grandfathered: result.grandfathered,
       probed: result.probed,
     });
-    const write = await writeAdmissionRows(s, result.rows, handle, signal);
+    const write = await writeAdmissionRows(s, result.rows, handle, sourceSnapshots, signal);
     if ('skipped' in write) return write;
     summary = {
       sources: rows.length, candidates: candidates.length, surveyRejectedExisting: frozen.length,
@@ -1626,7 +1628,8 @@ export type AdmissionWriteResult = { written: number } | { skipped: 'lease_lost'
  * 失败整批回滚，不重放旧结果。与刷新替换事务（shuyuan.ts:1350 同型结构）一致走 s.transaction([...])。
  */
 export async function writeAdmissionRows(
-  s: Sql, rows: AdmissionSourceRow[], lease: LeaseHandle, signal?: AbortSignal,
+  s: Sql, rows: AdmissionSourceRow[], lease: LeaseHandle,
+  sources: readonly AdmissionInputRow[], signal?: AbortSignal,
 ): Promise<AdmissionWriteResult> {
   const handle = checkedLeaseHandle(lease);
   if (!handle) return { skipped: 'lease_lost', written: 0 };
@@ -1634,6 +1637,14 @@ export async function writeAdmissionRows(
   // 写库前自查：行内 engine_semantics_version 必须与 rules_hash 版本前缀同源（复审 P3 单一真源，
   // 与 scripts/seed-admission.mjs 共用同一判据）。错配即抛、整批不落库，暴露上游口径分裂。
   assertAdmissionVersionConsistent(rows);
+  // 结果只能证明探测时的源快照。使用既有 JS hash 自查结果归属，SQL 只比较 jsonb，
+  // 不复制 JSON.stringify/SHA 口径（刷新原对象与 jsonb 读回的键序可能不同）。
+  const snapshots = new Map(sources.map((source) => [source.url, source.source]));
+  const guardedRows = rows.map((row) => {
+    const source = snapshots.get(row.source_url);
+    if (!source || rulesHash(source) !== row.rules_hash) throw new Error('admission source snapshot mismatch');
+    return { ...row, expected_source: source };
+  });
   const batch = s`
     WITH guard AS MATERIALIZED (
       SELECT 1 FROM cron_health
@@ -1645,11 +1656,14 @@ export async function writeAdmissionRows(
        engine_semantics_version, host, error, compile_diagnostics)
     SELECT source_url, tier, compile_ok, core_field_mask, search_ok, search_verdict, search_checked_at, rules_hash,
            engine_semantics_version, host, error, compile_diagnostics
-    FROM guard CROSS JOIN jsonb_to_recordset(${JSON.stringify(rows)}::jsonb)
+    FROM guard CROSS JOIN jsonb_to_recordset(${JSON.stringify(guardedRows)}::jsonb)
       AS t(source_url text, tier text, compile_ok boolean, core_field_mask jsonb, search_ok boolean,
            search_verdict text, search_checked_at timestamptz, rules_hash text,
-           engine_semantics_version integer, host text, error text, compile_diagnostics jsonb)
-    WHERE true
+           engine_semantics_version integer, host text, error text, compile_diagnostics jsonb, expected_source jsonb)
+    WHERE EXISTS (
+      SELECT 1 FROM shuyuan_sources current
+      WHERE current.source_url = t.source_url AND current.source = t.expected_source
+    )
     ON CONFLICT (source_url) DO UPDATE SET
       tier = EXCLUDED.tier, compile_ok = EXCLUDED.compile_ok, core_field_mask = EXCLUDED.core_field_mask,
       search_ok = EXCLUDED.search_ok, search_verdict = EXCLUDED.search_verdict,
@@ -1665,13 +1679,16 @@ export async function writeAdmissionRows(
     const results = await s.transaction([
       s`SET LOCAL lock_timeout = '5s'`,
       s`SET LOCAL statement_timeout = '30s'`,
-      // 独立语句先取得同行锁；下一条 guard 才读取锁后的当前时刻。
+      // 与刷新整表替换的 SHARE ROW EXCLUSIVE、普通源更新互斥；持有到提交，
+      // 锁后下一语句用 ReadCommitted 新快照判当前规则，避免检查后再被刷新。
+      s`LOCK TABLE shuyuan_sources IN SHARE MODE`,
+      // 只在最终短写事务持源表锁，再锁租约行；guard 读取两道锁后的当前时刻。
       s`SELECT name FROM cron_health WHERE name = ${handle.leaseName} FOR UPDATE`,
       batch,
     ], { isolationLevel: 'ReadCommitted', arrayMode: false, fullResults: false,
       fetchOptions: signal ? { signal } : undefined });
-    const result = results[3]?.[0] as { lease_valid?: unknown; written?: unknown } | undefined;
-    if (results[3]?.length !== 1 || typeof result?.lease_valid !== 'boolean'
+    const result = results[4]?.[0] as { lease_valid?: unknown; written?: unknown } | undefined;
+    if (results[4]?.length !== 1 || typeof result?.lease_valid !== 'boolean'
       || typeof result.written !== 'number' || !Number.isSafeInteger(result.written) || result.written < 0
       || (!result.lease_valid && result.written !== 0)) throw new Error('invalid admission write result');
     // 取消只能停止等待。若底层随后确认提交，仍清缓存；不把晚提交回报成本轮成功。

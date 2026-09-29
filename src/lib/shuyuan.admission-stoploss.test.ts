@@ -46,11 +46,12 @@ describe('41-ADMIT-CONC-FIX:refreshShuyuan 准入逐探止损(端到端,c 缺省
       return query.text.startsWith('SELECT count(*)') ? [zeroCounts] : [];
     });
     transaction.mockReset().mockImplementation(async (batch) => {
-      if (!batch[2]?.text.startsWith('SELECT name FROM cron_health')) return [];
+      if (!batch.some((query) => query.text.startsWith('SELECT name FROM cron_health'))) return [];
       const results = [];
       for (const query of batch) results.push(await execute(query));
-      if (batch[3].text.includes('INSERT INTO source_admission')) {
-        results[3] = [{ lease_valid: true, written: JSON.parse(batch[3].values[2] as string).length }];
+      const writeIndex = batch.findIndex((query) => query.text.includes('INSERT INTO source_admission'));
+      if (writeIndex >= 0) {
+        results[writeIndex] = [{ lease_valid: true, written: JSON.parse(batch[writeIndex].values[2] as string).length }];
       }
       return results;
     });

@@ -91,11 +91,12 @@ beforeEach(() => {
     return [];
   });
   transaction.mockReset().mockImplementation(async (batch) => {
-      if (!batch[2]?.text.startsWith('SELECT name FROM cron_health')) return [];
+      if (!batch.some((query) => query.text.startsWith('SELECT name FROM cron_health'))) return [];
       const results = [];
       for (const query of batch) results.push(await execute(query));
-      if (batch[3].text.includes('INSERT INTO source_admission')) {
-        results[3] = [{ lease_valid: true, written: JSON.parse(batch[3].values[2] as string).length }];
+      const writeIndex = batch.findIndex((query) => query.text.includes('INSERT INTO source_admission'));
+      if (writeIndex >= 0) {
+        results[writeIndex] = [{ lease_valid: true, written: JSON.parse(batch[writeIndex].values[2] as string).length }];
       }
       return results;
     });
@@ -252,7 +253,7 @@ describe('runAdmissionRound：独立预算', () => {
   it('数据库实际 written=0 时不按探测输入数报成功写入、不发布', async () => {
     stored = [{ source_url: 'https://dead0.example/', source: deadSource(0) }];
     fetchMock.mockRejectedValue(new Error('synthetic offline'));
-    transaction.mockResolvedValueOnce([[], [], [], [{ lease_valid: true, written: 0 }]]);
+    transaction.mockResolvedValueOnce([[], [], [], [], [{ lease_valid: true, written: 0 }]]);
     const publish = vi.spyOn(poolArtifact, 'writePoolArtifactFile');
     expect(await runAdmissionRound()).toMatchObject({ candidates: 1, written: 0 });
     expect(successQueries()).toHaveLength(1);
@@ -260,7 +261,7 @@ describe('runAdmissionRound：独立预算', () => {
   });
 
   it('空源表在最终 guard 丢约时返回 lease_lost，不能伪装 no_candidates', async () => {
-    transaction.mockResolvedValueOnce([[], [], [], [{ lease_valid: false, written: 0 }]]);
+    transaction.mockResolvedValueOnce([[], [], [], [], [{ lease_valid: false, written: 0 }]]);
     expect(await runAdmissionRound()).toEqual({ skipped: 'lease_lost', written: 0 });
     expect(successQueries()).toHaveLength(0);
   });
@@ -279,7 +280,7 @@ describe('runAdmissionRound：独立预算', () => {
     await started;
     controller.abort();
     expect(await pending).toEqual({ skipped: 'failed' });
-    complete([[], [], [], [{ lease_valid: true, written: 1 }]]);
+    complete([[], [], [], [], [{ lease_valid: true, written: 1 }]]);
     await pendingSql;
     await Promise.resolve();
     expect(transaction).toHaveBeenCalledTimes(1);
