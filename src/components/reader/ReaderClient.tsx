@@ -323,6 +323,8 @@ function ReaderSession({ session, from }: Props) {
           if (loading || panel || event.altKey || event.ctrlKey || event.metaKey || (event.target as HTMLElement).closest('button, a, input, select, textarea')) return;
           if (['ArrowDown', 'PageDown', ' ', 'End'].includes(event.key)) markScrollIntent(true);
           if (['ArrowUp', 'PageUp', 'Home'].includes(event.key)) markScrollIntent(false);
+          // Shift+方向键是浏览器原生扩展选区:不拦截、不翻章,否则用户选字选到边界就被带去下一章。
+          if (event.shiftKey) return;
           if (event.key === 'ArrowLeft' && chapter > 0) { event.preventDefault(); navigate(position(chapter - 1)); }
           if (event.key === 'ArrowRight' && hasNextChapter) { event.preventDefault(); navigate(position(chapter + 1)); }
         }}
