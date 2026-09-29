@@ -28,28 +28,43 @@ export default function ShuyuanTab() {
     actionAbort.current = controller;
     return controller.signal;
   }
+  // 当前视图(filter,page)的镜像。load 用它判断「自己是否还属于当前视图」:
+  // 不能只看启动先后——旧操作闭包里的视图参数可以在新列表加载完之后才兑现,
+  // 比新视图请求更晚启动的旧响应照样覆盖新视图,必须按参数是否仍是当前视图来判。
+  // 写入放 effect(渲染期禁写 ref):filter/page 变化后的渲染提交后才更新镜像,
+  // 新视图自己的 load 一定读得到新值;旧视图迟到兑现时读到的已是新值,正确拒绝写回。
+  const viewRef = useRef({ filter, page });
+  useEffect(() => {
+    viewRef.current = { filter, page };
+  }, [filter, page]);
 
   const load = useCallback(async (
     target: { filter: ShuyuanSourceFilter; page: number },
     signal: AbortSignal,
   ): Promise<ShuyuanStatsPage | null> => {
-    setLoading(true);
-    setError('');
+    // 启动、写回、收尾同一口径:已中止或非当前视图的加载不动 loading/error、不写 stats——
+    // 迟到的旧视图响应/失败提示不得覆盖用户已经切过去的新视图,loading 由仍属当前视图的加载负责收尾。
+    const isCurrent = () => !signal.aborted
+      && viewRef.current.filter === target.filter && viewRef.current.page === target.page;
+    if (isCurrent()) {
+      setLoading(true);
+      setError('');
+    }
     try {
       const res = await apiFetch(`/api/shuyuan?filter=${target.filter}&page=${target.page}`, { signal });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || '书源加载失败');
       // 请求已取消时不要写回：下一次 load 可能已经把更新的数据放进去了，
-      // 迟到的旧响应会把它盖掉。与下面 catch/finally 的 aborted 守卫同一口径。
-      if (signal?.aborted) return null;
+      // 迟到的旧响应会把它盖掉。与下面 catch/finally 的守卫同一口径。
+      if (!isCurrent()) return null;
       setStats(data as ShuyuanStatsPage);
       return data as ShuyuanStatsPage;
     } catch (e) {
-      if (signal?.aborted) return null;
+      if (!isCurrent()) return null;
       setError(e instanceof Error ? e.message : '书源加载失败');
       return null;
     } finally {
-      if (!signal?.aborted) setLoading(false);
+      if (isCurrent()) setLoading(false);
     }
   }, [apiFetch]);
 
@@ -78,6 +93,11 @@ export default function ShuyuanTab() {
     refreshInFlight.current = true;
     setRefreshing(true);
     setError('');
+    // POST 一开始就领 action signal(而非成功后才领):卸载/下一次操作发生在 POST 等待或
+    // 读体期间时,这里兑现后不再发 load——卸载后的组件不该再发新请求,旧操作也不该
+    // 抢在用户已切换的新视图上继续加载。请求本体(apiFetch 不带 signal)不在此中止:
+    // 服务端写入是否发生不受影响,取消只挡住「回写与重载」。
+    const signal = beginAction();
     try {
       const res = await apiFetch('/api/shuyuan', {
         method: 'POST',
@@ -86,9 +106,10 @@ export default function ShuyuanTab() {
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || '刷新失败');
-      retreatToLastPage(await load({ filter, page }, beginAction()), page);
+      if (signal.aborted) return;
+      retreatToLastPage(await load({ filter, page }, signal), page);
     } catch (e) {
-      setError(e instanceof Error ? e.message : '刷新失败');
+      if (!signal.aborted) setError(e instanceof Error ? e.message : '刷新失败');
     } finally {
       setRefreshing(false);
       refreshInFlight.current = false;
@@ -99,6 +120,8 @@ export default function ShuyuanTab() {
     if (toggling) return;
     setToggling(source.url);
     setError('');
+    // 同 refresh:signal 覆盖整个操作周期,POST 兑现时若已被中止/视图已换,不再重载。
+    const signal = beginAction();
     try {
       const res = await apiFetch('/api/shuyuan', {
         method: 'POST',
@@ -107,13 +130,14 @@ export default function ShuyuanTab() {
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || '操作失败');
+      if (signal.aborted) return;
       // 后端返回「没这一行」= 这个 URL 已不在库里（刷新换过合集）：列表已过期，
       // 重新拉一次让用户看到实况。提示放在 load 之后，否则会被 load 的 setError('') 抹掉。
       const gone = data.disabled === false || data.enabled === false;
-      retreatToLastPage(await load({ filter, page }, beginAction()), page);
-      if (gone) setError('这个书源已不在当前合集里，已为你重新加载列表');
+      retreatToLastPage(await load({ filter, page }, signal), page);
+      if (gone && !signal.aborted) setError('这个书源已不在当前合集里，已为你重新加载列表');
     } catch (e) {
-      setError(e instanceof Error ? e.message : '操作失败');
+      if (!signal.aborted) setError(e instanceof Error ? e.message : '操作失败');
     } finally {
       setToggling('');
     }

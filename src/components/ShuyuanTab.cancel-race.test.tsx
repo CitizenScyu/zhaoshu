@@ -39,8 +39,10 @@ function statsPage(over: Record<string, unknown> = {}) {
   };
 }
 
+type Manual<T> = { promise: Promise<T>; resolve: (value: T) => void; reject: (reason?: unknown) => void };
+
 /** 手动兑现的 promise：new Promise + resolve 句柄，测试按需放行。 */
-function manual<T>() {
+function manual<T>(): Manual<T> {
   let resolve!: (value: T) => void;
   let reject!: (reason?: unknown) => void;
   const promise = new Promise<T>((res, rej) => { resolve = res; reject = rej; });
@@ -49,8 +51,8 @@ function manual<T>() {
 
 interface Recorded {
   url: string; method: string; signal: AbortSignal | null | undefined;
-  headers: manual<Response>;
-  body: manual<unknown>;
+  headers: Manual<Response>;
+  body: Manual<unknown>;
 }
 
 /**
