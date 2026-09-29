@@ -11,6 +11,7 @@ import {
 } from '@/lib/source-parser';
 import type { SourceRequestContext } from '@/lib/source-reader';
 import { contentHtmlToText, contentNeedsHtmlToText } from './content-html';
+import { isStructuredChallengePage } from './content-challenge';
 import { createScope, evaluateField, evaluateFieldList, normalizeBody } from './evaluate';
 import { enginePostSearchEnabled } from './compile-smoke';
 import type { CompiledRules, FieldIr, SkippedField } from './types';
@@ -248,6 +249,10 @@ export async function engineFetchContent(
     }
     receivedPages.add(receivedKey);
     const scope = createScope(normalizeBody(page.text), page.url);
+    // 首/后页同门：挑战页不能作为正文交付，也不能缓存已拼出的半章。
+    if (scope.kind === 'html' && isStructuredChallengePage(scope.$)) {
+      throw new SourcePolicyError('书源正文页被安全验证拦截，请重试或更换书源');
+    }
     // 正文是唯一「多节点拼接」字段：@p@text 类规则靠 multi=true 把多段落拼成整章。
     // 是否做 HTML→纯文本按**规则类型**判定（41-HTMLFIX 复审）：全部候选支都是
     // text/ownText/textNodes（或不写后缀，字段层默认按 @text 求值，evaluate.ts:220）时
