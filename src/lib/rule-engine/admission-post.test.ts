@@ -142,6 +142,60 @@ describe('41-admpost item2：准入探测 POST/charset 分类', () => {
     expect(fetchPage).not.toHaveBeenCalled();
   });
 
+  it.each([307, 308])('POSTREDIR53: 准入同origin %s保留POST并成功搜索', async (status) => {
+    for (const body of ['k={{key}}', '{"key":"{{key}}"}']) {
+      const host = 'canonical.example.com';
+      const source = postSource(host, { searchUrl: `https://${host}/s,` + JSON.stringify({
+        method: 'POST', body, charset: 'gb2312', headers: { Referer: `https://${host}/index` },
+      }) });
+      const expected = buildSourceSearchRequest(source.searchUrl, '剑来', `https://${host}`, value => new URL(String(value)));
+      const expectedBody = encodeToBytes(expected.body!, expected.charset);
+      const fetchPage = vi.fn<AdmissionTransport>().mockImplementation(async (url, init) => {
+        if (url === expected.url) return new Response(null, { status, headers: { location: '/middle' } });
+        const valid = init.method === 'POST' && init.body instanceof Uint8Array && Buffer.from(init.body).toString('hex') === Buffer.from(expectedBody).toString('hex')
+          && init.headers['Content-Type'] === expected.headers!['Content-Type'] && init.headers.Referer === expected.headers!.Referer;
+        if (!valid) return new Response('合成搜索需要POST关键词', { status: 405 });
+        return url === `https://${host}/middle`
+          ? new Response(null, { status: 308, headers: { location: '/result' } })
+          : new Response(CANDIDATE_HTML, { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
+      });
+      const result = await searchAdmission(source, { fetchPage, declaredHosts: declared(host), signal: signal(), throttleMs: 0 });
+      expect(result).toMatchObject({ verdict: 'ok', candidateCount: 1 });
+      expect(fetchPage).toHaveBeenCalledTimes(3);
+    }
+  });
+
+  it.each([[301, false], [302, false], [303, false], [307, true], [308, true]] as const)
+    ('POSTREDIR53: 准入%s跨origin=%s降GET后返回原站仍不重放', async (status, crossOrigin) => {
+      const host = 'canonical.example.com';
+      const middleHost = crossOrigin ? 'other.example.com' : host;
+      const source = postSource(host, { searchUrl: `https://${host}/s,` + JSON.stringify({
+        method: 'POST', body: 'k={{key}}', headers: { Referer: `https://${host}/index`, 'User-Agent': 'synthetic-agent' },
+      }) });
+      const fetchPage = vi.fn<AdmissionTransport>()
+        .mockResolvedValueOnce(new Response(null, { status, headers: { location: `https://${middleHost}/middle` } }))
+        .mockResolvedValueOnce(new Response(null, { status: 308, headers: { location: `https://${host}/result` } }))
+        .mockResolvedValueOnce(new Response(CANDIDATE_HTML));
+      expect((await searchAdmission(source, { fetchPage, declaredHosts: new Set([host, middleHost]), signal: signal(), throttleMs: 0 })).verdict)
+        .toBe('ok');
+      expect(fetchPage.mock.calls.map(([, init]) => init.method)).toEqual(['POST', 'GET', 'GET']);
+      for (const [, init] of fetchPage.mock.calls.slice(1)) {
+        expect(init.body).toBeUndefined();
+        expect(init.headers['Content-Type']).toBeUndefined();
+        expect(init.headers.Referer).toBeUndefined();
+        expect(init.headers['User-Agent']).not.toBe('synthetic-agent');
+      }
+    });
+
+  it.each([307, 308])('POSTREDIR53: 准入%s仍先检查声明host门', async (status) => {
+    const host = 'canonical.example.com';
+    const fetchPage = vi.fn<AdmissionTransport>().mockResolvedValue(new Response(null, { status,
+      headers: { location: 'https://not-declared.example.com/search' } }));
+    const result = await searchAdmission(postSource(host), { fetchPage, declaredHosts: declared(host), signal: signal(), throttleMs: 0 });
+    expect(result.verdict).toBe('url_invalid');
+    expect(fetchPage).toHaveBeenCalledOnce();
+  });
+
   it('POST 重定向后降级为无 body 的 GET', async () => {
     const methods: (string | undefined)[] = [];
     const bodies: unknown[] = [];

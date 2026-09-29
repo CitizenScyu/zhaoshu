@@ -90,13 +90,18 @@ function hostFailureKind(error: unknown): HostFailureKind | null {
 /**
  * 引擎 POST 搜索（41-postsearch）的请求覆写：method/body/白名单头 + 请求体字符集。
  * 仅 ENGINE_POST_SEARCH 开时由 buildSourceSearchRequest 产出并传入；缺省 = 现有 GET/utf-8 路径。
- * body 只发在首跳；重定向一律降级为无 body 的 GET（避免跨 host 重放 POST body，且合乎浏览器 303 语义）。
+ * 仅连续同 origin 的 307/308 保留 POST；其他跳转降为无 body 的 GET，跨 origin 不重放请求数据。
  */
 export interface SourcePageRequest {
   method?: 'GET' | 'POST';
   body?: string;
   headers?: Record<string, string>;
   charset: SourceCharset;
+}
+
+/** 两侧均已通过各自 URL 门；只允许同 origin 的 307/308 延续原 POST，不把 host 别名视作同 origin。 */
+export function preservesSourcePostRedirect(method: SourcePageRequest['method'], status: number, from: string, to: string): boolean {
+  return method === 'POST' && (status === 307 || status === 308) && new URL(from).origin === new URL(to).origin;
 }
 
 interface FetchSourceOptions {
@@ -195,8 +200,9 @@ async function attemptOnce(start: URL, {
   parentSignal.addEventListener('abort', onAbort, { once: true });
   const timer = setTimeout(() => controller.abort(new DOMException('书源请求及正文读取超时', 'TimeoutError')), timeoutMs);
   const signal = controller.signal;
-  // POST/body/头只用于首个 HTTP 跳；重定向后一律降级为无 body 的 GET。
+  // 同 origin 307/308 可延续原请求；一旦降级，后续跳回原站也不能恢复 body/头。
   const bodyBytes = request?.body !== undefined ? encodeToBytes(request.body, request.charset) : undefined;
+  let sendOriginalRequest = true;
   let response: Response | undefined;
   try {
     for (let redirects = 0; ; redirects += 1) {
@@ -209,40 +215,42 @@ async function attemptOnce(start: URL, {
       const connectTimer = setTimeout(() => {
         controller.abort(new DOMException('书源连接超时', 'ConnectTimeoutError'));
       }, connectTimeoutMs);
-      const firstHop = redirects === 0;
       const headers: Record<string, string> = { 'User-Agent': 'Mozilla/5.0 (compatible; novel-finder-reader/1.0)' };
-      if (firstHop && request?.headers) Object.assign(headers, request.headers);
+      if (sendOriginalRequest && request?.headers) Object.assign(headers, request.headers);
       const pending = fetch(current, {
         redirect: 'manual', cache: 'no-store', signal, headers,
-        method: firstHop ? request?.method ?? 'GET' : 'GET',
-        body: (firstHop && request?.method === 'POST' ? bodyBytes : undefined) as BodyInit | undefined,
+        method: sendOriginalRequest ? request?.method ?? 'GET' : 'GET',
+        body: (sendOriginalRequest && request?.method === 'POST' ? bodyBytes : undefined) as BodyInit | undefined,
       });
       void pending.then((late) => { if (signal.aborted) cancelBody(late, signal.reason); }, () => {});
+      let received: Response;
       try {
-        response = await sourceAbortable(pending, signal);
+        received = await sourceAbortable(pending, signal);
+        response = received;
       } finally {
         clearTimeout(connectTimer);
       }
-      if (response.redirected) throw new SourcePolicyError('书源响应发生未受控跳转');
-      if ([301, 302, 303, 307, 308].includes(response.status)) {
-        const location = response.headers.get('location');
-        cancelBody(response);
+      if (received.redirected) throw new SourcePolicyError('书源响应发生未受控跳转');
+      if ([301, 302, 303, 307, 308].includes(received.status)) {
+        const location = received.headers.get('location');
+        cancelBody(received);
         if (!location) throw new SourcePolicyError('书源跳转缺少 Location');
         if (redirects >= maxRedirects) throw new SourcePolicyError('书源跳转次数超限');
         const next = validateSourceUrl(location, current).href;
         if (visited.has(next)) throw new SourcePolicyError('书源跳转形成循环');
+        sendOriginalRequest = sendOriginalRequest && preservesSourcePostRedirect(request?.method, received.status, current, next);
         visited.add(next);
         current = next;
         continue;
       }
-      if (!response.ok) throw new SourceHttpError(response.status, parseRetryAfterMs(response.headers.get('retry-after')));
+      if (!received.ok) throw new SourceHttpError(received.status, parseRetryAfterMs(received.headers.get('retry-after')));
       // 解码字符集：显式字符集优先；'auto' 按 Content-Type 嗅探（回退 utf-8）；缺省 utf-8（改前语义）。
       const charset: SourceCharset = responseCharset && responseCharset !== 'auto'
         ? responseCharset
         : responseCharset === 'auto'
-          ? charsetFromContentType(response.headers.get('content-type')) ?? 'utf-8'
+          ? charsetFromContentType(received.headers.get('content-type')) ?? 'utf-8'
           : 'utf-8';
-      const text = await responseText(response, signal, maxBytes, charset);
+      const text = await responseText(received, signal, maxBytes, charset);
       signal.throwIfAborted();
       return { url: current, text };
     }

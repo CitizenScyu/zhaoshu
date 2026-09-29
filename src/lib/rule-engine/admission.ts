@@ -11,7 +11,7 @@
 
 import { checkSourceUrl, upgradeSourceTemplateUrl, SourcePolicyError } from '@/lib/source-policy';
 import { sourceRevision } from '@/lib/source-revision';
-import { sourceAbortable } from '@/lib/source-fetch';
+import { preservesSourcePostRedirect, sourceAbortable } from '@/lib/source-fetch';
 import { buildSourceSearchRequest, type SourceSearchRequest, type SourceUrlValidator } from '@/lib/source-parser';
 import { charsetFromContentType, encodeToBytes, type SourceCharset } from '@/lib/source-charset';
 import { CORE_FIELDS, enginePostSearchEnabled, iterRulePairs, selectCandidates, type RawSource } from './compile-smoke';
@@ -548,7 +548,7 @@ async function readCappedBody(response: Response, signal: AbortSignal, maxBytes:
  * （alternateSourceHost 是 book15 专有语义，准入对象无备用 host 概念）。
  * HTTP 状态码不抛错——challenge/http_5xx 分桶需要拿到 status 与 body。
  * 41-admpost：request 携带 method/body/白名单头/charset（flag 开时由 buildAdmissionSearchRequest 产出）。
- * body 只发首跳（`encodeToBytes` 按 charset 字节化）；重定向一律降级为无 body 的 GET（同 source-fetch 语义）。
+ * body 按 charset 字节化；仅连续同 origin 307/308 保留 POST，其余跳转降 GET（同 source-fetch 语义）。
  * 响应按 Content-Type 声明字符集解码，回退到请求声明字符集（GBK 站常不在头里声明）。
  */
 async function admissionFetch(request: SourceSearchRequest, options: AdmissionFetchOptions): Promise<{ url: string; status: number; text: string }> {
@@ -576,19 +576,19 @@ async function admissionFetch(request: SourceSearchRequest, options: AdmissionFe
   };
   try {
     let current = initial.href;
+    let sendOriginalRequest = true;
     const visited = new Set([current]);
     for (let redirects = 0; ; redirects += 1) {
       probeSignal.throwIfAborted();
       await throttle();
       probeSignal.throwIfAborted();
-      // 首跳带 method/body/白名单头；重定向后一律 GET、无 body（不跨跳重放 POST body）。
-      const firstHop = redirects === 0;
+      // 降级后不恢复 method/body/白名单头，跨 origin 后即使跳回原站也不重放。
       const headers: Record<string, string> = { 'User-Agent': 'Mozilla/5.0 (compatible; novel-finder-admission/1.0)' };
-      if (firstHop && request.headers) Object.assign(headers, request.headers);
+      if (sendOriginalRequest && request.headers) Object.assign(headers, request.headers);
       const response = await fetchPage(current, {
         signal: probeSignal, redirect: 'manual', headers,
-        method: firstHop ? request.method : 'GET',
-        body: firstHop && request.method === 'POST' ? bodyBytes : undefined,
+        method: sendOriginalRequest ? request.method : 'GET',
+        body: sendOriginalRequest && request.method === 'POST' ? bodyBytes : undefined,
       });
       if ([301, 302, 303, 307, 308].includes(response.status)) {
         const location = response.headers.get('location');
@@ -597,6 +597,7 @@ async function admissionFetch(request: SourceSearchRequest, options: AdmissionFe
         if (redirects >= maxRedirects) throw new SourcePolicyError('书源跳转次数超限');
         const next = validateAdmissionUrl(location, current, declaredHosts).href;
         if (visited.has(next)) throw new SourcePolicyError('书源跳转形成循环');
+        sendOriginalRequest = sendOriginalRequest && preservesSourcePostRedirect(request.method, response.status, current, next);
         visited.add(next);
         current = next;
         continue;

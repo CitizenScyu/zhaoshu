@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { fetchSourceText } from './source-fetch';
 import { encodeToBytes } from './source-charset';
+import { buildSourceSearchRequest } from './source-parser';
 
 afterEach(() => { vi.unstubAllGlobals(); });
 const base = () => ({ signal: new AbortController().signal });
@@ -17,6 +18,72 @@ describe('source-fetch POST/charset（41-postsearch）', () => {
     expect(init.method).toBe('POST');
     expect(new TextDecoder().decode(init.body)).toBe('searchkey=%BD%A3');
     expect(init.headers['Content-Type']).toBe('application/x-www-form-urlencoded');
+  });
+
+  it.each([307, 308])('POSTREDIR53: 同origin %s链保留表单/JSON的编码字节和请求头', async (status) => {
+    for (const body of ['searchkey={{key}}', '{"key":"{{key}}"}']) {
+      const request = buildSourceSearchRequest('https://book15.net/s,' + JSON.stringify({
+        method: 'POST', body, charset: 'gb2312', headers: { Referer: 'https://book15.net/index' },
+      }), '合成书', 'https://book15.net');
+      const expectedBody = encodeToBytes(request.body!, request.charset);
+      const fetchMock = vi.fn().mockImplementation(async (url, init) => {
+        if (url === request.url) return new Response(null, { status, headers: { location: '/middle' } });
+        const valid = init.method === 'POST' && Buffer.from(init.body ?? []).equals(Buffer.from(expectedBody))
+          && init.headers['Content-Type'] === request.headers!['Content-Type'] && init.headers.Referer === request.headers!.Referer;
+        if (!valid) return new Response('合成搜索需要POST关键词', { status: 405 });
+        return url === 'https://book15.net/middle'
+          ? new Response(null, { status: 308, headers: { location: '/result' } }) : new Response('合成搜索结果');
+      });
+      vi.stubGlobal('fetch', fetchMock);
+      const beforeRequest = vi.fn().mockResolvedValue(undefined);
+      expect(await fetchSourceText(request.url, { ...base(), request, beforeRequest }))
+        .toEqual({ url: 'https://book15.net/result', text: '合成搜索结果' });
+      expect(fetchMock).toHaveBeenCalledTimes(3);
+      expect(beforeRequest).toHaveBeenCalledTimes(3);
+    }
+  });
+
+  it.each([[301, false], [302, false], [303, false], [307, true], [308, true]] as const)
+    ('POSTREDIR53: %s跨origin=%s降GET后不因返回原站而恢复body或头', async (status, crossOrigin) => {
+      const middle = `https://${crossOrigin ? 'www.book15.net' : 'book15.net'}/middle`;
+      const fetchMock = vi.fn()
+        .mockResolvedValueOnce(new Response(null, { status, headers: { location: middle } }))
+        .mockResolvedValueOnce(new Response(null, { status: 308, headers: { location: 'https://book15.net/result' } }))
+        .mockResolvedValueOnce(new Response('合成结果'));
+      vi.stubGlobal('fetch', fetchMock);
+      const request = buildSourceSearchRequest('https://book15.net/s,' + JSON.stringify({
+        method: 'POST', body: 'k={{key}}', headers: { Referer: 'https://book15.net/index', 'User-Agent': 'synthetic-agent' },
+      }), '合成书', 'https://book15.net');
+      await fetchSourceText(request.url, { ...base(), request });
+      expect(fetchMock.mock.calls.map(([, init]) => init.method)).toEqual(['POST', 'GET', 'GET']);
+      for (const [, init] of fetchMock.mock.calls.slice(1)) {
+        expect(init.body).toBeUndefined();
+        expect(init.headers['Content-Type']).toBeUndefined();
+        expect(init.headers.Referer).toBeUndefined();
+        expect(init.headers['User-Agent']).not.toBe('synthetic-agent');
+      }
+    });
+
+  it.each([307, 308])('POSTREDIR53: %s不能把POST带向host门外', async (status) => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(null, { status, headers: { location: 'https://not-approved.invalid/search' } }));
+    vi.stubGlobal('fetch', fetchMock);
+    await expect(fetchSourceText('https://book15.net/s', {
+      ...base(), request: { method: 'POST', body: 'k=synthetic', charset: 'utf-8' },
+    })).rejects.toThrow();
+    expect(fetchMock).toHaveBeenCalledOnce();
+  });
+
+  it('POSTREDIR53: GET的307仍不续传仅供首跳的自定义头', async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(null, { status: 307, headers: { location: '/result' } }))
+      .mockResolvedValueOnce(new Response('结果'));
+    vi.stubGlobal('fetch', fetchMock);
+    await fetchSourceText('https://book15.net/s', { ...base(), request: {
+      method: 'GET', charset: 'utf-8', headers: { Referer: 'https://book15.net/index' },
+    } });
+    expect(fetchMock.mock.calls[1][1].method).toBe('GET');
+    expect(fetchMock.mock.calls[1][1].body).toBeUndefined();
+    expect(fetchMock.mock.calls[1][1].headers.Referer).toBeUndefined();
   });
 
   it('响应按显式 gbk 解码', async () => {
