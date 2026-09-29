@@ -111,6 +111,39 @@ describe('GET /api/stats', () => {
   });
   afterEach(() => { vi.unstubAllEnvs(); vi.restoreAllMocks(); });
 
+  it('allowed partitions start while library is pending, and response waits for every partition', async () => {
+    let releaseLibrary!: (rows: unknown[][]) => void;
+    let releaseTokens!: (value: TokenStats) => void;
+    const libraryPending = new Promise<unknown[][]>(resolve => { releaseLibrary = resolve; });
+    const tokenPending = new Promise<TokenStats>(resolve => { releaseTokens = resolve; });
+    const originalTransaction = (sql as typeof sql & { transaction: (...args: unknown[]) => Promise<unknown> }).transaction;
+    Object.assign(sql, { transaction: vi.fn((batch: unknown, options: unknown) =>
+      typeof batch === 'function' ? libraryPending : originalTransaction(batch, options)) });
+    getLlmUsageStats.mockReturnValue(tokenPending);
+    let finished = false;
+    const pending = GET(request()).then(response => { finished = true; return response; });
+    try {
+      await vi.waitFor(() => expect(getLlmUsageStats).toHaveBeenCalledOnce());
+      const texts = sql.mock.calls.map(([parts]) => (parts as TemplateStringsArray).join(''));
+      expect(texts.some(text => text.includes('FROM download_tasks'))).toBe(true);
+      expect(texts.some(text => text.includes('count(DISTINCT query)'))).toBe(true);
+      expect(texts.some(text => text.includes('GROUP BY status'))).toBe(true);
+      expect(texts.some(text => text.includes('FROM shuyuan_sources'))).toBe(true);
+      expect(finished).toBe(false);
+      releaseLibrary([[{ total: 12, with_quality: 10, avg_quality: 8.2, chars_labeled: 360000 }], [{ genre: '仙侠', n: 12 }]]);
+      await new Promise(resolve => setTimeout(resolve, 0));
+      expect(finished).toBe(false);
+      releaseTokens(tokens);
+      const response = await pending;
+      expect(response.status).toBe(200);
+      expect((await response.json()).sectionStates).toEqual(readyStates);
+    } finally {
+      releaseLibrary([[{ total: 0, with_quality: 0, avg_quality: null, chars_labeled: 0 }], []]);
+      releaseTokens(emptyTokens);
+      await pending;
+    }
+  });
+
   it('authenticates before initialization', async () => {
     const req = request();
     req.headers.delete('Authorization');

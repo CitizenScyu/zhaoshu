@@ -74,6 +74,7 @@ async function handleGET(req: NextRequest) {
     return NextResponse.json({ ...stats, error: '统计暂不可用，请稍后重试', code: 'STATS_UNAVAILABLE' }, { status: 503 });
   }
 
+  const readLibrary = async () => {
   try {
     // 两段同属一个 try/catch（失败就整段 library 置空），合成一次事务往返（task-70 T55-4）：
     // 原本两条串行 RTT。其余各段仍各自独立 access.run —— 每段有自己的容错，跨段合批会让
@@ -110,8 +111,10 @@ async function handleGET(req: NextRequest) {
   } catch (e) {
     console.error('stats library aggregate failed', e instanceof Error ? { message: e.message } : e);
   }
+  };
 
   // 个人下载只统计 requested_by=user 且属于本人；系统/用户漏斗见 owner 只读 download-stats。
+  const readDownload = async () => {
   if (allowedSections.includes('download')) try {
     const rows = await access.run(async () => downloadStatsForUserQuery(s, userId)) as {
       total: number;
@@ -126,7 +129,9 @@ async function handleGET(req: NextRequest) {
   } catch (e) {
     console.error('stats download aggregate failed', e instanceof Error ? { message: e.message } : e);
   }
+  };
 
+  const readFind = async () => {
   try {
     // 找书次数按去重口味描述计；书架添加产生的伪 query 不算
     const rows = await access.run(async () => findStatsForUserQuery(s, userId)) as {
@@ -140,7 +145,9 @@ async function handleGET(req: NextRequest) {
   } catch (e) {
     console.error('stats find aggregate failed', e instanceof Error ? { message: e.message } : e);
   }
+  };
 
+  const readShelf = async () => {
   try {
     const rows = await access.run(async () => shelfStatsForUserQuery(s, userId)) as {
       name: string;
@@ -152,7 +159,9 @@ async function handleGET(req: NextRequest) {
   } catch (e) {
     console.error('stats shelf aggregate failed', e instanceof Error ? { message: e.message } : e);
   }
+  };
 
+  const readShuyuan = async () => {
   if (allowedSections.includes('shuyuan')) try {
     // B3：counts 与池健康度并行取——池大小要走 getReadingSources 的真实判定，
     // 刷新年龄来自同一条 meta 行；两者都只读，合段容错语义不变。
@@ -166,7 +175,9 @@ async function handleGET(req: NextRequest) {
   } catch (e) {
     console.error('stats shuyuan aggregate failed', e instanceof Error ? { message: e.message } : e);
   }
+  };
 
+  const readTokens = async () => {
   if (allowedSections.includes('tokens')) try {
     stats.tokens = await access.run(getLlmUsageStats);
     stats.availability.tokens = true;
@@ -174,6 +185,10 @@ async function handleGET(req: NextRequest) {
   } catch (e) {
     console.error('stats tokens aggregate failed', e instanceof Error ? { message: e.message } : e);
   }
+  };
+
+  // 初始化/授权已完成，各区独立容错；只重叠等待，不跨区合事务或重置预算。
+  await Promise.all([readLibrary(), readDownload(), readFind(), readShelf(), readShuyuan(), readTokens()]);
 
   const available = allowedSections.map((section) => stats.availability[section]);
   if (available.some((value) => !value)) {
