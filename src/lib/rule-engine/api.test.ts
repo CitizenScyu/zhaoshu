@@ -628,6 +628,33 @@ describe('正文翻页遇下一章即停（41-PAGEFIX）', () => {
     }
   });
 
+  it.each([false, true])('REPEAT53: 最终响应重复页拒绝，strict=%s', async (strict) => {
+    for (const target of [chapter(1), chapter(1) + '#body', chapter(1).replace('book15.net', 'www.book15.net')]) {
+      let count = 0;
+      const context = { page: async () => ({ url: count++ === 0 ? chapter(1) : target,
+        text: page('第一页正文', '/cc/1_2.html') }) } as unknown as SourceRequestContext;
+      const promise = engineFetchContent(cuoceng, chapter(1), context, strict, chapter(1));
+      if (strict) await expect(promise).rejects.toThrow('pagination_cycle');
+      else await expect(promise).rejects.toMatchObject({ name: 'SourcePolicyError' });
+      expect(count).toBe(2);
+    }
+  });
+
+  it.each([false, true])('REPEAT53: 相同文本的不同查询/尾斜杠页仍逐页保留，strict=%s', async (strict) => {
+    const first = chapter(1) + '?canonical=1';
+    const second = chapter(1) + '?canonical=2';
+    const third = chapter(1) + '/';
+    let count = 0;
+    const finals = [first, second, third];
+    const context = { page: async () => {
+      const at = count++;
+      return { url: finals[at], text: page('相同但合法的段落', at < 2 ? `/cc/page-${at + 2}.html` : undefined) };
+    } } as unknown as SourceRequestContext;
+    expect(await engineFetchContent(cuoceng, chapter(1), context, strict, chapter(1)))
+      .toEqual({ text: '相同但合法的段落\n相同但合法的段落\n相同但合法的段落' });
+    expect(count).toBe(3);
+  });
+
   it('③ 不传 nextChapterUrl（末章 / 旧调用）⇒ 行为与改前相同：照旧沿 linkNext 翻页拼接', async () => {
     for (const args of [[], [false], [false, undefined]] as const) {
       const run = recording(threeChapters());

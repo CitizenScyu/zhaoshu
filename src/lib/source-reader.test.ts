@@ -1620,6 +1620,60 @@ describe('引擎源正文分派（N01）', () => {
     expect((await service.readSourceChapter(catalog.version, 0, context())).text).toBe('第一章完整正文');
   });
 
+  it.each([false, true])('REPEAT53: 分页302回已读页不缓存重复正文，首次canonical=%s', async (canonical) => {
+    const catalog = await primeEngineCatalog();
+    const paged = { ...contentEngineSource, rules: { ...contentEngineSource.rules,
+      ruleContent: { content: '#body@text', nextContentUrl: '.next@href' } } };
+    mocks.sources.mockResolvedValue([paged]);
+    const canonicalUrl = n01Chapter + '?canonical=1';
+    const continuation = 'https://book15.net/n01/c/1_2.html';
+    const firstHtml = '<div id="body">第一章前半</div><a class="next" href="/n01/c/1_2.html">下页</a>';
+    pages.set(n01Chapter, { text: firstHtml });
+    pages.set(canonicalUrl, { text: firstHtml });
+    pages.set(continuation, { text: '<div id="body">第一章后半</div>' });
+    const originalFetch = mocks.fetch.getMockImplementation()!;
+    let looping = true;
+    mocks.fetch.mockImplementation((input, init) => {
+      const target = canonical && String(input) === n01Chapter ? canonicalUrl
+        : looping && String(input) === continuation ? (canonical ? canonicalUrl : n01Chapter) : null;
+      return target ? Promise.resolve(new Response(null, { status: 302, headers: { location: target } }))
+        : originalFetch(input, init);
+    });
+    await expect(service.readSourceChapter(catalog.version, 0, context()))
+      .rejects.toMatchObject({ code: 'SOURCE_CHAPTER_UNAVAILABLE', status: 503 });
+    looping = false;
+    const beforeRetry = mocks.fetch.mock.calls.length;
+    const recovered = await service.readSourceChapter(catalog.version, 0, context());
+    expect(recovered.text).toBe('第一章前半\n第一章后半');
+    expect(mocks.fetch.mock.calls.slice(beforeRetry).map(([url]) => String(url)))
+      .toEqual(canonical ? [n01Chapter, canonicalUrl, continuation] : [n01Chapter, continuation]);
+    const beforeWarm = mocks.fetch.mock.calls.length;
+    expect(await service.readSourceChapter(catalog.version, 0, context())).toEqual(recovered);
+    expect(mocks.fetch).toHaveBeenCalledTimes(beforeWarm);
+  });
+
+  it('REPEAT53: 当前源分页回跳后由备用源完整交付并缓存真实供稿身份', async () => {
+    const catalog = await primeEngineCatalog();
+    const paged = { ...contentEngineSource, rules: { ...contentEngineSource.rules,
+      ruleContent: { content: '#body@text', nextContentUrl: '.next@href' } } };
+    mocks.sources.mockResolvedValue([paged, backup]);
+    const continuation = 'https://book15.net/n01/c/1_2.html';
+    pages.set(n01Chapter, { text: '<div id="body">第一章前半</div><a class="next" href="/n01/c/1_2.html">下页</a>' });
+    pages.set(backupSearch(), { text: '<a href="/books/details777.html">测试书</a>' });
+    pages.set(backupPage, { text: detail(777) });
+    pages.set(backupChapter(777, 1), { text: chapterHtml('备用完整章节') });
+    const originalFetch = mocks.fetch.getMockImplementation()!;
+    mocks.fetch.mockImplementation((input, init) => String(input) === continuation
+      ? Promise.resolve(new Response(null, { status: 302, headers: { location: n01Chapter } }))
+      : originalFetch(input, init));
+    const part = await service.readSourceChapter(catalog.version, 0, context());
+    expect(part).toMatchObject({ text: '备用完整章节', servedFromUrl: backup.url });
+    expect(part.sourceSession).toBe(part.version);
+    const beforeWarm = mocks.fetch.mock.calls.length;
+    expect(await service.readSourceChapter(catalog.version, 0, context())).toEqual(part);
+    expect(mocks.fetch).toHaveBeenCalledTimes(beforeWarm);
+  });
+
   it('引擎源目录 + #body@text 正文 → readSourceChapter 成功（对齐 N01 反例）', async () => {
     const catalog = await primeEngineCatalog();
     pages.set(n01Chapter, { text: '<div id="body">Synthetic chapter body.</div>' });

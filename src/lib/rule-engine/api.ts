@@ -204,6 +204,7 @@ export async function engineFetchContent(
 ): Promise<EngineContentResult> {
   const parts: string[] = [];
   const visited = new Set<string>();
+  const receivedPages = new Set<string>();
   const contentField = field(source.compiled, 'ruleContent.content');
   const convertContent = contentNeedsHtmlToText(contentField);
   let next = absoluteUrl(chapterUrl, source.url);
@@ -224,9 +225,16 @@ export async function engineFetchContent(
     if (visited.has(next)) { if (strict) throw new Error('pagination_cycle'); break; }
     visited.add(next);
     const page = await context.page(next, { responseCharset: enginePostSearchEnabled() ? 'auto' : undefined });
-    if (redirectStopKeys.has(redirectedPageIdentity(page.url))) {
+    const receivedKey = redirectedPageIdentity(page.url);
+    if (redirectStopKeys.has(receivedKey)) {
       throw new SourcePolicyError('书源正文跳转到了目录中的其他章节，请重试或更换书源');
     }
+    // 请求别名可能重定向回已读页；按实际落点拒绝整章，不能重复拼接后写入成功缓存。
+    if (receivedPages.has(receivedKey)) {
+      if (strict) throw new Error('pagination_cycle');
+      throw new SourcePolicyError('书源正文分页重复返回已读取的页面，请重试或更换书源');
+    }
+    receivedPages.add(receivedKey);
     const scope = createScope(normalizeBody(page.text), page.url);
     // 正文是唯一「多节点拼接」字段：@p@text 类规则靠 multi=true 把多段落拼成整章。
     // 是否做 HTML→纯文本按**规则类型**判定（41-HTMLFIX 复审）：全部候选支都是
