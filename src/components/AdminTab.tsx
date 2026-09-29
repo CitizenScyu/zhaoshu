@@ -204,11 +204,14 @@ export default function AdminTab() {
       if (!res.ok) throw new Error(errorText(data, '邀请码生成失败'));
       setCreated((data as { invites: CreatedInvite[] }).invites ?? []);
       setNotice('已生成邀请码：原文只显示这一次，请立即复制。');
-      const listRes = await apiFetch('/api/admin/invites', { signal: controller.signal });
-      if (!isCurrentAction(controller)) return;
-      if (listRes.ok) {
+      try {
+        const listRes = await apiFetch('/api/admin/invites', { signal: controller.signal });
+        if (!isCurrentAction(controller)) return;
+        if (!listRes.ok) throw new Error('邀请码列表刷新失败');
         const list = await listRes.json() as { invites: InviteCodeSummary[] };
         if (isCurrentAction(controller)) setInvites(list.invites ?? []);
+      } catch {
+        if (isCurrentAction(controller)) setNotice('邀请码已生成，请立即复制。列表暂未刷新，无需再次生成。');
       }
     } catch (e) {
       if (isCurrentAction(controller)) setError(e instanceof Error ? e.message : '邀请码生成失败');
