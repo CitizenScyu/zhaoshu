@@ -641,3 +641,94 @@ describe('ReaderClient 41-srcmem:按书记住上次成功的源', () => {
     await waitFor(() => expect(readSourceMemory('诡秘之主', '爱潜水的乌贼')).toBeNull());
   });
 });
+
+// reader-keyboard-shift53:Shift+方向键选字守卫回归。审查轮
+// (codex-fence-followup-20260929/cc-reader-keyboard-modifier-review.md)的复现形态就是
+// 「焦点在 <main aria-label=阅读正文> 上派发 keydown,看 chapter 请求与 defaultPrevented」,
+// 这里把同一形态钉进常驻回归,不删唯一复现。断言只看派发**之后新增**的请求。
+describe('ReaderClient 键盘:Shift+方向键选字不翻章', () => {
+  const chapterUrlsSince = (apiFetch: FetchMock, from: number) =>
+    urls(apiFetch).slice(from).filter((u) => u.includes('/api/read/source/chapter'));
+
+  // 章节正文带可区分文本,翻没翻章看得到;预取关掉,免得预取请求混进「未翻章」断言。
+  function simpleFetch() {
+    return vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.startsWith('/api/read/source/index')) return json(catalog());
+      const chapter = Number(new URLSearchParams(url.split('?')[1]).get('chapter') ?? '0');
+      return json(part({
+        chapterIndex: chapter,
+        title: chapter === 0 ? '第一章' : '第二章',
+        text: chapter === 0 ? '第一章\n正文内容' : '第二章\n后章正文',
+      }));
+    });
+  }
+
+  function mainScroller(): HTMLElement {
+    const el = document.querySelector<HTMLElement>('main[aria-label="阅读正文"]');
+    if (!el) throw new Error('找不到正文容器');
+    el.focus();
+    return el;
+  }
+
+  beforeEach(() => {
+    window.localStorage.setItem('novel-finder-reading-settings', JSON.stringify({ preloadNext: false }));
+  });
+
+  it('Shift+ArrowRight:不 preventDefault、不发章节请求(浏览器默认扩展选区照常)', async () => {
+    const apiFetch = simpleFetch();
+    renderReader(apiFetch);
+    await screen.findByText(/正文内容/);
+
+    const before = urls(apiFetch).length;
+    const notCancelled = fireEvent.keyDown(mainScroller(), { key: 'ArrowRight', shiftKey: true });
+    expect(notCancelled).toBe(true); // defaultPrevented=false
+    expect(chapterUrlsSince(apiFetch, before)).toEqual([]);
+  });
+
+  it('Shift+ArrowLeft(在第 2 章):不 preventDefault、不发章节请求', async () => {
+    const apiFetch = simpleFetch();
+    renderReader(apiFetch);
+    await screen.findByText(/正文内容/);
+    // 先真实翻到第 2 章,让 ArrowLeft 分支的 chapter > 0 前置成立。
+    await userEvent.setup().click(screen.getByRole('button', { name: '下一章 →' }));
+    await screen.findByText(/后章正文/);
+
+    const before = urls(apiFetch).length;
+    const notCancelled = fireEvent.keyDown(mainScroller(), { key: 'ArrowLeft', shiftKey: true });
+    expect(notCancelled).toBe(true);
+    expect(chapterUrlsSince(apiFetch, before)).toEqual([]);
+  });
+
+  it('无修饰 ArrowRight/ArrowLeft:仍翻章(正常对照,preventDefault 且发对应章请求)', async () => {
+    const apiFetch = simpleFetch();
+    renderReader(apiFetch);
+    await screen.findByText(/正文内容/);
+
+    const before = urls(apiFetch).length;
+    const rightCancelled = fireEvent.keyDown(mainScroller(), { key: 'ArrowRight' });
+    expect(rightCancelled).toBe(false); // preventDefault 生效
+    await screen.findByText(/后章正文/);
+    const rightUrls = chapterUrlsSince(apiFetch, before);
+    expect(rightUrls.some((u) => u.includes('chapter=1'))).toBe(true);
+
+    const beforeBack = urls(apiFetch).length;
+    const leftCancelled = fireEvent.keyDown(mainScroller(), { key: 'ArrowLeft' });
+    expect(leftCancelled).toBe(false);
+    // 回第 1 章可能命中已加载缓存而不重发请求,断言看页脚章号落回与正文重现。
+    await screen.findByText('第 1 / 2 章');
+    await screen.findByText(/正文内容/);
+    expect(chapterUrlsSince(apiFetch, beforeBack).every((u) => !u.includes('chapter=1'))).toBe(true);
+  });
+
+  it('Ctrl+ArrowRight:不翻章(既有排除不回归)', async () => {
+    const apiFetch = simpleFetch();
+    renderReader(apiFetch);
+    await screen.findByText(/正文内容/);
+
+    const before = urls(apiFetch).length;
+    const notCancelled = fireEvent.keyDown(mainScroller(), { key: 'ArrowRight', ctrlKey: true });
+    expect(notCancelled).toBe(true);
+    expect(chapterUrlsSince(apiFetch, before)).toEqual([]);
+  });
+});
