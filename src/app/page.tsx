@@ -77,22 +77,22 @@ function HomeContent() {
   return (
     <div className="min-h-screen flex flex-col">
       {/* 顶栏 */}
-      <header className="flex items-end gap-5 px-6 sm:px-10 pt-8 pb-0 max-w-5xl w-full mx-auto">
+      <header className="flex flex-wrap items-end gap-5 px-6 sm:px-10 pt-8 pb-0 max-w-5xl w-full mx-auto">
         <div className="seal w-14 h-14 text-xl rotate-[-3deg] shrink-0 ink-rise">书径</div>
-        <div className="pb-1 ink-rise" style={{ animationDelay: '0.08s' }}>
+        <div className="shrink-0 pb-1 ink-rise" style={{ animationDelay: '0.08s' }}>
           <h1 className="text-2xl tracking-[0.3em] font-bold">书径</h1>
           <p className="text-sm mt-1" style={{ color: 'var(--ink-faint)' }}>
             书山有路 · 按口味寻径
           </p>
         </div>
-        <div className="ml-auto pb-2 text-xs text-right ink-rise" style={{ animationDelay: '0.16s' }}>
+        <div className="ml-auto w-full min-w-0 sm:w-auto sm:max-w-full pb-2 text-xs text-right ink-rise" style={{ animationDelay: '0.16s' }}>
           {user ? (
-            <div className="flex items-center gap-3">
-              <span style={{ color: 'var(--ink-soft)' }}>
+            <div className="flex min-w-0 items-center justify-end gap-3">
+              <span className="min-w-0 [overflow-wrap:anywhere]" style={{ color: 'var(--ink-soft)' }}>
                 当前身份：<strong>{user.username}</strong>
                 {user.role === 'owner' && <span className="ml-1">（管理员）</span>}
               </span>
-              <button type="button" className="underline underline-offset-4 min-h-11 px-1" onClick={() => void signOut()}>退出</button>
+              <button type="button" className="shrink-0 min-w-11 underline underline-offset-4 min-h-11 px-1" onClick={() => void signOut()}>退出</button>
             </div>
           ) : (
             <span style={{ color: 'var(--ink-faint)' }}>{ready ? '未登录' : '正在恢复访问状态…'}</span>
