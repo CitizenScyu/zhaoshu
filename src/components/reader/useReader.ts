@@ -55,7 +55,7 @@ function canPrefetch(): boolean {
     && connection?.effectiveType !== '2g' && connection?.effectiveType !== 'slow-2g';
 }
 
-export function useReader(session: ReadingSession, apiFetch: ApiFetch, userId: number) {
+export function useReader(session: ReadingSession, apiFetch: ApiFetch, userId: number, isSessionCurrent: () => boolean) {
   // 确认路径（模糊候选点选后）会换 bookUrl 重放；初始 indexUrl 仍由 session 派生。
   // 41-srcmem：source 类且非点选深链（session 无 bookUrl）时，若记忆里有这本书上次读通的源，
   // 初始就带 prefer=1 请求那个源（服务端再校验 + 失败静默回落）。ReaderSession 只在客户端 auth
@@ -87,6 +87,9 @@ export function useReader(session: ReadingSession, apiFetch: ApiFetch, userId: n
   const request = useRef<AbortController | null>(null);
   const flowRequest = useRef<AbortController | null>(null);
   const serial = useRef(0);
+  const isCurrentRequest = useCallback((controller: AbortController, id: number) => (
+    !controller.signal.aborted && id === serial.current && isSessionCurrent()
+  ), [isSessionCurrent]);
   const currentReading = useRef<Reading | null>(null);
   const appliedReading = useRef<Reading | null>(null);
   const progress = useRef<ReadingProgress | null>(null);
@@ -113,7 +116,16 @@ export function useReader(session: ReadingSession, apiFetch: ApiFetch, userId: n
   );
 
   const [cache] = useState(() => new ReaderPartCache(async (index, position, signal) => {
-    const part = await responseJson<ReaderPart>(await apiFetch(readerChapterUrl(index, position), { signal, cache: 'no-store' }));
+    const ensureCurrent = () => {
+      signal.throwIfAborted();
+      if (!isSessionCurrent()) throw new DOMException('阅读会话已结束。', 'AbortError');
+    };
+    // 首段、跳章和预取共用实际请求入口，旧闭包不能在新身份下取正文。
+    ensureCurrent();
+    const response = await apiFetch(readerChapterUrl(index, position), { signal, cache: 'no-store' });
+    ensureCurrent();
+    const part = await responseJson<ReaderPart>(response);
+    ensureCurrent();
     if (!readerPartMatches(index, part, position)) {
       throw new RequestError('章节内容与目录不一致，请重新加载目录。', 409);
     }
@@ -285,6 +297,7 @@ export function useReader(session: ReadingSession, apiFetch: ApiFetch, userId: n
   }, [cache]);
 
   const loadIndex = useCallback(async () => {
+    if (!isSessionCurrent()) return;
     flushPosition();
     const { controller, id, retirePrevious } = beginRequest();
     retirePrevious();
@@ -294,7 +307,7 @@ export function useReader(session: ReadingSession, apiFetch: ApiFetch, userId: n
     const hinted = isPreferredSourceIndexUrl(indexUrl);
     try {
       const index = await responseJson<ReaderIndex & { hintCleared?: boolean }>(await apiFetch(indexUrl, { signal: controller.signal, cache: 'no-store' }));
-      if (controller.signal.aborted || id !== serial.current) return;
+      if (!isCurrentRequest(controller, id)) return;
       if (!Array.isArray(index.chapters) || !index.chapters.length) throw new RequestError('这本书还没有可阅读的正文。', 422);
       if (hinted && index.hintCleared && session.kind === 'source') forgetSource(session.title, session.author);
       adoptedSwitch.current = null; // 新目录为基线:后续仍可再跟随一次换源
@@ -325,7 +338,7 @@ export function useReader(session: ReadingSession, apiFetch: ApiFetch, userId: n
       pendingMigration.current = null;
       const position = saved ?? START;
       const part = await cache.get(index, position, controller.signal);
-      if (controller.signal.aborted || id !== serial.current) return;
+      if (!isCurrentRequest(controller, id)) return;
       const switched = adoptSwitch(index, part);
       // H7:换源附带新目录时,交付段改记新目录序号(switchedChapterIndex)。首载没有可迁的
       // currentReading(adoptSwitch 只迁已在读的阅读),位置随交付段落到新序号 —— 否则
@@ -346,20 +359,20 @@ export function useReader(session: ReadingSession, apiFetch: ApiFetch, userId: n
     } catch (error) {
       // M3 复审 P2:失败路径也要清掉暂存的迁移进度 —— 否则下一次 loadIndex(重试)
       // 会把一次已经失败的换源进度再迁移一遍;且失败时 URL 不变(见 switchSource 注释)。
-      if (!controller.signal.aborted && id === serial.current) {
+      if (isCurrentRequest(controller, id)) {
         pendingMigration.current = null;
         fail(error);
       }
     } finally {
       if (request.current === controller) request.current = null;
-      if (!controller.signal.aborted && id === serial.current) setLoading(false);
+      if (isCurrentRequest(controller, id)) setLoading(false);
     }
-  }, [apiFetch, indexUrl, beginRequest, adoptSwitch, cache, fail, flushPosition, progressKeyFor, session, switchedBookUrl, switchedSourceUrl]);
+  }, [apiFetch, indexUrl, beginRequest, adoptSwitch, cache, fail, flushPosition, progressKeyFor, session, switchedBookUrl, switchedSourceUrl, isSessionCurrent, isCurrentRequest]);
 
   // 模糊候选点选后的确认重放：换 bookUrl 重载目录（server 端跳过书名/作者匹配）。
   // 41-panel:扇出面板的确认必须带 sourceUrl(服务端按源 url 精确定位规则,同站多源时不再按 host 反查)。
   const loadConfirmedBook = useCallback((bookUrl: string, sourceUrl?: string) => {
-    if (session.kind !== 'source' || !bookUrl) return;
+    if (!isSessionCurrent() || session.kind !== 'source' || !bookUrl) return;
     flushPosition();
     const current = currentReading.current;
     if (current?.index.source && progress.current) {
@@ -368,7 +381,7 @@ export function useReader(session: ReadingSession, apiFetch: ApiFetch, userId: n
     setIndexUrl(confirmedIndexUrl(session.title, session.author, bookUrl, sourceUrl));
     // 显式重选同一候选也要重试确认；URL 未变不能成为跳过请求的依据。
     setConfirmationAttempt(value => value + 1);
-  }, [session, flushPosition]);
+  }, [session, flushPosition, isSessionCurrent]);
 
   useEffect(() => {
     let active = true;
@@ -401,21 +414,21 @@ export function useReader(session: ReadingSession, apiFetch: ApiFetch, userId: n
   const servingSourceUrl = reading?.index.source?.sourceUrl;
   const servingBookUrl = reading?.index.source?.url;
   useEffect(() => {
-    if (session.kind !== 'source' || !servingSourceUrl || !servingBookUrl) return;
+    if (!isSessionCurrent() || session.kind !== 'source' || !servingSourceUrl || !servingBookUrl) return;
     rememberSource(session.title, session.author, { sourceUrl: servingSourceUrl, bookUrl: servingBookUrl });
-  }, [session, servingSourceUrl, servingBookUrl]);
+  }, [session, servingSourceUrl, servingBookUrl, isSessionCurrent]);
 
   const activePart = reading?.parts.find((part) => partKey(part) === activeKey) ?? reading?.parts[0];
   useEffect(() => {
-    if (!reading || !activePart || loading || failure || !settings.preloadNext || !canPrefetch()) {
+    if (!isSessionCurrent() || !reading || !activePart || loading || failure || !settings.preloadNext || !canPrefetch()) {
       cache.cancelPrefetch();
       return;
     }
     const next = nextReadingPosition(reading.index, reading.parts[reading.parts.length - 1]);
     if (!next) return;
-    const timer = setTimeout(() => { if (canPrefetch()) cache.prefetch(reading.index, next); }, 250);
+    const timer = setTimeout(() => { if (isSessionCurrent() && canPrefetch()) cache.prefetch(reading.index, next); }, 250);
     return () => clearTimeout(timer);
-  }, [reading, activePart, loading, failure, settings.preloadNext, cache]);
+  }, [reading, activePart, loading, failure, settings.preloadNext, cache, isSessionCurrent]);
 
   useLayoutEffect(() => {
     currentReading.current = reading;
@@ -467,6 +480,7 @@ export function useReader(session: ReadingSession, apiFetch: ApiFetch, userId: n
   }, [reading, settings.fontSize, settings.lineHeight, settings.font, settings.width, focused, capturePosition, publishPosition, saveProgress]);
 
   const navigate = useCallback(async (position: ReadingPosition) => {
+    if (!isSessionCurrent()) return;
     const current = currentReading.current;
     if (!current) return;
     flushPosition();
@@ -478,7 +492,7 @@ export function useReader(session: ReadingSession, apiFetch: ApiFetch, userId: n
       const pending = cache.get(current.index, position, controller.signal);
       retirePrevious();
       const part = await pending;
-      if (controller.signal.aborted || id !== serial.current) return;
+      if (!isCurrentRequest(controller, id)) return;
       // 换源在飞期间用户又点了别处:结果只对发起它的那次阅读有效(与 extend 同款护栏)。
       if (currentReading.current !== current) return;
       const adopted = adoptSwitch(current.index, part);
@@ -492,14 +506,15 @@ export function useReader(session: ReadingSession, apiFetch: ApiFetch, userId: n
       setReading({ index: adopted, parts: [shownPart], position: shown, focus: true });
       setPercent(readingPercent(adopted, shownPart, shown.ratio));
     } catch (error) {
-      if (!controller.signal.aborted && id === serial.current) fail(error, position);
+      if (isCurrentRequest(controller, id)) fail(error, position);
     } finally {
       if (request.current === controller) request.current = null;
-      if (!controller.signal.aborted && id === serial.current) setLoading(false);
+      if (isCurrentRequest(controller, id)) setLoading(false);
     }
-  }, [adoptSwitch, beginRequest, cache, fail, flushPosition]);
+  }, [adoptSwitch, beginRequest, cache, fail, flushPosition, isSessionCurrent, isCurrentRequest]);
 
   const extend = useCallback(async (direction: 'next' | 'previous', manual = false) => {
+    if (!isSessionCurrent()) return;
     const current = currentReading.current;
     const viewport = scroller.current;
     if (!current || !viewport || flowRequest.current || request.current || loading) return;
@@ -524,7 +539,7 @@ export function useReader(session: ReadingSession, apiFetch: ApiFetch, userId: n
     setFailure(null);
     try {
       const part = await cache.get(current.index, next, controller.signal);
-      if (controller.signal.aborted || id !== serial.current || currentReading.current !== current) return;
+      if (!isCurrentRequest(controller, id) || currentReading.current !== current) return;
       // The reader may have scrolled back while the next section was in flight.
       // Keep the current window if its proposed eviction is visible again.
       if (current.parts.length >= WINDOW_SIZE) {
@@ -551,11 +566,14 @@ export function useReader(session: ReadingSession, apiFetch: ApiFetch, userId: n
         focus: false,
       });
     } catch (error) {
-      if (!controller.signal.aborted && id === serial.current) fail(error, next, direction);
+      if (isCurrentRequest(controller, id)) fail(error, next, direction);
     } finally {
-      if (flowRequest.current === controller) { flowRequest.current = null; setFlowing(false); }
+      if (flowRequest.current === controller) {
+        flowRequest.current = null;
+        if (isCurrentRequest(controller, id)) setFlowing(false);
+      }
     }
-  }, [adoptSwitch, loading, cache, captureStablePosition, fail, navigate]);
+  }, [adoptSwitch, loading, cache, captureStablePosition, fail, navigate, isSessionCurrent, isCurrentRequest]);
 
   function onScroll() {
     if (restoring.current || scrollFrame.current !== null) return;
@@ -581,6 +599,7 @@ export function useReader(session: ReadingSession, apiFetch: ApiFetch, userId: n
 
   function setFocusMode(next: boolean) { flushPosition(); setFocused(next); }
   function retry() {
+    if (!isSessionCurrent()) return;
     if (!failure || failure.status === 409 || !failure.target) return void loadIndex();
     if (failure.direction) return void extend(failure.direction, true);
     return void navigate(failure.target);

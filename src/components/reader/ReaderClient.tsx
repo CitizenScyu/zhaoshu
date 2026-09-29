@@ -103,13 +103,14 @@ function NoReadPermission({ from }: Pick<Props, 'from'>) {
 }
 
 function ReaderSession({ session, from }: Props) {
-  const { apiFetch, user } = useOwner();
+  const { apiFetch, user, sessionId, isCurrentSession } = useOwner();
+  const isReaderSessionCurrent = useCallback(() => isCurrentSession(sessionId), [isCurrentSession, sessionId]);
   const router = useRouter();
   const {
     settings, reading, activePart, loading, flowing, failure, percent, notice, storageFailed, focused,
     scroller, article, heading, onScroll, updateSettings, setFocusMode, navigate: requestNavigation,
     extend, retry, markScrollIntent, setSection, loadConfirmedBook, registerSwitchCommitted,
-  } = useReader(session, apiFetch, user?.id ?? 0);
+  } = useReader(session, apiFetch, user?.id ?? 0, isReaderSessionCurrent);
   const [panel, setPanel] = useState<'directory' | 'settings' | 'sources' | null>(null);
   // 41-panel:扇出 probe 结果在本阅读会话内复用(关了面板再开不重复出网/计数);换账号时 ReaderSession 重挂即清。
   const [probeCache] = useState<ProbeCache>(() => new Map());
@@ -199,18 +200,18 @@ function ReaderSession({ session, from }: Props) {
   // 新 book_url,刷新/回退都会重放一个已知失败的候选。失败时 URL 必须保持旧源,用户可重试或换源。
   // 41-panel:扇出面板的确认带上命中行的 sourceUrl(服务端按源精确定位);旧 alternates 面板不带。
   function switchSource(bookUrl: string, sourceUrl?: string) {
-    if (session.kind !== 'source' || !bookUrl) return;
+    if (!isReaderSessionCurrent() || session.kind !== 'source' || !bookUrl) return;
     loadConfirmedBook(bookUrl, sourceUrl);
     setPanel(null);
   }
   // 目录加载成功后把 book_url 持久化进 URL(与 loadIndex 成功对齐)。从 indexUrl 取实参,
   // 保证「写进 URL 的就是服务端刚成功建目录的那个候选」。
   const commitSwitchedBookUrl = useCallback((bookUrl: string | undefined, sourceUrl?: string) => {
-    if (session.kind !== 'source' || !bookUrl) return;
+    if (!isReaderSessionCurrent() || session.kind !== 'source' || !bookUrl) return;
     const query = new URLSearchParams({ title: session.title, author: session.author, from, book_url: bookUrl });
     if (sourceUrl) query.set('source', sourceUrl);
     if (window.location.search !== '?' + query.toString()) router.replace('/read/source?' + query);
-  }, [session, from, router]);
+  }, [session, from, router, isReaderSessionCurrent]);
   // M3 复审 P1-3:回调注册放进 effect(ref 写入不得在渲染期做,SSR 会抛)。
   // loadIndex 由 useReader 的 effect 里 queueMicrotask 触发,微排在所有 effect 之后,
   // 因此此处的注册必然先于任何一次 loadIndex 成功回调,时序安全。

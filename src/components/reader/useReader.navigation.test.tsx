@@ -9,6 +9,7 @@ import { readSourceMemory } from '@/lib/source-memory';
 type Reader = ReturnType<typeof useReader>;
 type ApiFetch = Parameters<typeof useReader>[1];
 const USER_ID = 99;
+const isSessionCurrent = () => true;
 
 beforeEach(() => {
   window.localStorage.clear();
@@ -34,7 +35,7 @@ afterEach(() => {
 function mountReader(session: ReadingSession, apiFetch: ApiFetch) {
   let seen: Reader;
   function Probe() {
-    const reader = useReader(session, apiFetch, USER_ID);
+    const reader = useReader(session, apiFetch, USER_ID, isSessionCurrent);
     seen = reader;
     return <main data-viewport ref={reader.scroller}>
       <article ref={reader.article}>

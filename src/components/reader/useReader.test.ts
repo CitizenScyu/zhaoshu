@@ -13,7 +13,7 @@ function readInitial() {
   const apiFetch = vi.fn();
   let seen: ReturnType<typeof useReader> | undefined;
   function Probe() {
-    seen = useReader({ kind: 'download', taskId: 1 }, apiFetch, 3);
+    seen = useReader({ kind: 'download', taskId: 1 }, apiFetch, 3, () => true);
     return null;
   }
   renderToStaticMarkup(createElement(Probe));
@@ -112,7 +112,7 @@ describe('首屏返回的阅读状态', () => {
     const apiFetch = vi.fn();
     let seen: ReturnType<typeof useReader> | undefined;
     function Probe() {
-      seen = useReader({ kind: 'source', title: '测试书', author: '作者' }, apiFetch, 3);
+      seen = useReader({ kind: 'source', title: '测试书', author: '作者' }, apiFetch, 3, () => true);
       return null;
     }
     renderToStaticMarkup(createElement(Probe));
