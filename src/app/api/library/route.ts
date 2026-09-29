@@ -115,7 +115,7 @@ async function handleGET(req: NextRequest) {
                ${sharedReadTask} AS shared_read_task_id,
                ${myDownloadTask} AS my_download_task_id
         FROM labeled_books ${where}
-        ORDER BY ${orderBy}
+        ORDER BY ${orderBy}, id DESC
         LIMIT ${PAGE_SIZE} OFFSET ${(page - 1) * PAGE_SIZE}`,
         tx`
         SELECT count(*)::int AS total FROM labeled_books ${where}`,
