@@ -49,8 +49,8 @@ describe('推荐主查询、最新原因和共享阅读定位', () => {
     expect((await response.json()).recommendations[0].read_task_id).toBe(90);
     const query = db.queries[0];
     expect(query.values).toEqual([3, 3, 3, 300, 0]);
-    expect(query.text).toContain("dt.status = 'done'");
-    expect(query.text).toContain('SELECT dt.id');
+    expect(query.text).toMatch(/FROM download_tasks WHERE status = 'done'\s+GROUP BY/);
+    expect(query.text).toContain('max(id) AS read_task_id');
     expect(query.text).not.toMatch(/dt\.(?:error|user_id|source_url|log)/);
   });
   it('owner 的个人推荐仍只按 userId=1 查询', async () => {
