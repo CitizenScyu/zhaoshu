@@ -336,7 +336,7 @@ export const QUERY_INSENSITIVE_OVERLAP = 0.8;
 export const ADMISSION_PROBE_WORST_MS = 2 * ADMISSION_TIMEOUT_MS + ADMISSION_THROTTLE_MS;
 
 // CHALLENGE_MARKERS 口径对齐 probe-reachability.py:33。cloudflare 字样过宽（正常经 CF CDN
-// 的页面 meta 也可能有），单列 weak；强标记要求 status 403/503 或命中弱集合外的 marker。
+// 的页面 meta 也可能有），单列 weak；403 保留状态拒绝，503 需强标记才判质询，否则按临时5xx退避。
 const CHALLENGE_MARKERS = [
   'just a moment', 'cf-mitigated', 'ge_js_validator', 'cf-challenge',
   'challenge-platform', 'attention required', 'cloudflare',
@@ -773,13 +773,18 @@ async function searchAdmissionOnce(
     return { verdict: 'conn_fail', candidateCount: 0, error: errorMessage(error) };
   }
   const low = response.text.toLowerCase();
-  // 判定顺序（P1-2 裁定）：403/503 与 5xx/4xx 状态先判，**候选计数先于强标记**。
+  // 先判错误状态；503 只有强质询证据才进入有限strike，纯临时服务故障走5xx退避。
   // 反例教训：200 正常搜索页页脚含「安全验证/enable javascript/人机验证」时，若标记先判
   // 会把它误判成 challenge（rejected 终态、20h 不重测）；probe-reachability.py 只是一次性
-  // 探测，准入把它升级成了永久拒。故「有 ≥1 候选的正常页一律 ok」，墙只在 403/503 或
-  // 「0 候选 + 强标记」成立。弱标记 cloudflare 仍不判墙。
-  if (response.status === 403 || response.status === 503) {
+  // 探测，准入把它升级成了永久拒。故正常成功页仍保持「候选计数先于强标记」，
+  // 有 ≥1 候选即 ok；没有候选时再判强标记。弱标记 cloudflare 仍不判墙。
+  if (response.status === 403) {
     return { verdict: 'challenge', candidateCount: 0, status: response.status, error: String(response.status) };
+  }
+  if (response.status === 503) {
+    const marker = STRONG_CHALLENGE_MARKERS.find((item) => low.includes(item));
+    // 写具体有限标记，区别历史仅凭503状态生成的challenge行，使旧行可安全复核一次。
+    if (marker !== undefined) return { verdict: 'challenge', candidateCount: 0, status: 503, error: marker };
   }
   if (response.status >= 500) return { verdict: 'http_5xx', candidateCount: 0, status: response.status, error: String(response.status) };
   if (response.status >= 400) return { verdict: 'http_4xx', candidateCount: 0, status: response.status, error: String(response.status) };
@@ -1059,7 +1064,11 @@ function isRetestDue(row: AdmissionSourceRow, nowMs: number, urlStillInvalid: ()
   }
   // 41-srcfix 改法1：challenge 有限复测——strike 未满按 72h 窗到期，满了回终态（见常量注释）。
   if (row.search_verdict === 'challenge') {
-    if (challengeStrikes(row) >= ADMISSION_CHALLENGE_MAX_STRIKES) return false;
+    // 旧版把纯503也计质询strike，满额后即使站点恢复也不再探测。
+    // 仅这些精确旧原因按原72h窗重新确认；复核写入5xx/ok/强标记后自然退出此兼容分支。
+    const legacyStrike = row.error.match(new RegExp(`^${ADMISSION_CHALLENGE_STRIKE_PREFIX}([1-9]\\d*):503$`));
+    const legacy503 = row.error === '503' || (legacyStrike !== null && Number.isSafeInteger(Number(legacyStrike[1])));
+    if (!legacy503 && challengeStrikes(row) >= ADMISSION_CHALLENGE_MAX_STRIKES) return false;
     if (!row.search_checked_at) return true;
     const checked = Date.parse(row.search_checked_at);
     return !Number.isFinite(checked) || nowMs - checked >= ADMISSION_CHALLENGE_RETEST_MS;

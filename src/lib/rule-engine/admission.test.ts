@@ -127,14 +127,14 @@ describe('滤网 2 searchAdmission 判定分桶', () => {
     expect(fetchPage).toHaveBeenCalledOnce();
   });
 
-  it('403 → challenge（rejected）；503 同样判 challenge 不落 http_5xx', async () => {
+  it('403仍拒绝；无强标记的503进入5xx退避', async () => {
     for (const status of [403, 503]) {
       const fetchPage = vi.fn<AdmissionTransport>().mockResolvedValue(page('blocked', status));
       const result = await searchAdmission(syntheticSource('https://wall.example.com/'), {
         fetchPage, declaredHosts: declared('wall.example.com'), signal: signal(), throttleMs: 0,
       });
-      expect(result.verdict).toBe('challenge');
-      expect(admissionBucket(result.verdict)).toBe('rejected');
+      expect(result.verdict).toBe(status === 403 ? 'challenge' : 'http_5xx');
+      expect(admissionBucket(result.verdict)).toBe(status === 403 ? 'rejected' : 'deferred');
     }
   });
 
@@ -153,7 +153,7 @@ describe('滤网 2 searchAdmission 判定分桶', () => {
   });
 
   // P1-2（复审裁定）：强标记先判会把正常 200 搜索页判成 challenge 终态（rejected 20h 不重测）。
-  // 判定顺序改为「候选计数先于强标记」——有 ≥1 候选一律 ok，墙只在 403/503 或 0 候选+强标记成立。
+  // 成功页「候选计数先于强标记」；错误状态不因正文含候选而入池。
   describe('P1-2 候选计数先于强标记（正常页不得判墙）', () => {
     const candidateHtml = (footer: string) =>
       `<html><body><div class="i"><span class="t">书名</span><a href="/b/1">x</a></div>${footer}</body></html>`;
@@ -187,14 +187,14 @@ describe('滤网 2 searchAdmission 判定分桶', () => {
       expect(result.verdict).toBe('ok');
     });
 
-    it('403/503 → challenge，不论有无候选（回归）', async () => {
+    it('403/503错误页不因含候选而入池；纯503仍可退避复测', async () => {
       for (const status of [403, 503]) {
         for (const body of [candidateHtml(''), '<html><body>no results</body></html>']) {
           const fetchPage = vi.fn<AdmissionTransport>().mockResolvedValue(page(body, status));
           const result = await searchAdmission(syntheticSource('https://wall.example.com/'), {
             fetchPage, declaredHosts: declared('wall.example.com'), signal: signal(), throttleMs: 0,
           });
-          expect(result.verdict, `${status} ${body.length}`).toBe('challenge');
+          expect(result.verdict, `${status} ${body.length}`).toBe(status === 403 ? 'challenge' : 'http_5xx');
         }
       }
     });
