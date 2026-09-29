@@ -7,7 +7,7 @@
 // admissionFetch / validateAdmissionUrl 不在此（它们在 rule-engine/admission.ts 且不导出）。
 import { alternateSourceHost, SourcePolicyError, upgradeSourceTemplateUrl, validateSourceUrl } from '@/lib/source-policy';
 import {
-  MAX_SOURCE_CHAPTERS, buildSourceSearchRequest, sourceSearchUrl, type SourceBookIdentity, type SourceChapter,
+  MAX_SOURCE_CHAPTERS, buildSourceSearchRequest, parseSourceAlias, sourceSearchUrl, type SourceBookIdentity, type SourceChapter,
 } from '@/lib/source-parser';
 import type { SourceRequestContext } from '@/lib/source-reader';
 import { contentHtmlToText, contentNeedsHtmlToText } from './content-html';
@@ -94,6 +94,7 @@ export async function engineSearchBook(
  * ruleBookInfo（name/author/tocUrl）。identity 校验留给调用方（§7.2）。
  * tocUrl 不在 `SourceBookIdentity` 里，作为附加字段带出（设计注释明确其属于本环节）；
  * 缺省时调用方回退用详情页 URL 当目录页。
+ * 页面自报的原书名别名一并带出；最终书名与作者身份仍由调用方核对。
  */
 export async function engineFetchDetail(
   source: EngineSource, bookUrl: string, context: SourceRequestContext,
@@ -108,6 +109,9 @@ export async function engineFetchDetail(
   if (title) detail.title = title;
   if (author) detail.author = author;
   if (tocUrl) detail.tocUrl = tocUrl;
+  // 与 builtin 复用成对括号的明确原书名标记，不把作者搜索词当作书名。
+  const alias = parseSourceAlias(page.text);
+  if (alias.alias) detail.alias = alias.alias;
   return detail;
 }
 

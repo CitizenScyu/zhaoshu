@@ -155,11 +155,14 @@ describe('probeSourceForBook:命中', () => {
 describe('probeSourceForBook:未命中的各结果类型', () => {
   it('搜索页 0 候选 ⇒ no_candidates', async () => {
     pages.set(e1.search(), { text: '<div>没有结果</div>' });
-    expect(await probe(E1)).toMatchObject({ status: 'no_candidates', requests: 1 });
+    pages.set(e1.search(book.author), { text: '<div>没有结果</div>' });
+    expect(await probe(E1)).toMatchObject({ status: 'no_candidates', requests: 2 });
+    expect(requested).toEqual([e1.search(), e1.search(book.author)]);
   });
 
   it('有候选但身份不符 ⇒ miss(不是 no_candidates)', async () => {
     pages.set(e1.search(), { text: engineListItem('别的书', '别人') });
+    pages.set(e1.search(book.author), { text: '<div>没有结果</div>' });
     pages.set(e1.detail, { text: '<h1 class="title">别的书</h1><span class="writer">别人</span>' });
     expect(await probe(E1)).toMatchObject({ status: 'miss' });
   });
@@ -361,6 +364,8 @@ describe('probeSourceForBook:进程级同站节流(41-fanfix N1)', () => {
     (await import('./source-policy')).refreshSupportedHosts(['e1.test', 'e2.test']);
     pages.set(e1.search(), { text: '<div>没有结果</div>' });
     pages.set('https://e2.test/s?q=' + q(book.title), { text: '<div>没有结果</div>' });
+    pages.set(e1.search(book.author), { text: '<div>没有结果</div>' });
+    pages.set('https://e2.test/s?q=' + q(book.author), { text: '<div>没有结果</div>' });
     const t0 = Date.now();
     const results = await drive(Promise.all([
       service.probeSourceForBook(E1, book, new AbortController().signal),
@@ -386,12 +391,14 @@ describe('probeSourceForBook:进程级同站节流(41-fanfix N1)', () => {
   it('SOURCE_THROTTLE_PER_HOST=0 ⇒ probe 也退回请求级单槽(不跨请求共享)', async () => {
     vi.stubEnv('SOURCE_THROTTLE_PER_HOST', '0');
     pages.set(e1.search(), { text: '<div>没有结果</div>' });
+    pages.set(e1.search(book.author), { text: '<div>没有结果</div>' });
     const t0 = Date.now();
     await drive(Promise.all([
       service.probeSourceForBook(E1, book, new AbortController().signal),
       service.probeSourceForBook(E1b, book, new AbortController().signal),
     ]));
-    expect(stamps.map((item) => item.at - t0)).toEqual([0, 0]);
+    // 两个独立probe的标题请求同刻出发，各自作者回退也只等待自己的下一槽。
+    expect(stamps.map((item) => item.at - t0)).toEqual([0, 0, 350, 350]);
   });
 });
 

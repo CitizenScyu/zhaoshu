@@ -1187,6 +1187,7 @@ describe('引擎源分派（M1 任务 4 §7.2）', () => {
   it('identity 不符时引擎源不自动取书（校验在调用方，§7.2）', async () => {
     mocks.sources.mockResolvedValue([engineSource]);
     pages.set(searchUrl, { text: '<div class="book"><span class="name">别的书</span><span class="author">别人</span><a href="/detail/1.html">x</a></div>' });
+    pages.set('https://book15.net/s?q=' + encodeURIComponent(book.author), { text: '<div>没有结果</div>' });
     pages.set(detailUrl, { text: '<h1 class="title">别的书</h1><span class="writer">别人</span><a class="toc" href="/toc/1.html">目录</a>' });
     pages.set(tocUrl, { text: '<li class="chapter"><a href="/c/1.html">第一章</a></li>' });
     await expect(service.resolveSourceBook(book, context())).rejects.toMatchObject({ code: 'SOURCE_NOT_FOUND' });

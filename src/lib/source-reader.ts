@@ -392,6 +392,13 @@ function engineDetailCandidates(book: SourceBookIdentity, results: EngineSearchR
     .map(({ result }) => result);
 }
 
+/** 作者回退只用于标题搜索无书名匹配行；搜索作者缺省不能挤掉待核详情。 */
+function engineAuthorSearchPending(book: SourceBookIdentity, results: EngineSearchResult[]): boolean {
+  const author = knownSourceAuthor(book.author);
+  return !!author && author !== normalizeSourceTitle(book.title)
+    && !results.some((result) => sourceBookMatches({ title: book.title, author: '' }, result));
+}
+
 /** 引擎源目录构造：与 catalogFrom 同构，version 用 ENGINE_PARSER_VERSION 区分（设计 §7.2）。 */
 function engineCatalogFrom(
   pageUrl: string, source: ReadingSource, identity: SourceBookIdentity, chapters: SourceChapter[],
@@ -755,7 +762,12 @@ export async function resolveSourceBook(
         const results = await engineSearchBook(engineSource, book.title, sourceContext);
         stat.searched = true;
         stat.candidates = results.length;
-        for (const result of engineDetailCandidates(book, results)) {
+        const authorFallbackPending = engineAuthorSearchPending(book, results);
+        // 预留作者搜索、最多4个详情和最终目录；不能用无关详情耗尽 child 的 L1。
+        const detailWidth = authorFallbackPending
+          ? Math.min(MAX_DETAIL_CANDIDATES, sourceContext.remainingFor(2 + MAX_DETAIL_CANDIDATES))
+          : MAX_DETAIL_CANDIDATES;
+        for (const result of engineDetailCandidates(book, results).slice(0, detailWidth)) {
           if (result.bookUrl === options.excludeBookUrl || checked.has(source.url + result.bookUrl)) continue;
           checked.add(source.url + result.bookUrl);
           try {
@@ -778,6 +790,36 @@ export async function resolveSourceBook(
               throw error;
             }
             hadFailure = true;
+          }
+        }
+        // 标题搜索没有书名匹配行（含零结果）时才回退作者；精确行的上游失败不额外搜索。
+        // 仍以详情层 sourceBookMatches（标题/别名 + 作者门）确认，不能按作者搜索词认领书。
+        // 余量至少「作者搜索 1 点 + 首个详情 1 点 + 目录 1 点」才回退（remainingFor：首源=root 只看
+        // L2，非首源 child 还要过 L1），不足则跳过——强开会把预算码抛给外层记成整轮失败。
+        if (authorFallbackPending && !matches.size && sourceContext.remainingFor(2) >= 1) {
+          const authorResults = await engineSearchBook(engineSource, book.author, sourceContext);
+          stat.fallbackCandidates += authorResults.length;
+          for (const result of engineDetailCandidates(book, authorResults)) {
+            if (result.bookUrl === options.excludeBookUrl || checked.has(source.url + result.bookUrl)) continue;
+            checked.add(source.url + result.bookUrl);
+            try {
+              const detail = await engineFetchDetail(engineSource, result.bookUrl, sourceContext);
+              const identity = engineIdentityOf(detail, result);
+              if (!sourceBookMatches(book, identity)) continue;
+              const toc = await engineFetchToc(engineSource, detail.tocUrl ?? result.bookUrl, sourceContext);
+              if (!toc.chapters.length) continue;
+              const catalog = engineCatalogFrom(result.bookUrl, source, identity, toc.chapters);
+              matches.set(catalog.bookUrl, catalog);
+              if (knownSourceAuthor(book.author)) return catalog;
+            } catch (error) {
+              context.signal.throwIfAborted();
+              if (error instanceof SourceReaderError) {
+                if (error.code === 'SOURCE_BUDGET_EXCEEDED') throw error;
+                if (error.code === 'SOURCE_SCOPE_EXHAUSTED') { hadFailure = true; break; }
+                throw error;
+              }
+              hadFailure = true;
+            }
           }
         }
         continue;
@@ -1115,15 +1157,27 @@ async function surveyOneSource(
   if (!isBuiltinReadingSource(source)) {
     const engineSource = engineSourceOf(source);
     const results = await engineSearchBook(engineSource, book.title, context);
-    for (const result of engineDetailCandidates(book, results)) {
-      if (result.bookUrl === excludeBookUrl || checked.has(result.bookUrl)) continue;
-      checked.add(result.bookUrl);
-      const detail = await engineFetchDetail(engineSource, result.bookUrl, context);
-      const identity = engineIdentityOf(detail, result);
-      if (!sourceBookMatches(book, identity)) continue;
-      const toc = await engineFetchToc(engineSource, detail.tocUrl ?? result.bookUrl, context);
-      if (!toc.chapters.length) continue;
-      return record(engineCatalogFrom(result.bookUrl, source, identity, toc.chapters));
+    const pending = engineAuthorSearchPending(book, results);
+    const inspect = async (candidates: EngineSearchResult[]): Promise<SourceAlternateStatus | null> => {
+      for (const result of candidates) {
+        if (result.bookUrl === excludeBookUrl || checked.has(result.bookUrl)) continue;
+        checked.add(result.bookUrl);
+        const detail = await engineFetchDetail(engineSource, result.bookUrl, context);
+        const identity = engineIdentityOf(detail, result);
+        if (!sourceBookMatches(book, identity)) continue;
+        const toc = await engineFetchToc(engineSource, detail.tocUrl ?? result.bookUrl, context);
+        if (!toc.chapters.length) continue;
+        return record(engineCatalogFrom(result.bookUrl, source, identity, toc.chapters));
+      }
+      return null;
+    };
+    const width = pending
+      ? Math.min(MAX_DETAIL_CANDIDATES, context.remainingFor(2 + MAX_DETAIL_CANDIDATES))
+      : MAX_DETAIL_CANDIDATES;
+    const found = await inspect(engineDetailCandidates(book, results).slice(0, width));
+    if (found) return found;
+    if (pending && context.remainingFor(2) >= 1) {
+      return inspect(engineDetailCandidates(book, await engineSearchBook(engineSource, book.author, context)));
     }
     return null;
   }
