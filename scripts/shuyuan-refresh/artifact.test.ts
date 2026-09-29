@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { existsSync, readFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { resolve, dirname } from 'node:path';
 
 // 打包产物必须能真跑:import 单文件、被判据无内联凭据。这里只做「可加载性」冒烟,
@@ -31,15 +31,18 @@ describe('refresh-runner 产物', () => {
     expect(/postgres:\/\/|ghp_|github_pat_|sk-/.test(text)).toBe(false);
   });
 
-  it('产物是自包含 ESM:单文件可被 node 加载并执行(无 DATABASE_URL 时走失败路径)', async () => {
-    // 产物无 DATABASE_URL 时会失败,但「失败」本身证明整包已加载、main() 已执行
-    // (bundle 内所有依赖解析成功)。用 --dry-run 且刻意不给 DB env,避免触碰真库;
-    // 无论本机能否连上游,失败前缀都必然出现,故判据与网络无关。
+  it('产物是自包含 ESM:单文件可被 node 加载并执行(隔离网络,失败路径确定性触发)', async () => {
+    // 产物跑失败即证明整包已加载、main() 已执行(bundle 内所有依赖解析成功)。
+    // 用 --dry-run 且刻意不给 DB env,避免触碰真库;fetch 用同目录 preload 夹具
+    // (artifact-fetch-fail.preload.mjs)替换为立即抛 TypeError('fetch failed')的桩——
+    // 原版「不拦截网络、赌上游不可达」在慢失败网络下 >5s 撞 testTimeout(环境敏感红)。
+    // 桩注入后不实际外呼任何地址,失败前缀与退出码确定性出现。
     const { spawnSync } = await import('node:child_process');
     const env = { ...process.env };
     delete env.DATABASE_URL;
-    const r = spawnSync(process.execPath, [dist, '--dry-run'], { encoding: 'utf8', env });
-    expect(r.stderr).toContain('shuyuan refresh runner failed:');
+    const preload = pathToFileURL(resolve(here, 'artifact-fetch-fail.preload.mjs')).href;
+    const r = spawnSync(process.execPath, ['--import', preload, dist, '--dry-run'], { encoding: 'utf8', env });
+    expect(r.stderr).toContain('shuyuan refresh runner failed: fetch failed');
     expect(r.status).toBe(1);
   });
 
