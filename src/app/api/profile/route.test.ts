@@ -79,6 +79,65 @@ describe('/api/profile writes', () => {
   });
   afterEach(() => { vi.unstubAllEnvs(); vi.restoreAllMocks(); });
 
+  it('starts both rebuild reads together and waits for both before calling the model', async () => {
+    let releaseFeedback!: (value: unknown[]) => void;
+    let releaseWithdrawn!: (value: unknown[]) => void;
+    mocks.getProfileFeedbackForUser.mockReturnValue(new Promise(resolve => { releaseFeedback = resolve; }));
+    mocks.getWithdrawnFeedbackBookTitlesForUserRaw.mockReturnValue(new Promise(resolve => { releaseWithdrawn = resolve; }));
+    const response = POST(request());
+    try {
+      await vi.waitFor(() => {
+        expect(mocks.getProfileFeedbackForUser).toHaveBeenCalledWith(1);
+        expect(mocks.getWithdrawnFeedbackBookTitlesForUserRaw).toHaveBeenCalledWith(1);
+      });
+      expect(mocks.chatRobust).not.toHaveBeenCalled();
+      releaseFeedback([{ title: '并行反馈书', author: '作者', status: 'done', note: '喜欢设定', feedbackId: 10 }]);
+      await new Promise(resolve => setTimeout(resolve, 0));
+      expect(mocks.chatRobust).not.toHaveBeenCalled();
+      releaseWithdrawn([{ title: '并行撤回书', feedbackId: 8 }]);
+      const events = await consumeSSE(await response);
+      const input = mocks.chatRobust.mock.calls[0][1] as string;
+      expect(input).toContain('并行反馈书');
+      expect(input).toContain('并行撤回书');
+      expect(lastEvent(events, 'done')).toMatchObject({ feedbackCount: 1, resetFromSeeds: false, updatedAt: nextVersion });
+      expect(mocks.saveProfileForUser).toHaveBeenCalledWith(1, seeds, '有效画像😀\n喜欢严谨设定', previousVersion, expect.any(Function));
+    } finally {
+      releaseFeedback([]); releaseWithdrawn([]); await response;
+    }
+  });
+
+  it.each(['feedback', 'withdrawn'])('a failed parallel %s read prevents model and writes', async (failed) => {
+    const failing = failed === 'feedback' ? mocks.getProfileFeedbackForUser : mocks.getWithdrawnFeedbackBookTitlesForUserRaw;
+    failing.mockRejectedValue(new Error('synthetic read failure'));
+    const errorLog = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const response = await POST(request());
+    expect(response.status).toBe(500);
+    expect(mocks.chatRobust).not.toHaveBeenCalled();
+    expect(mocks.saveProfileForUser).not.toHaveBeenCalled();
+    expect(mocks.transaction).not.toHaveBeenCalled();
+    errorLog.mockRestore();
+  });
+
+  it('cancellation during the two reads prevents late results from calling the model or writing', async () => {
+    const controller = new AbortController();
+    let releaseFeedback!: (value: unknown[]) => void;
+    let releaseWithdrawn!: (value: unknown[]) => void;
+    mocks.getProfileFeedbackForUser.mockReturnValue(new Promise(resolve => { releaseFeedback = resolve; }));
+    mocks.getWithdrawnFeedbackBookTitlesForUserRaw.mockReturnValue(new Promise(resolve => { releaseWithdrawn = resolve; }));
+    const response = POST(request('POST', { updatedAt: previousVersion }, controller.signal));
+    try {
+      await vi.waitFor(() => expect(mocks.getWithdrawnFeedbackBookTitlesForUserRaw).toHaveBeenCalledOnce());
+      controller.abort();
+      releaseFeedback([]); releaseWithdrawn([]);
+      expect((await response).status).toBe(499);
+      expect(mocks.chatRobust).not.toHaveBeenCalled();
+      expect(mocks.saveProfileForUser).not.toHaveBeenCalled();
+      expect(mocks.transaction).not.toHaveBeenCalled();
+    } finally {
+      releaseFeedback([]); releaseWithdrawn([]); await response;
+    }
+  });
+
   it('saves valid generated markdown as a stream ending in a done event, passing cancellation to the model', async () => {
     const req = request();
     const res = await POST(req);

@@ -130,10 +130,11 @@ async function handlePOST(req: NextRequest) {
     // F41-F1：上界必须是**实喂上界**（两类里 id 更大的未喂行不得被清），不能是
     // getMaxFeedbackIdForUser——反馈查询有 LIMIT 50，全表 max id 几乎必然大于本次真喂
     // 进去的行。用它推水位会把第 51+ 本书标成已消费，而它们从未进过模型输入。
-    const feedback = resetFromSeeds ? [] : await access.run(() => getProfileFeedbackForUser(userId));
-    const withdrawnTitles = resetFromSeeds
-      ? []
-      : await access.run(() => getWithdrawnFeedbackBookTitlesForUserRaw(userId));
+    // 版本和种子校验已完成；两条只读查询互不依赖，各自保留 access.run 的取消/截止守卫。
+    const [feedback, withdrawnTitles] = resetFromSeeds ? [[], []] : await Promise.all([
+      access.run(() => getProfileFeedbackForUser(userId)),
+      access.run(() => getWithdrawnFeedbackBookTitlesForUserRaw(userId)),
+    ]);
     const withdrawn = withdrawnTitles.map((row) => row.title);
     // 重建路径两类都是全量读：informative 只有 LIMIT 50 之内被真正喂给模型，
     // withdrawn 超过 50 的部分没有被告知 ⇒ 取 min，别把未覆盖的部分标成已吸收。
