@@ -1580,6 +1580,44 @@ describe('引擎源正文分派（N01）', () => {
     expect((await recovered.json()).chapters).toHaveLength(2);
   });
 
+  it.each([false, true])('TOCREPEAT53: 确认目录后页302回已读页不落库，首次canonical=%s', async (canonical) => {
+    await primeEngineCatalog();
+    const paged = { ...contentEngineSource, rules: { ...contentEngineSource.rules,
+      ruleToc: { ...contentEngineSource.rules.ruleToc, nextTocUrl: '.next@href' } } };
+    mocks.sources.mockResolvedValue([paged]);
+    const canonicalUrl = n01Toc + '?canonical=1';
+    const continuation = 'https://book15.net/n01/toc/2.html';
+    const firstHtml = '<li class="chapter"><a href="/n01/c/1.html">第一章</a></li><a class="next" href="/n01/toc/2.html">下页</a>';
+    pages.set(n01Toc, { text: firstHtml });
+    pages.set(canonicalUrl, { text: firstHtml });
+    pages.set(continuation, { text: '<li class="chapter"><a href="/n01/c/2.html">第二章</a></li>' });
+    const originalFetch = mocks.fetch.getMockImplementation()!;
+    let looping = true;
+    mocks.fetch.mockImplementation((input, init) => {
+      const target = canonical && String(input) === n01Toc ? canonicalUrl
+        : looping && String(input) === continuation ? (canonical ? canonicalUrl : n01Toc) : null;
+      return target ? Promise.resolve(new Response(null, { status: 302, headers: { location: target } }))
+        : originalFetch(input, init);
+    });
+    const query = `title=测试书&author=作者&book_url=${encodeURIComponent(n01Detail)}&source=${encodeURIComponent(paged.url)}`;
+    const savedBefore = catalogs.size;
+    const failed = await request('index', query);
+    expect.soft(failed.status).toBe(422);
+    expect.soft(await failed.json()).toMatchObject({ code: 'SOURCE_REJECTED' });
+    expect.soft(writes).toEqual([]);
+    expect.soft(catalogs.size).toBe(savedBefore);
+
+    looping = false;
+    const beforeRetry = mocks.fetch.mock.calls.length;
+    const recovered = await request('index', query);
+    expect(recovered.status).toBe(200);
+    const body = await recovered.json();
+    expect(body.chapters.map((chapter: { title: string }) => chapter.title)).toEqual(['第一章', '第二章']);
+    expect(catalogs.get(body.version)?.chapters).toHaveLength(2);
+    expect(mocks.fetch.mock.calls.slice(beforeRetry).map(([url]) => String(url)))
+      .toEqual(canonical ? [n01Detail, n01Toc, canonicalUrl, continuation] : [n01Detail, n01Toc, continuation]);
+  });
+
   it.each(['first', 'continuation'] as const)('REDIRECT53: %s跳到目录中其他章时不得交付或缓存错章', async (hop) => {
     await primeEngineCatalog();
     const paged = { ...contentEngineSource, rules: { ...contentEngineSource.rules,

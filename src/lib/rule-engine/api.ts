@@ -126,11 +126,19 @@ export async function engineFetchToc(
   const entries: SourceChapter[] = [];
   const seenUrls = new Set<string>(); // 唯一章节计数（页数/总量上限），与最终去重顺序无关
   const visited = new Set<string>();
+  const receivedPages = new Set<string>();
   let next = absoluteUrl(tocUrl, source.url);
   for (let pageIndex = 0; next && pageIndex < MAX_TOC_PAGES && seenUrls.size <= MAX_SOURCE_CHAPTERS; pageIndex += 1) {
     if (visited.has(next)) { if (strict) throw new Error('pagination_cycle'); break; }
     visited.add(next);
     const page = await context.page(next, { responseCharset: enginePostSearchEnabled() ? 'auto' : undefined });
+    // 不同分页请求可能重定向回已读目录；不能把首部分章节作为完整目录保存。
+    const receivedKey = redirectedPageIdentity(page.url);
+    if (receivedPages.has(receivedKey)) {
+      if (strict) throw new Error('pagination_cycle');
+      throw new SourcePolicyError('书源目录分页重复返回已读取的页面，请重试或更换书源');
+    }
+    receivedPages.add(receivedKey);
     const scope = createScope(normalizeBody(page.text), page.url);
     let validChapters = 0;
     const list = field(source.compiled, 'ruleToc.chapterList');

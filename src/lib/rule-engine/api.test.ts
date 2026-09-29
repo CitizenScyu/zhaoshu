@@ -87,6 +87,62 @@ describe('引擎门面四函数（M1 任务 4 §7.1）', () => {
       .toEqual({ text: '' });
   });
 
+  it.each([false, true])('TOCREPEAT53: 重复最终目录页拒绝，strict=%s', async (strict) => {
+    const source = engineSource({ ruleToc: { chapterList: '.chapter', chapterName: 'a@text', chapterUrl: 'a@href', nextTocUrl: '.next@href' } });
+    for (const repeated of [TOC_URL, TOC_URL + '#catalog', TOC_URL.replace('book15.net', 'www.book15.net')]) {
+      let count = 0;
+      const context = { page: async () => ({ url: count++ === 0 ? TOC_URL : repeated,
+        text: '<li class="chapter"><a href="/c/1.html">第一章</a></li><a class="next" href="/toc/2.html">下页</a>' }) } as unknown as SourceRequestContext;
+      const result = engineFetchToc(source, TOC_URL, context, strict);
+      if (strict) await expect(result).rejects.toThrow('pagination_cycle');
+      else await expect(result).rejects.toMatchObject({ name: 'SourcePolicyError' });
+      expect(count).toBe(2);
+    }
+  });
+
+  it.each([false, true])('TOCREPEAT53: 不同查询和尾斜杠目录页允许相同章节条目，strict=%s', async (strict) => {
+    const source = engineSource({ ruleToc: { chapterList: '.chapter', chapterName: 'a@text', chapterUrl: 'a@href', nextTocUrl: '.next@href' } });
+    const finals = [TOC_URL + '?page=1', TOC_URL + '?page=2', TOC_URL + '/'];
+    let count = 0;
+    const context = { page: async () => {
+      const at = count++;
+      return { url: finals[at], text: '<li class="chapter"><a href="/c/1.html">同一章条目</a></li>'
+        + (at < 2 ? `<a class="next" href="/toc/page-${at + 2}.html">下页</a>` : '') };
+    } } as unknown as SourceRequestContext;
+    expect(await engineFetchToc(source, TOC_URL, context, strict)).toEqual({ chapters: [{ title: '同一章条目', url: CHAPTER_URL }] });
+    expect(count).toBe(3);
+  });
+
+  it.each([false, true])('TOCREPEAT53: 同一最终URL即使返回新章节且无next也拒绝，strict=%s', async (strict) => {
+    const source = engineSource({ ruleToc: { chapterList: '.chapter', chapterName: 'a@text', chapterUrl: 'a@href', nextTocUrl: '.next@href' } });
+    let count = 0;
+    const context = { page: async () => ({ url: TOC_URL, text: count++ === 0
+      ? '<li class="chapter"><a href="/c/1.html">第一章</a></li><a class="next" href="/toc/2.html">下页</a>'
+      : '<li class="chapter"><a href="/c/2.html">第二章</a></li>' }) } as unknown as SourceRequestContext;
+    const result = engineFetchToc(source, TOC_URL, context, strict);
+    if (strict) await expect(result).rejects.toThrow('pagination_cycle');
+    else await expect(result).rejects.toMatchObject({ name: 'SourcePolicyError' });
+    expect(count).toBe(2);
+  });
+
+  it.each([undefined, '.missing@href'])('TOCREPEAT53: 章节URL缺省回退不合并不同目录页，rule=%s', async (chapterUrl) => {
+    const source = engineSource({ ruleToc: { chapterList: '.chapter', chapterName: 'a@text', chapterUrl, nextTocUrl: '.next@href' } });
+    const second = 'https://book15.net/toc/2.html';
+    expect(await engineFetchToc(source, TOC_URL, fakeContext(new Map([
+      [TOC_URL, '<li class="chapter"><a>第一章</a></li><a class="next" href="/toc/2.html">下页</a>'],
+      [second, '<li class="chapter"><a>第二章</a></li>'],
+    ])))).toEqual({ chapters: [{ title: '第一章', url: TOC_URL }, { title: '第二章', url: second }] });
+  });
+
+  it('TOCREPEAT53: 跨页重复章节仍保留最后出现顺序', async () => {
+    const source = engineSource({ ruleToc: { chapterList: '.chapter', chapterName: 'a@text', chapterUrl: 'a@href', nextTocUrl: '.next@href' } });
+    const chapter = (n: number) => `<li class="chapter"><a href="/c/${n}.html">第${n}章</a></li>`;
+    expect(await engineFetchToc(source, TOC_URL, fakeContext(new Map([
+      [TOC_URL, chapter(3) + chapter(1) + chapter(2) + '<a class="next" href="/toc/2.html">下页</a>'],
+      ['https://book15.net/toc/2.html', chapter(2) + chapter(3)],
+    ])))).toEqual({ chapters: [1, 2, 3].map((n) => ({ title: `第${n}章`, url: `https://book15.net/c/${n}.html` })) });
+  });
+
   it('engineFetchDetail 解释 ruleBookInfo（含 tocUrl 绝对化）', async () => {
     const pages = new Map([[BOOK_URL,
       '<h1 class="title">测试书</h1><span class="writer">作者</span><a class="toc" href="/toc/1.html">目录</a>']]);
