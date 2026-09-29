@@ -9,7 +9,7 @@ import {
 } from '@/lib/shuyuan-view';
 
 export default function ShuyuanTab() {
-  const { apiFetch } = useOwner();
+  const { apiFetch, sessionId, isCurrentSession } = useOwner();
   const [stats, setStats] = useState<ShuyuanStatsPage | null>(null);
   const [filter, setFilter] = useState<ShuyuanSourceFilter>('all');
   const [page, setPage] = useState(1);
@@ -47,13 +47,14 @@ export default function ShuyuanTab() {
     // 不再是当前视图)的加载**直接不发请求**;迟到兑现的旧响应/失败提示不得覆盖
     // 用户已经切过去的新视图,loading 由仍属当前视图的加载负责收尾。
     const gen = viewGen.current;
-    const isCurrent = () => !signal.aborted && viewGen.current === gen
+    const isCurrent = () => !signal.aborted && isCurrentSession(sessionId) && viewGen.current === gen
       && viewRef.current.filter === target.filter && viewRef.current.page === target.page;
     if (!isCurrent()) return null;
     setLoading(true);
     setError('');
     try {
       const res = await apiFetch(`/api/shuyuan?filter=${target.filter}&page=${target.page}`, { signal });
+      if (!isCurrent()) return null;
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || '书源加载失败');
       // 请求已取消时不要写回：下一次 load 可能已经把更新的数据放进去了，
@@ -68,7 +69,7 @@ export default function ShuyuanTab() {
     } finally {
       if (isCurrent()) setLoading(false);
     }
-  }, [apiFetch]);
+  }, [apiFetch, sessionId, isCurrentSession]);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -91,7 +92,7 @@ export default function ShuyuanTab() {
   }
 
   async function refresh() {
-    if (refreshInFlight.current) return;
+    if (!isCurrentSession(sessionId) || refreshInFlight.current) return;
     refreshInFlight.current = true;
     setRefreshing(true);
     setError('');
@@ -108,14 +109,17 @@ export default function ShuyuanTab() {
         body: JSON.stringify({ action: 'refresh' }),
         signal,
       });
+      if (!isActionCurrent(signal, gen)) return;
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || '刷新失败');
       if (!isActionCurrent(signal, gen)) return;
-      retreatToLastPage(await load({ filter, page }, signal), page);
+      const loaded = await load({ filter, page }, signal);
+      if (isActionCurrent(signal, gen)) retreatToLastPage(loaded, page);
     } catch (e) {
       if (isActionCurrent(signal, gen)) setError(e instanceof Error ? e.message : '刷新失败');
     } finally {
-      setRefreshing(false);
+      // 同一会话切筛选仍需解除忙碌；不能用视图代际或被其他动作取消的 signal 守收尾。
+      if (isCurrentSession(sessionId)) setRefreshing(false);
       refreshInFlight.current = false;
     }
   }
@@ -124,11 +128,12 @@ export default function ShuyuanTab() {
   // (视图代际已翻)或操作被中止/组件卸载时,迟到的错误提示与 gone 提示都不得
   // 写回新视图的 error 状态。load 内部的守卫与此同源(viewGen)。
   function isActionCurrent(signal: AbortSignal, gen: number) {
-    return !signal.aborted && viewGen.current === gen;
+    // AuthController 可先于 React 重挂切换会话；只靠卸载取消和 viewGen 挡不住旧闭包。
+    return !signal.aborted && isCurrentSession(sessionId) && viewGen.current === gen;
   }
 
   async function toggle(source: ShuyuanSourceStatus) {
-    if (toggling) return;
+    if (!isCurrentSession(sessionId) || toggling) return;
     setToggling(source.url);
     setError('');
     // 同 refresh:signal 覆盖整个操作周期并传给请求本体,POST 兑现时若已被中止/视图已换,不再重载。
@@ -141,18 +146,21 @@ export default function ShuyuanTab() {
         body: JSON.stringify({ action: source.disabled ? 'enable' : 'disable', url: source.url }),
         signal,
       });
+      if (!isActionCurrent(signal, gen)) return;
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || '操作失败');
       if (!isActionCurrent(signal, gen)) return;
       // 后端返回「没这一行」= 这个 URL 已不在库里（刷新换过合集）：列表已过期，
       // 重新拉一次让用户看到实况。提示放在 load 之后，否则会被 load 的 setError('') 抹掉。
       const gone = data.disabled === false || data.enabled === false;
-      retreatToLastPage(await load({ filter, page }, signal), page);
+      const loaded = await load({ filter, page }, signal);
+      if (!isActionCurrent(signal, gen)) return;
+      retreatToLastPage(loaded, page);
       if (gone && isActionCurrent(signal, gen)) setError('这个书源已不在当前合集里，已为你重新加载列表');
     } catch (e) {
       if (isActionCurrent(signal, gen)) setError(e instanceof Error ? e.message : '操作失败');
     } finally {
-      setToggling('');
+      if (isCurrentSession(sessionId)) setToggling('');
     }
   }
 

@@ -105,7 +105,7 @@ function renderTab(apiFetch: ApiFetch & { mock: { calls: unknown[][] } }) {
     ready: true, status: 'ready', user: null, permissions: { find: false, read: false, download: false },
     authMethod: null, accountsEnabled: true, expired: false, sessionId: 0, sessionOnly: false,
     setSessionOnly: vi.fn(), submitToken: vi.fn(), login: vi.fn(), logout: vi.fn(), refresh: vi.fn(),
-    apiFetch, can: () => false,
+    apiFetch, can: () => false, isCurrentSession: () => true,
   };
   return render(<ShuyuanTab />);
 }
