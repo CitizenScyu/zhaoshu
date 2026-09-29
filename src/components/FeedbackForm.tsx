@@ -17,7 +17,7 @@ export default function FeedbackForm({ title, author, status, initialSnapshot, c
   onCancel: () => void;
   onBusyChange: (busy: boolean) => void;
 }) {
-  const { apiFetch } = useOwner();
+  const { apiFetch, sessionId, isCurrentSession } = useOwner();
   const [baseline, setBaseline] = useState<FeedbackSnapshot | null>(initialSnapshot ?? null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
@@ -34,31 +34,34 @@ export default function FeedbackForm({ title, author, status, initialSnapshot, c
   useEffect(() => {
     if (initial.current && attempt === 0) return;
     const controller = new AbortController();
+    const current = () => !controller.signal.aborted && isCurrentSession(sessionId);
     queueMicrotask(() => {
-      if (controller.signal.aborted) return;
+      if (!current()) return;
       setBusy(true); onBusyChange(true);
       void apiFetch('/api/feedback?' + new URLSearchParams({ title, author }), { signal: controller.signal, cache: 'no-store' }).then(async (res) => {
+        if (!current()) return;
         const data = await res.json();
-        controller.signal.throwIfAborted();
+        if (!current()) return;
         const snapshot = readFeedbackSnapshot(data.current);
         if (!res.ok || !snapshot) throw new Error('读取当前反馈失败，请重试');
         if (currentBaseline.current) { setConflict(snapshot); setConflictDetected(true); }
         else setBaseline(snapshot);
         setError('');
       }).catch((error) => {
-        if (!controller.signal.aborted) setError(error instanceof Error ? error.message : '读取当前反馈失败');
+        if (current()) setError(error instanceof Error ? error.message : '读取当前反馈失败');
       }).finally(() => {
-        if (!controller.signal.aborted) { setBusy(false); onBusyChange(false); }
+        if (current()) { setBusy(false); onBusyChange(false); }
       });
     });
     return () => controller.abort();
-  }, [apiFetch, title, author, attempt, onBusyChange]);
+  }, [apiFetch, title, author, attempt, onBusyChange, sessionId, isCurrentSession]);
 
   async function save(note: string) {
-    if (!baseline || busy || conflictDetected || operation.current) return;
+    if (!baseline || busy || conflictDetected || operation.current || !isCurrentSession(sessionId)) return;
     const confirmNoteReduction = feedbackNeedsConfirmation(baseline.note, note);
     if (confirmNoteReduction && !window.confirm(feedbackReductionMessage(baseline.note, note))) return;
     const controller = new AbortController();
+    const current = () => !controller.signal.aborted && isCurrentSession(sessionId);
     operation.current = controller;
     setBusy(true); onBusyChange(true); setError('');
     try {
@@ -66,8 +69,9 @@ export default function FeedbackForm({ title, author, status, initialSnapshot, c
         method: 'POST', signal: controller.signal, headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ title, author, status, note, expectedFeedbackId: baseline.version, confirmNoteReduction }),
       });
+      if (!current()) return;
       const data = await res.json();
-      controller.signal.throwIfAborted();
+      if (!current()) return;
       if (res.status === 409) {
         setConflict(readFeedbackSnapshot(data.current));
         setConflictDetected(true);
@@ -79,16 +83,16 @@ export default function FeedbackForm({ title, author, status, initialSnapshot, c
       onSaved(note, readFeedbackProfileStatus(data.profileStatus));
       // F15：反馈已在服务端落地；画像吸收是独立的长模型调用，不阻塞本次保存的 UI。
       // 这里后台触发一次（结果若失败会留在队列里，由后续机会/显式重试重放）。
-      if (data.pending === true) {
+      if (data.pending === true && current()) {
         void apiFetch('/api/profile/absorb', {
           method: 'POST', keepalive: true, headers: { 'Content-Type': 'application/json' }, body: '{}',
         }).catch(() => {});
       }
     } catch (error) {
-      if (!controller.signal.aborted) setError((error instanceof Error ? error.message : '保存反馈失败') + '，草稿已保留。');
+      if (current()) setError((error instanceof Error ? error.message : '保存反馈失败') + '，草稿已保留。');
     } finally {
       if (operation.current === controller) operation.current = null;
-      if (!controller.signal.aborted) { setBusy(false); onBusyChange(false); }
+      if (current()) { setBusy(false); onBusyChange(false); }
     }
   }
 
