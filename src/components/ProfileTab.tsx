@@ -15,7 +15,7 @@ export default function ProfileTab({ state, dispatch, active }: {
   dispatch: Dispatch<ProfileDraftAction>;
   active: boolean;
 }) {
-  const { apiFetch } = useOwner();
+  const { apiFetch, sessionId, isCurrentSession } = useOwner();
   const { seeds, content: draft } = state;
   const content = state.saved?.content ?? '';
   const seedDirty = seedsChanged(state);
@@ -49,15 +49,17 @@ export default function ProfileTab({ state, dispatch, active }: {
   useEffect(() => {
     if (!active || busy) return;
     const controller = new AbortController();
+    const current = () => !controller.signal.aborted && isCurrentSession(sessionId);
     queueMicrotask(() => {
-      if (controller.signal.aborted) return;
+      if (!current()) return;
       setLoading(true);
       void apiFetch('/api/profile', { signal: controller.signal }).then(async (res) => {
+        if (!current()) return;
         const data = await res.json();
+        if (!current()) return;
         if (!res.ok) throw new Error(data.error || '读取画像失败（' + res.status + '）');
         const profile = readProfileSnapshot(data);
         if (!profile) throw new Error('画像数据不完整，请重新读取');
-        if (controller.signal.aborted) return;
         setLoadError('');
         dispatch({ type: 'load', profile });
         if (!loaded.current) {
@@ -65,15 +67,15 @@ export default function ProfileTab({ state, dispatch, active }: {
           loaded.current = true;
         }
       }).catch((error) => {
-        if (!controller.signal.aborted) {
+        if (current()) {
           setLoadError(error instanceof Error ? error.message : '读取画像失败，请重试');
         }
       }).finally(() => {
-        if (!controller.signal.aborted) setLoading(false);
+        if (current()) setLoading(false);
       });
     });
     return () => controller.abort();
-  }, [active, apiFetch, loadAttempt, busy, dispatch]);
+  }, [active, apiFetch, loadAttempt, busy, dispatch, sessionId, isCurrentSession]);
 
   function setSeeds(value: SeedBook[] | ((current: SeedBook[]) => SeedBook[])) {
     dispatch({ type: 'edit-seeds', seeds: typeof value === 'function' ? value(seeds) : value });
@@ -92,9 +94,14 @@ export default function ProfileTab({ state, dispatch, active }: {
     setMsg('');
   }
 
+  function isCurrentOperation(controller: AbortController): boolean {
+    return !controller.signal.aborted && isCurrentSession(sessionId);
+  }
+
   async function readWriteResponse(res: Response, controller: AbortController, generating = false): Promise<ProfileSnapshot | null> {
+    if (!isCurrentOperation(controller)) return null;
     const raw: unknown = await res.json().catch(() => null);
-    controller.signal.throwIfAborted();
+    if (!isCurrentOperation(controller)) return null;
     const data = isRecord(raw) ? raw : {};
     if (res.status === 409 && (data.code === 'PROFILE_CONFLICT' || data.code === 'PROFILE_SEEDS_CONFIRM_REQUIRED')) {
       const generated = generating && isRecord(data.draft)
@@ -117,7 +124,7 @@ export default function ProfileTab({ state, dispatch, active }: {
   }
 
   function beginOperation(): AbortController | null {
-    if (!state.saved || loading || loadError || operation.current) return null;
+    if (!state.saved || loading || loadError || operation.current || !isCurrentSession(sessionId)) return null;
     const controller = new AbortController();
     operation.current = controller;
     setBusy(true);
@@ -129,6 +136,7 @@ export default function ProfileTab({ state, dispatch, active }: {
   // 在 60s 掐断。结束帧带最终 seeds/content/updatedAt；冲突以 `conflict` 事件结算，
   // 保留第七批的 CAS/409 语义；最严苛错误落 `error` 事件，在正常流结束时交给调用方。
   async function generateFromStream(res: Response, controller: AbortController): Promise<ProfileSnapshot | null> {
+    if (!isCurrentOperation(controller)) return null;
     if (!res.body) throw new Error('生成响应为空，请重试');
     const reader = res.body.getReader();
     const decoder = new TextDecoder('utf-8');
@@ -136,7 +144,7 @@ export default function ProfileTab({ state, dispatch, active }: {
     try {
       while (true) {
         const { value, done } = await reader.read();
-        controller.signal.throwIfAborted();
+        if (!isCurrentOperation(controller)) return null;
         if (done) break;
         buf += decoder.decode(value, { stream: true });
         let boundary: number;
@@ -179,10 +187,11 @@ export default function ProfileTab({ state, dispatch, active }: {
   function finishOperation(controller: AbortController) {
     if (operation.current !== controller) return;
     operation.current = null;
-    if (!controller.signal.aborted) setBusy(false);
+    if (isCurrentOperation(controller)) setBusy(false);
   }
 
   async function save(scope: SaveScope) {
+    if (!isCurrentSession(sessionId)) return;
     const updatedAt = scope === 'all' ? state.conflict?.updatedAt : state.saved?.updatedAt;
     if (!updatedAt || (state.conflictDetected && scope !== 'all')) return;
     const baseline = scope === 'all' ? state.conflict : state.saved;
@@ -202,20 +211,22 @@ export default function ProfileTab({ state, dispatch, active }: {
           updatedAt,
         }),
       });
+      if (!isCurrentOperation(controller)) return;
       const profile = await readWriteResponse(res, controller);
-      if (!profile) return;
+      if (!profile || !isCurrentOperation(controller)) return;
       dispatch({ type: 'saved', profile, scope });
       if (scope !== 'content') setSeedEditing(false);
       if (scope !== 'seeds') setEditing(false);
       setMsg(scope === 'seeds' ? '✓ 种子已保存' : '✓ 已保存');
     } catch (error) {
-      if (!controller.signal.aborted) setMsg('✗ ' + (error instanceof Error ? error.message : '保存失败，请重试') + '，草稿已保留。');
+      if (isCurrentOperation(controller)) setMsg('✗ ' + (error instanceof Error ? error.message : '保存失败，请重试') + '，草稿已保留。');
     } finally {
       finishOperation(controller);
     }
   }
 
   async function generate() {
+    if (!isCurrentSession(sessionId)) return;
     if (state.conflictDetected || contentDirty) return;
     if (!state.saved) return;
     const confirmSeedRemoval = removedSeedBooks(state.saved.seeds, seeds).length > 0;
@@ -228,8 +239,9 @@ export default function ProfileTab({ state, dispatch, active }: {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ seeds, updatedAt: state.saved.updatedAt, confirmSeedRemoval }),
       });
+      if (!isCurrentOperation(controller)) return;
       const saved = await readWriteResponse(saveRes, controller);
-      if (!saved) return;
+      if (!saved || !isCurrentOperation(controller)) return;
       dispatch({ type: 'saved', profile: saved, scope: 'seeds' });
       setSeedEditing(false);
       const res = await apiFetch('/api/profile', {
@@ -237,22 +249,24 @@ export default function ProfileTab({ state, dispatch, active }: {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ updatedAt: saved.updatedAt }),
       });
+      if (!isCurrentOperation(controller)) return;
       if (!res.ok) {
         // 非 200 仍是流未启动前的错误（如 409 冲突 / 校验失败），沿用旧 readWriteResponse 契约。
         const fallback = await readWriteResponse(res, controller, true);
-        if (!fallback) return;
+        if (!fallback || !isCurrentOperation(controller)) return;
         dispatch({ type: 'saved', profile: fallback, scope: 'all' });
         setEditing(false);
         setMsg('✓ 画像已生成');
         return;
       }
       const profile = await generateFromStream(res, controller);
-      if (!profile) return;
+      // generateFromStream 的 finally 会 await reader.cancel()，其间也可能切换身份。
+      if (!profile || !isCurrentOperation(controller)) return;
       dispatch({ type: 'saved', profile, scope: 'all' });
       setEditing(false);
       setMsg('✓ 画像已生成');
     } catch (error) {
-      if (!controller.signal.aborted) setMsg('✗ ' + (error instanceof Error ? error.message : '生成失败，请重试'));
+      if (isCurrentOperation(controller)) setMsg('✗ ' + (error instanceof Error ? error.message : '生成失败，请重试'));
     } finally {
       finishOperation(controller);
     }
