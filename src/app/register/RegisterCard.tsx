@@ -2,7 +2,7 @@
 
 import Link from 'next/link';
 import { useRouter } from 'next/navigation';
-import { useEffect, useId, useState } from 'react';
+import { useEffect, useId, useRef, useState } from 'react';
 import { useOwner } from '@/components/OwnerProvider';
 import { safeReturnPath } from '@/lib/auth-client';
 
@@ -26,8 +26,14 @@ export default function RegisterCard({ returnTo }: { returnTo: string | null }) 
   const [inviteCode, setInviteCode] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState('');
+  // 在途提交的取消器；无提交时为 null。用 ref 而不是 effect 局部变量，是因为卸载清理
+  // 需要在组件整个生命周期内都能拿到当前在途的那一个（见下方卸载 effect）。
+  const submitAbort = useRef<AbortController | null>(null);
   const target = safeReturnPath(returnTo) ?? '/';
   const loginHref = `/login${returnTo ? `?returnTo=${encodeURIComponent(returnTo)}` : ''}`;
+
+  // 卸载（离页）即作废在途提交：abort 同时中止在途 POST，并让后续守卫拒绝迟到写回。
+  useEffect(() => () => submitAbort.current?.abort(), []);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -60,6 +66,12 @@ export default function RegisterCard({ returnTo }: { returnTo: string | null }) 
       setError(`密码至少需要 ${MIN_PASSWORD_CODEPOINTS} 个字符`); return;
     }
     setSubmitting(true);
+    // 提交是「离页即作废」的一次性动作：用户在注册 POST、读正文或身份刷新任何一个
+    // 窗口离开本页，迟到的成功就不许再触发认证刷新和 router.replace——那会把已离开
+    // 的页面拽回来。controller 只在提交期间存在，提交结束即置空；abort 同时中止在途
+    // POST；服务端账号是否已创建不受客户端取消影响（不宣称回滚）。
+    const controller = new AbortController();
+    submitAbort.current = controller;
     try {
       const res = await fetch('/api/auth/register', {
         method: 'POST',
@@ -69,8 +81,10 @@ export default function RegisterCard({ returnTo }: { returnTo: string | null }) 
           password,
           ...(mode === 'invite' && inviteCode.trim() ? { inviteCode: inviteCode.trim() } : {}),
         }),
+        signal: controller.signal,
       });
       const data = await res.json().catch(() => ({})) as { error?: string; code?: string };
+      if (controller.signal.aborted) return;
       if (!res.ok) {
         if (data.code === 'REGISTRATION_CLOSED') setMode('closed');
         setError(typeof data.error === 'string' && data.error ? data.error : '注册失败，请稍后重试');
@@ -79,12 +93,16 @@ export default function RegisterCard({ returnTo }: { returnTo: string | null }) 
       }
       setPassword(''); setConfirm('');
       await refresh().catch(() => {});
+      // 刷新期间离页：身份已由 OwnerProvider 更新，本页跳转必须就此打住。
+      if (controller.signal.aborted) return;
       router.replace(target);
     } catch {
+      if (controller.signal.aborted) return;
       setError('网络异常，请稍后重试；没有创建账号时可以重新提交');
       setPassword(''); setConfirm('');
     } finally {
-      setSubmitting(false);
+      if (submitAbort.current === controller) submitAbort.current = null;
+      if (!controller.signal.aborted) setSubmitting(false);
     }
   }
 

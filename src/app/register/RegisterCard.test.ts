@@ -21,6 +21,9 @@ vi.mock('react', async (importOriginal) => {
   return {
     ...actual,
     useId: () => 'test',
+    // submitAbort 的 ref 槽位跨渲染持久化即可；本文件不经卸载effect，current 恒为最后
+    // 一次提交领到的 controller（未中止），不影响既有断言。
+    useRef: (initial: unknown) => ({ current: initial }),
     useEffect: (effect: () => void | (() => void)) => { hooks.effects.push(effect); },
     useState: (initial: unknown) => {
       const slot = hooks.index++;
@@ -112,11 +115,11 @@ function render(returnTo: string | null = null): unknown {
   return RegisterCard({ returnTo }) as unknown;
 }
 
-/** 渲染并触发三态 effect（queueMicrotask → fetch → setMode），等微任务排空后重渲染。 */
+/** 渲染并触发三态 effect（queueMicrotask → fetch → setMode），等微任务排空后重渲染。
+ * 组件现在还有卸载守卫 effect（只登记清理，无副作用），一并触发后再取三态。 */
 async function renderAfterMode(returnTo: string | null = null): Promise<unknown> {
   render(returnTo);
-  const effect = hooks.effects[0] ?? null;
-  effect?.();
+  for (const effect of hooks.effects) effect();
   await vi.waitFor(() => { expect(mocks.fetch).toHaveBeenCalled(); });
   await new Promise((resolve) => setTimeout(resolve, 0));
   return render(returnTo);
@@ -342,7 +345,7 @@ describe('部署总闸', () => {
   it('账号模式总闸没开时不查三态，直接关闭', async () => {
     mocks.owner = ownerState({ accountsEnabled: false });
     render();
-    (hooks.effects[0] ?? (() => {}))();
+    for (const effect of hooks.effects) effect();
     await new Promise((resolve) => setTimeout(resolve, 0));
 
     expect(mocks.fetch).not.toHaveBeenCalled();
