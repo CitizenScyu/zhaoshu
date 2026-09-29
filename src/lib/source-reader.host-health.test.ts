@@ -52,12 +52,13 @@ const E1 = engine(1);
 const E2 = engine(2);
 const engineUrls = (n: number) => ({
   search: `https://e${n}.test/s?q=` + q(book.title),
+  authorSearch: `https://e${n}.test/s?q=` + q(book.author),
   detail: `https://e${n}.test/d/1.html`,
   toc: `https://e${n}.test/toc/1.html`,
   content: `https://e${n}.test/c/1.html`,
 });
 
-const pages = new Map<string, { text?: string; status?: number }>();
+const pages = new Map<string, { text?: string; status?: number; headers?: Record<string, string> }>();
 const catalogs = new Map<string, SourceCatalog>();
 /** 响应头延迟(虚拟毫秒);Infinity = 连接挂起，直到请求被中止(3s 连接段超时)。 */
 const headerDelay = new Map<string, number>();
@@ -65,6 +66,7 @@ let hints: unknown[];
 let requested: Array<{ url: string; at: number }>;
 const context = () => new service.SourceRequestContext(new AbortController().signal);
 const requestedUrls = () => requested.map(({ url }) => url);
+const requestTimeline = (startedAt: number) => requested.map(({ url, at }) => ({ url, at: at - startedAt }));
 
 /** 引擎源 n 有这本书：搜索 → 详情 → 目录(第一章)→ 正文。 */
 const primeEngine = (n: number) => {
@@ -74,8 +76,12 @@ const primeEngine = (n: number) => {
   pages.set(urls.toc, { text: '<li class="chapter"><a href="/c/1.html">第一章</a></li>' });
   pages.set(urls.content, { text: `<div class="content">引擎源${n}正文</div>` });
 };
-/** 引擎源 n 没有这本书：搜索结果为空(SOURCE_NOT_FOUND,一次请求)。 */
-const primeEngineMiss = (n: number) => pages.set(engineUrls(n).search, { text: '' });
+/** 引擎源 n 没有这本书：标题、作者搜索都返回 200 空页，各一次请求。 */
+const primeEngineMiss = (n: number) => {
+  const urls = engineUrls(n);
+  pages.set(urls.search, { text: '' });
+  pages.set(urls.authorSearch, { text: '' });
+};
 /** 当前源有这本书：搜索 + 详情。 */
 const primeCur = () => {
   pages.set(curSearch, { text: '<a href="/books/details42.html">测试书</a>' });
@@ -143,7 +149,7 @@ beforeEach(async () => {
     if (stallBody.has(url)) return new Response(new ReadableStream({ start() {} }), { status: 200 });
     const fixture = pages.get(url);
     if (!fixture) throw new Error('Unexpected source request ' + url);
-    return new Response(fixture.text ?? '', { status: fixture.status ?? 200 });
+    return new Response(fixture.text ?? '', { status: fixture.status ?? 200, headers: fixture.headers });
   });
   vi.stubGlobal('fetch', mocks.fetch);
   vi.spyOn(console, 'warn').mockImplementation(() => {});
@@ -200,8 +206,14 @@ describe('41-M1.3 建目录:宕机的 book15 降到队尾', () => {
     pages.set(book15Hint, { text: detail() });
     primeEngineMiss(1);
     requested = [];
+    const t0 = Date.now();
     expect((await build()).value.sourceUrl).toBe(book15.url);
-    expect(requestedUrls()).toEqual([engineUrls(1).search, book15Search(), book15Hint]);
+    expect(requestTimeline(t0)).toEqual([
+      { url: engineUrls(1).search, at: 0 },
+      { url: engineUrls(1).authorSearch, at: 350 },
+      { url: book15Search(), at: 350 },
+      { url: book15Hint, at: 700 },
+    ]);
     // 成功一次即清零：下一次 book15 回到队首。
     requested = [];
     expect((await build()).value.sourceUrl).toBe(book15.url);
@@ -245,12 +257,100 @@ describe('41-M1.3 章节级换源:宕机的 book15 不再是第一个候选', ()
     pages.set(book15Hint, { text: detail() });
     pages.set('https://book15.net/chapter/index42-1.html', { text: chapterHtml('book15 正文') });
     requested = [];
+    const t0 = Date.now();
     const { value: part } = await readChapter(catalog);
     expect(part).toMatchObject({ text: 'book15 正文', servedFrom: book15.name });
-    expect(requestedUrls()).toEqual([
-      curChapter, engineUrls(1).search, engineUrls(2).search,
-      book15Search(), book15Hint, 'https://book15.net/chapter/index42-1.html',
+    expect(requestTimeline(t0)).toEqual([
+      { url: curChapter, at: 0 },
+      { url: engineUrls(1).search, at: 0 },
+      { url: engineUrls(1).authorSearch, at: 350 },
+      { url: engineUrls(2).search, at: 350 },
+      { url: engineUrls(2).authorSearch, at: 700 },
+      { url: book15Search(), at: 700 },
+      { url: book15Hint, at: 1_050 },
+      { url: 'https://book15.net/chapter/index42-1.html', at: 1_400 },
     ]);
+  });
+});
+
+describe('53 作者搜索失败仍受换源预算约束', () => {
+  const arrange = async () => {
+    mocks.sources.mockResolvedValue([cur, E1, E2]);
+    primeCur();
+    const { value: catalog } = await build();
+    catalogs.set(catalog.version, catalog);
+    pages.set(curChapter, { status: 404 });
+    primeEngineMiss(1);
+    pages.set(engineUrls(1).authorSearch, { status: 503 });
+    primeEngine(2);
+    requested = [];
+    return catalog;
+  };
+  const expectHealthyDelivery = async (catalog: SourceCatalog, failedRequests: Array<{ url: string; at: number }>, e2At: number) => {
+    const ctx = context();
+    const t0 = Date.now();
+    // drive 排空所有定时器；此后断言的完整序列也覆盖切片到点后不能再发请求。
+    const { value: part, finishedAt } = await drive(service.readSourceChapter(catalog.version, 0, ctx));
+    expect(part).toMatchObject({ text: '引擎源2正文', servedFrom: E2.name });
+    const e2 = engineUrls(2);
+    expect(requestTimeline(t0)).toEqual([
+      { url: curChapter, at: 0 },
+      ...failedRequests,
+      { url: e2.search, at: e2At },
+      { url: e2.detail, at: e2At + 350 },
+      { url: e2.toc, at: e2At + 700 },
+      { url: e2.content, at: e2At + 1_050 },
+    ]);
+    expect(finishedAt - t0).toBe(e2At + 1_050);
+    expect(ctx.requests).toBe(1 + failedRequests.length + 4);
+    expect(ctx.requests).toBeLessThanOrEqual(ctx.totalLimit);
+    expect(ctx.signal.aborted).toBe(false);
+  };
+
+  it('作者查询真实 503 只重试一次，700ms 后健康 E2 仍可交付', async () => {
+    const catalog = await arrange();
+    const e1 = engineUrls(1);
+    await expectHealthyDelivery(catalog, [
+      { url: e1.search, at: 0 },
+      { url: e1.authorSearch, at: 350 },
+      { url: e1.authorSearch, at: 700 },
+    ], 700);
+    // 两次真实 503 进入主机硬失败记忆；200 空页不会产生这个结果。
+    expect((await import('./source-host-health')).isHostSuspect('e1.test')).toBe(true);
+  });
+
+  it('作者查询先返回慢 503，重试在 4s 切片到点时中止，健康 E2 继续', async () => {
+    const catalog = await arrange();
+    vi.stubEnv('SOURCE_FAILOVER_SLICE_MS', '4000');
+    const e1 = engineUrls(1);
+    headerDelay.set(e1.authorSearch, 2_500);
+    // 第一次作者请求 350→2850 返回真实 503；重试 2850→5350 原定也返回 503，
+    // 但标题成功后的 4s 切片在 4000 中止它。失败不顺延切片，也不截断兄弟源。
+    await expectHealthyDelivery(catalog, [
+      { url: e1.search, at: 0 },
+      { url: e1.authorSearch, at: 350 },
+      { url: e1.authorSearch, at: 2_850 },
+    ], 4_000);
+  });
+
+  it('作者重定向后返回 503，重试到单源第 6 个物理请求即停，健康 E2 保留预算', async () => {
+    const catalog = await arrange();
+    const e1 = engineUrls(1);
+    const firstHop = 'https://e1.test/author-hop-1';
+    const lastHop = 'https://e1.test/author-hop-2';
+    pages.set(e1.authorSearch, { status: 302, headers: { location: firstHop } });
+    pages.set(firstHop, { status: 302, headers: { location: lastHop } });
+    pages.set(lastHop, { status: 503 });
+    // 标题 1 点 + 首次作者链 3 点 + 重试链前 2 点 = 单源 6 点。
+    // 重试的第三跳不得越过 L1，但兄弟 E2 的搜索/详情/目录/正文仍完整可用。
+    await expectHealthyDelivery(catalog, [
+      { url: e1.search, at: 0 },
+      { url: e1.authorSearch, at: 350 },
+      { url: firstHop, at: 700 },
+      { url: lastHop, at: 1_050 },
+      { url: e1.authorSearch, at: 1_400 },
+      { url: firstHop, at: 1_750 },
+    ], 1_750);
   });
 });
 
@@ -276,14 +376,29 @@ describe('41-M1.2b T:suspect 的末位他源不享末位放宽(修 W3)', () => {
     requested = [];
     return catalog;
   };
-  // 时间线(虚拟毫秒,t0 = 读章开始;节流槽按 host 分桶,异站互不等待,41-fanout P1-C):cur 本章 0 → E1 搜索 0
-  // → E2 在 0 起跑(切片起点),首个请求 0,8s 总超时 ⇒ 8000 超时、立即重试(同站槽 350 早已过)
+  // 时间线(虚拟毫秒,t0 = 读章开始;节流槽按 host 分桶,异站互不等待):cur 本章 0 → E1 标题搜索 0
+  // → E1 作者搜索 350(200 空页，不重试)→ E2 在 350 起跑(切片起点)，8350 超时后立即重试。
   // → 原源兜底:搜索 → 详情 → 正文,同站各隔 350。
+  const E2_SLICE_AT = 350;
   const readTimed = async (catalog: SourceCatalog) => {
     const t0 = Date.now();
-    const { value: part, finishedAt } = await drive(service.readSourceChapter(catalog.version, 0, context()));
+    const ctx = context();
+    const { value: part, finishedAt } = await drive(service.readSourceChapter(catalog.version, 0, ctx));
     expect(part).toMatchObject({ text: '同站新链接正文', servedFrom: cur.name });
     const at = (url: string) => requested.filter((item) => item.url === url).map((item) => item.at - t0);
+    const fallbackAt = at(curRelisted.search)[0];
+    expect(requestTimeline(t0)).toEqual([
+      { url: curChapter, at: 0 },
+      { url: engineUrls(1).search, at: 0 },
+      { url: engineUrls(1).authorSearch, at: 350 },
+      { url: engineUrls(2).search, at: E2_SLICE_AT },
+      { url: engineUrls(2).search, at: E2_SLICE_AT + 8_000 },
+      { url: curRelisted.search, at: fallbackAt },
+      { url: curRelisted.detail, at: fallbackAt + 350 },
+      { url: curRelisted.chapter, at: fallbackAt + 700 },
+    ]);
+    expect(ctx.requests).toBe(8);
+    expect(ctx.signal.aborted).toBe(false);
     return { elapsedMs: finishedAt - t0, e2: at(engineUrls(2).search), fallback: at(curRelisted.search) };
   };
 
@@ -294,24 +409,23 @@ describe('41-M1.2b T:suspect 的末位他源不享末位放宽(修 W3)', () => {
     health.recordHostFailure('e2.test', 'timeout');
     expect(health.isHostSuspect('e2.test')).toBe(true);
     const { elapsedMs, e2, fallback } = await readTimed(catalog);
-    expect(e2).toEqual([0, 8_000]); // 第 1 次跑满 8s 超时;第 2 次在切片到点(起跑 0 + 12s)被中止
-    expect(fallback).toEqual([12_000]);
-    expect(elapsedMs).toBe(12_700); // 与 W3 复现的 cedf71f 时间线同形(当时全局单槽 13.05s,异站不再互等少 350ms)
+    expect(e2).toEqual([E2_SLICE_AT, E2_SLICE_AT + 8_000]); // 第 2 次在 E2 起跑 +12s 被中止。
+    expect(fallback).toEqual([E2_SLICE_AT + 12_000]);
+    expect(elapsedMs).toBe(E2_SLICE_AT + 12_700);
   });
 
   it('T② 对照:末位他源 E2 健康 ⇒ 仍享末位放宽,两次 8s 卡顿都跑满才轮到原源', async () => {
     const catalog = await arrange();
     const { elapsedMs, e2, fallback } = await readTimed(catalog);
-    expect(e2).toEqual([0, 8_000]);
-    expect(fallback).toEqual([16_000]); // 切片 = 余量 − 8s(留给原源)≈ 37s,两次 8s 超时都跑满
-    expect(elapsedMs).toBe(16_700);
+    expect(e2).toEqual([E2_SLICE_AT, E2_SLICE_AT + 8_000]);
+    expect(fallback).toEqual([E2_SLICE_AT + 16_000]); // 两次 8s 超时都跑满，原源仍有保留预算。
+    expect(elapsedMs).toBe(E2_SLICE_AT + 16_700);
   });
 
   // 窗口过期边界 × 末位放宽：E2 的两次硬失败都记在 F,把读章起点拨到「E2 起跑(切片取定)那一刻」恰落在窗口终点
-  // 前 1ms / 终点上。isLast 只在 E2 起跑时(读章 +0,异站不等节流槽)查一次记忆;判定是 now − lastFailureAt < 窗口(严格小于),
+  // 前 1ms / 终点上。isLast 只在 E2 起跑时(读章 +350)查一次记忆;判定是 now − lastFailureAt < 窗口(严格小于),
   // 所以终点前 1ms 仍是 suspect、恰在终点已过期。这里故意不先断言 isHostSuspect:边界要由端到端时间线本身分辨出来
   // (比较符改成 <= 或窗口减 1ms,红的是下面的毫秒断言)。
-  const E2_SLICE_AT = 0;
   const seedE2FailuresAt = async () => {
     const health = await import('./source-host-health');
     const failedAt = Date.now();
@@ -326,9 +440,9 @@ describe('41-M1.2b T:suspect 的末位他源不享末位放宽(修 W3)', () => {
     const sliceAt = failedAt + windowMs - 1;
     vi.setSystemTime(sliceAt - E2_SLICE_AT);
     const { elapsedMs, e2, fallback } = await readTimed(catalog);
-    expect(e2).toEqual([0, 8_000]);
-    expect(fallback).toEqual([12_000]);
-    expect(elapsedMs).toBe(12_700);
+    expect(e2).toEqual([E2_SLICE_AT, E2_SLICE_AT + 8_000]);
+    expect(fallback).toEqual([E2_SLICE_AT + 12_000]);
+    expect(elapsedMs).toBe(E2_SLICE_AT + 12_700);
   });
 
   it('T④ 失败记在 F,E2 起跑恰在窗口终点 ⇒ 已过期(严格小于),恢复末位放宽(同 T②)', async () => {
@@ -337,9 +451,9 @@ describe('41-M1.2b T:suspect 的末位他源不享末位放宽(修 W3)', () => {
     const sliceAt = failedAt + windowMs;
     vi.setSystemTime(sliceAt - E2_SLICE_AT);
     const { elapsedMs, e2, fallback } = await readTimed(catalog);
-    expect(e2).toEqual([0, 8_000]);
-    expect(fallback).toEqual([16_000]);
-    expect(elapsedMs).toBe(16_700);
+    expect(e2).toEqual([E2_SLICE_AT, E2_SLICE_AT + 8_000]);
+    expect(fallback).toEqual([E2_SLICE_AT + 16_000]);
+    expect(elapsedMs).toBe(E2_SLICE_AT + 16_700);
   });
 });
 
