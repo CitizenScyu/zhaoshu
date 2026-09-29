@@ -197,3 +197,73 @@ describe('ShuyuanTab 探测状态展示', () => {
     expect(hint).toBeTruthy();
   });
 });
+describe('ShuyuanTab 筛选切换后的统计标签(count-label53)', () => {
+  // ShuyuanStatsPage.total 是双语义字段:无筛选时=全局总数,带 filter 时=该筛选的分页
+  // 条数。53 独立脚本已复现:切到 disabled 后 API 返回 total=10(筛选数),旧实现拿它
+  // 画「全部」标签,全局 100 被顶成 10。修法:全局数用 enabled+disabled 推回,
+  // 页脚/总页数仍用筛选 total——同一份分页响应两种口径并存。
+  function filterPage(filter: string, filteredTotal: number) {
+    // 真实 API 形状:counts 段始终是全局聚合(100/90/10),只有 total 被换成筛选数。
+    return statsPage({
+      filter, total: filteredTotal, totalPages: Math.max(1, Math.ceil(filteredTotal / 20)),
+      page: 1,
+    });
+  }
+
+  it('切到 disabled 后「全部」仍是全局 100(enabled+disabled),页脚显示该筛选的 10', async () => {
+    const apiFetch = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes('filter=disabled')) return json(filterPage('disabled', 10));
+      return json(filterPage('all', 100));
+    });
+    renderTab(apiFetch);
+    const user = userEvent.setup();
+    await screen.findByRole('button', { name: textIs('全部 100') });
+
+    await user.click(screen.getByRole('button', { name: textIs('已禁用 10') }));
+
+    // 新视图(disabled)的响应兑现后:「全部」保持全局 100,其余卡仍取各自字段。
+    await waitFor(() => expect(screen.getByText(textIs('共 10 条,第 1 / 1 页'))).toBeTruthy());
+    expect(screen.getByRole('button', { name: textIs('全部 100') })).toBeTruthy();
+    expect(screen.getByRole('button', { name: textIs('已启用 90') })).toBeTruthy();
+    expect(screen.getByRole('button', { name: textIs('已禁用 10') })).toBeTruthy();
+    // 页脚/总页数用筛选 total(10 ⇒ 1 页),不用全局数。
+    expect(screen.queryByText(textIs('共 100 条,第 1 / 5 页'))).toBeNull();
+  });
+
+  it('切到 enabled 后「全部」仍是全局数;回到 all 视图页脚回到全局分页', async () => {
+    const apiFetch = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes('filter=enabled')) return json(filterPage('enabled', 90));
+      return json(filterPage('all', 100));
+    });
+    renderTab(apiFetch);
+    const user = userEvent.setup();
+    await screen.findByRole('button', { name: textIs('全部 100') });
+
+    await user.click(screen.getByRole('button', { name: textIs('已启用 90') }));
+    await waitFor(() => expect(screen.getByText(textIs('共 90 条,第 1 / 5 页'))).toBeTruthy());
+    // 「全部」没被 enabled 筛选的 total=90 顶掉。
+    expect(screen.getByRole('button', { name: textIs('全部 100') })).toBeTruthy();
+
+    await user.click(screen.getByRole('button', { name: textIs('全部 100') }));
+    await waitFor(() => expect(screen.getByText(textIs('共 100 条,第 1 / 5 页'))).toBeTruthy());
+  });
+
+  it('真实统计变化时标签跟着新快照走,不缓存首屏总数', async () => {
+    // 第一屏全局 100;重载后全局变 120(enabled 108/disabled 12)——「全部」应显示 120。
+    let call = 0;
+    const apiFetch = vi.fn(async () => {
+      call += 1;
+      if (call === 1) return json(filterPage('all', 100));
+      return json(statsPage({ total: 120, enabled: 108, disabled: 12, totalPages: 6 }));
+    });
+    renderTab(apiFetch);
+    const user = userEvent.setup();
+    await screen.findByRole('button', { name: textIs('全部 100') });
+
+    await user.click(screen.getByRole('button', { name: '刷新合集' }));
+    await waitFor(() => expect(screen.getByRole('button', { name: textIs('全部 120') })).toBeTruthy());
+    expect(screen.getByText(textIs('共 120 条,第 1 / 6 页'))).toBeTruthy();
+  });
+});

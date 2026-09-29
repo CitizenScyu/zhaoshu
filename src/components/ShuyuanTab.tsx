@@ -204,7 +204,12 @@ export default function ShuyuanTab() {
                 style={value === filter ? { borderColor: 'var(--ink)', color: 'var(--ink)', fontWeight: 600 } : undefined}
                 onClick={() => { setFilter(value); setPage(1); }}
               >
-                {filterLabel(value)} {stats[FILTER_COUNT_KEYS[value]]}
+                {/* 「全部」不能读 stats.total:分页响应把它复用为**当前筛选**的条数
+                    (ShuyuanStatsPage 同名字段两种语义),切到 disabled 后「全部」会被顶成 10。
+                    全局数用 enabled+disabled 推回——同一聚合快照里这两个是启停互补的
+                    全局计数,任何筛选下都原样带回;页脚/总页数仍用筛选 total。
+                    每次加载都是新快照,统计变化自然更新,不存在缓存首屏。 */}
+                {filterLabel(value)} {value === 'all' ? stats.enabled + stats.disabled : stats[FILTER_COUNT_KEYS[value]]}
               </button>
             ))}
           </div>
