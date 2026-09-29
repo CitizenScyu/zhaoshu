@@ -144,4 +144,47 @@ maybe('真实 PostgreSQL：书架/推荐/库存行级语义（深审残留 A R01
     const hits = await run(exactLibraryBooksForUserQuery(queryTag, 6, '《《嵌套审查》》', '审查作者'));
     expect(hits.map((row) => row.title)).toContain('《《嵌套审查》》');
   });
+
+  it('read task lookup preserves normalized identity, shared latest done task, representative rows and paging', async () => {
+    const mixed = { ...item(' Mixed CASE '), author: ' Author ' };
+    const anonymous = { ...item('synthetic anonymous'), author: '' };
+    await batch(persistRecommendationsForUserQueries(queryTag, 9, 'older', [mixed]) as unknown[]);
+    await batch(persistRecommendationsForUserQueries(queryTag, 9, 'newer', [mixed, anonymous, item('synthetic missing')]) as unknown[]);
+    const [container] = (await pg.query("INSERT INTO labeled_books(title,author) VALUES ('synthetic-task-container','synthetic') RETURNING id")).rows;
+    const insertTask = async (title: string, author: string, status: string, userId: number) => {
+      const [task] = (await pg.query('INSERT INTO download_tasks(user_id,book_id,title,author,status) VALUES ($1,$2,$3,$4,$5) RETURNING id',
+        [userId, container.id, title, author, status])).rows;
+      return task.id;
+    };
+    await insertTask('mixed case', 'author', 'done', 9);
+    const latest = await insertTask(' MIXED CASE ', ' AUTHOR ', 'done', 10);
+    await insertTask('mixed case', 'author', 'pending', 9);
+    await insertTask('synthetic anonymous', '   ', 'done', 9);
+    const anonymousLatest = await insertTask('synthetic anonymous', '佚名', 'done', 10);
+    const rows = await run(recommendationsForUserQuery(queryTag, 9, true));
+    expect(rows).toHaveLength(3);
+    expect(rows.find(row => row.title === mixed.title)).toMatchObject({ query: 'newer', read_task_id: latest });
+    expect(rows.find(row => row.title === anonymous.title)?.read_task_id).toBe(anonymousLatest);
+    expect(rows.find(row => row.title === 'synthetic missing')?.read_task_id).toBeNull();
+    const hidden = recommendationsForUserQuery(queryTag, 9, false) as unknown as Statement;
+    expect(hidden.text).not.toContain('download_tasks');
+    expect((await run(hidden)).map(row => row.read_task_id)).toEqual([null, null, null]);
+    const page = await run(recommendationsForUserQuery(queryTag, 9, true, { limit: 1, offset: 1 }));
+    expect(page).toEqual(rows.slice(1, 2));
+    const search = await run(recommendationsForUserQuery(queryTag, 9, true, { q: 'mixed case' }));
+    expect(search).toHaveLength(1); expect(search[0].read_task_id).toBe(latest);
+    // NULL is checked in a VALUES expression only; production NOT NULL constraints stay intact.
+    const nullAuthor = await pg.query(`WITH tasks(id, title, author, status) AS (
+      VALUES (1, 'synthetic', NULL::text, 'done'), (2, 'synthetic', '佚名', 'done'),
+             (3, 'synthetic', '', 'pending')
+    ), book(title, author) AS (VALUES ('synthetic', NULL::text))
+    SELECT (SELECT id FROM tasks t WHERE t.status='done' AND lower(btrim(t.title))=lower(btrim(b.title))
+      AND lower(COALESCE(NULLIF(btrim(t.author),''),'佚名'))=lower(COALESCE(NULLIF(btrim(b.author),''),'佚名'))
+      ORDER BY id DESC LIMIT 1) AS old_id, g.id AS grouped_id
+    FROM book b LEFT JOIN (
+      SELECT lower(btrim(title)) AS title_key, lower(COALESCE(NULLIF(btrim(author),''),'佚名')) AS author_key, max(id) AS id
+      FROM tasks WHERE status='done' GROUP BY 1,2
+    ) g ON g.title_key=lower(btrim(b.title)) AND g.author_key=lower(COALESCE(NULLIF(btrim(b.author),''),'佚名'))`);
+    expect(nullAuthor.rows).toEqual([{ old_id: 2, grouped_id: 2 }]);
+  });
 });

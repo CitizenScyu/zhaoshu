@@ -64,10 +64,15 @@ export function recommendationsForUserQuery(
   const search = keyword
     ? sql`AND (b.title ILIKE ${`%${escapeLike(keyword)}%`} ESCAPE '\\' OR b.author ILIKE ${`%${escapeLike(keyword)}%`} ESCAPE '\\')`
     : sql``;
-  const readTask = canRead ? sql`(SELECT dt.id FROM download_tasks dt
-    WHERE lower(btrim(dt.title)) = lower(btrim(b.title))
-      AND lower(COALESCE(NULLIF(btrim(dt.author), ''), '佚名')) = lower(COALESCE(NULLIF(btrim(b.author), ''), '佚名'))
-      AND dt.status = 'done' ORDER BY dt.id DESC LIMIT 1)` : sql`NULL::integer`;
+  const readTask = canRead ? sql`dt.read_task_id` : sql`NULL::integer`;
+  const readTaskJoin = canRead ? sql`LEFT JOIN (
+      SELECT lower(btrim(title)) AS title_key,
+        lower(COALESCE(NULLIF(btrim(author), ''), '佚名')) AS author_key,
+        max(id) AS read_task_id
+      FROM download_tasks WHERE status = 'done'
+      GROUP BY lower(btrim(title)), lower(COALESCE(NULLIF(btrim(author), ''), '佚名'))
+    ) dt ON dt.title_key = lower(btrim(b.title))
+      AND dt.author_key = lower(COALESCE(NULLIF(btrim(b.author), ''), '佚名'))` : sql``;
   return sql`SELECT * FROM (
       SELECT DISTINCT ON (r.book_id)
         r.id, r.book_id, r.query, r.match_score, r.hit_likes, r.risks, r.reason, r.status, r.created_at,
@@ -78,6 +83,7 @@ export function recommendationsForUserQuery(
         COALESCE((SELECT f.id FROM feedback f WHERE f.book_id = r.book_id AND f.user_id = ${userId}
           ORDER BY f.id DESC LIMIT 1), 0) AS feedback_id
       FROM recommendations r JOIN books b ON b.id = r.book_id
+      ${readTaskJoin}
       WHERE r.user_id = ${userId} ${search}
       ORDER BY r.book_id, r.created_at DESC, r.match_score DESC, r.id DESC
     ) rep
