@@ -4,8 +4,8 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const mocks = vi.hoisted(() => ({ apiFetch: vi.fn() }));
 
-// 本仓 vitest 只有 node 环境、没有 jsdom（vitest.config.ts）。组件测试走
-// renderToStaticMarkup + 模块桩这条既有先例（AuthForm.test.ts / LoginCard.test.ts）。
+// 本文件用 node 环境的 renderToStaticMarkup + 模块桩验证首屏。
+// 异步保存与代际交互另见 jsdom 套件 FeedbackForm.generation.test.tsx。
 // FeedbackForm 的取数在 useEffect 里，SSR 不执行；能测的是「拿到 props 后的首屏形态」，
 // 也就是线上快照已知 / 未知这两条分支——它们恰好决定了用户看到的是编辑器还是重读入口。
 vi.mock('next/link', () => ({ default: 'a' }));

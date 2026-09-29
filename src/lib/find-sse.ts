@@ -3,8 +3,8 @@
  * 后端下行是**真 SSE**：事件形如 `data: <json>\n\n`，phase/progress 为实时帧、
  * result 为结束帧、error 为错误帧（带可识别 code）。
  *
- * 抽成不依赖 DOM 的模块才能在 node 环境用假 Response 驱动真实消费路径——
- * 本仓 vitest 只收 *.test.ts 且没有 jsdom，写在 FindTab 的 JSX/闭包里的判定测不到。
+ * 独立模块可在 node 环境用合成 Response 验证真实消费路径；
+ * FindTab 的请求编排另由 jsdom 组件场景验证。
  */
 import { mergeAbortSignals, timeoutSignal } from '@/lib/abort-merge';
 import { isRecord } from '@/lib/sanitize';

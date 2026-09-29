@@ -4,8 +4,8 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const mocks = vi.hoisted(() => ({ apiFetch: vi.fn(), owner: {} as Record<string, unknown> }));
 
-// 本仓 vitest 只收 *.test.ts、environment 是 node（vitest.config.ts），组件测试走
-// renderToStaticMarkup + 模块桩这条既有先例（AuthForm.test.ts / LoginCard.test.ts）。
+// 本文件用 node 环境的 renderToStaticMarkup + 模块桩验证首屏。
+// 键盘、请求时序和代际交互由相邻 FindTab*.test.tsx 的 jsdom 用例验证。
 vi.mock('next/link', () => ({ default: 'a' }));
 vi.mock('@/components/OwnerProvider', () => ({ useOwner: () => mocks.owner }));
 

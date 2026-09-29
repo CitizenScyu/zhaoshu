@@ -3,7 +3,7 @@
  * - 部署总闸（AUTH_ACCOUNTS_ENABLED，前端表现为 accountsEnabled）：决定本站有没有账号模式；
  * - 运行时注册开关（admin 的 membersEnabled + registrationMode，经 /api/auth/registration 出三态）；
  * - 当前表单模式（用户名密码 / 管理员口令）。
- * 抽成不依赖 DOM 的模块才能在 node 环境直接测——本仓 vitest 只收 *.test.ts 且没有 jsdom。
+ * 保持不依赖 DOM，便于在 node 环境直接验证可见性判定。
  *
  * 与 src/lib/invite-codes.ts 的同名类型重复一份：那边 import 了 node:crypto，不能进客户端包。
  */

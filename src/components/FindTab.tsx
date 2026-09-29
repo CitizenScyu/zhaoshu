@@ -11,8 +11,7 @@ import { EMPTY_HISTORY, historyKeyFor, historySnapshot, rememberQuery, subscribe
 import { shouldRememberQuery } from '@/lib/find-retention';
 import { fetchExactSearch } from '@/lib/exact-search-request';
 import { createElapsedTicker, recallProgressSuffix, retryLabel, retryStep, showRetry, type FindPhase, type FindStep } from '@/lib/find-progress';
-// SSE 消费与落定判定放在纯模块里：本仓 vitest 只收 *.test.ts 且没有 jsdom，写在 JSX 闭包里的
-// 超时/落定判定测不到（见 find-sse.test.ts）。
+// SSE 消费与落定判定在纯模块中用 node 测试；组件编排由相邻 jsdom 套件验证。
 import { FIND_FETCH_TIMEOUT_MS, fetchFindResult, persistWarning, vetoedBooks, zeroResultNote, type SseEvent, type VetoedBook } from '@/lib/find-sse';
 // 精确找书（task-77）：模式、状态机、文案全部在纯模块里，本文件只做 JSX 与请求编排。
 import {
@@ -458,7 +457,7 @@ export function VetoedList({ books }: { books: VetoedBook[] }) {
 }
 
 // 精确找书面板（task-77）。状态机、文案选择、响应收窄全部来自 @/lib/find-exact——
-// 本仓 vitest 没有 jsdom，写在 JSX 里的判定测不到。
+// 纯判定便于单独验证，实际交互与异步请求另由 jsdom 组件测试覆盖。
 function ExactSearchSection({ onFallback }: { onFallback: (query: string) => void }) {
   const { apiFetch } = useOwner();
   const [title, setTitle] = useState('');

@@ -1,6 +1,6 @@
 /**
  * 书架视图的纯逻辑：同书折叠、按书名/作者过滤、两段式确认。
- * 抽成不依赖 DOM 的模块，才能在 node 环境直接测——本仓 vitest 只收 *.test.ts 且没有 jsdom。
+ * 保持不依赖 DOM，便于在 node 环境直接验证折叠、筛选与确认规则。
  */
 import { canonicalBookKey, normalizeBookAuthor } from './book-identity.ts';
 

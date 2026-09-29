@@ -6,8 +6,7 @@ import { partKey, useReader } from './useReader';
 import { DEFAULT_READER_SETTINGS } from '@/lib/reader-preferences';
 import type { ReaderPart } from '@/lib/reader-types';
 
-// 本仓 vitest 只有 node 环境、没有 jsdom（vitest.config.ts）：useReader 的取数、滚动、
-// 预取全部挂在 useEffect / useLayoutEffect 与 DOM 事件上，SSR 一个都不跑。
+// 本文件选择 node 环境的 SSR 验证；取数、滚动和预取依赖的 effect 与 DOM 事件不会执行。
 // 能钉的是「首屏返回值」与导出的纯函数——首屏这几个初值直接决定阅读页第一眼说什么
 // （见 ReaderClient.test.ts 的「正文未就绪」用例）。
 function readInitial() {

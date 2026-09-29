@@ -13,12 +13,10 @@ const mocks = vi.hoisted(() => ({
   readerCalls: 0,
 }));
 
-// 本仓 vitest 只有 node 环境、没有 jsdom（vitest.config.ts），组件测试走
-// renderToStaticMarkup + 模块桩这条既有先例（AuthForm.test.ts / LoginCard.test.ts）。
+// 本文件选择 node 环境的 renderToStaticMarkup + 模块桩验证渲染分支。
 // ReaderClient 的重活（取数/滚动/预取）在 useReader 里，这里把它换成受控替身，
 // 专门钉 ReaderClient 自己的分支：准入判定、失败口径、正文与页脚渲染。
-// reader.module.css 纯样式、与渲染断言无关，桩掉它以绕开本机 PostCSS/Tailwind
-// 插件链的加载问题（@alloc/quick-lru 在本机 node_modules 缺失，属环境问题）。
+// reader.module.css 不参与这些渲染断言，替身避免加载 PostCSS/Tailwind 插件链。
 vi.mock('./reader.module.css', () => ({ default: {} }));
 vi.mock('next/link', () => ({ default: 'a' }));
 vi.mock('next/navigation', () => ({ useRouter: () => ({ push: mocks.push, replace: mocks.push }) }));

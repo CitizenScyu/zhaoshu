@@ -1,6 +1,6 @@
 /**
  * 找书三步（召回/验证/重排）的纯逻辑：失败重试起点、进度文案、已耗时计时器。
- * 抽成不依赖 DOM 的模块，才能在 node 环境直接测——本仓 vitest 只收 *.test.ts 且没有 jsdom。
+ * 保持不依赖 DOM，便于在 node 环境直接验证状态与计时逻辑。
  */
 export type FindStep = 'recall' | 'verify' | 'rerank';
 

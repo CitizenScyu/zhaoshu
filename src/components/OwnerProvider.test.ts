@@ -3,10 +3,9 @@ import { renderToStaticMarkup } from 'react-dom/server';
 import { describe, expect, it } from 'vitest';
 import { OwnerProvider, useOwner } from './OwnerProvider';
 
-// 本仓 vitest 只有 node 环境、没有 jsdom（vitest.config.ts），组件只能走 renderToStaticMarkup
-// 这条既有先例（AuthForm.test.ts）。OwnerProvider 真正会变的状态全部产生在 useEffect 里，
-// SSR 不执行 effect，所以这里钉的是**首个渲染快照**与上下文契约——这两条正是所有消费
-// 组件（AuthForm/ReaderGate/ReadBookLink）做出渲染决定所依赖的东西。
+// 本文件选择 node 环境下的 renderToStaticMarkup，验证首个渲染快照与上下文契约。
+// SSR 不执行 effect，因此这里不覆盖挂载后的会话订阅和异步身份切换。
+// 需要 DOM 交互时，仓库支持以文件注释选择 jsdom 环境（见 vitest.config.ts）。
 
 function renderOwner(probe: (value: ReturnType<typeof useOwner>) => void): void {
   let seen: ReturnType<typeof useOwner> | undefined;

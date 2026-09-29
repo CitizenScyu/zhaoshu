@@ -1,9 +1,9 @@
 /**
  * 「读完了吗」反馈引导的纯逻辑：什么时候该问、问过没有、点返回时要不要接管。
- * 与 find-progress.ts 同款——不依赖 DOM，才能在本仓 node 环境（vitest 无 jsdom）直接测。
+ * 与 find-progress.ts 同款：不依赖 DOM，可在 node 环境直接验证状态判定。
  *
- * 本仓没有 jsdom / testing-library，组件级接线测不了。所以「判定 + 要不要记账」这一层
- * 全部收在这里：ReaderClient 的 handleBack 只剩三行搬运，判定逻辑改动才会被测试打到。
+ * 「判定 + 要不要记账」集中在这里，ReaderClient 只负责事件编排。
+ * 组件接线可用仓库现有的 jsdom / Testing Library 测试支持验证。
  *
  * 这里只决定「入口出不出现」；真正的提交仍然走既有的 FeedbackForm → /api/feedback，
  * 引导链路和回写画像的语义都不在本次改动范围内。

@@ -13,10 +13,9 @@ beforeEach(() => {
   vi.clearAllMocks();
 });
 
-// 本仓 vitest 只有 node 环境、没有 jsdom（vitest.config.ts），useEffect 不执行，
-// 而 ShelfTab 的一切（分组、两段式确认、带原因的移除）都发生在 `items` 到位之后
-// ——首屏的 `items === null && loading` 早返回把后面整棵树挡在 SSR 之外。
-// 因此这里只钉「首屏不能是别的东西」这条底线，其余留作报告里的已知缺口。
+// 本文件选择 SSR 首屏验证，useEffect 不执行；items 尚未加载时只渲染占位。
+// 分组和移除交互发生在加载之后，另由 ShelfTab.remove.test.tsx 与
+// ShelfTab.operation-lifecycle.test.tsx 的 jsdom 场景验证。
 describe('书架的加载态', () => {
   it('首屏是加载占位，不抢先渲染空书架或分组', () => {
     const html = renderToStaticMarkup(createElement(ShelfTab));
