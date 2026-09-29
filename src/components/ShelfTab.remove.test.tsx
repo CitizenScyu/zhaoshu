@@ -2,8 +2,10 @@
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-const mocks = vi.hoisted(() => ({ apiFetch: vi.fn() }));
-vi.mock('@/components/OwnerProvider', () => ({ useOwner: () => ({ apiFetch: mocks.apiFetch }) }));
+const mocks = vi.hoisted(() => ({ apiFetch: vi.fn(), isCurrentSession: (id: number) => id === 1 }));
+vi.mock('@/components/OwnerProvider', () => ({ useOwner: () => ({
+  apiFetch: mocks.apiFetch, sessionId: 1, isCurrentSession: mocks.isCurrentSession,
+}) }));
 vi.mock('@/components/ReadBookLink', () => ({ default: () => null }));
 vi.mock('@/components/FeedbackForm', () => ({ default: () => null }));
 import ShelfTab from './ShelfTab';

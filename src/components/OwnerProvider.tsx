@@ -17,6 +17,8 @@ interface OwnerContextValue {
   expired: boolean;
   /** 前端请求代际；数据库 session token 永远不在这里。 */
   sessionId: number;
+  /** 同步核对真实前端代际，不等待 React 提交新快照；不替代服务端鉴权。 */
+  isCurrentSession: (expectedId: number) => boolean;
   sessionOnly: boolean;
   setSessionOnly: (value: boolean) => void;
   submitToken: (draft: string) => Promise<void>;
@@ -126,6 +128,7 @@ export function OwnerProvider({ children }: { children: React.ReactNode }) {
     if (typeof userId === 'number' && userId > 0) forgetHistory(userId);
   }, [controller]);
   const refresh = useCallback(() => controller.refresh('visible'), [controller]);
+  const isCurrentSession = useCallback((expectedId: number) => controller.session.id === expectedId, [controller]);
   const apiFetch = useCallback(
     (input: RequestInfo | URL, init: RequestInit = {}) => controller.fetch(input, init),
     [controller],
@@ -146,6 +149,7 @@ export function OwnerProvider({ children }: { children: React.ReactNode }) {
       accountsEnabled: snapshot.accountsEnabled,
       expired: snapshot.expired,
       sessionId: snapshot.generation,
+      isCurrentSession,
       sessionOnly: snapshot.sessionOnly,
       setSessionOnly,
       submitToken,
@@ -155,7 +159,7 @@ export function OwnerProvider({ children }: { children: React.ReactNode }) {
       apiFetch,
       can: (permission: Permission) => permissions[permission],
     };
-  }, [snapshot, setSessionOnly, submitToken, login, logout, refresh, apiFetch]);
+  }, [snapshot, setSessionOnly, submitToken, login, logout, refresh, apiFetch, isCurrentSession]);
 
   return <OwnerContext.Provider value={value}>{children}</OwnerContext.Provider>;
 }

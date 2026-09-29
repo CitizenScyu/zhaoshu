@@ -60,7 +60,7 @@ describe('OwnerProvider 上下文契约', () => {
   // 消费组件一律直接调用这些字段；少一个就会在运行期炸在别人的组件里。
   it('对外暴露的操作面齐全且可调用', () => {
     renderOwner((owner) => {
-      for (const key of ['setSessionOnly', 'submitToken', 'login', 'logout', 'refresh', 'apiFetch', 'can'] as const) {
+      for (const key of ['setSessionOnly', 'submitToken', 'login', 'logout', 'refresh', 'apiFetch', 'can', 'isCurrentSession'] as const) {
         expect(typeof owner[key], `${key} 必须是函数`).toBe('function');
       }
     });

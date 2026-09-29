@@ -40,7 +40,7 @@ const GROUPS: { key: ShelfStatus; label: string; color: string }[] = [
 ];
 
 export default function ShelfTab() {
-  const { apiFetch } = useOwner();
+  const { apiFetch, sessionId, isCurrentSession } = useOwner();
   const [items, setItems] = useState<ShelfItem[] | null>(null);
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(true);
@@ -69,20 +69,24 @@ export default function ShelfTab() {
   const busy = updating || loading || removing || clearing;
 
   const load = useCallback(async (signal?: AbortSignal) => {
+    const current = () => !signal?.aborted && isCurrentSession(sessionId);
+    if (!current()) return;
     setLoading(true);
     setError('');
     try {
       const res = await apiFetch('/api/recommendations', { signal });
+      if (!current()) return;
       const data = await res.json();
+      if (!current()) return;
       if (!res.ok) throw new Error(data.error || '书架加载失败');
       setItems(data.recommendations);
     } catch (error) {
-      if (signal?.aborted) return;
+      if (!current()) return;
       setError(error instanceof Error ? error.message : '书架加载失败');
     } finally {
-      if (!signal?.aborted) setLoading(false);
+      if (current()) setLoading(false);
     }
-  }, [apiFetch]);
+  }, [apiFetch, sessionId, isCurrentSession]);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -100,6 +104,7 @@ export default function ShelfTab() {
   // 两段式确认：第一次点只武装，第二次点同一目标才放行；3 秒无后续点击自动解除。
   // 换目标只重新武装当前目标，不会顺手放行上一个目标。
   function armOrFire(target: string): boolean {
+    if (!isCurrentSession(sessionId)) return false;
     const step = nextConfirm(armed, target);
     setArmed(step.armed);
     if (!step.fire) {
@@ -114,6 +119,7 @@ export default function ShelfTab() {
   }
 
   function askRemove(item: ShelfItem) {
+    if (!isCurrentSession(sessionId)) return;
     const target = removeTarget(item.id);
     // T66：第一次点「✕ 移除」时顺带给一个选填的一句话入口（已表过态且还没写原因的书）。
     // 换目标就换草稿，不会把上一本的输入带过来。
@@ -126,8 +132,8 @@ export default function ShelfTab() {
   }
 
   async function doRemove(item: ShelfItem) {
+    if (removing || clearing || operationAbort.current || !isCurrentSession(sessionId)) return;
     setArmed(null);
-    if (removing) return;
     setRemoving(true);
     setError('');
     setFeedbackMessage('');
@@ -137,7 +143,7 @@ export default function ShelfTab() {
     // 本操作全链路持同一取消器;重试是全新操作,领新的 controller。
     const controller = new AbortController();
     operationAbort.current = controller;
-    const current = () => !controller.signal.aborted;
+    const current = () => !controller.signal.aborted && isCurrentSession(sessionId);
     try {
       if (draft && !noteIsSaved) {
         // 先存原因再移除：反馈挂在书上而不是推荐行上，移除后画像仍能用上这一句。
@@ -151,6 +157,7 @@ export default function ShelfTab() {
           }),
           signal: controller.signal,
         });
+        if (!current()) return;
         const data = await saved.json().catch(() => ({}));
         if (!current()) return;
         if (!saved.ok || data.ok !== true) {
@@ -161,6 +168,7 @@ export default function ShelfTab() {
       }
       // F05：按书移除（book_id），服务端删除该用户这本书的全部推荐行；不再传单条推荐 id。
       const res = await apiFetch(`/api/shelf?bookId=${item.book_id}`, { method: 'DELETE', signal: controller.signal });
+      if (!current()) return;
       const data = await res.json().catch(() => ({}));
       if (!current()) return;
       // 删除已提交但响应丢失，或另一页已移除时，目标已经达成；刷新以恢复本地视图。
@@ -182,16 +190,17 @@ export default function ShelfTab() {
   }
 
   async function doClearNew() {
-    if (clearing || removing) return;
+    if (clearing || removing || operationAbort.current || !isCurrentSession(sessionId)) return;
     setClearing(true);
     setError('');
     setFeedbackMessage('');
     // 与 doRemove 同一套全链路取消器:清理→重载是一个动作,离页即作废。
     const controller = new AbortController();
     operationAbort.current = controller;
-    const current = () => !controller.signal.aborted;
+    const current = () => !controller.signal.aborted && isCurrentSession(sessionId);
     try {
       const res = await apiFetch('/api/shelf/unprocessed', { method: 'DELETE', signal: controller.signal });
+      if (!current()) return;
       const data = await res.json().catch(() => ({}));
       if (!current()) return;
       if (!res.ok) throw new Error(data.error || '清理失败');
@@ -429,6 +438,7 @@ export default function ShelfTab() {
                       clearInitially={editing.clear}
                       onBusyChange={setUpdating}
                       onSaved={(note, profileStatus) => {
+                        if (!isCurrentSession(sessionId)) return;
                         setItems((current) => current?.map((entry) => entry.id === it.id ? { ...entry, status: editing.status, note } : entry) ?? null);
                         setEditing(null);
                         setFeedbackMessage(`「${it.title}」反馈已记录${feedbackProfileUpdateMessage(profileStatus)}`);

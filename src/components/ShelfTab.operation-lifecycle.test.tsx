@@ -7,8 +7,14 @@
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-const mocks = vi.hoisted(() => ({ apiFetch: vi.fn() }));
-vi.mock('@/components/OwnerProvider', () => ({ useOwner: () => ({ apiFetch: mocks.apiFetch }) }));
+const mocks = vi.hoisted(() => {
+  const state = { apiFetch: vi.fn(), generation: 1, isCurrentSession: (id: number): boolean => id === state.generation };
+  return state;
+});
+vi.mock('@/components/OwnerProvider', () => ({ useOwner: () => ({
+  apiFetch: mocks.apiFetch, sessionId: mocks.generation,
+  isCurrentSession: mocks.isCurrentSession,
+}) }));
 vi.mock('@/components/ReadBookLink', () => ({ default: () => null }));
 vi.mock('@/components/FeedbackForm', () => ({ default: () => null }));
 import ShelfTab from './ShelfTab';
@@ -75,7 +81,7 @@ async function armRemovalWithNote() {
   await screen.findByRole('textbox', { name: /^移出前记一句/ });
 }
 
-beforeEach(() => { vi.resetAllMocks(); });
+beforeEach(() => { vi.resetAllMocks(); mocks.generation = 1; });
 afterEach(() => { cleanup(); });
 
 async function fillReason() {
@@ -83,6 +89,31 @@ async function fillReason() {
 }
 
 describe('移除链路:反馈保存→删除→重载', () => {
+  it('真实代际已经变化但组件尚未重挂，旧反馈响应不能续发删除', async () => {
+    const api = makeApi();
+    await armRemovalWithNote();
+    fillReason();
+    fireEvent.click(screen.getByRole('button', { name: '再次点击确认将合成测试书移出书架' }));
+    await waitFor(() => expect(api.calls.filter((call) => call.method === 'POST')).toHaveLength(1));
+    // 只改变同步会话状态，刻意不rerender/unmount，模拟Provider提交前的窗口。
+    mocks.generation += 1;
+    api.currentUser = 3;
+    await act(async () => { api.feedbackBody.resolve({ ok: true }); });
+    expect(api.deletes).toEqual([]);
+    expect(api.calls.filter((call) => call.method === 'GET')).toHaveLength(1);
+  });
+
+  it('旧页面确认按钮在新代际开始后不再启动写入', async () => {
+    const api = makeApi();
+    await armRemovalWithNote();
+    fillReason();
+    mocks.generation += 1;
+    api.currentUser = 3;
+    fireEvent.click(screen.getByRole('button', { name: '再次点击确认将合成测试书移出书架' }));
+    await act(async () => {});
+    expect(api.calls.filter((call) => call.method !== 'GET')).toEqual([]);
+  });
+
   it('反馈JSON等待期离页并切换用户:迟到兑现不再以新用户发DELETE、不拉新列表,POST signal已中止', async () => {
     const api = makeApi();
     await armRemovalWithNote();
