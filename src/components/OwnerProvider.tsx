@@ -31,7 +31,7 @@ interface OwnerContextValue {
 
 const OwnerContext = createContext<OwnerContextValue | null>(null);
 const STORAGE_KEY = 'novel-finder-owner-token';
-// 跨标签回退信号键：只写时间戳，不含任何凭据。
+// 跨标签回退信号键：只写非秘密通知标记，不含任何凭据。
 const AUTH_SIGNAL_KEY = 'novel-finder-auth-signal';
 const AUTH_CHANNEL_NAME = 'novel-finder-auth';
 
@@ -67,6 +67,9 @@ const LEGACY_STORE: LegacyTokenStore = {
 function createAuthNotifier(onExternalChange: () => void): { notify: () => void; dispose: () => void } {
   if (typeof window === 'undefined') return { notify: () => {}, dispose: () => {} };
   const channel = typeof BroadcastChannel === 'function' ? new BroadcastChannel(AUTH_CHANNEL_NAME) : null;
+  // 只作唤醒标记，不含身份或凭据；同一时钟刻度的连续变化也必须产生不同 storage 值。
+  const instance = Math.random().toString(36).slice(2);
+  let sequence = 0;
   const onMessage = () => onExternalChange();
   const onStorage = (event: StorageEvent) => {
     if (event.key !== null && event.key !== AUTH_SIGNAL_KEY) return;
@@ -80,7 +83,7 @@ function createAuthNotifier(onExternalChange: () => void): { notify: () => void;
     notify: () => {
       try { channel?.postMessage({ type: 'auth-changed' }); } catch { /* 通道已关闭 */ }
       if (!channel) {
-        try { window.localStorage.setItem(AUTH_SIGNAL_KEY, String(Date.now())); } catch { /* 存储被禁用 */ }
+        try { window.localStorage.setItem(AUTH_SIGNAL_KEY, `${instance}:${++sequence}`); } catch { /* 存储被禁用 */ }
       }
     },
     dispose: () => {
