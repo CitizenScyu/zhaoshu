@@ -319,13 +319,13 @@ export default function FindTab() {
             if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) run();
           }}
         />
-        <div className="flex items-center gap-2 text-xs">
-          <label className="inline-flex items-center gap-1.5 cursor-pointer select-none">
+        <div className="flex flex-col items-start gap-2 text-xs sm:flex-row sm:items-center">
+          <label className="inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap cursor-pointer select-none">
             <input
               type="checkbox"
               checked={onlyThisTime}
               onChange={(e) => setOnlyThisTime(e.target.checked)}
-              className="accent-[var(--cinnabar)]"
+              className="shrink-0 accent-[var(--cinnabar)]"
             />
             <span>仅本次有效</span>
           </label>
