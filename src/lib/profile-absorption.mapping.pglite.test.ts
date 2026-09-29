@@ -61,7 +61,7 @@ beforeAll(async () => {
   mocks.sql = sql;
   pg = new PGlite(); await pg.waitReady;
   await createProductionSchema(sql as never, text => pg.exec(text));
-  await seedProductionMembers(pg, 3);
+  await seedProductionMembers(pg, 8);
   db = await import('./db');
   absorb = await import('./profile-absorption');
   mocks.model.mockResolvedValue({ content: '合成吸收后的画像' });
@@ -105,5 +105,57 @@ describe('真实SQL行经db封装到反馈吸收服务', () => {
     const withdrawal = (await pg.query<{ id: number }>("INSERT INTO feedback(user_id,book_id,status,note) VALUES(3,$1,'reading','') RETURNING id", [book])).rows[0].id;
     expect(await db.getWithdrawnFeedbackBookTitlesForUserRaw(3)).toEqual([{ title: '合成撤回书', feedbackId: withdrawal }]);
     expect(await db.getWithdrawnFeedbackBookTitlesForUser(3)).toEqual(['合成撤回书']);
+  });
+
+  it.each([
+    { userId: 4, informative: 60, withdrawn: 1, tail: false, expected: [[50, 0], [10, 1]] },
+    { userId: 5, informative: 60, withdrawn: 60, tail: false, expected: [[50, 0], [10, 50], [0, 10]] },
+    { userId: 6, informative: 0, withdrawn: 60, tail: false, expected: [[0, 50], [0, 10]] },
+    { userId: 7, informative: 50, withdrawn: 0, tail: true, expected: [[50, 0]] },
+    { userId: 8, informative: 0, withdrawn: 50, tail: true, expected: [[0, 50]] },
+  ])('混合安全前缀 $informative 条有效/$withdrawn 条撤回，尾部清理=$tail', async ({ userId, informative, withdrawn, tail, expected }) => {
+    mocks.model.mockClear();
+    await pg.query('INSERT INTO profile(id,content) VALUES($1,$2)', [userId, '合成原画像']);
+    const events: { id: number; title: string; kind: 'feedback' | 'withdrawn' }[] = [];
+    for (let i = 0; i < informative; i++) {
+      const title = `用户${userId}有效${i}`;
+      const { id } = await addFeedback(userId, title);
+      events.push({ id, title, kind: 'feedback' });
+    }
+    for (let i = 0; i < withdrawn; i++) {
+      const title = `用户${userId}撤回${i}`;
+      const { book } = await addFeedback(userId, title);
+      const id = (await pg.query<{ id: number }>("INSERT INTO feedback(user_id,book_id,status,note) VALUES($1,$2,'reading','') RETURNING id", [userId, book])).rows[0].id;
+      events.push({ id, title, kind: 'withdrawn' });
+    }
+    if (tail) await addFeedback(userId, `用户${userId}无信息尾部`, 'want', '');
+    await enqueueProfileFeedbackForUserQuery(sql as never, userId, 0, true);
+    const seen = new Set<string>();
+    let rounds = 0;
+    while ((await db.getProfileFeedbackQueueForUser(userId))?.pendingFeedbackId != null) {
+      expect(++rounds).toBeLessThanOrEqual(4);
+      const beforeCalls = mocks.model.mock.calls.length;
+      await absorb.absorbPendingProfileFeedback({ userId, leaseToken: `synthetic-${userId}-${rounds}`,
+        write, signal: new AbortController().signal, modelBudgetMs: 60000 });
+      if (mocks.model.mock.calls.length > beforeCalls) {
+        const input = JSON.parse(mocks.model.mock.calls.at(-1)![1]) as { feedback: { title: string }[]; withdrawn: string[] };
+        for (const title of [...input.feedback.map(row => row.title), ...input.withdrawn]) {
+          expect(seen.has(title)).toBe(false);
+          seen.add(title);
+        }
+      }
+      const queue = (await db.getProfileFeedbackQueueForUser(userId))!;
+      // 每轮已推进的任何当前有效事件，都必须已经真正进入模型输入。
+      for (const event of events.filter(event => event.id <= queue.absorbedFeedbackId)) expect(seen.has(event.title)).toBe(true);
+    }
+    expect(seen.size).toBe(events.length);
+    expect(mocks.model.mock.calls.map(([, user]) => {
+      const input = JSON.parse(user); return [input.feedback.length, input.withdrawn.length];
+    })).toEqual(expected);
+    if (tail) expect(rounds).toBe(2); // 空查询尾部推进candidate，不再调用模型。
+    // 重建默认全量撤回口径不被异步afterId改变；带已提交水位则没有待办撤回。
+    expect(await db.getWithdrawnFeedbackBookTitlesForUserRaw(userId)).toHaveLength(Math.min(withdrawn, 50));
+    expect(await db.getWithdrawnFeedbackBookTitlesForUserRaw(userId,
+      (await db.getProfileFeedbackQueueForUser(userId))!.absorbedFeedbackId)).toEqual([]);
   });
 });

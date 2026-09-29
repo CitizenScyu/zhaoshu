@@ -6,11 +6,8 @@ import { absorbedWatermarkFor, fedFeedbackUpperBound, feedbackForPrompt } from '
 // 核心不变量（任务书已定，不许推翻）：**任何反馈行除非真喂给模型，不得被标记已消费**。
 // 多保留（下轮重喂）可接受，多推进（漏行）禁止。
 //
-// `absorbedWatermarkFor(informative, withdrawn, combine)` 的 combine 由**该轮查询是否带
-// afterId 过滤**决定（见 db.ts 上的长注释）：
-//   - 异步吸收：informative 带 afterId、withdrawn 不带 ⇒ 'max'
-//   - 重建路径：两类都全量读 ⇒ 'min'
-// 这里把两种组合都钉住，因为它们回答的是不同问题、不能互相替代。
+// 异步吸收先按两类满批边界裁安全前缀，再对实际模型输入取max。
+// 重建保持原min契约。这些纯函数测试只验证组合器，不代替真实服务的限量裁剪测试。
 
 const info = (...ids: number[]) => ids.map((id) => ({ feedbackId: id }));
 const wd = (...ids: number[]) => ids.map((id) => ({ feedbackId: id }));
@@ -31,7 +28,7 @@ describe('F41-F1 fedFeedbackUpperBound', () => {
 
 describe("F41-F1 absorbedWatermarkFor(combine='max') 异步吸收路径", () => {
   it('撤回书目的 id 更大时，水位跟着撤回走（撤回是更新证据，必须告知过模型）', () => {
-    // informative 喂到 40，撤回书目在 id 91：afterId=40 之后的新 informative 与全量撤回
+    // informative 实喂到40、撤回实喂到91；此前已由服务确保两类在安全前缀内
     // 都进了输入 ⇒ 水位 = 91。
     expect(absorbedWatermarkFor(info(5, 12, 40), wd(60, 91), 'max')).toBe(91);
   });

@@ -1,3 +1,4 @@
+import { MAX_PROFILE_FEEDBACK } from './user-data';
 import type { PersonalWriter } from './personal-write';
 import {
   claimProfileFeedbackForUser,
@@ -100,22 +101,23 @@ export async function absorbPendingProfileFeedback(deps: {
   const lastCommittedUpperBound = queueBefore?.absorbedFeedbackId ?? 0;
   
   let profile = await getProfileForUser(userId);
-  const [feedback, withdrawnRows] = await Promise.all([
+  const [pendingFeedback, pendingWithdrawn] = await Promise.all([
     getProfileFeedbackForUser(userId, lastCommittedUpperBound),
-    getWithdrawnFeedbackBookTitlesForUserRaw(userId),
+    getWithdrawnFeedbackBookTitlesForUserRaw(userId, lastCommittedUpperBound),
   ]);
+  // 两类独立 LIMIT：满批意味着末ID之后可能仍有未取行，不能被另一类较晚ID越过。
+  // 在模型输入前裁双方到共同安全前缀，避免先喂晚行、却因水位停前而下轮重复应用。
+  const safePrefix = Math.min(
+    pendingFeedback.length >= MAX_PROFILE_FEEDBACK ? pendingFeedback[MAX_PROFILE_FEEDBACK - 1].feedbackId : Infinity,
+    pendingWithdrawn.length >= MAX_PROFILE_FEEDBACK ? pendingWithdrawn[MAX_PROFILE_FEEDBACK - 1].feedbackId : Infinity,
+  );
+  const feedback = pendingFeedback.filter((row) => row.feedbackId <= safePrefix);
+  const withdrawnRows = pendingWithdrawn.filter((row) => row.feedbackId <= safePrefix);
   const withdrawn = withdrawnRows.map((row) => row.title);
-  // F41-F1：本轮实喂上界 = max(informative 实喂 max id, withdrawn 实喂 max id)。
-  // 🔴 为什么改 min → max：informative 查询现在带 afterId（已喂上界）过滤，返回的是
-  // 「自已喂上界之后新出现/新改口的 informative 行」；withdrawn 查询不带 afterId，返回的是
-  // 「当前全部已撤回书目」。两者回答的是不同问题：
-  //   - 若 withdrawn max < informative max：撤回书目id 更小说明它们在 informative 之后
-  //     没有新动静，用 max 不会清掉它们（它们 id ≤ max，本来就在"已覆盖"范围内）。
-  //   - 若 withdrawn max > informative max：撤回是**更新的证据**，必须告知模型——max 让
-  //     水位跟着撤回走，informative 之后的撤回书目不会被 informative 的上界压掉。
-  // 用 max 之后：水位 = 「本轮喂过的所有行里最大的 id」，任何 id ≤ 它的 informative 行
-  // 都已进过输入（afterId 保证不漏），任何 id ≤ 它的撤回书目也已告知过（查询不带 afterId）。
   const fedUpperBound = absorbedWatermarkFor(feedback, withdrawnRows);
+  const noNewEvents = pendingFeedback.length === 0 && pendingWithdrawn.length === 0;
+  // 只有原查询确实为空才能清尾，不能把异常ID或裁剪空结果当作已经消费。
+  if (!noNewEvents && fedUpperBound <= lastCommittedUpperBound) throw new Error('InvalidFeedbackWatermark');
   // 空画像起步（F15 ③）：没有 profile 行时先建占位行，拿到有效 updated_at 才能走 CAS 保存。
   if (!profile.updatedAt) {
     await ensureProfileForUser(userId, write);
@@ -126,15 +128,10 @@ export async function absorbPendingProfileFeedback(deps: {
     }
   }
   
-  // 既无有效反馈、也无撤回信号：这次 pending 对画像零影响，直接推进水位（不调模型）。
-  // F41-F1：零行时 `fedUpperBound` 为 0，改用 candidate（pending 上界）。这里推进 candidate
-  // **不会跳过未喂行**：本轮查询带 afterId（= 已喂上界）仍返回空，说明「已喂上界之上没有
-  // 任何 informative 行」；而 withdrawn 查询不带 afterId 仍返回空，说明也没有撤回信号。
-  // 两者皆空 ⇒ 已喂上界之上没有任何可喂的东西，candidate 记的那些行已无需处理。
-  // （残留边界：撤回书目也有 LIMIT 50，单用户撤回书目超过 50 本时水位会被钉在第一批，
-  //  见报告「已知取舍」§9.6——不在本次改动范围内。）
-  const advanceTo = fedUpperBound > 0 ? fedUpperBound : candidate;
-  if (!feedback.length && !withdrawn.length) {
+  // 双方 afterId 查询都没有新事件时，candidate 范围无需模型处理，可以直接清尾。
+  // 非空时只推进到裁剪后实际输入的最大ID，保留晚于安全前缀的 pending。
+  const advanceTo = noNewEvents ? candidate : fedUpperBound;
+  if (noNewEvents) {
     const completion = await markProfileFeedbackAbsorbedForUser(userId, advanceTo, 'unchanged', write, leaseToken);
     if (!completion.matched) return { status: 'conflict', pendingFeedbackId: candidate };
     const { pendingFeedbackId } = completion;

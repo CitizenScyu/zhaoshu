@@ -219,8 +219,8 @@ export interface WithdrawnFeedbackTitle { title: string; feedbackId: number }
  * 「id ≤ batchMax 的该类行必然都在 batch 里」，故 batchMax 是可安全推进的水位上界。
  * 某类本轮 0 行 → 它不设上界（返回 null，调用方只受另一类约束）。
  *
- * 🔴 语义注意：这个函数只管「单类上界」。两类怎么合（min 还是 max）由调用方按**该轮
- * 查询是否带 afterId 过滤**决定——见 profile-absorption.ts 与 profile/route.ts 的注释。
+ * 这个函数只管单类实喂上界；两类批次须先由调用方验证完整性或裁安全前缀。
+ * 不能凭afterId本身推出独立LIMIT的两类已覆盖同一段ID。
  */
 export function fedFeedbackUpperBound(rows: { feedbackId: number }[] | undefined | null): number | null {
   if (!rows || !rows.length) return null;
@@ -230,10 +230,8 @@ export function fedFeedbackUpperBound(rows: { feedbackId: number }[] | undefined
 /**
  * F41-F1：合并两类的实喂上界。
  *
- * - 默认（异步吸收路径）：informative 带 afterId 过滤、withdrawn 不带 ⇒ 取 **max**。
- *   撤回书目是「当前全部已撤回」清单，比 informative 更新时必须告知模型，水位跟着它走
- *   不会漏掉 informative 之后的撤回；反过来也不会压掉任何 informative——id ≤ max 的
- *   informative 行都已进过输入（afterId 保证不漏）。
+ * - 默认（异步吸收路径）：两类都带 afterId，服务先按满批类别裁共同安全前缀。
+ *   这里对实际喂入的两类取 max；本函数本身不判断 LIMIT，不能对未裁批次盲用 max。
  * - 重建路径（profile/route.ts）两类都全量读：informative 的 LIMIT 50 之内才是实喂，
  *   withdrawn 超出的部分没告知 ⇒ 取 **min**，避免把未告知的撤回标成已覆盖。
  */
@@ -268,11 +266,12 @@ export async function getProfileFeedbackForUser(userId: number, afterId = 0): Pr
 
 // 已撤回反馈的书名（F04）：曾 informative、最新已非 informative。空数组表示没有撤回信号，
 // 路由据此不渲染撤回段。查询语义见 user-data.withdrawnFeedbackBookTitlesForUserQuery。
-// F41-F1：返回带 feedbackId 的行（raw 内部用）；需要「只透书名」的地方自行 map，
+// 返回带 feedbackId 的行（raw 内部用）；异步吸收可传 afterId，重建默认0不变。
+// 需要「只透书名」的地方自行 map，
 // 需要算水位的地方直接用 raw 行。两条调用方见 profile/route.ts 与 profile-absorption.ts。
-export async function getWithdrawnFeedbackBookTitlesForUserRaw(userId: number): Promise<WithdrawnFeedbackTitle[]> {
+export async function getWithdrawnFeedbackBookTitlesForUserRaw(userId: number, afterId = 0): Promise<WithdrawnFeedbackTitle[]> {
   requireUserId(userId);
-  const rows = await withdrawnFeedbackBookTitlesForUserQuery(getSql(), userId) as
+  const rows = await withdrawnFeedbackBookTitlesForUserQuery(getSql(), userId, undefined, afterId) as
     { title: string; feedback_id: number }[];
   return rows.map(({ title, feedback_id }) => ({ title, feedbackId: feedback_id }));
 }

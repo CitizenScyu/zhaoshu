@@ -581,7 +581,7 @@ export function ensureProfileForUserQuery(sql: PersonalQuery, userId: number) {
 // 等于靠旧数据永久保留已失效偏好。按 book_id 取最新一行即可让撤回如实生效。
 //
 // 只按 user_id 过滤，书中身份经 books join 取当前拼写；绝不跨用户读取。
-const MAX_PROFILE_FEEDBACK = 50;
+export const MAX_PROFILE_FEEDBACK = 50;
 
 export function recentInformativeFeedbackForUserQuery(sql: PersonalQuery, userId: number, limit = MAX_PROFILE_FEEDBACK, afterId = 0) {
   requireUserId(userId);
@@ -596,7 +596,7 @@ export function recentInformativeFeedbackForUserQuery(sql: PersonalQuery, userId
   //   (a) afterId（= 上一次的实喂上界）排除已喂过的行。没有它，每轮都重读同一批 LIMIT 50，
   //       实喂上界永远停在第一批——第 51+ 行既进不了画像，队列也永不排空；
   //   (b) ORDER BY feedback_id ASC ⇒ 未喂行的 id 必然大于返回集最大 id（水位可安全推进）；
-  //   (c) LIMIT 仍在——推进候选取 min(两类实喂 max)，不是 claim 返回的全表 pending 上界。
+  //   (c) LIMIT 仍在——吸收服务先裁两类共同安全前缀，再推进到实喂上界。
   // feedback_id 进投影只用于「本轮实喂上界」计算（见 db.ts 的 absorbedWatermarkFor），
   // 绝不进模型输入——提示词输入经 feedbackForPrompt 剥掉它。
   return sql`SELECT title, author, status, note, feedback_id FROM (
@@ -617,12 +617,10 @@ export function recentInformativeFeedbackForUserQuery(sql: PersonalQuery, userId
 //
 // 只回传**书名**（不回传旧 note 原文）：喂旧 note 会把要删除的偏好又当证据送进输入，
 // 与「不得作为既定事实保留」相悖。判定只看本人反馈，绝不跨用户。
-// F41-F1：ORDER BY latest.id ASC + 投影 feedback_id，与上面的 informative 查询同构——水位
-// 取两类实喂上界的 min，两类都必须能推出「id ≤ X 的全部都在返回集里」。
-// 撤回书目**不加 afterId 过滤**：它是「旧画像里可能残留的偏好清单」而不是待办队列——
-// 已撤回的书名每轮都要重新告知模型，直到用户重新给出 informative 反馈（那时该书自然
-// 不再是 withdrawn）。给它加 afterId 会让撤回信号只生效一轮，旧偏好又留在画像里。
-export function withdrawnFeedbackBookTitlesForUserQuery(sql: PersonalQuery, userId: number, limit = MAX_PROFILE_FEEDBACK) {
+// 重建路径默认 afterId=0，仍取得当前全部撤回书目（受 LIMIT 限制）。
+// 异步吸收传已提交水位，只处理新撤回事件；成功提交过的撤回已体现在画像中。
+// 两类各按id升序取一批，吸收服务再裁到共同安全前缀，避免越过另一类未取行。
+export function withdrawnFeedbackBookTitlesForUserQuery(sql: PersonalQuery, userId: number, limit = MAX_PROFILE_FEEDBACK, afterId = 0) {
   requireUserId(userId);
   return sql`SELECT latest.title, latest.id AS feedback_id FROM (
       SELECT DISTINCT ON (f.book_id) b.title, f.status, f.note, f.book_id, f.id
@@ -631,6 +629,7 @@ export function withdrawnFeedbackBookTitlesForUserQuery(sql: PersonalQuery, user
       ORDER BY f.book_id, f.id DESC
     ) latest
     WHERE NOT (latest.status IN (${'done'}, ${'dropped'}) AND btrim(latest.note) <> '')
+      AND latest.id > ${afterId}
       AND EXISTS (
         SELECT 1 FROM feedback h
         WHERE h.user_id = ${userId} AND h.book_id = latest.book_id
