@@ -1,6 +1,6 @@
 'use client';
 
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { useOwner } from '@/components/OwnerProvider';
 import { REASONING_CONFIRMATION_CODE } from '@/lib/app-settings-shared';
 import type { LlmModelSettings, LlmModelSource, ReasoningVerdict } from '@/lib/app-settings-shared';
@@ -121,7 +121,7 @@ export function confirmationFor(
 type SaveTarget = 'model' | 'defaultModel';
 
 export default function ModelSettingsTab() {
-  const { apiFetch } = useOwner();
+  const { apiFetch, sessionId, isCurrentSession } = useOwner();
   const [settings, setSettings] = useState<LlmModelSettings | null>(null);
   const [draft, setDraft] = useState('');
   const [defaultDraft, setDefaultDraft] = useState('');
@@ -132,22 +132,28 @@ export default function ModelSettingsTab() {
   // 判为推理模型时接口会先拒绝（409），由 owner 点按钮再保存一次——绝不自动重发，
   // 否则这道确认就退化成一个多余的往返，等于没有确认。target 决定确认后重发到哪一栏。
   const [confirmReasoning, setConfirmReasoning] = useState<{ target: SaveTarget; model: string; message: string } | null>(null);
+  const saveController = useRef<AbortController | null>(null);
+  useEffect(() => () => saveController.current?.abort(), []);
 
   const load = useCallback(async (signal?: AbortSignal) => {
+    const current = () => !signal?.aborted && isCurrentSession(sessionId);
+    if (!current()) return;
     setLoading(true);
     setError('');
     try {
       const res = await apiFetch('/api/admin/llm', { signal });
+      if (!current()) return;
       const data = await res.json();
+      if (!current()) return;
       if (!res.ok) throw new Error(data.error || '模型设置加载失败');
       setSettings(data as LlmModelSettings);
     } catch (e) {
-      if (signal?.aborted) return;
+      if (!current()) return;
       setError(e instanceof Error ? e.message : '模型设置加载失败');
     } finally {
-      if (!signal?.aborted) setLoading(false);
+      if (current()) setLoading(false);
     }
-  }, [apiFetch]);
+  }, [apiFetch, sessionId, isCurrentSession]);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -158,7 +164,10 @@ export default function ModelSettingsTab() {
   }, [load]);
 
   async function submit(target: SaveTarget, value: string | null, acknowledgeReasoning = false) {
-    if (saving) return;
+    if (!isCurrentSession(sessionId) || saveController.current) return;
+    const controller = new AbortController();
+    saveController.current = controller;
+    const current = () => !controller.signal.aborted && isCurrentSession(sessionId);
     setSaving(true);
     setError('');
     setNotice('');
@@ -166,10 +175,13 @@ export default function ModelSettingsTab() {
     try {
       const res = await apiFetch('/api/admin/llm', {
         method: 'PATCH',
+        signal: controller.signal,
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ [target]: value, ...(acknowledgeReasoning ? { acknowledgeReasoning: true } : {}) }),
       });
+      if (!current()) return;
       const data = await res.json();
+      if (!current()) return;
       if (!res.ok) {
         // 需要确认不是错误：单独摆成一个确认块，把接口给的原因原样带出来。
         const confirmation = confirmationFor(res.status, data, value);
@@ -191,9 +203,10 @@ export default function ModelSettingsTab() {
           : defaultSavedNotice(next));
       }
     } catch (e) {
-      setError(e instanceof Error ? e.message : '模型设置保存失败');
+      if (current()) setError(e instanceof Error ? e.message : '模型设置保存失败');
     } finally {
-      setSaving(false);
+      if (saveController.current === controller) saveController.current = null;
+      if (current()) setSaving(false);
     }
   }
 
