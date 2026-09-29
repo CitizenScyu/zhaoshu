@@ -5,8 +5,10 @@ import { userEvent } from '@testing-library/user-event';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import LibraryTab, { createLibraryView } from './LibraryTab';
 
-const mocks = vi.hoisted(() => ({ apiFetch: vi.fn() }));
-vi.mock('@/components/OwnerProvider', () => ({ useOwner: () => ({ apiFetch: mocks.apiFetch, can: () => true }) }));
+const mocks = vi.hoisted(() => ({ apiFetch: vi.fn(), isCurrentSession: (id: number) => id === 1 }));
+vi.mock('@/components/OwnerProvider', () => ({ useOwner: () => ({
+  apiFetch: mocks.apiFetch, can: () => true, sessionId: 1, isCurrentSession: mocks.isCurrentSession,
+}) }));
 vi.mock('@/components/ReadBookLink', () => ({ default: () => null }));
 
 function json(body: unknown, status = 200) {

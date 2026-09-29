@@ -4,10 +4,11 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-libra
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import LibraryTab, { createLibraryView } from './LibraryTab';
 
-const mocks = vi.hoisted(() => ({ apiFetch: vi.fn(), download: true, read: true }));
+const mocks = vi.hoisted(() => ({ apiFetch: vi.fn(), download: true, read: true, isCurrentSession: (id: number) => id === 1 }));
 vi.mock('@/components/OwnerProvider', () => ({
   useOwner: () => ({
     apiFetch: mocks.apiFetch, ready: true,
+    sessionId: 1, isCurrentSession: mocks.isCurrentSession,
     can: (permission: string) => permission === 'download' ? mocks.download : permission === 'read' ? mocks.read : true,
   }),
 }));

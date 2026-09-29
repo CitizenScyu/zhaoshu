@@ -59,6 +59,7 @@ const idCalls = (apiFetch: ReturnType<typeof makeApiFetch>) =>
 async function openDetailInProgress(apiFetch: ReturnType<typeof makeApiFetch>) {
   mocks.owner = {
     ready: true, status: 'ready', user: { id: 5 },
+    sessionId: 1, isCurrentSession: (id: number) => id === 1,
     apiFetch, can: () => true,
   };
   render(<Harness />);

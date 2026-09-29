@@ -61,7 +61,8 @@ const idCalls = (apiFetch: ReturnType<typeof makeApiFetch>) =>
 
 /** 打开详情页；挂载时立即拉一次（此时 quota=true ⇒ 首拉即配额）。 */
 async function openDetail(apiFetch: ReturnType<typeof makeApiFetch>) {
-  mocks.owner = { ready: true, status: 'ready', user: { id: 5 }, apiFetch, can: () => true };
+  mocks.owner = { ready: true, status: 'ready', user: { id: 5 }, apiFetch, can: () => true,
+    sessionId: 1, isCurrentSession: (id: number) => id === 1 };
   const view = render(<Harness />);
   fireEvent.click(await screen.findByRole('button', { name: '查看测试书详情' }));
   await waitFor(() => expect(idCalls(apiFetch)).toBe(1));

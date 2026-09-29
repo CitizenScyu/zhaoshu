@@ -162,7 +162,7 @@ export default function LibraryTab({ view, setView }: {
   view: LibraryView;
   setView: Dispatch<SetStateAction<LibraryView>>;
 }) {
-  const { apiFetch, can } = useOwner();
+  const { apiFetch, can, sessionId, isCurrentSession } = useOwner();
   const canDownload = can('download');
   const [books, setBooks] = useState<LibraryBook[] | null>(null);
   const [facets, setFacets] = useState<Facets>({ categories: [], finishStates: [] });
@@ -181,6 +181,11 @@ export default function LibraryTab({ view, setView }: {
   const [shelfBusy, setShelfBusy] = useState(0); // 当前正在加书架的书 id，0 表示空闲
   const reqId = useRef(0);
   const dlRequestId = useRef(0);
+  const actions = useRef(new Set<AbortController>());
+  useEffect(() => {
+    const pending = actions.current;
+    return () => { for (const controller of pending) controller.abort(); pending.clear(); };
+  }, []);
   const detailEntries = useRef(new Map<number, HTMLButtonElement>());
   const detailHeading = useRef<HTMLHeadingElement>(null);
   const libraryHeading = useRef<HTMLHeadingElement>(null);
@@ -236,7 +241,9 @@ export default function LibraryTab({ view, setView }: {
   }, [detailId]);
 
   const load = useCallback(async (p: number, q: string, cat: string, tg: string, fin: string, st: string, signal?: AbortSignal) => {
+    if (signal?.aborted || !isCurrentSession(sessionId)) return;
     const my = ++reqId.current;
+    const current = () => !signal?.aborted && my === reqId.current && isCurrentSession(sessionId);
     setLoading(true);
     setError('');
     try {
@@ -245,20 +252,21 @@ export default function LibraryTab({ view, setView }: {
       if (tg) params.set('tag', tg);
       if (fin) params.set('finish', fin);
       const res = await apiFetch(`/api/library?${params}`, { signal });
+      if (!current()) return;
       const data = await res.json();
+      if (!current()) return;
       if (!res.ok) throw new Error(data.error || '书库加载失败');
-      if (signal?.aborted || my !== reqId.current) return;
       setBooks(data.books);
       setTotal(data.total);
       setMaxPage(data.maxPage ?? 10_000);
       setFacets(data.facets ?? { categories: [], finishStates: [] });
     } catch (e) {
-      if (signal?.aborted || my !== reqId.current) return;
+      if (!current()) return;
       setError(e instanceof Error ? e.message : '书库加载失败');
     } finally {
-      if (!signal?.aborted && my === reqId.current) setLoading(false);
+      if (current()) setLoading(false);
     }
-  }, [apiFetch]);
+  }, [apiFetch, sessionId, isCurrentSession]);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -280,8 +288,9 @@ export default function LibraryTab({ view, setView }: {
     const my = ++dlRequestId.current;
     let stale = false;
     const controller = new AbortController();
+    const current = () => !stale && !controller.signal.aborted && my === dlRequestId.current && isCurrentSession(sessionId);
     queueMicrotask(() => {
-      if (controller.signal.aborted) return;
+      if (!current()) return;
       setTask(null);
       setDlError('');
       setDlMessage('');
@@ -290,9 +299,10 @@ export default function LibraryTab({ view, setView }: {
       void (async () => {
         try {
           const res = await apiFetch(`/api/download?bookId=${detailId}`, { signal: controller.signal });
+          if (!current()) return;
           const data = await res.json();
+          if (!current()) return;
           if (!res.ok) throw new Error(data.error || '查询下载任务失败');
-          if (stale || my !== dlRequestId.current) return;
           const found = parseTask(data);
           updateTask(found && found.bookId === detailId ? found : null);
         } catch {
@@ -304,7 +314,7 @@ export default function LibraryTab({ view, setView }: {
       stale = true;
       controller.abort();
     };
-  }, [detailId, canDownload, apiFetch, updateTask]);
+  }, [detailId, canDownload, apiFetch, updateTask, sessionId, isCurrentSession]);
 
   // pending/running 任务轮询单条进度。任务到终态后 pollTaskId 变 null，effect 清理即停轮询。
   const pollTaskId = canDownload && task !== null && (task.status === 'pending' || task.status === 'running')
@@ -324,22 +334,24 @@ export default function LibraryTab({ view, setView }: {
     let quotaDelayMs = 0;
     let pollVersion = 0;
     const controller = new AbortController();
+    const valid = () => !stale && !controller.signal.aborted && isCurrentSession(sessionId);
     const clearQuotaRetry = () => { if (quotaRetry !== null) { clearTimeout(quotaRetry); quotaRetry = null; } };
     const scheduleQuotaRetry = () => {
       clearQuotaRetry();
-      if (stale || document.hidden) return; // 后台不探：onVisibility 回前台时立即探
+      if (!valid() || document.hidden) return; // 后台不探：onVisibility 回前台时立即探
       quotaRetry = setTimeout(() => { quotaRetry = null; poll(); }, quotaDelayMs);
     };
     const poll = () => {
-      if (controller.signal.aborted) return;
+      if (!valid()) return;
       const my = dlRequestId.current;
       // 同一任务的定时刷新和回前台刷新可能并发，只接受最后发出的请求。
       const version = ++pollVersion;
-      const current = () => !stale && !controller.signal.aborted
+      const current = () => valid()
         && version === pollVersion && my === dlRequestId.current;
       void (async () => {
         try {
           const res = await apiFetch(`/api/download?id=${pollTaskId}`, { signal: controller.signal });
+          if (!current()) return;
           const data = await res.json();
           if (!current()) return;
           if (isDbQuotaResponse(res.status, data)) {
@@ -368,9 +380,10 @@ export default function LibraryTab({ view, setView }: {
         }
       })();
     };
-    const start = () => { if (timer === null) timer = setInterval(poll, 30000); };
+    const start = () => { if (valid() && timer === null) timer = setInterval(poll, 30000); };
     const stop = () => { if (timer !== null) { clearInterval(timer); timer = null; } };
     const onVisibility = () => {
+      if (!valid()) { stop(); clearQuotaRetry(); return; }
       if (document.hidden) {
         stop();
         clearQuotaRetry();
@@ -391,19 +404,33 @@ export default function LibraryTab({ view, setView }: {
       clearQuotaRetry();
       document.removeEventListener('visibilitychange', onVisibility);
     };
-  }, [pollTaskId, apiFetch, updateTask]);
+  }, [pollTaskId, apiFetch, updateTask, sessionId, isCurrentSession]);
+
+  function beginAction(): AbortController {
+    const controller = new AbortController();
+    actions.current.add(controller);
+    return controller;
+  }
+
+  function isCurrentAction(controller: AbortController, requestId?: number): boolean {
+    return !controller.signal.aborted && isCurrentSession(sessionId)
+      && (requestId === undefined || requestId === dlRequestId.current);
+  }
 
   async function addToShelf(book: LibraryBook) {
-    if (shelfBusy !== 0) return;
+    if (shelfBusy !== 0 || !isCurrentSession(sessionId)) return;
+    const controller = beginAction();
     setShelfBusy(book.id);
     setShelfMsg('');
     try {
       const res = await apiFetch('/api/shelf', {
-        method: 'POST',
+        method: 'POST', signal: controller.signal,
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ labeledBookId: book.id }),
       });
+      if (!isCurrentAction(controller)) return;
       const data = await res.json().catch(() => ({}));
+      if (!isCurrentAction(controller)) return;
       if (res.status === 409) {
         setShelfMsg(`「${book.title}」已在书架`);
         return;
@@ -411,34 +438,39 @@ export default function LibraryTab({ view, setView }: {
       if (!res.ok) throw new Error(data.error || '加入书架失败');
       setShelfMsg(`「${book.title}」已加入书架（想读）`);
     } catch (e) {
-      setShelfMsg(e instanceof Error ? e.message : '加入书架失败');
+      if (isCurrentAction(controller)) setShelfMsg(e instanceof Error ? e.message : '加入书架失败');
     } finally {
-      setShelfBusy(0);
+      actions.current.delete(controller);
+      if (isCurrentAction(controller)) setShelfBusy(0);
     }
   }
 
   async function startDownload() {
+    if (!isCurrentSession(sessionId)) return;
     // 心跳过期的 running 视为可重试：POST 会先回收僵尸租约再建任务。
     if (!canDownload || task?.requestedBy === 'system' || !detail || dlBusy || task?.status === 'done' || (task?.status === 'running' && !task.leaseExpired)) return;
     const my = ++dlRequestId.current;
+    const controller = beginAction();
     setDlBusy(true);
     setDlError('');
     setDlMessage('');
     try {
       const res = await apiFetch('/api/download', {
-        method: 'POST',
+        method: 'POST', signal: controller.signal,
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ bookId: detail.id }),
       });
+      if (!isCurrentAction(controller, my)) return;
       const data = await res.json().catch(() => ({}));
-      if (my !== dlRequestId.current) return;
+      if (!isCurrentAction(controller, my)) return;
       if (res.status === 409) {
         setDlMessage('任务已在队列，无需重复提交。');
         if (typeof data.taskId === 'number') {
           // 读取已有任务的真实状态，避免把已经完成的任务重新显示成 pending。
-          const currentRes = await apiFetch(`/api/download?id=${data.taskId}`);
+          const currentRes = await apiFetch(`/api/download?id=${data.taskId}`, { signal: controller.signal });
+          if (!isCurrentAction(controller, my)) return;
           const currentData = await currentRes.json().catch(() => null);
-          if (my !== dlRequestId.current) return;
+          if (!isCurrentAction(controller, my)) return;
           const current = parseTask(currentData);
           if (!currentRes.ok || !current || current.bookId !== detail.id) {
             throw new Error('任务已在队列，暂时无法读取进度，请稍后重试');
@@ -466,53 +498,61 @@ export default function LibraryTab({ view, setView }: {
       }
       throw new Error(data.error || '提交下载失败');
     } catch (e) {
-      if (my === dlRequestId.current) setDlError(e instanceof Error ? e.message : '提交下载失败');
+      if (isCurrentAction(controller, my)) setDlError(e instanceof Error ? e.message : '提交下载失败');
     } finally {
-      if (my === dlRequestId.current) setDlBusy(false);
+      actions.current.delete(controller);
+      if (isCurrentAction(controller, my)) setDlBusy(false);
     }
   }
 
   async function removeDownload() {
+    if (!isCurrentSession(sessionId)) return;
     if (!canDownload || task?.requestedBy === 'system') return;
     if (!task || dlBusy || (task.status !== 'pending' && task.status !== 'failed' && task.status !== 'partial'
       && task.status !== 'superseded_by_incomplete')) return;
     const failureMessage = task.status === 'failed' ? '清理失败' : '取消失败';
     const my = ++dlRequestId.current;
+    const controller = beginAction();
     setDlBusy(true);
     setDlError('');
     setDlMessage('');
     try {
       const res = await apiFetch('/api/download', {
-        method: 'DELETE',
+        method: 'DELETE', signal: controller.signal,
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ taskId: task.id }),
       });
-      if (my !== dlRequestId.current) return;
+      if (!isCurrentAction(controller, my)) return;
       if (!res.ok) {
         const data = await res.json().catch(() => ({}));
+        if (!isCurrentAction(controller, my)) return;
         throw new Error(data.error || failureMessage);
       }
       setTask(null);
     } catch (e) {
-      if (my === dlRequestId.current) setDlError(e instanceof Error ? e.message : failureMessage);
+      if (isCurrentAction(controller, my)) setDlError(e instanceof Error ? e.message : failureMessage);
     } finally {
-      if (my === dlRequestId.current) setDlBusy(false);
+      actions.current.delete(controller);
+      if (isCurrentAction(controller, my)) setDlBusy(false);
     }
   }
 
   async function retrieveFile() {
+    if (!isCurrentSession(sessionId)) return;
     if (!canDownload || task?.requestedBy === 'system') return;
     if (!task) return;
     const my = dlRequestId.current;
+    const controller = beginAction();
     try {
-      const res = await apiFetch(`/api/download/${task.id}/file`);
-      if (my !== dlRequestId.current) return;
+      const res = await apiFetch(`/api/download/${task.id}/file`, { signal: controller.signal });
+      if (!isCurrentAction(controller, my)) return;
       if (!res.ok) {
         const data = await res.json().catch(() => ({}));
+        if (!isCurrentAction(controller, my)) return;
         throw new Error(data.error || '文件取回失败');
       }
       const blob = await res.blob();
-      if (my !== dlRequestId.current) return;
+      if (!isCurrentAction(controller, my)) return;
       const name = fileNameFrom(res.headers.get('Content-Disposition') ?? '', `${task.title || 'novel'}.txt`);
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
@@ -521,7 +561,9 @@ export default function LibraryTab({ view, setView }: {
       a.click();
       URL.revokeObjectURL(url);
     } catch (e) {
-      if (my === dlRequestId.current) window.alert(e instanceof Error ? e.message : '文件取回失败');
+      if (isCurrentAction(controller, my)) window.alert(e instanceof Error ? e.message : '文件取回失败');
+    } finally {
+      actions.current.delete(controller);
     }
   }
 
