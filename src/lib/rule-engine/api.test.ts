@@ -604,6 +604,30 @@ describe('正文翻页遇下一章即停（41-PAGEFIX）', () => {
     }
   });
 
+  it.each([false, true])('REDIRECT53: 已知他章跳转拒绝，strict=%s', async (strict) => {
+    for (const target of [chapter(2), chapter(2) + '#body', chapter(2).replace('book15.net', 'www.book15.net')]) {
+      const context = { page: async () => ({ url: target, text: page('第二章错章正文') }) } as unknown as SourceRequestContext;
+      await expect(engineFetchContent(cuoceng, chapter(1), context, strict, [chapter(1), chapter(2)]))
+        .rejects.toMatchObject({ name: 'SourcePolicyError' });
+    }
+  });
+
+  it.each([false, true])('REDIRECT53: 单章本身和明确同站别名不被当作他章，strict=%s', async (strict) => {
+    for (const target of [chapter(1), chapter(1).replace('book15.net', 'www.book15.net')]) {
+      const context = { page: async () => ({ url: target, text: page('第一章正确正文') }) } as unknown as SourceRequestContext;
+      expect(await engineFetchContent(cuoceng, chapter(1), context, strict, chapter(1)))
+        .toEqual({ text: '第一章正确正文' });
+    }
+  });
+
+  it('REDIRECT53: 合法canonical查询与不同查询/尾斜杠不被合并成他章', async () => {
+    for (const target of [chapter(1) + '?canonical=1', chapter(2) + '?page=2', chapter(2) + '/']) {
+      const context = { page: async () => ({ url: target, text: page('本次页正文') }) } as unknown as SourceRequestContext;
+      expect(await engineFetchContent(cuoceng, chapter(1), context, false, [chapter(1), chapter(2)]))
+        .toEqual({ text: '本次页正文' });
+    }
+  });
+
   it('③ 不传 nextChapterUrl（末章 / 旧调用）⇒ 行为与改前相同：照旧沿 linkNext 翻页拼接', async () => {
     for (const args of [[], [false], [false, undefined]] as const) {
       const run = recording(threeChapters());

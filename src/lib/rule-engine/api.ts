@@ -5,7 +5,7 @@
 // 结构断言（v3 E5）：本模块导出集合**恰为**门面四函数（engineSearchBook / engineFetchDetail / engineFetchToc /
 // engineFetchContent）与其类型，外加正文翻页上限常量 MAX_CONTENT_PAGES（41-M1.1：阅读器正文 context 的 L1 上限复用它）；
 // admissionFetch / validateAdmissionUrl 不在此（它们在 rule-engine/admission.ts 且不导出）。
-import { SourcePolicyError, upgradeSourceTemplateUrl, validateSourceUrl } from '@/lib/source-policy';
+import { alternateSourceHost, SourcePolicyError, upgradeSourceTemplateUrl, validateSourceUrl } from '@/lib/source-policy';
 import {
   MAX_SOURCE_CHAPTERS, buildSourceSearchRequest, sourceSearchUrl, type SourceBookIdentity, type SourceChapter,
 } from '@/lib/source-parser';
@@ -181,6 +181,14 @@ function pageIdentity(url: string): string {
   return parsed.href;
 }
 
+// HTTP跳转落点核对：仅合并策略明确支持的同站host，不泛化任意域名的www关系。
+function redirectedPageIdentity(url: string): string {
+  const parsed = new URL(pageIdentity(url));
+  const alternate = alternateSourceHost(parsed.hostname);
+  if (alternate && alternate < parsed.hostname) parsed.hostname = alternate;
+  return parsed.href;
+}
+
 /**
  * ruleContent.content 拼接，含 nextContentUrl 翻页；多页以换行连接（§7.1）。
  * nextChapterUrl（41-PAGEFIX，legado BookContent.analyzeContent 同款判据）：「下一页」解析后等于下一章
@@ -209,10 +217,16 @@ export async function engineFetchContent(
     // 只对数组剔除本章自身（整本目录必然含本章）；单个地址保持改前语义不变。
     if (typeof nextChapterUrl !== 'string') stopKeys.delete(pageIdentity(next));
   }
+  const redirectStopKeys = new Set([...stopKeys].map(redirectedPageIdentity));
+  // 单章目录会把本章作为单个停止地址传入；正常交付本章（含同站换host）不能被拒绝。
+  if (next) redirectStopKeys.delete(redirectedPageIdentity(next));
   for (let pageIndex = 0; next && pageIndex < MAX_CONTENT_PAGES; pageIndex += 1) {
     if (visited.has(next)) { if (strict) throw new Error('pagination_cycle'); break; }
     visited.add(next);
     const page = await context.page(next, { responseCharset: enginePostSearchEnabled() ? 'auto' : undefined });
+    if (redirectStopKeys.has(redirectedPageIdentity(page.url))) {
+      throw new SourcePolicyError('书源正文跳转到了目录中的其他章节，请重试或更换书源');
+    }
     const scope = createScope(normalizeBody(page.text), page.url);
     // 正文是唯一「多节点拼接」字段：@p@text 类规则靠 multi=true 把多段落拼成整章。
     // 是否做 HTML→纯文本按**规则类型**判定（41-HTMLFIX 复审）：全部候选支都是

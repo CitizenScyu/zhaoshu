@@ -1580,6 +1580,46 @@ describe('引擎源正文分派（N01）', () => {
     expect((await recovered.json()).chapters).toHaveLength(2);
   });
 
+  it.each(['first', 'continuation'] as const)('REDIRECT53: %s跳到目录中其他章时不得交付或缓存错章', async (hop) => {
+    await primeEngineCatalog();
+    const paged = { ...contentEngineSource, rules: { ...contentEngineSource.rules,
+      ruleContent: { content: '#body@text', nextContentUrl: '.next@href' } } };
+    mocks.sources.mockResolvedValue([paged]);
+    pages.set(n01Toc, { text: '<li class="chapter"><a href="/n01/c/1.html">第一章</a></li><li class="chapter"><a href="/n01/c/2.html">第二章</a></li>' });
+    const catalog = await service.resolveSourceBook(book, context());
+    catalogs.set(catalog.version, catalog);
+    const second = 'https://book15.net/n01/c/2.html';
+    const continuation = 'https://book15.net/n01/c/1_2.html';
+    pages.set(n01Chapter, { text: '<div id="body">第一章前半</div><a class="next" href="/n01/c/1_2.html">下页</a>' });
+    pages.set(continuation, { text: '<div id="body">第一章后半</div>' });
+    pages.set(second, { text: '<div id="body">第二章内容，不属于第一章</div>' });
+    const originalFetch = mocks.fetch.getMockImplementation()!;
+    let redirecting = true;
+    mocks.fetch.mockImplementation((input, init) => {
+      if (redirecting && String(input) === (hop === 'first' ? n01Chapter : continuation)) {
+        return Promise.resolve(new Response(null, { status: 302, headers: { location: second } }));
+      }
+      return originalFetch(input, init);
+    });
+    await expect(service.readSourceChapter(catalog.version, 0, context()))
+      .rejects.toMatchObject({ code: 'SOURCE_CHAPTER_UNAVAILABLE', status: 503 });
+    redirecting = false;
+    const beforeRetry = mocks.fetch.mock.calls.length;
+    expect((await service.readSourceChapter(catalog.version, 0, context())).text).toBe('第一章前半\n第一章后半');
+    expect(mocks.fetch.mock.calls.length).toBeGreaterThan(beforeRetry);
+  });
+
+  it('REDIRECT53: 未指向其他目录章节的合法规范化跳转仍可读', async () => {
+    const catalog = await primeEngineCatalog();
+    const canonical = 'https://book15.net/n01/c/1.html?canonical=1';
+    pages.set(canonical, { text: '<div id="body">第一章完整正文</div>' });
+    const originalFetch = mocks.fetch.getMockImplementation()!;
+    mocks.fetch.mockImplementation((input, init) => String(input) === n01Chapter
+      ? Promise.resolve(new Response(null, { status: 302, headers: { location: canonical } }))
+      : originalFetch(input, init));
+    expect((await service.readSourceChapter(catalog.version, 0, context())).text).toBe('第一章完整正文');
+  });
+
   it('引擎源目录 + #body@text 正文 → readSourceChapter 成功（对齐 N01 反例）', async () => {
     const catalog = await primeEngineCatalog();
     pages.set(n01Chapter, { text: '<div id="body">Synthetic chapter body.</div>' });
