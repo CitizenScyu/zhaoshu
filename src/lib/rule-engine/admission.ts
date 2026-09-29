@@ -549,7 +549,7 @@ async function readCappedBody(response: Response, signal: AbortSignal, maxBytes:
  * HTTP 状态码不抛错——challenge/http_5xx 分桶需要拿到 status 与 body。
  * 41-admpost：request 携带 method/body/白名单头/charset（flag 开时由 buildAdmissionSearchRequest 产出）。
  * body 按 charset 字节化；仅连续同 origin 307/308 保留 POST，其余跳转降 GET（同 source-fetch 语义）。
- * 响应按 Content-Type 声明字符集解码，回退到请求声明字符集（GBK 站常不在头里声明）。
+ * flag 开时采用运行时搜索的声明/响应头优先级；flag 关时保持 UTF8。
  */
 async function admissionFetch(request: SourceSearchRequest, options: AdmissionFetchOptions): Promise<{ url: string; status: number; text: string }> {
   const {
@@ -602,12 +602,12 @@ async function admissionFetch(request: SourceSearchRequest, options: AdmissionFe
         current = next;
         continue;
       }
-      // 响应解码字符集：**受 enginePostSearchEnabled() 门控**（M1 修复）。flag 开时 Content-Type
-      // 声明优先、回退请求声明字符集（GBK 站常不在头里声明），与运行时 responseCharset:'auto' 一致；
+      // 与 engineSearchBook 同序：源 charset 是请求/响应双用途，非 UTF8 声明保留强制覆写。
+      // 声明为 UTF8（含未声明）时才采用响应头；不能用错误的 HTTP 头覆盖既有可用源规则。
       // flag 关时恒 utf-8——与基线 f57e191（硬编码 TextDecoder('utf-8')）逐字等价，纯 GET 源的
       // 准入响应解码不因站点声明 charset=gbk 而改变分桶（rvadmpost §2 M1 反例）。
       const charset: SourceCharset = enginePostSearchEnabled()
-        ? (charsetFromContentType(response.headers.get('content-type')) ?? request.charset)
+        ? request.charset !== 'utf-8' ? request.charset : (charsetFromContentType(response.headers.get('content-type')) ?? 'utf-8')
         : 'utf-8';
       const text = await readCappedBody(response, probeSignal, maxBytes, charset);
       probeSignal.throwIfAborted();
