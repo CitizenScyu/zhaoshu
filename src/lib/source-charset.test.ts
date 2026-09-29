@@ -13,6 +13,8 @@ describe('source-charset 归一化', () => {
   it('未知/非字符串 → null', () => {
     expect(normalizeCharset('big5')).toBeNull();
     expect(normalizeCharset('shift_jis')).toBeNull();
+    expect(normalizeCharset('constructor')).toBeNull();
+    expect(normalizeCharset('__proto__')).toBeNull();
     expect(normalizeCharset(42)).toBeNull();
     expect(normalizeCharset(undefined)).toBeNull();
   });

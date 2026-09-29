@@ -17,7 +17,8 @@ const CHARSET_ALIASES: Record<string, SourceCharset> = {
 /** 归一化字符集别名；未知字符集返回 null（调用方按「不支持」处理，不猜）。 */
 export function normalizeCharset(raw: unknown): SourceCharset | null {
   if (typeof raw !== 'string') return null;
-  return CHARSET_ALIASES[raw.trim().toLowerCase()] ?? null;
+  const label = raw.trim().toLowerCase();
+  return Object.prototype.hasOwnProperty.call(CHARSET_ALIASES, label) ? CHARSET_ALIASES[label] : null;
 }
 
 /** 从 Content-Type 头解析字符集；无/未知返回 null。 */

@@ -3,6 +3,7 @@
 import { alternateSourceHost, SourcePolicyError, validateSourceUrl } from './source-policy';
 import { recordHostFailure, recordHostSuccess, type HostFailureKind } from './source-host-health';
 import { charsetFromContentType, encodeToBytes, type SourceCharset } from './source-charset';
+import { charsetFromHtmlPrefix, SOURCE_HTML_CHARSET_BYTES } from './source-html-charset';
 
 export const MAX_SOURCE_REDIRECTS = 3;
 export const MAX_SOURCE_BYTES = 2 * 1024 * 1024;
@@ -48,28 +49,50 @@ export function sourceAbortable<T>(promise: PromiseLike<T>, signal: AbortSignal)
   });
 }
 
-async function responseText(response: Response, signal: AbortSignal, maxBytes: number, charset: SourceCharset = 'utf-8') {
+function responseDecoder(charset: SourceCharset) {
+  // 保留UTF8非法字节抛错、GBK类容忍杂散字节的既有语义。
+  return new TextDecoder(charset, { fatal: charset === 'utf-8' });
+}
+
+async function responseText(response: Response, signal: AbortSignal, maxBytes: number, charset: SourceCharset, sniffHtml: boolean) {
   if (Number(response.headers.get('content-length')) > maxBytes) {
     cancelBody(response);
     throw new SourcePolicyError('书源响应体积超限');
   }
   if (!response.body) return '';
   const reader = response.body.getReader();
-  // utf-8 保持 fatal:true（改前语义，非法字节抛错、不换 host）；GBK 类 fatal:false 容忍杂散字节。
-  const decoder = charset === 'utf-8'
-    ? new TextDecoder('utf-8', { fatal: true })
-    : new TextDecoder(charset, { fatal: false });
+  let decoder = sniffHtml ? undefined : responseDecoder(charset);
+  const prefix = new Uint8Array(sniffHtml ? SOURCE_HTML_CHARSET_BYTES : 0);
+  let prefixBytes = 0;
   let bytes = 0;
   let text = '';
   let complete = false;
+  const decodePrefix = () => {
+    const leading = prefix.subarray(0, prefixBytes);
+    const selected = responseDecoder(charsetFromHtmlPrefix(leading) ?? charset);
+    text += selected.decode(leading, { stream: true });
+    return selected;
+  };
   try {
     while (true) {
       signal.throwIfAborted();
       const { value, done } = await sourceAbortable(reader.read(), signal);
-      if (done) { complete = true; return text + decoder.decode(); }
+      if (done) {
+        decoder ??= decodePrefix();
+        complete = true;
+        return text + decoder.decode();
+      }
       bytes += value.byteLength;
       if (bytes > maxBytes) throw new SourcePolicyError('书源响应体积超限');
-      text += decoder.decode(value, { stream: true });
+      let offset = 0;
+      if (!decoder) {
+        offset = Math.min(value.byteLength, prefix.length - prefixBytes);
+        prefix.set(value.subarray(0, offset), prefixBytes);
+        prefixBytes += offset;
+        if (prefixBytes < prefix.length) continue;
+        decoder = decodePrefix();
+      }
+      text += decoder.decode(value.subarray(offset), { stream: true });
     }
   } finally {
     if (!complete) void reader.cancel(signal.reason).catch(() => {});
@@ -113,7 +136,7 @@ interface FetchSourceOptions {
   beforeRequest?: (signal: AbortSignal) => Promise<void>;
   /** POST/body/头覆写；缺省纯 GET。 */
   request?: SourcePageRequest;
-  /** 响应解码字符集：显式字符集、或 'auto'（按 Content-Type，回退 utf-8）；缺省 utf-8（改前语义）。 */
+  /** 显式字符集、或auto（HTTP声明→有界HTML head meta→UTF8）；缺省仍为UTF8。 */
   responseCharset?: SourceCharset | 'auto';
 }
 
@@ -244,13 +267,15 @@ async function attemptOnce(start: URL, {
         continue;
       }
       if (!received.ok) throw new SourceHttpError(received.status, parseRetryAfterMs(received.headers.get('retry-after')));
-      // 解码字符集：显式字符集优先；'auto' 按 Content-Type 嗅探（回退 utf-8）；缺省 utf-8（改前语义）。
+      // 仅auto且无有效HTTP声明的HTML响应考虑head meta；不改变显式或缺省解码。
+      const contentType = received.headers.get('content-type');
+      const httpCharset = responseCharset === 'auto' ? charsetFromContentType(contentType) : null;
       const charset: SourceCharset = responseCharset && responseCharset !== 'auto'
         ? responseCharset
-        : responseCharset === 'auto'
-          ? charsetFromContentType(received.headers.get('content-type')) ?? 'utf-8'
-          : 'utf-8';
-      const text = await responseText(received, signal, maxBytes, charset);
+        : httpCharset ?? 'utf-8';
+      const sniffHtml = responseCharset === 'auto' && !httpCharset &&
+        contentType?.split(';', 1)[0].trim().toLowerCase() === 'text/html';
+      const text = await responseText(received, signal, maxBytes, charset, sniffHtml);
       signal.throwIfAborted();
       return { url: current, text };
     }
