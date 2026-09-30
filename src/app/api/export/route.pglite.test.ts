@@ -85,33 +85,36 @@ async function exportA() {
   return GET(new NextRequest(`http://localhost/api/export?userId=${USER_B}`));
 }
 
-beforeAll(async () => {
-  const PGlite = await loadPGlite();
-  if (!PGlite) throw new Error('PGlite is required for export row-level regression');
-  pg = new PGlite();
-  // PostgreSQL's timestamptz::text projection uses the session timezone.
-  await pg.exec("SET TIME ZONE 'UTC'");
-  sql = createPGliteSql(pg);
-  await createProductionSchema(sql as never, statement => pg.exec(statement));
-  await seedProductionMembers(pg, USER_B);
-}, 60_000);
+// A null constructor means loadPGlite explicitly allowed optional unavailability.
+// Required-mode failures still reject here; an installed dependency always runs.
+const PGliteCtor = await loadPGlite();
+const describeWithPGlite = PGliteCtor ? describe : describe.skip;
 
-afterAll(async () => { await pg?.close(); });
+describeWithPGlite('GET /api/export with real production SQL and PGlite rows', () => {
+  beforeAll(async () => {
+    pg = new PGliteCtor!();
+    // PostgreSQL's timestamptz::text projection uses the session timezone.
+    await pg.exec("SET TIME ZONE 'UTC'");
+    sql = createPGliteSql(pg);
+    await createProductionSchema(sql as never, statement => pg.exec(statement));
+    await seedProductionMembers(pg, USER_B);
+  }, 60_000);
 
-beforeEach(async () => {
-  vi.clearAllMocks();
-  // Only synthetic, in-memory tables; no deployment env or database connection.
-  await pg.exec('TRUNCATE recommendations, feedback, profile, books, labeled_books RESTART IDENTITY CASCADE');
-  await seedGraph();
-  mocks.getSql.mockReturnValue(sql);
-  mocks.requirePermission.mockResolvedValue({ ok: true, principal: {
-    userId: USER_A, role: 'member', canFind: true, canRead: false, canDownload: false, authMethod: 'session',
-  } });
-});
+  afterAll(async () => { await pg?.close(); });
 
-afterEach(() => { vi.restoreAllMocks(); });
+  beforeEach(async () => {
+    vi.clearAllMocks();
+    // Only synthetic, in-memory tables; no deployment env or database connection.
+    await pg.exec('TRUNCATE recommendations, feedback, profile, books, labeled_books RESTART IDENTITY CASCADE');
+    await seedGraph();
+    mocks.getSql.mockReturnValue(sql);
+    mocks.requirePermission.mockResolvedValue({ ok: true, principal: {
+      userId: USER_A, role: 'member', canFind: true, canRead: false, canDownload: false, authMethod: 'session',
+    } });
+  });
 
-describe('GET /api/export with real production SQL and PGlite rows', () => {
+  afterEach(() => { vi.restoreAllMocks(); });
+
   it('exports exactly A reference closure once per book and isolates all three private tables', async () => {
     const transaction = vi.spyOn(sql, 'transaction'); // Call-through, never canned rows.
     const response = await exportA();
