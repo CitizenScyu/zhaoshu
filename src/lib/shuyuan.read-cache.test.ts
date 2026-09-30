@@ -30,7 +30,7 @@ import {
   getReadingSources, getShuyuanPoolHealth, invalidateShuyuanReadCache, refreshShuyuan, shuyuanReadCacheTtlMs,
   writeAdmissionRows,
 } from './shuyuan';
-import { refreshSupportedHosts, supportedHostList } from './source-policy';
+import { refreshSupportedHosts, supportedHostList, supportedHostVersion } from './source-policy';
 import { resolveDownloadSource } from './download-source';
 import { rulesHash, type AdmissionSourceRow } from './rule-engine/admission';
 
@@ -380,4 +380,132 @@ describe('写路径之后读到新值（本实例失效缓存）', () => {
     expect((await getReadingSources(signal())).map((source) => source.url))
       .toEqual(['https://book15.net/', 'https://b.example/']);
   });
+});
+
+
+describe('host 缓存消费者的晚兑现发布', () => {
+  function holdHosts() {
+    const base = execute.getMockImplementation()!;
+    const pending: Array<{ resolve: (rows: unknown[]) => void; reject: (error: unknown) => void }> = [];
+    execute.mockImplementation(query => kind(query.text) === 'hosts'
+      ? new Promise<unknown[]>((resolve, reject) => { pending.push({ resolve, reject }); }) : base(query));
+    return pending;
+  }
+  const oldHosts = [{ host: 'a.example' }];
+  const newHosts = [{ host: 'a.example' }, { host: 'b.example' }];
+  const urls = (pool: Awaited<ReturnType<typeof getReadingSources>>) => pool.map(source => source.url);
+
+  it.each(['success', 'failure'])('invalidate 后新池先完成，旧%s采用新结果且不重刷门', async result => {
+    const pending = holdHosts();
+    const a = getReadingSources(signal());
+    await vi.waitFor(() => expect(pending).toHaveLength(1));
+    invalidateShuyuanReadCache();
+    const b = getReadingSources(signal());
+    await vi.waitFor(() => expect(pending).toHaveLength(2));
+    pending[1].resolve(newHosts); await b;
+    const version = supportedHostVersion();
+    if (result === 'success') pending[0].resolve(oldHosts); else pending[0].reject(new Error('synthetic old failure'));
+    expect(urls(await a)).toContain('https://b.example/');
+    expect(supportedHostVersion()).toBe(version);
+    await getReadingSources(signal()); expect(pending).toHaveLength(2);
+  });
+
+  it('失效时没有后继则仅重读一次', async () => {
+    const pending = holdHosts(); const a = getReadingSources(signal());
+    await vi.waitFor(() => expect(pending).toHaveLength(1)); invalidateShuyuanReadCache(); pending[0].resolve(oldHosts);
+    await vi.waitFor(() => expect(pending).toHaveLength(2)); pending[1].resolve(newHosts);
+    expect(urls(await a)).toContain('https://b.example/'); expect(pending).toHaveLength(2);
+  });
+
+  it('TTL替换旧entry后晚结果采用新entry', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    const pending = holdHosts(); const a = getReadingSources(signal());
+    await vi.waitFor(() => expect(pending).toHaveLength(1)); vi.setSystemTime(Date.now() + 300001);
+    const b = getReadingSources(signal()); await vi.waitFor(() => expect(pending).toHaveLength(2));
+    pending[1].resolve(newHosts); await b; pending[0].resolve(oldHosts);
+    expect(urls(await a)).toContain('https://b.example/'); expect(pending).toHaveLength(2);
+  });
+
+  it('同entry并发仅一次读取与发布', async () => {
+    const pending = holdHosts(); const version = supportedHostVersion();
+    const a = getReadingSources(signal()), b = getReadingSources(signal());
+    await vi.waitFor(() => expect(pending).toHaveLength(1)); pending[0].resolve(newHosts);
+    expect(await a).toEqual(await b); expect(supportedHostVersion()).toBe(version + 1); expect(pending).toHaveLength(1);
+  });
+
+  it.each(['same', 'aba'])('外部%s发布使尚未完成的旧读取失效', async mode => {
+    const pending = holdHosts(); const a = getReadingSources(signal());
+    await vi.waitFor(() => expect(pending).toHaveLength(1));
+    if (mode === 'aba') refreshSupportedHosts(['b.example']);
+    refreshSupportedHosts([]); pending[0].resolve(oldHosts);
+    await vi.waitFor(() => expect(pending).toHaveLength(2)); pending[1].resolve(newHosts);
+    expect(urls(await a)).toContain('https://b.example/'); expect(pending).toHaveLength(2);
+  });
+
+  it('当前读取失败保留门，下一请求重读', async () => {
+    const pending = holdHosts(); refreshSupportedHosts(['b.example']); const a = getReadingSources(signal());
+    await vi.waitFor(() => expect(pending).toHaveLength(1)); pending[0].reject(new Error('synthetic failure'));
+    expect(urls(await a)).toEqual(['https://book15.net/']); expect(supportedHostList()).toContain('b.example');
+    const b = getReadingSources(signal()); await vi.waitFor(() => expect(pending).toHaveLength(2)); pending[1].resolve(newHosts);
+    expect(urls(await b)).toContain('https://b.example/');
+  });
+
+  it('连续再次失效至上限，停止重读并降级', async () => {
+    const pending = holdHosts(); const version = supportedHostVersion(); const a = getReadingSources(signal());
+    await vi.waitFor(() => expect(pending).toHaveLength(1)); invalidateShuyuanReadCache(); pending[0].resolve(oldHosts);
+    await vi.waitFor(() => expect(pending).toHaveLength(2)); invalidateShuyuanReadCache(); pending[1].resolve(newHosts);
+    expect(urls(await a)).toEqual(['https://book15.net/']); expect(pending).toHaveLength(2); expect(supportedHostVersion()).toBe(version);
+  });
+
+  it('TTL0独立caller信号，已成功后继可复用但顺序调用仍重读', async () => {
+    vi.stubEnv('SHUYUAN_READ_CACHE_TTL_MS', '0');
+    const pending = holdHosts(), ac = new AbortController(), bc = new AbortController();
+    const a = getReadingSources(ac.signal), b = getReadingSources(bc.signal);
+    await vi.waitFor(() => expect(pending).toHaveLength(2));
+    pending[1].resolve(newHosts); await b; pending[0].resolve(oldHosts);
+    expect(urls(await a)).toContain('https://b.example/');
+    const c = getReadingSources(signal()); await vi.waitFor(() => expect(pending).toHaveLength(3)); pending[2].resolve(newHosts); await c;
+  });
+
+  it('TTL0后继取消不连坐旧caller，保留自己尚有效的读取', async () => {
+    vi.stubEnv('SHUYUAN_READ_CACHE_TTL_MS', '0');
+    const pending = holdHosts(), ac = new AbortController(), bc = new AbortController();
+    const a = getReadingSources(ac.signal), b = getReadingSources(bc.signal);
+    const rejected = expect(b).rejects.toBeTruthy();
+    await vi.waitFor(() => expect(pending).toHaveLength(2)); bc.abort(); await rejected; pending[0].resolve(newHosts);
+    expect(urls(await a)).toContain('https://b.example/'); expect(pending).toHaveLength(2);
+    const version = supportedHostVersion(); pending[1].resolve(oldHosts);
+    await new Promise<void>(resolve => setImmediate(resolve));
+    expect(supportedHostVersion()).toBe(version); expect(ac.signal.aborted).toBe(false);
+  });
+
+  it('TTL0无失效按起调顺序完成，不额外重读或降级，原信号直传', async () => {
+    vi.stubEnv('SHUYUAN_READ_CACHE_TTL_MS', '0');
+    const pending = holdHosts(), ac = new AbortController(), bc = new AbortController();
+    const client = getSql(); const original = client.transaction;
+    const hostSignals: AbortSignal[] = [];
+    client.transaction = (queries: Query[], options?: TransactionOptions) => {
+      if (kind(queries[0].text) === 'hosts') hostSignals.push(options!.fetchOptions!.signal);
+      return original(queries, options);
+    };
+    const a = getReadingSources(ac.signal), b = getReadingSources(bc.signal);
+    await vi.waitFor(() => expect(pending).toHaveLength(2));
+    pending[0].resolve(newHosts); expect(urls(await a)).toContain('https://b.example/');
+    pending[1].resolve(newHosts); expect(urls(await b)).toContain('https://b.example/');
+    expect(pending).toHaveLength(2); expect(hostSignals).toEqual([ac.signal, bc.signal]);
+  });
+
+
+  it('TTL0明确失效且后继取消时，以自身signal仅重读一次', async () => {
+    vi.stubEnv('SHUYUAN_READ_CACHE_TTL_MS', '0');
+    const pending = holdHosts(), ac = new AbortController(), bc = new AbortController();
+    const a = getReadingSources(ac.signal);
+    await vi.waitFor(() => expect(pending).toHaveLength(1)); invalidateShuyuanReadCache();
+    const b = getReadingSources(bc.signal); const rejected = expect(b).rejects.toBeTruthy();
+    await vi.waitFor(() => expect(pending).toHaveLength(2)); bc.abort(); await rejected; pending[0].resolve(oldHosts);
+    await vi.waitFor(() => expect(pending).toHaveLength(3)); pending[2].resolve(newHosts);
+    expect(urls(await a)).toContain('https://b.example/'); expect(ac.signal.aborted).toBe(false);
+    pending[1].resolve(oldHosts);
+  });
+
 });

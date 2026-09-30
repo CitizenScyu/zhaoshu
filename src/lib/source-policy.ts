@@ -13,13 +13,17 @@ export const SUPPORTED_SOURCE_HOST: SupportedSourceHost = 'book15.net';
 // **绝不放大、也绝不空集**（空集会杀死全部现有阅读）。
 const builtinHosts: ReadonlySet<string> = new Set(BUILTIN_SOURCE_HOSTS);
 let supportedHosts: ReadonlySet<string> = builtinHosts;
+let supportedHostsVersion = 0;
+
+/** 发布版本包含同集合重刷，用于阻止在途旧读取覆盖外部更新。 */
+export function supportedHostVersion(): number { return supportedHostsVersion; }
 
 /**
  * 用一批 host 重算运行时集合（设计 §6.1 第 2 条）。语义：
  * - 始终以内建集合为底（book15 双 host 永不被移除，绝不空集）；
  * - 只并入**规范 hostname** 形态的条目（无端口/路径/userinfo/方括号），且非裸 IP/私网/环回；
  * - 传入空/全非法时结果 = 内建集合（收窄，绝不放大）。
- * 写入口只在 cron 准入批次（shuyuan.ts refreshWithinBudget）；运行时请求无写路径。
+ * cron 与运行时源池/下载定位均可更新本进程集合；这里不写数据库。
  */
 export function refreshSupportedHosts(hosts: Iterable<string>): void {
   const next = new Set<string>(builtinHosts);
@@ -31,6 +35,7 @@ export function refreshSupportedHosts(hosts: Iterable<string>): void {
     next.add(normalized);
   }
   supportedHosts = next;
+  supportedHostsVersion += 1;
 }
 
 /** 当前运行时 host 门的只读快照（字典序）。供 DB 读投影按门预筛（shuyuan.ts poolProbeMeta），不改门。 */

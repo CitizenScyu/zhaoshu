@@ -2,7 +2,7 @@ import { getSql } from '@/lib/db';
 import { engineHosts } from '@/lib/supported-sources-server';
 import { isRecord } from '@/lib/sanitize';
 import { createDeadline, raceDeadline, type RequestDeadline } from '@/lib/deadline';
-import { validateSourceUrl, refreshSupportedHosts, supportedHostList, upgradeSourceTemplateUrl } from '@/lib/source-policy';
+import { validateSourceUrl, refreshSupportedHosts, supportedHostList, supportedHostVersion, upgradeSourceTemplateUrl } from '@/lib/source-policy';
 import { engineSourceUsable } from '@/lib/source-usability';
 import {
   BUILTIN_SOURCE_HOSTS, builtinFallbackSource, builtinUrlPrefixes, type SupportedSourceTier,
@@ -457,11 +457,7 @@ async function refreshEngineHostGate(signal: AbortSignal, fresh = false): Promis
       return true;
     }
     // 41-xferfix B1：门被缓存之外改过则先作废缓存（见 syncReadCacheWithGate），再按缓存 host 集刷门并记下快照。
-    syncReadCacheWithGate();
-    refreshSupportedHosts(await cachedRead('engineHosts', signal,
-      (sig) => artifactOr((artifact) => artifact.hosts, () => engineHosts(sig))));
-    gateFromCache = supportedHostList().join(',');
-    return true;
+    return await publishCurrentHostRead(signal);
   } catch (error) {
     signal.throwIfAborted();
     console.error('shuyuan engine host gate refresh failed, falling back to builtin only', {
@@ -798,6 +794,7 @@ type ReadCacheEntry = { expiresAt: number; value: Promise<unknown> };
 const readCache = new Map<string, ReadCacheEntry>();
 /** 上次按缓存 engineHosts 刷出的门快照（refreshEngineHostGate 据此识别门被缓存之外改过）；null = 无。 */
 let gateFromCache: string | null = null;
+let readCacheGeneration = 0;
 
 /**
  * 丢弃全部池合成读缓存：本实例写路径之后调用；测试之间重置也用它。
@@ -810,6 +807,7 @@ export function invalidateShuyuanReadCache(): void {
 }
 
 function clearReadCache(): void {
+  readCacheGeneration += 1;
   readCache.clear();
   gateFromCache = null;
 }
@@ -832,6 +830,12 @@ async function cachedRead<T>(
   const ttl = shuyuanReadCacheTtlMs();
   if (ttl <= 0) return load(signal);
   signal?.throwIfAborted();
+  const entry = readCacheEntry(key, ttl, load);
+  const value = entry.value as Promise<T>;
+  return signal ? raceDeadline(signal, () => value) : value;
+}
+
+function readCacheEntry<T>(key: string, ttl: number, load: (signal: AbortSignal) => Promise<T>): ReadCacheEntry {
   const now = Date.now();
   let entry = readCache.get(key);
   if (!entry || entry.expiresAt <= now) {
@@ -842,8 +846,89 @@ async function cachedRead<T>(
     created.value.catch(() => { if (readCache.get(key) === created) readCache.delete(key); });
     entry = created;
   }
-  const value = entry.value as Promise<T>;
-  return signal ? raceDeadline(signal, () => value) : value;
+  return entry;
+}
+
+type HostReadOutcome = { ok: true; hosts: string[] } | { ok: false; error: unknown };
+type HostReadTask = {
+  sequence: number;
+  entry: ReadCacheEntry | null;
+  callerSignal?: AbortSignal;
+  generation: number;
+  version: number;
+  publishedVersion?: number;
+  outcome?: HostReadOutcome;
+  value: Promise<HostReadOutcome>;
+};
+let hostReadTask: HostReadTask | undefined;
+let hostReadSequence = 0;
+let lastHostPublication: HostReadTask | undefined;
+
+function currentHostTask(task: HostReadTask): boolean {
+  const version = supportedHostVersion();
+  const ownEarlierPublication = lastHostPublication?.publishedVersion === version
+    && lastHostPublication.generation === task.generation && lastHostPublication.sequence <= task.sequence;
+  return task.generation === readCacheGeneration
+    && !task.callerSignal?.aborted
+    && (version === (task.publishedVersion ?? task.version) || ownEarlierPublication)
+    && (!task.entry ? (lastHostPublication?.sequence ?? 0) <= task.sequence
+      : hostReadTask === task && (readCache.get('engineHosts') === task.entry
+      // 失败清理已删除自己的 entry，并不等于出现了更新任务。
+      || (!task.outcome?.ok && !readCache.has('engineHosts'))));
+}
+
+function acquireHostRead(signal: AbortSignal): HostReadTask {
+  syncReadCacheWithGate();
+  // 已完成的缓存结果与外部鲜读集合相同，保留 B1 的稳态命中；在途任务不能这样确认。
+  if (hostReadTask?.generation === readCacheGeneration && hostReadTask.publishedVersion !== undefined
+    && gateFromCache === supportedHostList().join(',')) hostReadTask.publishedVersion = supportedHostVersion();
+  // 集合相同或 A→B→A 仍是外部发布，字符串快照无法区分。
+  if (hostReadTask?.generation === readCacheGeneration
+    && !currentHostTask(hostReadTask)) clearReadCache();
+  const ttl = shuyuanReadCacheTtlMs();
+  const load = (sig: AbortSignal) => artifactOr((artifact) => artifact.hosts, () => engineHosts(sig));
+  const entry = ttl > 0 ? readCacheEntry('engineHosts', ttl, load) : null;
+  if (entry && hostReadTask?.entry === entry && currentHostTask(hostReadTask)) return hostReadTask;
+  const value = entry ? entry.value as Promise<string[]> : load(signal);
+  const task: HostReadTask = {
+    sequence: ++hostReadSequence,
+    entry, generation: readCacheGeneration, version: supportedHostVersion(),
+    callerSignal: entry ? undefined : signal,
+    value: value.then(
+      (hosts): HostReadOutcome => ({ ok: true, hosts }),
+      (error: unknown): HostReadOutcome => ({ ok: false, error }),
+    ).then((outcome) => { task.outcome = outcome; return outcome; }),
+  };
+  hostReadTask = task;
+  return task;
+}
+
+function publishHostTask(task: HostReadTask): boolean {
+  if (!currentHostTask(task) || !task.outcome?.ok) return false;
+  if (task.publishedVersion === undefined) {
+    refreshSupportedHosts(task.outcome.hosts);
+    task.publishedVersion = supportedHostVersion();
+    lastHostPublication = task;
+    gateFromCache = supportedHostList().join(',');
+  }
+  return true;
+}
+
+async function publishCurrentHostRead(signal: AbortSignal): Promise<boolean> {
+  signal.throwIfAborted();
+  let task = acquireHostRead(signal);
+  // 仅允许一次后继重定位；稳定新结果可直接复用，不循环追逐持续失效。
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const outcome = await raceDeadline(signal, () => task.value);
+    signal.throwIfAborted();
+    if (currentHostTask(task)) {
+      if (!outcome.ok) throw outcome.error;
+      return publishHostTask(task);
+    }
+    if (hostReadTask && publishHostTask(hostReadTask)) return true;
+    if (attempt === 0) task = hostReadTask?.entry && currentHostTask(hostReadTask) ? hostReadTask : acquireHostRead(signal);
+  }
+  return false;
 }
 
 // —— 源池产物（41-poolimpl，设计 poolart-41-report §2）：池合成四份输入行「产物优先、失败回退库」——
