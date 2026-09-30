@@ -247,6 +247,7 @@ export default function AuthForm({
             <button
               type="button"
               className="underline underline-offset-4"
+              disabled={busy}
               onClick={() => { setModeOverride(memberMode ? 'owner' : 'member'); setError(''); setPassword(''); }}
             >
               {memberMode ? '管理员口令登录' : '返回账号登录'}
