@@ -508,4 +508,26 @@ describe('host 缓存消费者的晚兑现发布', () => {
     pending[1].resolve(oldHosts);
   });
 
+
+  it('TTL0后继B已发布但C仍挂起，失效A直接采用B而不多发D', async () => {
+    vi.stubEnv('SHUYUAN_READ_CACHE_TTL_MS', '0');
+    const pending = holdHosts(); const a = getReadingSources(signal());
+    await vi.waitFor(() => expect(pending).toHaveLength(1)); invalidateShuyuanReadCache();
+    const b = getReadingSources(signal()); await vi.waitFor(() => expect(pending).toHaveLength(2));
+    pending[1].resolve(newHosts); await b;
+    const version = supportedHostVersion();
+    const c = getReadingSources(signal()); await vi.waitFor(() => expect(pending).toHaveLength(3));
+    let settled = false;
+    const observedA = a.then(pool => { settled = true; return pool; });
+    pending[0].resolve(oldHosts);
+    await vi.waitFor(() => {
+      // A如果错误地启动第4读，立即失败而不是把未结算任务留到测试超时。
+      if (pending[3]) pending[3].reject(new Error('unexpected fourth host read'));
+      expect(settled).toBe(true);
+    });
+    expect(urls(await observedA)).toContain('https://b.example/');
+    expect(pending).toHaveLength(3); expect(supportedHostVersion()).toBe(version);
+    pending[2].resolve(newHosts); expect(urls(await c)).toContain('https://b.example/');
+  });
+
 });

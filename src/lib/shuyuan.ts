@@ -926,6 +926,7 @@ async function publishCurrentHostRead(signal: AbortSignal): Promise<boolean> {
       return publishHostTask(task);
     }
     if (hostReadTask && publishHostTask(hostReadTask)) return true;
+    if (lastHostPublication && publishHostTask(lastHostPublication)) return true;
     if (attempt === 0) task = hostReadTask?.entry && currentHostTask(hostReadTask) ? hostReadTask : acquireHostRead(signal);
   }
   return false;
