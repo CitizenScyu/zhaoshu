@@ -142,4 +142,5 @@ it.each(['network', 'http', 'json', 'success'] as const)(
     expect((screen.getByRole('checkbox', { name: 'synthetic_2 canRead' }) as HTMLInputElement).checked).toBe(true);
     expectIntrinsicDisabled();
   },
+  15_000, // Multiple user-event rounds; this is a contract test, not a latency threshold.
 );
