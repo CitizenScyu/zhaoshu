@@ -28,6 +28,36 @@ const { getSql, sql, execute, transaction } = vi.hoisted(() => {
 
 vi.mock('@/lib/db', () => ({ ensureSchema: vi.fn(), getSql }));
 
+// 真实注册表里 book15 已退休（识别仍在、不许发请求，618 失效源整改）。池合成/产物用例需要
+// 「已注册的活跃内建源」：mock 注册表——退休 book15 原样保留，另注册一个活跃内建源 builtin.test
+// （host 进识别集合，行才能过 isActiveBuiltinHost/canProbe）。全部判定走被测模块的真实实现
+// （isHostActiveInSources / sourceForHostIn / 同一过滤谓词），只换注册表数据。
+vi.mock('@/lib/supported-sources', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/lib/supported-sources')>();
+  const activeBuiltin: import('@/lib/supported-sources').SupportedSource = {
+    url: 'https://builtin.test/',
+    name: 'builtin.test',
+    searchUrl: 'https://builtin.test/s?q={{key}}',
+    rules: {},
+    tier: 'builtin',
+    enabled: true,
+    lifecycle: 'active',
+    retiredReason: null,
+  };
+  const sources = [...actual.BUILTIN_SOURCES, activeBuiltin];
+  const active = () => sources.filter((source) => source.lifecycle === 'active' && source.enabled !== false);
+  return {
+    ...actual,
+    BUILTIN_SOURCE_HOSTS: [...actual.BUILTIN_SOURCE_HOSTS, 'builtin.test'],
+    BUILTIN_SOURCES: sources,
+    activeBuiltinSources: () => active(),
+    activeBuiltinSource: () => active()[0] ?? null,
+    builtinUrlPrefixes: () => sources.map((source) => new URL(source.url).origin),
+    builtinSourceForHost: (host: string) => actual.sourceForHostIn(host, sources),
+    isActiveBuiltinHost: (host: string) => actual.isHostActiveInSources(host, sources),
+  };
+});
+
 import {
   buildShuyuanPoolArtifact, disableShuyuanSource, enableShuyuanSource, getEngineSources, getFanoutPool,
   getPoolEngineHosts, getReadingSources, getSourcePools, invalidateShuyuanReadCache, publishPoolArtifact, refreshShuyuan,
@@ -50,6 +80,13 @@ const CHECKED = '2026-09-25T00:00:00Z';
 const metaWith = (entries: unknown[]) => ({
   collections: [{ id: 1, title: '合集', count: 1, probeSnapshot: { version: 1, entries } }],
   refreshed_at: '2026-09-24T00:00:00Z',
+});
+/** 已注册的活跃内建源行（合成注册表的 builtin.test，见顶部 vi.mock）。 */
+const builtinRegisteredRow = () => ({
+  source_url: 'https://builtin.test', source: {
+    bookSourceUrl: 'https://builtin.test', bookSourceName: 'builtin.test',
+    searchUrl: 'https://builtin.test/s?q={{key}}', enabled: true,
+  }, name: 'builtin.test', disabled_at: null, last_error: '',
 });
 
 const db = {
@@ -120,7 +157,7 @@ beforeEach(() => {
     { url: 'https://c.example', status: 'reachable', checked_at: CHECKED, error: null },
     { url: 'https://unrelated.example', status: 'failed', checked_at: CHECKED, error: 'x' },
   ]);
-  db.builtin = [];
+  db.builtin = [builtinRegisteredRow()];
   db.engine = [engineRowAt('a.example'), engineRowAt('b.example'), engineRowAt('c.example', { tier: 'T7' })];
   db.updateHits = 1;
   execute.mockReset().mockImplementation(async (query) => {
@@ -161,7 +198,7 @@ describe('生成：字段取自库，探测条目只留池行 URL', () => {
     const artifact = await buildShuyuanPoolArtifact(signal());
     expect(artifact.hosts).toEqual(['a.example', 'b.example', 'c.example']);
     expect(artifact.engine).toEqual(db.engine);
-    expect(artifact.builtin).toEqual([]);
+    expect(artifact.builtin).toEqual(db.builtin);
     expect(artifact.refreshedAt).toBe('2026-09-24T00:00:00Z');
     expect(artifact.probe.version).toBe(1);
     expect((artifact.probe.entries as { url: string }[]).map((e) => e.url)).toEqual(['https://a.example', 'https://c.example']);
@@ -177,7 +214,7 @@ describe('生成：字段取自库，探测条目只留池行 URL', () => {
 describe('消费：产物优先', () => {
   it('产物可用 ⇒ 取书池/扇出/selectable/引擎池/门与库读逐条相同，且零 DB 读', async () => {
     const baseline = await dbBaseline();
-    expect(baseline.reading).toEqual(['https://book15.net/', 'https://c.example/', 'https://b.example/']);
+    expect(baseline.reading).toEqual(['https://builtin.test/', 'https://c.example/', 'https://b.example/']);
     await seedArtifact();
     expect(urls(await getReadingSources(signal()))).toEqual(baseline.reading);
     expect((await getFanoutPool(signal())).map((s) => [s.url, s.readable])).toEqual(baseline.fanout);
@@ -192,7 +229,7 @@ describe('消费：产物优先', () => {
     await seedArtifact();
     db.engine = [engineRowAt('b.example')];
     vi.stubEnv('SHUYUAN_POOL_ARTIFACT', '0');
-    expect(urls(await getReadingSources(signal()))).toEqual(['https://book15.net/', 'https://b.example/']);
+    expect(urls(await getReadingSources(signal()))).toEqual(['https://builtin.test/', 'https://b.example/']);
     expect(dbReads()).toEqual(expect.arrayContaining(['hosts', 'poolMeta', 'builtinRows', 'engineRows']));
     expect(await getPoolEngineHosts(signal())).toEqual(['a.example', 'b.example', 'c.example']);
     expect(dbReads().filter((k) => k === 'hosts')).toHaveLength(2);
@@ -221,11 +258,11 @@ describe('消费：产物优先', () => {
   it('产物过期（默认 36h）⇒ 回退库读；调大 SHUYUAN_POOL_ARTIFACT_MAX_AGE_HOURS 后照常采信', async () => {
     await seedArtifact(Date.now() - 37 * 3_600_000);
     db.engine = [engineRowAt('b.example')];
-    expect(urls(await getReadingSources(signal()))).toEqual(['https://book15.net/', 'https://b.example/']);
+    expect(urls(await getReadingSources(signal()))).toEqual(['https://builtin.test/', 'https://b.example/']);
     expect(console.warn).toHaveBeenCalledWith(expect.any(String), { reason: 'stale', from: 'file' });
     vi.stubEnv('SHUYUAN_POOL_ARTIFACT_MAX_AGE_HOURS', '48');
     execute.mockClear();
-    expect(urls(await getReadingSources(signal()))).toEqual(['https://book15.net/', 'https://c.example/', 'https://b.example/']);
+    expect(urls(await getReadingSources(signal()))).toEqual(['https://builtin.test/', 'https://c.example/', 'https://b.example/']);
     expect(dbReads()).toEqual([]);
   });
 
@@ -239,7 +276,7 @@ describe('消费：产物优先', () => {
     expect(dbReads()).toEqual([]);
     db.engine = [engineRowAt('a.example'), engineRowAt('b.example'), engineRowAt('c.example', { disabled_at: CHECKED })];
     expect(await disableShuyuanSource('https://c.example', '人工禁用')).toBe(true);
-    expect(urls(await getReadingSources(signal()))).toEqual(['https://book15.net/', 'https://b.example/']);
+    expect(urls(await getReadingSources(signal()))).toEqual(['https://builtin.test/', 'https://b.example/']);
     expect(dbReads()).toContain('engineRows');
   });
 });
@@ -254,7 +291,7 @@ describe('写路径时序：写库成功才发布', () => {
     expect(after.contentHash).not.toBe(before);
     expect(after.engine.find((row: { source_url: string }) => row.source_url === 'https://c.example').disabled_at).toBe(CHECKED);
     execute.mockClear();
-    expect(urls(await getReadingSources(signal()))).toEqual(['https://book15.net/', 'https://b.example/']);
+    expect(urls(await getReadingSources(signal()))).toEqual(['https://builtin.test/', 'https://b.example/']);
     expect(dbReads()).toEqual([]);
   });
 
