@@ -34,16 +34,31 @@
 - `Ran 1041 tests in 7.724s` / `OK` / `GATE_EXIT=0 tests=1041 failures=0 errors=0 skipped=0`
 - 发现总数 1041，成功 1041，失败 0，错误 0，跳过 0，退出码 0。
 
-## 5. 网络阻断与放行计数（分开报）
+## 5. 网络阻断与放行计数（自检期与测试期分开报）
 
-- 门跑全程：BLOCKED_NET=2、BLOCKED_DNS=1（全部来自门自举的正控制合成调用）、BLOCKED_PROC=0、ALLOWED_PROC=0。
-- 即：套件运行期真实网络出网次数=0、真实 DNS 解析次数=0、子进程放行次数=0（套件内 subprocess 全为 mock，未真起进程）。
+最终门进程内全程累计（进程级计数，两阶段同进程）：
+
+| 阶段 | BLOCKED_NET | BLOCKED_DNS | BLOCKED_PROC | ALLOWED_PROC |
+|---|---|---|---|---|
+| 门自举正控制（合成调用，跑测试前） | 2 | 1 | 0 | 0 |
+| 测试套件运行期 | 0 | 0 | 0 | 0 |
+| 合计 | 2 | 1 | 0 | 0 |
+
+- 自检期 3 次拦截全部来自正控制的合成地址（TEST-NET 与 .invalid 域名均为硬编码字符串，未发包未解析）。
+- **测试套件运行期：真实网络出网 0 次、真实 DNS 0 次、真实子进程 0 次**（套件内 subprocess 全为 mock；若护栏被真实出网触发，会以非零计数+失败/错误出现在结果里，实际没有）。
+- 对照参考：修正前首跑（a6afb85 版 audit 拦 urllib.Request）同口径 BLOCKED_NET=4——多出的 2 次正是那个失败用例里被错误拦截层吞掉的合成出网尝试；修正后回落到纯自检期 3 次，进一步佐证套件期零触网。
+
+## 8. 报告版本史（回应主协调：骨架期不该带 DONE）
+
+- a6afb85：骨架版，末尾提前带 DONE——失误，已纠正为「运行中标 RUNNING、完整结果才标 DONE」的约定；该版骨架已被后续版本完整覆盖。
+- b6ed4fd：唯一一次有据修正 + selfcheck 复验证据。
+- 终版（本版）：最终门 1041/1041 全绿 + 计数分段表 + 自扫证据；此时 DONE 才成立。
 
 ## 6. 产物路径与提交
 
 - 脚本：`verify625_launcher.py`、`verify625_gate.py`（本树根）
 - 日志：`verify625-gate.log`（合成测试输出；子进程因 -I 忽略 PYTHONIOENCODING 而以 cp936 写入，已按 GBK 解码规范为 UTF-8，统计数字行均为 ASCII 原样；落盘前后自扫 postgres/sk-/API_KEY=/Bearer/password 模式命中 0）
-- 提交：a6afb85（启动器+门体+骨架+selfcheck 证据）→ b6ed4fd（唯一一次有据修正）→ 最终 HEAD（本报告+最终门日志）见下。
+- 提交：a6afb85（启动器+门体+骨架+selfcheck 证据）→ b6ed4fd（唯一一次有据修正）→ d688f4b（终报+终门日志）→ 追加提交（分段计数表+报告版本史，见 git log）。
 
 ## 7. 结论
 
