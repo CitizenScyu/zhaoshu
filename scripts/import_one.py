@@ -99,7 +99,10 @@ FIELD_STRINGS = ('title', 'site_title', 'author', 'author_encoding',
                  # lblmeta41：打标元数据三字段。**只做类型校验**（非字符串即 failed），
                  # 不写库——labeled_books 没有对应列，写进去要改表结构；这三项只落在
                  # labels.jsonl 里供事后按模型/提示词版本分桶回溯（jsonl 本身可重放）。
-                 'label_model', 'prompt_version', 'label_source')
+                 'label_model', 'prompt_version', 'label_source',
+                 # 628：稳定记录身份键（rank 重定位条目才带）。同上只校验不写库——
+                 # 它是 labeler 断点续传的口径，不是书库身份键（书库仍按 title/author）。
+                 'identity')
 
 # ---- 分类规范化（genre_map.mjs normalizeGenre 的 python 移植）----
 PRIMARY_GENRES = ('玄幻', '仙侠', '武侠', '都市', '历史', '科幻', '悬疑灵异',
