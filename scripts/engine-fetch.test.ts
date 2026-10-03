@@ -2,7 +2,7 @@
 // 参数解析、退出码、stdout 只放数据、凭据不外泄。全部走不依赖外网的路径（无 DATABASE_URL /
 // 参数错 / URL 非法，都在任何 DB/fetch 之前返回）。
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { resolve, dirname, join } from 'node:path';
@@ -259,5 +259,60 @@ describe('engine-fetch errorKind（giveup41）', () => {
     const { downloadErrorKind } = await import('./engine-error-kind.mjs');
     expect(downloadErrorKind(2)).toBe('source_unavailable');
     expect(downloadErrorKind(1)).toBe('partial');
+  });
+});
+
+// cli639：builtin 池段数组合同与退休 host 池反查前收口。退休收口在任何 DB/网络之前返回，
+// 前三条跑真 CLI 也零外网（假 DATABASE_URL 即可）；builtinPoolEntry/次序合同未导出，按源文本钉。
+// 与 runtime-download/engine.ts 的 resolveSource 同档同原因（code=2 + builtin_source_retired）。
+describe('cli639：builtin 池段数组合同与退休 host 池反查前收口', () => {
+  it('toc/content 对退休 builtin host → code=2、原因 builtin_source_retired（--json 第二行 errorKind 同名），DB 不可达不改变结论', () => {
+    // 真实注册表（BUILTIN_SOURCES[0] 已 retired）：假连接串下退休 host 零 DB/网络即收口；
+    // 若退休判定被挪到池反查之后，原因会先撞「引擎源池不可用」而漂移。
+    for (const sub of ['toc', 'content']) {
+      const r = run([sub, '--url', 'https://book15.net/book/123.html', '--json'], { DATABASE_URL: 'postgres://u:p@h/db' });
+      expect(r.status).toBe(2);
+      const lines = r.stderr.split('\n');
+      expect(lines[0]).toContain('builtin_source_retired');
+      expect(JSON.parse(lines[lines.length - 1])).toEqual({ errorKind: 'builtin_source_retired' });
+      expect(r.stdout).toBe('');
+    }
+  }, 60_000);
+
+  it('退休收口先于引擎池：带假 DATABASE_URL 时退休 host 仍以 builtin_source_retired 退 2，不落「引擎源池不可用」', () => {
+    // 假连接串下退休 host 零 DB/网络即收口；若退休判定被挪到池反查之后，原因会先撞
+    // 「引擎源池不可用」而漂移——本用例锁死退休收口先于池反查的次序。
+    const r = run(['content', '--url', 'https://book15.net/book/1.html'], { DATABASE_URL: 'postgres://u:p@h/db' });
+    expect(r.status).toBe(2);
+    expect(r.stderr).toContain('builtin_source_retired');
+    expect(r.stderr).not.toContain('引擎源池不可用');
+    expect(r.stderr).not.toContain('DATABASE_URL');
+  }, 60_000);
+
+  it('www 别名同判退休（同站双 host 跟随主条目）', () => {
+    const r = run(['content', '--url', 'https://www.book15.net/book/1.html', '--json'], { DATABASE_URL: 'postgres://u:p@h/db' });
+    expect(r.status).toBe(2);
+    expect(r.stderr).toContain('builtin_source_retired');
+  }, 60_000);
+
+  it('CLI 形态合同（源文本）：builtinPoolEntry 始终数组；退休收口位于 builtin 直通之后、loadEnginePool 之前', () => {
+    // builtinPoolEntry / resolveSourceForUrl 是 CLI 内部函数（未导出），按源文本钉两个形态合同：
+    // (a) cmdSearch `[...builtinPoolEntry(m)]` 展开要求可迭代——`builtinSource(m) ?? []` 在 active 时
+    //     返回单对象（TypeError 根因），锁死不回退；
+    // (b) isRetiredBuiltinHost 收口必须夹在 isBuiltinHost 直通与 loadEnginePool 之间（退休先于池反查；
+    //     普通 miss/池不可用不混成退休——isRetiredBuiltinHost 对识别集合外 host 返回 false 的语义
+    //     由 src/lib/supported-sources.test.ts 锁定，这里不重复跑网络路径）。
+    const source = readFileSync(cli, 'utf8');
+    expect(source).toContain('function builtinPoolEntry(m)');
+    expect(source).toMatch(/return b \? \[b\] : \[\];/);
+    expect(source).not.toMatch(/builtinSource\(m\) \?\? \[\]/);
+    const resolve = source.indexOf('async function resolveSourceForUrl');
+    const direct = source.indexOf('if (isBuiltinHost(m, host)) return', resolve);
+    const retired = source.indexOf('isRetiredBuiltinHost', resolve);
+    const pool = source.indexOf('loadEnginePool(m, signal)', resolve);
+    expect(resolve).toBeGreaterThan(-1);
+    expect(direct).toBeGreaterThan(-1);
+    expect(retired).toBeGreaterThan(direct);
+    expect(pool).toBeGreaterThan(retired);
   });
 });
