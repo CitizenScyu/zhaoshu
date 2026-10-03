@@ -28,6 +28,36 @@ const { ensureSchema, getSql, sql, execute, transaction, readTransaction } = vi.
 
 vi.mock('@/lib/db', () => ({ ensureSchema, getSql }));
 
+// 真实注册表里 book15 已退休（识别仍在、不许发请求）。池合成用例需要「已注册的活跃内建源」：
+// 这里 mock 注册表——退休 book15 原样保留，另注册一个活跃内建源 builtin.test（host 进识别集合，
+// validateSourceUrl 的内建兜底才放行它的行）。全部判定走被测模块的真实实现
+// （isHostActiveInSources / sourceForHostIn / 同一过滤谓词），只换注册表数据。
+vi.mock('@/lib/supported-sources', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/lib/supported-sources')>();
+  const activeBuiltin: import('@/lib/supported-sources').SupportedSource = {
+    url: 'https://builtin.test/',
+    name: 'builtin.test',
+    searchUrl: 'https://builtin.test/s?q={{key}}',
+    rules: {},
+    tier: 'builtin',
+    enabled: true,
+    lifecycle: 'active',
+    retiredReason: null,
+  };
+  const sources = [...actual.BUILTIN_SOURCES, activeBuiltin];
+  const active = () => sources.filter((source) => source.lifecycle === 'active' && source.enabled !== false);
+  return {
+    ...actual,
+    BUILTIN_SOURCE_HOSTS: [...actual.BUILTIN_SOURCE_HOSTS, 'builtin.test'],
+    BUILTIN_SOURCES: sources,
+    activeBuiltinSources: () => active(),
+    activeBuiltinSource: () => active()[0] ?? null,
+    builtinUrlPrefixes: () => sources.map((source) => new URL(source.url).origin),
+    builtinSourceForHost: (host: string) => actual.sourceForHostIn(host, sources),
+    isActiveBuiltinHost: (host: string) => actual.isHostActiveInSources(host, sources),
+  };
+});
+
 import {
   disableShuyuanSource, enableShuyuanSource, getEngineSources, getFanoutPool, getReadingPool, getShuyuanCounts,
   getShuyuanPoolHealth, getShuyuanStats, getReadingSources, getSourcePools, refreshShuyuan,
@@ -58,7 +88,8 @@ function setCollection(id: number, value: unknown) {
 }
 
 const unknownSource = { bookSourceUrl: 'https://unknown.invalid', bookSourceName: '未知源', ruleSearch: { name: 'h1' } };
-const knownSource = { ...unknownSource, bookSourceUrl: 'https://book15.net', bookSourceName: '支持的来源' };
+// 合成注册表（见顶部 vi.mock）的活跃内建源——替代「book15 当活跃默认」的旧 fixture。
+const knownSource = { ...unknownSource, bookSourceUrl: 'https://builtin.test', bookSourceName: '支持的来源' };
 const oldDisabledAt = '2026-09-14T00:00:00Z';
 function oldSource(item: typeof unknownSource) {
   return { source_url: item.bookSourceUrl, source: item, last_error: '历史连接超时', disabled_at: oldDisabledAt };
@@ -503,9 +534,9 @@ describe('refreshShuyuan atomic refresh', () => {
   it('支持来源实际读完成功响应后才记可达，用户禁用和旧失败原因保持独立', async () => {
     setCollection(11, [knownSource]);
     seedPrevious([oldSource(knownSource)]);
-    responses.set('https://book15.net/', { body: '离线合成响应' });
+    responses.set('https://builtin.test/', { body: '离线合成响应' });
     await refreshShuyuan();
-    expect(fetchMock.mock.calls.map(([url]) => String(url))).toContain('https://book15.net/');
+    expect(fetchMock.mock.calls.map(([url]) => String(url))).toContain('https://builtin.test/');
     expect(savedStates()).toEqual([expect.objectContaining({
       url: knownSource.bookSourceUrl, status: 'reachable', checked_at: expect.any(String), error: null,
     })]);
@@ -571,7 +602,7 @@ describe('refreshShuyuan atomic refresh', () => {
     setCollection(11, [knownSource]);
     seedPrevious([oldSource(knownSource)]);
     const ordinary = fetchMock.getMockImplementation()!;
-    fetchMock.mockImplementation((input, init) => String(input) === 'https://book15.net/'
+    fetchMock.mockImplementation((input, init) => String(input) === 'https://builtin.test/'
       ? Promise.resolve(new Response(new ReadableStream({ cancel() { cancelled = true; } })))
       : ordinary(input, init));
     const pending = refreshShuyuan();
@@ -949,15 +980,23 @@ describe('refreshShuyuan atomic refresh', () => {
       { ...oldSource(unknownSource), disabled_at: null, name: '未知域名' },
       { ...oldSource(knownSource), disabled_at: null, name: '支持的来源' },
     ]);
-    expect(await getReadingSources(new AbortController().signal)).toMatchObject([{ url: 'https://book15.net/', name: '支持的来源' }]);
+    expect(await getReadingSources(new AbortController().signal)).toMatchObject([{ url: 'https://builtin.test/', name: '支持的来源' }]);
     expect(transaction).not.toHaveBeenCalled();
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
-  it('合集没有已支持域名时复用 worker 的内置 book15 适配器', async () => {
+  it('合集没有该 host 记录时不补造注册表默认源：空段是合法结论（不隐式启用）', async () => {
     execute.mockResolvedValueOnce([{ collections: [] }]).mockResolvedValueOnce([]);
+    // 删除记录不构成隐式启用信号——活跃内建源必须经显式注册/启用行进池（主协调裁定语义）。
+    expect(await getReadingSources(new AbortController().signal)).toEqual([]);
+  });
+
+  it('已注册的活跃内建源行（零历史探测态）照常合成 builtin 池条目', async () => {
+    execute.mockResolvedValueOnce([{ collections: [] }]).mockResolvedValueOnce([
+      { ...oldSource(knownSource), disabled_at: null, name: '支持的来源' },
+    ]);
     expect(await getReadingSources(new AbortController().signal)).toMatchObject([
-      { url: 'https://book15.net/', searchUrl: 'https://book15.net/books/search.html?kw={{key}}' },
+      { url: 'https://builtin.test/', tier: 'builtin' },
     ]);
   });
 
@@ -978,12 +1017,16 @@ describe('refreshShuyuan atomic refresh', () => {
     });
     afterEach(() => refreshSupportedHosts([])); // 复位运行时 host 集合
 
+    // 池合成用例共用：已注册的活跃 builtin 行（真实注册表里 book15 已退休，注册表合成
+    // 只认「显式注册的活跃内建行」；这里 mock 的是合成注册表的 builtin.test 行，见顶部 vi.mock）。
+    const builtinRegisteredRow = [{ ...oldSource(knownSource), disabled_at: null, name: 'builtin.test' }];
+
     it('默认（无 READING_ENGINE_SOURCES）不并入引擎源：池 = builtin only，且不查准入表', async () => {
       refreshSupportedHosts(['engine.example']); // 即使 host 与准入数据都就绪
-      execute.mockResolvedValueOnce([{ collections: [] }]).mockResolvedValueOnce([]);
+      execute.mockResolvedValueOnce([{ collections: [] }]).mockResolvedValueOnce(builtinRegisteredRow);
       const sources = await getReadingSources(new AbortController().signal);
       expect(sources.map((source) => source.tier)).toEqual(['builtin']);
-      expect(sources[0].url).toBe('https://book15.net/');
+      expect(sources[0].url).toBe('https://builtin.test/');
       // 开关默认关 ⇒ 连准入表都不查（省 DB 往返，也不暴露引擎源失败面）。
       expect(execute.mock.calls.some(([query]) => query.text.includes('source_admission'))).toBe(false);
     });
@@ -991,7 +1034,7 @@ describe('refreshShuyuan atomic refresh', () => {
     it('READING_ENGINE_SOURCES=0 显式关闭：同默认（不并入引擎源）', async () => {
       vi.stubEnv('READING_ENGINE_SOURCES', '0');
       refreshSupportedHosts(['engine.example']);
-      execute.mockResolvedValueOnce([{ collections: [] }]).mockResolvedValueOnce([]);
+      execute.mockResolvedValueOnce([{ collections: [] }]).mockResolvedValueOnce(builtinRegisteredRow);
       expect((await getReadingSources(new AbortController().signal)).map((source) => source.tier)).toEqual(['builtin']);
     });
 
@@ -1000,10 +1043,10 @@ describe('refreshShuyuan atomic refresh', () => {
       // 冷启动：engineHosts（池合成前先刷门，故是第一条 SQL）读到空 ⇒ 运行时门保持内建单集合；
       // 即便准入表里有该源的 ok 行（engineReadingSources 仍返回它），validateSourceUrl 也过不了门 ⇒ 出池。
       execute.mockResolvedValueOnce([]).mockResolvedValueOnce([{ collections: [] }])
-        .mockResolvedValueOnce([]).mockResolvedValueOnce([engineRow()]);
+        .mockResolvedValueOnce(builtinRegisteredRow).mockResolvedValueOnce([engineRow()]);
       const sources = await getReadingSources(new AbortController().signal);
       expect(sources.map((source) => source.tier)).toEqual(['builtin']);
-      expect(sources[0].url).toBe('https://book15.net/');
+      expect(sources[0].url).toBe('https://builtin.test/');
     });
 
     it('READING_ENGINE_SOURCES=1 + host 就绪（门随池刷）：builtin 在前、引擎源在后，rules 原对象透传', async () => {
@@ -1011,7 +1054,7 @@ describe('refreshShuyuan atomic refresh', () => {
       // host 就绪来自 DB：engineHosts 读到 ok 态 host ⇒ getReadingPool 内先刷运行时门，再查引擎源。
       // 不再靠测试手动 refreshSupportedHosts——正是本改动要证明的「门随池按 DB 实况刷」。
       execute.mockResolvedValueOnce([{ host: 'engine.example' }]).mockResolvedValueOnce([{ collections: [] }])
-        .mockResolvedValueOnce([]).mockResolvedValueOnce([engineRow()]);
+        .mockResolvedValueOnce(builtinRegisteredRow).mockResolvedValueOnce([engineRow()]);
       const sources = await getReadingSources(new AbortController().signal);
       expect(sources.map((source) => source.tier)).toEqual(['builtin', 'M1']);
       expect(sources[1]).toMatchObject({
@@ -1027,7 +1070,7 @@ describe('refreshShuyuan atomic refresh', () => {
       vi.stubEnv('READING_ENGINE_SOURCES', '1');
       vi.stubEnv('READING_POOL_LIMIT', '1');
       execute.mockResolvedValueOnce([{ host: 'engine.example' }]).mockResolvedValueOnce([{ collections: [] }])
-        .mockResolvedValueOnce([]).mockResolvedValueOnce([engineRow()]);
+        .mockResolvedValueOnce(builtinRegisteredRow).mockResolvedValueOnce([engineRow()]);
       // 上限 1 ⇒ 只剩 builtin 首源（builtin 恒在前，引擎源被截断）。
       expect((await getReadingSources(new AbortController().signal)).map((source) => source.tier)).toEqual(['builtin']);
     });
@@ -1036,7 +1079,7 @@ describe('refreshShuyuan atomic refresh', () => {
       vi.stubEnv('READING_ENGINE_SOURCES', '1');
       // engineHosts 成功刷门（第一条 SQL）、engineReadingSources（JOIN 查询）失败 ⇒ 降级 builtin-only。
       execute.mockResolvedValueOnce([{ host: 'engine.example' }]).mockResolvedValueOnce([{ collections: [] }])
-        .mockResolvedValueOnce([])
+        .mockResolvedValueOnce(builtinRegisteredRow)
         .mockRejectedValueOnce(new Error('relation "source_admission" does not exist'));
       const sources = await getReadingSources(new AbortController().signal);
       expect(sources.map((source) => source.tier)).toEqual(['builtin']);
@@ -1071,7 +1114,8 @@ describe('refreshShuyuan atomic refresh', () => {
     });
 
     it('T6 builtin download needs no engine DB; missing admission never grants download', async () => {
-      expect(await resolveDownloadSource('https://www.book15.net/book/1')).toMatchObject({kind: 'builtin'});
+      // 已注册活跃内建源的 host：builtin 下载腿不需要引擎库（0 次查询）。
+      expect(await resolveDownloadSource('https://builtin.test/book/1')).toMatchObject({kind: 'builtin'});
       expect(execute).not.toHaveBeenCalled();
       execute.mockResolvedValueOnce([]);
       await expect(resolveDownloadSource('https://engine.example/book/1')).rejects.toThrow(SourcePolicyError);
@@ -1079,8 +1123,16 @@ describe('refreshShuyuan atomic refresh', () => {
 
     it('/api/stats 的 readingPoolSize 在默认开关下为 1', async () => {
       const refreshedAt = '2026-09-19T00:00:00Z';
-      execute.mockResolvedValueOnce([{ collections: [], refreshed_at: refreshedAt }])
-        .mockResolvedValueOnce([{ collections: [] }]).mockResolvedValueOnce([]);
+      // refreshed_at（meta）→ 池（poolProbeMeta + builtinRows）→ 准入漏斗，Promise.all 并发按文本分派。
+      execute.mockImplementation(async (query) => {
+        if (query.text.includes('SELECT refreshed_at::text AS refreshed_at FROM shuyuan_meta')) {
+          return [{ refreshed_at: refreshedAt }];
+        }
+        if (query.text.includes('FROM shuyuan_meta')) return [{ collections: [] }];
+        if (query.text.includes('FROM shuyuan_sources')) return builtinRegisteredRow;
+        if (query.text.includes('FROM source_admission')) return [];
+        return [];
+      });
       const health = await getShuyuanPoolHealth(new AbortController().signal);
       expect(health.readingPoolSize).toBe(1);
       expect(health.refreshedAtAgeHours).toBeGreaterThanOrEqual(0);
@@ -1108,7 +1160,7 @@ describe('refreshShuyuan atomic refresh', () => {
       vi.stubEnv('READING_ENGINE_SOURCES', '1');
       vi.stubEnv('READING_POOL_LIMIT', '10');
       execute.mockResolvedValueOnce(['a.example', 'b.example', 'c.example', 'd.example', 't7.example'].map((host) => ({ host })))
-        .mockResolvedValueOnce([reachableMeta('https://b.example')]).mockResolvedValueOnce([])
+        .mockResolvedValueOnce([reachableMeta('https://b.example')]).mockResolvedValueOnce(builtinRegisteredRow)
         .mockResolvedValueOnce([
           engineRowAt('a.example', { search_checked_at: '2026-09-01T00:00:00Z' }),
           engineRowAt('b.example', { search_checked_at: '2026-09-01T00:00:00Z' }), // reachable，应最先
@@ -1118,7 +1170,7 @@ describe('refreshShuyuan atomic refresh', () => {
         ]);
       const { sources } = await getReadingPool(new AbortController().signal);
       expect(sources.map((source) => source.url)).toEqual([
-        'https://book15.net/', // builtin 恒 index 0
+        'https://builtin.test/', // builtin 恒 index 0
         'https://b.example/',  // 唯一 reachable
         'https://c.example/',  // M1 新结论优先，同刻 url 升序
         'https://d.example/',
@@ -1130,10 +1182,10 @@ describe('refreshShuyuan atomic refresh', () => {
     it('排序对抗用例：builtin probe=failed 时引擎源递补 index 0；builtin 在场时恒 index 0', async () => {
       vi.stubEnv('READING_ENGINE_SOURCES', '1');
       refreshSupportedHosts(['engine.example']);
-      const builtinRow = { source_url: 'https://book15.net', source: { bookSourceUrl: 'https://book15.net', searchUrl: 'https://book15.net/s?kw={{key}}', enabled: true }, name: 'book15', disabled_at: null, last_error: '' };
+      const builtinRow = { source_url: 'https://builtin.test', source: { bookSourceUrl: 'https://builtin.test', searchUrl: 'https://builtin.test/s?kw={{key}}', enabled: true }, name: 'builtin', disabled_at: null, last_error: '' };
       // ① builtin probe=failed ⇒ 被剔除，reachable 的引擎源递补到 index 0。
       const failedMeta = { collections: [{ id: 1, title: '合集', count: 1, probeSnapshot: { version: 1, entries: [
-        { url: 'https://book15.net', status: 'failed', checked_at: '2026-09-18T00:00:00Z' },
+        { url: 'https://builtin.test', status: 'failed', checked_at: '2026-09-18T00:00:00Z' },
       ] } }] };
       execute.mockResolvedValueOnce([{ host: 'engine.example' }])
         .mockResolvedValueOnce([failedMeta]).mockResolvedValueOnce([builtinRow])
@@ -1147,24 +1199,26 @@ describe('refreshShuyuan atomic refresh', () => {
         .mockResolvedValueOnce([engineRow({ search_checked_at: '2026-09-18T00:00:00Z' })]);
       const present = await getReadingSources(new AbortController().signal);
       expect(present.map((source) => source.tier)).toEqual(['builtin', 'M1']);
-      expect(present[0].url).toBe('https://book15.net/');
+      expect(present[0].url).toBe('https://builtin.test/');
     });
 
     it('READING_POOL_LIMIT 生效且 poolCandidates 计数正确（§2.3 放行判据）', async () => {
       vi.stubEnv('READING_ENGINE_SOURCES', '1');
       const hostRows = ['a.example', 'b.example', 'c.example', 'd.example'].map((host) => ({ host }));
       const engineRows = ['a.example', 'b.example', 'c.example', 'd.example'].map((host) => engineRowAt(host));
-      // 候选 = builtin(1) + 引擎(4) = 5。上限 3 ⇒ 池 3、截断 2、其中引擎 2。
+      // 已注册的活跃 builtin 行 + 引擎(4) = 候选 5。上限 3 ⇒ 池 3、截断 2、其中引擎 2。
+      const builtinRegistered = () => execute.mockResolvedValueOnce(hostRows)
+        .mockResolvedValueOnce([{ collections: [] }])
+        .mockResolvedValueOnce([{ ...oldSource(knownSource), disabled_at: null, name: 'builtin' }])
+        .mockResolvedValueOnce(engineRows);
       vi.stubEnv('READING_POOL_LIMIT', '3');
-      execute.mockResolvedValueOnce(hostRows).mockResolvedValueOnce([{ collections: [] }])
-        .mockResolvedValueOnce([]).mockResolvedValueOnce(engineRows);
+      builtinRegistered();
       await expect(getReadingPool(new AbortController().signal)).resolves.toMatchObject({
         enginePoolSize: 2, poolCandidates: 2,
       });
       // 上限 6 ≥ 候选 5 ⇒ 放量空间为 0（W1：1 builtin + 4 引擎正好填不满 6）。
       vi.stubEnv('READING_POOL_LIMIT', '6');
-      execute.mockResolvedValueOnce(hostRows).mockResolvedValueOnce([{ collections: [] }])
-        .mockResolvedValueOnce([]).mockResolvedValueOnce(engineRows);
+      builtinRegistered();
       await expect(getReadingPool(new AbortController().signal)).resolves.toMatchObject({
         enginePoolSize: 4, poolCandidates: 0,
       });
@@ -1175,12 +1229,12 @@ describe('refreshShuyuan atomic refresh', () => {
     it('getFanoutPool：引擎开关关时仍含准入 ok 的引擎源、readable 只标 builtin；SOURCE_FANOUT_LIMIT 截断并夹上限', async () => {
       const hosts = ['a.example', 'b.example', 'c.example'];
       const arrange = () => execute.mockResolvedValueOnce(hosts.map((host) => ({ host })))
-        .mockResolvedValueOnce([{ collections: [] }]).mockResolvedValueOnce([])
+        .mockResolvedValueOnce([{ collections: [] }]).mockResolvedValueOnce(builtinRegisteredRow)
         .mockResolvedValueOnce(hosts.map((host) => engineRowAt(host)));
       arrange();
       const pool = await getFanoutPool(new AbortController().signal);
       expect(pool.map((source) => [source.url, source.tier, source.readable])).toEqual([
-        ['https://book15.net/', 'builtin', true],
+        ['https://builtin.test/', 'builtin', true],
         ['https://a.example/', 'M1', false],
         ['https://b.example/', 'M1', false],
         ['https://c.example/', 'M1', false],
@@ -1203,16 +1257,16 @@ describe('refreshShuyuan atomic refresh', () => {
     it('getSourcePools：traversal=取书池前缀、selectable=max(R,F) 截断；readable 与 selectable 同口径', async () => {
       const hosts = ['a.example', 'b.example', 'c.example', 'd.example'];
       const arrange = () => execute.mockResolvedValueOnce(hosts.map((host) => ({ host })))
-        .mockResolvedValueOnce([{ collections: [] }]).mockResolvedValueOnce([])
+        .mockResolvedValueOnce([{ collections: [] }]).mockResolvedValueOnce(builtinRegisteredRow)
         .mockResolvedValueOnce(hosts.map((host) => engineRowAt(host)));
       vi.stubEnv('READING_ENGINE_SOURCES', '1');
       vi.stubEnv('READING_POOL_LIMIT', '2');
       vi.stubEnv('SOURCE_FANOUT_LIMIT', '4');
       arrange();
       const pools = await getSourcePools(new AbortController().signal);
-      expect(pools.traversal.map((source) => source.url)).toEqual(['https://book15.net/', 'https://a.example/']);
+      expect(pools.traversal.map((source) => source.url)).toEqual(['https://builtin.test/', 'https://a.example/']);
       expect(pools.selectable.map((source) => source.url)).toEqual([
-        'https://book15.net/', 'https://a.example/', 'https://b.example/', 'https://c.example/',
+        'https://builtin.test/', 'https://a.example/', 'https://b.example/', 'https://c.example/',
       ]);
       arrange();
       expect((await getReadingSources(new AbortController().signal)).map((source) => source.url))
@@ -1232,7 +1286,7 @@ describe('refreshShuyuan atomic refresh', () => {
       // 引擎开关关 ⇒ selectable 只剩 builtin，且不查准入表（只读 meta + builtin 两次查询）；非合格源进不来。
       vi.stubEnv('READING_ENGINE_SOURCES', '0');
       execute.mockClear();
-      execute.mockResolvedValueOnce([{ collections: [] }]).mockResolvedValueOnce([]);
+      execute.mockResolvedValueOnce([{ collections: [] }]).mockResolvedValueOnce(builtinRegisteredRow);
       const off = await getSourcePools(new AbortController().signal);
       expect(off.selectable.map((source) => source.tier)).toEqual(['builtin']);
       expect(off.traversal.map((source) => source.tier)).toEqual(['builtin']);
@@ -1248,17 +1302,17 @@ describe('refreshShuyuan atomic refresh', () => {
         engineRowAt('x.example', { search_checked_at: '2026-09-20T00:00:00Z' }),
       ];
       const arrange = () => execute.mockResolvedValueOnce([{ host: 'dup.example' }, { host: 'x.example' }])
-        .mockResolvedValueOnce([{ collections: [] }]).mockResolvedValueOnce([]).mockResolvedValueOnce(rows);
+        .mockResolvedValueOnce([{ collections: [] }]).mockResolvedValueOnce(builtinRegisteredRow).mockResolvedValueOnce(rows);
       vi.stubEnv('READING_ENGINE_SOURCES', '1');
       vi.stubEnv('READING_POOL_LIMIT', '3');
       arrange();
       const pools = await getSourcePools(new AbortController().signal);
       // 改前：[book15, dup/a, dup/b] —— 3 个名额里 2 个是同一个站，x.example 自动遍历永远轮不到。
       expect(pools.traversal.map((source) => source.url)).toEqual([
-        'https://book15.net/', 'https://dup.example/a', 'https://x.example/',
+        'https://builtin.test/', 'https://dup.example/a', 'https://x.example/',
       ]);
       expect(pools.selectable.map((source) => source.url)).toEqual([
-        'https://book15.net/', 'https://dup.example/a', 'https://dup.example/b', 'https://dup.example/c', 'https://x.example/',
+        'https://builtin.test/', 'https://dup.example/a', 'https://dup.example/b', 'https://dup.example/c', 'https://x.example/',
       ]);
       arrange();
       await expect(getReadingPool(new AbortController().signal)).resolves.toMatchObject({
@@ -1267,13 +1321,13 @@ describe('refreshShuyuan atomic refresh', () => {
       // 41-swq：扇出同站去重，与 traversal 同口径选中 dup/a（改前 = selectable 全部 5 条）。
       arrange();
       expect((await getFanoutPool(new AbortController().signal)).map((source) => source.url))
-        .toEqual(['https://book15.net/', 'https://dup.example/a', 'https://x.example/']);
+        .toEqual(['https://builtin.test/', 'https://dup.example/a', 'https://x.example/']);
       // 窗口：selectable 只到 max(R,F)=3 条 ⇒ traversal 不越窗去捞 x.example（否则首开选中的源章节路径认不回来）。
       vi.stubEnv('SOURCE_FANOUT_LIMIT', '2');
       arrange();
       const narrow = await getSourcePools(new AbortController().signal);
       const selectableUrls = new Set(narrow.selectable.map((source) => source.url));
-      expect(narrow.traversal.map((source) => source.url)).toEqual(['https://book15.net/', 'https://dup.example/a']);
+      expect(narrow.traversal.map((source) => source.url)).toEqual(['https://builtin.test/', 'https://dup.example/a']);
       expect(narrow.traversal.every((source) => selectableUrls.has(source.url))).toBe(true);
     });
 
@@ -1292,7 +1346,7 @@ describe('refreshShuyuan atomic refresh', () => {
       const hosts = ['dup.example', 'y.example', 'z.example', 'w.example'];
       // dup/c 探测 reachable ⇒ 全序里排在同站其余副本之前（健康度是首键），去重应选它而不是 checked_at 最新的 a。
       const arrange = () => execute.mockResolvedValueOnce(hosts.map((host) => ({ host })))
-        .mockResolvedValueOnce([reachableMeta('https://dup.example/c')]).mockResolvedValueOnce([]).mockResolvedValueOnce(rows);
+        .mockResolvedValueOnce([reachableMeta('https://dup.example/c')]).mockResolvedValueOnce(builtinRegisteredRow).mockResolvedValueOnce(rows);
       vi.stubEnv('READING_ENGINE_SOURCES', '1');
       vi.stubEnv('READING_POOL_LIMIT', '2');
       vi.stubEnv('SOURCE_FANOUT_LIMIT', '3');
@@ -1300,21 +1354,21 @@ describe('refreshShuyuan atomic refresh', () => {
       const fanout = await getFanoutPool(new AbortController().signal);
       // 改前：[book15, dup/c, dup/a] —— 3 格里 2 格是同一个站。
       expect(fanout.map((source) => source.url)).toEqual([
-        'https://book15.net/', 'https://dup.example/c', 'https://y.example/',
+        'https://builtin.test/', 'https://dup.example/c', 'https://y.example/',
       ]);
       expect(fanout.every((source) => source.readable)).toBe(true);
       // y.example 在全序第 6 位，越过了 selectable 前缀窗口 max(R,F)=3 ——必须显式并进 selectable，否则面板能切、确认 404。
       arrange();
       const pools = await getSourcePools(new AbortController().signal);
       expect(pools.selectable.map((source) => source.url)).toEqual([
-        'https://book15.net/', 'https://dup.example/c', 'https://dup.example/a', 'https://y.example/',
+        'https://builtin.test/', 'https://dup.example/c', 'https://dup.example/a', 'https://y.example/',
       ]);
-      expect(pools.traversal.map((source) => source.url)).toEqual(['https://book15.net/', 'https://dup.example/c']);
+      expect(pools.traversal.map((source) => source.url)).toEqual(['https://builtin.test/', 'https://dup.example/c']);
       // 上限放宽 ⇒ 每站一格全部列出，T7 副本与其余同站副本都不出现；总数 = 1 builtin + 4 站。
       vi.stubEnv('SOURCE_FANOUT_LIMIT', '24');
       arrange();
       expect((await getFanoutPool(new AbortController().signal)).map((source) => source.url)).toEqual([
-        'https://book15.net/', 'https://dup.example/c', 'https://y.example/', 'https://z.example/', 'https://w.example/',
+        'https://builtin.test/', 'https://dup.example/c', 'https://y.example/', 'https://z.example/', 'https://w.example/',
       ]);
     });
 
@@ -1328,13 +1382,13 @@ describe('refreshShuyuan atomic refresh', () => {
       ];
       const hosts = ['www.dup.example', 'dup.example', 'y.example', 'www.z.example'];
       execute.mockResolvedValueOnce(hosts.map((host) => ({ host })))
-        .mockResolvedValueOnce([{ collections: [] }]).mockResolvedValueOnce([]).mockResolvedValueOnce(rows);
+        .mockResolvedValueOnce([{ collections: [] }]).mockResolvedValueOnce(builtinRegisteredRow).mockResolvedValueOnce(rows);
       vi.stubEnv('READING_ENGINE_SOURCES', '1');
       vi.stubEnv('READING_POOL_LIMIT', '2');
       vi.stubEnv('SOURCE_FANOUT_LIMIT', '24');
       // 改前：www.dup.example 与 dup.example 各占一格。
       expect((await getFanoutPool(new AbortController().signal)).map((source) => source.url)).toEqual([
-        'https://book15.net/', 'https://www.dup.example/', 'https://y.example/', 'https://www.z.example/',
+        'https://builtin.test/', 'https://www.dup.example/', 'https://y.example/', 'https://www.z.example/',
       ]);
     });
 
@@ -1355,11 +1409,11 @@ describe('refreshShuyuan atomic refresh', () => {
       ];
       const hosts = ['dup.example', 'lone.example', 'nocontent.example', 'y.example'];
       const arrange = () => execute.mockResolvedValueOnce(hosts.map((host) => ({ host })))
-        .mockResolvedValueOnce([{ collections: [] }]).mockResolvedValueOnce([]).mockResolvedValueOnce(rows);
+        .mockResolvedValueOnce([{ collections: [] }]).mockResolvedValueOnce(builtinRegisteredRow).mockResolvedValueOnce(rows);
       vi.stubEnv('READING_ENGINE_SOURCES', '1');
       vi.stubEnv('READING_POOL_LIMIT', '3');
       vi.stubEnv('SOURCE_FANOUT_LIMIT', '3');
-      const expected = ['https://book15.net/', 'https://dup.example/good', 'https://y.example/'];
+      const expected = ['https://builtin.test/', 'https://dup.example/good', 'https://y.example/'];
       arrange();
       expect((await getFanoutPool(new AbortController().signal)).map((source) => source.url)).toEqual(expected);
       arrange();
@@ -1391,7 +1445,7 @@ describe('refreshShuyuan atomic refresh', () => {
       vi.stubEnv('READING_ENGINE_SOURCES', '1');
       // ① 即时出池：库内该源 disabled_at 非空 ⇒ engineReadingSources 直接剔除。
       execute.mockResolvedValueOnce([{ host: 'engine.example' }]).mockResolvedValueOnce([{ collections: [] }])
-        .mockResolvedValueOnce([])
+        .mockResolvedValueOnce(builtinRegisteredRow)
         .mockResolvedValueOnce([engineRow({ disabled_at: '2026-09-10T00:00:00Z' })]);
       const disabledPool = await getReadingPool(new AbortController().signal);
       expect(disabledPool).toMatchObject({ enginePoolSize: 0 });
@@ -1418,7 +1472,7 @@ describe('refreshShuyuan atomic refresh', () => {
             rejection_codes: { unsupported_operator: 3 } }];
         }
         if (text.includes('JOIN source_admission')) return [engineRow()];
-        if (text.includes('FROM shuyuan_sources')) return [];
+        if (text.includes('FROM shuyuan_sources')) return builtinRegisteredRow;
         if (text.includes('FROM shuyuan_meta')) return [{ collections: [], refreshed_at: null }];
         return [];
       });
@@ -1478,7 +1532,7 @@ describe('refreshShuyuan atomic refresh', () => {
       execute.mockImplementation(async (query) => {
         const text = query.text;
         if (text.includes('FROM source_admission')) throw new Error('relation "source_admission" does not exist');
-        if (text.includes('FROM shuyuan_sources')) return [];
+        if (text.includes('FROM shuyuan_sources')) return builtinRegisteredRow;
         if (text.includes('FROM shuyuan_meta')) return [{ collections: [], refreshed_at: null }];
         return [];
       });
@@ -1501,7 +1555,7 @@ describe('refreshShuyuan atomic refresh', () => {
       refreshSupportedHosts(['stale.example']);
       // engineHosts（第一条 SQL，DISTINCT host）抛错 ⇒ refreshSupportedHosts 不会被调用，本次降级 builtin-only。
       execute.mockRejectedValueOnce(new Error('relation "source_admission" does not exist'))
-        .mockResolvedValueOnce([{ collections: [] }]).mockResolvedValueOnce([]);
+        .mockResolvedValueOnce([{ collections: [] }]).mockResolvedValueOnce(builtinRegisteredRow);
       const sources = await getReadingSources(new AbortController().signal);
       // 不抛错、不 500：池降级 builtin-only。
       expect(sources.map((source) => source.tier)).toEqual(['builtin']);
@@ -1517,7 +1571,7 @@ describe('refreshShuyuan atomic refresh', () => {
       vi.stubEnv('READING_ENGINE_SOURCES', '1');
       const secret = 'postgres://leak_user:leak_secret@db.internal.example/finder';
       execute.mockRejectedValueOnce(new Error(`Error connecting to database: ${secret}`))
-        .mockResolvedValueOnce([{ collections: [] }]).mockResolvedValueOnce([]);
+        .mockResolvedValueOnce([{ collections: [] }]).mockResolvedValueOnce(builtinRegisteredRow);
       const sources = await getReadingSources(new AbortController().signal);
       expect(sources.map((source) => source.tier)).toEqual(['builtin']); // 降级路径本身不变
       const logged = (console.error as ReturnType<typeof vi.fn>).mock.calls
@@ -1535,7 +1589,7 @@ describe('refreshShuyuan atomic refresh', () => {
       vi.stubEnv('READING_ENGINE_SOURCES', '1');
       const secret = 'postgresql://engine:pw123@db2.internal.example/prod';
       execute.mockResolvedValueOnce([{ host: 'engine.example' }]).mockResolvedValueOnce([{ collections: [] }])
-        .mockResolvedValueOnce([])
+        .mockResolvedValueOnce(builtinRegisteredRow)
         .mockRejectedValueOnce(new Error(`fetch failed while connecting: ${secret}`));
       const sources = await getReadingSources(new AbortController().signal);
       expect(sources.map((source) => source.tier)).toEqual(['builtin']);
@@ -1577,11 +1631,11 @@ describe('refreshShuyuan atomic refresh', () => {
       seedPrevious([pendingSeed()], [
         { url: knownSource.bookSourceUrl, status: 'pending', checked_at: null, error: null },
       ]);
-      responses.set('https://book15.net/', { body: '离线合成响应' });
+      responses.set('https://builtin.test/', { body: '离线合成响应' });
 
       await refreshShuyuan();
 
-      expect(probedUrls()).toContain('https://book15.net/');
+      expect(probedUrls()).toContain('https://builtin.test/');
       expect(savedStates()[0]).toMatchObject({
         url: knownSource.bookSourceUrl, status: 'reachable', error: null, consecutive_failures: 0,
       });
@@ -1595,11 +1649,11 @@ describe('refreshShuyuan atomic refresh', () => {
       seedPrevious([pendingSeed()], [
         { url: knownSource.bookSourceUrl, status: 'reachable', checked_at: '2026-09-16T00:00:00Z', error: null },
       ]);
-      responses.set('https://book15.net/', { body: '离线合成响应' });
+      responses.set('https://builtin.test/', { body: '离线合成响应' });
 
       await refreshShuyuan();
 
-      expect(probedUrls()).toContain('https://book15.net/');
+      expect(probedUrls()).toContain('https://builtin.test/');
       expect(savedStates()[0]).toMatchObject({ status: 'reachable', error: null });
     });
 
@@ -1609,17 +1663,17 @@ describe('refreshShuyuan atomic refresh', () => {
       seedPrevious([pendingSeed()], [
         { url: knownSource.bookSourceUrl, status: 'pending', checked_at: null, error: null, consecutive_failures: 2 },
       ]);
-      responses.set('https://book15.net/', { body: 'unavailable', status: 503 });
+      responses.set('https://builtin.test/', { body: 'unavailable', status: 503 });
 
       await refreshShuyuan();
 
-      expect(probedUrls()).toContain('https://book15.net/');
+      expect(probedUrls()).toContain('https://builtin.test/');
       expect(savedStates()[0]).toMatchObject({ status: 'failed', consecutive_failures: 3 });
     });
 
     it('pending 重探不饿死已知失败源重探：名额分配顺序为 probes → discovery → pending', async () => {
       // 已知失败源（带 last_error）+ 一个 pending 源。
-      const failedUrl = 'https://book15.net/failed';
+      const failedUrl = 'https://builtin.test/failed';
       const failedSource = { ...knownSource, bookSourceUrl: failedUrl, bookSourceName: '失败源' };
       const pendingUrl = knownSource.bookSourceUrl;
       setCollection(11, [failedSource, knownSource]);
@@ -1659,7 +1713,7 @@ describe('refreshShuyuan atomic refresh', () => {
     it('每轮 pending 重探数有界：backlog 再大也只重探 PROBE_PENDING_PER_REFRESH 个', async () => {
       // 构造 50 个 pending 源（远超名额 40），全部可探测（book15 host）。
       const many = Array.from({ length: 50 }, (_, i) => ({
-        ...knownSource, bookSourceUrl: `https://book15.net/p${i}`, bookSourceName: `P${i}`,
+        ...knownSource, bookSourceUrl: `https://builtin.test/p${i}`, bookSourceName: `P${i}`,
       }));
       setCollection(11, many);
       const rows = many.map((item) => ({
@@ -1673,7 +1727,7 @@ describe('refreshShuyuan atomic refresh', () => {
 
       await refreshShuyuan();
 
-      const probes = probedUrls().filter((url) => url.startsWith('https://book15.net/p'));
+      const probes = probedUrls().filter((url) => url.startsWith('https://builtin.test/p'));
       // 40 = PROBE_PENDING_PER_REFRESH（4 × 并发 10）。变异：去掉名额上限会探测全部 50 个。
       expect(probes.length).toBe(PROBE_PENDING_PER_REFRESH);
     });
@@ -1693,16 +1747,16 @@ describe('refreshShuyuan atomic refresh', () => {
       // 生产现状：库内 last_error 全空、无快照 ⇒ 旧门控永远不入队，探测链断电。
       setCollection(11, [knownSource]);
       seedPrevious([storedKnown('')]);
-      responses.set('https://book15.net/', { body: 'unavailable', status: 503 });
+      responses.set('https://builtin.test/', { body: 'unavailable', status: 503 });
 
       await refreshShuyuan();
 
-      expect(probedUrls()).toContain('https://book15.net/');
+      expect(probedUrls()).toContain('https://builtin.test/');
       expect(savedStates()).toEqual([{
         url: knownSource.bookSourceUrl, status: 'unprobed', checked_at: null, error: null, consecutive_failures: 1,
       }]);
       // last_error 的自动写点：此前只有人工 POST {action:disable} 会写它。
-      expect(savedRows()[0].err).toBe('503 https://book15.net/');
+      expect(savedRows()[0].err).toBe('503 https://builtin.test/');
     });
 
     it('单次探测失败不降级：保留上一次可达结论，只把计数加到 1', async () => {
@@ -1711,7 +1765,7 @@ describe('refreshShuyuan atomic refresh', () => {
 
       await refreshShuyuan();
 
-      expect(probedUrls()).toContain('https://book15.net/');
+      expect(probedUrls()).toContain('https://builtin.test/');
       expect(savedStates()).toEqual([{
         url: knownSource.bookSourceUrl, status: 'reachable', checked_at: '2026-09-16T00:00:00Z', error: null,
         consecutive_failures: 1,
@@ -1727,13 +1781,13 @@ describe('refreshShuyuan atomic refresh', () => {
 
       expect(savedStates()).toEqual([{
         url: knownSource.bookSourceUrl, status: 'failed', checked_at: expect.any(String),
-        error: expect.stringContaining('https://book15.net/'), consecutive_failures: 3,
+        error: expect.stringContaining('https://builtin.test/'), consecutive_failures: 3,
       }]);
     });
 
     it('阈值差一次时探测失败仍不判死：第二次失败只把计数加到 2，第三次才写 failed', async () => {
       setCollection(11, [knownSource]);
-      responses.set('https://book15.net/', { body: 'unavailable', status: 503 });
+      responses.set('https://builtin.test/', { body: 'unavailable', status: 503 });
       seedPrevious([storedKnown('历史连接超时')], [entry({ status: 'unprobed', checked_at: null, consecutive_failures: 1 })]);
 
       await refreshShuyuan();
@@ -1752,16 +1806,16 @@ describe('refreshShuyuan atomic refresh', () => {
 
       expect(savedStates()).toEqual([{
         url: knownSource.bookSourceUrl, status: 'failed', checked_at: expect.any(String),
-        error: expect.stringContaining('https://book15.net/'), consecutive_failures: 3,
+        error: expect.stringContaining('https://builtin.test/'), consecutive_failures: 3,
       }]);
     });
 
     it('已知失败源排在补探的未探测源之前', async () => {
-      const freshSource = { ...knownSource, bookSourceUrl: 'https://book15.net/fresh', bookSourceName: '全新源' };
+      const freshSource = { ...knownSource, bookSourceUrl: 'https://builtin.test/fresh', bookSourceName: '全新源' };
       setCollection(11, [knownSource, freshSource]);
       seedPrevious([storedKnown('历史连接超时')]);
-      responses.set('https://book15.net/', { body: 'unavailable', status: 503 });
-      responses.set('https://book15.net/fresh', { body: 'unavailable', status: 503 });
+      responses.set('https://builtin.test/', { body: 'unavailable', status: 503 });
+      responses.set('https://builtin.test/fresh', { body: 'unavailable', status: 503 });
 
       await refreshShuyuan();
 
@@ -1769,14 +1823,14 @@ describe('refreshShuyuan atomic refresh', () => {
       // 带 last_error 的已知失败源必须先于「没有任何结论」的补探源，补探不能插到队首。
       expect(probedUrls()).toEqual([
         indexUrl, collectionUrl(11), collectionUrl(12), collectionUrl(13),
-        'https://book15.net/', 'https://book15.net/fresh',
+        'https://builtin.test/', 'https://builtin.test/fresh',
       ]);
     });
 
     it('探测成功把连续失败计数清零并回到可达', async () => {
       setCollection(11, [knownSource]);
       seedPrevious([storedKnown('历史连接超时')], [entry({ status: 'unprobed', checked_at: null, consecutive_failures: 2 })]);
-      responses.set('https://book15.net/', { body: '离线合成响应' });
+      responses.set('https://builtin.test/', { body: '离线合成响应' });
 
       await refreshShuyuan();
 
@@ -1792,7 +1846,7 @@ describe('refreshShuyuan atomic refresh', () => {
       }] }]).mockResolvedValueOnce([{ ...oldSource(knownSource), disabled_at: null, name: '抖动源' }]);
 
       expect(await getReadingSources(new AbortController().signal))
-        .toMatchObject([{ url: 'https://book15.net/', name: '抖动源' }]);
+        .toMatchObject([{ url: 'https://builtin.test/', name: '抖动源' }]);
       expect(fetchMock).not.toHaveBeenCalled();
     });
 
@@ -1802,7 +1856,7 @@ describe('refreshShuyuan atomic refresh', () => {
       seedPrevious([storedKnown('历史连接超时')], [entry({ consecutive_failures: 1 })]);
       const ordinary = fetchMock.getMockImplementation()!;
       fetchMock.mockImplementation((input, init) => {
-        if (String(input) === 'https://book15.net/') {
+        if (String(input) === 'https://builtin.test/') {
           controller.abort(new Error('测试取消'));
           return Promise.reject(new Error('测试取消'));
         }

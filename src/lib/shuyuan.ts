@@ -6,7 +6,7 @@ import { validateSourceUrl, refreshSupportedHosts, supportedHostList, supportedH
 import { engineSourceUsable } from '@/lib/source-usability';
 import {
   BUILTIN_SOURCE_HOSTS, builtinUrlPrefixes,
-  activeBuiltinSource, builtinFallbackSource, isActiveBuiltinHost, type SupportedSourceTier,
+  builtinSourceForHost, isActiveBuiltinHost, type SupportedSourceTier,
 } from '@/lib/supported-sources';
 import {
   ADMISSION_MAX_REDIRECTS, ADMISSION_MIN_BUDGET_MS, ADMISSION_PHOENIX_OK_PREFIX, ADMISSION_PROBE_WORST_MS,
@@ -471,38 +471,32 @@ async function refreshEngineHostGate(signal: AbortSignal, fresh = false): Promis
 /**
  * 内建（builtin）档条目：改查注册表内建 URL 前缀，不再硬编码 ILIKE 字面量。
  *
- * 618-stalesource：三段判定，退休优先级最高（高于 DB enabled=true、probe reachable、缓存）：
- * 1. **静态生命周期**（supported-sources.ts lifecycle）：retired 的 host 一票否决——库里行
- *    enabled、reachable、来自源池产物缓存，都不救（主协调红线：无注册记录不得静默复活已停用源）。
+ * 活跃性两道门，退休判定优先级最高（高于 DB enabled=true、probe reachable、缓存）：
+ * 1. **静态生命周期**（isActiveBuiltinHost）：retired host 的行（含源池产物缓存里的旧行）
+ *    一票出局——不因「库里还有行/行 enabled/探测可达」复活。
  * 2. disabled_at / source.enabled === false / probe failed 的行照旧剔除（既有语义）。
- * 3. 合集**没有任何**该 host 记录时，旧代码补回 builtinFallbackSource() 兜底单源——该兜底正是
- *    裸删行会复活的洞。现在：活跃 builtin 缺记录仍补（既有 book15 零回归路径，活跃时语义不变）；
- *    retired builtin 缺记录**不补**，返回空段（无活跃 builtin ⇒ 池可为空，任务书判据 2）。
+ *
+ * 合集没有任何活跃 builtin host 记录时返回**空段**，不补造注册表默认源——活跃内建源必须经
+ * 显式注册/启用进池；删除记录不构成隐式启用信号。空段是合法结论：调用方走活跃引擎源或有限失败。
  */
 async function builtinReadingSources(
   s: Sql, states: Map<string, ProbeState>, signal: AbortSignal,
 ): Promise<ReadingSource[]> {
   const rows = (await cachedRead('builtinRows', signal,
     (sig) => artifactOr((artifact) => artifact.builtin, () => readBuiltinRows(s, sig))))
-    // 618：先过静态生命周期门——retired host 的行（含产物缓存里的旧行）在此一票出局。
     .filter((row) => isActiveBuiltinHost(hostOfUrl(row.source_url)) && canProbe(row.source_url));
-  if (!rows.length) {
-    // 合集没有任何活跃 builtin host 记录（618-stalesource）：
-    // - 有活跃 builtin ⇒ 既有「零 DB 记录也复用注册表档位（与 worker 同一适配器）」语义保留（T6 免 DB 路径）；
-    // - 无活跃 builtin（全部退休，618 现状）⇒ **空段**，不再补回默认单源——裸删行会复活的洞在此封死。
-    const active = activeBuiltinSource();
-    return active ? [{
-      url: active.url, name: active.name, searchUrl: active.searchUrl, rules: {}, tier: 'builtin' as const,
-    }] : [];
-  }
-  const fallback = activeBuiltinSource() ?? builtinFallbackSource();
+  if (!rows.length) return [];
   return rows.filter((row) => !row.disabled_at && isRecord(row.source) && row.source.enabled !== false && states.get(row.source_url)?.status !== 'failed')
     .sort((a, b) => probeRank(states, b.source_url) - probeRank(states, a.source_url)
       || a.source_url.localeCompare(b.source_url))
-    .map((row) => ({
-      url: validateSourceUrl(row.source_url).href, name: row.name.slice(0, 200) || fallback.name,
-      searchUrl: row.source.searchUrl ?? fallback.searchUrl, rules: row.source, tier: 'builtin' as const,
-    }));
+    .map((row) => {
+      // 行已过 isActiveBuiltinHost，注册表条目必存在；仍不造非空断言，缺档时用行自身信息兜底。
+      const entry = builtinSourceForHost(row.source_url);
+      return {
+        url: validateSourceUrl(row.source_url).href, name: row.name.slice(0, 200) || entry?.name || row.source_url,
+        searchUrl: row.source.searchUrl ?? entry?.searchUrl ?? '', rules: row.source, tier: 'builtin' as const,
+      };
+    });
 }
 
 /** builtin 候选行（注册表内建 URL 前缀，不再硬编码 ILIKE 字面量）；池合成与产物生成共用同一查询。 */
