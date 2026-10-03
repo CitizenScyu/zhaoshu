@@ -30,7 +30,7 @@ vi.mock('./source-policy', async (importOriginal) => {
 
 let service: typeof import('./source-reader');
 let GET: typeof import('@/app/api/read/source/[resource]/route').GET;
-const sourceOrigin = 'https://book15.net'; // 参数化准备；普通内联键迁好后才切换。
+const sourceOrigin = 'https://reader.test';
 const source = { url: `${sourceOrigin}/`, name: '测试书源', searchUrl: '/books/search.html?kw={{key}}', rules: {} };
 const book = { title: '测试书', author: '作者' };
 const pageUrl = (id = 42) => `${sourceOrigin}/books/details${id}.html`;
@@ -112,10 +112,13 @@ beforeEach(async () => {
   vi.spyOn(Date, 'now').mockImplementation(() => time += 400);
   service = await import('./source-reader');
   // 换源测试用另一个站:host 必须先过运行时白名单(source-policy),否则请求在到达 fetch 前就被拒。
-  (await import('./source-policy')).refreshSupportedHosts(['backup.test']);
+  (await import('./source-policy')).refreshSupportedHosts(['reader.test', 'www.reader.test', 'backup.test']);
   GET = (await import('@/app/api/read/source/[resource]/route')).GET;
 });
-afterEach(() => { vi.unstubAllGlobals(); vi.unstubAllEnvs(); vi.restoreAllMocks(); });
+afterEach(async () => {
+  (await import('./source-policy')).refreshSupportedHosts([]);
+  vi.unstubAllGlobals(); vi.unstubAllEnvs(); vi.restoreAllMocks();
+});
 
 describe('online reader source resolution and budgets', () => {
   it('searches by title, validates the detail author, and does not fetch any chapters', async () => {
@@ -142,7 +145,7 @@ describe('online reader source resolution and budgets', () => {
   });
 
   it('refuses ambiguous title-only matches', async () => {
-    pages.set('https://book15.net/books/search.html?kw=' + encodeURIComponent(book.title), {
+    pages.set(searchPageUrl(book.title), {
       text: '<a href="/books/details42.html">测试书</a><a href="/books/details43.html">测试书</a>',
     });
     pages.set(pageUrl(43), { text: detail(43, '另一作者') });
@@ -150,8 +153,8 @@ describe('online reader source resolution and budgets', () => {
   });
 
   it('falls back after a failed search source within the same request budget', async () => {
-    mocks.sources.mockResolvedValue([{ ...source, url: 'https://book15.net/old', searchUrl: '/failed?kw={{key}}' }, source]);
-    pages.set('https://book15.net/failed?kw=' + encodeURIComponent(book.title), { text: '', status: 500 });
+    mocks.sources.mockResolvedValue([{ ...source, url: 'https://reader.test/old', searchUrl: '/failed?kw={{key}}' }, source]);
+    pages.set('https://reader.test/failed?kw=' + encodeURIComponent(book.title), { text: '', status: 500 });
     const budget = context();
     expect((await service.resolveSourceBook(book, budget)).bookUrl).toBe(pageUrl());
     expect(budget.requests).toBe(4); // two failed attempts + one search + one detail
@@ -159,7 +162,7 @@ describe('online reader source resolution and budgets', () => {
 
   it('bounds retries and HTTP requests, counting redirects too', async () => {
     const { refreshSupportedHosts } = await import('./source-policy');
-    refreshSupportedHosts(['backup.test', 'reader.test']);
+    refreshSupportedHosts(['reader.test', 'www.reader.test', 'backup.test']);
     try {
       const budget = context(1);
       mocks.fetch.mockResolvedValue(new Response(null, { status: 302, headers: { location: '/redirect' } }));
@@ -168,19 +171,19 @@ describe('online reader source resolution and budgets', () => {
       // 预算已扣 1，重定向下一跳的 beforeRequest 撞预算即停，只此一发。
       expect(mocks.fetch).toHaveBeenCalledOnce();
     } finally {
-      refreshSupportedHosts(['backup.test']);
+      refreshSupportedHosts(['reader.test', 'www.reader.test', 'backup.test']);
     }
   });
 
   it('does not retry rate-limited sources', async () => {
     const { refreshSupportedHosts } = await import('./source-policy');
-    refreshSupportedHosts(['backup.test', 'reader.test']);
+    refreshSupportedHosts(['reader.test', 'www.reader.test', 'backup.test']);
     try {
       mocks.fetch.mockResolvedValue(new Response('', { status: 429 }));
       await expect(context().page('https://reader.test/')).rejects.toMatchObject({ status: 429 });
       expect(mocks.fetch).toHaveBeenCalledOnce();
     } finally {
-      refreshSupportedHosts(['backup.test']);
+      refreshSupportedHosts(['reader.test', 'www.reader.test', 'backup.test']);
     }
   });
 
@@ -255,7 +258,7 @@ describe('online reader source resolution and budgets', () => {
     const catalog = await service.resolveSourceBook(book, context());
     catalogs.set(catalog.version, catalog);
     pages.set(chapterUrl(), { text: '', status: 404 });
-    pages.set('https://book15.net/books/search.html?kw=' + encodeURIComponent(book.title), {
+    pages.set(searchPageUrl(book.title), {
       text: '<a href="/books/details43.html">测试书</a>',
     });
     pages.set(pageUrl(43), { text: detail(43, '作者', ['序言', '第一章']) });
@@ -309,12 +312,12 @@ describe('online reader source resolution and budgets', () => {
   it('换源候选排除当前源(同站候选降到队尾),全网只剩同站时才用它(洞 3)', async () => {
     // 当前源失效后,若候选只排除了「当前 bookUrl」,同站另一个详情页会立刻被选中 ——
     // 「换源」变成同站换 URL,仍留在故障站点。这里断言同站候选被降到**另一个站**之后。
-    const sameStation = { ...source, url: 'https://book15.net/same', name: '同站备用', searchUrl: '/same/search.html?kw={{key}}' };
+    const sameStation = { ...source, url: 'https://reader.test/same', name: '同站备用', searchUrl: '/same/search.html?kw={{key}}' };
     mocks.sources.mockResolvedValue([source, sameStation, backup]);
     pages.set(backupSearch(), { text: '<a href="/books/details777.html">测试书</a>' });
     pages.set(backupPage, { text: detail(777, '作者', ['第一章']) });
     pages.set(backupChapter(777, 1), { text: chapterHtml('另一站正文') });
-    pages.set('https://book15.net/same/search.html?kw=' + encodeURIComponent(book.title), {
+    pages.set('https://reader.test/same/search.html?kw=' + encodeURIComponent(book.title), {
       text: '<a href="/books/details888.html">测试书</a>',
     });
     pages.set(pageUrl(888), { text: detail(888, '作者', ['第一章']) });
@@ -352,27 +355,27 @@ describe('online reader source resolution and budgets', () => {
     // 站点把《改名书》上架为《站点新书》，标题搜索 0 结果；
     // 作者搜索命中，详情页简介自报【原书名：改名书】。
     const renamed = { title: '改名书', author: '原作者' };
-    const authorSearch = 'https://book15.net/books/search.html?kw=' + encodeURIComponent(renamed.author);
+    const authorSearch = searchPageUrl(renamed.author);
     const detailHtml = (id: number, title: string, author: string, alias?: string) =>
       `<meta property="og:novel:book_name" content="${title}"><meta property="og:novel:author" content="${author}">`
       + (alias ? `<div>小说简介:【原书名：${alias}】正文</div>` : '')
       + '<dd><a href="/chapter/index' + id + '-1.html">第一章</a></dd>';
-    pages.set('https://book15.net/books/search.html?kw=' + encodeURIComponent(renamed.title), { text: '' });
+    pages.set(searchPageUrl(renamed.title), { text: '' });
     pages.set(authorSearch, { text: '<a href="/books/details7.html">站点新书</a><a href="/books/details8.html">其他书</a>' });
-    pages.set('https://book15.net/books/details7.html', { text: detailHtml(7, '站点新书', '原作者', '改名书') });
-    pages.set('https://book15.net/books/details8.html', { text: detailHtml(8, '其他书', '另一作者', '无关原名') });
+    pages.set(pageUrl(7), { text: detailHtml(7, '站点新书', '原作者', '改名书') });
+    pages.set(pageUrl(8), { text: detailHtml(8, '其他书', '另一作者', '无关原名') });
     const catalog = await service.resolveSourceBook(renamed, context());
-    expect(catalog).toMatchObject({ title: '站点新书', author: '原作者', bookUrl: 'https://book15.net/books/details7.html' });
+    expect(catalog).toMatchObject({ title: '站点新书', author: '原作者', bookUrl: pageUrl(7) });
   });
 
   it('does not mis-pair an alias candidate whose author differs (renamed-book negative control)', async () => {
     // 目标《改名书》作者 A；作者搜索按 A 命中的唯一候选其实是另一作者的同素材书，
     // 其简介自报的原书名恰好也叫《改名书》。作者门必须拒 ⇒ 不自动取书；模糊层列为候选。
     const target = { title: '改名书', author: '作者A' };
-    const authorSearch = 'https://book15.net/books/search.html?kw=' + encodeURIComponent(target.author);
-    pages.set('https://book15.net/books/search.html?kw=' + encodeURIComponent(target.title), { text: '' });
+    const authorSearch = searchPageUrl(target.author);
+    pages.set(searchPageUrl(target.title), { text: '' });
     pages.set(authorSearch, { text: '<a href="/books/details7.html">站点新书</a>' });
-    pages.set('https://book15.net/books/details7.html', {
+    pages.set(pageUrl(7), {
       text: '<meta property="og:novel:book_name" content="站点新书"><meta property="og:novel:author" content="作者B">'
         + '<div>小说简介:【原书名：改名书】正文</div>'
         + '<dd><a href="/chapter/index7-1.html">第一章</a></dd>',
@@ -384,7 +387,7 @@ describe('online reader source resolution and budgets', () => {
   });
 
   it('does not run the author-search fallback when the title already matched', async () => {
-    const authorSearch = 'https://book15.net/books/search.html?kw=' + encodeURIComponent(book.author);
+    const authorSearch = searchPageUrl(book.author);
     pages.set(authorSearch, { text: '' });
     const catalog = await service.resolveSourceBook(book, context());
     expect(catalog.bookUrl).toBe(pageUrl());
@@ -394,7 +397,7 @@ describe('online reader source resolution and budgets', () => {
   it('returns similar candidates instead of 404 when the site has fuzzy-titled detail pages', async () => {
     // 标题搜索只有一个「书名对得上但作者不符」的候选（用户痛点：站点作者挂错/为空）。
     // 精确层拒，模糊层必须收集并列出，不能直接 SOURCE_NOT_FOUND。
-    pages.set('https://book15.net/books/search.html?kw=' + encodeURIComponent(book.title), {
+    pages.set(searchPageUrl(book.title), {
       text: '<a href="/books/details42.html">测试书</a>',
     });
     pages.set(pageUrl(), { text: detail(42, '站点挂错的作者') });
@@ -408,16 +411,16 @@ describe('online reader source resolution and budgets', () => {
     // 作者搜索命中两个候选：一个书名相似（作者不符）、一个完全无关 —— 只有前者可进候选。
     // 书名取「我的改名书」（≥4 字）以覆盖包含判据；无关书共享 ≤1 字必须被淘汰。
     const target = { title: '我的改名书', author: '作者A' };
-    const authorSearch = 'https://book15.net/books/search.html?kw=' + encodeURIComponent(target.author);
+    const authorSearch = searchPageUrl(target.author);
     const unrelatedDetail = (id: number, title: string, author: string) =>
       `<meta property="og:novel:book_name" content="${title}"><meta property="og:novel:author" content="${author}">`
       + '<dd><a href="/chapter/index' + id + '-1.html">第一章</a></dd>';
-    pages.set('https://book15.net/books/search.html?kw=' + encodeURIComponent(target.title), { text: '' });
+    pages.set(searchPageUrl(target.title), { text: '' });
     pages.set(authorSearch, {
       text: '<a href="/books/details7.html">我的改名书·全本</a><a href="/books/details8.html">全球高武</a>',
     });
-    pages.set('https://book15.net/books/details7.html', { text: unrelatedDetail(7, '我的改名书·全本', '别人') });
-    pages.set('https://book15.net/books/details8.html', { text: unrelatedDetail(8, '全球高武', '别人') });
+    pages.set(pageUrl(7), { text: unrelatedDetail(7, '我的改名书·全本', '别人') });
+    pages.set(pageUrl(8), { text: unrelatedDetail(8, '全球高武', '别人') });
     await expect(service.resolveSourceBook(target, context())).rejects.toMatchObject({
       code: 'SOURCE_SIMILAR',
       candidates: [{ title: '我的改名书·全本' }],
@@ -426,12 +429,12 @@ describe('online reader source resolution and budgets', () => {
 
   it('resolves a user-confirmed book_url without title/author matching', async () => {
     // 用户在候选列表点选后的确认重放：bookUrl 即用户决定，跳过书名/作者校验。
-    pages.set('https://book15.net/books/details77.html', {
+    pages.set(pageUrl(77), {
       text: detail(77, '随便什么作者')
         .replace('content="测试书"', 'content="随便什么书名"'),
     });
-    const catalog = await service.resolveSourceBook(book, context(), { bookUrl: 'https://book15.net/books/details77.html' });
-    expect(catalog).toMatchObject({ title: '随便什么书名', author: '随便什么作者', bookUrl: 'https://book15.net/books/details77.html' });
+    const catalog = await service.resolveSourceBook(book, context(), { bookUrl: pageUrl(77) });
+    expect(catalog).toMatchObject({ title: '随便什么书名', author: '随便什么作者', bookUrl: pageUrl(77) });
     expect(mocks.fetch).toHaveBeenCalledTimes(1);
   });
 
@@ -445,7 +448,7 @@ describe('online reader source resolution and budgets', () => {
   it('delivers the sole no-author match even when an earlier candidate detail fetch failed', async () => {
     // 改动 1 回归：author=''、唯一匹配，前一个候选详情页连接层失败（TypeError，page() 重试后抛回）。
     // 旧闸门：hadFailure ⇒ 丢弃唯一匹配 503 SOURCE_UNAVAILABLE；新语义：照常交付目录。
-    pages.set('https://book15.net/books/search.html?kw=' + encodeURIComponent(book.title), {
+    pages.set(searchPageUrl(book.title), {
       text: '<a href="/books/details41.html">测试书</a><a href="/books/details42.html">测试书</a>',
     });
     pages.set(pageUrl(41), networkFailure);
@@ -457,10 +460,10 @@ describe('online reader source resolution and budgets', () => {
   it('still surfaces SOURCE_SIMILAR candidates when a request failed mid-resolve', async () => {
     // 改动 1 回归：有相似候选 + 一次网络失败 → 仍 422 SOURCE_SIMILAR，且候选与健康路径一致。
     // 主源抓到作者不符的候选（进 similar）；镜像源健康时也复查同一详情页，候选不变。
-    const mirror = { ...source, url: 'https://book15.net/mirror', searchUrl: '/mirror/search.html?kw={{key}}' };
+    const mirror = { ...source, url: 'https://reader.test/mirror', searchUrl: '/mirror/search.html?kw={{key}}' };
     mocks.sources.mockResolvedValue([source, mirror]);
     pages.set(pageUrl(), { text: detail(42, '站点挂错的作者') });
-    const mirrorSearch = 'https://book15.net/mirror/search.html?kw=' + encodeURIComponent(book.title);
+    const mirrorSearch = 'https://reader.test/mirror/search.html?kw=' + encodeURIComponent(book.title);
     pages.set(mirrorSearch, { text: '<a href="/books/details42.html">测试书</a>' });
     const healthy = await service.resolveSourceBook(book, context())
       .catch((error: SourceReaderError & { candidates?: SourceSimilarCandidate[] }) => error);
@@ -479,7 +482,7 @@ describe('online reader source resolution and budgets', () => {
     // 改动 2 回归：预算中途耗尽不再终结 resolve（旧：503 SOURCE_BUDGET_EXCEEDED 重抛作废全部）。
     // 构造：无作者书在主源收集到唯一匹配（搜索+详情=2 请求）；镜像源搜索时预算已耗尽 ⇒
     // SOURCE_BUDGET_EXCEEDED 从 page() 抛到外层 catch → 特判 break → 已有唯一匹配照常返回。
-    mocks.sources.mockResolvedValue([source, { ...source, url: 'https://book15.net/mirror', searchUrl: '/mirror/search.html?kw={{key}}' }]);
+    mocks.sources.mockResolvedValue([source, { ...source, url: 'https://reader.test/mirror', searchUrl: '/mirror/search.html?kw={{key}}' }]);
     const catalog = await service.resolveSourceBook({ ...book, author: '' }, context(2));
     expect(catalog).toMatchObject({ title: '测试书', bookUrl: pageUrl(), chapters: [{ title: '第一章' }, { title: '第二章' }] });
   });
@@ -488,9 +491,9 @@ describe('online reader source resolution and budgets', () => {
     // 改动 2 回归：similar 已收集 + 预算中途耗尽 → 不再 503，落 422 SOURCE_SIMILAR。
     // 构造：主源搜索+详情（2 请求）抓到作者不符候选（进 similar）；镜像源搜索（第 3 请求）
     // 后其详情页触发 BUDGET → inspect 内层特判 break → similar 保留。
-    mocks.sources.mockResolvedValue([source, { ...source, url: 'https://book15.net/mirror', searchUrl: '/mirror/search.html?kw={{key}}' }]);
+    mocks.sources.mockResolvedValue([source, { ...source, url: 'https://reader.test/mirror', searchUrl: '/mirror/search.html?kw={{key}}' }]);
     pages.set(pageUrl(), { text: detail(42, '站点挂错的作者') });
-    pages.set('https://book15.net/mirror/search.html?kw=' + encodeURIComponent(book.title), {
+    pages.set('https://reader.test/mirror/search.html?kw=' + encodeURIComponent(book.title), {
       text: '<a href="/books/details43.html">测试书</a>',
     });
     await expect(service.resolveSourceBook(book, context(3))).rejects.toMatchObject({
@@ -500,7 +503,7 @@ describe('online reader source resolution and budgets', () => {
 
   it('still reports 503 SOURCE_UNAVAILABLE when the search itself fails with no results', async () => {
     // 负控（语义不变）：空结果 + 关键路径失败（标题搜索自身网络失败）→ 仍 503 SOURCE_UNAVAILABLE。
-    pages.set('https://book15.net/books/search.html?kw=' + encodeURIComponent(book.title), networkFailure);
+    pages.set(searchPageUrl(book.title), networkFailure);
     await expect(service.resolveSourceBook(book, context())).rejects.toMatchObject({
       code: 'SOURCE_UNAVAILABLE', status: 503,
     });
@@ -510,9 +513,9 @@ describe('online reader source resolution and budgets', () => {
     // P1-1 负控：空结果 + 仅 BUDGET（无网络失败）→ 503，不能把「没搜完」说成「没这本书」。
     // 双源 miss：主源标题/作者搜索均空（2 请求），镜像源搜索触发 BUDGET。
     const target = { title: '不存在的书', author: '作者A' };
-    mocks.sources.mockResolvedValue([source, { ...source, url: 'https://book15.net/mirror', searchUrl: '/mirror/search.html?kw={{key}}' }]);
-    pages.set('https://book15.net/books/search.html?kw=' + encodeURIComponent(target.title), { text: '' });
-    pages.set('https://book15.net/books/search.html?kw=' + encodeURIComponent(target.author), { text: '' });
+    mocks.sources.mockResolvedValue([source, { ...source, url: 'https://reader.test/mirror', searchUrl: '/mirror/search.html?kw={{key}}' }]);
+    pages.set(searchPageUrl(target.title), { text: '' });
+    pages.set(searchPageUrl(target.author), { text: '' });
     await expect(service.resolveSourceBook(target, context(2))).rejects.toMatchObject({
       code: 'SOURCE_UNAVAILABLE', status: 503,
     });
@@ -521,8 +524,8 @@ describe('online reader source resolution and budgets', () => {
   it('reports 404 SOURCE_NOT_FOUND when only the optional fuzzy-collection layer failed', async () => {
     // 改动 3 回归：模糊收集层（作者候选补抓）失败不记账 hadFailure → 关键路径全成功、无匹配 ⇒ 404。
     const target = { title: '改名书', author: '作者A' };
-    const titleSearch = 'https://book15.net/books/search.html?kw=' + encodeURIComponent(target.title);
-    const authorSearch = 'https://book15.net/books/search.html?kw=' + encodeURIComponent(target.author);
+    const titleSearch = searchPageUrl(target.title);
+    const authorSearch = searchPageUrl(target.author);
     const unrelatedDetail = (id: number, title: string, author: string) =>
       `<meta property="og:novel:book_name" content="${title}"><meta property="og:novel:author" content="${author}">`
       + '<dd><a href="/chapter/index' + id + '-1.html">第一章</a></dd>';
@@ -546,8 +549,8 @@ describe('online reader source resolution and budgets', () => {
     // 关键回归:同页兜底捡到无关详情链接**不得**关掉作者搜索回退 —— 它判的是「精确层 0 候选」,
     // 不是「candidates 是否为空」(40 任实测:改判据前作者搜索根本没跑,改名书路径被掐断)。
     const target = { title: '改名书', author: '作者A' };
-    const titleSearch = 'https://book15.net/books/search.html?kw=' + encodeURIComponent(target.title);
-    const authorSearch = 'https://book15.net/books/search.html?kw=' + encodeURIComponent(target.author);
+    const titleSearch = searchPageUrl(target.title);
+    const authorSearch = searchPageUrl(target.author);
     const links = Array.from({ length: 23 }, (_, i) => `<a href="/books/details${800 + i}.html">无关书${i}</a>`).join('');
     const unrelatedDetail = (id: number, title: string, author: string) =>
       `<meta property="og:novel:book_name" content="${title}"><meta property="og:novel:author" content="${author}">`
@@ -569,25 +572,25 @@ describe('online reader source resolution and budgets', () => {
       '<meta property="og:novel:book_name" content="新名"><meta property="og:novel:author" content="作者甲">'
       + '<div>小说简介:【原书名：旧名】改名前的版本。</div>'
       + '<dd><a href="/chapter/index' + id + '-1.html">第一章</a></dd>';
-    pages.set('https://book15.net/books/search.html?kw=' + encodeURIComponent(target.title), {
+    pages.set(searchPageUrl(target.title), {
       text: '<a href="/books/details61.html">无关书</a>',
     });
-    pages.set('https://book15.net/books/details61.html', {
+    pages.set(pageUrl(61), {
       text: '<meta property="og:novel:book_name" content="无关书"><meta property="og:novel:author" content="别人">'
         + '<dd><a href="/chapter/index61-1.html">第一章</a></dd>',
     });
-    pages.set('https://book15.net/books/search.html?kw=' + encodeURIComponent(target.author), {
+    pages.set(searchPageUrl(target.author), {
       text: '<a href="/books/details62.html">新名</a>',
     });
-    pages.set('https://book15.net/books/details62.html', { text: renamedDetail(62) });
+    pages.set(pageUrl(62), { text: renamedDetail(62) });
     const catalog = await service.resolveSourceBook(target, context());
-    expect(catalog).toMatchObject({ title: '新名', author: '作者甲', bookUrl: 'https://book15.net/books/details62.html' });
+    expect(catalog).toMatchObject({ title: '新名', author: '作者甲', bookUrl: pageUrl(62) });
   });
 
   it('falls back to same-page detail links when no anchor text matches the title exactly', async () => {
     // 核心回归:搜索页有详情链接,但锚文本带修饰(【完结】书名)⇒ parseSourceSearch 精确层 0 候选。
     // 兜底改按详情页形态收候选;身份仍由详情页的 sourceBookMatches(标题/别名 + 作者门)判定。
-    const titleSearch = 'https://book15.net/books/search.html?kw=' + encodeURIComponent(book.title);
+    const titleSearch = searchPageUrl(book.title);
     const decor = (id: number, title: string) => `<a href="/books/details${id}.html" title="${title}">【完结】${title}</a>`;
     pages.set(titleSearch, {
       text: decor(41, '测试书') + Array.from({ length: 8 }, (_, i) => `<a href="/books/details${900 + i}.html">无关书${i}</a>`).join(''),
@@ -599,12 +602,12 @@ describe('online reader source resolution and budgets', () => {
 
   it('does not mis-pair a same-title detail page by another author reached through the fallback', async () => {
     // 误配负控:兜底收到的候选里,同名详情页作者不符 ⇒ 不进 matches,继续找后面的候选。
-    const titleSearch = 'https://book15.net/books/search.html?kw=' + encodeURIComponent(book.title);
+    const titleSearch = searchPageUrl(book.title);
     pages.set(titleSearch, {
       text: '<a href="/books/details95.html" title="测试书">【完结】测试书</a>'
         + '<a href="/books/details96.html" title="测试书">测试书(全本)</a>',
     });
-    pages.set('https://book15.net/books/details95.html', { text: detail(95, '别的作者') });
+    pages.set(pageUrl(95), { text: detail(95, '别的作者') });
     pages.set(pageUrl(96), { text: detail(96) });
     const catalog = await service.resolveSourceBook(book, context());
     expect(catalog.bookUrl).toBe(pageUrl(96)); // 作者不符的 95 被作者门挡下,不误配
@@ -615,7 +618,7 @@ describe('online reader source resolution and budgets', () => {
     // 搜索页锚文本全带修饰(【完结】书名)⇒ parseSourceSearch 精确层 0 候选 ⇒ 同页兜底接上;
     // 兜底抓到的详情页里没有一页能过 sourceBookMatches(标题被修饰打过、作者也不符),
     // 但其中一页的标题在模糊层是有限的相似档 ⇒ 必须 422 SOURCE_SIMILAR 带候选,绝不 404。
-    const titleSearch = 'https://book15.net/books/search.html?kw=' + encodeURIComponent(book.title);
+    const titleSearch = searchPageUrl(book.title);
     const decorDetail = (id: number, title: string, author: string) =>
       `<meta property="og:novel:book_name" content="${title}"><meta property="og:novel:author" content="${author}">`
       + '<dd><a href="/chapter/index' + id + '-1.html">第一章</a></dd>'
@@ -626,13 +629,13 @@ describe('online reader source resolution and budgets', () => {
         + '<a href="/books/details72.html" title="全球高武">【完结】全球高武</a>',
     });
     // 71:标题被修饰打过(归一后 ≠ 「测试书」⇒ 身份门不过),作者也不符 ⇒ 只能当模糊候选。
-    pages.set('https://book15.net/books/details71.html', { text: decorDetail(71, '【完结】测试书', '站点挂错的作者') });
+    pages.set(pageUrl(71), { text: decorDetail(71, '【完结】测试书', '站点挂错的作者') });
     // 72:完全无关(共享字符太少、编辑距离过大)⇒ 模糊层 Infinity 淘汰,不得进候选。
-    pages.set('https://book15.net/books/details72.html', { text: decorDetail(72, '全球高武', '别人') });
+    pages.set(pageUrl(72), { text: decorDetail(72, '全球高武', '别人') });
     await expect(service.resolveSourceBook(book, context())).rejects.toMatchObject({
       code: 'SOURCE_SIMILAR',
       status: 422,
-      candidates: [{ title: '【完结】测试书', author: '站点挂错的作者', chapters: 2, bookUrl: 'https://book15.net/books/details71.html' }],
+      candidates: [{ title: '【完结】测试书', author: '站点挂错的作者', chapters: 2, bookUrl: pageUrl(71) }],
     });
   });
 
@@ -640,9 +643,9 @@ describe('online reader source resolution and budgets', () => {
     // 反向负控(异厂审查点名):模糊层唯一候选是**同名异作者**、且没有任何正确候选 ⇒
     // 必须 404/422 且**不得交付**。模糊层的宽松语义只放宽「交给用户选」,绝不放宽成
     // 「把别人的书当目标书送出去」—— 没有交付路径能绕过这里。
-    const titleSearch = 'https://book15.net/books/search.html?kw=' + encodeURIComponent(book.title);
+    const titleSearch = searchPageUrl(book.title);
     pages.set(titleSearch, { text: '<a href="/books/details71.html" title="测试书">【完结】测试书</a>' });
-    pages.set('https://book15.net/books/details71.html', {
+    pages.set(pageUrl(71), {
       text: '<meta property="og:novel:book_name" content="【完结】测试书"><meta property="og:novel:author" content="站点挂错的作者">'
         + '<dd><a href="/chapter/index71-1.html">第一章</a></dd>',
     });
@@ -655,35 +658,35 @@ describe('online reader source resolution and budgets', () => {
 
   it('never auto-delivers an unrelated detail page reached through the fallback', async () => {
     // 负控:兜底收到的详情页书名作者都对不上 ⇒ 不自动取书,交回既有判据(404,不放大到 503)。
-    const titleSearch = 'https://book15.net/books/search.html?kw=' + encodeURIComponent(book.title);
+    const titleSearch = searchPageUrl(book.title);
     pages.set(titleSearch, { text: '<a href="/books/details97.html" title="别的书">别的书</a>' });
-    pages.set('https://book15.net/books/details97.html', {
+    pages.set(pageUrl(97), {
       text: '<meta property="og:novel:book_name" content="别的书"><meta property="og:novel:author" content="别人">'
         + '<dd><a href="/chapter/index97-1.html">第一章</a></dd>',
     });
-    pages.set('https://book15.net/books/search.html?kw=' + encodeURIComponent(book.author), { text: '' });
+    pages.set(searchPageUrl(book.author), { text: '' });
     await expect(service.resolveSourceBook(book, context())).rejects.toMatchObject({
       code: 'SOURCE_NOT_FOUND', status: 404,
     });
     // 基线不会请求这条链接（精确层 0 ⇒ 直接转作者搜索），新实现必须**真的核验过**它 ——
     // 否则这条负控在基线上恒真，证明不了兜底路径被守住（40 任审查 E）。
     expect(mocks.fetch.mock.calls.map((call) => String(call[0])))
-      .toContain('https://book15.net/books/details97.html');
+      .toContain(pageUrl(97));
   });
 
   it('warns search_no_candidates when no anchor text matches the title exactly', async () => {
     // 只加观测：搜索页抓到（200）但锚点无一匹配 ⇒ 打一条结构化 warn，字段可 JSON.parse。
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
-    const titleSearch = 'https://book15.net/books/search.html?kw=' + encodeURIComponent(book.title);
+    const titleSearch = searchPageUrl(book.title);
     pages.set(titleSearch, { text: '<html><body><a href="/books/details99.html">别的书</a></body></html>' });
-    pages.set('https://book15.net/books/search.html?kw=' + encodeURIComponent(book.author), { text: '' });
+    pages.set(searchPageUrl(book.author), { text: '' });
     await service.resolveSourceBook(book, context()).catch(() => {});
     const calls = warn.mock.calls.filter(([tag]) => tag === '[read-source] search_no_candidates');
     expect(calls).toHaveLength(1);
     const payload = JSON.parse(calls[0][1] as string);
     expect(payload).toMatchObject({
       event: 'search_no_candidates',
-      sourceHost: 'book15.net',
+      sourceHost: 'reader.test',
       searchUrl: titleSearch,
       candidateCount: 0,
       title: '测试书',
@@ -696,10 +699,10 @@ describe('online reader source resolution and budgets', () => {
 
   it('flags hadChallengeHint for an anti-bot shell search page', async () => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
-    pages.set('https://book15.net/books/search.html?kw=' + encodeURIComponent(book.title), {
+    pages.set(searchPageUrl(book.title), {
       text: '<html><head><title>Just a moment...</title></head><body></body></html>',
     });
-    pages.set('https://book15.net/books/search.html?kw=' + encodeURIComponent(book.author), { text: '' });
+    pages.set(searchPageUrl(book.author), { text: '' });
     await service.resolveSourceBook(book, context()).catch(() => {});
     const calls = warn.mock.calls.filter(([tag]) => tag === '[read-source] search_no_candidates');
     expect(calls).toHaveLength(1);
@@ -717,16 +720,16 @@ describe('online reader source resolution and budgets', () => {
   it('warns source_not_found with per-source stats when the round ends 404', async () => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     const target = { title: '不存在书', author: '作者A' };
-    pages.set('https://book15.net/books/search.html?kw=' + encodeURIComponent(target.title), {
+    pages.set(searchPageUrl(target.title), {
       text: '<a href="/books/details99.html">别的书</a>',
     });
     // 新语义下同页兜底**会**去核验这条无关详情链接（基线不会），故必须给它 fixture：
     // 抓取成功 + 身份不符 ⇒ 干净 404；不给 fixture 会让 mock 抛错、hadFailure=true、错放大成 503。
-    pages.set('https://book15.net/books/details99.html', {
+    pages.set(pageUrl(99), {
       text: '<meta property="og:novel:book_name" content="别的书"><meta property="og:novel:author" content="别人">'
         + '<dd><a href="/chapter/index99-1.html">第一章</a></dd>',
     });
-    pages.set('https://book15.net/books/search.html?kw=' + encodeURIComponent(target.author), { text: '' });
+    pages.set(searchPageUrl(target.author), { text: '' });
     await expect(service.resolveSourceBook(target, context())).rejects.toMatchObject({
       code: 'SOURCE_NOT_FOUND', status: 404,
     });
@@ -739,7 +742,7 @@ describe('online reader source resolution and budgets', () => {
       sourcesTried: 1,
       // candidates 仍只指**精确层**命中数（0）；同页兜到的那 1 条另记 fallbackCandidates
       // —— 混成一个数会让「搜索页有结果却 0 候选」这个 P0 信号失效（40 任审查 D）。
-      perSource: [{ host: 'book15.net', searched: true, candidates: 0, fallbackCandidates: 1 }],
+      perSource: [{ host: 'reader.test', searched: true, candidates: 0, fallbackCandidates: 1 }],
     });
     expect(typeof payload.perSource[0].bytes).toBe('number');
     // 汇总与逐源信号是两条独立事件，且都出现。
@@ -755,7 +758,7 @@ describe('online reader source resolution and budgets', () => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     const noCandidates = () => warn.mock.calls.filter(([tag]) => tag === '[read-source] search_no_candidates');
     // (a) 同页兜底成功交付：锚文本带修饰 ⇒ 精确层 0，兜底按详情页形态捡到真书。
-    const titleSearch = 'https://book15.net/books/search.html?kw=' + encodeURIComponent(book.title);
+    const titleSearch = searchPageUrl(book.title);
     pages.set(titleSearch, {
       text: '<a href="/books/details41.html" title="测试书">【完结】测试书</a>'
         + Array.from({ length: 8 }, (_, i) => `<a href="/books/details${900 + i}.html">无关书${i}</a>`).join(''),
@@ -765,14 +768,14 @@ describe('online reader source resolution and budgets', () => {
     expect(noCandidates()).toHaveLength(0);
     // (b) 作者搜索回退成功交付：站点索引只有新名，靠作者搜索 + 自报别名找到。
     const target = { title: '旧名', author: '作者甲' };
-    pages.set('https://book15.net/books/search.html?kw=' + encodeURIComponent(target.title), {
+    pages.set(searchPageUrl(target.title), {
       text: '<a href="/books/details61.html">无关书</a>',
     });
     pages.set(pageUrl(61), {
       text: '<meta property="og:novel:book_name" content="无关书"><meta property="og:novel:author" content="别人">'
         + '<dd><a href="/chapter/index61-1.html">第一章</a></dd>',
     });
-    pages.set('https://book15.net/books/search.html?kw=' + encodeURIComponent(target.author), {
+    pages.set(searchPageUrl(target.author), {
       text: '<a href="/books/details62.html">新名</a>',
     });
     pages.set(pageUrl(62), {
@@ -793,9 +796,9 @@ describe('online reader source resolution and budgets', () => {
     const unrel = (id: number) =>
       `<meta property="og:novel:book_name" content="无关书${id}"><meta property="og:novel:author" content="别人">`
       + `<dd><a href="/chapter/index${id}-1.html">第一章</a></dd>`;
-    pages.set('https://book15.net/books/search.html?kw=' + encodeURIComponent(target.title),
+    pages.set(searchPageUrl(target.title),
       { text: [801, 802, 803, 804].map((id) => link(id, '无关书' + id)).join('') });
-    pages.set('https://book15.net/books/search.html?kw=' + encodeURIComponent(target.author),
+    pages.set(searchPageUrl(target.author),
       { text: [901, 902, 903, 904, 905, 906].map((id) => link(id, '无关书' + id)).join('') });
     for (const id of [801, 802, 803, 804, 901, 902, 903, 904, 905, 906]) pages.set(pageUrl(id), { text: unrel(id) });
     // 全部抓取成功、身份全不符 ⇒ 完整搜索后的未找到（404），不是书源故障。
@@ -817,9 +820,9 @@ describe('online reader source resolution and budgets', () => {
       + '<div>小说简介:【原书名：改名书】改名前的版本。</div>'
       + `<dd><a href="/chapter/index${id}-1.html">第一章</a></dd>`;
     hints = [701, 702, 703, 704].map((id) => ({ title: '改名书', author: '作者A', source_url: pageUrl(id) }));
-    pages.set('https://book15.net/books/search.html?kw=' + encodeURIComponent(target.title),
+    pages.set(searchPageUrl(target.title),
       { text: [801, 802, 803, 804].map((id) => link(id, '无关书' + id)).join('') });
-    pages.set('https://book15.net/books/search.html?kw=' + encodeURIComponent(target.author),
+    pages.set(searchPageUrl(target.author),
       { text: [901, 902, 903, 904, 905, 906].map((id) => link(id, '无关书' + id)).join('') });
     for (const id of [701, 702, 703, 704, 801, 802, 803, 804, 901, 902, 904, 905, 906]) pages.set(pageUrl(id), { text: unrel(id) });
     pages.set(pageUrl(903), { text: renamed(903) }); // 真书在第 3 个作者候选
@@ -838,21 +841,21 @@ describe('online reader source resolution and budgets', () => {
       + `<dd><a href="/chapter/index${id}-1.html">第一章</a></dd>`;
     const target = { title: '改名书', author: '作者A' };
     mocks.sources.mockResolvedValue([
-      { url: 'https://book15.net/a/', name: '源A', searchUrl: '/a/search.html?kw={{key}}', rules: {} },
-      { url: 'https://book15.net/b/', name: '源B', searchUrl: '/b/search.html?kw={{key}}', rules: {} },
+      { url: 'https://reader.test/a/', name: '源A', searchUrl: '/a/search.html?kw={{key}}', rules: {} },
+      { url: 'https://reader.test/b/', name: '源B', searchUrl: '/b/search.html?kw={{key}}', rules: {} },
     ]);
-    pages.set('https://book15.net/a/search.html?kw=' + encodeURIComponent(target.title), { text: '' });
-    pages.set('https://book15.net/a/search.html?kw=' + encodeURIComponent(target.author), { text: '' });
+    pages.set('https://reader.test/a/search.html?kw=' + encodeURIComponent(target.title), { text: '' });
+    pages.set('https://reader.test/a/search.html?kw=' + encodeURIComponent(target.author), { text: '' });
     // 源 B 标题搜索：同页兜底 5 条无关详情链接（搜索 1 + 兜底 5 ⇒ L1 上限 6 之内挤满，
     // 剩余 L1 = 0；旧手写 fallbackWidth 算 root 的 L2 ⇒ 兜底仍按 4 展开，作者搜索必撞 L1 闸门）
-    pages.set('https://book15.net/b/search.html?kw=' + encodeURIComponent(target.title),
+    pages.set('https://reader.test/b/search.html?kw=' + encodeURIComponent(target.title),
       { text: [801, 802, 803, 804, 805].map((i) => `<a href="/books/details${i}.html">无关书</a>`).join('') });
-    pages.set('https://book15.net/b/search.html?kw=' + encodeURIComponent(target.author),
+    pages.set('https://reader.test/b/search.html?kw=' + encodeURIComponent(target.author),
       { text: '<a href="/books/details9.html">新名</a>' });
-    for (const id of [801, 802, 803, 804, 805]) pages.set('https://book15.net/books/details' + id + '.html', { text: det(id, '无关书' + id, '别人') });
-    pages.set('https://book15.net/books/details9.html', { text: det(9, '新名', '作者A', '<div>小说简介:【原书名：改名书】。</div>') });
+    for (const id of [801, 802, 803, 804, 805]) pages.set(pageUrl(id), { text: det(id, '无关书' + id, '别人') });
+    pages.set(pageUrl(9), { text: det(9, '新名', '作者A', '<div>小说简介:【原书名：改名书】。</div>') });
     const catalog = await service.resolveSourceBook(target, context());
-    expect(catalog).toMatchObject({ title: '新名', author: '作者A', bookUrl: 'https://book15.net/books/details9.html' });
+    expect(catalog).toMatchObject({ title: '新名', author: '作者A', bookUrl: pageUrl(9) });
   });
 });
 
@@ -988,7 +991,7 @@ describe('GET /api/read/source/[resource]', () => {
     // 复审复现:原目录「第1章 风起」,备用目录「第1章 风起与云涌」(matchSourceChapter tier 3)。
     // 严格相等判据下 attach 静默不附,重读时前端标题防线判不符。
     mocks.sources.mockResolvedValue([source, backup]);
-    pages.set('https://book15.net/books/search.html?kw=' + encodeURIComponent(book.title), {
+    pages.set(searchPageUrl(book.title), {
       text: '<a href="/books/details42.html">测试书</a>',
     });
     pages.set(pageUrl(), { text: detail(42, '作者', ['第1章 风起', '第2章 落雨']) });
@@ -1036,7 +1039,7 @@ describe('GET /api/read/source/[resource]', () => {
     mocks.sources.mockResolvedValue([source]);
     // 覆盖 beforeEach 里的命中 fixture：搜索页（书名/作者两键）都改成无锚点正文。
     for (const key of [book.title, book.author]) {
-      pages.set('https://book15.net/books/search.html?kw=' + encodeURIComponent(key), { text: '无链接正文' });
+      pages.set(searchPageUrl(key), { text: '无链接正文' });
     }
     const miss = await request();
     expect(miss.status).toBe(404);
@@ -1055,7 +1058,7 @@ describe('GET /api/read/source/[resource]', () => {
     // 改动 4 回归：SOURCE_UNAVAILABLE 的 503 档必须有结构化日志（此前零观测）。
     // 只记 code/requests/elapsedMs，不打书名、作者、URL、查询串。
     const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
-    pages.set('https://book15.net/books/search.html?kw=' + encodeURIComponent(book.title), networkFailure);
+    pages.set(searchPageUrl(book.title), networkFailure);
     const res = await request();
     expect(res.status).toBe(503);
     expect(await res.json()).toMatchObject({ code: 'SOURCE_UNAVAILABLE' });
@@ -1070,7 +1073,7 @@ describe('GET /api/read/source/[resource]', () => {
 // M2-1 只做原语：SourceRequestContext.child / openPool 的语义与信号传递。
 // 软预算判据与跳源循环在 M2-2（设计 §9 任务卡：本文件这 5 条才是 M2-1 的权威验收）。
 describe('source budget primitives: child scopes and openPool (M2-1)', () => {
-  const scopedUrl = (id: number) => `https://book15.net/books/details${id}.html`;
+  const scopedUrl = pageUrl;
 
   it('opens the global pool with a 12 floor and a 30 cap, never shrinking', () => {
     // 设计 §3.1：openPool(n) = min(30, max(12, 6n))，幂等取最大值。
@@ -1098,12 +1101,12 @@ describe('source budget primitives: child scopes and openPool (M2-1)', () => {
   it('shares the request counter with a child while keeping the limits independent', async () => {
     pages.set(scopedUrl(50), { text: '正文占位' });
     const root = context();
-    const child = root.child('https://book15.net/mirror-page');
+    const child = root.child('https://reader.test/mirror-page');
     expect(root.scope).toBe('builtin'); // 根 context 是 builtin 首源
-    expect(child.scope).toBe('https://book15.net/mirror-page');
+    expect(child.scope).toBe('https://reader.test/mirror-page');
     expect(root.limit).toBe(12);
     expect(child.limit).toBe(service.PER_SOURCE_REQUESTS); // 单源默认 6（设计 §3.1）
-    expect(root.child('https://book15.net/x', { limit: 3 }).limit).toBe(3);
+    expect(root.child('https://reader.test/x', { limit: 3 }).limit).toBe(3);
     await child.page(scopedUrl(50));
     expect(child.requests).toBe(1); // 子计数写回共享
     expect(root.requests).toBe(1);
@@ -1116,7 +1119,7 @@ describe('source budget primitives: child scopes and openPool (M2-1)', () => {
     // 父计数不回退，兄弟/首源仍可用剩余全局预算。
     for (const id of [51, 52, 53, 54]) pages.set(scopedUrl(id), { text: '正文占位' });
     const root = context();
-    const child = root.child('https://book15.net/mirror-page', { limit: 2 });
+    const child = root.child('https://reader.test/mirror-page', { limit: 2 });
     await child.page(scopedUrl(51));
     await child.page(scopedUrl(52));
     await expect(child.page(scopedUrl(53))).rejects.toMatchObject({ code: 'SOURCE_SCOPE_EXHAUSTED', status: 503 });
@@ -1131,7 +1134,7 @@ describe('source budget primitives: child scopes and openPool (M2-1)', () => {
     // 验收 3：child 的 signal = AbortSignal.any([父 signal, 切片定时器])，父 abort 立刻传到子。
     const controller = new AbortController();
     const root = new service.SourceRequestContext(controller.signal);
-    const child = root.child('https://book15.net/mirror-page');
+    const child = root.child('https://reader.test/mirror-page');
     mocks.fetch.mockImplementation(() => new Promise<Response>(() => { /* 挂起，等父 abort */ }));
     const pending = child.page(scopedUrl(55));
     await new Promise((resolve) => setTimeout(resolve, 5)); // 让请求真正挂在 fetch 上
@@ -1143,7 +1146,7 @@ describe('source budget primitives: child scopes and openPool (M2-1)', () => {
   it('expires a source slice without aborting the parent', async () => {
     // 设计 §3.3 陷阱：切片只 abort 子 signal。若父 signal 也 aborted，M2-2 的循环会把它误判成整体取消。
     const root = context();
-    const child = root.child('https://book15.net/mirror-page', { sliceMs: 5 });
+    const child = root.child('https://reader.test/mirror-page', { sliceMs: 5 });
     mocks.fetch.mockImplementation(() => new Promise<Response>(() => { /* 挂起，等切片超时 */ }));
     const error = await child.page(scopedUrl(56)).catch((reason: unknown) => reason);
     expect(error).toMatchObject({ code: 'SOURCE_SCOPE_EXHAUSTED', status: 503 });
@@ -1162,11 +1165,11 @@ describe('source budget primitives: child scopes and openPool (M2-1)', () => {
       return new Response('<html></html>', { status: 200 });
     });
     const root = new service.SourceRequestContext(new AbortController().signal);
-    const child = root.child('https://book15.net/mirror-page');
+    const child = root.child('https://reader.test/mirror-page');
     await Promise.all([
-      root.page('https://book15.net/a'),
-      child.page('https://book15.net/b'),
-      root.page('https://book15.net/c'),
+      root.page('https://reader.test/a'),
+      child.page('https://reader.test/b'),
+      root.page('https://reader.test/c'),
     ]);
     expect(starts).toHaveLength(3);
     expect(starts[1] - starts[0]).toBeGreaterThanOrEqual(300);
@@ -1232,7 +1235,7 @@ describe('builtin 目录版本逐字节冻结（M1 任务 4 零回归）', () =>
 // M1 任务 4 §7.2：rules 非空且非 builtin 的源走引擎门面；identity 校验留在调用方。
 describe('引擎源分派（M1 任务 4 §7.2）', () => {
   const engineSource = {
-    url: 'https://book15.net/engine/', name: '引擎源', searchUrl: 'https://book15.net/s?q={{key}}',
+    url: 'https://reader.test/engine/', name: '引擎源', searchUrl: 'https://reader.test/s?q={{key}}',
     tier: 'M1' as const,
     rules: {
       ruleSearch: { bookList: '.book', name: '.name@text', author: '.author@text', bookUrl: 'a@href' },
@@ -1241,9 +1244,9 @@ describe('引擎源分派（M1 任务 4 §7.2）', () => {
       ruleContent: { content: '.content@text' },
     },
   };
-  const searchUrl = 'https://book15.net/s?q=' + encodeURIComponent('测试书');
-  const detailUrl = 'https://book15.net/detail/1.html';
-  const tocUrl = 'https://book15.net/toc/1.html';
+  const searchUrl = 'https://reader.test/s?q=' + encodeURIComponent('测试书');
+  const detailUrl = 'https://reader.test/detail/1.html';
+  const tocUrl = 'https://reader.test/toc/1.html';
 
   it('engineSearchBook → engineFetchDetail → engineFetchToc 产出目录（version 带 rule-engine-v1 前缀区分）', async () => {
     mocks.sources.mockResolvedValue([engineSource]);
@@ -1253,7 +1256,7 @@ describe('引擎源分派（M1 任务 4 §7.2）', () => {
     const catalog = await service.resolveSourceBook(book, context());
     expect(catalog).toMatchObject({
       title: '测试书', author: '作者', bookUrl: detailUrl,
-      chapters: [{ url: 'https://book15.net/c/1.html', title: '第一章' }, { url: 'https://book15.net/c/2.html', title: '第二章' }],
+      chapters: [{ url: 'https://reader.test/c/1.html', title: '第一章' }, { url: 'https://reader.test/c/2.html', title: '第二章' }],
     });
     // 源归属：sourceId 用引擎源的 url + 详情页 URL（与 builtin 同口径，m2-scaleout §5.1）。
     const sha1 = (value: unknown) => createHash('sha1').update(JSON.stringify(value)).digest('hex');
@@ -1264,7 +1267,7 @@ describe('引擎源分派（M1 任务 4 §7.2）', () => {
   it('identity 不符时引擎源不自动取书（校验在调用方，§7.2）', async () => {
     mocks.sources.mockResolvedValue([engineSource]);
     pages.set(searchUrl, { text: '<div class="book"><span class="name">别的书</span><span class="author">别人</span><a href="/detail/1.html">x</a></div>' });
-    pages.set('https://book15.net/s?q=' + encodeURIComponent(book.author), { text: '<div>没有结果</div>' });
+    pages.set('https://reader.test/s?q=' + encodeURIComponent(book.author), { text: '<div>没有结果</div>' });
     pages.set(detailUrl, { text: '<h1 class="title">别的书</h1><span class="writer">别人</span><a class="toc" href="/toc/1.html">目录</a>' });
     pages.set(tocUrl, { text: '<li class="chapter"><a href="/c/1.html">第一章</a></li>' });
     await expect(service.resolveSourceBook(book, context())).rejects.toMatchObject({ code: 'SOURCE_NOT_FOUND' });
@@ -1303,9 +1306,9 @@ describe('引擎源分派（M1 任务 4 §7.2）', () => {
   });
 });
 describe('M2-2 多源循环：跳源 / 软预算 / 去重 / bookUrl 反查', () => {
-  const search = (kw: string, host = 'https://book15.net') => host + '/books/search.html?kw=' + encodeURIComponent(kw);
-  const sourceB = { ...source, url: 'https://book15.net/b', name: '备用书源', searchUrl: '/b/search.html?kw={{key}}' };
-  const bSearch = 'https://book15.net/b/search.html?kw=' + encodeURIComponent(book.title);
+  const search = (kw: string, host = 'https://reader.test') => host + '/books/search.html?kw=' + encodeURIComponent(kw);
+  const sourceB = { ...source, url: 'https://reader.test/b', name: '备用书源', searchUrl: '/b/search.html?kw={{key}}' };
+  const bSearch = 'https://reader.test/b/search.html?kw=' + encodeURIComponent(book.title);
   // 引擎源 A：ruleToc.chapterList 在选择器无命中时返回空目录 ⇒ 每个候选只消耗 detail+toc 两点；
   // 4 个候选共 1+2×4 点，在单源 6 点闸门处撞 SOURCE_SCOPE_EXHAUSTED（跳源信号）。
   const engineRulesA = {
@@ -1314,11 +1317,11 @@ describe('M2-2 多源循环：跳源 / 软预算 / 去重 / bookUrl 反查', () 
     ruleToc: { chapterList: '.chapter', chapterName: 'a@text', chapterUrl: 'a@href' },
   };
   const engineA = {
-    url: 'https://book15.net/e-a/', name: '引擎A', searchUrl: 'https://book15.net/e-a?q={{key}}',
+    url: 'https://reader.test/e-a/', name: '引擎A', searchUrl: 'https://reader.test/e-a?q={{key}}',
     tier: 'M1' as const, rules: engineRulesA,
   };
-  const engineASearch = 'https://book15.net/e-a?q=' + encodeURIComponent(book.title);
-  const engineABook = (n: number) => `https://book15.net/d/${n}.html`;
+  const engineASearch = 'https://reader.test/e-a?q=' + encodeURIComponent(book.title);
+  const engineABook = (n: number) => `https://reader.test/d/${n}.html`;
   // 首个源（builtin）干净 miss：标题/作者搜索都返回空页（无 hadFailure）。
   const primeMiss = () => {
     pages.set(search(book.title), { text: '' });
@@ -1341,7 +1344,7 @@ describe('M2-2 多源循环：跳源 / 软预算 / 去重 / bookUrl 反查', () 
     expect(catalog.bookUrl).toBe(pageUrl());
     expect(catalog.sourceName).toBe('备用书源');
     // 引擎 A 在 6 点闸门处被跳源（detail+toc 各源独立计数），不会再发第 7 点请求。
-    expect(mocks.fetch.mock.calls.filter(([input]) => String(input).startsWith('https://book15.net/e-a')).length).toBe(1);
+    expect(mocks.fetch.mock.calls.filter(([input]) => String(input).startsWith('https://reader.test/e-a')).length).toBe(1);
   });
 
   it('全源耗尽（含跳源）⇒ 503 SOURCE_UNAVAILABLE，不是 404（验收 3）', async () => {
@@ -1357,7 +1360,7 @@ describe('M2-2 多源循环：跳源 / 软预算 / 去重 / bookUrl 反查', () 
   });
 
   it('软预算到点 ⇒ 不再发起后续源请求，已收集的命中照常返回（验收 4a）', async () => {
-    mocks.sources.mockResolvedValue([source, sourceB, { ...sourceB, url: 'https://book15.net/c', name: '第三源' }]);
+    mocks.sources.mockResolvedValue([source, sourceB, { ...sourceB, url: 'https://reader.test/c', name: '第三源' }]);
     const ctx = context();
     vi.mocked(Date.now).mockReturnValue(ctx.startedAt + 46_000); // elapsed 46000 > SOFT_BUDGET 45000
     // 无作者书：首源命中不提前返回（matches 累积），软预算到点后仍应交付首源命中。
@@ -1393,10 +1396,10 @@ describe('M2-2 多源循环：跳源 / 软预算 / 去重 / bookUrl 反查', () 
   it('单源切片超时 ⇒ 跳源（不 504），后续源照常命中（验收 5 前半，子/父 signal 陷阱）', async () => {
     primeMiss();
     primeHitB();
-    const sourceHang = { ...source, url: 'https://book15.net/hang', name: '挂起源', searchUrl: '/hang/search.html?kw={{key}}' };
-    const sourceC = { ...sourceB, url: 'https://book15.net/c', name: '命中源' };
+    const sourceHang = { ...source, url: 'https://reader.test/hang', name: '挂起源', searchUrl: '/hang/search.html?kw={{key}}' };
+    const sourceC = { ...sourceB, url: 'https://reader.test/c', name: '命中源' };
     mocks.sources.mockResolvedValue([source, sourceHang, sourceC]);
-    const hangUrl = 'https://book15.net/hang/search.html?kw=' + encodeURIComponent(book.title);
+    const hangUrl = 'https://reader.test/hang/search.html?kw=' + encodeURIComponent(book.title);
     // 测试注入机制：只缩短单源切片，不改生产签名（resolveSourceBook 内部仍用默认常量）。
     const ctx = context();
     const baseChild = ctx.child.bind(ctx);
@@ -1413,9 +1416,9 @@ describe('M2-2 多源循环：跳源 / 软预算 / 去重 / bookUrl 反查', () 
 
   it('父 signal 中止 ⇒ 仍按整体取消抛出（route 504），不被跳源吞成 503（验收 5 后半）', async () => {
     primeMiss();
-    const sourceHang = { ...source, url: 'https://book15.net/hang', name: '挂起源', searchUrl: '/hang/search.html?kw={{key}}' };
+    const sourceHang = { ...source, url: 'https://reader.test/hang', name: '挂起源', searchUrl: '/hang/search.html?kw={{key}}' };
     mocks.sources.mockResolvedValue([source, sourceHang]);
-    const hangUrl = 'https://book15.net/hang/search.html?kw=' + encodeURIComponent(book.title);
+    const hangUrl = 'https://reader.test/hang/search.html?kw=' + encodeURIComponent(book.title);
     const base = mocks.fetch.getMockImplementation()!;
     mocks.fetch.mockImplementation(async (input: RequestInfo | URL) => {
       if (String(input) === hangUrl) return new Promise<Response>(() => { /* 挂起 */ });
@@ -1435,7 +1438,7 @@ describe('M2-2 多源循环：跳源 / 软预算 / 去重 / bookUrl 反查', () 
     pages.set(bSearch, { text: '<a href="/books/details43.html">测试书</a>' });
     pages.set(pageUrl(43), { text: detail(43, '作者', ['第一章']) });
     const same = await service.resolveSourceBook({ ...book, author: '' }, context());
-    expect(same.bookUrl).toBe(pageUrl()); // 首源（book15 主源），不 422
+    expect(same.bookUrl).toBe(pageUrl()); // 首源（reader.test 主源），不 422
     // 不同作者：同名不同书，仍是真歧义，保留 422。
     pages.set(pageUrl(43), { text: detail(43, '别的作者', ['第一章']) });
     await expect(service.resolveSourceBook({ ...book, author: '' }, context())).rejects.toMatchObject({
@@ -1445,12 +1448,12 @@ describe('M2-2 多源循环：跳源 / 软预算 / 去重 / bookUrl 反查', () 
 
   it('bookUrl 确认路径不建 child、不调 openPool，只走根预算（验收 8a/8b）', async () => {
     mocks.sources.mockResolvedValue([source, engineA]); // 池里有引擎源，openPool 本会被触发
-    pages.set('https://book15.net/books/details77.html', {
+    pages.set(pageUrl(77), {
       text: detail(77, '随便什么作者').replace('content="测试书"', 'content="随便什么书名"'),
     });
     const childSpy = vi.spyOn(service.SourceRequestContext.prototype, 'child');
     const poolSpy = vi.spyOn(service.SourceRequestContext.prototype, 'openPool');
-    const catalog = await service.resolveSourceBook(book, context(), { bookUrl: 'https://book15.net/books/details77.html' });
+    const catalog = await service.resolveSourceBook(book, context(), { bookUrl: pageUrl(77) });
     expect(catalog).toMatchObject({ title: '随便什么书名', author: '随便什么作者' });
     expect(childSpy).not.toHaveBeenCalled(); // 无 child ⇒ 无切片定时器 ⇒ SOURCE_SCOPE_EXHAUSTED 不可能出现
     expect(poolSpy).not.toHaveBeenCalled();
@@ -1459,7 +1462,7 @@ describe('M2-2 多源循环：跳源 / 软预算 / 去重 / bookUrl 反查', () 
 
   it('bookUrl 按 host 反查引擎源（不再硬取 sources[0]），走同一引擎构造器（验收 8c）', async () => {
     const { refreshSupportedHosts } = await import('./source-policy');
-    refreshSupportedHosts(['engine.test']);
+    refreshSupportedHosts(['reader.test', 'www.reader.test', 'engine.test']);
     const engineHost = {
       url: 'https://engine.test/', name: '外部引擎', searchUrl: 'https://engine.test/s?q={{key}}',
       tier: 'M1' as const,
@@ -1480,7 +1483,7 @@ describe('M2-2 多源循环：跳源 / 软预算 / 去重 / bookUrl 反查', () 
 
   it('bookUrl 的 host 不在池内 ⇒ 404 重选（不回退 sources[0]）（验收 8c 负控）', async () => {
     const { refreshSupportedHosts } = await import('./source-policy');
-    refreshSupportedHosts(['engine.test']);
+    refreshSupportedHosts(['reader.test', 'www.reader.test', 'engine.test']);
     mocks.sources.mockResolvedValue([source]);
     await expect(service.resolveSourceBook(book, context(), { bookUrl: 'https://engine.test/d/1.html' }))
       .rejects.toMatchObject({ code: 'SOURCE_NOT_FOUND', status: 404 });
@@ -1508,7 +1511,7 @@ describe('M2-2 多源循环：跳源 / 软预算 / 去重 / bookUrl 反查', () 
       pages.set('https://engine.test/b/toc/1.html', { text: '<li class="bc"><a href="/b/c/1.html">第一章</a></li><li class="bc"><a href="/b/c/2.html">第二章</a></li>' });
     };
     beforeEach(async () => {
-      (await import('./source-policy')).refreshSupportedHosts(['engine.test', 'other.test']);
+      (await import('./source-policy')).refreshSupportedHosts(['reader.test', 'www.reader.test', 'engine.test', 'other.test']);
       mocks.sources.mockResolvedValue([source, sameHostA, sameHostB]);
     });
 
@@ -1553,7 +1556,7 @@ describe('M2-2 多源循环：跳源 / 软预算 / 去重 / bookUrl 反查', () 
 
   it('引擎源 identity 回退链：ruleBookInfo 缺 name/author ⇒ 用 ruleSearch 的名字/作者（验收 9）', async () => {
     const engineFallback = {
-      url: 'https://book15.net/e-f/', name: '引擎回退', searchUrl: 'https://book15.net/e-f?q={{key}}',
+      url: 'https://reader.test/e-f/', name: '引擎回退', searchUrl: 'https://reader.test/e-f?q={{key}}',
       tier: 'M1' as const,
       rules: {
         ruleSearch: { bookList: '.book', name: '.name@text', author: '.author@text', bookUrl: 'a@href' },
@@ -1561,12 +1564,12 @@ describe('M2-2 多源循环：跳源 / 软预算 / 去重 / bookUrl 反查', () 
         ruleToc: { chapterList: '.chapter', chapterName: 'a@text', chapterUrl: 'a@href' },
       },
     };
-    const searchUrl = 'https://book15.net/e-f?q=' + encodeURIComponent(book.title);
-    const detailUrl = 'https://book15.net/f/detail/1.html';
+    const searchUrl = 'https://reader.test/e-f?q=' + encodeURIComponent(book.title);
+    const detailUrl = 'https://reader.test/f/detail/1.html';
     mocks.sources.mockResolvedValue([engineFallback]);
     pages.set(searchUrl, { text: '<div class="book"><span class="name">测试书</span><span class="author">作者</span><a href="/f/detail/1.html">x</a></div>' });
     pages.set(detailUrl, { text: '<a class="toc" href="/f/toc/1.html">目录</a>' }); // 详情页无 .title/.writer
-    pages.set('https://book15.net/f/toc/1.html', { text: '<li class="chapter"><a href="/f/c/1.html">第一章</a></li>' });
+    pages.set('https://reader.test/f/toc/1.html', { text: '<li class="chapter"><a href="/f/c/1.html">第一章</a></li>' });
     const catalog = await service.resolveSourceBook(book, context());
     expect(catalog).toMatchObject({ title: '测试书', author: '作者' }); // 回退到搜索结果
     expect(catalog.chapters).toHaveLength(1);
@@ -1591,7 +1594,7 @@ describe('M2-2 多源循环：跳源 / 软预算 / 去重 / bookUrl 反查', () 
 describe('引擎源正文分派（N01）', () => {
   // 对齐 N01 反例的合成规则：ruleContent.content='#body@text'。
   const contentEngineSource = {
-    url: 'https://book15.net/n01/', name: 'N01引擎源', searchUrl: 'https://book15.net/n01s?q={{key}}',
+    url: 'https://reader.test/n01/', name: 'N01引擎源', searchUrl: 'https://reader.test/n01s?q={{key}}',
     tier: 'M1' as const,
     rules: {
       ruleSearch: { bookList: '.book', name: '.name@text', author: '.author@text', bookUrl: 'a@href' },
@@ -1600,10 +1603,10 @@ describe('引擎源正文分派（N01）', () => {
       ruleContent: { content: '#body@text' },
     },
   };
-  const n01Search = 'https://book15.net/n01s?q=' + encodeURIComponent(book.title);
-  const n01Detail = 'https://book15.net/n01/d/1.html';
-  const n01Toc = 'https://book15.net/n01/toc/1.html';
-  const n01Chapter = 'https://book15.net/n01/c/1.html';
+  const n01Search = 'https://reader.test/n01s?q=' + encodeURIComponent(book.title);
+  const n01Detail = 'https://reader.test/n01/d/1.html';
+  const n01Toc = 'https://reader.test/n01/toc/1.html';
+  const n01Chapter = 'https://reader.test/n01/c/1.html';
   const primeEngineCatalog = async () => {
     mocks.sources.mockResolvedValue([contentEngineSource]);
     pages.set(n01Search, { text: '<div class="book"><span class="name">测试书</span><span class="author">作者</span><a href="/n01/d/1.html">x</a></div>' });
@@ -1620,7 +1623,7 @@ describe('引擎源正文分派（N01）', () => {
     const catalog = await primeEngineCatalog();
     mocks.sources.mockResolvedValue(hasBackup ? [paged, backup] : [paged]);
     pages.set(n01Chapter, { text: '<div id="body">前半章</div><a class="next" href="/n01/c/1_2.html">下页</a>' });
-    pages.set('https://book15.net/n01/c/1_2.html', { text: '<div>请稍后重试</div>' });
+    pages.set('https://reader.test/n01/c/1_2.html', { text: '<div>请稍后重试</div>' });
     if (hasBackup) {
       pages.set(backupSearch(), { text: '<a href="/books/details777.html">测试书</a>' });
       pages.set(backupPage, { text: detail(777) });
@@ -1631,11 +1634,11 @@ describe('引擎源正文分派（N01）', () => {
     } else {
       await expect(service.readSourceChapter(catalog.version, 0, context()))
         .rejects.toMatchObject({ code: 'SOURCE_CHAPTER_UNAVAILABLE', status: 503 });
-      pages.set('https://book15.net/n01/c/1_2.html', { text: '<div id="body">后半章</div>' });
+      pages.set('https://reader.test/n01/c/1_2.html', { text: '<div id="body">后半章</div>' });
       const beforeRetry = mocks.fetch.mock.calls.length;
       expect((await service.readSourceChapter(catalog.version, 0, context())).text).toBe('前半章\n后半章');
       expect(mocks.fetch.mock.calls.slice(beforeRetry).map(([url]) => String(url)))
-        .toEqual([n01Chapter, 'https://book15.net/n01/c/1_2.html']);
+        .toEqual([n01Chapter, 'https://reader.test/n01/c/1_2.html']);
     }
   });
 
@@ -1646,13 +1649,13 @@ describe('引擎源正文分派（N01）', () => {
       ruleToc: { ...contentEngineSource.rules.ruleToc, nextTocUrl: '.next@href' } } };
     mocks.sources.mockResolvedValue([paged]);
     pages.set(n01Toc, { text: '<li class="chapter"><a href="/n01/c/1.html">第一章</a></li><a class="next" href="/n01/toc/2.html">下页</a>' });
-    pages.set('https://book15.net/n01/toc/2.html', { text: '<div>请稍后重试</div>' });
+    pages.set('https://reader.test/n01/toc/2.html', { text: '<div>请稍后重试</div>' });
     const query = `title=测试书&author=作者&book_url=${encodeURIComponent(n01Detail)}&source=${encodeURIComponent(paged.url)}`;
     const failed = await request('index', query);
     expect(failed.status).toBe(422);
     expect(await failed.json()).toMatchObject({ code: 'SOURCE_REJECTED' });
     expect(writes).toEqual([]);
-    pages.set('https://book15.net/n01/toc/2.html', { text: '<li class="chapter"><a href="/n01/c/2.html">第二章</a></li>' });
+    pages.set('https://reader.test/n01/toc/2.html', { text: '<li class="chapter"><a href="/n01/c/2.html">第二章</a></li>' });
     const recovered = await request('index', query);
     expect(recovered.status).toBe(200);
     expect((await recovered.json()).chapters).toHaveLength(2);
@@ -1664,7 +1667,7 @@ describe('引擎源正文分派（N01）', () => {
       ruleToc: { ...contentEngineSource.rules.ruleToc, nextTocUrl: '.next@href' } } };
     mocks.sources.mockResolvedValue([paged]);
     const canonicalUrl = n01Toc + '?canonical=1';
-    const continuation = 'https://book15.net/n01/toc/2.html';
+    const continuation = 'https://reader.test/n01/toc/2.html';
     const firstHtml = '<li class="chapter"><a href="/n01/c/1.html">第一章</a></li><a class="next" href="/n01/toc/2.html">下页</a>';
     pages.set(n01Toc, { text: firstHtml });
     pages.set(canonicalUrl, { text: firstHtml });
@@ -1704,8 +1707,8 @@ describe('引擎源正文分派（N01）', () => {
     pages.set(n01Toc, { text: '<li class="chapter"><a href="/n01/c/1.html">第一章</a></li><li class="chapter"><a href="/n01/c/2.html">第二章</a></li>' });
     const catalog = await service.resolveSourceBook(book, context());
     catalogs.set(catalog.version, catalog);
-    const second = 'https://book15.net/n01/c/2.html';
-    const continuation = 'https://book15.net/n01/c/1_2.html';
+    const second = 'https://reader.test/n01/c/2.html';
+    const continuation = 'https://reader.test/n01/c/1_2.html';
     pages.set(n01Chapter, { text: '<div id="body">第一章前半</div><a class="next" href="/n01/c/1_2.html">下页</a>' });
     pages.set(continuation, { text: '<div id="body">第一章后半</div>' });
     pages.set(second, { text: '<div id="body">第二章内容，不属于第一章</div>' });
@@ -1727,7 +1730,7 @@ describe('引擎源正文分派（N01）', () => {
 
   it('REDIRECT53: 未指向其他目录章节的合法规范化跳转仍可读', async () => {
     const catalog = await primeEngineCatalog();
-    const canonical = 'https://book15.net/n01/c/1.html?canonical=1';
+    const canonical = 'https://reader.test/n01/c/1.html?canonical=1';
     pages.set(canonical, { text: '<div id="body">第一章完整正文</div>' });
     const originalFetch = mocks.fetch.getMockImplementation()!;
     mocks.fetch.mockImplementation((input, init) => String(input) === n01Chapter
@@ -1742,7 +1745,7 @@ describe('引擎源正文分派（N01）', () => {
       ruleContent: { content: '#body@text', nextContentUrl: '.next@href' } } };
     mocks.sources.mockResolvedValue([paged]);
     const canonicalUrl = n01Chapter + '?canonical=1';
-    const continuation = 'https://book15.net/n01/c/1_2.html';
+    const continuation = 'https://reader.test/n01/c/1_2.html';
     const firstHtml = '<div id="body">第一章前半</div><a class="next" href="/n01/c/1_2.html">下页</a>';
     pages.set(n01Chapter, { text: firstHtml });
     pages.set(canonicalUrl, { text: firstHtml });
@@ -1773,7 +1776,7 @@ describe('引擎源正文分派（N01）', () => {
     const paged = { ...contentEngineSource, rules: { ...contentEngineSource.rules,
       ruleContent: { content: '#body@text', nextContentUrl: '.next@href' } } };
     mocks.sources.mockResolvedValue([paged, backup]);
-    const continuation = 'https://book15.net/n01/c/1_2.html';
+    const continuation = 'https://reader.test/n01/c/1_2.html';
     pages.set(n01Chapter, { text: '<div id="body">第一章前半</div><a class="next" href="/n01/c/1_2.html">下页</a>' });
     pages.set(backupSearch(), { text: '<a href="/books/details777.html">测试书</a>' });
     pages.set(backupPage, { text: detail(777) });
@@ -1825,13 +1828,13 @@ describe('引擎源正文分派（N01）', () => {
   });
 
   it('builtin 源仍走 parseSourceChapterText（行为不变）：#body 页面对 builtin 是无效正文', async () => {
-    const catalog = await service.resolveSourceBook(book, context()); // 默认 fixture = builtin book15
+    const catalog = await service.resolveSourceBook(book, context()); // 默认 fixture = builtin reader.test
     catalogs.set(catalog.version, catalog);
     // builtin 的章节 URL 换成引擎式 #body 正文页：parseSourceChapterText 找不到
     // <li class="chapter-content"> ⇒ 按既有语义失败（负控：builtin 分支没被引擎化）。
     pages.set(chapterUrl(), { text: '<div id="body">Synthetic chapter body.</div>' });
-    pages.set('https://book15.net/books/search.html?kw=' + encodeURIComponent(book.title), { text: '' });
-    pages.set('https://book15.net/books/search.html?kw=' + encodeURIComponent(book.author), { text: '' });
+    pages.set(searchPageUrl(book.title), { text: '' });
+    pages.set(searchPageUrl(book.author), { text: '' });
     await expect(service.readSourceChapter(catalog.version, 0, context()))
       .rejects.toMatchObject({ code: 'SOURCE_CHAPTER_UNAVAILABLE', status: 503 });
   });
@@ -1920,11 +1923,11 @@ describe('用户指定源按 selectable 反查，自动遍历仍只走取书池�
   // builtin（取书池唯一的源）没有这本书：标题/作者搜索页都是空页。
   const builtinMiss = () => {
     for (const keyword of [book.title, book.author]) {
-      pages.set('https://book15.net/books/search.html?kw=' + encodeURIComponent(keyword), { text: '' });
+      pages.set(searchPageUrl(keyword), { text: '' });
     }
   };
   beforeEach(async () => {
-    (await import('./source-policy')).refreshSupportedHosts(['backup.test', 'yunqi.test', 'zeta.test', 'gated.test']);
+    (await import('./source-policy')).refreshSupportedHosts(['reader.test', 'www.reader.test', 'backup.test', 'yunqi.test', 'zeta.test', 'gated.test']);
     mocks.sources.mockResolvedValue([source]);
     mocks.selectable.mockResolvedValue([source, outside, other]);
   });
@@ -1965,7 +1968,7 @@ describe('用户指定源按 selectable 反查，自动遍历仍只走取书池�
     const res = await request();
     expect(res.status).toBe(404);
     expect(await res.json()).toMatchObject({ code: 'SOURCE_NOT_FOUND' });
-    expect(hostsRequested()).toEqual(['book15.net']);
+    expect(hostsRequested()).toEqual(['reader.test']);
     expect(requested()).toHaveLength(2); // 标题搜索 + 作者搜索回退，恰好取书池这一个源
   });
 
@@ -2002,7 +2005,7 @@ describe('用户指定源按 selectable 反查，自动遍历仍只走取书池�
 // 与 resolveSourceBook 的差异(†):首命中即 break、单源失败记 unreachable 继续、不跨源去重、
 // 不抛 422 AMBIGUOUS、独立池上限 min(池, 6)。
 describe('M3 surveySourceBooks 换源扫描', () => {
-  const search = (kw: string, host = 'https://book15.net') => host + '/books/search.html?kw=' + encodeURIComponent(kw);
+  const search = (kw: string, host = 'https://reader.test') => host + '/books/search.html?kw=' + encodeURIComponent(kw);
   const sourceB = { ...source, url: 'https://backup.test/', name: '备用书源', searchUrl: '/books/search.html?kw={{key}}' };
   const bSearch = backupSearch();
   const primeHitB = () => {
@@ -2017,7 +2020,7 @@ describe('M3 surveySourceBooks 换源扫描', () => {
     expect(partial).toBe(false);
     const ok = sources.find((item) => item.sourceName === '备用书源');
     expect(ok).toMatchObject({ status: 'ok', bookUrl: backupPage, title: '测试书', chapters: 2 });
-    // 首源(book15 默认夹具命中)同样记 ok:survey 不做跨源去重,两源各留一条候选。
+    // 首源(reader.test 默认夹具命中)同样记 ok:survey 不做跨源去重,两源各留一条候选。
     expect(sources.find((item) => item.sourceName === '测试书源')).toMatchObject({ status: 'ok', bookUrl: pageUrl() });
   });
 
@@ -2083,7 +2086,7 @@ describe('M3 surveySourceBooks 换源扫描', () => {
     // context() 默认 limit=undefined ⇒ totalLimit 保底 12;两源 openPool(2)=max(12,12)=12。
     // 断言点在于「openPool 被调用过」:用一个 6 源纯内置池才能看出抬升(max(12,36)→30)。
     expect(before).toBe(12);
-    const many = Array.from({ length: 6 }, (_, i) => ({ ...source, url: `https://book15.net/p${i}/`, name: `池源${i}` }));
+    const many = Array.from({ length: 6 }, (_, i) => ({ ...source, url: `https://reader.test/p${i}/`, name: `池源${i}` }));
     mocks.sources.mockResolvedValue(many);
     for (const item of many) {
       pages.set(item.url.replace(/\/$/, '') + '/books/search.html?kw=' + encodeURIComponent(book.title), { text: '' });
@@ -2095,7 +2098,7 @@ describe('M3 surveySourceBooks 换源扫描', () => {
   });
 
   it('池超过 6 源 ⇒ 独立池上限 min(池, 6):第 7 源不扫', async () => {
-    const many = Array.from({ length: 7 }, (_, i) => ({ ...source, url: `https://book15.net/s${i}/`, name: `源${i}` }));
+    const many = Array.from({ length: 7 }, (_, i) => ({ ...source, url: `https://reader.test/s${i}/`, name: `源${i}` }));
     mocks.sources.mockResolvedValue(many);
     for (const item of many) pages.set(item.url.replace(/\/$/, '') + '/books/search.html?kw=' + encodeURIComponent(book.title), { text: '' });
     const { sources } = await service.surveySourceBooks(book, context());
@@ -2180,8 +2183,8 @@ describe('MS-01 两级预算统一接口 remainingFor（root/child 余量语义�
 
 // 41-FAILOVER-M1：章节级队列换源，所有传输和目录写入均使用本地 fake。
 describe('chapter failover candidate queue (41-FAILOVER-M1)', () => {
-  const sourceB = { ...source, url: 'https://book15.net/b', name: '第二备用源', searchUrl: '/b/search.html?kw={{key}}' };
-  const bSearch = 'https://book15.net/b/search.html?kw=' + encodeURIComponent(book.title);
+  const sourceB = { ...source, url: 'https://reader.test/b', name: '第二备用源', searchUrl: '/b/search.html?kw={{key}}' };
+  const bSearch = 'https://reader.test/b/search.html?kw=' + encodeURIComponent(book.title);
   const bPage = pageUrl(889);
   const bChapter = chapterUrl(889);
   const prepare = async (aTitles = ['第一章'], bTitles = ['第一章']) => {
@@ -2261,7 +2264,7 @@ describe('chapter failover candidate queue (41-FAILOVER-M1)', () => {
     // 引擎正文按 nextContentUrl 逐页 page();候选正文 context 的 L1 上限若低于翻页上限(M1 写的是 1),
     // 第 2 页必撞 SOURCE_SCOPE_EXHAUSTED,整个候选被判失败。
     const pagedEngine = {
-      url: 'https://book15.net/pg/', name: '翻页引擎源', searchUrl: 'https://book15.net/pgs?q={{key}}', tier: 'M1' as const,
+      url: 'https://reader.test/pg/', name: '翻页引擎源', searchUrl: 'https://reader.test/pgs?q={{key}}', tier: 'M1' as const,
       rules: {
         ruleSearch: { bookList: '.book', name: '.name@text', author: '.author@text', bookUrl: 'a@href' },
         ruleBookInfo: { name: '.title@text', author: '.writer@text', tocUrl: '.toc@href' },
@@ -2269,17 +2272,17 @@ describe('chapter failover candidate queue (41-FAILOVER-M1)', () => {
         ruleContent: { content: '.content@text', nextContentUrl: '.next@href' },
       },
     };
-    const secondPage = 'https://book15.net/pg/c/1_2.html';
+    const secondPage = 'https://reader.test/pg/c/1_2.html';
     const catalog = await service.resolveSourceBook(book, context());
     catalogs.set(catalog.version, catalog);
     mocks.sources.mockResolvedValue([source, pagedEngine]);
     pages.set(chapterUrl(), { text: '', status: 404 });
-    pages.set('https://book15.net/pgs?q=' + encodeURIComponent(book.title), {
+    pages.set('https://reader.test/pgs?q=' + encodeURIComponent(book.title), {
       text: '<div class="book"><span class="name">测试书</span><span class="author">作者</span><a href="/pg/d/1.html">x</a></div>',
     });
-    pages.set('https://book15.net/pg/d/1.html', { text: '<h1 class="title">测试书</h1><span class="writer">作者</span><a class="toc" href="/pg/toc/1.html">目录</a>' });
-    pages.set('https://book15.net/pg/toc/1.html', { text: '<li class="chapter"><a href="/pg/c/1.html">第一章</a></li>' });
-    pages.set('https://book15.net/pg/c/1.html', { text: '<div class="content">第一页正文</div><a class="next" href="/pg/c/1_2.html">下一页</a>' });
+    pages.set('https://reader.test/pg/d/1.html', { text: '<h1 class="title">测试书</h1><span class="writer">作者</span><a class="toc" href="/pg/toc/1.html">目录</a>' });
+    pages.set('https://reader.test/pg/toc/1.html', { text: '<li class="chapter"><a href="/pg/c/1.html">第一章</a></li>' });
+    pages.set('https://reader.test/pg/c/1.html', { text: '<div class="content">第一页正文</div><a class="next" href="/pg/c/1_2.html">下一页</a>' });
     pages.set(secondPage, { text: '<div class="content">第二页正文</div>' });
     const part = await read(catalog);
     expect(part).toMatchObject({ text: '第一页正文\n第二页正文', servedFrom: pagedEngine.name });
@@ -2321,15 +2324,15 @@ describe('chapter failover candidate queue (41-FAILOVER-M1)', () => {
 // ---- 41-M1.1:候选正文翻页 / 当前源切片 / 名额 / 脱敏聚合日志 / 标定旋钮(第二轮并入深审 A F1–F12) ----
 // 本组一律假时钟(setTimeout/clearTimeout/Date):节流槽、切片、单请求超时都按虚拟时间逐个触发，不真等,
 // 断言里的毫秒数就是实现的时间线。当前源放在独立 host(slow.test:没有同站备用 host,传输失败不换 host),
-// 它的时间线只由切片和 8s 单请求超时决定。备用源都在 book15.net 下，与当前源不同站，池序即尝试序。
+// 它的时间线只由切片和 8s 单请求超时决定。备用源都在 reader.test 下，与当前源不同站，池序即尝试序。
 // 用例名里的 H1–H8 对应热修任务书「测试」节的 8 个场景(H1 = 上方 41-FAILOVER-M1 组的「引擎候选正文两页」),
 // M1b/M1c/M1d/M3/M4a/M4d 对应深审 A §4 的变异(在本实现上的等价形态见报告)。
 describe('chapter failover M1.1 (41-M1.1)', () => {
   const current = { url: 'https://slow.test/', name: '当前书源', searchUrl: '/books/search.html?kw={{key}}', rules: {} };
   const currentSearch = 'https://slow.test/books/search.html?kw=' + encodeURIComponent(book.title);
   const currentChapter = 'https://slow.test/chapter/index42-1.html';
-  const alt = (n: number) => ({ url: `https://book15.net/alt${n}/`, name: `备用源${n}`, searchUrl: `/alt${n}/search.html?kw={{key}}`, rules: {} });
-  const altSearch = (n: number, keyword = book.title) => `https://book15.net/alt${n}/search.html?kw=` + encodeURIComponent(keyword);
+  const alt = (n: number) => ({ url: `https://reader.test/alt${n}/`, name: `备用源${n}`, searchUrl: `/alt${n}/search.html?kw={{key}}`, rules: {} });
+  const altSearch = (n: number, keyword = book.title) => `https://reader.test/alt${n}/search.html?kw=` + encodeURIComponent(keyword);
   // 引擎备用源：正文按 nextContentUrl、目录按 nextTocUrl 翻页。
   const engineRules = {
     ruleSearch: { bookList: '.book', name: '.name@text', author: '.author@text', bookUrl: 'a@href' },
@@ -2338,10 +2341,10 @@ describe('chapter failover M1.1 (41-M1.1)', () => {
     ruleContent: { content: '.content@text', nextContentUrl: '.next@href' },
   };
   const engineAlt = (n: number) => ({
-    url: `https://book15.net/e${n}/`, name: `引擎源${n}`, searchUrl: `https://book15.net/e${n}s?q={{key}}`, tier: 'M1' as const, rules: engineRules,
+    url: `https://reader.test/e${n}/`, name: `引擎源${n}`, searchUrl: `https://reader.test/e${n}s?q={{key}}`, tier: 'M1' as const, rules: engineRules,
   });
-  const engineToc = (n: number) => `https://book15.net/e${n}/toc/1.html`;
-  const engineChapter = (n: number) => `https://book15.net/e${n}/c/1.html`;
+  const engineToc = (n: number) => `https://reader.test/e${n}/toc/1.html`;
+  const engineChapter = (n: number) => `https://reader.test/e${n}/c/1.html`;
   const headerDelay = new Map<string, number>();
   const bodyDelay = new Map<string, number>();
   const failOnce = new Map<string, number>();
@@ -2368,10 +2371,10 @@ describe('chapter failover M1.1 (41-M1.1)', () => {
   };
   /** 引擎备用源 n 有这本书：搜索 → 详情 → 目录(第一章)→ 正文。 */
   const primeEngine = (n: number, content: { text?: string; status?: number } = { text: `<div class="content">引擎源${n}正文</div>` }) => {
-    pages.set(`https://book15.net/e${n}s?q=` + encodeURIComponent(book.title), {
+    pages.set(`https://reader.test/e${n}s?q=` + encodeURIComponent(book.title), {
       text: `<div class="book"><span class="name">测试书</span><span class="author">作者</span><a href="/e${n}/d/1.html">x</a></div>`,
     });
-    pages.set(`https://book15.net/e${n}/d/1.html`, { text: `<h1 class="title">测试书</h1><span class="writer">作者</span><a class="toc" href="/e${n}/toc/1.html">目录</a>` });
+    pages.set(`https://reader.test/e${n}/d/1.html`, { text: `<h1 class="title">测试书</h1><span class="writer">作者</span><a class="toc" href="/e${n}/toc/1.html">目录</a>` });
     pages.set(engineToc(n), { text: `<li class="chapter"><a href="/e${n}/c/1.html">第一章</a></li>` });
     pages.set(engineChapter(n), content);
   };
@@ -2423,7 +2426,7 @@ describe('chapter failover M1.1 (41-M1.1)', () => {
   };
 
   beforeEach(async () => {
-    (await import('./source-policy')).refreshSupportedHosts(['backup.test', 'slow.test', 'hang.test']);
+    (await import('./source-policy')).refreshSupportedHosts(['reader.test', 'www.reader.test', 'backup.test', 'slow.test', 'hang.test']);
     headerDelay.clear();
     bodyDelay.clear();
     failOnce.clear();
@@ -2499,7 +2502,7 @@ describe('chapter failover M1.1 (41-M1.1)', () => {
   it('a③: 当前源正文两页 ⇒ 正常拼接交付(当前源 child 的 L1 不低于翻页上限)', async () => {
     const source = engineAlt(9);
     primeEngine(9, { text: '<div class="content">第一页正文</div><a class="next" href="/e9/c/1_2.html">下一页</a>' });
-    pages.set('https://book15.net/e9/c/1_2.html', { text: '<div class="content">第二页正文</div>' });
+    pages.set('https://reader.test/e9/c/1_2.html', { text: '<div class="content">第二页正文</div>' });
     const catalog = await drive(service.resolveSourceBook(book, context(), { sources: [source] }));
     catalogs.set(catalog.version, catalog);
     mocks.sources.mockResolvedValue([source, alt(1)]);
@@ -2515,7 +2518,7 @@ describe('chapter failover M1.1 (41-M1.1)', () => {
     // 目录三章;每章一页,.next 指向下一章(末章也指向一个不存在的第 4 章，谁请求它谁就撞 Unexpected source request)。
     pages.set(engineToc(8), { text: [1, 2, 3].map((n) => `<li class="chapter"><a href="/e8/c/${n}.html">第${n}章</a></li>`).join('') });
     for (const n of [1, 2, 3]) {
-      pages.set(`https://book15.net/e8/c/${n}.html`, { text: `<div class="content">第${n}章正文</div><a class="next" href="/e8/c/${n + 1}.html">下一章</a>` });
+      pages.set(`https://reader.test/e8/c/${n}.html`, { text: `<div class="content">第${n}章正文</div><a class="next" href="/e8/c/${n + 1}.html">下一章</a>` });
     }
     const catalog = await drive(service.resolveSourceBook(book, context(), { sources: [source] }));
     catalogs.set(catalog.version, catalog);
@@ -2524,7 +2527,7 @@ describe('chapter failover M1.1 (41-M1.1)', () => {
     const part = await drive(service.readSourceChapter(catalog.version, 1, context()));
     expect(part).toMatchObject({ chapterIndex: 1, text: '第2章正文', servedFrom: source.name });
     expect(requested.length).toBeLessThanOrEqual(3);
-    expect(requestedUrls()).toEqual(['https://book15.net/e8/c/2.html']);
+    expect(requestedUrls()).toEqual(['https://reader.test/e8/c/2.html']);
     expect(failoverLines()).toEqual([]);
   });
 
@@ -2536,10 +2539,10 @@ describe('chapter failover M1.1 (41-M1.1)', () => {
     // 候选目录两章，与当前源同名;第一章的 .next 指向第二章(下一章)。
     pages.set(engineToc(7), { text: '<li class="chapter"><a href="/e7/c/1.html">第一章</a></li><li class="chapter"><a href="/e7/c/2.html">第二章</a></li>' });
     pages.set(engineChapter(7), { text: '<div class="content">引擎源7第一章</div><a class="next" href="/e7/c/2.html">下一章</a>' });
-    pages.set('https://book15.net/e7/c/2.html', { text: '<div class="content">引擎源7第二章</div>' });
+    pages.set('https://reader.test/e7/c/2.html', { text: '<div class="content">引擎源7第二章</div>' });
     const part = await readChapter(catalog);
     expect(part).toMatchObject({ text: '引擎源7第一章', servedFrom: engineAlt(7).name });
-    expect(requestedUrls()).not.toContain('https://book15.net/e7/c/2.html');
+    expect(requestedUrls()).not.toContain('https://reader.test/e7/c/2.html');
   });
 
   // ---- readerstop42：阅读器停止点 = 整本目录（与生产打标 EngineStopUrls 同口径）----
@@ -2549,15 +2552,15 @@ describe('chapter failover M1.1 (41-M1.1)', () => {
   it('RSTOP①: 每章一页、下一页链指向目录中非相邻章 ⇒ 只取本章 1 页，不串章（整本目录作停止点）', async () => {
     const engineSource = engineAlt(6);
     // 目录四章（顺序 1..4）；每章一页，但「下一页」链按站点自己的顺序跳：1 → 3 → 2 → 4（谁被串章谁就多翻页）。
-    pages.set(`https://book15.net/e6s?q=` + encodeURIComponent(book.title), {
+    pages.set(`https://reader.test/e6s?q=` + encodeURIComponent(book.title), {
       text: `<div class="book"><span class="name">测试书</span><span class="author">作者</span><a href="/e6/d/1.html">x</a></div>`,
     });
-    pages.set(`https://book15.net/e6/d/1.html`, { text: '<h1 class="title">测试书</h1><span class="writer">作者</span><a class="toc" href="/e6/toc/1.html">目录</a>' });
+    pages.set(`https://reader.test/e6/d/1.html`, { text: '<h1 class="title">测试书</h1><span class="writer">作者</span><a class="toc" href="/e6/toc/1.html">目录</a>' });
     pages.set(engineToc(6), { text: [1, 2, 3, 4].map((n) => `<li class="chapter"><a href="/e6/c/${n}.html">第一章</a></li>`).join('') });
     const linkNext: Record<number, number> = { 1: 3, 3: 2, 2: 4 };
     for (const n of [1, 2, 3, 4]) {
       const next = linkNext[n];
-      pages.set(`https://book15.net/e6/c/${n}.html`, {
+      pages.set(`https://reader.test/e6/c/${n}.html`, {
         text: `<div class="content">第${n}章正文</div>` + (next ? `<a class="next" href="/e6/c/${next}.html">下一页</a>` : ''),
       });
     }
@@ -2565,25 +2568,25 @@ describe('chapter failover M1.1 (41-M1.1)', () => {
     // 读第 1 章：旧口径（只传目录下一章=第 2 章）拦不住指向第 3 章的链，会串满 4 章。
     const part = await readChapter(catalog);
     expect(part).toMatchObject({ chapterIndex: 0, text: '第1章正文', servedFrom: engineSource.name });
-    expect(requestedUrls()).toEqual(['https://book15.net/e6/c/1.html']);
+    expect(requestedUrls()).toEqual(['https://reader.test/e6/c/1.html']);
     expect(failoverLines()).toEqual([]);
   });
 
   it('RSTOP②: 真·章内分页（下一页不在目录里）⇒ 仍按原逻辑翻页拼接；翻到目录内某章才停', async () => {
     const engineSource = engineAlt(5);
-    pages.set(`https://book15.net/e5s?q=` + encodeURIComponent(book.title), {
+    pages.set(`https://reader.test/e5s?q=` + encodeURIComponent(book.title), {
       text: `<div class="book"><span class="name">测试书</span><span class="author">作者</span><a href="/e5/d/1.html">x</a></div>`,
     });
-    pages.set(`https://book15.net/e5/d/1.html`, { text: '<h1 class="title">测试书</h1><span class="writer">作者</span><a class="toc" href="/e5/toc/1.html">目录</a>' });
+    pages.set(`https://reader.test/e5/d/1.html`, { text: '<h1 class="title">测试书</h1><span class="writer">作者</span><a class="toc" href="/e5/toc/1.html">目录</a>' });
     pages.set(engineToc(5), { text: [1, 2].map((n) => `<li class="chapter"><a href="/e5/c/${n}.html">第一章</a></li>`).join('') });
     // 第 1 章两页：1.html → 1_2.html（不在目录里）→ 指向第 2 章（在目录里）即停。
-    pages.set('https://book15.net/e5/c/1.html', { text: '<div class="content">第1章上半</div><a class="next" href="/e5/c/1_2.html">下一页</a>' });
-    pages.set('https://book15.net/e5/c/1_2.html', { text: '<div class="content">第1章下半</div><a class="next" href="/e5/c/2.html">下一页</a>' });
-    pages.set('https://book15.net/e5/c/2.html', { text: '<div class="content">第2章正文</div>' });
+    pages.set('https://reader.test/e5/c/1.html', { text: '<div class="content">第1章上半</div><a class="next" href="/e5/c/1_2.html">下一页</a>' });
+    pages.set('https://reader.test/e5/c/1_2.html', { text: '<div class="content">第1章下半</div><a class="next" href="/e5/c/2.html">下一页</a>' });
+    pages.set('https://reader.test/e5/c/2.html', { text: '<div class="content">第2章正文</div>' });
     const catalog = await prepareEngineCurrent(5, [engineSource], false);
     const part = await readChapter(catalog);
     expect(part).toMatchObject({ text: '第1章上半\n第1章下半', servedFrom: engineSource.name });
-    expect(requestedUrls()).toEqual(['https://book15.net/e5/c/1.html', 'https://book15.net/e5/c/1_2.html']);
+    expect(requestedUrls()).toEqual(['https://reader.test/e5/c/1.html', 'https://reader.test/e5/c/1_2.html']);
     expect(failoverLines()).toEqual([]);
   });
 
@@ -2593,7 +2596,7 @@ describe('chapter failover M1.1 (41-M1.1)', () => {
     const catalog = await prepareEngineCurrent(4, [engineSource]);
     const part = await readChapter(catalog);
     expect(part).toMatchObject({ text: '引擎源4正文', servedFrom: engineSource.name });
-    expect(requestedUrls()).toEqual(['https://book15.net/e4/c/1.html']);
+    expect(requestedUrls()).toEqual(['https://reader.test/e4/c/1.html']);
   });
 
   it('RSTOP④: 换源候选目录与「下一章」链序不同 ⇒ 候选也传整本目录，只取本章 1 页', async () => {
@@ -2605,15 +2608,15 @@ describe('chapter failover M1.1 (41-M1.1)', () => {
     pages.set(engineToc(3), { text: [1, 2, 3].map((n) => `<li class="chapter"><a href="/e3/c/${n}.html">第${n}章</a></li>`).join('') });
     for (const n of [1, 2, 3]) {
       const next = n === 1 ? 3 : n + 1;
-      pages.set(`https://book15.net/e3/c/${n}.html`, {
+      pages.set(`https://reader.test/e3/c/${n}.html`, {
         text: `<div class="content">引擎源3第${n}章</div>` + (next <= 3 ? `<a class="next" href="/e3/c/${next}.html">下一页</a>` : ''),
       });
     }
     const part = await readChapter(catalog);
     expect(part).toMatchObject({ text: '引擎源3第1章', servedFrom: engineAlt(3).name });
-    expect(requestedUrls()).toContain('https://book15.net/e3/c/1.html');
-    expect(requestedUrls()).not.toContain('https://book15.net/e3/c/2.html');
-    expect(requestedUrls()).not.toContain('https://book15.net/e3/c/3.html');
+    expect(requestedUrls()).toContain('https://reader.test/e3/c/1.html');
+    expect(requestedUrls()).not.toContain('https://reader.test/e3/c/2.html');
+    expect(requestedUrls()).not.toContain('https://reader.test/e3/c/3.html');
   });
 
   // ---- 热修任务书 H2–H8(H1 见 41-FAILOVER-M1 组「引擎候选正文两页」)----
@@ -2624,10 +2627,10 @@ describe('chapter failover M1.1 (41-M1.1)', () => {
     pages.set(currentChapter, { text: '', status: 404 });
     primeEngine(1);
     pages.set(engineToc(1), { text: '<li class="chapter"><a href="/e1/c/0.html">序章</a></li><a class="next-toc" href="/e1/toc/2.html">下一页</a>' });
-    pages.set('https://book15.net/e1/toc/2.html', { text: '<li class="chapter"><a href="/e1/c/1.html">第一章</a></li>' });
+    pages.set('https://reader.test/e1/toc/2.html', { text: '<li class="chapter"><a href="/e1/c/1.html">第一章</a></li>' });
     const part = await readChapter(catalog);
     expect(part).toMatchObject({ text: '引擎源1正文', servedFrom: engineAlt(1).name });
-    expect(requestedUrls()).toContain('https://book15.net/e1/toc/2.html');
+    expect(requestedUrls()).toContain('https://reader.test/e1/toc/2.html');
   });
 
   it('H3: builtin 候选搜索第 1 条同名不同作者、第 2 条才是正书 ⇒ 成功', async () => {
@@ -3111,7 +3114,7 @@ describe('chapter failover M1.1 (41-M1.1)', () => {
   const primeEngineChapterPages = (n: number, count: number, delayMs: number) => {
     const texts: string[] = [];
     for (let p = 1; p <= count; p += 1) {
-      const url = p === 1 ? engineChapter(n) : `https://book15.net/e${n}/c/1_${p}.html`;
+      const url = p === 1 ? engineChapter(n) : `https://reader.test/e${n}/c/1_${p}.html`;
       const next = p < count ? `<a class="next" href="/e${n}/c/1_${p + 1}.html">下一页</a>` : '';
       texts.push(`引擎源${n}第${p}页`);
       pages.set(url, { text: `<div class="content">引擎源${n}第${p}页</div>${next}` });
@@ -3187,12 +3190,12 @@ describe('chapter failover M1.1 (41-M1.1)', () => {
     expect(failoverLines()).toEqual([]);
   });
 
-  it('X1b-2.0(R3):book15 当前源 apex 正文卡住 8s 超时 → 换 www 2.0s 后返回(合计 10.35s)⇒ 当前源交付(5fb7ae3:503)', async () => {
+  it('X1b-2.0(R3):reader.test 当前源 apex 正文卡住 8s 超时 → 换 www 2.0s 后返回(合计 10.35s)⇒ 当前源交付(5fb7ae3:503)', async () => {
     const catalog = await drive(service.resolveSourceBook(book, context(), { sources: [source] }));
     catalogs.set(catalog.version, catalog);
     mocks.sources.mockResolvedValue([source]);
     requested = [];
-    const www = chapterUrl().replace('https://book15.net/', 'https://www.book15.net/');
+    const www = chapterUrl().replace('https://reader.test/', 'https://www.reader.test/');
     bodyDelay.set(chapterUrl(), Number.POSITIVE_INFINITY);
     pages.set(www, { text: chapterHtml('当前源正文www') });
     headerDelay.set(www, 2_000);
@@ -3207,7 +3210,7 @@ describe('chapter failover M1.1 (41-M1.1)', () => {
     pages.set(currentChapter, { text: '', status: 404 });
     primeEngine(1);
     const text = primeEngineChapterPages(1, 6, 1_800);
-    for (const url of ['https://book15.net/e1s?q=' + encodeURIComponent(book.title), 'https://book15.net/e1/d/1.html', engineToc(1)]) {
+    for (const url of ['https://reader.test/e1s?q=' + encodeURIComponent(book.title), 'https://reader.test/e1/d/1.html', engineToc(1)]) {
       headerDelay.set(url, 1_200);
     }
     const { part, ms } = await readTimed(catalog);
@@ -3220,9 +3223,9 @@ describe('chapter failover M1.1 (41-M1.1)', () => {
     const catalog = await prepareCurrent(pool);
     pages.set(currentChapter, { text: '', status: 404 });
     primeHit(1);
-    const wwwSearch = altSearch(1).replace('https://book15.net/', 'https://www.book15.net/');
+    const wwwSearch = altSearch(1).replace('https://reader.test/', 'https://www.reader.test/');
     bodyDelay.set(altSearch(1), Number.POSITIVE_INFINITY);
-    pages.set(wwwSearch, { text: '<a href="https://book15.net/books/details601.html">测试书</a>' });
+    pages.set(wwwSearch, { text: `<a href="${pageUrl(601)}">测试书</a>` });
     bodyDelay.set(wwwSearch, 3_900); // 头即到(不触发 3s 连接段上限)、正文 3.9s
     const part = await readChapter(catalog);
     expect(part).toMatchObject({ text: '备用源1正文', servedFrom: alt(1).name });
@@ -3269,7 +3272,7 @@ describe('chapter failover M1.1 (41-M1.1)', () => {
   /** 引擎源 n 的本章正文做成 count 页，每页响应头即到、正文 delayMs 后才到;返回拼接后的全文。 */
   const slowEnginePages = (n: number, count: number, delayMs: number) => {
     const text = primeEngineChapterPages(n, count, 0);
-    for (let p = 1; p <= count; p += 1) bodyDelay.set(p === 1 ? engineChapter(n) : `https://book15.net/e${n}/c/1_${p}.html`, delayMs);
+    for (let p = 1; p <= count; p += 1) bodyDelay.set(p === 1 ? engineChapter(n) : `https://reader.test/e${n}/c/1_${p}.html`, delayMs);
     return text;
   };
 
@@ -3285,7 +3288,7 @@ describe('chapter failover M1.1 (41-M1.1)', () => {
     );
     await expect(drive(settled)).rejects.toMatchObject({ code: 'SOURCE_TIMEOUT', status: 504 });
     expect(doneAt - requested[0].at).toBe(45_000);
-    expect(requestedUrls()).toContain('https://book15.net/e9/c/1_12.html'); // 直到被切断前都在出数据
+    expect(requestedUrls()).toContain('https://reader.test/e9/c/1_12.html'); // 直到被切断前都在出数据
     // 当前源被切断时软预算已见底：池里只有原源，兜底余量 < 8s ⇒ 一个候选都没开(partial ⇒ 504)。
     expect(oneFailoverLine('timeout', [engineAlt(9)])).toMatchObject({ trigger: 'SOURCE_SCOPE_EXHAUSTED', attempted: 0 });
   });
@@ -3300,7 +3303,7 @@ describe('chapter failover M1.1 (41-M1.1)', () => {
     primeHit(1);
     const part = await readChapter(catalog);
     expect(part).toMatchObject({ text: '备用源1正文', servedFrom: alt(1).name });
-    expect(requestedUrls()).toContain('https://book15.net/e9/c/1_9.html');
+    expect(requestedUrls()).toContain('https://reader.test/e9/c/1_9.html');
     expect(requested.find(({ url }) => url === altSearch(1))!.at - requested[0].at).toBe(42_000);
     expect(oneFailoverLine('success', pool)).toMatchObject({ trigger: 'SOURCE_SCOPE_EXHAUSTED', attempted: 1 });
   });
@@ -3311,7 +3314,7 @@ describe('chapter failover M1.1 (41-M1.1)', () => {
     pages.set(currentChapter, { text: '', status: 404 });
     primeEngine(1);
     slowEnginePages(1, 6, 7_000);
-    for (const url of ['https://book15.net/e1s?q=' + encodeURIComponent(book.title), 'https://book15.net/e1/d/1.html', engineToc(1)]) {
+    for (const url of ['https://reader.test/e1s?q=' + encodeURIComponent(book.title), 'https://reader.test/e1/d/1.html', engineToc(1)]) {
       bodyDelay.set(url, 7_000);
     }
     primeRelisted();
@@ -3320,7 +3323,7 @@ describe('chapter failover M1.1 (41-M1.1)', () => {
     // reserve 若为 0,他源会一直滑到 45s,原源兜底余量不足 8s ⇒ 503,原站新条目永远轮不到。
     const part = await readChapter(catalog);
     expect(part).toMatchObject({ text: '原站新条目正文', servedFrom: current.name });
-    expect(requestedUrls()).toContain('https://book15.net/e1/c/1_3.html'); // 他源直到被切断前都在出数据
+    expect(requestedUrls()).toContain('https://reader.test/e1/c/1_3.html'); // 他源直到被切断前都在出数据
     expect(requested.find(({ url }) => url === currentSearch)!.at - requested[0].at).toBe(37_000);
     expect(oneFailoverLine('success', pool)).toMatchObject({
       attempted: 2, expensiveAttempts: 1, reasonCounts: { SOURCE_SCOPE_EXHAUSTED: 1 },
