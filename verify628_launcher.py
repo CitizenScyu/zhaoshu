@@ -1,21 +1,23 @@
-"""628 严格隔离离线门启动器（labeler628-opus）。
+"""630 严格隔离离线门启动器（gate630-hardening，修 627 合同缺口后的 628 launcher）。
 
-机制（task 第 3/4 条）：
-1) 从空映射构造子进程环境，只逐键取白名单系统键（PATH/SYSTEMROOT/WINDIR/TEMP/TMP/
-   COMSPEC/PATHEXT/OS/PROCESSOR_ARCHITECTURE）；编码键用字面量，不读真实值。
-   HOME/USERPROFILE/APPDATA 等指到本树内假目录，杜绝真实 env 透传。
-2) 子进程用 python -I -B 运行 verify628_gate.py：在导入任何测试/业务代码**之前**
-   装进程级网络护栏（socket.create_connection/connect_ex + socket.getaddrinfo/
-   gethostbyname* 打桩拒绝 + audit hook 拦 urllib.request.urlopen/
-   http.client.HTTPConnection / ssl），真实 DNS/连接/urllib 请求一律不出进程；
-   护栏先跑正控制（合成调用必须被拒绝）再跑 unittest discover。
-3) 白名单子进程：不继承真实 env；任何额外子进程同样经白名单 env + -I -B + 护栏。
-   无法受控的子进程启动直接抛错使门失败（宁可失败不放松护栏）。
+对 628 launcher（6a1c99f）的改动只服务门合同，不放宽任何东西：
+1. 环境白名单不变（空映射起步、逐键取 PATH/SYSTEMROOT/WINDIR/COMSPEC/PATHEXT/
+   OS/PROCESSOR_ARCHITECTURE；TEMP/TMP 重定向本树假目录；编码键字面量），
+   **删掉** 628 的 LABELER_DATA_DIR=scripts 钉法——630 门不再需要它（套件
+   测试各自用 mock LABELER_DATA_DIR 指向自造夹具），留着只会误导。取而代之
+   显式设 TMPDIR/TEMP/TMP=本树 verify630-tmp，让 tempfile.TemporaryDirectory
+   的合成 .env 夹具全部落在门允许的目录内（第一次严格全量跑的真实失败事实：
+   86 errors——套件在系统 TEMP 建合成 .env 被门拒；修法=把假 TEMP 钉进树，
+   不是放宽门）。
+2. 子进程仍然只发一次受控 `python -I -B verify628_gate.py --suite`（630 裁定 3：
+   门内子进程一律拒绝，自门再入白名单已删——628 那段匹配的事件形态在真实
+   CPython 里不存在）。
+3. 假 HOME/APPDATA 指本树 verify630-fake-home（与 628 同）。
 
-用法（在隔离树根，本文件即入口）：
-    python verify628_launcher.py
-    python verify628_launcher.py --selfcheck   # 只跑护栏正负控制
-退出码：0=门全过；非 0=未通过（详见 verify628-gate.log）。
+用法（隔离树根）：
+    python verify628_launcher.py               # 一次严格全量门
+    python verify628_launcher.py --selfcheck   # 只跑门自检正负控制
+退出码：0=门全过；非 0=未通过（日志 verify628-gate.log）。
 """
 from __future__ import annotations
 
@@ -28,22 +30,20 @@ TREE = Path(__file__).resolve().parent
 GATE = TREE / 'verify628_gate.py'
 LOG = TREE / 'verify628-gate.log'
 
-# 只允许这些真实系统键进子进程（任务书第 3 条：只取必要系统键，不枚举后脱敏）。
-# 编码键不用真实值——字面量注入。
+# 只允许这些真实系统键进子进程（逐键取，不枚举后脱敏）。编码键用字面量。
 ENV_KEY_WHITELIST = (
     'PATH', 'SYSTEMROOT', 'WINDIR', 'COMSPEC', 'PATHEXT', 'OS',
-    'PROCESSOR_ARCHITECTURE', 'TEMP', 'TMP',
+    'PROCESSOR_ARCHITECTURE',
 )
 
-# 假目录（本树内）——HOME/USERPROFILE 类用户目录若被读也只落在受控假路径。
-FAKE_DIR = TREE / 'verify628-fake-home'
-FAKE_DIR.mkdir(exist_ok=True)
-FAKE_TMP = TREE / 'verify628-tmp'
+FAKE_HOME = TREE / 'verify630-fake-home'
+FAKE_HOME.mkdir(exist_ok=True)
+FAKE_TMP = TREE / 'verify630-tmp'
 FAKE_TMP.mkdir(exist_ok=True)
 
 
-def build_child_env() -> dict:
-    """空映射起步，逐键取白名单系统键；其余键名只记录不取值。"""
+def build_child_env() -> tuple[dict, list[str]]:
+    """空映射起步，逐键取白名单系统键；其余真实键一概不进子进程。"""
     child_env: dict = {}
     taken: list[str] = []
     for key in ENV_KEY_WHITELIST:
@@ -51,35 +51,34 @@ def build_child_env() -> dict:
         if val is not None:
             child_env[key] = val
             taken.append(key)
-    # TEMP/TMP 一律重定向到本树假临时目录（即使真实键存在也覆盖），
-    # 防测试临时文件落进系统 TEMP。
-    child_env['TEMP'] = str(FAKE_TMP)
-    child_env['TMP'] = str(FAKE_TMP)
-    taken = [k for k in taken if k not in ('TEMP', 'TMP')] + ['TEMP=FAKE', 'TMP=FAKE']
+    # TEMP/TMP/TMPDIR 一律钉本树假临时目录（合成夹具落点可判）。
+    for key in ('TEMP', 'TMP', 'TMPDIR'):
+        child_env[key] = str(FAKE_TMP)
+    taken += ['TEMP=FAKE', 'TMP=FAKE', 'TMPDIR=FAKE']
     # 字面量编码键（不读真实值）。
     child_env['PYTHONIOENCODING'] = 'utf-8'
     child_env['PYTHONUTF8'] = '1'
     child_env['LC_ALL'] = 'C.UTF-8'
-    # 假用户目录。
-    child_env['HOME'] = str(FAKE_DIR)
-    child_env['USERPROFILE'] = str(FAKE_DIR)
-    child_env['APPDATA'] = str(FAKE_DIR)
-    child_env['LOCALAPPDATA'] = str(FAKE_DIR)
-    # 显式关闭一切可能让子进程发网的已知开关（假值，非透传）。
-    child_env['LABELER_DATA_DIR'] = str(TREE / 'scripts')  # 数据目录钉在本树 scripts
-    taken.append('PYTHONIOENCODING=LITERAL')
-    taken.append('PYTHONUTF8=LITERAL')
-    taken.append('LC_ALL=LITERAL')
+    taken += ['PYTHONIOENCODING=LITERAL', 'PYTHONUTF8=LITERAL', 'LC_ALL=LITERAL']
+    # 假用户目录（本树内）。
+    for key in ('HOME', 'USERPROFILE', 'APPDATA', 'LOCALAPPDATA'):
+        child_env[key] = str(FAKE_HOME)
+    taken += ['HOME=FAKE', 'USERPROFILE=FAKE', 'APPDATA=FAKE',
+              'LOCALAPPDATA=FAKE']
     return child_env, taken
 
 
 def run_gate(extra_args: list[str]) -> int:
     child_env, taken = build_child_env()
+    # 唯一一次受控子进程：-I（隔离模式，不读用户 site）-B（不写 pyc）。
     cmd = [sys.executable, '-I', '-B', str(GATE), *extra_args]
     with LOG.open('w', encoding='utf-8', newline='\n') as log:
-        log.write(f'# verify628 gate log (synthetic, generated in isolated tree)\n')
-        log.write(f'# whitelist keys taken from real env: {", ".join(sorted(set(t for t in taken if "=" not in t)))}\n')
-        log.write(f'# overridden/literal keys: {", ".join(sorted(t for t in taken if "=" in t))}\n\n')
+        log.write('# verify630 gate log (synthetic, isolated tree, '
+                  'business SHA 6a1c99f8cc61b183cb614f8edb36ae3efe44e21b)\n')
+        log.write(f"# whitelist keys taken from real env (names only): "
+                  f"{', '.join(sorted(t for t in taken if '=' not in t))}\n")
+        log.write(f"# overridden/literal keys: "
+                  f"{', '.join(sorted(t for t in taken if '=' in t))}\n\n")
         log.flush()
         proc = subprocess.run(
             cmd, env=child_env, cwd=str(TREE),
@@ -90,9 +89,13 @@ def run_gate(extra_args: list[str]) -> int:
 
 def main() -> int:
     args = sys.argv[1:]
+    if '--selfcheck' not in args:
+        # 全量门必须在 SUITE 相跑（第一次全量跑的真实失败事实：launcher 忘传
+        # --suite，套件落进 SELFCHK 相，suiteViolations=0 是空洞通过。修法=
+        # launcher 补相位参数 + 门侧硬拒非 SUITE 相跑套件，双向钉死）。
+        args.append('--suite')
     rc = run_gate(args)
-    sys.stdout.write(
-        f'verify628 gate exit={rc}; log={LOG.name}\n')
+    sys.stdout.write(f'verify630 gate exit={rc}; log={LOG.name}\n')
     return rc
 
 
