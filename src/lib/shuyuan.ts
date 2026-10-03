@@ -5,7 +5,8 @@ import { createDeadline, raceDeadline, type RequestDeadline } from '@/lib/deadli
 import { validateSourceUrl, refreshSupportedHosts, supportedHostList, supportedHostVersion, upgradeSourceTemplateUrl } from '@/lib/source-policy';
 import { engineSourceUsable } from '@/lib/source-usability';
 import {
-  BUILTIN_SOURCE_HOSTS, builtinFallbackSource, builtinUrlPrefixes, type SupportedSourceTier,
+  BUILTIN_SOURCE_HOSTS, builtinFallbackSource, builtinUrlPrefixes,
+  isActiveBuiltinHost, type SupportedSourceTier,
 } from '@/lib/supported-sources';
 import {
   ADMISSION_MAX_REDIRECTS, ADMISSION_MIN_BUDGET_MS, ADMISSION_PHOENIX_OK_PREFIX, ADMISSION_PROBE_WORST_MS,
@@ -467,20 +468,28 @@ async function refreshEngineHostGate(signal: AbortSignal, fresh = false): Promis
   }
 }
 
-/** 内建（builtin）档条目：改查注册表内建 URL 前缀，不再硬编码 ILIKE 字面量。 */
+/**
+ * 内建（builtin）档条目：改查注册表内建 URL 前缀，不再硬编码 ILIKE 字面量。
+ *
+ * 618-stalesource：三段判定，退休优先级最高（高于 DB enabled=true、probe reachable、缓存）：
+ * 1. **静态生命周期**（supported-sources.ts lifecycle）：retired 的 host 一票否决——库里行
+ *    enabled、reachable、来自源池产物缓存，都不救（主协调红线：无注册记录不得静默复活已停用源）。
+ * 2. disabled_at / source.enabled === false / probe failed 的行照旧剔除（既有语义）。
+ * 3. 合集**没有任何**该 host 记录时，旧代码补回 builtinFallbackSource() 兜底单源——该兜底正是
+ *    裸删行会复活的洞。现在：活跃 builtin 缺记录仍补（既有 book15 零回归路径，活跃时语义不变）；
+ *    retired builtin 缺记录**不补**，返回空段（无活跃 builtin ⇒ 池可为空，任务书判据 2）。
+ */
 async function builtinReadingSources(
   s: Sql, states: Map<string, ProbeState>, signal: AbortSignal,
 ): Promise<ReadingSource[]> {
-  const rows = await cachedRead('builtinRows', signal,
-    (sig) => artifactOr((artifact) => artifact.builtin, () => readBuiltinRows(s, sig)));
-  const supported = rows.filter((row) => canProbe(row.source_url));
+  const rows = (await cachedRead('builtinRows', signal,
+    (sig) => artifactOr((artifact) => artifact.builtin, () => readBuiltinRows(s, sig))))
+    // 618：先过静态生命周期门——retired host 的行（含产物缓存里的旧行）在此一票出局。
+    .filter((row) => isActiveBuiltinHost(hostOfUrl(row.source_url)) && canProbe(row.source_url));
+  // 无活跃 builtin：不再补回默认单源（退休源不复活）。空段是合法结论，引擎源照常并入。
+  if (!rows.length) return [];
   const fallback = builtinFallbackSource();
-  // The same built-in adapter as the download worker, only when the collection
-  // has no record for this host. A disabled/failed record must never be bypassed.
-  if (!supported.length) {
-    return [{ url: fallback.url, name: fallback.name, searchUrl: fallback.searchUrl, rules: {}, tier: 'builtin' }];
-  }
-  return supported.filter((row) => !row.disabled_at && isRecord(row.source) && row.source.enabled !== false && states.get(row.source_url)?.status !== 'failed')
+  return rows.filter((row) => !row.disabled_at && isRecord(row.source) && row.source.enabled !== false && states.get(row.source_url)?.status !== 'failed')
     .sort((a, b) => probeRank(states, b.source_url) - probeRank(states, a.source_url)
       || a.source_url.localeCompare(b.source_url))
     .map((row) => ({
