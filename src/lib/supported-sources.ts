@@ -107,11 +107,26 @@ export function builtinFallbackSource(): SupportedSource {
 /**
  * host 是否属于某个**活跃**内建源（请求许可判定；识别判定见 BUILTIN_SOURCE_HOSTS）。
  * retired host 即便在 BUILTIN_SOURCE_HOSTS 里也返回 false——同站双 host 跟随主条目状态。
+ *
+ * 尾点正规化（618-stalesource，主协调 10-03）：DNS FQDN 的 `book15.net.`（根点形态）与
+ * `book15.net` 是同一台服务器，只 trim/lowercase 会把它当不同 host 放过。这里统一剥掉
+ * **单个**尾随根点再比对（与 refreshSupportedHosts 的「首尾非点」校验同向，且不放宽
+ * SSRF：剥点后仍走调用方既有的门/校验，本函数只做许可判定，不产生新授权）。
  */
 export function isActiveBuiltinHost(host: string): boolean {
-  const normalized = host.trim().toLowerCase();
+  const normalized = normalizeBuiltinHost(host);
   return BUILTIN_SOURCES.some((source) => source.lifecycle === 'active'
     && (hostOfUrl(source.url) === normalized || alternateBuiltinHost(source, normalized)));
+}
+
+/** 识别/许可共用的 host 归一键：trim + 小写 + 剥单个尾随根点。IDNA 域名由 URL.hostname 先行
+ *  归一（调用方传 new URL().hostname），裸字符串传入时本键只做字符级归一。 */
+function normalizeBuiltinHost(host: string): string {
+  const trimmed = host.trim().toLowerCase();
+  return trimmed.length > 1 && trimmed.endsWith('.')
+    && /^[a-z0-9-]+(?:\.[a-z0-9-]+)+\.$/.test(trimmed)
+    ? trimmed.slice(0, -1)
+    : trimmed;
 }
 
 function hostOfUrl(url: string): string {
