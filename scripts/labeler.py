@@ -3803,7 +3803,8 @@ def main() -> int:
     deferred_urls = recent_rejection_urls(data_path('labels-rejected.jsonl'), reject_cooldown)
     # 628：以上四类名单的身份版（identity 优先、回落 url 键）——重定位改写取文 URL 后，
     # split_queue/后移计数/钉子户日志按身份匹配，旧键不再失配。URL 版保留不动（旧契约
-    # 调用方与计数口径不变），身份版只在这条 rank 重定位路径上使用。
+    # 调用方不变），身份版只在这条 rank 重定位路径上使用；632 起 split_queue 的后移判定
+    # 与「其中 M 本」计数共用两者的并集 _deferred_keys（队列与日志同一口径）。
     _done_keys = (_load_terminal_identities(data_path('labels.jsonl'))
                   | _load_terminal_identities(data_path('labels-stub.jsonl')))
     rejection_identity_counts = _rejection_identity_counts(
@@ -3924,16 +3925,21 @@ def main() -> int:
         # 让队尾（多半是豆瓣/17K 尾部 / 分类新书）永远进不了视野——每轮只处理前 limit 条，
         # 做完进 done_urls，之后每轮 queue=[] 却仍全量搜索。先剔除已完成/钉子户/残本再取上限，
         # 语义 = 「本轮最多打 limit 本**未完成**的书」。stub_urls 折进 done 侧一并跳过（P1）。
+        # 632：队列判定与后移计数共用同一并集 _deferred_keys——identity-only 命中
+        # （拒收行带 identity、条目取文 URL 已换引擎站）此前队列后移了、计数却是 0，
+        # 日志「其中 M 本后移」与队尾事实自相矛盾。done>pinned>deferred 判定顺序与
+        # limit 后计数语义均不变，只是键集并集对齐。
+        _deferred_keys = deferred_urls | deferred_identity_urls
         queue, skipped_done, skipped_pinned = split_queue(
             all_books, done_urls | stub_urls | _done_keys,
             pinned | _pinned_keys,
-            deferred=deferred_urls | deferred_identity_urls)
+            deferred=_deferred_keys)
         queue = queue[:args.limit]
         # 后移计数：冷却期内被拒、且在切 --limit 后仍真正进入本轮待处理队列的本数。
         # 必须切片**之后**统计——后移的书都在队尾，limit 一截多半先被剔掉，所以「本轮待处理
         # N 本，其中 M 本后移」里的 M 必须与切片后的 N 同口径，否则 M 可能 > N，「其中」不成立。
         deferred_in_queue = sum(
-            1 for b in queue if _identity_keys(b, BOOK15) & deferred_urls)
+            1 for b in queue if _identity_keys(b, BOOK15) & _deferred_keys)
         # X = 本轮跳过总数（已完成 + 钉子户终态，互斥不重叠），Y = 其中因钉子户终态跳过的。
         print(f'本轮处理 {len(queue)} 本（跳过已完成 {len(skipped_done) + len(skipped_pinned)} 本'
               f'（含钉子户 {len(skipped_pinned)} 本））')
