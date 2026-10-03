@@ -152,7 +152,7 @@ export async function fetchSourceText(input: string, options: FetchSourceOptions
   const initial = validateSourceUrl(input);
   // 退休 builtin 门（request640）：host 门（validateSourceUrl）只管「认得这个 host」，
   // 静态生命周期在此收口——初始目标即退休 host 时，在预算扣点/网络发射/健康记账之前拒绝。
-  assertNotRetiredBuiltinHost(initial.hostname);
+  assertNotRetiredBuiltin(initial);
   try {
     const page = await fetchWithHostSwap(initial, options);
     recordHostSuccess(initial.hostname);
@@ -216,9 +216,12 @@ function swapHost(url: URL): URL | null {
  * 半开试探/host 健康失败计数）。
  * 刻意不放进 validateSourceUrl/checkSourceUrl：它们同时承担**旧 URL 识别**（旧书任务身份、
  * 换源 excludeBookUrl、parseSourceIdentity 输入），认得退休 host ≠ 允许向它发请求。
+ * 参数收 URL 对象而非 string：attemptOnce 内部 current 是绝对 href、初始校验点拿的是
+ * validateSourceUrl 产物，两侧都已是 URL/绝对地址；收 string 会诱使调用点传裸 hostname
+ * （85ba55f 审查阻断项：new URL('book15.net') 抛 Invalid URL，活跃源全部误伤成 TypeError）。
  */
-function assertNotRetiredBuiltinHost(hostname: string): void {
-  if (isRetiredBuiltinHost(hostname)) {
+function assertNotRetiredBuiltin(target: URL): void {
+  if (isRetiredBuiltinHost(target.hostname)) {
     throw new SourcePolicyError('书源已退休：不再对该来源发起请求');
   }
 }
@@ -255,7 +258,8 @@ async function attemptOnce(start: URL, {
       signal.throwIfAborted();
       // 退休门在扣点（beforeRequest）/节流/物理 fetch 之前：跳转后的新 current（302/307 的
       // Location 指向退休 host）与换 host 兜底的新起点都在这里拦，且不为注定被拒的目标烧预算。
-      assertNotRetiredBuiltinHost(new URL(current).hostname);
+      // current 恒为绝对 href（初始 URL 经 validateSourceUrl、跳转经 validateSourceUrl(location, current)）。
+      assertNotRetiredBuiltin(new URL(current));
       if (redirects > 0 || !skipFirstBeforeRequest) {
         try { await beforeRequest?.(signal, current); }
         catch (error) { (error as BeforeRequestFailure).fromBeforeRequest = true; throw error; }
