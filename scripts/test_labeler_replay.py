@@ -308,6 +308,13 @@ class TestMainDeferredLog(unittest.TestCase):
         self.books = [{'url': f'/books/details{c}.html', 'title': t}
                       for c, t in [('A', '甲'), ('B', '乙'), ('C', '丙'),
                                    ('D', '丁'), ('E', '戊')]]
+        # 624 测试隔离：_run 调 labeler.main() 会装配全局 SOURCE_POLICY 且 main 不恢复
+        # （生产语义：CLI 进程随 main 返回退出）。存原值、清理时恢复，不泄漏给后续套件。
+        self._prev_source_policy = labeler.SOURCE_POLICY
+        self.addCleanup(self._restore_source_policy)
+
+    def _restore_source_policy(self):
+        labeler.SOURCE_POLICY = self._prev_source_policy
 
     def _run(self, cooldown_env):
         import contextlib

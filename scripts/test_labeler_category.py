@@ -343,6 +343,10 @@ class TestStubTimesLimit(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         d = Path(self.tmp.name)
         (d / '.env').write_text('LLM_API_KEY=test-key-not-real\n', encoding='utf-8')
+        # 624 测试隔离：_dry_run 调 labeler.main() 会装配全局 SOURCE_POLICY 且 main
+        # 不恢复（生产语义：CLI 进程随 main 返回退出）。存原值、清理时恢复，不泄漏给后续套件。
+        self._prev_source_policy = labeler.SOURCE_POLICY
+        self.addCleanup(self._restore_source_policy)
         self.data_dir = d
         # details1..5 = 已记录的残本；details6..10 = 正常书
         self.stub_urls = [labeler.BASE + f'/books/details{i}.html' for i in range(1, 6)]
@@ -352,6 +356,9 @@ class TestStubTimesLimit(unittest.TestCase):
         self.books = (
             [{'url': f'/books/details{i}.html', 'title': f'残本{i}'} for i in range(1, 6)]
             + [{'url': f'/books/details{i}.html', 'title': f'正常{i}'} for i in range(6, 11)])
+
+    def _restore_source_policy(self):
+        labeler.SOURCE_POLICY = self._prev_source_policy
 
     def _dry_run(self, limit):
         import contextlib
@@ -587,6 +594,10 @@ class TestRuntimeStubDetection(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         d = Path(self.tmp.name)
         (d / '.env').write_text('LLM_API_KEY=test-key-not-real\n', encoding='utf-8')
+        # 624 测试隔离：用例调 labeler.main() 会装配全局 SOURCE_POLICY 且 main 不恢复
+        # （生产语义：CLI 进程随 main 返回退出）。存原值、清理时恢复，不泄漏给后续套件。
+        self._prev_source_policy = labeler.SOURCE_POLICY
+        self.addCleanup(self._restore_source_policy)
         self.data_dir = d
         # 详情页只有 3 章（< STUB_MIN_CHAPTERS=10）⇒ 章节数短路判残本，绝不抓全本正文
         self.detail_html = (
@@ -597,6 +608,9 @@ class TestRuntimeStubDetection(unittest.TestCase):
             '</body></html>')
         self.books = [{'url': f'/books/details{i}.html', 'title': f'残本{i}'}
                       for i in range(1, 4)]
+
+    def _restore_source_policy(self):
+        labeler.SOURCE_POLICY = self._prev_source_policy
 
     def test_short_book_recorded_to_stub_and_never_reaches_llm(self):
         import contextlib
@@ -644,6 +658,13 @@ class TestMainCategoryWiring(unittest.TestCase):
         self.data_dir = Path(self.tmp.name)
         (self.data_dir / '.env').write_text('LLM_API_KEY=test-key-not-real\n',
                                             encoding='utf-8')
+        # 624 测试隔离：_run_main 调 labeler.main() 会装配全局 SOURCE_POLICY 且 main
+        # 不恢复（生产语义：CLI 进程随 main 返回退出）。存原值、清理时恢复，不泄漏给后续套件。
+        self._prev_source_policy = labeler.SOURCE_POLICY
+        self.addCleanup(self._restore_source_policy)
+
+    def _restore_source_policy(self):
+        labeler.SOURCE_POLICY = self._prev_source_policy
 
     def _run_main(self, argv, rank_books, cat_books=None):
         import contextlib

@@ -250,6 +250,10 @@ class TestMainDryRun(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
+        # 624 测试隔离：用例调 labeler.main() 会装配全局 SOURCE_POLICY 且 main 不恢复
+        # （生产语义：CLI 进程随 main 返回退出）。存原值、清理时恢复，不泄漏给后续套件。
+        self._prev_source_policy = labeler.SOURCE_POLICY
+        self.addCleanup(self._restore_source_policy)
         d = Path(self.tmp.name)
         (d / '.env').write_text('LLM_API_KEY=test-key-not-real\n', encoding='utf-8')
         write_jsonl(d / 'labels.jsonl', [
@@ -266,6 +270,9 @@ class TestMainDryRun(unittest.TestCase):
             {'url': '/books/detailsD.html', 'title': '四次丁'},
             {'url': '/books/detailsE.html', 'title': '待处理戊'},
         ]
+
+    def _restore_source_policy(self):
+        labeler.SOURCE_POLICY = self._prev_source_policy
 
     def _stub_relocation(self):
         """617：book15 retired 后 rank 线走引擎重定位；本套件测的是 done/pinned 分流，
@@ -328,6 +335,10 @@ class TestWebnovelLimitCut(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
+        # 624 测试隔离：用例调 labeler.main() 会装配全局 SOURCE_POLICY 且 main 不恢复
+        # （生产语义：CLI 进程随 main 返回退出）。存原值、清理时恢复，不泄漏给后续套件。
+        self._prev_source_policy = labeler.SOURCE_POLICY
+        self.addCleanup(self._restore_source_policy)
         d = Path(self.tmp.name)
         (d / '.env').write_text('LLM_API_KEY=test-key-not-real\n', encoding='utf-8')
         # 命中 150：前 100 已打标，后 50 未完成
@@ -337,6 +348,9 @@ class TestWebnovelLimitCut(unittest.TestCase):
             {'url': labeler.BASE + f'/books/details{i}.html',
              'title': f'书{i}', 'site_title': f'书{i}'} for i in range(1, 101)])
         self.data_dir = d
+
+    def _restore_source_policy(self):
+        labeler.SOURCE_POLICY = self._prev_source_policy
 
     def _run(self, limit):
         import contextlib

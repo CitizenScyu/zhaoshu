@@ -168,6 +168,13 @@ class MainHarness(OfflineGuardMixin, unittest.TestCase):
         ]
         FakeAutoImporter.last = None
         FakeAutoImporter.behavior_template = {}
+        # 624 测试隔离：run_main 调 labeler.main() 会装配全局 SOURCE_POLICY 且 main 不恢复
+        # （生产语义：CLI 进程随 main 返回退出）。存原值、清理时恢复，不泄漏给后续套件。
+        self._prev_source_policy = labeler.SOURCE_POLICY
+        self.addCleanup(self._restore_source_policy)
+
+    def _restore_source_policy(self):
+        labeler.SOURCE_POLICY = self._prev_source_policy
 
     def write_env(self, **extra):
         lines = ['LLM_API_KEY=test-key-not-real']
