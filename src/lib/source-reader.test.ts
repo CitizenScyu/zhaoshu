@@ -146,18 +146,40 @@ describe('online reader source resolution and budgets', () => {
   });
 
   it('bounds retries and HTTP requests, counting redirects too', async () => {
-    const budget = context(1);
-    mocks.fetch.mockResolvedValue(new Response(null, { status: 302, headers: { location: '/redirect' } }));
-    await expect(budget.page('https://book15.net/')).rejects.toMatchObject({ code: 'SOURCE_BUDGET_EXCEEDED' });
-    // 302 是源站行为不是路径故障，不触发换 host；首次请求成功（拿到 302 响应）后，
-    // 预算已扣 1，重定向下一跳的 beforeRequest 撞预算即停，只此一发。
-    expect(mocks.fetch).toHaveBeenCalledOnce();
+    const { refreshSupportedHosts } = await import('./source-policy');
+    refreshSupportedHosts(['backup.test', 'reader.test']);
+    try {
+      const budget = context(1);
+      mocks.fetch.mockResolvedValue(new Response(null, { status: 302, headers: { location: '/redirect' } }));
+      await expect(budget.page('https://reader.test/')).rejects.toMatchObject({ code: 'SOURCE_BUDGET_EXCEEDED' });
+      // 302 是源站行为不是路径故障，不触发换 host；首次请求成功（拿到 302 响应）后，
+      // 预算已扣 1，重定向下一跳的 beforeRequest 撞预算即停，只此一发。
+      expect(mocks.fetch).toHaveBeenCalledOnce();
+    } finally {
+      refreshSupportedHosts(['backup.test']);
+    }
   });
 
   it('does not retry rate-limited sources', async () => {
-    mocks.fetch.mockResolvedValue(new Response('', { status: 429 }));
-    await expect(context().page('https://book15.net/')).rejects.toMatchObject({ status: 429 });
-    expect(mocks.fetch).toHaveBeenCalledOnce();
+    const { refreshSupportedHosts } = await import('./source-policy');
+    refreshSupportedHosts(['backup.test', 'reader.test']);
+    try {
+      mocks.fetch.mockResolvedValue(new Response('', { status: 429 }));
+      await expect(context().page('https://reader.test/')).rejects.toMatchObject({ status: 429 });
+      expect(mocks.fetch).toHaveBeenCalledOnce();
+    } finally {
+      refreshSupportedHosts(['backup.test']);
+    }
+  });
+
+  it('rejects a retired source before physical fetch or request budget consumption', async () => {
+    const { SourcePolicyError } = await import('./source-policy');
+    const budget = context(1);
+    const pending = budget.page('https://book15.net/books/synthetic');
+    await expect(pending).rejects.toBeInstanceOf(SourcePolicyError);
+    await expect(pending).rejects.toThrow('书源已退休');
+    expect(mocks.fetch).not.toHaveBeenCalled();
+    expect(budget.requests).toBe(0);
   });
 
   it('stops before source/DB access when cancelled', async () => {
