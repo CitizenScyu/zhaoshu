@@ -122,9 +122,12 @@ function builtinSource(m) {
 
 const isBuiltin = (source) => source.tier === 'builtin' || !source.rules || Object.keys(source.rules).length === 0;
 
-/** 池序里的 builtin 段：无活跃 builtin 时留空，不注入退休源。 */
+/** 池序里的 builtin 段：**始终数组**——有活跃 builtin 返回单元素数组，无则 []。
+ *  改前 `builtinSource(m) ?? []` 在 active 时返回单对象，cmdSearch 的 `[...builtinPoolEntry(m)]`
+ *  展开非可迭代对象即 TypeError；退休时才恰好因 [] 逃过。复活 builtin 前必须先修此形。 */
 function builtinPoolEntry(m) {
-  return builtinSource(m) ?? [];
+  const b = builtinSource(m);
+  return b ? [b] : [];
 }
 
 // 复刻 source-reader 的 engineSourceOf（未导出）：编译走 compile.ts 的 LRU。
@@ -226,6 +229,13 @@ async function resolveSourceForUrl(m, url, signal) {
   // 识别 ≠ 许可：retired builtin host 不直通 builtin 腿，落引擎池按 host 反查；
   // 找不到同站引擎源 ⇒ no_source（code=1 有限失败），不复活退休源。
   if (isBuiltinHost(m, host)) return { source: builtinSource(m), builtin: true };
+  // 退休收口（池反查**之前**）：退休是静态事实，不依赖引擎池/DB 是否可用——
+  // 池不可用、池里恰好有同站行，都不能让退休 host 复活。与 runtime-download/engine.ts 的
+  // resolveSource 同档同原因（code=2 + RETIRED_BUILTIN_REASON='builtin_source_retired'）：
+  // 下载腿按 source_unavailable 退避（可重试、零发布），labeler 不当普通 miss。
+  if (m.supported.isRetiredBuiltinHost?.(host)) {
+    throw new ExitError(2, 'builtin_source_retired', 'builtin_source_retired');
+  }
   // 非 builtin host ⇒ 需要引擎源池（DB）。DB 不可达 ⇒ 退 2。
   let enginePool;
   try {
