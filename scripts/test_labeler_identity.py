@@ -37,9 +37,17 @@ from test_labeler_import import (  # noqa: E402
 BASE = labeler.BASE                      # https://book15.net
 DETAIL_A = '/books/detailsA.html'
 DETAIL_B = '/books/detailsB.html'
+DETAIL_C = '/books/detailsC.html'
+DETAIL_D = '/books/detailsD.html'
 ENGINE_URL_A1 = 'https://src1.example/b/a'
 ENGINE_URL_A2 = 'https://src2.example/b/a'   # 下轮引擎换站后的同书 URL
 ALT = {'url': 'https://alt.example/b/a', 'title': '书甲', 'source': 'alt.example'}
+
+
+def _now_iso():
+    """冷却期内的拒收时间戳（now，ISO UTC）——deferred 判定的合成输入。"""
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).isoformat()
 
 
 def _proc(returncode=0, stdout='', stderr=''):
@@ -171,6 +179,70 @@ class TestRelocationKeepsStableIdentity(IdentityHarness):
                      'source': 'src1.example'}})
         self.assertEqual(code, 0)
         self.assertIn('其中 1 本因', out)          # 后移计数用同一身份口径
+
+    def test_deferred_by_identity_only_counted_in_log(self):
+        """632：拒收行带 identity 键且取文 URL 已换引擎站 → 队列后移了，日志计数不能是 0。
+
+        合成输入：拒收行 url=旧引擎 URL、identity=book15 站内绝对 URL（重定位后的真实
+        写回形态——`_attach_identity` 在 identity≠url 时写 identity）。条目本轮命中另
+        一家引擎站（URL 三者互不相等）：`deferred_urls`（URL 键）不命中任何键，
+        只有身份并集 `_deferred_keys` 命中 identity。修好前：队尾后移（队列判定用并集）、
+        「其中 0 本」计数（旧代码只交 deferred_urls）——日志与队列自相矛盾。
+        断言口径：处理 2 本 + 其中 1 本后移（M ≤ N，count 与队列同一身份键集）。
+        """
+        self.write_labels(
+            [{'url': ENGINE_URL_A1, 'identity': BASE + DETAIL_A,
+              'site_title': '书甲', 'rejected_at': _now_iso()}],
+            name='labels-rejected.jsonl')
+        code, out, _ = self.run_main(
+            [self.BOOK_B, self.BOOK_A],           # 书乙在前：后移的书甲必须排到队尾
+            {'书甲': {'url': ENGINE_URL_A2, 'title': '书甲', 'source': 'src2.example'},
+             '书乙': {'url': 'https://src1.example/b/b', 'title': '书乙',
+                     'source': 'src1.example'}})
+        self.assertEqual(code, 0)
+        self.assertIn('本轮处理 2 本', out)
+        self.assertIn('其中 1 本因', out)
+
+    def test_deferred_tail_cut_by_limit_counts_zero(self):
+        """632：后移书在队尾、被 --limit 截掉时计数为 0（limit 后计数语义不变）。
+
+        队头是未后移的正常书（书丙），两本后移书（书甲/书乙）排到队尾；--limit 1 只留
+        队头正常书：队尾两本没进本轮待处理队列，「其中 0 本」正确——计数跟着切片后的
+        queue 走，不是跟着 deferred 名单走（M 与 N 同口径，不会 M > N）。
+        """
+        self.write_labels(
+            [{'url': ENGINE_URL_A1, 'identity': BASE + DETAIL_A,
+              'site_title': '书甲', 'rejected_at': _now_iso()},
+             {'url': ENGINE_URL_A2, 'identity': BASE + DETAIL_B,
+              'site_title': '书乙', 'rejected_at': _now_iso()}],
+            name='labels-rejected.jsonl')
+        code, out, _ = self.run_main(
+            [{'url': DETAIL_C, 'title': '书丙'}, self.BOOK_A, self.BOOK_B],
+            {'书丙': {'url': 'https://src3.example/b/c', 'title': '书丙',
+                     'source': 'src3.example'},
+             '书甲': {'url': ENGINE_URL_A1, 'title': '书甲', 'source': 'src1.example'},
+             '书乙': {'url': ENGINE_URL_A2, 'title': '书乙', 'source': 'src2.example'}},
+            argv=('--dry-run', '--limit', '1'))
+        self.assertEqual(code, 0)
+        self.assertIn('本轮处理 1 本', out)
+        self.assertIn('其中 0 本因', out)
+
+    def test_deferred_same_title_other_book_not_moved(self):
+        """632：同名异书不因书名相同被误后移（身份键不含书名）。
+
+        被拒的是 detailsX（书名也叫书甲，但另一本）；本轮候选 detailsA 同名不同身份：
+        不得命中 deferred——不后移、计数 0。钉死后移判定就不会退回「裸书名/标题」匹配。
+        """
+        self.write_labels(
+            [{'url': BASE + '/books/detailsX.html', 'site_title': '书甲',
+              'rejected_at': _now_iso()}],
+            name='labels-rejected.jsonl')
+        code, out, _ = self.run_main(
+            [self.BOOK_A],
+            {'书甲': {'url': ENGINE_URL_A1, 'title': '书甲', 'source': 'src1.example'}})
+        self.assertEqual(code, 0)
+        self.assertIn('本轮处理 1 本', out)
+        self.assertIn('其中 0 本因', out)
 
     def test_success_written_this_round_matches_next_round_new_engine_url(self):
         """本轮成功写回 → 下轮引擎换站（URL 不同）也不重复打标。
