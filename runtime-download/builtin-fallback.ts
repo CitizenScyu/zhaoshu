@@ -46,7 +46,11 @@ type SearchHit = { title?: string; author?: string; bookUrl: string };
 interface PoolSource { url: string; name: string; searchUrl: unknown; rules?: unknown }
 interface Modules {
   compile: { compileSource(source: unknown): unknown };
-  supported: { BUILTIN_SOURCE_HOSTS: readonly string[] };
+  supported: {
+    BUILTIN_SOURCE_HOSTS: readonly string[];
+    /** 识别集合内但无活跃内建源的 host（失效源整改）。缺省视为无退休源（合成桩兼容）。 */
+    isRetiredBuiltinHost?: (host: string) => boolean;
+  };
   api: {
     engineSearchBook(engine: unknown, title: string, ctx: unknown): Promise<SearchHit[]>;
     engineFetchDetail(engine: unknown, bookUrl: string, ctx: unknown): Promise<Identity>;
@@ -89,6 +93,10 @@ export function createBuiltinFallback(options: BuiltinFallbackOptions) {
   const maxSources = options.maxSources ?? MAX_FALLBACK_SOURCES;
   const builtinHosts = new Set(m.supported.BUILTIN_SOURCE_HOSTS);
   const builtinSuspect = (task: TaskRow) => isSuspect(hostOf(task.source_url));
+  // 退休 host（识别集合内、无活跃内建源）：零出网径直回退。isHostSuspect 是**运行期**健康记忆
+  // （连续传输失败、10 分钟窗），退休是静态事实——不进「半开重试」节奏，第一次就跳过 builtin 腿，
+  // 也不再为它做预检搜索（对退休 host 的每个请求都被拒，做了只是白等超时）。
+  const builtinRetired = (task: TaskRow) => Boolean(m.supported.isRetiredBuiltinHost?.(hostOf(task.source_url)));
 
   // 预检选好的源交给下载腿：单槽（并发=1），按任务 id 认领，领一次即清。
   let planned: { taskId: number; sources: string[] } | null = null;
@@ -150,7 +158,7 @@ export function createBuiltinFallback(options: BuiltinFallbackOptions) {
         planned = null;
         if (!isBuiltinTask(task)) return inner(task, signal);
         let stage = 'search';
-        if (!builtinSuspect(task)) {
+        if (!builtinSuspect(task) && !builtinRetired(task)) {
           const result = await inner(task, signal);
           if (result.ok || !result.retryable) return result;
           stage = result.stage;
@@ -174,7 +182,7 @@ export function createBuiltinFallback(options: BuiltinFallbackOptions) {
           planned = null;
           let primary: AdapterOutcome | null = null;
           if (!sources) {
-            if (!builtinSuspect(task)) {
+            if (!builtinSuspect(task) && !builtinRetired(task)) {
               primary = await builtin.download(task, context);
               if (!isSourceUnavailable(primary)) return primary;
             }

@@ -46,11 +46,14 @@ export interface ResolvedSource {
 
 /** 与 engine-fetch.mjs 同形的错误：code=2 表示「无法尝试」（用法/依赖不可用），code=1 表示 miss。 */
 export class ResolveSourceError extends Error {
-  constructor(readonly code: 1 | 2, reason: string) {
+  constructor(readonly code: 1 | 2, readonly reason: string) {
     super(reason);
     this.name = 'ResolveSourceError';
   }
 }
+
+/** resolveSource 的退休收口（code=2、稳定原因码）：识别集合内但无活跃内建源的 host。 */
+export const RETIRED_BUILTIN_REASON = 'builtin_source_retired';
 
 const hostOf = (url: string): string => {
   try { return new URL(url).hostname; } catch { return ''; }
@@ -68,6 +71,10 @@ function builtinSource(m: EngineModules): ReadingSourceLike | null {
 // 识别 ≠ 许可：retired host 不从 resolveSource 直通 builtin 腿，落引擎池反查；
 // 找不到 ⇒ no_engine_source_for_host（code=1 有限失败），不复活退休源。
 const isBuiltinHost = (m: EngineModules, host: string) => m.supported.isActiveBuiltinHost(host);
+
+// 退休 host 在池反查**之前**收口：退休是静态事实，不依赖引擎池/DB 是否可用——
+// 池不可用、池里恰好有同站行，都不能让 resolveSource 对退休 host 给出可下载的源。
+const isRetiredBuiltin = (m: EngineModules, host: string) => m.supported.isRetiredBuiltinHost(host);
 
 /** 引擎源池：先刷新运行时 host 门，再读 getEngineSources（同 engine-fetch.mjs loadEnginePool）。 */
 export async function loadEnginePool(m: EngineModules, signal: AbortSignal): Promise<ReadingSourceLike[]> {
@@ -95,6 +102,10 @@ export function createResolveSource(m: EngineModules) {
     // isBuiltinHost 已是活跃判定：retired host 即便在识别集合里也返回 false，不直通 builtin 腿。
     // builtinSource 只在活跃时非 null（isBuiltinHost 与 builtinSource 同判据）。
     if (isBuiltinHost(m, host)) return { source: builtinSource(m)!, builtin: true };
+    // 退休 host（识别集合内、无活跃内建源）：**永久书源不可达**（code=2，稳定原因码可观测）。
+    // 与池反查的 code=1 miss 区分：退休是静态事实，池不可用/池里同站行都不改变这个结论，
+    // 下载腿按 source_unavailable 退避（可重试、零发布），永不向退休 host 发请求。
+    if (isRetiredBuiltin(m, host)) throw new ResolveSourceError(2, RETIRED_BUILTIN_REASON);
     let pool: ReadingSourceLike[];
     try {
       pool = await loadEnginePool(m, signal);

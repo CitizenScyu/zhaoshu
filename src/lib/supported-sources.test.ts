@@ -7,7 +7,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   BUILTIN_SOURCES, activeBuiltinSource, activeBuiltinSources, builtinSourceForHost,
-  isHostActiveInSources, sourceForHostIn, type SupportedSource,
+  isHostActiveInSources, isRetiredBuiltinHost, sourceForHostIn, type SupportedSource,
 } from './supported-sources';
 
 const base = {
@@ -28,6 +28,12 @@ describe('源注册表生命周期：合成反例', () => {
     expect(isHostActiveInSources('www.book15.net', BUILTIN_SOURCES)).toBe(false);
     expect(activeBuiltinSources()).toEqual([]);
     expect(activeBuiltinSource()).toBeNull();
+    // 第三态：识别集合内但无活跃内建源（取文链路据此按永久不可达收口，零请求）。
+    expect(isRetiredBuiltinHost('book15.net')).toBe(true);
+    expect(isRetiredBuiltinHost('www.book15.net')).toBe(true);
+    expect(isRetiredBuiltinHost('BOOK15.NET.')).toBe(true); // 尾点根形态同判
+    // 识别集合外不是退休（是普通未知 host，走各链路自己的反查/失败路径）。
+    expect(isRetiredBuiltinHost('good.example')).toBe(false);
   });
 
   it('反例 (a)：enabled=false 但 lifecycle=active 的源不是活跃源（active ∩ enabled 缺一不可）', () => {

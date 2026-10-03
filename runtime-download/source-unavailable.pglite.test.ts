@@ -1,7 +1,12 @@
 // 41-EXEC-SRCUNAVAIL 验收：书源不可达（搜索阶段连接超时 / 源站 5xx）⇒ 任务回到可重试态、
 // 日配额退还、零发布；4xx 与身份不符维持终态；连续不可达按 attempt_count 退避递增，封顶转终态。
 // PGlite 真库 + 真 downloadBook（builtin 腿）+ 合成 transport + 内存 GitHub；不联网、不连生产。
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+//
+// 本文件测「**活跃** builtin 源的瞬时不可达」语义：真实注册表里 book15 已退休（失效源整改），
+// 这里以合成注册表把该条目置回 active——识别门 BUILTIN_SOURCE_HOSTS/SSRF 防线原样不动，
+// 只改生命周期位，使搜索/详情/目录各阶段的真实失败能走到被测分类逻辑。
+// 退休专属反例（零请求、resolve 即收口、引擎回退照常）见 retired-builtin.pglite.test.ts。
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
@@ -14,6 +19,27 @@ import type { GitHubContents } from '../src/lib/download-publisher';
 import { SourceHttpError } from '../src/lib/source-fetch';
 import { downloadBook } from '../scripts/engine-download.mjs';
 import { createIdentityPrecheck } from './identity-precheck';
+
+vi.mock('../src/lib/supported-sources', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/lib/supported-sources')>();
+  // 合成注册表：book15 条目置回 active（其余条目与全部纯函数原样）。派生函数重定向到合成表，
+  // 与真实注册表走同一份判定代码（isHostActiveInSources），不改识别集合。
+  const sources = actual.BUILTIN_SOURCES.map((source) =>
+    source.url.startsWith('https://book15.net/')
+      ? { ...source, lifecycle: 'active' as const, retiredReason: null }
+      : source);
+  const active = (host: string) => actual.isHostActiveInSources(host, sources);
+  return {
+    ...actual,
+    BUILTIN_SOURCES: sources,
+    activeBuiltinSources: () => sources.filter((s) => s.lifecycle === 'active' && s.enabled !== false),
+    activeBuiltinSource: () => sources.find((s) => s.lifecycle === 'active' && s.enabled !== false) ?? null,
+    builtinSourceForHost: (host: string) => actual.sourceForHostIn(host, sources),
+    isActiveBuiltinHost: active,
+    isRetiredBuiltinHost: (host: string) =>
+      (actual.BUILTIN_SOURCE_HOSTS as readonly string[]).includes(host) && !active(host),
+  };
+});
 
 const PGliteCtor = await loadPGlite();
 const maybe = PGliteCtor ? describe : describe.skip;

@@ -137,6 +137,17 @@ export function isHostActiveInSources(host: string, sources: readonly SupportedS
   return source !== null && source.lifecycle === 'active' && source.enabled !== false;
 }
 
+/**
+ * host 在识别集合里但当前无活跃内建源（= 退休）。识别 ≠ 许可的第三态：
+ * 「认得这个 host 的旧 URL」但「对它发请求的许可已被收回」。取文链路据此把退休 host
+ * 按**永久不可达**收口（稳定 code=2、零请求、可退避不终态），而不是当成普通 miss。
+ */
+export function isRetiredBuiltinHost(host: string): boolean {
+  const normalized = normalizeBuiltinHost(host);
+  return BUILTIN_SOURCE_HOSTS.some((known) => normalizeBuiltinHost(known) === normalized)
+    && !isHostActiveInSources(normalized, BUILTIN_SOURCES);
+}
+
 function normalizeBuiltinHost(host: string): string {
   const trimmed = host.trim().toLowerCase();
   return trimmed.length > 1 && trimmed.endsWith('.')

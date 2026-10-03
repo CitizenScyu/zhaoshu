@@ -6,7 +6,11 @@
 //   ③ 引擎源也失败 ⇒ 仍 pending 且退避生效（额度退还、最多试 MAX_FALLBACK_SOURCES 个源）；
 //   ④ book15 可达 ⇒ 行为与改前一致（不碰引擎源池）。
 // 另钉：host 级跳过（book15 已知不可达时一个请求都不打）、DOWNLOAD_ENGINE_FALLBACK=0 回到改前、预检关闭时下载腿自己回退。
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+//
+// 本文件测「**活跃** builtin 源瞬时不可达 ⇒ 回退」机制：真实注册表里 book15 已退休（失效源整改），
+// 这里以合成注册表把该条目置回 active（识别门与纯函数原样，派生函数重定向到合成表）。
+// 退休专属反例（零请求、径直回退、回退关闭时的收口）见 retired-builtin.pglite.test.ts。
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
@@ -18,6 +22,27 @@ import { assembleEngineModules } from './engine';
 import { MAX_FALLBACK_SOURCES } from './builtin-fallback';
 import type { GitHubContents } from '../src/lib/download-publisher';
 import { recordHostFailure, recordHostSuccess } from '../src/lib/source-host-health';
+
+vi.mock('../src/lib/supported-sources', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/lib/supported-sources')>();
+  // 合成注册表：book15 条目置回 active（其余条目与全部纯函数原样）。派生函数重定向到合成表，
+  // 与真实注册表走同一份判定代码（isHostActiveInSources），不改识别集合。
+  const sources = actual.BUILTIN_SOURCES.map((source) =>
+    source.url.startsWith('https://book15.net/')
+      ? { ...source, lifecycle: 'active' as const, retiredReason: null }
+      : source);
+  const active = (host: string) => actual.isHostActiveInSources(host, sources);
+  return {
+    ...actual,
+    BUILTIN_SOURCES: sources,
+    activeBuiltinSources: () => sources.filter((s) => s.lifecycle === 'active' && s.enabled !== false),
+    activeBuiltinSource: () => sources.find((s) => s.lifecycle === 'active' && s.enabled !== false) ?? null,
+    builtinSourceForHost: (host: string) => actual.sourceForHostIn(host, sources),
+    isActiveBuiltinHost: active,
+    isRetiredBuiltinHost: (host: string) =>
+      (actual.BUILTIN_SOURCE_HOSTS as readonly string[]).includes(host) && !active(host),
+  };
+});
 
 const PGliteCtor = await loadPGlite();
 const maybe = PGliteCtor ? describe : describe.skip;
