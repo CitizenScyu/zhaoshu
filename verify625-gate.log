@@ -1,0 +1,15 @@
+# verify625 gate log (synthetic, generated in isolated tree)
+# whitelist keys taken from real env: COMSPEC, OS, PATH, PATHEXT, PROCESSOR_ARCHITECTURE, SYSTEMROOT, WINDIR
+# overridden/literal keys: LC_ALL=LITERAL, PYTHONIOENCODING=LITERAL, PYTHONUTF8=LITERAL, TEMP=FAKE, TMP=FAKE
+
+== verify625 gate ==
+== controls ==
+POS-OK create_connection blocked
+POS-OK getaddrinfo blocked
+POS-OK urlopen blocked (audit)
+NEG-OK local op unaffected
+== guard stats ==
+ALLOWED_PROC=0
+BLOCKED_DNS=1
+BLOCKED_NET=2
+BLOCKED_PROC=0
