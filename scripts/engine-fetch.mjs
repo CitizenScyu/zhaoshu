@@ -111,13 +111,21 @@ async function loadModules() {
   return { api, compile, shuyuan, supported, policy, parser, reader, fetchLayer };
 }
 
-// builtin book15 条目（ReadingSource 形态；rules 空 ⇒ 走 source-parser 适配器）。
+// builtin 条目（ReadingSource 形态；rules 空 ⇒ 走 source-parser 适配器）。
+// 618-stalesource：直构 builtin 对象前必须过 isActiveBuiltinHost——BUILTIN_SOURCES[0] 只是「识别用」
+// 档条目，host 已退休时这里返回 null，调用方不再注入 builtin 源（真实取文出口生效，非池层过滤）。
 function builtinSource(m) {
   const b = m.supported.BUILTIN_SOURCES[0];
+  if (!m.supported.isActiveBuiltinHost(hostOf(b.url))) return null;
   return { url: b.url, name: b.name, searchUrl: b.searchUrl, rules: {}, tier: 'builtin' };
 }
 
 const isBuiltin = (source) => source.tier === 'builtin' || !source.rules || Object.keys(source.rules).length === 0;
+
+/** 池序里的 builtin 段：null（无活跃 builtin，618-stalesource）时留空，不注入退休源。 */
+function builtinPoolEntry(m) {
+  return builtinSource(m) ?? [];
+}
 
 // 复刻 source-reader 的 engineSourceOf（未导出）：编译走 compile.ts 的 LRU。
 function engineSourceOf(m, source) {
@@ -147,9 +155,11 @@ async function loadEnginePool(m, signal) {
 
 const hostOf = (url) => { try { return new URL(url).hostname; } catch { return ''; } };
 
-// URL 的 host 是否属于 builtin（book15 双 host，静态、恒在门内，无需 DB）。
+// URL 的 host 是否属于**活跃** builtin（618-stalesource：请求许可判定）。
+// 旧 isBuiltinHost 只查识别集合（恒 true），退休 host 会从 resolveSourceForUrl 直通 builtin 腿发请求；
+// 改为 isActiveBuiltinHost——retired host 不再直通，落引擎池反查（找不到 ⇒ no_source 有限失败）。
 function isBuiltinHost(m, host) {
-  return m.supported.BUILTIN_SOURCE_HOSTS.includes(host);
+  return m.supported.isActiveBuiltinHost(host);
 }
 
 // 在池里按 host 找源（含同站备用 host，参照 resolveSourceBook 的 §3.7 反查）。
@@ -173,8 +183,9 @@ async function cmdSearch(m, args) {
     throw new ExitError(2, `引擎源池不可用：${safeReason(error)}`, 'pool');
   }
   // --skip-host 按源身份 host 过滤（与下面按请求 host 分组不是同一个键，理由见 excludeSkippedSources）。
+  // 618-stalesource：builtin 段经 builtinPoolEntry——无活跃 builtin 时为空数组，退休源不进搜索池。
   const sources = excludeSkippedSources(
-    [...(args.noBuiltin ? [] : [builtinSource(m)]), ...enginePool], args.skipHosts);
+    [...(args.noBuiltin ? [] : builtinPoolEntry(m)), ...enginePool], args.skipHosts);
   const context = new m.reader.SourceRequestContext(signal, 12);
   context.openPool(POOL_SIZE);
   // espfix41：改前逐源串行（墙钟=各源之和）；改后按目标站分组、组内串行、组间有界并发，
@@ -213,6 +224,8 @@ async function resolveSourceForUrl(m, url, signal) {
   if (!/^https:\/\//i.test(url)) throw new ExitError(2, '--url 非法：仅支持 HTTPS 完整地址');
   const host = hostOf(url);
   if (!host) throw new ExitError(2, `--url 非法：无法解析 host`);
+  // 618-stalesource：识别 ≠ 许可。retired builtin host 不再直通 builtin 腿（不发 book15 请求），
+  // 落引擎池按 host 反查；找不到同站引擎源 ⇒ no_source（code=1 有限失败），不复活退休源。
   if (isBuiltinHost(m, host)) return { source: builtinSource(m), builtin: true };
   // 非 builtin host ⇒ 需要引擎源池（DB）。DB 不可达 ⇒ 退 2。
   let enginePool;
