@@ -25,6 +25,36 @@ const { getSql, sql, execute, transaction } = vi.hoisted(() => {
 
 vi.mock('@/lib/db', () => ({ ensureSchema: vi.fn(), getSql }));
 
+// 真实注册表里 book15 已退休（识别仍在、不许发请求，618 失效源整改）。池合成读缓存用例需要
+// 「已注册的活跃内建源」：mock 注册表——退休 book15 原样保留，另注册一个活跃内建源 builtin.test
+// （host 进识别集合，行才能过 isActiveBuiltinHost/canProbe）。全部判定走被测模块的真实实现
+// （isHostActiveInSources / sourceForHostIn / 同一过滤谓词），只换注册表数据。
+vi.mock('@/lib/supported-sources', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/lib/supported-sources')>();
+  const activeBuiltin: import('@/lib/supported-sources').SupportedSource = {
+    url: 'https://builtin.test/',
+    name: 'builtin.test',
+    searchUrl: 'https://builtin.test/s?q={{key}}',
+    rules: {},
+    tier: 'builtin',
+    enabled: true,
+    lifecycle: 'active',
+    retiredReason: null,
+  };
+  const sources = [...actual.BUILTIN_SOURCES, activeBuiltin];
+  const active = () => sources.filter((source) => source.lifecycle === 'active' && source.enabled !== false);
+  return {
+    ...actual,
+    BUILTIN_SOURCE_HOSTS: [...actual.BUILTIN_SOURCE_HOSTS, 'builtin.test'],
+    BUILTIN_SOURCES: sources,
+    activeBuiltinSources: () => active(),
+    activeBuiltinSource: () => active()[0] ?? null,
+    builtinUrlPrefixes: () => sources.map((source) => new URL(source.url).origin),
+    builtinSourceForHost: (host: string) => actual.sourceForHostIn(host, sources),
+    isActiveBuiltinHost: (host: string) => actual.isHostActiveInSources(host, sources),
+  };
+});
+
 import {
   DEFAULT_SHUYUAN_READ_CACHE_TTL_MS, disableShuyuanSource, enableShuyuanSource, getEngineSources, getFanoutPool,
   getReadingSources, getShuyuanPoolHealth, invalidateShuyuanReadCache, refreshShuyuan, shuyuanReadCacheTtlMs,
@@ -44,6 +74,13 @@ const engineItemAt = (host: string) => ({
 const engineRowAt = (host: string, over: Record<string, unknown> = {}) => ({
   source_url: `https://${host}`, source: engineItemAt(host), name: host,
   disabled_at: null, last_error: '', tier: 'M1', search_checked_at: null, ...over,
+});
+/** 已注册的活跃内建源行（合成注册表的 builtin.test，见顶部 vi.mock）。 */
+const builtinRegisteredRow = () => ({
+  source_url: 'https://builtin.test', source: {
+    bookSourceUrl: 'https://builtin.test', bookSourceName: 'builtin.test',
+    searchUrl: 'https://builtin.test/s?q={{key}}', enabled: true,
+  }, name: 'builtin.test', disabled_at: null, last_error: '',
 });
 const metaWith = (entries: unknown[]) => ({
   collections: [{ id: 1, title: '合集', count: 1, probeSnapshot: { version: 1, entries } }],
@@ -85,7 +122,7 @@ beforeEach(() => {
   refreshSupportedHosts([]);
   db.hosts = [{ host: 'a.example' }, { host: 'b.example' }];
   db.meta = metaWith([]);
-  db.builtin = [];
+  db.builtin = [builtinRegisteredRow()];
   db.engine = [engineRowAt('a.example'), engineRowAt('b.example')];
   db.engineError = null;
   execute.mockReset().mockImplementation(async (query) => {
@@ -138,7 +175,7 @@ describe('池合成读缓存', () => {
     const first = await getReadingSources(signal());
     const second = await getReadingSources(signal());
     expect(second).toEqual(first);
-    expect(first.map((source) => source.url)).toEqual(['https://book15.net/', 'https://a.example/', 'https://b.example/']);
+    expect(first.map((source) => source.url)).toEqual(['https://builtin.test/', 'https://a.example/', 'https://b.example/']);
     expect(counts()).toEqual({ hosts: 1, poolMeta: 1, builtinRows: 1, engineRows: 1 });
     // 改前是整列 SELECT collections；投影后不再出现整列读。
     expect(execute.mock.calls.some(([query]) => query.text.startsWith('SELECT collections'))).toBe(false);
@@ -333,7 +370,7 @@ describe('写路径之后读到新值（本实例失效缓存）', () => {
     db.engine = [engineRowAt('a.example', { disabled_at: '2026-09-25T00:00:00Z' }), engineRowAt('b.example')];
     await disableShuyuanSource('https://a.example', '人工禁用');
     expect((await getReadingSources(signal())).map((source) => source.url))
-      .toEqual(['https://book15.net/', 'https://b.example/']);
+      .toEqual(['https://builtin.test/', 'https://b.example/']);
     expect(counts().engineRows).toBe(2);
   });
 
@@ -378,7 +415,7 @@ describe('写路径之后读到新值（本实例失效缓存）', () => {
     expect(transaction).toHaveBeenCalledTimes(1);
     db.meta = metaWith([{ url: 'https://a.example', status: 'failed', checked_at: '2026-09-25T00:00:00Z' }]);
     expect((await getReadingSources(signal())).map((source) => source.url))
-      .toEqual(['https://book15.net/', 'https://b.example/']);
+      .toEqual(['https://builtin.test/', 'https://b.example/']);
   });
 });
 
@@ -445,7 +482,7 @@ describe('host 缓存消费者的晚兑现发布', () => {
   it('当前读取失败保留门，下一请求重读', async () => {
     const pending = holdHosts(); refreshSupportedHosts(['b.example']); const a = getReadingSources(signal());
     await vi.waitFor(() => expect(pending).toHaveLength(1)); pending[0].reject(new Error('synthetic failure'));
-    expect(urls(await a)).toEqual(['https://book15.net/']); expect(supportedHostList()).toContain('b.example');
+    expect(urls(await a)).toEqual(['https://builtin.test/']); expect(supportedHostList()).toContain('b.example');
     const b = getReadingSources(signal()); await vi.waitFor(() => expect(pending).toHaveLength(2)); pending[1].resolve(newHosts);
     expect(urls(await b)).toContain('https://b.example/');
   });
@@ -454,7 +491,7 @@ describe('host 缓存消费者的晚兑现发布', () => {
     const pending = holdHosts(); const version = supportedHostVersion(); const a = getReadingSources(signal());
     await vi.waitFor(() => expect(pending).toHaveLength(1)); invalidateShuyuanReadCache(); pending[0].resolve(oldHosts);
     await vi.waitFor(() => expect(pending).toHaveLength(2)); invalidateShuyuanReadCache(); pending[1].resolve(newHosts);
-    expect(urls(await a)).toEqual(['https://book15.net/']); expect(pending).toHaveLength(2); expect(supportedHostVersion()).toBe(version);
+    expect(urls(await a)).toEqual(['https://builtin.test/']); expect(pending).toHaveLength(2); expect(supportedHostVersion()).toBe(version);
   });
 
   it('TTL0独立caller信号，已成功后继可复用但顺序调用仍重读', async () => {
