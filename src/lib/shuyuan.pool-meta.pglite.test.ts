@@ -13,6 +13,35 @@ type Statement = { text: string; params: unknown[] };
 const { getSql } = vi.hoisted(() => ({ getSql: vi.fn() }));
 vi.mock('@/lib/db', () => ({ ensureSchema: vi.fn(), getSql }));
 
+// 真实注册表里 book15 已退休（识别仍在、不许发请求，618 失效源整改）。真库夹具里的 builtin 行
+// 需要活跃内建源：mock 注册表——退休 book15 原样保留，另注册活跃内建源 builtin.test（host 进
+// 识别集合，行才能过 isActiveBuiltinHost/canProbe/host 门）。判定走被测模块真实实现，只换注册表数据。
+vi.mock('@/lib/supported-sources', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/lib/supported-sources')>();
+  const activeBuiltin: import('@/lib/supported-sources').SupportedSource = {
+    url: 'https://builtin.test/',
+    name: 'builtin.test',
+    searchUrl: 'https://builtin.test/s?q={{key}}',
+    rules: {},
+    tier: 'builtin',
+    enabled: true,
+    lifecycle: 'active',
+    retiredReason: null,
+  };
+  const sources = [...actual.BUILTIN_SOURCES, activeBuiltin];
+  const active = () => sources.filter((source) => source.lifecycle === 'active' && source.enabled !== false);
+  return {
+    ...actual,
+    BUILTIN_SOURCE_HOSTS: [...actual.BUILTIN_SOURCE_HOSTS, 'builtin.test'],
+    BUILTIN_SOURCES: sources,
+    activeBuiltinSources: () => active(),
+    activeBuiltinSource: () => active()[0] ?? null,
+    builtinUrlPrefixes: () => sources.map((source) => new URL(source.url).origin),
+    builtinSourceForHost: (host: string) => actual.sourceForHostIn(host, sources),
+    isActiveBuiltinHost: (host: string) => actual.isHostActiveInSources(host, sources),
+  };
+});
+
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -65,7 +94,7 @@ const FILLER = 1_200;
 function snapshotEntries(): unknown[] {
   const failed = (url: string) => ({ url, status: 'failed', checked_at: CHECKED, error: '连接超时', consecutive_failures: 3 });
   return [
-    { url: 'https://book15.net', status: 'reachable', checked_at: CHECKED, error: null, consecutive_failures: 0 },
+    { url: 'https://builtin.test', status: 'reachable', checked_at: CHECKED, error: null, consecutive_failures: 0 },
     failed('https://a.example'),
     failed('https://B.example/path'),
     { url: 'https://c.example:443/x', status: 'reachable', checked_at: CHECKED, error: null },
@@ -97,8 +126,8 @@ maybe('xfer41 池合成探测快照投影（PGlite 真库）', () => {
       ruleSearch: { bookList: '.i', name: '.t@text', bookUrl: 'a@href' },
       ruleToc: { chapterList: '.ch', chapterName: 'a@text' }, ruleContent: { content: '.c' },
     });
-    await pg.query(`INSERT INTO shuyuan_sources (source_url, name, source) VALUES ($1, 'book15', $2::jsonb)`,
-      ['https://book15.net', source('https://book15.net')]);
+    await pg.query(`INSERT INTO shuyuan_sources (source_url, name, source) VALUES ($1, 'builtin.test', $2::jsonb)`,
+      ['https://builtin.test', source('https://builtin.test')]);
     for (const url of ENGINE_URLS) {
       await pg.query(`INSERT INTO shuyuan_sources (source_url, name, source) VALUES ($1, $1, $2::jsonb)`, [url, source(url)]);
       await pg.query(`INSERT INTO source_admission (source_url, tier, compile_ok, core_field_mask, search_ok, rules_hash, host)
@@ -125,11 +154,11 @@ maybe('xfer41 池合成探测快照投影（PGlite 真库）', () => {
   it('入池结论与整列读相同：failed（含大写 host / 百分号 host）出池、重复条目作废、reachable 排前', async () => {
     const pool = await getReadingSources(new AbortController().signal);
     expect(pool.map((source) => source.url)).toEqual([
-      'https://book15.net/', 'https://c.example/x', 'https://d.example/',
+      'https://builtin.test/', 'https://c.example/x', 'https://d.example/',
     ]);
     const fanout = await getFanoutPool(new AbortController().signal);
     expect(fanout.map((source) => [source.url, source.readable])).toEqual([
-      ['https://book15.net/', true], ['https://c.example/x', true], ['https://d.example/', true],
+      ['https://builtin.test/', true], ['https://c.example/x', true], ['https://d.example/', true],
     ]);
   });
 
@@ -140,7 +169,7 @@ maybe('xfer41 池合成探测快照投影（PGlite 真库）', () => {
     const row = projected[0].rows[0] as { collections: { probeSnapshot: { version: number; entries: { url: string }[] } }[] };
     expect(row.collections[0].probeSnapshot.version).toBe(1);
     expect(row.collections[0].probeSnapshot.entries.map((entry) => entry.url)).toEqual([
-      'https://book15.net', 'https://a.example', 'https://B.example/path', 'https://c.example:443/x',
+      'https://builtin.test', 'https://a.example', 'https://B.example/path', 'https://c.example:443/x',
       'https://d.example', 'https://d.example', 'https://e%2Eexample',
     ]);
     const full = (await pg.query(`SELECT collections FROM shuyuan_meta WHERE id = 1`)).rows[0];
@@ -168,7 +197,7 @@ maybe('xfer41 池合成探测快照投影（PGlite 真库）', () => {
       // 生成走投影：不整列读 collections，探测条目只剩行 URL 对应的（1200 条 filler 不进产物）。
       expect(log.some((entry) => entry.text.includes('SELECT collections, refreshed_at'))).toBe(false);
       expect((artifact.probe.entries as { url: string }[]).map((entry) => entry.url)).toEqual([
-        'https://book15.net', 'https://a.example', 'https://B.example/path', 'https://c.example:443/x',
+        'https://builtin.test', 'https://a.example', 'https://B.example/path', 'https://c.example:443/x',
         'https://d.example', 'https://d.example', 'https://e%2Eexample',
       ]);
       const path = join(dir, 'pool.json');
@@ -192,7 +221,7 @@ maybe('xfer41 池合成探测快照投影（PGlite 真库）', () => {
       const pool = await getReadingSources(new AbortController().signal);
       // 无探测态 ⇒ 无 failed 可剔除、无 reachable 可前置 ⇒ 全部候选按 source_url localeCompare 升序（builtin 恒在前）。
       expect(pool.map((source) => source.url)).toEqual([
-        'https://book15.net/', 'https://a.example/', 'https://b.example/path', 'https://c.example/x',
+        'https://builtin.test/', 'https://a.example/', 'https://b.example/path', 'https://c.example/x',
         'https://d.example/', 'https://e.example/',
       ]);
     }
