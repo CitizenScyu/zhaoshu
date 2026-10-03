@@ -59,12 +59,13 @@ vi.mock('@/lib/supported-sources', async (importOriginal) => {
 });
 
 import {
-  disableShuyuanSource, enableShuyuanSource, getEngineSources, getFanoutPool, getReadingPool, getShuyuanCounts,
+  disableShuyuanSource, enableShuyuanSource, getBuiltinRequestSource, getEngineSources, getFanoutPool, getReadingPool, getShuyuanCounts,
   getShuyuanPoolHealth, getShuyuanStats, getReadingSources, getSourcePools, refreshShuyuan,
   REFRESH_BUDGET_MS, PROBE_PENDING_PER_REFRESH, RESPONSE_TIMEOUT_MS, SHUYUAN_REFRESH_PARTIAL, ShuyuanRefreshPartialError,
   ADMISSION_LEASE_ROW,
 } from './shuyuan';
 import { resolveDownloadSource } from './download-source';
+import { assembleEngineModules, createResolveSource } from '../../runtime-download/engine';
 import { sourceRevision } from './source-revision';
 import { ADMISSION_MIN_BUDGET_MS, rulesHash } from './rule-engine/admission';
 import { refreshSupportedHosts, validateSourceUrl, SourcePolicyError } from './source-policy';
@@ -1113,13 +1114,71 @@ describe('refreshShuyuan atomic refresh', () => {
       expect(fetchMock).not.toHaveBeenCalled();
     });
 
-    it('T6 builtin download needs no engine DB; missing admission never grants download', async () => {
-      // 已注册活跃内建源的 host：builtin 下载腿不需要引擎库（0 次查询）。
+    it('T6 builtin download requires a registered row but no engine admission query', async () => {
+      vi.stubEnv('SHUYUAN_READ_CACHE_TTL_MS', '0');
+      execute.mockResolvedValueOnce([{ collections: [] }]).mockResolvedValueOnce(builtinRegisteredRow);
       expect(await resolveDownloadSource('https://builtin.test/book/1')).toMatchObject({kind: 'builtin'});
-      expect(execute).not.toHaveBeenCalled();
+      expect(execute).toHaveBeenCalledTimes(2);
+      expect(execute.mock.calls.some(([query]) => query.text.includes('source_admission'))).toBe(false);
       execute.mockResolvedValueOnce([]);
       await expect(resolveDownloadSource('https://engine.example/book/1')).rejects.toThrow(SourcePolicyError);
     });
+
+    it.each(['missing', 'disabled', 'rule-disabled', 'failed', 'pool-error', 'active'] as const)(
+      '641 builtin registration gate and both real TS entrypoints: %s', async (state) => {
+        vi.stubEnv('SHUYUAN_READ_CACHE_TTL_MS', '0');
+        refreshSupportedHosts([]);
+        const registered = { ...builtinRegisteredRow[0], source: { ...knownSource, enabled: state !== 'rule-disabled' },
+          disabled_at: state === 'disabled' ? oldDisabledAt : null };
+        execute.mockImplementation(async (query) => {
+          if (state === 'pool-error') throw new Error('synthetic pool unavailable');
+          if (query.text.includes('FROM shuyuan_meta')) return [{ collections: [{ id: 1, title: 'synthetic', count: 1,
+            probeSnapshot: { version: 1, entries: [{ url: knownSource.bookSourceUrl,
+              status: state === 'failed' ? 'failed' : 'reachable', checked_at: '2026-09-20T00:00:00Z' }] } }] }];
+          if (query.text.includes('FROM shuyuan_sources')) return state === 'missing' ? [] : [registered];
+          throw new Error('Unexpected registration query');
+        });
+        const signal = new AbortController().signal;
+        const actual = await getBuiltinRequestSource('builtin.test', signal);
+        const web = () => resolveDownloadSource('https://builtin.test/book/1');
+        const runtime = () => createResolveSource(assembleEngineModules())(null, 'https://builtin.test/book/1', signal);
+        if (state === 'active') {
+          expect(actual).toMatchObject({ url: 'https://builtin.test/', tier: 'builtin' });
+          expect(actual?.rules).toBe(registered.source);
+          await expect(web()).resolves.toMatchObject({ kind: 'builtin' });
+          await expect(runtime()).resolves.toMatchObject({ builtin: true, source: actual });
+        } else {
+          expect(actual).toBeNull();
+          await expect(web()).rejects.toThrow(SourcePolicyError);
+          await expect(runtime()).rejects.toMatchObject({ code: 2, reason: 'builtin_source_unavailable' });
+        }
+        expect(fetchMock).not.toHaveBeenCalled();
+      },
+    );
+
+    it.each(['builtin.test', 'www.builtin.test', 'builtin.test.', 'www.builtin.test.'])(
+      '641 aliases select the actual registered source, never registry slot zero: %s', async (host) => {
+        vi.stubEnv('SHUYUAN_READ_CACHE_TTL_MS', '0');
+        refreshSupportedHosts(['www.builtin.test']);
+        execute.mockImplementation(async (query) => {
+          if (query.text.includes('FROM shuyuan_meta')) return [{ collections: [] }];
+          if (query.text.includes('FROM shuyuan_sources')) return builtinRegisteredRow;
+          throw new Error('Unexpected registration query');
+        });
+        const signal = new AbortController().signal;
+        const result = await getBuiltinRequestSource(host, signal);
+        expect(result).toMatchObject({ url: 'https://builtin.test/', name: 'builtin.test' });
+        const runtime = await createResolveSource(assembleEngineModules())(null, `https://${host}/book/1`, signal);
+        expect(runtime.source).toEqual(result);
+        expect(runtime.source.url).not.toContain('book15');
+        await expect(resolveDownloadSource(`https://${host}/book/1`)).resolves.toMatchObject({
+          kind: 'builtin', url: `https://${host.replace(/\.$/, '')}/book/1`,
+        });
+        expect(await getBuiltinRequestSource('unregistered.example', signal)).toBeNull();
+        expect(await getBuiltinRequestSource('book15.net', signal)).toBeNull();
+        expect(fetchMock).not.toHaveBeenCalled();
+      },
+    );
 
     it('/api/stats 的 readingPoolSize 在默认开关下为 1', async () => {
       const refreshedAt = '2026-09-19T00:00:00Z';

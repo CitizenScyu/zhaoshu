@@ -41,6 +41,18 @@ vi.mock('../src/lib/supported-sources', async (importOriginal) => {
   };
 });
 
+// 641：本组只测已获注册许可之后的传输失败；许可拒绝由 shuyuan.test.ts 的真实查询覆盖。
+vi.mock('../src/lib/shuyuan', async (importOriginal) => ({
+  ...await importOriginal<typeof import('../src/lib/shuyuan')>(),
+  getBuiltinRequestSource: async (host: string, signal: AbortSignal) => {
+    signal.throwIfAborted();
+    return ['book15.net', 'www.book15.net'].includes(host.replace(/\.$/, ''))
+      ? { url: 'https://book15.net/', name: 'synthetic registered builtin',
+          searchUrl: 'https://book15.net/books/search.html?kw={{key}}', rules: {}, tier: 'builtin' as const }
+      : null;
+  },
+}));
+
 const PGliteCtor = await loadPGlite();
 const maybe = PGliteCtor ? describe : describe.skip;
 

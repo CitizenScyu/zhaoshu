@@ -499,6 +499,24 @@ async function builtinReadingSources(
     });
 }
 
+/** 请求许可：静态活跃只负责识别，必须再命中当前合格注册记录；不补造默认源。 */
+export async function getBuiltinRequestSource(host: string, signal: AbortSignal): Promise<ReadingSource | null> {
+  signal.throwIfAborted();
+  const entry = builtinSourceForHost(host);
+  if (!entry || !isActiveBuiltinHost(host)) return null;
+  try {
+    const s = getSql();
+    syncReadCacheWithGate();
+    const { states } = readMeta((await poolProbeMeta(s, signal)).collections);
+    const sources = await builtinReadingSources(s, states, signal);
+    signal.throwIfAborted();
+    return sources.find((source) => builtinSourceForHost(hostOfUrl(source.url))?.url === entry.url) ?? null;
+  } catch {
+    signal.throwIfAborted();
+    return null;
+  }
+}
+
 /** builtin 候选行（注册表内建 URL 前缀，不再硬编码 ILIKE 字面量）；池合成与产物生成共用同一查询。 */
 function readBuiltinRows(s: Sql, signal?: AbortSignal): Promise<PoolArtifactSourceRow[]> {
   const patterns = builtinUrlPrefixes().map((prefix) => `${prefix}%`);

@@ -44,6 +44,18 @@ vi.mock('../src/lib/supported-sources', async (importOriginal) => {
   };
 });
 
+// 641：回退夹具显式提供合成注册许可；静态 active 本身不再授权下载。
+vi.mock('../src/lib/shuyuan', async (importOriginal) => ({
+  ...await importOriginal<typeof import('../src/lib/shuyuan')>(),
+  getBuiltinRequestSource: async (host: string, signal: AbortSignal) => {
+    signal.throwIfAborted();
+    return ['book15.net', 'www.book15.net'].includes(host.replace(/\.$/, ''))
+      ? { url: 'https://book15.net/', name: 'synthetic registered builtin',
+          searchUrl: 'https://book15.net/books/search.html?kw={{key}}', rules: {}, tier: 'builtin' as const }
+      : null;
+  },
+}));
+
 const PGliteCtor = await loadPGlite();
 const maybe = PGliteCtor ? describe : describe.skip;
 

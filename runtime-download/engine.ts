@@ -59,19 +59,6 @@ const hostOf = (url: string): string => {
   try { return new URL(url).hostname; } catch { return ''; }
 };
 
-/** builtin 条目（ReadingSource 形态；rules 空 ⇒ downloadBook 走 source-parser 分支）。
- *  直构 builtin 对象前过 isActiveBuiltinHost——BUILTIN_SOURCES[0] 只是「识别用」档条目，
- *  host 退休时返回 null，调用方不得再走 builtin 腿（真实取文出口生效，非池层过滤）。 */
-function builtinSource(m: EngineModules): ReadingSourceLike | null {
-  const b = m.supported.BUILTIN_SOURCES[0];
-  if (!m.supported.isActiveBuiltinHost(hostOf(b.url))) return null;
-  return { url: b.url, name: b.name, searchUrl: b.searchUrl, rules: {}, tier: 'builtin' };
-}
-
-// 识别 ≠ 许可：retired host 不从 resolveSource 直通 builtin 腿，落引擎池反查；
-// 找不到 ⇒ no_engine_source_for_host（code=1 有限失败），不复活退休源。
-const isBuiltinHost = (m: EngineModules, host: string) => m.supported.isActiveBuiltinHost(host);
-
 // 退休 host 在池反查**之前**收口：退休是静态事实，不依赖引擎池/DB 是否可用——
 // 池不可用、池里恰好有同站行，都不能让 resolveSource 对退休 host 给出可下载的源。
 const isRetiredBuiltin = (m: EngineModules, host: string) => m.supported.isRetiredBuiltinHost(host);
@@ -99,13 +86,21 @@ export function createResolveSource(m: EngineModules) {
     if (!/^https:\/\//i.test(url)) throw new ResolveSourceError(2, 'source_url_must_be_https');
     const host = hostOf(url);
     if (!host) throw new ResolveSourceError(2, 'source_url_host_unparseable');
-    // isBuiltinHost 已是活跃判定：retired host 即便在识别集合里也返回 false，不直通 builtin 腿。
-    // builtinSource 只在活跃时非 null（isBuiltinHost 与 builtinSource 同判据）。
-    if (isBuiltinHost(m, host)) return { source: builtinSource(m)!, builtin: true };
     // 退休 host（识别集合内、无活跃内建源）：**永久书源不可达**（code=2，稳定原因码可观测）。
     // 与池反查的 code=1 miss 区分：退休是静态事实，池不可用/池里同站行都不改变这个结论，
     // 下载腿按 source_unavailable 退避（可重试、零发布），永不向退休 host 发请求。
     if (isRetiredBuiltin(m, host)) throw new ResolveSourceError(2, RETIRED_BUILTIN_REASON);
+    if (m.supported.builtinSourceForHost(host)) {
+      let source: shuyuan.ReadingSource | null;
+      try {
+        source = await m.shuyuan.getBuiltinRequestSource(host, signal);
+      } catch {
+        signal.throwIfAborted();
+        throw new ResolveSourceError(2, 'builtin_source_unavailable');
+      }
+      if (!source) throw new ResolveSourceError(2, 'builtin_source_unavailable');
+      return { source: source as ReadingSourceLike, builtin: true };
+    }
     let pool: ReadingSourceLike[];
     try {
       pool = await loadEnginePool(m, signal);
