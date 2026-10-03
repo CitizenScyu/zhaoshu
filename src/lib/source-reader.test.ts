@@ -991,7 +991,7 @@ describe('GET /api/read/source/[resource]', () => {
   });
 
   it('gives an actionable error code when no supported book is found', async () => {
-    // 618-stalesource：池空（ mocks.sources 返回空数组 = 全部源退休/无活跃源）不再走「整轮无匹配」的
+    // 池空（mocks.sources 返回空数组 = 全部源退休/无活跃源）不再走「整轮无匹配」的
     // 404 分支，而是空池有限出口 SOURCE_UNAVAILABLE 503（不造默认源）。404 语义用「池有源但无匹配」覆盖。
     mocks.sources.mockResolvedValue([]);
     const res = await request();

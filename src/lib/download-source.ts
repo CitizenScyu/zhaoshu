@@ -6,9 +6,9 @@ import { sourceRevision } from './source-revision';
 /**
  * Same admission, disabled/probe filtering and host matching as T4 engine-fetch.
  *
- * 618-stalesource：builtin host 识别（旧书 source_url 仍是 book15.net）与 builtin 请求许可分离——
- * host 属内建集合但已退休（isActiveBuiltinHost=false）时，不直接放行 builtin 下载腿，改走引擎源池
- * 反查（找不到同站引擎源 ⇒ 与「该来源暂不支持全书下载」同一有限失败，不复活退休源）。
+ * builtin host 识别与请求许可分离：host 属内建集合但已退休（isActiveBuiltinHost=false）时不
+ * 直接放行 builtin 下载腿，改走引擎源池反查（找不到同站引擎源 ⇒ 「该来源暂不支持全书下载」
+ * 有限失败，不复活退休源）。
  */
 export async function resolveDownloadSource(value: string) {
   // Syntax/security checks happen before the admission lookup; this does not grant source capability.

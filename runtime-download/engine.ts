@@ -57,16 +57,16 @@ const hostOf = (url: string): string => {
 };
 
 /** builtin 条目（ReadingSource 形态；rules 空 ⇒ downloadBook 走 source-parser 分支）。
- *  618-stalesource：直构 builtin 对象前过 isActiveBuiltinHost——BUILTIN_SOURCES[0] 只是「识别用」
- *  档条目，host 退休时返回 null，调用方不得再走 builtin 腿（真实取文出口生效，非池层过滤）。 */
+ *  直构 builtin 对象前过 isActiveBuiltinHost——BUILTIN_SOURCES[0] 只是「识别用」档条目，
+ *  host 退休时返回 null，调用方不得再走 builtin 腿（真实取文出口生效，非池层过滤）。 */
 function builtinSource(m: EngineModules): ReadingSourceLike | null {
   const b = m.supported.BUILTIN_SOURCES[0];
   if (!m.supported.isActiveBuiltinHost(hostOf(b.url))) return null;
   return { url: b.url, name: b.name, searchUrl: b.searchUrl, rules: {}, tier: 'builtin' };
 }
 
-// 618-stalesource：识别 ≠ 许可。retired host 不再从 resolveSource 直通 builtin 腿（不发 book15 请求），
-// 落引擎池反查；找不到 ⇒ no_engine_source_for_host（code=1 有限失败），不复活退休源。
+// 识别 ≠ 许可：retired host 不从 resolveSource 直通 builtin 腿，落引擎池反查；
+// 找不到 ⇒ no_engine_source_for_host（code=1 有限失败），不复活退休源。
 const isBuiltinHost = (m: EngineModules, host: string) => m.supported.isActiveBuiltinHost(host);
 
 /** 引擎源池：先刷新运行时 host 门，再读 getEngineSources（同 engine-fetch.mjs loadEnginePool）。 */
@@ -92,8 +92,8 @@ export function createResolveSource(m: EngineModules) {
     if (!/^https:\/\//i.test(url)) throw new ResolveSourceError(2, 'source_url_must_be_https');
     const host = hostOf(url);
     if (!host) throw new ResolveSourceError(2, 'source_url_host_unparseable');
-    // isBuiltinHost 已是活跃判定（618-stalesource）：retired host 即便在识别集合里也返回 false，
-    // 不直通 builtin 腿。builtinSource 只在活跃时非 null（isBuiltinHost 与 builtinSource 同判据）。
+    // isBuiltinHost 已是活跃判定：retired host 即便在识别集合里也返回 false，不直通 builtin 腿。
+    // builtinSource 只在活跃时非 null（isBuiltinHost 与 builtinSource 同判据）。
     if (isBuiltinHost(m, host)) return { source: builtinSource(m)!, builtin: true };
     let pool: ReadingSourceLike[];
     try {

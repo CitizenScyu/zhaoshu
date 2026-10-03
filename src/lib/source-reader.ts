@@ -764,7 +764,7 @@ export async function resolveSourceBook(
   const sources = orderByHostHealth(deprioritizeSource(
     options.sources ?? await getReadingSources(context.signal), options.preferAfterSourceUrl,
   ));
-  // 618-stalesource：池可为空（book15 退休且无活跃引擎源）。有限失败，不造默认源（任务书判据 2）。
+  // 池可为空（内建源全部退休且无活跃引擎源）。有限失败，不造默认源。
   // 错误码沿用 SOURCE_UNAVAILABLE（503，可稍后重试）：池空是「现在没有可发请求的源」，
   // 不是「这本书不存在」；观测一行只带池大小，不带书名。
   if (!sources.length) {

@@ -987,7 +987,7 @@ describe('refreshShuyuan atomic refresh', () => {
 
   it('合集没有该 host 记录时不补造注册表默认源：空段是合法结论（不隐式启用）', async () => {
     execute.mockResolvedValueOnce([{ collections: [] }]).mockResolvedValueOnce([]);
-    // 删除记录不构成隐式启用信号——活跃内建源必须经显式注册/启用行进池（主协调裁定语义）。
+    // 删除记录不构成隐式启用信号——活跃内建源必须经显式注册/启用行进池。
     expect(await getReadingSources(new AbortController().signal)).toEqual([]);
   });
 
