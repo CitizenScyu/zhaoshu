@@ -3617,6 +3617,20 @@ def split_queue(books: list[dict], done_urls: set[str],
 
 
 def main() -> int:
+    """main() 不泄漏全局传输门（624）：进程内重复调 main()（单测 harness）与 CLI 单次
+    调用行为一致——返回/退出时 SOURCE_POLICY 恢复为调用前状态。改前 _main() 里装配的
+    SourcePolicy（book15 静态 retired）会留在模块全局，discover 全量跑时先跑过 main() 的
+    套件把后续套件里直连 http_get 的重试语义测试拦成「源策略拦截: 停用」（3 errors，
+    单跑各套件全绿 = 顺序依赖泄漏）。CLI 路径进程随 main 返回即退出，恢复无行为差异。"""
+    global SOURCE_POLICY
+    prev_policy = SOURCE_POLICY
+    try:
+        return _main()
+    finally:
+        SOURCE_POLICY = prev_policy
+
+
+def _main() -> int:
     global SOURCE_POLICY
     ap = argparse.ArgumentParser()
     ap.add_argument('--limit', type=int, default=100)
