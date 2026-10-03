@@ -276,6 +276,9 @@ def run_controls() -> list[str]:
     with open(fx, encoding='utf-8') as f:
         assert f.readline().startswith('LLM_API_KEY')
     results.append('C9a-OK synthetic fixture .env readable inside tree')
+    # 相位归还：控制组结束后必须把计数桶切回主相——否则套件期的允许/违规
+    # 会记进 CONTROLS 桶，SUITE 增量检查被架空（自审发现，CE7）。
+    _bucket_name = PHASE
     return results
 
 
