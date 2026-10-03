@@ -1166,22 +1166,54 @@ describe('source budget primitives: child scopes and openPool (M2-1)', () => {
 // 冻结的十六进制值 = 抽取前的实现 sha1(JSON.stringify([url, searchUrl, rules])) 的输出；
 // 改回键排序序列化或改动 version 参与项都会让此用例红。
 describe('builtin 目录版本逐字节冻结（M1 任务 4 零回归）', () => {
+  // 历史身份输入独立保留；不得随外层传输夹具迁移 host 或重录冻结哈希。
+  const historicalSource = {
+    url: 'https://book15.net/', name: '测试书源', searchUrl: '/books/search.html?kw={{key}}', rules: {},
+  };
+  const historicalBook = { title: '测试书', author: '作者' };
+  const historicalSearchUrl = 'https://book15.net/books/search.html?kw=' + encodeURIComponent(historicalBook.title);
+  const historicalDetailUrl = 'https://book15.net/books/details42.html';
+  const historicalPages = new Map([
+    [historicalSearchUrl, '<a href="/books/details42.html">测试书</a>'],
+    [historicalDetailUrl, '<meta property="og:novel:book_name" content="测试书">'
+      + '<meta property="og:novel:author" content="作者">'
+      + '<dd><a href="/chapter/index42-1.html">第一章</a></dd>'
+      + '<dd><a href="/chapter/index42-2.html">第二章</a></dd>'],
+  ]);
+  beforeEach(() => {
+    mocks.sources.mockResolvedValue([historicalSource]);
+    hints = [];
+  });
+  function historicalContext() {
+    const ctx = new service.SourceRequestContext(new AbortController().signal);
+    // 仅替换本实例；外层 afterEach 的 restoreAllMocks 归还，不改 prototype/退休门。
+    vi.spyOn(ctx, 'page').mockImplementation(async (url) => {
+      const text = historicalPages.get(url);
+      if (text === undefined) throw new Error('Unexpected historical identity fixture URL');
+      return { url, text };
+    });
+    return ctx;
+  }
+
   it('sourceId/sourceRevision/version 与抽取前逐字节相同', async () => {
-    const catalog = await service.resolveSourceBook(book, context());
+    const catalog = await service.resolveSourceBook(historicalBook, historicalContext());
     expect(catalog.sourceId).toBe('82ace1838da7f52acaca856ee2a528257903268b');
     expect(catalog.sourceRevision).toBe('a7be1f84fd76b1a0e25618ee7acf3d92b0e37a16');
     expect(catalog.version).toBe('3abbe7d9a0116f562e7e61ecdf119363a8876d48');
+    expect(mocks.fetch).not.toHaveBeenCalled();
   });
 
   it('reader 的 sourceRevision 就是共享函数 sourceRevision(source)（同一实现）', async () => {
-    const catalog = await service.resolveSourceBook(book, context());
-    expect(catalog.sourceRevision).toBe(sourceRevision(source));
+    const catalog = await service.resolveSourceBook(historicalBook, historicalContext());
+    expect(catalog.sourceRevision).toBe(sourceRevision(historicalSource));
+    expect(mocks.fetch).not.toHaveBeenCalled();
   });
 
   it('rules 为空的源仍走 builtin 路径（分派判据不含 rules 内容）', async () => {
-    mocks.sources.mockResolvedValue([{ ...source, rules: {} }]);
-    const catalog = await service.resolveSourceBook(book, context());
-    expect(catalog.sourceRevision).toBe(sourceRevision({ ...source, rules: {} }));
+    mocks.sources.mockResolvedValue([{ ...historicalSource, rules: {} }]);
+    const catalog = await service.resolveSourceBook(historicalBook, historicalContext());
+    expect(catalog.sourceRevision).toBe(sourceRevision({ ...historicalSource, rules: {} }));
+    expect(mocks.fetch).not.toHaveBeenCalled();
   });
 });
 
