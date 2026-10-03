@@ -991,11 +991,22 @@ describe('GET /api/read/source/[resource]', () => {
   });
 
   it('gives an actionable error code when no supported book is found', async () => {
+    // 618-stalesource：池空（ mocks.sources 返回空数组 = 全部源退休/无活跃源）不再走「整轮无匹配」的
+    // 404 分支，而是空池有限出口 SOURCE_UNAVAILABLE 503（不造默认源）。404 语义用「池有源但无匹配」覆盖。
     mocks.sources.mockResolvedValue([]);
     const res = await request();
-    expect(res.status).toBe(404);
+    expect(res.status).toBe(503);
     expectPrivate(res);
-    expect(await res.json()).toMatchObject({ code: 'SOURCE_NOT_FOUND', error: expect.stringContaining('下载全书') });
+    expect(await res.json()).toMatchObject({ code: 'SOURCE_UNAVAILABLE' });
+    // 池有源但搜不到书 ⇒ 原有 404 语义保持（hadFailure=false：抓取成功只是无匹配）。
+    mocks.sources.mockResolvedValue([source]);
+    // 覆盖 beforeEach 里的命中 fixture：搜索页（书名/作者两键）都改成无锚点正文。
+    for (const key of [book.title, book.author]) {
+      pages.set('https://book15.net/books/search.html?kw=' + encodeURIComponent(key), { text: '无链接正文' });
+    }
+    const miss = await request();
+    expect(miss.status).toBe(404);
+    expect(await miss.json()).toMatchObject({ code: 'SOURCE_NOT_FOUND', error: expect.stringContaining('下载全书') });
   });
 
   it('asks to reload expired directories without fetching any source', async () => {
