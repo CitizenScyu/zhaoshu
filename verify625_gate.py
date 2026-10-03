@@ -5,10 +5,14 @@
    一律抛 NetworkGuardError（真实 TCP/UDP 连接出不了进程）。
 2) DNS 层：socket.getaddrinfo / gethostbyname / gethostbyname_ex / gethostbyaddr
    抛 NetworkGuardError（不做真实解析）。
-3) audit hook 层：sys.addaudithook 拦 urllib.request.urlopen（event
-   'urllib.Request'）、http.client 连接、socket.connect —— 双保险，
-   防业务模块在 import 期就自己 import socket 后拿了原始引用（我们覆盖在先，
-   但 audit hook 不依赖引用被替换）。
+3) audit hook 层：sys.addaudithook 拦 **C 级 socket.connect 事件**与
+   subprocess.Popen。socket.connect 审计事件只在真实内核连接时由 C 层触发，
+   不受任何 Python 属性替换影响——它是「真实连接必被拦」的最终保证，且不会
+   抢占测试套件自带的 socket 层离线守卫（后者先于 C 层抛出自己的违约异常）。
+   刻意不拦 'urllib.Request'：该层早于 socket 层，会把套件守卫的
+   OfflineViolation（BaseException，须穿透 http_get 的 except Exception）
+   替换成普通 Exception 而被重试兜底吞掉（首跑实测 1 例失败）；对真实出网
+   它本就冗余——出网必经 DNS/连接层。
 
 计数：BLOCKED（拦截到的出网尝试）与 PASSED（护栏明确放行的零出网操作，如
 loopback 上限内绑定时被拒绝也计入 BLOCKED）分开累计，只在进程内统计、退出前
@@ -111,9 +115,8 @@ _GATED_PY = os.path.abspath(__file__)
 
 
 def _audit(event, args):
-    if event == 'urllib.Request':
-        _block('NET', 'urllib.request.urlopen (audit)')
     if event == 'socket.connect':
+        # C 级连接事件：仅当 Python 层守卫已被（mock.patch）换掉时才会到达这里。
         _block('NET', 'socket.connect (audit)')
     if event == 'subprocess.Popen':
         # 白名单子进程：只允许「白名单解释器 -I -B 本门文件」形态。
@@ -151,12 +154,13 @@ def run_controls() -> list[str]:
         results.append('POS-FAIL getaddrinfo not blocked')
     except NetworkGuardError:
         results.append('POS-OK getaddrinfo blocked')
-    # 正控制 3：urlopen 必须被拒（audit hook 触发）。
+    # 正控制 3：未打桩的 urlopen 必须被拒——urlopen 内部走 getaddrinfo（DNS 层）
+    # 或 socket.connect（C 层审计），两层任一拦截；两类异常都算护栏生效。
     try:
         urllib.request.urlopen('http://guard-synthetic.invalid/x', timeout=0)
         results.append('POS-FAIL urlopen not blocked')
     except NetworkGuardError:
-        results.append('POS-OK urlopen blocked (audit)')
+        results.append('POS-OK urlopen blocked (guard)')
     except Exception as e:  # noqa: BLE001 —— 有异常但不是护栏类=护栏没拦住
         results.append(f'POS-FAIL urlopen raised other: {type(e).__name__}')
     # 负控制：无网本地操作不受影响。

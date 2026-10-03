@@ -6,7 +6,7 @@
 == controls ==
 POS-OK create_connection blocked
 POS-OK getaddrinfo blocked
-POS-OK urlopen blocked (audit)
+POS-OK urlopen blocked (guard)
 NEG-OK local op unaffected
 == guard stats ==
 ALLOWED_PROC=0
