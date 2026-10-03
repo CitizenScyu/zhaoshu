@@ -18,12 +18,24 @@ vi.mock('./shuyuan', () => ({
   },
 }));
 
+// 合成同站配对仅服务普通传输夹具；真实退休判定及 book15 识别原样保留。
+vi.mock('./source-policy', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./source-policy')>();
+  return {
+    ...actual,
+    alternateSourceHost: (host: string) => host === 'reader.test' ? 'www.reader.test'
+      : host === 'www.reader.test' ? 'reader.test' : actual.alternateSourceHost(host),
+  };
+});
+
 let service: typeof import('./source-reader');
 let GET: typeof import('@/app/api/read/source/[resource]/route').GET;
-const source = { url: 'https://book15.net/', name: '测试书源', searchUrl: '/books/search.html?kw={{key}}', rules: {} };
+const sourceOrigin = 'https://book15.net'; // 参数化准备；普通内联键迁好后才切换。
+const source = { url: `${sourceOrigin}/`, name: '测试书源', searchUrl: '/books/search.html?kw={{key}}', rules: {} };
 const book = { title: '测试书', author: '作者' };
-const pageUrl = (id = 42) => `https://book15.net/books/details${id}.html`;
-const chapterUrl = (id = 42, chapter = 1) => `https://book15.net/chapter/index${id}-${chapter}.html`;
+const pageUrl = (id = 42) => `${sourceOrigin}/books/details${id}.html`;
+const chapterUrl = (id = 42, chapter = 1) => `${sourceOrigin}/chapter/index${id}-${chapter}.html`;
+const searchPageUrl = (keyword: string) => `${sourceOrigin}/books/search.html?kw=` + encodeURIComponent(keyword);
 const detail = (id = 42, author = '作者', titles = ['第一章', '第二章']) =>
   `<meta property="og:novel:book_name" content="测试书"><meta property="og:novel:author" content="${author}">`
   + titles.map((title, i) => `<dd><a href="/chapter/index${id}-${i + 1}.html">${title}</a></dd>`).join('');
@@ -64,7 +76,7 @@ beforeEach(async () => {
   writes = [];
   catalogs.clear();
   pages.clear();
-  pages.set('https://book15.net/books/search.html?kw=' + encodeURIComponent(book.title), {
+  pages.set(searchPageUrl(book.title), {
     text: '<a href="/books/details42.html">测试书</a>',
   });
   pages.set(pageUrl(), { text: detail() });
