@@ -326,7 +326,7 @@ class MainHarness(unittest.TestCase):
         sent = []
 
         def fake_build(http_get, skip_titles=None, include_douban=True, pages=None,
-                       engine_cli=None, book15_breaker=None):
+                       engine_cli=None, book15_breaker=None, source_policy=None):
             return [dict(self.BOOK)]
 
         def fake_label(text, *a, **k):

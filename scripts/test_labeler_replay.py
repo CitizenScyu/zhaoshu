@@ -314,6 +314,13 @@ class TestMainDeferredLog(unittest.TestCase):
         import io
         d = self._setup_dir(cooldown_env)
         buf = io.StringIO()
+        # 617：book15 retired 后 rank 线走引擎重定位；本套件测被拒冷却的队列顺序，
+        # 与重定位无关——短路成原样返回候选。
+        reloc = mock.patch.object(
+            labeler, '_relocate_rank_books_to_engine',
+            side_effect=lambda books, cli, **kw: (list(books), {}))
+        reloc.start()
+        self.addCleanup(reloc.stop)
         with mock.patch.dict(os.environ, {'LABELER_DATA_DIR': str(d)}), \
                 mock.patch.object(labeler, 'fetch_rank_books',
                                   return_value=list(self.books)), \

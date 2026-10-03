@@ -267,10 +267,20 @@ class TestMainDryRun(unittest.TestCase):
             {'url': '/books/detailsE.html', 'title': '待处理戊'},
         ]
 
+    def _stub_relocation(self):
+        """617：book15 retired 后 rank 线走引擎重定位；本套件测的是 done/pinned 分流，
+        与重定位无关——短路成原样返回候选（无引擎环境下的等效桩）。"""
+        patcher = mock.patch.object(
+            labeler, '_relocate_rank_books_to_engine',
+            side_effect=lambda books, cli, **kw: (list(books), {}))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_dry_run_prints_pinned_skip_line(self):
         import contextlib
         import io
         buf = io.StringIO()
+        self._stub_relocation()
         with mock.patch.dict(os.environ, {'LABELER_DATA_DIR': str(self.data_dir)}), \
                 mock.patch.object(labeler, 'fetch_rank_books', return_value=list(self.books)), \
                 mock.patch.object(sys, 'argv', ['labeler.py', '--dry-run', '--no-db-model']), \
@@ -296,6 +306,7 @@ class TestMainDryRun(unittest.TestCase):
         import contextlib
         import io
         buf = io.StringIO()
+        self._stub_relocation()
         with mock.patch.dict(os.environ, {'LABELER_DATA_DIR': str(self.data_dir)}), \
                 mock.patch.object(labeler, 'fetch_rank_books', return_value=list(self.books)), \
                 mock.patch.object(labeler, 'REJECT_TERMINAL_THRESHOLD', 0), \

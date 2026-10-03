@@ -318,6 +318,17 @@ class TestFetchCategoryBooks(unittest.TestCase):
 
 
 class TestStubTimesLimit(unittest.TestCase):
+    def _stub_relocation(self):
+        """617：book15 retired 后 rank 线走引擎重定位；本套件测分类合并/残本路径，
+        与重定位无关——短路成原样返回候选（无引擎环境下的等效桩）。"""
+        from unittest import mock
+        patcher = mock.patch.object(
+            labeler, '_relocate_rank_books_to_engine',
+            side_effect=lambda books, cli, **kw: (list(books), {}))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+
     """P1 核心组合断言：残本 × --limit —— 残本不得永久占住 --limit 名额把正常书饿死。
 
     诊断（labeler.py 文件头 P1）：残本候选一旦记入 labels-stub.jsonl，下轮必须与
@@ -346,6 +357,7 @@ class TestStubTimesLimit(unittest.TestCase):
         import io
         buf = io.StringIO()
         from unittest import mock
+        self._stub_relocation()
         with mock.patch.dict(os.environ, {'LABELER_DATA_DIR': str(self.data_dir)}), \
                 mock.patch.object(labeler, 'fetch_rank_books', return_value=list(self.books)), \
                 mock.patch.object(sys, 'argv', ['labeler.py', '--dry-run', '--no-db-model',
@@ -500,6 +512,17 @@ class TestHttpGetRetry(unittest.TestCase):
 
 
 class TestRuntimeStubDetection(unittest.TestCase):
+    def _stub_relocation(self):
+        """617：book15 retired 后 rank 线走引擎重定位；本套件测分类合并/残本路径，
+        与重定位无关——短路成原样返回候选（无引擎环境下的等效桩）。"""
+        from unittest import mock
+        patcher = mock.patch.object(
+            labeler, '_relocate_rank_books_to_engine',
+            side_effect=lambda books, cli, **kw: (list(books), {}))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+
     """运行时残本检测（非 dry-run）：章节数不足的书被记入 labels-stub.jsonl，
     形成 P1 闭环（下轮据此跳过）。全离线：http_get 打桩、不触达 LLM。"""
 
@@ -528,6 +551,7 @@ class TestRuntimeStubDetection(unittest.TestCase):
         def boom(*a, **k):
             raise AssertionError('残本不应触达 label_book（应在章节数处短路）')
 
+        self._stub_relocation()
         with mock.patch.dict(os.environ, {'LABELER_DATA_DIR': str(self.data_dir)}), \
                 mock.patch.object(labeler, 'fetch_rank_books', return_value=list(self.books)), \
                 mock.patch.object(labeler, 'http_get', return_value=self.detail_html), \
@@ -545,6 +569,17 @@ class TestRuntimeStubDetection(unittest.TestCase):
 
 
 class TestMainCategoryWiring(unittest.TestCase):
+    def _stub_relocation(self):
+        """617：book15 retired 后 rank 线走引擎重定位；本套件测分类合并/残本路径，
+        与重定位无关——短路成原样返回候选（无引擎环境下的等效桩）。"""
+        from unittest import mock
+        patcher = mock.patch.object(
+            labeler, '_relocate_rank_books_to_engine',
+            side_effect=lambda books, cli, **kw: (list(books), {}))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+
     """main() 接线：rank + 分类两路合并去重、--categories 默认/none 关闭、参数转发。"""
 
     def setUp(self):
@@ -560,6 +595,7 @@ class TestMainCategoryWiring(unittest.TestCase):
         from unittest import mock
         buf = io.StringIO()
         cat_mock = mock.MagicMock(return_value=list(cat_books or []))
+        self._stub_relocation()
         with mock.patch.dict(os.environ, {'LABELER_DATA_DIR': str(self.data_dir)}), \
                 mock.patch.object(labeler, 'fetch_rank_books',
                                   return_value=list(rank_books)), \
