@@ -5,8 +5,8 @@ import { createDeadline, raceDeadline, type RequestDeadline } from '@/lib/deadli
 import { validateSourceUrl, refreshSupportedHosts, supportedHostList, supportedHostVersion, upgradeSourceTemplateUrl } from '@/lib/source-policy';
 import { engineSourceUsable } from '@/lib/source-usability';
 import {
-  BUILTIN_SOURCE_HOSTS, builtinFallbackSource, builtinUrlPrefixes,
-  isActiveBuiltinHost, type SupportedSourceTier,
+  BUILTIN_SOURCE_HOSTS, builtinUrlPrefixes,
+  activeBuiltinSource, builtinFallbackSource, isActiveBuiltinHost, type SupportedSourceTier,
 } from '@/lib/supported-sources';
 import {
   ADMISSION_MAX_REDIRECTS, ADMISSION_MIN_BUDGET_MS, ADMISSION_PHOENIX_OK_PREFIX, ADMISSION_PROBE_WORST_MS,
@@ -486,9 +486,16 @@ async function builtinReadingSources(
     (sig) => artifactOr((artifact) => artifact.builtin, () => readBuiltinRows(s, sig))))
     // 618：先过静态生命周期门——retired host 的行（含产物缓存里的旧行）在此一票出局。
     .filter((row) => isActiveBuiltinHost(hostOfUrl(row.source_url)) && canProbe(row.source_url));
-  // 无活跃 builtin：不再补回默认单源（退休源不复活）。空段是合法结论，引擎源照常并入。
-  if (!rows.length) return [];
-  const fallback = builtinFallbackSource();
+  if (!rows.length) {
+    // 合集没有任何活跃 builtin host 记录（618-stalesource）：
+    // - 有活跃 builtin ⇒ 既有「零 DB 记录也复用注册表档位（与 worker 同一适配器）」语义保留（T6 免 DB 路径）；
+    // - 无活跃 builtin（全部退休，618 现状）⇒ **空段**，不再补回默认单源——裸删行会复活的洞在此封死。
+    const active = activeBuiltinSource();
+    return active ? [{
+      url: active.url, name: active.name, searchUrl: active.searchUrl, rules: {}, tier: 'builtin' as const,
+    }] : [];
+  }
+  const fallback = activeBuiltinSource() ?? builtinFallbackSource();
   return rows.filter((row) => !row.disabled_at && isRecord(row.source) && row.source.enabled !== false && states.get(row.source_url)?.status !== 'failed')
     .sort((a, b) => probeRank(states, b.source_url) - probeRank(states, a.source_url)
       || a.source_url.localeCompare(b.source_url))
