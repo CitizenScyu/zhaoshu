@@ -28,6 +28,8 @@ from collections import defaultdict
 from math import ceil
 from pathlib import Path
 
+import labeler_source_policy
+
 # >>> AUTHTAG_TITLE_FOLD_BEGIN
 # 由 scripts/gen-zh-variant-t2s.py 生成，勿手改。
 # 数据来源与许可同书源线那张表：OpenCC（Apache-2.0，见 THIRD_PARTY_NOTICES.md）。
@@ -921,15 +923,23 @@ class Book15Breaker:
                   f'本轮剩余候选跳过 book15 搜索、直接走引擎兜底', flush=True)
 
 
-def search_book15(http_get, title: str, breaker: Book15Breaker | None = None) -> dict | None:
+def search_book15(http_get, title: str, breaker: Book15Breaker | None = None,
+                  source_policy=None) -> dict | None:
     """书名 → book15 详情页（带语义校验）。miss / 误匹配 / 全重试失败均返回 None。
 
     http_get 需接受 book15 站内相对路径（与 labeler 抓正文同一约定，
     便于测试注入与将来换 BASE）。
-    breaker（可选）：已熔断 ⇒ 不发请求直接 None；拿到页面/全重试失败分别记成功/失败。"""
+    breaker（可选）：已熔断 ⇒ 不发请求直接 None；拿到页面/全重试失败分别记成功/失败。
+    source_policy（617，可选）：统一源策略。book15 停用（或冷却中）⇒ **零请求**直接 None
+    （= 一次 miss，调用方自然走引擎兜底）；全重试失败记一次临时失败；拿到页面（含正常
+    miss）记 success 清计数。None 时行为与改前逐字一致（旧调用形态红线）。"""
     if breaker is not None and breaker.open:
         breaker.skipped += 1
         return None
+    if source_policy is not None:
+        blocked, _why = source_policy.blocked(labeler_source_policy.BOOK15_HOST)
+        if blocked:
+            return None
     last_err = None
     for attempt in range(SEARCH_RETRY):
         try:
@@ -940,6 +950,8 @@ def search_book15(http_get, title: str, breaker: Book15Breaker | None = None) ->
             continue
         if breaker is not None:
             breaker.record(False)
+        if source_policy is not None:
+            source_policy.record_success(labeler_source_policy.BOOK15_HOST)
         for url, site_title in results:
             if title_compatible(title, site_title):
                 return {'url': url, 'title': site_title}
@@ -947,6 +959,8 @@ def search_book15(http_get, title: str, breaker: Book15Breaker | None = None) ->
     print(f'  book15搜索[{title}] {SEARCH_RETRY} 次全失败: {last_err}', file=sys.stderr)
     if breaker is not None:
         breaker.record(True)
+    if source_policy is not None:
+        source_policy.record_failure(labeler_source_policy.BOOK15_HOST, 'search_all_failed')
     return None
 
 
@@ -2102,22 +2116,26 @@ def validate_engine(cli) -> None:
 
 def build_douban_queue(http_get, skip_titles: set | None = None,
                        pages: int | None = None, engine_cli=None,
-                       book15_breaker: Book15Breaker | None = None) -> list[dict]:
+                       book15_breaker: Book15Breaker | None = None,
+                       source_policy=None) -> list[dict]:
     """豆瓣名单 → book15 打标队列 [{url, title, author, category, status, douban_url}]。
 
     与 labeler.fetch_rank_books() 的产出同构（url 为站内相对路径），
     打标循环零改动直接消费。搜不到 / 误匹配的书记日志跳过，不阻塞队列。
-    skip_titles（归一化书名集合）= 已打标书名，搜索前直接跳过（审查 D.3）。"""
+    skip_titles（归一化书名集合）= 已打标书名，搜索前直接跳过（审查 D.3）。
+    source_policy（617）：透传 _resolve_candidates（book15 停用 ⇒ 零请求直落引擎）。"""
     douban_books = fetch_douban_books(http_get, pages=pages)
     print(f'豆瓣名单共 {len(douban_books)} 本（去重后）')
     return _resolve_candidates(douban_books, http_get, origin='豆瓣tag',
                                skip_titles=skip_titles, engine_cli=engine_cli,
-                               book15_breaker=book15_breaker)
+                               book15_breaker=book15_breaker,
+                               source_policy=source_policy)
 
 
 def _resolve_candidates(candidates: list[dict], http_get, origin: str = '',
                         skip_titles: set | None = None, engine_cli=None,
-                        book15_breaker: Book15Breaker | None = None) -> list[dict]:
+                        book15_breaker: Book15Breaker | None = None,
+                        source_policy=None) -> list[dict]:
     """候选名单（[{title, author, ...}]）→ 过 book15 搜索+校验的打标队列。
 
     各名单源共用：命中记队列（category 记来源标记，默认取候选自带 origin，
@@ -2131,7 +2149,11 @@ def _resolve_candidates(candidates: list[dict], http_get, origin: str = '',
     退出码 2（环境错误）→ 本轮禁用引擎、降级 book15-only、不重试（不连坐后续候选）。
 
     book15_breaker（labelerdiag41）：book15 连续搜索全失败达阈值后，剩余候选不再搜 book15、
-    直接走引擎兜底；None 时行为不变。"""
+    直接走引擎兜底；None 时行为不变。
+
+    source_policy（617）：统一源策略。book15 停用/冷却中 ⇒ search_book15 零请求返回 None，
+    候选自然全部走引擎兜底（= 任务书「book15 不再作为候选前置搜索」；引擎未开时按 miss 汇总，
+    不回退 book15 直连）。None 时行为与改前一致。"""
     queue: list[dict] = []
     miss: list[str] = []
     skipped = 0
@@ -2171,7 +2193,8 @@ def _resolve_candidates(candidates: list[dict], http_get, origin: str = '',
         # espfix41：book15 已熔断 ⇒ 本本不会请求 book15，SEARCH_DELAY（对 book15 的礼貌间隔）不再睡；
         # 引擎 CLI 内部自带按请求节流，且每本新起进程本身就隔开了对同站的两次搜索。
         book15_skipped = book15_breaker is not None and book15_breaker.open
-        hit = search_book15(http_get, b['title'], breaker=book15_breaker)
+        hit = search_book15(http_get, b['title'], breaker=book15_breaker,
+                            source_policy=source_policy)
         if hit:
             entry = {'url': hit['url'], 'title': hit['title'],
                      'author': list_author,
@@ -2590,7 +2613,8 @@ def fetch_17k_quanben_books(http_get) -> list[dict]:
 def build_webnovel_queue(http_get, include_douban: bool = True,
                          skip_titles: set | None = None,
                          pages: int | None = None, engine_cli=None,
-                         book15_breaker: Book15Breaker | None = None) -> list[dict]:
+                         book15_breaker: Book15Breaker | None = None,
+                         source_policy=None) -> list[dict]:
     """网文站名单（主）+ 豆瓣 tag（补充）→ book15 打标队列。
 
     用户指令（2026-09-18）：网文站榜单是对口 book15 的一手来源，优先；
@@ -2622,4 +2646,5 @@ def build_webnovel_queue(http_get, include_douban: bool = True,
     if include_douban:
         add_batch(fetch_douban_books(http_get, pages=pages), '豆瓣网文tag')
     return _resolve_candidates(candidates, http_get, skip_titles=skip_titles,
-                               engine_cli=engine_cli, book15_breaker=book15_breaker)
+                               engine_cli=engine_cli, book15_breaker=book15_breaker,
+                               source_policy=source_policy)

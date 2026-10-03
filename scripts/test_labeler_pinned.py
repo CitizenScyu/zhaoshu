@@ -333,7 +333,7 @@ class TestWebnovelLimitCut(unittest.TestCase):
         buf = io.StringIO()
 
         def fake_build(http_get, skip_titles=None, include_douban=True, pages=None,
-                       engine_cli=None, book15_breaker=None):
+                       engine_cli=None, book15_breaker=None, source_policy=None):
             return list(self.books)
 
         with mock.patch.dict(os.environ, {'LABELER_DATA_DIR': str(self.data_dir)}), \

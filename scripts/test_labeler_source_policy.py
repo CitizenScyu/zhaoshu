@@ -2,16 +2,18 @@
 """统一源策略（labeler_source_policy.SourcePolicy）单测（617）。
 
 钉住的契约（任务书 §1–§3 / 主协调裁定）：
-  * book15 默认停用（builtin_disabled 装配后 is_disabled 恒真；HTTP 成功不复活）；
-    LABELER_BOOK15_ENABLED=1 恢复（resolve_book15_enabled 只认 '1'）。
-  * 停用与临时失败分开：blocked = 停用 ∪ 冷却；停用不自动恢复；冷却到期有限恢复。
+  * book15 静态 retired（RETIRED_HOSTS）：is_disabled 恒真；HTTP 成功、冷却到期、
+    env 旧开关（LABELER_BOOK15_ENABLED）、DB enabled 都不解除；resolve_book15_enabled
+    恒 False。恢复 = 改代码走一次明确的生命周期变更，本批无旁路。
+  * 停用与临时失败分开：blocked = 停用 ∪ 冷却；运维停用 enable()/删文件可恢复；
+    retired 不可。
   * 冷却跨轮复用 DeadHostMemory（dead_host_sink/dead_hosts_reader 注入）：新实例
     （= 新一轮进程）经 reader 仍拦截；TTL 过期自动放行；再失败再进冷却。
   * 正常 miss / 取消 / 预算结束不记 failure（record_success 清计数，miss 不封站）。
   * 状态文件：原子写、坏文件安全降级为空态不崩、条目上限、enable/disable 往返。
   * env 清单解析：合法 host 保留、垃圾项跳过、保序去重。
 
-全离线：不联网、不读 .env、临时目录、假时钟。
+全离线：不联网、不读 .env、临时目录、假时钟、子进程级白名单环境（见 _scrubbed_env）。
 复跑：PYTHONIOENCODING=utf-8 python -m unittest discover -s scripts -t scripts -p 'test_labeler_source_policy.py'
 """
 import contextlib
@@ -78,28 +80,23 @@ class TestDisabledVsCooldown(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
 
-    def test_book15_default_disabled_and_no_auto_revive(self):
+    def test_book15_retired_and_no_runtime_revive(self):
+        # 静态 retired：builtin 装配后恒停用，任何运行时信号都不解除
         pol, _ = make_policy(self.tmp.name, builtin=sp.BOOK15_HOSTS)
         for h in sp.BOOK15_HOSTS:
             self.assertTrue(pol.is_disabled(h))
         # 拿到成功响应也不复活（record_success 只清冷却）
         pol.record_success(sp.BOOK15_HOST)
         self.assertTrue(pol.is_disabled(sp.BOOK15_HOST))
-        # 冷却到期也不复活
+        # 冷却到期也不复活；旧开关 LABELER_BOOK15_ENABLED=1 也不复活（无旁路）
         pol2, _ = make_policy(self.tmp.name, builtin=sp.BOOK15_HOSTS)
         pol2.record_failure(sp.BOOK15_HOST, 'net', now=1.0)
         self.assertTrue(pol2.is_disabled(sp.BOOK15_HOST))
-
-    def test_book15_enabled_via_env_only(self):
-        with mock.patch.dict(os.environ, {}, clear=False):
-            os.environ.pop(sp.BOOK15_ENABLED_ENV, None)
+        with mock.patch.dict(os.environ, {'LABELER_BOOK15_ENABLED': '1'}, clear=False):
             self.assertFalse(sp.resolve_book15_enabled({}))
-            self.assertFalse(sp.resolve_book15_enabled({sp.BOOK15_ENABLED_ENV: '0'}))
-            self.assertFalse(sp.resolve_book15_enabled({sp.BOOK15_ENABLED_ENV: 'true'}))
-            self.assertTrue(sp.resolve_book15_enabled({sp.BOOK15_ENABLED_ENV: '1'}))
-            os.environ[sp.BOOK15_ENABLED_ENV] = '1'
-            self.assertTrue(sp.resolve_book15_enabled({}))
-            os.environ.pop(sp.BOOK15_ENABLED_ENV, None)
+        self.assertEqual(sp.RETIRED_HOSTS, frozenset(sp.BOOK15_HOSTS))
+        # enable() 也不能解除 retired
+        self.assertFalse(pol.enable(sp.BOOK15_HOST))
 
     def test_disable_and_enable_roundtrip(self):
         pol, _ = make_policy(self.tmp.name)
@@ -339,7 +336,7 @@ class TestCapAndOps(unittest.TestCase):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         pol_on, _ = make_policy(tmp.name, builtin=sp.BOOK15_HOSTS)
-        self.assertIn('book15 停用', pol_on.summary_line())
+        self.assertIn('book15 retired', pol_on.summary_line())
         pol_off, _ = make_policy(tmp.name)
         self.assertIn('book15 启用', pol_off.summary_line())
 
@@ -368,6 +365,82 @@ class TestCapAndOps(unittest.TestCase):
         pol3 = sp.SourcePolicy(base_dir=Path(tmp.name), cooldown_ttl=3600,
                                dead_hosts_reader=lambda: mem3.dead_hosts(now=10000.0))
         self.assertFalse(pol3.blocked('real.example')[0])
+
+
+class TestCounterexamples620(unittest.TestCase):
+    """620 静态审查的四个反例，逐一钉死（针对反例补测试，不把旧绿当覆盖）。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def test_env_disabled_not_persisted_by_disable_save(self):
+        """反例①：env 临时停用项不得混进文件持久集合——disable(other) 保存后，
+        新进程（无该 env）读不到 env 项；文件里也只有真正 disable() 过的那个。"""
+        pol, _ = make_policy(self.tmp.name, extra=('env-only.example',))
+        self.assertTrue(pol.is_disabled('env-only.example'))
+        pol.disable('ops.example', 'ops', now=1.0)          # 这次保存不得带走 env 项
+        raw = (Path(self.tmp.name) / sp.DISABLED_FILENAME).read_text(encoding='utf-8')
+        self.assertNotIn('env-only.example', raw)
+        pol2, _ = make_policy(self.tmp.name)                 # 新进程：无 env
+        self.assertFalse(pol2.is_disabled('env-only.example'))
+        self.assertTrue(pol2.is_disabled('ops.example'))
+        # env 项在原进程内仍然停用（它只随进程消失，不随别人保存落盘）
+        self.assertTrue(pol.is_disabled('env-only.example'))
+        # enable() 也不受理 env 项（无条目可移，返回 False 且不写文件）
+        self.assertFalse(pol.enable('env-only.example'))
+
+    def test_host_of_strips_trailing_dot(self):
+        """反例②：尾点 host 不得绕过停用判断（DNS 里 `book15.net.` = `book15.net`）。"""
+        self.assertEqual(sp.host_of('https://book15.net./books/x.html'), 'book15.net')
+        self.assertEqual(sp.host_of('https://BOOK15.NET./x'), 'book15.net')
+        pol, _ = make_policy(self.tmp.name, builtin=sp.BOOK15_HOSTS)
+        self.assertTrue(pol.blocked_url('https://book15.net./books/search.html?kw=x')[0])
+        self.assertTrue(pol.blocked_url('https://www.book15.net./chapter/index1-1.html')[0])
+        # 无 scheme 的串不放宽：解析不出 host → '' → 不拦（交调用方按普通错误处理）
+        self.assertEqual(sp.host_of('book15.net/books'), '')
+        self.assertFalse(pol.blocked_url('book15.net/books')[0])
+
+    def test_cooldown_remaining_is_real_seconds_or_unknown_marker(self):
+        """反例③：cooldown_remaining 必须报真实剩余秒；算不出就报 1（「在冷却，
+        剩余未知」），不得把 ttl 伪装成剩余。"""
+        clock = _FakeClock(100.0)
+        mem = MemDeadHosts(ttl_sec=1000, hosts={'down.example': 100.0}, now_fn=clock.now)
+        # ① 有 deadline 注入（DeadHostMemory.hosts 形态）→ 真实剩余
+        pol = sp.SourcePolicy(base_dir=self.tmp.name, cooldown_ttl=1000,
+                              dead_hosts_reader=mem.reader,
+                              dead_host_deadline=lambda: dict(mem.hosts),
+                              clock=clock.now)
+        self.assertEqual(pol.cooldown_remaining('down.example'), 1000)
+        clock.set(400.0)                                    # 过了 300s
+        self.assertEqual(pol.cooldown_remaining('down.example'), 700)
+        # ② 只有 reader（无 deadline）→ 只报 1，不伪装 ttl
+        pol2 = sp.SourcePolicy(base_dir=self.tmp.name, cooldown_ttl=1000,
+                               dead_hosts_reader=mem.reader, clock=clock.now)
+        clock.set(100.0)
+        self.assertEqual(pol2.cooldown_remaining('down.example'), 1)
+        # ③ 本轮判冷却（record_failure 达阈值）→ 剩余 = 判死时刻起完整 ttl，
+        # 假时钟推进后按推进量扣减
+        pol3, _ = make_policy(self.tmp.name, ttl=500, threshold=2, clock=clock.now,
+                              mem_now=clock.now)
+        pol3.record_failure('flaky.example', 'net', now=100.0)
+        pol3.record_failure('flaky.example', 'net', now=100.0)
+        self.assertEqual(pol3.cooldown_remaining('flaky.example'), 500)
+        clock.set(200.0)
+        self.assertEqual(pol3.cooldown_remaining('flaky.example'), 400)
+
+    def test_parse_disabled_hosts_env_is_sole_source_when_given(self):
+        """反例④：显式传 env（含空 dict / 空值）时以它为唯一来源，不回退 os.environ。"""
+        with mock.patch.dict(os.environ, {sp.DISABLED_HOSTS_ENV: 'real-env.example'}, clear=False):
+            # 显式空 dict / 值为空 → ()，绝不捡真进程环境
+            self.assertEqual(sp.parse_disabled_hosts({}), ())
+            self.assertEqual(sp.parse_disabled_hosts({sp.DISABLED_HOSTS_ENV: ''}), ())
+            self.assertEqual(sp.parse_disabled_hosts({sp.DISABLED_HOSTS_ENV: None}), ())
+            # 显式给的清单生效
+            self.assertEqual(sp.parse_disabled_hosts({sp.DISABLED_HOSTS_ENV: 'a.example'}),
+                             ('a.example',))
+            # env=None 才走进程环境（调地方没有环境字典的旧形态）
+            self.assertEqual(sp.parse_disabled_hosts(None), ('real-env.example',))
 
 
 class TestSourceBlockedError(unittest.TestCase):

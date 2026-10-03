@@ -426,7 +426,7 @@ class TestMainRejectsIdentityMismatch(unittest.TestCase):
         llm_called = []
 
         def fake_build(http_get, skip_titles=None, include_douban=True, pages=None,
-                       engine_cli=None, book15_breaker=None):
+                       engine_cli=None, book15_breaker=None, source_policy=None):
             return [book]
 
         out, err = io.StringIO(), io.StringIO()
@@ -465,7 +465,7 @@ class TestMainRejectsIdentityMismatch(unittest.TestCase):
                 'author': '天蚕土豆', 'engine': True}
 
         def fake_build(http_get, skip_titles=None, include_douban=True, pages=None,
-                       engine_cli=None, book15_breaker=None):
+                       engine_cli=None, book15_breaker=None, source_policy=None):
             return [book]
 
         out, err = io.StringIO(), io.StringIO()
@@ -532,7 +532,7 @@ class TestFailureClassification(unittest.TestCase):
             raise next(errors)
 
         def fake_build(http_get, skip_titles=None, include_douban=True, pages=None,
-                       engine_cli=None, book15_breaker=None):
+                       engine_cli=None, book15_breaker=None, source_policy=None):
             return list(books)
 
         out = io.StringIO()
@@ -565,7 +565,7 @@ class TestMainWiresBook15Breaker(unittest.TestCase):
         seen = []
 
         def fake_build(http_get, skip_titles=None, include_douban=True, pages=None,
-                       engine_cli=None, book15_breaker=None):
+                       engine_cli=None, book15_breaker=None, source_policy=None):
             seen.append(book15_breaker)
             return []
 
@@ -900,7 +900,7 @@ class TestMainSwitchesSourceAndRecordsIt(unittest.TestCase):
         labels = {'title_guess': '斗罗大陆III龙王传说', 'site_title_match': True, 'text_quality': '正常'}
 
         def fake_build(http_get, skip_titles=None, include_douban=True, pages=None,
-                       engine_cli=None, book15_breaker=None):
+                       engine_cli=None, book15_breaker=None, source_policy=None):
             return [dict(b) for b in books]
 
         out = io.StringIO()

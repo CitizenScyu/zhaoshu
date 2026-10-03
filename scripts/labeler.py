@@ -43,6 +43,7 @@ from pathlib import Path
 from typing import Callable, Iterable
 
 import douban_list
+import labeler_source_policy
 
 # ---- 配置 ----
 TARGET_CHARS = 500_000      # 每本抓取字数上限
@@ -268,21 +269,43 @@ def resolve_models(env: dict, use_db: bool = True) -> tuple[list[str], str]:
     return chain, 'environment'
 
 
+# 统一源策略（617）：全局传输门。None = 关闭（旧调用形态/单测默认/--book 调试，行为与
+# 改前一致）；main() 按 RETIRED_HOSTS 装配（book15 一族静态 retired，本批无运行时恢复
+# 入口）。http_get 的每次真实请求前问它一次——停用/冷却中的 host 零请求直接抛
+# SourceBlockedError（主循环按失败分类计数、不退避重试：策略拦截是确定性的）。
+SOURCE_POLICY: 'labeler_source_policy.SourcePolicy | None' = None
+
+
 def http_get(url: str, timeout: int = 30) -> str:
     """站点页面 GET（失败重试 HTTP_RETRY 次）。签名保持 (url, timeout) 不变，
     便于单测继续用 `labeler.http_get = lambda url, timeout=30: ...` 替换传输层。
 
     注意：章节抓取路径上还有 fetch_book_text 的 CHUNK_RETRY=3 外层重试，
     两处叠加时「持续失败的单章」最坏尝试 3×(1+HTTP_RETRY) 次——只影响失败页，
-    正常页面仍是 1 次请求。"""
+    正常页面仍是 1 次请求。
+
+    617：SOURCE_POLICY 装配后，停用/冷却中的 host 在**发请求前**抛 SourceBlockedError
+    （不打重试退避、不睡 HTTP_RETRY_DELAY——拦截是确定性的，重试结果不变）。"""
+    if SOURCE_POLICY is not None:
+        blocked, why = SOURCE_POLICY.blocked_url(url)
+        if blocked:
+            raise labeler_source_policy.SourceBlockedError(url, why)
     last_err = None
     for attempt in range(1 + HTTP_RETRY):
         try:
             req = urllib.request.Request(url, headers=UA)
             with urllib.request.urlopen(req, timeout=timeout) as res:
-                return res.read().decode('utf-8', 'replace')
+                text = res.read().decode('utf-8', 'replace')
+            if SOURCE_POLICY is not None:
+                SOURCE_POLICY.record_success(labeler_source_policy.host_of(url))
+            return text
+        except labeler_source_policy.SourceBlockedError:
+            raise
         except Exception as e:      # noqa: BLE001 —— 网络层异常一律重试，最后一次原样抛出
             last_err = e
+            if SOURCE_POLICY is not None and attempt == HTTP_RETRY:
+                # 最终失败才算一次临时失败（内层重试已耗尽）；成功/正常 miss 都不记。
+                SOURCE_POLICY.record_failure(labeler_source_policy.host_of(url), 'http_get_failed')
             if attempt < HTTP_RETRY:
                 print(f'  GET 失败，重试 {attempt + 1}/{HTTP_RETRY}: {url} ({e})',
                       file=sys.stderr)
@@ -3545,6 +3568,7 @@ def split_queue(books: list[dict], done_urls: set[str],
 
 
 def main() -> int:
+    global SOURCE_POLICY
     ap = argparse.ArgumentParser()
     ap.add_argument('--limit', type=int, default=100)
     ap.add_argument('--dry-run', action='store_true')
@@ -3631,6 +3655,15 @@ def main() -> int:
     if args.book:
         queue = [{'url': args.book, 'title': args.book}]
     else:
+        # 617：先把统一源策略装配好——后续（book15 搜索 / 榜单抓取 / 打标取文）所有
+        # book15 直连都先过这道门（停用 ⇒ 零请求）。装配提前到选书之前；打标阶段
+        # 再升级为带跨轮冷却载体的完整实例（见下方 SOURCE_POLICY 重装配）。
+        SOURCE_POLICY = labeler_source_policy.SourcePolicy(
+            base_dir=data_dir(),
+            builtin_disabled=labeler_source_policy.RETIRED_HOSTS,
+            extra_disabled=labeler_source_policy.parse_disabled_hosts(env),
+            cooldown_ttl=resolve_dead_host_ttl(env),
+        )
         if args.source in ('douban', 'webnovel'):
             # 名单选书：豆瓣网文 tag / 网文站榜单 → book15 站内搜索（含误匹配校验）。
             # 产出与 fetch_rank_books() 同构，后续打标循环零改动复用。
@@ -3643,6 +3676,8 @@ def main() -> int:
             # 豆瓣翻页默认 1 页；.env 里 LABELER_DOUBAN_PAGES=3 才开 3 页（审查 D.3）。
             pages = douban_list.resolve_douban_pages(env)
             # T5 引擎兜底：book15 miss 才回落引擎源池（开关默认关，配置缺失自动降级）。
+            # 617：book15 停用 ⇒ 每个候选都是零请求 miss，全量走引擎兜底；引擎不可用
+            # 时按 miss 汇总，**不回退 book15 直连**。
             engine_cli = _build_engine_cli(env)
             if engine_cli is not None:
                 print('  引擎兜底已启用：book15 miss 将回落引擎源池')
@@ -3651,11 +3686,13 @@ def main() -> int:
             book15_breaker = douban_list.Book15Breaker(douban_list.resolve_book15_breaker(env))
             all_books = (douban_list.build_douban_queue(
                              bridged, skip_titles=skip_titles, pages=pages,
-                             engine_cli=engine_cli, book15_breaker=book15_breaker)
+                             engine_cli=engine_cli, book15_breaker=book15_breaker,
+                             source_policy=SOURCE_POLICY)
                          if args.source == 'douban'
                          else douban_list.build_webnovel_queue(
                              bridged, skip_titles=skip_titles, pages=pages,
-                             engine_cli=engine_cli, book15_breaker=book15_breaker))
+                             engine_cli=engine_cli, book15_breaker=book15_breaker,
+                             source_policy=SOURCE_POLICY))
             print(f'{args.source} 线共 {len(all_books)} 本（搜索命中后）')
         else:
             print('拉取榜单书目...')
@@ -3732,6 +3769,24 @@ def main() -> int:
             source_giveups.dead.update(remembered)
             print(f'  死源跨轮记忆: {len(remembered)} 个 host 在 {dead_host_ttl // 3600}h 有效期内，'
                   f'本轮直接跳过（{", ".join(remembered)}）')
+
+    # 617：打标阶段把统一源策略升级为带跨轮冷却载体的完整形态（冷却复用上面同一个
+    # dead_host_memory = labels-dead-hosts.json，与引擎分支共享状态；停用态单独落
+    # labels-source-disabled.json，选书阶段已装配的停用清单经状态文件延续）。
+    # SOURCE_POLICY 为 None（--book 调试模式）时传输门关闭，行为与改前一致。
+    if not args.book:
+        SOURCE_POLICY = labeler_source_policy.SourcePolicy(
+            base_dir=data_dir(),
+            builtin_disabled=labeler_source_policy.RETIRED_HOSTS,
+            extra_disabled=labeler_source_policy.parse_disabled_hosts(env),
+            cooldown_ttl=dead_host_ttl,
+            dead_host_sink=(lambda host, now: (dead_host_memory.add(host, now=now),
+                                               dead_host_memory.save()))
+            if dead_host_memory is not None else None,
+            dead_hosts_reader=(lambda: dead_host_memory.dead_hosts(now=time.time()))
+            if dead_host_memory is not None else None,
+        )
+        print(SOURCE_POLICY.summary_line())
 
     def count_failure(kind: str) -> None:
         fail_kinds[kind] = fail_kinds.get(kind, 0) + 1

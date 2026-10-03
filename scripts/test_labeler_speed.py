@@ -293,7 +293,7 @@ class MainHarness(unittest.TestCase):
 
     def run_main(self, books, cli, argv=None):
         def fake_build(http_get, skip_titles=None, include_douban=True, pages=None,
-                       engine_cli=None, book15_breaker=None):
+                       engine_cli=None, book15_breaker=None, source_policy=None):
             return [dict(b) for b in books]
         labels = {'title_guess': '斗罗大陆III龙王传说', 'site_title_match': True,
                   'text_quality': '正常', 'confidence': 0.9}

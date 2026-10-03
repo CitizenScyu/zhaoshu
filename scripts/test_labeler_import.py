@@ -379,7 +379,15 @@ class TestOfflineGuardIsEffective(OfflineGuardMixin, unittest.TestCase):
         """变异钉（件2 验收）：http_get 不打桩 = 漏了一个出网调用。
 
         修好前这里会真实发包、超时 30s、最后只剩 `AssertionError: 2 != 0`；
-        有守卫后必须当场以「离线违约」失败，且点名 labeler.py:228 http_get。
+        有守卫后必须当场以「离线违约」失败，且点名 labeler.py 的 http_get。
+        617 变体：book15.net 已是静态 retired，SOURCE_POLICY 会在**网络层之前**
+        拦下详情页 GET——所以本用例不再用 book15 URL 触发桩缺失，改用**非停用 host**
+        的旧 URL（fetch_book_text 走引擎外路径时同样会 http_get(BASE+url)；这里直接
+        对 rank 线候选的详情页用解析不了的正则路径之外的方式触发）。守卫语义不变：
+        任何未打桩的真实出网必须当场「离线违约」，不许拖到超时。
+        另外 book15 停用路径本身有独立钉（本用例下方新增）：停用 host 的 GET 必须
+        在网络层之前被 SourceBlockedError 拦下，**根本不触发出网**——那不是漏桩，
+        是策略门在工作。
         """
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
@@ -387,10 +395,14 @@ class TestOfflineGuardIsEffective(OfflineGuardMixin, unittest.TestCase):
         (data / '.env').write_text(
             'LLM_API_KEY=test-key-not-real\n'
             'DATABASE_URL=postgresql://u:p@db.example/neondb\n', encoding='utf-8')
+        # 非停用 host 的候选：rank 线惰性元数据会对 BOOK15.absolute(url) 发详情页 GET。
+        # BOOK15.absolute 对绝对 URL 原样透传（T1 契约），借此把详情页 GET 引到
+        # 非 retired host——桩没打时这一步必然打到 socket 层，守卫当场拦。
+        probe_url = 'https://not-retired.example/books/detailsA.html'
         out, err = io.StringIO(), io.StringIO()
         with mock.patch.dict(os.environ, {'LABELER_DATA_DIR': str(data)}), \
                 mock.patch.object(labeler, 'fetch_rank_books',
-                                  return_value=[{'url': '/books/detailsA.html', 'title': '书甲'}]), \
+                                  return_value=[{'url': probe_url, 'title': '书甲'}]), \
                 mock.patch.object(labeler, 'fetch_book_text',
                                   return_value=('正文' * 30000, 60000)), \
                 mock.patch.object(labeler, 'label_book',
@@ -406,6 +418,35 @@ class TestOfflineGuardIsEffective(OfflineGuardMixin, unittest.TestCase):
         self.assertIn('http_get()', message)
         # urllib.request 走 socket.create_connection（TCP 层），不是等到超时
         self.assertIn('socket.', message)
+
+    def test_retired_host_is_blocked_before_network_not_offline_violation(self):
+        """617 变异钉：book15 retired 后，rank 线详情页 GET 必须在网络层**之前**被
+        SourceBlockedError 拦下——不触发出网（不是离线违约）、不重试退避、按失败分类
+        计数后继续。桩缺失守卫对它天然不适用：根本没有请求可打桩。"""
+        import labeler_source_policy
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        data = Path(tmp.name)
+        (data / '.env').write_text(
+            'LLM_API_KEY=test-key-not-real\n'
+            'DATABASE_URL=postgresql://u:p@db.example/neondb\n', encoding='utf-8')
+        # 不打 http_get 桩：让**真** http_get（内含策略门）跑。socket 层守卫仍在——
+        # 若门失效放行到网络，这里当场 OfflineViolation（本用例的红线信号）。
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.dict(os.environ, {'LABELER_DATA_DIR': str(data)}), \
+                mock.patch.object(labeler, 'fetch_rank_books',
+                                  return_value=[{'url': '/books/detailsA.html', 'title': '书甲'}]), \
+                mock.patch.object(labeler, 'fetch_book_text',
+                                  return_value=('正文' * 30000, 60000)), \
+                mock.patch.object(labeler, 'label_book',
+                                  return_value=(labels_for('书甲'), 1)), \
+                mock.patch.object(labeler, 'time', mock.Mock()), \
+                mock.patch.object(sys, 'argv', ['labeler.py', '--no-db-model']), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = labeler.main()
+        self.assertEqual(code, 2)                          # 整轮零成功（按失败计数）
+        self.assertIn('源策略拦截', err.getvalue())          # SourceBlockedError 被分类计数
+        self.assertIn('其他', out.getvalue())               # classify_failure 落「其他」
 
     def test_unlisted_url_in_stub_is_named_and_blocked(self):
         """桩覆盖不到的新 URL：点名该 URL（不用等发包超时）。"""
