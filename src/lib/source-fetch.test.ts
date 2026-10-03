@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { fetchSourceText, MAX_SOURCE_BYTES, SOURCE_CONNECT_TIMEOUT_MS, SOURCE_HOST_SWAP_DELAY_MS } from './source-fetch';
-import { refreshSupportedHosts, validateSourceUrl } from './source-policy';
+import { refreshSupportedHosts, SourcePolicyError, validateSourceUrl } from './source-policy';
 import { isRetiredBuiltinHost } from './supported-sources';
 
 // request640 起 source-fetch 有退休 builtin 请求许可门，真实注册表里 book15 lifecycle='retired'。
@@ -233,11 +233,19 @@ describe('退休 builtin 请求许可门（request640）', () => {
   });
 
   it('活跃合成目标正常放行（非 builtin 注册表 host 不受退休门影响）', async () => {
+    // 行为断言（85ba55f 阻断项修复的钉子）：活跃绝对 URL 必须到达 mock fetch，而非在
+    // 退休门里因参数形态错误抛 Invalid URL TypeError。
     refreshSupportedHosts(['e1.test']);
     const fetchMock = vi.fn().mockResolvedValue(new Response('正文'));
     vi.stubGlobal('fetch', fetchMock);
     expect(await fetchSourceText('https://e1.test/a', options())).toEqual({ url: 'https://e1.test/a', text: '正文' });
     expect(fetchMock).toHaveBeenCalledOnce();
+    expect(fetchMock.mock.calls[0][0]).toBe('https://e1.test/a'); // 真实物理发射了这一发
+  });
+
+  it.each(['https://book15.net/a', 'https://www.book15.net/a'])('退休变体 %s 拒为 SourcePolicyError 而非 TypeError', async (url) => {
+    vi.stubGlobal('fetch', vi.fn());
+    await expect(fetchSourceText(url, options())).rejects.toBeInstanceOf(SourcePolicyError);
   });
 
   it('活跃请求被 302 跳向退休 host：仅第一次 fetch 发出，第二次发射前被拒', async () => {
