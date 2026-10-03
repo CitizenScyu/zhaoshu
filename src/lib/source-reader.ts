@@ -764,6 +764,13 @@ export async function resolveSourceBook(
   const sources = orderByHostHealth(deprioritizeSource(
     options.sources ?? await getReadingSources(context.signal), options.preferAfterSourceUrl,
   ));
+  // 618-stalesource：池可为空（book15 退休且无活跃引擎源）。有限失败，不造默认源（任务书判据 2）。
+  // 错误码沿用 SOURCE_UNAVAILABLE（503，可稍后重试）：池空是「现在没有可发请求的源」，
+  // 不是「这本书不存在」；观测一行只带池大小，不带书名。
+  if (!sources.length) {
+    console.warn('[read-source] source_pool_empty', JSON.stringify({ event: 'source_pool_empty' }));
+    throw new SourceReaderError('书源暂时无法提供这本书，请稍后重试，也可返回书库尝试「下载全书」。', 'SOURCE_UNAVAILABLE', 503);
+  }
   // 池预算（设计 §3.1）：只有池里真的含引擎源时才抬高全局兜底上限。builtin-only 池保持
   // 今日预算语义逐点不变（零回归红线）；confirm 路径已在上面 return，不进入这里（§3.7）。
   if (sources.some((source) => !isBuiltinReadingSource(source))) context.openPool(sources.length);
