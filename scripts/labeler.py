@@ -3459,15 +3459,6 @@ def _read_rejection_rows(path: Path):
 IDENTITY_FIELD = 'identity'
 
 
-def _identity_of(book_or_rec) -> str:
-    """记录/条目 → 稳定身份键；无 identity 字段时回落 url（旧记录兼容口径）。"""
-    identity = book_or_rec.get(IDENTITY_FIELD) if isinstance(book_or_rec, dict) else ''
-    if isinstance(identity, str) and identity:
-        return identity
-    url = book_or_rec.get('url') or '' if isinstance(book_or_rec, dict) else ''
-    return url if isinstance(url, str) else ''
-
-
 def _identity_keys(book: dict, source: BookSource | None = None) -> set[str]:
     """队列条目 → 身份键集合（当前匹配用的全部键）。
 
