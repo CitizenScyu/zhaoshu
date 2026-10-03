@@ -3535,6 +3535,55 @@ def recent_rejection_urls(path: Path, cooldown_sec: int,
     return {url for url, ts in latest.items() if 0 <= now_ts - ts < cooldown_sec}
 
 
+def _relocate_rank_books_to_engine(rank_books: list[dict], engine_cli
+                                   ) -> tuple[list[dict], dict]:
+    """617 判据 1/4：book15 retired 后，rank/分类线候选改走引擎源池重定位。
+
+    rank/分类候选只带 {url(站内相对路径), title}，其中 url 在 book15 停用后**没有任何
+    安全用途**（详情页/章节/正文全在停用 host 上）——绝不沿旧 URL 发请求。处置分三类：
+      · title 非空（= 有可靠身份）→ search_engine(title)（与名单线同一函数、同一
+        N02 身份防线：title 兼容 + 作者校验 + 歧义护栏）。命中 → 条目改带引擎绝对 URL
+        与 engine 标记，后续打标循环自然走引擎取文分支；miss → 跳过（引擎源池也没有）。
+      · title 为空（身份不足，无从安全映射）→ 明确跳过 + 计数，不乱猜书。
+      · 引擎未开（engine_cli=None）/ 环境失败（EngineUnavailable）→ **不回退 book15**：
+        全量明确跳过 + 计数并打一行可行动提示（引擎侧环境问题应修引擎，不是绕回停用源）。
+    旧记录不删：done/pinned/stub 名单按 BOOK15.absolute(url) 比对（旧 URL 键继续有效，
+    重定位命中的条目是新 URL，自然不会重复标）。"""
+    relocated, skipped_no_identity, skipped_miss = [], [], []
+    engine_disabled = False
+    for b in rank_books:
+        title = (b.get('title') or '').strip()
+        if not title:
+            skipped_no_identity.append(b)
+            continue
+        if engine_cli is None or engine_disabled:
+            skipped_miss.append(b)
+            continue
+        try:
+            hit = douban_list.search_engine(engine_cli, title)
+        except douban_list.EngineUnavailable as e:
+            # 环境错误：一次就停，不逐本重试连坐（同名单线语义）。剩余全部按 miss 计。
+            print(f'  引擎不可用，剩余榜单候选全部跳过（book15 已停用，不回退直连）: {e}',
+                  file=sys.stderr)
+            engine_disabled = True
+            skipped_miss.append(b)
+            continue
+        if not hit:
+            skipped_miss.append(b)
+            continue
+        relocated.append({'url': hit['url'], 'title': hit['title'],
+                          'list_title': title,
+                          'author': b.get('author', ''),
+                          'category': b.get('category', ''),
+                          'status': '', 'engine': True,
+                          'source_host': hit['source']})
+    print(f'榜单重定位: 引擎命中 {len(relocated)} 本，跳过 {len(skipped_miss)} 本'
+          f'（引擎 miss/不可用），跳过身份不足 {len(skipped_no_identity)} 本（无书名，'
+          f'不乱猜、不沿旧 URL 请求）')
+    return relocated, {'relocated': len(relocated), 'skipped': len(skipped_miss),
+                       'skipped_no_identity': len(skipped_no_identity)}
+
+
 def split_queue(books: list[dict], done_urls: set[str],
                 pinned: set[str],
                 source: BookSource | None = None,
@@ -3715,6 +3764,19 @@ def main() -> int:
                 print(f'分类入口新增 {len(all_books) - len(rank_books)} 本候选'
                       f'（分类页去重后 {len(cat_books)} 本，'
                       f'与 rank 并集去重后 {len(all_books)} 本）')
+            # 617 判据 1/4：rank/分类线的候选 URL 是 book15 站内相对路径（绝对 URL 透传），
+            # book15 retired 后**没有可沿用的旧 URL 取文路径**——有可靠身份（非空 title）的
+            # 条目改走引擎源池重定位（search_engine 同款 title+author 校验 + N02 身份防线），
+            # 身份不足（无 title）或引擎不可用/未开时**明确跳过并计数**，绝不沿旧 URL 发请求。
+            # 引擎装配与名单线同一函数：未开/配置缺失 → engine_cli=None → 全量跳过计数
+            # （可行动：要恢复产能先修引擎侧，不是绕回停用源）。
+            if SOURCE_POLICY is not None and SOURCE_POLICY.is_disabled(
+                    labeler_source_policy.BOOK15_HOST):
+                engine_cli = _build_engine_cli(env)
+                all_books, _reloc_stats = _relocate_rank_books_to_engine(
+                    all_books, engine_cli)
+                engine_cli = (EngineStopUrls(engine_cli)
+                              if engine_cli is not None else None)
         # --limit 切在 split_queue **之后**（审查 F.1）：命中数一旦 > limit，切在前缀会
         # 让队尾（多半是豆瓣/17K 尾部 / 分类新书）永远进不了视野——每轮只处理前 limit 条，
         # 做完进 done_urls，之后每轮 queue=[] 却仍全量搜索。先剔除已完成/钉子户/残本再取上限，

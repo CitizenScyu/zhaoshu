@@ -204,6 +204,16 @@ class MainHarness(OfflineGuardMixin, unittest.TestCase):
             # 默认给「每个候选的详情页」各发一份合成 html（rank 线惰性元数据那一次 GET）
             pages = {labeler.BOOK15.absolute(b['url']): _detail_page() for b in self.books}
         served = self.stub_http(pages)
+        # 617：rank 线在 book15 retired 后会把候选交引擎重定位。本 harness 的 .env 无
+        # LABELER_ENGINE_FALLBACK → engine_cli=None → 重定位=全量跳过计数，惰性元数据/
+        # 取文路径不会走到，旧断言（book15 条目照旧打标/导入）就测不到了。默认把重定位
+        # 整段短路（原样返回候选）＝把选书层按「book15 条目可用」跑，保留全套旧契约；
+        # 重定位本身的行为由 TestRankRelocationWhenRetired 用假引擎单测钉。
+        reloc_patch = mock.patch.object(
+            labeler, '_relocate_rank_books_to_engine',
+            side_effect=lambda books, cli, **kw: (list(books), {}))
+        reloc_patch.start()
+        self.addCleanup(reloc_patch.stop)
         with mock.patch.dict(os.environ, {'LABELER_DATA_DIR': str(self.dir)}), \
                 mock.patch.object(labeler, 'fetch_rank_books', return_value=list(self.books)), \
                 mock.patch.object(labeler, 'fetch_book_text',
@@ -228,6 +238,14 @@ class MainHarness(OfflineGuardMixin, unittest.TestCase):
         if not path.exists():
             return []
         return [json.loads(line) for line in path.read_text(encoding='utf-8').splitlines() if line]
+
+    def stub_relocation_passthrough(self):
+        """617：把 rank 线引擎重定位短路成原样返回（测试无引擎环境时旧契约仍可测）。"""
+        patcher = mock.patch.object(
+            labeler, '_relocate_rank_books_to_engine',
+            side_effect=lambda books, cli, **kw: (list(books), {}))
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
 
 DATABASE_URL = 'postgresql://u:p@db.example/neondb'
@@ -398,8 +416,14 @@ class TestOfflineGuardIsEffective(OfflineGuardMixin, unittest.TestCase):
         # 非停用 host 的候选：rank 线惰性元数据会对 BOOK15.absolute(url) 发详情页 GET。
         # BOOK15.absolute 对绝对 URL 原样透传（T1 契约），借此把详情页 GET 引到
         # 非 retired host——桩没打时这一步必然打到 socket 层，守卫当场拦。
+        # 重定位须短路：这里的目的是「未打桩的真实出网必被守卫当场拦」，不是重定位行为。
         probe_url = 'https://not-retired.example/books/detailsA.html'
         out, err = io.StringIO(), io.StringIO()
+        reloc = mock.patch.object(
+            labeler, '_relocate_rank_books_to_engine',
+            side_effect=lambda books, cli, **kw: (list(books), {}))
+        reloc.start()
+        self.addCleanup(reloc.stop)
         with mock.patch.dict(os.environ, {'LABELER_DATA_DIR': str(data)}), \
                 mock.patch.object(labeler, 'fetch_rank_books',
                                   return_value=[{'url': probe_url, 'title': '书甲'}]), \
@@ -432,7 +456,14 @@ class TestOfflineGuardIsEffective(OfflineGuardMixin, unittest.TestCase):
             'DATABASE_URL=postgresql://u:p@db.example/neondb\n', encoding='utf-8')
         # 不打 http_get 桩：让**真** http_get（内含策略门）跑。socket 层守卫仍在——
         # 若门失效放行到网络，这里当场 OfflineViolation（本用例的红线信号）。
+        # 重定位短路成原样返回候选（本用例测传输门，不测选书层），详情页 GET 仍会发出
+        # 到 book15.net——策略门必须在网络层之前拦下它。
         out, err = io.StringIO(), io.StringIO()
+        reloc = mock.patch.object(
+            labeler, '_relocate_rank_books_to_engine',
+            side_effect=lambda books, cli, **kw: (list(books), {}))
+        reloc.start()
+        self.addCleanup(reloc.stop)
         with mock.patch.dict(os.environ, {'LABELER_DATA_DIR': str(data)}), \
                 mock.patch.object(labeler, 'fetch_rank_books',
                                   return_value=[{'url': '/books/detailsA.html', 'title': '书甲'}]), \
@@ -525,6 +556,7 @@ class TestWrittenTitleIsSiteTitle(MainHarness):
         self.books = [{'url': '/books/detailsA.html', 'title': '站点书名甲'}]
         self.write_env()
         out = io.StringIO()
+        self.stub_relocation_passthrough()
         with mock.patch.dict(os.environ, {'LABELER_DATA_DIR': str(self.dir)}), \
                 mock.patch.object(labeler, 'fetch_rank_books', return_value=list(self.books)), \
                 mock.patch.object(labeler, 'fetch_book_text',
@@ -591,6 +623,7 @@ class TestLabelMetadataFields(MainHarness):
             return dict(labels_for(site_title)), 1
 
         self.write_env()
+        self.stub_relocation_passthrough()
         with mock.patch.dict(os.environ, {'LABELER_DATA_DIR': str(self.dir)}), \
                 mock.patch.object(labeler, 'fetch_rank_books', return_value=list(self.books)), \
                 mock.patch.object(labeler, 'fetch_book_text',

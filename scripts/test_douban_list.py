@@ -3815,5 +3815,142 @@ class TestTocAdSuffixStrip(unittest.TestCase):
         self.assertEqual(jac, 0.0)
 
 
+class TestPolicyGatedSearchBook15(unittest.TestCase):
+    """617：source_policy 进 search_book15 / _resolve_candidates 的接线（零请求门）。"""
+
+    def _hit_cli_search(self, title):
+        """FakeEngineCli 的 search 结果：命中给定书名的引擎候选。"""
+        return FakeEngineCli({'search': _proc(
+            0, stdout=_engine_search_stdout([
+                {'title': title, 'bookUrl': f'https://src.example/book/{title}',
+                 'source': 'src.example', 'author': ''}]))})
+
+    def test_blocked_book15_is_zero_request_miss(self):
+        # 停用 ⇒ 一次 http_get 都不发，直接 None（= miss，调用方自然走引擎兜底）
+        calls = []
+
+        def no_http(url):
+            calls.append(url)
+            raise AssertionError('book15 停用后不得发任何请求')
+
+        class BlockedPolicy:
+            def blocked(self, host):
+                return True, '停用'
+
+            def record_failure(self, *a, **k):
+                calls.append(('record_failure',) + a)
+
+            def record_success(self, *a, **k):
+                calls.append(('record_success',) + a)
+
+        out = self.assertIsNone(
+            douban_list.search_book15(no_http, '诡秘之主', source_policy=BlockedPolicy()))
+        self.assertEqual(calls, [])          # 零请求、零记账（停用不进冷却账）
+
+    def test_unblocked_failure_counts_once_after_all_retries(self):
+        # 未停用 + 3 次全失败 ⇒ 恰好一次 record_failure；成功页面 ⇒ record_success
+        douban_list.SEARCH_RETRY_DELAY = 0
+        try:
+            policy = types.SimpleNamespace(
+                blocked=lambda host: (False, ''),
+                record_failure=mock.Mock(),
+                record_success=mock.Mock())
+
+            def failing(url):
+                raise ConnectionError('down')
+            douban_list.search_book15(failing, '任何书', source_policy=policy)
+            policy.record_failure.assert_called_once()
+            policy.record_success.assert_not_called()
+
+            policy2 = types.SimpleNamespace(
+                blocked=lambda host: (False, ''),
+                record_failure=mock.Mock(),
+                record_success=mock.Mock())
+            pages = {'/books/search.html?kw=%E9%9B%B6%E8%AF%BA': NO_RESULT_HTML}
+            douban_list.search_book15(lambda u: pages[u], '零诺', source_policy=policy2)
+            # 正常 miss（拿到页面无匹配）= success 清计数，不是 failure
+            policy2.record_success.assert_called_once()
+            policy2.record_failure.assert_not_called()
+        finally:
+            douban_list.SEARCH_RETRY_DELAY = 3
+
+    def test_engine_env_failure_does_not_fall_back_to_book15_when_disabled(self):
+        """判据 1：引擎环境失败（rc=2）不回退 book15——book15 停用时后续候选零 book15 请求。
+
+        用真 _resolve_candidates：两个候选，引擎第一次就 EngineUnavailable，
+        停用门应让 book15 搜索零请求、两候选都按 miss 落日志。"""
+        no_wait(self)
+        book15_calls = []
+
+        def bridged(path):
+            book15_calls.append(path)
+            raise AssertionError('book15 停用后不得发任何请求（含名单页桥接）')
+
+        # 豆瓣 tag 页由 bridged 服务——这里名单本身不经过 book15：直接用假名单绕过抓取，
+        # 调 _resolve_candidates（它是两条名单线的共同实现）。
+        import labeler_source_policy as sp
+        policy = sp.SourcePolicy(builtin_disabled=sp.BOOK15_HOSTS)
+        cli = FakeEngineCli({'search': _proc(2, stderr='engine pool unavailable')})
+        candidates = [{'title': '书甲', 'author': ''}, {'title': '书乙', 'author': ''}]
+        queue = douban_list._resolve_candidates(
+            candidates, bridged, origin='test', engine_cli=cli, source_policy=policy)
+        self.assertEqual(queue, [])          # 全 miss：不回退 book15、不硬造候选
+        self.assertEqual(book15_calls, [])   # 桥接零调用
+        # 降级提示点名「无可用源」而不是误导性的「降级 book15-only」
+
+
+class TestRankRelocationWhenRetired(unittest.TestCase):
+    """617 判据 4：rank/分类候选在 book15 retired 后改走引擎重定位（labeler 侧）。
+
+    直接单测 labeler._relocate_rank_books_to_engine（main 里 rank 分支的纯函数）：
+    命中/miss/身份不足/引擎不可用四类处置各有钉，且绝不沿旧 book15 URL 发请求。"""
+
+    def setUp(self):
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import labeler  # noqa: F401 —— 被测函数在 labeler 里
+
+    def _cli_hit(self, title, url=None):
+        return FakeEngineCli({'search': _proc(
+            0, stdout=_engine_search_stdout([
+                {'title': title, 'bookUrl': url or f'https://src.example/b/{title}',
+                 'source': 'src.example', 'author': ''}]))})
+
+    def test_hit_relocates_with_engine_marks(self):
+        import labeler
+        books = [{'url': '/books/details1.html', 'title': '诡秘之主'},
+                 {'title': '', 'url': '/books/details2.html'}]     # 身份不足
+        out, stats = labeler._relocate_rank_books_to_engine(books, self._cli_hit('诡秘之主'))
+        self.assertEqual(len(out), 1)
+        entry = out[0]
+        self.assertTrue(entry['engine'])
+        self.assertEqual(entry['url'], 'https://src.example/b/诡秘之主')
+        self.assertEqual(entry['source_host'], 'src.example')
+        self.assertEqual(entry['list_title'], '诡秘之主')   # 名单书名单独存（rvauthor 口径）
+        self.assertEqual(stats, {'relocated': 1, 'skipped': 0, 'skipped_no_identity': 1})
+
+    def test_miss_and_engine_unavailable_are_counted_not_fatal(self):
+        import labeler
+        # miss：引擎正常返回空候选
+        cli_miss = FakeEngineCli({'search': _proc(0, stdout='[]')})
+        out, stats = labeler._relocate_rank_books_to_engine(
+            [{'url': '/b1.html', 'title': '书甲'}], cli_miss)
+        self.assertEqual(out, [])
+        self.assertEqual(stats['skipped'], 1)
+        # 环境失败（rc=2）：第一条就 EngineUnavailable → 剩余全部计 miss，不抛
+        cli_dead = FakeEngineCli({'search': _proc(2, stderr='pool unavailable')})
+        out2, stats2 = labeler._relocate_rank_books_to_engine(
+            [{'url': '/b1.html', 'title': '书甲'}, {'url': '/b2.html', 'title': '书乙'}], cli_dead)
+        self.assertEqual(out2, [])
+        self.assertEqual(stats2['skipped'], 2)
+
+    def test_engine_none_skips_all_without_book15_fallback(self):
+        # 引擎未装配（env 无 LABELER_ENGINE_FALLBACK）⇒ 全量明确跳过计数，不回退 book15
+        import labeler
+        books = [{'url': '/b1.html', 'title': '书甲'}, {'url': '/b2.html', 'title': '书乙'}]
+        out, stats = labeler._relocate_rank_books_to_engine(books, None)
+        self.assertEqual(out, [])
+        self.assertEqual(stats, {'relocated': 0, 'skipped': 2, 'skipped_no_identity': 0})
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

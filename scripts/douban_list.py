@@ -2227,8 +2227,14 @@ def _resolve_candidates(candidates: list[dict], http_get, origin: str = '',
                 engine_hit = search_engine(engine_cli, b['title'], list_author,
                                            stats=engine_stats, junk=engine_junk)
             except EngineUnavailable as e:
-                # 环境错误：本轮降级 book15-only，后续候选不再尝试引擎（不连坐重试）
-                print(f'  引擎兜底不可用，本轮降级 book15-only（不重试）: {e}',
+                # 环境错误：本轮禁用引擎兜底，不重试（不连坐后续候选）。
+                # 617：book15 已静态 retired 时**没有**「降级 book15-only」可言——
+                # 它本身就是停用源；剩下的候选按 miss 汇总跳过（零请求），轮末计数可行动。
+                degraded_to = ('book15-only' if source_policy is None
+                               or not source_policy.is_disabled(
+                                   labeler_source_policy.BOOK15_HOST)
+                               else '零请求跳过（book15 已停用，无可用源）')
+                print(f'  引擎兜底不可用，本轮降级 {degraded_to}（不重试）: {e}',
                       file=sys.stderr)
                 engine_disabled = True
         if engine_hit:
