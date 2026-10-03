@@ -3926,7 +3926,10 @@ class TestRankRelocationWhenRetired(unittest.TestCase):
         self.assertEqual(entry['url'], 'https://src.example/b/诡秘之主')
         self.assertEqual(entry['source_host'], 'src.example')
         self.assertEqual(entry['list_title'], '诡秘之主')   # 名单书名单独存（rvauthor 口径）
-        self.assertEqual(stats, {'relocated': 1, 'skipped': 0, 'skipped_no_identity': 1})
+        # 628：重定位在改写 url 前把原 book15 路径存成稳定身份键（不随引擎换源漂移）
+        self.assertEqual(entry['identity'], labeler.BOOK15.absolute('/books/details1.html'))
+        self.assertEqual(stats, {'relocated': 1, 'skipped': 0, 'skipped_no_identity': 1,
+                                 'skipped_terminal': 0})
 
     def test_miss_and_engine_unavailable_are_counted_not_fatal(self):
         import labeler
@@ -3949,7 +3952,8 @@ class TestRankRelocationWhenRetired(unittest.TestCase):
         books = [{'url': '/b1.html', 'title': '书甲'}, {'url': '/b2.html', 'title': '书乙'}]
         out, stats = labeler._relocate_rank_books_to_engine(books, None)
         self.assertEqual(out, [])
-        self.assertEqual(stats, {'relocated': 0, 'skipped': 2, 'skipped_no_identity': 0})
+        self.assertEqual(stats, {'relocated': 0, 'skipped': 2, 'skipped_no_identity': 0,
+                                 'skipped_terminal': 0})
 
 
 if __name__ == '__main__':

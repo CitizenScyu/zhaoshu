@@ -3452,6 +3452,109 @@ def _read_rejection_rows(path: Path):
             yield url, reason if isinstance(reason, str) else '', rec
 
 
+# ---- 稳定记录身份（628）----
+# 身份与取文 URL 分离：引擎重定位/换源可以随时改写取文 URL，但「这是哪一条记录」不能跟着漂。
+# 身份键 = 记录里的 identity 字段（rank 线 = 原 book15 站内路径的绝对 URL）；旧记录没有该字段，
+# 回落 url 键（零迁移）。所有 done/stub/pinned/deferred 的读写都经这里，不各写一套。
+IDENTITY_FIELD = 'identity'
+
+
+def _identity_of(book_or_rec) -> str:
+    """记录/条目 → 稳定身份键；无 identity 字段时回落 url（旧记录兼容口径）。"""
+    identity = book_or_rec.get(IDENTITY_FIELD) if isinstance(book_or_rec, dict) else ''
+    if isinstance(identity, str) and identity:
+        return identity
+    url = book_or_rec.get('url') or '' if isinstance(book_or_rec, dict) else ''
+    return url if isinstance(url, str) else ''
+
+
+def _identity_keys(book: dict, source: BookSource | None = None) -> set[str]:
+    """队列条目 → 身份键集合（当前匹配用的全部键）。
+
+    带稳定身份的条目给 {identity, 当前取文 URL} 双键：identity 命中旧记录（done/stub/
+    pinned/deferred 按身份或旧 URL 记的都认得），取文 URL 命中按新 URL 写回的记录
+    （引擎成功记录 url 是实际取文来源）。不带 identity 的条目（普通 book15 路径）只给
+    {归一化 url}，与改前逐键一致——书名不参与：同名异书不同路径，裸书名合并是身份错配。"""
+    keys = set()
+    src = source or BOOK15
+    url = src.absolute(book.get('url') or '')
+    if url:
+        keys.add(url)
+    identity = book.get(IDENTITY_FIELD)
+    if isinstance(identity, str) and identity:
+        keys.add(identity)
+    return keys
+
+
+def _attach_identity(rec: dict, book: dict) -> dict:
+    """写回记录（labels.jsonl / labels-rejected.jsonl / labels-stub.jsonl）挂上稳定身份键。
+
+    只有条目显式带 identity 且与记录 url（实际取文来源）不同才写；普通 book15 条目
+    （无 identity）不写，旧行为不变。"""
+    identity = book.get(IDENTITY_FIELD) if isinstance(book, dict) else ''
+    if isinstance(identity, str) and identity and identity != rec.get('url'):
+        rec[IDENTITY_FIELD] = identity
+    return rec
+
+
+def _load_terminal_identities(path: Path) -> set[str]:
+    """labels.jsonl / labels-stub.jsonl → 身份键集合（identity 优先，回落 url）。"""
+    keys: set[str] = set()
+    if not path.exists():
+        return keys
+    for line in path.read_text(encoding='utf-8').splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(rec, dict):
+            continue
+        for field in (IDENTITY_FIELD, 'url'):
+            value = rec.get(field)
+            if isinstance(value, str) and value:
+                keys.add(value)
+    return keys
+
+
+def _rejection_identity_counts(path: Path) -> dict[str, int]:
+    """labels-rejected.jsonl → {身份键: 被拒次数}（identity 优先，回落 url；口径同 count_rejections
+    的豁免规则——本地预检行与无 ad_gate 的旧含广告行不计）。"""
+    counts: dict[str, int] = {}
+    for url, reason, rec in _read_rejection_rows(path):
+        if reason.startswith('本地预检:'):
+            continue
+        if reason == AD_REJECT_REASON and AD_GATE_FIELD not in rec:
+            continue
+        key = rec.get(IDENTITY_FIELD)
+        if not (isinstance(key, str) and key):
+            key = url
+        counts[key] = counts.get(key, 0) + 1
+    return counts
+
+
+def _recent_rejection_identities(path: Path, cooldown_sec: int,
+                                 now: float | None = None) -> set[str]:
+    """labels-rejected.jsonl → 冷却期内被拒过的身份键集合（recent_rejection_urls 的身份版）。"""
+    if cooldown_sec <= 0:
+        return set()
+    now_ts = time.time() if now is None else now
+    latest: dict[str, float] = {}
+    for url, _reason, rec in _read_rejection_rows(path):
+        parsed = _parse_iso_utc(rec.get(REJECTED_AT_FIELD))
+        if parsed is None:
+            continue
+        key = rec.get(IDENTITY_FIELD)
+        if not (isinstance(key, str) and key):
+            key = url
+        ts = parsed.timestamp()
+        if ts > latest.get(key, float('-inf')):
+            latest[key] = ts
+    return {key for key, ts in latest.items() if 0 <= now_ts - ts < cooldown_sec}
+
+
 def load_done_urls(path: Path) -> set[str]:
     """labels.jsonl → 已成功产出的详情页 url 集合（断点续传口径）。"""
     return set(_read_url_lines(path))
@@ -3535,7 +3638,8 @@ def recent_rejection_urls(path: Path, cooldown_sec: int,
     return {url for url, ts in latest.items() if 0 <= now_ts - ts < cooldown_sec}
 
 
-def _relocate_rank_books_to_engine(rank_books: list[dict], engine_cli
+def _relocate_rank_books_to_engine(rank_books: list[dict], engine_cli,
+                                   terminal_keys: set[str] | None = None
                                    ) -> tuple[list[dict], dict]:
     """617 判据 1/4：book15 retired 后，rank/分类线候选改走引擎源池重定位。
 
@@ -3547,14 +3651,28 @@ def _relocate_rank_books_to_engine(rank_books: list[dict], engine_cli
       · title 为空（身份不足，无从安全映射）→ 明确跳过 + 计数，不乱猜书。
       · 引擎未开（engine_cli=None）/ 环境失败（EngineUnavailable）→ **不回退 book15**：
         全量明确跳过 + 计数并打一行可行动提示（引擎侧环境问题应修引擎，不是绕回停用源）。
-    旧记录不删：done/pinned/stub 名单按 BOOK15.absolute(url) 比对（旧 URL 键继续有效，
-    重定位命中的条目是新 URL，自然不会重复标）。"""
-    relocated, skipped_no_identity, skipped_miss = [], [], []
+    628 身份与备选：
+      · 重定位**之前**把原 URL 的绝对形态存进条目 identity 键——它是不随引擎换源漂移的
+        稳定记录身份，done/stub/pinned/deferred 与成功/拒收写回都按它认账（改写 url 不丢历史）。
+      · hit 的 alternates 透传为 engine_alternates，与名单线同一换源机制
+        （fetch_engine_book_with_giveup / fetch_book_text_segmented）。
+      · terminal_keys（可选，= done ∪ stub ∪ pinned 身份键集合）：已终态的书**不发起引擎
+        搜索**（省一次全量空搜），但仍原样返回、交 split_queue 归类计数——计数不丢。
+        deferred 不在此滤（它只是后移不是终态）。"""
+    terminal_keys = terminal_keys or set()
+    relocated, skipped_no_identity, skipped_miss, skipped_terminal = [], [], [], []
     engine_disabled = False
     for b in rank_books:
+        identity = BOOK15.absolute(b.get('url') or '')
         title = (b.get('title') or '').strip()
         if not title:
             skipped_no_identity.append(b)
+            continue
+        if identity and identity in terminal_keys:
+            # 已终态（done/stub/pinned）：身份可判就不搜引擎；保留 identity 键原样返回，
+            # 交 split_queue 按身份归入跳过计数（不丢计数、不重打标）。
+            relocated.append({**b, IDENTITY_FIELD: identity})
+            skipped_terminal.append(b)
             continue
         if engine_cli is None or engine_disabled:
             skipped_miss.append(b)
@@ -3571,17 +3689,23 @@ def _relocate_rank_books_to_engine(rank_books: list[dict], engine_cli
         if not hit:
             skipped_miss.append(b)
             continue
-        relocated.append({'url': hit['url'], 'title': hit['title'],
-                          'list_title': title,
-                          'author': b.get('author', ''),
-                          'category': b.get('category', ''),
-                          'status': '', 'engine': True,
-                          'source_host': hit['source']})
-    print(f'榜单重定位: 引擎命中 {len(relocated)} 本，跳过 {len(skipped_miss)} 本'
+        entry = {'url': hit['url'], 'title': hit['title'],
+                 'list_title': title,
+                 'author': b.get('author', ''),
+                 'category': b.get('category', ''),
+                 'status': '', 'engine': True,
+                 'source_host': hit['source'],
+                 IDENTITY_FIELD: identity}
+        if hit.get('alternates'):
+            entry['engine_alternates'] = hit['alternates']
+        relocated.append(entry)
+    print(f'榜单重定位: 引擎命中 {len(relocated) - len(skipped_terminal)} 本，跳过 {len(skipped_miss)} 本'
           f'（引擎 miss/不可用），跳过身份不足 {len(skipped_no_identity)} 本（无书名，'
-          f'不乱猜、不沿旧 URL 请求）')
-    return relocated, {'relocated': len(relocated), 'skipped': len(skipped_miss),
-                       'skipped_no_identity': len(skipped_no_identity)}
+          f'不乱猜、不沿旧 URL 请求），已终态免搜 {len(skipped_terminal)} 本')
+    return relocated, {'relocated': len(relocated) - len(skipped_terminal),
+                       'skipped': len(skipped_miss),
+                       'skipped_no_identity': len(skipped_no_identity),
+                       'skipped_terminal': len(skipped_terminal)}
 
 
 def split_queue(books: list[dict], done_urls: set[str],
@@ -3592,7 +3716,9 @@ def split_queue(books: list[dict], done_urls: set[str],
 
     两个跳过名单**互斥**：已在 labels.jsonl 的书优先算「已完成」，不再算「钉子户」——
     它被拒过是历史，后来已成功，不该继续占用终态名额。
-    书的站内相对路径经书源适配器归一到绝对 URL 后与跳过名单比对。
+    书的匹配键（628）：条目按 `_identity_keys`（identity ∪ 当前取文 URL）与名单比对，
+    名单侧同样既收身份键也收 URL 键——引擎重定位/换源改写取文 URL 后，旧键仍命中；
+    不带 identity 的条目（普通 book15 路径）只有 URL 键，行为与改前逐项一致。
 
     lblreplay42：`deferred`（冷却期内被拒过的 url）里的书**不跳过**，但排到待处理队尾——
     两组各自保持原相对顺序（稳定分区）。重启后不再从名单头磨同一批刚被拒的书。
@@ -3604,12 +3730,12 @@ def split_queue(books: list[dict], done_urls: set[str],
     skipped_done: list[dict] = []
     skipped_pinned: list[dict] = []
     for b in books:
-        url = src.absolute(b['url'])
-        if url in done_urls:
+        keys = _identity_keys(b, src)
+        if keys & done_urls:
             skipped_done.append(b)
-        elif url in pinned:
+        elif keys & pinned:
             skipped_pinned.append(b)
-        elif url in deferred:
+        elif keys & deferred:
             tail.append(b)
         else:
             todo.append(b)
@@ -3675,6 +3801,20 @@ def main() -> int:
     # lblreplay42：近 cooldown 秒内被拒过的书 → 不跳过，但排到待处理队尾（见 split_queue）。
     # 关闸（≤0）时为空集，队列顺序与改前逐项相同。
     deferred_urls = recent_rejection_urls(data_path('labels-rejected.jsonl'), reject_cooldown)
+    # 628：以上四类名单的身份版（identity 优先、回落 url 键）——重定位改写取文 URL 后，
+    # split_queue/后移计数/钉子户日志按身份匹配，旧键不再失配。URL 版保留不动（旧契约
+    # 调用方与计数口径不变），身份版只在这条 rank 重定位路径上使用。
+    _done_keys = (_load_terminal_identities(data_path('labels.jsonl'))
+                  | _load_terminal_identities(data_path('labels-stub.jsonl')))
+    rejection_identity_counts = _rejection_identity_counts(
+        data_path('labels-rejected.jsonl'))
+    _pinned_keys = set(pinned)
+    if REJECT_TERMINAL_THRESHOLD > 0:
+        # 与 terminal_urls 同一常量同口径（关闸=0/负数时身份版同样为空，不另开语义）。
+        _pinned_keys |= {k for k, n in rejection_identity_counts.items()
+                         if n >= REJECT_TERMINAL_THRESHOLD}
+    deferred_identity_urls = _recent_rejection_identities(
+        data_path('labels-rejected.jsonl'), reject_cooldown)
 
     # T5 引擎兜底 CLI：仅 douban/webnovel 名单线用（下方分支按 .env 装配）；
     # rank / --book 线保持 None，取正文只走 book15，行为不变。
@@ -3773,8 +3913,11 @@ def main() -> int:
             if SOURCE_POLICY is not None and SOURCE_POLICY.is_disabled(
                     labeler_source_policy.BOOK15_HOST):
                 engine_cli = _build_engine_cli(env)
+                # 已终态（done ∪ stub ∪ pinned）按身份键先滤，省一次引擎搜索；
+                # deferred 不滤（后移不是终态）。被滤条目原样返回交 split_queue 归类计数。
                 all_books, _reloc_stats = _relocate_rank_books_to_engine(
-                    all_books, engine_cli)
+                    all_books, engine_cli,
+                    terminal_keys=_done_keys | _pinned_keys)
                 engine_cli = (EngineStopUrls(engine_cli)
                               if engine_cli is not None else None)
         # --limit 切在 split_queue **之后**（审查 F.1）：命中数一旦 > limit，切在前缀会
@@ -3782,13 +3925,15 @@ def main() -> int:
         # 做完进 done_urls，之后每轮 queue=[] 却仍全量搜索。先剔除已完成/钉子户/残本再取上限，
         # 语义 = 「本轮最多打 limit 本**未完成**的书」。stub_urls 折进 done 侧一并跳过（P1）。
         queue, skipped_done, skipped_pinned = split_queue(
-            all_books, done_urls | stub_urls, pinned, deferred=deferred_urls)
+            all_books, done_urls | stub_urls | _done_keys,
+            pinned | _pinned_keys,
+            deferred=deferred_urls | deferred_identity_urls)
         queue = queue[:args.limit]
         # 后移计数：冷却期内被拒、且在切 --limit 后仍真正进入本轮待处理队列的本数。
         # 必须切片**之后**统计——后移的书都在队尾，limit 一截多半先被剔掉，所以「本轮待处理
         # N 本，其中 M 本后移」里的 M 必须与切片后的 N 同口径，否则 M 可能 > N，「其中」不成立。
         deferred_in_queue = sum(
-            1 for b in queue if BOOK15.absolute(b['url']) in deferred_urls)
+            1 for b in queue if _identity_keys(b, BOOK15) & deferred_urls)
         # X = 本轮跳过总数（已完成 + 钉子户终态，互斥不重叠），Y = 其中因钉子户终态跳过的。
         print(f'本轮处理 {len(queue)} 本（跳过已完成 {len(skipped_done) + len(skipped_pinned)} 本'
               f'（含钉子户 {len(skipped_pinned)} 本））')
@@ -3797,7 +3942,10 @@ def main() -> int:
               f'因 {reject_cooldown} 秒内被拒过后移'
               if reject_cooldown > 0 else '被拒冷却后移: 关闭')
         for b in skipped_pinned:
-            print(f'  钉子户终态：跳过（历史被拒 {rejection_counts[BOOK15.absolute(b["url"])]} 次）'
+            keys = _identity_keys(b, BOOK15)
+            count = max([rejection_identity_counts.get(k, 0) for k in keys]
+                        + [rejection_counts.get(k, 0) for k in keys])
+            print(f'  钉子户终态：跳过（历史被拒 {count} 次）'
                   f' {b.get("title")} | {b["url"]}')
 
     if args.dry_run:
@@ -3858,8 +4006,9 @@ def main() -> int:
         """残本候选跳过：记 labels-stub.jsonl（不写 rejected、不占钉子户名额），
         下轮据此跳过（P1 修复）。人工删该行即重新并入候选。"""
         print(f'  残本候选：{reason}，跳过并记入 labels-stub.jsonl（下轮不再取，人工删行可恢复）')
-        rec = {'url': BOOK15.absolute(book['url']),
-               'title': book.get('title', ''), 'reason': reason}
+        rec = _attach_identity(
+            {'url': BOOK15.absolute(book['url']),
+             'title': book.get('title', ''), 'reason': reason}, book)
         with open(data_path('labels-stub.jsonl'), 'a', encoding='utf-8') as f:
             f.write(json.dumps(rec, ensure_ascii=False) + '\n')
 
@@ -3952,7 +4101,7 @@ def main() -> int:
                     'reason': f'抓取字数不足: {chars}',
                 }
                 rej_path = data_path('labels-rejected.jsonl')
-                write_rejection(rej_path, reject)
+                write_rejection(rej_path, _attach_identity(reject, b))
                 fail += 1
                 count_failure('字数不足')
                 continue
@@ -3974,7 +4123,7 @@ def main() -> int:
                     'reason': f'本地预检: {precheck_reason}',
                 }
                 rej_path = data_path('labels-rejected.jsonl')
-                write_rejection(rej_path, reject)
+                write_rejection(rej_path, _attach_identity(reject, b))
                 fail += 1
                 count_failure('本地预检拒收')
                 continue
@@ -4011,7 +4160,7 @@ def main() -> int:
                     'reason': reason,
                 }
                 rej_path = data_path('labels-rejected.jsonl')
-                write_rejection(rej_path, reject)
+                write_rejection(rej_path, _attach_identity(reject, b))
                 fail += 1
                 count_failure('书名核验不符')
                 time.sleep(LLM_INTERVAL_SEC)
@@ -4042,7 +4191,7 @@ def main() -> int:
                 if quality == TEXT_QUALITY_AD:
                     reject[AD_GATE_FIELD] = AD_GATE_VERSION
                 rej_path = data_path('labels-rejected.jsonl')
-                write_rejection(rej_path, reject)
+                write_rejection(rej_path, _attach_identity(reject, b))
                 fail += 1
                 count_failure('内容质量拒收')
                 time.sleep(LLM_INTERVAL_SEC)
@@ -4077,6 +4226,8 @@ def main() -> int:
                 'label_source': 'text_engine' if is_engine else 'text_book15',
                 'labels': labels,
             }
+            # 628：成功记录挂稳定身份键——下轮引擎换站后 split_queue 仍按身份认得（不重标）。
+            _attach_identity(b_out, b)
             if quality_flag:
                 b_out['quality_flag'] = quality_flag
                 b_out['text_quality_evidence'] = evidence
@@ -4137,7 +4288,7 @@ def main() -> int:
                 'reason': str(e),
             }
             rej_path = data_path('labels-rejected.jsonl')
-            write_rejection(rej_path, reject)
+            write_rejection(rej_path, _attach_identity(reject, b))
             fail += 1
             count_failure(classify_failure(e))
             continue
