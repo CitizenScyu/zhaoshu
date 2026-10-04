@@ -142,6 +142,7 @@ export async function claimDownloadTask(
 }
 
 /** Create a new immutable attempt after a terminal failure; never rewinds the old row. */
+// 未接线预留：生产无调用方（676 裁定保留；无重试按钮计划则整链下线，见 codex-fence-followup-20260929/verify676-progress.md）
 export async function retryDownloadTask(
   sql: DownloadQueueSql,
   failedTaskId: number,
