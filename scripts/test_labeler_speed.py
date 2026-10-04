@@ -290,10 +290,17 @@ class MainHarness(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.dir = Path(self.tmp.name)
         (self.dir / '.env').write_text('LLM_API_KEY=test-key-not-real\n', encoding='utf-8')
+        # 624 测试隔离：run_main 调 labeler.main() 会装配全局 SOURCE_POLICY 且 main 不恢复
+        # （生产语义：CLI 进程随 main 返回退出）。存原值、清理时恢复，不泄漏给后续套件。
+        self._prev_source_policy = labeler.SOURCE_POLICY
+        self.addCleanup(self._restore_source_policy)
+
+    def _restore_source_policy(self):
+        labeler.SOURCE_POLICY = self._prev_source_policy
 
     def run_main(self, books, cli, argv=None):
         def fake_build(http_get, skip_titles=None, include_douban=True, pages=None,
-                       engine_cli=None, book15_breaker=None):
+                       engine_cli=None, book15_breaker=None, source_policy=None):
             return [dict(b) for b in books]
         labels = {'title_guess': '斗罗大陆III龙王传说', 'site_title_match': True,
                   'text_quality': '正常', 'confidence': 0.9}

@@ -320,13 +320,22 @@ class MainHarness(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.dir = Path(self.tmp.name)
         (self.dir / '.env').write_text('LLM_API_KEY=test-key-not-real\n', encoding='utf-8')
+        # 624 测试隔离：run_main 调 labeler.main() 会装配全局 SOURCE_POLICY 且 main 不恢复
+        # （生产语义：CLI 进程随 main 返回退出）。本 harness 每用例先存原值、清理时恢复，
+        # 不把装配实例泄漏给后续套件（曾致 discover 全量跑时 category 的 http_get 重试测试
+        # 被顺序依赖拦红）。恢复的是「测试开始前的原值」，不是统一硬写 None。
+        self._prev_source_policy = labeler.SOURCE_POLICY
+        self.addCleanup(self._restore_source_policy)
+
+    def _restore_source_policy(self):
+        labeler.SOURCE_POLICY = self._prev_source_policy
 
     def run_main(self, fetch, labels=None):
         """fetch: fetch_book_text_engine 的 side_effect；labels: label_book 返回的标签。"""
         sent = []
 
         def fake_build(http_get, skip_titles=None, include_douban=True, pages=None,
-                       engine_cli=None, book15_breaker=None):
+                       engine_cli=None, book15_breaker=None, source_policy=None):
             return [dict(self.BOOK)]
 
         def fake_label(text, *a, **k):

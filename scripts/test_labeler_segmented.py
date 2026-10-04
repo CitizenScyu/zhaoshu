@@ -1482,6 +1482,13 @@ class TestMainLoop(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.dir = Path(self.tmp.name)
+        # 624 测试隔离：run_main 调 labeler.main() 会装配全局 SOURCE_POLICY 且 main 不恢复
+        # （生产语义：CLI 进程随 main 返回退出）。存原值、清理时恢复，不泄漏给后续套件。
+        self._prev_source_policy = labeler.SOURCE_POLICY
+        self.addCleanup(self._restore_source_policy)
+
+    def _restore_source_policy(self):
+        labeler.SOURCE_POLICY = self._prev_source_policy
 
     def run_main(self, env_lines, cli, label_fn):
         (self.dir / '.env').write_text('LLM_API_KEY=test-key-not-real\n' + env_lines,
@@ -1489,7 +1496,7 @@ class TestMainLoop(unittest.TestCase):
         book = _book(alternates=['b.example.com'])
 
         def fake_build(http_get, skip_titles=None, include_douban=True, pages=None,
-                       engine_cli=None, book15_breaker=None):
+                       engine_cli=None, book15_breaker=None, source_policy=None):
             return [json.loads(json.dumps(book))]
         label_mock = mock.Mock(side_effect=label_fn)
         out, err = io.StringIO(), io.StringIO()

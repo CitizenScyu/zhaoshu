@@ -418,6 +418,13 @@ class TestMainRejectsIdentityMismatch(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.dir = Path(self.tmp.name)
         (self.dir / '.env').write_text('LLM_API_KEY=test-key-not-real\n', encoding='utf-8')
+        # 624 测试隔离：用例调 labeler.main() 会装配全局 SOURCE_POLICY 且 main 不恢复
+        # （生产语义：CLI 进程随 main 返回退出）。存原值、清理时恢复，不泄漏给后续套件。
+        self._prev_source_policy = labeler.SOURCE_POLICY
+        self.addCleanup(self._restore_source_policy)
+
+    def _restore_source_policy(self):
+        labeler.SOURCE_POLICY = self._prev_source_policy
 
     def test_identity_mismatch_is_rejected_without_llm_call(self):
         book = {'url': 'https://www.yingsx.com/book/1', 'title': '斗破苍穹',
@@ -426,7 +433,7 @@ class TestMainRejectsIdentityMismatch(unittest.TestCase):
         llm_called = []
 
         def fake_build(http_get, skip_titles=None, include_douban=True, pages=None,
-                       engine_cli=None, book15_breaker=None):
+                       engine_cli=None, book15_breaker=None, source_policy=None):
             return [book]
 
         out, err = io.StringIO(), io.StringIO()
@@ -465,7 +472,7 @@ class TestMainRejectsIdentityMismatch(unittest.TestCase):
                 'author': '天蚕土豆', 'engine': True}
 
         def fake_build(http_get, skip_titles=None, include_douban=True, pages=None,
-                       engine_cli=None, book15_breaker=None):
+                       engine_cli=None, book15_breaker=None, source_policy=None):
             return [book]
 
         out, err = io.StringIO(), io.StringIO()
@@ -488,6 +495,16 @@ class TestMainRejectsIdentityMismatch(unittest.TestCase):
 
 class TestFailureClassification(unittest.TestCase):
     """labelerdiag41 P3：每轮失败按类别计数，轮末单独一行（「完成」行逐字不变）。"""
+
+    def setUp(self):
+        # 624 测试隔离：test_main_prints_failure_kinds 调 labeler.main() 会装配全局
+        # SOURCE_POLICY 且 main 不恢复（生产语义：CLI 进程随 main 返回退出）。
+        # 存原值、清理时恢复，不泄漏给后续套件。
+        self._prev_source_policy = labeler.SOURCE_POLICY
+        self.addCleanup(self._restore_source_policy)
+
+    def _restore_source_policy(self):
+        labeler.SOURCE_POLICY = self._prev_source_policy
 
     def test_classify_failure(self):
         truncated = None
@@ -532,7 +549,7 @@ class TestFailureClassification(unittest.TestCase):
             raise next(errors)
 
         def fake_build(http_get, skip_titles=None, include_douban=True, pages=None,
-                       engine_cli=None, book15_breaker=None):
+                       engine_cli=None, book15_breaker=None, source_policy=None):
             return list(books)
 
         out = io.StringIO()
@@ -558,6 +575,13 @@ class TestMainWiresBook15Breaker(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.dir = Path(self.tmp.name)
+        # 624 测试隔离：用例调 labeler.main() 会装配全局 SOURCE_POLICY 且 main 不恢复
+        # （生产语义：CLI 进程随 main 返回退出）。存原值、清理时恢复，不泄漏给后续套件。
+        self._prev_source_policy = labeler.SOURCE_POLICY
+        self.addCleanup(self._restore_source_policy)
+
+    def _restore_source_policy(self):
+        labeler.SOURCE_POLICY = self._prev_source_policy
 
     def _run(self, env_text):
         (self.dir / '.env').write_text('LLM_API_KEY=test-key-not-real\n' + env_text,
@@ -565,7 +589,7 @@ class TestMainWiresBook15Breaker(unittest.TestCase):
         seen = []
 
         def fake_build(http_get, skip_titles=None, include_douban=True, pages=None,
-                       engine_cli=None, book15_breaker=None):
+                       engine_cli=None, book15_breaker=None, source_policy=None):
             seen.append(book15_breaker)
             return []
 
@@ -890,6 +914,15 @@ class TestSourceSwitch(unittest.TestCase):
 class TestMainSwitchesSourceAndRecordsIt(unittest.TestCase):
     """主循环接线：主源失效换源后 labels.jsonl 记实际来源；无备选的书计「源失效放弃」、不写 rejected。"""
 
+    def setUp(self):
+        # 624 测试隔离：用例调 labeler.main() 会装配全局 SOURCE_POLICY 且 main 不恢复
+        # （生产语义：CLI 进程随 main 返回退出）。存原值、清理时恢复，不泄漏给后续套件。
+        self._prev_source_policy = labeler.SOURCE_POLICY
+        self.addCleanup(self._restore_source_policy)
+
+    def _restore_source_policy(self):
+        labeler.SOURCE_POLICY = self._prev_source_policy
+
     def test_main_records_alternate_source(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
@@ -900,7 +933,7 @@ class TestMainSwitchesSourceAndRecordsIt(unittest.TestCase):
         labels = {'title_guess': '斗罗大陆III龙王传说', 'site_title_match': True, 'text_quality': '正常'}
 
         def fake_build(http_get, skip_titles=None, include_douban=True, pages=None,
-                       engine_cli=None, book15_breaker=None):
+                       engine_cli=None, book15_breaker=None, source_policy=None):
             return [dict(b) for b in books]
 
         out = io.StringIO()
@@ -926,6 +959,16 @@ class TestMainWritebackUsesListTitle(unittest.TestCase):
     """rvauthor 增量必修：回写书名收紧要走真实路径。引擎条目由 _resolve_candidates 构造
     （名单书名进 list_title、候选站点标题进 title），主循环回写点用 list_title 与 toc 标题比
     「完全相等」——只前缀兼容的错书不回写。不直接给 engine_author_writeback 传参。"""
+
+    def setUp(self):
+        # 624 测试隔离：_run_main_and_read_record 调 labeler.main() 会装配全局
+        # SOURCE_POLICY 且 main 不恢复（生产语义：CLI 进程随 main 返回退出）。
+        # 存原值、清理时恢复，不泄漏给后续套件。
+        self._prev_source_policy = labeler.SOURCE_POLICY
+        self.addCleanup(self._restore_source_policy)
+
+    def _restore_source_policy(self):
+        labeler.SOURCE_POLICY = self._prev_source_policy
 
     def _cli(self, toc_title, toc_author):
         def handler(sub, url):
@@ -993,6 +1036,16 @@ class TestContentMatchAuditPassthrough(unittest.TestCase):
     """authcv41：内容比对救回条目的审计链——labels.jsonl 记录透传 content_match 诊断详情，
     且 toc 作者回写不得把 author_source 从 content_match 覆盖成 engine_toc（另记 toc 回写发生过）。
     非救回条目不带这些字段。全走主循环真实路径，不直接给 b_out 组装传参。"""
+
+    def setUp(self):
+        # 624 测试隔离：_run_main_and_read_record 调 labeler.main() 会装配全局
+        # SOURCE_POLICY 且 main 不恢复（生产语义：CLI 进程随 main 返回退出）。
+        # 存原值、清理时恢复，不泄漏给后续套件。
+        self._prev_source_policy = labeler.SOURCE_POLICY
+        self.addCleanup(self._restore_source_policy)
+
+    def _restore_source_policy(self):
+        labeler.SOURCE_POLICY = self._prev_source_policy
 
     def _cli(self, toc_title, toc_author):
         def handler(sub, url):

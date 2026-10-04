@@ -18,6 +18,7 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import labeler  # noqa: E402
+import labeler_source_policy  # noqa: E402 —— 624：TestHttpGetRetiredGate 装配用
 
 
 def write_jsonl(path: Path, rows) -> None:
@@ -318,6 +319,17 @@ class TestFetchCategoryBooks(unittest.TestCase):
 
 
 class TestStubTimesLimit(unittest.TestCase):
+    def _stub_relocation(self):
+        """617：book15 retired 后 rank 线走引擎重定位；本套件测分类合并/残本路径，
+        与重定位无关——短路成原样返回候选（无引擎环境下的等效桩）。"""
+        from unittest import mock
+        patcher = mock.patch.object(
+            labeler, '_relocate_rank_books_to_engine',
+            side_effect=lambda books, cli, **kw: (list(books), {}))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+
     """P1 核心组合断言：残本 × --limit —— 残本不得永久占住 --limit 名额把正常书饿死。
 
     诊断（labeler.py 文件头 P1）：残本候选一旦记入 labels-stub.jsonl，下轮必须与
@@ -331,6 +343,10 @@ class TestStubTimesLimit(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         d = Path(self.tmp.name)
         (d / '.env').write_text('LLM_API_KEY=test-key-not-real\n', encoding='utf-8')
+        # 624 测试隔离：_dry_run 调 labeler.main() 会装配全局 SOURCE_POLICY 且 main
+        # 不恢复（生产语义：CLI 进程随 main 返回退出）。存原值、清理时恢复，不泄漏给后续套件。
+        self._prev_source_policy = labeler.SOURCE_POLICY
+        self.addCleanup(self._restore_source_policy)
         self.data_dir = d
         # details1..5 = 已记录的残本；details6..10 = 正常书
         self.stub_urls = [labeler.BASE + f'/books/details{i}.html' for i in range(1, 6)]
@@ -341,11 +357,15 @@ class TestStubTimesLimit(unittest.TestCase):
             [{'url': f'/books/details{i}.html', 'title': f'残本{i}'} for i in range(1, 6)]
             + [{'url': f'/books/details{i}.html', 'title': f'正常{i}'} for i in range(6, 11)])
 
+    def _restore_source_policy(self):
+        labeler.SOURCE_POLICY = self._prev_source_policy
+
     def _dry_run(self, limit):
         import contextlib
         import io
         buf = io.StringIO()
         from unittest import mock
+        self._stub_relocation()
         with mock.patch.dict(os.environ, {'LABELER_DATA_DIR': str(self.data_dir)}), \
                 mock.patch.object(labeler, 'fetch_rank_books', return_value=list(self.books)), \
                 mock.patch.object(sys, 'argv', ['labeler.py', '--dry-run', '--no-db-model',
@@ -444,7 +464,16 @@ class TestFrameworkAlignment(unittest.TestCase):
 
 
 class TestHttpGetRetry(unittest.TestCase):
-    """站点 GET 重试：侦察实测 list-t-4 有一次 25s 超时后重试成功。移植自 branch2。"""
+    """站点 GET 重试：侦察实测 list-t-4 有一次 25s 超时后重试成功。移植自 branch2。
+
+    624 测试隔离：重试语义测**非 retired 的合成 host**（http-get-retry.example）——
+    book15.net 已属 RETIRED_HOSTS，任何装配过 SOURCE_POLICY 的上下文里它会在网络层
+    之前被停用门拦下，本类只想钉 urlopen 重试语义。策略前置明确：setUp 保存原
+    labeler.SOURCE_POLICY 并强制 None（旧调用形态），addCleanup 恢复原值——不统一
+    硬写 None 了事，防本类自身成为下一个泄漏源。retired 前置拦截的独立断言在
+    TestHttpGetRetiredGate（本文件下方）。"""
+
+    HOST = 'http-get-retry.example'      # 非 retired 合成 host（离线：urlopen 全打桩）
 
     class _Resp:
         def __init__(self, body):
@@ -458,6 +487,14 @@ class TestHttpGetRetry(unittest.TestCase):
 
         def __exit__(self, *exc):
             return False
+
+    def setUp(self):
+        self._prev_policy = labeler.SOURCE_POLICY
+        labeler.SOURCE_POLICY = None
+        self.addCleanup(self._restore_policy)
+
+    def _restore_policy(self):
+        labeler.SOURCE_POLICY = self._prev_policy
 
     def _patch(self, side_effect, retry):
         from unittest import mock
@@ -474,7 +511,7 @@ class TestHttpGetRetry(unittest.TestCase):
         p1, p2, p3 = self._patch([TimeoutError('25s 超时'),
                                   self._Resp('页面正文'.encode())], 1)
         with p1, p2, p3, contextlib.redirect_stderr(err):
-            self.assertEqual(labeler.http_get('https://book15.net/x'), '页面正文')
+            self.assertEqual(labeler.http_get(f'https://{self.HOST}/x'), '页面正文')
         self.assertIn('重试', err.getvalue())
 
     def test_raises_after_retries_exhausted(self):
@@ -483,7 +520,7 @@ class TestHttpGetRetry(unittest.TestCase):
         p1, p2, p3 = self._patch([TimeoutError('超时'), TimeoutError('超时')], 1)
         with p1, p2, p3, contextlib.redirect_stderr(io.StringIO()):
             with self.assertRaises(TimeoutError):
-                labeler.http_get('https://book15.net/x')
+                labeler.http_get(f'https://{self.HOST}/x')
 
     def test_retry_zero_means_single_attempt(self):
         calls = []
@@ -495,11 +532,60 @@ class TestHttpGetRetry(unittest.TestCase):
         p1, p2, p3 = self._patch(fake_urlopen, 0)
         with p1, p2, p3:
             with self.assertRaises(TimeoutError):
-                labeler.http_get('https://book15.net/x')
+                labeler.http_get(f'https://{self.HOST}/x')
         self.assertEqual(len(calls), 1)
 
 
+class TestHttpGetRetiredGate(unittest.TestCase):
+    """624：retired host 的 GET 必须在**网络层之前**被停用门拦下（独立钉，与重试语义分开）。
+
+    装配与 main() 同构（builtin_disabled=RETIRED_HOSTS）：urlopen 打桩为「被调用即败」，
+    断言一次请求都没发起、抛的是 SourceBlockedError 而非网络异常。setUp/addCleanup
+    保存恢复 labeler.SOURCE_POLICY（不硬写 None 收尾）。"""
+
+    def setUp(self):
+        self._prev_policy = labeler.SOURCE_POLICY
+        policy = labeler_source_policy.SourcePolicy(
+            builtin_disabled=labeler_source_policy.RETIRED_HOSTS)
+        labeler.SOURCE_POLICY = policy
+        self.addCleanup(self._restore_policy)
+
+    def _restore_policy(self):
+        labeler.SOURCE_POLICY = self._prev_policy
+
+    def test_retired_host_blocked_before_network_layer(self):
+        from unittest import mock
+
+        def no_urlopen(req, timeout=30):
+            raise AssertionError('retired host 的 GET 必须在网络层之前被拦下，不得发起 urlopen')
+
+        with mock.patch.object(labeler.urllib.request, 'urlopen', side_effect=no_urlopen):
+            with self.assertRaises(labeler_source_policy.SourceBlockedError) as ctx:
+                labeler.http_get('https://book15.net/x')
+        self.assertIn('停用', str(ctx.exception))
+
+    def test_www_and_trailing_dot_variants_blocked_too(self):
+        # 同族 host（www. 前缀）与尾点归一变体都必须拦（漏一个就是直连旁路）
+        from unittest import mock
+        with mock.patch.object(labeler.urllib.request, 'urlopen',
+                               side_effect=AssertionError('不得发起 urlopen')):
+            for url in ('https://www.book15.net/x', 'https://book15.net./x'):
+                with self.assertRaises(labeler_source_policy.SourceBlockedError, msg=url):
+                    labeler.http_get(url)
+
+
 class TestRuntimeStubDetection(unittest.TestCase):
+    def _stub_relocation(self):
+        """617：book15 retired 后 rank 线走引擎重定位；本套件测分类合并/残本路径，
+        与重定位无关——短路成原样返回候选（无引擎环境下的等效桩）。"""
+        from unittest import mock
+        patcher = mock.patch.object(
+            labeler, '_relocate_rank_books_to_engine',
+            side_effect=lambda books, cli, **kw: (list(books), {}))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+
     """运行时残本检测（非 dry-run）：章节数不足的书被记入 labels-stub.jsonl，
     形成 P1 闭环（下轮据此跳过）。全离线：http_get 打桩、不触达 LLM。"""
 
@@ -508,6 +594,10 @@ class TestRuntimeStubDetection(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         d = Path(self.tmp.name)
         (d / '.env').write_text('LLM_API_KEY=test-key-not-real\n', encoding='utf-8')
+        # 624 测试隔离：用例调 labeler.main() 会装配全局 SOURCE_POLICY 且 main 不恢复
+        # （生产语义：CLI 进程随 main 返回退出）。存原值、清理时恢复，不泄漏给后续套件。
+        self._prev_source_policy = labeler.SOURCE_POLICY
+        self.addCleanup(self._restore_source_policy)
         self.data_dir = d
         # 详情页只有 3 章（< STUB_MIN_CHAPTERS=10）⇒ 章节数短路判残本，绝不抓全本正文
         self.detail_html = (
@@ -519,6 +609,9 @@ class TestRuntimeStubDetection(unittest.TestCase):
         self.books = [{'url': f'/books/details{i}.html', 'title': f'残本{i}'}
                       for i in range(1, 4)]
 
+    def _restore_source_policy(self):
+        labeler.SOURCE_POLICY = self._prev_source_policy
+
     def test_short_book_recorded_to_stub_and_never_reaches_llm(self):
         import contextlib
         import io
@@ -528,6 +621,7 @@ class TestRuntimeStubDetection(unittest.TestCase):
         def boom(*a, **k):
             raise AssertionError('残本不应触达 label_book（应在章节数处短路）')
 
+        self._stub_relocation()
         with mock.patch.dict(os.environ, {'LABELER_DATA_DIR': str(self.data_dir)}), \
                 mock.patch.object(labeler, 'fetch_rank_books', return_value=list(self.books)), \
                 mock.patch.object(labeler, 'http_get', return_value=self.detail_html), \
@@ -545,6 +639,17 @@ class TestRuntimeStubDetection(unittest.TestCase):
 
 
 class TestMainCategoryWiring(unittest.TestCase):
+    def _stub_relocation(self):
+        """617：book15 retired 后 rank 线走引擎重定位；本套件测分类合并/残本路径，
+        与重定位无关——短路成原样返回候选（无引擎环境下的等效桩）。"""
+        from unittest import mock
+        patcher = mock.patch.object(
+            labeler, '_relocate_rank_books_to_engine',
+            side_effect=lambda books, cli, **kw: (list(books), {}))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+
     """main() 接线：rank + 分类两路合并去重、--categories 默认/none 关闭、参数转发。"""
 
     def setUp(self):
@@ -553,6 +658,13 @@ class TestMainCategoryWiring(unittest.TestCase):
         self.data_dir = Path(self.tmp.name)
         (self.data_dir / '.env').write_text('LLM_API_KEY=test-key-not-real\n',
                                             encoding='utf-8')
+        # 624 测试隔离：_run_main 调 labeler.main() 会装配全局 SOURCE_POLICY 且 main
+        # 不恢复（生产语义：CLI 进程随 main 返回退出）。存原值、清理时恢复，不泄漏给后续套件。
+        self._prev_source_policy = labeler.SOURCE_POLICY
+        self.addCleanup(self._restore_source_policy)
+
+    def _restore_source_policy(self):
+        labeler.SOURCE_POLICY = self._prev_source_policy
 
     def _run_main(self, argv, rank_books, cat_books=None):
         import contextlib
@@ -560,6 +672,7 @@ class TestMainCategoryWiring(unittest.TestCase):
         from unittest import mock
         buf = io.StringIO()
         cat_mock = mock.MagicMock(return_value=list(cat_books or []))
+        self._stub_relocation()
         with mock.patch.dict(os.environ, {'LABELER_DATA_DIR': str(self.data_dir)}), \
                 mock.patch.object(labeler, 'fetch_rank_books',
                                   return_value=list(rank_books)), \

@@ -308,12 +308,26 @@ class TestMainDeferredLog(unittest.TestCase):
         self.books = [{'url': f'/books/details{c}.html', 'title': t}
                       for c, t in [('A', '甲'), ('B', '乙'), ('C', '丙'),
                                    ('D', '丁'), ('E', '戊')]]
+        # 624 测试隔离：_run 调 labeler.main() 会装配全局 SOURCE_POLICY 且 main 不恢复
+        # （生产语义：CLI 进程随 main 返回退出）。存原值、清理时恢复，不泄漏给后续套件。
+        self._prev_source_policy = labeler.SOURCE_POLICY
+        self.addCleanup(self._restore_source_policy)
+
+    def _restore_source_policy(self):
+        labeler.SOURCE_POLICY = self._prev_source_policy
 
     def _run(self, cooldown_env):
         import contextlib
         import io
         d = self._setup_dir(cooldown_env)
         buf = io.StringIO()
+        # 617：book15 retired 后 rank 线走引擎重定位；本套件测被拒冷却的队列顺序，
+        # 与重定位无关——短路成原样返回候选。
+        reloc = mock.patch.object(
+            labeler, '_relocate_rank_books_to_engine',
+            side_effect=lambda books, cli, **kw: (list(books), {}))
+        reloc.start()
+        self.addCleanup(reloc.stop)
         with mock.patch.dict(os.environ, {'LABELER_DATA_DIR': str(d)}), \
                 mock.patch.object(labeler, 'fetch_rank_books',
                                   return_value=list(self.books)), \

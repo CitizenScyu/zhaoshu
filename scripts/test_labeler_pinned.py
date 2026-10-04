@@ -250,6 +250,10 @@ class TestMainDryRun(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
+        # 624 测试隔离：用例调 labeler.main() 会装配全局 SOURCE_POLICY 且 main 不恢复
+        # （生产语义：CLI 进程随 main 返回退出）。存原值、清理时恢复，不泄漏给后续套件。
+        self._prev_source_policy = labeler.SOURCE_POLICY
+        self.addCleanup(self._restore_source_policy)
         d = Path(self.tmp.name)
         (d / '.env').write_text('LLM_API_KEY=test-key-not-real\n', encoding='utf-8')
         write_jsonl(d / 'labels.jsonl', [
@@ -267,10 +271,23 @@ class TestMainDryRun(unittest.TestCase):
             {'url': '/books/detailsE.html', 'title': '待处理戊'},
         ]
 
+    def _restore_source_policy(self):
+        labeler.SOURCE_POLICY = self._prev_source_policy
+
+    def _stub_relocation(self):
+        """617：book15 retired 后 rank 线走引擎重定位；本套件测的是 done/pinned 分流，
+        与重定位无关——短路成原样返回候选（无引擎环境下的等效桩）。"""
+        patcher = mock.patch.object(
+            labeler, '_relocate_rank_books_to_engine',
+            side_effect=lambda books, cli, **kw: (list(books), {}))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_dry_run_prints_pinned_skip_line(self):
         import contextlib
         import io
         buf = io.StringIO()
+        self._stub_relocation()
         with mock.patch.dict(os.environ, {'LABELER_DATA_DIR': str(self.data_dir)}), \
                 mock.patch.object(labeler, 'fetch_rank_books', return_value=list(self.books)), \
                 mock.patch.object(sys, 'argv', ['labeler.py', '--dry-run', '--no-db-model']), \
@@ -296,6 +313,7 @@ class TestMainDryRun(unittest.TestCase):
         import contextlib
         import io
         buf = io.StringIO()
+        self._stub_relocation()
         with mock.patch.dict(os.environ, {'LABELER_DATA_DIR': str(self.data_dir)}), \
                 mock.patch.object(labeler, 'fetch_rank_books', return_value=list(self.books)), \
                 mock.patch.object(labeler, 'REJECT_TERMINAL_THRESHOLD', 0), \
@@ -317,6 +335,10 @@ class TestWebnovelLimitCut(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
+        # 624 测试隔离：用例调 labeler.main() 会装配全局 SOURCE_POLICY 且 main 不恢复
+        # （生产语义：CLI 进程随 main 返回退出）。存原值、清理时恢复，不泄漏给后续套件。
+        self._prev_source_policy = labeler.SOURCE_POLICY
+        self.addCleanup(self._restore_source_policy)
         d = Path(self.tmp.name)
         (d / '.env').write_text('LLM_API_KEY=test-key-not-real\n', encoding='utf-8')
         # 命中 150：前 100 已打标，后 50 未完成
@@ -327,13 +349,16 @@ class TestWebnovelLimitCut(unittest.TestCase):
              'title': f'书{i}', 'site_title': f'书{i}'} for i in range(1, 101)])
         self.data_dir = d
 
+    def _restore_source_policy(self):
+        labeler.SOURCE_POLICY = self._prev_source_policy
+
     def _run(self, limit):
         import contextlib
         import io
         buf = io.StringIO()
 
         def fake_build(http_get, skip_titles=None, include_douban=True, pages=None,
-                       engine_cli=None, book15_breaker=None):
+                       engine_cli=None, book15_breaker=None, source_policy=None):
             return list(self.books)
 
         with mock.patch.dict(os.environ, {'LABELER_DATA_DIR': str(self.data_dir)}), \
