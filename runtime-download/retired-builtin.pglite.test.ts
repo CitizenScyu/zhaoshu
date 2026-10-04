@@ -96,14 +96,25 @@ maybe('618 退休源反例：旧 book15 URL 的 builtin 下载任务（真实注
     }
   });
 
+  // 673 修正：attempt_count 真实语义 = DEFAULT 1（business-schema.ts:235，CHECK ≥1）+ defer +1
+  // （download-task-queue.ts:225）；领取（claim）不 +1（download-task-queue.ts:120–134）。
+  // 不显式传 attemptCount 时省略该列、落 DEFAULT 1（显式 0 过不了 CHECK ≥1）；
+  // ①②③不传参 ⇒ DEFAULT 1，一轮后 attempt_count=2（1+1），既有断言不变。
   const insertTask = async (opts: {
     requestedBy?: string; attemptCount?: number; status?: string; updatedAtAgoMs?: number;
-  } = {}): Promise<number> => Number(((await pg.query(
-    `INSERT INTO download_tasks(user_id, book_id, title, author, status, source_url, requested_by, source_kind, attempt_count, updated_at)
-     VALUES (NULL, 1, $1, $2, $3, $4, $5, 'builtin', $6, now() - ($7::bigint * interval '1 millisecond')) RETURNING id`,
-    [TITLE, AUTHOR, opts.status ?? 'pending', BOOK_URL, opts.requestedBy ?? 'system',
-      opts.attemptCount ?? 0, opts.updatedAtAgoMs ?? 0],
-  )).rows[0] as { id: number }).id);
+  } = {}): Promise<number> => {
+    const base = [TITLE, AUTHOR, opts.status ?? 'pending', BOOK_URL, opts.requestedBy ?? 'system'];
+    const result = opts.attemptCount === undefined
+      ? await pg.query(
+        `INSERT INTO download_tasks(user_id, book_id, title, author, status, source_url, requested_by, source_kind, updated_at)
+         VALUES (NULL, 1, $1, $2, $3, $4, $5, 'builtin', now() - ($6::bigint * interval '1 millisecond')) RETURNING id`,
+        [...base, opts.updatedAtAgoMs ?? 0])
+      : await pg.query(
+        `INSERT INTO download_tasks(user_id, book_id, title, author, status, source_url, requested_by, source_kind, attempt_count, updated_at)
+         VALUES (NULL, 1, $1, $2, $3, $4, $5, 'builtin', $6, now() - ($7::bigint * interval '1 millisecond')) RETURNING id`,
+        [...base, opts.attemptCount, opts.updatedAtAgoMs ?? 0]);
+    return Number((result.rows[0] as { id: number }).id);
+  };
   const row = async (id: number) => (await pg.query(
     `SELECT status, error, attempt_count, artifact_id, source_url, lease_owner,
             (extract(epoch FROM (next_attempt_at - updated_at)) * 1000)::float8 AS delay_ms
@@ -210,40 +221,52 @@ maybe('618 退休源反例：旧 book15 URL 的 builtin 下载任务（真实注
     expect(w.budget.used()).toBe(0);
   });
 
-  // 669：钉住 666 轮亲读的三条既有语义（不改生产代码）。
+  // 669：钉住 666 轮亲读的三条既有语义（不改生产代码）。673 修正 attempt_count 语义：
+  // DEFAULT 1（business-schema.ts:235，CHECK ≥1）+ defer +1（download-task-queue.ts:225），领取（claim）不 +1。
   // 依据：download-worker.ts:195–209 settleSourceUnavailable —— attemptCount<16 ⇒ defer 重排；
   //       否则 ⇒ finish 终态 partial（非 failed）。defer 语义见 download-task-queue.ts:223–233。
   it('④ user 任务同源不可用仍走 defer（不因 requested_by=user 而直接 failed）', async () => {
-    // requested_by='user'、源不可用、attempt_count=0 < 16。
-    // settleSourceUnavailable 不读 requested_by（download-worker.ts:190–209 无该判断），
-    // 领取 +1 后 lease.attemptCount=1 < 16 ⇒ defer：download-task-queue.ts:225 置 status='pending'、
-    // attempt_count=attempt_count+1、lease_owner=''。断言其未落 failed。
+    // requested_by='user'、源不可用；insert 不传 attempt_count ⇒ DEFAULT 1（business-schema.ts:235）。
+    // settleSourceUnavailable 不读 requested_by（download-worker.ts:190–209 无该判断）；
+    // 领取不 +1（download-task-queue.ts:120–134），lease.attemptCount=1 < 16 ⇒ defer：
+    // download-task-queue.ts:225 置 status='pending'、attempt_count=attempt_count+1、lease_owner=''。断言其未落 failed。
     const id = await insertTask({ requestedBy: 'user' });
     const w = await wired({ pool: ['nomatch.example'], catalog: { 'nomatch.example': { hits: [], detail: { title: '', author: '' } } } });
     expect(await w.executor.runOnce()).toBe(DEFAULT_DECISIONS.TASK_DONE);
     const state = await row(id);
     expect(state.status).toBe('pending'); // 非 failed
     expect(state.status).not.toBe('failed');
-    expect(state.attempt_count).toBe(2); // 领取 +1、defer +1
+    expect(state.attempt_count).toBe(2); // DEFAULT 1 + defer +1（领取不 +1）
     expect(state.lease_owner).toBe('');
     expect(state.error).toContain('source_unavailable');
     expect(w.requests).toEqual([]);
   });
 
   it('⑤ attempt_count 达上限（16）⇒ finish 终态 partial 且不再重排（非 failed）', async () => {
-    // 源不可用、领取后 lease.attemptCount 达 SOURCE_RETRY_MAX_ATTEMPTS=16（download-task-policy.ts:11）：
-    // download-worker.ts:195 的 `attemptCount < 16` 为假 ⇒ download-worker.ts:203–208 走 finish(status:'partial')，
-    // 不 defer。插入 attempt_count=15，领取 +1 ⇒ lease.attemptCount=16（上限）。
-    const id = await insertTask({ attemptCount: 15 });
+    // 源不可用、领取不 +1（download-task-queue.ts:120–134），故与既有
+    // source-unavailable.pglite.test.ts 用例⑥（:261–282）同构，改为两轮制：
+    // insert 落 DEFAULT 1（business-schema.ts:235）后 UPDATE 到 15（过 CHECK ≥1）；
+    // 第一轮 lease.attemptCount=15 < 16 ⇒ defer 重排（download-task-queue.ts:225）⇒ pending/16；
+    // dueNow 推进后第二轮 lease.attemptCount=16 = SOURCE_RETRY_MAX_ATTEMPTS（download-task-policy.ts:11），
+    // download-worker.ts:195 的 `attemptCount < 16` 为假 ⇒ download-worker.ts:203–208 走 finish(status:'partial')，不再重排。
+    const id = await insertTask();
+    await pg.query('UPDATE download_tasks SET attempt_count = 15 WHERE id = $1', [id]);
     const w = await wired({ pool: ['nomatch.example'], catalog: { 'nomatch.example': { hits: [], detail: { title: '', author: '' } } } });
     await w.executor.runOnce();
-    const state = await row(id);
-    expect(state.status).toBe('partial'); // 终态 partial，非 failed
-    expect(state.status).not.toBe('failed');
-    // finish 不改 attempt_count（download-task-queue.ts:202–208）：仍为领取后的 16；
-    // 若发生 defer 则为 17 —— 据此钉住「不再重排」。
-    expect(state.attempt_count).toBe(16);
-    expect(state.error).toContain('source_unavailable');
+    const deferred = await row(id);
+    expect(deferred.status).toBe('pending'); // 第一轮：15 < 16 ⇒ defer +1 ⇒ 16，退避重排非终态
+    expect(deferred.attempt_count).toBe(16);
+    // dueNow 推进（测试内合成辅助，不动生产）：参照 source-unavailable.pglite.test.ts:255/270 的写法，
+    // 把 next_attempt_at 拨回当下，使 claim 谓词 next_attempt_at <= now()（download-task-queue.ts:128）再次命中。
+    await pg.query(`UPDATE download_tasks SET next_attempt_at = now() - interval '1 millisecond' WHERE id = $1`, [id]);
+    await w.executor.runOnce();
+    const terminal = await row(id);
+    expect(terminal.status).toBe('partial'); // 终态 partial，非 failed
+    expect(terminal.status).not.toBe('failed');
+    // finish 不改 attempt_count（download-task-queue.ts:202–208）：保持第一轮 defer 后的 16；
+    // 若再发生 defer 则为 17 —— 据此钉住「不再重排」。
+    expect(terminal.attempt_count).toBe(16);
+    expect(terminal.error).toContain('source_unavailable');
     expect(w.requests).toEqual([]);
   });
 
@@ -252,18 +275,20 @@ maybe('618 退休源反例：旧 book15 URL 的 builtin 下载任务（真实注
     //   requested_by='system' AND attempt_count < 16 ⇒ 'pending' 且 attempt_count+1；
     //   否则（含 user，不分次数）⇒ 'failed' 且 attempt_count 不变；两者 lease_owner=''（:34）。
     const staleAgo = 31 * MINUTE; // > DOWNLOAD_TASK_STALE_MS=30min（download-task-policy.ts:3）
-    const sysId = await insertTask({ requestedBy: 'system', attemptCount: 0, status: 'running', updatedAtAgoMs: staleAgo });
-    const userId = await insertTask({ requestedBy: 'user', attemptCount: 0, status: 'running', updatedAtAgoMs: staleAgo });
+    // 673 修正：insert 不传 attempt_count ⇒ DEFAULT 1（business-schema.ts:235，CHECK ≥1）。
+    // system 过期租约回 pending 时 attempt_count +1（1→2）；user 置 failed 时保持 DEFAULT 1（非 0）。
+    const sysId = await insertTask({ requestedBy: 'system', status: 'running', updatedAtAgoMs: staleAgo });
+    const userId = await insertTask({ requestedBy: 'user', status: 'running', updatedAtAgoMs: staleAgo });
     await reclaimStaleTasks(sql);
     const sys = await row(sysId);
     const user = await row(userId);
     // 并列断言：同一回收谓词下两种 requested_by 的终态分叉。
     expect(sys.status).toBe('pending');
-    expect(sys.attempt_count).toBe(1); // system 且 <16：attempt_count+1
+    expect(sys.attempt_count).toBe(2); // system 且 <16：DEFAULT 1 再 attempt_count+1 ⇒ 2
     expect(sys.lease_owner).toBe('');
     expect(user.status).toBe('failed');
     expect(user.status).not.toBe('pending');
-    expect(user.attempt_count).toBe(0); // user：attempt_count 不变（即使次数远低于上限）
+    expect(user.attempt_count).toBe(1); // user：attempt_count 不变，保持 DEFAULT 1（非 0）
     expect(user.lease_owner).toBe('');
   });
 });
