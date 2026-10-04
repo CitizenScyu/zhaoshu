@@ -505,6 +505,83 @@ describe('GET /api/download/[id]/file', () => {
       expect(hits).toEqual(['index.json', ...fx.snapshots]);
     });
 
+    /** 三卷最小扩展:与 volumeFixture 同一套构造规则,只是多一卷一章。 */
+    function volumeFixture3() {
+      const vol1 = '【第1章】\n\n第一卷的正文内容。\n';
+      const vol2 = '【第2章】\n\n第二卷的正文内容。\n';
+      const vol3 = '【第3章】\n\n第三卷的正文内容。\n';
+      const book = vol1 + vol2 + vol3;
+      const b1 = Buffer.from(vol1, 'utf8');
+      const b2 = Buffer.from(vol2, 'utf8');
+      const b3 = Buffer.from(vol3, 'utf8');
+      const dir = 'books/我的小说-作者';
+      // 快照完整路径(进清单)与其 basename(resourceServer 按末段寻址,同 volumeFixture)。
+      const snapPath = (v: string) => `books/.snapshots/x/v-${gitBlobSha(v).slice(0, 8)}.txt`;
+      const snapName = (v: string) => `v-${gitBlobSha(v).slice(0, 8)}.txt`;
+      const manifest: VolumeManifest = {
+        schema: 2, format: 'volumes',
+        version: gitBlobSha(book).slice(0, 8), blob_sha: gitBlobSha(book),
+        bytes: Buffer.byteLength(book), chars: 3, chapters: 3, chapters_total: 3,
+        title: '我的小说', author: '作者', generated_at: '2026-09-23T00:00:00.000Z', task_id: 7,
+        volumes: [
+          { path: `${dir}/vol-001.txt`, snapshot_path: snapPath(vol1),
+            blob_sha: gitBlobSha(vol1), bytes: b1.byteLength, first_byte: 0, last_byte: b1.byteLength },
+          { path: `${dir}/vol-002.txt`, snapshot_path: snapPath(vol2),
+            blob_sha: gitBlobSha(vol2), bytes: b2.byteLength, first_byte: b1.byteLength, last_byte: b1.byteLength + b2.byteLength },
+          { path: `${dir}/vol-003.txt`, snapshot_path: snapPath(vol3),
+            blob_sha: gitBlobSha(vol3), bytes: b3.byteLength, first_byte: b1.byteLength + b2.byteLength,
+            last_byte: b1.byteLength + b2.byteLength + b3.byteLength },
+        ],
+        chapter_index: [
+          { i: 0, t: '【第1章】', v: 0, s: 0, e: b1.byteLength, p: 1 },
+          { i: 1, t: '【第2章】', v: 1, s: b1.byteLength, e: b1.byteLength + b2.byteLength, p: 1 },
+          { i: 2, t: '【第3章】', v: 2, s: b1.byteLength + b2.byteLength,
+            e: b1.byteLength + b2.byteLength + b3.byteLength, p: 1 },
+        ],
+      };
+      const artifactRow = {
+        owner: 'owner', repo: 'repo', branch: 'main',
+        canonical_path: `${dir}/index.json`, blob_sha: gitBlobSha(book), bytes: Buffer.byteLength(book),
+      };
+      return { manifest, artifactRow, book, vol1, vol2, vol3, snapName };
+    }
+
+    it('第二卷 sha 不符后:拒绝续读,且第三卷/回退零请求(fix698 中段边界)', async () => {
+      const fx = volumeFixture3();
+      // 第二卷快照 HTTP 成功但字节与清单 sha 不符(被覆盖/损坏);其余资源照常。
+      const resources = new Map<string, () => Response>([
+        ['index.json', () => new Response(stringifyVolumeManifest(fx.manifest))],
+        [fx.snapName(fx.vol1), () => new Response(fx.vol1)],
+        [fx.snapName(fx.vol2), () => new Response('被篡改的第二卷\n')],
+        [fx.snapName(fx.vol3), () => new Response(fx.vol3)],
+        ['vol-001.txt', () => new Response(fx.vol1)],
+        ['vol-002.txt', () => new Response(fx.vol2)],
+        ['vol-003.txt', () => new Response(fx.vol3)],
+      ]);
+      const hits: string[] = [];
+      sqlForArtifact(fx.artifactRow);
+      fetchMock.mockImplementation(resourceServer(resources, (name) => hits.push(name)));
+
+      const res = await download();
+      expect(res.status).toBe(200);
+
+      const reader = res.body!.getReader();
+      // 第一卷正确且实际下发。
+      const first = await reader.read();
+      expect(first.done).toBe(false);
+      expect(first.value).toEqual(new TextEncoder().encode(fx.vol1));
+
+      // 第二卷快照 HTTP 成功但 sha 不符 → 下一次 read 拒绝。
+      await expect(reader.read()).rejects.toThrow();
+
+      // 精确边界:只取了清单 + 第一卷快照 + 第二卷快照;
+      // 第三卷快照/规范卷零请求,第二卷也不因 sha 不符回退规范卷。
+      expect(hits).toEqual(['index.json', fx.snapName(fx.vol1), fx.snapName(fx.vol2)]);
+
+      // 已 errored 的流再 cancel 会拒绝:捕获掉,不留未处理 Promise。
+      await reader.cancel().catch(() => undefined);
+    });
+
     it('卷字节 sha 与清单不符 → 下载中断,绝不下发半新半旧的书', async () => {
       const fx = volumeFixture();
       const resources = new Map(fx.resources);
