@@ -81,6 +81,19 @@ describe('POST /api/download/relocate', () => {
     expect(sql.mock.calls.every((call) => !call[0].join('?').includes('UPDATE labeled_books'))).toBe(true);
   });
 
+  // 成功路径时序契约：reclaim 必须先于 activeTaskFor 预检执行，否则 409 判定会把僵尸
+  // running 任务当作活动任务。实际序为 sql#1=查书 → relocate → reclaim → sql#2=activeTaskFor
+  // → sql#3=INSERT，这里锁 reclaim 早于 sql#2（invocationCallOrder 索引 1）。
+  it('runs reclaim before checking for an active task on the success path', async () => {
+    sql.mockResolvedValueOnce([book]).mockResolvedValueOnce([]).mockResolvedValueOnce([{ id: 82 }]);
+
+    const response = await POST(request({ bookId: book.id }));
+
+    expect(response.status).toBe(201);
+    expect(reclaim).toHaveBeenCalledTimes(1);
+    expect(reclaim.mock.invocationCallOrder[0]).toBeLessThan(sql.mock.invocationCallOrder[1]);
+  });
+
   it('does not resolve or insert when the book does not exist', async () => {
     sql.mockResolvedValueOnce([]);
     const response = await POST(request({ bookId: book.id }));
