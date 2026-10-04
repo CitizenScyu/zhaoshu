@@ -543,7 +543,8 @@ export default function LibraryTab({ view, setView }: {
   // busy 复用 dlBusy（同一下载区块同一时刻只允许一种提交在飞），防错骨架与 startDownload 同构。
   async function relocateDownload() {
     if (!isCurrentSession(sessionId)) return;
-    if (!canRelocateNow()) return;
+    // 内联 !detail 让 TS 对后续 await 段保持非空收窄（canRelocateNow 内的判空收窄不跨函数）。
+    if (!canRelocateNow() || !detail) return;
     const my = ++dlRequestId.current;
     const controller = beginAction();
     setDlBusy(true);
@@ -592,7 +593,7 @@ export default function LibraryTab({ view, setView }: {
         // matched 只进文案展示实际命中的版本，绝不回写书库（§5）。
         const matched = data.resolvedSource?.matched;
         setDlMessage(typeof matched?.title === 'string'
-          ? `已在活跃书源匹配到《${matched.title}》(${typeof matched.author === 'string' ? matched.author : ''})，加入下载队列。`
+          ? `已在活跃书源匹配到《${matched.title}》（${typeof matched.author === 'string' ? matched.author : ''}），加入下载队列。`
           : '已加入下载队列。');
         return;
       }
