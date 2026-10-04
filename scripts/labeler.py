@@ -2767,6 +2767,28 @@ def engine_author_writeback(list_author: str, toc_author: str,
     return _clean_engine_author(toc_author)
 
 
+def _build_source_policy(env, dead_host_memory, dead_host_ttl: int, base_dir):
+    """统一源策略的唯一装配工厂（617 装配 + 726 选书接线）。
+
+    选书与打标共用：main() 只在选书前调用一次，同一实例贯穿整轮——选书阶段
+    （名单抓取 / book15 搜索）与打标阶段（http_get 传输门）看到同一停用/冷却状态，
+    冷却跨轮复用同一个 DeadHostMemory（labels-dead-hosts.json：格式 / 目录选择 /
+    TTL / 静态停用语义全部不变，不新增第二套状态），不再有两份容易漂移的装配。
+    dead_host_memory=None（TTL<=0 关闸）时 sink/reader 均为 None：跨轮冷却整体
+    关闭（record_failure 在 ttl<=0 时连进程内计数也不记），停用门不受影响。"""
+    return labeler_source_policy.SourcePolicy(
+        base_dir=base_dir,
+        builtin_disabled=labeler_source_policy.RETIRED_HOSTS,
+        extra_disabled=labeler_source_policy.parse_disabled_hosts(env),
+        cooldown_ttl=dead_host_ttl,
+        dead_host_sink=(lambda host, now: (dead_host_memory.add(host, now=now),
+                                           dead_host_memory.save()))
+        if dead_host_memory is not None else None,
+        dead_hosts_reader=(lambda: dead_host_memory.dead_hosts(now=time.time()))
+        if dead_host_memory is not None else None,
+    )
+
+
 def _build_engine_cli(env: dict):
     """按 .env 装配并探测 EngineCli；开关关闭/配置缺失/探针失败 → 返回 None。
 
@@ -3763,6 +3785,9 @@ def main() -> int:
     # 与 REJECT_TERMINAL_THRESHOLD 同理：默认参数在 def 时求值，显式传才是「改配置即生效」）。
     engine_target_chars = resolve_engine_target_chars(env)
     dead_host_ttl = resolve_dead_host_ttl(env)
+    # 726：跨轮冷却载体在选书前装载（见选书装配处）；--book 调试模式没有选书阶段，
+    # 保持 None，打标阶段按原路径补载。先在此初始化，避免 --book 分支引用未绑定名。
+    dead_host_memory = None
     # lblreplay42：被拒冷却（近 cooldown 秒内被拒过的书移到队尾，不跳过）。显式求出再传下去，
     # 与 dead_host_ttl 同理：默认参数在 def 时求值，显式传才是「改配置即生效」。
     reject_cooldown = resolve_reject_cooldown(env)
@@ -3839,12 +3864,19 @@ def main() -> int:
         # 617：先把统一源策略装配好——后续（book15 搜索 / 榜单抓取 / 打标取文）所有
         # book15 直连都先过这道门（停用 ⇒ 零请求）。装配提前到选书之前；打标阶段
         # 再升级为带跨轮冷却载体的完整实例（见下方 SOURCE_POLICY 重装配）。
-        SOURCE_POLICY = labeler_source_policy.SourcePolicy(
-            base_dir=data_dir(),
-            builtin_disabled=labeler_source_policy.RETIRED_HOSTS,
-            extra_disabled=labeler_source_policy.parse_disabled_hosts(env),
-            cooldown_ttl=resolve_dead_host_ttl(env),
-        )
+        # 726：跨轮冷却提前到**选书前**装载（原在打标阶段才 DeadHostMemory.load）——
+        # 上轮已判死的 host 在名单抓取阶段就零请求，不必每个 worker 又先试一遍。
+        # 同一 mem 同一 policy 贯穿整轮（工厂 _build_source_policy），打标阶段不再换实例。
+        dead_host_memory = (DeadHostMemory.load(data_path(DEAD_HOSTS_FILENAME),
+                                                ttl_sec=dead_host_ttl, now=time.time())
+                            if dead_host_ttl > 0 else None)
+        SOURCE_POLICY = _build_source_policy(env, dead_host_memory, dead_host_ttl,
+                                             data_dir())
+        if dead_host_memory is not None:
+            remembered = sorted(dead_host_memory.dead_hosts(now=time.time()))
+            if remembered:
+                print(f'  死源跨轮记忆: {len(remembered)} 个 host 在 {dead_host_ttl // 3600}h 有效期内，'
+                      f'选书与打标全程跳过（{", ".join(remembered)}）')
         if args.source in ('douban', 'webnovel'):
             # 名单选书：豆瓣网文 tag / 网文站榜单 → book15 站内搜索（含误匹配校验）。
             # 产出与 fetch_rank_books() 同构，后续打标循环零改动复用。
@@ -3965,9 +3997,11 @@ def main() -> int:
 
     # lblspeed41：本轮按 host 累计「源失效」放弃次数，达阈值后后续条目不再请求该 host。
     # 跨轮记忆：侧车文件里未过期的 host 直接进 dead（本轮零请求）。文件坏/读写失败静默降级为不跨轮。
-    dead_host_memory = (DeadHostMemory.load(data_path(DEAD_HOSTS_FILENAME),
-                                            ttl_sec=dead_host_ttl, now=time.time())
-                        if dead_host_ttl > 0 else None)
+    # 726：dead_host_memory 已在选书前装载（见上方选书装配）；--book 调试模式不装载
+    # （无选书阶段），此处照旧补载，行为不变。
+    if dead_host_memory is None and dead_host_ttl > 0:
+        dead_host_memory = DeadHostMemory.load(data_path(DEAD_HOSTS_FILENAME),
+                                               ttl_sec=dead_host_ttl, now=time.time())
     source_giveups = SourceGiveupTracker(DEAD_HOST_GIVEUPS,
                                          on_dead=_save_dead_hosts if dead_host_memory else None)
     if dead_host_memory is not None:
@@ -3977,22 +4011,12 @@ def main() -> int:
             print(f'  死源跨轮记忆: {len(remembered)} 个 host 在 {dead_host_ttl // 3600}h 有效期内，'
                   f'本轮直接跳过（{", ".join(remembered)}）')
 
-    # 617：打标阶段把统一源策略升级为带跨轮冷却载体的完整形态（冷却复用上面同一个
-    # dead_host_memory = labels-dead-hosts.json，与引擎分支共享状态；停用态单独落
-    # labels-source-disabled.json，选书阶段已装配的停用清单经状态文件延续）。
+    # 617/726：统一源策略在选书前已装配为带跨轮冷却载体的完整形态（工厂
+    # _build_source_policy：冷却复用同一个 dead_host_memory = labels-dead-hosts.json，
+    # 与引擎分支共享状态；停用态单独落 labels-source-disabled.json）。选书与打标
+    # 用的是**同一实例**，此处只打摘要行，不再换新实例（避免第二套装配漂移）。
     # SOURCE_POLICY 为 None（--book 调试模式）时传输门关闭，行为与改前一致。
-    if not args.book:
-        SOURCE_POLICY = labeler_source_policy.SourcePolicy(
-            base_dir=data_dir(),
-            builtin_disabled=labeler_source_policy.RETIRED_HOSTS,
-            extra_disabled=labeler_source_policy.parse_disabled_hosts(env),
-            cooldown_ttl=dead_host_ttl,
-            dead_host_sink=(lambda host, now: (dead_host_memory.add(host, now=now),
-                                               dead_host_memory.save()))
-            if dead_host_memory is not None else None,
-            dead_hosts_reader=(lambda: dead_host_memory.dead_hosts(now=time.time()))
-            if dead_host_memory is not None else None,
-        )
+    if not args.book and SOURCE_POLICY is not None:
         print(SOURCE_POLICY.summary_line())
 
     def count_failure(kind: str) -> None:
