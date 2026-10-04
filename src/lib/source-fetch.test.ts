@@ -1,5 +1,21 @@
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { fetchSourceText, MAX_SOURCE_BYTES, SOURCE_CONNECT_TIMEOUT_MS, SOURCE_HOST_SWAP_DELAY_MS } from './source-fetch';
+import { refreshSupportedHosts, SourcePolicyError, validateSourceUrl } from './source-policy';
+import { isRetiredBuiltinHost } from './supported-sources';
+
+// request640 起 source-fetch 有退休 builtin 请求许可门，真实注册表里 book15 lifecycle='retired'。
+// 本文件两组用例对注册表的诉求不同：
+// - 上方两组传输语义用例（重定向/超时/换 host 兜底）以 book15 为载体，测的是传输层而非生命周期——
+//   这里把 isRetiredBuiltinHost 钉成 false（等价于「book15 仍活跃」的注册表形态），保持聚焦；
+// - 下方「退休 builtin 请求许可门」组恢复真实判定（beforeEach 打开开关），只换这一处行为。
+const gate = vi.hoisted(() => ({ realRetiredGate: false }));
+vi.mock('./supported-sources', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./supported-sources')>();
+  return {
+    ...actual,
+    isRetiredBuiltinHost: (host: string) => (gate.realRetiredGate ? actual.isRetiredBuiltinHost(host) : false),
+  };
+});
 
 afterEach(() => { vi.unstubAllGlobals(); vi.useRealTimers(); });
 const options = () => ({ signal: new AbortController().signal });
@@ -183,5 +199,80 @@ describe('www.book15.net 同站兜底与超时拆段', () => {
     const assertion = expect(result).resolves.toEqual({ url: 'https://www.book15.net/a', text: '正文' });
     await vi.advanceTimersByTimeAsync(3_000 + SOURCE_HOST_SWAP_DELAY_MS + 1);
     await assertion;
+  });
+});
+
+// request640：退休 builtin 的中央请求许可门。gate.realRetiredGate 打开后走真实注册表判定
+// （book15 lifecycle='retired'，识别仍在）；「活跃合成目标」用 refreshSupportedHosts 注入
+// e1.test（非 builtin 注册表 host，isRetiredBuiltinHost=false ⇒ 不拦），走真实 transport 路径。
+describe('退休 builtin 请求许可门（request640）', () => {
+  beforeEach(() => { gate.realRetiredGate = true; });
+  afterEach(() => { gate.realRetiredGate = false; refreshSupportedHosts([]); });
+
+  it.each([
+    'https://book15.net/books/1.html', // apex
+    'https://www.book15.net/books/1.html', // www 别名
+  ])('初始目标为退休 host：%s 零物理请求即拒', async (url) => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal('fetch', fetchMock);
+    const beforeRequest = vi.fn().mockResolvedValue(undefined);
+    await expect(fetchSourceText(url, { ...options(), beforeRequest })).rejects.toThrow('已退休');
+    expect(fetchMock).not.toHaveBeenCalled(); // 0 次物理 fetch
+    expect(beforeRequest).not.toHaveBeenCalled(); // 也没烧预算点数
+    expect(isRetiredBuiltinHost(new URL(url).hostname)).toBe(true); // 用例前提自证
+  });
+
+  it('尾点根形态 https://book15.net./ ：静态门先行拒绝，同样零物理请求', async () => {
+    // 尾点 host 不在运行时白名单的规范 hostname 形态里，validateSourceUrl 先拒
+    // （即便 URL 解析器保留尾点放它过 host 门，退休门也认：normalizeBuiltinHost 尾点归一同判）。
+    const fetchMock = vi.fn();
+    vi.stubGlobal('fetch', fetchMock);
+    await expect(fetchSourceText('https://book15.net./books/1.html', options())).rejects.toThrow();
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(isRetiredBuiltinHost('book15.net.')).toBe(true); // 注册表侧尾点归一仍判退休
+  });
+
+  it('活跃合成目标正常放行（非 builtin 注册表 host 不受退休门影响）', async () => {
+    // 行为断言（85ba55f 阻断项修复的钉子）：活跃绝对 URL 必须到达 mock fetch，而非在
+    // 退休门里因参数形态错误抛 Invalid URL TypeError。
+    refreshSupportedHosts(['e1.test']);
+    const fetchMock = vi.fn().mockResolvedValue(new Response('正文'));
+    vi.stubGlobal('fetch', fetchMock);
+    expect(await fetchSourceText('https://e1.test/a', options())).toEqual({ url: 'https://e1.test/a', text: '正文' });
+    expect(fetchMock).toHaveBeenCalledOnce();
+    expect(fetchMock.mock.calls[0][0]).toBe('https://e1.test/a'); // 真实物理发射了这一发
+  });
+
+  it.each(['https://book15.net/a', 'https://www.book15.net/a'])('退休变体 %s 拒为 SourcePolicyError 而非 TypeError', async (url) => {
+    vi.stubGlobal('fetch', vi.fn());
+    await expect(fetchSourceText(url, options())).rejects.toBeInstanceOf(SourcePolicyError);
+  });
+
+  it('活跃请求被 302 跳向退休 host：仅第一次 fetch 发出，第二次发射前被拒', async () => {
+    refreshSupportedHosts(['e1.test']);
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(null, { status: 302, headers: { location: 'https://book15.net/retired.html' } }))
+      .mockResolvedValue(new Response('不该到达'));
+    vi.stubGlobal('fetch', fetchMock);
+    await expect(fetchSourceText('https://e1.test/a', options())).rejects.toThrow('已退休');
+    expect(fetchMock).toHaveBeenCalledOnce(); // e1.test 一发；退休跳转目标零发射
+  });
+
+  it('退休拒绝是策略拒绝：不触发换 host 兜底（apex 退休 www 同退休）', async () => {
+    // 若被误判为传输错误，fetchWithHostSwap 会退避后打 www.book15.net 第二发——用 fake timers
+    // 推满退避窗口，断言仍零物理请求。
+    vi.useFakeTimers();
+    const fetchMock = vi.fn();
+    vi.stubGlobal('fetch', fetchMock);
+    const pending = fetchSourceText('https://book15.net/a', options());
+    const assertion = expect(pending).rejects.toThrow('已退休');
+    await vi.advanceTimersByTimeAsync(SOURCE_HOST_SWAP_DELAY_MS * 2);
+    await assertion;
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('通用旧 URL 识别仍可用：validateSourceUrl 照常认得退休 host（识别 ≠ 许可）', () => {
+    expect(validateSourceUrl('https://book15.net/books/1.html').hostname).toBe('book15.net');
+    expect(validateSourceUrl('/x', 'https://www.book15.net/base').href).toBe('https://www.book15.net/x');
   });
 });

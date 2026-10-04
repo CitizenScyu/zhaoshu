@@ -3,6 +3,15 @@ import { fetchSourceText } from './source-fetch';
 import { encodeToBytes } from './source-charset';
 import { buildSourceSearchRequest } from './source-parser';
 
+// request640：source-fetch 增设退休 builtin 请求许可门，真实注册表里 book15 lifecycle='retired'。
+// 本文件全部用例以 book15.net 为合成载体测 POST/跳转/字符集的传输合同，不测生命周期——
+// 把退休门钉成 false（等价「book15 仍活跃」的注册表形态，同 source-fetch.test.ts 上方两组）；
+// 退休门自身的行为断言见 source-fetch.test.ts 的「退休 builtin 请求许可门」专组。
+vi.mock('./supported-sources', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./supported-sources')>();
+  return { ...actual, isRetiredBuiltinHost: () => false };
+});
+
 afterEach(() => { vi.unstubAllGlobals(); });
 const base = () => ({ signal: new AbortController().signal });
 

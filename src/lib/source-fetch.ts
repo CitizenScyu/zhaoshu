@@ -1,6 +1,7 @@
 // TypeScript port of zhaoshu-books/lib/source-fetch.mjs (batch 10).
 // Keep redirects, body limits and the single request/body timeout in sync.
 import { alternateSourceHost, SourcePolicyError, validateSourceUrl } from './source-policy';
+import { isRetiredBuiltinHost } from './supported-sources';
 import { recordHostFailure, recordHostSuccess, type HostFailureKind } from './source-host-health';
 import { charsetFromContentType, encodeToBytes, type SourceCharset } from './source-charset';
 import { charsetFromHtmlPrefix, SOURCE_HTML_CHARSET_BYTES } from './source-html-charset';
@@ -149,6 +150,9 @@ interface FetchSourceOptions {
 export async function fetchSourceText(input: string, options: FetchSourceOptions) {
   options.signal.throwIfAborted();
   const initial = validateSourceUrl(input);
+  // 退休 builtin 门（request640）：host 门（validateSourceUrl）只管「认得这个 host」，
+  // 静态生命周期在此收口——初始目标即退休 host 时，在预算扣点/网络发射/健康记账之前拒绝。
+  assertNotRetiredBuiltin(initial);
   try {
     const page = await fetchWithHostSwap(initial, options);
     recordHostSuccess(initial.hostname);
@@ -203,6 +207,25 @@ function swapHost(url: URL): URL | null {
   return next;
 }
 
+/**
+ * 退休 builtin 的中央请求许可门（request640）。isRetiredBuiltinHost 含 trim/小写/尾点根归一与
+ * apex/www 别名（supported-sources.ts 纯静态判定，不读 DB/env）。
+ * 只在**即将真实发射**的位置调用：fetchSourceText 初始校验后、attemptOnce 每次物理 fetch 前
+ * （含 302/307 跳转后的新 current 与换 host 兜底的新起点）。抛 SourcePolicyError——
+ * 策略拒绝不是站点传输故障（isTransportError 排除 SourcePolicyError ⇒ 不触发换 host/
+ * 半开试探/host 健康失败计数）。
+ * 刻意不放进 validateSourceUrl/checkSourceUrl：它们同时承担**旧 URL 识别**（旧书任务身份、
+ * 换源 excludeBookUrl、parseSourceIdentity 输入），认得退休 host ≠ 允许向它发请求。
+ * 参数收 URL 对象而非 string：attemptOnce 内部 current 是绝对 href、初始校验点拿的是
+ * validateSourceUrl 产物，两侧都已是 URL/绝对地址；收 string 会诱使调用点传裸 hostname
+ * （85ba55f 审查阻断项：new URL('book15.net') 抛 Invalid URL，活跃源全部误伤成 TypeError）。
+ */
+function assertNotRetiredBuiltin(target: URL): void {
+  if (isRetiredBuiltinHost(target.hostname)) {
+    throw new SourcePolicyError('书源已退休：不再对该来源发起请求');
+  }
+}
+
 async function attemptOnce(start: URL, {
   signal: parentSignal, timeoutMs, connectTimeoutMs, maxRedirects, maxBytes, beforeRequest, beforeFetch, request, responseCharset,
   skipFirstBeforeRequest = false,
@@ -233,6 +256,10 @@ async function attemptOnce(start: URL, {
   try {
     for (let redirects = 0; ; redirects += 1) {
       signal.throwIfAborted();
+      // 退休门在扣点（beforeRequest）/节流/物理 fetch 之前：跳转后的新 current（302/307 的
+      // Location 指向退休 host）与换 host 兜底的新起点都在这里拦，且不为注定被拒的目标烧预算。
+      // current 恒为绝对 href（初始 URL 经 validateSourceUrl、跳转经 validateSourceUrl(location, current)）。
+      assertNotRetiredBuiltin(new URL(current));
       if (redirects > 0 || !skipFirstBeforeRequest) {
         try { await beforeRequest?.(signal, current); }
         catch (error) { (error as BeforeRequestFailure).fromBeforeRequest = true; throw error; }
