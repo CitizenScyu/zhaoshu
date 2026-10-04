@@ -29,11 +29,12 @@ const resolved = {
   matched: { title: book.title, author: book.author },
 };
 
-function request(body: unknown) {
+function request(body: unknown, signal?: AbortSignal) {
   return new NextRequest('http://localhost/api/download/relocate', {
     method: 'POST',
     headers: { Authorization: 'Bearer relocate-test-owner', 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
+    ...(signal ? { signal } : {}),
   });
 }
 
@@ -112,6 +113,28 @@ describe('POST /api/download/relocate', () => {
     const response = await POST(request({ bookId: book.id }));
     expect(response.status).toBe(503);
     expect(await response.json()).toEqual({ error: 'pool unavailable', code: 'SOURCE_UNAVAILABLE' });
+    expect(reclaim).not.toHaveBeenCalled();
+  });
+
+  it('maps an aborted relocation to 504 REQUEST_ABORTED, not a 500 db error', async () => {
+    sql.mockResolvedValueOnce([book]);
+    relocate.mockImplementationOnce((_book, signal) => Promise.reject(signal!.reason ?? new DOMException('The operation was aborted.', 'AbortError')));
+    const response = await POST(request({ bookId: book.id }));
+    expect(response.status).toBe(504);
+    expect(await response.json()).toEqual({ error: 'relocation aborted or timed out', code: 'REQUEST_ABORTED' });
+    expect(reclaim).not.toHaveBeenCalled();
+  });
+
+  it('maps a client-aborted request to 504 REQUEST_ABORTED, not a 500 db error', async () => {
+    sql.mockResolvedValueOnce([book]);
+    const controller = new AbortController();
+    relocate.mockImplementationOnce((_book, signal) => new Promise((_resolve, reject) => {
+      signal!.addEventListener('abort', () => reject(signal.reason ?? new DOMException('The operation was aborted.', 'AbortError')));
+      controller.abort(new Error('client aborted'));
+    }));
+    const response = await POST(request({ bookId: book.id }, controller.signal));
+    expect(response.status).toBe(504);
+    expect(await response.json()).toEqual({ error: 'relocation aborted or timed out', code: 'REQUEST_ABORTED' });
     expect(reclaim).not.toHaveBeenCalled();
   });
 

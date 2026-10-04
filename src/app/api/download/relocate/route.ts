@@ -29,6 +29,11 @@ async function handlePOST(req: NextRequest) {
   const bookId = boundedPositiveInteger(body?.bookId);
   if (bookId === null) return authJson({ error: 'missing bookId', code: 'INVALID_ID' }, { status: 400 });
 
+  // deadline/signal 提到 try 外（镜像 read/source 路由）：catch 里才判得到 signal.aborted；
+  // 55s 预算随之从查库就开始计（maxDuration 60 仍留余量）。
+  const deadline = AbortSignal.timeout(55_000);
+  const signal = AbortSignal.any([req.signal, deadline]);
+
   try {
     await ensureSchema();
     const sql = getSql();
@@ -41,8 +46,6 @@ async function handlePOST(req: NextRequest) {
     if (!books.length) return authJson({ error: 'book not found', code: 'BOOK_NOT_FOUND' }, { status: 404 });
     const book = books[0];
 
-    const deadline = AbortSignal.timeout(55_000);
-    const signal = AbortSignal.any([req.signal, deadline]);
     const source = await resolveDownloadRelocation({ title: book.title, author: book.author }, signal);
 
     await reclaimStaleTasks(sql);
@@ -63,6 +66,11 @@ async function handlePOST(req: NextRequest) {
       },
     }, { status: 201 });
   } catch (error) {
+    // 整体中止/超时（req.signal 或 55s deadline，引擎循环裸抛 AbortError 上逸）先于其余错误档，
+    // 归一化 504，镜像 read/source 路由 signal.aborted → 504 的形态。
+    if (signal.aborted) {
+      return authJson({ error: 'relocation aborted or timed out', code: 'REQUEST_ABORTED' }, { status: 504 });
+    }
     if (error && typeof error === 'object' && 'code' in error && error.code === '23505') {
       try {
         return conflictResponse(await activeTaskFor(getSql(), guard.principal.userId, bookId));
