@@ -23,8 +23,9 @@ vi.mock('./source-reader', () => {
   return { SourceReaderError, SourceRequestContext, resolveSourceBook };
 });
 
+import { SourcePolicyError } from './source-policy';
 import { SourceReaderError } from './source-reader';
-import { resolveDownloadRelocation } from './download-relocate';
+import { DownloadRelocationError, resolveDownloadRelocation } from './download-relocate';
 
 const pool = [{ url: 'https://active.example/', name: 'active', searchUrl: '/search', rules: {}, tier: 'M1' }];
 const catalog = {
@@ -87,5 +88,22 @@ describe('resolveDownloadRelocation', () => {
     resolveSourceBook.mockRejectedValueOnce(unavailable);
     await expect(resolveDownloadRelocation({ title: catalog.title, author: catalog.author }, new AbortController().signal))
       .rejects.toBe(unavailable);
+  });
+
+  it('maps SOURCE_SIMILAR to RELOCATION_IDENTITY_MISMATCH without candidates', async () => {
+    resolveSourceBook.mockRejectedValueOnce(new SourceReaderError('similar only', 'SOURCE_SIMILAR', 422));
+    const rejection = resolveDownloadRelocation({ title: catalog.title, author: catalog.author }, new AbortController().signal);
+    await expect(rejection).rejects.toBeInstanceOf(DownloadRelocationError);
+    await expect(rejection).rejects.toMatchObject({ code: 'RELOCATION_IDENTITY_MISMATCH', status: 422 });
+    await expect(rejection).rejects.not.toHaveProperty('candidates');
+  });
+
+  it('maps a SourcePolicyError whitelist rejection to RELOCATION_IDENTITY_MISMATCH without candidates', async () => {
+    resolveSourceBook.mockResolvedValueOnce({ ...catalog, bookUrl: 'https://blocked.example/book/7' });
+    validateSourceUrl.mockImplementationOnce(() => { throw new SourcePolicyError('host not whitelisted'); });
+    const rejection = resolveDownloadRelocation({ title: catalog.title, author: catalog.author }, new AbortController().signal);
+    await expect(rejection).rejects.toBeInstanceOf(DownloadRelocationError);
+    await expect(rejection).rejects.toMatchObject({ code: 'RELOCATION_IDENTITY_MISMATCH', status: 422 });
+    await expect(rejection).rejects.not.toHaveProperty('candidates');
   });
 });
