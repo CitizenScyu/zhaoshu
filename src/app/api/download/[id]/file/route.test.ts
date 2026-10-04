@@ -569,8 +569,6 @@ describe('GET /api/download/[id]/file', () => {
       const first = await reader.read();
       expect(first.done).toBe(false);
       expect(first.value).toBeDefined();
-      // 合同是字节值而非原型:controller.enqueue 传入的是 readBoundedBody 返回的 Buffer,
-      // 统一转成同型 Uint8Array 再比较,避免依赖未执行的 matcher 对跨原型相等性的推断。
       expect(new Uint8Array(first.value!)).toEqual(new TextEncoder().encode(fx.vol1));
 
       await expect(reader.read()).rejects.toThrow();
