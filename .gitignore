@@ -68,3 +68,9 @@ shuyuan-refresh/dist/
 
 # T8 运行包打包产物（esbuild bundle + tar，可重复生成）
 runtime-download/build/
+
+# gate630 synthetic artifacts (fixtures/fake dirs/logs, regenerate on run)
+verify628-gate.log
+verify630-fx/
+verify630-tmp/
+verify630-fake-home/
