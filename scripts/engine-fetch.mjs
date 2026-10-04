@@ -122,9 +122,10 @@ function builtinSource(m) {
 
 const isBuiltin = (source) => source.tier === 'builtin' || !source.rules || Object.keys(source.rules).length === 0;
 
-/** 池序里的 builtin 段：无活跃 builtin 时留空，不注入退休源。 */
+/** 池序里的 builtin 段：始终数组（有活跃 builtin 单元素，无则空），供 cmdSearch 展开。 */
 function builtinPoolEntry(m) {
-  return builtinSource(m) ?? [];
+  const b = builtinSource(m);
+  return b ? [b] : [];
 }
 
 // 复刻 source-reader 的 engineSourceOf（未导出）：编译走 compile.ts 的 LRU。
@@ -223,9 +224,11 @@ async function resolveSourceForUrl(m, url, signal) {
   if (!/^https:\/\//i.test(url)) throw new ExitError(2, '--url 非法：仅支持 HTTPS 完整地址');
   const host = hostOf(url);
   if (!host) throw new ExitError(2, `--url 非法：无法解析 host`);
-  // 识别 ≠ 许可：retired builtin host 不直通 builtin 腿，落引擎池按 host 反查；
-  // 找不到同站引擎源 ⇒ no_source（code=1 有限失败），不复活退休源。
   if (isBuiltinHost(m, host)) return { source: builtinSource(m), builtin: true };
+  // 退休是静态事实：判定不依赖引擎池/DB，池反查之前即收口（code=2）。
+  if (m.supported.isRetiredBuiltinHost?.(host)) {
+    throw new ExitError(2, 'builtin_source_retired', 'builtin_source_retired');
+  }
   // 非 builtin host ⇒ 需要引擎源池（DB）。DB 不可达 ⇒ 退 2。
   let enginePool;
   try {
