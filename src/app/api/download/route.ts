@@ -58,13 +58,13 @@ function toTask(row: TaskRow) {
   };
 }
 
-interface ActiveTask {
+export interface ActiveTask {
   id: number;
   status: string;
 }
 
 // 同一用户对同一本书的活动任务（pending/running）。F03 的 partial 不在锁内：残缺终态可重下补齐。
-async function activeTaskFor(sql: DownloadSql, userId: number, bookId: number): Promise<ActiveTask | null> {
+export async function activeTaskFor(sql: DownloadSql, userId: number, bookId: number): Promise<ActiveTask | null> {
   const rows = (await sql`
     SELECT id, status FROM download_tasks
     WHERE requested_by = 'user' AND user_id = ${userId} AND book_id = ${bookId} AND status IN ('pending', 'running')
@@ -74,7 +74,7 @@ async function activeTaskFor(sql: DownloadSql, userId: number, bookId: number): 
 
 // 冲突响应带上同一用户已有任务的 taskId 与状态：前端据此接续轮询，而不是只显示一句
 // 「已在队列」后拿不到任务（F17）。竞争路径查不到时 taskId/status 为 null，前端回退提示。
-function conflictResponse(existing: ActiveTask | null) {
+export function conflictResponse(existing: ActiveTask | null) {
   return authJson(
     {
       error: '已有进行中的任务',
