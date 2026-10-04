@@ -11,6 +11,7 @@ import { createWorkerStorage, type DownloadSql } from './storage';
 import { createDownloadExecutor } from './entry';
 import { DEFAULT_DECISIONS } from './executor';
 import type { GitHubContents } from '../src/lib/download-publisher';
+import { reclaimStaleTasks } from '../src/lib/download-task-reclaim';
 
 const PGliteCtor = await loadPGlite();
 const maybe = PGliteCtor ? describe : describe.skip;
@@ -95,15 +96,19 @@ maybe('618 退休源反例：旧 book15 URL 的 builtin 下载任务（真实注
     }
   });
 
-  const insertTask = async (): Promise<number> => Number(((await pg.query(
-    `INSERT INTO download_tasks(user_id, book_id, title, author, status, source_url, requested_by, source_kind)
-     VALUES (NULL, 1, $1, $2, 'pending', $3, 'system', 'builtin') RETURNING id`, [TITLE, AUTHOR, BOOK_URL],
+  const insertTask = async (opts: {
+    requestedBy?: string; attemptCount?: number; status?: string; updatedAtAgoMs?: number;
+  } = {}): Promise<number> => Number(((await pg.query(
+    `INSERT INTO download_tasks(user_id, book_id, title, author, status, source_url, requested_by, source_kind, attempt_count, updated_at)
+     VALUES (NULL, 1, $1, $2, $3, $4, $5, 'builtin', $6, now() - ($7::bigint * interval '1 millisecond')) RETURNING id`,
+    [TITLE, AUTHOR, opts.status ?? 'pending', BOOK_URL, opts.requestedBy ?? 'system',
+      opts.attemptCount ?? 0, opts.updatedAtAgoMs ?? 0],
   )).rows[0] as { id: number }).id);
   const row = async (id: number) => (await pg.query(
-    `SELECT status, error, attempt_count, artifact_id, source_url,
+    `SELECT status, error, attempt_count, artifact_id, source_url, lease_owner,
             (extract(epoch FROM (next_attempt_at - updated_at)) * 1000)::float8 AS delay_ms
      FROM download_tasks WHERE id = $1`, [id],
-  )).rows[0] as { status: string; error: string; attempt_count: number; artifact_id: number | null; source_url: string; delay_ms: number | null };
+  )).rows[0] as { status: string; error: string; attempt_count: number; artifact_id: number | null; source_url: string; lease_owner: string; delay_ms: number | null };
 
   /** 生产装配 + 合成边界。transport 对任何请求一律记录并抛错（断言「零出网」）。 */
   async function wired(opts: { catalog?: Catalog; pool?: string[]; env?: Record<string, string>; strictDownload?: boolean }) {
@@ -203,5 +208,62 @@ maybe('618 退休源反例：旧 book15 URL 的 builtin 下载任务（真实注
     expect(w.downloaded).toEqual(['book15.net']); // builtin 腿被调用一次（改前行为），但——
     expect(w.requests).toEqual([]); // ——零出网：退休在 resolve 即收口，不靠连接超时判出
     expect(w.budget.used()).toBe(0);
+  });
+
+  // 669：钉住 666 轮亲读的三条既有语义（不改生产代码）。
+  // 依据：download-worker.ts:195–209 settleSourceUnavailable —— attemptCount<16 ⇒ defer 重排；
+  //       否则 ⇒ finish 终态 partial（非 failed）。defer 语义见 download-task-queue.ts:223–233。
+  it('④ user 任务同源不可用仍走 defer（不因 requested_by=user 而直接 failed）', async () => {
+    // requested_by='user'、源不可用、attempt_count=0 < 16。
+    // settleSourceUnavailable 不读 requested_by（download-worker.ts:190–209 无该判断），
+    // 领取 +1 后 lease.attemptCount=1 < 16 ⇒ defer：download-task-queue.ts:225 置 status='pending'、
+    // attempt_count=attempt_count+1、lease_owner=''。断言其未落 failed。
+    const id = await insertTask({ requestedBy: 'user' });
+    const w = await wired({ pool: ['nomatch.example'], catalog: { 'nomatch.example': { hits: [], detail: { title: '', author: '' } } } });
+    expect(await w.executor.runOnce()).toBe(DEFAULT_DECISIONS.TASK_DONE);
+    const state = await row(id);
+    expect(state.status).toBe('pending'); // 非 failed
+    expect(state.status).not.toBe('failed');
+    expect(state.attempt_count).toBe(2); // 领取 +1、defer +1
+    expect(state.lease_owner).toBe('');
+    expect(state.error).toContain('source_unavailable');
+    expect(w.requests).toEqual([]);
+  });
+
+  it('⑤ attempt_count 达上限（16）⇒ finish 终态 partial 且不再重排（非 failed）', async () => {
+    // 源不可用、领取后 lease.attemptCount 达 SOURCE_RETRY_MAX_ATTEMPTS=16（download-task-policy.ts:11）：
+    // download-worker.ts:195 的 `attemptCount < 16` 为假 ⇒ download-worker.ts:203–208 走 finish(status:'partial')，
+    // 不 defer。插入 attempt_count=15，领取 +1 ⇒ lease.attemptCount=16（上限）。
+    const id = await insertTask({ attemptCount: 15 });
+    const w = await wired({ pool: ['nomatch.example'], catalog: { 'nomatch.example': { hits: [], detail: { title: '', author: '' } } } });
+    await w.executor.runOnce();
+    const state = await row(id);
+    expect(state.status).toBe('partial'); // 终态 partial，非 failed
+    expect(state.status).not.toBe('failed');
+    // finish 不改 attempt_count（download-task-queue.ts:202–208）：仍为领取后的 16；
+    // 若发生 defer 则为 17 —— 据此钉住「不再重排」。
+    expect(state.attempt_count).toBe(16);
+    expect(state.error).toContain('source_unavailable');
+    expect(w.requests).toEqual([]);
+  });
+
+  it('⑥ reclaim 对照：同一过期租约下 system 回 pending、user 直接 failed', async () => {
+    // 依据 download-task-reclaim.ts:18–36：WHERE status='running' AND 心跳过期；
+    //   requested_by='system' AND attempt_count < 16 ⇒ 'pending' 且 attempt_count+1；
+    //   否则（含 user，不分次数）⇒ 'failed' 且 attempt_count 不变；两者 lease_owner=''（:34）。
+    const staleAgo = 31 * MINUTE; // > DOWNLOAD_TASK_STALE_MS=30min（download-task-policy.ts:3）
+    const sysId = await insertTask({ requestedBy: 'system', attemptCount: 0, status: 'running', updatedAtAgoMs: staleAgo });
+    const userId = await insertTask({ requestedBy: 'user', attemptCount: 0, status: 'running', updatedAtAgoMs: staleAgo });
+    await reclaimStaleTasks(sql);
+    const sys = await row(sysId);
+    const user = await row(userId);
+    // 并列断言：同一回收谓词下两种 requested_by 的终态分叉。
+    expect(sys.status).toBe('pending');
+    expect(sys.attempt_count).toBe(1); // system 且 <16：attempt_count+1
+    expect(sys.lease_owner).toBe('');
+    expect(user.status).toBe('failed');
+    expect(user.status).not.toBe('pending');
+    expect(user.attempt_count).toBe(0); // user：attempt_count 不变（即使次数远低于上限）
+    expect(user.lease_owner).toBe('');
   });
 });
