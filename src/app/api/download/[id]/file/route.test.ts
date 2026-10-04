@@ -566,16 +566,16 @@ describe('GET /api/download/[id]/file', () => {
       expect(res.status).toBe(200);
 
       const reader = res.body!.getReader();
-      // 第一卷正确且实际下发。
       const first = await reader.read();
       expect(first.done).toBe(false);
-      expect(first.value).toEqual(new TextEncoder().encode(fx.vol1));
+      expect(first.value).toBeDefined();
+      // 合同是字节值而非原型:controller.enqueue 传入的是 readBoundedBody 返回的 Buffer,
+      // 统一转成同型 Uint8Array 再比较,避免依赖未执行的 matcher 对跨原型相等性的推断。
+      expect(new Uint8Array(first.value!)).toEqual(new TextEncoder().encode(fx.vol1));
 
-      // 第二卷快照 HTTP 成功但 sha 不符 → 下一次 read 拒绝。
       await expect(reader.read()).rejects.toThrow();
 
-      // 精确边界:只取了清单 + 第一卷快照 + 第二卷快照;
-      // 第三卷快照/规范卷零请求,第二卷也不因 sha 不符回退规范卷。
+      // 精确边界:第三卷快照/规范卷零请求,第二卷也不因 sha 不符回退规范卷。
       expect(hits).toEqual(['index.json', fx.snapName(fx.vol1), fx.snapName(fx.vol2)]);
 
       // 已 errored 的流再 cancel 会拒绝:捕获掉,不留未处理 Promise。
