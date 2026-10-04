@@ -766,14 +766,44 @@ export default function LibraryTab({ view, setView }: {
             {canDownload && dlMessage && (
               <p role="status" className="text-xs mb-2" style={{ color: 'var(--dai)' }}>{dlMessage}</p>
             )}
+            {canDownload && relocateOffered && (task === null || task.requestedBy !== 'system'
+              && (task.status === 'failed' || task.status === 'partial' || task.status === 'superseded_by_incomplete'
+                || (task.status === 'running' && task.leaseExpired))) && (
+              <p className="text-xs mb-2 leading-5" style={{ color: 'var(--ink-soft)' }}>
+                原下载源已下线或不被支持，可按书名+作者在当前活跃书源池重新定位后下载。
+              </p>
+            )}
+            {canDownload && relocateCandidates.length > 0 && (
+              <div className="border-l-2 pl-3 mb-2" style={{ borderColor: 'var(--line)' }} aria-label="重定位候选（仅供参考）">
+                <ul
+                  className="list-disc pl-4 space-y-1 text-xs leading-6 break-words"
+                  style={{ color: 'var(--ink-soft)' }}
+                >
+                  {relocateCandidates.map((c, index) => (
+                    <li key={index}>《{c.title}》 — {c.author} · {candidateHost(c.bookUrl)}</li>
+                  ))}
+                </ul>
+              </div>
+            )}
             {!canDownload ? (
               <p role="status" className="text-sm" style={{ color: 'var(--ink-soft)' }}>
                 当前账号尚未获得下载权限，请联系管理员开通后再试。
               </p>
             ) : task === null ? (
-              <button className="seal-button text-sm" onClick={() => void startDownload()} disabled={dlBusy}>
-                {dlBusy ? '提交中…' : '⬇ 下载全书'}
-              </button>
+              <div className="flex flex-wrap items-center gap-3">
+                <button className="seal-button text-sm" onClick={() => void startDownload()} disabled={dlBusy}>
+                  {dlBusy ? '提交中…' : '⬇ 下载全书'}
+                </button>
+                {relocateOffered && (
+                  <button
+                    className="chip chip-dai text-sm disabled:opacity-50"
+                    onClick={() => void relocateDownload()}
+                    disabled={dlBusy}
+                  >
+                    {dlBusy ? '正在活跃源中查找…' : '⟳ 换活跃源重下'}
+                  </button>
+                )}
+              </div>
             ) : (
               <div className="space-y-3">
                 <div className="flex flex-wrap items-center gap-3">
@@ -800,6 +830,16 @@ export default function LibraryTab({ view, setView }: {
                       disabled={dlBusy}
                     >
                       {dlBusy ? '处理中…' : '重试'}
+                    </button>
+                  )}
+                  {relocateOffered && task.requestedBy !== 'system' && (task.status === 'failed' || task.status === 'partial'
+                    || task.status === 'superseded_by_incomplete' || (task.status === 'running' && task.leaseExpired)) && (
+                    <button
+                      className="chip chip-dai text-sm disabled:opacity-50"
+                      onClick={() => void relocateDownload()}
+                      disabled={dlBusy}
+                    >
+                      {dlBusy ? '正在活跃源中查找…' : '⟳ 换活跃源重下'}
                     </button>
                   )}
                   {task.requestedBy !== 'system' && (task.status === 'pending' || task.status === 'failed' || task.status === 'partial'
