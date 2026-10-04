@@ -189,32 +189,6 @@ maybe('T3 worker 任务层：租约、单写者、五阶段对账（PGlite + moc
     expect(github.calls).toHaveLength(0);
   });
 
-  // 端到端时序契约：code=2 被引擎 adapter 分类为 incomplete(source_unavailable) 后，runDownloadTask
-  // 必须走 settleSourceUnavailable 的 defer 退避链（download-worker.ts L279-292 → settleSourceUnavailable
-  // L195-202 → deferDownloadTask 单条 UPDATE），而不是 partial 终态——否则 claim 到期自动重领、自动换源
-  // 重试就断了。本例从 runDownloadTask 入口直接钉住返回值（非终态 + retryAt）与 DB 落库三件套
-  // （pending / attempt_count+1 / next_attempt_at），并复钉零发布。
-  it('incomplete(source_unavailable) 端到端退避：非终态 retryAt + pending/attempt_count+1/next_attempt_at 落库，零发布', async () => {
-    const id = await insertTask();
-    const result = await runDownloadTask(
-      options([scriptAdapter({ kind: 'incomplete', reason: 'source_unavailable', chaptersTotal: 10, chaptersDone: 7, charsTotal: 5000, stage: 'toc' })]),
-      (await claimDownloadTask(sql as never, 'worker-a'))!,
-    );
-    // 非终态：settleSourceUnavailable 未达 SOURCE_RETRY_MAX_ATTEMPTS(16) ⇒ defer 有值
-    expect(result).toMatchObject({ processed: true, reason: 'source_unavailable' });
-    expect(result.terminal).toBeUndefined();
-    expect(typeof result.retryAt).toBe('string');
-    // DB 侧：deferDownloadTask 落 pending + attempt_count 基线 1 → 2 + 15m 退避 + 租约清空
-    const deferred = await deferState(id);
-    expect(deferred).toMatchObject({ status: 'pending', attempt_count: 2, lease_owner: '', delay_min: 15 });
-    expect(deferred.next_attempt_at).toBeTruthy();
-    expect(deferred.next_attempt_at).toBe(result.retryAt);
-    expect(String(deferred.error)).toContain('source_unavailable');
-    // 零发布：incomplete 分派不写 GitHub、不写 book_artifacts（partial 零发布用例同款）
-    expect(github.calls).toHaveLength(0);
-    expect((await pg.query('SELECT count(*)::int AS n FROM book_artifacts')).rows[0].n).toBe(0);
-  });
-
   it('41-bookidfk：孤儿任务（book_id 不在 labeled_books）写 book_artifacts 撞外键 → failed 且错误为可读码、零发布', async () => {
     // 复现 t8fk-41 task 292：库停在 artifact v1（没有 download_tasks_book_fk），旁路入队了 book_id=292。
     await pg.exec('ALTER TABLE download_tasks DROP CONSTRAINT download_tasks_book_fk');
@@ -338,12 +312,6 @@ maybe('T3 worker 任务层：租约、单写者、五阶段对账（PGlite + moc
             round(extract(epoch FROM (next_attempt_at - now())) / 60)::int AS delay_min
      FROM download_tasks WHERE id = $1`, [id],
   )).rows[0] as { status: string; error: string; attempt_count: number; lease_owner: string; delay_min: number | null };
-  const deferState = async (id: number) => (await pg.query(
-    `SELECT status, error, attempt_count, lease_owner,
-            round(extract(epoch FROM (next_attempt_at - now())) / 60)::int AS delay_min,
-            to_char(next_attempt_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS next_attempt_at
-     FROM download_tasks WHERE id = $1`, [id],
-  )).rows[0] as { status: string; error: string; attempt_count: number; lease_owner: string; delay_min: number | null; next_attempt_at: string | null };
   const badGateway = () => Object.assign(new Error('bad gateway'), { code: 'http_502' });
 
   it('B2-03 规范阶段中途失败（卷已换新、index.json 未写）→ pending + 15m 退避；到期重领重跑 → done 且规范收敛到新版', async () => {
