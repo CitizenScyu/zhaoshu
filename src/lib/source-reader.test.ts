@@ -1236,6 +1236,71 @@ describe('引擎源分派（M1 任务 4 §7.2）', () => {
     }
   });
 });
+
+// 675：阅读入口退休 source_url 定向契约（书库行带退休 host 的普通书 + 活跃引擎池）。
+// 前提（664 轮已核）：真实注册表里 book15 已退休，getReadingSources 合成活跃池先剔退休 host——
+// 但本文件 vi.mock('./shuyuan')，池合成被 mocks.sources 替身接管，不经过真实注册表；
+// 这里钉的是 resolveSourceBook 在「书库 hints 带退休 source_url + 活跃引擎池」输入下的端到端合同：
+// 重定位成功（零出网退休 host）/ 池空 503 SOURCE_UNAVAILABLE（不造默认源）。
+describe('退休 source_url 普通书的活跃引擎重定位（675 契约）', () => {
+  const retiredHintHost = 'book15.net'; // 与本文件全部既有夹具同一 host：真实注册表已退休
+  const retiredHintUrl = 'https://book15.net/books/details42.html';
+  // 合成活跃引擎源：与既有「引擎源分派」describe 同款规则，host 用注册外的合成 host。
+  const activeEngine = {
+    url: 'https://active-engine.test/', name: '活跃引擎源', searchUrl: 'https://active-engine.test/s?q={{key}}',
+    tier: 'M1' as const,
+    rules: {
+      ruleSearch: { bookList: '.book', name: '.name@text', author: '.author@text', bookUrl: 'a@href' },
+      ruleBookInfo: { name: '.title@text', author: '.writer@text', tocUrl: '.toc@href' },
+      ruleToc: { chapterList: '.chapter', chapterName: 'a@text', chapterUrl: 'a@href' },
+      ruleContent: { content: '.content@text' },
+    },
+  };
+  const eSearch = 'https://active-engine.test/s?q=' + encodeURIComponent(book.title);
+  const eDetail = 'https://active-engine.test/detail/675.html';
+  const eToc = 'https://active-engine.test/toc/675.html';
+  const arrangeEngineHit = () => {
+    pages.set(eSearch, { text: '<div class="book"><span class="name">测试书</span><span class="author">作者</span><a href="/detail/675.html">x</a></div>' });
+    pages.set(eDetail, { text: '<h1 class="title">测试书</h1><span class="writer">作者</span><a class="toc" href="/toc/675.html">目录</a>' });
+    pages.set(eToc, { text: '<li class="chapter"><a href="/c/675-1.html">第一章</a></li><li class="chapter"><a href="/c/675-2.html">第二章</a></li>' });
+  };
+
+  it('书库行带退休 source_url 的普通书 ⇒ 经活跃引擎源按 title+author 重定位成功，零请求打向退休 host', async () => {
+    // 合成 host 进运行时白名单（与既有用例同款注册法）；池只含活跃引擎源——退休 host 已被
+    // getReadingSources 剔除的语义，在此用「池里没有 book15 行」在 mocks.sources 替身侧表达。
+    (await import('./source-policy')).refreshSupportedHosts(['active-engine.test']);
+    mocks.sources.mockResolvedValue([activeEngine]);
+    arrangeEngineHit();
+    // 书库 hints（labeled_books 行）：source_url 指向已退休 host。普通书，非用户显式点选
+    // book_url，走整池 title+author 搜索重定位，不拿退休 URL 当确认路径。
+    hints = [{ title: book.title, author: book.author, source_url: retiredHintUrl }];
+    const catalog = await service.resolveSourceBook(book, context());
+    // 交付的是活跃引擎源的目录（bookUrl/sourceId 归属引擎源），不是退休 host 的旧行。
+    expect(catalog).toMatchObject({
+      title: '测试书', author: '作者', bookUrl: eDetail,
+      chapters: [{ url: 'https://active-engine.test/c/675-1.html', title: '第一章' }],
+    });
+    const sha1 = (value: unknown) => createHash('sha1').update(JSON.stringify(value)).digest('hex');
+    expect(catalog.sourceId).toBe(sha1([activeEngine.url, eDetail]));
+    // 零出网断言（参照既有用例的 transport 记录法）：所有已发出的请求里没有任何一个打向退休 host。
+    const requested = mocks.fetch.mock.calls.map(([input]) => String(input));
+    expect(requested.some((url) => new URL(url).hostname === retiredHintHost)).toBe(false);
+    expect(requested.every((url) => new URL(url).hostname === 'active-engine.test')).toBe(true);
+    // 退休 URL 不进确认路径：没有对退休详情页的 GET。
+    expect(requested).not.toContain(retiredHintUrl);
+  });
+
+  it('同一本书但活跃池为空（sources:[]）⇒ 503 SOURCE_UNAVAILABLE，不是 404、不造默认源', async () => {
+    // 内建源全部退休且无活跃引擎源 ⇒ 池空是「现在没有可发请求的源」的有限失败：
+    // 不把退休 host 的书库行复活成取书来源，也不落回「整轮无匹配」的 404 语义。
+    mocks.sources.mockResolvedValue([]);
+    hints = [{ title: book.title, author: book.author, source_url: retiredHintUrl }];
+    await expect(service.resolveSourceBook(book, context()))
+      .rejects.toMatchObject({ code: 'SOURCE_UNAVAILABLE', status: 503 });
+    // 零出网：池空短路在 hints 抓取之前，一个请求都不发（含退休 host 与任何合成 host）。
+    expect(mocks.fetch).not.toHaveBeenCalled();
+  });
+});
 describe('M2-2 多源循环：跳源 / 软预算 / 去重 / bookUrl 反查', () => {
   const search = (kw: string, host = 'https://book15.net') => host + '/books/search.html?kw=' + encodeURIComponent(kw);
   const sourceB = { ...source, url: 'https://book15.net/b', name: '备用书源', searchUrl: '/b/search.html?kw={{key}}' };
