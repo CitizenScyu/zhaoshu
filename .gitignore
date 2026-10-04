@@ -74,3 +74,12 @@ verify628-gate.log
 verify630-fx/
 verify630-tmp/
 verify630-fake-home/
+
+# 一次性隔离验证门的过程产物（报告/日志/门工具脚本，不属产品代码，integ683 盘点后删除并补忽略）
+report628.md
+verify625-gate.log
+verify625-report.md
+verify625_gate.py
+verify625_launcher.py
+verify628_gate.py
+verify628_launcher.py
