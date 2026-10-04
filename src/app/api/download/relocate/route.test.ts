@@ -116,10 +116,16 @@ describe('POST /api/download/relocate', () => {
     expect(reclaim).not.toHaveBeenCalled();
   });
 
+  // deadline 分量（AbortSignal.timeout）用 Node 内部计时，单测不可伪造，能真实中止的只有 req.signal 分量。
+  // 本用例在查库阶段（引擎调用前）中止，与下面引擎调用中中止互补，两者都经 composed signal 落 504。
   it('maps an aborted relocation to 504 REQUEST_ABORTED, not a 500 db error', async () => {
-    sql.mockResolvedValueOnce([book]);
-    relocate.mockImplementationOnce((_book, signal) => Promise.reject(signal!.reason ?? new DOMException('The operation was aborted.', 'AbortError')));
-    const response = await POST(request({ bookId: book.id }));
+    const controller = new AbortController();
+    sql.mockImplementationOnce(() => {
+      controller.abort();
+      return Promise.resolve([book]);
+    });
+    relocate.mockImplementationOnce((_book, signal) => Promise.reject(signal!.reason));
+    const response = await POST(request({ bookId: book.id }, controller.signal));
     expect(response.status).toBe(504);
     expect(await response.json()).toEqual({ error: 'relocation aborted or timed out', code: 'REQUEST_ABORTED' });
     expect(reclaim).not.toHaveBeenCalled();
