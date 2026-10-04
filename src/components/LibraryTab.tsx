@@ -45,6 +45,13 @@ interface DownloadTask {
   artifactId?: string | null;
 }
 
+// 换活跃源重定位候选：/api/download/relocate 422 AMBIGUOUS 返回的只读条目，仅用于展示（无点选/回传）。
+interface RelocateCandidate {
+  title: string;
+  author: string;
+  bookUrl: string;
+}
+
 const FIELD_LABELS: [string, string][] = [
   ['genre', '题材'],
   ['style', '文风'],
@@ -177,6 +184,9 @@ export default function LibraryTab({ view, setView }: {
   const [dlError, setDlError] = useState('');
   const [dlMessage, setDlMessage] = useState('');
   const [dlBusy, setDlBusy] = useState(false);
+  // 换源重定位（front681）：仅 /api/download 400 UNSUPPORTED_SOURCE 后置位出现入口；候选只读展示。
+  const [relocateOffered, setRelocateOffered] = useState(false);
+  const [relocateCandidates, setRelocateCandidates] = useState<RelocateCandidate[]>([]);
   const [shelfMsg, setShelfMsg] = useState('');
   const [shelfBusy, setShelfBusy] = useState(0); // 当前正在加书架的书 id，0 表示空闲
   const reqId = useRef(0);
@@ -226,6 +236,8 @@ export default function LibraryTab({ view, setView }: {
     setDlError('');
     setDlMessage('');
     setDlBusy(false);
+    setRelocateOffered(false);
+    setRelocateCandidates([]);
   }
 
   useEffect(() => {
@@ -295,6 +307,8 @@ export default function LibraryTab({ view, setView }: {
       setDlError('');
       setDlMessage('');
       setDlBusy(false);
+      setRelocateOffered(false);
+      setRelocateCandidates([]);
       if (!canDownload || detailId === null) return;
       void (async () => {
         try {
@@ -496,6 +510,8 @@ export default function LibraryTab({ view, setView }: {
         setDlMessage(task ? '已重新加入下载队列。' : '已加入下载队列。');
         return;
       }
+      // 源已退休/不支持：置位换源入口（反应式触发，设计稿 §2；其他失败码不置位）。
+      if (data.code === 'UNSUPPORTED_SOURCE') setRelocateOffered(true);
       throw new Error(data.error || '提交下载失败');
     } catch (e) {
       if (isCurrentAction(controller, my)) setDlError(e instanceof Error ? e.message : '提交下载失败');
