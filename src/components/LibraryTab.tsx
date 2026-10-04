@@ -45,6 +45,22 @@ interface DownloadTask {
   artifactId?: string | null;
 }
 
+// 换活跃源重定位候选：/api/download/relocate 422 AMBIGUOUS 返回的只读条目，仅用于展示（无点选/回传）。
+interface RelocateCandidate {
+  title: string;
+  author: string;
+  bookUrl: string;
+}
+
+// 候选来源站点：只给 host 便于辨识来源站点，又不让长 URL 撑爆布局；非法 URL 回退原样字符串（§3.4）。
+function candidateHost(bookUrl: string): string {
+  try {
+    return new URL(bookUrl).host;
+  } catch {
+    return bookUrl;
+  }
+}
+
 const FIELD_LABELS: [string, string][] = [
   ['genre', '题材'],
   ['style', '文风'],
@@ -177,6 +193,9 @@ export default function LibraryTab({ view, setView }: {
   const [dlError, setDlError] = useState('');
   const [dlMessage, setDlMessage] = useState('');
   const [dlBusy, setDlBusy] = useState(false);
+  // 换源重定位（front681）：仅 /api/download 400 UNSUPPORTED_SOURCE 后置位出现入口；候选只读展示。
+  const [relocateOffered, setRelocateOffered] = useState(false);
+  const [relocateCandidates, setRelocateCandidates] = useState<RelocateCandidate[]>([]);
   const [shelfMsg, setShelfMsg] = useState('');
   const [shelfBusy, setShelfBusy] = useState(0); // 当前正在加书架的书 id，0 表示空闲
   const reqId = useRef(0);
@@ -226,6 +245,8 @@ export default function LibraryTab({ view, setView }: {
     setDlError('');
     setDlMessage('');
     setDlBusy(false);
+    setRelocateOffered(false);
+    setRelocateCandidates([]);
   }
 
   useEffect(() => {
@@ -295,6 +316,8 @@ export default function LibraryTab({ view, setView }: {
       setDlError('');
       setDlMessage('');
       setDlBusy(false);
+      setRelocateOffered(false);
+      setRelocateCandidates([]);
       if (!canDownload || detailId === null) return;
       void (async () => {
         try {
@@ -496,9 +519,124 @@ export default function LibraryTab({ view, setView }: {
         setDlMessage(task ? '已重新加入下载队列。' : '已加入下载队列。');
         return;
       }
+      // 源已退休/不支持：置位换源入口（反应式触发，设计稿 §2；其他失败码不置位）。
+      if (data.code === 'UNSUPPORTED_SOURCE') setRelocateOffered(true);
       throw new Error(data.error || '提交下载失败');
     } catch (e) {
       if (isCurrentAction(controller, my)) setDlError(e instanceof Error ? e.message : '提交下载失败');
+    } finally {
+      actions.current.delete(controller);
+      if (isCurrentAction(controller, my)) setDlBusy(false);
+    }
+  }
+
+  // 换源重定位前置守卫（§3.2）：task===null 天然允许；已有任务仅可重试终态可换源
+  // （failed/partial/superseded_by_incomplete/running+leaseExpired，与入口按钮同一条件）。
+  function canRelocateNow(): boolean {
+    if (!canDownload || !detail || dlBusy || task?.requestedBy === 'system') return false;
+    if (task === null) return true;
+    return task.status === 'failed' || task.status === 'partial' || task.status === 'superseded_by_incomplete'
+      || (task.status === 'running' && task.leaseExpired);
+  }
+
+  // 换活跃源重下（design679 §3.2/§3.3）：按书名+作者在活跃源池重新定位后建任务；
+  // busy 复用 dlBusy（同一下载区块同一时刻只允许一种提交在飞），防错骨架与 startDownload 同构。
+  async function relocateDownload() {
+    if (!isCurrentSession(sessionId)) return;
+    // 内联 !detail 让 TS 对后续 await 段保持非空收窄（canRelocateNow 内的判空收窄不跨函数）。
+    if (!canRelocateNow() || !detail) return;
+    const my = ++dlRequestId.current;
+    const controller = beginAction();
+    setDlBusy(true);
+    setDlError('');
+    setDlMessage('');
+    setRelocateCandidates([]);
+    try {
+      const res = await apiFetch('/api/download/relocate', {
+        method: 'POST', signal: controller.signal,
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ bookId: detail.id }),
+      });
+      if (!isCurrentAction(controller, my)) return;
+      const data = await res.json().catch(() => ({}));
+      if (!isCurrentAction(controller, my)) return;
+      if (res.status === 409) {
+        setDlMessage('任务已在队列，无需重复提交。');
+        if (typeof data.taskId === 'number') {
+          // 读取已有任务的真实状态，避免把已经完成的任务重新显示成 pending。
+          const currentRes = await apiFetch(`/api/download?id=${data.taskId}`, { signal: controller.signal });
+          if (!isCurrentAction(controller, my)) return;
+          const currentData = await currentRes.json().catch(() => null);
+          if (!isCurrentAction(controller, my)) return;
+          const current = parseTask(currentData);
+          if (!currentRes.ok || !current || current.bookId !== detail.id) {
+            throw new Error('任务已在队列，暂时无法读取进度，请稍后重试');
+          }
+          updateTask(current);
+          if (current.status === 'done') setDlMessage('任务已完成，可取回文件。');
+          if (current.status === 'failed') setDlMessage('任务已失败，可再次重试。');
+        }
+        return;
+      }
+      if (res.ok && typeof data.taskId === 'number') {
+        setTask({
+          id: data.taskId,
+          bookId: detail.id,
+          title: detail.title,
+          status: 'pending',
+          chaptersTotal: 0,
+          chaptersDone: 0,
+          charsTotal: 0,
+          error: null,
+          updatedAt: '',
+        });
+        // matched 只进文案展示实际命中的版本，绝不回写书库（§5）。
+        const matched = data.resolvedSource?.matched;
+        setDlMessage(typeof matched?.title === 'string'
+          ? `已在活跃书源匹配到《${matched.title}》（${typeof matched.author === 'string' ? matched.author : ''}），加入下载队列。`
+          : '已加入下载队列。');
+        return;
+      }
+      if (isDbQuotaResponse(res.status, data)) {
+        setDlError('数据库额度已用尽，请稍后再试。');
+        return;
+      }
+      // 503/504 源池透传失败：入口保留可重试（书源池会恢复）。
+      if (res.status === 503 || res.status === 504) {
+        setDlError(`书源池暂时不可用(${typeof data.code === 'string' ? data.code : 'SOURCE_UNAVAILABLE'})，请稍后再试。`);
+        return;
+      }
+      // 其余按 code 映射中文文案，避免服务端英文 error 裸奔（§6）。
+      if (data.code === 'RELOCATION_NO_CANDIDATES') {
+        setDlError('当前活跃书源中未找到这本书（按书名+作者搜索无候选）。书源池更新后可再试，或联系管理员补充书源。');
+        return;
+      }
+      if (data.code === 'RELOCATION_AMBIGUOUS') {
+        const candidates = Array.isArray(data.candidates)
+          ? data.candidates.filter((c: unknown): c is RelocateCandidate =>
+            typeof c === 'object' && c !== null && typeof (c as RelocateCandidate).title === 'string'
+            && typeof (c as RelocateCandidate).author === 'string' && typeof (c as RelocateCandidate).bookUrl === 'string')
+          : [];
+        if (candidates.length > 0) {
+          setDlError('活跃书源中「书名+作者」命中多个不同条目，为避免下载到错误版本，未自动开始。以下候选仅供参考：');
+          setRelocateCandidates(candidates);
+        } else {
+          // 空数组/形状不对：退化为无列表的纯文案（§3.4 空数组防御）。
+          setDlError('活跃书源中有相近但身份不一致的条目（如同名不同作者），为避免下错书未自动开始。');
+        }
+        return;
+      }
+      if (data.code === 'RELOCATION_IDENTITY_MISMATCH') {
+        setDlError('活跃书源中有相近但身份不一致的条目（如同名不同作者），为避免下错书未自动开始。');
+        return;
+      }
+      if (data.code === 'BOOK_NOT_FOUND') {
+        setDlError('书库记录已更新，请返回刷新书库后重试。');
+        return;
+      }
+      throw new Error(data.error || '重定位失败，请稍后再试。');
+    } catch (e) {
+      if (isCurrentAction(controller, my)) setDlError(e instanceof Error ? e.message : '重定位失败，请稍后再试。');
     } finally {
       actions.current.delete(controller);
       if (isCurrentAction(controller, my)) setDlBusy(false);
@@ -629,14 +767,44 @@ export default function LibraryTab({ view, setView }: {
             {canDownload && dlMessage && (
               <p role="status" className="text-xs mb-2" style={{ color: 'var(--dai)' }}>{dlMessage}</p>
             )}
+            {canDownload && relocateOffered && (task === null || task.requestedBy !== 'system'
+              && (task.status === 'failed' || task.status === 'partial' || task.status === 'superseded_by_incomplete'
+                || (task.status === 'running' && task.leaseExpired))) && (
+              <p className="text-xs mb-2 leading-5" style={{ color: 'var(--ink-soft)' }}>
+                原下载源已下线或不被支持，可按书名+作者在当前活跃书源池重新定位后下载。
+              </p>
+            )}
+            {canDownload && relocateCandidates.length > 0 && (
+              <div className="border-l-2 pl-3 mb-2" style={{ borderColor: 'var(--line)' }} aria-label="重定位候选（仅供参考）">
+                <ul
+                  className="list-disc pl-4 space-y-1 text-xs leading-6 break-words"
+                  style={{ color: 'var(--ink-soft)' }}
+                >
+                  {relocateCandidates.map((c, index) => (
+                    <li key={index}>《{c.title}》 — {c.author} · {candidateHost(c.bookUrl)}</li>
+                  ))}
+                </ul>
+              </div>
+            )}
             {!canDownload ? (
               <p role="status" className="text-sm" style={{ color: 'var(--ink-soft)' }}>
                 当前账号尚未获得下载权限，请联系管理员开通后再试。
               </p>
             ) : task === null ? (
-              <button className="seal-button text-sm" onClick={() => void startDownload()} disabled={dlBusy}>
-                {dlBusy ? '提交中…' : '⬇ 下载全书'}
-              </button>
+              <div className="flex flex-wrap items-center gap-3">
+                <button className="seal-button text-sm" onClick={() => void startDownload()} disabled={dlBusy}>
+                  {dlBusy ? '提交中…' : '⬇ 下载全书'}
+                </button>
+                {relocateOffered && (
+                  <button
+                    className="chip chip-dai text-sm disabled:opacity-50"
+                    onClick={() => void relocateDownload()}
+                    disabled={dlBusy}
+                  >
+                    {dlBusy ? '正在活跃源中查找…' : '⟳ 换活跃源重下'}
+                  </button>
+                )}
+              </div>
             ) : (
               <div className="space-y-3">
                 <div className="flex flex-wrap items-center gap-3">
@@ -663,6 +831,16 @@ export default function LibraryTab({ view, setView }: {
                       disabled={dlBusy}
                     >
                       {dlBusy ? '处理中…' : '重试'}
+                    </button>
+                  )}
+                  {relocateOffered && task.requestedBy !== 'system' && (task.status === 'failed' || task.status === 'partial'
+                    || task.status === 'superseded_by_incomplete' || (task.status === 'running' && task.leaseExpired)) && (
+                    <button
+                      className="chip chip-dai text-sm disabled:opacity-50"
+                      onClick={() => void relocateDownload()}
+                      disabled={dlBusy}
+                    >
+                      {dlBusy ? '正在活跃源中查找…' : '⟳ 换活跃源重下'}
                     </button>
                   )}
                   {task.requestedBy !== 'system' && (task.status === 'pending' || task.status === 'failed' || task.status === 'partial'
