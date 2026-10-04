@@ -78,7 +78,9 @@ export function useReader(session: ReadingSession, apiFetch: ApiFetch, userId: n
   const [failure, setFailure] = useState<Failure | null>(null);
   const [percent, setPercent] = useState(0);
   const [notice, setNotice] = useState('');
-  const [storageFailed, setStorageFailed] = useState(false);
+  const [progressStorageFailed, setProgressStorageFailed] = useState(false);
+  const [settingsStorageFailed, setSettingsStorageFailed] = useState(false);
+  const storageFailed = progressStorageFailed || settingsStorageFailed;
   const [focused, setFocused] = useState(false);
   const scroller = useRef<HTMLElement>(null);
   const article = useRef<HTMLElement>(null);
@@ -137,8 +139,10 @@ export function useReader(session: ReadingSession, apiFetch: ApiFetch, userId: n
     saveTimer.current = null;
     const index = currentReading.current?.index;
     if (!progress.current || !index) return;
-    try { window.localStorage.setItem(progressKeyFor(index), JSON.stringify(progress.current)); }
-    catch { setStorageFailed(true); }
+    try {
+      window.localStorage.setItem(progressKeyFor(index), JSON.stringify(progress.current));
+      setProgressStorageFailed(false);
+    } catch { setProgressStorageFailed(true); }
   }, [progressKeyFor]);
 
   const capturePosition = useCallback(() => {
@@ -324,7 +328,10 @@ export function useReader(session: ReadingSession, apiFetch: ApiFetch, userId: n
           const catalog = index.taskId === null && index.source && chapter?.title
             ? { chapterTitle: chapter.title, catalogPrefix: catalogPrefixKey(index, result.position.chapterIndex) } : {};
           saved = { schema: 1, version: index.version, ...result.position, ...catalog, updatedAt: Date.now() };
-          try { window.localStorage.setItem(progressKeyFor(index), JSON.stringify(saved)); } catch { setStorageFailed(true); }
+          try {
+            window.localStorage.setItem(progressKeyFor(index), JSON.stringify(saved));
+            setProgressStorageFailed(false);
+          } catch { setProgressStorageFailed(true); }
           migrationNotice.current = result.confidence === 'exact'
             ? '已切换书源,回到原进度'
             : '已切换书源,按章节进度估算定位(两源目录略有差异)';
@@ -593,8 +600,10 @@ export function useReader(session: ReadingSession, apiFetch: ApiFetch, userId: n
     flushPosition();
     setSettings(next);
     if (!next.preloadNext) cache.cancelPrefetch();
-    try { window.localStorage.setItem(READER_SETTINGS_KEY, JSON.stringify(next)); }
-    catch { setStorageFailed(true); }
+    try {
+      window.localStorage.setItem(READER_SETTINGS_KEY, JSON.stringify(next));
+      setSettingsStorageFailed(false);
+    } catch { setSettingsStorageFailed(true); }
   }
 
   function setFocusMode(next: boolean) { flushPosition(); setFocused(next); }
@@ -616,7 +625,7 @@ export function useReader(session: ReadingSession, apiFetch: ApiFetch, userId: n
   }
 
   return {
-    settings, reading, activePart, loading, flowing, failure, percent, notice, storageFailed, focused,
+    settings, reading, activePart, loading, flowing, failure, percent, notice, storageFailed, progressStorageFailed, settingsStorageFailed, focused,
     scroller, article, heading, onScroll, updateSettings, setFocusMode, navigate, extend, retry,
     markScrollIntent, loadConfirmedBook, switchedBookUrl, switchedSourceUrl,
     /**

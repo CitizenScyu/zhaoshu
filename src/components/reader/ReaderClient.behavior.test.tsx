@@ -119,6 +119,120 @@ beforeEach(() => {
 
 afterEach(() => cleanup());
 
+describe('本地阅读保存状态恢复', () => {
+  it('分别恢复进度和设置保存，另一域失败不被成功掩盖，失败期间仍可继续读', async () => {
+    const settingsKey = 'novel-finder-reading-settings';
+    const progressKey = 'novel-finder-reading-progress-u5-42';
+    const values = new Map<string, string>([
+      [settingsKey, JSON.stringify({ preloadNext: false })],
+    ]);
+    const writes: { key: string; value: string; failed: boolean }[] = [];
+    let failProgress = false;
+    let failSettings = false;
+    const getItem = vi.spyOn(Storage.prototype, 'getItem').mockImplementation(key => values.get(key) ?? null);
+    const setItem = vi.spyOn(Storage.prototype, 'setItem').mockImplementation((key, value) => {
+      const failed = (key === progressKey && failProgress) || (key === settingsKey && failSettings);
+      writes.push({ key, value, failed });
+      if (failed) throw new DOMException('Synthetic quota failure', 'QuotaExceededError');
+      values.set(key, value);
+    });
+    const calls: string[] = [];
+    const unexpected: string[] = [];
+    const apiFetch = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      calls.push(url);
+      if (url === '/api/read/42/index') return json(catalog({
+        taskId: 42, source: undefined, totalBytes: 8,
+        chapters: [
+          { index: 0, title: '第一章', startByte: 0, endByte: 4, partCount: 1 },
+          { index: 1, title: '第二章', startByte: 4, endByte: 8, partCount: 1 },
+        ],
+      }));
+      if (url === '/api/read/42/chapter?chapter=0&part=0&version=v1'
+        || url === '/api/read/42/chapter?chapter=1&part=0&version=v1') {
+        const second = url.includes('chapter=1');
+        return json(part({ taskId: 42, sourceId: undefined, chapterIndex: second ? 1 : 0,
+          title: second ? '第二章' : '第一章', startByte: second ? 4 : 0, endByte: second ? 8 : 4,
+          text: second ? '第二章\n继续阅读成功' : '第一章\n合成正文' }));
+      }
+      unexpected.push(url);
+      return json({ error: 'Unexpected synthetic request' }, 500);
+    });
+    const warning = (label: string) => `${label}保存失败，暂时无法记住。`;
+    const expectWarning = async (label: string) => {
+      await waitFor(() => {
+        const message = screen.getByText(warning(label), { exact: true });
+        expect(message.getAttribute('role')).toBe('status');
+      });
+    };
+    const expectClear = async () => {
+      await waitFor(() => expect(screen.queryByText(/保存失败，暂时无法记住。/)).toBeNull());
+    };
+    const save = () => fireEvent(window, new Event('pagehide'));
+    const changeFont = (label: string) => fireEvent.click(screen.getByRole('button', { name: label, exact: true }));
+    try {
+      mocks.owner = ownerWith(apiFetch);
+      render(createElement(ReaderClient, { session: { kind: 'download', taskId: 42 }, from: 'library' }));
+      await screen.findByRole('heading', { name: '第一章', exact: true });
+      save();
+      await waitFor(() => expect(values.has(progressKey)).toBe(true));
+
+      failProgress = true;
+      save();
+      await expectWarning('阅读进度');
+      const beforeRecovery = writes.length;
+      failProgress = false;
+      save();
+      await expectClear();
+      expect(writes.slice(beforeRecovery).some(write => write.key === progressKey && !write.failed)).toBe(true);
+      expect(JSON.parse(values.get(progressKey)!)).toMatchObject({ version: 'v1', chapterIndex: 0 });
+
+      fireEvent.click(screen.getByRole('button', { name: /设置$/, exact: false }));
+      failSettings = true;
+      changeFont('宋体');
+      await expectWarning('设置');
+      const beforeProgress = writes.length;
+      save();
+      expect(writes.slice(beforeProgress).some(write => write.key === progressKey && !write.failed)).toBe(true);
+      await expectWarning('设置');
+
+      failProgress = true;
+      failSettings = false;
+      changeFont('黑体');
+      await expectWarning('阅读进度');
+      expect(JSON.parse(values.get(settingsKey)!)).toMatchObject({ font: 'sans' });
+
+      failSettings = true;
+      changeFont('文楷');
+      await expectWarning('阅读进度与设置');
+      fireEvent.click(screen.getByRole('button', { name: '关闭阅读设置' }));
+      const next = screen.getByRole('button', { name: '下一章 →', exact: true });
+      expect((next as HTMLButtonElement).disabled).toBe(false);
+      fireEvent.click(next);
+      await screen.findByRole('heading', { name: '第二章', exact: true });
+      expect(calls).toContain('/api/read/42/chapter?chapter=1&part=0&version=v1');
+      await expectWarning('阅读进度与设置');
+
+      failProgress = false;
+      save();
+      await expectWarning('设置');
+      expect(JSON.parse(values.get(progressKey)!)).toMatchObject({ version: 'v1', chapterIndex: 1 });
+      failSettings = false;
+      fireEvent.click(screen.getByRole('button', { name: /设置$/, exact: false }));
+      changeFont('宋体');
+      await expectClear();
+      expect(JSON.parse(values.get(settingsKey)!)).toMatchObject({ font: 'serif' });
+      expect(writes.some(write => write.key === progressKey && write.failed)).toBe(true);
+      expect(writes.some(write => write.key === settingsKey && write.failed)).toBe(true);
+      expect(unexpected).toEqual([]);
+    } finally {
+      cleanup();
+      setItem.mockRestore();
+      getItem.mockRestore();
+    }
+  });
+});
+
 describe('ReaderClient 换源:章节响应带 sourceSession ⇒ 后续章节改用新 session', () => {
   it('首段响应带 sourceSession 时,下一章请求的 session 换成新源(不再用旧 session)', async () => {
     // 服务端换源成功的形状(readSourceChapter):part.version 与 part.sourceSession 同为新源

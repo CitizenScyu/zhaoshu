@@ -58,7 +58,7 @@ function readerBase(over: Record<string, unknown> = {}) {
   return {
     settings: { ...DEFAULT_READER_SETTINGS },
     reading: null, activePart: undefined, loading: true, flowing: false, failure: null,
-    percent: 0, notice: '', storageFailed: false, focused: false,
+    percent: 0, notice: '', storageFailed: false, progressStorageFailed: false, settingsStorageFailed: false, focused: false,
     scroller: { current: null }, article: { current: null }, heading: { current: null },
     onScroll: vi.fn(), updateSettings: vi.fn(), setFocusMode: vi.fn(), navigate: vi.fn(),
     extend: vi.fn(), retry: vi.fn(), markScrollIntent: vi.fn(), setSection: vi.fn(),
@@ -401,10 +401,14 @@ describe('阅读页的界面开关', () => {
     expect(render()).toContain('data-focused="false"');
   });
 
-  it('存储失败时明确告知进度与设置记不住', () => {
-    mocks.reader = readerBase({ storageFailed: true });
+  it.each([
+    [true, false, '阅读进度'],
+    [false, true, '设置'],
+    [true, true, '阅读进度与设置'],
+  ])('存储失败时只提示尚未保存的项目：%s/%s', (progressStorageFailed, settingsStorageFailed, label) => {
+    mocks.reader = readerBase({ storageFailed: true, progressStorageFailed, settingsStorageFailed });
     const html = render();
-    expect(html).toContain('浏览器未允许保存，阅读进度与设置暂时无法记住。');
+    expect(html).toContain(`${label}保存失败，暂时无法记住。`);
   });
 
   // 回归护栏：设置必须真的落到阅读页的根属性上，否则主题/字号改了没反应。

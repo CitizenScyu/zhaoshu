@@ -107,7 +107,7 @@ function ReaderSession({ session, from }: Props) {
   const isReaderSessionCurrent = useCallback(() => isCurrentSession(sessionId), [isCurrentSession, sessionId]);
   const router = useRouter();
   const {
-    settings, reading, activePart, loading, flowing, failure, percent, notice, storageFailed, focused,
+    settings, reading, activePart, loading, flowing, failure, percent, notice, storageFailed, progressStorageFailed, settingsStorageFailed, focused,
     scroller, article, heading, onScroll, updateSettings, setFocusMode, navigate: requestNavigation,
     extend, retry, markScrollIntent, setSection, loadConfirmedBook, registerSwitchCommitted,
   } = useReader(session, apiFetch, user?.id ?? 0, isReaderSessionCurrent);
@@ -383,7 +383,7 @@ function ReaderSession({ session, from }: Props) {
           <button className={styles.chapterButton} disabled={!reading || loading || !hasNextChapter} onClick={() => navigate(position(chapter + 1))}>下一章 →</button>
         </div>
       </footer>
-      {storageFailed && <p className={styles.storageWarning} role="status">浏览器未允许保存，阅读进度与设置暂时无法记住。</p>}
+      {storageFailed && <p className={styles.storageWarning} role="status">{progressStorageFailed && settingsStorageFailed ? '阅读进度与设置' : progressStorageFailed ? '阅读进度' : '设置'}保存失败，暂时无法记住。</p>}
       {panel === 'directory' && reading && <Panel title="目录" side="left" onClose={() => setPanel(null)}><Directory index={reading.index} current={chapter} onSelect={(selected) => navigate(position(selected))} /></Panel>}
       {panel === 'settings' && <Panel title="阅读设置" side="right" onClose={() => setPanel(null)}><Settings value={settings} onChange={updateSettings} /></Panel>}
       {panel === 'sources' && session.kind === 'source' && (
