@@ -123,26 +123,51 @@ export interface RateLimiterLike {
 
 export type SourceTransport = (
   url: string,
-  options: { signal: AbortSignal; timeoutMs?: number; beforeRequest?: (signal: AbortSignal) => Promise<void> },
+  options: {
+    signal: AbortSignal;
+    timeoutMs?: number;
+    beforeRequest?: (signal: AbortSignal) => Promise<void>;
+    /** 调用方已有的物理策略门（冷却等）：每次物理发射前先走，再取限速许可。 */
+    beforeFetch?: (signal: AbortSignal, url: string) => void | Promise<void>;
+  },
 ) => Promise<{ url: string; text: string }>;
 
 /**
- * 真实 HTTP 请求层：先取限速许可，再交给 fetchSourceText（含其自身节流/换 host 重试）。
- * 同一 limiter 实例被整个执行器共享（单实例）。
+ * 真实 HTTP 请求层（bphysical788）：限速许可不再在外层 acquire 一次，而是组合进
+ * fetchSourceText 的物理门 beforeFetch——先保留调用方已有物理策略门，再按**该次 current URL
+ * 的真实 hostname** 取 limiter 许可。初始/302 跳转后/传输失败换备用 host 的每次物理发射各取
+ * 一次许可，无初始双扣；beforeRequest 预算合同不变（换 host 重试仍 skipFirstBeforeRequest，
+ * 点数/节流不重复扣）。host 不私自合并 apex/www，沿 hostOf 原样。
+ * 成功反馈记到返回 page.url 的 host；HTTP 状态类失败记到 SourceHttpError.responseHost
+ * （真正返回响应的站）或最近实际发射的 host，不把备用 host 记到初始 host。
+ * 许可被拒/排队中止等 beforeFetch 异常沿用 source-fetch 的 fromBeforeRequest 标记：
+ * 不触发换 host 重试、不计源站失败。同一 limiter 实例被整个执行器共享（单实例）。
  */
 export function createSourceTransport(limiter?: RateLimiterLike): SourceTransport {
   return async (url, options) => {
-    const key = hostOf(url) || url;
-    await limiter?.acquire(key, { signal: options.signal });
+    const { signal, timeoutMs, beforeRequest, beforeFetch: callerGate } = options;
+    // 最近一次物理发射的 host（许可按它取过）：无 responseHost 的 HTTP 失败反馈归它。
+    let lastHost = hostOf(url);
+    const beforeFetch = limiter || callerGate
+      ? async (gateSignal: AbortSignal, current: string) => {
+        await callerGate?.(gateSignal, current);
+        if (!limiter) return;
+        const key = hostOf(current) || current;
+        lastHost = key;
+        await limiter.acquire(key, { signal: gateSignal });
+      }
+      : undefined;
     try {
-      const page = await fetchSourceText(url, options);
-      limiter?.recordSuccess?.(key);
+      const page = await fetchSourceText(url, { signal, timeoutMs, beforeRequest, beforeFetch });
+      limiter?.recordSuccess?.(hostOf(page.url) || lastHost);
       return page;
     } catch (error) {
       const status = (error as { status?: unknown })?.status;
       // 源站行为类错误（SourceHttpError 带 status，含 429）计入熔断；网络/中止不算源站失败。
       // 429/503 若带 Retry-After（SourceHttpError.retryAfterMs 已解析）则传给限速器尊重退避窗口。
       if (limiter && typeof status === 'number') {
+        const responseHost = (error as { responseHost?: unknown })?.responseHost;
+        const key = (typeof responseHost === 'string' && responseHost) || lastHost || hostOf(url) || url;
         const retryAfterMs = (error as { retryAfterMs?: unknown })?.retryAfterMs;
         limiter.recordFailure?.(key, typeof retryAfterMs === 'number' ? { retryAfterMs } : undefined);
       }
