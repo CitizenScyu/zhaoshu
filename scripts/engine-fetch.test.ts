@@ -255,6 +255,53 @@ describe('engine-fetch errorKind（giveup41）', () => {
     expect(engineErrorKind(new SourcePolicyError('x'))).toBe('other');
   });
 
+  class LocalHttpError extends Error {
+    constructor(readonly status: number) { super('synthetic_private_detail'); }
+  }
+  class LocalPolicyError extends Error {}
+  const localClasses = { SourceHttpError: LocalHttpError, SourcePolicyError: LocalPolicyError };
+  function feedbackFixture(nestedKind: 'http429' | 'policy') {
+    const nested = nestedKind === 'http429' ? new LocalHttpError(429) : new LocalPolicyError('synthetic_private_detail');
+    const feedback = Object.assign(new Error('Limiter feedback persistence unavailable'), {
+      name: 'LimiterFeedbackError',
+      code: 'LIMITER_FEEDBACK_UNAVAILABLE',
+      origin: 'limiter-feedback',
+      persistenceOutcome: 'unknown',
+      cause: nested,
+      requestError: nested,
+    });
+    return { nested, feedback, expectedKind: nestedKind === 'http429' ? 'http_5xx' : 'policy' };
+  }
+
+  it.each(['http429', 'policy'] as const)('合成F：嵌套%s不改变顶层other分类与JSON投影', async nestedKind => {
+    const { engineErrorKind } = await import('./engine-error-kind.mjs');
+    const { nested, feedback, expectedKind } = feedbackFixture(nestedKind);
+    expect(engineErrorKind(nested, localClasses)).toBe(expectedKind);
+    expect(feedback).not.toBeInstanceOf(LocalHttpError);
+    expect(feedback).not.toBeInstanceOf(LocalPolicyError);
+    const errorKind = engineErrorKind(feedback, localClasses);
+    expect(errorKind).toBe('other');
+    expect(JSON.stringify({ errorKind })).toBe('{"errorKind":"other"}');
+  });
+
+  it.each(['http429', 'policy'] as const)('合成G：聚合中的%s和清理细节不改变顶层other分类与JSON投影', async nestedKind => {
+    const { engineErrorKind } = await import('./engine-error-kind.mjs');
+    const { nested, feedback, expectedKind } = feedbackFixture(nestedKind);
+    const cleanup = new Error('synthetic_private_detail');
+    const aggregate = Object.assign(new AggregateError([feedback, cleanup], 'Limiter feedback cleanup failed', { cause: feedback }), {
+      name: 'LimiterFeedbackCleanupError',
+      code: 'LIMITER_FEEDBACK_UNAVAILABLE',
+      origin: 'limiter-feedback',
+      persistenceOutcome: 'unknown',
+    });
+    expect(engineErrorKind(nested, localClasses)).toBe(expectedKind);
+    expect(aggregate).not.toBeInstanceOf(LocalHttpError);
+    expect(aggregate).not.toBeInstanceOf(LocalPolicyError);
+    const errorKind = engineErrorKind(aggregate, localClasses);
+    expect(errorKind).toBe('other');
+    expect(JSON.stringify({ errorKind })).toBe('{"errorKind":"other"}');
+  });
+
   it('downloadErrorKind：code=2（日限额/瞬时不可用，可重试）不得标 partial，仅 code=1 是 partial', async () => {
     const { downloadErrorKind } = await import('./engine-error-kind.mjs');
     expect(downloadErrorKind(2)).toBe('source_unavailable');
