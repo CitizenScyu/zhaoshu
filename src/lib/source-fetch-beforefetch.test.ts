@@ -83,6 +83,17 @@ describe('beforeFetch 物理门支持异步（bphysical788）', () => {
     expect(fetchMock.mock.calls).toHaveLength(0);
   });
 
+  it('门 resolve 但等待期间父 signal 已中止：门后中止复查拦下，仍不发射 fetch', async () => {
+    // 限速器未必严格看 signal（实现差异）：门可能正常 resolve。门后的 throwIfAborted 是兜底。
+    const controller = new AbortController();
+    const beforeFetch = vi.fn(async () => { controller.abort(new Error('late cancel')); });
+    const fetchMock = vi.fn();
+    vi.stubGlobal('fetch', fetchMock);
+    await expect(fetchSourceText('https://book15.net/a', { signal: controller.signal, beforeFetch }))
+      .rejects.toThrow('late cancel');
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
   it('同步旧门兼容：同步 beforeFetch 照常拦截每次物理发射', async () => {
     const gateCalls: string[] = [];
     const beforeFetch = vi.fn((_signal: AbortSignal, current: string) => { gateCalls.push(current); });
