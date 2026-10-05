@@ -67,15 +67,20 @@ describe('beforeFetch 物理门支持异步（bphysical788）', () => {
     expect((policyStop as { fromBeforeRequest?: boolean }).fromBeforeRequest).toBe(true);
   });
 
-  it('await 期间父 signal 中止：门后复查中止，不发射 fetch', async () => {
+  it('await 期间父 signal 中止：门以 signal 拒绝，不发射 fetch', async () => {
+    // 模拟真实限速器的合同：acquire 收 signal，中止即拒绝（不悬挂）。
     const controller = new AbortController();
-    const beforeFetch = vi.fn((_signal: AbortSignal, _current: string) => new Promise<void>(() => {}));
+    const beforeFetch = vi.fn((signal: AbortSignal, _current: string) => new Promise<void>((_, reject) => {
+      signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+    }));
     const fetchMock = vi.fn();
     vi.stubGlobal('fetch', fetchMock);
     const pending = fetchSourceText('https://book15.net/a', { signal: controller.signal, beforeFetch });
     queueMicrotask(() => controller.abort(new Error('cancelled')));
     await expect(pending).rejects.toThrow('cancelled');
     expect(fetchMock).not.toHaveBeenCalled();
+    // 门被中止拒绝时不改判为传输失败：无第二次 fetch（不换 host）。
+    expect(fetchMock.mock.calls).toHaveLength(0);
   });
 
   it('同步旧门兼容：同步 beforeFetch 照常拦截每次物理发射', async () => {
