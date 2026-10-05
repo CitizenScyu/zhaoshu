@@ -135,8 +135,10 @@ interface FetchSourceOptions {
   maxRedirects?: number;
   maxBytes?: number;
   beforeRequest?: (signal: AbortSignal, url?: string) => Promise<void>;
-  /** 每次物理发射前的同步门，含同站兜底；独立于 beforeRequest 的点数/节流扣账。 */
-  beforeFetch?: (signal: AbortSignal, url: string) => void;
+  /** 每次物理发射前的门（bphysical788 起支持异步 void|Promise<void>），含同站兜底；独立于
+   * beforeRequest 的点数/节流扣账。物理门成功后先复查中止，随后才启动连接计时/fetch；
+   * 同步旧门照常可用；门失败沿用 fromBeforeRequest 标记——不触发换 host 重试、不计源站失败。 */
+  beforeFetch?: (signal: AbortSignal, url: string) => void | Promise<void>;
   /** POST/body/头覆写；缺省纯 GET。 */
   request?: SourcePageRequest;
   /** 显式字符集、或auto（HTTP声明→有界HTML head meta→UTF8）；缺省仍为UTF8。 */
@@ -236,7 +238,8 @@ async function attemptOnce(start: URL, {
   maxRedirects: number;
   maxBytes: number;
   beforeRequest?: (signal: AbortSignal, url?: string) => Promise<void>;
-  beforeFetch?: (signal: AbortSignal, url: string) => void;
+  /** 同 FetchSourceOptions.beforeFetch（bphysical788 起可异步）。 */
+  beforeFetch?: (signal: AbortSignal, url: string) => void | Promise<void>;
   request?: SourcePageRequest;
   responseCharset?: SourceCharset | 'auto';
   /** 换 host 重试的首次请求：与失败的那次是同一逻辑请求，预算/节流不重复扣。 */
@@ -265,8 +268,14 @@ async function attemptOnce(start: URL, {
         catch (error) { (error as BeforeRequestFailure).fromBeforeRequest = true; throw error; }
       }
       signal.throwIfAborted();
-      try { beforeFetch?.(signal, current); }
-      catch (error) { (error as BeforeRequestFailure).fromBeforeRequest = true; throw error; }
+      try {
+        await beforeFetch?.(signal, current);
+        // 物理门可能 await（限速排队）：拿到许可后再查一次中止，等待期间被取消不发射。
+        signal.throwIfAborted();
+      } catch (error) {
+        (error as BeforeRequestFailure).fromBeforeRequest = true;
+        throw error;
+      }
       const connectTimer = setTimeout(() => {
         controller.abort(new DOMException('书源连接超时', 'ConnectTimeoutError'));
       }, connectTimeoutMs);
