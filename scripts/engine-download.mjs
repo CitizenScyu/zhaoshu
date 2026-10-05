@@ -13,6 +13,8 @@ const atomic = (path, data) => {
   renameSync(temp, path);
 };
 const knownError = /^(identity_mismatch_or_no_candidate|empty_toc|empty_toc_page|pagination_cycle|toc_limit|unsupported_toc_rule|invalid_chapter|invalid_next_page|empty_content_page|content_page_limit|unsupported_content_rule|max_chapters|size_limit|toc_changed|missing_chapters|interrupted|budget_exhausted|operation_timeout|empty_content)$/;
+const isLimiterFeedbackError = error => error?.code === 'LIMITER_FEEDBACK_UNAVAILABLE'
+  && error?.origin === 'limiter-feedback';
 
 // 书源不可达（41-EXEC-SRCUNAVAIL）：搜索/详情/目录阶段的传输层失败（连接/请求超时、undici
 // `fetch failed`＝DNS/reset/TLS）、源站 5xx（含 Cloudflare 52x）、限速器熔断（由连续源站失败触发）
@@ -181,6 +183,7 @@ export async function downloadBook(m, args, resolveSource, transport = fetchSour
         atomic(path, text);
         Object.assign(chapter, { status: 'done', chars: [...text].length, sha256: hash(text) });
       } catch (error) {
+        if (isLimiterFeedbackError(error)) throw error;
         chapter.status = 'failed';
         // Do not persist upstream messages, URLs or credentials in diagnostics.
         chapter.error = knownError.test(error.message) ? error.message : 'chapter_failed';
@@ -196,6 +199,10 @@ export async function downloadBook(m, args, resolveSource, transport = fetchSour
     manifest.artifact = { file: 'book.txt', sha256: hash(txt), bytes: Buffer.byteLength(txt) };
     manifest.status = 'done';
   } catch (error) {
+    if (isLimiterFeedbackError(error)) {
+      manifest.errors.push('limiter_feedback_unavailable');
+      throw error;
+    }
     // 外部中断（停机/租约/总预算）时的请求失败是被中止，不是书源不可达。
     if (SOURCE_STAGES.has(stage) && !controller.signal.aborted && isSourceUnavailableError(error)) failureCode = 2;
     if (failureCode === 2) manifest.failure_stage = stage; // 固定枚举，不含上游细节
