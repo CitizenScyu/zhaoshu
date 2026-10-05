@@ -1,9 +1,10 @@
-// bphysical788 合成测试草稿（只写未跑）：createSourceTransport 把限速许可组合进物理门后的接线语义。
+// createSourceTransport 把限速许可组合进物理门后的接线语义。
 // 判别力（删掉修复即失败）：
 //   - 单页直取：acquire 恰一次、记初始 host（无初始双扣）；
 //   - 传输失败换备用 host：初始与备用各 acquire 一次，成功反馈归返回 page.url 的 host；
 //   - HTTP 失败：反馈归 responseHost（真正返回响应的站），不把备用 host 记到初始 host；
 //   - 异步物理门拒绝（限速排队被拒）：零 fetch、不把门拒绝当源站失败；
+//   - 门拒绝即使带数字 status/retryAfterMs（普通 Error）也不是源站行为，不记 recordFailure；
 //   - 调用方已有 beforeFetch 物理策略门先走，再取限速许可；
 //   - beforeRequest 预算回调保留、换 host 重试不重复扣（skipFirstBeforeRequest 合同不变）。
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -96,6 +97,39 @@ describe('createSourceTransport 逐 host 限速（bphysical788）', () => {
     await expect(transport('https://book15.net/x', opts())).rejects.toBe(gateStop);
     expect(fetchMock).not.toHaveBeenCalled();
     expect(limiter.failures).toHaveLength(0); // 策略/许可拒绝不是源站行为
+    expect(limiter.success).toHaveLength(0);
+  });
+
+  it('限速许可拒绝带 status/retryAfterMs：仍是门拒绝，不记 recordFailure', async () => {
+    // 门拒绝的反例形态：acquire 抛普通 Error 但带 status=429/retryAfterMs——物理 fetch
+    // 之前发生，不是源站行为，不得因数字 status 误入熔断/退避反馈。
+    const gateStop = Object.assign(new Error('limiter refused'), { status: 429, retryAfterMs: 5000 });
+    const limiter = fakeLimiter();
+    limiter.acquire = vi.fn(async () => { throw gateStop; });
+    const fetchMock = vi.fn();
+    vi.stubGlobal('fetch', fetchMock);
+    const transport = createSourceTransport(limiter);
+    await expect(transport('https://book15.net/x', opts())).rejects.toBe(gateStop); // 原错误原样上抛
+    expect(limiter.acquire).toHaveBeenCalledOnce();
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(limiter.failures).toHaveLength(0);
+    expect(limiter.success).toHaveLength(0);
+  });
+
+  it('调用方物理策略门拒绝带 status/retryAfterMs：零 acquire、不记 recordFailure', async () => {
+    // 与上一例同型，但拒绝点在 callerGate：门顺序保证 acquire 根本不发生。
+    const policyStop = Object.assign(new Error('cooldown'), { status: 429, retryAfterMs: 5000 });
+    const callerGate = vi.fn(async () => { throw policyStop; });
+    const limiter = fakeLimiter();
+    const acquireSpy = vi.spyOn(limiter, 'acquire');
+    const fetchMock = vi.fn();
+    vi.stubGlobal('fetch', fetchMock);
+    const transport = createSourceTransport(limiter);
+    await expect(transport('https://book15.net/x', { ...opts(), beforeFetch: callerGate })).rejects.toBe(policyStop);
+    expect(callerGate).toHaveBeenCalledOnce();
+    expect(acquireSpy).not.toHaveBeenCalled(); // 策略门不过连许可都不取
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(limiter.failures).toHaveLength(0);
     expect(limiter.success).toHaveLength(0);
   });
 
