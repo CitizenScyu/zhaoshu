@@ -119,6 +119,27 @@ describe('createSourceTransport异步反馈隔离', () => {
     expect(value.recordSuccess).not.toHaveBeenCalled();
   });
 
+  it('engine收到E时已因不同A取消：仍反馈E并保留E身份（决策层桩）', async () => {
+    const value = limiter();
+    const original = httpError();
+    const abortReason = Object.assign(new Error('synthetic different abort'), {
+      status: 429, retryAfterMs: 9000, responseHost: 'cancel.test',
+    });
+    const controller = new AbortController();
+    // 此桩明确把E交给engine；不借真实source-fetch的响应/取消竞态证明时序。
+    request.mockImplementationOnce(async () => { controller.abort(abortReason); throw original; });
+    const result = await createSourceTransport(value)(URL, { signal: controller.signal })
+      .catch((error: unknown) => error);
+    expect(controller.signal.aborted).toBe(true);
+    expect(controller.signal.reason).toBe(abortReason);
+    expect(original).not.toBe(abortReason);
+    expect(result).toBe(original);
+    expect(value.recordFailure).toHaveBeenCalledOnce();
+    expect(value.recordFailure).toHaveBeenCalledWith('response.test', { retryAfterMs: 5000 });
+    expect(value.recordSuccess).not.toHaveBeenCalled();
+    expect(request).toHaveBeenCalledOnce();
+  });
+
   it.each(['callerGate', 'acquire'] as const)('首尝试%s拒绝带429仍零反馈并保留身份', async gate => {
     const value = limiter();
     const stop = Object.assign(new Error('synthetic gate refusal'), { status: 429, retryAfterMs: 5000 });

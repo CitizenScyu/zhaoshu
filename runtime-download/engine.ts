@@ -189,6 +189,8 @@ export function createSourceTransport(limiter?: RateLimiterLike): SourceTranspor
     try {
       page = await fetchSourceText(url, { signal, timeoutMs, beforeRequest, beforeFetch });
     } catch (error) {
+      // 只认调用方取消reason的同一引用，不吞掉已收到的不同HTTP错误。
+      if (signal.aborted && error === signal.reason) throw error;
       const status = (error as { status?: unknown })?.status;
       // 源站行为类错误（SourceHttpError 带 status，含 429）计入熔断；网络/中止不算源站失败。
       // 429/503 若带 Retry-After（SourceHttpError.retryAfterMs 已解析）则传给限速器尊重退避窗口。

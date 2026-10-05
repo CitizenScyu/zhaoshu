@@ -9,6 +9,7 @@
 //   - beforeRequest 预算回调保留、换 host 重试不重复扣（skipFirstBeforeRequest 合同不变）。
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createSourceTransport, type RateLimiterLike } from './engine';
+import { SourceHttpError } from '../src/lib/source-fetch';
 
 // 与 src/lib/source-fetch.test.ts 同款约定：传输语义用例以 book15 为载体，把 isRetiredBuiltinHost
 // 钉成 false（等价「book15 仍活跃」的注册表形态）——fetchSourceText 的退休门在每次物理发射前收口，
@@ -38,6 +39,12 @@ function fakeLimiter(): RateLimiterLike & { acquireCalls: string[]; success: str
 
 const opts = () => ({ signal: new AbortController().signal });
 const transportFailure = new TypeError('fetch failed');
+
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  const promise = new Promise<T>(yes => { resolve = yes; });
+  return { promise, resolve };
+}
 
 describe('createSourceTransport 逐 host 限速（bphysical788）', () => {
   it('单页直取：acquire 恰一次且在 fetch 前，recordSuccess(host) 归初始 host', async () => {
@@ -181,5 +188,107 @@ describe('createSourceTransport 逐 host 限速（bphysical788）', () => {
     await transport('https://book15.net/x', { ...opts(), beforeFetch: callerGate });
     expect(callerGate).toHaveBeenCalledWith(expect.any(AbortSignal), 'https://book15.net/x');
     expect(fetchMock).toHaveBeenCalledOnce();
+  });
+});
+
+describe('调用方取消reason的同一性（真实source-fetch路径）', () => {
+  const reason = () => new SourceHttpError(429, 5000, 'cancel.test');
+
+  it('调用前已abort：原reason上抛，零许可、零fetch、零反馈', async () => {
+    const controller = new AbortController();
+    const stopped = reason();
+    controller.abort(stopped);
+    const limiter = fakeLimiter();
+    const fetchMock = vi.fn();
+    vi.stubGlobal('fetch', fetchMock);
+    await expect(createSourceTransport(limiter)('https://book15.net/synthetic/before', {
+      signal: controller.signal,
+    })).rejects.toBe(stopped);
+    expect(limiter.acquireCalls).toEqual([]);
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(limiter.success).toEqual([]);
+    expect(limiter.failures).toEqual([]);
+  });
+
+  it('acquire正常返回后已abort：发射前复查原reason，不借门拒绝标记', async () => {
+    const controller = new AbortController();
+    const stopped = reason();
+    const limiter = fakeLimiter();
+    limiter.acquire = async key => {
+      limiter.acquireCalls.push(key);
+      controller.abort(stopped); // 正常返回，不throw；source-fetch在await门之后才抛reason。
+    };
+    const fetchMock = vi.fn();
+    vi.stubGlobal('fetch', fetchMock);
+    await expect(createSourceTransport(limiter)('https://book15.net/synthetic/after-permit', {
+      signal: controller.signal,
+    })).rejects.toBe(stopped);
+    expect(stopped).not.toHaveProperty('fromBeforeRequest');
+    expect(limiter.acquireCalls).toEqual(['book15.net']);
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(limiter.success).toEqual([]);
+    expect(limiter.failures).toEqual([]);
+  });
+
+  it('响应头promise未完成时abort：原reason上抛且不记源站失败', async () => {
+    const controller = new AbortController();
+    const stopped = reason();
+    const limiter = fakeLimiter();
+    const entered = deferred<void>();
+    const headers = deferred<Response>();
+    const lateResponse = new Response('合成迟到正文');
+    const fetchMock = vi.fn(() => { entered.resolve(undefined); return headers.promise; });
+    vi.stubGlobal('fetch', fetchMock);
+    const pending = createSourceTransport(limiter)('https://book15.net/synthetic/headers', {
+      signal: controller.signal,
+    }).then(page => page, (error: unknown) => error);
+    try {
+      await entered.promise;
+      controller.abort(stopped);
+      expect(await pending).toBe(stopped);
+      expect(fetchMock).toHaveBeenCalledOnce();
+      expect(limiter.acquireCalls).toEqual(['book15.net']);
+      expect(limiter.success).toEqual([]);
+      expect(limiter.failures).toEqual([]);
+    } finally {
+      controller.abort(stopped);
+      headers.resolve(lateResponse);
+      await pending;
+      if (lateResponse.body && !lateResponse.body.locked) await lateResponse.body.cancel();
+    }
+  });
+
+  it('body真实读取中abort：原reason上抛，响应流与pending均收口', async () => {
+    const controller = new AbortController();
+    const stopped = reason();
+    const limiter = fakeLimiter();
+    const reading = deferred<void>();
+    let bodyController!: ReadableStreamDefaultController<Uint8Array>;
+    let bodyClosed = false;
+    const body = new ReadableStream<Uint8Array>({
+      start(streamController) { bodyController = streamController; },
+      pull() { reading.resolve(undefined); },
+      cancel() { bodyClosed = true; },
+    }, { highWaterMark: 0 }); // 无预取：只有真实reader.read才触发pull。
+    const fetchMock = vi.fn().mockResolvedValue(new Response(body));
+    vi.stubGlobal('fetch', fetchMock);
+    const pending = createSourceTransport(limiter)('https://book15.net/synthetic/body', {
+      signal: controller.signal,
+    }).then(page => page, (error: unknown) => error);
+    try {
+      await reading.promise;
+      expect(body.locked).toBe(true);
+      controller.abort(stopped);
+      expect(await pending).toBe(stopped);
+      expect(fetchMock).toHaveBeenCalledOnce();
+      expect(limiter.acquireCalls).toEqual(['book15.net']);
+      expect(limiter.success).toEqual([]);
+      expect(limiter.failures).toEqual([]);
+    } finally {
+      controller.abort(stopped);
+      if (!bodyClosed) { bodyController.close(); bodyClosed = true; }
+      await pending;
+      if (!body.locked) await body.cancel();
+    }
   });
 });
