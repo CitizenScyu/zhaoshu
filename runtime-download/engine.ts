@@ -132,6 +132,10 @@ export type SourceTransport = (
   },
 ) => Promise<{ url: string; text: string }>;
 
+/** source-fetch 的门拒绝标记（结构判别）：beforeRequest/beforeFetch 抛出的错误被标
+ * fromBeforeRequest=true——发生在物理 fetch 之前，不是源站行为。 */
+interface GateRejection { fromBeforeRequest?: boolean }
+
 /**
  * 真实 HTTP 请求层（bphysical788）：限速许可不再在外层 acquire 一次，而是组合进
  * fetchSourceText 的物理门 beforeFetch——先保留调用方已有物理策略门，再按**该次 current URL
@@ -165,7 +169,11 @@ export function createSourceTransport(limiter?: RateLimiterLike): SourceTranspor
       const status = (error as { status?: unknown })?.status;
       // 源站行为类错误（SourceHttpError 带 status，含 429）计入熔断；网络/中止不算源站失败。
       // 429/503 若带 Retry-After（SourceHttpError.retryAfterMs 已解析）则传给限速器尊重退避窗口。
-      if (limiter && typeof status === 'number') {
+      // 门拒绝（beforeRequest/beforeFetch，含 acquire/callerGate 抛出的带 status 的普通 Error）
+      // 被 source-fetch 标 fromBeforeRequest=true：发生在物理 fetch 之前，不是源站行为，
+      // 即使错误带 status/retryAfterMs 也不记 recordFailure，原样上抛保持错误身份。
+      const gateRejected = (error as GateRejection)?.fromBeforeRequest === true;
+      if (limiter && !gateRejected && typeof status === 'number') {
         const responseHost = (error as { responseHost?: unknown })?.responseHost;
         const key = (typeof responseHost === 'string' && responseHost) || lastHost || hostOf(url) || url;
         const retryAfterMs = (error as { retryAfterMs?: unknown })?.retryAfterMs;
