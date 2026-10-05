@@ -9,7 +9,18 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createSourceTransport, type RateLimiterLike } from './engine';
 
-// 传输语义用 book15 载体（本文件不触退休门：engine.ts 的 transport 不经 resolveSource）。
+// 与 src/lib/source-fetch.test.ts 同款约定：传输语义用例以 book15 为载体，把 isRetiredBuiltinHost
+// 钉成 false（等价「book15 仍活跃」的注册表形态）——fetchSourceText 的退休门在每次物理发射前收口，
+// 真实注册表里 book15 lifecycle='retired' 会把这些用例全拦成 SourcePolicyError，测不到限速接线。
+const gate = vi.hoisted(() => ({ realRetiredGate: false }));
+vi.mock('../src/lib/supported-sources', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/lib/supported-sources')>();
+  return {
+    ...actual,
+    isRetiredBuiltinHost: (host: string) => (gate.realRetiredGate ? actual.isRetiredBuiltinHost(host) : false),
+  };
+});
+
 afterEach(() => vi.unstubAllGlobals());
 
 function fakeLimiter(): RateLimiterLike & { acquireCalls: string[]; success: string[]; failures: { key: string; opts?: { retryAfterMs?: number } }[] } {
