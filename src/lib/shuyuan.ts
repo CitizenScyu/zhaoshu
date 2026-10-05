@@ -15,6 +15,7 @@ import {
 } from '@/lib/rule-engine/admission';
 import { enginePostSearchEnabled, selectCandidates, type RawSource } from '@/lib/rule-engine/compile-smoke';
 import { DEFAULT_SHUYUAN_READ_CACHE_TTL_MS, shuyuanReadCacheTtlMs } from '@/lib/read-cache-ttl';
+import { classifySourceAdult } from '@/lib/source-adult-classification';
 import {
   createPoolArtifact, currentPoolArtifact, noteLocalPoolWrite, poolArtifactEnabled, resetPoolArtifactMemo,
   writePoolArtifactFile, type PoolArtifact, type PoolArtifactEngineRow, type PoolArtifactSourceRow,
@@ -561,7 +562,8 @@ async function engineReadingSources(
   // 歧义：撞车时留库键本就是 https 的那份（与改前的池逐条相同），http 副本让位。
   const native = new Set(rows.map((row) => row.source_url).filter((url) => upgradeSourceTemplateUrl(url) === url));
   return rows
-    .filter((row) => canProbe(upgradeSourceTemplateUrl(row.source_url)) && !row.disabled_at && isRecord(row.source)
+    .filter((row) => classifySourceAdult(row.name, row.source) === 'unmarked'
+      && canProbe(upgradeSourceTemplateUrl(row.source_url)) && !row.disabled_at && isRecord(row.source)
       && row.source.enabled !== false && states.get(row.source_url)?.status !== 'failed'
       && (upgradeSourceTemplateUrl(row.source_url) === row.source_url
         || !native.has(upgradeSourceTemplateUrl(row.source_url))))
@@ -571,7 +573,7 @@ async function engineReadingSources(
       || a.source_url.localeCompare(b.source_url))
     .map((row) => ({
       url: validateSourceUrl(upgradeSourceTemplateUrl(row.source_url)).href,
-      name: row.name.slice(0, 200) || hostOfUrl(row.source_url),
+      name: (typeof row.name === 'string' ? row.name.slice(0, 200) : '') || hostOfUrl(row.source_url),
       searchUrl: typeof row.source.searchUrl === 'string' ? row.source.searchUrl : '',
       rules: row.source,
       tier: (row.tier === 'T7' ? 'T7' : 'M1') as SupportedSourceTier,

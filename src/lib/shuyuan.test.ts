@@ -67,6 +67,7 @@ import {
 import { resolveDownloadSource } from './download-source';
 import { assembleEngineModules, createResolveSource } from '../../runtime-download/engine';
 import { sourceRevision } from './source-revision';
+import * as poolArtifacts from './pool-artifact';
 import { ADMISSION_MIN_BUDGET_MS, rulesHash } from './rule-engine/admission';
 import { refreshSupportedHosts, validateSourceUrl, SourcePolicyError } from './source-policy';
 import { SOURCE_PAGE_SIZE, pageCount } from './shuyuan-view';
@@ -1083,6 +1084,53 @@ describe('refreshShuyuan atomic refresh', () => {
       expect(sources[1].rules).toBe(engineItem);
       // §6.1 核心断言：池合成后运行时 host 门已含该引擎 host（validateSourceUrl 能过）。
       expect(validateSourceUrl('https://engine.example/x').href).toBe('https://engine.example/x');
+    });
+
+    it.each(['database', 'artifact'] as const)('共用引擎池在%s取行后剔除成人/损坏元数据，普通规则原样保留', async (mode) => {
+      vi.stubEnv('SHUYUAN_READ_CACHE_TTL_MS', '0');
+      refreshSupportedHosts(['ordinary.example', 'adult.example', 'invalid.example']);
+      fetchMock.mockImplementation(async () => { throw new Error('Unexpected synthetic network call'); });
+      const ordinary = Object.freeze({ ...engineItem,
+        bookSourceName: '普通漫画听书外文', bookSourceGroup: null,
+        searchUrl: 'https://ordinary.example/s?q={{key}}',
+      });
+      const rows = [
+        engineRow({ source_url: 'https://ordinary.example/', name: null, source: ordinary }),
+        engineRow({ source_url: 'https://adult.example/group', name: '普通', source: { ...engineItem, bookSourceGroup: '文学|🔞' } }),
+        engineRow({ source_url: 'https://adult.example/raw-name', name: '普通', source: { ...engineItem, bookSourceName: '🈲合集' } }),
+        engineRow({ source_url: 'https://adult.example/name', name: '成人小说', source: engineItem }),
+        engineRow({ source_url: 'https://invalid.example/', name: '🔞', source: { ...engineItem, bookSourceGroup: 7 } }),
+        engineRow({ source_url: 'https://invalid.example/array', name: '普通', source: [] }),
+        engineRow({ source_url: 'https://ordinary.example/disabled', name: '普通', source: ordinary, disabled_at: '2026-01-01' }),
+      ];
+      const before = JSON.stringify(rows);
+      const enabled = vi.spyOn(poolArtifacts, 'poolArtifactEnabled').mockReturnValue(mode === 'artifact');
+      const current = vi.spyOn(poolArtifacts, 'currentPoolArtifact').mockResolvedValue({
+        engine: rows, probe: { version: 1, entries: [] }, refreshedAt: null,
+      } as unknown as Awaited<ReturnType<typeof poolArtifacts.currentPoolArtifact>>);
+      if (mode === 'database') {
+        execute.mockResolvedValueOnce([{ collections: [] }]).mockResolvedValueOnce(rows);
+      } else {
+        execute.mockRejectedValue(new Error('Unexpected DB access with synthetic artifact'));
+      }
+      try {
+        const sources = await getEngineSources(new AbortController().signal);
+        expect(sources.map((source) => source.url)).toEqual(['https://ordinary.example/']);
+        expect(sources[0].name).toBe('ordinary.example');
+        expect(sources[0].rules).toBe(ordinary);
+        expect(JSON.stringify(rows)).toBe(before);
+        expect(enabled).toHaveBeenCalled();
+        if (mode === 'artifact') {
+          expect(current).toHaveBeenCalled();
+          expect(execute).not.toHaveBeenCalled();
+        } else {
+          expect(current).not.toHaveBeenCalled();
+          expect(execute.mock.calls.some(([query]) => query.text.includes('JOIN source_admission'))).toBe(true);
+        }
+        expect(fetchMock).not.toHaveBeenCalled();
+      } finally {
+        refreshSupportedHosts([]);
+      }
     });
 
     it('READING_POOL_LIMIT 约束池大小（波次开关，默认 4）', async () => {
