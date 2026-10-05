@@ -270,12 +270,12 @@ async function attemptOnce(start: URL, {
       signal.throwIfAborted();
       try {
         await beforeFetch?.(signal, current);
-        // 物理门可能 await（限速排队）：拿到许可后再查一次中止，等待期间被取消不发射。
-        signal.throwIfAborted();
       } catch (error) {
         (error as BeforeRequestFailure).fromBeforeRequest = true;
         throw error;
       }
+      // 物理门可能 await（限速排队，bphysical788）：拿到许可后再查一次中止，等待期间被取消不发射。
+      signal.throwIfAborted();
       const connectTimer = setTimeout(() => {
         controller.abort(new DOMException('书源连接超时', 'ConnectTimeoutError'));
       }, connectTimeoutMs);
