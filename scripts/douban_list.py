@@ -799,19 +799,27 @@ def resolve_douban_pages(env: dict | None = None) -> int:
     return pages if pages >= 1 else DOUBAN_PAGES
 
 
-def load_done_titles(path) -> set:
-    """labels.jsonl → 已打标书名的归一化集合（搜索前跳过用）。
+def _done_author(value) -> str:
+    """只有可用署名才可证明同名候选是另一作者；空串保留未知信息。"""
+    if not isinstance(value, str):
+        return ''
+    author = clean_list_author(value)
+    normalized = _norm_author(author)
+    if (is_placeholder_author(normalized) or is_single_region_label(author)
+            or is_bogus_list_author(author) or is_bogus_list_author(normalized)):
+        return ''
+    return author
 
-    审查 D.3 认定「已在 labels.jsonl 的书名不要再搜」是收益最大的一刀：缓存是优化，
-    「跳过已完成再搜」是正确性/产品问题——否则扩容后稳态每轮全量空搜。
-    title / site_title 都收（LLM 猜名与站点名可能只中一个）。文件不存在/坏行只跳过。"""
-    titles: set = set()
+
+def load_done_index(path) -> dict[str, set[str]]:
+    """完成记录的title/site_title别名 → 作者集合；空作者项不能被已知作者覆盖。"""
+    titles: dict[str, set[str]] = {}
     source = Path(path)
     if not source.exists():
         return titles
     try:
         lines = source.read_text(encoding='utf-8').splitlines()
-    except OSError:
+    except (OSError, UnicodeError):
         return titles
     for line in lines:
         line = line.strip()
@@ -823,11 +831,33 @@ def load_done_titles(path) -> set:
             continue
         if not isinstance(rec, dict):
             continue
+        author = _done_author(rec.get('author'))
         for field in ('title', 'site_title'):
-            key = _norm_title(rec.get(field) or '')
+            title = rec.get(field)
+            key = _norm_title(title) if isinstance(title, str) else ''
             if key:
-                titles.add(key)
+                titles.setdefault(key, set()).add(author)
     return titles
+
+
+def load_done_titles(path) -> set:
+    """旧接口：只返回标题集合，调用方明确选择不区分作者的保守跳过。"""
+    return set(load_done_index(path))
+
+
+def is_done_candidate(title: str, author, done_index: dict[str, set[str]]) -> bool:
+    key = _norm_title(title)
+    if not key or key not in done_index:
+        return False
+    candidate_author = _done_author(author)
+    authors = done_index[key]
+    if not candidate_author or not authors:
+        return True
+    for value in authors:
+        previous_author = _done_author(value)
+        if not previous_author or author_matches(candidate_author, previous_author):
+            return True
+    return False
 
 
 def fetch_douban_books(http_get, pages: int | None = None) -> list[dict]:
@@ -2117,31 +2147,32 @@ def validate_engine(cli) -> None:
 def build_douban_queue(http_get, skip_titles: set | None = None,
                        pages: int | None = None, engine_cli=None,
                        book15_breaker: Book15Breaker | None = None,
-                       source_policy=None) -> list[dict]:
+                       source_policy=None, done_index: dict[str, set[str]] | None = None) -> list[dict]:
     """豆瓣名单 → book15 打标队列 [{url, title, author, category, status, douban_url}]。
 
     与 labeler.fetch_rank_books() 的产出同构（url 为站内相对路径），
     打标循环零改动直接消费。搜不到 / 误匹配的书记日志跳过，不阻塞队列。
     skip_titles（归一化书名集合）= 已打标书名，搜索前直接跳过（审查 D.3）。
+    done_index传入完成记录的作者信息；与旧skip_titles接口分开。
     source_policy（617）：透传 _resolve_candidates（book15 停用 ⇒ 零请求直落引擎）。"""
     douban_books = fetch_douban_books(http_get, pages=pages)
     print(f'豆瓣名单共 {len(douban_books)} 本（去重后）')
     return _resolve_candidates(douban_books, http_get, origin='豆瓣tag',
                                skip_titles=skip_titles, engine_cli=engine_cli,
                                book15_breaker=book15_breaker,
-                               source_policy=source_policy)
+                               source_policy=source_policy, done_index=done_index)
 
 
 def _resolve_candidates(candidates: list[dict], http_get, origin: str = '',
                         skip_titles: set | None = None, engine_cli=None,
                         book15_breaker: Book15Breaker | None = None,
-                        source_policy=None) -> list[dict]:
+                        source_policy=None, done_index: dict[str, set[str]] | None = None) -> list[dict]:
     """候选名单（[{title, author, ...}]）→ 过 book15 搜索+校验的打标队列。
 
     各名单源共用：命中记队列（category 记来源标记，默认取候选自带 origin，
     调用方可用 origin 参数覆盖），miss 记日志跳过。
-    skip_titles 命中（书名归一化后已在 labels.jsonl）→ **不发搜索**直接跳过：
-    缓存是优化，「跳过已完成再搜」是正确性/产品问题（审查 D.3）。
+    skip_titles保留旧的纯标题跳过语义；done_index区分已知作者，任一作者未知仍跳过。
+    两者同时传入时，显式skip_titles仍优先，不从纯标题集合猜作者。
 
     engine_cli（T5）：非空且 LABELER_ENGINE_FALLBACK 开启时，book15 miss 才回落引擎源池。
     engine_cli=None（开关关闭）时本函数行为**逐字不变**（红线）——不调 CLI、条目无 engine 标记。
@@ -2165,7 +2196,8 @@ def _resolve_candidates(candidates: list[dict], http_get, origin: str = '',
     engine_disabled = False
     for b in candidates:
         key = _norm_title(b.get('title', ''))
-        if skip_titles and key and key in skip_titles:
+        if ((skip_titles and key and key in skip_titles)
+                or (done_index is not None and is_done_candidate(b.get('title', ''), b.get('author'), done_index))):
             skipped += 1
             continue
         # 41-authtag：名单作者先清洗（剥前导国别/朝代标注 + 尾部译者段）再进任何一条路径。
@@ -2620,7 +2652,7 @@ def build_webnovel_queue(http_get, include_douban: bool = True,
                          skip_titles: set | None = None,
                          pages: int | None = None, engine_cli=None,
                          book15_breaker: Book15Breaker | None = None,
-                         source_policy=None) -> list[dict]:
+                         source_policy=None, done_index: dict[str, set[str]] | None = None) -> list[dict]:
     """网文站名单（主）+ 豆瓣 tag（补充）→ book15 打标队列。
 
     用户指令（2026-09-18）：网文站榜单是对口 book15 的一手来源，优先；
@@ -2628,6 +2660,7 @@ def build_webnovel_queue(http_get, include_douban: bool = True,
     豆瓣翻页默认 1 页、3 页走 LABELER_DOUBAN_PAGES 开关（审查 D.3）。
     跨源按归一化书名去重（断点续传另按 url 去重，扩名单不会重标已完成的）；
     skip_titles = 已打标书名，搜索前跳过（收益最大的一刀）。
+    done_index传入完成记录的作者信息；与旧skip_titles接口分开。
     产出与 fetch_rank_books() 同构，每个候选过 search_book15（LIKE + title_compatible）。
     """
     candidates: list[dict] = []
@@ -2653,4 +2686,4 @@ def build_webnovel_queue(http_get, include_douban: bool = True,
         add_batch(fetch_douban_books(http_get, pages=pages), '豆瓣网文tag')
     return _resolve_candidates(candidates, http_get, skip_titles=skip_titles,
                                engine_cli=engine_cli, book15_breaker=book15_breaker,
-                               source_policy=source_policy)
+                               source_policy=source_policy, done_index=done_index)

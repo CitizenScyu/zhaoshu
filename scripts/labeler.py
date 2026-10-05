@@ -3883,9 +3883,8 @@ def main() -> int:
             print('拉取名单并搜索 book15...')
             # 桥接：名单源（豆瓣/起点）传完整 URL，book15 搜索侧传站内相对路径。
             bridged = lambda path: http_get(BOOK15.absolute(path))
-            # 搜索前跳过已打标书名（审查 D.3「收益最大的一刀」）：缓存是优化，
-            # 跳过已完成再搜是正确性——否则扩容后稳态每轮全量空搜。
-            skip_titles = douban_list.load_done_titles(data_path('labels.jsonl'))
+            # 同名且双方作者可确认不同的候选继续核验；未知作者仍保守跳过。
+            done_index = douban_list.load_done_index(data_path('labels.jsonl'))
             # 豆瓣翻页默认 1 页；.env 里 LABELER_DOUBAN_PAGES=3 才开 3 页（审查 D.3）。
             pages = douban_list.resolve_douban_pages(env)
             # T5 引擎兜底：book15 miss 才回落引擎源池（开关默认关，配置缺失自动降级）。
@@ -3898,12 +3897,12 @@ def main() -> int:
             # book15 熔断（labelerdiag41）：整站挂掉时别让每本 3 次全失败把一轮拖成十几小时。
             book15_breaker = douban_list.Book15Breaker(douban_list.resolve_book15_breaker(env))
             all_books = (douban_list.build_douban_queue(
-                             bridged, skip_titles=skip_titles, pages=pages,
+                             bridged, done_index=done_index, pages=pages,
                              engine_cli=engine_cli, book15_breaker=book15_breaker,
                              source_policy=SOURCE_POLICY)
                          if args.source == 'douban'
                          else douban_list.build_webnovel_queue(
-                             bridged, skip_titles=skip_titles, pages=pages,
+                             bridged, done_index=done_index, pages=pages,
                              engine_cli=engine_cli, book15_breaker=book15_breaker,
                              source_policy=SOURCE_POLICY))
             print(f'{args.source} 线共 {len(all_books)} 本（搜索命中后）')
