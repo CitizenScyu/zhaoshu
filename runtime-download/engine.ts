@@ -117,8 +117,31 @@ export function createResolveSource(m: EngineModules) {
 /** 运行时限速器接缝（zhaoshu-books runtime/lib/rate-limiter.mjs 的 SourceRateLimiter 形态）。 */
 export interface RateLimiterLike {
   acquire(sourceKey: string, options?: { signal?: AbortSignal }): Promise<void>;
-  recordSuccess?(sourceKey: string): void;
-  recordFailure?(sourceKey: string, options?: { retryAfterMs?: number }): void;
+  recordSuccess?(sourceKey: string): void | Promise<void>;
+  recordFailure?(sourceKey: string, options?: { retryAfterMs?: number }): void | Promise<void>;
+}
+
+/** 反馈持久化不可确认；原错误仅保留引用，不复制源站status或敏感消息。 */
+export class LimiterFeedbackError extends Error {
+  readonly code = 'LIMITER_FEEDBACK_UNAVAILABLE';
+  readonly origin = 'limiter-feedback';
+  readonly persistenceOutcome = 'unknown';
+  readonly cause: unknown;
+  readonly requestError?: unknown;
+  readonly abortReason?: unknown;
+
+  constructor(
+    readonly phase: 'success' | 'failure',
+    readonly host: string,
+    readonly feedbackError: unknown,
+    details: { requestError?: unknown; abortReason?: unknown } = {},
+  ) {
+    super('Limiter feedback persistence unavailable');
+    this.name = 'LimiterFeedbackError';
+    this.cause = feedbackError;
+    if ('requestError' in details) this.requestError = details.requestError;
+    if ('abortReason' in details) this.abortReason = details.abortReason;
+  }
 }
 
 export type SourceTransport = (
@@ -161,10 +184,10 @@ export function createSourceTransport(limiter?: RateLimiterLike): SourceTranspor
         await limiter.acquire(key, { signal: gateSignal });
       }
       : undefined;
+    let page: { url: string; text: string };
+    // 请求结果与反馈结果分开捕获，反馈失败不能再次归因成HTTP失败。
     try {
-      const page = await fetchSourceText(url, { signal, timeoutMs, beforeRequest, beforeFetch });
-      limiter?.recordSuccess?.(hostOf(page.url) || lastHost);
-      return page;
+      page = await fetchSourceText(url, { signal, timeoutMs, beforeRequest, beforeFetch });
     } catch (error) {
       const status = (error as { status?: unknown })?.status;
       // 源站行为类错误（SourceHttpError 带 status，含 429）计入熔断；网络/中止不算源站失败。
@@ -177,9 +200,27 @@ export function createSourceTransport(limiter?: RateLimiterLike): SourceTranspor
         const responseHost = (error as { responseHost?: unknown })?.responseHost;
         const key = (typeof responseHost === 'string' && responseHost) || lastHost || hostOf(url) || url;
         const retryAfterMs = (error as { retryAfterMs?: unknown })?.retryAfterMs;
-        limiter.recordFailure?.(key, typeof retryAfterMs === 'number' ? { retryAfterMs } : undefined);
+        try {
+          await limiter.recordFailure?.(key, typeof retryAfterMs === 'number' ? { retryAfterMs } : undefined);
+        } catch (feedbackError) {
+          throw new LimiterFeedbackError('failure', key, feedbackError, {
+            requestError: error,
+            ...(signal.aborted ? { abortReason: signal.reason } : {}),
+          });
+        }
       }
       throw error;
     }
+    const successHost = hostOf(page.url) || lastHost;
+    try {
+      await limiter?.recordSuccess?.(successHost);
+    } catch (feedbackError) {
+      throw new LimiterFeedbackError('success', successHost, feedbackError, {
+        ...(signal.aborted ? { abortReason: signal.reason } : {}),
+      });
+    }
+    // 已取得请求结果就结算反馈；不以abort裸race遗弃反馈Promise。
+    signal.throwIfAborted();
+    return page;
   };
 }
