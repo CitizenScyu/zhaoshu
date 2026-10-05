@@ -875,12 +875,13 @@ describe('refreshShuyuan atomic refresh', () => {
       .mockResolvedValueOnce([{ ...zeroCounts, total: 1, disabled: 1, unprobed: 1 }])
       .mockResolvedValueOnce([{
         url: unknownSource.bookSourceUrl, name: '未知源', disabled: true, availability: 'unprobed',
+        classification_source: unknownSource,
         last_error: '历史连接超时', checked_at: null, probe_error: null,
       }]);
     expect(await getShuyuanStats()).toEqual({
       ...zeroCounts, total: 1, disabled: 1, unprobed: 1, collections, refreshedAt: null, sourcesLimit: 100,
       sources: [{ url: unknownSource.bookSourceUrl, name: '未知源', disabled: true, availability: 'unprobed',
-        lastError: '历史连接超时', checkedAt: null, probeError: null }],
+        lastError: '历史连接超时', checkedAt: null, probeError: null, adultClassification: 'unmarked' }],
     });
     expect(execute.mock.calls[2][0].text).toContain('LIMIT ?');
     expect(fetchMock).not.toHaveBeenCalled();
@@ -926,6 +927,33 @@ describe('refreshShuyuan atomic refresh', () => {
     expect(savedRows()).toEqual([expect.objectContaining({
       url: unknownSource.bookSourceUrl, disabled_at: null, err: '历史连接超时',
     })]);
+  });
+
+  it.each(['all', 'unprobed'] as const)('管理名册%s保留三态行，仅返回分类而不返回规则', async (filter) => {
+    const raw = Object.freeze({ bookSourceName: '普通名称', bookSourceGroup: '文学🔞',
+      headers: { 'X-Synthetic-Private': 'synthetic-header' }, ruleSearch: { name: 'synthetic-rule' } });
+    const base = { disabled: false, availability: 'unprobed', last_error: '', checked_at: null, probe_error: null };
+    const rows = [
+      { ...base, url: 'https://adult.example/', name: '标记源', classification_source: raw },
+      { ...base, url: 'https://invalid.example/', name: '无效源', disabled: true, classification_source: [] },
+      { ...base, url: 'https://ordinary.example/', name: '普通源', classification_source: { bookSourceGroup: null } },
+    ];
+    const counts = { ...zeroCounts, total: 3, enabled: 2, disabled: 1, unprobed: 3 };
+    execute.mockResolvedValueOnce([{ collections: [], refreshed_at: null }])
+      .mockResolvedValueOnce([counts]).mockResolvedValueOnce(rows);
+    const result = await getShuyuanStats(undefined, { filter, page: 1 });
+    expect(result.total).toBe(3);
+    expect(result.enabled).toBe(2);
+    expect(result.disabled).toBe(1);
+    expect(result.sources.map((source) => source.url)).toEqual(rows.map((row) => row.url));
+    expect(result.sources.map((source) => source.adultClassification)).toEqual(['adult', 'invalid', 'unmarked']);
+    expect(result.sources.map((source) => source.availability)).toEqual(['unprobed', 'unprobed', 'unprobed']);
+    for (const source of result.sources) {
+      expect(Object.keys(source).sort()).toEqual(['adultClassification', 'availability', 'checkedAt', 'disabled', 'lastError', 'name', 'probeError', 'url']);
+    }
+    expect(JSON.stringify(result)).not.toContain('synthetic-header');
+    expect(JSON.stringify(result)).not.toContain('synthetic-rule');
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 
   it('筛选分支把谓词、总数和页偏移绑定成同一组参数', async () => {

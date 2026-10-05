@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { cleanup, render, screen, waitFor } from '@testing-library/react';
+import { cleanup, render, screen, waitFor, within } from '@testing-library/react';
 import { userEvent } from '@testing-library/user-event';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -37,6 +37,7 @@ function statsPage(over: Record<string, unknown> = {}) {
     sourcesLimit: 20,
     sources: [{
       url: 'https://a.example', name: '源甲', disabled: false, availability: 'reachable',
+      adultClassification: 'unmarked',
       lastError: '', checkedAt: '2026-09-20T00:00:00.000Z', probeError: null,
     }],
     filter: 'all', page: 1, pageSize: 20, totalPages: 5,
@@ -88,6 +89,71 @@ describe('ShuyuanTab 统计数字:取自各自的字段(探活 vs 准入是两�
     renderTab(apiFetch);
     await screen.findByRole('button', { name: textIs('全部 100') });
     expect(String(apiFetch.mock.calls[0]?.[0])).toBe('/api/shuyuan?filter=all&page=1');
+  });
+});
+
+describe('ShuyuanTab 分类说明与手动网址', () => {
+  it('三态均保留，合法HTTP(S)使用隔离新窗口链接且悬停不请求源站', async () => {
+    const rows = [
+      { url: 'https://adult.example/book', name: '成人标记源', adultClassification: 'adult' },
+      { url: 'http://invalid.example/book', name: '元数据损坏源', adultClassification: 'invalid' },
+      { url: 'https://ordinary.example/', name: '普通源', adultClassification: 'unmarked' },
+    ].map((row) => ({ ...row, disabled: false, availability: 'reachable', lastError: '', checkedAt: null, probeError: null }));
+    const apiFetch = vi.fn<ApiFetch>(async (input) => {
+      expect(String(input)).toBe('/api/shuyuan?filter=all&page=1');
+      return json(statsPage({ total: 3, enabled: 3, disabled: 0, sources: rows }));
+    });
+    const directFetch = vi.fn(() => { throw new Error('Unexpected direct network request'); });
+    vi.stubGlobal('fetch', directFetch);
+    const open = vi.spyOn(window, 'open').mockImplementation(() => null);
+    try {
+      renderTab(apiFetch);
+      await screen.findByText('成人标记源');
+      expect(screen.getByText('启用/可达不等于可自动取书。')).toBeTruthy();
+      const user = userEvent.setup();
+      for (const row of rows) {
+        const item = screen.getByText(row.name).closest('li')!;
+        const link = within(item).getByRole('link', { name: `手动访问${row.name}的网址（新窗口）` });
+        expect(link.tagName).toBe('A');
+        expect(link.getAttribute('href')).toBe(row.url);
+        expect(link.getAttribute('target')).toBe('_blank');
+        expect(link.getAttribute('rel')?.split(/\s+/)).toEqual(expect.arrayContaining(['noopener', 'noreferrer']));
+        await user.hover(link);
+      }
+      const adult = screen.getByText('成人标记源').closest('li')!;
+      expect(within(adult).getByText(textIs('成人标记；不参与自动阅读/下载，可手动访问。'))).toBeTruthy();
+      const invalid = screen.getByText('元数据损坏源').closest('li')!;
+      expect(within(invalid).getByText(textIs('元数据无效；不参与自动阅读/下载。'))).toBeTruthy();
+      expect(invalid.textContent).not.toContain('成人标记');
+      expect(screen.getAllByRole('link')).toHaveLength(3);
+      expect(apiFetch).toHaveBeenCalledTimes(1);
+      expect(directFetch).not.toHaveBeenCalled();
+      expect(open).not.toHaveBeenCalled();
+    } finally {
+      cleanup();
+      open.mockRestore();
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it('危险scheme、相对地址、解析失败和URL凭据不产生链接或敏感回显', async () => {
+    const urls = ['javascript:alert(1)', 'data:text/plain,synthetic', 'file:///synthetic', '//unsafe.example/path',
+      '/relative', 'not a url', 'https://synthetic:synthetic-password@unsafe.example/', 'https://@unsafe.example/',
+      'https://bad host.example/'];
+    const rows = urls.map((url, index) => ({ url, name: `无效网址${index}`, adultClassification: 'unmarked',
+      disabled: false, availability: 'unprobed', lastError: '', checkedAt: null, probeError: null }));
+    const apiFetch = vi.fn<ApiFetch>(async () => json(statsPage({ sources: rows, total: rows.length })));
+    try {
+      renderTab(apiFetch);
+      await screen.findByText('无效网址0');
+      for (const row of rows) {
+        const item = screen.getByText(row.name).closest('li')!;
+        expect(within(item).queryByRole('link')).toBeNull();
+        expect(within(item).getByText('网址无法安全打开')).toBeTruthy();
+      }
+      expect(document.body.textContent).not.toContain('synthetic-password');
+      expect(apiFetch).toHaveBeenCalledTimes(1);
+    } finally { cleanup(); }
   });
 });
 

@@ -15,7 +15,7 @@ import {
 } from '@/lib/rule-engine/admission';
 import { enginePostSearchEnabled, selectCandidates, type RawSource } from '@/lib/rule-engine/compile-smoke';
 import { DEFAULT_SHUYUAN_READ_CACHE_TTL_MS, shuyuanReadCacheTtlMs } from '@/lib/read-cache-ttl';
-import { classifySourceAdult } from '@/lib/source-adult-classification';
+import { classifySourceAdult, type SourceAdultClassification } from '@/lib/source-adult-classification';
 import {
   createPoolArtifact, currentPoolArtifact, noteLocalPoolWrite, poolArtifactEnabled, resetPoolArtifactMemo,
   writePoolArtifactFile, type PoolArtifact, type PoolArtifactEngineRow, type PoolArtifactSourceRow,
@@ -132,6 +132,7 @@ export type ShuyuanPoolHealth = {
 export type ShuyuanSourceStatus = {
   url: string; name: string; disabled: boolean; availability: ShuyuanAvailability;
   lastError: string; checkedAt: string | null; probeError: string | null;
+  adultClassification: SourceAdultClassification;
 };
 export type ShuyuanStats = ShuyuanCounts & {
   collections: ShuyuanCollection[];
@@ -1180,8 +1181,9 @@ export async function getShuyuanStats(
   const rowsPending = readRows<{
     url: string; name: string; disabled: boolean; availability: ShuyuanAvailability;
     last_error: string; checked_at: string | null; probe_error: string | null;
+    classification_source: unknown;
   }>(s, s`
-    SELECT source_url AS url, name, disabled_at IS NOT NULL AS disabled,
+    SELECT source_url AS url, name, source AS classification_source, disabled_at IS NOT NULL AS disabled,
            COALESCE(p.status, 'unprobed') AS availability,
            last_error, p.checked_at, p.error AS probe_error
     FROM shuyuan_sources
@@ -1211,6 +1213,7 @@ export async function getShuyuanStats(
     sources: rows.map((row) => ({
       url: row.url, name: row.name, disabled: row.disabled, availability: row.availability,
       lastError: row.last_error, checkedAt: row.checked_at, probeError: row.probe_error,
+      adultClassification: classifySourceAdult(row.name, row.classification_source),
     })),
   };
   if (!list) return stats;

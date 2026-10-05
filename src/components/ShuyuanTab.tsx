@@ -8,6 +8,18 @@ import {
   participationHint, type ShuyuanSourceFilter,
 } from '@/lib/shuyuan-view';
 
+function manualSourceUrl(value: string): string | null {
+  if (typeof value !== 'string') return null;
+  const text = value.trim();
+  const authority = /^https?:\/\/([^/?#]*)/i.exec(text)?.[1];
+  if (!authority || authority.includes('@') || /[\\\u0000-\u0020\u007f]/.test(text)) return null;
+  try {
+    const url = new URL(text);
+    return (url.protocol === 'http:' || url.protocol === 'https:') && url.hostname && !url.username && !url.password
+      ? url.href : null;
+  } catch { return null; }
+}
+
 export default function ShuyuanTab() {
   const { apiFetch, sessionId, isCurrentSession } = useOwner();
   const [stats, setStats] = useState<ShuyuanStatsPage | null>(null);
@@ -189,7 +201,7 @@ export default function ShuyuanTab() {
         从 yckceo.com 拉取书源合集并去重合并。未知来源只保存资料和已有失败信息，不自动访问；
         规则变化后需要核验。自动检查仅限 book15.net，可达仅表示最近一次请求成功。
         计划每天自动更新一次，触发时间可能延迟；也可手动刷新。
-        <b>启停开关独立于探测结果</b>：禁用后该源不再进入书源搜索；重新启用后重新参与，
+        <b>启停开关独立于探测结果</b>：禁用后该源不再进入书源搜索；重新启用只恢复开关状态，仍需满足元数据、准入与可用性条件，
         但连续探测失败的源仍会被排除，要等探测恢复才回来。单次探测失败（含超时抖动）只记一次失败，
         不会立刻把源踢出去。刷新不会覆盖这里的启停选择。
       </p>
@@ -236,6 +248,7 @@ export default function ShuyuanTab() {
             ))}
           </div>
 
+          <p className="text-xs" style={{ color: 'var(--ink-soft)' }}>启用/可达不等于可自动取书。</p>
           <section aria-label="书源状态明细">
             <div className="flex flex-wrap items-baseline gap-3 mb-2">
               <h3 className="text-sm font-bold">{filterLabel(filter)}的书源</h3>
@@ -251,6 +264,7 @@ export default function ShuyuanTab() {
               <ul className="space-y-3">
                 {stats.sources.map((source) => {
                   const hint = participationHint(source);
+                  const manualUrl = manualSourceUrl(source.url);
                   return (
                     <li key={source.url} className="border border-[var(--line)] rounded-lg p-3 text-sm">
                       <div className="flex flex-wrap items-center gap-2">
@@ -271,7 +285,17 @@ export default function ShuyuanTab() {
                           {toggling === source.url ? '处理中…' : source.disabled ? '重新启用' : '禁用'}
                         </button>
                       </div>
-                      <p className="text-xs mt-2 break-all" style={{ color: 'var(--ink-faint)' }}>{source.url}</p>
+                      <p className="text-xs mt-2 break-all" style={{ color: 'var(--ink-faint)' }}>
+                        {manualUrl ? <a href={manualUrl} target="_blank" rel="noopener noreferrer" className="underline"
+                          aria-label={`手动访问${source.name || '未命名书源'}的网址（新窗口）`}>{manualUrl}</a>
+                          : '网址无法安全打开'}
+                      </p>
+                      {source.adultClassification === 'adult' && <p className="text-xs mt-2" style={{ color: 'var(--ink-soft)' }}>
+                        成人标记；不参与自动阅读/下载{manualUrl ? '，可手动访问' : ''}。
+                      </p>}
+                      {source.adultClassification === 'invalid' && <p className="text-xs mt-2" style={{ color: 'var(--ink-soft)' }}>
+                        元数据无效；不参与自动阅读/下载。
+                      </p>}
                       {source.lastError && <p className="mt-2 break-words">保留的失败信息：{source.lastError}</p>}
                       {source.probeError && <p className="mt-1 break-words">最近探测：{source.probeError}</p>}
                       {source.checkedAt && <p className="text-xs mt-2">探测时间 {new Date(source.checkedAt).toLocaleString('zh-CN')}</p>}
