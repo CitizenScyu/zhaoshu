@@ -176,22 +176,20 @@ export interface ReadingSource {
 }
 
 /**
- * M2-3 全局 kill switch（m2-scaleout §6.1，本任务提前落地）。
- * **默认关闭**：多源循环（M2-2 的软预算/切片/跳源）未落地前不把引擎源并入取书池——
- * 否则准入数据一到位，`resolveSourceBook` 会按池里每个源发请求，单次阅读预算被多源分食，
- * 55s deadline 下可能把「上游慢」变成用户侧超时/503。打开即等价 W1 起的放量（配合 READING_POOL_LIMIT）。
- * 只有显式 `1`/`true`/`on` 才开；缺失/`0`/`false` 一律关闭（回退效果 = book15-only）。
+ * 阅读引擎源开关：未设或trim后为空时默认开启；1/true/on开启，其余值保守关闭。
+ * 显式0/false/off关闭引擎入池，仍保留注册、准入、usable及READING_POOL_LIMIT约束。
+ * 关闭后仅保留合格活跃builtin；builtin全部退休时允许空池，不恢复退休源。
  */
 export function engineSourcesEnabled(): boolean {
   const raw = process.env.READING_ENGINE_SOURCES?.trim().toLowerCase();
-  return raw === '1' || raw === 'true' || raw === 'on';
+  return raw === undefined || raw === '' || raw === '1' || raw === 'true' || raw === 'on';
 }
 
 /**
  * 42-admbudget 开关 ADMISSION_OWN_CRON：开时 /api/shuyuan/admission 每天独立跑一轮准入（自带整份预算），
  * 刷新尾部准入与它共用同一把租约（ADMISSION_LEASE_ROW）防并发重复探测。默认关：独立轮路由空转返回。
  * admlfix42：刷新尾部**始终**参与租约（与本开关解耦），本开关只管独立 HTTP 入口的启停。
- * 只有显式 1/true/on 才开（与 READING_ENGINE_SOURCES 同口径）。
+ * 只有显式1/true/on才开；开启值同阅读引擎开关，但本开关仍默认关闭。
  */
 export function admissionOwnCronEnabled(env: Record<string, string | undefined> = process.env): boolean {
   const raw = env.ADMISSION_OWN_CRON?.trim().toLowerCase();
@@ -220,7 +218,7 @@ export interface ReadingPool {
 /**
  * 取书源池：注册表合成视图（设计 §5.2/§5.3）。builtin 恒在前（book15 零回归红线）。
  * 引擎源（admission ok ∧ 非 disabled ∧ probe 非 failed，按 §2.4 全序排序）**受
- * kill switch 约束**：READING_ENGINE_SOURCES 默认关 ⇒ 池 = builtin only，与今天逐字节相同。
+ * kill switch 约束**：READING_ENGINE_SOURCES默认开；显式关闭后只剩合格活跃builtin（可为空）。
  *
  * §2.4 全序（先表内各自排好，再按「builtin 恒在引擎源之前」拼接——builtin 是优先级最高的
  * 首键，故拼接即等价于对合并集按全序排序）：
@@ -286,7 +284,7 @@ async function eligibleReadingSources(signal: AbortSignal, includeEngine: boolea
   // 引擎分支：host 门随池合成刷新（设计 §6.1）。必须排在 readMeta **之前**——readMeta 解析
   // probeSnapshot 时用 canProbe（= validateSourceUrl 的运行时 host 门）过滤引擎源的探测态；门没刷，
   // 引擎源的 reachable 结论会被旧门丢弃、排序失真。engineHosts 读失败 ⇒ 不刷门（既有集合原样保留，
-  // fail-closed）且本次降级 builtin-only。开关默认关时完全不碰门、连准入表都不查（零回归 + 省 DB 往返）。
+  // fail-closed）且本次降级活跃builtin。开关显式关闭时不碰引擎门、也不查引擎准入表。
   // 这条「刷门必须排在 readMeta 之前」的不变量在**刷新路径**同样成立（且更严重）：refreshWithinBudget
   // 的 readMeta 与探测入队都用 canProbe，冷启动不先刷门会把整批引擎源静默滤出探测队列，见该处注释。
   const engineOk = includeEngine ? await refreshEngineHostGate(signal) : false;
@@ -303,7 +301,7 @@ async function eligibleReadingSources(signal: AbortSignal, includeEngine: boolea
 
 /**
  * 扇出开关（41-fanout 第一期）：浏览器逐源并发 probe 的服务端入口 `/api/read/source-probe`。
- * **默认关闭**；只有显式 `1`/`true`/`on` 才开（与 READING_ENGINE_SOURCES 同口径）。关闭时路由返回 404。
+ * **默认关闭**；只有显式 `1`/`true`/`on` 才开。开启值同阅读引擎开关，默认值不同。关闭时路由返回404。
  */
 export function sourceFanoutEnabled(): boolean {
   const raw = process.env.SOURCE_FANOUT_ENABLED?.trim().toLowerCase();
@@ -387,7 +385,7 @@ export interface SourcePools {
 /**
  * 一次合成同时给出两份池（41-readall）：traversal ⊆ selectable（同一全序、同一窗口，traversal 再做同站去重），章节路径一次 DB 往返拿齐。
  * 扇出候选 ⊆ selectable（41-swq）：扇出同站去重会越过前缀窗口往后补别的站，那些条目必须认得，否则面板上能切的源点了必 404。
- * includeEngine 与取书池同口径（READING_ENGINE_SOURCES）：开关关时不刷 host 门、不查准入表，selectable 只剩 builtin。
+ * includeEngine与取书池同口径（READING_ENGINE_SOURCES）：显式关闭时不刷引擎host门、不查引擎准入表，selectable只剩合格活跃builtin（可为空）。
  */
 export async function getSourcePools(signal: AbortSignal): Promise<SourcePools> {
   const engineOn = engineSourcesEnabled();

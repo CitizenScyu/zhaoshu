@@ -59,7 +59,7 @@ vi.mock('@/lib/supported-sources', async (importOriginal) => {
 });
 
 import {
-  disableShuyuanSource, enableShuyuanSource, getBuiltinRequestSource, getEngineSources, getFanoutPool, getReadingPool, getShuyuanCounts,
+  disableShuyuanSource, enableShuyuanSource, engineSourcesEnabled, getBuiltinRequestSource, getEngineSources, getFanoutPool, getReadingPool, getShuyuanCounts,
   getShuyuanPoolHealth, getShuyuanStats, getReadingSources, getSourcePools, refreshShuyuan,
   REFRESH_BUDGET_MS, PROBE_PENDING_PER_REFRESH, RESPONSE_TIMEOUT_MS, SHUYUAN_REFRESH_PARTIAL, ShuyuanRefreshPartialError,
   ADMISSION_LEASE_ROW,
@@ -145,6 +145,8 @@ describe('refreshShuyuan atomic refresh', () => {
       options?.readOnly ? readTransaction(queries, options) : transaction(queries, options),
     }));
     vi.stubEnv('APP_OWNER_TOKEN', 'shuyuan-test-owner');
+    // 不涉及引擎的旧SQL夹具明确关闭；默认开启用例自行覆盖此隔离前提。
+    vi.stubEnv('READING_ENGINE_SOURCES', '0');
     vi.spyOn(console, 'error').mockImplementation(() => {});
     responses.clear();
     responses.set(indexUrl, {
@@ -1002,7 +1004,7 @@ describe('refreshShuyuan atomic refresh', () => {
   });
 
   // M1 任务 4 §5.2/§[M2]6.1：注册表合成视图。builtin 恒在前；引擎源并入**受 kill switch 约束**
-  // （READING_ENGINE_SOURCES 默认关，提前落地 M2-3 开关）；启用后 = admission ok ∧ 非 disabled
+  // （READING_ENGINE_SOURCES 默认开，可显式关闭）；启用后 = admission ok ∧ 非 disabled
   // ∧ probe 非 failed，且 host 必须已在运行时门集合内（冷启动 fail-closed，不 500）。
   describe('注册表合成视图（M1 任务 4 + M2-3 kill switch）', () => {
     const engineItem = {
@@ -1022,21 +1024,37 @@ describe('refreshShuyuan atomic refresh', () => {
     // 只认「显式注册的活跃内建行」；这里 mock 的是合成注册表的 builtin.test 行，见顶部 vi.mock）。
     const builtinRegisteredRow = [{ ...oldSource(knownSource), disabled_at: null, name: 'builtin.test' }];
 
-    it('默认（无 READING_ENGINE_SOURCES）不并入引擎源：池 = builtin only，且不查准入表', async () => {
-      refreshSupportedHosts(['engine.example']); // 即使 host 与准入数据都就绪
-      execute.mockResolvedValueOnce([{ collections: [] }]).mockResolvedValueOnce(builtinRegisteredRow);
-      const sources = await getReadingSources(new AbortController().signal);
-      expect(sources.map((source) => source.tier)).toEqual(['builtin']);
-      expect(sources[0].url).toBe('https://builtin.test/');
-      // 开关默认关 ⇒ 连准入表都不查（省 DB 往返，也不暴露引擎源失败面）。
-      expect(execute.mock.calls.some(([query]) => query.text.includes('source_admission'))).toBe(false);
+    it.each<{ raw: string | undefined; expected: boolean }>([
+      { raw: undefined, expected: true }, { raw: '', expected: true }, { raw: ' \t\n', expected: true },
+      { raw: '1', expected: true }, { raw: 'true', expected: true }, { raw: 'on', expected: true },
+      { raw: ' TrUe ', expected: true }, { raw: ' ON ', expected: true },
+      { raw: '0', expected: false }, { raw: 'false', expected: false }, { raw: 'off', expected: false },
+      { raw: ' FaLsE ', expected: false }, { raw: ' OFF ', expected: false },
+      { raw: '2', expected: false }, { raw: 'yes', expected: false }, { raw: 'enabled', expected: false },
+      { raw: 'null', expected: false }, { raw: 'true,false', expected: false },
+    ])('阅读引擎开关解析 $raw → $expected', ({ raw, expected }) => {
+      vi.stubEnv('READING_ENGINE_SOURCES', raw);
+      expect(engineSourcesEnabled()).toBe(expected);
+      expect(execute).not.toHaveBeenCalled();
     });
 
-    it('READING_ENGINE_SOURCES=0 显式关闭：同默认（不并入引擎源）', async () => {
+    it('默认（未设 READING_ENGINE_SOURCES）并入通过准入与可用性检查的引擎源', async () => {
+      vi.stubEnv('READING_ENGINE_SOURCES', undefined);
+      execute.mockResolvedValueOnce([{ host: 'engine.example' }]).mockResolvedValueOnce([{ collections: [] }])
+        .mockResolvedValueOnce(builtinRegisteredRow).mockResolvedValueOnce([engineRow()]);
+      const sources = await getReadingSources(new AbortController().signal);
+      expect(sources.map((source) => source.tier)).toEqual(['builtin', 'M1']);
+      expect(sources[0].url).toBe('https://builtin.test/');
+      expect(sources[1].rules).toBe(engineItem);
+      expect(execute.mock.calls.some(([query]) => query.text.includes('source_admission'))).toBe(true);
+    });
+
+    it('READING_ENGINE_SOURCES=0 显式关闭：不并入引擎源、不查准入表', async () => {
       vi.stubEnv('READING_ENGINE_SOURCES', '0');
       refreshSupportedHosts(['engine.example']);
       execute.mockResolvedValueOnce([{ collections: [] }]).mockResolvedValueOnce(builtinRegisteredRow);
       expect((await getReadingSources(new AbortController().signal)).map((source) => source.tier)).toEqual(['builtin']);
+      expect(execute.mock.calls.some(([query]) => query.text.includes('source_admission'))).toBe(false);
     });
 
     it('READING_ENGINE_SOURCES=1 且 host 未就绪（冷启动）时引擎源仍不出池，不 500', async () => {
@@ -1662,7 +1680,7 @@ describe('refreshShuyuan atomic refresh', () => {
     });
 
     it('§6.1 零回归：引擎开关关时完全不碰 host 门，也不查准入表', async () => {
-      // beforeEach 未设 READING_ENGINE_SOURCES ⇒ 开关关。预置门集合，验证 getReadingPool 后原样不动。
+      // beforeEach显式关闭READING_ENGINE_SOURCES。预置门集合，验证getReadingPool后原样不动。
       refreshSupportedHosts(['preset.example']);
       execute.mockResolvedValueOnce([{ collections: [] }]).mockResolvedValueOnce([]);
       await getReadingSources(new AbortController().signal);
