@@ -1,11 +1,16 @@
 // T8 验收：storage 绑定（WorkerStorage 的运行时实现）。PGlite 真库语义，不连生产。
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createSchema, loadPGlite, makeSqlTag, type PGliteLike } from './testing/pglite';
 import { createWorkerStorage, type DownloadSql } from './storage';
 import { artifactIdentityKey } from '../src/lib/artifact-registry';
 
 const PGliteCtor = await loadPGlite();
 const maybe = PGliteCtor ? describe : describe.skip;
+
+const publication = (artifactId: number) => ({
+  artifactId, version: 'abcd1234', blobSha: 'a'.repeat(40), bytes: 1234,
+  chaptersTotal: 3, chaptersDone: 3, charsTotal: 5678, sourceRevision: 'rev', snapshotPath: 'books/.snapshots/x/abcd1234.txt',
+});
 
 maybe('T8 storage 绑定：租约条件/心跳/进度/终态/artifact 幂等', () => {
   let pg: PGliteLike;
@@ -113,26 +118,97 @@ maybe('T8 storage 绑定：租约条件/心跳/进度/终态/artifact 幂等', (
     expect(await storage.taskRow(999999)).toBeNull();
   });
 
-  it('artifact 登记：reserve 幂等同身份、register 发布并回指任务', async () => {
-    const id = await insertTask('running');
+  const registration = async () => {
+    const id = await insertTask();
     const storage = createWorkerStorage(sql);
+    const lease = (await storage.claim('owner-a'))!;
     const identityKey = artifactIdentityKey('测试书', '佚名');
     const input = { labeledBookId: 1, identityKey, repositoryId: 1, branch: 'main', canonicalPath: 'books/%E6%B5%8B%E8%AF%95%E4%B9%A6-%E4%BD%9A%E5%90%8D.txt' };
     const first = await storage.reserveArtifactPath(input);
     const second = await storage.reserveArtifactPath(input);
     expect(second).toBe(first); // identity_key 唯一 → 同 id
+    return { id, storage, lease, artifactId: first, input: publication(first) };
+  };
+  const snapshot = async () => ({
+    tasks: (await pg.query('SELECT * FROM download_tasks ORDER BY id')).rows,
+    artifacts: (await pg.query('SELECT * FROM book_artifacts ORDER BY id')).rows,
+  });
 
-    expect(await storage.registerArtifact({
-      artifactId: first, version: 'abcd1234', blobSha: 'a'.repeat(40), bytes: 1234,
-      chaptersTotal: 3, chaptersDone: 3, charsTotal: 5678, sourceRevision: 'rev', snapshotPath: 'books/.snapshots/x/abcd1234.txt',
-    })).toBe(true);
-    const artifact = (await pg.query('SELECT quality_status, blob_sha, chapters_done FROM book_artifacts WHERE id = $1', [first])).rows[0];
+  it('合法首次登记registered，同artifact同出版事实重试already且两表不变', async () => {
+    const { id, storage, lease, artifactId, input } = await registration();
+    expect(await storage.registerArtifact(lease, input)).toBe('registered');
+    const artifact = (await pg.query('SELECT quality_status, blob_sha, chapters_done FROM book_artifacts WHERE id = $1', [artifactId])).rows[0];
     expect(artifact).toMatchObject({ quality_status: 'published', blob_sha: 'a'.repeat(40), chapters_done: 3 });
-    expect((await state(id)).artifact_id).toBe(first);
-    // 任务已回指：再登记同一 artifact 不再匹配 running 行 → false（幂等收口）
-    expect(await storage.registerArtifact({
-      artifactId: first, version: 'abcd1234', blobSha: 'a'.repeat(40), bytes: 1234,
-      chaptersTotal: 3, chaptersDone: 3, charsTotal: 5678, sourceRevision: 'rev', snapshotPath: 'x',
-    })).toBe(false);
+    expect((await state(id)).artifact_id).toBe(artifactId);
+    const before = await snapshot();
+    expect(await storage.registerArtifact(lease, input)).toBe('already');
+    expect(await snapshot()).toEqual(before);
+  });
+
+  it.each([{ version: '00000001' }, { blobSha: 'b'.repeat(40) }, { bytes: 2345 },
+    { chaptersTotal: 4 }, { chaptersDone: 2 }, { charsTotal: 6000 },
+    { sourceRevision: 'new-rev' }, { snapshotPath: 'books/.snapshots/x/new.txt' }])
+    ('同artifact出版字段改变必须重新registered，不按版本大小猜顺序（%#）', async (change) => {
+      const { storage, lease, input } = await registration();
+      expect(await storage.registerArtifact(lease, input)).toBe('registered');
+      const next = { ...input, ...change };
+      expect(await storage.registerArtifact(lease, next)).toBe('registered');
+      expect(await storage.registerArtifact(lease, next)).toBe('already');
+    });
+
+  it.each(['generation', 'owner', 'not-running', 'missing-task', 'wrong-book', 'missing-artifact', 'other-artifact'])
+    ('失权或错配%s：登记前后两表完全相同', async (kind) => {
+      const { id, storage, lease, input } = await registration();
+      let requestLease = lease;
+      let request = input;
+      if (kind === 'generation') await pg.query('UPDATE download_tasks SET lease_generation = lease_generation + 1 WHERE id = $1', [id]);
+      if (kind === 'owner') await pg.query("UPDATE download_tasks SET lease_owner = 'owner-b' WHERE id = $1", [id]);
+      if (kind === 'not-running') await pg.query("UPDATE download_tasks SET status = 'pending' WHERE id = $1", [id]);
+      if (kind === 'missing-task') requestLease = { ...lease, id: 999999 };
+      if (kind === 'wrong-book') {
+        const other = (await pg.query("INSERT INTO labeled_books(title, author, source_url) VALUES ('合成另一书', '合成作者', '') RETURNING id")).rows[0] as { id: number };
+        await pg.query('UPDATE download_tasks SET book_id = $1 WHERE id = $2', [other.id, id]);
+      }
+      if (kind === 'missing-artifact') request = { ...input, artifactId: 999999 };
+      if (kind === 'other-artifact') {
+        const other = await storage.reserveArtifactPath({ labeledBookId: 1, identityKey: 'synthetic-other',
+          repositoryId: 1, branch: 'main', canonicalPath: 'books/other.txt' });
+        await pg.query('UPDATE download_tasks SET artifact_id = $1 WHERE id = $2', [other, id]);
+      }
+      const before = await snapshot();
+      expect(await storage.registerArtifact(requestLease, request)).toBe(
+        ['generation', 'owner', 'not-running', 'missing-task'].includes(kind) ? 'lost' : 'mismatch');
+      expect(await snapshot()).toEqual(before);
+    });
+
+  it('出版字段约束异常时整条SQL回滚，不遗留单侧task挂接', async () => {
+    const { storage, lease, input } = await registration();
+    const before = await snapshot();
+    await expect(storage.registerArtifact(lease, { ...input, bytes: -1 })).rejects.toThrow();
+    expect(await snapshot()).toEqual(before);
+  });
+});
+
+describe('登记返回证据的假SQL映射（不证明数据库原子性）', () => {
+  const lease = { id: 1, leaseGeneration: 2, leaseOwner: 'synthetic-owner', attemptCount: 1 };
+  const registered = { status: 'registered', atomic_ok: 1, lease_ok: 1, guard_ok: 1, already_ok: 0, attach_ok: 1, pub_ok: 1 };
+  it.each([
+    registered,
+    { ...registered, status: 'already', already_ok: 1, attach_ok: 0, pub_ok: 0 },
+    { ...registered, status: 'lost', lease_ok: 0, guard_ok: 0, attach_ok: 0, pub_ok: 0 },
+    { ...registered, status: 'mismatch', guard_ok: 0, attach_ok: 0, pub_ok: 0 },
+  ])('完整证据映射$status且只提交一条SQL', async (row) => {
+    const fake = vi.fn().mockResolvedValue([row]);
+    expect(await createWorkerStorage(fake as unknown as DownloadSql).registerArtifact(lease, publication(1))).toBe(row.status);
+    expect(fake).toHaveBeenCalledTimes(1);
+    expect(fake.mock.calls[0].slice(1, 4)).toEqual([lease.id, lease.leaseGeneration, lease.leaseOwner]);
+  });
+  it.each([{ rows: [] }, { rows: [{}] }, { rows: [registered, registered] },
+    { rows: [{ ...registered, pub_ok: 0 }] }, { rows: [{ ...registered, attach_ok: 0 }] },
+    { rows: [{ ...registered, atomic_ok: 0 }] }, { rows: [{ status: 'already', was_attached: true }] }])
+    ('无完整成功证据拒绝（%#）', async ({ rows }) => {
+      const fake = vi.fn().mockResolvedValue(rows);
+      await expect(createWorkerStorage(fake as unknown as DownloadSql).registerArtifact(lease, publication(1)))
+        .rejects.toThrow('ARTIFACT_REGISTRATION_INVALID_RESULT');
   });
 });

@@ -25,7 +25,7 @@ function harness(result: PrecheckResult | Error | null, options: { used?: number
     finish: async (_l: DownloadTaskLease, r: { status: string; error?: string }) => { log.push(`finish:${r.status}:${r.error}`); return true; },
     defer: async () => { log.push('defer'); return '2026-09-24T03:15:00.000Z'; },
     reserveArtifactPath: async () => 1,
-    registerArtifact: async () => true,
+    registerArtifact: async () => 'registered' as const,
     releaseClaim: async () => { log.push('release'); return true; },
     ...options.storage,
   } as WorkerStorage & { releaseClaim: (l: DownloadTaskLease) => Promise<boolean> };

@@ -1,9 +1,7 @@
 // T8 接线：WorkerStorage 的运行时绑定（T3 任务层的 storage 接缝实现）。
 //
-// 只做接线，不新造存取语义：claim/心跳/进度/终态直接复用 download-task-queue.ts 的既有
-// v7 SQL；artifact 路径声明复用 artifact-registry.ts 的 reserveArtifactPath。任务行的
-// 两处写（taskRow 读取、registerArtifact 收口）在 T3 层没有独立导出函数（T3 测试在
-// 绑定处内联），本文件按 T3 测试的同形语句实现，并在报告中记为 T3 接口缺件。
+// claim/心跳/进度/终态复用既有v7 SQL；路径声明复用artifact-registry。
+// 出版登记在本模块用单条SQL锁定准确租约与artifact，原子更新并返回幂等结果。
 //
 // 不做 DDL：只 DML。
 
@@ -13,7 +11,7 @@ import {
   type DownloadTaskLease,
 } from '../src/lib/download-task-queue';
 import { reserveArtifactPath } from '../src/lib/artifact-registry';
-import type { TaskRow, WorkerStorage } from '../src/lib/download-worker';
+import type { ArtifactRegistrationResult, TaskRow, WorkerStorage } from '../src/lib/download-worker';
 
 export type DownloadSql = ReturnType<typeof neon>;
 
@@ -42,24 +40,75 @@ export function createWorkerStorage(sql: DownloadSql): RuntimeWorkerStorage {
 
     reserveArtifactPath: input => reserveArtifactPath(sql, input),
 
-    // T3 WorkerStorage.registerArtifact 只给 artifactId（无 taskId/lease），无法直接定位任务行。
-    // 单写者 + 并发=1 下，book 的 running 且未登记 artifact 的任务行唯一，按 book_artifacts
-    // 的 labeled_book_id 关联收口（T3 测试用「最近 running 行」近似，同义收窄）。
-    async registerArtifact(input) {
-      await sql`
-        UPDATE book_artifacts SET
-          quality_status = 'published', version = ${input.version}, blob_sha = ${input.blobSha},
-          bytes = ${input.bytes}, chapters_total = ${input.chaptersTotal},
-          chapters_done = ${input.chaptersDone}, chars = ${input.charsTotal},
-          snapshot_path = ${input.snapshotPath}, source_revision = ${input.sourceRevision},
-          published_at = now()
-        WHERE id = ${input.artifactId}`;
+    async registerArtifact(lease, input) {
       const rows = await sql`
-        UPDATE download_tasks SET artifact_id = ${input.artifactId}
-        WHERE status = 'running' AND artifact_id IS NULL
-          AND book_id = (SELECT labeled_book_id FROM book_artifacts WHERE id = ${input.artifactId})
-        RETURNING id` as unknown as { id: number }[];
-      return rows.length === 1;
+        WITH lease_guard AS MATERIALIZED (
+          SELECT id, book_id, artifact_id FROM download_tasks
+          WHERE id = ${lease.id} AND status = 'running'
+            AND lease_generation = ${lease.leaseGeneration} AND lease_owner = ${lease.leaseOwner}
+          FOR UPDATE
+        ), artifact_guard AS MATERIALIZED (
+          SELECT a.*, t.id AS task_id,
+            (t.artifact_id IS NOT DISTINCT FROM a.id
+              AND a.quality_status = 'published' AND a.published_at IS NOT NULL
+              AND a.version IS NOT DISTINCT FROM ${input.version}
+              AND a.blob_sha IS NOT DISTINCT FROM ${input.blobSha}
+              AND a.bytes IS NOT DISTINCT FROM ${input.bytes}
+              AND a.chapters_total IS NOT DISTINCT FROM ${input.chaptersTotal}
+              AND a.chapters_done IS NOT DISTINCT FROM ${input.chaptersDone}
+              AND a.chars IS NOT DISTINCT FROM ${input.charsTotal}
+              AND a.snapshot_path IS NOT DISTINCT FROM ${input.snapshotPath}
+              AND a.source_revision IS NOT DISTINCT FROM ${input.sourceRevision}) AS is_same
+          FROM book_artifacts a JOIN lease_guard t ON a.labeled_book_id = t.book_id
+          WHERE a.id = ${input.artifactId} AND (t.artifact_id IS NULL OR t.artifact_id = a.id)
+          FOR UPDATE OF a
+        ), attached AS (
+          UPDATE download_tasks t SET artifact_id = g.id
+          FROM artifact_guard g WHERE t.id = g.task_id AND NOT g.is_same
+          RETURNING t.id
+        ), published AS (
+          UPDATE book_artifacts a SET quality_status = 'published',
+            version = ${input.version}, blob_sha = ${input.blobSha}, bytes = ${input.bytes},
+            chapters_total = ${input.chaptersTotal}, chapters_done = ${input.chaptersDone},
+            chars = ${input.charsTotal}, snapshot_path = ${input.snapshotPath},
+            source_revision = ${input.sourceRevision}, published_at = now()
+          FROM artifact_guard g
+          WHERE a.id = g.id AND NOT g.is_same AND EXISTS (SELECT 1 FROM attached t WHERE t.id = g.task_id)
+          RETURNING a.id
+        ), proof AS (
+          SELECT (SELECT count(*)::int FROM lease_guard) AS lease_ok,
+            (SELECT count(*)::int FROM artifact_guard) AS guard_ok,
+            (SELECT count(*)::int FROM artifact_guard WHERE is_same) AS already_ok,
+            (SELECT count(*)::int FROM attached) AS attach_ok,
+            (SELECT count(*)::int FROM published) AS pub_ok
+        ), verdict AS (
+          SELECT proof.*, CASE
+            WHEN lease_ok = 0 AND guard_ok = 0 AND already_ok = 0 AND attach_ok = 0 AND pub_ok = 0 THEN 'lost'
+            WHEN lease_ok = 1 AND guard_ok = 0 AND already_ok = 0 AND attach_ok = 0 AND pub_ok = 0 THEN 'mismatch'
+            WHEN lease_ok = 1 AND guard_ok = 1 AND already_ok = 1 AND attach_ok = 0 AND pub_ok = 0 THEN 'already'
+            WHEN lease_ok = 1 AND guard_ok = 1 AND already_ok = 0 AND attach_ok = 1 AND pub_ok = 1 THEN 'registered'
+            ELSE NULL END AS status FROM proof
+        )
+        -- 非预期行数在同一语句内报错回滚，不能提交只有一侧成功的结果。
+        SELECT verdict.*, 1 / CASE WHEN status IS NULL THEN 0 ELSE 1 END AS atomic_ok FROM verdict
+      ` as unknown as Record<string, unknown>[];
+      const expected = {
+        lost: [0, 0, 0, 0, 0], mismatch: [1, 0, 0, 0, 0],
+        already: [1, 1, 1, 0, 0], registered: [1, 1, 0, 1, 1],
+      } as const;
+      const row = rows[0];
+      const status = row?.status;
+      const equalsCount = (value: unknown, count: number) => value === count || value === String(count);
+      if (rows.length !== 1 || !row || typeof status !== 'string'
+        || !Object.prototype.hasOwnProperty.call(expected, status) || !equalsCount(row.atomic_ok, 1)) {
+        throw new Error('ARTIFACT_REGISTRATION_INVALID_RESULT');
+      }
+      const result = status as ArtifactRegistrationResult;
+      const counts = [row.lease_ok, row.guard_ok, row.already_ok, row.attach_ok, row.pub_ok];
+      if (!expected[result].every((count, index) => equalsCount(counts[index], count))) {
+        throw new Error('ARTIFACT_REGISTRATION_INVALID_RESULT');
+      }
+      return result;
     },
 
     // 租约条件回退：只对「仍是本租约的 running 行」生效，失权后零行（不改他人行）。

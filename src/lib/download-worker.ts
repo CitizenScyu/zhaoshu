@@ -63,6 +63,8 @@ export interface SourceAdapter {
   download(task: TaskRow, context: SourceAdapterContext): Promise<AdapterOutcome>;
 }
 
+export type ArtifactRegistrationResult = 'registered' | 'already' | 'lost' | 'mismatch';
+
 export interface WorkerStorage {
   /** 领取一个 pending 任务（含 v7 租约递增）。返回 null 表示队列空。 */
   claim(owner: string): Promise<DownloadTaskLease | null>;
@@ -79,11 +81,11 @@ export interface WorkerStorage {
   /** T2 发布对账的 DB 前置：写前登记路径声明。 */
   reserveArtifactPath(input: { labeledBookId: number; identityKey: string; repositoryId: number; branch: string; canonicalPath: string }): Promise<number>;
   /** DB 阶段收口：登记已发布产物并把任务指向 artifact_id。 */
-  registerArtifact(input: {
+  registerArtifact(lease: DownloadTaskLease, input: {
     artifactId: number; version: string; blobSha: string; bytes: number;
     chaptersTotal: number; chaptersDone: number; charsTotal: number; sourceRevision: string;
     snapshotPath: string;
-  }): Promise<boolean>;
+  }): Promise<ArtifactRegistrationResult>;
 }
 
 /** PG 严格 text 禁 \x00 与孤立代理对（zhaoshu-books cleanPgText 同形）。 */
@@ -366,12 +368,14 @@ export async function runDownloadTask(
     // 快照/manifest 已落库，修复器凭完整 hash 与目标路径补登记，不重复下载。
     await heartbeat.stop();
     throwIfAbortedUnlessBudget(signal);
-    const registered = await storage.registerArtifact({
+    const registered = await storage.registerArtifact(lease, {
       artifactId, version: release.version, blobSha: release.blobSha, bytes: release.bytes,
       chaptersTotal: outcome.chaptersTotal, chaptersDone: outcome.chaptersDone,
       charsTotal: outcome.charsTotal, sourceRevision: '', snapshotPath: release.snapshotPath,
     });
-    if (!registered) throw new TaskLeaseLostError();
+    if (registered === 'lost') throw new TaskLeaseLostError();
+    if (registered === 'mismatch') throw new Error('ARTIFACT_REGISTRATION_MISMATCH');
+    if (registered !== 'registered' && registered !== 'already') throw new Error('ARTIFACT_REGISTRATION_INVALID_RESULT');
     const written = await storage.finish(lease, { status: 'done', error: '' });
     if (!written) throw new TaskLeaseLostError();
     return { processed: true, terminal: 'done' };

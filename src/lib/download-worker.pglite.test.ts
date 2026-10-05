@@ -10,6 +10,7 @@ import {
   claimDownloadTask, deferDownloadTask, finishDownloadTask, heartbeatDownloadTask, retryDownloadTask, updateDownloadTaskProgress,
 } from './download-task-queue';
 import { reserveArtifactPath } from './artifact-registry';
+import { createWorkerStorage } from '../../runtime-download/storage';
 import {
   createEngineAdapter, runDownloadTask, runWorkerOnce, startLeaseHeartbeat,
   TaskLeaseLostError, isLeaseLostError,
@@ -85,17 +86,7 @@ maybe('T3 worker 任务层：租约、单写者、五阶段对账（PGlite + moc
       labeledBookId: input.labeledBookId, identityKey: input.identityKey,
       repositoryId: input.repositoryId, branch: input.branch, canonicalPath: input.canonicalPath,
     }),
-    registerArtifact: async input => {
-      await sql`UPDATE book_artifacts SET quality_status = 'published', version = ${input.version},
-        blob_sha = ${input.blobSha}, bytes = ${input.bytes}, chapters_total = ${input.chaptersTotal},
-        chapters_done = ${input.chaptersDone}, chars = ${input.charsTotal}, snapshot_path = ${input.snapshotPath},
-        source_revision = ${input.sourceRevision}, published_at = now()
-        WHERE id = ${input.artifactId}`;
-      const rows = await sql`UPDATE download_tasks SET artifact_id = ${input.artifactId}
-        WHERE id = (SELECT id FROM download_tasks WHERE status = 'running' AND artifact_id IS NULL ORDER BY id DESC LIMIT 1)
-        RETURNING id`;
-      return rows.length === 1;
-    },
+    registerArtifact: (lease, input) => createWorkerStorage(sql as never).registerArtifact(lease, input),
     ...over,
   });
 
@@ -272,6 +263,33 @@ maybe('T3 worker 任务层：租约、单写者、五阶段对账（PGlite + moc
     expect(github.calls.some(call => call.op === 'put' && call.path.endsWith('current.json'))).toBe(false);
     // 快照/manifest 属内容寻址幂等产物，可能已落；任务行不指向任何 artifact
     expect(state.artifact_id).toBeNull();
+  });
+
+  it.each(['registered', 'already', 'lost', 'mismatch', 'unexpected'] as const)('登记结果%s：原样传lease并区分done、失权和失败', async (status) => {
+    await insertTask();
+    const lease = (await claimDownloadTask(sql as never, 'worker-a'))!;
+    const base = storage();
+    const finish = vi.fn(base.finish);
+    // 此处仅验证worker映射，返回预设值不证明SQL原子性。
+    const register = vi.fn<WorkerStorage['registerArtifact']>().mockResolvedValue(status as never);
+    const result = await runDownloadTask({ storage: storage({ registerArtifact: register, finish }), github,
+      adapters: [scriptAdapter({ kind: 'complete', txt: completeText('测试书', 3), chaptersTotal: 3, chaptersDone: 3, charsTotal: 2430 })],
+      repositoryId: 1, branch: 'main' }, lease);
+    expect(register).toHaveBeenCalledTimes(1);
+    expect(register.mock.calls[0][0]).toBe(lease);
+    expect(register.mock.calls[0][1]).toMatchObject({ artifactId: expect.any(Number), version: expect.any(String) });
+    if (status === 'registered' || status === 'already') {
+      expect(result.terminal).toBe('done');
+      expect(finish).toHaveBeenCalledTimes(1);
+      expect(finish).toHaveBeenCalledWith(lease, { status: 'done', error: '' });
+    } else if (status === 'lost') {
+      expect(result).toMatchObject({ processed: false, reason: 'lease_lost' });
+      expect(finish).not.toHaveBeenCalled();
+    } else {
+      expect(result.terminal).toBe('failed');
+      expect(finish.mock.calls.map(([, value]) => value.status)).toEqual(['failed']);
+      expect(finish.mock.calls[0][0]).toBe(lease);
+    }
   });
 
   it('DB 阶段（第五阶段）失败：任务 failed 可对账，快照/manifest 已落不被重下破坏', async () => {
@@ -597,11 +615,9 @@ maybe('T3 worker 任务层：租约、单写者、五阶段对账（PGlite + moc
         heartbeat: lease => heartbeatDownloadTask(recording as never, lease),
         progress: (lease, update) => updateDownloadTaskProgress(recording as never, lease, update),
         finish: (lease, result) => finishDownloadTask(recording as never, lease, result),
-        registerArtifact: async input => {
+        registerArtifact: async (lease, input) => {
           statements.push('register-artifact(update)');
-          await sql`UPDATE book_artifacts SET quality_status = 'published', version = ${input.version}, blob_sha = ${input.blobSha}, bytes = ${input.bytes}, chapters_total = ${input.chaptersTotal}, chapters_done = ${input.chaptersDone}, chars = ${input.charsTotal}, snapshot_path = ${input.snapshotPath}, source_revision = ${input.sourceRevision}, published_at = now() WHERE id = ${input.artifactId}`;
-          await sql`UPDATE download_tasks SET artifact_id = ${input.artifactId} WHERE id = ${id} AND status = 'running'`;
-          return true;
+          return createWorkerStorage(sql as never).registerArtifact(lease, input);
         },
       }),
       github, adapters: [scriptAdapter({ kind: 'complete', txt: completeText('测试书', 2), chaptersTotal: 2, chaptersDone: 2, charsTotal: 1620 })],

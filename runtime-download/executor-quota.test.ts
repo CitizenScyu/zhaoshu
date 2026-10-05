@@ -43,7 +43,7 @@ function fakeStorage(over: Partial<WorkerStorage> = {}): WorkerStorage {
     finish: async () => true,
     defer: async () => '2026-09-24T03:15:00.000Z',
     reserveArtifactPath: async () => 1,
-    registerArtifact: async () => true,
+    registerArtifact: async () => 'registered' as const,
     ...over,
   } as WorkerStorage;
 }
