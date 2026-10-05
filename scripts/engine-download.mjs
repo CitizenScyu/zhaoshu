@@ -86,6 +86,7 @@ export async function downloadBook(m, args, resolveSource, transport = fetchSour
   let nextAt = 0;
   let bytes = 0;
   let failureCode = 1;
+  let feedbackError;
   let stage = 'resolve';
   let lastCheckpoint = 0;
   // T3×P2 reconcile：两个节拍解耦——manifest 落盘按 5s 节流（P2-4 写放大修复），
@@ -200,6 +201,7 @@ export async function downloadBook(m, args, resolveSource, transport = fetchSour
     manifest.status = 'done';
   } catch (error) {
     if (isLimiterFeedbackError(error)) {
+      feedbackError = error;
       manifest.errors.push('limiter_feedback_unavailable');
       throw error;
     }
@@ -208,10 +210,23 @@ export async function downloadBook(m, args, resolveSource, transport = fetchSour
     if (failureCode === 2) manifest.failure_stage = stage; // 固定枚举，不含上游细节
     manifest.errors.push(failureCode === 2 ? 'source_unavailable' : knownError.test(error.message) ? error.message : 'download_failed');
   } finally {
-    clearTimeout(timer); process.off('SIGINT', stop); process.off('SIGTERM', stop);
-    if (external) external.removeEventListener?.('abort', onExternalAbort);
-    try { await checkpoint(); } finally {
-      closeSync(lock); unlinkSync(lockPath);
+    try {
+      clearTimeout(timer); process.off('SIGINT', stop); process.off('SIGTERM', stop);
+      if (external) external.removeEventListener?.('abort', onExternalAbort);
+      try { await checkpoint(); } finally {
+        closeSync(lock); unlinkSync(lockPath);
+      }
+    } catch (cleanupError) {
+      if (feedbackError === undefined) throw cleanupError;
+      throw Object.assign(
+        new AggregateError([feedbackError, cleanupError], 'Limiter feedback cleanup failed', { cause: feedbackError }),
+        {
+          name: 'LimiterFeedbackCleanupError',
+          code: 'LIMITER_FEEDBACK_UNAVAILABLE',
+          origin: 'limiter-feedback',
+          persistenceOutcome: 'unknown',
+        },
+      );
     }
   }
   return { manifest, manifestPath, code: manifest.status === 'done' ? 0 : failureCode };

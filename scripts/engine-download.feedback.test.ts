@@ -165,15 +165,48 @@ describe('downloadBook limiter feedback propagation', () => {
     expect(manifest.chapters[1].status).toBe('done');
   });
 
-  it('preserves the current boundary where final checkpoint callback error overrides feedback error', async () => {
-    const error = feedbackError();
+  it('retains frozen feedback and final checkpoint errors in a structured aggregate', async () => {
+    const error = Object.freeze(feedbackError());
     const cleanupError = new Error('synthetic_cleanup_failure');
     // Search fails before any earlier checkpoint, so this callback is reached only in finally.
     const fixture = setup({ at: 'search', error }, cleanupError);
-    await expect(fixture.run()).rejects.toBe(cleanupError);
+    const rejected = await fixture.run().then(
+      () => { throw new Error('expected_feedback_cleanup_rejection'); },
+      failure => failure,
+    );
+    expect(rejected).toBeInstanceOf(AggregateError);
+    expect(rejected.message).toBe('Limiter feedback cleanup failed');
+    expect(rejected.name).toBe('LimiterFeedbackCleanupError');
+    expect(rejected.code).toBe('LIMITER_FEEDBACK_UNAVAILABLE');
+    expect(rejected.origin).toBe('limiter-feedback');
+    expect(rejected.persistenceOutcome).toBe('unknown');
+    expect(rejected.cause).toBe(error);
+    expect(rejected.errors).toHaveLength(2);
+    expect(rejected.errors[0]).toBe(error);
+    expect(rejected.errors[1]).toBe(cleanupError);
+    expect(Object.getOwnPropertyDescriptor(rejected, 'cause')?.enumerable).toBe(false);
+    expect(Object.getOwnPropertyDescriptor(rejected, 'errors')?.enumerable).toBe(false);
+    expect(Object.keys(rejected).sort()).toEqual(['code', 'name', 'origin', 'persistenceOutcome']);
+    expect(Object.isFrozen(error)).toBe(true);
     expect(fixture.calls).toEqual([SEARCH]);
     expect(fixture.progress).toHaveBeenCalledTimes(1);
     const saved = expectFeedbackCheckpoint(fixture, error);
     expect(saved.chapters_done).toBe(0);
+    const raw = fixture.checkpoint().raw;
+    expect(raw).not.toContain(cleanupError.message);
+    expect(raw).not.toContain('Limiter feedback cleanup failed');
+    expect(raw).not.toContain('persistenceOutcome');
+  });
+
+  it('propagates a final checkpoint error unchanged when no feedback error was saved', async () => {
+    const cleanupError = new Error('synthetic_cleanup_only_failure');
+    const fixture = setup({ at: 'search', error: new Error('synthetic_ordinary_search_failure') }, cleanupError);
+    await expect(fixture.run()).rejects.toBe(cleanupError);
+    expect(cleanupError).not.toBeInstanceOf(AggregateError);
+    expect(cleanupError).not.toHaveProperty('code');
+    expect(cleanupError).not.toHaveProperty('origin');
+    expect(fixture.calls).toEqual([SEARCH]);
+    expect(fixture.progress).toHaveBeenCalledTimes(1);
+    expect(fixture.checkpoint().manifest.errors).toEqual(['download_failed']);
   });
 });
