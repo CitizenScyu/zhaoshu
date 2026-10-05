@@ -49,6 +49,8 @@ export interface ProductionExecutorOptions {
   env?: NodeJS.ProcessEnv;
   owner?: string;
   taskTimeoutMs?: number;
+  /** 默认存储目标owner/repo；缺省使用ZHAOSHU_BOOKS_REPO，与执行仓无关。完整DI时不使用。 */
+  repository?: string;
   // ---- 测试注入缝（生产均走默认装配）----
   storage?: RuntimeStorage;
   github?: GitHubContents;
@@ -68,20 +70,46 @@ function requiredEnv(env: NodeJS.ProcessEnv, key: string): string {
   return value;
 }
 
+function storageTarget(value: unknown, branch: string) {
+  if (value === undefined) throw new Error('MISSING_STORAGE_REPOSITORY');
+  if (typeof value !== 'string' || /[\x00-\x1f\x7f]/.test(value)) throw new Error('INVALID_STORAGE_REPOSITORY');
+  const parts = value.trim().split('/');
+  const [owner, repo] = parts;
+  if (parts.length !== 2 || !owner || !repo || parts.some(part => !/^[A-Za-z0-9._-]+$/.test(part) || part === '.' || part === '..')) {
+    throw new Error('INVALID_STORAGE_REPOSITORY');
+  }
+  return { owner, repo, branch, repository: `${owner}/${repo}` };
+}
+
 export async function createDownloadExecutor(options: ProductionExecutorOptions): Promise<DownloadExecutor> {
+  const hasGithub = options.github !== undefined;
+  const hasRepositoryId = options.repositoryId !== undefined;
+  if (hasGithub !== hasRepositoryId) throw new Error('STORAGE_TARGET_INJECTION_PAIR_REQUIRED');
+  if (hasRepositoryId && (typeof options.repositoryId !== 'number'
+    || !Number.isSafeInteger(options.repositoryId) || options.repositoryId <= 0)) {
+    throw new Error('INVALID_STORAGE_REPOSITORY_ID');
+  }
   const env = options.env ?? process.env;
   const log = options.log ?? (() => {});
   const branch = options.branch ?? env.DOWNLOAD_TARGET_BRANCH ?? 'main';
+  if (typeof branch !== 'string' || !branch.trim()) throw new Error('INVALID_STORAGE_BRANCH');
+  const target = hasGithub ? undefined
+    : storageTarget(options.repository !== undefined ? options.repository : env.ZHAOSHU_BOOKS_REPO, branch);
 
   let sql: ReturnType<typeof neon> | undefined;
   const storage = options.storage ?? createWorkerStorage(
     (sql = neon(requiredEnv(env, 'DATABASE_URL'))),
   );
 
-  const github = options.github ?? createGitHubContents({
+  let repositoryId = options.repositoryId;
+  if (repositoryId === undefined) {
+    if (!sql) sql = neon(requiredEnv(env, 'DATABASE_URL'));
+    repositoryId = await resolveRepositoryId(sql, target!);
+  }
+  const github = hasGithub ? options.github! : createGitHubContents({
     token: requiredEnv(env, 'GITHUB_TOKEN'),
-    repository: requiredEnv(env, 'GITHUB_REPOSITORY'),
-    branch, // 与 resolveRepositoryId 反查的同一条 branch，读写不落默认分支
+    repository: target!.repository,
+    branch: target!.branch,
   });
 
   const modules = options.modules ?? assembleEngineModules();
@@ -115,14 +143,6 @@ export async function createDownloadExecutor(options: ProductionExecutorOptions)
     engineAdapter,
     fallback ? fallback.wrapAdapter(builtinAdapter, engineAdapter) : builtinAdapter,
   ]);
-
-  let repositoryId = options.repositoryId;
-  if (repositoryId === undefined) {
-    if (!sql) sql = neon(requiredEnv(env, 'DATABASE_URL'));
-    const [owner, repo, extra] = requiredEnv(env, 'GITHUB_REPOSITORY').split('/');
-    if (!owner || !repo || extra !== undefined) throw new Error('GITHUB_REPOSITORY must be owner/repo');
-    repositoryId = await resolveRepositoryId(sql, { owner, repo, branch });
-  }
 
   // 扣额度前的身份预检默认开；DOWNLOAD_IDENTITY_PRECHECK=0 关（回到引入前行为：书源不可达只在下载中判出、
   // 事后退还日预算）。与下载腿共用 modules/resolveSource/transport（同一个运行时限速器）。
