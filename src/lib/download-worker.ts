@@ -55,6 +55,8 @@ export interface SourceAdapterContext {
   signal: AbortSignal;
   /** 进度回调：转写为租约条件的心跳/进度 SQL。抛错立即中断。 */
   progress(update: { chaptersDone: number; chaptersTotal: number; charsTotal: number }): Promise<void>;
+  /** 仅记录反馈错误原引用；任务层提供无 I/O 的回调。 */
+  onFeedbackFailure?(error: unknown): void;
 }
 
 export interface SourceAdapter {
@@ -178,6 +180,26 @@ export interface WorkerResult {
   stage?: string;
   sourceHost?: string;
   retryAt?: string | null;
+  feedback?: {
+    code: 'LIMITER_FEEDBACK_UNAVAILABLE';
+    origin: 'limiter-feedback';
+    persistenceOutcome: 'unknown';
+    budgetExhausted: boolean;
+    settlement: 'acknowledged' | 'lost' | 'unknown';
+  };
+}
+
+const workerFeedbackErrors = new WeakMap<WorkerResult, unknown>();
+
+/** 原异常仅供受控内存诊断，调用方不得将返回值写入日志或持久化。 */
+export function getWorkerFeedbackError(result: WorkerResult): unknown {
+  return workerFeedbackErrors.get(result);
+}
+
+function isFeedbackFailure(error: unknown): boolean {
+  if (typeof error !== 'object' || error === null) return false;
+  const value = error as { code?: unknown; origin?: unknown };
+  return value.code === 'LIMITER_FEEDBACK_UNAVAILABLE' && value.origin === 'limiter-feedback';
 }
 
 const hostOf = (url: string): string => {
@@ -264,19 +286,64 @@ export async function runDownloadTask(
   const taskTimer = setTimeout(() => taskDeadline.abort(new Error('budget_exhausted')), options.taskTimeoutMs ?? WORKER_TASK_TIMEOUT_MS);
   const signal = AbortSignal.any([heartbeat.signal, taskDeadline.signal]);
   let sawProgress = 0;
+  let leaseLostObserved = false;
+  let feedbackError: unknown;
+  let feedbackSettlementStarted = false;
+  let feedbackSettlement: Promise<WorkerResult> | undefined;
+  const recordFeedbackFailure = (error: unknown) => {
+    if (!feedbackSettlementStarted && feedbackError === undefined && isFeedbackFailure(error)) feedbackError = error;
+  };
+  const settleFeedback = (error?: unknown): Promise<WorkerResult> => {
+    if (feedbackSettlement) return feedbackSettlement;
+    feedbackSettlementStarted = true;
+    const originalFeedback = feedbackError;
+    feedbackSettlement = (async () => {
+      await heartbeat.stop();
+      const resultFor = (settlement: NonNullable<WorkerResult['feedback']>['settlement']): WorkerResult => {
+        const result: WorkerResult = {
+          processed: settlement !== 'lost',
+          reason: settlement === 'lost' ? 'lease_lost' : 'limiter_feedback_unavailable',
+          ...(settlement === 'acknowledged' ? { terminal: 'failed' as const } : {}),
+          feedback: {
+            code: 'LIMITER_FEEDBACK_UNAVAILABLE', origin: 'limiter-feedback', persistenceOutcome: 'unknown',
+            budgetExhausted: isBudgetExhausted(error) || isBudgetExhausted(signal.reason) || isBudgetExhausted(taskDeadline.signal.reason),
+            settlement,
+          },
+        };
+        workerFeedbackErrors.set(result, originalFeedback);
+        return result;
+      };
+      if (leaseLostObserved || isLeaseLostError(error) || isLeaseLostError(signal.reason) || isLeaseLostError(heartbeat.signal.reason)) {
+        return resultFor('lost');
+      }
+      let written: boolean;
+      try {
+        written = await storage.finish(lease, { status: 'failed', error: 'limiter_feedback_unavailable' });
+      } catch {
+        return resultFor('unknown');
+      }
+      return resultFor(written ? 'acknowledged' : 'lost');
+    })();
+    return feedbackSettlement;
+  };
 
   try {
     await heartbeat.check();
     const adapter = selectAdapter(options.adapters, task);
     const outcome = await adapter.download(task, {
       signal,
+      onFeedbackFailure: recordFeedbackFailure,
       async progress(update) {
         // adapter 进度即心跳数据通道：写失败（失租约）立即中断抓取。
         sawProgress = update.chaptersDone;
         const alive = await storage.progress(lease, update);
-        if (!alive) throw new TaskLeaseLostError();
+        if (!alive) {
+          leaseLostObserved = true;
+          throw new TaskLeaseLostError();
+        }
       },
     });
+    if (feedbackError !== undefined) return await settleFeedback();
 
     if (outcome.kind === 'incomplete') {
       // partial 零发布：任何 GitHub PUT 都没发生，DB 只写终态。
@@ -380,6 +447,9 @@ export async function runDownloadTask(
     if (!written) throw new TaskLeaseLostError();
     return { processed: true, terminal: 'done' };
   } catch (error) {
+    // 最终拒绝可能是含清理错误的 G，优先于先前回调记录的 F；收口开始后不再改引用。
+    if (!feedbackSettlementStarted && isFeedbackFailure(error)) feedbackError = error;
+    if (feedbackError !== undefined) return await settleFeedback(error);
     await heartbeat.stop();
     if (isLeaseLostError(error) || signal.reason instanceof TaskLeaseLostError || signal.reason instanceof LeaseLostError) {
       // 失租约：不写终态（行已不属于本租约），让接管者/回收器决定后续。
@@ -513,9 +583,12 @@ export function createEngineAdapter(options: EngineAdapterOptions): SourceAdapte
           onProgress: update => context.progress(update),
         });
       } catch (error) {
+        const feedbackFailure = isFeedbackFailure(error);
+        if (feedbackFailure) context.onFeedbackFailure?.(error);
         // 心跳失权由 startLeaseHeartbeat 以 TaskLeaseLostError 实例 abort（见 :117），
         // 判据收窄到「reason 是失权错误」——task signal 上的普通 abort（预算耗尽）不算失权。
         if (isLeaseLostError(error) || isLeaseLostError(context.signal.reason)) throw new TaskLeaseLostError();
+        if (feedbackFailure) throw error;
         // 任务预算耗尽（worker 侧定时器）不是源站失败：按可续传的 incomplete 收口，
         // 与引擎自身 budget 定时器的 budget_exhausted 分类一致（检查点保留，下次续传）。
         if (isBudgetExhausted(error) || isBudgetExhausted(context.signal.reason)) {
