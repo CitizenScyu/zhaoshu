@@ -116,9 +116,9 @@ export function createResolveSource(m: EngineModules) {
 
 /** 运行时限速器接缝（zhaoshu-books runtime/lib/rate-limiter.mjs 的 SourceRateLimiter 形态）。 */
 export interface RateLimiterLike {
-  acquire(sourceKey: string, options?: { signal?: AbortSignal }): Promise<void>;
-  recordSuccess?(sourceKey: string): void | Promise<void>;
-  recordFailure?(sourceKey: string, options?: { retryAfterMs?: number }): void | Promise<void>;
+  acquire(sourceKey: string, options?: { signal?: AbortSignal }): Promise<unknown>;
+  recordSuccess?(sourceKey: string, options?: { permit?: unknown }): void | Promise<void>;
+  recordFailure?(sourceKey: string, options?: { retryAfterMs?: number; permit?: unknown }): void | Promise<void>;
 }
 
 /** 反馈持久化不可确认；原错误仅保留引用，不复制源站status或敏感消息。 */
@@ -175,13 +175,16 @@ export function createSourceTransport(limiter?: RateLimiterLike): SourceTranspor
     const { signal, timeoutMs, beforeRequest, beforeFetch: callerGate } = options;
     // 最近一次物理发射的 host（许可按它取过）：无 responseHost 的 HTTP 失败反馈归它。
     let lastHost = hostOf(url);
+    // opaque许可只在本次transport内保留原引用；不解析字段或按反馈host重绑。
+    let lastPermit: unknown;
     const beforeFetch = limiter || callerGate
       ? async (gateSignal: AbortSignal, current: string) => {
+        lastPermit = undefined;
         await callerGate?.(gateSignal, current);
         if (!limiter) return;
         const key = hostOf(current) || current;
         lastHost = key;
-        await limiter.acquire(key, { signal: gateSignal });
+        lastPermit = await limiter.acquire(key, { signal: gateSignal });
       }
       : undefined;
     let page: { url: string; text: string };
@@ -202,8 +205,11 @@ export function createSourceTransport(limiter?: RateLimiterLike): SourceTranspor
         const responseHost = (error as { responseHost?: unknown })?.responseHost;
         const key = (typeof responseHost === 'string' && responseHost) || lastHost || hostOf(url) || url;
         const retryAfterMs = (error as { retryAfterMs?: unknown })?.retryAfterMs;
+        const failureOptions = typeof retryAfterMs === 'number' ? { retryAfterMs } : undefined;
         try {
-          await limiter.recordFailure?.(key, typeof retryAfterMs === 'number' ? { retryAfterMs } : undefined);
+          await limiter.recordFailure?.(key, lastPermit === undefined
+            ? failureOptions
+            : { ...failureOptions, permit: lastPermit });
         } catch (feedbackError) {
           throw new LimiterFeedbackError('failure', key, feedbackError, {
             requestError: error,
@@ -215,7 +221,8 @@ export function createSourceTransport(limiter?: RateLimiterLike): SourceTranspor
     }
     const successHost = hostOf(page.url) || lastHost;
     try {
-      await limiter?.recordSuccess?.(successHost);
+      if (lastPermit === undefined) await limiter?.recordSuccess?.(successHost);
+      else await limiter?.recordSuccess?.(successHost, { permit: lastPermit });
     } catch (feedbackError) {
       throw new LimiterFeedbackError('success', successHost, feedbackError, {
         ...(signal.aborted ? { abortReason: signal.reason } : {}),
