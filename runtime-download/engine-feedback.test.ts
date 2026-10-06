@@ -1,7 +1,7 @@
-// 仅测反馈错误边界；真实HTTP/物理门集成断言保留在engine-request-gate.test.ts。
+// 仅测反馈错误与permit接线边界；真实HTTP/物理门集成断言保留在engine-request-gate.test.ts。
 // 完整替换engine的外部模块，避免本组用例加载真实配置、数据库或网络实现。
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { createSourceTransport, LimiterFeedbackError } from './engine';
+import { createSourceTransport, LimiterFeedbackError, type RateLimiterLike } from './engine';
 
 const source = vi.hoisted(() => ({ fetchSourceText: vi.fn() }));
 vi.mock('../src/lib/rule-engine/api', () => ({}));
@@ -42,7 +42,11 @@ beforeEach(() => {
 afterEach(() => vi.unstubAllGlobals());
 
 function limiter() {
-  return { acquire: vi.fn(async () => {}), recordSuccess: vi.fn(), recordFailure: vi.fn() };
+  return {
+    acquire: vi.fn<RateLimiterLike['acquire']>(async () => {}),
+    recordSuccess: vi.fn<NonNullable<RateLimiterLike['recordSuccess']>>(),
+    recordFailure: vi.fn<NonNullable<RateLimiterLike['recordFailure']>>(),
+  };
 }
 const options = () => ({ signal: new AbortController().signal });
 const httpError = () => Object.assign(new Error('synthetic HTTP error'), {
@@ -219,6 +223,154 @@ describe('createSourceTransport异步反馈隔离', () => {
     } finally {
       write.resolve();
       await pending;
+    }
+  });
+});
+
+describe('createSourceTransport opaque permit接线（决策层合成桩）', () => {
+  const permit = Object.freeze({ tag: 'synthetic opaque permit' });
+  const retryUrl = 'https://retry.test/chapter';
+
+  // 只模拟一次指定传输错误后的物理门重入，不验证真实source-fetch重试实现。
+  function simulateRetry(retryError: Error) {
+    source.fetchSourceText.mockImplementation(async (url: string, gateOptions: GateOptions) => {
+      const gate = async (current: string) => {
+        try { await gateOptions.beforeFetch?.(gateOptions.signal, current); }
+        catch (error) {
+          (error as { fromBeforeRequest?: boolean }).fromBeforeRequest = true;
+          throw error;
+        }
+      };
+      await gate(url);
+      try { return await request(); }
+      catch (error) { if (error !== retryError) throw error; }
+      await gate(retryUrl);
+      return request();
+    });
+  }
+
+  it.each([permit, null])('成功反馈保留opaque值%j，page.url换host不改绑定', async opaque => {
+    const value = limiter();
+    value.acquire.mockResolvedValue(opaque);
+    await expect(createSourceTransport(value)(URL, options())).resolves.toBe(PAGE);
+    expect(value.acquire.mock.calls[0]?.[0]).toBe('source.test');
+    expect(value.recordSuccess).toHaveBeenCalledOnce();
+    expect(value.recordSuccess).toHaveBeenCalledWith('result.test', { permit: opaque });
+    expect(value.recordSuccess.mock.calls[0]?.[1]?.permit).toBe(opaque);
+    expect(value.recordFailure).not.toHaveBeenCalled();
+    expect(realFetch).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { opaque: permit, retryAfterMs: 5000 },
+    { opaque: permit, retryAfterMs: undefined },
+    { opaque: undefined, retryAfterMs: undefined },
+  ])('失败反馈保留permit=$opaque和retryAfterMs=$retryAfterMs及旧void形状', async ({ opaque, retryAfterMs }) => {
+    const value = limiter();
+    value.acquire.mockResolvedValue(opaque);
+    const original = Object.assign(new Error('synthetic HTTP error'), { status: 429, responseHost: 'response.test' },
+      retryAfterMs === undefined ? {} : { retryAfterMs });
+    request.mockRejectedValue(original);
+    await expect(createSourceTransport(value)(URL, options())).rejects.toBe(original);
+    const failureOptions = retryAfterMs === undefined ? undefined : { retryAfterMs };
+    expect(value.recordFailure).toHaveBeenCalledOnce();
+    expect(value.recordFailure).toHaveBeenCalledWith('response.test', opaque === undefined
+      ? failureOptions : { ...failureOptions, permit: opaque });
+    expect(value.recordFailure.mock.calls[0]?.[1]?.permit).toBe(opaque);
+    expect(value.recordSuccess).not.toHaveBeenCalled();
+  });
+
+  it.each([Object.freeze({ tag: 'second permit' }), undefined])('重试独立acquire，第二许可%j不沿用第一许可', async secondPermit => {
+    const value = limiter();
+    const retryError = new Error('synthetic retryable transport error');
+    simulateRetry(retryError);
+    request.mockRejectedValueOnce(retryError);
+    value.acquire.mockResolvedValueOnce(permit).mockResolvedValueOnce(secondPermit);
+    const opts = options();
+    await expect(createSourceTransport(value)(URL, opts)).resolves.toBe(PAGE);
+    expect(value.acquire.mock.calls).toEqual([
+      ['source.test', { signal: opts.signal }], ['retry.test', { signal: opts.signal }],
+    ]);
+    expect(request).toHaveBeenCalledTimes(2);
+    if (secondPermit === undefined) expect(value.recordSuccess.mock.calls).toEqual([['result.test']]);
+    else {
+      expect(value.recordSuccess).toHaveBeenCalledOnce();
+      expect(value.recordSuccess).toHaveBeenCalledWith('result.test', { permit: secondPermit });
+      expect(value.recordSuccess.mock.calls[0]?.[1]?.permit).toBe(secondPermit);
+    }
+    expect(value.recordFailure).not.toHaveBeenCalled();
+  });
+
+  it('重试acquire拒绝带429时不沿用旧permit反馈', async () => {
+    const value = limiter();
+    const retryError = new Error('synthetic retryable transport error');
+    const stop = Object.assign(new Error('synthetic acquire refusal'), { status: 429 });
+    simulateRetry(retryError);
+    request.mockRejectedValueOnce(retryError);
+    value.acquire.mockResolvedValueOnce(permit).mockRejectedValueOnce(stop);
+    await expect(createSourceTransport(value)(URL, options())).rejects.toBe(stop);
+    expect(value.acquire).toHaveBeenCalledTimes(2);
+    expect(stop).toHaveProperty('fromBeforeRequest', true);
+    expect(request).toHaveBeenCalledOnce();
+    expect(value.recordSuccess).not.toHaveBeenCalled();
+    expect(value.recordFailure).not.toHaveBeenCalled();
+  });
+
+  it('已获permit后返回同一取消reason，仍零源站反馈', async () => {
+    const value = limiter();
+    value.acquire.mockResolvedValue(permit);
+    const controller = new AbortController();
+    const stop = Object.assign(new Error('synthetic caller abort'), { status: 429 });
+    request.mockImplementationOnce(async () => { controller.abort(stop); throw stop; });
+    await expect(createSourceTransport(value)(URL, { signal: controller.signal })).rejects.toBe(stop);
+    expect(value.acquire).toHaveBeenCalledOnce();
+    expect(stop).not.toHaveProperty('fromBeforeRequest');
+    expect(value.recordSuccess).not.toHaveBeenCalled();
+    expect(value.recordFailure).not.toHaveBeenCalled();
+  });
+
+  it.each(['success', 'failure'] as const)('携permit的%s反馈拒绝仍只包装原F', async phase => {
+    const value = limiter();
+    value.acquire.mockResolvedValue(permit);
+    const feedbackError = Object.assign(new Error('synthetic feedback failure'), { status: 503 });
+    const original = phase === 'failure' ? httpError() : undefined;
+    if (original) request.mockRejectedValue(original);
+    const feedback = phase === 'success' ? value.recordSuccess : value.recordFailure;
+    feedback.mockRejectedValue(feedbackError);
+    const result = await createSourceTransport(value)(URL, options()).catch((error: unknown) => error);
+    expectFeedback(result, phase, feedbackError, original);
+    expect(feedback).toHaveBeenCalledOnce();
+    expect(feedback.mock.calls[0]?.[1]?.permit).toBe(permit);
+    expect(phase === 'success' ? value.recordFailure : value.recordSuccess).not.toHaveBeenCalled();
+    expect(request).toHaveBeenCalledOnce();
+  });
+
+  it('同一transport并发交错完成时各自保留许可原引用', async () => {
+    const value = limiter();
+    const secondPermit = Object.freeze({ tag: 'concurrent permit' });
+    value.acquire.mockResolvedValueOnce(permit).mockResolvedValueOnce(secondPermit);
+    const entered = deferred();
+    const release = deferred();
+    source.fetchSourceText.mockImplementation(async (url: string, gateOptions: GateOptions) => {
+      await gateOptions.beforeFetch?.(gateOptions.signal, url);
+      if (url === URL) { entered.resolve(); await release.promise; }
+      return { url, text: '合成正文' };
+    });
+    const transport = createSourceTransport(value);
+    const first = transport(URL, options());
+    try {
+      await entered.promise;
+      await transport(retryUrl, options());
+      release.resolve();
+      await first;
+      expect(value.acquire).toHaveBeenCalledTimes(2);
+      expect(value.recordSuccess.mock.calls.map(([host]) => host)).toEqual(['retry.test', 'source.test']);
+      expect(value.recordSuccess.mock.calls[0]?.[1]?.permit).toBe(secondPermit);
+      expect(value.recordSuccess.mock.calls[1]?.[1]?.permit).toBe(permit);
+      expect(value.recordFailure).not.toHaveBeenCalled();
+    } finally {
+      release.resolve();
+      await first;
     }
   });
 });
