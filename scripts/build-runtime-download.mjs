@@ -15,6 +15,7 @@ import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { wireDownloadExecutor } from './runtime-download-template.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(here, '..');
@@ -60,51 +61,7 @@ for (const extra of ['timer', 'docs', 'systemd', 'README.md']) {
 // 3) 注入执行器接缝到构建产物里的 main.mjs（源文件零改动）。
 const mainPath = join(runtimeOut, 'service', 'main.mjs');
 const original = readFileSync(mainPath, 'utf8');
-const START = '  // ---- 执行器接缝（T3 交付后替换）----';
-const END = '\n  const loop = createDrainLoop({';
-const startAt = original.indexOf(START);
-const endAt = original.indexOf(END, startAt);
-if (startAt < 0 || endAt < 0) {
-  throw new Error('main.mjs 执行器接缝锚点未找到：shell 已变更，需人工复核（未生成 tar）');
-}
-const injection = `${START}
-  let dummyTasks = 2;
-  let productionRunOnce = null;
-  const runOnce = async (signal) => {
-    if (dummy) {
-      if (dummyTasks <= 0) return LoopDecision.NO_TASK;
-      const consumed = await budget.consume();
-      if (!consumed.allowed) return LoopDecision.BUDGET_EXHAUSTED;
-      dummyTasks -= 1;
-      log('info', 'dummy 执行器完成一本（合成任务）', { used: consumed.used, limit: consumed.limit });
-      return LoopDecision.TASK_DONE;
-    }
-    if (!productionRunOnce) {
-      const { createDownloadExecutor } = await import('../executor/executor.mjs');
-      const executor = await createDownloadExecutor({
-        budget,
-        // 与上文 createDailyBudget 同一状态文件：书源不可达的尝试凭它退还日预算（41-EXEC-SRCUNAVAIL）。
-        budgetStatePath: join(stateDir, 'daily-budget.json'),
-        // 与上文 createDailyBudget 同一上限：shell read() 不回上限，扣额度前预检据此判断「今天已满就不预检」。
-        budgetLimit: config.dailyBookLimit,
-        workDir: join(stateDir, 'download'),
-        rateLimiter: new SourceRateLimiter(),
-        decisions: LoopDecision,
-        log,
-      });
-      productionRunOnce = executor.runOnce;
-    }
-    return productionRunOnce(signal);
-  };`;
-const patched = original.slice(0, startAt) + injection + original.slice(endAt);
-// 限速器来自 shell 自身（单一实例，真实 HTTP 请求层共享）。
-if (!patched.includes("from '../lib/rate-limiter.mjs'")) {
-  const anchor = "import { createDailyBudget } from '../lib/daily-budget.mjs';";
-  if (!patched.includes(anchor)) throw new Error('main.mjs rate-limiter 注入锚点未找到');
-  writeFileSync(mainPath, patched.replace(anchor, `${anchor}\nimport { SourceRateLimiter } from '../lib/rate-limiter.mjs';`), 'utf8');
-} else {
-  writeFileSync(mainPath, patched, 'utf8');
-}
+writeFileSync(mainPath, wireDownloadExecutor(original), 'utf8');
 
 // 4) 依赖：把 external 的 @neondatabase/serverless 随包分发（与 T7 tar 策略一致）。
 const neonSrc = join(repoRoot, 'node_modules', NEON_DEP);
