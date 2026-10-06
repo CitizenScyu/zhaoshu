@@ -17,6 +17,12 @@ import * as parser from '../src/lib/source-parser';
 import * as reader from '../src/lib/source-reader';
 import { fetchSourceText } from '../src/lib/source-fetch';
 
+export {
+  createFeedbackDeadlineLimiter, FeedbackDeadlineError, FeedbackHostStateError,
+  type FeedbackDeadlineOptions, type FeedbackDeadlineLimiter, type FeedbackDiagnostic,
+  type FeedbackHostStatus, type FeedbackPublicState, type FeedbackIOState, type FeedbackPhase,
+} from './limiter-feedback-deadline';
+
 export interface EngineModules {
   api: typeof api;
   compile: typeof compile;
