@@ -8,7 +8,7 @@ import {
 const PRIVATE = 'synthetic_private_detail';
 const CODE = 'LIMITER_FEEDBACK_UNAVAILABLE';
 const ORIGIN = 'limiter-feedback';
-const lease: Parameters<typeof runDownloadTask>[1] = { id: 7, owner: 'synthetic-worker', leaseGeneration: 3, attemptCount: 1 };
+const lease: Parameters<typeof runDownloadTask>[1] = { id: 7, leaseOwner: 'synthetic-worker', leaseGeneration: 3, attemptCount: 1 };
 const task: TaskRow = {
   id: 7, book_id: 1, title: '合成书', author: '合成作者', status: 'running',
   source_url: 'https://reader.test/book', source_kind: 'engine', source_id: null, requested_by: 'system',
