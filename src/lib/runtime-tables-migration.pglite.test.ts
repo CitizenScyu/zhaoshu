@@ -18,6 +18,8 @@ import { runAuthMigration } from '../../scripts/migrate-auth-prod.mjs';
 import { assertAuthSchema } from './auth-store';
 
 const RUNTIME_TABLES = ['app_settings', 'cron_health', 'profile_feedback_queue', 'source_admission'];
+// 0005 建的三张 prefetch 生态表：同样走运行时幂等 DDL（business-schema.ts），冷建库由 0005 复刻。
+const PREFETCH_TABLES = ['download_source_candidates', 'download_host_occupancy', 'download_source_prefetch'];
 
 const PGliteCtor = await loadPGlite();
 const maybe = PGliteCtor ? describe : describe.skip;
@@ -62,19 +64,19 @@ maybe('0003 四表与运行时建表同构（逐列比对，真 SQL）', () => {
     await initializeBusinessSchema(createPGliteSql(viaRuntime) as never);
   }, 120_000);
 
-  it('四表都在 EXPECTED_TABLES 里（db:check 缺表即退出码 2）', () => {
-    expect(EXPECTED_TABLES).toEqual(expect.arrayContaining(RUNTIME_TABLES));
+  it('运行期表都在 EXPECTED_TABLES 里（db:check 缺表即退出码 2）', () => {
+    expect(EXPECTED_TABLES).toEqual(expect.arrayContaining([...RUNTIME_TABLES, ...PREFETCH_TABLES]));
   });
 
-  it('没有 0003 的冷建库：db:check 判不通过，缺的是这四张表与 artifact 三表', () => {
+  it('没有 0003 的冷建库：db:check 判不通过，缺的是运行期表、prefetch 三表与 artifact 三表', () => {
     expect(beforeRuntimeVerdict.authVersionOk).toBe(true);
     expect(beforeRuntimeVerdict.checksumOk).toBe(true);
-    // 41-coldbuild：这个库同样没有 artifact schema（没跑 migrate:artifacts:prod），故缺表集合 = 四张运行期表 + artifact 三表。
-    expect([...beforeRuntimeVerdict.missingTables].sort()).toEqual([...RUNTIME_TABLES, ...ARTIFACT_TABLES].sort());
+    // 41-coldbuild：这个库同样没有 artifact schema（没跑 migrate:artifacts:prod），故缺表集合 = 运行期表 + prefetch 三表 + artifact 三表。
+    expect([...beforeRuntimeVerdict.missingTables].sort()).toEqual([...RUNTIME_TABLES, ...PREFETCH_TABLES, ...ARTIFACT_TABLES].sort());
     expect(beforeRuntimeVerdict.ok).toBe(false);
   });
 
-  for (const table of RUNTIME_TABLES) {
+  for (const table of [...RUNTIME_TABLES, ...PREFETCH_TABLES]) {
     it(`${table}：列 / 约束 / 索引 / 种子行与运行时一致`, async () => {
       const migrated = await shapeOf(viaMigration, table);
       expect(migrated.columns.length).toBeGreaterThan(0);
@@ -82,10 +84,10 @@ maybe('0003 四表与运行时建表同构（逐列比对，真 SQL）', () => {
     }, 60_000);
   }
 
-  it('迁移建好的库再跑运行时 DDL 是空转：四表形状不变', async () => {
-    const before = await Promise.all(RUNTIME_TABLES.map((table) => shapeOf(viaMigration, table)));
+  it('迁移建好的库再跑运行时 DDL 是空转：各表形状不变', async () => {
+    const before = await Promise.all([...RUNTIME_TABLES, ...PREFETCH_TABLES].map((table) => shapeOf(viaMigration, table)));
     await initializeBusinessSchema(createPGliteSql(viaMigration) as never);
-    expect(await Promise.all(RUNTIME_TABLES.map((table) => shapeOf(viaMigration, table)))).toEqual(before);
+    expect(await Promise.all([...RUNTIME_TABLES, ...PREFETCH_TABLES].map((table) => shapeOf(viaMigration, table)))).toEqual(before);
   }, 60_000);
 
   it('0004 给旧行补默认代次；直接重跑迁移 SQL 和运行期 DDL 都不重置既有代次', async () => {
