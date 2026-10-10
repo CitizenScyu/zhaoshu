@@ -69,11 +69,13 @@ const hostOf = (url: string): string => {
 // 池不可用、池里恰好有同站行，都不能让 resolveSource 对退休 host 给出可下载的源。
 const isRetiredBuiltin = (m: EngineModules, host: string) => m.supported.isRetiredBuiltinHost(host);
 
-/** 引擎源池：先刷新运行时 host 门，再读 getEngineSources（同 engine-fetch.mjs loadEnginePool）。 */
+/** 引擎源池：先刷新运行时 host 门，再读 getDownloadEngineSources（同 engine-fetch.mjs loadEnginePool）。 */
 export async function loadEnginePool(m: EngineModules, signal: AbortSignal): Promise<ReadingSourceLike[]> {
   // 41-poolimpl：host 门与池同源（源池产物优先、失败回退库；开关关时即 engineHosts 鲜读）。
-  m.policy.refreshSupportedHosts(await m.shuyuan.getPoolEngineHosts(signal));
-  return (await m.shuyuan.getEngineSources(signal)) as unknown as ReadingSourceLike[];
+  // bpool-normalize：下载腿走 getDownloadPoolEngineHosts/getDownloadEngineSources——
+  // DOWNLOAD_POOL_INCLUDE_PHOENIX_OK 开时额外纳入 phoenix_ok: 行/host；缺省关时逐字委托原 getPoolEngineHosts/getEngineSources。
+  m.policy.refreshSupportedHosts(await m.shuyuan.getDownloadPoolEngineHosts(signal));
+  return (await m.shuyuan.getDownloadEngineSources(signal)) as unknown as ReadingSourceLike[];
 }
 
 function findSourceByHost(m: EngineModules, sources: ReadingSourceLike[], host: string): ReadingSourceLike | undefined {

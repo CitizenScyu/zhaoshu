@@ -17,12 +17,17 @@ interface AdmissionHostRow { host: string }
  * 按 probe 态收窄会让判死的源永远重探不到、恢复不了。
  * admrunner42：phoenix_ok: 行（phoenix runner 探 ok、Vercel 未确认）不放行——与 shuyuan.ts readEngineRows /
  * readAdmissionFunnel ok 桶同一谓词，池与门口径一致。
+ * bpool-normalize：includePhoenixOk=true 时额外放行 phoenix_ok: 行（下载腿扩池用）；缺省 false 与改前逐字相同。
  */
-export async function engineHosts(signal?: AbortSignal): Promise<string[]> {
+export async function engineHosts(
+  signal?: AbortSignal, { includePhoenixOk = false }: { includePhoenixOk?: boolean } = {},
+): Promise<string[]> {
   const sql = getSql();
   const query = sql`
     SELECT DISTINCT host FROM source_admission a
-    WHERE a.compile_ok AND a.search_ok IS TRUE AND (a.error IS NULL OR a.error NOT LIKE 'phoenix_ok:%') AND a.host <> ''
+    WHERE a.compile_ok AND a.search_ok IS TRUE
+      AND (${includePhoenixOk}::boolean OR a.error IS NULL OR a.error NOT LIKE 'phoenix_ok:%')
+      AND a.host <> ''
       AND EXISTS (SELECT 1 FROM shuyuan_sources src WHERE src.source_url = a.source_url)`;
   const [rows] = await sql.transaction([query], {
     readOnly: true, ...(signal ? { fetchOptions: { signal } } : {}),
