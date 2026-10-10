@@ -23,10 +23,10 @@ const SHA_A = 'a'.repeat(40);
 const LEASE1 = { taskId: 1, owner: 'service-1', generation: 1 };
 const BINDING = {
   requestKey: 'req-1', labeledBookId: 1, identityKey: 'id-a', blobSha: SHA_A,
-  repositoryId: 1, branch: 'release/a', canonicalPath: 'books/x.txt', logicalBytes: 60n,
+  repositoryId: 1, branch: 'release/a', canonicalPath: 'books/x.txt', logicalBytes: BigInt(60),
 };
 const INPUT = { binding: BINDING, lease: LEASE1, accountingEpoch: 'epoch-1', admissionVersion: 'adm-1' };
-const PROOF = { repositoryId: 1, branch: 'release/a', canonicalPath: 'books/x.txt', blobSha: SHA_A, logicalBytes: 60n };
+const PROOF = { repositoryId: 1, branch: 'release/a', canonicalPath: 'books/x.txt', blobSha: SHA_A, logicalBytes: BigInt(60) };
 const expectEvidence = (ok: boolean) => ({ confirm: async () => ok });
 
 describe('artifact capacity kernel: real local Postgres vectors (draft, unrun)', () => {
@@ -82,7 +82,7 @@ describe('artifact capacity kernel: real local Postgres vectors (draft, unrun)',
     );
   }
 
-  const ledgerReserved = async () => Number((await pg.query('SELECT reserved_bytes FROM repository_capacity_ledger WHERE repository_id=1')).rows[0].reserved_bytes);
+  const ledgerReserved = async () => Number(((await pg.query('SELECT reserved_bytes FROM repository_capacity_ledger WHERE repository_id=1')).rows[0] as Record<string, unknown>).reserved_bytes);
 
   it('vector 1: a request with insufficient remaining capacity is refused with zero writes', async () => {
     await seedLedger({ reserved: 60 }); // 60 + 60 > 100
@@ -149,7 +149,7 @@ describe('artifact capacity kernel: real local Postgres vectors (draft, unrun)',
       .resolves.toEqual({ status: 'committed' });
     await expect(confirmPublication(sql as never, { requestKey: 'req-1', lease: LEASE1, publicationProof: PROOF, evidence: expectEvidence(true) }))
       .resolves.toEqual({ status: 'already_committed' });
-    const ledger = (await pg.query('SELECT registered_bytes,reserved_bytes FROM repository_capacity_ledger WHERE repository_id=1')).rows[0];
+    const ledger = (await pg.query('SELECT registered_bytes,reserved_bytes FROM repository_capacity_ledger WHERE repository_id=1')).rows[0] as Record<string, unknown>;
     expect(Number(ledger.registered_bytes)).toBe(60);
     expect(Number(ledger.reserved_bytes)).toBe(0);
     await expect(releaseUnused(sql as never, { requestKey: 'req-1', lease: LEASE1 })).resolves.toEqual({ status: 'already_committed' });
@@ -177,7 +177,7 @@ describe('artifact capacity kernel: real local Postgres vectors (draft, unrun)',
     // 若内核误用可变对象，proof_match 将失配 → reconciliation_required；冻结快照则 commit 成功。
     await expect(confirmPublication(sql as never, { requestKey: 'req-1', lease: LEASE1, publicationProof: callerProof, evidence: mutatingPort }))
       .resolves.toEqual({ status: 'committed' });
-    const ledger = (await pg.query('SELECT registered_bytes,reserved_bytes FROM repository_capacity_ledger WHERE repository_id=1')).rows[0];
+    const ledger = (await pg.query('SELECT registered_bytes,reserved_bytes FROM repository_capacity_ledger WHERE repository_id=1')).rows[0] as Record<string, unknown>;
     expect(Number(ledger.registered_bytes)).toBe(60);
     expect(Number(ledger.reserved_bytes)).toBe(0);
   });

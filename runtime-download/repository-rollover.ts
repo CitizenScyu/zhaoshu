@@ -117,7 +117,7 @@ export interface RepositorySwitchPlan {
 export interface RepositoryReusePlan {
   kind: 'reuse';
   target: RepositoryTuple;
-  logicalBytesToReserve: 0n;
+  logicalBytesToReserve: bigint;
   requiresReservation: false;
 }
 
@@ -161,12 +161,12 @@ const tupleMatches = (binding: RepositoryTuple, candidate: RepositoryTuple): boo
   && binding.branch === candidate.branch;
 
 const requireNonNegativeBigint = (value: unknown, name: string): bigint => {
-  if (typeof value !== 'bigint' || value < 0n) throw new RepositoryRolloverInputError('INVALID_BYTE_QUANTITY', name);
+  if (typeof value !== 'bigint' || value < BigInt(0)) throw new RepositoryRolloverInputError('INVALID_BYTE_QUANTITY', name);
   return value;
 };
 
 const requirePositiveBigint = (value: unknown, name: string): bigint => {
-  if (typeof value !== 'bigint' || value <= 0n) throw new RepositoryRolloverInputError('INVALID_TARGET_BYTES', name);
+  if (typeof value !== 'bigint' || value <= BigInt(0)) throw new RepositoryRolloverInputError('INVALID_TARGET_BYTES', name);
   return value;
 };
 
@@ -283,7 +283,7 @@ export function planRepositoryRollover(request: RepositoryRolloverRequest): Repo
       && binding.canonicalPath === request.canonicalPath
       && binding.logicalBytes === logicalBytes;
     if (exact) {
-      return { kind: 'reuse', target: tupleOf(binding.target), logicalBytesToReserve: 0n, requiresReservation: false };
+      return { kind: 'reuse', target: tupleOf(binding.target), logicalBytesToReserve: BigInt(0), requiresReservation: false };
     }
     return { kind: 'blocked', reason: 'EXISTING_BINDING_REQUIRES_RECONCILIATION' };
   }

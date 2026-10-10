@@ -536,7 +536,7 @@ export default function LibraryTab({ view, setView }: {
     if (!canDownload || !detail || dlBusy || task?.requestedBy === 'system') return false;
     if (task === null) return true;
     return task.status === 'failed' || task.status === 'partial' || task.status === 'superseded_by_incomplete'
-      || (task.status === 'running' && task.leaseExpired);
+      || (task.status === 'running' && task.leaseExpired === true);
   }
 
   // 换活跃源重下（design679 §3.2/§3.3）：按书名+作者在活跃源池重新定位后建任务；

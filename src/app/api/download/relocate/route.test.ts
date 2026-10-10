@@ -16,7 +16,7 @@ vi.mock('@/lib/download-relocate', async (original) => ({
   resolveDownloadRelocation: relocate,
 }));
 
-import { DownloadRelocationError } from '@/lib/download-relocate';
+import { DownloadRelocationError, type DownloadRelocationCandidate } from '@/lib/download-relocate';
 import { SourceReaderError } from '@/lib/source-reader';
 import { POST } from './route';
 
@@ -109,7 +109,7 @@ describe('POST /api/download/relocate', () => {
     ['RELOCATION_AMBIGUOUS', 422, [{ title: '测试书', author: '另一作者', bookUrl: 'https://active.example/other' }]],
   ] as const)('returns %s without enqueueing', async (code, status, candidates) => {
     sql.mockResolvedValueOnce([book]);
-    relocate.mockRejectedValueOnce(new DownloadRelocationError('cannot relocate', code, status, candidates));
+    relocate.mockRejectedValueOnce(new DownloadRelocationError('cannot relocate', code, status, candidates as unknown as DownloadRelocationCandidate[] | undefined));
     const response = await POST(request({ bookId: book.id }));
     expect(response.status).toBe(status);
     expect(await response.json()).toEqual({

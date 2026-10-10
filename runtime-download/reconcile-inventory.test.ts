@@ -60,7 +60,7 @@ describe('previewReconciliationInventory (no-I/O inventory delta preview)', () =
       status: 'inventory_preview',
       target,
       snapshotId: 'snap-1',
-      logicalTxtBytes: 0n,
+      logicalTxtBytes: BigInt(0),
       unregisteredPaths: [],
       overlapPaths: [],
       activationEligible: false,
@@ -76,14 +76,14 @@ describe('previewReconciliationInventory (no-I/O inventory delta preview)', () =
 
   it('V2: a remote book absent from the registry counts once as unregistered', () => {
     const res = previewReconciliationInventory(
-      input({ remoteBooks: [book('txt/a.txt', 'sha-a', 100n)] }),
+      input({ remoteBooks: [book('txt/a.txt', 'sha-a', BigInt(100))] }),
       okVerifier(),
     );
     expect(res).toEqual({
       status: 'inventory_preview',
       target,
       snapshotId: 'snap-1',
-      logicalTxtBytes: 100n,
+      logicalTxtBytes: BigInt(100),
       unregisteredPaths: ['txt/a.txt'],
       overlapPaths: [],
       activationEligible: false,
@@ -91,16 +91,16 @@ describe('previewReconciliationInventory (no-I/O inventory delta preview)', () =
   });
 
   it('V3: a registered book matching remote overlaps and is NOT double-counted', () => {
-    const b = book('txt/a.txt', 'sha-a', 100n);
+    const b = book('txt/a.txt', 'sha-a', BigInt(100));
     const res = previewReconciliationInventory(
-      input({ remoteBooks: [b], registeredBooks: [book('txt/a.txt', 'sha-a', 100n)] }),
+      input({ remoteBooks: [b], registeredBooks: [book('txt/a.txt', 'sha-a', BigInt(100))] }),
       okVerifier(),
     );
     expect(res).toEqual({
       status: 'inventory_preview',
       target,
       snapshotId: 'snap-1',
-      logicalTxtBytes: 100n, // 只计一次
+      logicalTxtBytes: BigInt(100), // 只计一次
       unregisteredPaths: [],
       overlapPaths: ['txt/a.txt'],
       activationEligible: false,
@@ -108,14 +108,14 @@ describe('previewReconciliationInventory (no-I/O inventory delta preview)', () =
   });
 
   it('V4: consistent duplicate remote rows are de-duplicated (single path, summed once)', () => {
-    const b = book('txt/a.txt', 'sha-a', 100n);
+    const b = book('txt/a.txt', 'sha-a', BigInt(100));
     const res = previewReconciliationInventory(
-      input({ remoteBooks: [b, book('txt/a.txt', 'sha-a', 100n)] }),
+      input({ remoteBooks: [b, book('txt/a.txt', 'sha-a', BigInt(100))] }),
       okVerifier(),
     );
     expect(res).toMatchObject({
       status: 'inventory_preview',
-      logicalTxtBytes: 100n,
+      logicalTxtBytes: BigInt(100),
       unregisteredPaths: ['txt/a.txt'],
       overlapPaths: [],
     });
@@ -124,13 +124,13 @@ describe('previewReconciliationInventory (no-I/O inventory delta preview)', () =
   it('V5: same path with conflicting blob or bytes is inventory_conflict', () => {
     expect(
       previewReconciliationInventory(
-        input({ remoteBooks: [book('txt/a.txt', 'sha-a', 100n), book('txt/a.txt', 'sha-b', 100n)] }),
+        input({ remoteBooks: [book('txt/a.txt', 'sha-a', BigInt(100)), book('txt/a.txt', 'sha-b', BigInt(100))] }),
         okVerifier(),
       ),
     ).toEqual({ status: 'rejected', reason: 'inventory_conflict' });
     expect(
       previewReconciliationInventory(
-        input({ remoteBooks: [book('txt/a.txt', 'sha-a', 100n), book('txt/a.txt', 'sha-a', 101n)] }),
+        input({ remoteBooks: [book('txt/a.txt', 'sha-a', BigInt(100)), book('txt/a.txt', 'sha-a', BigInt(101))] }),
         okVerifier(),
       ),
     ).toEqual({ status: 'rejected', reason: 'inventory_conflict' });
@@ -139,7 +139,7 @@ describe('previewReconciliationInventory (no-I/O inventory delta preview)', () =
   it('V6: a registry row absent from the proven remote list is inventory_conflict (no dangling)', () => {
     expect(
       previewReconciliationInventory(
-        input({ registeredBooks: [book('txt/x.txt', 'sha-x', 5n)] }),
+        input({ registeredBooks: [book('txt/x.txt', 'sha-x', BigInt(5))] }),
         okVerifier(),
       ),
     ).toEqual({ status: 'rejected', reason: 'inventory_conflict' });
@@ -149,8 +149,8 @@ describe('previewReconciliationInventory (no-I/O inventory delta preview)', () =
     expect(
       previewReconciliationInventory(
         input({
-          remoteBooks: [book('txt/a.txt', 'sha-a', 100n)],
-          registeredBooks: [book('txt/a.txt', 'sha-a', 99n)],
+          remoteBooks: [book('txt/a.txt', 'sha-a', BigInt(100))],
+          registeredBooks: [book('txt/a.txt', 'sha-a', BigInt(99))],
         }),
         okVerifier(),
       ),
@@ -229,9 +229,9 @@ describe('previewReconciliationInventory (no-I/O inventory delta preview)', () =
   });
 
   it('V12: input ordering does not change the digest binding or the preview result', () => {
-    const a = book('txt/a.txt', 'sha-a', 100n);
-    const b = book('txt/b.txt', 'sha-b', 200n);
-    const c = book('txt/c.txt', 'sha-c', 300n);
+    const a = book('txt/a.txt', 'sha-a', BigInt(100));
+    const b = book('txt/b.txt', 'sha-b', BigInt(200));
+    const c = book('txt/c.txt', 'sha-c', BigInt(300));
     const seen: string[] = [];
     const verifier: CoverageVerifier = {
       verify: (m) => {
@@ -253,18 +253,18 @@ describe('previewReconciliationInventory (no-I/O inventory delta preview)', () =
   });
 
   it('V13: bigint sums beyond Number.MAX_SAFE_INTEGER stay exact', () => {
-    const big = 9_007_199_254_740_993n; // 2^53 + 1
+    const big = BigInt(9_007_199_254_740_993); // 2^53 + 1
     const res = previewReconciliationInventory(
       input({ remoteBooks: [book('txt/a.txt', 'sha-a', big), book('txt/b.txt', 'sha-b', big)] }),
       okVerifier(),
     );
-    expect(res).toMatchObject({ status: 'inventory_preview', logicalTxtBytes: 18_014_398_509_481_986n });
+    expect(res).toMatchObject({ status: 'inventory_preview', logicalTxtBytes: BigInt(18_014_398_509_481_986) });
   });
 
   it('V14: negative/invalid byte counts and illegal shapes reject deterministically', () => {
     expect(
       previewReconciliationInventory(
-        input({ remoteBooks: [book('txt/a.txt', 'sha-a', -1n)] }),
+        input({ remoteBooks: [book('txt/a.txt', 'sha-a', -BigInt(1))] }),
         okVerifier(),
       ),
     ).toEqual({ status: 'rejected', reason: 'inventory_conflict' });
@@ -275,7 +275,7 @@ describe('previewReconciliationInventory (no-I/O inventory delta preview)', () =
       ),
     ).toEqual({ status: 'rejected', reason: 'inventory_conflict' });
     expect(
-      previewReconciliationInventory(input({ remoteBooks: [book('', 'sha-a', 1n)] }), okVerifier()),
+      previewReconciliationInventory(input({ remoteBooks: [book('', 'sha-a', BigInt(1))] }), okVerifier()),
     ).toEqual({ status: 'rejected', reason: 'inventory_conflict' });
     expect(
       previewReconciliationInventory(input({ target: { repositoryId: 0, branch: 'b' } as InventoryTarget }), okVerifier()),
@@ -286,7 +286,7 @@ describe('previewReconciliationInventory (no-I/O inventory delta preview)', () =
     const verifier: CoverageVerifier = {
       verify: (m) => {
         try {
-          (m.remoteBooks as unknown as InventoryBookEntry[]).push(book('txt/evil.txt', 'sha-evil', 999n));
+          (m.remoteBooks as unknown as InventoryBookEntry[]).push(book('txt/evil.txt', 'sha-evil', BigInt(999)));
         } catch {
           /* frozen copy */
         }
@@ -305,14 +305,14 @@ describe('previewReconciliationInventory (no-I/O inventory delta preview)', () =
       },
     };
     const res = previewReconciliationInventory(
-      input({ remoteBooks: [book('txt/a.txt', 'sha-a', 100n)] }),
+      input({ remoteBooks: [book('txt/a.txt', 'sha-a', BigInt(100))] }),
       verifier,
     );
     expect(res).toEqual({
       status: 'inventory_preview',
       target,
       snapshotId: 'snap-1',
-      logicalTxtBytes: 100n,
+      logicalTxtBytes: BigInt(100),
       unregisteredPaths: ['txt/a.txt'],
       overlapPaths: [],
       activationEligible: false,
@@ -333,7 +333,7 @@ describe('previewReconciliationInventory (no-I/O inventory delta preview)', () =
       status: 'rejected',
       reason: 'no_authoritative_source',
     });
-    const ok = previewReconciliationInventory(input({ remoteBooks: [book('txt/a.txt', 'sha-a', 1n)] }), okVerifier());
+    const ok = previewReconciliationInventory(input({ remoteBooks: [book('txt/a.txt', 'sha-a', BigInt(1))] }), okVerifier());
     expect(ok.status).toBe('inventory_preview');
     expect((ok as { activationEligible: unknown }).activationEligible).toBe(false);
     expect(['initialized', 'ready', 'verified', 'granted']).not.toContain(ok.status);
@@ -342,14 +342,14 @@ describe('previewReconciliationInventory (no-I/O inventory delta preview)', () =
   // F1：孤立 UTF-16 代理项在 UTF-8 编码下折叠为 U+FFFD 致同码——必须拒绝，不产生摘要碰撞。
   it('F1a: two different isolated high surrogates in a path are both rejected (no U+FFFD collision)', () => {
     const v = okVerifier();
-    expect(previewReconciliationInventory(input({ remoteBooks: [book('txt/\uD800a.txt', 'sha-a', 1n)] }), v))
+    expect(previewReconciliationInventory(input({ remoteBooks: [book('txt/\uD800a.txt', 'sha-a', BigInt(1))] }), v))
       .toEqual({ status: 'rejected', reason: 'inventory_conflict' });
-    expect(previewReconciliationInventory(input({ remoteBooks: [book('txt/\uD801a.txt', 'sha-a', 1n)] }), v))
+    expect(previewReconciliationInventory(input({ remoteBooks: [book('txt/\uD801a.txt', 'sha-a', BigInt(1))] }), v))
       .toEqual({ status: 'rejected', reason: 'inventory_conflict' });
   });
 
   it('F1b: an isolated low surrogate in a path is rejected', () => {
-    expect(previewReconciliationInventory(input({ remoteBooks: [book('txt/\uDC00a.txt', 'sha-a', 1n)] }), okVerifier()))
+    expect(previewReconciliationInventory(input({ remoteBooks: [book('txt/\uDC00a.txt', 'sha-a', BigInt(1))] }), okVerifier()))
       .toEqual({ status: 'rejected', reason: 'inventory_conflict' });
   });
 
@@ -375,8 +375,8 @@ describe('previewReconciliationInventory (no-I/O inventory delta preview)', () =
         };
       },
     };
-    const r1 = previewReconciliationInventory(input({ remoteBooks: [book(p, 'sha-a', 5n)] }), verifier);
-    const r2 = previewReconciliationInventory(input({ remoteBooks: [book(p, 'sha-a', 5n)] }), verifier);
+    const r1 = previewReconciliationInventory(input({ remoteBooks: [book(p, 'sha-a', BigInt(5))] }), verifier);
+    const r2 = previewReconciliationInventory(input({ remoteBooks: [book(p, 'sha-a', BigInt(5))] }), verifier);
     expect(seen[0]).toBe(seen[1]);
     expect(r1).toEqual(r2);
     expect(r1).toMatchObject({ status: 'inventory_preview', unregisteredPaths: [p] });
@@ -389,10 +389,10 @@ describe('previewReconciliationInventory (no-I/O inventory delta preview)', () =
       ' txt/a.txt', 'txt/a.txt ', 'txt/a.txt',
     ];
     for (const p of bad) {
-      expect(previewReconciliationInventory(input({ remoteBooks: [book(p, 'sha-a', 1n)] }), okVerifier()))
+      expect(previewReconciliationInventory(input({ remoteBooks: [book(p, 'sha-a', BigInt(1))] }), okVerifier()))
         .toEqual({ status: 'rejected', reason: 'inventory_conflict' });
     }
-    expect(previewReconciliationInventory(input({ remoteBooks: [book('txt/a.txt', 'sha-a', 1n)] }), okVerifier()))
+    expect(previewReconciliationInventory(input({ remoteBooks: [book('txt/a.txt', 'sha-a', BigInt(1))] }), okVerifier()))
       .toMatchObject({ status: 'inventory_preview', unregisteredPaths: ['txt/a.txt'] });
   });
 
@@ -400,10 +400,10 @@ describe('previewReconciliationInventory (no-I/O inventory delta preview)', () =
   it('F2b: content identifier must be a non-empty letter/digit-bearing ASCII token', () => {
     const bad = ['', '   ', 'sha a', 'sha\ta', '---', '._:-', 'shaé', 'sha'];
     for (const id of bad) {
-      expect(previewReconciliationInventory(input({ remoteBooks: [book('txt/a.txt', id, 1n)] }), okVerifier()))
+      expect(previewReconciliationInventory(input({ remoteBooks: [book('txt/a.txt', id, BigInt(1))] }), okVerifier()))
         .toEqual({ status: 'rejected', reason: 'inventory_conflict' });
     }
-    expect(previewReconciliationInventory(input({ remoteBooks: [book('txt/a.txt', 'abc.DEF_1-2:3', 1n)] }), okVerifier()))
+    expect(previewReconciliationInventory(input({ remoteBooks: [book('txt/a.txt', 'abc.DEF_1-2:3', BigInt(1))] }), okVerifier()))
       .toMatchObject({ status: 'inventory_preview', unregisteredPaths: ['txt/a.txt'] });
   });
 });

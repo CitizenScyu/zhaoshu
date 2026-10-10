@@ -17,7 +17,7 @@ import {
 
 const NOW = new Date('2026-10-08T04:00:00.000Z');
 const FUTURE = '2026-12-31T00:00:00.000Z';
-const TARGET = 1_000_000_000n; // 十进制 1GB
+const TARGET = BigInt(1_000_000_000); // 十进制 1GB
 const SHA = 'a'.repeat(40);
 const CURRENT: RepositoryTuple = { id: 1, owner: 'citizen', repo: 'repo-1', branch: 'main' };
 const NEXT: RepositoryTuple = { id: 2, owner: 'citizen', repo: 'repo-2', branch: 'main' };
@@ -39,7 +39,7 @@ function candidate(over: {
     sealed: over.sealed ?? false,
     targetBytes: over.targetBytes ?? TARGET,
     accounting: {
-      registeredLogicalBytes: over.registered ?? 0n, reservedLogicalBytes: over.reserved ?? 0n,
+      registeredLogicalBytes: over.registered ?? BigInt(0), reservedLogicalBytes: over.reserved ?? BigInt(0),
       version: 'v1', validUntil: FUTURE, target: self,
     },
     externalAdmission: {
@@ -75,16 +75,16 @@ const wiringInput = (over: { logicalBytes?: bigint } = {}) => ({
   identityKey: 'id-abc',
   blobSha: SHA,
   canonicalPath: snapshotPaths('测试书', '作者').canonicalPath,
-  logicalBytes: over.logicalBytes ?? 1n,
+  logicalBytes: over.logicalBytes ?? BigInt(1),
 });
 
 describe('capacity985 rollover wiring（合成端口）', () => {
   it('stay 路径：当前仓容量充足 ⇒ 沿用原仓元组，闭包引用不变', async () => {
-    const candidates = [candidate({ id: 1, registered: 100n })];
-    const outcome = await decideRepositoryForPublication(port(candidates), wiringInput({ logicalBytes: 1n }));
+    const candidates = [candidate({ id: 1, registered: BigInt(100) })];
+    const outcome = await decideRepositoryForPublication(port(candidates), wiringInput({ logicalBytes: BigInt(1) }));
     expect(outcome).toEqual({
       kind: 'stay', target: CURRENT, snapshotVersion: 'v1',
-      logicalBytesToReserve: 1n, needsClosureRebuild: false,
+      logicalBytesToReserve: BigInt(1), needsClosureRebuild: false,
     });
     // 消费点之后装配：stay 不重建闭包，reserve/publish 用的还是原引用。
     const before = closureOf(CURRENT);
@@ -97,14 +97,14 @@ describe('capacity985 rollover wiring（合成端口）', () => {
     const full = candidate({ id: 1, registered: TARGET }); // 投影 TARGET+1 > TARGET
     const fresh = candidate({ id: 2 });
     const outcome = await decideRepositoryForPublication(
-      port([full, fresh]), wiringInput({ logicalBytes: 1n }),
+      port([full, fresh]), wiringInput({ logicalBytes: BigInt(1) }),
     );
     expect(outcome.kind).toBe('switch');
     if (outcome.kind !== 'switch') return;
     expect(outcome.target).toEqual(NEXT);
     expect(outcome.needsClosureRebuild).toBe(true);
     expect(outcome.snapshotVersion).toBe('v1');
-    expect(outcome.logicalBytesToReserve).toBe(1n);
+    expect(outcome.logicalBytesToReserve).toBe(BigInt(1));
     // 防「只换 id」回归：重建后的闭包标记元组、repositoryId/branch 全属新仓，与旧闭包无共享。
     const oldClosure = closureOf(CURRENT);
     const newClosure = closureOf(outcome.target);
@@ -119,7 +119,7 @@ describe('capacity985 rollover wiring（合成端口）', () => {
   it('无可用新仓（唯一候选满）⇒ blocked(NO_ELIGIBLE_REPOSITORY) 上抛，不静默降级回旧仓', async () => {
     const full = candidate({ id: 1, registered: TARGET });
     await expect(
-      decideRepositoryForPublication(port([full]), wiringInput({ logicalBytes: 1n })),
+      decideRepositoryForPublication(port([full]), wiringInput({ logicalBytes: BigInt(1) })),
     ).rejects.toMatchObject({
       name: 'RolloverWiringBlockedError', code: 'ROLLOVER_WIRING_BLOCKED', reason: 'NO_ELIGIBLE_REPOSITORY',
     });
@@ -129,11 +129,11 @@ describe('capacity985 rollover wiring（合成端口）', () => {
     const full = candidate({ id: 1, registered: TARGET });
     const deniedNext = candidate({ id: 2, admissionStatus: 'denied' });
     await expect(
-      decideRepositoryForPublication(port([full, deniedNext]), wiringInput({ logicalBytes: 1n })),
+      decideRepositoryForPublication(port([full, deniedNext]), wiringInput({ logicalBytes: BigInt(1) })),
     ).rejects.toMatchObject({ reason: 'CAPACITY_UNKNOWN' });
     const unknownNext = candidate({ id: 2, admissionStatus: 'unknown' });
     await expect(
-      decideRepositoryForPublication(port([full, unknownNext]), wiringInput({ logicalBytes: 1n })),
+      decideRepositoryForPublication(port([full, unknownNext]), wiringInput({ logicalBytes: BigInt(1) })),
     ).rejects.toMatchObject({ reason: 'CAPACITY_UNKNOWN' });
   });
 
@@ -150,10 +150,10 @@ describe('capacity985 rollover wiring（合成端口）', () => {
     const fresh = candidate({ id: 2 });
     await expect(
       decideRepositoryForPublication(port([full, fresh]), {
-        ...wiringInput({ logicalBytes: 1n }),
+        ...wiringInput({ logicalBytes: BigInt(1) }),
         existingBinding: {
           labeledBookId: 1036, identityKey: 'id-abc', blobSha: SHA,
-          canonicalPath: 'books/other/path/index.json', logicalBytes: 1n, published: true, target: CURRENT,
+          canonicalPath: 'books/other/path/index.json', logicalBytes: BigInt(1), published: true, target: CURRENT,
         },
       }),
     ).rejects.toMatchObject({ reason: 'EXISTING_BINDING_REQUIRES_RECONCILIATION' });
@@ -169,7 +169,7 @@ describe('capacity985 rollover wiring（合成端口）', () => {
   it('stay 决策不得改写元组：owner/repo 大小写不一致的候选按证据绑定核对', async () => {
     // 注册表同仓不同大小写：纯决策的 tupleMatches 按 owner/repo 忽略大小写核对证据，
     // stay 目标必须原样回传输入 current（不把候选的大小写带出去重建闭包）。
-    const sameRepoDifferingCase = candidate({ id: 1, owner: 'Citizen', repo: 'Repo-1', registered: 10n });
+    const sameRepoDifferingCase = candidate({ id: 1, owner: 'Citizen', repo: 'Repo-1', registered: BigInt(10) });
     const outcome = await decideRepositoryForPublication(port([sameRepoDifferingCase]), wiringInput());
     expect(outcome.kind).toBe('stay');
     if (outcome.kind !== 'stay') return;
@@ -179,14 +179,14 @@ describe('capacity985 rollover wiring（合成端口）', () => {
   });
 
   it('switch 后仍需预留：logicalBytesToReserve 与 snapshotVersion 原样透传给预留层', async () => {
-    const full = candidate({ id: 1, registered: 900_000_000n, reserved: 100_000_000n });
-    const next = candidate({ id: 2, registered: 5n, reserved: 7n });
+    const full = candidate({ id: 1, registered: BigInt(900_000_000), reserved: BigInt(100_000_000) });
+    const next = candidate({ id: 2, registered: BigInt(5), reserved: BigInt(7) });
     const outcome = await decideRepositoryForPublication(
-      port([full, next]), wiringInput({ logicalBytes: 12345n }),
+      port([full, next]), wiringInput({ logicalBytes: BigInt(12345) }),
     );
     expect(outcome.kind).toBe('switch');
     if (outcome.kind !== 'switch') return;
-    expect(outcome.logicalBytesToReserve).toBe(12345n);
+    expect(outcome.logicalBytesToReserve).toBe(BigInt(12345));
     expect(outcome.snapshotVersion).toBe('v1');
     expect(outcome.target.id).toBe(2);
   });

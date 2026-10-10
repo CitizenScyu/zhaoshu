@@ -46,7 +46,7 @@ const raw = { reconciliationVersion: 'v1', occupancyProofRef: 'proof-1', barrier
 function original(over: Partial<VerifiedOriginalIdentity> = {}): VerifiedOriginalIdentity {
   return {
     repositoryId: 11, branch: 'release/a', logicalTxtScope: 'txt/v1',
-    targetBytes: 1_000_000n, registeredBytes: 0n, activeReservations: [],
+    targetBytes: BigInt(1_000_000), registeredBytes: BigInt(0), activeReservations: [],
     reconciliationVersion: 'v1', occupancyProofDigest: 'sha:abc',
     admissionBinding: { version: 'adm-1', target: { repositoryId: 11, branch: 'release/a' } },
     barrierRef: 'bar-1', fingerprint: 'fp-raw-1',
@@ -86,7 +86,7 @@ describe('reconcileInitialization (first activation / ready idempotency)', () =>
   it('V2: writes the verified registered total verbatim (no re-summing; unregistered books counted once by the port)', async () => {
     const stub = sqlBoundary(i => (i === 0 ? [] : [{ status: 'initialized', atomic_ok: 1 }]));
     await reconcileInitialization(
-      stub.port, source({ status: 'verified', original: original({ registeredBytes: 12345n }) }, granted), { target, raw },
+      stub.port, source({ status: 'verified', original: original({ registeredBytes: BigInt(12345) }) }, granted), { target, raw },
     );
     expect(params(stub.batches[0])).toContain('12345');
     expect(text(stub.batches[0])).not.toMatch(/registered_bytes\s*\+/);   // 入口不做累加

@@ -140,7 +140,7 @@ describe('collectFixedBookManifestCandidate (fixed single-book collection compos
       volumeContentVerified: false, logicalInventoryVerified: false,
       activationEligible: false, repositoryInventoryComplete: false,
     });
-    const out = res as { binding: { target: TreeTarget; commitSha: string; treeSha: string; canonicalPath: string }; volumes: { snapshotPath: string }[]; observedUnclassifiedEntries: { path: string }[] };
+    const out = res as unknown as { binding: { target: TreeTarget; commitSha: string; treeSha: string; canonicalPath: string }; volumes: { snapshotPath: string }[]; observedUnclassifiedEntries: { path: string }[] };
     expect(out.binding.target).toEqual(target);
     expect(out.binding.commitSha).toBe(COMMIT_SHA);
     expect(out.binding.treeSha).toBe(TREE_SHA);
@@ -522,7 +522,7 @@ describe('collectFixedBookManifestCandidate (fixed single-book collection compos
       manifestGitBlobSha: manifestSha,
       declaredFullTextBlobSha: FULL_TEXT_BLOB_SHA,
     });
-    const out = res as {
+    const out = res as unknown as {
       binding: { commitSha: string; treeSha: string; canonicalPath: string; manifestGitBlobSha: string };
       volumes: { snapshotPath: string; declaredBlobSha: string }[];
       observedUnclassifiedEntries: { path: string; size?: number }[];

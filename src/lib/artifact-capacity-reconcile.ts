@@ -146,7 +146,7 @@ const SQL_STATUSES: ReadonlySet<string> = new Set([
 
 const isPosInt = (value: unknown): value is number =>
   typeof value === 'number' && Number.isSafeInteger(value) && value > 0;
-const isNonNegBig = (value: unknown): value is bigint => typeof value === 'bigint' && value >= 0n;
+const isNonNegBig = (value: unknown): value is bigint => typeof value === 'bigint' && value >= BigInt(0);
 const nonEmptyStr = (value: unknown): value is string =>
   typeof value === 'string' && value.length > 0 && !value.includes('\0');
 
@@ -224,7 +224,7 @@ function freezeOriginal(original: VerifiedOriginalIdentity): VerifiedOriginalIde
 function validateOriginal(original: VerifiedOriginalIdentity): void {
   if (!isPosInt(original.repositoryId) || !nonEmptyStr(original.branch)
     || !nonEmptyStr(original.logicalTxtScope)
-    || !(typeof original.targetBytes === 'bigint' && original.targetBytes > 0n)
+    || !(typeof original.targetBytes === 'bigint' && original.targetBytes > BigInt(0))
     || !isNonNegBig(original.registeredBytes)
     || !nonEmptyStr(original.reconciliationVersion) || !nonEmptyStr(original.occupancyProofDigest)
     || !nonEmptyStr(original.barrierRef) || !nonEmptyStr(original.fingerprint)
@@ -235,7 +235,7 @@ function validateOriginal(original: VerifiedOriginalIdentity): void {
   }
   for (const r of original.activeReservations) {
     if (!nonEmptyStr(r.requestKey) || (r.state !== 'reserved' && r.state !== 'uncertain')
-      || !(typeof r.logicalBytes === 'bigint' && r.logicalBytes > 0n)) {
+      || !(typeof r.logicalBytes === 'bigint' && r.logicalBytes > BigInt(0))) {
       throw new ArtifactCapacityError('INVALID_CAPACITY_INPUT', 'malformed original active reservation');
     }
   }

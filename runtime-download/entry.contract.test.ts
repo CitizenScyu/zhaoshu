@@ -28,11 +28,11 @@ import { createDownloadExecutor } from './entry';
 const storage = {} as RuntimeStorage;
 const github: GitHubContents = { put: vi.fn(), getBytes: vi.fn() };
 const executor = { synthetic: true };
-const env = { DATABASE_URL: 'synthetic-database', GITHUB_TOKEN: 'synthetic-token',
+const env = { NODE_ENV: 'test' as const, DATABASE_URL: 'synthetic-database', GITHUB_TOKEN: 'synthetic-token',
   ZHAOSHU_BOOKS_REPO: ' Storage/Books ', GITHUB_REPOSITORY: 'Runner/Execution' };
 function options(overrides: Partial<ProductionExecutorOptions> = {}): ProductionExecutorOptions {
   return { workDir: 'synthetic-workdir', budget: { read: vi.fn(), consume: vi.fn() },
-    adapters: [], env: {}, ...overrides };
+    adapters: [], env: { NODE_ENV: 'test' as const }, ...overrides };
 }
 function noAssembly() {
   for (const factory of Object.values(mocks)) expect(factory).not.toHaveBeenCalled();
@@ -55,7 +55,7 @@ describe('createDownloadExecutor显式存储目标合同', () => {
   afterEach(() => { vi.unstubAllGlobals(); });
 
   it('只有执行仓变量不能成为存储目标，任何工厂均未装配', async () => {
-    await expect(createDownloadExecutor(options({ env: { GITHUB_REPOSITORY: 'Runner/Execution' } })))
+    await expect(createDownloadExecutor(options({ env: { NODE_ENV: 'test' as const, GITHUB_REPOSITORY: 'Runner/Execution' } })))
       .rejects.toThrow('MISSING_STORAGE_REPOSITORY');
     noAssembly();
   });
@@ -81,7 +81,7 @@ describe('createDownloadExecutor显式存储目标合同', () => {
   });
 
   it('完整目标DI只补storage时不要求仓或GitHub环境', async () => {
-    await createDownloadExecutor(options({ github, repositoryId: 17, env: { DATABASE_URL: 'synthetic-database' } }));
+    await createDownloadExecutor(options({ github, repositoryId: 17, env: { NODE_ENV: 'test' as const, DATABASE_URL: 'synthetic-database' } }));
     expect(mocks.storage).toHaveBeenCalledWith(mocks.sql);
     expect(mocks.sql).not.toHaveBeenCalled();
     expect(mocks.github).not.toHaveBeenCalled();

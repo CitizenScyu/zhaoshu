@@ -21,7 +21,7 @@ import type { RepositoryCandidate, RepositoryTuple } from '../../runtime-downloa
 
 const NOW = new Date('2026-10-08T04:00:00.000Z');
 const FUTURE = '2026-12-31T00:00:00.000Z';
-const TARGET_BYTES = 1_000_000_000n; // 十进制 1GB（rollover 量纲，非 1GiB）
+const TARGET_BYTES = BigInt(1_000_000_000); // 十进制 1GB（rollover 量纲，非 1GiB）
 const CURRENT: RepositoryTuple = { id: 1, owner: 'citizen', repo: 'repo-1', branch: 'main' };
 const NEXT: RepositoryTuple = { id: 2, owner: 'citizen', repo: 'repo-2', branch: 'main' };
 
@@ -66,7 +66,7 @@ function candidate(over: {
     sealed: false,
     targetBytes: over.targetBytes ?? TARGET_BYTES,
     accounting: {
-      registeredLogicalBytes: over.registered ?? 0n, reservedLogicalBytes: over.reserved ?? 0n,
+      registeredLogicalBytes: over.registered ?? BigInt(0), reservedLogicalBytes: over.reserved ?? BigInt(0),
       version: 'v1', validUntil: FUTURE, target: self,
     },
     externalAdmission: {
@@ -119,7 +119,7 @@ function fixture(seam: PublicationRolloverSeam | undefined) {
 
 describe('capacity986 download-worker 切仓决策消费点（合成端口）', () => {
   it('a. stay：容量充足 ⇒ reserveArtifactPath 收到装配期 repositoryId/branch，发布沿用装配期闭包原引用', async () => {
-    const { seam: rolloverSeam, rebuilt } = makeSeam([[candidate({ id: 1, registered: 10n })]]);
+    const { seam: rolloverSeam, rebuilt } = makeSeam([[candidate({ id: 1, registered: BigInt(10) })]]);
     const { storage, assembly, run } = fixture(rolloverSeam);
     const result = await run();
     expect(result.terminal).toBe('done');
@@ -189,7 +189,7 @@ describe('capacity986 download-worker 切仓决策消费点（合成端口）', 
     const fresh = candidate({ id: 2 });
     const { seam: rolloverSeam, rebuilt, portCallCount } = makeSeam([
       [full, fresh],                          // 第一任务：switch 到 repo-2
-      [candidate({ id: 1, registered: 5n })], // 第二任务：容量已对账，stay
+      [candidate({ id: 1, registered: BigInt(5) })], // 第二任务：容量已对账，stay
     ]);
     const { storage, assembly, options, run } = fixture(rolloverSeam);
     const first = await run();

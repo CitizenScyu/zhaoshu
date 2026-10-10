@@ -222,7 +222,7 @@ function validateBinding(binding: CapacityBinding): void {
     || typeof binding.blobSha !== 'string' || !SHA40.test(binding.blobSha)
     || typeof binding.branch !== 'string' || !binding.branch || binding.branch.includes('\0')
     || typeof binding.canonicalPath !== 'string' || !binding.canonicalPath
-    || typeof binding.logicalBytes !== 'bigint' || binding.logicalBytes <= 0n) {
+    || typeof binding.logicalBytes !== 'bigint' || binding.logicalBytes <= BigInt(0)) {
     throw new ArtifactCapacityError('INVALID_CAPACITY_INPUT');
   }
   // 与 reserveArtifactPath 同口径的路径合法性（拒绝遍历/控制字符）；映射回内核错误码口径。
@@ -558,7 +558,7 @@ export async function confirmPublication(
   if (!proof || !isPosInt(proof.repositoryId) || typeof proof.branch !== 'string' || !proof.branch
     || typeof proof.canonicalPath !== 'string' || !proof.canonicalPath
     || typeof proof.blobSha !== 'string' || !SHA40.test(proof.blobSha)
-    || typeof proof.logicalBytes !== 'bigint' || proof.logicalBytes <= 0n
+    || typeof proof.logicalBytes !== 'bigint' || proof.logicalBytes <= BigInt(0)
     || !evidencePort || typeof evidencePort.confirm !== 'function') {
     throw new ArtifactCapacityError('INVALID_CAPACITY_INPUT');
   }
