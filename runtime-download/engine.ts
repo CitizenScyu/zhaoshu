@@ -69,7 +69,7 @@ const hostOf = (url: string): string => {
 // 池不可用、池里恰好有同站行，都不能让 resolveSource 对退休 host 给出可下载的源。
 const isRetiredBuiltin = (m: EngineModules, host: string) => m.supported.isRetiredBuiltinHost(host);
 
-/** 引擎源池：先刷新运行时 host 门，再读 getDownloadEngineSources（同 engine-fetch.mjs loadEnginePool）。 */
+/** 引擎源池：先刷新运行时 host 门，再读 getDownloadEngineSources（下载腿入口；engine-fetch.mjs 仍走阅读腿原入口）。 */
 export async function loadEnginePool(m: EngineModules, signal: AbortSignal): Promise<ReadingSourceLike[]> {
   // 41-poolimpl：host 门与池同源（源池产物优先、失败回退库；开关关时即 engineHosts 鲜读）。
   // bpool-normalize：下载腿走 getDownloadPoolEngineHosts/getDownloadEngineSources——
