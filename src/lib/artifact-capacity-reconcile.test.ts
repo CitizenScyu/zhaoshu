@@ -155,7 +155,9 @@ describe('reconcileInitialization (first activation / ready idempotency)', () =>
     expect(sql).toContain('clock_timestamp()');                    // 真实时钟求值
     expect(sql).toContain('admission_time_ok');                    // 期限谓词落在首次激活门
     // 954 B：两次插值各自显式定型 timestamptz（空值检测不再依赖后一次 cast 定型）。
-    expect(sql).toContain('::timestamptz IS NOT NULL AND ::timestamptz > clock_timestamp()');
+    // 桩的 text()=strings.join('') 不含插值参数，两段 ::timestamptz 之间隔换行+AND；
+    // 断言按跨参数形态匹配（兼容真实端口的 $n 占位与桩的空串占位两种拼接结果）。
+    expect(sql).toMatch(/::timestamptz IS NOT NULL\s+AND\s+::timestamptz > clock_timestamp\(\)/);
   });
 
   // 954 B：当前许可为 null（首次 admission_invalid）也须 SQL 可解析，且 ready 同身份仍幂等零写。

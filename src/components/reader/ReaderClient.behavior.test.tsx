@@ -141,6 +141,12 @@ describe('本地阅读保存状态恢复', () => {
     const apiFetch = vi.fn(async (input: RequestInfo | URL) => {
       const url = String(input);
       calls.push(url);
+      // T66 反馈入口：save() 落过本机进度后 readTrace 变真，组件会后台 GET /api/feedback
+      // 查线上反馈状态（ReaderClient.tsx:166-175）。路由之并回合法空快照（version 0、
+      // 无状态、无备注）——只查状态，不应有写请求；不 mock 会落进 unexpected。
+      if (url.startsWith('/api/feedback')) {
+        return json({ current: { version: 0, status: null, note: '' } });
+      }
       if (url === '/api/read/42/index') return json(catalog({
         taskId: 42, source: undefined, totalBytes: 8,
         chapters: [

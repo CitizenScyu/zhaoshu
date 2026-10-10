@@ -409,7 +409,7 @@ async function runReconcileTransaction(
           CASE WHEN NOT input_active_empty OR db_active_n > 0 THEN 'active_reservations_present'
                WHEN NOT (activation_granted AND activation_target_ok AND admission_time_ok) THEN
                     (CASE WHEN activation_granted THEN 'admission_invalid' ELSE activation_reject END)
-               WHEN repo_ok = 0 THEN 'repository_not_writable'
+               WHEN NOT repo_ok THEN 'repository_not_writable'
                WHEN (update_ok + insert_ok) = 1 THEN 'initialized'
                ELSE NULL END
         -- F4：ready 分支只比不可变原始身份，先于仓可写/准入/屏障/活动，零写、不续准入。
@@ -423,7 +423,7 @@ async function runReconcileTransaction(
           CASE WHEN NOT input_active_empty OR db_active_n > 0 THEN 'active_reservations_present'
                WHEN NOT (activation_granted AND activation_target_ok AND admission_time_ok) THEN
                     (CASE WHEN activation_granted THEN 'admission_invalid' ELSE activation_reject END)
-               WHEN repo_ok = 0 THEN 'repository_not_writable'
+               WHEN NOT repo_ok THEN 'repository_not_writable'
                WHEN (update_ok + insert_ok) = 1 THEN 'initialized'
                ELSE NULL END
         WHEN existing_state = 'uninitialized' THEN 'binding_conflict'

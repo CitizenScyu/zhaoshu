@@ -95,7 +95,9 @@ describe('resolveDownloadRelocation', () => {
     const rejection = resolveDownloadRelocation({ title: catalog.title, author: catalog.author }, new AbortController().signal);
     await expect(rejection).rejects.toBeInstanceOf(DownloadRelocationError);
     await expect(rejection).rejects.toMatchObject({ code: 'RELOCATION_IDENTITY_MISMATCH', status: 422 });
-    await expect(rejection).rejects.not.toHaveProperty('candidates');
+    // TS 参数属性把省略的第四参固化成自有属性 `candidates: undefined`；「不带候选」
+    // 的实际口径是值为 undefined（路由层也仅在 AMBIGUOUS 才读它）。
+    await expect(rejection).rejects.toMatchObject({ candidates: undefined });
   });
 
   it('maps a SourcePolicyError whitelist rejection to RELOCATION_IDENTITY_MISMATCH without candidates', async () => {
@@ -104,6 +106,6 @@ describe('resolveDownloadRelocation', () => {
     const rejection = resolveDownloadRelocation({ title: catalog.title, author: catalog.author }, new AbortController().signal);
     await expect(rejection).rejects.toBeInstanceOf(DownloadRelocationError);
     await expect(rejection).rejects.toMatchObject({ code: 'RELOCATION_IDENTITY_MISMATCH', status: 422 });
-    await expect(rejection).rejects.not.toHaveProperty('candidates');
+    await expect(rejection).rejects.toMatchObject({ candidates: undefined });
   });
 });

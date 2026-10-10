@@ -225,8 +225,12 @@ function validateBinding(binding: CapacityBinding): void {
     || typeof binding.logicalBytes !== 'bigint' || binding.logicalBytes <= 0n) {
     throw new ArtifactCapacityError('INVALID_CAPACITY_INPUT');
   }
-  // 与 reserveArtifactPath 同口径的路径合法性（拒绝遍历/控制字符）。
-  validateArtifactPath(binding.canonicalPath);
+  // 与 reserveArtifactPath 同口径的路径合法性（拒绝遍历/控制字符）；映射回内核错误码口径。
+  try {
+    validateArtifactPath(binding.canonicalPath);
+  } catch {
+    throw new ArtifactCapacityError('INVALID_CAPACITY_INPUT');
+  }
 }
 
 function validateLease(lease: CapacityLease): void {

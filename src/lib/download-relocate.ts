@@ -63,6 +63,8 @@ export async function resolveDownloadRelocation(
         throw new DownloadRelocationError(error.message, 'RELOCATION_AMBIGUOUS', 422, displayCandidates(error));
       }
       if (error.code === 'SOURCE_SIMILAR') {
+        // 相似但非精确命中不携带展示候选：第四参省略（参数属性会把它固化成
+        // 值为 undefined 的自有属性，消费方仅按“值是否数组”读，见 route.ts）。
         throw new DownloadRelocationError(error.message, 'RELOCATION_IDENTITY_MISMATCH', 422);
       }
       // Availability, rate-limit and budget errors retain the reader contract,

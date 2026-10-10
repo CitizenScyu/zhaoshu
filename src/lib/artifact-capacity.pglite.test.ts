@@ -119,8 +119,10 @@ describe('artifact capacity kernel: real local Postgres vectors (draft, unrun)',
     await seedLedger({ target: 1000 }); // F6：容量足够两笔，第二笔才真正进入身份排他，而非先被容量门挡下
     await expect(reserveCapacityAndPath(sql as never, INPUT)).resolves.toMatchObject({ status: 'reserved' });
     expect(await ledgerReserved()).toBe(60); // 第一笔占用
+    // 第二笔属另一用户（user_id=2）：同 user 活动任务受 download_tasks_user_active_book_idx
+    // (user_id, book_id) 部分唯一索引约束，同 user 再插先撞 23505，到不了身份排异。
     await pg.exec(`INSERT INTO download_tasks(id,user_id,book_id,title,author,status,lease_owner,lease_generation)
-      VALUES(2,1,1,'synthetic','author','running','service-2',1)`);
+      VALUES(2,2,1,'synthetic','author','running','service-2',1)`);
     await expect(reserveCapacityAndPath(sql as never, {
       ...INPUT,
       binding: { ...BINDING, requestKey: 'req-2', canonicalPath: 'books/y.txt' },
@@ -238,9 +240,9 @@ describe('artifact capacity kernel: real local Postgres vectors (draft, unrun)',
     await expect(beginPublication(sql as never, { requestKey: 'req-1', lease: LEASE1 })).resolves.toEqual({ status: 'lost_lease' });
     await expect(releaseUnused(sql as never, { requestKey: 'req-1', lease: LEASE1 })).resolves.toEqual({ status: 'lost_lease' });
     expect(await ledgerReserved()).toBe(60); // 接管不发许可、不退款
-    // 跨任务显式拒绝，不隐式重绑。
+    // 跨任务显式拒绝，不隐式重绑（第二任务属 user 2，避开 user_active_book 唯一索引）。
     await pg.exec(`INSERT INTO download_tasks(id,user_id,book_id,title,author,status,lease_owner,lease_generation)
-      VALUES(2,1,1,'synthetic','author','running','service-9',1)`);
+      VALUES(2,2,1,'synthetic','author','running','service-9',1)`);
     await expect(adoptReservation(sql as never, { requestKey: 'req-1', newLease: { taskId: 2, owner: 'service-9', generation: 1 } }))
       .resolves.toEqual({ status: 'reconciliation_required' });
   });
