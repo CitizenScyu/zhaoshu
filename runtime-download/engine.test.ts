@@ -4,7 +4,7 @@
 //   - 源站 HTTP 错误（含 429）→ recordFailure(host, ...)，429 带 Retry-After 则含 retryAfterMs（发现 4）；
 //   - 网络/传输错误（无 status）→ 不计熔断（recordFailure 不被调用）。
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { createSourceTransport, type RateLimiterLike } from './engine';
+import { createSourceTransport, loadEnginePool, type EngineModules, type RateLimiterLike } from './engine';
 import { refreshSupportedHosts } from '../src/lib/source-policy';
 
 // book15 已被退休源闸（assertNotRetiredBuiltin）拦死，传输语义用例迁合成域：
@@ -66,5 +66,27 @@ describe('T8 createSourceTransport 限速器接线', () => {
     await expect(transport(`https://${HOST}/x`, opts())).rejects.toBeInstanceOf(TypeError);
     expect(limiter.failures).toHaveLength(0);
     expect(limiter.success).toHaveLength(0);
+  });
+});
+
+describe('loadEnginePool 下载池接线', () => {
+  it('先按下载门刷 host 门，再取下载池；不下探 getPoolEngineHosts/getEngineSources', async () => {
+    const pool = [{ url: 'https://source.example/rules', name: 's', searchUrl: '/s', rules: {} }];
+    const modules = {
+      policy: { refreshSupportedHosts: vi.fn() },
+      shuyuan: {
+        getPoolEngineHosts: vi.fn(async () => ['source.example']),
+        getEngineSources: vi.fn(async () => pool),
+        getDownloadPoolEngineHosts: vi.fn(async () => ['source.example', 'www.source.example']),
+        getDownloadEngineSources: vi.fn(async () => pool),
+      },
+    };
+    const result = await loadEnginePool(modules as unknown as EngineModules, new AbortController().signal);
+    expect(result).toBe(pool);
+    expect(modules.shuyuan.getDownloadPoolEngineHosts).toHaveBeenCalledTimes(1);
+    expect(modules.shuyuan.getDownloadEngineSources).toHaveBeenCalledTimes(1);
+    expect(modules.shuyuan.getPoolEngineHosts).not.toHaveBeenCalled();
+    expect(modules.shuyuan.getEngineSources).not.toHaveBeenCalled();
+    expect(modules.policy.refreshSupportedHosts).toHaveBeenCalledWith(['source.example', 'www.source.example']);
   });
 });

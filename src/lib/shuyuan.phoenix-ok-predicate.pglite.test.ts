@@ -13,7 +13,7 @@ const { getSql } = vi.hoisted(() => ({ getSql: vi.fn() }));
 vi.mock('@/lib/db', () => ({ ensureSchema: vi.fn(), getSql }));
 vi.mock('./db', () => ({ ensureSchema: vi.fn(), getSql }));
 
-import { buildShuyuanPoolArtifact, getShuyuanPoolHealth, invalidateShuyuanReadCache } from './shuyuan';
+import { buildShuyuanPoolArtifact, getEngineSources, getDownloadEngineSources, getDownloadPoolEngineHosts, getPoolEngineHosts, getShuyuanPoolHealth, invalidateShuyuanReadCache } from './shuyuan';
 import { engineHosts } from './supported-sources-server';
 import { refreshSupportedHosts } from './source-policy';
 import { ADMISSION_PHOENIX_OK_PREFIX, ADMISSION_RECHECK_FAIL_PREFIX } from './rule-engine/admission';
@@ -112,5 +112,43 @@ maybe('admrunner42 池谓词排除 phoenix_ok: 行（PGlite 真库）', () => {
     expect(artifact.engine.map((row) => row.source_url)).toContain(PHOENIX);
     const health = await getShuyuanPoolHealth(new AbortController().signal);
     expect(health.admission).toMatchObject({ ok: 3, deferred: 2 });
+  });
+
+  // bpool-expand：下载池开关。镜像 runtime-download/engine.ts loadEnginePool 的调用序
+  // （先 refreshSupportedHosts(await getDownloadPoolEngineHosts()) 再取池）。
+  const downloadPoolUrls = async () => {
+    refreshSupportedHosts(await getDownloadPoolEngineHosts(new AbortController().signal));
+    return (await getDownloadEngineSources(new AbortController().signal)).map((s) => s.url).sort();
+  };
+  const readingPoolUrls = async () => {
+    refreshSupportedHosts(await getPoolEngineHosts(new AbortController().signal));
+    return (await getEngineSources(new AbortController().signal)).map((s) => s.url).sort();
+  };
+
+  it('c5) 开关关（默认）：下载池 == 阅读池（逐字回改前）', async () => {
+    invalidateShuyuanReadCache?.();
+    expect(await downloadPoolUrls()).toEqual(await readingPoolUrls());
+    expect(await downloadPoolUrls()).toEqual([CLEAN, STRIKE].sort());
+  });
+
+  it('c6) 开关开：下载池含 phoenix_ok: 源，阅读池/产物/门/漏斗全部仍排除（零泄漏）', async () => {
+    vi.stubEnv('DOWNLOAD_POOL_INCLUDE_PHOENIX_OK', '1');
+    invalidateShuyuanReadCache?.();
+    // 下载池放开：PHOENIX 进；DEAD（search_ok=false）仍不进。
+    expect(await downloadPoolUrls()).toEqual([CLEAN, PHOENIX, STRIKE].sort());
+    // 阅读侧四个口径不受开关影响，PHOENIX 一律排除。
+    expect(await readingPoolUrls()).toEqual([CLEAN, STRIKE].sort());
+    expect((await engineHosts()).sort()).toEqual(['clean.example', 'strike.example']);
+    const artifact = await buildShuyuanPoolArtifact(new AbortController().signal);
+    expect(artifact.engine.map((row) => row.source_url)).not.toContain(PHOENIX);
+    const health = await getShuyuanPoolHealth(new AbortController().signal);
+    expect(health.admission).toMatchObject({ ok: 2, deferred: 3 });
+  });
+
+  it('c7) 开关开：下载池 host 门放行 phoenix host，但不放行 DEAD host', async () => {
+    vi.stubEnv('DOWNLOAD_POOL_INCLUDE_PHOENIX_OK', '1');
+    invalidateShuyuanReadCache?.();
+    expect((await getDownloadPoolEngineHosts()).sort()).toEqual(['clean.example', 'phoenix.example', 'strike.example']);
+    expect((await getDownloadPoolEngineHosts()).sort()).not.toContain('dead.example');
   });
 });
