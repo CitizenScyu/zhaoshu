@@ -24,6 +24,8 @@ export const BUSINESS_SCHEMA_RELATIONS = [
   'profile_seed_audit', 'profile_seed_audit_user_time_idx',
   'app_settings', 'source_admission', 'source_admission_host_idx',
   'profile_feedback_queue', 'cron_health',
+  'download_source_candidates', 'download_source_candidates_book_pos_idx',
+  'download_source_candidates_host_idx', 'download_host_occupancy', 'download_source_prefetch',
 ] as const;
 
 /** ALTER TABLE ... ADD COLUMN IF NOT EXISTS 给既有表补的全部列（[表, 列]）。 */
@@ -384,5 +386,39 @@ export async function initializeBusinessSchema(s: Sql) {
     tx`
     ALTER TABLE cron_health
       ADD COLUMN IF NOT EXISTS lease_generation bigint NOT NULL DEFAULT 0`,
+    // bsrcfix-41（prefetch 生态）：引擎回退选源结果的持久化与跨实例占位/预取认领三表。
+    // 每本书（book_id）选出的候选源共享一份；failure 分类 ''（可用）/ 'permanent'（身份不符）/
+    // 'temporary'（超时/不可达）。host 占位与按书预取认领均以 expires_at 判过期、原子接管，
+    // 无需清理器。老库靠本幂等 DDL 补建，冷建库由 migrations/0005 逐字复刻（MS-25 同款同构约束）。
+    tx`
+    CREATE TABLE IF NOT EXISTS download_source_candidates (
+      book_id int NOT NULL CONSTRAINT download_source_candidates_book_fk REFERENCES labeled_books(id),
+      source_url text NOT NULL,
+      host text NOT NULL,
+      position int NOT NULL DEFAULT 0,
+      failure text NOT NULL DEFAULT '' CONSTRAINT download_source_candidates_failure_check
+        CHECK (failure IN ('', 'permanent', 'temporary')),
+      failure_reason text NOT NULL DEFAULT '',
+      updated_at timestamptz NOT NULL DEFAULT now(),
+      PRIMARY KEY (book_id, source_url)
+    )`,
+    tx`CREATE INDEX IF NOT EXISTS download_source_candidates_book_pos_idx ON download_source_candidates (book_id, position)`,
+    tx`CREATE INDEX IF NOT EXISTS download_source_candidates_host_idx ON download_source_candidates (host)`,
+    tx`
+    CREATE TABLE IF NOT EXISTS download_host_occupancy (
+      host text PRIMARY KEY,
+      holder text NOT NULL,
+      kind text NOT NULL CONSTRAINT download_host_occupancy_kind_check CHECK (kind IN ('download', 'prefetch')),
+      task_id int,
+      claimed_at timestamptz NOT NULL DEFAULT now(),
+      expires_at timestamptz NOT NULL DEFAULT now()
+    )`,
+    tx`
+    CREATE TABLE IF NOT EXISTS download_source_prefetch (
+      book_id int PRIMARY KEY CONSTRAINT download_source_prefetch_book_fk REFERENCES labeled_books(id),
+      owner text NOT NULL,
+      claimed_at timestamptz NOT NULL DEFAULT now(),
+      expires_at timestamptz NOT NULL DEFAULT now()
+    )`,
   ]);
 }
