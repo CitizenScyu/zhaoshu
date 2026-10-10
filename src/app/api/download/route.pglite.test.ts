@@ -10,6 +10,30 @@ import { downloadStatsForUserQuery } from '@/lib/user-data';
 const db = vi.hoisted(() => ({ getSql: vi.fn(), ensureSchema: vi.fn() }));
 vi.mock('@/lib/db', () => db);
 vi.mock('@/lib/github', () => ({ triggerDownloadWorkflow: vi.fn() }));
+// book15 已退休（resolveDownloadSource 抛 UNSUPPORTED_SOURCE→400），pglite 夹具书源
+// 换成合成活跃内建源（与 route.test.ts 同款 fixture），不改变隔离语义断言。
+vi.mock('@/lib/shuyuan', () => ({
+  getBuiltinRequestSource: vi.fn(async () => ({
+    url: 'https://builtin.test/', name: '合成内建源', searchUrl: '/search?q={{key}}', rules: {}, tier: 'builtin',
+  })),
+  getEngineSources: vi.fn(async () => []),
+  getPoolEngineHosts: vi.fn(async () => []),
+}));
+vi.mock('@/lib/supported-sources', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/lib/supported-sources')>();
+  const synthetic: import('@/lib/supported-sources').SupportedSource = {
+    url: 'https://builtin.test/', name: '合成内建源', searchUrl: '/search?q={{key}}',
+    rules: {}, tier: 'builtin', enabled: true, lifecycle: 'active', retiredReason: null,
+  };
+  const sources = [...actual.BUILTIN_SOURCES, synthetic];
+  return {
+    ...actual,
+    BUILTIN_SOURCE_HOSTS: [...actual.BUILTIN_SOURCE_HOSTS, 'builtin.test', 'www.builtin.test'],
+    BUILTIN_SOURCES: sources,
+    builtinSourceForHost: (host: string) => actual.sourceForHostIn(host, sources),
+    isRetiredBuiltinHost: (host: string) => actual.isRetiredBuiltinHost(host) && host !== 'builtin.test' && host !== 'www.builtin.test',
+  };
+});
 import { GET, POST, DELETE } from './route';
 import { GET as fileGET } from './[id]/file/route';
 import { GET as observationGET } from '../admin/download-stats/route';
@@ -48,7 +72,7 @@ beforeEach(async () => {
   db.getSql.mockReturnValue(sql);
   db.ensureSchema.mockResolvedValue(undefined);
   await pg.exec(`
-    INSERT INTO labeled_books(id,title,author,source_url) VALUES (7,'合成书','合成作者','https://book15.net/books/details7.html');
+    INSERT INTO labeled_books(id,title,author,source_url) VALUES (7,'合成书','合成作者','https://builtin.test/books/details7.html');
     INSERT INTO download_tasks(id,book_id,title,user_id,requested_by,status,updated_at,artifact_id) VALUES
       (1,7,'A',1,'user','pending',now(),NULL),
       (2,7,'B',2,'user','pending',now(),NULL),

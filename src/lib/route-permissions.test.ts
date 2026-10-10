@@ -26,6 +26,8 @@ const policies: Record<string, Record<string, 'find' | 'read' | 'download' | 'ow
   'download/[id]/file': { GET: 'download' },
   // F16：过期下载租约的周期回收，只由 Vercel cron 以 CRON_SECRET 调用（见 route.test.ts）。
   'download/reclaim': { GET: 'cron' },
+  // 下载源重定位（W 线 56520f7）：与 download 同权限档，POST 受 guardPermissionWrite('download') 保护。
+  'download/relocate': { POST: 'download' },
   'admin/download-stats': { GET: 'owner' },
   export: { GET: 'find' },
   feedback: { GET: 'find', POST: 'find' }, find: { POST: 'find' },

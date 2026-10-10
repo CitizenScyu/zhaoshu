@@ -19,6 +19,24 @@ vi.mock('./shuyuan', () => ({
   },
 }));
 
+// 真实注册表 book15 已退休（lifecycle='retired'），退休门会在物理发射前拒绝；本文件的语义正是
+// 「活跃 builtin 载体宕机后的降序/恢复」，按 618 裁定把注册表钉成「book15 仍活跃」形态：
+// 识别集合不变（book15 双 host），BUILTIN_SOURCES 条目 lifecycle='active'。判定走真实实现
+// （isHostActiveInSources 同一谓词），只换注册表数据；测试结束随 vi.resetModules 复位。
+vi.mock('./supported-sources', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./supported-sources')>();
+  const activeBook15 = actual.BUILTIN_SOURCES.map((source) => ({ ...source, lifecycle: 'active' as const, retiredReason: null }));
+  const active = () => activeBook15.filter((source) => source.lifecycle === 'active' && source.enabled !== false);
+  return {
+    ...actual,
+    BUILTIN_SOURCES: activeBook15,
+    activeBuiltinSources: () => active(),
+    activeBuiltinSource: () => active()[0] ?? null,
+    isActiveBuiltinHost: (host: string) => actual.isHostActiveInSources(host, activeBook15),
+    isRetiredBuiltinHost: () => false,
+  };
+});
+
 let service: typeof import('./source-reader');
 const book = { title: '测试书', author: '作者' };
 const q = (keyword: string) => encodeURIComponent(keyword);

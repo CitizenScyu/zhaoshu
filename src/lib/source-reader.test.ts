@@ -1345,9 +1345,13 @@ describe('退休 source_url 普通书的活跃引擎重定位（675 契约）', 
     hints = [{ title: book.title, author: book.author, source_url: retiredHintUrl }];
     const catalog = await service.resolveSourceBook(book, context());
     // 交付的是活跃引擎源的目录（bookUrl/sourceId 归属引擎源），不是退休 host 的旧行。
+    // 目录夹具含两章（eToc 675-1/675-2），chapters 断言相应列全两章。
     expect(catalog).toMatchObject({
       title: '测试书', author: '作者', bookUrl: eDetail,
-      chapters: [{ url: 'https://active-engine.test/c/675-1.html', title: '第一章' }],
+      chapters: [
+        { url: 'https://active-engine.test/c/675-1.html', title: '第一章' },
+        { url: 'https://active-engine.test/c/675-2.html', title: '第二章' },
+      ],
     });
     const sha1 = (value: unknown) => createHash('sha1').update(JSON.stringify(value)).digest('hex');
     expect(catalog.sourceId).toBe(sha1([activeEngine.url, eDetail]));

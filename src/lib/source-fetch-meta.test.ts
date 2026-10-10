@@ -1,12 +1,17 @@
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { fetchSourceText, SOURCE_HOST_SWAP_DELAY_MS } from './source-fetch';
+import { refreshSupportedHosts } from './source-policy';
 import { encodeToBytes, type SourceCharset } from './source-charset';
 
-afterEach(() => { vi.unstubAllGlobals(); vi.useRealTimers(); });
+// book15 在 supported-sources 静态注册表里 lifecycle='retired'，许可门会在物理发射前拒绝；
+// 本文件测的是响应字符集/meta 探测的传输语义，载体统一用合成活跃 host e1.test
+// （beforeEach 注册、afterEach 复位，不跨用例污染）。
+beforeEach(() => { refreshSupportedHosts(['e1.test']); });
+afterEach(() => { vi.unstubAllGlobals(); vi.useRealTimers(); refreshSupportedHosts([]); });
 const signal = () => new AbortController().signal;
 const html = (head: string) => `<!doctype html><html><head>${head}</head><body>合成正文</body></html>`;
 const request = (options: Partial<Parameters<typeof fetchSourceText>[1]> = {}) =>
-  fetchSourceText('https://book15.net/meta', { signal: signal(), responseCharset: 'auto', ...options });
+  fetchSourceText('https://e1.test/meta', { signal: signal(), responseCharset: 'auto', ...options });
 function serve(text: string, charset: SourceCharset = 'utf-8', contentType = 'text/html') {
   const mock = vi.fn().mockResolvedValue(new Response(encodeToBytes(text, charset), { headers: { 'content-type': contentType } }));
   vi.stubGlobal('fetch', mock);
@@ -141,23 +146,39 @@ describe('META53: 有界HTML head响应字符集', () => {
   });
 
   it('前缀读取与后续正文共享原总deadline，已有一次换host规则不变', async () => {
-    vi.useFakeTimers();
-    const cancel = vi.fn();
-    const streams: ReadableStream[] = [];
-    const mock = vi.fn().mockImplementation(async () => {
-      const stream = new ReadableStream({ start(c) {
-        c.enqueue(encodeToBytes('<head><meta charset=gbk>', 'gbk'));
-        setTimeout(() => c.enqueue(new Uint8Array(1024).fill(32)), 60);
-      }, cancel });
-      streams.push(stream);
-      return new Response(stream, { headers: { 'content-type': 'text/html' } });
+    // 换 host 兜底需要同站对：唯一的对（book15）lifecycle='retired' 会被许可门拒绝。
+    // doMock 只把同站对数据换成合成 e1.test ↔ www.e1.test，判定走真实实现；
+    // finally 撤 mock 复位，不污染后续用例。
+    vi.doMock('./supported-sources', async (importOriginal) => {
+      const actual = await importOriginal<typeof import('./supported-sources')>();
+      return { ...actual, BUILTIN_SOURCE_HOSTS: ['e1.test', 'www.e1.test'] };
     });
-    vi.stubGlobal('fetch', mock);
-    const result = request({ timeoutMs: 100 });
-    const assertion = expect(result).rejects.toMatchObject({ name: 'TimeoutError' });
-    await vi.advanceTimersByTimeAsync(100 + SOURCE_HOST_SWAP_DELAY_MS + 100);
-    await assertion;
-    expect(mock).toHaveBeenCalledTimes(2); expect(cancel).toHaveBeenCalledTimes(2);
-    expect(streams.every((s) => !s.locked)).toBe(true);
+    try {
+      vi.resetModules();
+      const { fetchSourceText: fetchSourceTextWithSwap } = await import('./source-fetch');
+      vi.useFakeTimers();
+      const cancel = vi.fn();
+      const streams: ReadableStream[] = [];
+      const mock = vi.fn().mockImplementation(async () => {
+        const stream = new ReadableStream({ start(c) {
+          c.enqueue(encodeToBytes('<head><meta charset=gbk>', 'gbk'));
+          setTimeout(() => c.enqueue(new Uint8Array(1024).fill(32)), 60);
+        }, cancel });
+        streams.push(stream);
+        return new Response(stream, { headers: { 'content-type': 'text/html' } });
+      });
+      vi.stubGlobal('fetch', mock);
+      const result = fetchSourceTextWithSwap('https://e1.test/meta', {
+        signal: signal(), responseCharset: 'auto', timeoutMs: 100,
+      });
+      const assertion = expect(result).rejects.toMatchObject({ name: 'TimeoutError' });
+      await vi.advanceTimersByTimeAsync(100 + SOURCE_HOST_SWAP_DELAY_MS + 100);
+      await assertion;
+      expect(mock).toHaveBeenCalledTimes(2); expect(cancel).toHaveBeenCalledTimes(2);
+      expect(streams.every((s) => !s.locked)).toBe(true);
+    } finally {
+      vi.doUnmock('./supported-sources');
+      vi.resetModules();
+    }
   });
 });

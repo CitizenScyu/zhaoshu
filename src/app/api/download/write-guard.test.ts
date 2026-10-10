@@ -12,6 +12,30 @@ const { ensureSchema, getSql, sql, triggerDownloadWorkflow, findSession } = vi.h
 }));
 vi.mock('@/lib/db', () => ({ ensureSchema, getSql }));
 vi.mock('@/lib/github', () => ({ triggerDownloadWorkflow }));
+// book15 已退休（resolveDownloadSource 对退休内建 host 抛 UNSUPPORTED_SOURCE→400），
+// 写守卫用例只测守卫面，载体换成合成活跃内建源（与 route.test.ts 同款 fixture）。
+vi.mock('@/lib/shuyuan', () => ({
+  getBuiltinRequestSource: vi.fn(async () => ({
+    url: 'https://builtin.test/', name: '合成内建源', searchUrl: '/search?q={{key}}', rules: {}, tier: 'builtin',
+  })),
+  getEngineSources: vi.fn(async () => []),
+  getPoolEngineHosts: vi.fn(async () => []),
+}));
+vi.mock('@/lib/supported-sources', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/lib/supported-sources')>();
+  const synthetic: import('@/lib/supported-sources').SupportedSource = {
+    url: 'https://builtin.test/', name: '合成内建源', searchUrl: '/search?q={{key}}',
+    rules: {}, tier: 'builtin', enabled: true, lifecycle: 'active', retiredReason: null,
+  };
+  const sources = [...actual.BUILTIN_SOURCES, synthetic];
+  return {
+    ...actual,
+    BUILTIN_SOURCE_HOSTS: [...actual.BUILTIN_SOURCE_HOSTS, 'builtin.test', 'www.builtin.test'],
+    BUILTIN_SOURCES: sources,
+    builtinSourceForHost: (host: string) => actual.sourceForHostIn(host, sources),
+    isRetiredBuiltinHost: (host: string) => actual.isRetiredBuiltinHost(host) && host !== 'builtin.test' && host !== 'www.builtin.test',
+  };
+});
 vi.mock('@/lib/auth-session', async original => ({
   ...await original<typeof import('@/lib/auth-session')>(),
   findSessionByToken: findSession,
@@ -20,7 +44,7 @@ vi.mock('@/lib/auth-session', async original => ({
 import { DELETE, POST } from './route';
 
 const SESSION_RECORD = { userId: 7, role: 'member', canFind: true, canRead: true, canDownload: true, authMethod: 'password', membersEnabled: true };
-const book = { id: 7, title: '测试书', author: '作者', source_url: 'https://book15.net/books/details7.html' };
+const book = { id: 7, title: '测试书', author: '作者', source_url: 'https://builtin.test/books/details7.html' };
 const url = 'http://localhost/api/download';
 
 type BrowserOptions = { csrf?: string | null; origin?: string | null; contentType?: string };
