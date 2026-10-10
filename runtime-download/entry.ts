@@ -8,7 +8,7 @@ import { join } from 'node:path';
 import { neon } from '@neondatabase/serverless';
 import { downloadBook } from '../scripts/engine-download.mjs';
 import {
-  createEngineAdapter, type EngineDownloadLike, type SourceAdapter, type WorkerStorage,
+  createEngineAdapter, type EngineDownloadLike, type PublicationRolloverSeam, type SourceAdapter, type WorkerStorage,
 } from '../src/lib/download-worker';
 import type { GitHubContents } from '../src/lib/download-publisher';
 import { createWorkerStorage } from './storage';
@@ -22,6 +22,9 @@ import { createIdentityPrecheck } from './identity-precheck';
 import { createBuiltinFallback } from './builtin-fallback';
 import { createExecutor, DEFAULT_DECISIONS, type DailyBudgetLike, type DownloadExecutor, type LoopDecisions } from './executor';
 import { dbQuotaBackoffMs, recordDbQuotaSeen } from '../src/lib/db-quota';
+// capacity991：rollover 决策端口的生产装配（端口合同在 wiring、候选形状在 rollover 纯决策模块）。
+import { RolloverWiringEvidenceError, type RolloverEvidencePort } from './repository-rollover-wiring';
+import type { AdmissionStatus, RepositoryCandidate, RepositoryTuple } from './repository-rollover';
 
 export type { DownloadExecutor, DailyBudgetLike, LoopDecisions } from './executor';
 
@@ -81,6 +84,137 @@ function storageTarget(value: unknown, branch: string) {
   return { owner, repo, branch, repository: `${owner}/${repo}` };
 }
 
+// ---------------------------------------------------------------------------
+// capacity991：rollover 决策端口的生产装配
+//
+// 端口合同见 repository-rollover-wiring.ts（RolloverEvidencePort）；候选形状见
+// repository-rollover.ts（RepositoryCandidate）。装配期只**读**：storage_repositories
+// 注册行 + repository_capacity_ledger 已对账账目（state='ready'），逐行组装证据。
+// 证据缺失/形状非法一律抛 RolloverWiringEvidenceError（模块语义：不静默降级、不按 0 猜），
+// 由 wiring 层原样上抛到既有失败路径（发布失败收口），绝不放行「照旧写旧仓」。
+// ---------------------------------------------------------------------------
+
+/** neon HTTP 驱动对 bigint 列返回口径不一（bigint/number/十进制 string），统一规范为非负 bigint。 */
+function rolloverBigint(value: unknown, column: string): bigint {
+  let parsed: bigint;
+  if (typeof value === 'bigint') parsed = value;
+  else if (typeof value === 'number' && Number.isSafeInteger(value)) parsed = BigInt(value);
+  else if (typeof value === 'string' && /^\d+$/.test(value)) parsed = BigInt(value);
+  else throw new RolloverWiringEvidenceError(`column ${column} is not a non-negative integer`);
+  if (parsed < BigInt(0)) throw new RolloverWiringEvidenceError(`column ${column} is negative`);
+  return parsed;
+}
+
+function rolloverText(value: unknown, field: string): string {
+  if (typeof value !== 'string' || value.trim() === '') {
+    throw new RolloverWiringEvidenceError(`field ${field} is missing`);
+  }
+  return value;
+}
+
+function rolloverPositiveInt(value: unknown, field: string): number {
+  const n = typeof value === 'bigint' ? Number(value) : typeof value === 'string' ? Number(value) : value;
+  if (typeof n !== 'number' || !Number.isSafeInteger(n) || n <= 0) {
+    throw new RolloverWiringEvidenceError(`field ${field} is not a positive integer`);
+  }
+  return n;
+}
+
+/** LEFT JOIN 后单行形状（storage_repositories 列 + repository_capacity_ledger 列）。 */
+interface RolloverCandidateRow {
+  id: unknown; owner: unknown; repo: unknown; branch: unknown;
+  enabled: unknown; is_private: unknown; read_only: unknown; sealed_at: unknown;
+  ledger_state: unknown; baseline_epoch: unknown; target_bytes: unknown;
+  registered_bytes: unknown; reserved_bytes: unknown;
+  admission_status: unknown; admission_version: unknown;
+  admission_valid_until: unknown; admission_target: unknown;
+}
+
+/** 单行 → RepositoryCandidate；任何证据缺失/形状非法即抛（不降级）。 */
+function toRepositoryCandidate(row: RolloverCandidateRow): RepositoryCandidate {
+  const id = rolloverPositiveInt(row.id, 'id');
+  const owner = rolloverText(row.owner, 'owner');
+  const repo = rolloverText(row.repo, 'repo');
+  const branch = rolloverText(row.branch, 'branch');
+  // 四门可写标志（显式 boolean，缺失/非 boolean 即抛——纯决策要求显式 boolean，不许被当 false 放行）。
+  for (const [field, value] of [['enabled', row.enabled], ['is_private', row.is_private], ['read_only', row.read_only]] as const) {
+    if (typeof value !== 'boolean') throw new RolloverWiringEvidenceError(`field ${field} is not boolean`);
+  }
+  // 账目证据：必须已对账（state='ready'）且有非空版本（baseline_epoch）；否则无可信容量证据，抛。
+  if (row.ledger_state !== 'ready') {
+    throw new RolloverWiringEvidenceError(`repository ${id} has no ready capacity ledger`);
+  }
+  const version = rolloverText(row.baseline_epoch, 'baseline_epoch');
+  const target: RepositoryTuple = { id, owner, repo, branch };
+  // 账目 validUntil：ledger 无独立账目期限列，取同账行的准入期限作为可信窗口上界（缺失=null⇒决策判 unknown）。
+  const admissionValidUntil = typeof row.admission_valid_until === 'string' ? row.admission_valid_until : null;
+  const accounting = {
+    registeredLogicalBytes: rolloverBigint(row.registered_bytes, 'registered_bytes'),
+    reservedLogicalBytes: rolloverBigint(row.reserved_bytes, 'reserved_bytes'),
+    version, validUntil: admissionValidUntil, target,
+  };
+  // 外部准入：状态/版本/期限来自账行；目标元组须与本仓一致（错绑即抛，不产可写计划）。
+  const admissionStatus = row.admission_status;
+  if (admissionStatus !== 'granted' && admissionStatus !== 'denied' && admissionStatus !== 'unknown') {
+    throw new RolloverWiringEvidenceError(`repository ${id} admission_status invalid`);
+  }
+  const admissionTarget = row.admission_target as { repositoryId?: unknown; branch?: unknown } | null | undefined;
+  if (admissionTarget == null || typeof admissionTarget !== 'object') {
+    throw new RolloverWiringEvidenceError(`repository ${id} admission_target missing`);
+  }
+  if (rolloverPositiveInt(admissionTarget.repositoryId, 'admission_target.repositoryId') !== id
+    || rolloverText(admissionTarget.branch, 'admission_target.branch') !== branch) {
+    throw new RolloverWiringEvidenceError(`repository ${id} admission_target does not bind this repository`);
+  }
+  return {
+    ...target,
+    enabled: row.enabled as boolean,
+    isPrivate: row.is_private as boolean,
+    readOnly: row.read_only as boolean,
+    sealed: row.sealed_at !== null && row.sealed_at !== undefined,
+    targetBytes: rolloverBigint(row.target_bytes, 'target_bytes'),
+    accounting,
+    externalAdmission: {
+      status: admissionStatus as AdmissionStatus,
+      version: typeof row.admission_version === 'string' ? row.admission_version : null,
+      validUntil: admissionValidUntil,
+      target,
+    },
+  };
+}
+
+/** 生产证据端口：有序候选（按 id 升序，优先序即数组顺序）+ 显式时钟。 */
+export function createRolloverEvidencePort(
+  sql: ReturnType<typeof neon>,
+  log: (level: 'info' | 'error', message: string, fields?: Record<string, unknown>) => void,
+): RolloverEvidencePort {
+  return {
+    async listCandidates() {
+      let rows: RolloverCandidateRow[];
+      try {
+        rows = await sql`
+          SELECT r.id, r.owner, r.repo, r.branch, r.enabled, r.is_private, r.read_only, r.sealed_at,
+                 l.state AS ledger_state, l.baseline_epoch, l.target_bytes,
+                 l.registered_bytes, l.reserved_bytes,
+                 l.admission_status, l.admission_version, l.admission_valid_until, l.admission_target
+          FROM storage_repositories r
+          LEFT JOIN repository_capacity_ledger l ON l.repository_id = r.id
+          ORDER BY r.id ASC` as unknown as RolloverCandidateRow[];
+      } catch (error) {
+        // 端口故障 = 容量未知：上抛（wiring 层转 RolloverWiringEvidenceError），不降级回旧仓。
+        throw new RolloverWiringEvidenceError(`candidate query failed: ${(error as Error)?.message?.slice(0, 120) ?? ''}`);
+      }
+      if (!Array.isArray(rows) || rows.length === 0) {
+        throw new RolloverWiringEvidenceError('no registered repositories');
+      }
+      // 只记数量，不含仓名/凭据。
+      log('info', 'rollover 候选证据装配', { candidates: rows.length });
+      return rows.map(toRepositoryCandidate);
+    },
+    now: () => new Date(),
+  };
+}
+
 export async function createDownloadExecutor(options: ProductionExecutorOptions): Promise<DownloadExecutor> {
   const hasGithub = options.github !== undefined;
   const hasRepositoryId = options.repositoryId !== undefined;
@@ -111,6 +245,30 @@ export async function createDownloadExecutor(options: ProductionExecutorOptions)
     repository: target!.repository,
     branch: target!.branch,
   });
+
+  // capacity991：rollover 决策缝装配。缺省关（未设 ZHAOSHU_ROLLOVER_ENABLED=1）= 不注入，
+  // 生产语义与 986 前逐字一致。开则构造真端口：listCandidates 查注册行 + 对账账目（拿不到即抛，
+  // 不降级）；now=装配期时钟；current=装配期仓元组；rebuildGitHubContents=按 target 用同配置重建闭包。
+  const rolloverEnabled = env.ZHAOSHU_ROLLOVER_ENABLED === '1';
+  let rollover: PublicationRolloverSeam | undefined;
+  if (rolloverEnabled) {
+    // 端口需要仓 owner/repo 元组，只有默认装配路径（从 ZHAOSHU_BOOKS_REPO 解析出 target）才有；
+    // 完整 DI（注入 github/repositoryId）不带 owner/repo，开开关即证据不可得，抛（不静默降级）。
+    if (!target) throw new RolloverWiringEvidenceError('rollover requires the default storage target assembly');
+    if (!sql) sql = neon(requiredEnv(env, 'DATABASE_URL'));
+    const rolloverSql = sql;
+    const current: RepositoryTuple = { id: repositoryId, owner: target.owner, repo: target.repo, branch: target.branch };
+    rollover = {
+      port: createRolloverEvidencePort(rolloverSql, log),
+      current,
+      // switch 时按新仓元组用与装配期相同的配置重建 GitHubContents 闭包（token 留在装配期）。
+      rebuildGitHubContents: (t: RepositoryTuple) => createGitHubContents({
+        token: requiredEnv(env, 'GITHUB_TOKEN'),
+        repository: `${t.owner}/${t.repo}`,
+        branch: t.branch,
+      }),
+    };
+  }
 
   const modules = options.modules ?? assembleEngineModules();
   const resolveSource = options.resolveSource ?? createResolveSource(modules);
@@ -182,6 +340,7 @@ export async function createDownloadExecutor(options: ProductionExecutorOptions)
     owner: options.owner ?? `service-${process.pid}`,
     taskTimeoutMs: options.taskTimeoutMs,
     decisions: options.decisions ?? DEFAULT_DECISIONS,
+    ...(rollover ? { rollover } : {}),
     // 数据库配额（Neon 402）长退避：默认 30 分钟，env DB_QUOTA_BACKOFF_MS 覆盖；恢复后在 cron_health 补记。
     quotaBackoffMs: dbQuotaBackoffMs(env),
     recordQuotaSeen: quotaSql ? (seenAt => recordDbQuotaSeen(quotaSql, seenAt)) : undefined,

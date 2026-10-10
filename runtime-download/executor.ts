@@ -18,7 +18,7 @@
 
 import {
   runWorkerOnce, settleSourceUnavailable, TaskLeaseLostError,
-  type SourceAdapter, type TaskRow, type WorkerOptions, type WorkerStorage,
+  type PublicationRolloverSeam, type SourceAdapter, type TaskRow, type WorkerOptions, type WorkerStorage,
 } from '../src/lib/download-worker';
 import type { GitHubContents } from '../src/lib/download-publisher';
 import type { BudgetRefundOutcome, BudgetTicket } from './budget-refund';
@@ -105,6 +105,11 @@ export interface ExecutorDependencies {
   quotaBackoffMs?: number;
   /** 配额恢复后补记最近一次发现时刻（cron_health）；缺省不补记。失败只记日志。 */
   recordQuotaSeen?: (seenAtIso: string) => Promise<void>;
+  /**
+   * capacity991：切仓决策注入缝（986 的 WorkerOptions.rollover 透传）。
+   * 缺省 = 不注入 = 发布行为与 986 前逐字一致；装配期由 entry 按环境开关构造。
+   */
+  rollover?: PublicationRolloverSeam;
   // ---- 测试注入缝 ----
   now?: () => number;
   /** 冷却等待；signal 中止时须尽快 resolve（不 reject）。 */
@@ -144,6 +149,7 @@ export function createExecutor(deps: ExecutorDependencies): DownloadExecutor {
     repositoryId: deps.repositoryId,
     branch: deps.branch,
     taskTimeoutMs: deps.taskTimeoutMs,
+    ...(deps.rollover ? { rollover: deps.rollover } : {}),
   });
   // 书源不可达的结构化日志：扣额度前预检与下载腿打同一行，只含原因码/阶段/源 host/下次可重试时刻。
   const logSourceUnavailable = (stage: string, host: string, retryAt: string | null) =>
