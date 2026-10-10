@@ -17,6 +17,8 @@ export interface PrefetchTask {
   bookId: number;
   title: string;
   author: string;
+  /** 领取时的可用候选快照：预取只补缺额，finish 不覆盖领取后下载侧写入。 */
+  sourceUrls?: string[];
 }
 
 export interface PrefetchSelectRequest {
