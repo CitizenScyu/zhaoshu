@@ -16,11 +16,14 @@ import { createHash } from 'node:crypto';
 import type { DownloadTaskLease } from './download-task-queue';
 import { PUBLICATION_RETRY_MAX_ATTEMPTS, SOURCE_RETRY_MAX_ATTEMPTS, sourceRetryDelayMs } from './download-task-policy';
 import {
-  isRetryablePublicationError, LeaseLostError, publishBookVersion, PublicationStageError, snapshotPaths,
+  gitBlobSha, isRetryablePublicationError, LeaseLostError, publishBookVersion, PublicationStageError, snapshotPaths,
   type GitHubContents, type PublishOutcome,
 } from './download-publisher';
 import { artifactIdentityKey } from './artifact-registry';
 import type { TxtChapter } from './txt-chapters';
+// capacity986：发布期切仓决策（985 已交付模块，纯决策 + 端口注入，无 DB/网络副作用）。
+import { decideRepositoryForPublication, type RolloverEvidencePort } from '../../runtime-download/repository-rollover-wiring';
+import type { RepositoryTuple } from '../../runtime-download/repository-rollover';
 
 export { LeaseLostError };
 
@@ -169,6 +172,24 @@ export interface WorkerOptions {
   /** 供发布对账的 DB 侧目标仓（T2 registry）。 */
   repositoryId: number;
   branch: string;
+  /**
+   * capacity986 切仓决策消费缝：缺省（undefined）= 不决策，发布行为与引入前逐字一致。
+   * 注入后在 reserveArtifactPath 之前调用 decideRepositoryForPublication：
+   * stay 沿用装配期闭包/repositoryId/branch 原引用（零行为变化）；switch 用 target 整体换闭包
+   * （rebuildGitHubContents 重建 GitHubContents + target.id/target.branch，非只换 DB id）；
+   * blocked / 证据端口故障按既有失败路径上抛，不静默降级回旧仓。
+   * 装配期常量只读：本字段与 options.github/repositoryId/branch 在任务执行中永不被改写。
+   */
+  rollover?: PublicationRolloverSeam;
+}
+
+/** 切仓决策注入缝：端口（候选仓证据 + 显式时钟）与闭包重建工厂均由调用方（entry/测试）注入。 */
+export interface PublicationRolloverSeam {
+  port: RolloverEvidencePort;
+  /** 装配期当前仓元组（entry 的 storage 目标 + resolveRepositoryId 结果）。 */
+  current: RepositoryTuple;
+  /** switch 时按新仓元组重建发布闭包（生产 = createGitHubContents；凭据留在调用方，不进本模块）。 */
+  rebuildGitHubContents(target: RepositoryTuple): GitHubContents;
 }
 
 export interface WorkerResult {
@@ -378,16 +399,43 @@ export async function runDownloadTask(
     // complete → 五阶段发布。DB 前置：T2 reserveArtifactPath（identity_key 唯一，
     // 同身份重复发布取回同一 artifact id）。
     const { canonicalPath, dir } = snapshotPaths(task.title, task.author);
+    const identityKey = artifactIdentityKey(task.title, task.author);
+    // capacity986 切仓决策消费点：在 reserveArtifactPath 之前、且在把 github/repositoryId/branch
+    // 交给本次发布之前。决策输入与发布器同源：identityKey 全量 hash、git blob sha40（与
+    // publishBookVersion 内部 gitBlobSha 同口径）、logicalBytes = 整本 UTF-8 字节（十进制）。
+    // existingBinding 在本调用栈无可信已发布证据，按模块合同省略（交给决策判定）。
+    // 局部变量承接本次发布目标：装配期常量（options.github/repositoryId/branch 与 rollover.current）
+    // 只读，一次 switch 不污染后续任务（后续任务仍从装配期常量重新决策）。
+    let publishGithub = github;
+    let publishRepositoryId = repositoryId;
+    let publishBranch = branch;
+    if (options.rollover) {
+      const plan = await decideRepositoryForPublication(options.rollover.port, {
+        current: options.rollover.current,
+        labeledBookId: task.book_id,
+        identityKey,
+        blobSha: gitBlobSha(outcome.txt),
+        canonicalPath,
+        logicalBytes: BigInt(Buffer.byteLength(outcome.txt, 'utf8')),
+      });
+      if (plan.needsClosureRebuild) {
+        // switch：换整闭包（重建 GitHubContents + repositoryId/branch），非只换 DB id。
+        publishGithub = options.rollover.rebuildGitHubContents(plan.target);
+        publishRepositoryId = plan.target.id;
+        publishBranch = plan.target.branch;
+      }
+      // stay：闭包与元组维持装配期原引用，零重建零行为变化。
+    }
     const artifactId = await storage.reserveArtifactPath({
       labeledBookId: task.book_id,
-      identityKey: artifactIdentityKey(task.title, task.author),
-      repositoryId, branch, canonicalPath,
+      identityKey,
+      repositoryId: publishRepositoryId, branch: publishBranch, canonicalPath,
     });
 
     await heartbeat.check();
     let release: PublishOutcome;
     try {
-      release = await publishBookVersion(github, {
+      release = await publishBookVersion(publishGithub, {
         check: async () => {
           const alive = await storage.heartbeat(lease);
           if (!alive) throw new LeaseLostError();
