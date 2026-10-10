@@ -226,7 +226,7 @@ async function runService(harnessOptions = {}) {
   await executor.link(() => { throw new Error('unexpected executor dependency'); });
   await executor.evaluate();
 
-  const module = new SourceTextModule(source, { context, identifier: 'prefetch.mjs',
+  const generatedModule = new SourceTextModule(source, { context, identifier: 'prefetch.mjs',
     async importModuleDynamically(specifier, referencingModule) {
       dynamicSeen.push(specifier);
       if (harnessOptions.importBehavior === 'reject') throw new Error('synthetic import failure');
@@ -235,13 +235,13 @@ async function runService(harnessOptions = {}) {
       return executor;
     },
   });
-  await module.link((specifier) => {
+  await generatedModule.link((specifier) => {
     staticSeen.push(specifier);
     const found = statics.get(specifier);
     if (!found) throw new Error('unexpected static import (not same-package): ' + specifier);
     return found;
   });
-  await module.evaluate();
+  await generatedModule.evaluate();
 
   const flush = async (n = 12) => { for (let i = 0; i < n; i++) await new Promise((resolve) => setImmediate(resolve)); };
   await flush(12);
