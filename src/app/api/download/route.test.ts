@@ -64,8 +64,8 @@ function expectSafeReclaim(index: number) {
   expect(query).toContain('updated_at = now()');
   expect(query).toMatch(/WHERE status = 'running' AND updated_at < now\(\) - \(\?::bigint \* interval '1 millisecond'\)$/);
   expect(sql.mock.calls[index].slice(1)).toEqual([
-    // W 线退避梯（SOURCE_RETRY_MAX_DELAY_MS=30min）与 946bd1b 分支（6h）不同：此处钉 W 实现值。
-    16, 16, 16, 15 * 60_000, 30 * 60_000, 16,
+    // 退避梯封顶 6h（SOURCE_RETRY_MAX_DELAY_MS，download-task-policy.ts:10）；末位 30min 为 DOWNLOAD_TASK_STALE_MS。
+    16, 16, 16, 15 * 60_000, 6 * 60 * 60_000, 16,
     '\nworker 中断自动回收，退避后重新入队', '\nworker 中断自动回收', 30 * 60_000,
   ]);
 }

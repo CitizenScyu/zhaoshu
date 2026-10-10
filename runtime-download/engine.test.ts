@@ -3,10 +3,17 @@
 //   - 成功 → recordSuccess(host)；
 //   - 源站 HTTP 错误（含 429）→ recordFailure(host, ...)，429 带 Retry-After 则含 retryAfterMs（发现 4）；
 //   - 网络/传输错误（无 status）→ 不计熔断（recordFailure 不被调用）。
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createSourceTransport, type RateLimiterLike } from './engine';
+import { refreshSupportedHosts } from '../src/lib/source-policy';
 
-afterEach(() => vi.unstubAllGlobals());
+// book15 已被退休源闸（assertNotRetiredBuiltin）拦死，传输语义用例迁合成域：
+// 运行时 host 门注册合成 host 即可放行，且该 host 不在静态 SUPPORTED_SOURCE_HOSTS
+// 二元组内 ⇒ 无换 host 兜底，断言语义（429/503/TypeError）保持原样。
+const HOST = 't8-transport.test';
+
+beforeEach(() => refreshSupportedHosts([HOST]));
+afterEach(() => { refreshSupportedHosts([]); vi.unstubAllGlobals(); });
 
 function fakeLimiter(): RateLimiterLike & { acquireCalls: string[]; success: string[]; failures: { key: string; opts?: { retryAfterMs?: number } }[] } {
   const acquireCalls: string[] = [];
@@ -27,10 +34,10 @@ describe('T8 createSourceTransport 限速器接线', () => {
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('正文')));
     const limiter = fakeLimiter();
     const transport = createSourceTransport(limiter);
-    const page = await transport('https://book15.net/x', opts());
+    const page = await transport(`https://${HOST}/x`, opts());
     expect(page.text).toBe('正文');
-    expect(limiter.acquireCalls).toEqual(['book15.net']);
-    expect(limiter.success).toEqual(['book15.net']);
+    expect(limiter.acquireCalls).toEqual([HOST]);
+    expect(limiter.success).toEqual([HOST]);
     expect(limiter.failures).toHaveLength(0);
   });
 
@@ -38,8 +45,8 @@ describe('T8 createSourceTransport 限速器接线', () => {
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('', { status: 429, headers: { 'retry-after': '5' } })));
     const limiter = fakeLimiter();
     const transport = createSourceTransport(limiter);
-    await expect(transport('https://book15.net/x', opts())).rejects.toMatchObject({ status: 429 });
-    expect(limiter.failures).toEqual([{ key: 'book15.net', opts: { retryAfterMs: 5000 } }]);
+    await expect(transport(`https://${HOST}/x`, opts())).rejects.toMatchObject({ status: 429 });
+    expect(limiter.failures).toEqual([{ key: HOST, opts: { retryAfterMs: 5000 } }]);
     expect(limiter.success).toHaveLength(0);
   });
 
@@ -47,8 +54,8 @@ describe('T8 createSourceTransport 限速器接线', () => {
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('', { status: 503 })));
     const limiter = fakeLimiter();
     const transport = createSourceTransport(limiter);
-    await expect(transport('https://book15.net/x', opts())).rejects.toMatchObject({ status: 503 });
-    expect(limiter.failures).toEqual([{ key: 'book15.net', opts: undefined }]);
+    await expect(transport(`https://${HOST}/x`, opts())).rejects.toMatchObject({ status: 503 });
+    expect(limiter.failures).toEqual([{ key: HOST, opts: undefined }]);
   });
 
   it('网络/传输错误（无 status）→ 不计熔断', async () => {
@@ -56,7 +63,7 @@ describe('T8 createSourceTransport 限速器接线', () => {
     vi.stubGlobal('fetch', vi.fn().mockRejectedValue(Object.assign(new TypeError('fetch failed'))));
     const limiter = fakeLimiter();
     const transport = createSourceTransport(limiter);
-    await expect(transport('https://book15.net/x', opts())).rejects.toBeInstanceOf(TypeError);
+    await expect(transport(`https://${HOST}/x`, opts())).rejects.toBeInstanceOf(TypeError);
     expect(limiter.failures).toHaveLength(0);
     expect(limiter.success).toHaveLength(0);
   });
