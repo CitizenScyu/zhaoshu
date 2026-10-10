@@ -529,6 +529,7 @@ class TestMainPrecheck(unittest.TestCase):
         sent = []
 
         def fake_build(http_get, skip_titles=None, include_douban=True, pages=None,
+                       done_index=None,
                        engine_cli=None, book15_breaker=None, source_policy=None):
             return [book]
 
