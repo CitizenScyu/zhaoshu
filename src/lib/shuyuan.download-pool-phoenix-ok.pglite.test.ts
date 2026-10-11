@@ -10,6 +10,9 @@ import { createProductionSchema } from './fixtures/production-schema';
 
 type Statement = { text: string; params: unknown[] };
 
+const isUnsafe = (value: unknown): value is { __pgliteUnsafe: true; raw: string } =>
+  typeof value === 'object' && value !== null && '__pgliteUnsafe' in value;
+
 const { getSql } = vi.hoisted(() => ({ getSql: vi.fn() }));
 vi.mock('@/lib/db', () => ({ ensureSchema: vi.fn(), getSql }));
 vi.mock('./db', () => ({ ensureSchema: vi.fn(), getSql }));
@@ -22,7 +25,8 @@ import { engineHosts } from './supported-sources-server';
 import { refreshSupportedHosts } from './source-policy';
 import { ADMISSION_PHOENIX_OK_PREFIX } from './rule-engine/admission';
 
-/** neon 形状的惰性标签：`sql\`\`` 只描述语句，await 或 transaction([...]) 时才执行。 */
+/** neon 形状的惰性标签：`sql\`\`` 只描述语句，await 或 transaction([...]) 时才执行。
+ * 另支持 `sql.unsafe(raw)`：neon 用它内联原始 SQL 片段（urlfix 的归一化表达式依赖它）。 */
 function lazySql(pg: PGliteLike) {
   const run = async ({ text, params }: Statement) => (await pg.query(text, params)).rows;
   const tag = (parts: TemplateStringsArray, ...values: unknown[]) => {
@@ -30,12 +34,16 @@ function lazySql(pg: PGliteLike) {
     const params: unknown[] = [];
     parts.forEach((part, index) => {
       text += part;
-      if (index < values.length) { params.push(values[index]); text += `$${params.length}`; }
+      if (index < values.length) {
+        const value = values[index];
+        if (isUnsafe(value)) { text += value.raw; } else { params.push(value); text += `$${params.length}`; }
+      }
     });
     const statement = { text, params };
     return { ...statement, then: (ok: (rows: unknown[]) => unknown, fail: (e: unknown) => unknown) => run(statement).then(ok, fail) };
   };
   return Object.assign(tag, {
+    unsafe: (raw: string) => ({ __pgliteUnsafe: true, raw } as unknown),
     transaction: async (queries: Statement[]) => {
       const out: unknown[][] = [];
       for (const query of queries) out.push(await run(query));

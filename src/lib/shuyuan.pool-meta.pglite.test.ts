@@ -53,6 +53,9 @@ import { refreshSupportedHosts } from './source-policy';
 
 /** neon 形状的惰性标签：`sql\`\`` 只描述语句，await 或 transaction([...]) 时才执行；执行结果记入 log。 */
 function lazySql(pg: PGliteLike, log: { text: string; rows: unknown[] }[]) {
+  // urlfix：neon 的 sql.unsafe(raw) 把原始 SQL 片段内联进 text（不是参数绑定），归一化表达式依赖它。
+  const isUnsafe = (value: unknown): value is { __unsafe: true; raw: string } =>
+    typeof value === 'object' && value !== null && '__unsafe' in value;
   const run = async ({ text, params }: Statement) => {
     const rows = (await pg.query(text, params)).rows;
     log.push({ text, rows });
@@ -63,12 +66,16 @@ function lazySql(pg: PGliteLike, log: { text: string; rows: unknown[] }[]) {
     const params: unknown[] = [];
     parts.forEach((part, index) => {
       text += part;
-      if (index < values.length) { params.push(values[index]); text += `$${params.length}`; }
+      if (index < values.length) {
+        const value = values[index];
+        if (isUnsafe(value)) { text += value.raw; } else { params.push(value); text += `$${params.length}`; }
+      }
     });
     const statement = { text, params };
     return { ...statement, then: (ok: (rows: unknown[]) => unknown, fail: (e: unknown) => unknown) => run(statement).then(ok, fail) };
   };
   return Object.assign(tag, {
+    unsafe: (raw: string) => ({ __unsafe: true, raw } as unknown),
     transaction: async (queries: Statement[]) => {
       const out: unknown[][] = [];
       for (const query of queries) out.push(await run(query));

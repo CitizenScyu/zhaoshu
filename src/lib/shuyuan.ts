@@ -1,5 +1,5 @@
 import { getSql } from '@/lib/db';
-import { engineHosts } from '@/lib/supported-sources-server';
+import { engineHosts, normalizeUrlSql } from '@/lib/supported-sources-server';
 import { isRecord } from '@/lib/sanitize';
 import { createDeadline, raceDeadline, type RequestDeadline } from '@/lib/deadline';
 import { validateSourceUrl, refreshSupportedHosts, supportedHostList, supportedHostVersion, upgradeSourceTemplateUrl } from '@/lib/source-policy';
@@ -595,17 +595,41 @@ async function engineReadingSources(
     }));
 }
 
+/**
+ * urlfix：URL 形态归一化的共享 SQL 片段定义在 supported-sources-server.ts 的 normalizeUrlSql
+ * （取书池 JOIN 与 host 门共用一处，避免两处漂移）。此处只消费，不重复定义。
+ */
+
 /** 引擎候选行：shuyuan_sources JOIN source_admission ok 态；池合成与产物生成共用同一查询。
  * admrunner42：phoenix_ok: 行（runner 探 ok、Vercel 未确认）不入池——谓词与 supported-sources.ts engineHosts、
- * readAdmissionFunnel 的 ok 桶同款。 */
+ * readAdmissionFunnel 的 ok 桶同款。
+ * urlfix：JOIN 条件从纯字符串等值放宽为「精确等值 OR（归一化等值 AND 同条目判据 AND 供判行是旧形态孤儿）」：
+ *   - 归一化等值：两侧 URL 形态不同（#/#🎃 后缀）时仍能配上；
+ *   - 同条目判据 `norm(src.source->>'bookSourceUrl') = norm(a.source_url)`：admission 结论必须来自**本条目**的
+ *     bookSourceUrl，绝不让跨条目源拿别家结论进池（准入是唯一规则安全闸，legado 规则可含任意 JS/CSS/正则）；
+ *   - 旧形态孤儿 `NOT EXISTS(精确键在表)`：真实库里 source_url 恒 = norm(bookSourceUrl)，单靠上两条在真实数据上会
+ *     退化成「纯归一化相等」，分不开「同条目旧形态」与「host 相同但另一条目」——biquge001 型反例判据恒等放行。
+ *     这一条才把前者（救回 urlsuffix §1b 的 15 条）与后者（挡住 §1c 跨条目）区分开。
+ * LATERAL + LIMIT 1 保证每条规则行至多配一条 admission 行（同 host 新旧键并存时**精确等值优先**），不膨胀。 */
 function readEngineRows(s: Sql, signal?: AbortSignal, includePhoenixOk = false): Promise<PoolArtifactEngineRow[]> {
   return readRows<PoolArtifactEngineRow>(s, s`
     SELECT src.source_url, src.name, src.source, src.disabled_at::text AS disabled_at, src.last_error,
            a.tier, a.search_checked_at::text AS search_checked_at
     FROM shuyuan_sources src
-    JOIN source_admission a ON a.source_url = src.source_url
-    WHERE a.compile_ok AND a.search_ok IS TRUE
-      AND (${includePhoenixOk}::boolean OR a.error IS NULL OR a.error NOT LIKE 'phoenix_ok:%')
+    JOIN LATERAL (
+      SELECT ad.tier, ad.search_checked_at
+      FROM source_admission ad
+      WHERE ad.compile_ok AND ad.search_ok IS TRUE
+        AND (${includePhoenixOk}::boolean OR ad.error IS NULL OR ad.error NOT LIKE 'phoenix_ok:%')
+        AND (
+          ad.source_url = src.source_url
+          OR (${s.unsafe(normalizeUrlSql('ad.source_url'))} = ${s.unsafe(normalizeUrlSql('src.source_url'))}
+            AND ${s.unsafe(normalizeUrlSql("src.source->>'bookSourceUrl'"))} = ${s.unsafe(normalizeUrlSql('ad.source_url'))}
+            AND NOT EXISTS (SELECT 1 FROM shuyuan_sources s2 WHERE s2.source_url = ad.source_url))
+        )
+      ORDER BY (ad.source_url = src.source_url) DESC, ad.search_checked_at DESC NULLS LAST
+      LIMIT 1
+    ) a ON true
     ORDER BY src.source_url`, signal);
 }
 

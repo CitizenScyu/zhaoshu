@@ -11,13 +11,25 @@ import type { PGliteLike } from './pglite';
 /** 标签的返回物：既是要 await 的 thenable，也自带 text/params 供 transaction 拆包。 */
 export type PGliteTagResult = Promise<unknown> & { text: string; params: unknown[] };
 
+/** neon 的 `sql.unsafe(raw)` 形状：把**原始 SQL 片段**内联进查询（不是参数绑定）。urlfix 的归一化表达式用它。 */
+type UnsafeFragment = { readonly __pgliteUnsafe: true; readonly raw: string };
+
+const isUnsafe = (value: unknown): value is UnsafeFragment =>
+  typeof value === 'object' && value !== null && '__pgliteUnsafe' in value;
+
 /** 把字面量与插值合成 ($n, params)。与生产 neon 的绑定顺序一致。 */
 function toStatement(parts: TemplateStringsArray, values: unknown[]): { text: string; params: unknown[] } {
   let text = '';
   const params: unknown[] = [];
   parts.forEach((part, index) => {
     text += part;
-    if (index < values.length) { params.push(values[index]); text += `$${params.length}`; }
+    if (index < values.length) {
+      const value = values[index];
+      // unsafe 片段原样内联（与 neon 一致），其余按参数绑定。
+      if (isUnsafe(value)) { text += value.raw; return; }
+      params.push(value);
+      text += `$${params.length}`;
+    }
   });
   return { text, params };
 }
@@ -67,7 +79,9 @@ export function createPGliteSql(pg: PGliteLike) {
   // 生产 neon 的 `sql.query(text, params)`（非模板形态，见 @neondatabase/serverless 类型）在 PGlite 上的等价物：
   // 直接返回行数组（与 neon 默认 arrayMode=false 一致）。businessSchemaCurrent 的动态探测 SQL 走这条。
   const query = async (text: string, params: unknown[] = []) => (await pg.query(text, params)).rows;
-  return Object.assign(tag, { transaction, query });
+  // 生产 neon 的 `sql.unsafe(raw)`：把一段原始 SQL 内联进当前模板（urlfix 的归一化表达式依赖它）。
+  const unsafe = (raw: string) => ({ __pgliteUnsafe: true, raw } as UnsafeFragment);
+  return Object.assign(tag, { transaction, query, unsafe });
 }
 
 /**

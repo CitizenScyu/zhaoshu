@@ -6,8 +6,21 @@ type TransactionOptions = { readOnly?: boolean; fetchOptions?: { signal: AbortSi
 
 const { ensureSchema, getSql, sql, execute, transaction, readTransaction } = vi.hoisted(() => {
   const execute = vi.fn<(query: Query) => Promise<unknown[]>>();
-  const sql = vi.fn((strings: TemplateStringsArray, ...values: unknown[]) => {
-    const query = { text: strings.join('?').replace(/\s+/g, ' ').trim(), values };
+  // urlfix：neon 的 sql.unsafe(raw) 把原始 SQL 片段内联进 text（不是参数绑定），
+  // 归一化表达式依赖它；其余插值照旧进 values。
+  const isUnsafe = (value: unknown): value is { __unsafe: true; raw: string } =>
+    typeof value === 'object' && value !== null && '__unsafe' in value;
+  const tag = vi.fn((strings: TemplateStringsArray, ...values: unknown[]) => {
+    let text = '';
+    const bound: unknown[] = [];
+    strings.forEach((part, index) => {
+      text += part;
+      if (index < values.length) {
+        const value = values[index];
+        if (isUnsafe(value)) { text += value.raw; } else { bound.push(value); text += '?'; }
+      }
+    });
+    const query = { text: text.replace(/\s+/g, ' ').trim(), values: bound };
     // Neon 的标签模板返回惰性查询；只有独立 await 才会绕过 transaction 执行。
     return {
       ...query,
@@ -16,6 +29,7 @@ const { ensureSchema, getSql, sql, execute, transaction, readTransaction } = vi.
       },
     };
   });
+  const sql = Object.assign(tag, { unsafe: (raw: string) => ({ __unsafe: true, raw } as unknown) });
   return {
     ensureSchema: vi.fn(),
     getSql: vi.fn(),
@@ -1153,7 +1167,7 @@ describe('refreshShuyuan atomic refresh', () => {
           expect(execute).not.toHaveBeenCalled();
         } else {
           expect(current).not.toHaveBeenCalled();
-          expect(execute.mock.calls.some(([query]) => query.text.includes('JOIN source_admission'))).toBe(true);
+          expect(execute.mock.calls.some(([query]) => query.text.includes('JOIN LATERAL ('))).toBe(true);
         }
         expect(fetchMock).not.toHaveBeenCalled();
       } finally {
@@ -1204,7 +1218,7 @@ describe('refreshShuyuan atomic refresh', () => {
         expect(await result).toEqual({ url: 'https://engine.example/book/1', kind: 'engine', id: 'https://engine.example/',
           revision: sourceRevision({ url: 'https://engine.example/', searchUrl: engineItem.searchUrl, rules: engineItem }) });
       } else await expect(result).rejects.toThrow('不支持全书下载');
-      expect(execute.mock.calls.at(-1)![0].text).toContain('WHERE a.compile_ok AND a.search_ok IS TRUE');
+      expect(execute.mock.calls.at(-1)![0].text).toContain('ad.compile_ok AND ad.search_ok IS TRUE');
       expect(fetchMock).not.toHaveBeenCalled();
     });
 
@@ -1615,16 +1629,20 @@ describe('refreshShuyuan atomic refresh', () => {
       vi.stubEnv('READING_POOL_LIMIT', '6');
       refreshSupportedHosts(['engine.example']);
       // getShuyuanPoolHealth 内部 Promise.all 并发取池与漏斗，靠 SQL 文本分派而非调用顺序。
-      execute.mockImplementation(async (query) => {
+      // urlfix 哨兵：readEngineRows 是 `JOIN LATERAL (` 子查询；漏斗里是 `CROSS JOIN LATERAL jsonb_array_elements`，
+  // 无「( 」紧跟，用它作锚点可避免误捕漏斗（text 已规范化为单空格）。
+  const ENGINE_SQL_MARK = 'JOIN LATERAL (';
+  execute.mockImplementation(async (query) => {
         const text = query.text;
         // engineHosts（门随池刷）：DISTINCT host 必须先于漏斗聚合分派，两者都命中 FROM source_admission。
         if (text.includes('SELECT DISTINCT host FROM source_admission')) return [{ host: 'engine.example' }];
+        // urlfix：readEngineRows 含 FROM source_admission 与 JOIN LATERAL，必须先于漏斗分派避免被截。
+        if (text.includes(ENGINE_SQL_MARK)) return [engineRow()];
         if (text.includes('FROM source_admission')) {
           // 准入兼容 L4：漏斗带 url_defaulted / miss_chapter_list / miss_chapter_name 三个新列。
           return [{ ok: 12, deferred: 5, rejected: 3, url_defaulted: 10, miss_chapter_list: 0, miss_chapter_name: 0,
             rejection_codes: { unsupported_operator: 3 } }];
         }
-        if (text.includes('JOIN source_admission')) return [engineRow()];
         if (text.includes('FROM shuyuan_sources')) return builtinRegisteredRow;
         if (text.includes('FROM shuyuan_meta')) return [{ collections: [], refreshed_at: null }];
         return [];
