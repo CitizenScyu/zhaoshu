@@ -25,9 +25,26 @@ function unsupported(msg: string, rule: string, diagnostic: RuleDiagnostic): nev
 }
 
 // ---- 不支持构件（编译期一律拒绝，见 §0/§2.3 与任务 reject-list）----
-// xpath / tpl_rule({{@@}}) / tpl_var({{变量}}) / put(@put:) / get(@get:) /
+// xpath / tpl_rule({{@@}}) / tpl_var({{变量}}，baseUrl 除外) / put(@put:) / get(@get:) /
 // tpl_js_expr / @js:/<js> / ||(顶层) / &&(顶层) / %%(拼接) / match:
 const JS_EXPR_RE = /[=+*/%!<>?;]|java\.|Date\.|baseUrl\.|typeof|new\s|\breturn\b|\.match\(|\.replace\(/;
+
+/**
+ * 唯一放行的模板变量（窄口子，见 tocfix 任务书）。
+ *
+ * legado 语义对照：legado 的 `BaseAnalysis`/`AnalyzeUrl` 在展开规则时把内置变量
+ * `baseUrl` 替换为**当前页面的 URL 字符串**（不是对象、不是表达式）。故 `{{baseUrl}}`
+ * 等价于「本格取当前页 URL」，引擎侧实现为 TemplatePart{kind:'var',name:'baseUrl'}，
+ * 求值期取 scope.pageUrl（见 evaluate.ts renderTemplate）。
+ *
+ * 边界（有意收窄）：
+ * - **只放行 trim 后恰为 `baseUrl` 的这一种**；`result`/`book`/`chapter`/`headerMap`
+ *   及其它任何 `{{变量}}` 照旧 tpl_var 拒绝（JS_EXPR_RE 之下的兜底分支不动）。
+ * - `{{baseUrl.replace(...)}}` 内含 `.replace(`，命中 JS_EXPR_RE → 仍按 tpl_js_expr 拒；
+ *   本口子不开 JS 口。JS 侧求值（如 baseUrl.replace）留给 T7。
+ * - 与 `@baseUrl` 具名属性兜底（LEGADO_SPECIAL_VARS，见下）无关：那是末端 op，本改动不动它。
+ */
+const ALLOWED_TEMPLATE_VARS = new Set(['baseUrl']);
 
 /**
  * 顶层构件白名单校验（在剥正则尾缀之前，对整条规则做粗筛）。
@@ -45,8 +62,8 @@ function rejectUnsupportedConstructs(rule: string): void {
 /**
  * 全串扫描 {{...}} 模板并拒绝不支持类别（对齐 §2.3 step 2 与 survey.py refined_feats：
  * 二者都对整条规则做扫描——含正则尾缀里的 {{变量}}，如 `##...{{chapter.title}}`）。
- * 只有 {{$...}}（tpl_jsonpath）放行；{{@@}}（tpl_rule）/JS 表达式（tpl_js_expr）/
- * 其余 {{变量}}（tpl_var）一律 RULE_UNSUPPORTED。
+ * `{{$...}}`（tpl_jsonpath）与 `{{baseUrl}}`（窄口子，见 ALLOWED_TEMPLATE_VARS）放行；
+ * `{{@@}}`（tpl_rule）/JS 表达式（tpl_js_expr）/其余 {{变量}}（tpl_var）一律 RULE_UNSUPPORTED。
  */
 function rejectUnsupportedTemplates(rule: string): void {
   const re = /\{\{(.*?)\}\}/g;
@@ -54,6 +71,7 @@ function rejectUnsupportedTemplates(rule: string): void {
   while ((m = re.exec(rule)) !== null) {
     const inner = m[1].trim();
     if (inner.startsWith('$')) continue; // tpl_jsonpath（M1 支持）
+    if (ALLOWED_TEMPLATE_VARS.has(inner)) continue; // {{baseUrl}}：当前页 URL（窄口子）
     if (inner.startsWith('@@')) unsupported('模板含 {{@@规则}}（tpl_rule）', rule, { code: 'unsupported_template_rule' });
     if (JS_EXPR_RE.test(inner)) unsupported('模板含 JS 表达式（tpl_js_expr）', rule, { code: 'unsupported_template_js' });
     unsupported('模板含 {{变量}}（tpl_var）', rule, { code: 'unsupported_template_var' });
@@ -66,8 +84,8 @@ function looksLikeXPath(rule: string): boolean {
 }
 
 /**
- * 解析 {{...}} 模板：只允许 {{$.x}}（tpl_jsonpath）。
- * {{@@...}}=tpl_rule、{{变量}}=tpl_var、含 JS 表达式=tpl_js_expr → 一律 RULE_UNSUPPORTED。
+ * 解析 {{...}} 模板：允许 {{$.x}}（tpl_jsonpath）与 {{baseUrl}}（窄口子 → var part）。
+ * {{@@...}}=tpl_rule、其余 {{变量}}=tpl_var、含 JS 表达式=tpl_js_expr → 一律 RULE_UNSUPPORTED。
  * 返回 null 表示该段不含 {{}}（走非模板路径）。
  */
 function tryParseTemplate(segment: string, rule: string): TemplatePart[] | null {
@@ -82,6 +100,8 @@ function tryParseTemplate(segment: string, rule: string): TemplatePart[] | null 
     if (inner.startsWith('@@')) unsupported('模板含 {{@@规则}}（tpl_rule）', rule, { code: 'unsupported_template_rule' });
     if (inner.startsWith('$')) {
       parts.push({ kind: 'jsonpath', path: parseJsonPath(inner) });
+    } else if (ALLOWED_TEMPLATE_VARS.has(inner)) {
+      parts.push({ kind: 'var', name: 'baseUrl' });
     } else if (JS_EXPR_RE.test(inner)) {
       unsupported('模板含 JS 表达式（tpl_js_expr）', rule, { code: 'unsupported_template_js' });
     } else {

@@ -107,7 +107,10 @@ export type RuleIr =
 
 export type TemplatePart =
   | { kind: 'literal'; text: string }
-  | { kind: 'jsonpath'; path: JsonPathIr };
+  | { kind: 'jsonpath'; path: JsonPathIr }
+  // legado 模板变量窄口子：只放行 {{baseUrl}}（当前页 URL）。
+  // 见 parse.ts rejectUnsupportedTemplates / tryParseTemplate 的窄口与 evaluate.ts renderTemplate。
+  | { kind: 'var'; name: 'baseUrl' };
 
 /** ##pattern##replacement##flags## 正则替换。 */
 export interface RegexSub {
