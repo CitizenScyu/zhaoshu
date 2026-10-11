@@ -473,3 +473,42 @@ exports[`parse: 支持构件 → IR 快照 > 'tpl_jsonpath': 'https://appi.kuwo.
   ],
 }
 `;
+
+exports[`parse: 支持构件 → IR 快照 > 'tpl_var_baseUrl': '{{baseUrl}}' 1`] = `
+{
+  "rules": [
+    {
+      "kind": "template",
+      "parts": [
+        {
+          "kind": "var",
+          "name": "baseUrl",
+        },
+      ],
+    },
+  ],
+}
+`;
+
+exports[`parse: 支持构件 → IR 快照 > 'tpl_var_baseUrl_regex': '{{baseUrl}}##//m##//www' 1`] = `
+{
+  "regex": [
+    {
+      "flags": undefined,
+      "pattern": "//m",
+      "replacement": "//www",
+    },
+  ],
+  "rules": [
+    {
+      "kind": "template",
+      "parts": [
+        {
+          "kind": "var",
+          "name": "baseUrl",
+        },
+      ],
+    },
+  ],
+}
+`;

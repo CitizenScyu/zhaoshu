@@ -187,15 +187,28 @@ function evaluateOr(ir: { kind: 'or'; branches: RuleIr[] }, scope: EvalScope, mu
   return { kind: 'text', value: '' };
 }
 
-/** `{{$.x}}` 模板渲染：字面段原样，求值段取首个命中（多值取首，避免把 URL 类字段拼坏）。 */
+/**
+ * 模板渲染：字面段原样；`{{baseUrl}}`（TemplatePart kind='var'）取 scope.pageUrl；
+ * `{{$.x}}` 取 jsonpath 首个命中（多值取首，避免把 URL 类字段拼坏）。
+ *
+ * html scope：只允许 literal + var（`{{baseUrl}}`）两类段——这正是 `ruleBookInfo.tocUrl =
+ * "{{baseUrl}}##/detail/##/chapter/"` 这类「拿当前页 URL 改写」规则的形态；含 jsonpath 段的
+ * 模板在 html scope 仍 evalFailed（jsonpath 是 JSON 输入的构件，口径不变）。
+ * json scope：var 段同样取 pageUrl（legado 里 baseUrl 就是当前页 URL，与输入类型无关），
+ * jsonpath 段照旧走 evalJsonPath。
+ */
 function renderTemplate(parts: TemplatePart[], scope: EvalScope): string {
-  if (scope.kind !== 'json') return evalFailed('模板规则不能对 HTML 输入求值');
   let out = '';
   for (const part of parts) {
     if (part.kind === 'literal') {
       out += part.text;
       continue;
     }
+    if (part.kind === 'var') {
+      out += scope.pageUrl;
+      continue;
+    }
+    if (scope.kind !== 'json') return evalFailed('模板规则不能对 HTML 输入求值');
     const values = evalJsonPath(part.path, scope.json);
     out += values.length > 0 ? jsonValueToString(values[0]) : '';
   }
