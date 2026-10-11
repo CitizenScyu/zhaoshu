@@ -24,9 +24,10 @@ maybe('engineHosts：孤儿准入行不进 host 门（pglite 真库）', () => {
     const tag = createPGliteSql(pg);
     await createProductionSchema(tag as never, (statement) => pg.exec(statement));
     // engineHosts 用 neon 的数组形 transaction([query], opts)；PGlite 标签是即发的，逐条等结果即可。
+    // urlfix：包一层时要把 tag.unsafe 一并透传——engineHosts 用它内联归一化 SQL 片段。
     db.sql = Object.assign(
       (parts: TemplateStringsArray, ...values: unknown[]) => tag(parts, ...values),
-      { transaction: async (queries: Promise<unknown>[]) => Promise.all(queries) },
+      { transaction: async (queries: Promise<unknown>[]) => Promise.all(queries), unsafe: tag.unsafe },
     );
   }, 120_000);
 
