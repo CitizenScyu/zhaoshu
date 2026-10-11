@@ -37,7 +37,8 @@ interface AdmissionHostRow { host: string }
  * bpool-normalize：includePhoenixOk=true 时额外放行 phoenix_ok: 行（下载腿扩池用）；缺省 false 与改前逐字相同。
  * urlfix：EXISTS 半连接与取书池 JOIN **同款三段判据**（精确等值 OR 归一化+同条目+旧形态孤儿）——
  * 裸精确 EXISTS 堵不住形态分裂孤儿（`chuangshi.qq.com#🎃` 与规则行 `chuangshi.qq.com` 同条目不同形态），
- * 裸归一化又会把「同 host 但另一条目」的孤儿行放进来。归一化片段从 shuyuan.ts 复用，两处不会漂移。
+ * 裸归一化又会把「同 host 但另一条目」的孤儿行放进来。归一化片段即本文件的 normalizeUrlSql，
+ * 取书池（shuyuan.ts readEngineRows）也从这里引用，两处不会漂移。
  * EXISTS 只判存在性、不聚合，行数与 DISTINCT 语义不变；includePhoenixOk 谓词原样保留。
  */
 export async function engineHosts(
