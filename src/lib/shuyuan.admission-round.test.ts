@@ -10,8 +10,22 @@ type TransactionOptions = { readOnly?: boolean; fetchOptions?: { signal: AbortSi
 
 const { ensureSchema, getSql, sql, execute, transaction, readTransaction } = vi.hoisted(() => {
   const execute = vi.fn<(query: Query) => Promise<unknown[]>>();
-  const sql = vi.fn((strings: TemplateStringsArray, ...values: unknown[]) => {
-    const query = { text: strings.join('?').replace(/\s+/g, ' ').trim(), values };
+  // urlfix：neon 的 sql.unsafe(raw) 把原始 SQL 片段内联进 text（不是参数绑定），
+  // 归一化表达式依赖它；其余插值照旧进 values（mock 风格用 ? 占位）。
+  const isUnsafe = (value: unknown): value is { __unsafe: true; raw: string } =>
+    typeof value === 'object' && value !== null && '__unsafe' in value;
+  const tag = vi.fn((strings: TemplateStringsArray, ...values: unknown[]) => {
+    let text = '';
+    const bound: unknown[] = [];
+    strings.forEach((part, index) => {
+      text += part;
+      if (index < values.length) {
+        const value = values[index];
+        if (isUnsafe(value)) { text += value.raw; } else { bound.push(value); text += '?'; }
+      }
+    });
+    const query = { text: text.replace(/\s+/g, ' ').trim(), values: bound };
+    // Neon 的标签模板返回惰性查询；只有独立 await 才会绕过 transaction 执行。
     return {
       ...query,
       then(onFulfilled: (rows: unknown[]) => unknown, onRejected: (error: unknown) => unknown) {
@@ -19,6 +33,7 @@ const { ensureSchema, getSql, sql, execute, transaction, readTransaction } = vi.
       },
     };
   });
+  const sql = Object.assign(tag, { unsafe: (raw: string) => ({ __unsafe: true, raw } as unknown) });
   return {
     ensureSchema: vi.fn(), getSql: vi.fn(), sql, execute,
     transaction: vi.fn<(queries: Query[], options?: TransactionOptions) => Promise<unknown[][]>>(),
