@@ -14,6 +14,15 @@ import { compileCoreFieldsFromRules, selectCandidates, type RawSource } from './
 //       - 1× `@baseUrl` legado 特殊变量（知妖；§2.3 第5条不猜测，主会话已裁定拒绝）；
 //       - 1× `$2` 非法 JSONPath（疯情阅读2；§2.2「$ 后跟非上述语法 → RULE_UNSUPPORTED」）。
 //   113 = 114 − 5(A) + 4(B)。faithful = 114。
+//
+// 2026-10-11 tocfix（窄口子引擎救 chuangshi.qq.com#）：放行 `{{baseUrl}}` 模板变量。
+// 数字漂移已逐源归因——
+//   - off 态 114/60 不变（off 态 bare `{{baseUrl}}` 的 6 源仍叠其它失败桶：||/var_get/JS）；
+//   - `unsupported_template_var` 12 → 6（6 源从 tpl_var 桶里移除：9559/酷我/找故事网×2/秋田×2），
+//     余下 6 源（英文小说/陌上阁m×3/得间小说×2）是真非 baseUrl 的 tpl_var，未误伤；
+//   - on 态 133 → 136（rescued 19 → 22）：新增 3 源是 bare `{{baseUrl}}` 上叠了 || 桶的源，
+//     放开后 || 与 tpl_var 同时满足 → compile-ok（9559、❤️秋田书屋、秋田书屋🎃）；
+//   - 非 || 桶的 144 源两态结论逐源一致（无意外连代救回/误伤）。
 
 interface FixtureSource {
   name: string;
@@ -53,7 +62,7 @@ describe('174 源 compile 冒烟', () => {
     expect(counts).toMatchObject({
       '||': 30,
       unsupported_var_get: 13,
-      unsupported_template_var: 12,
+      unsupported_template_var: 6, // tocfix 前 12；余下 6 源均非 baseUrl 的 tpl_var（见文件头归因）
       unsupported_var_put: 7,
       regex_only: 6,
       unsupported_template_js: 5,
@@ -83,15 +92,17 @@ describe('174 源 compile 冒烟', () => {
     expect(rejected).toHaveLength(60);
   });
 
-  it('P1a on：|| 桶 30 源全部 compile-ok（133/41）；其余桶结论不因 || 放开而漂移', () => {
+  it('P1a on：|| 桶 30 源全部 compile-ok（136/38）；其余桶结论不因 || 放开而漂移', () => {
     const onOk = sources.filter((s) => compileCoreFieldsFromRules(s.coreRules, { orEnabled: true }).ok);
-    expect(onOk.length).toBe(133); // 114 + 19（|| 单桶救回：9559 之外的 19 源，见报告）
+    // tocfix 前 133 = 114 + 19；tocfix 放行 {{baseUrl}} 后 +3（|| 桶里叠 tpl_var 桶的
+    // 9559 / ❤️秋田书屋 / 秋田书屋🎃 三源同时满足 → 136 = 114 + 22。
+    expect(onOk.length).toBe(136);
     // || 桶（off 态诊断 operator='||' 的 30 源）在 on 态的结局：
     const orBucket = sources.filter((s) => compileCoreFieldsFromRules(s.coreRules).failures.some((f) => f.diagnostic.operator === '||'));
     expect(orBucket.length).toBe(30);
-    // 其一：30 源中 19 源 on 态全核心字段编译通过（其余 11 源还叠着 @get/@put/{{var}}/regex_only/&& 桶）。
+    // 其一：30 源中 22 源 on 态全核心字段编译通过（其余 8 源还叠着 @get/@put/{{var}}/regex_only/&& 桶）。
     const rescued = orBucket.filter((s) => compileCoreFieldsFromRules(s.coreRules, { orEnabled: true }).ok);
-    expect(rescued.length).toBe(19);
+    expect(rescued.length).toBe(22);
     // 其二：|| 桶之外（144 源）两态结论必须逐源一致——|| 不连带救回/误伤别的桶。
     for (const s of sources) {
       if (orBucket.includes(s)) continue;
