@@ -203,10 +203,9 @@ maybe('urlfix URL 形态分裂 JOIN（PGlite 真库）', () => {
   // c8 query 串保留：归一化只剥 # 之后部分，query（?id=1）完整。
   it('c8) query 串保留：https://x.com/read?id=1 归一化后 query 完整（不误剥）', async () => {
     const norm = "regexp_replace(regexp_replace(btrim(COALESCE(%s, '')), '#.*$', ''), '/+$', '')";
-    const q = (v: string) => norm.replace('%s', '$1');
-    const stripped = await pg.query(`SELECT ${q('$1')} AS out`, ['https://x.com/read?id=1#frag']);
+    const stripped = await pg.query(`SELECT ${norm.replace('%s', '$1')} AS out`, ['https://x.com/read?id=1#frag']);
     expect((stripped.rows[0] as { out: string }).out).toBe('https://x.com/read?id=1');
-    const kept = await pg.query(`SELECT ${q('$1')} AS out`, ['https://x.com/read?id=1']);
+    const kept = await pg.query(`SELECT ${norm.replace('%s', '$1')} AS out`, ['https://x.com/read?id=1']);
     expect((kept.rows[0] as { out: string }).out).toBe('https://x.com/read?id=1');
   });
 });

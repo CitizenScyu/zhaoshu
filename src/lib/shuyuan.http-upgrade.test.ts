@@ -6,8 +6,20 @@ type Query = { text: string; values: unknown[] };
 
 const { getSql, sql, execute } = vi.hoisted(() => {
   const execute = vi.fn<(query: Query) => Promise<unknown[]>>();
-  const sql = vi.fn((strings: TemplateStringsArray, ...values: unknown[]) => {
-    const query = { text: strings.join('?').replace(/\s+/g, ' ').trim(), values };
+  // urlfix：neon 的 sql.unsafe(raw) 把原始 SQL 片段内联进 text（不是参数绑定），归一化表达式依赖它。
+  const isUnsafe = (value: unknown): value is { __unsafe: true; raw: string } =>
+    typeof value === 'object' && value !== null && '__unsafe' in value;
+  const tag = vi.fn((strings: TemplateStringsArray, ...values: unknown[]) => {
+    let text = '';
+    const bound: unknown[] = [];
+    strings.forEach((part, index) => {
+      text += part;
+      if (index < values.length) {
+        const value = values[index];
+        if (isUnsafe(value)) { text += value.raw; } else { bound.push(value); text += '?'; }
+      }
+    });
+    const query = { text: text.replace(/\s+/g, ' ').trim(), values: bound };
     return {
       ...query,
       then(onFulfilled: (rows: unknown[]) => unknown, onRejected: (error: unknown) => unknown) {
@@ -15,6 +27,7 @@ const { getSql, sql, execute } = vi.hoisted(() => {
       },
     };
   });
+  const sql = Object.assign(tag, { unsafe: (raw: string) => ({ __unsafe: true, raw } as unknown) });
   return { getSql: vi.fn(), sql, execute };
 });
 
@@ -41,7 +54,7 @@ beforeEach(() => {
   invalidateShuyuanReadCache();
   execute.mockReset().mockImplementation(async (query) => {
     if (query.text.includes('FROM shuyuan_meta')) return [{ collections: [], refreshed_at: null }];
-    if (query.text.includes('JOIN source_admission')) return engine;
+    if (query.text.includes('JOIN LATERAL (')) return engine;
     return [];
   });
   getSql.mockReturnValue(Object.assign(sql, {
