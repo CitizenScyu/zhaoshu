@@ -1166,9 +1166,11 @@ async function readPoolProbeMeta(s: Sql, hosts: string[], sig?: AbortSignal): Pr
   return rows[0] ?? { collections: [], refreshed_at: null };
 }
 
-/** admission 候选筛包装：规则先过公共 survey 锁，命永久排除名单本-batch 即拒（不前送到深层探查）。 */
+/** admission 候选筛包装：规则先过公共 survey 锁，命永久排除名单本-batch 即拒（不前送到深层探查）。
+ * 字段是 bookSourceUrl 不是 url——RawSource 无 url 字段，`c.url` 恒 undefined 会让
+ * isPermanentlyDisabledUrl('undefined') 静默返回 false（bug42 复发根因，见 shuyuan.test.ts 反例）。 */
 function selectCandidatesWithPermanentBlock(sources: RawSource[], options: { postSearch?: boolean }): RawSource[] {
-  return selectCandidates(sources, options).filter((c) => !isPermanentlyDisabledUrl('' + c.url));
+  return selectCandidates(sources, options).filter((c) => !isPermanentlyDisabledUrl(String(c.bookSourceUrl ?? '')));
 }
 
 async function countsFromStates(s: Sql, states: Map<string, ProbeState>, signal?: AbortSignal): Promise<ShuyuanCounts> {
