@@ -439,7 +439,9 @@ describe('refreshShuyuan atomic refresh', () => {
     const inserted = savedRows();
     expect(inserted).toHaveLength(2);
     const dup = inserted.find((row) => row.url === 'https://dup.example/a');
-    // 首见优先：合集按 entries 顺序拉取，第一条的名称胜出。
+    // srcfeed：两条 yckceo 条目都打到 position=0、双方无 lastUpdateTime ⇒ incomingWins 恒 false，
+    // 「首见留表」；这两条注释钉的是 yckceo 内部反复现的第一条（合集间冲突的语义钉在
+    // shuyuan.extra-feeds.test.ts：extra 后到者胜，但 yckceo 占 position=0，对 yckceo 不可翻）。
     expect(dup?.source).toMatchObject({ bookSourceName: '首见版本' });
   });
 
@@ -484,6 +486,25 @@ describe('refreshShuyuan atomic refresh', () => {
       }),
     );
     expect(fetchMock).toHaveBeenCalledTimes(4);
+  });
+
+  it('srcfeed：yckceo 半挂 ⇒ extra feed 全短路（fetch 仍只有 4 条 yckceo，extraFeeds 不伸手）', async () => {
+    vi.stubEnv('SHUYUAN_EXTRA_FEEDS', 'https://extra1.example/all.json');
+    const extraCalled: string[] = [];
+    const ordinary = fetchMock.getMockImplementation()!;
+    fetchMock.mockImplementation((input, options) => {
+      const url = String(input);
+      if (url === 'https://extra1.example/all.json') extraCalled.push(url);
+      if (url === 'https://www.yckceo.com/yuedu/shuyuans/json/id/12.json') return Promise.resolve(new Response('unavailable', { status: 503 }));
+      return ordinary(input, options);
+    });
+
+    await expect(refreshShuyuan()).rejects.toThrow('仅拉到 2/3 个书源合集，本次刷新中止，保留既有数据');
+
+    expect(fetchMock).toHaveBeenCalledTimes(4);
+    expect(extraCalled).toEqual([]);
+    expect(transaction).not.toHaveBeenCalled();
+    expect(execute).not.toHaveBeenCalled();
   });
 
   it('returns the transaction error to the refresh API instead of announcing success', async () => {
