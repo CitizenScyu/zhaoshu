@@ -33,7 +33,10 @@ export type { ShuyuanAvailability };
 
 export const INDEX_URL = 'https://www.yckceo.com/yuedu/shuyuans/index.html';
 const jsonUrl = (id: number) => `https://www.yckceo.com/yuedu/shuyuans/json/id/${id}.json`;
-export const LATEST_COUNT = 3; // 只跟最新 3 个合集
+// 只跟最新 N 个合集。3→5（2026-10-12 池塌缩修复）：上游合集滑动把已准入 ok 源（sfacg/faloo/chuangshi 等）
+// 挤出 shuyuan_sources 整表替换窗口 ⇒ engineHosts 孤儿过滤把 58 个 host 踢出阅读池门（73→13）。
+// 拉入 1304（精选）实测多 +119 形态筛通过候选 / +73 新 host，且能救回 36 个孤儿 host。
+export const LATEST_COUNT = 5;
 // srcfeed：额外上游合集直链（分号分隔；仅存「裸 JSON 数组」链接：直接 fetch 解析为 bookSource 数组）。
 // 缺省/空白项/非法 URL（非 https）一律丢弃 ⇒ 缺省值下与「仅 yckceo」逐字同行为（零行为变化门禁）。
 // 例：shidahuilang good.json、aoaostar legado 每日镜像（取值只进 .env，不进代码）。
