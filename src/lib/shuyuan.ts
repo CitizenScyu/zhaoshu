@@ -2,7 +2,7 @@ import { getSql } from '@/lib/db';
 import { engineHosts, normalizeUrlSql } from '@/lib/supported-sources-server';
 import { isRecord } from '@/lib/sanitize';
 import { createDeadline, raceDeadline, type RequestDeadline } from '@/lib/deadline';
-import { validateSourceUrl, refreshSupportedHosts, supportedHostList, supportedHostVersion, upgradeSourceTemplateUrl, isForbiddenHostAddress } from '@/lib/source-policy';
+import { validateSourceUrl, refreshSupportedHosts, supportedHostList, supportedHostVersion, upgradeSourceTemplateUrl, isForbiddenHostAddress, isPermanentlyDisabledUrl, permanentDisableHostList } from '@/lib/source-policy';
 import { engineSourceUsable } from '@/lib/source-usability';
 import {
   BUILTIN_SOURCE_HOSTS, builtinUrlPrefixes,
@@ -1166,6 +1166,11 @@ async function readPoolProbeMeta(s: Sql, hosts: string[], sig?: AbortSignal): Pr
   return rows[0] ?? { collections: [], refreshed_at: null };
 }
 
+/** admission 候选筛包装：规则先过公共 survey 锁，命永久排除名单本-batch 即拒（不前送到深层探查）。 */
+function selectCandidatesWithPermanentBlock(sources: RawSource[], options: { postSearch?: boolean }): RawSource[] {
+  return selectCandidates(sources, options).filter((c) => !isPermanentlyDisabledUrl('' + c.url));
+}
+
 async function countsFromStates(s: Sql, states: Map<string, ProbeState>, signal?: AbortSignal): Promise<ShuyuanCounts> {
   const rows = await readRows<ShuyuanCounts>(s, s`
     SELECT count(*)::int AS total,
@@ -1422,6 +1427,7 @@ function mergeIntoPool(merged: Map<string, [Record<string, unknown>, number]>, p
     if (!isRecord(item) || typeof item.bookSourceUrl !== 'string') continue;
     const url = normalizeUrl(item.bookSourceUrl);
     if (!url) continue;
+    if (isPermanentlyDisabledUrl(url)) continue; // 永久排除红线：wnreader 一类的复生源直接拒收
     const cleaned = cleanJson(item);
     if (!isRecord(cleaned)) continue;
     const existing = merged.get(url);
@@ -1519,6 +1525,7 @@ async function refreshWithinBudget(s: Sql, budget: RequestDeadline, signal: Abor
       if (!isRecord(item) || typeof item.bookSourceUrl !== 'string') continue;
       const url = normalizeUrl(item.bookSourceUrl);
       if (!url) continue;
+      if (isPermanentlyDisabledUrl(url)) continue; // 永久排除红线：wnreader 一类的复生源直接拒收
       const cleaned = cleanJson(item);
       if (!isRecord(cleaned)) continue;
       // yckceo 令牌 position=0：恒压一切 extra feed（正数位）；同合集间冲突由 lastUpdateTime 判新旧。
@@ -1676,9 +1683,16 @@ async function refreshWithinBudget(s: Sql, budget: RequestDeadline, signal: Abor
   // srcfeed：extra feed 失败降级挂在首条 yckceo collection（与 probeSnapshot 同位，读侧只认
   // isRecord/既有键 ⇒ 新键对外不可见且不破坏既有解析；feed 字段已是 feedLabelOf 的 host/文件名
   // 形态）。缺省时本三元运算恒 undefined⇒剥离，serialized value 与改前逐字节一致。
+  // permblock42：永久排除名单的 mirror 挂到首条 probeSnapshot（可观测「当前过滤了哪几个 host」），
+  // 命中即剔除本批次；缺省时本三元运算恒 undefined⇒剥离。
+  const hostPermanentlyDisabled: string[] = permanentDisableHostList();
   const savedCollections = collections.map((collection, i) => i === 0 ? {
     ...collection,
-    probeSnapshot: { version: 1, entries: [...states.values()] },
+    probeSnapshot: {
+      version: 1,
+      entries: [...states.values()],
+      ...(hostPermanentlyDisabled.length > 0 ? { permanentDisable: { hosts: hostPermanentlyDisabled } } : {}),
+    },
     ...(extraFeedFailures.length > 0 ? { extraFeedFailures } : {}),
   } : collection);
   const updateMeta = s`
@@ -1883,7 +1897,7 @@ async function admitRows(
   const postSearch = enginePostSearchEnabled();
   for (const row of rows) {
     const source = row.source as RawSource;
-    (selectCandidates([source], { postSearch }).length === 1 ? candidates : surveyRejected).push({ url: row.url, source });
+    (selectCandidatesWithPermanentBlock([source], { postSearch }).length === 1 ? candidates : surveyRejected).push({ url: row.url, source });
   }
   let summary: AdmissionRoundSummary;
   try {

@@ -142,3 +142,71 @@ export function isForbiddenHostAddress(hostname: string): boolean {
   if (hostname.includes(':') || hostname.startsWith('[')) return true; // IPv6 字面量（含 ::1、fc00::/7）
   return /^\d{1,3}(?:\.\d{1,3}){3}$/.test(hostname); // 任意 IPv4 直连（公网/私网/环回/链路本地全拒）
 }
+
+/**
+ * 永久排除名单（Policy §4 红线）：取自主机会永远不再准入的 host 列表。
+ * 匹配方式：精确 hostname 或后缀匹配（`banned.com` 同 `*.banned.com` 一起拒）。
+ *
+ * 硬默认名单：wnreader（历史 22 次复生投放源——Vercel cron 每 6h + admission timer 每 :17 复写）
+ * 追加 via 环境变量 SHUYUAN_PERMANENT_DISABLE（分号分隔，支持 `api.xxx.com` 或 `xxx.com`）。
+ *
+ * 判定层只在 entry-point admission 候选筛选 + merge-url 入池两处使用；
+ * 不重删既有 source_admission 行（由池合成侧按 disabled_at 落终态）。
+ */
+const DEFAULT_PERMANENT_DISABLE_HOSTS = ['api.wnreader.com', 'wnreader.com'] as const;
+
+interface PermanentDisableCache {
+  hosts: ReadonlySet<string>;
+  suffixes: readonly string[];
+  builtAt: number;
+}
+
+let permanentDisableCache: PermanentDisableCache | null = null;
+
+function parsePermanentDisableEnv(env: NodeJS.ProcessEnv = process.env): string[] {
+  const raw = env.SHUYUAN_PERMANENT_DISABLE;
+  if (typeof raw !== 'string' || raw.trim().length === 0) return [];
+  return raw
+    .split(/[;,]/)
+    .map((token) => token.trim().toLowerCase())
+    .filter((token) => token.length > 0)
+    .filter((token) => !token.includes('/') && !token.includes(':') && !token.startsWith('['))
+    .filter((token) => {
+      try { return new URL(`https://${token}`).hostname === token; } catch { return false; }
+    });
+}
+
+function permanentDisableHostsCache(env: NodeJS.ProcessEnv = process.env): PermanentDisableCache {
+  if (permanentDisableCache && permanentDisableCache.builtAt >= 0) return permanentDisableCache;
+  const extra = parsePermanentDisableEnv(env);
+  const hosts = new Set<string>(DEFAULT_PERMANENT_DISABLE_HOSTS);
+  for (const h of extra) hosts.add(h);
+  // 同时加 suffix 形态：wnreader.com → 也匹  api.wnreader.com / sub.wnreader.com
+  const suffixes: string[] = [];
+  for (const h of hosts) suffixes.push(`.${h}`);
+  permanentDisableCache = { hosts, suffixes, builtAt: Date.now() };
+  return permanentDisableCache;
+}
+
+/** 命中即入的名单本身（供 shuyuan.ts 在每次 refresh 时随行挂 probeSnapshot.permanentDisable.hosts 观测用）。 */
+export function permanentDisableHostList(): string[] {
+  return [...permanentDisableHostsCache().hosts].sort();
+}
+
+/** url 是否命中永久排除名单（读侧调用前先做 URL 解析，host 取 lowercase+去尾点）。
+ * 只认 https：其它 scheme（ftp:、file:、javascript:…）不属于「来源 URL」，一律当未命中，
+ * 保持与 validateAdmissionUrl / validateSourceUrl 的 scheme 线一致。 */
+export function isPermanentlyDisabledUrl(url: string): boolean {
+  let hostname: string;
+  let protocol: string;
+  try {
+    const parsed = new URL(url);
+    if (parsed.protocol !== 'https:') return false;
+    hostname = parsed.hostname.toLowerCase().replace(/\.$/, '');
+    protocol = parsed.protocol;
+  } catch { return false; }
+  void protocol; // 仅供未来调试/审计扩展（当前不计入 suffix 判断）
+  const { hosts, suffixes } = permanentDisableHostsCache();
+  if (hosts.has(hostname)) return true;
+  return suffixes.some((suffix) => hostname.endsWith(suffix));
+}

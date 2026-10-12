@@ -260,8 +260,16 @@ describe('refreshShuyuan atomic refresh', () => {
     });
     const meta = queries[queries.length - 1];
     expect(meta.text).toMatch(/^UPDATE shuyuan_meta SET collections = \?::jsonb, refreshed_at = now\(\) WHERE id = 1$/);
+    // permblock42：首条 collection 的 probeSnapshot 新增 permanentDisable.hosts mirror（硬默认名单）。
     expect(JSON.parse(meta.values[0] as string)).toEqual(collections.map((collection, i) =>
-      i === 0 ? { ...collection, probeSnapshot: { version: 1, entries: [] } } : collection));
+      i === 0 ? {
+        ...collection,
+        probeSnapshot: {
+          version: 1,
+          entries: [],
+          permanentDisable: { hosts: ['api.wnreader.com', 'wnreader.com'] },
+        },
+      } : collection));
     // 6 次读 + 1 次 claim + 5 句空准入批次判权事务（含源快照锁）。
     expect(execute).toHaveBeenCalledTimes(12);
     expect(transaction.mock.calls[0][1]?.fetchOptions?.signal).toBeInstanceOf(AbortSignal);
