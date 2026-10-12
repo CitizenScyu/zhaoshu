@@ -2,7 +2,7 @@ import { getSql } from '@/lib/db';
 import { engineHosts, normalizeUrlSql } from '@/lib/supported-sources-server';
 import { isRecord } from '@/lib/sanitize';
 import { createDeadline, raceDeadline, type RequestDeadline } from '@/lib/deadline';
-import { validateSourceUrl, refreshSupportedHosts, supportedHostList, supportedHostVersion, upgradeSourceTemplateUrl } from '@/lib/source-policy';
+import { validateSourceUrl, refreshSupportedHosts, supportedHostList, supportedHostVersion, upgradeSourceTemplateUrl, isForbiddenHostAddress } from '@/lib/source-policy';
 import { engineSourceUsable } from '@/lib/source-usability';
 import {
   BUILTIN_SOURCE_HOSTS, builtinUrlPrefixes,
@@ -34,6 +34,45 @@ export type { ShuyuanAvailability };
 export const INDEX_URL = 'https://www.yckceo.com/yuedu/shuyuans/index.html';
 const jsonUrl = (id: number) => `https://www.yckceo.com/yuedu/shuyuans/json/id/${id}.json`;
 export const LATEST_COUNT = 3; // 只跟最新 3 个合集
+// srcfeed：额外上游合集直链（分号分隔；仅存「裸 JSON 数组」链接：直接 fetch 解析为 bookSource 数组）。
+// 缺省/空白项/非法 URL（非 https）一律丢弃 ⇒ 缺省值下与「仅 yckceo」逐字同行为（零行为变化门禁）。
+// 例：shidahuilang good.json、aoaostar legado 每日镜像（取值只进 .env，不进代码）。
+export const SHUYUAN_MAX_EXTRA_FEEDS = 8;
+
+// srcfeed：feed 失败条目的统一形状（reason 已脱敏为 host 级，见 safeReason 同款纪律）。
+export type ExtraFeedFailure = { feed: string; reason: string };
+
+/**
+ * 解析 SHUYUAN_EXTRA_FEEDS：分号分隔、trim、去空白项；每项必须是规范 https URL——
+ * 这里拦的只是一眼非法的 env 错填（协议非 https 或 URL 无法解析），**不替代**源级门卫
+ * （源地址入池后照旧过 validateSourceUrl/checkSourceUrl 同一把锁，feed 端 host 白名单靠
+ * fetchText 的 redirect 白名单约束跳转方向、靠环境侧只填已知上游约束内容来源）。
+ * 缺失/全空 ⇒ [] ⇒ 缺省行为逐字不变。
+ */
+export function shuyuanExtraFeeds(
+  env: Record<string, string | undefined> = process.env,
+): { urls: string[]; invalid: string[] } {
+  const raw = env.SHUYUAN_EXTRA_FEEDS;
+  if (!raw) return { urls: [], invalid: [] };
+  const urls: string[] = [];
+  const invalid: string[] = [];
+  for (const item of raw.split(';')) {
+    const url = item.trim();
+    if (!url) continue;
+    let parsed: URL;
+    try { parsed = new URL(url); } catch { invalid.push(url); continue; }
+    // feed 本身只允许 https（不含 userinfo / 非 443 / 裸 IP——这几类是源级门卫的口径，
+    // 这里只做协议层粗筛，防止把 http/ftp 等一眼错认的条目放进拉取列表）。
+    if (parsed.protocol !== 'https:' || parsed.username !== '' || parsed.password !== ''
+        || parsed.port !== '' || isForbiddenHostAddress(parsed.hostname)) {
+      invalid.push(url);
+      continue;
+    }
+    if (!urls.includes(url)) urls.push(url);
+    if (urls.length >= SHUYUAN_MAX_EXTRA_FEEDS) break;
+  }
+  return { urls, invalid };
+}
 const PROBE_TIMEOUT_MS = 8_000;
 const PROBE_CONCURRENCY = 10;
 // 连续探测失败达到该次数，才把源写成 failed（failed 会被 getReadingSources 剔除，退出取书可用集）。
@@ -1349,6 +1388,89 @@ export class ShuyuanRefreshPartialError extends Error {
   }
 }
 
+// srcfeed：跨上游合并的版本取舍。「版本戳」取 legado 源自身的 lastUpdateTime（毫秒时间戳）。
+// position 是合并管线给的「序列号」（0=yckceo 恒赢，>0=feed 起始位），随条目并列保存在
+// merged Map 的 value 元组里——**不写进源 JSON 本体**：source 落库后会被对比（sameRules）与
+// 下发给阅读/准入，注入键会让「上次拉取结果 ≠ 本轮重新拉取结果」误判为规则变化（源被整批
+// 置 pending）。因此元数据只在合并内存中存活。
+type PoolVersion = { stamp: number; position: number };
+function sourceVersion(item: Record<string, unknown>, position: number): PoolVersion {
+  const stampValue = item.lastUpdateTime;
+  const stamp = typeof stampValue === 'number' && Number.isFinite(stampValue) ? stampValue : 0;
+  return { stamp, position: Number.isSafeInteger(position) && position >= 0 ? position : Number.MAX_SAFE_INTEGER };
+}
+/** 全序：stamp 不相等且都 >0 ⇒ 新者胜；其余（含相等/缺失）⇒ position 大的（后出现者）胜；yckceo(0) 恒压正位。 */
+export function incomingWins(incoming: PoolVersion, existing: PoolVersion): boolean {
+  if (incoming.stamp > 0 && existing.stamp > 0 && incoming.stamp !== existing.stamp) {
+    return incoming.stamp > existing.stamp;
+  }
+  return incoming.position > existing.position;
+}
+
+/**
+ * srcfeed：把一条 feed 解析结果合入去重表。返回本 feed 实际入选（写入/覆盖）的条数，
+ * 供 meta collections 数组记「净贡献」而不是原始条数。
+ * 源条目形状过滤与 yckceo 完全一致：isRecord + bookSourceUrl 是 string + normalizeUrl 非空
+ * + cleanJson 入表——JSON 原样落 shuyuan_sources.source（下游准入/探测的 validateSourceUrl
+ * /checkSourceUrl/upgradeSourceTemplateUrl 三级门不改、照常生效）。
+ * positionBase = 合并序列中本 feed 起始位置（yckceo 占 0..LATEST_COUNT-1，extra feed 顺延，
+ * 永远为正且位于 yckceo 之后），保证 id 唯一、序有意义。
+ */
+function mergeIntoPool(merged: Map<string, [Record<string, unknown>, number]>, parsed: unknown[], positionBase: number): number {
+  let wins = 0;
+  for (const item of parsed) {
+    if (!isRecord(item) || typeof item.bookSourceUrl !== 'string') continue;
+    const url = normalizeUrl(item.bookSourceUrl);
+    if (!url) continue;
+    const cleaned = cleanJson(item);
+    if (!isRecord(cleaned)) continue;
+    const existing = merged.get(url);
+    if (!existing) { merged.set(url, [cleaned, positionBase]); wins += 1; continue; }
+    if (!incomingWins(sourceVersion(cleaned, positionBase), sourceVersion(existing[0], existing[1]))) continue; // 旧的让新的
+    merged.set(url, [cleaned, positionBase]); // 较新版 或 无法比较时后到者胜
+    wins += 1;
+  }
+  return wins;
+}
+
+// srcfeed：额外 feed 拉取结果转入 meta 时，feed URL 一律只留「host/文件名」形态——
+// 完整路径可能带上游签名/查询串，绝不让它原样进 shuyuan_meta（会随 /api/shuyuan 回显）。
+export function feedLabelOf(url: string): string {
+  const parsed = new URL(url);
+  const segments = parsed.pathname.split('/').filter(Boolean);
+  return segments.length > 0 ? `${parsed.hostname}/${segments.at(-1)}` : parsed.hostname;
+}
+
+/**
+ * srcfeed：额外 feed 直链拉取。每条裸 JSON 数组直链一次 fetch（内层超时与 yckceo 合集同为
+ * RESPONSE_TIMEOUT_MS），串行处理（并发 2 的收益抵不上与「并发竞态 + 预算止损」交叉的复杂度，
+ * 单 feed 12s × 上限 8 条最坏 96s，仍在 180s 预算内容纳——报告「主会话待办」提了放量选项）。
+ * 任一 feed 失败只跳过该 feed：返回 failures 供 meta 记一行结构化 error，绝不中止刷新。
+ * feed url 只记 feedLabel 与 host 级 reason（safeReason 同款纪律：不回显整链，防带签名 URL 进日志/库）。
+ */
+async function fetchExtraFeeds(
+  feeds: readonly string[], signal: AbortSignal, assertActive: () => void,
+): Promise<{ results: { feed: string; items: unknown[] }[]; failures: ExtraFeedFailure[] }> {
+  const results: { feed: string; items: unknown[] }[] = [];
+  const failures: ExtraFeedFailure[] = [];
+  for (const feed of feeds) {
+    assertActive();
+    const label = feedLabelOf(feed);
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(await fetchText(feed, RESPONSE_TIMEOUT_MS, signal));
+      // fetch 层中止（信号）原样上抛——中止是刷新级语义，不归入「单个 feed 失败跳过」；
+      // 但解析阶段的 SyntaxError/类型不符是 feed 内容坏，同样只跳过本轮这条 feed。
+      if (!Array.isArray(parsed)) throw new Error('合集 JSON 不是数组');
+      results.push({ feed: label, items: parsed }); // 入表的是脱敏 label，不是原链
+    } catch (error) {
+      assertActive(); // 中止/预算耗尽不解释为 feed 失败，原样上抛终止刷新
+      failures.push({ feed: label, reason: safeReason(error) });
+    }
+  }
+  return { results, failures };
+}
+
 // 固定合集拉取、规则核对、有限探测和写回共用原有预算（现 180s，见 REFRESH_BUDGET_MS）。
 export async function refreshShuyuan(parentSignal?: AbortSignal): Promise<ShuyuanStats> {
   const budget = createDeadline(REFRESH_BUDGET_MS);
@@ -1363,11 +1485,19 @@ export async function refreshShuyuan(parentSignal?: AbortSignal): Promise<Shuyua
 async function refreshWithinBudget(s: Sql, budget: RequestDeadline, signal: AbortSignal): Promise<ShuyuanStats> {
   const assertActive = () => { signal.throwIfAborted(); budget.assert(); };
   assertActive();
+  // srcfeed：额外 feed 只从 env 读一次；缺省（原始无 / 解析后全空）⇒ 本路径全短路，
+  // extraFeedFailures 恒空，meta 断言与「仅 yckceo」逐字一致（零行为变化门禁）。
+  const { urls: extraFeeds, invalid: extraInvalid } = shuyuanExtraFeeds();
+  // env 错填（非 https / 解析失败）不作为 feed 失败参与降级中止，但要把「这批条目被丢弃」
+  // 记进 meta——缺省与全合法时本数组长 0（剥离后与改前逐字节一致）。
+  const extraFeedFailures: ExtraFeedFailure[] = extraInvalid.map((raw) => ({
+    feed: feedLabelOf(raw), reason: 'env 条目非法：非 https 或无法解析',
+  }));
   const html = await fetchText(INDEX_URL, RESPONSE_TIMEOUT_MS * 2, signal);
   const entries = parseIndex(html);
   if (entries.length === 0) throw new Error('书源列表页解析到 0 个合集，页面结构可能变了');
 
-  const merged = new Map<string, Record<string, unknown>>();
+  const merged = new Map<string, [Record<string, unknown>, number]>();
   const collections: ShuyuanCollection[] = [];
   // 失败合集的原因归类，只用于降级告警：上游整体不可达时要说清「拉了哪些、为什么没拿到」。
   const collectionFailures: { id: number; reason: string }[] = [];
@@ -1388,9 +1518,14 @@ async function refreshWithinBudget(s: Sql, budget: RequestDeadline, signal: Abor
     for (const item of parsed) {
       if (!isRecord(item) || typeof item.bookSourceUrl !== 'string') continue;
       const url = normalizeUrl(item.bookSourceUrl);
-      if (!url || merged.has(url)) continue;
+      if (!url) continue;
       const cleaned = cleanJson(item);
-      if (isRecord(cleaned)) merged.set(url, cleaned);
+      if (!isRecord(cleaned)) continue;
+      // yckceo 令牌 position=0：恒压一切 extra feed（正数位）；同合集间冲突由 lastUpdateTime 判新旧。
+      const existing = merged.get(url);
+      if (!existing) { merged.set(url, [cleaned, 0]); continue; }
+      if (!incomingWins(sourceVersion(cleaned, 0), sourceVersion(existing[0], existing[1]))) continue;
+      merged.set(url, [cleaned, 0]);
     }
     collections.push({ id: entry.id, title: entry.title, count: parsed.length });
   }
@@ -1418,6 +1553,25 @@ async function refreshWithinBudget(s: Sql, budget: RequestDeadline, signal: Abor
     throw partial;
   }
 
+  // srcfeed：yckceo 判全过之后才接额外 feed——判据先于拉取，保证「yckceo 半挂 ⇒ 中止」不被
+  // extra feed 拉取耗时稀释（烧预算）也不被 extra feed 结果翻转（中止语义只挂在 yckceo 上）。
+  // 缺省（extraFeeds=[]）时本块整体短路：零 fetch、零 meta 变化。
+  const extraFailures: { feed: string; reason: string }[] = [];
+  if (extraFeeds.length > 0) {
+    const { results, failures } = await fetchExtraFeeds(extraFeeds, signal, assertActive);
+    extraFailures.push(...failures);
+    for (const [index, result] of results.entries()) {
+      assertActive();
+      const wins = mergeIntoPool(merged, result.items, LATEST_COUNT + index + 1);
+      collections.push({
+        id: LATEST_COUNT + index + 1,
+        title: `feed:${feedLabelOf(result.feed)}`,
+        count: wins, // 净贡献（去重后实际入选条数），而不是原始条数
+      });
+    }
+  }
+  extraFeedFailures.push(...extraFailures); // env 错填行 + 本轮 fetch/解析失败行合并进 meta
+
   const previousRows = await readRows<StoredSource>(s, s`
     SELECT source_url, last_error, source, disabled_at::text AS disabled_at FROM shuyuan_sources`, signal);
   const previous = new Map(previousRows.map((row) => [row.source_url, row]));
@@ -1441,7 +1595,8 @@ async function refreshWithinBudget(s: Sql, budget: RequestDeadline, signal: Abor
   // 落在 probes/discovery 之后：pending backlog（生产 944）无论多大都不能饿死已知失败源的重探。
   const pendingReprobe: string[] = [];
   let pendingSlots = PROBE_PENDING_PER_REFRESH;
-  for (const [url, item] of merged) {
+  for (const [url, pair] of merged) {
+    const item = pair[0]; // 合并 value 是 [cleaned, position] 元组；position 只在合并在内存存活（不落 source）
     const old = previous.get(url);
     if (old && !sameRules(old.source, item)) {
       // 规则变了：旧的结论和连续失败计数一起作废，退回待核验。
@@ -1507,19 +1662,24 @@ async function refreshWithinBudget(s: Sql, budget: RequestDeadline, signal: Abor
   await Promise.all(Array.from({ length: Math.min(PROBE_CONCURRENCY, probes.length) }, () => probeWorker()));
   assertActive();
 
-  const rows = [...merged.entries()].map(([url, item]) => ({
+  const rows = [...merged.entries()].map(([url, pair]) => { const item = pair[0]; return {
     url, name: typeof item.bookSourceName === 'string' ? item.bookSourceName : '',
     grp: typeof item.bookSourceGroup === 'string' ? item.bookSourceGroup : '', source: item,
     disabled_at: previous.get(url)?.disabled_at ?? null,
     err: previous.get(url)?.last_error || probeFailures.get(url) || '',
-  }));
+  }; });
   const insertChunk = (chunk: typeof rows) => s`
     INSERT INTO shuyuan_sources (source_url, name, group_name, source, disabled_at, last_error)
     SELECT url, name, grp, source, disabled_at, err
     FROM jsonb_to_recordset(${JSON.stringify(chunk)}::jsonb)
     AS t(url text, name text, grp text, source jsonb, disabled_at timestamptz, err text)`;
+  // srcfeed：extra feed 失败降级挂在首条 yckceo collection（与 probeSnapshot 同位，读侧只认
+  // isRecord/既有键 ⇒ 新键对外不可见且不破坏既有解析；feed 字段已是 feedLabelOf 的 host/文件名
+  // 形态）。缺省时本三元运算恒 undefined⇒剥离，serialized value 与改前逐字节一致。
   const savedCollections = collections.map((collection, i) => i === 0 ? {
-    ...collection, probeSnapshot: { version: 1, entries: [...states.values()] },
+    ...collection,
+    probeSnapshot: { version: 1, entries: [...states.values()] },
+    ...(extraFeedFailures.length > 0 ? { extraFeedFailures } : {}),
   } : collection);
   const updateMeta = s`
     UPDATE shuyuan_meta
