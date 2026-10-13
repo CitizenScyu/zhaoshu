@@ -1348,8 +1348,14 @@ export async function runAdmissionBatch(input: AdmissionBatchInput): Promise<Adm
         // admrunner42：runner 探得干净 ok 时打 okPrefix（phoenix_ok:，池外待 Vercel 确认）。例外：该源已是
         // Vercel 确认过的在池行（search_ok=true、无 phoenix_ok: 前缀、规则未变）——runner 的复核 ok 不能把
         // 在池源踢出池，保留原 error（干净 ok 仍干净；带 recheck_fail: strike 的仍留 strike，由 Vercel 定夺）。
+        // phnx-payload42：okPrefix 拼 hash 短尾（`1:abcdef…` → `phoenix_ok:abcdef12`）使横行驻留时可见规则版本；
+        // 旧行（裸 phoenix_ok:）与所有 startsWith 判据（planProbeOrder / isRetestDue / recheckOutcome /
+        // challengeError / shuyuan.ts `error LIKE 'phoenix_ok:%'`）对 payload 追加仍保持兼容。Vercel 复测
+        // 洗白走 `outcome.error = ''` 或保留 strike，覆盖整段 error，不依赖匹配。
         if (input.okPrefix && outcome.search_verdict === 'ok' && outcome.error === '') {
-          outcome.error = isVercelConfirmedOk(item.previous, item.hash) ? item.previous!.error : input.okPrefix;
+          outcome.error = isVercelConfirmedOk(item.previous, item.hash)
+            ? item.previous!.error
+            : `${input.okPrefix}${item.hash.slice(2, 10)}`;
         }
         // 41-srcfix 改法1：challenge 结论带 strike 计数（有限复测的上限判据，见 challengeStrikes）。
         if (outcome.search_verdict === 'challenge') {

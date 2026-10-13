@@ -1526,12 +1526,19 @@ describe('准入状态机 runAdmissionBatch', () => {
     it('b) 传 okPrefix ⇒ ok 行 error=前缀（search_ok/verdict 照常），失败行不带前缀，其余字段与不传时逐字相同', async () => {
       const plain = await batch();
       const prefixed = await batch({ okPrefix: ADMISSION_PHOENIX_OK_PREFIX });
+      // phnx-payload42：runner okPrefix 拼 rules_hash 短尾（`1:abcdef…` → `phoenix_ok:abcdef12`）；
+      // 所有 startsWith 判据对追加兼容。规则已知的 hash 短尾列在断言里显式出现，作为对 startsWithη 覆盖。
+      const { rulesHash } = await import('./admission');
+      const hashTail = rulesHash(source).slice(2, 10);
       expect(prefixed.rows.map((row) => [row.source_url, row.search_ok, row.search_verdict, row.error])).toEqual([
-        [url, true, 'ok', ADMISSION_PHOENIX_OK_PREFIX],
+        [url, true, 'ok', `${ADMISSION_PHOENIX_OK_PREFIX}${hashTail}`],
         [deadUrl, false, 'http_5xx', '500'],
       ]);
       // 只有 ok 行的 error 不同，其它字段（tier/hash/version/host/checked_at…）逐字一致。
       expect(prefixed.rows.map((row) => ({ ...row, error: row.source_url === url ? '' : row.error }))).toEqual(plain.rows);
+      // 与裸 phoenix_ok: 之间的长度差恒为 8（hash 40 hex 取 2..9）；用于让「追加」这一事实可被静态锚定。
+      expect(hashTail.length).toBe(8);
+      expect(prefixed.rows[0]?.error).toMatch(/^phoenix_ok:[0-9a-f]{8}$/);
     });
 
     it('b2) runner 复核 Vercel 已确认的在池 ok 行：探得 ok 保留原 error（不打前缀把在池源踢出池）', async () => {
@@ -1558,7 +1565,12 @@ describe('准入状态机 runAdmissionBatch', () => {
         candidates: [{ url, source }], existing: new Map([[url, changed]]), okPrefix: ADMISSION_PHOENIX_OK_PREFIX,
         fetchPage: okPage(),
       });
-      expect(rehash.rows[0]).toMatchObject({ search_ok: true, search_verdict: 'ok', error: ADMISSION_PHOENIX_OK_PREFIX });
+      // phnx-payload42：规则变化的复测走 hash 短尾形态（裸 phoenix_ok: 只是旧路径留简名，现带 payload）。
+      const { rulesHash } = await import('./admission');
+      expect(rehash.rows[0]).toMatchObject({
+        search_ok: true, search_verdict: 'ok',
+        error: `${ADMISSION_PHOENIX_OK_PREFIX}${rulesHash(source).slice(2, 10)}`,
+      });
       // runner 对在池 ok 行探失败：与 Vercel 同款 recheck_fail: strike（不出池）。
       const struck = await batch({
         candidates: [{ url, source }], existing: new Map([[url, cleanOk]]), okPrefix: ADMISSION_PHOENIX_OK_PREFIX,
