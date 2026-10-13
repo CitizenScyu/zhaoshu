@@ -47,7 +47,7 @@ import {
   ADMISSION_LEASE_ROW, ADMISSION_LEASE_TTL_MS, ADMISSION_ROUND_BUDGET_MS, REFRESH_BUDGET_MS,
   admissionLeaseTtlMs, admissionOwnCronEnabled, refreshShuyuan, runAdmissionRound, runAdmissionRunnerRound,
 } from './shuyuan';
-import { ADMISSION_PHOENIX_OK_PREFIX, ADMISSION_PROBE_WORST_MS } from './rule-engine/admission';
+import { ADMISSION_PHOENIX_OK_PREFIX, ADMISSION_PROBE_WORST_MS, rulesHash } from './rule-engine/admission';
 import * as poolArtifact from './pool-artifact';
 
 const WRITE_RESERVE_MS = 5_000; // shuyuan.ts 同名常量（未导出）；止损门 = 剩余 > 单探最坏 + 写库预留
@@ -201,7 +201,9 @@ describe('runAdmissionRunnerRound（phoenix runner）', () => {
     const insert = queries().find((query) => query.text.includes('INSERT INTO source_admission'))!;
     const rows = JSON.parse(insert.values[2] as string) as { source_url: string; search_ok: boolean | null; search_verdict: string; error: string }[];
     const byUrl = Object.fromEntries(rows.map((row) => [row.source_url, row]));
-    expect(byUrl['https://dead0.example/']).toMatchObject({ search_ok: true, search_verdict: 'ok', error: ADMISSION_PHOENIX_OK_PREFIX });
+// phnx-payload42：ok 行 error = phoenix_ok: + rulesHash 短尾（slice(2,10)，见 admission.ts okPrefix 拼接）。
+    expect(byUrl['https://dead0.example/']).toMatchObject({ search_ok: true, search_verdict: 'ok', error: `${ADMISSION_PHOENIX_OK_PREFIX}${rulesHash(deadSource(0)).slice(2, 10)}` });
+    expect(byUrl['https://dead0.example/'].error).toMatch(/^phoenix_ok:[0-9a-f]{8}$/);
     expect(byUrl['https://dead1.example/']).toMatchObject({ search_ok: false, search_verdict: 'conn_fail' });
     expect(byUrl['https://dead1.example/'].error.startsWith(ADMISSION_PHOENIX_OK_PREFIX)).toBe(false);
     // 不发布产物：没有产物生成的库读（shuyuan_meta 投影），收尾行 artifact='skipped'、trigger='runner'。
