@@ -627,6 +627,10 @@ async function engineReadingSources(
     .sort((a, b) => probeRank(states, b.source_url) - probeRank(states, a.source_url)
       || tierRank(a.tier) - tierRank(b.tier)
       || checkedAtMs(b.search_checked_at) - checkedAtMs(a.search_checked_at)
+      // hostbucket42：前面 §2.4 三键（probe/tier/checked_at）全等时，host_ok_score_24h 降序作 tie-break：
+      // 同 host 最近 24h 至少有 non-phnx 干净 ok 副本的源排前（同 host 全 phnx/全失败/从未合规各归位同分）。
+      // 分相等（0/0 或 1/1）时落回 url 升序 —— 不会改变任何一对前三键已形成严格差的源对, 只打同分双打。
+      || (b.host_ok_score_24h ?? 0) - (a.host_ok_score_24h ?? 0)
       || a.source_url.localeCompare(b.source_url))
     .map((row) => ({
       url: validateSourceUrl(upgradeSourceTemplateUrl(row.source_url)).href,
@@ -645,6 +649,11 @@ async function engineReadingSources(
 /** 引擎候选行：shuyuan_sources JOIN source_admission ok 态；池合成与产物生成共用同一查询。
  * admrunner42：phoenix_ok: 行（runner 探 ok、Vercel 未确认）不入池——谓词与 supported-sources.ts engineHosts、
  * readAdmissionFunnel 的 ok 桶同款。
+ * hostbucket42：LEFT JOIN source_admission 24h 聚合(host_ok_score_24h)——「同 host 最近 24h 内是否有 non-phnx 干净 ok」
+ *   二值分。只在 eligibleReadingSources.TS 侧排序用作 tie-break（probe → tier → checked_at → host_ok_score → url），
+ *   列本身只读透传、不参与 WHERE/JOIN 谓词 → 现网读池条目不增减，只是排序微调（§2.4 前 3 键全等时由它断同）。
+ *   pg 侧聚合按本查询时间窗重算，产物缓存 36h 窗口内会带到下次刷新（Vercel 06:00 cron）才过期——可接受，
+ *   此窗正是 hostbucket 想要的「最近 24h 干净 ok」语义的一部分；排序键等价物即 admittedAt 情况不变。
  * urlfix：JOIN 条件从纯字符串等值放宽为「精确等值 OR（归一化等值 AND 同条目判据 AND 供判行是旧形态孤儿）」：
  *   - 归一化等值：两侧 URL 形态不同（#/#🎃 后缀）时仍能配上；
  *   - 同条目判据 `norm(src.source->>'bookSourceUrl') = norm(a.source_url)`：admission 结论必须来自**本条目**的
@@ -655,8 +664,16 @@ async function engineReadingSources(
  * LATERAL + LIMIT 1 保证每条规则行至多配一条 admission 行（同 host 新旧键并存时**精确等值优先**），不膨胀。 */
 function readEngineRows(s: Sql, signal?: AbortSignal, includePhoenixOk = false): Promise<PoolArtifactEngineRow[]> {
   return readRows<PoolArtifactEngineRow>(s, s`
+    WITH recent_per_url AS (
+      SELECT source_url,
+             MAX(CASE WHEN search_ok AND error NOT LIKE 'phoenix_ok:%' THEN 1 ELSE 0 END)::int AS has_clean_recent
+      FROM source_admission
+      WHERE search_checked_at > NOW() - INTERVAL '24 hours'
+      GROUP BY source_url
+    )
     SELECT src.source_url, src.name, src.source, src.disabled_at::text AS disabled_at, src.last_error,
-           a.tier, a.search_checked_at::text AS search_checked_at
+           a.tier, a.search_checked_at::text AS search_checked_at,
+           COALESCE(recent_per_url.has_clean_recent, 0) AS host_ok_score_24h
     FROM shuyuan_sources src
     JOIN LATERAL (
       SELECT ad.tier, ad.search_checked_at
@@ -672,6 +689,7 @@ function readEngineRows(s: Sql, signal?: AbortSignal, includePhoenixOk = false):
       ORDER BY (ad.source_url = src.source_url) DESC, ad.search_checked_at DESC NULLS LAST
       LIMIT 1
     ) a ON true
+    LEFT JOIN recent_per_url ON recent_per_url.source_url = src.source_url
     ORDER BY src.source_url`, signal);
 }
 

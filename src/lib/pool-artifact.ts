@@ -29,6 +29,10 @@ export interface PoolArtifactSourceRow {
 export interface PoolArtifactEngineRow extends PoolArtifactSourceRow {
   tier: string;
   search_checked_at: string | null;
+  // hostbucket42：host 级 24h 活跃分（同 host 去重后区分「最近 24h 仍有至少一条 non-phnx 干净 ok 副本」）。
+  // **向后兼容的可选字段**：旧产物缺字段时消费侧按 0 读（`?? 0`），排序退化为现状全序；
+  // 新产物恒由 SQL 生成 0/1（COALESCE 后 int4）。
+  host_ok_score_24h?: number;
 }
 
 export interface PoolArtifactBody {
@@ -98,8 +102,11 @@ function isSourceRow(row: unknown): row is PoolArtifactSourceRow {
 
 function isEngineRow(row: unknown): row is PoolArtifactEngineRow {
   if (!isSourceRow(row)) return false;
-  const { tier, search_checked_at: checkedAt } = row as Partial<PoolArtifactEngineRow>;
-  return typeof tier === 'string' && (checkedAt === null || typeof checkedAt === 'string');
+  const { tier, search_checked_at: checkedAt, host_ok_score_24h: score } =
+    row as Partial<PoolArtifactEngineRow>;
+  // hostbucket42：host_ok_score_24h 向后兼容——允许缺失（旧产物，消费侧按 0 读）或为非负有限 number。
+  return typeof tier === 'string' && (checkedAt === null || typeof checkedAt === 'string')
+    && (score === undefined || (typeof score === 'number' && Number.isFinite(score) && score >= 0));
 }
 
 /** 形状与版本校验（不含新鲜度）。 */
