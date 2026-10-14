@@ -3,8 +3,7 @@ import { mkdirSync, readFileSync, writeFileSync, renameSync, existsSync, openSyn
 import { resolve, join } from 'node:path';
 import { setTimeout as pause } from 'node:timers/promises';
 import { canonicalBookKey } from '../src/lib/book-identity.ts';
-import { knownSourceAuthor, sourceBookMatches } from '../src/lib/source-parser.ts';
-import { foldTraditional } from '../src/lib/zh-variant-fold.ts';
+import { sourceBookMatches } from '../src/lib/source-parser.ts';
 import { fetchSourceText, sourceAbortable } from '../src/lib/source-fetch.ts';
 
 const hash = value => createHash('sha256').update(value).digest('hex');
