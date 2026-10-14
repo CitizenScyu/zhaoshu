@@ -211,6 +211,41 @@ maybe('v7 下载队列：迁移、幂等入队与租约 fencing', () => {
     expect(await finishDownloadTask(sql as never, lease!, { status: 'done' })).toBe(false);
   });
 
+  // 41-zombieocc：reclaim 同时清掉 task 已非 running 的僵尸占用行——worker 硬终止后
+  // closeScope 的 finally 不执行，占用行只能等 TTL（最长 ~6h），期间该 host 所有任务
+  // 连环 host_occupied。活跃占位（task 仍 running）与 prefetch（task_id NULL）不动。
+  it('41-zombieocc reclaim：清僵尸 host 占用，保留活跃占用与 prefetch 占位', async () => {
+    // 僵尸任务的占位行：任务刚被上面路径置 failed 前先造一个独立僵尸（running + 心跳超时）。
+    const [{ id: zombieId }] = (await pg.query(
+      `INSERT INTO download_tasks(user_id, book_id, title, author, status, source_url, requested_by, enqueue_key, updated_at)
+       VALUES (NULL, 91, 'zombie occ', '作者甲', 'running', 'https://z.example/1', 'system', '91:z:', now() - interval '2 hours') RETURNING id`,
+    )).rows as { id: number }[];
+    // 活跃任务占用的 host：running 且心跳新鲜。
+    const [{ id: aliveId }] = (await pg.query(
+      `INSERT INTO download_tasks(user_id, book_id, title, author, status, source_url, requested_by, enqueue_key, updated_at)
+       VALUES (NULL, 92, 'alive occ', '作者甲', 'running', 'https://a.example/1', 'system', '92:a:', now()) RETURNING id`,
+    )).rows as { id: number }[];
+    await pg.query(`CREATE TABLE IF NOT EXISTS download_host_occupancy (
+      host text PRIMARY KEY, holder text NOT NULL, kind text NOT NULL,
+      task_id integer, claimed_at timestamptz NOT NULL DEFAULT now(),
+      expires_at timestamptz NOT NULL DEFAULT now())`);
+    await pg.query(`INSERT INTO download_host_occupancy(host, holder, kind, task_id, expires_at)
+      VALUES ('zombie.test', 'h1', 'download', $1, now() + interval '2 hours'),
+             ('alive.test', 'h2', 'download', $2, now() + interval '2 hours'),
+             ('scan.test', 'h3', 'prefetch', NULL, now() + interval '30 seconds')`,
+      [zombieId, aliveId]);
+    await reclaimStaleTasks(sql as never);
+    // 僵尸行已清（任务被 reclaim 置 failed ⇒ 占位行随之消失）。
+    expect(await pg.query('SELECT host FROM download_host_occupancy ORDER BY host')).toMatchObject({
+      rows: [
+        { host: 'alive.test' },
+        { host: 'scan.test' },
+      ],
+    });
+    expect((await pg.query('SELECT status FROM download_tasks WHERE id = $1', [zombieId])).rows[0])
+      .toMatchObject({ status: 'pending' });
+  });
+
   // B2-03：崩溃在发布中途的 system 任务没有人替它点重试，reclaim 必须把它放回队列（有界、退避、fencing）。
   async function staleSystemTask(bookId: number, attemptCount: number) {
     const [{ id }] = (await pg.query(
