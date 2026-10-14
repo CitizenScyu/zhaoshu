@@ -117,6 +117,32 @@ describe('引擎源完整 URL 解析', () => {
     expect(result.source).toBe(h.alternate);
   });
 
+  // 41-cnresolve：任务 URL 带语言/版块前缀（noveltri 形态 /zh-cn/book/…）时，
+  // 匹配序 = 精确 URL > 最长前缀源（同版块）> host 兜底。判别力：删掉前缀匹配即命中 zh-tw 主源失败。
+  it('同 host 分版源：任务 URL 的最长前缀源优先于 host 兜底首项（noveltri zh-cn/zh-tw）', async () => {
+    const tw = { url: 'https://source.example', name: 'tw', searchUrl: '/zh-tw/search', rules: {} };
+    const cn = { url: 'https://source.example/zh-cn', name: 'cn', searchUrl: '/zh-cn/search', rules: {} };
+    // 池序与 DB 一致：zh-tw 主源在前。
+    const pool = [tw, cn];
+    const modules = {
+      supported: { isRetiredBuiltinHost: vi.fn(() => false), builtinSourceForHost: vi.fn(() => null) },
+      policy: { refreshSupportedHosts: vi.fn(), alternateSourceHost: vi.fn(() => undefined) },
+      shuyuan: {
+        getDownloadPoolEngineHosts: vi.fn(async () => ['source.example']),
+        getDownloadEngineSources: vi.fn(async () => pool),
+        getPoolEngineHosts: vi.fn(async () => ['source.example']),
+        getEngineSources: vi.fn(async () => pool),
+      },
+    };
+    const resolve = createResolveSource(modules as unknown as EngineModules);
+    const result = await resolve(null, 'https://source.example/zh-cn/book/abc.html', new AbortController().signal);
+    expect(result.source).toBe(cn);
+    expect(result.builtin).toBe(false);
+    // 无前缀命中时仍走 host 兜底（首项），既有行为不变。
+    const fallback = await resolve(null, 'https://source.example/read/other.html', new AbortController().signal);
+    expect(fallback.source).toBe(tw);
+  });
+
   it('HTTPS 和退休门仍先于池加载，内建源仍先于引擎精确匹配', async () => {
     const h = resolverFixture();
     const signal = new AbortController().signal;

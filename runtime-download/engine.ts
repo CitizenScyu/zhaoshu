@@ -84,6 +84,19 @@ function findSourceByHost(m: EngineModules, sources: ReadingSourceLike[], host: 
   });
 }
 
+// 41-cnresolve：任务 URL 带站内语言/版块前缀（noveltri /zh-cn/book/…）而池里同 host 有多行源
+// （第 1 行 /zh-tw 搜索模板、第 2 行 /zh-cn）时，host 兜底会命中第 1 行——zh-tw 搜简体书名恒空，
+// 该书在这一源下永远不可达。精确 URL 匹配失败后先选**池中 url 是任务 URL 前缀的最长一条**
+// （= 与任务 URL 同版块的源），再落 host 兜底；不引入任何新 host（只在同 host 内重排）。
+function findSourceByLongestPrefix(sources: ReadingSourceLike[], url: string): ReadingSourceLike | undefined {
+  let best: ReadingSourceLike | undefined;
+  let bestLen = -1;
+  for (const s of sources) {
+    if (s.url && url.startsWith(s.url) && s.url.length > bestLen) { best = s; bestLen = s.url.length; }
+  }
+  return best;
+}
+
 /**
  * resolveSource(m, url, signal)：engine-download 的源解析接缝。
  * 返回 { source, builtin }；builtin=true 时 downloadBook 走 book15 source-parser 分支。
@@ -115,7 +128,10 @@ export function createResolveSource(m: EngineModules) {
       // 池不可用（DB 不可达等）：code=2，「没尝试成抓取」，与引擎 CLI 同档。
       throw new ResolveSourceError(2, 'engine_source_pool_unavailable');
     }
-    const source = pool.find(candidate => candidate.url === url) ?? findSourceByHost(m, pool, host);
+    // 匹配序（41-cnresolve）：精确 URL > 同 host 最长前缀（zh-cn/zh-tw 分版源各归各位） > host 兜底。
+    const source = pool.find(candidate => candidate.url === url)
+      ?? findSourceByLongestPrefix(pool, url)
+      ?? findSourceByHost(m, pool, host);
     if (!source) throw new ResolveSourceError(1, 'no_engine_source_for_host');
     return { source, builtin: false };
   };
