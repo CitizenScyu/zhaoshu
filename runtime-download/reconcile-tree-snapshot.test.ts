@@ -99,7 +99,7 @@ describe('captureTreeSnapshot (frozen git tree snapshot, no I/O)', () => {
     });
     const res = await captureTreeSnapshot({ target }, p);
     expect(res).toMatchObject({ status: 'tree_snapshot' });
-    const entries = (res as { entries: { path: string }[] }).entries;
+    const entries = (res as unknown as { entries: { path: string }[] }).entries;
     expect(entries.map(e => e.path)).toEqual(['txt/a.txt', 'txt/b.txt']); // 去重 + 排序
   });
 
@@ -164,7 +164,7 @@ describe('captureTreeSnapshot (frozen git tree snapshot, no I/O)', () => {
     });
     const res = await captureTreeSnapshot({ target }, p);
     expect(res).toMatchObject({ status: 'tree_snapshot' });
-    const entries = (res as { entries: { path: string; kind: string; size?: number }[] }).entries;
+    const entries = (res as unknown as { entries: { path: string; kind: string; size?: number }[] }).entries;
     const byPath = Object.fromEntries(entries.map(e => [e.path, e]));
     expect(byPath['txt/a.txt'].kind).toBe('regular-blob');
     expect(byPath['txt/a.txt'].size).toBe(5);

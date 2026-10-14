@@ -185,7 +185,7 @@ function isValidEntry(value: unknown): value is InventoryBookEntry {
     isCanonicalPath(e.canonicalPath) &&
     isContentId(e.blobSha) &&
     typeof e.logicalTxtBytes === 'bigint' &&
-    e.logicalTxtBytes >= 0n
+    e.logicalTxtBytes >= BigInt(0)
   );
 }
 
@@ -315,7 +315,7 @@ export function previewReconciliationInventory(
 
   // 8. 确定性集合运算：remote−registered 为未登记集合；重叠不双计；logicalTxtBytes 只求去重后 remote 总和。
   const registeredPaths = new Set(registered.map((e) => e.canonicalPath));
-  let logicalTxtBytes = 0n;
+  let logicalTxtBytes = BigInt(0);
   for (const r of remote) logicalTxtBytes += r.logicalTxtBytes;
   const overlapPaths = registered.map((e) => e.canonicalPath);
   const unregisteredPaths = remote

@@ -40,6 +40,37 @@ import { fileURLToPath } from 'node:url';
 
 const scriptsDir = dirname(fileURLToPath(import.meta.url));
 const repoRoot = dirname(scriptsDir);
+const selfPath = fileURLToPath(import.meta.url);
+
+// ---------------------------------------------------------------------------
+// 【capacity992】VM 模块 flag 自举。
+// scripts/runtime-download-template.test.mjs 用 node:vm 的 SourceTextModule / SyntheticModule,
+// 这两个导出**只在 `--experimental-vm-modules` flag 下存在**。本 runner 用 node:test 的
+// `run({ files })` API 在本进程内加载测试文件;进程不带该 flag 时,文件 import 即抛错,
+// 该文件汇总静默丢失 → fail-closed 判红(即本次 push 被拦的现象)。
+// CI 跑的正是 `npm run test:scripts`,改 CI 易漏(本地 / pre-push 钩子 / CI 三处要同步),
+// 故在这里自举:进程缺 flag 时以带 flag 的形态重启自身一次,子进程带同一份 argv 继续,
+// `run({ files })` 其余逻辑零变化。
+// 判定用 `process.execArgv`(Node 启动时实际生效的 flag)而非 process.argv——重启传的 flag
+// 会进入子进程的 execArgv,可被再次检出;「本来就没 flag」与「用户已手带 flag」两条路径都正确。
+// ---------------------------------------------------------------------------
+const VM_MODULES_FLAG = '--experimental-vm-modules';
+if (!process.execArgv.includes(VM_MODULES_FLAG)) {
+  const restarted = spawnSync(
+    process.execPath,
+    [...process.execArgv, VM_MODULES_FLAG, selfPath],
+    { stdio: 'inherit' },
+  );
+  if (restarted.error) {
+    console.error(
+      `✖ scripts runner 无法以 ${VM_MODULES_FLAG} 重启自身(${restarted.error.message})。\n` +
+        '  runtime-download-template.test.mjs 用 node:vm 的 SourceTextModule,缺该 flag 时无法加载,故 fail-closed。',
+    );
+    process.exit(1);
+  }
+  // 透传子进程退出码;被信号终止(status === null)按失败计,保持 fail-closed。
+  process.exit(restarted.status === null ? 1 : restarted.status);
+}
 
 // 下限常量:新增 .test.mjs 时**不需要**改这里;只有删除或改名导致数量掉到 4 以下才触发,
 // 而那正是这条门要拦的情况。4 = 接入时的既有文件数(backfill_authors / import_labels /

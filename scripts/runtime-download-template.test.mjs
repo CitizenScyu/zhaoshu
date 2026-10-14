@@ -115,15 +115,15 @@ async function harness(mode, { dummy = false, failAt, readyError, limiterError }
   await executor.link(() => { throw new Error('unexpected executor import'); });
   await executor.evaluate();
   const generated = wireDownloadExecutor(template);
-  const module = new SourceTextModule(generated, { context,
+  const generatedModule = new SourceTextModule(generated, { context,
     async importModuleDynamically(specifier) {
       assert.equal(specifier, '../executor/executor.mjs');
       return executor;
     },
   });
-  await module.link(() => { throw new Error('unexpected static import'); });
-  await module.evaluate();
-  return { start: () => module.namespace.main(), calls, failure,
+  await generatedModule.link(() => { throw new Error("unexpected static import"); });
+  await generatedModule.evaluate();
+  return { start: () => generatedModule.namespace.main(), calls, failure,
     counts: () => ({ constructions, executorCalls, budgetConsumed }),
     options: () => memoryOptions, exitCode: () => context.process.exitCode };
 }

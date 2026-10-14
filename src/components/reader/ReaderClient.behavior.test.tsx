@@ -141,6 +141,12 @@ describe('本地阅读保存状态恢复', () => {
     const apiFetch = vi.fn(async (input: RequestInfo | URL) => {
       const url = String(input);
       calls.push(url);
+      // T66 反馈入口：save() 落过本机进度后 readTrace 变真，组件会后台 GET /api/feedback
+      // 查线上反馈状态（ReaderClient.tsx:166-175）。路由之并回合法空快照（version 0、
+      // 无状态、无备注）——只查状态，不应有写请求；不 mock 会落进 unexpected。
+      if (url.startsWith('/api/feedback')) {
+        return json({ current: { version: 0, status: null, note: '' } });
+      }
       if (url === '/api/read/42/index') return json(catalog({
         taskId: 42, source: undefined, totalBytes: 8,
         chapters: [
@@ -169,11 +175,11 @@ describe('本地阅读保存状态恢复', () => {
       await waitFor(() => expect(screen.queryByText(/保存失败，暂时无法记住。/)).toBeNull());
     };
     const save = () => fireEvent(window, new Event('pagehide'));
-    const changeFont = (label: string) => fireEvent.click(screen.getByRole('button', { name: label, exact: true }));
+    const changeFont = (label: string) => fireEvent.click(screen.getByRole('button', { name: label }));
     try {
       mocks.owner = ownerWith(apiFetch);
       render(createElement(ReaderClient, { session: { kind: 'download', taskId: 42 }, from: 'library' }));
-      await screen.findByRole('heading', { name: '第一章', exact: true });
+      await screen.findByRole('heading', { name: '第一章' });
       save();
       await waitFor(() => expect(values.has(progressKey)).toBe(true));
 
@@ -187,7 +193,7 @@ describe('本地阅读保存状态恢复', () => {
       expect(writes.slice(beforeRecovery).some(write => write.key === progressKey && !write.failed)).toBe(true);
       expect(JSON.parse(values.get(progressKey)!)).toMatchObject({ version: 'v1', chapterIndex: 0 });
 
-      fireEvent.click(screen.getByRole('button', { name: /设置$/, exact: false }));
+      fireEvent.click(screen.getByRole('button', { name: /设置$/ }));
       failSettings = true;
       changeFont('宋体');
       await expectWarning('设置');
@@ -206,10 +212,10 @@ describe('本地阅读保存状态恢复', () => {
       changeFont('文楷');
       await expectWarning('阅读进度与设置');
       fireEvent.click(screen.getByRole('button', { name: '关闭阅读设置' }));
-      const next = screen.getByRole('button', { name: '下一章 →', exact: true });
+      const next = screen.getByRole('button', { name: '下一章 →' });
       expect((next as HTMLButtonElement).disabled).toBe(false);
       fireEvent.click(next);
-      await screen.findByRole('heading', { name: '第二章', exact: true });
+      await screen.findByRole('heading', { name: '第二章' });
       expect(calls).toContain('/api/read/42/chapter?chapter=1&part=0&version=v1');
       await expectWarning('阅读进度与设置');
 
@@ -218,7 +224,7 @@ describe('本地阅读保存状态恢复', () => {
       await expectWarning('设置');
       expect(JSON.parse(values.get(progressKey)!)).toMatchObject({ version: 'v1', chapterIndex: 1 });
       failSettings = false;
-      fireEvent.click(screen.getByRole('button', { name: /设置$/, exact: false }));
+      fireEvent.click(screen.getByRole('button', { name: /设置$/ }));
       changeFont('宋体');
       await expectClear();
       expect(JSON.parse(values.get(settingsKey)!)).toMatchObject({ font: 'serif' });

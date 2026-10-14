@@ -155,10 +155,10 @@ function isManifestCanonicalPath(value: unknown): value is string {
 
 function validTarget(t: unknown): t is TreeTarget {
   return isObj(t)
-    && isPosInt((t as TreeTarget).repositoryId)
-    && isSafeText((t as TreeTarget).owner)
-    && isSafeText((t as TreeTarget).repo)
-    && isSafeText((t as TreeTarget).branch);
+    && isPosInt((t as unknown as TreeTarget).repositoryId)
+    && isSafeText((t as unknown as TreeTarget).owner)
+    && isSafeText((t as unknown as TreeTarget).repo)
+    && isSafeText((t as unknown as TreeTarget).branch);
 }
 
 function sameTarget(a: TreeTarget, b: TreeTarget): boolean {

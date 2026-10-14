@@ -146,7 +146,7 @@ const SQL_STATUSES: ReadonlySet<string> = new Set([
 
 const isPosInt = (value: unknown): value is number =>
   typeof value === 'number' && Number.isSafeInteger(value) && value > 0;
-const isNonNegBig = (value: unknown): value is bigint => typeof value === 'bigint' && value >= 0n;
+const isNonNegBig = (value: unknown): value is bigint => typeof value === 'bigint' && value >= BigInt(0);
 const nonEmptyStr = (value: unknown): value is string =>
   typeof value === 'string' && value.length > 0 && !value.includes('\0');
 
@@ -224,7 +224,7 @@ function freezeOriginal(original: VerifiedOriginalIdentity): VerifiedOriginalIde
 function validateOriginal(original: VerifiedOriginalIdentity): void {
   if (!isPosInt(original.repositoryId) || !nonEmptyStr(original.branch)
     || !nonEmptyStr(original.logicalTxtScope)
-    || !(typeof original.targetBytes === 'bigint' && original.targetBytes > 0n)
+    || !(typeof original.targetBytes === 'bigint' && original.targetBytes > BigInt(0))
     || !isNonNegBig(original.registeredBytes)
     || !nonEmptyStr(original.reconciliationVersion) || !nonEmptyStr(original.occupancyProofDigest)
     || !nonEmptyStr(original.barrierRef) || !nonEmptyStr(original.fingerprint)
@@ -235,7 +235,7 @@ function validateOriginal(original: VerifiedOriginalIdentity): void {
   }
   for (const r of original.activeReservations) {
     if (!nonEmptyStr(r.requestKey) || (r.state !== 'reserved' && r.state !== 'uncertain')
-      || !(typeof r.logicalBytes === 'bigint' && r.logicalBytes > 0n)) {
+      || !(typeof r.logicalBytes === 'bigint' && r.logicalBytes > BigInt(0))) {
       throw new ArtifactCapacityError('INVALID_CAPACITY_INPUT', 'malformed original active reservation');
     }
   }
@@ -409,7 +409,7 @@ async function runReconcileTransaction(
           CASE WHEN NOT input_active_empty OR db_active_n > 0 THEN 'active_reservations_present'
                WHEN NOT (activation_granted AND activation_target_ok AND admission_time_ok) THEN
                     (CASE WHEN activation_granted THEN 'admission_invalid' ELSE activation_reject END)
-               WHEN repo_ok = 0 THEN 'repository_not_writable'
+               WHEN NOT repo_ok THEN 'repository_not_writable'
                WHEN (update_ok + insert_ok) = 1 THEN 'initialized'
                ELSE NULL END
         -- F4：ready 分支只比不可变原始身份，先于仓可写/准入/屏障/活动，零写、不续准入。
@@ -423,7 +423,7 @@ async function runReconcileTransaction(
           CASE WHEN NOT input_active_empty OR db_active_n > 0 THEN 'active_reservations_present'
                WHEN NOT (activation_granted AND activation_target_ok AND admission_time_ok) THEN
                     (CASE WHEN activation_granted THEN 'admission_invalid' ELSE activation_reject END)
-               WHEN repo_ok = 0 THEN 'repository_not_writable'
+               WHEN NOT repo_ok THEN 'repository_not_writable'
                WHEN (update_ok + insert_ok) = 1 THEN 'initialized'
                ELSE NULL END
         WHEN existing_state = 'uninitialized' THEN 'binding_conflict'

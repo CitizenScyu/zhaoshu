@@ -54,7 +54,7 @@ function controlledSource(originalVerdict: OriginalVerification, activation: Cur
 function original(over: Partial<VerifiedOriginalIdentity> = {}): VerifiedOriginalIdentity {
   return {
     repositoryId: 1, branch: 'release/a', logicalTxtScope: 'txt/v1',
-    targetBytes: 100n, registeredBytes: 0n, activeReservations: [],
+    targetBytes: BigInt(100), registeredBytes: BigInt(0), activeReservations: [],
     reconciliationVersion: 'v1', occupancyProofDigest: 'sha:abc',
     admissionBinding: { version: 'adm-1', target: { repositoryId: 1, branch: 'release/a' } },
     barrierRef: 'bar-1', fingerprint: 'fp-1',
@@ -118,15 +118,15 @@ describe('reconcileInitialization: real local Postgres SQL vectors (draft, unrun
   }
 
   const ledgerRow = async (): Promise<Record<string, unknown>> =>
-    (await pg.query('SELECT * FROM repository_capacity_ledger WHERE repository_id=1')).rows[0];
+    (await pg.query('SELECT * FROM repository_capacity_ledger WHERE repository_id=1')).rows[0] as Record<string, unknown>;
   const ledgerCount = async (): Promise<number> =>
-    Number((await pg.query('SELECT count(*)::int AS n FROM repository_capacity_ledger')).rows[0].n);
+    Number(((await pg.query('SELECT count(*)::int AS n FROM repository_capacity_ledger')).rows[0] as Record<string, unknown>).n);
 
   const run = (originalVerdict: OriginalVerification, activation: CurrentActivation | null) =>
     reconcileInitialization(sql as never, controlledSource(originalVerdict, activation), INPUT);
 
   it('1: absent ledger + valid admission + trusted empty occupancy → initialized; exactly one ready row', async () => {
-    const res = await run({ status: 'verified', original: original({ targetBytes: 100n, registeredBytes: 0n, fingerprint: 'fp-1' }) }, granted());
+    const res = await run({ status: 'verified', original: original({ targetBytes: BigInt(100), registeredBytes: BigInt(0), fingerprint: 'fp-1' }) }, granted());
     expect(res).toEqual({ status: 'initialized' });
     expect(await ledgerCount()).toBe(1);
     const row = await ledgerRow();
@@ -142,7 +142,7 @@ describe('reconcileInitialization: real local Postgres SQL vectors (draft, unrun
   });
 
   it('1b: registered total is written verbatim (nonzero)', async () => {
-    const res = await run({ status: 'verified', original: original({ targetBytes: 1_000_000n, registeredBytes: 12345n }) }, granted());
+    const res = await run({ status: 'verified', original: original({ targetBytes: BigInt(1_000_000), registeredBytes: BigInt(12345) }) }, granted());
     expect(res).toEqual({ status: 'initialized' });
     const row = await ledgerRow();
     expect(Number(row.target_bytes)).toBe(1_000_000);
@@ -165,7 +165,7 @@ describe('reconcileInitialization: real local Postgres SQL vectors (draft, unrun
 
   it('3: matching uninitialized → legal first update; drifted old target/binding → conflict, value unchanged', async () => {
     await seedLedger({ state: 'uninitialized', targetBytes: 100, epoch: 'fp-1', admissionStatus: 'unknown', admissionTarget: null });
-    expect(await run({ status: 'verified', original: original({ fingerprint: 'fp-1', targetBytes: 100n }) }, granted()))
+    expect(await run({ status: 'verified', original: original({ fingerprint: 'fp-1', targetBytes: BigInt(100) }) }, granted()))
       .toEqual({ status: 'initialized' });
     let row = await ledgerRow();
     expect(row.state).toBe('ready');
@@ -174,7 +174,7 @@ describe('reconcileInitialization: real local Postgres SQL vectors (draft, unrun
     // 旧 target 漂移：不放宽，原值不变（保存调用前实际行，冲突后相等）。
     await pg.exec(`UPDATE repository_capacity_ledger SET state='uninitialized', target_bytes=999, baseline_epoch='fp-1', admission_target=NULL WHERE repository_id=1`);
     const beforeTargetDrift = await ledgerRow();
-    expect(await run({ status: 'verified', original: original({ fingerprint: 'fp-1', targetBytes: 100n }) }, granted()))
+    expect(await run({ status: 'verified', original: original({ fingerprint: 'fp-1', targetBytes: BigInt(100) }) }, granted()))
       .toEqual({ status: 'binding_conflict' });
     row = await ledgerRow();
     expect(row.state).toBe('uninitialized');
@@ -185,7 +185,7 @@ describe('reconcileInitialization: real local Postgres SQL vectors (draft, unrun
     // 旧 admission_target 绑到别的目标：同样冲突，且**实际原 admission_target 不变**。
     await pg.exec(`UPDATE repository_capacity_ledger SET state='uninitialized', target_bytes=100, baseline_epoch='fp-1', admission_target='{"repositoryId":2,"branch":"release/b"}'::jsonb WHERE repository_id=1`);
     const beforeBindDrift = await ledgerRow();
-    expect(await run({ status: 'verified', original: original({ fingerprint: 'fp-1', targetBytes: 100n }) }, granted()))
+    expect(await run({ status: 'verified', original: original({ fingerprint: 'fp-1', targetBytes: BigInt(100) }) }, granted()))
       .toEqual({ status: 'binding_conflict' });
     row = await ledgerRow();
     expect(row.state).toBe('uninitialized');
@@ -240,7 +240,7 @@ describe('reconcileInitialization: real local Postgres SQL vectors (draft, unrun
   it('5a: first activation with non-empty input activity → reject, no activate (no DB activity)', async () => {
     // 输入原始活动非空（DB 无预留）。
     expect(await run(
-      { status: 'verified', original: original({ activeReservations: [{ requestKey: 'req-i', state: 'reserved', logicalBytes: 3n }] }) },
+      { status: 'verified', original: original({ activeReservations: [{ requestKey: 'req-i', state: 'reserved', logicalBytes: BigInt(3) }] }) },
       granted(),
     )).toEqual({ status: 'active_reservations_present' });
     expect(await ledgerCount()).toBe(0);
@@ -254,11 +254,11 @@ describe('reconcileInitialization: real local Postgres SQL vectors (draft, unrun
        VALUES ('req-res', 1, 'id-res', $1, 1, 'release/a', 'books/res.txt', 7, 'reserved', 'svc', 3, 1)`,
       [SHA_A],
     );
-    const before = (await pg.query(`SELECT * FROM artifact_capacity_reservations WHERE request_key='req-res'`)).rows[0];
+    const before = (await pg.query(`SELECT * FROM artifact_capacity_reservations WHERE request_key='req-res'`)).rows[0] as Record<string, unknown>;
     expect(await run({ status: 'verified', original: original() }, granted()))
       .toEqual({ status: 'active_reservations_present' });
     expect(await ledgerCount()).toBe(0); // 账未激活
-    const after = (await pg.query(`SELECT * FROM artifact_capacity_reservations WHERE request_key='req-res'`)).rows[0];
+    const after = (await pg.query(`SELECT * FROM artifact_capacity_reservations WHERE request_key='req-res'`)).rows[0] as Record<string, unknown>;
     expect(after.state).toBe('reserved');                                     // 原状态
     expect(Number(after.logical_bytes)).toBe(Number(before.logical_bytes));   // 原逻辑字节
     expect(after.repository_id).toBe(before.repository_id);                   // 目标归属
@@ -274,11 +274,11 @@ describe('reconcileInitialization: real local Postgres SQL vectors (draft, unrun
        VALUES ('req-unc', 1, 'id-unc', $1, 1, 'release/a', 'books/unc.txt', 9, 'uncertain', 'svc', 4, 1)`,
       [SHA_A],
     );
-    const before = (await pg.query(`SELECT * FROM artifact_capacity_reservations WHERE request_key='req-unc'`)).rows[0];
+    const before = (await pg.query(`SELECT * FROM artifact_capacity_reservations WHERE request_key='req-unc'`)).rows[0] as Record<string, unknown>;
     expect(await run({ status: 'verified', original: original() }, granted()))
       .toEqual({ status: 'active_reservations_present' });
     expect(await ledgerCount()).toBe(0);
-    const after = (await pg.query(`SELECT * FROM artifact_capacity_reservations WHERE request_key='req-unc'`)).rows[0];
+    const after = (await pg.query(`SELECT * FROM artifact_capacity_reservations WHERE request_key='req-unc'`)).rows[0] as Record<string, unknown>;
     expect(after.state).toBe('uncertain');
     expect(Number(after.logical_bytes)).toBe(Number(before.logical_bytes));
     expect(after.repository_id).toBe(before.repository_id);

@@ -49,14 +49,14 @@ const bodyThrow = (error: unknown) => stubSql(text => { if (text.includes(LOCK_T
 
 const binding = {
   requestKey: 'req-1', labeledBookId: 1, identityKey: 'id-a', blobSha: 'a'.repeat(40),
-  repositoryId: 1, branch: 'release/a', canonicalPath: 'books/x.txt', logicalBytes: 60n,
+  repositoryId: 1, branch: 'release/a', canonicalPath: 'books/x.txt', logicalBytes: BigInt(60),
 };
 const lease = { taskId: 7, owner: 'service-100', generation: 3 };
 const input = {
   binding, lease, accountingEpoch: 'epoch-1', admissionVersion: 'adm-1',
 };
 const proof: CompletionEvidence = {
-  repositoryId: 1, branch: 'release/a', canonicalPath: 'books/x.txt', blobSha: 'a'.repeat(40), logicalBytes: 60n,
+  repositoryId: 1, branch: 'release/a', canonicalPath: 'books/x.txt', blobSha: 'a'.repeat(40), logicalBytes: BigInt(60),
 };
 
 describe('input validation (system boundary)', () => {
@@ -64,7 +64,7 @@ describe('input validation (system boundary)', () => {
     const { sql } = bodyVerdict([]);
     await expect(reserveCapacityAndPath(sql, { ...input, binding: { ...binding, blobSha: 'xyz' } }))
       .rejects.toMatchObject({ code: 'INVALID_CAPACITY_INPUT' });
-    await expect(reserveCapacityAndPath(sql, { ...input, binding: { ...binding, logicalBytes: 0n } }))
+    await expect(reserveCapacityAndPath(sql, { ...input, binding: { ...binding, logicalBytes: BigInt(0) } }))
       .rejects.toMatchObject({ code: 'INVALID_CAPACITY_INPUT' });
     await expect(reserveCapacityAndPath(sql, { ...input, binding: { ...binding, requestKey: '' } }))
       .rejects.toMatchObject({ code: 'INVALID_CAPACITY_INPUT' });

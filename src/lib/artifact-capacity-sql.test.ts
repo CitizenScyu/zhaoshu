@@ -46,7 +46,7 @@ function boundary(respond: (index: number, stmt: Stmt) => Row[]) {
 
 const binding = {
   requestKey: 'req-1', labeledBookId: 1, identityKey: 'id-a', blobSha: 'a'.repeat(40),
-  repositoryId: 1, branch: 'release/a', canonicalPath: 'books/x.txt', logicalBytes: 60n,
+  repositoryId: 1, branch: 'release/a', canonicalPath: 'books/x.txt', logicalBytes: BigInt(60),
 };
 const lease = { taskId: 7, owner: 'service-100', generation: 3 };
 const input = { binding, lease, accountingEpoch: 'epoch-1', admissionVersion: 'adm-1' };

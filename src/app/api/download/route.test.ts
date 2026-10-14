@@ -11,11 +11,33 @@ const { ensureSchema, getSql, sql, triggerDownloadWorkflow } = vi.hoisted(() => 
 vi.mock('@/lib/db', () => ({ ensureSchema, getSql }));
 vi.mock('@/lib/github', () => ({ triggerDownloadWorkflow }));
 vi.mock('@/lib/shuyuan', () => ({
+  getBuiltinRequestSource: vi.fn<(host: string, signal: AbortSignal) => Promise<import('@/lib/shuyuan').ReadingSource | null>>(),
   getEngineSources: vi.fn(async () => []),
   getPoolEngineHosts: vi.fn(async () => ['www.yingsx.com']),
 }));
 
-import { getEngineSources } from '@/lib/shuyuan';
+// 只追加活跃合成内建源；真实 book15 条目及退休判定原样保留。
+vi.mock('@/lib/supported-sources', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/lib/supported-sources')>();
+  const synthetic: import('@/lib/supported-sources').SupportedSource = {
+    url: 'https://builtin.test/', name: '合成内建源', searchUrl: '/search?q={{key}}',
+    rules: {}, tier: 'builtin', enabled: true, lifecycle: 'active', retiredReason: null,
+  };
+  const sources = [...actual.BUILTIN_SOURCES, synthetic];
+  const active = () => sources.filter(source => source.lifecycle === 'active' && source.enabled !== false);
+  return {
+    ...actual,
+    BUILTIN_SOURCE_HOSTS: [...actual.BUILTIN_SOURCE_HOSTS, 'builtin.test', 'www.builtin.test'],
+    BUILTIN_SOURCES: sources,
+    activeBuiltinSources: active,
+    activeBuiltinSource: () => active()[0] ?? null,
+    builtinUrlPrefixes: () => sources.map(source => new URL(source.url).origin),
+    builtinSourceForHost: (host: string) => actual.sourceForHostIn(host, sources),
+    isActiveBuiltinHost: (host: string) => actual.isHostActiveInSources(host, sources),
+  };
+});
+
+import { getBuiltinRequestSource, getEngineSources, getPoolEngineHosts } from '@/lib/shuyuan';
 import { refreshSupportedHosts } from '@/lib/source-policy';
 import { DELETE, GET, POST } from './route';
 
@@ -42,12 +64,16 @@ function expectSafeReclaim(index: number) {
   expect(query).toContain('updated_at = now()');
   expect(query).toMatch(/WHERE status = 'running' AND updated_at < now\(\) - \(\?::bigint \* interval '1 millisecond'\)$/);
   expect(sql.mock.calls[index].slice(1)).toEqual([
+    // 退避梯封顶 6h（SOURCE_RETRY_MAX_DELAY_MS，download-task-policy.ts:10）；末位 30min 为 DOWNLOAD_TASK_STALE_MS。
     16, 16, 16, 15 * 60_000, 6 * 60 * 60_000, 16,
     '\nworker 中断自动回收，退避后重新入队', '\nworker 中断自动回收', 30 * 60_000,
   ]);
 }
 
-const book = { id: 7, title: '测试书', author: '作者', source_url: 'https://book15.net/books/details7.html' };
+const book = { id: 7, title: '测试书', author: '作者', source_url: 'https://builtin.test/books/details7.html' };
+const permittedBuiltin = {
+  url: 'https://builtin.test/', name: '合成内建源', searchUrl: '/search?q={{key}}', rules: {}, tier: 'builtin' as const,
+};
 const recoveredTask = {
   id: 42,
   book_id: book.id,
@@ -65,6 +91,13 @@ const recoveredTask = {
 describe('/api/download recovery and cleanup', () => {
   beforeEach(() => {
     vi.resetAllMocks();
+    refreshSupportedHosts([]);
+    vi.mocked(getBuiltinRequestSource).mockImplementation(async (host, signal) => {
+      signal.throwIfAborted();
+      return ['builtin.test', 'www.builtin.test'].includes(host) ? permittedBuiltin : null;
+    });
+    vi.mocked(getEngineSources).mockResolvedValue([]);
+    vi.mocked(getPoolEngineHosts).mockResolvedValue(['www.yingsx.com']);
     vi.stubEnv('APP_OWNER_TOKEN', 'download-test-owner');
     vi.stubEnv('LEGACY_DOWNLOAD_DISPATCH_ENABLED', '1');
     vi.stubGlobal('fetch', vi.fn(() => { throw new Error('Unexpected network request'); }));
@@ -75,6 +108,7 @@ describe('/api/download recovery and cleanup', () => {
   });
 
   afterEach(() => {
+    refreshSupportedHosts([]);
     vi.restoreAllMocks();
     vi.unstubAllGlobals();
     vi.unstubAllEnvs();
@@ -205,6 +239,10 @@ describe('/api/download recovery and cleanup', () => {
     expect(queryText(3)).toMatch(/^INSERT INTO download_tasks /);
     expect(sql.mock.calls[3].slice(1)).toEqual([1, book.id, book.title, book.author, book.source_url, 'builtin', null, '']);
     expect(triggerDownloadWorkflow).toHaveBeenCalledOnce();
+    expect(getBuiltinRequestSource).toHaveBeenCalledTimes(1);
+    expect(getBuiltinRequestSource).toHaveBeenCalledWith('builtin.test', expect.any(AbortSignal));
+    expect(getEngineSources).not.toHaveBeenCalled();
+    expect(fetch).not.toHaveBeenCalled();
   });
 
   it('still refuses to enqueue a duplicate active task and returns its taskId and status', async () => {
@@ -305,21 +343,50 @@ describe('/api/download recovery and cleanup', () => {
   });
 
   it('规范化书库 HTTPS 地址入队，忽略客户端自报地址', async () => {
-    sql.mockResolvedValueOnce([{ ...book, source_url: 'https://BOOK15.NET:443/books/details7.html#chapters' }])
+    sql.mockResolvedValueOnce([{ ...book, source_url: 'https://BUILTIN.TEST:443/books/details7.html#chapters' }])
       .mockResolvedValueOnce([]).mockResolvedValueOnce([]).mockResolvedValueOnce([{ id: 43 }]);
     expect((await POST(request('POST', { bookId: book.id, sourceUrl: 'https://127.0.0.1/private' }))).status).toBe(201);
     expect(sql.mock.calls[3].slice(1)).toEqual([1, book.id, book.title, book.author, book.source_url, 'builtin', null, '']);
     expect(triggerDownloadWorkflow).toHaveBeenCalledOnce();
   });
 
-  it('enqueues a www.book15.net source, mirroring the reading-side allowlist', async () => {
-    // www 是同站备用 host（阅读侧与 worker 侧 policy 已同步放行），书库存量 www 来源照常入队。
-    const wwwUrl = 'https://www.book15.net/books/details7.html';
+  it('enqueues a registered active www builtin alias', async () => {
+    const wwwUrl = 'https://www.builtin.test/books/details7.html';
     sql.mockResolvedValueOnce([{ ...book, source_url: wwwUrl }])
       .mockResolvedValueOnce([]).mockResolvedValueOnce([]).mockResolvedValueOnce([{ id: 43 }]);
     expect((await POST(request('POST', { bookId: book.id }))).status).toBe(201);
     expect(sql.mock.calls[3].slice(1)).toEqual([1, book.id, book.title, book.author, wwwUrl, 'builtin', null, '']);
     expect(triggerDownloadWorkflow).toHaveBeenCalledOnce();
+  });
+
+  it.each(['book15.net', 'www.book15.net'])('退休来源 %s 拒绝，书记录读取后不写任务或 dispatch', async (host) => {
+    sql.mockResolvedValueOnce([{ ...book, source_url: `https://${host}/books/details7.html` }]);
+    const res = await POST(request('POST', { bookId: book.id }));
+    expect(res.status).toBe(400);
+    expect(await res.json()).toEqual({ error: '该来源暂不支持全书下载', code: 'UNSUPPORTED_SOURCE' });
+    expect(sql).toHaveBeenCalledOnce();
+    expect(queryText(0)).toContain('FROM labeled_books');
+    expect(getBuiltinRequestSource).not.toHaveBeenCalled();
+    expect(getEngineSources).not.toHaveBeenCalled();
+    expect(getPoolEngineHosts).not.toHaveBeenCalled();
+    expect(triggerDownloadWorkflow).not.toHaveBeenCalled();
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it('活跃 builtin 公共许可为 null 时拒绝，不回收/去重/入队/dispatch', async () => {
+    vi.mocked(getBuiltinRequestSource).mockResolvedValueOnce(null);
+    sql.mockResolvedValueOnce([book]);
+    const res = await POST(request('POST', { bookId: book.id }));
+    expect(res.status).toBe(400);
+    expect(await res.json()).toEqual({ error: '该来源暂不支持全书下载', code: 'UNSUPPORTED_SOURCE' });
+    expect(getBuiltinRequestSource).toHaveBeenCalledTimes(1);
+    expect(getBuiltinRequestSource).toHaveBeenCalledWith('builtin.test', expect.any(AbortSignal));
+    expect(sql).toHaveBeenCalledOnce();
+    expect(queryText(0)).toContain('FROM labeled_books');
+    expect(getEngineSources).not.toHaveBeenCalled();
+    expect(getPoolEngineHosts).not.toHaveBeenCalled();
+    expect(triggerDownloadWorkflow).not.toHaveBeenCalled();
+    expect(fetch).not.toHaveBeenCalled();
   });
 
   it('T6：引擎档 host 虽准入但已不在可用池，被下载能力门拒绝，不回收/去重/入队/dispatch', async () => {

@@ -108,7 +108,7 @@ describe('parseFixedBookManifestCandidate (fixed single-book manifest candidate,
       volumeContentVerified: false, logicalInventoryVerified: false,
       activationEligible: false, repositoryInventoryComplete: false,
     });
-    const out = res as { volumes: { snapshotPath: string }[]; observedUnclassifiedEntries: { path: string }[] };
+    const out = res as unknown as { volumes: { snapshotPath: string }[]; observedUnclassifiedEntries: { path: string }[] };
     expect(out.volumes.map((v) => v.snapshotPath)).toEqual([
       'books/.snapshots/stem-abc/v-11111111.txt', 'books/.snapshots/stem-abc/v-22222222.txt',
     ]);
@@ -234,10 +234,10 @@ describe('parseFixedBookManifestCandidate (fixed single-book manifest candidate,
       manifestBytes: built.bytes,
     });
     expect(res).toMatchObject({ status: 'fixed_book_manifest_candidate' });
-    const unclassified = (res as { observedUnclassifiedEntries: { path: string; sha: string }[] }).observedUnclassifiedEntries;
+    const unclassified = (res as unknown as { observedUnclassifiedEntries: { path: string; sha: string }[] }).observedUnclassifiedEntries;
     expect(unclassified).toContainEqual(expect.objectContaining({ path: 'books/stem-abc/vol-001.txt', sha: SHA('0') }));
     // manifest 与快照保持一致：声明的快照 SHA 仍为 6。
-    expect((res as { volumes: { declaredBlobSha: string }[] }).volumes[0].declaredBlobSha).toBe(SHA('6'));
+    expect((res as unknown as { volumes: { declaredBlobSha: string }[] }).volumes[0].declaredBlobSha).toBe(SHA('6'));
   });
 
   it('6: history/orphan/other-book/symlink/gitlink stay unclassified; a link used as required reference rejects', () => {
@@ -254,7 +254,7 @@ describe('parseFixedBookManifestCandidate (fixed single-book manifest candidate,
     ];
     const res = parseFixedBookManifestCandidate({ binding: bindingOf({ manifestGitBlobSha: manifestSha }), snapshot: snapshotOf(entries), manifestBytes: built.bytes });
     expect(res).toMatchObject({ status: 'fixed_book_manifest_candidate', repositoryInventoryComplete: false });
-    const paths = (res as { observedUnclassifiedEntries: { path: string }[] }).observedUnclassifiedEntries.map((e) => e.path);
+    const paths = (res as unknown as { observedUnclassifiedEntries: { path: string }[] }).observedUnclassifiedEntries.map((e) => e.path);
     expect(paths).toEqual(expect.arrayContaining([
       'books/.snapshots/stem-abc/v-aaaaaaaa.txt', 'books/stem-abc/vol-001.txt',
       'books/stem-other/index.json', 'books/stem-abc/link', 'books/stem-abc/sub',
@@ -280,7 +280,7 @@ describe('parseFixedBookManifestCandidate (fixed single-book manifest candidate,
     ];
     const res = parseFixedBookManifestCandidate({ binding: bindingOf({ manifestGitBlobSha: manifestSha }), snapshot: snapshotOf(entries), manifestBytes: built.bytes });
     expect(res).toMatchObject({ status: 'fixed_book_manifest_candidate', declaredLogicalTxtBytes: 80 }); // 声明量 80，非 dedup 后的 40
-    const out = res as { volumes: { declaredBlobSha: string }[]; volumeContentVerified: false; logicalInventoryVerified: false };
+    const out = res as unknown as { volumes: { declaredBlobSha: string }[]; volumeContentVerified: false; logicalInventoryVerified: false };
     expect(out.volumes).toHaveLength(2);
     expect(out.volumeContentVerified).toBe(false);
     expect(out.logicalInventoryVerified).toBe(false);
@@ -319,7 +319,7 @@ describe('parseFixedBookManifestCandidate (fixed single-book manifest candidate,
       blobEntry('books/stem-abc/link', SHA('9'), '120000', 'blob', 'symlink'),
     ]);
     expect(res).toMatchObject({ status: 'fixed_book_manifest_candidate' });
-    expect((res as { observedUnclassifiedEntries: { path: string }[] }).observedUnclassifiedEntries.map((e) => e.path))
+    expect((res as unknown as { observedUnclassifiedEntries: { path: string }[] }).observedUnclassifiedEntries.map((e) => e.path))
       .toContain('books/stem-abc/link');
   });
 
@@ -349,8 +349,8 @@ describe('parseFixedBookManifestCandidate (fixed single-book manifest candidate,
     // 事后改动输入原对象，不得污染输出。
     mutableTarget.branch = 'hacked';
     mutableEntry.sha = SHA('9');
-    expect((res as { binding: { target: TreeTarget } }).binding.target.branch).toBe('main');
-    expect((res as { volumes: { snapshot: { sha: string } }[] }).volumes[0].snapshot.sha).toBe(SHA('c'));
-    expect((res as { binding: { target: TreeTarget } }).binding.target).not.toBe(mutableTarget);
+    expect((res as unknown as { binding: { target: TreeTarget } }).binding.target.branch).toBe('main');
+    expect((res as unknown as { volumes: { snapshot: { sha: string } }[] }).volumes[0].snapshot.sha).toBe(SHA('c'));
+    expect((res as unknown as { binding: { target: TreeTarget } }).binding.target).not.toBe(mutableTarget);
   });
 });

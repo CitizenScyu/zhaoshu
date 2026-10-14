@@ -96,10 +96,10 @@ const isGitObjectId = (value: unknown): value is string =>
 /** 目标形状：正安全整数 ID 及非空合法文本（与 962 目标入口一致）。 */
 function validTarget(t: unknown): t is TreeTarget {
   return isObj(t)
-    && isPosInt((t as TreeTarget).repositoryId)
-    && isSafeText((t as TreeTarget).owner)
-    && isSafeText((t as TreeTarget).repo)
-    && isSafeText((t as TreeTarget).branch);
+    && isPosInt((t as unknown as TreeTarget).repositoryId)
+    && isSafeText((t as unknown as TreeTarget).owner)
+    && isSafeText((t as unknown as TreeTarget).repo)
+    && isSafeText((t as unknown as TreeTarget).branch);
 }
 
 function cloneTarget(t: TreeTarget): TreeTarget {
@@ -169,8 +169,8 @@ export async function collectFixedBookManifestCandidate(
   const treePort = (ports as { tree?: unknown }).tree;
   const blobPort = (ports as { blob?: unknown }).blob;
   if (!isObj(treePort) || !isObj(blobPort)) return composition('missing_port');
-  const tree = treePort as GitTreePort;
-  const blob = blobPort as GitHubManifestBlobReader;
+  const tree = treePort as unknown as GitTreePort;
+  const blob = blobPort as unknown as GitHubManifestBlobReader;
   // 固定原函数引用及其 receiver：后续外部替换 ports 字段/方法不影响本次执行目标。
   const getCommitFn = tree.getCommit;
   const getTreeFn = tree.getTree;

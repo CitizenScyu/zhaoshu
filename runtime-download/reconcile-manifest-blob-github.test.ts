@@ -376,6 +376,7 @@ describe('capacity971 组7：异常与 receiver', () => {
     let seen: unknown = null;
     const envelope: GitHubJsonResponse = {
       status: 200,
+      // eslint-disable-next-line @typescript-eslint/no-this-alias -- 测试意图即捕获方法 receiver 以断言 this === envelope
       json(): Promise<unknown> { seen = this; return Promise.resolve({ sha: emptySha, encoding: 'base64', content: '', size: 0 }); },
     };
     const request: GitHubJsonRequest = async () => envelope;

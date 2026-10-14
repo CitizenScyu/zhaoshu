@@ -15,7 +15,7 @@ const CHAPTERS = [
 ] as const;
 const SIGNALS = ['SIGINT', 'SIGTERM'] as const;
 const dirs: string[] = [];
-const originalListeners = new Map<(typeof SIGNALS)[number], ReturnType<typeof process.listeners>>();
+const originalListeners = new Map<(typeof SIGNALS)[number], NodeJS.SignalsListener[]>();
 type Fault = { at: 'search' | 'toc' | 'content'; error: Error };
 type RequestOptions = { signal: AbortSignal; beforeRequest?: (signal: AbortSignal) => Promise<void> };
 
