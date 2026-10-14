@@ -72,8 +72,10 @@ export function checkEnvExample(root) {
     if (!existsSync(path)) return;
     for (const entry of readdirSync(path, { withFileTypes: true })) {
       const full = join(path, entry.name);
-      if (entry.isDirectory() && !['dist', 'node_modules', '.next'].includes(entry.name)) scan(full);
-      else if (entry.isFile() && CODE_EXTENSIONS.test(entry.name)) collect(readFileSync(full, 'utf8'), relative(root, full).split(sep).join('/'));
+      // build/ 是打包产物（runtime-download/build 已 gitignore），点开头文件是本地临时 bundle：
+      // 里面内联了第三方依赖的 env 读取（CI/NO_PROXY/JEST_WORKER_ID…），不是本仓代码的读取键。
+      if (entry.isDirectory() && !['dist', 'build', 'node_modules', '.next'].includes(entry.name)) scan(full);
+      else if (entry.isFile() && !entry.name.startsWith('.') && CODE_EXTENSIONS.test(entry.name)) collect(readFileSync(full, 'utf8'), relative(root, full).split(sep).join('/'));
     }
   }
   for (const directory of ['src', 'scripts', 'runtime-download', 'shuyuan-refresh']) scan(join(root, directory));
