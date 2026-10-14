@@ -145,9 +145,11 @@ function identityTitle(value: string): string {
 
 // 复合题名「书名-作者」（41-suffix，2026-10-14）：打标书库里存在「三体Ⅲ-刘慈欣」「盗墓笔记-南派三叔」这类
 // 「本体名+连字符+作者」的题名，而源站只列本体名「三体Ⅲ」。这不是两本书，两档从严降级（只在精确相等失败后）：
-//   A 后缀 = expected.author（三体Ⅲ-刘慈欣/作者刘慈欣）：剥后缀比本体，作者门照常生效；
-//   B 后缀 = actual.author（盗墓笔记-南派三叔，DB 作者是打标人「稻博、盗墓博物馆」）：书名自带真实作者且与
-//     源站作者相符，本体相等即过——后缀在这里就是作者证据。
+//   A 后缀 = expected.author（三体Ⅲ-刘慈欣/作者刘慈欣）：剥后缀比本体；
+//   B 后缀 = actual.author（盗墓笔记-南派三叔，DB 作者是打标人「稻博、盗墓博物馆」）：后缀即作者证据。
+// A/B 都不得与作者门冲突：源站作者在场且与任务作者、后缀都不同（作者冲突）⇒ 不放宽。A 档在源站
+// 作者缺失（vikbook 形态 og:novel:author 不存在）时也放行——后缀=任务作者是显式作者证据；
+// B 档在源站作者缺失时**不放行**：后缀与任务作者不一致且无第三方核对（副题反例排除不了）。
 // 后缀两档都对不上（「楚留香新传1-借尸还魂」的「借尸还魂」是副题不是作者）不剥，按原严格口径。
 const SUFFIX_AUTHOR_SEPARATOR = /[-—－–]/;
 
@@ -164,17 +166,20 @@ export function sourceBookMatches(expected: SourceBookIdentity, actual: SourceBo
   const actualTitles = [actual.title, ...(actual.alias ? [actual.alias] : [])].map(identityTitle);
   // 作者门：两侧同一套归一（字段修饰剥离 + 一对一繁简折叠），只吸收「同一个名字的不同写法」，不同名字仍判不符。
   const actualAuthor = foldTraditional(knownSourceAuthor(actual.author));
-  const authorOk = !author || author === actualAuthor;
-  if (title && actualTitles.includes(title)) return authorOk;
+  if (title && actualTitles.includes(title)) return !author || author === actualAuthor;
   if (!title) return false;
-  // 41-suffix 降级：expected 是「书名-作者」复合题名时，剥后缀比本体（两档判据见函数头）。
+  // 41-suffix 降级：精确相等失败后，expected 是「书名-作者」复合题名时剥后缀比本体（两档从严判据见函数头）。
   const { body: rawBody, suffix } = splitAuthorSuffix(expected.title);
-  if (!suffix) return false;
-  const suffixKey = foldTraditional(normalizeSourceTitle(suffix));
-  const body = identityTitle(rawBody);
-  if (!body || body === title || !actualTitles.includes(body)) return false;
-  if (authorOk && suffixKey === author) return true; // A：后缀即 expected.author
-  return suffixKey !== '' && suffixKey === actualAuthor; // B：后缀即源站作者
+  const suffixKey = suffix ? foldTraditional(normalizeSourceTitle(suffix)) : '';
+  const body = rawBody === expected.title ? '' : identityTitle(rawBody);
+  if (suffixKey === '' || !body || body === title || !actualTitles.includes(body)) return false;
+  // 作者门未冲突才能走降级（本体名对上后，唯一的排除证据就是作者冲突）：
+  // 源站作者在场且 ≠ 任务作者 ⇒ 同名异书嫌疑，不放宽（副题后缀「借尸还魂」正落这里）。
+  // 源站作者缺失（vikbook 无 og:novel:author）：任务作者未知「佚名」或 ≠ 后缀时，后缀提供了
+  // 任务/源站都没给作者名时的唯一作者证据，本体对上即过；源站作者在场则须后缀与之一致（A/B 档）。
+  if (author && actualAuthor && actualAuthor !== author && actualAuthor !== suffixKey) return false;
+  if (suffixKey === author) return true;  // A：后缀即任务作者，源站作者缺失/一致都已过冲突门——后缀显式自证作者
+  return suffixKey === actualAuthor; // B：后缀即源站作者。源站作者缺失不放行：后缀与任务作者都不足以单独证作者（副题反例无法排除）
 }
 
 // 组合键分隔符：NUL 不出现在归一化后的书名/作者里，避免 'a,b'+'c' 与 'a'+'b,c' 撞键。

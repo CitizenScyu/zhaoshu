@@ -70,10 +70,14 @@ describe('supported source parser', () => {
   it('41-suffix 复合题名：后缀=任务作者或源站作者 ⇒ 剥后缀判同一本', () => {
     // 档 A：后缀就是 expected.author（三体Ⅲ-刘慈欣 / 作者刘慈欣），源站只列本体。
     expect(sourceBookMatches({ title: '三体Ⅲ-刘慈欣', author: '刘慈欣' }, { title: '三体Ⅲ', author: '刘慈欣' })).toBe(true);
+    // 档 A 源站作者缺失（vikbook 形态无 og:novel:author）：后缀=任务作者即作者证据，本体相等即过。
+    expect(sourceBookMatches({ title: '三体Ⅲ-刘慈欣', author: '刘慈欣' }, { title: '三体Ⅲ', author: '' })).toBe(true);
     // 档 B：后缀是源站作者（DB 作者是打标人「稻博、盗墓博物馆」），源站列本体+真实作者。
     expect(sourceBookMatches({ title: '盗墓笔记-南派三叔', author: '稻博、盗墓博物馆' }, { title: '盗墓笔记', author: '南派三叔' })).toBe(true);
     // 档 A 作者门照常：本体对上但源站作者与任务作者不符 ⇒ 仍 false。
     expect(sourceBookMatches({ title: '三体Ⅲ-刘慈欣', author: '刘慈欣' }, { title: '三体Ⅲ', author: '别人' })).toBe(false);
+    // 档 B 源站作者缺失不放行：后缀与任务作者不一致且无第三方核对（副题反例排除不了）。
+    expect(sourceBookMatches({ title: '盗墓笔记-南派三叔', author: '稻博、盗墓博物馆' }, { title: '盗墓笔记', author: '' })).toBe(false);
   });
 
   it('41-suffix 不放宽成错配：副题后缀、无连字符、源站仍用全名、后缀是第三者都不判同一本', () => {
