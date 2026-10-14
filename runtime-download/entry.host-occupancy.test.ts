@@ -43,7 +43,7 @@ const complete = { kind: 'complete' as const, txt: 'synthetic', chaptersTotal: 1
 
 function options(overrides: Partial<ProductionExecutorOptions> = {}): ProductionExecutorOptions {
   return { workDir: 'synthetic-workdir', budget: { read: vi.fn(), consume: vi.fn() },
-    storage, github, repositoryId: 17, sql: sqlMarker, rateLimiter: limiter, env: {}, ...overrides };
+    storage, github, repositoryId: 17, sql: sqlMarker, rateLimiter: limiter, env: {} as NodeJS.ProcessEnv, ...overrides };
 }
 const adaptersOf = () => mocks.executor.mock.calls[0][0].adapters as SourceAdapter[];
 
@@ -119,7 +119,7 @@ describe('entry 物理 host 占用装配', () => {
       try { return await op(); }
       finally { events.push('exit'); }
     });
-    await createDownloadExecutor(options({ env: { DOWNLOAD_ENGINE_FALLBACK: '0' } }));
+    await createDownloadExecutor(options({ env: { DOWNLOAD_ENGINE_FALLBACK: '0' } as unknown as NodeJS.ProcessEnv }));
     const engine = adaptersOf()[0];
     await expect(engine.download({ id: 7 } as never, context)).rejects.toBe(failure);
     await expect(engine.download({ id: 7 } as never, context)).resolves.toEqual(complete);
@@ -127,7 +127,7 @@ describe('entry 物理 host 占用装配', () => {
   });
 
   it('DOWNLOAD_ENGINE_FALLBACK=0：fallback 不装配，两条默认腿仍被逐次 scope 覆盖', async () => {
-    await createDownloadExecutor(options({ env: { DOWNLOAD_ENGINE_FALLBACK: '0' } }));
+    await createDownloadExecutor(options({ env: { DOWNLOAD_ENGINE_FALLBACK: '0' } as unknown as NodeJS.ProcessEnv }));
     expect(mocks.createBuiltinFallback).not.toHaveBeenCalled();
     expect(mocks.createHostOccupancy).toHaveBeenCalledTimes(1);
     const adapters = adaptersOf();

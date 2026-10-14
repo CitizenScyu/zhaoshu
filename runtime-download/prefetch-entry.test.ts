@@ -67,10 +67,11 @@ function fakeSql(opts: FakeSqlOptions = {}) {
     return [];
   };
   const sql = ((strings: TemplateStringsArray, ...values: unknown[]) =>
-    query(strings, ...values)) as unknown as PrefetchSql & {
-    transaction: (fn: (tx: unknown) => unknown, options?: unknown) => Promise<unknown>;
-  };
-  sql.transaction = async (fn: (tx: unknown) => unknown, options?: unknown) => {
+    query(strings, ...values)) as unknown as PrefetchSql;
+  // 41-zombieocc 等场景对 neon 事务签名做窄化断言——生产 sql 仍按 PrefetchSql 使用，
+  // 这里只把 mock 的 transaction 属性收到能直接赋值的最小形状，避免与 neon 重载签名不兼容。
+  type FakeTransaction = (fn: (tx: unknown) => unknown, options?: unknown) => Promise<unknown>;
+  (sql as unknown as { transaction: FakeTransaction }).transaction = async (fn, options) => {
     transactionOptions.push(options);
     return fn(sql);
   };
@@ -135,7 +136,7 @@ const pickTwo = vi.fn<SourceSelector>(async () => ['https://a.example/b', 'https
 /** 便捷构造：全部注入，env 留空（验证生产 env 键解析不触发）。 */
 function entry(o: Partial<Parameters<typeof createSourcePrefetch>[0]> = {}) {
   return createSourcePrefetch({
-    rateLimiter: fakeLimiter(), log, env: {}, ...o,
+    rateLimiter: fakeLimiter(), log, env: {} as NodeJS.ProcessEnv, ...o,
   });
 }
 
@@ -156,7 +157,7 @@ describe('createSourcePrefetch 装配门（fail-closed）', () => {
     const s = createFakeStore({ tasks: [task(1)] });
     expect(() => createSourcePrefetch({
       rateLimiter: undefined as unknown as import('./engine').RateLimiterLike,
-      log, env: {}, sql: f.sql, store: s.store,
+      log, env: {} as NodeJS.ProcessEnv, sql: f.sql, store: s.store,
     })).toThrow('PREFETCH_RATE_LIMITER_REQUIRED');
     expect(f.calls.length).toBe(0);
     expect(s.calls.busyHosts + s.calls.claimNext + s.calls.finish + s.calls.release).toBe(0);
@@ -165,7 +166,7 @@ describe('createSourcePrefetch 装配门（fail-closed）', () => {
 
   it('无 sql/store 注入且 env 缺 DATABASE_URL：固定键名错误且不读配置文件', () => {
     vi.stubGlobal('fetch', vi.fn(() => { throw new Error('UNEXPECTED_NETWORK'); }));
-    expect(() => createSourcePrefetch({ rateLimiter: fakeLimiter(), log, env: {} }))
+    expect(() => createSourcePrefetch({ rateLimiter: fakeLimiter(), log, env: {} as NodeJS.ProcessEnv }))
       .toThrow('missing environment key: DATABASE_URL');
     expect(log).not.toHaveBeenCalled();
   });
@@ -288,8 +289,8 @@ describe('失败候选排除（真实 selector 包装）', () => {
     const selector = vi.fn();
     // 失败退避默认 60s：用首次 SQL 调用后即 abort 截断退避等待，让 run 可收口。
     const controller = new AbortController();
-    const transaction = f.sql.transaction;
-    f.sql.transaction = async (build: (tx: unknown) => unknown, options?: unknown) => {
+    const transaction = (f.sql as unknown as { transaction: (fn: (tx: unknown) => unknown, options?: unknown) => Promise<unknown> }).transaction;
+    (f.sql as unknown as { transaction: (fn: (tx: unknown) => unknown, options?: unknown) => Promise<unknown> }).transaction = async (build, options) => {
       setTimeout(() => controller.abort(new Error('prefetch_aborted')), 0);
       return transaction(build, options);
     };
@@ -406,7 +407,7 @@ describe('默认真实链（真实 selector/transport/occupancy 装配）', () =
     const prefetch = createSourcePrefetch({
       rateLimiter: limiter,
       log,
-      env: {},
+      env: {} as NodeJS.ProcessEnv,
       sql: f.sql,
       store: s.store,
       // DI 边界单点转型：窄合成形状只覆盖 selector 读取面。
