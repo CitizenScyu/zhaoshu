@@ -773,7 +773,10 @@ export function sameRules(a: unknown, b: unknown): boolean {
 }
 
 export function normalizeUrl(url: string): string {
-  return url.trim().replace(/\/+$/, '');
+  // P2-c:与 SQL 侧 normalizeUrlSql 同口径(trim + 去 #frag + 去尾斜杠)。此前两侧分裂,
+  // 带 #frag 的 candidate.url 写入 source_admission 时含锚、读侧 SQL JOIN 按无锚键查不到
+  // ⇒ planProbeOrder existing.get miss ⇒ 反复按 class 0 新行重探(实测 24h 内 32.1% 探测为重复 host)。
+  return url.trim().replace(/#.*$/, '').replace(/\/+$/, '');
 }
 
 // PG jsonb 严禁 NUL，孤立 UTF-16 代理项编码成 UTF-8 也非法；
