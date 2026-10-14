@@ -130,18 +130,16 @@ describe('共用选源器', () => {
     expect(sameHost.searchedUrls).toEqual(['https://a.example/new']);
   });
 
-  it('扫描内单源无书不禁整 host：本轮同 host 只扫首个变体，后续轮次经排除仍可选同 host 变体', async () => {
+  it('扫描内同 host 变体全扫不设死区：s1 无书后 s2 同轮仍可命中（scanrev41 回归）', async () => {
+    // 历史教训：曾加「每 host 每轮只扫首个变体」的去重，导致排在无书变体之后的同 host
+    // 变体永久死区（扫描无书不进 excludedSources，markFailure 只记下载过的源）——
+    // noveltri zh-cn/zh-tw 同 host 分版正是活例。去重已删，此测试钉住该语义。
     const h = harness({
       pool: ['https://a.example/s1', 'https://a.example/s2', 'https://b.example/'],
       search: url => (url === 'https://a.example/s1' ? [] : [{ title: TASK.title, author: TASK.author, bookUrl: `${url}b/1` }]),
     });
-    // 本轮：s1 无书即标记该 host，s2 不再消耗槽位；b 补位。
-    expect(await h.selector(request({ targetHits: 1 }), freshSignal())).toEqual(['https://b.example/']);
-    expect(h.searchedUrls).toEqual(['https://a.example/s1', 'https://b.example/']);
-    // 后续轮次 s1 进失败排除集后，同 host 变体 s2 恢复可扫（早停于 targetHits=1）。
-    expect(await h.selector(request({ targetHits: 1, excludedSources: ['https://a.example/s1'] }), freshSignal()))
-      .toEqual(['https://a.example/s2']);
-    expect(h.searchedUrls).toEqual(['https://a.example/s1', 'https://b.example/', 'https://a.example/s2']);
+    expect(await h.selector(request({ targetHits: 1 }), freshSignal())).toEqual(['https://a.example/s2']);
+    expect(h.searchedUrls).toEqual(['https://a.example/s1', 'https://a.example/s2']);
   });
 
   it('身份判据：标题须 normalize 相等、列表作者冲突不进详情、每源至多 2 详情', async () => {

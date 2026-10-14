@@ -43,8 +43,9 @@ export const MAX_FALLBACK_SOURCES = 2;
  * （rouwennp.org 单 host 4 个变体烧 4 个槽位），而实测载书的大站全排在 44–155（xyuzhaiwu10=44、
  * sto66=103、quanwenyuedu=105、vikbook=155）——当日 668 次选源扫描 628 次零命中，热门书
  * （我的治愈系游戏）在池内可达源精确命中却报 0 候选。回调到 160 ≈ 全池（https 去重后 ~170），
- * 配合 selector 同 host 去重让每个槽位都是不同 host；墙钟 300s 与早停（2 host）仍是硬上界，
- * 真无源书每轮扫描代价 ≈ 预算耗尽时间，不随上限线性放大。持久化候选（recall）零出网，
+ * 已命中 host 仍去重（pickedHosts），扫描内不再另设同 host 去重（scanrev41 复核：会造成
+ * 无书变体之后的同 host 变体永久死区）。墙钟 300s 与早停（2 host）仍是硬上界；真无源书
+ * 每轮扫描代价 ≈ 预算耗尽时间且随上限近似线性（快失败源多则更低）。持久化候选（recall）零出网，
  * 不占扫描额度。后续任务重试重新建立余额，不无限延续旧轮计数。
  */
 export const MAX_FALLBACK_SCAN_SOURCES = 160;
