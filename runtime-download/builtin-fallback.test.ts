@@ -14,6 +14,7 @@ const task = (over: Partial<TaskRow> = {}): TaskRow => ({
 });
 const hostOf = (url: string) => new URL(url).hostname;
 const UNAVAILABLE: PrecheckResult = { ok: false, reason: 'source_unavailable', retryable: true, stage: 'detail' };
+const IDENTITY_MISS: PrecheckResult = { ok: false, reason: 'identity_mismatch', retryable: false, stage: 'detail' };
 const signal = () => new AbortController().signal;
 
 function harness(opts: {
@@ -90,6 +91,37 @@ describe('41-T8FB builtin-fallback', () => {
     const calls: string[] = [];
     await h.fallback.wrapAdapter(adapter({}, []), adapter({}, calls)).download(task(), context());
     expect(calls).toEqual(['a.example', 'b.example', 'c.example']);
+  });
+
+  // 41-nocand（2026-10-14）：原源可达但库里没有这本书（identity_mismatch / no_candidate）
+  // 此前不触发引擎回退直接终态 failed——book.qq 链尾 cohort 全栽在这条路径。现扩回退资格。
+  it('41-nocand：原源身份缺失（无此书）也走引擎回退，选到即放行并下载成功', async () => {
+    const h = harness({ pool: ['https://a.example/', 'https://b.example/'] });
+    expect(await h.fallback.wrapPrecheck(async () => IDENTITY_MISS)(task(), signal()))
+      .toEqual({ ok: true, reason: 'builtin_engine_fallback' });
+    const calls: string[] = [];
+    const out = await h.fallback.wrapAdapter(adapter({}, []), adapter({ 'a.example': {
+      kind: 'complete', txt: 'x', chaptersTotal: 1, chaptersDone: 1, charsTotal: 1,
+    } }, calls)).download(task(), context());
+    expect(out.kind).toBe('complete');
+    expect(calls).toEqual(['a.example']);
+  });
+
+  it('41-nocand：身份缺失且引擎池也选不到 ⇒ 按原身份失败终态，不退避空耗重扫', async () => {
+    const h = harness({ pool: ['https://a.example/'], noBook: ['a.example'] });
+    expect(await h.fallback.wrapPrecheck(async () => IDENTITY_MISS)(task(), signal()))
+      .toEqual(IDENTITY_MISS);
+  });
+
+  it('41-nocand：下载腿原源 identity_mismatch_or_no_candidate ⇒ 换引擎候选收口', async () => {
+    const h = harness({ pool: ['https://a.example/'] });
+    const calls: string[] = [];
+    const builtin = adapter({ 'book15.net': { kind: 'failure', code: 'identity_mismatch_or_no_candidate' } }, []);
+    const out = await h.fallback.wrapAdapter(builtin, adapter({ 'a.example': {
+      kind: 'complete', txt: 'x', chaptersTotal: 1, chaptersDone: 1, charsTotal: 1,
+    } }, calls)).download(task(), context());
+    expect(out.kind).toBe('complete');
+    expect(calls).toEqual(['a.example']);
   });
 
   it('逐书出网封顶：书不在池里时最多搜 MAX_FALLBACK_SCAN_SOURCES 个源', async () => {
@@ -172,28 +204,34 @@ describe('41-T8FB builtin-fallback', () => {
     expect(h.searched).toEqual([]);
   });
 
-  it('内层预检其余结论（身份不符/放行/未验证）原样返回，不读源池；无候选存储时engine任务直通', async () => {
+  it('内层预检放行/未验证原样返回不读源池；身份不符（41-nocand）改走引擎回退；engine 无候选存储直通', async () => {
     const h = harness({ pool: ['https://a.example/'] });
-    for (const result of [{ ok: false, reason: 'identity_mismatch' }, { ok: true }, { ok: true, reason: 'identity_unverified' }] as PrecheckResult[]) {
+    for (const result of [{ ok: true }, { ok: true, reason: 'identity_unverified' }] as PrecheckResult[]) {
       expect(await h.fallback.wrapPrecheck(async () => result)(task(), signal())).toEqual(result);
     }
     expect(await h.fallback.wrapPrecheck(async () => UNAVAILABLE)(task({ source_kind: 'engine' }), signal()))
       .toEqual(UNAVAILABLE);
     expect(h.poolLoads).toEqual([]);
+    // identity_mismatch：原源可达但无此书 ⇒ 扫池找候选（41-nocand 前 identity_mismatch 直通终态）。
+    expect(await h.fallback.wrapPrecheck(async () => IDENTITY_MISS)(task(), signal()))
+      .toEqual({ ok: true, reason: 'builtin_engine_fallback' });
+    expect(h.searched).toEqual(['a.example']);
   });
 
-  it('engine 任务有候选存储但无可用候选：先过原预检，身份不符原样返回不读源池', async () => {
+  it('engine 任务有候选存储但无可用候选：先过原预检，放行直通；身份不符（41-nocand）改扫池选候选', async () => {
     const state = {
       usable: [],
       stored: [] as [number, string[]][], failures: [] as [number, string, string, string][],
     };
     const h = candidatesHarness(state);
     const engineTask = task({ source_kind: 'engine', source_url: 'https://origin.example/rules' });
-    for (const result of [{ ok: false, reason: 'identity_mismatch' }, { ok: true }] as PrecheckResult[]) {
-      expect(await h.fallback.wrapPrecheck(async () => result)(engineTask, signal())).toEqual(result);
-    }
+    expect(await h.fallback.wrapPrecheck(async () => ({ ok: true }))(engineTask, signal())).toEqual({ ok: true });
     expect(h.searched).toEqual([]);
-    expect(state.stored).toEqual([]);
+    // identity_mismatch：原引擎源可达但无此书 ⇒ 扫池选候选并落库（41-nocand 前直通终态）。
+    expect(await h.fallback.wrapPrecheck(async () => IDENTITY_MISS)(engineTask, signal()))
+      .toEqual({ ok: true, reason: 'engine_source_candidates' });
+    expect(h.searched).toEqual(['a.example', 'b.example']);
+    expect(state.stored).toEqual([[1, ['https://a.example/', 'https://b.example/']]]);
   });
 
   it('engine 任务已有持久化候选：跳过原预检并下载候选', async () => {

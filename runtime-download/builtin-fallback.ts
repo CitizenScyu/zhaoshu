@@ -103,6 +103,16 @@ const isSourceUnavailable = (outcome: AdapterOutcome) =>
   outcome.kind === 'incomplete' && outcome.reason === 'source_unavailable';
 
 /**
+ * 原始源可达但库里没有这本书（无候选/身份不符）：2026-10-14 41-nocand 扩展回退资格。
+ * 此前只有 source_unavailable 触发引擎回退——book.qq 链尾 cohort（战役 9/9 失败全是它）
+ * 因源可达+书不在库直接终态 failed，扫池能力（scanfix）够不到这条路径。身份判据与
+ * 回退选源共用 identityMatches，别处命中的候选同样可信；选不到则按原身份失败终态
+ * （permanent，不空耗 16 次重扫）。
+ */
+const isIdentityMiss = (outcome: AdapterOutcome): boolean =>
+  outcome.kind === 'failure' && outcome.code === 'identity_mismatch_or_no_candidate';
+
+/**
  * download-worker incomplete 枚举里稳定的源级 reason（download-worker.ts 归类）：
  * source_unavailable / missing_chapters / toc_changed / operation_timeout——单源问题，标 temporary 后换源。
  * budget_exhausted / interrupted 是任务层停止：不标失败、不换源；白名单外的未知 incomplete 同样
@@ -234,6 +244,7 @@ export function createBuiltinFallback(options: BuiltinFallbackOptions) {
         let sources = await recallSources(task);
         signal.throwIfAborted();
         let stage = 'search';
+        let identityMissed = false;
         if (sources === null && !builtinSuspect(task) && !builtinRetired(task)) {
           let result: PrecheckResult | null = null;
           try {
@@ -246,13 +257,16 @@ export function createBuiltinFallback(options: BuiltinFallbackOptions) {
             // HOST_OCCUPANCY_UNAVAILABLE（占位表不可读）语义不同，仍上抛由执行器立即收口。
             if ((error as { code?: unknown } | null | undefined)?.code !== 'HOST_OCCUPIED') throw error;
           }
-          if (result && (result.ok || !result.retryable)) return result;
+          if (result && (result.ok || (!result.retryable && result.reason !== 'identity_mismatch'))) return result;
+          identityMissed = result?.reason === 'identity_mismatch';
           if (result) stage = result.stage;
         }
         signal.throwIfAborted();
         sources ??= await selectSources(task, signal, scanBudget);
         signal.throwIfAborted();
-        if (!sources.length) return { ok: false, reason: 'source_unavailable', retryable: true, stage };
+        if (!sources.length) return identityMissed
+          ? { ok: false, reason: 'identity_mismatch', retryable: false, stage }
+          : { ok: false, reason: 'source_unavailable', retryable: true, stage };
         planned = { taskId: task.id, sources, scanBudget };
         return { ok: true, reason: builtin ? 'builtin_engine_fallback' : 'engine_source_candidates' };
       };
@@ -303,7 +317,7 @@ export function createBuiltinFallback(options: BuiltinFallbackOptions) {
               primary = await (kind === 'engine' ? engine : builtin).download(task, context);
               stop = stopped(context.signal);
               if (stop) return stop;
-              if (!isSourceUnavailable(primary)) return primary;
+              if (!isSourceUnavailable(primary) && !isIdentityMiss(primary)) return primary;
               // 930 确认点 2：原源被物理门拒绝（host_occupied / host_occupancy_unavailable）按原
               // 可重试分类收口，不触发扫池——“host 正被占用”对选新源的出网请求同样生效。
               if (primary.kind === 'incomplete' && primary.retryCause) return primary;
