@@ -143,14 +143,38 @@ function identityTitle(value: string): string {
   return foldTraditional(stripped || normalized);
 }
 
+// 复合题名「书名-作者」（41-suffix，2026-10-14）：打标书库里存在「三体Ⅲ-刘慈欣」「盗墓笔记-南派三叔」这类
+// 「本体名+连字符+作者」的题名，而源站只列本体名「三体Ⅲ」。这不是两本书，两档从严降级（只在精确相等失败后）：
+//   A 后缀 = expected.author（三体Ⅲ-刘慈欣/作者刘慈欣）：剥后缀比本体，作者门照常生效；
+//   B 后缀 = actual.author（盗墓笔记-南派三叔，DB 作者是打标人「稻博、盗墓博物馆」）：书名自带真实作者且与
+//     源站作者相符，本体相等即过——后缀在这里就是作者证据。
+// 后缀两档都对不上（「楚留香新传1-借尸还魂」的「借尸还魂」是副题不是作者）不剥，按原严格口径。
+const SUFFIX_AUTHOR_SEPARATOR = /[-—－–]/;
+
+function splitAuthorSuffix(rawTitle: string): { body: string; suffix: string } {
+  const parts = rawTitle.split(SUFFIX_AUTHOR_SEPARATOR);
+  if (parts.length < 2) return { body: rawTitle, suffix: '' };
+  return { body: parts.slice(0, -1).join('-'), suffix: parts[parts.length - 1].trim() };
+}
+
 export function sourceBookMatches(expected: SourceBookIdentity, actual: SourceBookIdentity): boolean {
+  const author = foldTraditional(knownSourceAuthor(expected.author));
   const title = identityTitle(expected.title);
   // 站点可能把书上架为新名而在简介里自报原名（【原书名：X】）；标题或别名任一相等即过。
   const actualTitles = [actual.title, ...(actual.alias ? [actual.alias] : [])].map(identityTitle);
   // 作者门：两侧同一套归一（字段修饰剥离 + 一对一繁简折叠），只吸收「同一个名字的不同写法」，不同名字仍判不符。
-  const author = foldTraditional(knownSourceAuthor(expected.author));
-  return Boolean(title && actualTitles.includes(title)
-    && (!author || author === foldTraditional(knownSourceAuthor(actual.author))));
+  const actualAuthor = foldTraditional(knownSourceAuthor(actual.author));
+  const authorOk = !author || author === actualAuthor;
+  if (title && actualTitles.includes(title)) return authorOk;
+  if (!title) return false;
+  // 41-suffix 降级：expected 是「书名-作者」复合题名时，剥后缀比本体（两档判据见函数头）。
+  const { body: rawBody, suffix } = splitAuthorSuffix(expected.title);
+  if (!suffix) return false;
+  const suffixKey = foldTraditional(normalizeSourceTitle(suffix));
+  const body = identityTitle(rawBody);
+  if (!body || body === title || !actualTitles.includes(body)) return false;
+  if (authorOk && suffixKey === author) return true; // A：后缀即 expected.author
+  return suffixKey !== '' && suffixKey === actualAuthor; // B：后缀即源站作者
 }
 
 // 组合键分隔符：NUL 不出现在归一化后的书名/作者里，避免 'a,b'+'c' 与 'a'+'b,c' 撞键。
