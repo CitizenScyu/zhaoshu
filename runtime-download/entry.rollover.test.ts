@@ -107,6 +107,22 @@ describe('capacity991 entry rollover seam 装配（合成）', () => {
     expect(candidates[0].id).toBe(17);
   });
 
+  it('②b neon 把 timestamptz 解析成 Date ⇒ validUntil 仍取到（ISO 串），不判 unknown', async () => {
+    mocks.sql.mockImplementation(async (strings: TemplateStringsArray) => {
+      const text = strings.join("");
+      return text.includes('repository_capacity_ledger')
+        ? [candidateRow({ admission_valid_until: new Date('2099-12-31T00:00:00.000Z') })]
+        : [{ id: 17 }];
+    });
+    await createDownloadExecutor(options({ env: { ...env, ZHAOSHU_ROLLOVER_ENABLED: '1' } }));
+    const deps = mocks.executor.mock.calls[0][0] as {
+      rollover?: { port: { listCandidates(): Promise<readonly { accounting: { validUntil: string | null }; externalAdmission: { validUntil: string | null } }[]> } };
+    };
+    const [candidate] = await deps.rollover!.port.listCandidates();
+    expect(candidate.accounting.validUntil).toBe('2099-12-31T00:00:00.000Z');
+    expect(candidate.externalAdmission.validUntil).toBe('2099-12-31T00:00:00.000Z');
+  });
+
   it('③ 开但 listCandidates 拿不到对账证据（ledger 非 ready）⇒ 抛，不降级', async () => {
     mocks.sql.mockImplementation(async (strings: TemplateStringsArray) => {
       const text = strings.join("");

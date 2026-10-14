@@ -160,7 +160,12 @@ function toRepositoryCandidate(row: RolloverCandidateRow): RepositoryCandidate {
   const version = rolloverText(row.baseline_epoch, 'baseline_epoch');
   const target: RepositoryTuple = { id, owner, repo, branch };
   // 账目 validUntil：ledger 无独立账目期限列，取同账行的准入期限作为可信窗口上界（缺失=null⇒决策判 unknown）。
-  const admissionValidUntil = typeof row.admission_valid_until === 'string' ? row.admission_valid_until : null;
+  // neon 驱动按 pg-types 把 timestamptz 解析成 Date（不是字符串）；两种都收，非法 Date 视同缺失。
+  // 只认字符串时生产 validUntil 恒为 null ⇒ 全部候选 unknown ⇒ CAPACITY_UNKNOWN（2026-10-13 task 3612）。
+  const rawValidUntil = row.admission_valid_until;
+  const admissionValidUntil = typeof rawValidUntil === 'string' ? rawValidUntil
+    : rawValidUntil instanceof Date && !Number.isNaN(rawValidUntil.getTime()) ? rawValidUntil.toISOString()
+    : null;
   const accounting = {
     registeredLogicalBytes: rolloverBigint(row.registered_bytes, 'registered_bytes'),
     reservedLogicalBytes: rolloverBigint(row.reserved_bytes, 'reserved_bytes'),
