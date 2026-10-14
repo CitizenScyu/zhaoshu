@@ -7,19 +7,31 @@
 // （真实决策层）比对两边选出的仓，避免本脚本的判据副本与权威实现漂移。
 import { describe, expect, it } from 'vitest';
 import { decideRepositoryForPublication } from '../runtime-download/repository-rollover-wiring';
+import type { RepositoryCandidate } from '../runtime-download/repository-rollover';
 import { parseArgs, resolveActiveRepository, selectActiveRepository } from './repo-auto-create.mjs';
 
 const NOW = new Date('2026-10-15T00:00:00Z');
 const FUTURE = '2099-01-01T00:00:00.000Z';
 const PAST = '2020-01-01T00:00:00.000Z';
-const TARGET_BYTES = 1_000_000_000n;
+const TARGET_BYTES = BigInt(1_000_000_000);
+
+/** storage_repositories LEFT JOIN repository_capacity_ledger 的一行（列名见 resolveActiveRepository 的 SQL）。 */
+type LedgerRow = {
+  id: number; owner: string; repo: string; branch: string;
+  enabled: boolean; is_private: boolean; read_only: boolean; sealed_at: string | null;
+  ledger_state: string; baseline_epoch: string;
+  target_bytes: bigint; registered_bytes: bigint; reserved_bytes: bigint;
+  admission_status: 'granted' | 'denied' | 'unknown'; admission_version: string;
+  admission_valid_until: string | null;
+  admission_target: { repositoryId: number; branch: string } | null;
+};
 
 /** 一个账目/准入都齐、账上 0 字节的候选仓（各用例按需覆盖字段）。 */
-const repo = (over = {}) => ({
+const repo = (over: Partial<LedgerRow> = {}): LedgerRow => ({
   id: 1, owner: 'CitizenScyu', repo: 'zhaoshu-books', branch: 'main',
   enabled: true, is_private: true, read_only: false, sealed_at: null,
   ledger_state: 'ready', baseline_epoch: 'm0001_capacity_init',
-  target_bytes: TARGET_BYTES, registered_bytes: 0n, reserved_bytes: 0n,
+  target_bytes: TARGET_BYTES, registered_bytes: BigInt(0), reserved_bytes: BigInt(0),
   admission_status: 'granted', admission_version: 'storage_repositories_writable_v1',
   admission_valid_until: FUTURE,
   admission_target: { repositoryId: 1, branch: 'main' },
@@ -40,7 +52,7 @@ describe('parseArgs：现役仓来源必须显式二选一', () => {
   it('旧用法向后兼容（--current 仍可用、其余闸门不变）', () => {
     expect(parseArgs(['--database-url-env=A', '--github-token-env=B', '--current=o/r', '--apply',
       '--threshold-pct=90', '--target-bytes=2000000000'], {}))
-      .toMatchObject({ owner: 'o', repo: 'r', mode: 'apply', thresholdPct: 90, targetBytes: 2000000000n });
+      .toMatchObject({ owner: 'o', repo: 'r', mode: 'apply', thresholdPct: 90, targetBytes: BigInt(2_000_000_000) });
     expect(() => parseArgs(['--database-url-env=A', '--github-token-env=B', '--current=o/r', '--bogus'], {})).toThrow(/未知参数/);
     expect(() => parseArgs(['--database-url-env=A', '--github-token-env=B', '--current=noslash'], {})).toThrow(/owner\/repo/);
     expect(() => parseArgs(['--database-url-env=A', '--github-token-env=B', '--current=o/r', '--threshold-pct=100'], {})).toThrow(/0,100/);
@@ -59,8 +71,8 @@ describe('selectActiveRepository：盯台账现役仓，不盯写死值', () => 
   it('核心场景：repo1 已满仓 → 盯 repo2（哪怕 repo1 id 更小）', () => {
     const rows = [
       repo({ id: 1, repo: 'zhaoshu-books', registered_bytes: TARGET_BYTES, admission_target: { repositoryId: 1, branch: 'main' } }),
-      repo({ id: 2, repo: 'zhaoshu-books-2', registered_bytes: 123n, admission_target: { repositoryId: 2, branch: 'main' } }),
-      repo({ id: 3, repo: 'zhaoshu-books-3', registered_bytes: 0n, admission_target: { repositoryId: 3, branch: 'main' } }),
+      repo({ id: 2, repo: 'zhaoshu-books-2', registered_bytes: BigInt(123), admission_target: { repositoryId: 2, branch: 'main' } }),
+      repo({ id: 3, repo: 'zhaoshu-books-3', registered_bytes: BigInt(0), admission_target: { repositoryId: 3, branch: 'main' } }),
     ];
     expect(selectActiveRepository(rows, NOW)).toMatchObject({
       status: 'ok',
@@ -70,16 +82,16 @@ describe('selectActiveRepository：盯台账现役仓，不盯写死值', () => 
 
   it('repo1 未满且可写 → 仍是 repo1（不无谓跳仓）', () => {
     const rows = [
-      repo({ id: 1, repo: 'zhaoshu-books', registered_bytes: 800_000_000n, admission_target: { repositoryId: 1, branch: 'main' } }),
-      repo({ id: 2, repo: 'zhaoshu-books-2', registered_bytes: 0n, admission_target: { repositoryId: 2, branch: 'main' } }),
+      repo({ id: 1, repo: 'zhaoshu-books', registered_bytes: BigInt(800_000_000), admission_target: { repositoryId: 1, branch: 'main' } }),
+      repo({ id: 2, repo: 'zhaoshu-books-2', registered_bytes: BigInt(0), admission_target: { repositoryId: 2, branch: 'main' } }),
     ];
     expect(selectActiveRepository(rows, NOW)).toMatchObject({ status: 'ok', repository: { id: 1, repo: 'zhaoshu-books' } });
   });
 
   it('repo1 已封存 → 直接盯 repo2（封存优先于容量）', () => {
     const rows = [
-      repo({ id: 1, repo: 'zhaoshu-books', sealed_at: '2026-10-13T08:21:00Z', registered_bytes: 0n, admission_target: { repositoryId: 1, branch: 'main' } }),
-      repo({ id: 2, repo: 'zhaoshu-books-2', registered_bytes: 0n, admission_target: { repositoryId: 2, branch: 'main' } }),
+      repo({ id: 1, repo: 'zhaoshu-books', sealed_at: '2026-10-13T08:21:00Z', registered_bytes: BigInt(0), admission_target: { repositoryId: 1, branch: 'main' } }),
+      repo({ id: 2, repo: 'zhaoshu-books-2', registered_bytes: BigInt(0), admission_target: { repositoryId: 2, branch: 'main' } }),
     ];
     expect(selectActiveRepository(rows, NOW)).toMatchObject({ status: 'ok', repository: { id: 2 } });
   });
@@ -100,7 +112,7 @@ describe('selectActiveRepository：盯台账现役仓，不盯写死值', () => 
     ['准入目标缺失', { admission_target: null }],
   ])('%s 的仓不算现役（下一个合格仓顶上）', (_label, bad) => {
     const rows = [
-      repo({ id: 1, ...bad }),
+      repo({ id: 1, ...(bad as Partial<LedgerRow>) }),
       repo({ id: 2, repo: 'zhaoshu-books-2', admission_target: { repositoryId: 2, branch: 'main' } }),
     ];
     expect(selectActiveRepository(rows, NOW)).toMatchObject({ status: 'ok', repository: { id: 2 } });
@@ -119,7 +131,7 @@ describe('selectActiveRepository：盯台账现役仓，不盯写死值', () => 
   it('空候选与非法时钟：空候选 blocked、非法时钟抛（不读真实时间）', () => {
     expect(selectActiveRepository([], NOW)).toMatchObject({ status: 'blocked', reason: 'no registered repositories' });
     expect(() => selectActiveRepository([repo()], new Date('nope'))).toThrow(/有效 Date/);
-    expect(() => selectActiveRepository([repo()], '2026-10-15')).toThrow(/有效 Date/);
+    expect(() => selectActiveRepository([repo()], '2026-10-15' as unknown as Date)).toThrow(/有效 Date/);
   });
 
   it('入参顺序不影响结果（按 id 升序，不靠数组顺序）', () => {
@@ -134,7 +146,7 @@ describe('selectActiveRepository：盯台账现役仓，不盯写死值', () => 
 
   it('reserved_bytes 也计入占用（与 decide 的投影同式）', () => {
     const rows = [
-      repo({ id: 1, registered_bytes: TARGET_BYTES - 10n, reserved_bytes: 11n }),
+      repo({ id: 1, registered_bytes: TARGET_BYTES - BigInt(10), reserved_bytes: BigInt(11) }),
       repo({ id: 2, repo: 'zhaoshu-books-2', admission_target: { repositoryId: 2, branch: 'main' } }),
     ];
     expect(selectActiveRepository(rows, NOW)).toMatchObject({ status: 'ok', repository: { id: 2 } });
@@ -143,7 +155,7 @@ describe('selectActiveRepository：盯台账现役仓，不盯写死值', () => 
 
 describe('与权威决策层交叉验证：探针盯的仓 = decide 在当前仓满时会选的仓', () => {
   /** 把 ledger 行装配成 decideRepositoryForPublication 的候选（同 runtime-download/entry.ts 的口径）。 */
-  const toCandidate = (row) => {
+  const toCandidate = (row: LedgerRow): RepositoryCandidate => {
     const tuple = { id: Number(row.id), owner: row.owner, repo: row.repo, branch: row.branch };
     // jsonb 里的 admission_target 先按 entry.ts:180-186 核「绑本仓」，核过才把完整元组当外部准入证据。
     const bound = row.admission_target;
@@ -167,11 +179,11 @@ describe('与权威决策层交叉验证：探针盯的仓 = decide 在当前仓
     };
   };
 
-  const decideTarget = async (rows, currentId, logicalBytes) => {
+  const decideTarget = async (rows: LedgerRow[], currentId: number, logicalBytes: bigint) => {
     const outcome = await decideRepositoryForPublication(
       { listCandidates: async () => rows.map(toCandidate), now: () => NOW },
       {
-        current: toCandidate(rows.find(r => Number(r.id) === currentId) ?? rows[0]),
+        current: toCandidate(rows.find((r: LedgerRow) => Number(r.id) === currentId) ?? rows[0]),
         labeledBookId: 1, identityKey: 'k', blobSha: 'a'.repeat(40),
         canonicalPath: 'books/x/1.txt', logicalBytes,
       },
@@ -182,18 +194,18 @@ describe('与权威决策层交叉验证：探针盯的仓 = decide 在当前仓
   it('repo1 满 + 本次还要写 1 字节：decide 切到 repo2，探针也盯 repo2', async () => {
     const rows = [
       repo({ id: 1, repo: 'zhaoshu-books', registered_bytes: TARGET_BYTES, admission_target: { repositoryId: 1, branch: 'main' } }),
-      repo({ id: 2, repo: 'zhaoshu-books-2', registered_bytes: 0n, admission_target: { repositoryId: 2, branch: 'main' } }),
+      repo({ id: 2, repo: 'zhaoshu-books-2', registered_bytes: BigInt(0), admission_target: { repositoryId: 2, branch: 'main' } }),
     ];
-    expect(await decideTarget(rows, 1, 1n)).toBe(2);
+    expect(await decideTarget(rows, 1, BigInt(1))).toBe(2);
     expect(selectActiveRepository(rows, NOW)).toMatchObject({ status: 'ok', repository: { id: 2 } });
   });
 
   it('repo1 还有余量：两边都留在 repo1（探针不无谓跳仓）', async () => {
     const rows = [
-      repo({ id: 1, repo: 'zhaoshu-books', registered_bytes: 800_000_000n, admission_target: { repositoryId: 1, branch: 'main' } }),
-      repo({ id: 2, repo: 'zhaoshu-books-2', registered_bytes: 0n, admission_target: { repositoryId: 2, branch: 'main' } }),
+      repo({ id: 1, repo: 'zhaoshu-books', registered_bytes: BigInt(800_000_000), admission_target: { repositoryId: 1, branch: 'main' } }),
+      repo({ id: 2, repo: 'zhaoshu-books-2', registered_bytes: BigInt(0), admission_target: { repositoryId: 2, branch: 'main' } }),
     ];
-    expect(await decideTarget(rows, 1, 1_000_000n)).toBe(1);
+    expect(await decideTarget(rows, 1, BigInt(1_000_000))).toBe(1);
     expect(selectActiveRepository(rows, NOW)).toMatchObject({ status: 'ok', repository: { id: 1 } });
   });
 
@@ -201,9 +213,9 @@ describe('与权威决策层交叉验证：探针盯的仓 = decide 在当前仓
     const rows = [
       repo({ id: 1, repo: 'zhaoshu-books', sealed_at: '2026-10-13T08:21:00Z', admission_target: { repositoryId: 1, branch: 'main' } }),
       repo({ id: 2, repo: 'zhaoshu-books-2', registered_bytes: TARGET_BYTES, admission_target: { repositoryId: 2, branch: 'main' } }),
-      repo({ id: 3, repo: 'zhaoshu-books-3', registered_bytes: 0n, admission_target: { repositoryId: 3, branch: 'main' } }),
+      repo({ id: 3, repo: 'zhaoshu-books-3', registered_bytes: BigInt(0), admission_target: { repositoryId: 3, branch: 'main' } }),
     ];
-    expect(await decideTarget(rows, 1, 1n)).toBe(3);
+    expect(await decideTarget(rows, 1, BigInt(1))).toBe(3);
     expect(selectActiveRepository(rows, NOW)).toMatchObject({ status: 'ok', repository: { id: 3 } });
   });
 });

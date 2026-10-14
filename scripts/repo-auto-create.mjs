@@ -37,6 +37,7 @@ import { neon } from '@neondatabase/serverless';
 
 const USAGE = '用法: repo-auto-create.mjs --database-url-env=NAME --github-token-env=NAME (--current=owner/repo | --current-from-ledger) [--threshold-pct=85] [--target-bytes=1000000000] [--dry-run | --apply]';
 
+/** @param {string[]} argv @param {Record<string, string | undefined>} [env] */
 export function parseArgs(argv, env = process.env) {
   let dbEnv, ghEnv, current, currentFromLedger = false, thresholdPct = 85, targetBytes = BigInt(1_000_000_000);
   let apply = false, dryRun = false;
@@ -91,10 +92,8 @@ export function parseArgs(argv, env = process.env) {
  * 任一条不满足即该仓不是现役仓；**没有**任何回退分支去猜别的仓——全都不合格就失败关闭（退出码 3），
  * 因为「猜一个仓去探针」正是本任务要消灭的行为。
  *
- * @param {{id:unknown,owner:unknown,repo:unknown,branch:unknown,enabled:unknown,is_private:unknown,
- *          read_only:unknown,sealed_at:unknown,ledger_state:unknown,baseline_epoch:unknown,target_bytes:unknown,
- *          registered_bytes:unknown,reserved_bytes:unknown,admission_status:unknown,admission_version:unknown,
- *          admission_valid_until:unknown,admission_target:unknown}[]} rows 按 id 升序的候选
+ * @param {Array<Record<string, unknown>>} rows 候选行（storage_repositories LEFT JOIN repository_capacity_ledger
+ *        的列，见 resolveActiveRepository 的 SQL）；按 id 升序处理，不依赖入参数组顺序
  * @param {Date} now 显式时钟（与纯决策同一红线：不读真实时间）
  */
 export function selectActiveRepository(rows, now) {

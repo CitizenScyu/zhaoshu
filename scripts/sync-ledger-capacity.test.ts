@@ -7,6 +7,7 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { initializeArtifactSchema } from '../src/lib/business-schema';
 import { initializeArtifactCapacitySchema } from '../src/lib/artifact-capacity-schema';
+import { loadPGlite, type PGliteLike } from '../src/lib/fixtures/pglite';
 import { createPGliteSql } from '../src/lib/fixtures/pglite-sql';
 import { createProductionSchema, seedV6MemberUser } from '../src/lib/fixtures/production-schema';
 import {
@@ -72,17 +73,17 @@ describe('字节口径：只算 books 下普通 blob，排除 .snapshots', () =>
       .toThrow(IncompleteTreeError);
     expect(() => sumRegisteredLogicalBytes([{ path: 'books/a.txt', type: 'blob', mode: '100644', size: -1 }]))
       .toThrow(IncompleteTreeError);
-    expect(() => sumRegisteredLogicalBytes('not-an-array')).toThrow(IncompleteTreeError);
+    expect(() => sumRegisteredLogicalBytes('not-an-array' as never)).toThrow(IncompleteTreeError);
   });
 });
 
 describe('认证请求：token 只进请求头', () => {
   it('固定 api.github.com + Authorization 头；返回值不含 token', async () => {
-    const seen = [];
-    const request = createGitHubTreeRequest('ghp_supersecret', async (url, init) => {
+    const seen: Array<{ url: string, headers: Record<string, string> }> = [];
+    const request = createGitHubTreeRequest('ghp_supersecret', (async (url: string, init: { headers: Record<string, string> }) => {
       seen.push({ url, headers: init.headers });
       return { status: 200, json: async () => ({ truncated: false, tree: [] }) };
-    });
+    }) as never);
     const res = await request('/repos/o/r/git/trees/main?recursive=1');
     expect(seen[0].url).toBe('https://api.github.com/repos/o/r/git/trees/main?recursive=1');
     expect(seen[0].headers.Authorization).toBe('Bearer ghp_supersecret');
@@ -91,22 +92,26 @@ describe('认证请求：token 只进请求头', () => {
   });
 });
 
-describe('runSync（PGlite 真表 + 合成 GitHub 桩）', () => {
-  let pg;
-  let sql;
+const PGliteCtor = await loadPGlite();
+const maybe = PGliteCtor ? describe : describe.skip;
 
+maybe('runSync（PGlite 真表 + 合成 GitHub 桩）', () => {
+  let pg: PGliteLike;
+  let sql: ReturnType<typeof createPGliteSql>;
+
+  type TreeBody = { truncated?: boolean, tree: unknown[] } | Error;
   /** 合成 GitHub 桩：按路由返回受控树；不触网、不证明真实 GitHub 可达。 */
-  const stubRequest = (trees) => async (route) => {
+  const stubRequest = (trees: Record<string, TreeBody>) => async (route: string) => {
     const body = trees[route];
     if (!body) return { status: 404, json: async () => ({ message: 'not found' }) };
     if (body instanceof Error) throw body;
     return { status: 200, json: async () => body };
   };
 
-  const blob = (path, size) => ({ path, type: 'blob', mode: '100644', size });
+  const blob = (path: string, size: number) => ({ path, type: 'blob', mode: '100644', size });
 
   beforeAll(async () => {
-    pg = new (await import('@electric-sql/pglite')).PGlite();
+    pg = new PGliteCtor!();
     sql = createPGliteSql(pg);
     await createProductionSchema(sql as never, statement => pg.exec(statement));
     await seedV6MemberUser(pg);
@@ -206,12 +211,10 @@ describe('runSync（PGlite 真表 + 合成 GitHub 桩）', () => {
       [`/repos/fixture/repo-a/git/trees/${'e'.repeat(40)}?recursive=1`]: { truncated: false, tree: [blob('.snapshots/s.txt', 9999)] },
     };
     const report = await runSync({ sql, request: stubRequest(drilled), mode: 'apply' });
-    const first = report.repositories.find(r => r.repositoryId === 1);
-    expect(first.status).toBe('applied');
     // books/top.txt(7) + books/x/1.txt(300) + books/x/2.txt(200) = 507；books/.snapshots/s.txt(9999) 与
     // 两次截断响应里的 partial(1) 都不进和。
-    expect(first.bytes).toBe('507');
-    expect(first.fileCount).toBe(3);
+    expect(report.repositories.find(r => r.repositoryId === 1))
+      .toMatchObject({ status: 'applied', bytes: '507', fileCount: 3 });
   }, 60_000);
 
   it('补不齐就失败关闭：该仓不写库、如实标 failed 并计数', async () => {
@@ -222,8 +225,7 @@ describe('runSync（PGlite 真表 + 合成 GitHub 桩）', () => {
     };
     const report = await runSync({ sql, request: stubRequest(broken), mode: 'apply' });
     expect(report.failedCount).toBe(1);
-    expect(report.repositories[0]).toMatchObject({ repositoryId: 1, status: 'failed' });
-    expect(report.repositories[0].error).toMatch(/INCOMPLETE_TREE/);
+    expect(report.repositories[0]).toMatchObject({ repositoryId: 1, status: 'failed', error: expect.stringContaining('INCOMPLETE_TREE') });
     // 失败仓的 registered_bytes 保持原值（没被部分和覆盖）
     expect(String((await pg.query('SELECT registered_bytes FROM repository_capacity_ledger WHERE repository_id = 1')).rows[0].registered_bytes)).toBe('0');
     // 另一仓照常推进
