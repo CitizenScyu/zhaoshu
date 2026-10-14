@@ -14,7 +14,9 @@ const task = (over: Partial<TaskRow> = {}): TaskRow => ({
 });
 const hostOf = (url: string) => new URL(url).hostname;
 const UNAVAILABLE: PrecheckResult = { ok: false, reason: 'source_unavailable', retryable: true, stage: 'detail' };
-const IDENTITY_MISS: PrecheckResult = { ok: false, reason: 'identity_mismatch', retryable: false, stage: 'detail' };
+// 生产 identity-precheck 对 identity_mismatch 只回 {ok:false, reason}（不带 retryable/stage，
+// nocandrev41 F3）：夹具同形状，钉住 retryable 缺省=不可重试的收窄路径。
+const IDENTITY_MISS: PrecheckResult = { ok: false, reason: 'identity_mismatch' };
 const signal = () => new AbortController().signal;
 
 function harness(opts: {
@@ -110,7 +112,19 @@ describe('41-T8FB builtin-fallback', () => {
   it('41-nocand：身份缺失且引擎池也选不到 ⇒ 按原身份失败终态，不退避空耗重扫', async () => {
     const h = harness({ pool: ['https://a.example/'], noBook: ['a.example'] });
     expect(await h.fallback.wrapPrecheck(async () => IDENTITY_MISS)(task(), signal()))
-      .toEqual(IDENTITY_MISS);
+      .toMatchObject({ ok: false, reason: 'identity_mismatch', retryable: false });
+  });
+
+  it('41-nocand F1（nocandrev41）：预检身份缺失选到候选、候选全失败 ⇒ 身份失败终态，不退避重扫', async () => {
+    // F1 反例：候选搜得到但下载全挂时，旧版降级 source_unavailable ⇒ 16 轮退避重扫（每轮全池）。
+    const h = harness({ pool: ['https://a.example/', 'https://b.example/'] });
+    expect(await h.fallback.wrapPrecheck(async () => IDENTITY_MISS)(task(), signal()))
+      .toEqual({ ok: true, reason: 'builtin_engine_fallback' });
+    const calls: string[] = [];
+    const out = await h.fallback.wrapAdapter(adapter({}, []), adapter({}, calls)).download(task(), context());
+    // adapter 默认兜底 outcome 即 identity_mismatch_or_no_candidate failure ⇒ 两候选全失败。
+    expect(out).toEqual({ kind: 'failure', code: 'identity_mismatch_or_no_candidate' });
+    expect(calls).toEqual(['a.example', 'b.example']);
   });
 
   it('41-nocand：下载腿原源 identity_mismatch_or_no_candidate ⇒ 换引擎候选收口', async () => {

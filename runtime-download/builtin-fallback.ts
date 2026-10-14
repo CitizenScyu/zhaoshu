@@ -150,8 +150,10 @@ export function createBuiltinFallback(options: BuiltinFallbackOptions) {
   });
 
   // 预检选好的源交给下载腿：单槽（并发=1），按任务 id 认领，领一次即清。
+  // identityMissed：预检腿判定原源可达但库里无此书（41-nocand）——下载腿候选全失败时按
+  // 身份失败终态收口（nocandrev41 F1：不可降级成 source_unavailable 16 轮退避重扫）。
   type ScanBudget = { remaining: number };
-  let planned: { taskId: number; sources: string[]; scanBudget: ScanBudget } | null = null;
+  let planned: { taskId: number; sources: string[]; scanBudget: ScanBudget; identityMissed?: boolean } | null = null;
 
   const stopped = (signal: AbortSignal): AdapterOutcome | undefined => {
     if (!signal.aborted) return undefined;
@@ -257,17 +259,22 @@ export function createBuiltinFallback(options: BuiltinFallbackOptions) {
             // HOST_OCCUPANCY_UNAVAILABLE（占位表不可读）语义不同，仍上抛由执行器立即收口。
             if ((error as { code?: unknown } | null | undefined)?.code !== 'HOST_OCCUPIED') throw error;
           }
-          if (result && (result.ok || (!result.retryable && result.reason !== 'identity_mismatch'))) return result;
-          identityMissed = result?.reason === 'identity_mismatch';
-          if (result) stage = result.stage;
+          if (result) {
+            if (result.ok) return result;
+            // 非 identity_mismatch 的不可重试结论原样直通；identity_mismatch（41-nocand）继续走回退。
+            // retryable 缺省视为不可重试（identity-precheck 生产返回就不带该字段）。
+            if (!result.retryable && result.reason !== 'identity_mismatch') return result;
+            identityMissed = result.reason === 'identity_mismatch';
+            if ('stage' in result) stage = result.stage;
+          }
         }
         signal.throwIfAborted();
         sources ??= await selectSources(task, signal, scanBudget);
         signal.throwIfAborted();
         if (!sources.length) return identityMissed
-          ? { ok: false, reason: 'identity_mismatch', retryable: false, stage }
+          ? { ok: false, reason: 'identity_mismatch', retryable: false }
           : { ok: false, reason: 'source_unavailable', retryable: true, stage };
-        planned = { taskId: task.id, sources, scanBudget };
+        planned = { taskId: task.id, sources, scanBudget, identityMissed };
         return { ok: true, reason: builtin ? 'builtin_engine_fallback' : 'engine_source_candidates' };
       };
     },
@@ -392,6 +399,9 @@ export function createBuiltinFallback(options: BuiltinFallbackOptions) {
           }
           stop = stopped(context.signal);
           if (stop) return stop;
+          // nocandrev41 F1：预检判定过身份缺失（原源可达但无此书）且候选全失败 ⇒ 按身份失败
+          // 终态收口（与预检腿选不到候选同一语义），不降级成 source_unavailable 16 轮退避重扫。
+          if (primary === null && plan?.identityMissed) return { kind: 'failure', code: 'identity_mismatch_or_no_candidate' };
           return primary ?? unavailable('search');
         },
       };
