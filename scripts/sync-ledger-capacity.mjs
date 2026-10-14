@@ -30,11 +30,51 @@
 //   - 只 UPDATE registered_bytes + updated_at；不改 state / target_bytes / admission_*（不在本任务范围）。
 //
 // 出口码：0=全部处理完（含 unchanged / dry-run）；1=有仓失败（至少一仓未取到可信值）；2=参数错误。
+//
+// 自包含性（部署约束）：本脚本**不 import 任何仓内其它模块**，只用 @neondatabase/serverless 与
+// node 内置。它要 scp 到 phoenix /opt/zhaoshu-download-b/scripts/ 与只装了 serverless 的探针同目录
+// 运行；若复用 register-storage-repository.mjs 那套 migrate-auth-prod.mjs/db-migration-lib.mjs，
+// 会连带拖进 ../src/lib/*.ts 整个 TS 树（argon2 等依赖），在服务器上根本起不来。故把三个小helper
+// （目标变量闸门 / 取连接串 / 脱敏错误）就地内联，保持行为口径一致。
+//
+// 与 assertProdDatabaseUrlEnv 的差异（有意）：那边额外拒收变量名 DATABASE_URL（开发机 .env.local 里
+// 有同名应用连接串，怕误指）。本脚本的生产目标就是服务器上**唯一**那个 DATABASE_URL（phoenix env 键
+// 白名单核实过：只有 DATABASE_URL/GITHUB_TOKEN 等，无专用 PROD_ 变量），拒掉它就没法部署。仍强制
+// 显式给变量名、仍不读 .env*、仍拒绝 TEST_DATABASE_URL（真 footgun）。
 import { neon } from '@neondatabase/serverless';
 import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { assertProdDatabaseUrlEnv, readDatabaseUrl } from './migrate-auth-prod.mjs';
-import { safeError } from './db-migration-lib.mjs';
+
+const ENV_NAME_RE = /^[A-Z_][A-Z0-9_]*$/;
+const REJECTED_ENV_NAMES = new Set(['TEST_DATABASE_URL']);
+
+function assertProdDatabaseUrlEnv(envName, usage = '') {
+  const suffix = usage ? `。${usage}` : '';
+  if (!envName || !ENV_NAME_RE.test(envName)) {
+    throw new Error(`必须用 --database-url-env=<大写变量名> 显式指定目标${suffix}`);
+  }
+  if (REJECTED_ENV_NAMES.has(envName)) {
+    throw new Error(`--database-url-env 不能是 ${envName}：本入口拒绝测试库连接变量${suffix}`);
+  }
+}
+
+/** 只校验形状并取出 host 供人核对；连接串本身不进本函数的返回值以外的任何地方。 */
+function readDatabaseUrl(envName, env = process.env) {
+  assertProdDatabaseUrlEnv(envName);
+  const value = env[envName]?.trim();
+  if (!value) throw new Error(`环境变量 ${envName} 为空；不会回退到 DATABASE_URL，也不会读取 .env 文件`);
+  let url;
+  try { url = new URL(value); } catch { throw new Error(`环境变量 ${envName} 不是有效的连接 URL`); }
+  if (!['postgres:', 'postgresql:'].includes(url.protocol)) throw new Error(`环境变量 ${envName} 必须是 PostgreSQL URL`);
+  return { connectionString: value, host: url.hostname };
+}
+
+/** 错误脱敏：连接串/口令不进日志与报告（同 db-migration-lib.mjs safeError）。 */
+function safeError(error) {
+  return {
+    message: String(error?.message ?? error).replace(/postgres(?:ql)?:\/\/[^\s]+/gi, '[REDACTED_DATABASE_URL]'),
+  };
+}
 
 export const DEFAULT_TREE_ROOT = 'books';
 /** 普通 blob 的 git mode：与 reconcile-tree-snapshot.ts:144 的 regular-blob 同判据。 */
@@ -43,8 +83,6 @@ const REGULAR_BLOB_MODES = new Set(['100644', '100755']);
 const MAX_DRILL_DOWN_DEPTH = 8;
 
 const USAGE = '用法: sync-ledger-capacity.mjs --database-url-env=<变量名> --github-token-env=<变量名> [--tree-root=books] [--dry-run | --apply]';
-
-const ENV_NAME_RE = /^[A-Z_][A-Z0-9_]*$/;
 
 /** @param {string[]} argv @param {Record<string, string | undefined>} [env] */
 export function parseSyncArgs(argv, env = process.env) {

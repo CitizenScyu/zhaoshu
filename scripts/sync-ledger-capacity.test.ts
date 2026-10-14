@@ -20,7 +20,6 @@ describe('参数解析：目标与 token 来源都必须显式，缺省 dry-run'
     [[], /--database-url-env/],
     [['--database-url-env=PROD_URL'], /--github-token-env/],
     [['--database-url-env=PROD_URL', '--github-token-env=lower'], /大写变量名/],
-    [['--database-url-env=DATABASE_URL', '--github-token-env=GITHUB_TOKEN'], /不能是 DATABASE_URL/],
     [['--database-url-env=TEST_DATABASE_URL', '--github-token-env=GITHUB_TOKEN'], /不能是 TEST_DATABASE_URL/],
     [['--database-url-env=PROD_URL', '--database-url-env=OTHER_URL', '--github-token-env=GH'], /只能给一次/],
     [['--database-url-env=PROD_URL', '--github-token-env=GH1', '--github-token-env=GH2'], /只能给一次/],
@@ -39,6 +38,8 @@ describe('参数解析：目标与 token 来源都必须显式，缺省 dry-run'
     expect(JSON.stringify(parsed)).not.toMatch(/gh[pousr]_token/i);
     expect(parseSyncArgs(['--database-url-env=PROD_URL', '--github-token-env=GH', '--apply'], {}).mode).toBe('apply');
     expect(parseSyncArgs(['--database-url-env=PROD_URL', '--github-token-env=GH', '--tree-root=/books/'], {}).treeRoot).toBe('books');
+    // 服务器上唯一那个 DATABASE_URL 就是本脚本的生产目标，必须放行（见脚本头「自包含性」注释）。
+    expect(parseSyncArgs(['--database-url-env=DATABASE_URL', '--github-token-env=GITHUB_TOKEN'], {}).dbEnv).toBe('DATABASE_URL');
   });
 });
 
