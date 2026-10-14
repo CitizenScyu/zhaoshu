@@ -8,7 +8,7 @@
 import { describe, expect, it } from 'vitest';
 import { decideRepositoryForPublication } from '../runtime-download/repository-rollover-wiring';
 import type { RepositoryCandidate } from '../runtime-download/repository-rollover';
-import { parseArgs, resolveActiveRepository, selectActiveRepository } from './repo-auto-create.mjs';
+import { evaluateThreshold, parseArgs, resolveActiveRepository, selectActiveRepository } from './repo-auto-create.mjs';
 
 const NOW = new Date('2026-10-15T00:00:00Z');
 const FUTURE = '2099-01-01T00:00:00.000Z';
@@ -220,6 +220,70 @@ describe('与权威决策层交叉验证：探针盯的仓 = decide 在当前仓
   });
 });
 
+describe('evaluateThreshold：现役模式比台账逻辑字节，legacy 比压缩 KiB（probefix41）', () => {
+  const legacy = (sizeKib: number, targetBytes = TARGET_BYTES, thresholdPct = 85) =>
+    evaluateThreshold({ metric: 'github-compressed', thresholdPct, cfgTargetBytes: targetBytes, accounting: null, sizeKib });
+  const ledger = (registeredBytes: bigint, reservedBytes: bigint, targetBytes = TARGET_BYTES, thresholdPct = 85) =>
+    evaluateThreshold({ metric: 'ledger-logical', thresholdPct, cfgTargetBytes: TARGET_BYTES,
+      accounting: { registeredBytes, reservedBytes, targetBytes }, sizeKib: 0 });
+
+  it('legacy（--current=）口径逐字不变：850MB 压缩字节边界两侧翻转，direction 是 >=', () => {
+    const boundary = Number(TARGET_BYTES / 1024n * 85n / 100n); // 85% of 1e9 B 换算 KiB
+    expect(legacy(boundary).thresholdKib).toBe(boundary);
+    expect(legacy(boundary - 1).exceeded).toBe(false);
+    expect(legacy(boundary).exceeded).toBe(true);      // 边界本身算过线（>=，非 >）
+    expect(legacy(boundary + 1).exceeded).toBe(true);
+    // 旧算法细节：先 /1024 再乘百分比（整数截断），不是先算字节再换 KiB
+    expect(legacy(0, BigInt(2_000_000_000), 90).thresholdKib).toBe(Number(BigInt(2_000_000_000) / 1024n * 90n / 100n));
+  });
+
+  it('legacy 模式忽略 accounting（保持「只看压缩 size」）', () => {
+    const over = legacy(Number(TARGET_BYTES / 1024n * 85n / 100n));
+    expect(over.metric).toBe('github-compressed');
+    expect(over.exceeded).toBe(true);
+  });
+
+  it('现役模式：registered+reserved 合计过 85% → 建仓（不取 cfg 默认 target）', () => {
+    // target 仍是台账里的 1e9，但 cfg 传 9e9 也不该被采信：判定必须跟台账。
+    const v = evaluateThreshold({ metric: 'ledger-logical', thresholdPct: 85, cfgTargetBytes: BigInt(9_000_000_000),
+      accounting: { registeredBytes: BigInt(849_999_999), reservedBytes: BigInt(1), targetBytes: TARGET_BYTES }, sizeKib: 0 });
+    expect(v.exceeded).toBe(true);
+    expect(v).toMatchObject({ metric: 'ledger-logical', thresholdLogicalBytes: BigInt(850_000_000) });
+  });
+
+  it('现役模式：reserved 单独把合计顶过线也算过线（与 decide 同式）', () => {
+    expect(ledger(BigInt(800_000_000), BigInt(60_000_000)).exceeded).toBe(true);
+    expect(ledger(BigInt(840_000_000), BigInt(9_999_999)).exceeded).toBe(false);
+  });
+
+  it('现役模式：books-2 现场量级（204,689,438 B）未过 85% → 不建仓（exit 2 below-threshold 的来源）', () => {
+    const v = ledger(BigInt(204_689_438), BigInt(0));
+    expect(v.exceeded).toBe(false);
+    expect(v.usedLogicalBytes).toBe(BigInt(204_689_438));
+  });
+
+  it('每仓用自己的 target_bytes（不用 cfg 默认值）', () => {
+    expect(ledger(BigInt(850_000_000), BigInt(0), BigInt(2_000_000_000)).exceeded).toBe(false);
+    expect(ledger(BigInt(1_700_000_000), BigInt(0), BigInt(2_000_000_000)).exceeded).toBe(true);
+  });
+
+  it('反例护栏：压缩口径永不触发的时点（逻辑 2.05GB ≈ 压缩 820MB）在新口径已触发', () => {
+    // books-2 实测压缩≈逻辑 40%。逻辑 2.05GB 时压缩仅 820MB < 旧阈值 829,101 KiB ⇒ 旧口径永不触发;
+    // 但台账早在 1e9 逻辑处就被 decide 切走、而 books-4 还没建 ⇒ ROLLOVER_WIRING_BLOCKED 死锁形态。
+    const compressedKib = Math.floor(820_000_000 / 1024);
+    expect(legacy(compressedKib).exceeded).toBe(false);
+    expect(ledger(BigInt(2_050_000_000), BigInt(0)).exceeded).toBe(true);
+  });
+
+  it('accounting 缺失 → 抛错失败关闭（不用默认值蒙混）', () => {
+    expect(() => evaluateThreshold({ metric: 'ledger-logical', thresholdPct: 85, cfgTargetBytes: TARGET_BYTES, accounting: null, sizeKib: 1 }))
+      .toThrow(/accounting/);
+    expect(() => evaluateThreshold({ metric: 'ledger-logical', thresholdPct: 85, cfgTargetBytes: TARGET_BYTES,
+      accounting: { registeredBytes: BigInt(1), reservedBytes: BigInt(0), targetBytes: BigInt(0) }, sizeKib: 1 }))
+      .toThrow(/target_bytes/);
+  });
+});
+
 describe('resolveActiveRepository（PGlite 真表）', () => {
   // 纯函数测不到列名/LEFT JOIN 写错，故用真表跑一次真实 SQL（合成数据，不触生产）。
   it('按 id 升序读全表候选，选第一个仍可写且未装满的仓', async () => {
@@ -251,6 +315,12 @@ describe('resolveActiveRepository（PGlite 真表）', () => {
     `);
     const active = await resolveActiveRepository(sql, NOW);
     expect(active).toMatchObject({ status: 'ok', repository: { id: 2, repo: 'repo-b', branch: 'main' } });
+    // accounting 是现役模式阈值判定的唯一输入来源，必须真表跑出来（不是 cfg 默认值）。
+    if (active.status === 'ok') {
+      expect(active.accounting).toEqual({ registeredBytes: BigInt(120_000_000), reservedBytes: BigInt(0), targetBytes: BigInt(1_000_000_000) });
+      expect(evaluateThreshold({ metric: 'ledger-logical', thresholdPct: 85, cfgTargetBytes: BigInt(9_000_000_000),
+        accounting: active.accounting, sizeKib: 0 }).exceeded).toBe(false);
+    }
     await pg.close();
   }, 60_000);
 });

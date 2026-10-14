@@ -3,8 +3,9 @@
 // 设计依据:
 // - 仓满自动切换链路草案(本轮静态盘点, novel-finder/runtime-download/repository-rollover.ts
 //   是已写好的纯决策层;缺的就是候选池里没下一仓)。
-// - 用户口径: 1G = 10^9 字节, 告警阈值 85% (~890MB 压缩口径), 满仓 100%。
-// - GitHub API size 字段报的是 KB(压缩后 Git 仓大小), 与 1GB=10^9B 阈值对照需换算。
+// - 用户口径: 1G = 10^9 字节, 告警阈值 85%, 满仓 100%。
+// - GitHub API size 字段报的是 KB(压缩后 Git 仓大小), 与 1GB=10^9B 阈值**不是同一度量**;
+//   legacy 模式仍按它换算比较,现役模式改用台账逻辑字节（见文件头与 evaluateThreshold）。
 //
 // 行为合同:
 // - 幂等: 按"当前仓名-N"的命名约定探测下一编号;若 storage_repositories 已有目标行
@@ -30,8 +31,14 @@
 // - 「现役仓」定义:见 selectActiveRepository 注释——与 decideRepositoryForPublication
 //   同一组判据,失败关闭,无任何「最后一个被封存仓」或「ZHAOSHU_BOOKS_REPO 配置值」回退,
 //   否则 books-3/4 永不会被探针观察到（ledgersync41）。
-// - 阈值比较仍用 GitHub 报回的 size 字段(KiB 压缩口径);与台账逻辑字节不是同一度量,
-//   不在本任务范围,follow-up 单独处理（见 ledgersync41 报告）。
+// - 阈值比较有两套口径,按模式分家（见 evaluateThreshold）:
+//   · --current-from-ledger（现役模式,生产在用）: 台账逻辑字节 registered_bytes+reserved_bytes
+//     对每仓 target_bytes×thresholdPct。与 decideRepositoryForPublication 同一度量、同一账本,
+//     故必然在 decide 切仓之前触发,不会出现「decide 已切、探针仍 below-threshold」的死锁。
+//   · --current=owner/repo（legacy）: 沿用 GitHub 报回的压缩 size(KiB) 对 --target-bytes,
+//     行为逐字不变。
+//   GitHub 压缩 size 两种模式都照旧拉取,但只进日志不参与判定——TXT 压缩比下压缩≈逻辑 40%,
+//   拿它比 10^9 逻辑字节阈值会要 2.1GB 逻辑才触发,那时仓早就被 decide 切走了。
 
 import { neon } from '@neondatabase/serverless';
 
@@ -153,6 +160,40 @@ export async function resolveActiveRepository(sql, now) {
   return selectActiveRepository(rows, now);
 }
 
+/**
+ * 阈值判定（纯函数，两套口径按模式分家）。判定只读入参、不读时钟、不发网络，便于反例验证。
+ *
+ * - metric='ledger-logical'（--current-from-ledger,生产在用）: 用台账账目
+ *   registered+reserved 对**每仓自己的** targetBytes×thresholdPct。这与 decideRepositoryForPublication
+ *   的投影式判定同账本同单位,故 registered+reserved 越过 85% 时探针先于 decide 的 100% 切仓触发,
+ *   下一仓必定已经建好——不留「decide 已切、探针还 below-threshold」的死锁窗口。
+ * - metric='github-compressed'（legacy --current=）: GitHub 报回的压缩 size(KiB) 对
+ *   --target-bytes 的 85%,逐字沿用旧算法与旧比较方向。
+ * sizeKib 两种模式都只是日志字段,不参与 ledger 口径的判定。
+ *
+ * @param {{ metric: 'ledger-logical'|'github-compressed', thresholdPct: number,
+ *           cfgTargetBytes: bigint, accounting: {registeredBytes: bigint, reservedBytes: bigint, targetBytes: bigint}|null,
+ *           sizeKib: number }} input
+ */
+export function evaluateThreshold({ metric, thresholdPct, cfgTargetBytes, accounting, sizeKib }) {
+  if (metric === 'ledger-logical') {
+    if (!accounting) throw new Error('ledger 口径缺少 accounting（调用方须先失败关闭，不得猜默认值）');
+    const registered = BigInt(accounting.registeredBytes);
+    const reserved = BigInt(accounting.reservedBytes);
+    const target = BigInt(accounting.targetBytes);
+    if (!(target > BigInt(0))) throw new Error(`ledger target_bytes 非正: ${accounting.targetBytes}`);
+    const thresholdLogicalBytes = target * BigInt(thresholdPct) / 100n;
+    const usedLogicalBytes = registered + reserved;
+    return {
+      metric, exceeded: usedLogicalBytes >= thresholdLogicalBytes,
+      usedLogicalBytes, thresholdLogicalBytes, accountingTargetBytes: target,
+      thresholdKib: null,
+    };
+  }
+  const thresholdKib = Number(cfgTargetBytes / 1024n * BigInt(thresholdPct) / 100n);
+  return { metric, exceeded: sizeKib >= thresholdKib, thresholdKib, sizeKib };
+}
+
 async function ghFetch(token, method, path, body) {
   const res = await fetch(`https://api.github.com${path}`, {
     method,
@@ -240,39 +281,61 @@ async function main() {
   let owner = cfg.owner;
   let repo = cfg.repo;
   let activeRepositoryId = null;
+  let accounting = null;
   if (cfg.currentFromLedger) {
     // 现役仓从台账派生，不从配置/写死值派生（ledgersync41 根因）。
     const active = await resolveActiveRepository(sql, new Date());
-    if (active.status !== 'ok') {
+    if (active.status !== 'ok' || !active.accounting) {
       // 失败关闭：不猜、不回退到任何硬编码仓；unit 的 SuccessExitStatus 只含 0/2，故退出码 3 会被
-      // systemd 判为失败并告警——这是期望行为（账目不可信时宁可不探针）。
-      console.error(JSON.stringify({ phase: 'done', status: 'no-active-repository', reason: active.reason, exit: 3 }));
+      // systemd 判为失败并告警——这是期望行为（账目不可信时宁可不探针）。accounting 缺失同样落这条
+      // ——账目残缺等于账目不可信，失败关闭而非用默认值蒙混。
+      console.error(JSON.stringify({ phase: 'done', status: 'no-active-repository',
+        reason: active.status === 'ok' ? 'ledger accounting missing' : active.reason,
+        metric: 'ledger-logical', exit: 3 }));
       process.exitCode = 3;
       return;
     }
     owner = active.repository.owner;
     repo = active.repository.repo;
     activeRepositoryId = active.repository.id;
+    accounting = active.accounting;
   }
-  const thresholdKib = Number(cfg.targetBytes / 1024n * BigInt(cfg.thresholdPct) / 100n);
-  console.log(JSON.stringify({ phase: 'probe', current: `${owner}/${repo}`, repositoryId: activeRepositoryId,
-    source: cfg.currentFromLedger ? 'ledger' : 'flag', thresholdPct: cfg.thresholdPct, thresholdKib, mode: cfg.mode }));
-
+  const metric = cfg.currentFromLedger ? 'ledger-logical' : 'github-compressed';
   const cur = await readRepoSizeKib(cfg.token, owner, repo);
-  const exceeded = cur.sizeKib >= thresholdKib;
-  console.log(JSON.stringify({ phase: 'probe-result', sizeKib: cur.sizeKib, thresholdKib, exceeded, defaultBranch: cur.defaultBranch }));
+  const verdict = evaluateThreshold({
+    metric, thresholdPct: cfg.thresholdPct, cfgTargetBytes: cfg.targetBytes, accounting, sizeKib: cur.sizeKib,
+  });
+  const probeLog = {
+    phase: 'probe', current: `${owner}/${repo}`, repositoryId: activeRepositoryId,
+    source: cfg.currentFromLedger ? 'ledger' : 'flag',
+    metric, thresholdPct: cfg.thresholdPct, mode: cfg.mode,
+  };
+  if (verdict.thresholdKib !== null) probeLog.thresholdKib = verdict.thresholdKib;
+  console.log(JSON.stringify(probeLog));
 
-  if (!exceeded) {
-    console.log(JSON.stringify({ phase: 'done', status: 'below-threshold', exit: 2 }));
+  const probeResultLog = {
+    phase: 'probe-result', metric, sizeKib: cur.sizeKib, exceeded: verdict.exceeded,
+    defaultBranch: cur.defaultBranch,
+  };
+  if (verdict.thresholdKib !== null) probeResultLog.thresholdKib = verdict.thresholdKib;
+  if (verdict.usedLogicalBytes !== undefined) {
+    probeResultLog.usedLogicalBytes = verdict.usedLogicalBytes.toString();
+    probeResultLog.thresholdLogicalBytes = verdict.thresholdLogicalBytes.toString();
+    probeResultLog.accountingTargetBytes = verdict.accountingTargetBytes.toString();
+  }
+  console.log(JSON.stringify(probeResultLog));
+
+  if (!verdict.exceeded) {
+    console.log(JSON.stringify({ phase: 'done', status: 'below-threshold', metric, exit: 2 }));
     process.exitCode = 2;
     return;
   }
 
   const nextName = await findNextName(cfg.token, owner, repo);
-  console.log(JSON.stringify({ phase: 'plan', nextRepo: `${owner}/${nextName}`, branch: cur.defaultBranch }));
+  console.log(JSON.stringify({ phase: 'plan', nextRepo: `${owner}/${nextName}`, branch: cur.defaultBranch, metric }));
 
   if (cfg.mode === 'dry-run') {
-    console.log(JSON.stringify({ phase: 'done', status: 'dry-run', wouldCreate: `${owner}/${nextName}` }));
+    console.log(JSON.stringify({ phase: 'done', status: 'dry-run', wouldCreate: `${owner}/${nextName}`, metric }));
     return;
   }
 
@@ -285,14 +348,14 @@ async function main() {
     const existingId = existing[0] ? Number(existing[0].id) : null;
     if (existingId) {
       await liftCapacityLedger(sql, existingId, cur.defaultBranch);
-      console.log(JSON.stringify({ phase: 'done', status: 'applied', repo: `${owner}/${nextName}`, storageId: existingId, note: 'concurrent-skip-register lift-capacity' }));
+      console.log(JSON.stringify({ phase: 'done', status: 'applied', repo: `${owner}/${nextName}`, storageId: existingId, note: 'concurrent-skip-register lift-capacity', metric }));
       return;
     }
-    console.log(JSON.stringify({ phase: 'done', status: 'applied', repo: `${owner}/${nextName}`, storageId: 'concurrent-skip', note: '未找到既有行,跳过 lift' }));
+    console.log(JSON.stringify({ phase: 'done', status: 'applied', repo: `${owner}/${nextName}`, storageId: 'concurrent-skip', note: '未找到既有行,跳过 lift', metric }));
     return;
   }
   await liftCapacityLedger(sql, Number(id), cur.defaultBranch);
-  console.log(JSON.stringify({ phase: 'done', status: 'applied', repo: `${owner}/${nextName}`, storageId: Number(id), capacity: 'ready/granted' }));
+  console.log(JSON.stringify({ phase: 'done', status: 'applied', repo: `${owner}/${nextName}`, storageId: Number(id), capacity: 'ready/granted', metric }));
 }
 
 // 仅当脚本被直接执行时才跑 main;被 import 时只暴露模块接口
