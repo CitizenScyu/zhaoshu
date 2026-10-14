@@ -64,10 +64,12 @@ function expectSafeReclaim(index: number) {
   expect(query).toContain('updated_at = now()');
   expect(query).toMatch(/WHERE status = 'running' AND updated_at < now\(\) - \(\?::bigint \* interval '1 millisecond'\)$/);
   expect(sql.mock.calls[index].slice(1)).toEqual([
-    // 退避梯封顶 6h（SOURCE_RETRY_MAX_DELAY_MS，download-task-policy.ts:10）；末位 30min 为 DOWNLOAD_TASK_STALE_MS。
-    16, 16, 16, 15 * 60_000, 6 * 60 * 60_000, 16,
+    // 退避梯封顶 30min（SOURCE_RETRY_MAX_DELAY_MS，download-task-policy.ts:13）；末位 30min 为 DOWNLOAD_TASK_STALE_MS。
+    16, 16, 16, 15 * 60_000, 30 * 60_000, 16,
     '\nworker 中断自动回收，退避后重新入队', '\nworker 中断自动回收', 30 * 60_000,
   ]);
+  // 41-zombieocc：回收紧随其后同步清僵尸占用行——占用行的 task 不在 running 即视为残留。
+  expect(queryText(index + 1)).toMatch(/^DELETE FROM download_host_occupancy WHERE task_id IS NOT NULL AND NOT EXISTS \(SELECT 1 FROM download_tasks WHERE download_tasks\.id = download_host_occupancy\.task_id AND status = 'running'\) RETURNING host$/);
 }
 
 const book = { id: 7, title: '测试书', author: '作者', source_url: 'https://builtin.test/books/details7.html' };
@@ -224,8 +226,9 @@ describe('/api/download recovery and cleanup', () => {
 
   it('recovers before POST deduplication and only lets pending/running block a new task', async () => {
     sql.mockResolvedValueOnce([book])
-      .mockResolvedValueOnce([])
-      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([])   // 回收 UPDATE
+      .mockResolvedValueOnce([])   // 回收 DELETE 僵尸占用
+      .mockResolvedValueOnce([])   // 活动任务查询：无
       .mockResolvedValueOnce([{ id: 43 }]);
 
     const res = await POST(request('POST', { bookId: book.id }));
@@ -234,10 +237,10 @@ describe('/api/download recovery and cleanup', () => {
     expect(await res.json()).toEqual({ taskId: 43 });
     expectSafeReclaim(1);
     // F03：活动锁只看 pending/running——partial（残缺终态）不阻塞重下补齐
-    expect(queryText(2)).toMatch(/WHERE requested_by = 'user' AND user_id = \? AND book_id = \? AND status IN \('pending', 'running'\) ORDER BY created_at DESC LIMIT 1$/);
-    expect(queryText(2)).not.toContain('partial');
-    expect(queryText(3)).toMatch(/^INSERT INTO download_tasks /);
-    expect(sql.mock.calls[3].slice(1)).toEqual([1, book.id, book.title, book.author, book.source_url, 'builtin', null, '']);
+    expect(queryText(3)).toMatch(/WHERE requested_by = 'user' AND user_id = \? AND book_id = \? AND status IN \('pending', 'running'\) ORDER BY created_at DESC LIMIT 1$/);
+    expect(queryText(3)).not.toContain('partial');
+    expect(queryText(4)).toMatch(/^INSERT INTO download_tasks /);
+    expect(sql.mock.calls[4].slice(1)).toEqual([1, book.id, book.title, book.author, book.source_url, 'builtin', null, '']);
     expect(triggerDownloadWorkflow).toHaveBeenCalledOnce();
     expect(getBuiltinRequestSource).toHaveBeenCalledTimes(1);
     expect(getBuiltinRequestSource).toHaveBeenCalledWith('builtin.test', expect.any(AbortSignal));
@@ -247,7 +250,8 @@ describe('/api/download recovery and cleanup', () => {
 
   it('still refuses to enqueue a duplicate active task and returns its taskId and status', async () => {
     sql.mockResolvedValueOnce([book])
-      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([])   // 回收 UPDATE
+      .mockResolvedValueOnce([])   // 回收 DELETE 僵尸占用
       .mockResolvedValueOnce([{ id: 42, status: 'running' }]);
 
     const res = await POST(request('POST', { bookId: book.id }));
@@ -261,13 +265,14 @@ describe('/api/download recovery and cleanup', () => {
       status: 'running',
     });
     expectSafeReclaim(1);
-    expect(sql).toHaveBeenCalledTimes(3);
+    expect(sql).toHaveBeenCalledTimes(4);
     expect(triggerDownloadWorkflow).not.toHaveBeenCalled();
   });
 
   it('F17：23505 竞争路径补读本人活动任务，两个并发请求最终指向同一 taskId', async () => {
     sql.mockResolvedValueOnce([book])
-      .mockResolvedValueOnce([])   // 回收
+      .mockResolvedValueOnce([])   // 回收 UPDATE
+      .mockResolvedValueOnce([])   // 回收 DELETE 僵尸占用
       .mockResolvedValueOnce([])   // 竞争前的活动查询：对手尚未提交可见
       .mockRejectedValueOnce(Object.assign(new Error('duplicate key'), { code: '23505' })) // INSERT 撞唯一索引
       .mockResolvedValueOnce([{ id: 55, status: 'pending' }]); // 补读本人活动任务
@@ -282,14 +287,15 @@ describe('/api/download recovery and cleanup', () => {
       taskId: 55,
       status: 'pending',
     });
-    expect(sql).toHaveBeenCalledTimes(5);
+    expect(sql).toHaveBeenCalledTimes(6);
     expect(triggerDownloadWorkflow).not.toHaveBeenCalled();
   });
 
   it('F03：同一本书只有 partial（残缺）任务时可重新入队补齐', async () => {
     // 活动锁只匹配 pending/running，已有的 partial 行不在去重结果里，因此建任务成功。
     sql.mockResolvedValueOnce([book])
-      .mockResolvedValueOnce([])   // 回收
+      .mockResolvedValueOnce([])   // 回收 UPDATE
+      .mockResolvedValueOnce([])   // 回收 DELETE 僵尸占用
       .mockResolvedValueOnce([])   // 活动任务查询：partial 不返回
       .mockResolvedValueOnce([{ id: 44 }]);
 
@@ -297,7 +303,7 @@ describe('/api/download recovery and cleanup', () => {
 
     expect(res.status).toBe(201);
     expect(await res.json()).toEqual({ taskId: 44 });
-    expect(queryText(2)).not.toContain('partial');
+    expect(queryText(3)).not.toContain('partial');
     expect(triggerDownloadWorkflow).toHaveBeenCalledOnce();
   });
 
@@ -318,18 +324,18 @@ describe('/api/download recovery and cleanup', () => {
 
   it('admitted engine requests persist source identity/revision and never wake the legacy builtin worker', async () => {
     vi.mocked(getEngineSources).mockResolvedValueOnce([{ url:'https://www.yingsx.com/', name:'合成源', searchUrl:'/search', rules:{ ruleContent:{content:'.body'} }, tier:'M1' }]);
-    sql.mockResolvedValueOnce([{...book,source_url:'https://www.yingsx.com/book/7'}]).mockResolvedValueOnce([]).mockResolvedValueOnce([]).mockResolvedValueOnce([{id:43}]);
+    sql.mockResolvedValueOnce([{...book,source_url:'https://www.yingsx.com/book/7'}]).mockResolvedValueOnce([]).mockResolvedValueOnce([]).mockResolvedValueOnce([]).mockResolvedValueOnce([{id:43}]);
     expect((await POST(request('POST',{bookId:7}))).status).toBe(201);
-    expect(sql.mock.calls[3].slice(-3)).toEqual(['engine','https://www.yingsx.com/',expect.stringMatching(/^[a-f0-9]{40}$/)]);
+    expect(sql.mock.calls[4].slice(-3)).toEqual(['engine','https://www.yingsx.com/',expect.stringMatching(/^[a-f0-9]{40}$/)]);
     expect(triggerDownloadWorkflow).not.toHaveBeenCalled();
   });
 
   it('dispatch defaults off: creation succeeds and client cannot create system requests', async () => {
     vi.stubEnv('LEGACY_DOWNLOAD_DISPATCH_ENABLED', '');
-    sql.mockResolvedValueOnce([book]).mockResolvedValueOnce([]).mockResolvedValueOnce([]).mockResolvedValueOnce([{ id: 43 }]);
+    sql.mockResolvedValueOnce([book]).mockResolvedValueOnce([]).mockResolvedValueOnce([]).mockResolvedValueOnce([]).mockResolvedValueOnce([{ id: 43 }]);
     expect((await POST(request('POST', { bookId: 7, requestedBy: 'system', userId: 2 }))).status).toBe(201);
-    expect(queryText(3)).toContain("'user'");
-    expect(sql.mock.calls[3][1]).toBe(1);
+    expect(queryText(4)).toContain("'user'");
+    expect(sql.mock.calls[4][1]).toBe(1);
     expect(triggerDownloadWorkflow).not.toHaveBeenCalled();
   });
 
@@ -344,18 +350,18 @@ describe('/api/download recovery and cleanup', () => {
 
   it('规范化书库 HTTPS 地址入队，忽略客户端自报地址', async () => {
     sql.mockResolvedValueOnce([{ ...book, source_url: 'https://BUILTIN.TEST:443/books/details7.html#chapters' }])
-      .mockResolvedValueOnce([]).mockResolvedValueOnce([]).mockResolvedValueOnce([{ id: 43 }]);
+      .mockResolvedValueOnce([]).mockResolvedValueOnce([]).mockResolvedValueOnce([]).mockResolvedValueOnce([{ id: 43 }]);
     expect((await POST(request('POST', { bookId: book.id, sourceUrl: 'https://127.0.0.1/private' }))).status).toBe(201);
-    expect(sql.mock.calls[3].slice(1)).toEqual([1, book.id, book.title, book.author, book.source_url, 'builtin', null, '']);
+    expect(sql.mock.calls[4].slice(1)).toEqual([1, book.id, book.title, book.author, book.source_url, 'builtin', null, '']);
     expect(triggerDownloadWorkflow).toHaveBeenCalledOnce();
   });
 
   it('enqueues a registered active www builtin alias', async () => {
     const wwwUrl = 'https://www.builtin.test/books/details7.html';
     sql.mockResolvedValueOnce([{ ...book, source_url: wwwUrl }])
-      .mockResolvedValueOnce([]).mockResolvedValueOnce([]).mockResolvedValueOnce([{ id: 43 }]);
+      .mockResolvedValueOnce([]).mockResolvedValueOnce([]).mockResolvedValueOnce([]).mockResolvedValueOnce([{ id: 43 }]);
     expect((await POST(request('POST', { bookId: book.id }))).status).toBe(201);
-    expect(sql.mock.calls[3].slice(1)).toEqual([1, book.id, book.title, book.author, wwwUrl, 'builtin', null, '']);
+    expect(sql.mock.calls[4].slice(1)).toEqual([1, book.id, book.title, book.author, wwwUrl, 'builtin', null, '']);
     expect(triggerDownloadWorkflow).toHaveBeenCalledOnce();
   });
 
