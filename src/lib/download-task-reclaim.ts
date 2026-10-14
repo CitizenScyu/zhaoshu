@@ -34,6 +34,18 @@ export async function reclaimStaleTasks(sql: DownloadSql): Promise<void> {
         lease_owner = '',
         updated_at = now()
     WHERE status = 'running' AND updated_at < now() - (${DOWNLOAD_TASK_STALE_MS}::bigint * interval '1 millisecond')`;
+  // 41-zombieocc：reclaim 收完僵尸任务后，同步清 download_host_occupancy 里的僵尸占用行——
+  // worker 硬终止（SIGKILL/掉电）时 closeScope 的 finally 释放不会执行，占用行只能等 TTL
+  // （download TTL=任务超时+10min，最长约 6h）。判据与释放链同一事实：占用行的 task 不在
+  // running ⇒ 持有它的 download/prefetch 作用域已结束（正常路径会自删，剩的就是硬终止残留）。
+  // 不删会导致这些 host 的所有后续任务连环 host_occupied 退避（2026-10-14 6 行僵尸占用挡住
+  // sto66/kxdu/cuoceng/yunqi 等源的实测案例）。prefetch 作用域 task_id 为 NULL 且 TTL 短（6min），
+  // 不在谓词内，自然过期即净。
+  await sql`
+    DELETE FROM download_host_occupancy
+    WHERE task_id IS NOT NULL
+      AND NOT EXISTS (SELECT 1 FROM download_tasks WHERE download_tasks.id = download_host_occupancy.task_id AND status = 'running')
+    RETURNING host`;
 }
 
 // GET 保持只读：不写库，只把「running 且心跳过期」派生为可操作状态。

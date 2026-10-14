@@ -61,7 +61,10 @@ const maybe = PGliteCtor ? describe : describe.skip;
 
 const MINUTE = 60_000;
 const TITLE = '测试书';
-const AUTHOR = '佚名';
+// 41-IDLENIENT：身份判据与阅读器 sourceBookMatches 同口径，作者门两侧都过 knownSourceAuthor——
+// 占位作者（佚名/未知）归一成空串即视为「无作者约束」，测不了「作者不符」。这里用具体作者，
+// 让 ② 的作者不匹配反例仍然成立。
+const AUTHOR = '测试作者';
 const BOOK_URL = 'https://book15.net/books/details1.html';
 const TXT = '第一章\n\n合成正文\n\n';
 
@@ -212,6 +215,9 @@ maybe('41-T8FB：builtin 任务 book15 不可达时回退引擎源池', () => {
     const executor = await createDownloadExecutor({
       budget, budgetStatePath: budgetPath, budgetLimit: 3, workDir,
       env: (opts.env ?? {}) as NodeJS.ProcessEnv,
+      // bsrcfix-20261007：显式注入 sql——候选持久化/失败记忆/物理 host 占用门走真 DB 链
+      // （此前只注入 storage，candidates/occupancy 装配空转，新增的落库断言测不到真表）。
+      sql: sql as never,
       storage: createWorkerStorage(sql) as never, github,
       modules: modules as never, transport: transport as never, engineDownload: engineDownload as never,
       loadEnginePool: async () => {
@@ -270,16 +276,18 @@ maybe('41-T8FB：builtin 任务 book15 不可达时回退引擎源池', () => {
     expect(github.files.size).toBe(0);
   });
 
-  it('③ 引擎源也失败 ⇒ 最多试 MAX_FALLBACK_SOURCES 个源，仍 pending、退避 15m 生效、额度退还、零发布', async () => {
+  it('③ 引擎源也失败 ⇒ 首批 2 源全败后补扫其余源，仍 pending、退避 15m 生效、额度退还、零发布', async () => {
     const id = await insertTask();
     const pool = ['s1.example', 's2.example', 's3.example', 's4.example'];
     const w = await wired({
       pool,
       catalog: Object.fromEntries(pool.map(host => [host, listing(host)])),
-      downloads: { 's1.example': 'unavailable', 's2.example': 'mismatch', 's3.example': 'unavailable', 's4.example': 'done' },
+      downloads: { 's1.example': 'unavailable', 's2.example': 'mismatch', 's3.example': 'unavailable', 's4.example': 'mismatch' },
     });
     expect(await w.executor.runOnce()).toBe(DEFAULT_DECISIONS.TASK_DONE);
-    expect(w.downloaded).toEqual(pool.slice(0, MAX_FALLBACK_SOURCES));
+    // bsrcfix-41：预检早停目标 2（FALLBACK_HOST_TARGET）先选 2 源；首批全败后触发一次补扫，
+    // 排除已失败 URL 后扫到其余 2 源——四源全部试完仍无成功源。
+    expect(w.downloaded).toEqual(pool);
     const state = await row(id);
     expect(state).toMatchObject({ status: 'pending', attempt_count: 2, artifact_id: null });
     expect(state.delay_ms).toBe(15 * MINUTE);
@@ -287,6 +295,17 @@ maybe('41-T8FB：builtin 任务 book15 不可达时回退引擎源池', () => {
     expect(github.files.size).toBe(0);
     expect(await createWorkerStorage(sql).claim('peek')).toBeNull(); // 退避生效：未到期不可再领
     expect(w.logs.find(line => line.message === '书源不可达')?.fields).toMatchObject({ reason: 'source_unavailable', host: 'book15.net' });
+    // bsrcfix-41 失败记忆：不可达 ⇒ temporary、身份不符 ⇒ permanent，均落候选表；
+    // 下轮只排除失败 URL，同 host 的其它 URL 仍可补扫。
+    const marks = (await pg.query(
+      `SELECT source_url, failure FROM download_source_candidates WHERE book_id = 1 ORDER BY source_url`,
+    )).rows as { source_url: string; failure: string }[];
+    expect(marks).toEqual([
+      { source_url: `https://s1.example/`, failure: 'temporary' },
+      { source_url: `https://s2.example/`, failure: 'permanent' },
+      { source_url: `https://s3.example/`, failure: 'temporary' },
+      { source_url: `https://s4.example/`, failure: 'permanent' },
+    ]);
   });
 
   it('④ book15 可达 ⇒ 与改前一致：只走 book15，不读引擎源池、不搜引擎源', async () => {

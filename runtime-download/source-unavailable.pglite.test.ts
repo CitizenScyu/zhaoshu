@@ -126,7 +126,7 @@ maybe('41-EXEC-SRCUNAVAIL：书源不可达不落终态、不耗日配额、零�
 
   const insertTask = async (): Promise<number> => Number(((await pg.query(
     `INSERT INTO download_tasks(user_id, book_id, title, author, status, source_url, requested_by, source_kind)
-     VALUES (NULL, 1, '测试书', '佚名', 'pending', $1, 'system', 'builtin') RETURNING id`, [BOOK_URL],
+     VALUES (NULL, 1, '测试书', '测试作者', 'pending', $1, 'system', 'builtin') RETURNING id`, [BOOK_URL],
   )).rows[0] as { id: number }).id);
   const row = async (id: number) => (await pg.query(
     `SELECT status, error, attempt_count, artifact_id,
@@ -187,7 +187,7 @@ maybe('41-EXEC-SRCUNAVAIL：书源不可达不落终态、不耗日配额、零�
     expect(lines).toHaveLength(1);
     expect(lines[0].fields).toEqual({ reason: 'source_unavailable', stage: 'search', host: 'book15.net', retryAt: state.next_attempt_at });
     const printed = JSON.stringify(logs);
-    for (const secret of ['测试书', '佚名', 'details1', 'search.html', 'kw=', 'https://']) expect(printed).not.toContain(secret);
+    for (const secret of ['测试书', '测试作者', 'details1', 'search.html', 'kw=', 'https://']) expect(printed).not.toContain(secret);
   });
 
   it.each([522, 503])('② 源站 HTTP %s ⇒ 同 ①：pending + 退避、配额退还、零发布', async status => {
@@ -243,7 +243,7 @@ maybe('41-EXEC-SRCUNAVAIL：书源不可达不落终态、不耗日配额、零�
     expect((await row(id)).attempt_count).toBe(3);
   });
 
-  it('⑥ 连续不可达 ⇒ 退避按 attempt_count 递增：15m → 30m → 1h → 2h', async () => {
+  it('⑥ 连续不可达 ⇒ 退避按 attempt_count 递增并封顶 30m：15m → 30m → 30m → 30m', async () => {
     const id = await insertTask();
     const budget = ledgerBudget();
     const delays: number[] = [];
@@ -254,11 +254,11 @@ maybe('41-EXEC-SRCUNAVAIL：书源不可达不落终态、不耗日配额、零�
       delays.push(Number(state.delay_ms));
       await dueNow(id);
     }
-    expect(delays).toEqual([15, 30, 60, 120].map(m => m * MINUTE));
+    expect(delays).toEqual([15, 30, 30, 30].map(m => m * MINUTE));
     expect(budget.used()).toBe(0);
   });
 
-  it('⑥ 上限：退避封顶 6h；第 16 次仍不可达 ⇒ 转终态 partial（source_unavailable），配额照退、零发布', async () => {
+  it('⑥ 上限：退避封顶 30m；第 16 次仍不可达 ⇒ 转终态 partial（source_unavailable），配额照退、零发布', async () => {
     const id = await insertTask();
     await pg.query('UPDATE download_tasks SET attempt_count = 15 WHERE id = $1', [id]);
     const budget = ledgerBudget();
@@ -266,7 +266,7 @@ maybe('41-EXEC-SRCUNAVAIL：书源不可达不落终态、不耗日配额、零�
     await runOnce(failingSearch(() => new SourceHttpError(522)), budget, logs);
     const deferred = await row(id);
     expect(deferred).toMatchObject({ status: 'pending', attempt_count: 16 });
-    expect(deferred.delay_ms).toBe(6 * 60 * MINUTE);
+    expect(deferred.delay_ms).toBe(30 * MINUTE);
     await dueNow(id);
     await runOnce(failingSearch(() => new SourceHttpError(522)), budget, logs);
     const terminal = await row(id);
@@ -322,7 +322,7 @@ maybe('41-EXEC-SRCUNAVAIL 第二轮：生产装配（扣额度前预检开）', 
 
   const insertTask = async (): Promise<number> => Number(((await pg.query(
     `INSERT INTO download_tasks(user_id, book_id, title, author, status, source_url, requested_by, source_kind)
-     VALUES (NULL, 1, '测试书', '佚名', 'pending', $1, 'system', 'builtin') RETURNING id`, [BOOK_URL],
+     VALUES (NULL, 1, '测试书', '测试作者', 'pending', $1, 'system', 'builtin') RETURNING id`, [BOOK_URL],
   )).rows[0] as { id: number }).id);
   const row = async (id: number) => (await pg.query(
     `SELECT status, error, attempt_count,
@@ -347,7 +347,7 @@ maybe('41-EXEC-SRCUNAVAIL 第二轮：生产装配（扣额度前预检开）', 
         if (options.failBookRead?.n === bookReads) throw options.failBookRead.error();
         return {
           url,
-          text: `<meta property="og:novel:book_name" content="测试书"><meta property="og:novel:author" content="${options.pageAuthor ?? '佚名'}">`
+          text: `<meta property="og:novel:book_name" content="测试书"><meta property="og:novel:author" content="${options.pageAuthor ?? '测试作者'}">`
             + '<div class="d-chapter-list" id="full-catalog"><dd><a href="/chapter/index1-1.html">第1章</a></dd></div>',
         };
       }
@@ -470,7 +470,7 @@ maybe('41-EXEC-SRCUNAVAIL 第二轮：生产装配（扣额度前预检开）', 
     // （resolve 不在可达性阶段）⇒ fail-open 照常 consume；下载器判 code=2 ⇒ source_unavailable ⇒ 退避 + 凭票退还。
     const id = Number(((await pg.query(
       `INSERT INTO download_tasks(user_id, book_id, title, author, status, source_url, requested_by, source_kind)
-       VALUES (NULL, 1, '测试书', '佚名', 'pending', 'http://book15.net/books/details1.html', 'system', 'builtin') RETURNING id`,
+       VALUES (NULL, 1, '测试书', '测试作者', 'pending', 'http://book15.net/books/details1.html', 'system', 'builtin') RETURNING id`,
     )).rows[0] as { id: number }).id);
     const budget = ledgerBudget();
     const logs: LogLine[] = [];

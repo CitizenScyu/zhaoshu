@@ -7,7 +7,7 @@
 // admissionFetch / validateAdmissionUrl 不在此（它们在 rule-engine/admission.ts 且不导出）。
 import { alternateSourceHost, SourcePolicyError, upgradeSourceTemplateUrl, validateSourceUrl } from '@/lib/source-policy';
 import {
-  MAX_SOURCE_CHAPTERS, buildSourceSearchRequest, parseSourceAlias, sourceSearchUrl, type SourceBookIdentity, type SourceChapter,
+  MAX_SOURCE_CHAPTERS, buildSourceSearchRequest, itempropAuthorOf, parseSourceAlias, sourceSearchUrl, type SourceBookIdentity, type SourceChapter,
 } from '@/lib/source-parser';
 import type { SourceRequestContext } from '@/lib/source-reader';
 import { contentHtmlToText, contentNeedsHtmlToText } from './content-html';
@@ -108,8 +108,14 @@ export async function engineFetchDetail(
   const author = evaluateText(source.compiled, 'ruleBookInfo.author', scope);
   const tocUrl = absoluteUrl(evaluateText(source.compiled, 'ruleBookInfo.tocUrl', scope), page.url);
   if (title) detail.title = title;
-  if (author) detail.author = author;
   if (tocUrl) detail.tocUrl = tocUrl;
+  // 41-author：源的 ruleBookInfo.author 没命中（vikbook 写 .author@a 但页面并无该 class）时，
+  // 退 schema.org 微数据作者（与 parseSourceIdentity 共用口径）；仍缺则留给调用方回落搜索候选行。
+  if (author) detail.author = author;
+  else {
+    const fallback = itempropAuthorOf(page.text);
+    if (fallback) detail.author = fallback;
+  }
   // 与 builtin 复用成对括号的明确原书名标记，不把作者搜索词当作书名。
   const alias = parseSourceAlias(page.text);
   if (alias.alias) detail.alias = alias.alias;

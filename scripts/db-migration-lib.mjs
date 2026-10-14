@@ -434,6 +434,30 @@ export const EXPECTED_RUNTIME_COLUMNS = {
     ['error', 'text', 'NO', "''::text"],
     ['compile_diagnostics', 'jsonb', 'NO', "'[]'::jsonb"],
   ],
+  // 0005 三表（bsrcfix-41，源搜索整改）：候选源持久化 / host 占位 / 预取认领。
+  download_source_candidates: [
+    ['book_id', 'integer', 'NO', null],
+    ['source_url', 'text', 'NO', null],
+    ['host', 'text', 'NO', null],
+    ['position', 'integer', 'NO', '0'],
+    ['failure', 'text', 'NO', "''::text"],
+    ['failure_reason', 'text', 'NO', "''::text"],
+    ['updated_at', 'timestamp with time zone', 'NO', 'now()'],
+  ],
+  download_host_occupancy: [
+    ['host', 'text', 'NO', null],
+    ['holder', 'text', 'NO', null],
+    ['kind', 'text', 'NO', null],
+    ['task_id', 'integer', 'YES', null],
+    ['claimed_at', 'timestamp with time zone', 'NO', 'now()'],
+    ['expires_at', 'timestamp with time zone', 'NO', 'now()'],
+  ],
+  download_source_prefetch: [
+    ['book_id', 'integer', 'NO', null],
+    ['owner', 'text', 'NO', null],
+    ['claimed_at', 'timestamp with time zone', 'NO', 'now()'],
+    ['expires_at', 'timestamp with time zone', 'NO', 'now()'],
+  ],
 };
 
 // 按列名比对（不比物理列序：老实例的列由 ADD COLUMN 追加，列序本来就可能不同）。

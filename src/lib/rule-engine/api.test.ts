@@ -151,6 +151,16 @@ describe('引擎门面四函数（M1 任务 4 §7.1）', () => {
     });
   });
 
+  // 41-author：源规则 author 没命中（vikbook 的 .author@a 在页面无此 class）时退微数据作者。
+  it('engineFetchDetail 规则 author 未命中时退 schema.org 微数据作者（vikbook 形态）', async () => {
+    const pages = new Map([[BOOK_URL,
+      '<h1 class="title" itemprop="name">盗墓笔记</h1>'
+      + '<p>作者：<span itemprop="author"><a class="red" title="作者：南派三叔" href="https://x">南派三叔</a></span></p>'
+      + '<a class="toc" href="/toc/1.html">目录</a>']]);
+    expect(await engineFetchDetail(engineSource(), BOOK_URL, fakeContext(pages)))
+      .toEqual({ title: '盗墓笔记', author: '南派三叔', tocUrl: TOC_URL });
+  });
+
   it('engineFetchToc 解释 chapterList 并按 nextTocUrl 翻页拼接', async () => {
     const toc2 = 'https://book15.net/toc/2.html';
     const pages = new Map([

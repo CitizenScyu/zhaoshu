@@ -366,14 +366,14 @@ maybe('T3 worker 任务层：租约、单写者、五阶段对账（PGlite + moc
     expect((await pg.query('SELECT count(*)::int AS n FROM download_tasks')).rows[0].n).toBe(2);
   });
 
-  it('B2-03 快照阶段传输失败同样退避；第 3 次失败 ⇒ 1h（与书源不可达同阶梯）', async () => {
+  it('B2-03 快照阶段传输失败同样退避；第 3 次失败 ⇒ 30m（与书源不可达同阶梯、封顶 30m）', async () => {
     const id = await insertTask('pending', { attempt_count: 3 });
     github.failAt = { pathPattern: /\/v-[a-f0-9]{8}\.txt$/, op: 'put', error: badGateway() };
     const txt = completeText('测试书', 3);
     const result = await runDownloadTask(options([scriptAdapter({ kind: 'complete', txt, chaptersTotal: 3, chaptersDone: 3, charsTotal: 3 * 810 })]), (await claimDownloadTask(sql as never, 'worker-a'))!);
     expect(result.reason).toBe('publication_retry');
     const state = await retryState(id);
-    expect(state).toMatchObject({ status: 'pending', attempt_count: 4, delay_min: 60 });
+    expect(state).toMatchObject({ status: 'pending', attempt_count: 4, delay_min: 30 });
     expect(state.error).toContain('snapshot:http_502');
   });
 

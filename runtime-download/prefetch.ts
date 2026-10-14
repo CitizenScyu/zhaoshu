@@ -40,7 +40,7 @@ export type PrefetchSelector =
 export interface PrefetchStore {
   /** 当前 running 任务占用的源 host 集合。 */
   busyHosts(signal: AbortSignal): Promise<string[]>;
-  /** 原子抢一个「仅 pending 且尚无有效 plan」的预扫资格（跨进程同本互斥）。null = 无可预扫任务。 */
+  /** 原子抢一个「仅 pending 且不足两个有效 host」的预扫资格（跨进程同本互斥）。null = 无可预扫任务。 */
   claimNext(signal: AbortSignal): Promise<PrefetchTask | null>;
   /** 持久化 plan（此后该书免重扫）。false = 预取资格已丢失。 */
   finish(task: PrefetchTask, plan: { sourceUrls: string[] }): Promise<boolean>;
@@ -67,6 +67,22 @@ export type PrefetchSchedulerStop = 'completed' | 'idle_bound' | 'failure_bound'
 
 const hostOf = (url: string): string => {
   try { return new URL(url).hostname; } catch { return ''; }
+};
+
+/**
+ * 有效已知 host 的口径必须与 store.claimNext 的领取门槛一致：仅 HTTPS、host 非空、按 hostname
+ * 去重（URL 解析出的 hostname 已小写）。非 HTTPS/非法旧候选不占缺额名额——否则旧的 http 候选会把
+ * 两个 HTTPS host 的缺额算成 0，调度器永远裁掉新 host，补不满两个有效 host。
+ */
+const knownHttpsHosts = (urls: readonly string[] | undefined): Set<string> => {
+  const hosts = new Set<string>();
+  for (const url of urls ?? []) {
+    try {
+      const parsed = new URL(url);
+      if (parsed.protocol === 'https:' && parsed.hostname) hosts.add(parsed.hostname);
+    } catch { /* 非法旧候选不计入有效 host。 */ }
+  }
+  return hosts;
 };
 
 const sleepInterruptible = (ms: number, signal: AbortSignal): Promise<void> =>
@@ -132,6 +148,10 @@ export async function runPrefetchScheduler(options: PrefetchSchedulerOptions): P
       });
       return { picked };
     } catch (error) {
+      if (!signal.aborted
+        && (error as { code?: unknown } | null | undefined)?.code === 'HOST_OCCUPANCY_UNAVAILABLE') {
+        throw error;
+      }
       if (error instanceof Error && error.message === 'prefetch_budget_exhausted') {
         return { failure: 'scan_budget_exhausted' };
       }
@@ -148,9 +168,10 @@ export async function runPrefetchScheduler(options: PrefetchSchedulerOptions): P
       const busyHosts = await store.busyHosts(signal);
       if (signal.aborted) return 'aborted';
       const claim = await store.claimNext(signal);
+      held = claim;
       if (signal.aborted) {
-        // claim 可能已领回一本书：中止路径也必须归还，不落 plan、不卡持有态。
-        if (claim) await store.release(claim, { reason: 'aborted' }).catch(() => {});
+        if (claim) await store.release(claim, { reason: 'aborted' });
+        held = null;
         return 'aborted';
       }
       const task = claim;
@@ -168,7 +189,7 @@ export async function runPrefetchScheduler(options: PrefetchSchedulerOptions): P
 
       const scanned = await scanOne(task, busyHosts);
       if (signal.aborted) {
-        await store.release(task, { reason: 'aborted' }).catch(() => {});
+        await store.release(task, { reason: 'aborted' });
         held = null;
         return 'aborted';
       }
@@ -186,14 +207,16 @@ export async function runPrefetchScheduler(options: PrefetchSchedulerOptions): P
         continue;
       }
 
-      const seen = new Set(busyHosts);
+      const knownHosts = knownHttpsHosts(task.sourceUrls);
+      const seen = new Set([...busyHosts, ...knownHosts]);
+      const missingHits = Math.max(0, targetHits - knownHosts.size);
       const trimmed: string[] = [];
       for (const url of scanned.picked) {
+        if (trimmed.length >= missingHits) break;
         const host = hostOf(url);
-        if (!host || seen.has(host)) continue;
+        if (!/^https:\/\//i.test(url) || !host || seen.has(host)) continue;
         seen.add(host);
         trimmed.push(url);
-        if (trimmed.length >= targetHits) break;
       }
 
       if (!trimmed.length) {
@@ -211,6 +234,7 @@ export async function runPrefetchScheduler(options: PrefetchSchedulerOptions): P
       }
 
       const ok = await store.finish(task, { sourceUrls: trimmed });
+      if (!ok) await store.release(task, { reason: 'prefetch_lease_lost' });
       held = null;
       consecutiveFailures = 0;
       if (!ok) {
@@ -227,8 +251,8 @@ export async function runPrefetchScheduler(options: PrefetchSchedulerOptions): P
     return 'aborted';
   } finally {
     if (held) {
-      // store 抛错等未预期路径也不把预取资格卡在持有态。
-      try { await store.release(held, { reason: 'scheduler_exit' }); } catch { /* 尽力归还 */ }
+      // store 抛错等未预期路径也不把预取资格卡在持有态；归还失败继续上抛，不能静默丢失 token。
+      await store.release(held, { reason: 'scheduler_exit' });
     }
   }
 }

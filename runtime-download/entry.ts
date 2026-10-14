@@ -9,17 +9,26 @@ import { neon } from '@neondatabase/serverless';
 import { downloadBook } from '../scripts/engine-download.mjs';
 import {
   createEngineAdapter, type EngineDownloadLike, type PublicationRolloverSeam, type SourceAdapter, type WorkerStorage,
+  WORKER_TASK_TIMEOUT_MS,
 } from '../src/lib/download-worker';
 import type { GitHubContents } from '../src/lib/download-publisher';
 import { createWorkerStorage } from './storage';
 import { createGitHubContents } from './github-contents';
-import { assembleEngineModules, createResolveSource, createSourceTransport, loadEnginePool, type EngineModules, type RateLimiterLike, type ResolvedSource } from './engine';
+import {
+  assembleEngineModules, createResolveSource, createSourceTransport, loadEnginePool,
+  type EngineModules, type RateLimiterLike, type ResolvedSource,
+} from './engine';
 import { readBookText } from './read-book-text';
 import { resolveRepositoryId } from './repository';
 import { withoutProcessSignals } from './without-process-signals';
 import { createBudgetRefund } from './budget-refund';
 import { createIdentityPrecheck } from './identity-precheck';
 import { createBuiltinFallback } from './builtin-fallback';
+import { createHostOccupancy, type HostOccupancy } from './host-occupancy';
+import {
+  failedCandidateSources, markCandidateFailure, occupiedHosts, replaceSourceCandidates,
+  usableSourceCandidates,
+} from '../src/lib/download-source-candidates';
 import { createExecutor, DEFAULT_DECISIONS, type DailyBudgetLike, type DownloadExecutor, type LoopDecisions } from './executor';
 import { dbQuotaBackoffMs, recordDbQuotaSeen } from '../src/lib/db-quota';
 // capacity991：rollover 决策端口的生产装配（端口合同在 wiring、候选形状在 rollover 纯决策模块）。
@@ -65,6 +74,10 @@ export interface ProductionExecutorOptions {
   loadEnginePool?: (signal: AbortSignal) => Promise<Array<{ url: string; name: string; searchUrl: unknown }>>;
   repositoryId?: number;
   branch?: string;
+  /** 合成注入 sql（PGlite 等）：候选持久化/占位门与默认 storage/repository 共用同一实例。 */
+  sql?: ReturnType<typeof neon>;
+  /** 注入 host 占用门（默认 sql 路径自建）。 */
+  hostOccupancy?: HostOccupancy;
 }
 
 function requiredEnv(env: NodeJS.ProcessEnv, key: string): string {
@@ -147,7 +160,12 @@ function toRepositoryCandidate(row: RolloverCandidateRow): RepositoryCandidate {
   const version = rolloverText(row.baseline_epoch, 'baseline_epoch');
   const target: RepositoryTuple = { id, owner, repo, branch };
   // 账目 validUntil：ledger 无独立账目期限列，取同账行的准入期限作为可信窗口上界（缺失=null⇒决策判 unknown）。
-  const admissionValidUntil = typeof row.admission_valid_until === 'string' ? row.admission_valid_until : null;
+  // neon 驱动按 pg-types 把 timestamptz 解析成 Date（不是字符串）；两种都收，非法 Date 视同缺失。
+  // 只认字符串时生产 validUntil 恒为 null ⇒ 全部候选 unknown ⇒ CAPACITY_UNKNOWN（2026-10-13 task 3612）。
+  const rawValidUntil = row.admission_valid_until;
+  const admissionValidUntil = typeof rawValidUntil === 'string' ? rawValidUntil
+    : rawValidUntil instanceof Date && !Number.isNaN(rawValidUntil.getTime()) ? rawValidUntil.toISOString()
+    : null;
   const accounting = {
     registeredLogicalBytes: rolloverBigint(row.registered_bytes, 'registered_bytes'),
     reservedLogicalBytes: rolloverBigint(row.reserved_bytes, 'reserved_bytes'),
@@ -230,14 +248,14 @@ export async function createDownloadExecutor(options: ProductionExecutorOptions)
   const target = hasGithub ? undefined
     : storageTarget(options.repository !== undefined ? options.repository : env.ZHAOSHU_BOOKS_REPO, branch);
 
-  let sql: ReturnType<typeof neon> | undefined;
+  let sql = options.sql;
   const storage = options.storage ?? createWorkerStorage(
-    (sql = neon(requiredEnv(env, 'DATABASE_URL'))),
+    (sql ??= neon(requiredEnv(env, 'DATABASE_URL'))),
   );
 
   let repositoryId = options.repositoryId;
   if (repositoryId === undefined) {
-    if (!sql) sql = neon(requiredEnv(env, 'DATABASE_URL'));
+    sql ??= neon(requiredEnv(env, 'DATABASE_URL'));
     repositoryId = await resolveRepositoryId(sql, target!);
   }
   const github = hasGithub ? options.github! : createGitHubContents({
@@ -272,7 +290,18 @@ export async function createDownloadExecutor(options: ProductionExecutorOptions)
 
   const modules = options.modules ?? assembleEngineModules();
   const resolveSource = options.resolveSource ?? createResolveSource(modules);
-  const transport = options.transport ?? createSourceTransport(options.rateLimiter);
+  // 物理 host 互斥（bsrcfix-20261007）：默认 sql 路径建 hostOccupancy，对默认 transport（注入
+  // transport ?? createSourceTransport）wrapTransport——下载腿 runDownload 作用域内按真实物理
+  // 发射 host 占位（download TTL）、作用域外（预检/回退选源）每次调用自起 prefetch 作用域
+  // （scan TTL）。TTL：download 与任务超时同源 + 10 分钟余量，scan 固定 6 分钟。
+  const hostOccupancy = options.hostOccupancy ?? (sql
+    ? createHostOccupancy(sql, {
+      downloadTtlMs: (options.taskTimeoutMs ?? WORKER_TASK_TIMEOUT_MS) + 600_000,
+      scanTtlMs: 360_000,
+    })
+    : undefined);
+  const baseTransport = options.transport ?? createSourceTransport(options.rateLimiter);
+  const transport = hostOccupancy ? hostOccupancy.wrapTransport(baseTransport) : baseTransport;
 
   const outRoot = join(options.workDir, 'out');
   // 常驻 drain：包一层去掉 downloadBook 对 process 的 SIGINT/SIGTERM 注册（外部停机由 hooks.signal
@@ -281,12 +310,24 @@ export async function createDownloadExecutor(options: ProductionExecutorOptions)
     (options.engineDownload ?? downloadBook) as unknown as (...a: unknown[]) => Promise<unknown>,
   ) as unknown as EngineDownloadLike;
   // book15 不可达时 builtin 任务回退引擎源池（41-T8FB，见 builtin-fallback.ts）。默认开；
-  // DOWNLOAD_ENGINE_FALLBACK=0 关（回到引入前行为：只退避等 book15）。测试注入 adapters 时不装（包的是默认两条腿）。
+  // DOWNLOAD_ENGINE_FALLBACK=0 关（回到引入前行为：只退避等 book15）。测试注入 adapters 时不装
+  // （包的是默认两条腿）。bsrcfix-41：注入候选源持久化接缝（0005 候选表；host 占位已改由
+  // hostOccupancy 物理门负责，fallback 不再 coarse occupy）。
+  const candidateSql = sql;
   const fallback = options.adapters || env.DOWNLOAD_ENGINE_FALLBACK === '0'
     ? undefined
     : createBuiltinFallback({
       modules, transport, log,
       loadPool: options.loadEnginePool ?? (signal => loadEnginePool(modules, signal)),
+      ...(candidateSql ? {
+        candidates: {
+          usable: (bookId) => usableSourceCandidates(candidateSql, bookId),
+          failedSources: (bookId) => failedCandidateSources(candidateSql, bookId),
+          replace: (bookId, sources) => replaceSourceCandidates(candidateSql, bookId, sources),
+          markFailure: (bookId, url, kind, reason) => markCandidateFailure(candidateSql, bookId, url, kind, reason),
+          occupiedHosts: () => occupiedHosts(candidateSql),
+        },
+      } : {}),
     });
   const engineAdapter = createEngineAdapter({
     downloadBook: engineDownload,
@@ -297,17 +338,31 @@ export async function createDownloadExecutor(options: ProductionExecutorOptions)
     downloadBook: engineDownload,
     modules, resolveSource, transport, readBookText, outRoot, sourceKind: 'builtin',
   });
-  const adapters = options.adapters ?? ([
-    engineAdapter,
-    fallback ? fallback.wrapAdapter(builtinAdapter, engineAdapter) : builtinAdapter,
-  ]);
+  // 每次引擎 download 各自一个物理占用作用域：fallback 换源调用的是已包装的 engine 腿，
+  // 上一个源的作用域已在 engine.download 返回（finally 释放）后才进下一个源——没有整个
+  // fallback 一大作用域，也不同与物理门自冲突。占位门不可用（无 sql）时腿保持原样。
+  const scoped = hostOccupancy && !options.adapters
+    ? (adapter: SourceAdapter): SourceAdapter => ({
+      kind: adapter.kind,
+      async download(task, context) {
+        return hostOccupancy!.runDownload(task.id, context.signal, () => adapter.download(task, context));
+      },
+    })
+    : (adapter: SourceAdapter): SourceAdapter => adapter;
+  const scopedEngine = scoped(engineAdapter);
+  const scopedBuiltin = scoped(builtinAdapter);
+  const adapters = options.adapters ?? [
+    fallback ? fallback.wrapAdapter(scopedEngine, scopedEngine, 'engine') : scopedEngine,
+    fallback ? fallback.wrapAdapter(scopedBuiltin, scopedEngine) : scopedBuiltin,
+  ];
 
   // 扣额度前的身份预检默认开；DOWNLOAD_IDENTITY_PRECHECK=0 关（回到引入前行为：书源不可达只在下载中判出、
   // 事后退还日预算）。与下载腿共用 modules/resolveSource/transport（同一个运行时限速器）。
   const identityPrecheck = env.DOWNLOAD_IDENTITY_PRECHECK === '0'
     ? undefined
     : createIdentityPrecheck({ modules, resolveSource, transport });
-  // 回退开启时预检多一步：book15 不可达就在扣额度前选好引擎源，选不到仍按不可达退避（不扣额度）。
+  // 回退开启时预检多一步：原始源不可达（book15/引擎源）就在扣额度前选好引擎候选，
+  // 选不到仍按不可达退避（不扣额度）。927 复核点 3：engine 任务无候选时也先过原预检。
   const precheck = identityPrecheck && fallback ? fallback.wrapPrecheck(identityPrecheck) : identityPrecheck;
 
   // shell 的 read() 只回 {date, used}：用打包注入的上限补齐 DailyBudgetLike 契约（缺省保持未知）。

@@ -8,7 +8,7 @@ const mocks = vi.hoisted(() => ({
 }));
 vi.mock('@neondatabase/serverless', () => ({ neon: mocks.neon }));
 vi.mock('../scripts/engine-download.mjs', () => ({ downloadBook: vi.fn() }));
-vi.mock('../src/lib/download-worker', () => ({ createEngineAdapter: mocks.adapter }));
+vi.mock('../src/lib/download-worker', () => ({ createEngineAdapter: mocks.adapter, WORKER_TASK_TIMEOUT_MS: 123_000 }));
 vi.mock('./storage', () => ({ createWorkerStorage: mocks.storage }));
 vi.mock('./github-contents', () => ({ createGitHubContents: mocks.github }));
 vi.mock('./engine', () => ({
@@ -20,6 +20,7 @@ vi.mock('./without-process-signals', () => ({ withoutProcessSignals: (fn: unknow
 vi.mock('./budget-refund', () => ({ createBudgetRefund: vi.fn() }));
 vi.mock('./identity-precheck', () => ({ createIdentityPrecheck: vi.fn() }));
 vi.mock('./builtin-fallback', () => ({ createBuiltinFallback: vi.fn() }));
+vi.mock('./host-occupancy', () => ({ createHostOccupancy: vi.fn() }));
 vi.mock('./executor', () => ({ createExecutor: mocks.executor, DEFAULT_DECISIONS: {} }));
 vi.mock('../src/lib/db-quota', () => ({ dbQuotaBackoffMs: () => 0, recordDbQuotaSeen: vi.fn() }));
 // repository.ts保持真实：其SQL模板进入假SQL，不注入ID冒充反查覆盖。

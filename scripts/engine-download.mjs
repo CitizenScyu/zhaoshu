@@ -3,6 +3,8 @@ import { mkdirSync, readFileSync, writeFileSync, renameSync, existsSync, openSyn
 import { resolve, join } from 'node:path';
 import { setTimeout as pause } from 'node:timers/promises';
 import { canonicalBookKey } from '../src/lib/book-identity.ts';
+import { knownSourceAuthor, sourceBookMatches } from '../src/lib/source-parser.ts';
+import { foldTraditional } from '../src/lib/zh-variant-fold.ts';
 import { fetchSourceText, sourceAbortable } from '../src/lib/source-fetch.ts';
 
 const hash = value => createHash('sha256').update(value).digest('hex');
@@ -15,17 +17,22 @@ const atomic = (path, data) => {
 const knownError = /^(identity_mismatch_or_no_candidate|empty_toc|empty_toc_page|pagination_cycle|toc_limit|unsupported_toc_rule|invalid_chapter|invalid_next_page|empty_content_page|content_page_limit|unsupported_content_rule|max_chapters|size_limit|toc_changed|missing_chapters|interrupted|budget_exhausted|operation_timeout|empty_content)$/;
 const isLimiterFeedbackError = error => error?.code === 'LIMITER_FEEDBACK_UNAVAILABLE'
   && error?.origin === 'limiter-feedback';
+const isHostGateError = error => error?.code === 'HOST_OCCUPIED'
+  || error?.code === 'HOST_OCCUPANCY_UNAVAILABLE';
 
 // 书源不可达（41-EXEC-SRCUNAVAIL）：搜索/详情/目录阶段的传输层失败（连接/请求超时、undici
 // `fetch failed`＝DNS/reset/TLS）、源站 5xx（含 Cloudflare 52x）、限速器熔断（由连续源站失败触发）
 // 与限速器每源日请求上限（DailyRequestBudgetError，UTC 换日即重置，属瞬时）归 code=2 source_unavailable，
 // 与 resolveSource code=2 同档：可重试、零发布。4xx、策略拒绝、身份不符与其余异常维持原分类；
 // 正文阶段逐章失败照旧收口为 missing_chapters。
+// 41-src403：search/detail/toc 阶段的 403/429 也算源站暂时不可达——Cloudflare challenge
+// 常按 URL/频率阶段性放行（noveltri 详情页对 phoenix 出网 403、同刻搜索页 200），
+// 以前这类被吞成 download_failed 终态。仍走既有退避（16 次上限），永久封禁最多退干净到 failed。
 const SOURCE_STAGES = new Set(['search', 'detail', 'toc']);
 const UNREACHABLE_ERROR_NAMES = new Set(['ConnectTimeoutError', 'TimeoutError', 'CircuitOpenError', 'DailyRequestBudgetError']);
 export function isSourceUnavailableError(error) {
   const status = error?.status;
-  if (typeof status === 'number') return status >= 500 && status <= 599;
+  if (typeof status === 'number') return (status >= 500 && status <= 599) || status === 403 || status === 429;
   if (UNREACHABLE_ERROR_NAMES.has(error?.name)) return true;
   return error instanceof TypeError && /^fetch failed/i.test(error.message);
 }
@@ -55,9 +62,28 @@ export function downloadOptions(args) {
   return options;
 }
 
-// 身份判据的唯一实现：downloadBook 选候选与执行器扣额度前的身份预检（runtime-download/identity-precheck.ts）共用。
-// 书名、作者都非空，且 canonicalBookKey 全等。不剥「著」、不看 alias，严格程度与原判据逐字一致。
-export const identityMatches = (detail, args) => Boolean(detail.title && detail.author && canonicalBookKey(detail.title, detail.author) === canonicalBookKey(args.title, args.author));
+// 身份判据的唯一实现：downloadBook 选候选、执行器扣额度前的身份预检（runtime-download/identity-precheck.ts）
+// 与 builtin 引擎源回退（runtime-download/builtin-fallback.ts）共用。
+//
+// 41-IDLENIENT（2026-10-07）：判据改与**生产阅读器**同一口径 sourceBookMatches（src/lib/source-parser.ts），
+// 不再用 canonicalBookKey 全等。旧判据过严，与阅读侧不对称，把阅读器能读的书判成身份不符：
+//   - 站点作者字段带「著」/「作者：」/「@」修饰（book.qq「忘语 著」）——sourceBookMatches 经 knownSourceAuthor
+//     剥掉后判等，旧 canonicalBookKey 不剥 ⇒ 误判；
+//   - 源的 ruleBookInfo 不写 name/author（kxdu.net 详情页只有简介/封面）⇒ engineFetchDetail 返回 {}，
+//     旧判据对空 detail 直接 false；阅读侧用 engineIdentityOf 把详情页缺的字段回落到**搜索候选行**再比。
+// detail 与 candidate（搜索候选行，engineSearchBook 的 {title,author,bookUrl}）合并：详情页求值非空即覆盖，
+// 为空则取候选行——与阅读器 engineIdentityOf(detail, result) 逐字同义。**回落目标必须是搜索候选行、不是任务
+// 本身**：回落成任务会把「空详情」判成恒真（候选行与任务同名时尤其），门就形同虚设。
+// 结果：凡阅读器判「是同一本书」的源，下载器同判；不同书名/不同作者仍判不符（只吸收同义写法，不放宽到同名异书）。
+// builtin 候选行只有 {bookUrl}（无 title/author），detail 由 parseSourceIdentity 从 h1/meta 取，行为不变。
+export const identityMatches = (detail, candidate, args) => {
+  const identity = {
+    title: detail.title ?? candidate?.title ?? '',
+    author: detail.author ?? candidate?.author ?? '',
+    ...(detail.alias ? { alias: detail.alias } : {}),
+  };
+  return sourceBookMatches({ title: args.title, author: args.author }, identity);
+};
 
 // One shared request slot covers search/detail/toc/content, redirects and alternate hosts.
 // hooks（T3 任务层接缝，全部可选、向后兼容）：
@@ -139,7 +165,7 @@ export async function downloadBook(m, args, resolveSource, transport = fetchSour
         if (!builtin) return m.api.engineFetchDetail(engine, candidate.bookUrl, ctx);
         return m.parser.parseSourceIdentity((await ctx.page(candidate.bookUrl)).text);
       });
-      if (identityMatches(detail, args)) { selected = { ...candidate, ...detail }; break; }
+      if (identityMatches(detail, candidate, args)) { selected = { ...candidate, ...detail }; break; }
     }
     if (!selected) throw new Error('identity_mismatch_or_no_candidate');
     manifest.bookUrl = selected.bookUrl;
@@ -184,7 +210,7 @@ export async function downloadBook(m, args, resolveSource, transport = fetchSour
         atomic(path, text);
         Object.assign(chapter, { status: 'done', chars: [...text].length, sha256: hash(text) });
       } catch (error) {
-        if (isLimiterFeedbackError(error)) throw error;
+        if (isLimiterFeedbackError(error) || isHostGateError(error)) throw error;
         chapter.status = 'failed';
         // Do not persist upstream messages, URLs or credentials in diagnostics.
         chapter.error = knownError.test(error.message) ? error.message : 'chapter_failed';
@@ -205,6 +231,7 @@ export async function downloadBook(m, args, resolveSource, transport = fetchSour
       manifest.errors.push('limiter_feedback_unavailable');
       throw error;
     }
+    if (isHostGateError(error)) throw error;
     // 外部中断（停机/租约/总预算）时的请求失败是被中止，不是书源不可达。
     if (SOURCE_STAGES.has(stage) && !controller.signal.aborted && isSourceUnavailableError(error)) failureCode = 2;
     if (failureCode === 2) manifest.failure_stage = stage; // 固定枚举，不含上游细节

@@ -104,7 +104,8 @@ maybe('618 退休源反例：旧 book15 URL 的 builtin 下载任务（真实注
     requestedBy?: string; attemptCount?: number; status?: string; updatedAtAgoMs?: number;
   } = {}): Promise<number> => {
     // requested_by='user' 的行必须带真实属主（download_tasks_request_identity_check，
-    // business-schema.ts），user_id=NULL 直接 23514；owner id=1 由 initializeAuthSchema 写入。
+    // business-schema.ts:243–246），user_id=NULL 直接 23514——与 download-task-queue.pglite.test.ts
+    // 先 seed 用户再插行的做法同源；owner id=1 由 initializeAuthSchema 写入。
     const requestedBy = opts.requestedBy ?? 'system';
     const userId = requestedBy === 'user' ? 1 : null;
     const base = [TITLE, AUTHOR, opts.status ?? 'pending', BOOK_URL, requestedBy];

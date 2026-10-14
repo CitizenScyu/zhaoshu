@@ -113,14 +113,15 @@ describe('A. 身份预检：先书源可达、后身份（与下载器同源同�
     expect(await precheckOn(hanging, true, { timeoutMs: 60_000, budgetMs: 30 })(s.task)).toEqual(UNVERIFIED);
   });
 
-  it('drain 中途停机时的请求失败不算书源不可达', async () => {
+  it('drain 中途停机时上抛原中止原因，不吞成书源不可达', async () => {
     const controller = new AbortController();
+    const reason = new Error('SIGTERM');
     const stopping: Transport = async (_url, opts) => new Promise((_, reject) => {
       opts.signal.addEventListener('abort', () => reject(connectTimeout()), { once: true });
-      setTimeout(() => controller.abort(new Error('SIGTERM')), 5);
+      setTimeout(() => controller.abort(reason), 5);
     });
     const s = site();
-    expect(await precheckOn(stopping)(s.task, controller.signal)).toEqual(UNVERIFIED);
+    await expect(precheckOn(stopping)(s.task, controller.signal)).rejects.toBe(reason);
   });
 
   const errors: [string, () => unknown][] = [
@@ -222,10 +223,10 @@ describe('B. 执行器：预检判书源不可达 ⇒ 与下载腿同一收口�
     for (const secret of [row.title, row.author, 'details859', 'https://']) expect(printed).not.toContain(secret);
   });
 
-  it('退避与下载腿共用 attempt_count 阶梯：第 3 次 ⇒ 1h', async () => {
+  it('退避与下载腿共用 attempt_count 阶梯：第 3 次 ⇒ 30m', async () => {
     const h = harness(retry('detail'), { attemptCount: 3 });
     await h.executor.runOnce();
-    expect(h.defers.map(d => d.delayMs)).toEqual([60 * MINUTE]);
+    expect(h.defers.map(d => d.delayMs)).toEqual([30 * MINUTE]);
   });
 
   it('第 16 次仍不可达 ⇒ partial 终态（不再退避），日志 retryAt=null', async () => {

@@ -7,15 +7,7 @@
 // SourceRateLimiter——预取没有独立限速能力，没有共享 limiter 就没有出网资格。
 // run 每轮 maxTasksPerRound=1、maxIdlePolls=1（service drain 每本书可接管一次）；signal
 // 全程由 run(signal) 传入，不新建永不取消的常驻 signal。
-//
-// host 占用门为「薄实现」：直接用 src/lib/download-source-candidates 的 tryOccupyHost/
-// releaseHostOccupancy（组1 host-occupancy.ts 本体搁置，不移植）。每次 transport 调用
-// （一次物理请求）自持一个 holder，beforeFetch 内先跑调用方已有物理门、再原子占位；被他人
-// 占用抛 HostOccupiedError（selector 按「该源跳过」吞掉，不连坐 host），请求结束（含异常）
-// 释放本 holder 占位。当前 master 的 SourceTransport 只有 beforeFetch（无 afterAcquire），
-// 故不做 acquire 后二次复查——单相位门足以表达「发射前独占」。
 
-import { randomUUID } from 'node:crypto';
 import { neon } from '@neondatabase/serverless';
 import {
   PREFETCH_BOOK_BUDGET_MS, PREFETCH_SCAN_LIMIT, PREFETCH_TARGET_HITS, runPrefetchScheduler,
@@ -23,13 +15,12 @@ import {
 } from './prefetch';
 import { createPrefetchStore, type PrefetchSql } from './prefetch-store';
 import { createSourceSelector, type SourceSelector } from './source-selector';
-import {
-  tryOccupyHost, releaseHostOccupancy,
-} from '../src/lib/download-source-candidates';
+import { createHostOccupancy } from './host-occupancy';
 import {
   assembleEngineModules, createSourceTransport, loadEnginePool,
   type EngineModules, type RateLimiterLike, type SourceTransport,
 } from './engine';
+import { WORKER_TASK_TIMEOUT_MS } from '../src/lib/download-worker';
 import { sourceAbortable } from '../src/lib/source-fetch';
 
 export type PrefetchLog = (level: 'info' | 'error', message: string, fields?: Record<string, unknown>) => void;
@@ -37,15 +28,6 @@ export type PrefetchLog = (level: 'info' | 'error', message: string, fields?: Re
 export const PREFETCH_STORE_LEASE_MS = 600_000;
 export const PREFETCH_STORE_BUDGET_MS = 300_000;
 export const PREFETCH_SCAN_TTL_MS = 360_000;
-
-/** 物理发射前 host 已被他人（未过期占位）持有：结构判别码供 selector 归入「该源跳过」。 */
-export class HostOccupiedError extends Error {
-  readonly code = 'HOST_OCCUPIED';
-  constructor(readonly host: string) {
-    super('host occupied: ' + host);
-    this.name = 'HostOccupiedError';
-  }
-}
 
 export interface SourcePrefetchOptions {
   /** 与下载腿共享的运行时限速器（同一实例）；必填，缺省固定码拒绝。 */
@@ -69,37 +51,6 @@ function requiredEnv(env: NodeJS.ProcessEnv, key: string): string {
   const value = env[key];
   if (!value) throw new Error(`missing environment key: ${key}`); // 只报键名
   return value;
-}
-
-/**
- * 薄 host 占用门：包装传输层，使每次物理发射前原子占位、发射后释放。holder 每次调用独立
- * （一次物理请求一个），占位 INSERT 命中未过期他人行即抛 HostOccupiedError。注入 transport
- * 同样过门（不绕过）：先建传输层再统一包装。
- */
-function wrapTransportWithOccupancy(
-  transport: SourceTransport, sql: PrefetchSql, ttlMs: number,
-): SourceTransport {
-  return async (url, options) => {
-    const holder = randomUUID();
-    const hosts = new Set<string>();
-    const beforeFetch = async (signal: AbortSignal, current: string) => {
-      await options.beforeFetch?.(signal, current);
-      signal.throwIfAborted();
-      let host: string;
-      try { host = new URL(current).hostname; } catch { return; }
-      if (!host) return;
-      const occupied = await tryOccupyHost(sql, host, holder, 'prefetch', null, ttlMs);
-      if (!occupied) throw new HostOccupiedError(host);
-      hosts.add(host);
-    };
-    try {
-      return await transport(url, { ...options, beforeFetch });
-    } finally {
-      for (const host of hosts) {
-        try { await releaseHostOccupancy(sql, host, holder); } catch { /* 过期自动回收 */ }
-      }
-    }
-  };
 }
 
 /**
@@ -174,10 +125,13 @@ export function createSourcePrefetch(options: SourcePrefetchOptions): SourcePref
   // 注入 selector 时不建默认链：DI 运行不需要 modules/transport/occupancy。
   const baseSelector = options.selector ?? (() => {
     const modules = options.modules ?? assembleEngineModules();
-    // 预取只做扫描（kind=prefetch），scan 独立短 TTL；注入 transport 也必须过占用门（不绕过）。
-    const transport = wrapTransportWithOccupancy(
-      options.transport ?? createSourceTransport(options.rateLimiter), sql, PREFETCH_SCAN_TTL_MS,
-    );
+    // 预取只挂 wrapTransport（runDownload 属下载腿）；下载 TTL 与任务超时同源，scan 独立短 TTL。
+    const occupancy = createHostOccupancy(sql, {
+      downloadTtlMs: WORKER_TASK_TIMEOUT_MS + 600_000,
+      scanTtlMs: PREFETCH_SCAN_TTL_MS,
+    });
+    // 注入 transport 也必须过占用门（不绕过）：先建传输层再统一 wrapTransport。
+    const transport = occupancy.wrapTransport(options.transport ?? createSourceTransport(options.rateLimiter));
     return createSourceSelector({
       modules,
       transport,

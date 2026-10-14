@@ -73,6 +73,64 @@ describe('41-T5-IDENTITY 扣额度前预检钩子', () => {
     expect(h.log).toEqual(['claim', 'read', 'precheck', 'consume', 'download', 'finish:failed:x']);
   });
 
+  it.each(['HOST_OCCUPIED', 'HOST_OCCUPANCY_UNAVAILABLE'])('预检 %s 归还租约并上抛，不扣额度、不下载', async code => {
+    const error = Object.assign(new Error('synthetic gate rejection'), { code });
+    const h = harness(error);
+    await expect(h.executor.runOnce()).rejects.toBe(error);
+    expect(h.log).toEqual(['claim', 'read', 'precheck', 'release']);
+    expect(h.logged).toEqual([]);
+  });
+
+  it('预检期间停机不会 fail-open 扣额度或下载', async () => {
+    const h = harness({ ok: true });
+    const controller = new AbortController();
+    const error = new Error('synthetic cancellation');
+    h.precheck!.mockImplementation(async () => {
+      h.log.push('precheck');
+      controller.abort(error);
+      throw error;
+    });
+    await expect(h.executor.runOnce(controller.signal)).rejects.toBe(error);
+    expect(h.log).toEqual(['claim', 'read', 'precheck', 'release']);
+  });
+
+  it.each([true, false])('预检返回 ok=%s 时已停机，归还租约而不扣额度或写终态', async ok => {
+    const h = harness({ ok: true });
+    const controller = new AbortController();
+    const reason = new Error('synthetic cancellation');
+    h.precheck!.mockImplementation(async () => {
+      h.log.push('precheck');
+      controller.abort(reason);
+      return ok ? { ok: true } : { ok: false, reason: 'identity_mismatch' };
+    });
+    await expect(h.executor.runOnce(controller.signal)).rejects.toBe(reason);
+    expect(h.log).toEqual(['claim', 'read', 'precheck', 'release']);
+    expect(h.logged).toEqual([]);
+  });
+
+  it('读任务期间停机，归还租约而不执行预检或扣额度', async () => {
+    const controller = new AbortController();
+    const reason = new Error('synthetic cancellation');
+    const h = harness({ ok: true }, { storage: { taskRow: async () => {
+      controller.abort(reason);
+      return row;
+    } } });
+    await expect(h.executor.runOnce(controller.signal)).rejects.toBe(reason);
+    expect(h.log).toEqual(['claim', 'read', 'release']);
+    expect(h.precheck).not.toHaveBeenCalled();
+  });
+
+  it('无预检时领取期间停机，仍归还租约而不扣额度', async () => {
+    const controller = new AbortController();
+    const reason = new Error('synthetic cancellation');
+    const h = harness(null, { storage: { claim: async () => {
+      controller.abort(reason);
+      return lease;
+    } } });
+    await expect(h.executor.runOnce(controller.signal)).rejects.toBe(reason);
+    expect(h.log).toEqual(['release']);
+  });
+
   it('今日额度已满 ⇒ 不跑预检（不给源站白打请求），照旧 consume 拒绝 → 退回 pending，BUDGET_EXHAUSTED', async () => {
     const h = harness({ ok: false, reason: 'identity_mismatch' }, { used: 3, allowed: false });
     expect(await h.executor.runOnce()).toBe(DEFAULT_DECISIONS.BUDGET_EXHAUSTED);

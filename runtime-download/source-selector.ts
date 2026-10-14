@@ -69,10 +69,10 @@ export function createSourceSelector(options: SourceSelectorOptions): SourceSele
     const title = normalizeBookTitle(task.title);
     const hits = (await modules.api.engineSearchBook(engine, task.title, context)).filter(hit =>
       typeof hit.title === 'string' && normalizeBookTitle(hit.title) === title
-      && (!hit.author?.trim() || identityMatches(hit, task)));
+      && (!hit.author?.trim() || identityMatches(hit, hit, task)));
     for (const hit of hits.slice(0, 2)) {
       signal.throwIfAborted();
-      if (identityMatches(await modules.api.engineFetchDetail(engine, hit.bookUrl, context), task)) return true;
+      if (identityMatches(await modules.api.engineFetchDetail(engine, hit.bookUrl, context), hit, task)) return true;
     }
     return false;
   };
@@ -100,6 +100,10 @@ export function createSourceSelector(options: SourceSelectorOptions): SourceSele
       const excludedSources = new Set(request.excludedSources);
       const picked: string[] = [];
       const pickedHosts: string[] = [];
+      // 不做扫描内同 host 去重（2026-10-14 scanrev41 异厂复核推翻当日一手版）：同 host 变体承载
+      // 不同内容是真实形态（noveltri zh-cn/zh-tw，7cd9222），扫描内去重会让排在无书变体之后的
+      // 同 host 变体永久死区——扫描无书不进 excludedSources（markFailure 只记下载过的源），轮轮
+      // 如此。槽位饥饿已由 MAX_FALLBACK_SCAN_SOURCES≈全池解决；已命中 host 的去重（pickedHosts）保留。
       let scanned = 0;
       for (const source of pool) {
         signal.throwIfAborted();

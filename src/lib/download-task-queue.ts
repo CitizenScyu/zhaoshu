@@ -117,6 +117,12 @@ export async function claimDownloadTask(
   leaseOwner: string,
 ): Promise<DownloadTaskLease | null> {
   const owner = requireNonEmpty(leaseOwner, 'leaseOwner', 128);
+  // host 感知调度（2026-10-07 用户批准「action 1」）：多个 worker 实例共享队列时，
+  // 优先领取「源 host 未被任何 running 任务占用」的 pending，把并发实例摊到不同源上，
+  // 而不是全部挤在队头的同一 host（同 host 受共享限速器每源 QPS≤1 串行，多实例无增益）。
+  // 未占用 host 的行 EXISTS=false 排在前（PG 布尔 false<true）；若所有 host 都被占用，
+  // 排序退化为原 created_at,id FIFO——永不空转。单 host 队列（如纯 book15）行为与原来逐字一致。
+  // host 取 source_url 的第 3 段（scheme://host/...），与运行时 hostOf 同口径（不做 www 合并）。
   const rows = await sql`
     UPDATE download_tasks
     SET status = 'running',
@@ -124,9 +130,15 @@ export async function claimDownloadTask(
         lease_owner = ${owner},
         updated_at = now()
     WHERE id = (
-      SELECT id FROM download_tasks
-      WHERE status = 'pending' AND (next_attempt_at IS NULL OR next_attempt_at <= now())
-      ORDER BY created_at, id
+      SELECT candidate.id FROM download_tasks candidate
+      WHERE candidate.status = 'pending' AND (candidate.next_attempt_at IS NULL OR candidate.next_attempt_at <= now())
+      ORDER BY
+        EXISTS (
+          SELECT 1 FROM download_tasks busy
+          WHERE busy.status = 'running' AND busy.lease_owner <> ''
+            AND split_part(busy.source_url, '/', 3) = split_part(candidate.source_url, '/', 3)
+        ),
+        candidate.created_at, candidate.id
       LIMIT 1 FOR UPDATE SKIP LOCKED
     )
     RETURNING id, lease_generation, lease_owner, attempt_count` as {

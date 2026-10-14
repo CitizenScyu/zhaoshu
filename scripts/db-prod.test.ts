@@ -234,7 +234,7 @@ maybe('PGlite 真库', () => {
     await applyMigration(createPGliteClient(viaMigration), await load());
     const migrated = await runProdCheck(createPGliteClient(viaMigration), await load());
     expect(migrated.runtimeColumns).toMatchObject({ ok: true, problems: [], extra: [], absentTables: [] });
-    expect(migrated.runtimeColumns.rows).toHaveLength(36);
+    expect(migrated.runtimeColumns.rows).toHaveLength(53);
   }, 120_000);
 
   it('dry-run 零写入：生产形态列出 v3/v4 与记账行，库指纹不变', async () => {

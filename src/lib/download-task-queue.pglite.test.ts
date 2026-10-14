@@ -211,6 +211,41 @@ maybe('v7 下载队列：迁移、幂等入队与租约 fencing', () => {
     expect(await finishDownloadTask(sql as never, lease!, { status: 'done' })).toBe(false);
   });
 
+  // 41-zombieocc：reclaim 同时清掉 task 已非 running 的僵尸占用行——worker 硬终止后
+  // closeScope 的 finally 不执行，占用行只能等 TTL（最长 ~6h），期间该 host 所有任务
+  // 连环 host_occupied。活跃占位（task 仍 running）与 prefetch（task_id NULL）不动。
+  it('41-zombieocc reclaim：清僵尸 host 占用，保留活跃占用与 prefetch 占位', async () => {
+    // 僵尸任务的占位行：任务刚被上面路径置 failed 前先造一个独立僵尸（running + 心跳超时）。
+    const [{ id: zombieId }] = (await pg.query(
+      `INSERT INTO download_tasks(user_id, book_id, title, author, status, source_url, requested_by, enqueue_key, updated_at)
+       VALUES (NULL, 91, 'zombie occ', '作者甲', 'running', 'https://z.example/1', 'system', '91:z:', now() - interval '2 hours') RETURNING id`,
+    )).rows as { id: number }[];
+    // 活跃任务占用的 host：running 且心跳新鲜。
+    const [{ id: aliveId }] = (await pg.query(
+      `INSERT INTO download_tasks(user_id, book_id, title, author, status, source_url, requested_by, enqueue_key, updated_at)
+       VALUES (NULL, 92, 'alive occ', '作者甲', 'running', 'https://a.example/1', 'system', '92:a:', now()) RETURNING id`,
+    )).rows as { id: number }[];
+    await pg.query(`CREATE TABLE IF NOT EXISTS download_host_occupancy (
+      host text PRIMARY KEY, holder text NOT NULL, kind text NOT NULL,
+      task_id integer, claimed_at timestamptz NOT NULL DEFAULT now(),
+      expires_at timestamptz NOT NULL DEFAULT now())`);
+    await pg.query(`INSERT INTO download_host_occupancy(host, holder, kind, task_id, expires_at)
+      VALUES ('zombie.test', 'h1', 'download', $1, now() + interval '2 hours'),
+             ('alive.test', 'h2', 'download', $2, now() + interval '2 hours'),
+             ('scan.test', 'h3', 'prefetch', NULL, now() + interval '30 seconds')`,
+      [zombieId, aliveId]);
+    await reclaimStaleTasks(sql as never);
+    // 僵尸行已清（任务被 reclaim 置 failed ⇒ 占位行随之消失）。
+    expect(await pg.query('SELECT host FROM download_host_occupancy ORDER BY host')).toMatchObject({
+      rows: [
+        { host: 'alive.test' },
+        { host: 'scan.test' },
+      ],
+    });
+    expect((await pg.query('SELECT status FROM download_tasks WHERE id = $1', [zombieId])).rows[0])
+      .toMatchObject({ status: 'pending' });
+  });
+
   // B2-03：崩溃在发布中途的 system 任务没有人替它点重试，reclaim 必须把它放回队列（有界、退避、fencing）。
   async function staleSystemTask(bookId: number, attemptCount: number) {
     const [{ id }] = (await pg.query(
@@ -246,14 +281,14 @@ maybe('v7 下载队列：迁移、幂等入队与租约 fencing', () => {
     expect(await claimDownloadTask(sql as never, 'next-worker')).toMatchObject({ id, leaseGeneration: 3, attemptCount: 2 });
   });
 
-  it('B2-03 reclaim：退避与 sourceRetryDelayMs 同阶梯（第 3 次 ⇒ 1h，第 8 次 ⇒ 封顶 6h）', async () => {
+  it('B2-03 reclaim：退避与 sourceRetryDelayMs 同阶梯（第 3 次 ⇒ 30m，第 8 次 ⇒ 封顶 30m）', async () => {
     const third = await staleSystemTask(61, 3);
     await reclaimStaleTasks(sql as never);
-    expect(await taskState(third.id)).toMatchObject({ status: 'pending', attempt_count: 4, delay_min: 60 });
+    expect(await taskState(third.id)).toMatchObject({ status: 'pending', attempt_count: 4, delay_min: 30 });
     await pg.query("UPDATE download_tasks SET status = 'done' WHERE id = $1", [third.id]);
     const eighth = await staleSystemTask(62, 8);
     await reclaimStaleTasks(sql as never);
-    expect(await taskState(eighth.id)).toMatchObject({ status: 'pending', attempt_count: 9, delay_min: 360 });
+    expect(await taskState(eighth.id)).toMatchObject({ status: 'pending', attempt_count: 9, delay_min: 30 });
   });
 
   it('B2-03 reclaim：达上限（attempt_count=16）的 system 任务落 failed，不再入队', async () => {
@@ -293,5 +328,30 @@ maybe('v7 下载队列：迁移、幂等入队与租约 fencing', () => {
        ) RETURNING id, user_id, requested_by`,
     );
     expect(rows.rows[0]).toMatchObject({ id, user_id: 2, requested_by: 'user' });
+  });
+
+  // host 感知调度（2026-10-07）：优先领未被 running 占用的源 host，把并发实例摊到不同源。
+  it('host 感知领取：跳过已被 running 占用的 host，改领空闲 host 的队头；全占用时退回 FIFO', async () => {
+    // 三个 pending：A(host-a 最早)、B(host-a)、C(host-b)。created_at 递增保证 A 是 FIFO 队头。
+    await pg.query(
+      `INSERT INTO download_tasks(user_id, book_id, title, status, requested_by, source_url, created_at)
+       VALUES (2, 61, 'a1', 'pending', 'user', 'https://host-a.test/1', now() - interval '3 min'),
+              (2, 62, 'a2', 'pending', 'user', 'https://host-a.test/2', now() - interval '2 min'),
+              (2, 63, 'b1', 'pending', 'user', 'https://host-b.test/1', now() - interval '1 min')`,
+    );
+    // 第一个实例拿 FIFO 队头 A（host-a），此刻无占用。
+    const first = await claimDownloadTask(sql as never, 'w1');
+    expect(first).not.toBeNull();
+    expect((await pg.query('SELECT source_url FROM download_tasks WHERE id = $1', [first!.id])).rows[0])
+      .toMatchObject({ source_url: 'https://host-a.test/1' });
+    // 第二个实例：队头是 B(host-a) 但已被占用，应跳过领 C(host-b)。
+    const second = await claimDownloadTask(sql as never, 'w2');
+    expect((await pg.query('SELECT source_url FROM download_tasks WHERE id = $1', [second!.id])).rows[0])
+      .toMatchObject({ source_url: 'https://host-b.test/1' });
+    // 第三个实例：只剩 host-a 的 B（已占用），无空闲 host ⇒ 退回 FIFO 领 B，不空转。
+    const third = await claimDownloadTask(sql as never, 'w3');
+    expect((await pg.query('SELECT source_url FROM download_tasks WHERE id = $1', [third!.id])).rows[0])
+      .toMatchObject({ source_url: 'https://host-a.test/2' });
+    expect(await claimDownloadTask(sql as never, 'w4')).toBeNull();
   });
 });

@@ -3,7 +3,7 @@
 // 连同 zhaoshu-books/runtime 的 shell 与 @neondatabase/serverless 依赖一起产出可部署 tar。
 //
 // 用法：node scripts/build-runtime-download.mjs
-//   env RUNTIME_SHELL_DIR 覆盖 shell 目录（默认 ../zhaoshu-books/runtime）
+//   必须显式指定 RUNTIME_SHELL_DIR（含共享限速监督者的 shell 源；不再默认使用 T7）
 // 复现性：先清空 runtime-download/build 再全量生成；tar 只含 runtime/ + node_modules/。
 //
 // 说明：main.mjs 的「执行器接缝」是 T7 明确标注的替换点（runtime/service/main.mjs:59-78）。
@@ -16,13 +16,18 @@ import { execFileSync } from 'node:child_process';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { wireDownloadExecutor } from './runtime-download-template.mjs';
+import { assertSharedRuntimeShell, renderPrefetchService } from './runtime-prefetch-template.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(here, '..');
 const buildDir = join(repoRoot, 'runtime-download', 'build');
-const shellDir = resolve(process.env.RUNTIME_SHELL_DIR ?? join(repoRoot, '..', 'zhaoshu-books', 'runtime'));
+const shellInput = process.env.RUNTIME_SHELL_DIR;
+if (!shellInput?.trim()) throw new Error('RUNTIME_SHELL_DIR_REQUIRED');
+const shellDir = resolve(shellInput);
 const runtimeOut = join(buildDir, 'runtime');
 const executorOut = join(runtimeOut, 'executor', 'executor.mjs');
+const prefetchEntryPath = join(repoRoot, 'runtime-download', 'prefetch-entry.ts');
+const prefetchExecutorOut = join(runtimeOut, 'executor', 'prefetch.mjs');
 const tarPath = join(buildDir, 'zhaoshu-download-runtime.tar.gz');
 const NEON_DEP = '@neondatabase/serverless';
 
@@ -30,13 +35,24 @@ if (!existsSync(join(shellDir, 'service', 'main.mjs'))) {
   throw new Error(`runtime shell 未找到：${shellDir}（用 RUNTIME_SHELL_DIR 覆盖）`);
 }
 
+// 来源门在 rm/build/copy 之前：只读取 shell 源码，不 import 执行、不读取部署 env 文件。
+// T7 缺共享装配即明确拒绝；不能仅靠记住覆盖目录来保证生成的预取服务可启动。
+const shellSources = {};
+for (const relative of ['service/main.mjs', 'lib/env.mjs', 'lib/shared-rate/limiter.mjs',
+  'lib/shared-rate/startup.mjs', 'lib/shared-rate/supervisor.mjs']) {
+  const path = join(shellDir, relative);
+  if (!existsSync(path)) throw new Error('RUNTIME_SHELL_SHARED_SOURCE_MISSING');
+  shellSources[relative] = readFileSync(path, 'utf8');
+}
+assertSharedRuntimeShell(shellSources);
+
+if (!existsSync(prefetchEntryPath)) throw new Error('PREFETCH_ENTRY_MISSING');
+
 rmSync(buildDir, { recursive: true, force: true });
 mkdirSync(dirname(executorOut), { recursive: true });
 
 // 1) esbuild：绑定层 + T3 + 引擎模块 → 单文件 ESM（无 loader、无别名）。
-await build({
-  entryPoints: [join(repoRoot, 'runtime-download', 'entry.ts')],
-  outfile: executorOut,
+const esbuildOptions = {
   bundle: true,
   format: 'esm',
   platform: 'node',
@@ -48,6 +64,16 @@ await build({
     // 让被打进来的 CJS 依赖（cheerio/entities 等）在 ESM 里拿到 require。
     js: "import { createRequire as __cr } from 'node:module'; const require = __cr(import.meta.url);",
   },
+};
+await build({
+  entryPoints: [join(repoRoot, 'runtime-download', 'entry.ts')],
+  outfile: executorOut,
+  ...esbuildOptions,
+});
+await build({
+  entryPoints: [prefetchEntryPath],
+  outfile: prefetchExecutorOut,
+  ...esbuildOptions,
 });
 
 // 2) 拷贝 shell（用 T7 的目录形态：runtime/service + runtime/lib + runtime/timer + docs）。
@@ -62,6 +88,7 @@ for (const extra of ['timer', 'docs', 'systemd', 'README.md']) {
 const mainPath = join(runtimeOut, 'service', 'main.mjs');
 const original = readFileSync(mainPath, 'utf8');
 writeFileSync(mainPath, wireDownloadExecutor(original), 'utf8');
+writeFileSync(join(runtimeOut, 'service', 'prefetch.mjs'), renderPrefetchService(), 'utf8');
 
 // 4) 依赖：把 external 的 @neondatabase/serverless 随包分发（与 T7 tar 策略一致）。
 const neonSrc = join(repoRoot, 'node_modules', NEON_DEP);

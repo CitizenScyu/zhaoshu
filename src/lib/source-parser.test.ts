@@ -66,9 +66,54 @@ describe('supported source parser', () => {
     expect(sourceBookMatches({ title: '头发', author: '甲' }, { title: '頭發', author: '甲' })).toBe(true);
   });
 
+  // 41-suffix（2026-10-14）：打标库「书名-作者」复合题名 vs 源站本体名。两档从严降级，精确相等失败后才走。
+  it('41-suffix 复合题名：后缀=任务作者或源站作者 ⇒ 剥后缀判同一本', () => {
+    // 档 A：后缀就是 expected.author（三体Ⅲ-刘慈欣 / 作者刘慈欣），源站只列本体。
+    expect(sourceBookMatches({ title: '三体Ⅲ-刘慈欣', author: '刘慈欣' }, { title: '三体Ⅲ', author: '刘慈欣' })).toBe(true);
+    // 档 A 源站作者缺失（vikbook 形态无 og:novel:author）：后缀=任务作者即作者证据，本体相等即过。
+    expect(sourceBookMatches({ title: '三体Ⅲ-刘慈欣', author: '刘慈欣' }, { title: '三体Ⅲ', author: '' })).toBe(true);
+    // 档 B：后缀是源站作者（DB 作者是打标人「稻博、盗墓博物馆」），源站列本体+真实作者。
+    expect(sourceBookMatches({ title: '盗墓笔记-南派三叔', author: '稻博、盗墓博物馆' }, { title: '盗墓笔记', author: '南派三叔' })).toBe(true);
+    // 档 A 作者门照常：本体对上但源站作者与任务作者不符 ⇒ 仍 false。
+    expect(sourceBookMatches({ title: '三体Ⅲ-刘慈欣', author: '刘慈欣' }, { title: '三体Ⅲ', author: '别人' })).toBe(false);
+    // 档 B 源站作者缺失不放行：后缀与任务作者不一致且无第三方核对（副题反例排除不了）。
+    expect(sourceBookMatches({ title: '盗墓笔记-南派三叔', author: '稻博、盗墓博物馆' }, { title: '盗墓笔记', author: '' })).toBe(false);
+  });
+
+  it('41-suffix 不放宽成错配：副题后缀、无连字符、源站仍用全名、后缀是第三者都不判同一本', () => {
+    // 副题不是作者（楚留香新传1-借尸还魂）：两档都对不上后缀 ⇒ 剥不了。
+    expect(sourceBookMatches({ title: '楚留香新传1-借尸还魂', author: '古龙' }, { title: '楚留香新传1', author: '古龙' })).toBe(false);
+    // 后缀是第三者名字（既不是任务作者也不是源站作者）。
+    expect(sourceBookMatches({ title: '三体Ⅲ-刘慈欣', author: '刘慈欣' }, { title: '三体Ⅲ', author: '南派三叔' })).toBe(false);
+    // 无连字符的普通书名行为不变：不因源站标题是任务标题前缀而放行（非复合题名不走降级）。
+    expect(sourceBookMatches({ title: '三体', author: '刘慈欣' }, { title: '三体Ⅲ', author: '刘慈欣' })).toBe(false);
+  });
+
   it('decodes metadata entities regardless of attribute ordering', () => {
     expect(parseSourceIdentity(`<meta content='Ａ书' property='og:novel:book_name'><meta property="og:novel:author" content="甲&middot;乙">`))
       .toEqual({ title: 'Ａ书', author: '甲·乙' });
+  });
+
+  // 41-author（2026-10-14）：vikbook 详情页无 og:novel:author，作者只是 schema.org 微数据，
+  // itemprop 挂在外层 span 上、<a> 文本才是署名。三类形态各自兜底，og 优先级最高。
+  it('41-author 微数据作者兜底：span itemprop > a 文本 / a 自带 itemprop / title 属性', () => {
+    expect(parseSourceIdentity('<h1 class="title" itemprop="name">盗墓笔记</h1>'
+      + '<span itemprop="author"><p>作者：<span itemprop="author"><a class="red" title="作者：南派三叔" href="https://x">南派三叔</a></span></p></span>'))
+      .toEqual({ title: '盗墓笔记', author: '南派三叔' });
+    // a 自身带 itemprop：拿链接文本。
+    expect(parseSourceIdentity('<h1>三体Ⅲ</h1><span itemprop="author"><a itemprop="author" title="作者：刘慈欣">刘慈欣</a></span>'))
+      .toEqual({ title: '三体Ⅲ', author: '刘慈欣' });
+    // 块内无 <a> 可用：退 title 属性（原样返回，「作者：」标签在 knownSourceAuthor 比对时才剥）。
+    expect(parseSourceIdentity('<h1>三体Ⅲ</h1><span itemprop="author" title="作者：刘慈欣"></span>'))
+      .toEqual({ title: '三体Ⅲ', author: '作者：刘慈欣' });
+    // og 存在时不被微数据覆盖；无任何作者证据时 author 为空串。
+    expect(parseSourceIdentity('<meta property="og:novel:author" content="甲"><span itemprop="author"><a title="作者：乙">乙</a></span>'))
+      .toEqual({ title: '', author: '甲' });
+    expect(parseSourceIdentity('<h1>盗墓笔记</h1><div>正文</div>'))
+      .toEqual({ title: '盗墓笔记', author: '' });
+    // 防误收：itemprop 块内离头 400 字符窗口外才出现的链接不算署名。
+    expect(parseSourceIdentity('<h1>盗墓笔记</h1><div itemprop="author">' + 'x'.repeat(2000) + '</div><a href="#">无关</a>'))
+      .toEqual({ title: '盗墓笔记', author: '' });
   });
 
   it('expands only simple GET templates and encodes the search term', () => {

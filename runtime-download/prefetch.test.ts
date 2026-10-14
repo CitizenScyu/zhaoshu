@@ -126,6 +126,42 @@ describe('预取调度器', () => {
     expect(s.plans.size).toBe(0);
   });
 
+  it.each(['claim', 'scan'])('在 %s 后中止且归还失败时上抛，finally 再尝试归还', async phase => {
+    const s = createFakeStore({ tasks: [task(1)] });
+    const controller = new AbortController();
+    const failure = new Error('synthetic release failure');
+    const release = vi.spyOn(s.store, 'release');
+    release.mockRejectedValueOnce(failure);
+    if (phase === 'claim') {
+      const originalClaim = s.store.claimNext.bind(s.store);
+      vi.spyOn(s.store, 'claimNext').mockImplementation(async sig => {
+        const claimed = await originalClaim(sig);
+        controller.abort();
+        return claimed;
+      });
+    }
+    const selector = vi.fn(async () => {
+      controller.abort();
+      return ['https://a.example/b'];
+    });
+    await expect(runPrefetchScheduler(baseOptions(s.store, {
+      selector, signal: controller.signal,
+    }))).rejects.toBe(failure);
+    expect(release).toHaveBeenCalledTimes(2);
+    expect(release.mock.calls.map(([, input]) => input.reason)).toEqual(['aborted', 'scheduler_exit']);
+    expect(s.plans.size).toBe(0);
+    expect(selector).toHaveBeenCalledTimes(phase === 'claim' ? 0 : 1);
+  });
+
+  it('占位后端故障保留稳定门错误并上抛，交服务层退避，不伪装成扫描失败', async () => {
+    const s = createFakeStore({ tasks: [task(1)] });
+    const gateError = Object.assign(new Error('synthetic occupancy failure'), { code: 'HOST_OCCUPANCY_UNAVAILABLE' });
+    const selector = vi.fn(async () => { throw gateError; });
+    await expect(runPrefetchScheduler(baseOptions(s.store, { selector }))).rejects.toBe(gateError);
+    expect(s.releases).toEqual([{ id: 1, reason: 'scheduler_exit', retryDelayMs: undefined }]);
+    expect(s.plans.size).toBe(0);
+  });
+
   it('预算超时兜底：selector 永不 settle 也不拖过单本预算，scanSignal 通知守约 selector', async () => {
     const s = createFakeStore({ tasks: [task(1)] });
     let observedAbort = false;
@@ -186,6 +222,28 @@ describe('预取调度器', () => {
     expect(s.plans.get(1)).toEqual(['https://a.example/b', 'https://b.example/b']);
   });
 
+  it('非 HTTPS 旧候选不占有效缺额：仍补齐两个 HTTPS host', async () => {
+    // 反例（accept933 确认点）：H=http://legacy.example 在 claim/entry 都不算有效 host，
+    // 调度器也不能把它算进 knownHosts，否则缺额被算成 1，永远裁掉第二个 HTTPS host。
+    const s = createFakeStore({ tasks: [{ ...task(1), sourceUrls: ['http://legacy.example/book'] }] });
+    const result = await runPrefetchScheduler(baseOptions(s.store, {
+      selector: async () => ['https://b.example/book', 'https://c.example/book'],
+      targetHits: 2, maxTasksPerRound: 1, maxIdlePolls: 1, idlePollMs: 1,
+    }));
+    expect(result).toBe('completed');
+    expect(s.plans.get(1)).toEqual(['https://b.example/book', 'https://c.example/book']);
+  });
+
+  it('HTTPS 旧候选仍占有效缺额：只补一个新 host（不过度纠正）', async () => {
+    const s = createFakeStore({ tasks: [{ ...task(1), sourceUrls: ['https://known.example/book'] }] });
+    const result = await runPrefetchScheduler(baseOptions(s.store, {
+      selector: async () => ['https://b.example/book', 'https://c.example/book'],
+      targetHits: 2, maxTasksPerRound: 1, maxIdlePolls: 1, idlePollMs: 1,
+    }));
+    expect(result).toBe('completed');
+    expect(s.plans.get(1)).toEqual(['https://b.example/book']);
+  });
+
   it('正在下载的 host 传给选源器（busyHosts 注入）', async () => {
     const s = createFakeStore({ tasks: [task(1)], busyHosts: ['book15.net'] });
     let excluded: string[] = [];
@@ -203,6 +261,32 @@ describe('预取调度器', () => {
       maxConsecutiveFailures: 1, failureBackoffMs: 1,
     }))).rejects.toThrow('store down');
     expect(s.releases.some(r => r.id === 1)).toBe(true);
+  });
+
+  it('finish 返回 false 时仍尝试归还，不能丢掉 store 保留的租约', async () => {
+    const s = createFakeStore({ tasks: [task(1)] });
+    vi.spyOn(s.store, 'finish').mockResolvedValueOnce(false);
+    await runPrefetchScheduler(baseOptions(s.store, {
+      selector: async () => ['https://a.example/b', 'https://b.example/b'],
+      maxTasksPerRound: 1,
+    }));
+    expect(s.releases).toEqual([{ id: 1, reason: 'prefetch_lease_lost', retryDelayMs: undefined }]);
+    expect(s.plans.size).toBe(0);
+    expect(s.rows[0].claimed).toBe(false);
+  });
+
+  it('finish 返回 false 后归还失败时保留 held，finally 再尝试归还并上抛', async () => {
+    const s = createFakeStore({ tasks: [task(1)] });
+    vi.spyOn(s.store, 'finish').mockResolvedValueOnce(false);
+    const failure = new Error('synthetic release failure');
+    const release = vi.spyOn(s.store, 'release').mockRejectedValueOnce(failure);
+    await expect(runPrefetchScheduler(baseOptions(s.store, {
+      selector: async () => ['https://a.example/b', 'https://b.example/b'],
+      maxTasksPerRound: 1,
+    }))).rejects.toBe(failure);
+    expect(release.mock.calls.map(([, input]) => input.reason)).toEqual(['prefetch_lease_lost', 'scheduler_exit']);
+    expect(s.plans.size).toBe(0);
+    expect(s.rows[0].claimed).toBe(false);
   });
 
   it('注入边界：调度器只触碰 PrefetchStore 四个方法，接口无 download_tasks 写入口', async () => {

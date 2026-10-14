@@ -1,12 +1,8 @@
 // prefetch-entry 合成测试（不连库、不联网、不执行生产装配）：env 固定键名、缺 limiter 固定码
 // 拒绝且零 store/SQL/HTTP、DI run 参数与每轮上界、失败候选精确 URL 排除不连坐 host、busy host
 // 透传、abort 零出网/归还、GitHub 键与日预算不参与；另覆盖默认真实链（fake modules/pool/
-// SQL + mock fetchSourceText）：薄占用门与限速许可双门顺序、注入 transport 不绕过门、
+// SQL.transaction + mock fetchSourceText）：占用门与限速许可双门顺序、注入 transport 不绕过门、
 // 占用被抢时零许可消耗。
-//
-// 接缝差异（相对 W 草稿）：当前 master 的 SourceTransport 只有 beforeFetch（无 afterAcquire），
-// 占用门为 src/lib/download-source-candidates 的 tryOccupyHost 薄实现——每次物理请求一个
-// holder、一次占位；故门序是 occupy→acquire→emit→release（单相位），非 W 草稿的两相位复查。
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createSourcePrefetch, type SourcePrefetch } from './prefetch-entry';
 import type { PrefetchStore, PrefetchTask } from './prefetch';
@@ -26,8 +22,8 @@ const mocks = vi.hoisted(() => ({
 vi.mock('../src/lib/source-fetch', async (importOriginal) => {
   const actual = await importOriginal() as Record<string, unknown>;
   // 受控 fetchSourceText 模拟真实行为顺序：先过 beforeFetch 物理门（wrapTransport 占用门 →
-  // createSourceTransport 限速许可），再 abort 检查、最后才记发射；页面文本携带身份载荷，
-  // 让 fake api 从传输层页面解析身份。sourceAbortable 等其余导出保留真实实现。
+  // createSourceTransport 限速许可 → afterAcquire 复查），再 abort 检查、最后才记发射；页面文本
+  // 携带身份载荷，让 fake api 从传输层页面解析身份。sourceAbortable 等其余导出保留真实实现。
   mocks.fetchSourceText.mockImplementation(async (
     url: string,
     options: { signal: AbortSignal; beforeFetch?: (signal: AbortSignal, url: string) => void | Promise<void> },
@@ -47,7 +43,7 @@ interface FakeSqlOptions {
   occupyFail?: boolean;
 }
 
-/** 记录所有 SQL 调用的文本/参数；实现 transaction（失败候选查询需要）；可注入故障。 */
+/** 记录所有 SQL 调用的文本/参数；实现 transaction（occupancy 门需要）；可注入故障。 */
 function fakeSql(opts: FakeSqlOptions = {}) {
   const calls: { text: string; values: unknown[] }[] = [];
   const transactionOptions: unknown[] = [];
@@ -74,10 +70,10 @@ function fakeSql(opts: FakeSqlOptions = {}) {
     query(strings, ...values)) as unknown as PrefetchSql & {
     transaction: (fn: (tx: unknown) => unknown, options?: unknown) => Promise<unknown>;
   };
-  sql.transaction = (async (fn: (tx: unknown) => unknown, options?: unknown) => {
+  sql.transaction = async (fn: (tx: unknown) => unknown, options?: unknown) => {
     transactionOptions.push(options);
     return fn(sql);
-  }) as unknown as typeof sql.transaction;
+  };
   return { sql, calls, candidates, transactionOptions };
 }
 
@@ -139,7 +135,7 @@ const pickTwo = vi.fn<SourceSelector>(async () => ['https://a.example/b', 'https
 /** 便捷构造：全部注入，env 留空（验证生产 env 键解析不触发）。 */
 function entry(o: Partial<Parameters<typeof createSourcePrefetch>[0]> = {}) {
   return createSourcePrefetch({
-    rateLimiter: fakeLimiter(), log, env: {} as NodeJS.ProcessEnv, ...o,
+    rateLimiter: fakeLimiter(), log, env: {}, ...o,
   });
 }
 
@@ -160,7 +156,7 @@ describe('createSourcePrefetch 装配门（fail-closed）', () => {
     const s = createFakeStore({ tasks: [task(1)] });
     expect(() => createSourcePrefetch({
       rateLimiter: undefined as unknown as import('./engine').RateLimiterLike,
-      log, env: {} as NodeJS.ProcessEnv, sql: f.sql, store: s.store,
+      log, env: {}, sql: f.sql, store: s.store,
     })).toThrow('PREFETCH_RATE_LIMITER_REQUIRED');
     expect(f.calls.length).toBe(0);
     expect(s.calls.busyHosts + s.calls.claimNext + s.calls.finish + s.calls.release).toBe(0);
@@ -169,7 +165,7 @@ describe('createSourcePrefetch 装配门（fail-closed）', () => {
 
   it('无 sql/store 注入且 env 缺 DATABASE_URL：固定键名错误且不读配置文件', () => {
     vi.stubGlobal('fetch', vi.fn(() => { throw new Error('UNEXPECTED_NETWORK'); }));
-    expect(() => createSourcePrefetch({ rateLimiter: fakeLimiter(), log, env: {} as NodeJS.ProcessEnv }))
+    expect(() => createSourcePrefetch({ rateLimiter: fakeLimiter(), log, env: {} }))
       .toThrow('missing environment key: DATABASE_URL');
     expect(log).not.toHaveBeenCalled();
   });
@@ -292,12 +288,11 @@ describe('失败候选排除（真实 selector 包装）', () => {
     const selector = vi.fn();
     // 失败退避默认 60s：用首次 SQL 调用后即 abort 截断退避等待，让 run 可收口。
     const controller = new AbortController();
-    const transaction = f.sql.transaction as unknown as
-      (build: (tx: unknown) => unknown, options?: unknown) => Promise<unknown>;
-    f.sql.transaction = (async (build: (tx: unknown) => unknown, options?: unknown) => {
+    const transaction = f.sql.transaction;
+    f.sql.transaction = async (build: (tx: unknown) => unknown, options?: unknown) => {
       setTimeout(() => controller.abort(new Error('prefetch_aborted')), 0);
       return transaction(build, options);
-    }) as unknown as typeof f.sql.transaction;
+    };
     const stop = await entry({ sql: f.sql, store: s.store, selector }).run(controller.signal);
     expect(stop).toBe('aborted');
     expect(selector).not.toHaveBeenCalled();
@@ -355,11 +350,11 @@ describe('busy host 与 abort 合同', () => {
 
 /**
  * 默认真实链用例（不注入 selector/transport）：modules/loadPool/sql/store 注入合成物，
- * fetchSourceText 被 mock 成受控页源（不联网），createSourceTransport(limiter) 与薄占用门
- * 都是真实实现——用统一事件日志证明门序（occupy → acquire → emit → release），每次物理
- * 请求自持一个 holder（结束后 release）。
+ * fetchSourceText 被 mock 成受控页源（不联网），createSourceTransport(limiter) 与
+ * occupancy.wrapTransport 都是真实实现——用统一事件日志证明门序（occupy → acquire → emit），
+ * 每次 wrapTransport 调用自持 prefetch scope（结束后 release）。
  */
-describe('默认真实链（真实 selector/transport/薄占用门装配）', () => {
+describe('默认真实链（真实 selector/transport/occupancy 装配）', () => {
   /** 与 identity-precheck pageContext 的 ctx 同形：{ signal, page(url) }，page 经真实 transport 出网。 */
   type FakeCtx = { signal: AbortSignal; page: (url: string) => Promise<{ url: string; text: string }> };
 
@@ -411,7 +406,7 @@ describe('默认真实链（真实 selector/transport/薄占用门装配）', ()
     const prefetch = createSourcePrefetch({
       rateLimiter: limiter,
       log,
-      env: {} as NodeJS.ProcessEnv,
+      env: {},
       sql: f.sql,
       store: s.store,
       // DI 边界单点转型：窄合成形状只覆盖 selector 读取面。
@@ -422,7 +417,7 @@ describe('默认真实链（真实 selector/transport/薄占用门装配）', ()
     return { f, s, limiter, prefetch };
   }
 
-  it('默认链全通：排除生效后仅一源出网，occupy→acquire→emit→release 门序、plan 落库', async () => {
+  it('默认链全通：排除生效后仅一源出网，occupy→acquire→occupy(复查)→emit→release 门序、plan 落库', async () => {
     const chain = buildDefaultChain(
       ['https://failed.example/x', 'https://busy.example/y', 'https://book15.net/a', 'https://pick.example/ok'],
       { failed: ['https://failed.example/x'], busyHosts: ['busy.example'] },
@@ -430,11 +425,11 @@ describe('默认真实链（真实 selector/transport/薄占用门装配）', ()
     const stop = await chain.prefetch.run(new AbortController().signal);
     expect(stop).toBe('completed');
     // 失败候选（精确 URL）、busy host（store.busyHosts 注入的快照）、builtin host 三重排除生效。
-    // 薄占用门（真实）：每次物理发射前 beforeFetch 内先占用，再取限速许可，才进发射；
-    // 该次请求 scope 结束后归还（release:）。
+    // 两阶段门（真实 engine）：每次发射前 beforeFetch 占用→限速许可→afterAcquire 占用复查，
+    // 才进发射；该次 wrapTransport scope 结束后归还（release:）。
     expect(mocks.events).toEqual([
-      'occupy:pick.example', 'acquire:pick.example', 'emit:https://pick.example/ok/search', 'release:pick.example',
-      'occupy:pick.example', 'acquire:pick.example', 'emit:https://pick.example/ok/detail', 'release:pick.example',
+      'occupy:pick.example', 'acquire:pick.example', 'occupy:pick.example', 'emit:https://pick.example/ok/search', 'release:pick.example',
+      'occupy:pick.example', 'acquire:pick.example', 'occupy:pick.example', 'emit:https://pick.example/ok/detail', 'release:pick.example',
     ]);
     expect(chain.limiter.recordSuccess).toHaveBeenCalledTimes(2);
     expect(chain.limiter.recordFailure).not.toHaveBeenCalled();
@@ -442,10 +437,11 @@ describe('默认真实链（真实 selector/transport/薄占用门装配）', ()
     expect(chain.s.plans.get(1)).toEqual(['https://pick.example/ok']);
   });
 
-  it('注入 transport 仍过占用门：wrapTransport 不被绕过（占用 INSERT 每请求一次）', async () => {
-    // 注入方自带门：不走 createSourceTransport，故 limiter 不被触碰；占用门照常每请求执行一次。
+  it('注入 transport 仍过占用门：wrapTransport 不被绕过（占用 INSERT 每请求两次）', async () => {
+    // 注入方自带门：不走 createSourceTransport，故 limiter 不被触碰；两阶段占用门照常各执行一次。
     const transport: SourceTransport = async (url, options) => {
       await options.beforeFetch?.(options.signal, url);
+      await options.afterAcquire?.(options.signal, url);
       options.signal.throwIfAborted();
       mocks.events.push(`rawEmit:${url}`);
       return { url, text: 't1|佚名' };
@@ -454,8 +450,8 @@ describe('默认真实链（真实 selector/transport/薄占用门装配）', ()
     const stop = await chain.prefetch.run(new AbortController().signal);
     expect(stop).toBe('completed');
     expect(mocks.events).toEqual([
-      'occupy:pick.example', 'rawEmit:https://pick.example/ok/search', 'release:pick.example',
-      'occupy:pick.example', 'rawEmit:https://pick.example/ok/detail', 'release:pick.example',
+      'occupy:pick.example', 'occupy:pick.example', 'rawEmit:https://pick.example/ok/search', 'release:pick.example',
+      'occupy:pick.example', 'occupy:pick.example', 'rawEmit:https://pick.example/ok/detail', 'release:pick.example',
     ]);
     expect(chain.limiter.acquire).not.toHaveBeenCalled();
     expect(chain.f.calls.some(c => c.text.includes('INSERT INTO download_host_occupancy'))).toBe(true);
