@@ -228,17 +228,17 @@ describe('evaluateThreshold：现役模式比台账逻辑字节，legacy 比压�
       accounting: { registeredBytes, reservedBytes, targetBytes }, sizeKib: 0 });
 
   it('legacy（--current=）口径逐字不变：850MB 压缩字节边界两侧翻转，direction 是 >=', () => {
-    const boundary = Number(TARGET_BYTES / 1024n * 85n / 100n); // 85% of 1e9 B 换算 KiB
+    const boundary = Number(TARGET_BYTES / BigInt(1024) * BigInt(85) / BigInt(100)); // 85% of 1e9 B 换算 KiB
     expect(legacy(boundary).thresholdKib).toBe(boundary);
     expect(legacy(boundary - 1).exceeded).toBe(false);
     expect(legacy(boundary).exceeded).toBe(true);      // 边界本身算过线（>=，非 >）
     expect(legacy(boundary + 1).exceeded).toBe(true);
     // 旧算法细节：先 /1024 再乘百分比（整数截断），不是先算字节再换 KiB
-    expect(legacy(0, BigInt(2_000_000_000), 90).thresholdKib).toBe(Number(BigInt(2_000_000_000) / 1024n * 90n / 100n));
+    expect(legacy(0, BigInt(2_000_000_000), 90).thresholdKib).toBe(Number(BigInt(2_000_000_000) / BigInt(1024) * BigInt(90) / BigInt(100)));
   });
 
   it('legacy 模式忽略 accounting（保持「只看压缩 size」）', () => {
-    const over = legacy(Number(TARGET_BYTES / 1024n * 85n / 100n));
+    const over = legacy(Number(TARGET_BYTES / BigInt(1024) * BigInt(85) / BigInt(100)));
     expect(over.metric).toBe('github-compressed');
     expect(over.exceeded).toBe(true);
   });
@@ -318,8 +318,9 @@ describe('resolveActiveRepository（PGlite 真表）', () => {
     // accounting 是现役模式阈值判定的唯一输入来源，必须真表跑出来（不是 cfg 默认值）。
     if (active.status === 'ok') {
       expect(active.accounting).toEqual({ registeredBytes: BigInt(120_000_000), reservedBytes: BigInt(0), targetBytes: BigInt(1_000_000_000) });
+      const accounting = active.accounting ?? null;
       expect(evaluateThreshold({ metric: 'ledger-logical', thresholdPct: 85, cfgTargetBytes: BigInt(9_000_000_000),
-        accounting: active.accounting, sizeKib: 0 }).exceeded).toBe(false);
+        accounting, sizeKib: 0 }).exceeded).toBe(false);
     }
     await pg.close();
   }, 60_000);
