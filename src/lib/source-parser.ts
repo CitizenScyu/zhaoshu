@@ -293,14 +293,17 @@ export function parseSourceIdentity(html: string): SourceBookIdentity {
     if (attrs.property && attrs.content) meta.set(attrs.property.toLowerCase(), attrs.content.trim());
   }
   const title = meta.get('og:novel:book_name') ?? plainText(/<h1\b[^>]*>([\s\S]*?)<\/h1>/i.exec(html)?.[1] ?? '');
-  // og:novel:author 之外的兜底：schema.org 微数据作者（vikbook 形态：itemprop 在外层 span 上，
-  // 链接文本才是署名）。匹配顺序：1) a 自身带 itemprop；2) itemprop=author 元素块内第一个 <a> 文本；
-  // 3) itemprop=author 元素自身的 title 属性（「作者：X」，由 knownSourceAuthor 剥标签）。
-  const itempropAuthor = (plainText(/<a\b[^>]*itemprop=["']author["'][^>]*>([\s\S]*?)<\/a>/i.exec(html)?.[1] ?? ''))
+  const author = meta.get('og:novel:author') || itempropAuthorOf(html) || '';
+  return { title, author, ...parseSourceAlias(html) };
+}
+
+// schema.org 微数据作者（vikbook 形态：itemprop 在外层 span 上，链接文本才是署名）。
+// 匹配顺序：1) a 自身带 itemprop；2) itemprop=author 元素块内第一个 <a> 文本（400 字符窗口防误收）；
+// 3) itemprop=author 元素自身的 title 属性（「作者：X」）。标签前缀「作者：」留给 knownSourceAuthor 比对时剥。
+export function itempropAuthorOf(html: string): string {
+  return (plainText(/<a\b[^>]*itemprop=["']author["'][^>]*>([\s\S]*?)<\/a>/i.exec(html)?.[1] ?? ''))
     || (plainText(/<[^>]*itemprop=["']author["'][^>]*>[\s\S]{0,400}?<a\b[^>]*>([^<]*)<\/a>/i.exec(html)?.[1] ?? ''))
     || (/<[^>]*itemprop=["']author["'][^>]*title=["']([^"']*)["']/i.exec(html)?.[1] ?? '');
-  const author = meta.get('og:novel:author') || itempropAuthor || '';
-  return { title, author, ...parseSourceAlias(html) };
 }
 
 // 站点在简介里自报的改名标记（book15 实测：「小说简介:【原书名：我有一座恐怖屋】…」）。
