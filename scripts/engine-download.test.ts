@@ -387,8 +387,6 @@ describe('书源不可达分类（41-EXEC-SRCUNAVAIL）', () => {
 
   it.each([
     ['HTTP 404', () => new SourceHttpError(404)],
-    ['HTTP 403', () => new SourceHttpError(403)],
-    ['HTTP 429', () => new SourceHttpError(429)],
     ['策略拒绝', () => new SourcePolicyError('书源跳转次数超限')],
     ['未归类异常', () => new Error('boom')],
     ['非传输 TypeError', () => new TypeError('The encoded data was not valid for encoding utf-8')],
@@ -398,6 +396,22 @@ describe('书源不可达分类（41-EXEC-SRCUNAVAIL）', () => {
     expect(result.code).toBe(1);
     expect(result.manifest.errors).toEqual(['download_failed']);
     expect(stageOf(result)).toBeUndefined();
+  });
+
+  // 41-src403：403/429 从「download_failed 终态」改判 source_unavailable（可重试退避）。
+  // Cloudflare challenge 常阶段性放行（noveltri 详情页对 phoenix 出网 403、同刻搜索页 200），
+  // 旧分类把这类书直接打 failed 且不退避。判别力：删掉 isSourceUnavailableError 的 403/429
+  // 分支，本组回到 code=1 失败。
+  it.each([
+    ['HTTP 403', () => new SourceHttpError(403)],
+    ['HTTP 429', () => new SourceHttpError(429)],
+  ])('搜索阶段 %s ⇒ 改判 source_unavailable（code=2，41-src403）', async (_name, error) => {
+    const f = setup(-1);
+    const result = await f.run(failAt(f, 'search', error));
+    expect(result.code).toBe(2);
+    expect(result.manifest.errors).toEqual(['source_unavailable']);
+    expect(stageOf(result)).toBe('search');
+    expect(result.manifest.status).toBe('partial');
   });
 
   it('身份不符维持 identity_mismatch_or_no_candidate（code=1）', async () => {

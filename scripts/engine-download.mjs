@@ -25,11 +25,14 @@ const isHostGateError = error => error?.code === 'HOST_OCCUPIED'
 // 与限速器每源日请求上限（DailyRequestBudgetError，UTC 换日即重置，属瞬时）归 code=2 source_unavailable，
 // 与 resolveSource code=2 同档：可重试、零发布。4xx、策略拒绝、身份不符与其余异常维持原分类；
 // 正文阶段逐章失败照旧收口为 missing_chapters。
+// 41-src403：search/detail/toc 阶段的 403/429 也算源站暂时不可达——Cloudflare challenge
+// 常按 URL/频率阶段性放行（noveltri 详情页对 phoenix 出网 403、同刻搜索页 200），
+// 以前这类被吞成 download_failed 终态。仍走既有退避（16 次上限），永久封禁最多退干净到 failed。
 const SOURCE_STAGES = new Set(['search', 'detail', 'toc']);
 const UNREACHABLE_ERROR_NAMES = new Set(['ConnectTimeoutError', 'TimeoutError', 'CircuitOpenError', 'DailyRequestBudgetError']);
 export function isSourceUnavailableError(error) {
   const status = error?.status;
-  if (typeof status === 'number') return status >= 500 && status <= 599;
+  if (typeof status === 'number') return (status >= 500 && status <= 599) || status === 403 || status === 429;
   if (UNREACHABLE_ERROR_NAMES.has(error?.name)) return true;
   return error instanceof TypeError && /^fetch failed/i.test(error.message);
 }
