@@ -99,12 +99,12 @@ describe('41-T8FB builtin-fallback', () => {
     expect(h.searched).toHaveLength(MAX_FALLBACK_SCAN_SOURCES);
   });
 
-  it.each([false, true])('预检新扫与下载补扫累计最多 40 个源（耗尽=%s），下一轮重建余额', async exhausted => {
-    const pool = Array.from({ length: 50 }, (_, i) => `https://s${i}.example/`);
+  it.each([false, true])('预检新扫与下载补扫累计最多 MAX_FALLBACK_SCAN_SOURCES 个源（耗尽=%s），下一轮重建余额', async exhausted => {
+    const pool = Array.from({ length: MAX_FALLBACK_SCAN_SOURCES + 10 }, (_, i) => `https://s${i}.example/`);
     const searched: string[] = [];
     const failed = new Set<string>();
     let loads = 0;
-    const firstHit = exhausted ? 38 : 37;
+    const firstHit = MAX_FALLBACK_SCAN_SOURCES - (exhausted ? 2 : 3);
     const fallback = createBuiltinFallback({
       modules: {
         compile: { compileSource: () => ({}) },
@@ -132,15 +132,15 @@ describe('41-T8FB builtin-fallback', () => {
     });
     const precheck = fallback.wrapPrecheck(async () => UNAVAILABLE);
     expect(await precheck(task(), signal())).toEqual({ ok: true, reason: 'builtin_engine_fallback' });
-    expect(searched).toHaveLength(exhausted ? 40 : 39);
+    expect(searched).toHaveLength(exhausted ? MAX_FALLBACK_SCAN_SOURCES : MAX_FALLBACK_SCAN_SOURCES - 1);
     const calls: string[] = [];
     await fallback.wrapAdapter(adapter({}, []), adapter({}, calls)).download(task(), context());
-    // 预检已花 40 时零补扫；已花 39 时仅允许补扫一个，不能再次按 40 扫出两候选。
-    expect(searched).toHaveLength(40);
+    // 预检扫满额度时零补扫；差一个扫满时仅允许补扫一个，不能再次按全额度扫出两候选。
+    expect(searched).toHaveLength(MAX_FALLBACK_SCAN_SOURCES);
     expect(loads).toBe(exhausted ? 1 : 2);
     expect(calls).toEqual([...pool.slice(firstHit, firstHit + 2).map(hostOf),
       ...(exhausted ? [] : ['s0.example'])]);
-    if (!exhausted) expect(searched[39]).toBe(pool[0]);
+    if (!exhausted) expect(searched[MAX_FALLBACK_SCAN_SOURCES - 1]).toBe(pool[0]);
     // planned 仅传给同一轮下载；新轮拥有新的累计额度，而非永久耗尽。
     searched.length = 0;
     expect(await precheck(task(), signal())).toEqual({ ok: true, reason: 'builtin_engine_fallback' });

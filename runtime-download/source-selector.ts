@@ -100,6 +100,11 @@ export function createSourceSelector(options: SourceSelectorOptions): SourceSele
       const excludedSources = new Set(request.excludedSources);
       const picked: string[] = [];
       const pickedHosts: string[] = [];
+      // 同 host 去重（2026-10-14 实测整改）：同一 host 在池里常有多条书源变体（rouwennp.org ×4），
+      // 原逻辑只对「已命中 host」去重，扫描槽位仍被同 host 变体重复消耗——scanLimit 40 的窗口里
+      // 重复变体挤掉后面的不同 host，载书源永远轮不到。改为扫描前按 host 去重：每轮每 host 至多
+      // 消耗一个槽位；变体在后续轮次经 excludedSources（失败候选精确排除）仍可入选。
+      const scannedHosts = new Set<string>();
       let scanned = 0;
       for (const source of pool) {
         signal.throwIfAborted();
@@ -107,8 +112,9 @@ export function createSourceSelector(options: SourceSelectorOptions): SourceSele
           || (request.scanBudget && request.scanBudget.remaining <= 0)) break;
         const host = hostOf(source.url);
         if (!/^https:\/\//i.test(source.url) || !host || builtinHosts.has(host) || isSuspect(host)
-          || excludedHosts.has(host) || excludedSources.has(source.url) || pickedHosts.includes(host)) continue;
+          || excludedHosts.has(host) || excludedSources.has(source.url) || scannedHosts.has(host)) continue;
         scanned += 1;
+        scannedHosts.add(host);
         if (request.scanBudget) request.scanBudget.remaining -= 1;
         try {
           if (await sourceAbortable(sourceHasBook(source, task, overall), overall)) {

@@ -38,13 +38,16 @@ import type { PrecheckHook, PrecheckResult } from './executor';
 export const MAX_FALLBACK_SOURCES = 2;
 /**
  * 每本书最多搜索的引擎源数（按池序，跳过的不计）：给逐书出网封顶，作为 selector 的 scanLimit。
- * 2026-10-09 提速整改：200 → 40。实测多数无源书扫 130-140 源仍 0 候选、单本 ~90s，200 上限只让
- * 空转更久。池序靠前源命中概率高，早停（不同 host 数达标）通常远在 40 前收口；40 是同一本书本次
- * 下载跨预检新扫与下载补扫的累计上限，不是常态请求量。余额随预检计划交给下载腿，各次扫描在实际
- * 检查源前扣减（跳过的不计，异常不退回）；持久化候选（recall）零出网，不占扫描额度。后续任务重试
- * 重新建立余额，不无限延续旧轮计数。
+ * 历史：200 → 40（2026-10-09 提速整改）→ 160（2026-10-14 实测回调）。10-14 实测发现 40 上限系统性
+ * 漏检：池序（probe reachable → tier → checkedAt → url）前 40 被同人向镜像站与同 host 变体占满
+ * （rouwennp.org 单 host 4 个变体烧 4 个槽位），而实测载书的大站全排在 44–155（xyuzhaiwu10=44、
+ * sto66=103、quanwenyuedu=105、vikbook=155）——当日 668 次选源扫描 628 次零命中，热门书
+ * （我的治愈系游戏）在池内可达源精确命中却报 0 候选。回调到 160 ≈ 全池（https 去重后 ~170），
+ * 配合 selector 同 host 去重让每个槽位都是不同 host；墙钟 300s 与早停（2 host）仍是硬上界，
+ * 真无源书每轮扫描代价 ≈ 预算耗尽时间，不随上限线性放大。持久化候选（recall）零出网，
+ * 不占扫描额度。后续任务重试重新建立余额，不无限延续旧轮计数。
  */
-export const MAX_FALLBACK_SCAN_SOURCES = 40;
+export const MAX_FALLBACK_SCAN_SOURCES = 160;
 /** 选源早停目标：命中 2 个**不同 host**的可用源即停止扫描（2026-10-07 用户要求倾向 2 源而非 3 源）。 */
 export const FALLBACK_HOST_TARGET = 2;
 /** 选源墙钟预算：由 selector 内部计时管理，本文件不再另盖 AbortSignal.timeout。仍 << 30min 租约回收阈值。 */
