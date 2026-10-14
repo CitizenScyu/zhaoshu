@@ -17,10 +17,10 @@ vi.mock('./shuyuan', () => ({
 let service: typeof import('./source-reader');
 
 // builtin 夹具（与 source-reader.test.ts 同款形态）。
-const source = { url: 'https://book15.net/', name: '测试书源', searchUrl: '/books/search.html?kw={{key}}', rules: {} };
+const source = { url: 'https://bsrc53.test/', name: '测试书源', searchUrl: '/books/search.html?kw={{key}}', rules: {} };
 const backup = { url: 'https://backup.test/', name: '备用书源', searchUrl: '/books/search.html?kw={{key}}', rules: {} };
 const book = { title: '测试书', author: '作者' };
-const pageUrl = (id = 42) => `https://book15.net/books/details${id}.html`;
+const pageUrl = (id = 42) => `https://bsrc53.test/books/details${id}.html`;
 const backupDetail = (id = 777) =>
   `<meta property="og:novel:book_name" content="测试书"><meta property="og:novel:author" content="作者">`
   + `<dd><a href="/chapter/index${id}-1.html">第一章</a></dd><dd><a href="/chapter/index${id}-2.html">第二章</a></dd>`;
@@ -74,14 +74,14 @@ beforeEach(async () => {
   });
   vi.stubGlobal('fetch', mocks.fetch);
   service = await import('./source-reader');
-  (await import('./source-policy')).refreshSupportedHosts(['backup.test', 'e1.test']);
+  (await import('./source-policy')).refreshSupportedHosts(['bsrc53.test', 'backup.test', 'e1.test']);
   vi.stubGlobal('fetch', mocks.fetch);
 });
 afterEach(() => { vi.unstubAllGlobals(); vi.unstubAllEnvs(); vi.restoreAllMocks(); });
 
 describe('53-ratelimit：429 的候选层与作者回退行为（builtin 档）', () => {
   it('搜索页 429 ⇒ 跳源，不再打该站（既有语义，负控）', async () => {
-    pages.set('https://book15.net/books/search.html?kw=' + encodeURIComponent(book.title), { status: 429, headers: { 'retry-after': '60' } });
+    pages.set('https://bsrc53.test/books/search.html?kw=' + encodeURIComponent(book.title), { status: 429, headers: { 'retry-after': '60' } });
     mocks.sources.mockResolvedValue([source, backup]);
     pages.set('https://backup.test/books/search.html?kw=' + encodeURIComponent(book.title), {
       text: '<a href="/books/details777.html">测试书</a>',
@@ -89,7 +89,7 @@ describe('53-ratelimit：429 的候选层与作者回退行为（builtin 档）'
     pages.set('https://backup.test/books/details777.html', { text: backupDetail() });
     const catalog = await service.resolveSourceBook(book, context());
     expect(catalog.bookUrl).toBe('https://backup.test/books/details777.html');
-    expect(callsTo('book15.net')).toBe(1);
+    expect(callsTo('bsrc53.test')).toBe(1);
   });
 
   it('详情页 429 ⇒ 止损跳源：不再打同站其余候选、不再作者回退（53-ratelimit 修复回归）', async () => {
@@ -97,19 +97,19 @@ describe('53-ratelimit：429 的候选层与作者回退行为（builtin 档）'
     // 修复前行为（基线 b0985ac 复现）：3 个详情全打完（≥4 次物理请求），Retry-After 无人消费。
     // 修复后判据：首个 429 详情即止损——同站恰 2 次（搜索 1 + 详情 1），作者回退被拦。
     mocks.sources.mockResolvedValue([source, backup]);
-    pages.set('https://book15.net/books/search.html?kw=' + encodeURIComponent(book.title), {
+    pages.set('https://bsrc53.test/books/search.html?kw=' + encodeURIComponent(book.title), {
       text: '<a href="/books/details41.html">测试书</a><a href="/books/details42.html">测试书</a><a href="/books/details43.html">测试书</a>',
     });
     for (const id of [41, 42, 43]) pages.set(pageUrl(id), { status: 429, headers: { 'retry-after': '60' } });
     pages.set('https://backup.test/books/search.html?kw=' + encodeURIComponent(book.author), { status: 404 });
     await expect(service.resolveSourceBook(book, context())).rejects.toMatchObject({ code: 'SOURCE_UNAVAILABLE', status: 503 });
-    expect(callsTo('book15.net')).toBe(2);
+    expect(callsTo('bsrc53.test')).toBe(2);
   });
 
   it('详情页 429 止损后备用源照常拿到全书（预算不再被限流源挤占）', async () => {
     // 限流源吃掉 2 点即止；备用源用剩余预算完成搜索→详情→交付。
     mocks.sources.mockResolvedValue([source, backup]);
-    pages.set('https://book15.net/books/search.html?kw=' + encodeURIComponent(book.title), {
+    pages.set('https://bsrc53.test/books/search.html?kw=' + encodeURIComponent(book.title), {
       text: '<a href="/books/details41.html">测试书</a><a href="/books/details42.html">测试书</a>',
     });
     for (const id of [41, 42]) pages.set(pageUrl(id), { status: 429, headers: { 'retry-after': '60' } });
@@ -119,7 +119,7 @@ describe('53-ratelimit：429 的候选层与作者回退行为（builtin 档）'
     pages.set('https://backup.test/books/details777.html', { text: backupDetail() });
     const catalog = await service.resolveSourceBook(book, context());
     expect(catalog.bookUrl).toBe('https://backup.test/books/details777.html');
-    expect(callsTo('book15.net')).toBe(2); // 429 止损：搜索 1 + 详情 1，不多打
+    expect(callsTo('bsrc53.test')).toBe(2); // 429 止损：搜索 1 + 详情 1，不多打
   });
 });
 
@@ -127,7 +127,7 @@ describe('53-ratelimit：503 与 Retry-After 的退避', () => {
   it('page() 对带有效 Retry-After 的 503 首次响应即停止重试', async () => {
     pages.set(pageUrl(), { status: 503, headers: { 'retry-after': '60' } });
     await expect(context().page(pageUrl())).rejects.toMatchObject({ status: 503 });
-    expect(callsTo('book15.net')).toBe(1);
+    expect(callsTo('bsrc53.test')).toBe(1);
   });
 });
 
@@ -171,7 +171,7 @@ describe('53-ratelimit：预算与取消后的多余请求（负控）', () => {
     const budget = context(1);
     await expect(budget.page(pageUrl())).rejects.toMatchObject({ code: 'SOURCE_BUDGET_EXCEEDED' });
     // 第 1 次尝试扣 1 点；重试的 beforeRequest 撞 L2 即停 ⇒ 恰 1 次物理请求。
-    expect(callsTo('book15.net')).toBe(1);
+    expect(callsTo('bsrc53.test')).toBe(1);
   });
 
   it('取消后不再发请求（既有语义，负控）', async () => {

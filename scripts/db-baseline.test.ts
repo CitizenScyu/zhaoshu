@@ -108,8 +108,12 @@ describe('契约的来源与冻结', () => {
     for (const [version, checksum] of Object.entries(PUBLISHED_CHECKSUMS)) expect(BASELINE_CHECKSUMS[Number(version) as 1 | 2]).toBe(checksum);
   }, 60_000);
 
-  it('契约的表 = 迁移管理的表（EXPECTED_TABLES 去掉记账表与 artifact 三表）= 出处表的键', () => {
-    const expected = EXPECTED_TABLES.filter((table) => table !== 'schema_migrations' && !ARTIFACT_TABLES.includes(table)).sort();
+  it('契约的表 = 迁移管理的表（EXPECTED_TABLES 去掉记账表、artifact 三表与 0005 三表）= 出处表的键', () => {
+    // 0005 三表（bsrcfix-41）也是运行期表（老库由 initializeBusinessSchema 幂等建）：baseline 契约
+    // 只对 v1–v3 成立，与 app_settings 等四张 0003 表同理从契约比对中排除。
+    const postBaseline = new Set(['download_source_candidates', 'download_host_occupancy', 'download_source_prefetch']);
+    const expected = EXPECTED_TABLES.filter((table) => table !== 'schema_migrations'
+      && !ARTIFACT_TABLES.includes(table) && !postBaseline.has(table)).sort();
     expect(Object.keys(BASELINE_SHAPE).sort()).toEqual(expected);
     expect(Object.keys(BASELINE_TABLE_SOURCES).sort()).toEqual(expected);
   });
@@ -162,8 +166,12 @@ maybe('PGlite 真库', () => {
     expect(await main({ argv: baselineArgv(true), env: { PROD_DATABASE_URL: FAKE_URL }, open: async () => client, probe: okProbe,
       migrations: list, ...out })).toBe(0);
     const applied = JSON.parse(out.lines.at(-1)!);
-    // baseline 只登记 v1–v3；v4 列和记账尚未补全，check 应拒绝这个中间态。
-    expect(applied).toMatchObject({ status: 'applied', after: { ok: false, checksumOk: false, authVersionOk: true, missingTables: [] } });
+    // baseline 只登记 v1–v3；v4 列与 v5 三表和记账尚未补全，check 应拒绝这个中间态。
+    // migratedUnledgered 跑的是 loadBaseline()（≤v3），0005 三表不在库里，故 missingTables 报这三张。
+    expect(applied).toMatchObject({
+      status: 'applied',
+      after: { ok: false, checksumOk: false, authVersionOk: true, missingTables: ['download_host_occupancy', 'download_source_candidates', 'download_source_prefetch'] },
+    });
     expect(out.lines.join('\n')).not.toContain('not-a-secret-marker');
 
     const ledger = (await pg.query('SELECT version, name, checksum FROM schema_migrations ORDER BY version')).rows;
@@ -187,8 +195,8 @@ maybe('PGlite 真库', () => {
     // (c) 登记之后再跑 baseline：已有记账表 → 拒绝，退出码 2，记账不变。
     const again = await runProdBaseline(client, list, 'apply');
     expect(again.status).toBe('refused');
-    expect(again.refusals.join('\n')).toMatch(/已有 schema_migrations（登记了 4 个版本）/);
-    expect((await pg.query('SELECT count(*)::int AS n FROM schema_migrations')).rows[0].n).toBe(4);
+    expect(again.refusals.join('\n')).toMatch(/已有 schema_migrations（登记了 5 个版本）/);
+    expect((await pg.query('SELECT count(*)::int AS n FROM schema_migrations')).rows[0].n).toBe(5);
   }, 180_000);
 
   it('按生产演化路径建的库（旧应用表 → auth v1–v7 → 运行期 DDL → 手工 0002 → artifact → 用量表）：baseline 通过，登记后 check 退出 0', async () => {

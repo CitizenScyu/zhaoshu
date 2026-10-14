@@ -4,6 +4,18 @@ const mocks = vi.hoisted(() => ({ sources: vi.fn(), getSql: vi.fn() }));
 vi.mock('./db', () => ({ getSql: mocks.getSql }));
 vi.mock('./shuyuan', () => ({ getReadingSources: mocks.sources, getSourcePools: async () => ({ traversal: [], selectable: [] }) }));
 
+// 合成同站配对（与 source-reader.test.ts 同款约定）：唯一的内建同站对（book15）在真实注册表里
+// lifecycle='retired'，退休门会在物理发射前拒绝；本文件的「同站别名/换 host 兜底」用例只测冷却
+// 共享语义，把 alternateSourceHost 钉成 cooldown.test ↔ www.cooldown.test（非内建 host，退休门不适用）。
+vi.mock('./source-policy', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./source-policy')>();
+  return {
+    ...actual,
+    alternateSourceHost: (host: string) => host === 'cooldown.test' ? 'www.cooldown.test'
+      : host === 'www.cooldown.test' ? 'cooldown.test' : actual.alternateSourceHost(host),
+  };
+});
+
 let service: typeof import('./source-reader');
 const epoch = Date.parse('2026-09-29T00:00:00Z');
 const host = 'https://cooldown.test';
@@ -41,7 +53,7 @@ beforeEach(async () => {
     return new Response(fixture.text ?? '', { status: fixture.status ?? 200, headers: fixture.headers });
   });
   service = await import('./source-reader');
-  (await import('./source-policy')).refreshSupportedHosts(['cooldown.test', 'other.test']);
+  (await import('./source-policy')).refreshSupportedHosts(['cooldown.test', 'www.cooldown.test', 'other.test']);
 });
 afterEach(() => { vi.useRealTimers(); vi.unstubAllGlobals(); vi.unstubAllEnvs(); vi.restoreAllMocks(); });
 
@@ -115,14 +127,14 @@ describe('53 请求树共享冷却', () => {
   it('同站别名共享窗口，节流全局回滚也不把冷却扩大到异站', async () => {
     vi.stubEnv('SOURCE_THROTTLE_PER_HOST', '0');
     const ctx = root();
-    pages.set('https://book15.net/limited', { status: 503, headers: { 'retry-after': '60' } });
+    pages.set(host + '/limited', { status: 503, headers: { 'retry-after': '60' } });
     pages.set(other + '/good', { text: 'other' });
-    await expect(ctx.page('https://book15.net/limited')).rejects.toMatchObject({ status: 503 });
-    await expect(ctx.page('https://www.book15.net/good')).rejects.toMatchObject({ code: 'SOURCE_SCOPE_EXHAUSTED' });
+    await expect(ctx.page(host + '/limited')).rejects.toMatchObject({ status: 503 });
+    await expect(ctx.page('https://www.cooldown.test/good')).rejects.toMatchObject({ code: 'SOURCE_SCOPE_EXHAUSTED' });
     const allowed = settle(ctx.page(other + '/good'));
     await vi.advanceTimersByTimeAsync(350);
     expect((await allowed).value).toMatchObject({ text: 'other' });
-    expect(requests.map(call => call.url)).toEqual(['https://book15.net/limited', other + '/good']);
+    expect(requests.map(call => call.url)).toEqual([host + '/limited', other + '/good']);
   });
 
   it('重定向后的503按实际响应站记窗，不误封起始站', async () => {
@@ -144,15 +156,15 @@ describe('53 请求树共享冷却', () => {
 
   it('连接失败准备换host时收到同站503，兜底发射也重查且不重复扣点', async () => {
     const ctx = root();
-    pages.set('https://book15.net/network', { delay: 40, networkFailure: true });
-    pages.set('https://www.book15.net/limited', { status: 503, headers: { 'retry-after': '60' } });
-    const first = settle(ctx.page('https://book15.net/network'));
-    const limited = settle(ctx.page('https://www.book15.net/limited'));
+    pages.set(host + '/network', { delay: 40, networkFailure: true });
+    pages.set('https://www.cooldown.test/limited', { status: 503, headers: { 'retry-after': '60' } });
+    const first = settle(ctx.page(host + '/network'));
+    const limited = settle(ctx.page('https://www.cooldown.test/limited'));
     await vi.advanceTimersByTimeAsync(400);
     expect((await limited).error).toMatchObject({ status: 503 });
     expect((await first).error).toMatchObject({ code: 'SOURCE_SCOPE_EXHAUSTED' });
     expect(requests).toEqual([
-      { url: 'https://book15.net/network', at: 0 }, { url: 'https://www.book15.net/limited', at: 350 },
+      { url: host + '/network', at: 0 }, { url: 'https://www.cooldown.test/limited', at: 350 },
     ]);
     expect(ctx.requests).toBe(2);
   });

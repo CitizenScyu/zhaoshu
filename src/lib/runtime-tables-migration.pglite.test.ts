@@ -17,7 +17,8 @@ import { applyMigration, ARTIFACT_TABLES, evaluateSchema, EXPECTED_TABLES, inspe
 import { runAuthMigration } from '../../scripts/migrate-auth-prod.mjs';
 import { assertAuthSchema } from './auth-store';
 
-const RUNTIME_TABLES = ['app_settings', 'cron_health', 'profile_feedback_queue', 'source_admission'];
+const RUNTIME_TABLES = ['app_settings', 'cron_health', 'profile_feedback_queue', 'source_admission',
+  'download_source_candidates', 'download_host_occupancy', 'download_source_prefetch'];
 
 const PGliteCtor = await loadPGlite();
 const maybe = PGliteCtor ? describe : describe.skip;

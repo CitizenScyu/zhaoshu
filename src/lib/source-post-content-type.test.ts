@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { buildSourceSearchRequest } from './source-parser';
-import { checkSourceUrl } from './source-policy';
+import { checkSourceUrl, refreshSupportedHosts } from './source-policy';
 import { fetchSourceText } from './source-fetch';
 import { searchAdmission, type AdmissionTransport } from './rule-engine/admission';
 import type { RawSource } from './rule-engine/compile-smoke';
@@ -93,7 +93,7 @@ describe('postnr42 a 类 7 源：构造出的请求带 CT', () => {
 
 // 两条发请求路径都经 buildSourceSearchRequest：CT 只在首跳，重定向后的 GET 不带。
 describe('发请求层：首跳带 CT、重定向跳不带', () => {
-  afterEach(() => { delete process.env.ENGINE_POST_SEARCH; vi.unstubAllGlobals(); });
+  afterEach(() => { delete process.env.ENGINE_POST_SEARCH; vi.unstubAllGlobals(); refreshSupportedHosts([]); });
 
   it('准入 searchAdmission（ENGINE_POST_SEARCH 开）', async () => {
     process.env.ENGINE_POST_SEARCH = '1';
@@ -122,7 +122,10 @@ describe('发请求层：首跳带 CT、重定向跳不带', () => {
   });
 
   it('运行时 fetchSourceText（请求来自 buildSourceSearchRequest）', async () => {
-    const req = buildSourceSearchRequest('https://book15.net/s,{"method":"POST","body":"searchkey={{key}}","charset":"gb2312"}', '剑来', 'https://book15.net');
+    // book15 在静态注册表里 lifecycle='retired'（许可门物理发射前拒绝）；本例只测传输合同，
+    // 载体用合成活跃 host e1.test。
+    refreshSupportedHosts(['e1.test']);
+    const req = buildSourceSearchRequest('https://e1.test/s,{"method":"POST","body":"searchkey={{key}}","charset":"gb2312"}', '剑来', 'https://e1.test');
     const fetchMock = vi.fn()
       .mockResolvedValueOnce(new Response(null, { status: 302, headers: { location: '/result' } }))
       .mockResolvedValueOnce(new Response('结果'));

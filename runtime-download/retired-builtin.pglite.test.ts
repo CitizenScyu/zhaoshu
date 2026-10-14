@@ -103,16 +103,21 @@ maybe('618 退休源反例：旧 book15 URL 的 builtin 下载任务（真实注
   const insertTask = async (opts: {
     requestedBy?: string; attemptCount?: number; status?: string; updatedAtAgoMs?: number;
   } = {}): Promise<number> => {
-    const base = [TITLE, AUTHOR, opts.status ?? 'pending', BOOK_URL, opts.requestedBy ?? 'system'];
+    // requested_by='user' 的行必须带真实属主（download_tasks_request_identity_check，
+    // business-schema.ts:243–246），user_id=NULL 直接 23514——与 download-task-queue.pglite.test.ts
+    // 先 seed 用户再插行的做法同源；owner id=1 由 initializeAuthSchema 写入。
+    const requestedBy = opts.requestedBy ?? 'system';
+    const userId = requestedBy === 'user' ? 1 : null;
+    const base = [TITLE, AUTHOR, opts.status ?? 'pending', BOOK_URL, requestedBy];
     const result = opts.attemptCount === undefined
       ? await pg.query(
         `INSERT INTO download_tasks(user_id, book_id, title, author, status, source_url, requested_by, source_kind, updated_at)
-         VALUES (NULL, 1, $1, $2, $3, $4, $5, 'builtin', now() - ($6::bigint * interval '1 millisecond')) RETURNING id`,
-        [...base, opts.updatedAtAgoMs ?? 0])
+         VALUES ($6, 1, $1, $2, $3, $4, $5, 'builtin', now() - ($7::bigint * interval '1 millisecond')) RETURNING id`,
+        [...base, userId, opts.updatedAtAgoMs ?? 0])
       : await pg.query(
         `INSERT INTO download_tasks(user_id, book_id, title, author, status, source_url, requested_by, source_kind, attempt_count, updated_at)
-         VALUES (NULL, 1, $1, $2, $3, $4, $5, 'builtin', $6, now() - ($7::bigint * interval '1 millisecond')) RETURNING id`,
-        [...base, opts.attemptCount, opts.updatedAtAgoMs ?? 0]);
+         VALUES ($6, 1, $1, $2, $3, $4, $5, 'builtin', $7, now() - ($8::bigint * interval '1 millisecond')) RETURNING id`,
+        [...base, userId, opts.attemptCount, opts.updatedAtAgoMs ?? 0]);
     return Number((result.rows[0] as { id: number }).id);
   };
   const row = async (id: number) => (await pg.query(

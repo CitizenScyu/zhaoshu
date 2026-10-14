@@ -552,10 +552,14 @@ function checkedAtMs(value: string | null): number {
  * 排序即 §2.4 全序的引擎段：(probe reachable) DESC → tier 升序 → search_checked_at DESC → url 升序。
  */
 async function engineReadingSources(
-  s: Sql, states: Map<string, ProbeState>, signal: AbortSignal,
+  s: Sql, states: Map<string, ProbeState>, signal: AbortSignal, includePhoenixOk = false,
 ): Promise<ReadingSource[]> {
-  const rows = await cachedRead('engineRows', signal,
-    (sig) => artifactOr((artifact) => artifact.engine, () => readEngineRows(s, sig)));
+  // bpool-expand：下载池（includePhoenixOk=true）**不复用**阅读池的 'engineRows' 缓存键，也不读源池产物
+  // （产物是 Vercel 确认口径、已排除 phoenix_ok: 行），鲜读并放开前缀。默认 false ⇒ 缓存键/产物路径逐字不变。
+  const rows = includePhoenixOk
+    ? await cachedRead('engineRowsDownload', signal, (sig) => readEngineRows(s, sig, true))
+    : await cachedRead('engineRows', signal,
+      (sig) => artifactOr((artifact) => artifact.engine, () => readEngineRows(s, sig)));
   // 41-srcfix 改法2：库键 source_url 仍是上游原样（http:// 源不改键，source_admission 不会出新旧两行），
   // 运行时身份 url 取升 https 后的形态——搜索基址、目录/正文相对链接、目录缓存 sourceUrl 全部由它派生，
   // 所以 http 源的每个请求都走 https。只改 scheme，过的仍是同一把 validateSourceUrl 锁。
@@ -583,14 +587,16 @@ async function engineReadingSources(
 
 /** 引擎候选行：shuyuan_sources JOIN source_admission ok 态；池合成与产物生成共用同一查询。
  * admrunner42：phoenix_ok: 行（runner 探 ok、Vercel 未确认）不入池——谓词与 supported-sources.ts engineHosts、
- * readAdmissionFunnel 的 ok 桶同款。 */
-function readEngineRows(s: Sql, signal?: AbortSignal): Promise<PoolArtifactEngineRow[]> {
+ * readAdmissionFunnel 的 ok 桶同款。
+ * bpool-expand：`includePhoenixOk=true` 放开该前缀（仅下载池；产物生成恒传默认 false，阅读池口径不变）。 */
+function readEngineRows(s: Sql, signal?: AbortSignal, includePhoenixOk = false): Promise<PoolArtifactEngineRow[]> {
   return readRows<PoolArtifactEngineRow>(s, s`
     SELECT src.source_url, src.name, src.source, src.disabled_at::text AS disabled_at, src.last_error,
            a.tier, a.search_checked_at::text AS search_checked_at
     FROM shuyuan_sources src
     JOIN source_admission a ON a.source_url = src.source_url
-    WHERE a.compile_ok AND a.search_ok IS TRUE AND (a.error IS NULL OR a.error NOT LIKE 'phoenix_ok:%')
+    WHERE a.compile_ok AND a.search_ok IS TRUE
+      AND (${includePhoenixOk}::boolean OR a.error IS NULL OR a.error NOT LIKE 'phoenix_ok:%')
     ORDER BY src.source_url`, signal);
 }
 
@@ -611,6 +617,22 @@ export async function getEngineSources(signal: AbortSignal): Promise<ReadingSour
   syncReadCacheWithGate(); // 调用方（download-source）常先按鲜读刷门再来取池
   const { states } = readMeta((await poolProbeMeta(s, signal)).collections);
   return engineReadingSources(s, states, signal);
+}
+
+/** 下载池放量开关（bpool-expand）：env `DOWNLOAD_POOL_INCLUDE_PHOENIX_OK` 为 1/true/on 才开。
+ * 默认关 ⇒ 下载池 = 阅读池（逐字回改前）。B 线下载出站全走 phoenix，故信任 phoenix 准入结论。 */
+export function downloadPoolIncludesPhoenixOk(env: Record<string, string | undefined> = process.env): boolean {
+  const raw = env.DOWNLOAD_POOL_INCLUDE_PHOENIX_OK?.trim().toLowerCase();
+  return raw === '1' || raw === 'true' || raw === 'on';
+}
+
+/** 下载池引擎源（bpool-expand）：开关开时放开 phoenix_ok: 行（阅读池不受影响）。 */
+export async function getDownloadEngineSources(signal: AbortSignal): Promise<ReadingSource[]> {
+  if (!downloadPoolIncludesPhoenixOk()) return getEngineSources(signal);
+  const s = getSql();
+  syncReadCacheWithGate();
+  const { states } = readMeta((await poolProbeMeta(s, signal)).collections);
+  return engineReadingSources(s, states, signal, true);
 }
 
 function canProbe(url: string): boolean {
@@ -978,6 +1000,12 @@ async function artifactOr<T>(pick: (artifact: PoolArtifact) => T, load: () => Pr
  */
 export async function getPoolEngineHosts(signal?: AbortSignal): Promise<string[]> {
   return artifactOr((artifact) => artifact.hosts, () => engineHosts(signal));
+}
+
+/** 下载池 host 门（bpool-expand）：开关开时放开 phoenix_ok: 源 host；关时同 getPoolEngineHosts。 */
+export async function getDownloadPoolEngineHosts(signal?: AbortSignal): Promise<string[]> {
+  if (!downloadPoolIncludesPhoenixOk()) return getPoolEngineHosts(signal);
+  return engineHosts(signal, { includePhoenixOk: true });
 }
 
 /**

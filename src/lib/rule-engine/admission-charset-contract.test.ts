@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { SourceRequestContext } from '@/lib/source-reader';
 import { buildSourceSearchRequest } from '@/lib/source-parser';
+import { refreshSupportedHosts } from '@/lib/source-policy';
 import { encodeToBytes, type SourceCharset } from '@/lib/source-charset';
 import { engineSearchBook } from './api';
 import { searchAdmission } from './admission';
@@ -12,12 +13,18 @@ vi.mock('@/lib/shuyuan', () => ({
   getSourcePools: () => { throw new Error('合成字符集验证不能读取源池'); },
 }));
 
-const BASE = 'https://book15.net';
+// 真实注册表 book15 已退休（lifecycle='retired'），运行时 engineSearchBook → context.page →
+// fetchSourceText 的退休门会在物理发射前拒绝。本契约只测字符集双用途，载体用合成活跃 host
+// cc53.test（beforeEach 注册进运行时 host 门、afterEach 复位回内建集合，不跨文件污染）。
+const BASE = 'https://cc53.test';
 const TITLE = '合成书';
 const HTML = '<div class="book" data-title="合成书"><span class="title">合成书</span><span class="author">合成作者</span><a href="/book/1">详情</a></div>';
 
-beforeEach(() => { vi.stubEnv('ENGINE_POST_SEARCH', '1'); });
-afterEach(() => { vi.unstubAllGlobals(); vi.unstubAllEnvs(); });
+beforeEach(() => {
+  vi.stubEnv('ENGINE_POST_SEARCH', '1');
+  refreshSupportedHosts(['cc53.test']);
+});
+afterEach(() => { vi.unstubAllGlobals(); vi.unstubAllEnvs(); refreshSupportedHosts([]); });
 
 function template(method: 'GET' | 'POST', charset: SourceCharset) {
   return BASE + '/charset-contract' + (method === 'GET' ? '?q={{key}}' : '') + ',' + JSON.stringify({
@@ -43,7 +50,7 @@ async function checkBoth(searchUrl: string, bodyCharset: SourceCharset, headerCh
   };
   const raw = { bookSourceUrl: BASE, bookSourceName: '合成契约源', checkKeyWord: TITLE, searchUrl, ...rules };
   const admission = await searchAdmission(raw, {
-    fetchPage, declaredHosts: new Set(['book15.net']), signal: new AbortController().signal, throttleMs: 0,
+    fetchPage, declaredHosts: new Set(['cc53.test']), signal: new AbortController().signal, throttleMs: 0,
   });
   expect(admission).toMatchObject({ verdict: expected === 'empty' ? 'no_result' : 'ok', candidateCount: expected === 'empty' ? 0 : 1 });
   const source = { url: BASE, name: raw.bookSourceName, searchUrl, compiled: compileSource({ url: BASE, searchUrl, rules }) };

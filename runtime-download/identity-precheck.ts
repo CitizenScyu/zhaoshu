@@ -13,7 +13,8 @@
 //   { ok: false, reason: 'source_unavailable', retryable: true, stage }，执行器按下载腿同一收口退避，不扣额度；
 // - 页面都取到了：搜到但作者都对不上，或一个候选都没有 ⇒ { ok: false, reason: 'identity_mismatch' }（与下载器
 //   会判 identity_mismatch_or_no_candidate 的情形一一对应）；对得上 ⇒ { ok: true }；
-// - 其余（源解析失败、未归类错误、4xx、逐请求超时、预检墙钟用尽、drain 停机、候选超过
+// - caller 停机与物理占位门拒绝上抛，不归为身份无结论。
+// - 其余（源解析失败、未归类错误、4xx、逐请求超时、预检墙钟用尽、候选超过
 //   MAX_PRECHECK_CANDIDATES 且前面的都对不上）⇒ { ok: true, reason: 'identity_unverified' }，放行，由下载器按原路径处理。
 
 import { identityMatches, isSourceUnavailableError } from '../scripts/engine-download.mjs';
@@ -26,7 +27,7 @@ export const IDENTITY_PRECHECK_BUDGET_MS = 120_000;
 
 type Page = { url: string; text: string };
 export type Transport = (url: string, options: { signal: AbortSignal; timeoutMs?: number }) => Promise<Page>;
-type Candidate = { bookUrl: string };
+type Candidate = { title?: string; author?: string; bookUrl: string };
 type Identity = { title?: string; author?: string };
 interface Modules {
   compile: { compileSource(source: unknown): unknown };
@@ -105,7 +106,7 @@ export function createIdentityPrecheck(options: IdentityPrecheckOptions): Preche
       const detail = builtin
         ? m.parser.parseSourceIdentity((await ctx.page(candidate.bookUrl)).text)
         : await m.api.engineFetchDetail(engine, candidate.bookUrl, ctx);
-      if (identityMatches(detail, task)) return true;
+      if (identityMatches(detail, candidate, task)) return true;
     }
     return candidates.length > MAX_PRECHECK_CANDIDATES ? null : false;
   };
@@ -120,8 +121,11 @@ export function createIdentityPrecheck(options: IdentityPrecheckOptions): Preche
       if (matched === null) return { ok: true, reason: 'identity_unverified' };
       return matched ? { ok: true } : { ok: false, reason: 'identity_mismatch' };
     } catch (error) {
+      signal?.throwIfAborted();
+      const code = (error as { code?: unknown } | null | undefined)?.code;
+      if (code === 'HOST_OCCUPIED' || code === 'HOST_OCCUPANCY_UNAVAILABLE') throw error;
       // 先书源可达、后身份：页面没取到且是书源侧不可达（与下载器同一判据），交执行器退避；
-      // 预检自己的墙钟/drain 停机中止不算（AbortSignal.timeout 的 reason 也是 TimeoutError）。
+      // 预检自己的墙钟中止不算（AbortSignal.timeout 的 reason 也是 TimeoutError）。
       if (REACHABILITY_STAGES.has(progress.stage) && !overall.aborted && isSourceUnavailableError(error)) {
         return { ok: false, reason: 'source_unavailable', retryable: true, stage: progress.stage };
       }

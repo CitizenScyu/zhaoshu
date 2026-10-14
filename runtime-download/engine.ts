@@ -72,8 +72,9 @@ const isRetiredBuiltin = (m: EngineModules, host: string) => m.supported.isRetir
 /** 引擎源池：先刷新运行时 host 门，再读 getEngineSources（同 engine-fetch.mjs loadEnginePool）。 */
 export async function loadEnginePool(m: EngineModules, signal: AbortSignal): Promise<ReadingSourceLike[]> {
   // 41-poolimpl：host 门与池同源（源池产物优先、失败回退库；开关关时即 engineHosts 鲜读）。
-  m.policy.refreshSupportedHosts(await m.shuyuan.getPoolEngineHosts(signal));
-  return (await m.shuyuan.getEngineSources(signal)) as unknown as ReadingSourceLike[];
+  // bpool-expand：下载腿走 Download 池入口，开关开时接受 phoenix_ok: 源（阅读池不受影响）。
+  m.policy.refreshSupportedHosts(await m.shuyuan.getDownloadPoolEngineHosts(signal));
+  return (await m.shuyuan.getDownloadEngineSources(signal)) as unknown as ReadingSourceLike[];
 }
 
 function findSourceByHost(m: EngineModules, sources: ReadingSourceLike[], host: string): ReadingSourceLike | undefined {
@@ -114,7 +115,7 @@ export function createResolveSource(m: EngineModules) {
       // 池不可用（DB 不可达等）：code=2，「没尝试成抓取」，与引擎 CLI 同档。
       throw new ResolveSourceError(2, 'engine_source_pool_unavailable');
     }
-    const source = findSourceByHost(m, pool, host);
+    const source = pool.find(candidate => candidate.url === url) ?? findSourceByHost(m, pool, host);
     if (!source) throw new ResolveSourceError(1, 'no_engine_source_for_host');
     return { source, builtin: false };
   };
@@ -158,6 +159,7 @@ export type SourceTransport = (
     beforeRequest?: (signal: AbortSignal) => Promise<void>;
     /** 调用方已有的物理策略门（冷却等）：每次物理发射前先走，再取限速许可。 */
     beforeFetch?: (signal: AbortSignal, url: string) => void | Promise<void>;
+    afterAcquire?: (signal: AbortSignal, url: string) => void | Promise<void>;
   },
 ) => Promise<{ url: string; text: string }>;
 
@@ -178,19 +180,21 @@ interface GateRejection { fromBeforeRequest?: boolean }
  */
 export function createSourceTransport(limiter?: RateLimiterLike): SourceTransport {
   return async (url, options) => {
-    const { signal, timeoutMs, beforeRequest, beforeFetch: callerGate } = options;
+    const { signal, timeoutMs, beforeRequest, beforeFetch: callerGate, afterAcquire } = options;
     // 最近一次物理发射的 host（许可按它取过）：无 responseHost 的 HTTP 失败反馈归它。
     let lastHost = hostOf(url);
     // opaque许可只在本次transport内保留原引用；不解析字段或按反馈host重绑。
     let lastPermit: unknown;
-    const beforeFetch = limiter || callerGate
+    const beforeFetch = limiter || callerGate || afterAcquire
       ? async (gateSignal: AbortSignal, current: string) => {
         lastPermit = undefined;
         await callerGate?.(gateSignal, current);
-        if (!limiter) return;
-        const key = hostOf(current) || current;
-        lastHost = key;
-        lastPermit = await limiter.acquire(key, { signal: gateSignal });
+        if (limiter) {
+          const key = hostOf(current) || current;
+          lastHost = key;
+          lastPermit = await limiter.acquire(key, { signal: gateSignal });
+        }
+        await afterAcquire?.(gateSignal, current);
       }
       : undefined;
     let page: { url: string; text: string };

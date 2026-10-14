@@ -47,7 +47,7 @@ export type AdapterOutcome =
       chapterRanges?: TxtChapter[];
     }
   // stage：source_unavailable 时判定所在阶段（resolve/search/detail/toc），只作日志用的固定枚举。
-  | { kind: 'incomplete'; reason: string; chaptersTotal: number; chaptersDone: number; charsTotal: number; stage?: string }
+  | { kind: 'incomplete'; reason: string; chaptersTotal: number; chaptersDone: number; charsTotal: number; stage?: string; retryCause?: 'host_occupied' | 'host_occupancy_unavailable' }
   | { kind: 'failure'; code: string };
 
 export interface SourceAdapterContext {
@@ -114,6 +114,13 @@ export function isLeaseLostError(error: unknown): boolean {
 /** 任务预算耗尽的归一判据：worker 侧定时器与引擎侧定时器共用 `budget_exhausted` 字面量。 */
 export function isBudgetExhausted(error: unknown): boolean {
   return error instanceof Error && error.message === 'budget_exhausted';
+}
+
+function hostGateCauseOf(error: unknown): 'host_occupied' | 'host_occupancy_unavailable' | undefined {
+  const code = (error as { code?: unknown } | null | undefined)?.code;
+  if (code === 'HOST_OCCUPIED') return 'host_occupied';
+  if (code === 'HOST_OCCUPANCY_UNAVAILABLE') return 'host_occupancy_unavailable';
+  return undefined;
 }
 
 /**
@@ -593,6 +600,16 @@ export function createEngineAdapter(options: EngineAdapterOptions): SourceAdapte
         // 与引擎自身 budget 定时器的 budget_exhausted 分类一致（检查点保留，下次续传）。
         if (isBudgetExhausted(error) || isBudgetExhausted(context.signal.reason)) {
           return { kind: 'incomplete', reason: 'budget_exhausted', chaptersTotal: 0, chaptersDone: 0, charsTotal: 0 };
+        }
+        const retryCause = hostGateCauseOf(error);
+        if (retryCause) {
+          if (context.signal.aborted) {
+            return { kind: 'incomplete', reason: 'interrupted', chaptersTotal: 0, chaptersDone: 0, charsTotal: 0 };
+          }
+          return {
+            kind: 'incomplete', reason: 'source_unavailable', chaptersTotal: 0, chaptersDone: 0, charsTotal: 0,
+            stage: 'request', retryCause,
+          };
         }
         return { kind: 'failure', code: /^[a-z0-9_]+$/.test((error as Error).message) ? (error as Error).message : 'adapter_runtime_error' };
       }

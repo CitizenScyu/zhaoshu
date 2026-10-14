@@ -9,16 +9,32 @@ export function wireDownloadExecutor(original) {
       original.indexOf(END, endAt + END.length) !== -1) {
     throw new Error('main.mjs 执行器接缝锚点缺失或不唯一：shell 已变更，需人工复核（未生成 tar）');
   }
-  // The selected limiter must be in the preserved prefix, never synthesized here.
-  const prefix = original.slice(0, startAt);
-  if (!prefix.includes('let rateLimiter = null;') ||
-      !prefix.includes('rateLimiter = createSharedRateLimiter({') ||
-      !prefix.includes('rateLimiter = new SourceRateLimiter({') ||
-      !prefix.includes('await verifySharedRateStartup(config.sharedRate);') ||
-      prefix.indexOf('await verifySharedRateStartup(config.sharedRate);') >
-        prefix.indexOf('rateLimiter = createSharedRateLimiter({')) {
-    throw new Error('main.mjs 已选限速器装配锚点失配：需人工复核（未生成 tar）');
+  const anchors = [
+    'let rateLimiter = null;',
+    'await startSharedRateSupervisor({ sharedRate: config.sharedRate',
+    'verifyStartup: verifySharedRateStartup,',
+    'createLimiter:',
+    'createSharedRateLimiter({',
+    'if (!startup.allowed) {',
+    /process\.exitCode = startup\.exitCode;\r?\n[^\S\n]*return;/g,
+    'rateLimiter = startup.limiter;',
+    'rateLimiter = new SourceRateLimiter({',
+  ];
+  let previous = -1;
+  for (const anchor of anchors) {
+    const positions = [];
+    if (typeof anchor === 'string') {
+      let at = original.indexOf(anchor);
+      while (at !== -1) { positions.push(at); at = original.indexOf(anchor, at + anchor.length); }
+    } else {
+      for (const match of original.matchAll(anchor)) positions.push(match.index);
+    }
+    if (positions.length !== 1 || positions[0] >= startAt || positions[0] <= previous) {
+      throw new Error('main.mjs 共享限速 supervisor 装配锚点失配：需人工复核（未生成 tar）');
+    }
+    previous = positions[0];
   }
+  const prefix = original.slice(0, startAt);
   const injection = `${START}
   let dummyTasks = 2;
   let productionRunOnce = null;

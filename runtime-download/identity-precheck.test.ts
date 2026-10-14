@@ -33,14 +33,16 @@ function task(title: string, author: string): TaskRow {
   return { id: 9, book_id: 1036, title, author, status: 'running', source_url: BOOK, source_kind: 'builtin', source_id: null, requested_by: 'system' };
 }
 
-/** 合成源站：详情页作者 = pageAuthor。hits=false 时搜索无结果。 */
-function site(title: string, pageAuthor: string, { hits = true, detailError = false } = {}) {
+/** 合成源站：详情页作者 = pageAuthor。hits=false 时搜索无结果。bareDetail=true 时详情页无书名/作者规则（kxdu 形态）。 */
+function site(title: string, pageAuthor: string, { hits = true, detailError = false, bareDetail = false } = {}) {
   vi.stubGlobal('fetch', () => { throw new Error('network forbidden'); });
   const calls: string[] = [];
   const search = hits
     ? `<div class="list-item-panel"><h3><a href="${BOOK}">${title}</a></h3><a class="author">${pageAuthor}</a></div><li itemprop="mainEntity"><a itemprop="url" href="${BOOK}"><h2 itemprop="name">${title}</h2></a><p itemprop="author">${pageAuthor}</p></li>`
     : '<div class="empty">没有找到</div>';
-  const detail = `<h1>${title}</h1><div class="d-info-panel"><a href="/author/1">${pageAuthor}</a></div><meta property="og:novel:book_name" content="${title}"><meta property="og:novel:author" content="${pageAuthor}">`;
+  const detail = bareDetail
+    ? '<div class="d-info-panel"><p>简介…</p></div>'
+    : `<h1>${title}</h1><div class="d-info-panel"><a href="/author/1">${pageAuthor}</a></div><meta property="og:novel:book_name" content="${title}"><meta property="og:novel:author" content="${pageAuthor}">`;
   const transport = async (url: string, opts: { signal: AbortSignal; beforeRequest?: (signal: AbortSignal) => Promise<void> }) => {
     calls.push(url);
     await opts.beforeRequest?.(opts.signal);
@@ -67,6 +69,22 @@ async function downloadError(transport: Parameters<typeof downloadBook>[3], t: T
 }
 
 describe('41-T5-IDENTITY 身份预检钩子', () => {
+  it.each(['HOST_OCCUPIED', 'HOST_OCCUPANCY_UNAVAILABLE'])('物理占位门 %s 不吞成 identity_unverified', async code => {
+    const error = Object.assign(new Error('synthetic gate rejection'), { code });
+    const transport = async () => { throw error; };
+    await expect(precheckFor(transport)(task('测试书', '测试作者'), new AbortController().signal))
+      .rejects.toBe(error);
+  });
+
+  it('caller abort 优先于迟到占位门错误', async () => {
+    const controller = new AbortController();
+    const error = new Error('synthetic cancellation');
+    const transport = async () => {
+      controller.abort(error);
+      throw Object.assign(new Error('synthetic gate'), { code: 'HOST_OCCUPANCY_UNAVAILABLE' });
+    };
+    await expect(precheckFor(transport)(task('测试书', '测试作者'), controller.signal)).rejects.toBe(error);
+  });
   it('名单作者 ≠ 源站作者（生产实例：九鼎狂尊 上汤豆苗 vs 孤神枫）⇒ {ok:false, identity_mismatch}，只打搜索+详情两次', async () => {
     const s = site('九鼎狂尊', '孤神枫');
     expect(await precheckFor(s.transport)(task('九鼎狂尊', '上汤豆苗'))).toEqual(MISMATCH);
@@ -84,6 +102,24 @@ describe('41-T5-IDENTITY 身份预检钩子', () => {
   ])('canonicalBookKey 归一差异（%s）⇒ 视为对得上', async (_label, taskAuthor, pageAuthor) => {
     const s = site('活着', pageAuthor);
     expect(await precheckFor(s.transport)(task('活着', taskAuthor))).toEqual(MATCH);
+  });
+
+  // 41-IDLENIENT：判据与阅读器 sourceBookMatches 同口径，站点作者字段的已知修饰要剥掉。
+  it('站点作者带「著」修饰（book.qq 形态：忘语 著）⇒ 视为对得上', async () => {
+    const s = site('凡人修仙传', '忘语 著');
+    expect(await precheckFor(s.transport)(task('凡人修仙传', '忘语'))).toEqual(MATCH);
+  });
+
+  it('详情页无书名/作者规则（kxdu 形态：detail={}）⇒ 回落到搜索候选行判等', async () => {
+    const s = site('盗墓笔记', '南派三叔', { bareDetail: true });
+    const precheck = createIdentityPrecheck({ modules, resolveSource: resolveAs(false), transport: s.transport, timeoutMs: 1000 });
+    expect(await precheck({ ...task('盗墓笔记', '南派三叔'), source_kind: 'engine' })).toEqual(MATCH);
+  });
+
+  it('详情页无书名/作者规则但搜索候选作者不符 ⇒ 仍拦截', async () => {
+    const s = site('盗墓笔记', '旁人甲', { bareDetail: true });
+    const precheck = createIdentityPrecheck({ modules, resolveSource: resolveAs(false), transport: s.transport, timeoutMs: 1000 });
+    expect(await precheck({ ...task('盗墓笔记', '南派三叔'), source_kind: 'engine' })).toEqual(MISMATCH);
   });
 
   it('源站搜不到同名书 ⇒ 拦截（下载器同样判 no_candidate）', async () => {
@@ -110,11 +146,12 @@ describe('41-T5-IDENTITY 身份预检钩子', () => {
     expect(await precheckFor(hanging, { budgetMs: 50, timeoutMs: 60000 })(task('九鼎狂尊', '上汤豆苗'))).toEqual(UNVERIFIED);
   });
 
-  it('drain 已停机 ⇒ 放行，一个请求都不发', async () => {
+  it('drain 已停机 ⇒ 上抛原中止原因，一个请求都不发', async () => {
     const s = site('九鼎狂尊', '孤神枫');
     const controller = new AbortController();
-    controller.abort();
-    expect(await precheckFor(s.transport)(task('九鼎狂尊', '上汤豆苗'), controller.signal)).toEqual(UNVERIFIED);
+    const reason = new Error('synthetic cancellation');
+    controller.abort(reason);
+    await expect(precheckFor(s.transport)(task('九鼎狂尊', '上汤豆苗'), controller.signal)).rejects.toBe(reason);
     expect(s.calls).toEqual([]);
   });
 

@@ -165,6 +165,7 @@ export function createExecutor(deps: ExecutorDependencies): DownloadExecutor {
           const { used, limit } = await deps.budget.read();
           const full = typeof limit === 'number' && Number.isFinite(limit) && used >= limit;
           if (!full) task = await deps.storage.taskRow(lease.id);
+          signal?.throwIfAborted();
         } catch (error) {
           await deps.storage.releaseClaim?.(lease);
           throw error;
@@ -173,7 +174,13 @@ export function createExecutor(deps: ExecutorDependencies): DownloadExecutor {
         let result: PrecheckResult;
         try {
           result = await precheck(task, signal);
-        } catch {
+          signal?.throwIfAborted();
+        } catch (error) {
+          const code = (error as { code?: unknown } | null | undefined)?.code;
+          if (signal?.aborted || code === 'HOST_OCCUPIED' || code === 'HOST_OCCUPANCY_UNAVAILABLE') {
+            await deps.storage.releaseClaim?.(lease);
+            throw error;
+          }
           result = { ok: true, reason: 'precheck_error' }; // 预检自身出错不拦任务（fail-open）
         }
         if (!result.ok && result.retryable) {
@@ -220,6 +227,7 @@ export function createExecutor(deps: ExecutorDependencies): DownloadExecutor {
         if (deps.precheck) await precheckBeforeConsume(lease, deps.precheck);
         let consumed: { allowed: boolean; date?: string };
         try {
+          signal?.throwIfAborted();
           consumed = await deps.budget.consume();
         } catch (error) {
           await deps.storage.releaseClaim?.(lease);

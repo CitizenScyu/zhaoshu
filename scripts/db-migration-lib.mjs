@@ -27,7 +27,8 @@ export const TARGET_SCHEMA = 'public';
 // `db:check:prod` 仍 rc=0（tempdb41 §缺陷 D1 实测：T8 worker 启动即 relation does not exist）。
 export const EXPECTED_TABLES = [
   'app_settings', 'artifact_schema_migrations', 'auth_rate_limits', 'auth_schema_migrations', 'auth_settings',
-  'book_artifacts', 'books', 'cron_health', 'download_tasks', 'feedback', 'labeled_books', 'llm_usage', 'profile',
+  'book_artifacts', 'books', 'cron_health', 'download_host_occupancy', 'download_source_candidates',
+  'download_source_prefetch', 'download_tasks', 'feedback', 'labeled_books', 'llm_usage', 'profile',
   'profile_feedback_queue', 'profile_seed_audit', 'recommendations', 'schema_migrations', 'sessions',
   'shuyuan_meta', 'shuyuan_sources', 'source_admission', 'source_read_catalogs', 'storage_repositories', 'users',
 ];
@@ -44,7 +45,7 @@ const migrationsDir = resolve(here, '..', 'migrations');
 
 // 迁移文件是显式有序列表，不扫目录：目录里多一个 .sql 不该在无人察觉时被执行。
 // version 由文件名前缀解析，SCHEMA_VERSION 必须等于列表里的最大版本（见 loadMigrations）。
-export const MIGRATION_FILES = ['0001_baseline.sql', '0002_identity_key.sql', '0003_runtime_tables.sql', '0004_admission_lease_generation.sql'];
+export const MIGRATION_FILES = ['0001_baseline.sql', '0002_identity_key.sql', '0003_runtime_tables.sql', '0004_admission_lease_generation.sql', '0005_source_candidates.sql'];
 
 // 已发布（已登记进某个库的 schema_migrations）的迁移摘要，冻结在这里由测试钉住。
 // v1 = 隔离库首次 db:migrate 登记的值（见下方 normalizeSqlText 注释）；生产从未跑过 runner、没有
@@ -427,6 +428,30 @@ export const EXPECTED_RUNTIME_COLUMNS = {
     ['host', 'text', 'NO', null],
     ['error', 'text', 'NO', "''::text"],
     ['compile_diagnostics', 'jsonb', 'NO', "'[]'::jsonb"],
+  ],
+  // 0005 三表（bsrcfix-41，源搜索整改）：候选源持久化 / host 占位 / 预取认领。
+  download_source_candidates: [
+    ['book_id', 'integer', 'NO', null],
+    ['source_url', 'text', 'NO', null],
+    ['host', 'text', 'NO', null],
+    ['position', 'integer', 'NO', '0'],
+    ['failure', 'text', 'NO', "''::text"],
+    ['failure_reason', 'text', 'NO', "''::text"],
+    ['updated_at', 'timestamp with time zone', 'NO', 'now()'],
+  ],
+  download_host_occupancy: [
+    ['host', 'text', 'NO', null],
+    ['holder', 'text', 'NO', null],
+    ['kind', 'text', 'NO', null],
+    ['task_id', 'integer', 'YES', null],
+    ['claimed_at', 'timestamp with time zone', 'NO', 'now()'],
+    ['expires_at', 'timestamp with time zone', 'NO', 'now()'],
+  ],
+  download_source_prefetch: [
+    ['book_id', 'integer', 'NO', null],
+    ['owner', 'text', 'NO', null],
+    ['claimed_at', 'timestamp with time zone', 'NO', 'now()'],
+    ['expires_at', 'timestamp with time zone', 'NO', 'now()'],
   ],
 };
 

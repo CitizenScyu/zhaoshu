@@ -1,74 +1,92 @@
-// T8 builtin 任务的引擎源池回退（41-T8FB）：book15 不可达时，按任务 (书名, 作者) 在引擎源池里找同一本书下载。
+// T8 任务的引擎源池回退（41-T8FB）：原始源（book15 或引擎源）不可达时，按任务 (书名, 作者) 在引擎源池里找同一本书下载。
 //
 // 背景：phoenix 出网连不上 book15 的 HTTPS，builtin 任务只会逐条退避重排、永远 pending；labeler 侧早已在
 // book15 熔断后改从引擎源池取正文。这里给下载器补同一条路：
-// - 判据：只用 identityMatches（scripts/engine-download.mjs，预检与 downloadBook 共用的同一个函数）。
-//   选源 = 引擎搜索 + 详情，详情页书名作者都对得上才入选；搜索列表上作者对不上的候选连详情都不看。
-//   真正下载仍由 downloadBook 在该引擎源上再按同一判据选候选，对不上抛 identity_mismatch_or_no_candidate。
-// - 候选按池序（getEngineSources：探测可达优先）依次核对，最多 MAX_FALLBACK_SOURCES 个源入选，逐个下载，
-//   首个完整即收；单源失败（身份不符/缺章/超时/不可达）换下一个，全部失败回到 book15 的 source_unavailable
-//   语义（退避放回 pending，不落 failed）。
-// - host 级退避：book15 是否「已知不可达」看 source-host-health 的 isHostSuspect（fetch 层按 host 记连续
-//   传输层硬失败，≥2 次且 10 分钟窗内）。窗内直接跳过 book15、不再每本白等 6.4s 连接超时；窗过期后下一本
-//   照常先试 book15（半开），恢复即回到原路径。引擎源也按同一记忆跳过 suspect host。
+// - 判据：identityMatches（scripts/engine-download.mjs，预检与 downloadBook 共用的同一个函数）。选源判据
+//   已抽到共用 selector（./source-selector，B 线预取同款）：搜索列表书名须相等、作者不冲突，详情页三参
+//   判据对上才算命中——本文件不再自持 sourceHasBook/扫描循环，只喂排除输入（正忙 host 快照、失败源 URL
+//   精确集）与目标/上限/预算。真正下载仍由 downloadBook 在该引擎源上再按同一判据选候选，对不上抛
+//   identity_mismatch_or_no_candidate。
+// - 候选按池序依次下载，首个完整即收；单源失败（身份不符/缺章/超时/不可达）换下一个，全部失败回到
+//   book15 的 source_unavailable 语义（退避放回 pending，不落 failed）。
+// - host 级互斥不再由本文件粗粒度 occupy/release：entry 对默认 transport wrapTransport、对两条默认腿的
+//   每次 engine.download 各开一个 runDownload 物理作用域（finally 释放）。fallback 换源调的就是已包装的
+//   engine 腿——上一源作用域已先释放，不存在整个 fallback 一个大作用域。物理门拒绝经 incomplete.retryCause
+//   传回：host_occupied 换下一已记录源（绝不标失败）、host_occupancy_unavailable 立即收口（绝不标失败）。
 // - 不改任务行的 source_url/source_kind（book15 绑定保留，恢复后行为不漂移）；实际用了哪个源只进日志（host）
 //   和运行目录里 downloadBook 自己的 manifest.json（source 字段）。
 //
-// 预检接缝（wrapPrecheck）：book15 不可达时在扣额度前就把引擎源选好，选不到 ⇒ 仍按 source_unavailable 退避
-// （不扣日额度）；选到 ⇒ 放行，选源结果放进单槽缓存交给下载腿（并发=1，同一时刻只有一本在跑）。
-// 预检关闭（DOWNLOAD_IDENTITY_PRECHECK=0）时由下载腿自己选源。
+// 预检接缝（wrapPrecheck）：原始源不可达时在扣额度前就把引擎候选选好（持久化命中优先，零出网），
+// 选不到 ⇒ 仍按 source_unavailable 退避（不扣日额度）；选到 ⇒ 放行，选源结果放进单槽缓存交给
+// 下载腿（并发=1，同一时刻只有一本在跑）。预检关闭（DOWNLOAD_IDENTITY_PRECHECK=0）时由下载腿自己选源。
 
-import { identityMatches } from '../scripts/engine-download.mjs';
-import { normalizeBookTitle } from '../src/lib/book-identity';
 import { isHostSuspect } from '../src/lib/source-host-health';
-import { sourceAbortable } from '../src/lib/source-fetch';
 import {
-  isLeaseLostError, TaskLeaseLostError,
+  isBudgetExhausted, isLeaseLostError, TaskLeaseLostError,
   type AdapterOutcome, type SourceAdapter, type TaskRow,
 } from '../src/lib/download-worker';
-import { pageContext, type Transport } from './identity-precheck';
+import { classifyFailure } from '../src/lib/download-source-candidates';
+import { createSourceSelector } from './source-selector';
 import type { PrecheckHook, PrecheckResult } from './executor';
 
-/** 最多入选（并依次尝试下载）的引擎源数。 */
-export const MAX_FALLBACK_SOURCES = 3;
-/** 每个源最多看几个搜索候选的详情页（列表书名对得上、作者不冲突的才看）。 */
-export const MAX_FALLBACK_DETAILS_PER_SOURCE = 2;
 /**
- * 每本书最多搜索的引擎源数（按池序，跳过的不计）：给逐书出网封顶。池序已是「探测可达 → tier → 最近搜索验证」，
- * 靠后的源命中概率低；与 120s 墙钟一起兜住「书不在池里」时一本书的请求量（≤ 30 次搜索 + 少量详情）。
+ * 每批入选（并依次尝试下载）的引擎源数；recall 与出网选源的 targetHits 同为
+ * min(maxSources, hostTarget)（默认 2/2，即每批两个不同 host）。已知候选全部失败后
+ * 最多补扫一批新候选（失败 URL 精确排除，不无限重试）；本常量是批内上限，
+ * 不是单任务累计总源数——累计上界由「一批已知 + 一批补扫」结构保证。
  */
-export const MAX_FALLBACK_SCAN_SOURCES = 30;
-/** 选源墙钟上限：与身份预检同量级，远小于 30 分钟租约回收阈值（预检期间不发心跳）。 */
-export const FALLBACK_SELECT_BUDGET_MS = 120_000;
+export const MAX_FALLBACK_SOURCES = 2;
+/**
+ * 每本书最多搜索的引擎源数（按池序，跳过的不计）：给逐书出网封顶，作为 selector 的 scanLimit。
+ * 2026-10-09 提速整改：200 → 40。实测多数无源书扫 130-140 源仍 0 候选、单本 ~90s，200 上限只让
+ * 空转更久。池序靠前源命中概率高，早停（不同 host 数达标）通常远在 40 前收口；40 是同一本书本次
+ * 下载跨预检新扫与下载补扫的累计上限，不是常态请求量。余额随预检计划交给下载腿，各次扫描在实际
+ * 检查源前扣减（跳过的不计，异常不退回）；持久化候选（recall）零出网，不占扫描额度。后续任务重试
+ * 重新建立余额，不无限延续旧轮计数。
+ */
+export const MAX_FALLBACK_SCAN_SOURCES = 40;
+/** 选源早停目标：命中 2 个**不同 host**的可用源即停止扫描（2026-10-07 用户要求倾向 2 源而非 3 源）。 */
+export const FALLBACK_HOST_TARGET = 2;
+/** 选源墙钟预算：由 selector 内部计时管理，本文件不再另盖 AbortSignal.timeout。仍 << 30min 租约回收阈值。 */
+export const FALLBACK_SELECT_BUDGET_MS = 300_000;
 
-type Identity = { title?: string; author?: string };
-type SearchHit = { title?: string; author?: string; bookUrl: string };
 interface PoolSource { url: string; name: string; searchUrl: unknown; rules?: unknown }
 interface Modules {
-  compile: { compileSource(source: unknown): unknown };
   supported: {
     BUILTIN_SOURCE_HOSTS: readonly string[];
     /** 识别集合内但无活跃内建源的 host（失效源整改）。缺省视为无退休源（合成桩兼容）。 */
     isRetiredBuiltinHost?: (host: string) => boolean;
-  };
-  api: {
-    engineSearchBook(engine: unknown, title: string, ctx: unknown): Promise<SearchHit[]>;
-    engineFetchDetail(engine: unknown, bookUrl: string, ctx: unknown): Promise<Identity>;
   };
 }
 
 export interface BuiltinFallbackOptions {
   modules: unknown;
   transport: unknown;
-  /** 引擎源池（生产 = engine.ts loadEnginePool）。抛错视为池不可用：本轮不回退。 */
+  /** 引擎源池（生产 = engine.ts loadEnginePool）。抛错视为池不可用：selector 返回空、本轮不回退。 */
   loadPool: (signal: AbortSignal) => Promise<PoolSource[]>;
+  /**
+   * 候选源持久化接缝（bsrcfix-41）。缺省 = 不持久化（回到内存单槽行为，单测/兼容用）。
+   * 生产由 entry 传入 src/lib/download-source-candidates 的函数集合（经 neon sql tag）。
+   * 只保留候选记忆：usable/failedSources/replace/markFailure/occupiedHosts——物理 host 互斥由
+   * entry 的 hostOccupancy（runDownload 逐次作用域 + wrapTransport）负责，本文件无 coarse 占位。
+   */
+  candidates?: {
+    usable: (bookId: number) => Promise<{ source_url: string; host: string }[]>;
+    /** 该书已失败候选（temporary/permanent）的 source_url 集——补扫单源精确排除，不禁整个 host。 */
+    failedSources: (bookId: number) => Promise<Set<string>>;
+    replace: (bookId: number, sources: string[]) => Promise<void>;
+    markFailure: (bookId: number, sourceUrl: string, kind: 'permanent' | 'temporary', reason: string) => Promise<void>;
+    occupiedHosts: () => Promise<Set<string>>;
+  };
   /** host 是否处于已知不可达窗口；缺省 = source-host-health.isHostSuspect。 */
   isSuspect?: (host: string) => boolean;
-  /** 只记任务 id、源 host、原因码，不记书名、作者、URL。 */
+  /** 只记任务 id、源 host、原因码，不记书名、作者、URL。选源明细日志由共用 selector 统一记。 */
   log?: (level: 'info' | 'error', message: string, fields?: Record<string, unknown>) => void;
   timeoutMs?: number;
   budgetMs?: number;
   maxSources?: number;
+  /** 选源早停目标（不同 host 数）；缺省 FALLBACK_HOST_TARGET。测试缝，生产不覆盖。 */
+  hostTarget?: number;
 }
 
 const hostOf = (url: string): string => {
@@ -80,123 +98,282 @@ const isBuiltinTask = (task: TaskRow) => task.source_kind !== 'engine'; // 与 s
 const isSourceUnavailable = (outcome: AdapterOutcome) =>
   outcome.kind === 'incomplete' && outcome.reason === 'source_unavailable';
 
+/**
+ * download-worker incomplete 枚举里稳定的源级 reason（download-worker.ts 归类）：
+ * source_unavailable / missing_chapters / toc_changed / operation_timeout——单源问题，标 temporary 后换源。
+ * budget_exhausted / interrupted 是任务层停止：不标失败、不换源；白名单外的未知 incomplete 同样
+ * 不标失败、不换源（不归因给该源）。物理 host 门拒绝（retryCause）不在此列：绝不标失败。
+ */
+const SOURCE_LEVEL_INCOMPLETE_REASONS = new Set(['source_unavailable', 'missing_chapters', 'toc_changed', 'operation_timeout']);
+
 /** 回退源全部失败时回给任务层的结论：同 book15 不可达（退避放回 pending）。 */
 const unavailable = (stage: string): AdapterOutcome =>
   ({ kind: 'incomplete', reason: 'source_unavailable', chaptersTotal: 0, chaptersDone: 0, charsTotal: 0, stage });
 
 export function createBuiltinFallback(options: BuiltinFallbackOptions) {
   const m = options.modules as Modules;
-  const transport = options.transport as Transport;
   const isSuspect = options.isSuspect ?? ((host: string) => isHostSuspect(host));
   const log = options.log ?? (() => {});
-  const timeoutMs = options.timeoutMs ?? 30000;
   const maxSources = options.maxSources ?? MAX_FALLBACK_SOURCES;
+  const hostTarget = options.hostTarget ?? FALLBACK_HOST_TARGET;
+  const budgetMs = options.budgetMs ?? FALLBACK_SELECT_BUDGET_MS;
+  const candidates = options.candidates;
   const builtinHosts = new Set(m.supported.BUILTIN_SOURCE_HOSTS);
   const builtinSuspect = (task: TaskRow) => isSuspect(hostOf(task.source_url));
   // 退休 host（识别集合内、无活跃内建源）：零出网径直回退。isHostSuspect 是**运行期**健康记忆
   // （连续传输失败、10 分钟窗），退休是静态事实——不进「半开重试」节奏，第一次就跳过 builtin 腿，
   // 也不再为它做预检搜索（对退休 host 的每个请求都被拒，做了只是白等超时）。
   const builtinRetired = (task: TaskRow) => Boolean(m.supported.isRetiredBuiltinHost?.(hostOf(task.source_url)));
+  // 共用选源器（B 线预取同款）：搜索/详情判据、host 去重、扫描上限、早停与预算计时都在 selector 内；
+  // 选源日志（固定字段：taskId/scanned/candidates/hosts）也由 selector 统一记，本文件不重复记。
+  const selector = createSourceSelector({
+    modules: options.modules,
+    transport: options.transport,
+    loadPool: options.loadPool,
+    isSuspect,
+    log,
+    timeoutMs: options.timeoutMs ?? 30000,
+  });
 
   // 预检选好的源交给下载腿：单槽（并发=1），按任务 id 认领，领一次即清。
-  let planned: { taskId: number; sources: string[] } | null = null;
+  type ScanBudget = { remaining: number };
+  let planned: { taskId: number; sources: string[]; scanBudget: ScanBudget } | null = null;
 
-  /** 该引擎源上是否有同一本书（详情页 identityMatches）。 */
-  const sourceHasBook = async (source: PoolSource, task: TaskRow, signal: AbortSignal): Promise<boolean> => {
-    const engine = { url: source.url, name: source.name, searchUrl: source.searchUrl, compiled: m.compile.compileSource(source) };
-    const ctx = pageContext(transport, signal, timeoutMs);
-    const want = normalizeBookTitle(task.title);
-    const hits = (await m.api.engineSearchBook(engine, task.title, ctx)).filter(hit =>
-      typeof hit.title === 'string' && normalizeBookTitle(hit.title) === want
-      // 列表上带了作者且对不上：不是这本（与详情判据同一函数），省掉详情请求。
-      && (!hit.author?.trim() || identityMatches(hit, task)));
-    for (const hit of hits.slice(0, MAX_FALLBACK_DETAILS_PER_SOURCE)) {
-      if (identityMatches(await m.api.engineFetchDetail(engine, hit.bookUrl, ctx), task)) return true;
-    }
-    return false;
+  const stopped = (signal: AbortSignal): AdapterOutcome | undefined => {
+    if (!signal.aborted) return undefined;
+    if (isLeaseLostError(signal.reason)) throw new TaskLeaseLostError();
+    return { kind: 'incomplete', reason: isBudgetExhausted(signal.reason) ? 'budget_exhausted' : 'interrupted',
+      chaptersTotal: 0, chaptersDone: 0, charsTotal: 0 };
   };
 
-  /** 按池序选出至多 maxSources 个有这本书的引擎源（返回源 URL）。单源失败跳过；池不可用返回空。 */
-  const selectSources = async (task: TaskRow, signal: AbortSignal): Promise<string[]> => {
-    let pool: PoolSource[];
+  /**
+   * 持久化命中：这本书之前选过的可用候选（免出网重扫）。host 从 URL 解析，不信 DB host 字段；
+   * 与出网选源同过滤口径：非 https / builtin host / suspect host / 重复 host 剔除，且不超过
+   * min(maxSources, hostTarget) 个；过滤后为空 ⇒ 返回 null（走出网选源——已失败候选不重试，重扫补新源）。
+   * 读库失败返回空数组，停止本轮，不盲扫。
+   */
+  const recallSources = async (task: TaskRow): Promise<string[] | null> => {
+    if (!candidates) return null;
+    let rows: { source_url: string; host: string }[];
     try {
-      pool = await options.loadPool(signal);
+      rows = await candidates.usable(task.book_id);
     } catch {
-      log('info', '引擎回退：源池不可用', { taskId: task.id, reason: 'engine_source_pool_unavailable' });
       return [];
     }
     const picked: string[] = [];
-    let scanned = 0;
-    for (const source of pool) {
-      if (picked.length >= maxSources || scanned >= MAX_FALLBACK_SCAN_SOURCES || signal.aborted) break;
-      const host = hostOf(source.url);
-      if (!/^https:\/\//i.test(source.url) || !host || builtinHosts.has(host) || isSuspect(host)) continue;
+    for (const row of rows) {
+      const host = hostOf(row.source_url);
+      if (!/^https:\/\//i.test(row.source_url) || !host || builtinHosts.has(host) || isSuspect(host)) continue;
       if (picked.some(url => hostOf(url) === host)) continue;
-      scanned += 1;
-      try {
-        if (await sourceAbortable(sourceHasBook(source, task, signal), signal)) picked.push(source.url);
-      } catch {
-        // 单源搜索/详情失败：跳过这个源（fetch 层已按 host 记健康），不影响其余源。
-      }
+      picked.push(row.source_url);
+      if (picked.length >= Math.min(maxSources, hostTarget)) break;
     }
-    log('info', '引擎回退选源', { taskId: task.id, scanned, candidates: picked.length, hosts: picked.map(hostOf) });
-    return picked;
+    return picked.length ? picked : null;
   };
 
-  const selectWithin = (task: TaskRow, signal?: AbortSignal) => {
-    const deadline = AbortSignal.timeout(options.budgetMs ?? FALLBACK_SELECT_BUDGET_MS);
-    return selectSources(task, signal ? AbortSignal.any([signal, deadline]) : deadline);
+  /**
+   * 出网选源（共用 selector）：occupiedHosts/failedSources 快照作排除输入——正忙 host 不扫（宁退勿撞，
+   * 占位表不可读同样返回空退避），失败源按 URL 精确排除、不连坐整 host。候选读失败 ⇒ 安全返回空
+   * （退避）；caller abort 一律上抛（selector 对 abort 也是上抛，不吞）。预算由 selector 内部计时管理。
+   * 选到后 replace 落库由本文件负责（selector 不持久化）：只替换可用行，不删失败记忆。
+   */
+  const selectSources = async (task: TaskRow, signal: AbortSignal, scanBudget: ScanBudget): Promise<string[]> => {
+    signal.throwIfAborted();
+    if (scanBudget.remaining <= 0) return [];
+    let busy: Set<string> = new Set();
+    let failed: Set<string> = new Set();
+    if (candidates) {
+      try {
+        busy = await candidates.occupiedHosts();
+        failed = await candidates.failedSources(task.book_id);
+      } catch {
+        if (signal.aborted) throw signal.reason;
+        return [];
+      }
+    }
+    const picked = await selector({
+      task: { id: task.id, title: task.title, author: task.author },
+      excludedHosts: [...busy],
+      excludedSources: [...failed],
+      targetHits: Math.min(maxSources, hostTarget),
+      scanLimit: Math.min(MAX_FALLBACK_SCAN_SOURCES, scanBudget.remaining),
+      scanBudget,
+      budgetMs,
+    }, signal);
+    if (picked.length && candidates) {
+      try {
+        await candidates.replace(task.book_id, picked);
+      } catch {
+        signal.throwIfAborted();
+        log('error', '候选保存失败', { taskId: task.id, reason: 'candidate_persistence_unavailable' });
+        return [];
+      }
+    }
+    return picked;
   };
 
   return {
     /**
-     * 包身份预检：builtin 任务先按原预检判 book15（已知不可达则跳过）；判出 source_unavailable 时改为选引擎源，
-     * 选到放行（reason=builtin_engine_fallback），选不到原样按 source_unavailable 退避。其余结论原样返回。
+     * 包身份预检：先按原预检判原始源（builtin 任务判 book15，已知不可达/退休则跳过；engine 任务判
+     * 其原始引擎源）；持久化命中（该书之前选过、零出网）优先于原预检。原预检判出 source_unavailable
+     * 时改为取回退源——出网选源并落库；选到放行（reason=builtin_engine_fallback /
+     * engine_source_candidates），选不到原样按 source_unavailable 退避。其余结论原样返回。
+     * engine 任务无候选时先过原预检再扫池：原源可用就不必烧一次 200 源扫描（927 复核点 3）。
      */
     wrapPrecheck(inner: PrecheckHook): PrecheckHook {
-      return async (task, signal): Promise<PrecheckResult> => {
+      return async (task, signal = new AbortController().signal): Promise<PrecheckResult> => {
         planned = null;
-        if (!isBuiltinTask(task)) return inner(task, signal);
+        const scanBudget: ScanBudget = { remaining: MAX_FALLBACK_SCAN_SOURCES };
+        signal.throwIfAborted();
+        const builtin = isBuiltinTask(task);
+        if (!builtin && !candidates) return inner(task, signal);
+        let sources = await recallSources(task);
+        signal.throwIfAborted();
         let stage = 'search';
-        if (!builtinSuspect(task) && !builtinRetired(task)) {
-          const result = await inner(task, signal);
-          if (result.ok || !result.retryable) return result;
-          stage = result.stage;
+        if (sources === null && !builtinSuspect(task) && !builtinRetired(task)) {
+          let result: PrecheckResult | null = null;
+          try {
+            result = await inner(task, signal);
+          } catch (error) {
+            // 原始源 host 被本机其他实例的下载作用域占用（物理门 HOST_OCCUPIED）：不再上抛
+            // （否则 executor 释放任务 → drain ERROR 60s 退避 → 重领同一 host → 死循环空转），
+            // 改走引擎回退选源——selector 的 excludedHosts 已排除忙 host，落到空闲 host 上。
+            // 选不到（全忙）则下面按 source_unavailable 退避，仍是有限退避而非空转。
+            // HOST_OCCUPANCY_UNAVAILABLE（占位表不可读）语义不同，仍上抛由执行器立即收口。
+            if ((error as { code?: unknown } | null | undefined)?.code !== 'HOST_OCCUPIED') throw error;
+          }
+          if (result && (result.ok || !result.retryable)) return result;
+          if (result) stage = result.stage;
         }
-        const sources = await selectWithin(task, signal);
+        signal.throwIfAborted();
+        sources ??= await selectSources(task, signal, scanBudget);
+        signal.throwIfAborted();
         if (!sources.length) return { ok: false, reason: 'source_unavailable', retryable: true, stage };
-        planned = { taskId: task.id, sources };
-        return { ok: true, reason: 'builtin_engine_fallback' };
+        planned = { taskId: task.id, sources, scanBudget };
+        return { ok: true, reason: builtin ? 'builtin_engine_fallback' : 'engine_source_candidates' };
       };
     },
 
     /**
-     * 包 builtin 下载腿：book15 可达时行为不变；book15 判 source_unavailable（或已知不可达、或预检已选好源）
-     * 时按选出的引擎源依次用 engine 腿下载（任务行不改，只把本次调用的 source_url 换成引擎源）。
+     * 包 builtin/engine 下载腿：优先保留原源路径（builtin 任务先试 book15、engine 任务先试其原始
+     * 引擎源；suspect/退休 host 直接跳过原源）；原始源不可达或无候选时，按持久化候选和补扫结果
+     * 依次用 engine 腿下载。
+     * 逐源收口规则：
+     * - complete 即收；任务层停止（budget_exhausted/interrupted）不标失败、不换源，按原分类收口；
+     * - 物理 host 门拒绝（retryCause）：绝不 markFailure——host_occupied 换下一已记录源，
+     *   host_occupancy_unavailable 立即收口不再试；
+     * - kind='failure' 或四 reason 源级 incomplete ⇒ 标失败记忆（identity ⇒ permanent，其余 temporary）
+     *   后换下一个源；白名单外的未知 incomplete 不标失败、不换源；未知异常按原语义上抛。
+     * 全部候选失败回 book15 的 source_unavailable 退避语义（不落 failed）。
      */
-    wrapAdapter(builtin: SourceAdapter, engine: SourceAdapter): SourceAdapter {
+    wrapAdapter(builtin: SourceAdapter, engine: SourceAdapter, kind: SourceAdapter['kind'] = 'builtin'): SourceAdapter {
       return {
-        kind: 'builtin',
+        kind,
         async download(task, context) {
-          let sources = planned?.taskId === task.id ? planned.sources : null;
+          const plan = planned?.taskId === task.id ? planned : null;
+          const scanBudget: ScanBudget = plan?.scanBudget ?? { remaining: MAX_FALLBACK_SCAN_SOURCES };
+          const selectForDownload = async (): Promise<string[] | AdapterOutcome> => {
+            try {
+              return await selectSources(task, context.signal, scanBudget);
+            } catch (error) {
+              const stop = stopped(context.signal);
+              if (stop) return stop;
+              if ((error as { code?: unknown } | null)?.code === 'HOST_OCCUPANCY_UNAVAILABLE') {
+                return { kind: 'incomplete', reason: 'source_unavailable', stage: 'search',
+                  retryCause: 'host_occupancy_unavailable', chaptersTotal: 0, chaptersDone: 0, charsTotal: 0 };
+              }
+              throw error;
+            }
+          };
+          let sources = plan?.sources ?? null;
           planned = null;
+          let stop = stopped(context.signal);
+          if (stop) return stop;
+          if (kind === 'engine' && !candidates) return engine.download(task, context);
           let primary: AdapterOutcome | null = null;
           if (!sources) {
-            if (!builtinSuspect(task) && !builtinRetired(task)) {
-              primary = await builtin.download(task, context);
+            sources = await recallSources(task);
+            stop = stopped(context.signal);
+            if (stop) return stop;
+            if (sources === null && !builtinSuspect(task) && !builtinRetired(task)) {
+              primary = await (kind === 'engine' ? engine : builtin).download(task, context);
+              stop = stopped(context.signal);
+              if (stop) return stop;
               if (!isSourceUnavailable(primary)) return primary;
+              // 930 确认点 2：原源被物理门拒绝（host_occupied / host_occupancy_unavailable）按原
+              // 可重试分类收口，不触发扫池——“host 正被占用”对选新源的出网请求同样生效。
+              if (primary.kind === 'incomplete' && primary.retryCause) return primary;
             }
-            sources = await selectWithin(task, context.signal);
-            if (isLeaseLostError(context.signal.reason)) throw new TaskLeaseLostError();
+            if (sources === null) {
+              const selected = await selectForDownload();
+              if (!Array.isArray(selected)) return selected;
+              sources = selected;
+            }
           }
-          for (const url of sources) {
-            const outcome = await engine.download({ ...task, source_url: url, source_kind: 'engine' }, context);
-            const reason = outcome.kind === 'complete' ? 'done' : outcome.kind === 'failure' ? outcome.code : outcome.reason;
-            log('info', '引擎回退下载', { taskId: task.id, host: hostOf(url), outcome: outcome.kind, reason });
-            if (outcome.kind === 'complete') return outcome;
-            // 任务层的停止（预算耗尽/停机中断）不是这个源的问题：不再换源，按原分类收口。
-            if (outcome.kind === 'incomplete' && (outcome.reason === 'budget_exhausted' || outcome.reason === 'interrupted')) return outcome;
+          stop = stopped(context.signal);
+          if (stop) return stop;
+          if (!sources.length) return primary ?? unavailable('search');
+          let supplemented = false;
+          for (;;) {
+            let allFailed = true;
+            for (const url of sources) {
+              stop = stopped(context.signal);
+              if (stop) return stop;
+              const next = await engine.download({ ...task, source_url: url, source_kind: 'engine' }, context);
+              stop = stopped(context.signal);
+              if (stop) return stop;
+              const host = hostOf(url);
+              const reason = next.kind === 'complete' ? 'done' : next.kind === 'failure' ? next.code : next.reason;
+              log('info', '引擎回退下载', {
+                taskId: task.id, host, outcome: next.kind, reason,
+                ...(next.kind === 'incomplete' && next.retryCause ? { retryCause: next.retryCause } : {}),
+              });
+              if (next.kind === 'complete') return next;
+              if (next.kind === 'failure') {
+                if (candidates) {
+                  try {
+                    await candidates.markFailure(task.book_id, url, classifyFailure(next.code), next.code);
+                  } catch {
+                    stop = stopped(context.signal);
+                    if (stop) return stop;
+                    log('error', '候选失败记忆保存失败', { taskId: task.id, reason: 'candidate_persistence_unavailable' });
+                    return unavailable('candidates');
+                  }
+                }
+                continue;
+              }
+              if (next.reason === 'budget_exhausted' || next.reason === 'interrupted') return next;
+              if (next.retryCause === 'host_occupancy_unavailable') return next;
+              if (next.retryCause === 'host_occupied') {
+                allFailed = false;
+                continue;
+              }
+              if (SOURCE_LEVEL_INCOMPLETE_REASONS.has(next.reason)) {
+                if (candidates) {
+                  try {
+                    await candidates.markFailure(task.book_id, url, classifyFailure(next.reason), next.reason);
+                  } catch {
+                    stop = stopped(context.signal);
+                    if (stop) return stop;
+                    log('error', '候选失败记忆保存失败', { taskId: task.id, reason: 'candidate_persistence_unavailable' });
+                    return unavailable('candidates');
+                  }
+                }
+                continue;
+              }
+              return next;
+            }
+            if (!allFailed || supplemented || !candidates) break;
+            supplemented = true;
+            const selected = await selectForDownload();
+            if (!Array.isArray(selected)) return selected;
+            sources = selected;
+            stop = stopped(context.signal);
+            if (stop) return stop;
+            if (!sources.length) break;
           }
+          stop = stopped(context.signal);
+          if (stop) return stop;
           return primary ?? unavailable('search');
         },
       };

@@ -15,11 +15,14 @@ describe('source request pacing under concurrent page() calls', () => {
       starts.push(Date.now());
       return new Response('<html></html>', { status: 200 });
     }));
+    // 真实注册表 book15 已退休（退休门在物理发射前拒绝）；本例只测节流槽并发语义，
+    // 载体用合成活跃 host pace.test。
+    refreshSupportedHosts(['pace.test']);
     const context = new SourceRequestContext(new AbortController().signal, 10);
     await Promise.all([
-      context.page('https://book15.net/a'),
-      context.page('https://book15.net/b'),
-      context.page('https://book15.net/c'),
+      context.page('https://pace.test/a'),
+      context.page('https://pace.test/b'),
+      context.page('https://pace.test/c'),
     ]);
     expect(starts).toHaveLength(3);
     // 槽位间隔约 350ms；给调度留余量，只要求明显大于突发（<50ms）且不小于 300ms。

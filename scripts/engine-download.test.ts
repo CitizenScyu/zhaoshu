@@ -407,6 +407,51 @@ describe('书源不可达分类（41-EXEC-SRCUNAVAIL）', () => {
     expect(result.manifest.errors).toEqual(['identity_mismatch_or_no_candidate']);
   });
 
+  // 41-IDLENIENT（2026-10-07）：判据与阅读器 sourceBookMatches 同口径，修复旧严格判据把阅读器能读的书判成不符。
+  describe('身份判据与阅读器同口径（41-IDLENIENT）', () => {
+    function engineSetup(searchAuthor: string, detailHtml: string, title = '凡人修仙传', author = '忘语') {
+      const out = mkdtempSync(join(tmpdir(), 'tidl-')); dirs.push(out);
+      const rules: Record<string, Record<string, string>> = {};
+      for (const [key, value] of Object.entries(fixtures[0].coreRules)) {
+        const [group, field] = key.split('.'); (rules[group] ??= {})[field] = value as string;
+      }
+      const source = { url: 'https://book15.net/', name: 'synthetic', searchUrl: '/search?q={{key}}', rules };
+      const options = downloadOptions({ source: source.url, title, author, out, 'rate-ms': 0, 'timeout-ms': 1000 });
+      const book = 'https://book15.net/books/details1.html';
+      const search = `<div class="list-item-panel"><h3><a href="${book}">${title}</a></h3><a class="author">${searchAuthor}</a></div>`;
+      const catalog = '<div class="d-chapter-list" id="full-catalog"><dd><a href="/read/1">第1章</a></dd></div>';
+      const transport = async (url: string) => {
+        if (url.includes('/search')) return { url, text: search };
+        if (url === book) return { url, text: detailHtml + catalog };
+        return { url, text: '<li class="chapter-content" id="article-content"><p>合成正文，离线测试。</p></li>' };
+      };
+      vi.stubGlobal('fetch', () => { throw new Error('network forbidden'); });
+      return () => downloadBook({ api, compile, parser }, options, async () => ({ source, builtin: false }), transport);
+    }
+
+    it('站点详情页作者带「著」修饰 ⇒ 判为同一本书并完成下载', async () => {
+      // book.qq 形态：详情页作者「忘语 著」，任务作者「忘语」。
+      const run = engineSetup('忘语', '<h1>凡人修仙传</h1><div class="d-info-panel"><a href="/author/1">忘语 著</a></div>');
+      const result = await run();
+      expect(result.code).toBe(0);
+      expect(result.manifest.status).toBe('done');
+    });
+
+    it('详情页无书名/作者规则（kxdu 形态 detail={}）⇒ 回落到搜索候选行，判为同一本书', async () => {
+      const run = engineSetup('南派三叔', '<div class="d-info-panel"><p>简介…</p></div>', '盗墓笔记', '南派三叔');
+      const result = await run();
+      expect(result.code).toBe(0);
+      expect(result.manifest.status).toBe('done');
+    });
+
+    it('详情页无书名/作者规则且搜索候选作者不符 ⇒ 仍判身份不符', async () => {
+      const run = engineSetup('旁人甲', '<div class="d-info-panel"><p>简介…</p></div>', '盗墓笔记', '南派三叔');
+      const result = await run();
+      expect(result.code).toBe(1);
+      expect(result.manifest.errors).toEqual(['identity_mismatch_or_no_candidate']);
+    });
+  });
+
   it('正文阶段的传输层失败不改判：逐章失败后仍是 missing_chapters（code=1）', async () => {
     const f = setup(-1);
     const result = await f.run(async (url, opts) => {
@@ -415,5 +460,56 @@ describe('书源不可达分类（41-EXEC-SRCUNAVAIL）', () => {
     });
     expect(result.code).toBe(1);
     expect(result.manifest.errors).toEqual(['missing_chapters']);
+  });
+});
+
+describe('物理 host 占位门拒绝透传', () => {
+  const gateError = (code: 'HOST_OCCUPIED' | 'HOST_OCCUPANCY_UNAVAILABLE') =>
+    Object.assign(new Error('synthetic gate rejection'), { code });
+  const dirOf = (f: ReturnType<typeof setup>): string => {
+    const out = f.options.out as string;
+    const sub = readdirSync(out).find(name => existsSync(join(out, name, 'manifest.json')));
+    if (!sub) throw new Error('manifest dir missing');
+    return join(out, sub);
+  };
+
+  it.each(['HOST_OCCUPIED', 'HOST_OCCUPANCY_UNAVAILABLE'] as const)('搜索阶段 %s 原样上抛', async code => {
+    const f = setup(0);
+    const error = gateError(code);
+    await expect(f.run(async (url, opts) => {
+      if (url.includes('/search')) throw error;
+      return f.transport(url, opts);
+    })).rejects.toBe(error);
+    const saved = JSON.parse(readFileSync(join(dirOf(f), 'manifest.json'), 'utf8'));
+    expect(saved.status).toBe('partial');
+    expect(saved.chapters).toHaveLength(0);
+    expect(saved.errors).toEqual([]);
+  });
+
+  it.each(['HOST_OCCUPIED', 'HOST_OCCUPANCY_UNAVAILABLE'] as const)('正文阶段 %s 停止，不标坏章、不请求下一章', async code => {
+    const f = setup(0);
+    const error = gateError(code);
+    await expect(f.run(async (url, opts) => {
+      if (url.endsWith('/read/1')) throw error;
+      return f.transport(url, opts);
+    })).rejects.toBe(error);
+    expect(f.calls.some(url => url.endsWith('/read/2'))).toBe(false);
+    const saved = JSON.parse(readFileSync(join(dirOf(f), 'manifest.json'), 'utf8'));
+    expect(saved.chapters).toHaveLength(2);
+    expect(saved.chapters.every((chapter: { status: string }) => chapter.status === 'pending')).toBe(true);
+    expect(saved.errors).toEqual([]);
+    expect(existsSync(join(dirOf(f), 'download.lock'))).toBe(false);
+    expect((await f.run()).code).toBe(0);
+  });
+
+  it('同文案但无稳定 code 仍按普通章节失败收口', async () => {
+    const f = setup(0);
+    const result = await f.run(async (url, opts) => {
+      if (url.endsWith('/read/1')) throw new Error('host occupied: synthetic.test');
+      return f.transport(url, opts);
+    });
+    expect(result.code).toBe(1);
+    expect(result.manifest.errors).toEqual(['missing_chapters']);
+    expect(result.manifest.chapters[0].error).toBe('chapter_failed');
   });
 });

@@ -173,18 +173,37 @@ describe('唯一记录点 fetchSourceText:只有传输层硬失败才计数', ()
   });
 
   it('换 host 兜底算同一次逻辑请求：apex 与 www 都失败只计 1 次;www 成功即清零', async () => {
-    const fetchMock = respondWith(() => { throw new TypeError('fetch failed'); });
-    await call('https://book15.net/a');
-    expect(fetchMock).toHaveBeenCalledTimes(2); // apex + www 两发物理请求
-    expect(health.isHostSuspect('book15.net')).toBe(false);
-    fetchMock.mockReset();
-    fetchMock.mockRejectedValueOnce(new TypeError('fetch failed')).mockResolvedValueOnce(new Response('正文'));
-    expect(await call('https://book15.net/a')).toBe('ok');
-    // 清零后再失败一次仍不够 2 次。
-    fetchMock.mockReset();
-    fetchMock.mockRejectedValue(new TypeError('fetch failed'));
-    await call('https://book15.net/a');
-    expect(health.isHostSuspect('book15.net')).toBe(false);
+    // 纯传输用例：换 host 兜底需要同站对，唯一的对（book15）lifecycle='retired' 会被许可门拒绝。
+    // doMock 只把同站对数据换成合成 e1.test ↔ www.e1.test，判定走真实实现；
+    // finally 撤 mock 复位，不污染后续用例。
+    vi.doMock('./supported-sources', async (importOriginal) => {
+      const actual = await importOriginal<typeof import('./supported-sources')>();
+      return { ...actual, BUILTIN_SOURCE_HOSTS: ['e1.test', 'www.e1.test'] };
+    });
+    try {
+      vi.resetModules();
+      const fetchFresh = await import('./source-fetch');
+      const healthFresh = await import('./source-host-health');
+      const callFresh = (url: string) =>
+        fetchFresh.fetchSourceText(url, { signal: new AbortController().signal })
+          .then(() => 'ok', (error: unknown) => error);
+      const fetchMock = vi.fn().mockImplementation(async () => { throw new TypeError('fetch failed'); });
+      vi.stubGlobal('fetch', fetchMock);
+      await callFresh('https://e1.test/a');
+      expect(fetchMock).toHaveBeenCalledTimes(2); // apex + www 两发物理请求
+      expect(healthFresh.isHostSuspect('e1.test')).toBe(false);
+      fetchMock.mockReset();
+      fetchMock.mockRejectedValueOnce(new TypeError('fetch failed')).mockResolvedValueOnce(new Response('正文'));
+      expect(await callFresh('https://e1.test/a')).toBe('ok');
+      // 清零后再失败一次仍不够 2 次。
+      fetchMock.mockReset();
+      fetchMock.mockRejectedValue(new TypeError('fetch failed'));
+      await callFresh('https://e1.test/a');
+      expect(healthFresh.isHostSuspect('e1.test')).toBe(false);
+    } finally {
+      vi.doUnmock('./supported-sources');
+      vi.resetModules();
+    }
   });
 
   it.each([
