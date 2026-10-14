@@ -94,6 +94,28 @@ describe('supported source parser', () => {
       .toEqual({ title: 'Ａ书', author: '甲·乙' });
   });
 
+  // 41-author（2026-10-14）：vikbook 详情页无 og:novel:author，作者只是 schema.org 微数据，
+  // itemprop 挂在外层 span 上、<a> 文本才是署名。三类形态各自兜底，og 优先级最高。
+  it('41-author 微数据作者兜底：span itemprop > a 文本 / a 自带 itemprop / title 属性', () => {
+    expect(parseSourceIdentity('<h1 class="title" itemprop="name">盗墓笔记</h1>'
+      + '<span itemprop="author"><p>作者：<span itemprop="author"><a class="red" title="作者：南派三叔" href="https://x">南派三叔</a></span></p></span>'))
+      .toEqual({ title: '盗墓笔记', author: '南派三叔' });
+    // a 自身带 itemprop：拿链接文本。
+    expect(parseSourceIdentity('<h1>三体Ⅲ</h1><span itemprop="author"><a itemprop="author" title="作者：刘慈欣">刘慈欣</a></span>'))
+      .toEqual({ title: '三体Ⅲ', author: '刘慈欣' });
+    // 块内无 <a> 可用：退 title 属性（原样返回，「作者：」标签在 knownSourceAuthor 比对时才剥）。
+    expect(parseSourceIdentity('<h1>三体Ⅲ</h1><span itemprop="author" title="作者：刘慈欣"></span>'))
+      .toEqual({ title: '三体Ⅲ', author: '作者：刘慈欣' });
+    // og 存在时不被微数据覆盖；无任何作者证据时 author 为空串。
+    expect(parseSourceIdentity('<meta property="og:novel:author" content="甲"><span itemprop="author"><a title="作者：乙">乙</a></span>'))
+      .toEqual({ title: '', author: '甲' });
+    expect(parseSourceIdentity('<h1>盗墓笔记</h1><div>正文</div>'))
+      .toEqual({ title: '盗墓笔记', author: '' });
+    // 防误收：itemprop 块内离头 400 字符窗口外才出现的链接不算署名。
+    expect(parseSourceIdentity('<h1>盗墓笔记</h1><div itemprop="author">' + 'x'.repeat(2000) + '</div><a href="#">无关</a>'))
+      .toEqual({ title: '盗墓笔记', author: '' });
+  });
+
   it('expands only simple GET templates and encodes the search term', () => {
     const result = sourceSearchUrl('/books/search.html?kw={{key}}&page={{page}}', '书&作者', 'https://book15.net/');
     expect(new URL(result).searchParams.get('kw')).toBe('书&作者');
