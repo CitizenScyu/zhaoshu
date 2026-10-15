@@ -118,6 +118,18 @@ describe('共用选源器', () => {
     expect(h.poolLoads).toEqual([1]);
   });
 
+  it('qqpay42 付费墙 host 跳过：挂书命中也不进 picked、不耗扫描槽位', async () => {
+    // 付费墙站恒挂书（搜索命中、正文拿不到）——qq 4 host 即便命中也须跳过；
+    // scanLimit=2 钉住「跳过不耗槽位」：若耗槽位，两个免费源一个都扫不到。
+    const h = harness({
+      pool: ['https://book.qq.com/', 'https://chuangshi.qq.com/', 'https://ubook.reader.qq.com/',
+        'https://yunqi.qq.com/', 'https://a.example/', 'https://b.example/'],
+    });
+    expect(await h.selector(request({ scanLimit: 2 }), freshSignal())).toEqual(['https://a.example/', 'https://b.example/']);
+    expect(h.searchedUrls).toEqual(['https://a.example/', 'https://b.example/']);
+    expect(h.logs[0].fields).toMatchObject({ scanned: 2, candidates: 2 });
+  });
+
   it('已失败 URL 只按精确 source_url 排除：A/B 排除后补 C/D；同 host 不同 source URL 仍可选', async () => {
     const h = harness({ pool: ['https://a.example/', 'https://b.example/', 'https://c.example/', 'https://d.example/'] });
     expect(await h.selector(request({ excludedSources: ['https://a.example/', 'https://b.example/'] }), freshSignal()))

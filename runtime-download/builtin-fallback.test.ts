@@ -379,6 +379,36 @@ describe('41-T8FB builtin-fallback', () => {
     expect(state.stored).toEqual([[1, ['https://a.example/', 'https://b.example/']]]);
   });
 
+  it('qqpay42：recall 剔除 qq 付费墙 host——混入 qq 只放行免费源，全 qq ⇒ null 走出网重选', async () => {
+    const state = {
+      usable: [
+        { source_url: 'https://book.qq.com/b1', host: 'book.qq.com' },
+        { source_url: 'https://yunqi.qq.com/b1', host: 'yunqi.qq.com' },
+        { source_url: 'https://free.example/b1', host: 'free.example' },
+      ],
+      stored: [] as [number, string[]][], failures: [] as [number, string, string, string][],
+    };
+    const h = candidatesHarness(state);
+    // qq 候选行被过滤，只剩 free.example：零出网放行。
+    expect(await h.fallback.wrapPrecheck(async () => UNAVAILABLE)(task(), signal()))
+      .toEqual({ ok: true, reason: 'builtin_engine_fallback' });
+    expect(h.searched).toEqual([]);
+    const calls: string[] = [];
+    const out = await h.fallback.wrapAdapter(adapter({}, []), adapter({ 'free.example': {
+      kind: 'complete', txt: 'x', chaptersTotal: 1, chaptersDone: 1, charsTotal: 1,
+    } }, calls)).download(task(), context());
+    expect(out.kind).toBe('complete');
+    expect(calls).toEqual(['free.example']);
+    // 存量候选全是 qq ⇒ recall 全空，改走出网选源（a.example 命中）。
+    state.usable = [
+      { source_url: 'https://chuangshi.qq.com/b1', host: 'chuangshi.qq.com' },
+      { source_url: 'https://ubook.reader.qq.com/b1', host: 'ubook.reader.qq.com' },
+    ];
+    expect(await h.fallback.wrapPrecheck(async () => UNAVAILABLE)(task(), signal()))
+      .toEqual({ ok: true, reason: 'builtin_engine_fallback' });
+    expect(h.searched).toEqual(['a.example', 'b.example']);
+  });
+
   it('recall 过滤：suspect/重复 host/超上限剔除，全被剔除 ⇒ 重选出网', async () => {
     const state = {
       usable: [

@@ -22,6 +22,19 @@ beforeEach(async () => {
 });
 afterEach(() => { vi.useRealTimers(); vi.unstubAllGlobals(); vi.unstubAllEnvs(); vi.restoreAllMocks(); });
 
+describe('qqpay42 付费墙 host 集合', () => {
+  it('4 个 qq host 命中；子域与大小写变体不连带（精确匹配）', () => {
+    for (const host of ['book.qq.com', 'chuangshi.qq.com', 'ubook.reader.qq.com', 'yunqi.qq.com']) {
+      expect(health.isPaywallHost(host)).toBe(true);
+      expect(health.isPaywallHost(host.toUpperCase())).toBe(true);
+    }
+    expect(health.isPaywallHost('x.book.qq.com')).toBe(false);
+    expect(health.isPaywallHost('qq.com')).toBe(false);
+    expect(health.isPaywallHost('a.example')).toBe(false);
+    expect(health.PAYWALL_HOSTS).toHaveLength(4);
+  });
+});
+
 describe('判定：连续硬失败 ≥ 2 次且最近一次在窗口内 ⇒ suspect', () => {
   it('1 次不算,2 次才算', () => {
     fail('dead.test', 1);
