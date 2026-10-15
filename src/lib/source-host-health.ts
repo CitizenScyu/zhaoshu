@@ -17,6 +17,25 @@ import { alternateSourceHost } from './source-policy';
 // 已知局限：按「请求 URL 的 host」记、按「源 url 的 host」查。引擎源的 searchUrl 若在另一个 host 上，
 // 那个 host 的失败不会让本源降序。
 
+/**
+ * 付费墙 host（qqpay42）：搜索恒命中（付费墙站挂书）但正文拿不到（~250 字 VIP 预览），
+ * 选中只会 preview_truncated / host_occupied 空转。对任何下载任务都拿不到正文，
+ * 故全局排除（不设 env 开关、不做任务级判定）。
+ */
+export const PAYWALL_HOSTS: readonly string[] = [
+  'book.qq.com',
+  'chuangshi.qq.com',
+  'ubook.reader.qq.com',
+  'yunqi.qq.com',
+];
+
+const PAYWALL_HOST_SET = new Set(PAYWALL_HOSTS);
+
+/** 精确 host 匹配（不匹配子域）。 */
+export function isPaywallHost(host: string): boolean {
+  return PAYWALL_HOST_SET.has(host.toLowerCase());
+}
+
 export type HostFailureKind = 'timeout' | 'network' | 'http_5xx';
 
 /** 判 suspect 所需的连续传输层硬失败次数。 */

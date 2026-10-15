@@ -20,7 +20,7 @@
 // 选不到 ⇒ 仍按 source_unavailable 退避（不扣日额度）；选到 ⇒ 放行，选源结果放进单槽缓存交给
 // 下载腿（并发=1，同一时刻只有一本在跑）。预检关闭（DOWNLOAD_IDENTITY_PRECHECK=0）时由下载腿自己选源。
 
-import { isHostSuspect } from '../src/lib/source-host-health';
+import { isHostSuspect, isPaywallHost } from '../src/lib/source-host-health';
 import {
   isBudgetExhausted, isLeaseLostError, TaskLeaseLostError,
   type AdapterOutcome, type SourceAdapter, type TaskRow,
@@ -189,7 +189,7 @@ export function createBuiltinFallback(options: BuiltinFallbackOptions) {
     const picked: string[] = [];
     for (const row of rows) {
       const host = hostOf(row.source_url);
-      if (!/^https:\/\//i.test(row.source_url) || !host || builtinHosts.has(host) || isSuspect(host)) continue;
+      if (!/^https:\/\//i.test(row.source_url) || !host || builtinHosts.has(host) || isSuspect(host) || isPaywallHost(host)) continue;
       if (picked.some(url => hostOf(url) === host)) continue;
       picked.push(row.source_url);
       if (picked.length >= Math.min(maxSources, hostTarget)) break;

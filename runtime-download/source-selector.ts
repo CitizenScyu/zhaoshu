@@ -1,6 +1,6 @@
 import { identityMatches } from '../scripts/engine-download.mjs';
 import { normalizeBookTitle } from '../src/lib/book-identity';
-import { isHostSuspect } from '../src/lib/source-host-health';
+import { isHostSuspect, isPaywallHost } from '../src/lib/source-host-health';
 import { sourceAbortable } from '../src/lib/source-fetch';
 import { pageContext, type Transport } from './identity-precheck';
 
@@ -110,7 +110,7 @@ export function createSourceSelector(options: SourceSelectorOptions): SourceSele
         if (picked.length >= request.targetHits || scanned >= request.scanLimit || overall.aborted
           || (request.scanBudget && request.scanBudget.remaining <= 0)) break;
         const host = hostOf(source.url);
-        if (!/^https:\/\//i.test(source.url) || !host || builtinHosts.has(host) || isSuspect(host)
+        if (!/^https:\/\//i.test(source.url) || !host || builtinHosts.has(host) || isSuspect(host) || isPaywallHost(host)
           || excludedHosts.has(host) || excludedSources.has(source.url) || pickedHosts.includes(host)) continue;
         scanned += 1;
         if (request.scanBudget) request.scanBudget.remaining -= 1;
