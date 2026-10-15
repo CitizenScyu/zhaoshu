@@ -72,7 +72,7 @@ export function checkEnvExample(root) {
     if (!existsSync(path)) return;
     for (const entry of readdirSync(path, { withFileTypes: true })) {
       const full = join(path, entry.name);
-      if (entry.isDirectory() && !['dist', 'node_modules', '.next'].includes(entry.name)) scan(full);
+      if (entry.isDirectory() && !['dist', 'node_modules', '.next', 'build'].includes(entry.name)) scan(full);
       else if (entry.isFile() && CODE_EXTENSIONS.test(entry.name)) collect(readFileSync(full, 'utf8'), relative(root, full).split(sep).join('/'));
     }
   }
