@@ -17,7 +17,8 @@
 //   和运行目录里 downloadBook 自己的 manifest.json（source 字段）。
 //
 // 预检接缝（wrapPrecheck）：原始源不可达时在扣额度前就把引擎候选选好（持久化命中优先，零出网），
-// 选不到 ⇒ 仍按 source_unavailable 退避（不扣日额度）；选到 ⇒ 放行，选源结果放进单槽缓存交给
+// 选不到 ⇒ 仍按可重试退避（不扣日额度）；整池实探后确实零候选的记 no_candidates（nocand42：长退避
+// 曲线，因免费站收录以天计）；选到 ⇒ 放行，选源结果放进单槽缓存交给
 // 下载腿（并发=1，同一时刻只有一本在跑）。预检关闭（DOWNLOAD_IDENTITY_PRECHECK=0）时由下载腿自己选源。
 
 import { isHostSuspect, isPaywallHost } from '../src/lib/source-host-health';
@@ -26,7 +27,7 @@ import {
   type AdapterOutcome, type SourceAdapter, type TaskRow,
 } from '../src/lib/download-worker';
 import { classifyFailure } from '../src/lib/download-source-candidates';
-import { createSourceSelector } from './source-selector';
+import { createSourceSelector, type SourceSelection } from './source-selector';
 import type { PrecheckHook, PrecheckResult } from './executor';
 
 /**
@@ -131,8 +132,9 @@ const isPreviewTruncated = (outcome: AdapterOutcome) =>
 const SOURCE_LEVEL_INCOMPLETE_REASONS = new Set(['source_unavailable', 'missing_chapters', 'toc_changed', 'operation_timeout', 'preview_truncated']);
 
 /** 回退源全部失败时回给任务层的结论：同 book15 不可达（退避放回 pending）。 */
-const unavailable = (stage: string): AdapterOutcome =>
-  ({ kind: 'incomplete', reason: 'source_unavailable', chaptersTotal: 0, chaptersDone: 0, charsTotal: 0, stage });
+const unavailable = (stage: string, noCandidate = false): AdapterOutcome =>
+  ({ kind: 'incomplete', reason: noCandidate ? 'no_candidates' : 'source_unavailable',
+    chaptersTotal: 0, chaptersDone: 0, charsTotal: 0, stage });
 
 export function createBuiltinFallback(options: BuiltinFallbackOptions) {
   const m = options.modules as Modules;
@@ -199,13 +201,14 @@ export function createBuiltinFallback(options: BuiltinFallbackOptions) {
 
   /**
    * 出网选源（共用 selector）：occupiedHosts/failedSources 快照作排除输入——正忙 host 不扫（宁退勿撞，
-   * 占位表不可读同样返回空退避），失败源按 URL 精确排除、不连坐整 host。候选读失败 ⇒ 安全返回空
-   * （退避）；caller abort 一律上抛（selector 对 abort 也是上抛，不吞）。预算由 selector 内部计时管理。
-   * 选到后 replace 落库由本文件负责（selector 不持久化）：只替换可用行，不删失败记忆。
+   * 占位表不可读同样返回空退避），失败源按 URL 精确排除、不连坐整 host。候选读失败 ⇒ 安全返回
+   * scanned=0（退避；这是瞬时不可达，不是 0 候选）。caller abort 一律上抛（selector 对 abort 也是上抛，
+   * 不吞）。预算由 selector 内部计时管理。选到后 replace 落库由本文件负责（selector 不持久化）：
+   * 只替换可用行，不删失败记忆。
    */
-  const selectSources = async (task: TaskRow, signal: AbortSignal, scanBudget: ScanBudget): Promise<string[]> => {
+  const selectSources = async (task: TaskRow, signal: AbortSignal, scanBudget: ScanBudget): Promise<SourceSelection> => {
     signal.throwIfAborted();
-    if (scanBudget.remaining <= 0) return [];
+    if (scanBudget.remaining <= 0) return { picked: [], scanned: 0 };
     let busy: Set<string> = new Set();
     let failed: Set<string> = new Set();
     if (candidates) {
@@ -214,10 +217,10 @@ export function createBuiltinFallback(options: BuiltinFallbackOptions) {
         failed = await candidates.failedSources(task.book_id);
       } catch {
         if (signal.aborted) throw signal.reason;
-        return [];
+        return { picked: [], scanned: 0 };
       }
     }
-    const picked = await selector({
+    const selection = await selector({
       task: { id: task.id, title: task.title, author: task.author },
       excludedHosts: [...busy],
       excludedSources: [...failed],
@@ -226,16 +229,16 @@ export function createBuiltinFallback(options: BuiltinFallbackOptions) {
       scanBudget,
       budgetMs,
     }, signal);
-    if (picked.length && candidates) {
+    if (selection.picked.length && candidates) {
       try {
-        await candidates.replace(task.book_id, picked);
+        await candidates.replace(task.book_id, selection.picked);
       } catch {
         signal.throwIfAborted();
         log('error', '候选保存失败', { taskId: task.id, reason: 'candidate_persistence_unavailable' });
-        return [];
+        return { picked: [], scanned: 0 };
       }
     }
-    return picked;
+    return selection;
   };
 
   return {
@@ -245,6 +248,8 @@ export function createBuiltinFallback(options: BuiltinFallbackOptions) {
      * 时改为取回退源——出网选源并落库；选到放行（reason=builtin_engine_fallback /
      * engine_source_candidates），选不到原样按 source_unavailable 退避。其余结论原样返回。
      * engine 任务无候选时先过原预检再扫池：原源可用就不必烧一次 200 源扫描（927 复核点 3）。
+     * 选不到时按实探数分两类收口（nocand42）：整池实探（scanned>0）零候选 ⇒ no_candidates 长退避；
+     * 一次没探 ⇒ source_unavailable 短退避。
      */
     wrapPrecheck(inner: PrecheckHook): PrecheckHook {
       return async (task, signal = new AbortController().signal): Promise<PrecheckResult> => {
@@ -279,11 +284,19 @@ export function createBuiltinFallback(options: BuiltinFallbackOptions) {
           }
         }
         signal.throwIfAborted();
-        sources ??= await selectSources(task, signal, scanBudget);
+        let selection: SourceSelection | null = null;
+        if (sources === null) {
+          selection = await selectSources(task, signal, scanBudget);
+          sources = selection.picked;
+        }
         signal.throwIfAborted();
-        if (!sources.length) return identityMissed
-          ? { ok: false, reason: 'identity_mismatch', retryable: false }
-          : { ok: false, reason: 'source_unavailable', retryable: true, stage };
+        if (!sources.length) {
+          if (identityMissed) return { ok: false, reason: 'identity_mismatch', retryable: false };
+          // 实探过整池仍零候选 ⇒ no_candidates（nocand42）：免费站收录以天计，走 1h/2h/4h 长退避；
+          // 一次没探（busy 全占/池不可读/预算尽）⇒ 仍是瞬时不可达，维持 15m/30m 快退避捞回。
+          return { ok: false, reason: selection && selection.scanned > 0 ? 'no_candidates' : 'source_unavailable',
+            retryable: true, stage };
+        }
         planned = { taskId: task.id, sources, scanBudget, identityMissed };
         return { ok: true, reason: builtin ? 'builtin_engine_fallback' : 'engine_source_candidates' };
       };
@@ -309,7 +322,11 @@ export function createBuiltinFallback(options: BuiltinFallbackOptions) {
         async download(task, context) {
           const plan = planned?.taskId === task.id ? planned : null;
           const scanBudget: ScanBudget = plan?.scanBudget ?? { remaining: MAX_FALLBACK_SCAN_SOURCES };
-          const selectForDownload = async (): Promise<string[] | AdapterOutcome> => {
+          // 最近一次补扫的实探数：收口时判「整池 0 候选」还是「瞬时不可达」（nocand42）。
+          let lastScanned = 0;
+          const isSelection = (value: SourceSelection | AdapterOutcome): value is SourceSelection =>
+            'picked' in value;
+          const selectForDownload = async (): Promise<SourceSelection | AdapterOutcome> => {
             try {
               return await selectSources(task, context.signal, scanBudget);
             } catch (error) {
@@ -344,13 +361,14 @@ export function createBuiltinFallback(options: BuiltinFallbackOptions) {
             }
             if (sources === null) {
               const selected = await selectForDownload();
-              if (!Array.isArray(selected)) return selected;
-              sources = selected;
+              if (!isSelection(selected)) return selected;
+              sources = selected.picked;
+              lastScanned = selected.scanned;
             }
           }
           stop = stopped(context.signal);
           if (stop) return stop;
-          if (!sources.length) return primary ?? unavailable('search');
+          if (!sources.length) return primary ?? unavailable('search', lastScanned > 0);
           let supplemented = false;
           for (;;) {
             let allFailed = true;
@@ -405,8 +423,9 @@ export function createBuiltinFallback(options: BuiltinFallbackOptions) {
             if (!allFailed || supplemented || !candidates) break;
             supplemented = true;
             const selected = await selectForDownload();
-            if (!Array.isArray(selected)) return selected;
-            sources = selected;
+            if (!isSelection(selected)) return selected;
+            sources = selected.picked;
+            lastScanned = selected.scanned;
             stop = stopped(context.signal);
             if (stop) return stop;
             if (!sources.length) break;

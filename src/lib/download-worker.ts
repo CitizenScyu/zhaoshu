@@ -14,7 +14,7 @@
 
 import { createHash } from 'node:crypto';
 import type { DownloadTaskLease } from './download-task-queue';
-import { PUBLICATION_RETRY_MAX_ATTEMPTS, SOURCE_RETRY_MAX_ATTEMPTS, sourceRetryDelayMs } from './download-task-policy';
+import { PUBLICATION_RETRY_MAX_ATTEMPTS, SOURCE_RETRY_MAX_ATTEMPTS, sourceRetryDelayMs, type SourceRetryClass } from './download-task-policy';
 import {
   gitBlobSha, isRetryablePublicationError, LeaseLostError, publishBookVersion, PublicationStageError, snapshotPaths,
   type GitHubContents, type PublishOutcome,
@@ -240,23 +240,29 @@ const hostOf = (url: string): string => {
  * 书源不可达（source_unavailable）的统一收口：下载腿（runDownloadTask）与执行器扣额度前预检共用。
  * 未达上限 ⇒ 租约条件放回 pending，按 attempt_count 退避；达上限 ⇒ partial 终态；失租约 ⇒ TaskLeaseLostError。
  * 返回下次可重试时刻（ISO UTC），null = 已封顶转终态。
+ *
+ * retryClass 选退避曲线（nocand42）：no_candidates = 全池实探后这本书一个候选都没有，扫描的恢复
+ * 周期以天计，走 1h/2h/4h 长曲线；transient（默认）= 源/网络正忙、池读不到、预算尽，快速重试才捞得回。
+ * 上限 SOURCE_RETRY_MAX_ATTEMPTS 两条曲线共用，退避总量依旧有界。
  */
 export async function settleSourceUnavailable(
   storage: Pick<WorkerStorage, 'defer' | 'finish'>,
   lease: DownloadTaskLease,
   stage: string,
+  retryClass: SourceRetryClass = 'transient',
 ): Promise<{ retryAt: string | null }> {
+  const code: 'no_candidates' | 'source_unavailable' = retryClass === 'no_candidates' ? 'no_candidates' : 'source_unavailable';
   if (lease.attemptCount < SOURCE_RETRY_MAX_ATTEMPTS) {
     const retryAt = await storage.defer(lease, {
-      delayMs: sourceRetryDelayMs(lease.attemptCount),
-      error: `源不可用（${stage} 阶段，第 ${lease.attemptCount} 次）：source_unavailable，自动退避重试`,
+      delayMs: sourceRetryDelayMs(lease.attemptCount, retryClass),
+      error: `源不可用（${stage} 阶段，第 ${lease.attemptCount} 次）：${code}，自动退避重试`,
     });
     if (!retryAt) throw new TaskLeaseLostError();
     return { retryAt };
   }
   const written = await storage.finish(lease, {
     status: 'partial',
-    error: `源不可用（${stage} 阶段，已连续 ${lease.attemptCount} 次，停止自动重试）：source_unavailable`,
+    error: `源不可用（${stage} 阶段，已连续 ${lease.attemptCount} 次，停止自动重试）：${code}`,
   });
   if (!written) throw new TaskLeaseLostError();
   return { retryAt: null };
@@ -379,15 +385,18 @@ export async function runDownloadTask(
       // partial 零发布：任何 GitHub PUT 都没发生，DB 只写终态。
       await heartbeat.stop();
       throwIfAbortedUnlessBudget(signal);
-      if (outcome.reason === 'source_unavailable') {
+      if (outcome.reason === 'source_unavailable' || outcome.reason === 'no_candidates') {
         // 书源不可达不是终态：放回 pending，按 attempt_count 退避后由 claim 自动重领（零发布）；
         // 连续 SOURCE_RETRY_MAX_ATTEMPTS 次仍不可达才落 partial 终态。
+        // no_candidates = 全池实探后这本书一个候选都没有（nocand42）：走 1h/2h/4h 长曲线，
+        // 30 分钟重扫一轮对免费站的收录变化毫无意义，纯空烧出网。
         const stage = outcome.stage ?? 'unknown';
         const sourceHost = hostOf(task.source_url);
-        const { retryAt } = await settleSourceUnavailable(storage, lease, stage);
+        const retryClass: SourceRetryClass = outcome.reason === 'no_candidates' ? 'no_candidates' : 'transient';
+        const { retryAt } = await settleSourceUnavailable(storage, lease, stage, retryClass);
         return retryAt
-          ? { processed: true, reason: 'source_unavailable', stage, sourceHost, retryAt }
-          : { processed: true, terminal: 'partial', reason: 'source_unavailable', stage, sourceHost, retryAt: null };
+          ? { processed: true, reason: outcome.reason, stage, sourceHost, retryAt }
+          : { processed: true, terminal: 'partial', reason: outcome.reason, stage, sourceHost, retryAt: null };
       }
       const detail = `缺章 ${outcome.chaptersDone}/${outcome.chaptersTotal}：${outcome.reason}`;
       const written = await storage.finish(lease, {

@@ -39,8 +39,19 @@ export interface SourceSelectionRequest {
   scanBudget?: { remaining: number };
 }
 
+/**
+ * 选源结果：picked = 命中的源 URL（按池序），scanned = 本轮实际出网探测的源数。
+ * scanned 是区分「全池 0 候选」与「瞬时不可达」的唯一依据（nocand42）：scanned>0 且 picked 为空
+ * 说明这本书整池没人挂，免费站收录以天计 ⇒ 长退避；scanned===0 是 busy 全占/池不可读/预算尽 ⇒ 快退避。
+ * 扫描 0 个源时也如实返回 0，不粉饰。
+ */
+export interface SourceSelection {
+  picked: string[];
+  scanned: number;
+}
+
 export type SourceSelector =
-  (request: SourceSelectionRequest, signal: AbortSignal) => Promise<string[]>;
+  (request: SourceSelectionRequest, signal: AbortSignal) => Promise<SourceSelection>;
 
 const hostOf = (url: string): string => {
   try { return new URL(url).hostname; } catch { return ''; }
@@ -79,7 +90,7 @@ export function createSourceSelector(options: SourceSelectorOptions): SourceSele
 
   return async (request, signal) => {
     signal.throwIfAborted();
-    if (request.scanBudget && request.scanBudget.remaining <= 0) return [];
+    if (request.scanBudget && request.scanBudget.remaining <= 0) return { picked: [], scanned: 0 };
     const budget = new AbortController();
     const timer = setTimeout(() => budget.abort(new Error('select_budget_exhausted')), request.budgetMs);
     const overall = AbortSignal.any([signal, budget.signal]);
@@ -91,9 +102,9 @@ export function createSourceSelector(options: SourceSelectorOptions): SourceSele
       } catch (error) {
         signal.throwIfAborted();
         if (isOccupancyUnavailable(error)) throw error;
-        if (overall.aborted) return [];
+        if (overall.aborted) return { picked: [], scanned: 0 };
         log('info', '选源：源池不可用', { taskId: task.id, reason: 'engine_source_pool_unavailable' });
-        return [];
+        return { picked: [], scanned: 0 };
       }
       signal.throwIfAborted();
       const excludedHosts = new Set(request.excludedHosts);
@@ -128,7 +139,7 @@ export function createSourceSelector(options: SourceSelectorOptions): SourceSele
         }
       }
       log('info', '选源完成', { taskId: task.id, scanned, candidates: picked.length, hosts: pickedHosts });
-      return picked;
+      return { picked, scanned };
     } finally {
       clearTimeout(timer);
     }

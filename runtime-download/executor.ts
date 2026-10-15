@@ -51,15 +51,16 @@ export class BudgetExhaustedError extends Error {
  *   { ok: true }          放行：照常 consume → 下载；
  *   { ok: true, reason }  放行，并记一行日志（预检没得出结论，如超时、未归类错误）；
  *   { ok: false, reason } 拦截：任务落 failed 终态、error = reason，不 consume、不下载，决策 TASK_DONE；
- *   { ok: false, reason: 'source_unavailable', retryable: true, stage }
+ *   { ok: false, reason: 'source_unavailable' | 'no_candidates', retryable: true, stage }
  *                         书源不可达：与下载腿同一收口（退避放回 pending，封顶落 partial），不 consume、
- *                         不下载，决策 TASK_DONE。
+ *                         不下载，决策 TASK_DONE。no_candidates = 全池实探后零候选（nocand42），
+ *                         退避曲线更长（1h/2h/4h），其余 source_unavailable 维持 15m/30m。
  * reason 只能是固定的小写原因码（[a-z0-9_]），不许带书名、作者、URL；不合规的一律记成 precheck_rejected。
  */
 export type PrecheckResult =
   | { ok: true; reason?: string }
   | { ok: false; reason: string; retryable?: false }
-  | { ok: false; reason: 'source_unavailable'; retryable: true; stage: string };
+  | { ok: false; reason: 'source_unavailable' | 'no_candidates'; retryable: true; stage: string };
 export type PrecheckHook = (task: TaskRow, signal?: AbortSignal) => Promise<PrecheckResult>;
 
 /** 预检拦截：任务已落 failed 终态、未扣日预算，按 TASK_DONE 决策（立即领下一本）。 */
@@ -71,8 +72,9 @@ export class PrecheckRejectedError extends Error {
 /** 预检判书源不可达：任务已退避放回 pending（或封顶落 partial）、未扣日预算，按 TASK_DONE 决策。 */
 export class PrecheckDeferredError extends Error {
   readonly code = 'PRECHECK_DEFERRED';
-  constructor(readonly stage: string, readonly host: string, readonly retryAt: string | null) {
-    super('precheck deferred: source_unavailable');
+  constructor(readonly reason: 'source_unavailable' | 'no_candidates', readonly stage: string,
+    readonly host: string, readonly retryAt: string | null) {
+    super(`precheck deferred: ${reason}`);
     this.name = 'PrecheckDeferredError';
   }
 }
@@ -152,8 +154,8 @@ export function createExecutor(deps: ExecutorDependencies): DownloadExecutor {
     ...(deps.rollover ? { rollover: deps.rollover } : {}),
   });
   // 书源不可达的结构化日志：扣额度前预检与下载腿打同一行，只含原因码/阶段/源 host/下次可重试时刻。
-  const logSourceUnavailable = (stage: string, host: string, retryAt: string | null) =>
-    log('info', '书源不可达', { reason: 'source_unavailable', stage, host, retryAt });
+  const logSourceUnavailable = (reason: string, stage: string, host: string, retryAt: string | null) =>
+    log('info', '书源不可达', { reason, stage, host, retryAt });
 
   // 单轮本体（配额闸在下方对外的 runOnce）。
   const inner: DownloadExecutor = {
@@ -192,9 +194,11 @@ export function createExecutor(deps: ExecutorDependencies): DownloadExecutor {
         if (!result.ok && result.retryable) {
           // 书源不可达：与下载腿同一收口，此时还没扣日预算，无需退还。
           const stage = STAGE_CODE.test(result.stage) ? result.stage : 'unknown';
+          const reason = result.reason;
           let retryAt: string | null;
           try {
-            ({ retryAt } = await settleSourceUnavailable(deps.storage, lease, stage));
+            ({ retryAt } = await settleSourceUnavailable(deps.storage, lease, stage,
+              reason === 'no_candidates' ? 'no_candidates' : 'transient'));
           } catch (error) {
             if (error instanceof TaskLeaseLostError) {
               log('info', '扣额度前预检收口时租约已失', { taskId: lease.id });
@@ -203,7 +207,7 @@ export function createExecutor(deps: ExecutorDependencies): DownloadExecutor {
             await deps.storage.releaseClaim?.(lease);
             throw error;
           }
-          throw new PrecheckDeferredError(stage, hostOf(task.source_url), retryAt);
+          throw new PrecheckDeferredError(reason, stage, hostOf(task.source_url), retryAt);
         }
         if (!result.ok) {
           const reason = REASON_CODE.test(result.reason) ? result.reason : 'precheck_rejected';
@@ -264,7 +268,7 @@ export function createExecutor(deps: ExecutorDependencies): DownloadExecutor {
         if (error instanceof BudgetExhaustedError) return decisions.BUDGET_EXHAUSTED;
         if (error instanceof PrecheckRejectedError) return decisions.TASK_DONE;
         if (error instanceof PrecheckDeferredError) {
-          logSourceUnavailable(error.stage, error.host, error.retryAt);
+          logSourceUnavailable(error.reason, error.stage, error.host, error.retryAt);
           return decisions.TASK_DONE;
         }
         // 预检收口时失租约：行已不归本租约、未扣额度，与下载腿失租约同样按已尝试收口。
@@ -272,8 +276,8 @@ export function createExecutor(deps: ExecutorDependencies): DownloadExecutor {
         throw error; // drain → ERROR 退避
       }
       if (!result.processed && result.reason === 'queue_empty') return decisions.NO_TASK;
-      if (result.processed && result.reason === 'source_unavailable') {
-        logSourceUnavailable(result.stage ?? 'unknown', result.sourceHost ?? '', result.retryAt ?? null);
+      if (result.processed && (result.reason === 'source_unavailable' || result.reason === 'no_candidates')) {
+        logSourceUnavailable(result.reason, result.stage ?? 'unknown', result.sourceHost ?? '', result.retryAt ?? null);
         // 书源不可达不计日预算：退还本次领取时的扣减。退还失败不影响已落库的任务状态，
         // 记一行错误（配额按已扣处理，保守侧）。
         const spent = ticket as BudgetTicket | null;

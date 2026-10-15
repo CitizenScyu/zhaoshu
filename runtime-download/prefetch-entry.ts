@@ -97,7 +97,9 @@ function wrapSelectorWithFailedSources(
       }
       const missingHits = Math.max(0, request.targetHits - knownHosts.size);
       if (!missingHits) return [];
-      return await base({
+      // 共用 selector 返回 {picked, scanned}（nocand42 加的实探计数）；预取调度器只认源列表，
+      // 零候选的退避判据是下载线的事，这里丢弃 scanned。
+      const { picked } = await base({
         task: { id: request.task.id, title: request.task.title, author: request.task.author },
         excludedHosts: [...new Set([...request.excludedHosts, ...knownHosts])],
         excludedSources: rows.map(row => row.source_url).filter(url => typeof url === 'string' && url.length > 0),
@@ -105,6 +107,7 @@ function wrapSelectorWithFailedSources(
         scanLimit: request.scanLimit,
         budgetMs: remainingMs,
       }, signal);
+      return picked;
     } finally {
       clearTimeout(timer);
     }
