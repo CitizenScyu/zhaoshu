@@ -26,6 +26,11 @@ import styles from './reader.module.css';
 interface Props { session: ReadingSession; from: ReaderOrigin }
 const DIRECTORY_PAGE_SIZE = 80;
 
+// readerux42-B 自动阅读:三档滚读速度(px/s);100ms 一拍,长章只改 scrollTop 不动 DOM。
+type AutoSpeed = 'slow' | 'normal' | 'fast';
+const AUTO_READ_SPEEDS: Record<AutoSpeed, number> = { slow: 36, normal: 75, fast: 150 };
+const AUTO_READ_TICK_MS = 100;
+
 function bodyText(part: ReaderPart): string {
   const text = part.text.replace(/^\uFEFF/, '');
   if (part.partIndex !== 0) return text;
@@ -258,6 +263,40 @@ function ReaderSession({ session, from }: Props) {
     return () => controller.abort();
   }, [failure, panel, session, settings.autoSwitchSource, apiFetch, probeCache, servingSource, loadConfirmedBook, isReaderSessionCurrent, setNotice, switchedBookUrl]);
 
+  // readerux42-B 自动阅读:会话内状态(不持久化);开关在页脚,速度三档。滚读是定时驱动
+  // (每拍只改 scroller.scrollTop,不重排 DOM,长章不卡);章末走既有 extend('next') 连续阅读
+  // 链路无缝接下一章(fqapp 语义:新章从顶部开始、播放不中断);到最后一章停并提示。
+  // 暂停条件:页面隐藏、面板打开、取章在途(loading/flowing)、出错(错误条出现即停)。
+  // 用户主动滚动/翻章即接管 —— 自动阅读关闭,再点开关恢复。
+  const [autoRead, setAutoRead] = useState(false);
+  const [autoSpeed, setAutoSpeed] = useState<AutoSpeed>('normal');
+  const autoHasNext = !!after;
+  useEffect(() => { if (failure && autoRead) setAutoRead(false); }, [failure, autoRead]);
+  useEffect(() => {
+    if (!autoRead) return;
+    const speedPx = AUTO_READ_SPEEDS[autoSpeed] / (1000 / AUTO_READ_TICK_MS);
+    const timer = setInterval(() => {
+      const viewport = scroller.current;
+      if (!viewport || document.visibilityState === 'hidden' || panel || failure || loading || flowing) return;
+      const remaining = viewport.scrollHeight - viewport.scrollTop - viewport.clientHeight;
+      if (remaining > 4) {
+        viewport.scrollTop = viewport.scrollTop + speedPx;
+      } else if (autoHasNext) {
+        // 章末无缝接续:extend 内部复用滚动续读/预取链路,新章内容接上后本拍继续滚。
+        void extend('next', true);
+      } else {
+        setAutoRead(false);
+        setNotice('已读到全书末尾，自动阅读停止。');
+      }
+    }, AUTO_READ_TICK_MS);
+    return () => clearInterval(timer);
+  }, [autoRead, autoSpeed, autoHasNext, panel, failure, loading, flowing, extend, scroller, setNotice]);
+  // 用户手势(滚轮/触摸拖动/方向键)即接管滚动:自动阅读让位。
+  function userScrollIntent(forward: boolean) {
+    if (autoRead) setAutoRead(false);
+    markScrollIntent(forward);
+  }
+
   function toggleFocus(focusControl = false) {
     const next = !focused;
     setFocusMode(next);
@@ -339,14 +378,14 @@ function ReaderSession({ session, from }: Props) {
         aria-busy={loading}
         tabIndex={0}
         onScroll={onScroll}
-        onWheel={(event) => markScrollIntent(event.deltaY > 0)}
+        onWheel={(event) => userScrollIntent(event.deltaY > 0)}
         onPointerDown={(event) => {
           if (event.pointerType !== 'touch' || !event.isPrimary || !(event.target as HTMLElement).closest('[data-reader-prose]')) { tap.current = null; return; }
           tap.current = { x: event.clientX, y: event.clientY, time: performance.now() };
         }}
         onPointerMove={(event) => {
           if (event.pointerType === 'touch' && tap.current && Math.abs(event.clientY - tap.current.y) > 8) {
-            markScrollIntent(event.clientY < tap.current.y);
+            userScrollIntent(event.clientY < tap.current.y);
           }
         }}
         onPointerUp={(event) => {
@@ -360,8 +399,8 @@ function ReaderSession({ session, from }: Props) {
         onPointerCancel={() => { tap.current = null; }}
         onKeyDown={(event) => {
           if (loading || panel || event.altKey || event.ctrlKey || event.metaKey || (event.target as HTMLElement).closest('button, a, input, select, textarea')) return;
-          if (['ArrowDown', 'PageDown', ' ', 'End'].includes(event.key)) markScrollIntent(true);
-          if (['ArrowUp', 'PageUp', 'Home'].includes(event.key)) markScrollIntent(false);
+          if (['ArrowDown', 'PageDown', ' ', 'End'].includes(event.key)) userScrollIntent(true);
+          if (['ArrowUp', 'PageUp', 'Home'].includes(event.key)) userScrollIntent(false);
           // Shift+方向键是浏览器原生扩展选区:不拦截、不翻章,否则用户选字选到边界就被带去下一章。
           if (event.shiftKey) return;
           if (event.key === 'ArrowLeft' && chapter > 0) { event.preventDefault(); navigate(position(chapter - 1)); }
@@ -413,6 +452,14 @@ function ReaderSession({ session, from }: Props) {
 
       <footer className={styles.footer} hidden={focused}>
         <div className={styles.progressTrack} role="progressbar" aria-label="全书阅读进度" aria-valuemin={0} aria-valuemax={100} aria-valuenow={Number(percent.toFixed(1))}><span style={{ width: percent + '%' }} /></div>
+        {reading && <div className={styles.autoRow}>
+          <button className={styles.tool} aria-pressed={autoRead} title={autoRead ? '停止自动阅读' : '开始自动阅读'} onClick={() => setAutoRead(!autoRead)}>{autoRead ? '停止自动' : '自动阅读'}</button>
+          {autoRead && <div className={styles.autoSpeeds} role="group" aria-label="自动阅读速度">
+            {([['slow', '慢'], ['normal', '中'], ['fast', '快']] as [AutoSpeed, string][]).map(([key, label]) => (
+              <button key={key} className={styles.choice} aria-pressed={autoSpeed === key} onClick={() => setAutoSpeed(key)}>{label}</button>
+            ))}
+          </div>}
+        </div>}
         <div className={styles.footerInner}>
           <button className={styles.chapterButton} disabled={!reading || loading || chapter === 0} onClick={() => navigate(position(chapter - 1))}>← 上一章</button>
           <button className={styles.progressButton} disabled={!reading} onClick={() => showPanel('directory')} aria-label="打开目录，查看阅读位置">
