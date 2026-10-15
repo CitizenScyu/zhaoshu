@@ -67,7 +67,8 @@ describe('download offline full books', () => {
     const result = await f.run(async () => { throw new TypeError('synthetic opaque detail'); });
     expect(result.code).toBe(1);
     expect(result.manifest.errors).toEqual(['download_failed']);
-    expect(result.manifest.failure_name).toBe('TypeError');
+    // failure_name 同 failure_stage：catch 里补上的字段，JS 推断的字面量类型里没有。
+    expect((result.manifest as { failure_name?: string }).failure_name).toBe('TypeError');
     // 上游消息原文绝不落盘；只有构造器名这个固定类别。
     expect(readFileSync(result.manifestPath, 'utf8')).not.toContain('synthetic opaque detail');
     expect(readFileSync(result.manifestPath, 'utf8')).toContain('TypeError');
