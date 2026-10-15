@@ -51,7 +51,7 @@ export type AdapterOutcome =
     }
   // stage：source_unavailable 时判定所在阶段（resolve/search/detail/toc），只作日志用的固定枚举。
   | { kind: 'incomplete'; reason: string; chaptersTotal: number; chaptersDone: number; charsTotal: number; stage?: string; retryCause?: 'host_occupied' | 'host_occupancy_unavailable' }
-  | { kind: 'failure'; code: string };
+  | { kind: 'failure'; code: string; /** 脱敏诊断类别（Error 构造器名，如 TypeError）——download_failed 兜底时定位速败结构用。 */ detail?: string };
 
 export interface SourceAdapterContext {
   /** 任务层提供的租约信号：adapter 中断后应立即停止抓取。 */
@@ -695,7 +695,10 @@ export function createEngineAdapter(options: EngineAdapterOptions): SourceAdapte
       if (classified === 'missing_chapters' || classified === 'toc_changed' || classified === 'budget_exhausted' || classified === 'interrupted' || classified === 'operation_timeout') {
         return { kind: 'incomplete', reason: classified, chaptersTotal, chaptersDone, charsTotal };
       }
-      return { kind: 'failure', code: classified };
+      // dlfail42：download_failed 兜底（脱敏吞掉真实错误类别）时透传 Error 构造器名——不含上游文本，
+      // 配合阶段足以定位速败结构；白名单错误无 detail（reason 本身即类别）。
+      const failureName = /^[A-Za-z]{1,32}$/.test(manifest.failure_name ?? '') ? manifest.failure_name : undefined;
+      return failureName ? { kind: 'failure', code: classified, detail: failureName } : { kind: 'failure', code: classified };
     },
   };
 }

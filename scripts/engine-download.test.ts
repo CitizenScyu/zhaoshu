@@ -62,6 +62,16 @@ describe('download offline full books', () => {
     const r = await f.run(); expect(r.code).toBe(1); expect(r.manifest.status).toBe('partial');
     expect(JSON.parse(readFileSync(r.manifestPath, 'utf8')).status).toBe('partial');
   });
+  it('opaque error degrades to download_failed with sanitized constructor name (dlfail42)', async () => {
+    const f = setup();
+    const result = await f.run(async () => { throw new TypeError('synthetic opaque detail'); });
+    expect(result.code).toBe(1);
+    expect(result.manifest.errors).toEqual(['download_failed']);
+    expect(result.manifest.failure_name).toBe('TypeError');
+    // 上游消息原文绝不落盘；只有构造器名这个固定类别。
+    expect(readFileSync(result.manifestPath, 'utf8')).not.toContain('synthetic opaque detail');
+    expect(readFileSync(result.manifestPath, 'utf8')).toContain('TypeError');
+  });
   it.each(['invalid_chapter', 'invalid_next_page', 'empty_content_page', 'content_page_limit', 'unsupported_content_rule'])('preserves safe diagnostic %s', async reason => {
     const f = setup();
     const result = await f.run(async () => { throw new Error(reason); });

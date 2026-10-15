@@ -364,6 +364,7 @@ export function createBuiltinFallback(options: BuiltinFallbackOptions) {
               const reason = next.kind === 'complete' ? 'done' : next.kind === 'failure' ? next.code : next.reason;
               log('info', '引擎回退下载', {
                 taskId: task.id, host, outcome: next.kind, reason,
+                ...(next.kind === 'failure' && next.detail ? { detail: next.detail } : {}),
                 ...(next.kind === 'incomplete' && next.retryCause ? { retryCause: next.retryCause } : {}),
               });
               if (next.kind === 'complete') return next;

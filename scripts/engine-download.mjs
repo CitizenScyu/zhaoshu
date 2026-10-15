@@ -243,6 +243,11 @@ export async function downloadBook(m, args, resolveSource, transport = fetchSour
     if (SOURCE_STAGES.has(stage) && !controller.signal.aborted && isSourceUnavailableError(error)) failureCode = 2;
     if (failureCode === 2) manifest.failure_stage = stage; // 固定枚举，不含上游细节
     manifest.errors.push(failureCode === 2 ? 'source_unavailable' : knownError.test(error.message) ? error.message : 'download_failed');
+    // dlfail42：白名单外错误被脱敏成 download_failed 时记 Error 构造器名（TypeError 等，不含上游文本），
+    // 供桥层透传进日志定位「5 秒速败」类失败的结构（阶段 + 异常类别）。
+    if (failureCode !== 2 && !knownError.test(error.message)) {
+      manifest.failure_name = /^[A-Za-z]{1,32}$/.test(error?.name) ? error.name : 'unknown';
+    }
   } finally {
     try {
       clearTimeout(timer); process.off('SIGINT', stop); process.off('SIGTERM', stop);

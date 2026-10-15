@@ -466,6 +466,9 @@ maybe('T3 worker 任务层：租约、单写者、五阶段对账（PGlite + moc
       // errors 故意不放 source_unavailable：该 reason 本就在 incomplete 名单内，
       // 删掉 `result.code===2` 分支测试仍绿。用 download_failed 才能钉住退出码契约。
       if (args.source.includes('dead')) return { code: 2, manifest: { status: 'partial', errors: ['download_failed'], chapters_total: 0, chapters_done: 0, chars: 0 } };
+      // dlfail42：白名单外错误兜底 download_failed 时 manifest 带 failure_name（脱敏构造器名）
+      if (args.source.includes('opaque')) return { code: 1, manifest: { status: 'partial', errors: ['download_failed'], failure_name: 'TypeError', chapters_total: 0, chapters_done: 0, chars: 0 } };
+      if (args.source.includes('noname')) return { code: 1, manifest: { status: 'partial', errors: ['download_failed'], chapters_total: 0, chapters_done: 0, chars: 0 } };
       const mode = args.source.includes('bad') ? 'missing' : 'ok';
       if (mode === 'ok') return { code: 0, manifest: { status: 'done', errors: [], chapters_total: 3, chapters_done: 3, chars: 2430, artifact: { file: 'book.txt', sha256: 'x', bytes: 9 } } };
       return { code: 1, manifest: { status: 'partial', errors: ['missing_chapters'], chapters_total: 3, chapters_done: 2, chars: 1620 } };
@@ -494,6 +497,19 @@ maybe('T3 worker 任务层：租约、单写者、五阶段对账（PGlite + moc
       progress: async () => {},
     });
     expect(dead).toMatchObject({ kind: 'incomplete', reason: 'source_unavailable' });
+    // dlfail42：download_failed 兜底带 failure_name ⇒ failure 带 detail（构造器名类别）；
+    // 同兜底但无 failure_name（老 manifest）⇒ 无 detail，行为不变。
+    const opaque = await adapter.download({ id: 6, book_id: 1, title: 't', author: 'a', status: 'running', source_url: 'https://opaque.example/z', source_kind: 'engine', source_id: null, requested_by: 'system' }, {
+      signal: new AbortController().signal,
+      progress: async () => {},
+    });
+    expect(opaque).toMatchObject({ kind: 'failure', code: 'download_failed', detail: 'TypeError' });
+    const noname = await adapter.download({ id: 7, book_id: 1, title: 't', author: 'a', status: 'running', source_url: 'https://noname.example/z', source_kind: 'engine', source_id: null, requested_by: 'system' }, {
+      signal: new AbortController().signal,
+      progress: async () => {},
+    });
+    expect(noname).toMatchObject({ kind: 'failure', code: 'download_failed' });
+    expect((noname as { detail?: string }).detail).toBeUndefined();
     // hooks 被透传：进度上报发生
     expect(fakeDownload.mock.calls[0][4].onProgress).toBeTypeOf('function');
   });
