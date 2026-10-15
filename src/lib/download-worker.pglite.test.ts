@@ -9,7 +9,7 @@ import {
 import {
   claimDownloadTask, deferDownloadTask, finishDownloadTask, heartbeatDownloadTask, retryDownloadTask, updateDownloadTaskProgress,
 } from './download-task-queue';
-import { reserveArtifactPath } from './artifact-registry';
+import { findArtifactBinding, reserveArtifactPath } from './artifact-registry';
 import { createWorkerStorage } from '../../runtime-download/storage';
 import {
   createEngineAdapter, runDownloadTask, runWorkerOnce, startLeaseHeartbeat,
@@ -86,6 +86,7 @@ maybe('T3 worker 任务层：租约、单写者、五阶段对账（PGlite + moc
       labeledBookId: input.labeledBookId, identityKey: input.identityKey,
       repositoryId: input.repositoryId, branch: input.branch, canonicalPath: input.canonicalPath,
     }),
+    findArtifactBinding: input => findArtifactBinding(sql as never, input),
     registerArtifact: (lease, input) => createWorkerStorage(sql as never).registerArtifact(lease, input),
     ...over,
   });

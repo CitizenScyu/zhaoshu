@@ -10,7 +10,7 @@ import {
   claimDownloadTask, deferDownloadTask, finishDownloadTask, heartbeatDownloadTask, updateDownloadTaskProgress,
   type DownloadTaskLease,
 } from '../src/lib/download-task-queue';
-import { reserveArtifactPath } from '../src/lib/artifact-registry';
+import { findArtifactBinding, reserveArtifactPath } from '../src/lib/artifact-registry';
 import type { ArtifactRegistrationResult, TaskRow, WorkerStorage } from '../src/lib/download-worker';
 
 export type DownloadSql = ReturnType<typeof neon>;
@@ -39,6 +39,7 @@ export function createWorkerStorage(sql: DownloadSql): RuntimeWorkerStorage {
     defer: (lease, input) => deferDownloadTask(sql, lease, input),
 
     reserveArtifactPath: input => reserveArtifactPath(sql, input),
+    findArtifactBinding: input => findArtifactBinding(sql, input),
 
     async registerArtifact(lease, input) {
       const rows = await sql`

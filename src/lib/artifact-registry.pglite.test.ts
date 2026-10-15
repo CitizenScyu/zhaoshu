@@ -5,7 +5,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } 
 import { initializeArtifactSchema } from './business-schema';
 import { createPGliteSql } from './fixtures/pglite-sql';
 import { createProductionSchema, seedV6MemberUser } from './fixtures/production-schema';
-import { artifactIdentityKey, reserveArtifactPath } from './artifact-registry';
+import { artifactIdentityKey, findArtifactBinding, reserveArtifactPath } from './artifact-registry';
 import { bookFilename } from './book-file-name';
 import { artifactContentsUrl, locateTaskArtifact } from './artifact-locator';
 
@@ -177,6 +177,20 @@ describe('artifact registry: real local Postgres and mock private GitHub', () =>
     expect(await claim()).toBe(await claim());
     await expect(claim('identity-a', 2)).rejects.toMatchObject({ code: 'ARTIFACT_IDENTITY_CONFLICT' });
     await expect(claim('identity-b', 2)).resolves.toBeTypeOf('number');
+  });
+
+  // covgap41 §4.8 阻断修复：换源重下前按 identityKey 查既有落位，命中即回旧行的仓。
+  it('finds the existing binding by identity+book, and only for the same labeled book', async () => {
+    await claim('identity-a', 1, 'books/collision.txt');
+    expect(await findArtifactBinding(sql, { identityKey: 'identity-a', labeledBookId: 1 })).toEqual({
+      repositoryId: 1, branch: 'release/a', canonicalPath: 'books/collision.txt',
+    });
+    // 无此身份 / 身份挂在别的书 id：均返回 null（不改绑他书）。
+    expect(await findArtifactBinding(sql, { identityKey: 'identity-zz', labeledBookId: 1 })).toBeNull();
+    expect(await findArtifactBinding(sql, { identityKey: 'identity-a', labeledBookId: 2 })).toBeNull();
+    // 非法输入与坏行防御。
+    await expect(findArtifactBinding(sql, { identityKey: '', labeledBookId: 1 })).rejects.toThrow('INVALID_ARTIFACT_INPUT');
+    await expect(findArtifactBinding(sql, { identityKey: 'identity-a', labeledBookId: -1 })).rejects.toThrow('INVALID_ARTIFACT_INPUT');
   });
 
   it.each(['enabled=false', 'is_private=false', 'read_only=true', 'sealed_at=now()'])('refuses writes when %s', async setting => {

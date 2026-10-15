@@ -41,16 +41,24 @@ export interface RolloverWiringInput {
   logicalBytes: bigint;
   /** 既有绑定（可信、已 published）；缺失时省略，交给决策判定。 */
   existingBinding?: ExistingBinding;
+  /**
+   * 同书既有 artifact 落位（identity_key 唯一约束下的旧行）：命中且行 canonicalPath 与本次
+   * 一致时，把决策 current 重定向到旧行的仓——reserveArtifactPath 的 ON CONFLICT 只在四字段
+   * 与旧行一致时放行幂等更新，缺省 current（切仓后的装配仓）会撞 identity 冲突。旧仓不可写
+   * （sealed/read_only/disabled/不在候选）时不重定向，维持缺省 current 走既有决策与失败路径。
+   */
+  existingArtifactBinding?: { repositoryId: number; branch: string; canonicalPath: string };
 }
 
 export interface RolloverStayOutcome {
   kind: 'stay';
-  /** 沿用原仓：元组与闭包均不变，闭包工厂入参等于 current。 */
+  /** 决策仓元组：正常沿用输入 current 原引用；既有 artifact 绑定重定向时为旧行的仓。 */
   target: RepositoryTuple;
   /** 决策所依据的账目快照版本（供预留层核对，stale 即拒）。 */
   snapshotVersion: string;
   logicalBytesToReserve: bigint;
-  needsClosureRebuild: false;
+  /** true 仅当 current 被既有 artifact 绑定重定向（≠装配闭包，须重建 GitHubContents）。 */
+  needsClosureRebuild: boolean;
 }
 
 export interface RolloverSwitchOutcome {
@@ -111,6 +119,22 @@ export async function decideRepositoryForPublication(
     // 证据端口故障 = 容量未知：维持既有失败路径（上抛），不退化为「照旧写旧仓」。
     throw new RolloverWiringEvidenceError((error as Error)?.message?.slice(0, 120));
   }
+  // 既有 artifact 落位优先（清污换源重下）：identity_key 唯一约束已把这本书的落位钉在旧行，
+  // 同仓落位 = reserveArtifactPath 幂等更新；canonicalPath 不一致属对账异常，不重定向。
+  let decisionCurrent = input.current;
+  let redirected = false;
+  if (input.existingArtifactBinding) {
+    const binding = input.existingArtifactBinding;
+    const match = binding.canonicalPath === input.canonicalPath
+      ? candidates.find(candidate => candidate.id === binding.repositoryId
+        && candidate.branch === binding.branch
+        && candidate.enabled && !candidate.readOnly && !candidate.sealed)
+      : undefined;
+    if (match) {
+      decisionCurrent = { id: match.id, owner: match.owner, repo: match.repo, branch: match.branch };
+      redirected = true;
+    }
+  }
   let plan;
   try {
     plan = planRepositoryRollover({
@@ -119,7 +143,7 @@ export async function decideRepositoryForPublication(
       blobSha: input.blobSha,
       canonicalPath: input.canonicalPath,
       logicalBytes: input.logicalBytes,
-      currentRepositoryId: input.current.id,
+      currentRepositoryId: decisionCurrent.id,
       candidates,
       existingBinding: input.existingBinding,
       now,
@@ -130,14 +154,15 @@ export async function decideRepositoryForPublication(
     throw new RolloverWiringBlockedError('CAPACITY_UNKNOWN', code);
   }
   if (plan.kind === 'stay') {
-    // 同一性按 tupleMatches 判据核对（注册表大小写可以不同）；stay 回传**输入 current 原引用**，
-    // 不把候选的大小写变体带出去重建闭包——闭包引用不变，调用方零重建。
-    if (!sameRepository(plan.target, input.current)) {
+    // 同一性按 tupleMatches 判据核对（注册表大小写可以不同）；stay 回传**决策 current 原引用**，
+    // 不把候选的大小写变体带出去重建闭包——正常路径闭包引用不变，调用方零重建；
+    // 既有 artifact 绑定重定向时 target ≠ 装配闭包，置 needsClosureRebuild=true 交调用方重建。
+    if (!sameRepository(plan.target, decisionCurrent)) {
       throw new RolloverWiringBlockedError('CAPACITY_UNKNOWN', 'stay target drifted from current');
     }
     return {
-      kind: 'stay', target: input.current, snapshotVersion: plan.snapshotVersion,
-      logicalBytesToReserve: plan.logicalBytesToReserve, needsClosureRebuild: false,
+      kind: 'stay', target: decisionCurrent, snapshotVersion: plan.snapshotVersion,
+      logicalBytesToReserve: plan.logicalBytesToReserve, needsClosureRebuild: redirected,
     };
   }
   if (plan.kind === 'switch') {

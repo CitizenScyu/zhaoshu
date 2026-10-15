@@ -17,6 +17,7 @@ import {
   type TaskRow, type WorkerOptions, type WorkerStorage,
 } from './download-worker';
 import { artifactIdentityKey } from './artifact-registry';
+import { snapshotPaths } from './download-publisher';
 import type { RepositoryCandidate, RepositoryTuple } from '../../runtime-download/repository-rollover';
 
 const NOW = new Date('2026-10-08T04:00:00.000Z');
@@ -105,6 +106,7 @@ function fixture(seam: PublicationRolloverSeam | undefined) {
     finish: vi.fn<WorkerStorage['finish']>().mockResolvedValue(true),
     defer: vi.fn<WorkerStorage['defer']>().mockResolvedValue(null),
     reserveArtifactPath: vi.fn<WorkerStorage['reserveArtifactPath']>().mockResolvedValue(11),
+    findArtifactBinding: vi.fn<WorkerStorage['findArtifactBinding']>().mockResolvedValue(null),
     registerArtifact: vi.fn<WorkerStorage['registerArtifact']>().mockResolvedValue('registered'),
   };
   const assembly = new TaggedGitHub('assembly:repo-1');
@@ -214,5 +216,41 @@ describe('capacity986 download-worker 切仓决策消费点（合成端口）', 
     expect(options.github).toBe(assembly);
     expect(options.repositoryId).toBe(1);
     expect(options.branch).toBe('main');
+  });
+
+  // covgap41 §4.8 阻断修复端到端：同书旧 artifact 钉在旧仓（切仓前登记），换源重下成功后
+  // 发布必须回旧仓落位（reserveArtifactPath 的 ON CONFLICT 四字段同值幂等更新），
+  // 否则 identity_key 冲突把成功下载烧成终态 failed。
+  it('e. 既有 artifact 绑定：旧仓 eligible ⇒ reserve 落旧仓 + 闭包重建到旧仓；装配仓闭包零调用', async () => {
+    const full = candidate({ id: 1, registered: TARGET_BYTES }); // 装配仓已满
+    const old = candidate({ id: 3, registered: BigInt(10) });    // 旧 artifact 所在仓
+    const { seam: rolloverSeam, rebuilt, rebuildTargets } = makeSeam([[full, old]]);
+    const { storage, assembly, run } = fixture(rolloverSeam);
+    const { canonicalPath } = snapshotPaths(task.title, task.author);
+    storage.findArtifactBinding.mockResolvedValue({
+      repositoryId: 3, branch: 'main', canonicalPath,
+    });
+    const result = await run();
+    expect(result.terminal).toBe('done');
+    expect(storage.reserveArtifactPath).toHaveBeenCalledWith(expect.objectContaining({
+      repositoryId: 3, branch: 'main', canonicalPath,
+    }));
+    expect(rebuildTargets).toEqual([{ id: 3, owner: 'citizen', repo: 'repo-3', branch: 'main' }]);
+    expect(rebuilt[0].calls.some(call => call.op === 'put')).toBe(true);
+    expect(assembly.calls).toHaveLength(0);
+  });
+
+  it('f. 既有 artifact 绑定不存在 ⇒ findArtifactBinding 返回 null，行为与修复前逐字一致', async () => {
+    const { seam: rolloverSeam, rebuilt } = makeSeam([[candidate({ id: 1, registered: BigInt(10) })]]);
+    const { storage, run } = fixture(rolloverSeam);
+    const result = await run();
+    expect(result.terminal).toBe('done');
+    expect(storage.findArtifactBinding).toHaveBeenCalledWith({
+      identityKey: artifactIdentityKey(task.title, task.author), labeledBookId: task.book_id,
+    });
+    expect(storage.reserveArtifactPath).toHaveBeenCalledWith(expect.objectContaining({
+      repositoryId: 1, branch: 'main',
+    }));
+    expect(rebuilt).toHaveLength(0);
   });
 });

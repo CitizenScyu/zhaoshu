@@ -106,6 +106,7 @@ function memoryStorage() {
     // 合成书源永远可达,不该走到退避放回(41-EXEC-SRCUNAVAIL 的 defer);真走到就记下来,由用例①断言兜住。
     defer: async (_lease, input) => { state.deferred = input; return '2026-09-24T03:15:00.000Z'; },
     reserveArtifactPath: async () => 7,
+    findArtifactBinding: async () => null,
     registerArtifact: async () => 'registered' as const,
   };
   return { storage, state };

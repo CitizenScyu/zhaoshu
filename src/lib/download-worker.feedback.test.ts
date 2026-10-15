@@ -48,6 +48,7 @@ function fixture(adapter: SourceAdapter, taskTimeoutMs = 600_000) {
     finish: vi.fn<WorkerStorage['finish']>().mockResolvedValue(true),
     defer: vi.fn<WorkerStorage['defer']>().mockResolvedValue(null),
     reserveArtifactPath: vi.fn<WorkerStorage['reserveArtifactPath']>().mockResolvedValue(1),
+    findArtifactBinding: vi.fn<WorkerStorage['findArtifactBinding']>().mockResolvedValue(null),
     registerArtifact: vi.fn<WorkerStorage['registerArtifact']>().mockResolvedValue('registered'),
   };
   const github = {

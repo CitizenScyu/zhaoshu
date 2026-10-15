@@ -190,4 +190,49 @@ describe('capacity985 rollover wiring（合成端口）', () => {
     expect(outcome.snapshotVersion).toBe('v1');
     expect(outcome.target.id).toBe(2);
   });
+
+  // covgap41 §4.8（ARTIFACT_IDENTITY_CONFLICT 阻断修复）：identity_key 唯一约束把同书落位
+  // 钉在旧行的仓；切仓后的装配期 current 不再撞墙，而是被既有落位重定向回旧仓。
+  it('既有 artifact 落位命中 ⇒ 决策 current 重定向到旧行的仓（stay + needsClosureRebuild）', async () => {
+    const old = candidate({ id: 3, repo: 'repo-3', registered: BigInt(100) });
+    const currentFull = candidate({ id: 1, registered: BigInt(900_000_000), reserved: BigInt(100_000_000) });
+    const outcome = await decideRepositoryForPublication(port([currentFull, old]), {
+      ...wiringInput({ logicalBytes: BigInt(1) }),
+      existingArtifactBinding: {
+        repositoryId: 3, branch: 'main', canonicalPath: snapshotPaths('测试书', '作者').canonicalPath,
+      },
+    });
+    // 装配仓（id 1）明明已满，但既有落位在仓 3：重定向优先，stay 到仓 3 且须重建闭包。
+    expect(outcome).toEqual({
+      kind: 'stay', target: { id: 3, owner: 'citizen', repo: 'repo-3', branch: 'main' },
+      snapshotVersion: 'v1', logicalBytesToReserve: BigInt(1), needsClosureRebuild: true,
+    });
+  });
+
+  it('既有落位的仓不可写（sealed）⇒ 不重定向，维持缺省 current 走既有决策', async () => {
+    const sealedOld = candidate({ id: 3, repo: 'repo-3', sealed: true });
+    const current = candidate({ id: 1, registered: BigInt(100) });
+    const outcome = await decideRepositoryForPublication(port([current, sealedOld]), {
+      ...wiringInput({ logicalBytes: BigInt(1) }),
+      existingArtifactBinding: {
+        repositoryId: 3, branch: 'main', canonicalPath: snapshotPaths('测试书', '作者').canonicalPath,
+      },
+    });
+    expect(outcome.kind).toBe('stay');
+    if (outcome.kind !== 'stay') return;
+    expect(outcome.target).toBe(CURRENT);
+    expect(outcome.needsClosureRebuild).toBe(false);
+  });
+
+  it('既有落位 canonicalPath 与本次不一致 ⇒ 不重定向（对账异常留给 reserve 冲突诊断）', async () => {
+    const current = candidate({ id: 1, registered: BigInt(100) });
+    const outcome = await decideRepositoryForPublication(port([current]), {
+      ...wiringInput({ logicalBytes: BigInt(1) }),
+      existingArtifactBinding: { repositoryId: 1, branch: 'main', canonicalPath: 'books/其他路径/index.json' },
+    });
+    expect(outcome.kind).toBe('stay');
+    if (outcome.kind !== 'stay') return;
+    expect(outcome.target).toBe(CURRENT);
+    expect(outcome.needsClosureRebuild).toBe(false);
+  });
 });

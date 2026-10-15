@@ -85,6 +85,8 @@ export interface WorkerStorage {
   defer(lease: DownloadTaskLease, input: { delayMs: number; error?: string }): Promise<string | null>;
   /** T2 发布对账的 DB 前置：写前登记路径声明。 */
   reserveArtifactPath(input: { labeledBookId: number; identityKey: string; repositoryId: number; branch: string; canonicalPath: string }): Promise<number>;
+  /** 查同书既有 artifact 落位（identity_key 唯一）：换源重下时发布决策回旧行的仓。 */
+  findArtifactBinding(input: { identityKey: string; labeledBookId: number }): Promise<{ repositoryId: number; branch: string; canonicalPath: string } | null>;
   /** DB 阶段收口：登记已发布产物并把任务指向 artifact_id。 */
   registerArtifact(lease: DownloadTaskLease, input: {
     artifactId: number; version: string; blobSha: string; bytes: number;
@@ -410,13 +412,20 @@ export async function runDownloadTask(
     // capacity986 切仓决策消费点：在 reserveArtifactPath 之前、且在把 github/repositoryId/branch
     // 交给本次发布之前。决策输入与发布器同源：identityKey 全量 hash、git blob sha40（与
     // publishBookVersion 内部 gitBlobSha 同口径）、logicalBytes = 整本 UTF-8 字节（十进制）。
-    // existingBinding 在本调用栈无可信已发布证据，按模块合同省略（交给决策判定）。
+    // existingBinding（reuse 语义）在本调用栈无可信已发布证据，按模块合同省略；同书既有
+    // artifact 落位改走 existingArtifactBinding 重定向（见下方）。
     // 局部变量承接本次发布目标：装配期常量（options.github/repositoryId/branch 与 rollover.current）
     // 只读，一次 switch 不污染后续任务（后续任务仍从装配期常量重新决策）。
     let publishGithub = github;
     let publishRepositoryId = repositoryId;
     let publishBranch = branch;
     if (options.rollover) {
+      // 既有 artifact 落位优先（covgap41 §4.8 阻断修复）：identity_key 唯一约束已把同书落位
+      // 钉在旧行（切仓前的仓）；缺省 current 会在切仓后让成功下载撞 identity 冲突终态 failed。
+      // 命中旧行时由 wiring 把决策 current 重定向到旧行的仓（同仓幂等更新）。
+      const existingBinding = await storage.findArtifactBinding({
+        identityKey, labeledBookId: task.book_id,
+      });
       const plan = await decideRepositoryForPublication(options.rollover.port, {
         current: options.rollover.current,
         labeledBookId: task.book_id,
@@ -424,14 +433,16 @@ export async function runDownloadTask(
         blobSha: gitBlobSha(outcome.txt),
         canonicalPath,
         logicalBytes: BigInt(Buffer.byteLength(outcome.txt, 'utf8')),
+        ...(existingBinding ? { existingArtifactBinding: existingBinding } : {}),
       });
       if (plan.needsClosureRebuild) {
-        // switch：换整闭包（重建 GitHubContents + repositoryId/branch），非只换 DB id。
+        // switch 或既有 artifact 重定向：换整闭包（重建 GitHubContents + repositoryId/branch），
+        // 非只换 DB id。
         publishGithub = options.rollover.rebuildGitHubContents(plan.target);
         publishRepositoryId = plan.target.id;
         publishBranch = plan.target.branch;
       }
-      // stay：闭包与元组维持装配期原引用，零重建零行为变化。
+      // 正常 stay：闭包与元组维持装配期原引用，零重建零行为变化。
     }
     const artifactId = await storage.reserveArtifactPath({
       labeledBookId: task.book_id,

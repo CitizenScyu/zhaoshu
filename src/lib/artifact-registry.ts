@@ -26,6 +26,43 @@ export function artifactIdentityKey(title: string, author: string): string {
   return createHash('sha256').update(canonicalBookKey(title, author)).digest('hex');
 }
 
+/** 既有 artifact 落位（identity_key 全局唯一下的同书绑定）。 */
+export interface ArtifactBindingRow {
+  repositoryId: number;
+  branch: string;
+  canonicalPath: string;
+}
+
+export interface FindArtifactBindingInput {
+  /** 与 reserveArtifactPath 同一口径的全量 identity hash。 */
+  identityKey: string;
+  labeledBookId: number;
+}
+
+/**
+ * 查同书的既有 artifact 落位（只读）。换源重下（清污）时发布决策据此回旧行的仓：
+ * reserveArtifactPath 的 ON CONFLICT 只在 labeled_book_id/repository/branch/canonical_path
+ * 四者与既有行一致时放行幂等更新；切仓后的装配期仓不满足 ⇒ 成功下载终态 failed。
+ */
+export async function findArtifactBinding(
+  sql: ReturnType<typeof neon>,
+  input: FindArtifactBindingInput,
+): Promise<ArtifactBindingRow | null> {
+  if (!input.identityKey || input.identityKey.includes('\0')
+    || !Number.isSafeInteger(input.labeledBookId) || input.labeledBookId <= 0) throw new Error('INVALID_ARTIFACT_INPUT');
+  const rows = await sql`
+    SELECT repository_id, branch, canonical_path FROM book_artifacts
+    WHERE identity_key = ${input.identityKey} AND labeled_book_id = ${input.labeledBookId}
+    LIMIT 1` as { repository_id: number | string; branch: string; canonical_path: string }[];
+  const row = rows[0];
+  if (!row) return null;
+  const repositoryId = Number(row.repository_id);
+  if (!Number.isSafeInteger(repositoryId) || repositoryId <= 0 || !row.branch || !row.canonical_path) {
+    throw new Error('INVALID_ARTIFACT_BINDING_ROW');
+  }
+  return { repositoryId, branch: row.branch, canonicalPath: row.canonical_path };
+}
+
 /**
  * T3 pre-write seam. Persist the path claim BEFORE any GitHub PUT. Identity is unique
  * because this table holds one canonical location per book, not snapshot history.
