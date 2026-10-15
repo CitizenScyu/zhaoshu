@@ -13,6 +13,7 @@ import { build } from 'esbuild';
 import { cpSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
+import { createRequire } from 'node:module';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { wireDownloadExecutor } from './runtime-download-template.mjs';
@@ -51,7 +52,18 @@ if (!existsSync(prefetchEntryPath)) throw new Error('PREFETCH_ENTRY_MISSING');
 rmSync(buildDir, { recursive: true, force: true });
 mkdirSync(dirname(executorOut), { recursive: true });
 
-// 1) esbuild：绑定层 + T3 + 引擎模块 → 单文件 ESM（无 loader、无别名）。
+// dlfail42 根因：cheerio 链在 pnpm 锁文件里解析到 css-select@5.1.0 + nth-check@2.0.1（CJS-only），
+// Node ESM / esbuild node-mode 互操作把 `import getNCheck from "nth-check"` 的 default 绑成
+// namespace 对象 ⇒ 任何 `:nth-*` 伪类选择器编译即抛（book.qq TOC `ul:nth-of-type(2)` 速败根因，
+// 池内 75 个源的规则含 nth 伪类）。顶层 css-select@5.2.2 + nth-check@2.1.1（真 ESM default）组合正常。
+// 构建时把 cheerio 链的 css-select 重定向到顶层 5.2.2；正路修复（pnpm override 重装）受共享
+// node_modules 约束暂缓，见 follow-up。
+const require = createRequire(import.meta.url);
+const cssSelectDir = resolve(require.resolve('css-select'), '../..');
+if (!/css-select$/.test(cssSelectDir)) throw new Error(`css-select 别名解析异常：${cssSelectDir}`);
+const SELECTOR_FIX_ALIAS = { 'css-select': cssSelectDir };
+
+// 1) esbuild：绑定层 + T3 + 引擎模块 → 单文件 ESM（无 loader）。
 const esbuildOptions = {
   bundle: true,
   format: 'esm',
@@ -59,6 +71,7 @@ const esbuildOptions = {
   target: 'node24',
   tsconfig: join(repoRoot, 'tsconfig.json'),
   external: [NEON_DEP],
+  alias: SELECTOR_FIX_ALIAS,
   logLevel: 'warning',
   banner: {
     // 让被打进来的 CJS 依赖（cheerio/entities 等）在 ESM 里拿到 require。
@@ -75,6 +88,13 @@ await build({
   outfile: prefetchExecutorOut,
   ...esbuildOptions,
 });
+
+// dlfail42 门禁：别名没生效时 cheerio 链会打回 nth-check@2.0.1（CJS-only，nth 伪类互操作坏副本）。
+for (const bundle of [executorOut, prefetchExecutorOut]) {
+  if (readFileSync(bundle, 'utf8').includes('nth-check@2.0.1')) {
+    throw new Error(`nth-check 互操作坏副本打进 bundle：${bundle}（css-select 别名未生效）`);
+  }
+}
 
 // 2) 拷贝 shell（用 T7 的目录形态：runtime/service + runtime/lib + runtime/timer + docs）。
 cpSync(join(shellDir, 'service'), join(runtimeOut, 'service'), { recursive: true });

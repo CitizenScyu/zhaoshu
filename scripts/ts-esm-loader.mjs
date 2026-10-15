@@ -52,6 +52,13 @@ export function resolve(specifier, context, nextResolve) {
     const url = resolveFile(fileURLToPath(new URL(specifier, context.parentURL)));
     if (url) return { url, shortCircuit: true };
   }
+  // dlfail42：pnpm 锁文件里 cheerio 链解析到 nth-check@2.0.1（CJS-only），Node ESM 对它的
+  // default 导入拿到 namespace 对象 ⇒ cheerio 里所有 `:nth-*` 伪类选择器编译即抛。
+  // 裸 'nth-check' 一律重定向到顶层 2.1.1 的 ESM 入口（真 default 导出；API 兼容）。
+  if (specifier === 'nth-check') {
+    const esm = resolvePath(REPO_ROOT, 'node_modules', 'nth-check', 'lib', 'esm', 'index.js');
+    try { if (statSync(esm).isFile()) return { url: pathToFileURL(esm).href, shortCircuit: true }; } catch { /* 落回默认解析 */ }
+  }
   return nextResolve(specifier, context);
 }
 
