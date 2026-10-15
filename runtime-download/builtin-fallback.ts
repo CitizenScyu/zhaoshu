@@ -113,12 +113,22 @@ const isIdentityMiss = (outcome: AdapterOutcome): boolean =>
   outcome.kind === 'failure' && outcome.code === 'identity_mismatch_or_no_candidate';
 
 /**
+ * 付费墙预览截断（vipwall42）：源可达、正文非空但全是 ~250 字 VIP 预览，同源重试不可能变好
+ * （付费墙恒定）——必须换源，不能像 missing_chapters 那样退避重试原源死循环 16 轮。
+ * builtin 原源与引擎腿同判：原源 preview_truncated 触发引擎回退；引擎腿 preview_truncated
+ * 标 temporary 失败记忆后换下一源（temporary 而非 permanent：该源此书在付费墙，同源其他书未必）。
+ */
+const isPreviewTruncated = (outcome: AdapterOutcome) =>
+  outcome.kind === 'incomplete' && outcome.reason === 'preview_truncated';
+
+/**
  * download-worker incomplete 枚举里稳定的源级 reason（download-worker.ts 归类）：
  * source_unavailable / missing_chapters / toc_changed / operation_timeout——单源问题，标 temporary 后换源。
  * budget_exhausted / interrupted 是任务层停止：不标失败、不换源；白名单外的未知 incomplete 同样
- * 不标失败、不换源（不归因给该源）。物理 host 门拒绝（retryCause）不在此列：绝不标失败。
+ * 不标失败、不换源（不归因给该源）。preview_truncated 属源级（见 isPreviewTruncated）。
+ * 物理 host 门拒绝（retryCause）不在此列：绝不标失败。
  */
-const SOURCE_LEVEL_INCOMPLETE_REASONS = new Set(['source_unavailable', 'missing_chapters', 'toc_changed', 'operation_timeout']);
+const SOURCE_LEVEL_INCOMPLETE_REASONS = new Set(['source_unavailable', 'missing_chapters', 'toc_changed', 'operation_timeout', 'preview_truncated']);
 
 /** 回退源全部失败时回给任务层的结论：同 book15 不可达（退避放回 pending）。 */
 const unavailable = (stage: string): AdapterOutcome =>
@@ -287,8 +297,10 @@ export function createBuiltinFallback(options: BuiltinFallbackOptions) {
      * - complete 即收；任务层停止（budget_exhausted/interrupted）不标失败、不换源，按原分类收口；
      * - 物理 host 门拒绝（retryCause）：绝不 markFailure——host_occupied 换下一已记录源，
      *   host_occupancy_unavailable 立即收口不再试；
-     * - kind='failure' 或四 reason 源级 incomplete ⇒ 标失败记忆（identity ⇒ permanent，其余 temporary）
+     * - kind='failure' 或源级 incomplete（source_unavailable / missing_chapters / toc_changed /
+     *   operation_timeout / preview_truncated）⇒ 标失败记忆（identity ⇒ permanent，其余 temporary）
      *   后换下一个源；白名单外的未知 incomplete 不标失败、不换源；未知异常按原语义上抛。
+     *   builtin 原源 preview_truncated 同样触发回退（见 isPreviewTruncated）。
      * 全部候选失败回 book15 的 source_unavailable 退避语义（不落 failed）。
      */
     wrapAdapter(builtin: SourceAdapter, engine: SourceAdapter, kind: SourceAdapter['kind'] = 'builtin'): SourceAdapter {
@@ -324,7 +336,8 @@ export function createBuiltinFallback(options: BuiltinFallbackOptions) {
               primary = await (kind === 'engine' ? engine : builtin).download(task, context);
               stop = stopped(context.signal);
               if (stop) return stop;
-              if (!isSourceUnavailable(primary) && !isIdentityMiss(primary)) return primary;
+              // preview_truncated（原源是付费墙预览）：不 return primary——同源重试无意义，改走引擎回退换免费源。
+              if (!isSourceUnavailable(primary) && !isIdentityMiss(primary) && !isPreviewTruncated(primary)) return primary;
               // 930 确认点 2：原源被物理门拒绝（host_occupied / host_occupancy_unavailable）按原
               // 可重试分类收口，不触发扫池——“host 正被占用”对选新源的出网请求同样生效。
               if (primary.kind === 'incomplete' && primary.retryCause) return primary;

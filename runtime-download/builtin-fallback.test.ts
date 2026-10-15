@@ -285,6 +285,43 @@ describe('41-T8FB builtin-fallback', () => {
     expect(calls).toEqual(['book15.net', 'a.example']);
   });
 
+  // vipwall42：付费墙预览截断 partial 不得像 missing_chapters 那样退避重试原源（付费墙恒定，
+  // 16 轮全在同源重抓预览）；必须触发引擎回退换免费源。
+  it('vipwall42：builtin 原源 preview_truncated ⇒ 不直通 partial，改走引擎回退并成功', async () => {
+    const h = harness({ pool: ['https://a.example/', 'https://b.example/'] });
+    const truncated: AdapterOutcome = { kind: 'incomplete', reason: 'preview_truncated', chaptersTotal: 2000, chaptersDone: 2000, charsTotal: 300000 };
+    const calls: string[] = [];
+    const out = await h.fallback.wrapAdapter(adapter({ 'book15.net': truncated }, calls), adapter({ 'a.example': {
+      kind: 'complete', txt: 'x', chaptersTotal: 1, chaptersDone: 1, charsTotal: 1,
+    } }, calls)).download(task(), context());
+    expect(out.kind).toBe('complete');
+    expect(calls).toEqual(['book15.net', 'a.example']);
+  });
+
+  it('vipwall42：引擎腿 preview_truncated ⇒ 标 temporary 失败记忆并换下一候选源', async () => {
+    const state = {
+      usable: [
+        { source_url: 'https://engine-a.example/b1', host: 'engine-a.example' },
+        { source_url: 'https://engine-b.example/b1', host: 'engine-b.example' },
+      ],
+      stored: [] as [number, string[]][], failures: [] as [number, string, string, string][],
+    };
+    const h = candidatesHarness(state);
+    const engineTask = task({ source_kind: 'engine', source_url: 'https://origin.example/rules' });
+    expect(await h.fallback.wrapPrecheck(async () => UNAVAILABLE)(engineTask, signal()))
+      .toEqual({ ok: true, reason: 'engine_source_candidates' });
+    const truncated: AdapterOutcome = { kind: 'incomplete', reason: 'preview_truncated', chaptersTotal: 2000, chaptersDone: 2000, charsTotal: 300000 };
+    const calls: string[] = [];
+    const out = await h.fallback.wrapAdapter(adapter({ 'origin.example': truncated }, calls), adapter({
+      'engine-a.example': truncated,
+      'engine-b.example': { kind: 'complete', txt: 'x', chaptersTotal: 1, chaptersDone: 1, charsTotal: 1 },
+    }, calls), 'engine').download(engineTask, context());
+    expect(out.kind).toBe('complete');
+    // 既有语义：有持久化候选时跳过原引擎源（origin.example 不试），按候选逐源。
+    expect(calls).toEqual(['engine-a.example', 'engine-b.example']);
+    expect(state.failures).toContainEqual([1, 'https://engine-a.example/b1', 'temporary', 'preview_truncated']);
+  });
+
   it('engine 任务有持久化候选时优先复用候选，不调用原预检并按候选逐源切换', async () => {
     const state = {
       usable: [
