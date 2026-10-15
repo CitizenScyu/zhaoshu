@@ -275,7 +275,9 @@ maybe('41-T8FB：builtin 任务 book15 不可达时回退引擎源池', () => {
     // 第 1 次退避 1h（长曲线起点），不是旧版的 15m。
     expect(state.delay_ms).toBe(HOUR);
     expect(w.logs.find(line => line.message === '书源不可达')?.fields).toMatchObject({ reason: 'no_candidates', host: 'book15.net' });
-    expect(w.searched).toEqual(['listwrong.example', 'detailwrong.example']);
+    // authbridge42：listwrong 的书名命中被作者门过滤掉 ⇒ 过滤后 0 命中 ⇒ 补一轮作者名搜索（同 host 第二次）；
+    // detailwrong 列表无作者（命中留下）⇒ hits.length>0 直接短路，不补搜。
+    expect(w.searched).toEqual(['listwrong.example', 'listwrong.example', 'detailwrong.example']);
     expect(w.downloaded).toEqual([]);
     expect(w.budget.used()).toBe(0);
     expect(github.files.size).toBe(0);
