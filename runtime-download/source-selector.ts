@@ -2,7 +2,7 @@ import { identityMatches } from '../scripts/engine-download.mjs';
 import { normalizeBookTitle } from '../src/lib/book-identity';
 import { isHostSuspect, isPaywallHost } from '../src/lib/source-host-health';
 import { sourceAbortable } from '../src/lib/source-fetch';
-import { pageContext, type Transport } from './identity-precheck';
+import { authorSearchKey, pageContext, type Transport } from './identity-precheck';
 
 type Identity = { title?: string; author?: string };
 type SearchHit = { title?: string; author?: string; bookUrl: string };
@@ -61,6 +61,16 @@ const isOccupancyUnavailable = (error: unknown): boolean =>
   typeof error === 'object' && error !== null
   && (error as { code?: unknown }).code === 'HOST_OCCUPANCY_UNAVAILABLE';
 
+/** 作者轮候选按 bookUrl 去重：镜像站常把同一本书重复挂三条链接（书名/图片/阅读入口），不去重白烧出网额度。 */
+function dedupeBookUrls(hits: SearchHit[]): SearchHit[] {
+  const seen = new Set<string>();
+  return hits.filter(hit => {
+    if (typeof hit?.bookUrl !== 'string' || seen.has(hit.bookUrl)) return false;
+    seen.add(hit.bookUrl);
+    return true;
+  });
+}
+
 export function createSourceSelector(options: SourceSelectorOptions): SourceSelector {
   const modules = options.modules as Modules;
   const transport = options.transport as Transport;
@@ -69,6 +79,10 @@ export function createSourceSelector(options: SourceSelectorOptions): SourceSele
   const timeoutMs = options.timeoutMs ?? 30_000;
   const builtinHosts = new Set(modules.supported.BUILTIN_SOURCE_HOSTS);
 
+  // authbridge42：书名轮收 0 后的作者名回退轮。QQ 系书在镜像站按通行书名收录（队列名「少年羽皇」vs
+  // 站名「帝临鸿蒙」），书名搜索天然失配，是生产 0 候选率 96.6% 的结构性根因；qqmirror42 出网实测
+  // 作者名搜索 5/6 命中，作者名是可靠桥接键。这一轮不按书名过滤（过滤等于把回退作废），候选逐个过
+  // 详情页身份门才算数；scanned 语义不变——它记的是探测的源数，不是出网请求数。
   const sourceHasBook = async (source: PoolSource, task: SourceSelectionTask, signal: AbortSignal): Promise<boolean> => {
     signal.throwIfAborted();
     const engine = {
@@ -82,6 +96,16 @@ export function createSourceSelector(options: SourceSelectorOptions): SourceSele
       typeof hit.title === 'string' && normalizeBookTitle(hit.title) === title
       && (!hit.author?.trim() || identityMatches(hit, hit, task)));
     for (const hit of hits.slice(0, 2)) {
+      signal.throwIfAborted();
+      if (identityMatches(await modules.api.engineFetchDetail(engine, hit.bookUrl, context), hit, task)) return true;
+    }
+    if (hits.length) return false;
+    if (!authorSearchKey(task.title, task.author)) return false;
+    // 搜索本身不 catch：宿主占用门失效（HOST_OCCUPANCY_UNAVAILABLE）必须照旧上抛 fail-closed，
+    // 被这里吞掉会变成「这个源没书」而继续扫全池。
+    const authorHits = dedupeBookUrls(await modules.api.engineSearchBook(engine, task.author, context));
+    // 每源至多 2 次详情，与书名轮同档：全池扫描（scanLimit 可达数百）下作者轮把每源出网翻到 4 次已是显著放大。
+    for (const hit of authorHits.slice(0, 2)) {
       signal.throwIfAborted();
       if (identityMatches(await modules.api.engineFetchDetail(engine, hit.bookUrl, context), hit, task)) return true;
     }

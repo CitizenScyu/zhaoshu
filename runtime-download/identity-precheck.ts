@@ -18,6 +18,7 @@
 //   MAX_PRECHECK_CANDIDATES 且前面的都对不上）⇒ { ok: true, reason: 'identity_unverified' }，放行，由下载器按原路径处理。
 
 import { identityMatches, isSourceUnavailableError } from '../scripts/engine-download.mjs';
+import { knownSourceAuthor, normalizeSourceTitle, sourceBookMatches } from '../src/lib/source-parser';
 import { sourceAbortable } from '../src/lib/source-fetch';
 import type { TaskRow } from '../src/lib/download-worker';
 import type { PrecheckHook, PrecheckResult } from './executor';
@@ -34,6 +35,7 @@ interface Modules {
   parser: {
     sourceSearchUrl(searchUrl: unknown, title: string, base: string): string;
     parseSourceSearch(text: string, url: string, title: string): string[];
+    parseSourceDetailLinks(text: string, url: string, expectedTitle?: string): string[];
     parseSourceIdentity(text: string): Identity;
   };
   api: {
@@ -83,6 +85,17 @@ export function pageContext(transport: Transport, signal: AbortSignal, timeoutMs
   };
 }
 
+/**
+ * authbridge42：作者名回退轮的搜索键。归一后为空（作者缺失/佚名/未知）时返回 ''，调用方据此不触发；
+ * 作者与书名归一后同键时同样返回 ''——否则等于把同一个搜索原样再发一遍，白花一次出网。
+ * 与阅读侧 source-reader 的 engineAuthorSearchPending 同判据；选源器（source-selector）也调这一份，
+ * 保证「同源同判」。QQ 系书在镜像站按通行书名收录、书名搜索天然失配，这是 0 候选的结构性根因。
+ */
+export function authorSearchKey(title: string, author: string): string {
+  const key = knownSourceAuthor(author);
+  return key && key !== normalizeSourceTitle(title) ? key : '';
+}
+
 export function createIdentityPrecheck(options: IdentityPrecheckOptions): PrecheckHook {
   const m = options.modules as Modules;
   const transport = options.transport as Transport;
@@ -93,22 +106,50 @@ export function createIdentityPrecheck(options: IdentityPrecheckOptions): Preche
     const ctx = pageContext(transport, signal, timeoutMs);
     const { source, builtin } = await options.resolveSource(m, task.source_url, signal) as Resolved;
     const engine = builtin ? null : { url: source.url, name: source.name, searchUrl: source.searchUrl, compiled: m.compile.compileSource(source) };
-    let candidates: Candidate[];
+    const detailOf = async (candidate: Candidate): Promise<Identity> => builtin
+      ? m.parser.parseSourceIdentity((await ctx.page(candidate.bookUrl)).text)
+      : await m.api.engineFetchDetail(engine, candidate.bookUrl, ctx);
+    const matchesAny = async (candidates: Candidate[]): Promise<boolean> => {
+      progress.stage = 'detail';
+      for (const candidate of candidates.slice(0, MAX_PRECHECK_CANDIDATES)) {
+        if (identityMatches(await detailOf(candidate), candidate, task)) return true;
+      }
+      return false;
+    };
+
     progress.stage = 'search';
+    let candidates: Candidate[];
     if (builtin) {
       const page = await ctx.page(m.parser.sourceSearchUrl(source.searchUrl, task.title, source.url));
       candidates = m.parser.parseSourceSearch(page.text, page.url, task.title).map(bookUrl => ({ bookUrl }));
     } else {
       candidates = await m.api.engineSearchBook(engine, task.title, ctx);
     }
-    progress.stage = 'detail';
-    for (const candidate of candidates.slice(0, MAX_PRECHECK_CANDIDATES)) {
-      const detail = builtin
-        ? m.parser.parseSourceIdentity((await ctx.page(candidate.bookUrl)).text)
-        : await m.api.engineFetchDetail(engine, candidate.bookUrl, ctx);
-      if (identityMatches(detail, candidate, task)) return true;
+    if (await matchesAny(candidates)) return true;
+    // 超过上限没看完就不下结论，也不再补搜：搜索本来就不完整时加一轮作者，只会把「没看完」伪装成
+    // 「都看过且都对不上」，把放行变成错拦。
+    if (candidates.length > MAX_PRECHECK_CANDIDATES) return null;
+
+    // authbridge42 作者名回退轮（搜索键判据与选源器共用 authorSearchKey，同源同判）。这一轮**不按书名
+    // 过滤**——镜像站按通行书名收录，按书名过滤等于把回退作废；候选靠详情页身份门认。
+    if (!authorSearchKey(task.title, task.author)) return false;
+    // 书名搜索里已经出现过书名匹配行时不做作者回退（与阅读侧 engineAuthorSearchPending 同判据）：
+    // 那种形态的失败是身份冲突不是改名，回退会用作者名把真实的同名异作者冲突盖过去。
+    if (candidates.some(c => typeof c.title === 'string'
+      && sourceBookMatches({ title: task.title, author: '' }, { title: c.title, author: '' }))) return false;
+    progress.stage = 'search';
+    let authorCandidates: Candidate[];
+    if (builtin) {
+      const page = await ctx.page(m.parser.sourceSearchUrl(source.searchUrl, task.author, source.url));
+      const urls = /^\/books\/details\d+\.html$/.test(new URL(page.url).pathname)
+        ? [page.url]
+        : m.parser.parseSourceDetailLinks(page.text, page.url, task.title);
+      authorCandidates = urls.map(bookUrl => ({ bookUrl }));
+    } else {
+      authorCandidates = await m.api.engineSearchBook(engine, task.author, ctx);
     }
-    return candidates.length > MAX_PRECHECK_CANDIDATES ? null : false;
+    if (await matchesAny(authorCandidates)) return true;
+    return authorCandidates.length > MAX_PRECHECK_CANDIDATES ? null : false;
   };
 
   return async (task, signal): Promise<PrecheckResult> => {

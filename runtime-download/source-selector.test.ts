@@ -13,12 +13,13 @@ type Detail = { title?: string; author?: string };
 function harness(opts: {
   pool?: string[];
   poolThrows?: 'sync' | 'async';
-  search?: (url: string) => Hit[] | Promise<Hit[]>;
+  search?: (url: string, key: string) => Hit[] | Promise<Hit[]>;
   detail?: (bookUrl: string) => Detail;
   suspect?: string[];
   builtinHosts?: string[];
 }) {
   const searchedUrls: string[] = [];
+  const searchKeys: string[] = [];
   const detailUrls: string[] = [];
   const poolLoads: number[] = [];
   const logs: Array<{ level: 'info' | 'error'; message: string; fields?: Record<string, unknown> }> = [];
@@ -28,9 +29,10 @@ function harness(opts: {
       supported: { BUILTIN_SOURCE_HOSTS: opts.builtinHosts ?? ['book15.net', 'www.book15.net'] },
       api: {
         // 非 async：让 search 能同步 throw（穿透到 sourceHasBook 成 rejection）。
-        engineSearchBook: (engine: { url: string }) => {
+        engineSearchBook: (engine: { url: string }, key: string) => {
           searchedUrls.push(engine.url);
-          return opts.search?.(engine.url) ?? [{ title: TASK.title, author: TASK.author, bookUrl: `${engine.url}b/1` }];
+          searchKeys.push(key);
+          return opts.search?.(engine.url, key) ?? [{ title: TASK.title, author: TASK.author, bookUrl: `${engine.url}b/1` }];
         },
         engineFetchDetail: (_engine: unknown, bookUrl: string) => {
           detailUrls.push(bookUrl);
@@ -50,7 +52,7 @@ function harness(opts: {
     isSuspect: (host: string) => opts.suspect?.includes(host) ?? false,
     log: (level, message, fields) => logs.push({ level, message, fields }),
   });
-  return { selector, searchedUrls, detailUrls, poolLoads, logs };
+  return { selector, searchedUrls, searchKeys, detailUrls, poolLoads, logs };
 }
 
 const request = (over: Partial<SourceSelectionRequest> = {}): SourceSelectionRequest => ({
@@ -330,5 +332,119 @@ describe('共用选源器', () => {
     const sync = harness({ poolThrows: 'sync' });
     expect(await sync.selector(request({ scanBudget: budget }), freshSignal())).toEqual({ picked: [], scanned: 0 });
     expect(budget.remaining).toBe(2);
+  });
+
+  // authbridge42：QQ 系书在镜像站按通行书名收录（队列名「少年羽皇」vs 站名「帝临鸿蒙」），
+  // 书名搜索天然失配；作者名是可靠桥接键（qqmirror42 实测 5/6 命中）。这一组只钉**接线**——
+  // 什么时候补搜、搜什么 key、详情门怎么把关、出网怎么封顶——判据本体不在这里动。
+  describe('authbridge42 作者名回退轮', () => {
+    const task = { id: 21, title: '测试书', author: '测试作者' };
+    const byKey = (titleHits: Hit[], authorHits: Hit[]) =>
+      (_url: string, key: string) => (key === '测试作者' ? authorHits : titleHits);
+
+    it('书名轮收 0 才补搜作者名，详情门对上即算该源有书', async () => {
+      const h = harness({
+        pool: ['https://a.example/'],
+        search: byKey([], [{ title: '测试书', author: '测试作者', bookUrl: 'https://a.example/author-hit' }]),
+        detail: () => ({ title: '测试书', author: '测试作者' }),
+      });
+      expect((await h.selector(request({ task, targetHits: 1 }), freshSignal())).picked).toEqual(['https://a.example/']);
+      expect(h.searchKeys).toEqual(['测试书', '测试作者']);
+      expect(h.detailUrls).toEqual(['https://a.example/author-hit']);
+    });
+
+    it('作者轮候选逐个过详情门：全对不上就不 picked', async () => {
+      const h = harness({
+        pool: ['https://a.example/'],
+        search: byKey([], [
+          { title: '别的书', author: '测试作者', bookUrl: 'https://a.example/w1' },
+          { title: '也别的', author: '测试作者', bookUrl: 'https://a.example/w2' },
+        ]),
+        detail: () => ({ title: '别的书', author: '测试作者' }),
+      });
+      expect((await h.selector(request({ task }), freshSignal())).picked).toEqual([]);
+      expect(h.detailUrls).toEqual(['https://a.example/w1', 'https://a.example/w2']);
+    });
+
+    it('作者轮每源至多 2 次详情，且重复 bookUrl 只算一条', async () => {
+      const h = harness({
+        pool: ['https://a.example/'],
+        search: byKey([], [
+          { title: '测试书', author: '测试作者', bookUrl: 'https://a.example/c1' },
+          { title: '测试书', author: '测试作者', bookUrl: 'https://a.example/c1' },
+          { title: '测试书', author: '测试作者', bookUrl: 'https://a.example/c2' },
+          { title: '测试书', author: '测试作者', bookUrl: 'https://a.example/c3' },
+        ]),
+        detail: () => ({ title: '测试书', author: '别人' }),
+      });
+      expect((await h.selector(request({ task }), freshSignal())).picked).toEqual([]);
+      expect(h.detailUrls).toEqual(['https://a.example/c1', 'https://a.example/c2']);
+    });
+
+    it('作者归一后为空（缺失/佚名/未知）不触发回退：一次搜索不多打', async () => {
+      for (const author of ['', '佚名', '未知', '未知作者']) {
+        const h = harness({ pool: ['https://a.example/'], search: () => [] });
+        expect((await h.selector(request({ task: { ...task, author } }), freshSignal())).picked).toEqual([]);
+        expect(h.searchKeys).toEqual(['测试书']);
+      }
+    });
+
+    it('作者与书名同键不触发回退：否则等于把同一个搜索原样再发一遍', async () => {
+      const h = harness({ pool: ['https://a.example/'], search: () => [] });
+      expect((await h.selector(request({ task: { ...task, author: '测试书' } }), freshSignal())).picked).toEqual([]);
+      expect(h.searchKeys).toEqual(['测试书']);
+    });
+
+    it('书名轮已有命中时不补搜：命中但详情不过说明是身份问题不是改名', async () => {
+      const h = harness({
+        pool: ['https://a.example/'],
+        search: byKey([{ title: '测试书', author: '测试作者', bookUrl: 'https://a.example/d1' }], [
+          { title: '测试书', author: '测试作者', bookUrl: 'https://a.example/author-hit' },
+        ]),
+        detail: () => ({ title: '测试书', author: '别人' }),
+      });
+      expect((await h.selector(request({ task }), freshSignal())).picked).toEqual([]);
+      expect(h.searchKeys).toEqual(['测试书']);
+      expect(h.detailUrls).toEqual(['https://a.example/d1']);
+    });
+
+    it('scanned 口径不变：作者轮多出的出网不计入 scanned，也不额外扣扫描余额', async () => {
+      const pool = ['https://a.example/', 'https://b.example/', 'https://c.example/'];
+      const h = harness({ pool, search: byKey([], [{ title: '别的书', author: '测试作者', bookUrl: 'https://x.example/w' }]) });
+      const scanBudget = { remaining: 3 };
+      expect(await h.selector(request({ task, scanBudget }), freshSignal())).toEqual({ picked: [], scanned: 3 });
+      expect(scanBudget.remaining).toBe(0);
+      // 每源两次搜索（书名 + 作者），scanned 仍是 3：scanned 是「探测的源数」不是「HTTP 请求数」。
+      expect(h.searchKeys).toHaveLength(6);
+    });
+
+    it('宿主占用门在作者轮失效照样上抛 fail-closed，不被吞成「这个源没书」', async () => {
+      const h = harness({
+        pool: ['https://a.example/', 'https://b.example/'],
+        search: (_url, key) => key === '测试作者'
+          ? Promise.reject(Object.assign(new Error('gate'), { code: 'HOST_OCCUPANCY_UNAVAILABLE' }))
+          : [],
+      });
+      await expect(h.selector(request({ task }), freshSignal())).rejects.toMatchObject({ code: 'HOST_OCCUPANCY_UNAVAILABLE' });
+      // a 源打了两次（书名 + 作者）就上抛，b 源从未进入——门失效后不许继续扫全池。
+      expect(h.searchedUrls).toEqual(['https://a.example/', 'https://a.example/']);
+      expect(h.searchKeys).toEqual(['测试书', '测试作者']);
+    });
+
+    it('别名书在现行 identityMatches 下仍不命中（authbridge42 不放宽判据；判据一改这里就是要翻的用例）', async () => {
+      // 镜像站详情页形态实测（authbridge42-probe：leesven.com/leebook/4877.html）：
+      // og:novel:book_name=帝临鸿蒙、og:novel:author=为尹染墨红尘、全文无「原书名」标记 ⇒ 无 alias。
+      // 书名直等不过 ⇒ 当前判据下作者轮救不了别名书。这条用例把现状钉死，避免接线被误读成已修好。
+      const aliasTask = { id: 22, title: '少年羽皇', author: '为尹染墨红尘' };
+      const h = harness({
+        pool: ['https://www.leesven.com/'],
+        search: (_url, key) => key === '为尹染墨红尘'
+          ? [{ title: '帝临鸿蒙', author: '为尹染墨红尘', bookUrl: 'https://www.leesven.com/leebook/4877.html' }]
+          : [],
+        detail: () => ({ title: '帝临鸿蒙', author: '为尹染墨红尘' }),
+      });
+      expect((await h.selector(request({ task: aliasTask }), freshSignal())).picked).toEqual([]);
+      expect(h.detailUrls).toEqual(['https://www.leesven.com/leebook/4877.html']);
+    });
   });
 });
