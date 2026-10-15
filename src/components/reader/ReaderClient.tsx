@@ -18,7 +18,7 @@ import { DEFAULT_READER_SETTINGS, indexProgressKey } from '@/lib/reader-preferen
 import type { ReaderSettings, ReaderTheme, ReadingPosition } from '@/lib/reader-preferences';
 import { useReader, partKey } from './useReader';
 import FeedbackPrompt from './FeedbackPrompt';
-import { isCurrentSource, useSourceFanout } from './useSourceFanout';
+import { isCurrentSource, useSourceFanout, findFirstSwitchableSource } from './useSourceFanout';
 import type { FanoutRow, ProbeCache, ServingSource } from './useSourceFanout';
 import { nextReadingPosition, previousReadingPosition } from '@/lib/reader-part-cache';
 import styles from './reader.module.css';
@@ -109,7 +109,7 @@ function ReaderSession({ session, from }: Props) {
   const {
     settings, reading, activePart, loading, flowing, failure, percent, notice, storageFailed, progressStorageFailed, settingsStorageFailed, focused,
     scroller, article, heading, onScroll, updateSettings, setFocusMode, navigate: requestNavigation,
-    extend, retry, markScrollIntent, setSection, loadConfirmedBook, registerSwitchCommitted,
+    extend, retry, markScrollIntent, setSection, loadConfirmedBook, registerSwitchCommitted, setNotice, switchedBookUrl,
   } = useReader(session, apiFetch, user?.id ?? 0, isReaderSessionCurrent);
   const [panel, setPanel] = useState<'directory' | 'settings' | 'sources' | null>(null);
   // 41-panel:扇出 probe 结果在本阅读会话内复用(关了面板再开不重复出网/计数);换账号时 ReaderSession 重挂即清。
@@ -218,6 +218,45 @@ function ReaderSession({ session, from }: Props) {
   // 注册函数是 hook 内部维护 ref 的稳定句柄(不是裸 ref),避免 react-hooks 的
   // React Compiler 规则判「修改 hook 返回值」error。
   useEffect(() => { registerSwitchCommitted(commitSwitchedBookUrl); }, [registerSwitchCommitted, commitSwitchedBookUrl]);
+
+  // readerux42-A 阅读中自动换源:正文/目录取失败(请求已落定,错误条已出现)时自动触发扇出检测,
+  // 取第一个可直切源走 loadConfirmedBook(进度经既有迁移逻辑尽量保留)。
+  // 纪律:每章(或目录)至多自动换一次 —— 第二次失败只提示、回落手动换源 UI,防多源连环失败死循环;
+  // SOURCE_SIMILAR(422)有自己的候选点选卡,歧义候选不自动替用户选;用户打开换源面板时在途自动
+  // 探测中止(面板有自己的扫描与同一 ProbeCache),让位给手动选择;开关默认开(阅读设置)。
+  const autoSwitchSeen = useRef<typeof failure>(null);
+  const autoSwitchTried = useRef<string | null>(null);
+  useEffect(() => {
+    if (!failure || failure === autoSwitchSeen.current) return;
+    autoSwitchSeen.current = failure;
+    if (session.kind !== 'source' || panel === 'sources') return;
+    if (failure.code === 'SOURCE_SIMILAR' || ![404, 422, 503, 504].includes(failure.status)) return;
+    if (!settings.autoSwitchSource) return;
+    // 确认路径(手动点选候选后的 book_url 重放)失败不自动换:候选是用户明确选的,自动重试同一
+    // 候选没有增量价值、还会与用户的再次点选叠成双份确认;回落「重试/换个书源」手动路径。
+    if (!failure.target && switchedBookUrl()) return;
+    const key = failure.target ? `${failure.target.chapterIndex}:${failure.target.partIndex}` : 'index';
+    if (autoSwitchTried.current === key) {
+      setNotice('本章已自动换过一次书源,不再自动重试;可点「换个书源」手动切换。');
+      return;
+    }
+    autoSwitchTried.current = key;
+    setNotice('本章打不开,正在尝试其他书源…');
+    const controller = new AbortController();
+    void findFirstSwitchableSource({
+      apiFetch, title: session.title, author: session.author, currentSource: servingSource, cache: probeCache, signal: controller.signal,
+    }).then((found) => {
+      if (controller.signal.aborted || !isReaderSessionCurrent()) return;
+      if (found) {
+        // 切换成功后的提示交给 useReader 的换源迁移 notice(「已切换书源,回到原进度」等),不重复播报。
+        loadConfirmedBook(found.bookUrl, found.sourceUrl);
+      } else {
+        setNotice('没有找到可直接切换的可用书源;可点「换个书源」手动检测。');
+      }
+    });
+    // 依赖里的 panel 变化(打开换源面板/其他面板)会中止在途自动探测;seen 守卫防止二次触发。
+    return () => controller.abort();
+  }, [failure, panel, session, settings.autoSwitchSource, apiFetch, probeCache, servingSource, loadConfirmedBook, isReaderSessionCurrent, setNotice, switchedBookUrl]);
 
   function toggleFocus(focusControl = false) {
     const next = !focused;
@@ -687,6 +726,10 @@ function Settings({ value, onChange }: { value: ReaderSettings; onChange: (value
         <legend>接着阅读</legend>
         <label className={styles.switchRow}><span>滚动自动接续<small>接近章末时载入后文</small></span><input type="checkbox" checked={value.continuous} onChange={(event) => onChange({ ...value, continuous: event.target.checked })} /></label>
         <label className={styles.switchRow}><span>提前载入下一处<small>减少翻章等待，省流量模式下自动暂停</small></span><input type="checkbox" checked={value.preloadNext} onChange={(event) => onChange({ ...value, preloadNext: event.target.checked })} /></label>
+      </fieldset>
+      <fieldset>
+        <legend>换源</legend>
+        <label className={styles.switchRow}><span>自动换源<small>正文打不开时自动切换可用书源，每章至多一次</small></span><input type="checkbox" checked={value.autoSwitchSource} onChange={(event) => onChange({ ...value, autoSwitchSource: event.target.checked })} /></label>
       </fieldset>
       <div className={styles.settingSample} style={{ fontSize: value.fontSize, lineHeight: value.lineHeight }}>掬一捧月色，<br />翻一页山河。</div>
       <button className={styles.locate} onClick={() => onChange({ ...DEFAULT_READER_SETTINGS })}>恢复默认设置</button>

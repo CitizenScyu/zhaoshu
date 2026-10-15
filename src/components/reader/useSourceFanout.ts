@@ -243,3 +243,50 @@ export function useSourceFanout({ apiFetch, title, author, currentSource, cache 
 
   return { ...state, rescan };
 }
+
+// ---- readerux42-A:阅读中自动换源 ----
+
+/** 自动换源可直接切换的命中源:bookUrl 喂给 loadConfirmedBook(进度走既有迁移逻辑)。 */
+export interface SwitchableSource { bookUrl: string; sourceUrl: string; sourceName: string }
+
+/**
+ * 顺序探测(并发 1)候选源,返回**第一个可直切**的源:只认 ok + readable + book.bookUrl 的精确
+ * 命中;similar(歧义候选)不自动替用户选,超时/未命中的源继续下一个。429/503/401/扇出未开
+ * (stop)一律放弃不烧限流额度,自动换源静默回落手动换源 UI。探测结论写入同一 ProbeCache,
+ * 用户随后打开换源面板时不再重复出网/计数。
+ */
+export async function findFirstSwitchableSource({ apiFetch, title, author, currentSource, cache, signal }: {
+  apiFetch: ApiFetch; title: string; author: string; currentSource?: ServingSource; cache: ProbeCache; signal: AbortSignal;
+}): Promise<SwitchableSource | null> {
+  let res: Response;
+  let data: unknown;
+  try {
+    res = await apiFetch('/api/read/source-probe', { signal, cache: 'no-store' });
+    data = await res.json().catch(() => null);
+  } catch { return null; }
+  if (signal.aborted) return null;
+  // 扇出未开(404 SOURCE_FANOUT_DISABLED)或旧部署无此路由、候选列表异常:静默放弃。
+  if (!res.ok) return null;
+  const candidates = parseCandidates(data);
+  if (!candidates) return null;
+  for (const source of candidates) {
+    if (signal.aborted) return null;
+    if (isCurrentSource(source, currentSource)) continue;
+    const key = probeCacheKey(title, author, source.url);
+    const cached = cache.get(key);
+    const outcome: Outcome = cached
+      ? { kind: 'result', result: cached }
+      : await probeOne(apiFetch, title, author, source, signal);
+    if (outcome.kind === 'aborted') return null;
+    // 限流/服务不可用/鉴权失效/扇出被关:立即放弃,不把剩余源的探测也发出去。
+    if (outcome.kind === 'stop') return null;
+    if (outcome.kind === 'failed') continue;
+    // 与 scan 同口径:超时不缓存(下次可重试),其余结论(含 miss)复用缓存。
+    if (outcome.result.status !== 'timeout') cache.set(key, outcome.result);
+    const book = outcome.result.readable && outcome.result.status === 'ok' ? outcome.result.book : undefined;
+    if (book?.bookUrl) {
+      return { bookUrl: book.bookUrl, sourceUrl: outcome.result.sourceUrl, sourceName: outcome.result.sourceName };
+    }
+  }
+  return null;
+}
