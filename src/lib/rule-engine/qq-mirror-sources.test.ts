@@ -11,14 +11,37 @@ import type { RawSource } from './compile-smoke';
 // 页面全部为 2026-10-16 出网实采（fixtures/qq-mirror/），本文件离线跑真实 HTML 断言。
 // 落盘形状是硬约束（src/lib/shuyuan.ts mergeIntoPool 只收：isRecord + bookSourceUrl 是 string +
 // normalizeUrl 非空 + cleanJson 过），所以文件必须是裸数组而不是对象包一层。
+// feed 只含 shidaxiaoshuo 一条：leesven 经主会话 2026-10-16 裁定不入池（无正文的转码展示站，
+// 见文件末尾「反面证据」一组用例——规则仍留在本文件里，用于证明它为什么进不了 pool）。
 
 const feed = JSON.parse(
   readFileSync(path.resolve(__dirname, '../../../public/qq-mirror-sources.json'), 'utf8'),
 ) as RawSource[];
 
-// 运行时 host 门常态只放内建集合；两站上线要靠 cron 准入批次把 ok 态 host 并进来
+// 主会话 2026-10-16 裁定不入池的候选源（转码展示站：目录页零章节、正文页回「章节内容缺失」）。
+// 它不在 feed 里；规则原样保留在本文件作为反面证据。
+const rejected = {
+  bookSourceName: '🔑猎神小说（QQ镜像·仅搜索）',
+  bookSourceUrl: 'https://leesven.com',
+  searchUrl: '/search/?searchkey={{key}}',
+  checkKeyWord: '绝品邪少',
+  ruleSearch: {
+    author: 'div.btm@tag.a@text',
+    bookList: 'div.l.rank@tag.div.item',
+    bookUrl: 'tag.dl@tag.dt@tag.a@href',
+    name: 'tag.dl@tag.dt@tag.a@text',
+  },
+  ruleBookInfo: {
+    author: '[property="og:novel:author"]@content',
+    name: 'id.info@tag.h1@text',
+  },
+  ruleToc: { chapterList: '', chapterName: 'text', chapterUrl: 'href' },
+  ruleContent: { content: '' },
+} as unknown as RawSource;
+
+// 运行时 host 门常态只放内建集合；源上线要靠 cron 准入批次把 ok 态 host 并进来
 // （refreshSupportedHosts，source-policy §6.1）。测试按同一入口开门，不绕过门本身。
-refreshSupportedHosts(feed.map((s) => new URL(String(s.bookSourceUrl)).hostname));
+refreshSupportedHosts([...feed, rejected].map((s) => new URL(String(s.bookSourceUrl)).hostname));
 
 const fixture = (name: string) => readFileSync(path.resolve(__dirname, 'fixtures/qq-mirror', name), 'utf8');
 
@@ -53,12 +76,10 @@ function context(pages: Map<string, string>): SourceRequestContext {
 }
 
 describe('feed 文件形状（mergeIntoPool 入池过滤条件）', () => {
-  it('是裸 JSON 数组，恰好两条源，bookSourceUrl 分属两站', () => {
+  it('是裸 JSON 数组，恰好一条源（shidaxiaoshuo）；leesven 已按裁定剔除', () => {
     expect(Array.isArray(feed)).toBe(true);
-    expect(feed.map((s) => s.bookSourceUrl).sort()).toEqual([
-      'https://leesven.com',
-      'https://www.shidaxiaoshuo.com',
-    ]);
+    expect(feed.map((s) => s.bookSourceUrl)).toEqual(['https://www.shidaxiaoshuo.com']);
+    expect(feed.some((s) => String(s.bookSourceUrl).includes('leesven'))).toBe(false);
   });
 
   it('每条都是 record、bookSourceUrl 是非空 string、且过 cleanJson/normalizeUrl 口径', () => {
@@ -99,8 +120,7 @@ describe('feed 文件形状（mergeIntoPool 入池过滤条件）', () => {
       expect(String(raw.checkKeyWord).trim().length).toBeGreaterThan(0);
       expect(Number(raw.lastUpdateTime)).toBeGreaterThan(0);
     }
-    // checkKeyWord 必须是本站确定收录的书名：lee=《绝品邪少》（作者陨落星辰），sdx=《唐朝诡事录》（作者魏风华）
-    expect(String(sourceOf('leesven.com').checkKeyWord)).toBe('绝品邪少');
+    // checkKeyWord 必须是本站确定收录的书名：sdx=《唐朝诡事录》（作者魏风华）
     expect(String(sourceOf('shidaxiaoshuo.com').checkKeyWord)).toBe('唐朝诡事录');
   });
 });
@@ -174,12 +194,23 @@ describe('shidaxiaoshuo.com 离线真实 HTML 断言', () => {
   });
 });
 
-describe('leesven.com 离线真实 HTML 断言（搜索段可用、正文段结构性缺失）', () => {
-  const raw = sourceOf('leesven.com');
-  const source = engineSource(raw);
-  const base = String(raw.bookSourceUrl);
+describe('反面证据：leesven.com 不入池（主会话 2026-10-16 裁定）', () => {
+  // 本组不读 feed，规则就地内联。存在的意义是：证明 leesven 搜索段虽能解析，但目录/正文结构性缺失，
+  // 按 compileAdmission 的 REQUIRED_FIELDS 必然被判不合格 → 永远进不了 supportedHosts 门 → 入池零价值。
+  const source = engineSource(rejected);
+  const base = String(rejected.bookSourceUrl);
 
-  it('搜索「绝品邪少」→ 候选非空，author 为作者名，bookUrl 指向 /leebook/', async () => {
+  it('feed 中确无 leesven 条目（裁定已落到交付物）', () => {
+    expect(feed.map((s) => String(s.bookSourceUrl))).not.toContain('https://leesven.com');
+  });
+
+  it('准入必填字段缺失：ruleToc.chapterList 与 ruleContent.content 为空 → 不可能通过 admission', () => {
+    expect(String(rejected.ruleToc?.chapterList)).toBe('');
+    expect(String(rejected.ruleContent?.content)).toBe('');
+    expect(String(rejected.ruleBookInfo?.tocUrl ?? '')).toBe('');
+  });
+
+  it('搜索「绝品邪少」→ 候选非空，author 为作者名，bookUrl 指向 /leebook/（仅搜索段可用）', async () => {
     const pages = new Map([[`${base}/search/?searchkey=${encodeURIComponent('绝品邪少')}`, fixture('leesven-search2.html')]]);
     const results = await engineSearchBook(source, '绝品邪少', context(pages));
     expect(results.length).toBe(3);
@@ -189,7 +220,7 @@ describe('leesven.com 离线真实 HTML 断言（搜索段可用、正文段结�
     expect(results.some((r) => r.author === '陨落星辰')).toBe(true);
   });
 
-  it('详情页 → name/author 取到（og:novel:author 与 h1 两条都可用）', async () => {
+  it('详情页 → name/author 取到（og:novel:author 与 h1 两条都可用），但无 tocUrl', async () => {
     const bookUrl = `${base}/leebook/1752.html`;
     const detail = await engineFetchDetail(source, bookUrl, context(new Map([[bookUrl, fixture('leesven-detail.html')]])));
     expect(detail.title).toBe('绝品邪少');
