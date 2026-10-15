@@ -182,26 +182,42 @@ describe('41-T5-IDENTITY 身份预检钩子', () => {
   });
 
   // authbridge42：镜像站按通行书名收录，标题搜索空、作者名才搜得到（书名 0 候选的结构性根因）。
-  // 这一组钉「补搜接线」；别名↔通行名的门不在这里动（判据本体冻结中，见 authbridge42-report.md §2）。
+  // 这一组钉「补搜接线 + B′ 门」（主会话 2026-10-15 裁定：作者门逐字过 且 候选去重后恰好 1 条）。
   describe('authbridge42 作者名回退轮', () => {
     /** 标题搜索空、作者搜索才有结果。pageTitle 可与任务书名不同（通行名形态）。 */
     function bridgeSite(author: string, pageTitle: string) {
+      return bridgeSiteMulti(author, [pageTitle]);
+    }
+
+    /** 同上，但作者搜索返回多本书（各占一个详情 URL）。 */
+    function bridgeSiteMulti(author: string, pageTitles: string[]) {
       vi.stubGlobal('fetch', () => { throw new Error('network forbidden'); });
       const calls: string[] = [];
-      const found = `<div class="list-item-panel"><h3><a href="${BOOK}">${pageTitle}</a></h3><a class="author">${author}</a></div>`
-        + `<li itemprop="mainEntity"><a itemprop="url" href="${BOOK}"><h2 itemprop="name">${pageTitle}</h2></a><p itemprop="author">${author}</p></li>`;
-      const detail = `<h1>${pageTitle}</h1><div class="d-info-panel"><a href="/author/1">${author}</a></div>`
-        + `<meta property="og:novel:book_name" content="${pageTitle}"><meta property="og:novel:author" content="${author}">`;
+      const bookUrl = (n: number) => `https://book15.net/books/details${n}.html`;
+      const row = (title: string, url: string) =>
+        `<div class="list-item-panel"><h3><a href="${url}">${title}</a></h3><a class="author">${author}</a></div>`
+        + `<li itemprop="mainEntity"><a itemprop="url" href="${url}"><h2 itemprop="name">${title}</h2></a><p itemprop="author">${author}</p></li>`;
+      const found = pageTitles.map((t, i) => row(t, bookUrl(i + 1))).join('');
+      const detailOf = (url: string) => {
+        const n = Number(/details(\d+)\.html$/.exec(url)?.[1] ?? '1') - 1;
+        const title = pageTitles[n] ?? pageTitles[0];
+        return `<h1>${title}</h1><div class="d-info-panel"><a href="/author/1">${author}</a></div>`
+          + `<meta property="og:novel:book_name" content="${title}"><meta property="og:novel:author" content="${author}">`;
+      };
       const transport = async (url: string) => {
         calls.push(url);
         if (url.includes('/search')) {
           const key = decodeURIComponent(new URL(url).searchParams.get('q') ?? '');
-          return { url, text: key === author ? found : '<div class="empty">没有找到</div>' };
+          return { url, text: key === author && pageTitles.length ? found : '<div class="empty">没有找到</div>' };
         }
-        if (url === BOOK) return { url, text: detail };
+        if (/^https:\/\/book15\.net\/books\/details\d+\.html$/.test(url)) return { url, text: detailOf(url) };
         throw new Error(`unexpected url ${url}`);
       };
-      return { calls, transport, searches: () => calls.filter(url => url.includes('/search')) };
+      return {
+        calls, transport,
+        searches: () => calls.filter(url => url.includes('/search')),
+        detailReads: () => calls.filter(url => !url.includes('/search')),
+      };
     }
 
     it.each([true, false])('builtin=%s 标题搜空时补搜作者名，详情门对上即 ok（两轮搜索各一次）', async builtin => {
@@ -211,19 +227,20 @@ describe('41-T5-IDENTITY 身份预检钩子', () => {
       expect(s.searches()).toHaveLength(2);
     });
 
-    it('作者轮候选详情页作者不符 ⇒ identity_mismatch（作者名只是桥接键，不等于认领）', async () => {
-      const s = bridgeSite('别人', '测试书');
-      expect(await precheckFor(s.transport)(task('测试书', '测试作者'))).toEqual(MISMATCH);
+    it('别名桥接（authbridge42 核心价值）：书名搜空 + 作者轮唯一候选作者门过 ⇒ ok', async () => {
+      // 实测形态（authbridge42-probe：leesven.com/leebook/4877.html）：og:novel:book_name=帝临鸿蒙、
+      // og:novel:author=为尹染墨红尘、全文无「原书名」⇒ 无 alias ⇒ sourceBookMatches 书名门不过，
+      // 靠 B′ 门的作者门 + 唯一性认出来——这正是 0 候选率 96.6% 的结构性修复点。
+      const s = bridgeSite('为尹染墨红尘', '帝临鸿蒙');
+      expect(await precheckFor(s.transport)(task('少年羽皇', '为尹染墨红尘'))).toEqual(MATCH);
       expect(s.searches()).toHaveLength(2);
     });
 
-    it('别名形态仍判 mismatch：详情页是通行名且无原书名标记，authbridge42 不放宽判据', async () => {
-      // 实测形态（authbridge42-probe：leesven.com/leebook/4877.html）：og:novel:book_name=帝临鸿蒙、
-      // og:novel:author=为尹染墨红尘、全文无「原书名」⇒ parseSourceIdentity 不产 alias ⇒ 书名门不过。
-      // 判据一改，这条用例就是要翻的那条。
-      const s = bridgeSite('为尹染墨红尘', '帝临鸿蒙');
-      expect(await precheckFor(s.transport)(task('少年羽皇', '为尹染墨红尘'))).toEqual(MISMATCH);
+    it('作者轮候选 >1（同作者多本）判 mismatch，且唯一性先于详情：不抓详情', async () => {
+      const s = bridgeSiteMulti('魏风华', ['诡事录1', '诡事录2', '诡事录3']);
+      expect(await precheckFor(s.transport)(task('大唐神探之长安诡案', '魏风华'))).toEqual(MISMATCH);
       expect(s.searches()).toHaveLength(2);
+      expect(s.detailReads()).toHaveLength(0);
     });
 
     it('作者归一后为空（缺失/佚名/未知）不补搜：搜索只打一次', async () => {

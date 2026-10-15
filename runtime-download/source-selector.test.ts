@@ -353,32 +353,43 @@ describe('共用选源器', () => {
       expect(h.detailUrls).toEqual(['https://a.example/author-hit']);
     });
 
-    it('作者轮候选逐个过详情门：全对不上就不 picked', async () => {
+    it('作者轮候选 >1（同作者多本）判不命中，且唯一性先于详情：一次详情都不打', async () => {
+      // shidaxiaoshuo 搜「魏风华」返回 3 本诡事录系列的形态：没有书名证据时认哪一本都是猜，
+      // 错配一本比 0 命中坏得多 ⇒ 先按去重后 bookUrl 数判唯一性，不合格就不进详情。
       const h = harness({
         pool: ['https://a.example/'],
         search: byKey([], [
-          { title: '别的书', author: '测试作者', bookUrl: 'https://a.example/w1' },
-          { title: '也别的', author: '测试作者', bookUrl: 'https://a.example/w2' },
+          { title: '诡事录1', author: '魏风华', bookUrl: 'https://a.example/w1' },
+          { title: '诡事录2', author: '魏风华', bookUrl: 'https://a.example/w2' },
         ]),
-        detail: () => ({ title: '别的书', author: '测试作者' }),
+        detail: () => ({ title: '诡事录1', author: '魏风华' }),
       });
       expect((await h.selector(request({ task }), freshSignal())).picked).toEqual([]);
-      expect(h.detailUrls).toEqual(['https://a.example/w1', 'https://a.example/w2']);
+      expect(h.detailUrls).toEqual([]);
     });
 
-    it('作者轮每源至多 2 次详情，且重复 bookUrl 只算一条', async () => {
+    it('作者轮候选按 bookUrl 去重后恰好 1 条才进详情（重复链接不算多本）', async () => {
       const h = harness({
         pool: ['https://a.example/'],
         search: byKey([], [
           { title: '测试书', author: '测试作者', bookUrl: 'https://a.example/c1' },
           { title: '测试书', author: '测试作者', bookUrl: 'https://a.example/c1' },
-          { title: '测试书', author: '测试作者', bookUrl: 'https://a.example/c2' },
-          { title: '测试书', author: '测试作者', bookUrl: 'https://a.example/c3' },
+          { title: '阅读测试书', author: '测试作者', bookUrl: 'https://a.example/c1' },
         ]),
-        detail: () => ({ title: '测试书', author: '别人' }),
+        detail: () => ({ title: '测试书', author: '测试作者' }),
+      });
+      expect((await h.selector(request({ task, targetHits: 1 }), freshSignal())).picked).toEqual(['https://a.example/']);
+      expect(h.detailUrls).toEqual(['https://a.example/c1']);
+    });
+
+    it('唯一候选但详情页作者门对不上 ⇒ 不 picked（作者名只是桥接键，不等于认领）', async () => {
+      const h = harness({
+        pool: ['https://a.example/'],
+        search: byKey([], [{ title: '别的书', author: '别人', bookUrl: 'https://a.example/w1' }]),
+        detail: () => ({ title: '别的书', author: '别人' }),
       });
       expect((await h.selector(request({ task }), freshSignal())).picked).toEqual([]);
-      expect(h.detailUrls).toEqual(['https://a.example/c1', 'https://a.example/c2']);
+      expect(h.detailUrls).toEqual(['https://a.example/w1']);
     });
 
     it('作者归一后为空（缺失/佚名/未知）不触发回退：一次搜索不多打', async () => {
@@ -431,10 +442,11 @@ describe('共用选源器', () => {
       expect(h.searchKeys).toEqual(['测试书', '测试作者']);
     });
 
-    it('别名书在现行 identityMatches 下仍不命中（authbridge42 不放宽判据；判据一改这里就是要翻的用例）', async () => {
-      // 镜像站详情页形态实测（authbridge42-probe：leesven.com/leebook/4877.html）：
-      // og:novel:book_name=帝临鸿蒙、og:novel:author=为尹染墨红尘、全文无「原书名」标记 ⇒ 无 alias。
-      // 书名直等不过 ⇒ 当前判据下作者轮救不了别名书。这条用例把现状钉死，避免接线被误读成已修好。
+    it('别名书桥接（authbridge42 核心价值）：书名搜不到，作者轮唯一候选 + 作者门过 ⇒ picked', async () => {
+      // 实测形态（authbridge42-probe：leesven.com/leebook/4877.html）：
+      // og:novel:book_name=帝临鸿蒙（通行名）、og:novel:author=为尹染墨红尘（与任务作者逐字一致）、
+      // 全文无「原书名」标记 ⇒ sourceBookMatches 的 alias 通道恒空，书名直等必不过。
+      // B′ 门靠作者门 + 唯一性把它认出来——这是 0 候选率 96.6% 的结构性修复点。
       const aliasTask = { id: 22, title: '少年羽皇', author: '为尹染墨红尘' };
       const h = harness({
         pool: ['https://www.leesven.com/'],
@@ -443,8 +455,17 @@ describe('共用选源器', () => {
           : [],
         detail: () => ({ title: '帝临鸿蒙', author: '为尹染墨红尘' }),
       });
-      expect((await h.selector(request({ task: aliasTask }), freshSignal())).picked).toEqual([]);
+      expect((await h.selector(request({ task: aliasTask, targetHits: 1 }), freshSignal())).picked)
+        .toEqual(['https://www.leesven.com/']);
+      expect(h.searchKeys).toEqual(['少年羽皇', '为尹染墨红尘']);
       expect(h.detailUrls).toEqual(['https://www.leesven.com/leebook/4877.html']);
+    });
+
+    it('作者门过但作者轮收 0 条 ⇒ 仍不 picked（作者名搜不到就是搜不到，不猜）', async () => {
+      const aliasTask = { id: 23, title: '少年羽皇', author: '为尹染墨红尘' };
+      const h = harness({ pool: ['https://www.leesven.com/'], search: () => [] });
+      expect((await h.selector(request({ task: aliasTask }), freshSignal())).picked).toEqual([]);
+      expect(h.detailUrls).toEqual([]);
     });
   });
 });

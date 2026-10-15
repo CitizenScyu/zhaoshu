@@ -18,7 +18,8 @@
 //   MAX_PRECHECK_CANDIDATES 且前面的都对不上）⇒ { ok: true, reason: 'identity_unverified' }，放行，由下载器按原路径处理。
 
 import { identityMatches, isSourceUnavailableError } from '../scripts/engine-download.mjs';
-import { knownSourceAuthor, normalizeSourceTitle, sourceBookMatches } from '../src/lib/source-parser';
+import { authorBridgeAccepts, authorBridgeCandidates, authorSearchKey } from '../src/lib/source-author-bridge';
+import { sourceBookMatches } from '../src/lib/source-parser';
 import { sourceAbortable } from '../src/lib/source-fetch';
 import type { TaskRow } from '../src/lib/download-worker';
 import type { PrecheckHook, PrecheckResult } from './executor';
@@ -86,16 +87,9 @@ export function pageContext(transport: Transport, signal: AbortSignal, timeoutMs
 }
 
 /**
- * authbridge42：作者名回退轮的搜索键。归一后为空（作者缺失/佚名/未知）时返回 ''，调用方据此不触发；
- * 作者与书名归一后同键时同样返回 ''——否则等于把同一个搜索原样再发一遍，白花一次出网。
- * 与阅读侧 source-reader 的 engineAuthorSearchPending 同判据；选源器（source-selector）也调这一份，
- * 保证「同源同判」。QQ 系书在镜像站按通行书名收录、书名搜索天然失配，这是 0 候选的结构性根因。
+ * authbridge42：作者名回退轮的搜索键与候选门都归到 src/lib/source-author-bridge（与选源器、
+ * 下载腿 scripts/engine-download.mjs 共用同一份），保证三处「同源同判」。
  */
-export function authorSearchKey(title: string, author: string): string {
-  const key = knownSourceAuthor(author);
-  return key && key !== normalizeSourceTitle(title) ? key : '';
-}
-
 export function createIdentityPrecheck(options: IdentityPrecheckOptions): PrecheckHook {
   const m = options.modules as Modules;
   const transport = options.transport as Transport;
@@ -152,8 +146,12 @@ export function createIdentityPrecheck(options: IdentityPrecheckOptions): Preche
     } else {
       authorCandidates = await m.api.engineSearchBook(engine, task.author, ctx);
     }
-    if (await matchesAny(authorCandidates)) return true;
-    return authorCandidates.length > MAX_PRECHECK_CANDIDATES ? null : false;
+    // B′ 门（与选源器、下载腿共用 authorBridgeAccepts）：候选按 bookUrl 去重后须恰好 1 条，
+    // 且该条详情页作者门逐字对上。候选 >1（同作者多本）判不命中——没有书名证据时认哪一本都是猜。
+    const authorHits = authorBridgeCandidates(authorCandidates);
+    if (authorHits.length !== 1) return false;
+    progress.stage = 'detail';
+    return authorBridgeAccepts(authorHits, await detailOf(authorHits[0]), task);
   };
 
   return async (task, signal): Promise<PrecheckResult> => {

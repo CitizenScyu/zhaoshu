@@ -3,6 +3,7 @@ import { mkdirSync, readFileSync, writeFileSync, renameSync, existsSync, openSyn
 import { resolve, join } from 'node:path';
 import { setTimeout as pause } from 'node:timers/promises';
 import { canonicalBookKey } from '../src/lib/book-identity.ts';
+import { authorBridgeAccepts, authorBridgeCandidates, authorSearchKey } from '../src/lib/source-author-bridge.ts';
 import { sourceBookMatches } from '../src/lib/source-parser.ts';
 import { fetchSourceText, sourceAbortable } from '../src/lib/source-fetch.ts';
 
@@ -165,6 +166,31 @@ export async function downloadBook(m, args, resolveSource, transport = fetchSour
         return m.parser.parseSourceIdentity((await ctx.page(candidate.bookUrl)).text);
       });
       if (identityMatches(detail, candidate, args)) { selected = { ...candidate, ...detail }; break; }
+    }
+    // authbridge42：书名候选全被拒后的作者名回退轮。QQ 系书在镜像站按通行书名收录（队列名「少年羽皇」
+    // vs 站名「帝临鸿蒙」），书名搜索天然失配 → 下载腿会把选源已命中的源又判成 0 候选
+    // （identity_mismatch_or_no_candidate → markFailure 淘汰），选源/预检的改动就白烧出网。
+    // 纯增量：书名路径逐字不变，只在书名候选一条都没选上时多跑一轮。
+    // B′ 门与选源器、预检共用 authorBridgeAccepts：候选按 bookUrl 去重后须恰好 1 条且详情页作者门逐字对上；
+    // 候选 >1（同作者多本，如 shidaxiaoshuo「魏风华」3 本诡事录系列）判不命中——没有书名证据时认哪一本都是猜。
+    if (!selected && authorSearchKey(args.title, args.author)) {
+      stage = 'search';
+      const authorHits = authorBridgeCandidates(await operation(async ctx => {
+        if (!builtin) return m.api.engineSearchBook(engine, args.author, ctx);
+        const page = await ctx.page(m.parser.sourceSearchUrl(source.searchUrl, args.author, source.url));
+        const urls = /^\/books\/details\d+\.html$/.test(new URL(page.url).pathname)
+          ? [page.url]
+          : m.parser.parseSourceDetailLinks(page.text, page.url, args.title);
+        return urls.map(bookUrl => ({ bookUrl }));
+      }));
+      if (authorHits.length === 1) {
+        stage = 'detail';
+        const detail = await operation(async ctx => {
+          if (!builtin) return m.api.engineFetchDetail(engine, authorHits[0].bookUrl, ctx);
+          return m.parser.parseSourceIdentity((await ctx.page(authorHits[0].bookUrl)).text);
+        });
+        if (authorBridgeAccepts(authorHits, detail, args)) selected = { ...authorHits[0], ...detail };
+      }
     }
     if (!selected) throw new Error('identity_mismatch_or_no_candidate');
     manifest.bookUrl = selected.bookUrl;

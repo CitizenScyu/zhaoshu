@@ -572,3 +572,80 @@ describe('vipwall42 付费墙预览截断识别', () => {
     expect(r.manifest.status).toBe('done');
   });
 });
+
+// authbridge42：下载腿作者名回退轮（主会话 2026-10-15 裁定扩范围到本文件）。
+// 背景：QQ 系别名书在镜像站按通行书名收录，选源/预检按作者名命中后，下载腿若仍只按书名搜，
+// 会把同一个源又判成 identity_mismatch_or_no_candidate → markFailure 淘汰，选源的改动等于白烧出网。
+describe('authbridge42 下载腿作者名回退轮', () => {
+  const bookUrl = (n: number) => `https://book15.net/books/details${n}.html`;
+  /** 标题搜索恒空、作者搜索返回 pageTitles 各占一个详情页（通行名形态）。pageAuthor 可与任务作者不同。 */
+  function aliasSetup(pageTitles: string[], pageAuthor: string, taskAuthor = '为尹染墨红尘', title = '少年羽皇') {
+    const out = mkdtempSync(join(tmpdir(), 'ab42-')); dirs.push(out);
+    const rules: Record<string, Record<string, string>> = {};
+    for (const [key, value] of Object.entries(fixtures[0].coreRules)) {
+      const [group, field] = key.split('.'); (rules[group] ??= {})[field] = value as string;
+    }
+    rules.ruleToc.nextTocUrl = '.next@href';
+    const source = { url: 'https://book15.net/', name: 'synthetic', searchUrl: '/search?q={{key}}', rules };
+    const options = downloadOptions({ source: source.url, title, author: taskAuthor, out, 'rate-ms': 0, 'timeout-ms': 1000 });
+    const calls: string[] = [];
+    const transport = async (url: string, opts: { signal: AbortSignal; beforeRequest?: (signal: AbortSignal) => Promise<void> }) => {
+      calls.push(url); await opts.beforeRequest?.(opts.signal);
+      if (url.includes('/search')) {
+        const key = decodeURIComponent(new URL(url).searchParams.get('q') ?? '');
+        if (key !== taskAuthor) return { url, text: '<div class="empty">没有找到</div>' };
+        return {
+          url,
+          text: pageTitles.map((t, i) =>
+            `<div class="list-item-panel"><h3><a href="${bookUrl(i + 1)}">${t}</a></h3><a class="author">${pageAuthor}</a></div>`
+            + `<li itemprop="mainEntity"><a itemprop="url" href="${bookUrl(i + 1)}"><h2 itemprop="name">${t}</h2></a><p itemprop="author">${pageAuthor}</p></li>`).join(''),
+        };
+      }
+      const n = Number(/details(\d+)\.html$/.exec(url)?.[1] ?? '1') - 1;
+      const pageTitle = pageTitles[n] ?? pageTitles[0];
+      if (/^https:\/\/book15\.net\/books\/details\d+\.html$/.test(url)) {
+        return {
+          url,
+          text: `<h1>${pageTitle}</h1><div class="d-info-panel"><a href="/author/1">${pageAuthor}</a></div>`
+            + `<meta property="og:novel:book_name" content="${pageTitle}"><meta property="og:novel:author" content="${pageAuthor}">`
+            + `<div class="d-chapter-list" id="full-catalog"><dd><a href="/read/1">第1章</a></dd></div>`,
+        };
+      }
+      return { url, text: '<li class="chapter-content" id="article-content"><p>合成正文。</p></li>' };
+    };
+    vi.stubGlobal('fetch', () => { throw new Error('network forbidden'); });
+    const run = () => downloadBook({ api, compile, parser }, options, async () => ({ source, builtin: false }), transport);
+    return { run, calls, options };
+  }
+
+  it('别名桥接：书名搜空 → 作者轮唯一候选 + 作者门过 ⇒ 真的下载完成', async () => {
+    const f = aliasSetup(['帝临鸿蒙'], '为尹染墨红尘');
+    const r = await f.run();
+    expect(r.code).toBe(0);
+    expect(r.manifest.status).toBe('done');
+    expect((r.manifest as { bookUrl?: string }).bookUrl).toBe(bookUrl(1));
+    // 书名搜索确实先打了一次且没结果，作者轮是补上去的。
+    expect(f.calls.filter(url => url.includes('/search')).length).toBe(2);
+  });
+
+  it('作者轮候选 >1（同作者多本）⇒ 仍 identity_mismatch_or_no_candidate，且不抓详情', async () => {
+    const f = aliasSetup(['诡事录1', '诡事录2'], '魏风华');
+    const r = await f.run();
+    expect(r.manifest.errors).toEqual(['identity_mismatch_or_no_candidate']);
+    expect(f.calls.filter(url => /details\d+\.html$/.test(url))).toEqual([]);
+  });
+
+  it('唯一候选但详情页作者门对不上 ⇒ identity_mismatch_or_no_candidate', async () => {
+    const f = aliasSetup(['帝临鸿蒙'], '别人');
+    const r = await f.run();
+    expect(r.manifest.errors).toEqual(['identity_mismatch_or_no_candidate']);
+    expect(f.calls.filter(url => /details\d+\.html$/.test(url))).toEqual([bookUrl(1)]);
+  });
+
+  it('纯增量：书名候选已选上时一次都不补搜', async () => {
+    const f = setup(0);
+    const r = await f.run();
+    expect(r.code).toBe(0);
+    expect(f.calls.filter(url => url.includes('/search'))).toHaveLength(1);
+  });
+});
