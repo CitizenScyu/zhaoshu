@@ -1,0 +1,90 @@
+[
+  {
+    "bookSourceName": "🔑十大小说（QQ镜像）",
+    "bookSourceUrl": "https://www.shidaxiaoshuo.com",
+    "bookSourceGroup": "QQ镜像;影视原著",
+    "bookSourceComment": "qqsrc42 出网实测：B 级可读站，搜索 GET /search/?searchkey=、UTF-8、无 WAF；详情 /book/{id}/、目录 /index/{id}/（分页 /index/{id}/2/）、正文 /read/{id}/{cid}.html。搜作者「魏风华」得《唐朝诡事录》3 本。",
+    "bookSourceType": 0,
+    "enabled": true,
+    "enabledExplore": false,
+    "exploreUrl": "",
+    "header": "{\"User-Agent\":\"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36\"}",
+    "loginUrl": "",
+    "lastUpdateTime": 1762627200000,
+    "checkKeyWord": "唐朝诡事录",
+    "searchUrl": "/search/?searchkey={{key}}",
+    "ruleExplore": {},
+    "ruleSearch": {
+      "author": "div.btm@tag.a@text",
+      "bookList": "div.ln-book-list@tag.div.item",
+      "bookUrl": "tag.dl@tag.dt@tag.a@href",
+      "intro": "tag.dl@tag.dd@text",
+      "kind": "",
+      "lastChapter": "",
+      "name": "tag.dl@tag.dt@tag.a@text"
+    },
+    "ruleBookInfo": {
+      "author": "div.ln-info-meta@tag.p.0@tag.a@text",
+      "coverUrl": "div.ln-cover@tag.img@data-original",
+      "intro": "div.ln-intro@text",
+      "kind": "div.ln-info-meta@tag.p.1@tag.a@text",
+      "lastChapter": "div.ln-info-meta@tag.p.3@tag.a@text",
+      "name": "div.ln-info-main@tag.h1@text",
+      "tocUrl": "div.ln-actions@tag.a.1@href"
+    },
+    "ruleContent": {
+      "content": "id.content@id.booktxt@html",
+      "nextContentUrl": ""
+    },
+    "ruleToc": {
+      "chapterList": "div.ln-chapter-grid@tag.a[href*='/read/']",
+      "chapterName": "text",
+      "chapterUrl": "href",
+      "nextTocUrl": "div.ln-chapter-pager@tag.a.index-container-btn.-1@href"
+    }
+  },
+  {
+    "bookSourceName": "🔑猎神小说（QQ镜像·仅搜索）",
+    "bookSourceUrl": "https://leesven.com",
+    "bookSourceGroup": "QQ镜像;搜索用",
+    "bookSourceComment": "qqsrc42 出网实测：A 级收录站。搜索 GET /search/?searchkey=、UTF-8、无反爬；作者名搜索命中率高（搜「陨落星辰」得《帝临鸿蒙》等）。但本站是搜索引擎转码展示站：/leeindex/{id}/ 目录页不输出章节链接、/leeread/{id}/{cid}.html 正文页回「章节内容缺失或章节不存在」，footer 自述「不保存小说内容及数据，仅作宣传展示」⇒ 只能作候选发现站，取不到正文。仅搜索段规则有值。",
+    "bookSourceType": 0,
+    "enabled": true,
+    "enabledExplore": false,
+    "exploreUrl": "",
+    "header": "{\"User-Agent\":\"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36\"}",
+    "loginUrl": "",
+    "lastUpdateTime": 1762627200000,
+    "checkKeyWord": "绝品邪少",
+    "searchUrl": "/search/?searchkey={{key}}",
+    "ruleExplore": {},
+    "ruleSearch": {
+      "author": "div.btm@tag.a@text",
+      "bookList": "div.l.rank@tag.div.item",
+      "bookUrl": "tag.dl@tag.dt@tag.a@href",
+      "intro": "tag.dl@tag.dd@text",
+      "kind": "",
+      "lastChapter": "",
+      "name": "tag.dl@tag.dt@tag.a@text"
+    },
+    "ruleBookInfo": {
+      "author": "[property=\"og:novel:author\"]@content",
+      "coverUrl": "[property=\"og:image\"]@content",
+      "intro": "id.intro@text",
+      "kind": "[property=\"og:novel:category\"]@content",
+      "lastChapter": "[property=\"og:novel:latest_chapter_name\"]@content",
+      "name": "id.info@tag.h1@text",
+      "tocUrl": ""
+    },
+    "ruleContent": {
+      "content": "",
+      "nextContentUrl": ""
+    },
+    "ruleToc": {
+      "chapterList": "",
+      "chapterName": "text",
+      "chapterUrl": "href",
+      "nextTocUrl": ""
+    }
+  }
+]
