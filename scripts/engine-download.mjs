@@ -13,7 +13,7 @@ const atomic = (path, data) => {
   try { writeFileSync(fd, data); fsyncSync(fd); } finally { closeSync(fd); }
   renameSync(temp, path);
 };
-const knownError = /^(identity_mismatch_or_no_candidate|empty_toc|empty_toc_page|pagination_cycle|toc_limit|unsupported_toc_rule|invalid_chapter|invalid_next_page|empty_content_page|content_page_limit|unsupported_content_rule|max_chapters|size_limit|toc_changed|missing_chapters|interrupted|budget_exhausted|operation_timeout|empty_content)$/;
+const knownError = /^(identity_mismatch_or_no_candidate|empty_toc|empty_toc_page|pagination_cycle|toc_limit|unsupported_toc_rule|invalid_chapter|invalid_next_page|empty_content_page|content_page_limit|unsupported_content_rule|max_chapters|size_limit|toc_changed|missing_chapters|preview_truncated|interrupted|budget_exhausted|operation_timeout|empty_content)$/;
 const isLimiterFeedbackError = error => error?.code === 'LIMITER_FEEDBACK_UNAVAILABLE'
   && error?.origin === 'limiter-feedback';
 const isHostGateError = error => error?.code === 'HOST_OCCUPIED'
@@ -220,6 +220,14 @@ export async function downloadBook(m, args, resolveSource, transport = fetchSour
     stage = 'toc';
     if (hash(JSON.stringify(await toc())) !== manifest.tocHash) throw new Error('toc_changed');
     if (manifest.chapters.some(c => c.status !== 'done')) throw new Error('missing_chapters');
+    // vipwall42：付费墙预览识别（4393 实证：阅文系 chuangshi/yunqi 对 VIP 章返回 ~250-350 字预览文本，
+    // 引擎当正常章存为 done，全书 done 后晋升发布——448 本 done 里 75 本章均 <500 字、书仓已发布 96 本）。
+    // 判据：done 章字符数中位数 < 500 且章数 ≥ 50（免费章 2000+ 字、预览 ~250；小书短章不判，免误伤）。
+    // 触发时按 preview_truncated partial 收口（零发布），16 轮退避换源重试免费源。
+    {
+      const doneChars = manifest.chapters.filter(c => c.status === 'done').map(c => c.chars).sort((a, b) => a - b);
+      if (doneChars.length >= 50 && doneChars[Math.floor(doneChars.length / 2)] < 500) throw new Error('preview_truncated');
+    }
     const txt = manifest.chapters.map(c => `${c.title}\n\n${readFileSync(join(dir, c.file), 'utf8')}\n\n`).join('');
     atomic(join(dir, 'book.txt'), txt);
     manifest.artifact = { file: 'book.txt', sha256: hash(txt), bytes: Buffer.byteLength(txt) };

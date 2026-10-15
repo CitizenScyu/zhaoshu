@@ -527,3 +527,37 @@ describe('物理 host 占位门拒绝透传', () => {
     expect(result.manifest.chapters[0].error).toBe('chapter_failed');
   });
 });
+
+describe('vipwall42 付费墙预览截断识别', () => {
+  const bigCatalog = (n: number) => `<div class="d-chapter-list" id="full-catalog">${Array.from({ length: n }, (_, i) => `<dd><a href="/read/${i + 1}">第${i + 1}章</a></dd>`).join('')}</div>`;
+  const previewText = '预'.repeat(280);
+  const fullText = '正'.repeat(2200);
+  const wrap = (f: ReturnType<typeof setup>, catalogChapters: number, body: string) => async (url: string, opts: { signal: AbortSignal; beforeRequest?: (s: AbortSignal) => Promise<void> }) => {
+    if (url.includes('/search')) return { url, text: `<div class="list-item-panel"><h3><a href="https://book15.net/books/details1.html">测试书</a></h3><a class="author">作者甲</a></div>` };
+    if (url === 'https://book15.net/books/details1.html') {
+      return { url, text: `<h1>测试书</h1><div class="d-info-panel"><a href="/author/1">作者甲</a></div><meta property="og:novel:book_name" content="测试书"><meta property="og:novel:author" content="作者甲">` + bigCatalog(catalogChapters) };
+    }
+    if (url.includes('/read/')) return { url, text: `<li class="chapter-content" id="article-content"><p>${body}</p></li>` };
+    return f.transport(url, opts);
+  };
+  it('60 章预览书（中位 280 字）按 preview_truncated partial 收口、零 book.txt', async () => {
+    const f = setup();
+    const r = await f.run(wrap(f, 60, previewText));
+    expect(r.code).toBe(1);
+    expect(r.manifest.status).toBe('partial');
+    expect(r.manifest.errors).toEqual(['preview_truncated']);
+    expect(existsSync(join(dirname(r.manifestPath), 'book.txt'))).toBe(false);
+  });
+  it('60 章正常书（中位 2200 字）不受闸门影响照常 done', async () => {
+    const f = setup();
+    const r = await f.run(wrap(f, 60, fullText));
+    expect(r.code).toBe(0);
+    expect(r.manifest.status).toBe('done');
+  });
+  it('小书短章（30 章 280 字）不触发闸门照常 done', async () => {
+    const f = setup();
+    const r = await f.run(wrap(f, 30, previewText));
+    expect(r.code).toBe(0);
+    expect(r.manifest.status).toBe('done');
+  });
+});
