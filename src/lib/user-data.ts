@@ -193,6 +193,50 @@ export function profileForUserQuery(sql: PersonalQuery, userId: number) {
   return sql`SELECT seeds, content, updated_at::text AS updated_at FROM profile WHERE id = ${userId}`;
 }
 
+// ---- readsync42：阅读进度 / 设置云端同步 ----
+//
+// 只按 user_id 过滤，绝不跨用户读；item_key 由调用方从已归一的条目拼出（见 reader-sync.ts）。
+// 存的 updated_at 是**客户端**时钟的 epoch 毫秒：last-write-wins 必须比客户端版本而不是服务器
+// 版本，否则「后写的客户端」未必是「云端较新的一方」（两台设备时钟没有共同基准）。
+
+export function readerSyncEntriesForUserQuery(sql: PersonalQuery, userId: number, itemKeys?: readonly string[]) {
+  requireUserId(userId);
+  // 只回本次提交的键：PUT 的响应必须是「服务端对这几个键的真值」，否则客户端无法就地收敛。
+  // 两条语句**刻意各写一遍、没有条件片段插值**：仓内两套测试适配器（fixtures/pglite-sql 与
+  // fixtures/mock-sql）对「模板套模板」的处理不一致（前者会把内层当绑定参数），共用片段会让
+  // PGlite 真库测试跑的是一条根本发不出去的 SQL。
+  if (!itemKeys?.length) {
+    return sql`SELECT r.item_key, r.payload, r.client_updated_at
+      FROM reader_sync_state r WHERE r.user_id = ${userId} ORDER BY r.item_key`;
+  }
+  return sql`SELECT r.item_key, r.payload, r.client_updated_at
+    FROM reader_sync_state r WHERE r.user_id = ${userId}
+      AND r.item_key IN (SELECT jsonb_array_elements_text(${JSON.stringify(itemKeys)}::jsonb))
+    ORDER BY r.item_key`;
+}
+
+export function saveReaderSyncEntriesForUserQueries(
+  sql: PersonalQuery, userId: number,
+  rows: readonly { item_key: string; payload: unknown; client_updated_at: number }[],
+) {
+  requireUserId(userId);
+  if (!rows.length) return [];
+  // ON CONFLICT 的 WHERE 就是 last-write-wins 的**全部**语义：客户端版本严格更大才覆盖，
+  // 相等或更小则这行不动（返回 0 行也不报错，调用方随后重读真值即可）。原子判据在语句里，
+  // 不靠「先读后写」——两个设备同时 PUT 时后者会读到前者的中间态。
+  return [sql`
+    INSERT INTO reader_sync_state (user_id, item_key, payload, client_updated_at)
+    SELECT ${userId}, j.item_key, j.payload, j.client_updated_at
+    FROM jsonb_to_recordset(${JSON.stringify(rows)}::jsonb)
+      AS j(item_key text, payload jsonb, client_updated_at bigint)
+    ON CONFLICT (user_id, item_key) DO UPDATE
+      SET payload = EXCLUDED.payload,
+          client_updated_at = EXCLUDED.client_updated_at,
+          updated_at = now()
+      WHERE reader_sync_state.client_updated_at < EXCLUDED.client_updated_at
+    RETURNING item_key`];
+}
+
 export function saveProfileForUserQuery(sql: PersonalQuery, userId: number, seeds: unknown, content: string, expectedUpdatedAt: string) {
   requireUserId(userId);
   // Lock and compare before replacing. Audit and CAS commit together: an audit

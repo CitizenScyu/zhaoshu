@@ -1,6 +1,6 @@
 'use client';
 
-import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import type { ReaderIndex, ReaderPart, ReadingSession } from '@/lib/reader-types';
 import { confirmedIndexUrl, isPreferredSourceIndexUrl, preferredSourceIndexUrl, readerChapterUrl, readerIndexUrl, readerPartMatches, switchedReaderIndex, switchedReaderPart } from '@/lib/reader-session';
 import { ReaderPartCache, nextReadingPosition, previousReadingPosition } from '@/lib/reader-part-cache';
@@ -8,6 +8,8 @@ import { captureTextAnchor, restoreTextAnchor } from '@/lib/reader-text-anchor';
 import { forgetSource, readSourceMemory, rememberSource } from '@/lib/source-memory';
 import { catalogPrefixKey, migrateProgressAcrossSources, parseReaderSettings, parseReadingProgress, readingPercent, READER_SETTINGS_KEY } from '@/lib/reader-preferences';
 import { migrateLegacyIndexProgressKey } from '@/lib/user-scope';
+import { createReaderSync, READER_SYNC_PATH, ReaderSyncUnauthorizedError } from '@/lib/reader-sync-client';
+import type { ReaderSyncEntry } from '@/lib/reader-sync';
 import type { ReaderSettings, ReadingPosition, ReadingProgress } from '@/lib/reader-preferences';
 
 interface Reading {
@@ -71,6 +73,33 @@ export function useReader(session: ReadingSession, apiFetch: ApiFetch, userId: n
   // 进度键按当前用户固定：卸载清理时仍写回旧用户，不会写进下一个身份的键。
   const progressKeyFor = useCallback((index: ReaderIndex) => migrateLegacyIndexProgressKey(index, userId), [userId]);
   const [settings, setSettings] = useState(() => parseReaderSettings(storedValue(READER_SETTINGS_KEY)));
+
+  // 云端同步（readsync42）：localStorage 始终是权威副本，这里只维护「跨设备」的第二份。
+  // userId=0（未登录 / 身份未就绪）时整个实例一次请求都不发，与改动前的行为逐字一致。
+  const sync = useMemo(() => createReaderSync({
+    userId,
+    request: async (method, body, signal) => {
+      const response = await apiFetch(READER_SYNC_PATH, {
+        method, signal, cache: 'no-store',
+        ...(method === 'PUT'
+          ? { headers: { 'Content-Type': 'application/json', 'x-nf-csrf': '1' }, body: JSON.stringify(body) }
+          : {}),
+      });
+      if (response.status === 401 || response.status === 403) throw new ReaderSyncUnauthorizedError();
+      const data: unknown = await response.json().catch(() => null);
+      if (!response.ok || !data || typeof data !== 'object' || !Array.isArray((data as { entries?: unknown }).entries)) {
+        throw new Error('reader sync request failed');
+      }
+      // 服务端已按 normalizeReaderSyncEntry 归一过；这里只挡「形状不符就当同步成功」。
+      return (data as { entries: unknown[] }).entries.filter((entry): entry is ReaderSyncEntry => (
+        !!entry && typeof entry === 'object' && typeof (entry as ReaderSyncEntry).updatedAt === 'number'
+      ));
+    },
+    store: {
+      read: (key) => storedValue(key),
+      write: (key, raw) => { window.localStorage.setItem(key, raw); },
+    },
+  }), [apiFetch, userId]);
   const [reading, setReading] = useState<Reading | null>(null);
   const [activeKey, setActiveKey] = useState('0:0');
   const [loading, setLoading] = useState(true);
@@ -143,7 +172,9 @@ export function useReader(session: ReadingSession, apiFetch: ApiFetch, userId: n
       window.localStorage.setItem(progressKeyFor(index), JSON.stringify(progress.current));
       setProgressStorageFailed(false);
     } catch { setProgressStorageFailed(true); }
-  }, [progressKeyFor]);
+    // 本地写成功才排队上云：存储都写不进去时推上去的只会是别的设备上的旧值。
+    sync.scheduleProgress(progressKeyFor(index), progress.current, progress.current.updatedAt);
+  }, [progressKeyFor, sync]);
 
   const capturePosition = useCallback(() => {
     const current = currentReading.current;
@@ -582,6 +613,35 @@ export function useReader(session: ReadingSession, apiFetch: ApiFetch, userId: n
     }
   }, [adoptSwitch, loading, cache, captureStablePosition, fail, navigate, isSessionCurrent, isCurrentRequest]);
 
+  // 云端同步（readsync42）：进入阅读后异步拉一次全量并按 last-write-wins 合并进本地。
+  // 刻意**不** await —— 拉取慢或失败都不得阻塞进入阅读页（本地进度已经先渲染出来了）。
+  // pull 本身已吞掉全部失败；这里再判一次 alive 只是不往已卸载的会话写状态。
+  useEffect(() => {
+    let alive = true;
+    void sync.pull().then((applied) => {
+      if (!alive || !applied.length) return;
+      const settingsEntry = applied.find((entry) => entry.kind === 'settings');
+      if (settingsEntry) setSettings(parseReaderSettings(JSON.stringify(settingsEntry.payload)));
+      const index = currentReading.current?.index;
+      if (!index) return;
+      const entry = applied.find((candidate) => candidate.kind === 'progress' && candidate.key === progressKeyFor(index));
+      if (!entry) return;
+      // 云端进度必须先过 parseReadingProgress：目录版本/指纹对不上的旧进度不能拿来覆盖本地
+      // （「静默打开另一章」那个老坑，跨设备只是把它从本机搬到了云端）。
+      const merged = parseReadingProgress(JSON.stringify(entry.payload), index);
+      if (!merged) return;
+      const here = currentReading.current?.position;
+      if (here && here.chapterIndex === merged.chapterIndex && here.partIndex === merged.partIndex
+          && Math.abs(here.ratio - merged.ratio) < 0.01) return;
+      // 不手动改写 progress.current：navigate 会先 flush 当前位置、再由 restore 按 merged
+      // 落盘并盖上新的 updatedAt，手工赋值反而会被那次 flush 覆盖掉。
+      void navigate({ chapterIndex: merged.chapterIndex, partIndex: merged.partIndex, ratio: merged.ratio });
+    });
+    return () => { alive = false; };
+  }, [sync, progressKeyFor, navigate]);
+
+  useEffect(() => () => sync.dispose(), [sync]);
+
   function onScroll() {
     if (restoring.current || scrollFrame.current !== null) return;
     scrollFrame.current = requestAnimationFrame(() => {
@@ -603,7 +663,8 @@ export function useReader(session: ReadingSession, apiFetch: ApiFetch, userId: n
     try {
       window.localStorage.setItem(READER_SETTINGS_KEY, JSON.stringify(next));
       setSettingsStorageFailed(false);
-    } catch { setSettingsStorageFailed(true); }
+    } catch { setSettingsStorageFailed(true); return; }
+    sync.scheduleSettings(next, Date.now());
   }
 
   function setFocusMode(next: boolean) { flushPosition(); setFocused(next); }

@@ -26,6 +26,7 @@ export const BUSINESS_SCHEMA_RELATIONS = [
   'profile_feedback_queue', 'cron_health',
   'download_source_candidates', 'download_source_candidates_book_pos_idx',
   'download_source_candidates_host_idx', 'download_host_occupancy', 'download_source_prefetch',
+  'reader_sync_state',
 ] as const;
 
 /** ALTER TABLE ... ADD COLUMN IF NOT EXISTS 给既有表补的全部列（[表, 列]）。 */
@@ -386,6 +387,21 @@ export async function initializeBusinessSchema(s: Sql) {
     tx`
     ALTER TABLE cron_health
       ADD COLUMN IF NOT EXISTS lease_generation bigint NOT NULL DEFAULT 0`,
+    // readsync42：阅读进度 / 阅读设置的云端同步。每用户一「项」，item_key = '<kind>:<本地存储键>'
+    // （见 src/lib/reader-sync.ts），payload 是 ReadingProgress / ReaderSettings 的 JSON 序列化。
+    // client_updated_at 是**客户端**时钟的 epoch 毫秒，作 last-write-wins 版本号——刻意不用
+    // 服务器 now()：跨设备的时钟没有共同基准，按服务器时间落版本会让「后写的客户端」未必
+    // 是云端较新的一方。updated_at 只记「谁最后碰过这行」，不参与比较。
+    // 冷建库由 migrations/0006 逐字复刻（MS-25 同款同构约束）。
+    tx`
+    CREATE TABLE IF NOT EXISTS reader_sync_state (
+      user_id int NOT NULL CONSTRAINT reader_sync_state_user_fk REFERENCES users(id),
+      item_key text NOT NULL,
+      payload jsonb NOT NULL DEFAULT '{}',
+      client_updated_at bigint NOT NULL DEFAULT 0,
+      updated_at timestamptz NOT NULL DEFAULT now(),
+      PRIMARY KEY (user_id, item_key)
+    )`,
     // bsrcfix-41（prefetch 生态）：引擎回退选源结果的持久化与跨实例占位/预取认领三表。
     // 每本书（book_id）选出的候选源共享一份；failure 分类 ''（可用）/ 'permanent'（身份不符）/
     // 'temporary'（超时/不可达）。host 占位与按书预取认领均以 expires_at 判过期、原子接管，
