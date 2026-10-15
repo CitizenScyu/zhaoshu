@@ -141,7 +141,9 @@ describe('41-T8FB builtin-fallback', () => {
   it('逐书出网封顶：书不在池里时最多搜 MAX_FALLBACK_SCAN_SOURCES 个源', async () => {
     const pool = Array.from({ length: MAX_FALLBACK_SCAN_SOURCES + 10 }, (_, i) => `https://s${i}.example/`);
     const h = harness({ pool, noBook: pool.map(hostOf) });
-    expect(await h.fallback.wrapPrecheck(async () => UNAVAILABLE)(task(), signal())).toEqual(UNAVAILABLE);
+    // 实探过整池仍零候选 ⇒ no_candidates（nocand42：长退避曲线，不是瞬时不可达）。
+    expect(await h.fallback.wrapPrecheck(async () => UNAVAILABLE)(task(), signal()))
+      .toEqual({ ...UNAVAILABLE, reason: 'no_candidates' });
     expect(h.searched).toHaveLength(MAX_FALLBACK_SCAN_SOURCES);
   });
 
@@ -196,6 +198,36 @@ describe('41-T8FB builtin-fallback', () => {
   it('源池不可用 ⇒ 预检保持 source_unavailable（阶段沿用内层），不放行', async () => {
     const h = harness({ pool: () => { throw new Error('db down'); } });
     expect(await h.fallback.wrapPrecheck(async () => UNAVAILABLE)(task(), signal())).toEqual(UNAVAILABLE);
+  });
+
+  // nocand42：预检腿按 selector 的 scanned 把「全池 0 候选」与「瞬时不可达」分成两个 reason 码，
+  // 执行器据此选不同退避曲线。反例钉住 scanned=0 一侧不被误判成长退避。
+  it('nocand42：实探过池仍零候选 ⇒ no_candidates；一个源都没探 ⇒ 仍 source_unavailable', async () => {
+    const scanned = harness({ pool: ['https://a.example/', 'https://b.example/'], noBook: ['a.example', 'b.example'] });
+    expect(await scanned.fallback.wrapPrecheck(async () => UNAVAILABLE)(task(), signal()))
+      .toEqual({ ...UNAVAILABLE, reason: 'no_candidates' });
+    expect(scanned.searched).toEqual(['a.example', 'b.example']);
+
+    // 池里的源全被 suspect 排除 ⇒ 一次没探，不是「整池没人挂」。
+    const skipped = harness({ pool: ['https://busy.example/'], suspect: ['busy.example'] });
+    expect(await skipped.fallback.wrapPrecheck(async () => UNAVAILABLE)(task(), signal())).toEqual(UNAVAILABLE);
+    expect(skipped.searched).toEqual([]);
+  });
+
+  it('nocand42：下载腿零候选回 no_candidates；原源本身瞬时挂仍回它自己的 source_unavailable', async () => {
+    // 原源被健康记忆判 suspect ⇒ 跳过 builtin 腿（primary 为 null），池里实探完仍零候选。
+    const zero = harness({ pool: ['https://a.example/'], noBook: ['a.example'], suspect: ['book15.net'] });
+    const calls: string[] = [];
+    const out = await zero.fallback.wrapAdapter(adapter({}, calls), adapter({}, calls)).download(task(), context());
+    expect(calls).toEqual([]); // 没探到候选 ⇒ 一个引擎源都没下载
+    expect(out).toMatchObject({ kind: 'incomplete', reason: 'no_candidates', stage: 'search' });
+
+    // 反例：原源 book15 判不可达是瞬时事实，池里没候选不该把它的语义改写成 0 候选终局。
+    const primary: AdapterOutcome = { kind: 'incomplete', reason: 'source_unavailable', chaptersTotal: 0, chaptersDone: 0, charsTotal: 0, stage: 'toc' };
+    const kept: string[] = [];
+    const live = harness({ pool: ['https://a.example/'], noBook: ['a.example'] });
+    const back = await live.fallback.wrapAdapter(adapter({ 'book15.net': primary }, kept), adapter({}, kept)).download(task(), context());
+    expect(back).toEqual(primary);
   });
 
   // 933 回归：原源 host 被本机其他实例的下载作用域占用（物理门 HOST_OCCUPIED）时，wrapPrecheck 不得

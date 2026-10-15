@@ -20,3 +20,32 @@ describe('书源不可达退避窗口（41-EXEC-SRCUNAVAIL）', () => {
     expect(sourceRetryDelayMs(-3)).toBe(15 * MINUTE);
   });
 });
+
+// nocand42：全池 0 候选与瞬时不可达分成两条曲线，共用同一个 attempt 上限（都必有界）。
+describe('全池 0 候选退避曲线（nocand42）', () => {
+  it('1h 起、×2 递增、4h 封顶；15 次逐次求和 = 55h（≈2.3 天），第 16 次仍落终态', () => {
+    const delays = Array.from({ length: SOURCE_RETRY_MAX_ATTEMPTS - 1 }, (_, i) =>
+      sourceRetryDelayMs(i + 1, 'no_candidates'));
+    expect(delays.map(ms => ms / HOUR)).toEqual([1, 2, ...Array(13).fill(4)]);
+    expect(delays.reduce((sum, ms) => sum + ms, 0)).toBe(55 * HOUR);
+  });
+
+  it('封顶 4h：非法/越界 attempt 不产生负值或超上限的延迟', () => {
+    expect(sourceRetryDelayMs(40, 'no_candidates')).toBe(4 * HOUR);
+    expect(sourceRetryDelayMs(0, 'no_candidates')).toBe(HOUR);
+    expect(sourceRetryDelayMs(-3, 'no_candidates')).toBe(HOUR);
+  });
+
+  it('两条曲线互不串扰：同一 attempt 上 0 候选恒 ≥ 瞬时不可达，瞬时曲线逐次值不变', () => {
+    for (let attempt = 1; attempt <= SOURCE_RETRY_MAX_ATTEMPTS; attempt += 1) {
+      expect(sourceRetryDelayMs(attempt, 'no_candidates')).toBeGreaterThan(sourceRetryDelayMs(attempt, 'transient'));
+      expect(sourceRetryDelayMs(attempt, 'transient')).toBe(sourceRetryDelayMs(attempt));
+    }
+    // 0 候选曲线比旧曲线多出的累计时长（55h − 7.25h）就是这轮整改要省下的空烧窗口。
+    const sum = (retryClass: 'no_candidates' | 'transient') =>
+      Array.from({ length: SOURCE_RETRY_MAX_ATTEMPTS - 1 }, (_, i) => sourceRetryDelayMs(i + 1, retryClass))
+        .reduce((total, ms) => total + ms, 0);
+    expect(sum('transient')).toBe(7.25 * HOUR);
+    expect(sum('no_candidates') - sum('transient')).toBe(47.75 * HOUR);
+  });
+});

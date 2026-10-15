@@ -131,7 +131,7 @@ const fakeLimiter = () => ({
   recordFailure: vi.fn(),
 });
 
-const pickTwo = vi.fn<SourceSelector>(async () => ['https://a.example/b', 'https://b.example/b']);
+const pickTwo = vi.fn<SourceSelector>(async () => ({ picked: ['https://a.example/b', 'https://b.example/b'], scanned: 2 }));
 
 /** 便捷构造：全部注入，env 留空（验证生产 env 键解析不触发）。 */
 function entry(o: Partial<Parameters<typeof createSourcePrefetch>[0]> = {}) {
@@ -218,7 +218,7 @@ describe('失败候选排除（真实 selector 包装）', () => {
     const f = fakeSql();
     const known = { ...task(1), sourceUrls: ['https://known.example/book'] };
     const s = createFakeStore({ tasks: [known], busyHosts: ['busy.example'] });
-    const selector = vi.fn<SourceSelector>(async () => ['https://new.example/book']);
+    const selector = vi.fn<SourceSelector>(async () => ({ picked: ['https://new.example/book'], scanned: 1 }));
     expect(await entry({ sql: f.sql, store: s.store, selector }).run(new AbortController().signal)).toBe('completed');
     expect(selector.mock.calls[0][0]).toMatchObject({ targetHits: 1, scanLimit: 200,
       excludedHosts: ['busy.example', 'known.example'] });
@@ -231,7 +231,7 @@ describe('失败候选排除（真实 selector 包装）', () => {
     const f = fakeSql();
     const legacy = { ...task(1), sourceUrls: ['http://legacy.example/book'] };
     const s = createFakeStore({ tasks: [legacy], busyHosts: ['busy.example'] });
-    const selector = vi.fn<SourceSelector>(async () => ['https://a.example/book', 'https://b.example/book']);
+    const selector = vi.fn<SourceSelector>(async () => ({ picked: ['https://a.example/book', 'https://b.example/book'], scanned: 2 }));
     expect(await entry({ sql: f.sql, store: s.store, selector }).run(new AbortController().signal)).toBe('completed');
     expect(selector.mock.calls[0][0]).toMatchObject({ targetHits: 2, excludedHosts: ['busy.example'] });
     expect(s.plans.get(1)).toEqual(['https://a.example/book', 'https://b.example/book']);
@@ -337,7 +337,7 @@ describe('busy host 与 abort 合同', () => {
     // 1ms 时中止落在 selector 等待窗口内（20ms 才返回）：scan 中止 → 归还 → aborted。
     const selector = vi.fn(async () => {
       await new Promise(resolve => setTimeout(resolve, 20));
-      return ['https://a.example/b', 'https://b.example/b'];
+      return { picked: ['https://a.example/b', 'https://b.example/b'], scanned: 2 };
     });
     const controller = new AbortController();
     const pending = entry({ sql: f.sql, store: s.store, selector }).run(controller.signal);

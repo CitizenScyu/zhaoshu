@@ -60,6 +60,7 @@ const PGliteCtor = await loadPGlite();
 const maybe = PGliteCtor ? describe : describe.skip;
 
 const MINUTE = 60_000;
+const HOUR = 60 * MINUTE;
 const TITLE = '测试书';
 // 41-IDLENIENT：身份判据与阅读器 sourceBookMatches 同口径，作者门两侧都过 knownSourceAuthor——
 // 占位作者（佚名/未知）归一成空串即视为「无作者约束」，测不了「作者不符」。这里用具体作者，
@@ -269,7 +270,11 @@ maybe('41-T8FB：builtin 任务 book15 不可达时回退引擎源池', () => {
     expect(await w.executor.runOnce()).toBe(DEFAULT_DECISIONS.TASK_DONE);
     const state = await row(id);
     expect(state).toMatchObject({ status: 'pending', attempt_count: 2, artifact_id: null, source_url: BOOK_URL });
-    expect(state.error).toContain('source_unavailable');
+    // 两个源都实探过、都没有这本书 ⇒ no_candidates（nocand42：长退避曲线），不是瞬时不可达。
+    expect(state.error).toContain('no_candidates');
+    // 第 1 次退避 1h（长曲线起点），不是旧版的 15m。
+    expect(state.delay_ms).toBe(HOUR);
+    expect(w.logs.find(line => line.message === '书源不可达')?.fields).toMatchObject({ reason: 'no_candidates', host: 'book15.net' });
     expect(w.searched).toEqual(['listwrong.example', 'detailwrong.example']);
     expect(w.downloaded).toEqual([]);
     expect(w.budget.used()).toBe(0);
@@ -337,7 +342,14 @@ maybe('41-T8FB：builtin 任务 book15 不可达时回退引擎源池', () => {
     const w = await wired({ pool: [] });
     expect(await w.executor.runOnce()).toBe(DEFAULT_DECISIONS.TASK_DONE);
     expect(w.requests).toEqual([]);
-    expect(await row(id)).toMatchObject({ status: 'pending', attempt_count: 2 });
+    const state = await row(id);
+    expect(state).toMatchObject({ status: 'pending', attempt_count: 2 });
+    // nocand42 反例：一个源都没实探过（空池）≠ 全池零候选 —— 那是「此刻没得扫」，快退避才捞得回
+    // 刚被占用的 host/刚恢复的池。曲线必须留在 15m，误判成 no_candidates 会白等 1 小时。
+    expect(state.error).toContain('source_unavailable');
+    expect(state.error).not.toContain('no_candidates');
+    expect(state.delay_ms).toBe(15 * MINUTE);
+    expect(w.logs.find(line => line.message === '书源不可达')?.fields).toMatchObject({ reason: 'source_unavailable' });
     expect(w.budget.used()).toBe(0);
   });
 

@@ -17,6 +17,7 @@ const PGliteCtor = await loadPGlite();
 const maybe = PGliteCtor ? describe : describe.skip;
 
 const MINUTE = 60_000;
+const HOUR = 60 * MINUTE;
 const TITLE = '测试书';
 const AUTHOR = '佚名';
 const BOOK_URL = 'https://book15.net/books/details1.html';
@@ -196,14 +197,15 @@ maybe('618 退休源反例：旧 book15 URL 的 builtin 下载任务（真实注
     expect([...github.files.keys()].some(path => path.endsWith('/index.json'))).toBe(true);
   });
 
-  it('② 退休 host + 引擎源无此书 ⇒ 仍按 source_unavailable 退避（pending、15m、额度退还、零发布），零 book15 请求', async () => {
+  it('② 退休 host + 引擎源无此书 ⇒ 按 no_candidates 退避（pending、1h、额度退还、零发布），零 book15 请求', async () => {
     const id = await insertTask();
     const w = await wired({ pool: ['nomatch.example'], catalog: { 'nomatch.example': { hits: [], detail: { title: '', author: '' } } } });
     expect(await w.executor.runOnce()).toBe(DEFAULT_DECISIONS.TASK_DONE);
     const state = await row(id);
     expect(state).toMatchObject({ status: 'pending', attempt_count: 2, artifact_id: null, source_url: BOOK_URL });
-    expect(state.error).toContain('source_unavailable');
-    expect(state.delay_ms).toBe(15 * MINUTE);
+    // nocand42：池里那一个源实探过、确认没有这本书 ⇒ no_candidates（1h 长退避），不是瞬时不可达。
+    expect(state.error).toContain('no_candidates');
+    expect(state.delay_ms).toBe(HOUR);
     expect(w.requests).toEqual([]);
     expect(w.downloaded).toEqual([]);
     expect(w.budget.used()).toBe(0); // 领取扣 1、判不可达退 1
@@ -243,7 +245,7 @@ maybe('618 退休源反例：旧 book15 URL 的 builtin 下载任务（真实注
     expect(state.status).not.toBe('failed');
     expect(state.attempt_count).toBe(2); // DEFAULT 1 + defer +1（领取不 +1）
     expect(state.lease_owner).toBe('');
-    expect(state.error).toContain('source_unavailable');
+    expect(state.error).toContain('no_candidates');
     expect(w.requests).toEqual([]);
   });
 
@@ -271,7 +273,7 @@ maybe('618 退休源反例：旧 book15 URL 的 builtin 下载任务（真实注
     // finish 不改 attempt_count（download-task-queue.ts:202–208）：保持第一轮 defer 后的 16；
     // 若再发生 defer 则为 17 —— 据此钉住「不再重排」。
     expect(terminal.attempt_count).toBe(16);
-    expect(terminal.error).toContain('source_unavailable');
+    expect(terminal.error).toContain('no_candidates');
     expect(w.requests).toEqual([]);
   });
 

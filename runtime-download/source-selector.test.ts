@@ -62,7 +62,7 @@ describe('共用选源器', () => {
   it('逐书出网封顶：书不在池里最多扫 scanLimit 个源，不必扫完整池', async () => {
     const pool = Array.from({ length: 220 }, (_, i) => `https://s${i}.example/`);
     const h = harness({ pool, search: () => [] });
-    expect(await h.selector(request({ scanLimit: 200 }), freshSignal())).toEqual([]);
+    expect((await h.selector(request({ scanLimit: 200 }), freshSignal())).picked).toEqual([]);
     expect(h.searchedUrls).toHaveLength(200);
     expect(h.detailUrls).toEqual([]);
   });
@@ -70,12 +70,12 @@ describe('共用选源器', () => {
   it('共享扫描余额跨调用保留，过滤不扣额，耗尽后不再读池', async () => {
     const h = harness({ pool: ['http://skip.example/', 'https://a.example/', 'https://b.example/', 'https://c.example/'] });
     const scanBudget = { remaining: 3 };
-    expect(await h.selector(request({ scanBudget }), freshSignal())).toEqual(['https://a.example/', 'https://b.example/']);
+    expect((await h.selector(request({ scanBudget }), freshSignal())).picked).toEqual(['https://a.example/', 'https://b.example/']);
     expect(scanBudget.remaining).toBe(1);
-    expect(await h.selector(request({ scanBudget, excludedSources: ['https://a.example/', 'https://b.example/'] }), freshSignal()))
+    expect((await h.selector(request({ scanBudget, excludedSources: ['https://a.example/', 'https://b.example/'] }), freshSignal())).picked)
       .toEqual(['https://c.example/']);
     expect(scanBudget.remaining).toBe(0);
-    expect(await h.selector(request({ scanBudget }), freshSignal())).toEqual([]);
+    expect((await h.selector(request({ scanBudget }), freshSignal())).picked).toEqual([]);
     expect(h.poolLoads).toHaveLength(2);
     expect(h.searchedUrls).toEqual(['https://a.example/', 'https://b.example/', 'https://c.example/']);
   });
@@ -93,16 +93,16 @@ describe('共用选源器', () => {
   it('命中 targetHits 个不同 host 早停（2 与 3）', async () => {
     const pool = ['https://a.example/', 'https://b.example/', 'https://c.example/', 'https://d.example/', 'https://e.example/'];
     const two = harness({ pool });
-    expect(await two.selector(request({ targetHits: 2 }), freshSignal())).toEqual(['https://a.example/', 'https://b.example/']);
+    expect((await two.selector(request({ targetHits: 2 }), freshSignal())).picked).toEqual(['https://a.example/', 'https://b.example/']);
     expect(two.searchedUrls).toEqual(['https://a.example/', 'https://b.example/']);
     const three = harness({ pool });
-    expect(await three.selector(request({ targetHits: 3 }), freshSignal())).toHaveLength(3);
+    expect((await three.selector(request({ targetHits: 3 }), freshSignal())).picked).toHaveLength(3);
     expect(three.searchedUrls).toEqual(['https://a.example/', 'https://b.example/', 'https://c.example/']);
   });
 
   it('同 host 重复候选：已命中 host 不再扫，另一 host 补位', async () => {
     const h = harness({ pool: ['https://a.example/', 'https://a.example/other/', 'https://b.example/'] });
-    expect(await h.selector(request(), freshSignal())).toEqual(['https://a.example/', 'https://b.example/']);
+    expect((await h.selector(request(), freshSignal())).picked).toEqual(['https://a.example/', 'https://b.example/']);
     expect(h.searchedUrls).toEqual(['https://a.example/', 'https://b.example/']);
   });
 
@@ -112,7 +112,7 @@ describe('共用选源器', () => {
         'https://a.example/', 'https://b.example/', 'https://c.example/'],
       suspect: ['dead.example'],
     });
-    expect(await h.selector(request({ excludedHosts: ['busy.example'], scanLimit: 2 }), freshSignal()))
+    expect((await h.selector(request({ excludedHosts: ['busy.example'], scanLimit: 2 }), freshSignal())).picked)
       .toEqual(['https://a.example/', 'https://b.example/']);
     expect(h.searchedUrls).toEqual(['https://a.example/', 'https://b.example/']);
     expect(h.poolLoads).toEqual([1]);
@@ -125,19 +125,19 @@ describe('共用选源器', () => {
       pool: ['https://book.qq.com/', 'https://chuangshi.qq.com/', 'https://ubook.reader.qq.com/',
         'https://yunqi.qq.com/', 'https://a.example/', 'https://b.example/'],
     });
-    expect(await h.selector(request({ scanLimit: 2 }), freshSignal())).toEqual(['https://a.example/', 'https://b.example/']);
+    expect((await h.selector(request({ scanLimit: 2 }), freshSignal())).picked).toEqual(['https://a.example/', 'https://b.example/']);
     expect(h.searchedUrls).toEqual(['https://a.example/', 'https://b.example/']);
     expect(h.logs[0].fields).toMatchObject({ scanned: 2, candidates: 2 });
   });
 
   it('已失败 URL 只按精确 source_url 排除：A/B 排除后补 C/D；同 host 不同 source URL 仍可选', async () => {
     const h = harness({ pool: ['https://a.example/', 'https://b.example/', 'https://c.example/', 'https://d.example/'] });
-    expect(await h.selector(request({ excludedSources: ['https://a.example/', 'https://b.example/'] }), freshSignal()))
+    expect((await h.selector(request({ excludedSources: ['https://a.example/', 'https://b.example/'] }), freshSignal())).picked)
       .toEqual(['https://c.example/', 'https://d.example/']);
     expect(h.searchedUrls).toEqual(['https://c.example/', 'https://d.example/']);
 
     const sameHost = harness({ pool: ['https://a.example/old', 'https://a.example/new'] });
-    expect(await sameHost.selector(request({ targetHits: 1, excludedSources: ['https://a.example/old'] }), freshSignal()))
+    expect((await sameHost.selector(request({ targetHits: 1, excludedSources: ['https://a.example/old'] }), freshSignal())).picked)
       .toEqual(['https://a.example/new']);
     expect(sameHost.searchedUrls).toEqual(['https://a.example/new']);
   });
@@ -150,7 +150,7 @@ describe('共用选源器', () => {
       pool: ['https://a.example/s1', 'https://a.example/s2', 'https://b.example/'],
       search: url => (url === 'https://a.example/s1' ? [] : [{ title: TASK.title, author: TASK.author, bookUrl: `${url}b/1` }]),
     });
-    expect(await h.selector(request({ targetHits: 1 }), freshSignal())).toEqual(['https://a.example/s2']);
+    expect((await h.selector(request({ targetHits: 1 }), freshSignal())).picked).toEqual(['https://a.example/s2']);
     expect(h.searchedUrls).toEqual(['https://a.example/s1', 'https://a.example/s2']);
   });
 
@@ -169,7 +169,7 @@ describe('共用选源器', () => {
       // a 源两条详情都对不上（不入选），b 源对得上：d3 超每源详情上限永不触详情。
       detail: bookUrl => (bookUrl.startsWith('https://a.example/') ? { title: '测试书', author: '别人' } : { title: '测试书', author: '测试作者' }),
     });
-    expect(await h.selector(request({ task }), freshSignal())).toEqual(['https://b.example/']);
+    expect((await h.selector(request({ task }), freshSignal())).picked).toEqual(['https://b.example/']);
     expect(h.detailUrls).toEqual(['https://a.example/d1', 'https://a.example/d2', 'https://b.example/d1']);
     expect(h.detailUrls).not.toContain('https://a.example/author-conflict');
     expect(h.searchedUrls).toEqual(['https://a.example/', 'https://b.example/']);
@@ -177,10 +177,10 @@ describe('共用选源器', () => {
 
   it('池不可用：真实异常（异步与同步 throw）返回 [] 并记固定原因码', async () => {
     const poolAsync = harness({ poolThrows: 'async' });
-    expect(await poolAsync.selector(request(), freshSignal())).toEqual([]);
+    expect((await poolAsync.selector(request(), freshSignal())).picked).toEqual([]);
     expect(poolAsync.logs[0].fields).toMatchObject({ taskId: TASK.id, reason: 'engine_source_pool_unavailable' });
     const poolSync = harness({ poolThrows: 'sync' });
-    expect(await poolSync.selector(request(), freshSignal())).toEqual([]);
+    expect((await poolSync.selector(request(), freshSignal())).picked).toEqual([]);
     expect(poolSync.logs[0].fields).toMatchObject({ reason: 'engine_source_pool_unavailable' });
   });
 
@@ -192,7 +192,7 @@ describe('共用选源器', () => {
         return [{ title: TASK.title, author: TASK.author, bookUrl: `${url}b/1` }];
       },
     });
-    expect(await syncThrow.selector(request({ targetHits: 1 }), freshSignal())).toEqual(['https://b.example/']);
+    expect((await syncThrow.selector(request({ targetHits: 1 }), freshSignal())).picked).toEqual(['https://b.example/']);
     expect(syncThrow.searchedUrls).toEqual(['https://a.example/', 'https://b.example/']);
 
     const asyncReject = harness({
@@ -200,7 +200,7 @@ describe('共用选源器', () => {
       search: url => (url === 'https://a.example/' ? Promise.reject(new TypeError('fetch failed'))
         : [{ title: TASK.title, author: TASK.author, bookUrl: `${url}b/1` }]),
     });
-    expect(await asyncReject.selector(request({ targetHits: 1 }), freshSignal())).toEqual(['https://b.example/']);
+    expect((await asyncReject.selector(request({ targetHits: 1 }), freshSignal())).picked).toEqual(['https://b.example/']);
   });
 
   it('caller abort：及时停止并抛 signal.reason，不再继续扫描；入口已中止不读池', async () => {
@@ -228,7 +228,7 @@ describe('共用选源器', () => {
       search: url => (url === 'https://a.example/' ? Promise.reject(gateError('HOST_OCCUPIED'))
         : [{ title: TASK.title, author: TASK.author, bookUrl: `${url}b/1` }]),
     });
-    expect(await occupied.selector(request({ targetHits: 2 }), freshSignal()))
+    expect((await occupied.selector(request({ targetHits: 2 }), freshSignal())).picked)
       .toEqual(['https://b.example/', 'https://c.example/']);
     expect(occupied.searchedUrls).toEqual(['https://a.example/', 'https://b.example/', 'https://c.example/']);
 
@@ -240,7 +240,7 @@ describe('共用选源器', () => {
         return { title: TASK.title, author: TASK.author };
       },
     });
-    expect(await occupiedDetail.selector(request({ targetHits: 1 }), freshSignal())).toEqual(['https://b.example/']);
+    expect((await occupiedDetail.selector(request({ targetHits: 1 }), freshSignal())).picked).toEqual(['https://b.example/']);
 
     // 门后端失效（DB 不可用）：fail-closed 上抛，第一个源之后不再有任何搜索。
     const unavailable = harness({
@@ -271,7 +271,7 @@ describe('共用选源器', () => {
       pool: ['https://a.example/', 'https://b.example/', 'https://c.example/'],
       search: url => (url === 'https://b.example/' ? hang<Hit[]>() : [{ title: TASK.title, author: TASK.author, bookUrl: `${url}b/1` }]),
     });
-    expect(await h.selector(request({ budgetMs: 60 }), freshSignal())).toEqual(['https://a.example/']);
+    expect((await h.selector(request({ budgetMs: 60 }), freshSignal())).picked).toEqual(['https://a.example/']);
     expect(h.searchedUrls).toEqual(['https://a.example/', 'https://b.example/']);
     expect(h.detailUrls).toEqual(['https://a.example/b/1']);
   });
@@ -281,7 +281,7 @@ describe('共用选源器', () => {
     expect(typeof h.selector).toBe('function');
     expect(Object.keys(h.selector)).toEqual([]);
     const picked = await h.selector(request({ targetHits: 1 }), freshSignal());
-    expect(picked.every(u => typeof u === 'string')).toBe(true);
+    expect(picked.picked.every(u => typeof u === 'string')).toBe(true);
   });
 
   it('日志脱敏：只记 taskId/scanned/candidates/host/原因码，不含书名、作者、URL、错误原文', async () => {
@@ -297,5 +297,38 @@ describe('共用选源器', () => {
     const fail = JSON.stringify({ m: boom.logs[0].message, f: boom.logs[0].fields });
     expect(fail).toContain('engine_source_pool_unavailable');
     expect(fail).not.toContain('pool async down');
+  });
+
+  // nocand42：scanned 是下载线区分「全池 0 候选」与「瞬时不可达」的唯一依据，0 也必须如实返回。
+  it('nocand42 scanned 计数：实探数而非池大小；跳过与未探一律不计', async () => {
+    const zero = harness({ pool: ['https://a.example/', 'https://b.example/', 'https://c.example/'], search: () => [] });
+    expect((await zero.selector(request(), freshSignal())).scanned).toBe(3);
+
+    const capped = harness({ pool: Array.from({ length: 220 }, (_, i) => `https://s${i}.example/`), search: () => [] });
+    expect((await capped.selector(request({ scanLimit: 200 }), freshSignal())).scanned).toBe(200);
+
+    // builtin/suspect/非 https 被跳过 = 没探，不计入 scanned。
+    const skipped = harness({
+      pool: ['http://skip.example/', 'https://builtin.example/', 'https://sick.example/', 'https://real.example/'],
+      builtinHosts: ['builtin.example'], suspect: ['sick.example'], search: () => [],
+    });
+    const selection = await skipped.selector(request(), freshSignal());
+    expect(selection).toEqual({ picked: [], scanned: 1 });
+    expect(skipped.searchedUrls).toEqual(['https://real.example/']);
+
+    // 扫描余额耗尽 ⇒ 一次没探，scanned=0（下载线据此判「瞬时不可达」而非 0 候选）。
+    const budget = { remaining: 0 };
+    const broke = harness({ pool: ['https://a.example/'] });
+    expect(await broke.selector(request({ scanBudget: budget }), freshSignal())).toEqual({ picked: [], scanned: 0 });
+    expect(broke.searchedUrls).toEqual([]);
+  });
+
+  it('nocand42 池不可读 ⇒ scanned=0（不是「全池没人挂」）', async () => {
+    const h = harness({ poolThrows: 'async' });
+    expect(await h.selector(request(), freshSignal())).toEqual({ picked: [], scanned: 0 });
+    const budget = { remaining: 2 };
+    const sync = harness({ poolThrows: 'sync' });
+    expect(await sync.selector(request({ scanBudget: budget }), freshSignal())).toEqual({ picked: [], scanned: 0 });
+    expect(budget.remaining).toBe(2);
   });
 });
