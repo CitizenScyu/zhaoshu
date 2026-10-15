@@ -10,6 +10,14 @@ export type CandidateSql = ReturnType<typeof neon>;
 
 export type CandidateFailureKind = '' | 'permanent' | 'temporary';
 
+/**
+ * temporary 失败记忆的解禁时长（默认 48h）。质量型失败（缺章/截断/空 TOC/分页环）多与
+ * 站点当日状态相关而非书的固有属性；无 TTL 时一次失败即被该书永久拉黑，免费站覆盖
+ * 本就只有 1-2 个，重试烧穿终态 failed（covgap41 §4.4：4474 的 wcshuba、4469 的
+ * cuoceng/sto66 皆此形态）。permanent 不受影响（identity_mismatch 重试无意义）。
+ */
+export const TEMPORARY_FAILURE_TTL_MS = 48 * 60 * 60 * 1000;
+
 export interface SourceCandidateRow {
   source_url: string;
   host: string;
@@ -32,11 +40,22 @@ export async function usableSourceCandidates(sql: CandidateSql, bookId: number):
   return rows;
 }
 
-/** 该书已失败候选（temporary/permanent）的 source_url 集——补扫按单源精确排除，不禁整个 host。 */
-export async function failedCandidateSources(sql: CandidateSql, bookId: number): Promise<Set<string>> {
+/**
+ * 该书已失败候选的 source_url 集——补扫按单源精确排除，不禁整个 host。
+ * temporary 记忆带 TTL（默认 48h，见 TEMPORARY_FAILURE_TTL_MS）：过窗后源重回可选，
+ * 失败再标记时 updated_at 刷新、窗口重启；permanent 永久排除。
+ */
+export async function failedCandidateSources(
+  sql: CandidateSql,
+  bookId: number,
+  ttlMs: number = TEMPORARY_FAILURE_TTL_MS,
+): Promise<Set<string>> {
+  if (!Number.isSafeInteger(ttlMs) || ttlMs < 0) throw new Error('ttlMs is invalid');
   const rows = await sql`
     SELECT DISTINCT source_url FROM download_source_candidates
-    WHERE book_id = ${bookId} AND failure <> ''` as unknown as { source_url: string }[];
+    WHERE book_id = ${bookId}
+      AND (failure = 'permanent'
+        OR (failure = 'temporary' AND updated_at > now() - (${ttlMs}::bigint * interval '1 millisecond')))` as unknown as { source_url: string }[];
   return new Set(rows.map(row => row.source_url));
 }
 

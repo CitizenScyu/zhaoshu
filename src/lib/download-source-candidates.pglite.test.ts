@@ -100,6 +100,25 @@ maybe('bsrcfix-41：候选源持久化与跨实例占位（0005 三表）', () =
     expect(classifyFailure('operation_timeout')).toBe('temporary');
   });
 
+  // covgap41 §4.4：temporary 失败记忆带 TTL（默认 48h）——过窗解禁获重试，permanent 永久。
+  it('failedCandidateSources 的 temporary TTL：过窗解禁、permanent 不受影响、窗口参数可控', async () => {
+    await replaceSourceCandidates(sql(), 1, ['https://a.example/', 'https://b.example/']);
+    await markCandidateFailure(sql(), 1, 'https://a.example/', 'temporary', 'missing_chapters');
+    await markCandidateFailure(sql(), 1, 'https://b.example/', 'permanent', 'identity_mismatch_or_no_candidate');
+    // 刚失败：默认 TTL 48h 内两者都排除（既有行为不变）。
+    expect(await failedCandidateSources(sql(), 1))
+      .toEqual(new Set(['https://a.example/', 'https://b.example/']));
+    // temporary 过窗（拨回 49h 前）⇒ 解禁；permanent 不受时间影响。
+    await pg.query(`UPDATE download_source_candidates SET updated_at = now() - interval '49 hours'
+      WHERE book_id = 1 AND source_url = 'https://a.example/'`);
+    expect(await failedCandidateSources(sql(), 1)).toEqual(new Set(['https://b.example/']));
+    // ttlMs=0 ⇒ temporary 全部即时解禁（只剩 permanent）。
+    await markCandidateFailure(sql(), 1, 'https://a.example/', 'temporary', 'empty_toc_page');
+    expect(await failedCandidateSources(sql(), 1, 0)).toEqual(new Set(['https://b.example/']));
+    // 坏参数拒绝。
+    await expect(failedCandidateSources(sql(), 1, -1)).rejects.toThrow('ttlMs is invalid');
+  });
+
   it('tryOccupyHost 原子互斥：他实例占用 ⇒ false；过期 ⇒ 接管；释放后可再占', async () => {
     expect(await tryOccupyHost(sql(), 'a.example', 'w1', 'download', 1, 60_000)).toBe(true);
     expect(await tryOccupyHost(sql(), 'a.example', 'w2', 'download', 2, 60_000)).toBe(false);
