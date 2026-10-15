@@ -79,6 +79,8 @@ export function useReader(session: ReadingSession, apiFetch: ApiFetch, userId: n
   const sync = useMemo(() => createReaderSync({
     userId,
     request: async (method, body, signal) => {
+      // 会话已换代/失效的请求一律不发，和目录、正文请求同一条判据。
+      if (!isSessionCurrent()) throw new ReaderSyncUnauthorizedError();
       const response = await apiFetch(READER_SYNC_PATH, {
         method, signal, cache: 'no-store',
         ...(method === 'PUT'
@@ -99,7 +101,7 @@ export function useReader(session: ReadingSession, apiFetch: ApiFetch, userId: n
       read: (key) => storedValue(key),
       write: (key, raw) => { window.localStorage.setItem(key, raw); },
     },
-  }), [apiFetch, userId]);
+  }), [apiFetch, userId, isSessionCurrent]);
   const [reading, setReading] = useState<Reading | null>(null);
   const [activeKey, setActiveKey] = useState('0:0');
   const [loading, setLoading] = useState(true);
@@ -618,7 +620,8 @@ export function useReader(session: ReadingSession, apiFetch: ApiFetch, userId: n
   // pull 本身已吞掉全部失败；这里再判一次 alive 只是不往已卸载的会话写状态。
   useEffect(() => {
     let alive = true;
-    void sync.pull().then((applied) => {
+    // 先让出一个微任务：与初始目录加载同一节拍，会话在这一拍里换代的话就不该发请求。
+    void Promise.resolve().then(() => sync.pull()).then((applied) => {
       if (!alive || !applied.length) return;
       const settingsEntry = applied.find((entry) => entry.kind === 'settings');
       if (settingsEntry) setSettings(parseReaderSettings(JSON.stringify(settingsEntry.payload)));

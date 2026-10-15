@@ -23,14 +23,15 @@ maybe('readsync42：阅读进度/设置云端存储（0006 reader_sync_state）'
   const sql = () => createPGliteSql(pg) as never;
 
   async function push(userId: number, entries: readonly ReaderSyncEntry[]) {
-    await createPGliteSql(pg).transaction((tx) => saveReaderSyncEntriesForUserQueries(
-      tx as never, userId,
-      entries.map((entry) => ({
-        item_key: readerSyncItemKey(entry.kind, entry.key),
-        payload: entry.payload,
-        client_updated_at: entry.updatedAt,
-      })),
-    ));
+    const rows = entries.map((entry) => ({
+      item_key: readerSyncItemKey(entry.kind, entry.key),
+      payload: entry.payload,
+      client_updated_at: entry.updatedAt,
+    }));
+    if (!rows.length) return;
+    // 单条 upsert，自带 ON CONFLICT 判据，不需要显式事务（与 user-data.feedback-queue 同款写法）。
+    const statement = saveReaderSyncEntriesForUserQueries(sql(), userId, rows)[0] as unknown as { text: string; params: unknown[] };
+    await pg.query(statement.text, statement.params);
   }
 
   async function pull(userId: number, itemKeys?: readonly string[]): Promise<ReaderSyncEntry[]> {
