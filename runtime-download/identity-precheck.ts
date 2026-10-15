@@ -133,10 +133,14 @@ export function createIdentityPrecheck(options: IdentityPrecheckOptions): Preche
     // authbridge42 作者名回退轮（搜索键判据与选源器共用 authorSearchKey，同源同判）。这一轮**不按书名
     // 过滤**——镜像站按通行书名收录，按书名过滤等于把回退作废；候选靠详情页身份门认。
     if (!authorSearchKey(task.title, task.author)) return false;
-    // 书名搜索里已经出现过书名匹配行时不做作者回退（与阅读侧 engineAuthorSearchPending 同判据）：
-    // 那种形态的失败是身份冲突不是改名，回退会用作者名把真实的同名异作者冲突盖过去。
-    if (candidates.some(c => typeof c.title === 'string'
-      && sourceBookMatches({ title: task.title, author: '' }, { title: c.title, author: '' }))) return false;
+    // 书名搜索阶段已经产出候选时不做作者回退（与阅读侧 engineAuthorSearchPending 同判据）：那种形态的
+    // 失败是身份冲突不是改名，回退会白花两次出网，还可能用作者名把真实的同名异作者冲突盖过去。
+    // builtin 的 parseSourceSearch 本就只收书名锚文本相等的行，产出候选即等价于「书名匹配行存在」。
+    const titleMatched = builtin
+      ? candidates.length > 0
+      : candidates.some(c => typeof c.title === 'string'
+        && sourceBookMatches({ title: task.title, author: '' }, { title: c.title, author: '' }));
+    if (titleMatched) return false;
     progress.stage = 'search';
     let authorCandidates: Candidate[];
     if (builtin) {
