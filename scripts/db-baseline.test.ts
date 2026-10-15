@@ -188,8 +188,9 @@ maybe('PGlite 真库', () => {
     // (c) 登记之后再跑 baseline：已有记账表 → 拒绝，退出码 2，记账不变。
     const again = await runProdBaseline(client, list, 'apply');
     expect(again.status).toBe('refused');
-    expect(again.refusals.join('\n')).toMatch(/已有 schema_migrations（登记了 5 个版本）/);
-    expect((await pg.query('SELECT count(*)::int AS n FROM schema_migrations')).rows[0].n).toBe(5);
+    // 版本数从迁移清单推，别写死：加一条迁移（0006 reader_sync_state）就该跟着变。
+    expect(again.refusals.join('\n')).toMatch(new RegExp(`已有 schema_migrations（登记了 ${list.length} 个版本）`));
+    expect((await pg.query('SELECT count(*)::int AS n FROM schema_migrations')).rows[0].n).toBe(list.length);
   }, 180_000);
 
   it('按生产演化路径建的库（旧应用表 → auth v1–v7 → 运行期 DDL → 手工 0002 → artifact → 用量表）：baseline 通过，登记后 check 退出 0', async () => {
