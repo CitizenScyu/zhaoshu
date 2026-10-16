@@ -6,7 +6,7 @@
     },
     {
       "path": "/api/shuyuan/admission",
-      "schedule": "0 14 * * *"
+      "schedule": "0 */4 * * *"
     },
     {
       "path": "/api/download/reclaim",

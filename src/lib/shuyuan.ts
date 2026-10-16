@@ -1927,7 +1927,7 @@ async function admitRows(
   for (const row of rows) {
     try { declaredHosts.add(new URL(row.url).hostname); } catch { /* 上游脏 URL：无法声明 host */ }
   }
-  const candidates: AdmissionCandidate[] = [];
+  let candidates: AdmissionCandidate[] = [];
   const surveyRejected: AdmissionCandidate[] = [];
   // 41-admpost F2：准入候选筛与 compileAdmission 用同一开关/判据；flag 开时 POST 源同步进候选评估环。
   const postSearch = enginePostSearchEnabled();
@@ -1946,7 +1946,22 @@ async function admitRows(
     // compile_ok=false ⇒ 终态去抖不再重写。这是**扩**评估环而非把候选池收窄成「只喂 compile_ok」
     // （admission.ts「严禁」注释防的是后者）：compile_ok=false 的旧行照旧不喂，上游改回合规规则时源
     // 重新过初筛成为普通候选，占位行 search_ok=null ⇒ class 0 未测优先，自动回池。
-    const frozen = surveyRejected.filter((candidate) => existing.get(candidate.url)?.compile_ok === true);
+    let frozen = surveyRejected.filter((candidate) => existing.get(candidate.url)?.compile_ok === true);
+    // admchurn42：phoenix runner 轮（okPrefix 路径）不再评估「已入池的 ok 行」——runner 对这些行的
+    // 最好结局也只是把 error 改写成 phoenix_ok:（= 降级出池等 Vercel 重确认），复核它们纯属净损失。
+    // 2026-10-16 生产事故复盘：刷新落地两天上游规则变更 ⇒ rules_hash 大面积变化 ⇒ 大量 ok 行到期，
+    // runner 两轮把 16 个已确认 host 全部搅降级，池掉到 2。在池 ok 行（干净与 recheck_fail: 可疑，
+    // 后者仍算入池）的复核只交给 Vercel 侧（刷新尾部 / 独立准入轮）——只有它们的 ok 结论能保住池籍。
+    // Vercel 两条路径不传 okPrefix，本过滤零生效（行为不变）。
+    if (options.okPrefix) {
+      const runnerProbes = (url: string) => {
+        const previous = existing.get(url);
+        return !(previous && previous.search_ok === true && previous.search_verdict === 'ok'
+          && !previous.error.startsWith(options.okPrefix!));
+      };
+      candidates = candidates.filter((candidate) => runnerProbes(candidate.url));
+      frozen = frozen.filter((candidate) => runnerProbes(candidate.url));
+    }
     if (candidates.length === 0 && frozen.length === 0) {
       const write = await writeAdmissionRows(s, [], handle, sourceSnapshots, signal);
       return 'skipped' in write ? write : { skipped: 'no_candidates' };

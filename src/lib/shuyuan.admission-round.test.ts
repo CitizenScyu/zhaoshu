@@ -69,6 +69,8 @@ function deadSource(i: number) {
 
 let lease: 'claimed' | 'held' | 'error';
 let stored: { source_url: string; source: Record<string, unknown> }[];
+// admchurn42：readAdmissionRows（既有 source_admission 行）的回放夹具；缺省空 = 全部行视为未测。
+let admissionExisting: Record<string, unknown>[];
 // 42-admhealth：cron_health 成功行写入（recordCronSuccess('admission')）的替身开关。
 let admissionSuccessWrite: 'ok' | 'fail';
 
@@ -86,6 +88,7 @@ beforeEach(() => {
   vi.clearAllMocks();
   lease = 'claimed';
   stored = [];
+  admissionExisting = [];
   admissionSuccessWrite = 'ok';
   execute.mockReset().mockImplementation(async (query) => {
     if (query.text.startsWith('WITH guard') && query.text.includes('INSERT INTO cron_health')) {
@@ -102,6 +105,8 @@ beforeEach(() => {
       return lease === 'claimed' ? [{ name: ADMISSION_LEASE_ROW, generation: '1' }] : [];
     }
     if (query.text.startsWith('SELECT source_url, source FROM shuyuan_sources ORDER BY id')) return stored;
+    // admchurn42：既有准入行回放（readAdmissionRows 只回已有行，形状见 AdmissionSourceRow）。
+    if (query.text.startsWith('SELECT source_url, tier, compile_ok, core_field_mask')) return admissionExisting;
     if (query.text.startsWith('SELECT count(*)')) return [zeroCounts];
     return [];
   });
@@ -241,6 +246,69 @@ describe('runAdmissionRunnerRound（phoenix runner）', () => {
     const insert = queries().find((query) => query.text.includes('INSERT INTO source_admission'))!;
     const rows = JSON.parse(insert.values[2] as string) as { source_url: string }[];
     expect(rows.map((row) => row.source_url)).toEqual(['https://dead0.example/']);
+  });
+
+  // admchurn42：runner 轮不再评估「已入池的 ok 行」（干净 + recheck_fail: 可疑都算在池）——
+  // 复盘 2026-10-16：刷新改 rules_hash 后 runner 两轮把 16 个已确认 host 搅降级成 phoenix_ok:，
+  // 池 16→2。复核在池 ok 行只交给 Vercel 侧。phoenix_ok: 待确认行与未测行照旧评估。
+  const inPoolRow = (url: string, error: string, rulesHashValue = 'stale-hash') => ({
+    source_url: url, tier: 'T7', compile_ok: true, core_field_mask: {}, search_ok: true,
+    search_verdict: 'ok', search_checked_at: '2026-10-01T00:00:00.000Z', rules_hash: rulesHashValue,
+    engine_semantics_version: 1, host: new URL(url).hostname, error, compile_diagnostics: [],
+  });
+
+  it('admchurn42：在池 ok 行（干净/可疑）不进 runner 评估环；phoenix_ok: 与未测行照旧', async () => {
+    vi.useFakeTimers();
+    vi.stubEnv('ADMISSION_MAX_PROBES', '4');
+    stored = [
+      { source_url: 'https://dead0.example/', source: deadSource(0) },
+      { source_url: 'https://dead1.example/', source: deadSource(1) },
+      { source_url: 'https://dead2.example/', source: deadSource(2) },
+      { source_url: 'https://dead3.example/', source: deadSource(3) },
+    ];
+    admissionExisting = [
+      inPoolRow('https://dead0.example/', ''),
+      inPoolRow('https://dead1.example/', 'recheck_fail:1'),
+      inPoolRow('https://dead2.example/', `${ADMISSION_PHOENIX_OK_PREFIX}abcd1234`),
+    ];
+    fetchMock.mockImplementation((input) => {
+      const url = String(input);
+      if (!SEARCH.test(url)) return Promise.reject(new Error(`Unexpected network request: ${url}`));
+      return Promise.resolve(okResponse(input));
+    });
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    const settled = runAdmissionRunnerRound(120_000);
+    await vi.advanceTimersByTimeAsync(120_000 + 60_000);
+    const summary = await settled;
+    vi.useRealTimers();
+    // 评估环只剩 dead2（phoenix_ok: 待确认）与 dead3（未测）：两行在池 ok 行被 runner 滤出。
+    expect(summary).toMatchObject({ sources: 4, candidates: 2, probed: 2, written: 2 });
+    const probedHosts = [...new Set(searches().map(([input]) => new URL(String(input)).hostname))].sort();
+    expect(probedHosts).toEqual(['dead2.example', 'dead3.example']);
+    const insert = queries().find((query) => query.text.includes('INSERT INTO source_admission'))!;
+    const rows = JSON.parse(insert.values[2] as string) as { source_url: string }[];
+    expect(rows.map((row) => row.source_url).sort()).toEqual(['https://dead2.example/', 'https://dead3.example/']);
+  });
+
+  it('admchurn42：Vercel 独立轮不受影响——在池 ok 行 rules 变更后照旧评估改判', async () => {
+    vi.useFakeTimers();
+    vi.stubEnv('ADMISSION_MAX_PROBES', '1');
+    stored = [{ source_url: 'https://dead0.example/', source: deadSource(0) }];
+    admissionExisting = [inPoolRow('https://dead0.example/', '', 'not-current-hash')];
+    fetchMock.mockImplementation((input) => {
+      const url = String(input);
+      if (!SEARCH.test(url)) return Promise.reject(new Error(`Unexpected network request: ${url}`));
+      return Promise.resolve(okResponse(input));
+    });
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    const settled = runAdmissionRound();
+    await vi.advanceTimersByTimeAsync(ADMISSION_ROUND_BUDGET_MS + 60_000);
+    const summary = await settled;
+    vi.useRealTimers();
+    expect(summary).toMatchObject({ sources: 1, candidates: 1, probed: 1, written: 1 });
+    const insert = queries().find((query) => query.text.includes('INSERT INTO source_admission'))!;
+    const [row] = JSON.parse(insert.values[2] as string) as { search_verdict: string; error: string }[];
+    expect(row).toMatchObject({ search_verdict: 'ok', error: '' });
   });
 
   it('租约被占 ⇒ 整轮跳过（trigger=runner），不读源表、不探、不记成功行', async () => {    lease = 'held';
