@@ -28,6 +28,12 @@ export interface ReaderChapter {
 export interface ReaderIndex {
   taskId: number | null;
   source?: ReaderSource;
+  /**
+   * readerlocal42：书仓直读提示。仅 source 会话的目录响应附带——同书在 download_tasks
+   * 已有可读 done 全文时给该任务 id，前端渲染提示条一键跳 /read/<id>。下载会话与
+   * 旧服务端不带此字段。只提示、不切换会话，正文交付路径零变化。
+   */
+  doneReadTaskId?: number;
   title: string;
   author: string;
   version: string;

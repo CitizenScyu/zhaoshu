@@ -79,6 +79,7 @@
 .liveStatus { min-height: 30px; flex-shrink: 0; text-align: center; padding: 6px 16px; font-size: 12px; color: var(--reader-muted); }
 .liveStatus:empty { display: none; }
 .errorBar { display: flex; justify-content: center; align-items: center; gap: 16px; flex-wrap: wrap; padding: 8px 20px; color: var(--reader-accent); background: var(--reader-paper); font-size: 14px; }
+.doneHint { display: flex; justify-content: center; align-items: center; gap: 16px; flex-wrap: wrap; padding: 8px 20px; color: var(--reader-muted); background: var(--reader-paper); font-size: 13px; }
 .errorText { color: var(--reader-accent) !important; }
 .similarList { display: flex; flex-direction: column; gap: 8px; flex-shrink: 0; max-height: 40vh; overflow: auto; padding: 8px 20px 12px; }
 .similarItem { display: flex; flex-direction: column; gap: 4px; padding: 10px 14px; text-align: left; background: var(--reader-paper); border: 1px solid var(--reader-line); border-radius: 4px; color: inherit; font: inherit; cursor: pointer; }

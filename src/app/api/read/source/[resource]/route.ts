@@ -8,9 +8,10 @@ import { SourcePolicyError } from '@/lib/source-policy';
 import { sourceBookMatches } from '@/lib/source-parser';
 import {
   currentSourceHint, readSourceChapter, resolveSourceBook, saveSourceCatalog, sourceReaderIndex,
-  SourceReaderError, SourceRequestContext, surveySourceBooks,
+  SourceCatalog, SourceReaderError, SourceRequestContext, surveySourceBooks,
 } from '@/lib/source-reader';
 import { attachSwitchedCatalog } from '@/lib/reader-switch-catalog';
+import { findDoneReadTask } from '@/lib/library-read-task';
 import { withDbQuotaGuard } from '@/lib/db-quota-guard';
 
 export const runtime = 'nodejs';
@@ -48,6 +49,27 @@ async function withSwitchedCatalog(part: Awaited<ReturnType<typeof readSourceCha
  */
 function isRecoverableHintFailure(error: unknown): boolean {
   return error instanceof SourceReaderError || error instanceof SourcePolicyError;
+}
+
+/**
+ * readerlocal42：目录响应统一出口。目录建成后附带一次书仓 done 任务查询（身份口径与
+ * find/exact 的 sharedReadTaskId 同源），命中即带 doneReadTaskId 供前端渲染「书仓已有
+ * 全文」提示条。查询失败静默（lib 内 catch 归 null）——提示是加分项，绝不拖垮目录交付；
+ * 目录已 saveSourceCatalog 落库，正文路径不受此查询影响。
+ */
+async function indexResponse(catalog: SourceCatalog, canRead: boolean, extra: Record<string, unknown> = {}) {
+  // lib 契约是失败归 null，这里再兜一层：任何异常都不许拖垮目录交付。
+  let doneReadTaskId: number | null = null;
+  try {
+    doneReadTaskId = await findDoneReadTask(canRead, catalog.title, catalog.author);
+  } catch {
+    doneReadTaskId = null;
+  }
+  return response({
+    ...sourceReaderIndex(catalog),
+    ...(doneReadTaskId !== null ? { doneReadTaskId } : {}),
+    ...extra,
+  });
 }
 
 async function handleGET(req: NextRequest, { params }: { params: Promise<{ resource: string }> }) {
@@ -102,7 +124,7 @@ async function handleGET(req: NextRequest, { params }: { params: Promise<{ resou
             throw new SourceReaderError('首选源指向的书与请求不一致，已回落整池搜索。', 'SOURCE_NOT_FOUND', 404);
           }
           await saveSourceCatalog(catalog, signal);
-          return response(sourceReaderIndex(catalog));
+          return await indexResponse(catalog, auth.ok);
         } catch (error) {
           if (signal.aborted || !isRecoverableHintFailure(error)) throw error;
           // 落到下面的整池搜索（bookUrl 不再带 ⇒ 按 title/author 重新选源）。
@@ -111,7 +133,7 @@ async function handleGET(req: NextRequest, { params }: { params: Promise<{ resou
       // 显式点选确认（无 prefer）仍带 bookUrl 走 confirm 路径、失败 404，行为逐字不变。
       const catalog = await resolveSourceBook({ title, author }, context, bookUrl && !hinted ? { bookUrl, ...(sourceUrl ? { sourceUrl } : {}) } : {});
       await saveSourceCatalog(catalog, signal);
-      return response(hinted ? { ...sourceReaderIndex(catalog), hintCleared: true } : sourceReaderIndex(catalog));
+      return await indexResponse(catalog, auth.ok, hinted ? { hintCleared: true } : {});
     }
     if (resource === 'alternates') {
       await raceDeadline(signal, ensureSchema);

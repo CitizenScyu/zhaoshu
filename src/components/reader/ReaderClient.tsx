@@ -124,6 +124,12 @@ function ReaderSession({ session, from }: Props) {
   const tap = useRef<{ x: number; y: number; time: number } | null>(null);
   const chapter = activePart?.chapterIndex ?? 0;
   const chapters = reading?.index.chapters ?? [];
+  // readerlocal42 书仓直读提示：source 会话的目录响应带 doneReadTaskId（同书在书仓已有可读 done
+  // 全文）时渲染提示条。旧服务端/无命中不带字段，条不出现。只提示、不切换会话——链接跳
+  // /read/<id> 是新会话，当前 source 会话进度不受影响。非安全正整数一律按无提示处理。
+  const doneHintId = typeof reading?.index.doneReadTaskId === 'number'
+    && Number.isSafeInteger(reading.index.doneReadTaskId) && reading.index.doneReadTaskId > 0
+    ? reading.index.doneReadTaskId : null;
   // 正在供稿的源:段上的源名与源 url 成对取(章内换源后是新源);还没有段时取目录的。
   // 段只带源名(旧服务端)时 url 留空 ⇒ 面板按源名认,不拿目录上可能已过时的 url 去配。
   // ruxrev42 F-1:必须 memo 在原始值上 —— 裸对象字面量每次渲染都是新引用,下游把它放进
@@ -350,6 +356,12 @@ function ReaderSession({ session, from }: Props) {
         </div>
       </header>
       <button ref={restoreButton} hidden={!focused} className={styles.restoreTools} onClick={() => toggleFocus(true)} aria-label="显示工具栏" title="显示工具栏（Esc）">☷</button>
+      {session.kind === 'source' && doneHintId !== null && (
+        <div className={styles.doneHint} role="status">
+          <span>书库已有本书全文，切换后阅读更稳、无需逐章请求书源。</span>
+          <Link className={styles.tool} href={`/read/${doneHintId}?from=${from}`}>打开全书阅读 →</Link>
+        </div>
+      )}
       {failure && (
         <div className={styles.errorBar} role="alert">
           <span>{failure.message}</span>
