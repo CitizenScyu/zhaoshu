@@ -568,6 +568,7 @@ export interface EngineDownloadLike {
         chapters_done?: number;
         chars?: number;
         failure_stage?: string;
+        failure_name?: string;
         artifact?: { file: string; sha256: string; bytes: number };
         chapters?: EngineChapterRecord[];
       };
