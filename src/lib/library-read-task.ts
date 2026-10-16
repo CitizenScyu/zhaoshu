@@ -21,6 +21,7 @@ function doneReadTaskQuery(
         AND NOT EXISTS (SELECT 1 FROM unnest(string_to_array(a.canonical_path, '/')) AS segment
           WHERE segment IN ('', '.', '..'))
     ))` : sql`to_jsonb(dt)->>'artifact_id' IS NULL`;
+  // 嵌套片段只能在模板里内插（与 user-data.exactLibraryBooksForUserQuery 同范式），不能包一层再调用。
   return sql`SELECT dt.id FROM download_tasks dt
     WHERE lower(btrim(dt.title)) = ${titleKey}
       AND lower(COALESCE(NULLIF(btrim(dt.author), ''), '佚名')) = ${authorKey}
@@ -43,10 +44,10 @@ export async function findDoneReadTask(canRead: boolean, title: string, author: 
       SELECT to_regclass('book_artifacts') IS NOT NULL
         AND to_regclass('storage_repositories') IS NOT NULL AS available
     ` as { available: boolean }[];
-    const rows = await sql(doneReadTaskQuery(
+    const rows = await doneReadTaskQuery(
       sql, normalizeBookTitle(title).toLowerCase(), normalizeBookAuthor(author).toLowerCase(),
       registry[0]?.available === true,
-    )) as { id: number }[];
+    ) as { id: number }[];
     const id = rows[0]?.id;
     return typeof id === 'number' && Number.isSafeInteger(id) && id > 0 && id <= 2_147_483_647 ? id : null;
   } catch {
