@@ -18,13 +18,18 @@ import { DEFAULT_READER_SETTINGS, indexProgressKey } from '@/lib/reader-preferen
 import type { ReaderSettings, ReaderTheme, ReadingPosition } from '@/lib/reader-preferences';
 import { useReader, partKey } from './useReader';
 import FeedbackPrompt from './FeedbackPrompt';
-import { isCurrentSource, useSourceFanout } from './useSourceFanout';
+import { isCurrentSource, useSourceFanout, findFirstSwitchableSource } from './useSourceFanout';
 import type { FanoutRow, ProbeCache, ServingSource } from './useSourceFanout';
 import { nextReadingPosition, previousReadingPosition } from '@/lib/reader-part-cache';
 import styles from './reader.module.css';
 
 interface Props { session: ReadingSession; from: ReaderOrigin }
 const DIRECTORY_PAGE_SIZE = 80;
+
+// readerux42-B 自动阅读:三档滚读速度(px/s);100ms 一拍,长章只改 scrollTop 不动 DOM。
+type AutoSpeed = 'slow' | 'normal' | 'fast';
+const AUTO_READ_SPEEDS: Record<AutoSpeed, number> = { slow: 36, normal: 75, fast: 150 };
+const AUTO_READ_TICK_MS = 100;
 
 function bodyText(part: ReaderPart): string {
   const text = part.text.replace(/^\uFEFF/, '');
@@ -109,7 +114,7 @@ function ReaderSession({ session, from }: Props) {
   const {
     settings, reading, activePart, loading, flowing, failure, percent, notice, storageFailed, progressStorageFailed, settingsStorageFailed, focused,
     scroller, article, heading, onScroll, updateSettings, setFocusMode, navigate: requestNavigation,
-    extend, retry, markScrollIntent, setSection, loadConfirmedBook, registerSwitchCommitted,
+    extend, retry, markScrollIntent, setSection, loadConfirmedBook, registerSwitchCommitted, setNotice, switchedBookUrl,
   } = useReader(session, apiFetch, user?.id ?? 0, isReaderSessionCurrent);
   const [panel, setPanel] = useState<'directory' | 'settings' | 'sources' | null>(null);
   // 41-panel:扇出 probe 结果在本阅读会话内复用(关了面板再开不重复出网/计数);换账号时 ReaderSession 重挂即清。
@@ -121,9 +126,13 @@ function ReaderSession({ session, from }: Props) {
   const chapters = reading?.index.chapters ?? [];
   // 正在供稿的源:段上的源名与源 url 成对取(章内换源后是新源);还没有段时取目录的。
   // 段只带源名(旧服务端)时 url 留空 ⇒ 面板按源名认,不拿目录上可能已过时的 url 去配。
-  const servingSource: ServingSource | undefined = activePart?.servedFrom
-    ? { name: activePart.servedFrom, url: activePart.servedFromUrl }
-    : reading?.index.source && { name: reading.index.source.name, url: reading.index.source.sourceUrl };
+  // ruxrev42 F-1:必须 memo 在原始值上 —— 裸对象字面量每次渲染都是新引用,下游把它放进
+  // 带 abort cleanup 的 effect 依赖(自动换源)时,无关重渲染(notice 等)就会取消在飞探测。
+  const servingSource = useMemo<ServingSource | undefined>(() => {
+    if (activePart?.servedFrom) return { name: activePart.servedFrom, url: activePart.servedFromUrl };
+    if (reading?.index.source) return { name: reading.index.source.name, url: reading.index.source.sourceUrl };
+    return undefined;
+  }, [activePart?.servedFrom, activePart?.servedFromUrl, reading?.index.source]);
   const first = reading?.parts[0];
   const last = reading?.parts[reading.parts.length - 1];
   const before = reading && first ? previousReadingPosition(reading.index, first) : null;
@@ -219,6 +228,89 @@ function ReaderSession({ session, from }: Props) {
   // React Compiler 规则判「修改 hook 返回值」error。
   useEffect(() => { registerSwitchCommitted(commitSwitchedBookUrl); }, [registerSwitchCommitted, commitSwitchedBookUrl]);
 
+  // readerux42-A 阅读中自动换源:正文/目录取失败(请求已落定,错误条已出现)时自动触发扇出检测,
+  // 取第一个可直切源走 loadConfirmedBook(进度经既有迁移逻辑尽量保留)。
+  // 纪律:每章(或目录)至多自动换一次 —— 第二次失败只提示、回落手动换源 UI,防多源连环失败死循环;
+  // SOURCE_SIMILAR(422)有自己的候选点选卡,歧义候选不自动替用户选;用户打开换源面板时在途自动
+  // 探测中止(面板有自己的扫描与同一 ProbeCache),让位给手动选择;开关默认开(阅读设置)。
+  const autoSwitchSeen = useRef<typeof failure>(null);
+  const autoSwitchTried = useRef<string | null>(null);
+  // ruxrev42 F-1:session 拆成收窄后的原始值再进依赖 —— 对象引用不稳定时不得进带 abort
+  // cleanup 的 effect 依赖(下游重渲染会取消在飞探测);source 会话的 title/author 恒定。
+  const sessionKind = session.kind;
+  const sessionTitle = session.kind === 'source' ? session.title : '';
+  const sessionAuthor = session.kind === 'source' ? session.author : '';
+  useEffect(() => {
+    if (!failure || failure === autoSwitchSeen.current) return;
+    autoSwitchSeen.current = failure;
+    if (sessionKind !== 'source' || panel === 'sources') return;
+    if (failure.code === 'SOURCE_SIMILAR' || ![404, 422, 503, 504].includes(failure.status)) return;
+    if (!settings.autoSwitchSource) return;
+    // 确认路径(手动点选候选后的 book_url 重放)失败不自动换:候选是用户明确选的,自动重试同一
+    // 候选没有增量价值、还会与用户的再次点选叠成双份确认;回落「重试/换个书源」手动路径。
+    if (!failure.target && switchedBookUrl()) return;
+    // ruxrev42 F-2:无 target 的失败(换源后建目录/取首段失败)是触发它的那次换源的延续,
+    // 继承上一次已记的 key —— 自立 'index' 命名空间会让一次章节失败连带烧第二轮扇出探测。
+    // 尚未记过任何 key(初次进书目录失败)才用 'index'。
+    const key = failure.target
+      ? `${failure.target.chapterIndex}:${failure.target.partIndex}`
+      : autoSwitchTried.current ?? 'index';
+    if (autoSwitchTried.current === key) {
+      setNotice('本章已自动换过一次书源,不再自动重试;可点「换个书源」手动切换。');
+      return;
+    }
+    autoSwitchTried.current = key;
+    setNotice('本章打不开,正在尝试其他书源…');
+    const controller = new AbortController();
+    void findFirstSwitchableSource({
+      apiFetch, title: sessionTitle, author: sessionAuthor, currentSource: servingSource, cache: probeCache, signal: controller.signal,
+    }).then((found) => {
+      if (controller.signal.aborted || !isReaderSessionCurrent()) return;
+      if (found) {
+        // 切换成功后的提示交给 useReader 的换源迁移 notice(「已切换书源,回到原进度」等),不重复播报。
+        loadConfirmedBook(found.bookUrl, found.sourceUrl);
+      } else {
+        setNotice('没有找到可直接切换的可用书源;可点「换个书源」手动检测。');
+      }
+    });
+    // 依赖里的 panel 变化(打开换源面板/其他面板)会中止在途自动探测;seen 守卫防止二次触发。
+    return () => controller.abort();
+  }, [failure, panel, sessionKind, sessionTitle, sessionAuthor, settings.autoSwitchSource, apiFetch, probeCache, servingSource, loadConfirmedBook, isReaderSessionCurrent, setNotice, switchedBookUrl]);
+
+  // readerux42-B 自动阅读:会话内状态(不持久化);开关在页脚,速度三档。滚读是定时驱动
+  // (每拍只改 scroller.scrollTop,不重排 DOM,长章不卡);章末走既有 extend('next') 连续阅读
+  // 链路无缝接下一章(fqapp 语义:新章从顶部开始、播放不中断);到最后一章停并提示。
+  // 暂停条件:页面隐藏、面板打开、取章在途(loading/flowing)、出错(错误条出现即停)。
+  // 用户主动滚动/翻章即接管 —— 自动阅读关闭,再点开关恢复。
+  const [autoRead, setAutoRead] = useState(false);
+  const [autoSpeed, setAutoSpeed] = useState<AutoSpeed>('normal');
+  const autoHasNext = !!after;
+  useEffect(() => { if (failure && autoRead) setAutoRead(false); }, [failure, autoRead]);
+  useEffect(() => {
+    if (!autoRead) return;
+    const speedPx = AUTO_READ_SPEEDS[autoSpeed] / (1000 / AUTO_READ_TICK_MS);
+    const timer = setInterval(() => {
+      const viewport = scroller.current;
+      if (!viewport || document.visibilityState === 'hidden' || panel || failure || loading || flowing) return;
+      const remaining = viewport.scrollHeight - viewport.scrollTop - viewport.clientHeight;
+      if (remaining > 4) {
+        viewport.scrollTop = viewport.scrollTop + speedPx;
+      } else if (autoHasNext) {
+        // 章末无缝接续:extend 内部复用滚动续读/预取链路,新章内容接上后本拍继续滚。
+        void extend('next', true);
+      } else {
+        setAutoRead(false);
+        setNotice('已读到全书末尾，自动阅读停止。');
+      }
+    }, AUTO_READ_TICK_MS);
+    return () => clearInterval(timer);
+  }, [autoRead, autoSpeed, autoHasNext, panel, failure, loading, flowing, extend, scroller, setNotice]);
+  // 用户手势(滚轮/触摸拖动/方向键)即接管滚动:自动阅读让位。
+  function userScrollIntent(forward: boolean) {
+    if (autoRead) setAutoRead(false);
+    markScrollIntent(forward);
+  }
+
   function toggleFocus(focusControl = false) {
     const next = !focused;
     setFocusMode(next);
@@ -300,14 +392,14 @@ function ReaderSession({ session, from }: Props) {
         aria-busy={loading}
         tabIndex={0}
         onScroll={onScroll}
-        onWheel={(event) => markScrollIntent(event.deltaY > 0)}
+        onWheel={(event) => userScrollIntent(event.deltaY > 0)}
         onPointerDown={(event) => {
           if (event.pointerType !== 'touch' || !event.isPrimary || !(event.target as HTMLElement).closest('[data-reader-prose]')) { tap.current = null; return; }
           tap.current = { x: event.clientX, y: event.clientY, time: performance.now() };
         }}
         onPointerMove={(event) => {
           if (event.pointerType === 'touch' && tap.current && Math.abs(event.clientY - tap.current.y) > 8) {
-            markScrollIntent(event.clientY < tap.current.y);
+            userScrollIntent(event.clientY < tap.current.y);
           }
         }}
         onPointerUp={(event) => {
@@ -321,8 +413,8 @@ function ReaderSession({ session, from }: Props) {
         onPointerCancel={() => { tap.current = null; }}
         onKeyDown={(event) => {
           if (loading || panel || event.altKey || event.ctrlKey || event.metaKey || (event.target as HTMLElement).closest('button, a, input, select, textarea')) return;
-          if (['ArrowDown', 'PageDown', ' ', 'End'].includes(event.key)) markScrollIntent(true);
-          if (['ArrowUp', 'PageUp', 'Home'].includes(event.key)) markScrollIntent(false);
+          if (['ArrowDown', 'PageDown', ' ', 'End'].includes(event.key)) userScrollIntent(true);
+          if (['ArrowUp', 'PageUp', 'Home'].includes(event.key)) userScrollIntent(false);
           // Shift+方向键是浏览器原生扩展选区:不拦截、不翻章,否则用户选字选到边界就被带去下一章。
           if (event.shiftKey) return;
           if (event.key === 'ArrowLeft' && chapter > 0) { event.preventDefault(); navigate(position(chapter - 1)); }
@@ -374,6 +466,14 @@ function ReaderSession({ session, from }: Props) {
 
       <footer className={styles.footer} hidden={focused}>
         <div className={styles.progressTrack} role="progressbar" aria-label="全书阅读进度" aria-valuemin={0} aria-valuemax={100} aria-valuenow={Number(percent.toFixed(1))}><span style={{ width: percent + '%' }} /></div>
+        {reading && <div className={styles.autoRow}>
+          <button className={styles.tool} aria-pressed={autoRead} title={autoRead ? '停止自动阅读' : '开始自动阅读'} onClick={() => setAutoRead(!autoRead)}>{autoRead ? '停止自动' : '自动阅读'}</button>
+          {autoRead && <div className={styles.autoSpeeds} role="group" aria-label="自动阅读速度">
+            {([['slow', '慢'], ['normal', '中'], ['fast', '快']] as [AutoSpeed, string][]).map(([key, label]) => (
+              <button key={key} className={styles.choice} aria-pressed={autoSpeed === key} onClick={() => setAutoSpeed(key)}>{label}</button>
+            ))}
+          </div>}
+        </div>}
         <div className={styles.footerInner}>
           <button className={styles.chapterButton} disabled={!reading || loading || chapter === 0} onClick={() => navigate(position(chapter - 1))}>← 上一章</button>
           <button className={styles.progressButton} disabled={!reading} onClick={() => showPanel('directory')} aria-label="打开目录，查看阅读位置">
@@ -687,6 +787,10 @@ function Settings({ value, onChange }: { value: ReaderSettings; onChange: (value
         <legend>接着阅读</legend>
         <label className={styles.switchRow}><span>滚动自动接续<small>接近章末时载入后文</small></span><input type="checkbox" checked={value.continuous} onChange={(event) => onChange({ ...value, continuous: event.target.checked })} /></label>
         <label className={styles.switchRow}><span>提前载入下一处<small>减少翻章等待，省流量模式下自动暂停</small></span><input type="checkbox" checked={value.preloadNext} onChange={(event) => onChange({ ...value, preloadNext: event.target.checked })} /></label>
+      </fieldset>
+      <fieldset>
+        <legend>换源</legend>
+        <label className={styles.switchRow}><span>自动换源<small>正文打不开时自动切换可用书源，每章至多一次</small></span><input type="checkbox" checked={value.autoSwitchSource} onChange={(event) => onChange({ ...value, autoSwitchSource: event.target.checked })} /></label>
       </fieldset>
       <div className={styles.settingSample} style={{ fontSize: value.fontSize, lineHeight: value.lineHeight }}>掬一捧月色，<br />翻一页山河。</div>
       <button className={styles.locate} onClick={() => onChange({ ...DEFAULT_READER_SETTINGS })}>恢复默认设置</button>

@@ -19,6 +19,8 @@ export interface ReaderSettings {
   width: ReaderWidth;
   continuous: boolean;
   preloadNext: boolean;
+  /** readerux42-A:正文取失败时自动换源(每章至多一次)。 */
+  autoSwitchSource: boolean;
 }
 
 export interface ReadingPosition {
@@ -44,7 +46,7 @@ export interface ReadingProgress extends ReadingPosition {
 
 export const DEFAULT_READER_SETTINGS: ReaderSettings = {
   fontSize: 20, lineHeight: 1.9, theme: 'day', font: 'wenkai', width: 'standard',
-  continuous: true, preloadNext: true,
+  continuous: true, preloadNext: true, autoSwitchSource: true,
 };
 
 function parseObject(raw: string | null): Record<string, unknown> | null {
@@ -69,6 +71,7 @@ export function parseReaderSettings(raw: string | null): ReaderSettings {
     width: value?.width === 'narrow' || value?.width === 'wide' ? value.width : 'standard',
     continuous: typeof value?.continuous === 'boolean' ? value.continuous : true,
     preloadNext: typeof value?.preloadNext === 'boolean' ? value.preloadNext : true,
+    autoSwitchSource: typeof value?.autoSwitchSource === 'boolean' ? value.autoSwitchSource : true,
   };
 }
 

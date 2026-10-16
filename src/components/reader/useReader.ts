@@ -692,6 +692,8 @@ export function useReader(session: ReadingSession, apiFetch: ApiFetch, userId: n
     settings, reading, activePart, loading, flowing, failure, percent, notice, storageFailed, progressStorageFailed, settingsStorageFailed, focused,
     scroller, article, heading, onScroll, updateSettings, setFocusMode, navigate, extend, retry,
     markScrollIntent, loadConfirmedBook, switchedBookUrl, switchedSourceUrl,
+    /** readerux42-A:UI 层(自动换源)写轻提示;useState setter 稳定引用,与既有 notice 5s 自清共用。 */
+    setNotice,
     /**
      * M3 复审 P1-3:注册「目录加载成功」回调,供 UI 层在成功后才写 book_url 进 URL。
      * 返回的是注册函数(稳定引用),不是裸 ref —— 直接写 hook 返回的 ref 会被

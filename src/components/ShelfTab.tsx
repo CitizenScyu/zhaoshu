@@ -6,6 +6,8 @@ import { feedbackProfileUpdateMessage, MAX_FEEDBACK_NOTE_LENGTH } from '@/lib/fe
 import { useOwner } from '@/components/OwnerProvider';
 import FeedbackForm from '@/components/FeedbackForm';
 import ReadBookLink from '@/components/ReadBookLink';
+import { readSourceMemory } from '@/lib/source-memory';
+import { userReadingProgressKey } from '@/lib/user-scope';
 import {
   CLEAR_NEW_TARGET, SHELF_ROW_LIMIT, filterShelfCards, foldShelfItems, nextConfirm, removeTarget,
 } from '@/lib/shelf-view';
@@ -39,8 +41,32 @@ const GROUPS: { key: ShelfStatus; label: string; color: string }[] = [
   { key: 'new', label: '未处理', color: 'var(--ink-faint)' },
 ];
 
+/** readerux42-C:任务类阅读进度的宽松读取(只取排序与章节展示需要的字段,坏形状一律当没有)。 */
+function taskProgressOf(raw: string | null): { updatedAt: number; chapterIndex: number } | null {
+  try {
+    const value = raw ? JSON.parse(raw) : null;
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+    const record = value as Record<string, unknown>;
+    const { chapterIndex, updatedAt } = record;
+    if (record.schema !== 1
+      || typeof chapterIndex !== 'number' || !Number.isSafeInteger(chapterIndex) || chapterIndex < 0
+      || typeof updatedAt !== 'number' || !Number.isFinite(updatedAt) || updatedAt <= 0) return null;
+    return { updatedAt, chapterIndex };
+  } catch {
+    return null;
+  }
+}
+
+function readTimeAgo(at: number, now: number): string {
+  const minutes = Math.max(1, Math.round((now - at) / 60_000));
+  if (minutes < 60) return `${minutes} 分钟前`;
+  const hours = Math.round(minutes / 60);
+  if (hours < 24) return `${hours} 小时前`;
+  return `${Math.round(hours / 24)} 天前`;
+}
+
 export default function ShelfTab() {
-  const { apiFetch, sessionId, isCurrentSession } = useOwner();
+  const { apiFetch, user, sessionId, isCurrentSession } = useOwner();
   const [items, setItems] = useState<ShelfItem[] | null>(null);
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(true);
@@ -100,6 +126,33 @@ export default function ShelfTab() {
   const visible = useMemo(() => filterShelfCards(cards, keyword), [cards, keyword]);
   // 后端一次最多返回 SHELF_ROW_LIMIT 本，拿满就说明后面还有没列出来的。
   const truncated = (items?.length ?? 0) >= SHELF_ROW_LIMIT;
+
+  // readerux42-C「最近在读」:按本地阅读数据(任务进度 localStorage + 源记忆)的最后阅读时间
+  // 排序,同一本书取最新一条、最多 5 本;点进走 ReadBookLink 深链,阅读页自己恢复到章节位置。
+  // 只做只读合成,不写存储;无进度数据(含未登录)整节不渲染。
+  const recentReads = useMemo(() => {
+    if (!items || !user) return [];
+    const userId = user.id;
+    const now = Date.now();
+    const best = new Map<number, { item: ShelfItem; at: number; chapter: number | null }>();
+    for (const item of items) {
+      let at = 0;
+      let chapter: number | null = null;
+      if (typeof item.read_task_id === 'number') {
+        let raw: string | null = null;
+        try { raw = window.localStorage.getItem(userReadingProgressKey(userId, item.read_task_id)); } catch { raw = null; }
+        const progress = taskProgressOf(raw);
+        if (progress) { at = progress.updatedAt; chapter = progress.chapterIndex; }
+      }
+      // 源类在线读没有任务 id:用「按书记住上次读通的源」的时间(身份键即书名+作者归一)。
+      const memory = readSourceMemory(item.title, item.author, now);
+      if (memory && memory.at > at) at = memory.at;
+      if (at <= 0) continue;
+      const previous = best.get(item.book_id);
+      if (!previous || at > previous.at) best.set(item.book_id, { item, at, chapter });
+    }
+    return [...best.values()].sort((a, b) => b.at - a.at).slice(0, 5);
+  }, [items, user]);
 
   // 两段式确认：第一次点只武装，第二次点同一目标才放行；3 秒无后续点击自动解除。
   // 换目标只重新武装当前目标，不会顺手放行上一个目标。
@@ -242,6 +295,37 @@ export default function ShelfTab() {
         <p className="text-sm py-10 text-center" style={{ color: 'var(--ink-faint)' }}>
           书架空空，先去「找书」跑一单
         </p>
+      )}
+      {recentReads.length > 0 && (
+        <section aria-label="最近在读">
+          <div className="flex flex-wrap items-center gap-2 mb-3 pb-2 border-b border-dashed" style={{ borderColor: 'var(--line)' }}>
+            <h2 className="text-sm font-bold tracking-[0.25em]" style={{ color: 'var(--gold)' }}>
+              最近在读 · {recentReads.length}
+            </h2>
+          </div>
+          <div className="space-y-2.5">
+            {recentReads.map(({ item, at, chapter }) => (
+              <div key={item.id} className="book-card px-5 py-3 pl-6 flex flex-wrap items-center gap-x-4 gap-y-2">
+                <div className="min-w-0 flex-1">
+                  <span className="font-bold break-words">{item.title}</span>
+                  <span className="text-xs ml-2 break-words" style={{ color: 'var(--ink-faint)' }}>
+                    {item.author}
+                  </span>
+                </div>
+                <span className="text-xs shrink-0" style={{ color: 'var(--ink-faint)' }}>
+                  {readTimeAgo(at, Date.now())}
+                </span>
+                <ReadBookLink
+                  taskId={item.read_task_id}
+                  title={item.title}
+                  author={item.author}
+                  from="shelf"
+                  label={chapter != null ? `续读 · 第 ${chapter + 1} 章` : '续读'}
+                />
+              </div>
+            ))}
+          </div>
+        </section>
       )}
       {cards.length > 0 && (
         <div className="flex flex-wrap items-center gap-2">

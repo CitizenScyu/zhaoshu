@@ -103,6 +103,12 @@
 .footer { flex-shrink: 0; background: var(--reader-paper); padding-bottom: env(safe-area-inset-bottom); }
 .progressTrack { height: 2px; background: var(--reader-line); }
 .progressTrack > span { height: 100%; display: block; background: var(--reader-accent); }
+/* readerux42-B 自动阅读:页脚进度条下方一行,开关 + 开启后的三档速度。 */
+.autoRow { max-width: 820px; margin: 0 auto; display: flex; justify-content: center; align-items: center; gap: 12px; padding: 6px max(20px, env(safe-area-inset-right)) 0 max(20px, env(safe-area-inset-left)); }
+.autoRow .tool { min-height: 40px; padding: 6px 16px; font-size: 13px; }
+.autoRow .tool[aria-pressed='true'] { border-color: var(--reader-accent); color: var(--reader-accent); background: var(--reader-selected); }
+.autoSpeeds { display: flex; gap: 8px; }
+.autoSpeeds .choice { flex: none; min-width: 52px; min-height: 40px; }
 .footerInner { max-width: 820px; margin: 0 auto; display: grid; grid-template-columns: 1fr 1fr 1fr; align-items: center; gap: 12px; padding: 8px max(20px, env(safe-area-inset-right)) 8px max(20px, env(safe-area-inset-left)); }
 .chapterButton { min-height: 48px; font-size: 14px; padding: 10px; border-radius: 3px; white-space: nowrap; }
 .chapterButton:first-child { justify-self: start; }
@@ -201,6 +207,9 @@
   .chapterTitle { margin: 24px 0; letter-spacing: .03em; }
   .prose { letter-spacing: 0; }
   .footerInner { gap: 2px; padding: 5px max(8px, env(safe-area-inset-right)) 5px max(8px, env(safe-area-inset-left)); }
+  .autoRow { gap: 8px; padding: 4px max(8px, env(safe-area-inset-right)) 0 max(8px, env(safe-area-inset-left)); }
+  .autoSpeeds { gap: 6px; }
+  .autoSpeeds .choice { min-width: 44px; }
   .chapterButton { font-size: 13px; padding: 8px; }
   .progressButton { font-size: 12px; }
   .continueNav { gap: 10px; }
