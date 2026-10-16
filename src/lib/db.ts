@@ -7,7 +7,8 @@ import type { PersonalWriter } from './personal-write';
 import { completeProfileFeedbackForUserQuery } from './user-data';
 import { quotaAwareFetch } from './db-quota-guard';
 import { libraryLabelsForCandidatesQuery, type LibraryLabelRow } from './library-grounding';
-import { requireUserId, profileForUserQuery, saveProfileForUserQuery, excludedBooksForUserQuery, persistRecommendationsForUserQueries, feedbackForUserQueries, feedbackSnapshotForUserQuery, recentInformativeFeedbackForUserQuery, withdrawnFeedbackBookTitlesForUserQuery, enqueueProfileFeedbackForUserQuery, profileFeedbackQueueForUserQuery, markProfileFeedbackAbsorbedForUserQuery, markProfileFeedbackFailedForUserQuery, markProfileFeedbackAbsorbedUncheckedForUserQuery, profileFeedbackFailCountForUserQuery, maxFeedbackIdForUserQuery, ensureProfileForUserQuery, claimProfileFeedbackForUserQuery, drainableProfileFeedbackUsersQuery, profileFeedbackBackoffMs } from './user-data';
+import { requireUserId, profileForUserQuery, saveProfileForUserQuery, excludedBooksForUserQuery, persistRecommendationsForUserQueries, feedbackForUserQueries, feedbackSnapshotForUserQuery, recentInformativeFeedbackForUserQuery, withdrawnFeedbackBookTitlesForUserQuery, enqueueProfileFeedbackForUserQuery, profileFeedbackQueueForUserQuery, markProfileFeedbackAbsorbedForUserQuery, markProfileFeedbackFailedForUserQuery, markProfileFeedbackAbsorbedUncheckedForUserQuery, profileFeedbackFailCountForUserQuery, maxFeedbackIdForUserQuery, ensureProfileForUserQuery, claimProfileFeedbackForUserQuery, drainableProfileFeedbackUsersQuery, profileFeedbackBackoffMs, readerSyncEntriesForUserQuery, saveReaderSyncEntriesForUserQueries } from './user-data';
+import { normalizeReaderSyncEntry, parseReaderSyncItemKey, readerSyncItemKey, type ReaderSyncEntry } from './reader-sync';
 export { canonicalBookKey } from './book-identity';
 
 const DATABASE_URL = process.env.DATABASE_URL;
@@ -443,4 +444,43 @@ export async function ensureProfileForUser(userId: number, write: PersonalWriter
   requireUserId(userId);
   if (typeof write !== 'function') throw new Error('authorized writer is required');
   await write((sql) => [ensureProfileForUserQuery(sql, userId)]);
+}
+
+// ---- readsync42：阅读进度 / 设置云端同步 ----
+
+function readerSyncRow(entry: { item_key: string; payload: unknown; client_updated_at: unknown }): ReaderSyncEntry | null {
+  const parsed = parseReaderSyncItemKey(entry.item_key);
+  if (!parsed) return null;
+  return normalizeReaderSyncEntry({ ...parsed, payload: entry.payload, updatedAt: Number(entry.client_updated_at) });
+}
+
+export async function getReaderSyncForUser(userId: number): Promise<ReaderSyncEntry[]> {
+  requireUserId(userId);
+  const rows = await readerSyncEntriesForUserQuery(getSql(), userId) as
+    { item_key: string; payload: unknown; client_updated_at: unknown }[];
+  return rows.map(readerSyncRow).filter((entry): entry is ReaderSyncEntry => entry !== null);
+}
+
+/**
+ * 推一批条目并回读**服务端对这几个键的真值**。
+ * 返回的不是「哪些写成功」而是「这些键现在长什么样」：客户端据此就地收敛（本地较新就再推一次，
+ * 云端较新就覆盖本地），不必为确认结果再发一次 GET。
+ */
+export async function saveReaderSyncForUser(
+  userId: number, entries: readonly ReaderSyncEntry[], write: PersonalWriter,
+): Promise<ReaderSyncEntry[]> {
+  requireUserId(userId);
+  if (typeof write !== 'function') throw new Error('authorized writer is required');
+  const rows = entries.map((entry) => ({
+    // 键名必须与 SQL 里 jsonb_to_recordset 的列名逐字一致（snake_case）——
+    // 写成 itemKey 会让 recordset 把每一列都取成 NULL，报的是 item_key 非空约束，看着像迁移坏了。
+    item_key: readerSyncItemKey(entry.kind, entry.key),
+    payload: entry.payload,
+    client_updated_at: entry.updatedAt,
+  }));
+  if (!rows.length) return [];
+  await write((sql) => saveReaderSyncEntriesForUserQueries(sql, userId, rows));
+  const stored = await readerSyncEntriesForUserQuery(getSql(), userId, rows.map((row) => row.item_key)) as
+    { item_key: string; payload: unknown; client_updated_at: unknown }[];
+  return stored.map(readerSyncRow).filter((entry): entry is ReaderSyncEntry => entry !== null);
 }

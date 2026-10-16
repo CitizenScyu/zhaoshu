@@ -129,7 +129,9 @@ describe('planMigrations（纯函数）', () => {
   it('plannedLedgerWrites：每个待执行版本一行记账，0001 自带的 auth 记账 1–4 一并列出', async () => {
     const migrations = await loadMigrations();
     const writes = plannedLedgerWrites(planMigrations([], migrations).pending, migrations);
-    expect(writes.filter((item) => item.table === 'schema_migrations').map((item) => item.version)).toEqual([1, 2, 3, 4, 5]);
+    // 版本号从迁移清单推，别写死：新增 0006 之类时这条断言不该被顺手改坏。
+    expect(writes.filter((item) => item.table === 'schema_migrations').map((item) => item.version))
+      .toEqual(migrations.map((item) => item.version));
     expect(writes.filter((item) => item.table === 'auth_schema_migrations')).toEqual([
       { table: 'auth_schema_migrations', byVersion: 1, values: '(1),(2),(3),(4)', onConflict: 'DO NOTHING' },
     ]);
@@ -242,7 +244,8 @@ maybe('PGlite 真库', () => {
     const before = await fingerprint(pg);
     const report = await runProdMigrate(createPGliteClient(pg), await load(), 'dry-run');
     expect(report.status).toBe('dry-run');
-    expect(report.ledger.pending.map((item: { version: number }) => item.version)).toEqual([3, 4, 5]);
+    expect(report.ledger.pending.map((item: { version: number }) => item.version))
+      .toEqual((await load()).filter(({ version }) => version >= 3).map(({ version }) => version));
     expect(report.ledgerWrites).toEqual((await load()).filter(({ version }) => version >= 3)
       .map(({ version, name, checksum }) => ({ table: 'schema_migrations', version, name, checksum })));
     expect(await fingerprint(pg)).toEqual(before);
@@ -251,7 +254,8 @@ maybe('PGlite 真库', () => {
   it('dry-run 零写入：空库（冷建库）不建 schema_migrations、不建任何表', async () => {
     const pg = new PGliteCtor!();
     const report = await runProdMigrate(createPGliteClient(pg), await load(), 'dry-run');
-    expect(report.ledger.pending.map((item: { version: number }) => item.version)).toEqual([1, 2, 3, 4, 5]);
+    expect(report.ledger.pending.map((item: { version: number }) => item.version))
+      .toEqual((await load()).map(({ version }) => version));
     expect((await pg.query(`SELECT count(*)::int AS n FROM information_schema.tables WHERE table_schema = 'public'`)).rows[0].n).toBe(0);
   }, 60_000);
 
@@ -266,7 +270,7 @@ maybe('PGlite 真库', () => {
     const applied = await runProdMigrate(client, list, 'apply');
     expect(applied.status).toBe('applied');
     expect(applied.versions.map((item: { version: number; status: string }) => [item.version, item.status]))
-      .toEqual([[1, 'unchanged'], [2, 'unchanged'], [3, 'applied'], [4, 'applied'], [5, 'applied']]);
+      .toEqual(list.map((item) => [item.version, item.version >= 3 ? 'applied' : 'unchanged']));
     expect(applied.after).toMatchObject({ ok: true, checksumOk: true, authVersionOk: true, runtimeColumnsOk: true });
     const ledgerAfter = await ledgerOf(pg);
     expect(ledgerAfter.slice(0, 2)).toEqual(ledgerBefore);
@@ -349,8 +353,9 @@ maybe('PGlite 真库', () => {
 
     it('库版本高于代码（版本倒退）', async () => {
       const pg = await prodLike();
-      await pg.query(`INSERT INTO schema_migrations(version, name, checksum) VALUES (6, '0006_future.sql', $1)`, ['d'.repeat(64)]);
-      await expectRefused(pg, await load(), /库已登记版本 6，高于代码的最新版本 5/);
+      const future = (await load()).at(-1)!.version + 1;
+      await pg.query(`INSERT INTO schema_migrations(version, name, checksum) VALUES (${future}, '0006_future.sql', $1)`, ['d'.repeat(64)]);
+      await expectRefused(pg, await load(), new RegExp(`库已登记版本 ${future}，高于代码的最新版本 ${future - 1}`));
     }, 120_000);
 
     it('库里有代码不认识的版本', async () => {
@@ -391,7 +396,8 @@ maybe('PGlite 真库', () => {
       await expect(applyMigration(client, await load(), { strict: true })).rejects.toThrow(/高于代码的最新版本/);
       expect(await ledgerOf(pg)).toEqual(before);
       // 默认（非 strict）保持旧行为：多出的高版本被忽略——回滚路径依赖这一点。
-      expect((await applyMigration(client, await load())).versions.at(-1)).toMatchObject({ version: 5, status: 'applied' });
+      expect((await applyMigration(client, await load())).versions.at(-1))
+        .toMatchObject({ version: (await load()).at(-1)!.version, status: 'applied' });
     }, 120_000);
   });
 });

@@ -44,6 +44,8 @@ const policies: Record<string, Record<string, 'find' | 'read' | 'download' | 'ow
   // F15 残留③：吸收 drain 兜底入口，只由 cron 以 CRON_SECRET 调用（与 download/reclaim 同款）。
   'profile/absorb/drain': { GET: 'cron' },
   'read/[id]/[resource]': { GET: 'read' }, 'read/source/[resource]': { GET: 'read' }, 'read/source-probe': { GET: 'read' },
+  // readsync42：阅读进度/设置的本人数据同步，与 profile 同权限档（PUT 同样受同源写保护）。
+  'reader-sync': { GET: 'find', PUT: 'find' },
   recommendations: { GET: 'find' },
   shelf: { POST: 'find', DELETE: 'find' },
   'shelf/unprocessed': { DELETE: 'find' },

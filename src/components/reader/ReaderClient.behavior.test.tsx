@@ -147,6 +147,8 @@ describe('本地阅读保存状态恢复', () => {
       if (url.startsWith('/api/feedback')) {
         return json({ current: { version: 0, status: null, note: '' } });
       }
+      // readsync42：登录用户进阅读页会先拉一次云端进度/设置；回空快照即「云端没有可覆盖本机的值」。
+      if (url.startsWith('/api/reader-sync')) return json({ entries: [] });
       if (url === '/api/read/42/index') return json(catalog({
         taskId: 42, source: undefined, totalBytes: 8,
         chapters: [
