@@ -457,12 +457,41 @@ describe('GET /api/read/source-probe', () => {
     expect(res.status).toBe(200);
     expect(res.headers.get('Cache-Control')).toBe('private, no-store');
     expect(await res.json()).toEqual({
-      limit: 24,
+      limit: 24, batch: 0, total: 2, hasMore: false,
       sources: [
         { url: book15.url, name: book15.name, tier: 'builtin', readable: true, hostKey: 'book15.net' },
         { url: E1.url, name: E1.name, tier: 'M1', readable: false, hostKey: 'e1.test' },
       ],
     });
+  });
+
+  it('fanbatch42「换一批」：batch 切片、hasMore 推进、非法批号回 0、超出末尾给空批；单源反查用全量池不 404', async () => {
+    vi.stubEnv('SOURCE_FANOUT_LIMIT', '1');
+    mocks.pool.mockResolvedValue([
+      { ...book15, readable: true },
+      { ...E1, readable: true },
+      { ...E1, url: 'https://e2.test/', name: 'e2', readable: true },
+    ]);
+    const first = await (await call('batch=0')).json() as { batch: number; total: number; hasMore: boolean; sources: unknown[] };
+    expect(first).toMatchObject({ limit: 1, batch: 0, total: 3, hasMore: true });
+    expect(first.sources).toHaveLength(1);
+    const second = await (await call('batch=1')).json() as { sources: { url: string }[]; hasMore: boolean };
+    expect(second.sources.map((item) => item.url)).toEqual([E1.url]);
+    expect(second.hasMore).toBe(true);
+    const last = await (await call('batch=2')).json() as { sources: { url: string }[]; hasMore: boolean };
+    expect(last.sources.map((item) => item.url)).toEqual(['https://e2.test/']);
+    expect(last.hasMore).toBe(false);
+    const beyond = await (await call('batch=7')).json() as { batch: number; hasMore: boolean; sources: unknown[] };
+    expect(beyond).toMatchObject({ batch: 7, hasMore: false });
+    expect(beyond.sources).toEqual([]);
+    const invalid = await (await call('batch=abc')).json() as { batch: number; sources: unknown[] };
+    expect(invalid).toMatchObject({ batch: 0 });
+    expect(invalid.sources).toHaveLength(1);
+    // 单源 probe 不带 batch 参数也要认得批 1 的源（route 反查全量池）：不 404 UNKNOWN_SOURCE。
+    pages.set(e1.search(), { text: '<div>没有结果</div>' });
+    const probe = await call(`title=${q('测试书')}&source=${q(E1.url)}`);
+    expect(probe.status).toBe(200);
+    expect(await probe.json()).toMatchObject({ status: 'no_candidates' });
   });
 
   it('候选 hostKey 与服务端节流同一站键:book15 apex/www 同键;节流回滚开关(=0)不把它变成全局 *', async () => {

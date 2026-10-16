@@ -362,11 +362,11 @@ export function sourceFanoutEnabled(): boolean {
   return raw === '1' || raw === 'true' || raw === 'on';
 }
 
-/** 扇出候选上限默认 24（legado-arch-41 C.3），硬上限 60：env 误配不得把一次换源放大成对上百个站的扫描。 */
+/** 每批扇出候选上限默认 24（legado-arch-41 C.3），硬上限 60：env 误配不得把一批换源放大成对上百个站的扫描。 */
 export const DEFAULT_SOURCE_FANOUT_LIMIT = 24;
 export const MAX_SOURCE_FANOUT_LIMIT = 60;
 
-/** 扇出候选上限：env `SOURCE_FANOUT_LIMIT`；非法/≤0/缺失回退默认，合法值夹到 MAX。与 READING_POOL_LIMIT 解耦。 */
+/** 每批扇出候选上限：env `SOURCE_FANOUT_LIMIT`；非法/≤0/缺失回退默认，合法值夹到 MAX。与 READING_POOL_LIMIT 解耦。 */
 export function sourceFanoutLimit(): number {
   const parsed = Number.parseInt(process.env.SOURCE_FANOUT_LIMIT ?? '', 10);
   return Number.isSafeInteger(parsed) && parsed > 0 ? Math.min(parsed, MAX_SOURCE_FANOUT_LIMIT) : DEFAULT_SOURCE_FANOUT_LIMIT;
@@ -388,31 +388,35 @@ function selectableTier(source: ReadingSource, engineOn: boolean): boolean {
 
 /**
  * 扇出候选集（41-fanout P1-B 服务端）：builtin + 准入 ok 的引擎源（compile_ok ∧ search_ok IS TRUE，第一期不纳未测源），
- * 与取书池同一份合成与全序，只把截断上限换成 sourceFanoutLimit()。引擎源**不受** READING_ENGINE_SOURCES 约束
- * （扇出由 SOURCE_FANOUT_ENABLED 单独把门，调用方先判开关）；为此这里总会按准入表刷一次 host 门——与取书池开引擎源时同一数据源。
+ * 与取书池同一份合成与全序。引擎源**不受** READING_ENGINE_SOURCES 约束（扇出由 SOURCE_FANOUT_ENABLED 单独把门，
+ * 调用方先判开关）；为此这里总会按准入表刷一次 host 门——与取书池开引擎源时同一数据源。
+ * adultsrc42：成人源在 engineReadingSources 侧已被分类器滤出，扇出候选天然不含成人源。
  *
- * readable：确认路径（index?book_url=）与章节路径按 getSourcePools().selectable 反查源（41-readall）——扇出候选全部落在
- * 其内（selectable 显式并入 fanoutOf 的选中项），故 readable 只看开关：引擎开关关时引擎源仍是「仅展示」（面板 unreadable）。
+ * **返回同站去重后的完整全序（不截断）**：fanbatch42「换一批」翻页由 route 按 batch 切片（每批 ≤
+ * sourceFanoutLimit()，默认 24），单源 probe 的反查也在全序上做——否则第 2 批起的面板行点了必 404
+ * SOURCE_PROBE_UNKNOWN_SOURCE。自动换源（findFirstSwitchableSource）不带 batch 参数 ⇒ 默认批 0 = 改前的前 24。
+ *
+ * readable：确认路径（index?book_url=）与章节路径按 getSourcePools().selectable 反查源（41-readall）——
+ * 扇出候选全部落在其内（selectable 并入全量去重序），故 readable 只看开关：引擎开关关时引擎源仍是「仅展示」（面板 unreadable）。
  */
 export async function getFanoutPool(signal: AbortSignal): Promise<FanoutSource[]> {
   const eligible = await eligibleReadingSources(signal, true);
   const engineOn = engineSourcesEnabled();
-  return fanoutOf(eligible).map((source) => ({
+  return fanoutDeduped(eligible).map((source) => ({
     ...source,
     readable: selectableTier(source, engineOn),
   }));
 }
 
 /**
- * 扇出候选切片（41-swq 同站去重）：引擎源按 bookSourceUrl 的 hostname 只留全序里最靠前的一份，腾出的名额按全序
- * 往后补给别的站，总数仍 ≤ sourceFanoutLimit()。选哪一份 = §2.4 全序本身（probe reachable → tier M1 先于 T7 →
- * search_checked_at 最新 → url），即「健康度 → 准入档位 → 准入结论新鲜度」，与 traversalOf 同口径。
- * 改前按条目截断：同站多份规则（梧桐 4 份、quanwenyuedu/esjzone/qq 系各 2 份）占满 24 格只剩约 15 个站；且
- * bookSourceUrl 的 `#…` 片段被 validateSourceUrl 抹掉，同站副本的 url 相同，路由按 url 反查永远落到第一份——
- * 面板上 4 行梧桐实际探测的是同一条规则。builtin 不参与（book15 零回归红线）。
+ * 扇出候选全序（41-swq 同站去重，fanbatch42 改为不截断）：引擎源按 bookSourceUrl 的 hostname 只留全序里
+ * 最靠前的一份。选哪一份 = §2.4 全序本身（probe reachable → tier M1 先于 T7 → search_checked_at 最新 →
+ * host_ok_score_24h → url），与 traversalOf 同口径。改前按 sourceFanoutLimit() 截断，「换一批」上线后截断
+ * 挪到 route 按批切片（翻页翻到的任何一批都可达，须可被确认路径反查）；批 0 与改前的候选集逐条相同，
+ * 旧前端不带 batch 参数照拿前 24，零回归。builtin 不参与（book15 零回归红线）。
  */
-function fanoutOf(eligible: readonly ReadingSource[]): ReadingSource[] {
-  return firstPerHost(eligible, sourceFanoutLimit());
+function fanoutDeduped(eligible: readonly ReadingSource[]): ReadingSource[] {
+  return firstPerHost(eligible, eligible.length);
 }
 
 /**
@@ -422,8 +426,8 @@ function fanoutOf(eligible: readonly ReadingSource[]): ReadingSource[] {
 export type SelectableSources = readonly ReadingSource[] & { readonly __selectableSources: true };
 
 /**
- * 反查范围的前缀窗口：全序前 max(取书池, 扇出) 条。扇出同站去重后可能越过窗口往后补位，getSourcePools 另把那几条
- * 并进 selectable——任何一侧能展示/遍历到的源，用户点选都认。
+ * 反查范围的前缀窗口：全序前 max(取书池, 扇出) 条。扇出全序（fanbatch42 不截断）整条并入 selectable——
+ * 任何一侧能展示/遍历/翻页到的源，用户点选都认。
  */
 export function selectableSourceLimit(): number {
   return Math.max(readingPoolLimit(), sourceFanoutLimit());
@@ -438,14 +442,15 @@ export interface SourcePools {
 
 /**
  * 一次合成同时给出两份池（41-readall）：traversal ⊆ selectable（同一全序、同一窗口，traversal 再做同站去重），章节路径一次 DB 往返拿齐。
- * 扇出候选 ⊆ selectable（41-swq）：扇出同站去重会越过前缀窗口往后补别的站，那些条目必须认得，否则面板上能切的源点了必 404。
+ * 扇出候选 ⊆ selectable（41-swq / fanbatch42）：扇出全序不再截断——「换一批」能翻到的每一批都必须被确认路径认得，
+ * 故 selectable 并入**全量**同站去重序（fanoutDeduped），不只是前缀窗口。去重补位越窗的源照旧认得（改前语义）。
  * includeEngine与取书池同口径（READING_ENGINE_SOURCES）：显式关闭时不刷引擎host门、不查引擎准入表，selectable只剩合格活跃builtin（可为空）。
  */
 export async function getSourcePools(signal: AbortSignal): Promise<SourcePools> {
   const engineOn = engineSourcesEnabled();
   const eligible = await eligibleReadingSources(signal, engineOn);
   const window = selectableSourceLimit();
-  const fanout = new Set(fanoutOf(eligible));
+  const fanout = new Set(fanoutDeduped(eligible));
   return {
     traversal: traversalOf(eligible),
     selectable: eligible.filter((source, index) => (index < window || fanout.has(source))
@@ -1910,6 +1915,12 @@ async function admitRows(
 ): Promise<AdmissionRoundSummary> {
   const handle = checkedLeaseHandle(lease);
   if (!handle) return { skipped: 'lease_lost', written: 0 };
+  // adultsrc42：成人源不参加准入打标（用户口径「不参加打标和换源」）。分类器与引擎池过滤
+  // （engineReadingSources）同一把：按 source 元数据（bookSourceName/bookSourceGroup 与库里 name 同源）
+  // 判定即可，三个准入入口（Vercel 独立轮 / phoenix runner / 刷新尾部）都在这一处收口。
+  // 滤出的源不消耗探测预算；既有 source_admission 旧行留库（展示侧照旧，池侧由分类器挡住）。
+  const probedRows = rows.filter((row) => classifySourceAdult(undefined, row.source) !== 'adult');
+  rows = probedRows;
   // 在探测前固定快照；写前不得重读新规则冒充本轮已经测过的对象。
   const sourceSnapshots = rows.map(({ url, source }) => ({ url, source: structuredClone(source) }));
   const declaredHosts = new Set<string>();

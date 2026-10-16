@@ -217,8 +217,33 @@ describe('runAdmissionRunnerRound（phoenix runner）', () => {
       .toBeLessThan(order.findIndex((text) => text.startsWith('SELECT source_url, source FROM shuyuan_sources')));
   });
 
-  it('租约被占 ⇒ 整轮跳过（trigger=runner），不读源表、不探、不记成功行', async () => {
-    lease = 'held';
+  it('adultsrc42：成人源（打标或未打标站名）不进评估环——不探、不写行、不占探测名额', async () => {
+    vi.useFakeTimers();
+    vi.stubEnv('ADMISSION_MAX_PROBES', '2');
+    stored = [
+      { source_url: 'https://adult.example/', source: { ...deadSource(0), bookSourceUrl: 'https://adult.example/', bookSourceName: '肉文屋1' } },
+      { source_url: 'https://dead0.example/', source: deadSource(0) },
+      { source_url: 'https://marked.example/', source: { ...deadSource(9), bookSourceUrl: 'https://marked.example/', bookSourceName: '🔞标记站' } },
+    ];
+    fetchMock.mockImplementation((input) => {
+      const url = String(input);
+      if (!SEARCH.test(url) || !url.startsWith('https://dead0.')) return Promise.reject(new Error(`Unexpected network request: ${url}`));
+      return Promise.resolve(okResponse(input));
+    });
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    const settled = runAdmissionRunnerRound(120_000);
+    await vi.advanceTimersByTimeAsync(120_000 + 60_000);
+    const summary = await settled;
+    vi.useRealTimers();
+    // 源表 3 行,评估环只剩 dead0:成人源在 admitRows 入口即滤出(adultsrc42,三入口共一处)。
+    expect(summary).toMatchObject({ sources: 1, candidates: 1, probed: 1, written: 1 });
+    expect(searches().every(([input]) => String(input).startsWith('https://dead0.'))).toBe(true);
+    const insert = queries().find((query) => query.text.includes('INSERT INTO source_admission'))!;
+    const rows = JSON.parse(insert.values[2] as string) as { source_url: string }[];
+    expect(rows.map((row) => row.source_url)).toEqual(['https://dead0.example/']);
+  });
+
+  it('租约被占 ⇒ 整轮跳过（trigger=runner），不读源表、不探、不记成功行', async () => {    lease = 'held';
     stored = [{ source_url: 'https://dead0.example/', source: deadSource(0) }];
     const log = vi.spyOn(console, 'log').mockImplementation(() => {});
     expect(await runAdmissionRunnerRound(60_000)).toEqual({ skipped: 'lease' });

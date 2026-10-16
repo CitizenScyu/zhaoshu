@@ -10,8 +10,9 @@ import { SourceProbeRateLimitUnavailableError, checkSourceProbeRateLimit } from 
 import { withDbQuotaGuard } from '@/lib/db-quota-guard';
 
 // 41-fanout 第一期（服务端）：浏览器换源面板逐源并发的单源入口。一次调用只查一个源，不循环、不遍历池。
-//   GET /api/read/source-probe                              → 扇出候选列表（面板据此决定发哪些 probe）
-//   GET /api/read/source-probe?title=&author=&source=<url>  → 单源 probe 结果（status 见 SourceProbeStatus）
+//   GET /api/read/source-probe                            → 扇出候选列表（面板据此决定发哪些 probe）
+//   GET /api/read/source-probe?batch=N                     → 第 N 批候选（fanbatch42「换一批」，0-based，默认 0）
+//   GET /api/read/source-probe?title=&author=&source=<url>  → 单源 probe 结果（status 见 SourceProbeStatus；反查用全量池）
 // 开关 SOURCE_FANOUT_ENABLED 默认关：关闭时鉴权通过后一律 404 SOURCE_FANOUT_DISABLED。鉴权与阅读路由相同（read 能力）。
 // 单源 probe 按用户限流（SOURCE_PROBE_RATE_LIMITS，见 source-probe-rate-limit.ts）：超限 429 SOURCE_PROBE_RATE_LIMITED。
 export const runtime = 'nodejs';
@@ -29,6 +30,12 @@ function response(body: unknown, status = 200, extraHeaders: Record<string, stri
 
 function hostOf(url: string): string {
   try { return new URL(url).hostname; } catch { return ''; }
+}
+
+/** fanbatch42：「换一批」批号（0-based）。非法/越界一律回批 0——旧前端不带参数、自动换源也不带，都拿首批。 */
+function parseBatch(raw: string | null): number {
+  const parsed = Number.parseInt(raw ?? '', 10);
+  return Number.isSafeInteger(parsed) && parsed >= 0 && parsed <= 999 ? parsed : 0;
 }
 
 async function handleGET(req: NextRequest) {
@@ -63,10 +70,16 @@ async function handleGET(req: NextRequest) {
     }
     const pool = await getFanoutPool(signal);
     if (listOnly) {
+      // fanbatch42：候选按批切片（每批 ≤ sourceFanoutLimit()）；pool 本身是全量同站去重序，翻到第几批
+      // 都在这里切。hasMore=false 表示翻完了（前端据此撤「换一批」）。超出末尾的批号返回空列表。
+      const batch = parseBatch(query.get('batch'));
+      const limit = sourceFanoutLimit();
+      const start = batch * limit;
+      const sources = pool.slice(start, start + limit);
       // hostKey：服务端按站节流用的同一站键（book15 apex/www 归一），面板据此做同站串行（41-srcurl）。
       return response({
-        limit: sourceFanoutLimit(),
-        sources: pool.map(({ url, name, tier, readable }) => ({ url, name, tier: tier ?? 'builtin', readable, hostKey: sourceStationKey(url) })),
+        limit, batch, total: pool.length, hasMore: start + limit < pool.length,
+        sources: sources.map(({ url, name, tier, readable }) => ({ url, name, tier: tier ?? 'builtin', readable, hostKey: sourceStationKey(url) })),
       });
     }
     const source = pool.find((item) => item.url === sourceUrl);

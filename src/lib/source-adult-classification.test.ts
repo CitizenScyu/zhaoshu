@@ -23,6 +23,26 @@ describe('source adult metadata classification', () => {
     expect(classifySourceAdult(text, { bookSourceName: text, bookSourceGroup: text })).toBe('unmarked');
   });
 
+  // adultsrc42：生产池未打标成人站的站名级专名（肉文屋/PO18/肉肉屋/欲望社/御宅屋/御书屋/海棠/桃色/7wav）。
+  it.each([
+    '肉文屋1', '肉色屋网', '肉书屋🎃#2', '👔 肉肉屋②', '肉肉屋②',
+    'PO18 #一程1101', 'po18文学', 'PO18文学🎃#8', 'PO18 脸红心跳🎃',
+    '欲望社', '新欲望社🎃', '欲望社🎃#2',
+    '新御宅屋', '新御宅🎃', '🔰 新御宅屋', '🎃新御宅屋🎃', '新御书屋',
+    '海棠书屋🎃', '海棠书房🎃', '海棠文学',
+    '📂桃色小说', '7wav',
+  ])('recognizes unmarked adult site names (adultsrc42): %s', (text) => {
+    expect(classifySourceAdult(text, {})).toBe('adult');
+    expect(classifySourceAdult(undefined, { bookSourceName: text })).toBe('adult');
+  });
+
+  // 同名泛词不得误伤：只收「海棠+书屋/书房/文学」这类站名组合，裸「海棠」「御宅」「PO 文学」不算。
+  it.each([
+    '海棠', '海棠花儿', '御宅族小说', 'PO文学3', 'PO全本🎃', '书耽中文', '夫妻小说', '桃桃书',
+  ])('does not over-match near misses (adultsrc42): %s', (text) => {
+    expect(classifySourceAdult(text, { bookSourceName: text, bookSourceGroup: text })).toBe('unmarked');
+  });
+
   it('allows missing, null and empty string metadata without changing the source object', () => {
     const source = Object.freeze({ bookSourceName: null, bookSourceGroup: '', ruleSearch: Object.freeze({ name: '.title' }) });
     expect(classifySourceAdult(undefined, {})).toBe('unmarked');

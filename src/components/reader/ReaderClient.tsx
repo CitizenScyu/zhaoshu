@@ -643,20 +643,21 @@ function FanoutSourcePanel({ fanout, title, currentSource, onSwitch }: {
   fanout: ReturnType<typeof useSourceFanout>; title: string; currentSource?: ServingSource;
   onSwitch: (bookUrl: string, sourceUrl?: string) => void;
 }) {
-  const { phase, rows, retryAfter, message, rescan } = fanout;
+  const { phase, rows, retryAfter, message, rescan, nextBatch, batch, hasMore } = fanout;
   const busy = phase === 'loading' || phase === 'running';
   const settled = rows.filter((row) => row.state === 'done' || row.state === 'failed').length;
   return (
     <div className={styles.sources}>
-      <p className={styles.sourcesIntro}>逐个检测各书源能否提供这本书,检测完一个显示一个;可切换的书源点「切换到此源」,尽量保留当前阅读进度。</p>
+      <p className={styles.sourcesIntro}>逐个检测各书源能否提供这本书,检测完一个显示一个;可切换的书源点「切换到此源」,尽量保留当前阅读进度。这批都没有时,可点「换一批」翻看其它书源。</p>
       <div className={styles.sourceActions}>
         <button className={styles.locate} disabled={busy} onClick={rescan}>{busy ? '检测中...' : '重新检测'}</button>
+        {hasMore && <button className={styles.locate} disabled={busy} onClick={nextBatch}>换一批</button>}
       </div>
       {phase === 'rate_limited' && <p className={styles.sourcesError} role="alert">检测过于频繁,请稍后再试{retryAfter ? `（${retryAfter} 秒）` : ''}。</p>}
       {(phase === 'unavailable' || phase === 'error') && <p className={styles.sourcesError} role="alert">{message}</p>}
       {phase === 'loading' && <p className={styles.noResults}>正在获取候选书源...</p>}
       {phase === 'done' && !rows.length && <p className={styles.noResults}>暂无可检测的书源。</p>}
-      {rows.length > 0 && <p className={styles.sourcesNote} role="status">已检测 {settled} / {rows.length}</p>}
+      {rows.length > 0 && <p className={styles.sourcesNote} role="status">已检测 {settled} / {rows.length}{batch > 0 ? `（第 ${batch + 1} 批）` : ''}</p>}
       {rows.length > 0 && <ul className={styles.sourceList}>
         {rows.map((row) => {
           const current = isCurrentSource(row, currentSource);

@@ -1435,14 +1435,15 @@ describe('refreshShuyuan atomic refresh', () => {
         ['https://b.example/', 'M1', false],
         ['https://c.example/', 'M1', false],
       ]);
-      // 引擎开关开 + 取书池上限 2 ⇒ 扇出里第 3 位（取书池外）也 readable（41-readall，改前是 [true, true, false]）；
-      // 扇出上限 3 ⇒ 截掉第 4 个。
+      // 引擎开关开 + 取书池上限 2 ⇒ 全序第 3 位（取书池外）也 readable（41-readall，改前是 [true, true, false]）；
+      // fanbatch42：getFanoutPool 不再按 SOURCE_FANOUT_LIMIT 截断（「换一批」翻页由 route 按批切片），
+      // 全量同站去重序 4 条全出，readable 只看引擎开关。
       vi.stubEnv('READING_ENGINE_SOURCES', '1');
       vi.stubEnv('READING_POOL_LIMIT', '2');
       vi.stubEnv('SOURCE_FANOUT_LIMIT', '3');
       arrange();
-      expect((await getFanoutPool(new AbortController().signal)).map((source) => source.readable)).toEqual([true, true, true]);
-      // 误配 999 ⇒ 夹到 MAX 60（此处候选只有 4 个，全出）。
+      expect((await getFanoutPool(new AbortController().signal)).map((source) => source.readable)).toEqual([true, true, true, true]);
+      // 误配 999 ⇒ 夹到 MAX 60（每批切片口径）；全量池照旧全出。
       vi.stubEnv('SOURCE_FANOUT_LIMIT', '999');
       arrange();
       expect(await getFanoutPool(new AbortController().signal)).toHaveLength(4);
@@ -1461,8 +1462,9 @@ describe('refreshShuyuan atomic refresh', () => {
       arrange();
       const pools = await getSourcePools(new AbortController().signal);
       expect(pools.traversal.map((source) => source.url)).toEqual(['https://builtin.test/', 'https://a.example/']);
+      // fanbatch42：selectable 并入全量扇出序（不再只有前缀窗口 max(R,F)）——「换一批」翻得到的源都得认得。
       expect(pools.selectable.map((source) => source.url)).toEqual([
-        'https://builtin.test/', 'https://a.example/', 'https://b.example/', 'https://c.example/',
+        'https://builtin.test/', 'https://a.example/', 'https://b.example/', 'https://c.example/', 'https://d.example/',
       ]);
       arrange();
       expect((await getReadingSources(new AbortController().signal)).map((source) => source.url))
@@ -1548,16 +1550,18 @@ describe('refreshShuyuan atomic refresh', () => {
       vi.stubEnv('SOURCE_FANOUT_LIMIT', '3');
       arrange();
       const fanout = await getFanoutPool(new AbortController().signal);
-      // 改前：[book15, dup/c, dup/a] —— 3 格里 2 格是同一个站。
+      // 改前：[book15, dup/c, dup/a] —— 3 格里 2 格是同一个站。fanbatch42：扇出不再截断,
+      // 全量同站去重序 5 条（builtin + 4 站）全出,「换一批」翻页由 route 按 3/批切片。
       expect(fanout.map((source) => source.url)).toEqual([
-        'https://builtin.test/', 'https://dup.example/c', 'https://y.example/',
+        'https://builtin.test/', 'https://dup.example/c', 'https://y.example/', 'https://z.example/', 'https://w.example/',
       ]);
       expect(fanout.every((source) => source.readable)).toBe(true);
-      // y.example 在全序第 6 位，越过了 selectable 前缀窗口 max(R,F)=3 ——必须显式并进 selectable，否则面板能切、确认 404。
+      // fanbatch42：selectable 并入全量扇出序——z/w 在窗口外且被同站去重挤掉,但「换一批」翻得到 ⇒ 必须认得。
       arrange();
       const pools = await getSourcePools(new AbortController().signal);
       expect(pools.selectable.map((source) => source.url)).toEqual([
         'https://builtin.test/', 'https://dup.example/c', 'https://dup.example/a', 'https://y.example/',
+        'https://z.example/', 'https://w.example/',
       ]);
       expect(pools.traversal.map((source) => source.url)).toEqual(['https://builtin.test/', 'https://dup.example/c']);
       // 上限放宽 ⇒ 每站一格全部列出，T7 副本与其余同站副本都不出现；总数 = 1 builtin + 4 站。

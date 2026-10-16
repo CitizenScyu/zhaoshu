@@ -5,7 +5,7 @@ import { useOwner } from '@/components/OwnerProvider';
 import type { SourceProbePanelResult } from '@/lib/source-reader';
 
 // 41-panel:浏览器换源面板的扇出调度(接口约定见 fanout-41-report §6)。
-//   1. GET /api/read/source-probe            → 候选列表(不计限流、不出网)
+//   1. GET /api/read/source-probe[?batch=N]   → 候选列表(不计限流、不出网;fanbatch42「换一批」按批取)
 //   2. 逐源 GET ...?title=&author=&source=   → 单源 probe,每行到达即渲染
 // 前端并发有界(SOURCE_PROBE_CONCURRENCY),同 host 的候选不同时在飞(服务端节流只在单实例内有效)。
 // 404 ⇒ 扇出未开(或旧部署无此路由),面板退回旧 alternates 路径;429/503 ⇒ 停发剩余 probe,不自动重试。
@@ -30,7 +30,11 @@ export type FanoutRow = FanoutCandidate & (
  */
 export type FanoutPhase = 'loading' | 'disabled' | 'running' | 'done' | 'rate_limited' | 'unavailable' | 'error';
 
-export interface FanoutState { phase: FanoutPhase; rows: FanoutRow[]; retryAfter: number | null; message: string }
+export interface FanoutState {
+  phase: FanoutPhase; rows: FanoutRow[]; retryAfter: number | null; message: string;
+  /** fanbatch42：当前批号（0-based）与是否还有下一批（服务端按 hasMore 撤按钮；旧服务端不带 ⇒ false）。 */
+  batch: number; hasMore: boolean;
+}
 
 /** 同一阅读会话内的 probe 结果缓存:不对同一 (书, 源) 重复 probe(第一期服务端无缓存,每次都出网计数)。 */
 export type ProbeCache = Map<string, SourceProbePanelResult>;
@@ -41,7 +45,7 @@ type Outcome =
   | { kind: 'stop'; phase: 'rate_limited' | 'unavailable' | 'error' | 'disabled'; retryAfter?: number | null; message: string }
   | { kind: 'aborted' };
 
-const INITIAL: FanoutState = { phase: 'loading', rows: [], retryAfter: null, message: '' };
+const INITIAL: FanoutState = { phase: 'loading', rows: [], retryAfter: null, message: '', batch: 0, hasMore: false };
 
 /** 正在供稿的源:url = 源 url(目录的 source.sourceUrl / 段的 servedFromUrl),name = 源名;旧服务端不带 url。 */
 export interface ServingSource { name?: string; url?: string }
@@ -142,31 +146,36 @@ export function useSourceFanout({ apiFetch, title, author, currentSource, cache 
   const { sessionId, isCurrentSession } = useOwner();
   const [state, setState] = useState<FanoutState>(INITIAL);
   const [generation, setGeneration] = useState(0);
+  // fanbatch42：「换一批」的当前批号（0-based）。批号一变 effect 即重扫（abort 在途、行换新批）；
+  // rescan 只重测当前批。批 0 不带 query 参数——旧服务端（无 batch 支持）拿到的也是同一份候选。
+  const [batch, setBatch] = useState(0);
   // 当前源只在一次扫描开始时读:它不必 probe(已在读),变化也不应让在飞的扫描重来。
   // 按源 url 精确比对(目录 source.sourceUrl / 段 servedFromUrl),缺失时退回源名,见 isCurrentSource。
   const current = useRef(currentSource);
   useEffect(() => { current.current = currentSource; }, [currentSource]);
 
-  const scan = useCallback(async (signal: AbortSignal) => {
+  const scan = useCallback(async (signal: AbortSignal, batch: number) => {
     const valid = () => !signal.aborted && isCurrentSession(sessionId);
     if (!valid()) return;
     const set = (update: (previous: FanoutState) => FanoutState) => { if (valid()) setState(update); };
     let res: Response;
     let data: unknown;
     try {
-      res = await apiFetch('/api/read/source-probe', { signal, cache: 'no-store' });
+      res = await apiFetch(batch > 0 ? `/api/read/source-probe?batch=${batch}` : '/api/read/source-probe', { signal, cache: 'no-store' });
       if (!valid()) return;
       data = await res.json().catch(() => null);
     } catch {
-      set(() => ({ ...INITIAL, phase: 'error', message: '换源候选加载失败,请重试。' }));
+      set(() => ({ ...INITIAL, batch, phase: 'error', message: '换源候选加载失败,请重试。' }));
       return;
     }
     if (!valid()) return;
     // 404 SOURCE_FANOUT_DISABLED(开关关)或旧部署没有这条路由:都退回旧面板,不当错误提示。
-    if (res.status === 404) { set(() => ({ ...INITIAL, phase: 'disabled' })); return; }
+    if (res.status === 404) { set(() => ({ ...INITIAL, batch, phase: 'disabled' })); return; }
     // 候选列表不计限流(路由只在带 source 的 probe 上查限流),不会有 503 限流不可用;网关/平台的 5xx 一律走 error。
     const candidates = res.ok ? parseCandidates(data) : null;
-    if (!candidates) { set(() => ({ ...INITIAL, phase: 'error', message: errorText(data, '换源候选加载失败,请重试。') })); return; }
+    if (!candidates) { set(() => ({ ...INITIAL, batch, phase: 'error', message: errorText(data, '换源候选加载失败,请重试。') })); return; }
+    // fanbatch42：hasMore 由服务端批切片给出（旧服务端不带 ⇒ false，面板不显示「换一批」）。
+    const hasMore = (data as { hasMore?: unknown } | null)?.hasMore === true;
 
     const exclude = current.current;
     const rows: FanoutRow[] = candidates.map((source) => {
@@ -174,7 +183,7 @@ export function useSourceFanout({ apiFetch, title, author, currentSource, cache 
       if (cached) return { ...source, state: 'done', result: cached };
       return { ...source, state: isCurrentSource(source, exclude) ? 'current' : 'pending' };
     });
-    set(() => ({ phase: 'running', rows, retryAfter: null, message: '' }));
+    set(() => ({ phase: 'running', rows, retryAfter: null, message: '', batch, hasMore }));
     const patch = (url: string, row: (source: FanoutCandidate) => FanoutRow) => set((previous) => ({
       ...previous, rows: previous.rows.map((item) => (item.url === url ? row(item) : item)),
     }));
@@ -224,6 +233,7 @@ export function useSourceFanout({ apiFetch, title, author, currentSource, cache 
     // 停发:队列里没发出去的行标「未检测」;不自动重试(429 要求等 Retry-After 秒)。
     const skipped = new Set(queue.map((source) => source.url));
     set((previous) => ({
+      ...previous,
       phase: halted.phase, retryAfter: halted.retryAfter ?? null, message: halted.message,
       rows: previous.rows.map((item) => (skipped.has(item.url) ? { ...item, state: 'skipped' } : item)),
     }));
@@ -231,9 +241,9 @@ export function useSourceFanout({ apiFetch, title, author, currentSource, cache 
 
   useEffect(() => {
     const controller = new AbortController();
-    void scan(controller.signal);
+    void scan(controller.signal, batch);
     return () => controller.abort();
-  }, [scan, generation]);
+  }, [scan, generation, batch]);
 
   const rescan = useCallback(() => {
     if (!isCurrentSession(sessionId)) return;
@@ -241,7 +251,17 @@ export function useSourceFanout({ apiFetch, title, author, currentSource, cache 
     setGeneration((value) => value + 1);
   }, [sessionId, isCurrentSession]);
 
-  return { ...state, rescan };
+  /**
+   * fanbatch42「换一批」：换下一批候选重扫。批号变更触发 effect（abort 在途 probe、行整体替换）；
+   * 旧批已 probe 的结论留在 ProbeCache,同会话内翻回/重检同批源不重复出网计数。
+   */
+  const nextBatch = useCallback(() => {
+    if (!isCurrentSession(sessionId)) return;
+    setState((previous) => ({ ...INITIAL, batch: previous.batch + 1, hasMore: false }));
+    setBatch((value) => value + 1);
+  }, [sessionId, isCurrentSession]);
+
+  return { ...state, rescan, nextBatch };
 }
 
 // ---- readerux42-A:阅读中自动换源 ----
