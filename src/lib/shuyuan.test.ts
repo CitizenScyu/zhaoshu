@@ -1592,6 +1592,25 @@ describe('refreshShuyuan atomic refresh', () => {
       ]);
     });
 
+    // fankey42：m. 也是同站前缀——生产扇出曾出现 m.zhulang.com 与 www.zhulang.com 两份逐浪同时占格。
+    it('fankey42 扇出同站去重：m./www./apex 三形态算同站，只留全序第一份', async () => {
+      const rows = [
+        engineRowAt('m.dup.example', { search_checked_at: '2026-09-24T00:00:00Z' }),
+        engineRowAt('www.dup.example', { search_checked_at: '2026-09-23T00:00:00Z' }),
+        engineRowAt('dup.example', { search_checked_at: '2026-09-22T00:00:00Z' }),
+        engineRowAt('x.example', { search_checked_at: '2026-09-20T00:00:00Z' }),
+      ];
+      const hosts = ['m.dup.example', 'www.dup.example', 'dup.example', 'x.example'];
+      execute.mockResolvedValueOnce(hosts.map((host) => ({ host })))
+        .mockResolvedValueOnce([{ collections: [] }]).mockResolvedValueOnce(builtinRegisteredRow).mockResolvedValueOnce(rows);
+      vi.stubEnv('READING_ENGINE_SOURCES', '1');
+      vi.stubEnv('READING_POOL_LIMIT', '2');
+      vi.stubEnv('SOURCE_FANOUT_LIMIT', '24');
+      expect((await getFanoutPool(new AbortController().signal)).map((source) => source.url)).toEqual([
+        'https://builtin.test/', 'https://m.dup.example/', 'https://x.example/',
+      ]);
+    });
+
     // 41-swq：sfacg 规则的 searchUrl 指向 host 门外的 m.sfacg.com，准入却记 search_ok；去重腾出名额后补进扇出、每次
     // probe 必 compile_failed。判据与 probe 同一处（source-usability），进池前筛掉。
     it('41-swq 运行时用不了的引擎源（门外/动态搜索模板、必需字段缺失）进池前筛掉：不占扇出/取书池/窗口名额，同站后面能用的那份照样选上', async () => {
