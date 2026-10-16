@@ -2,7 +2,21 @@ import { describe, expect, it } from 'vitest';
 
 // srcfeed：多 feed 合并的版本取舍是纯函数——把它钉在模块级单测里，不碰数据库与 fetch。
 // 全序判据只在 incomingWins 内一处判定；上游自报 lastUpdateTime 不能压过 yckceo（position=0）。
-import { incomingWins } from './shuyuan';
+import { feedLabelOf, incomingWins } from './shuyuan';
+
+describe('srcfeed: feedLabelOf（URL → host/文件名 label）', () => {
+  it('合法 https URL → host/最后一段', () => {
+    expect(feedLabelOf('https://book.cloud.us.kg/qq-mirror-sources.json'))
+      .toBe('book.cloud.us.kg/qq-mirror-sources.json');
+    expect(feedLabelOf('https://example.com/')).toBe('example.com');
+  });
+
+  // 2026-10-16 生产事故回归钉：label 本身不是合法 URL（无 scheme），
+  // 把 fetchExtraFeeds 返回的 result.feed 再喂 feedLabelOf 必抛 Invalid URL 并炸整轮刷新。
+  it('label 无 scheme 不可再被 new URL 解析（result.feed 严禁二次 feedLabelOf）', () => {
+    expect(() => new URL('book.cloud.us.kg/qq-mirror-sources.json')).toThrow();
+  });
+});
 
 describe('srcfeed: incomingWins（source_url 归并版本取舍）', () => {
   it('yckceo（position=0）与 extra（position>0）都无戳 ⇒ 不到者让位（yckceo 不覆 extra）', () => {

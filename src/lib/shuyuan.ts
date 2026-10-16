@@ -1519,8 +1519,10 @@ async function refreshWithinBudget(s: Sql, budget: RequestDeadline, signal: Abor
   const { urls: extraFeeds, invalid: extraInvalid } = shuyuanExtraFeeds();
   // env 错填（非 https / 解析失败）不作为 feed 失败参与降级中止，但要把「这批条目被丢弃」
   // 记进 meta——缺省与全合法时本数组长 0（剥离后与改前逐字节一致）。
+  // feedLabelOf 对无法解析的字符串会抛 Invalid URL：invalid 条目里恰有这种值（解析失败正是
+  // 入选 invalid 的原因之一），只能用 hostOf 的安全降级形态（host 级、解析不了给占位符）。
   const extraFeedFailures: ExtraFeedFailure[] = extraInvalid.map((raw) => ({
-    feed: feedLabelOf(raw), reason: 'env 条目非法：非 https 或无法解析',
+    feed: hostOf(raw), reason: 'env 条目非法：非 https 或无法解析',
   }));
   const html = await fetchText(INDEX_URL, RESPONSE_TIMEOUT_MS * 2, signal);
   const entries = parseIndex(html);
@@ -1595,7 +1597,7 @@ async function refreshWithinBudget(s: Sql, budget: RequestDeadline, signal: Abor
       const wins = mergeIntoPool(merged, result.items, LATEST_COUNT + index + 1);
       collections.push({
         id: LATEST_COUNT + index + 1,
-        title: `feed:${feedLabelOf(result.feed)}`,
+        title: `feed:${result.feed}`,
         count: wins, // 净贡献（去重后实际入选条数），而不是原始条数
       });
     }
