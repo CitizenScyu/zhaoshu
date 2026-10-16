@@ -240,6 +240,77 @@ describe('readerux42-A 阅读中自动换源', () => {
     await screen.findByText(textIs('没有找到可直接切换的可用书源;可点「换个书源」手动检测。'));
     expect(probeCalls(apiFetch).every((u) => param(u, 'source') !== 'https://c.example')).toBe(true);
   });
+
+  // ruxrev42 F-1 回归:探测必须跨宏任务兑现。同微任务兑现的 mock(其余用例)抢在 React
+  // 调度 re-render 之前跑完,测不出「依赖里的新引用触发 cleanup abort 在飞探测」;真实
+  // fetch 起步就是一个宏任务。且失败必须发生在**已读到正文之后** —— 首载即败时 reading
+  // 尚为 null、servingSource 恒 undefined(稳定值),暴露不了每次渲染新引用的缺陷。
+  it('ruxrev42 F-1:读到正文后章节失败,跨宏任务兑现的探测仍完成并切换(notice 重渲染不中止探测)', async () => {
+    const tick = () => new Promise((resolve) => setTimeout(resolve, 5));
+    const apiFetch = vi.fn(async (input: RequestInfo | URL) => {
+      await tick(); // 与真实网络同量级:兑现晚于 setNotice 触发的 re-render
+      const url = String(input);
+      if (url === '/api/read/source-probe') return candidatesBody();
+      if (url.startsWith('/api/read/source-probe?')) {
+        return param(url, 'source') === 'https://b.example'
+          ? probeOk('https://b.example', '源乙', 'https://b.example/2')
+          : probeOk('https://c.example', '源丙', 'https://c.example/3');
+      }
+      if (url.startsWith('/api/read/source/index')) {
+        return param(url, 'book_url')
+          ? json(catalog({ source: { id: 'src-2', name: '源乙', url: 'https://b.example', session: 'sess-B' } }))
+          : json(catalog());
+      }
+      if (param(url, 'session') === 'sess-B') {
+        return json(part({ sourceId: 'src-2', servedFrom: '源乙', text: '第一章\n备用源正文' }));
+      }
+      // 首章读得通;翻到第二章 503 ⇒ 失败时 reading/正文已在屏上。
+      const chapter = Number(new URLSearchParams(url.split('?')[1]).get('chapter') ?? '0');
+      return chapter === 0 ? json(part()) : unavailable();
+    });
+    renderReader(apiFetch);
+
+    await screen.findByText(/正文内容/);
+    fireEvent.click(screen.getByRole('button', { name: '下一章 →' }));
+    await screen.findByRole('alert');
+    // 命中源的单源 probe 真的发出(没有被 notice 重渲染的 cleanup abort 掉)。
+    await waitFor(() => expect(probeCalls(apiFetch).some((u) => param(u, 'source') === 'https://b.example')).toBe(true));
+    // 切换完成:确认重放发出且带 book_url/source,新源正文透出。
+    await screen.findByText(/备用源正文/);
+    const confirmed = urls(apiFetch).filter((u) => u.startsWith('/api/read/source/index') && param(u, 'book_url'));
+    expect(confirmed.length).toBeGreaterThanOrEqual(1);
+    expect(param(confirmed[0], 'book_url')).toBe('https://b.example/2');
+    expect(param(confirmed[0], 'source')).toBe('https://b.example');
+  });
+
+  // ruxrev42 F-2:一次可见失败至多一轮扇出。章节失败触发的自动换源走确认重放,新源建目录
+  // 失败(无 target)与触发它的章节失败算同一次 —— 计数上继承上一次的 key,不再自立
+  // 'index' 命名空间,也不发第二轮候选探测。
+  it('ruxrev42 F-2:章节失败自动换源后新源建目录失败,只计同一次,不再发第二轮扇出探测', async () => {
+    const apiFetch = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === '/api/read/source-probe') return candidatesBody();
+      if (url.startsWith('/api/read/source-probe?')) return probeOk('https://b.example', '源乙', 'https://b.example/2');
+      if (url.startsWith('/api/read/source/index')) {
+        // 确认路径(带 book_url)建目录也失败 —— 换源未成,错误条回到可见。
+        return param(url, 'book_url') ? unavailable() : json(catalog());
+      }
+      return unavailable();
+    });
+    renderReader(apiFetch);
+
+    // 章节 503 ⇒ 第一轮(也是唯一一轮)候选探测 + 命中源的确认重放。
+    await screen.findByRole('alert');
+    await waitFor(() => expect(candidateListCalls(apiFetch)).toHaveLength(1));
+    await waitFor(() => expect(probeCalls(apiFetch).some((u) => param(u, 'source') === 'https://b.example')).toBe(true));
+    await waitFor(() => {
+      expect(urls(apiFetch).some((u) => u.startsWith('/api/read/source/index') && param(u, 'book_url'))).toBe(true);
+    });
+    // 确认重放失败落定后,等一个可观测窗口:候选列表仍是 1 次 —— 一次可见失败只烧一轮扇出。
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(candidateListCalls(apiFetch)).toHaveLength(1);
+    expect(screen.getByRole('alert')).toBeTruthy();
+  });
 });
 
 describe('readerux42-A 自动换源开关(阅读设置)', () => {

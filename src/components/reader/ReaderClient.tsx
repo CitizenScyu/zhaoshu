@@ -126,9 +126,13 @@ function ReaderSession({ session, from }: Props) {
   const chapters = reading?.index.chapters ?? [];
   // 正在供稿的源:段上的源名与源 url 成对取(章内换源后是新源);还没有段时取目录的。
   // 段只带源名(旧服务端)时 url 留空 ⇒ 面板按源名认,不拿目录上可能已过时的 url 去配。
-  const servingSource: ServingSource | undefined = activePart?.servedFrom
-    ? { name: activePart.servedFrom, url: activePart.servedFromUrl }
-    : reading?.index.source && { name: reading.index.source.name, url: reading.index.source.sourceUrl };
+  // ruxrev42 F-1:必须 memo 在原始值上 —— 裸对象字面量每次渲染都是新引用,下游把它放进
+  // 带 abort cleanup 的 effect 依赖(自动换源)时,无关重渲染(notice 等)就会取消在飞探测。
+  const servingSource = useMemo<ServingSource | undefined>(() => {
+    if (activePart?.servedFrom) return { name: activePart.servedFrom, url: activePart.servedFromUrl };
+    if (reading?.index.source) return { name: reading.index.source.name, url: reading.index.source.sourceUrl };
+    return undefined;
+  }, [activePart?.servedFrom, activePart?.servedFromUrl, reading?.index.source]);
   const first = reading?.parts[0];
   const last = reading?.parts[reading.parts.length - 1];
   const before = reading && first ? previousReadingPosition(reading.index, first) : null;
@@ -231,16 +235,26 @@ function ReaderSession({ session, from }: Props) {
   // 探测中止(面板有自己的扫描与同一 ProbeCache),让位给手动选择;开关默认开(阅读设置)。
   const autoSwitchSeen = useRef<typeof failure>(null);
   const autoSwitchTried = useRef<string | null>(null);
+  // ruxrev42 F-1:session 拆成收窄后的原始值再进依赖 —— 对象引用不稳定时不得进带 abort
+  // cleanup 的 effect 依赖(下游重渲染会取消在飞探测);source 会话的 title/author 恒定。
+  const sessionKind = session.kind;
+  const sessionTitle = session.kind === 'source' ? session.title : '';
+  const sessionAuthor = session.kind === 'source' ? session.author : '';
   useEffect(() => {
     if (!failure || failure === autoSwitchSeen.current) return;
     autoSwitchSeen.current = failure;
-    if (session.kind !== 'source' || panel === 'sources') return;
+    if (sessionKind !== 'source' || panel === 'sources') return;
     if (failure.code === 'SOURCE_SIMILAR' || ![404, 422, 503, 504].includes(failure.status)) return;
     if (!settings.autoSwitchSource) return;
     // 确认路径(手动点选候选后的 book_url 重放)失败不自动换:候选是用户明确选的,自动重试同一
     // 候选没有增量价值、还会与用户的再次点选叠成双份确认;回落「重试/换个书源」手动路径。
     if (!failure.target && switchedBookUrl()) return;
-    const key = failure.target ? `${failure.target.chapterIndex}:${failure.target.partIndex}` : 'index';
+    // ruxrev42 F-2:无 target 的失败(换源后建目录/取首段失败)是触发它的那次换源的延续,
+    // 继承上一次已记的 key —— 自立 'index' 命名空间会让一次章节失败连带烧第二轮扇出探测。
+    // 尚未记过任何 key(初次进书目录失败)才用 'index'。
+    const key = failure.target
+      ? `${failure.target.chapterIndex}:${failure.target.partIndex}`
+      : autoSwitchTried.current ?? 'index';
     if (autoSwitchTried.current === key) {
       setNotice('本章已自动换过一次书源,不再自动重试;可点「换个书源」手动切换。');
       return;
@@ -249,7 +263,7 @@ function ReaderSession({ session, from }: Props) {
     setNotice('本章打不开,正在尝试其他书源…');
     const controller = new AbortController();
     void findFirstSwitchableSource({
-      apiFetch, title: session.title, author: session.author, currentSource: servingSource, cache: probeCache, signal: controller.signal,
+      apiFetch, title: sessionTitle, author: sessionAuthor, currentSource: servingSource, cache: probeCache, signal: controller.signal,
     }).then((found) => {
       if (controller.signal.aborted || !isReaderSessionCurrent()) return;
       if (found) {
@@ -261,7 +275,7 @@ function ReaderSession({ session, from }: Props) {
     });
     // 依赖里的 panel 变化(打开换源面板/其他面板)会中止在途自动探测;seen 守卫防止二次触发。
     return () => controller.abort();
-  }, [failure, panel, session, settings.autoSwitchSource, apiFetch, probeCache, servingSource, loadConfirmedBook, isReaderSessionCurrent, setNotice, switchedBookUrl]);
+  }, [failure, panel, sessionKind, sessionTitle, sessionAuthor, settings.autoSwitchSource, apiFetch, probeCache, servingSource, loadConfirmedBook, isReaderSessionCurrent, setNotice, switchedBookUrl]);
 
   // readerux42-B 自动阅读:会话内状态(不持久化);开关在页脚,速度三档。滚读是定时驱动
   // (每拍只改 scroller.scrollTop,不重排 DOM,长章不卡);章末走既有 extend('next') 连续阅读
