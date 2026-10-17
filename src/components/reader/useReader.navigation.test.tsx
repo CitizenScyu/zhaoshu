@@ -13,6 +13,8 @@ const isSessionCurrent = () => true;
 
 beforeEach(() => {
   window.localStorage.clear();
+  // readerlocal42 往返快照存 sessionStorage;同文件内前序用例的快照不能泄进后续用例。
+  window.sessionStorage.clear();
   window.localStorage.setItem(READER_SETTINGS_KEY, JSON.stringify({ preloadNext: false }));
   vi.stubGlobal('ResizeObserver', class { observe() {} disconnect() {} });
   // jsdom 没有排版：提供长章滚动几何，真实 hook 仍负责恢复、捕获及保存位置。

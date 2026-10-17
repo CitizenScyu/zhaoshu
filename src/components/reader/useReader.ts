@@ -2,7 +2,8 @@
 
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import type { ReaderIndex, ReaderPart, ReadingSession } from '@/lib/reader-types';
-import { confirmedIndexUrl, isPreferredSourceIndexUrl, preferredSourceIndexUrl, readerChapterUrl, readerIndexUrl, readerPartMatches, switchedReaderIndex, switchedReaderPart } from '@/lib/reader-session';
+import { confirmedIndexUrl, isPreferredSourceIndexUrl, preferredSourceIndexUrl, readingSessionKey, readerChapterUrl, readerIndexUrl, readerPartMatches, switchedReaderIndex, switchedReaderPart } from '@/lib/reader-session';
+import { readReaderSnapshot, saveReaderSnapshot, type ReaderSnapshot } from '@/lib/page-snapshot';
 import { ReaderPartCache, nextReadingPosition, previousReadingPosition } from '@/lib/reader-part-cache';
 import { captureTextAnchor, restoreTextAnchor } from '@/lib/reader-text-anchor';
 import { forgetSource, readSourceMemory, rememberSource } from '@/lib/source-memory';
@@ -58,6 +59,17 @@ function canPrefetch(): boolean {
 }
 
 export function useReader(session: ReadingSession, apiFetch: ApiFetch, userId: number, isSessionCurrent: () => boolean) {
+  // readerlocal42:往返快照。/ 与 /read/* 是不同路由,切去书库/找书再回来 ReaderSession
+  // 整体重挂,目录与正文窗口都会重新请求。落定时把 (index, parts, position) 写进
+  // sessionStorage,挂载时读回——正文已在快照里,只把窗口外的下一章走正常请求路径。
+  const sessionKey = useMemo(() => readingSessionKey(session), [session]);
+  const [restoredSnapshot] = useState<ReaderSnapshot | null>(() => {
+    const read = readReaderSnapshot(userId, sessionKey);
+    if (!read) return null;
+    const { index, parts, position } = read.value;
+    if (!index || !Array.isArray(parts) || !parts.length || !position) return null;
+    return read.value;
+  });
   // 确认路径（模糊候选点选后）会换 bookUrl 重放；初始 indexUrl 仍由 session 派生。
   // 41-srcmem：source 类且非点选深链（session 无 bookUrl）时，若记忆里有这本书上次读通的源，
   // 初始就带 prefer=1 请求那个源（服务端再校验 + 失败静默回落）。ReaderSession 只在客户端 auth
@@ -102,9 +114,13 @@ export function useReader(session: ReadingSession, apiFetch: ApiFetch, userId: n
       write: (key, raw) => { window.localStorage.setItem(key, raw); },
     },
   }), [apiFetch, userId, isSessionCurrent]);
-  const [reading, setReading] = useState<Reading | null>(null);
+  // 有往返快照时初始 reading 直接采用快照:index/parts 都是纯 JSON 数据,恢复即渲染,
+  // 无需等任何网络请求。activeKey 取 position 所在段;failure/flowing 保持 null/false。
+  const [reading, setReading] = useState<Reading | null>(() => restoredSnapshot
+    ? { index: restoredSnapshot.index, parts: restoredSnapshot.parts, position: restoredSnapshot.position, focus: false }
+    : null);
   const [activeKey, setActiveKey] = useState('0:0');
-  const [loading, setLoading] = useState(true);
+  const [loading, setLoading] = useState(!restoredSnapshot);
   const [flowing, setFlowing] = useState(false);
   const [failure, setFailure] = useState<Failure | null>(null);
   const [percent, setPercent] = useState(0);
@@ -335,6 +351,16 @@ export function useReader(session: ReadingSession, apiFetch: ApiFetch, userId: n
 
   const loadIndex = useCallback(async () => {
     if (!isSessionCurrent()) return;
+    // readerlocal42:已有往返快照时跳过首次目录加载——正文与进度都在快照里,重拉只会
+    // 闪烁一次"正在准备目录"。任何后续 loadIndex(确认换源/重试/409 重载)不受影响:
+    // 走到那些路径时 reading 已被替换,本守卫只挡"挂载后的第一次"。
+    if (restoredSnapshot && !currentReading.current) {
+      const shown = restoredSnapshot.position;
+      setActiveKey(partKey(restoredSnapshot.parts.find((part) => part.chapterIndex === shown.chapterIndex && part.partIndex === shown.partIndex) ?? restoredSnapshot.parts[0]));
+      setPercent(readingPercent(restoredSnapshot.index, restoredSnapshot.parts[0], shown.ratio));
+      setLoading(false);
+      return;
+    }
     flushPosition();
     const { controller, id, retirePrevious } = beginRequest();
     retirePrevious();
@@ -407,7 +433,7 @@ export function useReader(session: ReadingSession, apiFetch: ApiFetch, userId: n
       if (request.current === controller) request.current = null;
       if (isCurrentRequest(controller, id)) setLoading(false);
     }
-  }, [apiFetch, indexUrl, beginRequest, adoptSwitch, cache, fail, flushPosition, progressKeyFor, session, switchedBookUrl, switchedSourceUrl, isSessionCurrent, isCurrentRequest]);
+  }, [apiFetch, indexUrl, beginRequest, adoptSwitch, cache, fail, flushPosition, progressKeyFor, session, switchedBookUrl, switchedSourceUrl, isSessionCurrent, isCurrentRequest, restoredSnapshot]);
 
   // 模糊候选点选后的确认重放：换 bookUrl 重载目录（server 端跳过书名/作者匹配）。
   // 41-panel:扇出面板的确认必须带 sourceUrl(服务端按源 url 精确定位规则,同站多源时不再按 host 反查)。
@@ -432,6 +458,23 @@ export function useReader(session: ReadingSession, apiFetch: ApiFetch, userId: n
       if (scrollFrame.current !== null) cancelAnimationFrame(scrollFrame.current);
     };
   }, [loadIndex, cache, saveProgress, confirmationAttempt]);
+
+  // readerlocal42:往返快照写入。reading 有正文窗口且不在加载中(落定/章内续读)时
+  // 持续更新 sessionStorage——切页离开那一刻的窗口即恢复窗口。卸载 cleanup 里
+  // saveProgress() 已把进度写回,这里再补一次快照(卸载前 effect cleanup 与 ref 仍在)。
+  useEffect(() => {
+    if (!reading || loading || !isSessionCurrent()) return;
+    saveReaderSnapshot(userId, sessionKey, {
+      index: reading.index, parts: reading.parts, position: reading.position,
+    });
+  }, [reading, loading, userId, sessionKey, isSessionCurrent]);
+  useEffect(() => () => {
+    const current = currentReading.current;
+    if (!current) return;
+    saveReaderSnapshot(userId, sessionKey, {
+      index: current.index, parts: current.parts, position: current.position,
+    });
+  }, [userId, sessionKey]);
 
   useEffect(() => {
     const onHidden = () => {

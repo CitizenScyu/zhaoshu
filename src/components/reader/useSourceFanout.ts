@@ -145,6 +145,9 @@ export function useSourceFanout({ apiFetch, title, author, currentSource, cache 
 }) {
   const { sessionId, isCurrentSession } = useOwner();
   const [state, setState] = useState<FanoutState>(INITIAL);
+  // prevBatch/nextBatch 闭包要读当前批与 hasMore：避免把 state 挂进依赖导致回调身份每行更新都变。
+  const stateRef = useRef(state);
+  useEffect(() => { stateRef.current = state; });
   const [generation, setGeneration] = useState(0);
   // fanbatch42：「换一批」的当前批号（0-based）。批号一变 effect 即重扫（abort 在途、行换新批）；
   // rescan 只重测当前批。批 0 不带 query 参数——旧服务端（无 batch 支持）拿到的也是同一份候选。
@@ -252,16 +255,20 @@ export function useSourceFanout({ apiFetch, title, author, currentSource, cache 
   }, [sessionId, isCurrentSession]);
 
   /**
-   * fanbatch42「换一批」：换下一批候选重扫。批号变更触发 effect（abort 在途 probe、行整体替换）；
-   * 旧批已 probe 的结论留在 ProbeCache,同会话内翻回/重检同批源不重复出网计数。
+   * fanbatch42 翻页：批号变更触发 effect（abort 在途、行换新批）；旧批 probe 结论留在
+   * ProbeCache,翻回/重检同批源不重复出网计数。到边界（批 0 / 末批 hasMore=false）为 no-op。
    */
   const nextBatch = useCallback(() => {
-    if (!isCurrentSession(sessionId)) return;
-    setState((previous) => ({ ...INITIAL, batch: previous.batch + 1, hasMore: false }));
+    if (!isCurrentSession(sessionId) || !stateRef.current.hasMore) return;
     setBatch((value) => value + 1);
   }, [sessionId, isCurrentSession]);
 
-  return { ...state, rescan, nextBatch };
+  const prevBatch = useCallback(() => {
+    if (!isCurrentSession(sessionId) || stateRef.current.batch <= 0) return;
+    setBatch((value) => value - 1);
+  }, [sessionId, isCurrentSession]);
+
+  return { ...state, rescan, nextBatch, prevBatch };
 }
 
 // ---- readerux42-A:阅读中自动换源 ----

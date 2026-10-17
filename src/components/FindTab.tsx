@@ -9,6 +9,7 @@ import { isRecord } from '@/lib/sanitize';
 import { feedbackProfileUpdateMessage, type FeedbackProfileStatus } from '@/lib/feedback';
 import { EMPTY_HISTORY, historyKeyFor, historySnapshot, rememberQuery, subscribeHistory } from '@/lib/recent-queries';
 import { shouldRememberQuery } from '@/lib/find-retention';
+import { readExactSnapshot, saveExactSnapshot, readFindSnapshot, saveFindSnapshot } from '@/lib/page-snapshot';
 import { fetchExactSearch } from '@/lib/exact-search-request';
 import { createElapsedTicker, recallProgressSuffix, retryLabel, retryStep, showRetry, type FindPhase, type FindStep } from '@/lib/find-progress';
 // SSE 消费与落定判定在纯模块中用 node 测试；组件编排由相邻 jsdom 套件验证。
@@ -61,18 +62,23 @@ export default function FindTab() {
   const [mode, setMode] = useState<FindMode>('taste');
   // 最近搜索按身份分开；旧全局键只迁给已确认的 owner。
   const historyKey = useMemo(() => historyKeyFor(userId), [userId]);
-  const [query, setQuery] = useState('');
+  // readerlocal42:往返快照。/read/* 与 / 是不同路由,切去阅读再回来 FindTab 整体重挂,
+  // 已拿到的结果会丢。挂载时读回同一标签页 30 分钟内的快照:结果直接恢复(不重跑三步
+  // 找书),查询框回填原需求;跑新查询或出错都会走覆盖/不写的路径(见下方 effect)。
+  const [restored] = useState(() => readFindSnapshot(userId));
+  const restoredResults = Array.isArray(restored?.value.results) ? restored!.value.results : [];
+  const [query, setQuery] = useState(restored?.value.q ?? '');
   const [onlyThisTime, setOnlyThisTime] = useState(false); // 「仅本次有效」checkbox：默认不勾=长期
   const [verifyTotal, setVerifyTotal] = useState(0);
   const [verifyDone, setVerifyDone] = useState(0);
   const [sourceProgress, setSourceProgress] = useState<{ done: number; total: number } | null>(null);
-  const [phase, setPhase] = useState<Phase>('idle');
+  const [phase, setPhase] = useState<Phase>(restoredResults.length > 0 ? 'done' : 'idle');
   const [candidates, setCandidates] = useState<Candidate[]>([]);
-  const [results, setResults] = useState<RerankedItem[]>([]);
+  const [results, setResults] = useState<RerankedItem[]>(restoredResults);
   const [error, setError] = useState('');
-  const [persistNote, setPersistNote] = useState(''); // result 帧 persisted=false：结果没存下来，必须说给用户
-  const [emptyNote, setEmptyNote] = useState(''); // F13：合法零结果的排除原因摘要/放宽建议
-  const [vetoed, setVetoed] = useState<VetoedBook[]>([]); // 41-veto-visible：因画像雷点被自动排除的书
+  const [persistNote, setPersistNote] = useState(restored?.value.persistNote ?? ''); // result 帧 persisted=false：结果没存下来，必须说给用户
+  const [emptyNote, setEmptyNote] = useState(restored?.value.emptyNote ?? ''); // F13：合法零结果的排除原因摘要/放宽建议
+  const [vetoed, setVetoed] = useState<VetoedBook[]>(Array.isArray(restored?.value.vetoed) ? restored!.value.vetoed : []); // 41-veto-visible：因画像雷点被自动排除的书
   const [recallSeconds, setRecallSeconds] = useState(0); // recall 阶段已等待秒数
   const [retryFrom, setRetryFrom] = useState<FindStep | null>(null); // 失败后可从哪一步起重试
   const request = useRef<AbortController | null>(null);
@@ -82,6 +88,19 @@ export default function FindTab() {
   const ticketRef = useRef('');
   const runCtxRef = useRef<{ q: string; conditions: string; retention: FindRetention } | null>(null);
   useEffect(() => () => { request.current?.abort(); }, [apiFetch]);
+
+  // readerlocal42:落定即写快照。error 不写——失败态不值得恢复,留旧快照比留错误页更有用;
+  // 新一轮 run() 会先 setPhase('recall'),期间不会覆盖,成功后自然替换。
+  useEffect(() => {
+    if (phase !== 'done' || !isCurrentSession(sessionId)) return;
+    saveFindSnapshot(userId, {
+      q: runCtxRef.current?.q ?? restored?.value.q ?? '',
+      results,
+      persistNote,
+      emptyNote,
+      vetoed,
+    });
+  }, [phase, results, persistNote, emptyNote, vetoed, userId, sessionId, isCurrentSession, restored]);
 
   // recall 阶段后端不发阶段推进事件，用前端计时器报「已等待 Xs」；phase 一变或组件卸载就清理，
   // 本仓出过卸载后 timer 还在跑的缺陷。
@@ -459,12 +478,20 @@ export function VetoedList({ books }: { books: VetoedBook[] }) {
 // 精确找书面板（task-77）。状态机、文案选择、响应收窄全部来自 @/lib/find-exact——
 // 纯判定便于单独验证，实际交互与异步请求另由 jsdom 组件测试覆盖。
 function ExactSearchSection({ onFallback }: { onFallback: (query: string) => void }) {
-  const { apiFetch } = useOwner();
-  const [title, setTitle] = useState('');
-  const [author, setAuthor] = useState('');
-  const [state, dispatch] = useReducer(exactReducer, EMPTY_EXACT_STATE);
+  const { apiFetch, user } = useOwner();
+  const userId = user?.id ?? 0;
+  // readerlocal42:往返快照,与口味推荐同一套机制(见 FindTab 顶部注释)。
+  const [restored] = useState(() => readExactSnapshot(userId));
+  const [title, setTitle] = useState(restored?.value.title ?? '');
+  const [author, setAuthor] = useState(restored?.value.author ?? '');
+  const [state, dispatch] = useReducer(exactReducer, restored?.value.state ?? EMPTY_EXACT_STATE);
   const request = useRef<AbortController | null>(null);
   useEffect(() => () => { request.current?.abort(); }, [apiFetch]);
+  // 落定(done)才写;error 不写,理由与口味推荐一致。
+  useEffect(() => {
+    if (state.phase !== 'done') return;
+    saveExactSnapshot(userId, { title, author, state });
+  }, [state.phase, title, author, userId]);
 
   async function search() {
     const q = title.trim();

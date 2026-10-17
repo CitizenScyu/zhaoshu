@@ -560,8 +560,8 @@ describe('换源面板扇出:调度', () => {
   });
 });
 
-describe('换源面板扇出:换一批(fanbatch42)', () => {
-  it('hasMore=true 显示「换一批」;点击取 batch=1 候选并整体替换行;末批按钮撤掉;旧批结论留在缓存不重复出网', async () => {
+describe('换源面板扇出:翻页(fanbatch42 翻页器)', () => {
+  it('hasMore=true 可翻下一页;点击取 batch=1 候选并整体替换行;上一页翻回批 0;末批「下一页」禁用;旧批结论留在缓存不重复出网', async () => {
     const batch0 = [candidate('首批源', 'https://first.example'), candidate('源甲', CURRENT)];
     const batch1 = [candidate('次批源', 'https://second.example')];
     const listCalls: string[] = [];
@@ -586,14 +586,21 @@ describe('换源面板扇出:换一批(fanbatch42)', () => {
     await waitFor(() => expect(row('首批源').dataset.probeStatus).toBe('miss'));
     // 批 0 不带 query(旧服务端兼容);批 1 带 batch=1。
     expect(listCalls).toEqual(['/api/read/source-probe']);
-    const nextButton = screen.getByRole('button', { name: '换一批' }) as HTMLButtonElement;
+    // 批 0:「上一页」禁用、「下一页」可用。
+    expect((screen.getByRole('button', { name: '上一页' }) as HTMLButtonElement).disabled).toBe(true);
+    const nextButton = screen.getByRole('button', { name: '下一页' }) as HTMLButtonElement;
     await waitFor(() => expect(nextButton.disabled).toBe(false));
     await user.click(nextButton);
     await waitFor(() => expect(row('次批源').dataset.probeStatus).toBe('miss'));
     expect(listCalls).toEqual(['/api/read/source-probe', '/api/read/source-probe?batch=1']);
-    // 行整体替换:首批源不再渲染;末批 hasMore=false ⇒ 按钮撤掉。
+    // 行整体替换:首批源不再渲染;末批 hasMore=false ⇒ 「下一页」禁用、「上一页」可翻回。
     expect(() => row('首批源')).toThrow();
-    await waitFor(() => expect(screen.queryByRole('button', { name: '换一批' })).toBeNull());
+    const prevButton = screen.getByRole('button', { name: '上一页' }) as HTMLButtonElement;
+    await waitFor(() => expect((screen.getByRole('button', { name: '下一页' }) as HTMLButtonElement).disabled).toBe(true));
+    await waitFor(() => expect(prevButton.disabled).toBe(false));
+    await user.click(prevButton);
+    await waitFor(() => expect(row('首批源').dataset.probeStatus).toBe('miss'));
+    expect(listCalls).toEqual(['/api/read/source-probe', '/api/read/source-probe?batch=1', '/api/read/source-probe']);
     // 重开面板回到批 0:首批源命中 ProbeCache,不再发 probe;次批源也只探过一次。
     await user.click(screen.getByRole('button', { name: '关闭切换书源' }));
     await user.click(screen.getByRole('button', { name: /换源/ }));
@@ -602,11 +609,12 @@ describe('换源面板扇出:换一批(fanbatch42)', () => {
     expect(probeCalls(apiFetch).filter((url) => url === 'https://second.example').length).toBe(1);
   });
 
-  it('旧服务端候选列表不带 hasMore ⇒ 不显示「换一批」(零回归)', async () => {
+  it('旧服务端候选列表不带 hasMore ⇒ 不显示翻页器(零回归)', async () => {
     const sources = [candidate('源甲', CURRENT), candidate('命中源', 'https://ok.example')];
     const apiFetch = fanoutFetch(sources, (url) => json(probe(sources.find((item) => item.url === url)!, { status: 'miss' })));
     await openPanel(apiFetch);
     await waitFor(() => expect(row('命中源').dataset.probeStatus).toBe('miss'));
-    expect(screen.queryByRole('button', { name: '换一批' })).toBeNull();
+    expect(screen.queryByRole('button', { name: '上一页' })).toBeNull();
+    expect(screen.queryByRole('button', { name: '下一页' })).toBeNull();
   });
 });

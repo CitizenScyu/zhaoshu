@@ -34,6 +34,8 @@ function mount(apiFetch: ApiFetch) {
 beforeEach(() => {
   current = true;
   window.localStorage.clear();
+  // readerlocal42 往返快照存 sessionStorage;同文件内前序用例的快照不能泄进后续用例。
+  window.sessionStorage.clear();
   window.localStorage.setItem(READER_SETTINGS_KEY, JSON.stringify({ preloadNext: false }));
   vi.stubGlobal('ResizeObserver', class { observe() {} disconnect() {} });
 });

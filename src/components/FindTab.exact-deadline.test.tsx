@@ -29,7 +29,12 @@ function start() {
   return view;
 }
 
-async function flush() { await act(async () => {}); }
+async function flush() {
+  // readerlocal42 快照 effect 落定后会 sessionStorage.setItem;jsdom 的 setItem 内部
+  // 排一个 setTimeout(0) 派发 storage 事件,fake timers 不走零毫就挂着。这里推进 0ms
+  // 只消化该内部任务,不会提前触发 35s 期限。
+  await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+}
 async function expire() {
   await act(async () => { await vi.advanceTimersByTimeAsync(EXACT_SEARCH_TIMEOUT_MS); });
 }
