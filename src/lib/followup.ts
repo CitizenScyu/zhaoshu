@@ -154,7 +154,7 @@ export interface FollowupCandidate {
 export function followupCandidatesQuery(sql: FollowupSql, limit: number) {
   return sql`
     WITH done_tasks AS (
-      SELECT id, user_id, book_id, title, author, source_url, source_kind, source_id, source_revision
+      SELECT id, user_id, book_id, title, author, source_url, source_kind, source_id, source_revision, created_at
       FROM download_tasks
       WHERE status = 'done' AND requested_by = 'user' AND user_id IS NOT NULL
     ), reading AS (
@@ -336,6 +336,22 @@ export async function claimFollowupLease(sql: FollowupSql): Promise<FollowupLeas
   return null;
 }
 
+/** 候选查询的库侧行形状（驱动返回列名，不做自动驼峰化）。 */
+interface FollowupCandidateRow {
+  user_id: number; book_id: number; title: string; author: string; source_url: string;
+  source_kind: string; source_id: string | null; source_revision: string;
+  last_chapter_count: number | null; last_toc_prefix_hash: string | null; consecutive_no_new: number | null;
+}
+
+function candidateOf(row: FollowupCandidateRow): FollowupCandidate {
+  return {
+    userId: row.user_id, bookId: row.book_id, title: row.title, author: row.author, sourceUrl: row.source_url,
+    sourceKind: row.source_kind, sourceId: row.source_id, sourceRevision: row.source_revision,
+    lastChapterCount: row.last_chapter_count, lastTocPrefixHash: row.last_toc_prefix_hash ?? '',
+    consecutiveNoNew: row.consecutive_no_new ?? 0,
+  };
+}
+
 export interface FollowupRoundReport {
   skipped?: 'lease';
   candidates: number;
@@ -371,7 +387,9 @@ export async function runFollowupRound(parentSignal?: AbortSignal, deps: Followu
     const resolveSource = deps.resolveSource ?? defaultFollowupSourceResolver;
     const probe = deps.probe ?? probeFollowupCatalog;
     const report: FollowupRoundReport = { candidates: 0, probed: 0, enqueued: 0, rebased: 0, failed: 0, items: [], elapsedMs: 0 };
-    const candidates = await followupCandidatesQuery(sql, FOLLOWUP_CANDIDATE_LIMIT) as unknown as FollowupCandidate[];
+    // 驱动返回的是库列名（snake_case），映射到候选形状只在这一处发生。
+    const rows = await followupCandidatesQuery(sql, FOLLOWUP_CANDIDATE_LIMIT) as unknown as FollowupCandidateRow[];
+    const candidates = rows.map(candidateOf);
     report.candidates = candidates.length;
     for (const candidate of candidates) {
       signal.throwIfAborted();
