@@ -31,6 +31,8 @@ const policies: Record<string, Record<string, 'find' | 'read' | 'download' | 'ow
   'admin/download-stats': { GET: 'owner' },
   export: { GET: 'find' },
   feedback: { GET: 'find', POST: 'find' }, find: { POST: 'find' },
+  // zhuigeng42：追更轮，只由 phoenix 侧 systemd timer 以 CRON_SECRET 调用（见 followup/route.test.ts）。
+  followup: { POST: 'cron' },
   // 精确找书（task-77）：与 /api/find 同为「找书」能力，且同样会向豆瓣发外部请求，
   // 所以必须走同一套 withFindAccess（匿名必须在读写与外部副作用之前被拒）。
   'find/exact': { POST: 'find' }, 'find/exact/shelf': { POST: 'find' },
