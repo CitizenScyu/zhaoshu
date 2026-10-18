@@ -51,9 +51,14 @@ describe('GET /api/profile/absorb/drain (F15 兜底 drain)', () => {
     vi.restoreAllMocks();
   });
 
-  it('R1：每日 cron 直接调用拥有 295s 预算的 drain 路由', () => {
-    const config = JSON.parse(readFileSync('vercel.json', 'utf8'));
-    expect(config.crons).toContainEqual({ path: '/api/profile/absorb/drain', schedule: '30 21 * * *' });
+  it('R1：phoenix 的 drain timer 每日直接调用拥有 295s 预算的 drain 路由', () => {
+    // 2026-10-18 crons5：调度从 vercel.json 的 crons 迁到 phoenix systemd timer
+    // （vercel.json 的 crons 块已删，留着就是双跑）。判据跟着迁到仓内单元副本：
+    // 每日一次 → 24h < maxDuration 295s，drain 路由仍拿到整份预算。
+    const timer = readFileSync('deploy/phoenix/zhaoshu-cron-drain.timer', 'utf8');
+    expect(timer).toMatch(/^OnCalendar=\*-\*-\* \d{2}:\d{2}:\d{2} [A-Za-z_/+-]+$/m);
+    const service = readFileSync('deploy/phoenix/zhaoshu-cron-drain.service', 'utf8');
+    expect(service).toMatch(/^ExecStart=\S*cron-call\.sh \/api\/profile\/absorb\/drain \d+$/m);
     expect(maxDuration).toBe(295);
   });
 
