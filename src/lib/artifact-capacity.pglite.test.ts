@@ -60,40 +60,57 @@ describe('artifact capacity kernel: real local Postgres vectors (draft, unrun)',
   });
 
   /** 受控对账入口未实现：测试直接用裸 SQL 填 ready 权威账（生产默认 uninitialized，不能放行）。 */
-  async function seedLedger(overrides: Partial<{ state: string; epoch: string; admission: string; version: string; validUntil: string; registered: number; reserved: number; target: number; admissionTarget: object | null }> = {}) {
+  async function seedLedger(overrides: Partial<{ state: string; epoch: string; admission: string; version: string; validUntil: string; registered: number; reserved: number; target: number; githubSize: number; compressedTarget: number; admissionTarget: object | null }> = {}) {
     const row = {
       state: 'ready', epoch: 'epoch-1', admission: 'granted', version: 'adm-1',
       validUntil: '2100-01-01T00:00:00Z', registered: 0, reserved: 0, target: 100,
+      githubSize: 0, compressedTarget: 1_073_741_824,
       admissionTarget: { repositoryId: 1, branch: 'release/a' } as object | null, ...overrides,
     };
     await pg.query(
       `INSERT INTO repository_capacity_ledger
          (repository_id, state, target_bytes, registered_bytes, reserved_bytes,
+          github_size_bytes, target_compressed_bytes,
           baseline_epoch, admission_status, admission_version, admission_valid_until, admission_target)
-       VALUES (1,$1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb)
+       VALUES (1,$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::jsonb)
        ON CONFLICT (repository_id) DO UPDATE SET
          state=EXCLUDED.state, target_bytes=EXCLUDED.target_bytes,
          registered_bytes=EXCLUDED.registered_bytes, reserved_bytes=EXCLUDED.reserved_bytes,
+         github_size_bytes=EXCLUDED.github_size_bytes,
+         target_compressed_bytes=EXCLUDED.target_compressed_bytes,
          baseline_epoch=EXCLUDED.baseline_epoch, admission_status=EXCLUDED.admission_status,
          admission_version=EXCLUDED.admission_version, admission_valid_until=EXCLUDED.admission_valid_until,
          admission_target=EXCLUDED.admission_target`,
-      [row.state, row.target, row.registered, row.reserved, row.epoch, row.admission,
-        row.version, row.validUntil, row.admissionTarget == null ? null : JSON.stringify(row.admissionTarget)],
+      [row.state, row.target, row.registered, row.reserved, row.githubSize, row.compressedTarget,
+        row.epoch, row.admission, row.version, row.validUntil,
+        row.admissionTarget == null ? null : JSON.stringify(row.admissionTarget)],
     );
   }
 
   const ledgerReserved = async () => Number(((await pg.query('SELECT reserved_bytes FROM repository_capacity_ledger WHERE repository_id=1')).rows[0] as Record<string, unknown>).reserved_bytes);
 
   it('vector 1: a request with insufficient remaining capacity is refused with zero writes', async () => {
-    await seedLedger({ reserved: 60 }); // 60 + 60 > 100
+    await seedLedger({ githubSize: 100, compressedTarget: 100 }); // 100 + 1 > 100 ⇒ 正好装满即不合格
     await expect(reserveCapacityAndPath(sql as never, INPUT)).resolves.toEqual({ status: 'insufficient_capacity' });
-    expect(await ledgerReserved()).toBe(60);
+    expect(await ledgerReserved()).toBe(0);
     expect((await pg.query('SELECT count(*)::int n FROM artifact_capacity_reservations')).rows).toEqual([{ n: 0 }]);
     expect((await pg.query('SELECT count(*)::int n FROM book_artifacts')).rows).toEqual([{ n: 0 }]);
     // 余量刚好够一笔则放行（并发交错须在目标库验证）。
-    await seedLedger({ reserved: 40 });
+    await seedLedger({ githubSize: 99, compressedTarget: 100 });
     await expect(reserveCapacityAndPath(sql as never, INPUT)).resolves.toMatchObject({ status: 'reserved' });
-    expect(await ledgerReserved()).toBe(100);
+    expect(await ledgerReserved()).toBe(60);
+  });
+
+  // repothresh44 回归：生产 id1/id2 的逻辑字节（1.92e9 / 1.00e9）早已越过旧 target_bytes=1e9，
+  // 压缩 size 却只有 774 MiB / 397 MiB。本门若仍读逻辑字节，decide 判 stay 之后发布会被
+  // insufficient_capacity 挡死 ⇒ 这条钉住「预留门与 decide 同口径」。
+  it('vector 1b: 逻辑字节超旧 target_bytes 但压缩未满 ⇒ 仍放行（旧口径只作观测）', async () => {
+    await seedLedger({
+      target: 1_000_000_000, registered: 1_922_960_818, reserved: 0,
+      githubSize: 774_512_640, compressedTarget: 1_073_741_824,
+    });
+    await expect(reserveCapacityAndPath(sql as never, INPUT)).resolves.toMatchObject({ status: 'reserved' });
+    expect(await ledgerReserved()).toBe(60);
   });
 
   it('vector 2: re-entry strictly compares immutable binding, lease and state', async () => {
@@ -116,7 +133,8 @@ describe('artifact capacity kernel: real local Postgres vectors (draft, unrun)',
   });
 
   it('vector 3b: a second active reservation for the same identity is refused atomically (945 F6)', async () => {
-    await seedLedger({ target: 1000 }); // F6：容量足够两笔，第二笔才真正进入身份排他，而非先被容量门挡下
+    // F6：容量门放行两笔（seedLedger 默认 githubSize=0 对 1GiB 压缩目标），第二笔才真正进入身份排他，
+    // 而非先被容量门挡下。
     await expect(reserveCapacityAndPath(sql as never, INPUT)).resolves.toMatchObject({ status: 'reserved' });
     expect(await ledgerReserved()).toBe(60); // 第一笔占用
     // 第二笔属另一用户（user_id=2）：同 user 活动任务受 download_tasks_user_active_book_idx

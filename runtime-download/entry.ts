@@ -139,6 +139,7 @@ interface RolloverCandidateRow {
   enabled: unknown; is_private: unknown; read_only: unknown; sealed_at: unknown;
   ledger_state: unknown; baseline_epoch: unknown; target_bytes: unknown;
   registered_bytes: unknown; reserved_bytes: unknown;
+  github_size_bytes: unknown; target_compressed_bytes: unknown;
   admission_status: unknown; admission_version: unknown;
   admission_valid_until: unknown; admission_target: unknown;
 }
@@ -191,6 +192,10 @@ function toRepositoryCandidate(row: RolloverCandidateRow): RepositoryCandidate {
     readOnly: row.read_only as boolean,
     sealed: row.sealed_at !== null && row.sealed_at !== undefined,
     targetBytes: rolloverBigint(row.target_bytes, 'target_bytes'),
+    // 容量门槛两列（repothresh44）：缺列/NULL/负数一律抛（失败关闭）——按 0 猜会让已满的仓
+    // 看起来「无限空」，继续往里写直到撞 GitHub 硬限。故必须先跑 migrations/0008 再上这版代码。
+    targetCompressedBytes: rolloverBigint(row.target_compressed_bytes, 'target_compressed_bytes'),
+    githubSizeBytes: rolloverBigint(row.github_size_bytes, 'github_size_bytes'),
     accounting,
     externalAdmission: {
       status: admissionStatus as AdmissionStatus,
@@ -214,6 +219,7 @@ export function createRolloverEvidencePort(
           SELECT r.id, r.owner, r.repo, r.branch, r.enabled, r.is_private, r.read_only, r.sealed_at,
                  l.state AS ledger_state, l.baseline_epoch, l.target_bytes,
                  l.registered_bytes, l.reserved_bytes,
+                 l.github_size_bytes, l.target_compressed_bytes,
                  l.admission_status, l.admission_version, l.admission_valid_until, l.admission_target
           FROM storage_repositories r
           LEFT JOIN repository_capacity_ledger l ON l.repository_id = r.id

@@ -18,7 +18,10 @@ import {
 const NOW = new Date('2026-10-08T04:00:00.000Z');
 const FUTURE = '2026-12-31T00:00:00.000Z';
 const PAST = '2026-01-01T00:00:00.000Z';
+/** 旧逻辑口径目标：repothresh44 起只作观测，不参与容量门槛（仍必须为正，见输入校验）。 */
 const TARGET = BigInt(1_000_000_000);
+/** 新容量门槛目标：GitHub 压缩 pack 字节 1GiB。 */
+const COMPRESSED_TARGET = BigInt(1_073_741_824);
 const SHA = 'a'.repeat(40); // 合法 git blob sha40 合成值
 
 function tuple(id: number, repo = `repo-${id}`): RepositoryTuple {
@@ -40,6 +43,8 @@ function candidate(over: Partial<Omit<RepositoryCandidate, 'accounting' | 'exter
     readOnly: over.readOnly ?? false,
     sealed: over.sealed ?? false,
     targetBytes: over.targetBytes ?? TARGET,
+    targetCompressedBytes: over.targetCompressedBytes ?? COMPRESSED_TARGET,
+    githubSizeBytes: over.githubSizeBytes ?? BigInt(0),
     accounting: over.accounting ?? {
       registeredLogicalBytes: BigInt(0), reservedLogicalBytes: BigInt(0), version: 'v1', validUntil: FUTURE, target: self,
     },
@@ -64,9 +69,12 @@ function request(over: Partial<RepositoryRolloverRequest> & { currentRepositoryI
 }
 
 describe('reporollover937+939 planRepositoryRollover 纯决策（未运行草稿）', () => {
-  it('向量1：当前未满、此次恰好达阈值 ⇒ stay，仍需预留', () => {
+  it('向量1：压缩 size 差 1 字节到阈值 ⇒ stay（逻辑字节再多也不参与容量门槛），仍需预留', () => {
+    // repothresh44 语义变更的定点钉子：逻辑账 900M+50M 再写 50M（旧口径恰好压线）与本次
+    // 50M 逻辑字节都不影响门槛；门槛只看 githubSizeBytes+1 <= targetCompressedBytes。
     const a = candidate({
       id: 1,
+      githubSizeBytes: COMPRESSED_TARGET - BigInt(1),
       accounting: { registeredLogicalBytes: BigInt(900_000_000), reservedLogicalBytes: BigInt(50_000_000), version: 'v7', validUntil: FUTURE, target: tuple(1) },
     });
     const plan = planRepositoryRollover(request({
@@ -78,9 +86,10 @@ describe('reporollover937+939 planRepositoryRollover 纯决策（未运行草稿
     });
   });
 
-  it('向量2：当前已到阈值 ⇒ switch 到下一合法空仓（完整目标元组）', () => {
+  it('向量2：当前压缩 size 已到阈值 ⇒ switch 到下一合法空仓（完整目标元组）', () => {
     const a = candidate({
-      id: 1, accounting: { registeredLogicalBytes: BigInt(1_000_000_000), reservedLogicalBytes: BigInt(0), version: 'v1', validUntil: FUTURE, target: tuple(1) },
+      id: 1, githubSizeBytes: COMPRESSED_TARGET,
+      accounting: { registeredLogicalBytes: BigInt(1_000_000_000), reservedLogicalBytes: BigInt(0), version: 'v1', validUntil: FUTURE, target: tuple(1) },
     });
     const b = candidate({ id: 2, owner: 'citizen', repo: 'repo-2', branch: 'main' });
     const plan = planRepositoryRollover(request({
@@ -92,9 +101,10 @@ describe('reporollover937+939 planRepositoryRollover 纯决策（未运行草稿
     });
   });
 
-  it('向量3：新内容越界且后续仓 read_only/disabled ⇒ blocked(NO_ELIGIBLE_REPOSITORY)，不回退当前仓', () => {
+  it('向量3：当前仓压缩已满且后续仓 read_only/disabled ⇒ blocked(NO_ELIGIBLE_REPOSITORY)，不回退当前仓', () => {
     const a = candidate({
-      id: 1, accounting: { registeredLogicalBytes: BigInt(999_999_950), reservedLogicalBytes: BigInt(0), version: 'v1', validUntil: FUTURE, target: tuple(1) },
+      id: 1, githubSizeBytes: COMPRESSED_TARGET,
+      accounting: { registeredLogicalBytes: BigInt(999_999_950), reservedLogicalBytes: BigInt(0), version: 'v1', validUntil: FUTURE, target: tuple(1) },
     });
     const b = candidate({ id: 2, readOnly: true });
     const c = candidate({ id: 3, enabled: false });
@@ -104,9 +114,10 @@ describe('reporollover937+939 planRepositoryRollover 纯决策（未运行草稿
     expect(plan).toEqual({ kind: 'blocked', reason: 'NO_ELIGIBLE_REPOSITORY' });
   });
 
-  it('向量4：当前满、无下一仓 ⇒ blocked(NO_ELIGIBLE_REPOSITORY)，不回退满仓', () => {
+  it('向量4：当前压缩已满、无下一仓 ⇒ blocked(NO_ELIGIBLE_REPOSITORY)，不回退满仓', () => {
     const a = candidate({
-      id: 1, accounting: { registeredLogicalBytes: BigInt(1_000_000_000), reservedLogicalBytes: BigInt(0), version: 'v1', validUntil: FUTURE, target: tuple(1) },
+      id: 1, githubSizeBytes: COMPRESSED_TARGET,
+      accounting: { registeredLogicalBytes: BigInt(1_000_000_000), reservedLogicalBytes: BigInt(0), version: 'v1', validUntil: FUTURE, target: tuple(1) },
     });
     const plan = planRepositoryRollover(request({
       currentRepositoryId: 1, candidates: [a], logicalBytes: BigInt(1),
@@ -116,7 +127,8 @@ describe('reporollover937+939 planRepositoryRollover 纯决策（未运行草稿
 
   it('向量5：同内容已发布绑定在满仓 ⇒ reuse，增量 0，不换仓', () => {
     const a = candidate({
-      id: 1, accounting: { registeredLogicalBytes: BigInt(1_000_000_000), reservedLogicalBytes: BigInt(0), version: 'v1', validUntil: FUTURE, target: tuple(1) },
+      id: 1, githubSizeBytes: COMPRESSED_TARGET,
+      accounting: { registeredLogicalBytes: BigInt(1_000_000_000), reservedLogicalBytes: BigInt(0), version: 'v1', validUntil: FUTURE, target: tuple(1) },
     });
     const plan = planRepositoryRollover(request({
       currentRepositoryId: 1, candidates: [a], logicalBytes: BigInt(12_345),
@@ -278,7 +290,8 @@ describe('reporollover937+939 planRepositoryRollover 纯决策（未运行草稿
 
   it('候选优先序稳定：当前满时选数组中第一个可写且足够的仓', () => {
     const a = candidate({
-      id: 1, accounting: { registeredLogicalBytes: BigInt(1_000_000_000), reservedLogicalBytes: BigInt(0), version: 'v1', validUntil: FUTURE, target: tuple(1) },
+      id: 1, githubSizeBytes: COMPRESSED_TARGET,
+      accounting: { registeredLogicalBytes: BigInt(1_000_000_000), reservedLogicalBytes: BigInt(0), version: 'v1', validUntil: FUTURE, target: tuple(1) },
     });
     const b = candidate({ id: 2, repo: 'repo-b' });
     const c = candidate({ id: 3, repo: 'repo-c' });
@@ -289,16 +302,27 @@ describe('reporollover937+939 planRepositoryRollover 纯决策（未运行草稿
 
   it('bigint 超过 Number 安全整数仍精确；负数/target=0 拒绝', () => {
     const huge = BigInt(10_000_000_000_000_000_001); // > 2^53
-    const a = candidate({
-      id: 1, targetBytes: huge,
+    // 压缩门槛在 2^53 之外仍逐字节精确：huge-1 + 1 <= huge 合格；huge + 1 > huge 不合格。
+    const atEdge = candidate({
+      id: 1, targetCompressedBytes: huge, githubSizeBytes: huge - BigInt(1),
       accounting: { registeredLogicalBytes: huge - BigInt(1), reservedLogicalBytes: BigInt(0), version: 'v1', validUntil: FUTURE, target: tuple(1) },
     });
-    expect(planRepositoryRollover(request({ currentRepositoryId: 1, candidates: [a], logicalBytes: BigInt(1) })).kind).toBe('stay');
-    expect(planRepositoryRollover(request({ currentRepositoryId: 1, candidates: [a], logicalBytes: BigInt(2) })).kind).toBe('blocked');
-    expect(() => planRepositoryRollover(request({ currentRepositoryId: 1, candidates: [a], logicalBytes: -BigInt(1) })))
+    expect(planRepositoryRollover(request({ currentRepositoryId: 1, candidates: [atEdge], logicalBytes: BigInt(1) })).kind).toBe('stay');
+    const full = candidate({ id: 1, targetCompressedBytes: huge, githubSizeBytes: huge });
+    expect(planRepositoryRollover(request({ currentRepositoryId: 1, candidates: [full], logicalBytes: BigInt(1) })).kind).toBe('blocked');
+    // 本次 logicalBytes 不再参与容量门槛：写 1 字节与写 huge 字节判定相同（旧逻辑口径此处翻成 blocked）。
+    expect(planRepositoryRollover(request({ currentRepositoryId: 1, candidates: [atEdge], logicalBytes: huge })).kind).toBe('stay');
+    expect(() => planRepositoryRollover(request({ currentRepositoryId: 1, candidates: [atEdge], logicalBytes: -BigInt(1) })))
       .toThrow(RepositoryRolloverInputError);
     expect(() => planRepositoryRollover(request({
       currentRepositoryId: 1, candidates: [candidate({ id: 1, targetBytes: BigInt(0) })], logicalBytes: BigInt(1),
+    }))).toThrow(RepositoryRolloverInputError);
+    // 新列同样失败关闭：压缩目标非正、压缩 size 为负一律拒绝，不按 0 猜（猜 0 = 满仓看着无限空）。
+    expect(() => planRepositoryRollover(request({
+      currentRepositoryId: 1, candidates: [candidate({ id: 1, targetCompressedBytes: BigInt(0) })], logicalBytes: BigInt(1),
+    }))).toThrow(RepositoryRolloverInputError);
+    expect(() => planRepositoryRollover(request({
+      currentRepositoryId: 1, candidates: [candidate({ id: 1, githubSizeBytes: -BigInt(1) })], logicalBytes: BigInt(1),
     }))).toThrow(RepositoryRolloverInputError);
   });
 

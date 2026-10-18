@@ -22,7 +22,8 @@ import type { RepositoryCandidate, RepositoryTuple } from '../../runtime-downloa
 
 const NOW = new Date('2026-10-08T04:00:00.000Z');
 const FUTURE = '2026-12-31T00:00:00.000Z';
-const TARGET_BYTES = BigInt(1_000_000_000); // 十进制 1GB（rollover 量纲，非 1GiB）
+const TARGET_BYTES = BigInt(1_000_000_000); // 旧**逻辑**口径（十进制 1GB）；repothresh44 起只作观测
+const COMPRESSED_TARGET = BigInt(1_073_741_824); // 容量门槛：GitHub 压缩 pack 1GiB
 const CURRENT: RepositoryTuple = { id: 1, owner: 'citizen', repo: 'repo-1', branch: 'main' };
 const NEXT: RepositoryTuple = { id: 2, owner: 'citizen', repo: 'repo-2', branch: 'main' };
 
@@ -55,6 +56,7 @@ class TaggedGitHub {
 /** 合成候选（沿 repository-rollover-wiring.test.ts 的 candidate 形状，证据全部绑定本仓）。 */
 function candidate(over: {
   id: number; registered?: bigint; reserved?: bigint; targetBytes?: bigint;
+  githubSize?: bigint; targetCompressedBytes?: bigint;
 }): RepositoryCandidate {
   const self: RepositoryTuple = {
     id: over.id, owner: 'citizen', repo: `repo-${over.id}`, branch: 'main',
@@ -66,6 +68,8 @@ function candidate(over: {
     readOnly: false,
     sealed: false,
     targetBytes: over.targetBytes ?? TARGET_BYTES,
+    targetCompressedBytes: over.targetCompressedBytes ?? COMPRESSED_TARGET,
+    githubSizeBytes: over.githubSize ?? BigInt(0),
     accounting: {
       registeredLogicalBytes: over.registered ?? BigInt(0), reservedLogicalBytes: over.reserved ?? BigInt(0),
       version: 'v1', validUntil: FUTURE, target: self,
@@ -137,8 +141,9 @@ describe('capacity986 download-worker 切仓决策消费点（合成端口）', 
     expect(rebuilt).toHaveLength(0);
   });
 
-  it('b. switch：旧仓投影超限 ⇒ reserve 与 publish 均收到新仓 repositoryId/branch/github（防只换 id 回归）', async () => {
-    const full = candidate({ id: 1, registered: TARGET_BYTES }); // 投影 TARGET+bytes > TARGET
+  it('b. switch：旧仓压缩 size 已满 ⇒ reserve 与 publish 均收到新仓 repositoryId/branch/github（防只换 id 回归）', async () => {
+    // size+1 > 1GiB ⇒ 不合格；registered 同量级只是观测（repothresh44 起不参与判定）。
+    const full = candidate({ id: 1, registered: TARGET_BYTES, githubSize: COMPRESSED_TARGET });
     const fresh = candidate({ id: 2 });
     const { seam: rolloverSeam, rebuilt, rebuildTargets } = makeSeam([[full, fresh]]);
     const { storage, assembly, run } = fixture(rolloverSeam);
@@ -157,7 +162,7 @@ describe('capacity986 download-worker 切仓决策消费点（合成端口）', 
   });
 
   it('c1. blocked（无可用新仓）⇒ 上抛收口 failed，reserveArtifactPath 与发布零调用，不降级写旧仓', async () => {
-    const full = candidate({ id: 1, registered: TARGET_BYTES });
+    const full = candidate({ id: 1, registered: TARGET_BYTES, githubSize: COMPRESSED_TARGET });
     const { seam: rolloverSeam, rebuilt } = makeSeam([[full]]);
     const { storage, assembly, run } = fixture(rolloverSeam);
     const result = await run();
@@ -187,7 +192,7 @@ describe('capacity986 download-worker 切仓决策消费点（合成端口）', 
   });
 
   it('d. 一次 switch 后装配期常量不被污染：下一任务重新决策 stay，回到装配期闭包与 repositoryId', async () => {
-    const full = candidate({ id: 1, registered: TARGET_BYTES });
+    const full = candidate({ id: 1, registered: TARGET_BYTES, githubSize: COMPRESSED_TARGET });
     const fresh = candidate({ id: 2 });
     const { seam: rolloverSeam, rebuilt, portCallCount } = makeSeam([
       [full, fresh],                          // 第一任务：switch 到 repo-2
@@ -222,7 +227,7 @@ describe('capacity986 download-worker 切仓决策消费点（合成端口）', 
   // 发布必须回旧仓落位（reserveArtifactPath 的 ON CONFLICT 四字段同值幂等更新），
   // 否则 identity_key 冲突把成功下载烧成终态 failed。
   it('e. 既有 artifact 绑定：旧仓 eligible ⇒ reserve 落旧仓 + 闭包重建到旧仓；装配仓闭包零调用', async () => {
-    const full = candidate({ id: 1, registered: TARGET_BYTES }); // 装配仓已满
+    const full = candidate({ id: 1, registered: TARGET_BYTES, githubSize: COMPRESSED_TARGET }); // 装配仓已满
     const old = candidate({ id: 3, registered: BigInt(10) });    // 旧 artifact 所在仓
     const { seam: rolloverSeam, rebuilt, rebuildTargets } = makeSeam([[full, old]]);
     const { storage, assembly, run } = fixture(rolloverSeam);

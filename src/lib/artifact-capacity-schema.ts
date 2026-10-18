@@ -9,6 +9,15 @@
 // 383d980b1215f58c357b243b7a130c6ed38b639c7824df4daddc3dd4f3ac4b54），942/943 已收口。
 //
 // 迁移编号：本片不定，未来迁移任务分配；不得假定 0006 可用。此处不加 artifact_schema_migrations 行。
+//
+// 容量口径（repothresh44，2026-10-19 用户裁定「仓少一点、平衡一点」）：切仓判定用**压缩**口径
+//   github_size_bytes（GitHub `GET /repos/{owner}/{repo}` 的 size×1024，由 sync-ledger-capacity
+//   每小时回写）对 target_compressed_bytes（默认 1GiB=1073741824，贴合 GitHub 官方「仓 <1GB」
+//   建议线，对 5GB 硬限留约 5 倍余量）。
+//   target_bytes / registered_bytes / reserved_bytes 是旧**逻辑**字节口径，保留作观测与预留记账，
+//   不再参与切仓判定（TXT 压缩≈逻辑 40%，按逻辑字节切仓比真实限制早约 2.6 倍触发）。
+//   已建表的库靠 migrations/0008_capacity_compressed_threshold.sql 补这两列（CREATE TABLE
+//   IF NOT EXISTS 不给既有表加列）；两处列定义必须同构。
 
 import type { neon } from '@neondatabase/serverless';
 
@@ -26,6 +35,9 @@ export const ARTIFACT_CAPACITY_SCHEMA_STATEMENTS: readonly string[] = [
      target_bytes          bigint NOT NULL CHECK (target_bytes > 0),
      registered_bytes      bigint NOT NULL DEFAULT 0 CHECK (registered_bytes >= 0),
      reserved_bytes        bigint NOT NULL DEFAULT 0 CHECK (reserved_bytes >= 0),
+     github_size_bytes     bigint NOT NULL DEFAULT 0 CHECK (github_size_bytes >= 0),
+     target_compressed_bytes bigint NOT NULL DEFAULT 1073741824
+                             CHECK (target_compressed_bytes > 0),
      baseline_epoch        text NOT NULL CHECK (length(baseline_epoch) > 0),
      admission_status      text NOT NULL DEFAULT 'unknown'
                              CHECK (admission_status IN ('granted','denied','unknown')),

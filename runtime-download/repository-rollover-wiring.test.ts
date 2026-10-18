@@ -17,7 +17,8 @@ import {
 
 const NOW = new Date('2026-10-08T04:00:00.000Z');
 const FUTURE = '2026-12-31T00:00:00.000Z';
-const TARGET = BigInt(1_000_000_000); // 十进制 1GB
+const TARGET = BigInt(1_000_000_000); // 旧逻辑口径（十进制 1GB），repothresh44 起只作观测
+const COMPRESSED_TARGET = BigInt(1_073_741_824); // 新容量门槛：GitHub 压缩 1GiB
 const SHA = 'a'.repeat(40);
 const CURRENT: RepositoryTuple = { id: 1, owner: 'citizen', repo: 'repo-1', branch: 'main' };
 const NEXT: RepositoryTuple = { id: 2, owner: 'citizen', repo: 'repo-2', branch: 'main' };
@@ -26,6 +27,7 @@ function candidate(over: {
   id: number; owner?: string; repo?: string; branch?: string;
   enabled?: boolean; readOnly?: boolean; sealed?: boolean;
   registered?: bigint; reserved?: bigint; targetBytes?: bigint;
+  githubSize?: bigint; targetCompressedBytes?: bigint;
   admissionStatus?: 'granted' | 'denied' | 'unknown';
 }): RepositoryCandidate {
   const self: RepositoryTuple = {
@@ -38,6 +40,8 @@ function candidate(over: {
     readOnly: over.readOnly ?? false,
     sealed: over.sealed ?? false,
     targetBytes: over.targetBytes ?? TARGET,
+    targetCompressedBytes: over.targetCompressedBytes ?? COMPRESSED_TARGET,
+    githubSizeBytes: over.githubSize ?? BigInt(0),
     accounting: {
       registeredLogicalBytes: over.registered ?? BigInt(0), reservedLogicalBytes: over.reserved ?? BigInt(0),
       version: 'v1', validUntil: FUTURE, target: self,
@@ -93,8 +97,8 @@ describe('capacity985 rollover wiring（合成端口）', () => {
     expect(after.repositoryId).toBe(1);
   });
 
-  it('rollover 路径：旧仓投影超限 ⇒ switch，新仓元组生效且闭包与 repositoryId 均属新仓', async () => {
-    const full = candidate({ id: 1, registered: TARGET }); // 投影 TARGET+1 > TARGET
+  it('rollover 路径：旧仓压缩 size 已满 ⇒ switch，新仓元组生效且闭包与 repositoryId 均属新仓', async () => {
+    const full = candidate({ id: 1, registered: TARGET, githubSize: COMPRESSED_TARGET }); // size+1 > 1GiB
     const fresh = candidate({ id: 2 });
     const outcome = await decideRepositoryForPublication(
       port([full, fresh]), wiringInput({ logicalBytes: BigInt(1) }),
@@ -117,7 +121,7 @@ describe('capacity985 rollover wiring（合成端口）', () => {
   });
 
   it('无可用新仓（唯一候选满）⇒ blocked(NO_ELIGIBLE_REPOSITORY) 上抛，不静默降级回旧仓', async () => {
-    const full = candidate({ id: 1, registered: TARGET });
+    const full = candidate({ id: 1, registered: TARGET, githubSize: COMPRESSED_TARGET });
     await expect(
       decideRepositoryForPublication(port([full]), wiringInput({ logicalBytes: BigInt(1) })),
     ).rejects.toMatchObject({
@@ -126,7 +130,7 @@ describe('capacity985 rollover wiring（合成端口）', () => {
   });
 
   it('下一仓准入拒绝/未知 ⇒ blocked(CAPACITY_UNKNOWN)，满仓不获豁免', async () => {
-    const full = candidate({ id: 1, registered: TARGET });
+    const full = candidate({ id: 1, registered: TARGET, githubSize: COMPRESSED_TARGET });
     const deniedNext = candidate({ id: 2, admissionStatus: 'denied' });
     await expect(
       decideRepositoryForPublication(port([full, deniedNext]), wiringInput({ logicalBytes: BigInt(1) })),
@@ -146,7 +150,7 @@ describe('capacity985 rollover wiring（合成端口）', () => {
   });
 
   it('既有绑定不一致 ⇒ blocked(EXISTING_BINDING_REQUIRES_RECONCILIATION)，不改绑他仓', async () => {
-    const full = candidate({ id: 1, registered: TARGET });
+    const full = candidate({ id: 1, registered: TARGET, githubSize: COMPRESSED_TARGET });
     const fresh = candidate({ id: 2 });
     await expect(
       decideRepositoryForPublication(port([full, fresh]), {
@@ -179,7 +183,7 @@ describe('capacity985 rollover wiring（合成端口）', () => {
   });
 
   it('switch 后仍需预留：logicalBytesToReserve 与 snapshotVersion 原样透传给预留层', async () => {
-    const full = candidate({ id: 1, registered: BigInt(900_000_000), reserved: BigInt(100_000_000) });
+    const full = candidate({ id: 1, registered: BigInt(900_000_000), reserved: BigInt(100_000_000), githubSize: COMPRESSED_TARGET });
     const next = candidate({ id: 2, registered: BigInt(5), reserved: BigInt(7) });
     const outcome = await decideRepositoryForPublication(
       port([full, next]), wiringInput({ logicalBytes: BigInt(12345) }),
@@ -195,7 +199,7 @@ describe('capacity985 rollover wiring（合成端口）', () => {
   // 钉在旧行的仓；切仓后的装配期 current 不再撞墙，而是被既有落位重定向回旧仓。
   it('既有 artifact 落位命中 ⇒ 决策 current 重定向到旧行的仓（stay + needsClosureRebuild）', async () => {
     const old = candidate({ id: 3, repo: 'repo-3', registered: BigInt(100) });
-    const currentFull = candidate({ id: 1, registered: BigInt(900_000_000), reserved: BigInt(100_000_000) });
+    const currentFull = candidate({ id: 1, registered: BigInt(900_000_000), reserved: BigInt(100_000_000), githubSize: COMPRESSED_TARGET });
     const outcome = await decideRepositoryForPublication(port([currentFull, old]), {
       ...wiringInput({ logicalBytes: BigInt(1) }),
       existingArtifactBinding: {

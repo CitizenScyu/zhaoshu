@@ -50,7 +50,7 @@ const migrationsDir = resolve(here, '..', 'migrations');
 
 // 迁移文件是显式有序列表，不扫目录：目录里多一个 .sql 不该在无人察觉时被执行。
 // version 由文件名前缀解析，SCHEMA_VERSION 必须等于列表里的最大版本（见 loadMigrations）。
-export const MIGRATION_FILES = ['0001_baseline.sql', '0002_identity_key.sql', '0003_runtime_tables.sql', '0004_admission_lease_generation.sql', '0005_prefetch_tables.sql', '0006_reader_sync_state.sql', '0007_followup_probe_state.sql'];
+export const MIGRATION_FILES = ['0001_baseline.sql', '0002_identity_key.sql', '0003_runtime_tables.sql', '0004_admission_lease_generation.sql', '0005_prefetch_tables.sql', '0006_reader_sync_state.sql', '0007_followup_probe_state.sql', '0008_capacity_compressed_threshold.sql'];
 
 // 已发布（已登记进某个库的 schema_migrations）的迁移摘要，冻结在这里由测试钉住。
 // v1 = 隔离库首次 db:migrate 登记的值（见下方 normalizeSqlText 注释）；生产从未跑过 runner、没有

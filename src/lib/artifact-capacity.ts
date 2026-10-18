@@ -369,12 +369,16 @@ export async function reserveCapacityAndPath(
         FROM artifact_capacity_reservations r, lease_guard g
         WHERE r.request_key = ${requestKey}
       ), capacity_gate AS (
+        -- 容量门槛（repothresh44）：GitHub 压缩 pack 字节，与 runtime-download/repository-rollover.ts
+        -- 的 evaluateCandidate 逐字同判据（githubSize + 1 <= targetCompressed）。两层必须同口径，
+        -- 否则 decide 判 stay 而本门判 insufficient_capacity，发布被直接阻断。逻辑字节
+        -- registered/reserved 与压缩 size 量纲不同，只作观测与记账，不再参与判定。
         UPDATE repository_capacity_ledger l
            SET reserved_bytes = l.reserved_bytes + ${logicalBytes}::bigint, updated_at = now()
          FROM ledger_guard g, repo_guard p
         WHERE l.repository_id = g.repository_id
           AND g.epoch_match AND g.admission_ok AND g.state = 'ready'
-          AND l.registered_bytes + l.reserved_bytes + ${logicalBytes}::bigint <= l.target_bytes
+          AND l.github_size_bytes + 1 <= l.target_compressed_bytes
           AND NOT EXISTS (SELECT 1 FROM existing)
         RETURNING l.repository_id
       ), reservation_ins AS (

@@ -8,6 +8,9 @@
 | `0002_identity_key.sql` | 2 | 身份键从表达式索引升级为「生成列 + 唯一索引」（task-53 Phase 2） |
 | `0003_runtime_tables.sql` | 3 | 把此前只有运行时 DDL 的 `app_settings` / `source_admission` / `profile_feedback_queue` / `cron_health` 纳入契约（MS-25）；语句逐字取自 `business-schema.ts`，`runtime-tables-migration.pglite.test.ts` 逐列比对两条路径 |
 | `0004_admission_lease_generation.sql` | 4 | `cron_health` 加 `lease_generation bigint NOT NULL DEFAULT 0`（fencefix42 fencing token）：准入租约显式代次列，幂等 `ADD COLUMN IF NOT EXISTS`，老库既有行默认 0；运行期 `initializeBusinessSchema` 有同款 DDL（属惰性 schema 初始化：应用走到该初始化时即补列、不依赖迁移先行，但不保证每次启动都执行）；代次生命周期前提见「回滚」一节 |
+| `0008_capacity_compressed_threshold.sql` | 8 | `repository_capacity_ledger` 加两列（repothresh44）：`github_size_bytes bigint NOT NULL DEFAULT 0`（GitHub 压缩 pack 字节，由 `sync-ledger-capacity.mjs` 每小时回写）与 `target_compressed_bytes bigint NOT NULL DEFAULT 1073741824`（切仓门槛目标 = 1GiB）。**这张表不由 0001–0007 建**，而由运行期 `initializeArtifactCapacitySchema`（`src/lib/artifact-capacity-schema.ts`）建，且外键指向 `storage_repositories`（由 `migrate:artifacts:prod` 建）；故本文件只 `ALTER TABLE IF EXISTS`，回填段用 `to_regclass` 判存在后跳过，绝不 `CREATE TABLE`。回填三行的压缩值取自 phoenix 只读 `GET /repos/CitizenScyu/<repo>` 实测（非估算），按 `(owner, repo)` 匹配、只填仍为 0 的行。**部署顺序硬约束**：预留门 `capacity_gate`（`src/lib/artifact-capacity.ts`）、运行期 decide、探针、台账同步四处都读这两列，必须先跑本迁移再上对应代码；否则四处分别以预留事务报错回滚（**发布全断**，不是降级）/ `RolloverWiringEvidenceError` / exit 1 / 抛错失败关闭（都不按 0 猜）。`admission_*` 各列与 repofix43 的续期逻辑一字未动 |
+
+> **表格有缺行（既有文档债，repothresh44 记录）**：上表只列到 `0004`，`0005_prefetch_tables.sql` / `0006_reader_sync_state.sql` / `0007_followup_probe_state.sql` 三行从未补写（本任务只在 `MIGRATION_FILES` 追加 `0008` 时顺带补了 `0008` 行）。权威列表始终是 `scripts/db-migration-lib.mjs` 的 `MIGRATION_FILES`，不是本表。
 
 版本号取自文件名数字前缀，`SCHEMA_VERSION` 必须等于列表里的最大版本，否则 `loadMigrations()` 直接报错——常量与文件脱节不会被静默放过。**已发布的文件内容即其摘要**：`0001` 的 sha256（`1b47f1ca…`）已记入隔离库 / 灾备演练库的 `schema_migrations`，`db:baseline:prod` 也按这三份字节登记生产；改一个字节会让 `db:check` / `db:migrate` 在已登记的库上拒绝继续。`0002` 已由生产按同一文件手工执行过 DDL，同样不得再改。
 
