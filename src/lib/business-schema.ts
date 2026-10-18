@@ -26,7 +26,7 @@ export const BUSINESS_SCHEMA_RELATIONS = [
   'profile_feedback_queue', 'cron_health',
   'download_source_candidates', 'download_source_candidates_book_pos_idx',
   'download_source_candidates_host_idx', 'download_host_occupancy', 'download_source_prefetch',
-  'reader_sync_state',
+  'reader_sync_state', 'followup_probe_state', 'followup_probe_state_due_idx',
 ] as const;
 
 /** ALTER TABLE ... ADD COLUMN IF NOT EXISTS 给既有表补的全部列（[表, 列]）。 */
@@ -436,5 +436,22 @@ export async function initializeBusinessSchema(s: Sql) {
       claimed_at timestamptz NOT NULL DEFAULT now(),
       expires_at timestamptz NOT NULL DEFAULT now()
     )`,
+    // zhuigeng42：追更/增量更新的探测状态，每本书一行（判据与字段含义见 migrations/0007 头注）。
+    // 老库靠本幂等 DDL 补建，冷建库由 migrations/0007 逐字复刻（MS-25 同款同构约束）。
+    tx`
+    CREATE TABLE IF NOT EXISTS followup_probe_state (
+      book_id int NOT NULL PRIMARY KEY
+        CONSTRAINT followup_probe_state_book_fk REFERENCES labeled_books(id),
+      last_probe_at timestamptz,
+      last_chapter_count int,
+      last_toc_prefix_hash text NOT NULL DEFAULT '',
+      consecutive_no_new int NOT NULL DEFAULT 0,
+      next_probe_at timestamptz,
+      last_enqueued_task_id int
+        CONSTRAINT followup_probe_state_task_fk REFERENCES download_tasks(id) ON DELETE SET NULL,
+      created_at timestamptz NOT NULL DEFAULT now(),
+      updated_at timestamptz NOT NULL DEFAULT now()
+    )`,
+    tx`CREATE INDEX IF NOT EXISTS followup_probe_state_due_idx ON followup_probe_state (next_probe_at)`,
   ]);
 }

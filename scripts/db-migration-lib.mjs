@@ -28,7 +28,7 @@ export const TARGET_SCHEMA = 'public';
 export const EXPECTED_TABLES = [
   'app_settings', 'artifact_schema_migrations', 'auth_rate_limits', 'auth_schema_migrations', 'auth_settings',
   'book_artifacts', 'books', 'cron_health', 'download_host_occupancy', 'download_source_candidates',
-  'download_source_prefetch', 'download_tasks', 'feedback', 'labeled_books', 'llm_usage', 'profile',
+  'download_source_prefetch', 'download_tasks', 'feedback', 'followup_probe_state', 'labeled_books', 'llm_usage', 'profile',
   'profile_feedback_queue', 'profile_seed_audit', 'reader_sync_state', 'recommendations', 'schema_migrations', 'sessions',
   'shuyuan_meta', 'shuyuan_sources', 'source_admission', 'source_read_catalogs', 'storage_repositories', 'users',
 ];
@@ -42,7 +42,7 @@ export const EXPECTED_TABLES = [
 // 它们同属「冷建库必须补齐、缺了 db:check:prod 就该非 0」，但同样不属于 0001–0003 契约，故一并列入
 // 本清单（与 artifact 三表同理，从 BASELINE_SHAPE 比对里减掉）。
 export const ARTIFACT_TABLES = ['artifact_schema_migrations', 'book_artifacts', 'storage_repositories'];
-export const NON_BASELINE_TABLES = ['download_source_candidates', 'download_host_occupancy', 'download_source_prefetch', 'reader_sync_state'];
+export const NON_BASELINE_TABLES = ['download_source_candidates', 'download_host_occupancy', 'download_source_prefetch', 'followup_probe_state', 'reader_sync_state'];
 
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -50,7 +50,7 @@ const migrationsDir = resolve(here, '..', 'migrations');
 
 // 迁移文件是显式有序列表，不扫目录：目录里多一个 .sql 不该在无人察觉时被执行。
 // version 由文件名前缀解析，SCHEMA_VERSION 必须等于列表里的最大版本（见 loadMigrations）。
-export const MIGRATION_FILES = ['0001_baseline.sql', '0002_identity_key.sql', '0003_runtime_tables.sql', '0004_admission_lease_generation.sql', '0005_prefetch_tables.sql', '0006_reader_sync_state.sql'];
+export const MIGRATION_FILES = ['0001_baseline.sql', '0002_identity_key.sql', '0003_runtime_tables.sql', '0004_admission_lease_generation.sql', '0005_prefetch_tables.sql', '0006_reader_sync_state.sql', '0007_followup_probe_state.sql'];
 
 // 已发布（已登记进某个库的 schema_migrations）的迁移摘要，冻结在这里由测试钉住。
 // v1 = 隔离库首次 db:migrate 登记的值（见下方 normalizeSqlText 注释）；生产从未跑过 runner、没有
