@@ -1,0 +1,32 @@
+[Unit]
+Description=zhaoshu web (Next standalone server.js)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=zsweb
+Group=zsweb
+SupplementaryGroups=zspool
+WorkingDirectory=/opt/zhaoshu-web/current
+EnvironmentFile=/etc/zhaoshu-web/env
+Environment=NODE_ENV=production
+Environment=HOSTNAME=127.0.0.1
+Environment=PORT=3000
+Environment=TZ=UTC
+Environment=PATH=/opt/node22/bin:/usr/bin:/bin
+Environment=NODE_OPTIONS=--max-old-space-size=1024
+ExecStart=/opt/node22/bin/node /opt/zhaoshu-web/current/server.js
+Restart=always
+RestartSec=2
+TimeoutStopSec=30s
+KillMode=mixed
+MemoryMax=1.5G
+CPUWeight=100
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target
