@@ -1,10 +1,11 @@
 // capacity991：entry 生产端口装配（rollover seam）合成测试（全 mock：零网络、零真库、零凭据）。
 //
-// 断言任务书冻结的四件：
+// 断言任务书冻结的四件 + repothresh44 的部署顺序护栏：
 //   ① 开关关（未设 ZHAOSHU_ROLLOVER_ENABLED）⇒ WorkerOptions 不含 rollover（undefined），零行为变化；
 //   ② 开 ⇒ seam 三件齐（port/current/rebuildGitHubContents），current 元组与装配期一致；
 //   ③ 开但 listCandidates 拿不到对账证据（ledger 非 ready）⇒ 抛（不降级）；
-//   ④ rebuildGitHubContents 用与装配期相同的配置（同 token + target 的 owner/repo/branch）重建闭包。
+//   ④ rebuildGitHubContents 用与装配期相同的配置（同 token + target 的 owner/repo/branch）重建闭包；
+//   ⑤ 容量门槛两列（github_size_bytes / target_compressed_bytes）缺失或非法 ⇒ 抛，不按 0 猜。
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ProductionExecutorOptions, RuntimeStorage } from './entry';
 import type { GitHubContents } from '../src/lib/download-publisher';
@@ -53,6 +54,7 @@ function candidateRow(over: Record<string, unknown> = {}): Record<string, unknow
     enabled: true, is_private: true, read_only: false, sealed_at: null,
     ledger_state: 'ready', baseline_epoch: 'epoch-v1', target_bytes: '1000000000',
     registered_bytes: '0', reserved_bytes: '0',
+    github_size_bytes: '0', target_compressed_bytes: '2147483648',
     admission_status: 'granted', admission_version: 'adm-1',
     admission_valid_until: '2099-12-31T00:00:00.000Z',
     admission_target: { repositoryId: 17, branch: 'main' },
@@ -132,6 +134,28 @@ describe('capacity991 entry rollover seam 装配（合成）', () => {
     await createDownloadExecutor(options({ env: { ...env, ZHAOSHU_ROLLOVER_ENABLED: '1' } }));
     const deps = mocks.executor.mock.calls[0][0] as { rollover?: { port: { listCandidates(): Promise<unknown> } } };
     await expect(deps.rollover!.port.listCandidates()).rejects.toThrow(/no ready capacity ledger/);
+  });
+
+  // repothresh44 部署顺序护栏：容量门槛改用台账压缩两列后，未跑 migrations/0008 的库上
+  // 这两列不存在（驱动返回 undefined）。按 0 猜会让已满的仓看起来「无限空」⇒ 必须抛。
+  it('⑤ 压缩口径两列缺失/非法（未跑 0008 就上代码）⇒ 抛，不按 0 猜', async () => {
+    for (const bad of [
+      { github_size_bytes: undefined },
+      { target_compressed_bytes: undefined },
+      { github_size_bytes: null },
+      { target_compressed_bytes: '-1' },
+      { github_size_bytes: 'not-a-number' },
+    ]) {
+      mocks.sql.mockImplementation(async (strings: TemplateStringsArray) => {
+        const text = strings.join("");
+        return text.includes('repository_capacity_ledger') ? [candidateRow(bad)] : [{ id: 17 }];
+      });
+      await createDownloadExecutor(options({ env: { ...env, ZHAOSHU_ROLLOVER_ENABLED: '1' } }));
+      const calls = mocks.executor.mock.calls;
+      const deps = calls[calls.length - 1][0] as { rollover?: { port: { listCandidates(): Promise<unknown> } } };
+      await expect(deps.rollover!.port.listCandidates())
+        .rejects.toThrow(/github_size_bytes|target_compressed_bytes/);
+    }
   });
 
   it('④ rebuildGitHubContents 用与装配期相同配置（同 token + target owner/repo/branch）重建闭包', async () => {
