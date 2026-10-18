@@ -11,6 +11,7 @@ import { loadPGlite, type PGliteLike } from '@/lib/fixtures/pglite';
 import { createPGliteClient, createPGliteSql } from '@/lib/fixtures/pglite-sql';
 import { createProductionSchema, seedProductionMembers } from '@/lib/fixtures/production-schema';
 import { applyMigration, loadMigrations } from '../../scripts/db-migration-lib.mjs';
+import { SCHEMA_VERSION } from '@/lib/schema-version';
 import {
   claimFollowupLease, followupCandidatesQuery, followupPrefixKey, processFollowupCandidate,
   type FollowupCandidate, type FollowupProbeOutcome,
@@ -125,7 +126,11 @@ maybe('0007 本地干跑：迁移链跑到 0007，重跑是空转', () => {
     const migrations = await loadMigrations();
     const first = await applyMigration(client, migrations);
     expect(first.status).toBe('applied');
-    expect(first.versions.at(-1)).toMatchObject({ version: 7, name: '0007_followup_probe_state.sql', status: 'applied' });
+    // 本用例的主题是 0007 被应用；链尾只钉「等于 SCHEMA_VERSION」，不写死 7——
+    // 写死的话每加一个迁移都得改这行（repothresh44 加 0008 时就撞上了）。
+    expect(first.versions.find((item) => item.version === 7))
+      .toMatchObject({ name: '0007_followup_probe_state.sql', status: 'applied' });
+    expect(first.versions.at(-1)).toMatchObject({ version: SCHEMA_VERSION, status: 'applied' });
     const columns = (await pg.query(
       `SELECT column_name FROM information_schema.columns WHERE table_name = 'followup_probe_state' ORDER BY column_name`))
       .rows.map((row) => row.column_name);
