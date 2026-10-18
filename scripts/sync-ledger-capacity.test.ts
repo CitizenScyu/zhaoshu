@@ -1,5 +1,7 @@
 // ledgersync41：sync-ledger-capacity 的参数闸门、字节口径（排除 .snapshots/符号链接）、
 // 树截断下钻补齐、幂等与「凭据不进输出」。
+// repothresh44：新增压缩口径（GitHub `size` 字段 = pack 的 KiB）同步用例——
+// 它是切仓门槛的判定量，逻辑字节降级为观测；取不到 size 一律失败关闭（不按 0 猜）。
 //
 // 夹具与既有容量用例同款：createProductionSchema + initializeArtifactSchema +
 // initializeArtifactCapacitySchema 在隔离 PGlite 上建真实表；GitHub 侧是合成受控桩
@@ -11,8 +13,8 @@ import { loadPGlite, type PGliteLike } from '../src/lib/fixtures/pglite';
 import { createPGliteSql } from '../src/lib/fixtures/pglite-sql';
 import { createProductionSchema, seedV6MemberUser } from '../src/lib/fixtures/production-schema';
 import {
-  DEFAULT_TREE_ROOT, IncompleteTreeError, createGitHubTreeRequest, isCountedPath, parseSyncArgs,
-  runSync, sumRegisteredLogicalBytes,
+  DEFAULT_TREE_ROOT, IncompleteTreeError, createGitHubTreeRequest, isCountedPath,
+  measureRepositoryCompressedBytes, parseSyncArgs, runSync, sumRegisteredLogicalBytes,
 } from './sync-ledger-capacity.mjs';
 
 describe('参数解析：目标与 token 来源都必须显式，缺省 dry-run', () => {
@@ -93,6 +95,53 @@ describe('认证请求：token 只进请求头', () => {
   });
 });
 
+// repothresh44：压缩口径读取。GitHub `GET /repos/{owner}/{repo}` 的 `size` 单位是 **KiB**
+// （仓库 pack 的压缩体积），不是字节——单位搞错会让门槛相差 1024 倍，故单列一组边界。
+describe('measureRepositoryCompressedBytes：size 是 KiB，取不到就抛（不按 0 猜）', () => {
+  /** 造一个固定响应的 request 端口（与 createGitHubTreeRequest 同形状）；`as never` 沿用本文件既有桩写法。 */
+  const requestReturning = (res: unknown) => (async (_route: string) => res) as never;
+  const repo = { owner: 'fixture', repo: 'repo-a', branch: 'main' };
+
+  it('size 为 KiB ⇒ 返回字节（×1024）；大值仍精确', async () => {
+    expect(await measureRepositoryCompressedBytes(requestReturning(
+      { status: 200, json: async () => ({ size: 100 }) },
+    ), repo)).toBe(BigInt(102_400));
+    expect(await measureRepositoryCompressedBytes(requestReturning(
+      { status: 200, json: async () => ({ size: 0 }) },
+    ), repo)).toBe(BigInt(0));
+    // 1 GiB 量级（sizeKib ≈ 1048576）仍在安全整数内，BigInt 转换不丢精度。
+    expect(await measureRepositoryCompressedBytes(requestReturning(
+      { status: 200, json: async () => ({ size: 1_048_576 }) },
+    ), repo)).toBe(BigInt(1_073_741_824));
+  });
+
+  it.each([
+    [{ status: 200, json: async () => ({}) }, /size missing or invalid/],
+    [{ status: 200, json: async () => ({ size: null }) }, /size missing or invalid/],
+    [{ status: 200, json: async () => ({ size: '1024' }) }, /size missing or invalid/],
+    [{ status: 200, json: async () => ({ size: -1 }) }, /size missing or invalid/],
+    [{ status: 200, json: async () => ({ size: 1.5 }) }, /size missing or invalid/],
+    [{ status: 200, json: async () => ({ size: Number.NaN }) }, /size missing or invalid/],
+    [{ status: 200, json: async () => ({ size: Number.POSITIVE_INFINITY }) }, /size missing or invalid/],
+    [{ status: 200, json: async () => null }, /malformed repo body/],
+    [{ status: 200, json: async () => 'nope' }, /malformed repo body/],
+    [{ status: 404, json: async () => ({ message: 'Not Found' }) }, /GITHUB_REPO_HTTP_404/],
+    [{ status: 403, json: async () => ({ message: 'rate limited' }) }, /GITHUB_REPO_HTTP_403/],
+    [{ status: 500, json: async () => ({}) }, /GITHUB_REPO_HTTP_500/],
+    [{ json: async () => ({ size: 1 }) }, /malformed response envelope/],
+    [{ status: '200', json: async () => ({ size: 1 }) }, /malformed response envelope/],
+    [{ status: 99, json: async () => ({ size: 1 }) }, /malformed response envelope/],
+  ])('坏响应 %j ⇒ 抛', async (res, message) => {
+    await expect(measureRepositoryCompressedBytes(requestReturning(res), repo)).rejects.toThrow(message);
+  });
+
+  it('HTTP 错误信息里不带响应体（token/正文都不进日志与报告）', async () => {
+    const res = { status: 403, json: async () => ({ message: 'ghp_supersecret leaked' }) };
+    await expect(measureRepositoryCompressedBytes(requestReturning(res), repo))
+      .rejects.toThrow(/^GITHUB_REPO_HTTP_403$/);
+  });
+});
+
 const PGliteCtor = await loadPGlite();
 const maybe = PGliteCtor ? describe : describe.skip;
 
@@ -100,10 +149,19 @@ maybe('runSync（PGlite 真表 + 合成 GitHub 桩）', () => {
   let pg: PGliteLike;
   let sql: ReturnType<typeof createPGliteSql>;
 
-  type TreeBody = { truncated?: boolean, tree: unknown[] } | Error;
-  /** 合成 GitHub 桩：按路由返回受控树；不触网、不证明真实 GitHub 可达。 */
-  const stubRequest = (trees: Record<string, TreeBody>) => async (route: string) => {
-    const body = trees[route];
+  type StubBody = { truncated?: boolean, tree?: unknown[], size?: number } | Error;
+  /**
+   * 压缩口径桩（repothresh44）：`GET /repos/{owner}/{repo}` 的 size 单位是 **KiB**。
+   * 单列一张表并由 stubRequest 兜底，好让既有树用例不必逐条重复声明 size 路由；
+   * 用例内显式给出同一路由即覆盖（用于造「size 缺失/非法」）。
+   */
+  const sizes: Record<string, StubBody> = {
+    '/repos/fixture/repo-a': { size: 100 }, // 100 KiB → 102400 B
+    '/repos/fixture/repo-b': { size: 50 },  // 50 KiB → 51200 B
+  };
+  /** 合成 GitHub 桩：按路由返回受控响应；不触网、不证明真实 GitHub 可达。 */
+  const stubRequest = (routes: Record<string, StubBody>) => async (route: string) => {
+    const body = routes[route] ?? sizes[route];
     if (!body) return { status: 404, json: async () => ({ message: 'not found' }) };
     if (body instanceof Error) throw body;
     return { status: 200, json: async () => body };
@@ -133,9 +191,9 @@ maybe('runSync（PGlite 真表 + 合成 GitHub 桩）', () => {
         VALUES(1,'fixture','repo-a','main',true,true,false,1000000000),
               (2,'fixture','repo-b','main',true,true,false,1000000000),
               (3,'fixture','repo-off','main',false,true,false,1000000000);
-      INSERT INTO repository_capacity_ledger(repository_id,state,target_bytes,registered_bytes,reserved_bytes,baseline_epoch)
-        VALUES(1,'ready',1000000000,0,0,'epoch-1'),
-              (2,'ready',1000000000,1850000000,0,'epoch-1');
+      INSERT INTO repository_capacity_ledger(repository_id,state,target_bytes,registered_bytes,reserved_bytes,github_size_bytes,baseline_epoch)
+        VALUES(1,'ready',1000000000,0,0,0,'epoch-1'),
+              (2,'ready',1000000000,1850000000,0,51200,'epoch-1');
     `);
   });
 
@@ -152,33 +210,73 @@ maybe('runSync（PGlite 真表 + 合成 GitHub 桩）', () => {
   };
 
   // PGlite 对 bigint 列的返回类型随值而异（小值走 number），断言一律按字符串比较。
-  const registered = async () => (await pg.query('SELECT repository_id, registered_bytes FROM repository_capacity_ledger ORDER BY repository_id')).rows
-    .map(row => ({ repository_id: row.repository_id, registered_bytes: String(row.registered_bytes) }));
+  const capacity = async () => (await pg.query('SELECT repository_id, registered_bytes, github_size_bytes FROM repository_capacity_ledger ORDER BY repository_id')).rows
+    .map(row => ({ repository_id: row.repository_id, registered_bytes: String(row.registered_bytes), github_size_bytes: String(row.github_size_bytes) }));
 
-  it('dry-run 零写：报告每仓新旧值，库中 registered_bytes 原样不动', async () => {
+  // 冷建库路径（initializeArtifactCapacitySchema）与 migrations/0008 必须同构：
+  // 两处缺省值不一致的话，新建台账行会拿到错门槛（0 会被运行期 requirePositiveBigint 判失败）。
+  it('台账 DDL 缺省：github_size_bytes=0、target_compressed_bytes=1GiB，均 NOT NULL', async () => {
+    expect((await pg.query(`
+      SELECT column_name, column_default, is_nullable
+      FROM information_schema.columns
+      WHERE table_name = 'repository_capacity_ledger'
+        AND column_name IN ('github_size_bytes', 'target_compressed_bytes')
+      ORDER BY column_name`)).rows).toEqual([
+      { column_name: 'github_size_bytes', column_default: '0', is_nullable: 'NO' },
+      { column_name: 'target_compressed_bytes', column_default: '1073741824', is_nullable: 'NO' },
+    ]);
+  });
+
+  it('dry-run 零写：报告每仓两个口径的新旧值，库中原样不动', async () => {
     const report = await runSync({ sql, request: stubRequest(trees), mode: 'dry-run' });
     expect(report.mode).toBe('dry-run');
     expect(report.failedCount).toBe(0);
+    // repo-b 的压缩值与库中同值（51200）而逻辑值不同 ⇒ 仍须报 dry-run：
+    // 「两值全等」才算 unchanged，任一变动都要写回，否则压缩门槛会长期停在陈旧值。
     expect(report.repositories).toEqual([
-      { repositoryId: 1, repo: 'fixture/repo-a', branch: 'main', status: 'dry-run', fileCount: 2, previousBytes: '0', bytes: '500', admissionRenewal: 'skipped-not-eligible' },
-      { repositoryId: 2, repo: 'fixture/repo-b', branch: 'main', status: 'dry-run', fileCount: 1, previousBytes: '1850000000', bytes: '400', admissionRenewal: 'skipped-not-eligible' },
+      { repositoryId: 1, repo: 'fixture/repo-a', branch: 'main', status: 'dry-run', fileCount: 2,
+        previousBytes: '0', bytes: '500',
+        previousGithubSizeBytes: '0', githubSizeBytes: '102400',
+        admissionRenewal: 'skipped-not-eligible' },
+      { repositoryId: 2, repo: 'fixture/repo-b', branch: 'main', status: 'dry-run', fileCount: 1,
+        previousBytes: '1850000000', bytes: '400',
+        previousGithubSizeBytes: '51200', githubSizeBytes: '51200',
+        admissionRenewal: 'skipped-not-eligible' },
     ]);
-    expect(await registered()).toEqual([
-      { repository_id: 1, registered_bytes: '0' },
-      { repository_id: 2, registered_bytes: '1850000000' },
+    expect(await capacity()).toEqual([
+      { repository_id: 1, registered_bytes: '0', github_size_bytes: '0' },
+      { repository_id: 2, registered_bytes: '1850000000', github_size_bytes: '51200' },
     ]);
   });
 
-  it('apply 写对的行：只动 enabled 仓的 registered_bytes（禁用仓不进列表）', async () => {
+  it('apply 写对的行：两个口径同时回写，且只动 enabled 仓（禁用仓不进列表）', async () => {
     const report = await runSync({ sql, request: stubRequest(trees), mode: 'apply' });
     expect(report.repositories.map(r => r.status)).toEqual(['applied', 'applied']);
-    expect(await registered()).toEqual([
-      { repository_id: 1, registered_bytes: '500' },
-      { repository_id: 2, registered_bytes: '400' },
+    expect(await capacity()).toEqual([
+      { repository_id: 1, registered_bytes: '500', github_size_bytes: '102400' },
+      { repository_id: 2, registered_bytes: '400', github_size_bytes: '51200' },
+    ]);
+    // 门槛列 target_compressed_bytes 不被本脚本改写（它是配置，不是观测量）。
+    expect((await pg.query('SELECT DISTINCT target_compressed_bytes FROM repository_capacity_ledger')).rows
+      .map(r => String(r.target_compressed_bytes))).toEqual(['1073741824']);
+  });
+
+  it('只有压缩值变（逻辑值同值）⇒ 仍 applied，不误判 unchanged', async () => {
+    await runSync({ sql, request: stubRequest(trees), mode: 'apply' });
+    // GitHub pack 重算/仓库 GC 后 size 变了，而 books 下 blob 总字节没变。
+    const grew = { ...trees, '/repos/fixture/repo-a': { size: 101 } };
+    const again = await runSync({ sql, request: stubRequest(grew), mode: 'apply' });
+    expect(again.repositories[0]).toMatchObject({
+      status: 'applied', bytes: '500', previousBytes: '500',
+      githubSizeBytes: '103424', previousGithubSizeBytes: '102400',
+    });
+    expect(await capacity()).toEqual([
+      { repository_id: 1, registered_bytes: '500', github_size_bytes: '103424' },
+      { repository_id: 2, registered_bytes: '400', github_size_bytes: '51200' },
     ]);
   });
 
-  it('幂等：重跑 apply 同值即 unchanged，不再产生写', async () => {
+  it('幂等：重跑 apply 两个口径都同值即 unchanged，不再产生写', async () => {
     await runSync({ sql, request: stubRequest(trees), mode: 'apply' });
     const stamp = (await pg.query('SELECT updated_at FROM repository_capacity_ledger WHERE repository_id = 1')).rows[0].updated_at;
     const again = await runSync({ sql, request: stubRequest(trees), mode: 'apply' });
@@ -213,12 +311,12 @@ maybe('runSync（PGlite 真表 + 合成 GitHub 桩）', () => {
     };
     const report = await runSync({ sql, request: stubRequest(drilled), mode: 'apply' });
     // books/top.txt(7) + books/x/1.txt(300) + books/x/2.txt(200) = 507；books/.snapshots/s.txt(9999) 与
-    // 两次截断响应里的 partial(1) 都不进和。
+    // 两次截断响应里的 partial(1) 都不进和。压缩值走 sizes 兜底路由（100 KiB）。
     expect(report.repositories.find(r => r.repositoryId === 1))
-      .toMatchObject({ status: 'applied', bytes: '507', fileCount: 3 });
+      .toMatchObject({ status: 'applied', bytes: '507', fileCount: 3, githubSizeBytes: '102400' });
   }, 60_000);
 
-  it('补不齐就失败关闭：该仓不写库、如实标 failed 并计数', async () => {
+  it('补不齐就失败关闭：该仓两个口径都不写库、如实标 failed 并计数', async () => {
     const broken = {
       ...trees,
       '/repos/fixture/repo-a/git/trees/main?recursive=1': { truncated: true, tree: [] },
@@ -226,11 +324,45 @@ maybe('runSync（PGlite 真表 + 合成 GitHub 桩）', () => {
     };
     const report = await runSync({ sql, request: stubRequest(broken), mode: 'apply' });
     expect(report.failedCount).toBe(1);
-    expect(report.repositories[0]).toMatchObject({ repositoryId: 1, status: 'failed', error: expect.stringContaining('INCOMPLETE_TREE') });
-    // 失败仓的 registered_bytes 保持原值（没被部分和覆盖）
-    expect(String((await pg.query('SELECT registered_bytes FROM repository_capacity_ledger WHERE repository_id = 1')).rows[0].registered_bytes)).toBe('0');
-    // 另一仓照常推进
-    expect(String((await pg.query('SELECT registered_bytes FROM repository_capacity_ledger WHERE repository_id = 2')).rows[0].registered_bytes)).toBe('400');
+    expect(report.repositories[0]).toMatchObject({ repositoryId: 1, status: 'failed', admissionRenewal: 'not-verified', error: expect.stringContaining('INCOMPLETE_TREE') });
+    // 失败仓的 registered_bytes/github_size_bytes 都保持原值（没被部分和或单侧新值覆盖）
+    expect(await capacity()).toEqual([
+      { repository_id: 1, registered_bytes: '0', github_size_bytes: '0' },
+      { repository_id: 2, registered_bytes: '400', github_size_bytes: '51200' },
+    ]);
+  });
+
+  // repothresh44：压缩值是切仓门槛的**判定量**，取不到就不能写——
+  // 写 0 等于告诉运行期 decide「这仓无限空」，会一路写到撞 GitHub 5GB 硬限。
+  it('GitHub size 缺失/非法 ⇒ 该仓 failed，两列都不写、不续期', async () => {
+    for (const bad of [{}, { size: null }, { size: '100' }, { size: -5 }]) {
+      await pg.exec(`UPDATE repository_capacity_ledger SET registered_bytes = 0, github_size_bytes = 0;`);
+      const routes = { ...trees, '/repos/fixture/repo-a': bad };
+      const report = await runSync({ sql, request: stubRequest(routes), mode: 'apply' });
+      expect(report.failedCount).toBe(1);
+      expect(report.repositories[0]).toMatchObject({
+        repositoryId: 1, status: 'failed', admissionRenewal: 'not-verified',
+        error: expect.stringContaining('repo size missing or invalid'),
+      });
+      expect(await capacity()).toEqual([
+        { repository_id: 1, registered_bytes: '0', github_size_bytes: '0' },
+        { repository_id: 2, registered_bytes: '400', github_size_bytes: '51200' },
+      ]);
+    }
+  });
+
+  it('逻辑值量到了但压缩值取不到 ⇒ 该仓 failed，两列都不写（不留「逻辑新鲜、压缩陈旧」的账）', async () => {
+    const routes = { ...trees, '/repos/fixture/repo-b': new Error('synthetic transport failure') };
+    const report = await runSync({ sql, request: stubRequest(routes), mode: 'apply' });
+    expect(report.failedCount).toBe(1);
+    expect(report.repositories[0]).toMatchObject({ repositoryId: 1, status: 'applied', githubSizeBytes: '102400' });
+    expect(report.repositories[1]).toMatchObject({
+      repositoryId: 2, status: 'failed', admissionRenewal: 'not-verified', error: 'synthetic transport failure',
+    });
+    expect(await capacity()).toEqual([
+      { repository_id: 1, registered_bytes: '500', github_size_bytes: '102400' },
+      { repository_id: 2, registered_bytes: '1850000000', github_size_bytes: '51200' },
+    ]);
   });
 
   it('无台账行 / 无 books 目录：不写、不谎报 0', async () => {
@@ -242,10 +374,16 @@ maybe('runSync（PGlite 真表 + 合成 GitHub 桩）', () => {
       '/repos/fixture/repo-a/git/trees/main?recursive=1': { truncated: false, tree: [blob('README.md', 42)] },
     };
     const report = await runSync({ sql, request: stubRequest(noRoot), mode: 'apply' });
-    expect(report.repositories[0].status).toBe('no-tree-root');
-    expect(report.repositories[1].status).toBe('no-ledger');
-    // 两仓的 registered_bytes 都保持原值：no-tree-root 不写 0、no-ledger 不 INSERT。
-    expect(await registered()).toEqual([{ repository_id: 1, registered_bytes: '0' }]);
+    // no-tree-root 仍如实报出本轮量到的压缩值（只是不写库），便于运维对照；
+    // 但不报 bytes——没有可信的逻辑和就不给数，避免被当成 0 抄进别处。
+    expect(report.repositories[0]).toMatchObject({
+      status: 'no-tree-root', fileCount: 0, previousBytes: '0',
+      previousGithubSizeBytes: '0', githubSizeBytes: '102400', admissionRenewal: 'not-verified',
+    });
+    expect(report.repositories[0]).not.toHaveProperty('bytes');
+    expect(report.repositories[1]).toMatchObject({ status: 'no-ledger', admissionRenewal: 'not-verified' });
+    // 两仓的字节账都保持原值：no-tree-root 不写 0、no-ledger 不 INSERT。
+    expect(await capacity()).toEqual([{ repository_id: 1, registered_bytes: '0', github_size_bytes: '0' }]);
   });
 
   it('输出不含任何秘密字面量（连接串 / token 都不进报告）', async () => {
@@ -288,9 +426,9 @@ maybe('runSync（PGlite 真表 + 合成 GitHub 桩）', () => {
     const report = await runSync({ sql, request: stubRequest(trees), mode: 'apply' });
     expect(report.repositories.map(r => [r.status, r.admissionRenewal])).toEqual([['applied', 'skipped-not-eligible'], ['applied', 'skipped-not-eligible']]);
     // 字节照常回写（续期闸不影响字节职责）
-    expect(await registered()).toEqual([
-      { repository_id: 1, registered_bytes: '500' },
-      { repository_id: 2, registered_bytes: '400' },
+    expect(await capacity()).toEqual([
+      { repository_id: 1, registered_bytes: '500', github_size_bytes: '102400' },
+      { repository_id: 2, registered_bytes: '400', github_size_bytes: '51200' },
     ]);
     const after = (await pg.query(`SELECT admission_valid_until FROM repository_capacity_ledger ORDER BY repository_id`)).rows.map(r => String(r.admission_valid_until));
     expect(after).toEqual(before);
@@ -303,5 +441,21 @@ maybe('runSync（PGlite 真表 + 合成 GitHub 桩）', () => {
     expect(report.repositories.map(r => r.admissionRenewal)).toEqual(['would-renew', 'skipped-not-eligible']);
     const after = String((await pg.query(`SELECT admission_valid_until FROM repository_capacity_ledger WHERE repository_id = 1`)).rows[0].admission_valid_until);
     expect(after).toBe(before);
+  });
+
+  // repothresh44 部署顺序护栏（放最后：临时改表结构）。未跑 migrations/0008 的库上没有
+  // github_size_bytes 列 ⇒ 必须抛而不是按 0 猜：0 会让运行期 decide 认为满仓「无限空」，
+  // 一路写到撞 GitHub 5GB 硬限。同时逻辑值也不写，避免只写半边账。
+  it('台账缺 github_size_bytes 列（未跑 0008）⇒ 抛，不按 0 猜、不写库', async () => {
+    await pg.exec(`ALTER TABLE repository_capacity_ledger DROP COLUMN github_size_bytes;`);
+    try {
+      await expect(runSync({ sql, request: stubRequest(trees), mode: 'apply' }))
+        .rejects.toThrow(/github_size_bytes/);
+      expect((await pg.query('SELECT registered_bytes FROM repository_capacity_ledger ORDER BY repository_id')).rows
+        .map(r => String(r.registered_bytes))).toEqual(['0', '1850000000']);
+    } finally {
+      await pg.exec(`ALTER TABLE repository_capacity_ledger
+        ADD COLUMN github_size_bytes bigint NOT NULL DEFAULT 0 CHECK (github_size_bytes >= 0);`);
+    }
   });
 });

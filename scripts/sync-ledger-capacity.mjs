@@ -1,16 +1,20 @@
-// sync-ledger-capacity: 把 GitHub 实测逻辑字节回写进 repository_capacity_ledger.registered_bytes。
+// sync-ledger-capacity: 把 GitHub 实测容量回写进 repository_capacity_ledger
+//   （registered_bytes = 逻辑字节观测；github_size_bytes = 压缩 pack 字节，即切仓门槛口径）。
 //
 // 为什么需要（ledgersync41 任务书背景，主会话 2026-10-15 亲验）：
-//   仓满切换的判据是 `decideRepositoryForPublication`（runtime-download/repository-rollover.ts:223）
-//   的 `registered_bytes + reserved_bytes + logicalBytes <= target_bytes`。但设计上 registered_bytes
-//   由「预留→confirm」链（artifact-capacity.ts 的 reserved→registered 转移）维护，而 phoenix 发布路径
-//   **不调** reserve/confirm（artifact_capacity_reservations 表全空），`reconcileInitialization` 也无生产
-//   调用方 ⇒ 台账永不累计：repo1 的 1.85GB 是 2026-10-13 一次性手写，现役仓 zhaoshu-books-2 自
-//   10-13 08:21 初始化后 registered_bytes 恒 0。后果 = books-2 满仓时 decide 仍选 books-2，永不切 books-3。
-//   本脚本把 GitHub tree 的实测逻辑字节作为**观测**值回写，使判据重新有数据基础。
+//   仓满切换的判据是 `decideRepositoryForPublication`（runtime-download/repository-rollover.ts）。
+//   设计上 registered_bytes 由「预留→confirm」链（artifact-capacity.ts 的 reserved→registered 转移）
+//   维护，而 phoenix 发布路径**不调** reserve/confirm（artifact_capacity_reservations 表全空），
+//   `reconcileInitialization` 也无生产调用方 ⇒ 台账永不累计：repo1 的 1.85GB 是 2026-10-13 一次性手写，
+//   现役仓 zhaoshu-books-2 自 10-13 08:21 初始化后 registered_bytes 恒 0。后果 = books-2 满仓时 decide
+//   仍选 books-2，永不切 books-3。本脚本把 GitHub 的实测值作为**观测**回写，使判据重新有数据基础。
 //
-// 口径（docs/artifact-registry.md:151）：
-//   registered_bytes = 观测到的 canonical TXT **逻辑**字节；current_tree_bytes 才含 snapshots。
+// 两个口径（repothresh44，2026-10-19 用户裁定「仓少一点、平衡一点」）：
+//   · github_size_bytes = `GET /repos/{owner}/{repo}` 的 size 字段 × 1024。GitHub 报的这个 size 就是
+//     压缩后 pack 的 KiB 数，**正是切仓门槛用的度量**（判据 github_size_bytes + 1 <= target_compressed_bytes，
+//     默认 1GiB）。它滞后且偏小（GitHub 定期 gc/统计延迟），偏差方向是晚切不早切，属保守可接受。
+//   · registered_bytes = canonical TXT **逻辑**字节（docs/artifact-registry.md:151 口径；current_tree_bytes
+//     才含 snapshots）。切仓判定已不用它，但照旧同步作观测与预留记账基础。
 //   故本脚本对 `<tree-root>/**`（缺省 books/）下的**普通 blob**（mode 100644/100755，与
 //   reconcile-tree-snapshot.ts:144 的 regular-blob 同判据）求 `size` 之和，并**排除**路径中任何
 //   `.snapshots` 段。符号链接 blob（120000）与 gitlink（160000）不是 TXT 内容，不计。
@@ -18,8 +22,10 @@
 // 树完整性（与 reconcile-tree-snapshot.ts:211 同红线）：递归树返回 `truncated: true` 时**不采信部分和**
 //   ——部分和会**低估**容量，比高估更危险（账目以为还有余量、实际已满）。改为按子树逐层下钻补齐
 //   （等价于分页枚举）；下钻到底仍截断则该仓失败关闭、不写库、不当空树。
+//   压缩 size 同红线：缺失/非法/HTTP 非 2xx 一律该仓 failed（不按 0 猜——0 会让满仓看起来空，
+//   运行期 decide 于是永不切仓，正是本脚本要消灭的故障形态）。
 //
-// 幂等：重跑重算；算得的值与库中现值相同即 status='unchanged'、字节不产生写。
+// 幂等：重跑重算；两个值都与库中现值相同即 status='unchanged'、字节不产生写。
 //   例外（F1 续期）：ready+granted 行每轮 apply 都会把 admission_valid_until 顺延到 NOW()+30天
 //   （滚动续命，写的是准入期限不是字节）；非 ready/非 granted 行仍零写。
 //
@@ -29,7 +35,11 @@
 //     不回退 DATABASE_URL/TEST_DATABASE_URL）与 --github-token-env=<大写变量名>。token/连接串只在脚本
 //     内部送往 GitHub/DB，既不进输出也不进错误消息（错误统一过 safeError）。
 //   - 仓列表从 DB 读（storage_repositories 全表的 enabled 行），不写死仓名。
-//   - 字节回写只 UPDATE registered_bytes + updated_at；不改 state / target_bytes / admission_status/version/target。
+//   - 字节回写只 UPDATE registered_bytes + github_size_bytes + updated_at（**同一条语句**，避免两个值
+//     分属不同轮次的撕裂态）；不改 state / target_bytes / target_compressed_bytes / admission_*。
+//   - **部署顺序**：本脚本 SELECT/UPDATE github_size_bytes，故必须先跑
+//     migrations/0008_capacity_compressed_threshold.sql 再上这版脚本；否则报「column does not exist」
+//     → 该轮全仓 failed、退出码 1（失败关闭，不静默跳过压缩口径）。
 //   - 准入续期（F1, repofix43）：admission_valid_until 全系统无续期机制，现仓 2026-11-12 同时到期即悬崖。
 //     本脚本每小时已在跑、已在核对同一批行——对**本轮核对成功**且 state='ready' ∧ admission_status='granted'
 //     的行顺带续期 30 天（UPDATE 的 WHERE 自带双闸，不得复活非 ready/非 granted 行）。
@@ -252,6 +262,30 @@ export async function measureRepositoryLogicalBytes(request, repo, treeRoot) {
   return { bytes, fileCount, missingRoot: fileCount === 0 };
 }
 
+/**
+ * 压缩口径（repothresh44）：`GET /repos/{owner}/{repo}` 的 size 字段是压缩 pack 的 **KiB** 数，
+ * ×1024 得字节，正是切仓门槛判据用的量。
+ * 失败关闭：HTTP 非 2xx / 响应壳非法 / size 缺失或非法（负数、小数、非数）一律抛，不按 0 猜——
+ * 把满仓写成 0 会让运行期 decide 认为「无限空」而永不切仓，直到撞 GitHub 5GB 硬限。
+ * @param {GitHubJsonRequest} request
+ * @param {{owner: string, repo: string, branch: string}} repo
+ * @returns {Promise<bigint>} 压缩 pack 字节
+ */
+export async function measureRepositoryCompressedBytes(request, repo) {
+  const res = await request(`/repos/${repo.owner}/${repo.repo}`);
+  if (typeof res?.status !== 'number' || !Number.isInteger(res.status) || res.status < 100 || res.status > 599) {
+    throw new Error('malformed response envelope');
+  }
+  if (res.status < 200 || res.status >= 300) throw new Error(`GITHUB_REPO_HTTP_${res.status}`);
+  const body = await res.json();
+  if (body == null || typeof body !== 'object') throw new Error('malformed repo body');
+  const size = body.size;
+  if (typeof size !== 'number' || !Number.isSafeInteger(size) || size < 0) {
+    throw new Error('repo size missing or invalid');
+  }
+  return BigInt(size) * BigInt(1024);
+}
+
 /** 台账口径涉及的全部 enabled 仓（仓列表来自 DB，不写死仓名）。 */
 export async function listEnabledRepositories(sql) {
   return await sql`
@@ -261,28 +295,48 @@ export async function listEnabledRepositories(sql) {
     ORDER BY id ASC`;
 }
 
-/** 读台账行的字节账与准入闸。state/admission_status 只用于报告与 dry-run 预判；续期的真守卫在 UPDATE 的 WHERE。 */
+/** 读台账行的两个字节账与准入闸。state/admission_status 只用于报告与 dry-run 预判；续期的真守卫在 UPDATE 的 WHERE。 */
 export async function readLedgerRow(sql, repositoryId) {
   const rows = await sql`
-    SELECT registered_bytes, state, admission_status
+    SELECT registered_bytes, github_size_bytes, state, admission_status
     FROM repository_capacity_ledger
     WHERE repository_id = ${repositoryId}`;
   if (!rows.length) return null;
-  const raw = rows[0].registered_bytes;
   return {
-    registeredBytes: typeof raw === 'bigint' ? raw : BigInt(raw),
+    registeredBytes: ledgerBigint(rows[0].registered_bytes, 'registered_bytes'),
+    githubSizeBytes: ledgerBigint(rows[0].github_size_bytes, 'github_size_bytes'),
     state: rows[0].state ?? null,
     admissionStatus: rows[0].admission_status ?? null,
   };
 }
 
-/** 唯一字节写语句：只碰 registered_bytes 与 updated_at，其余列（state/target/admission）原样保留。 */
-export async function updateRegisteredBytes(sql, repositoryId, bytes) {
+/**
+ * bigint 列规范化：驱动对 bigint 返回口径不一（bigint/number/十进制 string）。缺失（未跑
+ * migrations/0008 时 github_size_bytes 会是 undefined）或非法一律抛——按 0 猜会把满仓报成空仓。
+ */
+function ledgerBigint(value, column) {
+  if (typeof value === 'bigint') {
+    if (value < BigInt(0)) throw new Error(`台账列 ${column} 为负: ${value}`);
+    return value;
+  }
+  if (typeof value === 'number' && Number.isSafeInteger(value) && value >= 0) return BigInt(value);
+  if (typeof value === 'string' && /^\d+$/.test(value)) return BigInt(value);
+  throw new Error(`台账列 ${column} 缺失或非法（migrations/0008 是否已跑？）: ${String(value).slice(0, 40)}`);
+}
+
+/**
+ * 唯一字节写语句：一条 UPDATE 同时写两个口径 + updated_at，其余列（state/target/target_compressed/
+ * admission）原样保留。合成一条是为了避免「逻辑值是本轮的、压缩值是上轮的」撕裂态——
+ * 运行期 decide 只看压缩值，但两值并列进报告才有对照价值。
+ */
+export async function updateCapacityBytes(sql, repositoryId, registeredBytes, githubSizeBytes) {
   const rows = await sql`
     UPDATE repository_capacity_ledger
-    SET registered_bytes = ${bytes}::bigint, updated_at = now()
+    SET registered_bytes = ${registeredBytes.toString()}::bigint,
+        github_size_bytes = ${githubSizeBytes.toString()}::bigint,
+        updated_at = now()
     WHERE repository_id = ${repositoryId}
-    RETURNING registered_bytes`;
+    RETURNING registered_bytes, github_size_bytes`;
   return rows;
 }
 
@@ -303,7 +357,7 @@ export async function renewAdmissionValidUntil(sql, repositoryId) {
 }
 
 /**
- * 主流程：读仓列表 → 逐仓量字节 → 比对现值 → （apply 且有差异时）UPDATE。
+ * 主流程：读仓列表 → 逐仓量两个口径 → 比对现值 → （apply 且有差异时）一条 UPDATE 写回。
  * request 与 sql 均为注入端口，测试可换合成桩，不触网、不读 .env。
  * @param {{sql: unknown, request: GitHubJsonRequest, mode: 'dry-run'|'apply', treeRoot?: string}} options
  */
@@ -316,8 +370,12 @@ export async function runSync(options) {
     const repo = { owner: String(row.owner), repo: String(row.repo), branch: String(row.branch) };
     const base = { repositoryId: id, repo: `${repo.owner}/${repo.repo}`, branch: repo.branch };
     let measured;
+    let githubSizeBytes;
     try {
       measured = await measureRepositoryLogicalBytes(options.request, repo, treeRoot);
+      // 压缩口径与逻辑口径同轮取：任一取不到都算本轮核对失败（不写库、不续期），
+      // 否则会出现「逻辑值新鲜、压缩值陈旧」的账，而门槛只看压缩值。
+      githubSizeBytes = await measureRepositoryCompressedBytes(options.request, repo);
     } catch (error) {
       // 该仓失败关闭：不写库，向上如实报失败（部分和会低估容量，比不写更危险）。
       results.push({ ...base, status: 'failed', admissionRenewal: 'not-verified', error: error instanceof Error ? error.message : String(error) });
@@ -330,12 +388,14 @@ export async function runSync(options) {
       continue;
     }
     const before = ledgerRow.registeredBytes;
+    const beforeCompressed = ledgerRow.githubSizeBytes;
     if (measured.missingRoot) {
-      results.push({ ...base, status: 'no-tree-root', fileCount: 0, previousBytes: before.toString(), admissionRenewal: 'not-verified',
-        note: `仓内没有 ${treeRoot}/ 目录；不把缺目录写成 0 容量` });
+      results.push({ ...base, status: 'no-tree-root', fileCount: 0, previousBytes: before.toString(),
+        previousGithubSizeBytes: beforeCompressed.toString(), githubSizeBytes: githubSizeBytes.toString(),
+        admissionRenewal: 'not-verified', note: `仓内没有 ${treeRoot}/ 目录；不把缺目录写成 0 容量` });
       continue;
     }
-    // F1 准入续期：能走到这里 = 本轮对该仓核对成功（树完整、books 根目录在、台账行在）。
+    // F1 准入续期：能走到这里 = 本轮对该仓核对成功（树完整、books 根目录在、压缩 size 取到、台账行在）。
     // 续期资格的真守卫在 renewAdmissionValidUntil 的 WHERE（原子双闸）；这里的预判只用于
     // 报告与 dry-run 不落写。no-tree-root/no-ledger/failed 三种核对失败情形在上游已 continue，不续期。
     const renewable = ledgerRow.state === 'ready' && ledgerRow.admissionStatus === 'granted';
@@ -343,16 +403,22 @@ export async function runSync(options) {
     if (!renewable) admissionRenewal = 'skipped-not-eligible';
     else if (options.mode === 'dry-run') admissionRenewal = 'would-renew';
     else admissionRenewal = (await renewAdmissionValidUntil(options.sql, id)).length > 0 ? 'renewed' : 'skipped-not-eligible';
-    if (before === measured.bytes) {
-      results.push({ ...base, status: 'unchanged', fileCount: measured.fileCount, previousBytes: before.toString(), bytes: measured.bytes.toString(), admissionRenewal });
+    const observed = {
+      fileCount: measured.fileCount,
+      previousBytes: before.toString(), bytes: measured.bytes.toString(),
+      previousGithubSizeBytes: beforeCompressed.toString(), githubSizeBytes: githubSizeBytes.toString(),
+      admissionRenewal,
+    };
+    if (before === measured.bytes && beforeCompressed === githubSizeBytes) {
+      results.push({ ...base, status: 'unchanged', ...observed });
       continue;
     }
     if (options.mode === 'dry-run') {
-      results.push({ ...base, status: 'dry-run', fileCount: measured.fileCount, previousBytes: before.toString(), bytes: measured.bytes.toString(), admissionRenewal });
+      results.push({ ...base, status: 'dry-run', ...observed });
       continue;
     }
-    await updateRegisteredBytes(options.sql, id, measured.bytes);
-    results.push({ ...base, status: 'applied', fileCount: measured.fileCount, previousBytes: before.toString(), bytes: measured.bytes.toString(), admissionRenewal });
+    await updateCapacityBytes(options.sql, id, measured.bytes, githubSizeBytes);
+    results.push({ ...base, status: 'applied', ...observed });
   }
   const failed = results.filter(r => r.status === 'failed');
   return { mode: options.mode, treeRoot, repositories: results, failedCount: failed.length };
