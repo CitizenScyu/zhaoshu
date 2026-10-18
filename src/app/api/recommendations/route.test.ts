@@ -48,7 +48,8 @@ describe('推荐主查询、最新原因和共享阅读定位', () => {
     const response = await GET(request());
     expect((await response.json()).recommendations[0].read_task_id).toBe(90);
     const query = db.queries[0];
-    expect(query.values).toEqual([3, 3, 3, 300, 0]);
+    // zhuigeng42：has_update 子查询比 done 任务关联多两个 userId 绑定（子查询里限定进度项归属与拼 item_key）。
+    expect(query.values).toEqual([3, 3, 3, 3, 3, 300, 0]);
     expect(query.text).toMatch(/FROM download_tasks WHERE status = 'done'\s+GROUP BY/);
     expect(query.text).toContain('max(id) AS read_task_id');
     expect(query.text).not.toMatch(/dt\.(?:error|user_id|source_url|log)/);
@@ -56,7 +57,7 @@ describe('推荐主查询、最新原因和共享阅读定位', () => {
   it('owner 的个人推荐仍只按 userId=1 查询', async () => {
     vi.stubEnv('AUTH_ACCOUNTS_ENABLED', 'false');
     expect((await GET(new NextRequest('http://localhost/api/recommendations', { headers: { 'X-Owner-Token': 'recommendations-owner' } }))).status).toBe(200);
-    expect(db.queries[0].values).toEqual([1, 1, 1, 300, 0]);
+    expect(db.queries[0].values).toEqual([1, 1, 1, 1, 1, 300, 0]);
   });
   // F06：搜索移服务端 + 分页，均走绑定参数（不做字符串拼接）。
   it('F06：?q= 过滤 title/author，?limit=&offset= 分页', async () => {
@@ -64,6 +65,7 @@ describe('推荐主查询、最新原因和共享阅读定位', () => {
     expect(res.status).toBe(200);
     const query = db.queries[0];
     expect(query.text).toContain('ILIKE ?');
+    // member-a 无 read 能力 ⇒ has_update 落成 false 字面量、不额外绑定参数。
     expect(query.values).toEqual([2, 2, 2, '%鬼%', '%鬼%', 50, 100]);
   });
   it('F06：非法 limit/offset 返回 400 且不发查询', async () => {

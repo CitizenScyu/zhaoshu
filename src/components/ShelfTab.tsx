@@ -31,6 +31,8 @@ interface ShelfItem {
   douban_rating_count: number | null;
   meta: { category?: string; wordCount?: string };
   read_task_id?: number | null;
+  /** zhuigeng42：最新那版全文发布得比该用户最后一次阅读进度更新（服务端按 done 任务与进度项比较）。 */
+  has_update?: boolean;
 }
 
 const GROUPS: { key: ShelfStatus; label: string; color: string }[] = [
@@ -55,6 +57,19 @@ function taskProgressOf(raw: string | null): { updatedAt: number; chapterIndex: 
   } catch {
     return null;
   }
+}
+
+/** zhuigeng42「有更新」徽标：仅样式提示，不改变卡片其余行为；颜色用现成 css 变量。 */
+function UpdateBadge() {
+  return (
+    <span
+      className="text-xs px-1.5 py-0.5 rounded border shrink-0"
+      style={{ borderColor: 'var(--gold)', color: 'var(--gold)' }}
+      aria-label="有更新"
+    >
+      有更新
+    </span>
+  );
 }
 
 function readTimeAgo(at: number, now: number): string {
@@ -308,6 +323,7 @@ export default function ShelfTab() {
               <div key={item.id} className="book-card px-5 py-3 pl-6 flex flex-wrap items-center gap-x-4 gap-y-2">
                 <div className="min-w-0 flex-1">
                   <span className="font-bold break-words">{item.title}</span>
+                  {item.has_update && <span className="ml-2 inline-block align-middle"><UpdateBadge /></span>}
                   <span className="text-xs ml-2 break-words" style={{ color: 'var(--ink-faint)' }}>
                     {item.author}
                   </span>
@@ -391,6 +407,7 @@ export default function ShelfTab() {
                   <div className="w-full sm:w-auto sm:flex-1 min-w-0">
                     <div className="flex flex-wrap items-baseline gap-x-2.5">
                       <span className="min-w-0 max-w-full font-bold break-words">{it.title}</span>
+                      {it.has_update && <UpdateBadge />}
                       <span className="text-xs" style={{ color: 'var(--ink-faint)' }}>
                         {it.author}
                         {it.meta?.category ? ` · ${it.meta.category}` : ''}
