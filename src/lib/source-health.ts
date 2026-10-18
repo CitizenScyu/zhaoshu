@@ -8,13 +8,14 @@ import { DB_QUOTA_HEALTH_ROW } from './db-quota';
 // 阈值集中在这里一处（探针侧在 workflow 里复述同一组数字，两边必须一致）。
 // 判据 =「该 cron 的计划间隔 + 2h 容差」：漏掉一次计划运行后不久即暴露，而不是拖到第二天。
 //
-// ⚠️ 不变量：**每条 cron 的告警阈值必须 > 它在 vercel.json 里的实际触发间隔**。
-// Vercel **Hobby** 计划限制「每条 cron 每天只能触发一次」，所以本仓三条 cron（shuyuan /
-// reclaim / drain）的间隔恒为 24h，阈值一律 = 24h + 2h 容差 = 26h。
-// shuyuan 原为 8h —— f474e27 定该值时 cron 还是每 6h 的 `0 2,8,14,20`，但 b561fba（实际上更早）
-// 已把 cron 改回每日一次 `0 2 * * *`，两条线各自都对、合起来 8h 阈值配上 HEALTH_URL 会**每天误报**。
-// 改 vercel.json 的 cron 计划时必须同步改这里与 workflow 里的数字；`src/lib/vercel-cron.test.ts`
-// 有一条离线门禁按表达式真算间隔、比对这里的常数，脱节即红（防下次再靠人记）。
+// ⚠️ 不变量：**每条 cron 的告警阈值必须 > 它在 phoenix systemd timer 里的实际触发间隔**。
+// 调度唯一来源是 phoenix 的 systemd timer（deploy/phoenix/，2026-10-18 crons5 起 vercel.json
+// 已无 crons）：shuyuan / reclaim / drain / followup 的间隔恒为 24h（followup 为 0.5h），
+// shuyuan 阈值一律 = 24h + 2h 容差 = 26h（followup 沿用 26h，远大于 0.5h）。
+// shuyuan 原为 8h —— f474e27 定该值时调度还是每 6h 的 `0 2,8,14,20`，但 b561fba（实际上更早）
+// 已把调度改回每日一次 `0 2 * * *`，两条线各自都对、合起来 8h 阈值配上 HEALTH_URL 会**每天误报**。
+// 改 phoenix timer 的 OnCalendar 计划时必须同步改这里与 workflow 里的数字；`src/lib/vercel-cron.test.ts`
+// 有一条离线门禁按 OnCalendar 表达式真算间隔、比对这里的常数，脱节即红（防下次再靠人记）。
 export const SHUYUAN_REFRESH_ALERT_HOURS = 26;
 export const CRON_ALERT_HOURS = 26;
 // 42-admhealth：准入成功行 name='admission' 的判龄阈值。一天两轮（02:00 刷新尾部 + 14:00 独立轮）

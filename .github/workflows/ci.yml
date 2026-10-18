@@ -55,8 +55,8 @@ jobs:
       - name: lint
         run: npm run lint
 
-      # 部署配置门（review-42 MS-09）：vercel.json cron 频率/路由、maxDuration 上限与路由内部预算、
-      # next.config 构建类型门。纯静态读文件，不联网、不读 .env*。本工作流不走 `npm run check`，
+      # 部署配置门（review-42 MS-09）：vercel.json（无 crons 时早退放行）、maxDuration 上限与路由内部预算、
+      # next.config 构建类型门。调度以 phoenix timer 为准（deploy/phoenix/）。纯静态读文件，不联网、不读 .env*。本工作流不走 `npm run check`，
       # 所以必须单列一步；本地 pre-push 经 `npm run check` 同样会跑。
       - name: check:deploy
         run: npm run check:deploy
