@@ -457,7 +457,7 @@ describe('evaluateThreshold：单一口径 = GitHub 压缩 pack 字节（repothr
 
 describe('resolveActiveRepository（PGlite 真表）', () => {
   // 纯函数测不到列名/LEFT JOIN 写错，故用真表跑一次真实 SQL（合成数据，不触生产）。
-  it('按 id 升序读全表候选，选第一个仍可写且压缩未满的仓', async () => {
+  it('按 id 升序读全表候选，选第一个仍可写且压缩未满的仓；门槛目标取每仓自己的台账列', async () => {
     const { PGlite } = await import('@electric-sql/pglite');
     const { initializeArtifactSchema } = await import('../src/lib/business-schema');
     const { initializeArtifactCapacitySchema } = await import('../src/lib/artifact-capacity-schema');
@@ -470,8 +470,9 @@ describe('resolveActiveRepository（PGlite 真表）', () => {
     await pg.exec(`INSERT INTO labeled_books(id,title,author) VALUES(1,'synthetic','author');`);
     await initializeArtifactSchema(sql as never);
     await initializeArtifactCapacitySchema(sql as never);
-    // repo1 已封存、repo2 在用（逻辑账 1.85G 已超旧 target 但压缩只 120MB）、repo3 空着
-    // ⇒ 现役仓必须是 repo2（探针盯它，不是 repo1 也不是 repo3）。
+    // repo1 已封存；repo2 在用（逻辑账 1.85G 已超旧 target；压缩 1,024,000,000 B **已超
+    // 缺省 1GiB 目标的 85%**，但它自己的台账目标是 5GiB ⇒ 仍未满）；repo3 空着。
+    // ⇒ 现役仓必须是 repo2，且判定用的是 repo2 那一行的 target_compressed_bytes，不是 --compressed-target-bytes。
     await pg.exec(`
       INSERT INTO storage_repositories(id,owner,repo,branch,enabled,is_private,read_only,sealed_at,target_bytes)
         VALUES(1,'fixture','repo-a','main',true,true,false,'2026-10-13T08:21:00Z',1000000000),
@@ -483,7 +484,7 @@ describe('resolveActiveRepository（PGlite 真表）', () => {
          admission_status,admission_version,admission_valid_until,admission_target)
         VALUES
           (1,'ready',1000000000,1850000000,0,1073741824,1073741824,'epoch-1','granted','v1',NOW()+INTERVAL '30 days','{"repositoryId":1,"branch":"main"}'),
-          (2,'ready',1000000000,1850000000,0,120000000,1073741824,'epoch-1','granted','v1',NOW()+INTERVAL '30 days','{"repositoryId":2,"branch":"main"}'),
+          (2,'ready',1000000000,1850000000,0,1024000000,5368709120,'epoch-1','granted','v1',NOW()+INTERVAL '30 days','{"repositoryId":2,"branch":"main"}'),
           (3,'ready',1000000000,0,0,0,1073741824,'epoch-1','granted','v1',NOW()+INTERVAL '30 days','{"repositoryId":3,"branch":"main"}');
     `);
     const active = await resolveActiveRepository(sql, NOW);
@@ -492,13 +493,19 @@ describe('resolveActiveRepository（PGlite 真表）', () => {
     if (active.status === 'ok') {
       expect(active.accounting).toEqual({
         registeredBytes: BigInt(1_850_000_000), reservedBytes: BigInt(0), targetBytes: BigInt(1_000_000_000),
-        githubSizeBytes: BigInt(120_000_000), targetCompressedBytes: BigInt(1_073_741_824),
+        githubSizeBytes: BigInt(1_024_000_000), targetCompressedBytes: BigInt(5_368_709_120),
       });
       const accounting = active.accounting;
-      // 真表值喂回判定：压缩 120MB 远低于 85%×1GiB ⇒ 不建仓；逻辑 1.85G 已超旧线只进 observation。
-      const v = evaluateThreshold({ thresholdPct: 85, sizeKib: 117_187, compressedTargetBytes: accounting.targetCompressedBytes, accounting });
-      expect(v.exceeded).toBe(false);
-      expect(v.observation?.logicalExceeded).toBe(true);
+      // 每仓用自己的 target_compressed_bytes：1,000,000 KiB = 1,024,000,000 B < 85%×5GiB ⇒ 不建仓。
+      const own = evaluateThreshold({ thresholdPct: 85, sizeKib: 1_000_000, compressedTargetBytes: accounting.targetCompressedBytes, accounting });
+      expect(own.exceeded).toBe(false);
+      expect(own.thresholdCompressedBytes).toBe(BigInt(4_563_402_752));
+      expect(own.observation?.ledgerTargetCompressedBytes).toBe(BigInt(5_368_709_120));
+      // 反例护栏：同一 sizeKib 若误用 --compressed-target-bytes 的缺省 1GiB 就会判过线（会无谓建仓），
+      // 证明「取台账列」不是等价写法而是必需。
+      expect(evaluateThreshold({ thresholdPct: 85, sizeKib: 1_000_000, compressedTargetBytes: COMPRESSED_TARGET, accounting }).exceeded).toBe(true);
+      // 逻辑 1.85G 已超旧线，但只进 observation，不参与判定。
+      expect(own.observation?.logicalExceeded).toBe(true);
     }
     await pg.close();
   }, 60_000);
