@@ -19,7 +19,9 @@
 //   ——部分和会**低估**容量，比高估更危险（账目以为还有余量、实际已满）。改为按子树逐层下钻补齐
 //   （等价于分页枚举）；下钻到底仍截断则该仓失败关闭、不写库、不当空树。
 //
-// 幂等：重跑重算；算得的值与库中现值相同即 status='unchanged'、不产生写。同值重跑不产生实质变更。
+// 幂等：重跑重算；算得的值与库中现值相同即 status='unchanged'、字节不产生写。
+//   例外（F1 续期）：ready+granted 行每轮 apply 都会把 admission_valid_until 顺延到 NOW()+30天
+//   （滚动续命，写的是准入期限不是字节）；非 ready/非 granted 行仍零写。
 //
 // 硬约束：
 //   - 默认 dry-run（只报告会做什么）；显式 --apply 才写。
@@ -27,7 +29,10 @@
 //     不回退 DATABASE_URL/TEST_DATABASE_URL）与 --github-token-env=<大写变量名>。token/连接串只在脚本
 //     内部送往 GitHub/DB，既不进输出也不进错误消息（错误统一过 safeError）。
 //   - 仓列表从 DB 读（storage_repositories 全表的 enabled 行），不写死仓名。
-//   - 只 UPDATE registered_bytes + updated_at；不改 state / target_bytes / admission_*（不在本任务范围）。
+//   - 字节回写只 UPDATE registered_bytes + updated_at；不改 state / target_bytes / admission_status/version/target。
+//   - 准入续期（F1, repofix43）：admission_valid_until 全系统无续期机制，现仓 2026-11-12 同时到期即悬崖。
+//     本脚本每小时已在跑、已在核对同一批行——对**本轮核对成功**且 state='ready' ∧ admission_status='granted'
+//     的行顺带续期 30 天（UPDATE 的 WHERE 自带双闸，不得复活非 ready/非 granted 行）。
 //
 // 出口码：0=全部处理完（含 unchanged / dry-run）；1=有仓失败（至少一仓未取到可信值）；2=参数错误。
 //
@@ -256,17 +261,22 @@ export async function listEnabledRepositories(sql) {
     ORDER BY id ASC`;
 }
 
-export async function readRegisteredBytes(sql, repositoryId) {
+/** 读台账行的字节账与准入闸。state/admission_status 只用于报告与 dry-run 预判；续期的真守卫在 UPDATE 的 WHERE。 */
+export async function readLedgerRow(sql, repositoryId) {
   const rows = await sql`
-    SELECT registered_bytes
+    SELECT registered_bytes, state, admission_status
     FROM repository_capacity_ledger
     WHERE repository_id = ${repositoryId}`;
   if (!rows.length) return null;
   const raw = rows[0].registered_bytes;
-  return typeof raw === 'bigint' ? raw : BigInt(raw);
+  return {
+    registeredBytes: typeof raw === 'bigint' ? raw : BigInt(raw),
+    state: rows[0].state ?? null,
+    admissionStatus: rows[0].admission_status ?? null,
+  };
 }
 
-/** 唯一写语句：只碰 registered_bytes 与 updated_at，其余列（state/target/admission）原样保留。 */
+/** 唯一字节写语句：只碰 registered_bytes 与 updated_at，其余列（state/target/admission）原样保留。 */
 export async function updateRegisteredBytes(sql, repositoryId, bytes) {
   const rows = await sql`
     UPDATE repository_capacity_ledger
@@ -274,6 +284,22 @@ export async function updateRegisteredBytes(sql, repositoryId, bytes) {
     WHERE repository_id = ${repositoryId}
     RETURNING registered_bytes`;
   return rows;
+}
+
+/**
+ * F1 准入续期：对本轮核对成功的行把 admission_valid_until 顺延到 NOW()+30天。
+ * WHERE 自带 state='ready' ∧ admission_status='granted' 双闸（原子守卫，不靠调用方预读）——
+ * 非 ready/非 granted 行绝不被续期（不复活）。updated_at 随续期推进，作为「最近一轮成功核对」的时间戳。
+ * @returns RETURNING 命中行；空数组 = 该仓不具备续期资格（行不存在或非 ready/非 granted）。
+ */
+export async function renewAdmissionValidUntil(sql, repositoryId) {
+  return await sql`
+    UPDATE repository_capacity_ledger
+    SET admission_valid_until = NOW() + INTERVAL '30 days', updated_at = NOW()
+    WHERE repository_id = ${repositoryId}
+      AND state = 'ready'
+      AND admission_status = 'granted'
+    RETURNING admission_valid_until`;
 }
 
 /**
@@ -294,30 +320,39 @@ export async function runSync(options) {
       measured = await measureRepositoryLogicalBytes(options.request, repo, treeRoot);
     } catch (error) {
       // 该仓失败关闭：不写库，向上如实报失败（部分和会低估容量，比不写更危险）。
-      results.push({ ...base, status: 'failed', error: error instanceof Error ? error.message : String(error) });
+      results.push({ ...base, status: 'failed', admissionRenewal: 'not-verified', error: error instanceof Error ? error.message : String(error) });
       continue;
     }
-    const before = await readRegisteredBytes(options.sql, id);
-    if (before === null) {
-      results.push({ ...base, status: 'no-ledger', fileCount: measured.fileCount,
+    const ledgerRow = await readLedgerRow(options.sql, id);
+    if (ledgerRow === null) {
+      results.push({ ...base, status: 'no-ledger', fileCount: measured.fileCount, admissionRenewal: 'not-verified',
         note: 'repository_capacity_ledger 无该仓行；本脚本只 UPDATE 不 INSERT（登记请用 register-storage-repository / 初始化对账）' });
       continue;
     }
+    const before = ledgerRow.registeredBytes;
     if (measured.missingRoot) {
-      results.push({ ...base, status: 'no-tree-root', fileCount: 0, previousBytes: before.toString(),
+      results.push({ ...base, status: 'no-tree-root', fileCount: 0, previousBytes: before.toString(), admissionRenewal: 'not-verified',
         note: `仓内没有 ${treeRoot}/ 目录；不把缺目录写成 0 容量` });
       continue;
     }
+    // F1 准入续期：能走到这里 = 本轮对该仓核对成功（树完整、books 根目录在、台账行在）。
+    // 续期资格的真守卫在 renewAdmissionValidUntil 的 WHERE（原子双闸）；这里的预判只用于
+    // 报告与 dry-run 不落写。no-tree-root/no-ledger/failed 三种核对失败情形在上游已 continue，不续期。
+    const renewable = ledgerRow.state === 'ready' && ledgerRow.admissionStatus === 'granted';
+    let admissionRenewal;
+    if (!renewable) admissionRenewal = 'skipped-not-eligible';
+    else if (options.mode === 'dry-run') admissionRenewal = 'would-renew';
+    else admissionRenewal = (await renewAdmissionValidUntil(options.sql, id)).length > 0 ? 'renewed' : 'skipped-not-eligible';
     if (before === measured.bytes) {
-      results.push({ ...base, status: 'unchanged', fileCount: measured.fileCount, previousBytes: before.toString(), bytes: measured.bytes.toString() });
+      results.push({ ...base, status: 'unchanged', fileCount: measured.fileCount, previousBytes: before.toString(), bytes: measured.bytes.toString(), admissionRenewal });
       continue;
     }
     if (options.mode === 'dry-run') {
-      results.push({ ...base, status: 'dry-run', fileCount: measured.fileCount, previousBytes: before.toString(), bytes: measured.bytes.toString() });
+      results.push({ ...base, status: 'dry-run', fileCount: measured.fileCount, previousBytes: before.toString(), bytes: measured.bytes.toString(), admissionRenewal });
       continue;
     }
     await updateRegisteredBytes(options.sql, id, measured.bytes);
-    results.push({ ...base, status: 'applied', fileCount: measured.fileCount, previousBytes: before.toString(), bytes: measured.bytes.toString() });
+    results.push({ ...base, status: 'applied', fileCount: measured.fileCount, previousBytes: before.toString(), bytes: measured.bytes.toString(), admissionRenewal });
   }
   const failed = results.filter(r => r.status === 'failed');
   return { mode: options.mode, treeRoot, repositories: results, failedCount: failed.length };

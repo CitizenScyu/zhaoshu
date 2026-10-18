@@ -160,8 +160,8 @@ maybe('runSync（PGlite 真表 + 合成 GitHub 桩）', () => {
     expect(report.mode).toBe('dry-run');
     expect(report.failedCount).toBe(0);
     expect(report.repositories).toEqual([
-      { repositoryId: 1, repo: 'fixture/repo-a', branch: 'main', status: 'dry-run', fileCount: 2, previousBytes: '0', bytes: '500' },
-      { repositoryId: 2, repo: 'fixture/repo-b', branch: 'main', status: 'dry-run', fileCount: 1, previousBytes: '1850000000', bytes: '400' },
+      { repositoryId: 1, repo: 'fixture/repo-a', branch: 'main', status: 'dry-run', fileCount: 2, previousBytes: '0', bytes: '500', admissionRenewal: 'skipped-not-eligible' },
+      { repositoryId: 2, repo: 'fixture/repo-b', branch: 'main', status: 'dry-run', fileCount: 1, previousBytes: '1850000000', bytes: '400', admissionRenewal: 'skipped-not-eligible' },
     ]);
     expect(await registered()).toEqual([
       { repository_id: 1, registered_bytes: '0' },
@@ -254,5 +254,54 @@ maybe('runSync（PGlite 真表 + 合成 GitHub 桩）', () => {
     expect(dumped).not.toContain('postgres://');
     expect(dumped).not.toMatch(/gh[pousr]_/i);
     expect(dumped).not.toContain('Bearer');
+  });
+
+  // F1（repofix43）：admission_valid_until 无续期机制 → 2026-11-12 悬崖。续期只对
+  // 本轮核对成功且 ready+granted 的行；WHERE 自带双闸，不复活非 ready/非 granted 行。
+  it('F1 续期：ready+granted 行 apply 后续期到约 30 天后；unchanged（字节同值）也照续', async () => {
+    await pg.exec(`
+      UPDATE repository_capacity_ledger
+      SET admission_status='granted', admission_version='v1',
+          admission_valid_until=NOW()+INTERVAL '5 days',
+          admission_target=jsonb_build_object('repositoryId', repository_id, 'branch', 'main')
+      WHERE repository_id IN (1,2);
+    `);
+    const first = await runSync({ sql, request: stubRequest(trees), mode: 'apply' });
+    expect(first.repositories.map(r => [r.status, r.admissionRenewal])).toEqual([['applied', 'renewed'], ['applied', 'renewed']]);
+    const spans = (await pg.query(`SELECT EXTRACT(EPOCH FROM admission_valid_until - NOW()) AS secs FROM repository_capacity_ledger ORDER BY repository_id`)).rows;
+    for (const row of spans) {
+      const secs = Number(row.secs);
+      expect(secs).toBeGreaterThan(25 * 86400);
+      expect(secs).toBeLessThan(31 * 86400);
+    }
+    // 第二跑字节同值（unchanged）——探针每小时续命走的正是这条路
+    const second = await runSync({ sql, request: stubRequest(trees), mode: 'apply' });
+    expect(second.repositories.map(r => [r.status, r.admissionRenewal])).toEqual([['unchanged', 'renewed'], ['unchanged', 'renewed']]);
+  });
+
+  it('F1 续期：非 granted / 非 ready 行不续期（双闸不复活），字节回写不受影响', async () => {
+    await pg.exec(`
+      UPDATE repository_capacity_ledger SET admission_status='denied', admission_valid_until=NOW()+INTERVAL '5 days' WHERE repository_id = 1;
+      UPDATE repository_capacity_ledger SET state='uninitialized', admission_status='granted', admission_valid_until=NOW()+INTERVAL '5 days' WHERE repository_id = 2;
+    `);
+    const before = (await pg.query(`SELECT admission_valid_until FROM repository_capacity_ledger ORDER BY repository_id`)).rows.map(r => String(r.admission_valid_until));
+    const report = await runSync({ sql, request: stubRequest(trees), mode: 'apply' });
+    expect(report.repositories.map(r => [r.status, r.admissionRenewal])).toEqual([['applied', 'skipped-not-eligible'], ['applied', 'skipped-not-eligible']]);
+    // 字节照常回写（续期闸不影响字节职责）
+    expect(await registered()).toEqual([
+      { repository_id: 1, registered_bytes: '500' },
+      { repository_id: 2, registered_bytes: '400' },
+    ]);
+    const after = (await pg.query(`SELECT admission_valid_until FROM repository_capacity_ledger ORDER BY repository_id`)).rows.map(r => String(r.admission_valid_until));
+    expect(after).toEqual(before);
+  });
+
+  it('F1 续期：dry-run 只报告 would-renew，不落写', async () => {
+    await pg.exec(`UPDATE repository_capacity_ledger SET admission_status='granted', admission_valid_until=NOW()+INTERVAL '5 days' WHERE repository_id = 1;`);
+    const before = String((await pg.query(`SELECT admission_valid_until FROM repository_capacity_ledger WHERE repository_id = 1`)).rows[0].admission_valid_until);
+    const report = await runSync({ sql, request: stubRequest(trees), mode: 'dry-run' });
+    expect(report.repositories.map(r => r.admissionRenewal)).toEqual(['would-renew', 'skipped-not-eligible']);
+    const after = String((await pg.query(`SELECT admission_valid_until FROM repository_capacity_ledger WHERE repository_id = 1`)).rows[0].admission_valid_until);
+    expect(after).toBe(before);
   });
 });
