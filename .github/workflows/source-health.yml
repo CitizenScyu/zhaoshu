@@ -12,14 +12,14 @@
 #   - 开/关 issue 用的是 Actions 自带的短期 token（下方 `${{ github.token }}`，等价于
 #     `GITHUB_TOKEN`），由平台自动注入、随 job 结束失效，无需用户配置、不是仓库 Secret。
 #
-# 阈值必须与 src/lib/source-health.ts 里的常数一致（改 cron 计划时两处一起改）。
-# Vercel Hobby 限「每条 cron 每天最多触发一次」，三条 cron 的间隔均为 24h，阈值 = 24h + 2h 容差：
+# 阈值必须与 src/lib/source-health.ts 里的常数一致（改 timer 计划时两处一起改）。
+# 调度唯一来源是 phoenix 的 systemd timer（deploy/phoenix/，vercel.json 已无 crons）：
 #   SHUYUAN_REFRESH_ALERT_HOURS = 26 —— shuyuan 每日一次 + 2h 容差
-#   CRON_ALERT_HOURS           = 26 —— reclaim / drain 每日一次 + 2h 容差
+#   CRON_ALERT_HOURS           = 26 —— reclaim / drain 每日一次 + 2h 容差；followup 每 0.5h 一次（26 远大于 0.5）
 #   ADMISSION_ALERT_HOURS      = 30 —— admission 一天两轮（02:00 刷新尾部 / 14:00 独立轮，任一成功
 #                                        即刷新成功行），30h = 一轮整体失败后的最坏间隔 24h + 漂移余量；
 #                                        一轮失败不告警，两轮都失败才告警（42-admhealth）。
-# 离线门禁 src/lib/vercel-cron.test.ts 会按 vercel.json 真算间隔比对这几组常数，脱节即红（防漏改）。
+# 离线门禁 src/lib/vercel-cron.test.ts 会按 deploy/phoenix 的 OnCalendar 真算间隔比对这几组常数，脱节即红（防漏改）。
 name: Source health probe
 
 on:

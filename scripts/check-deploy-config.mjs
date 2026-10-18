@@ -363,7 +363,7 @@ if (isMain) {
     process.exit(1);
   }
   console.log(
-    `✔ check-deploy-config：vercel.json 合法、cron 每条 ≤${MAX_CRON_RUNS_PER_DAY} 次/日且路由存在并导出 GET、` +
+    `✔ check-deploy-config：vercel.json 合法（无 crons 时早退放行；调度以 phoenix timer 为准，见 deploy/phoenix/）、` +
       `maxDuration ≤${MAX_FUNCTION_SECONDS}s 且大于路由内部预算、未关构建类型门。`,
   );
 }

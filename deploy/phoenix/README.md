@@ -16,6 +16,7 @@
 | `zhaoshu-cron-shuyuan.service` / `.timer` | 同名 |
 | `zhaoshu-cron-reclaim.service` / `.timer` | 同名 |
 | `zhaoshu-cron-drain.service` / `.timer` | 同名 |
+| `zhaoshu-cron-followup.service` / `.timer` | 同名 |
 | `zhaoshu-admission.service` / `.timer` | 同名 |
 | `zhaoshu-admission.service.d/70-scan5.conf` | `/etc/systemd/system/zhaoshu-admission.service.d/70-scan5.conf` |
 | `cron-call.sh` | `/usr/local/lib/zhaoshu/cron-call.sh` |
@@ -24,6 +25,10 @@
 单元文件里**没有任何密钥真值**：`EnvironmentFile=/etc/zhaoshu-web/env` 与
 `/etc/zhaoshu-shuyuan/env` 一律保持引用形式，`CRON_SECRET` 由 cron-call.sh 从环境读取、
 经 curl 的 stdin 传入，不进 argv 也不进 journal。
+
+cron-call.sh 用法：`cron-call.sh <路由路径> [max-time 秒，默认 330] [HTTP 方法，默认 GET]`；
+第 3 参数是 2026-10-18 追更上线时加的（`/api/followup` 只导出 POST，GET 会 405），
+旧调用点不传第 3 参数即保持 GET，行为不变。
 
 ## timer 与告警阈值对照
 
@@ -36,6 +41,7 @@ crons5 删除，见下）。阈值常量在 `src/lib/source-health.ts`，**不�
 | `zhaoshu-cron-shuyuan.timer` | `*-*-* 10:00:00 Asia/Shanghai` | 24h | `cron-call.sh /api/shuyuan 330` | `SHUYUAN_REFRESH_ALERT_HOURS` |
 | `zhaoshu-cron-reclaim.timer` | `*-*-* 05:00:00 Asia/Shanghai` | 24h | `cron-call.sh /api/download/reclaim 60` | `CRON_ALERT_HOURS` |
 | `zhaoshu-cron-drain.timer` | `*-*-* 05:30:00 Asia/Shanghai` | 24h | `cron-call.sh /api/profile/absorb/drain 330` | `CRON_ALERT_HOURS` |
+| `zhaoshu-cron-followup.timer` | `*:0/30` | 0.5h | `cron-call.sh /api/followup 60 POST` | `CRON_ALERT_HOURS` |
 | `zhaoshu-admission.timer` | `*-*-* 00/1:17:00 UTC` | 1h | `refresh-runner.mjs --admission` | `ADMISSION_ALERT_HOURS` |
 
 **不变量：告警阈值必须 > 实际触发间隔**，否则正常运行就会误报。该不变量由

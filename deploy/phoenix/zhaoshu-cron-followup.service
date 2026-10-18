@@ -1,0 +1,16 @@
+[Unit]
+Description=zhaoshu cron followup (POST /api/followup via loopback)
+After=zhaoshu-web.service
+
+[Service]
+Type=oneshot
+User=zsweb
+Group=zsweb
+EnvironmentFile=/etc/zhaoshu-web/env
+ExecStart=/usr/local/lib/zhaoshu/cron-call.sh /api/followup 60 POST
+TimeoutStartSec=120
+Nice=10
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true

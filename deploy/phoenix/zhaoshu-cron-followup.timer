@@ -1,0 +1,10 @@
+[Unit]
+Description=zhaoshu cron followup timer (every 30min)
+
+[Timer]
+OnCalendar=*:0/30
+RandomizedDelaySec=5min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

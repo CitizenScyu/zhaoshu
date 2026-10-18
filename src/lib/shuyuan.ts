@@ -108,7 +108,8 @@ export const RESPONSE_TIMEOUT_MS = 12_000;
 // 占位下轮续测，刷新本身不被挤挂）仍留余量给替换事务与写库；route maxDuration=295s
 // 平台上限内（41-ADMIT-THROUGHPUT：264s 最坏总墙钟 < 295s，25 源会顶破故默认 20）。
 export const REFRESH_BUDGET_MS = 180_000;
-// 42-admbudget：独立准入轮（/api/shuyuan/admission，vercel.json `0 14 * * *`，与 02 点刷新错开 12h）自带的整份预算。
+// 42-admbudget：独立准入轮（/api/shuyuan/admission，现为冷备路由——vercel.json 的独立轮 cron
+// 已删，调度以 phoenix timer 为准，现网准入是 admrunner42 runner，见 deploy/phoenix/README.md）自带的整份预算。
 // 路由 maxDuration=295s；读源表 + 批次 + 写回 + 刷 host 门 + 发布源池产物都在本预算内，留 55s 给 ensureSchema、
 // 租约与平台余量。批次内 canProbe 照旧按 ADMISSION_PROBE_WORST_MS + WRITE_RESERVE_MS 逐探止损。
 export const ADMISSION_ROUND_BUDGET_MS = 240_000;
