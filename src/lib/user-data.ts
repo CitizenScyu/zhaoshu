@@ -68,16 +68,27 @@ export function recommendationsForUserQuery(
   const readTaskJoin = canRead ? sql`LEFT JOIN (
       SELECT lower(btrim(title)) AS title_key,
         lower(COALESCE(NULLIF(btrim(author), ''), '佚名')) AS author_key,
-        max(id) AS read_task_id
+        max(id) AS read_task_id,
+        (array_agg(updated_at ORDER BY id DESC))[1] AS read_task_at
       FROM download_tasks WHERE status = 'done'
       GROUP BY lower(btrim(title)), lower(COALESCE(NULLIF(btrim(author), ''), '佚名'))
     ) dt ON dt.title_key = lower(btrim(b.title))
       AND dt.author_key = lower(COALESCE(NULLIF(btrim(b.author), ''), '佚名'))` : sql``;
+  // zhuigeng42「有更新」徽标：这本书**最新那版全文**发布得比该用户最后一次阅读进度更新。
+  // 阅读进度项的 item_key 形如 progress:novel-finder-reading-progress-u<uid>-<taskId>（user-scope.ts），
+  // 所以「读过这本书某一版」由它与 done 任务 id 的对应关系表达；用户从未读过这版时该子查询为空，
+  // 落到 '-infinity' ⇒ 有更新为真（刚下载完还没打开，正该提示）。
+  const hasUpdate = canRead ? sql`(dt.read_task_at IS NOT NULL AND dt.read_task_at > COALESCE((
+      SELECT max(s.updated_at) FROM reader_sync_state s
+      WHERE s.user_id = ${userId}
+        AND s.item_key = 'progress:novel-finder-reading-progress-u' || ${userId}::text || '-' || dt.read_task_id::text
+    ), '-infinity'::timestamptz))` : sql`false`;
   return sql`SELECT * FROM (
       SELECT DISTINCT ON (r.book_id)
         r.id, r.book_id, r.query, r.match_score, r.hit_likes, r.risks, r.reason, r.status, r.created_at,
         b.title, b.author, b.douban_id, b.douban_rating, b.douban_rating_count, b.meta,
         ${readTask} AS read_task_id,
+        ${hasUpdate} AS has_update,
         COALESCE((SELECT f.note FROM feedback f WHERE f.book_id = r.book_id AND f.user_id = ${userId}
           ORDER BY f.id DESC LIMIT 1), '') AS note,
         COALESCE((SELECT f.id FROM feedback f WHERE f.book_id = r.book_id AND f.user_id = ${userId}
