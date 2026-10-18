@@ -322,7 +322,7 @@ maybe('书架「有更新」徽标：真库上的真假两例', () => {
   let shelfBook = 0;
   let followupTask = 0;
   const runShelf = async (userId: number, canRead: boolean) => {
-    const { text, params } = recommendationsForUserQuery(shelfSql, userId, canRead) as Statement;
+    const { text, params } = recommendationsForUserQuery(shelfSql, userId, canRead) as unknown as Statement;
     return (await pg.query(text, params)).rows as { book_id: number; read_task_id: number | null; has_update: boolean }[];
   };
 

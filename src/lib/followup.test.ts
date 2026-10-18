@@ -13,7 +13,7 @@ import type { ReaderIndex } from './reader-types';
 
 function indexOf(titles: string[]): ReaderIndex {
   return {
-    taskId: null, title: '追更测试书', author: '作者', version: 'v1', totalBytes: 0, source: null,
+    taskId: null, title: '追更测试书', author: '作者', version: 'v1', totalBytes: 0, source: undefined,
     chapters: titles.map((title, index) => ({ index, title, startByte: 0, endByte: 0, partCount: 1 })),
   };
 }
