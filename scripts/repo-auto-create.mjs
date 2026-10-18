@@ -48,6 +48,10 @@
 //   探针用 GitHub **实时** size 对 85%×目标,运行期 decide 用台账**滞后且偏小**的 size 对 100%×目标,
 //   故探针必然先于 decide 触发——不留「decide 已切、探针还 below-threshold」的死锁窗口。
 //   旧逻辑口径的 used/threshold/exceeded 一并进 probe-result 日志(observation 前缀),只作对照不判定。
+//   注: --target-bytes 现在**只是被接受并打进日志**(cfgTargetBytes),不再参与任何判定——
+//   逻辑观测目标取的是各仓台账行自己的 target_bytes 列,不是这个参数;新仓台账行的 target_bytes
+//   也仍是 INSERT 里写死的 10^9(既有行为,本次未改)。保留该参数只为不让仍在传它的老 unit 撞
+//   「未知参数」;要调门槛请改台账 target_compressed_bytes 列或传 --compressed-target-bytes。
 
 import { neon } from '@neondatabase/serverless';
 
