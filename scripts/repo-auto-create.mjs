@@ -145,6 +145,22 @@ export function selectActiveRepository(rows, now) {
   return { status: 'blocked', reason: 'no eligible writable repository' };
 }
 
+/**
+ * 备仓判定（repofix42 幂等护栏的纯函数形态）：剔除现役行后对其余候选重跑
+ * selectActiveRepository。返回 ok 即存在合格备仓——main 据此 noop 退出(successor-ready)、
+ * 不再重复建仓（books-2-2..books-2-9 重复造仓的根因修复）；blocked 即无备仓，走建仓路径。
+ * liftCapacityLedger 给新仓 registered=0 且 granted，故新仓必过全部门禁。
+ *
+ * @param {Array<Record<string, unknown>>} rows 同 selectActiveRepository 的候选行
+ * @param {number} activeRepositoryId 现役仓 id；非法（非正整数）即抛——失败关闭，不猜
+ * @param {Date} now 显式时钟（同 selectActiveRepository，不读真实时间）
+ */
+export function selectSuccessor(rows, activeRepositoryId, now) {
+  const id = Number(activeRepositoryId);
+  if (!Number.isSafeInteger(id) || id <= 0) throw new Error(`activeRepositoryId 非法: ${activeRepositoryId}`);
+  return selectActiveRepository(rows.filter(row => Number(row.id) !== id), now);
+}
+
 /** 读候选（与 runtime-download/entry.ts:210 的 createRolloverEvidencePort 同一组列），再按判据选现役仓。 */
 export async function resolveActiveRepository(sql, now) {
   const rows = await sql`
@@ -235,6 +251,17 @@ async function createRepo(token, name) {
 async function repoExists(token, owner, repo) {
   const res = await ghFetch(token, 'GET', `/repos/${owner}/${repo}`);
   return res.ok;
+}
+
+async function ignoreRepo(token, owner, repo) {
+  // GitHub 默认自动 watch 新建仓库,20 worker 高频 push 会刷爆账号邮箱;
+  // 建仓成功后立刻把自己设为 ignored(best-effort,失败不阻断建仓流程)
+  try {
+    const res = await ghFetch(token, 'PUT', `/repos/${owner}/${repo}/subscription`, { ignored: true });
+    if (res.status !== 202) console.log(JSON.stringify({ phase: 'note', what: 'auto-ignore', repo: `${owner}/${repo}`, status: res.status, outcome: 'ignored-not-set' }));
+  } catch (err) {
+    console.log(JSON.stringify({ phase: 'note', what: 'auto-ignore', repo: `${owner}/${repo}`, outcome: 'failed-nonfatal', error: String(err && err.message).slice(0, 120) }));
+  }
 }
 
 async function findNextName(token, owner, baseRepo) {
@@ -331,6 +358,29 @@ async function main() {
     return;
   }
 
+  // 幂等护栏（repofix42）: 阈值已超但备仓已就绪 → noop 退出 0,不再建新仓。
+  // 否则探针每小时都会重复造仓(books-2-2..books-2-9 的根因)。设计意图是探针在 85%
+  // 处先于 decide 的 100% 切仓把下一个仓建好;建好之后到真正切仓之间的每一轮探针都应 noop。
+  // 仅现役模式(activeRepositoryId 非空)可判;legacy --current= 模式行为逐字不变。
+  if (activeRepositoryId !== null) {
+    // 与 resolveActiveRepository 同一条 SQL,须同步维护;selectSuccessor 剔除现役行后重选,
+    // 返回 ok 即存在合格备仓(liftCapacityLedger 给新仓 registered=0 且 granted,必过全部门禁)。
+    const rows = await sql`
+      SELECT r.id, r.owner, r.repo, r.branch, r.enabled, r.is_private, r.read_only, r.sealed_at,
+             l.state AS ledger_state, l.baseline_epoch, l.target_bytes,
+             l.registered_bytes, l.reserved_bytes,
+             l.admission_status, l.admission_version, l.admission_valid_until, l.admission_target
+      FROM storage_repositories r
+      LEFT JOIN repository_capacity_ledger l ON l.repository_id = r.id
+      ORDER BY r.id ASC`;
+    const successor = selectSuccessor(rows, activeRepositoryId, new Date());
+    if (successor.status === 'ok') {
+      console.log(JSON.stringify({ phase: 'done', status: 'successor-ready',
+        successor: `${successor.repository.owner}/${successor.repository.repo}`, metric }));
+      return;
+    }
+  }
+
   const nextName = await findNextName(cfg.token, owner, repo);
   console.log(JSON.stringify({ phase: 'plan', nextRepo: `${owner}/${nextName}`, branch: cur.defaultBranch, metric }));
 
@@ -340,6 +390,7 @@ async function main() {
   }
 
   await createRepo(cfg.token, nextName);
+  await ignoreRepo(cfg.token, owner, nextName);
   const rows = await registerStorageRepo(sql, owner, nextName, cur.defaultBranch);
   const id = rows[0]?.id ?? null;
   if (id === null) {

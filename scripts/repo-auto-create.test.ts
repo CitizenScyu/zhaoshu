@@ -8,7 +8,7 @@
 import { describe, expect, it } from 'vitest';
 import { decideRepositoryForPublication } from '../runtime-download/repository-rollover-wiring';
 import type { RepositoryCandidate } from '../runtime-download/repository-rollover';
-import { evaluateThreshold, parseArgs, resolveActiveRepository, selectActiveRepository } from './repo-auto-create.mjs';
+import { evaluateThreshold, parseArgs, resolveActiveRepository, selectActiveRepository, selectSuccessor } from './repo-auto-create.mjs';
 
 const NOW = new Date('2026-10-15T00:00:00Z');
 const FUTURE = '2099-01-01T00:00:00.000Z';
@@ -150,6 +150,40 @@ describe('selectActiveRepository：盯台账现役仓，不盯写死值', () => 
       repo({ id: 2, repo: 'zhaoshu-books-2', admission_target: { repositoryId: 2, branch: 'main' } }),
     ];
     expect(selectActiveRepository(rows, NOW)).toMatchObject({ status: 'ok', repository: { id: 2 } });
+  });
+});
+
+describe('selectSuccessor：repofix42 幂等护栏（阈值已超但备仓就绪 → 不重复建仓）', () => {
+  it('有合格备仓 → 返回该备仓（main 据此 successor-ready 退出 0，不再建仓）', () => {
+    const rows = [
+      repo({ id: 1, repo: 'zhaoshu-books', registered_bytes: TARGET_BYTES, admission_target: { repositoryId: 1, branch: 'main' } }),
+      repo({ id: 2, repo: 'zhaoshu-books-2', registered_bytes: BigInt(900_000_000), admission_target: { repositoryId: 2, branch: 'main' } }),
+      repo({ id: 3, repo: 'zhaoshu-books-3', registered_bytes: BigInt(0), admission_target: { repositoryId: 3, branch: 'main' } }),
+    ];
+    expect(selectSuccessor(rows, 2, NOW)).toMatchObject({ status: 'ok', repository: { id: 3, repo: 'zhaoshu-books-3' } });
+  });
+
+  it('无备仓 → blocked（走建仓路径的信号）：剔除现役行后其余全不合格', () => {
+    const rows = [
+      repo({ id: 1, repo: 'zhaoshu-books', sealed_at: '2026-10-13T08:21:00Z', admission_target: { repositoryId: 1, branch: 'main' } }),
+      repo({ id: 2, repo: 'zhaoshu-books-2', registered_bytes: BigInt(900_000_000), admission_target: { repositoryId: 2, branch: 'main' } }),
+      repo({ id: 3, repo: 'zhaoshu-books-3', ledger_state: 'uninitialized', admission_target: { repositoryId: 3, branch: 'main' } }),
+    ];
+    const outcome = selectSuccessor(rows, 2, NOW);
+    expect(outcome.status).toBe('blocked');
+    expect(outcome).not.toHaveProperty('repository');
+  });
+
+  it('现役行是唯一合格仓时也绝不回选它自己（剔除语义是护栏存在的意义）', () => {
+    const rows = [repo({ id: 2, repo: 'zhaoshu-books-2', admission_target: { repositoryId: 2, branch: 'main' } })];
+    expect(selectSuccessor(rows, 2, NOW).status).toBe('blocked');
+  });
+
+  it('activeRepositoryId 非法 → 抛错失败关闭；剔除后空候选 → blocked', () => {
+    expect(() => selectSuccessor([repo()], 0, NOW)).toThrow(/activeRepositoryId/);
+    expect(() => selectSuccessor([repo()], -1, NOW)).toThrow(/activeRepositoryId/);
+    expect(() => selectSuccessor([repo()], Number.NaN, NOW)).toThrow(/activeRepositoryId/);
+    expect(selectSuccessor([], 1, NOW)).toMatchObject({ status: 'blocked', reason: 'no registered repositories' });
   });
 });
 
