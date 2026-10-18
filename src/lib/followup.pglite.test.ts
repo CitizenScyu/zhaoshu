@@ -8,8 +8,9 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { loadPGlite, type PGliteLike } from '@/lib/fixtures/pglite';
-import { createPGliteSql } from '@/lib/fixtures/pglite-sql';
+import { createPGliteClient, createPGliteSql } from '@/lib/fixtures/pglite-sql';
 import { createProductionSchema, seedProductionMembers } from '@/lib/fixtures/production-schema';
+import { applyMigration, loadMigrations } from '../../scripts/db-migration-lib.mjs';
 import {
   claimFollowupLease, followupCandidatesQuery, followupPrefixKey, processFollowupCandidate,
   type FollowupCandidate, type FollowupProbeOutcome,
@@ -110,6 +111,37 @@ async function stateOf(bookId: number) {
 
 const probe = (titles: string[]): FollowupProbeOutcome => ({ ok: true, titles });
 const failed: FollowupProbeOutcome = { ok: false, titles: [], reason: 'source_unavailable' };
+
+maybe('0007 本地干跑：迁移链跑到 0007，重跑是空转', () => {
+  let pg: PGliteLike;
+
+  beforeAll(async () => {
+    pg = new PGliteCtor!();
+  }, 60_000);
+  afterAll(() => pg.close());
+
+  it('db:migrate 走到 0007 并建出状态表与到期索引；再跑一次全部 unchanged', async () => {
+    const client = createPGliteClient(pg);
+    const migrations = await loadMigrations();
+    const first = await applyMigration(client, migrations);
+    expect(first.status).toBe('applied');
+    expect(first.versions.at(-1)).toMatchObject({ version: 7, name: '0007_followup_probe_state.sql', status: 'applied' });
+    const columns = (await pg.query(
+      `SELECT column_name FROM information_schema.columns WHERE table_name = 'followup_probe_state' ORDER BY column_name`))
+      .rows.map((row) => row.column_name);
+    expect(columns).toEqual([
+      'book_id', 'consecutive_no_new', 'created_at', 'last_chapter_count', 'last_enqueued_task_id',
+      'last_probe_at', 'last_toc_prefix_hash', 'next_probe_at', 'updated_at',
+    ]);
+    expect((await pg.query(
+      `SELECT indexname FROM pg_indexes WHERE tablename = 'followup_probe_state' AND indexname = 'followup_probe_state_due_idx'`)).rows)
+      .toHaveLength(1);
+
+    const second = await applyMigration(client, migrations);
+    expect(second.status).toBe('unchanged');
+    expect(second.versions.every((item) => item.status === 'unchanged')).toBe(true);
+  }, 120_000);
+});
 
 maybe('追更轮：真库上的候选 / 判定 / 入队 / 退避', () => {
   beforeAll(async () => {
