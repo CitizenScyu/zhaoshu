@@ -115,22 +115,26 @@ describe('measureRepositoryCompressedBytes：size 是 KiB，取不到就抛（�
     ), repo)).toBe(BigInt(1_073_741_824));
   });
 
+  // 每条 json() 都显式标返回类型：不标的话 tsc 在 it.each 的元组推断里会报 TS7023（隐式 any）。
+  const body = (v: unknown) => async (): Promise<unknown> => v;
   it.each([
-    [{ status: 200, json: async () => ({}) }, /size missing or invalid/],
-    [{ status: 200, json: async () => ({ size: null }) }, /size missing or invalid/],
-    [{ status: 200, json: async () => ({ size: '1024' }) }, /size missing or invalid/],
-    [{ status: 200, json: async () => ({ size: -1 }) }, /size missing or invalid/],
-    [{ status: 200, json: async () => ({ size: 1.5 }) }, /size missing or invalid/],
-    [{ status: 200, json: async () => ({ size: Number.NaN }) }, /size missing or invalid/],
-    [{ status: 200, json: async () => ({ size: Number.POSITIVE_INFINITY }) }, /size missing or invalid/],
-    [{ status: 200, json: async () => null }, /malformed repo body/],
-    [{ status: 200, json: async () => 'nope' }, /malformed repo body/],
-    [{ status: 404, json: async () => ({ message: 'Not Found' }) }, /GITHUB_REPO_HTTP_404/],
-    [{ status: 403, json: async () => ({ message: 'rate limited' }) }, /GITHUB_REPO_HTTP_403/],
-    [{ status: 500, json: async () => ({}) }, /GITHUB_REPO_HTTP_500/],
-    [{ json: async () => ({ size: 1 }) }, /malformed response envelope/],
-    [{ status: '200', json: async () => ({ size: 1 }) }, /malformed response envelope/],
-    [{ status: 99, json: async () => ({ size: 1 }) }, /malformed response envelope/],
+    [{ status: 200, json: body({}) }, /size missing or invalid/],
+    [{ status: 200, json: body({ size: null }) }, /size missing or invalid/],
+    [{ status: 200, json: body({ size: '1024' }) }, /size missing or invalid/],
+    [{ status: 200, json: body({ size: -1 }) }, /size missing or invalid/],
+    [{ status: 200, json: body({ size: 1.5 }) }, /size missing or invalid/],
+    [{ status: 200, json: body({ size: Number.NaN }) }, /size missing or invalid/],
+    [{ status: 200, json: body({ size: Number.POSITIVE_INFINITY }) }, /size missing or invalid/],
+    [{ status: 200, json: body(null) }, /malformed repo body/],
+    [{ status: 200, json: body('nope') }, /malformed repo body/],
+    [{ status: 200, json: body([1, 2]) }, /size missing or invalid/],
+    [{ status: 404, json: body({ message: 'Not Found' }) }, /GITHUB_REPO_HTTP_404/],
+    [{ status: 403, json: body({ message: 'rate limited' }) }, /GITHUB_REPO_HTTP_403/],
+    [{ status: 500, json: body({}) }, /GITHUB_REPO_HTTP_500/],
+    [{ json: body({ size: 1 }) }, /malformed response envelope/],
+    [{ status: '200', json: body({ size: 1 }) }, /malformed response envelope/],
+    [{ status: 99, json: body({ size: 1 }) }, /malformed response envelope/],
+    [{ status: 200.5, json: body({ size: 1 }) }, /malformed response envelope/],
   ])('坏响应 %j ⇒ 抛', async (res, message) => {
     await expect(measureRepositoryCompressedBytes(requestReturning(res), repo)).rejects.toThrow(message);
   });
@@ -149,7 +153,8 @@ maybe('runSync（PGlite 真表 + 合成 GitHub 桩）', () => {
   let pg: PGliteLike;
   let sql: ReturnType<typeof createPGliteSql>;
 
-  type StubBody = { truncated?: boolean, tree?: unknown[], size?: number } | Error;
+  // size 声明为 unknown：失败关闭用例要能造 null / 字符串 / 负数等非法值。
+  type StubBody = { truncated?: boolean, tree?: unknown[], size?: unknown } | Error;
   /**
    * 压缩口径桩（repothresh44）：`GET /repos/{owner}/{repo}` 的 size 单位是 **KiB**。
    * 单列一张表并由 stubRequest 兜底，好让既有树用例不必逐条重复声明 size 路由；

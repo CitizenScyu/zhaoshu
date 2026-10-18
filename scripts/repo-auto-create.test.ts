@@ -496,6 +496,8 @@ describe('resolveActiveRepository（PGlite 真表）', () => {
         githubSizeBytes: BigInt(1_024_000_000), targetCompressedBytes: BigInt(5_368_709_120),
       });
       const accounting = active.accounting;
+      // 收窄掉 optional（tsc：evaluateThreshold 收 null 不收 undefined）；真缺就是夹具坏了，直接炸。
+      if (accounting === undefined) throw new Error('夹具不变量：status=ok 必带 accounting');
       // 每仓用自己的 target_compressed_bytes：1,000,000 KiB = 1,024,000,000 B < 85%×5GiB ⇒ 不建仓。
       const own = evaluateThreshold({ thresholdPct: 85, sizeKib: 1_000_000, compressedTargetBytes: accounting.targetCompressedBytes, accounting });
       expect(own.exceeded).toBe(false);
