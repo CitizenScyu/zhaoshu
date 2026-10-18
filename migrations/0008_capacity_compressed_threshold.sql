@@ -22,6 +22,11 @@
 --
 -- 语义边界：
 --   - target_bytes 保留只读作历史（旧逻辑口径），不再参与任何切仓判定；
+--   - 这两列的消费方共四处，必须与本迁移同批上线：预留门 capacity_gate
+--     （src/lib/artifact-capacity.ts）、运行期 decide（runtime-download/repository-rollover.ts）、
+--     探针（scripts/repo-auto-create.mjs）、每小时同步（scripts/sync-ledger-capacity.mjs）。
+--     **0008 未跑就部署本代码 ⇒ 发布全断**：预留门读不到列会让整笔预留事务报错回滚，
+--     这不是降级而是硬失败，故部署顺序是「先 0008、后代码」；
 --   - admission_* 一律不碰（F1 准入续期语义归 scripts/sync-ledger-capacity.mjs）；
 --   - 回填**不推进 updated_at**：该列的语义是「最近一轮成功核对的时刻」（F1 用它做时间戳），
 --     迁移种值不是一次核对，推进它等于伪造核对证据。
