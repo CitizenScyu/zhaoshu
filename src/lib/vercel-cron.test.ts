@@ -31,11 +31,26 @@ function directiveValues(unit: string, key: string): string[] {
  * `OnCalendar=` → 触发间隔（小时）。**只支持本仓实际在用的三种写法**，其余一律抛错：
  *   `*-*-* HH:MM:SS <TZ>`      每日一次 → 24h
  *   `*-*-* HH/M:MM:SS <TZ>`    每 M 小时一次 → M h（如准点的 `*-*-* 00/1:17:00 UTC`）
- * 段数、字面量以外的语法（列表、区间、`*~` 等）都属「解析不了」—— 抛错让用例红，
- * 绝不静默跳过：静默跳过等于把新写的计划放出门禁，正是本门禁要防的事。
+ *   `*:0/S`                    每 S 分钟一次（整点起等步进）→ S/60 h（如 `*:0/30` → 0.5）
+ * 段数、字面量以外的语法（列表、区间、`*~`、非整点起的分钟步进 `*:15/10` 等）都属
+ * 「解析不了」—— 抛错让用例红，绝不静默跳过：静默跳过等于把新写的计划放出门禁，
+ * 正是本门禁要防的事。
  */
-function intervalHoursFromOnCalendar(expr: string): number {
+export function intervalHoursFromOnCalendar(expr: string): number {
   const parts = expr.trim().split(/\s+/);
+  if (parts.length === 1) {
+    // 第三种形态：`*:0/S`（小时段 `*`、分钟段 `0/S`，S=1..59）。只认从整点 0 分起的等步进，
+    // 其他分钟写法（`*:15/10` 等）照旧抛错——它们的首次触发时刻与步进的关系需要另算，不猜。
+    const minuteStep = /^\*:(\d{1,2})\/(\d{1,2})$/.exec(parts[0]);
+    if (!minuteStep) {
+      throw new Error(`OnCalendar 解析不了：\`${expr}\`。本门禁只认 \`*-*-* HH:MM:SS [TZ]\`、\`*-*-* HH/M:MM:SS [TZ]\` 与 \`*:0/S\``);
+    }
+    const minute = Number(minuteStep[1]);
+    const step = Number(minuteStep[2]);
+    if (minute !== 0) throw new Error(`OnCalendar 分钟步进只认从整点起的 \`*:0/S\`，收到 \`${parts[0]}\`（完整表达式：${expr}）`);
+    if (minute > 59 || step < 1 || step > 59) throw new Error(`OnCalendar 的分钟步进越界：${parts[0]}`);
+    return step / 60;
+  }
   if (parts[0] !== '*-*-*') {
     throw new Error(`OnCalendar 的日期段只支持 \`*-*-*\`，收到 \`${parts[0]}\`（完整表达式：${expr}）`);
   }
@@ -78,6 +93,7 @@ const TIMERS: TimerSpec[] = [
   { timer: 'zhaoshu-cron-shuyuan.timer', alertHours: SHUYUAN_REFRESH_ALERT_HOURS, route: '/api/shuyuan' },
   { timer: 'zhaoshu-cron-reclaim.timer', alertHours: CRON_ALERT_HOURS, route: '/api/download/reclaim' },
   { timer: 'zhaoshu-cron-drain.timer', alertHours: CRON_ALERT_HOURS, route: '/api/profile/absorb/drain' },
+  { timer: 'zhaoshu-cron-followup.timer', alertHours: CRON_ALERT_HOURS, route: '/api/followup' },
   { timer: 'zhaoshu-admission.timer', alertHours: ADMISSION_ALERT_HOURS, runnerFragments: ['refresh-runner.mjs', '--admission'] },
 ];
 
@@ -92,6 +108,32 @@ describe('vercel.json 不得再有 crons（调度唯一来源 = phoenix timer）
         '（同一轮探测/回收写两遍库、扣两遍预算、cron_health 被两个来源交替刷新，判龄失去意义）。' +
         '调度唯一来源是 deploy/phoenix/zhaoshu-cron-*.timer 与 zhaoshu-admission.timer。',
     ).toEqual(0);
+  });
+});
+
+describe('intervalHoursFromOnCalendar：`*:0/S` 分钟步进形态（syncph42）', () => {
+  it('`*:0/30` → 0.5h，26h 阈值 > 0.5h 间隔（followup timer 的实际形态）', () => {
+    expect(intervalHoursFromOnCalendar('*:0/30')).toBe(0.5);
+    expect(CRON_ALERT_HOURS).toBeGreaterThan(intervalHoursFromOnCalendar('*:0/30'));
+  });
+
+  it('`*:0/59` → 59/60h（合法区间上界）；`*:0/1` → 1/60h（下界）', () => {
+    expect(intervalHoursFromOnCalendar('*:0/59')).toBeCloseTo(59 / 60);
+    expect(intervalHoursFromOnCalendar('*:0/1')).toBeCloseTo(1 / 60);
+  });
+
+  it('非整点起的分钟步进（`*:15/10`）抛错——只认从整点 0 分起', () => {
+    expect(() => intervalHoursFromOnCalendar('*:15/10')).toThrow(/分钟步进只认从整点起/);
+  });
+
+  it('分钟步进越界（`*:0/60`）与非法写法（`*:30`、`*-*-* 01:00:00` 缺日段时的第三段乱写）照旧抛错', () => {
+    expect(() => intervalHoursFromOnCalendar('*:0/60')).toThrow(/越界/);
+    expect(() => intervalHoursFromOnCalendar('*:30')).toThrow(/解析不了/);
+  });
+
+  it('既有两种形态语义不变：`*-*-* 05:30:00 Asia/Shanghai` → 24h、`*-*-* 00/1:17:00 UTC` → 1h', () => {
+    expect(intervalHoursFromOnCalendar('*-*-* 05:30:00 Asia/Shanghai')).toBe(24);
+    expect(intervalHoursFromOnCalendar('*-*-* 00/1:17:00 UTC')).toBe(1);
   });
 });
 
