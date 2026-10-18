@@ -8,8 +8,9 @@
 --   比 GitHub 实际的压缩 pack 口径早约 2.6 倍触发（书仓 TXT 实测压缩≈逻辑 40%：books-2 逻辑
 --   1,000,307,484 B 对应压缩 397,520,896 B）。GitHub 的容量限制与 clone/push 性能都按压缩 pack 算，
 --   按逻辑字节切仓会在远未触到真实限制时就开新仓。新判据统一为
---   `github_size_bytes + 1 <= target_compressed_bytes`（默认 2GiB = 2147483648），
---   对 5GB 硬限留约 2.5 倍余量，仓数量约降为旧口径的 1/5。
+--   `github_size_bytes + 1 <= target_compressed_bytes`（默认 1GiB = 1073741824，用户 2026-10-19
+--   确认「1G 安全」收敛，不用 2GiB），严格贴合 GitHub 官方「仓 <1GB」建议线，对 5GB 硬限留约
+--   5 倍余量，仓数量约降为旧口径的 1/3。
 --
 -- 本文件**不建表**：repository_capacity_ledger 的 DDL 在 src/lib/artifact-capacity-schema.ts
 -- （initializeArtifactCapacitySchema），且它外键引用 storage_repositories——后者由
@@ -39,7 +40,7 @@
 
 ALTER TABLE IF EXISTS repository_capacity_ledger
   ADD COLUMN IF NOT EXISTS github_size_bytes bigint NOT NULL DEFAULT 0 CHECK (github_size_bytes >= 0),
-  ADD COLUMN IF NOT EXISTS target_compressed_bytes bigint NOT NULL DEFAULT 2147483648 CHECK (target_compressed_bytes > 0);
+  ADD COLUMN IF NOT EXISTS target_compressed_bytes bigint NOT NULL DEFAULT 1073741824 CHECK (target_compressed_bytes > 0);
 
 DO $$ BEGIN
   IF to_regclass('public.repository_capacity_ledger') IS NULL THEN

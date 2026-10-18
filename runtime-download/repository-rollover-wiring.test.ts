@@ -18,7 +18,7 @@ import {
 const NOW = new Date('2026-10-08T04:00:00.000Z');
 const FUTURE = '2026-12-31T00:00:00.000Z';
 const TARGET = BigInt(1_000_000_000); // 旧逻辑口径（十进制 1GB），repothresh44 起只作观测
-const COMPRESSED_TARGET = BigInt(2_147_483_648); // 新容量门槛：GitHub 压缩 2GiB
+const COMPRESSED_TARGET = BigInt(1_073_741_824); // 新容量门槛：GitHub 压缩 1GiB
 const SHA = 'a'.repeat(40);
 const CURRENT: RepositoryTuple = { id: 1, owner: 'citizen', repo: 'repo-1', branch: 'main' };
 const NEXT: RepositoryTuple = { id: 2, owner: 'citizen', repo: 'repo-2', branch: 'main' };
@@ -98,7 +98,7 @@ describe('capacity985 rollover wiring（合成端口）', () => {
   });
 
   it('rollover 路径：旧仓压缩 size 已满 ⇒ switch，新仓元组生效且闭包与 repositoryId 均属新仓', async () => {
-    const full = candidate({ id: 1, registered: TARGET, githubSize: COMPRESSED_TARGET }); // size+1 > 2GiB
+    const full = candidate({ id: 1, registered: TARGET, githubSize: COMPRESSED_TARGET }); // size+1 > 1GiB
     const fresh = candidate({ id: 2 });
     const outcome = await decideRepositoryForPublication(
       port([full, fresh]), wiringInput({ logicalBytes: BigInt(1) }),

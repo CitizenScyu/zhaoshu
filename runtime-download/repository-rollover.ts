@@ -10,13 +10,14 @@
 //   之前消费本决策（不能只换 DB id 而继续用旧仓闭包）。本片不实现接线。
 //
 // 量纲：全部字节量为非负 bigint，target>0。容量门槛（repothresh44，用户 2026-10-19 裁定）用
-// **GitHub 压缩 pack 字节**：githubSizeBytes + 1 <= targetCompressedBytes（默认 2GiB=2147483648，
+// **GitHub 压缩 pack 字节**：githubSizeBytes + 1 <= targetCompressedBytes（默认 1GiB=1073741824，
 // 十进制 1000000000 的旧 targetBytes 只作观测，不再参与判定）。理由：GitHub 的容量限制与
 // clone/push 性能都按压缩 pack 算，而书仓 TXT 压缩≈逻辑 40%（books-2 实测逻辑 1,000,307,484 B
-// 对压缩 397,520,896 B），按逻辑字节切仓会在远未触到真实限制时就开新仓（仓数量约 5 倍膨胀）。
+// 对压缩 397,520,896 B），按逻辑字节切仓会在远未触到真实限制时就开新仓（同样内容下仓数量约 3 倍膨胀）。
+// 1GiB 压缩目标严格贴合 GitHub 官方「仓 <1GB」建议线。
 // +1 = 「本次发布至少占 1 字节」，故正好装满（githubSizeBytes == target）的仓不合格。
 // githubSizeBytes 由 sync-ledger-capacity 每小时从 GitHub API 回写台账，**滞后且偏小**（gc/统计
-// 延迟），偏差方向是晚切不早切；对 5GB 硬限的 2.5 倍余量足以吸收一小时的增长。
+// 延迟），偏差方向是晚切不早切；对 5GB 硬限的约 5 倍余量足以吸收一小时的增长。
 // registeredLogicalBytes/reservedLogicalBytes 与压缩 size 量纲不同（逻辑 vs 压缩），不做混合投影；
 // 它们仍随证据一起校验（R2 绑定/版本/期限），并继续供预留层记账（logicalBytesToReserve）。
 //
@@ -67,7 +68,7 @@ export interface RepositoryCandidate extends RepositoryTuple {
   sealed: boolean;
   /** 旧**逻辑**字节口径目标（十进制 1e9）。repothresh44 起只作观测，不参与容量判定。 */
   targetBytes: bigint;
-  /** 容量门槛目标：GitHub 压缩 pack 字节（台账 target_compressed_bytes，默认 2GiB）。 */
+  /** 容量门槛目标：GitHub 压缩 pack 字节（台账 target_compressed_bytes，默认 1GiB）。 */
   targetCompressedBytes: bigint;
   /** 最近一次观测到的 GitHub 压缩 pack 字节（台账 github_size_bytes；滞后且偏小，见文件头）。 */
   githubSizeBytes: bigint;

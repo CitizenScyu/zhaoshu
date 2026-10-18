@@ -20,8 +20,8 @@ const FUTURE = '2026-12-31T00:00:00.000Z';
 const PAST = '2026-01-01T00:00:00.000Z';
 /** 旧逻辑口径目标：repothresh44 起只作观测，不参与容量门槛（仍必须为正，见输入校验）。 */
 const TARGET = BigInt(1_000_000_000);
-/** 新容量门槛目标：GitHub 压缩 pack 字节 2GiB。 */
-const COMPRESSED_TARGET = BigInt(2_147_483_648);
+/** 新容量门槛目标：GitHub 压缩 pack 字节 1GiB。 */
+const COMPRESSED_TARGET = BigInt(1_073_741_824);
 const SHA = 'a'.repeat(40); // 合法 git blob sha40 合成值
 
 function tuple(id: number, repo = `repo-${id}`): RepositoryTuple {

@@ -54,7 +54,7 @@ function candidateRow(over: Record<string, unknown> = {}): Record<string, unknow
     enabled: true, is_private: true, read_only: false, sealed_at: null,
     ledger_state: 'ready', baseline_epoch: 'epoch-v1', target_bytes: '1000000000',
     registered_bytes: '0', reserved_bytes: '0',
-    github_size_bytes: '0', target_compressed_bytes: '2147483648',
+    github_size_bytes: '0', target_compressed_bytes: '1073741824',
     admission_status: 'granted', admission_version: 'adm-1',
     admission_valid_until: '2099-12-31T00:00:00.000Z',
     admission_target: { repositoryId: 17, branch: 'main' },
