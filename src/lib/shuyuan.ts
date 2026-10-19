@@ -667,7 +667,25 @@ async function engineReadingSources(
  *   - 旧形态孤儿 `NOT EXISTS(精确键在表)`：真实库里 source_url 恒 = norm(bookSourceUrl)，单靠上两条在真实数据上会
  *     退化成「纯归一化相等」，分不开「同条目旧形态」与「host 相同但另一条目」——biquge001 型反例判据恒等放行。
  *     这一条才把前者（救回 urlsuffix §1b 的 15 条）与后者（挡住 §1c 跨条目）区分开。
- * LATERAL + LIMIT 1 保证每条规则行至多配一条 admission 行（同 host 新旧键并存时**精确等值优先**），不膨胀。 */
+ * LATERAL + LIMIT 1 保证每条规则行至多配一条 admission 行（同 host 新旧键并存时**精确等值优先**），不膨胀。
+ *
+ * engsql45：三段判据一个没动，只改**计算方式**。原写法把归一化塞在 LATERAL 的 `OR` 里，优化器无法用
+ *   `source_admission_source_url_key` 索引，只能对 5847 源 × 363 ok 行逐对做两层 regexp_replace + jsonb 抽取
+ *   （生产只读实测 3.6–7.3 秒，冷缓存 36 秒）。这条查询长期占住 shim 连接池（POOL_MAX=15）的槽，
+ *   3–4 个并发就把池占满 → 下载 worker 拿不到连接 → shim 返 503 → 任务 failed / 批次变僵尸 / done 停摆。
+ *   改法：`OR` 的归一化分支只在「供判行是旧形态孤儿」时才可能命中，而孤儿 ok 行生产实测只有 25 行
+ *   （includePhoenixOk=true；false 时 9 行）。于是先把孤儿集合**物化**出来（`orphan_ok`），
+ *   让它按归一化键与源表做等值 hash join（`orphan_match`，实测命中 55 行），再让结果参与 LATERAL 的等值分支：
+ *     精确分支  ad.source_url = k.source_url        → 仍走 source_admission_source_url_key 索引
+ *     孤儿分支  om.id = k.id（orphan_match 已算好） → 扫 ≤55 行的物化集合
+ *   两分支 UNION ALL 后仍按 `is_exact DESC, search_checked_at DESC NULLS LAST` 取 LIMIT 1 ＝ 原全序
+ *   （原 ORDER BY 的 `(ad.source_url = src.source_url)` 在孤儿分支恒为 FALSE：孤儿定义就是精确键不在表，
+ *   而 src.source_url 在表 ⇒ 两分支互斥，`is_exact` 与它逐行同值；生产实测同时命中两分支的对数 = 0）。
+ *   贵的 jsonb 归一化（`source->>'bookSourceUrl'`）只对 hash join 命中的 ≤55 行算，不再对 5847 行全算。
+ *   宽列（name/source/…）最后按主键回表，只取命中行。实测：includePhoenixOk=true 3.6s→0.06s、false 4.0s→0.04s，
+ *   两侧结果集在生产只读逐行逐列全等（双向 EXCEPT ALL = 0、有序全列摘要同串）。
+ *   CTE 里新增的四个（src_nurl / orphan_ok / orphan_match / hit）全部显式 MATERIALIZED：
+ *   默认内联会让优化器把归一化重新推回嵌套循环（实测 NOT MATERIALIZED 25.3 秒）。 */
 function readEngineRows(s: Sql, signal?: AbortSignal, includePhoenixOk = false): Promise<PoolArtifactEngineRow[]> {
   return readRows<PoolArtifactEngineRow>(s, s`
     WITH recent_per_url AS (
@@ -676,25 +694,44 @@ function readEngineRows(s: Sql, signal?: AbortSignal, includePhoenixOk = false):
       FROM source_admission
       WHERE search_checked_at > NOW() - INTERVAL '24 hours'
       GROUP BY source_url
-    )
-    SELECT src.source_url, src.name, src.source, src.disabled_at::text AS disabled_at, src.last_error,
-           a.tier, a.search_checked_at::text AS search_checked_at,
-           COALESCE(recent_per_url.has_clean_recent, 0) AS host_ok_score_24h
-    FROM shuyuan_sources src
-    JOIN LATERAL (
-      SELECT ad.tier, ad.search_checked_at
+    ), src_nurl AS MATERIALIZED (
+      SELECT s0.id, s0.source_url, ${s.unsafe(normalizeUrlSql('s0.source_url'))} AS n_url
+      FROM shuyuan_sources s0
+    ), orphan_ok AS MATERIALIZED (
+      SELECT ad.source_url, ad.tier, ad.search_checked_at,
+             ${s.unsafe(normalizeUrlSql('ad.source_url'))} AS n_url
       FROM source_admission ad
       WHERE ad.compile_ok AND ad.search_ok IS TRUE
         AND (${includePhoenixOk}::boolean OR ad.error IS NULL OR ad.error NOT LIKE 'phoenix_ok:%')
-        AND (
-          ad.source_url = src.source_url
-          OR (${s.unsafe(normalizeUrlSql('ad.source_url'))} = ${s.unsafe(normalizeUrlSql('src.source_url'))}
-            AND ${s.unsafe(normalizeUrlSql("src.source->>'bookSourceUrl'"))} = ${s.unsafe(normalizeUrlSql('ad.source_url'))}
-            AND NOT EXISTS (SELECT 1 FROM shuyuan_sources s2 WHERE s2.source_url = ad.source_url))
-        )
-      ORDER BY (ad.source_url = src.source_url) DESC, ad.search_checked_at DESC NULLS LAST
-      LIMIT 1
-    ) a ON true
+        AND NOT EXISTS (SELECT 1 FROM shuyuan_sources s2 WHERE s2.source_url = ad.source_url)
+    ), orphan_match AS MATERIALIZED (
+      SELECT k.id, o.tier, o.search_checked_at
+      FROM src_nurl k
+      JOIN orphan_ok o ON o.n_url = k.n_url
+      JOIN shuyuan_sources s1 ON s1.id = k.id
+      WHERE o.n_url = ${s.unsafe(normalizeUrlSql("s1.source->>'bookSourceUrl'"))}
+    ), hit AS MATERIALIZED (
+      SELECT k.id, a.tier, a.search_checked_at
+      FROM src_nurl k
+      JOIN LATERAL (
+        (SELECT ad.tier, ad.search_checked_at, TRUE AS is_exact
+         FROM source_admission ad
+         WHERE ad.compile_ok AND ad.search_ok IS TRUE
+           AND (${includePhoenixOk}::boolean OR ad.error IS NULL OR ad.error NOT LIKE 'phoenix_ok:%')
+           AND ad.source_url = k.source_url)
+        UNION ALL
+        (SELECT om.tier, om.search_checked_at, FALSE AS is_exact
+         FROM orphan_match om
+         WHERE om.id = k.id)
+        ORDER BY is_exact DESC, search_checked_at DESC NULLS LAST
+        LIMIT 1
+      ) a ON true
+    )
+    SELECT src.source_url, src.name, src.source, src.disabled_at::text AS disabled_at, src.last_error,
+           hit.tier, hit.search_checked_at::text AS search_checked_at,
+           COALESCE(recent_per_url.has_clean_recent, 0) AS host_ok_score_24h
+    FROM hit
+    JOIN shuyuan_sources src ON src.id = hit.id
     LEFT JOIN recent_per_url ON recent_per_url.source_url = src.source_url
     ORDER BY src.source_url`, signal);
 }

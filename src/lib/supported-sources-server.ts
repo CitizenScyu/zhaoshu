@@ -40,6 +40,22 @@ interface AdmissionHostRow { host: string }
  * 裸归一化又会把「同 host 但另一条目」的孤儿行放进来。归一化片段即本文件的 normalizeUrlSql，
  * 取书池（shuyuan.ts readEngineRows）也从这里引用，两处不会漂移。
  * EXISTS 只判存在性、不聚合，行数与 DISTINCT 语义不变；includePhoenixOk 谓词原样保留。
+ *
+ * engsql45：三段判据一个没动，只改**计算方式**（与 shuyuan.ts readEngineRows 同一手法、同一理由）。
+ * 原写法把归一化塞在 `EXISTS(... OR ...)` 里，优化器退化成 Semi Join 逐对扫 5847 源行
+ * （生产只读实测：`Rows Removed by Join Filter: 261383`，false 0.95–2.9 秒 / true 3.6–20.8 秒）。
+ * 门随池刷新（refreshSupportedHosts）与产物生成都会跑它，同样长期占住 shim 连接池槽 → 503。
+ * 改法：`OR` 的归一化分支只在「供判行是旧形态孤儿」时才可能命中，而孤儿 ok 行生产实测只有 25 行
+ * （includePhoenixOk=true；false 时 9 行），且孤儿判据 `NOT EXISTS(...)` **不引用 src**，可以外提。于是：
+ *   1) 精确分支保持原样的相关 EXISTS —— 走 `shuyuan_sources_source_url_key` 索引；
+ *   2) 归一化分支改成 `a.source_url = ANY(ARRAY(不相关子查询))`：子查询先物化孤儿 ok 集合、只算**便宜的**
+ *      source_url 归一化，与源表按归一化键 hash join（实测命中 55 行），再对这几行回表算
+ *      `norm(src.source->>'bookSourceUrl')` 做同条目判据 —— 贵的 jsonb 归一化从 5847 次降到 55 次。
+ *      `ARRAY(子查询)` 是 InitPlan，整个查询只求值一次。
+ * 等价性：`EXISTS(src: P OR (Q AND C))`，其中 C＝孤儿判据不引用 src ⇒ `= EXISTS(src:P) OR (C AND EXISTS(src:Q))`；
+ * 再因 `source_admission.source_url` 唯一，`a.source_url ∈ 孤儿匹配集` ⟺ C(a) ∧ ∃src:Q(src,a)（集合里的 om
+ * 与 a 必是同一行，om 的 ok 谓词即 a 的 ok 谓词，已由外层 WHERE 满足）。生产只读实测两侧 host 集合
+ * 逐行全等（80 / 185 行、有序摘要同串、双向 EXCEPT ALL = 0），耗时 false 2.9s→0.03s、true 4.2s→0.02s。
  */
 export async function engineHosts(
   signal?: AbortSignal, { includePhoenixOk = false }: { includePhoenixOk?: boolean } = {},
@@ -50,12 +66,21 @@ export async function engineHosts(
     WHERE a.compile_ok AND a.search_ok IS TRUE
       AND (${includePhoenixOk}::boolean OR a.error IS NULL OR a.error NOT LIKE 'phoenix_ok:%')
       AND a.host <> ''
-      AND EXISTS (
-    SELECT 1 FROM shuyuan_sources src
-    WHERE src.source_url = a.source_url
-       OR (${sql.unsafe(normalizeUrlSql('a.source_url'))} = ${sql.unsafe(normalizeUrlSql('src.source_url'))}
-         AND ${sql.unsafe(normalizeUrlSql("src.source->>'bookSourceUrl'"))} = ${sql.unsafe(normalizeUrlSql('a.source_url'))}
-         AND NOT EXISTS (SELECT 1 FROM shuyuan_sources s2 WHERE s2.source_url = a.source_url)))`;
+      AND (EXISTS (SELECT 1 FROM shuyuan_sources src WHERE src.source_url = a.source_url)
+        OR a.source_url = ANY(ARRAY(
+          SELECT om.source_url
+          FROM (
+            SELECT ad.source_url, ${sql.unsafe(normalizeUrlSql('ad.source_url'))} AS n_url
+            FROM source_admission ad
+            WHERE ad.compile_ok AND ad.search_ok IS TRUE
+              AND (${includePhoenixOk}::boolean OR ad.error IS NULL OR ad.error NOT LIKE 'phoenix_ok:%')
+              AND NOT EXISTS (SELECT 1 FROM shuyuan_sources s2 WHERE s2.source_url = ad.source_url)
+          ) om
+          JOIN (SELECT s0.id, ${sql.unsafe(normalizeUrlSql('s0.source_url'))} AS n_url FROM shuyuan_sources s0) k
+            ON k.n_url = om.n_url
+          JOIN shuyuan_sources s1 ON s1.id = k.id
+            AND om.n_url = ${sql.unsafe(normalizeUrlSql("s1.source->>'bookSourceUrl'"))}
+        )))`;
   const [rows] = await sql.transaction([query], {
     readOnly: true, ...(signal ? { fetchOptions: { signal } } : {}),
   });
