@@ -671,7 +671,7 @@ async function engineReadingSources(
  *
  * engsql45：三段判据一个没动，只改**计算方式**。原写法把归一化塞在 LATERAL 的 `OR` 里，优化器无法用
  *   `source_admission_source_url_key` 索引，只能对 5847 源 × 363 ok 行逐对做两层 regexp_replace + jsonb 抽取
- *   （生产只读实测 3.6–7.3 秒，冷缓存 36 秒）。这条查询长期占住 shim 连接池（POOL_MAX=15）的槽，
+ *   （生产只读实测 3.8–9.5 秒，冷缓存/有负载时 `EXPLAIN (ANALYZE)` Execution Time 33.0–54.5 秒）。这条查询长期占住 shim 连接池（POOL_MAX=15）的槽，
  *   3–4 个并发就把池占满 → 下载 worker 拿不到连接 → shim 返 503 → 任务 failed / 批次变僵尸 / done 停摆。
  *   改法：`OR` 的归一化分支只在「供判行是旧形态孤儿」时才可能命中，而孤儿 ok 行生产实测只有 25 行
  *   （includePhoenixOk=true；false 时 9 行）。于是先把孤儿集合**物化**出来（`orphan_ok`），
@@ -682,10 +682,14 @@ async function engineReadingSources(
  *   （原 ORDER BY 的 `(ad.source_url = src.source_url)` 在孤儿分支恒为 FALSE：孤儿定义就是精确键不在表，
  *   而 src.source_url 在表 ⇒ 两分支互斥，`is_exact` 与它逐行同值；生产实测同时命中两分支的对数 = 0）。
  *   贵的 jsonb 归一化（`source->>'bookSourceUrl'`）只对 hash join 命中的 ≤55 行算，不再对 5847 行全算。
- *   宽列（name/source/…）最后按主键回表，只取命中行。实测：includePhoenixOk=true 3.6s→0.06s、false 4.0s→0.04s，
- *   两侧结果集在生产只读逐行逐列全等（双向 EXCEPT ALL = 0、有序全列摘要同串）。
+ *   宽列（name/source/…）最后按主键回表，只取命中行。生产只读交替 A/B 实测（同连接、旧新交替、active_backends=0–1）：
+ *   includePhoenixOk=false 3941/3803 ms → 42.9/45.5 ms，true 7414/9476 ms → 75.5/91.3 ms；
+ *   EXPLAIN (ANALYZE) Execution Time false 33024 ms → 54 ms、true 54461 ms → 80 ms。
+ *   两侧结果集在生产只读逐行逐列全等（行数 112/351、双向 EXCEPT ALL = 0、有序全列摘要同串、逐行 FULL OUTER JOIN
+ *   mismatched_rows = 0）。
  *   CTE 里新增的四个（src_nurl / orphan_ok / orphan_match / hit）全部显式 MATERIALIZED：
- *   默认内联会让优化器把归一化重新推回嵌套循环（实测 NOT MATERIALIZED 25.3 秒）。 */
+ *   默认内联会让优化器把归一化重新推回嵌套循环——同一份 SQL 只把 src_keys 的 `MATERIALIZED` 换成
+ *   `NOT MATERIALIZED`，实测 137–164 ms → 30906–32172 ms（约 220 倍）。 */
 function readEngineRows(s: Sql, signal?: AbortSignal, includePhoenixOk = false): Promise<PoolArtifactEngineRow[]> {
   return readRows<PoolArtifactEngineRow>(s, s`
     WITH recent_per_url AS (

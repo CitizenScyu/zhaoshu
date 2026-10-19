@@ -43,7 +43,8 @@ interface AdmissionHostRow { host: string }
  *
  * engsql45：三段判据一个没动，只改**计算方式**（与 shuyuan.ts readEngineRows 同一手法、同一理由）。
  * 原写法把归一化塞在 `EXISTS(... OR ...)` 里，优化器退化成 Semi Join 逐对扫 5847 源行
- * （生产只读实测：`Rows Removed by Join Filter: 261383`，false 0.95–2.9 秒 / true 3.6–20.8 秒）。
+ * （生产只读实测：`Rows Removed by Join Filter: 261383`（false）/ `879654`（true），
+ * false 3.4–6.4 秒 / true 9.3–20.8 秒）。
  * 门随池刷新（refreshSupportedHosts）与产物生成都会跑它，同样长期占住 shim 连接池槽 → 503。
  * 改法：`OR` 的归一化分支只在「供判行是旧形态孤儿」时才可能命中，而孤儿 ok 行生产实测只有 25 行
  * （includePhoenixOk=true；false 时 9 行），且孤儿判据 `NOT EXISTS(...)` **不引用 src**，可以外提。于是：
@@ -55,7 +56,9 @@ interface AdmissionHostRow { host: string }
  * 等价性：`EXISTS(src: P OR (Q AND C))`，其中 C＝孤儿判据不引用 src ⇒ `= EXISTS(src:P) OR (C AND EXISTS(src:Q))`；
  * 再因 `source_admission.source_url` 唯一，`a.source_url ∈ 孤儿匹配集` ⟺ C(a) ∧ ∃src:Q(src,a)（集合里的 om
  * 与 a 必是同一行，om 的 ok 谓词即 a 的 ok 谓词，已由外层 WHERE 满足）。生产只读实测两侧 host 集合
- * 逐行全等（80 / 185 行、有序摘要同串、双向 EXCEPT ALL = 0），耗时 false 2.9s→0.03s、true 4.2s→0.02s。
+ * 逐行全等（80 / 185 行、有序摘要同串、双向 EXCEPT ALL = 0）。生产只读交替 A/B 实测（同连接、旧新交替）：
+ * includePhoenixOk=false 3449/3719 ms → 20.3/74.6 ms，true 11695/10272 ms → 61.2/77.3 ms；
+ * EXPLAIN (ANALYZE) Execution Time false 6429 ms → 21.3 ms、true 9297 ms → 23.6 ms。
  */
 export async function engineHosts(
   signal?: AbortSignal, { includePhoenixOk = false }: { includePhoenixOk?: boolean } = {},
