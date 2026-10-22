@@ -1,8 +1,11 @@
 // baseline 结构契约（41-BASELINE）：0001→0002→0003 在空库上真跑完之后，这 20 张表的结构全貌。
 // 由 PGlite 真库导出（pg_catalog：format_type / pg_get_expr / pg_get_constraintdef / pg_indexes.indexdef），
 // 不是手抄：scripts/db-baseline.test.ts 每次都重新跑一遍 0001–0003 并断言导出结果与本文件逐项相等，
-// 迁移文件或导出投影一变就红。它只对 BASELINE_CHECKSUMS 那三份迁移字节成立，是冻结产物，与
-// PUBLISHED_CHECKSUMS 同理——以后的迁移不改这里（baseline 只替 v1–v3 作证）。
+// 迁移文件或导出投影一变就红。它只对 BASELINE_CHECKSUMS 那三份迁移字节成立，是冻结产物——
+// 基线 v1–v3 冻结，以后的迁移不改这里（baseline 只替 v1–v3 作证）。注意这不适用于
+// PUBLISHED_CHECKSUMS（db-migration-lib.mjs）：那份清单是**追加制**，0004 起每个迁移发布后
+// 必须追加它的摘要。漏追加的后果：该文件的字节在测试期没有任何钉子，被改动时测试抓不住，
+// 要等到已登记库跑 db:check / db:migrate 才以「摘要不匹配」整批拒绝——别把两份清单的规则搞混。
 //
 // 每张表出自哪段 SQL 见 db-baseline.mjs 的 BASELINE_TABLE_SOURCES。
 // columns:     [列名, format_type, NOT NULL, 默认值表达式, identity('d'=BY DEFAULT), 生成列表达式, 所属序列的 pg_sequence 参数]

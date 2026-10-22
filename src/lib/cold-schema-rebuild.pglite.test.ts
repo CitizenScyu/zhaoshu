@@ -12,7 +12,8 @@
 // T8 worker 启动即 `relation "storage_repositories" does not exist`（tempdb41 §缺陷 D1）。
 //
 // 不变量：
-// 1. 已发布迁移的摘要冻结（PUBLISHED_CHECKSUMS）——改已发布文件的字节会让生产 db:check/db:migrate 拒绝。
+// 1. 已发布迁移的摘要冻结（PUBLISHED_CHECKSUMS）——改已发布文件的字节会让生产 db:check/db:migrate 拒绝；
+//    清单必须覆盖全部迁移文件，漏追加新迁移的摘要在本测试即红，而不是等某库 db:check 才暴露。
 // 2. 只跑 db:migrate 时 db:check 判不通过（auth 只记到 v4、artifact 记账表都还没有），且这两项都是原因。
 // 3. 跑完 migrate:auth:prod 与 migrate:artifacts:prod 后 db:check 通过，ensureSchema 的两步都成功。
 // 4. 闸门单向：库版本 8 放行，降到 6 抛 AuthSchemaRequiredError。
@@ -34,6 +35,13 @@ it('已发布迁移的摘要与冻结值一致（改已发布文件的字节会�
   const migrations = await loadMigrations();
   for (const [version, checksum] of Object.entries(PUBLISHED_CHECKSUMS)) {
     expect(migrations.find((item) => item.version === Number(version))?.checksum, `v${version}`).toBe(checksum);
+  }
+  // 反向钉住完整性：每个迁移文件都必须在清单里有条目。缺这个方向时「加了新迁移忘追加摘要」
+  // 全程绿灯（0003–0008 曾因此漏钉），该文件被改字节要走到某库 db:check 才整批拒绝。
+  const pinned = new Set(Object.keys(PUBLISHED_CHECKSUMS).map(Number));
+  for (const migration of migrations) {
+    expect(pinned.has(migration.version),
+      `v${migration.version}（${migration.name}）缺 PUBLISHED_CHECKSUMS 摘要：发布后必须把 checksumOf 的值追加进 db-migration-lib.mjs`).toBe(true);
   }
 }, 60_000);
 

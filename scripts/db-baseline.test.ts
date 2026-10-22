@@ -105,7 +105,12 @@ describe('契约的来源与冻结', () => {
     for (const version of BASELINE_VERSIONS) {
       expect(migrations.find((item) => item.version === version)?.checksum, `v${version}`).toBe(BASELINE_CHECKSUMS[version as 1 | 2 | 3]);
     }
-    for (const [version, checksum] of Object.entries(PUBLISHED_CHECKSUMS)) expect(BASELINE_CHECKSUMS[Number(version) as 1 | 2]).toBe(checksum);
+    // PUBLISHED_CHECKSUMS 是追加制（0004 起每个已发布迁移都有条目），baseline 契约只替 v1–v3 作证，
+    // 所以核对方向必须是 baseline → published（反向会因 v4+ 在 BASELINE_CHECKSUMS 无条目而误红）。
+    for (const version of BASELINE_VERSIONS) {
+      const published = Object.entries(PUBLISHED_CHECKSUMS).find(([v]) => Number(v) === version)?.[1];
+      expect(published, `v${version} 的已发布摘要与 baseline 摘要不一致`).toBe(BASELINE_CHECKSUMS[version as 1 | 2 | 3]);
+    }
   }, 60_000);
 
   it('契约的表 = 迁移管理的表（EXPECTED_TABLES 去掉记账表、artifact 三表与 prefetch 三表）= 出处表的键', () => {

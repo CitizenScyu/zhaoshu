@@ -56,10 +56,18 @@ export const MIGRATION_FILES = ['0001_baseline.sql', '0002_identity_key.sql', '0
 // v1 = 隔离库首次 db:migrate 登记的值（见下方 normalizeSqlText 注释）；生产从未跑过 runner、没有
 // schema_migrations，由 db:baseline:prod 按同一份字节登记。3c7a20f 曾改了 0001 的一行
 // 记账，摘要随之变成另一枚，已登记的库再跑 db:check / db:migrate 就会被「摘要不匹配」拒绝——
-// 改已发布文件只能新增版本，不能回头改字节。新增迁移发布后把它的摘要追加进来。
+// 改已发布文件只能新增版本，不能回头改字节。**新增迁移发布时必须把它的摘要追加进来**：
+// 漏追加意味着该文件的字节在测试期没有任何钉子，被改动要走到某库 db:check 摘要不匹配才暴露
+// （整批拒绝）。cold-schema-rebuild.pglite.test.ts 反向断言「每个迁移文件都有条目」，漏加即红。
 export const PUBLISHED_CHECKSUMS = {
   1: '1b47f1ca7dbe16fc01fa50ff71fa4893af186b5de21aedb88529cf390c5a5db2',
   2: '839ae90fb54ae667a0c326c79afd4a584c96b015a6e3edbb428f236b7afaf24f',
+  3: '81957051de3fdd7bdc84e4b8d98084980e05bad591c38efed001eac5f51ccdf6',
+  4: '996e22723c7ab2657cfd1982aef5198724fe4eb28d7b75fa05f15187c413d602',
+  5: '1621261cae32464a877c465e2b26281445ad6245a11df030df121c98abbd6c7b',
+  6: 'c4dffc3d632de0faccbc3d51c7d33487d370b880f5742e7e49949984871077eb',
+  7: '6ef340475b16fd26a3a9290cfbceabd6df76c9f6a9762a8ef63e7d3c2e5b2cf8',
+  8: 'dfa812a0b51df407ae2a6f8f4cecf557d8c16a22943f98324e5bf868fa229e20',
 };
 export const migrationPaths = MIGRATION_FILES.map((name) => resolve(migrationsDir, name));
 
