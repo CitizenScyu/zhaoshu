@@ -187,6 +187,26 @@ function probeCooldownSlots(env: SourceTuningEnv = process.env): Map<string, num
   return env.SOURCE_THROTTLE_PER_HOST === '0' ? undefined : PROBE_COOLDOWN_SLOTS;
 }
 
+// 46-revcap：Retry-After 不设上限是既有语义（cooldown53 钉住 49 天窗口必须完整保留，为的是不生成
+// 会溢出 Node 计时器上限的定时器）。但那份记忆在 46-probecool 之前只活在单请求树里、随请求结束消失；
+// 进了进程级共享表之后，源站一次异常或恶意的 Retry-After 就能让该站对全实例所有用户长期 unreachable，
+// phoenix 是长驻进程只能重启恢复，而 sweepCooldowns 只删已到期项 ⇒ 毒条目永远扫不掉。
+// 所以只对共享表钳期限，请求级表（阅读/换源路径）语义不动。
+const SHARED_COOLDOWN_CAP_MS = 10 * 60_000;
+
+/**
+ * 共享表的冷却截止时间；请求级表原样返回。
+ * 共享身份用与模块级常量的引用相等判定，两者同文件、且共享表只在 probeCooldownSlots 一处产出。
+ */
+function sharedCooldownUntil(cooldowns: Map<string, number>, retryAfterMs: number, station: string): number {
+  const now = Date.now();
+  if (cooldowns !== PROBE_COOLDOWN_SLOTS || retryAfterMs <= SHARED_COOLDOWN_CAP_MS) return now + retryAfterMs;
+  console.warn('[read-source] probe_cooldown_capped', JSON.stringify({
+    event: 'probe_cooldown_capped', station, retryAfterMs, capMs: SHARED_COOLDOWN_CAP_MS,
+  }));
+  return now + SHARED_COOLDOWN_CAP_MS;
+}
+
 /** 冷却表同样只留未到期的条目；超阈值时清掉已过期项，防长驻实例无界增长。 */
 function sweepCooldowns(cooldowns: Map<string, number>, now: number): void {
   if (cooldowns.size <= THROTTLE_SLOTS_SWEEP_SIZE) return;
@@ -398,8 +418,8 @@ export class SourceRequestContext {
           if (error instanceof SourceHttpError && positiveRetryAfter(error)) {
             // 只归属真正返回响应的站（可能经过重定向），保留最长期限，不被迟到响应缩短。
             const key = sourceStationKey(error.responseHost ? `https://${error.responseHost}/` : url);
-            const until = Date.now() + error.retryAfterMs!;
             const cooldowns = this.budget.cooldownUntil;
+            const until = sharedCooldownUntil(cooldowns, error.retryAfterMs!, key);
             cooldowns.set(key, Math.max(until, cooldowns.get(key) ?? 0));
             sweepCooldowns(cooldowns, Date.now());
           }

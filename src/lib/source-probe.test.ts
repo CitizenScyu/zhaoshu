@@ -67,7 +67,7 @@ const book15DetailHtml = (id = 42, title = '测试书', author = '作者') =>
   `<meta property="og:novel:book_name" content="${title}"><meta property="og:novel:author" content="${author}">`
   + `<dd><a href="/chapter/index${id}-1.html">第一章</a></dd><dd><a href="/chapter/index${id}-2.html">第二章</a></dd>`;
 
-const pages = new Map<string, { text?: string; status?: number }>();
+const pages = new Map<string, { text?: string; status?: number; headers?: Record<string, string> }>();
 /** 响应头延迟(虚拟毫秒);Infinity = 挂起直到请求被中止。 */
 const headerDelay = new Map<string, number>();
 /** 有响应头、正文卡住(直到请求被中止)的 URL。 */
@@ -131,7 +131,7 @@ beforeEach(async () => {
     if (stallBody.has(url)) return new Response(new ReadableStream({ start() {} }), { status: 200 });
     const fixture = pages.get(url);
     if (!fixture) throw new Error('Unexpected source request ' + url);
-    return new Response(fixture.text ?? '', { status: fixture.status ?? 200 });
+    return new Response(fixture.text ?? '', { status: fixture.status ?? 200, headers: fixture.headers });
   });
   vi.stubGlobal('fetch', mocks.fetch);
   vi.spyOn(console, 'warn').mockImplementation(() => {});
@@ -416,6 +416,33 @@ describe('probeSourceForBook:进程级同站节流(41-fanfix N1)', () => {
     ]));
     // 两个独立probe的标题请求同刻出发，各自作者回退也只等待自己的下一槽。
     expect(stamps.map((item) => item.at - t0)).toEqual([0, 0, 350, 350]);
+  });
+});
+
+describe('46-revcap：共享冷却表的 Retry-After 上限', () => {
+  // 反例：源站给出超 Node 计时器上限的 Retry-After。这个窗口本身合法（cooldown53 钉住请求级表必须
+  // 完整保留，为的是不生成溢出计时器上限的定时器），但 46-probecool 把它提升成进程级共享之后，
+  // 长驻进程里一次异常响应就能让该站对全部用户长期 unreachable、只能重启恢复，
+  // 且 sweepCooldowns 只删已到期项 ⇒ 毒条目永远扫不掉。
+  const hits = () => requested.filter((url) => new URL(url).hostname === 'e1.test').length;
+
+  it('49 天的 Retry-After ⇒ 共享表只记 10 分钟：9 分钟时仍拦住(保护没被删)，10 分钟后同站 probe 恢复出网', async () => {
+    pages.set(e1.search(), { text: '', status: 429, headers: { 'retry-after': '4294968' } });
+    pages.set(e1.search(book.author), { text: '', status: 429, headers: { 'retry-after': '4294968' } });
+    await probe(E1);
+    const afterFirst = hits();
+    expect(afterFirst).toBeGreaterThan(0);
+
+    // 换成正常页面：接下来两个 probe 若不出网，只可能是被共享冷却表拦住。
+    pages.set(e1.search(), { text: '<div>没有结果</div>' });
+    pages.set(e1.search(book.author), { text: '<div>没有结果</div>' });
+    vi.setSystemTime(Date.now() + 9 * 60_000);
+    await probe(E1);
+    expect(hits()).toBe(afterFirst);
+
+    vi.setSystemTime(Date.now() + 60_000);
+    await probe(E1);
+    expect(hits()).toBeGreaterThan(afterFirst);
   });
 });
 
