@@ -64,8 +64,13 @@ export function alternateSourceHost(hostname: string): SupportedSourceHost | nul
 // （换 host 兜底、redirectedPageIdentity），只在确认同内容的内建对内启用、刻意不泛化；
 // 本函数只做归类、不发请求，按前缀形态对任意站归一。
 export function stationKeyOfHost(hostname: string): string {
-  const host = hostname.toLowerCase();
-  return host.startsWith('www.') || host.startsWith('m.') ? host.slice(host.indexOf('.') + 1) : host;
+  // 剥到不再匹配为止（www.m.X 两层前缀也归 X）——单层剥法对叠层前缀不幂等，
+  // www.m.X ≠ m.X ≠ X 会留三套键（post-fix-rev2 疑似4）。
+  let host = hostname.toLowerCase();
+  while (host.startsWith('www.') || host.startsWith('m.')) {
+    host = host.slice(host.indexOf('.') + 1);
+  }
+  return host;
 }
 
 /** URL 形态的站键；解析失败返回空串（与各调用点 hostOf 的 '' 口径一致，调用方自行把空串判为不匹配）。 */

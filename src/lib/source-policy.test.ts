@@ -98,11 +98,13 @@ describe('站键归一 stationKeyOfHost/stationKeyOfUrl（stationkey43）', () =
     expect(stationKeyOfHost('M.Zhulang.Com')).toBe('zhulang.com');
   });
 
-  it('非孪生前缀逐字不动；只剥一层；空串与退化形态不崩', () => {
+  it('非孪生前缀逐字不动；叠层孪生剥到底；空串与退化形态不崩', () => {
     expect(stationKeyOfHost('api.x.example')).toBe('api.x.example');
     expect(stationKeyOfHost('mobile.x.example')).toBe('mobile.x.example');
     expect(stationKeyOfHost('wwww.x.example')).toBe('wwww.x.example'); // 'wwww' 不以 'www.' 开头
-    expect(stationKeyOfHost('www.m.x.example')).toBe('m.x.example'); // 只剥一层
+    // 叠层前缀剥到不再匹配（post-fix-rev2 疑似4 修订）：单层剥法不幂等，会留 www.m.X/m.X/X 三套键。
+    expect(stationKeyOfHost('www.m.x.example')).toBe('x.example');
+    expect(stationKeyOfHost('m.www.x.example')).toBe('x.example');
     expect(stationKeyOfHost('')).toBe('');
     expect(stationKeyOfHost('m.')).toBe('');
   });

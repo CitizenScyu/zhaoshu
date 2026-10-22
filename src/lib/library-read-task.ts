@@ -39,7 +39,9 @@ function doneReadTaskQuery(
     ORDER BY dt.id DESC LIMIT 1`;
 }
 
-// 表存在性单调（只建不删），once-true 可缓存：省掉目录响应里每次一发的 to_regclass 探测。
+// 表存在性单调（只建不删），探测到 true 后可永久缓存；false **不缓存**——phoenix web 是
+// 长驻进程，进程先于迁移启动时首探 false，缓存它会把提示条永久钉在 legacy 分支（修后审查
+// post-fix-rev2 确认缺陷2：once-true 缓存被误写成 once-any 缓存）。
 let registryAvailable: boolean | null = null;
 
 /**
@@ -54,18 +56,20 @@ export async function findDoneReadTask(canRead: boolean, title: string, author: 
   try {
     const sql = getSql();
     // 注册表探测与 find/exact 同款：旧库（book_artifacts 未建）只认 legacy 无指针任务。
-    if (registryAvailable === null) {
+    if (registryAvailable !== true) {
       const registry = await sql`
         SELECT to_regclass('book_artifacts') IS NOT NULL
           AND to_regclass('storage_repositories') IS NOT NULL AS available
       ` as { available: boolean }[];
-      registryAvailable = registry[0]?.available === true;
+      // 只把 true 粘进缓存；false 每请求重探（旧库形态本来就少见，代价可接受）。
+      registryAvailable = registry[0]?.available === true ? true : null;
     }
     const authorKey = normalizeBookAuthor(author).toLowerCase();
     const rows = await doneReadTaskQuery(
       sql, normalizeBookTitle(title).toLowerCase(),
       authorKey === '' ? '佚名' : authorKey,
-      registryAvailable,
+      // registryAvailable 此处仍可能是 null（false 不缓存，见上方缓存注释），?? false 收敛为 legacy 分支。
+      registryAvailable ?? false,
     ) as { id: number }[];
     const id = rows[0]?.id;
     return typeof id === 'number' && Number.isSafeInteger(id) && id > 0 && id <= 2_147_483_647 ? id : null;

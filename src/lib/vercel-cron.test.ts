@@ -182,7 +182,8 @@ describe('phoenix timer 的告警阈值 > 实际触发间隔（阈值必须留�
         const listMatch = /^\*:(\d{1,2}(?:,\d{1,2})+):(\d{2})$/.exec(onCalendarList[1]);
         if (!listMatch) throw new Error(`登记的分钟列表 \`${onCalendarList[1]}\` 不是 \`*:M1,M2,…:SS\` 形态`);
         const minutes = listMatch[1].split(',').map(Number).sort((a, b) => a - b);
-        let minDiff = minutes[minutes.length - 1] - minutes[0] + 60;
+        // 环绕差：首元素+60-尾元素（如 `*:05,55` 真实环绕差是 10 分钟，不是 50）。
+        let minDiff = minutes[0] + 60 - minutes[minutes.length - 1];
         for (let i = 1; i < minutes.length; i += 1) {
           minDiff = Math.min(minDiff, minutes[i] - minutes[i - 1]);
         }
@@ -282,8 +283,11 @@ describe('shuyuan-refresh/deploy 副本与 deploy/phoenix 逐字一致（灾备�
     ).toBe(phoenixExpr[0]);
   });
 
-  it('admission.service 两副本 ExecStart 逐字一致（40→80 探针数差异于 2026-10-22 修齐）', () => {
-    expect(directiveValues(readRefreshUnit('zhaoshu-admission.service'), 'ExecStart'))
-      .toEqual(directiveValues(readUnit('zhaoshu-admission.service'), 'ExecStart'));
+  it.each([
+    'zhaoshu-admission.service',
+    'zhaoshu-pool-artifact.service',
+  ])('%s 两副本 ExecStart 逐字一致', (service) => {
+    expect(directiveValues(readRefreshUnit(service), 'ExecStart'))
+      .toEqual(directiveValues(readUnit(service), 'ExecStart'));
   });
 });
