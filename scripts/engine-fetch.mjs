@@ -162,11 +162,14 @@ function isBuiltinHost(m, host) {
   return m.supported.isActiveBuiltinHost(host);
 }
 
-// 在池里按 host 找源（含同站备用 host，参照 resolveSourceBook 的 §3.7 反查）。
+// 在池里按站找源（全站统一站键 stationKeyOfHost：www./m./apex 同站，与阅读侧 §3.7 反查同一口径，
+// stationkey43）。池序即质量序，首个同站匹配即得；不引入任何新 host。
 function findSourceByHost(m, sources, host) {
+  const stationOf = m.policy.stationKeyOfHost ?? ((h) => h);
+  const station = stationOf(host);
   return sources.find((s) => {
     const h = hostOf(s.url);
-    return h === host || (h.length > 0 && m.policy.alternateSourceHost?.(host) === h);
+    return h.length > 0 && stationOf(h) === station;
   });
 }
 

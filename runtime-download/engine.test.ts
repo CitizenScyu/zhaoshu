@@ -5,7 +5,7 @@
 //   - 网络/传输错误（无 status）→ 不计熔断（recordFailure 不被调用）。
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createResolveSource, createSourceTransport, loadEnginePool, type EngineModules, type RateLimiterLike } from "./engine";
-import { refreshSupportedHosts } from "../src/lib/source-policy";
+import { refreshSupportedHosts, stationKeyOfHost } from "../src/lib/source-policy";
 
 vi.mock("../src/lib/supported-sources", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../src/lib/supported-sources")>();
@@ -87,7 +87,7 @@ describe('引擎源完整 URL 解析', () => {
       },
       policy: {
         refreshSupportedHosts: vi.fn(),
-        alternateSourceHost: vi.fn(() => 'www.source.example'),
+        stationKeyOfHost,
       },
       shuyuan: {
         getPoolEngineHosts: vi.fn(async () => ['source.example', 'www.source.example']),
@@ -111,7 +111,7 @@ describe('引擎源完整 URL 解析', () => {
     }
   });
 
-  it('没有完整 URL 匹配时保留原 host/alternate 池序兼容', async () => {
+  it('没有完整 URL 匹配时保留原 host/同站孪生池序兼容（www 孪生与 apex 同站键，池序首匹配即得）', async () => {
     const h = resolverFixture();
     const result = await h.resolve(null, 'https://source.example/book/42', new AbortController().signal);
     expect(result.source).toBe(h.alternate);
@@ -126,7 +126,7 @@ describe('引擎源完整 URL 解析', () => {
     const pool = [tw, cn];
     const modules = {
       supported: { isRetiredBuiltinHost: vi.fn(() => false), builtinSourceForHost: vi.fn(() => null) },
-      policy: { refreshSupportedHosts: vi.fn(), alternateSourceHost: vi.fn(() => undefined) },
+      policy: { refreshSupportedHosts: vi.fn(), stationKeyOfHost },
       shuyuan: {
         getDownloadPoolEngineHosts: vi.fn(async () => ['source.example']),
         getDownloadEngineSources: vi.fn(async () => pool),

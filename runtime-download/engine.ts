@@ -78,10 +78,14 @@ export async function loadEnginePool(m: EngineModules, signal: AbortSignal): Pro
   return (await m.shuyuan.getDownloadEngineSources(signal)) as unknown as ReadingSourceLike[];
 }
 
+// 池内认源按全站统一站键（stationKeyOfHost：www./m./apex 同站，与阅读侧同一口径，stationkey43）。
+// 池序即质量序，首个同站匹配即得；不引入任何新 host（只在池内归并）。
 function findSourceByHost(m: EngineModules, sources: ReadingSourceLike[], host: string): ReadingSourceLike | undefined {
+  const stationOf = m.policy.stationKeyOfHost ?? ((h: string) => h);
+  const station = stationOf(host);
   return sources.find((s) => {
     const h = hostOf(s.url);
-    return h === host || (h.length > 0 && m.policy.alternateSourceHost?.(host) === h);
+    return h.length > 0 && stationOf(h) === station;
   });
 }
 

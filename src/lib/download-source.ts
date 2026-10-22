@@ -1,4 +1,4 @@
-import { alternateSourceHost, checkSourceUrl, refreshSupportedHosts, SourcePolicyError, validateSourceUrl } from './source-policy';
+import { checkSourceUrl, refreshSupportedHosts, SourcePolicyError, stationKeyOfHost, validateSourceUrl } from './source-policy';
 import { builtinSourceForHost, isRetiredBuiltinHost } from './supported-sources';
 import { getBuiltinRequestSource, getEngineSources, getPoolEngineHosts } from './shuyuan';
 import { sourceRevision } from './source-revision';
@@ -24,9 +24,12 @@ export async function resolveDownloadSource(value: string) {
   refreshSupportedHosts(await getPoolEngineHosts(signal));
   const url = validateSourceUrl(value).href;
   const pool = await getEngineSources(signal);
+  // 池内认源按全站统一站键（stationKeyOfHost：www./m./apex 同站，与阅读侧确认反查同一口径）；
+  // 池序即质量序，首个同站匹配即得。用户 URL 仍逐字过 validateSourceUrl 的门，不引入新 host。
+  const station = stationKeyOfHost(host);
   const source = pool.find((s) => {
-    const candidate = new URL(s.url).hostname;
-    return candidate === host || alternateSourceHost(host) === candidate;
+    const candidate = stationKeyOfHost(new URL(s.url).hostname);
+    return candidate.length > 0 && candidate === station;
   });
   if (!source) throw new SourcePolicyError('该来源暂不支持全书下载');
   return { url, kind: 'engine', id: source.url, revision: sourceRevision(source) };
