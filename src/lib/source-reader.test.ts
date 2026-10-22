@@ -3465,7 +3465,7 @@ describe('chapter failover M1.1 (41-M1.1)', () => {
   });
 });
 
-// ---- 46-engfix：引擎缺陷回归（probe 429 跨请求冷却 / 主机健康）----
+// ---- 46-engfix：引擎缺陷回归（probe 429 跨请求冷却 / 主机健康 / 节流槽幻影预占）----
 // 全部假时钟；probe 的进程级表（节流槽、冷却）在每个用例前随 vi.resetModules 重新 import 得到新实例。
 describe('46-engfix:probe 429 冷却跨请求 + 主机健康', () => {
   const probeSource = (host: string, name = host) => ({
@@ -3564,5 +3564,62 @@ describe('46-engfix:probe 429 冷却跨请求 + 主机健康', () => {
     const before = stamps.length;
     await drive(service.probeSourceForBook(probeSource('rl.test', '同站另一行'), book, new AbortController().signal));
     expect(stamps.length).toBeGreaterThan(before);
+  });
+});
+
+describe('46-engfix:节流槽在 abort 时不留下幻影预占', () => {
+  const host = 'slot.test';
+  const url = (path: string) => `https://${host}/${path}`;
+  const drive = async <T>(work: Promise<T>): Promise<T> => {
+    const settled = work.then((value) => ({ value }), (error: unknown) => ({ error }));
+    await vi.runAllTimersAsync();
+    const result = await settled;
+    if ('error' in result) throw result.error;
+    return result.value;
+  };
+  let stamps: Array<{ url: string; at: number }>;
+
+  beforeEach(async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+    vi.setSystemTime(Date.parse('2026-10-22T00:00:00Z'));
+    stamps = [];
+    const base = mocks.fetch.getMockImplementation()!;
+    mocks.fetch.mockImplementation(async (input, init) => {
+      stamps.push({ url: String(input), at: Date.now() });
+      return base(input, init);
+    });
+    (await import('./source-policy')).refreshSupportedHosts([host]);
+    pages.set(url('a'), { text: 'ok-a' });
+    pages.set(url('b'), { text: 'ok-b' });
+  });
+  afterEach(() => { vi.useRealTimers(); });
+
+  it('排队中被中止的请求回退自己的预占：后来的请求不必等那 350ms', async () => {
+    // 共享一张槽表 = probe 的进程级表语义。
+    const table = new Map<string, number>();
+    const root = () => new service.SourceRequestContext(new AbortController().signal, 12, { throttleSlots: table });
+    const first = root().page(url('a'));
+    // 第二个请求排到 350ms 之后；它在等待中就被中止（不推进定时器，确保它还在排队）。
+    const controller = new AbortController();
+    const queued = new service.SourceRequestContext(controller.signal, 12, { throttleSlots: table }).page(url('b'));
+    await Promise.resolve();
+    controller.abort(new Error('关面板'));
+    await expect(queued).rejects.toThrow('关面板');
+    await vi.advanceTimersByTimeAsync(400);
+    await first;
+    // 幻影预占还在的话，这里会被推到 350ms；回退后应当立刻发射。
+    const t0 = Date.now();
+    const later = root().page(url('b'));
+    await vi.advanceTimersByTimeAsync(0);
+    await later;
+    expect(stamps.filter((item) => item.url === url('b')).at(-1)!.at - t0).toBe(0);
+  });
+
+  it('并发语义不变：同一张表的并发请求仍各自拿到互不重叠的发射时刻', async () => {
+    const table = new Map<string, number>();
+    const root = () => new service.SourceRequestContext(new AbortController().signal, 12, { throttleSlots: table });
+    const t0 = Date.now();
+    await drive(Promise.all([root().page(url('a')), root().page(url('b')), root().page(url('a'))]));
+    expect(stamps.map((item) => item.at - t0)).toEqual([0, 350, 700]);
   });
 });

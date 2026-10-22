@@ -360,11 +360,24 @@ export class SourceRequestContext {
             const now = Date.now();
             const slots = this.budget.nextRequestAt;
             const at = Math.max(now, slots.get(throttleKey) ?? 0);
-            slots.set(throttleKey, at + SOURCE_DELAY_MS);
+            const reserved = at + SOURCE_DELAY_MS;
+            slots.set(throttleKey, reserved);
             if (slots.size > THROTTLE_SLOTS_SWEEP_SIZE) {
               for (const [key, next] of slots) if (next <= now) slots.delete(key);
             }
-            if (at > now) await pause(at - now, signal);
+            if (at > now) {
+              // 46-slotleak：预占后没等到点就被中止（翻页/关面板 abort 在飞 probe）时，槽已把该站
+              // 下一次发射推后 350ms 却没有任何请求用掉它。probe 的槽表是进程级共享的，泄漏会累积成
+              // 别人的 probe 在预算内干等。回退到本次预占前的值 at（而不是删掉条目：at 是前一个调用者
+              // 留下的「下一允许时刻」，删掉会让下一次发射提前、破坏同站间隔）。只有槽仍是自己预占的
+              // 那个值才回退，避免误删后来者的预占。
+              try {
+                await pause(at - now, signal);
+              } catch (error) {
+                if (slots.get(throttleKey) === reserved) slots.set(throttleKey, at);
+                throw error;
+              }
+            }
           },
           // 预排队者醒来、重定向及换 host 兜底的每次物理发射前都重查；不重复扣点。
           beforeFetch: (signal, targetUrl) => this.checkCooldown(targetUrl, signal),
