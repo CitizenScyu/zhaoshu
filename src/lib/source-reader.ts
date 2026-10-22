@@ -34,12 +34,19 @@ export const MAX_POOL_REQUESTS = 30;
 // 章节级换源预算（41-M1.1 第二轮 / 41-M1.2）：候选 child 用默认单源点数 PER_SOURCE_REQUESTS
 // （翻页、一次 5xx 重试、第二条搜索结果、作者回退都要点数）；切片按进展滑动（见 SourceSliceSlide）：
 // 基准取 min(旋钮, 软预算余量)，每次成功请求顺延一个基准，目录与正文共用一片。名额只数「昂贵失败」：
-// SOURCE_NOT_FOUND 不占。切片与名额这里是默认值，生效值走 sourceFailoverSliceMs() / sourceFailoverMaxAttempts()。
+// SOURCE_NOT_FOUND / SOURCE_CHAPTER_MISSING 不占（见 FREE_FAILOVER_REASONS）。切片与名额这里是默认值，
+// 生效值走 sourceFailoverSliceMs() / sourceFailoverMaxAttempts()。
 // 候选基准 12s：卡死的候选 12s 就放弃（当前源 12s + 两个卡死候选 24s 后，余量 9s，
 // 第三个候选还能开跑）；一直在出数据的候选靠顺延不被砍；12s 也装得下 book15 候选
 // 「apex 卡住 8s + 换 host 0.35s + www 一页 ≤3.6s ≈ 11.95s」这条救援路径。
 export const SOURCE_FAILOVER_SLICE_MS = 12_000;
 export const SOURCE_FAILOVER_MAX_ATTEMPTS = 3;
+/**
+ * 不消耗换源昂贵名额的失败原因（46-chapterquota）：都是「本站对这本书的确定性结论」，
+ * 不是「源站现在不行」的信号。SOURCE_NOT_FOUND = 搜索确认本站没有这本书；
+ * SOURCE_CHAPTER_MISSING = 本站有这本书、但目录里没有本章（中途收录的源）。
+ */
+const FREE_FAILOVER_REASONS: ReadonlySet<string> = new Set(['SOURCE_NOT_FOUND', 'SOURCE_CHAPTER_MISSING']);
 /** 原源兜底的起跑门槛：余量不足一次完整物理请求就不再开，只剩它时按 503 收尾(P1b);也是 P2 给原源兜底预留的时间。 */
 export const SOURCE_FAILOVER_MIN_START_MS = SOURCE_TIMEOUT_MS;
 /**
@@ -1668,7 +1675,8 @@ function failureCode(error: unknown): string {
  *
  * 队列与名额(41-M1.2):队列固定为 [他源…, 原源]。先试他源(同站异 URL 的源被 deprioritizeSource 排在他源末尾);
  * 原源**总是**最后一个候选,带 excludeBookUrl 再搜一次,不占名额(深审 A 第二轮 R1)。名额只数「昂贵失败」
- * (SOURCE_NOT_FOUND 以外),满 sourceFailoverMaxAttempts() 后其余他源不再试,直接轮到原源兜底。
+ * (FREE_FAILOVER_REASONS 以外,即 SOURCE_NOT_FOUND / SOURCE_CHAPTER_MISSING 都不占),满 sourceFailoverMaxAttempts()
+ * 后其余他源不再试,直接轮到原源兜底。
  * 每个候选一个 child:默认单源点数,切片按进展滑动(SourceSliceSlide):基准 min(sourceFailoverSliceMs(), 余量),
  * 每次成功请求顺延一个基准,顺延上限 = 软预算终点(原源兜底还在后面时再扣掉 8s);最后一个他源的基准放宽到
  * 「余量 − 8s」,原源兜底的基准 = 全部余量(R4/P2)。目录与正文共用这一片。
@@ -1778,8 +1786,11 @@ async function switchSourceChapter(
       throwIfCancelled();
       const reason = failureCode(error);
       fail(candidate.name, reason);
-      // 名额只数昂贵失败:SOURCE_NOT_FOUND(搜索确认本站没有这本书)不占,原源兜底那一次也不占。
-      if (reason !== 'SOURCE_NOT_FOUND' && !isOriginal) expensiveAttempts += 1;
+      // 名额只数昂贵失败（46-chapterquota）：SOURCE_NOT_FOUND（搜索确认本站没有这本书）与
+      // SOURCE_CHAPTER_MISSING（本站有书但目录里没有本章）都是**确定性**结论，不说明源站状态差；
+      // 让它们占名额会把千章书换源时的前 3 个中途收录候选当成三次昂贵失败，第 4 个可能收录全本的
+      // 候选根本没机会试。原源兜底那一次同样不占。
+      if (!isOriginal && !FREE_FAILOVER_REASONS.has(reason)) expensiveAttempts += 1;
       continue;
     }
     // 正文拿到后才固化目录,避免失败候选污染可续读会话。落库失败 fail-closed:DB 故障换源救不了,

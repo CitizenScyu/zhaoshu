@@ -2831,17 +2831,45 @@ describe('chapter failover M1.1 (41-M1.1)', () => {
     const pool = [current, alt(1), alt(2), alt(3), alt(4)];
     const catalog = await prepareCurrent(pool);
     pages.set(currentChapter, { text: '', status: 404 });
-    for (const n of [1, 2, 3, 4]) primeNoChapter(n);
+    // 昂贵失败用搜索页 500（SOURCE_UNAVAILABLE：源在、这次没搜成）：46-chapterquota 后 CHAPTER_MISSING 已豁免名额。
+    for (const n of [1, 2, 3, 4]) pages.set(altSearch(n), { text: '', status: 500 });
     await expect(readChapter(catalog)).rejects.toMatchObject({ code: 'SOURCE_CHAPTER_UNAVAILABLE', status: 503, attempted: 4 });
     expect(requestedUrls()).not.toContain(altSearch(4));
     expect(requestedUrls()).toContain(currentSearch); // 原源总是最后再试一次(41-M1.2 R1)
     expect(oneFailoverLine('exhausted', pool)).toMatchObject({
-      trigger: 'SOURCE_HTTP_4XX', attempted: 4, expensiveAttempts: 3, reasonCounts: { SOURCE_CHAPTER_MISSING: 3, SOURCE_NOT_FOUND: 1 },
+      trigger: 'SOURCE_HTTP_4XX', attempted: 4, expensiveAttempts: 3, reasonCounts: { SOURCE_UNAVAILABLE: 3, SOURCE_NOT_FOUND: 1 },
     });
   });
 
-  // 名额豁免集合只有 SOURCE_NOT_FOUND 一个码(c① 钉住)。下面两条钉住它的边界:与它相邻、最容易被误并进
-  // 「不占名额」的两种结局仍算昂贵失败 —— 把任一个也豁免掉，第 4 个候选就会被请求，对应用例变红。
+  // 46-chapterquota：SOURCE_CHAPTER_MISSING 与 SOURCE_NOT_FOUND 同为确定性结论，都不占昂贵名额。
+  // 反例：把它算回昂贵失败时，第 4 个候选（唯一收录全本的）一次都不会被请求，本用例变红。
+  it('c②b(46-chapterquota): 前 3 个候选都缺本章(CHAPTER_MISSING)不占名额，第 4 个仍被请求并成功交付', async () => {
+    const pool = [current, alt(1), alt(2), alt(3), alt(4)];
+    const catalog = await prepareCurrent(pool);
+    pages.set(currentChapter, { text: '', status: 404 });
+    for (const n of [1, 2, 3]) primeNoChapter(n);
+    primeHit(4);
+    expect(await readChapter(catalog)).toMatchObject({ text: '备用源4正文', servedFrom: alt(4).name });
+    expect(requestedUrls()).toContain(altSearch(4));
+    expect(oneFailoverLine('success', pool)).toMatchObject({
+      attempted: 4, expensiveAttempts: 0, reasonCounts: { SOURCE_CHAPTER_MISSING: 3 },
+    });
+  });
+
+  it('c②c(46-chapterquota 边界): 全部候选都缺本章 ⇒ 仍落回原源兜底并 503，与原行为一致', async () => {
+    const pool = [current, alt(1), alt(2), alt(3), alt(4)];
+    const catalog = await prepareCurrent(pool);
+    pages.set(currentChapter, { text: '', status: 404 });
+    for (const n of [1, 2, 3, 4]) primeNoChapter(n);
+    await expect(readChapter(catalog)).rejects.toMatchObject({ code: 'SOURCE_CHAPTER_UNAVAILABLE', status: 503, attempted: 5 });
+    expect(requestedUrls()).toContain(currentSearch); // 原源兜底照旧
+    expect(oneFailoverLine('exhausted', pool)).toMatchObject({
+      attempted: 5, expensiveAttempts: 0, reasonCounts: { SOURCE_CHAPTER_MISSING: 4, SOURCE_NOT_FOUND: 1 },
+    });
+  });
+
+  // 名额豁免集合是 {SOURCE_NOT_FOUND, SOURCE_CHAPTER_MISSING}。下面两条钉住边界：与它们相邻、
+  // 最容易被误并进「不占名额」的两种结局仍算昂贵失败 —— 把任一个也豁免掉，第 4 个候选就会被请求，用例变红。
   /** 4 个候选都以同一原因失败：满 3 个昂贵名额后第 4 个一次都不请求，轮到原源兜底(原站确认没有 ⇒ NOT_FOUND)。 */
   const expectQuotaStopsAtThree = async (reason: string, primeFailure: (n: number) => void, noAuthor = false) => {
     const pool = [current, alt(1), alt(2), alt(3), alt(4)];
@@ -3011,7 +3039,7 @@ describe('chapter failover M1.1 (41-M1.1)', () => {
     expect(again).toMatchObject({ text: '原站新条目正文', servedFrom: current.name });
     expect(requestedUrls()).toContain(currentSearch);
     expect(oneFailoverLine('success', pool)).toMatchObject({
-      attempted: 2, expensiveAttempts: 1, reasonCounts: { SOURCE_CHAPTER_MISSING: 1 },
+      attempted: 2, expensiveAttempts: 0, reasonCounts: { SOURCE_CHAPTER_MISSING: 1 },
     });
   });
 
@@ -3043,7 +3071,7 @@ describe('chapter failover M1.1 (41-M1.1)', () => {
       { source: current.name, reason: 'SOURCE_NOT_FOUND' },
     ]);
     expect(oneFailoverLine('exhausted', pool)).toMatchObject({
-      trigger: 'SOURCE_HTTP_4XX', attempted: 6, expensiveAttempts: 4,
+      trigger: 'SOURCE_HTTP_4XX', attempted: 6, expensiveAttempts: 3,
       reasonCounts: {
         SOURCE_CHAPTER_MISSING: 1, SOURCE_HTTP_4XX: 1, SOURCE_POLICY_REJECTED: 1, SOURCE_NOT_FOUND: 2, SOURCE_SIMILAR: 1,
       },
@@ -3184,8 +3212,9 @@ describe('chapter failover M1.1 (41-M1.1)', () => {
     pages.set(currentChapter, { text: chapterHtml('当前源正文') });
     // 这一页 6s 才完成、之前没有任何进展：默认 12s 基准下会正常交付;env 调到 5s ⇒ 5s 处放弃。
     bodyDelay.set(currentChapter, 6_000);
-    primeNoChapter(1);
-    primeNoChapter(2);
+    // 昂贵失败用搜索页 500（SOURCE_UNAVAILABLE：源在、这次没搜成）：46-chapterquota 后 CHAPTER_MISSING 不占名额。
+    pages.set(altSearch(1), { text: '', status: 500 });
+    pages.set(altSearch(2), { text: '', status: 500 });
     const child = vi.spyOn(service.SourceRequestContext.prototype, 'child');
     const t0 = Date.now();
     await expect(readChapter(catalog)).rejects.toMatchObject({ code: 'SOURCE_CHAPTER_UNAVAILABLE', attempted: 2 });
@@ -3465,7 +3494,7 @@ describe('chapter failover M1.1 (41-M1.1)', () => {
   });
 });
 
-// ---- 46-engfix：引擎缺陷回归（probe 429 跨请求冷却 / 主机健康 / 节流槽幻影预占）----
+// ---- 46-engfix：三条引擎缺陷的回归（probe 429 跨请求冷却 / 节流槽幻影预占 / CHAPTER_MISSING 名额）----
 // 全部假时钟；probe 的进程级表（节流槽、冷却）在每个用例前随 vi.resetModules 重新 import 得到新实例。
 describe('46-engfix:probe 429 冷却跨请求 + 主机健康', () => {
   const probeSource = (host: string, name = host) => ({
