@@ -1,0 +1,23 @@
+[Unit]
+Description=zhaoshu repo auto-rollover probe (phoenix, hourly via timer)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=zsdownload
+Group=zsdownload
+EnvironmentFile=/etc/zhaoshu-download-b/env
+ExecStart=/opt/node24/bin/node /opt/zhaoshu-download-b/scripts/repo-auto-create.mjs --database-url-env=DATABASE_URL --github-token-env=GITHUB_TOKEN --current-from-ledger --apply
+ExecStartPost=/opt/node24/bin/node /opt/zhaoshu-download-b/scripts/sync-ledger-capacity.mjs --database-url-env=DATABASE_URL --github-token-env=GITHUB_TOKEN --apply
+StandardOutput=journal
+StandardError=journal
+# 阈值未到退出 2 = noop,不算失败
+SuccessExitStatus=0 2
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

@@ -10,8 +10,9 @@ User=root
 # 只读 DATABASE_URL 一个键(见 /etc/zhaoshu-shuyuan/env 的键清单)。
 EnvironmentFile=/etc/zhaoshu-shuyuan/env
 # admrunner42 任务书写死:每轮 40 探、并发 4;租约 TTL ≥ 看门狗(持有者被杀也最迟 15 分钟释放)。
-Environment=ADMISSION_MAX_PROBES=40
-Environment=ADMISSION_PROBE_CONCURRENCY=4
+# 现网经 drop-in(70-scan5.conf)提升到 120/8;主 unit 在 deploy/phoenix/ 保持 80/8,本副本对齐主 unit。
+Environment=ADMISSION_MAX_PROBES=80
+Environment=ADMISSION_PROBE_CONCURRENCY=8
 Environment=ADMISSION_LEASE_TTL_MS=900000
 Environment=WATCHDOG_MS=900000
 Environment=HEARTBEAT_FILE=/opt/zhaoshu-shuyuan-refresh/admission-heartbeat.log

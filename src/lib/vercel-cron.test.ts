@@ -15,8 +15,13 @@ vi.mock('@/lib/db', () => ({ getSql: () => { throw new Error('vercel-cron 门禁
 import { ADMISSION_ALERT_HOURS, CRON_ALERT_HOURS, SHUYUAN_REFRESH_ALERT_HOURS } from './source-health';
 
 const PHOENIX_DIR = 'deploy/phoenix';
+// shuyuan-refresh/deploy 是同一批单元的第二个入仓副本（README:灾备按它重建）。
+// 2026-10-22 实测教训：admission.timer 在该副本仍是旧 2h 口径而现网已 1h——灾备按旧副本
+// 重建会把准入降频一半且门禁不覆盖。故门禁必须覆盖两个目录、并钉两副本 OnCalendar 一致。
+const REFRESH_DIR = 'shuyuan-refresh/deploy';
 
 const readUnit = (name: string) => readFileSync(`${PHOENIX_DIR}/${name}`, 'utf8');
+const readRefreshUnit = (name: string) => readFileSync(`${REFRESH_DIR}/${name}`, 'utf8');
 
 /** 从单元文件里取出某条指令的**全部**取值（systemd 允许同名指令多次出现）。 */
 function directiveValues(unit: string, key: string): string[] {
@@ -87,6 +92,10 @@ type TimerSpec = {
   route?: string;
   /** admrunner42 runner 形态：不打 HTTP 路由，直接调仓库里的 admitRows（§10.6 ④ 的有意偏离，见 deploy/phoenix/README.md）。 */
   runnerFragments?: string[];
+  /** OnCalendar 用 systemd 关键字而非显式表达式（如 `hourly`）时，在此登记等价小时数。 */
+  onCalendarKeyword?: 'hourly';
+  /** OnCalendar 用时刻列表形态（如 `*:07,37:00`）时，在此登记列表原文；间隔取相邻两项最小差。 */
+  onCalendarList?: string[];
 };
 
 const TIMERS: TimerSpec[] = [
@@ -95,6 +104,14 @@ const TIMERS: TimerSpec[] = [
   { timer: 'zhaoshu-cron-drain.timer', alertHours: CRON_ALERT_HOURS, route: '/api/profile/absorb/drain' },
   { timer: 'zhaoshu-cron-followup.timer', alertHours: CRON_ALERT_HOURS, route: '/api/followup' },
   { timer: 'zhaoshu-admission.timer', alertHours: ADMISSION_ALERT_HOURS, runnerFragments: ['refresh-runner.mjs', '--admission'] },
+  // 2026-10-22 补登记：现网已在跑、副本已入仓但此前未受门禁覆盖的四个 timer。
+  { timer: 'zhaoshu-admission-confirm.timer', alertHours: ADMISSION_ALERT_HOURS, route: '/api/shuyuan/admission', onCalendarKeyword: 'hourly' },
+  { timer: 'zhaoshu-pool-artifact.timer', alertHours: CRON_ALERT_HOURS, onCalendarList: ['*-*-*', '*:07,37:00'] },
+  { timer: 'zhaoshu-repo-rollover.timer', alertHours: CRON_ALERT_HOURS, runnerFragments: ['repo-auto-create.mjs', 'sync-ledger-capacity.mjs'] },
+  // 相对触发形态（OnBootSec/OnUnitActiveSec，无 OnCalendar）：不受「阈值 > 间隔」断言，
+  // 但登记在此让目录完整性用例覆盖、runnerFragments 钉住 ExecStart 不会静默换目标。
+  { timer: 'zhaoshu-pool-sync-copy.timer', alertHours: 0, runnerFragments: ['pool-artifact.json'] },
+  { timer: 'zhaoshu-download-b-reclaim.timer', alertHours: 0, runnerFragments: ['reclaim.mjs'] },
 ];
 
 describe('vercel.json 不得再有 crons（调度唯一来源 = phoenix timer）', () => {
@@ -142,7 +159,8 @@ describe('phoenix timer 的告警阈值 > 实际触发间隔（阈值必须留�
   //   SHUYUAN_REFRESH_ALERT_HOURS 定为 8；但 b561fba（cron 线，实际上更早）已把它改回
   //   每日一次 `0 2 * * *`。两条线各自都对，合起来 8h 阈值配上 HEALTH_URL 会**每天误报一次**。
   // 光把 8 改成 26 治不了本 —— 下次改 cron 计划还会脱节。所以把不变量钉进离线测试。
-  it.each(TIMERS)('$timer 的阈值 > 其 OnCalendar 间隔', ({ timer, alertHours }) => {
+
+  it.each(TIMERS.filter((t) => t.alertHours > 0))('$timer 的阈值 > 其 OnCalendar 间隔', ({ timer, alertHours, onCalendarKeyword, onCalendarList }) => {
     const onCalendars = directiveValues(readUnit(timer), 'OnCalendar');
     expect(
       onCalendars.length,
@@ -152,12 +170,34 @@ describe('phoenix timer 的告警阈值 > 实际触发间隔（阈值必须留�
     const expr = onCalendars[0];
     let interval: number;
     try {
-      interval = intervalHoursFromOnCalendar(expr);
+      if (onCalendarKeyword) {
+        // systemd 关键字形态：等价小时数由登记方声明（hourly→1h），写错登记就测不出——
+        // 所以这里同时反向断言关键字本身没拼错。
+        if (expr !== onCalendarKeyword) throw new Error(`OnCalendar=\`${expr}\` 与登记的关键字 \`${onCalendarKeyword}\` 不符`);
+        interval = onCalendarKeyword === 'hourly' ? 1 : 0;
+      } else if (onCalendarList) {
+        // 时刻列表形态（带日期段，如 `*-*-* *:07,37:00`）：登记两段原文，间隔取相邻最小差。
+        const joined = onCalendarList.join(' ');
+        if (expr !== joined) throw new Error(`OnCalendar=\`${expr}\` 与登记的列表 \`${joined}\` 不符`);
+        const listMatch = /^\*:(\d{1,2}(?:,\d{1,2})+):(\d{2})$/.exec(onCalendarList[1]);
+        if (!listMatch) throw new Error(`登记的分钟列表 \`${onCalendarList[1]}\` 不是 \`*:M1,M2,…:SS\` 形态`);
+        const minutes = listMatch[1].split(',').map(Number).sort((a, b) => a - b);
+        let minDiff = minutes[minutes.length - 1] - minutes[0] + 60;
+        for (let i = 1; i < minutes.length; i += 1) {
+          minDiff = Math.min(minDiff, minutes[i] - minutes[i - 1]);
+        }
+        interval = minDiff / 60;
+      } else if (/^\*:\d{1,2}:\d{2}$/.test(expr.split(/\s+/)[1] ?? '')) {
+        // `*-*-* *:MM:SS`：每小时固定时刻 → 1h（如 repo-rollover 的 `*-*-* *:37:00`）。
+        interval = 1;
+      } else {
+        interval = intervalHoursFromOnCalendar(expr);
+      }
     } catch (error) {
       throw new Error(
         `${timer} 的 OnCalendar=\`${expr}\` 解析失败：${(error as Error).message}。` +
-          `本门禁只认本仓在用的写法（\`*-*-* HH:MM:SS [TZ]\` 与 \`*-*-* HH/M:MM:SS [TZ]\`）。` +
-          `若确实要换语法，请同步扩 intervalHoursFromOnCalendar，不要为了让测试变绿而改测试。`,
+          `本门禁只认本仓在用的写法（\`*-*-* HH:MM:SS [TZ]\`、\`*-*-* HH/M:MM:SS [TZ]\`、\`*:0/S\`、\`*:M1,M2:SS\` 与关键字 hourly）。` +
+          `若确实要换语法，请同步扩本 describe 的解析逻辑，不要为了让测试变绿而改测试。`,
       );
     }
 
@@ -182,15 +222,22 @@ describe('timer 与 service 的路由对得上（防改名/换路由后门禁脱
   });
 
   it.each(TIMERS.filter((t) => t.runnerFragments))('$timer 的 service 是 runner 形态（不打 HTTP 路由）', ({ timer, runnerFragments }) => {
-    const execStart = directiveValues(readUnit(serviceOf(timer)), 'ExecStart');
-    expect(execStart).toHaveLength(1);
+    // ExecStart 与 ExecStartPost 都算启动指令（repo-rollover 的 ledger sync 在 Post 里）。
+    const allExec = [
+      ...directiveValues(readUnit(serviceOf(timer)), 'ExecStart'),
+      ...directiveValues(readUnit(serviceOf(timer)), 'ExecStartPost'),
+    ];
+    expect(allExec.length, `${serviceOf(timer)} 必须至少一条启动指令`).toBeGreaterThanOrEqual(1);
     for (const fragment of runnerFragments!) {
-      expect(execStart[0]).toContain(fragment);
+      expect(
+        allExec.join('\n'),
+        `${serviceOf(timer)} 的启动指令缺片段 \`${fragment}\`（F1 续期/切仓探测靠它）`,
+      ).toContain(fragment);
     }
     // 有意偏离架构书 §10.6 ④（准入也走 cron-call.sh 打路由）：现网是 admrunner42 runner，
     // 直接调仓库 admitRows、与路由共用 admission_lease，是唯一准入源。理由见 deploy/phoenix/README.md。
     // 若哪天收敛回路由形态，把这条断言删掉并把 TIMERS 里该行换成 route 形态。
-    expect(execStart[0], '准入若改回 cron-call.sh 形态，请同步改本断言与 deploy/phoenix/README.md').not.toContain('cron-call.sh');
+    expect(allExec.join('\n'), 'runner 形态若改回 cron-call.sh，请同步改本断言与 deploy/phoenix/README.md').not.toContain('cron-call.sh');
   });
 });
 
@@ -206,5 +253,37 @@ describe('deploy/phoenix/ 目录完整性', () => {
     for (const { timer } of TIMERS) {
       expect(files, `${timer} 缺配套的 ${timer.replace(/\.timer$/, '.service')}`).toContain(timer.replace(/\.timer$/, '.service'));
     }
+  });
+});
+
+describe('shuyuan-refresh/deploy 副本与 deploy/phoenix 逐字一致（灾备按任一副本重建须等价）', () => {
+  // 该目录的 admission 单元是 admrunner42 时期部署的、pool-artifact 单元也在现网。
+  // zhaoshu-shuyuan-refresh.timer 已退役（2026-10-22 核实现网无此 unit，刷新轮由
+  // deploy/phoenix/zhaoshu-cron-shuyuan.timer 每日 10:00 路由形态承担），
+  // 该目录残留的旧副本仅作历史参照，不进对照表。
+  // 两副本漂移的实害：README 的灾备部署命令直接 scp 本目录文件，旧口径会静默降频准入。
+  const REFRESH_TIMERS = ['zhaoshu-admission.timer', 'zhaoshu-pool-artifact.timer'];
+
+  it('目录里的 timer 集合与登记一致（新增/删除须同步本表；shuyuan-refresh.timer 是退役残留不数）', () => {
+    const retired = new Set(['zhaoshu-shuyuan-refresh.timer']);
+    const onDisk = readdirSync(REFRESH_DIR).filter((name) => /^zhaoshu-.*\.timer$/.test(name) && !retired.has(name)).sort();
+    expect(onDisk).toEqual([...REFRESH_TIMERS].sort());
+  });
+
+  it.each(REFRESH_TIMERS)('%s 的 OnCalendar 与 deploy/phoenix 同名单元逐字一致', (timer) => {
+    const phoenixExpr = directiveValues(readUnit(timer), 'OnCalendar');
+    const refreshExpr = directiveValues(readRefreshUnit(timer), 'OnCalendar');
+    expect(phoenixExpr, `${PHOENIX_DIR}/${timer} 必须恰好一条 OnCalendar`).toHaveLength(1);
+    expect(refreshExpr, `${REFRESH_DIR}/${timer} 必须恰好一条 OnCalendar`).toHaveLength(1);
+    expect(
+      refreshExpr[0],
+      `${REFRESH_DIR}/${timer} 的 OnCalendar=\`${refreshExpr[0]}\` 与 ${PHOENIX_DIR} 的 \`${phoenixExpr[0]}\` 不一致。` +
+        `灾备按 README 用 shuyuan-refresh/deploy 重建时会部署出不同频率;以现网为准回写本副本。`,
+    ).toBe(phoenixExpr[0]);
+  });
+
+  it('admission.service 两副本 ExecStart 逐字一致（40→80 探针数差异于 2026-10-22 修齐）', () => {
+    expect(directiveValues(readRefreshUnit('zhaoshu-admission.service'), 'ExecStart'))
+      .toEqual(directiveValues(readUnit('zhaoshu-admission.service'), 'ExecStart'));
   });
 });

@@ -29,7 +29,7 @@ systemd 单元见 `deploy/`。运行器读 env `DATABASE_URL`(取自 `/etc/zhaos
 (池谓词全部 `... AND (error IS NULL OR error NOT LIKE 'phoenix_ok:%')`),由 Vercel 下一轮按 20h 窗
 class 1 复测:ok 洗掉前缀进池、失败直接写真实 verdict。runner 不发布源池产物(pool-artifact timer 每 30 分钟自会生成)。
 
-单元:`deploy/zhaoshu-admission.service` + `deploy/zhaoshu-admission.timer`(每 2h 一轮,`*-*-* 01/2:17:00 UTC`)。
+单元:`deploy/zhaoshu-admission.service` + `deploy/zhaoshu-admission.timer`(每小时一轮,`*-*-* 00/1:17:00 UTC`,与 `deploy/phoenix/` 副本逐字同频)。
 env:`ADMISSION_MAX_PROBES=40`、`ADMISSION_PROBE_CONCURRENCY=4`、`ADMISSION_LEASE_TTL_MS=900000`(须 ≥ `WATCHDOG_MS=900000`)。
 预算 = `ADMISSION_BUDGET_MS`(缺省 `WATCHDOG_MS` − 30s;再缺省 240s)。
 

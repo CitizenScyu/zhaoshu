@@ -1,0 +1,14 @@
+[Unit]
+Description=zhaoshu shuyuan pool artifact (phoenix; refresh-runner --pool-artifact, 41-poolimpl)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+EnvironmentFile=/etc/zhaoshu-shuyuan/env
+Environment=SHUYUAN_POOL_ARTIFACT_PATH=/var/www/zhaoshu-pool/pool-artifact.json
+Environment=WATCHDOG_MS=90000
+ExecStart=/opt/node24/bin/node /opt/zhaoshu-pool-artifact/refresh-runner.mjs --pool-artifact
+TimeoutStartSec=120
+Nice=10

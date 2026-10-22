@@ -19,8 +19,14 @@
 | `zhaoshu-cron-followup.service` / `.timer` | 同名 |
 | `zhaoshu-admission.service` / `.timer` | 同名 |
 | `zhaoshu-admission.service.d/70-scan5.conf` | `/etc/systemd/system/zhaoshu-admission.service.d/70-scan5.conf` |
+| `zhaoshu-admission-confirm.service` / `.timer` | 同名（admconf46，每小时 GET /api/shuyuan/admission） |
+| `zhaoshu-pool-artifact.service` / `.timer` | 同名（每 30min 源池产物） |
+| `zhaoshu-pool-sync-copy.service` / `.timer` | 同名（每 5min 产物副本同步，OnUnitActiveSec 形态） |
+| `zhaoshu-repo-rollover.service` / `.timer` | 同名（每小时切仓探针 + ExecStartPost 台账/续期同步） |
+| `zhaoshu-download-b-reclaim.service` / `.timer` | 同名（B 线每 30min stale 任务回收，OnUnitActiveSec 形态） |
 | `cron-call.sh` | `/usr/local/lib/zhaoshu/cron-call.sh` |
 | `nginx/book.conf` | `/etc/nginx/sites-enabled/`（生产站块，占位符版） |
+| `nginx-pool-artifact.conf`（在 shuyuan-refresh/deploy/） | vhost 443 块内 `/pool-artifact.json` location（41-poolimpl） |
 
 单元文件里**没有任何密钥真值**：`EnvironmentFile=/etc/zhaoshu-web/env` 与
 `/etc/zhaoshu-shuyuan/env` 一律保持引用形式，`CRON_SECRET` 由 cron-call.sh 从环境读取、
@@ -43,6 +49,15 @@ crons5 删除，见下）。阈值常量在 `src/lib/source-health.ts`，**不�
 | `zhaoshu-cron-drain.timer` | `*-*-* 05:30:00 Asia/Shanghai` | 24h | `cron-call.sh /api/profile/absorb/drain 330` | `CRON_ALERT_HOURS` |
 | `zhaoshu-cron-followup.timer` | `*:0/30` | 0.5h | `cron-call.sh /api/followup 60 POST` | `CRON_ALERT_HOURS` |
 | `zhaoshu-admission.timer` | `*-*-* 00/1:17:00 UTC` | 1h | `refresh-runner.mjs --admission` | `ADMISSION_ALERT_HOURS` |
+| `zhaoshu-admission-confirm.timer` | `hourly`（关键字） | 1h | `cron-call.sh /api/shuyuan/admission 300` | `ADMISSION_ALERT_HOURS` |
+| `zhaoshu-pool-artifact.timer` | `*-*-* *:07,37:00` | 0.5h | `refresh-runner.mjs --pool-artifact` | `CRON_ALERT_HOURS` |
+| `zhaoshu-repo-rollover.timer` | `*-*-* *:37:00` | 1h | `repo-auto-create.mjs` + ExecStartPost `sync-ledger-capacity.mjs` | `CRON_ALERT_HOURS` |
+| `zhaoshu-pool-sync-copy.timer` | 无 OnCalendar（`OnUnitActiveSec=5min`） | 5min | `cp pool-artifact.json → /var/lib/zhaoshu-sync/` | 不判龄（副本同步，非业务轮） |
+| `zhaoshu-download-b-reclaim.timer` | 无 OnCalendar（`OnUnitActiveSec=30min`） | 0.5h | `runtime/timer/reclaim.mjs`（B 线本机回收） | 不判龄（不写 cron_health） |
+
+后三条是 2026-10-22 从现网取回补齐的（此前零登记、不受门禁覆盖）：
+- `admission-confirm` / `pool-artifact` / `repo-rollover` 已进 `src/lib/vercel-cron.test.ts` 的 TIMERS 表并做「阈值 > 间隔」断言；
+- `pool-sync-copy` / `download-b-reclaim` 是相对触发形态，只登记不做间隔断言（ExecStart 片段由 runnerFragments 钉住）。
 
 **不变量：告警阈值必须 > 实际触发间隔**，否则正常运行就会误报。该不变量由
 `src/lib/vercel-cron.test.ts` 从本目录的 timer/service 文件**真解析** `OnCalendar=` 与

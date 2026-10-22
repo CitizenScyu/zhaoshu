@@ -1,0 +1,12 @@
+[Unit]
+Description=Run zhaoshu B-line reclaim every 30 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=30min
+AccuracySec=1min
+RandomizedDelaySec=90
+Unit=zhaoshu-download-b-reclaim.service
+
+[Install]
+WantedBy=timers.target

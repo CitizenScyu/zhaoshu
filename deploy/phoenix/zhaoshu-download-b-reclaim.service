@@ -1,0 +1,15 @@
+[Unit]
+Description=zhaoshu B-line download stale-task reclaim
+Documentation=file:///opt/zhaoshu-download-b/runtime/timer/reclaim.mjs
+
+[Service]
+Type=oneshot
+User=zsdownload
+Group=zsdownload
+ExecStart=/opt/node24/bin/node /opt/zhaoshu-download-b/runtime/timer/reclaim.mjs
+WorkingDirectory=/opt/zhaoshu-download-b
+EnvironmentFile=/etc/zhaoshu-download-b/env
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true

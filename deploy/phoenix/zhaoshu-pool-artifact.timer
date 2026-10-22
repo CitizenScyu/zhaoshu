@@ -1,0 +1,10 @@
+[Unit]
+Description=zhaoshu shuyuan pool artifact every 30 minutes (phoenix)
+
+[Timer]
+OnCalendar=*-*-* *:07,37:00
+Persistent=true
+RandomizedDelaySec=60
+
+[Install]
+WantedBy=timers.target

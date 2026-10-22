@@ -1,0 +1,11 @@
+[Unit]
+Description=zhaoshu admission confirm timer (hourly, 错峰避开 :17 runner 轮与 :07/:37 pool-artifact 轮; admconf46)
+
+[Timer]
+OnCalendar=hourly
+RandomizedDelaySec=180
+Persistent=true
+Unit=zhaoshu-admission-confirm.service
+
+[Install]
+WantedBy=timers.target

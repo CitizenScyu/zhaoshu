@@ -1,0 +1,10 @@
+[Unit]
+Description=zhaoshu repo auto-rollover hourly probe
+
+[Timer]
+OnCalendar=*-*-* *:37:00
+RandomizedDelaySec=300
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,16 @@
+[Unit]
+Description=zhaoshu admission confirm round (独立准入确认轮，GET /api/shuyuan/admission via loopback; admconf46, 启用 2026-10-20; 停用即回原状)
+After=zhaoshu-web.service
+
+[Service]
+Type=oneshot
+User=zsweb
+Group=zsweb
+EnvironmentFile=/etc/zhaoshu-web/env
+ExecStart=/usr/local/lib/zhaoshu/cron-call.sh /api/shuyuan/admission 300
+TimeoutStartSec=360
+Nice=10
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true

@@ -1,0 +1,3 @@
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c "cp -p /var/www/zhaoshu-pool/pool-artifact.json /var/lib/zhaoshu-sync/pool-artifact.json.tmp && chmod 644 /var/lib/zhaoshu-sync/pool-artifact.json.tmp && mv /var/lib/zhaoshu-sync/pool-artifact.json.tmp /var/lib/zhaoshu-sync/pool-artifact.json"
