@@ -64,6 +64,15 @@ describe('判定：连续硬失败 ≥ 2 次且最近一次在窗口内 ⇒ susp
     expect(health.isHostSuspect('flaky.test', 21)).toBe(false);
   });
 
+  it('46-probecool:http_429 与其它硬失败同权计数，孪生 host 共享同一本账', () => {
+    health.recordHostFailure('www.rl.test', 'http_429', 0);
+    health.recordHostFailure('rl.test', 'http_429', 0);
+    expect(health.isHostSuspect('rl.test', 1)).toBe(true);
+    expect(health.isHostSuspect('www.rl.test', 1)).toBe(true);
+    health.recordHostSuccess('rl.test');
+    expect(health.isHostSuspect('www.rl.test', 1)).toBe(false);
+  });
+
   it('窗口 env SOURCE_HOST_SUSPECT_MS 生效，钳在 [60000, 3600000],空串/非数字/0/负数回退默认 600000', () => {
     const read = health.sourceHostSuspectMs;
     expect(read({})).toBe(WINDOW);

@@ -5,7 +5,7 @@ import { shuyuanReadCacheTtlMs } from './read-cache-ttl';
 import { fetchSourceText, sourceAbortable, SourceHttpError, SOURCE_CONNECT_TIMEOUT_MS, SOURCE_TIMEOUT_MS, type SourcePageRequest } from './source-fetch';
 import { SourcePolicyError, stationKeyOfUrl, validateSourceUrl } from './source-policy';
 import { sourceRevision } from './source-revision';
-import { isHostSuspect, orderByHostHealth } from './source-host-health';
+import { isHostSuspect, orderByHostHealth, recordHostFailure } from './source-host-health';
 import { normalizeBookTitle } from './book-identity';
 import {
   engineFetchContent, engineFetchDetail, engineFetchToc, engineSearchBook, MAX_CONTENT_PAGES, type EngineSearchResult, type EngineSource,
@@ -126,7 +126,10 @@ interface SharedSourceBudget {
    * 单源 probe 传入进程级共享表（probeThrottleSlots），同实例内的并发 probe 互相排队。
    */
   nextRequestAt: Map<string, number>;
-  /** 仅本请求树共享的同站冷却绝对期限；条目数不超过本树实际请求数，生命周期随 root 结束。 */
+  /**
+   * 同站冷却绝对期限。默认每个根 context 新建一张表，生命周期随 root 结束；
+   * 单源 probe 传入进程级共享表（probeCooldownSlots），429 的冷却跨请求生效。
+   */
   cooldownUntil: Map<string, number>;
   totalLimit: number;
   startedAt: number;
@@ -166,6 +169,23 @@ function probeThrottleSlots(env: SourceTuningEnv = process.env): Map<string, num
   return env.SOURCE_THROTTLE_PER_HOST === '0' ? undefined : PROBE_THROTTLE_SLOTS;
 }
 
+// 46-probecool：429 冷却记忆同样要跨 probe 请求存活。节流槽只管「两次发射间隔 350ms」，
+// 冷却窗口是源站明说的「这个站 600s 别来」；放在请求级 budget 里时，每翻一页/每次「换一批」
+// 都会把这份记忆丢掉、对同一站重打一遍。与节流槽同款：同一 Node 进程（同一实例）内共享，
+// 跨实例不共享；键同样走 stationKeyOfUrl（孪生 host 共享一份冷却）。
+const PROBE_COOLDOWN_SLOTS = new Map<string, number>();
+
+/** probe 的冷却表：与节流槽同一个回滚开关（SOURCE_THROTTLE_PER_HOST=0 ⇒ 退回请求级，改动前语义）。 */
+function probeCooldownSlots(env: SourceTuningEnv = process.env): Map<string, number> | undefined {
+  return env.SOURCE_THROTTLE_PER_HOST === '0' ? undefined : PROBE_COOLDOWN_SLOTS;
+}
+
+/** 冷却表同样只留未到期的条目；超阈值时清掉已过期项，防长驻实例无界增长。 */
+function sweepCooldowns(cooldowns: Map<string, number>, now: number): void {
+  if (cooldowns.size <= THROTTLE_SLOTS_SWEEP_SIZE) return;
+  for (const [key, until] of cooldowns) if (until <= now) cooldowns.delete(key);
+}
+
 /**
  * 按进展滑动的切片（41-M1.2）：本 context 或其子孙每完成一次**成功**的上游请求，切片截止时间顺延到
  * min(now + stepMs, until)，只延后不提前；失败、超时、被中止的请求不顺延。慢但一直在出数据的源不被砍，
@@ -187,6 +207,8 @@ interface SourceContextOptions {
   parent?: SourceRequestContext;
   /** 根 context 的节流表；缺省新建请求级表。单源 probe 传进程级共享表（见 PROBE_THROTTLE_SLOTS）。 */
   throttleSlots?: Map<string, number>;
+  /** 根 context 的冷却表；缺省新建请求级表。单源 probe 传进程级共享表（见 PROBE_COOLDOWN_SLOTS）。 */
+  cooldownSlots?: Map<string, number>;
 }
 
 /** page() 取页可选覆写（41-postsearch）：request=POST/body/头，responseCharset=响应解码字符集，attempts=重试次数。 */
@@ -215,7 +237,11 @@ export class SourceRequestContext {
     // 根 context 的全局上限初值 = 构造 limit：不经 openPool 的调用路径（单独用 context(n)）行为逐点不变。
     // openPool 的调用点：resolveSourceBook（池里含引擎源时）、surveySourceBooks 开头、switchSourceChapter 开头，都只增不减。
     this.budget = options.budget ?? {
-      requests: 0, nextRequestAt: options.throttleSlots ?? new Map(), cooldownUntil: new Map(), totalLimit: limit, startedAt: Date.now(),
+      requests: 0,
+      nextRequestAt: options.throttleSlots ?? new Map(),
+      cooldownUntil: options.cooldownSlots ?? new Map(),
+      totalLimit: limit,
+      startedAt: Date.now(),
     };
     this.parent = options.parent;
     const sliceController = options.sliceController;
@@ -353,7 +379,14 @@ export class SourceRequestContext {
             // 只归属真正返回响应的站（可能经过重定向），保留最长期限，不被迟到响应缩短。
             const key = sourceStationKey(error.responseHost ? `https://${error.responseHost}/` : url);
             const until = Date.now() + error.retryAfterMs!;
-            this.budget.cooldownUntil.set(key, Math.max(until, this.budget.cooldownUntil.get(key) ?? 0));
+            const cooldowns = this.budget.cooldownUntil;
+            cooldowns.set(key, Math.max(until, cooldowns.get(key) ?? 0));
+            sweepCooldowns(cooldowns, Date.now());
+          }
+          // 46-probecool：429 也是「这个站现在不行」，计入主机健康（fetch 层只记 5xx/超时/网络）。
+          // 记在实际响应站上，与上面的冷却归属同口径；5xx 已由 fetchSourceText 记过，这里只补 429。
+          if (error instanceof SourceHttpError && error.status === 429) {
+            recordHostFailure(error.responseHost || hostnameOf(url), 'http_429');
           }
           throw error;
         }
@@ -1433,6 +1466,9 @@ export async function probeSourceForBook(
   (timer as { unref?: () => void }).unref?.();
   const context = new SourceRequestContext(AbortSignal.any([signal, budgetController.signal]), MAX_SOURCE_REQUESTS, {
     throttleSlots: probeThrottleSlots(),
+    // 46-probecool：429 冷却同样跨请求共享 —— 一个用户的 probe 吃到的 Retry-After 保护后续所有 probe，
+    // 「换一批」翻页/重新探测不再对同一站重打一遍。
+    cooldownSlots: probeCooldownSlots(),
   });
   const base = { sourceUrl: source.url, sourceName: source.name };
   const finish = (result: Omit<SourceProbeResult, 'sourceUrl' | 'sourceName' | 'elapsedMs' | 'requests'>): SourceProbeResult => (

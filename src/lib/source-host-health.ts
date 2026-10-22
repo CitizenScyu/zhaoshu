@@ -6,9 +6,9 @@ import { stationKeyOfHost } from './source-policy';
 // 章节级换源时它又因「builtin 恒在前」恒排第一个候选，先白耗 min(14s, 余量)。
 //
 // 记录点只有一处：source-fetch.ts 的 fetchSourceText（builtin 与引擎两条腿唯一的 HTTP 出口）。
-// - 只有传输层硬失败才计数：连接/请求超时、fetch failed、HTTP 5xx（含 522）。404 等 4xx、策略拒绝、
-//   解码失败、预算/节流中止、调用方中止一律不计（既不加一，也不清零）。搜不到书、解析失败发生在 HTTP 成功之后，
-//   对 host 而言是成功。
+// - 只有传输层硬失败才计数：连接/请求超时、fetch failed、HTTP 5xx（含 522）、HTTP 429（源站明确限流，
+//   46-probecool）。404 等 4xx、策略拒绝、解码失败、预算/节流中止、调用方中止一律不计（既不加一，也不清零）。
+//   搜不到书、解析失败发生在 HTTP 成功之后，对 host 而言是成功。
 // - 任何一次成功（拿到 2xx 正文）立即清零。
 // - 连续硬失败 ≥ HOST_SUSPECT_FAILURES 次且最近一次失败在窗口内 ⇒ suspect。窗口过期后自动恢复原位（半开）：
 //   计数保留，恢复后再硬失败一次就重新判 suspect；成功一次才真正清零。
@@ -36,7 +36,11 @@ export function isPaywallHost(host: string): boolean {
   return PAYWALL_HOST_SET.has(host.toLowerCase());
 }
 
-export type HostFailureKind = 'timeout' | 'network' | 'http_5xx';
+/**
+ * 传输层硬失败类目。http_429 是 46-probecool 新增：源站明确限流同样是「这个站现在不行」的信号，
+ * 换源排序不该再把它当健康站第一个试。与 http_5xx 同权计入 suspect 计数。
+ */
+export type HostFailureKind = 'timeout' | 'network' | 'http_5xx' | 'http_429';
 
 /** 判 suspect 所需的连续传输层硬失败次数。 */
 export const HOST_SUSPECT_FAILURES = 2;

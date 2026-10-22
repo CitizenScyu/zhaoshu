@@ -3464,3 +3464,105 @@ describe('chapter failover M1.1 (41-M1.1)', () => {
     expect(failoverLines()).toEqual([]);
   });
 });
+
+// ---- 46-engfix：引擎缺陷回归（probe 429 跨请求冷却 / 主机健康）----
+// 全部假时钟；probe 的进程级表（节流槽、冷却）在每个用例前随 vi.resetModules 重新 import 得到新实例。
+describe('46-engfix:probe 429 冷却跨请求 + 主机健康', () => {
+  const probeSource = (host: string, name = host) => ({
+    url: `https://${host}/`, name, searchUrl: `https://${host}/s?q={{key}}`, tier: 'M1' as const,
+    rules: {
+      ruleSearch: { bookList: '.book', name: '.name@text', author: '.author@text', bookUrl: 'a@href' },
+      ruleBookInfo: { name: '.title@text', author: '.writer@text', tocUrl: '.toc@href' },
+      ruleToc: { chapterList: '.chapter', chapterName: 'a@text', chapterUrl: 'a@href' },
+      ruleContent: { content: '.content@text' },
+    },
+  });
+  const searchOf = (host: string, keyword = book.title) => `https://${host}/s?q=` + encodeURIComponent(keyword);
+  const drive = async <T>(work: Promise<T>): Promise<T> => {
+    const settled = work.then((value) => ({ value }), (error: unknown) => ({ error }));
+    await vi.runAllTimersAsync();
+    const result = await settled;
+    if ('error' in result) throw result.error;
+    return result.value;
+  };
+  let stamps: Array<{ url: string; at: number }>;
+  let health: typeof import('./source-host-health');
+  const headers = new Map<string, Record<string, string>>();
+
+  beforeEach(async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+    vi.setSystemTime(Date.parse('2026-10-22T00:00:00Z'));
+    stamps = [];
+    headers.clear();
+    const base = mocks.fetch.getMockImplementation()!;
+    mocks.fetch.mockImplementation(async (input, init) => {
+      stamps.push({ url: String(input), at: Date.now() });
+      const response = await base(input, init);
+      const extra = headers.get(String(input));
+      if (!extra) return response;
+      return new Response(response.body, { status: response.status, headers: extra });
+    });
+    (await import('./source-policy')).refreshSupportedHosts(['rl.test', 'ok.test']);
+    health = await import('./source-host-health');
+  });
+  afterEach(() => { vi.useRealTimers(); });
+
+  it('Retry-After 600s：同一站的第二次 probe 直接吃冷却、不再出网；异站不受影响', async () => {
+    pages.set(searchOf('rl.test'), { text: '', status: 429 });
+    pages.set(searchOf('rl.test', book.author), { text: '', status: 429 });
+    headers.set(searchOf('rl.test'), { 'retry-after': '600' });
+    headers.set(searchOf('rl.test', book.author), { 'retry-after': '600' });
+    const first = await drive(service.probeSourceForBook(probeSource('rl.test'), book, new AbortController().signal));
+    expect(first.status).toBe('unreachable');
+    const firstCount = stamps.length;
+    expect(firstCount).toBeGreaterThan(0);
+    // 第二次 probe（等价于「换一批」翻页后的新请求）：新的 context 树，但冷却表是进程级共享的。
+    const second = await drive(service.probeSourceForBook(probeSource('rl.test', '同站另一行'), book, new AbortController().signal));
+    expect(second.status).toBe('unreachable');
+    expect(second.requests).toBe(0);
+    expect(stamps.length).toBe(firstCount); // 一次物理请求都没再发
+    // 异站 probe 照常出网。
+    pages.set(searchOf('ok.test'), { text: '<div>没有结果</div>' });
+    pages.set(searchOf('ok.test', book.author), { text: '<div>没有结果</div>' });
+    expect((await drive(service.probeSourceForBook(probeSource('ok.test'), book, new AbortController().signal))).status)
+      .toBe('no_candidates');
+  });
+
+  it('冷却窗口到期后同一站恢复可用（不是永久封站）', async () => {
+    pages.set(searchOf('rl.test'), { text: '', status: 429 });
+    pages.set(searchOf('rl.test', book.author), { text: '', status: 429 });
+    headers.set(searchOf('rl.test'), { 'retry-after': '600' });
+    headers.set(searchOf('rl.test', book.author), { 'retry-after': '600' });
+    await drive(service.probeSourceForBook(probeSource('rl.test'), book, new AbortController().signal));
+    pages.set(searchOf('rl.test'), { text: '<div>没有结果</div>' });
+    pages.set(searchOf('rl.test', book.author), { text: '<div>没有结果</div>' });
+    headers.clear();
+    vi.setSystemTime(Date.now() + 600_000);
+    expect((await drive(service.probeSourceForBook(probeSource('rl.test'), book, new AbortController().signal))).status)
+      .toBe('no_candidates');
+  });
+
+  it('429 计入主机健康：连续两次 probe 吃 429 ⇒ 该站 suspect（fetch 层只记 5xx/超时/网络）', async () => {
+    pages.set(searchOf('rl.test'), { text: '', status: 429 });
+    pages.set(searchOf('rl.test', book.author), { text: '', status: 429 });
+    headers.set(searchOf('rl.test'), { 'retry-after': '600' });
+    headers.set(searchOf('rl.test', book.author), { 'retry-after': '600' });
+    await drive(service.probeSourceForBook(probeSource('rl.test'), book, new AbortController().signal));
+    expect(health.isHostSuspect('rl.test')).toBe(false);
+    vi.setSystemTime(Date.now() + 600_000); // 冷却到期，再打一次
+    await drive(service.probeSourceForBook(probeSource('rl.test'), book, new AbortController().signal));
+    expect(health.isHostSuspect('rl.test')).toBe(true);
+  });
+
+  it('SOURCE_THROTTLE_PER_HOST=0 回滚：冷却退回请求级，第二个 probe 仍会出网', async () => {
+    vi.stubEnv('SOURCE_THROTTLE_PER_HOST', '0');
+    pages.set(searchOf('rl.test'), { text: '', status: 429 });
+    pages.set(searchOf('rl.test', book.author), { text: '', status: 429 });
+    headers.set(searchOf('rl.test'), { 'retry-after': '600' });
+    headers.set(searchOf('rl.test', book.author), { 'retry-after': '600' });
+    await drive(service.probeSourceForBook(probeSource('rl.test'), book, new AbortController().signal));
+    const before = stamps.length;
+    await drive(service.probeSourceForBook(probeSource('rl.test', '同站另一行'), book, new AbortController().signal));
+    expect(stamps.length).toBeGreaterThan(before);
+  });
+});
