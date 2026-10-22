@@ -63,6 +63,19 @@ export function probeCacheKey(title: string, author: string, sourceUrl: string):
   return JSON.stringify([title, author, sourceUrl]);
 }
 
+/**
+ * 这个结论值不值得在本阅读会话内复用。两类不缓存：
+ * - `timeout`：下一轮可能就好了（原有语义）。
+ * - `unreachable` 且一次上游请求都没发出：那是**本地冷却表**在拒绝（源站说过「N 秒别来」，
+ *   见 source-reader 的 PROBE_COOLDOWN_SLOTS），不是对这个站的结论。缓存它的话，冷却到期后
+ *   点「重新检测」仍显示 unreachable、一次网都不出，只有刷新页面才好。
+ * `compile_failed` 等同样 requests=0 但结论在本会话内稳定的行照旧缓存，不白烧限流额度。
+ */
+export function cacheableProbeResult(result: SourceProbePanelResult): boolean {
+  if (result.status === 'timeout') return false;
+  return !(result.status === 'unreachable' && result.requests === 0);
+}
+
 function hostOf(url: string): string {
   try { return new URL(url).hostname; } catch { return ''; }
 }
@@ -138,7 +151,8 @@ async function probeOne(apiFetch: ApiFetch, title: string, author: string, sourc
 
 /**
  * 换源扇出:挂载即取候选并逐源 probe;卸载(关面板)即 abort 全部在途请求。
- * rescan() 只重测没有定论的行(超时/失败/未测),已有结果的行复用 cache,不重复计数。
+ * rescan() 只重测没有定论的行(超时/失败/未测/被本地冷却拦下),已有结果的行复用 cache,不重复计数。
+ * 「有没有定论」的判据就是 cacheableProbeResult：不入缓存 ⇒ rescan 时该行回到 pending ⇒ 真出网。
  */
 export function useSourceFanout({ apiFetch, title, author, currentSource, cache }: {
   apiFetch: ApiFetch; title: string; author: string; currentSource?: ServingSource; cache: ProbeCache;
@@ -214,8 +228,8 @@ export function useSourceFanout({ apiFetch, title, author, currentSource, cache 
             // 此时既不能写回缓存，也不能把取消当失败而在新会话继续 pump。
             if (!valid()) { resolve(); return; }
             if (outcome.kind === 'result') {
-              // 超时不缓存:下次「重新检测」可以再试;其它结论(含 miss)同一会话内复用。
-              if (outcome.result.status !== 'timeout') cache.set(probeCacheKey(title, author, source.url), outcome.result);
+              // 缓存口径见 cacheableProbeResult：超时、以及「本地冷却拦下、根本没出网」都不缓存。
+              if (cacheableProbeResult(outcome.result)) cache.set(probeCacheKey(title, author, source.url), outcome.result);
               patch(source.url, (item) => ({ ...item, state: 'done', result: outcome.result }));
             } else if (outcome.kind === 'failed') {
               patch(source.url, (item) => ({ ...item, state: 'failed', message: outcome.message }));
@@ -308,8 +322,8 @@ export async function findFirstSwitchableSource({ apiFetch, title, author, curre
     // 限流/服务不可用/鉴权失效/扇出被关:立即放弃,不把剩余源的探测也发出去。
     if (outcome.kind === 'stop') return null;
     if (outcome.kind === 'failed') continue;
-    // 与 scan 同口径:超时不缓存(下次可重试),其余结论(含 miss)复用缓存。
-    if (outcome.result.status !== 'timeout') cache.set(key, outcome.result);
+    // 与 scan 同口径（cacheableProbeResult）：超时与「本地冷却拦下、根本没出网」都不缓存。
+    if (cacheableProbeResult(outcome.result)) cache.set(key, outcome.result);
     const book = outcome.result.readable && outcome.result.status === 'ok' ? outcome.result.book : undefined;
     if (book?.bookUrl) {
       return { bookUrl: book.bookUrl, sourceUrl: outcome.result.sourceUrl, sourceName: outcome.result.sourceName };
