@@ -95,7 +95,10 @@ describe('GET /api/health/sources (S5-1 匿名健康端点)', () => {
       ['admissionCheckedAtAgeHours', 'crons', 'dbQuota', 'ok', 'refreshedAtAgeHours'],
     );
     expect(Object.keys(payload.dbQuota as object).sort()).toEqual(['lastSeenAt', 'state']);
-    expect(Object.keys(payload.crons as object).sort()).toEqual(['admission', 'drain', 'reclaim', 'shuyuan']);
+    // obsfix45 起含 followup（追更轮）与 ledgerSync（台账同步/F1 准入续期）两个心跳键。
+    expect(Object.keys(payload.crons as object).sort()).toEqual(
+      ['admission', 'drain', 'followup', 'ledgerSync', 'reclaim', 'shuyuan'],
+    );
     for (const cron of Object.values(payload.crons as Record<string, object>)) {
       expect(Object.keys(cron)).toEqual(['lastSuccessAt']);
     }
@@ -113,6 +116,46 @@ describe('GET /api/health/sources (S5-1 匿名健康端点)', () => {
     expect(Date.parse(crons.shuyuan.lastSuccessAt as string)).toBe(NOW - 3.2 * 3_600_000);
     // admission（42-admhealth）只透传 cron_health 行，不参与 ok 判据。
     expect(crons.admission.lastSuccessAt).toBeNull();
+    // followup / ledgerSync（obsfix45）同理：默认桩里没有这两行 ⇒ 都是 null，而 ok 仍为 true。
+    expect(crons.followup.lastSuccessAt).toBeNull();
+    expect(crons.ledgerSync.lastSuccessAt).toBeNull();
+  });
+
+  // obsfix45：追更轮与台账同步的成功心跳。两者的行都是**新接线**，部署后首轮成功前库里没有行，
+  // 端点必须照常 200 且 ok 不受影响（否则新观测自己制造一段假红）；有行则逐字透传。
+  it('followup / ledgerSync 行：有则透传，超龄或缺行都不拉低 ok（判龄在探针侧单独做）', async () => {
+    mocks.getSql.mockReturnValue(sqlStub(
+      [
+        { name: 'reclaim', last_success_at: hoursAgo(5) }, { name: 'drain', last_success_at: hoursAgo(6) },
+        { name: 'followup', last_success_at: hoursAgo(40) },
+        { name: 'ledger_sync', last_success_at: hoursAgo(3) },
+      ],
+      hoursAgo(5),
+    ));
+    const payload = await body(await GET());
+    const crons = payload.crons as Record<string, { lastSuccessAt: string | null }>;
+    expect(payload.ok).toBe(true);
+    expect(crons.followup.lastSuccessAt).toBe(hoursAgo(40));
+    expect(crons.ledgerSync.lastSuccessAt).toBe(hoursAgo(3));
+  });
+
+  it('租约行不冒充心跳：followup_probe_lease 存的是到期时刻（未来），绝不透传成 followup', async () => {
+    // 这正是 obsfix45 修的缺陷形态：followup 对 cron_health 的唯一写入曾是租约行，其
+    // last_success_at = now()+TTL，看起来永远「刚刚成功」，timer 停摆也照样新鲜。
+    const leaseExpiry = new Date(NOW + 50_000).toISOString();
+    mocks.getSql.mockReturnValue(sqlStub(
+      [
+        { name: 'reclaim', last_success_at: hoursAgo(5) }, { name: 'drain', last_success_at: hoursAgo(6) },
+        { name: 'followup_probe_lease', last_success_at: leaseExpiry },
+        { name: 'admission_lease', last_success_at: leaseExpiry },
+      ],
+      hoursAgo(5),
+    ));
+    const crons = (await body(await GET())).crons as Record<string, { lastSuccessAt: string | null }>;
+    expect(crons.followup.lastSuccessAt).toBeNull();
+    expect(crons.admission.lastSuccessAt).toBeNull();
+    // 契约里没有租约键：两个租约行的值不得出现在 payload 任何位置。
+    expect(JSON.stringify(await body(await GET()))).not.toContain(leaseExpiry);
   });
 
   it('admission 行（42-admhealth）：cron_health 有该行时透传，且超龄也不拉低 ok（阈值在探针侧单独判）', async () => {
@@ -191,6 +234,8 @@ describe('GET /api/health/sources (S5-1 匿名健康端点)', () => {
         reclaim: { lastSuccessAt: null },
         drain: { lastSuccessAt: null },
         admission: { lastSuccessAt: null },
+        followup: { lastSuccessAt: null },
+        ledgerSync: { lastSuccessAt: null },
       },
       dbQuota: { state: 'ok', lastSeenAt: null },
     });

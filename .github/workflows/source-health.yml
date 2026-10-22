@@ -15,7 +15,10 @@
 # 阈值必须与 src/lib/source-health.ts 里的常数一致（改 timer 计划时两处一起改）。
 # 调度唯一来源是 phoenix 的 systemd timer（deploy/phoenix/，vercel.json 已无 crons）：
 #   SHUYUAN_REFRESH_ALERT_HOURS = 26 —— shuyuan 每日一次 + 2h 容差
-#   CRON_ALERT_HOURS           = 26 —— reclaim / drain 每日一次 + 2h 容差；followup 每 0.5h 一次（26 远大于 0.5）
+#   CRON_ALERT_HOURS           = 26 —— reclaim / drain 每日一次 + 2h 容差；followup 每 0.5h、
+#                                        ledgerSync（台账同步/准入续期）每 1h，26 对二者都远大于间隔
+#                                        （obsfix45 起这两条才真有心跳行可读，此前 followup 只在
+#                                         CRON_ALERT_HOURS 的注释里被提到、实际无人判它）
 #   ADMISSION_ALERT_HOURS      = 30 —— admission 一天两轮（02:00 刷新尾部 / 14:00 独立轮，任一成功
 #                                        即刷新成功行），30h = 一轮整体失败后的最坏间隔 24h + 漂移余量；
 #                                        一轮失败不告警，两轮都失败才告警（42-admhealth）。
@@ -104,6 +107,19 @@ jobs:
             # 42-admhealth：准入成功行（02:00 刷新尾部与 14:00 独立轮共记）。部署后首轮成功前是 null，
             # check_iso 对 null 的处理与其他项一致（「从未记录到成功」告警）——首次告警窗口见任务报告。
             check_iso "admission" "$(jq -r '.crons.admission.lastSuccessAt' health.json)" "$ADMISSION_ALERT_HOURS"
+            # obsfix45 缺陷1：追更轮（phoenix zhaoshu-cron-followup.timer，每 0.5h）。此前该轮对
+            # cron_health 只写租约行 followup_probe_lease，其 last_success_at 是**到期时刻**（now()+TTL，
+            # 未来时间）⇒ timer 停摆或路由 502 时它照样「新鲜」，全静默。现在读的是真成功心跳行 followup。
+            # 阈值沿用 CRON_ALERT_HOURS=26（远大于 0.5h 间隔）：单次上游抖动不告警，代价是最坏 26h 才发现停摆。
+            # 首次告警窗口：新版 web 部署后到第一轮追更跑完（≤30min）之间该行不存在，会报一次「从未记录到成功」。
+            check_iso "followup" "$(jq -r '.crons.followup.lastSuccessAt' health.json)" "$CRON_ALERT_HOURS"
+            # obsfix45 缺陷2：台账同步（phoenix zhaoshu-repo-rollover.timer 的 ExecStartPost，每 1h 跑
+            # scripts/sync-ledger-capacity.mjs）。它承担 F1 准入续期（每轮把 ready+granted 行的
+            # admission_valid_until 顺延 30 天）；停摆 = 30 天后准入悬崖重现（2026-11-12 那次），而库里
+            # 没有别的东西会因为「没续期」而变陈旧。心跳行 ledger_sync 由脚本自己在核对成功时写。
+            # ⚠️ 部署顺序：本行生效后，若 phoenix 上的脚本还是旧版（不写心跳），探针会持续报
+            # 「ledgerSync 从未记录到成功」。先 scp 新脚本到 /opt/zhaoshu-download-b/scripts/ 再放行本改动。
+            check_iso "ledgerSync" "$(jq -r '.crons.ledgerSync.lastSuccessAt' health.json)" "$CRON_ALERT_HOURS"
             if [ "$(jq -r '.ok' health.json)" != "true" ] && [ -z "$reason" ]; then
               reason="端点自报 ok=false，但未匹配到具体原因（阈值口径可能与 src/lib/source-health.ts 漂移）"
             fi
@@ -139,7 +155,7 @@ jobs:
               fi
             fi
           elif [ -n "$number" ]; then
-            gh issue comment "$number" --body "已恢复：健康端点 ok=true，池新鲜度与三条 cron 均在阈值内。"
+            gh issue comment "$number" --body "已恢复：健康端点 ok=true，池新鲜度与全部 cron 心跳（shuyuan / reclaim / drain / admission / followup / ledgerSync）均在阈值内。"
             gh issue close "$number"
           else
             echo "健康，且无未关闭的告警 issue"

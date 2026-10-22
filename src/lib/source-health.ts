@@ -12,6 +12,9 @@ import { DB_QUOTA_HEALTH_ROW } from './db-quota';
 // 调度唯一来源是 phoenix 的 systemd timer（deploy/phoenix/，2026-10-18 crons5 起 vercel.json
 // 已无 crons）：shuyuan / reclaim / drain / followup 的间隔恒为 24h（followup 为 0.5h），
 // shuyuan 阈值一律 = 24h + 2h 容差 = 26h（followup 沿用 26h，远大于 0.5h）。
+// CRON_ALERT_HOURS 同时是 followup（0.5h）与台账同步（1h）的阈值：对这两条亚日级 timer，26h
+// 意味着**最坏 26h 才发现停摆**，是有意选的宽松值——它们守的故障各有余裕（追更下一轮就能补上、
+// 准入续期有 30 天窗口），收紧到 2h 只会把单次上游抖动变成告警噪声。
 // shuyuan 原为 8h —— f474e27 定该值时调度还是每 6h 的 `0 2,8,14,20`，但 b561fba（实际上更早）
 // 已把调度改回每日一次 `0 2 * * *`，两条线各自都对、合起来 8h 阈值配上 HEALTH_URL 会**每天误报**。
 // 改 phoenix timer 的 OnCalendar 计划时必须同步改这里与 workflow 里的数字；`src/lib/vercel-cron.test.ts`
@@ -23,7 +26,17 @@ export const CRON_ALERT_HOURS = 26;
 // 漂移与探针采样（3h 一次）余量。比 26h 宽是为了「一轮失败不告警、两轮都失败才告警」。
 export const ADMISSION_ALERT_HOURS = 30;
 
-export type CronName = 'reclaim' | 'drain' | 'admission';
+/**
+ * 台账同步（zhaoshu-repo-rollover.timer 的 ExecStartPost，每小时一轮）的成功行名。
+ * 该行由 scripts/sync-ledger-capacity.mjs 自己写（脚本自包含、不 import TS，故行名在这里
+ * 与脚本里各写一次字面值——改一处必须改两处，本仓无编译期手段可钉）。
+ * 为什么要有它：那个 timer 承担 F1 准入续期（每轮把 ready+granted 行的 admission_valid_until
+ * 顺延 30 天）。它停摆 = 30 天后 2026-11-12 那种「三仓准入同时到期、发布全停」的悬崖重现，
+ * 而库里没有任何别的东西会因为「没续期」而变陈旧到可观测。
+ */
+export const LEDGER_SYNC_HEALTH_ROW = 'ledger_sync';
+
+export type CronName = 'reclaim' | 'drain' | 'admission' | 'followup';
 
 /** 各 cron 上次成功时间（ISO-8601 文本；null = 从未记录到一次成功）。 */
 export interface CronSuccessTimes {
@@ -32,15 +45,39 @@ export interface CronSuccessTimes {
   /** 准入上次成功（42-admhealth）：02:00 刷新尾部与 14:00 独立轮两个入口共记同一行。 */
   admission: string | null;
   /**
+   * 追更轮上次成功（obsfix45）：runFollowupRound 真跑完一轮才记；租约被占而跳过（skipped:'lease'）
+   * **不记**——那不是完成，拿跳过冒充成功会把「轮次一直空转」显示成健康。
+   */
+  followup: string | null;
+  /** 台账同步/准入续期上次成功（obsfix45），行名见 LEDGER_SYNC_HEALTH_ROW。 */
+  ledgerSync: string | null;
+  /**
    * 同表另一行（41-q402fix）：最近一次发现数据库配额错误的时刻（库恢复可写后由各进程补记，
    * 见 db-quota.ts recordDbQuotaSeen）；不是 cron 成功时间，不参与 ok 判据。从未记录为 null。
    */
   dbQuotaSeenAt: string | null;
 }
 
+/**
+ * cron_health 行名 → CronSuccessTimes 字段。行名是库里的字面值，这张表就是「哪些行算成功心跳」
+ * 的唯一判据：**同表还住着租约行**（admission_lease / followup_probe_lease，它们的 last_success_at
+ * 存的是租约**到期时刻**，是未来时间）与配额发现行，都不在本表里，因此绝不会被当成成功心跳。
+ */
+const CRON_ROW_FIELDS: Record<string, keyof CronSuccessTimes> = {
+  reclaim: 'reclaim',
+  drain: 'drain',
+  admission: 'admission',
+  followup: 'followup',
+  [LEDGER_SYNC_HEALTH_ROW]: 'ledgerSync',
+};
+
 // cron 成功分支调用一次。监控写入失败绝不能把 cron 本身打挂（否则告警系统自己制造故障）：
 // 吞掉异常、只记一行日志。写失败时健康端点会看到该 cron 的 lastSuccessAt 陈旧，这本身也是信号。
 // 42-admhealth：name='admission' 由 shuyuan.ts 准入轮成功分支调（见 runAdmissionRound / admitRows 尾部）。
+// obsfix45：name='followup' 由 followup.ts 的 runFollowupRound 在**真跑完一轮**时调。
+// 台账同步行（LEDGER_SYNC_HEALTH_ROW）不经本函数——写它的 scripts/sync-ledger-capacity.mjs
+// 是自包含脚本（部署到 phoenix 与只装 serverless 的探针同目录，不 import 仓内 TS），行名与
+// upsert 语句在脚本内就地内联。
 export async function recordCronSuccess(name: CronName): Promise<void> {
   try {
     await getSql()`
@@ -53,15 +90,18 @@ export async function recordCronSuccess(name: CronName): Promise<void> {
   }
 }
 
-// 一次查询读回全部 cron 行（表最多三行，不做动态 WHERE IN）。缺行归一为 null。
+// 一次查询读回全部 cron 行（表最多几行，不做动态 WHERE IN）。缺行归一为 null。
 export async function readCronSuccessTimes(): Promise<CronSuccessTimes> {
   const rows = await getSql()`
     SELECT name, last_success_at::text AS last_success_at FROM cron_health` as {
     name: string; last_success_at: string | null;
   }[];
-  const out: CronSuccessTimes = { reclaim: null, drain: null, admission: null, dbQuotaSeenAt: null };
+  const out: CronSuccessTimes = {
+    reclaim: null, drain: null, admission: null, followup: null, ledgerSync: null, dbQuotaSeenAt: null,
+  };
   for (const row of rows) {
-    if (row.name === 'reclaim' || row.name === 'drain' || row.name === 'admission') out[row.name] = row.last_success_at;
+    const field = CRON_ROW_FIELDS[row.name];
+    if (field) out[field] = row.last_success_at;
     else if (row.name === DB_QUOTA_HEALTH_ROW) out.dbQuotaSeenAt = row.last_success_at;
   }
   return out;

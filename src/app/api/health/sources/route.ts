@@ -13,7 +13,8 @@ import { dbQuotaLatch, requestHitDbQuota, withDbQuotaGuard } from '@/lib/db-quot
 //
 // 🔴 红线（硬性）：payload 只含聚合数字与时间戳——不得出现源站域名 / URL、源名、用户 id、
 // 任何凭据，或任何可在别处复用的标识。字段集是契约，多一个键都算缺陷（route.test.ts 用
-// Object.keys(...).sort() 精确比对钉死）。
+// Object.keys(...).sort() 精确比对钉死）。新增键必须与 route.test.ts 的契约集合同一次提交改
+// （obsfix45 加了 crons.followup 与 crons.ledgerSync 两个键，都是纯时间戳，无标识）。
 //
 // 失败语义：任何异常都返回 200 + ok:false，**绝不 500**——探针必须能区分「端点挂了」
 // （HTTP 非 200 / 解析不出 JSON）与「池子陈旧或 cron 没跑」（200 + ok:false）。
@@ -35,6 +36,10 @@ interface SourceHealth {
     reclaim: { lastSuccessAt: string | null };
     drain: { lastSuccessAt: string | null };
     admission: { lastSuccessAt: string | null };
+    /** 追更轮（obsfix45）：只透传，不参与 ok 判据。 */
+    followup: { lastSuccessAt: string | null };
+    /** 台账同步 / F1 准入续期（obsfix45）：只透传，不参与 ok 判据。 */
+    ledgerSync: { lastSuccessAt: string | null };
   };
   dbQuota: { state: 'ok' | 'exceeded'; lastSeenAt: string | null };
 }
@@ -50,6 +55,8 @@ function emptyHealth(): SourceHealth {
       reclaim: { lastSuccessAt: null },
       drain: { lastSuccessAt: null },
       admission: { lastSuccessAt: null },
+      followup: { lastSuccessAt: null },
+      ledgerSync: { lastSuccessAt: null },
     },
     dbQuota: { state: 'ok', lastSeenAt: null },
   };
@@ -91,6 +98,13 @@ async function handleGET() {
     // 准入成功行（42-admhealth）：两个准入入口（02:00 刷新尾部 / 14:00 独立轮）共记同一行。
     // 只透传，不参与 ok 判据（ok 判据保持池新鲜度 + 三条 cron，阈值差异在探针侧按 30h 单独判）。
     health.crons.admission.lastSuccessAt = crons.admission;
+    // obsfix45：追更轮与台账同步的成功心跳，同样只透传、不进 ok。
+    // 为什么这两条（连同 admission）不拉低 ok：ok 是「核心读取链是否活着」的粗判据，唯一消费方是
+    // 探针 workflow，而探针**逐条** cron 判龄（见 source-health.yml 的 check_iso 调用）——告警粒度
+    // 在那里，不在 ok。把三条辅助心跳也并进 ok 只会让「追更轮空转」把整个端点染红，反而看不出
+    // 是哪条停了；且新接线的行在部署后首轮成功前是 null，并进 ok 会造成一段必然的假红窗口。
+    health.crons.followup.lastSuccessAt = crons.followup;
+    health.crons.ledgerSync.lastSuccessAt = crons.ledgerSync;
     health.ok = poolFresh(pool.refreshedAtAgeHours)
       && isFresh(crons.reclaim, CRON_ALERT_HOURS)
       && isFresh(crons.drain, CRON_ALERT_HOURS);

@@ -8,7 +8,7 @@ const mocks = vi.hoisted(() => ({ getSql: vi.fn() }));
 vi.mock('@/lib/db', () => ({ getSql: mocks.getSql }));
 
 import {
-  ADMISSION_ALERT_HOURS, CRON_ALERT_HOURS, SHUYUAN_REFRESH_ALERT_HOURS,
+  ADMISSION_ALERT_HOURS, CRON_ALERT_HOURS, LEDGER_SYNC_HEALTH_ROW, SHUYUAN_REFRESH_ALERT_HOURS,
   hoursSince, readAdmissionCheckedAgeHours, readCronSuccessTimes, recordCronSuccess,
 } from './source-health';
 
@@ -59,7 +59,8 @@ describe('source-health (S5-1)', () => {
     const sql = sqlMock(async () => [{ name: 'drain', last_success_at: '2026-09-23T06:00:00.000Z' }]);
     mocks.getSql.mockReturnValue(sql);
     expect(await readCronSuccessTimes()).toEqual({
-      reclaim: null, drain: '2026-09-23T06:00:00.000Z', admission: null, dbQuotaSeenAt: null,
+      reclaim: null, drain: '2026-09-23T06:00:00.000Z', admission: null,
+      followup: null, ledgerSync: null, dbQuotaSeenAt: null,
     });
     expect(sql).toHaveBeenCalledOnce();
   });
@@ -71,7 +72,8 @@ describe('source-health (S5-1)', () => {
     ]);
     mocks.getSql.mockReturnValue(sql);
     expect(await readCronSuccessTimes()).toEqual({
-      reclaim: '2026-09-23T05:00:00.000Z', drain: null, admission: null, dbQuotaSeenAt: '2026-09-25T03:43:00.000Z',
+      reclaim: '2026-09-23T05:00:00.000Z', drain: null, admission: null,
+      followup: null, ledgerSync: null, dbQuotaSeenAt: '2026-09-25T03:43:00.000Z',
     });
     expect(sql).toHaveBeenCalledOnce();
   });
@@ -84,6 +86,30 @@ describe('source-health (S5-1)', () => {
     mocks.getSql.mockReturnValue(sql);
     expect(await readCronSuccessTimes()).toMatchObject({ admission: '2026-09-27T14:02:00.000Z' });
     expect((await readCronSuccessTimes()).dbQuotaSeenAt).toBeNull();
+  });
+
+  // obsfix45：追更轮与台账同步的成功心跳行。同表的 followup_probe_lease 存的是**到期时刻**
+  // （now()+TTL，未来时间），绝不能被当成 followup 的成功心跳——那正是本缺陷的原形态。
+  it('readCronSuccessTimes 带回 followup 与 ledger_sync 行，两个租约行都不串进来', async () => {
+    const sql = sqlMock(async () => [
+      { name: 'followup', last_success_at: '2026-10-22T09:00:00.000Z' },
+      { name: 'followup_probe_lease', last_success_at: '2026-10-22T09:30:50.000Z' },
+      { name: LEDGER_SYNC_HEALTH_ROW, last_success_at: '2026-10-22T09:37:00.000Z' },
+    ]);
+    mocks.getSql.mockReturnValue(sql);
+    expect(await readCronSuccessTimes()).toEqual({
+      reclaim: null, drain: null, admission: null,
+      followup: '2026-10-22T09:00:00.000Z',
+      ledgerSync: '2026-10-22T09:37:00.000Z',
+      dbQuotaSeenAt: null,
+    });
+  });
+
+  it('recordCronSuccess 接受 followup（CronName 覆盖追更轮心跳行）', async () => {
+    const sql = sqlMock(async () => []);
+    mocks.getSql.mockReturnValue(sql);
+    await recordCronSuccess('followup');
+    expect(sql.mock.calls[0][1]).toBe('followup');
   });
 
   it('readAdmissionCheckedAgeHours 取 MAX 并换算成小时；空表为 null', async () => {

@@ -16,6 +16,7 @@
 import { getSql, ensureSchema } from './db';
 import { createDeadline } from './deadline';
 import { resolveDownloadSource } from './download-source';
+import { recordCronSuccess } from './source-health';
 import { SourcePolicyError } from './source-policy';
 import { resolveSourceBook, SourceReaderError, SourceRequestContext, type SourceCatalog } from './source-reader';
 import type { SourceBookIdentity } from './source-parser';
@@ -33,9 +34,16 @@ export const FOLLOWUP_CANDIDATE_LIMIT = 6;
 export const FOLLOWUP_BASE_INTERVAL_MS = 4 * 60 * 60 * 1000;
 /** 退避上限（连续 3 轮无进展即到顶：连载停了或站方长期不可达）。 */
 export const FOLLOWUP_MAX_INTERVAL_MS = 24 * 60 * 60 * 1000;
-/** 重叠保护用的租约行（cron_health），与准入租约同结构、不同行名 → 两轮互不干扰。 */
+/**
+ * 重叠保护用的租约行（cron_health），与准入租约同结构、不同行名 → 两轮互不干扰。
+ * ⚠️ 这行**不是**成功心跳：它的 last_success_at 存的是租约**到期时刻**（now()+TTL，未来时间），
+ * 每轮开始时就被推进，跑没跑完都一样。判活用同表的 'followup' 行（见 runFollowupRound 尾部），
+ * 健康端点与探针读的也是那一行——把租约行当心跳会让「timer 在打但每轮都失败」永远看不出来。
+ */
 export const FOLLOWUP_LEASE_ROW = 'followup_probe_lease';
 export const FOLLOWUP_LEASE_TTL_MS = 50_000;
+/** 成功心跳行名（obsfix45）。与 FOLLOWUP_LEASE_ROW 同表不同行，语义见 recordCronSuccess。 */
+export const FOLLOWUP_HEALTH_ROW = 'followup';
 
 /**
  * 把多个取消信号合成一个。刻意不用 AbortSignal.any：仓里 lib.dom 声明缺 any() 的重载，
@@ -401,6 +409,10 @@ export async function runFollowupRound(parentSignal?: AbortSignal, deps: Followu
       else if (handled.outcome === 'rebased') report.rebased += 1;
       else if (handled.outcome === 'probe_failed') report.failed += 1;
     }
+    // obsfix45：真跑完一轮才记成功心跳（上面的 skipped:'lease' 分支不记）。候选为 0 也记——
+    // 「这一轮没有到期候选」是正常空转，心跳要证明的是 timer/路由/库这条链活着。
+    // recordCronSuccess 自己吞异常，写不进心跳不会把追更轮打挂。
+    await recordCronSuccess(FOLLOWUP_HEALTH_ROW);
     return { ...report, elapsedMs: Date.now() - startedAt };
   } finally {
     budget.dispose();
