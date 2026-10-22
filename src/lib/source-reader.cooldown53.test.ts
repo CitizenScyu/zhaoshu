@@ -215,3 +215,46 @@ describe('53 有效正窗口才结束源，保留普通失败后的可用候选'
     expect(ctx.requests).toBe(6);
   });
 });
+
+describe('46-probecool 补测：本地冷却拒绝与主机健康记账的边界', () => {
+  // 冷却表里预置一个未到期条目 ⇒ page() 在 beforeRequest 阶段就抛 SourceCooldownError，一次上游请求
+  // 都不发。该错误被 source-fetch 标 fromBeforeRequest ⇒ isTransportError 排除 ⇒ hostFailureKind 返
+  // null ⇒ 不记账；SourceCooldownError 的注释就是这么要求的（本地拒绝不代表又收到一次 HTTP 503）。
+  // 判据必须是「连拒两次」：HOST_SUSPECT_FAILURES=2，误记账两次就到线、isHostSuspect 翻 true。
+  // 上面 53 用例里那条 isHostSuspect=false 钉不住这点 —— 同一次 429 本身就记 1 次，本来就未到门槛。
+  it('连续两次被本地冷却拦下：不出网、也不把好源写进主机健康', async () => {
+    const health = await import('./source-host-health');
+    const cooldowns = new Map([[service.sourceStationKey(host + '/good'), epoch + 60_000]]);
+    pages.set(host + '/good', { text: 'ok' }); // 站本身可达：冷却逻辑若失效，请求会成功而不是被拒
+    const ctx = new service.SourceRequestContext(new AbortController().signal, undefined, { cooldownSlots: cooldowns });
+    for (let i = 0; i < 2; i += 1) {
+      await expect(ctx.page(host + '/good')).rejects.toMatchObject({ code: 'SOURCE_SCOPE_EXHAUSTED', status: 503 });
+    }
+    expect(requests).toEqual([]); // 一次上游请求都没发
+    expect(health.isHostSuspect('cooldown.test')).toBe(false);
+    expect(cooldowns.size).toBe(1); // 未到期条目原样留着，不被 checkCooldown 顺手删掉
+  });
+
+  it('429 不带 Retry-After：照记主机健康（两次即 suspect），但不设冷却、同站下一个请求照常出网', async () => {
+    // 冷却窗口只在源站明确给出正 Retry-After 时才设（page() catch 里的 positiveRetryAfter）：裸 429
+    // 没说「等多久」，凭空设窗口等于给全站加一把没有期限的锁。但它确实是限流信号 ⇒ isSourceThrottled
+    // 认 429 ⇒ recordHostFailure('http_429') 照记，两件事不能互相顶替。
+    // 三次请求必须在**同一棵请求树**里：冷却表是树内共享（53 语义），换成三个独立 root 的话
+    // 各自新建空表，误设冷却也影响不到下一次，这条就钉不住了。
+    const health = await import('./source-host-health');
+    pages.set(host + '/rl', { status: 429 }); // 无 retry-after 头
+    pages.set(host + '/good', { text: 'ok' });
+    const ctx = root();
+    await expect(ctx.child(host).page(host + '/rl')).rejects.toMatchObject({ status: 429 });
+    expect(health.isHostSuspect('cooldown.test')).toBe(false); // 1 次未到 HOST_SUSPECT_FAILURES
+    await vi.advanceTimersByTimeAsync(400); // 过掉同站节流槽的 350ms 间隔
+    await expect(ctx.child(host).page(host + '/rl')).rejects.toMatchObject({ status: 429 });
+    expect(health.isHostSuspect('cooldown.test')).toBe(true); // 第 2 次到线 ⇒ 候选排序会避开这个站
+    await vi.advanceTimersByTimeAsync(400);
+    // suspect 只影响排序、不设冷却：同站另一个 url 立刻照常出网。
+    // 裸 429 若被误设冷却，这里会是 SOURCE_SCOPE_EXHAUSTED 且 requests 不增。
+    await expect(ctx.page(host + '/good')).resolves.toMatchObject({ text: 'ok' });
+    expect(requests.map(call => call.url)).toEqual([host + '/rl', host + '/rl', host + '/good']);
+    expect(health.isHostSuspect('cooldown.test')).toBe(false); // 成功一次即恢复（既有语义）
+  });
+});
