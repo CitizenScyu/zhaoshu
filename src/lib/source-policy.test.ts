@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import cases from './fixtures/source-policy.json';
-import { refreshSupportedHosts, SourcePolicyError, upgradeSourceTemplateUrl, validateSourceUrl } from './source-policy';
+import { refreshSupportedHosts, SourcePolicyError, stationKeyOfHost, stationKeyOfUrl, upgradeSourceTemplateUrl, validateSourceUrl } from './source-policy';
 
 describe('书源精确 allowlist（与 worker 共用夹具）', () => {
   beforeEach(() => vi.stubGlobal('fetch', vi.fn(() => { throw new Error('策略测试禁止网络'); })));
@@ -86,3 +86,32 @@ describe('模板 URL http→https 升级（41-urlfix）', () => {
     expect(() => validateSourceUrl(upgradeSourceTemplateUrl('http://user@book15.net/s'))).toThrow(SourcePolicyError);
   });
 });
+
+// stationkey43：全站唯一的同站口径。m./www./apex 互为孪生（生产实测 m.zhulang.com ≡ www.zhulang.com），
+// 任何同站判定不得再各写一份前缀逻辑或只认 book15 静态别名对。
+describe('站键归一 stationKeyOfHost/stationKeyOfUrl（stationkey43）', () => {
+  it('www./m./apex 三形态同键；大小写归一', () => {
+    expect(stationKeyOfHost('www.book15.net')).toBe('book15.net');
+    expect(stationKeyOfHost('m.book15.net')).toBe('book15.net');
+    expect(stationKeyOfHost('book15.net')).toBe('book15.net');
+    expect(stationKeyOfHost('WWW.Book15.NET')).toBe('book15.net');
+    expect(stationKeyOfHost('M.Zhulang.Com')).toBe('zhulang.com');
+  });
+
+  it('非孪生前缀逐字不动；只剥一层；空串与退化形态不崩', () => {
+    expect(stationKeyOfHost('api.x.example')).toBe('api.x.example');
+    expect(stationKeyOfHost('mobile.x.example')).toBe('mobile.x.example');
+    expect(stationKeyOfHost('wwww.x.example')).toBe('wwww.x.example'); // 'wwww' 不以 'www.' 开头
+    expect(stationKeyOfHost('www.m.x.example')).toBe('m.x.example'); // 只剥一层
+    expect(stationKeyOfHost('')).toBe('');
+    expect(stationKeyOfHost('m.')).toBe('');
+  });
+
+  it('stationKeyOfUrl 取 hostname 后同口径归一；非法 URL 返回空串', () => {
+    expect(stationKeyOfUrl('https://m.x.example/a/b?c=1#d')).toBe('x.example');
+    expect(stationKeyOfUrl('https://x.example/')).toBe('x.example');
+    expect(stationKeyOfUrl('notaurl')).toBe('');
+    expect(stationKeyOfUrl('')).toBe('');
+  });
+});
+

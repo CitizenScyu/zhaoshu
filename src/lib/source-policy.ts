@@ -54,6 +54,25 @@ export function alternateSourceHost(hostname: string): SupportedSourceHost | nul
   return index === -1 ? null : SUPPORTED_SOURCE_HOSTS[1 - index];
 }
 
+// 站键归一（全站唯一的「同站」口径）：www./m. 前缀归 apex —— www.X / m.X / X 是同一个站。
+// 所有「同站判定/记账/调度」共用本函数：节流分桶与 429 冷却、suspect 健康记账、换源降级与
+// 确认反查（source-reader / source-host-health）、引擎池同站去重（shuyuan）、下载侧池内反查
+// （download-source / runtime-download / scripts/engine-fetch.mjs）、扇出面板 hostKey。
+// 禁止各写一份：fankey42 只把 shuyuan 池去重改成剥前缀，其余四处仍只认 book15 静态别名对，
+// www.X 与 m.X 互判他站（孪生 host 不被降队尾、冷却与 suspect 记忆不共享），stationkey43 收敛。
+// 与 alternateSourceHost 的分工：后者是「真向另一个 host 发请求/认跳转身份」的白名单
+// （换 host 兜底、redirectedPageIdentity），只在确认同内容的内建对内启用、刻意不泛化；
+// 本函数只做归类、不发请求，按前缀形态对任意站归一。
+export function stationKeyOfHost(hostname: string): string {
+  const host = hostname.toLowerCase();
+  return host.startsWith('www.') || host.startsWith('m.') ? host.slice(host.indexOf('.') + 1) : host;
+}
+
+/** URL 形态的站键；解析失败返回空串（与各调用点 hostOf 的 '' 口径一致，调用方自行把空串判为不匹配）。 */
+export function stationKeyOfUrl(url: string): string {
+  try { return stationKeyOfHost(new URL(url).hostname); } catch { return ''; }
+}
+
 export class SourcePolicyError extends Error {
   constructor(reason: string) {
     super(reason);
