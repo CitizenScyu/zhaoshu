@@ -17,6 +17,18 @@ type UnsafeFragment = { readonly __pgliteUnsafe: true; readonly raw: string };
 const isUnsafe = (value: unknown): value is UnsafeFragment =>
   typeof value === 'object' && value !== null && '__pgliteUnsafe' in value;
 
+/** 嵌套 sql`` 片段（生产 neon 支持把子模板内插进外层，user-data / library-read-task 依赖它）。 */
+const isNestedFragment = (value: unknown): value is { text: string; params: unknown[] } =>
+  typeof value === 'object' && value !== null && !isUnsafe(value)
+    && 'text' in value && 'params' in value
+    && typeof (value as { text: unknown }).text === 'string'
+    && Array.isArray((value as { params: unknown }).params);
+
+/** 嵌套片段的 $n 按外层已绑参数量重编号。片段 text 由本适配器生成，静态部分不含字面量 $n。 */
+function renumberPlaceholders(text: string, offset: number): string {
+  return text.replace(/\$(\d+)/g, (_, digits: string) => `$${Number(digits) + offset}`);
+}
+
 /** 把字面量与插值合成 ($n, params)。与生产 neon 的绑定顺序一致。 */
 function toStatement(parts: TemplateStringsArray, values: unknown[]): { text: string; params: unknown[] } {
   let text = '';
@@ -27,6 +39,11 @@ function toStatement(parts: TemplateStringsArray, values: unknown[]): { text: st
       const value = values[index];
       // unsafe 片段原样内联（与 neon 一致），其余按参数绑定。
       if (isUnsafe(value)) { text += value.raw; return; }
+      if (isNestedFragment(value)) {
+        text += renumberPlaceholders(value.text, params.length);
+        params.push(...value.params);
+        return;
+      }
       params.push(value);
       text += `$${params.length}`;
     }
