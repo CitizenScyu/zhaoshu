@@ -1,4 +1,4 @@
-import { alternateSourceHost } from './source-policy';
+import { stationKeyOfHost } from './source-policy';
 
 // 41-M1.3 主机级健康记忆：进程内、按 host 记「连续传输层硬失败」，只用来给源排序（降序，不剔除）。
 // 背景（read-smoke-41 §0/§5）：book15 自 09-21 起 Cloudflare 522，对它每调一次 page() 约 12.7s
@@ -64,12 +64,10 @@ export function sourceHostSuspectMs(env: Record<string, string | undefined> = pr
     : SOURCE_HOST_SUSPECT_MS;
 }
 
-// 同站 apex ↔ www（book15.net ↔ www.book15.net）是一个站：fetch 层在两者间换 host 兜底，deprioritizeSource
-// 也把它们当同站。键取两者中字典序小的那个，两边的记录落在同一条上。
+// 健康记账按全站统一站键（stationKeyOfHost：www./m./apex 同站）——429/超时的账本跨孪生 host 共享：
+// 对源站而言它们是同一个站，一个孪生被打挂，另一个孪生也不该再被当健康站第一个试（stationkey43）。
 function hostKey(host: string): string {
-  const normalized = host.toLowerCase();
-  const alternate = alternateSourceHost(normalized);
-  return alternate && alternate < normalized ? alternate : normalized;
+  return stationKeyOfHost(host);
 }
 
 function hostnameOf(url: string): string {

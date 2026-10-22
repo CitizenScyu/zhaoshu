@@ -2,7 +2,7 @@ import { getSql } from '@/lib/db';
 import { engineHosts, normalizeUrlSql } from '@/lib/supported-sources-server';
 import { isRecord } from '@/lib/sanitize';
 import { createDeadline, raceDeadline, type RequestDeadline } from '@/lib/deadline';
-import { validateSourceUrl, refreshSupportedHosts, supportedHostList, supportedHostVersion, upgradeSourceTemplateUrl, isForbiddenHostAddress, isPermanentlyDisabledUrl, permanentDisableHostList } from '@/lib/source-policy';
+import { validateSourceUrl, refreshSupportedHosts, supportedHostList, supportedHostVersion, upgradeSourceTemplateUrl, isForbiddenHostAddress, isPermanentlyDisabledUrl, permanentDisableHostList, stationKeyOfUrl } from '@/lib/source-policy';
 import { engineSourceUsable } from '@/lib/source-usability';
 import {
   BUILTIN_SOURCE_HOSTS, builtinUrlPrefixes,
@@ -312,18 +312,19 @@ function traversalOf(eligible: readonly ReadingSource[]): ReadingSource[] {
 }
 
 /**
- * 按全序逐条取，引擎源同站（siteKeyOfUrl：apex ↔ www 算一个站）只留第一份，取满 limit 即停；builtin 不参与去重。
+ * 按全序逐条取，引擎源同站（stationKeyOfUrl：www./m./apex 算一个站，与阅读侧节流/健康/降级同一站键）
+ * 只留第一份，取满 limit 即停；builtin 不参与去重。
  * traversalOf 与 fanoutOf 共用。
  */
 function firstPerHost(sources: readonly ReadingSource[], limit: number): ReadingSource[] {
-  const seenHosts = new Set<string>();
+  const seenStations = new Set<string>();
   const out: ReadingSource[] = [];
   for (const source of sources) {
     if (out.length >= limit) break;
     if (source.tier !== 'builtin') {
-      const host = siteKeyOfUrl(source.url);
-      if (seenHosts.has(host)) continue;
-      seenHosts.add(host);
+      const station = stationKeyOfUrl(source.url);
+      if (seenStations.has(station)) continue;
+      seenStations.add(station);
     }
     out.push(source);
   }
@@ -744,12 +745,6 @@ function hostOfUrl(url: string): string {
   try { return new URL(url).hostname; } catch { return ''; }
 }
 
-// 同站键：与 source-host-health 的 hostKey 同一口径（apex ↔ www 是一个站，book15.net ↔ www.book15.net 键同为 apex），
-// fankey42：www./m. 前缀都归 apex（冒烟实测 m.zhulang.com 与 www.zhulang.com 两份逐浪同时入池，浪费扇出名额）。
-function siteKeyOfUrl(url: string): string {
-  const host = hostOfUrl(url).toLowerCase();
-  return host.startsWith('www.') || host.startsWith('m.') ? host.slice(host.indexOf('.') + 1) : host;
-}
 
 /** 引擎档候选（设计 §5.2 的新增导出；M2-3 的放量/排序在此扩面）。 */
 export async function getEngineSources(signal: AbortSignal): Promise<ReadingSource[]> {

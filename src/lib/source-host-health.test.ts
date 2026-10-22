@@ -87,6 +87,17 @@ describe('判定：连续硬失败 ≥ 2 次且最近一次在窗口内 ⇒ susp
     expect(health.isHostSuspect('book15.net', 1)).toBe(false);
   });
 
+  it('stationkey43：m./www. 孪生与 apex 记同一条（站键统一后健康记忆跨孪生共享）', () => {
+    // 反例锚点：旧 hostKey 只认 book15 别名对，m./www. 各记各的——这条在旧实现下全红。
+    health.recordHostFailure('m.twin.test', 'timeout', 0);
+    health.recordHostFailure('www.twin.test', 'http_5xx', 0);
+    expect(health.isHostSuspect('twin.test', 1)).toBe(true);
+    expect(health.isHostSuspect('m.twin.test', 1)).toBe(true);
+    health.recordHostSuccess('www.twin.test'); // 任一孪生成功即清零整条
+    expect(health.isHostSuspect('m.twin.test', 1)).toBe(false);
+    expect(health.isHostSuspect('twin.test', 1)).toBe(false);
+  });
+
   it('⑥ 上限 256:满了淘汰最久没记过失败的 host;再记一次失败会刷新它的位置', () => {
     expect(health.HOST_HEALTH_MAX_ENTRIES).toBe(256);
     for (let i = 0; i < 256; i += 1) fail(`h${i}.test`);

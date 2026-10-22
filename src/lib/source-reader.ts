@@ -3,7 +3,7 @@ import { getSql } from './db';
 import { getReadingSources, getSourcePools, type ReadingSource, type SelectableSources } from './shuyuan';
 import { shuyuanReadCacheTtlMs } from './read-cache-ttl';
 import { fetchSourceText, sourceAbortable, SourceHttpError, SOURCE_CONNECT_TIMEOUT_MS, SOURCE_TIMEOUT_MS, type SourcePageRequest } from './source-fetch';
-import { SourcePolicyError, alternateSourceHost, validateSourceUrl } from './source-policy';
+import { SourcePolicyError, stationKeyOfUrl, validateSourceUrl } from './source-policy';
 import { sourceRevision } from './source-revision';
 import { isHostSuspect, orderByHostHealth } from './source-host-health';
 import { normalizeBookTitle } from './book-identity';
@@ -134,7 +134,7 @@ interface SharedSourceBudget {
 
 /**
  * 节流分桶键（41-fanout P1-C，legado ConcurrentRateLimiter 按源限速同构）：同站同一桶，异站互不等待。
- * 同站备用 host（book15.net ↔ www.book15.net，fetch 层换 host 兜底）归一到同一桶——对源站而言是同一个站。
+ * 同站孪生 host（www./m./apex，sourceStationKey 归一）归到同一桶——对源站而言是同一个站。
  * env `SOURCE_THROTTLE_PER_HOST=0` 回滚为全局单槽（所有请求共用一个桶，即改动前语义）。
  * 键取 page() 入参 URL 的 hostname；请求中途跳转到别站仍记在入参站的桶上（跳转次数本身有上限）。
  */
@@ -144,14 +144,13 @@ export function sourceThrottleKey(url: string, env: SourceTuningEnv = process.en
 }
 
 /**
- * 站键：hostname，同站备用 host 归一到同一个（节流分桶的按站部分）。扇出候选列表把它作为 hostKey 下发，
- * 浏览器据此做同站串行（41-srcurl）；不含 SOURCE_THROTTLE_PER_HOST=0 的全局单槽回滚 —— 那是服务端节流的
- * 回滚开关，下发成 '*' 会让浏览器把整轮扇出串成单发。
+ * 站键 = stationKeyOfUrl（www./m. 前缀归 apex，source-policy 的全站单一口径）：节流分桶与 429 冷却
+ * 都按它归站，孪生 host 共享同一桶/同一份冷却。扇出候选列表把它作为 hostKey 下发，浏览器据此做同站
+ * 串行（41-srcurl）；不含 SOURCE_THROTTLE_PER_HOST=0 的全局单槽回滚 —— 那是服务端节流的回滚开关，
+ * 下发成 '*' 会让浏览器把整轮扇出串成单发。
  */
 export function sourceStationKey(url: string): string {
-  const hostname = hostnameOf(url);
-  const alternate = alternateSourceHost(hostname);
-  return alternate && alternate < hostname ? alternate : hostname;
+  return stationKeyOfUrl(url);
 }
 
 // 41-fanfix N1：扇出时浏览器同时发 N 个独立的 probe 请求，每个请求各自一棵 context 树，
@@ -551,21 +550,22 @@ function rankSimilarCandidates(expected: SourceBookIdentity, found: SourceSimila
 }
 
 /**
- * 洞 3:把**当前源**(含同站备用 host)的候选降到队尾 —— 稳定重排,其余保持原有优先级;
+ * 洞 3:把**当前源**(含同站孪生 host)的候选降到队尾 —— 稳定重排,其余保持原有优先级;
  * 全网只剩同站候选时它们仍能被选到,只是排在最后,避免「同站换 URL 不换站」原地打转。
+ * 同站判定走全站统一站键（stationKeyOfUrl：www./m./apex 同站）——孪生 host 同样降队尾,
+ * 刚失败的站不会披着 m./www. 孪生的皮被当「他源」第一个再试（stationkey43）。
  * 章节级换源在此之上更严一格(见 switchSourceChapter):原源本身(同一 url)先不进队列,
  * 只有他源全部确认无此书时才作为最后一个候选带 excludeBookUrl 再试一次。
  */
 function deprioritizeSource(sources: ReadingSource[], url: string | undefined): ReadingSource[] {
   if (!url) return sources;
-  const host = hostOf(url);
-  if (!host) return sources;
+  const station = stationKeyOfUrl(url);
+  if (!station) return sources;
   const current: ReadingSource[] = [];
   const rest: ReadingSource[] = [];
   for (const source of sources) {
-    const sourceHost = hostOf(source.url);
-    const sameStation = sourceHost === host || (sourceHost.length > 0 && alternateSourceHost(host) === sourceHost);
-    (sameStation ? current : rest).push(source);
+    const sourceStation = stationKeyOfUrl(source.url);
+    (sourceStation.length > 0 && sourceStation === station ? current : rest).push(source);
   }
   return current.length && rest.length ? [...rest, ...current] : sources;
 }
@@ -669,11 +669,11 @@ async function confirmSourceBook(
     // builtin 的 url 给引擎源的 bookUrl 算 sourceId/revision。匹配不到保持既有 sources[0]
     // 回退（单源池下等价），M2 收紧为 404。带 sourceUrl（扇出面板的确认）时改按源 url 精确定位，
     // 且 bookUrl 必须属于该源的站；同站多源时 host 反查只会取到池里排在前面的那个源的规则。
-    const targetHost = hostOf(url);
+    const targetStation = stationKeyOfUrl(url);
     const sameStation = (item: ReadingSource) => {
-      const host = hostOf(item.url);
-      // 同站备用 host（book15.net ↔ www.book15.net，fetch 层换 host 兜底）视为同一个源。
-      return host === targetHost || (host.length > 0 && alternateSourceHost(targetHost) === host);
+      // 同站孪生 host（www./m./apex 同键）视为同一个源——与节流/冷却/降级的站键同一口径（stationkey43）。
+      const station = stationKeyOfUrl(item.url);
+      return station.length > 0 && station === targetStation;
     };
     const source = options.sourceUrl !== undefined
       ? sources.find((item) => item.url === options.sourceUrl && sameStation(item))

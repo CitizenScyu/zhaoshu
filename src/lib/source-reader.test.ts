@@ -335,6 +335,32 @@ describe('online reader source resolution and budgets', () => {
     expect(onlySame.sourceName).toBe('同站备用');
   });
 
+  it('stationkey43：m. 孪生 host 同样判同站降到队尾——换源先试他站，不烧在刚失败站的孪生上', async () => {
+    // 反例锚点：旧 deprioritizeSource 只认 book15 静态别名对（本文件 mock 也只钉 www.reader.test），
+    // m.reader.test 被当他站 → 紧跟原源排第一，换源第一发就烧在同站孪生上。旧实现下本条红。
+    (await import('./source-policy')).refreshSupportedHosts(['reader.test', 'www.reader.test', 'm.reader.test', 'backup.test']);
+    const twin = { ...source, url: 'https://m.reader.test/twin', name: '同站孪生', searchUrl: '/twin/search.html?kw={{key}}' };
+    mocks.sources.mockResolvedValue([source, twin, backup]);
+    pages.set(backupSearch(), { text: '<a href="/books/details777.html">测试书</a>' });
+    pages.set(backupPage, { text: detail(777, '作者', ['第一章']) });
+    pages.set(backupChapter(777, 1), { text: chapterHtml('另一站正文') });
+    pages.set('https://m.reader.test/twin/search.html?kw=' + encodeURIComponent(book.title), {
+      text: '<a href="/books/details888.html">测试书</a>',
+    });
+    pages.set('https://m.reader.test/books/details888.html', { text: detail(888, '作者', ['第一章']) });
+    pages.set('https://m.reader.test/chapter/index888-1.html', { text: chapterHtml('孪生正文') });
+    const catalog = await service.resolveSourceBook(book, context(), { sources: [source, twin, backup] });
+    const alternative = await service.resolveSourceBook(catalog, context(), {
+      excludeBookUrl: catalog.bookUrl, sources: [source, twin, backup], preferAfterSourceUrl: catalog.sourceUrl,
+    });
+    expect(alternative.sourceName).toBe(backup.name); // 先出另一站，而不是同站孪生 m.reader.test
+    // 只剩孪生时仍能用（降级不是禁止）。
+    const onlyTwin = await service.resolveSourceBook(catalog, context(), {
+      excludeBookUrl: catalog.bookUrl, sources: [source, twin], preferAfterSourceUrl: catalog.sourceUrl,
+    });
+    expect(onlyTwin.sourceName).toBe('同站孪生');
+  });
+
   it('章节标题跨站写法差异仍能对齐;完全无关的章不匹配(洞 4)', async () => {
     const catalog = await service.resolveSourceBook(book, context());
     catalogs.set(catalog.version, catalog);
