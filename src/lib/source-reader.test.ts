@@ -3644,6 +3644,33 @@ describe('46-engfix:节流槽在 abort 时不留下幻影预占', () => {
     expect(stamps.filter((item) => item.url === url('b')).at(-1)!.at - t0).toBe(0);
   });
 
+  it('多路依次中止：只回退队尾那一格，残留 3×350ms 而非归零（已知限制，非回归）', async () => {
+    // 覆盖审查指出的测试缺口：上面只有「单个排队请求被中止」，正好漏掉多路依次中止的残留。
+    // 真实发射在 t0（表 → t0+350），A/B/C 依次预占到 t0+700/+1050/+1400。按 A→B→C 中止时，
+    // 只有 C 的槽仍等于自己预占的值 ⇒ 只有 C 回退，表停在 t0+1050。
+    // 即泄漏从 4×350 降到 3×350、没归零；量级有界且随时间自愈，彻底归零需要引用计数或队列。
+    const table = new Map<string, number>();
+    const root = () => new service.SourceRequestContext(new AbortController().signal, 12, { throttleSlots: table });
+    pages.set(url('c'), { text: 'ok-c' });
+    pages.set(url('d'), { text: 'ok-d' });
+    const t0 = Date.now();
+    const real = root().page(url('a'));
+    const queued = ['b', 'c', 'd'].map((path) => {
+      const controller = new AbortController();
+      const work = new service.SourceRequestContext(controller.signal, 12, { throttleSlots: table }).page(url(path));
+      return { controller, work };
+    });
+    await Promise.resolve();
+    const aborted = queued.map(({ controller, work }) => {
+      controller.abort(new Error('关面板'));
+      return expect(work).rejects.toThrow('关面板');
+    });
+    await Promise.all(aborted);
+    await real;
+    // 直接断言槽表：完全没有回退的话这里是 t0+1400。
+    expect([...table.values()]).toEqual([t0 + 1050]);
+  });
+
   it('并发语义不变：同一张表的并发请求仍各自拿到互不重叠的发射时刻', async () => {
     const table = new Map<string, number>();
     const root = () => new service.SourceRequestContext(new AbortController().signal, 12, { throttleSlots: table });
