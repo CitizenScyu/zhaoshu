@@ -6,14 +6,15 @@
 // 夹具与既有容量用例同款：createProductionSchema + initializeArtifactSchema +
 // initializeArtifactCapacitySchema 在隔离 PGlite 上建真实表；GitHub 侧是合成受控桩
 // （明确只验证本脚本消费受控响应的行为，不证明真实 GitHub 可达或真实容量）。
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import { readFileSync } from 'node:fs';
 import { initializeArtifactSchema } from '../src/lib/business-schema';
 import { initializeArtifactCapacitySchema } from '../src/lib/artifact-capacity-schema';
 import { loadPGlite, type PGliteLike } from '../src/lib/fixtures/pglite';
 import { createPGliteSql } from '../src/lib/fixtures/pglite-sql';
 import { createProductionSchema, seedV6MemberUser } from '../src/lib/fixtures/production-schema';
 import {
-  DEFAULT_TREE_ROOT, IncompleteTreeError, createGitHubTreeRequest, isCountedPath,
+  DEFAULT_TREE_ROOT, IncompleteTreeError, LEDGER_SYNC_HEALTH_ROW, createGitHubTreeRequest, isCountedPath,
   measureRepositoryCompressedBytes, parseSyncArgs, runSync, sumRegisteredLogicalBytes,
 } from './sync-ledger-capacity.mjs';
 
@@ -42,6 +43,20 @@ describe('参数解析：目标与 token 来源都必须显式，缺省 dry-run'
     expect(parseSyncArgs(['--database-url-env=PROD_URL', '--github-token-env=GH', '--tree-root=/books/'], {}).treeRoot).toBe('books');
     // 服务器上唯一那个 DATABASE_URL 就是本脚本的生产目标，必须放行（见脚本头「自包含性」注释）。
     expect(parseSyncArgs(['--database-url-env=DATABASE_URL', '--github-token-env=GITHUB_TOKEN'], {}).dbEnv).toBe('DATABASE_URL');
+  });
+});
+
+// obsfix45：心跳行名在脚本（.mjs，自包含不 import TS）与 src/lib/source-health.ts 里各写一次
+// 字面值。没有编译期手段能钉住这条一致性——行名漂移的话脚本照写、端点照读，两边永远对不上，
+// 表现是「探针报 ledgerSync 从未记录到成功」而 journal 里明明每小时都 recorded。
+describe('心跳行名两侧逐字同名', () => {
+  it('src/lib/source-health.ts 的 LEDGER_SYNC_HEALTH_ROW 与本脚本导出的行名一致', () => {
+    const tsSource = readFileSync(new URL('../src/lib/source-health.ts', import.meta.url), 'utf8');
+    const declared = /export const LEDGER_SYNC_HEALTH_ROW = '([^']+)'/.exec(tsSource);
+    expect(declared, 'source-health.ts 里找不到 LEDGER_SYNC_HEALTH_ROW 声明（改名了？两处必须同改）').not.toBeNull();
+    expect(LEDGER_SYNC_HEALTH_ROW).toBe(declared![1]);
+    // 端点侧还得真把这行映射进 crons.ledgerSync，否则读了也不透传。
+    expect(tsSource).toContain(`[LEDGER_SYNC_HEALTH_ROW]: 'ledgerSync'`);
   });
 });
 
@@ -446,6 +461,92 @@ maybe('runSync（PGlite 真表 + 合成 GitHub 桩）', () => {
     expect(report.repositories.map(r => r.admissionRenewal)).toEqual(['would-renew', 'skipped-not-eligible']);
     const after = String((await pg.query(`SELECT admission_valid_until FROM repository_capacity_ledger WHERE repository_id = 1`)).rows[0].admission_valid_until);
     expect(after).toBe(before);
+  });
+
+  // obsfix45 缺陷2：成功心跳。本脚本是 admission_valid_until **全系统唯一**的续期入口，它停摆
+  // = 30 天后准入悬崖重现（2026-11-12 那次三仓同时到期、发布全停）。而停摆在库里原本看不见：
+  // 字节不变的轮次连 updated_at 都不动（unchanged 分支零写）。故每轮核对成功写一行 cron_health，
+  // 由 /api/health/sources 透传、GitHub Actions 探针判龄。
+  const heartbeatRows = async () => (await pg.query(
+    `SELECT name, last_success_at FROM cron_health WHERE name = $1`, [LEDGER_SYNC_HEALTH_ROW],
+  )).rows as { name: string, last_success_at: unknown }[];
+  const clearHeartbeat = () => pg.exec(`DELETE FROM cron_health`);
+
+  it('apply 且全部仓核对成功 ⇒ 写 ledger_sync 心跳（report.heartbeat=recorded）', async () => {
+    await clearHeartbeat();
+    const report = await runSync({ sql, request: stubRequest(trees), mode: 'apply' });
+    expect(report.heartbeat).toBe('recorded');
+    const rows = await heartbeatRows();
+    expect(rows).toHaveLength(1);
+    // 心跳记的是「刚刚成功」的时刻（过去/现在），不是租约那种 now()+TTL 的未来到期时刻。
+    expect(Date.parse(String(rows[0].last_success_at))).toBeLessThanOrEqual(Date.now() + 1_000);
+  });
+
+  it('dry-run 不写心跳：没续期就没有「续期成功」可记，写了等于拿干跑冒充真跑', async () => {
+    await clearHeartbeat();
+    const report = await runSync({ sql, request: stubRequest(trees), mode: 'dry-run' });
+    expect(report.heartbeat).toBe('skipped-dry-run');
+    expect(await heartbeatRows()).toHaveLength(0);
+  });
+
+  it('有仓核对失败（not-verified）⇒ 不写心跳：exit 0 但某仓一直续不上，正是悬崖悄悄回来的形态', async () => {
+    await clearHeartbeat();
+    const broken = {
+      ...trees,
+      '/repos/fixture/repo-a/git/trees/main?recursive=1': { truncated: true, tree: [] },
+      '/repos/fixture/repo-a/git/trees/main?recursive=0': { truncated: true, tree: [] },
+    };
+    const report = await runSync({ sql, request: stubRequest(broken), mode: 'apply' });
+    // 另一仓照常 applied+续期，但本轮整体不算成功 ⇒ 心跳不写（判据是「有没有仓没续上」，不是「进程跑完没」）。
+    expect(report.repositories.map(r => r.status)).toEqual(['failed', 'applied']);
+    expect(report.heartbeat).toBe('skipped-not-verified');
+    expect(await heartbeatRows()).toHaveLength(0);
+  });
+
+  it('no-ledger / no-tree-root 同样算 not-verified ⇒ 不写心跳', async () => {
+    await clearHeartbeat();
+    await pg.exec(`DELETE FROM repository_capacity_ledger WHERE repository_id = 2;`);
+    const report = await runSync({ sql, request: stubRequest(trees), mode: 'apply' });
+    expect(report.repositories[1]).toMatchObject({ status: 'no-ledger', admissionRenewal: 'not-verified' });
+    expect(report.heartbeat).toBe('skipped-not-verified');
+    expect(await heartbeatRows()).toHaveLength(0);
+  });
+
+  it('重跑 upsert 同一行：心跳不随轮次或仓数累积', async () => {
+    await clearHeartbeat();
+    await runSync({ sql, request: stubRequest(trees), mode: 'apply' });
+    await pg.exec(`UPDATE cron_health SET last_success_at = now() - interval '2 hours'`);
+    const again = await runSync({ sql, request: stubRequest(trees), mode: 'apply' });
+    expect(again.heartbeat).toBe('recorded');
+    const rows = await heartbeatRows();
+    expect(rows).toHaveLength(1);
+    expect((await pg.query(`SELECT count(*)::int AS n FROM cron_health`)).rows[0]).toMatchObject({ n: 1 });
+    // 第二轮把时间戳推到 now()（不是保留 2h 前的旧值）。
+    expect(Date.now() - Date.parse(String(rows[0].last_success_at))).toBeLessThan(60_000);
+  });
+
+  it('心跳写失败不影响本轮结果与出口码：只落日志、report.heartbeat=write-failed', async () => {
+    await clearHeartbeat();
+    const logged: string[] = [];
+    const spy = vi.spyOn(console, 'error').mockImplementation((...args: unknown[]) => { logged.push(args.map(String).join(' ')); });
+    type Tag = (strings: TemplateStringsArray, ...values: unknown[]) => Promise<unknown>;
+    const failingSql = ((strings: TemplateStringsArray, ...values: unknown[]) => {
+      if (strings.join(' ').includes('INSERT INTO cron_health')) return Promise.reject(new Error('postgresql://user:pass@host/db 心跳写失败'));
+      return (sql as unknown as Tag)(strings, ...values);
+    }) as unknown as typeof sql;
+    const report = await runSync({ sql: failingSql, request: stubRequest(trees), mode: 'apply' });
+    // 字节回写与续期照常完成（心跳在末尾，失败不回滚、不抛）。
+    expect(report.heartbeat).toBe('write-failed');
+    expect(report.failedCount).toBe(0);
+    expect(report.repositories.map(r => r.status)).toEqual(['applied', 'applied']);
+    expect(await capacity()).toEqual([
+      { repository_id: 1, registered_bytes: '500', github_size_bytes: '102400' },
+      { repository_id: 2, registered_bytes: '400', github_size_bytes: '51200' },
+    ]);
+    // 连接串被 safeError 脱敏后才进日志。
+    expect(logged.join('\n')).toContain('heartbeat');
+    expect(logged.join('\n')).not.toContain('postgresql://');
+    spy.mockRestore();
   });
 
   // repothresh44 部署顺序护栏（放最后：临时改表结构）。未跑 migrations/0008 的库上没有

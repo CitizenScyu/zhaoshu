@@ -28,6 +28,8 @@
 // 幂等：重跑重算；两个值都与库中现值相同即 status='unchanged'、字节不产生写。
 //   例外（F1 续期）：ready+granted 行每轮 apply 都会把 admission_valid_until 顺延到 NOW()+30天
 //   （滚动续命，写的是准入期限不是字节）；非 ready/非 granted 行仍零写。
+//   例外（obsfix45 心跳）：每轮 apply 且全部仓核对成功时 upsert 一行 cron_health('ledger_sync')
+//   ——恒为一行、不随仓数增长，重跑只是把时间戳推到 now()。
 //
 // 硬约束：
 //   - 默认 dry-run（只报告会做什么）；显式 --apply 才写。
@@ -40,11 +42,16 @@
 //   - **部署顺序**：本脚本 SELECT/UPDATE github_size_bytes，故必须先跑
 //     migrations/0008_capacity_compressed_threshold.sql 再上这版脚本；否则报「column does not exist」
 //     → 该轮全仓 failed、退出码 1（失败关闭，不静默跳过压缩口径）。
+//   - **部署顺序（obsfix45 心跳）**：探针 .github/workflows/source-health.yml 已判 crons.ledgerSync，
+//     而那一行只有**本版脚本**会写。故本文件改完后必须先 scp 到 phoenix
+//     /opt/zhaoshu-download-b/scripts/ 并等一轮跑过，探针才不会持续报「ledgerSync 从未记录到成功」。
+//     （unit 是 zhaoshu-repo-rollover.service 的 ExecStartPost，每小时 :37 一轮，无需改 unit。）
 //   - 准入续期（F1, repofix43）：admission_valid_until 全系统无续期机制，现仓 2026-11-12 同时到期即悬崖。
 //     本脚本每小时已在跑、已在核对同一批行——对**本轮核对成功**且 state='ready' ∧ admission_status='granted'
 //     的行顺带续期 30 天（UPDATE 的 WHERE 自带双闸，不得复活非 ready/非 granted 行）。
 //
 // 出口码：0=全部处理完（含 unchanged / dry-run）；1=有仓失败（至少一仓未取到可信值）；2=参数错误。
+//   心跳写失败**不影响**出口码（只落一行 phase=heartbeat 的日志）：观测不能反过来把同步打挂。
 //
 // 自包含性（部署约束）：本脚本**不 import 任何仓内其它模块**，只用 @neondatabase/serverless 与
 // node 内置。它要 scp 到 phoenix /opt/zhaoshu-download-b/scripts/ 与只装了 serverless 的探针同目录
@@ -357,7 +364,49 @@ export async function renewAdmissionValidUntil(sql, repositoryId) {
 }
 
 /**
- * 主流程：读仓列表 → 逐仓量两个口径 → 比对现值 → （apply 且有差异时）一条 UPDATE 写回。
+ * 成功心跳行名（obsfix45 缺陷2）。与 src/lib/source-health.ts 的 LEDGER_SYNC_HEALTH_ROW
+ * **逐字同名**：本脚本自包含（不 import 仓内 TS，见文件头「自包含性」），故行名在两处各写一次
+ * 字面值，改一处必须改两处——仓内没有编译期手段能钉住这条一致性。
+ */
+export const LEDGER_SYNC_HEALTH_ROW = 'ledger_sync';
+
+/**
+ * 写「本轮台账同步/准入续期成功」心跳（cron_health 行 LEDGER_SYNC_HEALTH_ROW）。
+ *
+ * 为什么需要：本脚本是 admission_valid_until **全系统唯一**的续期入口（每小时随
+ * zhaoshu-repo-rollover.service 的 ExecStartPost 跑）。它停摆 = 30 天后准入悬崖重现
+ * （2026-11-12 那次：三仓准入同时到期 → 探针 exit 3、运行期 CAPACITY_UNKNOWN、发布全停）。
+ * 而停摆本身在库里看不见：字节不变的那些轮连 repository_capacity_ledger.updated_at 都不动
+ * （unchanged 分支零写），所以「updated_at 陈旧」既不能证明停摆、也不能证明续期在跑。
+ * 健康端点 /api/health/sources 透传本行，GitHub Actions 探针按 CRON_ALERT_HOURS 判龄开单。
+ *
+ * 记与不记的判据 = **本轮有没有仓没被核对成功**（admissionRenewal='not-verified'，即
+ * failed / no-ledger / no-tree-root 三种）：那三种仓的准入这一轮没续上，30 天后照样到期。
+ * 按「有仓没续上」告警比按「进程跑完了没」告警更贴近真实风险——脚本 exit 0 但某仓一直
+ * 404 的形态，正是悬崖会悄悄回来的形态。
+ *
+ * 只在 --apply 下写：dry-run 不续期，没有「续期成功」可记（写了等于拿 dry-run 冒充真跑）。
+ * 心跳写失败**不改变出口码**：告警系统自己把同步打挂比不告警更糟（同 recordCronSuccess 口径），
+ * 失败只落一行日志，此时健康端点会看到本行陈旧——那本身也是信号。
+ * @returns {'recorded'|'skipped-dry-run'|'skipped-not-verified'|'write-failed'} 只进报告，不参与出口码。
+ */
+export async function recordLedgerSyncHeartbeat(sql, results, mode) {
+  if (mode !== 'apply') return 'skipped-dry-run';
+  if (results.some(result => result.admissionRenewal === 'not-verified')) return 'skipped-not-verified';
+  try {
+    await sql`
+      INSERT INTO cron_health (name, last_success_at) VALUES (${LEDGER_SYNC_HEALTH_ROW}, now())
+      ON CONFLICT (name) DO UPDATE SET last_success_at = now()`;
+    return 'recorded';
+  } catch (error) {
+    console.error(JSON.stringify({ phase: 'heartbeat', status: 'failed', error: safeError(error) }));
+    return 'write-failed';
+  }
+}
+
+/**
+ * 主流程：读仓列表 → 逐仓量两个口径 → 比对现值 → （apply 且有差异时）一条 UPDATE 写回
+ *   → 末尾按本轮核对结果写一次成功心跳（见 recordLedgerSyncHeartbeat）。
  * request 与 sql 均为注入端口，测试可换合成桩，不触网、不读 .env。
  * @param {{sql: unknown, request: GitHubJsonRequest, mode: 'dry-run'|'apply', treeRoot?: string}} options
  */
@@ -421,7 +470,8 @@ export async function runSync(options) {
     results.push({ ...base, status: 'applied', ...observed });
   }
   const failed = results.filter(r => r.status === 'failed');
-  return { mode: options.mode, treeRoot, repositories: results, failedCount: failed.length };
+  const heartbeat = await recordLedgerSyncHeartbeat(options.sql, results, options.mode);
+  return { mode: options.mode, treeRoot, repositories: results, failedCount: failed.length, heartbeat };
 }
 
 /** 认证请求函数：固定 host、固定超时；token 只出现在请求头，不进任何返回值或日志。 */
