@@ -140,7 +140,7 @@ describe('POST /api/download/relocate', () => {
     relocate.mockImplementationOnce((_book, signal) => Promise.reject(signal!.reason));
     const response = await POST(request({ bookId: book.id }, controller.signal));
     expect(response.status).toBe(504);
-    expect(await response.json()).toEqual({ error: 'relocation aborted or timed out', code: 'REQUEST_ABORTED' });
+    expect(await response.json()).toEqual({ error: '书源查询超时或已取消，请稍后重试。', code: 'REQUEST_ABORTED' });
     expect(reclaim).not.toHaveBeenCalled();
   });
 
@@ -153,7 +153,7 @@ describe('POST /api/download/relocate', () => {
     }));
     const response = await POST(request({ bookId: book.id }, controller.signal));
     expect(response.status).toBe(504);
-    expect(await response.json()).toEqual({ error: 'relocation aborted or timed out', code: 'REQUEST_ABORTED' });
+    expect(await response.json()).toEqual({ error: '书源查询超时或已取消，请稍后重试。', code: 'REQUEST_ABORTED' });
     expect(reclaim).not.toHaveBeenCalled();
   });
 
