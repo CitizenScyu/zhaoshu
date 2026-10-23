@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-// readerux42-B:自动阅读的行为钉(开关与速度/章末无缝接续/末章停止/用户手势接管)。
+// readerux42-B:自动阅读的行为钉(开关与速度/章末无缝接续/出错即停/末章停止/用户手势接管)。
 // 滚读的滚动量与章末判定依赖 scrollHeight/clientHeight,jsdom 无布局 ⇒ 用
 // Object.defineProperty 在正文容器上钉假尺寸;定时拍用假计时器驱动。
 import { createElement } from 'react';
@@ -106,6 +106,19 @@ function simpleFetch() {
   });
 }
 
+/** 首章正常、下一章取不到:用来钉「自动阅读中出错 ⇒ 自动停」。
+ * 刻意用 500 而不是 503/404/422/504 —— 那几个状态会触发 readerux42-A 的自动换源扇出,
+ * 探测请求会混进「停下之后不再发任何请求」的断言口径(换源那条路径由 autoswitch 测试钉)。 */
+function failingNextFetch() {
+  return vi.fn(async (input: RequestInfo | URL) => {
+    const url = String(input);
+    if (url.startsWith('/api/read/source/index')) return json(catalog());
+    const chapter = Number(param(url, 'chapter') ?? '0');
+    if (chapter >= 1) return json({ error: '下一章取不到内容' }, 500);
+    return json(part({ chapterIndex: 0, title: '第一章', text: '第一章\n正文内容' }));
+  });
+}
+
 /** 正文容器上钉假视口尺寸:content 高度可变(章末接续后加高,模拟新章内容接上)。 */
 function pinViewport(content: () => number, client: number): HTMLElement {
   const el = document.querySelector<HTMLElement>('main[aria-label="阅读正文"]');
@@ -177,6 +190,34 @@ describe('readerux42-B 自动阅读', () => {
     await act(async () => { await vi.advanceTimersByTimeAsync(1000); });
     expect(viewport.scrollTop).toBeGreaterThan(start + 60);
     expect(screen.getByRole('button', { name: '停止自动' }).getAttribute('aria-pressed')).toBe('true');
+  });
+
+  it('出错即停:自动阅读中取下一章失败,开关自动回到关,不再滚动也不再发请求', async () => {
+    const apiFetch = failingNextFetch();
+    renderReader(apiFetch);
+    await screen.findByText(/正文内容/);
+    // 视口 500、内容 520(滚 20px 到章底)⇒ 自动阅读会去 extend 下一章,而下一章取不到。
+    const viewport = pinViewport(() => 520, 500);
+
+    vi.useFakeTimers();
+    fireEvent.click(screen.getByRole('button', { name: '自动阅读' }));
+    fireEvent.click(screen.getByRole('button', { name: '快' })); // 150px/s ⇒ 15px/拍,两拍到章底
+    await act(async () => { await vi.advanceTimersByTimeAsync(600); });
+
+    // 停下的是「出错」这条路径,不是「读到末尾」那条:错误条在,末尾提示不在。
+    screen.getByText('下一章取不到内容');
+    expect(screen.queryByText(textIs('已读到全书末尾，自动阅读停止。'))).toBeNull();
+    // 开关自己回到关(不是停在「开但不滚」的假活状态):速度组收起、按钮回到未按下态。
+    expect(screen.getByRole('button', { name: '自动阅读' }).getAttribute('aria-pressed')).toBe('false');
+    expect(screen.queryByRole('button', { name: '停止自动' })).toBeNull();
+    expect(screen.queryByRole('group', { name: '自动阅读速度' })).toBeNull();
+
+    // 停了就是停了:再走 2 秒,不滚动、不自行重试取章(重试只由用户点「重试」发起)。
+    const after = urls(apiFetch).length;
+    const stopped = viewport.scrollTop;
+    await act(async () => { await vi.advanceTimersByTimeAsync(2000); });
+    expect(viewport.scrollTop).toBe(stopped);
+    expect(urls(apiFetch).slice(after)).toEqual([]);
   });
 
   it('最后一章滚到底:自动阅读停止并提示,不再发任何章节请求', async () => {
