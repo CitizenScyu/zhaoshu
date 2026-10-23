@@ -4,8 +4,11 @@
 覆盖：
 - resolve_probe_models：LLM_MODELS 优先；旧 LLM_MODEL 单值兜底；两者都缺/为空 -> ([], 'none')。
 - probe：逐模型探测、任一通过即放行；全挂不放行；每个模型都真的被探到。
-- 端点：probe_one 真把传进来的 llm_url 发到线上；默认端点是部署机本机 NewAPI 的 loopback 入口；
-        main 把 .env 的 LLM_URL 解析结果透传给 probe（与 F3 的模型链不变式同型）。
+- 端点：probe_one 真把传进来的 llm_url 发到线上；默认端点是部署机本机 NewAPI 的 loopback 入口
+        （断言字面值）；main 把 .env 的 LLM_URL 解析结果透传给 probe —— **两处**调用点都钉
+        （等窗口阶段 + labeler 异常退出后的恢复阶段）；llm_url 在 probe/probe_one 上是必填参数。
+- resolve_probe_endpoint：复用 labeler.resolve_llm_url；labeler.py 太旧（缺该函数）时抛
+        LabelerTooOld，由 main 转成 EXIT_VERSION_MISMATCH 并 fail-closed 不启动 labeler。
 - main：模型链缺失时 fail-closed（返回 EXIT_NO_MODELS、不启动 labeler）；
         模型链存在时按 .env 链启动 labeler。
 
@@ -13,10 +16,12 @@
 复跑：PYTHONIOENCODING=utf-8 python -m unittest discover -s scripts -t scripts -p 'test_gatekeeper.py'
 """
 import contextlib
+import inspect
 import io
 import os
 import sys
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -151,8 +156,12 @@ class ProbeEndpointTest(unittest.TestCase):
         2026-10-23 之前这里硬编码 api.cloud.us.kg——那是 phoenix 上的 new-api-phx（自家另一台
         实例，不是打标机本机那台；一手核实方式见 labeler.py 的 LLM_URL 注释），而生产实际跑的
         是部署机上两处**未版本化**的就地改文件（127.0.0.1:13001）。谁把默认值改回公网主机名，
-        这条就红。"""
+        这条就红。
+
+        断言的是**字面值**而不是 `labeler.LLM_URL` 常量：待测的就是那个常量，拿它断言它是
+        同义反复——变异「默认端口 13001 改成 13998」两边一起变、测试照绿（实测存活）。"""
         url = gatekeeper.labeler.resolve_llm_url({})
+        self.assertEqual(url, 'http://127.0.0.1:13001/v1/chat/completions')
         self.assertTrue(url.startswith('http://127.0.0.1:'), url)
         self.assertNotIn('cloud.us.kg', url)
 
@@ -261,6 +270,125 @@ class MainFailClosedTest(unittest.TestCase):
         self.assertEqual(set(endpoints), {FAKE_URL})
         self.assertNotIn(gatekeeper.labeler.LLM_URL, endpoints)
         self.assertIn(FAKE_URL, out.getvalue())          # 端点进日志，出事能直接对质
+
+    def test_recovery_probe_uses_the_same_endpoint(self):
+        """X3：main 里**第二处** probe 调用（恢复分支）也必须用同一个解析出的端点。
+
+        main 探两次端点：等窗口阶段，以及「labeler 异常退出后判断渠道还活着吗」的恢复阶段。
+        上一条用例在首次 subprocess.run 就抛异常，从没进过恢复分支，于是变异「只把恢复分支
+        改传 labeler.LLM_URL」三组全绿（实测存活，捕获到 [覆盖地址, 覆盖地址, 默认地址]）。
+        后果不是小事：LLM 异常之后恰恰最需要门卫按**真实运行端点**判断是否恢复，
+        探默认端点就会错误放行（渠道其实还坏）或永久阻断（渠道已好但探的不是它）。"""
+        endpoints = []
+        launched = []
+
+        class _Stop(Exception):
+            pass
+
+        def fake_run(cmd, **kw):
+            launched.append(cmd)
+            return SimpleNamespace(returncode=1)         # 异常退出 → 进恢复分支
+
+        def fake_probe(api_key, models, llm_url):
+            endpoints.append(llm_url)
+            if launched:                                 # 已启动过 labeler ⇒ 这是恢复分支的探测
+                raise _Stop                              # 有界退出，不让 main 回到无限循环
+            return True
+
+        with mock.patch.object(gatekeeper.labeler, 'load_env',
+                               return_value=_env(LLM_MODELS='m-1', LLM_URL=FAKE_URL)), \
+             mock.patch.object(gatekeeper, 'probe', side_effect=fake_probe), \
+             mock.patch.object(gatekeeper.subprocess, 'run', side_effect=fake_run), \
+             mock.patch.object(gatekeeper.time, 'sleep', lambda *_: None):
+            with contextlib.redirect_stdout(io.StringIO()):
+                with self.assertRaises(_Stop):
+                    gatekeeper.main()
+        self.assertEqual(launched, [gatekeeper.LABELER_CMD])
+        # 分阶段断言（不只是「集合里只有覆盖地址」）：等待阶段 PASS_N 次 + 恢复阶段至少 1 次，
+        # 每一次都必须是 .env 解析出的那个。
+        self.assertEqual(endpoints[:gatekeeper.PASS_N], [FAKE_URL] * gatekeeper.PASS_N)
+        self.assertEqual(endpoints[gatekeeper.PASS_N:], [FAKE_URL])
+
+
+class ProbeContractTest(unittest.TestCase):
+    """M5：llm_url 在 probe / probe_one 上是**必填**参数这件事本身要有测试。
+
+    两个函数的 docstring 都写了「必填；给默认值就会静默漂移」，但注释不是防线：变异
+    「改成 llm_url: str | None = None，函数体里 llm_url or labeler.LLM_URL」三组全绿
+    （实测存活）——既有用例个个都显式传了端点，看不出差别，而从此漏传会静默退回常量。"""
+
+    def test_llm_url_is_required_on_probe_one(self):
+        with self.assertRaises(TypeError):
+            gatekeeper.probe_one(FAKE_KEY, 'm-1')
+
+    def test_llm_url_is_required_on_probe(self):
+        with self.assertRaises(TypeError):
+            gatekeeper.probe(FAKE_KEY, ['m-1'])
+
+    def test_llm_url_has_no_default_in_signature(self):
+        """上一条钉「漏传就炸」，这条钉「签名里没有默认值可悄悄兜住」。
+
+        两者不等价：给 llm_url 任何默认值都会让 TypeError 消失，但只有默认值恰好是
+        labeler.LLM_URL 时行为才「看起来对」——那正是最难发现的那种漂移。"""
+        for fn in (gatekeeper.probe_one, gatekeeper.probe):
+            with self.subTest(fn=fn.__name__):
+                param = inspect.signature(fn).parameters['llm_url']
+                self.assertIs(param.default, inspect.Parameter.empty)
+
+
+class VersionMismatchTest(unittest.TestCase):
+    """两文件配套部署：新 gatekeeper.py 落在旧 labeler.py 上要说人话，且照样 fail-closed。
+
+    gatekeeper 复用 labeler.resolve_llm_url 之后，只更新 gatekeeper.py 会在启动时炸
+    AttributeError；systemd 是 Restart=on-failure / RestartSec=60，表现为一分钟一次的
+    traceback 崩循环、打标全停，而日志里看不出是「两文件版本不配对」。"""
+
+    @contextlib.contextmanager
+    def old_labeler(self):
+        """模拟「部署机上的 labeler.py 还是端点改造之前那一版」（没有 resolve_llm_url）。
+        真的把属性删掉而不是塞 None —— 要复现的是 AttributeError 形态，不是取值为假。"""
+        saved = gatekeeper.labeler.resolve_llm_url
+        del gatekeeper.labeler.resolve_llm_url
+        try:
+            yield
+        finally:
+            gatekeeper.labeler.resolve_llm_url = saved
+
+    def test_resolver_raises_a_readable_error_not_attribute_error(self):
+        with self.old_labeler():
+            with self.assertRaises(gatekeeper.LabelerTooOld) as ctx:
+                gatekeeper.resolve_probe_endpoint(_env())
+        message = str(ctx.exception)
+        self.assertIn('labeler.py', message)          # 指出是哪个文件的问题
+        self.assertIn('同批部署', message)             # 指出怎么修
+
+    def test_resolver_reuses_the_labeler_function_when_present(self):
+        """正常路径仍是「复用 labeler 的解析」，不是门卫自己抄一份端点逻辑。"""
+        sentinel = 'http://127.0.0.1:13998/v1/chat/completions'
+        with mock.patch.object(gatekeeper.labeler, 'resolve_llm_url',
+                               return_value=sentinel) as m:
+            self.assertEqual(gatekeeper.resolve_probe_endpoint(_env()), sentinel)
+        self.assertTrue(m.called)
+
+    def test_main_fails_closed_with_its_own_exit_code(self):
+        def must_not_launch(*a, **kw):
+            raise AssertionError('版本不配对时不应启动 labeler')
+
+        with self.old_labeler(), \
+             mock.patch.object(gatekeeper.labeler, 'load_env',
+                               return_value=_env(LLM_MODELS='m-1')), \
+             mock.patch.object(gatekeeper.subprocess, 'run', side_effect=must_not_launch), \
+             mock.patch.object(gatekeeper.time, 'sleep', lambda *_: None), \
+             mock.patch.object(gatekeeper, 'probe_one', return_value=True):
+            with contextlib.redirect_stderr(io.StringIO()) as err:
+                rc = gatekeeper.main()
+        self.assertEqual(rc, gatekeeper.EXIT_VERSION_MISMATCH)
+        # 两种 fail-closed 必须能分辨：都是「没启动 labeler」，但一个是 .env 缺配置、
+        # 一个是部署配错版本，修法完全不同。
+        self.assertNotEqual(rc, gatekeeper.EXIT_NO_MODELS)
+        text = err.getvalue()
+        self.assertIn('同批部署', text)
+        self.assertIn('fail-closed', text)
 
 
 if __name__ == '__main__':

@@ -31,6 +31,7 @@ PROBE_TIMEOUT = 280       # 单次探测超时（CF 524 在 ~125s，280 足够�
 # （复用 labeler 的解析函数，见 resolve_probe_models），彻底消除两处漂移。
 
 EXIT_NO_MODELS = 3        # .env 未给模型链：fail-closed，不放行 labeler
+EXIT_VERSION_MISMATCH = 4  # 同目录 labeler.py 太旧（缺 resolve_llm_url）：fail-closed，不放行
 # 探测链要不要带上数据库 app_settings.label_model（链首）？labeler 启动时走
 # `resolve_models(env, use_db=not args.no_db_model)`，而 LABELER_CMD 未带 `--no-db-model`，
 # 所以 labeler 实际 use_db=True。门卫探测必须用同一条链，否则「探测的就是要跑的」不成立
@@ -70,13 +71,42 @@ def resolve_probe_models(env: dict) -> tuple[list[str], str]:
     return (models, key) if models else ([], 'none')
 
 
+class LabelerTooOld(RuntimeError):
+    """同目录的 labeler.py 没有 resolve_llm_url（= 比本门卫旧一版）。
+
+    两文件是**配套**的：本门卫从 2026-10-23 的端点改造起复用 labeler.resolve_llm_url，
+    好让「探测的端点」与「labeler 会请求的端点」同源同函数。只更新 gatekeeper.py、
+    不更新 labeler.py 就会在启动时炸 AttributeError，而 systemd 是
+    Restart=on-failure / RestartSec=60 —— 表现为一分钟一次的 traceback 崩循环、打标全停，
+    日志里看不出来是「两文件版本不配对」。这里改成先 getattr 检查、缺失就抛本异常，
+    由 main 转成一句人话 + 独立退出码 EXIT_VERSION_MISMATCH（仍是 fail-closed，不放行 labeler）。
+
+    部署侧的正解是 labeler.py 与 gatekeeper.py **同批**下发；本异常只是把配错的后果
+    从「崩循环 traceback」变成「一眼能读懂的诊断」，不是允许配错。"""
+
+
+def resolve_probe_endpoint(env: dict) -> str:
+    """探测端点 = labeler 会请求的端点，复用 labeler.resolve_llm_url（不另写一套解析）。
+
+    labeler.py 太旧时抛 LabelerTooOld（见该类说明），不静默退回硬编码端点——静默退回会把
+    「两文件版本不配对」伪装成「探测正常」，与 resolve_probe_models 的 fail-closed 同理。"""
+    resolver = getattr(labeler, 'resolve_llm_url', None)
+    if resolver is None:
+        # 刻意不在 f-string 里嵌套同类引号（PEP 701 要 3.12+），部署机的 python3 未必那么新。
+        labeler_path = DIR / 'labeler.py'
+        raise LabelerTooOld(
+            f'{labeler_path} 没有 resolve_llm_url：labeler.py 比 gatekeeper.py 旧一版。'
+            '两文件必须同批部署（scp 后重启 zhaoshu-labeler.service）。')
+    return resolver(env)
+
+
 def probe_one(api_key: str, model: str, llm_url: str) -> bool:
     """对单个模型做 25 万字段探测；首字节即判活。
 
     llm_url 是**必填**的：门卫的全部意义就是「探测的就是要跑的」，端点也不例外。
     给它一个默认值的话，漏传会静默退化成 labeler.LLM_URL，探测的端点与 labeler 实际
     请求的端点就能在无人察觉时漂移——和 F3 要防的模型链漂移是同一个失效形态。
-    传 labeler.resolve_llm_url(env) 的结果，两边同源同函数、同一个 .env，配置不变时取值一致
+    传 resolve_probe_endpoint(env) 的结果，两边同源同函数、同一个 .env，配置不变时取值一致
     （不是无条件保证：子进程每次启动自己重读 .env，边界见 main 里的说明）。"""
     body = json.dumps({
         'model': model, 'stream': True, 'max_tokens': 50,
@@ -120,7 +150,16 @@ def main() -> int:
     # 边界说清楚，别当成无条件保证：本函数只在启动时 resolve 一次，而 labeler 子进程每次启动
     # 都自己重读 .env——门卫跑着的时候改 .env 的 LLM_URL，探测端点就与之后子进程的端点不一致
     # （模型链同理）。改完 .env 要重启门卫。
-    llm_url = labeler.resolve_llm_url(env)
+    try:
+        llm_url = resolve_probe_endpoint(env)
+    except LabelerTooOld as e:
+        # 两文件版本不配对：fail-closed，不放行 labeler，也不让裸 AttributeError 变成
+        # systemd 的一分钟一次崩循环（见 LabelerTooOld 说明）。退出码独立于 EXIT_NO_MODELS，
+        # 好让 `systemctl status` / gate.log 一眼分辨「.env 配置缺失」与「部署配错版本」。
+        print(f'错误: {e}', file=sys.stderr, flush=True)
+        print(f'拒绝放行 labeler（fail-closed，退出码 {EXIT_VERSION_MISMATCH}）。',
+              file=sys.stderr, flush=True)
+        return EXIT_VERSION_MISMATCH
     print(f'探测端点: {llm_url}', flush=True)
     models, src_key = resolve_probe_models(env)
     if not models:

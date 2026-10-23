@@ -266,6 +266,13 @@ class TestLlmUrl(unittest.TestCase):
     本机 loopback」和「传下去的端点必须真被请求」钉死，让那次漂移和那个跨机端点都回不来。"""
 
     def test_default_is_the_local_newapi(self):
+        """断言**字面值**，不是拿 `labeler.LLM_URL` 去断言它自己。
+
+        待测的就是这个常量，用常量断言常量是同义反复：变异「把默认端口 13001 改成 13998」
+        两边一起变，测试照绿（实测存活）。13001 不是随手挑的数——它是打标机本机那台
+        new-api 容器映射到宿主的端口（`docker ps`：127.0.0.1:13001->3000），
+        路径 /v1/chat/completions 是 OpenAI 兼容的对话补全入口。"""
+        self.assertEqual(labeler.LLM_URL, 'http://127.0.0.1:13001/v1/chat/completions')
         self.assertTrue(labeler.LLM_URL.startswith('http://127.0.0.1:'), labeler.LLM_URL)
         self.assertNotIn('cloud.us.kg', labeler.LLM_URL)
         for env in ({}, None):
@@ -308,6 +315,40 @@ class TestLlmUrl(unittest.TestCase):
             self._capture_urls(lambda: labeler.label_book(long_text, FAKE_KEY, ['m1'],
                                                           llm_url=URL_OVERRIDE)),
             [URL_OVERRIDE, URL_OVERRIDE])
+
+    def test_single_segment_path_also_threads_url(self):
+        """单段分支也必须透传——它是默认配置下 main 唯一会走到的那条。
+
+        label_book 里有**三处** _label_once 调用点：单段（len(text) <= SEGMENT_CHARS）+ 两段式
+        的前后两段。上一条用例只覆盖两段，于是变异「删掉单段分支的 llm_url=llm_url」全部
+        测试照绿（实测存活），而线上后果是每本都静默打回内置默认端点。
+
+        可达性说清楚，别说过头：引擎取文默认 LABELER_ENGINE_TARGET_CHARS=80000 字，
+        远小于 SEGMENT_CHARS=250000，所以**默认配置下** main 只会走单段分支。但
+        resolve_engine_target_chars 没有上限钳制，而 .env.local.example 明写「设 500000
+        即回退旧行为」——那样一来两段式也可达。结论是两条都得测，而单段是默认路径、
+        两段是配置改大后才走的路径。
+        边界值 SEGMENT_CHARS 本身走单段（条件是 <=），一并钉住。"""
+        for size in (10, labeler.SEGMENT_CHARS):
+            with self.subTest(chars=size):
+                self.assertEqual(
+                    self._capture_urls(
+                        lambda n=size: labeler.label_book('字' * n, FAKE_KEY, ['m1'],
+                                                          llm_url=URL_OVERRIDE)),
+                    [URL_OVERRIDE])
+
+    def test_resolve_ignores_process_environment(self):
+        """口径钉：只认传进来的 .env 字典，不读 os.environ。
+
+        load_env() 解析的是 .env **文件**、不写 os.environ，本文件其余全部 resolve_* 同口径；
+        systemd 单元 zhaoshu-labeler.service 也没有 EnvironmentFile，所以 shell 里
+        `export LLM_URL=...` 对这条链路本来就无效。scripts/backfill_quality.mjs 的
+        resolveLlmUrl 已对齐成同一口径。把这条写死，谁日后给它加一层 os.environ 兜底
+        （两处解析就分叉了）会在这里变红。唯一读 os.environ 的例外是 LABELER_DATA_DIR，
+        它要在 load_env 找到 .env 之前就知道去哪儿找。"""
+        with mock.patch.dict(os.environ, {labeler.LLM_URL_ENV: URL_OVERRIDE}):
+            self.assertEqual(labeler.resolve_llm_url({}), labeler.LLM_URL)
+            self.assertEqual(labeler.resolve_llm_url(None), labeler.LLM_URL)
 
 
 if __name__ == '__main__':

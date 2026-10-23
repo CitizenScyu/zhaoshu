@@ -3184,7 +3184,14 @@ def resolve_llm_url(env: dict | None = None) -> str:
 
     与 resolve_max_tokens 同理必须「显式求出再传下去」：默认参数在 def 时就求值了，
     只有传参才是改 .env 即生效。为什么默认值钉死本机 loopback、而不是那个公网主机名，
-    见 LLM_URL 常量处那段说明（含 2026-10-23 的一手证据与归属未核实的结论）。"""
+    见 LLM_URL 常量处那段说明（含 2026-10-23 的一手证据：那个主机名 = phoenix 上的
+    new-api-phx，自家另一台实例，不是打标机本机那台）。
+
+    只认 load_env() 交来的 **.env 文件**字典，不读 os.environ（systemd 的 Environment=/
+    EnvironmentFile=、shell 里 export 都不生效）——与本文件其余全部 resolve_* 同口径，
+    也与 load_env 本身「解析文件、不写 os.environ」一致；唯一的例外是 LABELER_DATA_DIR
+    （它要在 load_env 找到 .env 之前就知道去哪儿找）。gatekeeper.py 复用本函数，
+    backfill_quality.mjs 的 resolveLlmUrl 同口径（也只认 env 文件）。"""
     return str((env or {}).get(LLM_URL_ENV) or '').strip() or LLM_URL
 
 

@@ -1490,8 +1490,18 @@ class TestMainLoop(unittest.TestCase):
     def _restore_source_policy(self):
         labeler.SOURCE_POLICY = self._prev_source_policy
 
+    # X1 哨兵：与内置默认值（本机 13001）刻意不同的端点，写进 .env 后断言 main 真的把它
+    # 传给了 label_book。放在 run_main 里而不是单个用例里，是因为「开关开/关两条路径传的是
+    # 同一个值」这句话只有两条路径都验过**值**才成立。
+    # 原先两个用例只断言 kwargs 的**键集合**，于是变异「label_book(..., llm_url=llm_url)
+    # 改成 llm_url=LLM_URL（常量）」三组 150 例全绿（实测存活；独立复现：日志
+    # main_logged_configured_url=true 而 actual_label_book_url 是默认端点）——正是端点改造
+    # 要防的那种漂移，而且 main 每轮印的「来源: .env 的 LLM_URL」会变成一句主动的谎话。
+    LLM_URL_SENTINEL = 'http://127.0.0.1:13999/v1/chat/completions'
+
     def run_main(self, env_lines, cli, label_fn):
-        (self.dir / '.env').write_text('LLM_API_KEY=test-key-not-real\n' + env_lines,
+        (self.dir / '.env').write_text('LLM_API_KEY=test-key-not-real\n'
+                                       f'LLM_URL={self.LLM_URL_SENTINEL}\n' + env_lines,
                                        encoding='utf-8')
         book = _book(alternates=['b.example.com'])
 
@@ -1537,6 +1547,11 @@ class TestMainLoop(unittest.TestCase):
         # 「关时调用形态不变」——它仍然是「除了 llm_url 这类全局运行配置，什么都不多传」。
         self.assertEqual(set(label_mock.call_args.kwargs),
                          {'site_title', 'site_author', 'max_tokens', 'meta', 'llm_url'})
+        # 键集合之外必须验**值**（X1）：只验键名的话，「传的是常量而不是解析结果」全绿。
+        self.assertEqual(label_mock.call_args.kwargs['llm_url'], self.LLM_URL_SENTINEL)
+        self.assertIn(self.LLM_URL_SENTINEL, out)                 # 端点进日志，出事能对质
+        self.assertIn(f'来源: .env 的 {labeler.LLM_URL_ENV}', out)  # 且标明来源是 .env
+        self.assertNotIn(labeler.LLM_URL, out)                    # 默认端点一次都没出现
         self.assertNotIn('分布式采样', out)
 
     def test_switch_on_segments_and_arc(self):
@@ -1564,6 +1579,10 @@ class TestMainLoop(unittest.TestCase):
         self.assertEqual(rec['prompt_version'], 'v2')
         self.assertTrue(seen['kwargs']['system_prompt'].startswith(labeler.SYSTEM_PROMPT))
         self.assertIn('arc', seen['kwargs']['system_prompt'])
+        # 开关开的路径同样必须传解析出的端点（X1）：两条路径各验一次值，
+        # 只验一条的话，另一条漏传仍然全绿。
+        self.assertEqual(seen['kwargs']['llm_url'], self.LLM_URL_SENTINEL)
+        self.assertEqual(label_mock.call_args.kwargs['llm_url'], self.LLM_URL_SENTINEL)
         self.assertIn('【第 4 段：约 90% 处，第 91–95 章】', seen['text'])
         arc = rec['labels']['arc']
         self.assertEqual(arc['decline'], 'mild')

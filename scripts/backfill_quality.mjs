@@ -32,6 +32,17 @@ export function parseQualityResponse(value) {
   return overall;
 }
 
+// 端点解析：只认 --env 指定的**文件**，缺省/空白回落本机默认。刻意**不**读 process.env——
+// 本函数旁边的 DATABASE_URL / LLM_API_KEY / LLM_MODEL 全都只从文件取，Python 侧的
+// labeler.resolve_llm_url 与 gatekeeper.resolve_probe_endpoint 也只认 load_env() 的文件字典
+// （systemd 没有 EnvironmentFile，shell export 对那条链路同样不生效）。原先这里多出一层
+// `|| process.env.LLM_URL`，是三处解析里唯一的例外：同一个键在打标链路上「文件与进程环境谁赢」
+// 两种口径，排查时必然误判。统一成文件优先、且只有文件。
+export function resolveLlmUrl(env) {
+  const fromFile = typeof env?.LLM_URL === 'string' ? env.LLM_URL.trim() : '';
+  return fromFile || DEFAULT_LLM_URL;
+}
+
 function parseArgs(argv) {
   const args = { env: null, limit: 20 };
   for (let i = 0; i < argv.length; i += 1) {
@@ -152,9 +163,10 @@ async function run() {
   const env = loadEnvFile(resolve(args.env));
   if (!env.DATABASE_URL || !env.LLM_API_KEY) throw new Error('env 文件缺 DATABASE_URL / LLM_API_KEY');
   const model = env.LLM_MODEL || 'deepseek-v4-flash-bohe';
-  // 端点：env 文件优先，其次进程环境，最后才是内置的本机默认。开跑就印一行——
-  // 这个脚本会把 LLM_API_KEY 发出去，端点走错必须一眼看得见，不能等事后翻代码。
-  const llmUrl = env.LLM_URL || process.env.LLM_URL || DEFAULT_LLM_URL;
+  // 端点：env 文件优先，缺失才回落内置的本机默认（见 resolveLlmUrl 的口径说明）。
+  // 开跑就印一行——这个脚本会把 LLM_API_KEY 与抓来的正文发出去，端点走错必须一眼看得见，
+  // 不能等事后翻代码。
+  const llmUrl = resolveLlmUrl(env);
   console.log(`LLM 端点: ${llmUrl}`);
   const sql = neon(env.DATABASE_URL);
 
