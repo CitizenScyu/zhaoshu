@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createDeadline } from './deadline';
+import { refreshSupportedHosts } from './source-policy';
 import type { VerifiedCandidate } from './types';
 import { sanitizeVerified } from './sanitize';
 
@@ -7,7 +8,7 @@ const mocks = vi.hoisted(() => ({ resolve: vi.fn(), sources: vi.fn() }));
 vi.mock('./shuyuan', () => ({ getReadingSources: mocks.sources }));
 vi.mock('./source-reader', async (original) => ({ ...await original<typeof import('./source-reader')>(), resolveSourceBook: mocks.resolve }));
 import { supplementSourceEvidence, SOURCE_VERIFY_BUDGET_MS, SOURCE_VERIFY_CONCURRENCY, SOURCE_VERIFY_REQUEST_LIMIT } from './source-verification';
-import { SourceReaderError } from './source-reader';
+import { probeCooldownSlots, SourceReaderError } from './source-reader';
 
 const candidate: VerifiedCandidate = { title: '测试书', author: '作者', category: '', wordCount: '', why: '', source: 'llm', douban: { status: 'not_found', found: false } };
 const match = { sourceName: '测试来源', bookUrl: 'https://book15.net/books/details42.html' };
@@ -197,5 +198,34 @@ describe('source existence supplement inside verify', () => {
     const forged = { status: 'unavailable' as const, code: 'evil<script>' as never, note: '注' };
     expect(sanitizeVerified([{ ...candidate, sourceEvidence: forged }])[0].sourceEvidence)
       .toEqual({ status: 'unavailable', note: '注' });
+  });
+
+  it('46-revfix:补验 context 挂进程级共享冷却表 —— probe 吃到的 429 冷却挡下候选搜索', async () => {
+    // 行为级：种进共享表（与 probe 写入同源）后,补验 context 里对该站的 page() 在
+    // beforeRequest 就被冷却拒绝,零物理请求。断言在 resolve mock 内做 —— 补验 worker 的
+    // finally budget.dispose() 会把 context signal 一并 abort,复刻构造后再断言会拿到中止错误。
+    refreshSupportedHosts(['rl.test']);
+    const table = probeCooldownSlots()!;
+    table.set('rl.test', Date.now() + 600_000);
+    let cooldownObserved: unknown;
+    mocks.resolve.mockImplementationOnce(async (_book: unknown, context: { page(url: string): Promise<unknown> }) => {
+      try {
+        await context.page('https://rl.test/s?q=x');
+      } catch (error) {
+        cooldownObserved = error;
+      }
+      return match;
+    });
+    const deadline = createDeadline(285_000);
+    try {
+      const result = await supplementSourceEvidence([candidate], deadline, deadline.signal);
+      expect(result[0].sourceEvidence?.status).toBe('matched');
+      expect(cooldownObserved).toBeInstanceOf(SourceReaderError);
+      expect(cooldownObserved).toMatchObject({ code: 'SOURCE_SCOPE_EXHAUSTED' });
+    } finally {
+      table.delete('rl.test');
+      refreshSupportedHosts([]);
+      deadline.dispose();
+    }
   });
 });

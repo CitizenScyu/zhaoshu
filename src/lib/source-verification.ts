@@ -1,6 +1,6 @@
 import { createDeadline, WRITE_BACK_RESERVE_MS, type RequestDeadline } from './deadline';
 import { getReadingSources } from './shuyuan';
-import { resolveSourceBook, SourceReaderError, SourceRequestContext } from './source-reader';
+import { probeCooldownSlots, resolveSourceBook, SourceReaderError, SourceRequestContext } from './source-reader';
 import type { SourceEvidence, SourceEvidenceCode, VerifiedCandidate } from './types';
 
 export const SOURCE_VERIFY_BUDGET_MS = 25_000;
@@ -55,7 +55,10 @@ export async function supplementSourceEvidence(
   // A single bounded supplement inside the existing verify step, never a fresh model budget.
   const budget = createDeadline(budgetMs);
   const signal = AbortSignal.any([parentSignal, deadline.signal, budget.signal]);
-  const context = new SourceRequestContext(signal, SOURCE_VERIFY_REQUEST_LIMIT);
+  // 46-revfix：补验 context 与 probe / 阅读根 context / 下载重定位同一张进程级冷却表。此前本腿
+  // 裸建请求级表：probe 吃到的 429 冷却对候选补验不可见，同轮 verify 会对同一站重打。
+  // SOURCE_THROTTLE_PER_HOST=0 回滚语义 = 请求级（probeCooldownSlots 同步退回）。
+  const context = new SourceRequestContext(signal, SOURCE_VERIFY_REQUEST_LIMIT, { cooldownSlots: probeCooldownSlots() });
   let done = 0;
   let next = 0;
   onProgress?.(done, pendingIndexes.length);

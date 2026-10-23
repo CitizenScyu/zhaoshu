@@ -147,8 +147,8 @@ interface FetchSourceOptions {
 
 // 41-M1.3：主机级健康记忆（source-host-health.ts）的唯一记录点——builtin 与引擎两条腿的每次逻辑请求都经过这里。
 // 换 host 兜底算同一次逻辑请求：任一 host 拿到正文即记成功；失败只按传输层硬失败计数（hostFailureKind），
-// 记在初始 URL 的 host 上（apex 与 www 在健康记忆里是同一个站）。父 signal 已中止（调用方取消、切片到点）不计：
-// 那是调用方的时间决定，不是 host 的健康信号。
+// HTTP 失败按实际响应 host 记、传输层错误记在初始 URL 的 host 上（apex 与 www 在健康记忆里是同一个站）。
+// 父 signal 已中止（调用方取消、切片到点）不计：那是调用方的时间决定，不是 host 的健康信号。
 export async function fetchSourceText(input: string, options: FetchSourceOptions) {
   options.signal.throwIfAborted();
   const initial = validateSourceUrl(input);

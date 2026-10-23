@@ -1,5 +1,5 @@
 import { SourcePolicyError, validateSourceUrl } from './source-policy';
-import { resolveSourceBook, SourceReaderError, SourceRequestContext, type SourceSearchStat } from './source-reader';
+import { probeCooldownSlots, resolveSourceBook, SourceReaderError, SourceRequestContext, type SourceSearchStat } from './source-reader';
 import { getEngineSources } from './shuyuan';
 
 export interface DownloadRelocationCandidate {
@@ -40,7 +40,10 @@ export async function resolveDownloadRelocation(
     // The pool is the capability boundary. The historical labeled_books.source_url
     // is deliberately not accepted by this adapter and therefore cannot be requested.
     const pool = await getEngineSources(signal);
-    const catalog = await resolveSourceBook(book, new SourceRequestContext(signal), { sources: pool, searchStats });
+    // 46-revfix：下载重定位与阅读根 context / probe / followup 同一张进程级冷却表。此前本腿
+    // 裸建请求级表：probe 吃到的 429 冷却对搬迁搜索不可见，同一进程稍后的搬迁会对同一站重打。
+    // SOURCE_THROTTLE_PER_HOST=0 回滚语义 = 请求级（probeCooldownSlots 同步退回）。
+    const catalog = await resolveSourceBook(book, new SourceRequestContext(signal, undefined, { cooldownSlots: probeCooldownSlots() }), { sources: pool, searchStats });
     const bookUrl = validateSourceUrl(catalog.bookUrl).href;
     return {
       bookUrl,

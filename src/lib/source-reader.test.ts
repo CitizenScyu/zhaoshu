@@ -3492,7 +3492,7 @@ describe('chapter failover M1.1 (41-M1.1)', () => {
 
   // ---- 41-M1.2b:深审 A 第三轮四列探针里违反「三列取优」的两行(V1/V2),在 a02e482 上都是红的 ----
 
-  it('V1 ROUTE-504r2(G):当前源卡住;A、B 一直出数据、最后才失败，吃掉大半预算;C 可用 ⇒ 余量 6.65s 时 C 仍开跑并交付 200(a02e482:<8s ⇒ 504)', async () => {
+  it('V1 ROUTE-504r2(G):当前源卡住;A、B 一直出数据、最后才失败，吃掉大半预算;C 可用 ⇒ 37s(until)处 C 开跑并交付 200(a02e482:<8s ⇒ 504)', async () => {
     const pool = [current, alt(1), alt(2), alt(3)];
     const catalog = await prepareCurrent(pool);
     pages.set(currentChapter, { text: chapterHtml('当前源正文') });

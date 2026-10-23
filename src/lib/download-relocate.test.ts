@@ -1,7 +1,9 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-const { getEngineSources, resolveSourceBook, validateSourceUrl } = vi.hoisted(() => ({
+const { cooldownTable, getEngineSources, probeCooldownSlots, resolveSourceBook, validateSourceUrl } = vi.hoisted(() => ({
+  cooldownTable: new Map<string, number>(),
   getEngineSources: vi.fn(),
+  probeCooldownSlots: vi.fn(),
   resolveSourceBook: vi.fn(),
   validateSourceUrl: vi.fn((value: string) => new URL(value)),
 }));
@@ -11,6 +13,7 @@ vi.mock('./source-policy', () => {
   class SourcePolicyError extends Error {}
   return { SourcePolicyError, validateSourceUrl };
 });
+const contextOptions: Array<Record<string, unknown> | undefined> = [];
 vi.mock('./source-reader', () => {
   class SourceReaderError extends Error {
     constructor(message: string, readonly code: string, readonly status = 500) {
@@ -18,9 +21,11 @@ vi.mock('./source-reader', () => {
     }
   }
   class SourceRequestContext {
-    constructor(readonly signal: AbortSignal) {}
+    constructor(readonly signal: AbortSignal, _limit?: unknown, options?: Record<string, unknown>) {
+      contextOptions.push(options);
+    }
   }
-  return { SourceReaderError, SourceRequestContext, resolveSourceBook };
+  return { SourceReaderError, SourceRequestContext, probeCooldownSlots, resolveSourceBook };
 });
 
 import { SourcePolicyError } from './source-policy';
@@ -36,8 +41,11 @@ const catalog = {
 describe('resolveDownloadRelocation', () => {
   beforeEach(() => {
     vi.resetAllMocks();
+    contextOptions.length = 0;
     getEngineSources.mockResolvedValue(pool);
     resolveSourceBook.mockResolvedValue(catalog);
+    // 46-revfix 断言哨兵：probeCooldownSlots 由被测实现调用（真实现读 env 决定 undefined 退回）。
+    probeCooldownSlots.mockReturnValue(cooldownTable);
     validateSourceUrl.mockImplementation((value: string) => new URL(value));
   });
 
@@ -107,5 +115,11 @@ describe('resolveDownloadRelocation', () => {
     await expect(rejection).rejects.toBeInstanceOf(DownloadRelocationError);
     await expect(rejection).rejects.toMatchObject({ code: 'RELOCATION_IDENTITY_MISMATCH', status: 422 });
     await expect(rejection).rejects.toMatchObject({ candidates: undefined });
+  });
+
+  it('46-revfix:搬迁 context 挂进程级共享冷却表（probe 的 429 对本腿可见）', async () => {
+    await resolveDownloadRelocation({ title: catalog.title, author: catalog.author }, new AbortController().signal);
+    expect(probeCooldownSlots).toHaveBeenCalledOnce();
+    expect(contextOptions).toEqual([{ cooldownSlots: cooldownTable }]);
   });
 });
