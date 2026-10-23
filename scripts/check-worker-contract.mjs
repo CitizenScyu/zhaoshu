@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, relative, resolve } from 'node:path';
-import { fileURLToPath, pathToFileURL } from 'node:url';
+import { pathToFileURL } from 'node:url';
 import { bookFilename } from '../src/lib/book-file-name.ts';
 import { DOWNLOAD_TASK_STALE_MS } from '../src/lib/download-task-policy.ts';
 import { validateSourceUrl } from '../src/lib/source-policy.ts';
@@ -39,110 +39,94 @@ console.log('Cross-repository source policy contract: ' + sourceCases.length + '
 console.log(`Task timing contract: heartbeat ${heartbeat.HEARTBEAT_INTERVAL_MS}ms + query ${heartbeat.HEARTBEAT_QUERY_TIMEOUT_MS}ms < reclaim ${DOWNLOAD_TASK_STALE_MS}ms`);
 
 // 第五组：runtime/ 新路线的注入锚点契约（T8 打包脚本）。
-//   生产执行器走 runtime/ 新路线：scripts/build-runtime-download.mjs 把装配代码「注入」到兄弟仓
-//   runtime/service/main.mjs 的固定接缝上，靠三条硬编码字符串锚点定位（其 :63 起点、:64 终点、:98 限速器导入）。
+//   生产执行器走 runtime/ 新路线：scripts/build-runtime-download.mjs 调 scripts/runtime-download-template.mjs
+//   的 wireDownloadExecutor()，把装配代码「注入」到兄弟仓 runtime/service/main.mjs 的固定接缝上，靠硬编码
+//   锚点定位（接缝起点/终点 + 共享限速 supervisor 装配的 9 条锚点，要求各出现恰好一次且都在接缝之前）。
 //   锚点失配只在**打包时**才抛（build-runtime-download.mjs 的 throw），反馈太晚——本组把它提前到 push 时。
 //
-// 设计：锚点原文**不在本文件复写**（否则成第三处硬编码，改一处漏两处），而是从 build-runtime-download.mjs
-//   的源码里解析出那三条字面量。解析失败即硬失败（fail-closed），不静默跳过。
-const buildScriptPath = fileURLToPath(new URL('./build-runtime-download.mjs', import.meta.url));
+// 设计（2026-10-23 改）：直接 import 生产用的那个纯函数，拿兄弟仓的 main.mjs 真跑一遍。
+//   旧写法是用正则去 build 脚本源码里解析 `const START = '...'` 这类字面量；锚点搬进 template（8af9ecd,
+//   2026-10-06）并扩成 9 条数组（c0f4374, 2026-10-14）之后就永久失配，而这条契约从没被执行过
+//   （CI 不 checkout 兄弟仓、pre-push 钩子未激活），红了 17 天没人发现。改成调用真函数后，锚点原文
+//   既不复写、也不可能与打包路径脱钩——template 改了这里跟着变，不需要第三处硬编码。
 const shellMainRel = 'runtime/service/main.mjs';
+const { wireDownloadExecutor } = await import(new URL('./runtime-download-template.mjs', import.meta.url).href);
 
-// 把 JS 字符串字面量（含两侧引号）还原成真实值，处理 \n \t \uXXXX 等转义。
-// 转义用字符码表示，避免源码里出现控制字符。
-function unescapeLiteral(literal) {
-  const body = literal.slice(1, -1);
-  const simple = { n: 10, r: 13, t: 9, b: 8, f: 12, v: 11, 0: 0 };
-  let out = '';
-  for (let i = 0; i < body.length; i += 1) {
-    const ch = body[i];
-    if (ch !== '\\') { out += ch; continue; }
-    const next = body[(i += 1)];
-    if (next === 'u') { out += String.fromCharCode(parseInt(body.slice(i + 1, i + 5), 16)); i += 4; continue; }
-    if (next === 'x') { out += String.fromCharCode(parseInt(body.slice(i + 1, i + 3), 16)); i += 2; continue; }
-    out += Object.prototype.hasOwnProperty.call(simple, next) ? String.fromCharCode(simple[next]) : next;
-  }
-  return out;
-}
+// 兄弟仓的 runtime/ 源在不在。origin/main 从来没有 runtime/（它只存在于本地提交 4e960b3，已随空目录一起
+// 丢失），所以**任何新克隆都会走「无 runtime/」这条**。缺失=无法验证，不等于验证通过：明确 warn 后跳过
+// 第五/六组，其余四组（worker.mjs 所有权 / 文件名 / 源策略 / 心跳时序）照旧硬跑。
+// runtime/ 在、但缺必需模块 → 仍然硬失败（残缺状态不能当可选契约放行，见第六组）。
+const shellPresent = existsSync(resolve(workerRoot, 'runtime'));
 
-// 从 build-runtime-download.mjs 源码里按「声明名 + 字符串字面量」提取三条锚点。
-// 只依赖声明名（START / END / anchor）与字符串字面量形状，锚点原文不进本文件。
-function extractShellAnchors(source) {
-  const decls = [
-    ['START', '执行器接缝起点'],
-    ['END', '执行器接缝终点'],
-    ['anchor', 'rate-limiter 注入锚点'],
-  ];
-  return decls.map(([name, label]) => {
-    const re = new RegExp(`const\\s+${name}\\s*=\\s*('(?:[^'\\\\]|\\\\.)*'|"(?:[^"\\\\]|\\\\.)*")`);
-    const m = re.exec(source);
-    if (!m) {
-      throw new Error(`跨仓 runtime 锚点契约自检失败：在 scripts/build-runtime-download.mjs 里解析不到锚点 "${name}" 的字符串字面量（被重命名或改写法）。请同步更新 scripts/check-worker-contract.mjs 的声明名清单。`);
-    }
-    return { name, label, value: unescapeLiteral(m[1]) };
-  });
-}
-
-if (!existsSync(workerRoot)) {
-  // 与 pre-push 钩子的 `[ -d ../zhaoshu-books ]` 约定一致：兄弟仓不在就跳过，不拒绝 push。
-  console.log('○ 跳过跨仓 runtime 锚点契约：本地无兄弟仓');
+if (!shellPresent) {
+  console.warn('⚠ 跳过跨仓 runtime 契约（第五组注入锚点 + 第六组预算/限速）：兄弟仓没有 runtime/ 源目录。');
+  console.warn('  这是「无法验证」，不是「通过」。补回 shell 源后两组自动重新武装，本文件不用改。');
+  console.warn('  已知影响：全量 runtime 重建+部署路径当前不可用——phoenix 上只有构建产物，其 main.mjs 是');
+  console.warn('  2026-10-07 代（verifySharedRateStartup / createSharedRateLimiter 内联装配，各出现 2 次），');
+  console.warn('  与本仓 template 自 c0f4374 起要求的 startSharedRateSupervisor 装配不符（部署版 0 次）；');
+  console.warn('  生产下载线靠单换 executor.mjs 维持，未走过全量重建。');
 } else {
-  const anchors = extractShellAnchors(readFileSync(buildScriptPath, 'utf8'));
   const shellMainPath = resolve(workerRoot, shellMainRel);
   if (!existsSync(shellMainPath)) {
     throw new Error(
-      `跨仓 runtime 锚点契约失败：兄弟仓缺少 ${shellMainRel}（${shellMainPath}）。\n` +
+      `跨仓 runtime 锚点契约失败：兄弟仓有 runtime/ 但缺少 ${shellMainRel}（${shellMainPath}）。\n` +
       `  生产执行器走 runtime/ 新路线，打包脚本 scripts/build-runtime-download.mjs 会在打包时抛「runtime shell 未找到」。\n` +
-      `  修法：把兄弟仓切到含 runtime/ 的版本（或在兄弟仓补上 runtime/service/main.mjs）。`,
+      `  修法：把兄弟仓切到含 ${shellMainRel} 的版本。`,
     );
   }
-  const shellSource = readFileSync(shellMainPath, 'utf8');
-  for (const { name, label, value } of anchors) {
-    if (shellSource.includes(value)) continue;
+  // 真跑一遍生产注入函数：锚点齐了就返回改写后的 main.mjs，缺任何一条就抛。
+  try {
+    assert.ok(wireDownloadExecutor(readFileSync(shellMainPath, 'utf8')).length > 0);
+  } catch (error) {
     throw new Error(
-      `跨仓 runtime 锚点契约失败：锚点 "${name}"（${label}）在兄弟仓 ${shellMainRel} 里找不到。\n` +
-      `  锚点原文（读自 scripts/build-runtime-download.mjs）：${JSON.stringify(value)}\n` +
+      `跨仓 runtime 锚点契约失败：${shellMainRel} 过不了 scripts/runtime-download-template.mjs 的注入检查。\n` +
+      `  打包器原文：${error.message}\n` +
       `  影响：scripts/build-runtime-download.mjs 打包注入会失配，在打包阶段才抛错（反馈太晚）。\n` +
-      `  修法：要么把兄弟仓 ${shellMainRel} 的对应接缝/导入行改回原文，要么同步更新本仓 scripts/build-runtime-download.mjs 的锚点。`,
+      `  修法：要么把兄弟仓 ${shellMainRel} 的接缝/共享限速装配行改回 template 要求的原文，要么同步更新 template 的锚点。`,
     );
   }
-  console.log(`Cross-repository runtime anchor contract: ${anchors.length} anchors present in ${shellMainRel}`);
+  // 负向对照：证明上面那次「通过」不是空函数造成的假绿（template 被改成恒返回时这里会红）。
+  assert.throws(() => wireDownloadExecutor('// 没有接缝也没有装配锚点的 shell'), /锚点缺失或不唯一/,
+    'wireDownloadExecutor 必须在缺接缝时抛错，否则第五组是假绿');
+  console.log(`Cross-repository runtime anchor contract: wireDownloadExecutor() ran clean on ${shellMainRel} (+1 negative control)`);
 }
 
 // 第六组：runtime 日预算退还 + 限速器错误名契约（41-EXEC-SRCUNAVAIL）。
 //   runtime-download/budget-refund.ts 与兄弟仓 runtime/lib/daily-budget.mjs 读写同一份状态文件；
 //   scripts/engine-download.mjs 的 isSourceUnavailableError 按 name 识别兄弟仓限速器的两类错误。
 //   任一侧改了文件格式或类名，这里在 push 时就红，而不是上线后静默漏退、或把瞬时错误落成终态。
-const shellBudgetPath = resolve(workerRoot, 'runtime/lib/daily-budget.mjs');
-const shellLimiterPath = resolve(workerRoot, 'runtime/lib/rate-limiter.mjs');
-// 兄弟仓整体缺席由 pre-push 的目录检查决定跳过；进入此处时 runtime 已通过前组检查。
-// 这两个文件分别是 shell 的静态依赖与打包器注入的依赖，缺失不能按可选契约放行。
-const missingRuntimeFiles = [shellBudgetPath, shellLimiterPath].filter(file => !existsSync(file));
-if (missingRuntimeFiles.length) {
-  throw new Error(`跨仓 runtime 契约失败：缺少必需文件 ${missingRuntimeFiles
-    .map(file => relative(workerRoot, file).replaceAll('\\', '/')).join(', ')}`);
-} else {
-  const { createDailyBudget } = await import(pathToFileURL(shellBudgetPath).href);
-  const { createBudgetRefund } = await import('../runtime-download/budget-refund.ts');
-  const dir = mkdtempSync(join(tmpdir(), 'budget-contract-'));
-  try {
-    const statePath = join(dir, 'daily-budget.json');
-    const now = () => Date.parse('2026-09-24T03:00:00.000Z');
-    const budget = createDailyBudget({ statePath, limit: 3, now });
-    const first = await budget.consume();
-    await budget.consume();
-    const refund = createBudgetRefund({ statePath, now });
-    assert.equal(await refund({ key: 'contract:1', date: first.date }), 'refunded');
-    assert.deepEqual(await budget.read(), { date: first.date, used: 1 });
-    assert.equal(await refund({ key: 'contract:1', date: first.date }), 'duplicate');
-    assert.deepEqual(await budget.read(), { date: first.date, used: 1 });
-    assert.equal((await budget.consume()).used, 2); // shell 在退还后的文件上照常续扣
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
+if (shellPresent) {
+  const shellBudgetPath = resolve(workerRoot, 'runtime/lib/daily-budget.mjs');
+  const shellLimiterPath = resolve(workerRoot, 'runtime/lib/rate-limiter.mjs');
+  // 兄弟仓整体缺席由 pre-push 的目录检查决定跳过；进入此处时 runtime/ 已通过第五组检查。
+  // 这两个文件分别是 shell 的静态依赖与打包器注入的依赖，缺失不能按可选契约放行。
+  const missingRuntimeFiles = [shellBudgetPath, shellLimiterPath].filter(file => !existsSync(file));
+  if (missingRuntimeFiles.length) {
+    throw new Error(`跨仓 runtime 契约失败：缺少必需文件 ${missingRuntimeFiles
+      .map(file => relative(workerRoot, file).replaceAll('\\', '/')).join(', ')}`);
+  } else {
+    const { createDailyBudget } = await import(pathToFileURL(shellBudgetPath).href);
+    const { createBudgetRefund } = await import('../runtime-download/budget-refund.ts');
+    const dir = mkdtempSync(join(tmpdir(), 'budget-contract-'));
+    try {
+      const statePath = join(dir, 'daily-budget.json');
+      const now = () => Date.parse('2026-09-24T03:00:00.000Z');
+      const budget = createDailyBudget({ statePath, limit: 3, now });
+      const first = await budget.consume();
+      await budget.consume();
+      const refund = createBudgetRefund({ statePath, now });
+      assert.equal(await refund({ key: 'contract:1', date: first.date }), 'refunded');
+      assert.deepEqual(await budget.read(), { date: first.date, used: 1 });
+      assert.equal(await refund({ key: 'contract:1', date: first.date }), 'duplicate');
+      assert.deepEqual(await budget.read(), { date: first.date, used: 1 });
+      assert.equal((await budget.consume()).used, 2); // shell 在退还后的文件上照常续扣
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+    const limiter = await import(pathToFileURL(shellLimiterPath).href);
+    const { isSourceUnavailableError } = await import('./engine-download.mjs');
+    assert.ok(isSourceUnavailableError(new limiter.CircuitOpenError('book15.net', Date.now())), 'CircuitOpenError 必须归 source_unavailable');
+    assert.ok(isSourceUnavailableError(new limiter.DailyRequestBudgetError('book15.net', 20_000)), 'DailyRequestBudgetError 必须归 source_unavailable');
+    console.log('Cross-repository runtime budget/limiter contract: refund round-trip + 2 limiter error names passed');
   }
-  const limiter = await import(pathToFileURL(shellLimiterPath).href);
-  const { isSourceUnavailableError } = await import('./engine-download.mjs');
-  assert.ok(isSourceUnavailableError(new limiter.CircuitOpenError('book15.net', Date.now())), 'CircuitOpenError 必须归 source_unavailable');
-  assert.ok(isSourceUnavailableError(new limiter.DailyRequestBudgetError('book15.net', 20_000)), 'DailyRequestBudgetError 必须归 source_unavailable');
-  console.log('Cross-repository runtime budget/limiter contract: refund round-trip + 2 limiter error names passed');
 }
