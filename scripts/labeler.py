@@ -69,22 +69,24 @@ STUB_MIN_CHAPTERS = 10
 STUB_MIN_CHARS = 50_000
 BASE = 'https://book15.net'
 # LLM 端点：默认 = 打标机本机那个 NewAPI 的 loopback 入口。换端点写 .env 的 LLM_URL
-# （见 resolve_llm_url），**别改这行源码**。2026-10-23 改这里的两层原因，第二层比第一层要紧：
+# （见 resolve_llm_url），**别改这行源码**。2026-10-23 改这里的两层原因，① 是缺陷本体，
+# ② 是那个端点到底指向哪台机器：
 # ① 仓↔机漂移不可见。这里原先硬编码一个公网主机名，而部署机 /var/lib/zhaoshu-worker 上对
 #    labeler.py 与 gatekeeper.py 各做过一处**未版本化**的就地修改，换成了 127.0.0.1:13001
 #    （该机 `docker ps`：new-api 127.0.0.1:13001->3000）。仓库里看不出部署机被改过；仓内也没有
 #    打标机的自动部署脚本，所以风险形态是「人工拿仓库版本覆盖部署机、又没保留那处就地补丁」，
 #    端点就被静默换掉。默认值改成部署机实际在用的那个、并让 env 可覆盖，这类漂移没有立足点。
-# ② 原先硬编码的那个公网主机名（api.cloud.us.kg）**指向谁没核实过，别当可信端点写回默认值**。
-#    仓内 .env.local.example:25 曾把它记成「本机 NewAPI 的 Cloudflare Tunnel 公网入口」，那是
-#    二手记录，已被一手证据推翻：该机 cloudflared 的生效 ingress（journal 2026-10-18 09:22:33
-#    "Updated to new configuration" version=22：19 条 hostname + 末尾 catchall http_status:404）
-#    里**没有**这个 hostname；磁盘 /etc/cloudflared/config.yml 虽然写着它→localhost:3001
-#    （Nginx 3001→13001），但该 unit 是远端托管的，磁盘文件不生效。而公网那头确实有个 NewAPI
-#    在应答（无凭据 GET /api/status：200、CF-Cache-Status=DYNAMIC、无 Age ⇒ 非缓存），其
-#    start_time 比本机 new-api 容器的 StartedAt 晚 69019 秒 ⇒ **不是同一个进程**。归属查清前，
-#    往那儿发 = 把 LLM_API_KEY 和抓来的书内容送去未核实上游（见 .claude/CLAUDE.md 安全红线）。
-#    所以默认值钉死本机 loopback，并且每轮开跑都把实际端点印出来（见 main）。
+# ② 原先硬编码的那个公网主机名不是本机实例，是**另一台** NewAPI：api.cloud.us.kg = phoenix 上的
+#    new-api-phx。一手核实（2026-10-23，全程无凭据）：公网 GET /api/status 的 start_time=1792709062
+#    与 phoenix `docker inspect --format '{{.State.StartedAt}}' new-api-phx`（2026-10-22T22:44:22Z）
+#    同秒；打标机本机那台 new-api 是 1792640043（2026-10-22T03:34:03Z），差 69019 秒。
+#    旁证：打标机 cloudflared 的生效 ingress（journal 2026-10-18 09:22:33 "Updated to new
+#    configuration" version=22，19 条 hostname + 末尾 catchall http_status:404）里没有这个
+#    hostname；磁盘 /etc/cloudflared/config.yml 虽写着它→localhost:3001，但该 unit 远端托管、
+#    磁盘文件不生效（别拿磁盘配置当生效配置）。
+#    两台都是自家基础设施、同 system_name，不是凭据外泄；但打标侧跨到 phoenix 等于白多一跳公网，
+#    且用的是另一台实例（本机那台的 key 未必在那边有效）。仓内 .env.local.example 曾把它记成
+#    「本机 NewAPI 的 Tunnel 入口」——对 web 侧成立（Vercel 只能走公网入口），对打标侧不成立。
 LLM_URL = 'http://127.0.0.1:13001/v1/chat/completions'
 LLM_URL_ENV = 'LLM_URL'
 UA = {'User-Agent': 'Mozilla/5.0 (compatible; zhaoshu-labeler/1.0)'}

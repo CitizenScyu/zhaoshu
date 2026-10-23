@@ -7,11 +7,10 @@ import { pathToFileURL } from 'node:url';
 import { parseQuality } from './import_labels.mjs';
 
 // LLM 端点默认值 = 打标机本机 NewAPI 的 loopback 入口。换端点写 env 文件的 LLM_URL，别改这行。
-// 2026-10-23 核实：本文件与 scripts/labeler.py、scripts/gatekeeper.py 原先都硬编码公网主机名
-// api.cloud.us.kg，而部署机上对那两个 .py 各做过一处**未版本化**的就地修改换成 127.0.0.1:13001。
-// 仓内 .env.local.example 曾说那个主机名是「本机 NewAPI 的 Tunnel 公网入口」，一手证据不支持
-// （打标机 cloudflared 生效 ingress 里没有它；公网应答的 NewAPI 进程 start_time 与本机容器不同）
-// ⇒ 归属未核实，别把它写回默认值。详见 labeler.py 的 LLM_URL 注释。
+// 2026-10-23 核实：本文件与 scripts/labeler.py、scripts/gatekeeper.py 原先都硬编码
+// api.cloud.us.kg——那是 phoenix 上的 new-api-phx（自家**另一台**实例，不是打标机本机那台），
+// 而部署机上对那两个 .py 各做过一处**未版本化**的就地修改换成 127.0.0.1:13001。
+// 证据与为什么打标侧该用本机，见 labeler.py 的 LLM_URL 注释。
 const DEFAULT_LLM_URL = 'http://127.0.0.1:13001/v1/chat/completions';
 const TARGET_CHARS = 400_000;
 const CHAPTER_DELAY = 0.3;

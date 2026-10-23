@@ -146,13 +146,12 @@ class ProbeEndpointTest(unittest.TestCase):
         self.assertEqual(seen, [FAKE_URL])
 
     def test_default_endpoint_is_the_local_newapi(self):
-        """回归护栏：默认端点必须是 loopback，不能是任何公网主机名。
+        """回归护栏：默认端点必须是本机 loopback，不能是另一台实例的公网入口。
 
-        2026-10-23 之前这里硬编码 api.cloud.us.kg，生产实际跑的是部署机上两处**未版本化**的
-        就地改文件（127.0.0.1:13001）。仓内文档说那个主机名是「本机 NewAPI 的公网入口」，
-        一手证据不支持：该机 cloudflared 生效 ingress（journal version=22）里没有这个 hostname，
-        而公网应答的 NewAPI 进程 start_time 与本机 new-api 容器不同 ⇒ 不是同一个进程、归属未核实。
-        往未核实上游发 LLM_API_KEY 与书内容触安全红线，所以默认值只能是本机。谁改回去这条就红。"""
+        2026-10-23 之前这里硬编码 api.cloud.us.kg——那是 phoenix 上的 new-api-phx（自家另一台
+        实例，不是打标机本机那台；一手核实方式见 labeler.py 的 LLM_URL 注释），而生产实际跑的
+        是部署机上两处**未版本化**的就地改文件（127.0.0.1:13001）。谁把默认值改回公网主机名，
+        这条就红。"""
         url = gatekeeper.labeler.resolve_llm_url({})
         self.assertTrue(url.startswith('http://127.0.0.1:'), url)
         self.assertNotIn('cloud.us.kg', url)
