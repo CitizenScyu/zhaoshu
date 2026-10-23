@@ -45,6 +45,73 @@ from typing import Callable, Iterable
 import douban_list
 import labeler_source_policy
 
+# ---- 同目录配套文件的接口契约（部署防呆）----
+# labeler.py 与同目录那几个配套文件是**一起部署**的：本文件直接引用它们的一批名字，缺任何一个都会在
+# 选书或打标途中炸 AttributeError。2026-10-23 差点真踩一次：部署机 /var/lib/zhaoshu-worker 的
+# douban_list.py 停在 eab792a（只有 load_done_titles），而 labeler.py 已到 30f0581
+# （改调 load_done_index + build_*_queue(done_index=…)）——只 scp labeler.py 上去，下一轮就会在
+# 选书阶段炸；而 gatekeeper 的恢复分支是「探测→重启 labeler→再炸」，会无限循环，每圈还白烧
+# 最多 FAIL_M 次 25 万字段探测。仓内测试兜不住这个：它们永远只看到同一提交里的两个文件。
+# 所以启动时自检一次，缺失即 fail-closed（不选书、不打标、退出码 EXIT_COMPANION_TOO_OLD）+ 一句人话。
+# 名单不是手写死账：test_labeler_companion.py 从本文件源码反查全部 `douban_list.<名字>` /
+# `labeler_source_policy.<名字>` 引用，新增引用却没进名单会变红；名单里的名字在仓内对应模块不存在
+# 也会变红（防错字/防陈旧条目）。反查用正则扫全文，所以本文件里不要写出「<模块名>.某个不是接口的词」
+# 这种字面（含注释与文档串），唯一允许的例外是文件名后缀 douban_list.py（测试里显式排除 'py'）。
+# 覆盖范围说清楚：
+#   · 只查**名字在不在**，不查签名（同名换签名不在防护内）。刻意不查签名——万一某天某函数改成
+#     **kwargs 收参，签名探测会误判并把生产打标整体停掉，代价远大于它多兜的那点。
+#   · 只查 `模块.名字` 这种写法；`getattr(模块, '名字')` 形态的动态取用扫不到（本文件目前没有，
+#     gatekeeper.py 那两处是刻意动态的，各自已有 fail-closed 兜底）。
+#   · 新加一个配套文件就在 COMPANION_MODULES 里加一行 + 在测试里加同款的名单反查。
+EXIT_COMPANION_TOO_OLD = 5   # 配套文件版本不匹配：fail-closed（0/1/2 的语义见 main 末尾）
+REQUIRED_DOUBAN_LIST_API = (
+    'Book15Breaker', 'CONTENT_TOC_MIN_MATCH', 'CONTENT_TOC_MIN_NAME_CHARS', 'ENGINE_CLI_TIMEOUT',
+    'EngineCli', 'EngineUnavailable', '_AUTHOR_SUFFIX_RE', '_body_decides', '_char_ngrams',
+    '_clean_body_chapters', '_informative_toc_titles', '_is_auxiliary_toc_name', '_norm_author',
+    '_norm_generic_toc_word', '_norm_title', '_norm_title_bare', '_split_toc_numbering',
+    '_strip_author_label', '_to_simplified', '_toc_chapter_number', '_toc_decides',
+    'author_matches', 'body_pair_details', 'build_douban_queue', 'build_webnovel_queue',
+    'engine_fallback_enabled', 'fetch_content_fingerprint', 'is_placeholder_author',
+    'load_done_index', 'resolve_book15_breaker', 'resolve_douban_pages', 'same_book',
+    'search_engine', 'title_compatible', 'validate_engine',
+)
+REQUIRED_SOURCE_POLICY_API = (
+    'BOOK15_HOST', 'RETIRED_HOSTS', 'SourceBlockedError', 'SourcePolicy',
+    'host_of', 'parse_disabled_hosts',
+)
+# (真模块, 它必须提供的名字) 清单。模块引用在 import 时定格，与生产实际用的那份是同一个对象。
+COMPANION_MODULES = (
+    (douban_list, REQUIRED_DOUBAN_LIST_API),
+    (labeler_source_policy, REQUIRED_SOURCE_POLICY_API),
+)
+
+
+class CompanionTooOld(RuntimeError):
+    """同目录的配套文件缺 labeler.py 要用的接口（= 文件不配套）。见上面那段说明。"""
+
+
+def check_companion_api(modules=COMPANION_MODULES) -> None:
+    """自检配套接口齐全；缺任何一个就抛 CompanionTooOld（不静默降级、不带着残接口继续跑）。
+
+    一次报全所有模块的所有缺失（不是碰到第一个就抛）：部署机上往往是好几个文件都停在旧版本，
+    一次说清才不用「修一个、重启、再看下一个」。
+    modules 参数只为测试可注入（传一组 (假模块, 名单)），生产走默认值 = 真 import 进来那几个模块。
+    用 hasattr 而不是 callable：名单里既有函数/类，也有常量与已编译正则。"""
+    gaps = []
+    for module, required in modules:
+        missing = sorted(name for name in required if not hasattr(module, name))
+        if missing:
+            # 原样用 __file__，不套 Path()：这里不做任何路径运算，而 Path 会把 POSIX 路径按当前平台
+            # 重排分隔符（Windows 上跑用例时 /var/lib/... 会变成 \var\lib\...），日志里对不上真文件。
+            path = getattr(module, '__file__', None) or f'{module.__name__}.py'
+            gaps.append(f'{path} 缺少 labeler.py 需要的 {len(missing)} 个接口: {", ".join(missing)}。')
+    if gaps:
+        raise CompanionTooOld(
+            ''.join(gaps) +
+            '配套文件必须同批部署（scp 后重启 zhaoshu-labeler.service）；只换一个会在选书/打标'
+            '途中炸 AttributeError，并被门卫的恢复分支循环重启（每圈白烧探测额度）。')
+
+
 # ---- 配置 ----
 TARGET_CHARS = 500_000      # 每本抓取字数上限
 CHUNK_RETRY = 3             # 单章抓取重试
@@ -3814,6 +3881,15 @@ def main() -> int:
     ap.add_argument('--max-pages', type=int, default=None,
                     help=f'每个分类最多抓取的页数（默认 {CATEGORY_MAX_PAGES}，即以页内尾页为准）')
     args = ap.parse_args()
+
+    try:
+        check_companion_api()
+    except CompanionTooOld as e:
+        # 部署配错版本，不是渠道坏也不是书的问题：重启一万次结果一样，所以立刻 fail-closed，
+        # 不选书、不打标、不读 .env。退出码独立于 0/1/2（见 main 末尾），gate.log 一眼可辨；
+        # gatekeeper 认这个码后也不再进「探测→重启」的恢复循环（见 gatekeeper.EXIT_COMPANION_TOO_OLD）。
+        print(f'错误: {e}', file=sys.stderr, flush=True)
+        return EXIT_COMPANION_TOO_OLD
 
     env = load_env()
     models, model_source = resolve_models(env, use_db=not args.no_db_model)

@@ -29,6 +29,24 @@ import gatekeeper  # noqa: E402
 
 FAKE_KEY = 'test-key-not-real-0123456789'
 FAKE_URL = 'http://127.0.0.1:13999/v1/chat/completions'   # 端口刻意与真实中转不同，防串台
+# 部署机上配套文件所在的绝对路径（只用于错误文本断言，不访问）。
+DEPLOYED_DOUBAN_LIST = '/var/lib/zhaoshu-worker/douban_list.py'
+# 自检函数的**原**引用（import 时取，此刻还没被任何 patch 动过）：用例里会 patch 掉
+# labeler.check_companion_api，而造「真错误」时仍要调原函数（调 patch 后的那个会自我递归，
+# 实测 RecursionError）。
+REAL_CHECK_COMPANION_API = gatekeeper.labeler.check_companion_api
+
+
+class _PartialDoubanList:
+    """只有指定属性的假 douban_list（hasattr / __file__ 语义与真模块一致）。
+
+    用普通对象而不是 types.ModuleType：这里只需要 hasattr 能分辨「名字在不在」，
+    少一个 import 也让替身的意图更直白。"""
+
+    def __init__(self, path: str, names):
+        self.__file__ = path
+        for name in names:
+            setattr(self, name, object())
 
 
 def _env(**kw) -> dict:
@@ -389,6 +407,159 @@ class VersionMismatchTest(unittest.TestCase):
         text = err.getvalue()
         self.assertIn('同批部署', text)
         self.assertIn('fail-closed', text)
+
+
+class CompanionMismatchTest(unittest.TestCase):
+    """三文件配套部署：labeler.py 报「douban_list.py 不配套」时，门卫必须停止重试。
+
+    失效形态（2026-10-23 差点踩到）：只把 labeler.py scp 上去，它引用的 douban_list.load_done_index
+    在部署机那份（eab792a）里不存在 ⇒ 每轮启动就在选书阶段炸，退出码既不是 0 也不是 2 ⇒ 落进
+    「探测→重启 labeler→再炸」的恢复循环，无限重启且每圈白烧最多 FAIL_M 次 25 万字段探测。
+    重启一万次结果一样，所以这个码要短路成 fail-closed（退出码 5，systemd 标 failed），
+    而不是让服务看起来 active 却永远零产出。自检本体与名单来源见 test_labeler_companion.py。"""
+
+    @staticmethod
+    def _real_error():
+        """造出**真**自检报出的那条错（缺 load_done_index = eab792a 形态），供 patch 用。
+
+        刻意不在测试里手写一句错误文本：那样断言的是我编的字符串，门卫转发的是 labeler 编的
+        字符串，两边可以各自漂移到互不相干而用例照绿。"""
+        module = _PartialDoubanList(DEPLOYED_DOUBAN_LIST,
+                                    [n for n in gatekeeper.labeler.REQUIRED_DOUBAN_LIST_API
+                                     if n != 'load_done_index'])
+        try:
+            REAL_CHECK_COMPANION_API(((module, gatekeeper.labeler.REQUIRED_DOUBAN_LIST_API),))
+        except gatekeeper.labeler.CompanionTooOld as e:
+            return e
+        raise AssertionError('缺 load_done_index 的假模块本该被判为不配套')
+
+    @classmethod
+    def _refuse(cls, *a, **kw):
+        raise cls._real_error()
+
+    def test_pairing_check_passes_on_the_real_pair(self):
+        self.assertIsNone(gatekeeper.check_companion_pairing())
+
+    def test_pairing_check_returns_the_error_text(self):
+        with mock.patch.object(gatekeeper.labeler, 'check_companion_api', side_effect=self._refuse):
+            message = gatekeeper.check_companion_pairing()
+        self.assertIn('load_done_index', message)      # 原文上交，不重新措辞（丢细节就没法排查）
+
+    def test_old_labeler_without_the_check_is_not_refused(self):
+        """旧 labeler.py 没有 check_companion_api：返回 None（放行），不当成「检查通过」也不拒绝。
+
+        这一侧的后果由 labeler 自己的启动自检、以及下面两条退出码用例兜住；门卫若在这里
+        直接拒绝，就会把「新门卫 + 旧 labeler + 旧 douban_list」这套本来能跑的配对判死。"""
+        saved = gatekeeper.labeler.check_companion_api
+        saved_exc = gatekeeper.labeler.CompanionTooOld
+        del gatekeeper.labeler.check_companion_api
+        del gatekeeper.labeler.CompanionTooOld      # 异常类也一并缺（= 真的旧一版）
+        try:
+            self.assertIsNone(gatekeeper.check_companion_pairing())
+        finally:
+            gatekeeper.labeler.check_companion_api = saved
+            gatekeeper.labeler.CompanionTooOld = saved_exc
+
+    def test_main_fails_closed_before_probing_or_reading_env(self):
+        def must_not(*a, **kw):
+            raise AssertionError('配套不齐时不应探测、不应读 .env、更不应启动 labeler')
+
+        with mock.patch.object(gatekeeper.labeler, 'check_companion_api', side_effect=self._refuse), \
+             mock.patch.object(gatekeeper.labeler, 'load_env', side_effect=must_not), \
+             mock.patch.object(gatekeeper, 'probe', side_effect=must_not), \
+             mock.patch.object(gatekeeper, 'probe_one', side_effect=must_not), \
+             mock.patch.object(gatekeeper.subprocess, 'run', side_effect=must_not), \
+             mock.patch.object(gatekeeper.time, 'sleep', lambda *_: None):
+            with contextlib.redirect_stderr(io.StringIO()) as err:
+                rc = gatekeeper.main()
+        self.assertEqual(rc, gatekeeper.EXIT_COMPANION_TOO_OLD)
+        text = err.getvalue()
+        self.assertIn('load_done_index', text)
+        self.assertIn('同批部署', text)
+        self.assertIn('fail-closed', text)
+
+    def _run_until_exit_5(self, codes):
+        """按 codes 依次给出 labeler 的退出码，跑 main 并收集探测次数与启动次数。
+
+        启动次数有硬上限：退出码 5 的短路若被删掉，恢复分支会变成「探测→重启→再报 5」的
+        无限循环，而本文件把 time.sleep 换成了空操作 ⇒ 用例会**挂死**（CI/pre-push 卡住）
+        而不是报红。超限即抛，helper 把它转成 rc=None，让断言正常失败并说清原因。"""
+        launched = []
+        probes = []
+        queue = list(codes)
+
+        class _TooManyLaunches(Exception):
+            pass
+
+        def fake_run(cmd, **kw):
+            launched.append(cmd)
+            if len(launched) > 4:
+                raise _TooManyLaunches('labeler 被反复重启：退出码 5 没有短路')
+            return SimpleNamespace(returncode=queue.pop(0) if len(queue) > 1 else queue[0])
+
+        def fake_probe(api_key, models, llm_url):
+            probes.append(list(models))
+            return True
+
+        with mock.patch.object(gatekeeper.labeler, 'load_env',
+                               return_value=_env(LLM_MODELS='m-1')), \
+             mock.patch.object(gatekeeper, 'probe', side_effect=fake_probe), \
+             mock.patch.object(gatekeeper.subprocess, 'run', side_effect=fake_run), \
+             mock.patch.object(gatekeeper.time, 'sleep', lambda *_: None):
+            with contextlib.redirect_stdout(io.StringIO()) as out, \
+                 contextlib.redirect_stderr(io.StringIO()) as err:
+                try:
+                    rc = gatekeeper.main()
+                except _TooManyLaunches as e:
+                    return None, launched, probes, out.getvalue(), f'{err.getvalue()}\n{e}'
+        return rc, launched, probes, out.getvalue(), err.getvalue()
+
+    def test_exit_5_on_first_launch_stops_without_entering_the_recovery_loop(self):
+        rc, launched, probes, _, err = self._run_until_exit_5(
+            [gatekeeper.EXIT_COMPANION_TOO_OLD])
+        self.assertEqual(rc, gatekeeper.EXIT_COMPANION_TOO_OLD)
+        self.assertEqual(len(launched), 1, '退出码 5 不该再重启 labeler')
+        # 只放行了等窗口那 PASS_N 次探测，恢复分支一次都没探（那才是白烧额度的地方）。
+        self.assertEqual(len(probes), gatekeeper.PASS_N)
+        self.assertIn('停止重试', err)
+        self.assertIn('同批部署', err)
+
+    def test_exit_5_in_the_recovery_branch_also_stops(self):
+        """第二处启动点（恢复分支重启）同样要短路。
+
+        两处各写一遍的判定迟早漏掉一处，而漏掉的那处正好是没人测的那处（本仓已有先例）；
+        所以这里让首轮以 1 退出把 main 推进恢复分支，重启后报 5。"""
+        rc, launched, _, _, err = self._run_until_exit_5(
+            [1, gatekeeper.EXIT_COMPANION_TOO_OLD])
+        self.assertEqual(rc, gatekeeper.EXIT_COMPANION_TOO_OLD)
+        self.assertEqual(len(launched), 2, '应先进恢复分支重启一次，再在 5 上停下')
+        self.assertIn('停止重试', err)
+
+    def test_launch_labeler_returns_the_code_and_logs_it(self):
+        with mock.patch.object(gatekeeper.subprocess, 'run',
+                               return_value=SimpleNamespace(returncode=5)) as run, \
+             mock.patch.object(gatekeeper.time, 'time', side_effect=[0.0, 90.0]), \
+             contextlib.redirect_stdout(io.StringIO()) as out:
+            code = gatekeeper.launch_labeler()
+        self.assertEqual(code, 5)
+        self.assertEqual(run.call_args.args[0], gatekeeper.LABELER_CMD)
+        self.assertEqual(run.call_args.kwargs, {'cwd': str(gatekeeper.DIR)})
+        self.assertIn('labeler 退出: code=5', out.getvalue())
+        self.assertIn('用时 2 分钟', out.getvalue())     # 用时照旧打印（排查产能靠它）
+
+    def test_both_launch_sites_go_through_the_shared_helper(self):
+        """接线钉：两处启动点都调 launch_labeler() 且都紧跟退出码 5 的短路。
+
+        上面几条用例分别覆盖两处，但「把其中一处改回内联 subprocess.run」只会让那一处的
+        短路消失、用例仍可能因为另一处而绿；这里直接数源码里的调用点，把「共用一个入口」
+        这件事本身钉住（同 scripts/check-worker-contract.test.ts 的接线钉思路）。"""
+        with open(gatekeeper.__file__, encoding='utf-8') as fh:
+            src = fh.read()
+        self.assertEqual(src.count('subprocess.run(LABELER_CMD'), 1,
+                         'LABELER_CMD 只应在 launch_labeler 里被启动一次')
+        self.assertEqual(src.count('code = launch_labeler()'), 2)
+        self.assertEqual(src.count('if code == EXIT_COMPANION_TOO_OLD:'), 2)
+        self.assertEqual(src.count('return stop_on_companion_mismatch()'), 2)
 
 
 if __name__ == '__main__':

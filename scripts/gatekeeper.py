@@ -32,6 +32,9 @@ PROBE_TIMEOUT = 280       # 单次探测超时（CF 524 在 ~125s，280 足够�
 
 EXIT_NO_MODELS = 3        # .env 未给模型链：fail-closed，不放行 labeler
 EXIT_VERSION_MISMATCH = 4  # 同目录 labeler.py 太旧（缺 resolve_llm_url）：fail-closed，不放行
+EXIT_COMPANION_TOO_OLD = 5  # labeler.py 报「同目录配套文件不齐全」：停止重试，原样上交
+# 5 与 labeler.EXIT_COMPANION_TOO_OLD 是同一个数、同一个含义，两边刻意各写一份字面值而不是
+# 跨模块取常量：取常量就要求「新 gatekeeper 配新 labeler」，而那正是这个码要报的故障本身。
 # 探测链要不要带上数据库 app_settings.label_model（链首）？labeler 启动时走
 # `resolve_models(env, use_db=not args.no_db_model)`，而 LABELER_CMD 未带 `--no-db-model`，
 # 所以 labeler 实际 use_db=True。门卫探测必须用同一条链，否则「探测的就是要跑的」不成立
@@ -141,7 +144,57 @@ def probe(api_key: str, models: list[str], llm_url: str) -> bool:
     return passed
 
 
+def check_companion_pairing() -> str | None:
+    """跑 labeler 的配套自检（labeler.check_companion_api）；返回 None = 放行，否则返回错误文本。
+
+    前置到**探测之前**的理由：缺接口是部署配错版本，与渠道好坏无关，没必要先烧 PASS_N 次
+    25 万字段探测再发现。旧 labeler.py 没有 check_companion_api 时返回 None（本门卫不因此拒绝
+    放行）——那种配对的后果由 labeler 自己的启动自检、以及下面 launch_labeler 的退出码处理兜住。
+    与 resolve_probe_endpoint 的 LabelerTooOld 同理：不静默当成「检查通过」。"""
+    check = getattr(labeler, 'check_companion_api', None)
+    if check is None:
+        return None
+    too_old = getattr(labeler, 'CompanionTooOld', RuntimeError)
+    try:
+        check()
+    except too_old as e:          # 异常类从 labeler 动态取（旧 labeler 可能没有它），故不能写字面量
+        return str(e)
+    return None
+
+
+def launch_labeler() -> int:
+    """跑一轮 labeler 子进程，打印退出码与用时，返回退出码。
+
+    两处启动点（首轮 + 恢复分支重启）共用一个入口，好让「配套不匹配就停止重试」这条判定只写一次：
+    两处各补一遍的写法迟早漏掉一处，而漏掉的那处正好是没人测的那处（本仓已有先例）。"""
+    t0 = time.time()
+    r = subprocess.run(LABELER_CMD, cwd=str(DIR))
+    mins = (time.time() - t0) / 60
+    print(f'labeler 退出: code={r.returncode} 用时 {mins:.0f} 分钟', flush=True)
+    return r.returncode
+
+
+def stop_on_companion_mismatch() -> int:
+    """配套文件版本不匹配时的收口：停止重试，退出码上交。
+
+    重启一万次结果一样，所以不进「探测→重启」的恢复循环（每圈还要白烧最多 FAIL_M 次 25 万字段
+    探测）。退出码原样上交，systemd 会把本服务标成 failed —— 比「active 但永远零产出」诚实。"""
+    print('labeler 报配套文件版本不匹配，停止重试（fail-closed）。'
+          '缺哪些接口见上面 labeler 自己的「错误: …」行（子进程 stderr 未被捕获，与本行同进 gate.log）；'
+          '把 labeler.py / gatekeeper.py / douban_list.py / labeler_source_policy.py 同批部署后'
+          '再重启本服务。',
+          file=sys.stderr, flush=True)
+    return EXIT_COMPANION_TOO_OLD
+
+
 def main() -> int:
+    pairing = check_companion_pairing()
+    if pairing is not None:
+        # 探测之前就拦下：一次探测 25 万字段，配错版本时那是纯浪费（见 check_companion_pairing）。
+        print(f'错误: {pairing}', file=sys.stderr, flush=True)
+        print(f'拒绝放行 labeler（fail-closed，退出码 {EXIT_COMPANION_TOO_OLD}）。',
+              file=sys.stderr, flush=True)
+        return EXIT_COMPANION_TOO_OLD
     # 与 labeler 同一途径读 .env（含引号剥离/必需键校验），避免两套解析漂移。
     env = labeler.load_env()
     key = env['LLM_API_KEY']
@@ -192,16 +245,15 @@ def main() -> int:
                 consecutive_ok = 0
             time.sleep(PROBE_INTERVAL)
         print(f'渠道就绪，启动 labeler round {round_no}', flush=True)
-        t0 = time.time()
-        r = subprocess.run(LABELER_CMD, cwd=str(DIR))
-        mins = (time.time() - t0) / 60
-        print(f'labeler 退出: code={r.returncode} 用时 {mins:.0f} 分钟', flush=True)
-        if r.returncode == 0:
+        code = launch_labeler()
+        if code == EXIT_COMPANION_TOO_OLD:
+            return stop_on_companion_mismatch()
+        if code == 0:
             # 正常跑完一轮；继续下一轮（断点续传会跳过已完成的）
             print('一轮跑完，10 分钟后探测下一轮', flush=True)
             time.sleep(PROBE_INTERVAL)
             continue
-        if r.returncode == 2:
+        if code == 2:
             # 整轮零成功：渠道已转坏，不空转，直接回等待窗口
             print('整轮零成功（渠道转坏），回到等待窗口', flush=True)
             continue
@@ -218,11 +270,10 @@ def main() -> int:
                 print('渠道转坏，回到等待窗口', flush=True)
                 break
             print('  渠道仍活，重启 labeler', flush=True)
-            t0 = time.time()
-            r = subprocess.run(LABELER_CMD, cwd=str(DIR))
-            mins = (time.time() - t0) / 60
-            print(f'labeler 退出: code={r.returncode} 用时 {mins:.0f} 分钟', flush=True)
-            if r.returncode in (0, 2):
+            code = launch_labeler()
+            if code == EXIT_COMPANION_TOO_OLD:
+                return stop_on_companion_mismatch()
+            if code in (0, 2):
                 break
 
 
