@@ -1531,9 +1531,12 @@ class TestMainLoop(unittest.TestCase):
         # 仍是「从开头顺序读到 8 万」：只取主源第 0..26 章
         self.assertEqual(sorted(_idx(c[1]) for c in _content_calls(cli)), list(range(27)))
         self.assertEqual(rec['chars'], 27 * 3000)
-        # label_book 调用形态与改前一致：不传 system_prompt
+        # label_book 调用形态与改前一致：不传 system_prompt。
+        # llm_url 是 2026-10-23 端点改造新加的（LLM_URL 由硬编码改成 resolve_llm_url(env)
+        # 显式求出再传参），开关开/关两条路径都传同一个值，所以不影响本用例要钉的
+        # 「关时调用形态不变」——它仍然是「除了 llm_url 这类全局运行配置，什么都不多传」。
         self.assertEqual(set(label_mock.call_args.kwargs),
-                         {'site_title', 'site_author', 'max_tokens', 'meta'})
+                         {'site_title', 'site_author', 'max_tokens', 'meta', 'llm_url'})
         self.assertNotIn('分布式采样', out)
 
     def test_switch_on_segments_and_arc(self):

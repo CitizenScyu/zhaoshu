@@ -6,7 +6,12 @@ import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { parseQuality } from './import_labels.mjs';
 
-const LLM_URL = 'https://api.cloud.us.kg/v1/chat/completions';
+// LLM 端点默认值 = 打标机本机 NewAPI 的 loopback 入口。换端点写 env 文件的 LLM_URL，别改这行。
+// 2026-10-23 核实：本文件与 scripts/labeler.py、scripts/gatekeeper.py 原先都硬编码同一台
+// NewAPI 的公网 Cloudflare Tunnel 入口（api.cloud.us.kg），而部署机上对那两个 .py 各做过一处
+// **未版本化**的就地修改换成 127.0.0.1:13001。同一上游、不是泄密，但仓↔机漂移不可见：
+// 从仓库重新部署会静默把端点换回公网入口（多一跳、撞 CF ~100s 砍线）。详见 labeler.py 的 LLM_URL。
+const DEFAULT_LLM_URL = 'http://127.0.0.1:13001/v1/chat/completions';
 const TARGET_CHARS = 400_000;
 const CHAPTER_DELAY = 0.3;
 const RETRY = 3;
@@ -99,7 +104,7 @@ async function fetchBookText(sourceUrl, targetChars) {
   return parts.join('\n\n');
 }
 
-async function llmQuality(apiKey, model, text) {
+async function llmQuality(apiKey, model, text, llmUrl) {
   const body = JSON.stringify({
     model, stream: true, max_tokens: 300,
     messages: [
@@ -110,7 +115,7 @@ async function llmQuality(apiKey, model, text) {
   let lastErr;
   for (let attempt = 1; attempt <= 3; attempt++) {
     try {
-      const res = await fetch(LLM_URL, {
+      const res = await fetch(llmUrl, {
         method: 'POST',
         headers: { ...UA, 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
         body,
@@ -147,6 +152,10 @@ async function run() {
   const env = loadEnvFile(resolve(args.env));
   if (!env.DATABASE_URL || !env.LLM_API_KEY) throw new Error('env 文件缺 DATABASE_URL / LLM_API_KEY');
   const model = env.LLM_MODEL || 'deepseek-v4-flash-bohe';
+  // 端点：env 文件优先，其次进程环境，最后才是内置的本机默认。开跑就印一行——
+  // 这个脚本会把 LLM_API_KEY 发出去，端点走错必须一眼看得见，不能等事后翻代码。
+  const llmUrl = env.LLM_URL || process.env.LLM_URL || DEFAULT_LLM_URL;
+  console.log(`LLM 端点: ${llmUrl}`);
   const sql = neon(env.DATABASE_URL);
 
   const rows = (await sql`
@@ -161,7 +170,7 @@ async function run() {
     try {
       const text = await fetchBookText(r.source_url, TARGET_CHARS);
       if (text.length < 10_000) throw new Error(`仅抓到 ${text.length} 字`);
-      const overall = await llmQuality(env.LLM_API_KEY, model, text);
+      const overall = await llmQuality(env.LLM_API_KEY, model, text, llmUrl);
       await sql`UPDATE labeled_books SET quality = ${overall} WHERE id = ${r.id}`;
       console.log(`  quality = ${overall}`);
       ok += 1;

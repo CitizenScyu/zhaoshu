@@ -70,14 +70,19 @@ def resolve_probe_models(env: dict) -> tuple[list[str], str]:
     return (models, key) if models else ([], 'none')
 
 
-def probe_one(api_key: str, model: str) -> bool:
-    """对单个模型做 25 万字段探测；首字节即判活。"""
+def probe_one(api_key: str, model: str, llm_url: str) -> bool:
+    """对单个模型做 25 万字段探测；首字节即判活。
+
+    llm_url 是**必填**的：门卫的全部意义就是「探测的就是要跑的」，端点也不例外。
+    给它一个默认值的话，漏传会静默退化成 labeler.LLM_URL，探测的端点与 labeler 实际
+    请求的端点就能在无人察觉时漂移——和 F3 要防的模型链漂移是同一个失效形态。
+    传 labeler.resolve_llm_url(env) 的结果，两边同源同函数，天然一致。"""
     body = json.dumps({
         'model': model, 'stream': True, 'max_tokens': 50,
         'messages': [{'role': 'user', 'content': '重复' * (PROBE_CHARS // 2)}],
     }).encode('utf-8')
     req = urllib.request.Request(
-        'https://api.cloud.us.kg/v1/chat/completions', data=body, method='POST',
+        llm_url, data=body, method='POST',
         headers={'Content-Type': 'application/json',
                  'Authorization': f'Bearer {api_key}',
                  'User-Agent': 'Mozilla/5.0 (compatible, zhaoshu-labeler/1.0)'})
@@ -90,13 +95,13 @@ def probe_one(api_key: str, model: str) -> bool:
     return False
 
 
-def probe(api_key: str, models: list[str]) -> bool:
+def probe(api_key: str, models: list[str], llm_url: str) -> bool:
     """对整个模型链各探测一次；任一模型探测通过即视为窗口可用。
     逐模型记录结果（probe_one 内部打印单模型行，这里再打一行汇总），
-    便于事后从 gate.log 看出是「链里哪个模型在扛」。"""
+    便于事后从 gate.log 看出是「链里哪个模型在扛」。llm_url 见 probe_one 说明（必填）。"""
     ok = []
     for m in models:
-        good = probe_one(api_key, m)
+        good = probe_one(api_key, m, llm_url)
         ok.append((m, good))
         print(f'  [探测] {m}: {"通过" if good else "失败"}', flush=True)
     passed = any(g for _, g in ok)
@@ -109,6 +114,10 @@ def main() -> int:
     # 与 labeler 同一途径读 .env（含引号剥离/必需键校验），避免两套解析漂移。
     env = labeler.load_env()
     key = env['LLM_API_KEY']
+    # 端点与模型链同源解析：labeler 子进程自己会再走一遍 resolve_llm_url(env)，两边取的是
+    # 同一个 .env 的同一个键，「探测的端点 == labeler 会请求的端点」由构造保证（同 F3 的思路）。
+    llm_url = labeler.resolve_llm_url(env)
+    print(f'探测端点: {llm_url}', flush=True)
     models, src_key = resolve_probe_models(env)
     if not models:
         # fail-closed：配置缺失/被改坏时不放行 labeler。若这里退回硬编码旧链，
@@ -133,7 +142,7 @@ def main() -> int:
         consecutive_ok = 0
         # 等待连续 PASS_N 次通过
         while consecutive_ok < PASS_N:
-            if probe(key, models):
+            if probe(key, models, llm_url):
                 consecutive_ok += 1
                 print(f'  探测通过 {consecutive_ok}/{PASS_N}', flush=True)
             else:
@@ -158,7 +167,7 @@ def main() -> int:
         while True:
             alive = False
             for _ in range(FAIL_M):
-                if probe(key, models):
+                if probe(key, models, llm_url):
                     alive = True
                     break
                 time.sleep(60)

@@ -3,7 +3,8 @@
 
 覆盖：max_tokens 默认值与按模型覆盖（LABELER_MAX_TOKENS）；content 为空时从 reasoning_content
 兜底取 JSON；completion_tokens 触顶 / finish_reason=length 报「输出被截断」并直接换模型；
-上游空回单独报错；非 2xx 响应体摘要（脱敏、截断）进日志。
+上游空回单独报错；非 2xx 响应体摘要（脱敏、截断）进日志；LLM 端点的默认值/env 覆盖，
+以及「解析出的端点真的落到线上请求」（防默认端点被改回公网 Tunnel 入口的回归）。
 全离线：urlopen 被替换，不联网、不调真模型。
 复跑：PYTHONIOENCODING=utf-8 python -m unittest discover -s scripts -p 'test_labeler_llm.py'
 """
@@ -250,6 +251,63 @@ class TestLabelsFromReply(unittest.TestCase):
         reply = {'content': json.dumps(LABELS), 'reasoning': '', 'finish_reason': 'length',
                  'completion_tokens': 6000}
         self.assertEqual(labeler._labels_from_reply(reply, 6000), (LABELS, 'content'))
+
+
+URL_OVERRIDE = 'http://127.0.0.1:13999/v1/chat/completions'   # 端口刻意与真实中转不同，防串台
+
+
+class TestLlmUrl(unittest.TestCase):
+    """LLM 端点：默认值是部署机本机 NewAPI、env 可覆盖、且覆盖值真的落到请求上。
+
+    2026-10-23 之前 LLM_URL 硬编码为同一台 NewAPI 的公网 Cloudflare Tunnel 入口
+    （api.cloud.us.kg），生产实际跑的却是部署机上对 labeler.py / gatekeeper.py 各一处
+    **未版本化**的就地改文件（127.0.0.1:13001）。同一上游、不是泄密，但仓↔机漂移不可见：
+    从仓库重新部署会静默把端点换回公网入口（多一跳、撞 CF ~100s 砍线）。这组用例把
+    「默认必须是本机 loopback」和「传下去的端点必须真被请求」钉死，让那次漂移回不来。"""
+
+    def test_default_is_the_local_newapi(self):
+        self.assertTrue(labeler.LLM_URL.startswith('http://127.0.0.1:'), labeler.LLM_URL)
+        self.assertNotIn('cloud.us.kg', labeler.LLM_URL)
+        for env in ({}, None):
+            self.assertEqual(labeler.resolve_llm_url(env), labeler.LLM_URL)
+
+    def test_env_override_wins_and_blank_falls_back(self):
+        self.assertEqual(labeler.resolve_llm_url({labeler.LLM_URL_ENV: URL_OVERRIDE}), URL_OVERRIDE)
+        self.assertEqual(labeler.resolve_llm_url({labeler.LLM_URL_ENV: '  '}), labeler.LLM_URL)
+        self.assertEqual(labeler.resolve_llm_url({labeler.LLM_URL_ENV: ''}), labeler.LLM_URL)
+
+    def _capture_urls(self, call):
+        seen = []
+
+        def fake_urlopen(req, timeout=None):
+            seen.append(req.full_url)
+            return FakeResponse(_sse(_delta(content=json.dumps(LABELS), finish='stop')))
+
+        with mock.patch.object(labeler.urllib.request, 'urlopen', side_effect=fake_urlopen), \
+                mock.patch.object(labeler.time, 'sleep'), \
+                contextlib.redirect_stderr(io.StringIO()):
+            call()
+        return seen
+
+    def test_label_once_requests_the_url_it_was_given(self):
+        self.assertEqual(
+            self._capture_urls(lambda: labeler._label_once('正文', FAKE_KEY, ['m1'],
+                                                           llm_url=URL_OVERRIDE)),
+            [URL_OVERRIDE])
+
+    def test_label_once_without_url_uses_safe_default(self):
+        # None 回落的是常量（本机中转），不是任何别处残留的硬编码端点。
+        self.assertEqual(
+            self._capture_urls(lambda: labeler._label_once('正文', FAKE_KEY, ['m1'])),
+            [labeler.LLM_URL])
+
+    def test_label_book_threads_url_to_every_segment(self):
+        """两段式必须逐段透传：只传第一段的话，后半场会静默打回默认端点。"""
+        long_text = '字' * (labeler.SEGMENT_CHARS + 10)
+        self.assertEqual(
+            self._capture_urls(lambda: labeler.label_book(long_text, FAKE_KEY, ['m1'],
+                                                          llm_url=URL_OVERRIDE)),
+            [URL_OVERRIDE, URL_OVERRIDE])
 
 
 if __name__ == '__main__':

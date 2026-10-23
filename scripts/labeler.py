@@ -68,7 +68,18 @@ HTTP_RETRY_DELAY = 2.0      # 重试间隔（秒）
 STUB_MIN_CHAPTERS = 10
 STUB_MIN_CHARS = 50_000
 BASE = 'https://book15.net'
-LLM_URL = 'https://api.cloud.us.kg/v1/chat/completions'
+# LLM 端点：默认 = 打标机本机那个 NewAPI 的 loopback 入口。换端点写 .env 的 LLM_URL
+# （见 resolve_llm_url），**别改这行源码**。2026-10-23 核实的教训：这里原先硬编码的是
+# 同一台 NewAPI 的公网 Cloudflare Tunnel 入口（api.cloud.us.kg，见 .env.local.example），
+# 而部署机 /var/lib/zhaoshu-worker 上对 labeler.py 与 gatekeeper.py 各做过一处
+# **未版本化**的就地修改，换成了 127.0.0.1:13001（该机 `docker ps`: new-api
+# 127.0.0.1:13001->3000）。两者是同一上游、同一信任域，**不是泄密**；真正的问题是
+# 仓↔机漂移不可见：仓库里看不出部署机被改过，任何一次「从仓库重新部署」都会静默把生产
+# 端点从 loopback 还原成公网 Tunnel 入口——多一跳公网、且撞 CF ~100s 无响应砍线
+# （.env.local.example 自己记着这条理由），表现为整轮打标莫名失败且极难归因。
+# 默认值改成部署机实际在用的那个、并让它可被 env 覆盖，漂移就没有立足点了。
+LLM_URL = 'http://127.0.0.1:13001/v1/chat/completions'
+LLM_URL_ENV = 'LLM_URL'
 UA = {'User-Agent': 'Mozilla/5.0 (compatible; zhaoshu-labeler/1.0)'}
 # 钉子户终态（诊断 P1-1）：被拒的书不进 labels.jsonl，断点续传（done_urls）认不出来，
 # 于是每轮都被重新抓取 + 重新打标 + 重新拒收——5 本钉子户历史被拒 34~51 次，
@@ -3159,6 +3170,14 @@ class LlmEmptyReply(RuntimeError):
     """上游空回：content 为空，reasoning_content 里也没有可用 JSON，且未触顶。"""
 
 
+def resolve_llm_url(env: dict | None = None) -> str:
+    """LLM_URL → 本轮真正请求的 LLM 端点；缺省/空值回落 LLM_URL 常量（本机中转）。
+
+    与 resolve_max_tokens 同理必须「显式求出再传下去」：默认参数在 def 时就求值了，
+    只有传参才是改 .env 即生效。为什么默认值是本机而不是公网中转，见 LLM_URL 常量处那段说明。"""
+    return str((env or {}).get(LLM_URL_ENV) or '').strip() or LLM_URL
+
+
 def resolve_max_tokens(env: dict | None = None) -> dict:
     """LABELER_MAX_TOKENS → {'*': 默认上限, 模型名: 覆盖}。
 
@@ -3307,13 +3326,15 @@ def _log_model(context: str, message: str) -> None:
 def label_book(text: str, api_key: str, models: list[str],
                site_title: str = '', site_author: str = '',
                max_tokens: dict | None = None, meta: dict | None = None,
-               system_prompt: str = SYSTEM_PROMPT) -> tuple[dict, int]:
+               system_prompt: str = SYSTEM_PROMPT,
+               llm_url: str | None = None) -> tuple[dict, int]:
     """50 万字文本 → (标签 dict, 实际调用次数)。
     两段式：每段 ≤25 万字独立过 CF 100s 线（实测 40 万字单段 prefill 必撞 524）。
     第二段带第一段结论合并，可修正只看开头的误判；text_quality 两段各判、按 merge_text_quality 合并。
     site_title / site_author 为本次来源站点书目，附加打标验证段供成分判定。
     models 为后备模型链（如 bohe → grok → ...），逐段内按链逐个尝试。
     max_tokens = resolve_max_tokens(env) 的结果（按模型的输出上限），None 用默认。
+    llm_url = resolve_llm_url(env) 的结果，逐段透传给 _label_once；None 回落本机中转默认值。
     meta（lblmeta41）：可选出参。成功时写入 `label_model` = **产出返回标签那一段**实际响应的
     模型（多段时是末段；模型链会在多厂家间按可用性回退，事后按这个字段才能把 quality 分归因）。"""
     used: dict = {}
@@ -3322,21 +3343,21 @@ def label_book(text: str, api_key: str, models: list[str],
     if len(text) <= SEGMENT_CHARS:
         labels = _label_once(text, api_key, models, verification,
                              context=f'{context} 分段=1/1', max_tokens=max_tokens, used=used,
-                             system_prompt=system_prompt)
+                             system_prompt=system_prompt, llm_url=llm_url)
         if meta is not None:
             meta['label_model'] = used.get('label_model', '')
         return labels, 1
     seg1, seg2 = text[:SEGMENT_CHARS], text[SEGMENT_CHARS:]
     labels1 = _label_once(seg1, api_key, models, verification,
                           context=f'{context} 分段=1/2', max_tokens=max_tokens, used=used,
-                          system_prompt=system_prompt)
+                          system_prompt=system_prompt, llm_url=llm_url)
     merged_user = (
         "【前次阅读结论】\n" + json.dumps(labels1, ensure_ascii=False)
         + "\n\n【后续文本】\n" + seg2 + MERGE_PROMPT_SUFFIX
     )
     labels2 = _label_once(merged_user, api_key, models, verification,
                           context=f'{context} 分段=2/2', max_tokens=max_tokens, used=used,
-                          system_prompt=system_prompt)
+                          system_prompt=system_prompt, llm_url=llm_url)
     quality, evidence = merge_text_quality([labels1, labels2])
     if quality is not None:
         labels2['text_quality'] = quality
@@ -3349,11 +3370,13 @@ def label_book(text: str, api_key: str, models: list[str],
 def _label_once(user_content: str, api_key: str, models: list[str],
                 verification: str = '', *, context: str = '',
                 max_tokens: dict | None = None, used: dict | None = None,
-                system_prompt: str = SYSTEM_PROMPT) -> dict:
+                system_prompt: str = SYSTEM_PROMPT,
+                llm_url: str | None = None) -> dict:
     """单次 LLM 调用。流式。对链中每个模型最多试 MODEL_RETRY 次，
     某模型连续 MODEL_RETRY 次失败即切换下一个；全部模型耗尽才算本次失败。
     输出被截断 / 上游空回不在同模型上重试（同预算重试大概率同样结果），直接换下一个模型。
-    used（lblmeta41）：可选出参，成功时写 `label_model` = 本次真正响应的模型名。"""
+    used（lblmeta41）：可选出参，成功时写 `label_model` = 本次真正响应的模型名。
+    llm_url = resolve_llm_url(env) 的结果；None 回落 LLM_URL 常量（本机中转）。"""
     if not models:
         raise RuntimeError('模型链为空，无法打标')
     _log_model(context, f'开始分段，模型链从链首 {models[0]} 开始')
@@ -3374,7 +3397,7 @@ def _label_once(user_content: str, api_key: str, models: list[str],
             }).encode('utf-8')
             try:
                 req = urllib.request.Request(
-                    LLM_URL, data=body, method='POST',
+                    llm_url or LLM_URL, data=body, method='POST',
                     headers={**UA, 'Content-Type': 'application/json',
                              'Authorization': f'Bearer {api_key}'})
                 _log_model(context, f'请求模型 {model} 尝试 {attempt + 1}/{MODEL_RETRY}'
@@ -3781,6 +3804,12 @@ def main() -> int:
     print(f'模型链: {models}')
     max_tokens = resolve_max_tokens(env)
     print(f'输出上限 max_tokens: {max_tokens}')
+    # 端点也显式求出再传下去（同 max_tokens）。每轮开头印一行用的是哪个端点、来自哪里：
+    # 这次改动的全部目的就是「别让人不知不觉把 LLM_API_KEY 和正文送去别处」，
+    # 那么日志里就必须能直接对质，而不是等出事再去 diff 部署机上的源码。
+    llm_url = resolve_llm_url(env)
+    llm_url_source = f'.env 的 {LLM_URL_ENV}' if str(env.get(LLM_URL_ENV) or '').strip() else '内置默认（本机中转）'
+    print(f'LLM 端点: {llm_url}（来源: {llm_url_source}）')
     # lblspeed41：引擎取文止损与死源跨轮记忆的运行时配置（显式求出再传下去，
     # 与 REJECT_TERMINAL_THRESHOLD 同理：默认参数在 def 时求值，显式传才是「改配置即生效」）。
     engine_target_chars = resolve_engine_target_chars(env)
@@ -4153,7 +4182,7 @@ def main() -> int:
             labels, calls = label_book(
                 text, env['LLM_API_KEY'], models,
                 site_title=site_title, site_author=b.get('author', ''),
-                max_tokens=max_tokens, meta=llm_meta,
+                max_tokens=max_tokens, meta=llm_meta, llm_url=llm_url,
                 **({'system_prompt': SYSTEM_PROMPT + SEGMENTED_PROMPT_SUFFIX} if sampling else {}))
             if sampling:
                 # lblseg41：arc 证据只认送入文本里找得到的原文（text 即本次送模文本），不足即降 unknown
