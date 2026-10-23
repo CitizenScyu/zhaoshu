@@ -601,9 +601,11 @@ export default function LibraryTab({ view, setView }: {
         setDlError('数据库额度已用尽，请稍后再试。');
         return;
       }
-      // 503/504 源池透传失败：入口保留可重试（书源池会恢复）。
+      // 503/504 源池透传失败：入口保留可重试（书源池会恢复）。此分支的 code 全是服务端
+      // SourceReaderError/REQUEST_ABORTED 透传，message 已是面向用户的中文文案；英文 code
+      // 对用户无意义，不再拼接展示（§6 不裸奔原则，46-revfix 后冷却拒绝更常走到这里）。
       if (res.status === 503 || res.status === 504) {
-        setDlError(`书源池暂时不可用(${typeof data.code === 'string' ? data.code : 'SOURCE_UNAVAILABLE'})，请稍后再试。`);
+        setDlError(typeof data.error === 'string' && data.error ? data.error : '书源池暂时不可用，请稍后再试。');
         return;
       }
       // 其余按 code 映射中文文案，避免服务端英文 error 裸奔（§6）。

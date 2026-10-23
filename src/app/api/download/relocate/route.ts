@@ -69,7 +69,7 @@ async function handlePOST(req: NextRequest) {
     // 整体中止/超时（req.signal 或 55s deadline，引擎循环裸抛 AbortError 上逸）先于其余错误档，
     // 归一化 504，镜像 read/source 路由 signal.aborted → 504 的形态。
     if (signal.aborted) {
-      return authJson({ error: 'relocation aborted or timed out', code: 'REQUEST_ABORTED' }, { status: 504 });
+      return authJson({ error: '书源查询超时或已取消，请稍后重试。', code: 'REQUEST_ABORTED' }, { status: 504 });
     }
     if (error && typeof error === 'object' && 'code' in error && error.code === '23505') {
       try {
