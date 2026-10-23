@@ -69,15 +69,22 @@ STUB_MIN_CHAPTERS = 10
 STUB_MIN_CHARS = 50_000
 BASE = 'https://book15.net'
 # LLM 端点：默认 = 打标机本机那个 NewAPI 的 loopback 入口。换端点写 .env 的 LLM_URL
-# （见 resolve_llm_url），**别改这行源码**。2026-10-23 核实的教训：这里原先硬编码的是
-# 同一台 NewAPI 的公网 Cloudflare Tunnel 入口（api.cloud.us.kg，见 .env.local.example），
-# 而部署机 /var/lib/zhaoshu-worker 上对 labeler.py 与 gatekeeper.py 各做过一处
-# **未版本化**的就地修改，换成了 127.0.0.1:13001（该机 `docker ps`: new-api
-# 127.0.0.1:13001->3000）。两者是同一上游、同一信任域，**不是泄密**；真正的问题是
-# 仓↔机漂移不可见：仓库里看不出部署机被改过，任何一次「从仓库重新部署」都会静默把生产
-# 端点从 loopback 还原成公网 Tunnel 入口——多一跳公网、且撞 CF ~100s 无响应砍线
-# （.env.local.example 自己记着这条理由），表现为整轮打标莫名失败且极难归因。
-# 默认值改成部署机实际在用的那个、并让它可被 env 覆盖，漂移就没有立足点了。
+# （见 resolve_llm_url），**别改这行源码**。2026-10-23 改这里的两层原因，第二层比第一层要紧：
+# ① 仓↔机漂移不可见。这里原先硬编码一个公网主机名，而部署机 /var/lib/zhaoshu-worker 上对
+#    labeler.py 与 gatekeeper.py 各做过一处**未版本化**的就地修改，换成了 127.0.0.1:13001
+#    （该机 `docker ps`：new-api 127.0.0.1:13001->3000）。仓库里看不出部署机被改过；仓内也没有
+#    打标机的自动部署脚本，所以风险形态是「人工拿仓库版本覆盖部署机、又没保留那处就地补丁」，
+#    端点就被静默换掉。默认值改成部署机实际在用的那个、并让 env 可覆盖，这类漂移没有立足点。
+# ② 原先硬编码的那个公网主机名（api.cloud.us.kg）**指向谁没核实过，别当可信端点写回默认值**。
+#    仓内 .env.local.example:25 曾把它记成「本机 NewAPI 的 Cloudflare Tunnel 公网入口」，那是
+#    二手记录，已被一手证据推翻：该机 cloudflared 的生效 ingress（journal 2026-10-18 09:22:33
+#    "Updated to new configuration" version=22：19 条 hostname + 末尾 catchall http_status:404）
+#    里**没有**这个 hostname；磁盘 /etc/cloudflared/config.yml 虽然写着它→localhost:3001
+#    （Nginx 3001→13001），但该 unit 是远端托管的，磁盘文件不生效。而公网那头确实有个 NewAPI
+#    在应答（无凭据 GET /api/status：200、CF-Cache-Status=DYNAMIC、无 Age ⇒ 非缓存），其
+#    start_time 比本机 new-api 容器的 StartedAt 晚 69019 秒 ⇒ **不是同一个进程**。归属查清前，
+#    往那儿发 = 把 LLM_API_KEY 和抓来的书内容送去未核实上游（见 .claude/CLAUDE.md 安全红线）。
+#    所以默认值钉死本机 loopback，并且每轮开跑都把实际端点印出来（见 main）。
 LLM_URL = 'http://127.0.0.1:13001/v1/chat/completions'
 LLM_URL_ENV = 'LLM_URL'
 UA = {'User-Agent': 'Mozilla/5.0 (compatible; zhaoshu-labeler/1.0)'}
@@ -3174,7 +3181,8 @@ def resolve_llm_url(env: dict | None = None) -> str:
     """LLM_URL → 本轮真正请求的 LLM 端点；缺省/空值回落 LLM_URL 常量（本机中转）。
 
     与 resolve_max_tokens 同理必须「显式求出再传下去」：默认参数在 def 时就求值了，
-    只有传参才是改 .env 即生效。为什么默认值是本机而不是公网中转，见 LLM_URL 常量处那段说明。"""
+    只有传参才是改 .env 即生效。为什么默认值钉死本机 loopback、而不是那个公网主机名，
+    见 LLM_URL 常量处那段说明（含 2026-10-23 的一手证据与归属未核实的结论）。"""
     return str((env or {}).get(LLM_URL_ENV) or '').strip() or LLM_URL
 
 

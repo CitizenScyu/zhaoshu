@@ -4,7 +4,7 @@
 覆盖：max_tokens 默认值与按模型覆盖（LABELER_MAX_TOKENS）；content 为空时从 reasoning_content
 兜底取 JSON；completion_tokens 触顶 / finish_reason=length 报「输出被截断」并直接换模型；
 上游空回单独报错；非 2xx 响应体摘要（脱敏、截断）进日志；LLM 端点的默认值/env 覆盖，
-以及「解析出的端点真的落到线上请求」（防默认端点被改回公网 Tunnel 入口的回归）。
+以及「解析出的端点真的落到线上请求」（防默认端点被改回未核实公网主机名的回归）。
 全离线：urlopen 被替换，不联网、不调真模型。
 复跑：PYTHONIOENCODING=utf-8 python -m unittest discover -s scripts -p 'test_labeler_llm.py'
 """
@@ -257,13 +257,14 @@ URL_OVERRIDE = 'http://127.0.0.1:13999/v1/chat/completions'   # 端口刻意与�
 
 
 class TestLlmUrl(unittest.TestCase):
-    """LLM 端点：默认值是部署机本机 NewAPI、env 可覆盖、且覆盖值真的落到请求上。
+    """LLM 端点：默认值是本机 loopback、env 可覆盖、且覆盖值真的落到请求上。
 
-    2026-10-23 之前 LLM_URL 硬编码为同一台 NewAPI 的公网 Cloudflare Tunnel 入口
-    （api.cloud.us.kg），生产实际跑的却是部署机上对 labeler.py / gatekeeper.py 各一处
-    **未版本化**的就地改文件（127.0.0.1:13001）。同一上游、不是泄密，但仓↔机漂移不可见：
-    从仓库重新部署会静默把端点换回公网入口（多一跳、撞 CF ~100s 砍线）。这组用例把
-    「默认必须是本机 loopback」和「传下去的端点必须真被请求」钉死，让那次漂移回不来。"""
+    2026-10-23 之前 LLM_URL 硬编码为公网主机名 api.cloud.us.kg，生产实际跑的却是部署机上对
+    labeler.py / gatekeeper.py 各一处**未版本化**的就地改文件（127.0.0.1:13001）。仓内文档说
+    那个主机名是「本机 NewAPI 的 Tunnel 公网入口」，一手证据不支持（该机 cloudflared 生效
+    ingress 里没有它；公网应答的 NewAPI 进程 start_time 与本机容器不同）⇒ 归属未核实，
+    往那儿发 key 与书内容触安全红线。这组用例把「默认必须是本机 loopback」和「传下去的端点
+    必须真被请求」钉死，让那次漂移和那个主机名都回不来。"""
 
     def test_default_is_the_local_newapi(self):
         self.assertTrue(labeler.LLM_URL.startswith('http://127.0.0.1:'), labeler.LLM_URL)

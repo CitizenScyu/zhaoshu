@@ -76,7 +76,8 @@ def probe_one(api_key: str, model: str, llm_url: str) -> bool:
     llm_url 是**必填**的：门卫的全部意义就是「探测的就是要跑的」，端点也不例外。
     给它一个默认值的话，漏传会静默退化成 labeler.LLM_URL，探测的端点与 labeler 实际
     请求的端点就能在无人察觉时漂移——和 F3 要防的模型链漂移是同一个失效形态。
-    传 labeler.resolve_llm_url(env) 的结果，两边同源同函数，天然一致。"""
+    传 labeler.resolve_llm_url(env) 的结果，两边同源同函数、同一个 .env，配置不变时取值一致
+    （不是无条件保证：子进程每次启动自己重读 .env，边界见 main 里的说明）。"""
     body = json.dumps({
         'model': model, 'stream': True, 'max_tokens': 50,
         'messages': [{'role': 'user', 'content': '重复' * (PROBE_CHARS // 2)}],
@@ -114,8 +115,11 @@ def main() -> int:
     # 与 labeler 同一途径读 .env（含引号剥离/必需键校验），避免两套解析漂移。
     env = labeler.load_env()
     key = env['LLM_API_KEY']
-    # 端点与模型链同源解析：labeler 子进程自己会再走一遍 resolve_llm_url(env)，两边取的是
-    # 同一个 .env 的同一个键，「探测的端点 == labeler 会请求的端点」由构造保证（同 F3 的思路）。
+    # 端点与模型链同源解析：这里与 labeler 走同一个解析函数、读同一个 .env 的同一个键，
+    # 所以「探测的端点 == labeler 会请求的端点」在**配置不变的前提下**成立（同 F3 的思路）。
+    # 边界说清楚，别当成无条件保证：本函数只在启动时 resolve 一次，而 labeler 子进程每次启动
+    # 都自己重读 .env——门卫跑着的时候改 .env 的 LLM_URL，探测端点就与之后子进程的端点不一致
+    # （模型链同理）。改完 .env 要重启门卫。
     llm_url = labeler.resolve_llm_url(env)
     print(f'探测端点: {llm_url}', flush=True)
     models, src_key = resolve_probe_models(env)
