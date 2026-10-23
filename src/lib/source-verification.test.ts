@@ -202,8 +202,9 @@ describe('source existence supplement inside verify', () => {
 
   it('46-revfix:补验 context 挂进程级共享冷却表 —— probe 吃到的 429 冷却挡下候选搜索', async () => {
     // 行为级：种进共享表（与 probe 写入同源）后,补验 context 里对该站的 page() 在
-    // beforeRequest 就被冷却拒绝,零物理请求。断言在 resolve mock 内做 —— 补验 worker 的
-    // finally budget.dispose() 会把 context signal 一并 abort,复刻构造后再断言会拿到中止错误。
+    // beforeRequest 就被冷却拒绝,零物理请求。断言在 resolve mock 内做 —— context 是
+    // supplementSourceEvidence 的局部变量,resolve 回调是测试唯一能拿到它的拦截点;
+    // 函数返回后 context 不再可达,事后补断言无从谈起。
     refreshSupportedHosts(['rl.test']);
     const table = probeCooldownSlots()!;
     table.set('rl.test', Date.now() + 600_000);
