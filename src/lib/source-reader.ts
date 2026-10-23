@@ -182,8 +182,8 @@ function probeThrottleSlots(env: SourceTuningEnv = process.env): Map<string, num
 // 跨实例不共享；键同样走 stationKeyOfUrl（孪生 host 共享一份冷却）。
 const PROBE_COOLDOWN_SLOTS = new Map<string, number>();
 
-/** probe 的冷却表：与节流槽同一个回滚开关（SOURCE_THROTTLE_PER_HOST=0 ⇒ 退回请求级，改动前语义）。 */
-function probeCooldownSlots(env: SourceTuningEnv = process.env): Map<string, number> | undefined {
+/** probe 与阅读根 context 共用的冷却表：SOURCE_THROTTLE_PER_HOST=0 回滚时连同共享一起退回请求级（改动前语义）。 */
+export function probeCooldownSlots(env: SourceTuningEnv = process.env): Map<string, number> | undefined {
   return env.SOURCE_THROTTLE_PER_HOST === '0' ? undefined : PROBE_COOLDOWN_SLOTS;
 }
 
@@ -286,7 +286,14 @@ export class SourceRequestContext {
         );
         (timer as { unref?: () => void }).unref?.();
       };
-      this.armSlice(Date.now() + (options.sliceMs ?? PER_SOURCE_SLICE_MS));
+      // 46-revfix：初始切片同样受 slide.until 钳制。此前只有 noteProgress 的顺延被 until 截住，
+      // 构造时的 armSlice(now + sliceMs) 不受钳 —— 起跑晚（但仍早于 until）的非末位候选初始
+      // deadline = now + min(基准, 余量) 会越过 until(softEnd − reserve)；顺延只延后不提前，
+      // 切片永远回不到 until，原源兜底的 reserve 活生生被吃掉。
+      // until 已在过去时不钳（末位放宽、余量即切片，见 c③ 与 X2s）：那时的既有语义就是用满
+      // 余量，钳了反而变成构造即中止。
+      const initialDeadline = Date.now() + (options.sliceMs ?? PER_SOURCE_SLICE_MS);
+      this.armSlice(this.slide && this.slide.until > Date.now() ? Math.min(initialDeadline, this.slide.until) : initialDeadline);
       if (this.signal.aborted) clearTimeout(timer);
       else this.signal.addEventListener('abort', () => clearTimeout(timer), { once: true });
     }
@@ -1540,6 +1547,16 @@ export async function probeSourceForBook(
           const empty = stat?.searched === true && stat.candidates + stat.fallbackCandidates === 0;
           return finish({ status: empty ? 'no_candidates' : 'miss' });
         }
+      }
+      // 46-revfix C：probe 单源、无作者回退路径 ⇒ requests===0 的 hadFailure 只能来自共享冷却/
+      // 节流在 beforeRequest 就拒（源循环把这类错误转成 hadFailure+continue，收尾统一抛
+      // SOURCE_UNAVAILABLE）。给它独立观测码，面板与统计里「源站真死」与「冷却挡住」不再
+      // 混进同一个不可区分的 SOURCE_UNAVAILABLE。已知瑕疵：池快照之后恰逢 host 退休的竞态
+      // 窗口里，策略拒绝也会以零请求+SOURCE_UNAVAILABLE 到这里、被标成冷却拒绝 —— 该窗口
+      // 分钟级且池快照构造时已滤退休 host，误差频率≈0；换精确判据需把源级 sourceThrottled
+      // 上浮到收尾，改动面不成比例，不为统计精度做。
+      if (context.requests === 0 && error instanceof SourceReaderError && error.code === 'SOURCE_UNAVAILABLE') {
+        return finish({ status: 'unreachable', code: 'SOURCE_COOLDOWN_REJECTED' });
       }
       return finish({ status: 'unreachable', code: failureCode(error) });
     }

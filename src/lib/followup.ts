@@ -18,7 +18,7 @@ import { createDeadline } from './deadline';
 import { resolveDownloadSource } from './download-source';
 import { recordCronSuccess } from './source-health';
 import { SourcePolicyError } from './source-policy';
-import { resolveSourceBook, SourceReaderError, SourceRequestContext, type SourceCatalog } from './source-reader';
+import { probeCooldownSlots, resolveSourceBook, SourceReaderError, SourceRequestContext, type SourceCatalog } from './source-reader';
 import type { SourceBookIdentity } from './source-parser';
 import { getBuiltinRequestSource, getEngineSources, type ReadingSource } from './shuyuan';
 
@@ -236,6 +236,10 @@ export async function probeFollowupCatalog(
     if (!source) return { ok: false, titles: [], reason: 'source_unavailable' };
     const context = new SourceRequestContext(probeSignal, PROBE_REQUEST_LIMIT, {
       throttleSlots: FOLLOWUP_THROTTLE_SLOTS,
+      // 46-revfix：冷却表与 probe / 阅读根 context 同一张（进程级共享）。此前 followup 只共享节流
+      // 不共享冷却 —— probe 吃到的 429 冷却对追更探测不可见，定时器一轮会对同一站重打。必须同一张表
+      // 才走 sharedCooldownUntil 的 10 分钟钳制（Retry-After 投毒防线），不能另建 FOLLOWUP_COOLDOWN_SLOTS。
+      cooldownSlots: probeCooldownSlots(),
     });
     try {
       const catalog: SourceCatalog = await resolveSourceBook(

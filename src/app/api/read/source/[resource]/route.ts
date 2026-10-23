@@ -8,7 +8,7 @@ import { SourcePolicyError } from '@/lib/source-policy';
 import { sourceBookMatches } from '@/lib/source-parser';
 import {
   currentSourceHint, readSourceChapter, resolveSourceBook, saveSourceCatalog, sourceReaderIndex,
-  SourceCatalog, SourceReaderError, SourceRequestContext, surveySourceBooks,
+  probeCooldownSlots, SourceCatalog, SourceReaderError, SourceRequestContext, surveySourceBooks,
 } from '@/lib/source-reader';
 import { attachSwitchedCatalog } from '@/lib/reader-switch-catalog';
 import { findDoneReadTask } from '@/lib/library-read-task';
@@ -104,7 +104,12 @@ async function handleGET(req: NextRequest, { params }: { params: Promise<{ resou
   }
   const deadline = createDeadline(55_000);
   const signal = AbortSignal.any([req.signal, deadline.signal]);
-  const context = new SourceRequestContext(signal);
+  // 46-revfix：阅读根 context 接上 probe 的进程级共享冷却表。此前只有 probe 单腿共享：同一用户
+  // probe 吃到 429 后，紧接着的阅读请求（index/alternates/chapter）看不到这份冷却，换源/搜索会对
+  // 同一站立即重打。节流槽仍是请求级（350ms 只在 probe 扇出内有意义）；冷却表是源站明说的
+  // 「600s 别打我」，跨请求生效才是它的语义。表与 probe 同一张 ⇒ sharedCooldownUntil 的
+  // 10 分钟钳制（Retry-After 投毒防线）同样覆盖到这条腿。
+  const context = new SourceRequestContext(signal, undefined, { cooldownSlots: probeCooldownSlots() });
   try {
     if (resource === 'index') {
       await raceDeadline(signal, ensureSchema);

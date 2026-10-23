@@ -2918,7 +2918,7 @@ describe('chapter failover M1.1 (41-M1.1)', () => {
     expect(child.mock.calls).toContainEqual([alt(1).url, expect.objectContaining({ sliceMs: 3_000 })]);
   });
 
-  it('c③\'(杀 M1c):余量 10s 时非末位候选的基准取 min(12s, 余量)=10s,挂起的候选在 10s 处放弃', async () => {
+  it('c³\'(杀 M1c;46-revfix):余量 10s 的非末位挂起候选被 until(45−8=37s) 钳制 —— 2s 处放弃,末位他源仍开跑并交付', async () => {
     const pool = [current, alt(1), alt(2)];
     const catalog = await prepareCurrent(pool);
     pages.set(currentChapter, { text: '', status: 404 });
@@ -2928,11 +2928,15 @@ describe('chapter failover M1.1 (41-M1.1)', () => {
     const child = vi.spyOn(service.SourceRequestContext.prototype, 'child');
     const ctx = context();
     vi.setSystemTime(ctx.startedAt + service.SOFT_BUDGET_MS - 10_000);
-    await expect(readChapter(catalog, ctx)).rejects.toMatchObject({ code: 'SOURCE_TIMEOUT', status: 504 });
+    const part = await readChapter(catalog, ctx);
+    expect(part).toMatchObject({ text: '备用源2正文', servedFrom: alt(2).name });
+    // 非末位 alt(1) 在 35s 起跑:切片参数仍是 min(12s, 余量 10s)=10s,但初始 deadline 被 until(37s) 截住 ⇒ 37s 被切。
+    // 旧实现不钳初始切片 ⇒ alt(1) 挂满 10s 到 45s,alt(2) 和原源都开不了跑 ⇒ 504(本轮修复改掉的正是这个口子)。
     expect(child.mock.calls).toContainEqual([alt(1).url, expect.objectContaining({ sliceMs: 10_000 })]);
-    expect(requestedUrls()).not.toContain(altSearch(2));
-    expect(oneFailoverLine('timeout', pool)).toMatchObject({
-      attempted: 1, expensiveAttempts: 1, elapsedMs: 10_000, reasonCounts: { SOURCE_SCOPE_EXHAUSTED: 1 },
+    expect(child.mock.calls).toContainEqual([alt(2).url, expect.objectContaining({ sliceMs: 8_000 })]);
+    expect(requested.find(({ url }) => url === altSearch(2))!.at - requested[0].at).toBe(2_000);
+    expect(oneFailoverLine('success', pool)).toMatchObject({
+      attempted: 2, expensiveAttempts: 1, elapsedMs: 2_700, reasonCounts: { SOURCE_SCOPE_EXHAUSTED: 1 },
     });
   });
 
@@ -3454,6 +3458,38 @@ describe('chapter failover M1.1 (41-M1.1)', () => {
     });
   });
 
+  it('reserve-init(46-revfix):30s 才起跑的末位他源初始切片被 until 钳住 —— 原源兜底仍拿到完整 8s', async () => {
+    // 缝隙:slide.until=softEnd−8s 只钳 noteProgress 的顺延,不钳构造时的初始 armSlice。
+    // 前一个候选于 ~30s 失败后,末位他源在 ~30s 起跑:切片参数 = max(min(12s, 余量 15s), 余量−8s) = 12s,
+    // 初始 deadline ≈ 42s,越过 until(37s);顺延只延后不提前 ⇒ 切片永远回不到 37s,
+    // 原源兜底的 8s 被吃成 <3s ⇒ 起跑判定处 break ⇒ 503(钳制缺失时的反例锚点)。
+    const pool = [current, engineAlt(1), engineAlt(2)];
+    const catalog = await prepareCurrent(pool);
+    pages.set(currentChapter, { text: '', status: 404 });
+    // 备用源1:搜索/详情/目录/正文第 1 页各 7s(0.35s…29.4s 持续进展),正文第 2 页 500 ⇒ ~29.8s 处昂贵失败。
+    primeEngine(1);
+    slowEnginePages(1, 2, 7_000);
+    pages.set('https://reader.test/e1/c/1_2.html', { text: '', status: 500 });
+    bodyDelay.set('https://reader.test/e1/c/1_2.html', 0);
+    for (const url of ['https://reader.test/e1s?q=' + encodeURIComponent(book.title), 'https://reader.test/e1/d/1.html', engineToc(1)]) {
+      bodyDelay.set(url, 7_000);
+    }
+    // 备用源2(末位):~30s 起跑,首个进展(搜索正文 7s)要到 ~37s 之后 —— 修复前初始 deadline ≈42s,
+    // 把原源兜底的余量吃光;修复后初始 deadline 被 until(37s) 钳住,37s 被切,原源贴线起跑。
+    primeEngine(2);
+    slowEnginePages(2, 6, 7_000);
+    for (const url of ['https://reader.test/e2s?q=' + encodeURIComponent(book.title), 'https://reader.test/e2/d/1.html', engineToc(2)]) {
+      bodyDelay.set(url, 7_000);
+    }
+    primeRelisted();
+    const part = await readChapter(catalog);
+    expect(part).toMatchObject({ text: '原站新条目正文', servedFrom: current.name });
+    expect(requested.find(({ url }) => url === currentSearch)!.at - requested[0].at).toBe(37_000);
+    expect(oneFailoverLine('success', pool)).toMatchObject({
+      attempted: 3, expensiveAttempts: 2, reasonCounts: { SOURCE_HTTP_5XX: 1, SOURCE_SCOPE_EXHAUSTED: 1 },
+    });
+  });
+
   // ---- 41-M1.2b:深审 A 第三轮四列探针里违反「三列取优」的两行(V1/V2),在 a02e482 上都是红的 ----
 
   it('V1 ROUTE-504r2(G):当前源卡住;A、B 一直出数据、最后才失败，吃掉大半预算;C 可用 ⇒ 余量 6.65s 时 C 仍开跑并交付 200(a02e482:<8s ⇒ 504)', async () => {
@@ -3472,9 +3508,10 @@ describe('chapter failover M1.1 (41-M1.1)', () => {
     const res = await drive(request('chapter', `session=${catalog.version}&version=${catalog.version}&chapter=0`));
     expect(res.status).toBe(200);
     expect(await res.json()).toMatchObject({ text: '备用源3正文', servedFrom: alt(3).name });
-    // 当前源 12s 放弃;A 在 12s…26s 出数据，正文 5xx 于 26.35s 失败;B 从 26.7s 起出数据，38.35s 被自己的切片切断。
-    // C 在 38.35s 开跑，余量 6.65s:不足原源兜底的 8s 门槛，但够他源的起跑门槛 3s。
-    expect(requested.find(({ url }) => url === altSearch(3))!.at - requested[0].at).toBe(38_350);
+    // 当前源 12s 放弃;A 在 12s…26s 出数据，正文 5xx 于 26.35s 失败;B 从 26.7s 起出数据,
+    // 初始切片(min(12s, 余量))被 until(45−8=37s) 钳回 —— 46-revfix 前截止在 38.35s,
+    // 吃掉原源兜底的余量。C 在 37s 开跑，余量 8s:不足原源兜底的 8s 门槛，但够他源的起跑门槛 3s。
+    expect(requested.find(({ url }) => url === altSearch(3))!.at - requested[0].at).toBe(37_000);
     expect(oneFailoverLine('success', pool)).toMatchObject({
       trigger: 'SOURCE_SCOPE_EXHAUSTED', attempted: 3, expensiveAttempts: 2,
       reasonCounts: { SOURCE_HTTP_5XX: 1, SOURCE_SCOPE_EXHAUSTED: 1 },
@@ -3593,6 +3630,38 @@ describe('46-engfix:probe 429 冷却跨请求 + 主机健康', () => {
     const before = stamps.length;
     await drive(service.probeSourceForBook(probeSource('rl.test', '同站另一行'), book, new AbortController().signal));
     expect(stamps.length).toBeGreaterThan(before);
+  });
+
+  it('46-revfix C：requests===0 的 unreachable 带 SOURCE_COOLDOWN_REJECTED 观测码（不再与真 5xx 混同）', async () => {
+    pages.set(searchOf('rl.test'), { text: '', status: 429 });
+    pages.set(searchOf('rl.test', book.author), { text: '', status: 429 });
+    headers.set(searchOf('rl.test'), { 'retry-after': '600' });
+    headers.set(searchOf('rl.test', book.author), { 'retry-after': '600' });
+    const first = await drive(service.probeSourceForBook(probeSource('rl.test'), book, new AbortController().signal));
+    expect(first.status).toBe('unreachable');
+    const result = first as { status: string; code?: string };
+    // 第一次 429 已发出请求(计 >0),旧的 failureCode 归类(SOURCE_UNAVAILABLE)不能变。
+    expect(result.code).toBe('SOURCE_UNAVAILABLE');
+    // 第二次 probe:冷却直接拒,零请求 ⇒ 新观测码。
+    const second = await drive(service.probeSourceForBook(probeSource('rl.test', '同站另一行'), book, new AbortController().signal));
+    expect(second).toMatchObject({ status: 'unreachable', code: 'SOURCE_COOLDOWN_REJECTED', requests: 0 });
+  });
+
+  it('46-revfix B：阅读根 context 接共享冷却 —— probe 吃到的 429 后紧跟的搜索请求被冷却挡住', async () => {
+    // 场景同款:扇出面板 probe rl.test 拿 429+Retry-After 600s,用户紧接着点阅读:
+    // 阅读根 context (route.ts) 传 probeCooldownSlots() ⇒ 搜索请求在 beforeRequest 就被
+    // 共享冷却拒绝,不再对 rl.test 立即重打。
+    pages.set(searchOf('rl.test'), { text: '', status: 429 });
+    pages.set(searchOf('rl.test', book.author), { text: '', status: 429 });
+    headers.set(searchOf('rl.test'), { 'retry-after': '600' });
+    headers.set(searchOf('rl.test', book.author), { 'retry-after': '600' });
+    await drive(service.probeSourceForBook(probeSource('rl.test'), book, new AbortController().signal));
+    const before = stamps.length;
+    const ctx = new service.SourceRequestContext(new AbortController().signal, 12, {
+      cooldownSlots: service.probeCooldownSlots(),
+    });
+    await expect(ctx.page(searchOf('rl.test'))).rejects.toMatchObject({ code: 'SOURCE_SCOPE_EXHAUSTED' });
+    expect(stamps.length).toBe(before);
   });
 });
 

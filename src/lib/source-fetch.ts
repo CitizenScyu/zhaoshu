@@ -161,7 +161,10 @@ export async function fetchSourceText(input: string, options: FetchSourceOptions
     return page;
   } catch (error) {
     const kind = options.signal.aborted ? null : hostFailureKind(error);
-    if (kind) recordHostFailure(initial.hostname, kind);
+    // 46-revfix：HTTP 失败按实际响应 host 记（46-revfix 前记在 initial 上）：重定向跨 host 后
+    // 站 A 引到站 B,B 的 5xx 不是站 A 的健康信号。传输层错误无 responseHost,仍记 initial
+    // (apex 与 www 在健康记忆里是同一个站,换 host 兜底算同一次逻辑请求)。
+    if (kind) recordHostFailure((error instanceof SourceHttpError && error.responseHost) || initial.hostname, kind);
     throw error;
   }
 }

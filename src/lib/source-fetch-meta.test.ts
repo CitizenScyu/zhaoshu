@@ -182,3 +182,30 @@ describe('META53: 有界HTML head响应字符集', () => {
     }
   });
 });
+
+describe('46-revfix G：重定向后 5xx 记在响应 host 上（不再错记到初始 host）', () => {
+  it('e1.test 302 → ok.test 500 ×2 ⇒ ok.test suspect、e1.test 健康记分不受污染', async () => {
+    // 本文件前面的用例跑过 vi.resetModules()：静态 import 与动态 import 会落在不同模块实例上
+    // （记账模块与观察模块分裂）。统一 resetModules 后动态导入三方（fetch/健康/门），并在
+    // 同一注册表上刷新 host 门 —— source-fetch 内部的 source-policy/health 与观察方同实例。
+    vi.resetModules();
+    const { fetchSourceText: fetchWithHealth } = await import('./source-fetch');
+    const health = await import('./source-host-health');
+    const { refreshSupportedHosts: refresh } = await import('./source-policy');
+    refresh(['e1.test', 'ok.test']);
+    const mock = vi.fn().mockImplementation(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url === 'https://e1.test/meta') {
+        return new Response(null, { status: 302, headers: { location: 'https://ok.test/target' } });
+      }
+      return new Response(null, { status: 500 });
+    });
+    vi.stubGlobal('fetch', mock);
+    for (let round = 0; round < 2; round += 1) {
+      await expect(fetchWithHealth('https://e1.test/meta', { signal: signal() })).rejects.toMatchObject({ status: 500 });
+    }
+    // 46-revfix 前:错记到 initial.hostname ⇒ e1.test 累计 2 次 5xx ⇒ e1.test suspect,ok.test 无记录。
+    expect(health.isHostSuspect('e1.test')).toBe(false);
+    expect(health.isHostSuspect('ok.test')).toBe(true);
+  });
+});
