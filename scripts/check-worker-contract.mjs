@@ -1,11 +1,11 @@
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join, relative, resolve } from 'node:path';
+import { existsSync, readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { bookFilename } from '../src/lib/book-file-name.ts';
 import { DOWNLOAD_TASK_STALE_MS } from '../src/lib/download-task-policy.ts';
 import { validateSourceUrl } from '../src/lib/source-policy.ts';
+import { runRuntimeBudgetContract } from './worker-runtime-budget-contract.mjs';
 
 // Explicit cross-repository check; normal unit tests also run these fixtures in each repo.
 const workerRoot = resolve(process.argv[2] || '../zhaoshu-books');
@@ -92,41 +92,9 @@ if (!shellPresent) {
 }
 
 // 第六组：runtime 日预算退还 + 限速器错误名契约（41-EXEC-SRCUNAVAIL）。
-//   runtime-download/budget-refund.ts 与兄弟仓 runtime/lib/daily-budget.mjs 读写同一份状态文件；
-//   scripts/engine-download.mjs 的 isSourceUnavailableError 按 name 识别兄弟仓限速器的两类错误。
-//   任一侧改了文件格式或类名，这里在 push 时就红，而不是上线后静默漏退、或把瞬时错误落成终态。
-if (shellPresent) {
-  const shellBudgetPath = resolve(workerRoot, 'runtime/lib/daily-budget.mjs');
-  const shellLimiterPath = resolve(workerRoot, 'runtime/lib/rate-limiter.mjs');
-  // 兄弟仓整体缺席由 pre-push 的目录检查决定跳过；进入此处时 runtime/ 已通过第五组检查。
-  // 这两个文件分别是 shell 的静态依赖与打包器注入的依赖，缺失不能按可选契约放行。
-  const missingRuntimeFiles = [shellBudgetPath, shellLimiterPath].filter(file => !existsSync(file));
-  if (missingRuntimeFiles.length) {
-    throw new Error(`跨仓 runtime 契约失败：缺少必需文件 ${missingRuntimeFiles
-      .map(file => relative(workerRoot, file).replaceAll('\\', '/')).join(', ')}`);
-  } else {
-    const { createDailyBudget } = await import(pathToFileURL(shellBudgetPath).href);
-    const { createBudgetRefund } = await import('../runtime-download/budget-refund.ts');
-    const dir = mkdtempSync(join(tmpdir(), 'budget-contract-'));
-    try {
-      const statePath = join(dir, 'daily-budget.json');
-      const now = () => Date.parse('2026-09-24T03:00:00.000Z');
-      const budget = createDailyBudget({ statePath, limit: 3, now });
-      const first = await budget.consume();
-      await budget.consume();
-      const refund = createBudgetRefund({ statePath, now });
-      assert.equal(await refund({ key: 'contract:1', date: first.date }), 'refunded');
-      assert.deepEqual(await budget.read(), { date: first.date, used: 1 });
-      assert.equal(await refund({ key: 'contract:1', date: first.date }), 'duplicate');
-      assert.deepEqual(await budget.read(), { date: first.date, used: 1 });
-      assert.equal((await budget.consume()).used, 2); // shell 在退还后的文件上照常续扣
-    } finally {
-      rmSync(dir, { recursive: true, force: true });
-    }
-    const limiter = await import(pathToFileURL(shellLimiterPath).href);
-    const { isSourceUnavailableError } = await import('./engine-download.mjs');
-    assert.ok(isSourceUnavailableError(new limiter.CircuitOpenError('book15.net', Date.now())), 'CircuitOpenError 必须归 source_unavailable');
-    assert.ok(isSourceUnavailableError(new limiter.DailyRequestBudgetError('book15.net', 20_000)), 'DailyRequestBudgetError 必须归 source_unavailable');
-    console.log('Cross-repository runtime budget/limiter contract: refund round-trip + 2 limiter error names passed');
-  }
-}
+//   实现在 worker-runtime-budget-contract.mjs（依赖全部可注入），本处与
+//   scripts/check-worker-contract.test.ts 调的是**同一个函数**——不再把契约正文抄一份到测试里、
+//   也不再靠「切源码文本 + VM eval」来跑它（那种写法对文件结构零容忍：锚点被包进 if 块，切到文件尾
+//   就多一个不配对的 `}`，整段 SyntaxError；来龙去脉见该模块头部）。跳过 vs 拒绝的策略也在那个函数里，
+//   改这里请连同它的测试一起改。shellPresent=false 时的 warn 由上面第五组那段负责，本处不重复打印。
+await runRuntimeBudgetContract({ workerRoot, shellPresent });
