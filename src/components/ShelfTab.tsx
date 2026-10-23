@@ -80,6 +80,9 @@ function readTimeAgo(at: number, now: number): string {
   return `${Math.round(hours / 24)} 天前`;
 }
 
+/** 「最近在读」时间基准的推进间隔：细到分钟级文案不滞后，又不至于让书架整节无谓重渲染。 */
+const RECENT_READS_TICK_MS = 60_000;
+
 export default function ShelfTab() {
   const { apiFetch, user, sessionId, isCurrentSession } = useOwner();
   const [items, setItems] = useState<ShelfItem[] | null>(null);
@@ -142,13 +145,24 @@ export default function ShelfTab() {
   // 后端一次最多返回 SHELF_ROW_LIMIT 本，拿满就说明后面还有没列出来的。
   const truncated = (items?.length ?? 0) >= SHELF_ROW_LIMIT;
 
+  // render 期不能取当前时间（react-hooks/purity：Date.now() 写在渲染里会让「多久以前」随每次
+  // 无关重渲染漂移，SSR 与水合也对不上）。挂载后取一次基准、每 RECENT_READS_TICK_MS 推进一次：
+  // 纯度合规，时间文案还能自己走动。now=0 表示基准尚未取到，「最近在读」整节先不渲染——
+  // items 本来就是异步取回的（初值 null），用户看不到这一帧。
+  const [now, setNow] = useState(0);
+  useEffect(() => {
+    const stamp = () => setNow(Date.now());
+    stamp();
+    const timer = window.setInterval(stamp, RECENT_READS_TICK_MS);
+    return () => window.clearInterval(timer);
+  }, []);
+
   // readerux42-C「最近在读」:按本地阅读数据(任务进度 localStorage + 源记忆)的最后阅读时间
   // 排序,同一本书取最新一条、最多 5 本;点进走 ReadBookLink 深链,阅读页自己恢复到章节位置。
   // 只做只读合成,不写存储;无进度数据(含未登录)整节不渲染。
   const recentReads = useMemo(() => {
-    if (!items || !user) return [];
+    if (!items || !user || !now) return [];
     const userId = user.id;
-    const now = Date.now();
     const best = new Map<number, { item: ShelfItem; at: number; chapter: number | null }>();
     for (const item of items) {
       let at = 0;
@@ -167,7 +181,7 @@ export default function ShelfTab() {
       if (!previous || at > previous.at) best.set(item.book_id, { item, at, chapter });
     }
     return [...best.values()].sort((a, b) => b.at - a.at).slice(0, 5);
-  }, [items, user]);
+  }, [items, user, now]);
 
   // 两段式确认：第一次点只武装，第二次点同一目标才放行；3 秒无后续点击自动解除。
   // 换目标只重新武装当前目标，不会顺手放行上一个目标。
@@ -329,7 +343,7 @@ export default function ShelfTab() {
                   </span>
                 </div>
                 <span className="text-xs shrink-0" style={{ color: 'var(--ink-faint)' }}>
-                  {readTimeAgo(at, Date.now())}
+                  {readTimeAgo(at, now)}
                 </span>
                 <ReadBookLink
                   taskId={item.read_task_id}

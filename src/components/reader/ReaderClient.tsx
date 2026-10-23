@@ -134,11 +134,17 @@ function ReaderSession({ session, from }: Props) {
   // 段只带源名(旧服务端)时 url 留空 ⇒ 面板按源名认,不拿目录上可能已过时的 url 去配。
   // ruxrev42 F-1:必须 memo 在原始值上 —— 裸对象字面量每次渲染都是新引用,下游把它放进
   // 带 abort cleanup 的 effect 依赖(自动换源)时,无关重渲染(notice 等)就会取消在飞探测。
+  // 依赖值先取成局部量:React Compiler 从可选链推断出的依赖(activePart.servedFrom)与手写的
+  // activePart?.servedFrom 对不上,会报 preserve-manual-memoization 并放弃优化整个组件;
+  // 取成局部量后推断集与手写集逐字相同,依赖语义与 F-1 原意一致(仍是那三个原始值)。
+  const servedFrom = activePart?.servedFrom;
+  const servedFromUrl = activePart?.servedFromUrl;
+  const indexSource = reading?.index.source;
   const servingSource = useMemo<ServingSource | undefined>(() => {
-    if (activePart?.servedFrom) return { name: activePart.servedFrom, url: activePart.servedFromUrl };
-    if (reading?.index.source) return { name: reading.index.source.name, url: reading.index.source.sourceUrl };
+    if (servedFrom) return { name: servedFrom, url: servedFromUrl };
+    if (indexSource) return { name: indexSource.name, url: indexSource.sourceUrl };
     return undefined;
-  }, [activePart?.servedFrom, activePart?.servedFromUrl, reading?.index.source]);
+  }, [servedFrom, servedFromUrl, indexSource]);
   const first = reading?.parts[0];
   const last = reading?.parts[reading.parts.length - 1];
   const before = reading && first ? previousReadingPosition(reading.index, first) : null;
@@ -291,7 +297,11 @@ function ReaderSession({ session, from }: Props) {
   const [autoRead, setAutoRead] = useState(false);
   const [autoSpeed, setAutoSpeed] = useState<AutoSpeed>('normal');
   const autoHasNext = !!after;
-  useEffect(() => { if (failure && autoRead) setAutoRead(false); }, [failure, autoRead]);
+  // 出错即停自动阅读。用「渲染期调整状态」而不是 effect:effect 里同步 setState 会多一轮级联
+  // 渲染(react-hooks/set-state-in-effect),而这里要的正是「本次提交就别再按 autoRead 走」——
+  // 渲染期改状态让 React 立刻带 autoRead=false 重跑本组件再提交,滚读定时器那一轮压根不启。
+  // 条件里带 autoRead,置 false 后判断即假,不会循环。
+  if (failure && autoRead) setAutoRead(false);
   useEffect(() => {
     if (!autoRead) return;
     const speedPx = AUTO_READ_SPEEDS[autoSpeed] / (1000 / AUTO_READ_TICK_MS);

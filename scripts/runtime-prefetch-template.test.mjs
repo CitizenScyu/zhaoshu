@@ -226,7 +226,8 @@ async function runService(harnessOptions = {}) {
   await executor.link(() => { throw new Error('unexpected executor dependency'); });
   await executor.evaluate();
 
-  const module = new SourceTextModule(source, { context, identifier: 'prefetch.mjs',
+  // 变量不能叫 module（@next/next/no-assign-module-variable：会遮蔽 CJS 的 module 绑定）。
+  const prefetchModule = new SourceTextModule(source, { context, identifier: 'prefetch.mjs',
     async importModuleDynamically(specifier, referencingModule) {
       dynamicSeen.push(specifier);
       if (harnessOptions.importBehavior === 'reject') throw new Error('synthetic import failure');
@@ -235,13 +236,13 @@ async function runService(harnessOptions = {}) {
       return executor;
     },
   });
-  await module.link((specifier) => {
+  await prefetchModule.link((specifier) => {
     staticSeen.push(specifier);
     const found = statics.get(specifier);
     if (!found) throw new Error('unexpected static import (not same-package): ' + specifier);
     return found;
   });
-  await module.evaluate();
+  await prefetchModule.evaluate();
 
   const flush = async (n = 12) => { for (let i = 0; i < n; i++) await new Promise((resolve) => setImmediate(resolve)); };
   await flush(12);
