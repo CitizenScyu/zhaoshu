@@ -122,9 +122,27 @@ export function matchSourceChapter(chapters: SourceChapter[], expectedTitle: str
 const AUTHOR_LABEL = /^(?:作者:|@)(?=.)/u;
 const AUTHOR_BYLINE = /^(.{2,}?)\/?著$/u;
 
+// pubmeta1026：出版物元数据形态的作者串（打标库/QQ 书城：「[英]J.R.R.托尔金 著，[英]克里斯托弗·托尔金 编」）。
+// 网文站只写笔名，比对与作者回退搜索都只能用第一作者本体。只在出现「出版形态证据」——开头国籍括注或多作者
+// 分隔——时才剥 编/译/绘/图 等角色词：单个笔名以这些字结尾（「宏图」）的不动，避免把真名削短。
+// 国籍括注限 1–6 个汉字（NFKC 后全角括号已折成半角）；分隔符含「著/编…」紧跟下一个国籍括注的无标点写法。
+const AUTHOR_NATIONALITY = /^[[(〔【][一-鿿]{1,6}[\])〕】]/u;
+const AUTHOR_SEPARATOR = /[,，、;；/&]|(?<=[著编译绘图撰])(?=[[(〔【][一-鿿]{1,6}[\])〕】])/u;
+const AUTHOR_ROLE = /^(.{2,}?)(?:原著|编著|主编|编译|译著|著|编|译|绘|图|撰)$/u;
+
+/** 出版形态作者串取第一作者本体；不是出版形态（无国籍括注、无多作者分隔）原样返回。 */
+function primaryPublishedAuthor(value: string): string {
+  const segments = value.split(AUTHOR_SEPARATOR).filter(Boolean);
+  if (segments.length < 2 && !AUTHOR_NATIONALITY.test(value)) return value;
+  const first = (segments[0] ?? value).replace(AUTHOR_NATIONALITY, '');
+  const body = first.replace(AUTHOR_ROLE, '$1');
+  return body || value;
+}
+
 export function knownSourceAuthor(value: string): string {
-  const normalized = value.normalize('NFKC').trim().replace(/\s+/gu, '').toLocaleLowerCase()
-    .replace(AUTHOR_LABEL, '').replace(AUTHOR_BYLINE, '$1');
+  const normalized = primaryPublishedAuthor(value.normalize('NFKC').trim().replace(/\s+/gu, '').toLocaleLowerCase()
+    .replace(AUTHOR_LABEL, ''))
+    .replace(AUTHOR_BYLINE, '$1');
   return ['', '佚名', '未知', '未知作者'].includes(normalized) ? '' : normalized;
 }
 
@@ -132,14 +150,26 @@ export function knownSourceAuthor(value: string): string {
 // 「番外」「全集」「精品」这类可能指向另一部作品/合集的词不在其列（那是模糊层 TITLE_DECORATION 的事，留给用户确认）。
 // 剥完为空（书名本身就是「【完结】」）则保留原样，空串不得与任何东西判等。
 const IDENTITY_TITLE_STATUS = /[[【(](?:已?完结|全本|完本|连载中?|新书|首发|独家|免费|无删减|txt)[\]】)]/gu;
+// pubmeta1026：书名尾部的**版本注记**（「精灵宝钻（精装插图本）」「百年孤独(典藏版)」「X【全译本】」）同属出版元数据，
+// 不是书名本体。只剥尾部一个、以「版/本」收尾、不超过 12 字的括注。注记暗示**内容不同**时不剥：分册/续作
+// （第/部/卷/册/集/上中下）、删改本（精品/精选/节选/缩写/简本/青少/少儿/改编）、换媒介（绘本/漫画/有声/剧本）、
+// 番外/外传——与 IDENTITY_TITLE_STATUS 同一原则，那些交给模糊层由用户确认。
+const IDENTITY_TITLE_EDITION = /[[【(]([^[\]【】()]{1,12}[版本])[\]】)]$/u;
+const EDITION_VOLUME_HINT = /[第部卷册集上中下选节缩续]|精品|简本|简写|青少|少儿|儿童|改编|绘本|漫画|有声|剧本|番外|外传/u;
+
+function stripEditionNote(title: string): string {
+  const match = IDENTITY_TITLE_EDITION.exec(title);
+  if (!match || EDITION_VOLUME_HINT.test(match[1])) return title;
+  return title.slice(0, match.index) || title;
+}
 
 /**
- * 书源身份比对用的书名键（41-swq）：normalizeSourceTitle → 剥状态标记 → 繁→简字形折叠。
+ * 书源身份比对用的书名键（41-swq）：normalizeSourceTitle → 剥状态标记 → 剥尾部版本注记（pubmeta1026）→ 繁→简字形折叠。
  * 只用于「是不是同一本书」的判等，不改存储值、不进 DB 身份键（book-identity.ts 与 SQL 权威键逐字对齐）。
  */
 function identityTitle(value: string): string {
   const normalized = normalizeSourceTitle(value);
-  const stripped = normalized.replace(IDENTITY_TITLE_STATUS, '');
+  const stripped = stripEditionNote(normalized.replace(IDENTITY_TITLE_STATUS, ''));
   return foldTraditional(stripped || normalized);
 }
 
