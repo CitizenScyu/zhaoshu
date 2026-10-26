@@ -805,6 +805,55 @@ describe('refreshShuyuan atomic refresh', () => {
     expect(execute.mock.calls.some(([query]) => query.text.includes('INSERT INTO source_admission'))).toBe(true);
   });
 
+  // js-1026：装饰字段（coverUrl）带 JS 的源——开关关逐字原口径（不进评估环、不发搜索）；
+  // ADMISSION_NONCORE_JS=1 时进候选并对其发准入搜索、写 compile_ok=true 行。
+  describe('js-1026：ADMISSION_NONCORE_JS 放行装饰字段 JS', () => {
+    const decoratedSource = {
+      ...admissionCandidate,
+      ruleSearch: { ...admissionCandidate.ruleSearch, coverUrl: 'img@src@js:result.replace("http:","https:")' },
+    };
+    const runWith = async () => {
+      setCollection(11, [decoratedSource]);
+      execute.mockImplementation(async (query) => {
+        if (query.text.startsWith('SELECT count(*)')) return [zeroCounts];
+        if (query.text.startsWith('INSERT INTO cron_health') && query.values[0] === ADMISSION_LEASE_ROW) {
+          return [{ name: ADMISSION_LEASE_ROW, generation: '1' }];
+        }
+        if (query.text.includes('FROM shuyuan_meta')) return [{ collections: [], refreshed_at: null }];
+        return [];
+      });
+      fetchMock.mockImplementation(async (input) => {
+        const url = String(input);
+        if (url === admissionSearchUrl) {
+          return new Response('<div class="i"><span class="t">书名</span><a href="/b/1">x</a></div>', { status: 200 });
+        }
+        const fixture = responses.get(url);
+        if (!fixture) throw new Error(`Unexpected network request: ${url}`);
+        return new Response(fixture.body, { status: fixture.status ?? 200 });
+      });
+      vi.spyOn(console, 'log').mockImplementation(() => {});
+      await refreshShuyuan();
+      const insert = execute.mock.calls.find(([query]) => query.text.includes('INSERT INTO source_admission'));
+      return {
+        searched: fetchMock.mock.calls.some(([input]) => String(input) === admissionSearchUrl),
+        payload: insert ? JSON.parse(insert[0].values[2] as string) as Record<string, unknown>[] : undefined,
+      };
+    };
+
+    it('开关关：不进评估环、不发准入搜索', async () => {
+      const { searched, payload } = await runWith();
+      expect(searched).toBe(false);
+      expect(payload ?? []).toEqual([]);
+    });
+
+    it('开关开：进评估环、发准入搜索、写 compile_ok=true', async () => {
+      vi.stubEnv('ADMISSION_NONCORE_JS', '1');
+      const { searched, payload } = await runWith();
+      expect(searched).toBe(true);
+      expect(payload).toEqual([expect.objectContaining({ source_url: 'https://new.example', compile_ok: true })]);
+    });
+  });
+
   // 41-srcfix G5：源规则改到过不了 survey 初筛（这里加 <js>）⇒ 改前 runAdmissionAfterRefresh 直接跳过它，
   // 既有 ok 行永久冻结、池 JOIN 照样命中、带 JS 的新规则以 ok 身份留池。改后送回批次改判 T7 出池。
   describe('41-srcfix G5：初筛不过的源其 compile_ok 旧行改判出池', () => {

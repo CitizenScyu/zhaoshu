@@ -31,6 +31,25 @@ export function enginePostSearchEnabled(env: NodeJS.ProcessEnv = process.env): b
   return env.ENGINE_POST_SEARCH === '1' || env.ENGINE_POST_SEARCH === 'true';
 }
 
+/**
+ * ADMISSION_NONCORE_JS 开关（js-1026）：开时初筛的「无 JS」只查阅读路径字段（CORE_FIELDS + 下面的阻断字段），
+ * 装饰字段（coverUrl/intro/kind/lastChapter、ruleExplore.* 等）带 JS 不再整源拒——引擎本就从不执行 JS
+ * （parse.ts 判 unsupported、compileSource 标 skipped，§3.4 装饰字段置空继续），运行时可用性门
+ * （source-usability missingEngineFields）也只看必需字段。2026-10-26 现网 538 源只因装饰字段 JS 被拒。
+ * 默认关，关时行为逐字不变；web/runner/download 三处 env 须同开同关，否则确认轮会把对侧放行的源判回 T7。
+ */
+export function admissionNoncoreJsEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env.ADMISSION_NONCORE_JS === '1' || env.ADMISSION_NONCORE_JS === 'true';
+}
+
+/**
+ * 非核心但改变阅读路径结果的字段：详情页预处理、正文 webView 脚本、资源嗅探、目录前置脚本。
+ * 引擎不实现这些语义，其中带 JS 说明源依赖脚本才能读出核心内容——开关开时照旧整源拒。
+ */
+export const READING_PATH_JS_FIELDS = [
+  'ruleBookInfo.init', 'ruleContent.webJs', 'ruleContent.sourceRegex', 'ruleToc.preUpdateJs',
+] as const;
+
 export interface RawSource {
   bookSourceUrl?: unknown;
   bookSourceName?: unknown;
@@ -56,8 +75,12 @@ export function* iterRulePairs(src: RawSource): Generator<[string, string]> {
   }
 }
 
-function rulesNoJs(src: RawSource): boolean {
-  for (const [, v] of iterRulePairs(src)) {
+const READING_PATH_FIELDS: ReadonlySet<string> = new Set([...CORE_FIELDS, ...READING_PATH_JS_FIELDS]);
+
+/** readingPathOnly（ADMISSION_NONCORE_JS 开）：只查阅读路径字段；关时查全部规则组（逐字原口径）。 */
+function rulesNoJs(src: RawSource, readingPathOnly = false): boolean {
+  for (const [field, v] of iterRulePairs(src)) {
+    if (readingPathOnly && !READING_PATH_FIELDS.has(field)) continue;
     if (v.includes('@js:') || v.includes('<js')) return false;
   }
   return true;
@@ -82,13 +105,19 @@ function searchIsPureGet(su: unknown): boolean {
  * 41-admpost F1：postSearch 开时的放开分支改用 `searchOptionsConstructible`——与运行时 `buildSourceSearchRequest`
  * **同一判据函数**（展开 {{key}} + rejectUnexpanded + 类型校验，只放开 host 白名单），消除「候选放行 / 运行时抛」的
  * 22 源分歧（{{cookie}} 等展不开的模板、空 charset、非串 body、非对象 headers 一律判不支持）。postSearch 关时逐字不变。
+ *
+ * js-1026：`noncoreJs`（ADMISSION_NONCORE_JS）开时 JS 判据只查阅读路径字段，见 admissionNoncoreJsEnabled。
+ * 源类型按 legado BookSourceType（0 文本 / 1 音频 / 2 图片 / 3 文件 / 4 视频）只放行文本源：原判据只拒 2
+ * 且注释误作「听书源」，音频（猫耳FM/喜马拉雅）与文件源（Zlibrary/知轩藏书）可漏进文本池。缺省按文本，非数值拒。
  */
-export function selectCandidates(data: RawSource[], options: { postSearch?: boolean } = {}): RawSource[] {
+export function selectCandidates(
+  data: RawSource[], options: { postSearch?: boolean; noncoreJs?: boolean } = {},
+): RawSource[] {
   const out: RawSource[] = [];
   for (const s of data) {
     const upgradedBase = upgradeSourceTemplateUrl(String(s.bookSourceUrl ?? ''));
     if (!upgradedBase.startsWith('https://')) continue;
-    if (!rulesNoJs(s)) continue;
+    if (!rulesNoJs(s, options.noncoreJs === true)) continue;
     // 默认口径 = 纯 GET；postSearch 开时额外放行「可构造出 POST/GET 请求」的源（与运行时同一判据，webView/未知键/展不开仍拒）。
     if (!searchIsPureGet(s.searchUrl)
       && !(options.postSearch && searchOptionsConstructible(s.searchUrl, upgradedBase))) continue;
@@ -96,10 +125,16 @@ export function selectCandidates(data: RawSource[], options: { postSearch?: bool
     const rc = (s.ruleContent ?? {}) as Record<string, unknown>;
     if (!(rs && typeof rs === 'object' && rs.bookList)) continue;
     if (!(rc && typeof rc === 'object' && rc.content)) continue;
-    if (s.bookSourceType === 2) continue; // 听书源
+    if (!isTextSourceType(s.bookSourceType)) continue;
     out.push(s);
   }
   return out;
+}
+
+/** legado BookSourceType 0 = 文本；缺省（老源无此字段）按文本。数字串同数字处理。 */
+function isTextSourceType(value: unknown): boolean {
+  if (value === undefined || value === null || value === '') return true;
+  return Number(value) === 0;
 }
 
 export interface CompileResult {

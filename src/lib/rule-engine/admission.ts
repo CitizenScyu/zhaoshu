@@ -14,7 +14,7 @@ import { sourceRevision } from '@/lib/source-revision';
 import { preservesSourcePostRedirect, sourceAbortable } from '@/lib/source-fetch';
 import { buildSourceSearchRequest, type SourceSearchRequest, type SourceUrlValidator } from '@/lib/source-parser';
 import { charsetFromContentType, encodeToBytes, type SourceCharset } from '@/lib/source-charset';
-import { CORE_FIELDS, enginePostSearchEnabled, iterRulePairs, selectCandidates, type RawSource } from './compile-smoke';
+import { admissionNoncoreJsEnabled, CORE_FIELDS, enginePostSearchEnabled, iterRulePairs, selectCandidates, type RawSource } from './compile-smoke';
 import { parseFieldRule } from './parse';
 import {
   createScope, evaluateField, evaluateFieldList, normalizeBody,
@@ -413,10 +413,12 @@ export function compileAdmission(source: RawSource): AdmissionCompile {
   const coreFieldMask: Record<string, boolean> = {};
   for (const field of CORE_FIELDS) coreFieldMask[field] = false;
 
-  if (selectCandidates([source], { postSearch: enginePostSearchEnabled() }).length !== 1) {
+  if (selectCandidates([source], {
+    postSearch: enginePostSearchEnabled(), noncoreJs: admissionNoncoreJsEnabled(),
+  }).length !== 1) {
     return {
       ok: false, tier: 'T7', coreFieldMask, failures: [],
-      reason: '未通过 survey 初筛（HTTPS/无JS/纯GET或POST搜索/非听书/含 bookList+content）',
+      reason: '未通过 survey 初筛（HTTPS/无JS/纯GET或POST搜索/文本源/含 bookList+content）',
     };
   }
   const failures: AdmissionCompile['failures'] = [];
