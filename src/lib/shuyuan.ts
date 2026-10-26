@@ -251,6 +251,18 @@ export function downloadPoolIncludesPhoenixOk(env: Record<string, string | undef
   return raw === '1' || raw === 'true' || raw === 'on';
 }
 
+/**
+ * runner 准入轮是否仍给 ok 结论打 phoenix_ok: 前缀（admgate1026）。2026-10 起 web 与确认轮都在 phoenix 本机，
+ * 「phoenix 探 ok、等 Vercel 出网再确认」这道门已无意义，只让新源晚 20h 入池，默认关：runner 直接写干净 ok。
+ * 显式 1/true/on 才回旧行为（回滚开关）。关闭后 admchurn42 的「runner 跳过在池 ok 行」也随之不生效——
+ * 那条过滤防的是前缀把在池行降级，不打前缀就没有降级，在池行复核照常（首败记 strike、不出池）。
+ * 存量 phoenix_ok: 行无需清库：class 1 到期后被 runner 复测，ok 即洗白进池；成人源本就不进评估环、也不进池。
+ */
+export function admissionRunnerPhoenixOkPrefix(env: Record<string, string | undefined> = process.env): boolean {
+  const raw = env.ADMISSION_RUNNER_PHOENIX_OK?.trim().toLowerCase();
+  return raw === '1' || raw === 'true' || raw === 'on';
+}
+
 /** M2-3 波次开关（m2-scaleout §6.1）：池上限默认 4（放量前与既有 slice(0,4) 逐字相同）。 */
 export const DEFAULT_READING_POOL_LIMIT = 4;
 
@@ -1849,6 +1861,8 @@ export type AdmissionRoundSummary =
   | {
     sources: number; candidates: number; surveyRejectedExisting: number; compileOk: number;
     compileRejected: number; probed: number; written: number;
+    /** probecircuit1026：只在本轮熔断时出现（未熔断时摘要形状不变）。 */
+    circuitOpen?: true; suppressedConnFail?: number;
   };
 
 /**
@@ -1927,8 +1941,9 @@ export async function runAdmissionRound(parentSignal?: AbortSignal): Promise<Adm
  * phoenix runner 准入轮（admrunner42，scripts/shuyuan-refresh/entry.ts `--admission` 调用）。
  * 与 runAdmissionRound 同一条流水（租约 → 读 shuyuan_sources → admitRows → 写 source_admission），差别只在：
  * - 预算由调用方给（runner 单元 WATCHDOG_MS 兜底），租约 TTL 走 env ADMISSION_LEASE_TTL_MS（≥ 预算）；
- * - ok 结论带 ADMISSION_PHOENIX_OK_PREFIX（池外待 Vercel 确认，见 admission.ts 常量注释）；
- * - **不**发布源池产物（phoenix 的 pool-artifact timer 每 30 分钟自会生成，且 phoenix_ok: 行本就不入池）。
+ * - ok 结论默认写干净 ok、直接入池（admgate1026）；ADMISSION_RUNNER_PHOENIX_OK=1 时回旧行为带
+ *   ADMISSION_PHOENIX_OK_PREFIX（池外待确认，见 admission.ts 常量注释与 admissionRunnerPhoenixOkPrefix）；
+ * - **不**发布源池产物（phoenix 的 pool-artifact timer 每 30 分钟自会生成）。
  * admitRows 尾部的 refreshSupportedHosts 在 runner 进程里只刷本进程内存（无消费者），无害、语义不改。
  */
 export async function runAdmissionRunnerRound(budgetMs: number): Promise<AdmissionRoundSummary> {
@@ -1940,7 +1955,8 @@ export async function runAdmissionRunnerRound(budgetMs: number): Promise<Admissi
     const stored = await readRows<{ source_url: string; source: Record<string, unknown> }>(s, s`
       SELECT source_url, source FROM shuyuan_sources ORDER BY id`, budget.signal);
     const rows = stored.map((row) => ({ url: row.source_url, source: row.source }));
-    const summary = await admitRows(s, rows, budget, budget.signal, { okPrefix: ADMISSION_PHOENIX_OK_PREFIX }, lease);
+    const okPrefix = admissionRunnerPhoenixOkPrefix() ? { okPrefix: ADMISSION_PHOENIX_OK_PREFIX } : {};
+    const summary = await admitRows(s, rows, budget, budget.signal, okPrefix, lease);
     if (budget.signal.aborted) return { skipped: 'failed' };
     console.log('shuyuan admission round', { ...summary, trigger: 'runner', artifact: 'skipped', remainingMs: budget.remainingMs });
     return summary;
@@ -2029,6 +2045,7 @@ async function admitRows(
       compileRejected: result.compileRejected,
       grandfathered: result.grandfathered,
       probed: result.probed,
+      ...(result.circuitOpen ? { circuitOpen: true, suppressedConnFail: result.suppressedConnFail, verdicts: result.verdicts } : {}),
     });
     const write = await writeAdmissionRows(s, result.rows, handle, sourceSnapshots, signal);
     if ('skipped' in write) return write;
@@ -2036,6 +2053,7 @@ async function admitRows(
       sources: rows.length, candidates: candidates.length, surveyRejectedExisting: frozen.length,
       compileOk: result.compileOk, compileRejected: result.compileRejected, probed: result.probed,
       written: write.written,
+      ...(result.circuitOpen ? { circuitOpen: true as const, suppressedConnFail: result.suppressedConnFail } : {}),
     };
   } catch (error) {
     // 准入失败只影响本轮准入（§6.3）：该批 next round 重来，刷新本身已成功。

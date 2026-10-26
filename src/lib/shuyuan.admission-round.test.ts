@@ -45,7 +45,7 @@ vi.mock('@/lib/db', () => ({ ensureSchema, getSql }));
 
 import {
   ADMISSION_LEASE_ROW, ADMISSION_LEASE_TTL_MS, ADMISSION_ROUND_BUDGET_MS, REFRESH_BUDGET_MS,
-  admissionLeaseTtlMs, admissionOwnCronEnabled, refreshShuyuan, runAdmissionRound, runAdmissionRunnerRound,
+  admissionLeaseTtlMs, admissionOwnCronEnabled, admissionRunnerPhoenixOkPrefix, refreshShuyuan, runAdmissionRound, runAdmissionRunnerRound,
 } from './shuyuan';
 import { ADMISSION_PHOENIX_OK_PREFIX, ADMISSION_PROBE_WORST_MS, rulesHash } from './rule-engine/admission';
 import * as poolArtifact from './pool-artifact';
@@ -181,6 +181,7 @@ describe('runAdmissionRunnerRound（phoenix runner）', () => {
 
   it('ok 站写 phoenix_ok: 前缀、死站写真实 verdict；不发布产物；记 admission 成功行', async () => {
     vi.useFakeTimers();
+    vi.stubEnv('ADMISSION_RUNNER_PHOENIX_OK', '1'); // admgate1026：旧行为只在回滚开关下保留
     vi.stubEnv('ADMISSION_MAX_PROBES', '2');
     vi.stubEnv('SHUYUAN_POOL_ARTIFACT', '1');
     vi.stubEnv('SHUYUAN_POOL_ARTIFACT_PATH', 'D:/nonexistent/pool.json');
@@ -259,8 +260,9 @@ describe('runAdmissionRunnerRound（phoenix runner）', () => {
     engine_semantics_version: 1, host: new URL(url).hostname, error, compile_diagnostics: [],
   });
 
-  it('admchurn42：在池 ok 行（干净/可疑）不进 runner 评估环；phoenix_ok: 与未测行照旧', async () => {
+  it('admchurn42（回滚开关 ADMISSION_RUNNER_PHOENIX_OK=1）：在池 ok 行不进 runner 评估环；phoenix_ok: 与未测行照旧', async () => {
     vi.useFakeTimers();
+    vi.stubEnv('ADMISSION_RUNNER_PHOENIX_OK', '1');
     vi.stubEnv('ADMISSION_MAX_PROBES', '4');
     stored = [
       { source_url: 'https://dead0.example/', source: deadSource(0) },
@@ -290,6 +292,69 @@ describe('runAdmissionRunnerRound（phoenix runner）', () => {
     const insert = queries().find((query) => query.text.includes('INSERT INTO source_admission'))!;
     const rows = JSON.parse(insert.values[2] as string) as { source_url: string }[];
     expect(rows.map((row) => row.source_url).sort()).toEqual(['https://dead2.example/', 'https://dead3.example/']);
+  });
+
+  // admgate1026：默认（未设 ADMISSION_RUNNER_PHOENIX_OK）runner 直接写干净 ok 并评估在池 ok 行——
+  // 2026-10-26 实测 phoenix_ok: 待确认 89 行里 21 行孤儿、确认腿长期 probed=0，闸门只在制造积压。
+  it('admgate1026 默认：ok 站写干净 ok（error 空）、死站写真实 verdict', async () => {
+    vi.useFakeTimers();
+    vi.stubEnv('ADMISSION_MAX_PROBES', '2');
+    stored = [
+      { source_url: 'https://dead0.example/', source: deadSource(0) },
+      { source_url: 'https://dead1.example/', source: deadSource(1) },
+    ];
+    fetchMock.mockImplementation((input, options) => {
+      const url = String(input);
+      if (!SEARCH.test(url)) return Promise.reject(new Error(`Unexpected network request: ${url}`));
+      if (url.startsWith('https://dead0.')) return Promise.resolve(okResponse(input));
+      return new Promise<Response>((_resolve, reject) => {
+        options!.signal!.addEventListener('abort', () => reject(options!.signal!.reason), { once: true });
+      });
+    });
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    const settled = runAdmissionRunnerRound(120_000);
+    await vi.advanceTimersByTimeAsync(120_000 + 60_000);
+    const summary = await settled;
+    vi.useRealTimers();
+    expect(summary).toMatchObject({ sources: 2, candidates: 2, probed: 2, written: 2 });
+    const insert = queries().find((query) => query.text.includes('INSERT INTO source_admission'))!;
+    const rows = JSON.parse(insert.values[2] as string) as { source_url: string; search_ok: boolean | null; search_verdict: string; error: string }[];
+    const byUrl = Object.fromEntries(rows.map((row) => [row.source_url, row]));
+    expect(byUrl['https://dead0.example/']).toMatchObject({ search_ok: true, search_verdict: 'ok', error: '' });
+    expect(byUrl['https://dead1.example/']).toMatchObject({ search_ok: false, search_verdict: 'conn_fail' });
+  });
+
+  it('admgate1026 默认：在池 ok 行（rules 变更后）照旧进 runner 评估环', async () => {
+    vi.useFakeTimers();
+    vi.stubEnv('ADMISSION_MAX_PROBES', '4');
+    stored = [
+      { source_url: 'https://dead0.example/', source: deadSource(0) },
+      { source_url: 'https://dead1.example/', source: deadSource(1) },
+    ];
+    admissionExisting = [
+      inPoolRow('https://dead0.example/', ''),
+      inPoolRow('https://dead1.example/', 'recheck_fail:1'),
+    ];
+    fetchMock.mockImplementation((input) => {
+      const url = String(input);
+      if (!SEARCH.test(url)) return Promise.reject(new Error(`Unexpected network request: ${url}`));
+      return Promise.resolve(okResponse(input));
+    });
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    const settled = runAdmissionRunnerRound(120_000);
+    await vi.advanceTimersByTimeAsync(120_000 + 60_000);
+    const summary = await settled;
+    vi.useRealTimers();
+    expect(summary).toMatchObject({ sources: 2, candidates: 2, probed: 2, written: 2 });
+    const insert = queries().find((query) => query.text.includes('INSERT INTO source_admission'))!;
+    const rows = JSON.parse(insert.values[2] as string) as { source_url: string; error: string }[];
+    expect(rows.every((row) => !row.error.startsWith(ADMISSION_PHOENIX_OK_PREFIX))).toBe(true);
+  });
+
+  it.each([
+    [undefined, false], ['', false], ['0', false], ['false', false], ['1', true], ['true', true], ['ON', true],
+  ] as const)('admissionRunnerPhoenixOkPrefix(%j) = %s', (value, expected) => {
+    expect(admissionRunnerPhoenixOkPrefix(value === undefined ? {} : { ADMISSION_RUNNER_PHOENIX_OK: value })).toBe(expected);
   });
 
   it('admchurn42：Vercel 独立轮不受影响——在池 ok 行 rules 变更后照旧评估改判', async () => {

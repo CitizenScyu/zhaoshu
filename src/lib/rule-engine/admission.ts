@@ -335,6 +335,16 @@ export const QUERY_INSENSITIVE_OVERLAP = 0.8;
  */
 export const ADMISSION_PROBE_WORST_MS = 2 * ADMISSION_TIMEOUT_MS + ADMISSION_THROTTLE_MS;
 
+/**
+ * 探测侧熔断（probecircuit1026）：一轮里大面积 conn_fail 多半是探测端出网故障，不是源同时死了。
+ * 2026-10-25 10:00–14:00 CST 实证：探测端故障期间 531 行被记 conn_fail（超时 + fetch failed，319 host），
+ * 每行再等 7 天退避才复测。判据只数「上一次不是 conn_fail」的探测——复测已知死站的轮次本来就满是
+ * conn_fail，不能让它们触发熔断。熔断后本轮 conn_fail 结论按「没轮到」处理（有占位写占位、否则不写），
+ * 旧结论原样保留、下一轮照旧到期重探；其它 verdict 照常写。
+ */
+export const ADMISSION_CIRCUIT_MIN_PROBES = 20;
+export const ADMISSION_CIRCUIT_CONN_FAIL_RATIO = 0.6;
+
 // CHALLENGE_MARKERS 口径对齐 probe-reachability.py:33。cloudflare 字样过宽（正常经 CF CDN
 // 的页面 meta 也可能有），单列 weak；403 保留状态拒绝，503 需强标记才判质询，否则按临时5xx退避。
 const CHALLENGE_MARKERS = [
@@ -923,6 +933,10 @@ export interface AdmissionBatchResult {
   verdicts: Record<string, number>;
   /** N03 祖父条款命中数（新校验下本会拒、因「规则未变 ∧ 已在池」维持既有资格的源）。 */
   grandfathered: number;
+  /** probecircuit1026：本轮 conn_fail 比例触发探测侧熔断。 */
+  circuitOpen: boolean;
+  /** 熔断时按「没轮到」处理、未写 conn_fail 结论的探测数（未熔断恒 0）。 */
+  suppressedConnFail: number;
 }
 
 function hostOf(url: string): string {
@@ -1298,6 +1312,8 @@ export async function runAdmissionBatch(input: AdmissionBatchInput): Promise<Adm
   // inflightHosts:当前在飞的目标站(mutexHost,同站互斥);claimed:已处理的候选(已起探,或判否后写了占位)。
   const inflightHosts = new Set<string>();
   const claimed = new Array<boolean>(probes.length).fill(false);
+  // probecircuit1026：本轮真探过的 probes 下标 → 原始 verdict（recheckOutcome 改写前）。
+  const probedVerdicts = new Map<number, string>();
   let remaining = probes.length;
   // 被 host 挡住的 worker 在此等待「任一探测完成」再重扫(全部被挡才等,否则跳过继续找)。
   const waiters: (() => void)[] = [];
@@ -1342,6 +1358,7 @@ export async function runAdmissionBatch(input: AdmissionBatchInput): Promise<Adm
           canRetryKeyword: () => canProbe() && !input.signal.aborted,
         });
         verdicts[result.verdict] = (verdicts[result.verdict] ?? 0) + 1;
+        probedVerdicts.set(pick, result.verdict);
         // 41-B2-OK-RECHECK:写库结论走 recheckOutcome——干净 ok 行首次复核失败记 strike 不出池。
         // 必须用 item.previous:worker 是独立函数,闭包拿不到外层循环的 previous。
         const outcome = recheckOutcome(item.previous, result);
@@ -1379,7 +1396,26 @@ export async function runAdmissionBatch(input: AdmissionBatchInput): Promise<Adm
   }
   await Promise.all(Array.from({ length: Math.min(concurrency, probes.length) }, () => probeWorker()));
 
+  // probecircuit1026：熔断判定在汇总前，只改本轮真探出 conn_fail 的槽。
+  let considered = 0;
+  let consideredConnFail = 0;
+  for (const [pick, verdict] of probedVerdicts) {
+    if (probes[pick].previous?.search_verdict === 'conn_fail') continue;
+    considered += 1;
+    if (verdict === 'conn_fail') consideredConnFail += 1;
+  }
+  const circuitOpen = considered >= ADMISSION_CIRCUIT_MIN_PROBES
+    && consideredConnFail / considered >= ADMISSION_CIRCUIT_CONN_FAIL_RATIO;
+  let suppressedConnFail = 0;
+  if (circuitOpen) {
+    for (const [pick, verdict] of probedVerdicts) {
+      if (verdict !== 'conn_fail') continue;
+      results[probes[pick].index] = probes[pick].placeholder;
+      suppressedConnFail += 1;
+    }
+  }
+
   // 汇总:按计划顺序输出(先落槽后汇总 ⇒ 与完成先后无关;undefined 槽即本批无行)。
   for (const row of results) if (row !== undefined) rows.push(row);
-  return { rows, compileOk, compileRejected, probed, verdicts, grandfathered };
+  return { rows, compileOk, compileRejected, probed, verdicts, grandfathered, circuitOpen, suppressedConnFail };
 }
