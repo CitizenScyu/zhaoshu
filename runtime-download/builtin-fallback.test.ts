@@ -330,6 +330,32 @@ describe('41-T8FB builtin-fallback', () => {
     expect(calls).toEqual(['book15.net', 'a.example']);
   });
 
+  // paywall1026：原源 host 在 PAYWALL_HOSTS ⇒ 预检与下载腿都不碰原源，零出网直接走引擎回退。
+  it('paywall1026：原源是付费墙 host ⇒ 预检不调原源、下载腿不抓预览，直接引擎回退', async () => {
+    const h = harness({ pool: ['https://a.example/', 'https://b.example/'] });
+    const paywalled = task({ source_url: 'https://book.qq.com/book-detail/1' });
+    let innerCalls = 0;
+    const precheck = h.fallback.wrapPrecheck(async () => { innerCalls += 1; return { ok: true, reason: 'ok' } as PrecheckResult; });
+    expect(await precheck(paywalled, signal())).toEqual({ ok: true, reason: 'builtin_engine_fallback' });
+    expect(innerCalls).toBe(0);
+    const calls: string[] = [];
+    const out = await h.fallback.wrapAdapter(adapter({}, calls), adapter({ 'a.example': {
+      kind: 'complete', txt: 'x', chaptersTotal: 1, chaptersDone: 1, charsTotal: 1,
+    } }, calls)).download(paywalled, context());
+    expect(out.kind).toBe('complete');
+    expect(calls).toEqual(['a.example']);
+  });
+
+  it('paywall1026：无预检直接下载时同样跳过付费墙原源', async () => {
+    const h = harness({ pool: ['https://a.example/'] });
+    const calls: string[] = [];
+    const out = await h.fallback.wrapAdapter(adapter({}, calls), adapter({ 'a.example': {
+      kind: 'complete', txt: 'x', chaptersTotal: 1, chaptersDone: 1, charsTotal: 1,
+    } }, calls)).download(task({ source_url: 'https://ubook.reader.qq.com/x' }), context());
+    expect(out.kind).toBe('complete');
+    expect(calls).toEqual(['a.example']);
+  });
+
   it('vipwall42：引擎腿 preview_truncated ⇒ 标 temporary 失败记忆并换下一候选源', async () => {
     const state = {
       usable: [
