@@ -21,6 +21,8 @@ import {
 } from './evaluate';
 import { RuleEngineError, type FieldIr, type RuleDiagnostic } from './types';
 import { compileSource, engineSourceRevision } from './compile';
+import { engineSyntaxVarsEnabled } from './syntax-flags';
+import { resolveSourceVars } from './vars-subset';
 import { contentHtmlToText, contentNeedsHtmlToText } from './content-html';
 import { isStructuredChallengePage } from './content-challenge';
 
@@ -423,7 +425,8 @@ export function compileAdmission(source: RawSource): AdmissionCompile {
     };
   }
   const failures: AdmissionCompile['failures'] = [];
-  for (const [field, rule] of iterRulePairs(source)) {
+  // vars1027：与 compileSource 同一改写（剥 @put、详情页 init put → 整条 @get 内联），开关关时原样。
+  for (const [field, rule] of iterRulePairs(engineSyntaxVarsEnabled() ? resolveSourceVars(source) : source)) {
     if (!(field in coreFieldMask)) continue;
     try {
       parseFieldRule(rule);
@@ -693,7 +696,7 @@ function searchCandidateUrls(source: RawSource, text: string, pageUrl: string): 
 
 /** 同 searchCandidateUrls，带上书名（read1027 可读性影子腿按书名挑样本书）。url 为字段求值结果（@href 已绝对化，JSON 值可能仍是相对路径）。 */
 function searchCandidates(source: RawSource, text: string, pageUrl: string): { title: string; url: string }[] {
-  const rules = source.ruleSearch;
+  const rules = (engineSyntaxVarsEnabled() ? resolveSourceVars(source) : source).ruleSearch;
   if (!rules || typeof rules !== 'object') return [];
   const bookList = (rules as Record<string, unknown>).bookList;
   const name = (rules as Record<string, unknown>).name;

@@ -7,11 +7,17 @@ import { sourceRevision } from '@/lib/source-revision';
 import { parseFieldRule, type ParseOptions } from './parse';
 import type { CompiledRules } from './types';
 import {
-  engineSemanticsVersion, engineSyntaxOrEnabled, engineSyntaxXPathEnabled, ENGINE_SEMANTICS_VERSION,
+  engineSemanticsVersion, engineSyntaxOrEnabled, engineSyntaxVarsEnabled, engineSyntaxXPathEnabled, ENGINE_SEMANTICS_VERSION,
 } from './syntax-flags';
+import { resolveSourceVars, ruleMayUseVars } from './vars-subset';
 import { ruleMayUseXPath } from './xpath-subset';
 
 export { ENGINE_SEMANTICS_VERSION };
+
+/** 编译选项：parse 层两开关 + 源级改写开关（vars1027，ENGINE_SYNTAX_VARS，默认读 env）。 */
+export interface CompileOptions extends ParseOptions {
+  varsEnabled?: boolean;
+}
 
 /** 版本化缓存键（P0 口径）：semanticsVersion:contentRevision。 */
 export function engineVersionedKey(contentRevision: string, semanticsVersion = ENGINE_SEMANTICS_VERSION): string {
@@ -22,16 +28,19 @@ export function engineVersionedKey(contentRevision: string, semanticsVersion = E
  * 内容 identity 与引擎语义 identity 的唯一组合口径（语义版本随 || 开关联动，P1a）。
  * orsrc1027：语义版本按源判定——开关 on 且规则组里出现 `||` 的源才是版本 2，其余源恒为 1。
  * xpath1027：同理，ENGINE_SYNTAX_XPATH on 且规则组可能含 XPath 段的源再加 XPath 位（3/4），其余源不变。
+ * vars1027：ENGINE_SYNTAX_VARS on 且规则组含 @put/@get 的源再加变量位（5–8）。
  */
 export function engineSourceRevision(
   source: { url: string; searchUrl: unknown; rules: Record<string, unknown> },
-  options: ParseOptions = {},
+  options: CompileOptions = {},
 ): string {
   const orEnabled = options.orEnabled ?? engineSyntaxOrEnabled();
   const xpathEnabled = options.xpathEnabled ?? engineSyntaxXPathEnabled();
+  const varsEnabled = options.varsEnabled ?? engineSyntaxVarsEnabled();
   return engineVersionedKey(sourceRevision(source), engineSemanticsVersion(
     orEnabled && sourceUsesOrSyntax(source.rules),
     xpathEnabled && sourceUsesXPathSyntax(source.rules),
+    varsEnabled && sourceUsesVarSyntax(source.rules),
   ));
 }
 
@@ -63,6 +72,11 @@ export function sourceUsesXPathSyntax(rules: Record<string, unknown>): boolean {
   return someRule(rules, ruleMayUseXPath);
 }
 
+/** 源的规则组里是否有 @put/@get（vars1027；不涉及变量的源 resolveSourceVars 原样返回，identity 不该变）。 */
+export function sourceUsesVarSyntax(rules: Record<string, unknown>): boolean {
+  return someRule(rules, ruleMayUseVars);
+}
+
 /** LRU 上限：单测/低并发下足够；无关热路径，只防规则对象无限积累。 */
 const CACHE_LIMIT = 64;
 const cache = new Map<string, CompiledRules>();
@@ -71,16 +85,18 @@ const cache = new Map<string, CompiledRules>();
  * 把一个源的规则原文编译成 `字段全名 → FieldIr`（设计 §7.1）。
  * 单字段编译失败（RULE_UNSUPPORTED）不抛出，标 `skipped:'unsupported'`——核心/装饰字段的
  * 阻断语义由准入（滤网 1）与字段层（§3.4）决定，此处只做无异常的物化。
- * `orEnabled`（默认读 ENGINE_SYNTAX_OR，off）/`xpathEnabled`（默认读 ENGINE_SYNTAX_XPATH，off）逐次求值：
+ * `orEnabled`（默认读 ENGINE_SYNTAX_OR，off）/`xpathEnabled`（默认读 ENGINE_SYNTAX_XPATH，off）/
+ * `varsEnabled`（默认读 ENGINE_SYNTAX_VARS，off；on 时先 resolveSourceVars 改写再逐字段编译）逐次求值：
  * 切换开关会换缓存键，各态编译产物在同一进程内共存互不污染。
  */
 export function compileSource(
   source: { url: string; searchUrl: unknown; rules: Record<string, unknown> },
-  options: ParseOptions = {},
+  options: CompileOptions = {},
 ): CompiledRules {
   const orEnabled = options.orEnabled ?? engineSyntaxOrEnabled();
   const xpathEnabled = options.xpathEnabled ?? engineSyntaxXPathEnabled();
-  const key = engineSourceRevision(source, { orEnabled, xpathEnabled });
+  const varsEnabled = options.varsEnabled ?? engineSyntaxVarsEnabled();
+  const key = engineSourceRevision(source, { orEnabled, xpathEnabled, varsEnabled });
   const hit = cache.get(key);
   if (hit) {
     cache.delete(key); // 触达即续期（Map 插入序 = LRU 序）
@@ -88,8 +104,9 @@ export function compileSource(
     return hit;
   }
   const compiled: CompiledRules = new Map();
+  const sourceRules = varsEnabled ? resolveSourceVars(source.rules) : source.rules;
   for (const group of RULE_GROUPS) {
-    const rules = source.rules[group];
+    const rules = sourceRules[group];
     if (!rules || typeof rules !== 'object' || Array.isArray(rules)) continue;
     for (const [field, rule] of Object.entries(rules as Record<string, unknown>)) {
       if (typeof rule !== 'string' || !rule.trim()) continue;

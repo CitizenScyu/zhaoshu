@@ -20,9 +20,13 @@ export const ENGINE_SEMANTICS_VERSION_OR = 2;
  */
 export const ENGINE_SEMANTICS_XPATH_BIT = 2;
 
-/** 语义版本随 || / XPath 开关联动（唯一口径，供 compile.ts 缓存键与 rulesHash 复用）。 */
-export function engineSemanticsVersion(orEnabled: boolean, xpathEnabled = false): number {
-  return (orEnabled ? ENGINE_SEMANTICS_VERSION_OR : ENGINE_SEMANTICS_VERSION) + (xpathEnabled ? ENGINE_SEMANTICS_XPATH_BIT : 0);
+/** vars1027：@put/@get 静态子集语义位。版本再 +4（5–8 = 含变量位的四种组合），1–4 逐字不变。 */
+export const ENGINE_SEMANTICS_VARS_BIT = 4;
+
+/** 语义版本随 || / XPath / 变量开关联动（唯一口径，供 compile.ts 缓存键与 rulesHash 复用）。 */
+export function engineSemanticsVersion(orEnabled: boolean, xpathEnabled = false, varsEnabled = false): number {
+  return (orEnabled ? ENGINE_SEMANTICS_VERSION_OR : ENGINE_SEMANTICS_VERSION)
+    + (xpathEnabled ? ENGINE_SEMANTICS_XPATH_BIT : 0) + (varsEnabled ? ENGINE_SEMANTICS_VARS_BIT : 0);
 }
 
 /**
@@ -49,5 +53,14 @@ export function engineSyntaxOrEnabled(env: OrEnv = process.env): boolean {
  */
 export function engineSyntaxXPathEnabled(env: OrEnv = process.env): boolean {
   const raw = env.ENGINE_SYNTAX_XPATH?.trim().toLowerCase();
+  return raw === '1' || raw === 'true' || raw === 'on';
+}
+
+/**
+ * ENGINE_SYNTAX_VARS 独立开关（vars1027，默认 off，口径同 ENGINE_SYNTAX_OR）。
+ * on = 编译前剥 @put、详情页内 init put → 同组整条 @get 内联（vars-subset.ts）；残留 @get 照旧拒。off = 逐字不变。
+ */
+export function engineSyntaxVarsEnabled(env: OrEnv = process.env): boolean {
+  const raw = env.ENGINE_SYNTAX_VARS?.trim().toLowerCase();
   return raw === '1' || raw === 'true' || raw === 'on';
 }
