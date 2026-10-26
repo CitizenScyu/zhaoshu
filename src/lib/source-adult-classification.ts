@@ -1,3 +1,5 @@
+import { stationKeyOfHost } from './source-policy';
+
 export type SourceAdultClassification = 'adult' | 'unmarked' | 'invalid';
 
 const ADULT_PHRASE = /成人(?:小说|文学|书源|内容|专区)/;
@@ -9,6 +11,8 @@ const ADULT_SITE_PHRASE = /肉文屋|肉色屋|肉书屋|肉肉屋|肉宅屋|御
 // adult1026：站名被改成正常名（如「笔趣阁#58」「安月书屋」「PO文学🎃」）但域名仍是成人站（生产池 2026-10-26 实测）。
 // 按 hostname 标签内子串匹配；只收成人站专有拼音/品牌，不收 xiaoshuo/shuwu 这类泛词。
 const ADULT_HOST_TOKEN = /rouzhaiwu|yuzhaiwu|rouwen|roushuwu|powenwu|powenxue|pofans|po18|18jinshu|shibashuwu|xoxiaoshuo|yiyechunxiao|yuwangshe|haitangshuwu/i;
+// adultbl1026：域名无专有拼音、靠 token 抓不到的成人站，按站键（www./m. 剥净，含子域）拉黑。2026-10-26 用户确认名单。
+const ADULT_STATION_KEYS: ReadonlySet<string> = new Set(['lulushu18.com', 'dfu7.com', 'blpopo.com', 'jubu.cc']);
 // bookSourceComment 里「同站：<站名/网址>」声明的是同一个站的别名：别名命中成人站名或成人域名即同判。
 // 只看「同站」之后的一段，不扫整段注释（注释里常有免责声明、作者群号等无关文字）。
 const SAME_SITE_NOTE = /同站[:：\s]*([^\n]{0,120})/g;
@@ -20,7 +24,15 @@ function hostOfSourceUrl(value: unknown): string {
 
 /** 域名本身是成人站（不看元数据）。供池侧按 host 判定与测试复用。 */
 export function isAdultSiteHost(hostname: string): boolean {
-  return hostname !== '' && ADULT_HOST_TOKEN.test(hostname);
+  return hostname !== '' && (ADULT_HOST_TOKEN.test(hostname) || onAdultStation(stationKeyOfHost(hostname)));
+}
+
+/** 站键等于黑名单站或是其子域（api.blpopo.com 命中；xdfu7.com / jubu.cc.cn 不命中）。 */
+function onAdultStation(key: string): boolean {
+  for (const station of ADULT_STATION_KEYS) {
+    if (key === station || key.endsWith(`.${station}`)) return true;
+  }
+  return false;
 }
 
 function sameSiteNoteIsAdult(comment: unknown): boolean {

@@ -1208,7 +1208,8 @@ describe('refreshShuyuan atomic refresh', () => {
 
     it.each(['database', 'artifact'] as const)('共用引擎池在%s取行后剔除成人/损坏元数据，普通规则原样保留', async (mode) => {
       vi.stubEnv('SHUYUAN_READ_CACHE_TTL_MS', '0');
-      refreshSupportedHosts(['ordinary.example', 'adult.example', 'invalid.example', 'm.rouzhaiwu.info', 'www.adult.example']);
+      refreshSupportedHosts(['ordinary.example', 'adult.example', 'invalid.example', 'm.rouzhaiwu.info', 'www.adult.example',
+        'm.lulushu18.com', 'book.qq.com']);
       fetchMock.mockImplementation(async () => { throw new Error('Unexpected synthetic network call'); });
       const ordinary = Object.freeze({ ...engineItem,
         bookSourceName: '普通漫画听书外文', bookSourceGroup: null,
@@ -1225,6 +1226,11 @@ describe('refreshShuyuan atomic refresh', () => {
         // adult1026：站名正常、域名是成人站。
         engineRow({ source_url: 'https://m.rouzhaiwu.info/', name: '普通',
           source: { ...engineItem, bookSourceUrl: 'https://m.rouzhaiwu.info' } }),
+        // adultbl1026：站键精确黑名单（域名无成人拼音）。
+        engineRow({ source_url: 'https://m.lulushu18.com/', name: '普通',
+          source: { ...engineItem, bookSourceUrl: 'https://m.lulushu18.com' } }),
+        // paywall1026：付费墙 host 出换源池。
+        engineRow({ source_url: 'https://book.qq.com/', name: 'QQ阅读', source: engineItem }),
         engineRow({ source_url: 'https://invalid.example/', name: '🔞', source: { ...engineItem, bookSourceGroup: 7 } }),
         engineRow({ source_url: 'https://invalid.example/array', name: '普通', source: [] }),
         engineRow({ source_url: 'https://ordinary.example/disabled', name: '普通', source: ordinary, disabled_at: '2026-01-01' }),

@@ -60,6 +60,19 @@ describe('source adult metadata classification', () => {
     expect(isAdultSiteHost(new URL(bookSourceUrl.split(/[#,]/)[0]).hostname)).toBe(true);
   });
 
+  // adultbl1026：站键精确黑名单（www./m. 剥净后等于黑名单站或为其子域才命中，不按子串）。
+  it.each([
+    'https://m.lulushu18.com', 'https://lulushu18.com', 'https://dfu7.com', 'https://www.dfu7.com/',
+    'https://m.blpopo.com', 'https://api.blpopo.com', 'https://www.jubu.cc', 'https://www.m.jubu.cc',
+  ])('recognizes blacklisted stations: %s', (bookSourceUrl) => {
+    expect(classifySourceAdult('普通', { bookSourceUrl })).toBe('adult');
+  });
+
+  it.each(['https://m.lulushu18.com.example', 'https://xdfu7.com', 'https://jubu.cc.cn'])(
+    'blacklist is exact-station only: %s', (bookSourceUrl) => {
+      expect(classifySourceAdult('普通', { bookSourceUrl })).toBe('unmarked');
+    });
+
   it.each([
     'https://www.biquge7.xyz', 'https://m.lulushuwu.com', 'https://www.xiangtxsw.com', 'https://so.ihuaben.com',
     'https://www.sjks88.com', 'https://www.wanwx.com', 'https://www.mgyqw.com', 'https://m.shubl.com',

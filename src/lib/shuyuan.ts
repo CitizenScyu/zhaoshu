@@ -16,6 +16,7 @@ import {
 import { admissionNoncoreJsEnabled, enginePostSearchEnabled, selectCandidates, type RawSource } from '@/lib/rule-engine/compile-smoke';
 import { DEFAULT_SHUYUAN_READ_CACHE_TTL_MS, shuyuanReadCacheTtlMs } from '@/lib/read-cache-ttl';
 import { adultStationKeys, classifySourceAdult, type SourceAdultClassification } from '@/lib/source-adult-classification';
+import { isPaywallHost } from '@/lib/source-host-health';
 import {
   createPoolArtifact, currentPoolArtifact, noteLocalPoolWrite, poolArtifactEnabled, resetPoolArtifactMemo,
   writePoolArtifactFile, type PoolArtifact, type PoolArtifactEngineRow, type PoolArtifactSourceRow,
@@ -643,6 +644,8 @@ async function engineReadingSources(
   return rows
     .filter((row) => classifySourceAdult(row.name, row.source) === 'unmarked'
       && !adultStations.has(stationKeyOfUrl(row.source_url))
+      // paywall1026：付费墙 host 搜索恒命中、正文只有 VIP 预览——下载侧早已全局排除，换源池同口径出池。
+      && !isPaywallHost(hostOfUrl(upgradeSourceTemplateUrl(row.source_url)))
       && canProbe(upgradeSourceTemplateUrl(row.source_url)) && !row.disabled_at && isRecord(row.source)
       && row.source.enabled !== false && states.get(row.source_url)?.status !== 'failed'
       && (upgradeSourceTemplateUrl(row.source_url) === row.source_url
