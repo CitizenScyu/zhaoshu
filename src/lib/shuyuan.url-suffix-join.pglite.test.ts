@@ -149,11 +149,11 @@ maybe('urlfix URL 形态分裂 JOIN（PGlite 真库）', () => {
 
   // c3b 同 host 新旧条目并存（旧形态那条也在表）：只有精确键那份进池，旧形态那份不借别家结论。
   it('c3b) 同 host 新旧条目并存：只有精确键那份进池，旧形态那份不借别家结论', async () => {
-    await seedSource('https://mm.xyuzhaiwu.xyz/#🚀'); // 条目 B（带后缀形态）
-    await seedSource('https://mm.xyuzhaiwu.xyz');     // 条目 A（无后缀）
-    await seedAdmission('https://mm.xyuzhaiwu.xyz');   // 供判行属条目 A（精确键仍在表）
+    await seedSource('https://mm.suffixjoin.example/#🚀'); // 条目 B（带后缀形态）
+    await seedSource('https://mm.suffixjoin.example');     // 条目 A（无后缀）
+    await seedAdmission('https://mm.suffixjoin.example');   // 供判行属条目 A（精确键仍在表）
     openGate();
-    expect(await poolUrls()).toEqual(['https://mm.xyuzhaiwu.xyz/']);
+    expect(await poolUrls()).toEqual(['https://mm.suffixjoin.example/']);
   });
 
   // c4 host 门：真孤儿不放行；形态分裂同条目旧形态放行（救回，与 c2 同口径）；精确在池放行。
