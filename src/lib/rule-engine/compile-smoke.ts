@@ -4,7 +4,7 @@
 
 import { upgradeSourceTemplateUrl } from '@/lib/source-policy';
 import { searchOptionsConstructible } from '@/lib/source-parser';
-import { parseFieldRule } from './parse';
+import { parseFieldRule, type ParseOptions } from './parse';
 import { RuleEngineError, type RuleDiagnostic } from './types';
 
 // survey.py CORE_FIELDS（阅读路径必需字段）
@@ -145,7 +145,7 @@ export interface CompileResult {
 }
 
 /** 对一个源的核心字段跑 parseFieldRule；任一核心字段 RULE_UNSUPPORTED → ok=false。 */
-export function compileCoreFields(src: RawSource, options: { orEnabled?: boolean } = {}): CompileResult {
+export function compileCoreFields(src: RawSource, options: ParseOptions = {}): CompileResult {
   const core: Record<string, string> = {};
   const coreSet = new Set<string>(CORE_FIELDS);
   for (const [field, rule] of iterRulePairs(src)) {
@@ -157,10 +157,11 @@ export function compileCoreFields(src: RawSource, options: { orEnabled?: boolean
 /**
  * 对「字段名→规则文本」映射（核心字段冻结 fixture smoke-174.json 的 coreRules）跑编译。
  * 任一核心字段 RULE_UNSUPPORTED → ok=false。
- * `orEnabled`（P1a，默认 off）透传 parseFieldRule：on 态顶层 || 编译成 OrNode。
+ * `orEnabled`（P1a，默认 off）/`xpathEnabled`（xpath1027，默认 off）透传 parseFieldRule：on 态顶层 || 编译成 OrNode、
+ * 简单子集 XPath 翻成 CSS。
  */
 export function compileCoreFieldsFromRules(
-  coreRules: Record<string, string>, options: { orEnabled?: boolean } = {},
+  coreRules: Record<string, string>, options: ParseOptions = {},
 ): CompileResult {
   const failures: CompileResult['failures'] = [];
   for (const [field, rule] of Object.entries(coreRules)) {

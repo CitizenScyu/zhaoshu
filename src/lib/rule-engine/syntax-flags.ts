@@ -14,9 +14,15 @@ export const ENGINE_SEMANTICS_VERSION = 1;
 /** P1a || 组合语义版本：开关 on 时启用，缓存/准入 identity 按此版本失效。 */
 export const ENGINE_SEMANTICS_VERSION_OR = 2;
 
-/** 语义版本随 || 开关联动（唯一口径，供 compile.ts 缓存键与 rulesHash 复用）。 */
-export function engineSemanticsVersion(orEnabled: boolean): number {
-  return orEnabled ? ENGINE_SEMANTICS_VERSION_OR : ENGINE_SEMANTICS_VERSION;
+/**
+ * xpath1027：XPath 子集语义位。版本 = 1 + (|| ? 1 : 0) + (XPath ? 2 : 0)，即 1 基线 / 2 仅 || /
+ * 3 仅 XPath / 4 两者——既有 1/2 行逐字不变，四种组合互不撞号。
+ */
+export const ENGINE_SEMANTICS_XPATH_BIT = 2;
+
+/** 语义版本随 || / XPath 开关联动（唯一口径，供 compile.ts 缓存键与 rulesHash 复用）。 */
+export function engineSemanticsVersion(orEnabled: boolean, xpathEnabled = false): number {
+  return (orEnabled ? ENGINE_SEMANTICS_VERSION_OR : ENGINE_SEMANTICS_VERSION) + (xpathEnabled ? ENGINE_SEMANTICS_XPATH_BIT : 0);
 }
 
 /**
@@ -33,5 +39,15 @@ interface OrEnv {
 
 export function engineSyntaxOrEnabled(env: OrEnv = process.env): boolean {
   const raw = env.ENGINE_SYNTAX_OR?.trim().toLowerCase();
+  return raw === '1' || raw === 'true' || raw === 'on';
+}
+
+/**
+ * ENGINE_SYNTAX_XPATH 独立开关（xpath1027，默认 off，口径同 ENGINE_SYNTAX_OR）。
+ * on = 简单子集 XPath（逐级 / 与 //、属性等值/存在/contains 谓词、前置 [n] 下标、末尾 /text() 或 /@attr）
+ * 编译期翻成 CSS 选择器；子集外的 XPath 照旧 unsupported_xpath。off = 旧 parser 逐字不变。
+ */
+export function engineSyntaxXPathEnabled(env: OrEnv = process.env): boolean {
+  const raw = env.ENGINE_SYNTAX_XPATH?.trim().toLowerCase();
   return raw === '1' || raw === 'true' || raw === 'on';
 }

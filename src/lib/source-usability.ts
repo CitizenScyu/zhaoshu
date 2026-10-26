@@ -3,7 +3,7 @@
 // （41-swq 实测：sfacg 两条规则 searchUrl 指向门外的 m.sfacg.com，准入记 search_ok，运行时必拒）。
 import { compileSource } from './rule-engine/compile';
 import { enginePostSearchEnabled } from './rule-engine/compile-smoke';
-import { engineSyntaxOrEnabled } from './rule-engine/syntax-flags';
+import { engineSyntaxOrEnabled, engineSyntaxXPathEnabled } from './rule-engine/syntax-flags';
 import { buildSourceSearchRequest, sourceSearchUrl } from './source-parser';
 import { SourcePolicyError } from './source-policy';
 
@@ -47,15 +47,15 @@ export function missingEngineFields(source: RuleSource): string[] {
  * 必需字段编译结论按规则对象记忆（池合成每次请求都要筛全部准入源，≈180 条，超出 compileSource 的 64 条 LRU；
  * 规则对象来自 shuyuan 的读缓存，TTL 内是同一个对象）。语义开关变了就重算。
  */
-const rulesUsable = new WeakMap<object, { orEnabled: boolean; usable: boolean }>();
+const rulesUsable = new WeakMap<object, { flags: string; usable: boolean }>();
 
 /** 引擎源能否进取书池/扇出：搜索模板展得开且必需字段都编译得出。调用前 host 门须已刷新（门的结论不记忆）。 */
 export function engineSourceUsable(source: RuleSource): boolean {
   if (searchTemplateRejected(source, '书')) return false;
-  const orEnabled = engineSyntaxOrEnabled();
+  const flags = `${engineSyntaxOrEnabled()}:${engineSyntaxXPathEnabled()}`;
   const hit = rulesUsable.get(source.rules);
-  if (hit?.orEnabled === orEnabled) return hit.usable;
+  if (hit?.flags === flags) return hit.usable;
   const usable = missingEngineFields(source).length === 0;
-  rulesUsable.set(source.rules, { orEnabled, usable });
+  rulesUsable.set(source.rules, { flags, usable });
   return usable;
 }
