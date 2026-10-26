@@ -150,6 +150,10 @@ export function createBuiltinFallback(options: BuiltinFallbackOptions) {
   // （连续传输失败、10 分钟窗），退休是静态事实——不进「半开重试」节奏，第一次就跳过 builtin 腿，
   // 也不再为它做预检搜索（对退休 host 的每个请求都被拒，做了只是白等超时）。
   const builtinRetired = (task: TaskRow) => Boolean(m.supported.isRetiredBuiltinHost?.(hostOf(task.source_url)));
+  // paywall1026：原源是付费墙 host（PAYWALL_HOSTS）时同样零出网直接回退——预检必过（搜索恒命中），
+  // 下载腿必得 preview_truncated 再回退，白耗一次预检 + 一次整书预览抓取（2026-10-26 实测）。
+  const builtinPaywall = (task: TaskRow) => isPaywallHost(hostOf(task.source_url));
+  const skipOriginal = (task: TaskRow) => builtinSuspect(task) || builtinRetired(task) || builtinPaywall(task);
   // 共用选源器（B 线预取同款）：搜索/详情判据、host 去重、扫描上限、早停与预算计时都在 selector 内；
   // 选源日志（固定字段：taskId/scanned/candidates/hosts）也由 selector 统一记，本文件不重复记。
   const selector = createSourceSelector({
@@ -262,7 +266,7 @@ export function createBuiltinFallback(options: BuiltinFallbackOptions) {
         signal.throwIfAborted();
         let stage = 'search';
         let identityMissed = false;
-        if (sources === null && !builtinSuspect(task) && !builtinRetired(task)) {
+        if (sources === null && !skipOriginal(task)) {
           let result: PrecheckResult | null = null;
           try {
             result = await inner(task, signal);
@@ -349,7 +353,7 @@ export function createBuiltinFallback(options: BuiltinFallbackOptions) {
             sources = await recallSources(task);
             stop = stopped(context.signal);
             if (stop) return stop;
-            if (sources === null && !builtinSuspect(task) && !builtinRetired(task)) {
+            if (sources === null && !skipOriginal(task)) {
               primary = await (kind === 'engine' ? engine : builtin).download(task, context);
               stop = stopped(context.signal);
               if (stop) return stop;
