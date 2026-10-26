@@ -21,7 +21,6 @@ import {
 } from './evaluate';
 import { RuleEngineError, type RuleDiagnostic } from './types';
 import { engineSourceRevision } from './compile';
-import { engineSemanticsVersion, engineSyntaxOrEnabled } from './syntax-flags';
 
 // ---------------------------------------------------------------- 常量
 /**
@@ -973,21 +972,19 @@ export function rulesHash(source: unknown): string {
 }
 
 /**
- * 落库的 engine_semantics_version：必须与 rulesHash 的版本前缀同一口径
- * （engineSourceRevision → engineSemanticsVersion(engineSyntaxOrEnabled())，P1a off=1/on=2）。
- * P1a 开闸前置修复：此前三处落库写死常量 ENGINE_SEMANTICS_VERSION（恒 1），而 rulesHash
- * 在 ENGINE_SYNTAX_OR=1 时产出 `2:<hash>`，会写下行内自相矛盾的元数据
- * （hash 带 2 前缀、版本列写 1）。off 态两式逐字等值：engineSyntaxOrEnabled()=false
- * ⇒ engineSemanticsVersion(false)===ENGINE_SEMANTICS_VERSION===1，行为不变。
+ * 落库的 engine_semantics_version：取该行 rules_hash 的版本前缀，与 rulesHash 同一口径、by construction 自洽
+ * （engineSourceRevision → engineSemanticsVersion，P1a off=1/on=2）。orsrc1027 起语义版本按源判定
+ * （开关 on 且规则含 `||` 才是 2），同一批里可以 1/2 混存，不能再按批取一个常量。
+ * off 态所有源前缀恒为 1，与旧常量 ENGINE_SEMANTICS_VERSION 逐字等值，行为不变。
  */
-function admissionSemanticsVersion(): number {
-  return engineSemanticsVersion(engineSyntaxOrEnabled());
+function semanticsVersionOf(hash: string): number {
+  return Number(hash.split(':', 1)[0]);
 }
 
 /**
  * 版本自洽守卫（复审 P3 单一真源）：source_admission 每行的 `engine_semantics_version` 必须等于
  * `rules_hash` 的版本前缀（rules_hash 形如 `<engine_semantics_version>:<contentRevision>`，见
- * engineSourceRevision / admissionSemanticsVersion）。**两条写库路径**——`scripts/seed-admission.mjs`
+ * engineSourceRevision / semanticsVersionOf）。**两条写库路径**——`scripts/seed-admission.mjs`
  * 与 `src/lib/shuyuan.ts` 的 `writeAdmissionRows`——都在写库之前调用此函数，判据集中在此、两侧不各自抄一份
  * （两处复制正是复审发现的成因）。发现错配即抛错、拒绝写库：防的是 INSERT 列清单漏写版本列时行内元数据
  * 自相矛盾（版本列取 schema 默认 0，rules_hash 却带真实 `1:`/`2:` 前缀）。当前落库靠 P1a 让
@@ -1228,9 +1225,6 @@ function isVercelConfirmedOk(previous: AdmissionSourceRow | undefined, hash: str
 
 export async function runAdmissionBatch(input: AdmissionBatchInput): Promise<AdmissionBatchResult> {
   const now = input.now ?? (() => new Date());
-  // 每批判定一次语义版本：同一批所有行的版本列必须彼此一致，且与各自 rules_hash 前缀同源
-  // （rulesHash 内部同款默认读 ENGINE_SYNTAX_OR）。
-  const semanticsVersion = admissionSemanticsVersion();
   const rows: AdmissionSourceRow[] = [];
   const verdicts: Record<string, number> = {};
   let compileOk = 0;
@@ -1276,7 +1270,7 @@ export async function runAdmissionBatch(input: AdmissionBatchInput): Promise<Adm
       results[index] = {
         source_url: candidate.url, tier: 'T7', compile_ok: false, core_field_mask: compile.coreFieldMask,
         search_ok: null, search_verdict: '', search_checked_at: null, rules_hash: hash,
-        engine_semantics_version: semanticsVersion, host, error: compile.reason,
+        engine_semantics_version: semanticsVersionOf(hash), host, error: compile.reason,
         compile_diagnostics: compileDiagnostics(compile),
       };
       continue;
@@ -1301,7 +1295,7 @@ export async function runAdmissionBatch(input: AdmissionBatchInput): Promise<Adm
         ? {
           source_url: candidate.url, tier: 'M1', compile_ok: true, core_field_mask: compile.coreFieldMask,
           search_ok: null, search_verdict: '', search_checked_at: null, rules_hash: hash,
-          engine_semantics_version: semanticsVersion, host, error: '', compile_diagnostics: [],
+          engine_semantics_version: semanticsVersionOf(hash), host, error: '', compile_diagnostics: [],
         }
         : undefined;
     probes.push({
@@ -1387,7 +1381,7 @@ export async function runAdmissionBatch(input: AdmissionBatchInput): Promise<Adm
           source_url: item.candidate.url, tier: 'M1', compile_ok: true, core_field_mask: item.compile.coreFieldMask,
           ...outcome,
           search_checked_at: now().toISOString(), rules_hash: item.hash,
-          engine_semantics_version: semanticsVersion, host: item.host,
+          engine_semantics_version: semanticsVersionOf(item.hash), host: item.host,
           compile_diagnostics: [],
         };
       } finally {

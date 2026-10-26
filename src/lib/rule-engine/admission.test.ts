@@ -1813,9 +1813,11 @@ describe('落库元数据自洽：engine_semantics_version 与 rulesHash 前缀�
     expect(row.rules_hash.startsWith('2:')).toBe(true);
   });
 
-  it('on 态（ENGINE_SYNTAX_OR=1）：compile 拒行同样版本列 2、hash 前缀 2:', async () => {
+  it('on 态（ENGINE_SYNTAX_OR=1）：含 || 但仍被拒的行版本列 2、hash 前缀 2:', async () => {
     vi.stubEnv('ENGINE_SYNTAX_OR', '1');
-    const source = xpathSource('on-reject.example.com');
+    const source = syntheticSource('https://on-reject.example.com/', {
+      ruleSearch: { bookList: '.i', name: '.t@text||.n@text', bookUrl: 'a@href', author: '//div/a' },
+    } as Partial<RawSource>);
     const result = await runAdmissionBatch({
       candidates: [{ url: 'https://on-reject.example.com/', source }],
       declaredHosts: new Set(['on-reject.example.com']),
@@ -1827,6 +1829,57 @@ describe('落库元数据自洽：engine_semantics_version 与 rulesHash 前缀�
     expect(row.engine_semantics_version).toBe(2);
     expect(row.rules_hash.startsWith('2:')).toBe(true);
     expect(row.engine_semantics_version).toBe(hashVersion(row.rules_hash));
+  });
+
+  // orsrc1027：语义版本按源判定——不含 || 的源两态编译逐字同路，开闸不该改它的 identity。
+  it('orsrc1027：on 态不含 || 的源（xpath 拒行）版本列仍 1、hash 与 off 态逐字相同', async () => {
+    const source = xpathSource('on-noor.example.com');
+    const run = () => runAdmissionBatch({
+      candidates: [{ url: 'https://on-noor.example.com/', source }],
+      declaredHosts: new Set(['on-noor.example.com']),
+      existing: new Map(), fetchPage: vi.fn<AdmissionTransport>(), signal: signal(), maxProbes: 0,
+    });
+    vi.stubEnv('ENGINE_SYNTAX_OR', '');
+    const off = (await run()).rows[0];
+    vi.stubEnv('ENGINE_SYNTAX_OR', '1');
+    const on = (await run()).rows[0];
+    expect(on.compile_ok).toBe(false);
+    expect(on.engine_semantics_version).toBe(1);
+    expect(on.rules_hash).toBe(off.rules_hash);
+    expect(on.engine_semantics_version).toBe(hashVersion(on.rules_hash));
+  });
+
+  it('orsrc1027：开闸前已在池的不含 || 源，开闸后规则未变、结论仍有效，不重探', async () => {
+    const url = 'https://in-pool.example.com/';
+    const source = syntheticSource(url);
+    vi.stubEnv('ENGINE_SYNTAX_OR', '');
+    const offHash = rulesHash(source);
+    vi.stubEnv('ENGINE_SYNTAX_OR', '1');
+    expect(rulesHash(source)).toBe(offHash);
+    const fetchPage = vi.fn<AdmissionTransport>();
+    const result = await runAdmissionBatch({
+      candidates: [{ url, source }],
+      declaredHosts: new Set(['in-pool.example.com']),
+      existing: new Map([[url, {
+        source_url: url, tier: 'M1', compile_ok: true, core_field_mask: {}, search_ok: true, search_verdict: 'ok',
+        search_checked_at: new Date().toISOString(), rules_hash: offHash, engine_semantics_version: 1,
+        host: 'in-pool.example.com', error: '', compile_diagnostics: [],
+      }]]),
+      fetchPage, signal: signal(), maxProbes: 5, throttleMs: 0,
+    });
+    expect(fetchPage).not.toHaveBeenCalled();
+    expect(result.rows).toHaveLength(0);
+  });
+
+  it('orsrc1027：含 || 的源开闸后 identity 变（2:），按规则已变重审', () => {
+    const source = orSource('or-flip.example.com');
+    vi.stubEnv('ENGINE_SYNTAX_OR', '');
+    const offHash = rulesHash(source);
+    vi.stubEnv('ENGINE_SYNTAX_OR', '1');
+    const onHash = rulesHash(source);
+    expect(offHash.startsWith('1:')).toBe(true);
+    expect(onHash.startsWith('2:')).toBe(true);
+    expect(onHash.slice(2)).toBe(offHash.slice(2));
   });
 });
 // 41-ADMIT-CONC:准入探测受限并发(env ADMISSION_PROBE_CONCURRENCY,默认 1=串行)。

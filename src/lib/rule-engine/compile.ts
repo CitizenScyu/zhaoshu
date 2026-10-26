@@ -17,16 +17,36 @@ export function engineVersionedKey(contentRevision: string, semanticsVersion = E
   return `${semanticsVersion}:${contentRevision}`;
 }
 
-/** 内容 identity 与引擎语义 identity 的唯一组合口径（语义版本随 || 开关联动，P1a）。 */
+/**
+ * 内容 identity 与引擎语义 identity 的唯一组合口径（语义版本随 || 开关联动，P1a）。
+ * orsrc1027：语义版本按源判定——开关 on 且规则组里出现 `||` 的源才是版本 2，其余源恒为 1。
+ */
 export function engineSourceRevision(
   source: { url: string; searchUrl: unknown; rules: Record<string, unknown> },
   options: { orEnabled?: boolean } = {},
 ): string {
   const orEnabled = options.orEnabled ?? engineSyntaxOrEnabled();
-  return engineVersionedKey(sourceRevision(source), engineSemanticsVersion(orEnabled));
+  return engineVersionedKey(sourceRevision(source), engineSemanticsVersion(orEnabled && sourceUsesOrSyntax(source.rules)));
 }
 
 const RULE_GROUPS = ['ruleSearch', 'ruleBookInfo', 'ruleContent', 'ruleToc', 'ruleExplore'] as const;
+
+/**
+ * 源的规则组里是否有字段文本含 `||`（orsrc1027）。不含 `||` 的规则 on/off 两态编译逐字同路
+ * （off 的 splitTopLevel 与 on 的 tokenizeOrBranches 都只切出一段），语义没变，identity 就不该变：
+ * 否则开闸会把全部准入行判成「规则已变」，清掉 conn_fail 退避并整池重探。只看子串、宁宽勿漏——
+ * 括号/引号内的 `||` 也算，多算只是多重探一次。
+ */
+export function sourceUsesOrSyntax(rules: Record<string, unknown>): boolean {
+  for (const group of RULE_GROUPS) {
+    const fields = rules[group];
+    if (!fields || typeof fields !== 'object' || Array.isArray(fields)) continue;
+    for (const rule of Object.values(fields as Record<string, unknown>)) {
+      if (typeof rule === 'string' && rule.includes('||')) return true;
+    }
+  }
+  return false;
+}
 
 /** LRU 上限：单测/低并发下足够；无关热路径，只防规则对象无限积累。 */
 const CACHE_LIMIT = 64;
