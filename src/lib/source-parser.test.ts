@@ -51,6 +51,37 @@ describe('supported source parser', () => {
     expect(sourceBookMatches({ title: 'A书', author: '作者君' }, { title: 'A书', author: '君' })).toBe(false);
   });
 
+  // pubmeta1026：打标库/QQ 书城的出版元数据（任务 7280《精灵宝钻（精装插图本）》）——版本注记与多作者/国籍/角色。
+  it('pubmeta1026 出版元数据：尾部版本注记、第一作者、国籍括注与角色词判同一本', () => {
+    const wanted = { title: '精灵宝钻（精装插图本）', author: '[英] J. R. R. 托尔金 著、[英] 克里斯托弗·托尔金 编、[加拿大] 泰德·纳史密斯 图' };
+    for (const author of ['J.R.R.托尔金', 'j.r.r.托尔金', '[英]J.R.R.托尔金', '（英）J.R.R.托尔金 著', '作者：J.R.R.托尔金']) {
+      expect(sourceBookMatches(wanted, { title: '精灵宝钻', author }), author).toBe(true);
+    }
+    for (const title of ['百年孤独(典藏版)', '百年孤独【全译本】', '百年孤独（2017新版）', '百年孤独']) {
+      expect(sourceBookMatches({ title: '百年孤独', author: '[哥伦比亚]加西亚·马尔克斯 著，范晔 译' },
+        { title, author: '加西亚·马尔克斯' }), title).toBe(true);
+    }
+    expect(sourceBookMatches({ title: '红楼梦', author: '(清)曹雪芹 著' }, { title: '红楼梦', author: '曹雪芹' })).toBe(true);
+    // 无标点的多作者串：「著」后紧跟下一个国籍括注。
+    expect(sourceBookMatches({ title: 'X', author: '[美]甲乙著[美]丙丁译' }, { title: 'X', author: '甲乙' })).toBe(true);
+  });
+
+  it('pubmeta1026 不放宽成错配：分册/续作注记不剥，第一作者不同、非出版形态笔名不削', () => {
+    for (const title of ['三体(第二部)', '三体（上本）', '三体(精品)', '三体(全集)', '三体2', '三体(精品版)', '三体(青少版)',
+      '三体（节选本）', '三体(漫画版)', '三体(绘本)', '三体(缩写本)']) {
+      expect(sourceBookMatches({ title: '三体', author: '刘慈欣' }, { title, author: '刘慈欣' }), title).toBe(false);
+    }
+    // 第一作者才是作者键：译者/绘者对不上第一作者。
+    expect(sourceBookMatches({ title: 'X', author: '[英]甲乙 著，丙丁 译' }, { title: 'X', author: '丙丁' })).toBe(false);
+    // 单个笔名以角色字结尾（无国籍括注、无分隔）不剥：「宏图」≠「宏」，「鸿蒙宏图」≠「鸿蒙宏」。
+    expect(sourceBookMatches({ title: 'X', author: '鸿蒙宏图' }, { title: 'X', author: '鸿蒙宏' })).toBe(false);
+    expect(sourceBookMatches({ title: 'X', author: '宏图' }, { title: 'X', author: '宏' })).toBe(false);
+    // 只有括注、剥完为空：保持原值，不变成「作者未知」绕开作者门。
+    expect(sourceBookMatches({ title: 'X', author: '【英】' }, { title: 'X', author: '别人' })).toBe(false);
+    // 书名只剩版本注记时不剥成空串。
+    expect(sourceBookMatches({ title: '(典藏版)', author: '' }, { title: '', author: '' })).toBe(false);
+  });
+
   // 41-swq 审查 §1.1 反例（rvswq-scratch/probe1.mjs 第 1 组、probe2.mjs）：两个不同的字、简体写法相同，不得判同一本。
   it('41-swq 繁简折叠不把不同的字判等（多前像映射已剔除）', () => {
     for (const [expected, actual] of [
