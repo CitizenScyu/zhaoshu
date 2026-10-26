@@ -1332,6 +1332,69 @@ describe('引擎源分派（M1 任务 4 §7.2）', () => {
   });
 });
 
+// dlsearch-1026：在线阅读引擎源搜索词清洗——出版注记书名/多作者国籍串原样搜索在源站搜不到
+// （源站按通行书名/第一作者建索引），改用 cleanSearchTitle/cleanSearchAuthor 的清洗值发起搜索。
+// 身份比对（sourceBookMatches）仍用原值（另案处理）：源站条目的书名/作者与任务书**完全一致**
+// 时身份门照过，这样两个用例都只钉「出网的搜索词换了」，不被身份门行为牵连。
+describe('dlsearch-1026 引擎源搜索词清洗', () => {
+  const engineSource = {
+    url: 'https://reader.test/engine/', name: '引擎源', searchUrl: 'https://reader.test/s?q={{key}}',
+    tier: 'M1' as const,
+    rules: {
+      ruleSearch: { bookList: '.book', name: '.name@text', author: '.author@text', bookUrl: 'a@href' },
+      ruleBookInfo: { name: '.title@text', author: '.writer@text', tocUrl: '.toc@href' },
+      ruleToc: { chapterList: '.chapter', chapterName: 'a@text', chapterUrl: 'a@href' },
+      ruleContent: { content: '.content@text' },
+    },
+  };
+  const detailUrl = 'https://reader.test/detail/1.html';
+  const tocUrl = 'https://reader.test/toc/1.html';
+  const annotatedTitle = '精灵宝钻（精装插图本）';
+  const annotatedAuthor = '[英] J.R.R.托尔金 著，[英] 泰德·纳史密斯 图';
+  const searchPageOf = (key: string) => 'https://reader.test/s?q=' + encodeURIComponent(key);
+
+  it('带出版注记的书名用清洗后的书名搜索（精灵宝钻（精装插图本）→ 搜「精灵宝钻」）', async () => {
+    const wanted = { title: annotatedTitle, author: annotatedAuthor };
+    mocks.sources.mockResolvedValue([engineSource]);
+    // 源站按通行书名建索引：清洗键「精灵宝钻」有结果（条目身份与任务书一致，过身份门）；
+    // 原书名键不设页面——若未清洗而打原键，mock 会抛 Unexpected source request 使测试失败。
+    pages.set(searchPageOf('精灵宝钻'), {
+      text: `<div class="book"><span class="name">${annotatedTitle}</span><span class="author">${annotatedAuthor}</span><a href="/detail/1.html">x</a></div>`,
+    });
+    pages.set(detailUrl, { text: `<h1 class="title">${annotatedTitle}</h1><span class="writer">${annotatedAuthor}</span><a class="toc" href="/toc/1.html">目录</a>` });
+    pages.set(tocUrl, { text: '<li class="chapter"><a href="/c/1.html">第一章</a></li>' });
+    const catalog = await service.resolveSourceBook(wanted, context());
+    expect(catalog).toMatchObject({ bookUrl: detailUrl });
+    // 出网确实打的是清洗键，原书名键没有出网（有则说明没清洗）。
+    const queried = mocks.fetch.mock.calls.map(([input]) => String(input));
+    expect(queried.some((url) => url.includes(encodeURIComponent('精灵宝钻')))).toBe(true);
+    expect(queried.some((url) => url.includes(encodeURIComponent(annotatedTitle)))).toBe(false);
+  });
+
+  it('书名搜索零命中时作者回退轮也用清洗后的作者（[英] X 著，[英] Y 图 → 搜「X」）', async () => {
+    const wanted = { title: annotatedTitle, author: annotatedAuthor };
+    mocks.sources.mockResolvedValue([engineSource]);
+    // 书名轮：清洗键搜索页只回无关书（身份门拒）→ 触发作者回退。
+    pages.set(searchPageOf('精灵宝钻'), {
+      text: '<div class="book"><span class="name">无关书</span><span class="author">别人</span><a href="/detail/9.html">x</a></div>',
+    });
+    pages.set('https://reader.test/detail/9.html', { text: '<h1 class="title">无关书</h1><span class="writer">别人</span><a class="toc" href="/toc/9.html">目录</a>' });
+    pages.set('https://reader.test/toc/9.html', { text: '<li class="chapter"><a href="/c9/1.html">第一章</a></li>' });
+    // 作者轮：清洗键「J.R.R.托尔金」唯一候选，条目身份与任务书一致（身份门用原值判等）。
+    pages.set(searchPageOf('J.R.R.托尔金'), {
+      text: `<div class="book"><span class="name">${annotatedTitle}</span><span class="author">${annotatedAuthor}</span><a href="/detail/1.html">x</a></div>`,
+    });
+    pages.set(detailUrl, { text: `<h1 class="title">${annotatedTitle}</h1><span class="writer">${annotatedAuthor}</span><a class="toc" href="/toc/1.html">目录</a>` });
+    pages.set(tocUrl, { text: '<li class="chapter"><a href="/c/1.html">第一章</a></li>' });
+    const catalog = await service.resolveSourceBook(wanted, context());
+    expect(catalog).toMatchObject({ bookUrl: detailUrl });
+    const queried = mocks.fetch.mock.calls.map(([input]) => String(input));
+    expect(queried.some((url) => url.includes(encodeURIComponent('J.R.R.托尔金')))).toBe(true);
+    // 原作者整串没有出网：带国籍/角色词/多作者的键没发给源站。
+    expect(queried.some((url) => url.includes(encodeURIComponent(annotatedAuthor)))).toBe(false);
+  });
+});
+
 // 675：阅读入口退休 source_url 定向契约（书库行带退休 host 的普通书 + 活跃引擎池）。
 // 前提（664 轮已核）：真实注册表里 book15 已退休，getReadingSources 合成活跃池先剔退休 host——
 // 但本文件 vi.mock('./shuyuan')，池合成被 mocks.sources 替身接管，不经过真实注册表；

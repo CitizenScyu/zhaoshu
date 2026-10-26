@@ -4,6 +4,7 @@ import { resolve, join } from 'node:path';
 import { setTimeout as pause } from 'node:timers/promises';
 import { canonicalBookKey } from '../src/lib/book-identity.ts';
 import { authorBridgeAccepts, authorBridgeCandidates, authorSearchKey } from '../src/lib/source-author-bridge.ts';
+import { searchKeysOf } from '../src/lib/search-key.ts';
 import { sourceBookMatches } from '../src/lib/source-parser.ts';
 import { fetchSourceText, sourceAbortable } from '../src/lib/source-fetch.ts';
 
@@ -152,11 +153,14 @@ export async function downloadBook(m, args, resolveSource, transport = fetchSour
     });
     manifest.sourceRevision = hash(JSON.stringify(source));
     const engine = builtin ? null : { url: source.url, name: source.name, searchUrl: source.searchUrl, compiled: m.compile.compileSource(source) };
+    // dlsearch-1026：搜索词用清洗后的值（版本注记/国籍/角色词见 src/lib/search-key.ts），身份判据
+    // identityMatches 仍用任务原值（args.title/args.author）——搜索词是「怎么找候选」，比对是「是不是这本书」。
+    const searchKeys = searchKeysOf({ title: args.title, author: args.author });
     stage = 'search';
     const candidates = await operation(async ctx => {
-      if (!builtin) return m.api.engineSearchBook(engine, args.title, ctx);
-      const page = await ctx.page(m.parser.sourceSearchUrl(source.searchUrl, args.title, source.url));
-      return m.parser.parseSourceSearch(page.text, page.url, args.title).map(bookUrl => ({ bookUrl }));
+      if (!builtin) return m.api.engineSearchBook(engine, searchKeys.title, ctx);
+      const page = await ctx.page(m.parser.sourceSearchUrl(source.searchUrl, searchKeys.title, source.url));
+      return m.parser.parseSourceSearch(page.text, page.url, searchKeys.title).map(bookUrl => ({ bookUrl }));
     });
     let selected;
     stage = 'detail';
@@ -176,11 +180,11 @@ export async function downloadBook(m, args, resolveSource, transport = fetchSour
     if (!selected && authorSearchKey(args.title, args.author)) {
       stage = 'search';
       const authorHits = authorBridgeCandidates(await operation(async ctx => {
-        if (!builtin) return m.api.engineSearchBook(engine, args.author, ctx);
-        const page = await ctx.page(m.parser.sourceSearchUrl(source.searchUrl, args.author, source.url));
+        if (!builtin) return m.api.engineSearchBook(engine, searchKeys.author, ctx);
+        const page = await ctx.page(m.parser.sourceSearchUrl(source.searchUrl, searchKeys.author, source.url));
         const urls = /^\/books\/details\d+\.html$/.test(new URL(page.url).pathname)
           ? [page.url]
-          : m.parser.parseSourceDetailLinks(page.text, page.url, args.title);
+          : m.parser.parseSourceDetailLinks(page.text, page.url, searchKeys.title);
         return urls.map(bookUrl => ({ bookUrl }));
       }));
       if (authorHits.length === 1) {

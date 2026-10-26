@@ -21,6 +21,7 @@ import { identityMatches, isSourceUnavailableError } from '../scripts/engine-dow
 import { authorBridgeAccepts, authorBridgeCandidates, authorSearchKey } from '../src/lib/source-author-bridge';
 import { sourceBookMatches } from '../src/lib/source-parser';
 import { sourceAbortable } from '../src/lib/source-fetch';
+import { searchKeysOf } from '../src/lib/search-key';
 import type { TaskRow } from '../src/lib/download-worker';
 import type { PrecheckHook, PrecheckResult } from './executor';
 
@@ -111,13 +112,17 @@ export function createIdentityPrecheck(options: IdentityPrecheckOptions): Preche
       return false;
     };
 
+    // dlsearch-1026：搜索词用清洗后的值（版本注记/国籍/角色词见 src/lib/search-key.ts），身份比对
+    // （identityMatches / sourceBookMatches）仍用任务原值——与下载腿「同源同判」契约不变。
+    const keys = searchKeysOf(task);
+
     progress.stage = 'search';
     let candidates: Candidate[];
     if (builtin) {
-      const page = await ctx.page(m.parser.sourceSearchUrl(source.searchUrl, task.title, source.url));
-      candidates = m.parser.parseSourceSearch(page.text, page.url, task.title).map(bookUrl => ({ bookUrl }));
+      const page = await ctx.page(m.parser.sourceSearchUrl(source.searchUrl, keys.title, source.url));
+      candidates = m.parser.parseSourceSearch(page.text, page.url, keys.title).map(bookUrl => ({ bookUrl }));
     } else {
-      candidates = await m.api.engineSearchBook(engine, task.title, ctx);
+      candidates = await m.api.engineSearchBook(engine, keys.title, ctx);
     }
     if (await matchesAny(candidates)) return true;
     // 超过上限没看完就不下结论，也不再补搜：搜索本来就不完整时加一轮作者，只会把「没看完」伪装成
@@ -138,13 +143,13 @@ export function createIdentityPrecheck(options: IdentityPrecheckOptions): Preche
     progress.stage = 'search';
     let authorCandidates: Candidate[];
     if (builtin) {
-      const page = await ctx.page(m.parser.sourceSearchUrl(source.searchUrl, task.author, source.url));
+      const page = await ctx.page(m.parser.sourceSearchUrl(source.searchUrl, keys.author, source.url));
       const urls = /^\/books\/details\d+\.html$/.test(new URL(page.url).pathname)
         ? [page.url]
-        : m.parser.parseSourceDetailLinks(page.text, page.url, task.title);
+        : m.parser.parseSourceDetailLinks(page.text, page.url, keys.title);
       authorCandidates = urls.map(bookUrl => ({ bookUrl }));
     } else {
-      authorCandidates = await m.api.engineSearchBook(engine, task.author, ctx);
+      authorCandidates = await m.api.engineSearchBook(engine, keys.author, ctx);
     }
     // B′ 门（与选源器、下载腿共用 authorBridgeAccepts）：候选按 bookUrl 去重后须恰好 1 条，
     // 且该条详情页作者门逐字对上。候选 >1（同作者多本）判不命中——没有书名证据时认哪一本都是猜。

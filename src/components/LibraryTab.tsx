@@ -4,6 +4,7 @@ import { useCallback, useEffect, useRef, useState, type Dispatch, type SetStateA
 import { useOwner } from '@/components/OwnerProvider';
 import ReadBookLink from '@/components/ReadBookLink';
 import { isDbQuotaResponse, quotaRetryDelayMs } from '@/lib/db-quota';
+import { SOURCE_RETRY_MAX_ATTEMPTS } from '@/lib/download-task-policy';
 
 interface LibraryBook {
   id: number;
@@ -38,6 +39,10 @@ interface DownloadTask {
   charsTotal: number;
   error: string | null;
   updatedAt: string;
+  // 退避轮次与下次自动重试时刻（dlsearch-1026 任务 B）：pending + attemptCount>0 + 未来
+  // nextAttemptAt = 退避中，UI 显示重试倒计时而非「排队中」。旧 worker 的行无该字段时缺省。
+  attemptCount?: number;
+  nextAttemptAt?: string | null;
   // 派生状态：running 且 worker 心跳过期。GET 保持只读，由这里暴露给 UI 做受控重试。
   leaseExpired?: boolean;
   requestedBy?: 'user' | 'system';
@@ -112,6 +117,8 @@ function parseTask(data: unknown): DownloadTask | null {
     charsTotal: Number(t.charsTotal) || 0,
     error: typeof t.error === 'string' ? t.error : null,
     updatedAt: typeof t.updatedAt === 'string' ? t.updatedAt : '',
+    attemptCount: typeof t.attemptCount === 'number' ? t.attemptCount : 0,
+    nextAttemptAt: typeof t.nextAttemptAt === 'string' ? t.nextAttemptAt : null,
     leaseExpired: t.leaseExpired === true,
     requestedBy: t.requestedBy === 'system' ? 'system' : 'user',
     retryOf: typeof t.retryOf === 'number' ? t.retryOf : null,
@@ -119,9 +126,24 @@ function parseTask(data: unknown): DownloadTask | null {
   };
 }
 
+// 退避中的 pending（dlsearch-1026 任务 B）：已试过（attemptCount>0）且下次重试在未来
+// ⇒ 不是「排队中」而是 worker 退避等待。上限取 worker 同一份 SOURCE_RETRY_MAX_ATTEMPTS
+// （download-task-policy.ts，下载与发布共用同一 attempt_count 阶梯），不另设魔数。
+// 旧 worker 写的行没有 attempt_count/next_attempt_at 字段（route 未选出）时保持原「排队中」文案。
+function isBackingOff(t: DownloadTask): boolean {
+  return t.status === 'pending' && (t.attemptCount ?? 0) > 0
+    && typeof t.nextAttemptAt === 'string' && new Date(t.nextAttemptAt).getTime() > Date.now();
+}
+
+function backoffRetryText(t: DownloadTask): string {
+  const next = new Date(t.nextAttemptAt as string);
+  const hhmm = next.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false });
+  return `暂无可用源，将于 ${hhmm} 自动重试（第 ${t.attemptCount}/${SOURCE_RETRY_MAX_ATTEMPTS} 次）`;
+}
+
 function downloadStatusText(t: DownloadTask): string {
   switch (t.status) {
-    case 'pending': return '排队中，等待下载任务开始';
+    case 'pending': return isBackingOff(t) ? backoffRetryText(t) : '排队中，等待下载任务开始';
     // 心跳过期的 running 是硬中断残留：不再显示诱人的「下载中 n/m」，明确告知可重试。
     case 'running': return t.leaseExpired
       ? `下载已中断（worker 无心跳），已存 ${t.chaptersDone}/${t.chaptersTotal} 章，可重试`

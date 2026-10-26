@@ -7,6 +7,7 @@ import { SourcePolicyError, stationKeyOfUrl, validateSourceUrl } from './source-
 import { sourceRevision } from './source-revision';
 import { isHostSuspect, orderByHostHealth, recordHostFailure } from './source-host-health';
 import { normalizeBookTitle } from './book-identity';
+import { cleanSearchAuthor, cleanSearchTitle } from './search-key';
 import {
   engineFetchContent, engineFetchDetail, engineFetchToc, engineSearchBook, MAX_CONTENT_PAGES, type EngineSearchResult, type EngineSource,
 } from './rule-engine/api';
@@ -892,9 +893,11 @@ export async function resolveSourceBook(
     try {
       // 引擎档分派（设计 §7.2）：rules 非空且非 builtin ⇒ 走 rule-engine 门面；
       // 只做「搜索→详情→目录 + 身份校验」，身份校验沿用 sourceBookMatches（留在调用方）。
+      // dlsearch-1026：搜索词清洗（版本注记/国籍/角色词，src/lib/search-key.ts）——只改搜索词，
+      // 身份比对（sourceBookMatches/engineDetailCandidates/engineAuthorSearchPending）仍用原值。
       if (!isBuiltinReadingSource(source)) {
         const engineSource = engineSourceOf(source);
-        const results = await engineSearchBook(engineSource, book.title, sourceContext);
+        const results = await engineSearchBook(engineSource, cleanSearchTitle(book.title), sourceContext);
         stat.searched = true;
         stat.candidates = results.length;
         const authorFallbackPending = engineAuthorSearchPending(book, results);
@@ -936,7 +939,7 @@ export async function resolveSourceBook(
         // L2，非首源 child 还要过 L1），不足则跳过——强开会把预算码抛给外层记成整轮失败。
         // 上游限流后不再作者回退：站点已明说「现在别来」，换词再搜只是再吃一个 429（53-ratelimit）。
         if (authorFallbackPending && !sourceThrottled && !matches.size && sourceContext.remainingFor(2) >= 1) {
-          const authorResults = await engineSearchBook(engineSource, book.author, sourceContext);
+          const authorResults = await engineSearchBook(engineSource, cleanSearchAuthor(book.author), sourceContext);
           stat.fallbackCandidates += authorResults.length;
           for (const result of engineDetailCandidates(book, authorResults)) {
             if (result.bookUrl === options.excludeBookUrl || checked.has(source.url + result.bookUrl)) continue;
@@ -1316,7 +1319,8 @@ async function surveyOneSource(
   });
   if (!isBuiltinReadingSource(source)) {
     const engineSource = engineSourceOf(source);
-    const results = await engineSearchBook(engineSource, book.title, context);
+    // dlsearch-1026：搜索词清洗（同 resolveSourceBook 的引擎档，src/lib/search-key.ts）；比对仍用原值。
+    const results = await engineSearchBook(engineSource, cleanSearchTitle(book.title), context);
     const pending = engineAuthorSearchPending(book, results);
     const inspect = async (candidates: EngineSearchResult[]): Promise<SourceAlternateStatus | null> => {
       for (const result of candidates) {
@@ -1337,7 +1341,7 @@ async function surveyOneSource(
     const found = await inspect(engineDetailCandidates(book, results).slice(0, width));
     if (found) return found;
     if (pending && context.remainingFor(2) >= 1) {
-      return inspect(engineDetailCandidates(book, await engineSearchBook(engineSource, book.author, context)));
+      return inspect(engineDetailCandidates(book, await engineSearchBook(engineSource, cleanSearchAuthor(book.author), context)));
     }
     return null;
   }

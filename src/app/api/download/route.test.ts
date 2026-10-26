@@ -88,6 +88,8 @@ const recoveredTask = {
   error: '此前的提示\nworker 中断自动回收',
   created_at: '2026-09-14T00:00:00Z',
   updated_at: '2026-09-14T01:00:00Z',
+  attempt_count: 2,
+  next_attempt_at: '2026-09-14T01:30:00.000Z',
 };
 
 describe('/api/download recovery and cleanup', () => {
@@ -147,7 +149,26 @@ describe('/api/download recovery and cleanup', () => {
     expect(sql).toHaveBeenCalledOnce();
     expect(queryText(0)).toMatch(/^SELECT .* FROM download_tasks /);
     expect(queryText(0)).toContain('user_id = ?');
+    // dlsearch-1026 任务 B：退避文案依赖 attempt_count 与 next_attempt_at（business-schema 真列）。
+    expect(queryText(0)).toContain('attempt_count');
+    expect(queryText(0)).toContain('next_attempt_at');
+    expect(suffix ? data.task : data.tasks[0]).toMatchObject({
+      attemptCount: recoveredTask.attempt_count,
+      nextAttemptAt: recoveredTask.next_attempt_at,
+    });
     expect(sql.mock.calls[0].slice(1)).toEqual(suffix ? [recoveredTask.id, 1] : [1, 20]);
+  });
+
+  it('dlsearch-1026：GET 返回退避字段 attemptCount/nextAttemptAt，pending 退避行 UI 可判「自动重试」', async () => {
+    sql.mockResolvedValueOnce([{
+      ...recoveredTask, status: 'pending', attempt_count: 3,
+      next_attempt_at: new Date(Date.now() + 15 * 60_000).toISOString(),
+    }]);
+    const res = await GET(request('GET', undefined, `?id=${recoveredTask.id}`));
+    const data = await res.json();
+    expect(res.status).toBe(200);
+    expect(data.task).toMatchObject({ status: 'pending', attemptCount: 3 });
+    expect(typeof data.task.nextAttemptAt).toBe('string');
   });
 
   it('rejects invalid task IDs before any recovery write', async () => {
