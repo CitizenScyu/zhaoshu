@@ -7,7 +7,7 @@ import {
   ADMISSION_RETEST_INTERVAL_MS, ADMISSION_TIMEOUT_MS, DEFAULT_ADMISSION_MAX_PROBES,
   DEFAULT_ADMISSION_PROBE_CONCURRENCY, MAX_ADMISSION_PROBE_CONCURRENCY,
   ADMISSION_FAIL_COUNT_PREFIX, ADMISSION_NO_RESULT_RETEST_MS, ADMISSION_PHOENIX_OK_PREFIX,
-  ADMISSION_CONN_FAIL_MAX_MS, ADMISSION_HTTP_ERR_MAX_MS,
+  ADMISSION_CONN_FAIL_MAX_MS, ADMISSION_HTTP_ERR_MAX_MS, ADMISSION_CIRCUIT_CONN_FAIL_RATIO, ADMISSION_CIRCUIT_MIN_PROBES,
   ADMISSION_NO_RESULT_MAX_MS, ADMISSION_QUERY_INSENSITIVE_MAX_MS,
   parseFailCount, applyFailCountPrefix,
   admissionBucket, admissionMaxProbes, admissionProbeConcurrency, compileAdmission,
@@ -2446,3 +2446,78 @@ describe('admbackoff42：isRetestDue 按连续失败次数指数退避（窗口�
 });
 
 
+
+// probecircuit1026：一轮里大面积 conn_fail（2026-10-25 探测端出网故障，531 行被打进 7d+ 退避）按探测侧故障处理。
+describe('probecircuit1026：探测侧 conn_fail 熔断', () => {
+  const okBody = '<div class="i"><span class="t">书名</span><a href="/b/1">x</a></div>';
+  const hostOf = (i: number, kind: string) => `${kind}${i}.circuit.example.com`;
+  const cand = (host: string) => ({ url: `https://${host}`, source: syntheticSource(`https://${host}/`) });
+  /** host 名以 down 开头 ⇒ fetch failed（conn_fail），其余 ⇒ ok 页。 */
+  const fetchPage = () => vi.fn<AdmissionTransport>().mockImplementation(async (input) => {
+    if (new URL(input).hostname.startsWith('down')) throw new TypeError('fetch failed');
+    return page(okBody);
+  });
+  const batch = (candidates: { url: string; source: RawSource }[], existing = new Map<string, AdmissionSourceRow>()) =>
+    runAdmissionBatch({
+      candidates, declaredHosts: new Set(candidates.map(({ url }) => new URL(url).hostname)),
+      existing, fetchPage: fetchPage(), signal: signal(), throttleMs: 0, maxProbes: 100,
+    });
+  const fresh = (down: number, up: number) => [
+    ...Array.from({ length: down }, (_, i) => cand(hostOf(i, 'down'))),
+    ...Array.from({ length: up }, (_, i) => cand(hostOf(i, 'up'))),
+  ];
+
+  it('阈值常量：至少 20 次有效探测、conn_fail 占比 ≥ 0.6', () => {
+    expect(ADMISSION_CIRCUIT_MIN_PROBES).toBe(20);
+    expect(ADMISSION_CIRCUIT_CONN_FAIL_RATIO).toBe(0.6);
+  });
+
+  it('熔断：25 次中 15 次 conn_fail（60%）⇒ conn_fail 不落结论、改写未测占位；ok 照常写', async () => {
+    const result = await batch(fresh(15, 10));
+    expect(result.probed).toBe(25);
+    expect(result).toMatchObject({ circuitOpen: true, suppressedConnFail: 15 });
+    expect(result.verdicts).toEqual({ conn_fail: 15, ok: 10 }); // 观测口径不改
+    const byVerdict = Object.groupBy(result.rows, (row) => row.search_verdict);
+    expect(byVerdict.ok).toHaveLength(10);
+    expect(byVerdict.conn_fail).toBeUndefined();
+    expect(byVerdict['']).toHaveLength(15);
+    expect(byVerdict['']!.every((row) => row.search_ok === null && row.search_checked_at === null && row.error === '')).toBe(true);
+  });
+
+  it('未达阈值照旧：25 次中 14 次 conn_fail（56%）、19 次全 conn_fail（不足 20 次）都写真实 conn_fail', async () => {
+    const below = await batch(fresh(14, 11));
+    expect(below).toMatchObject({ circuitOpen: false, suppressedConnFail: 0 });
+    expect(below.rows.filter((row) => row.search_verdict === 'conn_fail')).toHaveLength(14);
+    const few = await batch(fresh(19, 0));
+    expect(few).toMatchObject({ circuitOpen: false, suppressedConnFail: 0 });
+    expect(few.rows.filter((row) => row.search_verdict === 'conn_fail')).toHaveLength(19);
+  });
+
+  it('上一次已是 conn_fail 的复测不计入占比：已知死站复测轮不触发熔断', async () => {
+    // 新探 20 次（10 conn_fail = 50%）+ 15 个到期复测的老 conn_fail 站仍挂：合计 25/35 = 71%，但判据只看 50%。
+    const dead = Array.from({ length: 15 }, (_, i) => cand(hostOf(i, 'downold')));
+    const existing = new Map(dead.map(({ url, source }) => [url, sourceRow(url, {
+      tier: 'M1', compile_ok: true, search_ok: false, search_verdict: 'conn_fail', error: 'fetch failed',
+      search_checked_at: new Date(Date.now() - ADMISSION_CONN_FAIL_MAX_MS - 24 * 3_600_000).toISOString(),
+      rules_hash: rulesHash(source), engine_semantics_version: ENGINE_SEMANTICS_VERSION,
+    })]));
+    const result = await batch([...fresh(10, 10), ...dead], existing);
+    expect(result.probed).toBe(35);
+    expect(result).toMatchObject({ circuitOpen: false, suppressedConnFail: 0 });
+    expect(result.rows.filter((row) => row.search_verdict === 'conn_fail')).toHaveLength(25);
+  });
+
+  it('熔断时在池 ok 行复核失败不吃 strike、不写行（旧结论原样保留）', async () => {
+    const inPool = cand('downpool.circuit.example.com');
+    const existing = new Map([[inPool.url, sourceRow(inPool.url, {
+      tier: 'M1', compile_ok: true, search_ok: true, search_verdict: 'ok',
+      search_checked_at: new Date(Date.now() - ADMISSION_OK_RECHECK_MS - 24 * 3_600_000).toISOString(),
+      rules_hash: rulesHash(inPool.source), engine_semantics_version: ENGINE_SEMANTICS_VERSION,
+    })]]);
+    const result = await batch([...fresh(15, 9), inPool], existing);
+    expect(result.probed).toBe(25);
+    expect(result).toMatchObject({ circuitOpen: true, suppressedConnFail: 16 });
+    expect(result.rows.some((row) => row.source_url === inPool.url)).toBe(false);
+    expect(result.rows.some((row) => row.error.startsWith(ADMISSION_RECHECK_FAIL_PREFIX))).toBe(false);
+  });
+});
