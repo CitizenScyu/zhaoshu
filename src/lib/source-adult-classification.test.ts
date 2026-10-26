@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { classifySourceAdult } from './source-adult-classification';
+import { adultStationKeys, classifySourceAdult, isAdultSiteHost } from './source-adult-classification';
 
 describe('source adult metadata classification', () => {
   it.each(['🈲', '🔞'])('recognizes %s anywhere in each independent metadata position', (marker) => {
@@ -41,6 +41,54 @@ describe('source adult metadata classification', () => {
     '海棠', '海棠花儿', '御宅族小说', 'PO文学3', 'PO全本🎃', '书耽中文', '夫妻小说', '桃桃书',
   ])('does not over-match near misses (adultsrc42): %s', (text) => {
     expect(classifySourceAdult(text, { bookSourceName: text, bookSourceGroup: text })).toBe('unmarked');
+  });
+
+  // adult1026：生产池 2026-10-26 漏网的站名。
+  it.each(['肉宅屋网🎃', 'PO文屋🎃', 'po文屋', '📂十八书屋', '辣肉文', '🎃辣肉文🎃'])(
+    'recognizes adult site names found leaking on 2026-10-26: %s', (text) => {
+      expect(classifySourceAdult(text, {})).toBe('adult');
+    });
+
+  // adult1026：站名正常、域名是成人站（生产池实测样本）。
+  it.each([
+    'https://m.rouzhaiwu.info', 'https://m.powenwu16.com', 'https://m.powenxue15.com', 'https://www.pofans.com',
+    'https://www.18jinshu.com', 'https://www.yiyechunxiao.com', 'https://op-lake-rope.xoxiaoshuo-102.com',
+    'https://www.shibashuwu.net', 'https://m.xyuzhaiwu7.com', 'https://www.roushuwu.com#🎃',
+    'http://m.nprouwen.org/', 'https://m.yuwangshe.one,{"webView":true}',
+  ])('recognizes adult domains behind ordinary names: %s', (bookSourceUrl) => {
+    expect(classifySourceAdult('笔趣阁#58', { bookSourceName: '笔趣阁#58', bookSourceUrl })).toBe('adult');
+    expect(isAdultSiteHost(new URL(bookSourceUrl.split(/[#,]/)[0]).hostname)).toBe(true);
+  });
+
+  it.each([
+    'https://www.biquge7.xyz', 'https://m.lulushuwu.com', 'https://www.xiangtxsw.com', 'https://so.ihuaben.com',
+    'https://www.sjks88.com', 'https://www.wanwx.com', 'https://www.mgyqw.com', 'https://m.shubl.com',
+    'https://www.jjjjxs.com', 'https://www.kxwx.org', '', 'not a url',
+  ])('does not flag ordinary domains: %s', (bookSourceUrl) => {
+    expect(classifySourceAdult('普通', { bookSourceUrl })).toBe('unmarked');
+  });
+
+  it('bookSourceUrl/bookSourceComment of a wrong type are ignored instead of making the row invalid', () => {
+    expect(classifySourceAdult('普通', { bookSourceUrl: 1, bookSourceComment: {} })).toBe('unmarked');
+  });
+
+  it.each([
+    ['同站： 新御宅屋 https://www.layuzhaiwu.xyz', 'adult'],
+    ['同站https://www.larouwen .com/ https://www.example.com', 'adult'],
+    ['同站 CP文库： https://www.cpwenku.com', 'unmarked'],
+    ['免责声明：本源仅供学习，禁止成人内容传播', 'unmarked'],
+  ] as const)('reads only the 同站 alias part of bookSourceComment: %s', (bookSourceComment, expected) => {
+    expect(classifySourceAdult('耽美小说', { bookSourceComment })).toBe(expected);
+  });
+
+  it('adultStationKeys spreads one adult row to its whole station', () => {
+    const rows = [
+      { url: 'https://444.1006sd.com', name: '🔞猩猩小说' },
+      { url: 'https://444.1006sd.com#🎃', name: '🎃猩猩小说🎃' },
+      { url: 'https://m.example.com', name: '普通' },
+    ];
+    const keys = adultStationKeys(rows, (row) => classifySourceAdult(row.name, {}), (row) => new URL(row.url).hostname);
+    expect([...keys]).toEqual(['444.1006sd.com']);
   });
 
   it('allows missing, null and empty string metadata without changing the source object', () => {

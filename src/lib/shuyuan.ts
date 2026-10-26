@@ -15,7 +15,7 @@ import {
 } from '@/lib/rule-engine/admission';
 import { enginePostSearchEnabled, selectCandidates, type RawSource } from '@/lib/rule-engine/compile-smoke';
 import { DEFAULT_SHUYUAN_READ_CACHE_TTL_MS, shuyuanReadCacheTtlMs } from '@/lib/read-cache-ttl';
-import { classifySourceAdult, type SourceAdultClassification } from '@/lib/source-adult-classification';
+import { adultStationKeys, classifySourceAdult, type SourceAdultClassification } from '@/lib/source-adult-classification';
 import {
   createPoolArtifact, currentPoolArtifact, noteLocalPoolWrite, poolArtifactEnabled, resetPoolArtifactMemo,
   writePoolArtifactFile, type PoolArtifact, type PoolArtifactEngineRow, type PoolArtifactSourceRow,
@@ -625,8 +625,12 @@ async function engineReadingSources(
   // 同一站点合集里常同时收录 http:// 与 https:// 两份（1522 源里 57 对），升级后 url 撞车会让按 url 反查源
   // 歧义：撞车时留库键本就是 https 的那份（与改前的池逐条相同），http 副本让位。
   const native = new Set(rows.map((row) => row.source_url).filter((url) => upgradeSourceTemplateUrl(url) === url));
+  // adult1026：同站传染——同站键下任一源判 adult，整站出池（防同站换个没打标的名字漏网）。
+  const adultStations = adultStationKeys(rows, (row) => classifySourceAdult(row.name, row.source),
+    (row) => stationKeyOfUrl(row.source_url));
   return rows
     .filter((row) => classifySourceAdult(row.name, row.source) === 'unmarked'
+      && !adultStations.has(stationKeyOfUrl(row.source_url))
       && canProbe(upgradeSourceTemplateUrl(row.source_url)) && !row.disabled_at && isRecord(row.source)
       && row.source.enabled !== false && states.get(row.source_url)?.status !== 'failed'
       && (upgradeSourceTemplateUrl(row.source_url) === row.source_url
@@ -1956,7 +1960,11 @@ async function admitRows(
   // （engineReadingSources）同一把：按 source 元数据（bookSourceName/bookSourceGroup 与库里 name 同源）
   // 判定即可，三个准入入口（Vercel 独立轮 / phoenix runner / 刷新尾部）都在这一处收口。
   // 滤出的源不消耗探测预算；既有 source_admission 旧行留库（展示侧照旧，池侧由分类器挡住）。
-  const probedRows = rows.filter((row) => classifySourceAdult(undefined, row.source) !== 'adult');
+  // adult1026：与池侧同口径做同站传染——本轮输入里同站任一源判 adult，整站都不评估。
+  const adultStations = adultStationKeys(rows, (row) => classifySourceAdult(undefined, row.source),
+    (row) => stationKeyOfUrl(row.url));
+  const probedRows = rows.filter((row) => classifySourceAdult(undefined, row.source) !== 'adult'
+    && !adultStations.has(stationKeyOfUrl(row.url)));
   rows = probedRows;
   // 在探测前固定快照；写前不得重读新规则冒充本轮已经测过的对象。
   const sourceSnapshots = rows.map(({ url, source }) => ({ url, source: structuredClone(source) }));
