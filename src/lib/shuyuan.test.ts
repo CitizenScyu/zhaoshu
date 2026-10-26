@@ -1159,7 +1159,7 @@ describe('refreshShuyuan atomic refresh', () => {
 
     it.each(['database', 'artifact'] as const)('共用引擎池在%s取行后剔除成人/损坏元数据，普通规则原样保留', async (mode) => {
       vi.stubEnv('SHUYUAN_READ_CACHE_TTL_MS', '0');
-      refreshSupportedHosts(['ordinary.example', 'adult.example', 'invalid.example']);
+      refreshSupportedHosts(['ordinary.example', 'adult.example', 'invalid.example', 'm.rouzhaiwu.info', 'www.adult.example']);
       fetchMock.mockImplementation(async () => { throw new Error('Unexpected synthetic network call'); });
       const ordinary = Object.freeze({ ...engineItem,
         bookSourceName: '普通漫画听书外文', bookSourceGroup: null,
@@ -1170,6 +1170,12 @@ describe('refreshShuyuan atomic refresh', () => {
         engineRow({ source_url: 'https://adult.example/group', name: '普通', source: { ...engineItem, bookSourceGroup: '文学|🔞' } }),
         engineRow({ source_url: 'https://adult.example/raw-name', name: '普通', source: { ...engineItem, bookSourceName: '🈲合集' } }),
         engineRow({ source_url: 'https://adult.example/name', name: '成人小说', source: engineItem }),
+        // adult1026：同站传染——名字没打标的同站孪生（含 www. 形态）随 adult.example 一起出池。
+        engineRow({ source_url: 'https://adult.example/twin', name: '🎃普通🎃', source: engineItem }),
+        engineRow({ source_url: 'https://www.adult.example/', name: '普通', source: engineItem }),
+        // adult1026：站名正常、域名是成人站。
+        engineRow({ source_url: 'https://m.rouzhaiwu.info/', name: '普通',
+          source: { ...engineItem, bookSourceUrl: 'https://m.rouzhaiwu.info' } }),
         engineRow({ source_url: 'https://invalid.example/', name: '🔞', source: { ...engineItem, bookSourceGroup: 7 } }),
         engineRow({ source_url: 'https://invalid.example/array', name: '普通', source: [] }),
         engineRow({ source_url: 'https://ordinary.example/disabled', name: '普通', source: ordinary, disabled_at: '2026-01-01' }),

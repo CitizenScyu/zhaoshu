@@ -229,6 +229,8 @@ describe('runAdmissionRunnerRound（phoenix runner）', () => {
       { source_url: 'https://adult.example/', source: { ...deadSource(0), bookSourceUrl: 'https://adult.example/', bookSourceName: '肉文屋1' } },
       { source_url: 'https://dead0.example/', source: deadSource(0) },
       { source_url: 'https://marked.example/', source: { ...deadSource(9), bookSourceUrl: 'https://marked.example/', bookSourceName: '🔞标记站' } },
+      // adult1026：与 marked.example 同站、名字没打标的孪生也不评估。
+      { source_url: 'https://m.marked.example/', source: { ...deadSource(8), bookSourceUrl: 'https://m.marked.example/', bookSourceName: '🎃标记站🎃' } },
     ];
     fetchMock.mockImplementation((input) => {
       const url = String(input);
@@ -240,7 +242,7 @@ describe('runAdmissionRunnerRound（phoenix runner）', () => {
     await vi.advanceTimersByTimeAsync(120_000 + 60_000);
     const summary = await settled;
     vi.useRealTimers();
-    // 源表 3 行,评估环只剩 dead0:成人源在 admitRows 入口即滤出(adultsrc42,三入口共一处)。
+    // 源表 4 行,评估环只剩 dead0:成人源及其同站孪生在 admitRows 入口即滤出(adultsrc42/adult1026,三入口共一处)。
     expect(summary).toMatchObject({ sources: 1, candidates: 1, probed: 1, written: 1 });
     expect(searches().every(([input]) => String(input).startsWith('https://dead0.'))).toBe(true);
     const insert = queries().find((query) => query.text.includes('INSERT INTO source_admission'))!;
