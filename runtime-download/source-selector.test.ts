@@ -467,5 +467,67 @@ describe('共用选源器', () => {
       expect((await h.selector(request({ task: aliasTask }), freshSignal())).picked).toEqual([]);
       expect(h.detailUrls).toEqual([]);
     });
+
+    // dlsearch-1026：搜索词清洗接线——带版本注记书名/国籍多作者串的任务，出网键是清洗后的值；
+    // 直等过滤认清洗键（源站通行书名）与任务原书名两个归一键，身份比对仍吃任务原值。
+    it('dlsearch-1026：搜索键用清洗值（版本注记书名/国籍作者串），身份比对仍用任务原值', async () => {
+      const task = {
+        id: 24,
+        title: '精灵宝钻（精装插图本）',
+        author: '[英] J.R.R.托尔金 著，[英] 泰德·纳史密斯 图',
+      };
+      // 形态 1：源站按通行书名（清洗键）列条目——搜到后须过直等过滤 + 身份门。
+      const commonName = harness({
+        pool: ['https://a.example/'],
+        search: (_url, key) => {
+          if (key === '精灵宝钻') {
+            return [{ title: '精灵宝钻', author: task.author, bookUrl: 'https://a.example/b1' }];
+          }
+          throw new Error(`unexpected search key: ${key}`);
+        },
+        detail: () => ({ title: task.title, author: task.author }),
+      });
+      expect((await commonName.selector(request({ task, targetHits: 1 }), freshSignal())).picked)
+        .toEqual(['https://a.example/']);
+      expect(commonName.searchKeys).toEqual(['精灵宝钻']);
+      // 形态 2：源站条目带同款注记（与任务书逐字一致）——原书名键分支。
+      const annotated = harness({
+        pool: ['https://b.example/'],
+        search: (_url, key) => {
+          if (key === '精灵宝钻') {
+            return [{ title: task.title, author: task.author, bookUrl: 'https://b.example/b1' }];
+          }
+          throw new Error(`unexpected search key: ${key}`);
+        },
+        detail: () => ({ title: task.title, author: task.author }),
+      });
+      expect((await annotated.selector(request({ task, targetHits: 1 }), freshSignal())).picked)
+        .toEqual(['https://b.example/']);
+      expect(annotated.searchKeys).toEqual(['精灵宝钻']);
+    });
+
+    it('dlsearch-1026：作者回退轮也用清洗后的作者键（[英] X 著，[英] Y 图 → 搜「J.R.R.托尔金」）', async () => {
+      const task = {
+        id: 25,
+        title: '精灵宝钻（精装插图本）',
+        author: '[英] J.R.R.托尔金 著，[英] 泰德·纳史密斯 图',
+      };
+      const h = harness({
+        pool: ['https://a.example/'],
+        search: (_url, key) => {
+          if (key === 'J.R.R.托尔金') {
+            return [{ title: '精灵宝钻', author: 'J.R.R.托尔金', bookUrl: 'https://a.example/w1' }];
+          }
+          return [];
+        },
+        detail: (bookUrl) => (bookUrl === 'https://a.example/w1'
+          ? { title: '精灵宝钻', author: 'J.R.R.托尔金' }
+          : { title: task.title, author: task.author }),
+      });
+      // 书名轮 0 命中 → 作者轮清洗键唯一候选，作者门（authorBridgeAccepts 用任务原值归一）对上。
+      expect((await h.selector(request({ task, targetHits: 1 }), freshSignal())).picked)
+        .toEqual(['https://a.example/']);
+      expect(h.searchKeys).toEqual(['精灵宝钻', 'J.R.R.托尔金']);
+    });
   });
 });

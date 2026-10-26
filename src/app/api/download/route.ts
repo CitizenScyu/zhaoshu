@@ -35,6 +35,8 @@ interface TaskRow {
   requested_by: string;
   retry_of: number | null;
   artifact_id: string | null;
+  attempt_count: number;
+  next_attempt_at: string | null;
 }
 
 function toTask(row: TaskRow) {
@@ -53,6 +55,10 @@ function toTask(row: TaskRow) {
     error: row.error,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
+    // 退避中的 pending（dlsearch-1026 任务 B）：UI 据此显示「暂无可用源，将于 HH:mm 自动重试」，
+    // 而不是误导性的「排队中」。attempt_count/next_attempt_at 由 worker 退避写入（download-task-policy）。
+    attemptCount: row.attempt_count,
+    nextAttemptAt: row.next_attempt_at,
     // 派生状态，不写库：running 但心跳已过期的任务在 UI 里视为可重试。
     leaseExpired: isLeaseExpired(row.status, row.updated_at),
   };
@@ -106,7 +112,7 @@ async function handleGET(req: NextRequest) {
     if (id !== null) {
       const rows = (await sql`
         SELECT id, book_id, title, author, status, requested_by, retry_of, artifact_id::text AS artifact_id, chapters_total, chapters_done,
-               chars_total, error, created_at::text AS created_at, to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS updated_at
+               chars_total, error, attempt_count, to_char(next_attempt_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS next_attempt_at, created_at::text AS created_at, to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS updated_at
         FROM download_tasks WHERE id = ${id} AND requested_by = 'user' AND user_id = ${auth.principal.userId}`) as unknown as TaskRow[];
       if (rows.length === 0) {
         return authJson({ error: 'task not found', code: 'TASK_NOT_FOUND' }, { status: 404 });
@@ -118,14 +124,14 @@ async function handleGET(req: NextRequest) {
       // 也不会误读别的用户在同一本书上的完成任务（F17/F18）。
       const rows = (await sql`
         SELECT id, book_id, title, author, status, requested_by, retry_of, artifact_id::text AS artifact_id, chapters_total, chapters_done,
-               chars_total, error, created_at::text AS created_at, to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS updated_at
+               chars_total, error, attempt_count, to_char(next_attempt_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS next_attempt_at, created_at::text AS created_at, to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS updated_at
         FROM download_tasks WHERE book_id = ${bookId} AND requested_by = 'user' AND user_id = ${auth.principal.userId}
         ORDER BY created_at DESC LIMIT 1`) as unknown as TaskRow[];
       return authJson({ task: rows.length > 0 ? toTask(rows[0]) : null });
     }
     const rows = (await sql`
       SELECT id, book_id, title, author, status, requested_by, retry_of, artifact_id::text AS artifact_id, chapters_total, chapters_done,
-             chars_total, error, created_at::text AS created_at, to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS updated_at
+             chars_total, error, attempt_count, to_char(next_attempt_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS next_attempt_at, created_at::text AS created_at, to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS updated_at
       FROM download_tasks WHERE requested_by = 'user' AND user_id = ${auth.principal.userId}
       ORDER BY created_at DESC LIMIT ${LIST_LIMIT}`) as unknown as TaskRow[];
     return authJson({ tasks: rows.map(toTask) });

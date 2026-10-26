@@ -3,6 +3,7 @@ import { normalizeBookTitle } from '../src/lib/book-identity';
 import { authorBridgeAccepts, authorBridgeCandidates, authorSearchKey } from '../src/lib/source-author-bridge';
 import { isHostSuspect, isPaywallHost } from '../src/lib/source-host-health';
 import { sourceAbortable } from '../src/lib/source-fetch';
+import { searchKeysOf } from '../src/lib/search-key';
 import { pageContext, type Transport } from './identity-precheck';
 
 type Identity = { title?: string; author?: string };
@@ -82,9 +83,14 @@ export function createSourceSelector(options: SourceSelectorOptions): SourceSele
     };
     signal.throwIfAborted();
     const context = pageContext(transport, signal, timeoutMs);
-    const title = normalizeBookTitle(task.title);
-    const hits = (await modules.api.engineSearchBook(engine, task.title, context)).filter(hit =>
-      typeof hit.title === 'string' && normalizeBookTitle(hit.title) === title
+    // dlsearch-1026：搜索词用清洗后的值（版本注记/国籍/角色词清洗见 src/lib/search-key.ts）。
+    // 书名直等过滤同时认「清洗键」与「任务原书名」两个归一键：任务带注记（精灵宝钻（精装插图本））
+    // 而源站按通行书名（精灵宝钻）收录时，只认原书名会把真书滤成 0 候选——搜到也匹配不上。
+    // 后续身份比对（identityMatches → sourceBookMatches）仍吃任务原值，判等口径不变。
+    const keys = searchKeysOf(task);
+    const titleKeys = new Set([normalizeBookTitle(keys.title), normalizeBookTitle(task.title)]);
+    const hits = (await modules.api.engineSearchBook(engine, keys.title, context)).filter(hit =>
+      typeof hit.title === 'string' && titleKeys.has(normalizeBookTitle(hit.title))
       && (!hit.author?.trim() || identityMatches(hit, hit, task)));
     for (const hit of hits.slice(0, 2)) {
       signal.throwIfAborted();
@@ -94,7 +100,7 @@ export function createSourceSelector(options: SourceSelectorOptions): SourceSele
     if (!authorSearchKey(task.title, task.author)) return false;
     // 搜索本身不 catch：宿主占用门失效（HOST_OCCUPANCY_UNAVAILABLE）必须照旧上抛 fail-closed，
     // 被这里吞掉会变成「这个源没书」而继续扫全池。
-    const authorHits = authorBridgeCandidates(await modules.api.engineSearchBook(engine, task.author, context));
+    const authorHits = authorBridgeCandidates(await modules.api.engineSearchBook(engine, keys.author, context));
     // B′ 门要求候选唯一 ⇒ 至多核 1 条详情。候选 >1（同作者多本）直接判这个源没书：
     // 没有书名证据时认哪一本都是猜，错配一本比 0 命中坏得多。
     if (authorHits.length !== 1) return false;
