@@ -2466,55 +2466,85 @@ describe('probecircuit1026：探测侧 conn_fail 熔断', () => {
     ...Array.from({ length: down }, (_, i) => cand(hostOf(i, 'down'))),
     ...Array.from({ length: up }, (_, i) => cand(hostOf(i, 'up'))),
   ];
+  /** 有连通基线的源：上次干净 ok、长周期复核已到期（circuitbase1026 判定只数这类）。 */
+  const known = (down: number, up: number) => {
+    const candidates = [
+      ...Array.from({ length: down }, (_, i) => cand(hostOf(i, 'downknown'))),
+      ...Array.from({ length: up }, (_, i) => cand(hostOf(i, 'upknown'))),
+    ];
+    const existing = new Map(candidates.map(({ url, source }) => [url, sourceRow(url, {
+      tier: 'M1', compile_ok: true, search_ok: true, search_verdict: 'ok',
+      search_checked_at: new Date(Date.now() - ADMISSION_OK_RECHECK_MS - 24 * 3_600_000).toISOString(),
+      rules_hash: rulesHash(source), engine_semantics_version: ENGINE_SEMANTICS_VERSION,
+    })]));
+    return { candidates, existing };
+  };
 
   it('阈值常量：至少 20 次有效探测、conn_fail 占比 ≥ 0.6', () => {
     expect(ADMISSION_CIRCUIT_MIN_PROBES).toBe(20);
     expect(ADMISSION_CIRCUIT_CONN_FAIL_RATIO).toBe(0.6);
   });
 
-  it('熔断：25 次中 15 次 conn_fail（60%）⇒ conn_fail 不落结论、改写未测占位；ok 照常写', async () => {
-    const result = await batch(fresh(15, 10));
-    expect(result.probed).toBe(25);
-    expect(result).toMatchObject({ circuitOpen: true, suppressedConnFail: 15 });
-    expect(result.verdicts).toEqual({ conn_fail: 15, ok: 10 }); // 观测口径不改
+  it('熔断：有基线的 25 次中 15 次 conn_fail（60%）⇒ 本轮 conn_fail 全不落结论（未测源写占位、已知源不写行）；ok 照常写', async () => {
+    const base = known(15, 10);
+    const result = await batch([...base.candidates, ...fresh(5, 0)], base.existing);
+    expect(result.probed).toBe(30);
+    expect(result).toMatchObject({ circuitOpen: true, suppressedConnFail: 20 });
+    expect(result.verdicts).toEqual({ conn_fail: 20, ok: 10 }); // 观测口径不改
     const byVerdict = Object.groupBy(result.rows, (row) => row.search_verdict);
     expect(byVerdict.ok).toHaveLength(10);
     expect(byVerdict.conn_fail).toBeUndefined();
-    expect(byVerdict['']).toHaveLength(15);
+    expect(byVerdict['']).toHaveLength(5);
     expect(byVerdict['']!.every((row) => row.search_ok === null && row.search_checked_at === null && row.error === '')).toBe(true);
+    expect(result.rows.some((row) => row.source_url.includes('downknown'))).toBe(false);
   });
 
-  it('未达阈值照旧：25 次中 14 次 conn_fail（56%）、19 次全 conn_fail（不足 20 次）都写真实 conn_fail', async () => {
-    const below = await batch(fresh(14, 11));
+  // 在池干净 ok 复核失败按既有机制记 recheck_fail: strike（不直接写 conn_fail）；熔断开时连 strike 都不吃。
+  const struck = (rows: AdmissionSourceRow[]) => rows.filter((row) => row.error.startsWith(ADMISSION_RECHECK_FAIL_PREFIX));
+
+  it('未达阈值照旧：有基线 25 次中 14 次 conn_fail（56%）、19 次全 conn_fail（不足 20 次）都照常记失败', async () => {
+    const belowBase = known(14, 11);
+    const below = await batch(belowBase.candidates, belowBase.existing);
     expect(below).toMatchObject({ circuitOpen: false, suppressedConnFail: 0 });
-    expect(below.rows.filter((row) => row.search_verdict === 'conn_fail')).toHaveLength(14);
-    const few = await batch(fresh(19, 0));
+    expect(struck(below.rows)).toHaveLength(14);
+    const fewBase = known(19, 0);
+    const few = await batch(fewBase.candidates, fewBase.existing);
     expect(few).toMatchObject({ circuitOpen: false, suppressedConnFail: 0 });
-    expect(few.rows.filter((row) => row.search_verdict === 'conn_fail')).toHaveLength(19);
+    expect(struck(few.rows)).toHaveLength(19);
+  });
+
+  it('circuitbase1026：全是未测新源时不熔断——死站多是常态（复现 2026-10-26 19:18：73% conn_fail 误触熔断）', async () => {
+    const result = await batch(fresh(73, 27));
+    expect(result.probed).toBe(100);
+    expect(result).toMatchObject({ circuitOpen: false, suppressedConnFail: 0 });
+    expect(result.rows.filter((row) => row.search_verdict === 'conn_fail')).toHaveLength(73);
   });
 
   it('上一次已是 conn_fail 的复测不计入占比：已知死站复测轮不触发熔断', async () => {
-    // 新探 20 次（10 conn_fail = 50%）+ 15 个到期复测的老 conn_fail 站仍挂：合计 25/35 = 71%，但判据只看 50%。
+    // 有基线新探 20 次（10 conn_fail = 50%）+ 15 个到期复测的老 conn_fail 站仍挂：合计 25/35 = 71%，但判据只看 50%。
     const dead = Array.from({ length: 15 }, (_, i) => cand(hostOf(i, 'downold')));
-    const existing = new Map(dead.map(({ url, source }) => [url, sourceRow(url, {
+    const base = known(10, 10);
+    const existing = new Map([...base.existing, ...dead.map(({ url, source }) => [url, sourceRow(url, {
       tier: 'M1', compile_ok: true, search_ok: false, search_verdict: 'conn_fail', error: 'fetch failed',
       search_checked_at: new Date(Date.now() - ADMISSION_CONN_FAIL_MAX_MS - 24 * 3_600_000).toISOString(),
       rules_hash: rulesHash(source), engine_semantics_version: ENGINE_SEMANTICS_VERSION,
-    })]));
-    const result = await batch([...fresh(10, 10), ...dead], existing);
+    })] as const)]);
+    const result = await batch([...base.candidates, ...dead], existing);
     expect(result.probed).toBe(35);
     expect(result).toMatchObject({ circuitOpen: false, suppressedConnFail: 0 });
-    expect(result.rows.filter((row) => row.search_verdict === 'conn_fail')).toHaveLength(25);
+    expect(result.rows.filter((row) => row.search_verdict === 'conn_fail')).toHaveLength(15);
+    expect(struck(result.rows)).toHaveLength(10);
   });
 
   it('熔断时在池 ok 行复核失败不吃 strike、不写行（旧结论原样保留）', async () => {
+    const base = known(15, 9);
     const inPool = cand('downpool.circuit.example.com');
-    const existing = new Map([[inPool.url, sourceRow(inPool.url, {
+    base.existing.set(inPool.url, sourceRow(inPool.url, {
       tier: 'M1', compile_ok: true, search_ok: true, search_verdict: 'ok',
       search_checked_at: new Date(Date.now() - ADMISSION_OK_RECHECK_MS - 24 * 3_600_000).toISOString(),
       rules_hash: rulesHash(inPool.source), engine_semantics_version: ENGINE_SEMANTICS_VERSION,
-    })]]);
-    const result = await batch([...fresh(15, 9), inPool], existing);
+    }));
+    const result = await batch([...base.candidates, inPool], base.existing);
     expect(result.probed).toBe(25);
     expect(result).toMatchObject({ circuitOpen: true, suppressedConnFail: 16 });
     expect(result.rows.some((row) => row.source_url === inPool.url)).toBe(false);

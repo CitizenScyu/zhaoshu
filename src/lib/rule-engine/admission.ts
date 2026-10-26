@@ -338,8 +338,8 @@ export const ADMISSION_PROBE_WORST_MS = 2 * ADMISSION_TIMEOUT_MS + ADMISSION_THR
 /**
  * 探测侧熔断（probecircuit1026）：一轮里大面积 conn_fail 多半是探测端出网故障，不是源同时死了。
  * 2026-10-25 10:00–14:00 CST 实证：探测端故障期间 531 行被记 conn_fail（超时 + fetch failed，319 host），
- * 每行再等 7 天退避才复测。判据只数「上一次不是 conn_fail」的探测——复测已知死站的轮次本来就满是
- * conn_fail，不能让它们触发熔断。熔断后本轮 conn_fail 结论按「没轮到」处理（有占位写占位、否则不写），
+ * 每行再等 7 天退避才复测。判据只数「上一次有过非 conn_fail 结论」的探测（circuitbase1026）——复测已知死站的
+ * 轮次本来就满是 conn_fail、未测新源没有连通基线，都不能触发熔断。熔断后本轮 conn_fail 结论按「没轮到」处理（有占位写占位、否则不写），
  * 旧结论原样保留、下一轮照旧到期重探；其它 verdict 照常写。
  */
 export const ADMISSION_CIRCUIT_MIN_PROBES = 20;
@@ -1399,10 +1399,15 @@ export async function runAdmissionBatch(input: AdmissionBatchInput): Promise<Adm
   await Promise.all(Array.from({ length: Math.min(concurrency, probes.length) }, () => probeWorker()));
 
   // probecircuit1026：熔断判定在汇总前，只改本轮真探出 conn_fail 的槽。
+  // circuitbase1026：只数「上一次有过非 conn_fail 结论」的探测——已知能连通的源大面积连不上才说明探测端出网故障；
+  // 未测新源没有基线（死站本就多），不参与判定。2026-10-26 19:18 实证：ADMISSION_NONCORE_JS 放开后一轮 120 个
+  // 全是未测新源、88 个 conn_fail（73%）误触熔断；结论不落库 ⇒ 它们恒为未测、恒排第一，轮轮重探轮轮熔断，
+  // 复测到期的源永远轮不到。判定只决定开不开；开了照旧压下本轮所有 conn_fail（含未测源）。
   let considered = 0;
   let consideredConnFail = 0;
   for (const [pick, verdict] of probedVerdicts) {
-    if (probes[pick].previous?.search_verdict === 'conn_fail') continue;
+    const previous = probes[pick].previous;
+    if (!previous || previous.search_ok === null || previous.search_verdict === 'conn_fail') continue;
     considered += 1;
     if (verdict === 'conn_fail') consideredConnFail += 1;
   }
