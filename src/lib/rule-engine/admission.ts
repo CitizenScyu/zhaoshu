@@ -19,8 +19,10 @@ import { parseFieldRule } from './parse';
 import {
   createScope, evaluateField, evaluateFieldList, normalizeBody,
 } from './evaluate';
-import { RuleEngineError, type RuleDiagnostic } from './types';
-import { engineSourceRevision } from './compile';
+import { RuleEngineError, type FieldIr, type RuleDiagnostic } from './types';
+import { compileSource, engineSourceRevision } from './compile';
+import { contentHtmlToText, contentNeedsHtmlToText } from './content-html';
+import { isStructuredChallengePage } from './content-challenge';
 
 // ---------------------------------------------------------------- 常量
 /**
@@ -686,6 +688,11 @@ const MAX_CANDIDATE_SCAN = 50;
 
 /** bookList 求值 → 逐条 name/bookUrl 可解析的候选 URL（设计 §4.1：≥1 条即 ok；对照判据比 URL 集）。 */
 function searchCandidateUrls(source: RawSource, text: string, pageUrl: string): string[] {
+  return searchCandidates(source, text, pageUrl).map((item) => item.url);
+}
+
+/** 同 searchCandidateUrls，带上书名（read1027 可读性影子腿按书名挑样本书）。url 为字段求值结果（@href 已绝对化，JSON 值可能仍是相对路径）。 */
+function searchCandidates(source: RawSource, text: string, pageUrl: string): { title: string; url: string }[] {
   const rules = source.ruleSearch;
   if (!rules || typeof rules !== 'object') return [];
   const bookList = (rules as Record<string, unknown>).bookList;
@@ -705,16 +712,16 @@ function searchCandidateUrls(source: RawSource, text: string, pageUrl: string): 
   // HTML 与 JSON 搜索页同一路径（JSON 页 bookList 取列表项，见 evaluateFieldList）。
   let items;
   try { items = evaluateFieldList(listIr, scope); } catch { return []; }
-  const urls: string[] = [];
+  const found: { title: string; url: string }[] = [];
   for (let i = 0; i < items.length && i < MAX_CANDIDATE_SCAN; i += 1) {
     const inner = items[i];
     try {
       const title = nameIr ? evaluateField(nameIr, inner) : '';
       const url = bookUrlIr ? evaluateField(bookUrlIr, inner) : '';
-      if (title.trim() && url.trim()) urls.push(url.trim());
+      if (title.trim() && url.trim()) found.push({ title: title.trim(), url: url.trim() });
     } catch { /* 单条候选求值失败：跳过，不影响整页判定（§3.4 失败隔离） */ }
   }
-  return urls;
+  return found;
 }
 
 export interface AdmissionSearchResult {
@@ -722,6 +729,8 @@ export interface AdmissionSearchResult {
   candidateCount: number;
   status?: number;
   error: string;
+  /** read1027：仅 sampleBook 开且 verdict=ok 时带——可读性影子腿用的样本书（url 可能为相对路径，pageUrl 为其基址）。 */
+  sample?: { title: string; url: string; pageUrl: string };
 }
 
 /**
@@ -745,6 +754,8 @@ export async function searchAdmission(source: RawSource, options: {
   keywordFallback?: boolean;
   /** 每次换词前的预算判定；缺省恒 true。返回 false 即不再换词。 */
   canRetryKeyword?: () => boolean;
+  /** read1027：ok 结果带样本书（书名含命中词的首个候选，否则首个候选）。缺省关：结果形状逐字不变。 */
+  sampleBook?: boolean;
 }): Promise<AdmissionSearchResult> {
   const keywords = options.keywordFallback ? admissionKeywords(source) : [admissionKeyword(source)];
   let result: AdmissionSearchResult | undefined;
@@ -800,7 +811,8 @@ async function searchAdmissionOnce(
   }
   if (response.status >= 500) return { verdict: 'http_5xx', candidateCount: 0, status: response.status, error: String(response.status) };
   if (response.status >= 400) return { verdict: 'http_4xx', candidateCount: 0, status: response.status, error: String(response.status) };
-  const urls = searchCandidateUrls(source, response.text, response.url);
+  const found = searchCandidates(source, response.text, response.url);
+  const urls = found.map((item) => item.url);
   const candidateCount = urls.length;
   if (candidateCount >= 1) {
     if (options.controlQuery) {
@@ -811,6 +823,10 @@ async function searchAdmissionOnce(
           error: `对照搜索结果重合 ${Math.round(overlap * 100)}%`,
         };
       }
+    }
+    if (options.sampleBook) {
+      const pick = found.find((item) => item.title.includes(keyword)) ?? found[0];
+      return { verdict: 'ok', candidateCount, status: response.status, error: '', sample: { ...pick, pageUrl: response.url } };
     }
     return { verdict: 'ok', candidateCount, status: response.status, error: '' };
   }
@@ -861,6 +877,124 @@ async function controlQueryOverlap(
   let shared = 0;
   for (const item of b) if (a.has(item)) shared += 1;
   return shared / (a.size + b.size - shared);
+}
+
+// ---------------------------------------------------------------- 可读性影子腿（read1027，只观测不判定）
+// 问题：准入只验「搜得到」，不验「读得了」。2026-10-26 实证下载侧 2233 本只有 527 本有成功候选、成功集中在
+// 22 个 host；chuangshi.qq.com 搜索 ok 却 empty_toc_page 1265 次，book.qq.com 前几章免费、后面付费墙。
+// 先上影子：搜索判 ok 的源顺手抽一本样本书走 详情 → 目录首页 → 目录中间一章正文，结论**只进本轮汇总与日志，
+// 不写库、不改 verdict、不影响池籍**；攒够几轮分布、核对误判后再决定要不要升级为准入判据。
+// 抽中间章而非首章：首章常是序/作品相关（短）、付费站首章免费——中间章才看得出付费墙与截断。
+/** 每轮最多做几次影子检查的上限夹值（单次最多 3 个请求，名额与刷新预算都按此量级估）。 */
+export const MAX_ADMISSION_READABILITY_SHADOW = 60;
+/** 正文去空白后少于此字数判 content_short——与下载侧 preview_truncated（中位 < 500 字）同口径。 */
+export const READABILITY_MIN_CHARS = 500;
+
+/** env `ADMISSION_READABILITY_SHADOW_MAX`：每轮影子检查次数；缺失/非法/≤0 = 关（默认关），超上限夹到上限。 */
+export function admissionReadabilityShadowMax(env: AdmissionProbesEnv = process.env): number {
+  const parsed = Number.parseInt(env.ADMISSION_READABILITY_SHADOW_MAX ?? '', 10);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? Math.min(parsed, MAX_ADMISSION_READABILITY_SHADOW) : 0;
+}
+
+export type ReadabilityVerdict =
+  | 'readable' | 'content_short' | 'content_empty' | 'toc_empty'
+  | 'challenge' | 'http_error' | 'fetch_fail' | 'url_invalid' | 'eval_error' | 'skipped';
+
+export interface ReadabilityShadowResult {
+  verdict: ReadabilityVerdict;
+  /** 目录首页解析出的章节数（不跟翻页）。 */
+  chapters: number;
+  /** 抽检章正文去空白后的字数。 */
+  chars: number;
+  /** 出错阶段与原因（`detail:`/`toc:`/`content:` 前缀），成功为空。 */
+  error: string;
+}
+
+class ReadabilityStop extends Error {
+  constructor(readonly verdict: ReadabilityVerdict, message: string) { super(message); }
+}
+
+/**
+ * 对一本样本书做一次可读性抽检（read1027）。请求走 admissionFetch + 准入门（新源的 host 还不在运行时门里，
+ * 不能用 api.ts 的 engineFetch*）；求值口径对齐 api.ts：tocUrl 缺省用详情页、chapterUrl 空用目录页 URL、
+ * 正文多段拼接并按规则类型做 HTML→文本；解码同运行时 responseCharset 'auto'（ENGINE_POST_SEARCH 开时按
+ * Content-Type）。只跑目录首页、不跟翻页，单本最多 3 个请求，请求间补节流间隔。
+ * 从不抛错：调用方中止或预算不足一律 skipped。
+ */
+export async function readabilityShadow(
+  source: RawSource,
+  sample: { url: string; pageUrl: string },
+  options: {
+    fetchPage: AdmissionTransport;
+    declaredHosts: ReadonlySet<string>;
+    signal: AbortSignal;
+    throttleMs?: number;
+    sleep?: (ms: number, signal: AbortSignal) => Promise<void>;
+    /** 每个请求前的预算判定；缺省恒 true。 */
+    canFetch?: () => boolean;
+  },
+): Promise<ReadabilityShadowResult> {
+  let stage = 'detail';
+  let chapters = 0;
+  const throttleMs = options.throttleMs ?? ADMISSION_THROTTLE_MS;
+  let requests = 0;
+  const gate = (value: string, base: string) =>
+    validateAdmissionUrl(upgradeSourceTemplateUrl(value), base, options.declaredHosts).href;
+  const get = async (url: string) => {
+    if (requests > 0 && throttleMs > 0) await (options.sleep ?? defaultSleep)(throttleMs, options.signal);
+    if (options.canFetch && !options.canFetch()) throw new ReadabilityStop('skipped', 'budget');
+    requests += 1;
+    const page = await admissionFetch({ url, method: 'GET', charset: 'utf-8' }, options);
+    if (page.status < 200 || page.status >= 300) {
+      throw new ReadabilityStop(page.status === 403 ? 'challenge' : 'http_error', String(page.status));
+    }
+    const scope = createScope(normalizeBody(page.text), page.url);
+    if (scope.kind === 'html' && isStructuredChallengePage(scope.$)) throw new ReadabilityStop('challenge', 'challenge_page');
+    return { url: page.url, scope };
+  };
+  try {
+    const compiled = compileSource({
+      url: typeof source.bookSourceUrl === 'string' ? source.bookSourceUrl : '', searchUrl: source.searchUrl,
+      rules: source as Record<string, unknown>,
+    });
+    const field = (name: string): FieldIr | undefined => {
+      const found = compiled.get(name);
+      return found && !('skipped' in found) ? found : undefined;
+    };
+    const text = (name: string, scope: ReturnType<typeof createScope>, multi = false) => {
+      const ir = field(name);
+      return ir ? evaluateField(ir, scope, multi) : '';
+    };
+    const detail = await get(gate(sample.url, sample.pageUrl));
+    stage = 'toc';
+    const rawToc = text('ruleBookInfo.tocUrl', detail.scope).trim();
+    const tocUrl = rawToc ? gate(rawToc, detail.url) : detail.url;
+    const toc = tocUrl === detail.url ? detail : await get(tocUrl);
+    const list = field('ruleToc.chapterList');
+    const urls: string[] = [];
+    for (const inner of list ? evaluateFieldList(list, toc.scope) : []) {
+      const title = text('ruleToc.chapterName', inner);
+      const rawUrl = text('ruleToc.chapterUrl', inner).trim();
+      let chapterUrl: string;
+      try { chapterUrl = rawUrl ? gate(rawUrl, toc.url) : toc.url; } catch { continue; }
+      if (title) urls.push(chapterUrl);
+    }
+    chapters = urls.length;
+    if (chapters === 0) return { verdict: 'toc_empty', chapters, chars: 0, error: list ? '' : 'toc:no_chapter_list' };
+    stage = 'content';
+    const content = await get(urls[Math.floor(chapters / 2)]);
+    const contentField = field('ruleContent.content');
+    const raw = text('ruleContent.content', content.scope, true);
+    const chars = (contentNeedsHtmlToText(contentField) ? contentHtmlToText(raw) : raw).replace(/\s/g, '').length;
+    const verdict: ReadabilityVerdict = chars === 0 ? 'content_empty' : chars < READABILITY_MIN_CHARS ? 'content_short' : 'readable';
+    return { verdict, chapters, chars, error: '' };
+  } catch (error) {
+    if (error instanceof ReadabilityStop) return { verdict: error.verdict, chapters, chars: 0, error: `${stage}:${error.message}` };
+    if (options.signal.aborted) return { verdict: 'skipped', chapters, chars: 0, error: `${stage}:aborted` };
+    const verdict: ReadabilityVerdict = error instanceof SourcePolicyError ? 'url_invalid'
+      : error instanceof RuleEngineError ? 'eval_error' : 'fetch_fail';
+    return { verdict, chapters, chars: 0, error: `${stage}:${errorMessage(error)}` };
+  }
 }
 
 // ---------------------------------------------------------------- 状态机（runAdmissionBatch）
@@ -923,6 +1057,18 @@ export interface AdmissionBatchInput {
    * ADMISSION_PHOENIX_OK_PREFIX；缺省不传 ⇒ 输出行逐字不变（Vercel 两条路径）。
    */
   okPrefix?: string;
+  /**
+   * read1027：本轮可读性影子检查次数上限（admissionReadabilityShadowMax）。缺省/0 = 关：搜索不带样本、
+   * 结果不带 readability 字段，输入输出逐字不变。开时只观测，rows 与 verdicts 不受影响。
+   */
+  readabilityShadow?: number;
+}
+
+/** read1027：本轮可读性影子检查汇总（只在 readabilityShadow > 0 时出现）。明细按计划序，不含书名与规则原文。 */
+export interface AdmissionReadabilitySummary {
+  checked: number;
+  verdicts: Record<string, number>;
+  samples: ({ host: string } & ReadabilityShadowResult)[];
 }
 
 export interface AdmissionBatchResult {
@@ -938,6 +1084,8 @@ export interface AdmissionBatchResult {
   circuitOpen: boolean;
   /** 熔断时按「没轮到」处理、未写 conn_fail 结论的探测数（未熔断恒 0）。 */
   suppressedConnFail: number;
+  /** read1027：可读性影子汇总，仅 readabilityShadow > 0 时出现。 */
+  readability?: AdmissionReadabilitySummary;
 }
 
 function hostOf(url: string): string {
@@ -1236,6 +1384,10 @@ export async function runAdmissionBatch(input: AdmissionBatchInput): Promise<Adm
   let upgradedSlots = Math.max(0, input.upgradedMaxProbes ?? admissionUpgradedMaxProbes());
   const canProbe = input.canProbe ?? (() => true);
   const concurrency = normalizeAdmissionConcurrency(input.probeConcurrency ?? admissionProbeConcurrency());
+  const shadowMax = Math.max(0, Math.trunc(input.readabilityShadow ?? 0));
+  let shadowSlots = shadowMax;
+  // read1027：影子结果按计划序下标归位（与 results 同理，不按完成先后）。
+  const shadowResults = new Map<number, { host: string } & ReadabilityShadowResult>();
 
   const plan = planProbeOrder(input, now().getTime());
   // 结果槽:与计划同序(undefined = 本条无行输出)。汇总后按计划顺序产出 rows。
@@ -1352,6 +1504,7 @@ export async function runAdmissionBatch(input: AdmissionBatchInput): Promise<Adm
           // 41-srcfix 改法1：换词不另占名额，但每次换词前与起探同一口径判预算/中止。
           keywordFallback: input.keywordFallback,
           canRetryKeyword: () => canProbe() && !input.signal.aborted,
+          ...(shadowMax > 0 ? { sampleBook: true } : {}),
         });
         verdicts[result.verdict] = (verdicts[result.verdict] ?? 0) + 1;
         probedVerdicts.set(pick, result.verdict);
@@ -1384,6 +1537,15 @@ export async function runAdmissionBatch(input: AdmissionBatchInput): Promise<Adm
           engine_semantics_version: semanticsVersionOf(item.hash), host: item.host,
           compile_diagnostics: [],
         };
+        // read1027：结论已落槽，影子检查只观测。仍在同站互斥内跑（不给同站加并发），每个请求前判预算。
+        if (result.sample && shadowSlots > 0 && canProbe() && !input.signal.aborted) {
+          shadowSlots -= 1;
+          const shadow = await readabilityShadow(item.candidate.source, result.sample, {
+            fetchPage: input.fetchPage, declaredHosts: input.declaredHosts, signal: input.signal,
+            throttleMs: input.throttleMs, sleep: input.sleep, canFetch: () => canProbe() && !input.signal.aborted,
+          });
+          shadowResults.set(item.index, { host: item.host, ...shadow });
+        }
       } finally {
         inflightHosts.delete(item.mutexHost);
         releaseWaiters();
@@ -1418,5 +1580,12 @@ export async function runAdmissionBatch(input: AdmissionBatchInput): Promise<Adm
 
   // 汇总:按计划顺序输出(先落槽后汇总 ⇒ 与完成先后无关;undefined 槽即本批无行)。
   for (const row of results) if (row !== undefined) rows.push(row);
-  return { rows, compileOk, compileRejected, probed, verdicts, grandfathered, circuitOpen, suppressedConnFail };
+  const summary: AdmissionBatchResult = { rows, compileOk, compileRejected, probed, verdicts, grandfathered, circuitOpen, suppressedConnFail };
+  if (shadowMax > 0) {
+    const samples = [...shadowResults.entries()].sort((a, b) => a[0] - b[0]).map(([, sample]) => sample);
+    const tally: Record<string, number> = {};
+    for (const sample of samples) tally[sample.verdict] = (tally[sample.verdict] ?? 0) + 1;
+    summary.readability = { checked: samples.length, verdicts: tally, samples };
+  }
+  return summary;
 }

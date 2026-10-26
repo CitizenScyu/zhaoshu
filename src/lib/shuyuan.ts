@@ -10,7 +10,7 @@ import {
 } from '@/lib/supported-sources';
 import {
   ADMISSION_MAX_REDIRECTS, ADMISSION_MIN_BUDGET_MS, ADMISSION_PHOENIX_OK_PREFIX, ADMISSION_PROBE_WORST_MS,
-  assertAdmissionVersionConsistent, defaultAdmissionTransport, rulesHash, runAdmissionBatch,
+  admissionReadabilityShadowMax, assertAdmissionVersionConsistent, defaultAdmissionTransport, rulesHash, runAdmissionBatch,
   type AdmissionCandidate, type AdmissionSourceRow,
 } from '@/lib/rule-engine/admission';
 import { admissionNoncoreJsEnabled, enginePostSearchEnabled, selectCandidates, type RawSource } from '@/lib/rule-engine/compile-smoke';
@@ -2032,6 +2032,7 @@ async function admitRows(
       const write = await writeAdmissionRows(s, [], handle, sourceSnapshots, signal);
       return 'skipped' in write ? write : { skipped: 'no_candidates' };
     }
+    const readabilityShadow = admissionReadabilityShadowMax();
     const result = await runAdmissionBatch({
       candidates: [...candidates, ...frozen], declaredHosts, existing, fetchPage: defaultAdmissionTransport, signal,
       // espfix41：开查询不敏感对照搜索，单探最坏 = 主搜索 + 对照搜索（ADMISSION_PROBE_WORST_MS），止损按它预留。
@@ -2041,6 +2042,8 @@ async function admitRows(
       canProbe: () => !signal.aborted && budget.remainingMs > ADMISSION_PROBE_WORST_MS + WRITE_RESERVE_MS,
       // admrunner42：只有 phoenix runner 传 okPrefix；Vercel 两条路径不传 ⇒ 展开为空对象，输入形状逐字不变。
       ...(options.okPrefix ? { okPrefix: options.okPrefix } : {}),
+      // read1027：可读性影子腿（env ADMISSION_READABILITY_SHADOW_MAX，默认关）；只出日志，不改写库行。
+      ...(readabilityShadow > 0 ? { readabilityShadow } : {}),
     });
     // 准入兼容 L4（§2.4）：每轮一行漂移计数（不建历史表；要趋势曲线再上日表，Phase 2）。
     console.log('shuyuan admission batch', {
@@ -2052,6 +2055,13 @@ async function admitRows(
       probed: result.probed,
       ...(result.circuitOpen ? { circuitOpen: true, suppressedConnFail: result.suppressedConnFail, verdicts: result.verdicts } : {}),
     });
+    if (result.readability) {
+      const { checked, verdicts, samples } = result.readability;
+      console.log('shuyuan admission readability shadow', {
+        checked, verdicts,
+        samples: samples.map((sample) => `${sample.host} ${sample.verdict} ${sample.chapters}/${sample.chars}${sample.error ? ` ${sample.error}` : ''}`),
+      });
+    }
     const write = await writeAdmissionRows(s, result.rows, handle, sourceSnapshots, signal);
     if ('skipped' in write) return write;
     summary = {
