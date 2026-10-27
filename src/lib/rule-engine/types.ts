@@ -213,6 +213,11 @@ export interface FieldIr {
    * （不含 JS）。求值期宿主回调只认这里的键，在字段作用域上取值（见 evaluate.ts jsBindings）。
    */
   jsGets?: ReadonlyMap<string, FieldIr>;
+  /**
+   * JS 链用到了对称加解密 / toNumChapter 帮手（jsutil1028，ENGINE_SYNTAX_JS_UTIL）：求值期只给这样的字段装这批帮手，
+   * 其余字段的沙箱逐字不变（见 js-sandbox.ts JsBindings.utilHelpers）。
+   */
+  jsUtil?: true;
 }
 
 /** 装饰字段编译失败不阻断，标 skip 的占位。 */
@@ -233,6 +238,14 @@ export const JS_JAVA_HELPERS: ReadonlySet<string> = new Set([
 ]);
 /** 读字段作用域的 java.* 宿主回调（jsget1028）：不在 JS_JAVA_HELPERS 里，只在 ENGINE_SYNTAX_JS_GET on 且实参是字面量时放行。 */
 export const JS_JAVA_GETTERS: ReadonlySet<string> = new Set(['getString', 'getStringList']);
+/**
+ * 对称加解密与章节号帮手（jsutil1028）：不在 JS_JAVA_HELPERS 里，只在 ENGINE_SYNTAX_JS_UTIL on 时放行。弃用的 aes/des/3DES 包装
+ * 只收 legado 里等价于 createSymmetricCrypto(...).decryptStr/encryptBase64 的几个（js-sandbox.ts UTIL_PRELUDE 同名单）。
+ */
+export const JS_JAVA_UTIL_HELPERS: ReadonlySet<string> = new Set([
+  'createSymmetricCrypto', 'aesBase64DecodeToString', 'aesDecodeToString', 'aesEncodeToBase64String', 'desDecodeToString',
+  'desBase64DecodeToString', 'desEncodeToBase64String', 'tripleDESDecodeStr', 'tripleDESEncodeBase64Str', 'toNumChapter',
+]);
 export const MAX_CSS_CHAIN_DEPTH = 8; //         CssStep 链深上限
 export const MAX_REGEX_PATTERN_LENGTH = 256; //  正则 pattern 长度上限
 /** || 组合分支数上限（P1a，设计 §5.1 建议 16 的保守起点；2048 字符规则串最多也就 ~1024 支，预算前置防滥用）。 */

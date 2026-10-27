@@ -7,6 +7,7 @@ import {
   CssStep,
   FieldIr,
   JS_JAVA_HELPERS,
+  JS_JAVA_UTIL_HELPERS,
   JsonPathIr,
   JsTemplatePart,
   MAX_CSS_CHAIN_DEPTH,
@@ -25,7 +26,7 @@ import { parseJsonPath } from './jsonpath';
 import { AIO_LIST_FIELDS, isAioListField, isAioListRule, parseAioField } from './aio-syntax';
 import {
   engineSyntaxAioEnabled, engineSyntaxAndEnabled, engineSyntaxJsBindEnabled, engineSyntaxJsEnabled, engineSyntaxJsExtEnabled,
-  engineSyntaxJsGetEnabled, engineSyntaxListJsEnabled, engineSyntaxOrEnabled,
+  engineSyntaxJsGetEnabled, engineSyntaxJsUtilEnabled, engineSyntaxListJsEnabled, engineSyntaxOrEnabled,
   engineSyntaxRegexEnabled, engineSyntaxXPathEnabled, engineSyntaxXPathEvalEnabled,
 } from './syntax-flags';
 import { compileXPath, XPathSyntaxError } from './xpath-eval';
@@ -560,6 +561,11 @@ export interface ParseOptions {
    * 编译进 FieldIr.jsGets 白名单（collectJavaGets）。默认读 env（缺失=off）。
    */
   jsGetEnabled?: boolean;
+  /**
+   * 对称加解密 / toNumChapter 帮手（ENGINE_SYNTAX_JS_UTIL，jsutil1028；须 jsEnabled）：字符串字段 JS 链里放行 JS_JAVA_UTIL_HELPERS，
+   * 用到的字段标 FieldIr.jsUtil（列表 JS 与 makeUp 不收）。默认读 env（缺失=off）。
+   */
+  jsUtilEnabled?: boolean;
 }
 
 export function parseFieldRule(rule: string, options: ParseOptions = {}): FieldIr {
@@ -797,6 +803,7 @@ function parseJsChain(trimmed: string, rule: string, options: ParseOptions): Fie
   };
   const gets: JsGets | undefined = (options.jsGetEnabled ?? engineSyntaxJsGetEnabled())
     ? { options: segmentOptions, out: new Map() } : undefined;
+  const util: JsUtil | undefined = (options.jsUtilEnabled ?? engineSyntaxJsUtilEnabled()) ? { used: false } : undefined;
   const chain: ChainStage[] = [];
   const pushRule = (text: string) => {
     const segment = text.trim();
@@ -815,14 +822,14 @@ function parseJsChain(trimmed: string, rule: string, options: ParseOptions): Fie
     const detached = itemLevel && chain.length === 0;
     if (detached && !(jsExt && !jsReadsInput(code))) unsupported('条目级字段首段不能是 JS', rule, { code: 'unsupported_js' });
     if (jsExt) {
-      const stage = parseJsExtStage(code, rule, itemLevel, segmentOptions, binds, gets);
+      const stage = parseJsExtStage(code, rule, itemLevel, segmentOptions, binds, gets, util);
       if (detached) {
         if (stage.kind !== 'js') unsupported('条目级字段首段不能是纯正则', rule, { code: 'unsupported_js' });
         stage.detached = true;
       }
       chain.push(stage);
     } else {
-      checkJsCode(code, rule, itemLevel, false, binds, gets);
+      checkJsCode(code, rule, itemLevel, false, binds, gets, util);
       chain.push({ kind: 'js', code });
     }
     last = match.index + match[0].length;
@@ -830,6 +837,7 @@ function parseJsChain(trimmed: string, rule: string, options: ParseOptions): Fie
   pushRule(trimmed.slice(last));
   const out: FieldIr = { rules: [], chain };
   if (gets && gets.out.size > 0) out.jsGets = gets.out;
+  if (util?.used) out.jsUtil = true;
   return out;
 }
 
@@ -973,11 +981,11 @@ function isMakeUpRule(text: string): boolean {
  * `{{规则}}` 按普通规则编译（不嵌 JS），`{{JS}}` 与拼回后的代码骨架过同一套白名单。
  */
 function parseJsExtStage(
-  code: string, rule: string, itemLevel: boolean, segmentOptions: ParseOptions, binds?: JsBinds, gets?: JsGets,
+  code: string, rule: string, itemLevel: boolean, segmentOptions: ParseOptions, binds?: JsBinds, gets?: JsGets, util?: JsUtil,
 ): ChainStage {
   if (/@(?:get|put):/i.test(code)) unsupported('JS 段含 @get/@put', rule, { code: 'unsupported_js' });
   if (!code.includes('##') && !code.includes('{{')) {
-    checkJsCode(code, rule, itemLevel, true, binds, gets);
+    checkJsCode(code, rule, itemLevel, true, binds, gets, util);
     return { kind: 'js', code };
   }
   if (!code.includes('{{')) {
@@ -986,7 +994,7 @@ function parseJsExtStage(
     const regex = makeUpRegex(parts, rule);
     // legado getString：makeUp 后代码为空、有替换时跳过 evalJS，只对上一段结果做替换。
     if (body === '' && regex) return { kind: 'regex', regex: [regex] };
-    checkJsCode(body, rule, itemLevel, true, binds, gets);
+    checkJsCode(body, rule, itemLevel, true, binds, gets, util);
     const stage: ChainStage = { kind: 'js', code: body };
     if (regex) stage.regex = regex;
     return stage;
@@ -1002,7 +1010,7 @@ function parseJsExtStage(
     if (isMakeUpRule(inner)) {
       template.push({ kind: 'rule', field: parseFieldRule(inner, segmentOptions) });
     } else {
-      checkJsCode(inner, rule, itemLevel, true, binds, gets);
+      checkJsCode(inner, rule, itemLevel, true, binds, gets, util);
       template.push({ kind: 'js', code: inner });
     }
     last = match.index + match[0].length;
@@ -1016,7 +1024,7 @@ function parseJsExtStage(
   // jsget1028：getter 先在带占位的骨架上收（实参含占位的留给白名单拒），再把占位换成数字过白名单。
   if (body !== '' || parts.length < 2) {
     const checked = gets ? collectJavaGets(body, rule, gets) : body;
-    checkJsCode(checked.replaceAll(TEMPLATE_HOLE, '0'), rule, itemLevel, true, binds);
+    checkJsCode(checked.replaceAll(TEMPLATE_HOLE, '0'), rule, itemLevel, true, binds, undefined, util);
   }
   // 正则段里没有占位时编译期即可校验（有占位的留到求值期）。
   if (parts.length > 1 && !parts[1].includes(TEMPLATE_HOLE)) makeUpRegex(parts, rule);
@@ -1053,9 +1061,10 @@ function makeUpRegex(parts: readonly string[], rule: string): RegexSub | undefin
 /**
  * JS 段的编译期白名单（沙箱内的二道防线见 js-sandbox.ts）。`allowEval`（jsext1028）：放行 `eval`（代码同样在沙箱里跑）。
  * `binds`（bind1028）：该字段可读的宿主绑定，命中的标识符只许读白名单成员、不许赋值/自增。
+ * `util`（jsutil1028）：另放行 JS_JAVA_UTIL_HELPERS，用到即记 `used`（调用方据此给字段标 jsUtil）。
  */
 function checkJsCode(
-  code: string, rule: string, itemLevel: boolean, allowEval = false, binds?: JsBinds, gets?: JsGets,
+  code: string, rule: string, itemLevel: boolean, allowEval = false, binds?: JsBinds, gets?: JsGets, util?: JsUtil,
 ): void {
   const reject = (why: string): never => unsupported(`JS 段${why}`, rule, { code: 'unsupported_js' });
   if (code.trim() === '') reject('为空');
@@ -1074,8 +1083,18 @@ function checkJsCode(
     }
     if (name !== 'java') continue;
     const member = /^\s*\.\s*([A-Za-z_$][\w$]*)/.exec(bare.slice(match.index + name.length));
+    if (member && util && JS_JAVA_UTIL_HELPERS.has(member[1])) {
+      util.used = true;
+      continue;
+    }
     if (!member || !JS_JAVA_HELPERS.has(member[1])) reject(`用了沙箱不提供的 java.${member?.[1] ?? '[…]'}`);
   }
+}
+
+// ---- 对称加解密 / toNumChapter 帮手（jsutil1028，ENGINE_SYNTAX_JS_UTIL）----
+/** 一条 JS 链编译期的帮手使用记录：任一段用到即 `used`。 */
+interface JsUtil {
+  used: boolean;
 }
 
 // ---- java.getString/getStringList（jsget1028，ENGINE_SYNTAX_JS_GET）----

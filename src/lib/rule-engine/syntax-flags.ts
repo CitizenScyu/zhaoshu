@@ -23,11 +23,11 @@ export const ENGINE_SEMANTICS_XPATH_BIT = 2;
 /** vars1027：@put/@get 静态子集语义位。版本再 +4（5–8 = 含变量位的四种组合），1–4 逐字不变。 */
 export const ENGINE_SEMANTICS_VARS_BIT = 4;
 
-/** 语义版本随 || / XPath / 变量 / JS / XPath 求值 / 正则 / && / AllInOne / 搜索 JS / 列表 JS / JS 扩展 / 宿主绑定 / java.getString 开关联动（唯一口径，供 compile.ts 缓存键与 rulesHash 复用）。 */
+/** 语义版本随 || / XPath / 变量 / JS / XPath 求值 / 正则 / && / AllInOne / 搜索 JS / 列表 JS / JS 扩展 / 宿主绑定 / java.getString / 加解密帮手开关联动（唯一口径，供 compile.ts 缓存键与 rulesHash 复用）。 */
 export function engineSemanticsVersion(
   orEnabled: boolean, xpathEnabled = false, varsEnabled = false, jsEnabled = false, xpathEvalEnabled = false,
   regexEnabled = false, andEnabled = false, aioEnabled = false, searchJsEnabled = false, listJsEnabled = false,
-  jsExtEnabled = false, jsBindEnabled = false, jsGetEnabled = false,
+  jsExtEnabled = false, jsBindEnabled = false, jsGetEnabled = false, jsUtilEnabled = false,
 ): number {
   return (orEnabled ? ENGINE_SEMANTICS_VERSION_OR : ENGINE_SEMANTICS_VERSION)
     + (xpathEnabled ? ENGINE_SEMANTICS_XPATH_BIT : 0) + (varsEnabled ? ENGINE_SEMANTICS_VARS_BIT : 0)
@@ -35,7 +35,8 @@ export function engineSemanticsVersion(
     + (regexEnabled ? ENGINE_SEMANTICS_REGEX_BIT : 0) + (andEnabled ? ENGINE_SEMANTICS_AND_BIT : 0)
     + (aioEnabled ? ENGINE_SEMANTICS_AIO_BIT : 0) + (searchJsEnabled ? ENGINE_SEMANTICS_SEARCH_JS_BIT : 0)
     + (listJsEnabled ? ENGINE_SEMANTICS_LIST_JS_BIT : 0) + (jsExtEnabled ? ENGINE_SEMANTICS_JS_EXT_BIT : 0)
-    + (jsBindEnabled ? ENGINE_SEMANTICS_JS_BIND_BIT : 0) + (jsGetEnabled ? ENGINE_SEMANTICS_JS_GET_BIT : 0);
+    + (jsBindEnabled ? ENGINE_SEMANTICS_JS_BIND_BIT : 0) + (jsGetEnabled ? ENGINE_SEMANTICS_JS_GET_BIT : 0)
+    + (jsUtilEnabled ? ENGINE_SEMANTICS_JS_UTIL_BIT : 0);
 }
 
 /**
@@ -234,5 +235,22 @@ export const ENGINE_SEMANTICS_JS_GET_BIT = 4096;
  */
 export function engineSyntaxJsGetEnabled(env: OrEnv = process.env): boolean {
   const raw = env.ENGINE_SYNTAX_JS_GET?.trim().toLowerCase();
+  return raw === '1' || raw === 'true' || raw === 'on';
+}
+
+/**
+ * jsutil1028：对称加解密 / toNumChapter 帮手语义位。版本再 +8192（8193–16384），1–8192 逐字不变。
+ * 只对 off 态被拒、on 态编译通过的字段所在源计入（compile.ts sourceUsesJsUtilSyntax）。
+ */
+export const ENGINE_SEMANTICS_JS_UTIL_BIT = 8192;
+
+/**
+ * ENGINE_SYNTAX_JS_UTIL 独立开关（jsutil1028，默认 off，口径同 ENGINE_SYNTAX_OR；须 ENGINE_SYNTAX_JS 同开才生效）。
+ * on = 字符串字段的 JS 链里放行 `java.createSymmetricCrypto(...)` 的 decryptStr/encryptBase64/encryptHex、几个等价的弃用
+ * aes/des/3DES 包装与 `java.toNumChapter`，按 legado（hutool SymmetricCrypto、StringUtils.stringToInt）口径在宿主实现；
+ * 口径不定的输入（非字符串实参、非 UTF-8 明文、奇数长 hex、CBC 缺 IV…）一律求值失败。off = 逐字不变。
+ */
+export function engineSyntaxJsUtilEnabled(env: OrEnv = process.env): boolean {
+  const raw = env.ENGINE_SYNTAX_JS_UTIL?.trim().toLowerCase();
   return raw === '1' || raw === 'true' || raw === 'on';
 }

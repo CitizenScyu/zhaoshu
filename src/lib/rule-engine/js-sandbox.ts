@@ -11,6 +11,7 @@
 
 import { createHash } from 'node:crypto';
 import type { QuickJSContext, QuickJSHandle, QuickJSSyncVariant, QuickJSWASMModule } from 'quickjs-emscripten-core';
+import { symmetricCrypt, toNumChapter, type SymOp } from './js-util';
 import { RuleEngineError } from './types';
 
 const WASM_INITIAL_PAGES = 256; // 16MB
@@ -62,6 +63,11 @@ export interface JsBindings {
    * 返回字符串、字符串数组（带 size()/get()）或 null。同名覆盖纯计算帮手。
    */
   callbacks?: Readonly<Record<string, (arg: string) => JsValue | null>>;
+  /**
+   * 装对称加解密 / toNumChapter 帮手（jsutil1028，名单见 types.ts JS_JAVA_UTIL_HELPERS）：只给编译期标了 FieldIr.jsUtil 的字段开，
+   * 其余求值的沙箱逐字不变。帮手失败与回调一样致命。
+   */
+  utilHelpers?: boolean;
 }
 
 let ready: QuickJSWASMModule | undefined;
@@ -185,6 +191,71 @@ const PRELUDE = `(function(){
   if (Array.isArray(globalThis.result)) asList(globalThis.result);
 })();`;
 
+// jsutil1028：加解密 / toNumChapter 帮手，排在 PRELUDE 前（PRELUDE 末尾冻结 java）。宿主函数藏在 __jsutil 里，闭包取走后删掉全局。
+// 实参严格按 legado 的 Kotlin 签名：个数不对、非字符串（null 只在可空处放行）、含孤立代理项一律经 bad() 致命失败。
+// createSymmetricCrypto 返回代理：只有 decryptStr/encryptBase64/encryptHex 三个方法，碰其他属性（decrypt/encrypt、toString…）致命。
+const UTIL_PRELUDE = `(function(){
+  var u = globalThis.__jsutil, j = globalThis.java;
+  delete globalThis.__jsutil;
+  var bad = u.bad, sym = u.sym, num = u.num, P = Proxy, S = String;
+  var cca = Function.prototype.call.bind(String.prototype.charCodeAt);
+  var hasOwn = Function.prototype.call.bind(Object.prototype.hasOwnProperty);
+  function str(v, what) {
+    if (typeof v !== 'string') bad(what + ' 不是字符串');
+    for (var i = 0; i < v.length; i++) {
+      var c = cca(v, i);
+      if (c >= 0xD800 && c <= 0xDBFF) {
+        var d = cca(v, i + 1);
+        if (d >= 0xDC00 && d <= 0xDFFF) { i++; continue; }
+        bad(what + ' 含孤立代理项');
+      }
+      if (c >= 0xDC00 && c <= 0xDFFF) bad(what + ' 含孤立代理项');
+    }
+    return v;
+  }
+  function arity(n, want, name) { if (n !== want) bad(name + ' 的参数个数不对'); }
+  j.createSymmetricCrypto = function(t, key, iv) {
+    var n = arguments.length;
+    if (n !== 2 && n !== 3) bad('createSymmetricCrypto 的参数个数不对');
+    str(t, 'transformation'); str(key, 'key');
+    var v = n === 3 && iv !== null ? str(iv, 'iv') : '';
+    sym('check', t, key, v, '');
+    function op(name) {
+      return function(data) { arity(arguments.length, 1, name); return sym(name, t, key, v, str(data, 'data')); };
+    }
+    var ops = { decryptStr: op('decryptStr'), encryptBase64: op('encryptBase64'), encryptHex: op('encryptHex') };
+    function deny(o, p) { bad('SymmetricCrypto.' + S(p)); }
+    return new P(ops, {
+      get: function(o, p) { if (typeof p === 'string' && hasOwn(o, p)) return o[p]; deny(o, p); },
+      set: deny, defineProperty: deny, deleteProperty: deny,
+    });
+  };
+  function dep(name, op) {
+    j[name] = function(data, key, t, iv) {
+      arity(arguments.length, 4, name);
+      return sym(op, str(t, 'transformation'), str(key, 'key'), str(iv, 'iv'), str(data, 'data'));
+    };
+  }
+  dep('aesBase64DecodeToString', 'decryptStr'); dep('aesDecodeToString', 'decryptStr');
+  dep('desDecodeToString', 'decryptStr'); dep('desBase64DecodeToString', 'decryptStr');
+  dep('aesEncodeToBase64String', 'encryptBase64'); dep('desEncodeToBase64String', 'encryptBase64');
+  function dep3(name, op) {
+    j[name] = function(data, key, mode, padding, iv) {
+      arity(arguments.length, 5, name);
+      var t = 'DESede/' + str(mode, 'mode') + '/' + str(padding, 'padding');
+      return sym(op, t, str(key, 'key'), str(iv, 'iv'), str(data, 'data'));
+    };
+  }
+  dep3('tripleDESDecodeStr', 'decryptStr'); dep3('tripleDESEncodeBase64Str', 'encryptBase64');
+  j.toNumChapter = function(s) {
+    arity(arguments.length, 1, 'toNumChapter');
+    return s === null ? null : num(str(s, 'toNumChapter 实参'));
+  };
+})();
+`;
+
+const SYM_OPS: ReadonlySet<string> = new Set<SymOp | 'check'>(['check', 'decryptStr', 'encryptBase64', 'encryptHex']);
+
 // ---------------------------------------------------------------- 求值
 /**
  * 同步执行一段规则 JS，返回值按 legado 口径转换：null/undefined → null（legado RhinoScriptEngine 把 Undefined
@@ -247,7 +318,7 @@ function runInFreshRuntime<T>(
     const context = runtime.newContext();
     try {
       const host = installGlobals(context, bindings);
-      const prelude = context.evalCode(PRELUDE, 'prelude.js');
+      const prelude = context.evalCode(bindings.utilHelpers ? UTIL_PRELUDE + PRELUDE : PRELUDE, 'prelude.js');
       if (prelude.error) {
         prelude.error.dispose();
         return evalFailed('JS 沙箱初始化失败');
@@ -357,7 +428,37 @@ function installGlobals(context: QuickJSContext, bindings: JsBindings): { failur
   }
   setGlobal('java', java);
   java.dispose();
+  if (bindings.utilHelpers) installUtilHost(context, host);
   return host;
+}
+
+/** jsutil1028 的宿主函数（UTIL_PRELUDE 包装）：失败记进 host.failure，与 getter 回调一样致命。 */
+function installUtilHost(context: QuickJSContext, host: { failure?: unknown }): void {
+  const util = context.newObject();
+  const add = (name: string, impl: (args: string[]) => string) => {
+    const fn = context.newFunction(name, (...args) => {
+      try {
+        const out = impl(args.map((arg) => context.getString(arg)));
+        if (out.length > MAX_JS_OUTPUT_CHARS) throw new Error(`java 帮手 ${name} 输出过大`);
+        return context.newString(out);
+      } catch (error) {
+        host.failure ??= error;
+        throw error;
+      }
+    });
+    context.setProp(util, name, fn);
+    fn.dispose();
+  };
+  add('sym', ([op, transformation, key, iv, data]) => {
+    if (!SYM_OPS.has(op)) throw new Error('未知的加解密操作');
+    return symmetricCrypt(op as SymOp | 'check', transformation, key, iv, data);
+  });
+  add('num', ([text]) => toNumChapter(text));
+  add('bad', ([what]) => {
+    throw new Error(`java 帮手不支持：${what}`);
+  });
+  context.setProp(context.global, '__jsutil', util);
+  util.dispose();
 }
 
 function exportValue(context: QuickJSContext, handle: QuickJSHandle): JsValue | null {
