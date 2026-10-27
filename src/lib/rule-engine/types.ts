@@ -83,7 +83,25 @@ export type JsonPathSegment =
   | { kind: 'filterEq'; name: string; value: string | number | boolean } // [?(@.x==y)]
   // ..[n] / ..[n,m] / ..[a:b]（Jayway ScanPathToken + 数组 token）：elements=false 时产出每个数组本身
   // （后接下标段），elements=true 时产出每个数组的全部元素（数组 token 不是末段，Jayway 略过下标）。
-  | { kind: 'arrayScan'; elements: boolean };
+  | { kind: 'arrayScan'; elements: boolean }
+  // [?(表达式)]（jsonpath1028，ENGINE_SYNTAX_JSON_PATH 下 off 态解析不了的路径才产出）：Jayway PredicatePathToken——
+  // 对象节点判它自身、数组节点逐元素判，标量节点不产出
+  | { kind: 'filter'; expr: JsonPathFilterExpr };
+
+/** jsonpath1028 过滤器字面量（Jayway FilterCompiler.readLiteral 子集）。number 另带 BigDecimal.toString 口径的 canonical。 */
+export type JsonPathFilterLiteral =
+  | { kind: 'string'; value: string }
+  | { kind: 'number'; value: number; canonical: string }
+  | { kind: 'bool'; value: boolean }
+  | { kind: 'null' };
+
+/** jsonpath1028 过滤器表达式：`@.a.b` 存在性、`@.a.b <op> 字面量`、`&&`/`||`/`!`/括号。 */
+export type JsonPathFilterExpr =
+  | { kind: 'exists'; path: string[]; negate: boolean }
+  | { kind: 'cmp'; path: string[]; op: '==' | '!=' | '<' | '<=' | '>' | '>='; value: JsonPathFilterLiteral }
+  | { kind: 'and'; items: JsonPathFilterExpr[] }
+  | { kind: 'or'; items: JsonPathFilterExpr[] }
+  | { kind: 'not'; item: JsonPathFilterExpr };
 
 export interface JsonPathIr {
   segments: JsonPathSegment[];

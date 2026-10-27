@@ -26,7 +26,7 @@ import { parseJsonPath } from './jsonpath';
 import { AIO_LIST_FIELDS, isAioListField, isAioListRule, parseAioField } from './aio-syntax';
 import {
   engineSyntaxAioEnabled, engineSyntaxAndEnabled, engineSyntaxJsBindEnabled, engineSyntaxJsEnabled, engineSyntaxJsExtEnabled,
-  engineSyntaxJsGetEnabled, engineSyntaxJsUtilEnabled, engineSyntaxListJsEnabled, engineSyntaxOrEnabled,
+  engineSyntaxJsGetEnabled, engineSyntaxJsonPathEnabled, engineSyntaxJsUtilEnabled, engineSyntaxListJsEnabled, engineSyntaxOrEnabled,
   engineSyntaxRegexEnabled, engineSyntaxXPathEnabled, engineSyntaxXPathEvalEnabled,
 } from './syntax-flags';
 import { compileXPath, XPathSyntaxError } from './xpath-eval';
@@ -35,6 +35,12 @@ import { looksLikeXPath, xpathPrefixed, xpathSegmentBody, xpathToCss } from './x
 function unsupported(msg: string, rule: string, diagnostic: RuleDiagnostic): never {
   throw new RuleEngineError('RULE_UNSUPPORTED', msg, rule, diagnostic);
 }
+
+/**
+ * 当前 parseFieldRule 帧的 JSONPath 扩展子集开关（jsonpath1028）：编译全程同步，parseFieldRule 进出时保存/恢复，
+ * translateSegment / tryParseTemplate 据此调 parseJsonPath(…, ext)。
+ */
+let jsonPathExt = false;
 
 // ---- 不支持构件（编译期一律拒绝，见 §0/§2.3 与任务 reject-list）----
 // xpath / tpl_rule({{@@}}) / tpl_var({{变量}}，baseUrl 除外) / put(@put:) / get(@get:) /
@@ -106,7 +112,7 @@ function tryParseTemplate(segment: string, rule: string): TemplatePart[] | null 
     const inner = m[1].trim();
     if (inner.startsWith('@@')) unsupported('模板含 {{@@规则}}（tpl_rule）', rule, { code: 'unsupported_template_rule' });
     if (inner.startsWith('$')) {
-      parts.push({ kind: 'jsonpath', path: parseJsonPath(inner) });
+      parts.push({ kind: 'jsonpath', path: parseJsonPath(inner, jsonPathExt) });
     } else if (ALLOWED_TEMPLATE_VARS.has(inner)) {
       parts.push({ kind: 'var', name: 'baseUrl' });
     } else if (JS_EXPR_RE.test(inner)) {
@@ -360,7 +366,7 @@ function translateSegment(segment: string, rule: string, xpathEnabled = false, x
 
   // 1) JSONPath：段首 $ 或 {{$.x}} 模板
   if (seg.startsWith('$')) {
-    return { kind: 'jsonpath', path: parseJsonPath(seg) };
+    return { kind: 'jsonpath', path: parseJsonPath(seg, jsonPathExt) };
   }
 
   // 2) {{...}} 模板（只允许 {{$.x}}）
@@ -566,9 +572,24 @@ export interface ParseOptions {
    * 用到的字段标 FieldIr.jsUtil（列表 JS 与 makeUp 不收）。默认读 env（缺失=off）。
    */
   jsUtilEnabled?: boolean;
+  /**
+   * JSONPath 扩展子集（ENGINE_SYNTAX_JSON_PATH，jsonpath1028）：off 态解析不了的 `$` 路径再试 `.[` 与 `[?(表达式)]`
+   * （jsonpath.ts parseJsonPath ext）。默认读 env（缺失=off）。
+   */
+  jsonPathEnabled?: boolean;
 }
 
 export function parseFieldRule(rule: string, options: ParseOptions = {}): FieldIr {
+  const saved = jsonPathExt;
+  jsonPathExt = options.jsonPathEnabled ?? engineSyntaxJsonPathEnabled();
+  try {
+    return parseFieldRuleWithObjectKey(rule, options);
+  } finally {
+    jsonPathExt = saved;
+  }
+}
+
+function parseFieldRuleWithObjectKey(rule: string, options: ParseOptions): FieldIr {
   const field = parseFieldRuleText(rule, options);
   // listjs1027：对象条目的键值直取只看规则原文（legado getString 遇 NativeObject 不走解析器），与上面的编译结果并存。
   if (options.listJsGroup === true && options.field !== undefined && !isAioListField(options.field)
@@ -799,7 +820,7 @@ function parseJsChain(trimmed: string, rule: string, options: ParseOptions): Fie
   const binds = (options.jsBindEnabled ?? engineSyntaxJsBindEnabled()) ? fieldBinds(field) : undefined;
   const segmentOptions: ParseOptions = {
     orEnabled: options.orEnabled, xpathEnabled: options.xpathEnabled, xpathEvalEnabled: options.xpathEvalEnabled, jsEnabled: false,
-    regexEnabled,
+    regexEnabled, jsonPathEnabled: options.jsonPathEnabled,
   };
   const gets: JsGets | undefined = (options.jsGetEnabled ?? engineSyntaxJsGetEnabled())
     ? { options: segmentOptions, out: new Map() } : undefined;
@@ -926,6 +947,7 @@ function listRuleStage(tail: string, rule: string, options: ParseOptions, reject
   const field = parseFieldRule(body, {
     orEnabled: options.orEnabled, xpathEnabled: options.xpathEnabled, xpathEvalEnabled: options.xpathEvalEnabled, jsEnabled: false,
     regexEnabled: options.regexEnabled, andEnabled: options.andEnabled, aioEnabled: false, field: options.field,
+    jsonPathEnabled: options.jsonPathEnabled,
   });
   return { kind: 'rule', field, mode };
 }
@@ -1286,6 +1308,7 @@ function parseMakeUpRule(inner: string, rule: string, options: ParseOptions): Fi
   return parseFieldRule(text, {
     orEnabled: options.orEnabled, xpathEnabled: options.xpathEnabled, xpathEvalEnabled: options.xpathEvalEnabled, jsEnabled: false,
     regexEnabled: options.regexEnabled, andEnabled: options.andEnabled, aioEnabled: false, field: options.field,
+    jsonPathEnabled: options.jsonPathEnabled,
   });
 }
 
