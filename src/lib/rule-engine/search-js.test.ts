@@ -123,6 +123,21 @@ describe('legado AnalyzeUrl 口径求值', () => {
     expect(build(`${BASE}/s?q={{key}}&p=<1, 2>&t={{page*1}}`).url).toBe(`${BASE}/s?q=%E4%B9%A6&p=1&t=1`);
   });
 
+  it('java.put/get：一次请求构造内跨段共享，put 返回值本身', () => {
+    expect(build(`<js>java.put('o', String((page-1)*20))</js>${BASE}/s?q={{key}}&o={{java.get('o')}}`).url)
+      .toBe(`${BASE}/s?q=%E4%B9%A6&o=0`);
+    expect(build(`${BASE}/s?q={{java.put('k', key)}}&n={{java.put('p', page)}}`).url).toBe(`${BASE}/s?q=%E4%B9%A6&n=1`);
+    expect(build('@js:java.put("u", "https://a.example.com/s?q=");java.get("u")+key').url).toBe(`${BASE}/s?q=%E4%B9%A6`);
+    expect(build(`${BASE}/s?q={{key}}&a={{java.put('__proto__','x')}}&b={{java.get('__proto__')}}`).url)
+      .toBe(`${BASE}/s?q=%E4%B9%A6&a=x&b=x`);
+  });
+
+  it('变量袋对规则代码不可见；每次构造从空袋起', () => {
+    expect(build(`${BASE}/s?q={{key}}&v={{typeof vars}}`).url).toBe(`${BASE}/s?q=%E4%B9%A6&v=undefined`);
+    build(`${BASE}/s?q={{key}}&a={{java.put('z','1')}}`);
+    expect(() => build(`${BASE}/s?q={{key}}&b={{java.get('z')}}`)).toThrow(SourcePolicyError);
+  });
+
   it('非整数：Java 与 JS 同形的范围放行，其余拒', () => {
     expect(build(`${BASE}/s?q={{key}}&r={{0.5}}`).url).toBe(`${BASE}/s?q=%E4%B9%A6&r=0.5`);
     expect(() => build(`${BASE}/s?q={{key}}&r={{1e-7}}`)).toThrow(SourcePolicyError);
@@ -139,6 +154,10 @@ describe('拒绝面', () => {
     ['死循环（250ms 截停）', '@js:while(true){}'],
     ['头值含非 ASCII（OkHttp 拒）', `${BASE}/s?p={{page+0}},{"headers":{"Referer":"{{key}}"}}`],
     ['非 https 结果', '@js:"http://127.0.0.1/s?q="+key'],
+    ['java.get 读本次未 put 的键（legado 会查持久化源变量）', `${BASE}/s?q={{key}}&t={{java.get('token')}}`],
+    ['java.put 对象值', `${BASE}/s?q={{key}}&t={{java.put('h', {a:1})}}`],
+    ['java.put 指数形态数字', `${BASE}/s?q={{key}}&t={{java.put('n', 1e21)}}`],
+    ['java 不可改写', `${BASE}/s?q={{key}}&t={{java.ajax = function(){ return 'x'; }, java.ajax()}}`],
   ])('%s', (_label, template) => {
     expect(() => build(template)).toThrow(SourcePolicyError);
   });

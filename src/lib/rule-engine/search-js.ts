@@ -2,7 +2,8 @@
 // 口径照 legado AnalyzeUrl.initUrl（Jer-Chao/legado@c2c4775）：analyzeJs（`<js>…</js>` / `@js:` 逐段求值，段间文本
 // 替换 `@result`）→ replaceKeyPageJs（`{{表达式}}` 逐个求值、`<a,b>` 页码取首项）→ analyzeUrl（选项/编码，
 // source-parser buildLegadoSearchRequest）。JS 一律在 js-sandbox 的 QuickJS 里跑：无网络/文件/定时器，
-// 只绑定 key/page/baseUrl/result/source（只读：getKey/bookSourceUrl/getVariable→''）/cookie（空实现）/book=null；
+// 只绑定 key/page/baseUrl/result/source（只读：getKey/bookSourceUrl/getVariable→''）/cookie（空实现）/book=null，
+// java 在纯计算帮手之外补 put/get（本次请求构造内的变量袋，见 SETUP）；
 // java.ajax、cache、source.put 等依赖宿主状态的调用在沙箱里不存在 → 求值失败 → 判不支持。
 // 只对旧口径构造不出请求的模板生效（searchTemplateNeedsJs），旧口径能构造的模板逐字走旧路径。
 // 本模块只在服务端用（js-sandbox 依赖 node:crypto 与 wasm），纯函数部分在 source-parser.ts。
@@ -32,17 +33,41 @@ const JS_PATTERN = /<js>([\w\W]*?)<\/js>|@js:([\w\W]*)/gi;
 const PAGE_PATTERN = /<(.*?)>/g;
 const OPTION_SPLIT = /\s*,\s*(?=\{)/;
 const SEARCH_PAGE = 1;
+const MAX_SEARCH_VARS = 32;
+const MAX_SEARCH_VARS_CHARS = 16_384;
 
-// 沙箱里的 legado 绑定。source/cookie 冻结；__sourceKey 用完即删，规则代码看不到。
-const SETUP = `(function(){
+// 沙箱里的 legado 绑定（在包装函数体内展开：vars 是闭包变量，规则代码经间接 eval 在全局作用域跑、看不到它）。
+// source/cookie/java 冻结；__sourceKey/__vars 用完即删。
+// java.put/get = legado AnalyzeUrl.put/get：搜索时写进本次搜索的 RuleData（一次请求构造内各段共享），put 返回值本身。
+// get 读不到本次 put 过的键时 legado 会再查持久化的源变量，这里没有那份状态 → 判不支持；
+// 值只收字符串/布尔/无指数形态的数字（Rhino 转 String 与 JS 同形），其余形态不可复现即拒。
+const SETUP = `
   var k = globalThis.__sourceKey; delete globalThis.__sourceKey;
+  var vars = Object.create(null), seed = JSON.parse(globalThis.__vars); delete globalThis.__vars;
+  Object.keys(seed).forEach(function(n){ vars[n] = seed[n]; });
   globalThis.source = Object.freeze({
     key: k, bookSourceUrl: k, variable: '',
     getKey: function(){ return k; }, getBookSourceUrl: function(){ return k; }, getVariable: function(){ return ''; }
   });
   globalThis.cookie = Object.freeze({ getCookie: function(){ return ''; }, removeCookie: function(){} });
   globalThis.book = null;
-})();`;
+  var j = globalThis.java, nj = {};
+  Object.keys(j).forEach(function(n){ nj[n] = j[n]; });
+  nj.put = function(name, v){
+    if (typeof name !== 'string') throw new TypeError('java.put 键须为字符串');
+    var s;
+    if (typeof v === 'string') s = v;
+    else if (typeof v === 'boolean' || (typeof v === 'number' && isFinite(v) && !/e/i.test(String(v)))) s = String(v);
+    else throw new TypeError('java.put 不支持的值类型：' + typeof v);
+    vars[name] = s;
+    return s;
+  };
+  nj.get = function(name){
+    if (typeof name !== 'string' || !Object.prototype.hasOwnProperty.call(vars, name)) throw new TypeError('java.get 读不到本次 put 的变量');
+    return vars[name];
+  };
+  globalThis.java = Object.freeze(nj);
+`;
 
 // analyzeJs：legado `evalJS(code, result).toString()`。null → "null"（照抄）；数字在 Rhino 是 Double，toString 得 "1.0"，
 // 与 JS 口径不一致，直接判不支持；对象/数组的 Java toString 形态不可复现，同样拒。
@@ -65,17 +90,18 @@ const INLINE_FORMAT = `(function(v){
   throw new TypeError('不支持的 JS 结果类型：' + typeof v);
 })`;
 
-interface EvalContext { title: string; baseUrl: string }
+interface EvalContext { title: string; baseUrl: string; vars: Record<string, string> }
 
 function evalSearchJs(code: string, ctx: EvalContext, result: string | null): string {
-  const wrapper = `${SETUP}\n${result === null ? 'globalThis.result = null;\n' : ''}`
-    + `${result === null ? INLINE_FORMAT : SEGMENT_FORMAT}((0, eval)(${JSON.stringify(code)}))`;
-  let value: unknown;
+  const wrapper = `(function(){${SETUP}${result === null ? 'globalThis.result = null;\n' : ''}`
+    + `var out = ${result === null ? INLINE_FORMAT : SEGMENT_FORMAT}((0, eval)(${JSON.stringify(code)}));\n`
+    + 'return JSON.stringify([out, vars]);\n})()';
+  let packed: unknown;
   try {
-    value = runJs(wrapper, {
+    packed = runJs(wrapper, {
       result: result ?? '',
       baseUrl: ctx.baseUrl,
-      globals: { key: ctx.title, page: SEARCH_PAGE, __sourceKey: ctx.baseUrl },
+      globals: { key: ctx.title, page: SEARCH_PAGE, __sourceKey: ctx.baseUrl, __vars: JSON.stringify(ctx.vars) },
     });
   } catch (error) {
     if (error instanceof RuleEngineError) {
@@ -84,7 +110,13 @@ function evalSearchJs(code: string, ctx: EvalContext, result: string | null): st
     }
     throw error;
   }
+  if (typeof packed !== 'string') throw new SourcePolicyError('不支持该书源的搜索 JS（结果非字符串）');
+  const [value, vars] = JSON.parse(packed) as [unknown, Record<string, string>];
   if (typeof value !== 'string') throw new SourcePolicyError('不支持该书源的搜索 JS（结果非字符串）');
+  if (Object.keys(vars).length > MAX_SEARCH_VARS || JSON.stringify(vars).length > MAX_SEARCH_VARS_CHARS) {
+    throw new SourcePolicyError('不支持该书源的搜索 JS（变量过多）');
+  }
+  ctx.vars = vars;
   return value;
 }
 
@@ -147,7 +179,7 @@ export function buildSearchJsRequest(
   template: string, title: string, base: string, validate: SourceUrlValidator = validateSourceUrl,
 ): SourceSearchRequest {
   const split = OPTION_SPLIT.exec(base);
-  const ctx: EvalContext = { title, baseUrl: split ? base.slice(0, split.index) : base };
+  const ctx: EvalContext = { title, baseUrl: split ? base.slice(0, split.index) : base, vars: {} };
   const ruleUrl = replacePages(replaceInline(analyzeJs(template, ctx), ctx));
   return buildLegadoSearchRequest(ruleUrl, ctx.baseUrl, validate);
 }
