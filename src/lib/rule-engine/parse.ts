@@ -21,8 +21,9 @@ import {
   TerminalOp,
 } from './types';
 import { parseJsonPath } from './jsonpath';
+import { isAioListField, isAioListRule, parseAioField } from './aio-syntax';
 import {
-  engineSyntaxAndEnabled, engineSyntaxJsEnabled, engineSyntaxOrEnabled, engineSyntaxRegexEnabled, engineSyntaxXPathEnabled,
+  engineSyntaxAioEnabled, engineSyntaxAndEnabled, engineSyntaxJsEnabled, engineSyntaxOrEnabled, engineSyntaxRegexEnabled, engineSyntaxXPathEnabled,
   engineSyntaxXPathEvalEnabled,
 } from './syntax-flags';
 import { compileXPath, XPathSyntaxError } from './xpath-eval';
@@ -527,12 +528,22 @@ export interface ParseOptions {
   regexEnabled?: boolean;
   /** legado `&&` 合并（ENGINE_SYNTAX_AND，and1027；须 orEnabled，且只对 AND_FIELDS 生效）。默认读 env（缺失=off）。 */
   andEnabled?: boolean;
+  /** legado AllInOne 正则列表（ENGINE_SYNTAX_AIO，aio1027）。默认读 env（缺失=off）；还须给出 field。 */
+  aioEnabled?: boolean;
+  /**
+   * 字段所在规则组的列表规则以 `:` 开头（aio1027，调用方按 aio-syntax.ts aioGroups 判定）：同组条目字段按 legado Regex 模式
+   * 解释（`$N` 捕获组引用）。列表字段自身由规则原文判定，不看这一项。
+   */
+  aioGroup?: boolean;
 }
 
 export function parseFieldRule(rule: string, options: ParseOptions = {}): FieldIr {
   if (typeof rule !== 'string') unsupported('规则非字符串', String(rule), { code: 'invalid_rule_type' });
   const trimmed = rule.trim();
   if (trimmed === '') unsupported('空规则', rule, { code: 'empty_rule' });
+  // aio1027：AllInOne 组整组换一套解释（Regex 模式下 CSS/JSONPath/JS 都不适用），排在一切方言判定之前。off 态逐字不变。
+  if (options.field !== undefined && (options.aioGroup === true || (isAioListField(options.field) && isAioListRule(rule)))
+    && (options.aioEnabled ?? engineSyntaxAioEnabled())) return parseAioField(rule, options.field);
   if (ruleHasJs(trimmed) && (options.jsEnabled ?? engineSyntaxJsEnabled())) return parseJsChain(trimmed, rule, options);
   if (trimmed.length > MAX_RULE_LENGTH) unsupported('规则过长', rule, { code: 'rule_too_long' });
 

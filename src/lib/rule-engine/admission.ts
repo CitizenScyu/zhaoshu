@@ -24,7 +24,8 @@ import {
 } from './evaluate';
 import { RuleEngineError, type FieldIr, type RuleDiagnostic } from './types';
 import { compileSource, engineSourceRevision } from './compile';
-import { engineSyntaxVarsEnabled } from './syntax-flags';
+import { engineSyntaxAioEnabled, engineSyntaxVarsEnabled } from './syntax-flags';
+import { aioGroups, isAioListRule, ruleGroupOf } from './aio-syntax';
 import { preloadJsSandbox } from './js-sandbox';
 import { resolveSourceVars } from './vars-subset';
 import { contentHtmlToText, contentNeedsHtmlToText } from './content-html';
@@ -431,10 +432,13 @@ export function compileAdmission(source: RawSource): AdmissionCompile {
   }
   const failures: AdmissionCompile['failures'] = [];
   // vars1027：与 compileSource 同一改写（剥 @put、详情页 init put → 整条 @get 内联），开关关时原样。
-  for (const [field, rule] of iterRulePairs(engineSyntaxVarsEnabled() ? resolveSourceVars(source) : source)) {
+  const rulesSource = engineSyntaxVarsEnabled() ? resolveSourceVars(source) : source;
+  // aio1027：与 compileSource 同一判据——列表规则以 `:` 开头的组整组按 AllInOne 解释。
+  const aio = engineSyntaxAioEnabled() ? aioGroups(rulesSource) : new Set<string>();
+  for (const [field, rule] of iterRulePairs(rulesSource)) {
     if (!(field in coreFieldMask)) continue;
     try {
-      parseFieldRule(rule, { jsEnabled: coreJs, field });
+      parseFieldRule(rule, { jsEnabled: coreJs, field, aioGroup: aio.has(ruleGroupOf(field)) });
       coreFieldMask[field] = true;
     } catch (error) {
       const message = error instanceof RuleEngineError ? error.message : String(error);
@@ -708,9 +712,10 @@ function searchCandidates(source: RawSource, text: string, pageUrl: string): { t
   const bookUrl = (rules as Record<string, unknown>).bookUrl;
   if (typeof bookList !== 'string') return [];
   const jsEnabled = jsChainEnabledFor(source);
+  const aioGroup = engineSyntaxAioEnabled() && isAioListRule(bookList);
   const parseSafe = (rule: unknown, name?: string) => {
     if (typeof rule !== 'string' || !rule.trim()) return undefined;
-    try { return parseFieldRule(rule, { jsEnabled, field: name }); } catch { return undefined; }
+    try { return parseFieldRule(rule, { jsEnabled, field: name, aioGroup }); } catch { return undefined; }
   };
   const listIr = parseSafe(bookList, 'ruleSearch.bookList');
   if (!listIr) return [];
@@ -820,7 +825,9 @@ async function searchAdmissionOnce(
   }
   if (response.status >= 500) return { verdict: 'http_5xx', candidateCount: 0, status: response.status, error: String(response.status) };
   if (response.status >= 400) return { verdict: 'http_4xx', candidateCount: 0, status: response.status, error: String(response.status) };
-  if (jsChainEnabledFor(source) && sourceHasJsChainField(source)) await preloadJsSandbox();
+  // AllInOne 搜索列表（aio1027）的正则也在沙箱里跑。
+  if ((jsChainEnabledFor(source) && sourceHasJsChainField(source))
+    || (engineSyntaxAioEnabled() && aioGroups(source).has('ruleSearch'))) await preloadJsSandbox();
   const found = searchCandidates(source, response.text, response.url);
   const urls = found.map((item) => item.url);
   const candidateCount = urls.length;

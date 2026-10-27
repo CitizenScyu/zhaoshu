@@ -23,15 +23,16 @@ export const ENGINE_SEMANTICS_XPATH_BIT = 2;
 /** vars1027：@put/@get 静态子集语义位。版本再 +4（5–8 = 含变量位的四种组合），1–4 逐字不变。 */
 export const ENGINE_SEMANTICS_VARS_BIT = 4;
 
-/** 语义版本随 || / XPath / 变量 / JS / XPath 求值 / 正则 / && 开关联动（唯一口径，供 compile.ts 缓存键与 rulesHash 复用）。 */
+/** 语义版本随 || / XPath / 变量 / JS / XPath 求值 / 正则 / && / AllInOne 开关联动（唯一口径，供 compile.ts 缓存键与 rulesHash 复用）。 */
 export function engineSemanticsVersion(
   orEnabled: boolean, xpathEnabled = false, varsEnabled = false, jsEnabled = false, xpathEvalEnabled = false,
-  regexEnabled = false, andEnabled = false,
+  regexEnabled = false, andEnabled = false, aioEnabled = false,
 ): number {
   return (orEnabled ? ENGINE_SEMANTICS_VERSION_OR : ENGINE_SEMANTICS_VERSION)
     + (xpathEnabled ? ENGINE_SEMANTICS_XPATH_BIT : 0) + (varsEnabled ? ENGINE_SEMANTICS_VARS_BIT : 0)
     + (jsEnabled ? ENGINE_SEMANTICS_JS_BIT : 0) + (xpathEvalEnabled ? ENGINE_SEMANTICS_XPATH_EVAL_BIT : 0)
-    + (regexEnabled ? ENGINE_SEMANTICS_REGEX_BIT : 0) + (andEnabled ? ENGINE_SEMANTICS_AND_BIT : 0);
+    + (regexEnabled ? ENGINE_SEMANTICS_REGEX_BIT : 0) + (andEnabled ? ENGINE_SEMANTICS_AND_BIT : 0)
+    + (aioEnabled ? ENGINE_SEMANTICS_AIO_BIT : 0);
 }
 
 /**
@@ -130,5 +131,21 @@ export const ENGINE_SEMANTICS_AND_BIT = 64;
  */
 export function engineSyntaxAndEnabled(env: OrEnv = process.env): boolean {
   const raw = env.ENGINE_SYNTAX_AND?.trim().toLowerCase();
+  return raw === '1' || raw === 'true' || raw === 'on';
+}
+
+/**
+ * aio1027：legado AllInOne 正则列表语义位。版本再 +128（129–256），1–128 逐字不变。
+ * 只对 ruleSearch.bookList / ruleToc.chapterList 以 `:` 开头的源计入（compile.ts sourceUsesAioSyntax）。
+ */
+export const ENGINE_SEMANTICS_AIO_BIT = 128;
+
+/**
+ * ENGINE_SYNTAX_AIO 独立开关（aio1027，默认 off，口径同 ENGINE_SYNTAX_OR）。
+ * on = 列表规则 `:正则[&&正则…]`（legado splitSourceRule allInOne → AnalyzeByRegex.getElements）在 QuickJS 沙箱里跑正则，
+ * 条目 = 捕获组列表；同组条目字段的 `$N` 引用捕获组（AnalyzeRule.splitRegex/makeUpRule）。off = 逐字不变（`:` 列表照旧拒）。
+ */
+export function engineSyntaxAioEnabled(env: OrEnv = process.env): boolean {
+  const raw = env.ENGINE_SYNTAX_AIO?.trim().toLowerCase();
   return raw === '1' || raw === 'true' || raw === 'on';
 }

@@ -4,10 +4,11 @@
 // ENGINE_SYNTAX_OR 联动——off=1 / on=2）：规则原文或引擎语义任一变化，键即变，旧编译
 // 产物自然失效，不存在「|| 开关打开后仍复用 off 态编译缓存」的窗口。
 import { sourceRevision } from '@/lib/source-revision';
+import { aioGroups } from './aio-syntax';
 import { jsChainFieldAllowed, parseFieldRule, ruleHasJs, type ParseOptions } from './parse';
 import type { CompiledRules, FieldIr, RuleIr } from './types';
 import {
-  engineSemanticsVersion, engineSyntaxAndEnabled, engineSyntaxJsEnabled, engineSyntaxOrEnabled, engineSyntaxRegexEnabled,
+  engineSemanticsVersion, engineSyntaxAioEnabled, engineSyntaxAndEnabled, engineSyntaxJsEnabled, engineSyntaxOrEnabled, engineSyntaxRegexEnabled,
   engineSyntaxVarsEnabled, engineSyntaxXPathEnabled, engineSyntaxXPathEvalEnabled, ENGINE_SEMANTICS_VERSION,
 } from './syntax-flags';
 import { resolveSourceVars, ruleMayUseVars } from './vars-subset';
@@ -34,6 +35,7 @@ export function engineVersionedKey(contentRevision: string, semanticsVersion = E
  * xpatheval1027：ENGINE_SYNTAX_XPATH 与 ENGINE_SYNTAX_XPATH_EVAL 都 on 且有字段编译出 XPath 求值 IR 时再加求值位（17–32）。
  * regex1027：ENGINE_SYNTAX_REGEX on 且有字段编译出正则-only 规则或 replaceFirst 替换时再加正则位（33–64）。
  * and1027：ENGINE_SYNTAX_AND（须 OR）on 且有 off 态因 && 被拒的字段在 on 态编译通过时再加 && 位（65–128）。
+ * aio1027：ENGINE_SYNTAX_AIO on 且 bookList/chapterList 以 `:` 开头时再加 AllInOne 位（129–256）。
  */
 export function engineSourceRevision(
   source: { url: string; searchUrl: unknown; rules: Record<string, unknown> },
@@ -46,6 +48,7 @@ export function engineSourceRevision(
   const xpathEval = options.xpathEvalEnabled ?? engineSyntaxXPathEvalEnabled();
   const regexEnabled = options.regexEnabled ?? engineSyntaxRegexEnabled();
   const andEnabled = options.andEnabled ?? engineSyntaxAndEnabled();
+  const aioEnabled = options.aioEnabled ?? engineSyntaxAioEnabled();
   const jsChain = jsEnabled && !sourceHasJsLib(source.rules);
   return engineVersionedKey(sourceRevision(source), engineSemanticsVersion(
     orEnabled && sourceUsesOrSyntax(source.rules),
@@ -59,6 +62,7 @@ export function engineSourceRevision(
     orEnabled && andEnabled && sourceUsesAndSyntax(source.rules, {
       varsEnabled, jsEnabled: jsChain, xpathEnabled, xpathEvalEnabled: xpathEval, regexEnabled,
     }),
+    aioEnabled && sourceUsesAioSyntax(source.rules),
   ));
 }
 
@@ -221,6 +225,14 @@ export function sourceUsesRegexSyntax(
   return uses;
 }
 
+/**
+ * 源是否会因 ENGINE_SYNTAX_AIO 改变编译结果（aio1027）：列表规则以 `:` 开头才走 AllInOne，其余源两态逐字同路。
+ * off 态这类源读不出目录/搜索结果（`:` 列表被当伪选择器、求值失败，`$N` 条目按 JSONPath 编译失败），identity 只在它们身上翻动。
+ */
+export function sourceUsesAioSyntax(rules: Record<string, unknown>): boolean {
+  return aioGroups(rules).size > 0;
+}
+
 const andMemo = new WeakMap<object, Map<string, boolean>>();
 
 /**
@@ -294,8 +306,9 @@ export function compileSource(
   const xpathEvalEnabled = options.xpathEvalEnabled ?? engineSyntaxXPathEvalEnabled();
   const regexEnabled = options.regexEnabled ?? engineSyntaxRegexEnabled();
   const andEnabled = options.andEnabled ?? engineSyntaxAndEnabled();
+  const aioEnabled = options.aioEnabled ?? engineSyntaxAioEnabled();
   const key = engineSourceRevision(source, {
-    orEnabled, xpathEnabled, varsEnabled, jsEnabled, xpathEvalEnabled, regexEnabled, andEnabled,
+    orEnabled, xpathEnabled, varsEnabled, jsEnabled, xpathEvalEnabled, regexEnabled, andEnabled, aioEnabled,
   });
   const hit = cache.get(key);
   if (hit) {
@@ -305,6 +318,7 @@ export function compileSource(
   }
   const compiled: CompiledRules = new Map();
   const sourceRules = varsEnabled ? resolveSourceVars(source.rules) : source.rules;
+  const aio = aioEnabled ? aioGroups(sourceRules) : new Set<string>();
   for (const group of RULE_GROUPS) {
     const rules = sourceRules[group];
     if (!rules || typeof rules !== 'object' || Array.isArray(rules)) continue;
@@ -313,7 +327,8 @@ export function compileSource(
       const name = `${group}.${field}`;
       try {
         compiled.set(name, parseFieldRule(rule, {
-          orEnabled, xpathEnabled, xpathEvalEnabled, jsEnabled, regexEnabled, andEnabled, field: name,
+          orEnabled, xpathEnabled, xpathEvalEnabled, jsEnabled, regexEnabled, andEnabled, aioEnabled, aioGroup: aio.has(group),
+          field: name,
         }));
       } catch {
         compiled.set(name, { skipped: 'unsupported' });

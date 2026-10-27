@@ -5,7 +5,8 @@
 import { upgradeSourceTemplateUrl } from '@/lib/source-policy';
 import { searchOptionsConstructible } from '@/lib/source-parser';
 import { jsChainFieldAllowed, parseFieldRule, ruleHasJs, type ParseOptions } from './parse';
-import { engineSyntaxJsEnabled } from './syntax-flags';
+import { aioGroupsFlat, ruleGroupOf } from './aio-syntax';
+import { engineSyntaxAioEnabled, engineSyntaxJsEnabled } from './syntax-flags';
 import { RuleEngineError, type RuleDiagnostic } from './types';
 
 // survey.py CORE_FIELDS（阅读路径必需字段）
@@ -196,10 +197,12 @@ export function compileCoreFieldsFromRules(
   coreRules: Record<string, string>, options: ParseOptions = {},
 ): CompileResult {
   const failures: CompileResult['failures'] = [];
+  // aio1027：与 compileSource 同一判据（列表规则以 `:` 开头的组整组按 AllInOne 解释）。
+  const aio = (options.aioEnabled ?? engineSyntaxAioEnabled()) ? aioGroupsFlat(coreRules) : new Set<string>();
   for (const [field, rule] of Object.entries(coreRules)) {
     if (typeof rule !== 'string' || !rule.trim()) continue;
     try {
-      parseFieldRule(rule, { ...options, field });
+      parseFieldRule(rule, { ...options, field, aioGroup: aio.has(ruleGroupOf(field)) });
     } catch (err) {
       if (err instanceof RuleEngineError && err.code === 'RULE_UNSUPPORTED') {
         failures.push({ field, rule, message: err.message, diagnostic: err.diagnostic ?? { code: 'unsupported_rule' } });

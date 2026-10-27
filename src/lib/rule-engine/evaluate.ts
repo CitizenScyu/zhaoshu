@@ -8,6 +8,7 @@ import {
   type ChainStage, type CompiledRules, type FieldIr, type JsonPathIr, RuleEngineError, type RuleIr, type RegexSub,
   type SkippedField, type TemplatePart,
 } from './types';
+import { aioListCode } from './aio-syntax';
 import { type JsValue, runJs } from './js-sandbox';
 import { evalJsonPath, evalJsonPathList, parseJsonPath } from './jsonpath';
 import { defaultSyntaxSource } from './parse';
@@ -103,6 +104,8 @@ export interface JsonScope {
   pageUrl: string;
   /** 同 HtmlScope.source。 */
   source?: string;
+  /** AllInOne 条目（aio1027）：legado `[group0..groupN]`，下标即 `$N`（group0 不回传，占位空串）；json 恒为 undefined。 */
+  groups?: readonly string[];
 }
 
 export type EvalScope = HtmlScope | JsonScope;
@@ -170,6 +173,15 @@ export function evaluateRule(ir: RuleIr, scope: EvalScope, multi = false): EvalR
       return evaluateXPathRule(ir, scope, multi);
     case 'self':
       return { kind: 'text', value: selfText(scope) };
+    case 'groupRef': {
+      // legado makeUpRule：捕获组越界（含 `$N` 大于组数）插空串；代换后整体 trim。
+      if (scope.kind !== 'json' || scope.groups === undefined) return evalFailed('$N 捕获组引用只能在 AllInOne 条目上求值');
+      const groups = scope.groups;
+      const value = ir.parts.map((part) => (part.kind === 'literal' ? part.text : groups[part.index] ?? '')).join('');
+      return { kind: 'text', value: value.trim() };
+    }
+    case 'regexList':
+      return evalFailed('AllInOne 列表规则只能按列表求值');
     default:
       return evalFailed('未知的规则 IR');
   }
@@ -466,9 +478,13 @@ export function evaluateField(field: FieldIr, scope: EvalScope, multi = false): 
     else value = scope.kind === 'html' ? applyTerminal(scope.$, result.nodes, { op: 'text' }, scope.pageUrl, multi) : '';
     if (value.trim() !== '') break;
   }
+  const kind = field.rules.length === 1 ? field.rules[0].kind : undefined;
+  // aio1027：模板代换后为空时 legado 拿捕获组列表的 toString 去做 `##` 替换（这类规则编译期已拒），这里空即空。
+  if (kind === 'groupRef' && value === '') return '';
   if (field.regex !== undefined) value = applyRegexSubs(value, field.regex);
-  // 正则-only 规则的输入是未解码的原文：对齐 legado getString 末段（含 `&` 即 unescapeHtml4）；正文（multi）交 content-html。
-  if (!multi && field.rules.length === 1 && field.rules[0].kind === 'self' && value.includes('&')) value = decodeHTML(value);
+  // 正则-only 规则的输入是未解码的原文、AllInOne 条目值是正则截出的原文：对齐 legado getString 末段（含 `&` 即
+  // unescapeHtml4）；正文（multi）交 content-html。
+  if (!multi && (kind === 'self' || kind === 'groupRef') && value.includes('&')) value = decodeHTML(value);
   return value.trim();
 }
 
@@ -500,6 +516,7 @@ export function evaluateFieldNodes(field: FieldIr, scope: EvalScope): CheerioNod
       if (nodes.length > 0) return scope.$(nodes as never);
       continue;
     }
+    if (ir.kind === 'regexList') continue; // AllInOne 条目不是节点（evaluateFieldList 另走 aioListScopes）
     const result = evaluateRule(ir, scope);
     if (result.kind === 'nodes' && result.nodes.length > 0) return result.nodes;
   }
@@ -515,6 +532,8 @@ export function evaluateFieldNodes(field: FieldIr, scope: EvalScope): CheerioNod
  */
 export function evaluateFieldList(field: FieldIr, scope: EvalScope): EvalScope[] {
   if (field.chain) return evalFailed('列表字段不支持 JS 链');
+  const head = field.rules[0];
+  if (head?.kind === 'regexList') return aioListScopes(head, scope);
   if (scope.kind === 'html') {
     const nodes = evaluateFieldNodes(field, scope);
     const scopes: EvalScope[] = [];
@@ -526,6 +545,27 @@ export function evaluateFieldList(field: FieldIr, scope: EvalScope): EvalScope[]
     if (items.length > 0) return items.map((item) => createJsonScope(item, scope.pageUrl));
   }
   return [];
+}
+
+/**
+ * AllInOne 列表（aio1027）：对页面原文（legado `result.toString()`，HTML/JSON 页一样）在沙箱里跑 getElements 级联，
+ * 每个末级匹配成为一个条目作用域。沙箱只回传 JSON 文本，宿主逐项校验形状，不信任沙箱产出。
+ */
+function aioListScopes(ir: Extract<RuleIr, { kind: 'regexList' }>, scope: EvalScope): EvalScope[] {
+  const source = scope.source;
+  if (source === undefined) return evalFailed('AllInOne 列表规则需要页面原文，当前作用域没有');
+  const out = runJs(aioListCode(ir.stages), { result: source, src: source, baseUrl: scope.pageUrl });
+  if (typeof out !== 'string') return evalFailed('AllInOne 列表求值结果异常');
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(out);
+  } catch {
+    return evalFailed('AllInOne 列表求值结果异常');
+  }
+  if (!Array.isArray(parsed) || !parsed.every((item) => Array.isArray(item) && item.every((group) => typeof group === 'string'))) {
+    return evalFailed('AllInOne 列表求值结果异常');
+  }
+  return (parsed as string[][]).map((groups): JsonScope => ({ kind: 'json', json: undefined, pageUrl: scope.pageUrl, groups: ['', ...groups] }));
 }
 
 function jsonListItems(ir: RuleIr, json: unknown): unknown[] {
@@ -555,9 +595,12 @@ export function fieldUsesJs(field: FieldIr | SkippedField | undefined): field is
   return field !== undefined && !('skipped' in field) && field.chain !== undefined;
 }
 
-/** 编译产物里是否有 JS 链字段（调用方据此先 await preloadJsSandbox）。 */
+/** 编译产物里是否有要用沙箱的字段：JS 链，或 AllInOne 列表（aio1027）。调用方据此先 await preloadJsSandbox。 */
 export function compiledUsesJs(compiled: CompiledRules): boolean {
-  for (const field of compiled.values()) if (fieldUsesJs(field)) return true;
+  for (const field of compiled.values()) {
+    if (fieldUsesJs(field)) return true;
+    if (!('skipped' in field) && field.rules[0]?.kind === 'regexList') return true;
+  }
   return false;
 }
 
@@ -643,7 +686,8 @@ export function applyRegexSubs(text: string, subs: readonly RegexSub[]): string 
   for (const sub of subs) {
     let re: RegExp;
     try {
-      re = new RegExp(sub.pattern, sub.first ? '' : (sub.flags ?? 'g'));
+      // first 去掉 g（只取首个匹配）；AllInOne 的 Java 内联标志（aio1027，如 `(?s)`）随 flags 带过来。
+      re = new RegExp(sub.pattern, sub.first ? (sub.flags ?? '').replace('g', '') : (sub.flags ?? 'g'));
     } catch {
       return evalFailed(`正则无法编译：${sub.pattern}`, sub.pattern);
     }

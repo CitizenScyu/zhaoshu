@@ -116,7 +116,20 @@ export type RuleIr =
   // 当前内容原文（regex1027，ENGINE_SYNTAX_REGEX）：正则-only 规则（`##p##r###`，剥尾缀后主体为空）的输入。
   // legado getString 主体为空时不跑解析器，直接对 content.toString() 做替换：整页作用域 = 页面原文，
   // 条目作用域 = 元素 outerHtml（jsoup 带缩进美化，这里是 cheerio 原样序列化，见 evaluate.ts selfText）。
-  | { kind: 'self' };
+  | { kind: 'self' }
+  // AllInOne 列表（aio1027，ENGINE_SYNTAX_AIO）：`:正则[&&正则…]` 在沙箱里按 legado AnalyzeByRegex.getElements 级联求值，
+  // 条目 = 末级每个匹配的捕获组列表（见 aio-syntax.ts、evaluate.ts aioListScopes）。只出现在列表字段。
+  | { kind: 'regexList'; stages: AioRegexStage[] }
+  // AllInOne 条目模板（aio1027）：字面量与 `$N` 捕获组引用拼接（legado makeUpRule），只在 AllInOne 条目作用域求值。
+  | { kind: 'groupRef'; parts: GroupRefPart[] };
+
+/** AllInOne 一级正则（已译成 JS 源串；flags 不含 g）。 */
+export interface AioRegexStage {
+  pattern: string;
+  flags: string;
+}
+
+export type GroupRefPart = { kind: 'literal'; text: string } | { kind: 'group'; index: number };
 
 export type TemplatePart =
   | { kind: 'literal'; text: string }
