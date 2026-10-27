@@ -24,7 +24,8 @@ import {
 import { parseJsonPath } from './jsonpath';
 import { AIO_LIST_FIELDS, isAioListField, isAioListRule, parseAioField } from './aio-syntax';
 import {
-  engineSyntaxAioEnabled, engineSyntaxAndEnabled, engineSyntaxJsEnabled, engineSyntaxJsExtEnabled, engineSyntaxListJsEnabled, engineSyntaxOrEnabled,
+  engineSyntaxAioEnabled, engineSyntaxAndEnabled, engineSyntaxJsBindEnabled, engineSyntaxJsEnabled, engineSyntaxJsExtEnabled,
+  engineSyntaxListJsEnabled, engineSyntaxOrEnabled,
   engineSyntaxRegexEnabled, engineSyntaxXPathEnabled, engineSyntaxXPathEvalEnabled,
 } from './syntax-flags';
 import { compileXPath, XPathSyntaxError } from './xpath-eval';
@@ -548,6 +549,12 @@ export interface ParseOptions {
    * SourceRule.makeUpRule 改写（列表字段 getElements 不 makeUp，仍拒）。默认读 env（缺失=off）。
    */
   jsExtEnabled?: boolean;
+  /**
+   * 宿主绑定与规则级 makeUp（ENGINE_SYNTAX_JS_BIND，bind1028；须 jsEnabled）：JS 里放行 `book.origin`/`chapter.title`/`title`
+   * （按字段，见 fieldBinds）；核心字符串字段的非 JS 规则里旧路径拒收的 `{{}}` 按 legado SourceRule 拼值（parseMakeUpField）。
+   * 默认读 env（缺失=off）。
+   */
+  jsBindEnabled?: boolean;
 }
 
 export function parseFieldRule(rule: string, options: ParseOptions = {}): FieldIr {
@@ -574,6 +581,10 @@ function parseFieldRuleText(rule: string, options: ParseOptions): FieldIr {
     return parseJsChain(trimmed, rule, options);
   }
   if (trimmed.length > MAX_RULE_LENGTH) unsupported('规则过长', rule, { code: 'rule_too_long' });
+
+  // bind1028：旧路径拒收的 `{{}}` 才改走 legado makeUp，旧路径收得下的模板（`{{$.x}}`/`{{baseUrl}}`）两态同路。
+  if (options.field !== undefined && SELF_FIELDS.has(options.field) && trimmed.includes('{{') && bindActive(options)
+    && templatesRejected(trimmed)) return parseMakeUpField(trimmed, rule, options);
 
   rejectUnsupportedConstructs(trimmed);
 
@@ -774,6 +785,7 @@ function parseJsChain(trimmed: string, rule: string, options: ParseOptions): Fie
   if (trimmed.length > MAX_JS_RULE_LENGTH) unsupported('规则过长', rule, { code: 'rule_too_long' });
   const regexEnabled = options.regexEnabled ?? engineSyntaxRegexEnabled();
   const jsExt = options.jsExtEnabled ?? engineSyntaxJsExtEnabled();
+  const binds = (options.jsBindEnabled ?? engineSyntaxJsBindEnabled()) ? fieldBinds(field) : undefined;
   const segmentOptions: ParseOptions = {
     orEnabled: options.orEnabled, xpathEnabled: options.xpathEnabled, xpathEvalEnabled: options.xpathEvalEnabled, jsEnabled: false,
     regexEnabled,
@@ -796,14 +808,14 @@ function parseJsChain(trimmed: string, rule: string, options: ParseOptions): Fie
     const detached = itemLevel && chain.length === 0;
     if (detached && !(jsExt && !jsReadsInput(code))) unsupported('条目级字段首段不能是 JS', rule, { code: 'unsupported_js' });
     if (jsExt) {
-      const stage = parseJsExtStage(code, rule, itemLevel, segmentOptions);
+      const stage = parseJsExtStage(code, rule, itemLevel, segmentOptions, binds);
       if (detached) {
         if (stage.kind !== 'js') unsupported('条目级字段首段不能是纯正则', rule, { code: 'unsupported_js' });
         stage.detached = true;
       }
       chain.push(stage);
     } else {
-      checkJsCode(code, rule, itemLevel);
+      checkJsCode(code, rule, itemLevel, false, binds);
       chain.push({ kind: 'js', code });
     }
     last = match.index + match[0].length;
@@ -951,10 +963,12 @@ function isMakeUpRule(text: string): boolean {
  * （正则为空不替换）。只改写 off 态被拒的段：不含 `##`/`{{` 的段与旧路径同一产物（另放行 eval）。
  * `{{规则}}` 按普通规则编译（不嵌 JS），`{{JS}}` 与拼回后的代码骨架过同一套白名单。
  */
-function parseJsExtStage(code: string, rule: string, itemLevel: boolean, segmentOptions: ParseOptions): ChainStage {
+function parseJsExtStage(
+  code: string, rule: string, itemLevel: boolean, segmentOptions: ParseOptions, binds?: JsBinds,
+): ChainStage {
   if (/@(?:get|put):/i.test(code)) unsupported('JS 段含 @get/@put', rule, { code: 'unsupported_js' });
   if (!code.includes('##') && !code.includes('{{')) {
-    checkJsCode(code, rule, itemLevel, true);
+    checkJsCode(code, rule, itemLevel, true, binds);
     return { kind: 'js', code };
   }
   if (!code.includes('{{')) {
@@ -963,7 +977,7 @@ function parseJsExtStage(code: string, rule: string, itemLevel: boolean, segment
     const regex = makeUpRegex(parts, rule);
     // legado getString：makeUp 后代码为空、有替换时跳过 evalJS，只对上一段结果做替换。
     if (body === '' && regex) return { kind: 'regex', regex: [regex] };
-    checkJsCode(body, rule, itemLevel, true);
+    checkJsCode(body, rule, itemLevel, true, binds);
     const stage: ChainStage = { kind: 'js', code: body };
     if (regex) stage.regex = regex;
     return stage;
@@ -979,7 +993,7 @@ function parseJsExtStage(code: string, rule: string, itemLevel: boolean, segment
     if (isMakeUpRule(inner)) {
       template.push({ kind: 'rule', field: parseFieldRule(inner, segmentOptions) });
     } else {
-      checkJsCode(inner, rule, itemLevel, true);
+      checkJsCode(inner, rule, itemLevel, true, binds);
       template.push({ kind: 'js', code: inner });
     }
     last = match.index + match[0].length;
@@ -990,7 +1004,7 @@ function parseJsExtStage(code: string, rule: string, itemLevel: boolean, segment
   const parts = skeleton.split('##');
   const body = parts[0].trim();
   // 代码段为空（占位都在 ## 之后）且有替换段：求值期只做替换（evaluate.ts），不过白名单。
-  if (body !== '' || parts.length < 2) checkJsCode(body.replaceAll(TEMPLATE_HOLE, '0'), rule, itemLevel, true);
+  if (body !== '' || parts.length < 2) checkJsCode(body.replaceAll(TEMPLATE_HOLE, '0'), rule, itemLevel, true, binds);
   // 正则段里没有占位时编译期即可校验（有占位的留到求值期）。
   if (parts.length > 1 && !parts[1].includes(TEMPLATE_HOLE)) makeUpRegex(parts, rule);
   return { kind: 'js', code, template };
@@ -1023,8 +1037,11 @@ function makeUpRegex(parts: readonly string[], rule: string): RegexSub | undefin
   return regex;
 }
 
-/** JS 段的编译期白名单（沙箱内的二道防线见 js-sandbox.ts）。`allowEval`（jsext1028）：放行 `eval`（代码同样在沙箱里跑）。 */
-function checkJsCode(code: string, rule: string, itemLevel: boolean, allowEval = false): void {
+/**
+ * JS 段的编译期白名单（沙箱内的二道防线见 js-sandbox.ts）。`allowEval`（jsext1028）：放行 `eval`（代码同样在沙箱里跑）。
+ * `binds`（bind1028）：该字段可读的宿主绑定，命中的标识符只许读白名单成员、不许赋值/自增。
+ */
+function checkJsCode(code: string, rule: string, itemLevel: boolean, allowEval = false, binds?: JsBinds): void {
   const reject = (why: string): never => unsupported(`JS 段${why}`, rule, { code: 'unsupported_js' });
   if (code.trim() === '') reject('为空');
   // legado 在求值前对 JS 文本做 {{}}/@get/## 改写（SourceRule 构造与 makeUpRule），这里不模拟那几步。
@@ -1032,6 +1049,11 @@ function checkJsCode(code: string, rule: string, itemLevel: boolean, allowEval =
   const bare = stripJsLiterals(code) ?? reject('字符串/注释未闭合');
   for (const match of bare.matchAll(/(?<![.\w$])[A-Za-z_$][\w$]*/g)) {
     const name = match[0];
+    const members = binds?.get(name);
+    if (members) {
+      checkBoundRef(bare, match.index, name, members, reject);
+      continue;
+    }
     if ((JS_BANNED_IDENTIFIERS.has(name) && !(allowEval && name === 'eval')) || (itemLevel && name === 'src')) {
       reject(`引用了沙箱不提供的 ${name}`);
     }
@@ -1039,6 +1061,137 @@ function checkJsCode(code: string, rule: string, itemLevel: boolean, allowEval =
     const member = /^\s*\.\s*([A-Za-z_$][\w$]*)/.exec(bare.slice(match.index + name.length));
     if (!member || !JS_JAVA_HELPERS.has(member[1])) reject(`用了沙箱不提供的 java.${member?.[1] ?? '[…]'}`);
   }
+}
+
+// ---- 宿主只读绑定（bind1028，ENGINE_SYNTAX_JS_BIND）----
+/** 标识符 → 可读成员；`''` = 裸标识符本身就是值（legado bindings 的 `title`）。 */
+type JsBinds = ReadonlyMap<string, ReadonlySet<string>>;
+
+/** 全部 JS 字段：legado evalJS 的 `book` = ruleData（搜索条目 SearchBook / 书籍 Book），`origin` = 书源地址。 */
+const BIND_ORIGIN: JsBinds = new Map([['book', new Set(['origin'])]]);
+/** 另有当前章节的字段：目录 chapterUrl（legado 先求 chapterName 赋给 bookChapter.title）与正文两字段。 */
+const BIND_CHAPTER: JsBinds = new Map([
+  ['book', new Set(['origin'])], ['chapter', new Set(['title'])], ['title', new Set([''])],
+]);
+const CHAPTER_BIND_FIELDS: ReadonlySet<string> = new Set(['ruleToc.chapterUrl', 'ruleContent.content', 'ruleContent.nextContentUrl']);
+
+/** 字段可读的宿主绑定。chapterName 求值时章节名还没出来，目录列表/搜索列表也不开（列表 JS 与 makeUp 都不经这里）。 */
+function fieldBinds(field: string | undefined): JsBinds | undefined {
+  if (field === undefined || field === 'ruleToc.chapterName' || isAioListField(field)) return undefined;
+  return CHAPTER_BIND_FIELDS.has(field) ? BIND_CHAPTER : BIND_ORIGIN;
+}
+
+/** 宿主绑定的一处引用：`book.origin` 这类成员读，或裸 `title`（字符串值，其成员如 `.length` 照常可读）；赋值、自增自减、对象的其余成员一律拒。 */
+function checkBoundRef(
+  bare: string, index: number, name: string, members: ReadonlySet<string>, reject: (why: string) => never,
+): void {
+  let rest = bare.slice(index + name.length);
+  const member = /^\s*\.\s*([A-Za-z_$][\w$]*)/.exec(rest);
+  if (member && members.has(member[1])) rest = rest.slice(member[0].length);
+  else if (!members.has('')) reject(`用了沙箱不提供的 ${name}${member ? `.${member[1]}` : ''}`);
+  if (/(?:\+\+|--)\s*$/.test(bare.slice(0, index)) || /^\s*(?:\+\+|--|(?:\*\*|>>>|<<|>>|&&|\|\||\?\?|[-+*/%&|^])?=(?!=))/.test(rest)) {
+    reject(`给宿主绑定 ${name} 赋值`);
+  }
+}
+
+/** bind1028 是否对本次解析生效：须 JS 链同开（ENGINE_SYNTAX_JS），口径同外层开关的 env 默认。 */
+function bindActive(options: ParseOptions): boolean {
+  return (options.jsEnabled ?? engineSyntaxJsEnabled()) && (options.jsBindEnabled ?? engineSyntaxJsBindEnabled());
+}
+
+/** 旧路径（rejectUnsupportedTemplates）会拒这条规则的某个 `{{}}`。 */
+function templatesRejected(text: string): boolean {
+  try {
+    rejectUnsupportedTemplates(text);
+    return false;
+  } catch (error) {
+    if (error instanceof RuleEngineError) return true;
+    throw error;
+  }
+}
+
+/** 裸标识符模板 `{{x}}`/`{{x.y}}` 的根须是 legado evalJS 能取到的名字，否则（`{{host}}`/`{{key}}`…）照旧 tpl_var。 */
+const TEMPLATE_JS_ROOTS: ReadonlySet<string> = new Set([
+  'baseUrl', 'result', 'src', 'title', 'book', 'chapter', 'java', 'Date', 'Math', 'String', 'Number', 'JSON',
+]);
+
+/**
+ * 非 JS 规则里的 legado 模板（bind1028，AnalyzeRule.SourceRule）：构造时剥 `@@`/`@XPath:`/`@Json:` 前缀，按 evalPattern 切出
+ * `{{}}`；首个 `{{` 在串首或其前没有 `##` 时整条进 Regex 模式——getString 直接返回 makeUp 后的规则串（`split("##")` 首段
+ * trim，主体为空则对 content.toString() 替换），否则保持原模式，`{{}}` 只在首个 `##` 之后，拼出动态正则/替换。
+ * `{{规则}}`（isRule）在字段作用域取字符串（规则内不嵌 JS），`{{JS}}` 以当前内容为 result 求值（条目级字段不许读
+ * result/src），null 不拼。`@get`/`@put`/`match:`/`%%` 与模板外文本的 `$N`（splitRegex 会把模式切成 Regex）不猜，拒。
+ */
+function parseMakeUpField(trimmed: string, rule: string, options: ParseOptions): FieldIr {
+  const field = options.field!;
+  if (/@put:/i.test(trimmed)) unsupported('规则含 @put 变量存取', rule, { code: 'unsupported_var_put' });
+  if (/@get:/i.test(trimmed)) unsupported('规则含 @get 变量存取', rule, { code: 'unsupported_var_get' });
+  if (trimmed.startsWith('match:')) unsupported('规则含 match: 正则', rule, { code: 'unsupported_regex_match' });
+  if (trimmed.includes('%%')) unsupported('规则含 %% 拼接（T7）', rule, { code: 'unsupported_operator', operator: '%%' });
+  const prefix = /^(?:@@|@xpath:|@json:)/i.exec(trimmed)?.[0] ?? '';
+  const body = trimmed.slice(prefix.length);
+  const first = /\{\{[\w\W]*?\}\}/.exec(body);
+  if (!first) return unsupported('模板含 {{变量}}（tpl_var）', rule, { code: 'unsupported_template_var' });
+  const head = body.slice(0, first.index);
+  if (first.index === 0 || !head.includes('##')) {
+    return { rules: [], makeUp: { parts: makeUpParts(body, rule, options, field), regexMode: true } };
+  }
+  const hash = head.indexOf('##');
+  const parts = makeUpParts(body.slice(hash), rule, options, field);
+  if (/\$\d/.test(head.slice(0, hash))) unsupported('模板外的文本含 $N（legado 切成 Regex 模式）', rule, { code: 'unsupported_template_var' });
+  const out: FieldIr = head.slice(0, hash).trim() === ''
+    ? { rules: [{ kind: 'self' }] }
+    : parseFieldRuleText(trimmed.slice(0, prefix.length + hash), options);
+  out.makeUp = { parts, regexMode: false };
+  return out;
+}
+
+/** 切模板片段：文本原样（不许 `$N`）、`{{规则}}` 编译成字段、`{{JS}}` 过白名单。 */
+function makeUpParts(text: string, rule: string, options: ParseOptions, field: string): JsTemplatePart[] {
+  const itemLevel = JS_ITEM_FIELDS.has(field);
+  const binds = fieldBinds(field);
+  const parts: JsTemplatePart[] = [];
+  const pushText = (piece: string) => {
+    if (piece === '') return;
+    if (/\$\d/.test(piece)) unsupported('模板外的文本含 $N（legado 切成 Regex 模式）', rule, { code: 'unsupported_template_var' });
+    parts.push({ kind: 'text', text: piece });
+  };
+  let last = 0;
+  for (const match of text.matchAll(JS_TEMPLATE_RE)) {
+    pushText(text.slice(last, match.index));
+    const inner = match[1];
+    if (isMakeUpRule(inner)) {
+      parts.push({ kind: 'rule', field: parseMakeUpRule(inner, rule, options) });
+    } else {
+      const path = /^\s*([A-Za-z_$][\w$]*)(?:\s*\.\s*[A-Za-z_$][\w$]*)*\s*$/.exec(inner);
+      if (path && !TEMPLATE_JS_ROOTS.has(path[1])) unsupported('模板含 {{变量}}（tpl_var）', rule, { code: 'unsupported_template_var' });
+      if (itemLevel && jsReadsInput(inner)) unsupported('条目级字段的模板 JS 读了 result/src', rule, { code: 'unsupported_template_js' });
+      checkJsCode(inner, rule, itemLevel, true, binds);
+      parts.push({ kind: 'js', code: inner });
+    }
+    last = match.index + match[0].length;
+  }
+  pushText(text.slice(last));
+  return parts;
+}
+
+/**
+ * `{{规则}}`：legado 以单条 SourceRule 在当前内容上 getString（不切 JS 段）。前缀按 SourceRule 构造归一：`@CSS:` 规范成
+ * 解析器认的小写，`@@` 剥掉，`@Json:` 剥掉后按 Jayway 补 `$.`（`@XPath:` 交 translateSegment）。
+ */
+function parseMakeUpRule(inner: string, rule: string, options: ParseOptions): FieldIr {
+  let text = inner;
+  if (/^@css:/i.test(text)) text = `@css:${text.slice(5)}`;
+  else if (text.startsWith('@@')) text = text.slice(2);
+  else if (/^@json:/i.test(text)) {
+    const path = text.slice(6);
+    text = path.startsWith('$') ? path : path.startsWith('[') ? `$${path}` : `$.${path}`;
+  }
+  if (text.trim() === '') unsupported('模板 {{规则}} 为空', rule, { code: 'unsupported_template_rule' });
+  return parseFieldRule(text, {
+    orEnabled: options.orEnabled, xpathEnabled: options.xpathEnabled, xpathEvalEnabled: options.xpathEvalEnabled, jsEnabled: false,
+    regexEnabled: options.regexEnabled, andEnabled: options.andEnabled, aioEnabled: false, field: options.field,
+  });
 }
 
 /** 正则字面量前一个有效字符若是这些（或在行首），`/` 是正则开头而非除号。 */

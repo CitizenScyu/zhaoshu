@@ -5,7 +5,8 @@ import { compileSource } from './rule-engine/compile';
 import { enginePostSearchEnabled, engineSearchJsActive } from './rule-engine/compile-smoke';
 import { buildSearchProbeRequest, buildSearchRequest, SEARCH_PROBE_TITLE, SearchJsNotReadyError } from './rule-engine/search-js';
 import {
-  engineSyntaxAioEnabled, engineSyntaxAndEnabled, engineSyntaxJsEnabled, engineSyntaxJsExtEnabled, engineSyntaxListJsEnabled, engineSyntaxOrEnabled, engineSyntaxRegexEnabled,
+  engineSyntaxAioEnabled, engineSyntaxAndEnabled, engineSyntaxJsBindEnabled, engineSyntaxJsEnabled, engineSyntaxJsExtEnabled, engineSyntaxListJsEnabled,
+  engineSyntaxOrEnabled, engineSyntaxRegexEnabled,
   engineSyntaxVarsEnabled, engineSyntaxXPathEnabled, engineSyntaxXPathEvalEnabled,
 } from './rule-engine/syntax-flags';
 import { sourceSearchUrl } from './source-parser';
@@ -59,7 +60,7 @@ const rulesUsable = new WeakMap<object, { flags: string; usable: boolean }>();
 /** 引擎源能否进取书池/扇出：搜索模板展得开且必需字段都编译得出。调用前 host 门须已刷新（门的结论不记忆）。 */
 export function engineSourceUsable(source: RuleSource): boolean {
   if (searchTemplateRejected(source)) return false;
-  const flags = `${engineSyntaxOrEnabled()}:${engineSyntaxXPathEnabled()}:${engineSyntaxVarsEnabled()}:${engineSyntaxJsEnabled()}:${engineSyntaxXPathEvalEnabled()}:${engineSyntaxRegexEnabled()}:${engineSyntaxAndEnabled()}:${engineSyntaxAioEnabled()}:${engineSyntaxListJsEnabled()}:${engineSyntaxJsExtEnabled()}`;
+  const flags = `${engineSyntaxOrEnabled()}:${engineSyntaxXPathEnabled()}:${engineSyntaxVarsEnabled()}:${engineSyntaxJsEnabled()}:${engineSyntaxXPathEvalEnabled()}:${engineSyntaxRegexEnabled()}:${engineSyntaxAndEnabled()}:${engineSyntaxAioEnabled()}:${engineSyntaxListJsEnabled()}:${engineSyntaxJsExtEnabled()}:${engineSyntaxJsBindEnabled()}`;
   const hit = rulesUsable.get(source.rules);
   if (hit?.flags === flags) return hit.usable;
   const usable = missingEngineFields(source).length === 0;

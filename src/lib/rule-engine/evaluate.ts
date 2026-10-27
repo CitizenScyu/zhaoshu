@@ -3,13 +3,13 @@
 // / §3.4（失败隔离）。引擎零网络：本文件不引入任何请求路径，页 URL 由调用方经 scope 传入。
 
 import { load, type CheerioAPI } from 'cheerio';
-import { decodeHTML } from 'entities';
+import { decodeHTML, decodeHTMLStrict } from 'entities';
 import {
-  type ChainStage, type CompiledRules, type FieldIr, type JsonPathIr, MAX_REGEX_PATTERN_LENGTH, RuleEngineError, type RuleIr, type RegexSub,
-  type SkippedField, type TemplatePart,
+  type ChainStage, type CompiledRules, type FieldIr, type JsonPathIr, type JsTemplatePart, MAX_REGEX_PATTERN_LENGTH, RuleEngineError,
+  type RuleIr, type RegexSub, type SkippedField, type TemplatePart,
 } from './types';
 import { aioListCode } from './aio-syntax';
-import { type JsListItem, type JsValue, runJs, runJsItems } from './js-sandbox';
+import { type JsBindings, type JsListItem, type JsValue, runJs, runJsItems } from './js-sandbox';
 import { evalJsonPath, evalJsonPathList, parseJsonPath } from './jsonpath';
 import { defaultSyntaxSource } from './parse';
 import { evaluateXPath } from './xpath-eval';
@@ -87,6 +87,15 @@ function tryParseJson(text: string): { ok: true; value: unknown } | { ok: false 
 }
 
 // ---------------------------------------------------------------- 作用域
+/**
+ * legado evalJS 的宿主只读绑定（bind1028，ENGINE_SYNTAX_JS_BIND）：门面按 legado 口径注入，未注入的不进沙箱。
+ * `origin` = `book.origin`（书源地址）；`chapterTitle` = `chapter.title` 与 `title`（目录条目的章节名 / 正文所属章节）。
+ */
+export interface ScopeHost {
+  origin?: string;
+  chapterTitle?: string;
+}
+
 /** HTML 输入的作用域。`nodes` 是求值起点：整篇文档（`$.root()`）或 bookList 的某一条。 */
 export interface HtmlScope {
   kind: 'html';
@@ -95,6 +104,8 @@ export interface HtmlScope {
   pageUrl: string;
   /** 页面原文（jsbox1027：JS 链首段的 result 与 `src`）。只有整页作用域有，收窄到条目后为 undefined。 */
   source?: string;
+  /** 宿主绑定（bind1028）；列表条目作用域沿用页面作用域的。 */
+  host?: ScopeHost;
 }
 
 /** JSON 输入的作用域（jsonpath / tpl_jsonpath 规则用）。 */
@@ -104,6 +115,8 @@ export interface JsonScope {
   pageUrl: string;
   /** 同 HtmlScope.source。 */
   source?: string;
+  /** 同 HtmlScope.host。 */
+  host?: ScopeHost;
   /** AllInOne 条目（aio1027）：legado `[group0..groupN]`，下标即 `$N`（group0 不回传，占位空串）；json 恒为 undefined。 */
   groups?: readonly string[];
   /** 列表 JS 返回的对象条目（listjs1027，legado NativeObject）：条目字段按 FieldIr.objectKey 键值直取；json 恒为 undefined。 */
@@ -129,6 +142,13 @@ export function createJsonScope(json: unknown, pageUrl: string): JsonScope {
 export function createScope(body: NormalizedBody, pageUrl: string): EvalScope {
   const scope = body.kind === 'json' ? createJsonScope(body.json, pageUrl) : createHtmlScope(body.text, pageUrl);
   scope.source = body.text;
+  return scope;
+}
+
+/** 链中段把上一段结果重新当页面解析（同 pageUrl），宿主绑定（bind1028）随作用域带下去。 */
+function rescope(text: string, from: EvalScope): EvalScope {
+  const scope = createScope(normalizeBody(text), from.pageUrl);
+  if (from.host) scope.host = from.host;
   return scope;
 }
 
@@ -474,13 +494,8 @@ export function evaluateField(field: FieldIr, scope: EvalScope, multi = false): 
     // T7 构件（&& 连接符 / %% 拼接）：M1 未实现，宁可失败也不要静默返回错的字符串。
     return evalFailed('M1 不支持 && / %% 组合规则（T7）');
   }
-  let value = '';
-  for (const ir of field.rules) {
-    const result = evaluateRule(ir, scope, multi);
-    if (result.kind === 'text') value = result.value;
-    else value = scope.kind === 'html' ? applyTerminal(scope.$, result.nodes, { op: 'text' }, scope.pageUrl, multi) : '';
-    if (value.trim() !== '') break;
-  }
+  if (field.makeUp) return makeUpFieldValue(field, field.makeUp, scope, multi);
+  let value = firstRuleValue(field.rules, scope, multi);
   const kind = field.rules.length === 1 ? field.rules[0].kind : undefined;
   // aio1027：模板代换后为空时 legado 拿捕获组列表的 toString 去做 `##` 替换（这类规则编译期已拒），这里空即空。
   if (kind === 'groupRef' && value === '') return '';
@@ -489,6 +504,79 @@ export function evaluateField(field: FieldIr, scope: EvalScope, multi = false): 
   // unescapeHtml4）；正文（multi）交 content-html。
   if (!multi && (kind === 'self' || kind === 'groupRef') && value.includes('&')) value = decodeHTML(value);
   return value.trim();
+}
+
+/** 逐条候选取首个非空（节点结果按 text 取）。 */
+function firstRuleValue(rules: readonly RuleIr[], scope: EvalScope, multi: boolean): string {
+  let value = '';
+  for (const ir of rules) {
+    const result = evaluateRule(ir, scope, multi);
+    if (result.kind === 'text') value = result.value;
+    else value = scope.kind === 'html' ? applyTerminal(scope.$, result.nodes, { op: 'text' }, scope.pageUrl, multi) : '';
+    if (value.trim() !== '') break;
+  }
+  return value;
+}
+
+/**
+ * 规则级 makeUp（bind1028，见 parse.ts parseMakeUpField）：片段拼成串后 `split("##")`。Regex 模式首段 trim 即值（为空且有
+ * 替换时对 content.toString() 替换），否则值取自规则主体；之后套拼出的正则（编译失败按 legado 口径回退）。Regex 模式的值
+ * 与正则-only 主体是未解码文本，非正文字段含 `&` 时按 unescapeHtml4 口径（只认带分号的实体）解码。
+ */
+function makeUpFieldValue(field: FieldIr, makeUp: NonNullable<FieldIr['makeUp']>, scope: EvalScope, multi: boolean): string {
+  const pieces = makeUpText(makeUp.parts, scope, multi).split('##');
+  const regex = dynamicRegex(pieces);
+  let value: string;
+  let raw = true;
+  if (makeUp.regexMode) {
+    value = pieces[0].trim();
+    if (value === '' && regex) value = selfText(scope);
+  } else {
+    value = firstRuleValue(field.rules, scope, multi);
+    raw = field.rules[0]?.kind === 'self';
+  }
+  if (regex) value = applyRegexSubs(value, [regex]);
+  if (!multi && raw && value.includes('&')) value = decodeHTMLStrict(value);
+  return value.trim();
+}
+
+/** makeUp 拼出的串长度上限（jsext1028 同款）：占位可能拼进整页文本，超出即失败。 */
+const MAX_MADE_UP_CHARS = 65_536;
+
+/** 拼模板片段：`{{规则}}` 在字段作用域取字符串；`{{JS}}` 以当前内容为 result（legado makeUpRule(result)），null 不拼。 */
+function makeUpText(parts: readonly JsTemplatePart[], scope: EvalScope, multi: boolean): string {
+  let text = '';
+  for (const part of parts) {
+    if (part.kind === 'text') text += part.text;
+    else if (part.kind === 'rule') text += evaluateField(part.field, scope, multi);
+    else {
+      const out = runJs(part.code, { result: scope.source ?? '', src: scope.source, baseUrl: scope.pageUrl, ...hostBindings(scope) });
+      if (Array.isArray(out)) return evalFailed('模板 {{JS}} 返回了数组（legado 按 NativeArray.toString 拼，不复现）');
+      if (out !== null) text += out;
+    }
+    if (text.length > MAX_MADE_UP_CHARS) return evalFailed('模板 makeUp 后过长');
+  }
+  return text;
+}
+
+/** makeUp 切出的正则（`split("##")` 第 2/3 段，≥4 段 replaceFirst）；正则段为空不替换。 */
+function dynamicRegex(pieces: readonly string[]): RegexSub | undefined {
+  if (pieces.length < 2 || pieces[1] === '') return undefined;
+  if (pieces[1].length > MAX_REGEX_PATTERN_LENGTH) return evalFailed('模板 makeUp 后正则 pattern 过长');
+  const regex: RegexSub = { pattern: pieces[1], replacement: pieces[2] ?? '', dynamic: true };
+  if (pieces.length > 3) regex.first = true;
+  return regex;
+}
+
+/** 作用域上的宿主绑定 → 沙箱绑定（bind1028）。没注入的不进沙箱：JS 里引用它照旧 ReferenceError。 */
+function hostBindings(scope: EvalScope): Pick<JsBindings, 'globals' | 'objects'> {
+  const host = scope.host;
+  if (host === undefined) return {};
+  const objects: Record<string, Record<string, string>> = {};
+  if (host.origin !== undefined) objects.book = { origin: host.origin };
+  if (host.chapterTitle === undefined) return { objects };
+  objects.chapter = { title: host.chapterTitle };
+  return { objects, globals: { title: host.chapterTitle } };
 }
 
 /**
@@ -532,8 +620,15 @@ export function evaluateFieldNodes(field: FieldIr, scope: EvalScope): CheerioNod
  * - JSON：对齐 legado AnalyzeByJSonPath.getList——JSONPath 规则按 `evalJsonPathList` 取列表项，
  *   默认语法规则补 `$.` 后同样处理（`.bookList[*]` → `$..bookList[*]`），`||` 取首个非空支；
  *   模板/字面量/显式 CSS 没有列表语义，视为空支。每项各自成为 JSON 作用域。
+ * 条目作用域都沿用页面作用域的宿主绑定（bind1028；legado 同一个 AnalyzeRule 的 book 不随条目变）。
  */
 export function evaluateFieldList(field: FieldIr, scope: EvalScope): EvalScope[] {
+  const scopes = fieldListScopes(field, scope);
+  if (scope.host !== undefined) for (const item of scopes) item.host ??= scope.host;
+  return scopes;
+}
+
+function fieldListScopes(field: FieldIr, scope: EvalScope): EvalScope[] {
   if (field.chain) return listChainScopes(field.chain, scope);
   const head = field.rules[0];
   if (head?.kind === 'regexList') return aioListScopes(head, scope);
@@ -664,11 +759,13 @@ export function fieldUsesJs(field: FieldIr | SkippedField | undefined): field is
   return field !== undefined && !('skipped' in field) && field.chain !== undefined;
 }
 
-/** 编译产物里是否有要用沙箱的字段：JS 链，或 AllInOne 列表（aio1027）。调用方据此先 await preloadJsSandbox。 */
+/** 编译产物里是否有要用沙箱的字段：JS 链、AllInOne 列表（aio1027），或带 `{{JS}}` 的规则级 makeUp（bind1028）。调用方据此先 await preloadJsSandbox。 */
 export function compiledUsesJs(compiled: CompiledRules): boolean {
   for (const field of compiled.values()) {
     if (fieldUsesJs(field)) return true;
-    if (!('skipped' in field) && field.rules[0]?.kind === 'regexList') return true;
+    if ('skipped' in field) continue;
+    if (field.rules[0]?.kind === 'regexList') return true;
+    if (field.makeUp?.parts.some((part) => part.kind === 'js')) return true;
   }
   return false;
 }
@@ -700,7 +797,7 @@ function evaluateChain(chain: readonly ChainStage[], scope: EvalScope, list: boo
   let value: JsValue | undefined; // undefined = 还在首段
   for (const stage of chain) {
     if (stage.kind === 'rule') {
-      const stageScope = value === undefined ? scope : createScope(normalizeBody(joinLines(value)), scope.pageUrl);
+      const stageScope = value === undefined ? scope : rescope(joinLines(value), scope);
       value = list ? splitLines(evaluateField(stage.field, stageScope, true)) : evaluateField(stage.field, stageScope, multi);
       continue;
     }
@@ -718,7 +815,7 @@ function evaluateChain(chain: readonly ChainStage[], scope: EvalScope, list: boo
       value = applyRegexSubs(joinLines(input), [regex]);
       continue;
     }
-    const out = runJs(code, { result: input, src: scope.source, baseUrl: scope.pageUrl }, stage.template ? stage.code : code);
+    const out = runJs(code, { result: input, src: scope.source, baseUrl: scope.pageUrl, ...hostBindings(scope) }, stage.template ? stage.code : code);
     if (out === null) return null;
     if (regex === undefined) value = out;
     else if (!Array.isArray(out)) value = applyRegexSubs(out, [regex]);
@@ -746,7 +843,7 @@ function makeUpJs(
     if (part.kind === 'text') text += part.text;
     else if (part.kind === 'rule') text += evaluateField(part.field, scope);
     else {
-      const out = runJs(part.code, { result: input, src: scope.source, baseUrl: scope.pageUrl });
+      const out = runJs(part.code, { result: input, src: scope.source, baseUrl: scope.pageUrl, ...hostBindings(scope) });
       if (out === null || Array.isArray(out)) return evalFailed('JS 段 {{}} 占位的结果不是字符串');
       text += out;
     }
@@ -789,7 +886,8 @@ function substituteListRefs(code: string, items: readonly string[]): string {
 /**
  * 套用 `##pattern##replacement##flags##` 替换（`##p##` 无 replacement 即删除匹配，§3.3）。
  * `first`（regex1027）= legado replaceFirst：取首个匹配串、对它再套一次替换（Matcher.group(0).replaceFirst），
- * 匹配外的文本丢弃，无匹配得空串。
+ * 匹配外的文本丢弃，无匹配得空串。`dynamic`（bind1028）的 pattern 编译失败按 legado replaceRegex 回退：first 得 replacement，
+ * 否则按字面量整串替换。
  */
 export function applyRegexSubs(text: string, subs: readonly RegexSub[]): string {
   let out = text;
@@ -799,7 +897,9 @@ export function applyRegexSubs(text: string, subs: readonly RegexSub[]): string 
       // first 去掉 g（只取首个匹配）；AllInOne 的 Java 内联标志（aio1027，如 `(?s)`）随 flags 带过来。
       re = new RegExp(sub.pattern, sub.first ? (sub.flags ?? '').replace('g', '') : (sub.flags ?? 'g'));
     } catch {
-      return evalFailed(`正则无法编译：${sub.pattern}`, sub.pattern);
+      if (!sub.dynamic) return evalFailed(`正则无法编译：${sub.pattern}`, sub.pattern);
+      out = sub.first ? sub.replacement : out.split(sub.pattern).join(sub.replacement);
+      continue;
     }
     if (sub.first) {
       const match = re.exec(out);

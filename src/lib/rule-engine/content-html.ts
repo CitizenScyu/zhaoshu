@@ -42,6 +42,8 @@ export function contentNeedsHtmlToText(field: FieldIr | undefined): boolean {
   if (!field) return false;
   // JS 链（jsbox1027）的输出形态由脚本决定（常见是拼出的 HTML 片段），一律按 legado HtmlFormatter 口径转换。
   if (field.chain) return true;
+  // 规则级 makeUp 的 Regex 模式（bind1028）：值是拼出的文本（常含 {{@html}} 片段），同上。
+  if (field.makeUp?.regexMode) return true;
   return !field.rules.every(ruleIsPlainText);
 }
 

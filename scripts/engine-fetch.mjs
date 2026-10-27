@@ -44,6 +44,8 @@ function parseArgs(argv) {
     else if (a === '--title') args.title = argv[++i] ?? null;
     else if (a === '--author') args.author = argv[++i] ?? null;
     else if (a === '--url') args.url = argv[++i] ?? null;
+    // bind1028：content 的本章章节名（正文 JS 读 chapter.title/title；ENGINE_SYNTAX_JS_BIND 关时不用）。只用于 content。
+    else if (a === '--chapter-title') args.chapterTitle = argv[++i] ?? null;
     // espfix41：labeler 已自行搜过 book15（或已熔断），--no-builtin 免掉 CLI 里重复的一次；
     // --skip-host（可重复）跳过本轮已判「查询不敏感」的垃圾源。二者只用于 search。
     else if (a === '--no-builtin') args.noBuiltin = true;
@@ -134,6 +136,7 @@ function engineSourceOf(m, source) {
     url: source.url, name: source.name,
     searchUrl: typeof source.searchUrl === 'string' ? source.searchUrl : '',
     compiled: m.compile.compileSource({ url: source.url, searchUrl: source.searchUrl, rules: source.rules }),
+    origin: typeof source.rules?.bookSourceUrl === 'string' ? source.rules.bookSourceUrl : undefined,
   };
 }
 
@@ -299,7 +302,7 @@ async function cmdContent(m, args) {
     const engineSource = engineSourceOf(m, source);
     // lblqual41：停止点 = 整本目录。站点「下一页」若是目录里的任一章（cuoceng 的 #linkNext 就是下一章，
     // 且目录序与下一章链序不同）即停，不再一路翻 20 页串进后续章节。未给清单时行为同改前。
-    text = (await m.api.engineFetchContent(engineSource, args.url, context, false, args.stopUrls)).text;
+    text = (await m.api.engineFetchContent(engineSource, args.url, context, false, args.stopUrls, args.chapterTitle ?? undefined)).text;
   }
   if (!text) throw new ExitError(1, `空正文：${args.url}`);
   const out = { source: hostOf(source.url), url: args.url, text };

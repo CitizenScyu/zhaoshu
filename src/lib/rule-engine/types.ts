@@ -148,6 +148,11 @@ export interface RegexSub {
    * 只取首个匹配，结果 = 该匹配串套一次替换，匹配外的文本丢弃；无匹配得空串。off 态与带选择器主体的段不产出此键。
    */
   first?: true;
+  /**
+   * 求值期才拼出的正则（bind1028 规则级 makeUp）：编译期校验不了。legado replaceRegex 的失败口径——非 first 时 pattern
+   * 编译失败按字面量整串替换，first 时直接得 replacement。
+   */
+  dynamic?: true;
 }
 
 /**
@@ -197,6 +202,12 @@ export interface FieldIr {
   objectKey?: { key: string; regex?: RegexSub } | { unsupported: string };
   /** 目录列表规则以 `-` 开头（listjs1027，legado BookChapterList 剥前缀后整表反转）。 */
   reverse?: true;
+  /**
+   * 规则级 makeUp（bind1028，ENGINE_SYNTAX_JS_BIND）：legado SourceRule 对非 JS 规则里 `{{}}` 的处理。`regexMode`（首个 `{{`
+   * 前没有 `##`）= 整条按片段拼值后 `split("##")`，首段即结果（rules 为空）；否则 rules 是首个 `##` 之前的规则主体，`parts`
+   * 只是从首个 `##` 起的尾巴，拼出后切成动态正则与替换（见 evaluate.ts makeUpValue）。
+   */
+  makeUp?: { parts: JsTemplatePart[]; regexMode: boolean };
 }
 
 /** 装饰字段编译失败不阻断，标 skip 的占位。 */

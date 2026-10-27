@@ -55,6 +55,8 @@ export interface JsBindings {
   baseUrl: string;
   /** 额外的全局变量（searchjs1027 搜索模板的 key/page 等）；与 result/src/baseUrl/java 同名的被它们覆盖。 */
   globals?: Readonly<Record<string, string | number>>;
+  /** 宿主只读对象（bind1028 的 `book`/`chapter`）：名 → 字符串属性表，沙箱里冻结；与 result/src/baseUrl/java 同名的被它们覆盖。 */
+  objects?: Readonly<Record<string, Readonly<Record<string, string>>>>;
 }
 
 let ready: QuickJSWASMModule | undefined;
@@ -159,11 +161,13 @@ const HOST_HELPERS: Record<string, (args: (string | undefined)[]) => string> = {
 };
 
 // log/toast 在 legado 里返回入参（log 可串在表达式中间），沙箱内直接用 JS 实现；result 列表补 legado
-// NativeJavaList 的 size()/get()。
+// NativeJavaList 的 size()/get()；宿主只读对象（bind1028 book/chapter）冻结。
 const PRELUDE = `(function(){
   var j = globalThis.java;
   j.log = function(m){ return m; }; j.toast = function(m){ return m; }; j.longToast = function(m){ return m; };
   Object.freeze(j);
+  if (typeof globalThis.book === 'object' && globalThis.book) Object.freeze(globalThis.book);
+  if (typeof globalThis.chapter === 'object' && globalThis.chapter) Object.freeze(globalThis.chapter);
   var r = globalThis.result;
   if (Array.isArray(r)) {
     Object.defineProperty(r, 'size', { value: function(){ return this.length; } });
@@ -204,6 +208,7 @@ function execute<T>(
     : bindings.result;
   const inputs = [...results, bindings.src ?? '', bindings.baseUrl];
   for (const value of Object.values(bindings.globals ?? {})) if (typeof value === 'string') inputs.push(value);
+  for (const props of Object.values(bindings.objects ?? {})) inputs.push(...Object.values(props));
   if (inputs.reduce((sum, text) => sum + text.length, 0) > MAX_JS_INPUT_CHARS * 2
     || inputs.some((text) => text.length > MAX_JS_INPUT_CHARS)) return evalFailed('JS 输入过大');
   const started = Date.now();
@@ -265,6 +270,16 @@ function installGlobals(context: QuickJSContext, bindings: JsBindings): void {
     const handle = typeof value === 'number' ? context.newNumber(value) : context.newString(value);
     setGlobal(name, handle);
     handle.dispose();
+  }
+  for (const [name, props] of Object.entries(bindings.objects ?? {})) {
+    const object = context.newObject();
+    for (const [key, value] of Object.entries(props)) {
+      const handle = context.newString(value);
+      context.setProp(object, key, handle);
+      handle.dispose();
+    }
+    setGlobal(name, object);
+    object.dispose();
   }
   const baseUrl = context.newString(bindings.baseUrl);
   setGlobal('baseUrl', baseUrl);

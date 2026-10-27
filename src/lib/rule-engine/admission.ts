@@ -24,7 +24,7 @@ import {
 } from './evaluate';
 import { RuleEngineError, type FieldIr, type RuleDiagnostic } from './types';
 import { compileSource, engineSourceRevision } from './compile';
-import { engineSyntaxAioEnabled, engineSyntaxVarsEnabled } from './syntax-flags';
+import { engineSyntaxAioEnabled, engineSyntaxJsBindEnabled, engineSyntaxVarsEnabled } from './syntax-flags';
 import { aioGroups, isAioListRule, ruleGroupOf } from './aio-syntax';
 import { preloadJsSandbox } from './js-sandbox';
 import { buildSearchRequest, prepareSearchJs, SearchJsNotReadyError } from './search-js';
@@ -729,6 +729,8 @@ function searchCandidates(source: RawSource, text: string, pageUrl: string): { t
   const bookUrlIr = parseSafe(bookUrl, 'ruleSearch.bookUrl');
   let scope;
   try { scope = createScope(normalizeBody(text), pageUrl); } catch { return []; }
+  // bind1028：宿主绑定同 api.ts pageScope（开关 on 才挂）。
+  if (engineSyntaxJsBindEnabled()) scope.host = { origin: typeof source.bookSourceUrl === 'string' ? source.bookSourceUrl : '' };
   // HTML 与 JSON 搜索页同一路径（JSON 页 bookList 取列表项，见 evaluateFieldList）。
   let items;
   try { items = evaluateFieldList(listIr, scope); } catch { return []; }
@@ -967,7 +969,8 @@ export async function readabilityShadow(
   let requests = 0;
   const gate = (value: string, base: string) =>
     validateAdmissionUrl(upgradeSourceTemplateUrl(value), base, options.declaredHosts).href;
-  const get = async (url: string) => {
+  const origin = typeof source.bookSourceUrl === 'string' ? source.bookSourceUrl : '';
+  const get = async (url: string, chapterTitle?: string) => {
     if (requests > 0 && throttleMs > 0) await (options.sleep ?? defaultSleep)(throttleMs, options.signal);
     if (options.canFetch && !options.canFetch()) throw new ReadabilityStop('skipped', 'budget');
     requests += 1;
@@ -976,6 +979,8 @@ export async function readabilityShadow(
       throw new ReadabilityStop(page.status === 403 ? 'challenge' : 'http_error', String(page.status));
     }
     const scope = createScope(normalizeBody(page.text), page.url);
+    // bind1028：宿主绑定同 api.ts pageScope（开关 on 才挂）。
+    if (engineSyntaxJsBindEnabled()) scope.host = { origin, ...(chapterTitle === undefined ? {} : { chapterTitle }) };
     if (scope.kind === 'html' && isStructuredChallengePage(scope.$)) throw new ReadabilityStop('challenge', 'challenge_page');
     return { url: page.url, scope };
   };
@@ -999,18 +1004,27 @@ export async function readabilityShadow(
     const toc = tocUrl === detail.url ? detail : await get(tocUrl);
     const list = field('ruleToc.chapterList');
     const urls: string[] = [];
+    const titles: string[] = [];
     for (const inner of list ? evaluateFieldList(list, toc.scope) : []) {
       const title = text('ruleToc.chapterName', inner);
-      const rawUrl = text('ruleToc.chapterUrl', inner).trim();
+      const urlScope = inner.host ? { ...inner, host: { ...inner.host, chapterTitle: title } } : inner;
+      const rawUrl = text('ruleToc.chapterUrl', urlScope).trim();
       let chapterUrl: string;
       try { chapterUrl = rawUrl ? gate(rawUrl, toc.url) : toc.url; } catch { continue; }
-      if (title) urls.push(chapterUrl);
+      if (title) {
+        urls.push(chapterUrl);
+        titles.push(title);
+      }
     }
-    if (list?.reverse === true) urls.reverse(); // listjs1027：`-` 前缀整表反转（样本章取中位，与运行时同向）
+    if (list?.reverse === true) { // listjs1027：`-` 前缀整表反转（样本章取中位，与运行时同向）
+      urls.reverse();
+      titles.reverse();
+    }
     chapters = urls.length;
     if (chapters === 0) return { verdict: 'toc_empty', chapters, chars: 0, error: list ? '' : 'toc:no_chapter_list' };
     stage = 'content';
-    const content = await get(urls[Math.floor(chapters / 2)]);
+    const middle = Math.floor(chapters / 2);
+    const content = await get(urls[middle], titles[middle]);
     const contentField = field('ruleContent.content');
     const raw = text('ruleContent.content', content.scope, true);
     const chars = (contentNeedsHtmlToText(contentField) ? contentHtmlToText(raw) : raw).replace(/\s/g, '').length;

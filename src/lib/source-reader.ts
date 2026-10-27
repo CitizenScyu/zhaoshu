@@ -483,6 +483,8 @@ function engineSourceOf(source: ReadingSource): EngineSource {
     url: source.url, name: source.name,
     searchUrl: typeof source.searchUrl === 'string' ? source.searchUrl : '',
     compiled: compileSource({ url: source.url, searchUrl: source.searchUrl, rules: source.rules }),
+    // bind1028：`book.origin` 取书源原文地址（url 已升 https/归一）。
+    origin: typeof source.rules?.bookSourceUrl === 'string' ? source.rules.bookSourceUrl : undefined,
   };
 }
 
@@ -1616,7 +1618,7 @@ async function chapterText(
     if (new URL(page.url).pathname !== new URL(chapter.url).pathname) throw new SourcePolicyError('章节跳转到了另一页面');
     return parseSourceChapterText(page.text, chapter.title);
   }
-  const { text } = await engineFetchContent(engineSourceOf(source), chapter.url, context, false, stopUrls);
+  const { text } = await engineFetchContent(engineSourceOf(source), chapter.url, context, false, stopUrls, chapter.title);
   // 引擎只解释规则不做内容判定：builtin 的两道内容闸（空正文 / 单章限长）在这里补齐，错误语义与 builtin
   // 对齐：当前源失败同样进章节级换源；候选失败记 SOURCE_POLICY_REJECTED 后试下一个候选。
   if (!text) throw new SourcePolicyError('书源未提供有效正文');

@@ -23,18 +23,19 @@ export const ENGINE_SEMANTICS_XPATH_BIT = 2;
 /** vars1027：@put/@get 静态子集语义位。版本再 +4（5–8 = 含变量位的四种组合），1–4 逐字不变。 */
 export const ENGINE_SEMANTICS_VARS_BIT = 4;
 
-/** 语义版本随 || / XPath / 变量 / JS / XPath 求值 / 正则 / && / AllInOne / 搜索 JS / 列表 JS / JS 扩展开关联动（唯一口径，供 compile.ts 缓存键与 rulesHash 复用）。 */
+/** 语义版本随 || / XPath / 变量 / JS / XPath 求值 / 正则 / && / AllInOne / 搜索 JS / 列表 JS / JS 扩展 / 宿主绑定开关联动（唯一口径，供 compile.ts 缓存键与 rulesHash 复用）。 */
 export function engineSemanticsVersion(
   orEnabled: boolean, xpathEnabled = false, varsEnabled = false, jsEnabled = false, xpathEvalEnabled = false,
   regexEnabled = false, andEnabled = false, aioEnabled = false, searchJsEnabled = false, listJsEnabled = false,
-  jsExtEnabled = false,
+  jsExtEnabled = false, jsBindEnabled = false,
 ): number {
   return (orEnabled ? ENGINE_SEMANTICS_VERSION_OR : ENGINE_SEMANTICS_VERSION)
     + (xpathEnabled ? ENGINE_SEMANTICS_XPATH_BIT : 0) + (varsEnabled ? ENGINE_SEMANTICS_VARS_BIT : 0)
     + (jsEnabled ? ENGINE_SEMANTICS_JS_BIT : 0) + (xpathEvalEnabled ? ENGINE_SEMANTICS_XPATH_EVAL_BIT : 0)
     + (regexEnabled ? ENGINE_SEMANTICS_REGEX_BIT : 0) + (andEnabled ? ENGINE_SEMANTICS_AND_BIT : 0)
     + (aioEnabled ? ENGINE_SEMANTICS_AIO_BIT : 0) + (searchJsEnabled ? ENGINE_SEMANTICS_SEARCH_JS_BIT : 0)
-    + (listJsEnabled ? ENGINE_SEMANTICS_LIST_JS_BIT : 0) + (jsExtEnabled ? ENGINE_SEMANTICS_JS_EXT_BIT : 0);
+    + (listJsEnabled ? ENGINE_SEMANTICS_LIST_JS_BIT : 0) + (jsExtEnabled ? ENGINE_SEMANTICS_JS_EXT_BIT : 0)
+    + (jsBindEnabled ? ENGINE_SEMANTICS_JS_BIND_BIT : 0);
 }
 
 /**
@@ -199,5 +200,22 @@ export const ENGINE_SEMANTICS_JS_EXT_BIT = 1024;
  */
 export function engineSyntaxJsExtEnabled(env: OrEnv = process.env): boolean {
   const raw = env.ENGINE_SYNTAX_JS_EXT?.trim().toLowerCase();
+  return raw === '1' || raw === 'true' || raw === 'on';
+}
+
+/**
+ * bind1028：宿主绑定与规则级 makeUp 语义位。版本再 +2048（2049–4096），1–2048 逐字不变。
+ * 只对 off 态被拒、on 态编译通过的字段所在源计入（compile.ts sourceUsesJsBindSyntax）。
+ */
+export const ENGINE_SEMANTICS_JS_BIND_BIT = 2048;
+
+/**
+ * ENGINE_SYNTAX_JS_BIND 独立开关（bind1028，默认 off，口径同 ENGINE_SYNTAX_OR；须 ENGINE_SYNTAX_JS 同开才生效）。
+ * on = ① JS 里放行宿主只读绑定 `book.origin`（全部 JS 字段）与 `chapter.title`/`title`（chapterUrl 与正文两字段），
+ * 值由门面按 legado 口径注入（书源地址、目录条目的章节名）；② 非 JS 规则里 legado 模板 `{{规则}}`/`{{JS}}` 按
+ * SourceRule 的 Regex 模式（首个 `{{` 前没有 `##`）拼值、或作为 `##` 之后的动态正则/替换求值。off = 逐字不变。
+ */
+export function engineSyntaxJsBindEnabled(env: OrEnv = process.env): boolean {
+  const raw = env.ENGINE_SYNTAX_JS_BIND?.trim().toLowerCase();
   return raw === '1' || raw === 'true' || raw === 'on';
 }

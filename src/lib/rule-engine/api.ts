@@ -18,6 +18,7 @@ import {
 import { enginePostSearchEnabled, engineSearchJsActive } from './compile-smoke';
 import { preloadJsSandbox } from './js-sandbox';
 import { buildSearchRequest, prepareSearchJs } from './search-js';
+import { engineSyntaxJsBindEnabled } from './syntax-flags';
 import type { CompiledRules, FieldIr, SkippedField } from './types';
 
 export interface EngineSource {
@@ -26,6 +27,8 @@ export interface EngineSource {
   searchUrl: string;
   /** compile.ts 产物（带 LRU，key=sourceRevision）。 */
   compiled: CompiledRules;
+  /** 书源原文的 bookSourceUrl（bind1028 `book.origin`，legado 不做归一）；缺省用 url。 */
+  origin?: string;
 }
 export interface EngineSearchResult { title: string; author: string; bookUrl: string }
 export interface EngineTocResult { chapters: SourceChapter[] }
@@ -59,6 +62,18 @@ function evaluateText(
 function absoluteUrl(value: string, base: string): string | undefined {
   if (!value) return undefined;
   try { return validateSourceUrl(upgradeSourceTemplateUrl(value), base).href; } catch { return undefined; }
+}
+
+/**
+ * 页面作用域（bind1028，ENGINE_SYNTAX_JS_BIND on 才挂）：JS 的 `book.origin` = 书源地址，正文页另带当前章节名。
+ * off 态不挂，JS 求值的输入与改前逐字一致。
+ */
+function pageScope(source: EngineSource, text: string, url: string, chapterTitle?: string): ReturnType<typeof createScope> {
+  const scope = createScope(normalizeBody(text), url);
+  if (engineSyntaxJsBindEnabled()) {
+    scope.host = { origin: source.origin ?? source.url, ...(chapterTitle === undefined ? {} : { chapterTitle }) };
+  }
+  return scope;
 }
 
 /** 编译产物含 JS 链字段时先载入沙箱（jsbox1027；求值是同步的，必须在取页之前就绪）。无 JS 链零开销。 */
@@ -108,7 +123,7 @@ export async function engineSearchBook(
   } else {
     page = await context.page(sourceSearchUrl(source.searchUrl, title, source.url));
   }
-  const scope = createScope(normalizeBody(page.text), page.url);
+  const scope = pageScope(source, page.text, page.url);
   const list = field(source.compiled, 'ruleSearch.bookList');
   if (!list) return [];
   const items = evaluateFieldList(list, scope);
@@ -139,7 +154,7 @@ export async function engineFetchDetail(
   await prepareJs(source);
   const target = validateSourceUrl(bookUrl).href;
   const page = await context.page(target, { responseCharset: enginePostSearchEnabled() ? 'auto' : undefined });
-  const scope = createScope(normalizeBody(page.text), page.url);
+  const scope = pageScope(source, page.text, page.url);
   const detail: Partial<SourceBookIdentity> & { tocUrl?: string } = {};
   const title = evaluateText(source.compiled, 'ruleBookInfo.name', scope);
   const author = evaluateText(source.compiled, 'ruleBookInfo.author', scope);
@@ -193,7 +208,7 @@ export async function engineFetchToc(
       throw new SourcePolicyError('书源目录分页重复返回已读取的页面，请重试或更换书源');
     }
     receivedPages.add(receivedKey);
-    const scope = createScope(normalizeBody(page.text), page.url);
+    const scope = pageScope(source, page.text, page.url);
     let validChapters = 0;
     const list = field(source.compiled, 'ruleToc.chapterList');
     if (strict && [...source.compiled.entries()].some(([key, value]) => key.startsWith('ruleToc.') && 'skipped' in value)) throw new Error('unsupported_toc_rule');
@@ -206,7 +221,9 @@ export async function engineFetchToc(
         // docs/legado-semantics/）：URL 类规则缺失或求值为空 → 章节 url 取当前目录页 URL
         // （baseUrl）。只有这两种情况落兜底；规则产出非空但过不了 host 门的 URL 一律丢弃
         // （absoluteUrl 返回 undefined），绝不洗成 page.url。
-        const rawUrl = evaluateText(source.compiled, 'ruleToc.chapterUrl', inner);
+        // bind1028：legado 先求 chapterName 赋给 bookChapter.title，chapterUrl 的 JS 可读 chapter.title/title。
+        const urlScope = inner.host ? { ...inner, host: { ...inner.host, chapterTitle: title } } : inner;
+        const rawUrl = evaluateText(source.compiled, 'ruleToc.chapterUrl', urlScope);
         const chapterUrl = rawUrl.trim() ? absoluteUrl(rawUrl, page.url) : page.url;
         if (strict && (!title || title.length > MAX_TITLE_LENGTH || !chapterUrl || !rawUrl.trim())) throw new Error('invalid_chapter');
         if (!title || title.length > MAX_TITLE_LENGTH || !chapterUrl) continue;
@@ -273,10 +290,11 @@ function redirectedPageIdentity(url: string): string {
  * 传数组（lblqual41）= 一组停止地址，下一页命中其中任一即停：站点「下一章」链的顺序可能与目录顺序不同
  * （cuoceng《鬼吹灯》第 0 章的下一章是目录第 3 章），只给目录里的下一章拦不住，调用方可以把整本目录都传进来。
  * 本章自身地址不参与停止判断（整本目录必然含本章；自指翻页仍按 visited/strict 的环检测处理）。
+ * chapterTitle（bind1028）：本章章节名，正文两字段的 JS 读 `chapter.title`/`title` 时用；不传则读到 undefined。
  */
 export async function engineFetchContent(
   source: EngineSource, chapterUrl: string, context: SourceRequestContext, strict = false,
-  nextChapterUrl?: string | readonly string[],
+  nextChapterUrl?: string | readonly string[], chapterTitle?: string,
 ): Promise<EngineContentResult> {
   await prepareJs(source);
   const parts: string[] = [];
@@ -316,7 +334,7 @@ export async function engineFetchContent(
       throw new SourcePolicyError('书源正文分页重复返回已读取的页面，请重试或更换书源');
     }
     receivedPages.add(receivedKey);
-    const scope = createScope(normalizeBody(page.text), page.url);
+    const scope = pageScope(source, page.text, page.url, chapterTitle);
     // 首/后页同门：挑战页不能作为正文交付，也不能缓存已拼出的半章。
     if (scope.kind === 'html' && isStructuredChallengePage(scope.$)) {
       throw new SourcePolicyError('书源正文页被安全验证拦截，请重试或更换书源');

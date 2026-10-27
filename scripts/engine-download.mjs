@@ -152,7 +152,8 @@ export async function downloadBook(m, args, resolveSource, transport = fetchSour
       catch (error) { if (error.code === 2) failureCode = 2; throw error; }
     });
     manifest.sourceRevision = hash(JSON.stringify(source));
-    const engine = builtin ? null : { url: source.url, name: source.name, searchUrl: source.searchUrl, compiled: m.compile.compileSource(source) };
+    const engine = builtin ? null : { url: source.url, name: source.name, searchUrl: source.searchUrl, compiled: m.compile.compileSource(source),
+      origin: typeof source.rules?.bookSourceUrl === 'string' ? source.rules.bookSourceUrl : undefined };
     // dlsearch-1026：搜索词用清洗后的值（版本注记/国籍/角色词见 src/lib/search-key.ts），身份判据
     // identityMatches 仍用任务原值（args.title/args.author）——搜索词是「怎么找候选」，比对是「是不是这本书」。
     const searchKeys = searchKeysOf({ title: args.title, author: args.author });
@@ -230,7 +231,7 @@ export async function downloadBook(m, args, resolveSource, transport = fetchSour
           if (hash(cached) === prior.sha256 && cached.trim()) text = cached;
         }
         if (text === undefined) text = await operation(async ctx => {
-          if (!builtin) return (await m.api.engineFetchContent(engine, chapter.url, ctx, true, stopUrls)).text;
+          if (!builtin) return (await m.api.engineFetchContent(engine, chapter.url, ctx, true, stopUrls, chapter.title)).text;
           return m.parser.parseSourceChapterText((await ctx.page(chapter.url)).text, chapter.title);
         });
         if (!text.trim()) throw new Error('empty_content');
