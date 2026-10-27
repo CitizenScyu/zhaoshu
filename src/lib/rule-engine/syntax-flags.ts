@@ -23,12 +23,12 @@ export const ENGINE_SEMANTICS_XPATH_BIT = 2;
 /** vars1027：@put/@get 静态子集语义位。版本再 +4（5–8 = 含变量位的四种组合），1–4 逐字不变。 */
 export const ENGINE_SEMANTICS_VARS_BIT = 4;
 
-/** 语义版本随 || / XPath / 变量 / JS / XPath 求值 / 正则 / && / AllInOne / 搜索 JS / 列表 JS / JS 扩展 / 宿主绑定 / java.getString / 加解密帮手 / JSONPath 扩展 / 详情 init / 搜索选项 legado 口径开关联动（唯一口径，供 compile.ts 缓存键与 rulesHash 复用）。 */
+/** 语义版本随 || / XPath / 变量 / JS / XPath 求值 / 正则 / && / AllInOne / 搜索 JS / 列表 JS / JS 扩展 / 宿主绑定 / java.getString / 加解密帮手 / JSONPath 扩展 / 详情 init / 搜索选项 legado 口径 / URL 字段选项开关联动（唯一口径，供 compile.ts 缓存键与 rulesHash 复用）。 */
 export function engineSemanticsVersion(
   orEnabled: boolean, xpathEnabled = false, varsEnabled = false, jsEnabled = false, xpathEvalEnabled = false,
   regexEnabled = false, andEnabled = false, aioEnabled = false, searchJsEnabled = false, listJsEnabled = false,
   jsExtEnabled = false, jsBindEnabled = false, jsGetEnabled = false, jsUtilEnabled = false, jsonPathEnabled = false,
-  initEnabled = false, searchOptionsEnabled = false,
+  initEnabled = false, searchOptionsEnabled = false, urlOptionsEnabled = false,
 ): number {
   return (orEnabled ? ENGINE_SEMANTICS_VERSION_OR : ENGINE_SEMANTICS_VERSION)
     + (xpathEnabled ? ENGINE_SEMANTICS_XPATH_BIT : 0) + (varsEnabled ? ENGINE_SEMANTICS_VARS_BIT : 0)
@@ -38,7 +38,8 @@ export function engineSemanticsVersion(
     + (listJsEnabled ? ENGINE_SEMANTICS_LIST_JS_BIT : 0) + (jsExtEnabled ? ENGINE_SEMANTICS_JS_EXT_BIT : 0)
     + (jsBindEnabled ? ENGINE_SEMANTICS_JS_BIND_BIT : 0) + (jsGetEnabled ? ENGINE_SEMANTICS_JS_GET_BIT : 0)
     + (jsUtilEnabled ? ENGINE_SEMANTICS_JS_UTIL_BIT : 0) + (jsonPathEnabled ? ENGINE_SEMANTICS_JSON_PATH_BIT : 0)
-    + (initEnabled ? ENGINE_SEMANTICS_INIT_BIT : 0) + (searchOptionsEnabled ? ENGINE_SEMANTICS_SEARCH_OPTIONS_BIT : 0);
+    + (initEnabled ? ENGINE_SEMANTICS_INIT_BIT : 0) + (searchOptionsEnabled ? ENGINE_SEMANTICS_SEARCH_OPTIONS_BIT : 0)
+    + (urlOptionsEnabled ? ENGINE_SEMANTICS_URL_OPTIONS_BIT : 0);
 }
 
 /**
@@ -305,5 +306,22 @@ export const ENGINE_SEMANTICS_SEARCH_OPTIONS_BIT = 65536;
  */
 export function engineSearchOptionsEnabled(env: OrEnv = process.env): boolean {
   const raw = env.ENGINE_SEARCH_OPTIONS?.trim().toLowerCase();
+  return raw === '1' || raw === 'true' || raw === 'on';
+}
+
+/**
+ * urlopt1028：URL 字段选项后缀语义位。版本再 +131072（131073–262144），1–131072 逐字不变。
+ * 只对 URL 字段原文像会产出 `,{选项}` 的源计入（url-options.ts urlOptionFields）。
+ */
+export const ENGINE_SEMANTICS_URL_OPTIONS_BIT = 131072;
+
+/**
+ * ENGINE_URL_OPTIONS 独立开关（urlopt1028，默认 off，口径同 ENGINE_SYNTAX_OR）。
+ * on = 搜索 bookUrl、详情 tocUrl、目录 chapterUrl/nextTocUrl、正文 nextContentUrl 的值带 legado `url,{选项}` 后缀时，
+ * 去掉后取页语义不变的选项（webView 当普通请求、未知键与 GET 的 body 忽略）先剥掉再过 host 门；POST/headers/非 utf-8
+ * charset/js 等仍用原值。off = 逐字不变（带选项的值单引号/空白形态被 host 门丢弃，双引号形态被编码进路径）。
+ */
+export function engineUrlOptionsEnabled(env: OrEnv = process.env): boolean {
+  const raw = env.ENGINE_URL_OPTIONS?.trim().toLowerCase();
   return raw === '1' || raw === 'true' || raw === 'on';
 }

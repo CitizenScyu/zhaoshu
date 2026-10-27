@@ -241,6 +241,11 @@ export interface FieldIr {
    * 详情字段先在 init 的结果上求值（evaluate.ts bookInfoScope）。未挂 = init 不生效（off 态口径）。
    */
   initScope?: true;
+  /**
+   * URL 字段值剥 legado `,{选项}` 后缀（urlopt1028，ENGINE_URL_OPTIONS，只挂在 url-options.ts urlOptionFields 判出的字段上）：
+   * 值进 host 门前先过 urlOptionHead（api.ts absoluteUrl / admission.ts）。未挂 = 原值进门（off 态口径）。
+   */
+  urlOptions?: true;
 }
 
 /** 装饰字段编译失败不阻断，标 skip 的占位。 */

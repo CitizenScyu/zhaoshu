@@ -20,6 +20,7 @@ import { preloadJsSandbox } from './js-sandbox';
 import { buildSearchRequest, prepareSearchJs } from './search-js';
 import { engineSyntaxJsBindEnabled } from './syntax-flags';
 import type { CompiledRules, FieldIr, SkippedField } from './types';
+import { stripUrlOptions } from './url-options';
 
 export interface EngineSource {
   url: string;
@@ -58,10 +59,12 @@ function evaluateText(
  * 值来自页面抽出的链接（详情页 tocUrl、目录章节/翻页、正文翻页），也可能是规则里写死的
  * 绝对 URL；其中写死 `http://` 的先升 https（host/端口/路径不变，41-urlfix），再过同一把锁；
  * 因此放行的 host 集合与判据完全不变，只是不让「同 host 只是写错 scheme」白白丢候选。
+ * urlopt1028：传入的字段 IR 挂了 urlOptions 时先剥 legado `,{选项}` 后缀（url-options.ts）；不传或未挂逐字不变。
  */
-function absoluteUrl(value: string, base: string): string | undefined {
-  if (!value) return undefined;
-  try { return validateSourceUrl(upgradeSourceTemplateUrl(value), base).href; } catch { return undefined; }
+function absoluteUrl(value: string, base: string, ir?: FieldIr): string | undefined {
+  const plain = stripUrlOptions(value, ir?.urlOptions);
+  if (!plain) return undefined;
+  try { return validateSourceUrl(upgradeSourceTemplateUrl(plain), base).href; } catch { return undefined; }
 }
 
 /**
@@ -89,7 +92,7 @@ function chainNextUrls(ir: FieldIr, scope: ReturnType<typeof createScope>, pageU
   const urls: string[] = [];
   const keys = new Set([pageIdentity(pageUrl)]);
   for (const raw of evaluateFieldStrings(ir, scope)) {
-    const url = absoluteUrl(raw, pageUrl);
+    const url = absoluteUrl(raw, pageUrl, ir);
     if (!url) {
       if (strict) throw new Error('invalid_next_page');
       continue;
@@ -131,10 +134,11 @@ export async function engineSearchBook(
   const seen = new Set<string>();
   // listjs1027：`-` 前缀 = legado BookList 去重（保留首次出现）后整表反转，先收全再反转、截候选上限。
   const reverse = list.reverse === true;
+  const bookUrlIr = field(source.compiled, 'ruleSearch.bookUrl');
   for (let index = 0; index < items.length && (reverse || results.length < MAX_SEARCH_CANDIDATES); index += 1) {
     const inner = items[index];
     const name = evaluateText(source.compiled, 'ruleSearch.name', inner);
-    const bookUrl = absoluteUrl(evaluateText(source.compiled, 'ruleSearch.bookUrl', inner), page.url);
+    const bookUrl = absoluteUrl(evaluateText(source.compiled, 'ruleSearch.bookUrl', inner), page.url, bookUrlIr);
     if (!name || !bookUrl || seen.has(bookUrl)) continue;
     seen.add(bookUrl);
     results.push({ title: name, author: evaluateText(source.compiled, 'ruleSearch.author', inner), bookUrl });
@@ -160,7 +164,7 @@ export async function engineFetchDetail(
   const detail: Partial<SourceBookIdentity> & { tocUrl?: string } = {};
   const title = evaluateText(source.compiled, 'ruleBookInfo.name', info);
   const author = evaluateText(source.compiled, 'ruleBookInfo.author', info);
-  const tocUrl = absoluteUrl(evaluateText(source.compiled, 'ruleBookInfo.tocUrl', info), page.url);
+  const tocUrl = absoluteUrl(evaluateText(source.compiled, 'ruleBookInfo.tocUrl', info), page.url, field(source.compiled, 'ruleBookInfo.tocUrl'));
   if (title) detail.title = title;
   if (tocUrl) detail.tocUrl = tocUrl;
   // 41-author：源的 ruleBookInfo.author 没命中（vikbook 写 .author@a 但页面并无该 class）时，
@@ -226,7 +230,7 @@ export async function engineFetchToc(
         // bind1028：legado 先求 chapterName 赋给 bookChapter.title，chapterUrl 的 JS 可读 chapter.title/title。
         const urlScope = inner.host ? { ...inner, host: { ...inner.host, chapterTitle: title } } : inner;
         const rawUrl = evaluateText(source.compiled, 'ruleToc.chapterUrl', urlScope);
-        const chapterUrl = rawUrl.trim() ? absoluteUrl(rawUrl, page.url) : page.url;
+        const chapterUrl = rawUrl.trim() ? absoluteUrl(rawUrl, page.url, field(source.compiled, 'ruleToc.chapterUrl')) : page.url;
         if (strict && (!title || title.length > MAX_TITLE_LENGTH || !chapterUrl || !rawUrl.trim())) throw new Error('invalid_chapter');
         if (!title || title.length > MAX_TITLE_LENGTH || !chapterUrl) continue;
         validChapters += 1;
@@ -252,7 +256,7 @@ export async function engineFetchToc(
     }
     // 只有当前页确实是 HTML 时才解析翻页 URL；否则链结束（避免对 JSON 输入跑 CSS 规则）。
     const rawNext = scope.kind === 'html' ? evaluateText(source.compiled, 'ruleToc.nextTocUrl', scope) : '';
-    next = absoluteUrl(rawNext, page.url);
+    next = absoluteUrl(rawNext, page.url, nextField);
     if (strict && rawNext.trim() && !next) throw new Error('invalid_next_page');
   }
   if (strict && (next || fanout.length > 0 || seenUrls.size > MAX_SOURCE_CHAPTERS)) throw new Error('toc_limit');
@@ -366,7 +370,7 @@ export async function engineFetchContent(
       continue;
     }
     const rawNext = scope.kind === 'html' ? evaluateText(source.compiled, 'ruleContent.nextContentUrl', scope) : '';
-    next = absoluteUrl(rawNext, page.url);
+    next = absoluteUrl(rawNext, page.url, field(source.compiled, 'ruleContent.nextContentUrl'));
     if (strict && rawNext.trim() && !next) throw new Error('invalid_next_page');
     // 放在 invalid_next_page 之后：命中下一章不是非法链接；置空 next 让循环后的 content_page_limit 不误报。
     if (next && stopKeys.has(pageIdentity(next))) { next = undefined; break; }

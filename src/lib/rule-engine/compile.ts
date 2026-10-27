@@ -13,8 +13,10 @@ import type { CompiledRules, FieldIr, RuleIr } from './types';
 import {
   engineSemanticsVersion, engineSyntaxAioEnabled, engineSyntaxAndEnabled, engineSyntaxInitEnabled, engineSyntaxJsBindEnabled, engineSyntaxJsEnabled,
   engineSyntaxJsExtEnabled, engineSyntaxJsGetEnabled, engineSyntaxJsonPathEnabled, engineSyntaxJsUtilEnabled, engineSyntaxListJsEnabled,
-  engineSyntaxOrEnabled, engineSyntaxRegexEnabled, engineSyntaxVarsEnabled, engineSyntaxXPathEnabled, engineSyntaxXPathEvalEnabled, ENGINE_SEMANTICS_VERSION,
+  engineSyntaxOrEnabled, engineSyntaxRegexEnabled, engineSyntaxVarsEnabled, engineSyntaxXPathEnabled, engineSyntaxXPathEvalEnabled, engineUrlOptionsEnabled,
+  ENGINE_SEMANTICS_VERSION,
 } from './syntax-flags';
+import { urlOptionFields } from './url-options';
 import { resolveSourceVars, ruleMayUseVars } from './vars-subset';
 import { ruleMayUseXPath } from './xpath-subset';
 
@@ -29,6 +31,8 @@ export interface CompileOptions extends ParseOptions {
   initEnabled?: boolean;
   /** searchopt1028：搜索选项 legado 口径（缺省 = ENGINE_POST_SEARCH 与 ENGINE_SEARCH_OPTIONS 都开）。只影响语义版本位。 */
   searchOptionsEnabled?: boolean;
+  /** urlopt1028：URL 字段选项后缀（ENGINE_URL_OPTIONS，默认读 env）。只给 urlOptionFields 判出的字段挂 FieldIr.urlOptions。 */
+  urlOptionsEnabled?: boolean;
 }
 
 /** 版本化缓存键（P0 口径）：semanticsVersion:contentRevision。 */
@@ -55,6 +59,7 @@ export function engineVersionedKey(contentRevision: string, semanticsVersion = E
  * jsonpath1028：ENGINE_SYNTAX_JSON_PATH on 且有字段 off 态被拒、on 态编译通过时再加 JSONPath 扩展位（16385–32768）。
  * init1028：ENGINE_SYNTAX_INIT on 且 ruleBookInfo.init 可复现（sourceUsesInitSyntax）时再加 init 位（32769–65536）。
  * searchopt1028：搜索选项 legado 口径生效且该源 searchUrl 的选项被旧口径拒（searchOptionsNeedParity）时再加选项位（65537–131072）。
+ * urlopt1028：ENGINE_URL_OPTIONS on 且有 URL 字段原文像会产出 `,{选项}`（urlOptionFields 非空）时再加 URL 选项位（131073–262144）。
  */
 export function engineSourceRevision(
   source: { url: string; searchUrl: unknown; rules: Record<string, unknown> },
@@ -77,6 +82,7 @@ export function engineSourceRevision(
   const jsonPathEnabled = options.jsonPathEnabled ?? engineSyntaxJsonPathEnabled();
   const initEnabled = options.initEnabled ?? engineSyntaxInitEnabled();
   const searchOptionsEnabled = options.searchOptionsEnabled ?? engineSearchOptionsActive();
+  const urlOptionsEnabled = options.urlOptionsEnabled ?? engineUrlOptionsEnabled();
   const jsChain = jsEnabled && !sourceHasJsLib(source.rules);
   // 下游 sourceUses* 的编译与 compileSource 同一组开关（jsBind/jsGet/jsUtil 只在 JS 链生效时有意义）。
   const jsBind = jsChain && jsBindEnabled;
@@ -127,6 +133,7 @@ export function engineSourceRevision(
       jsExtEnabled, jsBindEnabled: jsBind, jsGetEnabled: jsGet, jsUtilEnabled: jsUtil, jsonPathEnabled,
     }),
     searchOptionsEnabled && searchOptionsNeedParity(source.searchUrl, upgradeSourceTemplateUrl(source.url)),
+    urlOptionsEnabled && urlOptionFields(source.rules).size > 0,
   ));
 }
 
@@ -763,9 +770,10 @@ export function compileSource(
   const jsUtilEnabled = options.jsUtilEnabled ?? engineSyntaxJsUtilEnabled();
   const jsonPathEnabled = options.jsonPathEnabled ?? engineSyntaxJsonPathEnabled();
   const initEnabled = options.initEnabled ?? engineSyntaxInitEnabled();
+  const urlOptionsEnabled = options.urlOptionsEnabled ?? engineUrlOptionsEnabled();
   const key = engineSourceRevision(source, {
     orEnabled, xpathEnabled, varsEnabled, jsEnabled, xpathEvalEnabled, regexEnabled, andEnabled, aioEnabled, listJsEnabled, jsExtEnabled,
-    jsBindEnabled, jsGetEnabled, jsUtilEnabled, jsonPathEnabled, initEnabled,
+    jsBindEnabled, jsGetEnabled, jsUtilEnabled, jsonPathEnabled, initEnabled, urlOptionsEnabled,
   });
   const hit = cache.get(key);
   if (hit) {
@@ -798,6 +806,13 @@ export function compileSource(
   const init = compiled.get('ruleBookInfo.init');
   const initRule = initRuleOf(source.rules);
   if (initEnabled && initApplies(initRule, init)) compiled.set('ruleBookInfo.init', { ...init, initScope: true });
+  // urlopt1028：URL 字段挂 urlOptions（值进 host 门前剥 legado 选项后缀，见 url-options.ts）；判据同样看原文。
+  if (urlOptionsEnabled) {
+    for (const name of urlOptionFields(source.rules)) {
+      const ir = compiled.get(name);
+      if (ir && !('skipped' in ir)) compiled.set(name, { ...ir, urlOptions: true });
+    }
+  }
   cache.set(key, compiled);
   while (cache.size > CACHE_LIMIT) cache.delete(cache.keys().next().value!);
   return compiled;

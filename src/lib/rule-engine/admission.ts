@@ -24,7 +24,8 @@ import {
 } from './evaluate';
 import { RuleEngineError, type FieldIr, type RuleDiagnostic } from './types';
 import { compileSource, engineSourceRevision } from './compile';
-import { engineSyntaxAioEnabled, engineSyntaxJsBindEnabled, engineSyntaxVarsEnabled } from './syntax-flags';
+import { engineSyntaxAioEnabled, engineSyntaxJsBindEnabled, engineSyntaxVarsEnabled, engineUrlOptionsEnabled } from './syntax-flags';
+import { stripUrlOptions, urlOptionFields } from './url-options';
 import { aioGroups, isAioListRule, ruleGroupOf } from './aio-syntax';
 import { preloadJsSandbox } from './js-sandbox';
 import { buildSearchRequest, prepareSearchJs, SearchJsNotReadyError } from './search-js';
@@ -727,6 +728,8 @@ function searchCandidates(source: RawSource, text: string, pageUrl: string): { t
   if (!listIr) return [];
   const nameIr = parseSafe(name, 'ruleSearch.name');
   const bookUrlIr = parseSafe(bookUrl, 'ruleSearch.bookUrl');
+  // urlopt1028：同 compileSource 挂 urlOptions 的判据（看源原文），候选 URL 剥 legado 选项后缀（可读性影子腿拿它当样本书地址）。
+  const bookUrlOptions = engineUrlOptionsEnabled() && urlOptionFields(source as Record<string, unknown>).has('ruleSearch.bookUrl');
   let scope;
   try { scope = createScope(normalizeBody(text), pageUrl); } catch { return []; }
   // bind1028：宿主绑定同 api.ts pageScope（开关 on 才挂）。
@@ -741,7 +744,7 @@ function searchCandidates(source: RawSource, text: string, pageUrl: string): { t
     const inner = items[i];
     try {
       const title = nameIr ? evaluateField(nameIr, inner) : '';
-      const url = bookUrlIr ? evaluateField(bookUrlIr, inner) : '';
+      const url = bookUrlIr ? stripUrlOptions(evaluateField(bookUrlIr, inner), bookUrlOptions) : '';
       if (title.trim() && url.trim()) found.push({ title: title.trim(), url: url.trim() });
     } catch { /* 单条候选求值失败：跳过，不影响整页判定（§3.4 失败隔离） */ }
   }
@@ -967,8 +970,9 @@ export async function readabilityShadow(
   let chapters = 0;
   const throttleMs = options.throttleMs ?? ADMISSION_THROTTLE_MS;
   let requests = 0;
-  const gate = (value: string, base: string) =>
-    validateAdmissionUrl(upgradeSourceTemplateUrl(value), base, options.declaredHosts).href;
+  // urlopt1028：字段 IR 挂了 urlOptions 时先剥 legado 选项后缀（同 api.ts absoluteUrl）。
+  const gate = (value: string, base: string, ir?: FieldIr) =>
+    validateAdmissionUrl(upgradeSourceTemplateUrl(stripUrlOptions(value, ir?.urlOptions)), base, options.declaredHosts).href;
   const origin = typeof source.bookSourceUrl === 'string' ? source.bookSourceUrl : '';
   const get = async (url: string, chapterTitle?: string) => {
     if (requests > 0 && throttleMs > 0) await (options.sleep ?? defaultSleep)(throttleMs, options.signal);
@@ -1001,7 +1005,7 @@ export async function readabilityShadow(
     stage = 'toc';
     // init1028：tocUrl 同 api.ts engineFetchDetail 在 init 结果上求值；tocUrl 缺省/等于详情页时目录照旧读详情页原文（legado tocHtml）。
     const rawToc = text('ruleBookInfo.tocUrl', bookInfoScope(compiled, detail.scope)).trim();
-    const tocUrl = rawToc ? gate(rawToc, detail.url) : detail.url;
+    const tocUrl = rawToc ? gate(rawToc, detail.url, field('ruleBookInfo.tocUrl')) : detail.url;
     const toc = tocUrl === detail.url ? detail : await get(tocUrl);
     const list = field('ruleToc.chapterList');
     const urls: string[] = [];
@@ -1011,7 +1015,7 @@ export async function readabilityShadow(
       const urlScope = inner.host ? { ...inner, host: { ...inner.host, chapterTitle: title } } : inner;
       const rawUrl = text('ruleToc.chapterUrl', urlScope).trim();
       let chapterUrl: string;
-      try { chapterUrl = rawUrl ? gate(rawUrl, toc.url) : toc.url; } catch { continue; }
+      try { chapterUrl = rawUrl ? gate(rawUrl, toc.url, field('ruleToc.chapterUrl')) : toc.url; } catch { continue; }
       if (title) {
         urls.push(chapterUrl);
         titles.push(title);
