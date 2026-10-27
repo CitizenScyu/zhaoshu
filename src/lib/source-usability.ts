@@ -3,7 +3,7 @@
 // （41-swq 实测：sfacg 两条规则 searchUrl 指向门外的 m.sfacg.com，准入记 search_ok，运行时必拒）。
 import { compileSource } from './rule-engine/compile';
 import { enginePostSearchEnabled, engineSearchJsActive } from './rule-engine/compile-smoke';
-import { buildSearchRequest, SearchJsNotReadyError } from './rule-engine/search-js';
+import { buildSearchProbeRequest, buildSearchRequest, SEARCH_PROBE_TITLE, SearchJsNotReadyError } from './rule-engine/search-js';
 import {
   engineSyntaxAioEnabled, engineSyntaxAndEnabled, engineSyntaxJsEnabled, engineSyntaxOrEnabled, engineSyntaxRegexEnabled, engineSyntaxVarsEnabled,
   engineSyntaxXPathEnabled, engineSyntaxXPathEvalEnabled,
@@ -27,11 +27,13 @@ interface RuleSource { url: string; searchUrl: unknown; rules: Record<string, un
  * 与 engineSearchBook 同一分支：ENGINE_POST_SEARCH 开时走 buildSourceSearchRequest（`url,{options}` POST 源可用），
  * 关时走 sourceSearchUrl（纯 GET，选项模板照旧判不可用）。searchjs1027：ENGINE_SEARCH_JS 开时需 JS 的模板同 engineSearchBook
  * 在沙箱里求值（调用方须先 await prepareSearchJs）；沙箱瞬时不可用按本次不可用（结论不记忆，下次请求重算）。
+ * 不传 title = 池/扇出名额筛的「能否构造」判定：占位书名，JS 段求值结果按模板记忆（buildSearchProbeRequest），host 门照旧每次重验。
  */
-export function searchTemplateRejected(source: RuleSource, title: string): boolean {
+export function searchTemplateRejected(source: RuleSource, title?: string): boolean {
   try {
-    if (enginePostSearchEnabled()) buildSearchRequest(source.searchUrl, title, source.url, validateSourceUrl, engineSearchJsActive());
-    else sourceSearchUrl(source.searchUrl, title, source.url);
+    if (!enginePostSearchEnabled()) sourceSearchUrl(source.searchUrl, title ?? SEARCH_PROBE_TITLE, source.url);
+    else if (title === undefined) buildSearchProbeRequest(source.searchUrl, source.url, validateSourceUrl, engineSearchJsActive());
+    else buildSearchRequest(source.searchUrl, title, source.url, validateSourceUrl, engineSearchJsActive());
     return false;
   } catch (error) {
     if (error instanceof SourcePolicyError || error instanceof SearchJsNotReadyError) return true;
@@ -56,7 +58,7 @@ const rulesUsable = new WeakMap<object, { flags: string; usable: boolean }>();
 
 /** 引擎源能否进取书池/扇出：搜索模板展得开且必需字段都编译得出。调用前 host 门须已刷新（门的结论不记忆）。 */
 export function engineSourceUsable(source: RuleSource): boolean {
-  if (searchTemplateRejected(source, '书')) return false;
+  if (searchTemplateRejected(source)) return false;
   const flags = `${engineSyntaxOrEnabled()}:${engineSyntaxXPathEnabled()}:${engineSyntaxVarsEnabled()}:${engineSyntaxJsEnabled()}:${engineSyntaxXPathEvalEnabled()}:${engineSyntaxRegexEnabled()}:${engineSyntaxAndEnabled()}:${engineSyntaxAioEnabled()}`;
   const hit = rulesUsable.get(source.rules);
   if (hit?.flags === flags) return hit.usable;

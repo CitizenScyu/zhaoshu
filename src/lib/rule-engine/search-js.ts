@@ -174,14 +174,35 @@ function replacePages(ruleUrl: string): string {
   return url;
 }
 
-/** legado AnalyzeUrl 的 JS 段与 `{{…}}` 求值 → 交 buildLegadoSearchRequest。base = 书源 bookSourceUrl（带选项时照 legado 剥掉，作相对地址基准）。 */
+interface EvaluatedSearchJs { ruleUrl: string; baseUrl: string }
+
+/** legado AnalyzeUrl 的 JS 段与 `{{…}}`/页码求值，得交给 buildLegadoSearchRequest 的 ruleUrl。base 带选项时照 legado 剥掉，作相对地址基准。 */
+function evaluateSearchJs(template: string, title: string, base: string): EvaluatedSearchJs {
+  const split = OPTION_SPLIT.exec(base);
+  const ctx: EvalContext = { title, baseUrl: split ? base.slice(0, split.index) : base, vars: {} };
+  return { ruleUrl: replacePages(replaceInline(analyzeJs(template, ctx), ctx)), baseUrl: ctx.baseUrl };
+}
+
+/** legado AnalyzeUrl 口径的整条搜索请求。base = 书源 bookSourceUrl。 */
 export function buildSearchJsRequest(
   template: string, title: string, base: string, validate: SourceUrlValidator = validateSourceUrl,
 ): SourceSearchRequest {
-  const split = OPTION_SPLIT.exec(base);
-  const ctx: EvalContext = { title, baseUrl: split ? base.slice(0, split.index) : base, vars: {} };
-  const ruleUrl = replacePages(replaceInline(analyzeJs(template, ctx), ctx));
-  return buildLegadoSearchRequest(ruleUrl, ctx.baseUrl, validate);
+  const { ruleUrl, baseUrl } = evaluateSearchJs(template, title, base);
+  return buildLegadoSearchRequest(ruleUrl, baseUrl, validate);
+}
+
+function withSearchJs(
+  template: unknown, title: string, base: string | undefined, validate: SourceUrlValidator, searchJs: boolean,
+  evaluate: (template: string, base: string) => EvaluatedSearchJs,
+): SourceSearchRequest {
+  try {
+    return buildSourceSearchRequest(template, title, base, validate);
+  } catch (error) {
+    if (!(error instanceof SourcePolicyError) || !searchJs || typeof template !== 'string' || base === undefined
+      || !searchTemplateNeedsJs(template, base)) throw error;
+    const { ruleUrl, baseUrl } = evaluate(template, base);
+    return buildLegadoSearchRequest(ruleUrl, baseUrl, validate);
+  }
 }
 
 /**
@@ -193,46 +214,62 @@ export function buildSearchRequest(
   template: unknown, title: string, base: string | undefined,
   validate: SourceUrlValidator = validateSourceUrl, searchJs = false,
 ): SourceSearchRequest {
-  try {
-    return buildSourceSearchRequest(template, title, base, validate);
-  } catch (error) {
-    if (!(error instanceof SourcePolicyError) || !searchJs || typeof template !== 'string' || base === undefined
-      || !searchTemplateNeedsJs(template, base)) throw error;
-    return buildSearchJsRequest(template, title, base, validate);
-  }
+  return withSearchJs(template, title, base, validate, searchJs, (t, b) => evaluateSearchJs(t, title, b));
 }
 
 function allowAnyHost(value: unknown, base?: string): URL {
   return checkSourceUrl(value, base, { hostAllowed: () => true });
 }
 
-const PROBE_TITLE = '书';
-const MAX_CONSTRUCTIBLE_CACHE = 512;
-const constructible = new Map<string, boolean>();
+/** 判「模板能否构造」用的占位书名（与 source-usability / 候选口径同一个）。 */
+export const SEARCH_PROBE_TITLE = '书';
+const MAX_PROBE_CACHE = 512;
+const probed = new Map<string, EvaluatedSearchJs | { rejected: string }>();
 
 /**
- * 候选口径：该需 JS 的模板能否在沙箱里构造出请求（放开 host 白名单，红线照守；占位书名）。结论按
- * base+模板 LRU 记忆；沙箱未就绪抛 SearchJsNotReadyError、不记忆。调用方先确认 searchTemplateNeedsJs。
+ * 占位书名下的 JS 段求值结果（ruleUrl 或策略拒原因）按 base+模板 LRU 记忆：候选筛与取书池每次请求都要判全部源，
+ * 不能每次都起沙箱、吃共享 JS 预算（还会因单段预算耗尽让同一个源时好时坏）。只记忆求值结果，host 门/红线每次对
+ * 结果重验；沙箱未就绪抛 SearchJsNotReadyError、不记忆。真实搜索（真书名）不走这里。
+ */
+function probeSearchJs(template: string, base: string): EvaluatedSearchJs {
+  const cacheKey = `${base}\0${template}`;
+  let entry = probed.get(cacheKey);
+  if (entry !== undefined) {
+    probed.delete(cacheKey);
+  } else {
+    try {
+      entry = evaluateSearchJs(template, SEARCH_PROBE_TITLE, base);
+    } catch (error) {
+      if (!(error instanceof SourcePolicyError)) throw error;
+      entry = { rejected: error.message };
+    }
+  }
+  probed.set(cacheKey, entry);
+  while (probed.size > MAX_PROBE_CACHE) probed.delete(probed.keys().next().value!);
+  if ('rejected' in entry) throw new SourcePolicyError(entry.rejected);
+  return entry;
+}
+
+/** 同 buildSearchRequest，书名固定为 SEARCH_PROBE_TITLE、JS 段求值走 probeSearchJs 记忆：只给「能否构造」类判定用。 */
+export function buildSearchProbeRequest(
+  template: unknown, base: string | undefined, validate: SourceUrlValidator = validateSourceUrl, searchJs = false,
+): SourceSearchRequest {
+  return withSearchJs(template, SEARCH_PROBE_TITLE, base, validate, searchJs, probeSearchJs);
+}
+
+/**
+ * 候选口径：该需 JS 的模板能否在沙箱里构造出请求（放开 host 白名单，红线照守；占位书名，求值结果记忆见 probeSearchJs）。
+ * 沙箱未就绪抛 SearchJsNotReadyError。调用方先确认 searchTemplateNeedsJs。
  */
 export function searchJsConstructible(template: string, base: string): boolean {
-  const cacheKey = `${base}\0${template}`;
-  const hit = constructible.get(cacheKey);
-  if (hit !== undefined) {
-    constructible.delete(cacheKey);
-    constructible.set(cacheKey, hit);
-    return hit;
-  }
-  let ok: boolean;
   try {
-    buildSearchJsRequest(template, PROBE_TITLE, base, allowAnyHost);
-    ok = true;
+    const { ruleUrl, baseUrl } = probeSearchJs(template, base);
+    buildLegadoSearchRequest(ruleUrl, baseUrl, allowAnyHost);
+    return true;
   } catch (error) {
     if (!(error instanceof SourcePolicyError)) throw error;
-    ok = false;
+    return false;
   }
-  constructible.set(cacheKey, ok);
-  while (constructible.size > MAX_CONSTRUCTIBLE_CACHE) constructible.delete(constructible.keys().next().value!);
-  return ok;
 }
 
 /** 求值是同步的：用到搜索 JS 的路径先 await 这里（幂等，并发共享同一次加载）。 */
