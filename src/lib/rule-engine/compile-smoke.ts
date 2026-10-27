@@ -4,7 +4,8 @@
 
 import { upgradeSourceTemplateUrl } from '@/lib/source-policy';
 import { searchOptionsConstructible } from '@/lib/source-parser';
-import { parseFieldRule, type ParseOptions } from './parse';
+import { jsChainFieldAllowed, parseFieldRule, ruleHasJs, type ParseOptions } from './parse';
+import { engineSyntaxJsEnabled } from './syntax-flags';
 import { RuleEngineError, type RuleDiagnostic } from './types';
 
 // survey.py CORE_FIELDS（阅读路径必需字段）
@@ -77,11 +78,42 @@ export function* iterRulePairs(src: RawSource): Generator<[string, string]> {
 
 const READING_PATH_FIELDS: ReadonlySet<string> = new Set([...CORE_FIELDS, ...READING_PATH_JS_FIELDS]);
 
-/** readingPathOnly（ADMISSION_NONCORE_JS 开）：只查阅读路径字段；关时查全部规则组（逐字原口径）。 */
-function rulesNoJs(src: RawSource, readingPathOnly = false): boolean {
+/** 源带 jsLib（公共函数库）：引擎沙箱不执行 jsLib，含 JS 段照样判拒（与 compile.ts sourceHasJsLib 同口径）。 */
+export function hasJsLib(src: RawSource): boolean {
+  const lib = src.jsLib;
+  return typeof lib === 'string' && lib.trim() !== '';
+}
+
+/**
+ * 该源此刻是否开 JS 链（jsbox1027）：ENGINE_SYNTAX_JS on 且无 jsLib。编译（compile.ts）、准入初筛
+ * （selectCandidates 的 coreJs）、准入求值（admission.ts）三处必须同一判据，否则会把对侧拒的源放进来。
+ */
+export function jsChainEnabledFor(src: RawSource, env: NodeJS.ProcessEnv = process.env): boolean {
+  return engineSyntaxJsEnabled(env) && !hasJsLib(src);
+}
+
+/** 该源是否有字段会走 JS 链（白名单字段里含 JS 段）——用来决定要不要预加载沙箱。 */
+export function sourceHasJsChainField(src: RawSource): boolean {
+  for (const [field, rule] of iterRulePairs(src)) {
+    if (jsChainFieldAllowed(field) && ruleHasJs(rule)) return true;
+  }
+  return false;
+}
+
+/**
+ * readingPathOnly（ADMISSION_NONCORE_JS 开）：只查阅读路径字段；关时查全部规则组（逐字原口径）。
+ * coreJs（ENGINE_SYNTAX_JS on）：无 jsLib 的源里，JS 链白名单字段（parse.ts jsChainFieldAllowed）的 JS
+ * 不再整源拒——引擎改由沙箱执行；READING_PATH_JS_FIELDS 与列表字段（bookList/chapterList，链不支持）
+ * 照旧拒。coreJs 关时逐字原口径。
+ */
+function rulesNoJs(src: RawSource, options: { noncoreJs?: boolean; coreJs?: boolean } = {}): boolean {
+  const readingPathOnly = options.noncoreJs === true;
+  const jsOk = options.coreJs === true && !hasJsLib(src);
   for (const [field, v] of iterRulePairs(src)) {
     if (readingPathOnly && !READING_PATH_FIELDS.has(field)) continue;
-    if (v.includes('@js:') || v.includes('<js')) return false;
+    if (!ruleHasJs(v)) continue;
+    if (jsOk && jsChainFieldAllowed(field)) continue;
+    return false;
   }
   return true;
 }
@@ -111,13 +143,13 @@ function searchIsPureGet(su: unknown): boolean {
  * 且注释误作「听书源」，音频（猫耳FM/喜马拉雅）与文件源（Zlibrary/知轩藏书）可漏进文本池。缺省按文本，非数值拒。
  */
 export function selectCandidates(
-  data: RawSource[], options: { postSearch?: boolean; noncoreJs?: boolean } = {},
+  data: RawSource[], options: { postSearch?: boolean; noncoreJs?: boolean; coreJs?: boolean } = {},
 ): RawSource[] {
   const out: RawSource[] = [];
   for (const s of data) {
     const upgradedBase = upgradeSourceTemplateUrl(String(s.bookSourceUrl ?? ''));
     if (!upgradedBase.startsWith('https://')) continue;
-    if (!rulesNoJs(s, options.noncoreJs === true)) continue;
+    if (!rulesNoJs(s, options)) continue;
     // 默认口径 = 纯 GET；postSearch 开时额外放行「可构造出 POST/GET 请求」的源（与运行时同一判据，webView/未知键/展不开仍拒）。
     if (!searchIsPureGet(s.searchUrl)
       && !(options.postSearch && searchOptionsConstructible(s.searchUrl, upgradedBase))) continue;
@@ -167,7 +199,7 @@ export function compileCoreFieldsFromRules(
   for (const [field, rule] of Object.entries(coreRules)) {
     if (typeof rule !== 'string' || !rule.trim()) continue;
     try {
-      parseFieldRule(rule, options);
+      parseFieldRule(rule, { ...options, field });
     } catch (err) {
       if (err instanceof RuleEngineError && err.code === 'RULE_UNSUPPORTED') {
         failures.push({ field, rule, message: err.message, diagnostic: err.diagnostic ?? { code: 'unsupported_rule' } });

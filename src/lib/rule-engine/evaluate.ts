@@ -3,9 +3,12 @@
 // / §3.4（失败隔离）。引擎零网络：本文件不引入任何请求路径，页 URL 由调用方经 scope 传入。
 
 import { load, type CheerioAPI } from 'cheerio';
+import { decodeHTML } from 'entities';
 import {
-  type FieldIr, type JsonPathIr, RuleEngineError, type RuleIr, type RegexSub, type TemplatePart,
+  type ChainStage, type CompiledRules, type FieldIr, type JsonPathIr, RuleEngineError, type RuleIr, type RegexSub,
+  type SkippedField, type TemplatePart,
 } from './types';
+import { type JsValue, runJs } from './js-sandbox';
 import { evalJsonPath, evalJsonPathList, parseJsonPath } from './jsonpath';
 import { defaultSyntaxSource } from './parse';
 import {
@@ -88,6 +91,8 @@ export interface HtmlScope {
   $: CheerioAPI;
   nodes: CheerioNodes;
   pageUrl: string;
+  /** 页面原文（jsbox1027：JS 链首段的 result 与 `src`）。只有整页作用域有，收窄到条目后为 undefined。 */
+  source?: string;
 }
 
 /** JSON 输入的作用域（jsonpath / tpl_jsonpath 规则用）。 */
@@ -95,6 +100,8 @@ export interface JsonScope {
   kind: 'json';
   json: unknown;
   pageUrl: string;
+  /** 同 HtmlScope.source。 */
+  source?: string;
 }
 
 export type EvalScope = HtmlScope | JsonScope;
@@ -114,12 +121,14 @@ export function createJsonScope(json: unknown, pageUrl: string): JsonScope {
 
 /** 按归一化结果建立作用域（§3.1 的分流点）。 */
 export function createScope(body: NormalizedBody, pageUrl: string): EvalScope {
-  return body.kind === 'json' ? createJsonScope(body.json, pageUrl) : createHtmlScope(body.text, pageUrl);
+  const scope = body.kind === 'json' ? createJsonScope(body.json, pageUrl) : createHtmlScope(body.text, pageUrl);
+  scope.source = body.text;
+  return scope;
 }
 
 /** 收窄作用域到某个节点（列表字段逐条求值用，如 bookList → 每条的 name/author/bookUrl）。 */
 export function insideNode(scope: HtmlScope, node: unknown): HtmlScope {
-  return { ...scope, nodes: scope.$(node as never) };
+  return { ...scope, nodes: scope.$(node as never), source: undefined };
 }
 
 // ---------------------------------------------------------------- 单规则求值
@@ -384,6 +393,7 @@ function matchingBrace(text: string, open: number): number {
  * 仅 `ruleContent.content` 由门面传 `multi=true` 拼接多段落。见 dom-ops.ts:applyTerminal。
  */
 export function evaluateField(field: FieldIr, scope: EvalScope, multi = false): string {
+  if (field.chain) return chainToString(evaluateChain(field.chain, scope, false, multi), multi);
   if (field.joins !== undefined || field.concats !== undefined) {
     // T7 构件（&& 连接符 / %% 拼接）：M1 未实现，宁可失败也不要静默返回错的字符串。
     return evalFailed('M1 不支持 && / %% 组合规则（T7）');
@@ -408,6 +418,7 @@ export function evaluateField(field: FieldIr, scope: EvalScope, multi = false): 
  * 求值异常照旧上抛不吞。
  */
 export function evaluateFieldNodes(field: FieldIr, scope: EvalScope): CheerioNodes {
+  if (field.chain) return evalFailed('列表字段不支持 JS 链');
   if (scope.kind !== 'html') return emptyNodes();
   for (const ir of field.rules) {
     if (ir.kind === 'or') {
@@ -431,6 +442,7 @@ export function evaluateFieldNodes(field: FieldIr, scope: EvalScope): CheerioNod
  *   模板/字面量/显式 CSS 没有列表语义，视为空支。每项各自成为 JSON 作用域。
  */
 export function evaluateFieldList(field: FieldIr, scope: EvalScope): EvalScope[] {
+  if (field.chain) return evalFailed('列表字段不支持 JS 链');
   if (scope.kind === 'html') {
     const nodes = evaluateFieldNodes(field, scope);
     const scopes: EvalScope[] = [];
@@ -461,6 +473,90 @@ function jsonListItems(ir: RuleIr, json: unknown): unknown[] {
     default:
       return [];
   }
+}
+
+// ---------------------------------------------------------------- JS 链（jsbox1027）
+/** 字段是否编译成了 JS 链（ENGINE_SYNTAX_JS on 且字段含 JS 段）。 */
+export function fieldUsesJs(field: FieldIr | SkippedField | undefined): field is FieldIr & { chain: ChainStage[] } {
+  return field !== undefined && !('skipped' in field) && field.chain !== undefined;
+}
+
+/** 编译产物里是否有 JS 链字段（调用方据此先 await preloadJsSandbox）。 */
+export function compiledUsesJs(compiled: CompiledRules): boolean {
+  for (const field of compiled.values()) if (fieldUsesJs(field)) return true;
+  return false;
+}
+
+/**
+ * 列表口径求值（legado getStringList，下一页链接用）：规则段按多值取（multi 拼接后按行拆），
+ * JS 段返回数组即列表、返回字符串按 `\n` 拆；逐项 trim、去空。非链字段退化为单值列表。
+ * URL 绝对化与去重留给调用方（对齐 legado isUrl 分支）。
+ */
+export function evaluateFieldStrings(field: FieldIr, scope: EvalScope): string[] {
+  if (!field.chain) {
+    const value = evaluateField(field, scope);
+    return value === '' ? [] : [value];
+  }
+  const value = evaluateChain(field.chain, scope, true, true);
+  if (value === null) return [];
+  return (Array.isArray(value) ? value : value.split('\n')).map((item) => item.trim()).filter((item) => item !== '');
+}
+
+/**
+ * legado AnalyzeRule.getString / getStringList 的逐段执行（AnalyzeRule.kt）：
+ * - 首段输入是作用域本身（规则段）或页面原文（JS / 纯正则段）；之后每段输入是上一段的字符串结果——
+ *   规则段把它重新当页面解析（JSON/HTML 按内容判，见 normalizeBody），JS 段把它作为 `result`；
+ * - JS 返回 null/undefined → 整条链中止（legado result=null 后跳过余下各段，最终得空）；
+ * - 列表结果喂给 JS 前先做 `$n` 替换（SourceRule.makeUpRule：n≥1 取第 n 项，越界删去，`$0` 原样）。
+ * `list` = getStringList 口径（规则段按多值拆行、正则逐项替换）；否则规则段按 `multi` 取值。
+ */
+function evaluateChain(chain: readonly ChainStage[], scope: EvalScope, list: boolean, multi: boolean): JsValue | null {
+  let value: JsValue | undefined; // undefined = 还在首段
+  for (const stage of chain) {
+    if (stage.kind === 'rule') {
+      const stageScope = value === undefined ? scope : createScope(normalizeBody(joinLines(value)), scope.pageUrl);
+      value = list ? splitLines(evaluateField(stage.field, stageScope, true)) : evaluateField(stage.field, stageScope, multi);
+      continue;
+    }
+    const input = value ?? scope.source;
+    if (input === undefined) return evalFailed('JS 链首段需要页面原文，当前作用域没有');
+    if (stage.kind === 'regex') {
+      value = Array.isArray(input) && list
+        ? input.map((item) => applyRegexSubs(item, stage.regex))
+        : applyRegexSubs(joinLines(input), stage.regex);
+      continue;
+    }
+    const code = Array.isArray(input) ? substituteListRefs(stage.code, input) : stage.code;
+    const out = runJs(code, { result: input, src: scope.source, baseUrl: scope.pageUrl });
+    if (out === null) return null;
+    value = out;
+  }
+  return value ?? null;
+}
+
+/** 字符串口径收尾（legado getString 末段）：数组按行拼；非正文字段含 `&` 时解 HTML 实体；trim。 */
+function chainToString(value: JsValue | null, multi: boolean): string {
+  let text = value === null ? '' : joinLines(value);
+  // 正文（multi）不在这里解：content-html 把 JS 链正文当 HTML 转纯文本，实体在那一步解（legado HtmlFormatter 后再 unescape）。
+  if (!multi && text.includes('&')) text = decodeHTML(text);
+  return text.trim();
+}
+
+function joinLines(value: JsValue): string {
+  return Array.isArray(value) ? value.join('\n') : value;
+}
+
+function splitLines(text: string): string[] {
+  return text === '' ? [] : text.split('\n');
+}
+
+/** SourceRule.makeUpRule 的 `$n`（1–2 位数字）替换：只在上一段结果是列表时发生。 */
+function substituteListRefs(code: string, items: readonly string[]): string {
+  return code.replace(/\$(\d{1,2})/g, (whole, digits: string) => {
+    const index = Number(digits);
+    if (index < 1) return whole;
+    return index < items.length ? items[index] : '';
+  });
 }
 
 /** 套用 `##pattern##replacement##flags##` 替换（`##p##` 无 replacement 即删除匹配，§3.3）。 */

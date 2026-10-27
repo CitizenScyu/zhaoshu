@@ -38,6 +38,8 @@ function ruleIsPlainText(ir: RuleIr): boolean {
  */
 export function contentNeedsHtmlToText(field: FieldIr | undefined): boolean {
   if (!field) return false;
+  // JS 链（jsbox1027）的输出形态由脚本决定（常见是拼出的 HTML 片段），一律按 legado HtmlFormatter 口径转换。
+  if (field.chain) return true;
   return !field.rules.every(ruleIsPlainText);
 }
 

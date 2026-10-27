@@ -3,10 +3,13 @@
 // 设计依据：m1-engine-design.md v3 §2.3。这就是滤网 1 的实现本体。
 
 import {
+  ChainStage,
   CssStep,
   FieldIr,
+  JS_JAVA_HELPERS,
   JsonPathIr,
   MAX_CSS_CHAIN_DEPTH,
+  MAX_JS_RULE_LENGTH,
   MAX_OR_BRANCHES,
   MAX_REGEX_PATTERN_LENGTH,
   MAX_RULE_LENGTH,
@@ -18,7 +21,7 @@ import {
   TerminalOp,
 } from './types';
 import { parseJsonPath } from './jsonpath';
-import { engineSyntaxOrEnabled, engineSyntaxXPathEnabled } from './syntax-flags';
+import { engineSyntaxJsEnabled, engineSyntaxOrEnabled, engineSyntaxXPathEnabled } from './syntax-flags';
 import { looksLikeXPath, xpathSegmentBody, xpathToCss } from './xpath-subset';
 
 function unsupported(msg: string, rule: string, diagnostic: RuleDiagnostic): never {
@@ -52,7 +55,7 @@ const ALLOWED_TEMPLATE_VARS = new Set(['baseUrl']);
  * 命中任何不支持构件 → RULE_UNSUPPORTED。
  */
 function rejectUnsupportedConstructs(rule: string): void {
-  if (rule.includes('@js:') || /<js\b|<js>/.test(rule)) unsupported('规则含 JS（@js:/<js>）', rule, { code: 'unsupported_js' });
+  if (ruleHasJs(rule)) unsupported('规则含 JS（@js:/<js>）', rule, { code: 'unsupported_js' });
   if (rule.includes('@put:')) unsupported('规则含 @put 变量存取', rule, { code: 'unsupported_var_put' });
   if (rule.includes('@get:')) unsupported('规则含 @get 变量存取', rule, { code: 'unsupported_var_get' });
   if (rule.trimStart().startsWith('match:')) unsupported('规则含 match: 正则', rule, { code: 'unsupported_regex_match' });
@@ -481,12 +484,17 @@ export interface ParseOptions {
   orEnabled?: boolean;
   /** 简单子集 XPath 是否翻成 CSS（ENGINE_SYNTAX_XPATH，xpath1027）。默认读 env（缺失=off）。 */
   xpathEnabled?: boolean;
+  /** 含 JS 段的字段可否编译成链（ENGINE_SYNTAX_JS，jsbox1027）。默认读 env（缺失=off）；还须给出 field。 */
+  jsEnabled?: boolean;
+  /** 字段全名（如 `ruleContent.content`）。JS 链只对白名单字段开放，未给出时含 JS 照旧拒。 */
+  field?: string;
 }
 
 export function parseFieldRule(rule: string, options: ParseOptions = {}): FieldIr {
   if (typeof rule !== 'string') unsupported('规则非字符串', String(rule), { code: 'invalid_rule_type' });
   const trimmed = rule.trim();
   if (trimmed === '') unsupported('空规则', rule, { code: 'empty_rule' });
+  if (ruleHasJs(trimmed) && (options.jsEnabled ?? engineSyntaxJsEnabled())) return parseJsChain(trimmed, rule, options);
   if (trimmed.length > MAX_RULE_LENGTH) unsupported('规则过长', rule, { code: 'rule_too_long' });
 
   rejectUnsupportedConstructs(trimmed);
@@ -543,6 +551,162 @@ function singleSegmentField(
 function parseOrBranch(branch: string, rule: string, xpathEnabled: boolean): RuleIr {
   if (branch.trim() === '') unsupported('|| 分支为空', rule, { code: 'empty_or_branch' });
   return translateSegment(branch, rule, xpathEnabled);
+}
+
+// ---- JS 链（jsbox1027，ENGINE_SYNTAX_JS）----
+/** 与 rejectUnsupportedConstructs 同一判据：开关 off 时含 JS 照旧 unsupported_js。 */
+export function ruleHasJs(rule: string): boolean {
+  return rule.includes('@js:') || /<js\b|<js>/.test(rule);
+}
+
+/** legado AnalyzeRule.JS_PATTERN（大小写不敏感）：`<js>…</js>` 取最短，`@js:` 吞到串尾。 */
+const JS_SEGMENT_RE = /<js>([\w\W]*?)<\/js>|@js:([\w\W]*)/gi;
+
+/** 页面级字段：首段输入是整页原文，JS 里可用 `src`（legado evalJS 的 src = content）。 */
+const JS_PAGE_FIELDS: ReadonlySet<string> = new Set([
+  'ruleBookInfo.name', 'ruleBookInfo.author', 'ruleBookInfo.tocUrl',
+  'ruleToc.nextTocUrl', 'ruleContent.content', 'ruleContent.nextContentUrl',
+]);
+/**
+ * 条目级字段：legado 里首段输入是 jsoup Element / JSON Map，JS 要靠 Java 互操作才读得动——只放行
+ * 「先规则取出字符串、后 JS 加工」的形态，首段是 JS/纯正则一律拒；`src` 同理不可用。
+ * 列表字段（bookList/chapterList）的 JS 要返回节点/对象集合，不开放。
+ */
+const JS_ITEM_FIELDS: ReadonlySet<string> = new Set([
+  'ruleSearch.name', 'ruleSearch.author', 'ruleSearch.bookUrl', 'ruleToc.chapterName', 'ruleToc.chapterUrl',
+]);
+
+/** 该字段是否允许 JS 链（parseJsChain 的白名单；准入初筛与语义版本判定共用）。 */
+export function jsChainFieldAllowed(field: string): boolean {
+  return JS_PAGE_FIELDS.has(field) || JS_ITEM_FIELDS.has(field);
+}
+
+/**
+ * 依赖 legado 宿主状态或动态代码的标识符：沙箱里没有对应对象，编译期先拒，免得准入放进实跑必失败的源。
+ * 只认「前面不是 `.`」的裸标识符（`x.book` 是属性访问，不算）；字符串/注释里的不算。
+ */
+const JS_BANNED_IDENTIFIERS: ReadonlySet<string> = new Set([
+  'book', 'source', 'cookie', 'cache', 'chapter', 'title', 'nextChapterUrl', 'rssArticle', 'Packages', 'org',
+  'eval', 'Function', 'importScript', 'XMLHttpRequest', 'fetch', 'webView', 'startBrowser',
+]);
+
+/**
+ * 含 JS 段的字段 → legado 链式 FieldIr（AnalyzeRule.splitSourceRule 的切法：JS 段原样、非 JS 段 trim 后为空即丢）。
+ * 非 JS 段各自按普通规则编译（含 ## 尾缀/||，开关同外层）；剥掉 ## 后主体为空的段成为只做替换的 regex 段。
+ * 求值见 evaluate.ts evaluateChain。
+ */
+function parseJsChain(trimmed: string, rule: string, options: ParseOptions): FieldIr {
+  const field = options.field;
+  const itemLevel = field !== undefined && JS_ITEM_FIELDS.has(field);
+  if (field === undefined || !jsChainFieldAllowed(field)) {
+    unsupported('规则含 JS（@js:/<js>）', rule, { code: 'unsupported_js' });
+  }
+  if (trimmed.length > MAX_JS_RULE_LENGTH) unsupported('规则过长', rule, { code: 'rule_too_long' });
+  const segmentOptions: ParseOptions = { orEnabled: options.orEnabled, xpathEnabled: options.xpathEnabled, jsEnabled: false };
+  const chain: ChainStage[] = [];
+  const pushRule = (text: string) => {
+    const segment = text.trim();
+    if (segment === '') return;
+    if (segment.startsWith('##')) {
+      if (itemLevel && chain.length === 0) unsupported('条目级字段首段不能是纯正则', rule, { code: 'unsupported_js' });
+      chain.push({ kind: 'regex', regex: stripRegexSuffix(segment, rule).regex });
+      return;
+    }
+    chain.push({ kind: 'rule', field: parseFieldRule(segment, segmentOptions) });
+  };
+  let last = 0;
+  for (const match of trimmed.matchAll(JS_SEGMENT_RE)) {
+    pushRule(trimmed.slice(last, match.index));
+    const code = match[1] ?? match[2] ?? '';
+    if (itemLevel && chain.length === 0) unsupported('条目级字段首段不能是 JS', rule, { code: 'unsupported_js' });
+    checkJsCode(code, rule, itemLevel);
+    chain.push({ kind: 'js', code });
+    last = match.index + match[0].length;
+  }
+  pushRule(trimmed.slice(last));
+  return { rules: [], chain };
+}
+
+/** JS 段的编译期白名单（沙箱内的二道防线见 js-sandbox.ts）。 */
+function checkJsCode(code: string, rule: string, itemLevel: boolean): void {
+  const reject = (why: string): never => unsupported(`JS 段${why}`, rule, { code: 'unsupported_js' });
+  if (code.trim() === '') reject('为空');
+  // legado 在求值前对 JS 文本做 {{}}/@get/## 改写（SourceRule 构造与 makeUpRule），这里不模拟那几步。
+  if (code.includes('##') || code.includes('{{') || /@(?:get|put):/i.test(code)) reject('含 ##/{{}}/@get/@put');
+  const bare = stripJsLiterals(code) ?? reject('字符串/注释未闭合');
+  for (const match of bare.matchAll(/(?<![.\w$])[A-Za-z_$][\w$]*/g)) {
+    const name = match[0];
+    if (JS_BANNED_IDENTIFIERS.has(name) || (itemLevel && name === 'src')) reject(`引用了沙箱不提供的 ${name}`);
+    if (name !== 'java') continue;
+    const member = /^\s*\.\s*([A-Za-z_$][\w$]*)/.exec(bare.slice(match.index + name.length));
+    if (!member || !JS_JAVA_HELPERS.has(member[1])) reject(`用了沙箱不提供的 java.${member?.[1] ?? '[…]'}`);
+  }
+}
+
+/** 正则字面量前一个有效字符若是这些（或在行首），`/` 是正则开头而非除号。 */
+const REGEX_PRECEDERS = '(,=:[!&|?{};+-*%<>~^';
+
+/**
+ * 把 JS 里的字符串字面量、正则字面量与注释换成占位（只为扫标识符）；未闭合返回 null。
+ * 模板字面量不剥（`${}` 里是代码，宁可多扫）。正则字面量按常规启发式识别：`/` 前一个有效字符是
+ * 运算符/开括号/串首，或紧跟关键字 return/typeof 时视为正则开头。
+ */
+function stripJsLiterals(code: string): string | null {
+  let out = '';
+  let i = 0;
+  let prev = ''; // 上一个非空白有效字符；字面量与标识符记作 'a'（操作数）
+  let word = ''; // 紧邻的上一个标识符（判 return/typeof 后的正则）
+  while (i < code.length) {
+    const ch = code[i];
+    if (ch === '/' && code[i + 1] === '/') {
+      const end = code.indexOf('\n', i);
+      i = end < 0 ? code.length : end;
+      out += ' ';
+      continue;
+    }
+    if (ch === '/' && code[i + 1] === '*') {
+      const end = code.indexOf('*/', i + 2);
+      if (end < 0) return null;
+      i = end + 2;
+      out += ' ';
+      continue;
+    }
+    const regexStart = ch === '/' && (prev === '' || REGEX_PRECEDERS.includes(prev) || word === 'return' || word === 'typeof');
+    if (ch === "'" || ch === '"' || regexStart) {
+      let j = i + 1;
+      let inClass = false;
+      for (; j < code.length; j += 1) {
+        const c = code[j];
+        if (c === '\\') {
+          j += 1;
+          continue;
+        }
+        if (c === '\n') return null;
+        if (ch !== '/') {
+          if (c === ch) break;
+        } else if (c === '[') inClass = true;
+        else if (c === ']') inClass = false;
+        else if (c === '/' && !inClass) break;
+      }
+      if (j >= code.length) return null;
+      i = j + 1;
+      if (regexStart) while (i < code.length && /[a-z]/i.test(code[i])) i += 1; // flags
+      out += ' a ';
+      prev = 'a';
+      word = '';
+      continue;
+    }
+    out += ch;
+    if (/[\w$]/.test(ch)) {
+      word = /[\w$]/.test(code[i - 1] ?? '') ? word + ch : ch;
+      prev = 'a';
+    } else if (!/\s/.test(ch)) {
+      prev = ch;
+      word = '';
+    }
+    i += 1;
+  }
+  return out;
 }
 
 /** 便捷单规则解析（返回首个 RuleIr，测试用）。 */

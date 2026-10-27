@@ -14,7 +14,10 @@ import { sourceRevision } from '@/lib/source-revision';
 import { preservesSourcePostRedirect, sourceAbortable } from '@/lib/source-fetch';
 import { buildSourceSearchRequest, type SourceSearchRequest, type SourceUrlValidator } from '@/lib/source-parser';
 import { charsetFromContentType, encodeToBytes, type SourceCharset } from '@/lib/source-charset';
-import { admissionNoncoreJsEnabled, CORE_FIELDS, enginePostSearchEnabled, iterRulePairs, selectCandidates, type RawSource } from './compile-smoke';
+import {
+  admissionNoncoreJsEnabled, CORE_FIELDS, enginePostSearchEnabled, iterRulePairs, jsChainEnabledFor, selectCandidates,
+  sourceHasJsChainField, type RawSource,
+} from './compile-smoke';
 import { parseFieldRule } from './parse';
 import {
   createScope, evaluateField, evaluateFieldList, normalizeBody,
@@ -22,6 +25,7 @@ import {
 import { RuleEngineError, type FieldIr, type RuleDiagnostic } from './types';
 import { compileSource, engineSourceRevision } from './compile';
 import { engineSyntaxVarsEnabled } from './syntax-flags';
+import { preloadJsSandbox } from './js-sandbox';
 import { resolveSourceVars } from './vars-subset';
 import { contentHtmlToText, contentNeedsHtmlToText } from './content-html';
 import { isStructuredChallengePage } from './content-challenge';
@@ -416,8 +420,9 @@ export function compileAdmission(source: RawSource): AdmissionCompile {
   const coreFieldMask: Record<string, boolean> = {};
   for (const field of CORE_FIELDS) coreFieldMask[field] = false;
 
+  const coreJs = jsChainEnabledFor(source);
   if (selectCandidates([source], {
-    postSearch: enginePostSearchEnabled(), noncoreJs: admissionNoncoreJsEnabled(),
+    postSearch: enginePostSearchEnabled(), noncoreJs: admissionNoncoreJsEnabled(), coreJs,
   }).length !== 1) {
     return {
       ok: false, tier: 'T7', coreFieldMask, failures: [],
@@ -429,7 +434,7 @@ export function compileAdmission(source: RawSource): AdmissionCompile {
   for (const [field, rule] of iterRulePairs(engineSyntaxVarsEnabled() ? resolveSourceVars(source) : source)) {
     if (!(field in coreFieldMask)) continue;
     try {
-      parseFieldRule(rule);
+      parseFieldRule(rule, { jsEnabled: coreJs, field });
       coreFieldMask[field] = true;
     } catch (error) {
       const message = error instanceof RuleEngineError ? error.message : String(error);
@@ -702,14 +707,15 @@ function searchCandidates(source: RawSource, text: string, pageUrl: string): { t
   const name = (rules as Record<string, unknown>).name;
   const bookUrl = (rules as Record<string, unknown>).bookUrl;
   if (typeof bookList !== 'string') return [];
-  const parseSafe = (rule: unknown) => {
+  const jsEnabled = jsChainEnabledFor(source);
+  const parseSafe = (rule: unknown, name?: string) => {
     if (typeof rule !== 'string' || !rule.trim()) return undefined;
-    try { return parseFieldRule(rule); } catch { return undefined; }
+    try { return parseFieldRule(rule, { jsEnabled, field: name }); } catch { return undefined; }
   };
   const listIr = parseSafe(bookList);
   if (!listIr) return [];
-  const nameIr = parseSafe(name);
-  const bookUrlIr = parseSafe(bookUrl);
+  const nameIr = parseSafe(name, 'ruleSearch.name');
+  const bookUrlIr = parseSafe(bookUrl, 'ruleSearch.bookUrl');
   let scope;
   try { scope = createScope(normalizeBody(text), pageUrl); } catch { return []; }
   // HTML 与 JSON 搜索页同一路径（JSON 页 bookList 取列表项，见 evaluateFieldList）。
@@ -814,6 +820,7 @@ async function searchAdmissionOnce(
   }
   if (response.status >= 500) return { verdict: 'http_5xx', candidateCount: 0, status: response.status, error: String(response.status) };
   if (response.status >= 400) return { verdict: 'http_4xx', candidateCount: 0, status: response.status, error: String(response.status) };
+  if (jsChainEnabledFor(source) && sourceHasJsChainField(source)) await preloadJsSandbox();
   const found = searchCandidates(source, response.text, response.url);
   const urls = found.map((item) => item.url);
   const candidateCount = urls.length;

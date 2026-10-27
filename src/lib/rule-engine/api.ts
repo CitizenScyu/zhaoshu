@@ -12,8 +12,11 @@ import {
 import type { SourceRequestContext } from '@/lib/source-reader';
 import { contentHtmlToText, contentNeedsHtmlToText } from './content-html';
 import { isStructuredChallengePage } from './content-challenge';
-import { createScope, evaluateField, evaluateFieldList, normalizeBody } from './evaluate';
+import {
+  compiledUsesJs, createScope, evaluateField, evaluateFieldList, evaluateFieldStrings, fieldUsesJs, normalizeBody,
+} from './evaluate';
 import { enginePostSearchEnabled } from './compile-smoke';
+import { preloadJsSandbox } from './js-sandbox';
 import type { CompiledRules, FieldIr, SkippedField } from './types';
 
 export interface EngineSource {
@@ -57,10 +60,37 @@ function absoluteUrl(value: string, base: string): string | undefined {
   try { return validateSourceUrl(upgradeSourceTemplateUrl(value), base).href; } catch { return undefined; }
 }
 
+/** 编译产物含 JS 链字段时先载入沙箱（jsbox1027；求值是同步的，必须在取页之前就绪）。无 JS 链零开销。 */
+async function prepareJs(source: EngineSource): Promise<void> {
+  if (compiledUsesJs(source.compiled)) await preloadJsSandbox();
+}
+
+/**
+ * JS 链下一页（jsbox1027，legado getStringList(isUrl=true)）：逐项绝对化、去重，去掉当前页（legado 目录
+ * 排除 redirectUrl、正文以 nextUrlList 起始项排除）。strict 下任一项过不了 host 门即 invalid_next_page。
+ */
+function chainNextUrls(ir: FieldIr, scope: ReturnType<typeof createScope>, pageUrl: string, strict: boolean): string[] {
+  const urls: string[] = [];
+  const keys = new Set([pageIdentity(pageUrl)]);
+  for (const raw of evaluateFieldStrings(ir, scope)) {
+    const url = absoluteUrl(raw, pageUrl);
+    if (!url) {
+      if (strict) throw new Error('invalid_next_page');
+      continue;
+    }
+    const key = pageIdentity(url);
+    if (keys.has(key)) continue;
+    keys.add(key);
+    urls.push(url);
+  }
+  return urls;
+}
+
 /** ruleSearch.bookList → 逐条 name/author/bookUrl；身份判定不在这里（§7.1）。 */
 export async function engineSearchBook(
   source: EngineSource, title: string, context: SourceRequestContext,
 ): Promise<EngineSearchResult[]> {
+  await prepareJs(source);
   // 搜索 URL 展开：flag 关时复用 sourceSearchUrl（纯 GET、utf-8，逐字不变）；
   // flag 开时经 buildSourceSearchRequest 支持 POST/body/charset/白名单头（41-postsearch）。
   let page: { url: string; text: string };
@@ -100,6 +130,7 @@ export async function engineSearchBook(
 export async function engineFetchDetail(
   source: EngineSource, bookUrl: string, context: SourceRequestContext,
 ): Promise<Partial<SourceBookIdentity> & { tocUrl?: string }> {
+  await prepareJs(source);
   const target = validateSourceUrl(bookUrl).href;
   const page = await context.page(target, { responseCharset: enginePostSearchEnabled() ? 'auto' : undefined });
   const scope = createScope(normalizeBody(page.text), page.url);
@@ -134,12 +165,18 @@ export async function engineFetchToc(
   // 去重键是 url：BookChapter.kt:87-91 的 equals/hashCode 只比 url。
   // kxdu.net 形态（页面顶部「最新章节」9 条在目录末尾原样重列）正是靠这条把头部区块挤到末尾，
   // 让「第一章」回到首位；无重复的页面下该变换是恒等，逐字节不变。
+  await prepareJs(source);
   const entries: SourceChapter[] = [];
   const seenUrls = new Set<string>(); // 唯一章节计数（页数/总量上限），与最终去重顺序无关
   const visited = new Set<string>();
   const receivedPages = new Set<string>();
   let next = absoluteUrl(tocUrl, source.url);
-  for (let pageIndex = 0; next && pageIndex < MAX_TOC_PAGES && seenUrls.size <= MAX_SOURCE_CHAPTERS; pageIndex += 1) {
+  // JS 链 nextTocUrl 一次给出多页时（jsbox1027，legado BookChapterList 并发分支）：逐页全抓，这些页不再取下一页。
+  // 非链字段恒为空，循环与改前逐字等价。
+  const fanout: string[] = [];
+  for (let pageIndex = 0; (next || fanout.length > 0) && pageIndex < MAX_TOC_PAGES && seenUrls.size <= MAX_SOURCE_CHAPTERS; pageIndex += 1) {
+    const fromFanout = !next;
+    if (!next) next = fanout.shift()!;
     if (visited.has(next)) { if (strict) throw new Error('pagination_cycle'); break; }
     visited.add(next);
     const page = await context.page(next, { responseCharset: enginePostSearchEnabled() ? 'auto' : undefined });
@@ -176,12 +213,24 @@ export async function engineFetchToc(
     if (strict && validChapters === 0) throw new Error('empty_toc_page');
     // 已声明并跟随的后页缺内容，不能把前页目录作为完整成功；不改变首页/章节URL兜底语义。
     if (pageIndex > 0 && validChapters === 0) throw new SourcePolicyError('书源目录后续页未提供有效章节，请重试或更换书源');
+    if (fromFanout) {
+      next = undefined;
+      continue;
+    }
+    const nextField = field(source.compiled, 'ruleToc.nextTocUrl');
+    if (fieldUsesJs(nextField)) {
+      // JS 链在 JSON 页上照样求值（JS 段常用来解析 JSON 拼下一页）。
+      const urls = chainNextUrls(nextField, scope, page.url, strict);
+      next = urls.length === 1 ? urls[0] : undefined;
+      if (urls.length > 1) fanout.push(...urls.filter((url) => !visited.has(url)));
+      continue;
+    }
     // 只有当前页确实是 HTML 时才解析翻页 URL；否则链结束（避免对 JSON 输入跑 CSS 规则）。
     const rawNext = scope.kind === 'html' ? evaluateText(source.compiled, 'ruleToc.nextTocUrl', scope) : '';
     next = absoluteUrl(rawNext, page.url);
     if (strict && rawNext.trim() && !next) throw new Error('invalid_next_page');
   }
-  if (strict && (next || seenUrls.size > MAX_SOURCE_CHAPTERS)) throw new Error('toc_limit');
+  if (strict && (next || fanout.length > 0 || seenUrls.size > MAX_SOURCE_CHAPTERS)) throw new Error('toc_limit');
   // 保留每个 url 的**最后一次**出现。最后一次出现的位置严格递增，故按原序过滤即得 legado 净顺序。
   const lastIndex = new Map<string, number>();
   entries.forEach((chapter, index) => lastIndex.set(chapter.url, index));
@@ -221,6 +270,7 @@ export async function engineFetchContent(
   source: EngineSource, chapterUrl: string, context: SourceRequestContext, strict = false,
   nextChapterUrl?: string | readonly string[],
 ): Promise<EngineContentResult> {
+  await prepareJs(source);
   const parts: string[] = [];
   const visited = new Set<string>();
   const receivedPages = new Set<string>();
@@ -240,7 +290,11 @@ export async function engineFetchContent(
   const redirectStopKeys = new Set([...stopKeys].map(redirectedPageIdentity));
   // 单章目录会把本章作为单个停止地址传入；正常交付本章（含同站换host）不能被拒绝。
   if (next) redirectStopKeys.delete(redirectedPageIdentity(next));
-  for (let pageIndex = 0; next && pageIndex < MAX_CONTENT_PAGES; pageIndex += 1) {
+  // 同目录的 fanout（jsbox1027，legado BookContent 并发分支）：JS 链一次给出多页时逐页全抓，这些页不再取下一页。
+  const fanout: string[] = [];
+  for (let pageIndex = 0; (next || fanout.length > 0) && pageIndex < MAX_CONTENT_PAGES; pageIndex += 1) {
+    const fromFanout = !next;
+    if (!next) next = fanout.shift()!;
     if (visited.has(next)) { if (strict) throw new Error('pagination_cycle'); break; }
     visited.add(next);
     const page = await context.page(next, { responseCharset: enginePostSearchEnabled() ? 'auto' : undefined });
@@ -272,12 +326,23 @@ export async function engineFetchContent(
     if (content) parts.push(content);
     const nextRule = source.compiled.get('ruleContent.nextContentUrl');
     if (strict && nextRule && 'skipped' in nextRule) throw new Error('unsupported_content_rule');
+    if (fromFanout) {
+      next = undefined;
+      continue;
+    }
+    if (fieldUsesJs(nextRule)) {
+      // 命中停止地址（下一章）的项先剔除：单项时等同 legado 顺序分支「等于下一章即停」，多项时不把下一章当本章分页抓。
+      const urls = chainNextUrls(nextRule, scope, page.url, strict).filter((url) => !stopKeys.has(pageIdentity(url)));
+      next = urls.length === 1 ? urls[0] : undefined;
+      if (urls.length > 1) fanout.push(...urls.filter((url) => !visited.has(url)));
+      continue;
+    }
     const rawNext = scope.kind === 'html' ? evaluateText(source.compiled, 'ruleContent.nextContentUrl', scope) : '';
     next = absoluteUrl(rawNext, page.url);
     if (strict && rawNext.trim() && !next) throw new Error('invalid_next_page');
     // 放在 invalid_next_page 之后：命中下一章不是非法链接；置空 next 让循环后的 content_page_limit 不误报。
     if (next && stopKeys.has(pageIdentity(next))) { next = undefined; break; }
   }
-  if (strict && next) throw new Error('content_page_limit');
+  if (strict && (next || fanout.length > 0)) throw new Error('content_page_limit');
   return { text: parts.join('\n') };
 }

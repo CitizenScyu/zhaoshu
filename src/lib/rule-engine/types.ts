@@ -119,10 +119,22 @@ export interface RegexSub {
   flags?: string;
 }
 
+/**
+ * 含 JS 段字段的 legado 链式求值（jsbox1027，ENGINE_SYNTAX_JS）：按 `<js>…</js>` / `@js:` 切出的各段依次执行，
+ * 上一段的字符串结果作为下一段输入（见 parse.ts parseJsChain、evaluate.ts evaluateChain）。
+ */
+export type ChainStage =
+  | { kind: 'rule'; field: FieldIr }
+  | { kind: 'js'; code: string }
+  /** 剥掉 ## 尾缀后主体为空的段（如 `</js>##广告##`）：只对上一段结果做替换。 */
+  | { kind: 'regex'; regex: RegexSub[] };
+
 /** 一条字段规则的顶层组合。 */
 export interface FieldIr {
   /** || 分隔的候选项，逐个尝试到首个非空（T7；M1 期数组长度=1）。 */
   rules: RuleIr[];
+  /** 含 JS 段的链式字段（jsbox1027）。存在时 rules 为空数组，求值只走链。 */
+  chain?: ChainStage[];
   /** && 分隔时的连接符（T7；M1 期 undefined）。 */
   joins?: string[];
   /** %% 分隔的拼接符（仅 2 源，T7；M1 期 undefined）。 */
@@ -141,6 +153,12 @@ export type CompiledRules = Map<string, FieldIr | SkippedField>;
 
 // ---- 编译期防御上限（防规则炸弹，§2.3）----
 export const MAX_RULE_LENGTH = 2048; //          规则串长度上限，对齐 sourceSearchUrl
+/** 含 JS 段的整条规则长度上限（jsbox1027）：JS 段常见 1–4K 字符，非 JS 段仍各自受 MAX_RULE_LENGTH 约束。 */
+export const MAX_JS_RULE_LENGTH = 8192;
+/** 沙箱提供的 java.* 纯计算帮手（jsbox1027）：parse.ts 编译期白名单与 js-sandbox.ts 宿主实现共用这一份。 */
+export const JS_JAVA_HELPERS: ReadonlySet<string> = new Set([
+  'base64Decode', 'base64Encode', 'md5Encode', 'md5Encode16', 'encodeURI', 'hexDecodeToString', 'log', 'toast', 'longToast',
+]);
 export const MAX_CSS_CHAIN_DEPTH = 8; //         CssStep 链深上限
 export const MAX_REGEX_PATTERN_LENGTH = 256; //  正则 pattern 长度上限
 /** || 组合分支数上限（P1a，设计 §5.1 建议 16 的保守起点；2048 字符规则串最多也就 ~1024 支，预算前置防滥用）。 */

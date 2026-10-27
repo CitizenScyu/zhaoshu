@@ -24,9 +24,10 @@ export const ENGINE_SEMANTICS_XPATH_BIT = 2;
 export const ENGINE_SEMANTICS_VARS_BIT = 4;
 
 /** 语义版本随 || / XPath / 变量开关联动（唯一口径，供 compile.ts 缓存键与 rulesHash 复用）。 */
-export function engineSemanticsVersion(orEnabled: boolean, xpathEnabled = false, varsEnabled = false): number {
+export function engineSemanticsVersion(orEnabled: boolean, xpathEnabled = false, varsEnabled = false, jsEnabled = false): number {
   return (orEnabled ? ENGINE_SEMANTICS_VERSION_OR : ENGINE_SEMANTICS_VERSION)
-    + (xpathEnabled ? ENGINE_SEMANTICS_XPATH_BIT : 0) + (varsEnabled ? ENGINE_SEMANTICS_VARS_BIT : 0);
+    + (xpathEnabled ? ENGINE_SEMANTICS_XPATH_BIT : 0) + (varsEnabled ? ENGINE_SEMANTICS_VARS_BIT : 0)
+    + (jsEnabled ? ENGINE_SEMANTICS_JS_BIT : 0);
 }
 
 /**
@@ -62,5 +63,20 @@ export function engineSyntaxXPathEnabled(env: OrEnv = process.env): boolean {
  */
 export function engineSyntaxVarsEnabled(env: OrEnv = process.env): boolean {
   const raw = env.ENGINE_SYNTAX_VARS?.trim().toLowerCase();
+  return raw === '1' || raw === 'true' || raw === 'on';
+}
+
+/**
+ * jsbox1027：规则 JS 段（`<js>…</js>` / `@js:`）沙箱执行语义位。版本再 +8（9–16），1–8 逐字不变。
+ * 只对实际用到核心字段 JS 的源计入（compile.ts sourceUsesJsSyntax），其余源的 rules_hash 不因开关翻动。
+ */
+export const ENGINE_SEMANTICS_JS_BIT = 8;
+
+/**
+ * ENGINE_SYNTAX_JS 独立开关（jsbox1027，默认 off，口径同 ENGINE_SYNTAX_OR）。
+ * on = 阅读路径字段里通过编译期白名单的纯计算 JS 段在 QuickJS-wasm 沙箱执行（js-sandbox.ts）；off = 逐字不变。
+ */
+export function engineSyntaxJsEnabled(env: OrEnv = process.env): boolean {
+  const raw = env.ENGINE_SYNTAX_JS?.trim().toLowerCase();
   return raw === '1' || raw === 'true' || raw === 'on';
 }

@@ -4,10 +4,11 @@
 // ENGINE_SYNTAX_OR 联动——off=1 / on=2）：规则原文或引擎语义任一变化，键即变，旧编译
 // 产物自然失效，不存在「|| 开关打开后仍复用 off 态编译缓存」的窗口。
 import { sourceRevision } from '@/lib/source-revision';
-import { parseFieldRule, type ParseOptions } from './parse';
+import { jsChainFieldAllowed, parseFieldRule, ruleHasJs, type ParseOptions } from './parse';
 import type { CompiledRules } from './types';
 import {
-  engineSemanticsVersion, engineSyntaxOrEnabled, engineSyntaxVarsEnabled, engineSyntaxXPathEnabled, ENGINE_SEMANTICS_VERSION,
+  engineSemanticsVersion, engineSyntaxJsEnabled, engineSyntaxOrEnabled, engineSyntaxVarsEnabled, engineSyntaxXPathEnabled,
+  ENGINE_SEMANTICS_VERSION,
 } from './syntax-flags';
 import { resolveSourceVars, ruleMayUseVars } from './vars-subset';
 import { ruleMayUseXPath } from './xpath-subset';
@@ -29,6 +30,7 @@ export function engineVersionedKey(contentRevision: string, semanticsVersion = E
  * orsrc1027：语义版本按源判定——开关 on 且规则组里出现 `||` 的源才是版本 2，其余源恒为 1。
  * xpath1027：同理，ENGINE_SYNTAX_XPATH on 且规则组可能含 XPath 段的源再加 XPath 位（3/4），其余源不变。
  * vars1027：ENGINE_SYNTAX_VARS on 且规则组含 @put/@get 的源再加变量位（5–8）。
+ * jsbox1027：ENGINE_SYNTAX_JS on 且可编译成 JS 链的字段里有 JS、源无 jsLib 时再加 JS 位（9–16）。
  */
 export function engineSourceRevision(
   source: { url: string; searchUrl: unknown; rules: Record<string, unknown> },
@@ -37,10 +39,12 @@ export function engineSourceRevision(
   const orEnabled = options.orEnabled ?? engineSyntaxOrEnabled();
   const xpathEnabled = options.xpathEnabled ?? engineSyntaxXPathEnabled();
   const varsEnabled = options.varsEnabled ?? engineSyntaxVarsEnabled();
+  const jsEnabled = options.jsEnabled ?? engineSyntaxJsEnabled();
   return engineVersionedKey(sourceRevision(source), engineSemanticsVersion(
     orEnabled && sourceUsesOrSyntax(source.rules),
     xpathEnabled && sourceUsesXPathSyntax(source.rules),
     varsEnabled && sourceUsesVarSyntax(source.rules),
+    jsEnabled && sourceUsesJsSyntax(source.rules),
   ));
 }
 
@@ -77,6 +81,27 @@ export function sourceUsesVarSyntax(rules: Record<string, unknown>): boolean {
   return someRule(rules, ruleMayUseVars);
 }
 
+/** 源带 jsLib（公共函数库）：JS 段多半调用其中函数，沙箱不执行 jsLib，整源不开 JS 链。 */
+export function sourceHasJsLib(rules: Record<string, unknown>): boolean {
+  return typeof rules.jsLib === 'string' && rules.jsLib.trim() !== '';
+}
+
+/**
+ * 源是否会因 ENGINE_SYNTAX_JS 改变编译结果（jsbox1027）：无 jsLib，且 JS 链白名单字段（parse.ts
+ * jsChainFieldAllowed）里有含 JS 的规则。装饰字段/列表字段的 JS 开关前后同样不编译，identity 不该变。
+ */
+export function sourceUsesJsSyntax(rules: Record<string, unknown>): boolean {
+  if (sourceHasJsLib(rules)) return false;
+  for (const group of RULE_GROUPS) {
+    const fields = rules[group];
+    if (!fields || typeof fields !== 'object' || Array.isArray(fields)) continue;
+    for (const [name, rule] of Object.entries(fields as Record<string, unknown>)) {
+      if (typeof rule === 'string' && jsChainFieldAllowed(`${group}.${name}`) && ruleHasJs(rule)) return true;
+    }
+  }
+  return false;
+}
+
 /** LRU 上限：单测/低并发下足够；无关热路径，只防规则对象无限积累。 */
 const CACHE_LIMIT = 64;
 const cache = new Map<string, CompiledRules>();
@@ -96,7 +121,9 @@ export function compileSource(
   const orEnabled = options.orEnabled ?? engineSyntaxOrEnabled();
   const xpathEnabled = options.xpathEnabled ?? engineSyntaxXPathEnabled();
   const varsEnabled = options.varsEnabled ?? engineSyntaxVarsEnabled();
-  const key = engineSourceRevision(source, { orEnabled, xpathEnabled, varsEnabled });
+  // jsLib 源不开 JS 链（见 sourceHasJsLib）：字段里的 JS 照旧 unsupported_js。
+  const jsEnabled = (options.jsEnabled ?? engineSyntaxJsEnabled()) && !sourceHasJsLib(source.rules);
+  const key = engineSourceRevision(source, { orEnabled, xpathEnabled, varsEnabled, jsEnabled });
   const hit = cache.get(key);
   if (hit) {
     cache.delete(key); // 触达即续期（Map 插入序 = LRU 序）
@@ -112,7 +139,7 @@ export function compileSource(
       if (typeof rule !== 'string' || !rule.trim()) continue;
       const name = `${group}.${field}`;
       try {
-        compiled.set(name, parseFieldRule(rule, { orEnabled, xpathEnabled }));
+        compiled.set(name, parseFieldRule(rule, { orEnabled, xpathEnabled, jsEnabled, field: name }));
       } catch {
         compiled.set(name, { skipped: 'unsupported' });
       }
