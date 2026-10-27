@@ -155,7 +155,12 @@ export interface RegexSub {
  * 上一段的字符串结果作为下一段输入（见 parse.ts parseJsChain、evaluate.ts evaluateChain）。
  */
 export type ChainStage =
-  | { kind: 'rule'; field: FieldIr }
+  /**
+   * `mode`（listjs1027，只出现在列表字段的链里）：该段在 legado 里的解析模式——SourceRule 按段前缀与**原页面**是否
+   * JSON 定，不看 JS 产出的文本长什么样：`json` = `$.`/`$[`/`@Json:`；`html` = `@CSS:`/`@@`/`@XPath:`/`/`（强制 jsoup/XPath）；
+   * `default` = 无前缀（原页面是 JSON 时按 Json 模式）。见 evaluate.ts listChainScopes。
+   */
+  | { kind: 'rule'; field: FieldIr; mode?: 'json' | 'html' | 'default' }
   | { kind: 'js'; code: string }
   /** 剥掉 ## 尾缀后主体为空的段（如 `</js>##广告##`）：只对上一段结果做替换。 */
   | { kind: 'regex'; regex: RegexSub[] };
@@ -172,6 +177,14 @@ export interface FieldIr {
   concats?: string;
   /** ##pattern##replacement##flags## 尾缀，可多段。 */
   regex?: RegexSub[];
+  /**
+   * 列表 JS 条目的键值直取（listjs1027，只挂在列表字段含 JS 的组的条目核心字段上）：legado getString 遇 NativeObject
+   * 条目时只取首个 SourceRule、以其规则文本为键直接读对象属性，再套该段 `##` 替换。`unsupported` = 该规则在对象条目上
+   * 不可复现（模板/@get/$N/首段即 JS），对象条目上求值失败；字符串条目照常按 rules/chain 求值。
+   */
+  objectKey?: { key: string; regex?: RegexSub } | { unsupported: string };
+  /** 目录列表规则以 `-` 开头（listjs1027，legado BookChapterList 剥前缀后整表反转）。 */
+  reverse?: true;
 }
 
 /** 装饰字段编译失败不阻断，标 skip 的占位。 */

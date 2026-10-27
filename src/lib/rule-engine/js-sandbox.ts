@@ -40,6 +40,13 @@ const MAX_TRACKED_CODES = 256;
 
 export type JsValue = string | string[];
 
+/**
+ * 列表 JS 的一个条目（listjs1027，runJsItems）：字符串项原样；普通对象项是「自有数据属性 → 值」表——字符串原样、
+ * 布尔按 Java Boolean.toString，null/undefined 不入表（legado 键值直取得 null ⇒ 空串），其余值（数字、对象、数组、
+ * 函数、访问器）记 null：Rhino 里它们的 toString 口径（Double `1.0`、`[object Object]`…）这里不复现，取到即失败。
+ */
+export type JsListItem = string | ReadonlyMap<string, string | null>;
+
 export interface JsBindings {
   /** 上一段的结果（首段为页面原文）；数组按 legado 列表注入，带 size()/get()。 */
   result: JsValue;
@@ -171,6 +178,22 @@ const PRELUDE = `(function(){
  * 其余 String(value)。任何失败（语法错、运行时异常、超时、超内存、预算耗尽、未加载）都是 RULE_EVAL_FAILED。
  */
 export function runJs(code: string, bindings: JsBindings): JsValue | null {
+  return execute(code, bindings, exportValue);
+}
+
+/**
+ * 列表字段的 JS 段（listjs1027，legado AnalyzeRule.getElements 的 `evalJS(...) as List<Any>`）：null/undefined → null
+ * （legado 得空列表）；数组 → 逐项 JsListItem；字符串、数字、非数组对象 → 求值失败（legado 强转 List 抛 ClassCastException）；
+ * 数组里有字符串/普通对象以外的项 → 求值失败（legado 拿它 setContent，按 toString 再解析，口径不复现）。
+ * 沙箱里只做序列化，形状由宿主逐项校验，不信任沙箱产出。资源上限、预算与 runJs 同一套。
+ */
+export function runJsItems(code: string, bindings: JsBindings): JsListItem[] | null {
+  return execute(code, bindings, exportItems);
+}
+
+function execute<T>(
+  code: string, bindings: JsBindings, exporter: (context: QuickJSContext, handle: QuickJSHandle) => T | null,
+): T | null {
   const module = ready;
   if (!module) return evalFailed('JS 沙箱未就绪');
   // 首段 result 就是 src（installGlobals 复用同一句柄），只计一次。
@@ -185,7 +208,7 @@ export function runJs(code: string, bindings: JsBindings): JsValue | null {
   const startedPrecise = performance.now();
   checkBudget(code, started);
   try {
-    return runInFreshRuntime(module, code, bindings, started + EVAL_DEADLINE_MS);
+    return runInFreshRuntime(module, code, bindings, started + EVAL_DEADLINE_MS, exporter);
   } catch (error) {
     if (error instanceof RuleEngineError) throw error;
     discardModule();
@@ -195,7 +218,10 @@ export function runJs(code: string, bindings: JsBindings): JsValue | null {
   }
 }
 
-function runInFreshRuntime(module: QuickJSWASMModule, code: string, bindings: JsBindings, deadline: number): JsValue | null {
+function runInFreshRuntime<T>(
+  module: QuickJSWASMModule, code: string, bindings: JsBindings, deadline: number,
+  exporter: (context: QuickJSContext, handle: QuickJSHandle) => T | null,
+): T | null {
   const runtime = module.newRuntime();
   try {
     runtime.setMemoryLimit(RUNTIME_MEMORY_LIMIT);
@@ -217,7 +243,7 @@ function runInFreshRuntime(module: QuickJSWASMModule, code: string, bindings: Js
         return evalFailed(`JS 执行失败：${message}`);
       }
       try {
-        return exportValue(context, evaluated.value);
+        return exporter(context, evaluated.value);
       } finally {
         evaluated.value.dispose();
       }
@@ -301,6 +327,80 @@ function exportValue(context: QuickJSContext, handle: QuickJSHandle): JsValue | 
     }
   }
   return exportScalar(context, handle);
+}
+
+/**
+ * 列表 JS 结果的沙箱内序列化（listjs1027）：只读自有属性描述符（不触发 getter），对象项建成无原型对象（`__proto__`
+ * 键也落成自有属性）。返回 JSON 文本：`null` / `"string"` / `"other"` / `"item"` / 条目数组（对象项的不可复现值记 0）。
+ */
+const ITEMS_SERIALIZER = `(function(v){
+  if (v === undefined || v === null) return 'null';
+  if (!Array.isArray(v)) return typeof v === 'string' ? '"string"' : '"other"';
+  var out = [], getProto = Object.getPrototypeOf, own = Object.getOwnPropertyDescriptor, names = Object.getOwnPropertyNames;
+  var OP = Object.prototype, make = Object.create, len = v.length;
+  for (var i = 0; i < len; i++) {
+    var it = v[i];
+    if (typeof it === 'string') { out.push(it); continue; }
+    if (it === null || typeof it !== 'object' || Array.isArray(it)) return '"item"';
+    var p = getProto(it);
+    if (p !== OP && p !== null) return '"item"';
+    var o = make(null), keys = names(it);
+    for (var k = 0; k < keys.length; k++) {
+      var d = own(it, keys[k]), x = d.value;
+      if (d.get || d.set) o[keys[k]] = 0;
+      else if (typeof x === 'string') o[keys[k]] = x;
+      else if (typeof x === 'boolean') o[keys[k]] = x ? 'true' : 'false';
+      else if (x !== null && x !== undefined) o[keys[k]] = 0;
+    }
+    out.push(o);
+  }
+  return JSON.stringify(out);
+})`;
+
+function exportItems(context: QuickJSContext, handle: QuickJSHandle): JsListItem[] | null {
+  const serializer = context.evalCode(ITEMS_SERIALIZER, 'items.js');
+  if (serializer.error) {
+    serializer.error.dispose();
+    return evalFailed('JS 沙箱初始化失败');
+  }
+  let text: string;
+  try {
+    const called = context.callFunction(serializer.value, context.undefined, handle);
+    if (called.error) {
+      const message = describeError(context, called.error);
+      called.error.dispose();
+      return evalFailed(`列表 JS 结果无法读取：${message}`);
+    }
+    try {
+      text = context.typeof(called.value) === 'string' ? checkedOutput(context.getString(called.value)) : '';
+    } finally {
+      called.value.dispose();
+    }
+  } finally {
+    serializer.value.dispose();
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return evalFailed('列表 JS 结果异常');
+  }
+  if (parsed === null) return null;
+  if (parsed === 'string') return evalFailed('列表 JS 返回了字符串（legado getElements 强转 List 失败）');
+  if (parsed === 'other') return evalFailed('列表 JS 返回的不是数组（legado getElements 强转 List 失败）');
+  if (parsed === 'item') return evalFailed('列表 JS 数组含字符串/普通对象以外的项');
+  if (!Array.isArray(parsed)) return evalFailed('列表 JS 结果异常');
+  return parsed.map((item: unknown): JsListItem => {
+    if (typeof item === 'string') return item;
+    if (item === null || typeof item !== 'object' || Array.isArray(item)) return evalFailed('列表 JS 结果异常');
+    const entries = new Map<string, string | null>();
+    for (const [key, value] of Object.entries(item)) {
+      if (typeof value === 'string') entries.set(key, value);
+      else if (value === 0) entries.set(key, null);
+      else return evalFailed('列表 JS 结果异常');
+    }
+    return entries;
+  });
 }
 
 function exportScalar(context: QuickJSContext, handle: QuickJSHandle): string {

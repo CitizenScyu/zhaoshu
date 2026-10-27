@@ -9,7 +9,7 @@ import {
   type SkippedField, type TemplatePart,
 } from './types';
 import { aioListCode } from './aio-syntax';
-import { type JsValue, runJs } from './js-sandbox';
+import { type JsListItem, type JsValue, runJs, runJsItems } from './js-sandbox';
 import { evalJsonPath, evalJsonPathList, parseJsonPath } from './jsonpath';
 import { defaultSyntaxSource } from './parse';
 import { evaluateXPath } from './xpath-eval';
@@ -106,6 +106,8 @@ export interface JsonScope {
   source?: string;
   /** AllInOne 条目（aio1027）：legado `[group0..groupN]`，下标即 `$N`（group0 不回传，占位空串）；json 恒为 undefined。 */
   groups?: readonly string[];
+  /** 列表 JS 返回的对象条目（listjs1027，legado NativeObject）：条目字段按 FieldIr.objectKey 键值直取；json 恒为 undefined。 */
+  object?: ReadonlyMap<string, string | null>;
 }
 
 export type EvalScope = HtmlScope | JsonScope;
@@ -466,6 +468,7 @@ function matchingBrace(text: string, open: number): number {
  * 仅 `ruleContent.content` 由门面传 `multi=true` 拼接多段落。见 dom-ops.ts:applyTerminal。
  */
 export function evaluateField(field: FieldIr, scope: EvalScope, multi = false): string {
+  if (scope.kind === 'json' && scope.object !== undefined) return objectFieldValue(field, scope.object);
   if (field.chain) return chainToString(evaluateChain(field.chain, scope, false, multi), multi);
   if (field.joins !== undefined || field.concats !== undefined) {
     // T7 构件（&& 连接符 / %% 拼接）：M1 未实现，宁可失败也不要静默返回错的字符串。
@@ -531,7 +534,7 @@ export function evaluateFieldNodes(field: FieldIr, scope: EvalScope): CheerioNod
  *   模板/字面量/显式 CSS 没有列表语义，视为空支。每项各自成为 JSON 作用域。
  */
 export function evaluateFieldList(field: FieldIr, scope: EvalScope): EvalScope[] {
-  if (field.chain) return evalFailed('列表字段不支持 JS 链');
+  if (field.chain) return listChainScopes(field.chain, scope);
   const head = field.rules[0];
   if (head?.kind === 'regexList') return aioListScopes(head, scope);
   if (scope.kind === 'html') {
@@ -566,6 +569,72 @@ function aioListScopes(ir: Extract<RuleIr, { kind: 'regexList' }>, scope: EvalSc
     return evalFailed('AllInOne 列表求值结果异常');
   }
   return (parsed as string[][]).map((groups): JsonScope => ({ kind: 'json', json: undefined, pageUrl: scope.pageUrl, groups: ['', ...groups] }));
+}
+
+/**
+ * 列表字段的 JS 链（listjs1027，legado AnalyzeRule.getElements）：首段 result = 页面原文，JS 段之间传字符串；
+ * 末段 JS 的数组逐项成为条目，末段规则把上一段字符串重新解析成列表。中间段返回 null → 空列表（legado `result ?: continue`）。
+ * 条目字段的 SourceRule 在 legado 里按**原页面**是否 JSON 定模式：条目的形态与原页面对不上（HTML 页上产出 JSON 条目、
+ * 或反过来）时 legado 条目规则读不动，这里求值失败而不是按条目内容另选解释。`reverse`（`-` 前缀）由调用方对整表处理。
+ */
+function listChainScopes(chain: readonly ChainStage[], scope: EvalScope): EvalScope[] {
+  const source = scope.source;
+  if (source === undefined) return evalFailed('列表 JS 需要页面原文，当前作用域没有');
+  const pageJson = scope.kind === 'json';
+  let value = source;
+  for (let index = 0; index < chain.length; index += 1) {
+    const stage = chain[index];
+    const last = index === chain.length - 1;
+    if (stage.kind === 'js') {
+      const bindings = { result: value, src: source, baseUrl: scope.pageUrl };
+      if (last) {
+        const items = runJsItems(stage.code, bindings);
+        return items === null ? [] : items.map((item) => listItemScope(item, pageJson, scope.pageUrl));
+      }
+      const out = runJs(stage.code, bindings);
+      if (out === null) return [];
+      if (Array.isArray(out)) return evalFailed('列表 JS 中间段返回了数组');
+      value = out;
+      continue;
+    }
+    if (stage.kind !== 'rule' || !last) return evalFailed('列表 JS 链形态异常');
+    const itemsJson = stage.mode === 'json' || ((stage.mode ?? 'default') === 'default' && pageJson);
+    if (itemsJson !== pageJson) return evalFailed('列表 JS 末段规则的模式与原页面不一致（legado 条目规则读不动）');
+    return evaluateFieldList(stage.field, pageJson ? jsonTextScope(value, scope.pageUrl) : createHtmlScope(value, scope.pageUrl));
+  }
+  return evalFailed('列表 JS 链形态异常');
+}
+
+/**
+ * 字符串条目按原页面的模式重新解析（legado setContent(item) 后用页面级 SourceRule）；对象条目键值直取。
+ * 字符串条目的原文就是条目本身（legado 条目字段的 JS 段 result/src 都是它），故挂 source。
+ */
+function listItemScope(item: JsListItem, pageJson: boolean, pageUrl: string): EvalScope {
+  if (typeof item !== 'string') return { kind: 'json', json: undefined, pageUrl, object: item };
+  const scope: EvalScope = pageJson ? jsonTextScope(item, pageUrl) : createHtmlScope(item, pageUrl);
+  scope.source = item;
+  return scope;
+}
+
+function jsonTextScope(text: string, pageUrl: string): JsonScope {
+  const parsed = tryParseJson(text);
+  return parsed.ok ? createJsonScope(parsed.value, pageUrl) : evalFailed('列表 JS 产出的不是 JSON（legado Json 模式解析失败）');
+}
+
+/**
+ * 对象条目上的字段值（legado getString 的 NativeObject 分支）：键值直取 → 取不到即空串（不再套替换）→ `##` 替换 →
+ * 含 `&` 解 HTML 实体 → trim（引擎统一口径）。值是数字/对象等 Rhino toString 口径不复现的类型时求值失败。
+ */
+function objectFieldValue(field: FieldIr, object: ReadonlyMap<string, string | null>): string {
+  const key = field.objectKey;
+  if (key === undefined) return evalFailed('列表 JS 对象条目上没有键值直取规则');
+  if ('unsupported' in key) return evalFailed(`列表 JS 对象条目上不可复现的规则（${key.unsupported}）`);
+  const raw = object.get(key.key);
+  if (raw === undefined) return '';
+  if (raw === null) return evalFailed('列表 JS 对象条目的值不是字符串/布尔');
+  let value = key.regex === undefined ? raw : applyRegexSubs(raw, [key.regex]);
+  if (value.includes('&')) value = decodeHTML(value);
+  return value.trim();
 }
 
 function jsonListItems(ir: RuleIr, json: unknown): unknown[] {

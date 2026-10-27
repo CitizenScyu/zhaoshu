@@ -69,7 +69,7 @@ describe('admissionSurveyOptions（jsbox1027 候选筛与 compileAdmission 同�
 
   it('ENGINE_SYNTAX_JS 开：核心字段 JS 源 coreJs=true，候选筛放行', () => {
     const options = admissionSurveyOptions(coreJsSource, env({ ENGINE_SYNTAX_JS: '1' }));
-    expect(options).toEqual({ postSearch: false, noncoreJs: false, coreJs: true, searchJs: false });
+    expect(options).toEqual({ postSearch: false, noncoreJs: false, coreJs: true, searchJs: false, listJs: false });
     expect(selectCandidates([coreJsSource], options).length).toBe(1);
   });
 
@@ -87,7 +87,8 @@ describe('admissionSurveyOptions（jsbox1027 候选筛与 compileAdmission 同�
 
   it('postSearch/noncoreJs 透传各自开关', () => {
     expect(admissionSurveyOptions(src(), env({ ENGINE_POST_SEARCH: '1', ADMISSION_NONCORE_JS: 'true' })))
-      .toEqual({ postSearch: true, noncoreJs: true, coreJs: false, searchJs: false });
+      .toEqual({ postSearch: true, noncoreJs: true, coreJs: false, searchJs: false, listJs: false });
+    expect(admissionSurveyOptions(src(), env({ ENGINE_SYNTAX_LIST_JS: 'on' })).listJs).toBe(true);
     expect(admissionSurveyOptions(src(), env({ ENGINE_SEARCH_JS: '1' })).searchJs).toBe(false);
     expect(admissionSurveyOptions(src(), env({ ENGINE_POST_SEARCH: '1', ENGINE_SEARCH_JS: '1' })).searchJs).toBe(true);
   });

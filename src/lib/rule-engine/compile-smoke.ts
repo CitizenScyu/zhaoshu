@@ -4,10 +4,10 @@
 
 import { upgradeSourceTemplateUrl } from '@/lib/source-policy';
 import { searchOptionsConstructible, searchTemplateNeedsJs } from '@/lib/source-parser';
-import { jsChainFieldAllowed, parseFieldRule, ruleHasJs, type ParseOptions } from './parse';
-import { aioGroupsFlat, ruleGroupOf } from './aio-syntax';
+import { jsChainFieldAllowed, listJsGroupsFlat, parseFieldRule, ruleHasJs, type ParseOptions } from './parse';
+import { aioGroupsFlat, isAioListField, ruleGroupOf } from './aio-syntax';
 import { searchJsConstructible } from './search-js';
-import { engineSearchJsEnabled, engineSyntaxAioEnabled, engineSyntaxJsEnabled } from './syntax-flags';
+import { engineSearchJsEnabled, engineSyntaxAioEnabled, engineSyntaxJsEnabled, engineSyntaxListJsEnabled } from './syntax-flags';
 import { RuleEngineError, type RuleDiagnostic } from './types';
 
 // survey.py CORE_FIELDS（阅读路径必需字段）
@@ -99,10 +99,11 @@ export function jsChainEnabledFor(src: RawSource, env: NodeJS.ProcessEnv = proce
   return engineSyntaxJsEnabled(env) && !hasJsLib(src);
 }
 
-/** 该源是否有字段会走 JS 链（白名单字段里含 JS 段）——用来决定要不要预加载沙箱。 */
-export function sourceHasJsChainField(src: RawSource): boolean {
+/** 该源是否有字段会走 JS 链（白名单字段里含 JS 段；ENGINE_SYNTAX_LIST_JS on 时含列表字段）——用来决定要不要预加载沙箱。 */
+export function sourceHasJsChainField(src: RawSource, env: NodeJS.ProcessEnv = process.env): boolean {
+  const listJs = engineSyntaxListJsEnabled(env);
   for (const [field, rule] of iterRulePairs(src)) {
-    if (jsChainFieldAllowed(field) && ruleHasJs(rule)) return true;
+    if ((jsChainFieldAllowed(field) || (listJs && isAioListField(field))) && ruleHasJs(rule)) return true;
   }
   return false;
 }
@@ -114,28 +115,31 @@ export function sourceHasJsChainField(src: RawSource): boolean {
  */
 export function admissionSurveyOptions(
   src: RawSource, env: NodeJS.ProcessEnv = process.env,
-): { postSearch: boolean; noncoreJs: boolean; coreJs: boolean; searchJs: boolean } {
+): { postSearch: boolean; noncoreJs: boolean; coreJs: boolean; searchJs: boolean; listJs: boolean } {
   return {
     postSearch: enginePostSearchEnabled(env),
     noncoreJs: admissionNoncoreJsEnabled(env),
     coreJs: jsChainEnabledFor(src, env),
     searchJs: engineSearchJsActive(env),
+    listJs: engineSyntaxListJsEnabled(env),
   };
 }
 
 /**
  * readingPathOnly（ADMISSION_NONCORE_JS 开）：只查阅读路径字段；关时查全部规则组（逐字原口径）。
  * coreJs（ENGINE_SYNTAX_JS on）：无 jsLib 的源里，JS 链白名单字段（parse.ts jsChainFieldAllowed）的 JS
- * 不再整源拒——引擎改由沙箱执行；READING_PATH_JS_FIELDS 与列表字段（bookList/chapterList，链不支持）
- * 照旧拒。coreJs 关时逐字原口径。
+ * 不再整源拒——引擎改由沙箱执行；READING_PATH_JS_FIELDS 照旧拒；列表字段（bookList/chapterList）只在 listJs
+ * （ENGINE_SYNTAX_LIST_JS，listjs1027）同开时放行。coreJs 关时逐字原口径。
  */
-function rulesNoJs(src: RawSource, options: { noncoreJs?: boolean; coreJs?: boolean } = {}): boolean {
+function rulesNoJs(src: RawSource, options: { noncoreJs?: boolean; coreJs?: boolean; listJs?: boolean } = {}): boolean {
   const readingPathOnly = options.noncoreJs === true;
   const jsOk = options.coreJs === true && !hasJsLib(src);
+  const listJsOk = jsOk && options.listJs === true;
   for (const [field, v] of iterRulePairs(src)) {
     if (readingPathOnly && !READING_PATH_FIELDS.has(field)) continue;
     if (!ruleHasJs(v)) continue;
     if (jsOk && jsChainFieldAllowed(field)) continue;
+    if (listJsOk && isAioListField(field)) continue;
     return false;
   }
   return true;
@@ -169,7 +173,7 @@ function searchIsPureGet(su: unknown): boolean {
  * （search-js.ts searchJsConstructible，与运行时同一函数）。须先 await prepareSearchJs()，沙箱未就绪抛 SearchJsNotReadyError。
  */
 export function selectCandidates(
-  data: RawSource[], options: { postSearch?: boolean; noncoreJs?: boolean; coreJs?: boolean; searchJs?: boolean } = {},
+  data: RawSource[], options: { postSearch?: boolean; noncoreJs?: boolean; coreJs?: boolean; searchJs?: boolean; listJs?: boolean } = {},
 ): RawSource[] {
   const out: RawSource[] = [];
   for (const s of data) {
@@ -226,10 +230,12 @@ export function compileCoreFieldsFromRules(
   const failures: CompileResult['failures'] = [];
   // aio1027：与 compileSource 同一判据（列表规则以 `:` 开头的组整组按 AllInOne 解释）。
   const aio = (options.aioEnabled ?? engineSyntaxAioEnabled()) ? aioGroupsFlat(coreRules) : new Set<string>();
+  // listjs1027：同 compileSource（列表规则含 JS 的组，条目字段另挂 objectKey；开关判定在 parseFieldRule 里）。
+  const listJs = listJsGroupsFlat(coreRules);
   for (const [field, rule] of Object.entries(coreRules)) {
     if (typeof rule !== 'string' || !rule.trim()) continue;
     try {
-      parseFieldRule(rule, { ...options, field, aioGroup: aio.has(ruleGroupOf(field)) });
+      parseFieldRule(rule, { ...options, field, aioGroup: aio.has(ruleGroupOf(field)), listJsGroup: listJs.has(ruleGroupOf(field)) });
     } catch (err) {
       if (err instanceof RuleEngineError && err.code === 'RULE_UNSUPPORTED') {
         failures.push({ field, rule, message: err.message, diagnostic: err.diagnostic ?? { code: 'unsupported_rule' } });

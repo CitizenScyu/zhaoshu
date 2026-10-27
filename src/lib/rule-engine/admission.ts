@@ -18,7 +18,7 @@ import {
   admissionSurveyOptions, CORE_FIELDS, enginePostSearchEnabled, engineSearchJsActive, iterRulePairs, jsChainEnabledFor, selectCandidates,
   sourceHasJsChainField, type RawSource,
 } from './compile-smoke';
-import { parseFieldRule } from './parse';
+import { listJsGroups, parseFieldRule } from './parse';
 import {
   createScope, evaluateField, evaluateFieldList, normalizeBody,
 } from './evaluate';
@@ -435,10 +435,14 @@ export function compileAdmission(source: RawSource): AdmissionCompile {
   const rulesSource = engineSyntaxVarsEnabled() ? resolveSourceVars(source) : source;
   // aio1027：与 compileSource 同一判据——列表规则以 `:` 开头的组整组按 AllInOne 解释。
   const aio = engineSyntaxAioEnabled() ? aioGroups(rulesSource) : new Set<string>();
+  // listjs1027：同 compileSource（开关判定在 parseFieldRule 里，jsEnabled 用同一个 coreJs）。
+  const listJs = listJsGroups(rulesSource);
   for (const [field, rule] of iterRulePairs(rulesSource)) {
     if (!(field in coreFieldMask)) continue;
     try {
-      parseFieldRule(rule, { jsEnabled: coreJs, field, aioGroup: aio.has(ruleGroupOf(field)) });
+      parseFieldRule(rule, {
+        jsEnabled: coreJs, field, aioGroup: aio.has(ruleGroupOf(field)), listJsGroup: listJs.has(ruleGroupOf(field)),
+      });
       coreFieldMask[field] = true;
     } catch (error) {
       const message = error instanceof RuleEngineError ? error.message : String(error);
@@ -714,9 +718,10 @@ function searchCandidates(source: RawSource, text: string, pageUrl: string): { t
   if (typeof bookList !== 'string') return [];
   const jsEnabled = jsChainEnabledFor(source);
   const aioGroup = engineSyntaxAioEnabled() && isAioListRule(bookList);
+  const listJsGroup = listJsGroups({ ruleSearch: rules }).has('ruleSearch');
   const parseSafe = (rule: unknown, name?: string) => {
     if (typeof rule !== 'string' || !rule.trim()) return undefined;
-    try { return parseFieldRule(rule, { jsEnabled, field: name, aioGroup }); } catch { return undefined; }
+    try { return parseFieldRule(rule, { jsEnabled, field: name, aioGroup, listJsGroup }); } catch { return undefined; }
   };
   const listIr = parseSafe(bookList, 'ruleSearch.bookList');
   if (!listIr) return [];
@@ -727,6 +732,8 @@ function searchCandidates(source: RawSource, text: string, pageUrl: string): { t
   // HTML 与 JSON 搜索页同一路径（JSON 页 bookList 取列表项，见 evaluateFieldList）。
   let items;
   try { items = evaluateFieldList(listIr, scope); } catch { return []; }
+  // listjs1027：`-` 前缀整表反转（计数口径不去重，反转后取前 MAX_CANDIDATE_SCAN 条，与运行时同向）。
+  if (listIr.reverse === true) items = [...items].reverse();
   const found: { title: string; url: string }[] = [];
   for (let i = 0; i < items.length && i < MAX_CANDIDATE_SCAN; i += 1) {
     const inner = items[i];
@@ -999,6 +1006,7 @@ export async function readabilityShadow(
       try { chapterUrl = rawUrl ? gate(rawUrl, toc.url) : toc.url; } catch { continue; }
       if (title) urls.push(chapterUrl);
     }
+    if (list?.reverse === true) urls.reverse(); // listjs1027：`-` 前缀整表反转（样本章取中位，与运行时同向）
     chapters = urls.length;
     if (chapters === 0) return { verdict: 'toc_empty', chapters, chars: 0, error: list ? '' : 'toc:no_chapter_list' };
     stage = 'content';

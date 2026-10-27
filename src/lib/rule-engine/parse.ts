@@ -21,10 +21,10 @@ import {
   TerminalOp,
 } from './types';
 import { parseJsonPath } from './jsonpath';
-import { isAioListField, isAioListRule, parseAioField } from './aio-syntax';
+import { AIO_LIST_FIELDS, isAioListField, isAioListRule, parseAioField } from './aio-syntax';
 import {
-  engineSyntaxAioEnabled, engineSyntaxAndEnabled, engineSyntaxJsEnabled, engineSyntaxOrEnabled, engineSyntaxRegexEnabled, engineSyntaxXPathEnabled,
-  engineSyntaxXPathEvalEnabled,
+  engineSyntaxAioEnabled, engineSyntaxAndEnabled, engineSyntaxJsEnabled, engineSyntaxListJsEnabled, engineSyntaxOrEnabled, engineSyntaxRegexEnabled,
+  engineSyntaxXPathEnabled, engineSyntaxXPathEvalEnabled,
 } from './syntax-flags';
 import { compileXPath, XPathSyntaxError } from './xpath-eval';
 import { looksLikeXPath, xpathPrefixed, xpathSegmentBody, xpathToCss } from './xpath-subset';
@@ -535,16 +535,38 @@ export interface ParseOptions {
    * 解释（`$N` 捕获组引用）。列表字段自身由规则原文判定，不看这一项。
    */
   aioGroup?: boolean;
+  /** 列表字段（bookList/chapterList）的 JS 段（ENGINE_SYNTAX_LIST_JS，listjs1027；须 jsEnabled）。默认读 env（缺失=off）。 */
+  listJsEnabled?: boolean;
+  /**
+   * 字段所在规则组的列表规则含 JS（listjs1027，调用方按 listJsGroups 判定）：同组条目字段另挂 objectKey，供 JS 返回的
+   * 对象条目按 legado 键值直取。只在 jsEnabled 与 listJsEnabled 同开时生效。
+   */
+  listJsGroup?: boolean;
 }
 
 export function parseFieldRule(rule: string, options: ParseOptions = {}): FieldIr {
+  const field = parseFieldRuleText(rule, options);
+  // listjs1027：对象条目的键值直取只看规则原文（legado getString 遇 NativeObject 不走解析器），与上面的编译结果并存。
+  if (options.listJsGroup === true && options.field !== undefined && !isAioListField(options.field)
+    && (options.jsEnabled ?? engineSyntaxJsEnabled()) && (options.listJsEnabled ?? engineSyntaxListJsEnabled())) {
+    field.objectKey = objectKeyOf(rule);
+  }
+  return field;
+}
+
+function parseFieldRuleText(rule: string, options: ParseOptions): FieldIr {
   if (typeof rule !== 'string') unsupported('规则非字符串', String(rule), { code: 'invalid_rule_type' });
   const trimmed = rule.trim();
   if (trimmed === '') unsupported('空规则', rule, { code: 'empty_rule' });
   // aio1027：AllInOne 组整组换一套解释（Regex 模式下 CSS/JSONPath/JS 都不适用），排在一切方言判定之前。off 态逐字不变。
   if (options.field !== undefined && (options.aioGroup === true || (isAioListField(options.field) && isAioListRule(rule)))
     && (options.aioEnabled ?? engineSyntaxAioEnabled())) return parseAioField(rule, options.field);
-  if (ruleHasJs(trimmed) && (options.jsEnabled ?? engineSyntaxJsEnabled())) return parseJsChain(trimmed, rule, options);
+  if (ruleHasJs(trimmed) && (options.jsEnabled ?? engineSyntaxJsEnabled())) {
+    if (options.field !== undefined && isAioListField(options.field) && (options.listJsEnabled ?? engineSyntaxListJsEnabled())) {
+      return parseListJsChain(rule, options);
+    }
+    return parseJsChain(trimmed, rule, options);
+  }
   if (trimmed.length > MAX_RULE_LENGTH) unsupported('规则过长', rule, { code: 'rule_too_long' });
 
   rejectUnsupportedConstructs(trimmed);
@@ -771,6 +793,127 @@ function parseJsChain(trimmed: string, rule: string, options: ParseOptions): Fie
   }
   pushRule(trimmed.slice(last));
   return { rules: [], chain };
+}
+
+// ---- 列表 JS（listjs1027，ENGINE_SYNTAX_LIST_JS）----
+/** 列表规则含 JS 的规则组（嵌套形态 `{ ruleSearch: { bookList } }`）；AllInOne 列表（`:` 开头）不算。 */
+export function listJsGroups(source: Record<string, unknown>): Set<string> {
+  const groups = new Set<string>();
+  for (const [group, list] of Object.entries(AIO_LIST_FIELDS)) {
+    const fields = source[group];
+    if (fields && typeof fields === 'object' && !Array.isArray(fields)
+      && isListJsRule((fields as Record<string, unknown>)[list])) groups.add(group);
+  }
+  return groups;
+}
+
+/** 扁平形态（`'ruleSearch.bookList' → 规则`）同 listJsGroups。 */
+export function listJsGroupsFlat(rules: Record<string, unknown>): Set<string> {
+  const groups = new Set<string>();
+  for (const [group, list] of Object.entries(AIO_LIST_FIELDS)) {
+    if (isListJsRule(rules[`${group}.${list}`])) groups.add(group);
+  }
+  return groups;
+}
+
+function isListJsRule(rule: unknown): boolean {
+  return typeof rule === 'string' && ruleHasJs(rule) && !isAioListRule(rule);
+}
+
+/**
+ * 列表字段的 JS 链（legado AnalyzeRule.getElements）。先按 BookList/BookChapterList 对原文剥一个 `-`（整表反转）再剥一个
+ * `+`，之后按 splitSourceRule 切段。只收两种形态：
+ * - 一到多段 JS：末段返回数组，逐项成为条目（js-sandbox runJsItems）；
+ * - 一到多段 JS + 一段规则：JS 产出字符串，规则段把它重新解析成列表（规则段的模式见 ChainStage.mode）。
+ * 首段是规则（节点/JSON 对象要 Java 互操作才读得动）、JS 段之间夹规则段、纯正则段一律拒。
+ */
+function parseListJsChain(rule: string, options: ParseOptions): FieldIr {
+  const reject = (why: string): never => unsupported(`列表 JS ${why}`, rule, { code: 'unsupported_js' });
+  let text = rule;
+  const reverse = text.startsWith('-');
+  if (reverse) text = text.slice(1);
+  if (text.startsWith('+')) text = text.slice(1);
+  text = text.trim();
+  if (text.length > MAX_JS_RULE_LENGTH) unsupported('规则过长', rule, { code: 'rule_too_long' });
+  const chain: ChainStage[] = [];
+  let last = 0;
+  for (const match of text.matchAll(JS_SEGMENT_RE)) {
+    if (text.slice(last, match.index).trim() !== '') reject(chain.length === 0 ? '首段不是 JS' : 'JS 段之间夹规则段');
+    const code = match[1] ?? match[2] ?? '';
+    checkJsCode(code, rule, false);
+    chain.push({ kind: 'js', code });
+    last = match.index + match[0].length;
+  }
+  if (chain.length === 0) reject('没有 JS 段');
+  const tail = text.slice(last).trim();
+  if (tail !== '') chain.push(listRuleStage(tail, rule, options, reject));
+  const field: FieldIr = { rules: [], chain };
+  if (reverse) field.reverse = true;
+  return field;
+}
+
+/**
+ * 列表 JS 链的末段规则。getElements 不调 makeUpRule：`##`/`{{}}`/`@get` 原样留在选择器里，`$N` 把整段切成 Regex 模式——
+ * 都不猜，拒。前缀按 SourceRule 构造的顺序判模式；`@CSS:` 规范成解析器认的小写，`@@`/`@Json:` 剥掉。
+ */
+function listRuleStage(tail: string, rule: string, options: ParseOptions, reject: (why: string) => never): ChainStage {
+  if (tail.includes('##') || tail.includes('{{') || /@(?:get|put):/i.test(tail) || /\$\d/.test(tail) || tail.startsWith(':')) {
+    reject('末段规则含 ##/{{}}/@get/@put/$N/`:`');
+  }
+  let body = tail;
+  let mode: 'json' | 'html' | 'default' = 'default';
+  if (/^@css:/i.test(body)) {
+    mode = 'html';
+    body = `@css:${body.slice(5)}`;
+  } else if (body.startsWith('@@')) {
+    mode = 'html';
+    body = body.slice(2);
+  } else if (/^@xpath:/i.test(body) || body.startsWith('/')) {
+    mode = 'html';
+  } else if (/^@json:/i.test(body)) {
+    mode = 'json';
+    body = body.slice(6);
+  } else if (body.startsWith('$.') || body.startsWith('$[')) {
+    mode = 'json';
+  }
+  if (body.trim() === '') reject('末段规则为空');
+  const field = parseFieldRule(body, {
+    orEnabled: options.orEnabled, xpathEnabled: options.xpathEnabled, xpathEvalEnabled: options.xpathEvalEnabled, jsEnabled: false,
+    regexEnabled: options.regexEnabled, andEnabled: options.andEnabled, aioEnabled: false, field: options.field,
+  });
+  return { kind: 'rule', field, mode };
+}
+
+/** legado JS_PATTERN 的首个 JS 段（非全局，objectKeyOf 用）。 */
+const FIRST_JS_SEGMENT_RE = /<js>([\w\W]*?)<\/js>|@js:([\w\W]*)/i;
+
+/**
+ * 对象条目上的键值直取（legado AnalyzeRule.getString 的 NativeObject 分支）：只用首个 SourceRule——JS 段之前的规则文本。
+ * SourceRule 构造剥 `@@`/`@XPath:`/`@Json:`（`@CSS:` 与 `$.` 留在文本里，于是成了取不到的键），makeUpRule 再按 Kotlin
+ * split("##") 切出键（trim）与替换（≥4 段即 replaceFirst）。首段即 JS 时首个 SourceRule 是 Js 模式、规则文本就是 JS 代码，
+ * legado 照样拿它当键（不执行）。@put/@get/{{}}/`$N`（模板拼值）不复现。
+ */
+function objectKeyOf(rule: string): NonNullable<FieldIr['objectKey']> {
+  const js = FIRST_JS_SEGMENT_RE.exec(rule);
+  let head = (js ? rule.slice(0, js.index) : rule).trim();
+  if (head === '' && js) head = js[1] ?? js[2] ?? '';
+  else if (head.startsWith('@@')) head = head.slice(2);
+  else if (/^@xpath:/i.test(head)) head = head.slice(7);
+  else if (/^@json:/i.test(head)) head = head.slice(6);
+  const parts = head.split('##');
+  if (/@(?:put|get):/i.test(head) || head.includes('{{') || /\$\d/.test(parts[0])) return { unsupported: '模板/变量/$N' };
+  const key = parts[0].trim();
+  if (parts.length < 2 || parts[1] === '') return { key };
+  const pattern = parts[1];
+  if (pattern.length > MAX_REGEX_PATTERN_LENGTH) return { unsupported: '正则 pattern 过长' };
+  try {
+    new RegExp(pattern, 'g');
+  } catch {
+    return { unsupported: '正则 pattern 无法编译' };
+  }
+  const regex: RegexSub = { pattern, replacement: parts[2] ?? '' };
+  if (parts.length > 3) regex.first = true;
+  return { key, regex };
 }
 
 /** JS 段的编译期白名单（沙箱内的二道防线见 js-sandbox.ts）。 */

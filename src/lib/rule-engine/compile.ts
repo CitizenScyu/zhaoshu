@@ -8,11 +8,11 @@ import { upgradeSourceTemplateUrl } from '@/lib/source-policy';
 import { sourceRevision } from '@/lib/source-revision';
 import { engineSearchJsActive } from './compile-smoke';
 import { aioGroups } from './aio-syntax';
-import { jsChainFieldAllowed, parseFieldRule, ruleHasJs, type ParseOptions } from './parse';
+import { jsChainFieldAllowed, listJsGroups, parseFieldRule, ruleHasJs, type ParseOptions } from './parse';
 import type { CompiledRules, FieldIr, RuleIr } from './types';
 import {
-  engineSemanticsVersion, engineSyntaxAioEnabled, engineSyntaxAndEnabled, engineSyntaxJsEnabled, engineSyntaxOrEnabled, engineSyntaxRegexEnabled,
-  engineSyntaxVarsEnabled, engineSyntaxXPathEnabled, engineSyntaxXPathEvalEnabled, ENGINE_SEMANTICS_VERSION,
+  engineSemanticsVersion, engineSyntaxAioEnabled, engineSyntaxAndEnabled, engineSyntaxJsEnabled, engineSyntaxListJsEnabled, engineSyntaxOrEnabled,
+  engineSyntaxRegexEnabled, engineSyntaxVarsEnabled, engineSyntaxXPathEnabled, engineSyntaxXPathEvalEnabled, ENGINE_SEMANTICS_VERSION,
 } from './syntax-flags';
 import { resolveSourceVars, ruleMayUseVars } from './vars-subset';
 import { ruleMayUseXPath } from './xpath-subset';
@@ -42,6 +42,7 @@ export function engineVersionedKey(contentRevision: string, semanticsVersion = E
  * and1027：ENGINE_SYNTAX_AND（须 OR）on 且有 off 态因 && 被拒的字段在 on 态编译通过时再加 && 位（65–128）。
  * aio1027：ENGINE_SYNTAX_AIO on 且 bookList/chapterList 以 `:` 开头时再加 AllInOne 位（129–256）。
  * searchjs1027：搜索模板 JS 生效且该源 searchUrl 旧口径构造不出、需 JS（searchTemplateNeedsJs）时再加搜索 JS 位（257–512）。
+ * listjs1027：ENGINE_SYNTAX_LIST_JS on、JS 链对该源生效（ENGINE_SYNTAX_JS on、无 jsLib）且 bookList/chapterList 含 JS 段时再加列表 JS 位（513–1024）。
  */
 export function engineSourceRevision(
   source: { url: string; searchUrl: unknown; rules: Record<string, unknown> },
@@ -56,21 +57,23 @@ export function engineSourceRevision(
   const andEnabled = options.andEnabled ?? engineSyntaxAndEnabled();
   const aioEnabled = options.aioEnabled ?? engineSyntaxAioEnabled();
   const searchJsEnabled = options.searchJsEnabled ?? engineSearchJsActive();
+  const listJsEnabled = options.listJsEnabled ?? engineSyntaxListJsEnabled();
   const jsChain = jsEnabled && !sourceHasJsLib(source.rules);
   return engineVersionedKey(sourceRevision(source), engineSemanticsVersion(
     orEnabled && sourceUsesOrSyntax(source.rules),
     xpathEnabled && sourceUsesXPathSyntax(source.rules),
     varsEnabled && sourceUsesVarSyntax(source.rules),
     jsEnabled && sourceUsesJsSyntax(source.rules),
-    xpathEnabled && xpathEval && sourceUsesXPathEval(source.rules, { orEnabled, varsEnabled, jsEnabled: jsChain }),
+    xpathEnabled && xpathEval && sourceUsesXPathEval(source.rules, { orEnabled, varsEnabled, jsEnabled: jsChain, listJsEnabled }),
     regexEnabled && sourceUsesRegexSyntax(source.rules, {
-      orEnabled, varsEnabled, jsEnabled: jsChain, xpathEnabled, xpathEvalEnabled: xpathEval,
+      orEnabled, varsEnabled, jsEnabled: jsChain, xpathEnabled, xpathEvalEnabled: xpathEval, listJsEnabled,
     }),
     orEnabled && andEnabled && sourceUsesAndSyntax(source.rules, {
-      varsEnabled, jsEnabled: jsChain, xpathEnabled, xpathEvalEnabled: xpathEval, regexEnabled,
+      varsEnabled, jsEnabled: jsChain, xpathEnabled, xpathEvalEnabled: xpathEval, regexEnabled, listJsEnabled,
     }),
     aioEnabled && sourceUsesAioSyntax(source.rules),
     searchJsEnabled && searchTemplateNeedsJs(source.searchUrl, upgradeSourceTemplateUrl(source.url)),
+    jsChain && listJsEnabled && sourceUsesListJsSyntax(source.rules),
   ));
 }
 
@@ -147,10 +150,11 @@ const xpathEvalMemo = new WeakMap<object, Map<string, boolean>>();
  */
 export function sourceUsesXPathEval(
   rules: Record<string, unknown>,
-  options: { orEnabled: boolean; varsEnabled: boolean; jsEnabled: boolean },
+  options: { orEnabled: boolean; varsEnabled: boolean; jsEnabled: boolean; listJsEnabled?: boolean },
 ): boolean {
   if (!someRule(rules, ruleMayUseXPath)) return false;
-  const memoKey = `${options.orEnabled}:${options.varsEnabled}:${options.jsEnabled}`;
+  const listJsEnabled = options.listJsEnabled === true;
+  const memoKey = `${options.orEnabled}:${options.varsEnabled}:${options.jsEnabled}:${listJsEnabled}`;
   let memo = xpathEvalMemo.get(rules);
   const hit = memo?.get(memoKey);
   if (hit !== undefined) return hit;
@@ -163,7 +167,7 @@ export function sourceUsesXPathEval(
       if (typeof rule !== 'string' || !rule.trim() || !ruleMayUseXPath(rule)) continue;
       try {
         const ir = parseFieldRule(rule, {
-          orEnabled: options.orEnabled, xpathEnabled: true, xpathEvalEnabled: true, jsEnabled: options.jsEnabled,
+          orEnabled: options.orEnabled, xpathEnabled: true, xpathEvalEnabled: true, jsEnabled: options.jsEnabled, listJsEnabled,
           field: `${group}.${field}`,
         });
         if (fieldUsesXPathEval(ir)) {
@@ -197,10 +201,13 @@ const regexMemo = new WeakMap<object, Map<string, boolean>>();
  */
 export function sourceUsesRegexSyntax(
   rules: Record<string, unknown>,
-  options: { orEnabled: boolean; varsEnabled: boolean; jsEnabled: boolean; xpathEnabled: boolean; xpathEvalEnabled: boolean },
+  options: {
+    orEnabled: boolean; varsEnabled: boolean; jsEnabled: boolean; xpathEnabled: boolean; xpathEvalEnabled: boolean; listJsEnabled?: boolean;
+  },
 ): boolean {
   if (!someRule(rules, (rule) => rule.includes('##'))) return false;
-  const memoKey = `${options.orEnabled}:${options.varsEnabled}:${options.jsEnabled}:${options.xpathEnabled}:${options.xpathEvalEnabled}`;
+  const listJsEnabled = options.listJsEnabled === true;
+  const memoKey = `${options.orEnabled}:${options.varsEnabled}:${options.jsEnabled}:${options.xpathEnabled}:${options.xpathEvalEnabled}:${listJsEnabled}`;
   let memo = regexMemo.get(rules);
   const hit = memo?.get(memoKey);
   if (hit !== undefined) return hit;
@@ -214,7 +221,7 @@ export function sourceUsesRegexSyntax(
       try {
         const ir = parseFieldRule(rule, {
           orEnabled: options.orEnabled, xpathEnabled: options.xpathEnabled, xpathEvalEnabled: options.xpathEvalEnabled,
-          jsEnabled: options.jsEnabled, regexEnabled: true, field: `${group}.${field}`,
+          jsEnabled: options.jsEnabled, regexEnabled: true, listJsEnabled, field: `${group}.${field}`,
         });
         if (fieldUsesRegexSyntax(ir)) {
           uses = true;
@@ -241,6 +248,14 @@ export function sourceUsesAioSyntax(rules: Record<string, unknown>): boolean {
   return aioGroups(rules).size > 0;
 }
 
+/**
+ * 源是否会因 ENGINE_SYNTAX_LIST_JS 改变编译结果（listjs1027）：无 jsLib 且 bookList/chapterList 含 JS 段（AllInOne `:` 列表不算）。
+ * off 态这类列表恒编译失败；on 态列表与同组条目字段（另挂 objectKey）都换了编译产物。调用方还须确认 ENGINE_SYNTAX_JS on。
+ */
+export function sourceUsesListJsSyntax(rules: Record<string, unknown>): boolean {
+  return !sourceHasJsLib(rules) && listJsGroups(rules).size > 0;
+}
+
 const andMemo = new WeakMap<object, Map<string, boolean>>();
 
 /**
@@ -250,10 +265,13 @@ const andMemo = new WeakMap<object, Map<string, boolean>>();
  */
 export function sourceUsesAndSyntax(
   rules: Record<string, unknown>,
-  options: { varsEnabled: boolean; jsEnabled: boolean; xpathEnabled: boolean; xpathEvalEnabled: boolean; regexEnabled: boolean },
+  options: {
+    varsEnabled: boolean; jsEnabled: boolean; xpathEnabled: boolean; xpathEvalEnabled: boolean; regexEnabled: boolean; listJsEnabled?: boolean;
+  },
 ): boolean {
   if (!someRule(rules, (rule) => rule.includes('&&'))) return false;
-  const memoKey = `${options.varsEnabled}:${options.jsEnabled}:${options.xpathEnabled}:${options.xpathEvalEnabled}:${options.regexEnabled}`;
+  const listJsEnabled = options.listJsEnabled === true;
+  const memoKey = `${options.varsEnabled}:${options.jsEnabled}:${options.xpathEnabled}:${options.xpathEvalEnabled}:${options.regexEnabled}:${listJsEnabled}`;
   let memo = andMemo.get(rules);
   const hit = memo?.get(memoKey);
   if (hit !== undefined) return hit;
@@ -267,7 +285,7 @@ export function sourceUsesAndSyntax(
       const name = `${group}.${field}`;
       const parse = (andEnabled: boolean) => parseFieldRule(rule, {
         orEnabled: true, xpathEnabled: options.xpathEnabled, xpathEvalEnabled: options.xpathEvalEnabled,
-        jsEnabled: options.jsEnabled, regexEnabled: options.regexEnabled, andEnabled, field: name,
+        jsEnabled: options.jsEnabled, regexEnabled: options.regexEnabled, andEnabled, listJsEnabled, field: name,
       });
       try {
         parse(true);
@@ -315,8 +333,9 @@ export function compileSource(
   const regexEnabled = options.regexEnabled ?? engineSyntaxRegexEnabled();
   const andEnabled = options.andEnabled ?? engineSyntaxAndEnabled();
   const aioEnabled = options.aioEnabled ?? engineSyntaxAioEnabled();
+  const listJsEnabled = options.listJsEnabled ?? engineSyntaxListJsEnabled();
   const key = engineSourceRevision(source, {
-    orEnabled, xpathEnabled, varsEnabled, jsEnabled, xpathEvalEnabled, regexEnabled, andEnabled, aioEnabled,
+    orEnabled, xpathEnabled, varsEnabled, jsEnabled, xpathEvalEnabled, regexEnabled, andEnabled, aioEnabled, listJsEnabled,
   });
   const hit = cache.get(key);
   if (hit) {
@@ -327,6 +346,8 @@ export function compileSource(
   const compiled: CompiledRules = new Map();
   const sourceRules = varsEnabled ? resolveSourceVars(source.rules) : source.rules;
   const aio = aioEnabled ? aioGroups(sourceRules) : new Set<string>();
+  // listjs1027：列表规则含 JS 的组，条目字段另挂对象条目键值直取（parse.ts objectKeyOf）。
+  const listJs = jsEnabled && listJsEnabled ? listJsGroups(sourceRules) : new Set<string>();
   for (const group of RULE_GROUPS) {
     const rules = sourceRules[group];
     if (!rules || typeof rules !== 'object' || Array.isArray(rules)) continue;
@@ -336,7 +357,7 @@ export function compileSource(
       try {
         compiled.set(name, parseFieldRule(rule, {
           orEnabled, xpathEnabled, xpathEvalEnabled, jsEnabled, regexEnabled, andEnabled, aioEnabled, aioGroup: aio.has(group),
-          field: name,
+          listJsEnabled, listJsGroup: listJs.has(group), field: name,
         }));
       } catch {
         compiled.set(name, { skipped: 'unsupported' });

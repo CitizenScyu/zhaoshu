@@ -114,7 +114,9 @@ export async function engineSearchBook(
   const items = evaluateFieldList(list, scope);
   const results: EngineSearchResult[] = [];
   const seen = new Set<string>();
-  for (let index = 0; index < items.length && results.length < MAX_SEARCH_CANDIDATES; index += 1) {
+  // listjs1027：`-` 前缀 = legado BookList 去重（保留首次出现）后整表反转，先收全再反转、截候选上限。
+  const reverse = list.reverse === true;
+  for (let index = 0; index < items.length && (reverse || results.length < MAX_SEARCH_CANDIDATES); index += 1) {
     const inner = items[index];
     const name = evaluateText(source.compiled, 'ruleSearch.name', inner);
     const bookUrl = absoluteUrl(evaluateText(source.compiled, 'ruleSearch.bookUrl', inner), page.url);
@@ -122,7 +124,7 @@ export async function engineSearchBook(
     seen.add(bookUrl);
     results.push({ title: name, author: evaluateText(source.compiled, 'ruleSearch.author', inner), bookUrl });
   }
-  return results;
+  return reverse ? results.reverse().slice(0, MAX_SEARCH_CANDIDATES) : results;
 }
 
 /**
@@ -235,6 +237,8 @@ export async function engineFetchToc(
     if (strict && rawNext.trim() && !next) throw new Error('invalid_next_page');
   }
   if (strict && (next || fanout.length > 0 || seenUrls.size > MAX_SOURCE_CHAPTERS)) throw new Error('toc_limit');
+  // listjs1027：`-` 前缀时 legado 跳过去重前的那次反转，净效果 = 全部页的条目整表反转后再走下面的去重。
+  if (field(source.compiled, 'ruleToc.chapterList')?.reverse === true) entries.reverse();
   // 保留每个 url 的**最后一次**出现。最后一次出现的位置严格递增，故按原序过滤即得 legado 净顺序。
   const lastIndex = new Map<string, number>();
   entries.forEach((chapter, index) => lastIndex.set(chapter.url, index));
