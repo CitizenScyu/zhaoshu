@@ -63,19 +63,48 @@ describe('resolveSourceVars 改写', () => {
     expect(resolveSourceVars(plain)).toBe(plain);
   });
 
-  it('子集外不内联、残留 @get：init 带剩余规则 / put 解析失败 / 键缺失 / 内置键 / 非整条 / 跨阶段', () => {
+  it('子集外不内联、残留 @get：init 带剩余规则 / put 解析失败 / 键缺失 / 内置键 / 非整条 / 键带空白 / 跨阶段', () => {
     const variant = (bookInfo: Record<string, string>, extra: Record<string, unknown> = {}) =>
       resolveSourceVars({ ...SRC, ruleBookInfo: bookInfo, ...extra }) as typeof SRC & Record<string, Record<string, string>>;
     expect(variant({ init: '.box@put:{n:"h1@text"}', name: '@get:{n}' }).ruleBookInfo.name).toBe('@get:{n}');
     expect(variant({ init: '@put:{n:a/b}', name: '@get:{n}' }).ruleBookInfo.name).toBe('@get:{n}');
     expect(variant({ init: '@put:{n:"h1@text"}', name: '@get:{m}' }).ruleBookInfo.name).toBe('@get:{m}');
     expect(variant({ init: '@put:{bookName:"h1@text"}', name: '@get:{bookName}' }).ruleBookInfo.name).toBe('@get:{bookName}');
-    expect(variant({ init: '@put:{n:"h1@text"}', name: '@get:{n}##书名：' }).ruleBookInfo.name).toBe('@get:{n}##书名：');
+    expect(variant({ init: '@put:{n:"h1@text"}', name: '@get:{n}·@get:{n}' }).ruleBookInfo.name).toBe('@get:{n}·@get:{n}');
+    expect(variant({ init: '@put:{n:"h1@text"}', name: '@get:{ n }' }).ruleBookInfo.name).toBe('@get:{ n }');
     const cross = variant({ name: 'h1@text@put:{bid:"[data-id]@data-id"}' }, {
       ruleToc: { chapterList: '#list a', chapterName: '@text', chapterUrl: '/read/@get:{bid}/{{$.id}}' },
     });
     expect(cross.ruleBookInfo.name).toBe('h1@text');
     expect(cross.ruleToc.chapterUrl).toBe('/read/@get:{bid}/{{$.id}}');
+  });
+
+  it('`@get:{k}##正则` 后缀：put 规则无 ## 时内联为 规则##正则；put 规则自带 ## 时不内联', () => {
+    const out = resolveSourceVars({ ruleBookInfo: {
+      init: '@put:{a:"[property$=author]@content",l:"h2@text##最新："}', author: '@get:{a}##作者：', lastChapter: '@get:{l}##章节',
+    } });
+    expect(out.ruleBookInfo).toMatchObject({ author: '[property$=author]@content##作者：', lastChapter: '@get:{l}##章节' });
+  });
+
+  it('按 legado 求值顺序：搜索条目内前字段 put → 后字段 get 内联；后字段 put、bookList put 不内联', () => {
+    const out = resolveSourceVars({ ruleSearch: {
+      bookList: 'tbody tr@put:{p:"title@text"}',
+      name: '@get:{h}', author: '@get:{p}',
+      wordCount: 'class.odd.1@text@put:{h:"tag.a.0@href"}',
+      bookUrl: '@get:{h}',
+    } });
+    expect(out.ruleSearch).toEqual({
+      bookList: 'tbody tr', name: '@get:{h}', author: '@get:{p}', wordCount: 'class.odd.1@text', bookUrl: 'tag.a.0@href',
+    });
+  });
+
+  it('详情页：无 init 时前字段 put 可内联；put-only init 之后的字段 put 在空内容上求值，不内联', () => {
+    const noInit = resolveSourceVars({ ruleBookInfo: { name: 'h1@text@put:{bid:"[data-id]@data-id"}', tocUrl: '@get:{bid}' } });
+    expect(noInit.ruleBookInfo).toEqual({ name: 'h1@text', tocUrl: '[data-id]@data-id' });
+    const putInit = resolveSourceVars({ ruleBookInfo: {
+      init: '@put:{n:"h1@text"}', name: '@get:{n}@put:{n:"h2@text",t:"a.toc@href"}', author: '@get:{n}', tocUrl: '@get:{t}',
+    } });
+    expect(putInit.ruleBookInfo).toEqual({ init: '', name: 'h1@text', author: '@get:{n}', tocUrl: '@get:{t}' });
   });
 
   it('多个 put 块依次合并、后者覆盖前者（同 legado 依次 put）', () => {
@@ -136,6 +165,13 @@ describe('compile / 准入接线', () => {
     const on = compileSource(engineSource, { varsEnabled: true });
     const value = (name: string) => evaluateField(on.get(name) as Parameters<typeof evaluateField>[0], page);
     expect([value('ruleBookInfo.name'), value('ruleBookInfo.author'), value('ruleBookInfo.lastChapter')]).toEqual(['书名甲', '作者乙', '第九章']);
+  });
+
+  it('`@get:{k}##正则` 内联后先取值再替换（legado makeUpRule：变量值拼回规则后按 ## 切出正则）', () => {
+    const rules = { ...SRC, ruleBookInfo: { init: '@put:{a:"[property$=author]@content"}', name: 'h1@text', author: '@get:{a}##作者：' } };
+    const on = compileSource({ url: SRC.bookSourceUrl, searchUrl: SRC.searchUrl, rules: rules as unknown as Record<string, unknown> }, { varsEnabled: true });
+    const page = createHtmlScope('<html><head><meta property="og:novel:author" content="作者：丙"></head><body><h1>书</h1></body></html>', 'https://vars.example/b/2');
+    expect(evaluateField(on.get('ruleBookInfo.author') as Parameters<typeof evaluateField>[0], page)).toBe('丙');
   });
 
   it('compileAdmission / rulesHash 读 env：off 拒 @get，on 通过且版本前缀为 5', () => {

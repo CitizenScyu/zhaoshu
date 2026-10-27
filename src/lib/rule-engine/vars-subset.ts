@@ -5,7 +5,8 @@
 // `@get:{k}` 读变量；get() 先认内置键 bookName/title，其后才是 put 进来的值。
 // 子集（10-27 离线统计 5371 源，@get/@put 拒 76 源 / 48 host 中占大头的写法）：
 //   ruleBookInfo.init 只由 @put:{...} 组成时，同组字段整条恰为 `@get:{k}` 的，就地换成 put 里 k 的规则——
-//   put 与 get 都在详情页这一页上求值，内联与 legado 同值。跨阶段（搜索页 put、目录/正文 get）要运行时变量袋，
+//   put 与 get 都在详情页这一页上求值，内联与 legado 同值。vars2-1027 起推广到同组按求值顺序推演（搜索条目内
+//   前字段 put → 后字段 get；`@get:{k}##正则` 后缀）。跨阶段（搜索页 put、目录/正文 get）要运行时变量袋，
 //   不在子集内，残留 @get 照旧拒。
 
 const RULE_GROUPS = ['ruleSearch', 'ruleBookInfo', 'ruleContent', 'ruleToc', 'ruleExplore'] as const;
@@ -82,20 +83,73 @@ export function parsePutMap(text: string): Map<string, string> | null {
   return i === text.length ? map : null;
 }
 
-/** ruleBookInfo.init 只由 @put:{...} 组成时合并出 put 表（后者覆盖前者，同 legado 依次 put）；否则 undefined。 */
-function initPutMap(init: unknown): Map<string, string> | undefined {
-  if (typeof init !== 'string' || init.replace(PUT_RE, '').trim() !== '') return undefined;
+/**
+ * legado 对单本书逐字段求值的顺序（BookList.getSearchItem / BookInfo.analyzeBookInfo，取证快照 Jer-Chao@c2c4775）。
+ * 同一条目/同一页上，前面字段的 @put 对后面字段的 @get 可见；列表外字段（bookList 等）在逐条目求值之前、对整页求值。
+ */
+const FIELD_ORDER: Partial<Record<(typeof RULE_GROUPS)[number], readonly string[]>> = {
+  ruleSearch: ['name', 'author', 'kind', 'wordCount', 'lastChapter', 'intro', 'coverUrl', 'bookUrl'],
+  ruleBookInfo: ['init', 'name', 'author', 'kind', 'wordCount', 'lastChapter', 'intro', 'coverUrl', 'tocUrl', 'downloadUrls'],
+};
+
+/** 规则里全部 @put 块合并成的表（后者覆盖前者，同 legado 依次 put）；任一块解析不了返回 null。 */
+function rulePuts(rule: string): Map<string, string> | null {
   const merged = new Map<string, string>();
-  for (const match of init.matchAll(PUT_RE)) {
+  for (const match of rule.matchAll(PUT_RE)) {
     const map = parsePutMap(match[0].slice('@put:'.length));
-    if (!map) return undefined;
+    if (!map) return null;
     for (const [key, value] of map) merged.set(key, value);
   }
-  return merged.size > 0 ? merged : undefined;
+  return merged;
 }
 
 /**
- * 源规则改写（开关 on 时编译前调用）：各组字段剥 @put；ruleBookInfo 内整条 `@get:{k}` 按 init 的 put 表内联。
+ * 按求值顺序推演每个字段读 @get 时变量的值：值为规则串 = 与该字段同一内容上求值、可内联；
+ * null = 不可内联（列表前整页求值、详情页 init 换内容后求值、或有解析不了的 put 致键集未知）。
+ */
+function inlineGroup(group: string, fields: Record<string, unknown>): Record<string, unknown> {
+  const order = FIELD_ORDER[group as keyof typeof FIELD_ORDER] ?? [];
+  const known = new Map<string, string | null>();
+  let unknownPuts = false;
+  const record = (rule: unknown, inlinable: boolean) => {
+    if (typeof rule !== 'string' || !/@put:/i.test(rule)) return;
+    const puts = rulePuts(rule);
+    if (!puts) { unknownPuts = true; return; }
+    for (const [key, value] of puts) known.set(key, inlinable ? value : null);
+  };
+  // 列表外字段（bookList/checkKeyWord…）先于逐条目字段、在整页上求值：值与条目内容不同，不可内联。
+  for (const [name, rule] of Object.entries(fields)) if (!order.includes(name)) record(rule, false);
+  // 详情页 init：只由 @put 组成时 put 在整页上求值（可内联），随后 legado 把内容换成空结果，
+  // 后续字段的 put 在空内容上求值（不可内联）；init 带剩余规则时内容换成 init 结果、引擎不跟随，整组不内联。
+  const init = fields.init;
+  const initPutOnly = typeof init === 'string' && init.replace(PUT_RE, '').trim() === '' && /@put:/i.test(init);
+  if (group === 'ruleBookInfo' && typeof init === 'string' && init.trim() && !initPutOnly) unknownPuts = true;
+
+  const next: Record<string, unknown> = { ...fields };
+  for (const name of order) {
+    const rule = fields[name];
+    if (typeof rule !== 'string') continue;
+    if (name !== 'init' && !unknownPuts) {
+      const body = rule.replace(PUT_RE, '').trim();
+      const cut = body.indexOf('##');
+      const suffix = cut < 0 ? '' : body.slice(cut);
+      // legado 取 `@get:{` 与 `}` 之间原样作键（不 trim），`{ n }` 读不到 put 的 n。
+      const key = GET_WHOLE_RE.exec((cut < 0 ? body : body.slice(0, cut)).trim())?.[1];
+      const value = key === undefined || RESERVED_GET_KEYS.has(key) ? undefined : known.get(key);
+      // `@get:{k}##正则`：legado 取变量值后再做替换；put 规则自身带 ## 时两段正则会串，不内联。
+      if (typeof value === 'string' && !(suffix && value.includes('##'))) next[name] = value + suffix;
+    }
+    record(rule, name === 'init' || group !== 'ruleBookInfo' || !initPutOnly);
+  }
+  for (const [name, rule] of Object.entries(next)) {
+    if (typeof rule === 'string' && /@put:/i.test(rule)) next[name] = rule.replace(PUT_RE, '');
+  }
+  return next;
+}
+
+/**
+ * 源规则改写（开关 on 时编译前调用）：各组字段剥 @put；ruleSearch/ruleBookInfo 内整条 `@get:{k}`（可带 `##正则`
+ * 后缀）按 legado 求值顺序推演出与该字段同内容的 put 规则时就地内联。
  * 不涉及变量的源原样返回（同一对象），涉及的返回浅拷贝，不改入参。
  */
 export function resolveSourceVars<T extends object>(rules: T): T {
@@ -104,20 +158,9 @@ export function resolveSourceVars<T extends object>(rules: T): T {
   for (const group of RULE_GROUPS) {
     const fields = source[group];
     if (!fields || typeof fields !== 'object' || Array.isArray(fields)) continue;
-    const entries = Object.entries(fields as Record<string, unknown>);
-    if (!entries.some(([, rule]) => typeof rule === 'string' && ruleMayUseVars(rule))) continue;
-    const puts = group === 'ruleBookInfo' ? initPutMap((fields as Record<string, unknown>).init) : undefined;
-    const next: Record<string, unknown> = {};
-    for (const [name, rule] of entries) {
-      if (typeof rule !== 'string' || !ruleMayUseVars(rule)) { next[name] = rule; continue; }
-      let value = rule.replace(PUT_RE, '');
-      const get = name === 'init' ? null : GET_WHOLE_RE.exec(value.trim());
-      const key = get?.[1].trim();
-      if (key !== undefined && !RESERVED_GET_KEYS.has(key) && puts?.has(key)) value = puts.get(key)!;
-      next[name] = value;
-    }
+    if (!Object.values(fields).some((rule) => typeof rule === 'string' && ruleMayUseVars(rule))) continue;
     out ??= { ...source };
-    out[group] = next;
+    out[group] = inlineGroup(group, fields as Record<string, unknown>);
   }
   return (out ?? rules) as T;
 }
