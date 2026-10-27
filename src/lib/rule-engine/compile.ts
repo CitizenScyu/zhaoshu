@@ -3,7 +3,7 @@
 // 缓存键 = 语义版本化 sourceRevision（P0 引入 engineVersionedKey；P1a 起语义版本随
 // ENGINE_SYNTAX_OR 联动——off=1 / on=2）：规则原文或引擎语义任一变化，键即变，旧编译
 // 产物自然失效，不存在「|| 开关打开后仍复用 off 态编译缓存」的窗口。
-import { searchOptionsNeedParity, searchTemplateNeedsJs } from '@/lib/source-parser';
+import { searchOptionsMayUseWebView, searchOptionsNeedParity, searchTemplateNeedsJs } from '@/lib/source-parser';
 import { upgradeSourceTemplateUrl } from '@/lib/source-policy';
 import { sourceRevision } from '@/lib/source-revision';
 import { engineSearchJsActive, engineSearchOptionsActive } from './compile-smoke';
@@ -14,6 +14,7 @@ import {
   engineSemanticsVersion, engineSyntaxAioEnabled, engineSyntaxAndEnabled, engineSyntaxInitEnabled, engineSyntaxJsBindEnabled, engineSyntaxJsEnabled,
   engineSyntaxJsExtEnabled, engineSyntaxJsGetEnabled, engineSyntaxJsonPathEnabled, engineSyntaxJsUtilEnabled, engineSyntaxListJsEnabled,
   engineSyntaxOrEnabled, engineSyntaxRegexEnabled, engineSyntaxVarsEnabled, engineSyntaxXPathEnabled, engineSyntaxXPathEvalEnabled, engineUrlOptionsEnabled,
+  engineSearchWebViewEnabled,
   ENGINE_SEMANTICS_VERSION,
 } from './syntax-flags';
 import { urlOptionFields } from './url-options';
@@ -33,6 +34,8 @@ export interface CompileOptions extends ParseOptions {
   searchOptionsEnabled?: boolean;
   /** urlopt1028：URL 字段选项后缀（ENGINE_URL_OPTIONS，默认读 env）。只给 urlOptionFields 判出的字段挂 FieldIr.urlOptions。 */
   urlOptionsEnabled?: boolean;
+  /** searchwv1028：搜索选项 webView 当普通请求（ENGINE_SEARCH_WEBVIEW，默认读 env；须搜索选项 legado 口径同生效）。只影响语义版本位。 */
+  searchWebViewEnabled?: boolean;
 }
 
 /** 版本化缓存键（P0 口径）：semanticsVersion:contentRevision。 */
@@ -60,6 +63,7 @@ export function engineVersionedKey(contentRevision: string, semanticsVersion = E
  * init1028：ENGINE_SYNTAX_INIT on 且 ruleBookInfo.init 可复现（sourceUsesInitSyntax）时再加 init 位（32769–65536）。
  * searchopt1028：搜索选项 legado 口径生效且该源 searchUrl 的选项被旧口径拒（searchOptionsNeedParity）时再加选项位（65537–131072）。
  * urlopt1028：ENGINE_URL_OPTIONS on 且有 URL 字段原文像会产出 `,{选项}`（urlOptionFields 非空）时再加 URL 选项位（131073–262144）。
+ * searchwv1028：ENGINE_SEARCH_WEBVIEW on、搜索选项位条件成立且选项可能让 webView 为真（searchOptionsMayUseWebView）时再加搜索 webView 位（262145–524288）。
  */
 export function engineSourceRevision(
   source: { url: string; searchUrl: unknown; rules: Record<string, unknown> },
@@ -83,6 +87,8 @@ export function engineSourceRevision(
   const initEnabled = options.initEnabled ?? engineSyntaxInitEnabled();
   const searchOptionsEnabled = options.searchOptionsEnabled ?? engineSearchOptionsActive();
   const urlOptionsEnabled = options.urlOptionsEnabled ?? engineUrlOptionsEnabled();
+  const searchWebViewEnabled = options.searchWebViewEnabled ?? engineSearchWebViewEnabled();
+  const searchOptionParity = searchOptionsEnabled && searchOptionsNeedParity(source.searchUrl, upgradeSourceTemplateUrl(source.url));
   const jsChain = jsEnabled && !sourceHasJsLib(source.rules);
   // 下游 sourceUses* 的编译与 compileSource 同一组开关（jsBind/jsGet/jsUtil 只在 JS 链生效时有意义）。
   const jsBind = jsChain && jsBindEnabled;
@@ -132,8 +138,9 @@ export function engineSourceRevision(
       orEnabled, xpathEnabled, xpathEvalEnabled: xpathEval, jsEnabled: jsChain, regexEnabled, andEnabled, aioEnabled, listJsEnabled,
       jsExtEnabled, jsBindEnabled: jsBind, jsGetEnabled: jsGet, jsUtilEnabled: jsUtil, jsonPathEnabled,
     }),
-    searchOptionsEnabled && searchOptionsNeedParity(source.searchUrl, upgradeSourceTemplateUrl(source.url)),
+    searchOptionParity,
     urlOptionsEnabled && urlOptionFields(source.rules).size > 0,
+    searchWebViewEnabled && searchOptionParity && searchOptionsMayUseWebView(source.searchUrl),
   ));
 }
 

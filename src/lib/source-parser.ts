@@ -3,7 +3,7 @@ import { alternateSourceHost, checkSourceUrl, upgradeSourceTemplateUrl, validate
 import { encodeQueryComponent, normalizeCharset, percentEncodeChars, type SourceCharset } from './source-charset';
 import { foldTraditional } from './zh-variant-fold';
 import { gsonAsString, gsonPlainInteger, gsonPrettyJson, parseGsonLenient, type GsonValue } from './gson-lenient';
-import { engineSearchOptionsEnabled } from './rule-engine/syntax-flags';
+import { engineSearchOptionsEnabled, engineSearchWebViewEnabled } from './rule-engine/syntax-flags';
 
 export interface SourceBookIdentity { title: string; author: string; alias?: string }
 export interface SourceChapter { url: string; title: string }
@@ -588,11 +588,32 @@ export function searchOptionsNeedParity(template: unknown, base: string): boolea
 }
 
 /**
+ * searchwv1028：searchOptionsNeedParity 为真的模板，其选项是否可能让 webView 为真（语义版本位用，纯静态）。
+ * 旧口径模板按 GSON 宽松读顶层 webView（headers 等嵌套里的同名键不算）；JS 模板看不到求值结果，只有每处 `webView`
+ * 都是字面假值（false/"false"/""/null）才判否（宁宽勿漏，只多翻 revision）。
+ */
+export function searchOptionsMayUseWebView(template: unknown): boolean {
+  if (typeof template !== 'string') return false;
+  if (legacyOptionParityApplies(template)) {
+    const optMatch = /,\s*\{/.exec(template)!;
+    const optionText = template.slice(optMatch.index + 1).replace(/\{\{key\}\}/g, OPTION_KEY_MARK).replace(/\{\{page\}\}/g, '1');
+    const parsed = parseGsonLenient(optionText);
+    if (!parsed || parsed.kind !== 'object') return false;
+    const webView = gsonAsString(parsed.entries.get('webView'));
+    return webView !== null && webView !== '' && webView !== 'false';
+  }
+  const total = template.match(/webView(?!DelayTime)/g)?.length ?? 0;
+  const falsy = template.match(/webView['"]?\s*:\s*(?:false|null|'false'|"false"|''|"")\s*[,}]/g)?.length ?? 0;
+  return total > falsy;
+}
+
+/**
  * legado UrlOption 口径读选项文本，归一成两条旧管线都认的形状（method 仅 POST / charset 串 / headers 串值对象 / body 串）：
  * GSON 宽松读不出或不是对象 → 选项整段忽略（legado 按 GET 请求 url 部分）；未知键、origin/webJs 忽略；
  * method 只认 POST（不分大小写）；空 charset 视同未声明；headers 为对象或 JSON 串（值走 toString）；
- * POST 的对象/数组 body 按 GSON pretty 序列化。webView 为真、js/type/serverID 非 null、整数字段非整数（legado 整段读失败）、
- * 重复键、白名单头的值不是串/整数/布尔、口径不定的 body 一律拒。keyMark：选项文本里代替 {{key}} 的占位，读完还原。
+ * POST 的对象/数组 body 按 GSON pretty 序列化。webView 为真（ENGINE_SEARCH_WEBVIEW 开时改为仅配非空 webJs 才拒）、
+ * js/type/serverID 非 null、整数字段非整数（legado 整段读失败）、重复键、白名单头的值不是串/整数/布尔、口径不定的 body 一律拒。
+ * keyMark：选项文本里代替 {{key}} 的占位，读完还原。
  */
 function legadoUrlOption(raw: string, keyMark?: string): Record<string, unknown> {
   const parsed = parseGsonLenient(raw);
@@ -604,7 +625,12 @@ function legadoUrlOption(raw: string, keyMark?: string): Record<string, unknown>
     if (gsonAsString(field(key)) !== null) throw new SourcePolicyError(`不支持该书源的搜索选项：${key}`);
   }
   const webView = gsonAsString(field('webView'));
-  if (webView !== null && webView !== '' && webView !== 'false') throw new SourcePolicyError('不支持该书源的搜索选项：webView');
+  if (webView !== null && webView !== '' && webView !== 'false') {
+    // searchwv1028：开关开时 webView 当普通请求（webJs 会在页面里执行、取到的结果不同，仍拒）。
+    if (!engineSearchWebViewEnabled()) throw new SourcePolicyError('不支持该书源的搜索选项：webView');
+    const webJs = gsonAsString(field('webJs'));
+    if (webJs !== null && webJs.trim() !== '') throw new SourcePolicyError('不支持该书源的搜索选项：webJs');
+  }
   for (const key of LEGADO_INT_FIELDS) {
     const v = field(key);
     if (v === undefined || v.kind === 'null') continue;
@@ -729,7 +755,7 @@ const legadoIsXml = (text: string): boolean => {
 
 /**
  * 已完成 JS/`{{…}}`/页码替换的 legado ruleUrl → 结构化搜索请求（legado AnalyzeUrl.analyzeUrl 口径）：
- * 在首个 `\s*,\s*(?=\{)` 处切选项；选项键白名单与旧口径相同（webView/js/webJs 等照旧拒）；method 仅 POST（不分大小写）
+ * 在首个 `\s*,\s*(?=\{)` 处切选项；选项键白名单与旧口径相同（webView/js/webJs 等照旧拒；optionParity 时改按 legadoUrlOption 重读）；method 仅 POST（不分大小写）
  * 为 POST、其余字符串记 GET；空白 charset 视同未声明。GET 查询串未编码时按 queryEncoder 编码（已有 %XX 保留）；
  * POST 表单 body（非 JSON/XML 且未声明 `Content-Type` 头）逐段 URLEncoder 编码，未声明 charset 时已编码段原样。
  * 最终 URL 过同一把 validate（https/端口/userinfo/IP 红线不变）。

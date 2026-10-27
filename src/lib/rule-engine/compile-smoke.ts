@@ -187,7 +187,7 @@ export function selectCandidates(
     const upgradedBase = upgradeSourceTemplateUrl(String(s.bookSourceUrl ?? ''));
     if (!upgradedBase.startsWith('https://')) continue;
     if (!rulesNoJs(s, options)) continue;
-    // 默认口径 = 纯 GET；postSearch 开时额外放行「可构造出 POST/GET 请求」的源（与运行时同一判据，webView/未知键/展不开仍拒）。
+    // 默认口径 = 纯 GET；postSearch 开时额外放行「可构造出 POST/GET 请求」的源（与运行时同一判据，未知键/展不开仍拒，webView 仅 ENGINE_SEARCH_WEBVIEW 开时放行）。
     if (!searchIsPureGet(s.searchUrl)
       && !(options.postSearch && searchOptionsConstructible(s.searchUrl, upgradedBase))
       && !(options.postSearch && options.searchJs && searchTemplateNeedsJs(s.searchUrl, upgradedBase)

@@ -23,12 +23,12 @@ export const ENGINE_SEMANTICS_XPATH_BIT = 2;
 /** vars1027：@put/@get 静态子集语义位。版本再 +4（5–8 = 含变量位的四种组合），1–4 逐字不变。 */
 export const ENGINE_SEMANTICS_VARS_BIT = 4;
 
-/** 语义版本随 || / XPath / 变量 / JS / XPath 求值 / 正则 / && / AllInOne / 搜索 JS / 列表 JS / JS 扩展 / 宿主绑定 / java.getString / 加解密帮手 / JSONPath 扩展 / 详情 init / 搜索选项 legado 口径 / URL 字段选项开关联动（唯一口径，供 compile.ts 缓存键与 rulesHash 复用）。 */
+/** 语义版本随 || / XPath / 变量 / JS / XPath 求值 / 正则 / && / AllInOne / 搜索 JS / 列表 JS / JS 扩展 / 宿主绑定 / java.getString / 加解密帮手 / JSONPath 扩展 / 详情 init / 搜索选项 legado 口径 / URL 字段选项 / 搜索 webView 开关联动（唯一口径，供 compile.ts 缓存键与 rulesHash 复用）。 */
 export function engineSemanticsVersion(
   orEnabled: boolean, xpathEnabled = false, varsEnabled = false, jsEnabled = false, xpathEvalEnabled = false,
   regexEnabled = false, andEnabled = false, aioEnabled = false, searchJsEnabled = false, listJsEnabled = false,
   jsExtEnabled = false, jsBindEnabled = false, jsGetEnabled = false, jsUtilEnabled = false, jsonPathEnabled = false,
-  initEnabled = false, searchOptionsEnabled = false, urlOptionsEnabled = false,
+  initEnabled = false, searchOptionsEnabled = false, urlOptionsEnabled = false, searchWebViewEnabled = false,
 ): number {
   return (orEnabled ? ENGINE_SEMANTICS_VERSION_OR : ENGINE_SEMANTICS_VERSION)
     + (xpathEnabled ? ENGINE_SEMANTICS_XPATH_BIT : 0) + (varsEnabled ? ENGINE_SEMANTICS_VARS_BIT : 0)
@@ -39,7 +39,7 @@ export function engineSemanticsVersion(
     + (jsBindEnabled ? ENGINE_SEMANTICS_JS_BIND_BIT : 0) + (jsGetEnabled ? ENGINE_SEMANTICS_JS_GET_BIT : 0)
     + (jsUtilEnabled ? ENGINE_SEMANTICS_JS_UTIL_BIT : 0) + (jsonPathEnabled ? ENGINE_SEMANTICS_JSON_PATH_BIT : 0)
     + (initEnabled ? ENGINE_SEMANTICS_INIT_BIT : 0) + (searchOptionsEnabled ? ENGINE_SEMANTICS_SEARCH_OPTIONS_BIT : 0)
-    + (urlOptionsEnabled ? ENGINE_SEMANTICS_URL_OPTIONS_BIT : 0);
+    + (urlOptionsEnabled ? ENGINE_SEMANTICS_URL_OPTIONS_BIT : 0) + (searchWebViewEnabled ? ENGINE_SEMANTICS_SEARCH_WEBVIEW_BIT : 0);
 }
 
 /**
@@ -323,5 +323,22 @@ export const ENGINE_SEMANTICS_URL_OPTIONS_BIT = 131072;
  */
 export function engineUrlOptionsEnabled(env: OrEnv = process.env): boolean {
   const raw = env.ENGINE_URL_OPTIONS?.trim().toLowerCase();
+  return raw === '1' || raw === 'true' || raw === 'on';
+}
+
+/**
+ * searchwv1028：搜索选项 webView 语义位。版本再 +262144（262145–524288），1–262144 逐字不变。
+ * 只对搜索选项 legado 口径生效、选项被旧口径拒、且 searchUrl 原文含 webView 键的源计入（compile.ts engineSourceRevision）。
+ */
+export const ENGINE_SEMANTICS_SEARCH_WEBVIEW_BIT = 262144;
+
+/**
+ * ENGINE_SEARCH_WEBVIEW 独立开关（searchwv1028，默认 off，口径同 ENGINE_SYNTAX_OR；只在搜索选项 legado 口径生效时起作用，
+ * 即 ENGINE_POST_SEARCH 与 ENGINE_SEARCH_OPTIONS 同开）。on = legado UrlOption 的 webView 为真时按普通请求取搜索页
+ * （同 method/body/headers/charset；legado 会在 WebView 里渲染后取 HTML，页面不靠 JS 出结果时两者同，靠 JS 时解析不出结果、
+ * 由准入搜索探测判失败）；webView 配非空 webJs 仍拒。off = 逐字不变（webView 为真整条模板拒）。
+ */
+export function engineSearchWebViewEnabled(env: OrEnv = process.env): boolean {
+  const raw = env.ENGINE_SEARCH_WEBVIEW?.trim().toLowerCase();
   return raw === '1' || raw === 'true' || raw === 'on';
 }
