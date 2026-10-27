@@ -15,7 +15,7 @@ import { preservesSourcePostRedirect, sourceAbortable } from '@/lib/source-fetch
 import { buildSourceSearchRequest, type SourceSearchRequest, type SourceUrlValidator } from '@/lib/source-parser';
 import { charsetFromContentType, encodeToBytes, type SourceCharset } from '@/lib/source-charset';
 import {
-  admissionNoncoreJsEnabled, CORE_FIELDS, enginePostSearchEnabled, iterRulePairs, jsChainEnabledFor, selectCandidates,
+  admissionSurveyOptions, CORE_FIELDS, enginePostSearchEnabled, iterRulePairs, jsChainEnabledFor, selectCandidates,
   sourceHasJsChainField, type RawSource,
 } from './compile-smoke';
 import { parseFieldRule } from './parse';
@@ -421,10 +421,9 @@ export function compileAdmission(source: RawSource): AdmissionCompile {
   const coreFieldMask: Record<string, boolean> = {};
   for (const field of CORE_FIELDS) coreFieldMask[field] = false;
 
-  const coreJs = jsChainEnabledFor(source);
-  if (selectCandidates([source], {
-    postSearch: enginePostSearchEnabled(), noncoreJs: admissionNoncoreJsEnabled(), coreJs,
-  }).length !== 1) {
+  const surveyOptions = admissionSurveyOptions(source);
+  const { coreJs } = surveyOptions;
+  if (selectCandidates([source], surveyOptions).length !== 1) {
     return {
       ok: false, tier: 'T7', coreFieldMask, failures: [],
       reason: '未通过 survey 初筛（HTTPS/无JS/纯GET或POST搜索/文本源/含 bookList+content）',

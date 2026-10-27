@@ -13,7 +13,7 @@ import {
   admissionReadabilityShadowMax, assertAdmissionVersionConsistent, defaultAdmissionTransport, rulesHash, runAdmissionBatch,
   type AdmissionCandidate, type AdmissionSourceRow,
 } from '@/lib/rule-engine/admission';
-import { admissionNoncoreJsEnabled, enginePostSearchEnabled, selectCandidates, type RawSource } from '@/lib/rule-engine/compile-smoke';
+import { admissionSurveyOptions, selectCandidates, type RawSource } from '@/lib/rule-engine/compile-smoke';
 import { DEFAULT_SHUYUAN_READ_CACHE_TTL_MS, shuyuanReadCacheTtlMs } from '@/lib/read-cache-ttl';
 import { adultStationKeys, classifySourceAdult, type SourceAdultClassification } from '@/lib/source-adult-classification';
 import { isPaywallHost } from '@/lib/source-host-health';
@@ -1251,7 +1251,7 @@ async function readPoolProbeMeta(s: Sql, hosts: string[], sig?: AbortSignal): Pr
 /** admission 候选筛包装：规则先过公共 survey 锁，命永久排除名单本-batch 即拒（不前送到深层探查）。
  * 字段是 bookSourceUrl 不是 url——RawSource 无 url 字段，`c.url` 恒 undefined 会让
  * isPermanentlyDisabledUrl('undefined') 静默返回 false（bug42 复发根因，见 shuyuan.test.ts 反例）。 */
-function selectCandidatesWithPermanentBlock(sources: RawSource[], options: { postSearch?: boolean; noncoreJs?: boolean }): RawSource[] {
+function selectCandidatesWithPermanentBlock(sources: RawSource[], options: Parameters<typeof selectCandidates>[1]): RawSource[] {
   return selectCandidates(sources, options).filter((c) => !isPermanentlyDisabledUrl(String(c.bookSourceUrl ?? '')));
 }
 
@@ -1993,13 +1993,11 @@ async function admitRows(
   }
   let candidates: AdmissionCandidate[] = [];
   const surveyRejected: AdmissionCandidate[] = [];
-  // 41-admpost F2：准入候选筛与 compileAdmission 用同一开关/判据；flag 开时 POST 源同步进候选评估环。
-  const postSearch = enginePostSearchEnabled();
-  // js-1026：与 compileAdmission 同一开关，候选筛与初筛判据保持一致（否则放行源在评估环第一步被判回 T7）。
-  const noncoreJs = admissionNoncoreJsEnabled();
+  // 41-admpost F2 / js-1026 / jsbox1027：候选筛与 compileAdmission 同一口径（admissionSurveyOptions 逐源算），
+  // 否则放行源在评估环第一步被判回 T7，或（漏传 coreJs 时）JS 源根本进不了评估环。
   for (const row of rows) {
     const source = row.source as RawSource;
-    (selectCandidatesWithPermanentBlock([source], { postSearch, noncoreJs }).length === 1 ? candidates : surveyRejected).push({ url: row.url, source });
+    (selectCandidatesWithPermanentBlock([source], admissionSurveyOptions(source)).length === 1 ? candidates : surveyRejected).push({ url: row.url, source });
   }
   let summary: AdmissionRoundSummary;
   try {

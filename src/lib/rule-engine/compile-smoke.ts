@@ -102,6 +102,21 @@ export function sourceHasJsChainField(src: RawSource): boolean {
 }
 
 /**
+ * 准入初筛选项的唯一口径：compileAdmission（滤网 1）与 shuyuan admitRows 候选筛必须同一判据。
+ * 2026-10-27 修：admitRows 只传 postSearch/noncoreJs、漏了 coreJs，ENGINE_SYNTAX_JS 开时核心字段带 JS 的源
+ * 在候选筛就被拒、根本进不了评估环（离线 sim 直接调 compileAdmission，量不出这个缺口）。
+ */
+export function admissionSurveyOptions(
+  src: RawSource, env: NodeJS.ProcessEnv = process.env,
+): { postSearch: boolean; noncoreJs: boolean; coreJs: boolean } {
+  return {
+    postSearch: enginePostSearchEnabled(env),
+    noncoreJs: admissionNoncoreJsEnabled(env),
+    coreJs: jsChainEnabledFor(src, env),
+  };
+}
+
+/**
  * readingPathOnly（ADMISSION_NONCORE_JS 开）：只查阅读路径字段；关时查全部规则组（逐字原口径）。
  * coreJs（ENGINE_SYNTAX_JS on）：无 jsLib 的源里，JS 链白名单字段（parse.ts jsChainFieldAllowed）的 JS
  * 不再整源拒——引擎改由沙箱执行；READING_PATH_JS_FIELDS 与列表字段（bookList/chapterList，链不支持）

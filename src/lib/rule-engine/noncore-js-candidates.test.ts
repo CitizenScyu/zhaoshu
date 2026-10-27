@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { admissionNoncoreJsEnabled, compileCoreFields, selectCandidates, type RawSource } from './compile-smoke';
+import { admissionNoncoreJsEnabled, admissionSurveyOptions, compileCoreFields, selectCandidates, type RawSource } from './compile-smoke';
 
 // js-1026：装饰字段带 JS 的源在 ADMISSION_NONCORE_JS 开时可入选；阅读路径字段带 JS 两态都拒；源类型只放行文本。
 const src = (patch: Partial<RawSource> = {}): RawSource => ({
@@ -60,5 +60,33 @@ describe('selectCandidates × bookSourceType（legado 0 文本 / 1 音频 / 2 �
 describe('admissionNoncoreJsEnabled', () => {
   it.each([['1', true], ['true', true], ['0', false], ['', false], [undefined, false], ['yes', false]])('%s → %s', (value, expected) => {
     expect(admissionNoncoreJsEnabled({ ADMISSION_NONCORE_JS: value } as unknown as NodeJS.ProcessEnv)).toBe(expected);
+  });
+});
+
+describe('admissionSurveyOptions（jsbox1027 候选筛与 compileAdmission 同口径）', () => {
+  const env = (patch: Record<string, string>) => patch as unknown as NodeJS.ProcessEnv;
+  const coreJsSource = src({ ruleContent: { content: '.content@js:result.trim()' } });
+
+  it('ENGINE_SYNTAX_JS 开：核心字段 JS 源 coreJs=true，候选筛放行', () => {
+    const options = admissionSurveyOptions(coreJsSource, env({ ENGINE_SYNTAX_JS: '1' }));
+    expect(options).toEqual({ postSearch: false, noncoreJs: false, coreJs: true });
+    expect(selectCandidates([coreJsSource], options).length).toBe(1);
+  });
+
+  it('ENGINE_SYNTAX_JS 关：coreJs=false，逐字原口径拒', () => {
+    const options = admissionSurveyOptions(coreJsSource, env({}));
+    expect(options.coreJs).toBe(false);
+    expect(selectCandidates([coreJsSource], options).length).toBe(0);
+  });
+
+  it('带 jsLib 的源开关开也 coreJs=false', () => {
+    const s = { ...coreJsSource, jsLib: 'function f(){}' };
+    expect(admissionSurveyOptions(s, env({ ENGINE_SYNTAX_JS: '1' })).coreJs).toBe(false);
+    expect(selectCandidates([s], admissionSurveyOptions(s, env({ ENGINE_SYNTAX_JS: '1' }))).length).toBe(0);
+  });
+
+  it('postSearch/noncoreJs 透传各自开关', () => {
+    expect(admissionSurveyOptions(src(), env({ ENGINE_POST_SEARCH: '1', ADMISSION_NONCORE_JS: 'true' })))
+      .toEqual({ postSearch: true, noncoreJs: true, coreJs: false });
   });
 });
