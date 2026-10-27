@@ -25,7 +25,7 @@ const TEXT_OPS = new Set(['text', 'ownText', 'textNodes']);
  * 同样视为纯文本；`or` 组合要求全部分支都是纯文本，混合分支保守按「需转换」处理。
  */
 function ruleIsPlainText(ir: RuleIr): boolean {
-  if (ir.kind === 'or') return ir.branches.every(ruleIsPlainText);
+  if (ir.kind === 'or' || ir.kind === 'and') return ir.branches.every(ruleIsPlainText);
   // xpatheval1027：末步是 text()/allText()/num()/@attr 的 XPath 产出纯文本；元素结果是 outerHtml，需转换。
   if (ir.kind === 'xpath') return ir.program !== null && ir.program.plainText;
   if (ir.kind !== 'css') return false;

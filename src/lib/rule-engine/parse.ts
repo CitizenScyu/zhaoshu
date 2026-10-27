@@ -22,7 +22,8 @@ import {
 } from './types';
 import { parseJsonPath } from './jsonpath';
 import {
-  engineSyntaxJsEnabled, engineSyntaxOrEnabled, engineSyntaxRegexEnabled, engineSyntaxXPathEnabled, engineSyntaxXPathEvalEnabled,
+  engineSyntaxAndEnabled, engineSyntaxJsEnabled, engineSyntaxOrEnabled, engineSyntaxRegexEnabled, engineSyntaxXPathEnabled,
+  engineSyntaxXPathEvalEnabled,
 } from './syntax-flags';
 import { compileXPath, XPathSyntaxError } from './xpath-eval';
 import { looksLikeXPath, xpathPrefixed, xpathSegmentBody, xpathToCss } from './xpath-subset';
@@ -159,6 +160,11 @@ export function splitTopLevel(rule: string, sep: string): string[] {
  *    反斜杠感知同款），转义字符原样留在支内。
  */
 export function tokenizeOrBranches(rule: string): string[] {
+  return tokenizeTopLevel(rule, '||');
+}
+
+/** 按顶层二字符操作符（`||` / `&&`）切分，口径同 tokenizeOrBranches（and1027 复用）。 */
+export function tokenizeTopLevel(rule: string, op: '||' | '&&'): string[] {
   const out: string[] = [];
   let buf = '';
   let quote: string | null = null;
@@ -193,7 +199,7 @@ export function tokenizeOrBranches(rule: string): string[] {
     } else if (ch === '(' || ch === '[' || ch === '{') {
       stack.push(ch);
     }
-    if (stack.length === 0 && rule.startsWith('||', i)) {
+    if (stack.length === 0 && rule.startsWith(op, i)) {
       out.push(buf);
       buf = '';
       i += 1;
@@ -519,6 +525,8 @@ export interface ParseOptions {
   field?: string;
   /** legado `##` 正则语义（ENGINE_SYNTAX_REGEX，regex1027：replaceFirst + 正则-only 规则）。默认读 env（缺失=off）。 */
   regexEnabled?: boolean;
+  /** legado `&&` 合并（ENGINE_SYNTAX_AND，and1027；须 orEnabled，且只对 AND_FIELDS 生效）。默认读 env（缺失=off）。 */
+  andEnabled?: boolean;
 }
 
 export function parseFieldRule(rule: string, options: ParseOptions = {}): FieldIr {
@@ -530,10 +538,14 @@ export function parseFieldRule(rule: string, options: ParseOptions = {}): FieldI
 
   rejectUnsupportedConstructs(trimmed);
 
-  // 顶层 && → 拒（P1b 前两态一致）
-  if (splitTopLevel(trimmed, '&&').length > 1) unsupported('规则含顶层 &&（T7）', rule, { code: 'unsupported_operator', operator: '&&' });
-
   const orEnabled = options.orEnabled ?? engineSyntaxOrEnabled();
+  // and1027：off 判据（整串、含 ## 尾缀）命中才可能走 && 合并，未命中的规则两态逐字同路——开关只救被拒的规则。
+  const offAnd = splitTopLevel(trimmed, '&&').length > 1;
+  const andEnabled = offAnd && orEnabled && options.field !== undefined && AND_FIELDS.has(options.field)
+    && (options.andEnabled ?? engineSyntaxAndEnabled());
+  // 顶层 && → 拒（P1b 前两态一致）
+  if (offAnd && !andEnabled) unsupported('规则含顶层 &&（T7）', rule, { code: 'unsupported_operator', operator: '&&' });
+
   const xpathEnabled = options.xpathEnabled ?? engineSyntaxXPathEnabled();
   const xpathEval = xpathEnabled && (options.xpathEvalEnabled ?? engineSyntaxXPathEvalEnabled());
   const regexEnabled = options.regexEnabled ?? engineSyntaxRegexEnabled();
@@ -548,6 +560,14 @@ export function parseFieldRule(rule: string, options: ParseOptions = {}): FieldI
   const { body, regex } = stripRegexSuffix(trimmed, rule, regexEnabled);
   if (body.trim() === '' && regex.length > 0) return regexOnlyField(regex, rule, regexEnabled, options.field);
   const branches = tokenizeOrBranches(body);
+  if (andEnabled) {
+    const parts = tokenizeTopLevel(body, '&&');
+    if (parts.length > 1) {
+      // legado RuleAnalyzer.splitRule 只认首个出现的操作符，另一种留在支内当选择器文本——混用即坏规则，不猜。
+      if (branches.length > 1) unsupported('规则混用顶层 || 与 &&', rule, { code: 'unsupported_operator', operator: '&&' });
+      return andField(parts, regex, rule, xpathEnabled, xpathEval, options.field!);
+    }
+  }
   if (branches.length > 1) {
     if (branches.length > MAX_OR_BRANCHES) {
       unsupported(`|| 分支数超上限（${branches.length} > ${MAX_OR_BRANCHES}）`, rule, { code: 'or_branches_too_many' });
@@ -601,6 +621,55 @@ function regexOnlyField(regex: RegexSub[], rule: string, regexEnabled: boolean, 
     unsupported('正则-only 规则（无选择器主体，非 M1 集）', rule, { code: 'regex_only' });
   }
   return { rules: [{ kind: 'self' }], regex };
+}
+
+/**
+ * && 合并开放的字段（and1027）：核心字段去掉两个「下一页」URL——legado 对它们走 getStringList 收全部支的 URL
+ * （多页翻页），引擎 next 字段单值口径装不下，不猜。装饰字段不开：不多收一个源，只会让在池源 identity 翻动。
+ */
+const AND_FIELDS: ReadonlySet<string> = new Set([
+  'ruleSearch.bookList', 'ruleSearch.name', 'ruleSearch.author', 'ruleSearch.bookUrl',
+  'ruleBookInfo.name', 'ruleBookInfo.author', 'ruleBookInfo.tocUrl',
+  'ruleToc.chapterList', 'ruleToc.chapterName', 'ruleToc.chapterUrl',
+  'ruleContent.content',
+]);
+/** URL 字段：legado getString(isUrl=true) 在 Default 模式走 getString0，取首个非空支。 */
+const AND_URL_FIELDS: ReadonlySet<string> = new Set(['ruleSearch.bookUrl', 'ruleBookInfo.tocUrl', 'ruleToc.chapterUrl']);
+const AND_LIST_FIELDS: ReadonlySet<string> = new Set(['ruleSearch.bookList', 'ruleToc.chapterList']);
+
+/**
+ * `&&` 合并字段（and1027）。legado SourceRule 先剥 `##` 尾缀，RuleAnalyzer.splitRule 再切主体；规则模式由**整条**规则的
+ * 前缀定（`$.`/`$[` → Json，否则 Default），各支共用。这里只收两种能逐支对齐的形态：
+ * - 全部支都是默认语法选择器（JSON 输入上各支照旧按 Jayway 重解释，与 legado isJSON → Json 模式一致）；
+ * - 首支是 JSONPath（整条走 Json 模式），其后各支 JSONPath 或默认语法（Json 模式里补 `$.`，同上）。
+ * 显式 `@css:`（legado 整条切成 CSS 模式，后支不再按默认语法）、XPath、字面量、模板支一律拒，不猜。
+ * 列表字段的支不能带末端操作（legado getElements 把 `@text` 当选择器步，取不到节点）。
+ */
+function andField(
+  parts: string[], regex: RegexSub[], rule: string, xpathEnabled: boolean, xpathEval: boolean, fieldName: string,
+): FieldIr {
+  if (parts.length > MAX_OR_BRANCHES) {
+    unsupported(`&& 分支数超上限（${parts.length} > ${MAX_OR_BRANCHES}）`, rule, { code: 'or_branches_too_many' });
+  }
+  const reject = (why: string): never => unsupported(`&& 组合${why}`, rule, { code: 'unsupported_operator', operator: '&&' });
+  const list = AND_LIST_FIELDS.has(fieldName);
+  const jsonMode = parts[0].trim().startsWith('$');
+  const branches = parts.map((part): RuleIr => {
+    if (part.trim() === '') unsupported('&& 分支为空', rule, { code: 'empty_and_branch' });
+    const ir = translateSegment(part, rule, xpathEnabled, xpathEval);
+    if (ir.kind === 'jsonpath') {
+      if (!jsonMode) reject('首支是默认语法、后支是 JSONPath');
+      return ir;
+    }
+    if (ir.kind !== 'css' || defaultSyntaxSource(ir) === undefined) return reject('含显式 CSS/XPath/字面量/模板支');
+    if (list && ir.terminal !== undefined) reject('列表字段的支带末端操作');
+    return ir;
+  });
+  const and: Extract<RuleIr, { kind: 'and' }> = { kind: 'and', branches };
+  if (AND_URL_FIELDS.has(fieldName)) and.first = true;
+  const field: FieldIr = { rules: [and] };
+  if (regex.length > 0) field.regex = regex;
+  return field;
 }
 
 /**

@@ -105,6 +105,10 @@ export type RuleIr =
   // css/jsonpath/template/text 形态，**节点支与标量支不互相压扁、不跨支合并**。
   // 求值语义见 evaluate.ts evaluateOr；分支预算见 MAX_OR_BRANCHES。
   | { kind: 'or'; branches: RuleIr[] }
+  // && 合并节点（and1027，ENGINE_SYNTAX_AND）：每支都求值，legado 合并口径——字符串按行拼接非空支、
+  // first（URL 字段，legado getString0）取首个非空支；列表上下文节点/JSON 条目按支序拼接（保序保重复）。
+  // 支只会是 css / jsonpath（模式前缀、XPath、字面量、模板支编译期拒），求值见 evaluate.ts evaluateAnd。
+  | { kind: 'and'; branches: RuleIr[]; first?: true }
   // JsoupXpath 语义求值（xpatheval1027，ENGINE_SYNTAX_XPATH_EVAL）：翻不成 CSS 的 legado XPath 段。
   // program=null 仅限「`/` 开头、含 `{$.` 内嵌规则、解析不了」的段（legado 在 JSON 输入上按 Json 模式读它）。
   // source = 段原文（JSON 输入上交 jsonRuleString）；forced = 带 `@XPath:` 前缀（JSON 输入上也强制 XPath）。

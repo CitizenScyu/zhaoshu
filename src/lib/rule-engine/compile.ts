@@ -7,8 +7,8 @@ import { sourceRevision } from '@/lib/source-revision';
 import { jsChainFieldAllowed, parseFieldRule, ruleHasJs, type ParseOptions } from './parse';
 import type { CompiledRules, FieldIr, RuleIr } from './types';
 import {
-  engineSemanticsVersion, engineSyntaxJsEnabled, engineSyntaxOrEnabled, engineSyntaxRegexEnabled, engineSyntaxVarsEnabled,
-  engineSyntaxXPathEnabled, engineSyntaxXPathEvalEnabled, ENGINE_SEMANTICS_VERSION,
+  engineSemanticsVersion, engineSyntaxAndEnabled, engineSyntaxJsEnabled, engineSyntaxOrEnabled, engineSyntaxRegexEnabled,
+  engineSyntaxVarsEnabled, engineSyntaxXPathEnabled, engineSyntaxXPathEvalEnabled, ENGINE_SEMANTICS_VERSION,
 } from './syntax-flags';
 import { resolveSourceVars, ruleMayUseVars } from './vars-subset';
 import { ruleMayUseXPath } from './xpath-subset';
@@ -33,6 +33,7 @@ export function engineVersionedKey(contentRevision: string, semanticsVersion = E
  * jsbox1027：ENGINE_SYNTAX_JS on 且可编译成 JS 链的字段里有 JS、源无 jsLib 时再加 JS 位（9–16）。
  * xpatheval1027：ENGINE_SYNTAX_XPATH 与 ENGINE_SYNTAX_XPATH_EVAL 都 on 且有字段编译出 XPath 求值 IR 时再加求值位（17–32）。
  * regex1027：ENGINE_SYNTAX_REGEX on 且有字段编译出正则-only 规则或 replaceFirst 替换时再加正则位（33–64）。
+ * and1027：ENGINE_SYNTAX_AND（须 OR）on 且有 off 态因 && 被拒的字段在 on 态编译通过时再加 && 位（65–128）。
  */
 export function engineSourceRevision(
   source: { url: string; searchUrl: unknown; rules: Record<string, unknown> },
@@ -44,6 +45,7 @@ export function engineSourceRevision(
   const jsEnabled = options.jsEnabled ?? engineSyntaxJsEnabled();
   const xpathEval = options.xpathEvalEnabled ?? engineSyntaxXPathEvalEnabled();
   const regexEnabled = options.regexEnabled ?? engineSyntaxRegexEnabled();
+  const andEnabled = options.andEnabled ?? engineSyntaxAndEnabled();
   const jsChain = jsEnabled && !sourceHasJsLib(source.rules);
   return engineVersionedKey(sourceRevision(source), engineSemanticsVersion(
     orEnabled && sourceUsesOrSyntax(source.rules),
@@ -53,6 +55,9 @@ export function engineSourceRevision(
     xpathEnabled && xpathEval && sourceUsesXPathEval(source.rules, { orEnabled, varsEnabled, jsEnabled: jsChain }),
     regexEnabled && sourceUsesRegexSyntax(source.rules, {
       orEnabled, varsEnabled, jsEnabled: jsChain, xpathEnabled, xpathEvalEnabled: xpathEval,
+    }),
+    orEnabled && andEnabled && sourceUsesAndSyntax(source.rules, {
+      varsEnabled, jsEnabled: jsChain, xpathEnabled, xpathEvalEnabled: xpathEval, regexEnabled,
     }),
   ));
 }
@@ -216,6 +221,55 @@ export function sourceUsesRegexSyntax(
   return uses;
 }
 
+const andMemo = new WeakMap<object, Map<string, boolean>>();
+
+/**
+ * 源是否会因 ENGINE_SYNTAX_AND 改变编译结果（and1027）：off 态只有「整串含顶层 &&」才走拒绝分支，on 态也只改这些规则
+ * （parse.ts offAnd 门），所以按 on 态（OR 开、其余开关同 compileSource）实际编译这类字段，有一个编译通过即算——
+ * off 态它必是 skipped。on 态仍被拒的字段两态都 skipped，identity 不该变。
+ */
+export function sourceUsesAndSyntax(
+  rules: Record<string, unknown>,
+  options: { varsEnabled: boolean; jsEnabled: boolean; xpathEnabled: boolean; xpathEvalEnabled: boolean; regexEnabled: boolean },
+): boolean {
+  if (!someRule(rules, (rule) => rule.includes('&&'))) return false;
+  const memoKey = `${options.varsEnabled}:${options.jsEnabled}:${options.xpathEnabled}:${options.xpathEvalEnabled}:${options.regexEnabled}`;
+  let memo = andMemo.get(rules);
+  const hit = memo?.get(memoKey);
+  if (hit !== undefined) return hit;
+  const sourceRules = options.varsEnabled ? resolveSourceVars(rules) : rules;
+  let uses = false;
+  for (const group of RULE_GROUPS) {
+    const fields = sourceRules[group];
+    if (uses || !fields || typeof fields !== 'object' || Array.isArray(fields)) continue;
+    for (const [field, rule] of Object.entries(fields as Record<string, unknown>)) {
+      if (typeof rule !== 'string' || !rule.includes('&&')) continue;
+      const name = `${group}.${field}`;
+      const parse = (andEnabled: boolean) => parseFieldRule(rule, {
+        orEnabled: true, xpathEnabled: options.xpathEnabled, xpathEvalEnabled: options.xpathEvalEnabled,
+        jsEnabled: options.jsEnabled, regexEnabled: options.regexEnabled, andEnabled, field: name,
+      });
+      try {
+        parse(true);
+      } catch {
+        continue; // on 态也编译不过：两态都 skipped
+      }
+      try {
+        parse(false);
+      } catch {
+        uses = true;
+        break;
+      }
+    }
+  }
+  if (!memo) {
+    memo = new Map();
+    andMemo.set(rules, memo);
+  }
+  memo.set(memoKey, uses);
+  return uses;
+}
+
 /** LRU 上限：单测/低并发下足够；无关热路径，只防规则对象无限积累。 */
 const CACHE_LIMIT = 64;
 const cache = new Map<string, CompiledRules>();
@@ -239,7 +293,10 @@ export function compileSource(
   const jsEnabled = (options.jsEnabled ?? engineSyntaxJsEnabled()) && !sourceHasJsLib(source.rules);
   const xpathEvalEnabled = options.xpathEvalEnabled ?? engineSyntaxXPathEvalEnabled();
   const regexEnabled = options.regexEnabled ?? engineSyntaxRegexEnabled();
-  const key = engineSourceRevision(source, { orEnabled, xpathEnabled, varsEnabled, jsEnabled, xpathEvalEnabled, regexEnabled });
+  const andEnabled = options.andEnabled ?? engineSyntaxAndEnabled();
+  const key = engineSourceRevision(source, {
+    orEnabled, xpathEnabled, varsEnabled, jsEnabled, xpathEvalEnabled, regexEnabled, andEnabled,
+  });
   const hit = cache.get(key);
   if (hit) {
     cache.delete(key); // 触达即续期（Map 插入序 = LRU 序）
@@ -255,7 +312,9 @@ export function compileSource(
       if (typeof rule !== 'string' || !rule.trim()) continue;
       const name = `${group}.${field}`;
       try {
-        compiled.set(name, parseFieldRule(rule, { orEnabled, xpathEnabled, xpathEvalEnabled, jsEnabled, regexEnabled, field: name }));
+        compiled.set(name, parseFieldRule(rule, {
+          orEnabled, xpathEnabled, xpathEvalEnabled, jsEnabled, regexEnabled, andEnabled, field: name,
+        }));
       } catch {
         compiled.set(name, { skipped: 'unsupported' });
       }

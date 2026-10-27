@@ -164,6 +164,8 @@ export function evaluateRule(ir: RuleIr, scope: EvalScope, multi = false): EvalR
       // P1a || 组合（空值短路）。列表上下文（evaluateFieldNodes）不走这里——
       // 它按「首个非空节点集」逐支取，见 evaluateFieldNodes 的 or 分支。
       return evaluateOr(ir, scope, multi);
+    case 'and':
+      return evaluateAnd(ir, scope, multi);
     case 'xpath':
       return evaluateXPathRule(ir, scope, multi);
     case 'self':
@@ -232,6 +234,27 @@ function evaluateOr(ir: { kind: 'or'; branches: RuleIr[] }, scope: EvalScope, mu
     if (textValue.trim() !== '') return { kind: 'text', value: textValue };
   }
   return { kind: 'text', value: '' };
+}
+
+/**
+ * && 合并求值（and1027，字符串口径）。legado AnalyzeByJSoup.getString / AnalyzeByJSonPath.getString：每支都求值，
+ * 非空支按行拼接；节点支按字段层同款文本视图（@text，multi 口径随字段）。
+ * `first`（URL 字段）：HTML 上对齐 getString0 取首个非空支；JSON 上 legado 不分 URL 照样按行拼——多支命中时
+ * 拼出的是坏 URL，这里求值失败而不是另选一支（不替 legado 猜），只有一支命中时两者一致。
+ */
+function evaluateAnd(ir: Extract<RuleIr, { kind: 'and' }>, scope: EvalScope, multi: boolean): EvalResult {
+  const values: string[] = [];
+  for (const branch of ir.branches) {
+    const result = evaluateRule(branch, scope, multi);
+    const value = result.kind === 'text'
+      ? result.value
+      : scope.kind === 'html' ? applyTerminal(scope.$, result.nodes, { op: 'text' }, scope.pageUrl, multi) : '';
+    if (value.trim() === '') continue;
+    if (ir.first && scope.kind === 'html') return { kind: 'text', value };
+    values.push(value);
+  }
+  if (ir.first && values.length > 1) return evalFailed('JSON 输入上 && URL 字段多支命中（legado 按行拼成坏 URL）');
+  return { kind: 'text', value: values.join(MULTI_JOIN) };
 }
 
 /**
@@ -468,6 +491,15 @@ export function evaluateFieldNodes(field: FieldIr, scope: EvalScope): CheerioNod
       }
       continue;
     }
+    if (ir.kind === 'and') {
+      // and1027：各支节点集按支序拼接（legado getElements 的 Elements.addAll，保序、不去重）。
+      const nodes = ir.branches.flatMap((branch) => {
+        const result = evaluateRule(branch, scope);
+        return result.kind === 'nodes' ? result.nodes.toArray() : [];
+      });
+      if (nodes.length > 0) return scope.$(nodes as never);
+      continue;
+    }
     const result = evaluateRule(ir, scope);
     if (result.kind === 'nodes' && result.nodes.length > 0) return result.nodes;
   }
@@ -510,6 +542,8 @@ function jsonListItems(ir: RuleIr, json: unknown): unknown[] {
         if (items.length > 0) return items;
       }
       return [];
+    case 'and':
+      return ir.branches.flatMap((branch) => jsonListItems(branch, json));
     default:
       return [];
   }
