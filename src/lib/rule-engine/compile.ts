@@ -7,8 +7,8 @@ import { sourceRevision } from '@/lib/source-revision';
 import { jsChainFieldAllowed, parseFieldRule, ruleHasJs, type ParseOptions } from './parse';
 import type { CompiledRules, FieldIr, RuleIr } from './types';
 import {
-  engineSemanticsVersion, engineSyntaxJsEnabled, engineSyntaxOrEnabled, engineSyntaxVarsEnabled, engineSyntaxXPathEnabled,
-  engineSyntaxXPathEvalEnabled, ENGINE_SEMANTICS_VERSION,
+  engineSemanticsVersion, engineSyntaxJsEnabled, engineSyntaxOrEnabled, engineSyntaxRegexEnabled, engineSyntaxVarsEnabled,
+  engineSyntaxXPathEnabled, engineSyntaxXPathEvalEnabled, ENGINE_SEMANTICS_VERSION,
 } from './syntax-flags';
 import { resolveSourceVars, ruleMayUseVars } from './vars-subset';
 import { ruleMayUseXPath } from './xpath-subset';
@@ -32,6 +32,7 @@ export function engineVersionedKey(contentRevision: string, semanticsVersion = E
  * vars1027：ENGINE_SYNTAX_VARS on 且规则组含 @put/@get 的源再加变量位（5–8）。
  * jsbox1027：ENGINE_SYNTAX_JS on 且可编译成 JS 链的字段里有 JS、源无 jsLib 时再加 JS 位（9–16）。
  * xpatheval1027：ENGINE_SYNTAX_XPATH 与 ENGINE_SYNTAX_XPATH_EVAL 都 on 且有字段编译出 XPath 求值 IR 时再加求值位（17–32）。
+ * regex1027：ENGINE_SYNTAX_REGEX on 且有字段编译出正则-only 规则或 replaceFirst 替换时再加正则位（33–64）。
  */
 export function engineSourceRevision(
   source: { url: string; searchUrl: unknown; rules: Record<string, unknown> },
@@ -42,13 +43,16 @@ export function engineSourceRevision(
   const varsEnabled = options.varsEnabled ?? engineSyntaxVarsEnabled();
   const jsEnabled = options.jsEnabled ?? engineSyntaxJsEnabled();
   const xpathEval = options.xpathEvalEnabled ?? engineSyntaxXPathEvalEnabled();
+  const regexEnabled = options.regexEnabled ?? engineSyntaxRegexEnabled();
+  const jsChain = jsEnabled && !sourceHasJsLib(source.rules);
   return engineVersionedKey(sourceRevision(source), engineSemanticsVersion(
     orEnabled && sourceUsesOrSyntax(source.rules),
     xpathEnabled && sourceUsesXPathSyntax(source.rules),
     varsEnabled && sourceUsesVarSyntax(source.rules),
     jsEnabled && sourceUsesJsSyntax(source.rules),
-    xpathEnabled && xpathEval && sourceUsesXPathEval(source.rules, {
-      orEnabled, varsEnabled, jsEnabled: jsEnabled && !sourceHasJsLib(source.rules),
+    xpathEnabled && xpathEval && sourceUsesXPathEval(source.rules, { orEnabled, varsEnabled, jsEnabled: jsChain }),
+    regexEnabled && sourceUsesRegexSyntax(source.rules, {
+      orEnabled, varsEnabled, jsEnabled: jsChain, xpathEnabled, xpathEvalEnabled: xpathEval,
     }),
   ));
 }
@@ -162,6 +166,56 @@ export function sourceUsesXPathEval(
   return uses;
 }
 
+function fieldUsesRegexSyntax(field: FieldIr): boolean {
+  if (field.rules.some((ir) => ir.kind === 'self') || (field.regex ?? []).some((sub) => sub.first)) return true;
+  return (field.chain ?? []).some((stage) => (stage.kind === 'rule' && fieldUsesRegexSyntax(stage.field))
+    || (stage.kind === 'regex' && stage.regex.some((sub) => sub.first)));
+}
+
+const regexMemo = new WeakMap<object, Map<string, boolean>>();
+
+/**
+ * 源是否会因 ENGINE_SYNTAX_REGEX 改变编译结果（regex1027）：按 on 态（其余开关同 compileSource）实际编译含 `##` 的字段，
+ * 产出正则-only 规则或 replaceFirst 替换才算。带选择器主体的 `##` 替换两态同 IR，identity 不该变。
+ */
+export function sourceUsesRegexSyntax(
+  rules: Record<string, unknown>,
+  options: { orEnabled: boolean; varsEnabled: boolean; jsEnabled: boolean; xpathEnabled: boolean; xpathEvalEnabled: boolean },
+): boolean {
+  if (!someRule(rules, (rule) => rule.includes('##'))) return false;
+  const memoKey = `${options.orEnabled}:${options.varsEnabled}:${options.jsEnabled}:${options.xpathEnabled}:${options.xpathEvalEnabled}`;
+  let memo = regexMemo.get(rules);
+  const hit = memo?.get(memoKey);
+  if (hit !== undefined) return hit;
+  const sourceRules = options.varsEnabled ? resolveSourceVars(rules) : rules;
+  let uses = false;
+  for (const group of RULE_GROUPS) {
+    const fields = sourceRules[group];
+    if (uses || !fields || typeof fields !== 'object' || Array.isArray(fields)) continue;
+    for (const [field, rule] of Object.entries(fields as Record<string, unknown>)) {
+      if (typeof rule !== 'string' || !rule.includes('##')) continue;
+      try {
+        const ir = parseFieldRule(rule, {
+          orEnabled: options.orEnabled, xpathEnabled: options.xpathEnabled, xpathEvalEnabled: options.xpathEvalEnabled,
+          jsEnabled: options.jsEnabled, regexEnabled: true, field: `${group}.${field}`,
+        });
+        if (fieldUsesRegexSyntax(ir)) {
+          uses = true;
+          break;
+        }
+      } catch {
+        // on 态也编译不过：两态都 skipped，不影响 identity
+      }
+    }
+  }
+  if (!memo) {
+    memo = new Map();
+    regexMemo.set(rules, memo);
+  }
+  memo.set(memoKey, uses);
+  return uses;
+}
+
 /** LRU 上限：单测/低并发下足够；无关热路径，只防规则对象无限积累。 */
 const CACHE_LIMIT = 64;
 const cache = new Map<string, CompiledRules>();
@@ -184,7 +238,8 @@ export function compileSource(
   // jsLib 源不开 JS 链（见 sourceHasJsLib）：字段里的 JS 照旧 unsupported_js。
   const jsEnabled = (options.jsEnabled ?? engineSyntaxJsEnabled()) && !sourceHasJsLib(source.rules);
   const xpathEvalEnabled = options.xpathEvalEnabled ?? engineSyntaxXPathEvalEnabled();
-  const key = engineSourceRevision(source, { orEnabled, xpathEnabled, varsEnabled, jsEnabled, xpathEvalEnabled });
+  const regexEnabled = options.regexEnabled ?? engineSyntaxRegexEnabled();
+  const key = engineSourceRevision(source, { orEnabled, xpathEnabled, varsEnabled, jsEnabled, xpathEvalEnabled, regexEnabled });
   const hit = cache.get(key);
   if (hit) {
     cache.delete(key); // 触达即续期（Map 插入序 = LRU 序）
@@ -200,7 +255,7 @@ export function compileSource(
       if (typeof rule !== 'string' || !rule.trim()) continue;
       const name = `${group}.${field}`;
       try {
-        compiled.set(name, parseFieldRule(rule, { orEnabled, xpathEnabled, xpathEvalEnabled, jsEnabled, field: name }));
+        compiled.set(name, parseFieldRule(rule, { orEnabled, xpathEnabled, xpathEvalEnabled, jsEnabled, regexEnabled, field: name }));
       } catch {
         compiled.set(name, { skipped: 'unsupported' });
       }

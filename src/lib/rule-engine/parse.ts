@@ -21,7 +21,9 @@ import {
   TerminalOp,
 } from './types';
 import { parseJsonPath } from './jsonpath';
-import { engineSyntaxJsEnabled, engineSyntaxOrEnabled, engineSyntaxXPathEnabled, engineSyntaxXPathEvalEnabled } from './syntax-flags';
+import {
+  engineSyntaxJsEnabled, engineSyntaxOrEnabled, engineSyntaxRegexEnabled, engineSyntaxXPathEnabled, engineSyntaxXPathEvalEnabled,
+} from './syntax-flags';
 import { compileXPath, XPathSyntaxError } from './xpath-eval';
 import { looksLikeXPath, xpathPrefixed, xpathSegmentBody, xpathToCss } from './xpath-subset';
 
@@ -209,7 +211,7 @@ export function tokenizeOrBranches(rule: string): string[] {
  * 1 个 ##=只删匹配（replacement=''）、2 个=删、3 个=pattern/replacement(/flags)。
  * 返回 { body, regex }。pattern 编译失败 → RULE_UNSUPPORTED。
  */
-export function stripRegexSuffix(segment: string, rule: string): { body: string; regex: RegexSub[] } {
+export function stripRegexSuffix(segment: string, rule: string, regexEnabled = false): { body: string; regex: RegexSub[] } {
   const idx = segment.indexOf('##');
   if (idx < 0) return { body: segment, regex: [] };
   const body = segment.slice(0, idx);
@@ -233,7 +235,11 @@ export function stripRegexSuffix(segment: string, rule: string): { body: string;
   } catch {
     unsupported(`正则 pattern 无法编译：${pattern}`, rule, { code: 'regex_invalid' });
   }
-  regex.push({ pattern, replacement, flags: finalFlags });
+  // regex1027：legado SourceRule.makeUpRule 只有「≥4 段即 replaceFirst」，没有 flags 概念（`##p##r##i` 也是 replaceFirst）。
+  // 只对主体为空的正则-only 段生效（整页/条目原文上的全局替换没有意义）；`选择器##p##r###` 照旧全局替换——
+  // 已在池的源按旧语义实测通过，改它们的取值须另开开关并实测（or-sim regex-sim：on 态波及 516 个在池源）。
+  if (regexEnabled && chunks.length >= 3 && body.trim() === '') regex.push({ pattern, replacement, first: true });
+  else regex.push({ pattern, replacement, flags: finalFlags });
   return { body, regex };
 }
 
@@ -511,6 +517,8 @@ export interface ParseOptions {
   jsEnabled?: boolean;
   /** 字段全名（如 `ruleContent.content`）。JS 链只对白名单字段开放，未给出时含 JS 照旧拒。 */
   field?: string;
+  /** legado `##` 正则语义（ENGINE_SYNTAX_REGEX，regex1027：replaceFirst + 正则-only 规则）。默认读 env（缺失=off）。 */
+  regexEnabled?: boolean;
 }
 
 export function parseFieldRule(rule: string, options: ParseOptions = {}): FieldIr {
@@ -528,16 +536,17 @@ export function parseFieldRule(rule: string, options: ParseOptions = {}): FieldI
   const orEnabled = options.orEnabled ?? engineSyntaxOrEnabled();
   const xpathEnabled = options.xpathEnabled ?? engineSyntaxXPathEnabled();
   const xpathEval = xpathEnabled && (options.xpathEvalEnabled ?? engineSyntaxXPathEvalEnabled());
+  const regexEnabled = options.regexEnabled ?? engineSyntaxRegexEnabled();
   if (!orEnabled) {
     // off：冻结的 M1 路径（旧 splitTopLevel、旧顺序，逐字保留）。
     const orParts = splitTopLevel(trimmed, '||');
     if (orParts.length > 1) unsupported('规则含顶层 ||（T7）', rule, { code: 'unsupported_operator', operator: '||' });
-    return singleSegmentField(orParts[0], rule, xpathEnabled, xpathEval);
+    return singleSegmentField(orParts[0], rule, xpathEnabled, xpathEval, undefined, regexEnabled, options.field);
   }
 
   // on：先剥字段级 ## 尾缀，再切顶层 ||。尾缀挂在 FieldIr.regex（组合选定后净化）。
-  const { body, regex } = stripRegexSuffix(trimmed, rule);
-  if (body.trim() === '' && regex.length > 0) unsupported('正则-only 规则（无选择器主体，非 M1 集）', rule, { code: 'regex_only' });
+  const { body, regex } = stripRegexSuffix(trimmed, rule, regexEnabled);
+  if (body.trim() === '' && regex.length > 0) return regexOnlyField(regex, rule, regexEnabled, options.field);
   const branches = tokenizeOrBranches(body);
   if (branches.length > 1) {
     if (branches.length > MAX_OR_BRANCHES) {
@@ -547,7 +556,7 @@ export function parseFieldRule(rule: string, options: ParseOptions = {}): FieldI
     if (regex.length > 0) field.regex = regex;
     return field;
   }
-  return singleSegmentField(body, rule, xpathEnabled, xpathEval, { body, regex });
+  return singleSegmentField(body, rule, xpathEnabled, xpathEval, { body, regex }, regexEnabled, options.field);
 }
 
 /** 单段（无顶层 ||）字段编译。off 路径的这段与旧实现逐行等价。 */
@@ -557,15 +566,41 @@ function singleSegmentField(
   xpathEnabled: boolean,
   xpathEval: boolean,
   precomputed?: { body: string; regex: RegexSub[] },
+  regexEnabled = false,
+  fieldName?: string,
 ): FieldIr {
-  const { body, regex } = precomputed ?? stripRegexSuffix(segment, rule);
+  const { body, regex } = precomputed ?? stripRegexSuffix(segment, rule, regexEnabled);
   // 正则-only 规则（剥掉 ##...## 尾缀后主体为空，如 `##<a.*?href="([^"]+)"##$1###`）：
   // ##regex## 在 §2.3 里只定义为「选择器后缀」，无选择器主体的独立正则不在 M1 集内 → 显式拒绝
-  // （不猜「对原始输入直接跑正则」的语义，§2.3 第5条不猜测）。
-  if (body.trim() === '' && regex.length > 0) unsupported('正则-only 规则（无选择器主体，非 M1 集）', rule, { code: 'regex_only' });
+  // （不猜「对原始输入直接跑正则」的语义，§2.3 第5条不猜测）。regex1027 开关 on 时按 legado 语义收下，见 regexOnlyField。
+  if (body.trim() === '' && regex.length > 0) return regexOnlyField(regex, rule, regexEnabled, fieldName);
   const field: FieldIr = { rules: [translateSegment(body, rule, xpathEnabled, xpathEval)] };
   if (regex.length > 0) field.regex = regex;
   return field;
+}
+
+/**
+ * 正则-only 规则开放的字段：核心字段（evaluate.ts CORE_FIELDS）去掉三个列表字段。列表字段在 legado getElements 里
+ * 没有替换语义（主体为空 = 空列表）；装饰字段照旧 skipped——放开它们只会让大批已在池源的 identity 翻动
+ * （or-sim regex-sim：428 个在池源只因装饰字段换 rules_hash）而不多收一个源。未给出字段名的调用一律拒。
+ */
+const SELF_FIELDS: ReadonlySet<string> = new Set([
+  'ruleSearch.name', 'ruleSearch.author', 'ruleSearch.bookUrl',
+  'ruleBookInfo.name', 'ruleBookInfo.author', 'ruleBookInfo.tocUrl',
+  'ruleToc.chapterName', 'ruleToc.chapterUrl', 'ruleToc.nextTocUrl',
+  'ruleContent.content', 'ruleContent.nextContentUrl',
+]);
+
+/**
+ * 正则-only 规则（regex1027）。legado AnalyzeRule.getString：主体为空、有替换正则时不调解析器，result 保持
+ * content，直接 `replaceRegex(content.toString())`——整页 = 页面原文、条目 = 元素 outerHtml，结果非正文时解 HTML 实体。
+ * 开关 off 与 SELF_FIELDS 之外的字段照旧 regex_only。
+ */
+function regexOnlyField(regex: RegexSub[], rule: string, regexEnabled: boolean, fieldName: string | undefined): FieldIr {
+  if (!regexEnabled || fieldName === undefined || !SELF_FIELDS.has(fieldName)) {
+    unsupported('正则-only 规则（无选择器主体，非 M1 集）', rule, { code: 'regex_only' });
+  }
+  return { rules: [{ kind: 'self' }], regex };
 }
 
 /**
@@ -627,14 +662,18 @@ function parseJsChain(trimmed: string, rule: string, options: ParseOptions): Fie
     unsupported('规则含 JS（@js:/<js>）', rule, { code: 'unsupported_js' });
   }
   if (trimmed.length > MAX_JS_RULE_LENGTH) unsupported('规则过长', rule, { code: 'rule_too_long' });
-  const segmentOptions: ParseOptions = { orEnabled: options.orEnabled, xpathEnabled: options.xpathEnabled, xpathEvalEnabled: options.xpathEvalEnabled, jsEnabled: false };
+  const regexEnabled = options.regexEnabled ?? engineSyntaxRegexEnabled();
+  const segmentOptions: ParseOptions = {
+    orEnabled: options.orEnabled, xpathEnabled: options.xpathEnabled, xpathEvalEnabled: options.xpathEvalEnabled, jsEnabled: false,
+    regexEnabled,
+  };
   const chain: ChainStage[] = [];
   const pushRule = (text: string) => {
     const segment = text.trim();
     if (segment === '') return;
     if (segment.startsWith('##')) {
       if (itemLevel && chain.length === 0) unsupported('条目级字段首段不能是纯正则', rule, { code: 'unsupported_js' });
-      chain.push({ kind: 'regex', regex: stripRegexSuffix(segment, rule).regex });
+      chain.push({ kind: 'regex', regex: stripRegexSuffix(segment, rule, regexEnabled).regex });
       return;
     }
     chain.push({ kind: 'rule', field: parseFieldRule(segment, segmentOptions) });

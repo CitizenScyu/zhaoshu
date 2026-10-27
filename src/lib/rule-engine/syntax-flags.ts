@@ -23,13 +23,15 @@ export const ENGINE_SEMANTICS_XPATH_BIT = 2;
 /** vars1027：@put/@get 静态子集语义位。版本再 +4（5–8 = 含变量位的四种组合），1–4 逐字不变。 */
 export const ENGINE_SEMANTICS_VARS_BIT = 4;
 
-/** 语义版本随 || / XPath / 变量 / JS / XPath 求值开关联动（唯一口径，供 compile.ts 缓存键与 rulesHash 复用）。 */
+/** 语义版本随 || / XPath / 变量 / JS / XPath 求值 / 正则开关联动（唯一口径，供 compile.ts 缓存键与 rulesHash 复用）。 */
 export function engineSemanticsVersion(
   orEnabled: boolean, xpathEnabled = false, varsEnabled = false, jsEnabled = false, xpathEvalEnabled = false,
+  regexEnabled = false,
 ): number {
   return (orEnabled ? ENGINE_SEMANTICS_VERSION_OR : ENGINE_SEMANTICS_VERSION)
     + (xpathEnabled ? ENGINE_SEMANTICS_XPATH_BIT : 0) + (varsEnabled ? ENGINE_SEMANTICS_VARS_BIT : 0)
-    + (jsEnabled ? ENGINE_SEMANTICS_JS_BIT : 0) + (xpathEvalEnabled ? ENGINE_SEMANTICS_XPATH_EVAL_BIT : 0);
+    + (jsEnabled ? ENGINE_SEMANTICS_JS_BIT : 0) + (xpathEvalEnabled ? ENGINE_SEMANTICS_XPATH_EVAL_BIT : 0)
+    + (regexEnabled ? ENGINE_SEMANTICS_REGEX_BIT : 0);
 }
 
 /**
@@ -96,5 +98,21 @@ export const ENGINE_SEMANTICS_XPATH_EVAL_BIT = 16;
  */
 export function engineSyntaxXPathEvalEnabled(env: OrEnv = process.env): boolean {
   const raw = env.ENGINE_SYNTAX_XPATH_EVAL?.trim().toLowerCase();
+  return raw === '1' || raw === 'true' || raw === 'on';
+}
+
+/**
+ * regex1027：legado `##` 正则语义位。版本再 +32（33–64），1–32 逐字不变。
+ * 只对实际有字段编译出正则-only 规则或 replaceFirst 替换的源计入（compile.ts sourceUsesRegexSyntax）。
+ */
+export const ENGINE_SEMANTICS_REGEX_BIT = 32;
+
+/**
+ * ENGINE_SYNTAX_REGEX 独立开关（regex1027，默认 off，口径同 ENGINE_SYNTAX_OR）。
+ * on = 主体为空的正则-only 规则按 legado AnalyzeRule 对当前内容原文求值，`##` 切出 ≥4 段时 replaceFirst（只取首个匹配
+ * 套替换，无匹配得空）；带选择器主体的 `##p##r###` 不变。off = 逐字不变（正则-only 拒 regex_only，第 3 段当 JS flags）。
+ */
+export function engineSyntaxRegexEnabled(env: OrEnv = process.env): boolean {
+  const raw = env.ENGINE_SYNTAX_REGEX?.trim().toLowerCase();
   return raw === '1' || raw === 'true' || raw === 'on';
 }

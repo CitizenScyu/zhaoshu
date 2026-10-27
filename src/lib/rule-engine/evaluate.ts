@@ -166,9 +166,22 @@ export function evaluateRule(ir: RuleIr, scope: EvalScope, multi = false): EvalR
       return evaluateOr(ir, scope, multi);
     case 'xpath':
       return evaluateXPathRule(ir, scope, multi);
+    case 'self':
+      return { kind: 'text', value: selfText(scope) };
     default:
       return evalFailed('未知的规则 IR');
   }
+}
+
+/**
+ * legado `content.toString()`（regex1027 正则-only 规则的输入）：整页作用域取页面原文（AnalyzeRule 的 content 是响应体
+ * 字符串）；HTML 条目取元素 outerHtml，多个按行拼（jsoup Elements.toString）。jsoup 会带缩进美化输出，cheerio 原样序列化
+ * ——跨块元素的 `.` 匹配在这里可能比 legado 宽松，准入实测把关。JSON 条目在 legado 是 Map.toString（`{k=v}`），不模拟。
+ */
+function selfText(scope: EvalScope): string {
+  if (scope.source !== undefined) return scope.source;
+  if (scope.kind !== 'html') return evalFailed('正则-only 规则不能对 JSON 条目求值');
+  return scope.nodes.toArray().map((node) => scope.$.html(node as never) ?? '').join(MULTI_JOIN);
 }
 
 /**
@@ -431,6 +444,8 @@ export function evaluateField(field: FieldIr, scope: EvalScope, multi = false): 
     if (value.trim() !== '') break;
   }
   if (field.regex !== undefined) value = applyRegexSubs(value, field.regex);
+  // 正则-only 规则的输入是未解码的原文：对齐 legado getString 末段（含 `&` 即 unescapeHtml4）；正文（multi）交 content-html。
+  if (!multi && field.rules.length === 1 && field.rules[0].kind === 'self' && value.includes('&')) value = decodeHTML(value);
   return value.trim();
 }
 
@@ -584,15 +599,24 @@ function substituteListRefs(code: string, items: readonly string[]): string {
   });
 }
 
-/** 套用 `##pattern##replacement##flags##` 替换（`##p##` 无 replacement 即删除匹配，§3.3）。 */
+/**
+ * 套用 `##pattern##replacement##flags##` 替换（`##p##` 无 replacement 即删除匹配，§3.3）。
+ * `first`（regex1027）= legado replaceFirst：取首个匹配串、对它再套一次替换（Matcher.group(0).replaceFirst），
+ * 匹配外的文本丢弃，无匹配得空串。
+ */
 export function applyRegexSubs(text: string, subs: readonly RegexSub[]): string {
   let out = text;
   for (const sub of subs) {
     let re: RegExp;
     try {
-      re = new RegExp(sub.pattern, sub.flags ?? 'g');
+      re = new RegExp(sub.pattern, sub.first ? '' : (sub.flags ?? 'g'));
     } catch {
       return evalFailed(`正则无法编译：${sub.pattern}`, sub.pattern);
+    }
+    if (sub.first) {
+      const match = re.exec(out);
+      out = match ? match[0].replace(re, sub.replacement) : '';
+      continue;
     }
     out = out.replace(re, sub.replacement);
   }

@@ -108,7 +108,11 @@ export type RuleIr =
   // JsoupXpath 语义求值（xpatheval1027，ENGINE_SYNTAX_XPATH_EVAL）：翻不成 CSS 的 legado XPath 段。
   // program=null 仅限「`/` 开头、含 `{$.` 内嵌规则、解析不了」的段（legado 在 JSON 输入上按 Json 模式读它）。
   // source = 段原文（JSON 输入上交 jsonRuleString）；forced = 带 `@XPath:` 前缀（JSON 输入上也强制 XPath）。
-  | { kind: 'xpath'; program: XPathProgram | null; source: string; forced: boolean };
+  | { kind: 'xpath'; program: XPathProgram | null; source: string; forced: boolean }
+  // 当前内容原文（regex1027，ENGINE_SYNTAX_REGEX）：正则-only 规则（`##p##r###`，剥尾缀后主体为空）的输入。
+  // legado getString 主体为空时不跑解析器，直接对 content.toString() 做替换：整页作用域 = 页面原文，
+  // 条目作用域 = 元素 outerHtml（jsoup 带缩进美化，这里是 cheerio 原样序列化，见 evaluate.ts selfText）。
+  | { kind: 'self' };
 
 export type TemplatePart =
   | { kind: 'literal'; text: string }
@@ -122,6 +126,11 @@ export interface RegexSub {
   pattern: string;
   replacement: string;
   flags?: string;
+  /**
+   * legado replaceFirst（regex1027，ENGINE_SYNTAX_REGEX）：正则-only 段（主体为空）`##` 切出 ≥4 段（如 `##p##r###`）时
+   * 只取首个匹配，结果 = 该匹配串套一次替换，匹配外的文本丢弃；无匹配得空串。off 态与带选择器主体的段不产出此键。
+   */
+  first?: true;
 }
 
 /**
