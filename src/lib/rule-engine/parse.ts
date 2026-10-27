@@ -653,6 +653,8 @@ function andField(
   }
   const reject = (why: string): never => unsupported(`&& 组合${why}`, rule, { code: 'unsupported_operator', operator: '&&' });
   const list = AND_LIST_FIELDS.has(fieldName);
+  // legado 列表规则以 `:` 开头是 AllInOne 正则模式（splitSourceRule allInOne），`&&` 是正则级联而非节点合并。
+  if (list && parts[0].trim().startsWith(':')) reject('列表字段是 AllInOne 正则（`:` 开头）');
   const jsonMode = parts[0].trim().startsWith('$');
   const branches = parts.map((part): RuleIr => {
     if (part.trim() === '') unsupported('&& 分支为空', rule, { code: 'empty_and_branch' });

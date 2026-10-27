@@ -126,6 +126,8 @@ describe('parseFieldRule 接线', () => {
     expect(codeOf(() => f('a@text||b@text&&c@text'))).toBe('unsupported_operator');
     expect(codeOf(() => f('//div[1]/text()&&tag.p@text'))).toBe('unsupported_operator');
     expect(codeOf(() => f('class.a@li@text&&class.b@li', 'ruleSearch.bookList'))).toBe('unsupported_operator');
+    // AllInOne 正则列表（legado `:` 前缀，&& 是正则级联）
+    expect(codeOf(() => f(':正文卷[\\s\\S]*?/dl&&href ="([^"]+)">([^<]+)', 'ruleToc.chapterList'))).toBe('unsupported_operator');
     expect(codeOf(() => f('tag.h1@text&&'))).toBe('empty_and_branch');
     expect(codeOf(() => f(Array.from({ length: 17 }, (_, i) => `tag.p.${i}@text`).join('&&')))).toBe('or_branches_too_many');
   });

@@ -1813,6 +1813,25 @@ describe('落库元数据自洽：engine_semantics_version 与 rulesHash 前缀�
     expect(row.rules_hash.startsWith('2:')).toBe(true);
   });
 
+  it('and1027：&& bookList 在探测时按字段名编译（不带字段名会被当成未开放字段拒掉、候选 0）', async () => {
+    vi.stubEnv('ENGINE_SYNTAX_OR', '1');
+    vi.stubEnv('ENGINE_SYNTAX_AND', '1');
+    const source = syntheticSource('https://and-list.example.com/', {
+      ruleSearch: { bookList: '.i&&.j', name: '.t@text', bookUrl: 'a@href', author: '.a@text' },
+    } as Partial<RawSource>);
+    const fetchPage = vi.fn<AdmissionTransport>().mockResolvedValue(
+      page('<div class="j"><span class="t">书名</span><a href="/b/1">x</a></div>'));
+    const result = await runAdmissionBatch({
+      candidates: [{ url: 'https://and-list.example.com/', source }],
+      declaredHosts: new Set(['and-list.example.com']),
+      existing: new Map(), fetchPage, signal: signal(), maxProbes: 1, throttleMs: 0,
+    });
+    const row = result.rows[0];
+    expect(row.compile_ok).toBe(true);
+    expect(row.search_verdict).toBe('ok');
+    expect(row.rules_hash.startsWith('65:')).toBe(true); // 1 + and(64)（无 || 不计 or 位）
+  });
+
   it('on 态（ENGINE_SYNTAX_OR=1）：含 || 但仍被拒的行版本列 2、hash 前缀 2:', async () => {
     vi.stubEnv('ENGINE_SYNTAX_OR', '1');
     const source = syntheticSource('https://on-reject.example.com/', {

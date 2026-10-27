@@ -712,7 +712,7 @@ function searchCandidates(source: RawSource, text: string, pageUrl: string): { t
     if (typeof rule !== 'string' || !rule.trim()) return undefined;
     try { return parseFieldRule(rule, { jsEnabled, field: name }); } catch { return undefined; }
   };
-  const listIr = parseSafe(bookList);
+  const listIr = parseSafe(bookList, 'ruleSearch.bookList');
   if (!listIr) return [];
   const nameIr = parseSafe(name, 'ruleSearch.name');
   const bookUrlIr = parseSafe(bookUrl, 'ruleSearch.bookUrl');
