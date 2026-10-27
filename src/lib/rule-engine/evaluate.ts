@@ -5,7 +5,7 @@
 import { load, type CheerioAPI } from 'cheerio';
 import { decodeHTML } from 'entities';
 import {
-  type ChainStage, type CompiledRules, type FieldIr, type JsonPathIr, RuleEngineError, type RuleIr, type RegexSub,
+  type ChainStage, type CompiledRules, type FieldIr, type JsonPathIr, MAX_REGEX_PATTERN_LENGTH, RuleEngineError, type RuleIr, type RegexSub,
   type SkippedField, type TemplatePart,
 } from './types';
 import { aioListCode } from './aio-syntax';
@@ -704,7 +704,7 @@ function evaluateChain(chain: readonly ChainStage[], scope: EvalScope, list: boo
       value = list ? splitLines(evaluateField(stage.field, stageScope, true)) : evaluateField(stage.field, stageScope, multi);
       continue;
     }
-    const input = value ?? scope.source;
+    const input = value ?? scope.source ?? (stage.kind === 'js' && stage.detached ? '' : undefined);
     if (input === undefined) return evalFailed('JS 链首段需要页面原文，当前作用域没有');
     if (stage.kind === 'regex') {
       value = Array.isArray(input) && list
@@ -712,12 +712,53 @@ function evaluateChain(chain: readonly ChainStage[], scope: EvalScope, list: boo
         : applyRegexSubs(joinLines(input), stage.regex);
       continue;
     }
-    const code = Array.isArray(input) ? substituteListRefs(stage.code, input) : stage.code;
-    const out = runJs(code, { result: input, src: scope.source, baseUrl: scope.pageUrl });
+    const { code, regex } = makeUpJs(stage, input, scope);
+    if (code === '') { // legado getString：makeUp 后代码为空只做替换；无替换时 evalJS("") 得 null
+      if (regex === undefined) return null;
+      value = applyRegexSubs(joinLines(input), [regex]);
+      continue;
+    }
+    const out = runJs(code, { result: input, src: scope.source, baseUrl: scope.pageUrl }, stage.template ? stage.code : code);
     if (out === null) return null;
-    value = out;
+    if (regex === undefined) value = out;
+    else if (!Array.isArray(out)) value = applyRegexSubs(out, [regex]);
+    else if (list) value = out.map((item) => applyRegexSubs(item, [regex]));
+    else return evalFailed('JS 段返回数组后接 ## 替换（legado 按 List.toString 替换，不复现）');
   }
   return value ?? null;
+}
+
+/** makeUp 后代码的长度上限（jsext1028）：占位可能拼进整页文本，超出即失败。 */
+const MAX_MADE_UP_JS_CHARS = 65_536;
+
+/**
+ * JS 段执行前的 legado SourceRule.makeUpRule（jsext1028 见 parse.ts parseJsExtStage）：列表输入先做 `$n` 替换；
+ * 有 `{{}}` 模板时逐个求值拼回代码——规则占位在字段作用域上取字符串，JS 占位以上一段结果为 result 求值——
+ * 再按 `##` 切出代码与替换。占位结果为 null/数组（legado 口径不复现）、列表输入接模板一律求值失败。
+ */
+function makeUpJs(
+  stage: Extract<ChainStage, { kind: 'js' }>, input: JsValue, scope: EvalScope,
+): { code: string; regex?: RegexSub } {
+  if (!stage.template) return { code: Array.isArray(input) ? substituteListRefs(stage.code, input) : stage.code, regex: stage.regex };
+  if (Array.isArray(input)) return evalFailed('列表结果接含 {{}} 的 JS 段（legado 口径不复现）');
+  let text = '';
+  for (const part of stage.template) {
+    if (part.kind === 'text') text += part.text;
+    else if (part.kind === 'rule') text += evaluateField(part.field, scope);
+    else {
+      const out = runJs(part.code, { result: input, src: scope.source, baseUrl: scope.pageUrl });
+      if (out === null || Array.isArray(out)) return evalFailed('JS 段 {{}} 占位的结果不是字符串');
+      text += out;
+    }
+    if (text.length > MAX_MADE_UP_JS_CHARS) return evalFailed('JS 段 makeUp 后过长');
+  }
+  const parts = text.split('##');
+  const code = parts[0].trim();
+  if (parts.length < 2 || parts[1] === '') return { code };
+  if (parts[1].length > MAX_REGEX_PATTERN_LENGTH) return evalFailed('JS 段 makeUp 后正则 pattern 过长');
+  const regex: RegexSub = { pattern: parts[1], replacement: parts[2] ?? '' };
+  if (parts.length > 3) regex.first = true;
+  return { code, regex };
 }
 
 /** 字符串口径收尾（legado getString 末段）：数组按行拼；非正文字段含 `&` 时解 HTML 实体；trim。 */

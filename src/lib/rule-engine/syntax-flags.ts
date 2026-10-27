@@ -23,17 +23,18 @@ export const ENGINE_SEMANTICS_XPATH_BIT = 2;
 /** vars1027：@put/@get 静态子集语义位。版本再 +4（5–8 = 含变量位的四种组合），1–4 逐字不变。 */
 export const ENGINE_SEMANTICS_VARS_BIT = 4;
 
-/** 语义版本随 || / XPath / 变量 / JS / XPath 求值 / 正则 / && / AllInOne / 搜索 JS / 列表 JS 开关联动（唯一口径，供 compile.ts 缓存键与 rulesHash 复用）。 */
+/** 语义版本随 || / XPath / 变量 / JS / XPath 求值 / 正则 / && / AllInOne / 搜索 JS / 列表 JS / JS 扩展开关联动（唯一口径，供 compile.ts 缓存键与 rulesHash 复用）。 */
 export function engineSemanticsVersion(
   orEnabled: boolean, xpathEnabled = false, varsEnabled = false, jsEnabled = false, xpathEvalEnabled = false,
   regexEnabled = false, andEnabled = false, aioEnabled = false, searchJsEnabled = false, listJsEnabled = false,
+  jsExtEnabled = false,
 ): number {
   return (orEnabled ? ENGINE_SEMANTICS_VERSION_OR : ENGINE_SEMANTICS_VERSION)
     + (xpathEnabled ? ENGINE_SEMANTICS_XPATH_BIT : 0) + (varsEnabled ? ENGINE_SEMANTICS_VARS_BIT : 0)
     + (jsEnabled ? ENGINE_SEMANTICS_JS_BIT : 0) + (xpathEvalEnabled ? ENGINE_SEMANTICS_XPATH_EVAL_BIT : 0)
     + (regexEnabled ? ENGINE_SEMANTICS_REGEX_BIT : 0) + (andEnabled ? ENGINE_SEMANTICS_AND_BIT : 0)
     + (aioEnabled ? ENGINE_SEMANTICS_AIO_BIT : 0) + (searchJsEnabled ? ENGINE_SEMANTICS_SEARCH_JS_BIT : 0)
-    + (listJsEnabled ? ENGINE_SEMANTICS_LIST_JS_BIT : 0);
+    + (listJsEnabled ? ENGINE_SEMANTICS_LIST_JS_BIT : 0) + (jsExtEnabled ? ENGINE_SEMANTICS_JS_EXT_BIT : 0);
 }
 
 /**
@@ -182,5 +183,21 @@ export const ENGINE_SEMANTICS_LIST_JS_BIT = 512;
  */
 export function engineSyntaxListJsEnabled(env: OrEnv = process.env): boolean {
   const raw = env.ENGINE_SYNTAX_LIST_JS?.trim().toLowerCase();
+  return raw === '1' || raw === 'true' || raw === 'on';
+}
+
+/**
+ * jsext1028：JS 段扩展语义位。版本再 +1024（1025–2048），1–1024 逐字不变。
+ * 只对 off 态因 eval / JS 段内 `##`、`{{}}` 被拒、on 态编译通过的字段所在源计入（compile.ts sourceUsesJsExtSyntax）。
+ */
+export const ENGINE_SEMANTICS_JS_EXT_BIT = 1024;
+
+/**
+ * ENGINE_SYNTAX_JS_EXT 独立开关（jsext1028，默认 off，口径同 ENGINE_SYNTAX_OR；须 ENGINE_SYNTAX_JS 同开才生效）。
+ * on = JS 段放行 `eval`（沙箱本身是安全边界），并按 legado SourceRule.makeUpRule 处理 JS 段内的 `{{规则}}`/`{{JS}}`
+ * 与 `##正则##替换`：先求值占位拼回代码，再按 `##` 切出代码与替换。off = 逐字不变（这些 JS 段照旧拒）。
+ */
+export function engineSyntaxJsExtEnabled(env: OrEnv = process.env): boolean {
+  const raw = env.ENGINE_SYNTAX_JS_EXT?.trim().toLowerCase();
   return raw === '1' || raw === 'true' || raw === 'on';
 }

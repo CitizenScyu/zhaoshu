@@ -177,8 +177,8 @@ const PRELUDE = `(function(){
  * 解包成 null，getString 链随即中止得空串）；数组 → 字符串数组（逐项 String，null/undefined 项为 ''）；
  * 其余 String(value)。任何失败（语法错、运行时异常、超时、超内存、预算耗尽、未加载）都是 RULE_EVAL_FAILED。
  */
-export function runJs(code: string, bindings: JsBindings): JsValue | null {
-  return execute(code, bindings, exportValue);
+export function runJs(code: string, bindings: JsBindings, budgetKey = code): JsValue | null {
+  return execute(code, bindings, exportValue, budgetKey);
 }
 
 /**
@@ -191,8 +191,10 @@ export function runJsItems(code: string, bindings: JsBindings): JsListItem[] | n
   return execute(code, bindings, exportItems);
 }
 
+/** `budgetKey`：按哪段代码记预算（jsext1028 makeUp 后的代码随占位值变，按段原文记，免得每次换键绕过单段预算）。 */
 function execute<T>(
   code: string, bindings: JsBindings, exporter: (context: QuickJSContext, handle: QuickJSHandle) => T | null,
+  budgetKey = code,
 ): T | null {
   const module = ready;
   if (!module) return evalFailed('JS 沙箱未就绪');
@@ -206,7 +208,7 @@ function execute<T>(
     || inputs.some((text) => text.length > MAX_JS_INPUT_CHARS)) return evalFailed('JS 输入过大');
   const started = Date.now();
   const startedPrecise = performance.now();
-  checkBudget(code, started);
+  checkBudget(budgetKey, started);
   try {
     return runInFreshRuntime(module, code, bindings, started + EVAL_DEADLINE_MS, exporter);
   } catch (error) {
@@ -214,7 +216,7 @@ function execute<T>(
     discardModule();
     return evalFailed(`JS 沙箱异常：${error instanceof Error ? error.message : String(error)}`);
   } finally {
-    chargeBudget(code, started, Date.now(), performance.now() - startedPrecise);
+    chargeBudget(budgetKey, started, Date.now(), performance.now() - startedPrecise);
   }
 }
 

@@ -161,9 +161,21 @@ export type ChainStage =
    * `default` = 无前缀（原页面是 JSON 时按 Json 模式）。见 evaluate.ts listChainScopes。
    */
   | { kind: 'rule'; field: FieldIr; mode?: 'json' | 'html' | 'default' }
-  | { kind: 'js'; code: string }
+  /**
+   * `template` / `regex`（jsext1028，ENGINE_SYNTAX_JS_EXT）：legado SourceRule.makeUpRule 对 JS 段的改写。`template` = 段内
+   * `{{}}` 切出的片段，求值时拼回代码后再按 `##` 切（此时 code 是段原文，只作预算键）；无 `{{}}` 时编译期已切好，
+   * code = 首段 trim，`regex` = 其后的替换，作用在 JS 结果上。`detached`（jsext1028）：条目级字段首段 JS 不读 result/src，
+   * 作用域没有原文时以空串起链（legado 首段 result 是 Element/Map，代码不碰它则产出相同）。
+   */
+  | { kind: 'js'; code: string; template?: JsTemplatePart[]; regex?: RegexSub; detached?: true }
   /** 剥掉 ## 尾缀后主体为空的段（如 `</js>##广告##`）：只对上一段结果做替换。 */
   | { kind: 'regex'; regex: RegexSub[] };
+
+/**
+ * JS 段 makeUp 模板的片段（jsext1028）：字面代码、`{{规则}}`（legado isRule：`@`/`$.`/`$[`/`//` 开头，在字段作用域上取字符串）、
+ * `{{JS}}`（以上一段结果为 result 在沙箱求值，结果按字符串拼回代码）。
+ */
+export type JsTemplatePart = { kind: 'text'; text: string } | { kind: 'rule'; field: FieldIr } | { kind: 'js'; code: string };
 
 /** 一条字段规则的顶层组合。 */
 export interface FieldIr {

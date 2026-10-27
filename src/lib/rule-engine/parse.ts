@@ -8,6 +8,7 @@ import {
   FieldIr,
   JS_JAVA_HELPERS,
   JsonPathIr,
+  JsTemplatePart,
   MAX_CSS_CHAIN_DEPTH,
   MAX_JS_RULE_LENGTH,
   MAX_OR_BRANCHES,
@@ -23,8 +24,8 @@ import {
 import { parseJsonPath } from './jsonpath';
 import { AIO_LIST_FIELDS, isAioListField, isAioListRule, parseAioField } from './aio-syntax';
 import {
-  engineSyntaxAioEnabled, engineSyntaxAndEnabled, engineSyntaxJsEnabled, engineSyntaxListJsEnabled, engineSyntaxOrEnabled, engineSyntaxRegexEnabled,
-  engineSyntaxXPathEnabled, engineSyntaxXPathEvalEnabled,
+  engineSyntaxAioEnabled, engineSyntaxAndEnabled, engineSyntaxJsEnabled, engineSyntaxJsExtEnabled, engineSyntaxListJsEnabled, engineSyntaxOrEnabled,
+  engineSyntaxRegexEnabled, engineSyntaxXPathEnabled, engineSyntaxXPathEvalEnabled,
 } from './syntax-flags';
 import { compileXPath, XPathSyntaxError } from './xpath-eval';
 import { looksLikeXPath, xpathPrefixed, xpathSegmentBody, xpathToCss } from './xpath-subset';
@@ -542,6 +543,11 @@ export interface ParseOptions {
    * 对象条目按 legado 键值直取。只在 jsEnabled 与 listJsEnabled 同开时生效。
    */
   listJsGroup?: boolean;
+  /**
+   * JS 段扩展（ENGINE_SYNTAX_JS_EXT，jsext1028；须 jsEnabled）：JS 段放行 `eval`；字符串字段的 JS 段内 `{{}}`/`##` 按 legado
+   * SourceRule.makeUpRule 改写（列表字段 getElements 不 makeUp，仍拒）。默认读 env（缺失=off）。
+   */
+  jsExtEnabled?: boolean;
 }
 
 export function parseFieldRule(rule: string, options: ParseOptions = {}): FieldIr {
@@ -767,6 +773,7 @@ function parseJsChain(trimmed: string, rule: string, options: ParseOptions): Fie
   }
   if (trimmed.length > MAX_JS_RULE_LENGTH) unsupported('规则过长', rule, { code: 'rule_too_long' });
   const regexEnabled = options.regexEnabled ?? engineSyntaxRegexEnabled();
+  const jsExt = options.jsExtEnabled ?? engineSyntaxJsExtEnabled();
   const segmentOptions: ParseOptions = {
     orEnabled: options.orEnabled, xpathEnabled: options.xpathEnabled, xpathEvalEnabled: options.xpathEvalEnabled, jsEnabled: false,
     regexEnabled,
@@ -786,9 +793,19 @@ function parseJsChain(trimmed: string, rule: string, options: ParseOptions): Fie
   for (const match of trimmed.matchAll(JS_SEGMENT_RE)) {
     pushRule(trimmed.slice(last, match.index));
     const code = match[1] ?? match[2] ?? '';
-    if (itemLevel && chain.length === 0) unsupported('条目级字段首段不能是 JS', rule, { code: 'unsupported_js' });
-    checkJsCode(code, rule, itemLevel);
-    chain.push({ kind: 'js', code });
+    const detached = itemLevel && chain.length === 0;
+    if (detached && !(jsExt && !jsReadsInput(code))) unsupported('条目级字段首段不能是 JS', rule, { code: 'unsupported_js' });
+    if (jsExt) {
+      const stage = parseJsExtStage(code, rule, itemLevel, segmentOptions);
+      if (detached) {
+        if (stage.kind !== 'js') unsupported('条目级字段首段不能是纯正则', rule, { code: 'unsupported_js' });
+        stage.detached = true;
+      }
+      chain.push(stage);
+    } else {
+      checkJsCode(code, rule, itemLevel);
+      chain.push({ kind: 'js', code });
+    }
     last = match.index + match[0].length;
   }
   pushRule(trimmed.slice(last));
@@ -840,7 +857,7 @@ function parseListJsChain(rule: string, options: ParseOptions): FieldIr {
   for (const match of text.matchAll(JS_SEGMENT_RE)) {
     if (text.slice(last, match.index).trim() !== '') reject(chain.length === 0 ? '首段不是 JS' : 'JS 段之间夹规则段');
     const code = match[1] ?? match[2] ?? '';
-    checkJsCode(code, rule, false);
+    checkJsCode(code, rule, false, options.jsExtEnabled ?? engineSyntaxJsExtEnabled());
     chain.push({ kind: 'js', code });
     last = match.index + match[0].length;
   }
@@ -916,8 +933,98 @@ function objectKeyOf(rule: string): NonNullable<FieldIr['objectKey']> {
   return { key, regex };
 }
 
-/** JS 段的编译期白名单（沙箱内的二道防线见 js-sandbox.ts）。 */
-function checkJsCode(code: string, rule: string, itemLevel: boolean): void {
+// ---- JS 段扩展（jsext1028，ENGINE_SYNTAX_JS_EXT）----
+/** legado SourceRule.evalPattern 的 `{{}}` 部分（`@get:{}` 另拒）：取最短。 */
+const JS_TEMPLATE_RE = /\{\{([\w\W]*?)\}\}/g;
+
+/** 编译期骨架里的占位（不会出现在规则文本里）；查标识符时换成数字字面量。 */
+const TEMPLATE_HOLE = '\u0000';
+
+/** legado AnalyzeRule.isRule：`{{}}` 内以这些开头的按规则取值，其余按 JS 求值。 */
+function isMakeUpRule(text: string): boolean {
+  return text.startsWith('@') || text.startsWith('$.') || text.startsWith('$[') || text.startsWith('//');
+}
+
+/**
+ * JS 段的 legado makeUpRule（jsext1028）：SourceRule 构造把 JS 段原文按 evalPattern 切出 `{{}}` 占位，getString 前
+ * makeUpRule 把占位求值拼回，再 `split("##")`——首段 trim 为代码、第 2 段正则、第 3 段替换、≥4 段 replaceFirst
+ * （正则为空不替换）。只改写 off 态被拒的段：不含 `##`/`{{` 的段与旧路径同一产物（另放行 eval）。
+ * `{{规则}}` 按普通规则编译（不嵌 JS），`{{JS}}` 与拼回后的代码骨架过同一套白名单。
+ */
+function parseJsExtStage(code: string, rule: string, itemLevel: boolean, segmentOptions: ParseOptions): ChainStage {
+  if (/@(?:get|put):/i.test(code)) unsupported('JS 段含 @get/@put', rule, { code: 'unsupported_js' });
+  if (!code.includes('##') && !code.includes('{{')) {
+    checkJsCode(code, rule, itemLevel, true);
+    return { kind: 'js', code };
+  }
+  if (!code.includes('{{')) {
+    const parts = code.split('##');
+    const body = parts[0].trim();
+    const regex = makeUpRegex(parts, rule);
+    // legado getString：makeUp 后代码为空、有替换时跳过 evalJS，只对上一段结果做替换。
+    if (body === '' && regex) return { kind: 'regex', regex: [regex] };
+    checkJsCode(body, rule, itemLevel, true);
+    const stage: ChainStage = { kind: 'js', code: body };
+    if (regex) stage.regex = regex;
+    return stage;
+  }
+  const template: JsTemplatePart[] = [];
+  let skeleton = '';
+  let last = 0;
+  for (const match of code.matchAll(JS_TEMPLATE_RE)) {
+    const text = code.slice(last, match.index);
+    if (text !== '') template.push({ kind: 'text', text });
+    skeleton += text + TEMPLATE_HOLE;
+    const inner = match[1];
+    if (isMakeUpRule(inner)) {
+      template.push({ kind: 'rule', field: parseFieldRule(inner, segmentOptions) });
+    } else {
+      checkJsCode(inner, rule, itemLevel, true);
+      template.push({ kind: 'js', code: inner });
+    }
+    last = match.index + match[0].length;
+  }
+  const tail = code.slice(last);
+  if (tail !== '') template.push({ kind: 'text', text: tail });
+  skeleton += tail;
+  const parts = skeleton.split('##');
+  const body = parts[0].trim();
+  // 代码段为空（占位都在 ## 之后）且有替换段：求值期只做替换（evaluate.ts），不过白名单。
+  if (body !== '' || parts.length < 2) checkJsCode(body.replaceAll(TEMPLATE_HOLE, '0'), rule, itemLevel, true);
+  // 正则段里没有占位时编译期即可校验（有占位的留到求值期）。
+  if (parts.length > 1 && !parts[1].includes(TEMPLATE_HOLE)) makeUpRegex(parts, rule);
+  return { kind: 'js', code, template };
+}
+
+/** JS 段（含 `{{}}` 占位原文）可能读到上一段结果或作用域原文：引用 result/src 或能间接取到它们的标识符；字面量剥不干净也算。 */
+const JS_INPUT_IDENTIFIERS: ReadonlySet<string> = new Set(['result', 'src', 'eval', 'this', 'globalThis', 'arguments', 'Function']);
+
+function jsReadsInput(code: string): boolean {
+  // `{{JS}}` 占位以上一段结果为 result 求值，即使写在字符串字面量里也算；`{{规则}}` 在字段作用域取值，不算。
+  for (const match of code.matchAll(JS_TEMPLATE_RE)) if (!isMakeUpRule(match[1]) && jsReadsInput(match[1])) return true;
+  const bare = stripJsLiterals(code.replace(JS_TEMPLATE_RE, '0'));
+  if (bare === null) return true;
+  for (const match of bare.matchAll(/(?<![.\w$])[A-Za-z_$][\w$]*/g)) if (JS_INPUT_IDENTIFIERS.has(match[0])) return true;
+  return false;
+}
+
+/** makeUpRule 切出的正则替换（parts = `split("##")` 结果）；正则段为空 → 不替换。 */
+function makeUpRegex(parts: readonly string[], rule: string): RegexSub | undefined {
+  if (parts.length < 2 || parts[1] === '') return undefined;
+  const pattern = parts[1];
+  if (pattern.length > MAX_REGEX_PATTERN_LENGTH) unsupported('正则 pattern 过长', rule, { code: 'regex_pattern_too_long' });
+  try {
+    new RegExp(pattern, 'g');
+  } catch {
+    unsupported(`正则 pattern 无法编译：${pattern}`, rule, { code: 'regex_invalid' });
+  }
+  const regex: RegexSub = { pattern, replacement: parts[2] ?? '' };
+  if (parts.length > 3) regex.first = true;
+  return regex;
+}
+
+/** JS 段的编译期白名单（沙箱内的二道防线见 js-sandbox.ts）。`allowEval`（jsext1028）：放行 `eval`（代码同样在沙箱里跑）。 */
+function checkJsCode(code: string, rule: string, itemLevel: boolean, allowEval = false): void {
   const reject = (why: string): never => unsupported(`JS 段${why}`, rule, { code: 'unsupported_js' });
   if (code.trim() === '') reject('为空');
   // legado 在求值前对 JS 文本做 {{}}/@get/## 改写（SourceRule 构造与 makeUpRule），这里不模拟那几步。
@@ -925,7 +1032,9 @@ function checkJsCode(code: string, rule: string, itemLevel: boolean): void {
   const bare = stripJsLiterals(code) ?? reject('字符串/注释未闭合');
   for (const match of bare.matchAll(/(?<![.\w$])[A-Za-z_$][\w$]*/g)) {
     const name = match[0];
-    if (JS_BANNED_IDENTIFIERS.has(name) || (itemLevel && name === 'src')) reject(`引用了沙箱不提供的 ${name}`);
+    if ((JS_BANNED_IDENTIFIERS.has(name) && !(allowEval && name === 'eval')) || (itemLevel && name === 'src')) {
+      reject(`引用了沙箱不提供的 ${name}`);
+    }
     if (name !== 'java') continue;
     const member = /^\s*\.\s*([A-Za-z_$][\w$]*)/.exec(bare.slice(match.index + name.length));
     if (!member || !JS_JAVA_HELPERS.has(member[1])) reject(`用了沙箱不提供的 java.${member?.[1] ?? '[…]'}`);
