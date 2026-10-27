@@ -23,11 +23,13 @@ export const ENGINE_SEMANTICS_XPATH_BIT = 2;
 /** vars1027：@put/@get 静态子集语义位。版本再 +4（5–8 = 含变量位的四种组合），1–4 逐字不变。 */
 export const ENGINE_SEMANTICS_VARS_BIT = 4;
 
-/** 语义版本随 || / XPath / 变量开关联动（唯一口径，供 compile.ts 缓存键与 rulesHash 复用）。 */
-export function engineSemanticsVersion(orEnabled: boolean, xpathEnabled = false, varsEnabled = false, jsEnabled = false): number {
+/** 语义版本随 || / XPath / 变量 / JS / XPath 求值开关联动（唯一口径，供 compile.ts 缓存键与 rulesHash 复用）。 */
+export function engineSemanticsVersion(
+  orEnabled: boolean, xpathEnabled = false, varsEnabled = false, jsEnabled = false, xpathEvalEnabled = false,
+): number {
   return (orEnabled ? ENGINE_SEMANTICS_VERSION_OR : ENGINE_SEMANTICS_VERSION)
     + (xpathEnabled ? ENGINE_SEMANTICS_XPATH_BIT : 0) + (varsEnabled ? ENGINE_SEMANTICS_VARS_BIT : 0)
-    + (jsEnabled ? ENGINE_SEMANTICS_JS_BIT : 0);
+    + (jsEnabled ? ENGINE_SEMANTICS_JS_BIT : 0) + (xpathEvalEnabled ? ENGINE_SEMANTICS_XPATH_EVAL_BIT : 0);
 }
 
 /**
@@ -78,5 +80,21 @@ export const ENGINE_SEMANTICS_JS_BIT = 8;
  */
 export function engineSyntaxJsEnabled(env: OrEnv = process.env): boolean {
   const raw = env.ENGINE_SYNTAX_JS?.trim().toLowerCase();
+  return raw === '1' || raw === 'true' || raw === 'on';
+}
+
+/**
+ * xpatheval1027：JsoupXpath 语义求值位。版本再 +16（17–32），1–16 逐字不变。
+ * 只对实际有字段编译成 XPath 求值 IR 的源计入（compile.ts sourceUsesXPathEval），其余源 rules_hash 不翻动。
+ */
+export const ENGINE_SEMANTICS_XPATH_EVAL_BIT = 16;
+
+/**
+ * ENGINE_SYNTAX_XPATH_EVAL 独立开关（xpatheval1027，默认 off，口径同 ENGINE_SYNTAX_OR）。
+ * on 且 ENGINE_SYNTAX_XPATH on 时，翻不成 CSS 的 legado XPath 段（`@XPath:` 前缀或 `/` 开头）交
+ * xpath-eval.ts 按 JsoupXpath 语义求值；off = 逐字不变（子集外照旧 unsupported_xpath）。
+ */
+export function engineSyntaxXPathEvalEnabled(env: OrEnv = process.env): boolean {
+  const raw = env.ENGINE_SYNTAX_XPATH_EVAL?.trim().toLowerCase();
   return raw === '1' || raw === 'true' || raw === 'on';
 }

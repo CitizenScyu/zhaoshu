@@ -21,8 +21,9 @@ import {
   TerminalOp,
 } from './types';
 import { parseJsonPath } from './jsonpath';
-import { engineSyntaxJsEnabled, engineSyntaxOrEnabled, engineSyntaxXPathEnabled } from './syntax-flags';
-import { looksLikeXPath, xpathSegmentBody, xpathToCss } from './xpath-subset';
+import { engineSyntaxJsEnabled, engineSyntaxOrEnabled, engineSyntaxXPathEnabled, engineSyntaxXPathEvalEnabled } from './syntax-flags';
+import { compileXPath, XPathSyntaxError } from './xpath-eval';
+import { looksLikeXPath, xpathPrefixed, xpathSegmentBody, xpathToCss } from './xpath-subset';
 
 function unsupported(msg: string, rule: string, diagnostic: RuleDiagnostic): never {
   throw new RuleEngineError('RULE_UNSUPPORTED', msg, rule, diagnostic);
@@ -338,7 +339,7 @@ function cssEscapeContains(text: string): string {
 /**
  * 翻译一段（已剥正则尾缀、无顶层 ||）为 RuleIr。
  */
-function translateSegment(segment: string, rule: string, xpathEnabled = false): RuleIr {
+function translateSegment(segment: string, rule: string, xpathEnabled = false, xpathEval = false): RuleIr {
   const seg = segment.trim();
 
   // 1) JSONPath：段首 $ 或 {{$.x}} 模板
@@ -358,11 +359,17 @@ function translateSegment(segment: string, rule: string, xpathEnabled = false): 
 
   // 3) XPath：ENGINE_SYNTAX_XPATH on 时简单子集翻成 CSS（xpath1027，见 xpath-subset.ts）；
   //    子集外与开关 off 一律拒绝。翻出的 IR 不登记默认语法侧表——XPath 对 JSON 输入无意义。
+  //    xpatheval1027（ENGINE_SYNTAX_XPATH_EVAL）：子集外且属 legado XPath 模式（`@XPath:` 前缀或 `/` 开头）的段
+  //    改交 xpath-eval.ts 求值；只是「疑似 XPath」而不以 `/` 开头的段 legado 不按 XPath 处理，照旧拒。
   if (xpathEnabled) {
     const expr = xpathSegmentBody(seg);
     if (expr !== null) {
       const css = xpathToCss(expr);
-      if (!css) unsupported('XPath 超出可翻译子集', rule, { code: 'unsupported_xpath' });
+      if (!css) {
+        const forced = xpathPrefixed(seg);
+        if (xpathEval && (forced || seg.startsWith('/'))) return xpathEvalIr(expr, seg, forced, rule);
+        unsupported('XPath 超出可翻译子集', rule, { code: 'unsupported_xpath' });
+      }
       const terminal = css.terminal === undefined ? undefined : toTerminal(css.terminal, rule);
       return { kind: 'css', chain: css.selector ? [{ selector: css.selector }] : [], terminal };
     }
@@ -394,6 +401,20 @@ function translateSegment(segment: string, rule: string, xpathEnabled = false): 
   const ir = buildCssChain(seg, rule, false);
   DEFAULT_SYNTAX_SOURCE.set(ir, seg);
   return ir;
+}
+
+/**
+ * JsoupXpath 求值 IR（xpatheval1027）。解析不了的段拒 unsupported_xpath；例外是 `/` 开头、含 `{$.` 内嵌规则的段
+ * （如 `/book/{$.id}.html`）——legado 在 JSON 输入上按 Json 模式替换内嵌规则，留 program=null 只在 JSON 上求值。
+ */
+function xpathEvalIr(expr: string, seg: string, forced: boolean, rule: string): RuleIr {
+  try {
+    return { kind: 'xpath', program: compileXPath(expr), source: seg, forced };
+  } catch (error) {
+    if (!(error instanceof XPathSyntaxError)) throw error;
+    if (!forced && seg.includes('{$.')) return { kind: 'xpath', program: null, source: seg, forced };
+    return unsupported(`XPath 无法求值：${error.message}`, rule, { code: 'unsupported_xpath' });
+  }
 }
 
 /**
@@ -484,6 +505,8 @@ export interface ParseOptions {
   orEnabled?: boolean;
   /** 简单子集 XPath 是否翻成 CSS（ENGINE_SYNTAX_XPATH，xpath1027）。默认读 env（缺失=off）。 */
   xpathEnabled?: boolean;
+  /** 子集外 XPath 是否交 JsoupXpath 语义求值（ENGINE_SYNTAX_XPATH_EVAL，xpatheval1027；须 xpathEnabled）。默认读 env。 */
+  xpathEvalEnabled?: boolean;
   /** 含 JS 段的字段可否编译成链（ENGINE_SYNTAX_JS，jsbox1027）。默认读 env（缺失=off）；还须给出 field。 */
   jsEnabled?: boolean;
   /** 字段全名（如 `ruleContent.content`）。JS 链只对白名单字段开放，未给出时含 JS 照旧拒。 */
@@ -504,11 +527,12 @@ export function parseFieldRule(rule: string, options: ParseOptions = {}): FieldI
 
   const orEnabled = options.orEnabled ?? engineSyntaxOrEnabled();
   const xpathEnabled = options.xpathEnabled ?? engineSyntaxXPathEnabled();
+  const xpathEval = xpathEnabled && (options.xpathEvalEnabled ?? engineSyntaxXPathEvalEnabled());
   if (!orEnabled) {
     // off：冻结的 M1 路径（旧 splitTopLevel、旧顺序，逐字保留）。
     const orParts = splitTopLevel(trimmed, '||');
     if (orParts.length > 1) unsupported('规则含顶层 ||（T7）', rule, { code: 'unsupported_operator', operator: '||' });
-    return singleSegmentField(orParts[0], rule, xpathEnabled);
+    return singleSegmentField(orParts[0], rule, xpathEnabled, xpathEval);
   }
 
   // on：先剥字段级 ## 尾缀，再切顶层 ||。尾缀挂在 FieldIr.regex（组合选定后净化）。
@@ -519,11 +543,11 @@ export function parseFieldRule(rule: string, options: ParseOptions = {}): FieldI
     if (branches.length > MAX_OR_BRANCHES) {
       unsupported(`|| 分支数超上限（${branches.length} > ${MAX_OR_BRANCHES}）`, rule, { code: 'or_branches_too_many' });
     }
-    const field: FieldIr = { rules: [{ kind: 'or', branches: branches.map((branch) => parseOrBranch(branch, rule, xpathEnabled)) }] };
+    const field: FieldIr = { rules: [{ kind: 'or', branches: branches.map((branch) => parseOrBranch(branch, rule, xpathEnabled, xpathEval)) }] };
     if (regex.length > 0) field.regex = regex;
     return field;
   }
-  return singleSegmentField(body, rule, xpathEnabled, { body, regex });
+  return singleSegmentField(body, rule, xpathEnabled, xpathEval, { body, regex });
 }
 
 /** 单段（无顶层 ||）字段编译。off 路径的这段与旧实现逐行等价。 */
@@ -531,6 +555,7 @@ function singleSegmentField(
   segment: string,
   rule: string,
   xpathEnabled: boolean,
+  xpathEval: boolean,
   precomputed?: { body: string; regex: RegexSub[] },
 ): FieldIr {
   const { body, regex } = precomputed ?? stripRegexSuffix(segment, rule);
@@ -538,7 +563,7 @@ function singleSegmentField(
   // ##regex## 在 §2.3 里只定义为「选择器后缀」，无选择器主体的独立正则不在 M1 集内 → 显式拒绝
   // （不猜「对原始输入直接跑正则」的语义，§2.3 第5条不猜测）。
   if (body.trim() === '' && regex.length > 0) unsupported('正则-only 规则（无选择器主体，非 M1 集）', rule, { code: 'regex_only' });
-  const field: FieldIr = { rules: [translateSegment(body, rule, xpathEnabled)] };
+  const field: FieldIr = { rules: [translateSegment(body, rule, xpathEnabled, xpathEval)] };
   if (regex.length > 0) field.regex = regex;
   return field;
 }
@@ -548,9 +573,9 @@ function singleSegmentField(
  * 支内，形如 `(b||c)` 的「嵌套组合」不是合法本方言构件——按不支持的 CSS 选择器在
  * 求值期失败，编译期不猜其语义）。空支显式拒（`a||` 不猜「跳过空支」）。
  */
-function parseOrBranch(branch: string, rule: string, xpathEnabled: boolean): RuleIr {
+function parseOrBranch(branch: string, rule: string, xpathEnabled: boolean, xpathEval: boolean): RuleIr {
   if (branch.trim() === '') unsupported('|| 分支为空', rule, { code: 'empty_or_branch' });
-  return translateSegment(branch, rule, xpathEnabled);
+  return translateSegment(branch, rule, xpathEnabled, xpathEval);
 }
 
 // ---- JS 链（jsbox1027，ENGINE_SYNTAX_JS）----
@@ -602,7 +627,7 @@ function parseJsChain(trimmed: string, rule: string, options: ParseOptions): Fie
     unsupported('规则含 JS（@js:/<js>）', rule, { code: 'unsupported_js' });
   }
   if (trimmed.length > MAX_JS_RULE_LENGTH) unsupported('规则过长', rule, { code: 'rule_too_long' });
-  const segmentOptions: ParseOptions = { orEnabled: options.orEnabled, xpathEnabled: options.xpathEnabled, jsEnabled: false };
+  const segmentOptions: ParseOptions = { orEnabled: options.orEnabled, xpathEnabled: options.xpathEnabled, xpathEvalEnabled: options.xpathEvalEnabled, jsEnabled: false };
   const chain: ChainStage[] = [];
   const pushRule = (text: string) => {
     const segment = text.trim();

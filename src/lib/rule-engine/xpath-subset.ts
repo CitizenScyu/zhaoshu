@@ -15,9 +15,14 @@ export function looksLikeXPath(rule: string): boolean {
 
 const XPATH_PREFIX = '@xpath:';
 
+/** 段带 legado `@XPath:` 前缀（大小写不敏感）。 */
+export function xpathPrefixed(seg: string): boolean {
+  return seg.slice(0, XPATH_PREFIX.length).toLowerCase() === XPATH_PREFIX;
+}
+
 /** 开关 on 时该段按 XPath 处理则返回去前缀的表达式，否则 null（`@XPath:` 前缀、`/` 开头或旧判别命中）。 */
 export function xpathSegmentBody(seg: string): string | null {
-  if (seg.slice(0, XPATH_PREFIX.length).toLowerCase() === XPATH_PREFIX) return seg.slice(XPATH_PREFIX.length).trim();
+  if (xpathPrefixed(seg)) return seg.slice(XPATH_PREFIX.length).trim();
   if (seg.startsWith('/') || looksLikeXPath(seg)) return seg;
   return null;
 }

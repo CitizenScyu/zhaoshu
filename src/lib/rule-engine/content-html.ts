@@ -26,6 +26,8 @@ const TEXT_OPS = new Set(['text', 'ownText', 'textNodes']);
  */
 function ruleIsPlainText(ir: RuleIr): boolean {
   if (ir.kind === 'or') return ir.branches.every(ruleIsPlainText);
+  // xpatheval1027：末步是 text()/allText()/num()/@attr 的 XPath 产出纯文本；元素结果是 outerHtml，需转换。
+  if (ir.kind === 'xpath') return ir.program !== null && ir.program.plainText;
   if (ir.kind !== 'css') return false;
   return ir.terminal === undefined || TEXT_OPS.has(ir.terminal.op);
 }

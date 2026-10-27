@@ -5,10 +5,10 @@
 // 产物自然失效，不存在「|| 开关打开后仍复用 off 态编译缓存」的窗口。
 import { sourceRevision } from '@/lib/source-revision';
 import { jsChainFieldAllowed, parseFieldRule, ruleHasJs, type ParseOptions } from './parse';
-import type { CompiledRules } from './types';
+import type { CompiledRules, FieldIr, RuleIr } from './types';
 import {
   engineSemanticsVersion, engineSyntaxJsEnabled, engineSyntaxOrEnabled, engineSyntaxVarsEnabled, engineSyntaxXPathEnabled,
-  ENGINE_SEMANTICS_VERSION,
+  engineSyntaxXPathEvalEnabled, ENGINE_SEMANTICS_VERSION,
 } from './syntax-flags';
 import { resolveSourceVars, ruleMayUseVars } from './vars-subset';
 import { ruleMayUseXPath } from './xpath-subset';
@@ -31,6 +31,7 @@ export function engineVersionedKey(contentRevision: string, semanticsVersion = E
  * xpath1027：同理，ENGINE_SYNTAX_XPATH on 且规则组可能含 XPath 段的源再加 XPath 位（3/4），其余源不变。
  * vars1027：ENGINE_SYNTAX_VARS on 且规则组含 @put/@get 的源再加变量位（5–8）。
  * jsbox1027：ENGINE_SYNTAX_JS on 且可编译成 JS 链的字段里有 JS、源无 jsLib 时再加 JS 位（9–16）。
+ * xpatheval1027：ENGINE_SYNTAX_XPATH 与 ENGINE_SYNTAX_XPATH_EVAL 都 on 且有字段编译出 XPath 求值 IR 时再加求值位（17–32）。
  */
 export function engineSourceRevision(
   source: { url: string; searchUrl: unknown; rules: Record<string, unknown> },
@@ -40,11 +41,15 @@ export function engineSourceRevision(
   const xpathEnabled = options.xpathEnabled ?? engineSyntaxXPathEnabled();
   const varsEnabled = options.varsEnabled ?? engineSyntaxVarsEnabled();
   const jsEnabled = options.jsEnabled ?? engineSyntaxJsEnabled();
+  const xpathEval = options.xpathEvalEnabled ?? engineSyntaxXPathEvalEnabled();
   return engineVersionedKey(sourceRevision(source), engineSemanticsVersion(
     orEnabled && sourceUsesOrSyntax(source.rules),
     xpathEnabled && sourceUsesXPathSyntax(source.rules),
     varsEnabled && sourceUsesVarSyntax(source.rules),
     jsEnabled && sourceUsesJsSyntax(source.rules),
+    xpathEnabled && xpathEval && sourceUsesXPathEval(source.rules, {
+      orEnabled, varsEnabled, jsEnabled: jsEnabled && !sourceHasJsLib(source.rules),
+    }),
   ));
 }
 
@@ -102,6 +107,61 @@ export function sourceUsesJsSyntax(rules: Record<string, unknown>): boolean {
   return false;
 }
 
+function irUsesXPathEval(ir: RuleIr): boolean {
+  if (ir.kind === 'xpath') return true;
+  return ir.kind === 'or' && ir.branches.some(irUsesXPathEval);
+}
+
+function fieldUsesXPathEval(field: FieldIr): boolean {
+  if (field.rules.some(irUsesXPathEval)) return true;
+  return (field.chain ?? []).some((stage) => stage.kind === 'rule' && fieldUsesXPathEval(stage.field));
+}
+
+/** 按规则对象 + 开关组合记忆（rulesHash 与 compileSource 各算一次键；规则对象在读缓存 TTL 内不变）。 */
+const xpathEvalMemo = new WeakMap<object, Map<string, boolean>>();
+
+/**
+ * 源是否会因 ENGINE_SYNTAX_XPATH_EVAL 改变编译结果（xpatheval1027）：按 eval on 实际编译可能含 XPath 的字段，
+ * 有字段产出 `kind:'xpath'` IR 才算。子集内 XPath（翻成 CSS）、eval 下仍拒的段两态编译一致，identity 不该变。
+ */
+export function sourceUsesXPathEval(
+  rules: Record<string, unknown>,
+  options: { orEnabled: boolean; varsEnabled: boolean; jsEnabled: boolean },
+): boolean {
+  if (!someRule(rules, ruleMayUseXPath)) return false;
+  const memoKey = `${options.orEnabled}:${options.varsEnabled}:${options.jsEnabled}`;
+  let memo = xpathEvalMemo.get(rules);
+  const hit = memo?.get(memoKey);
+  if (hit !== undefined) return hit;
+  const sourceRules = options.varsEnabled ? resolveSourceVars(rules) : rules;
+  let uses = false;
+  for (const group of RULE_GROUPS) {
+    const fields = sourceRules[group];
+    if (uses || !fields || typeof fields !== 'object' || Array.isArray(fields)) continue;
+    for (const [field, rule] of Object.entries(fields as Record<string, unknown>)) {
+      if (typeof rule !== 'string' || !rule.trim() || !ruleMayUseXPath(rule)) continue;
+      try {
+        const ir = parseFieldRule(rule, {
+          orEnabled: options.orEnabled, xpathEnabled: true, xpathEvalEnabled: true, jsEnabled: options.jsEnabled,
+          field: `${group}.${field}`,
+        });
+        if (fieldUsesXPathEval(ir)) {
+          uses = true;
+          break;
+        }
+      } catch {
+        // eval on 也编译不过：两态都 skipped，不影响 identity
+      }
+    }
+  }
+  if (!memo) {
+    memo = new Map();
+    xpathEvalMemo.set(rules, memo);
+  }
+  memo.set(memoKey, uses);
+  return uses;
+}
+
 /** LRU 上限：单测/低并发下足够；无关热路径，只防规则对象无限积累。 */
 const CACHE_LIMIT = 64;
 const cache = new Map<string, CompiledRules>();
@@ -123,7 +183,8 @@ export function compileSource(
   const varsEnabled = options.varsEnabled ?? engineSyntaxVarsEnabled();
   // jsLib 源不开 JS 链（见 sourceHasJsLib）：字段里的 JS 照旧 unsupported_js。
   const jsEnabled = (options.jsEnabled ?? engineSyntaxJsEnabled()) && !sourceHasJsLib(source.rules);
-  const key = engineSourceRevision(source, { orEnabled, xpathEnabled, varsEnabled, jsEnabled });
+  const xpathEvalEnabled = options.xpathEvalEnabled ?? engineSyntaxXPathEvalEnabled();
+  const key = engineSourceRevision(source, { orEnabled, xpathEnabled, varsEnabled, jsEnabled, xpathEvalEnabled });
   const hit = cache.get(key);
   if (hit) {
     cache.delete(key); // 触达即续期（Map 插入序 = LRU 序）
@@ -139,7 +200,7 @@ export function compileSource(
       if (typeof rule !== 'string' || !rule.trim()) continue;
       const name = `${group}.${field}`;
       try {
-        compiled.set(name, parseFieldRule(rule, { orEnabled, xpathEnabled, jsEnabled, field: name }));
+        compiled.set(name, parseFieldRule(rule, { orEnabled, xpathEnabled, xpathEvalEnabled, jsEnabled, field: name }));
       } catch {
         compiled.set(name, { skipped: 'unsupported' });
       }

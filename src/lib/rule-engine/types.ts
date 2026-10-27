@@ -1,6 +1,7 @@
 // M1 规则引擎 IR 类型定义。字段语义全部对齐 legado 默认语法。
 // 设计依据：m1-engine-design.md v3 §2.2。任务 1 只交付 types/parse/jsonpath——
 // evaluate/dom-ops/compile/admission 属后续任务，本文件只声明解析层需要的类型。
+import type { XPathProgram } from './xpath-eval';
 
 /** 引擎支持档位。M1 = 默认语法 + 显式 CSS + JSONPath + ##正则##。 */
 export type Tier = 'M1' | 'T7';
@@ -103,7 +104,11 @@ export type RuleIr =
   // 空值短路——逐支求值到首个非空（文本非空白 / 节点集非空）；每支各自保持
   // css/jsonpath/template/text 形态，**节点支与标量支不互相压扁、不跨支合并**。
   // 求值语义见 evaluate.ts evaluateOr；分支预算见 MAX_OR_BRANCHES。
-  | { kind: 'or'; branches: RuleIr[] };
+  | { kind: 'or'; branches: RuleIr[] }
+  // JsoupXpath 语义求值（xpatheval1027，ENGINE_SYNTAX_XPATH_EVAL）：翻不成 CSS 的 legado XPath 段。
+  // program=null 仅限「`/` 开头、含 `{$.` 内嵌规则、解析不了」的段（legado 在 JSON 输入上按 Json 模式读它）。
+  // source = 段原文（JSON 输入上交 jsonRuleString）；forced = 带 `@XPath:` 前缀（JSON 输入上也强制 XPath）。
+  | { kind: 'xpath'; program: XPathProgram | null; source: string; forced: boolean };
 
 export type TemplatePart =
   | { kind: 'literal'; text: string }

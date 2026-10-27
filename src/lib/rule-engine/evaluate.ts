@@ -11,6 +11,7 @@ import {
 import { type JsValue, runJs } from './js-sandbox';
 import { evalJsonPath, evalJsonPathList, parseJsonPath } from './jsonpath';
 import { defaultSyntaxSource } from './parse';
+import { evaluateXPath } from './xpath-eval';
 import {
   applyTerminal,
   type CheerioNodes,
@@ -163,9 +164,33 @@ export function evaluateRule(ir: RuleIr, scope: EvalScope, multi = false): EvalR
       // P1a || 组合（空值短路）。列表上下文（evaluateFieldNodes）不走这里——
       // 它按「首个非空节点集」逐支取，见 evaluateFieldNodes 的 or 分支。
       return evaluateOr(ir, scope, multi);
+    case 'xpath':
+      return evaluateXPathRule(ir, scope, multi);
     default:
       return evalFailed('未知的规则 IR');
   }
+}
+
+/**
+ * JsoupXpath 语义求值（xpatheval1027）。JSON 输入上对齐 legado SourceRule：`/` 开头的段在 JSON 内容上走 Json 模式
+ * （jsonRuleString），只有 `@XPath:` 前缀强制 XPath（对 JSON 无意义，按失败处理）。
+ * 结果全是真元素 → 节点集（字段层照常转文本/列表）；content（multi）口径下元素取 outerHtml 逐行拼接（legado
+ * JXNode.asString），交 content-html 转换；值结果单值取首个非空（与 dom-ops 单值口径一致），multi 逐行拼接。
+ */
+function evaluateXPathRule(
+  ir: Extract<RuleIr, { kind: 'xpath' }>, scope: EvalScope, multi: boolean,
+): EvalResult {
+  if (scope.kind !== 'html') {
+    if (ir.forced) return evalFailed('@XPath: 规则不能对 JSON 输入求值');
+    return { kind: 'text', value: jsonRuleString(ir.source, scope.json) };
+  }
+  if (!ir.program) return evalFailed('规则在 HTML 输入上不是合法 XPath');
+  const out = evaluateXPath(ir.program, scope.$, scope.nodes.toArray(), scope.pageUrl, multi);
+  if (out.kind === 'nodes') {
+    if (multi) return { kind: 'text', value: out.nodes.map((node) => scope.$.html(node as never) ?? '').join(MULTI_JOIN) };
+    return { kind: 'nodes', nodes: scope.$(out.nodes as never) };
+  }
+  return { kind: 'text', value: multi ? out.values.join(MULTI_JOIN) : (out.values.find((v) => v.trim() !== '') ?? '') };
 }
 
 /**
