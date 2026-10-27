@@ -794,6 +794,31 @@ export function jsChainFieldAllowed(field: string): boolean {
   return JS_PAGE_FIELDS.has(field) || JS_ITEM_FIELDS.has(field);
 }
 
+// ---- 详情页 init（init1028，ENGINE_SYNTAX_INIT）----
+/**
+ * `ruleBookInfo.init` 原文能否按 legado BookInfo `setContent(getElement(init))` 复现（编译前的文本判据）。拒：
+ * `@put`/`@get`（变量袋与 vars-subset 的 init 口径另算）；`##`（getElement 的替换作用在 Elements/Map 的 toString 上）；
+ * `:` 开头（getElement 以 allInOne 切规则，按 Regex 模式取捕获组列表）；JS（返回对象供键值直取，另做）；
+ * `/` 或 `@XPath:` 开头的支（getElement 的 XPath 结果是 JXNode 列表，toString 后被当成 JSON）。
+ */
+export function initRuleTextSupported(rule: unknown): boolean {
+  if (typeof rule !== 'string' || rule.trim() === '') return false;
+  const trimmed = rule.trim();
+  if (/@put:|@get:/i.test(trimmed) || trimmed.includes('##') || trimmed.startsWith(':') || ruleHasJs(trimmed)) return false;
+  return !/(^|\|\|)\s*(\/|@xpath:)/i.test(trimmed);
+}
+
+/**
+ * init 编译结果能否复现（IR 判据，配合 initRuleTextSupported）：单条 css / jsonpath，或支全是 css / jsonpath 的 `||`。
+ * 模板、字面量、`&&`、正则尾缀、makeUp、JS 链一律不收。HTML/JSON 两侧再按页面在求值期细分（evaluate.ts evaluateInitScope）。
+ */
+export function initFieldSupported(field: FieldIr): boolean {
+  if (field.chain || field.makeUp || field.regex || field.joins || field.concats || field.rules.length !== 1) return false;
+  const ir = field.rules[0];
+  const simple = (rule: RuleIr) => rule.kind === 'css' || rule.kind === 'jsonpath';
+  return simple(ir) || (ir.kind === 'or' && ir.branches.every(simple));
+}
+
 /**
  * 依赖 legado 宿主状态或动态代码的标识符：沙箱里没有对应对象，编译期先拒，免得准入放进实跑必失败的源。
  * 只认「前面不是 `.`」的裸标识符（`x.book` 是属性访问，不算）；字符串/注释里的不算。

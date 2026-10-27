@@ -8,11 +8,11 @@ import { upgradeSourceTemplateUrl } from '@/lib/source-policy';
 import { sourceRevision } from '@/lib/source-revision';
 import { engineSearchJsActive } from './compile-smoke';
 import { aioGroups } from './aio-syntax';
-import { jsChainFieldAllowed, listJsGroups, parseFieldRule, ruleHasJs, type ParseOptions } from './parse';
+import { initFieldSupported, initRuleTextSupported, jsChainFieldAllowed, listJsGroups, parseFieldRule, ruleHasJs, type ParseOptions } from './parse';
 import type { CompiledRules, FieldIr, RuleIr } from './types';
 import {
-  engineSemanticsVersion, engineSyntaxAioEnabled, engineSyntaxAndEnabled, engineSyntaxJsBindEnabled, engineSyntaxJsEnabled, engineSyntaxJsExtEnabled,
-  engineSyntaxJsGetEnabled, engineSyntaxJsonPathEnabled, engineSyntaxJsUtilEnabled, engineSyntaxListJsEnabled,
+  engineSemanticsVersion, engineSyntaxAioEnabled, engineSyntaxAndEnabled, engineSyntaxInitEnabled, engineSyntaxJsBindEnabled, engineSyntaxJsEnabled,
+  engineSyntaxJsExtEnabled, engineSyntaxJsGetEnabled, engineSyntaxJsonPathEnabled, engineSyntaxJsUtilEnabled, engineSyntaxListJsEnabled,
   engineSyntaxOrEnabled, engineSyntaxRegexEnabled, engineSyntaxVarsEnabled, engineSyntaxXPathEnabled, engineSyntaxXPathEvalEnabled, ENGINE_SEMANTICS_VERSION,
 } from './syntax-flags';
 import { resolveSourceVars, ruleMayUseVars } from './vars-subset';
@@ -25,6 +25,8 @@ export interface CompileOptions extends ParseOptions {
   varsEnabled?: boolean;
   /** searchjs1027：搜索模板 JS（缺省 = ENGINE_POST_SEARCH 与 ENGINE_SEARCH_JS 都开）。只影响语义版本位，不影响编译产物。 */
   searchJsEnabled?: boolean;
+  /** init1028：详情页 init 生效（ENGINE_SYNTAX_INIT，默认读 env）。只给可复现的 init 挂 FieldIr.initScope。 */
+  initEnabled?: boolean;
 }
 
 /** 版本化缓存键（P0 口径）：semanticsVersion:contentRevision。 */
@@ -49,6 +51,7 @@ export function engineVersionedKey(contentRevision: string, semanticsVersion = E
  * jsget1028：ENGINE_SYNTAX_JS_GET on、JS 链对该源生效且有字段 off 态被拒、on 态编译通过时再加 getter 位（4097–8192）。
  * jsutil1028：ENGINE_SYNTAX_JS_UTIL on、JS 链对该源生效且有字段 off 态被拒、on 态编译通过时再加加解密帮手位（8193–16384）。
  * jsonpath1028：ENGINE_SYNTAX_JSON_PATH on 且有字段 off 态被拒、on 态编译通过时再加 JSONPath 扩展位（16385–32768）。
+ * init1028：ENGINE_SYNTAX_INIT on 且 ruleBookInfo.init 可复现（sourceUsesInitSyntax）时再加 init 位（32769–65536）。
  */
 export function engineSourceRevision(
   source: { url: string; searchUrl: unknown; rules: Record<string, unknown> },
@@ -69,6 +72,7 @@ export function engineSourceRevision(
   const jsGetEnabled = options.jsGetEnabled ?? engineSyntaxJsGetEnabled();
   const jsUtilEnabled = options.jsUtilEnabled ?? engineSyntaxJsUtilEnabled();
   const jsonPathEnabled = options.jsonPathEnabled ?? engineSyntaxJsonPathEnabled();
+  const initEnabled = options.initEnabled ?? engineSyntaxInitEnabled();
   const jsChain = jsEnabled && !sourceHasJsLib(source.rules);
   // 下游 sourceUses* 的编译与 compileSource 同一组开关（jsBind/jsGet/jsUtil 只在 JS 链生效时有意义）。
   const jsBind = jsChain && jsBindEnabled;
@@ -113,6 +117,10 @@ export function engineSourceRevision(
     jsonPathEnabled && sourceUsesJsonPathSyntax(source.rules, {
       orEnabled, varsEnabled, jsEnabled: jsChain, xpathEnabled, xpathEvalEnabled: xpathEval, regexEnabled, andEnabled, aioEnabled, listJsEnabled,
       jsExtEnabled, jsBindEnabled: jsBind, jsGetEnabled: jsGet, jsUtilEnabled: jsUtil,
+    }),
+    initEnabled && sourceUsesInitSyntax(source.rules, {
+      orEnabled, xpathEnabled, xpathEvalEnabled: xpathEval, jsEnabled: jsChain, regexEnabled, andEnabled, aioEnabled, listJsEnabled,
+      jsExtEnabled, jsBindEnabled: jsBind, jsGetEnabled: jsGet, jsUtilEnabled: jsUtil, jsonPathEnabled,
     }),
   ));
 }
@@ -672,6 +680,52 @@ export function sourceUsesJsonPathSyntax(
   return uses;
 }
 
+/** 源的 `ruleBookInfo.init` 原文（非字符串/缺组 = undefined）。 */
+function initRuleOf(rules: Record<string, unknown>): unknown {
+  const info = rules.ruleBookInfo;
+  return info && typeof info === 'object' && !Array.isArray(info) ? (info as Record<string, unknown>).init : undefined;
+}
+
+/** compileSource 编出的 init 是否挂 initScope（init1028）：原文过 initRuleTextSupported、编译结果过 initFieldSupported。 */
+function initApplies(rule: unknown, field: FieldIr | { skipped: string } | undefined): field is FieldIr {
+  return field !== undefined && !('skipped' in field) && initRuleTextSupported(rule) && initFieldSupported(field);
+}
+
+const initMemo = new WeakMap<object, Map<string, boolean>>();
+
+/**
+ * 源是否会因 ENGINE_SYNTAX_INIT 改变详情页求值（init1028）：init 原文与编译结果（其余开关同 compileSource）都可复现才算。
+ * init 不受 vars-subset 改写（文本判据已拒 @put/@get），按原文编译即与 compileSource 同口径。
+ */
+export function sourceUsesInitSyntax(
+  rules: Record<string, unknown>,
+  options: {
+    orEnabled: boolean; xpathEnabled: boolean; xpathEvalEnabled: boolean; jsEnabled: boolean; regexEnabled: boolean; andEnabled: boolean;
+    aioEnabled: boolean; listJsEnabled: boolean; jsExtEnabled: boolean; jsBindEnabled: boolean; jsGetEnabled: boolean; jsUtilEnabled: boolean;
+    jsonPathEnabled: boolean;
+  },
+): boolean {
+  const rule = initRuleOf(rules);
+  if (!initRuleTextSupported(rule)) return false;
+  const memoKey = `${options.orEnabled}:${options.xpathEnabled}:${options.xpathEvalEnabled}:${options.jsEnabled}:${options.regexEnabled}:${options.andEnabled}:${options.aioEnabled}:${options.listJsEnabled}:${options.jsExtEnabled}:${options.jsBindEnabled}:${options.jsGetEnabled}:${options.jsUtilEnabled}:${options.jsonPathEnabled}`;
+  let memo = initMemo.get(rules);
+  const hit = memo?.get(memoKey);
+  if (hit !== undefined) return hit;
+  let field: FieldIr | undefined;
+  try {
+    field = parseFieldRule(rule as string, { ...options, field: 'ruleBookInfo.init' });
+  } catch {
+    field = undefined;
+  }
+  const uses = initApplies(rule, field);
+  if (!memo) {
+    memo = new Map();
+    initMemo.set(rules, memo);
+  }
+  memo.set(memoKey, uses);
+  return uses;
+}
+
 /** LRU 上限：单测/低并发下足够；无关热路径，只防规则对象无限积累。 */
 const CACHE_LIMIT = 64;
 const cache = new Map<string, CompiledRules>();
@@ -703,9 +757,10 @@ export function compileSource(
   const jsGetEnabled = options.jsGetEnabled ?? engineSyntaxJsGetEnabled();
   const jsUtilEnabled = options.jsUtilEnabled ?? engineSyntaxJsUtilEnabled();
   const jsonPathEnabled = options.jsonPathEnabled ?? engineSyntaxJsonPathEnabled();
+  const initEnabled = options.initEnabled ?? engineSyntaxInitEnabled();
   const key = engineSourceRevision(source, {
     orEnabled, xpathEnabled, varsEnabled, jsEnabled, xpathEvalEnabled, regexEnabled, andEnabled, aioEnabled, listJsEnabled, jsExtEnabled,
-    jsBindEnabled, jsGetEnabled, jsUtilEnabled, jsonPathEnabled,
+    jsBindEnabled, jsGetEnabled, jsUtilEnabled, jsonPathEnabled, initEnabled,
   });
   const hit = cache.get(key);
   if (hit) {
@@ -734,6 +789,10 @@ export function compileSource(
       }
     }
   }
+  // init1028：可复现的 init 挂 initScope（详情字段改在 init 结果上求值，见 evaluate.ts bookInfoScope）；判据看原文，不看 vars 改写后的。
+  const init = compiled.get('ruleBookInfo.init');
+  const initRule = initRuleOf(source.rules);
+  if (initEnabled && initApplies(initRule, init)) compiled.set('ruleBookInfo.init', { ...init, initScope: true });
   cache.set(key, compiled);
   while (cache.size > CACHE_LIMIT) cache.delete(cache.keys().next().value!);
   return compiled;

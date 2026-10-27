@@ -23,11 +23,12 @@ export const ENGINE_SEMANTICS_XPATH_BIT = 2;
 /** vars1027：@put/@get 静态子集语义位。版本再 +4（5–8 = 含变量位的四种组合），1–4 逐字不变。 */
 export const ENGINE_SEMANTICS_VARS_BIT = 4;
 
-/** 语义版本随 || / XPath / 变量 / JS / XPath 求值 / 正则 / && / AllInOne / 搜索 JS / 列表 JS / JS 扩展 / 宿主绑定 / java.getString / 加解密帮手 / JSONPath 扩展开关联动（唯一口径，供 compile.ts 缓存键与 rulesHash 复用）。 */
+/** 语义版本随 || / XPath / 变量 / JS / XPath 求值 / 正则 / && / AllInOne / 搜索 JS / 列表 JS / JS 扩展 / 宿主绑定 / java.getString / 加解密帮手 / JSONPath 扩展 / 详情 init 开关联动（唯一口径，供 compile.ts 缓存键与 rulesHash 复用）。 */
 export function engineSemanticsVersion(
   orEnabled: boolean, xpathEnabled = false, varsEnabled = false, jsEnabled = false, xpathEvalEnabled = false,
   regexEnabled = false, andEnabled = false, aioEnabled = false, searchJsEnabled = false, listJsEnabled = false,
   jsExtEnabled = false, jsBindEnabled = false, jsGetEnabled = false, jsUtilEnabled = false, jsonPathEnabled = false,
+  initEnabled = false,
 ): number {
   return (orEnabled ? ENGINE_SEMANTICS_VERSION_OR : ENGINE_SEMANTICS_VERSION)
     + (xpathEnabled ? ENGINE_SEMANTICS_XPATH_BIT : 0) + (varsEnabled ? ENGINE_SEMANTICS_VARS_BIT : 0)
@@ -36,7 +37,8 @@ export function engineSemanticsVersion(
     + (aioEnabled ? ENGINE_SEMANTICS_AIO_BIT : 0) + (searchJsEnabled ? ENGINE_SEMANTICS_SEARCH_JS_BIT : 0)
     + (listJsEnabled ? ENGINE_SEMANTICS_LIST_JS_BIT : 0) + (jsExtEnabled ? ENGINE_SEMANTICS_JS_EXT_BIT : 0)
     + (jsBindEnabled ? ENGINE_SEMANTICS_JS_BIND_BIT : 0) + (jsGetEnabled ? ENGINE_SEMANTICS_JS_GET_BIT : 0)
-    + (jsUtilEnabled ? ENGINE_SEMANTICS_JS_UTIL_BIT : 0) + (jsonPathEnabled ? ENGINE_SEMANTICS_JSON_PATH_BIT : 0);
+    + (jsUtilEnabled ? ENGINE_SEMANTICS_JS_UTIL_BIT : 0) + (jsonPathEnabled ? ENGINE_SEMANTICS_JSON_PATH_BIT : 0)
+    + (initEnabled ? ENGINE_SEMANTICS_INIT_BIT : 0);
 }
 
 /**
@@ -269,5 +271,22 @@ export const ENGINE_SEMANTICS_JSON_PATH_BIT = 16384;
  */
 export function engineSyntaxJsonPathEnabled(env: OrEnv = process.env): boolean {
   const raw = env.ENGINE_SYNTAX_JSON_PATH?.trim().toLowerCase();
+  return raw === '1' || raw === 'true' || raw === 'on';
+}
+
+/**
+ * init1028：详情页 `ruleBookInfo.init` 语义位。版本再 +32768（32769–65536），1–32768 逐字不变。
+ * 只对 init 形态可复现（parse.ts initRuleSupported）的源计入（compile.ts sourceUsesInitSyntax）。
+ */
+export const ENGINE_SEMANTICS_INIT_BIT = 32768;
+
+/**
+ * ENGINE_SYNTAX_INIT 独立开关（init1028，默认 off，口径同 ENGINE_SYNTAX_OR）。
+ * on = 详情页字段（name/author/tocUrl）按 legado BookInfo `setContent(getElement(init))` 先把内容换成 init 的结果再求值：
+ * HTML 上默认语法/CSS 取节点集（Elements.toString 重新解析），JSON 上 JSONPath（含默认语法补 `$.`）取 Jayway getObject 的值；
+ * 只收 parse.ts initRuleSupported 的形态，其余 init 照旧不生效。off = 逐字不变（init 一律不生效）。
+ */
+export function engineSyntaxInitEnabled(env: OrEnv = process.env): boolean {
+  const raw = env.ENGINE_SYNTAX_INIT?.trim().toLowerCase();
   return raw === '1' || raw === 'true' || raw === 'on';
 }

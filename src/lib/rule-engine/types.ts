@@ -236,6 +236,11 @@ export interface FieldIr {
    * 其余字段的沙箱逐字不变（见 js-sandbox.ts JsBindings.utilHelpers）。
    */
   jsUtil?: true;
+  /**
+   * 详情页 init 生效（init1028，ENGINE_SYNTAX_INIT，只挂在 `ruleBookInfo.init` 上，且形态过了 parse.ts initRuleSupported）：
+   * 详情字段先在 init 的结果上求值（evaluate.ts bookInfoScope）。未挂 = init 不生效（off 态口径）。
+   */
+  initScope?: true;
 }
 
 /** 装饰字段编译失败不阻断，标 skip 的占位。 */

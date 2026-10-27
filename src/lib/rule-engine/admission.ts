@@ -20,7 +20,7 @@ import {
 } from './compile-smoke';
 import { listJsGroups, parseFieldRule } from './parse';
 import {
-  createScope, evaluateField, evaluateFieldList, normalizeBody,
+  bookInfoScope, createScope, evaluateField, evaluateFieldList, normalizeBody,
 } from './evaluate';
 import { RuleEngineError, type FieldIr, type RuleDiagnostic } from './types';
 import { compileSource, engineSourceRevision } from './compile';
@@ -999,7 +999,8 @@ export async function readabilityShadow(
     };
     const detail = await get(gate(sample.url, sample.pageUrl));
     stage = 'toc';
-    const rawToc = text('ruleBookInfo.tocUrl', detail.scope).trim();
+    // init1028：tocUrl 同 api.ts engineFetchDetail 在 init 结果上求值；tocUrl 缺省/等于详情页时目录照旧读详情页原文（legado tocHtml）。
+    const rawToc = text('ruleBookInfo.tocUrl', bookInfoScope(compiled, detail.scope)).trim();
     const tocUrl = rawToc ? gate(rawToc, detail.url) : detail.url;
     const toc = tocUrl === detail.url ? detail : await get(tocUrl);
     const list = field('ruleToc.chapterList');

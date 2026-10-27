@@ -10,7 +10,7 @@ import {
 } from './types';
 import { aioListCode } from './aio-syntax';
 import { type JsBindings, type JsListItem, type JsValue, runJs, runJsItems } from './js-sandbox';
-import { evalJsonPath, evalJsonPathList, parseJsonPath } from './jsonpath';
+import { evalJsonPath, evalJsonPathList, isDefinitePath, parseJsonPath } from './jsonpath';
 import { defaultSyntaxSource } from './parse';
 import { evaluateXPath } from './xpath-eval';
 import {
@@ -104,6 +104,11 @@ export interface HtmlScope {
   pageUrl: string;
   /** 页面原文（jsbox1027：JS 链首段的 result 与 `src`）。只有整页作用域有，收窄到条目后为 undefined。 */
   source?: string;
+  /**
+   * legado content 不是字符串时的 `content.toString()`（init1028：init 取出的 Elements 按行拼 outerHtml）。只供正则-only 规则；
+   * JS 链首段在 legado 拿到的是 Elements 对象，不复现（source 留空，首段 JS 求值失败）。
+   */
+  contentText?: string;
   /** 宿主绑定（bind1028）；列表条目作用域沿用页面作用域的。 */
   host?: ScopeHost;
 }
@@ -154,7 +159,7 @@ function rescope(text: string, from: EvalScope): EvalScope {
 
 /** 收窄作用域到某个节点（列表字段逐条求值用，如 bookList → 每条的 name/author/bookUrl）。 */
 export function insideNode(scope: HtmlScope, node: unknown): HtmlScope {
-  return { ...scope, nodes: scope.$(node as never), source: undefined };
+  return { ...scope, nodes: scope.$(node as never), source: undefined, contentText: undefined };
 }
 
 // ---------------------------------------------------------------- 单规则求值
@@ -217,6 +222,7 @@ export function evaluateRule(ir: RuleIr, scope: EvalScope, multi = false): EvalR
 function selfText(scope: EvalScope): string {
   if (scope.source !== undefined) return scope.source;
   if (scope.kind !== 'html') return evalFailed('正则-only 规则不能对 JSON 条目求值');
+  if (scope.contentText !== undefined) return scope.contentText;
   return scope.nodes.toArray().map((node) => scope.$.html(node as never) ?? '').join(MULTI_JOIN);
 }
 
@@ -785,6 +791,66 @@ function jsonListItems(ir: RuleIr, json: unknown): unknown[] {
     default:
       return [];
   }
+}
+
+// ---------------------------------------------------------------- 详情页 init（init1028）
+/**
+ * legado BookInfo `analyzeRule.setContent(analyzeRule.getElement(init))`：详情字段改在 init 的结果上求值（FieldIr.initScope
+ * 由 compile.ts 只挂给可复现的 init）。getElement 按页面定模式（AnalyzeRule.SourceRule）：
+ * - HTML：默认语法/CSS 取 Elements（`||` 取首个非空支），后续字段 `Jsoup.parse(Elements.toString())`——这里按行拼 outerHtml
+ *   重新载入。带末端 op 的规则（getElements 把末段当选择器）与 JSONPath（Jayway 解析 HTML 抛错）求值失败。
+ * - JSON：Jayway `ctx.read`（默认配置，不吞异常）。确定路径取命中值，缺失/null 即失败（setContent(null) 断言）；不确定路径
+ *   取命中列表。对象/数组成为 JSON 作用域，字符串按页面重新判定 HTML/JSON；数字/布尔（Integer/Double.toString 口径）、
+ *   显式 CSS（强制 JSoup 解析 JSON 文本）与 `||`（Jayway 不认）求值失败。
+ * 页面 URL 与宿主绑定沿用页面作用域。
+ */
+export function evaluateInitScope(field: FieldIr, scope: EvalScope): EvalScope {
+  const ir = field.rules[0];
+  if (field.chain || field.rules.length !== 1 || ir === undefined) return evalFailed('init 规则不可复现');
+  const next = scope.kind === 'html' ? htmlInitScope(ir, scope) : jsonInitScope(ir, scope);
+  if (scope.host) next.host = scope.host;
+  return next;
+}
+
+function htmlInitScope(ir: RuleIr, scope: HtmlScope): HtmlScope {
+  const nodesOf = (rule: RuleIr): CheerioNodes => {
+    if (rule.kind !== 'css') return evalFailed('init 的 JSONPath 规则不能对 HTML 输入求值');
+    if (rule.terminal !== undefined) return evalFailed('init 规则带末端取值（legado getElements 当选择器），不复现');
+    const result = evaluateRule(rule, scope);
+    return result.kind === 'nodes' ? result.nodes : evalFailed('init 规则没有取出节点集');
+  };
+  let nodes: CheerioNodes | undefined;
+  if (ir.kind === 'or') {
+    for (const branch of ir.branches) {
+      nodes = nodesOf(branch);
+      if (nodes.length > 0) break;
+    }
+  } else nodes = nodesOf(ir);
+  const html = (nodes?.toArray() ?? []).map((node) => scope.$.html(node as never) ?? '').join(MULTI_JOIN);
+  const next = createHtmlScope(html, scope.pageUrl);
+  next.contentText = html;
+  return next;
+}
+
+function jsonInitScope(ir: RuleIr, scope: JsonScope): EvalScope {
+  if (scope.json === undefined) return evalFailed('init 规则不能对列表条目求值');
+  let path: JsonPathIr | null;
+  if (ir.kind === 'jsonpath') path = ir.path;
+  else if (ir.kind === 'css' && defaultSyntaxSource(ir) !== undefined) path = reinterpretedPath(ir);
+  else return evalFailed('init 规则在 JSON 输入上不可复现（显式 CSS 或 ||）');
+  if (path === null) return evalFailed('init 规则不是合法 JSONPath');
+  const values = evalJsonPath(path, scope.json);
+  const value = isDefinitePath(path) ? values[0] : values;
+  if (value === undefined || value === null) return evalFailed('init 规则在 JSON 上没有命中（legado setContent(null)）');
+  if (typeof value === 'string') return rescope(value, scope);
+  if (typeof value !== 'object') return evalFailed('init 取出数字/布尔，不复现');
+  return createJsonScope(value, scope.pageUrl);
+}
+
+/** 详情字段（ruleBookInfo.name/author/tocUrl…）的求值作用域：init 挂了 initScope 时换成 init 结果，否则即页面作用域。 */
+export function bookInfoScope(compiled: CompiledRules, scope: EvalScope): EvalScope {
+  const init = compiled.get('ruleBookInfo.init');
+  return init && !('skipped' in init) && init.initScope ? evaluateInitScope(init, scope) : scope;
 }
 
 // ---------------------------------------------------------------- JS 链（jsbox1027）

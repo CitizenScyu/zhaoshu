@@ -13,7 +13,7 @@ import type { SourceRequestContext } from '@/lib/source-reader';
 import { contentHtmlToText, contentNeedsHtmlToText } from './content-html';
 import { isStructuredChallengePage } from './content-challenge';
 import {
-  compiledUsesJs, createScope, evaluateField, evaluateFieldList, evaluateFieldStrings, fieldUsesJs, normalizeBody,
+  bookInfoScope, compiledUsesJs, createScope, evaluateField, evaluateFieldList, evaluateFieldStrings, fieldUsesJs, normalizeBody,
 } from './evaluate';
 import { enginePostSearchEnabled, engineSearchJsActive } from './compile-smoke';
 import { preloadJsSandbox } from './js-sandbox';
@@ -155,10 +155,12 @@ export async function engineFetchDetail(
   const target = validateSourceUrl(bookUrl).href;
   const page = await context.page(target, { responseCharset: enginePostSearchEnabled() ? 'auto' : undefined });
   const scope = pageScope(source, page.text, page.url);
+  // init1028：详情字段在 init 结果上求值（未挂 initScope 时即页面作用域）；作者/别名兜底仍读页面原文。
+  const info = bookInfoScope(source.compiled, scope);
   const detail: Partial<SourceBookIdentity> & { tocUrl?: string } = {};
-  const title = evaluateText(source.compiled, 'ruleBookInfo.name', scope);
-  const author = evaluateText(source.compiled, 'ruleBookInfo.author', scope);
-  const tocUrl = absoluteUrl(evaluateText(source.compiled, 'ruleBookInfo.tocUrl', scope), page.url);
+  const title = evaluateText(source.compiled, 'ruleBookInfo.name', info);
+  const author = evaluateText(source.compiled, 'ruleBookInfo.author', info);
+  const tocUrl = absoluteUrl(evaluateText(source.compiled, 'ruleBookInfo.tocUrl', info), page.url);
   if (title) detail.title = title;
   if (tocUrl) detail.tocUrl = tocUrl;
   // 41-author：源的 ruleBookInfo.author 没命中（vikbook 写 .author@a 但页面并无该 class）时，
