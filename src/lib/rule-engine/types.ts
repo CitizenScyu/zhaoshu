@@ -208,6 +208,11 @@ export interface FieldIr {
    * 只是从首个 `##` 起的尾巴，拼出后切成动态正则与替换（见 evaluate.ts makeUpValue）。
    */
   makeUp?: { parts: JsTemplatePart[]; regexMode: boolean };
+  /**
+   * JS 链里 `java.getString`/`java.getStringList` 的实参白名单（jsget1028，ENGINE_SYNTAX_JS_GET）：字面量规则文本 → 编译结果
+   * （不含 JS）。求值期宿主回调只认这里的键，在字段作用域上取值（见 evaluate.ts jsBindings）。
+   */
+  jsGets?: ReadonlyMap<string, FieldIr>;
 }
 
 /** 装饰字段编译失败不阻断，标 skip 的占位。 */
@@ -226,6 +231,8 @@ export const MAX_JS_RULE_LENGTH = 8192;
 export const JS_JAVA_HELPERS: ReadonlySet<string> = new Set([
   'base64Decode', 'base64Encode', 'md5Encode', 'md5Encode16', 'encodeURI', 'hexDecodeToString', 'log', 'toast', 'longToast',
 ]);
+/** 读字段作用域的 java.* 宿主回调（jsget1028）：不在 JS_JAVA_HELPERS 里，只在 ENGINE_SYNTAX_JS_GET on 且实参是字面量时放行。 */
+export const JS_JAVA_GETTERS: ReadonlySet<string> = new Set(['getString', 'getStringList']);
 export const MAX_CSS_CHAIN_DEPTH = 8; //         CssStep 链深上限
 export const MAX_REGEX_PATTERN_LENGTH = 256; //  正则 pattern 长度上限
 /** || 组合分支数上限（P1a，设计 §5.1 建议 16 的保守起点；2048 字符规则串最多也就 ~1024 支，预算前置防滥用）。 */

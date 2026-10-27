@@ -23,11 +23,11 @@ export const ENGINE_SEMANTICS_XPATH_BIT = 2;
 /** vars1027：@put/@get 静态子集语义位。版本再 +4（5–8 = 含变量位的四种组合），1–4 逐字不变。 */
 export const ENGINE_SEMANTICS_VARS_BIT = 4;
 
-/** 语义版本随 || / XPath / 变量 / JS / XPath 求值 / 正则 / && / AllInOne / 搜索 JS / 列表 JS / JS 扩展 / 宿主绑定开关联动（唯一口径，供 compile.ts 缓存键与 rulesHash 复用）。 */
+/** 语义版本随 || / XPath / 变量 / JS / XPath 求值 / 正则 / && / AllInOne / 搜索 JS / 列表 JS / JS 扩展 / 宿主绑定 / java.getString 开关联动（唯一口径，供 compile.ts 缓存键与 rulesHash 复用）。 */
 export function engineSemanticsVersion(
   orEnabled: boolean, xpathEnabled = false, varsEnabled = false, jsEnabled = false, xpathEvalEnabled = false,
   regexEnabled = false, andEnabled = false, aioEnabled = false, searchJsEnabled = false, listJsEnabled = false,
-  jsExtEnabled = false, jsBindEnabled = false,
+  jsExtEnabled = false, jsBindEnabled = false, jsGetEnabled = false,
 ): number {
   return (orEnabled ? ENGINE_SEMANTICS_VERSION_OR : ENGINE_SEMANTICS_VERSION)
     + (xpathEnabled ? ENGINE_SEMANTICS_XPATH_BIT : 0) + (varsEnabled ? ENGINE_SEMANTICS_VARS_BIT : 0)
@@ -35,7 +35,7 @@ export function engineSemanticsVersion(
     + (regexEnabled ? ENGINE_SEMANTICS_REGEX_BIT : 0) + (andEnabled ? ENGINE_SEMANTICS_AND_BIT : 0)
     + (aioEnabled ? ENGINE_SEMANTICS_AIO_BIT : 0) + (searchJsEnabled ? ENGINE_SEMANTICS_SEARCH_JS_BIT : 0)
     + (listJsEnabled ? ENGINE_SEMANTICS_LIST_JS_BIT : 0) + (jsExtEnabled ? ENGINE_SEMANTICS_JS_EXT_BIT : 0)
-    + (jsBindEnabled ? ENGINE_SEMANTICS_JS_BIND_BIT : 0);
+    + (jsBindEnabled ? ENGINE_SEMANTICS_JS_BIND_BIT : 0) + (jsGetEnabled ? ENGINE_SEMANTICS_JS_GET_BIT : 0);
 }
 
 /**
@@ -217,5 +217,22 @@ export const ENGINE_SEMANTICS_JS_BIND_BIT = 2048;
  */
 export function engineSyntaxJsBindEnabled(env: OrEnv = process.env): boolean {
   const raw = env.ENGINE_SYNTAX_JS_BIND?.trim().toLowerCase();
+  return raw === '1' || raw === 'true' || raw === 'on';
+}
+
+/**
+ * jsget1028：`java.getString`/`java.getStringList` 语义位。版本再 +4096（4097–8192），1–4096 逐字不变。
+ * 只对 off 态被拒、on 态编译通过的字段所在源计入（compile.ts sourceUsesJsGetSyntax）。
+ */
+export const ENGINE_SEMANTICS_JS_GET_BIT = 4096;
+
+/**
+ * ENGINE_SYNTAX_JS_GET 独立开关（jsget1028，默认 off，口径同 ENGINE_SYNTAX_OR；须 ENGINE_SYNTAX_JS 同开才生效）。
+ * on = 字符串字段的 JS 链里放行 `java.getString("规则")`/`java.getStringList("规则")`（单个字符串字面量实参）：规则编译期
+ * 按普通规则（不含 JS）编译进白名单，求值期在字段作用域（legado AnalyzeRule 的 content：整页或列表条目）上取值；
+ * 实参不在白名单里的调用求值失败。off = 逐字不变。
+ */
+export function engineSyntaxJsGetEnabled(env: OrEnv = process.env): boolean {
+  const raw = env.ENGINE_SYNTAX_JS_GET?.trim().toLowerCase();
   return raw === '1' || raw === 'true' || raw === 'on';
 }

@@ -489,7 +489,7 @@ function matchingBrace(text: string, open: number): number {
  */
 export function evaluateField(field: FieldIr, scope: EvalScope, multi = false): string {
   if (scope.kind === 'json' && scope.object !== undefined) return objectFieldValue(field, scope.object);
-  if (field.chain) return chainToString(evaluateChain(field.chain, scope, false, multi), multi);
+  if (field.chain) return chainToString(evaluateChain(field.chain, scope, false, multi, field.jsGets), multi);
   if (field.joins !== undefined || field.concats !== undefined) {
     // T7 构件（&& 连接符 / %% 拼接）：M1 未实现，宁可失败也不要静默返回错的字符串。
     return evalFailed('M1 不支持 && / %% 组合规则（T7）');
@@ -577,6 +577,37 @@ function hostBindings(scope: EvalScope): Pick<JsBindings, 'globals' | 'objects'>
   if (host.chapterTitle === undefined) return { objects };
   objects.chapter = { title: host.chapterTitle };
   return { objects, globals: { title: host.chapterTitle } };
+}
+
+/**
+ * JS 链的沙箱绑定：宿主只读绑定（bind1028）+ getter 回调（jsget1028）。getter 只认编译期白名单（FieldIr.jsGets）里的实参，
+ * 在字段作用域上取值——legado 的 `java` 是 AnalyzeRule，content 是整页或列表条目，不随链上一段结果变；默认模式多个命中
+ * 按行拼接。getString 结果含 `&` 时按 unescapeHtml4 口径解码，getStringList 按行拆、不解码。同一次执行内按实参记忆。
+ */
+function jsBindings(scope: EvalScope, gets: FieldIr['jsGets']): Pick<JsBindings, 'globals' | 'objects' | 'callbacks'> {
+  const host = hostBindings(scope);
+  if (gets === undefined) return host;
+  const memo = new Map<string, string>();
+  const read = (rule: string): string => {
+    const field = gets.get(rule);
+    if (field === undefined) return evalFailed('java.getString 的实参不在编译期白名单里');
+    let value = memo.get(rule);
+    if (value === undefined) {
+      value = evaluateField(field, scope, true);
+      memo.set(rule, value);
+    }
+    return value;
+  };
+  return {
+    ...host,
+    callbacks: {
+      getString: (rule) => {
+        const value = read(rule);
+        return value.includes('&') ? decodeHTMLStrict(value) : value;
+      },
+      getStringList: (rule) => splitLines(read(rule)),
+    },
+  };
 }
 
 /**
@@ -780,7 +811,7 @@ export function evaluateFieldStrings(field: FieldIr, scope: EvalScope): string[]
     const value = evaluateField(field, scope);
     return value === '' ? [] : [value];
   }
-  const value = evaluateChain(field.chain, scope, true, true);
+  const value = evaluateChain(field.chain, scope, true, true, field.jsGets);
   if (value === null) return [];
   return (Array.isArray(value) ? value : value.split('\n')).map((item) => item.trim()).filter((item) => item !== '');
 }
@@ -793,7 +824,9 @@ export function evaluateFieldStrings(field: FieldIr, scope: EvalScope): string[]
  * - 列表结果喂给 JS 前先做 `$n` 替换（SourceRule.makeUpRule：n≥1 取第 n 项，越界删去，`$0` 原样）。
  * `list` = getStringList 口径（规则段按多值拆行、正则逐项替换）；否则规则段按 `multi` 取值。
  */
-function evaluateChain(chain: readonly ChainStage[], scope: EvalScope, list: boolean, multi: boolean): JsValue | null {
+function evaluateChain(
+  chain: readonly ChainStage[], scope: EvalScope, list: boolean, multi: boolean, gets?: FieldIr['jsGets'],
+): JsValue | null {
   let value: JsValue | undefined; // undefined = 还在首段
   for (const stage of chain) {
     if (stage.kind === 'rule') {
@@ -809,13 +842,13 @@ function evaluateChain(chain: readonly ChainStage[], scope: EvalScope, list: boo
         : applyRegexSubs(joinLines(input), stage.regex);
       continue;
     }
-    const { code, regex } = makeUpJs(stage, input, scope);
+    const { code, regex } = makeUpJs(stage, input, scope, gets);
     if (code === '') { // legado getString：makeUp 后代码为空只做替换；无替换时 evalJS("") 得 null
       if (regex === undefined) return null;
       value = applyRegexSubs(joinLines(input), [regex]);
       continue;
     }
-    const out = runJs(code, { result: input, src: scope.source, baseUrl: scope.pageUrl, ...hostBindings(scope) }, stage.template ? stage.code : code);
+    const out = runJs(code, { result: input, src: scope.source, baseUrl: scope.pageUrl, ...jsBindings(scope, gets) }, stage.template ? stage.code : code);
     if (out === null) return null;
     if (regex === undefined) value = out;
     else if (!Array.isArray(out)) value = applyRegexSubs(out, [regex]);
@@ -834,7 +867,7 @@ const MAX_MADE_UP_JS_CHARS = 65_536;
  * 再按 `##` 切出代码与替换。占位结果为 null/数组（legado 口径不复现）、列表输入接模板一律求值失败。
  */
 function makeUpJs(
-  stage: Extract<ChainStage, { kind: 'js' }>, input: JsValue, scope: EvalScope,
+  stage: Extract<ChainStage, { kind: 'js' }>, input: JsValue, scope: EvalScope, gets?: FieldIr['jsGets'],
 ): { code: string; regex?: RegexSub } {
   if (!stage.template) return { code: Array.isArray(input) ? substituteListRefs(stage.code, input) : stage.code, regex: stage.regex };
   if (Array.isArray(input)) return evalFailed('列表结果接含 {{}} 的 JS 段（legado 口径不复现）');
@@ -843,7 +876,7 @@ function makeUpJs(
     if (part.kind === 'text') text += part.text;
     else if (part.kind === 'rule') text += evaluateField(part.field, scope);
     else {
-      const out = runJs(part.code, { result: input, src: scope.source, baseUrl: scope.pageUrl, ...hostBindings(scope) });
+      const out = runJs(part.code, { result: input, src: scope.source, baseUrl: scope.pageUrl, ...jsBindings(scope, gets) });
       if (out === null || Array.isArray(out)) return evalFailed('JS 段 {{}} 占位的结果不是字符串');
       text += out;
     }

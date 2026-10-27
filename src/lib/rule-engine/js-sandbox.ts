@@ -57,6 +57,11 @@ export interface JsBindings {
   globals?: Readonly<Record<string, string | number>>;
   /** 宿主只读对象（bind1028 的 `book`/`chapter`）：名 → 字符串属性表，沙箱里冻结；与 result/src/baseUrl/java 同名的被它们覆盖。 */
   objects?: Readonly<Record<string, Readonly<Record<string, string>>>>;
+  /**
+   * 读宿主状态的 java.* 回调（jsget1028 的 getString/getStringList）：实参按字符串传入（缺省/非字符串按 String 转），
+   * 返回字符串、字符串数组（带 size()/get()）或 null。同名覆盖纯计算帮手。
+   */
+  callbacks?: Readonly<Record<string, (arg: string) => JsValue | null>>;
 }
 
 let ready: QuickJSWASMModule | undefined;
@@ -160,19 +165,24 @@ const HOST_HELPERS: Record<string, (args: (string | undefined)[]) => string> = {
   hexDecodeToString: ([hex = '']) => Buffer.from(hex, 'hex').toString('utf8'),
 };
 
-// log/toast 在 legado 里返回入参（log 可串在表达式中间），沙箱内直接用 JS 实现；result 列表补 legado
-// NativeJavaList 的 size()/get()；宿主只读对象（bind1028 book/chapter）冻结。
+// log/toast 在 legado 里返回入参（log 可串在表达式中间），沙箱内直接用 JS 实现；result 列表与 getStringList（jsget1028）
+// 的结果补 legado NativeJavaList 的 size()/get()；宿主只读对象（bind1028 book/chapter）冻结。
 const PRELUDE = `(function(){
   var j = globalThis.java;
   j.log = function(m){ return m; }; j.toast = function(m){ return m; }; j.longToast = function(m){ return m; };
+  function asList(r) {
+    Object.defineProperty(r, 'size', { value: function(){ return this.length; } });
+    Object.defineProperty(r, 'get', { value: function(i){ return this[i]; } });
+    return r;
+  }
+  if (typeof j.getStringList === 'function') {
+    var g = j.getStringList;
+    j.getStringList = function(rule){ var r = g(rule); return Array.isArray(r) ? asList(r) : r; };
+  }
   Object.freeze(j);
   if (typeof globalThis.book === 'object' && globalThis.book) Object.freeze(globalThis.book);
   if (typeof globalThis.chapter === 'object' && globalThis.chapter) Object.freeze(globalThis.chapter);
-  var r = globalThis.result;
-  if (Array.isArray(r)) {
-    Object.defineProperty(r, 'size', { value: function(){ return this.length; } });
-    Object.defineProperty(r, 'get', { value: function(i){ return this[i]; } });
-  }
+  if (Array.isArray(globalThis.result)) asList(globalThis.result);
 })();`;
 
 // ---------------------------------------------------------------- 求值
@@ -236,7 +246,7 @@ function runInFreshRuntime<T>(
     runtime.setInterruptHandler(() => Date.now() > deadline);
     const context = runtime.newContext();
     try {
-      installGlobals(context, bindings);
+      const host = installGlobals(context, bindings);
       const prelude = context.evalCode(PRELUDE, 'prelude.js');
       if (prelude.error) {
         prelude.error.dispose();
@@ -244,6 +254,12 @@ function runInFreshRuntime<T>(
       }
       prelude.value.dispose();
       const evaluated = context.evalCode(code, 'rule.js');
+      // 宿主回调失败（jsget1028）一律致命：JS 里 try/catch 吞掉也不算数，免得规则拿兜底分支冒充 legado 产出。
+      if (host.failure !== undefined) {
+        (evaluated.error ?? evaluated.value).dispose();
+        if (host.failure instanceof RuleEngineError) throw host.failure;
+        return evalFailed(`JS 宿主回调失败：${host.failure instanceof Error ? host.failure.message : String(host.failure)}`);
+      }
       if (evaluated.error) {
         const message = describeError(context, evaluated.error);
         evaluated.error.dispose();
@@ -262,7 +278,9 @@ function runInFreshRuntime<T>(
   }
 }
 
-function installGlobals(context: QuickJSContext, bindings: JsBindings): void {
+/** 返回宿主回调的失败记录（runInFreshRuntime 执行后检查）。 */
+function installGlobals(context: QuickJSContext, bindings: JsBindings): { failure?: unknown } {
+  const host: { failure?: unknown } = {};
   const setGlobal = (name: string, handle: QuickJSHandle) => {
     context.setProp(context.global, name, handle);
   };
@@ -313,8 +331,33 @@ function installGlobals(context: QuickJSContext, bindings: JsBindings): void {
     context.setProp(java, name, fn);
     fn.dispose();
   }
+  for (const [name, impl] of Object.entries(bindings.callbacks ?? {})) {
+    const fn = context.newFunction(name, (arg) => {
+      let out: JsValue | null;
+      try {
+        out = impl(arg === undefined ? 'undefined' : context.getString(arg));
+        const size = out === null ? 0 : typeof out === 'string' ? out.length : out.reduce((sum, item) => sum + item.length, 0);
+        if (size > MAX_JS_OUTPUT_CHARS) throw new Error(`java.${name} 输出过大`);
+      } catch (error) {
+        host.failure ??= error;
+        throw error;
+      }
+      if (out === null) return context.null;
+      if (typeof out === 'string') return context.newString(out);
+      const list = context.newArray();
+      out.forEach((item, index) => {
+        const value = context.newString(item);
+        context.setProp(list, index, value);
+        value.dispose();
+      });
+      return list;
+    });
+    context.setProp(java, name, fn);
+    fn.dispose();
+  }
   setGlobal('java', java);
   java.dispose();
+  return host;
 }
 
 function exportValue(context: QuickJSContext, handle: QuickJSHandle): JsValue | null {
