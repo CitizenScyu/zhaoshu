@@ -23,12 +23,12 @@ export const ENGINE_SEMANTICS_XPATH_BIT = 2;
 /** vars1027：@put/@get 静态子集语义位。版本再 +4（5–8 = 含变量位的四种组合），1–4 逐字不变。 */
 export const ENGINE_SEMANTICS_VARS_BIT = 4;
 
-/** 语义版本随 || / XPath / 变量 / JS / XPath 求值 / 正则 / && / AllInOne / 搜索 JS / 列表 JS / JS 扩展 / 宿主绑定 / java.getString / 加解密帮手 / JSONPath 扩展 / 详情 init 开关联动（唯一口径，供 compile.ts 缓存键与 rulesHash 复用）。 */
+/** 语义版本随 || / XPath / 变量 / JS / XPath 求值 / 正则 / && / AllInOne / 搜索 JS / 列表 JS / JS 扩展 / 宿主绑定 / java.getString / 加解密帮手 / JSONPath 扩展 / 详情 init / 搜索选项 legado 口径开关联动（唯一口径，供 compile.ts 缓存键与 rulesHash 复用）。 */
 export function engineSemanticsVersion(
   orEnabled: boolean, xpathEnabled = false, varsEnabled = false, jsEnabled = false, xpathEvalEnabled = false,
   regexEnabled = false, andEnabled = false, aioEnabled = false, searchJsEnabled = false, listJsEnabled = false,
   jsExtEnabled = false, jsBindEnabled = false, jsGetEnabled = false, jsUtilEnabled = false, jsonPathEnabled = false,
-  initEnabled = false,
+  initEnabled = false, searchOptionsEnabled = false,
 ): number {
   return (orEnabled ? ENGINE_SEMANTICS_VERSION_OR : ENGINE_SEMANTICS_VERSION)
     + (xpathEnabled ? ENGINE_SEMANTICS_XPATH_BIT : 0) + (varsEnabled ? ENGINE_SEMANTICS_VARS_BIT : 0)
@@ -38,7 +38,7 @@ export function engineSemanticsVersion(
     + (listJsEnabled ? ENGINE_SEMANTICS_LIST_JS_BIT : 0) + (jsExtEnabled ? ENGINE_SEMANTICS_JS_EXT_BIT : 0)
     + (jsBindEnabled ? ENGINE_SEMANTICS_JS_BIND_BIT : 0) + (jsGetEnabled ? ENGINE_SEMANTICS_JS_GET_BIT : 0)
     + (jsUtilEnabled ? ENGINE_SEMANTICS_JS_UTIL_BIT : 0) + (jsonPathEnabled ? ENGINE_SEMANTICS_JSON_PATH_BIT : 0)
-    + (initEnabled ? ENGINE_SEMANTICS_INIT_BIT : 0);
+    + (initEnabled ? ENGINE_SEMANTICS_INIT_BIT : 0) + (searchOptionsEnabled ? ENGINE_SEMANTICS_SEARCH_OPTIONS_BIT : 0);
 }
 
 /**
@@ -288,5 +288,22 @@ export const ENGINE_SEMANTICS_INIT_BIT = 32768;
  */
 export function engineSyntaxInitEnabled(env: OrEnv = process.env): boolean {
   const raw = env.ENGINE_SYNTAX_INIT?.trim().toLowerCase();
+  return raw === '1' || raw === 'true' || raw === 'on';
+}
+
+/**
+ * searchopt1028：搜索选项 legado 口径语义位。版本再 +65536（65537–131072），1–65536 逐字不变。
+ * 只对旧口径因选项被拒、且新口径会接手的模板计入（source-parser searchOptionsNeedParity）。
+ */
+export const ENGINE_SEMANTICS_SEARCH_OPTIONS_BIT = 65536;
+
+/**
+ * ENGINE_SEARCH_OPTIONS 独立开关（searchopt1028，默认 off，口径同 ENGINE_SYNTAX_OR；只在 ENGINE_POST_SEARCH 开时生效）。
+ * on = 旧口径因 `url,{选项}` 被拒的模板改按 legado AnalyzeUrl.UrlOption 口径重读选项：GSON 宽松 JSON（读不出则整段忽略、
+ * 按 GET 请求 url 部分）、未知键忽略、空 charset 视同未声明、headers 可为 JSON 串、对象 body 按 GSON pretty 序列化；
+ * webView/js/type/serverID 等仍拒。旧口径能构造的模板一律不走新口径。off = 逐字不变。
+ */
+export function engineSearchOptionsEnabled(env: OrEnv = process.env): boolean {
+  const raw = env.ENGINE_SEARCH_OPTIONS?.trim().toLowerCase();
   return raw === '1' || raw === 'true' || raw === 'on';
 }

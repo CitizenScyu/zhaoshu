@@ -3,10 +3,10 @@
 // 缓存键 = 语义版本化 sourceRevision（P0 引入 engineVersionedKey；P1a 起语义版本随
 // ENGINE_SYNTAX_OR 联动——off=1 / on=2）：规则原文或引擎语义任一变化，键即变，旧编译
 // 产物自然失效，不存在「|| 开关打开后仍复用 off 态编译缓存」的窗口。
-import { searchTemplateNeedsJs } from '@/lib/source-parser';
+import { searchOptionsNeedParity, searchTemplateNeedsJs } from '@/lib/source-parser';
 import { upgradeSourceTemplateUrl } from '@/lib/source-policy';
 import { sourceRevision } from '@/lib/source-revision';
-import { engineSearchJsActive } from './compile-smoke';
+import { engineSearchJsActive, engineSearchOptionsActive } from './compile-smoke';
 import { aioGroups } from './aio-syntax';
 import { initFieldSupported, initRuleTextSupported, jsChainFieldAllowed, listJsGroups, parseFieldRule, ruleHasJs, type ParseOptions } from './parse';
 import type { CompiledRules, FieldIr, RuleIr } from './types';
@@ -27,6 +27,8 @@ export interface CompileOptions extends ParseOptions {
   searchJsEnabled?: boolean;
   /** init1028：详情页 init 生效（ENGINE_SYNTAX_INIT，默认读 env）。只给可复现的 init 挂 FieldIr.initScope。 */
   initEnabled?: boolean;
+  /** searchopt1028：搜索选项 legado 口径（缺省 = ENGINE_POST_SEARCH 与 ENGINE_SEARCH_OPTIONS 都开）。只影响语义版本位。 */
+  searchOptionsEnabled?: boolean;
 }
 
 /** 版本化缓存键（P0 口径）：semanticsVersion:contentRevision。 */
@@ -52,6 +54,7 @@ export function engineVersionedKey(contentRevision: string, semanticsVersion = E
  * jsutil1028：ENGINE_SYNTAX_JS_UTIL on、JS 链对该源生效且有字段 off 态被拒、on 态编译通过时再加加解密帮手位（8193–16384）。
  * jsonpath1028：ENGINE_SYNTAX_JSON_PATH on 且有字段 off 态被拒、on 态编译通过时再加 JSONPath 扩展位（16385–32768）。
  * init1028：ENGINE_SYNTAX_INIT on 且 ruleBookInfo.init 可复现（sourceUsesInitSyntax）时再加 init 位（32769–65536）。
+ * searchopt1028：搜索选项 legado 口径生效且该源 searchUrl 的选项被旧口径拒（searchOptionsNeedParity）时再加选项位（65537–131072）。
  */
 export function engineSourceRevision(
   source: { url: string; searchUrl: unknown; rules: Record<string, unknown> },
@@ -73,6 +76,7 @@ export function engineSourceRevision(
   const jsUtilEnabled = options.jsUtilEnabled ?? engineSyntaxJsUtilEnabled();
   const jsonPathEnabled = options.jsonPathEnabled ?? engineSyntaxJsonPathEnabled();
   const initEnabled = options.initEnabled ?? engineSyntaxInitEnabled();
+  const searchOptionsEnabled = options.searchOptionsEnabled ?? engineSearchOptionsActive();
   const jsChain = jsEnabled && !sourceHasJsLib(source.rules);
   // 下游 sourceUses* 的编译与 compileSource 同一组开关（jsBind/jsGet/jsUtil 只在 JS 链生效时有意义）。
   const jsBind = jsChain && jsBindEnabled;
@@ -122,6 +126,7 @@ export function engineSourceRevision(
       orEnabled, xpathEnabled, xpathEvalEnabled: xpathEval, jsEnabled: jsChain, regexEnabled, andEnabled, aioEnabled, listJsEnabled,
       jsExtEnabled, jsBindEnabled: jsBind, jsGetEnabled: jsGet, jsUtilEnabled: jsUtil, jsonPathEnabled,
     }),
+    searchOptionsEnabled && searchOptionsNeedParity(source.searchUrl, upgradeSourceTemplateUrl(source.url)),
   ));
 }
 

@@ -9,11 +9,12 @@
 // 本模块只在服务端用（js-sandbox 依赖 node:crypto 与 wasm），纯函数部分在 source-parser.ts。
 
 import {
-  buildLegadoSearchRequest, buildSourceSearchRequest, searchTemplateNeedsJs,
+  buildLegadoSearchRequest, buildSourceSearchRequest, searchOptionsNeedParity, searchTemplateNeedsJs,
   type SourceSearchRequest, type SourceUrlValidator,
 } from '@/lib/source-parser';
 import { checkSourceUrl, SourcePolicyError, validateSourceUrl } from '@/lib/source-policy';
 import { preloadJsSandbox, runJs } from './js-sandbox';
+import { engineSearchOptionsEnabled } from './syntax-flags';
 import { RuleEngineError } from './types';
 
 /**
@@ -176,6 +177,11 @@ function replacePages(ruleUrl: string): string {
 
 interface EvaluatedSearchJs { ruleUrl: string; baseUrl: string }
 
+/** searchopt1028：求值后的选项按 legado UrlOption 口径重读（开关开、且静态模板的选项被旧口径拒时）。 */
+function optionParity(template: string, base: string): boolean {
+  return engineSearchOptionsEnabled() && searchOptionsNeedParity(template, base);
+}
+
 /** legado AnalyzeUrl 的 JS 段与 `{{…}}`/页码求值，得交给 buildLegadoSearchRequest 的 ruleUrl。base 带选项时照 legado 剥掉，作相对地址基准。 */
 function evaluateSearchJs(template: string, title: string, base: string): EvaluatedSearchJs {
   const split = OPTION_SPLIT.exec(base);
@@ -188,7 +194,7 @@ export function buildSearchJsRequest(
   template: string, title: string, base: string, validate: SourceUrlValidator = validateSourceUrl,
 ): SourceSearchRequest {
   const { ruleUrl, baseUrl } = evaluateSearchJs(template, title, base);
-  return buildLegadoSearchRequest(ruleUrl, baseUrl, validate);
+  return buildLegadoSearchRequest(ruleUrl, baseUrl, validate, optionParity(template, base));
 }
 
 function withSearchJs(
@@ -201,7 +207,7 @@ function withSearchJs(
     if (!(error instanceof SourcePolicyError) || !searchJs || typeof template !== 'string' || base === undefined
       || !searchTemplateNeedsJs(template, base)) throw error;
     const { ruleUrl, baseUrl } = evaluate(template, base);
-    return buildLegadoSearchRequest(ruleUrl, baseUrl, validate);
+    return buildLegadoSearchRequest(ruleUrl, baseUrl, validate, optionParity(template, base));
   }
 }
 
@@ -264,7 +270,7 @@ export function buildSearchProbeRequest(
 export function searchJsConstructible(template: string, base: string): boolean {
   try {
     const { ruleUrl, baseUrl } = probeSearchJs(template, base);
-    buildLegadoSearchRequest(ruleUrl, baseUrl, allowAnyHost);
+    buildLegadoSearchRequest(ruleUrl, baseUrl, allowAnyHost, optionParity(template, base));
     return true;
   } catch (error) {
     if (!(error instanceof SourcePolicyError)) throw error;

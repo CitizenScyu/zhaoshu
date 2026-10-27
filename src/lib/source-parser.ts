@@ -2,6 +2,8 @@ import { decodeHTML } from 'entities';
 import { alternateSourceHost, checkSourceUrl, upgradeSourceTemplateUrl, validateSourceUrl, SourcePolicyError } from './source-policy';
 import { encodeQueryComponent, normalizeCharset, percentEncodeChars, type SourceCharset } from './source-charset';
 import { foldTraditional } from './zh-variant-fold';
+import { gsonAsString, gsonPlainInteger, gsonPrettyJson, parseGsonLenient, type GsonValue } from './gson-lenient';
+import { engineSearchOptionsEnabled } from './rule-engine/syntax-flags';
 
 export interface SourceBookIdentity { title: string; author: string; alias?: string }
 export interface SourceChapter { url: string; title: string }
@@ -426,6 +428,31 @@ function expandField(text: string, title: string, charset: SourceCharset, jsonBo
  */
 export function buildSourceSearchRequest(
   template: unknown, title: string, base: string | undefined, validate: SourceUrlValidator = validateSourceUrl,
+  optionParity = searchOptionsActive(),
+): SourceSearchRequest {
+  try {
+    return buildDeclaredSearchRequest(template, title, base, validate);
+  } catch (error) {
+    if (!optionParity || !(error instanceof SourcePolicyError) || typeof template !== 'string'
+      || !legacyOptionParityApplies(template)) throw error;
+    // searchopt1028：旧口径因选项被拒 → 按 legado UrlOption 口径重读选项，其余流程（展开/红线/白名单头）与旧口径同一段代码。
+    // legado 先替换 {{key}}/{{page}} 再解析选项：书名以私用区占位进 GSON（裸串里与常见书名同为字面字符），读完还原。
+    const optMatch = /,\s*\{/.exec(template)!;
+    const optionText = template.slice(optMatch.index + 1).replace(/\{\{key\}\}/g, OPTION_KEY_MARK).replace(/\{\{page\}\}/g, '1');
+    return searchRequestFromOptions(
+      template.slice(0, optMatch.index), legadoUrlOption(optionText, OPTION_KEY_MARK), title, base, validate,
+    );
+  }
+}
+
+/** searchopt1028 实际生效：与 compile-smoke engineSearchOptionsActive 同口径（须 ENGINE_POST_SEARCH 同开）。 */
+function searchOptionsActive(): boolean {
+  const postSearch = process.env.ENGINE_POST_SEARCH;
+  return (postSearch === '1' || postSearch === 'true') && engineSearchOptionsEnabled();
+}
+
+function buildDeclaredSearchRequest(
+  template: unknown, title: string, base: string | undefined, validate: SourceUrlValidator,
 ): SourceSearchRequest {
   if (typeof template !== 'string' || template.length > 2048 || !/\{\{key\}\}/.test(template)) {
     throw new SourcePolicyError('书源缺少支持的搜索模板');
@@ -440,7 +467,13 @@ export function buildSourceSearchRequest(
   for (const key of Object.keys(options)) {
     if (!SEARCH_OPTION_KEYS.has(key)) throw new SourcePolicyError(`不支持该书源的搜索选项：${key}`);
   }
+  return searchRequestFromOptions(urlPart, options, title, base, validate);
+}
 
+/** 旧口径 `url,{选项}` 的展开与校验（选项已解析成对象、键已过白名单）。 */
+function searchRequestFromOptions(
+  urlPart: string, options: Record<string, unknown>, title: string, base: string | undefined, validate: SourceUrlValidator,
+): SourceSearchRequest {
   let charset: SourceCharset = 'utf-8';
   if (options.charset != null) {
     const normalized = normalizeCharset(options.charset);
@@ -512,6 +545,119 @@ export function searchOptionsConstructible(template: unknown, base: string): boo
     if (error instanceof SourcePolicyError) return false;
     throw error;
   }
+}
+
+// ---- searchopt1028：legado AnalyzeUrl.UrlOption 口径的选项（仅 ENGINE_SEARCH_OPTIONS 开、且旧口径因选项被拒时用） ----
+
+/** 选项文本里 {{key}} 的占位（私用区字符；模板本身含它则不走新口径）。 */
+const OPTION_KEY_MARK = '\uE000';
+const LEGADO_INT_FIELDS = ['retry', 'webViewDelayTime'] as const;
+const LEGADO_REJECT_FIELDS = ['js', 'type', 'serverID'] as const;
+
+/** 旧口径（parseSearchOptions + 键白名单 + 逐项类型校验）会因选项本身拒掉这段选项文本。 */
+function legacyOptionsRejected(raw: string): boolean {
+  const options = parseSearchOptions(raw);
+  if (!options) return true;
+  if (Object.keys(options).some((key) => !SEARCH_OPTION_KEYS.has(key))) return true;
+  if (options.charset === '') return true;
+  const method = String(options.method ?? 'GET').toUpperCase();
+  if (method !== 'GET' && method !== 'POST') return true;
+  if (options.headers != null && (typeof options.headers !== 'object' || Array.isArray(options.headers))) return true;
+  return options.body != null && typeof options.body !== 'string';
+}
+
+/** 旧口径模板（无 JS/页码表达式/`##`）且其 `,{选项}` 被旧口径拒：新口径接手的全部条件。 */
+function legacyOptionParityApplies(template: string): boolean {
+  if (template.length > 2048 || !/\{\{key\}\}/.test(template)) return false;
+  if (template.includes('##') || template.includes(OPTION_KEY_MARK)) return false;
+  if (SEARCH_JS_MARKER.test(template) || /<.*?>/.test(template)) return false;
+  const optMatch = /,\s*\{/.exec(template);
+  return optMatch !== null && legacyOptionsRejected(template.slice(optMatch.index + 1));
+}
+
+/**
+ * 该 searchUrl 是否会因 ENGINE_SEARCH_OPTIONS 而换请求口径（语义版本位与闸门共用，纯静态）：旧口径模板的选项被旧口径拒，
+ * 或 JS 模板（searchTemplateNeedsJs）的静态选项文本被旧口径拒（求值后的选项多半同形；宁宽勿漏，只多翻 revision）。
+ */
+export function searchOptionsNeedParity(template: unknown, base: string): boolean {
+  if (typeof template !== 'string') return false;
+  if (legacyOptionParityApplies(template)) return true;
+  if (!searchTemplateNeedsJs(template, base)) return false;
+  const split = LEGADO_OPTION_SPLIT.exec(template);
+  return split !== null && legacyOptionsRejected(template.slice(split.index + split[0].length));
+}
+
+/**
+ * legado UrlOption 口径读选项文本，归一成两条旧管线都认的形状（method 仅 POST / charset 串 / headers 串值对象 / body 串）：
+ * GSON 宽松读不出或不是对象 → 选项整段忽略（legado 按 GET 请求 url 部分）；未知键、origin/webJs 忽略；
+ * method 只认 POST（不分大小写）；空 charset 视同未声明；headers 为对象或 JSON 串（值走 toString）；
+ * POST 的对象/数组 body 按 GSON pretty 序列化。webView 为真、js/type/serverID 非 null、整数字段非整数（legado 整段读失败）、
+ * 重复键、白名单头的值不是串/整数/布尔、口径不定的 body 一律拒。keyMark：选项文本里代替 {{key}} 的占位，读完还原。
+ */
+function legadoUrlOption(raw: string, keyMark?: string): Record<string, unknown> {
+  const parsed = parseGsonLenient(raw);
+  if (!parsed || parsed.kind !== 'object') return {};
+  if (parsed.duplicate) throw new SourcePolicyError('不支持该书源的搜索选项（重复键）');
+  const restore = (text: string): string => (keyMark ? text.split(keyMark).join('{{key}}') : text);
+  const field = (key: string): GsonValue | undefined => parsed.entries.get(key);
+  for (const key of LEGADO_REJECT_FIELDS) {
+    if (gsonAsString(field(key)) !== null) throw new SourcePolicyError(`不支持该书源的搜索选项：${key}`);
+  }
+  const webView = gsonAsString(field('webView'));
+  if (webView !== null && webView !== '' && webView !== 'false') throw new SourcePolicyError('不支持该书源的搜索选项：webView');
+  for (const key of LEGADO_INT_FIELDS) {
+    const v = field(key);
+    if (v === undefined || v.kind === 'null') continue;
+    const ok = v.kind === 'number' ? gsonPlainInteger(v) && Math.abs(Number(v.raw)) <= 0x7fffffff
+      : v.kind === 'string' && /^-?\d{1,9}$/.test(v.value);
+    if (!ok) throw new SourcePolicyError(`不支持该书源的搜索选项：${key}`);
+  }
+
+  const options: Record<string, unknown> = {};
+  const method = gsonAsString(field('method'));
+  if (method !== null && method.toUpperCase() === 'POST') options.method = 'POST';
+  const charset = gsonAsString(field('charset'));
+  if (charset !== null && charset !== '') {
+    if (charset === 'escape') throw new SourcePolicyError('不支持该书源的搜索字符集');
+    options.charset = charset;
+  }
+
+  let headerValue = field('headers');
+  if (headerValue?.kind === 'string') {
+    headerValue = parseGsonLenient(headerValue.value) ?? undefined;
+    if (headerValue?.kind === 'object' && headerValue.duplicate) throw new SourcePolicyError('不支持该书源的搜索 headers');
+  }
+  if (headerValue?.kind === 'object') {
+    const headers: Record<string, string> = {};
+    for (const [rawName, v] of headerValue.entries) {
+      const name = restore(rawName);
+      const allowed = ALLOWED_REQUEST_HEADERS.has(name.toLowerCase());
+      let text: string | null = null;
+      if (v.kind === 'string') text = v.value;
+      else if (v.kind === 'boolean') text = String(v.value);
+      else if (v.kind === 'number' && gsonPlainInteger(v)) text = v.raw;
+      if (text === null) {
+        if (allowed) throw new SourcePolicyError('不支持该书源的搜索 headers');
+        continue;
+      }
+      if (allowed) headers[name] = restore(text);
+    }
+    if (Object.keys(headers).length) options.headers = headers;
+  }
+
+  const body = field('body');
+  if (options.method === 'POST' && body !== undefined && body.kind !== 'null') {
+    if (body.kind === 'string') {
+      options.body = restore(body.value);
+    } else if (body.kind === 'object' || body.kind === 'array') {
+      const json = gsonPrettyJson(body);
+      if (json === null) throw new SourcePolicyError('不支持该书源的搜索 body');
+      options.body = restore(json);
+    } else {
+      throw new SourcePolicyError('不支持该书源的搜索 body');
+    }
+  }
+  return options;
 }
 
 // ---- searchjs1027：legado AnalyzeUrl 口径的搜索模板（仅 ENGINE_SEARCH_JS 开时经 rule-engine/search-js.ts 走） ----
@@ -589,21 +735,39 @@ const legadoIsXml = (text: string): boolean => {
  * 最终 URL 过同一把 validate（https/端口/userinfo/IP 红线不变）。
  */
 export function buildLegadoSearchRequest(
-  ruleUrl: string, base: string | undefined, validate: SourceUrlValidator = validateSourceUrl,
+  ruleUrl: string, base: string | undefined, validate: SourceUrlValidator = validateSourceUrl, optionParity = false,
 ): SourceSearchRequest {
   if (ruleUrl.length > MAX_SEARCH_JS_TEMPLATE_LENGTH) throw new SourcePolicyError('书源搜索地址过长');
   const split = LEGADO_OPTION_SPLIT.exec(ruleUrl);
-  let urlPart = (split ? ruleUrl.slice(0, split.index) : ruleUrl).trim();
+  const urlPart = (split ? ruleUrl.slice(0, split.index) : ruleUrl).trim();
   rejectUnexpanded(urlPart);
+  const optionText = split ? ruleUrl.slice(split.index + split[0].length) : undefined;
+  try {
+    return legadoRequestFromOptions(urlPart, declaredLegadoOptions(optionText), base, validate);
+  } catch (error) {
+    // searchopt1028：旧选项口径拒了 → 按 legado UrlOption 口径重读（调用方只在 searchOptionsNeedParity 的源上开）。
+    if (!optionParity || optionText === undefined || !(error instanceof SourcePolicyError)) throw error;
+    return legadoRequestFromOptions(urlPart, legadoUrlOption(optionText), base, validate);
+  }
+}
+
+function declaredLegadoOptions(optionText: string | undefined): Record<string, unknown> {
   let options: Record<string, unknown> = {};
-  if (split) {
-    const parsed = parseSearchOptions(ruleUrl.slice(split.index + split[0].length));
+  if (optionText !== undefined) {
+    const parsed = parseSearchOptions(optionText);
     if (!parsed) throw new SourcePolicyError('不支持该书源的搜索选项（非法 JSON）');
     options = parsed;
   }
   for (const key of Object.keys(options)) {
     if (!SEARCH_OPTION_KEYS.has(key)) throw new SourcePolicyError(`不支持该书源的搜索选项：${key}`);
   }
+  return options;
+}
+
+function legadoRequestFromOptions(
+  ruleUrlPart: string, options: Record<string, unknown>, base: string | undefined, validate: SourceUrlValidator,
+): SourceSearchRequest {
+  let urlPart = ruleUrlPart;
   let declaredCharset: string | undefined;
   if (options.charset != null) {
     if (typeof options.charset !== 'string') throw new SourcePolicyError('不支持该书源的搜索字符集');

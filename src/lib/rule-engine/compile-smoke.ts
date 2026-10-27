@@ -7,7 +7,9 @@ import { searchOptionsConstructible, searchTemplateNeedsJs } from '@/lib/source-
 import { jsChainFieldAllowed, listJsGroupsFlat, parseFieldRule, ruleHasJs, type ParseOptions } from './parse';
 import { aioGroupsFlat, isAioListField, ruleGroupOf } from './aio-syntax';
 import { searchJsConstructible } from './search-js';
-import { engineSearchJsEnabled, engineSyntaxAioEnabled, engineSyntaxJsEnabled, engineSyntaxListJsEnabled } from './syntax-flags';
+import {
+  engineSearchJsEnabled, engineSearchOptionsEnabled, engineSyntaxAioEnabled, engineSyntaxJsEnabled, engineSyntaxListJsEnabled,
+} from './syntax-flags';
 import { RuleEngineError, type RuleDiagnostic } from './types';
 
 // survey.py CORE_FIELDS（阅读路径必需字段）
@@ -37,6 +39,11 @@ export function enginePostSearchEnabled(env: NodeJS.ProcessEnv = process.env): b
 /** 搜索模板 JS（searchjs1027）实际生效：ENGINE_SEARCH_JS 只在 ENGINE_POST_SEARCH 开时起作用（新路径产出的是结构化请求）。 */
 export function engineSearchJsActive(env: NodeJS.ProcessEnv = process.env): boolean {
   return enginePostSearchEnabled(env) && engineSearchJsEnabled(env);
+}
+
+/** 搜索选项 legado 口径（searchopt1028）实际生效：ENGINE_SEARCH_OPTIONS 只在 ENGINE_POST_SEARCH 开时起作用。 */
+export function engineSearchOptionsActive(env: NodeJS.ProcessEnv = process.env): boolean {
+  return enginePostSearchEnabled(env) && engineSearchOptionsEnabled(env);
 }
 
 /**
