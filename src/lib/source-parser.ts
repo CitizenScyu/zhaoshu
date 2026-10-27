@@ -1,6 +1,6 @@
 import { decodeHTML } from 'entities';
 import { alternateSourceHost, checkSourceUrl, upgradeSourceTemplateUrl, validateSourceUrl, SourcePolicyError } from './source-policy';
-import { encodeQueryComponent, normalizeCharset, type SourceCharset } from './source-charset';
+import { encodeQueryComponent, normalizeCharset, percentEncodeChars, type SourceCharset } from './source-charset';
 import { foldTraditional } from './zh-variant-fold';
 
 export interface SourceBookIdentity { title: string; author: string; alias?: string }
@@ -512,6 +512,155 @@ export function searchOptionsConstructible(template: unknown, base: string): boo
     if (error instanceof SourcePolicyError) return false;
     throw error;
   }
+}
+
+// ---- searchjs1027：legado AnalyzeUrl 口径的搜索模板（仅 ENGINE_SEARCH_JS 开时经 rule-engine/search-js.ts 走） ----
+// 这里只放纯函数（本模块进客户端包）：JS 求值在服务端 search-js.ts，求值后的 ruleUrl 交给 buildLegadoSearchRequest。
+
+/** 新路径接收的 searchUrl 上限（JS 模板比纯 URL 长，与规则 JS 上限同量级）。 */
+export const MAX_SEARCH_JS_TEMPLATE_LENGTH = 8192;
+const SEARCH_JS_MARKER = /@js:|<js>|\{\{(?!(?:key|page)\}\})/i;
+
+/**
+ * 该 searchUrl 是否要走 legado JS 求值路径：旧口径（buildSourceSearchRequest）构造不出请求，且模板里有 `@js:`/`<js>`
+ * 或 `{{key}}`/`{{page}}` 以外的 `{{表达式}}`。纯静态判断（不执行 JS），供语义版本位与新路径闸门共用——
+ * 旧口径能构造的模板永远不进新路径，开关开时这些源的请求逐字不变。
+ */
+export function searchTemplateNeedsJs(template: unknown, base: string): boolean {
+  if (typeof template !== 'string' || template.length > MAX_SEARCH_JS_TEMPLATE_LENGTH) return false;
+  if (!SEARCH_JS_MARKER.test(template)) return false;
+  return !searchOptionsConstructible(template, base);
+}
+
+// legado NetworkUtils.notNeedEncodingQuery / notNeedEncodingForm 与 AnalyzeUrl.queryEncoder
+// （RFC3986.UNRESERVED + `!$%&()*+,/:;=?@[\]^\`{|}`；`%` 安全，已有的 %XX 不重编）。
+const LEGADO_QUERY_PLAIN = /[A-Za-z0-9!$&()*+,\-./:;=?@[\\\]^_`{|}~]/;
+const LEGADO_FORM_PLAIN = /[A-Za-z0-9*\-._]/;
+const LEGADO_QUERY_ENCODER_SAFE = /[A-Za-z0-9\-._~!$%&()*+,/:;=?@[\\\]^`{|}]/;
+const HEX = /[0-9A-Fa-f]/;
+const LEGADO_OPTION_SPLIT = /\s*,\s*(?=\{)/;
+
+/** legado encodedQuery/encodedForm：只含安全字符与合法 %XX 即视为已编码（`i + 2 < length` 的边界照抄）。 */
+function legadoAlreadyEncoded(text: string, plain: RegExp): boolean {
+  for (let i = 0; i < text.length; i += 1) {
+    const c = text[i];
+    if (plain.test(c)) continue;
+    if (c === '%' && i + 2 < text.length && HEX.test(text[i + 1]) && HEX.test(text[i + 2])) {
+      i += 2;
+      continue;
+    }
+    return false;
+  }
+  return true;
+}
+
+/** legado AnalyzeUrl.encodeParams(isQuery=false)：按 & / = 切，逐段未编码（或声明了 charset）则 URLEncoder.encode。 */
+function legadoEncodeForm(body: string, charset: SourceCharset, checkEncoded: boolean): string {
+  const encode = (part: string) => (checkEncoded && legadoAlreadyEncoded(part, LEGADO_FORM_PLAIN)
+    ? part : percentEncodeChars(part, charset, (ch) => LEGADO_FORM_PLAIN.test(ch), true));
+  const out: string[] = [];
+  let pos = 0;
+  while (pos <= body.length) {
+    let amp = body.indexOf('&', pos);
+    if (amp === -1) amp = body.length;
+    const eq = body.indexOf('=', pos);
+    out.push(eq === -1 || eq > amp
+      ? encode(body.slice(pos, amp))
+      : `${encode(body.slice(pos, eq))}=${encode(body.slice(eq + 1, amp))}`);
+    pos = amp + 1;
+  }
+  return out.join('&');
+}
+
+const legadoIsJson = (text: string): boolean => {
+  const t = text.trim();
+  return (t.startsWith('{') && t.endsWith('}')) || (t.startsWith('[') && t.endsWith(']'));
+};
+const legadoIsXml = (text: string): boolean => {
+  const t = text.trim();
+  return t.startsWith('<') && t.endsWith('>');
+};
+
+/**
+ * 已完成 JS/`{{…}}`/页码替换的 legado ruleUrl → 结构化搜索请求（legado AnalyzeUrl.analyzeUrl 口径）：
+ * 在首个 `\s*,\s*(?=\{)` 处切选项；选项键白名单与旧口径相同（webView/js/webJs 等照旧拒）；method 仅 POST（不分大小写）
+ * 为 POST、其余字符串记 GET；空白 charset 视同未声明。GET 查询串未编码时按 queryEncoder 编码（已有 %XX 保留）；
+ * POST 表单 body（非 JSON/XML 且未声明 `Content-Type` 头）逐段 URLEncoder 编码，未声明 charset 时已编码段原样。
+ * 最终 URL 过同一把 validate（https/端口/userinfo/IP 红线不变）。
+ */
+export function buildLegadoSearchRequest(
+  ruleUrl: string, base: string | undefined, validate: SourceUrlValidator = validateSourceUrl,
+): SourceSearchRequest {
+  if (ruleUrl.length > MAX_SEARCH_JS_TEMPLATE_LENGTH) throw new SourcePolicyError('书源搜索地址过长');
+  const split = LEGADO_OPTION_SPLIT.exec(ruleUrl);
+  let urlPart = (split ? ruleUrl.slice(0, split.index) : ruleUrl).trim();
+  rejectUnexpanded(urlPart);
+  let options: Record<string, unknown> = {};
+  if (split) {
+    const parsed = parseSearchOptions(ruleUrl.slice(split.index + split[0].length));
+    if (!parsed) throw new SourcePolicyError('不支持该书源的搜索选项（非法 JSON）');
+    options = parsed;
+  }
+  for (const key of Object.keys(options)) {
+    if (!SEARCH_OPTION_KEYS.has(key)) throw new SourcePolicyError(`不支持该书源的搜索选项：${key}`);
+  }
+  let declaredCharset: string | undefined;
+  if (options.charset != null) {
+    if (typeof options.charset !== 'string') throw new SourcePolicyError('不支持该书源的搜索字符集');
+    if (options.charset.trim()) declaredCharset = options.charset;
+  }
+  let charset: SourceCharset = 'utf-8';
+  if (declaredCharset !== undefined) {
+    const normalized = normalizeCharset(declaredCharset);
+    if (!normalized) throw new SourcePolicyError('不支持该书源的搜索字符集');
+    charset = normalized;
+  }
+  if (options.method != null && typeof options.method !== 'string') throw new SourcePolicyError('不支持该书源的搜索方法');
+  const method: SourceSearchMethod = typeof options.method === 'string' && options.method.toUpperCase() === 'POST' ? 'POST' : 'GET';
+  let rawHeaders: Record<string, unknown> | undefined;
+  if (options.headers != null) {
+    if (typeof options.headers !== 'object' || Array.isArray(options.headers)) {
+      throw new SourcePolicyError('不支持该书源的搜索 headers');
+    }
+    rawHeaders = options.headers as Record<string, unknown>;
+  }
+
+  if (method === 'GET') {
+    const q = urlPart.indexOf('?');
+    if (q !== -1) {
+      const query = urlPart.slice(q + 1);
+      if (!legadoAlreadyEncoded(query, LEGADO_QUERY_PLAIN)) {
+        urlPart = urlPart.slice(0, q + 1) + percentEncodeChars(query, charset, (ch) => LEGADO_QUERY_ENCODER_SAFE.test(ch));
+      }
+    }
+  }
+  const finalUrl = validate(upgradeSourceTemplateUrl(urlPart), base).href;
+  const request: SourceSearchRequest = { url: finalUrl, method, charset };
+
+  let jsonBody = false;
+  if (method === 'POST' && options.body != null) {
+    if (typeof options.body !== 'string') throw new SourcePolicyError('不支持该书源的搜索 body');
+    let body = options.body;
+    rejectUnexpanded(body);
+    jsonBody = legadoIsJson(body);
+    const declaredType = rawHeaders !== undefined && typeof rawHeaders['Content-Type'] === 'string' && rawHeaders['Content-Type'] !== '';
+    if (body.trim() && !jsonBody && !legadoIsXml(body) && !declaredType) {
+      body = legadoEncodeForm(body, charset, declaredCharset === undefined);
+    }
+    if (body.trim()) request.body = body;
+  }
+  if (rawHeaders) {
+    const headers: Record<string, string> = {};
+    for (const [k, v] of Object.entries(rawHeaders)) {
+      if (typeof v !== 'string' || !ALLOWED_REQUEST_HEADERS.has(k.toLowerCase())) continue; // 非白名单头丢弃
+      // OkHttp 拒非 ASCII/控制字符的头值（legado 同样发不出去），{{key}} 原样展开进头的 CJK 书名在此拒。
+      if (/[^\x20-\x7e\t]/.test(v)) throw new SourcePolicyError('不支持该书源的搜索 headers');
+      headers[k] = v;
+    }
+    if (Object.keys(headers).length) request.headers = headers;
+  }
+  applyDefaultContentType(request, declaredCharset, jsonBody);
+  return request;
 }
 
 /** 详情页链接形态:book15 的 `/books/details<数字>.html`。候选收集的两条路径共用同一 grammar。 */

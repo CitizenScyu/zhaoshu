@@ -46,6 +46,8 @@ export interface JsBindings {
   /** 页面原文（legado `src`）；条目级字段没有。 */
   src?: string;
   baseUrl: string;
+  /** 额外的全局变量（searchjs1027 搜索模板的 key/page 等）；与 result/src/baseUrl/java 同名的被它们覆盖。 */
+  globals?: Readonly<Record<string, string | number>>;
 }
 
 let ready: QuickJSWASMModule | undefined;
@@ -176,6 +178,7 @@ export function runJs(code: string, bindings: JsBindings): JsValue | null {
     ? (bindings.result === bindings.src ? [] : [bindings.result])
     : bindings.result;
   const inputs = [...results, bindings.src ?? '', bindings.baseUrl];
+  for (const value of Object.values(bindings.globals ?? {})) if (typeof value === 'string') inputs.push(value);
   if (inputs.reduce((sum, text) => sum + text.length, 0) > MAX_JS_INPUT_CHARS * 2
     || inputs.some((text) => text.length > MAX_JS_INPUT_CHARS)) return evalFailed('JS 输入过大');
   const started = Date.now();
@@ -230,6 +233,11 @@ function installGlobals(context: QuickJSContext, bindings: JsBindings): void {
   const setGlobal = (name: string, handle: QuickJSHandle) => {
     context.setProp(context.global, name, handle);
   };
+  for (const [name, value] of Object.entries(bindings.globals ?? {})) {
+    const handle = typeof value === 'number' ? context.newNumber(value) : context.newString(value);
+    setGlobal(name, handle);
+    handle.dispose();
+  }
   const baseUrl = context.newString(bindings.baseUrl);
   setGlobal('baseUrl', baseUrl);
   baseUrl.dispose();

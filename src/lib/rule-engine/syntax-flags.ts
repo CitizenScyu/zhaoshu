@@ -23,16 +23,16 @@ export const ENGINE_SEMANTICS_XPATH_BIT = 2;
 /** vars1027：@put/@get 静态子集语义位。版本再 +4（5–8 = 含变量位的四种组合），1–4 逐字不变。 */
 export const ENGINE_SEMANTICS_VARS_BIT = 4;
 
-/** 语义版本随 || / XPath / 变量 / JS / XPath 求值 / 正则 / && / AllInOne 开关联动（唯一口径，供 compile.ts 缓存键与 rulesHash 复用）。 */
+/** 语义版本随 || / XPath / 变量 / JS / XPath 求值 / 正则 / && / AllInOne / 搜索 JS 开关联动（唯一口径，供 compile.ts 缓存键与 rulesHash 复用）。 */
 export function engineSemanticsVersion(
   orEnabled: boolean, xpathEnabled = false, varsEnabled = false, jsEnabled = false, xpathEvalEnabled = false,
-  regexEnabled = false, andEnabled = false, aioEnabled = false,
+  regexEnabled = false, andEnabled = false, aioEnabled = false, searchJsEnabled = false,
 ): number {
   return (orEnabled ? ENGINE_SEMANTICS_VERSION_OR : ENGINE_SEMANTICS_VERSION)
     + (xpathEnabled ? ENGINE_SEMANTICS_XPATH_BIT : 0) + (varsEnabled ? ENGINE_SEMANTICS_VARS_BIT : 0)
     + (jsEnabled ? ENGINE_SEMANTICS_JS_BIT : 0) + (xpathEvalEnabled ? ENGINE_SEMANTICS_XPATH_EVAL_BIT : 0)
     + (regexEnabled ? ENGINE_SEMANTICS_REGEX_BIT : 0) + (andEnabled ? ENGINE_SEMANTICS_AND_BIT : 0)
-    + (aioEnabled ? ENGINE_SEMANTICS_AIO_BIT : 0);
+    + (aioEnabled ? ENGINE_SEMANTICS_AIO_BIT : 0) + (searchJsEnabled ? ENGINE_SEMANTICS_SEARCH_JS_BIT : 0);
 }
 
 /**
@@ -147,5 +147,21 @@ export const ENGINE_SEMANTICS_AIO_BIT = 128;
  */
 export function engineSyntaxAioEnabled(env: OrEnv = process.env): boolean {
   const raw = env.ENGINE_SYNTAX_AIO?.trim().toLowerCase();
+  return raw === '1' || raw === 'true' || raw === 'on';
+}
+
+/**
+ * searchjs1027：搜索模板 JS 语义位。版本再 +256（257–512），1–256 逐字不变。
+ * 只对旧口径构造不出请求、且模板带 `@js:`/`<js>`/`{{表达式}}` 的源计入（source-parser searchTemplateNeedsJs）。
+ */
+export const ENGINE_SEMANTICS_SEARCH_JS_BIT = 256;
+
+/**
+ * ENGINE_SEARCH_JS 独立开关（searchjs1027，默认 off，口径同 ENGINE_SYNTAX_OR；只在 ENGINE_POST_SEARCH 开时生效）。
+ * on = 旧口径构造不出的 searchUrl 按 legado AnalyzeUrl（analyzeJs → `{{js}}` → 页码 → 选项/编码）在 QuickJS 沙箱求值
+ * （rule-engine/search-js.ts）；旧口径能构造的模板一律不走新路径。off = 逐字不变。
+ */
+export function engineSearchJsEnabled(env: OrEnv = process.env): boolean {
+  const raw = env.ENGINE_SEARCH_JS?.trim().toLowerCase();
   return raw === '1' || raw === 'true' || raw === 'on';
 }

@@ -7,7 +7,7 @@
 // admissionFetch / validateAdmissionUrl 不在此（它们在 rule-engine/admission.ts 且不导出）。
 import { alternateSourceHost, SourcePolicyError, upgradeSourceTemplateUrl, validateSourceUrl } from '@/lib/source-policy';
 import {
-  MAX_SOURCE_CHAPTERS, buildSourceSearchRequest, itempropAuthorOf, parseSourceAlias, sourceSearchUrl, type SourceBookIdentity, type SourceChapter,
+  MAX_SOURCE_CHAPTERS, itempropAuthorOf, parseSourceAlias, searchTemplateNeedsJs, sourceSearchUrl, type SourceBookIdentity, type SourceChapter,
 } from '@/lib/source-parser';
 import type { SourceRequestContext } from '@/lib/source-reader';
 import { contentHtmlToText, contentNeedsHtmlToText } from './content-html';
@@ -15,8 +15,9 @@ import { isStructuredChallengePage } from './content-challenge';
 import {
   compiledUsesJs, createScope, evaluateField, evaluateFieldList, evaluateFieldStrings, fieldUsesJs, normalizeBody,
 } from './evaluate';
-import { enginePostSearchEnabled } from './compile-smoke';
+import { enginePostSearchEnabled, engineSearchJsActive } from './compile-smoke';
 import { preloadJsSandbox } from './js-sandbox';
+import { buildSearchRequest, prepareSearchJs } from './search-js';
 import type { CompiledRules, FieldIr, SkippedField } from './types';
 
 export interface EngineSource {
@@ -95,7 +96,10 @@ export async function engineSearchBook(
   // flag 开时经 buildSourceSearchRequest 支持 POST/body/charset/白名单头（41-postsearch）。
   let page: { url: string; text: string };
   if (enginePostSearchEnabled()) {
-    const request = buildSourceSearchRequest(source.searchUrl, title, source.url);
+    // searchjs1027：旧口径构造不出、需 JS 的模板（ENGINE_SEARCH_JS 开）在沙箱里按 legado 口径求值；其余逐字走旧口径。
+    const searchJs = engineSearchJsActive();
+    if (searchJs && searchTemplateNeedsJs(source.searchUrl, source.url)) await prepareSearchJs();
+    const request = buildSearchRequest(source.searchUrl, title, source.url, validateSourceUrl, searchJs);
     page = await context.page(request.url, {
       request: { method: request.method, body: request.body, headers: request.headers, charset: request.charset },
       // 显式非 utf-8 字符集直接用；否则 'auto' 按 Content-Type 嗅探（utf-8 站维持原状）。

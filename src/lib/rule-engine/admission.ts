@@ -12,10 +12,10 @@
 import { checkSourceUrl, upgradeSourceTemplateUrl, SourcePolicyError } from '@/lib/source-policy';
 import { sourceRevision } from '@/lib/source-revision';
 import { preservesSourcePostRedirect, sourceAbortable } from '@/lib/source-fetch';
-import { buildSourceSearchRequest, type SourceSearchRequest, type SourceUrlValidator } from '@/lib/source-parser';
+import { type SourceSearchRequest, type SourceUrlValidator } from '@/lib/source-parser';
 import { charsetFromContentType, encodeToBytes, type SourceCharset } from '@/lib/source-charset';
 import {
-  admissionSurveyOptions, CORE_FIELDS, enginePostSearchEnabled, iterRulePairs, jsChainEnabledFor, selectCandidates,
+  admissionSurveyOptions, CORE_FIELDS, enginePostSearchEnabled, engineSearchJsActive, iterRulePairs, jsChainEnabledFor, selectCandidates,
   sourceHasJsChainField, type RawSource,
 } from './compile-smoke';
 import { parseFieldRule } from './parse';
@@ -27,6 +27,7 @@ import { compileSource, engineSourceRevision } from './compile';
 import { engineSyntaxAioEnabled, engineSyntaxVarsEnabled } from './syntax-flags';
 import { aioGroups, isAioListRule, ruleGroupOf } from './aio-syntax';
 import { preloadJsSandbox } from './js-sandbox';
+import { buildSearchRequest, prepareSearchJs, SearchJsNotReadyError } from './search-js';
 import { resolveSourceVars } from './vars-subset';
 import { contentHtmlToText, contentNeedsHtmlToText } from './content-html';
 import { isStructuredChallengePage } from './content-challenge';
@@ -684,7 +685,8 @@ function buildAdmissionSearchRequest(
   const validate: SourceUrlValidator = (value, b) => validateAdmissionUrl(value, b, declaredHosts);
   if (enginePostSearchEnabled()) {
     // 与运行时 sourceSearchUrl/buildSourceSearchRequest 同一口径（含 http→https 升级），否则「准入通过、阅读期被判死」两把锁漂移。
-    return buildSourceSearchRequest(source.searchUrl, keyword, base, validate);
+    // searchjs1027：ENGINE_SEARCH_JS 开时旧口径构造不出的 JS 模板与运行时同一函数求值（沙箱未就绪抛 SearchJsNotReadyError）。
+    return buildSearchRequest(source.searchUrl, keyword, base, validate, engineSearchJsActive());
   }
   const template = source.searchUrl;
   if (typeof template !== 'string' || template.length > 2048 || !/\{\{key\}\}/.test(template)) {
@@ -796,6 +798,7 @@ async function searchAdmissionOnce(
   try {
     request = buildAdmissionSearchRequest(source, options.declaredHosts, keyword);
   } catch (error) {
+    if (error instanceof SearchJsNotReadyError) throw error; // 瞬时：由 runAdmissionBatch 写占位，不记 url_invalid
     return { verdict: 'url_invalid', candidateCount: 0, error: errorMessage(error) };
   }
   let response: { url: string; status: number; text: string };
@@ -873,7 +876,8 @@ async function controlQueryOverlap(
   let request: SourceSearchRequest;
   try {
     request = buildAdmissionSearchRequest(source, options.declaredHosts, control);
-  } catch {
+  } catch (error) {
+    if (error instanceof SearchJsNotReadyError) throw error; // 不能因沙箱瞬时不可用跳过对照判定
     return undefined;
   }
   const throttleMs = options.throttleMs ?? ADMISSION_THROTTLE_MS;
@@ -1186,8 +1190,8 @@ function searchUrlStillInvalid(source: RawSource, declaredHosts: ReadonlySet<str
   try {
     buildAdmissionSearchRequest(source, declaredHosts);
     return false;
-  } catch {
-    return true;
+  } catch (error) {
+    return !(error instanceof SearchJsNotReadyError); // 沙箱瞬时不可用不算「本地确定性失败」
   }
 }
 
@@ -1405,6 +1409,8 @@ export async function runAdmissionBatch(input: AdmissionBatchInput): Promise<Adm
   // read1027：影子结果按计划序下标归位（与 results 同理，不按完成先后）。
   const shadowResults = new Map<number, { host: string } & ReadabilityShadowResult>();
 
+  // searchjs1027：候选筛/模板展开里的搜索 JS 是同步求值，先载入沙箱（加载失败即本轮失败，不把源误判成拒）。
+  if (engineSearchJsActive()) await prepareSearchJs();
   const plan = planProbeOrder(input, now().getTime());
   // 结果槽:与计划同序(undefined = 本条无行输出)。汇总后按计划顺序产出 rows。
   const results: (AdmissionSourceRow | undefined)[] = new Array(plan.length);
@@ -1420,7 +1426,13 @@ export async function runAdmissionBatch(input: AdmissionBatchInput): Promise<Adm
   for (let index = 0; index < plan.length; index += 1) {
     const { candidate, previous, hash, probeClass } = plan[index];
     const host = hostOf(candidate.url);
-    const compile = compileAdmission(candidate.source);
+    let compile: AdmissionCompile;
+    try {
+      compile = compileAdmission(candidate.source);
+    } catch (error) {
+      if (error instanceof SearchJsNotReadyError) continue; // 沙箱瞬时不可用（预算耗尽等）：本轮不写行，下一轮再判
+      throw error;
+    }
     // N03 祖父条款：新校验下会拒、但规则未变且已在池（compile_ok ∧ search_ok=true）→ 维持既有资格。
     const exempt = !compile.ok && isGrandfatheredAdmitted(previous, hash);
 
@@ -1514,14 +1526,22 @@ export async function runAdmissionBatch(input: AdmissionBatchInput): Promise<Adm
       probed += 1;
       inflightHosts.add(item.mutexHost);
       try {
-        const result = await searchAdmission(item.candidate.source, {
-          fetchPage: input.fetchPage, declaredHosts: input.declaredHosts, signal: input.signal,
-          throttleMs: input.throttleMs, sleep: input.sleep, controlQuery: input.controlQuery,
-          // 41-srcfix 改法1：换词不另占名额，但每次换词前与起探同一口径判预算/中止。
-          keywordFallback: input.keywordFallback,
-          canRetryKeyword: () => canProbe() && !input.signal.aborted,
-          ...(shadowMax > 0 ? { sampleBook: true } : {}),
-        });
+        let result: AdmissionSearchResult;
+        try {
+          result = await searchAdmission(item.candidate.source, {
+            fetchPage: input.fetchPage, declaredHosts: input.declaredHosts, signal: input.signal,
+            throttleMs: input.throttleMs, sleep: input.sleep, controlQuery: input.controlQuery,
+            // 41-srcfix 改法1：换词不另占名额，但每次换词前与起探同一口径判预算/中止。
+            keywordFallback: input.keywordFallback,
+            canRetryKeyword: () => canProbe() && !input.signal.aborted,
+            ...(shadowMax > 0 ? { sampleBook: true } : {}),
+          });
+        } catch (error) {
+          // searchjs1027：沙箱瞬时不可用（预算耗尽/重载中）不是源的结论，按「没轮到」写占位。
+          if (!(error instanceof SearchJsNotReadyError)) throw error;
+          if (item.placeholder) results[item.index] = item.placeholder;
+          continue;
+        }
         verdicts[result.verdict] = (verdicts[result.verdict] ?? 0) + 1;
         probedVerdicts.set(pick, result.verdict);
         // 41-B2-OK-RECHECK:写库结论走 recheckOutcome——干净 ok 行首次复核失败记 strike 不出池。

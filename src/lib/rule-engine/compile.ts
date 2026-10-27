@@ -3,7 +3,10 @@
 // 缓存键 = 语义版本化 sourceRevision（P0 引入 engineVersionedKey；P1a 起语义版本随
 // ENGINE_SYNTAX_OR 联动——off=1 / on=2）：规则原文或引擎语义任一变化，键即变，旧编译
 // 产物自然失效，不存在「|| 开关打开后仍复用 off 态编译缓存」的窗口。
+import { searchTemplateNeedsJs } from '@/lib/source-parser';
+import { upgradeSourceTemplateUrl } from '@/lib/source-policy';
 import { sourceRevision } from '@/lib/source-revision';
+import { engineSearchJsActive } from './compile-smoke';
 import { aioGroups } from './aio-syntax';
 import { jsChainFieldAllowed, parseFieldRule, ruleHasJs, type ParseOptions } from './parse';
 import type { CompiledRules, FieldIr, RuleIr } from './types';
@@ -19,6 +22,8 @@ export { ENGINE_SEMANTICS_VERSION };
 /** 编译选项：parse 层两开关 + 源级改写开关（vars1027，ENGINE_SYNTAX_VARS，默认读 env）。 */
 export interface CompileOptions extends ParseOptions {
   varsEnabled?: boolean;
+  /** searchjs1027：搜索模板 JS（缺省 = ENGINE_POST_SEARCH 与 ENGINE_SEARCH_JS 都开）。只影响语义版本位，不影响编译产物。 */
+  searchJsEnabled?: boolean;
 }
 
 /** 版本化缓存键（P0 口径）：semanticsVersion:contentRevision。 */
@@ -36,6 +41,7 @@ export function engineVersionedKey(contentRevision: string, semanticsVersion = E
  * regex1027：ENGINE_SYNTAX_REGEX on 且有字段编译出正则-only 规则或 replaceFirst 替换时再加正则位（33–64）。
  * and1027：ENGINE_SYNTAX_AND（须 OR）on 且有 off 态因 && 被拒的字段在 on 态编译通过时再加 && 位（65–128）。
  * aio1027：ENGINE_SYNTAX_AIO on 且 bookList/chapterList 以 `:` 开头时再加 AllInOne 位（129–256）。
+ * searchjs1027：搜索模板 JS 生效且该源 searchUrl 旧口径构造不出、需 JS（searchTemplateNeedsJs）时再加搜索 JS 位（257–512）。
  */
 export function engineSourceRevision(
   source: { url: string; searchUrl: unknown; rules: Record<string, unknown> },
@@ -49,6 +55,7 @@ export function engineSourceRevision(
   const regexEnabled = options.regexEnabled ?? engineSyntaxRegexEnabled();
   const andEnabled = options.andEnabled ?? engineSyntaxAndEnabled();
   const aioEnabled = options.aioEnabled ?? engineSyntaxAioEnabled();
+  const searchJsEnabled = options.searchJsEnabled ?? engineSearchJsActive();
   const jsChain = jsEnabled && !sourceHasJsLib(source.rules);
   return engineVersionedKey(sourceRevision(source), engineSemanticsVersion(
     orEnabled && sourceUsesOrSyntax(source.rules),
@@ -63,6 +70,7 @@ export function engineSourceRevision(
       varsEnabled, jsEnabled: jsChain, xpathEnabled, xpathEvalEnabled: xpathEval, regexEnabled,
     }),
     aioEnabled && sourceUsesAioSyntax(source.rules),
+    searchJsEnabled && searchTemplateNeedsJs(source.searchUrl, upgradeSourceTemplateUrl(source.url)),
   ));
 }
 

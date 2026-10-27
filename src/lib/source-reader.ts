@@ -12,6 +12,8 @@ import {
   engineFetchContent, engineFetchDetail, engineFetchToc, engineSearchBook, MAX_CONTENT_PAGES, type EngineSearchResult, type EngineSource,
 } from './rule-engine/api';
 import { compileSource } from './rule-engine/compile';
+import { engineSearchJsActive } from './rule-engine/compile-smoke';
+import { prepareSearchJs } from './rule-engine/search-js';
 import {
   knownSourceAuthor, matchSourceChapter, MAX_SOURCE_CHAPTER_CHARACTERS, normalizeSourceTitle, parseSourceChapters,
   parseSourceChapterText, parseSourceDetailLinks, parseSourceIdentity, parseSourceSearch,
@@ -1526,6 +1528,8 @@ export async function probeSourceForBook(
     { ...base, ...result, elapsedMs: Date.now() - startedAt, requests: context.requests }
   );
   try {
+    // searchjs1027：需 JS 的搜索模板在 probeCompileFailure 里同步求值，先载入沙箱。
+    if (engineSearchJsActive()) await prepareSearchJs();
     const compileFailure = probeCompileFailure(source, book.title);
     if (compileFailure) return finish({ status: 'compile_failed', ...compileFailure });
     const searchStats: SourceSearchStat[] = [];

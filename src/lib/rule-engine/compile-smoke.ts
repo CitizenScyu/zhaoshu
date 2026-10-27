@@ -3,10 +3,11 @@
 // 设计依据：m1-engine-design.md v3 §8.2；移植逻辑参考 .rule-survey/survey.py。
 
 import { upgradeSourceTemplateUrl } from '@/lib/source-policy';
-import { searchOptionsConstructible } from '@/lib/source-parser';
+import { searchOptionsConstructible, searchTemplateNeedsJs } from '@/lib/source-parser';
 import { jsChainFieldAllowed, parseFieldRule, ruleHasJs, type ParseOptions } from './parse';
 import { aioGroupsFlat, ruleGroupOf } from './aio-syntax';
-import { engineSyntaxAioEnabled, engineSyntaxJsEnabled } from './syntax-flags';
+import { searchJsConstructible } from './search-js';
+import { engineSearchJsEnabled, engineSyntaxAioEnabled, engineSyntaxJsEnabled } from './syntax-flags';
 import { RuleEngineError, type RuleDiagnostic } from './types';
 
 // survey.py CORE_FIELDS（阅读路径必需字段）
@@ -31,6 +32,11 @@ const RULE_GROUPS = ['ruleSearch', 'ruleBookInfo', 'ruleContent', 'ruleToc', 'ru
 /** ENGINE_POST_SEARCH 开关（41-postsearch）：开时引擎搜索支持 POST/body/charset、口径放开安全选项源。默认关，关时行为逐字不变。 */
 export function enginePostSearchEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
   return env.ENGINE_POST_SEARCH === '1' || env.ENGINE_POST_SEARCH === 'true';
+}
+
+/** 搜索模板 JS（searchjs1027）实际生效：ENGINE_SEARCH_JS 只在 ENGINE_POST_SEARCH 开时起作用（新路径产出的是结构化请求）。 */
+export function engineSearchJsActive(env: NodeJS.ProcessEnv = process.env): boolean {
+  return enginePostSearchEnabled(env) && engineSearchJsEnabled(env);
 }
 
 /**
@@ -108,11 +114,12 @@ export function sourceHasJsChainField(src: RawSource): boolean {
  */
 export function admissionSurveyOptions(
   src: RawSource, env: NodeJS.ProcessEnv = process.env,
-): { postSearch: boolean; noncoreJs: boolean; coreJs: boolean } {
+): { postSearch: boolean; noncoreJs: boolean; coreJs: boolean; searchJs: boolean } {
   return {
     postSearch: enginePostSearchEnabled(env),
     noncoreJs: admissionNoncoreJsEnabled(env),
     coreJs: jsChainEnabledFor(src, env),
+    searchJs: engineSearchJsActive(env),
   };
 }
 
@@ -157,9 +164,12 @@ function searchIsPureGet(su: unknown): boolean {
  * js-1026：`noncoreJs`（ADMISSION_NONCORE_JS）开时 JS 判据只查阅读路径字段，见 admissionNoncoreJsEnabled。
  * 源类型按 legado BookSourceType（0 文本 / 1 音频 / 2 图片 / 3 文件 / 4 视频）只放行文本源：原判据只拒 2
  * 且注释误作「听书源」，音频（猫耳FM/喜马拉雅）与文件源（Zlibrary/知轩藏书）可漏进文本池。缺省按文本，非数值拒。
+ *
+ * searchjs1027：`searchJs`（postSearch 同开才生效）时，旧口径构造不出、需 JS 的模板改在沙箱里按 legado 口径试构造
+ * （search-js.ts searchJsConstructible，与运行时同一函数）。须先 await prepareSearchJs()，沙箱未就绪抛 SearchJsNotReadyError。
  */
 export function selectCandidates(
-  data: RawSource[], options: { postSearch?: boolean; noncoreJs?: boolean; coreJs?: boolean } = {},
+  data: RawSource[], options: { postSearch?: boolean; noncoreJs?: boolean; coreJs?: boolean; searchJs?: boolean } = {},
 ): RawSource[] {
   const out: RawSource[] = [];
   for (const s of data) {
@@ -168,7 +178,9 @@ export function selectCandidates(
     if (!rulesNoJs(s, options)) continue;
     // 默认口径 = 纯 GET；postSearch 开时额外放行「可构造出 POST/GET 请求」的源（与运行时同一判据，webView/未知键/展不开仍拒）。
     if (!searchIsPureGet(s.searchUrl)
-      && !(options.postSearch && searchOptionsConstructible(s.searchUrl, upgradedBase))) continue;
+      && !(options.postSearch && searchOptionsConstructible(s.searchUrl, upgradedBase))
+      && !(options.postSearch && options.searchJs && searchTemplateNeedsJs(s.searchUrl, upgradedBase)
+        && searchJsConstructible(s.searchUrl as string, upgradedBase))) continue;
     const rs = (s.ruleSearch ?? {}) as Record<string, unknown>;
     const rc = (s.ruleContent ?? {}) as Record<string, unknown>;
     if (!(rs && typeof rs === 'object' && rs.bookList)) continue;

@@ -70,6 +70,22 @@ export function encodeQueryComponent(text: string, charset: SourceCharset): stri
 }
 
 /**
+ * searchjs1027：按 legado 编码器口径逐字符百分号编码——`safe` 判为安全的字符原样保留，其余按 charset 编成字节
+ * 后逐字节 `%XX`（大写）；`spaceAsPlus` 时空格记 `+`（java.net.URLEncoder 口径）。GBK 表外字符回退 UTF-8 字节，同 encodeToBytes。
+ */
+export function percentEncodeChars(
+  text: string, charset: SourceCharset, safe: (ch: string) => boolean, spaceAsPlus = false,
+): string {
+  let out = '';
+  for (const ch of text) {
+    if (ch.length === 1 && safe(ch)) { out += ch; continue; }
+    if (ch === ' ' && spaceAsPlus) { out += '+'; continue; }
+    for (const b of encodeToBytes(ch, charset)) out += pctByte(b);
+  }
+  return out;
+}
+
+/**
  * 把整段文本按 charset 编成字节，用于 POST body 发送。utf-8 直接走 TextEncoder；
  * GBK/gb18030 按双字节表编码（ASCII 单字节透传），表外字符回退 UTF-8 字节。
  * 表单 body（{{key}} 已是 ASCII 百分号编码）任何 charset 下字节相同；JSON body 的 CJK 才靠此得到正确字节。

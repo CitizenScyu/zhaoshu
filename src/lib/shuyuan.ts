@@ -13,7 +13,8 @@ import {
   admissionReadabilityShadowMax, assertAdmissionVersionConsistent, defaultAdmissionTransport, rulesHash, runAdmissionBatch,
   type AdmissionCandidate, type AdmissionSourceRow,
 } from '@/lib/rule-engine/admission';
-import { admissionSurveyOptions, selectCandidates, type RawSource } from '@/lib/rule-engine/compile-smoke';
+import { admissionSurveyOptions, engineSearchJsActive, selectCandidates, type RawSource } from '@/lib/rule-engine/compile-smoke';
+import { prepareSearchJs, SearchJsNotReadyError } from '@/lib/rule-engine/search-js';
 import { DEFAULT_SHUYUAN_READ_CACHE_TTL_MS, shuyuanReadCacheTtlMs } from '@/lib/read-cache-ttl';
 import { adultStationKeys, classifySourceAdult, type SourceAdultClassification } from '@/lib/source-adult-classification';
 import { isPaywallHost } from '@/lib/source-host-health';
@@ -364,6 +365,8 @@ async function eligibleReadingSources(signal: AbortSignal, includeEngine: boolea
   // 的那份照样选得上。准入表的 compile_ok/search_ok 是准入当时的结论，与运行时 host 门可能不一致（41-swq 实测：sfacg
   // 两条规则的 searchUrl 指向门外的 m.sfacg.com，准入记 search_ok，去重腾出名额后补进扇出，每次 probe 必 compile_failed）。
   // 必须在上面刷门之后筛。这类源搜不出书，也就不会有用户在读它，从 selectable 里拿掉不影响在读。
+  // searchjs1027：需 JS 的搜索模板在可用性判定里同步求值，先载入沙箱。
+  if (engineOk && engineSearchJsActive()) await prepareSearchJs();
   const engine = engineOk ? (await engineSourcesIncremental(s, states, signal)).filter(engineSourceUsable) : [];
   return [...builtin, ...engine];
 }
@@ -1995,9 +1998,18 @@ async function admitRows(
   const surveyRejected: AdmissionCandidate[] = [];
   // 41-admpost F2 / js-1026 / jsbox1027：候选筛与 compileAdmission 同一口径（admissionSurveyOptions 逐源算），
   // 否则放行源在评估环第一步被判回 T7，或（漏传 coreJs 时）JS 源根本进不了评估环。
+  // searchjs1027：搜索模板 JS 的候选判定在沙箱里同步求值，先载入；沙箱瞬时不可用的源本轮两边都不进（不误判 T7）。
+  if (engineSearchJsActive()) await prepareSearchJs();
   for (const row of rows) {
     const source = row.source as RawSource;
-    (selectCandidatesWithPermanentBlock([source], admissionSurveyOptions(source)).length === 1 ? candidates : surveyRejected).push({ url: row.url, source });
+    let selected: boolean;
+    try {
+      selected = selectCandidatesWithPermanentBlock([source], admissionSurveyOptions(source)).length === 1;
+    } catch (error) {
+      if (error instanceof SearchJsNotReadyError) continue;
+      throw error;
+    }
+    (selected ? candidates : surveyRejected).push({ url: row.url, source });
   }
   let summary: AdmissionRoundSummary;
   try {
