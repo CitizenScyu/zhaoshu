@@ -675,6 +675,13 @@ function jsBindings(
 ): Pick<JsBindings, 'globals' | 'objects' | 'callbacks' | 'utilHelpers'> {
   const host = util ? { ...hostBindings(scope), utilHelpers: true } : hostBindings(scope);
   if (gets === undefined) return host;
+  return { ...host, callbacks: { ...host.callbacks, ...getterCallbacks(scope, gets, initContent) } };
+}
+
+/** jsget1028 的 getter 回调（口径见 jsBindings）；listget1028 的列表 JS 同用，scope 为页面作用域。 */
+function getterCallbacks(
+  scope: EvalScope, gets: NonNullable<FieldIr['jsGets']>, initContent?: string,
+): NonNullable<JsBindings['callbacks']> {
   const memo = new Map<string, string>();
   const read = (rule: string, extra: readonly (string | null)[]): string => {
     if (initContent !== undefined && extra.length > 0 && (extra.length > 1 || extra[0] !== initContent)) {
@@ -690,15 +697,11 @@ function jsBindings(
     return value;
   };
   return {
-    ...host,
-    callbacks: {
-      ...host.callbacks,
-      getString: (rule, extra) => {
-        const value = read(rule, extra);
-        return value.includes('&') ? decodeHTMLStrict(value) : value;
-      },
-      getStringList: (rule, extra) => splitLines(read(rule, extra)),
+    getString: (rule, extra) => {
+      const value = read(rule, extra);
+      return value.includes('&') ? decodeHTMLStrict(value) : value;
     },
+    getStringList: (rule, extra) => splitLines(read(rule, extra)),
   };
 }
 
@@ -827,8 +830,8 @@ function listChainScopes(field: FieldIr, chain: readonly ChainStage[], scope: Ev
 }
 
 /**
- * 列表 JS 的 `book`（book1028）与变量袋回调（searchvars1028）：只给挂了 bookMembers / varGets 的列表字段，其余宿主绑定列表 JS
- * 照旧不给。
+ * 列表 JS 的 `book`（book1028）、变量袋回调（searchvars1028）与 getter 回调（listget1028，在页面作用域上取值——legado getElements
+ * 时 content 是整页）：只给挂了 bookMembers / varGets / jsGets 的列表字段，其余宿主绑定列表 JS 照旧不给。
  */
 function listBookBindings(field: FieldIr, scope: EvalScope): Pick<JsBindings, 'objects' | 'callbacks'> {
   const out: Pick<JsBindings, 'objects' | 'callbacks'> = {};
@@ -836,6 +839,7 @@ function listBookBindings(field: FieldIr, scope: EvalScope): Pick<JsBindings, 'o
   if (book !== undefined) out.objects = { book };
   const vars = field.varGets ? scope.host?.vars : undefined;
   if (vars !== undefined) out.callbacks = varCallbacks(vars);
+  if (field.jsGets !== undefined) out.callbacks = { ...out.callbacks, ...getterCallbacks(scope, field.jsGets) };
   return out;
 }
 

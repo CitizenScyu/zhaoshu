@@ -7,7 +7,7 @@ import { searchOptionsMayUseWebView, searchOptionsNeedParity, searchTemplateNeed
 import { upgradeSourceTemplateUrl } from '@/lib/source-policy';
 import { sourceRevision } from '@/lib/source-revision';
 import { engineSearchJsActive, engineSearchOptionsActive } from './compile-smoke';
-import { aioGroups } from './aio-syntax';
+import { AIO_LIST_FIELDS, aioGroups } from './aio-syntax';
 import {
   initFieldSupported, initJsFieldSupported, initRuleTextSupported, jsChainFieldAllowed, listJsGroups, objectKeyOf, parseFieldRule, ruleHasJs,
   type ParseOptions,
@@ -18,7 +18,7 @@ import {
   engineSyntaxJsExtEnabled, engineSyntaxJsGetEnabled, engineSyntaxJsonPathEnabled, engineSyntaxJsUtilEnabled, engineSyntaxListJsEnabled,
   engineSyntaxOrEnabled, engineSyntaxRegexEnabled, engineSyntaxVarsEnabled, engineSyntaxXPathEnabled, engineSyntaxXPathEvalEnabled, engineUrlOptionsEnabled,
   engineSearchWebViewEnabled, engineSyntaxInitJsEnabled, engineSyntaxJsoupEnabled, engineSyntaxVarsBagEnabled,
-  engineSyntaxBookFieldsEnabled, engineSyntaxSearchVarsEnabled, engineSyntaxItemVarsEnabled, ENGINE_SEMANTICS_VERSION,
+  engineSyntaxBookFieldsEnabled, engineSyntaxSearchVarsEnabled, engineSyntaxItemVarsEnabled, engineSyntaxListGetEnabled, ENGINE_SEMANTICS_VERSION,
 } from './syntax-flags';
 import { urlOptionFields } from './url-options';
 import {
@@ -51,6 +51,7 @@ export interface CompileOptions extends ParseOptions {
   searchVarsEnabled?: boolean;
   /** itemvars1028：搜索条目袋（ENGINE_SYNTAX_ITEM_VARS，默认读 env；须搜索袋同生效）。 */
   itemVarsEnabled?: boolean;
+  // listGetEnabled（listget1028，ENGINE_SYNTAX_LIST_GET）见 ParseOptions；compile 层另要求 JS 链对该源生效、列表 JS 与 getter 同开。
 }
 
 /** 版本化缓存键（P0 口径）：semanticsVersion:contentRevision。 */
@@ -87,6 +88,8 @@ export function engineVersionedKey(contentRevision: string, semanticsVersion = E
  * searchvars1028：ENGINE_SYNTAX_VARS、ENGINE_SYNTAX_SEARCH_VARS 与搜索 JS 都生效且搜索袋对该源真生效（compileSearchVars 非 null）时
  * 再加搜索袋位（+16777216）。
  * itemvars1028：搜索袋各条件与 ENGINE_SYNTAX_ITEM_VARS 都生效且条目袋对该源真生效（compileItemVars 非 null）时再加条目袋位（+33554432）。
+ * listget1028：ENGINE_SYNTAX_LIST_GET on、JS 链对该源生效、列表 JS 与 getter 同开且有列表字段 off 态被拒、on 态编译通过
+ * （sourceUsesListGetSyntax）时再加列表 getter 位（+67108864）。其余位的探测不传本开关（读 env，与 compileSource 同口径）。
  */
 export function engineSourceRevision(
   source: { url: string; searchUrl: unknown; rules: Record<string, unknown> },
@@ -122,6 +125,7 @@ export function engineSourceRevision(
   const book = jsBind && (options.bookFieldsEnabled ?? engineSyntaxBookFieldsEnabled()) && !sourceCanReName(source.rules);
   const searchVars = varsEnabled && searchJsEnabled && (options.searchVarsEnabled ?? engineSyntaxSearchVarsEnabled());
   const itemVars = searchVars && (options.itemVarsEnabled ?? engineSyntaxItemVarsEnabled());
+  const listGet = jsGet && listJsEnabled && (options.listGetEnabled ?? engineSyntaxListGetEnabled());
   // jsoup1028：其余各位先按 jsoup 关判（与旧口径逐字相同），jsoup 开时再补判一次取并集——jsoup 重试能救活
   // 某开关的 off 态（如条目首段 JS 以 Element 起链），只按 jsoup 开判会把该位清掉、在池源 identity 白翻。
   // book1028 同理：书籍成员重试也能救活别的开关的 off 态，book 开时再按 book 开（jsoup 两态）补判。
@@ -181,7 +185,7 @@ export function engineSourceRevision(
     varsEnabled && (options.varBagEnabled ?? engineSyntaxVarsBagEnabled()) && compileVarBag(source.rules, {
       orEnabled, xpathEnabled, xpathEvalEnabled: xpathEval, jsEnabled: jsChain, regexEnabled, andEnabled, aioEnabled, listJsEnabled,
       jsExtEnabled, jsBindEnabled: jsBind, jsGetEnabled: jsGet, jsUtilEnabled: jsUtil, jsonPathEnabled, initJsEnabled, jsoupEnabled: jsoup,
-      bookFieldsEnabled: book,
+      bookFieldsEnabled: book, listGetEnabled: listGet,
     }) !== null,
     jsoup && [false, ...(book ? [true] : [])].some((b) => sourceUsesJsoupSyntax(source.rules, {
       orEnabled, varsEnabled, xpathEnabled, xpathEvalEnabled: xpathEval, regexEnabled, andEnabled, aioEnabled, listJsEnabled, jsExtEnabled,
@@ -194,13 +198,17 @@ export function engineSourceRevision(
     searchVars && compileSearchVars(source, {
       orEnabled, xpathEnabled, xpathEvalEnabled: xpathEval, jsEnabled: jsChain, regexEnabled, andEnabled, aioEnabled, listJsEnabled,
       jsExtEnabled, jsBindEnabled: jsBind, jsGetEnabled: jsGet, jsUtilEnabled: jsUtil, jsonPathEnabled, initJsEnabled, jsoupEnabled: jsoup,
-      bookFieldsEnabled: book,
+      bookFieldsEnabled: book, listGetEnabled: listGet,
     }) !== null,
     itemVars && compileItemVars(source, {
       orEnabled, xpathEnabled, xpathEvalEnabled: xpathEval, jsEnabled: jsChain, regexEnabled, andEnabled, aioEnabled, listJsEnabled,
       jsExtEnabled, jsBindEnabled: jsBind, jsGetEnabled: jsGet, jsUtilEnabled: jsUtil, jsonPathEnabled, initJsEnabled, jsoupEnabled: jsoup,
-      bookFieldsEnabled: book,
+      bookFieldsEnabled: book, listGetEnabled: listGet,
     }) !== null,
+    listGet && soup((j, b) => sourceUsesListGetSyntax(source.rules, {
+      orEnabled, varsEnabled, xpathEnabled, xpathEvalEnabled: xpathEval, regexEnabled, andEnabled, aioEnabled, jsExtEnabled,
+      jsBindEnabled: jsBind, jsUtilEnabled: jsUtil, jsonPathEnabled, jsoupEnabled: j, bookFieldsEnabled: b,
+    })),
   ));
 }
 
@@ -661,6 +669,64 @@ export function sourceUsesJsGetSyntax(
   return uses;
 }
 
+const listGetMemo = new WeakMap<object, Map<string, boolean>>();
+
+/**
+ * 源是否会因 ENGINE_SYNTAX_LIST_GET 改变编译结果（listget1028）：on 态只放行列表 JS 里 off 态被拒的 getter 调用，所以对
+ * bookList/chapterList（非 AllInOne 组、含 getter 字样）按两态（JS、列表 JS、getter 开，其余开关同 compileSource）各编译一次，
+ * 有字段 off 拒、on 过即算。调用方须确认 JS 链对该源生效、列表 JS 与 getter 同开。
+ */
+export function sourceUsesListGetSyntax(
+  rules: Record<string, unknown>,
+  options: {
+    orEnabled: boolean; varsEnabled: boolean; xpathEnabled: boolean; xpathEvalEnabled: boolean; regexEnabled: boolean; andEnabled: boolean;
+    aioEnabled: boolean; jsExtEnabled: boolean; jsBindEnabled: boolean; jsUtilEnabled?: boolean; jsonPathEnabled?: boolean;
+    jsoupEnabled?: boolean;
+    bookFieldsEnabled?: boolean;
+  },
+): boolean {
+  if (sourceHasJsLib(rules) || !someRule(rules, ruleMayUseJsGet)) return false;
+  const jsUtilEnabled = options.jsUtilEnabled === true;
+  const jsonPathEnabled = options.jsonPathEnabled === true;
+  const jsoupEnabled = options.jsoupEnabled === true;
+  const bookFieldsEnabled = options.bookFieldsEnabled === true;
+  const memoKey = `${options.orEnabled}:${options.varsEnabled}:${options.xpathEnabled}:${options.xpathEvalEnabled}:${options.regexEnabled}:${options.andEnabled}:${options.aioEnabled}:${options.jsExtEnabled}:${options.jsBindEnabled}:${jsUtilEnabled}:${jsonPathEnabled}:${jsoupEnabled}:${bookFieldsEnabled}`;
+  let memo = listGetMemo.get(rules);
+  const hit = memo?.get(memoKey);
+  if (hit !== undefined) return hit;
+  const sourceRules = options.varsEnabled ? resolveSourceVars(rules) : rules;
+  const aio = options.aioEnabled ? aioGroups(sourceRules) : new Set<string>();
+  let uses = false;
+  for (const [group, list] of Object.entries(AIO_LIST_FIELDS)) {
+    const fields = sourceRules[group];
+    if (uses || aio.has(group) || !fields || typeof fields !== 'object' || Array.isArray(fields)) continue;
+    const rule = (fields as Record<string, unknown>)[list];
+    if (typeof rule !== 'string' || !ruleMayUseJsGet(rule)) continue;
+    const parse = (listGetEnabled: boolean) => parseFieldRule(rule, {
+      orEnabled: options.orEnabled, xpathEnabled: options.xpathEnabled, xpathEvalEnabled: options.xpathEvalEnabled, jsEnabled: true,
+      regexEnabled: options.regexEnabled, andEnabled: options.andEnabled, aioEnabled: options.aioEnabled, aioGroup: false,
+      listJsEnabled: true, jsExtEnabled: options.jsExtEnabled, jsBindEnabled: options.jsBindEnabled, jsGetEnabled: true, listGetEnabled,
+      jsUtilEnabled, jsonPathEnabled, jsoupEnabled, bookFieldsEnabled, field: `${group}.${list}`,
+    });
+    try {
+      parse(true);
+    } catch {
+      continue; // on 态也编译不过：两态都 skipped
+    }
+    try {
+      parse(false);
+    } catch {
+      uses = true;
+    }
+  }
+  if (!memo) {
+    memo = new Map();
+    listGetMemo.set(rules, memo);
+  }
+  memo.set(memoKey, uses);
+  return uses;
+}
+
 const jsUtilMemo = new WeakMap<object, Map<string, boolean>>();
 
 /** 可能受 jsutil1028 影响的规则：JS 规则里出现加解密帮手或 toNumChapter 的名字。宁宽勿漏，实编译再判。 */
@@ -1063,6 +1129,8 @@ function bagParseBase(rules: Record<string, unknown>, options: ParseOptions): Pa
   };
   // book1028：同 compileSource（宿主绑定生效、canReName 为空才开）。
   base.bookFieldsEnabled = base.jsBindEnabled === true && (options.bookFieldsEnabled ?? engineSyntaxBookFieldsEnabled()) && !sourceCanReName(rules);
+  // listget1028：同 compileSource（列表 JS 与 getter 同开才开）。
+  base.listGetEnabled = base.listJsEnabled === true && base.jsGetEnabled === true && (options.listGetEnabled ?? engineSyntaxListGetEnabled());
   return base;
 }
 
@@ -1355,10 +1423,11 @@ export function compileSource(
   const searchJsEnabled = options.searchJsEnabled ?? engineSearchJsActive();
   const searchVarsEnabled = varsEnabled && searchJsEnabled && (options.searchVarsEnabled ?? engineSyntaxSearchVarsEnabled());
   const itemVarsEnabled = searchVarsEnabled && (options.itemVarsEnabled ?? engineSyntaxItemVarsEnabled());
+  const listGetEnabled = jsEnabled && listJsEnabled && jsGetEnabled && (options.listGetEnabled ?? engineSyntaxListGetEnabled());
   const key = engineSourceRevision(source, {
     orEnabled, xpathEnabled, varsEnabled, jsEnabled, xpathEvalEnabled, regexEnabled, andEnabled, aioEnabled, listJsEnabled, jsExtEnabled,
     jsBindEnabled, jsGetEnabled, jsUtilEnabled, jsonPathEnabled, initEnabled, urlOptionsEnabled, initJsEnabled, varBagEnabled, jsoupEnabled,
-    bookFieldsEnabled, searchJsEnabled, searchVarsEnabled, itemVarsEnabled,
+    bookFieldsEnabled, searchJsEnabled, searchVarsEnabled, itemVarsEnabled, listGetEnabled,
   });
   const hit = cache.get(key);
   if (hit) {
@@ -1381,7 +1450,7 @@ export function compileSource(
         compiled.set(name, parseFieldRule(rule, {
           orEnabled, xpathEnabled, xpathEvalEnabled, jsEnabled, regexEnabled, andEnabled, aioEnabled, aioGroup: aio.has(group),
           listJsEnabled, listJsGroup: listJs.has(group), jsExtEnabled, jsBindEnabled, jsGetEnabled, jsUtilEnabled, jsonPathEnabled, initJsEnabled,
-          jsoupEnabled, bookFieldsEnabled, field: name,
+          jsoupEnabled, bookFieldsEnabled, listGetEnabled, field: name,
         }));
       } catch {
         compiled.set(name, { skipped: 'unsupported' });
@@ -1391,19 +1460,19 @@ export function compileSource(
   // varbag1028：变量袋对该源生效时换掉详情 put 字段与目录 get 字段（判据与语义位同一个 compileVarBag）。
   const bag = varBagEnabled ? compileVarBag(source.rules, {
     orEnabled, xpathEnabled, xpathEvalEnabled, jsEnabled, regexEnabled, andEnabled, aioEnabled, listJsEnabled, jsExtEnabled, jsBindEnabled,
-    jsGetEnabled, jsUtilEnabled, jsonPathEnabled, initJsEnabled, jsoupEnabled, bookFieldsEnabled,
+    jsGetEnabled, jsUtilEnabled, jsonPathEnabled, initJsEnabled, jsoupEnabled, bookFieldsEnabled, listGetEnabled,
   }) : null;
   if (bag) for (const [name, ir] of bag) compiled.set(name, ir);
   // searchvars1028：搜索袋对该源生效时换掉读袋的搜索字段（判据与语义位同一个 compileSearchVars）。
   const searchBag = searchVarsEnabled ? compileSearchVars(source, {
     orEnabled, xpathEnabled, xpathEvalEnabled, jsEnabled, regexEnabled, andEnabled, aioEnabled, listJsEnabled, jsExtEnabled, jsBindEnabled,
-    jsGetEnabled, jsUtilEnabled, jsonPathEnabled, initJsEnabled, jsoupEnabled, bookFieldsEnabled,
+    jsGetEnabled, jsUtilEnabled, jsonPathEnabled, initJsEnabled, jsoupEnabled, bookFieldsEnabled, listGetEnabled,
   }) : null;
   if (searchBag) for (const [name, ir] of searchBag) compiled.set(name, ir);
   // itemvars1028：条目袋对该源生效时换掉放/读袋的搜索、详情、目录字段（判据与语义位同一个 compileItemVars；与搜索袋同时生效时后覆盖）。
   const itemBag = itemVarsEnabled ? compileItemVars(source, {
     orEnabled, xpathEnabled, xpathEvalEnabled, jsEnabled, regexEnabled, andEnabled, aioEnabled, listJsEnabled, jsExtEnabled, jsBindEnabled,
-    jsGetEnabled, jsUtilEnabled, jsonPathEnabled, initJsEnabled, jsoupEnabled, bookFieldsEnabled,
+    jsGetEnabled, jsUtilEnabled, jsonPathEnabled, initJsEnabled, jsoupEnabled, bookFieldsEnabled, listGetEnabled,
   }) : null;
   if (itemBag) for (const [name, ir] of itemBag) compiled.set(name, ir);
   // init1028：可复现的 init 挂 initScope（详情字段改在 init 结果上求值，见 evaluate.ts bookInfoScope）；判据看原文，不看 vars 改写后的。

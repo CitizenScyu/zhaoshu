@@ -230,7 +230,8 @@ export interface FieldIr {
   makeUp?: { parts: JsTemplatePart[]; regexMode: boolean };
   /**
    * JS 链里 `java.getString`/`java.getStringList` 的实参白名单（jsget1028，ENGINE_SYNTAX_JS_GET）：字面量规则文本 → 编译结果
-   * （不含 JS）。求值期宿主回调只认这里的键，在字段作用域上取值（见 evaluate.ts jsBindings）。
+   * （不含 JS）。求值期宿主回调只认这里的键，在字段作用域上取值（见 evaluate.ts jsBindings）。列表字段的 JS 链（listget1028，
+   * ENGINE_SYNTAX_LIST_GET）同样挂，在页面作用域上取值（evaluate.ts listBookBindings）。
    */
   jsGets?: ReadonlyMap<string, FieldIr>;
   /**

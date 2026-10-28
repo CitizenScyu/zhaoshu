@@ -28,7 +28,7 @@ import {
   engineSyntaxAioEnabled, engineSyntaxAndEnabled, engineSyntaxJsBindEnabled, engineSyntaxJsEnabled, engineSyntaxJsExtEnabled,
   engineSyntaxJsGetEnabled, engineSyntaxJsonPathEnabled, engineSyntaxJsUtilEnabled, engineSyntaxListJsEnabled, engineSyntaxOrEnabled,
   engineSyntaxRegexEnabled, engineSyntaxXPathEnabled, engineSyntaxXPathEvalEnabled, engineInitJsActive, engineSyntaxJsoupEnabled,
-  engineSyntaxBookFieldsEnabled,
+  engineSyntaxBookFieldsEnabled, engineSyntaxListGetEnabled,
 } from './syntax-flags';
 import { compileXPath, XPathSyntaxError } from './xpath-eval';
 import { looksLikeXPath, xpathPrefixed, xpathSegmentBody, xpathToCss } from './xpath-subset';
@@ -595,6 +595,11 @@ export interface ParseOptions {
    */
   jsGetEnabled?: boolean;
   /**
+   * 列表 JS 的 getter（ENGINE_SYNTAX_LIST_GET，listget1028；须 jsGetEnabled）：列表字段 JS 段里字面量实参的
+   * `java.getString`/`java.getStringList` 同样编译进 FieldIr.jsGets（parseListJsChain）。默认读 env（缺失=off）。
+   */
+  listGetEnabled?: boolean;
+  /**
    * 对称加解密 / toNumChapter 帮手（ENGINE_SYNTAX_JS_UTIL，jsutil1028；须 jsEnabled）：字符串字段 JS 链里放行 JS_JAVA_UTIL_HELPERS，
    * 用到的字段标 FieldIr.jsUtil（列表 JS 与 makeUp 不收）。默认读 env（缺失=off）。
    */
@@ -1066,6 +1071,7 @@ function isListJsRule(rule: unknown): boolean {
  * - 一到多段 JS：末段返回数组，逐项成为条目（js-sandbox runJsItems）；
  * - 一到多段 JS + 一段规则：JS 产出字符串，规则段把它重新解析成列表（规则段的模式见 ChainStage.mode）。
  * 首段是规则（节点/JSON 对象要 Java 互操作才读得动）、JS 段之间夹规则段、纯正则段一律拒；jsoup1028 帧内另收首段取节点的规则。
+ * listget1028：JS 段字面量实参的 java.getString/getStringList 收进 FieldIr.jsGets（各段共用一张白名单）。
  */
 function parseListJsChain(rule: string, options: ParseOptions): FieldIr {
   const reject = (why: string): never => unsupported(`列表 JS ${why}`, rule, { code: 'unsupported_js' });
@@ -1075,6 +1081,16 @@ function parseListJsChain(rule: string, options: ParseOptions): FieldIr {
   if (text.startsWith('+')) text = text.slice(1);
   text = text.trim();
   if (text.length > MAX_JS_RULE_LENGTH) unsupported('规则过长', rule, { code: 'rule_too_long' });
+  // listget1028：getter 实参按字段 JS 的口径编译（不嵌 JS），求值期在页面作用域上取值（evaluate.ts listBookBindings）。
+  const gets: JsGets | undefined = (options.listGetEnabled ?? engineSyntaxListGetEnabled()) && (options.jsGetEnabled ?? engineSyntaxJsGetEnabled())
+    ? {
+      options: {
+        orEnabled: options.orEnabled, xpathEnabled: options.xpathEnabled, xpathEvalEnabled: options.xpathEvalEnabled, jsEnabled: false,
+        regexEnabled: options.regexEnabled ?? engineSyntaxRegexEnabled(), jsonPathEnabled: options.jsonPathEnabled,
+      },
+      out: new Map(),
+    }
+    : undefined;
   const chain: ChainStage[] = [];
   let last = 0;
   for (const match of text.matchAll(JS_SEGMENT_RE)) {
@@ -1088,7 +1104,7 @@ function parseListJsChain(rule: string, options: ParseOptions): FieldIr {
     }
     const code = match[1] ?? match[2] ?? '';
     // book1028：帧内列表 JS 也可读 book（legado 目录 getElements 的 ruleData 即 Book）。
-    checkJsCode(code, rule, false, options.jsExtEnabled ?? engineSyntaxJsExtEnabled(), bookFrame ? fieldBinds(options.field) : undefined);
+    checkJsCode(code, rule, false, options.jsExtEnabled ?? engineSyntaxJsExtEnabled(), bookFrame ? fieldBinds(options.field) : undefined, gets);
     chain.push({ kind: 'js', code });
     last = match.index + match[0].length;
   }
@@ -1097,6 +1113,7 @@ function parseListJsChain(rule: string, options: ParseOptions): FieldIr {
   if (tail !== '') chain.push(listRuleStage(tail, rule, options, reject));
   const field: FieldIr = { rules: [], chain };
   if (reverse) field.reverse = true;
+  if (gets && gets.out.size > 0) field.jsGets = gets.out;
   return field;
 }
 

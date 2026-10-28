@@ -23,13 +23,14 @@ export const ENGINE_SEMANTICS_XPATH_BIT = 2;
 /** vars1027：@put/@get 静态子集语义位。版本再 +4（5–8 = 含变量位的四种组合），1–4 逐字不变。 */
 export const ENGINE_SEMANTICS_VARS_BIT = 4;
 
-/** 语义版本随 || / XPath / 变量 / JS / XPath 求值 / 正则 / && / AllInOne / 搜索 JS / 列表 JS / JS 扩展 / 宿主绑定 / java.getString / 加解密帮手 / JSONPath 扩展 / 详情 init / 搜索选项 legado 口径 / URL 字段选项 / 搜索 webView / 详情 JS init / 详情→目录变量袋 / jsoup 直连 / 书籍成员 / 搜索 URL→搜索字段变量袋 / 搜索条目袋开关联动（唯一口径，供 compile.ts 缓存键与 rulesHash 复用）。 */
+/** 语义版本随 || / XPath / 变量 / JS / XPath 求值 / 正则 / && / AllInOne / 搜索 JS / 列表 JS / JS 扩展 / 宿主绑定 / java.getString / 加解密帮手 / JSONPath 扩展 / 详情 init / 搜索选项 legado 口径 / URL 字段选项 / 搜索 webView / 详情 JS init / 详情→目录变量袋 / jsoup 直连 / 书籍成员 / 搜索 URL→搜索字段变量袋 / 搜索条目袋 / 列表 JS getter 开关联动（唯一口径，供 compile.ts 缓存键与 rulesHash 复用）。 */
 export function engineSemanticsVersion(
   orEnabled: boolean, xpathEnabled = false, varsEnabled = false, jsEnabled = false, xpathEvalEnabled = false,
   regexEnabled = false, andEnabled = false, aioEnabled = false, searchJsEnabled = false, listJsEnabled = false,
   jsExtEnabled = false, jsBindEnabled = false, jsGetEnabled = false, jsUtilEnabled = false, jsonPathEnabled = false,
   initEnabled = false, searchOptionsEnabled = false, urlOptionsEnabled = false, searchWebViewEnabled = false, initJsEnabled = false,
   varBagEnabled = false, jsoupEnabled = false, bookFieldsEnabled = false, searchVarsEnabled = false, itemVarsEnabled = false,
+  listGetEnabled = false,
 ): number {
   return (orEnabled ? ENGINE_SEMANTICS_VERSION_OR : ENGINE_SEMANTICS_VERSION)
     + (xpathEnabled ? ENGINE_SEMANTICS_XPATH_BIT : 0) + (varsEnabled ? ENGINE_SEMANTICS_VARS_BIT : 0)
@@ -43,7 +44,8 @@ export function engineSemanticsVersion(
     + (urlOptionsEnabled ? ENGINE_SEMANTICS_URL_OPTIONS_BIT : 0) + (searchWebViewEnabled ? ENGINE_SEMANTICS_SEARCH_WEBVIEW_BIT : 0)
     + (initJsEnabled ? ENGINE_SEMANTICS_INIT_JS_BIT : 0) + (varBagEnabled ? ENGINE_SEMANTICS_VAR_BAG_BIT : 0)
     + (jsoupEnabled ? ENGINE_SEMANTICS_JSOUP_BIT : 0) + (bookFieldsEnabled ? ENGINE_SEMANTICS_BOOK_FIELDS_BIT : 0)
-    + (searchVarsEnabled ? ENGINE_SEMANTICS_SEARCH_VARS_BIT : 0) + (itemVarsEnabled ? ENGINE_SEMANTICS_ITEM_VARS_BIT : 0);
+    + (searchVarsEnabled ? ENGINE_SEMANTICS_SEARCH_VARS_BIT : 0) + (itemVarsEnabled ? ENGINE_SEMANTICS_ITEM_VARS_BIT : 0)
+    + (listGetEnabled ? ENGINE_SEMANTICS_LIST_GET_BIT : 0);
 }
 
 /**
@@ -460,5 +462,22 @@ export const ENGINE_SEMANTICS_ITEM_VARS_BIT = 33554432;
  */
 export function engineSyntaxItemVarsEnabled(env: OrEnv = process.env): boolean {
   const raw = env.ENGINE_SYNTAX_ITEM_VARS?.trim().toLowerCase();
+  return raw === '1' || raw === 'true' || raw === 'on';
+}
+
+/**
+ * listget1028：列表 JS getter 语义位。版本再 +67108864（1–33554432 逐字不变）。
+ * 只对有列表字段 off 态被拒、on 态编译通过（compile.ts sourceUsesListGetSyntax）的源计入。
+ */
+export const ENGINE_SEMANTICS_LIST_GET_BIT = 67108864;
+
+/**
+ * ENGINE_SYNTAX_LIST_GET 独立开关（listget1028，默认 off，口径同 ENGINE_SYNTAX_OR；须列表 JS 与 ENGINE_SYNTAX_JS_GET 同生效）。
+ * on = 列表字段（bookList/chapterList）的 JS 段也收字面量实参的 `java.getString`/`java.getStringList`（legado getElements 时
+ * `java` 即 AnalyzeRule，content 是整页）：实参规则编进 FieldIr.jsGets，求值期在页面作用域上取值，口径同字段 JS 的 getter。
+ * off = 逐字不变。
+ */
+export function engineSyntaxListGetEnabled(env: OrEnv = process.env): boolean {
+  const raw = env.ENGINE_SYNTAX_LIST_GET?.trim().toLowerCase();
   return raw === '1' || raw === 'true' || raw === 'on';
 }
