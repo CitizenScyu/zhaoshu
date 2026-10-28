@@ -20,13 +20,15 @@ import {
 } from './compile-smoke';
 import { listJsGroups, parseFieldRule } from './parse';
 import {
-  bookInfoScope, createScope, evaluateField, evaluateFieldList, fieldUsesJs, normalizeBody, scopeVars, withVars,
+  bookInfoScope, compiledUsesBook, createScope, evaluateField, evaluateFieldList, fieldUsesJs, normalizeBody, scopeVars, withBook, withVars,
 } from './evaluate';
 import { RuleEngineError, type FieldIr, type RuleDiagnostic } from './types';
-import { compileSource, compileVarBag, engineSourceRevision } from './compile';
+import { compileSource, compileVarBag, engineSourceRevision, sourceCanReName } from './compile';
 import {
-  engineSyntaxAioEnabled, engineSyntaxJsBindEnabled, engineSyntaxVarsBagEnabled, engineSyntaxVarsEnabled, engineUrlOptionsEnabled,
+  engineSyntaxAioEnabled, engineSyntaxBookFieldsEnabled, engineSyntaxJsBindEnabled, engineSyntaxVarsBagEnabled, engineSyntaxVarsEnabled,
+  engineUrlOptionsEnabled,
 } from './syntax-flags';
+import { bookUrlMember, bookView, formatBookAuthor, formatBookName, type BookView } from './book-format';
 import { stripUrlOptions, urlOptionFields } from './url-options';
 import { aioGroups, isAioListRule, ruleGroupOf } from './aio-syntax';
 import { preloadJsSandbox } from './js-sandbox';
@@ -443,6 +445,8 @@ export function compileAdmission(source: RawSource): AdmissionCompile {
   // varbag1028：同 compileSource——变量袋生效时详情 put 字段与目录 get 字段按带袋的编译结果算可解释。
   const bag = engineSyntaxVarsEnabled() && engineSyntaxVarsBagEnabled()
     ? compileVarBag(source as unknown as Record<string, unknown>, { jsEnabled: coreJs }) : null;
+  // book1028：同 compileSource——canReName 非空的源不开书籍成员（宿主绑定开关的判定在 parseFieldRule 里）。
+  const bookFieldsEnabled = engineSyntaxBookFieldsEnabled() && !sourceCanReName(source as Record<string, unknown>);
   for (const [field, rule] of iterRulePairs(rulesSource)) {
     if (!(field in coreFieldMask)) continue;
     if (bag?.has(field)) {
@@ -451,7 +455,7 @@ export function compileAdmission(source: RawSource): AdmissionCompile {
     }
     try {
       parseFieldRule(rule, {
-        jsEnabled: coreJs, field, aioGroup: aio.has(ruleGroupOf(field)), listJsGroup: listJs.has(ruleGroupOf(field)),
+        jsEnabled: coreJs, field, aioGroup: aio.has(ruleGroupOf(field)), listJsGroup: listJs.has(ruleGroupOf(field)), bookFieldsEnabled,
       });
       coreFieldMask[field] = true;
     } catch (error) {
@@ -718,25 +722,49 @@ function searchCandidateUrls(source: RawSource, text: string, pageUrl: string): 
   return searchCandidates(source, text, pageUrl).map((item) => item.url);
 }
 
-/** 同 searchCandidateUrls，带上书名（read1027 可读性影子腿按书名挑样本书）。url 为字段求值结果（@href 已绝对化，JSON 值可能仍是相对路径）。 */
-function searchCandidates(source: RawSource, text: string, pageUrl: string): { title: string; url: string }[] {
+/** book1028：按运行时同一份 compileSource 产物判源是否读书籍成员（规则文本无 `book.` 时不编译，判据同 compile.ts ruleMayUseBook）；编译异常按否。 */
+function sourceCompiledUsesBook(source: RawSource): boolean {
+  if (!/(?<![\w$.])book\s*\./.test(JSON.stringify(source))) return false;
+  try {
+    return compiledUsesBook(compileSource({
+      url: typeof source.bookSourceUrl === 'string' ? source.bookSourceUrl : '', searchUrl: source.searchUrl,
+      rules: source as Record<string, unknown>,
+    }));
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * 同 searchCandidateUrls，带上书名（read1027 可读性影子腿按书名挑样本书）。url 为字段求值结果（@href 已绝对化，JSON 值可能仍是相对路径）。
+ * `book`（book1028）只在读书籍成员的源上带：name/author 已按 legado 格式化；bookUrl 是未剥选项后缀的原值（影子腿过门后换成绝对地址），
+ * 剥过后缀时不带。
+ */
+function searchCandidates(source: RawSource, text: string, pageUrl: string): { title: string; url: string; book?: BookView }[] {
   const rules = (engineSyntaxVarsEnabled() ? resolveSourceVars(source) : source).ruleSearch;
   if (!rules || typeof rules !== 'object') return [];
   const bookList = (rules as Record<string, unknown>).bookList;
   const name = (rules as Record<string, unknown>).name;
+  const author = (rules as Record<string, unknown>).author;
   const bookUrl = (rules as Record<string, unknown>).bookUrl;
   if (typeof bookList !== 'string') return [];
   const jsEnabled = jsChainEnabledFor(source);
   const aioGroup = engineSyntaxAioEnabled() && isAioListRule(bookList);
   const listJsGroup = listJsGroups({ ruleSearch: rules }).has('ruleSearch');
+  const bookFieldsEnabled = engineSyntaxBookFieldsEnabled() && !sourceCanReName(source as Record<string, unknown>);
   const parseSafe = (rule: unknown, name?: string) => {
     if (typeof rule !== 'string' || !rule.trim()) return undefined;
-    try { return parseFieldRule(rule, { jsEnabled, field: name, aioGroup, listJsGroup }); } catch { return undefined; }
+    try { return parseFieldRule(rule, { jsEnabled, field: name, aioGroup, listJsGroup, bookFieldsEnabled }); } catch { return undefined; }
   };
   const listIr = parseSafe(bookList, 'ruleSearch.bookList');
   if (!listIr) return [];
   const nameIr = parseSafe(name, 'ruleSearch.name');
   const bookUrlIr = parseSafe(bookUrl, 'ruleSearch.bookUrl');
+  // book1028：源的任一字段读书籍成员（同 api.ts compiledUsesBook——详情/目录读成员也要搜索按 legado 顺序带出 book）时，
+  // 候选按 legado getSearchItem 顺序求值并带 book；其余源逐字走旧路径。
+  const authorIr = parseSafe(author, 'ruleSearch.author');
+  const usesBook = [listIr, nameIr, authorIr, bookUrlIr].some((ir) => ir?.bookMembers !== undefined)
+    || (bookFieldsEnabled && sourceCompiledUsesBook(source));
   // urlopt1028：同 compileSource 挂 urlOptions 的判据（看源原文），候选 URL 剥 legado 选项后缀（可读性影子腿拿它当样本书地址）。
   const bookUrlOptions = engineUrlOptionsEnabled() && urlOptionFields(source as Record<string, unknown>).has('ruleSearch.bookUrl');
   let scope;
@@ -748,9 +776,21 @@ function searchCandidates(source: RawSource, text: string, pageUrl: string): { t
   try { items = evaluateFieldList(listIr, scope); } catch { return []; }
   // listjs1027：`-` 前缀整表反转（计数口径不去重，反转后取前 MAX_CANDIDATE_SCAN 条，与运行时同向）。
   if (listIr.reverse === true) items = [...items].reverse();
-  const found: { title: string; url: string }[] = [];
+  const found: { title: string; url: string; book?: BookView }[] = [];
   for (let i = 0; i < items.length && i < MAX_CANDIDATE_SCAN; i += 1) {
     const inner = items[i];
+    if (usesBook) {
+      try {
+        const title = formatBookName(nameIr ? evaluateField(nameIr, inner) : '');
+        if (!title) continue;
+        const writer = formatBookAuthor(authorIr ? evaluateField(authorIr, withBook(inner, bookView({ name: title }))) : '');
+        const raw = bookUrlIr ? evaluateField(bookUrlIr, withBook(inner, bookView({ name: title, author: writer }))) : '';
+        const url = stripUrlOptions(raw, bookUrlOptions);
+        const book = bookView({ name: title, author: writer, bookUrl: url === raw ? raw : undefined });
+        if (url.trim()) found.push({ title, url: url.trim(), book });
+      } catch { /* 同下：单条候选求值失败跳过 */ }
+      continue;
+    }
     try {
       const title = nameIr ? evaluateField(nameIr, inner) : '';
       const url = bookUrlIr ? stripUrlOptions(evaluateField(bookUrlIr, inner), bookUrlOptions) : '';
@@ -765,8 +805,11 @@ export interface AdmissionSearchResult {
   candidateCount: number;
   status?: number;
   error: string;
-  /** read1027：仅 sampleBook 开且 verdict=ok 时带——可读性影子腿用的样本书（url 可能为相对路径，pageUrl 为其基址）。 */
-  sample?: { title: string; url: string; pageUrl: string };
+  /**
+   * read1027：仅 sampleBook 开且 verdict=ok 时带——可读性影子腿用的样本书（url 可能为相对路径，pageUrl 为其基址）。
+   * `book`（book1028）只在读书籍成员的源上带，见 searchCandidates。
+   */
+  sample?: { title: string; url: string; pageUrl: string; book?: BookView };
 }
 
 /**
@@ -964,7 +1007,7 @@ class ReadabilityStop extends Error {
  */
 export async function readabilityShadow(
   source: RawSource,
-  sample: { url: string; pageUrl: string },
+  sample: { url: string; pageUrl: string; book?: BookView },
   options: {
     fetchPage: AdmissionTransport;
     declaredHosts: ReadonlySet<string>;
@@ -1012,20 +1055,30 @@ export async function readabilityShadow(
       const ir = field(name);
       return ir ? evaluateField(ir, scope, multi) : '';
     };
-    const detail = await get(gate(sample.url, sample.pageUrl));
+    const detailUrl = gate(sample.url, sample.pageUrl);
+    const detail = await get(detailUrl);
     stage = 'toc';
+    // book1028：同 api.ts——搜索带出的成员 + 过门后的 bookUrl（搜索值剥过选项后缀时不带）进详情作用域。
+    const book = sample.book === undefined ? undefined
+      : bookView({ ...sample.book, bookUrl: sample.book.bookUrl === undefined ? undefined : detailUrl });
     // init1028：tocUrl 同 api.ts engineFetchDetail 在 init 结果上求值；tocUrl 缺省/等于详情页时目录照旧读详情页原文（legado tocHtml）。
-    const info = bookInfoScope(compiled, detail.scope);
+    const info = bookInfoScope(compiled, withBook(detail.scope, book));
     // varbag1028：变量袋源同运行时按 name → author → tocUrl 求值填袋，目录页带着袋求值。
     if (scopeVars(info)) {
       text('ruleBookInfo.name', info);
       text('ruleBookInfo.author', info);
     }
-    const rawToc = text('ruleBookInfo.tocUrl', info).trim();
+    const rawTocText = text('ruleBookInfo.tocUrl', info);
+    const rawToc = rawTocText.trim();
     const tocUrl = rawToc ? gate(rawToc, detail.url, field('ruleBookInfo.tocUrl')) : detail.url;
     const tocPage = tocUrl === detail.url ? detail : await get(tocUrl);
     const bag = scopeVars(info);
-    const toc = bag ? { ...tocPage, scope: withVars(tocPage.scope, bag) } : tocPage;
+    const bagged = bag ? { ...tocPage, scope: withVars(tocPage.scope, bag) } : tocPage;
+    // book1028：目录另带 tocUrl（tocUrl 为空时 legado 取 bookUrl）。
+    const tocBook = book === undefined ? undefined : bookView({
+      ...book, tocUrl: rawToc ? bookUrlMember(rawTocText, tocUrl, field('ruleBookInfo.tocUrl')) : book.bookUrl,
+    });
+    const toc = tocBook === undefined ? bagged : { ...bagged, scope: withBook(bagged.scope, tocBook) };
     const list = field('ruleToc.chapterList');
     const urls: string[] = [];
     const titles: string[] = [];

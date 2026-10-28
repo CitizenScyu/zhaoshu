@@ -770,6 +770,7 @@ async function confirmSourceBook(
       // 用户点选即用户决定：跳过书名/作者校验，只保留结构性防御与目录可解析。
       const engineSource = engineSourceOf(source);
       try {
+        // book1028：确认路径只有 URL、没有本条搜索结果的书籍成员，不传——读 book.name 等的源在这里求值失败（不猜值）。
         const detail = await engineFetchDetail(engineSource, url, context);
         // 身份口径与搜索/probe 路径同一个 engineIdentityOf：详情页没有书名规则时取请求的书（见其注释）。
         // 行为变化（41-confirmtoc，a9135d8 → 3954ae6）：书名与作者**都**回退到请求的书。改前确认路径的作者是
@@ -777,7 +778,7 @@ async function confirmSourceBook(
         // 「详情页无作者规则的同名异作者书」会被记成请求作者（入口只有用户点选，且 probe ok 已过 sourceBookMatches）。
         const identity = engineIdentityOf(detail, book);
         if (!identity.title) throw confirmFailure('该书源的详情页解析失败（取不到书名），请换一个候选。', 'detail_unparsed');
-        const toc = await engineFetchToc(engineSource, detail.tocUrl ?? url, context, false, detail.vars);
+        const toc = await engineFetchToc(engineSource, detail.tocUrl ?? url, context, false, detail.vars, detail.book);
         if (!toc.chapters.length) throw confirmFailure('该书源的目录为空（站点可能改版或拦截），请重试或换一个候选。', 'toc_empty');
         const fallback = identityFallbackOf(detail, book);
         // 回退成功的确认也要看得见（confirmtocrev §8-1）：请求书与站上书不是同一本时，目录会记成请求的书名，
@@ -913,11 +914,11 @@ export async function resolveSourceBook(
           if (result.bookUrl === options.excludeBookUrl || checked.has(source.url + result.bookUrl)) continue;
           checked.add(source.url + result.bookUrl);
           try {
-            const detail = await engineFetchDetail(engineSource, result.bookUrl, sourceContext);
+            const detail = await engineFetchDetail(engineSource, result.bookUrl, sourceContext, result.book);
             const identity = engineIdentityOf(detail, result);
             // 引擎只解释规则，不判断「这是不是那本书」——identity 是业务语义，留在调用方（§7.2）。
             if (!sourceBookMatches(book, identity)) continue;
-            const toc = await engineFetchToc(engineSource, detail.tocUrl ?? result.bookUrl, sourceContext, false, detail.vars);
+            const toc = await engineFetchToc(engineSource, detail.tocUrl ?? result.bookUrl, sourceContext, false, detail.vars, detail.book);
             if (!toc.chapters.length) continue;
             const catalog = engineCatalogFrom(result.bookUrl, source, identity, toc.chapters);
             matches.set(catalog.bookUrl, catalog);
@@ -949,10 +950,10 @@ export async function resolveSourceBook(
             if (result.bookUrl === options.excludeBookUrl || checked.has(source.url + result.bookUrl)) continue;
             checked.add(source.url + result.bookUrl);
             try {
-              const detail = await engineFetchDetail(engineSource, result.bookUrl, sourceContext);
+              const detail = await engineFetchDetail(engineSource, result.bookUrl, sourceContext, result.book);
               const identity = engineIdentityOf(detail, result);
               if (!sourceBookMatches(book, identity)) continue;
-              const toc = await engineFetchToc(engineSource, detail.tocUrl ?? result.bookUrl, sourceContext, false, detail.vars);
+              const toc = await engineFetchToc(engineSource, detail.tocUrl ?? result.bookUrl, sourceContext, false, detail.vars, detail.book);
               if (!toc.chapters.length) continue;
               const catalog = engineCatalogFrom(result.bookUrl, source, identity, toc.chapters);
               matches.set(catalog.bookUrl, catalog);
@@ -1330,10 +1331,10 @@ async function surveyOneSource(
       for (const result of candidates) {
         if (result.bookUrl === excludeBookUrl || checked.has(result.bookUrl)) continue;
         checked.add(result.bookUrl);
-        const detail = await engineFetchDetail(engineSource, result.bookUrl, context);
+        const detail = await engineFetchDetail(engineSource, result.bookUrl, context, result.book);
         const identity = engineIdentityOf(detail, result);
         if (!sourceBookMatches(book, identity)) continue;
-        const toc = await engineFetchToc(engineSource, detail.tocUrl ?? result.bookUrl, context, false, detail.vars);
+        const toc = await engineFetchToc(engineSource, detail.tocUrl ?? result.bookUrl, context, false, detail.vars, detail.book);
         if (!toc.chapters.length) continue;
         return record(engineCatalogFrom(result.bookUrl, source, identity, toc.chapters));
       }

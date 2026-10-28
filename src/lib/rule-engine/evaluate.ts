@@ -104,6 +104,11 @@ export interface ScopeHost {
    * `java.get(k)`，`@get:{k}` makeUp 片段从这里取；没挂时读袋的字段求值失败。
    */
   vars?: Map<string, string>;
+  /**
+   * 本书已求出的书籍成员（book1028，ENGINE_SYNTAX_BOOK_FIELDS）：name/author/bookUrl/tocUrl，随阶段递增（见 parse.ts
+   * bookStageMembers）。沙箱 `book` 上与 origin 一并给出；挂了 FieldIr.bookMembers 的字段缺成员或成员为空即求值失败。
+   */
+  book?: Readonly<Record<string, string>>;
 }
 
 /** HTML 输入的作用域。`nodes` 是求值起点：整篇文档（`$.root()`）或 bookList 的某一条。 */
@@ -506,6 +511,7 @@ function matchingBrace(text: string, open: number): number {
  */
 export function evaluateField(field: FieldIr, scope: EvalScope, multi = false): string {
   if (scope.kind === 'json' && scope.object !== undefined) return objectFieldValue(field, scope.object);
+  checkBookMembers(field, scope);
   if (field.varGets && scope.host?.vars === undefined) return evalFailed('目录字段读详情页变量，但作用域没带变量袋');
   if (field.varPuts !== undefined) putVars(field.varPuts, scope);
   if (field.chain) {
@@ -528,6 +534,19 @@ export function evaluateField(field: FieldIr, scope: EvalScope, multi = false): 
   // unescapeHtml4）；正文（multi）交 content-html。
   if (!multi && (kind === 'self' || kind === 'groupRef') && value.includes('&')) value = decodeHTML(value);
   return value.trim();
+}
+
+/**
+ * book1028：字段读到的书籍成员（FieldIr.bookMembers）须在作用域上带齐且非空。缺 = 调用方没有该阶段的书信息（不猜）；
+ * 空串在 Rhino 里是 Java String 包装、真值判断为 true，与 JS 空串不同口径，也失败。
+ */
+function checkBookMembers(field: FieldIr, scope: EvalScope): void {
+  const members = field.bookMembers;
+  if (members === undefined) return;
+  for (const member of members) {
+    const value = scope.host?.book?.[member];
+    if (value === undefined || value === '') evalFailed(`字段读 book.${member}，但作用域没带该成员或为空`);
+  }
 }
 
 /** legado putRule（varbag1028）：字段规则之前、在同一内容上逐键求值存袋。作用域没带袋（不读目录的调用方）时不存。 */
@@ -613,7 +632,8 @@ function hostBindings(scope: EvalScope): Pick<JsBindings, 'globals' | 'objects' 
   if (host === undefined) return {};
   const objects: Record<string, Record<string, string>> = {};
   const out: Pick<JsBindings, 'globals' | 'objects' | 'callbacks'> = { objects };
-  if (host.origin !== undefined) objects.book = { origin: host.origin };
+  if (host.book !== undefined) objects.book = host.origin === undefined ? { ...host.book } : { ...host.book, origin: host.origin };
+  else if (host.origin !== undefined) objects.book = { origin: host.origin };
   if (host.chapterTitle !== undefined) {
     objects.chapter = { title: host.chapterTitle };
     out.globals = { title: host.chapterTitle };
@@ -722,13 +742,14 @@ export function evaluateFieldNodes(field: FieldIr, scope: EvalScope): CheerioNod
  * 条目作用域都沿用页面作用域的宿主绑定（bind1028；legado 同一个 AnalyzeRule 的 book 不随条目变）。
  */
 export function evaluateFieldList(field: FieldIr, scope: EvalScope): EvalScope[] {
+  checkBookMembers(field, scope);
   const scopes = fieldListScopes(field, scope);
   if (scope.host !== undefined) for (const item of scopes) item.host ??= scope.host;
   return scopes;
 }
 
 function fieldListScopes(field: FieldIr, scope: EvalScope): EvalScope[] {
-  if (field.chain) return field.jsoup ? jsoupListScopes(field, field.chain, scope) : listChainScopes(field.chain, scope);
+  if (field.chain) return field.jsoup ? jsoupListScopes(field, field.chain, scope) : listChainScopes(field, field.chain, scope);
   const head = field.rules[0];
   if (head?.kind === 'regexList') return aioListScopes(head, scope);
   if (scope.kind === 'html') {
@@ -771,16 +792,17 @@ function aioListScopes(ir: Extract<RuleIr, { kind: 'regexList' }>, scope: EvalSc
  * 条目字段的 SourceRule 在 legado 里按**原页面**是否 JSON 定模式：条目的形态与原页面对不上（HTML 页上产出 JSON 条目、
  * 或反过来）时 legado 条目规则读不动，这里求值失败而不是按条目内容另选解释。`reverse`（`-` 前缀）由调用方对整表处理。
  */
-function listChainScopes(chain: readonly ChainStage[], scope: EvalScope): EvalScope[] {
+function listChainScopes(field: FieldIr, chain: readonly ChainStage[], scope: EvalScope): EvalScope[] {
   const source = scope.source;
   if (source === undefined) return evalFailed('列表 JS 需要页面原文，当前作用域没有');
   const pageJson = scope.kind === 'json';
+  const book = listBookBindings(field, scope);
   let value = source;
   for (let index = 0; index < chain.length; index += 1) {
     const stage = chain[index];
     const last = index === chain.length - 1;
     if (stage.kind === 'js') {
-      const bindings = { result: value, src: source, baseUrl: scope.pageUrl };
+      const bindings = { result: value, src: source, baseUrl: scope.pageUrl, ...book };
       if (last) {
         const items = runJsItems(stage.code, bindings);
         return items === null ? [] : items.map((item) => listItemScope(item, pageJson, scope.pageUrl));
@@ -797,6 +819,12 @@ function listChainScopes(chain: readonly ChainStage[], scope: EvalScope): EvalSc
     return evaluateFieldList(stage.field, pageJson ? jsonTextScope(value, scope.pageUrl) : createHtmlScope(value, scope.pageUrl));
   }
   return evalFailed('列表 JS 链形态异常');
+}
+
+/** 列表 JS 的 `book`（book1028）：只给挂了 bookMembers 的列表字段，其余宿主绑定列表 JS 照旧不给。 */
+function listBookBindings(field: FieldIr, scope: EvalScope): Pick<JsBindings, 'objects'> {
+  const book = field.bookMembers === undefined ? undefined : hostBindings(scope).objects?.book;
+  return book === undefined ? {} : { objects: { book } };
 }
 
 /**
@@ -819,6 +847,7 @@ function jsoupListScopes(field: FieldIr, chain: readonly ChainStage[], scope: Ev
   if (source === undefined) return evalFailed('列表 JS 需要页面原文，当前作用域没有');
   const pageJson = scope.kind === 'json';
   const getElements = jsoupGetElements(field, scope);
+  const book = listBookBindings(field, scope);
   let value = source;
   let elements: JElement[] | undefined;
   for (let index = 0; index < chain.length; index += 1) {
@@ -832,7 +861,7 @@ function jsoupListScopes(field: FieldIr, chain: readonly ChainStage[], scope: Ev
       continue;
     }
     if (stage.kind === 'js') {
-      const bindings: JsBindings = { result: value, src: source, baseUrl: scope.pageUrl, jsoup: { result: elements, getElements } };
+      const bindings: JsBindings = { result: value, src: source, baseUrl: scope.pageUrl, jsoup: { result: elements, getElements }, ...book };
       elements = undefined;
       if (last) {
         const items = runJsoupItems(stage.code, bindings);
@@ -915,6 +944,7 @@ function jsonListItems(ir: RuleIr, json: unknown): unknown[] {
  * 页面 URL 与宿主绑定沿用页面作用域。
  */
 export function evaluateInitScope(field: FieldIr, scope: EvalScope): EvalScope {
+  checkBookMembers(field, scope);
   if (field.chain) {
     const next = jsInitScope(field, field.chain, scope);
     if (scope.host) next.host = scope.host;
@@ -1010,6 +1040,17 @@ export function withVars<T extends EvalScope>(scope: T, vars: Readonly<Record<st
   return { ...scope, host: { ...scope.host, vars: new Map(Object.entries(vars)) } };
 }
 
+/** 编译产物里是否有读书籍成员的字段（book1028）。没有时调用方不必准备书信息，求值路径逐字不变。 */
+export function compiledUsesBook(compiled: CompiledRules): boolean {
+  for (const field of compiled.values()) if (!('skipped' in field) && field.bookMembers !== undefined) return true;
+  return false;
+}
+
+/** 作用域挂上本书已求出的书籍成员（book1028）；`book` 为 undefined 时原样返回。 */
+export function withBook<T extends EvalScope>(scope: T, book: Readonly<Record<string, string>> | undefined): T {
+  return book === undefined ? scope : { ...scope, host: { ...scope.host, book } };
+}
+
 // ---------------------------------------------------------------- JS 链（jsbox1027）
 /** 字段是否编译成了 JS 链（ENGINE_SYNTAX_JS on 且字段含 JS 段）。 */
 export function fieldUsesJs(field: FieldIr | SkippedField | undefined): field is FieldIr & { chain: ChainStage[] } {
@@ -1037,6 +1078,7 @@ export function evaluateFieldStrings(field: FieldIr, scope: EvalScope): string[]
     const value = evaluateField(field, scope);
     return value === '' ? [] : [value];
   }
+  checkBookMembers(field, scope);
   const value = field.jsoup
     ? evaluateJsoupChain(field, field.chain, scope, true, true)
     : evaluateChain(field.chain, scope, true, true, field.jsGets, field.jsUtil);

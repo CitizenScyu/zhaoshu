@@ -28,6 +28,7 @@ import {
   engineSyntaxAioEnabled, engineSyntaxAndEnabled, engineSyntaxJsBindEnabled, engineSyntaxJsEnabled, engineSyntaxJsExtEnabled,
   engineSyntaxJsGetEnabled, engineSyntaxJsonPathEnabled, engineSyntaxJsUtilEnabled, engineSyntaxListJsEnabled, engineSyntaxOrEnabled,
   engineSyntaxRegexEnabled, engineSyntaxXPathEnabled, engineSyntaxXPathEvalEnabled, engineInitJsActive, engineSyntaxJsoupEnabled,
+  engineSyntaxBookFieldsEnabled,
 } from './syntax-flags';
 import { compileXPath, XPathSyntaxError } from './xpath-eval';
 import { looksLikeXPath, xpathPrefixed, xpathSegmentBody, xpathToCss } from './xpath-subset';
@@ -55,6 +56,12 @@ let varBag: VarBagParse | undefined;
  * 嵌套解析不继承。`options` = 实参规则的编译开关（不含 JS）。
  */
 let jsoupFrame: { elements: Map<string, FieldIr>; options: ParseOptions } | undefined;
+
+/**
+ * 当前 parseFieldRule 帧的书籍成员重试（book1028，ParseOptions.bookFieldsEnabled）：off 态口径编译被拒的字段才在这一帧里重编，
+ * 帧内 `book` 另放行 `members`（字段所在阶段 legado 已求出的成员，见 bookStageMembers），读到的成员记进 `used`。嵌套解析不继承。
+ */
+let bookFrame: { members: ReadonlySet<string>; used: Set<string> } | undefined;
 
 /** 变量袋编译模式：`put` = JS 里放行字面量键的 `java.put`；`get` = 放行 `java.get('键')` 与规则级 makeUp 的 `@get:{键}`。键记进 keys。 */
 export interface VarBagParse {
@@ -611,42 +618,68 @@ export interface ParseOptions {
    * （见 jsoupFrame），通过的字段标 FieldIr.jsoup。off 态编译得过的字段逐字不变。默认读 env（缺失=off）。
    */
   jsoupEnabled?: boolean;
+  /**
+   * JS 读 `book` 的书籍成员（ENGINE_SYNTAX_BOOK_FIELDS，book1028；须 jsEnabled 与 jsBindEnabled）：字段按 off 态口径（及 jsoup
+   * 重试）编译被拒时，再在 bookFrame 里重编，通过的字段标 FieldIr.bookMembers。`ruleBookInfo.canReName` 非空的源由 compile.ts
+   * 传 false。默认读 env（缺失=off）。
+   */
+  bookFieldsEnabled?: boolean;
 }
 
 export function parseFieldRule(rule: string, options: ParseOptions = {}): FieldIr {
   const saved = jsonPathExt;
   const savedBag = varBag;
   const savedFrame = jsoupFrame;
+  const savedBook = bookFrame;
   jsonPathExt = options.jsonPathEnabled ?? engineSyntaxJsonPathEnabled();
   varBag = options.varBag;
   jsoupFrame = undefined;
+  bookFrame = undefined;
   const bagKeys = varBag === undefined ? undefined : [...varBag.keys];
   try {
     return parseFieldRuleWithObjectKey(rule, options);
   } catch (error) {
-    if (!(error instanceof RuleEngineError) || error.code !== 'RULE_UNSUPPORTED' || !jsoupRetryAllowed(rule, options)) throw error;
-    const frame = { elements: new Map<string, FieldIr>(), options: jsSegmentOptions(options) };
+    if (!(error instanceof RuleEngineError) || error.code !== 'RULE_UNSUPPORTED') throw error;
+    // 重试顺序：jsoup 单开（jsoup1028 原口径，逐字不变）→ book 单开 → 两者同开（book1028）。
+    const jsoup = jsoupRetryAllowed(rule, options);
+    const members = bookRetryMembers(rule, options);
+    const attempts: { jsoup: boolean; book: boolean }[] = [];
+    if (jsoup) attempts.push({ jsoup: true, book: false });
+    if (members) attempts.push({ jsoup: false, book: true });
+    if (members && jsoup) attempts.push({ jsoup: true, book: true });
     const restoreBag = () => {
       if (varBag === undefined || bagKeys === undefined) return;
       varBag.keys.clear();
       for (const key of bagKeys) varBag.keys.add(key);
     };
-    restoreBag();
-    jsoupFrame = frame;
-    let field: FieldIr;
-    try {
-      field = parseFieldRuleWithObjectKey(rule, options);
-    } catch {
+    for (const attempt of attempts) {
       restoreBag();
-      throw error; // 重编也不过：报 off 态口径的原错误（诊断维度不变）
+      const frame = attempt.jsoup ? { elements: new Map<string, FieldIr>(), options: jsSegmentOptions(options) } : undefined;
+      const book = attempt.book && members ? { members, used: new Set<string>() } : undefined;
+      jsoupFrame = frame;
+      bookFrame = book;
+      let field: FieldIr;
+      try {
+        field = parseFieldRuleWithObjectKey(rule, options);
+      } catch {
+        continue;
+      }
+      // 帧内只读到 book.origin（chapterName/列表 JS 因帧换绑才过）不算 book1028 增量，照旧拒。
+      if (book && book.used.size === 0) continue;
+      if (frame) {
+        field.jsoup = true;
+        if (frame.elements.size > 0) field.jsElements = frame.elements;
+      }
+      if (book) field.bookMembers = [...book.used].sort();
+      return field;
     }
-    field.jsoup = true;
-    if (frame.elements.size > 0) field.jsElements = frame.elements;
-    return field;
+    restoreBag();
+    throw error; // 重编也不过：报 off 态口径的原错误（诊断维度不变）
   } finally {
     jsonPathExt = saved;
     varBag = savedBag;
     jsoupFrame = savedFrame;
+    bookFrame = savedBook;
   }
 }
 
@@ -655,6 +688,15 @@ function jsoupRetryAllowed(rule: string, options: ParseOptions): boolean {
   return typeof rule === 'string' && options.field !== undefined && options.field !== 'ruleBookInfo.init'
     && (options.jsEnabled ?? engineSyntaxJsEnabled()) && (options.jsoupEnabled ?? engineSyntaxJsoupEnabled())
     && ruleHasJs(rule.trim());
+}
+
+/**
+ * book1028 重试可放行的 `book` 成员（含 origin）：开关同开、字段在 bookStageMembers 里、规则文本含 `book.`。不重试时 undefined。
+ */
+function bookRetryMembers(rule: string, options: ParseOptions): ReadonlySet<string> | undefined {
+  if (typeof rule !== 'string' || options.field === undefined || !bindActive(options)
+    || !(options.bookFieldsEnabled ?? engineSyntaxBookFieldsEnabled()) || !/(?<![\w$.])book\s*\./.test(rule)) return undefined;
+  return bookStageMembers(options.field);
 }
 
 /** JS 链里规则段 / getter 实参的编译开关（不含 JS）。 */
@@ -1045,7 +1087,8 @@ function parseListJsChain(rule: string, options: ParseOptions): FieldIr {
       chain.push(head);
     }
     const code = match[1] ?? match[2] ?? '';
-    checkJsCode(code, rule, false, options.jsExtEnabled ?? engineSyntaxJsExtEnabled());
+    // book1028：帧内列表 JS 也可读 book（legado 目录 getElements 的 ruleData 即 Book）。
+    checkJsCode(code, rule, false, options.jsExtEnabled ?? engineSyntaxJsExtEnabled(), bookFrame ? fieldBinds(options.field) : undefined);
     chain.push({ kind: 'js', code });
     last = match.index + match[0].length;
   }
@@ -1435,11 +1478,40 @@ const BIND_CHAPTER: JsBinds = new Map([
 ]);
 const CHAPTER_BIND_FIELDS: ReadonlySet<string> = new Set(['ruleToc.chapterUrl', 'ruleContent.content', 'ruleContent.nextContentUrl']);
 
-/** 字段可读的宿主绑定。chapterName 求值时章节名还没出来，目录列表/搜索列表也不开（列表 JS 与 makeUp 都不经这里）。 */
+/**
+ * 字段可读的宿主绑定。chapterName 求值时章节名还没出来，目录列表/搜索列表也不开（列表 JS 与 makeUp 都不经这里）。
+ * book1028 帧内（bookFrame）`book` 换成帧的成员集，chapterName 与目录列表另得 `book`。
+ */
 function fieldBinds(field: string | undefined): JsBinds | undefined {
-  if (field === undefined || field === 'ruleToc.chapterName' || isAioListField(field)) return undefined;
+  if (field === undefined) return undefined;
+  const frame = bookFrame;
+  if (frame !== undefined) {
+    const base = CHAPTER_BIND_FIELDS.has(field) ? BIND_CHAPTER : BIND_ORIGIN;
+    return new Map([...base, ['book', frame.members]]);
+  }
+  if (field === 'ruleToc.chapterName' || isAioListField(field)) return undefined;
   return CHAPTER_BIND_FIELDS.has(field) ? BIND_CHAPTER : BIND_ORIGIN;
 }
+
+/**
+ * book1028：字段求值时 legado `book` 上已有确定值的成员（含 origin）。搜索条目按 getSearchItem 顺序（name → author → kind →
+ * wordCount → lastChapter → intro → coverUrl → bookUrl）只给本条已求出的 name/author；详情给 name/author（搜索条目带来，
+ * canReName 源已排除）与 bookUrl；目录（含列表）另给 tocUrl。kind 等可空成员、正文、发现页不收。
+ */
+function bookStageMembers(field: string): ReadonlySet<string> | undefined {
+  if (field === 'ruleSearch.author') return BOOK_SEARCH_AUTHOR;
+  if (BOOK_SEARCH_LATE_FIELDS.has(field)) return BOOK_SEARCH_LATE;
+  if (field.startsWith('ruleBookInfo.')) return BOOK_INFO;
+  if (field.startsWith('ruleToc.')) return BOOK_TOC;
+  return undefined;
+}
+const BOOK_SEARCH_AUTHOR: ReadonlySet<string> = new Set(['origin', 'name']);
+const BOOK_SEARCH_LATE: ReadonlySet<string> = new Set(['origin', 'name', 'author']);
+const BOOK_SEARCH_LATE_FIELDS: ReadonlySet<string> = new Set([
+  'ruleSearch.kind', 'ruleSearch.wordCount', 'ruleSearch.lastChapter', 'ruleSearch.intro', 'ruleSearch.coverUrl', 'ruleSearch.bookUrl',
+]);
+const BOOK_INFO: ReadonlySet<string> = new Set(['origin', 'name', 'author', 'bookUrl']);
+const BOOK_TOC: ReadonlySet<string> = new Set(['origin', 'name', 'author', 'bookUrl', 'tocUrl']);
 
 /** 宿主绑定的一处引用：`book.origin` 这类成员读，或裸 `title`（字符串值，其成员如 `.length` 照常可读）；赋值、自增自减、对象的其余成员一律拒。 */
 function checkBoundRef(
@@ -1449,6 +1521,13 @@ function checkBoundRef(
   const member = /^\s*\.\s*([A-Za-z_$][\w$]*)/.exec(rest);
   if (member && members.has(member[1])) rest = rest.slice(member[0].length);
   else if (!members.has('')) reject(`用了沙箱不提供的 ${name}${member ? `.${member[1]}` : ''}`);
+  // book1028：书籍成员在 Rhino 里是 Java String 包装（typeof 'object'、`.length` 是方法、replace 不认正则），只收与 JS 字符串同结果的用法。
+  if (name === 'book' && member && member[1] !== 'origin' && bookFrame !== undefined) {
+    if (/^\s*(?:[.[(]|\?\.|[!=]==|instanceof\b)/.test(rest) || /(?:\btypeof|\bdelete|[!=]==)\s*$/.test(bare.slice(0, index))) {
+      reject(`把 book.${member[1]} 当 JS 字符串用（Rhino 里是 Java String）`);
+    }
+    bookFrame.used.add(member[1]);
+  }
   if (/(?:\+\+|--)\s*$/.test(bare.slice(0, index)) || /^\s*(?:\+\+|--|(?:\*\*|>>>|<<|>>|&&|\|\||\?\?|[-+*/%&|^])?=(?!=))/.test(rest)) {
     reject(`给宿主绑定 ${name} 赋值`);
   }

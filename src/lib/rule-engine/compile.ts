@@ -18,7 +18,7 @@ import {
   engineSyntaxJsExtEnabled, engineSyntaxJsGetEnabled, engineSyntaxJsonPathEnabled, engineSyntaxJsUtilEnabled, engineSyntaxListJsEnabled,
   engineSyntaxOrEnabled, engineSyntaxRegexEnabled, engineSyntaxVarsEnabled, engineSyntaxXPathEnabled, engineSyntaxXPathEvalEnabled, engineUrlOptionsEnabled,
   engineSearchWebViewEnabled, engineSyntaxInitJsEnabled, engineSyntaxJsoupEnabled, engineSyntaxVarsBagEnabled,
-  ENGINE_SEMANTICS_VERSION,
+  engineSyntaxBookFieldsEnabled, ENGINE_SEMANTICS_VERSION,
 } from './syntax-flags';
 import { urlOptionFields } from './url-options';
 import { resolveSourceVars, ruleMayUseVars, varBagPlan, varPutRules } from './vars-subset';
@@ -43,6 +43,7 @@ export interface CompileOptions extends ParseOptions {
   /** varbag1028：详情页 put → 目录页 get 变量袋（ENGINE_SYNTAX_VARS_BAG，默认读 env；须 varsEnabled 同开）。 */
   varBagEnabled?: boolean;
   // jsoupEnabled（jsoup1028，ENGINE_SYNTAX_JSOUP）见 ParseOptions；compile 层另要求 JS 链对该源生效。
+  // bookFieldsEnabled（book1028，ENGINE_SYNTAX_BOOK_FIELDS）见 ParseOptions；compile 层另要求 JS 链与宿主绑定对该源生效、canReName 为空。
 }
 
 /** 版本化缓存键（P0 口径）：semanticsVersion:contentRevision。 */
@@ -74,6 +75,8 @@ export function engineVersionedKey(contentRevision: string, semanticsVersion = E
  * initjs1028：ENGINE_SYNTAX_INIT 与 ENGINE_SYNTAX_INIT_JS 都 on、JS 链对该源生效且 init 是可复现的 JS（sourceUsesInitJsSyntax）时再加 JS init 位（524289–1048576）。
  * varbag1028：ENGINE_SYNTAX_VARS 与 ENGINE_SYNTAX_VARS_BAG 都 on 且变量袋对该源真生效（compileVarBag 非 null）时再加变量袋位（+2097152）。
  * jsoup1028：ENGINE_SYNTAX_JSOUP on、JS 链对该源生效且有含 JS 的字段 off 态被拒、on 态编译通过（sourceUsesJsoupSyntax）时再加 jsoup 位（+4194304）。
+ * book1028：ENGINE_SYNTAX_BOOK_FIELDS on、宿主绑定对该源生效、canReName 为空且有读 `book.` 成员的字段 off 态被拒、on 态编译通过
+ * （sourceUsesBookSyntax）时再加书籍成员位（+8388608）。
  */
 export function engineSourceRevision(
   source: { url: string; searchUrl: unknown; rules: Record<string, unknown> },
@@ -106,67 +109,75 @@ export function engineSourceRevision(
   const jsGet = jsChain && jsGetEnabled;
   const jsUtil = jsChain && jsUtilEnabled;
   const jsoup = jsChain && (options.jsoupEnabled ?? engineSyntaxJsoupEnabled());
+  const book = jsBind && (options.bookFieldsEnabled ?? engineSyntaxBookFieldsEnabled()) && !sourceCanReName(source.rules);
   // jsoup1028：其余各位先按 jsoup 关判（与旧口径逐字相同），jsoup 开时再补判一次取并集——jsoup 重试能救活
   // 某开关的 off 态（如条目首段 JS 以 Element 起链），只按 jsoup 开判会把该位清掉、在池源 identity 白翻。
-  const soup = (probe: (jsoupEnabled: boolean) => boolean) => probe(false) || (jsoup && probe(true));
+  // book1028 同理：书籍成员重试也能救活别的开关的 off 态，book 开时再按 book 开（jsoup 两态）补判。
+  const soup = (probe: (jsoupEnabled: boolean, bookFieldsEnabled: boolean) => boolean) => probe(false, false)
+    || (jsoup && probe(true, false)) || (book && (probe(false, true) || (jsoup && probe(true, true))));
   return engineVersionedKey(sourceRevision(source), engineSemanticsVersion(
     orEnabled && sourceUsesOrSyntax(source.rules),
     xpathEnabled && sourceUsesXPathSyntax(source.rules),
     varsEnabled && sourceUsesVarSyntax(source.rules),
     jsEnabled && sourceUsesJsSyntax(source.rules),
-    xpathEnabled && xpathEval && soup((j) => sourceUsesXPathEval(source.rules, {
+    xpathEnabled && xpathEval && soup((j, b) => sourceUsesXPathEval(source.rules, {
       orEnabled, varsEnabled, jsEnabled: jsChain, listJsEnabled, jsExtEnabled, jsBindEnabled: jsBind, jsGetEnabled: jsGet, jsUtilEnabled: jsUtil,
-      jsonPathEnabled, jsoupEnabled: j,
+      jsonPathEnabled, jsoupEnabled: j, bookFieldsEnabled: b,
     })),
-    regexEnabled && soup((j) => sourceUsesRegexSyntax(source.rules, {
+    regexEnabled && soup((j, b) => sourceUsesRegexSyntax(source.rules, {
       orEnabled, varsEnabled, jsEnabled: jsChain, xpathEnabled, xpathEvalEnabled: xpathEval, listJsEnabled, jsExtEnabled, jsBindEnabled: jsBind,
-      jsGetEnabled: jsGet, jsUtilEnabled: jsUtil, jsonPathEnabled, jsoupEnabled: j,
+      jsGetEnabled: jsGet, jsUtilEnabled: jsUtil, jsonPathEnabled, jsoupEnabled: j, bookFieldsEnabled: b,
     })),
-    orEnabled && andEnabled && soup((j) => sourceUsesAndSyntax(source.rules, {
+    orEnabled && andEnabled && soup((j, b) => sourceUsesAndSyntax(source.rules, {
       varsEnabled, jsEnabled: jsChain, xpathEnabled, xpathEvalEnabled: xpathEval, regexEnabled, listJsEnabled, jsExtEnabled, jsBindEnabled: jsBind,
-      jsGetEnabled: jsGet, jsUtilEnabled: jsUtil, jsonPathEnabled, jsoupEnabled: j,
+      jsGetEnabled: jsGet, jsUtilEnabled: jsUtil, jsonPathEnabled, jsoupEnabled: j, bookFieldsEnabled: b,
     })),
     aioEnabled && sourceUsesAioSyntax(source.rules),
     searchJsEnabled && searchTemplateNeedsJs(source.searchUrl, upgradeSourceTemplateUrl(source.url)),
     jsChain && listJsEnabled && sourceUsesListJsSyntax(source.rules),
-    jsChain && jsExtEnabled && soup((j) => sourceUsesJsExtSyntax(source.rules, {
+    jsChain && jsExtEnabled && soup((j, b) => sourceUsesJsExtSyntax(source.rules, {
       orEnabled, varsEnabled, xpathEnabled, xpathEvalEnabled: xpathEval, regexEnabled, andEnabled, aioEnabled, listJsEnabled, jsBindEnabled: jsBind,
-      jsGetEnabled: jsGet, jsUtilEnabled: jsUtil, jsonPathEnabled, jsoupEnabled: j,
+      jsGetEnabled: jsGet, jsUtilEnabled: jsUtil, jsonPathEnabled, jsoupEnabled: j, bookFieldsEnabled: b,
     })),
-    jsBind && soup((j) => sourceUsesJsBindSyntax(source.rules, {
+    jsBind && soup((j, b) => sourceUsesJsBindSyntax(source.rules, {
       orEnabled, varsEnabled, xpathEnabled, xpathEvalEnabled: xpathEval, regexEnabled, andEnabled, aioEnabled, listJsEnabled, jsExtEnabled,
-      jsGetEnabled: jsGet, jsUtilEnabled: jsUtil, jsonPathEnabled, jsoupEnabled: j,
+      jsGetEnabled: jsGet, jsUtilEnabled: jsUtil, jsonPathEnabled, jsoupEnabled: j, bookFieldsEnabled: b,
     })),
-    jsGet && soup((j) => sourceUsesJsGetSyntax(source.rules, {
+    jsGet && soup((j, b) => sourceUsesJsGetSyntax(source.rules, {
       orEnabled, varsEnabled, xpathEnabled, xpathEvalEnabled: xpathEval, regexEnabled, andEnabled, aioEnabled, listJsEnabled, jsExtEnabled,
-      jsBindEnabled: jsBind, jsUtilEnabled: jsUtil, jsonPathEnabled, jsoupEnabled: j,
+      jsBindEnabled: jsBind, jsUtilEnabled: jsUtil, jsonPathEnabled, jsoupEnabled: j, bookFieldsEnabled: b,
     })),
-    jsUtil && soup((j) => sourceUsesJsUtilSyntax(source.rules, {
+    jsUtil && soup((j, b) => sourceUsesJsUtilSyntax(source.rules, {
       orEnabled, varsEnabled, xpathEnabled, xpathEvalEnabled: xpathEval, regexEnabled, andEnabled, aioEnabled, listJsEnabled, jsExtEnabled,
-      jsBindEnabled: jsBind, jsGetEnabled: jsGet, jsonPathEnabled, jsoupEnabled: j,
+      jsBindEnabled: jsBind, jsGetEnabled: jsGet, jsonPathEnabled, jsoupEnabled: j, bookFieldsEnabled: b,
     })),
-    jsonPathEnabled && soup((j) => sourceUsesJsonPathSyntax(source.rules, {
+    jsonPathEnabled && soup((j, b) => sourceUsesJsonPathSyntax(source.rules, {
       orEnabled, varsEnabled, jsEnabled: jsChain, xpathEnabled, xpathEvalEnabled: xpathEval, regexEnabled, andEnabled, aioEnabled, listJsEnabled,
-      jsExtEnabled, jsBindEnabled: jsBind, jsGetEnabled: jsGet, jsUtilEnabled: jsUtil, jsoupEnabled: j,
+      jsExtEnabled, jsBindEnabled: jsBind, jsGetEnabled: jsGet, jsUtilEnabled: jsUtil, jsoupEnabled: j, bookFieldsEnabled: b,
     })),
-    initEnabled && soup((j) => sourceUsesInitSyntax(source.rules, {
+    initEnabled && soup((j, b) => sourceUsesInitSyntax(source.rules, {
       orEnabled, xpathEnabled, xpathEvalEnabled: xpathEval, jsEnabled: jsChain, regexEnabled, andEnabled, aioEnabled, listJsEnabled,
-      jsExtEnabled, jsBindEnabled: jsBind, jsGetEnabled: jsGet, jsUtilEnabled: jsUtil, jsonPathEnabled, jsoupEnabled: j,
+      jsExtEnabled, jsBindEnabled: jsBind, jsGetEnabled: jsGet, jsUtilEnabled: jsUtil, jsonPathEnabled, jsoupEnabled: j, bookFieldsEnabled: b,
     })),
     searchOptionParity,
     urlOptionsEnabled && urlOptionFields(source.rules).size > 0,
     searchWebViewEnabled && searchOptionParity && searchOptionsMayUseWebView(source.searchUrl),
-    initJsEnabled && jsChain && soup((j) => sourceUsesInitJsSyntax(source.rules, {
+    initJsEnabled && jsChain && soup((j, b) => sourceUsesInitJsSyntax(source.rules, {
       orEnabled, xpathEnabled, xpathEvalEnabled: xpathEval, regexEnabled, andEnabled, aioEnabled, listJsEnabled,
-      jsExtEnabled, jsBindEnabled: jsBind, jsGetEnabled: jsGet, jsUtilEnabled: jsUtil, jsonPathEnabled, jsoupEnabled: j,
+      jsExtEnabled, jsBindEnabled: jsBind, jsGetEnabled: jsGet, jsUtilEnabled: jsUtil, jsonPathEnabled, jsoupEnabled: j, bookFieldsEnabled: b,
     })),
     varsEnabled && (options.varBagEnabled ?? engineSyntaxVarsBagEnabled()) && compileVarBag(source.rules, {
       orEnabled, xpathEnabled, xpathEvalEnabled: xpathEval, jsEnabled: jsChain, regexEnabled, andEnabled, aioEnabled, listJsEnabled,
       jsExtEnabled, jsBindEnabled: jsBind, jsGetEnabled: jsGet, jsUtilEnabled: jsUtil, jsonPathEnabled, initJsEnabled, jsoupEnabled: jsoup,
+      bookFieldsEnabled: book,
     }) !== null,
-    jsoup && sourceUsesJsoupSyntax(source.rules, {
+    jsoup && [false, ...(book ? [true] : [])].some((b) => sourceUsesJsoupSyntax(source.rules, {
       orEnabled, varsEnabled, xpathEnabled, xpathEvalEnabled: xpathEval, regexEnabled, andEnabled, aioEnabled, listJsEnabled, jsExtEnabled,
-      jsBindEnabled: jsBind, jsGetEnabled: jsGet, jsUtilEnabled: jsUtil, jsonPathEnabled,
+      jsBindEnabled: jsBind, jsGetEnabled: jsGet, jsUtilEnabled: jsUtil, jsonPathEnabled, bookFieldsEnabled: b,
+    })),
+    book && sourceUsesBookSyntax(source.rules, {
+      orEnabled, varsEnabled, xpathEnabled, xpathEvalEnabled: xpathEval, regexEnabled, andEnabled, aioEnabled, listJsEnabled, jsExtEnabled,
+      jsGetEnabled: jsGet, jsUtilEnabled: jsUtil, jsonPathEnabled, initJsEnabled, jsoupEnabled: jsoup,
     }),
   ));
 }
@@ -248,6 +259,7 @@ export function sourceUsesXPathEval(
   options: {
     orEnabled: boolean; varsEnabled: boolean; jsEnabled: boolean; listJsEnabled?: boolean; jsExtEnabled?: boolean; jsBindEnabled?: boolean;
     jsGetEnabled?: boolean; jsUtilEnabled?: boolean; jsonPathEnabled?: boolean; jsoupEnabled?: boolean;
+    bookFieldsEnabled?: boolean;
   },
 ): boolean {
   if (!someRule(rules, ruleMayUseXPath)) return false;
@@ -258,7 +270,8 @@ export function sourceUsesXPathEval(
   const jsUtilEnabled = options.jsUtilEnabled === true;
   const jsonPathEnabled = options.jsonPathEnabled === true;
   const jsoupEnabled = options.jsoupEnabled === true;
-  const memoKey = `${options.orEnabled}:${options.varsEnabled}:${options.jsEnabled}:${listJsEnabled}:${jsExtEnabled}:${jsBindEnabled}:${jsGetEnabled}:${jsUtilEnabled}:${jsonPathEnabled}:${jsoupEnabled}`;
+  const bookFieldsEnabled = options.bookFieldsEnabled === true;
+  const memoKey = `${options.orEnabled}:${options.varsEnabled}:${options.jsEnabled}:${listJsEnabled}:${jsExtEnabled}:${jsBindEnabled}:${jsGetEnabled}:${jsUtilEnabled}:${jsonPathEnabled}:${jsoupEnabled}:${bookFieldsEnabled}`;
   let memo = xpathEvalMemo.get(rules);
   const hit = memo?.get(memoKey);
   if (hit !== undefined) return hit;
@@ -272,7 +285,7 @@ export function sourceUsesXPathEval(
       try {
         const ir = parseFieldRule(rule, {
           orEnabled: options.orEnabled, xpathEnabled: true, xpathEvalEnabled: true, jsEnabled: options.jsEnabled, listJsEnabled, jsExtEnabled,
-          jsBindEnabled, jsGetEnabled, jsUtilEnabled, jsonPathEnabled, jsoupEnabled, field: `${group}.${field}`,
+          jsBindEnabled, jsGetEnabled, jsUtilEnabled, jsonPathEnabled, jsoupEnabled, bookFieldsEnabled, field: `${group}.${field}`,
         });
         if (fieldUsesXPathEval(ir)) {
           uses = true;
@@ -309,6 +322,7 @@ export function sourceUsesRegexSyntax(
   options: {
     orEnabled: boolean; varsEnabled: boolean; jsEnabled: boolean; xpathEnabled: boolean; xpathEvalEnabled: boolean; listJsEnabled?: boolean;
     jsExtEnabled?: boolean; jsBindEnabled?: boolean; jsGetEnabled?: boolean; jsUtilEnabled?: boolean; jsonPathEnabled?: boolean; jsoupEnabled?: boolean;
+    bookFieldsEnabled?: boolean;
   },
 ): boolean {
   if (!someRule(rules, (rule) => rule.includes('##'))) return false;
@@ -319,7 +333,8 @@ export function sourceUsesRegexSyntax(
   const jsUtilEnabled = options.jsUtilEnabled === true;
   const jsonPathEnabled = options.jsonPathEnabled === true;
   const jsoupEnabled = options.jsoupEnabled === true;
-  const memoKey = `${options.orEnabled}:${options.varsEnabled}:${options.jsEnabled}:${options.xpathEnabled}:${options.xpathEvalEnabled}:${listJsEnabled}:${jsExtEnabled}:${jsBindEnabled}:${jsGetEnabled}:${jsUtilEnabled}:${jsonPathEnabled}:${jsoupEnabled}`;
+  const bookFieldsEnabled = options.bookFieldsEnabled === true;
+  const memoKey = `${options.orEnabled}:${options.varsEnabled}:${options.jsEnabled}:${options.xpathEnabled}:${options.xpathEvalEnabled}:${listJsEnabled}:${jsExtEnabled}:${jsBindEnabled}:${jsGetEnabled}:${jsUtilEnabled}:${jsonPathEnabled}:${jsoupEnabled}:${bookFieldsEnabled}`;
   let memo = regexMemo.get(rules);
   const hit = memo?.get(memoKey);
   if (hit !== undefined) return hit;
@@ -334,7 +349,7 @@ export function sourceUsesRegexSyntax(
         const ir = parseFieldRule(rule, {
           orEnabled: options.orEnabled, xpathEnabled: options.xpathEnabled, xpathEvalEnabled: options.xpathEvalEnabled,
           jsEnabled: options.jsEnabled, regexEnabled: true, listJsEnabled, jsExtEnabled, jsBindEnabled, jsGetEnabled, jsUtilEnabled,
-          jsonPathEnabled, jsoupEnabled, field: `${group}.${field}`,
+          jsonPathEnabled, jsoupEnabled, bookFieldsEnabled, field: `${group}.${field}`,
         });
         if (fieldUsesRegexSyntax(ir)) {
           uses = true;
@@ -381,6 +396,7 @@ export function sourceUsesAndSyntax(
   options: {
     varsEnabled: boolean; jsEnabled: boolean; xpathEnabled: boolean; xpathEvalEnabled: boolean; regexEnabled: boolean; listJsEnabled?: boolean;
     jsExtEnabled?: boolean; jsBindEnabled?: boolean; jsGetEnabled?: boolean; jsUtilEnabled?: boolean; jsonPathEnabled?: boolean; jsoupEnabled?: boolean;
+    bookFieldsEnabled?: boolean;
   },
 ): boolean {
   if (!someRule(rules, (rule) => rule.includes('&&'))) return false;
@@ -391,7 +407,8 @@ export function sourceUsesAndSyntax(
   const jsUtilEnabled = options.jsUtilEnabled === true;
   const jsonPathEnabled = options.jsonPathEnabled === true;
   const jsoupEnabled = options.jsoupEnabled === true;
-  const memoKey = `${options.varsEnabled}:${options.jsEnabled}:${options.xpathEnabled}:${options.xpathEvalEnabled}:${options.regexEnabled}:${listJsEnabled}:${jsExtEnabled}:${jsBindEnabled}:${jsGetEnabled}:${jsUtilEnabled}:${jsonPathEnabled}:${jsoupEnabled}`;
+  const bookFieldsEnabled = options.bookFieldsEnabled === true;
+  const memoKey = `${options.varsEnabled}:${options.jsEnabled}:${options.xpathEnabled}:${options.xpathEvalEnabled}:${options.regexEnabled}:${listJsEnabled}:${jsExtEnabled}:${jsBindEnabled}:${jsGetEnabled}:${jsUtilEnabled}:${jsonPathEnabled}:${jsoupEnabled}:${bookFieldsEnabled}`;
   let memo = andMemo.get(rules);
   const hit = memo?.get(memoKey);
   if (hit !== undefined) return hit;
@@ -406,7 +423,7 @@ export function sourceUsesAndSyntax(
       const parse = (andEnabled: boolean) => parseFieldRule(rule, {
         orEnabled: true, xpathEnabled: options.xpathEnabled, xpathEvalEnabled: options.xpathEvalEnabled,
         jsEnabled: options.jsEnabled, regexEnabled: options.regexEnabled, andEnabled, listJsEnabled, jsExtEnabled, jsBindEnabled, jsGetEnabled,
-        jsUtilEnabled, jsonPathEnabled, jsoupEnabled, field: name,
+        jsUtilEnabled, jsonPathEnabled, jsoupEnabled, bookFieldsEnabled, field: name,
       });
       try {
         parse(true);
@@ -442,6 +459,7 @@ export function sourceUsesJsExtSyntax(
     orEnabled: boolean; varsEnabled: boolean; xpathEnabled: boolean; xpathEvalEnabled: boolean; regexEnabled: boolean; andEnabled: boolean;
     aioEnabled: boolean; listJsEnabled: boolean; jsBindEnabled?: boolean; jsGetEnabled?: boolean; jsUtilEnabled?: boolean; jsonPathEnabled?: boolean;
     jsoupEnabled?: boolean;
+    bookFieldsEnabled?: boolean;
   },
 ): boolean {
   if (sourceHasJsLib(rules) || !someRule(rules, ruleHasJs)) return false;
@@ -450,7 +468,8 @@ export function sourceUsesJsExtSyntax(
   const jsUtilEnabled = options.jsUtilEnabled === true;
   const jsonPathEnabled = options.jsonPathEnabled === true;
   const jsoupEnabled = options.jsoupEnabled === true;
-  const memoKey = `${options.orEnabled}:${options.varsEnabled}:${options.xpathEnabled}:${options.xpathEvalEnabled}:${options.regexEnabled}:${options.andEnabled}:${options.aioEnabled}:${options.listJsEnabled}:${jsBindEnabled}:${jsGetEnabled}:${jsUtilEnabled}:${jsonPathEnabled}:${jsoupEnabled}`;
+  const bookFieldsEnabled = options.bookFieldsEnabled === true;
+  const memoKey = `${options.orEnabled}:${options.varsEnabled}:${options.xpathEnabled}:${options.xpathEvalEnabled}:${options.regexEnabled}:${options.andEnabled}:${options.aioEnabled}:${options.listJsEnabled}:${jsBindEnabled}:${jsGetEnabled}:${jsUtilEnabled}:${jsonPathEnabled}:${jsoupEnabled}:${bookFieldsEnabled}`;
   let memo = jsExtMemo.get(rules);
   const hit = memo?.get(memoKey);
   if (hit !== undefined) return hit;
@@ -466,7 +485,7 @@ export function sourceUsesJsExtSyntax(
         orEnabled: options.orEnabled, xpathEnabled: options.xpathEnabled, xpathEvalEnabled: options.xpathEvalEnabled, jsEnabled: true,
         regexEnabled: options.regexEnabled, andEnabled: options.andEnabled, aioEnabled: options.aioEnabled, aioGroup: aio.has(group),
         listJsEnabled: options.listJsEnabled, jsExtEnabled, jsBindEnabled, jsGetEnabled, jsUtilEnabled, jsonPathEnabled, jsoupEnabled,
-        field: `${group}.${field}`,
+        bookFieldsEnabled, field: `${group}.${field}`,
       });
       try {
         parse(true);
@@ -507,6 +526,7 @@ export function sourceUsesJsBindSyntax(
     orEnabled: boolean; varsEnabled: boolean; xpathEnabled: boolean; xpathEvalEnabled: boolean; regexEnabled: boolean; andEnabled: boolean;
     aioEnabled: boolean; listJsEnabled: boolean; jsExtEnabled: boolean; jsGetEnabled?: boolean; jsUtilEnabled?: boolean; jsonPathEnabled?: boolean;
     jsoupEnabled?: boolean;
+    bookFieldsEnabled?: boolean;
   },
 ): boolean {
   if (sourceHasJsLib(rules) || !someRule(rules, ruleMayUseJsBind)) return false;
@@ -514,7 +534,8 @@ export function sourceUsesJsBindSyntax(
   const jsUtilEnabled = options.jsUtilEnabled === true;
   const jsonPathEnabled = options.jsonPathEnabled === true;
   const jsoupEnabled = options.jsoupEnabled === true;
-  const memoKey = `${options.orEnabled}:${options.varsEnabled}:${options.xpathEnabled}:${options.xpathEvalEnabled}:${options.regexEnabled}:${options.andEnabled}:${options.aioEnabled}:${options.listJsEnabled}:${options.jsExtEnabled}:${jsGetEnabled}:${jsUtilEnabled}:${jsonPathEnabled}:${jsoupEnabled}`;
+  const bookFieldsEnabled = options.bookFieldsEnabled === true;
+  const memoKey = `${options.orEnabled}:${options.varsEnabled}:${options.xpathEnabled}:${options.xpathEvalEnabled}:${options.regexEnabled}:${options.andEnabled}:${options.aioEnabled}:${options.listJsEnabled}:${options.jsExtEnabled}:${jsGetEnabled}:${jsUtilEnabled}:${jsonPathEnabled}:${jsoupEnabled}:${bookFieldsEnabled}`;
   let memo = jsBindMemo.get(rules);
   const hit = memo?.get(memoKey);
   if (hit !== undefined) return hit;
@@ -530,7 +551,7 @@ export function sourceUsesJsBindSyntax(
         orEnabled: options.orEnabled, xpathEnabled: options.xpathEnabled, xpathEvalEnabled: options.xpathEvalEnabled, jsEnabled: true,
         regexEnabled: options.regexEnabled, andEnabled: options.andEnabled, aioEnabled: options.aioEnabled, aioGroup: aio.has(group),
         listJsEnabled: options.listJsEnabled, jsExtEnabled: options.jsExtEnabled, jsBindEnabled, jsGetEnabled, jsUtilEnabled,
-        jsonPathEnabled, jsoupEnabled, field: `${group}.${field}`,
+        jsonPathEnabled, jsoupEnabled, bookFieldsEnabled, field: `${group}.${field}`,
       });
       try {
         parse(true);
@@ -571,13 +592,15 @@ export function sourceUsesJsGetSyntax(
     orEnabled: boolean; varsEnabled: boolean; xpathEnabled: boolean; xpathEvalEnabled: boolean; regexEnabled: boolean; andEnabled: boolean;
     aioEnabled: boolean; listJsEnabled: boolean; jsExtEnabled: boolean; jsBindEnabled: boolean; jsUtilEnabled?: boolean; jsonPathEnabled?: boolean;
     jsoupEnabled?: boolean;
+    bookFieldsEnabled?: boolean;
   },
 ): boolean {
   if (sourceHasJsLib(rules) || !someRule(rules, ruleMayUseJsGet)) return false;
   const jsUtilEnabled = options.jsUtilEnabled === true;
   const jsonPathEnabled = options.jsonPathEnabled === true;
   const jsoupEnabled = options.jsoupEnabled === true;
-  const memoKey = `${options.orEnabled}:${options.varsEnabled}:${options.xpathEnabled}:${options.xpathEvalEnabled}:${options.regexEnabled}:${options.andEnabled}:${options.aioEnabled}:${options.listJsEnabled}:${options.jsExtEnabled}:${options.jsBindEnabled}:${jsUtilEnabled}:${jsonPathEnabled}:${jsoupEnabled}`;
+  const bookFieldsEnabled = options.bookFieldsEnabled === true;
+  const memoKey = `${options.orEnabled}:${options.varsEnabled}:${options.xpathEnabled}:${options.xpathEvalEnabled}:${options.regexEnabled}:${options.andEnabled}:${options.aioEnabled}:${options.listJsEnabled}:${options.jsExtEnabled}:${options.jsBindEnabled}:${jsUtilEnabled}:${jsonPathEnabled}:${jsoupEnabled}:${bookFieldsEnabled}`;
   let memo = jsGetMemo.get(rules);
   const hit = memo?.get(memoKey);
   if (hit !== undefined) return hit;
@@ -593,7 +616,7 @@ export function sourceUsesJsGetSyntax(
         orEnabled: options.orEnabled, xpathEnabled: options.xpathEnabled, xpathEvalEnabled: options.xpathEvalEnabled, jsEnabled: true,
         regexEnabled: options.regexEnabled, andEnabled: options.andEnabled, aioEnabled: options.aioEnabled, aioGroup: aio.has(group),
         listJsEnabled: options.listJsEnabled, jsExtEnabled: options.jsExtEnabled, jsBindEnabled: options.jsBindEnabled, jsGetEnabled,
-        jsUtilEnabled, jsonPathEnabled, jsoupEnabled, field: `${group}.${field}`,
+        jsUtilEnabled, jsonPathEnabled, jsoupEnabled, bookFieldsEnabled, field: `${group}.${field}`,
       });
       try {
         parse(true);
@@ -634,12 +657,14 @@ export function sourceUsesJsUtilSyntax(
     orEnabled: boolean; varsEnabled: boolean; xpathEnabled: boolean; xpathEvalEnabled: boolean; regexEnabled: boolean; andEnabled: boolean;
     aioEnabled: boolean; listJsEnabled: boolean; jsExtEnabled: boolean; jsBindEnabled: boolean; jsGetEnabled: boolean; jsonPathEnabled?: boolean;
     jsoupEnabled?: boolean;
+    bookFieldsEnabled?: boolean;
   },
 ): boolean {
   if (sourceHasJsLib(rules) || !someRule(rules, ruleMayUseJsUtil)) return false;
   const jsonPathEnabled = options.jsonPathEnabled === true;
   const jsoupEnabled = options.jsoupEnabled === true;
-  const memoKey = `${options.orEnabled}:${options.varsEnabled}:${options.xpathEnabled}:${options.xpathEvalEnabled}:${options.regexEnabled}:${options.andEnabled}:${options.aioEnabled}:${options.listJsEnabled}:${options.jsExtEnabled}:${options.jsBindEnabled}:${options.jsGetEnabled}:${jsonPathEnabled}:${jsoupEnabled}`;
+  const bookFieldsEnabled = options.bookFieldsEnabled === true;
+  const memoKey = `${options.orEnabled}:${options.varsEnabled}:${options.xpathEnabled}:${options.xpathEvalEnabled}:${options.regexEnabled}:${options.andEnabled}:${options.aioEnabled}:${options.listJsEnabled}:${options.jsExtEnabled}:${options.jsBindEnabled}:${options.jsGetEnabled}:${jsonPathEnabled}:${jsoupEnabled}:${bookFieldsEnabled}`;
   let memo = jsUtilMemo.get(rules);
   const hit = memo?.get(memoKey);
   if (hit !== undefined) return hit;
@@ -655,7 +680,7 @@ export function sourceUsesJsUtilSyntax(
         orEnabled: options.orEnabled, xpathEnabled: options.xpathEnabled, xpathEvalEnabled: options.xpathEvalEnabled, jsEnabled: true,
         regexEnabled: options.regexEnabled, andEnabled: options.andEnabled, aioEnabled: options.aioEnabled, aioGroup: aio.has(group),
         listJsEnabled: options.listJsEnabled, jsExtEnabled: options.jsExtEnabled, jsBindEnabled: options.jsBindEnabled,
-        jsGetEnabled: options.jsGetEnabled, jsUtilEnabled, jsonPathEnabled, jsoupEnabled, field: `${group}.${field}`,
+        jsGetEnabled: options.jsGetEnabled, jsUtilEnabled, jsonPathEnabled, jsoupEnabled, bookFieldsEnabled, field: `${group}.${field}`,
       });
       try {
         parse(true);
@@ -690,11 +715,12 @@ export function sourceUsesJsoupSyntax(
   options: {
     orEnabled: boolean; varsEnabled: boolean; xpathEnabled: boolean; xpathEvalEnabled: boolean; regexEnabled: boolean; andEnabled: boolean;
     aioEnabled: boolean; listJsEnabled: boolean; jsExtEnabled: boolean; jsBindEnabled: boolean; jsGetEnabled: boolean; jsUtilEnabled: boolean;
-    jsonPathEnabled: boolean;
+    jsonPathEnabled: boolean; bookFieldsEnabled?: boolean;
   },
 ): boolean {
   if (sourceHasJsLib(rules) || !someRule(rules, ruleHasJs)) return false;
-  const memoKey = `${options.orEnabled}:${options.varsEnabled}:${options.xpathEnabled}:${options.xpathEvalEnabled}:${options.regexEnabled}:${options.andEnabled}:${options.aioEnabled}:${options.listJsEnabled}:${options.jsExtEnabled}:${options.jsBindEnabled}:${options.jsGetEnabled}:${options.jsUtilEnabled}:${options.jsonPathEnabled}`;
+  const bookFieldsEnabled = options.bookFieldsEnabled === true;
+  const memoKey = `${options.orEnabled}:${options.varsEnabled}:${options.xpathEnabled}:${options.xpathEvalEnabled}:${options.regexEnabled}:${options.andEnabled}:${options.aioEnabled}:${options.listJsEnabled}:${options.jsExtEnabled}:${options.jsBindEnabled}:${options.jsGetEnabled}:${options.jsUtilEnabled}:${options.jsonPathEnabled}:${bookFieldsEnabled}`;
   let memo = jsoupMemo.get(rules);
   const hit = memo?.get(memoKey);
   if (hit !== undefined) return hit;
@@ -712,7 +738,7 @@ export function sourceUsesJsoupSyntax(
         regexEnabled: options.regexEnabled, andEnabled: options.andEnabled, aioEnabled: options.aioEnabled, aioGroup: aio.has(group),
         listJsEnabled: options.listJsEnabled, listJsGroup: listJs.has(group), jsExtEnabled: options.jsExtEnabled,
         jsBindEnabled: options.jsBindEnabled, jsGetEnabled: options.jsGetEnabled, jsUtilEnabled: options.jsUtilEnabled,
-        jsonPathEnabled: options.jsonPathEnabled, jsoupEnabled, field: `${group}.${field}`,
+        jsonPathEnabled: options.jsonPathEnabled, jsoupEnabled, bookFieldsEnabled, field: `${group}.${field}`,
       });
       try {
         parse(true);
@@ -730,6 +756,79 @@ export function sourceUsesJsoupSyntax(
   if (!memo) {
     memo = new Map();
     jsoupMemo.set(rules, memo);
+  }
+  memo.set(memoKey, uses);
+  return uses;
+}
+
+const bookMemo = new WeakMap<object, Map<string, boolean>>();
+
+/** 可能受 book1028 影响的规则：出现 `book.` 成员访问（parse.ts bookRetryMembers 同一文本判据）。实编译再判。 */
+function ruleMayUseBook(rule: string): boolean {
+  return /(?<![\w$.])book\s*\./.test(rule);
+}
+
+/**
+ * `ruleBookInfo.canReName` 非空（legado analyzeBookInfo 此时允许详情覆盖搜索带来的书名/作者，详情阶段 book.name/author 的值随之
+ * 不定）：book1028 对这类源整源不生效。非字符串的非空值同样按非空算（宁严）。
+ */
+export function sourceCanReName(rules: Record<string, unknown>): boolean {
+  const info = rules.ruleBookInfo;
+  if (!info || typeof info !== 'object' || Array.isArray(info)) return false;
+  const value = (info as Record<string, unknown>).canReName;
+  return typeof value === 'string' ? value.trim() !== '' : value !== undefined && value !== null && value !== false;
+}
+
+/**
+ * 源是否会因 ENGINE_SYNTAX_BOOK_FIELDS 改变编译结果（book1028）：on 态只重编 off 态（含 jsoup 重试）被拒的字段（parse.ts
+ * bookFrame），所以对含 `book.` 的字段按两态（JS 与宿主绑定开，其余开关同 compileSource）各编译一次，有字段 off 拒、on 过即算。
+ * 调用方须确认 JS 链与宿主绑定对该源生效；canReName 非空的源恒 false（compileSource 对它不开 book）。
+ */
+export function sourceUsesBookSyntax(
+  rules: Record<string, unknown>,
+  options: {
+    orEnabled: boolean; varsEnabled: boolean; xpathEnabled: boolean; xpathEvalEnabled: boolean; regexEnabled: boolean; andEnabled: boolean;
+    aioEnabled: boolean; listJsEnabled: boolean; jsExtEnabled: boolean; jsGetEnabled: boolean; jsUtilEnabled: boolean; jsonPathEnabled: boolean;
+    initJsEnabled: boolean; jsoupEnabled: boolean;
+  },
+): boolean {
+  if (sourceHasJsLib(rules) || sourceCanReName(rules) || !someRule(rules, ruleMayUseBook)) return false;
+  const memoKey = `${options.orEnabled}:${options.varsEnabled}:${options.xpathEnabled}:${options.xpathEvalEnabled}:${options.regexEnabled}:${options.andEnabled}:${options.aioEnabled}:${options.listJsEnabled}:${options.jsExtEnabled}:${options.jsGetEnabled}:${options.jsUtilEnabled}:${options.jsonPathEnabled}:${options.initJsEnabled}:${options.jsoupEnabled}`;
+  let memo = bookMemo.get(rules);
+  const hit = memo?.get(memoKey);
+  if (hit !== undefined) return hit;
+  const sourceRules = options.varsEnabled ? resolveSourceVars(rules) : rules;
+  const aio = options.aioEnabled ? aioGroups(sourceRules) : new Set<string>();
+  const listJs = options.listJsEnabled ? listJsGroups(sourceRules) : new Set<string>();
+  let uses = false;
+  for (const group of RULE_GROUPS) {
+    const fields = sourceRules[group];
+    if (uses || !fields || typeof fields !== 'object' || Array.isArray(fields)) continue;
+    for (const [field, rule] of Object.entries(fields as Record<string, unknown>)) {
+      if (typeof rule !== 'string' || !ruleMayUseBook(rule)) continue;
+      const parse = (bookFieldsEnabled: boolean) => parseFieldRule(rule, {
+        orEnabled: options.orEnabled, xpathEnabled: options.xpathEnabled, xpathEvalEnabled: options.xpathEvalEnabled, jsEnabled: true,
+        regexEnabled: options.regexEnabled, andEnabled: options.andEnabled, aioEnabled: options.aioEnabled, aioGroup: aio.has(group),
+        listJsEnabled: options.listJsEnabled, listJsGroup: listJs.has(group), jsExtEnabled: options.jsExtEnabled, jsBindEnabled: true,
+        jsGetEnabled: options.jsGetEnabled, jsUtilEnabled: options.jsUtilEnabled, jsonPathEnabled: options.jsonPathEnabled,
+        initJsEnabled: options.initJsEnabled, jsoupEnabled: options.jsoupEnabled, bookFieldsEnabled, field: `${group}.${field}`,
+      });
+      try {
+        parse(true);
+      } catch {
+        continue; // on 态也编译不过：两态都 skipped
+      }
+      try {
+        parse(false);
+      } catch {
+        uses = true;
+        break;
+      }
+    }
+  }
+  if (!memo) {
+    memo = new Map();
+    bookMemo.set(rules, memo);
   }
   memo.set(memoKey, uses);
   return uses;
@@ -753,11 +852,13 @@ export function sourceUsesJsonPathSyntax(
     orEnabled: boolean; varsEnabled: boolean; jsEnabled: boolean; xpathEnabled: boolean; xpathEvalEnabled: boolean; regexEnabled: boolean;
     andEnabled: boolean; aioEnabled: boolean; listJsEnabled: boolean; jsExtEnabled: boolean; jsBindEnabled: boolean; jsGetEnabled: boolean;
     jsUtilEnabled: boolean; jsoupEnabled?: boolean;
+    bookFieldsEnabled?: boolean;
   },
 ): boolean {
   if (!someRule(rules, ruleMayUseJsonPath)) return false;
   const jsoupEnabled = options.jsoupEnabled === true;
-  const memoKey = `${options.orEnabled}:${options.varsEnabled}:${options.jsEnabled}:${options.xpathEnabled}:${options.xpathEvalEnabled}:${options.regexEnabled}:${options.andEnabled}:${options.aioEnabled}:${options.listJsEnabled}:${options.jsExtEnabled}:${options.jsBindEnabled}:${options.jsGetEnabled}:${options.jsUtilEnabled}:${jsoupEnabled}`;
+  const bookFieldsEnabled = options.bookFieldsEnabled === true;
+  const memoKey = `${options.orEnabled}:${options.varsEnabled}:${options.jsEnabled}:${options.xpathEnabled}:${options.xpathEvalEnabled}:${options.regexEnabled}:${options.andEnabled}:${options.aioEnabled}:${options.listJsEnabled}:${options.jsExtEnabled}:${options.jsBindEnabled}:${options.jsGetEnabled}:${options.jsUtilEnabled}:${jsoupEnabled}:${bookFieldsEnabled}`;
   let memo = jsonPathMemo.get(rules);
   const hit = memo?.get(memoKey);
   if (hit !== undefined) return hit;
@@ -773,7 +874,7 @@ export function sourceUsesJsonPathSyntax(
         orEnabled: options.orEnabled, xpathEnabled: options.xpathEnabled, xpathEvalEnabled: options.xpathEvalEnabled,
         jsEnabled: options.jsEnabled, regexEnabled: options.regexEnabled, andEnabled: options.andEnabled, aioEnabled: options.aioEnabled,
         aioGroup: aio.has(group), listJsEnabled: options.listJsEnabled, jsExtEnabled: options.jsExtEnabled, jsBindEnabled: options.jsBindEnabled,
-        jsGetEnabled: options.jsGetEnabled, jsUtilEnabled: options.jsUtilEnabled, jsonPathEnabled, jsoupEnabled, field: `${group}.${field}`,
+        jsGetEnabled: options.jsGetEnabled, jsUtilEnabled: options.jsUtilEnabled, jsonPathEnabled, jsoupEnabled, bookFieldsEnabled, field: `${group}.${field}`,
       });
       try {
         parse(true);
@@ -819,17 +920,20 @@ export function sourceUsesInitSyntax(
     orEnabled: boolean; xpathEnabled: boolean; xpathEvalEnabled: boolean; jsEnabled: boolean; regexEnabled: boolean; andEnabled: boolean;
     aioEnabled: boolean; listJsEnabled: boolean; jsExtEnabled: boolean; jsBindEnabled: boolean; jsGetEnabled: boolean; jsUtilEnabled: boolean;
     jsonPathEnabled: boolean; jsoupEnabled?: boolean;
+    bookFieldsEnabled?: boolean;
   },
 ): boolean {
   const rule = initRuleOf(rules);
   if (!initRuleTextSupported(rule)) return false;
-  const memoKey = `${options.orEnabled}:${options.xpathEnabled}:${options.xpathEvalEnabled}:${options.jsEnabled}:${options.regexEnabled}:${options.andEnabled}:${options.aioEnabled}:${options.listJsEnabled}:${options.jsExtEnabled}:${options.jsBindEnabled}:${options.jsGetEnabled}:${options.jsUtilEnabled}:${options.jsonPathEnabled}:${options.jsoupEnabled === true}`;
+  const memoKey = `${options.orEnabled}:${options.xpathEnabled}:${options.xpathEvalEnabled}:${options.jsEnabled}:${options.regexEnabled}:${options.andEnabled}:${options.aioEnabled}:${options.listJsEnabled}:${options.jsExtEnabled}:${options.jsBindEnabled}:${options.jsGetEnabled}:${options.jsUtilEnabled}:${options.jsonPathEnabled}:${options.jsoupEnabled === true}:${options.bookFieldsEnabled === true}`;
   let memo = initMemo.get(rules);
   const hit = memo?.get(memoKey);
   if (hit !== undefined) return hit;
   let field: FieldIr | undefined;
   try {
-    field = parseFieldRule(rule as string, { ...options, jsoupEnabled: options.jsoupEnabled === true, field: 'ruleBookInfo.init' });
+    field = parseFieldRule(rule as string, {
+      ...options, jsoupEnabled: options.jsoupEnabled === true, bookFieldsEnabled: options.bookFieldsEnabled === true, field: 'ruleBookInfo.init',
+    });
   } catch {
     field = undefined;
   }
@@ -859,18 +963,20 @@ export function sourceUsesInitJsSyntax(
     orEnabled: boolean; xpathEnabled: boolean; xpathEvalEnabled: boolean; regexEnabled: boolean; andEnabled: boolean;
     aioEnabled: boolean; listJsEnabled: boolean; jsExtEnabled: boolean; jsBindEnabled: boolean; jsGetEnabled: boolean; jsUtilEnabled: boolean;
     jsonPathEnabled: boolean; jsoupEnabled?: boolean;
+    bookFieldsEnabled?: boolean;
   },
 ): boolean {
   const rule = initRuleOf(rules);
   if (typeof rule !== 'string' || !ruleHasJs(rule.trim())) return false;
-  const memoKey = `${options.orEnabled}:${options.xpathEnabled}:${options.xpathEvalEnabled}:${options.regexEnabled}:${options.andEnabled}:${options.aioEnabled}:${options.listJsEnabled}:${options.jsExtEnabled}:${options.jsBindEnabled}:${options.jsGetEnabled}:${options.jsUtilEnabled}:${options.jsonPathEnabled}:${options.jsoupEnabled === true}`;
+  const memoKey = `${options.orEnabled}:${options.xpathEnabled}:${options.xpathEvalEnabled}:${options.regexEnabled}:${options.andEnabled}:${options.aioEnabled}:${options.listJsEnabled}:${options.jsExtEnabled}:${options.jsBindEnabled}:${options.jsGetEnabled}:${options.jsUtilEnabled}:${options.jsonPathEnabled}:${options.jsoupEnabled === true}:${options.bookFieldsEnabled === true}`;
   let memo = initJsMemo.get(rules);
   const hit = memo?.get(memoKey);
   if (hit !== undefined) return hit;
   let field: FieldIr | undefined;
   try {
     field = parseFieldRule(rule, {
-      ...options, jsEnabled: true, initJsEnabled: true, jsoupEnabled: options.jsoupEnabled === true, field: 'ruleBookInfo.init',
+      ...options, jsEnabled: true, initJsEnabled: true, jsoupEnabled: options.jsoupEnabled === true,
+      bookFieldsEnabled: options.bookFieldsEnabled === true, field: 'ruleBookInfo.init',
     });
   } catch {
     field = undefined;
@@ -918,6 +1024,8 @@ export function compileVarBag(rules: Record<string, unknown>, options: ParseOpti
     initJsEnabled: js && (options.initJsEnabled ?? (engineSyntaxInitEnabled() && engineSyntaxInitJsEnabled())),
     jsoupEnabled: js && (options.jsoupEnabled ?? engineSyntaxJsoupEnabled()),
   };
+  // book1028：同 compileSource（宿主绑定生效、canReName 为空才开）。
+  base.bookFieldsEnabled = base.jsBindEnabled === true && (options.bookFieldsEnabled ?? engineSyntaxBookFieldsEnabled()) && !sourceCanReName(rules);
   const memoKey = JSON.stringify(base);
   let memo = varBagMemo.get(rules);
   if (!memo) {
@@ -1017,9 +1125,12 @@ export function compileSource(
   const initJsEnabled = initEnabled && (options.initJsEnabled ?? engineSyntaxInitJsEnabled());
   const varBagEnabled = varsEnabled && (options.varBagEnabled ?? engineSyntaxVarsBagEnabled());
   const jsoupEnabled = jsEnabled && (options.jsoupEnabled ?? engineSyntaxJsoupEnabled());
+  const bookFieldsEnabled = jsEnabled && jsBindEnabled && (options.bookFieldsEnabled ?? engineSyntaxBookFieldsEnabled())
+    && !sourceCanReName(source.rules);
   const key = engineSourceRevision(source, {
     orEnabled, xpathEnabled, varsEnabled, jsEnabled, xpathEvalEnabled, regexEnabled, andEnabled, aioEnabled, listJsEnabled, jsExtEnabled,
     jsBindEnabled, jsGetEnabled, jsUtilEnabled, jsonPathEnabled, initEnabled, urlOptionsEnabled, initJsEnabled, varBagEnabled, jsoupEnabled,
+    bookFieldsEnabled,
   });
   const hit = cache.get(key);
   if (hit) {
@@ -1042,7 +1153,7 @@ export function compileSource(
         compiled.set(name, parseFieldRule(rule, {
           orEnabled, xpathEnabled, xpathEvalEnabled, jsEnabled, regexEnabled, andEnabled, aioEnabled, aioGroup: aio.has(group),
           listJsEnabled, listJsGroup: listJs.has(group), jsExtEnabled, jsBindEnabled, jsGetEnabled, jsUtilEnabled, jsonPathEnabled, initJsEnabled,
-          jsoupEnabled, field: name,
+          jsoupEnabled, bookFieldsEnabled, field: name,
         }));
       } catch {
         compiled.set(name, { skipped: 'unsupported' });
@@ -1052,7 +1163,7 @@ export function compileSource(
   // varbag1028：变量袋对该源生效时换掉详情 put 字段与目录 get 字段（判据与语义位同一个 compileVarBag）。
   const bag = varBagEnabled ? compileVarBag(source.rules, {
     orEnabled, xpathEnabled, xpathEvalEnabled, jsEnabled, regexEnabled, andEnabled, aioEnabled, listJsEnabled, jsExtEnabled, jsBindEnabled,
-    jsGetEnabled, jsUtilEnabled, jsonPathEnabled, initJsEnabled, jsoupEnabled,
+    jsGetEnabled, jsUtilEnabled, jsonPathEnabled, initJsEnabled, jsoupEnabled, bookFieldsEnabled,
   }) : null;
   if (bag) for (const [name, ir] of bag) compiled.set(name, ir);
   // init1028：可复现的 init 挂 initScope（详情字段改在 init 结果上求值，见 evaluate.ts bookInfoScope）；判据看原文，不看 vars 改写后的。

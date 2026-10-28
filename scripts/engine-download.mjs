@@ -167,7 +167,8 @@ export async function downloadBook(m, args, resolveSource, transport = fetchSour
     stage = 'detail';
     for (const candidate of candidates) {
       const detail = await operation(async ctx => {
-        if (!builtin) return m.api.engineFetchDetail(engine, candidate.bookUrl, ctx);
+        // book1028：搜索带出的书籍成员原样交给详情；详情带回的（补了 tocUrl）经 selected 交给目录。
+        if (!builtin) return m.api.engineFetchDetail(engine, candidate.bookUrl, ctx, candidate.book);
         return m.parser.parseSourceIdentity((await ctx.page(candidate.bookUrl)).text);
       });
       if (identityMatches(detail, candidate, args)) { selected = { ...candidate, ...detail }; break; }
@@ -191,7 +192,7 @@ export async function downloadBook(m, args, resolveSource, transport = fetchSour
       if (authorHits.length === 1) {
         stage = 'detail';
         const detail = await operation(async ctx => {
-          if (!builtin) return m.api.engineFetchDetail(engine, authorHits[0].bookUrl, ctx);
+          if (!builtin) return m.api.engineFetchDetail(engine, authorHits[0].bookUrl, ctx, authorHits[0].book);
           return m.parser.parseSourceIdentity((await ctx.page(authorHits[0].bookUrl)).text);
         });
         if (authorBridgeAccepts(authorHits, detail, args)) selected = { ...authorHits[0], ...detail };
@@ -201,7 +202,7 @@ export async function downloadBook(m, args, resolveSource, transport = fetchSour
     manifest.bookUrl = selected.bookUrl;
     stage = 'toc';
     const toc = () => operation(async ctx => {
-      if (!builtin) return (await m.api.engineFetchToc(engine, selected.tocUrl ?? selected.bookUrl, ctx, true, selected.vars)).chapters;
+      if (!builtin) return (await m.api.engineFetchToc(engine, selected.tocUrl ?? selected.bookUrl, ctx, true, selected.vars, selected.book)).chapters;
       const page = await ctx.page(selected.bookUrl);
       return m.parser.parseSourceChapters(page.text, page.url);
     });

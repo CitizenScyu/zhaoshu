@@ -265,6 +265,11 @@ export interface FieldIr {
   jsoup?: true;
   /** `java.getElement(s)("规则")` 的实参白名单（jsoup1028）：字面量规则文本 → 编译结果（不含 JS，须是取节点的规则）。 */
   jsElements?: ReadonlyMap<string, FieldIr>;
+  /**
+   * JS 读到的 `book` 成员（book1028，ENGINE_SYNTAX_BOOK_FIELDS；parse.ts bookFrame 重编通过才挂，可能含 origin）。求值时作用域的
+   * ScopeHost 须带齐且非空，否则求值失败（evaluate.ts）；列表 JS 只在挂了它时注入宿主绑定。未挂 = 旧链路逐字不变。
+   */
+  bookMembers?: readonly string[];
 }
 
 /** 装饰字段编译失败不阻断，标 skip 的占位。 */

@@ -12,9 +12,10 @@ import {
 import type { SourceRequestContext } from '@/lib/source-reader';
 import { contentHtmlToText, contentNeedsHtmlToText } from './content-html';
 import { isStructuredChallengePage } from './content-challenge';
+import { bookUrlMember, bookView, formatBookAuthor, formatBookName, type BookView } from './book-format';
 import {
-  bookInfoScope, compiledUsesJs, createScope, evaluateField, evaluateFieldList, evaluateFieldStrings, fieldUsesJs, normalizeBody,
-  scopeVars, withVars,
+  bookInfoScope, compiledUsesBook, compiledUsesJs, createScope, evaluateField, evaluateFieldList, evaluateFieldStrings, fieldUsesJs,
+  normalizeBody, scopeVars, withBook, withVars,
 } from './evaluate';
 import { enginePostSearchEnabled, engineSearchJsActive } from './compile-smoke';
 import { preloadJsSandbox } from './js-sandbox';
@@ -23,6 +24,7 @@ import { engineSyntaxJsBindEnabled } from './syntax-flags';
 import type { CompiledRules, FieldIr, SkippedField } from './types';
 import { stripUrlOptions } from './url-options';
 
+export type { BookView };
 export interface EngineSource {
   url: string;
   name: string;
@@ -32,9 +34,16 @@ export interface EngineSource {
   /** 书源原文的 bookSourceUrl（bind1028 `book.origin`，legado 不做归一）；缺省用 url。 */
   origin?: string;
 }
-export interface EngineSearchResult { title: string; author: string; bookUrl: string }
-/** 详情结果；`vars`（varbag1028）只在变量袋源上出现，是要交给 engineFetchToc 的本书变量。 */
-export type EngineDetailResult = Partial<SourceBookIdentity> & { tocUrl?: string; vars?: Record<string, string> };
+export interface EngineSearchResult {
+  title: string; author: string; bookUrl: string;
+  /** book1028：本条的书籍成员（只在编译产物读书籍成员时出现），调用方原样交给 engineFetchDetail。 */
+  book?: BookView;
+}
+/**
+ * 详情结果；`vars`（varbag1028）只在变量袋源上出现，是要交给 engineFetchToc 的本书变量；`book`（book1028）只在调用方传了
+ * 搜索带出的 book 时出现，补上 tocUrl 后交给 engineFetchToc。
+ */
+export type EngineDetailResult = Partial<SourceBookIdentity> & { tocUrl?: string; vars?: Record<string, string>; book?: BookView };
 export interface EngineTocResult { chapters: SourceChapter[] }
 export interface EngineContentResult { text: string }
 
@@ -138,8 +147,22 @@ export async function engineSearchBook(
   // listjs1027：`-` 前缀 = legado BookList 去重（保留首次出现）后整表反转，先收全再反转、截候选上限。
   const reverse = list.reverse === true;
   const bookUrlIr = field(source.compiled, 'ruleSearch.bookUrl');
+  // book1028：读书籍成员的源按 legado getSearchItem 顺序求值（name 格式化、为空丢条 → author 格式化 → bookUrl），后面的字段
+  // 能读到前面已赋的成员；其余源逐字走旧顺序。
+  const usesBook = compiledUsesBook(source.compiled);
   for (let index = 0; index < items.length && (reverse || results.length < MAX_SEARCH_CANDIDATES); index += 1) {
     const inner = items[index];
+    if (usesBook) {
+      const name = formatBookName(evaluateText(source.compiled, 'ruleSearch.name', inner));
+      if (!name) continue;
+      const author = formatBookAuthor(evaluateText(source.compiled, 'ruleSearch.author', withBook(inner, bookView({ name }))));
+      const rawUrl = evaluateText(source.compiled, 'ruleSearch.bookUrl', withBook(inner, bookView({ name, author })));
+      const bookUrl = absoluteUrl(rawUrl, page.url, bookUrlIr);
+      if (!bookUrl || seen.has(bookUrl)) continue;
+      seen.add(bookUrl);
+      results.push({ title: name, author, bookUrl, book: bookView({ name, author, bookUrl: bookUrlMember(rawUrl, bookUrl, bookUrlIr) }) });
+      continue;
+    }
     const name = evaluateText(source.compiled, 'ruleSearch.name', inner);
     const bookUrl = absoluteUrl(evaluateText(source.compiled, 'ruleSearch.bookUrl', inner), page.url, bookUrlIr);
     if (!name || !bookUrl || seen.has(bookUrl)) continue;
@@ -154,20 +177,24 @@ export async function engineSearchBook(
  * tocUrl 不在 `SourceBookIdentity` 里，作为附加字段带出（设计注释明确其属于本环节）；
  * 缺省时调用方回退用详情页 URL 当目录页。
  * 页面自报的原书名别名一并带出；最终书名与作者身份仍由调用方核对。
+ * `book`（book1028）= 同一本书搜索结果带出的书籍成员，详情字段的 JS 读 `book.name` 等从这里取；读成员的源不传即求值失败。
+ * 传了时结果带回 `book`（补上 tocUrl），交给 engineFetchToc。
  */
 export async function engineFetchDetail(
-  source: EngineSource, bookUrl: string, context: SourceRequestContext,
+  source: EngineSource, bookUrl: string, context: SourceRequestContext, book?: BookView,
 ): Promise<EngineDetailResult> {
   await prepareJs(source);
   const target = validateSourceUrl(bookUrl).href;
   const page = await context.page(target, { responseCharset: enginePostSearchEnabled() ? 'auto' : undefined });
-  const scope = pageScope(source, page.text, page.url);
+  const scope = withBook(pageScope(source, page.text, page.url), book);
   // init1028：详情字段在 init 结果上求值（未挂 initScope 时即页面作用域）；作者/别名兜底仍读页面原文。
   const info = bookInfoScope(source.compiled, scope);
   const detail: EngineDetailResult = {};
   const title = evaluateText(source.compiled, 'ruleBookInfo.name', info);
   const author = evaluateText(source.compiled, 'ruleBookInfo.author', info);
-  const tocUrl = absoluteUrl(evaluateText(source.compiled, 'ruleBookInfo.tocUrl', info), page.url, field(source.compiled, 'ruleBookInfo.tocUrl'));
+  const tocUrlIr = field(source.compiled, 'ruleBookInfo.tocUrl');
+  const rawTocUrl = evaluateText(source.compiled, 'ruleBookInfo.tocUrl', info);
+  const tocUrl = absoluteUrl(rawTocUrl, page.url, tocUrlIr);
   if (title) detail.title = title;
   if (tocUrl) detail.tocUrl = tocUrl;
   // 41-author：源的 ruleBookInfo.author 没命中（vikbook 写 .author@a 但页面并无该 class）时，
@@ -183,16 +210,21 @@ export async function engineFetchDetail(
   // varbag1028：详情字段 put 进袋的值，调用方原样交给 engineFetchToc。非变量袋源不带此键。
   const vars = scopeVars(info);
   if (vars) detail.vars = vars;
+  // book1028：legado analyzeBookInfo 的 tocUrl 为空时取 bookUrl；规则产出了值但进不了成员（选项后缀/过不了 host 门）则不带。
+  if (book !== undefined) {
+    detail.book = bookView({ ...book, tocUrl: rawTocUrl.trim() ? bookUrlMember(rawTocUrl, tocUrl, tocUrlIr) : book.bookUrl });
+  }
   return detail;
 }
 
 /**
  * ruleToc.chapterList → SourceChapter[]，含 nextTocUrl 翻页循环。
  * `vars`（varbag1028）= 同一本书 engineFetchDetail 带出的变量袋，目录字段的 `@get:{k}` / `java.get('k')` 从这里读；
- * 读袋的源不传即求值失败（不猜值）。
+ * 读袋的源不传即求值失败（不猜值）。`book`（book1028）= engineFetchDetail 带回的书籍成员，同理不传即读成员的字段求值失败。
  */
 export async function engineFetchToc(
   source: EngineSource, tocUrl: string, context: SourceRequestContext, strict = false, vars?: Readonly<Record<string, string>>,
+  book?: BookView,
 ): Promise<EngineTocResult> {
   // 原始顺序（含重复）先全收，最后统一去重（41-ctocfu §5）。去重口径对齐 legado **净效果**：
   // BookChapterList.kt:114-124 先 `chapterList.reverse()` → `LinkedHashSet`（保留反转后的首次出现）
@@ -224,7 +256,7 @@ export async function engineFetchToc(
       throw new SourcePolicyError('书源目录分页重复返回已读取的页面，请重试或更换书源');
     }
     receivedPages.add(receivedKey);
-    const scope = vars ? withVars(pageScope(source, page.text, page.url), vars) : pageScope(source, page.text, page.url);
+    const scope = withBook(vars ? withVars(pageScope(source, page.text, page.url), vars) : pageScope(source, page.text, page.url), book);
     let validChapters = 0;
     const list = field(source.compiled, 'ruleToc.chapterList');
     if (strict && [...source.compiled.entries()].some(([key, value]) => key.startsWith('ruleToc.') && 'skipped' in value)) throw new Error('unsupported_toc_rule');
