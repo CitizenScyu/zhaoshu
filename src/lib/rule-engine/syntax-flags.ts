@@ -23,14 +23,14 @@ export const ENGINE_SEMANTICS_XPATH_BIT = 2;
 /** vars1027：@put/@get 静态子集语义位。版本再 +4（5–8 = 含变量位的四种组合），1–4 逐字不变。 */
 export const ENGINE_SEMANTICS_VARS_BIT = 4;
 
-/** 语义版本随 || / XPath / 变量 / JS / XPath 求值 / 正则 / && / AllInOne / 搜索 JS / 列表 JS / JS 扩展 / 宿主绑定 / java.getString / 加解密帮手 / JSONPath 扩展 / 详情 init / 搜索选项 legado 口径 / URL 字段选项 / 搜索 webView / 详情 JS init / 详情→目录变量袋 / jsoup 直连 / 书籍成员 / 搜索 URL→搜索字段变量袋 / 搜索条目袋 / 列表 JS getter / 书籍变量 / jsLib 开关联动（唯一口径，供 compile.ts 缓存键与 rulesHash 复用）。 */
+/** 语义版本随 || / XPath / 变量 / JS / XPath 求值 / 正则 / && / AllInOne / 搜索 JS / 列表 JS / JS 扩展 / 宿主绑定 / java.getString / 加解密帮手 / JSONPath 扩展 / 详情 init / 搜索选项 legado 口径 / URL 字段选项 / 搜索 webView / 详情 JS init / 详情→目录变量袋 / jsoup 直连 / 书籍成员 / 搜索 URL→搜索字段变量袋 / 搜索条目袋 / 列表 JS getter / 书籍变量 / jsLib / 书源常量开关联动（唯一口径，供 compile.ts 缓存键与 rulesHash 复用）。 */
 export function engineSemanticsVersion(
   orEnabled: boolean, xpathEnabled = false, varsEnabled = false, jsEnabled = false, xpathEvalEnabled = false,
   regexEnabled = false, andEnabled = false, aioEnabled = false, searchJsEnabled = false, listJsEnabled = false,
   jsExtEnabled = false, jsBindEnabled = false, jsGetEnabled = false, jsUtilEnabled = false, jsonPathEnabled = false,
   initEnabled = false, searchOptionsEnabled = false, urlOptionsEnabled = false, searchWebViewEnabled = false, initJsEnabled = false,
   varBagEnabled = false, jsoupEnabled = false, bookFieldsEnabled = false, searchVarsEnabled = false, itemVarsEnabled = false,
-  listGetEnabled = false, bookVariableEnabled = false, jsLibEnabled = false,
+  listGetEnabled = false, bookVariableEnabled = false, jsLibEnabled = false, sourceBindEnabled = false,
 ): number {
   return (orEnabled ? ENGINE_SEMANTICS_VERSION_OR : ENGINE_SEMANTICS_VERSION)
     + (xpathEnabled ? ENGINE_SEMANTICS_XPATH_BIT : 0) + (varsEnabled ? ENGINE_SEMANTICS_VARS_BIT : 0)
@@ -46,7 +46,7 @@ export function engineSemanticsVersion(
     + (jsoupEnabled ? ENGINE_SEMANTICS_JSOUP_BIT : 0) + (bookFieldsEnabled ? ENGINE_SEMANTICS_BOOK_FIELDS_BIT : 0)
     + (searchVarsEnabled ? ENGINE_SEMANTICS_SEARCH_VARS_BIT : 0) + (itemVarsEnabled ? ENGINE_SEMANTICS_ITEM_VARS_BIT : 0)
     + (listGetEnabled ? ENGINE_SEMANTICS_LIST_GET_BIT : 0) + (bookVariableEnabled ? ENGINE_SEMANTICS_BOOK_VARIABLE_BIT : 0)
-    + (jsLibEnabled ? ENGINE_SEMANTICS_JS_LIB_BIT : 0);
+    + (jsLibEnabled ? ENGINE_SEMANTICS_JS_LIB_BIT : 0) + (sourceBindEnabled ? ENGINE_SEMANTICS_SOURCE_BIND_BIT : 0);
 }
 
 /**
@@ -513,5 +513,21 @@ export const ENGINE_SEMANTICS_JS_LIB_BIT = 268435456;
  */
 export function engineSyntaxJsLibEnabled(env: OrEnv = process.env): boolean {
   const raw = env.ENGINE_SYNTAX_JS_LIB?.trim().toLowerCase();
+  return raw === '1' || raw === 'true' || raw === 'on';
+}
+
+/**
+ * srcbind1028：书源常量语义位。版本再 +536870912（1–268435456 逐字不变）。
+ * 只对有字段 off 态被拒、代入书源常量后编译通过的源计入（compile.ts engineSourceRevision / sourceUsesSourceBindSyntax）。
+ */
+export const ENGINE_SEMANTICS_SOURCE_BIND_BIT = 536870912;
+
+/**
+ * ENGINE_SYNTAX_SOURCE_BIND 独立开关（srcbind1028，默认 off，口径同 ENGINE_SYNTAX_OR；须 ENGINE_SYNTAX_JS 同开才生效）。
+ * on = JS 里的 `source.key`/`source.getKey()`/`source.bookSourceUrl`（legado BookSource，值 = 书源原文地址）与
+ * `eval(String(source.bookSourceComment))` 在编译期代入书源常量（parse.ts bindSourceConsts），只收与 Rhino 同结果的用法。off = 逐字不变。
+ */
+export function engineSyntaxSourceBindEnabled(env: OrEnv = process.env): boolean {
+  const raw = env.ENGINE_SYNTAX_SOURCE_BIND?.trim().toLowerCase();
   return raw === '1' || raw === 'true' || raw === 'on';
 }

@@ -27,11 +27,11 @@ import { RuleEngineError, type FieldIr, type RuleDiagnostic } from './types';
 import {
   compileItemVars, compileSearchVars, compileSource, compileVarBag, engineItemVarsActive, engineSearchVarsActive, engineSourceRevision,
   fieldWithJsLib, ruleTextOf,
-  sourceBookVariablePuts, sourceCanReName,
+  sourceBookVariablePuts, sourceCanReName, sourceConstsOf,
 } from './compile';
 import {
   engineSyntaxAioEnabled, engineSyntaxBookFieldsEnabled, engineSyntaxJsBindEnabled, engineSyntaxVarsBagEnabled, engineSyntaxVarsEnabled,
-  engineUrlOptionsEnabled, engineSyntaxBookVariableEnabled,
+  engineUrlOptionsEnabled, engineSyntaxBookVariableEnabled, engineSyntaxSourceBindEnabled,
 } from './syntax-flags';
 import { bookUrlMember, bookView, formatBookAuthor, formatBookName, type BookView } from './book-format';
 import { stripUrlOptions, urlOptionFields } from './url-options';
@@ -462,6 +462,8 @@ export function compileAdmission(source: RawSource): AdmissionCompile {
     ? sourceBookVariablePuts({ searchUrl: source.searchUrl, rules: source as Record<string, unknown> }) ?? undefined : undefined;
   // jslib1028：同 compileSource——带可复现库的源，字段（含袋字段）按原文与 vars 改写后的文本过 jsLibRuleProblem，编译时传库。
   const jsLib = coreJs ? sourceJsLibFor(source) ?? undefined : undefined;
+  // srcbind1028：同 compileSource——JS 链生效时代入书源常量（袋字段不代入）。
+  const sourceConsts = sourceConstsOf(source as Record<string, unknown>, coreJs && engineSyntaxSourceBindEnabled());
   for (const [field, rule] of iterRulePairs(rulesSource)) {
     if (!(field in coreFieldMask)) continue;
     const libProblem = jsLib === undefined ? undefined : [rule, ruleTextOf(source as Record<string, unknown>, field)]
@@ -477,7 +479,7 @@ export function compileAdmission(source: RawSource): AdmissionCompile {
     try {
       parseFieldRule(rule, {
         jsEnabled: coreJs, field, aioGroup: aio.has(ruleGroupOf(field)), listJsGroup: listJs.has(ruleGroupOf(field)), bookFieldsEnabled,
-        bookVariablePuts, jsLib,
+        bookVariablePuts, jsLib, sourceConsts,
       });
       coreFieldMask[field] = true;
     } catch (error) {
@@ -810,6 +812,7 @@ function searchCandidates(
   const itemBag = itemBagOf(source, jsEnabled);
   // jslib1028：同 compileSource——带可复现库的源，字段过库并挂库原文（袋字段按原文与改写后的文本过）。
   const jsLib = jsEnabled ? sourceJsLibFor(source) ?? undefined : undefined;
+  const sourceConsts = sourceConstsOf(source as Record<string, unknown>, jsEnabled && engineSyntaxSourceBindEnabled());
   const parseSafe = (rule: unknown, name?: string) => {
     // itemvars1028：条目袋字段规则可能只剩 @put（改写后为空），先取带袋的编译结果（同 compileSource 覆盖）。
     const bagged = name === undefined ? undefined : itemBag?.get(name) ?? searchBag?.get(name);
@@ -818,7 +821,7 @@ function searchCandidates(
       return fieldWithJsLib(bagged, [typeof rule === 'string' ? rule : undefined, ruleTextOf(source as Record<string, unknown>, name)], jsLib);
     }
     if (typeof rule !== 'string' || !rule.trim()) return undefined;
-    try { return parseFieldRule(rule, { jsEnabled, field: name, aioGroup, listJsGroup, bookFieldsEnabled, jsLib }); } catch { return undefined; }
+    try { return parseFieldRule(rule, { jsEnabled, field: name, aioGroup, listJsGroup, bookFieldsEnabled, jsLib, sourceConsts }); } catch { return undefined; }
   };
   const listIr = parseSafe(bookList, 'ruleSearch.bookList');
   if (!listIr) return [];

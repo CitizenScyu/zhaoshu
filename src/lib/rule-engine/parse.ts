@@ -65,6 +65,16 @@ let jsoupFrame: { elements: Map<string, FieldIr>; options: ParseOptions } | unde
  */
 let bookFrame: { members: ReadonlySet<string>; used: Set<string>; puts?: ReadonlySet<string>; vars: Set<string> } | undefined;
 
+/** 当前 parseFieldRule 帧的书源常量（srcbind1028，ParseOptions.sourceConsts）：进出时保存/恢复；嵌套解析沿用外层的（不含 JS，用不到）。 */
+let sourceFrame: SourceConsts | undefined;
+
+/** 书源常量（srcbind1028）：`key` = 书源原文地址（legado BookSource.getKey() = bookSourceUrl），`comment` = 书源注释原文。 */
+export interface SourceConsts {
+  key: string;
+  /** 缺省 = 不代入注释 eval（源无注释或带 jsLib，见 compile.ts sourceConstsOf）。 */
+  comment?: string;
+}
+
 /** 变量袋编译模式：`put` = JS 里放行字面量键的 `java.put`；`get` = 放行 `java.get('键')` 与规则级 makeUp 的 `@get:{键}`。键记进 keys。 */
 export interface VarBagParse {
   mode: 'put' | 'get';
@@ -642,6 +652,11 @@ export interface ParseOptions {
    * 见 parseFieldRule。缺省 = 无库（开关 off 时带 jsLib 的源整源不开 JS 链，逐字原口径）。
    */
   jsLib?: JsLib;
+  /**
+   * 书源常量（ENGINE_SYNTAX_SOURCE_BIND，srcbind1028）：compile.ts / admission.ts 只在开关与 JS 链对该源同生效时传（compile.ts
+   * sourceConstsOf）。给出时 JS 段与 `{{JS}}` 里的 `source.key` 等先代入成字面量（bindSourceConsts）；缺省 = `source` 照旧拒。
+   */
+  sourceConsts?: SourceConsts;
 }
 
 /**
@@ -662,7 +677,9 @@ function parseFieldRuleFramed(rule: string, options: ParseOptions): FieldIr {
   const savedBag = varBag;
   const savedFrame = jsoupFrame;
   const savedBook = bookFrame;
+  const savedSource = sourceFrame;
   jsonPathExt = options.jsonPathEnabled ?? engineSyntaxJsonPathEnabled();
+  sourceFrame = options.sourceConsts ?? sourceFrame;
   varBag = options.varBag;
   jsoupFrame = undefined;
   bookFrame = undefined;
@@ -713,6 +730,7 @@ function parseFieldRuleFramed(rule: string, options: ParseOptions): FieldIr {
     varBag = savedBag;
     jsoupFrame = savedFrame;
     bookFrame = savedBook;
+    sourceFrame = savedSource;
   }
 }
 
@@ -1040,7 +1058,8 @@ function parseJsChain(trimmed: string, rule: string, options: ParseOptions): Fie
   let last = 0;
   for (const match of trimmed.matchAll(JS_SEGMENT_RE)) {
     pushRule(trimmed.slice(last, match.index));
-    const code = match[1] ?? match[2] ?? '';
+    // srcbind1028：先代入书源常量（帧外原样），注释 eval 的注释代码按本段口径过白名单。
+    const code = bindSourceConsts(match[1] ?? match[2] ?? '', (comment) => checkJsCode(comment, rule, itemLevel, jsExt, binds, gets, util));
     // jsoup1028：帧内条目级首段 JS 的 result/src 是条目 Element（evaluate.ts evaluateJsoupChain），读输入也收。
     const first = itemLevel && chain.length === 0;
     const detached = first && jsExt && !jsReadsInput(code);
@@ -1130,9 +1149,11 @@ function parseListJsChain(rule: string, options: ParseOptions): FieldIr {
       if (head.kind !== 'rule' || head.mode === 'json' || !nodeFieldIr(head.field)) reject('首段规则不是取节点的规则');
       chain.push(head);
     }
-    const code = match[1] ?? match[2] ?? '';
+    const ext = options.jsExtEnabled ?? engineSyntaxJsExtEnabled();
     // book1028：帧内列表 JS 也可读 book（legado 目录 getElements 的 ruleData 即 Book）。
-    checkJsCode(code, rule, false, options.jsExtEnabled ?? engineSyntaxJsExtEnabled(), bookFrame ? fieldBinds(options.field) : undefined, gets);
+    const binds = bookFrame ? fieldBinds(options.field) : undefined;
+    const code = bindSourceConsts(match[1] ?? match[2] ?? '', (comment) => checkJsCode(comment, rule, false, ext, binds, gets));
+    checkJsCode(code, rule, false, ext, binds, gets);
     chain.push({ kind: 'js', code });
     last = match.index + match[0].length;
   }
@@ -1396,6 +1417,93 @@ function collectLiteralCalls(code: string, pattern: RegExp, rule: string, gets: 
     last = match.index + match[0].length;
   }
   return out + code.slice(last);
+}
+
+// ---- 书源常量（srcbind1028，ENGINE_SYNTAX_SOURCE_BIND）----
+/** legado BookSource.getKey() 即 bookSourceUrl：`source.key`/`source.bookSourceUrl`/`source.getKey()`/`source.getBookSourceUrl()`。 */
+const SOURCE_KEY_RE = /(?<![\w$.])source\s*\.\s*(?:key|bookSourceUrl|getKey\s*\(\s*\)|getBookSourceUrl\s*\(\s*\))(?![\w$])/g;
+
+/** 注释即代码的写法：`eval(String(source.bookSourceComment))`。 */
+const SOURCE_COMMENT_EVAL_RE = /(?<![\w$.])eval\s*\(\s*String\s*\(\s*source\s*\.\s*bookSourceComment\s*\)\s*\)/g;
+
+/** 常量后紧跟的 `.replace("字面量", "字面量")`（编译期折叠）。 */
+const SOURCE_REPLACE_RE = /^\s*\.\s*replace\s*\(\s*("(?:[^"\\\n]|\\.)*"|'(?:[^'\\\n]|\\.)*')\s*,\s*("(?:[^"\\\n]|\\.)*"|'(?:[^'\\\n]|\\.)*')\s*\)/;
+
+/**
+ * 把 JS 代码里的书源常量换成字符串字面量（帧外或代码不含 `source` 时原样返回，off 态逐字不变）。legado 里这些是 Java String
+ * （Rhino 包装成对象与否两说），只代入两种口径同结果的位置（sourceConstSafe）；其余命中留原文，交白名单按「沙箱不提供的 source」拒。
+ * `eval(String(source.bookSourceComment))` 整段换成 `eval(String("注释"))`：注释代码里的书源地址先代入，再交 `check` 按所在 JS 段的
+ * 口径过白名单（eval 本身只在 jsext1028 开时放行）。`template` = 代码是 `{{}}` 的整段 JS（整段即常量也收）。
+ */
+function bindSourceConsts(code: string, check: (comment: string) => void, template = false): string {
+  const consts = sourceFrame;
+  if (consts === undefined || !code.includes('source')) return code;
+  const comment = consts.comment;
+  const out = comment === undefined || comment.length > MAX_JS_RULE_LENGTH ? code : replaceInCode(code, SOURCE_COMMENT_EVAL_RE, () => {
+    const body = bindSourceKey(comment, consts.key, false);
+    check(body);
+    return `eval(String(${jsLiteral(body)}))`;
+  });
+  return bindSourceKey(out, consts.key, template);
+}
+
+/** 书源地址的代入：命中后接的字面量 `.replace` 能折叠的先折叠，位置不安全的命中原样留下。 */
+function bindSourceKey(code: string, key: string, template: boolean): string {
+  let out = '';
+  let last = 0;
+  for (const match of code.matchAll(SOURCE_KEY_RE)) {
+    if (match.index < last || !startsInCode(code, match.index)) continue;
+    let value = key;
+    let end = match.index + match[0].length;
+    for (let fold = SOURCE_REPLACE_RE.exec(code.slice(end)); fold; fold = SOURCE_REPLACE_RE.exec(code.slice(end))) {
+      const target = jsStringLiteralValue(fold[1]);
+      const replacement = jsStringLiteralValue(fold[2]);
+      // Java String.replace 全量替换、JS replace 只换首个且认 `$` 模式：目标至多出现一次、替换不含 `$` 时两者同结果。
+      if (target === null || replacement === null || target === '' || replacement.includes('$') || value.split(target).length > 2) break;
+      value = value.split(target).join(replacement);
+      end += fold[0].length;
+    }
+    if (!sourceConstSafe(code, match.index, end, template)) continue;
+    out += code.slice(last, match.index) + jsLiteral(value);
+    last = end;
+  }
+  return out + code.slice(last);
+}
+
+/** 把 `pattern` 在代码里（不在字符串/注释/正则/模板字面量里）的命中换成 `replace()` 的结果。 */
+function replaceInCode(code: string, pattern: RegExp, replace: () => string): string {
+  let out = '';
+  let last = 0;
+  for (const match of code.matchAll(pattern)) {
+    if (!startsInCode(code, match.index)) continue;
+    out += code.slice(last, match.index) + replace();
+    last = match.index + match[0].length;
+  }
+  return out + code.slice(last);
+}
+
+/** 字符串字面量；`{}#@<>` 与行/段分隔符转义，代入后不会拼出 `{{`/`##`/`@get:`/`</js>`。 */
+function jsLiteral(value: string): string {
+  return JSON.stringify(value).replace(/[{}#@<>\u2028\u2029]/g, (ch) => `\\u${ch.charCodeAt(0).toString(16).padStart(4, '0')}`);
+}
+
+/** 前缀运算位置上会被当成一元运算对象的关键字（`return +x` 等）。 */
+const JS_PREFIX_KEYWORDS: ReadonlySet<string> = new Set([
+  'return', 'typeof', 'void', 'delete', 'new', 'in', 'of', 'instanceof', 'case', 'throw', 'else', 'do', 'yield', 'await',
+]);
+
+/**
+ * 常量位置（code[start, end)）是否只会被转成字符串用：模板整段、`{{…}}` 整段、`String(…)` 实参、字符串拼接 `x + 常量`
+ * （右侧不接成员访问/调用/更高优先级运算）、表达式开头的 `常量 + …`。比较、typeof、成员调用（`.match` 等）、赋值给变量都不收。
+ */
+function sourceConstSafe(code: string, start: number, end: number, template: boolean): boolean {
+  const before = code.slice(0, start).trimEnd();
+  const after = code.slice(end).trimStart();
+  if (template && before === '' && after === '') return true;
+  if ((before.endsWith('{{') && after.startsWith('}}')) || (/(?<![\w$.])String\s*\($/.test(before) && after.startsWith(')'))) return true;
+  const left = /([\w$]+|[)\]'"`])\s*\+$/.exec(before);
+  if (left && !JS_PREFIX_KEYWORDS.has(left[1]) && !/^(?:[.[(*\/%`]|\?\.|\+\+|--)/.test(after)) return true;
+  return /^\+(?![+=])/.test(after) && /(?:^|[(,=;{}:?[&|<>]|(?<![\w$.])return)$/.test(before);
 }
 
 // ---- 书籍变量（bookvar1028，ENGINE_SYNTAX_BOOK_VARIABLE）----
@@ -1686,11 +1794,13 @@ function makeUpParts(text: string, rule: string, options: ParseOptions, field: s
     } else {
       // 变量袋路径不要求宿主绑定开：`{{JS}}` 仍是 bind1028 的能力，没开就照旧拒。
       if (!bind) unsupported('模板含 JS 表达式（tpl_js_expr）', rule, { code: 'unsupported_template_js' });
-      const path = /^\s*([A-Za-z_$][\w$]*)(?:\s*\.\s*[A-Za-z_$][\w$]*)*\s*$/.exec(inner);
+      // srcbind1028：整段是书源常量（或其拼接）时先代入成字面量，再按原口径查。
+      const code = bindSourceConsts(inner, (comment) => checkJsCode(comment, rule, itemLevel, true, binds), true);
+      const path = /^\s*([A-Za-z_$][\w$]*)(?:\s*\.\s*[A-Za-z_$][\w$]*)*\s*$/.exec(code);
       if (path && !TEMPLATE_JS_ROOTS.has(path[1])) unsupported('模板含 {{变量}}（tpl_var）', rule, { code: 'unsupported_template_var' });
-      if (itemLevel && jsReadsInput(inner)) unsupported('条目级字段的模板 JS 读了 result/src', rule, { code: 'unsupported_template_js' });
-      checkJsCode(inner, rule, itemLevel, true, binds);
-      parts.push({ kind: 'js', code: inner });
+      if (itemLevel && jsReadsInput(code)) unsupported('条目级字段的模板 JS 读了 result/src', rule, { code: 'unsupported_template_js' });
+      checkJsCode(code, rule, itemLevel, true, binds);
+      parts.push({ kind: 'js', code });
     }
   }
   pushText(text.slice(last));
