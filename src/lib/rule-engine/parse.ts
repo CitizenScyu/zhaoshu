@@ -58,6 +58,9 @@ let varBag: VarBagParse | undefined;
  */
 let jsoupFrame: { elements: Map<string, FieldIr>; options: ParseOptions; init?: boolean } | undefined;
 
+/** 当前 parseFieldRule 帧是否按 objkey1029 认对象字面量键（JS 与 ENGINE_SYNTAX_JS_BIND 同开，见 objectKeyAt）。 */
+let jsObjectKeys = false;
+
 /**
  * 当前 parseFieldRule 帧的书籍成员重试（book1028，ParseOptions.bookFieldsEnabled）：off 态口径编译被拒的字段才在这一帧里重编，
  * 帧内 `book` 另放行 `members`（字段所在阶段 legado 已求出的成员，见 bookStageMembers），读到的成员记进 `used`。嵌套解析不继承。
@@ -683,7 +686,9 @@ function parseFieldRuleFramed(rule: string, options: ParseOptions): FieldIr {
   const savedFrame = jsoupFrame;
   const savedBook = bookFrame;
   const savedSource = sourceFrame;
+  const savedKeys = jsObjectKeys;
   jsonPathExt = options.jsonPathEnabled ?? engineSyntaxJsonPathEnabled();
+  jsObjectKeys = bindActive(options);
   sourceFrame = options.sourceConsts ?? sourceFrame;
   varBag = options.varBag;
   jsoupFrame = undefined;
@@ -738,6 +743,7 @@ function parseFieldRuleFramed(rule: string, options: ParseOptions): FieldIr {
     jsoupFrame = savedFrame;
     bookFrame = savedBook;
     sourceFrame = savedSource;
+    jsObjectKeys = savedKeys;
   }
 }
 
@@ -1340,6 +1346,18 @@ function makeUpRegex(parts: readonly string[], rule: string): RegexSub | undefin
 }
 
 /**
+ * 对象字面量的键（objkey1029，JS 与 ENGINE_SYNTAX_JS_BIND 同开）：`{NAME:` / `, NAME:`（去掉字面量后），不是引用。
+ * `case a, NAME:` 的逗号表达式里是引用，代码含 `case` 时一律不认；简写 `{NAME}`、`::` 不认。只认宿主绑定名
+ * （JS_BIND_KEY_NAMES，与 compile.ts ruleMayUseJsBind 预筛同口径，bind 位按源判定才覆盖得到）。
+ */
+const JS_BIND_KEY_NAMES: ReadonlySet<string> = new Set(['book', 'chapter', 'title']);
+
+function objectKeyAt(bare: string, at: number, length: number): boolean {
+  return /[{,]\s*$/.test(bare.slice(Math.max(0, at - 40), at)) && /^\s*:(?!:)/.test(bare.slice(at + length))
+    && !/(?<![\w$.])case(?![\w$])/.test(bare);
+}
+
+/**
  * JS 段的编译期白名单（沙箱内的二道防线见 js-sandbox.ts）。`allowEval`（jsext1028）：放行 `eval`（代码同样在沙箱里跑）。
  * `binds`（bind1028）：该字段可读的宿主绑定，命中的标识符只许读白名单成员、不许赋值/自增。
  * `util`（jsutil1028）：另放行 JS_JAVA_UTIL_HELPERS，用到即记 `used`（调用方据此给字段标 jsUtil）。
@@ -1359,6 +1377,7 @@ function checkJsCode(
   for (const match of bare.matchAll(/(?<![.\w$])[A-Za-z_$][\w$]*/g)) {
     const name = match[0];
     if (localBook && name === 'book') continue;
+    if (jsObjectKeys && JS_BIND_KEY_NAMES.has(name) && objectKeyAt(bare, match.index, name.length)) continue;
     const members = binds?.get(name);
     if (members) {
       checkBoundRef(bare, match.index, name, members, reject);
