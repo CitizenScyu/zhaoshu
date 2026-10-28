@@ -17,7 +17,7 @@ import {
   engineSemanticsVersion, engineSyntaxAioEnabled, engineSyntaxAndEnabled, engineSyntaxInitEnabled, engineSyntaxJsBindEnabled, engineSyntaxJsEnabled,
   engineSyntaxJsExtEnabled, engineSyntaxJsGetEnabled, engineSyntaxJsonPathEnabled, engineSyntaxJsUtilEnabled, engineSyntaxListJsEnabled,
   engineSyntaxOrEnabled, engineSyntaxRegexEnabled, engineSyntaxVarsEnabled, engineSyntaxXPathEnabled, engineSyntaxXPathEvalEnabled, engineUrlOptionsEnabled,
-  engineSearchWebViewEnabled, engineSyntaxInitJsEnabled, engineSyntaxVarsBagEnabled,
+  engineSearchWebViewEnabled, engineSyntaxInitJsEnabled, engineSyntaxJsoupEnabled, engineSyntaxVarsBagEnabled,
   ENGINE_SEMANTICS_VERSION,
 } from './syntax-flags';
 import { urlOptionFields } from './url-options';
@@ -42,6 +42,7 @@ export interface CompileOptions extends ParseOptions {
   // initJsEnabled（initjs1028，ENGINE_SYNTAX_INIT_JS）见 ParseOptions；compile 层另要求 initEnabled 同开。
   /** varbag1028：详情页 put → 目录页 get 变量袋（ENGINE_SYNTAX_VARS_BAG，默认读 env；须 varsEnabled 同开）。 */
   varBagEnabled?: boolean;
+  // jsoupEnabled（jsoup1028，ENGINE_SYNTAX_JSOUP）见 ParseOptions；compile 层另要求 JS 链对该源生效。
 }
 
 /** 版本化缓存键（P0 口径）：semanticsVersion:contentRevision。 */
@@ -72,6 +73,7 @@ export function engineVersionedKey(contentRevision: string, semanticsVersion = E
  * searchwv1028：ENGINE_SEARCH_WEBVIEW on、搜索选项位条件成立且选项可能让 webView 为真（searchOptionsMayUseWebView）时再加搜索 webView 位（262145–524288）。
  * initjs1028：ENGINE_SYNTAX_INIT 与 ENGINE_SYNTAX_INIT_JS 都 on、JS 链对该源生效且 init 是可复现的 JS（sourceUsesInitJsSyntax）时再加 JS init 位（524289–1048576）。
  * varbag1028：ENGINE_SYNTAX_VARS 与 ENGINE_SYNTAX_VARS_BAG 都 on 且变量袋对该源真生效（compileVarBag 非 null）时再加变量袋位（+2097152）。
+ * jsoup1028：ENGINE_SYNTAX_JSOUP on、JS 链对该源生效且有含 JS 的字段 off 态被拒、on 态编译通过（sourceUsesJsoupSyntax）时再加 jsoup 位（+4194304）。
  */
 export function engineSourceRevision(
   source: { url: string; searchUrl: unknown; rules: Record<string, unknown> },
@@ -103,61 +105,69 @@ export function engineSourceRevision(
   const jsBind = jsChain && jsBindEnabled;
   const jsGet = jsChain && jsGetEnabled;
   const jsUtil = jsChain && jsUtilEnabled;
+  const jsoup = jsChain && (options.jsoupEnabled ?? engineSyntaxJsoupEnabled());
+  // jsoup1028：其余各位先按 jsoup 关判（与旧口径逐字相同），jsoup 开时再补判一次取并集——jsoup 重试能救活
+  // 某开关的 off 态（如条目首段 JS 以 Element 起链），只按 jsoup 开判会把该位清掉、在池源 identity 白翻。
+  const soup = (probe: (jsoupEnabled: boolean) => boolean) => probe(false) || (jsoup && probe(true));
   return engineVersionedKey(sourceRevision(source), engineSemanticsVersion(
     orEnabled && sourceUsesOrSyntax(source.rules),
     xpathEnabled && sourceUsesXPathSyntax(source.rules),
     varsEnabled && sourceUsesVarSyntax(source.rules),
     jsEnabled && sourceUsesJsSyntax(source.rules),
-    xpathEnabled && xpathEval && sourceUsesXPathEval(source.rules, {
+    xpathEnabled && xpathEval && soup((j) => sourceUsesXPathEval(source.rules, {
       orEnabled, varsEnabled, jsEnabled: jsChain, listJsEnabled, jsExtEnabled, jsBindEnabled: jsBind, jsGetEnabled: jsGet, jsUtilEnabled: jsUtil,
-      jsonPathEnabled,
-    }),
-    regexEnabled && sourceUsesRegexSyntax(source.rules, {
+      jsonPathEnabled, jsoupEnabled: j,
+    })),
+    regexEnabled && soup((j) => sourceUsesRegexSyntax(source.rules, {
       orEnabled, varsEnabled, jsEnabled: jsChain, xpathEnabled, xpathEvalEnabled: xpathEval, listJsEnabled, jsExtEnabled, jsBindEnabled: jsBind,
-      jsGetEnabled: jsGet, jsUtilEnabled: jsUtil, jsonPathEnabled,
-    }),
-    orEnabled && andEnabled && sourceUsesAndSyntax(source.rules, {
+      jsGetEnabled: jsGet, jsUtilEnabled: jsUtil, jsonPathEnabled, jsoupEnabled: j,
+    })),
+    orEnabled && andEnabled && soup((j) => sourceUsesAndSyntax(source.rules, {
       varsEnabled, jsEnabled: jsChain, xpathEnabled, xpathEvalEnabled: xpathEval, regexEnabled, listJsEnabled, jsExtEnabled, jsBindEnabled: jsBind,
-      jsGetEnabled: jsGet, jsUtilEnabled: jsUtil, jsonPathEnabled,
-    }),
+      jsGetEnabled: jsGet, jsUtilEnabled: jsUtil, jsonPathEnabled, jsoupEnabled: j,
+    })),
     aioEnabled && sourceUsesAioSyntax(source.rules),
     searchJsEnabled && searchTemplateNeedsJs(source.searchUrl, upgradeSourceTemplateUrl(source.url)),
     jsChain && listJsEnabled && sourceUsesListJsSyntax(source.rules),
-    jsChain && jsExtEnabled && sourceUsesJsExtSyntax(source.rules, {
+    jsChain && jsExtEnabled && soup((j) => sourceUsesJsExtSyntax(source.rules, {
       orEnabled, varsEnabled, xpathEnabled, xpathEvalEnabled: xpathEval, regexEnabled, andEnabled, aioEnabled, listJsEnabled, jsBindEnabled: jsBind,
-      jsGetEnabled: jsGet, jsUtilEnabled: jsUtil, jsonPathEnabled,
-    }),
-    jsBind && sourceUsesJsBindSyntax(source.rules, {
+      jsGetEnabled: jsGet, jsUtilEnabled: jsUtil, jsonPathEnabled, jsoupEnabled: j,
+    })),
+    jsBind && soup((j) => sourceUsesJsBindSyntax(source.rules, {
       orEnabled, varsEnabled, xpathEnabled, xpathEvalEnabled: xpathEval, regexEnabled, andEnabled, aioEnabled, listJsEnabled, jsExtEnabled,
-      jsGetEnabled: jsGet, jsUtilEnabled: jsUtil, jsonPathEnabled,
-    }),
-    jsGet && sourceUsesJsGetSyntax(source.rules, {
+      jsGetEnabled: jsGet, jsUtilEnabled: jsUtil, jsonPathEnabled, jsoupEnabled: j,
+    })),
+    jsGet && soup((j) => sourceUsesJsGetSyntax(source.rules, {
       orEnabled, varsEnabled, xpathEnabled, xpathEvalEnabled: xpathEval, regexEnabled, andEnabled, aioEnabled, listJsEnabled, jsExtEnabled,
-      jsBindEnabled: jsBind, jsUtilEnabled: jsUtil, jsonPathEnabled,
-    }),
-    jsUtil && sourceUsesJsUtilSyntax(source.rules, {
+      jsBindEnabled: jsBind, jsUtilEnabled: jsUtil, jsonPathEnabled, jsoupEnabled: j,
+    })),
+    jsUtil && soup((j) => sourceUsesJsUtilSyntax(source.rules, {
       orEnabled, varsEnabled, xpathEnabled, xpathEvalEnabled: xpathEval, regexEnabled, andEnabled, aioEnabled, listJsEnabled, jsExtEnabled,
-      jsBindEnabled: jsBind, jsGetEnabled: jsGet, jsonPathEnabled,
-    }),
-    jsonPathEnabled && sourceUsesJsonPathSyntax(source.rules, {
+      jsBindEnabled: jsBind, jsGetEnabled: jsGet, jsonPathEnabled, jsoupEnabled: j,
+    })),
+    jsonPathEnabled && soup((j) => sourceUsesJsonPathSyntax(source.rules, {
       orEnabled, varsEnabled, jsEnabled: jsChain, xpathEnabled, xpathEvalEnabled: xpathEval, regexEnabled, andEnabled, aioEnabled, listJsEnabled,
-      jsExtEnabled, jsBindEnabled: jsBind, jsGetEnabled: jsGet, jsUtilEnabled: jsUtil,
-    }),
-    initEnabled && sourceUsesInitSyntax(source.rules, {
+      jsExtEnabled, jsBindEnabled: jsBind, jsGetEnabled: jsGet, jsUtilEnabled: jsUtil, jsoupEnabled: j,
+    })),
+    initEnabled && soup((j) => sourceUsesInitSyntax(source.rules, {
       orEnabled, xpathEnabled, xpathEvalEnabled: xpathEval, jsEnabled: jsChain, regexEnabled, andEnabled, aioEnabled, listJsEnabled,
-      jsExtEnabled, jsBindEnabled: jsBind, jsGetEnabled: jsGet, jsUtilEnabled: jsUtil, jsonPathEnabled,
-    }),
+      jsExtEnabled, jsBindEnabled: jsBind, jsGetEnabled: jsGet, jsUtilEnabled: jsUtil, jsonPathEnabled, jsoupEnabled: j,
+    })),
     searchOptionParity,
     urlOptionsEnabled && urlOptionFields(source.rules).size > 0,
     searchWebViewEnabled && searchOptionParity && searchOptionsMayUseWebView(source.searchUrl),
-    initJsEnabled && jsChain && sourceUsesInitJsSyntax(source.rules, {
+    initJsEnabled && jsChain && soup((j) => sourceUsesInitJsSyntax(source.rules, {
       orEnabled, xpathEnabled, xpathEvalEnabled: xpathEval, regexEnabled, andEnabled, aioEnabled, listJsEnabled,
-      jsExtEnabled, jsBindEnabled: jsBind, jsGetEnabled: jsGet, jsUtilEnabled: jsUtil, jsonPathEnabled,
-    }),
+      jsExtEnabled, jsBindEnabled: jsBind, jsGetEnabled: jsGet, jsUtilEnabled: jsUtil, jsonPathEnabled, jsoupEnabled: j,
+    })),
     varsEnabled && (options.varBagEnabled ?? engineSyntaxVarsBagEnabled()) && compileVarBag(source.rules, {
       orEnabled, xpathEnabled, xpathEvalEnabled: xpathEval, jsEnabled: jsChain, regexEnabled, andEnabled, aioEnabled, listJsEnabled,
-      jsExtEnabled, jsBindEnabled: jsBind, jsGetEnabled: jsGet, jsUtilEnabled: jsUtil, jsonPathEnabled, initJsEnabled,
+      jsExtEnabled, jsBindEnabled: jsBind, jsGetEnabled: jsGet, jsUtilEnabled: jsUtil, jsonPathEnabled, initJsEnabled, jsoupEnabled: jsoup,
     }) !== null,
+    jsoup && sourceUsesJsoupSyntax(source.rules, {
+      orEnabled, varsEnabled, xpathEnabled, xpathEvalEnabled: xpathEval, regexEnabled, andEnabled, aioEnabled, listJsEnabled, jsExtEnabled,
+      jsBindEnabled: jsBind, jsGetEnabled: jsGet, jsUtilEnabled: jsUtil, jsonPathEnabled,
+    }),
   ));
 }
 
@@ -237,7 +247,7 @@ export function sourceUsesXPathEval(
   rules: Record<string, unknown>,
   options: {
     orEnabled: boolean; varsEnabled: boolean; jsEnabled: boolean; listJsEnabled?: boolean; jsExtEnabled?: boolean; jsBindEnabled?: boolean;
-    jsGetEnabled?: boolean; jsUtilEnabled?: boolean; jsonPathEnabled?: boolean;
+    jsGetEnabled?: boolean; jsUtilEnabled?: boolean; jsonPathEnabled?: boolean; jsoupEnabled?: boolean;
   },
 ): boolean {
   if (!someRule(rules, ruleMayUseXPath)) return false;
@@ -247,7 +257,8 @@ export function sourceUsesXPathEval(
   const jsGetEnabled = options.jsGetEnabled === true;
   const jsUtilEnabled = options.jsUtilEnabled === true;
   const jsonPathEnabled = options.jsonPathEnabled === true;
-  const memoKey = `${options.orEnabled}:${options.varsEnabled}:${options.jsEnabled}:${listJsEnabled}:${jsExtEnabled}:${jsBindEnabled}:${jsGetEnabled}:${jsUtilEnabled}:${jsonPathEnabled}`;
+  const jsoupEnabled = options.jsoupEnabled === true;
+  const memoKey = `${options.orEnabled}:${options.varsEnabled}:${options.jsEnabled}:${listJsEnabled}:${jsExtEnabled}:${jsBindEnabled}:${jsGetEnabled}:${jsUtilEnabled}:${jsonPathEnabled}:${jsoupEnabled}`;
   let memo = xpathEvalMemo.get(rules);
   const hit = memo?.get(memoKey);
   if (hit !== undefined) return hit;
@@ -261,7 +272,7 @@ export function sourceUsesXPathEval(
       try {
         const ir = parseFieldRule(rule, {
           orEnabled: options.orEnabled, xpathEnabled: true, xpathEvalEnabled: true, jsEnabled: options.jsEnabled, listJsEnabled, jsExtEnabled,
-          jsBindEnabled, jsGetEnabled, jsUtilEnabled, jsonPathEnabled, field: `${group}.${field}`,
+          jsBindEnabled, jsGetEnabled, jsUtilEnabled, jsonPathEnabled, jsoupEnabled, field: `${group}.${field}`,
         });
         if (fieldUsesXPathEval(ir)) {
           uses = true;
@@ -297,7 +308,7 @@ export function sourceUsesRegexSyntax(
   rules: Record<string, unknown>,
   options: {
     orEnabled: boolean; varsEnabled: boolean; jsEnabled: boolean; xpathEnabled: boolean; xpathEvalEnabled: boolean; listJsEnabled?: boolean;
-    jsExtEnabled?: boolean; jsBindEnabled?: boolean; jsGetEnabled?: boolean; jsUtilEnabled?: boolean; jsonPathEnabled?: boolean;
+    jsExtEnabled?: boolean; jsBindEnabled?: boolean; jsGetEnabled?: boolean; jsUtilEnabled?: boolean; jsonPathEnabled?: boolean; jsoupEnabled?: boolean;
   },
 ): boolean {
   if (!someRule(rules, (rule) => rule.includes('##'))) return false;
@@ -307,7 +318,8 @@ export function sourceUsesRegexSyntax(
   const jsGetEnabled = options.jsGetEnabled === true;
   const jsUtilEnabled = options.jsUtilEnabled === true;
   const jsonPathEnabled = options.jsonPathEnabled === true;
-  const memoKey = `${options.orEnabled}:${options.varsEnabled}:${options.jsEnabled}:${options.xpathEnabled}:${options.xpathEvalEnabled}:${listJsEnabled}:${jsExtEnabled}:${jsBindEnabled}:${jsGetEnabled}:${jsUtilEnabled}:${jsonPathEnabled}`;
+  const jsoupEnabled = options.jsoupEnabled === true;
+  const memoKey = `${options.orEnabled}:${options.varsEnabled}:${options.jsEnabled}:${options.xpathEnabled}:${options.xpathEvalEnabled}:${listJsEnabled}:${jsExtEnabled}:${jsBindEnabled}:${jsGetEnabled}:${jsUtilEnabled}:${jsonPathEnabled}:${jsoupEnabled}`;
   let memo = regexMemo.get(rules);
   const hit = memo?.get(memoKey);
   if (hit !== undefined) return hit;
@@ -322,7 +334,7 @@ export function sourceUsesRegexSyntax(
         const ir = parseFieldRule(rule, {
           orEnabled: options.orEnabled, xpathEnabled: options.xpathEnabled, xpathEvalEnabled: options.xpathEvalEnabled,
           jsEnabled: options.jsEnabled, regexEnabled: true, listJsEnabled, jsExtEnabled, jsBindEnabled, jsGetEnabled, jsUtilEnabled,
-          jsonPathEnabled, field: `${group}.${field}`,
+          jsonPathEnabled, jsoupEnabled, field: `${group}.${field}`,
         });
         if (fieldUsesRegexSyntax(ir)) {
           uses = true;
@@ -368,7 +380,7 @@ export function sourceUsesAndSyntax(
   rules: Record<string, unknown>,
   options: {
     varsEnabled: boolean; jsEnabled: boolean; xpathEnabled: boolean; xpathEvalEnabled: boolean; regexEnabled: boolean; listJsEnabled?: boolean;
-    jsExtEnabled?: boolean; jsBindEnabled?: boolean; jsGetEnabled?: boolean; jsUtilEnabled?: boolean; jsonPathEnabled?: boolean;
+    jsExtEnabled?: boolean; jsBindEnabled?: boolean; jsGetEnabled?: boolean; jsUtilEnabled?: boolean; jsonPathEnabled?: boolean; jsoupEnabled?: boolean;
   },
 ): boolean {
   if (!someRule(rules, (rule) => rule.includes('&&'))) return false;
@@ -378,7 +390,8 @@ export function sourceUsesAndSyntax(
   const jsGetEnabled = options.jsGetEnabled === true;
   const jsUtilEnabled = options.jsUtilEnabled === true;
   const jsonPathEnabled = options.jsonPathEnabled === true;
-  const memoKey = `${options.varsEnabled}:${options.jsEnabled}:${options.xpathEnabled}:${options.xpathEvalEnabled}:${options.regexEnabled}:${listJsEnabled}:${jsExtEnabled}:${jsBindEnabled}:${jsGetEnabled}:${jsUtilEnabled}:${jsonPathEnabled}`;
+  const jsoupEnabled = options.jsoupEnabled === true;
+  const memoKey = `${options.varsEnabled}:${options.jsEnabled}:${options.xpathEnabled}:${options.xpathEvalEnabled}:${options.regexEnabled}:${listJsEnabled}:${jsExtEnabled}:${jsBindEnabled}:${jsGetEnabled}:${jsUtilEnabled}:${jsonPathEnabled}:${jsoupEnabled}`;
   let memo = andMemo.get(rules);
   const hit = memo?.get(memoKey);
   if (hit !== undefined) return hit;
@@ -393,7 +406,7 @@ export function sourceUsesAndSyntax(
       const parse = (andEnabled: boolean) => parseFieldRule(rule, {
         orEnabled: true, xpathEnabled: options.xpathEnabled, xpathEvalEnabled: options.xpathEvalEnabled,
         jsEnabled: options.jsEnabled, regexEnabled: options.regexEnabled, andEnabled, listJsEnabled, jsExtEnabled, jsBindEnabled, jsGetEnabled,
-        jsUtilEnabled, jsonPathEnabled, field: name,
+        jsUtilEnabled, jsonPathEnabled, jsoupEnabled, field: name,
       });
       try {
         parse(true);
@@ -428,6 +441,7 @@ export function sourceUsesJsExtSyntax(
   options: {
     orEnabled: boolean; varsEnabled: boolean; xpathEnabled: boolean; xpathEvalEnabled: boolean; regexEnabled: boolean; andEnabled: boolean;
     aioEnabled: boolean; listJsEnabled: boolean; jsBindEnabled?: boolean; jsGetEnabled?: boolean; jsUtilEnabled?: boolean; jsonPathEnabled?: boolean;
+    jsoupEnabled?: boolean;
   },
 ): boolean {
   if (sourceHasJsLib(rules) || !someRule(rules, ruleHasJs)) return false;
@@ -435,7 +449,8 @@ export function sourceUsesJsExtSyntax(
   const jsGetEnabled = options.jsGetEnabled === true;
   const jsUtilEnabled = options.jsUtilEnabled === true;
   const jsonPathEnabled = options.jsonPathEnabled === true;
-  const memoKey = `${options.orEnabled}:${options.varsEnabled}:${options.xpathEnabled}:${options.xpathEvalEnabled}:${options.regexEnabled}:${options.andEnabled}:${options.aioEnabled}:${options.listJsEnabled}:${jsBindEnabled}:${jsGetEnabled}:${jsUtilEnabled}:${jsonPathEnabled}`;
+  const jsoupEnabled = options.jsoupEnabled === true;
+  const memoKey = `${options.orEnabled}:${options.varsEnabled}:${options.xpathEnabled}:${options.xpathEvalEnabled}:${options.regexEnabled}:${options.andEnabled}:${options.aioEnabled}:${options.listJsEnabled}:${jsBindEnabled}:${jsGetEnabled}:${jsUtilEnabled}:${jsonPathEnabled}:${jsoupEnabled}`;
   let memo = jsExtMemo.get(rules);
   const hit = memo?.get(memoKey);
   if (hit !== undefined) return hit;
@@ -450,7 +465,8 @@ export function sourceUsesJsExtSyntax(
       const parse = (jsExtEnabled: boolean) => parseFieldRule(rule, {
         orEnabled: options.orEnabled, xpathEnabled: options.xpathEnabled, xpathEvalEnabled: options.xpathEvalEnabled, jsEnabled: true,
         regexEnabled: options.regexEnabled, andEnabled: options.andEnabled, aioEnabled: options.aioEnabled, aioGroup: aio.has(group),
-        listJsEnabled: options.listJsEnabled, jsExtEnabled, jsBindEnabled, jsGetEnabled, jsUtilEnabled, jsonPathEnabled, field: `${group}.${field}`,
+        listJsEnabled: options.listJsEnabled, jsExtEnabled, jsBindEnabled, jsGetEnabled, jsUtilEnabled, jsonPathEnabled, jsoupEnabled,
+        field: `${group}.${field}`,
       });
       try {
         parse(true);
@@ -490,13 +506,15 @@ export function sourceUsesJsBindSyntax(
   options: {
     orEnabled: boolean; varsEnabled: boolean; xpathEnabled: boolean; xpathEvalEnabled: boolean; regexEnabled: boolean; andEnabled: boolean;
     aioEnabled: boolean; listJsEnabled: boolean; jsExtEnabled: boolean; jsGetEnabled?: boolean; jsUtilEnabled?: boolean; jsonPathEnabled?: boolean;
+    jsoupEnabled?: boolean;
   },
 ): boolean {
   if (sourceHasJsLib(rules) || !someRule(rules, ruleMayUseJsBind)) return false;
   const jsGetEnabled = options.jsGetEnabled === true;
   const jsUtilEnabled = options.jsUtilEnabled === true;
   const jsonPathEnabled = options.jsonPathEnabled === true;
-  const memoKey = `${options.orEnabled}:${options.varsEnabled}:${options.xpathEnabled}:${options.xpathEvalEnabled}:${options.regexEnabled}:${options.andEnabled}:${options.aioEnabled}:${options.listJsEnabled}:${options.jsExtEnabled}:${jsGetEnabled}:${jsUtilEnabled}:${jsonPathEnabled}`;
+  const jsoupEnabled = options.jsoupEnabled === true;
+  const memoKey = `${options.orEnabled}:${options.varsEnabled}:${options.xpathEnabled}:${options.xpathEvalEnabled}:${options.regexEnabled}:${options.andEnabled}:${options.aioEnabled}:${options.listJsEnabled}:${options.jsExtEnabled}:${jsGetEnabled}:${jsUtilEnabled}:${jsonPathEnabled}:${jsoupEnabled}`;
   let memo = jsBindMemo.get(rules);
   const hit = memo?.get(memoKey);
   if (hit !== undefined) return hit;
@@ -512,7 +530,7 @@ export function sourceUsesJsBindSyntax(
         orEnabled: options.orEnabled, xpathEnabled: options.xpathEnabled, xpathEvalEnabled: options.xpathEvalEnabled, jsEnabled: true,
         regexEnabled: options.regexEnabled, andEnabled: options.andEnabled, aioEnabled: options.aioEnabled, aioGroup: aio.has(group),
         listJsEnabled: options.listJsEnabled, jsExtEnabled: options.jsExtEnabled, jsBindEnabled, jsGetEnabled, jsUtilEnabled,
-        jsonPathEnabled, field: `${group}.${field}`,
+        jsonPathEnabled, jsoupEnabled, field: `${group}.${field}`,
       });
       try {
         parse(true);
@@ -552,12 +570,14 @@ export function sourceUsesJsGetSyntax(
   options: {
     orEnabled: boolean; varsEnabled: boolean; xpathEnabled: boolean; xpathEvalEnabled: boolean; regexEnabled: boolean; andEnabled: boolean;
     aioEnabled: boolean; listJsEnabled: boolean; jsExtEnabled: boolean; jsBindEnabled: boolean; jsUtilEnabled?: boolean; jsonPathEnabled?: boolean;
+    jsoupEnabled?: boolean;
   },
 ): boolean {
   if (sourceHasJsLib(rules) || !someRule(rules, ruleMayUseJsGet)) return false;
   const jsUtilEnabled = options.jsUtilEnabled === true;
   const jsonPathEnabled = options.jsonPathEnabled === true;
-  const memoKey = `${options.orEnabled}:${options.varsEnabled}:${options.xpathEnabled}:${options.xpathEvalEnabled}:${options.regexEnabled}:${options.andEnabled}:${options.aioEnabled}:${options.listJsEnabled}:${options.jsExtEnabled}:${options.jsBindEnabled}:${jsUtilEnabled}:${jsonPathEnabled}`;
+  const jsoupEnabled = options.jsoupEnabled === true;
+  const memoKey = `${options.orEnabled}:${options.varsEnabled}:${options.xpathEnabled}:${options.xpathEvalEnabled}:${options.regexEnabled}:${options.andEnabled}:${options.aioEnabled}:${options.listJsEnabled}:${options.jsExtEnabled}:${options.jsBindEnabled}:${jsUtilEnabled}:${jsonPathEnabled}:${jsoupEnabled}`;
   let memo = jsGetMemo.get(rules);
   const hit = memo?.get(memoKey);
   if (hit !== undefined) return hit;
@@ -573,7 +593,7 @@ export function sourceUsesJsGetSyntax(
         orEnabled: options.orEnabled, xpathEnabled: options.xpathEnabled, xpathEvalEnabled: options.xpathEvalEnabled, jsEnabled: true,
         regexEnabled: options.regexEnabled, andEnabled: options.andEnabled, aioEnabled: options.aioEnabled, aioGroup: aio.has(group),
         listJsEnabled: options.listJsEnabled, jsExtEnabled: options.jsExtEnabled, jsBindEnabled: options.jsBindEnabled, jsGetEnabled,
-        jsUtilEnabled, jsonPathEnabled, field: `${group}.${field}`,
+        jsUtilEnabled, jsonPathEnabled, jsoupEnabled, field: `${group}.${field}`,
       });
       try {
         parse(true);
@@ -613,11 +633,13 @@ export function sourceUsesJsUtilSyntax(
   options: {
     orEnabled: boolean; varsEnabled: boolean; xpathEnabled: boolean; xpathEvalEnabled: boolean; regexEnabled: boolean; andEnabled: boolean;
     aioEnabled: boolean; listJsEnabled: boolean; jsExtEnabled: boolean; jsBindEnabled: boolean; jsGetEnabled: boolean; jsonPathEnabled?: boolean;
+    jsoupEnabled?: boolean;
   },
 ): boolean {
   if (sourceHasJsLib(rules) || !someRule(rules, ruleMayUseJsUtil)) return false;
   const jsonPathEnabled = options.jsonPathEnabled === true;
-  const memoKey = `${options.orEnabled}:${options.varsEnabled}:${options.xpathEnabled}:${options.xpathEvalEnabled}:${options.regexEnabled}:${options.andEnabled}:${options.aioEnabled}:${options.listJsEnabled}:${options.jsExtEnabled}:${options.jsBindEnabled}:${options.jsGetEnabled}:${jsonPathEnabled}`;
+  const jsoupEnabled = options.jsoupEnabled === true;
+  const memoKey = `${options.orEnabled}:${options.varsEnabled}:${options.xpathEnabled}:${options.xpathEvalEnabled}:${options.regexEnabled}:${options.andEnabled}:${options.aioEnabled}:${options.listJsEnabled}:${options.jsExtEnabled}:${options.jsBindEnabled}:${options.jsGetEnabled}:${jsonPathEnabled}:${jsoupEnabled}`;
   let memo = jsUtilMemo.get(rules);
   const hit = memo?.get(memoKey);
   if (hit !== undefined) return hit;
@@ -633,7 +655,7 @@ export function sourceUsesJsUtilSyntax(
         orEnabled: options.orEnabled, xpathEnabled: options.xpathEnabled, xpathEvalEnabled: options.xpathEvalEnabled, jsEnabled: true,
         regexEnabled: options.regexEnabled, andEnabled: options.andEnabled, aioEnabled: options.aioEnabled, aioGroup: aio.has(group),
         listJsEnabled: options.listJsEnabled, jsExtEnabled: options.jsExtEnabled, jsBindEnabled: options.jsBindEnabled,
-        jsGetEnabled: options.jsGetEnabled, jsUtilEnabled, jsonPathEnabled, field: `${group}.${field}`,
+        jsGetEnabled: options.jsGetEnabled, jsUtilEnabled, jsonPathEnabled, jsoupEnabled, field: `${group}.${field}`,
       });
       try {
         parse(true);
@@ -656,6 +678,63 @@ export function sourceUsesJsUtilSyntax(
   return uses;
 }
 
+const jsoupMemo = new WeakMap<object, Map<string, boolean>>();
+
+/**
+ * 源是否会因 ENGINE_SYNTAX_JSOUP 改变编译结果（jsoup1028）：on 态只重试 off 态被拒的含 JS 字段（parse.ts parseFieldRule 的
+ * jsoupFrame 重试），所以对含 JS 的字段按两态（JS 开，其余开关同 compileSource）各编译一次，有字段 off 拒、on 过即算。
+ * 调用方须确认 JS 链对该源生效（ENGINE_SYNTAX_JS on、无 jsLib）。
+ */
+export function sourceUsesJsoupSyntax(
+  rules: Record<string, unknown>,
+  options: {
+    orEnabled: boolean; varsEnabled: boolean; xpathEnabled: boolean; xpathEvalEnabled: boolean; regexEnabled: boolean; andEnabled: boolean;
+    aioEnabled: boolean; listJsEnabled: boolean; jsExtEnabled: boolean; jsBindEnabled: boolean; jsGetEnabled: boolean; jsUtilEnabled: boolean;
+    jsonPathEnabled: boolean;
+  },
+): boolean {
+  if (sourceHasJsLib(rules) || !someRule(rules, ruleHasJs)) return false;
+  const memoKey = `${options.orEnabled}:${options.varsEnabled}:${options.xpathEnabled}:${options.xpathEvalEnabled}:${options.regexEnabled}:${options.andEnabled}:${options.aioEnabled}:${options.listJsEnabled}:${options.jsExtEnabled}:${options.jsBindEnabled}:${options.jsGetEnabled}:${options.jsUtilEnabled}:${options.jsonPathEnabled}`;
+  let memo = jsoupMemo.get(rules);
+  const hit = memo?.get(memoKey);
+  if (hit !== undefined) return hit;
+  const sourceRules = options.varsEnabled ? resolveSourceVars(rules) : rules;
+  const aio = options.aioEnabled ? aioGroups(sourceRules) : new Set<string>();
+  const listJs = options.listJsEnabled ? listJsGroups(sourceRules) : new Set<string>();
+  let uses = false;
+  for (const group of RULE_GROUPS) {
+    const fields = sourceRules[group];
+    if (uses || !fields || typeof fields !== 'object' || Array.isArray(fields)) continue;
+    for (const [field, rule] of Object.entries(fields as Record<string, unknown>)) {
+      if (typeof rule !== 'string' || !ruleHasJs(rule)) continue;
+      const parse = (jsoupEnabled: boolean) => parseFieldRule(rule, {
+        orEnabled: options.orEnabled, xpathEnabled: options.xpathEnabled, xpathEvalEnabled: options.xpathEvalEnabled, jsEnabled: true,
+        regexEnabled: options.regexEnabled, andEnabled: options.andEnabled, aioEnabled: options.aioEnabled, aioGroup: aio.has(group),
+        listJsEnabled: options.listJsEnabled, listJsGroup: listJs.has(group), jsExtEnabled: options.jsExtEnabled,
+        jsBindEnabled: options.jsBindEnabled, jsGetEnabled: options.jsGetEnabled, jsUtilEnabled: options.jsUtilEnabled,
+        jsonPathEnabled: options.jsonPathEnabled, jsoupEnabled, field: `${group}.${field}`,
+      });
+      try {
+        parse(true);
+      } catch {
+        continue; // on 态也编译不过：两态都 skipped
+      }
+      try {
+        parse(false);
+      } catch {
+        uses = true;
+        break;
+      }
+    }
+  }
+  if (!memo) {
+    memo = new Map();
+    jsoupMemo.set(rules, memo);
+  }
+  memo.set(memoKey, uses);
+  return uses;
+}
+
 const jsonPathMemo = new WeakMap<object, Map<string, boolean>>();
 
 /** 可能受 jsonpath1028 影响的规则：含 `$` 且出现 `.[` 或 `[?`。宁宽勿漏，实编译再判。 */
@@ -673,11 +752,12 @@ export function sourceUsesJsonPathSyntax(
   options: {
     orEnabled: boolean; varsEnabled: boolean; jsEnabled: boolean; xpathEnabled: boolean; xpathEvalEnabled: boolean; regexEnabled: boolean;
     andEnabled: boolean; aioEnabled: boolean; listJsEnabled: boolean; jsExtEnabled: boolean; jsBindEnabled: boolean; jsGetEnabled: boolean;
-    jsUtilEnabled: boolean;
+    jsUtilEnabled: boolean; jsoupEnabled?: boolean;
   },
 ): boolean {
   if (!someRule(rules, ruleMayUseJsonPath)) return false;
-  const memoKey = `${options.orEnabled}:${options.varsEnabled}:${options.jsEnabled}:${options.xpathEnabled}:${options.xpathEvalEnabled}:${options.regexEnabled}:${options.andEnabled}:${options.aioEnabled}:${options.listJsEnabled}:${options.jsExtEnabled}:${options.jsBindEnabled}:${options.jsGetEnabled}:${options.jsUtilEnabled}`;
+  const jsoupEnabled = options.jsoupEnabled === true;
+  const memoKey = `${options.orEnabled}:${options.varsEnabled}:${options.jsEnabled}:${options.xpathEnabled}:${options.xpathEvalEnabled}:${options.regexEnabled}:${options.andEnabled}:${options.aioEnabled}:${options.listJsEnabled}:${options.jsExtEnabled}:${options.jsBindEnabled}:${options.jsGetEnabled}:${options.jsUtilEnabled}:${jsoupEnabled}`;
   let memo = jsonPathMemo.get(rules);
   const hit = memo?.get(memoKey);
   if (hit !== undefined) return hit;
@@ -693,7 +773,7 @@ export function sourceUsesJsonPathSyntax(
         orEnabled: options.orEnabled, xpathEnabled: options.xpathEnabled, xpathEvalEnabled: options.xpathEvalEnabled,
         jsEnabled: options.jsEnabled, regexEnabled: options.regexEnabled, andEnabled: options.andEnabled, aioEnabled: options.aioEnabled,
         aioGroup: aio.has(group), listJsEnabled: options.listJsEnabled, jsExtEnabled: options.jsExtEnabled, jsBindEnabled: options.jsBindEnabled,
-        jsGetEnabled: options.jsGetEnabled, jsUtilEnabled: options.jsUtilEnabled, jsonPathEnabled, field: `${group}.${field}`,
+        jsGetEnabled: options.jsGetEnabled, jsUtilEnabled: options.jsUtilEnabled, jsonPathEnabled, jsoupEnabled, field: `${group}.${field}`,
       });
       try {
         parse(true);
@@ -738,18 +818,18 @@ export function sourceUsesInitSyntax(
   options: {
     orEnabled: boolean; xpathEnabled: boolean; xpathEvalEnabled: boolean; jsEnabled: boolean; regexEnabled: boolean; andEnabled: boolean;
     aioEnabled: boolean; listJsEnabled: boolean; jsExtEnabled: boolean; jsBindEnabled: boolean; jsGetEnabled: boolean; jsUtilEnabled: boolean;
-    jsonPathEnabled: boolean;
+    jsonPathEnabled: boolean; jsoupEnabled?: boolean;
   },
 ): boolean {
   const rule = initRuleOf(rules);
   if (!initRuleTextSupported(rule)) return false;
-  const memoKey = `${options.orEnabled}:${options.xpathEnabled}:${options.xpathEvalEnabled}:${options.jsEnabled}:${options.regexEnabled}:${options.andEnabled}:${options.aioEnabled}:${options.listJsEnabled}:${options.jsExtEnabled}:${options.jsBindEnabled}:${options.jsGetEnabled}:${options.jsUtilEnabled}:${options.jsonPathEnabled}`;
+  const memoKey = `${options.orEnabled}:${options.xpathEnabled}:${options.xpathEvalEnabled}:${options.jsEnabled}:${options.regexEnabled}:${options.andEnabled}:${options.aioEnabled}:${options.listJsEnabled}:${options.jsExtEnabled}:${options.jsBindEnabled}:${options.jsGetEnabled}:${options.jsUtilEnabled}:${options.jsonPathEnabled}:${options.jsoupEnabled === true}`;
   let memo = initMemo.get(rules);
   const hit = memo?.get(memoKey);
   if (hit !== undefined) return hit;
   let field: FieldIr | undefined;
   try {
-    field = parseFieldRule(rule as string, { ...options, field: 'ruleBookInfo.init' });
+    field = parseFieldRule(rule as string, { ...options, jsoupEnabled: options.jsoupEnabled === true, field: 'ruleBookInfo.init' });
   } catch {
     field = undefined;
   }
@@ -778,18 +858,20 @@ export function sourceUsesInitJsSyntax(
   options: {
     orEnabled: boolean; xpathEnabled: boolean; xpathEvalEnabled: boolean; regexEnabled: boolean; andEnabled: boolean;
     aioEnabled: boolean; listJsEnabled: boolean; jsExtEnabled: boolean; jsBindEnabled: boolean; jsGetEnabled: boolean; jsUtilEnabled: boolean;
-    jsonPathEnabled: boolean;
+    jsonPathEnabled: boolean; jsoupEnabled?: boolean;
   },
 ): boolean {
   const rule = initRuleOf(rules);
   if (typeof rule !== 'string' || !ruleHasJs(rule.trim())) return false;
-  const memoKey = `${options.orEnabled}:${options.xpathEnabled}:${options.xpathEvalEnabled}:${options.regexEnabled}:${options.andEnabled}:${options.aioEnabled}:${options.listJsEnabled}:${options.jsExtEnabled}:${options.jsBindEnabled}:${options.jsGetEnabled}:${options.jsUtilEnabled}:${options.jsonPathEnabled}`;
+  const memoKey = `${options.orEnabled}:${options.xpathEnabled}:${options.xpathEvalEnabled}:${options.regexEnabled}:${options.andEnabled}:${options.aioEnabled}:${options.listJsEnabled}:${options.jsExtEnabled}:${options.jsBindEnabled}:${options.jsGetEnabled}:${options.jsUtilEnabled}:${options.jsonPathEnabled}:${options.jsoupEnabled === true}`;
   let memo = initJsMemo.get(rules);
   const hit = memo?.get(memoKey);
   if (hit !== undefined) return hit;
   let field: FieldIr | undefined;
   try {
-    field = parseFieldRule(rule, { ...options, jsEnabled: true, initJsEnabled: true, field: 'ruleBookInfo.init' });
+    field = parseFieldRule(rule, {
+      ...options, jsEnabled: true, initJsEnabled: true, jsoupEnabled: options.jsoupEnabled === true, field: 'ruleBookInfo.init',
+    });
   } catch {
     field = undefined;
   }
@@ -834,6 +916,7 @@ export function compileVarBag(rules: Record<string, unknown>, options: ParseOpti
     jsUtilEnabled: js && (options.jsUtilEnabled ?? engineSyntaxJsUtilEnabled()),
     jsonPathEnabled: options.jsonPathEnabled ?? engineSyntaxJsonPathEnabled(),
     initJsEnabled: js && (options.initJsEnabled ?? (engineSyntaxInitEnabled() && engineSyntaxInitJsEnabled())),
+    jsoupEnabled: js && (options.jsoupEnabled ?? engineSyntaxJsoupEnabled()),
   };
   const memoKey = JSON.stringify(base);
   let memo = varBagMemo.get(rules);
@@ -933,9 +1016,10 @@ export function compileSource(
   const urlOptionsEnabled = options.urlOptionsEnabled ?? engineUrlOptionsEnabled();
   const initJsEnabled = initEnabled && (options.initJsEnabled ?? engineSyntaxInitJsEnabled());
   const varBagEnabled = varsEnabled && (options.varBagEnabled ?? engineSyntaxVarsBagEnabled());
+  const jsoupEnabled = jsEnabled && (options.jsoupEnabled ?? engineSyntaxJsoupEnabled());
   const key = engineSourceRevision(source, {
     orEnabled, xpathEnabled, varsEnabled, jsEnabled, xpathEvalEnabled, regexEnabled, andEnabled, aioEnabled, listJsEnabled, jsExtEnabled,
-    jsBindEnabled, jsGetEnabled, jsUtilEnabled, jsonPathEnabled, initEnabled, urlOptionsEnabled, initJsEnabled, varBagEnabled,
+    jsBindEnabled, jsGetEnabled, jsUtilEnabled, jsonPathEnabled, initEnabled, urlOptionsEnabled, initJsEnabled, varBagEnabled, jsoupEnabled,
   });
   const hit = cache.get(key);
   if (hit) {
@@ -958,7 +1042,7 @@ export function compileSource(
         compiled.set(name, parseFieldRule(rule, {
           orEnabled, xpathEnabled, xpathEvalEnabled, jsEnabled, regexEnabled, andEnabled, aioEnabled, aioGroup: aio.has(group),
           listJsEnabled, listJsGroup: listJs.has(group), jsExtEnabled, jsBindEnabled, jsGetEnabled, jsUtilEnabled, jsonPathEnabled, initJsEnabled,
-          field: name,
+          jsoupEnabled, field: name,
         }));
       } catch {
         compiled.set(name, { skipped: 'unsupported' });
@@ -968,7 +1052,7 @@ export function compileSource(
   // varbag1028：变量袋对该源生效时换掉详情 put 字段与目录 get 字段（判据与语义位同一个 compileVarBag）。
   const bag = varBagEnabled ? compileVarBag(source.rules, {
     orEnabled, xpathEnabled, xpathEvalEnabled, jsEnabled, regexEnabled, andEnabled, aioEnabled, listJsEnabled, jsExtEnabled, jsBindEnabled,
-    jsGetEnabled, jsUtilEnabled, jsonPathEnabled, initJsEnabled,
+    jsGetEnabled, jsUtilEnabled, jsonPathEnabled, initJsEnabled, jsoupEnabled,
   }) : null;
   if (bag) for (const [name, ir] of bag) compiled.set(name, ir);
   // init1028：可复现的 init 挂 initScope（详情字段改在 init 结果上求值，见 evaluate.ts bookInfoScope）；判据看原文，不看 vars 改写后的。

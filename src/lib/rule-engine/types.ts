@@ -257,6 +257,14 @@ export interface FieldIr {
   varPut?: true;
   /** 目录字段读本书变量袋（varbag1028）：`@get:{键}` makeUp 片段或 JS 里的 `java.get('键')`。求值时作用域没带袋即失败。 */
   varGets?: true;
+  /**
+   * JS 链直连 jsoup DOM（jsoup1028，ENGINE_SYNTAX_JSOUP）：沙箱装 Element/Elements/Java 字符串包装（js-sandbox.ts runJsoup），
+   * 条目级首段 JS 的 result/src 是条目 Element、列表链首段规则的结果以 Elements 交给后面的 JS（evaluate.ts evaluateJsoupChain）。
+   * 未挂 = 旧链路逐字不变。
+   */
+  jsoup?: true;
+  /** `java.getElement(s)("规则")` 的实参白名单（jsoup1028）：字面量规则文本 → 编译结果（不含 JS，须是取节点的规则）。 */
+  jsElements?: ReadonlyMap<string, FieldIr>;
 }
 
 /** 装饰字段编译失败不阻断，标 skip 的占位。 */

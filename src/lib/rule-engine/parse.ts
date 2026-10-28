@@ -27,7 +27,7 @@ import { AIO_LIST_FIELDS, isAioListField, isAioListRule, parseAioField } from '.
 import {
   engineSyntaxAioEnabled, engineSyntaxAndEnabled, engineSyntaxJsBindEnabled, engineSyntaxJsEnabled, engineSyntaxJsExtEnabled,
   engineSyntaxJsGetEnabled, engineSyntaxJsonPathEnabled, engineSyntaxJsUtilEnabled, engineSyntaxListJsEnabled, engineSyntaxOrEnabled,
-  engineSyntaxRegexEnabled, engineSyntaxXPathEnabled, engineSyntaxXPathEvalEnabled, engineInitJsActive,
+  engineSyntaxRegexEnabled, engineSyntaxXPathEnabled, engineSyntaxXPathEvalEnabled, engineInitJsActive, engineSyntaxJsoupEnabled,
 } from './syntax-flags';
 import { compileXPath, XPathSyntaxError } from './xpath-eval';
 import { looksLikeXPath, xpathPrefixed, xpathSegmentBody, xpathToCss } from './xpath-subset';
@@ -48,6 +48,13 @@ let jsonPathExt = false;
  * getter 实参不继承（它们里面的 put/get 照旧拒）。
  */
 let varBag: VarBagParse | undefined;
+
+/**
+ * 当前 parseFieldRule 帧的 jsoup 直连重试（jsoup1028，ParseOptions.jsoupEnabled）：off 态口径编译被拒的字段才在这一帧里重编，
+ * 帧内放行 `java.getElement(s)("规则")`（实参编进 elements）、`org.jsoup.Jsoup.parse`、条目级 `result`/`src`、列表链首段规则。
+ * 嵌套解析不继承。`options` = 实参规则的编译开关（不含 JS）。
+ */
+let jsoupFrame: { elements: Map<string, FieldIr>; options: ParseOptions } | undefined;
 
 /** 变量袋编译模式：`put` = JS 里放行字面量键的 `java.put`；`get` = 放行 `java.get('键')` 与规则级 makeUp 的 `@get:{键}`。键记进 keys。 */
 export interface VarBagParse {
@@ -599,19 +606,63 @@ export interface ParseOptions {
    * 变量袋（varbag1028，compile.ts 只给 vars-subset.ts varBagPlan 判出的字段传）：见 VarBagParse。只作用于本帧，嵌套解析不继承。
    */
   varBag?: VarBagParse;
+  /**
+   * jsoup DOM 直连（ENGINE_SYNTAX_JSOUP，jsoup1028；须 jsEnabled）：字符串/列表字段按 off 态口径编译被拒时，再按 jsoup 口径重编
+   * （见 jsoupFrame），通过的字段标 FieldIr.jsoup。off 态编译得过的字段逐字不变。默认读 env（缺失=off）。
+   */
+  jsoupEnabled?: boolean;
 }
 
 export function parseFieldRule(rule: string, options: ParseOptions = {}): FieldIr {
   const saved = jsonPathExt;
   const savedBag = varBag;
+  const savedFrame = jsoupFrame;
   jsonPathExt = options.jsonPathEnabled ?? engineSyntaxJsonPathEnabled();
   varBag = options.varBag;
+  jsoupFrame = undefined;
+  const bagKeys = varBag === undefined ? undefined : [...varBag.keys];
   try {
     return parseFieldRuleWithObjectKey(rule, options);
+  } catch (error) {
+    if (!(error instanceof RuleEngineError) || error.code !== 'RULE_UNSUPPORTED' || !jsoupRetryAllowed(rule, options)) throw error;
+    const frame = { elements: new Map<string, FieldIr>(), options: jsSegmentOptions(options) };
+    const restoreBag = () => {
+      if (varBag === undefined || bagKeys === undefined) return;
+      varBag.keys.clear();
+      for (const key of bagKeys) varBag.keys.add(key);
+    };
+    restoreBag();
+    jsoupFrame = frame;
+    let field: FieldIr;
+    try {
+      field = parseFieldRuleWithObjectKey(rule, options);
+    } catch {
+      restoreBag();
+      throw error; // 重编也不过：报 off 态口径的原错误（诊断维度不变）
+    }
+    field.jsoup = true;
+    if (frame.elements.size > 0) field.jsElements = frame.elements;
+    return field;
   } finally {
     jsonPathExt = saved;
     varBag = savedBag;
+    jsoupFrame = savedFrame;
   }
+}
+
+/** jsoup1028 重试的前提：开关同开、字段已知（详情 init 不收）、规则含 JS。 */
+function jsoupRetryAllowed(rule: string, options: ParseOptions): boolean {
+  return typeof rule === 'string' && options.field !== undefined && options.field !== 'ruleBookInfo.init'
+    && (options.jsEnabled ?? engineSyntaxJsEnabled()) && (options.jsoupEnabled ?? engineSyntaxJsoupEnabled())
+    && ruleHasJs(rule.trim());
+}
+
+/** JS 链里规则段 / getter 实参的编译开关（不含 JS）。 */
+function jsSegmentOptions(options: ParseOptions): ParseOptions {
+  return {
+    orEnabled: options.orEnabled, xpathEnabled: options.xpathEnabled, xpathEvalEnabled: options.xpathEvalEnabled, jsEnabled: false,
+    regexEnabled: options.regexEnabled ?? engineSyntaxRegexEnabled(), jsonPathEnabled: options.jsonPathEnabled,
+  };
 }
 
 function parseFieldRuleWithObjectKey(rule: string, options: ParseOptions): FieldIr {
@@ -915,13 +966,18 @@ function parseJsChain(trimmed: string, rule: string, options: ParseOptions): Fie
   for (const match of trimmed.matchAll(JS_SEGMENT_RE)) {
     pushRule(trimmed.slice(last, match.index));
     const code = match[1] ?? match[2] ?? '';
-    const detached = itemLevel && chain.length === 0;
-    if (detached && !(jsExt && !jsReadsInput(code))) unsupported('条目级字段首段不能是 JS', rule, { code: 'unsupported_js' });
+    // jsoup1028：帧内条目级首段 JS 的 result/src 是条目 Element（evaluate.ts evaluateJsoupChain），读输入也收。
+    const first = itemLevel && chain.length === 0;
+    const detached = first && jsExt && !jsReadsInput(code);
+    if (first && !detached && jsoupFrame === undefined) unsupported('条目级字段首段不能是 JS', rule, { code: 'unsupported_js' });
     if (jsExt) {
       const stage = parseJsExtStage(code, rule, itemLevel, segmentOptions, binds, gets, util);
-      if (detached) {
+      if (first) {
         if (stage.kind !== 'js') unsupported('条目级字段首段不能是纯正则', rule, { code: 'unsupported_js' });
-        stage.detached = true;
+        if (detached) stage.detached = true;
+      }
+      if (jsoupFrame !== undefined && stage.kind === 'js' && stage.template) {
+        unsupported('jsoup 直连的 JS 段含 {{}}', rule, { code: 'unsupported_js' });
       }
       chain.push(stage);
     } else {
@@ -967,7 +1023,7 @@ function isListJsRule(rule: unknown): boolean {
  * `+`，之后按 splitSourceRule 切段。只收两种形态：
  * - 一到多段 JS：末段返回数组，逐项成为条目（js-sandbox runJsItems）；
  * - 一到多段 JS + 一段规则：JS 产出字符串，规则段把它重新解析成列表（规则段的模式见 ChainStage.mode）。
- * 首段是规则（节点/JSON 对象要 Java 互操作才读得动）、JS 段之间夹规则段、纯正则段一律拒。
+ * 首段是规则（节点/JSON 对象要 Java 互操作才读得动）、JS 段之间夹规则段、纯正则段一律拒；jsoup1028 帧内另收首段取节点的规则。
  */
 function parseListJsChain(rule: string, options: ParseOptions): FieldIr {
   const reject = (why: string): never => unsupported(`列表 JS ${why}`, rule, { code: 'unsupported_js' });
@@ -980,13 +1036,20 @@ function parseListJsChain(rule: string, options: ParseOptions): FieldIr {
   const chain: ChainStage[] = [];
   let last = 0;
   for (const match of text.matchAll(JS_SEGMENT_RE)) {
-    if (text.slice(last, match.index).trim() !== '') reject(chain.length === 0 ? '首段不是 JS' : 'JS 段之间夹规则段');
+    const between = text.slice(last, match.index).trim();
+    if (between !== '') {
+      // jsoup1028：帧内首段可以是取节点的规则（legado getElements 得 Elements，作为 result 交给后面的 JS）。
+      if (chain.length > 0 || jsoupFrame === undefined) reject(chain.length === 0 ? '首段不是 JS' : 'JS 段之间夹规则段');
+      const head = listRuleStage(between, rule, options, reject);
+      if (head.kind !== 'rule' || head.mode === 'json' || !nodeFieldIr(head.field)) reject('首段规则不是取节点的规则');
+      chain.push(head);
+    }
     const code = match[1] ?? match[2] ?? '';
     checkJsCode(code, rule, false, options.jsExtEnabled ?? engineSyntaxJsExtEnabled());
     chain.push({ kind: 'js', code });
     last = match.index + match[0].length;
   }
-  if (chain.length === 0) reject('没有 JS 段');
+  if (!chain.some((stage) => stage.kind === 'js')) reject('没有 JS 段');
   const tail = text.slice(last).trim();
   if (tail !== '') chain.push(listRuleStage(tail, rule, options, reject));
   const field: FieldIr = { rules: [], chain };
@@ -1167,7 +1230,9 @@ function checkJsCode(
   if (code.trim() === '') reject('为空');
   // legado 在求值前对 JS 文本做 {{}}/@get/## 改写（SourceRule 构造与 makeUpRule），这里不模拟那几步。
   if (code.includes('##') || code.includes('{{') || /@(?:get|put):/i.test(code)) reject('含 ##/{{}}/@get/@put');
-  const bare = stripJsLiterals(collectVarCalls(gets ? collectJavaGets(code, rule, gets) : code)) ?? reject('字符串/注释未闭合');
+  const frame = jsoupFrame;
+  const collected = gets ? collectJavaGets(code, rule, gets) : code;
+  const bare = stripJsLiterals(collectVarCalls(frame ? collectJsoupCalls(collected, rule, frame) : collected)) ?? reject('字符串/注释未闭合');
   for (const match of bare.matchAll(/(?<![.\w$])[A-Za-z_$][\w$]*/g)) {
     const name = match[0];
     const members = binds?.get(name);
@@ -1175,7 +1240,7 @@ function checkJsCode(
       checkBoundRef(bare, match.index, name, members, reject);
       continue;
     }
-    if ((JS_BANNED_IDENTIFIERS.has(name) && !(allowEval && name === 'eval')) || (itemLevel && name === 'src')) {
+    if ((JS_BANNED_IDENTIFIERS.has(name) && !(allowEval && name === 'eval')) || (itemLevel && name === 'src' && frame === undefined)) {
       reject(`引用了沙箱不提供的 ${name}`);
     }
     if (name !== 'java') continue;
@@ -1224,7 +1289,7 @@ function startsInCode(code: string, index: number): boolean {
 }
 
 /** 把 `pattern` 命中的字面量实参调用（首个捕获组 = 字面量）编进白名单、在待查代码里换成 `(0)`。 */
-function collectLiteralCalls(code: string, pattern: RegExp, rule: string, gets: JsGets): string {
+function collectLiteralCalls(code: string, pattern: RegExp, rule: string, gets: JsGets, what = 'java.getString'): string {
   let out = '';
   let last = 0;
   for (const match of code.matchAll(pattern)) {
@@ -1235,13 +1300,41 @@ function collectLiteralCalls(code: string, pattern: RegExp, rule: string, gets: 
       try {
         gets.out.set(text, parseFieldRule(text, gets.options));
       } catch {
-        unsupported('JS 段 java.getString 的实参规则编译不过', rule, { code: 'unsupported_js' });
+        unsupported(`JS 段 ${what} 的实参规则编译不过`, rule, { code: 'unsupported_js' });
       }
     }
     out += `${code.slice(last, match.index)}(0)`;
     last = match.index + match[0].length;
   }
   return out + code.slice(last);
+}
+
+// ---- jsoup DOM 直连（jsoup1028，ENGINE_SYNTAX_JSOUP）----
+/** `java.getElement("…")`/`java.getElements('…')`：恰好一个不跨行的字符串字面量实参。 */
+const JAVA_GET_ELEMENTS_CALL_RE = /(?<![\w$.])java\s*\.\s*getElements?\s*\(\s*("(?:[^"\\\n]|\\.)*"|'(?:[^'\\\n]|\\.)*')\s*\)/g;
+/** `org.jsoup.Jsoup.parse` / `Packages.org.jsoup.Jsoup.parse`（沙箱只提供这一个 jsoup 静态入口）。 */
+const JSOUP_PARSE_RE = /(?<![\w$.])(?:Packages\s*\.\s*)?org\s*\.\s*jsoup\s*\.\s*Jsoup\s*\.\s*parse(?![\w$])/g;
+
+/**
+ * jsoup 帧内：字面量实参的 `java.getElement(s)` 编进 frame.elements（须是取节点的规则）、`Jsoup.parse` 入口换成 `(0)`，
+ * 其余 `org`/`Packages`/动态实参照旧交白名单拒。
+ */
+function collectJsoupCalls(code: string, rule: string, frame: NonNullable<typeof jsoupFrame>): string {
+  const before = new Set(frame.elements.keys());
+  const out = collectLiteralCalls(code, JAVA_GET_ELEMENTS_CALL_RE, rule, { options: frame.options, out: frame.elements }, 'java.getElements');
+  for (const [text, field] of frame.elements) {
+    if (!before.has(text) && !nodeFieldIr(field)) unsupported('JS 段 java.getElements 的实参不是取节点的规则', rule, { code: 'unsupported_js' });
+  }
+  return out.replace(JSOUP_PARSE_RE, '(0)');
+}
+
+/** 取节点的规则（jsoup1028）：单条不带末端操作的 CSS（或各支都是这种 CSS 的 ||/&&），不带链/替换/拼接/变量。 */
+function nodeFieldIr(field: FieldIr): boolean {
+  if (field.chain || field.makeUp || (field.regex?.length ?? 0) > 0 || field.joins || field.concats !== undefined || field.varPuts
+    || field.objectKey || field.rules.length !== 1) return false;
+  const ir = field.rules[0];
+  const plainCss = (node: RuleIr) => node.kind === 'css' && node.terminal === undefined;
+  return plainCss(ir) || ((ir.kind === 'or' || ir.kind === 'and') && ir.branches.every(plainCss));
 }
 
 // ---- 变量袋 java.put / java.get（varbag1028，ENGINE_SYNTAX_VARS_BAG）----

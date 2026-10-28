@@ -3,13 +3,18 @@
 // / §3.4（失败隔离）。引擎零网络：本文件不引入任何请求路径，页 URL 由调用方经 scope 传入。
 
 import { load, type CheerioAPI } from 'cheerio';
+import type { AnyNode, Document } from 'domhandler';
 import { decodeHTML, decodeHTMLStrict } from 'entities';
 import {
   type ChainStage, type CompiledRules, type FieldIr, type JsonPathIr, type JsTemplatePart, MAX_REGEX_PATTERN_LENGTH, RuleEngineError,
   type RuleIr, type RegexSub, type SkippedField, type TemplatePart,
 } from './types';
 import { aioListCode } from './aio-syntax';
-import { type JsBindings, type JsListItem, type JsValue, runJs, runJsInit, runJsItems } from './js-sandbox';
+import {
+  type JsBindings, type JsListItem, type JsValue, runJs, runJsInit, runJsItems, runJsoup, runJsoupItems,
+} from './js-sandbox';
+import { isDocument, isJElement, type JElement } from './jsoup-dom';
+import { docApi, registerHtmlDoc } from './jsoup-shim';
 import { evalJsonPath, evalJsonPathList, isDefinitePath, parseJsonPath } from './jsonpath';
 import { defaultSyntaxSource } from './parse';
 import { evaluateXPath } from './xpath-eval';
@@ -137,9 +142,10 @@ export type EvalScope = HtmlScope | JsonScope;
 
 export type EvalResult = { kind: 'text'; value: string } | { kind: 'nodes'; nodes: CheerioNodes };
 
-/** 载入 HTML 建立文档级作用域。 */
+/** 载入 HTML 建立文档级作用域。文档登记给 jsoup 直连（jsoup1028）：只记原文与 cheerio 实例，首次 jsoup 访问才扫描。 */
 export function createHtmlScope(html: string, pageUrl: string): HtmlScope {
   const $ = load(html);
+  registerHtmlDoc($.root()[0] as unknown as Document, $, html);
   return { kind: 'html', $, nodes: $.root() as unknown as CheerioNodes, pageUrl };
 }
 
@@ -502,7 +508,12 @@ export function evaluateField(field: FieldIr, scope: EvalScope, multi = false): 
   if (scope.kind === 'json' && scope.object !== undefined) return objectFieldValue(field, scope.object);
   if (field.varGets && scope.host?.vars === undefined) return evalFailed('目录字段读详情页变量，但作用域没带变量袋');
   if (field.varPuts !== undefined) putVars(field.varPuts, scope);
-  if (field.chain) return chainToString(evaluateChain(field.chain, scope, false, multi, field.jsGets, field.jsUtil), multi);
+  if (field.chain) {
+    const value = field.jsoup
+      ? evaluateJsoupChain(field, field.chain, scope, false, multi)
+      : evaluateChain(field.chain, scope, false, multi, field.jsGets, field.jsUtil);
+    return chainToString(value, multi);
+  }
   if (field.joins !== undefined || field.concats !== undefined) {
     // T7 构件（&& 连接符 / %% 拼接）：M1 未实现，宁可失败也不要静默返回错的字符串。
     return evalFailed('M1 不支持 && / %% 组合规则（T7）');
@@ -717,7 +728,7 @@ export function evaluateFieldList(field: FieldIr, scope: EvalScope): EvalScope[]
 }
 
 function fieldListScopes(field: FieldIr, scope: EvalScope): EvalScope[] {
-  if (field.chain) return listChainScopes(field.chain, scope);
+  if (field.chain) return field.jsoup ? jsoupListScopes(field, field.chain, scope) : listChainScopes(field.chain, scope);
   const head = field.rules[0];
   if (head?.kind === 'regexList') return aioListScopes(head, scope);
   if (scope.kind === 'html') {
@@ -797,6 +808,57 @@ function listItemScope(item: JsListItem, pageJson: boolean, pageUrl: string): Ev
   const scope: EvalScope = pageJson ? jsonTextScope(item, pageUrl) : createHtmlScope(item, pageUrl);
   scope.source = item;
   return scope;
+}
+
+/**
+ * jsoup1028 列表链（FieldIr.jsoup）：形态同 listChainScopes，另收首段取节点的规则——legado getElements 得 Elements，作为 result
+ * 交给后面的 JS（只在 HTML 页上复现）；JS 段走 runJsoup/runJsoupItems，末段返回的 Element（含 Elements 的元素）各自成为条目。
+ */
+function jsoupListScopes(field: FieldIr, chain: readonly ChainStage[], scope: EvalScope): EvalScope[] {
+  const source = scope.source;
+  if (source === undefined) return evalFailed('列表 JS 需要页面原文，当前作用域没有');
+  const pageJson = scope.kind === 'json';
+  const getElements = jsoupGetElements(field, scope);
+  let value = source;
+  let elements: JElement[] | undefined;
+  for (let index = 0; index < chain.length; index += 1) {
+    const stage = chain[index];
+    const last = index === chain.length - 1;
+    if (stage.kind === 'rule' && index === 0 && !last) {
+      if (scope.kind !== 'html') return evalFailed('列表 JS 首段规则只在 HTML 页上复现');
+      const nodes = evaluateFieldNodes(stage.field, scope).toArray() as AnyNode[];
+      if (!nodes.every((node) => isJElement(node))) return evalFailed('列表 JS 首段规则命中了非元素节点');
+      elements = nodes as JElement[];
+      continue;
+    }
+    if (stage.kind === 'js') {
+      const bindings: JsBindings = { result: value, src: source, baseUrl: scope.pageUrl, jsoup: { result: elements, getElements } };
+      elements = undefined;
+      if (last) {
+        const items = runJsoupItems(stage.code, bindings);
+        return items === null ? [] : items.map((item) => (typeof item === 'object' && 'jsoupNode' in item
+          ? nodeItemScope(item.jsoupNode, pageJson, scope.pageUrl)
+          : listItemScope(item, pageJson, scope.pageUrl)));
+      }
+      const out = runJsoup(stage.code, bindings, chain[index + 1].kind === 'js' ? 'midjs' : 'mid');
+      if (out === null) return [];
+      if (Array.isArray(out)) return evalFailed('列表 JS 中间段返回了数组');
+      value = out;
+      continue;
+    }
+    if (stage.kind !== 'rule' || !last) return evalFailed('列表 JS 链形态异常');
+    const itemsJson = stage.mode === 'json' || ((stage.mode ?? 'default') === 'default' && pageJson);
+    if (itemsJson !== pageJson) return evalFailed('列表 JS 末段规则的模式与原页面不一致（legado 条目规则读不动）');
+    return evaluateFieldList(stage.field, pageJson ? jsonTextScope(value, scope.pageUrl) : createHtmlScope(value, scope.pageUrl));
+  }
+  return evalFailed('列表 JS 链形态异常');
+}
+
+/** 列表 JS 返回的 Element 条目（jsoup1028）：在它所在文档上收窄成条目作用域；JSON 页上 legado 条目规则按 Json 模式读不动。 */
+function nodeItemScope(node: JElement, pageJson: boolean, pageUrl: string): EvalScope {
+  if (pageJson) return evalFailed('列表 JS 在 JSON 页上返回了 Element（legado 条目规则读不动）');
+  const $ = docApi(node);
+  return { kind: 'html', $, nodes: $(node as never) as unknown as CheerioNodes, pageUrl };
 }
 
 function jsonTextScope(text: string, pageUrl: string): JsonScope {
@@ -975,7 +1037,9 @@ export function evaluateFieldStrings(field: FieldIr, scope: EvalScope): string[]
     const value = evaluateField(field, scope);
     return value === '' ? [] : [value];
   }
-  const value = evaluateChain(field.chain, scope, true, true, field.jsGets, field.jsUtil);
+  const value = field.jsoup
+    ? evaluateJsoupChain(field, field.chain, scope, true, true)
+    : evaluateChain(field.chain, scope, true, true, field.jsGets, field.jsUtil);
   if (value === null) return [];
   return (Array.isArray(value) ? value : value.split('\n')).map((item) => item.trim()).filter((item) => item !== '');
 }
@@ -1020,6 +1084,75 @@ function evaluateChain(
     else return evalFailed('JS 段返回数组后接 ## 替换（legado 按 List.toString 替换，不复现）');
   }
   return value ?? null;
+}
+
+/**
+ * jsoup1028 字符串链（FieldIr.jsoup，parse.ts jsoupFrame）：逐段口径同 evaluateChain，JS 段改走 runJsoup——作用域是 HTML 条目时
+ * （legado AnalyzeRule.content 是条目 Element）首段 result 与各段 src 都是该 Element；`java.getElement(s)` 在字段作用域上取节点。
+ * 段产出能否流出由下一段定（JsoupMode）：后接规则不许 Element、后接 JS 还不许 Java 字符串，末段/后接正则按 getString 口径转字符串。
+ * 条目 Element 接正则段或含 {{}} 的 JS 段（legado 按 toString 口径，不复现）求值失败。
+ */
+function evaluateJsoupChain(field: FieldIr, chain: readonly ChainStage[], scope: EvalScope, list: boolean, multi: boolean): JsValue | null {
+  const item = scope.source === undefined ? jsoupItem(scope) : undefined;
+  const getElements = jsoupGetElements(field, scope);
+  let value: JsValue | undefined; // undefined = 还在首段
+  for (let index = 0; index < chain.length; index += 1) {
+    const stage = chain[index];
+    if (stage.kind === 'rule') {
+      const stageScope = value === undefined ? scope : rescope(joinLines(value), scope);
+      value = list ? splitLines(evaluateField(stage.field, stageScope, true)) : evaluateField(stage.field, stageScope, multi);
+      continue;
+    }
+    const element = value === undefined ? item : undefined;
+    const input = value ?? scope.source ?? (element !== undefined || (stage.kind === 'js' && stage.detached) ? '' : undefined);
+    if (input === undefined) return evalFailed('JS 链首段需要页面原文，当前作用域没有');
+    if (stage.kind === 'js' && stage.template) return evalFailed('jsoup 直连的 JS 段含 {{}}');
+    if (stage.kind === 'regex') {
+      if (element !== undefined) return evalFailed('条目 Element 接正则段（legado 按 Element.toString 替换，不复现）');
+      value = Array.isArray(input) && list
+        ? input.map((entry) => applyRegexSubs(entry, stage.regex))
+        : applyRegexSubs(joinLines(input), stage.regex);
+      continue;
+    }
+    const { code, regex } = makeUpJs(stage, input, scope, field.jsGets, field.jsUtil);
+    const next = chain[index + 1];
+    const mode = regex !== undefined || next === undefined || next.kind === 'regex' ? 'final' : next.kind === 'rule' ? 'mid' : 'midjs';
+    const bindings: JsBindings = {
+      result: input, src: scope.source, baseUrl: scope.pageUrl, ...jsBindings(scope, field.jsGets, field.jsUtil),
+      jsoup: { result: element, src: item, getElements },
+    };
+    const out = runJsoup(code, bindings, mode, code);
+    if (out === null) return null;
+    if (regex === undefined) value = out;
+    else if (!Array.isArray(out)) value = applyRegexSubs(out, [regex]);
+    else if (list) value = out.map((entry) => applyRegexSubs(entry, [regex]));
+    else return evalFailed('JS 段返回数组后接 ## 替换（legado 按 List.toString 替换，不复现）');
+  }
+  return value ?? null;
+}
+
+/** 作用域是 HTML 条目（单个 Element，非整页、非 init 结果）时的该 Element（jsoup1028）。 */
+function jsoupItem(scope: EvalScope): JElement | undefined {
+  if (scope.kind !== 'html' || scope.contentText !== undefined || scope.nodes.length !== 1) return undefined;
+  const node = scope.nodes[0] as AnyNode;
+  return isJElement(node) && !isDocument(node) ? node : undefined;
+}
+
+/**
+ * `java.getElement(s)("规则")` 的宿主回调（jsoup1028）：只认编译期白名单（FieldIr.jsElements），在字段作用域上取节点
+ * （legado getElements 的 content 是整页或条目，不随链上一段结果变）。非 HTML 作用域（JSON 页、init 结果）求值失败。
+ */
+function jsoupGetElements(field: FieldIr, scope: EvalScope): ((rule: string) => readonly JElement[]) | undefined {
+  const elements = field.jsElements;
+  if (elements === undefined) return undefined;
+  return (rule) => {
+    const sub = elements.get(rule);
+    if (sub === undefined) return evalFailed('java.getElements 的实参不在编译期白名单里');
+    if (scope.kind !== 'html' || scope.contentText !== undefined) return evalFailed('java.getElements 只在 HTML 作用域上复现');
+    const nodes = evaluateFieldNodes(sub, scope).toArray() as AnyNode[];
+    if (!nodes.every((node) => isJElement(node))) return evalFailed('java.getElements 命中了非元素节点');
+    return nodes as JElement[];
+  };
 }
 
 /** makeUp 后代码的长度上限（jsext1028）：占位可能拼进整页文本，超出即失败。 */

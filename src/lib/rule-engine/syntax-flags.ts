@@ -23,13 +23,13 @@ export const ENGINE_SEMANTICS_XPATH_BIT = 2;
 /** vars1027：@put/@get 静态子集语义位。版本再 +4（5–8 = 含变量位的四种组合），1–4 逐字不变。 */
 export const ENGINE_SEMANTICS_VARS_BIT = 4;
 
-/** 语义版本随 || / XPath / 变量 / JS / XPath 求值 / 正则 / && / AllInOne / 搜索 JS / 列表 JS / JS 扩展 / 宿主绑定 / java.getString / 加解密帮手 / JSONPath 扩展 / 详情 init / 搜索选项 legado 口径 / URL 字段选项 / 搜索 webView / 详情 JS init / 详情→目录变量袋开关联动（唯一口径，供 compile.ts 缓存键与 rulesHash 复用）。 */
+/** 语义版本随 || / XPath / 变量 / JS / XPath 求值 / 正则 / && / AllInOne / 搜索 JS / 列表 JS / JS 扩展 / 宿主绑定 / java.getString / 加解密帮手 / JSONPath 扩展 / 详情 init / 搜索选项 legado 口径 / URL 字段选项 / 搜索 webView / 详情 JS init / 详情→目录变量袋 / jsoup 直连开关联动（唯一口径，供 compile.ts 缓存键与 rulesHash 复用）。 */
 export function engineSemanticsVersion(
   orEnabled: boolean, xpathEnabled = false, varsEnabled = false, jsEnabled = false, xpathEvalEnabled = false,
   regexEnabled = false, andEnabled = false, aioEnabled = false, searchJsEnabled = false, listJsEnabled = false,
   jsExtEnabled = false, jsBindEnabled = false, jsGetEnabled = false, jsUtilEnabled = false, jsonPathEnabled = false,
   initEnabled = false, searchOptionsEnabled = false, urlOptionsEnabled = false, searchWebViewEnabled = false, initJsEnabled = false,
-  varBagEnabled = false,
+  varBagEnabled = false, jsoupEnabled = false,
 ): number {
   return (orEnabled ? ENGINE_SEMANTICS_VERSION_OR : ENGINE_SEMANTICS_VERSION)
     + (xpathEnabled ? ENGINE_SEMANTICS_XPATH_BIT : 0) + (varsEnabled ? ENGINE_SEMANTICS_VARS_BIT : 0)
@@ -41,7 +41,8 @@ export function engineSemanticsVersion(
     + (jsUtilEnabled ? ENGINE_SEMANTICS_JS_UTIL_BIT : 0) + (jsonPathEnabled ? ENGINE_SEMANTICS_JSON_PATH_BIT : 0)
     + (initEnabled ? ENGINE_SEMANTICS_INIT_BIT : 0) + (searchOptionsEnabled ? ENGINE_SEMANTICS_SEARCH_OPTIONS_BIT : 0)
     + (urlOptionsEnabled ? ENGINE_SEMANTICS_URL_OPTIONS_BIT : 0) + (searchWebViewEnabled ? ENGINE_SEMANTICS_SEARCH_WEBVIEW_BIT : 0)
-    + (initJsEnabled ? ENGINE_SEMANTICS_INIT_JS_BIT : 0) + (varBagEnabled ? ENGINE_SEMANTICS_VAR_BAG_BIT : 0);
+    + (initJsEnabled ? ENGINE_SEMANTICS_INIT_JS_BIT : 0) + (varBagEnabled ? ENGINE_SEMANTICS_VAR_BAG_BIT : 0)
+    + (jsoupEnabled ? ENGINE_SEMANTICS_JSOUP_BIT : 0);
 }
 
 /**
@@ -383,5 +384,23 @@ export const ENGINE_SEMANTICS_VAR_BAG_BIT = 2097152;
  */
 export function engineSyntaxVarsBagEnabled(env: OrEnv = process.env): boolean {
   const raw = env.ENGINE_SYNTAX_VARS_BAG?.trim().toLowerCase();
+  return raw === '1' || raw === 'true' || raw === 'on';
+}
+
+/**
+ * jsoup1028：JS 段里直连 jsoup DOM 语义位。版本再 +4194304（1–2097152 逐字不变）。
+ * 只对 off 态被拒、on 态编译通过的字段所在源计入（compile.ts sourceUsesJsoupSyntax）。
+ */
+export const ENGINE_SEMANTICS_JSOUP_BIT = 4194304;
+
+/**
+ * ENGINE_SYNTAX_JSOUP 独立开关（jsoup1028，默认 off，口径同 ENGINE_SYNTAX_OR；须 ENGINE_SYNTAX_JS 同开才生效）。
+ * on = 字符串/列表字段的 JS 链里放行 jsoup DOM 直连：`java.getElement(s)` 取 Elements、`org.jsoup.Jsoup.parse` 建文档，
+ * Element/Elements 的 text/ownText/outerHtml/html/attr/select/selectFirst/size/get/toArray… 与条目级 `result`
+ * 是 Element 的用法（jsoup-shim.ts 按 jsoup 1.16.2 语义实现）。选择器只收 QueryParser 的常规子集，
+ * 正则类伪类、绝对 URL 属性、svg/math/template 序列化等口径不定的形态一律求值失败。off = 逐字不变。
+ */
+export function engineSyntaxJsoupEnabled(env: OrEnv = process.env): boolean {
+  const raw = env.ENGINE_SYNTAX_JSOUP?.trim().toLowerCase();
   return raw === '1' || raw === 'true' || raw === 'on';
 }

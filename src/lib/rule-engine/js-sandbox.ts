@@ -12,6 +12,11 @@
 import { createHash } from 'node:crypto';
 import type { QuickJSContext, QuickJSHandle, QuickJSSyncVariant, QuickJSWASMModule } from 'quickjs-emscripten-core';
 import { symmetricCrypt, toNumChapter, type SymOp } from './js-util';
+import type { JElement } from './jsoup-dom';
+import {
+  decodeJsoupItems, decodeJsoupValue, exportJsoup, installJsoupHost, JSOUP_PRELUDE, type JsoupListItem, type JsoupMode,
+  JsoupSession,
+} from './jsoup-shim';
 import { RuleEngineError } from './types';
 
 const WASM_INITIAL_PAGES = 256; // 16MB
@@ -69,6 +74,15 @@ export interface JsBindings {
    * 其余求值的沙箱逐字不变。帮手失败与回调一样致命。
    */
   utilHelpers?: boolean;
+  /**
+   * jsoup1028 直连 DOM（只经 runJsoup/runJsoupItems 生效）：`result`/`src` 换成 Element/Elements 包装（缺省用上面的字符串），
+   * `getElements` 是 `java.getElement(s)("规则")` 的取节点回调（编译期白名单里的规则）。
+   */
+  jsoup?: {
+    readonly result?: JElement | readonly JElement[];
+    readonly src?: JElement;
+    readonly getElements?: (rule: string) => readonly JElement[];
+  };
 }
 
 let ready: QuickJSWASMModule | undefined;
@@ -285,10 +299,25 @@ export function runJsInit(code: string, bindings: JsBindings, budgetKey = code):
   return execute(code, bindings, exportInitValue, budgetKey) ?? evalFailed('init JS 返回了 null/undefined（legado setContent(null)）');
 }
 
+/**
+ * jsoup1028 字符串链的 JS 段：沙箱里装 jsoup 包装（jsoup-shim.ts）。`mode` 决定 Element/Java 字符串能否流出本段：
+ * final（末段/后接正则）按 legado getString 口径转字符串；mid（后接规则）与 midjs（后接 JS）遇 Element 失败，midjs 遇 Java 字符串也失败。
+ */
+export function runJsoup(code: string, bindings: JsBindings, mode: JsoupMode, budgetKey = code): JsValue | null {
+  const session = new JsoupSession(bindings.jsoup?.getElements);
+  return execute(code, bindings, (context, handle) => decodeJsoupValue(exportJsoup(context, handle, session, mode)), budgetKey, session);
+}
+
+/** jsoup1028 列表字段末段 JS：Elements 与数组里的 Element 逐个成为条目，其余口径同 runJsItems。 */
+export function runJsoupItems(code: string, bindings: JsBindings): JsoupListItem[] | null {
+  const session = new JsoupSession(bindings.jsoup?.getElements);
+  return execute(code, bindings, (context, handle) => decodeJsoupItems(exportJsoup(context, handle, session, 'items'), session), code, session);
+}
+
 /** `budgetKey`：按哪段代码记预算（jsext1028 makeUp 后的代码随占位值变，按段原文记，免得每次换键绕过单段预算）。 */
 function execute<T>(
   code: string, bindings: JsBindings, exporter: (context: QuickJSContext, handle: QuickJSHandle) => T | null,
-  budgetKey = code,
+  budgetKey = code, session?: JsoupSession,
 ): T | null {
   const module = ready;
   if (!module) return evalFailed('JS 沙箱未就绪');
@@ -305,7 +334,7 @@ function execute<T>(
   const startedPrecise = performance.now();
   checkBudget(budgetKey, started);
   try {
-    return runInFreshRuntime(module, code, bindings, started + EVAL_DEADLINE_MS, exporter);
+    return runInFreshRuntime(module, code, bindings, started + EVAL_DEADLINE_MS, exporter, session);
   } catch (error) {
     if (error instanceof RuleEngineError) throw error;
     discardModule();
@@ -317,7 +346,7 @@ function execute<T>(
 
 function runInFreshRuntime<T>(
   module: QuickJSWASMModule, code: string, bindings: JsBindings, deadline: number,
-  exporter: (context: QuickJSContext, handle: QuickJSHandle) => T | null,
+  exporter: (context: QuickJSContext, handle: QuickJSHandle) => T | null, session?: JsoupSession,
 ): T | null {
   const runtime = module.newRuntime();
   try {
@@ -327,7 +356,10 @@ function runInFreshRuntime<T>(
     const context = runtime.newContext();
     try {
       const host = installGlobals(context, bindings);
-      const prelude = context.evalCode(bindings.utilHelpers ? UTIL_PRELUDE + PRELUDE : PRELUDE, 'prelude.js');
+      if (session) installJsoupHost(context, session, host, bindings.jsoup);
+      const prelude = context.evalCode(session
+        ? (bindings.utilHelpers ? UTIL_PRELUDE : '') + JSOUP_PRELUDE + PRELUDE
+        : bindings.utilHelpers ? UTIL_PRELUDE + PRELUDE : PRELUDE, 'prelude.js');
       if (prelude.error) {
         prelude.error.dispose();
         return evalFailed('JS 沙箱初始化失败');
