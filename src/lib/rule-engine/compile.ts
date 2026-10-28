@@ -19,6 +19,7 @@ import {
   engineSyntaxOrEnabled, engineSyntaxRegexEnabled, engineSyntaxVarsEnabled, engineSyntaxXPathEnabled, engineSyntaxXPathEvalEnabled, engineUrlOptionsEnabled,
   engineSearchWebViewEnabled, engineSyntaxInitJsEnabled, engineSyntaxJsoupEnabled, engineSyntaxVarsBagEnabled,
   engineSyntaxBookFieldsEnabled, engineSyntaxSearchVarsEnabled, engineSyntaxItemVarsEnabled, engineSyntaxListGetEnabled, ENGINE_SEMANTICS_VERSION,
+  engineSyntaxBookVariableEnabled,
 } from './syntax-flags';
 import { urlOptionFields } from './url-options';
 import {
@@ -52,6 +53,8 @@ export interface CompileOptions extends ParseOptions {
   /** itemvars1028：搜索条目袋（ENGINE_SYNTAX_ITEM_VARS，默认读 env；须搜索袋同生效）。 */
   itemVarsEnabled?: boolean;
   // listGetEnabled（listget1028，ENGINE_SYNTAX_LIST_GET）见 ParseOptions；compile 层另要求 JS 链对该源生效、列表 JS 与 getter 同开。
+  /** bookvar1028：`book.getVariable`（ENGINE_SYNTAX_BOOK_VARIABLE，默认读 env；须 jsoup 与书籍成员同生效，源级键集见 sourceBookVariablePuts）。 */
+  bookVariableEnabled?: boolean;
 }
 
 /** 版本化缓存键（P0 口径）：semanticsVersion:contentRevision。 */
@@ -90,6 +93,8 @@ export function engineVersionedKey(contentRevision: string, semanticsVersion = E
  * itemvars1028：搜索袋各条件与 ENGINE_SYNTAX_ITEM_VARS 都生效且条目袋对该源真生效（compileItemVars 非 null）时再加条目袋位（+33554432）。
  * listget1028：ENGINE_SYNTAX_LIST_GET on、JS 链对该源生效、列表 JS 与 getter 同开且有列表字段 off 态被拒、on 态编译通过
  * （sourceUsesListGetSyntax）时再加列表 getter 位（+67108864）。其余位的探测不传本开关（读 env，与 compileSource 同口径）。
+ * bookvar1028：ENGINE_SYNTAX_BOOK_VARIABLE on、jsoup 与书籍成员对该源生效且有字段 off 态被拒、on 态编译通过
+ * （sourceUsesBookVariableSyntax）时再加书籍变量位（+134217728）。其余位的探测不传源级键集（同 listget1028 口径）。
  */
 export function engineSourceRevision(
   source: { url: string; searchUrl: unknown; rules: Record<string, unknown> },
@@ -126,6 +131,7 @@ export function engineSourceRevision(
   const searchVars = varsEnabled && searchJsEnabled && (options.searchVarsEnabled ?? engineSyntaxSearchVarsEnabled());
   const itemVars = searchVars && (options.itemVarsEnabled ?? engineSyntaxItemVarsEnabled());
   const listGet = jsGet && listJsEnabled && (options.listGetEnabled ?? engineSyntaxListGetEnabled());
+  const bookVariable = jsoup && book && (options.bookVariableEnabled ?? engineSyntaxBookVariableEnabled());
   // jsoup1028：其余各位先按 jsoup 关判（与旧口径逐字相同），jsoup 开时再补判一次取并集——jsoup 重试能救活
   // 某开关的 off 态（如条目首段 JS 以 Element 起链），只按 jsoup 开判会把该位清掉、在池源 identity 白翻。
   // book1028 同理：书籍成员重试也能救活别的开关的 off 态，book 开时再按 book 开（jsoup 两态）补判。
@@ -209,6 +215,10 @@ export function engineSourceRevision(
       orEnabled, varsEnabled, xpathEnabled, xpathEvalEnabled: xpathEval, regexEnabled, andEnabled, aioEnabled, jsExtEnabled,
       jsBindEnabled: jsBind, jsUtilEnabled: jsUtil, jsonPathEnabled, jsoupEnabled: j, bookFieldsEnabled: b,
     })),
+    bookVariable && sourceUsesBookVariableSyntax(source, {
+      orEnabled, varsEnabled, xpathEnabled, xpathEvalEnabled: xpathEval, regexEnabled, andEnabled, aioEnabled, listJsEnabled, jsExtEnabled,
+      jsGetEnabled: jsGet, jsUtilEnabled: jsUtil, jsonPathEnabled, initJsEnabled, listGetEnabled: listGet,
+    }),
   ));
 }
 
@@ -922,6 +932,117 @@ export function sourceUsesBookSyntax(
   return uses;
 }
 
+const bookVariablePutsMemo = new WeakMap<object, { searchUrl: unknown; puts: ReadonlySet<string> | null }>();
+
+/** 放变量的调用：AnalyzeRule.put（有 book 时落 book.putVariable）、put(Big)Variable 与 putCustomVariable（键恒为 custom）。 */
+const BOOK_VARIABLE_PUT_RE = /(?<![\w$])(java\s*\.\s*put|put(?:Big)?Variable|putCustomVariable)\s*\(\s*("[^"\\\n]*"|'[^'\\\n]*')?/g;
+/**
+ * 绕过上面字面量扫描的写法：`java` 被当值用（取别名、传参）、下标取 put、直接写 variable/variableMap、整包 setVariable
+ * （`source.setVariable` 写的是源变量，不算）、eval/Function 拼代码。
+ */
+const BOOK_VARIABLE_OPAQUE_RE = /(?<![\w$.])java(?![\w$])(?!\s*\.)|\[\s*["'`]\s*put|\bvariableMap\b|\.\s*variable\s*=(?!=)|(?<!\bsource\s*\.\s*)\bsetVariable\b|(?<![\w$.])(?:eval|Function)\s*\(/;
+
+/**
+ * bookvar1028：源内会往 legado 书籍变量里放的键（`@put:{}` 的键按 `键:` 宁宽地收）。扫搜索地址与规则对象里的全部字符串（含 jsLib、
+ * 发现、登录等——legado 跑到它们时同样能放，搜索时放进 SearchBook 的变量随 toBook 带进书架）。键不是不含转义的字面量、
+ * `@put:` 后不是一层 `{}`、或命中 BOOK_VARIABLE_OPAQUE_RE 时返回 null（整源不放行 book.getVariable）。宁严勿漏。
+ */
+export function sourceBookVariablePuts(source: { searchUrl: unknown; rules: Record<string, unknown> }): ReadonlySet<string> | null {
+  const hit = bookVariablePutsMemo.get(source.rules);
+  if (hit && hit.searchUrl === source.searchUrl) return hit.puts;
+  const texts: string[] = [];
+  const walk = (value: unknown) => {
+    if (typeof value === 'string') texts.push(value);
+    else if (value && typeof value === 'object') for (const item of Object.values(value)) walk(item);
+  };
+  walk(source.searchUrl);
+  walk(source.rules);
+  let puts: Set<string> | null = new Set();
+  scan: for (const text of texts) {
+    if (BOOK_VARIABLE_OPAQUE_RE.test(text)) {
+      puts = null;
+      break;
+    }
+    for (const match of text.matchAll(BOOK_VARIABLE_PUT_RE)) {
+      if (match[1] === 'putCustomVariable') puts.add('custom');
+      else if (match[2] === undefined) {
+        puts = null;
+        break scan;
+      } else puts.add(match[2].slice(1, -1));
+    }
+    for (const match of text.matchAll(/@put:\s*(\{[^{}]*\})?/gi)) {
+      if (match[1] === undefined) {
+        puts = null;
+        break scan;
+      }
+      for (const key of match[1].matchAll(/["']?([^"'{},:\s]+)["']?\s*:/g)) puts.add(key[1]);
+    }
+  }
+  bookVariablePutsMemo.set(source.rules, { searchUrl: source.searchUrl, puts });
+  return puts;
+}
+
+const bookVariableMemo = new WeakMap<object, Map<string, boolean>>();
+
+/**
+ * 源是否会因 ENGINE_SYNTAX_BOOK_VARIABLE 改变编译结果（bookvar1028）：on 态只在 jsoup + 书籍成员重试帧里多放行 book.getVariable，
+ * 所以对含 `getVariable` 的字段按两态（JS、宿主绑定、jsoup、书籍成员开，其余开关同 compileSource）各编译一次，有字段 off 拒、
+ * on 过即算。调用方须确认 jsoup 与书籍成员对该源生效；源级扫描（sourceBookVariablePuts）为 null 时恒 false。
+ */
+export function sourceUsesBookVariableSyntax(
+  source: { searchUrl: unknown; rules: Record<string, unknown> },
+  options: {
+    orEnabled: boolean; varsEnabled: boolean; xpathEnabled: boolean; xpathEvalEnabled: boolean; regexEnabled: boolean; andEnabled: boolean;
+    aioEnabled: boolean; listJsEnabled: boolean; jsExtEnabled: boolean; jsGetEnabled: boolean; jsUtilEnabled: boolean; jsonPathEnabled: boolean;
+    initJsEnabled: boolean; listGetEnabled: boolean;
+  },
+): boolean {
+  const rules = source.rules;
+  if (sourceHasJsLib(rules) || sourceCanReName(rules) || !someRule(rules, (rule) => rule.includes('getVariable'))) return false;
+  const puts = sourceBookVariablePuts(source);
+  if (puts === null) return false;
+  const memoKey = `${options.orEnabled}:${options.varsEnabled}:${options.xpathEnabled}:${options.xpathEvalEnabled}:${options.regexEnabled}:${options.andEnabled}:${options.aioEnabled}:${options.listJsEnabled}:${options.jsExtEnabled}:${options.jsGetEnabled}:${options.jsUtilEnabled}:${options.jsonPathEnabled}:${options.initJsEnabled}:${options.listGetEnabled}`;
+  let memo = bookVariableMemo.get(rules);
+  const hit = memo?.get(memoKey);
+  if (hit !== undefined) return hit;
+  const sourceRules = options.varsEnabled ? resolveSourceVars(rules) : rules;
+  const aio = options.aioEnabled ? aioGroups(sourceRules) : new Set<string>();
+  const listJs = options.listJsEnabled ? listJsGroups(sourceRules) : new Set<string>();
+  let uses = false;
+  for (const group of RULE_GROUPS) {
+    const fields = sourceRules[group];
+    if (uses || !fields || typeof fields !== 'object' || Array.isArray(fields)) continue;
+    for (const [field, rule] of Object.entries(fields as Record<string, unknown>)) {
+      if (typeof rule !== 'string' || !rule.includes('getVariable')) continue;
+      const parse = (bookVariablePuts: ReadonlySet<string> | undefined) => parseFieldRule(rule, {
+        orEnabled: options.orEnabled, xpathEnabled: options.xpathEnabled, xpathEvalEnabled: options.xpathEvalEnabled, jsEnabled: true,
+        regexEnabled: options.regexEnabled, andEnabled: options.andEnabled, aioEnabled: options.aioEnabled, aioGroup: aio.has(group),
+        listJsEnabled: options.listJsEnabled, listJsGroup: listJs.has(group), jsExtEnabled: options.jsExtEnabled, jsBindEnabled: true,
+        jsGetEnabled: options.jsGetEnabled, jsUtilEnabled: options.jsUtilEnabled, jsonPathEnabled: options.jsonPathEnabled,
+        initJsEnabled: options.initJsEnabled, jsoupEnabled: true, bookFieldsEnabled: true, listGetEnabled: options.listGetEnabled,
+        bookVariablePuts, field: `${group}.${field}`,
+      });
+      try {
+        parse(puts);
+      } catch {
+        continue; // on 态也编译不过：两态都 skipped
+      }
+      try {
+        parse(undefined);
+      } catch {
+        uses = true;
+        break;
+      }
+    }
+  }
+  if (!memo) {
+    memo = new Map();
+    bookVariableMemo.set(rules, memo);
+  }
+  memo.set(memoKey, uses);
+  return uses;
+}
+
 const jsonPathMemo = new WeakMap<object, Map<string, boolean>>();
 
 /** 可能受 jsonpath1028 影响的规则：含 `$` 且出现 `.[` 或 `[?`。宁宽勿漏，实编译再判。 */
@@ -1424,10 +1545,13 @@ export function compileSource(
   const searchVarsEnabled = varsEnabled && searchJsEnabled && (options.searchVarsEnabled ?? engineSyntaxSearchVarsEnabled());
   const itemVarsEnabled = searchVarsEnabled && (options.itemVarsEnabled ?? engineSyntaxItemVarsEnabled());
   const listGetEnabled = jsEnabled && listJsEnabled && jsGetEnabled && (options.listGetEnabled ?? engineSyntaxListGetEnabled());
+  const bookVariableEnabled = jsoupEnabled && bookFieldsEnabled && (options.bookVariableEnabled ?? engineSyntaxBookVariableEnabled());
+  // bookvar1028：源级键集为 null（有动态键的放变量写法等）时整源不放行。
+  const bookVariablePuts = bookVariableEnabled ? sourceBookVariablePuts(source) ?? undefined : undefined;
   const key = engineSourceRevision(source, {
     orEnabled, xpathEnabled, varsEnabled, jsEnabled, xpathEvalEnabled, regexEnabled, andEnabled, aioEnabled, listJsEnabled, jsExtEnabled,
     jsBindEnabled, jsGetEnabled, jsUtilEnabled, jsonPathEnabled, initEnabled, urlOptionsEnabled, initJsEnabled, varBagEnabled, jsoupEnabled,
-    bookFieldsEnabled, searchJsEnabled, searchVarsEnabled, itemVarsEnabled, listGetEnabled,
+    bookFieldsEnabled, searchJsEnabled, searchVarsEnabled, itemVarsEnabled, listGetEnabled, bookVariableEnabled,
   });
   const hit = cache.get(key);
   if (hit) {
@@ -1450,7 +1574,7 @@ export function compileSource(
         compiled.set(name, parseFieldRule(rule, {
           orEnabled, xpathEnabled, xpathEvalEnabled, jsEnabled, regexEnabled, andEnabled, aioEnabled, aioGroup: aio.has(group),
           listJsEnabled, listJsGroup: listJs.has(group), jsExtEnabled, jsBindEnabled, jsGetEnabled, jsUtilEnabled, jsonPathEnabled, initJsEnabled,
-          jsoupEnabled, bookFieldsEnabled, listGetEnabled, field: name,
+          jsoupEnabled, bookFieldsEnabled, listGetEnabled, bookVariablePuts, field: name,
         }));
       } catch {
         compiled.set(name, { skipped: 'unsupported' });

@@ -864,6 +864,7 @@ function jsoupListScopes(field: FieldIr, chain: readonly ChainStage[], scope: Ev
   const pageJson = scope.kind === 'json';
   const getElements = jsoupGetElements(field, scope);
   const book = listBookBindings(field, scope);
+  const bookVariables = field.bookVars !== undefined;
   let value = source;
   let elements: JElement[] | undefined;
   for (let index = 0; index < chain.length; index += 1) {
@@ -877,7 +878,9 @@ function jsoupListScopes(field: FieldIr, chain: readonly ChainStage[], scope: Ev
       continue;
     }
     if (stage.kind === 'js') {
-      const bindings: JsBindings = { result: value, src: source, baseUrl: scope.pageUrl, jsoup: { result: elements, getElements }, ...book };
+      const bindings: JsBindings = {
+        result: value, src: source, baseUrl: scope.pageUrl, jsoup: { result: elements, getElements, bookVariables }, ...book,
+      };
       elements = undefined;
       if (last) {
         const items = runJsoupItems(stage.code, bindings);
@@ -1197,7 +1200,7 @@ function evaluateJsoupChain(field: FieldIr, chain: readonly ChainStage[], scope:
     const mode = regex !== undefined || next === undefined || next.kind === 'regex' ? 'final' : next.kind === 'rule' ? 'mid' : 'midjs';
     const bindings: JsBindings = {
       result: input, src: scope.source, baseUrl: scope.pageUrl, ...jsBindings(scope, field.jsGets, field.jsUtil),
-      jsoup: { result: element, src: item, getElements },
+      jsoup: { result: element, src: item, getElements, bookVariables: field.bookVars !== undefined },
     };
     const out = runJsoup(code, bindings, mode, code);
     if (out === null) return null;

@@ -49,6 +49,8 @@ export interface JsoupInit {
   readonly result?: JElement | readonly JElement[];
   /** JS 的 `src`：条目级是该 Element。缺省 = 用普通绑定。 */
   readonly src?: JElement;
+  /** bookvar1028：沙箱 `book` 带 `getVariable`（得 Java 空串；字段挂了 FieldIr.bookVars 才给）。缺 `book` 时补一个空对象。 */
+  readonly bookVariables?: boolean;
 }
 
 export class JsoupSession {
@@ -230,6 +232,7 @@ export function installJsoupHost(
     context.setProp(api, key, handle);
     handle.dispose();
   }
+  if (init?.bookVariables) context.setProp(api, 'bv', context.true);
   context.setProp(context.global, '__jsoup', api);
   api.dispose();
 }
@@ -241,7 +244,7 @@ export function installJsoupHost(
 export const JSOUP_PRELUDE = `(function(){
   var J = globalThis.__jsoup, j = globalThis.java;
   delete globalThis.__jsoup;
-  var call = J.call, bad = J.bad, initR = J.r, initS = J.s;
+  var call = J.call, bad = J.bad, initR = J.r, initS = J.s, bookVars = J.bv === true;
   var P = Proxy, S = String, N = Number, OC = Object.create, freeze = Object.freeze, defProp = Object.defineProperty;
   var getProto = Object.getPrototypeOf, ownDesc = Object.getOwnPropertyDescriptor, ownNames = Object.getOwnPropertyNames;
   var stringify = JSON.stringify, RA = Reflect.apply, RG = Reflect.get, RH = Reflect.has, isArr = Array.isArray;
@@ -675,6 +678,16 @@ export const JSOUP_PRELUDE = `(function(){
   function initVal(spec) { var rest = slice(spec, 2); return slice(spec, 0, 1) === 'E' ? E(rest) : L(idList(rest)); }
   if (initR !== '') globalThis.result = initVal(initR);
   if (initS !== '') globalThis.src = initVal(initS);
+  // bookvar1028：编译期已核键是字面量、源内没有往书籍变量放它的写法，legado BaseBook.getVariable 落空得 ""（Java String）。
+  if (bookVars) {
+    var bk = globalThis.book;
+    if (typeof bk !== 'object' || bk === null) { bk = {}; globalThis.book = bk; }
+    bk.getVariable = function getVariable(key){
+      arity(arguments.length, 1, 1, 'book.getVariable');
+      sArg(key, 'book.getVariable');
+      return JS('');
+    };
+  }
 
   // ---- 导出（宿主调用；只用上面捕获的内建）
   function expStr(v) { return stringify({ s: v }); }

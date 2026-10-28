@@ -60,8 +60,9 @@ let jsoupFrame: { elements: Map<string, FieldIr>; options: ParseOptions } | unde
 /**
  * 当前 parseFieldRule 帧的书籍成员重试（book1028，ParseOptions.bookFieldsEnabled）：off 态口径编译被拒的字段才在这一帧里重编，
  * 帧内 `book` 另放行 `members`（字段所在阶段 legado 已求出的成员，见 bookStageMembers），读到的成员记进 `used`。嵌套解析不继承。
+ * bookvar1028：`puts` 给出时（只在 jsoup 同开的一次重试里）另放行字面量键不在集内的 `book.getVariable("键")`，键记进 `vars`。
  */
-let bookFrame: { members: ReadonlySet<string>; used: Set<string> } | undefined;
+let bookFrame: { members: ReadonlySet<string>; used: Set<string>; puts?: ReadonlySet<string>; vars: Set<string> } | undefined;
 
 /** 变量袋编译模式：`put` = JS 里放行字面量键的 `java.put`；`get` = 放行 `java.get('键')` 与规则级 makeUp 的 `@get:{键}`。键记进 keys。 */
 export interface VarBagParse {
@@ -629,6 +630,12 @@ export interface ParseOptions {
    * 传 false。默认读 env（缺失=off）。
    */
   bookFieldsEnabled?: boolean;
+  /**
+   * `book.getVariable("键")`（ENGINE_SYNTAX_BOOK_VARIABLE，bookvar1028）：compile.ts 按源扫出的「会被放进书籍变量的键」
+   * （sourceBookVariablePuts）。给出时 jsoup + 书籍成员同开的重试帧里放行字面量键的调用（键在集内的照旧拒），用到的键标
+   * FieldIr.bookVars；缺省 = 不放行（开关 off、依赖开关未生效或源内有动态键的放变量写法）。
+   */
+  bookVariablePuts?: ReadonlySet<string>;
 }
 
 export function parseFieldRule(rule: string, options: ParseOptions = {}): FieldIr {
@@ -660,7 +667,8 @@ export function parseFieldRule(rule: string, options: ParseOptions = {}): FieldI
     for (const attempt of attempts) {
       restoreBag();
       const frame = attempt.jsoup ? { elements: new Map<string, FieldIr>(), options: jsSegmentOptions(options) } : undefined;
-      const book = attempt.book && members ? { members, used: new Set<string>() } : undefined;
+      const puts = attempt.jsoup ? options.bookVariablePuts : undefined;
+      const book = attempt.book && members ? { members, used: new Set<string>(), puts, vars: new Set<string>() } : undefined;
       jsoupFrame = frame;
       bookFrame = book;
       let field: FieldIr;
@@ -669,13 +677,14 @@ export function parseFieldRule(rule: string, options: ParseOptions = {}): FieldI
       } catch {
         continue;
       }
-      // 帧内只读到 book.origin（chapterName/列表 JS 因帧换绑才过）不算 book1028 增量，照旧拒。
-      if (book && book.used.size === 0) continue;
+      // 帧内只读到 book.origin（chapterName/列表 JS 因帧换绑才过）不算 book1028 增量，照旧拒；只读书籍变量的（bookvar1028）不标成员。
+      if (book && book.used.size === 0 && book.vars.size === 0) continue;
       if (frame) {
         field.jsoup = true;
         if (frame.elements.size > 0) field.jsElements = frame.elements;
       }
-      if (book) field.bookMembers = [...book.used].sort();
+      if (book && book.used.size > 0) field.bookMembers = [...book.used].sort();
+      if (book && book.vars.size > 0) field.bookVars = [...book.vars].sort();
       return field;
     }
     restoreBag();
@@ -1291,7 +1300,8 @@ function checkJsCode(
   // legado 在求值前对 JS 文本做 {{}}/@get/## 改写（SourceRule 构造与 makeUpRule），这里不模拟那几步。
   if (code.includes('##') || code.includes('{{') || /@(?:get|put):/i.test(code)) reject('含 ##/{{}}/@get/@put');
   const frame = jsoupFrame;
-  const collected = gets ? collectJavaGets(code, rule, gets) : code;
+  const got = gets ? collectJavaGets(code, rule, gets) : code;
+  const collected = frame && bookFrame?.puts && binds?.has('book') ? collectBookVariables(got, bookFrame) : got;
   const bare = stripJsLiterals(collectVarCalls(frame ? collectJsoupCalls(collected, rule, frame) : collected)) ?? reject('字符串/注释未闭合');
   for (const match of bare.matchAll(/(?<![.\w$])[A-Za-z_$][\w$]*/g)) {
     const name = match[0];
@@ -1363,6 +1373,28 @@ function collectLiteralCalls(code: string, pattern: RegExp, rule: string, gets: 
         unsupported(`JS 段 ${what} 的实参规则编译不过`, rule, { code: 'unsupported_js' });
       }
     }
+    out += `${code.slice(last, match.index)}(0)`;
+    last = match.index + match[0].length;
+  }
+  return out + code.slice(last);
+}
+
+// ---- 书籍变量（bookvar1028，ENGINE_SYNTAX_BOOK_VARIABLE）----
+/** `book.getVariable("键")`：恰好一个不跨行的字符串字面量实参。 */
+const BOOK_GET_VARIABLE_CALL_RE = /(?<![\w$.])book\s*\.\s*getVariable\s*\(\s*("(?:[^"\\\n]|\\.)*"|'(?:[^'\\\n]|\\.)*')\s*\)/g;
+
+/**
+ * 把键不在 `frame.puts` 里的字面量键调用记进 `frame.vars`、在待查代码里换成 `(0)`（求值期得 Java 空串，任何用法与 Rhino
+ * 同结果，见 jsoup-shim.ts）；其余调用原样留下，交成员白名单按「沙箱不提供的 book.getVariable」拒。
+ */
+function collectBookVariables(code: string, frame: NonNullable<typeof bookFrame>): string {
+  let out = '';
+  let last = 0;
+  for (const match of code.matchAll(BOOK_GET_VARIABLE_CALL_RE)) {
+    if (!startsInCode(code, match.index)) continue;
+    const key = jsStringLiteralValue(match[1]);
+    if (key === null || key.includes(TEMPLATE_HOLE) || frame.puts?.has(key) !== false) continue;
+    frame.vars.add(key);
     out += `${code.slice(last, match.index)}(0)`;
     last = match.index + match[0].length;
   }

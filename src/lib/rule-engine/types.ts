@@ -276,6 +276,11 @@ export interface FieldIr {
    * ScopeHost 须带齐且非空，否则求值失败（evaluate.ts）；列表 JS 只在挂了它时注入宿主绑定。未挂 = 旧链路逐字不变。
    */
   bookMembers?: readonly string[];
+  /**
+   * JS 读到的书籍变量键（bookvar1028，ENGINE_SYNTAX_BOOK_VARIABLE；只在 jsoup + 书籍成员重试帧里挂）：编译期已核键是字面量、
+   * 源内没有往书籍变量放该键的写法，求值时沙箱 `book.getVariable` 得 Java 空串（jsoup-shim.ts）。未挂 = 旧链路逐字不变。
+   */
+  bookVars?: readonly string[];
 }
 
 /** 装饰字段编译失败不阻断，标 skip 的占位。 */

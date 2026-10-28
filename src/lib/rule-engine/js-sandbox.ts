@@ -82,6 +82,8 @@ export interface JsBindings {
     readonly result?: JElement | readonly JElement[];
     readonly src?: JElement;
     readonly getElements?: (rule: string) => readonly JElement[];
+    /** bookvar1028：`book.getVariable` 得 Java 空串（见 JsoupInit.bookVariables）。 */
+    readonly bookVariables?: boolean;
   };
 }
 

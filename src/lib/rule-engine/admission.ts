@@ -26,11 +26,11 @@ import {
 import { RuleEngineError, type FieldIr, type RuleDiagnostic } from './types';
 import {
   compileItemVars, compileSearchVars, compileSource, compileVarBag, engineItemVarsActive, engineSearchVarsActive, engineSourceRevision,
-  sourceCanReName,
+  sourceBookVariablePuts, sourceCanReName,
 } from './compile';
 import {
   engineSyntaxAioEnabled, engineSyntaxBookFieldsEnabled, engineSyntaxJsBindEnabled, engineSyntaxVarsBagEnabled, engineSyntaxVarsEnabled,
-  engineUrlOptionsEnabled,
+  engineUrlOptionsEnabled, engineSyntaxBookVariableEnabled,
 } from './syntax-flags';
 import { bookUrlMember, bookView, formatBookAuthor, formatBookName, type BookView } from './book-format';
 import { stripUrlOptions, urlOptionFields } from './url-options';
@@ -455,6 +455,9 @@ export function compileAdmission(source: RawSource): AdmissionCompile {
   const itemBag = itemBagOf(source, coreJs);
   // book1028：同 compileSource——canReName 非空的源不开书籍成员（宿主绑定开关的判定在 parseFieldRule 里）。
   const bookFieldsEnabled = engineSyntaxBookFieldsEnabled() && !sourceCanReName(source as Record<string, unknown>);
+  // bookvar1028：同 compileSource——源级放变量键集（只在 jsoup + 书籍成员重试帧里起作用，jsoup 判定在 parseFieldRule 里）。
+  const bookVariablePuts = bookFieldsEnabled && engineSyntaxBookVariableEnabled()
+    ? sourceBookVariablePuts({ searchUrl: source.searchUrl, rules: source as Record<string, unknown> }) ?? undefined : undefined;
   for (const [field, rule] of iterRulePairs(rulesSource)) {
     if (!(field in coreFieldMask)) continue;
     if (bag?.has(field) || searchBag?.has(field) || itemBag?.has(field)) {
@@ -464,6 +467,7 @@ export function compileAdmission(source: RawSource): AdmissionCompile {
     try {
       parseFieldRule(rule, {
         jsEnabled: coreJs, field, aioGroup: aio.has(ruleGroupOf(field)), listJsGroup: listJs.has(ruleGroupOf(field)), bookFieldsEnabled,
+        bookVariablePuts,
       });
       coreFieldMask[field] = true;
     } catch (error) {
