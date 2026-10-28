@@ -4,8 +4,9 @@
 //
 // 用法（labeler 逐级调用；`@/` 别名靠 ts-esm-loader.mjs，故必须带 --import）：
 //   node --import ./scripts/ts-esm-loader.mjs scripts/engine-fetch.mjs search  --title "斗破苍穹" [--author "天蚕土豆"] [--no-builtin] [--skip-host <host>]… [--json]
-//   node --import ./scripts/ts-esm-loader.mjs scripts/engine-fetch.mjs toc     --url <bookUrl>    [--json]
-//   node --import ./scripts/ts-esm-loader.mjs scripts/engine-fetch.mjs content --url <chapterUrl> [--stop-urls-file <path>] [--json]
+//   node --import ./scripts/ts-esm-loader.mjs scripts/engine-fetch.mjs toc     --url <bookUrl>    [--book-json <json>] [--vars-json <json>] [--json]
+//   node --import ./scripts/ts-esm-loader.mjs scripts/engine-fetch.mjs content --url <chapterUrl> [--stop-urls-file <path>] [--chapter-title <t>] [--book-json <json>] [--json]
+//   （clictx1029：search --json 的候选可带 book/vars，toc --json 可带 book——调用方原样回传给下一级的 --book-json/--vars-json）
 //   node --import ./scripts/ts-esm-loader.mjs scripts/engine-fetch.mjs doctor --json
 //   （env：--env <file> 或环境变量 DATABASE_URL；--env 剥引号，参照 backfill_quality.mjs）
 //
@@ -46,6 +47,12 @@ function parseArgs(argv) {
     else if (a === '--url') args.url = argv[++i] ?? null;
     // bind1028：content 的本章章节名（正文 JS 读 chapter.title/title；ENGINE_SYNTAX_JS_BIND 关时不用）。只用于 content。
     else if (a === '--chapter-title') args.chapterTitle = argv[++i] ?? null;
+    // clictx1029：书籍成员（toc/content；正文/详情 JS 读 book.name 等）与搜索条目袋（toc；详情/目录读回）。
+    // 值是上一级 --json 输出里的 book/vars 原样回传；读成员/读袋的源不传即求值失败，同阅读器与下载器。
+    else if (a === '--book-json' || a === '--vars-json') {
+      if (argv[i + 1] === undefined) throw new ExitError(2, `缺少参数值：${a}`);
+      args[a === '--book-json' ? 'bookJson' : 'varsJson'] = argv[++i];
+    }
     // espfix41：labeler 已自行搜过 book15（或已熔断），--no-builtin 免掉 CLI 里重复的一次；
     // --skip-host（可重复）跳过本轮已判「查询不敏感」的垃圾源。二者只用于 search。
     else if (a === '--no-builtin') args.noBuiltin = true;
@@ -88,6 +95,26 @@ function readStopUrls(path) {
   let raw;
   try { raw = readFileSync(resolve(path), 'utf8'); } catch { throw new ExitError(2, '--stop-urls-file 无法读取'); }
   return raw.split(/\r?\n/).map((line) => line.trim()).filter((line) => /^https:\/\//i.test(line)).slice(0, MAX_STOP_URLS);
+}
+
+// --book-json 只收 name/author/bookUrl/tocUrl 四个字符串成员（同 BookView）；--vars-json 只收字符串值（键数有上限）。
+// 其它形状 ⇒ 用法错退 2（DB 之前）。
+const BOOK_KEYS = new Set(['name', 'author', 'bookUrl', 'tocUrl']);
+const MAX_VARS = 256;
+function readJsonObject(raw, flag, keyOk, why) {
+  let value;
+  try { value = JSON.parse(raw); } catch { throw new ExitError(2, `${flag} 不是合法 JSON`); }
+  if (value === null || typeof value !== 'object' || Array.isArray(value)
+    || !Object.entries(value).every(([k, v]) => keyOk(k) && typeof v === 'string')) {
+    throw new ExitError(2, `${flag} ${why}`);
+  }
+  return value;
+}
+const readBookJson = (raw) => readJsonObject(raw, '--book-json', (k) => BOOK_KEYS.has(k), '只收 name/author/bookUrl/tocUrl 字符串成员');
+function readVarsJson(raw) {
+  const vars = readJsonObject(raw, '--vars-json', () => true, '只收字符串值');
+  if (Object.keys(vars).length > MAX_VARS) throw new ExitError(2, `--vars-json 键数超上限（${MAX_VARS}）`);
+  return vars;
 }
 
 // 🔴 脱敏：DB/连接错误的原文可能含连接串（含口令）。任何带 `://` 或 `@host` 形态的 token 一律抹掉，
@@ -210,7 +237,11 @@ async function cmdSearch(m, args) {
           .map((bookUrl) => ({ source: hostOf(source.url), sourceName: source.name, title: args.title, author: '', bookUrl, tocUrl: bookUrl }));
       }
       const results = await m.api.engineSearchBook(engineSourceOf(m, source), args.title, scoped);
-      return results.map((r) => ({ source: hostOf(source.url), sourceName: source.name, title: r.title, author: r.author, bookUrl: r.bookUrl }));
+      // clictx1029：读成员/条目袋的源，候选带出 book/vars（只在有时才带键）。
+      return results.map((r) => ({
+        source: hostOf(source.url), sourceName: source.name, title: r.title, author: r.author, bookUrl: r.bookUrl,
+        ...(r.book !== undefined ? { book: r.book } : {}), ...(r.vars !== undefined ? { vars: r.vars } : {}),
+      }));
     },
     onError: (source, error) => process.stderr.write(`[warn] 源 ${hostOf(source.url)} 搜索失败：${safeReason(error)}\n`),
   });
@@ -256,6 +287,7 @@ async function cmdToc(m, args) {
   let title = '';
   let author = '';
   let chapters = [];
+  let book;
   if (builtin) {
     const page = await context.page(m.policy.validateSourceUrl(args.url).href);
     const identity = m.parser.parseSourceIdentity(page.text);
@@ -268,17 +300,20 @@ async function cmdToc(m, args) {
     }
   } else {
     const engineSource = engineSourceOf(m, source);
-    const detail = await m.api.engineFetchDetail(engineSource, args.url, context);
+    // clictx1029：搜索候选的书籍成员与条目袋交给详情，详情带回的（补了 tocUrl / 以条目袋为初值）交给目录（同 engine-download）。
+    const detail = await m.api.engineFetchDetail(engineSource, args.url, context, args.book, args.vars);
     title = detail.title ?? '';
     author = detail.author ?? '';
-    const toc = await m.api.engineFetchToc(engineSource, detail.tocUrl ?? args.url, context, false, detail.vars);
+    const toc = await m.api.engineFetchToc(engineSource, detail.tocUrl ?? args.url, context, false, detail.vars, detail.book);
     chapters = toc.chapters;
+    book = detail.book;
   }
   if (!chapters.length) throw new ExitError(1, `无章节：${args.url}`);
   const out = {
     source: hostOf(source.url), title, author,
     chapters: chapters.map((c, index) => ({ index, title: c.title, url: c.url })),
   };
+  if (book !== undefined) out.book = book; // clictx1029：调用方按章回传给 content --book-json
   emit(args, out, () => `${out.title}${out.author ? ' / ' + out.author : ''}（${out.chapters.length} 章）\n`
     + out.chapters.slice(0, 5).map((c) => `  ${c.index}. ${c.title}`).join('\n')
     + (out.chapters.length > 5 ? `\n  … 共 ${out.chapters.length} 章` : ''));
@@ -302,7 +337,7 @@ async function cmdContent(m, args) {
     const engineSource = engineSourceOf(m, source);
     // lblqual41：停止点 = 整本目录。站点「下一页」若是目录里的任一章（cuoceng 的 #linkNext 就是下一章，
     // 且目录序与下一章链序不同）即停，不再一路翻 20 页串进后续章节。未给清单时行为同改前。
-    text = (await m.api.engineFetchContent(engineSource, args.url, context, false, args.stopUrls, args.chapterTitle ?? undefined)).text;
+    text = (await m.api.engineFetchContent(engineSource, args.url, context, false, args.stopUrls, args.chapterTitle ?? undefined, args.book)).text;
   }
   if (!text) throw new ExitError(1, `空正文：${args.url}`);
   const out = { source: hostOf(source.url), url: args.url, text };
@@ -340,6 +375,10 @@ async function main() {
   }
   if (command !== 'content' && args.stopUrlsFile) throw new ExitError(2, '--stop-urls-file 仅用于 content');
   if (args.stopUrlsFile) args.stopUrls = readStopUrls(args.stopUrlsFile);
+  if (command !== 'toc' && command !== 'content' && args.bookJson !== undefined) throw new ExitError(2, '--book-json 仅用于 toc/content');
+  if (command !== 'toc' && args.varsJson !== undefined) throw new ExitError(2, '--vars-json 仅用于 toc');
+  if (args.bookJson !== undefined) args.book = readBookJson(args.bookJson);
+  if (args.varsJson !== undefined) args.vars = readVarsJson(args.varsJson);
   if (command !== 'download') {
     for (const key of ['source', 'out', 'max-chapters', 'rate-ms', 'timeout-ms', 'budget-ms']) {
       if (args[key] !== undefined) throw new ExitError(2, `--${key} 仅用于 download`);

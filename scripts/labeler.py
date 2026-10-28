@@ -3031,6 +3031,133 @@ class EngineStopUrls:
         return proc
 
 
+# ---- 引擎书籍成员/条目袋/章节名透传（clictx1029）----
+# 阅读器与下载器逐级把搜索候选的书籍成员（book.name 等）与条目袋（@put 存的变量）交给详情/目录，
+# 把章节名与书籍成员交给正文；CLI 各子命令是独立进程，labeler 不回传就读不到（源 JS 读成员/读袋即求值失败）。
+# 这里包一层 CLI：记下 search 候选的 book/vars 与 toc 的 book/章节名，下一级调用时追加
+# --book-json/--vars-json/--chapter-title。CLI 只在开关打开、源确有成员/袋时才输出 book/vars，
+# 章节名在 ENGINE_SYNTAX_JS_BIND 关时不参与求值 —— 开关全关时取文结果与改前一致。
+CONTEXT_FLAGS = ('--book-json', '--vars-json', '--chapter-title')
+_BOOK_KEYS = frozenset(('name', 'author', 'bookUrl', 'tocUrl'))
+_MAX_CONTEXT_JSON = 8000  # 单个参数的字符上限（Windows 命令行总长 32K）；超了就不带
+_MAX_VARS = 256           # 同 CLI --vars-json 上限
+
+
+class EngineChapterContext:
+    """引擎 CLI 包装：search → toc 回传候选的 book/vars，toc → content 回传章节名与 book。
+
+    放在 EngineStopUrls 里层（外层追加的 --stop-urls-file 原样透传）。书按 bookUrl 记，最多 MAX_BOOKS 本；
+    章节按章节 URL 的 host 记该 host 最近一次 toc，最多 MAX_HOSTS 个，均按最久未用淘汰。
+    旧 CLI 不认新参数（rc=2 且 stderr 点名其一）→ 本轮降级为不带并重试一次，行为同改前。"""
+
+    MAX_BOOKS = 4096
+    MAX_HOSTS = 32
+
+    def __init__(self, cli):
+        self._cli = cli
+        # bookUrl → (book JSON | None, vars JSON | None)
+        self._books: dict[str, tuple[str | None, str | None]] = {}
+        # host → {章节 URL: (章节名, book JSON | None)}
+        self._chapters: dict[str, dict[str, tuple[str, str | None]]] = {}
+        self.supported = True
+
+    def __getattr__(self, name):
+        return getattr(self._cli, name)
+
+    @staticmethod
+    def _dump(value, keys=None) -> str | None:
+        if not isinstance(value, dict) or not value or len(value) > _MAX_VARS:
+            return None
+        if not all(isinstance(k, str) and isinstance(v, str) and (keys is None or k in keys)
+                   for k, v in value.items()):
+            return None
+        text = json.dumps(value, ensure_ascii=False, separators=(',', ':'))
+        return text if len(text) <= _MAX_CONTEXT_JSON else None
+
+    def _remember_search(self, stdout: str) -> None:
+        try:
+            candidates = json.loads(stdout)
+        except (ValueError, TypeError):
+            return
+        if not isinstance(candidates, list):
+            return
+        for c in candidates:
+            if not isinstance(c, dict) or not isinstance(c.get('bookUrl'), str) or not c['bookUrl']:
+                continue
+            url = c['bookUrl']
+            self._books.pop(url, None)
+            entry = (self._dump(c.get('book'), _BOOK_KEYS), self._dump(c.get('vars')))
+            if entry != (None, None):
+                self._books[url] = entry
+        while len(self._books) > self.MAX_BOOKS:
+            del self._books[next(iter(self._books))]
+
+    def _remember_toc(self, toc_url, stdout: str) -> None:
+        try:
+            data = json.loads(stdout)
+            chapters = data.get('chapters') or []
+            book = self._dump(data.get('book'), _BOOK_KEYS)
+        except (ValueError, AttributeError, TypeError):
+            chapters, book = [], None
+        by_host: dict[str, dict[str, tuple[str, str | None]]] = {}
+        for c in chapters if isinstance(chapters, list) else []:
+            if not isinstance(c, dict) or not isinstance(c.get('url'), str) or not c['url']:
+                continue
+            host = _url_host(c['url'])
+            title = c.get('title')
+            if host and isinstance(title, str):
+                by_host.setdefault(host, {})[c['url']] = (title, book)
+        if not by_host:
+            self._chapters.pop(_url_host(toc_url), None)
+        for host, entries in by_host.items():
+            self._chapters.pop(host, None)
+            self._chapters[host] = entries
+        while len(self._chapters) > self.MAX_HOSTS:
+            del self._chapters[next(iter(self._chapters))]
+
+    def _extra(self, subcommand: str, url) -> list[str]:
+        if not self.supported or not url:
+            return []
+        if subcommand == 'toc':
+            book, vars_json = self._books.get(url, (None, None))
+            return ((['--book-json', book] if book else [])
+                    + (['--vars-json', vars_json] if vars_json else []))
+        if subcommand == 'content':
+            host = _url_host(url)
+            entry = self._chapters.get(host, {}).get(url) if host else None
+            if entry is None:
+                return []
+            self._chapters[host] = self._chapters.pop(host)
+            title, book = entry
+            return ['--chapter-title', title] + (['--book-json', book] if book else [])
+        return []
+
+    def run(self, subcommand: str, *args: str, **kw):
+        url = args[1] if len(args) >= 2 and args[0] == '--url' else None
+        extra = self._extra(subcommand, url)
+        if extra:
+            proc = self._cli.run(subcommand, *args, *extra, **kw)
+            stderr = proc.stderr or ''
+            # 只认「不认识新参数」：点名的是外层的 --stop-urls-file 时原样交回，由 EngineStopUrls 降级。
+            if (proc.returncode != 2 or not _UNKNOWN_OPTION_RE.search(stderr)
+                    or not any(flag in stderr for flag in CONTEXT_FLAGS)):
+                return self._observe(subcommand, url, proc)
+            self.supported = False
+            print('  提示: 引擎 CLI 不支持 --book-json/--vars-json（旧版），本轮不回传书籍成员与章节名',
+                  file=sys.stderr)
+        return self._observe(subcommand, url, self._cli.run(subcommand, *args, **kw))
+
+    def _observe(self, subcommand: str, url, proc):
+        if subcommand == 'search' and proc.returncode == 0:
+            self._remember_search(proc.stdout)
+        elif subcommand == 'toc':
+            if proc.returncode == 0:
+                self._remember_toc(url, proc.stdout)
+            else:
+                self._chapters.pop(_url_host(url) if url else None, None)
+        return proc
+
+
 # ---- 打标层（将来可整体搬进主应用）----
 SEGMENT_CHARS = 250_000  # 每段字数上限（~160k tokens，远离 CF 100s prefill 死区）
 
@@ -4015,7 +4142,7 @@ def main() -> int:
             engine_cli = _build_engine_cli(env)
             if engine_cli is not None:
                 print('  引擎兜底已启用：book15 miss 将回落引擎源池')
-                engine_cli = EngineStopUrls(engine_cli)
+                engine_cli = EngineStopUrls(EngineChapterContext(engine_cli))
             # book15 熔断（labelerdiag41）：整站挂掉时别让每本 3 次全失败把一轮拖成十几小时。
             book15_breaker = douban_list.Book15Breaker(douban_list.resolve_book15_breaker(env))
             all_books = (douban_list.build_douban_queue(
@@ -4058,6 +4185,9 @@ def main() -> int:
             if SOURCE_POLICY is not None and SOURCE_POLICY.is_disabled(
                     labeler_source_policy.BOOK15_HOST):
                 engine_cli = _build_engine_cli(env)
+                # clictx1029：重定位的搜索也要记候选的 book/vars，所以里层包装在搜索之前套上。
+                if engine_cli is not None:
+                    engine_cli = EngineChapterContext(engine_cli)
                 # 已终态（done ∪ stub ∪ pinned）按身份键先滤，省一次引擎搜索；
                 # deferred 不滤（后移不是终态）。被滤条目原样返回交 split_queue 归类计数。
                 all_books, _reloc_stats = _relocate_rank_books_to_engine(

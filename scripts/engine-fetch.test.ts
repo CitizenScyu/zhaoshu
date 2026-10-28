@@ -172,6 +172,40 @@ describe('engine-fetch CLI 契约', () => {
     expect(unreadable.stdout).toBe('');
   }, 60_000);
 
+  // clictx1029：书籍成员/条目袋逐级透传。求值语义由 book/bookcontent/itemvars 测试钉住；这里钉 CLI 的参数契约。
+  it('clictx1029：toc 接受 --book-json/--vars-json、content 接受 --book-json/--chapter-title（DB 之前解析，落到缺 DATABASE_URL）', () => {
+    const book = JSON.stringify({ name: '书', author: '作者', bookUrl: 'https://a.example/b/1' });
+    for (const args of [
+      ['toc', '--url', 'https://a.example/b/1', '--book-json', book, '--vars-json', '{"k":"v"}'],
+      ['content', '--url', 'https://a.example/c/1', '--chapter-title', '第一章', '--book-json', book],
+    ]) {
+      const r = run(args, { DATABASE_URL: undefined });
+      expect(r.status).toBe(2);
+      expect(r.stderr).toContain('DATABASE_URL');
+      expect(r.stderr).not.toContain('未知参数');
+    }
+  }, 60_000);
+
+  it('clictx1029：--book-json/--vars-json 缺值、形状不对、用错子命令 → 退出码 2（DB 之前）', () => {
+    const cases: Array<[string[], string]> = [
+      [['content', '--url', 'https://a.example/c/1', '--book-json'], '缺少参数值：--book-json'],
+      [['content', '--url', 'https://a.example/c/1', '--book-json', '{'], '--book-json 不是合法 JSON'],
+      [['content', '--url', 'https://a.example/c/1', '--book-json', '["x"]'], '--book-json 只收'],
+      [['content', '--url', 'https://a.example/c/1', '--book-json', '{"kind":"x"}'], '--book-json 只收'],
+      [['content', '--url', 'https://a.example/c/1', '--book-json', '{"name":1}'], '--book-json 只收'],
+      [['toc', '--url', 'https://a.example/b/1', '--vars-json', '{"k":1}'], '--vars-json 只收'],
+      [['toc', '--url', 'https://a.example/b/1', '--vars-json', JSON.stringify(Object.fromEntries(Array.from({ length: 257 }, (_, i) => [`k${i}`, 'v'])))], '键数超上限'],
+      [['search', '--title', 'X', '--book-json', '{}'], '--book-json 仅用于 toc/content'],
+      [['content', '--url', 'https://a.example/c/1', '--vars-json', '{}'], '--vars-json 仅用于 toc'],
+    ];
+    for (const [args, message] of cases) {
+      const r = run(args, { DATABASE_URL: 'postgres://u:p@h/db' });
+      expect(r.status).toBe(2);
+      expect(r.stderr).toContain(message);
+      expect(r.stdout).toBe('');
+    }
+  }, 120_000);
+
   it('toc 缺 --url → 退出码 2', () => {
     const r = run(['toc'], { DATABASE_URL: 'postgres://u:p@h/db' });
     expect(r.status).toBe(2);

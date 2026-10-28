@@ -5,6 +5,7 @@
 - _drop_rule 新增的作者求票行 / 章末标记 / 纯分隔线规则（实证样本 + 不误删正文的反例）；
 - prepare_book_text：跨章去重（cuoceng 串章同形）、试读截断源判定（yunqi 同形）、去重后字数不足；
 - EngineStopUrls：toc 后给目录内章节的 content 带 --stop-urls-file，旧 CLI 不认时降级；
+- EngineChapterContext（clictx1029）：search→toc 回传 book/vars，toc→content 回传章节名与 book；
 - 主循环：本地预检不合格 → 不调模型、写 labels-rejected.jsonl；去重后的正文才送模型。
 全离线：不联网、不真调 CLI、不调 LLM。
 复跑：PYTHONIOENCODING=utf-8 python -m unittest discover -s scripts -p 'test_labeler_quality.py'
@@ -507,6 +508,144 @@ class TestEngineStopUrlsPerHost(unittest.TestCase):
             self.assertIsNone(self._stop_file(inner))
         cli.run('search', '--title', '鬼吹灯')
         self.assertEqual(inner.calls[-1], ('search', ('--title', '鬼吹灯')))
+
+
+class TestEngineChapterContext(unittest.TestCase):
+    """clictx1029：search 候选的 book/vars 回传给 toc，toc 的 book 与章节名回传给 content。"""
+
+    BOOK_URL = 'https://m.cuoceng.com/b.html'
+    URLS = ['https://m.cuoceng.com/b/0.html', 'https://m.cuoceng.com/b/1.html']
+    BOOK = {'name': '鬼吹灯', 'author': '天下霸唱', 'bookUrl': BOOK_URL}
+    TOC_BOOK = {**BOOK, 'tocUrl': 'https://m.cuoceng.com/b/toc.html'}
+
+    def _search(self, **extra):
+        return json.dumps([{'source': 'm.cuoceng.com', 'title': '鬼吹灯', 'author': '天下霸唱',
+                            'bookUrl': self.BOOK_URL, **extra}], ensure_ascii=False)
+
+    def _handler(self, search_extra=None, toc_book=True):
+        def handler(sub, args):
+            if sub == 'search':
+                return _proc(0, self._search(**(search_extra or {})))
+            if sub == 'toc':
+                data = json.loads(_toc_json(self.URLS))
+                if toc_book:
+                    data['book'] = self.TOC_BOOK
+                return _proc(0, json.dumps(data, ensure_ascii=False))
+            return _proc(0, '{"text": "x"}')
+        return handler
+
+    @staticmethod
+    def _dump(value):
+        return json.dumps(value, ensure_ascii=False, separators=(',', ':'))
+
+    def test_search_to_toc_to_content(self):
+        inner = RecordingCli(self._handler({'book': self.BOOK, 'vars': {'id': '7'}}))
+        cli = labeler.EngineChapterContext(inner)
+        cli.run('search', '--title', '鬼吹灯')
+        cli.run('toc', '--url', self.BOOK_URL)
+        cli.run('content', '--url', self.URLS[1])
+        self.assertEqual(inner.calls[0], ('search', ('--title', '鬼吹灯')))
+        self.assertEqual(inner.calls[1], ('toc', ('--url', self.BOOK_URL, '--book-json', self._dump(self.BOOK),
+                                                  '--vars-json', '{"id":"7"}')))
+        self.assertEqual(inner.calls[2], ('content', ('--url', self.URLS[1], '--chapter-title', '第1章',
+                                                      '--book-json', self._dump(self.TOC_BOOK))))
+        self.assertEqual(cli.node, '/usr/bin/node')      # 其余属性原样转发
+
+    def test_without_context_args_unchanged_except_chapter_title(self):
+        # 开关全关时 CLI 不输出 book/vars：toc 参数不变，content 只多章节名（JS_BIND 关时不参与求值）。
+        inner = RecordingCli(self._handler(toc_book=False))
+        cli = labeler.EngineChapterContext(inner)
+        cli.run('content', '--url', self.URLS[0])        # 还没取过 toc
+        cli.run('search', '--title', '鬼吹灯')
+        cli.run('toc', '--url', self.BOOK_URL)
+        cli.run('content', '--url', self.URLS[0])
+        cli.run('content', '--url', 'https://m.cuoceng.com/b/99.html')
+        self.assertEqual([c[1] for c in inner.calls], [
+            ('--url', self.URLS[0]), ('--title', '鬼吹灯'), ('--url', self.BOOK_URL),
+            ('--url', self.URLS[0], '--chapter-title', '第0章'), ('--url', 'https://m.cuoceng.com/b/99.html')])
+
+    def test_bad_shapes_not_forwarded(self):
+        inner = RecordingCli(self._handler({'book': {'name': '鬼吹灯', 'kind': 'x'}, 'vars': {'n': 1}}))
+        cli = labeler.EngineChapterContext(inner)
+        cli.run('search', '--title', '鬼吹灯')
+        cli.run('toc', '--url', self.BOOK_URL)
+        self.assertEqual(inner.calls[1], ('toc', ('--url', self.BOOK_URL)))
+
+    def test_new_search_without_context_forgets_old(self):
+        state = {'extra': {'vars': {'id': '7'}}}
+        inner = RecordingCli(lambda sub, args: self._handler(state['extra'])(sub, args))
+        cli = labeler.EngineChapterContext(inner)
+        cli.run('search', '--title', '鬼吹灯')
+        state['extra'] = {}
+        cli.run('search', '--title', '鬼吹灯')
+        cli.run('toc', '--url', self.BOOK_URL)
+        self.assertEqual(inner.calls[2], ('toc', ('--url', self.BOOK_URL)))
+
+    def test_failed_toc_forgets_chapters(self):
+        state = {'toc_ok': True}
+
+        def handler(sub, args):
+            if sub == 'toc' and not state['toc_ok']:
+                return _proc(1, '', '无章节')
+            return self._handler()(sub, args)
+
+        inner = RecordingCli(handler)
+        cli = labeler.EngineChapterContext(inner)
+        cli.run('toc', '--url', self.BOOK_URL)
+        state['toc_ok'] = False
+        cli.run('toc', '--url', self.BOOK_URL)
+        cli.run('content', '--url', self.URLS[0])
+        self.assertEqual(inner.calls[-1], ('content', ('--url', self.URLS[0])))
+
+    def test_old_cli_degrades_and_retries_once(self):
+        def handler(sub, args):
+            if '--chapter-title' in args:
+                return _proc(2, '', '未知参数：--chapter-title')
+            return self._handler()(sub, args)
+
+        inner = RecordingCli(handler)
+        cli = labeler.EngineChapterContext(inner)
+        cli.run('toc', '--url', self.BOOK_URL)
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            proc = cli.run('content', '--url', self.URLS[0])
+        self.assertEqual(proc.returncode, 0)
+        self.assertFalse(cli.supported)
+        self.assertIn('旧版', err.getvalue())
+        self.assertEqual(inner.calls[-1], ('content', ('--url', self.URLS[0])))
+        cli.run('content', '--url', self.URLS[1])        # 本轮之后都不再带
+        self.assertEqual(inner.calls[-1], ('content', ('--url', self.URLS[1])))
+
+    def test_unknown_stop_flag_left_to_outer_wrapper(self):
+        # 旧 CLI 两个参数都不认、先点名 --stop-urls-file：里层原样交回，由 EngineStopUrls 降级重试。
+        def handler(sub, args):
+            if '--stop-urls-file' in args:
+                return _proc(2, '', '未知参数：--stop-urls-file')
+            return self._handler()(sub, args)
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        inner = RecordingCli(handler)
+        cli = labeler.EngineStopUrls(labeler.EngineChapterContext(inner), directory=tmp.name)
+        cli.run('toc', '--url', self.BOOK_URL)
+        with contextlib.redirect_stderr(io.StringIO()):
+            proc = cli.run('content', '--url', self.URLS[0])
+        self.assertEqual(proc.returncode, 0)
+        title_book = ('--chapter-title', '第0章', '--book-json', self._dump(self.TOC_BOOK))
+        self.assertEqual(inner.calls[1][1][:2], ('--url', self.URLS[0]))
+        self.assertEqual(inner.calls[1][1][2:4], ('--stop-urls-file', cli.path))
+        self.assertEqual(inner.calls[1][1][4:], title_book)
+        self.assertEqual(inner.calls[2], ('content', ('--url', self.URLS[0]) + title_book))
+
+    def test_lru_bounds(self):
+        cli = labeler.EngineChapterContext(RecordingCli(lambda sub, args: _proc(0, '[]')))
+        for i in range(labeler.EngineChapterContext.MAX_HOSTS + 1):
+            cli._remember_toc(f'https://h{i}.example/b', _toc_json([f'https://h{i}.example/c/0']))
+        self.assertEqual(len(cli._chapters), labeler.EngineChapterContext.MAX_HOSTS)
+        self.assertNotIn('h0.example', cli._chapters)
+        with mock.patch.object(labeler.EngineChapterContext, 'MAX_BOOKS', 2):
+            cli._remember_search(json.dumps([{'bookUrl': f'https://b.example/{i}', 'vars': {'k': 'v'}}
+                                             for i in range(3)]))
+        self.assertEqual(list(cli._books), ['https://b.example/1', 'https://b.example/2'])
 
 
 class TestMainPrecheck(unittest.TestCase):
