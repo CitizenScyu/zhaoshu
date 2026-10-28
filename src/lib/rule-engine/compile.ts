@@ -1007,8 +1007,11 @@ export function sourceUsesBookSyntax(
 
 const bookVariablePutsMemo = new WeakMap<object, { searchUrl: unknown; puts: ReadonlySet<string> | null }>();
 
-/** 放变量的调用：AnalyzeRule.put（有 book 时落 book.putVariable）、put(Big)Variable 与 putCustomVariable（键恒为 custom）。 */
-const BOOK_VARIABLE_PUT_RE = /(?<![\w$])(java\s*\.\s*put|put(?:Big)?Variable|putCustomVariable)\s*\(\s*("[^"\\\n]*"|'[^'\\\n]*')?/g;
+/**
+ * 放变量的调用：AnalyzeRule.put（有 book 时落 book.putVariable）、put(Big)Variable 与 putCustomVariable（键恒为 custom）。
+ * 字面量键后须紧跟 `,`/`)`（putkey1029：`"k" + i`、`a ? "x" : "y"` 之类拼出的键不算字面量，按动态键整源 null）。
+ */
+const BOOK_VARIABLE_PUT_RE = /(?<![\w$])(java\s*\.\s*put|put(?:Big)?Variable|putCustomVariable)\s*\(\s*(?:("[^"\\\n]*"|'[^'\\\n]*')\s*(?=[,)]))?/g;
 /**
  * 绕过上面字面量扫描的写法：`java` 被当值用（取别名、传参）、下标取 put、直接写 variable/variableMap、整包 setVariable
  * （`source.setVariable` 写的是源变量，不算）、eval/Function 拼代码。

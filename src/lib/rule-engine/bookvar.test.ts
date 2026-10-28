@@ -80,6 +80,9 @@ describe('开关与语义版本', () => {
     expect(puts({ jsLib: 'function f(){ book.putCustomVariable("9") }' })).toEqual(['custom']);
     expect(puts({}, `${SITE}/s?q={{java.put('k', key)}}`)).toEqual(['k']);
     expect(puts({ ruleBookInfo: { name: '@js:var k="custom";java.put(k, result)' } })).toBeNull();
+    expect(puts({ ruleBookInfo: { name: '@js:java.put("cu" + "stom", result)' } })).toBeNull();
+    expect(puts({ ruleBookInfo: { name: '@js:book.putVariable(1 ? "a" : "b", result)' } })).toBeNull();
+    expect(puts({ ruleBookInfo: { name: '@js:book.putVariable("b" , result)' } })).toEqual(['b']);
     expect(puts({ ruleBookInfo: { name: '@js:var j=java;j.put("custom", result)' } })).toBeNull();
     expect(puts({ ruleBookInfo: { name: '@js:java["put"]("custom", result)' } })).toBeNull();
     expect(puts({ ruleBookInfo: { name: '@js:eval(result)' } })).toBeNull();
