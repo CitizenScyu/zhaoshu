@@ -94,6 +94,11 @@ function tryParseJson(text: string): { ok: true; value: unknown } | { ok: false 
 export interface ScopeHost {
   origin?: string;
   chapterTitle?: string;
+  /**
+   * 本书变量袋（varbag1028，ENGINE_SYNTAX_VARS_BAG）：详情页 put 填、目录页 get 读。挂上时沙箱多装 `java.put(k, v)` /
+   * `java.get(k)`，`@get:{k}` makeUp 片段从这里取；没挂时读袋的字段求值失败。
+   */
+  vars?: Map<string, string>;
 }
 
 /** HTML 输入的作用域。`nodes` 是求值起点：整篇文档（`$.root()`）或 bookList 的某一条。 */
@@ -495,6 +500,8 @@ function matchingBrace(text: string, open: number): number {
  */
 export function evaluateField(field: FieldIr, scope: EvalScope, multi = false): string {
   if (scope.kind === 'json' && scope.object !== undefined) return objectFieldValue(field, scope.object);
+  if (field.varGets && scope.host?.vars === undefined) return evalFailed('目录字段读详情页变量，但作用域没带变量袋');
+  if (field.varPuts !== undefined) putVars(field.varPuts, scope);
   if (field.chain) return chainToString(evaluateChain(field.chain, scope, false, multi, field.jsGets, field.jsUtil), multi);
   if (field.joins !== undefined || field.concats !== undefined) {
     // T7 构件（&& 连接符 / %% 拼接）：M1 未实现，宁可失败也不要静默返回错的字符串。
@@ -510,6 +517,20 @@ export function evaluateField(field: FieldIr, scope: EvalScope, multi = false): 
   // unescapeHtml4）；正文（multi）交 content-html。
   if (!multi && (kind === 'self' || kind === 'groupRef') && value.includes('&')) value = decodeHTML(value);
   return value.trim();
+}
+
+/** legado putRule（varbag1028）：字段规则之前、在同一内容上逐键求值存袋。作用域没带袋（不读目录的调用方）时不存。 */
+function putVars(puts: NonNullable<FieldIr['varPuts']>, scope: EvalScope): void {
+  const vars = scope.host?.vars;
+  if (vars === undefined) return;
+  for (const [key, rule] of puts) vars.set(key, evaluateField(rule, scope));
+}
+
+/** `@get:{键}`（varbag1028）：袋里没有的键得空串（legado get 落空口径；编译期已保证键由详情字段放）。 */
+function varGet(key: string, scope: EvalScope): string {
+  const vars = scope.host?.vars;
+  if (vars === undefined) return evalFailed('目录字段读详情页变量，但作用域没带变量袋');
+  return vars.get(key) ?? '';
 }
 
 /** 逐条候选取首个非空（节点结果按 text 取）。 */
@@ -555,6 +576,7 @@ function makeUpText(parts: readonly JsTemplatePart[], scope: EvalScope, multi: b
   for (const part of parts) {
     if (part.kind === 'text') text += part.text;
     else if (part.kind === 'rule') text += evaluateField(part.field, scope, multi);
+    else if (part.kind === 'get') text += varGet(part.key, scope);
     else {
       const out = runJs(part.code, { result: scope.source ?? '', src: scope.source, baseUrl: scope.pageUrl, ...hostBindings(scope) });
       if (Array.isArray(out)) return evalFailed('模板 {{JS}} 返回了数组（legado 按 NativeArray.toString 拼，不复现）');
@@ -575,14 +597,34 @@ function dynamicRegex(pieces: readonly string[]): RegexSub | undefined {
 }
 
 /** 作用域上的宿主绑定 → 沙箱绑定（bind1028）。没注入的不进沙箱：JS 里引用它照旧 ReferenceError。 */
-function hostBindings(scope: EvalScope): Pick<JsBindings, 'globals' | 'objects'> {
+function hostBindings(scope: EvalScope): Pick<JsBindings, 'globals' | 'objects' | 'callbacks'> {
   const host = scope.host;
   if (host === undefined) return {};
   const objects: Record<string, Record<string, string>> = {};
+  const out: Pick<JsBindings, 'globals' | 'objects' | 'callbacks'> = { objects };
   if (host.origin !== undefined) objects.book = { origin: host.origin };
-  if (host.chapterTitle === undefined) return { objects };
-  objects.chapter = { title: host.chapterTitle };
-  return { objects, globals: { title: host.chapterTitle } };
+  if (host.chapterTitle !== undefined) {
+    objects.chapter = { title: host.chapterTitle };
+    out.globals = { title: host.chapterTitle };
+  }
+  if (host.vars !== undefined) out.callbacks = varCallbacks(host.vars);
+  return out;
+}
+
+/**
+ * 变量袋回调（varbag1028）：legado `java.put(key, value)` 存值并原样返回、`java.get(key)` 取值（键编译期已核成字面量）。
+ * put 的值不是字符串、get 多实参（legado 的 get(url, headers) 是网络请求）求值失败。
+ */
+function varCallbacks(vars: Map<string, string>): NonNullable<JsBindings['callbacks']> {
+  return {
+    put: (key, extra) => {
+      const value = extra.length === 1 ? extra[0] : null;
+      if (typeof value !== 'string') return evalFailed('java.put 的值不是单个字符串');
+      vars.set(key, value);
+      return value;
+    },
+    get: (key, extra) => (extra.length === 0 ? vars.get(key) ?? '' : evalFailed('java.get 多实参（legado 网络请求重载）不复现')),
+  };
 }
 
 /**
@@ -615,6 +657,7 @@ function jsBindings(
   return {
     ...host,
     callbacks: {
+      ...host.callbacks,
       getString: (rule, extra) => {
         const value = read(rule, extra);
         return value.includes('&') ? decodeHTMLStrict(value) : value;
@@ -876,10 +919,33 @@ function jsonInitScope(ir: RuleIr, scope: JsonScope): EvalScope {
   return createJsonScope(value, scope.pageUrl);
 }
 
-/** 详情字段（ruleBookInfo.name/author/tocUrl…）的求值作用域：init 挂了 initScope 时换成 init 结果，否则即页面作用域。 */
+/**
+ * 详情字段（ruleBookInfo.name/author/tocUrl…）的求值作用域：init 挂了 initScope 时换成 init 结果，否则即页面作用域。
+ * 变量袋源（varbag1028）另挂一只空袋：详情字段求值时往里 put，调用方按 name → author → tocUrl 求值后用 scopeVars 取出。
+ */
 export function bookInfoScope(compiled: CompiledRules, scope: EvalScope): EvalScope {
   const init = compiled.get('ruleBookInfo.init');
-  return init && !('skipped' in init) && init.initScope ? evaluateInitScope(init, scope) : scope;
+  const base = compiledUsesVarBag(compiled) ? { ...scope, host: { ...scope.host, vars: new Map<string, string>() } } : scope;
+  return init && !('skipped' in init) && init.initScope ? evaluateInitScope(init, base) : base;
+}
+
+/** 编译产物里是否有变量袋字段（varbag1028：详情 put 或目录 get）。 */
+export function compiledUsesVarBag(compiled: CompiledRules): boolean {
+  for (const field of compiled.values()) {
+    if (!('skipped' in field) && (field.varPuts !== undefined || field.varPut || field.varGets)) return true;
+  }
+  return false;
+}
+
+/** 作用域上的变量袋快照（varbag1028）；没挂袋返回 undefined。 */
+export function scopeVars(scope: EvalScope): Record<string, string> | undefined {
+  const vars = scope.host?.vars;
+  return vars === undefined ? undefined : Object.fromEntries(vars);
+}
+
+/** 目录页作用域挂上详情页带来的变量袋（varbag1028）：袋是副本，目录求值不回写详情结果。 */
+export function withVars<T extends EvalScope>(scope: T, vars: Readonly<Record<string, string>>): T {
+  return { ...scope, host: { ...scope.host, vars: new Map(Object.entries(vars)) } };
 }
 
 // ---------------------------------------------------------------- JS 链（jsbox1027）
@@ -973,6 +1039,7 @@ function makeUpJs(
   for (const part of stage.template) {
     if (part.kind === 'text') text += part.text;
     else if (part.kind === 'rule') text += evaluateField(part.field, scope);
+    else if (part.kind === 'get') text += varGet(part.key, scope);
     else {
       const out = runJs(part.code, { result: input, src: scope.source, baseUrl: scope.pageUrl, ...jsBindings(scope, gets, util) });
       if (out === null || Array.isArray(out)) return evalFailed('JS 段 {{}} 占位的结果不是字符串');

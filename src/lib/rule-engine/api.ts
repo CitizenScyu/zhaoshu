@@ -14,6 +14,7 @@ import { contentHtmlToText, contentNeedsHtmlToText } from './content-html';
 import { isStructuredChallengePage } from './content-challenge';
 import {
   bookInfoScope, compiledUsesJs, createScope, evaluateField, evaluateFieldList, evaluateFieldStrings, fieldUsesJs, normalizeBody,
+  scopeVars, withVars,
 } from './evaluate';
 import { enginePostSearchEnabled, engineSearchJsActive } from './compile-smoke';
 import { preloadJsSandbox } from './js-sandbox';
@@ -32,6 +33,8 @@ export interface EngineSource {
   origin?: string;
 }
 export interface EngineSearchResult { title: string; author: string; bookUrl: string }
+/** 详情结果；`vars`（varbag1028）只在变量袋源上出现，是要交给 engineFetchToc 的本书变量。 */
+export type EngineDetailResult = Partial<SourceBookIdentity> & { tocUrl?: string; vars?: Record<string, string> };
 export interface EngineTocResult { chapters: SourceChapter[] }
 export interface EngineContentResult { text: string }
 
@@ -154,14 +157,14 @@ export async function engineSearchBook(
  */
 export async function engineFetchDetail(
   source: EngineSource, bookUrl: string, context: SourceRequestContext,
-): Promise<Partial<SourceBookIdentity> & { tocUrl?: string }> {
+): Promise<EngineDetailResult> {
   await prepareJs(source);
   const target = validateSourceUrl(bookUrl).href;
   const page = await context.page(target, { responseCharset: enginePostSearchEnabled() ? 'auto' : undefined });
   const scope = pageScope(source, page.text, page.url);
   // init1028：详情字段在 init 结果上求值（未挂 initScope 时即页面作用域）；作者/别名兜底仍读页面原文。
   const info = bookInfoScope(source.compiled, scope);
-  const detail: Partial<SourceBookIdentity> & { tocUrl?: string } = {};
+  const detail: EngineDetailResult = {};
   const title = evaluateText(source.compiled, 'ruleBookInfo.name', info);
   const author = evaluateText(source.compiled, 'ruleBookInfo.author', info);
   const tocUrl = absoluteUrl(evaluateText(source.compiled, 'ruleBookInfo.tocUrl', info), page.url, field(source.compiled, 'ruleBookInfo.tocUrl'));
@@ -177,12 +180,19 @@ export async function engineFetchDetail(
   // 与 builtin 复用成对括号的明确原书名标记，不把作者搜索词当作书名。
   const alias = parseSourceAlias(page.text);
   if (alias.alias) detail.alias = alias.alias;
+  // varbag1028：详情字段 put 进袋的值，调用方原样交给 engineFetchToc。非变量袋源不带此键。
+  const vars = scopeVars(info);
+  if (vars) detail.vars = vars;
   return detail;
 }
 
-/** ruleToc.chapterList → SourceChapter[]，含 nextTocUrl 翻页循环。 */
+/**
+ * ruleToc.chapterList → SourceChapter[]，含 nextTocUrl 翻页循环。
+ * `vars`（varbag1028）= 同一本书 engineFetchDetail 带出的变量袋，目录字段的 `@get:{k}` / `java.get('k')` 从这里读；
+ * 读袋的源不传即求值失败（不猜值）。
+ */
 export async function engineFetchToc(
-  source: EngineSource, tocUrl: string, context: SourceRequestContext, strict = false,
+  source: EngineSource, tocUrl: string, context: SourceRequestContext, strict = false, vars?: Readonly<Record<string, string>>,
 ): Promise<EngineTocResult> {
   // 原始顺序（含重复）先全收，最后统一去重（41-ctocfu §5）。去重口径对齐 legado **净效果**：
   // BookChapterList.kt:114-124 先 `chapterList.reverse()` → `LinkedHashSet`（保留反转后的首次出现）
@@ -214,7 +224,7 @@ export async function engineFetchToc(
       throw new SourcePolicyError('书源目录分页重复返回已读取的页面，请重试或更换书源');
     }
     receivedPages.add(receivedKey);
-    const scope = pageScope(source, page.text, page.url);
+    const scope = vars ? withVars(pageScope(source, page.text, page.url), vars) : pageScope(source, page.text, page.url);
     let validChapters = 0;
     const list = field(source.compiled, 'ruleToc.chapterList');
     if (strict && [...source.compiled.entries()].some(([key, value]) => key.startsWith('ruleToc.') && 'skipped' in value)) throw new Error('unsupported_toc_rule');
@@ -228,7 +238,7 @@ export async function engineFetchToc(
         // （baseUrl）。只有这两种情况落兜底；规则产出非空但过不了 host 门的 URL 一律丢弃
         // （absoluteUrl 返回 undefined），绝不洗成 page.url。
         // bind1028：legado 先求 chapterName 赋给 bookChapter.title，chapterUrl 的 JS 可读 chapter.title/title。
-        const urlScope = inner.host ? { ...inner, host: { ...inner.host, chapterTitle: title } } : inner;
+        const urlScope = inner.host?.origin !== undefined ? { ...inner, host: { ...inner.host, chapterTitle: title } } : inner;
         const rawUrl = evaluateText(source.compiled, 'ruleToc.chapterUrl', urlScope);
         const chapterUrl = rawUrl.trim() ? absoluteUrl(rawUrl, page.url, field(source.compiled, 'ruleToc.chapterUrl')) : page.url;
         if (strict && (!title || title.length > MAX_TITLE_LENGTH || !chapterUrl || !rawUrl.trim())) throw new Error('invalid_chapter');

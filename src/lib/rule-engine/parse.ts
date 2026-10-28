@@ -31,6 +31,7 @@ import {
 } from './syntax-flags';
 import { compileXPath, XPathSyntaxError } from './xpath-eval';
 import { looksLikeXPath, xpathPrefixed, xpathSegmentBody, xpathToCss } from './xpath-subset';
+import { VAR_BAG_RESERVED_KEYS } from './vars-subset';
 
 function unsupported(msg: string, rule: string, diagnostic: RuleDiagnostic): never {
   throw new RuleEngineError('RULE_UNSUPPORTED', msg, rule, diagnostic);
@@ -41,6 +42,18 @@ function unsupported(msg: string, rule: string, diagnostic: RuleDiagnostic): nev
  * translateSegment / tryParseTemplate 据此调 parseJsonPath(…, ext)。
  */
 let jsonPathExt = false;
+
+/**
+ * 当前 parseFieldRule 帧的变量袋模式（varbag1028，ParseOptions.varBag）：同样进出时保存/恢复，嵌套的规则段、`{{规则}}`、
+ * getter 实参不继承（它们里面的 put/get 照旧拒）。
+ */
+let varBag: VarBagParse | undefined;
+
+/** 变量袋编译模式：`put` = JS 里放行字面量键的 `java.put`；`get` = 放行 `java.get('键')` 与规则级 makeUp 的 `@get:{键}`。键记进 keys。 */
+export interface VarBagParse {
+  mode: 'put' | 'get';
+  keys: Set<string>;
+}
 
 // ---- 不支持构件（编译期一律拒绝，见 §0/§2.3 与任务 reject-list）----
 // xpath / tpl_rule({{@@}}) / tpl_var({{变量}}，baseUrl 除外) / put(@put:) / get(@get:) /
@@ -582,15 +595,22 @@ export interface ParseOptions {
    * `X = (x) => java.getString(x)` 别名（collectJavaGets）。默认读 env（ENGINE_SYNTAX_INIT 与 ENGINE_SYNTAX_INIT_JS 同开才算）。
    */
   initJsEnabled?: boolean;
+  /**
+   * 变量袋（varbag1028，compile.ts 只给 vars-subset.ts varBagPlan 判出的字段传）：见 VarBagParse。只作用于本帧，嵌套解析不继承。
+   */
+  varBag?: VarBagParse;
 }
 
 export function parseFieldRule(rule: string, options: ParseOptions = {}): FieldIr {
   const saved = jsonPathExt;
+  const savedBag = varBag;
   jsonPathExt = options.jsonPathEnabled ?? engineSyntaxJsonPathEnabled();
+  varBag = options.varBag;
   try {
     return parseFieldRuleWithObjectKey(rule, options);
   } finally {
     jsonPathExt = saved;
+    varBag = savedBag;
   }
 }
 
@@ -620,8 +640,11 @@ function parseFieldRuleText(rule: string, options: ParseOptions): FieldIr {
   if (trimmed.length > MAX_RULE_LENGTH) unsupported('规则过长', rule, { code: 'rule_too_long' });
 
   // bind1028：旧路径拒收的 `{{}}` 才改走 legado makeUp，旧路径收得下的模板（`{{$.x}}`/`{{baseUrl}}`）两态同路。
-  if (options.field !== undefined && SELF_FIELDS.has(options.field) && trimmed.includes('{{') && bindActive(options)
-    && templatesRejected(trimmed)) return parseMakeUpField(trimmed, rule, options);
+  // varbag1028：目录字段在变量袋 get 模式下，含 `@get:{}` 的规则同走 makeUp（legado evalPattern 把 @get 与 {{}} 一起切）。
+  if (options.field !== undefined && SELF_FIELDS.has(options.field)
+    && ((trimmed.includes('{{') && bindActive(options) && templatesRejected(trimmed)) || (varBag?.mode === 'get' && /@get:\{/i.test(trimmed)))) {
+    return parseMakeUpField(trimmed, rule, options);
+  }
 
   rejectUnsupportedConstructs(trimmed);
 
@@ -1144,7 +1167,7 @@ function checkJsCode(
   if (code.trim() === '') reject('为空');
   // legado 在求值前对 JS 文本做 {{}}/@get/## 改写（SourceRule 构造与 makeUpRule），这里不模拟那几步。
   if (code.includes('##') || code.includes('{{') || /@(?:get|put):/i.test(code)) reject('含 ##/{{}}/@get/@put');
-  const bare = stripJsLiterals(gets ? collectJavaGets(code, rule, gets) : code) ?? reject('字符串/注释未闭合');
+  const bare = stripJsLiterals(collectVarCalls(gets ? collectJavaGets(code, rule, gets) : code)) ?? reject('字符串/注释未闭合');
   for (const match of bare.matchAll(/(?<![.\w$])[A-Za-z_$][\w$]*/g)) {
     const name = match[0];
     const members = binds?.get(name);
@@ -1216,6 +1239,31 @@ function collectLiteralCalls(code: string, pattern: RegExp, rule: string, gets: 
       }
     }
     out += `${code.slice(last, match.index)}(0)`;
+    last = match.index + match[0].length;
+  }
+  return out + code.slice(last);
+}
+
+// ---- 变量袋 java.put / java.get（varbag1028，ENGINE_SYNTAX_VARS_BAG）----
+const JAVA_PUT_CALL_RE = /(?<![\w$.])java\s*\.\s*put\s*\(\s*("(?:[^"\\\n]|\\.)*"|'(?:[^'\\\n]|\\.)*')\s*,/g;
+const JAVA_VAR_GET_CALL_RE = /(?<![\w$.])java\s*\.\s*get\s*\(\s*("(?:[^"\\\n]|\\.)*"|'(?:[^'\\\n]|\\.)*')\s*\)/g;
+
+/**
+ * 变量袋模式下（本帧 varBag）把字面量键的 `java.put('k', 值` 换成 `(0, 值`、`java.get('k')` 换成 `(0)` 再交白名单查，键记进
+ * varBag.keys。动态键、起点在字面量/注释里、内置键、多实参的 get（legado 的网络请求重载）原样留下，按「沙箱不提供的 java.put/get」拒。
+ * 不在变量袋模式时原样返回。
+ */
+function collectVarCalls(code: string): string {
+  const bag = varBag;
+  if (bag === undefined) return code;
+  let out = '';
+  let last = 0;
+  for (const match of code.matchAll(bag.mode === 'put' ? JAVA_PUT_CALL_RE : JAVA_VAR_GET_CALL_RE)) {
+    if (!startsInCode(code, match.index)) continue;
+    const key = jsStringLiteralValue(match[1]);
+    if (key === null || key === '' || key.includes(TEMPLATE_HOLE) || VAR_BAG_RESERVED_KEYS.has(key)) continue;
+    bag.keys.add(key);
+    out += `${code.slice(last, match.index)}${bag.mode === 'put' ? '(0,' : '(0)'}`;
     last = match.index + match[0].length;
   }
   return out + code.slice(last);
@@ -1343,13 +1391,17 @@ const TEMPLATE_JS_ROOTS: ReadonlySet<string> = new Set([
  */
 function parseMakeUpField(trimmed: string, rule: string, options: ParseOptions): FieldIr {
   const field = options.field!;
+  const bagGet = varBag?.mode === 'get';
   if (/@put:/i.test(trimmed)) unsupported('规则含 @put 变量存取', rule, { code: 'unsupported_var_put' });
-  if (/@get:/i.test(trimmed)) unsupported('规则含 @get 变量存取', rule, { code: 'unsupported_var_get' });
+  if (!bagGet && /@get:/i.test(trimmed)) unsupported('规则含 @get 变量存取', rule, { code: 'unsupported_var_get' });
   if (trimmed.startsWith('match:')) unsupported('规则含 match: 正则', rule, { code: 'unsupported_regex_match' });
   if (trimmed.includes('%%')) unsupported('规则含 %% 拼接（T7）', rule, { code: 'unsupported_operator', operator: '%%' });
   const prefix = /^(?:@@|@xpath:|@json:)/i.exec(trimmed)?.[0] ?? '';
   const body = trimmed.slice(prefix.length);
-  const first = /\{\{[\w\W]*?\}\}/.exec(body);
+  if (bagGet && (body.match(/@get:/gi)?.length ?? 0) !== (body.match(/@get:\{[^}]+?\}/gi)?.length ?? 0)) {
+    unsupported('规则含 @get 变量存取', rule, { code: 'unsupported_var_get' });
+  }
+  const first = (bagGet ? /@get:\{[^}]+?\}|\{\{[\w\W]*?\}\}/i : /\{\{[\w\W]*?\}\}/).exec(body);
   if (!first) return unsupported('模板含 {{变量}}（tpl_var）', rule, { code: 'unsupported_template_var' });
   const head = body.slice(0, first.index);
   if (first.index === 0 || !head.includes('##')) {
@@ -1365,10 +1417,12 @@ function parseMakeUpField(trimmed: string, rule: string, options: ParseOptions):
   return out;
 }
 
-/** 切模板片段：文本原样（不许 `$N`）、`{{规则}}` 编译成字段、`{{JS}}` 过白名单。 */
+/** 切模板片段：文本原样（不许 `$N`）、`{{规则}}` 编译成字段、`{{JS}}` 过白名单、`@get:{键}`（变量袋 get 模式）读袋。 */
 function makeUpParts(text: string, rule: string, options: ParseOptions, field: string): JsTemplatePart[] {
   const itemLevel = JS_ITEM_FIELDS.has(field);
-  const binds = fieldBinds(field);
+  const bind = bindActive(options);
+  const binds = bind ? fieldBinds(field) : undefined;
+  const bag = varBag?.mode === 'get' ? varBag : undefined;
   const parts: JsTemplatePart[] = [];
   const pushText = (piece: string) => {
     if (piece === '') return;
@@ -1376,23 +1430,35 @@ function makeUpParts(text: string, rule: string, options: ParseOptions, field: s
     parts.push({ kind: 'text', text: piece });
   };
   let last = 0;
-  for (const match of text.matchAll(JS_TEMPLATE_RE)) {
+  for (const match of text.matchAll(bag ? VAR_BAG_TEMPLATE_RE : JS_TEMPLATE_RE)) {
     pushText(text.slice(last, match.index));
+    last = match.index + match[0].length;
     const inner = match[1];
+    if (bag && match[2] !== undefined) {
+      const key = match[2];
+      if (VAR_BAG_RESERVED_KEYS.has(key)) unsupported('@get 读了内置键（bookName/title）', rule, { code: 'unsupported_var_get' });
+      bag.keys.add(key);
+      parts.push({ kind: 'get', key });
+      continue;
+    }
     if (isMakeUpRule(inner)) {
       parts.push({ kind: 'rule', field: parseMakeUpRule(inner, rule, options) });
     } else {
+      // 变量袋路径不要求宿主绑定开：`{{JS}}` 仍是 bind1028 的能力，没开就照旧拒。
+      if (!bind) unsupported('模板含 JS 表达式（tpl_js_expr）', rule, { code: 'unsupported_template_js' });
       const path = /^\s*([A-Za-z_$][\w$]*)(?:\s*\.\s*[A-Za-z_$][\w$]*)*\s*$/.exec(inner);
       if (path && !TEMPLATE_JS_ROOTS.has(path[1])) unsupported('模板含 {{变量}}（tpl_var）', rule, { code: 'unsupported_template_var' });
       if (itemLevel && jsReadsInput(inner)) unsupported('条目级字段的模板 JS 读了 result/src', rule, { code: 'unsupported_template_js' });
       checkJsCode(inner, rule, itemLevel, true, binds);
       parts.push({ kind: 'js', code: inner });
     }
-    last = match.index + match[0].length;
   }
   pushText(text.slice(last));
   return parts;
 }
+
+/** legado evalPattern（忽略大小写）：`{{…}}` 进第 1 组，`@get:{键}` 的键进第 2 组。 */
+const VAR_BAG_TEMPLATE_RE = /\{\{([\w\W]*?)\}\}|@get:\{([^}]+?)\}/gi;
 
 /**
  * `{{规则}}`：legado 以单条 SourceRule 在当前内容上 getString（不切 JS 段）。前缀按 SourceRule 构造归一：`@CSS:` 规范成

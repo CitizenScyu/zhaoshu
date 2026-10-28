@@ -271,7 +271,7 @@ async function cmdToc(m, args) {
     const detail = await m.api.engineFetchDetail(engineSource, args.url, context);
     title = detail.title ?? '';
     author = detail.author ?? '';
-    const toc = await m.api.engineFetchToc(engineSource, detail.tocUrl ?? args.url, context);
+    const toc = await m.api.engineFetchToc(engineSource, detail.tocUrl ?? args.url, context, false, detail.vars);
     chapters = toc.chapters;
   }
   if (!chapters.length) throw new ExitError(1, `无章节：${args.url}`);

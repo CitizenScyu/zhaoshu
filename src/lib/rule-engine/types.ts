@@ -196,9 +196,11 @@ export type ChainStage =
 
 /**
  * JS 段 makeUp 模板的片段（jsext1028）：字面代码、`{{规则}}`（legado isRule：`@`/`$.`/`$[`/`//` 开头，在字段作用域上取字符串）、
- * `{{JS}}`（以上一段结果为 result 在沙箱求值，结果按字符串拼回代码）。
+ * `{{JS}}`（以上一段结果为 result 在沙箱求值，结果按字符串拼回代码）、`@get:{键}`（varbag1028，只出现在规则级 makeUp：
+ * 从本书变量袋取值，键原样不 trim）。
  */
-export type JsTemplatePart = { kind: 'text'; text: string } | { kind: 'rule'; field: FieldIr } | { kind: 'js'; code: string };
+export type JsTemplatePart =
+  | { kind: 'text'; text: string } | { kind: 'rule'; field: FieldIr } | { kind: 'js'; code: string } | { kind: 'get'; key: string };
 
 /** 一条字段规则的顶层组合。 */
 export interface FieldIr {
@@ -246,6 +248,15 @@ export interface FieldIr {
    * 值进 host 门前先过 urlOptionHead（api.ts absoluteUrl / admission.ts）。未挂 = 原值进门（off 态口径）。
    */
   urlOptions?: true;
+  /**
+   * 详情页 put（varbag1028，ENGINE_SYNTAX_VARS_BAG，只挂在 ruleBookInfo.name/author/tocUrl 上）：`varPuts` = 字段 `@put:{…}` 的
+   * 键 → 规则（不含 JS），legado putRule 先于字段规则在同一内容上求值；`varPut` = 字段 JS 里有字面量键的 `java.put`，字段本身
+   * 也要求值才能填袋（evaluate.ts detailVarBag）。
+   */
+  varPuts?: ReadonlyArray<readonly [string, FieldIr]>;
+  varPut?: true;
+  /** 目录字段读本书变量袋（varbag1028）：`@get:{键}` makeUp 片段或 JS 里的 `java.get('键')`。求值时作用域没带袋即失败。 */
+  varGets?: true;
 }
 
 /** 装饰字段编译失败不阻断，标 skip 的占位。 */

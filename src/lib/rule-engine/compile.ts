@@ -17,11 +17,11 @@ import {
   engineSemanticsVersion, engineSyntaxAioEnabled, engineSyntaxAndEnabled, engineSyntaxInitEnabled, engineSyntaxJsBindEnabled, engineSyntaxJsEnabled,
   engineSyntaxJsExtEnabled, engineSyntaxJsGetEnabled, engineSyntaxJsonPathEnabled, engineSyntaxJsUtilEnabled, engineSyntaxListJsEnabled,
   engineSyntaxOrEnabled, engineSyntaxRegexEnabled, engineSyntaxVarsEnabled, engineSyntaxXPathEnabled, engineSyntaxXPathEvalEnabled, engineUrlOptionsEnabled,
-  engineSearchWebViewEnabled, engineSyntaxInitJsEnabled,
+  engineSearchWebViewEnabled, engineSyntaxInitJsEnabled, engineSyntaxVarsBagEnabled,
   ENGINE_SEMANTICS_VERSION,
 } from './syntax-flags';
 import { urlOptionFields } from './url-options';
-import { resolveSourceVars, ruleMayUseVars } from './vars-subset';
+import { resolveSourceVars, ruleMayUseVars, varBagPlan, varPutRules } from './vars-subset';
 import { ruleMayUseXPath } from './xpath-subset';
 
 export { ENGINE_SEMANTICS_VERSION };
@@ -40,6 +40,8 @@ export interface CompileOptions extends ParseOptions {
   /** searchwv1028：搜索选项 webView 当普通请求（ENGINE_SEARCH_WEBVIEW，默认读 env；须搜索选项 legado 口径同生效）。只影响语义版本位。 */
   searchWebViewEnabled?: boolean;
   // initJsEnabled（initjs1028，ENGINE_SYNTAX_INIT_JS）见 ParseOptions；compile 层另要求 initEnabled 同开。
+  /** varbag1028：详情页 put → 目录页 get 变量袋（ENGINE_SYNTAX_VARS_BAG，默认读 env；须 varsEnabled 同开）。 */
+  varBagEnabled?: boolean;
 }
 
 /** 版本化缓存键（P0 口径）：semanticsVersion:contentRevision。 */
@@ -69,6 +71,7 @@ export function engineVersionedKey(contentRevision: string, semanticsVersion = E
  * urlopt1028：ENGINE_URL_OPTIONS on 且有 URL 字段原文像会产出 `,{选项}`（urlOptionFields 非空）时再加 URL 选项位（131073–262144）。
  * searchwv1028：ENGINE_SEARCH_WEBVIEW on、搜索选项位条件成立且选项可能让 webView 为真（searchOptionsMayUseWebView）时再加搜索 webView 位（262145–524288）。
  * initjs1028：ENGINE_SYNTAX_INIT 与 ENGINE_SYNTAX_INIT_JS 都 on、JS 链对该源生效且 init 是可复现的 JS（sourceUsesInitJsSyntax）时再加 JS init 位（524289–1048576）。
+ * varbag1028：ENGINE_SYNTAX_VARS 与 ENGINE_SYNTAX_VARS_BAG 都 on 且变量袋对该源真生效（compileVarBag 非 null）时再加变量袋位（+2097152）。
  */
 export function engineSourceRevision(
   source: { url: string; searchUrl: unknown; rules: Record<string, unknown> },
@@ -151,6 +154,10 @@ export function engineSourceRevision(
       orEnabled, xpathEnabled, xpathEvalEnabled: xpathEval, regexEnabled, andEnabled, aioEnabled, listJsEnabled,
       jsExtEnabled, jsBindEnabled: jsBind, jsGetEnabled: jsGet, jsUtilEnabled: jsUtil, jsonPathEnabled,
     }),
+    varsEnabled && (options.varBagEnabled ?? engineSyntaxVarsBagEnabled()) && compileVarBag(source.rules, {
+      orEnabled, xpathEnabled, xpathEvalEnabled: xpathEval, jsEnabled: jsChain, regexEnabled, andEnabled, aioEnabled, listJsEnabled,
+      jsExtEnabled, jsBindEnabled: jsBind, jsGetEnabled: jsGet, jsUtilEnabled: jsUtil, jsonPathEnabled, initJsEnabled,
+    }) !== null,
   ));
 }
 
@@ -795,6 +802,102 @@ export function sourceUsesInitJsSyntax(
   return uses;
 }
 
+// ---- 详情页 put → 目录页 get 变量袋（varbag1028）----
+const varBagMemo = new WeakMap<object, Map<string, ReadonlyMap<string, FieldIr> | null>>();
+
+/** put 值规则的编译口径：legado `put(key, getString(value))`，按非 URL 字符串字段编、不含 JS。 */
+const VAR_PUT_VALUE_FIELD = 'ruleBookInfo.name';
+
+/**
+ * 变量袋生效时要换掉的字段（字段全名 → 带 varPuts/varPut/varGets 的编译结果），不生效返回 null（整源照旧）。
+ * 先按 vars-subset.ts varBagPlan 文本粗筛，再逐字段编译核实：详情 put 字段在 put 模式下编译（字段规则用 resolveSourceVars
+ * 剥过 @put 的、put 值规则另编），目录 get 字段在 get 模式下编译；任一字段编译不过、编译收进来的 java.put 键与 @put 键重叠
+ * 或跨字段重键、get 的键没被 put、目录组是 AllInOne、或最后没有字段真读袋，一律 null。
+ * compileSource / compileAdmission 用它覆盖普通编译结果，engineSourceRevision 按非 null 计语义位——三处同一判据。
+ * `options` 缺省的开关读 env（与 parseFieldRule 同口径）。
+ */
+export function compileVarBag(rules: Record<string, unknown>, options: ParseOptions = {}): ReadonlyMap<string, FieldIr> | null {
+  const js = options.jsEnabled ?? engineSyntaxJsEnabled();
+  const xpathEnabled = options.xpathEnabled ?? engineSyntaxXPathEnabled();
+  const base: ParseOptions = {
+    orEnabled: options.orEnabled ?? engineSyntaxOrEnabled(),
+    xpathEnabled,
+    xpathEvalEnabled: xpathEnabled && (options.xpathEvalEnabled ?? engineSyntaxXPathEvalEnabled()),
+    jsEnabled: js,
+    regexEnabled: options.regexEnabled ?? engineSyntaxRegexEnabled(),
+    andEnabled: options.andEnabled ?? engineSyntaxAndEnabled(),
+    aioEnabled: options.aioEnabled ?? engineSyntaxAioEnabled(),
+    listJsEnabled: js && (options.listJsEnabled ?? engineSyntaxListJsEnabled()),
+    jsExtEnabled: js && (options.jsExtEnabled ?? engineSyntaxJsExtEnabled()),
+    jsBindEnabled: js && (options.jsBindEnabled ?? engineSyntaxJsBindEnabled()),
+    jsGetEnabled: js && (options.jsGetEnabled ?? engineSyntaxJsGetEnabled()),
+    jsUtilEnabled: js && (options.jsUtilEnabled ?? engineSyntaxJsUtilEnabled()),
+    jsonPathEnabled: options.jsonPathEnabled ?? engineSyntaxJsonPathEnabled(),
+    initJsEnabled: js && (options.initJsEnabled ?? (engineSyntaxInitEnabled() && engineSyntaxInitJsEnabled())),
+  };
+  const memoKey = JSON.stringify(base);
+  let memo = varBagMemo.get(rules);
+  if (!memo) {
+    memo = new Map();
+    varBagMemo.set(rules, memo);
+  }
+  if (memo.has(memoKey)) return memo.get(memoKey)!;
+  const out = buildVarBag(rules, base);
+  memo.set(memoKey, out);
+  return out;
+}
+
+function buildVarBag(rules: Record<string, unknown>, base: ParseOptions): ReadonlyMap<string, FieldIr> | null {
+  const plan = varBagPlan(rules);
+  if (!plan) return null;
+  const sourceRules = resolveSourceVars(rules);
+  if (base.aioEnabled && aioGroups(sourceRules).has('ruleToc')) return null;
+  const listJs = base.jsEnabled && base.listJsEnabled ? listJsGroups(sourceRules) : new Set<string>();
+  const info = (sourceRules.ruleBookInfo ?? {}) as Record<string, unknown>;
+  const rawInfo = (rules.ruleBookInfo ?? {}) as Record<string, unknown>;
+  const toc = (sourceRules.ruleToc ?? {}) as Record<string, unknown>;
+  const out = new Map<string, FieldIr>();
+  const owner = new Set<string>();
+  try {
+    for (const name of plan.puts.keys()) {
+      const field = `ruleBookInfo.${name}`;
+      const map = varPutRules(String(rawInfo[name]));
+      if (!map) return null;
+      const varPuts: Array<readonly [string, FieldIr]> = [];
+      for (const [key, rule] of map) {
+        varPuts.push([key, parseFieldRule(rule, { ...base, jsEnabled: false, field: VAR_PUT_VALUE_FIELD })]);
+      }
+      const javaKeys = new Set<string>();
+      const rule = typeof info[name] === 'string' ? (info[name] as string) : '';
+      // 只剩 @put 的字段：legado 字段规则为空串，取值为空。
+      const ir: FieldIr = rule.trim() === ''
+        ? { rules: [{ kind: 'text', literal: '' }] }
+        : parseFieldRule(rule, { ...base, field, varBag: { mode: 'put', keys: javaKeys } });
+      for (const key of [...map.keys(), ...javaKeys]) {
+        if (owner.has(key) || (map.has(key) && javaKeys.has(key))) return null;
+        owner.add(key);
+      }
+      const bagged: FieldIr = { ...ir };
+      if (varPuts.length > 0) bagged.varPuts = varPuts;
+      if (javaKeys.size > 0) bagged.varPut = true;
+      out.set(field, bagged);
+    }
+    let reads = false;
+    for (const name of plan.gets.keys()) {
+      const field = `ruleToc.${name}`;
+      const keys = new Set<string>();
+      const ir = parseFieldRule(String(toc[name]), { ...base, field, listJsGroup: listJs.has('ruleToc'), varBag: { mode: 'get', keys } });
+      if (keys.size === 0) continue; // get 只出现在字面量/注释里：字段不读袋，普通编译即可
+      for (const key of keys) if (!owner.has(key)) return null;
+      out.set(field, { ...ir, varGets: true });
+      reads = true;
+    }
+    return reads ? out : null;
+  } catch {
+    return null;
+  }
+}
+
 /** LRU 上限：单测/低并发下足够；无关热路径，只防规则对象无限积累。 */
 const CACHE_LIMIT = 64;
 const cache = new Map<string, CompiledRules>();
@@ -829,9 +932,10 @@ export function compileSource(
   const initEnabled = options.initEnabled ?? engineSyntaxInitEnabled();
   const urlOptionsEnabled = options.urlOptionsEnabled ?? engineUrlOptionsEnabled();
   const initJsEnabled = initEnabled && (options.initJsEnabled ?? engineSyntaxInitJsEnabled());
+  const varBagEnabled = varsEnabled && (options.varBagEnabled ?? engineSyntaxVarsBagEnabled());
   const key = engineSourceRevision(source, {
     orEnabled, xpathEnabled, varsEnabled, jsEnabled, xpathEvalEnabled, regexEnabled, andEnabled, aioEnabled, listJsEnabled, jsExtEnabled,
-    jsBindEnabled, jsGetEnabled, jsUtilEnabled, jsonPathEnabled, initEnabled, urlOptionsEnabled, initJsEnabled,
+    jsBindEnabled, jsGetEnabled, jsUtilEnabled, jsonPathEnabled, initEnabled, urlOptionsEnabled, initJsEnabled, varBagEnabled,
   });
   const hit = cache.get(key);
   if (hit) {
@@ -861,6 +965,12 @@ export function compileSource(
       }
     }
   }
+  // varbag1028：变量袋对该源生效时换掉详情 put 字段与目录 get 字段（判据与语义位同一个 compileVarBag）。
+  const bag = varBagEnabled ? compileVarBag(source.rules, {
+    orEnabled, xpathEnabled, xpathEvalEnabled, jsEnabled, regexEnabled, andEnabled, aioEnabled, listJsEnabled, jsExtEnabled, jsBindEnabled,
+    jsGetEnabled, jsUtilEnabled, jsonPathEnabled, initJsEnabled,
+  }) : null;
+  if (bag) for (const [name, ir] of bag) compiled.set(name, ir);
   // init1028：可复现的 init 挂 initScope（详情字段改在 init 结果上求值，见 evaluate.ts bookInfoScope）；判据看原文，不看 vars 改写后的。
   const init = compiled.get('ruleBookInfo.init');
   const initRule = initRuleOf(source.rules);

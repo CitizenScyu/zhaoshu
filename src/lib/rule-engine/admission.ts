@@ -20,11 +20,13 @@ import {
 } from './compile-smoke';
 import { listJsGroups, parseFieldRule } from './parse';
 import {
-  bookInfoScope, createScope, evaluateField, evaluateFieldList, fieldUsesJs, normalizeBody,
+  bookInfoScope, createScope, evaluateField, evaluateFieldList, fieldUsesJs, normalizeBody, scopeVars, withVars,
 } from './evaluate';
 import { RuleEngineError, type FieldIr, type RuleDiagnostic } from './types';
-import { compileSource, engineSourceRevision } from './compile';
-import { engineSyntaxAioEnabled, engineSyntaxJsBindEnabled, engineSyntaxVarsEnabled, engineUrlOptionsEnabled } from './syntax-flags';
+import { compileSource, compileVarBag, engineSourceRevision } from './compile';
+import {
+  engineSyntaxAioEnabled, engineSyntaxJsBindEnabled, engineSyntaxVarsBagEnabled, engineSyntaxVarsEnabled, engineUrlOptionsEnabled,
+} from './syntax-flags';
 import { stripUrlOptions, urlOptionFields } from './url-options';
 import { aioGroups, isAioListRule, ruleGroupOf } from './aio-syntax';
 import { preloadJsSandbox } from './js-sandbox';
@@ -438,8 +440,15 @@ export function compileAdmission(source: RawSource): AdmissionCompile {
   const aio = engineSyntaxAioEnabled() ? aioGroups(rulesSource) : new Set<string>();
   // listjs1027：同 compileSource（开关判定在 parseFieldRule 里，jsEnabled 用同一个 coreJs）。
   const listJs = listJsGroups(rulesSource);
+  // varbag1028：同 compileSource——变量袋生效时详情 put 字段与目录 get 字段按带袋的编译结果算可解释。
+  const bag = engineSyntaxVarsEnabled() && engineSyntaxVarsBagEnabled()
+    ? compileVarBag(source as unknown as Record<string, unknown>, { jsEnabled: coreJs }) : null;
   for (const [field, rule] of iterRulePairs(rulesSource)) {
     if (!(field in coreFieldMask)) continue;
+    if (bag?.has(field)) {
+      coreFieldMask[field] = true;
+      continue;
+    }
     try {
       parseFieldRule(rule, {
         jsEnabled: coreJs, field, aioGroup: aio.has(ruleGroupOf(field)), listJsGroup: listJs.has(ruleGroupOf(field)),
@@ -1006,15 +1015,23 @@ export async function readabilityShadow(
     const detail = await get(gate(sample.url, sample.pageUrl));
     stage = 'toc';
     // init1028：tocUrl 同 api.ts engineFetchDetail 在 init 结果上求值；tocUrl 缺省/等于详情页时目录照旧读详情页原文（legado tocHtml）。
-    const rawToc = text('ruleBookInfo.tocUrl', bookInfoScope(compiled, detail.scope)).trim();
+    const info = bookInfoScope(compiled, detail.scope);
+    // varbag1028：变量袋源同运行时按 name → author → tocUrl 求值填袋，目录页带着袋求值。
+    if (scopeVars(info)) {
+      text('ruleBookInfo.name', info);
+      text('ruleBookInfo.author', info);
+    }
+    const rawToc = text('ruleBookInfo.tocUrl', info).trim();
     const tocUrl = rawToc ? gate(rawToc, detail.url, field('ruleBookInfo.tocUrl')) : detail.url;
-    const toc = tocUrl === detail.url ? detail : await get(tocUrl);
+    const tocPage = tocUrl === detail.url ? detail : await get(tocUrl);
+    const bag = scopeVars(info);
+    const toc = bag ? { ...tocPage, scope: withVars(tocPage.scope, bag) } : tocPage;
     const list = field('ruleToc.chapterList');
     const urls: string[] = [];
     const titles: string[] = [];
     for (const inner of list ? evaluateFieldList(list, toc.scope) : []) {
       const title = text('ruleToc.chapterName', inner);
-      const urlScope = inner.host ? { ...inner, host: { ...inner.host, chapterTitle: title } } : inner;
+      const urlScope = inner.host?.origin !== undefined ? { ...inner, host: { ...inner.host, chapterTitle: title } } : inner;
       const rawUrl = text('ruleToc.chapterUrl', urlScope).trim();
       let chapterUrl: string;
       try { chapterUrl = rawUrl ? gate(rawUrl, toc.url, field('ruleToc.chapterUrl')) : toc.url; } catch { continue; }

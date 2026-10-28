@@ -164,3 +164,88 @@ export function resolveSourceVars<T extends object>(rules: T): T {
   }
   return (out ?? rules) as T;
 }
+
+// ---- 详情页 put → 目录页 get 变量袋（varbag1028，ENGINE_SYNTAX_VARS_BAG）----
+/** 放 put 的详情字段（legado BookInfo 求值顺序）与读 get 的目录非列表字段。 */
+export const VAR_BAG_PUT_FIELDS = ['name', 'author', 'tocUrl'] as const;
+const VAR_BAG_GET_FIELDS: ReadonlySet<string> = new Set(['chapterName', 'chapterUrl', 'nextTocUrl']);
+/** legado get() 先认的内置键、以及会落到原型链上的键：袋里不收。 */
+export const VAR_BAG_RESERVED_KEYS: ReadonlySet<string> = new Set(['bookName', 'title', '__proto__']);
+const JAVA_PUT_ANY = /(?<![\w$])java\s*\.\s*put\s*\(/g;
+const JAVA_GET_ANY = /(?<![\w$])java\s*\.\s*get\s*\(/g;
+const JAVA_PUT_LITERAL = /(?<![\w$])java\s*\.\s*put\s*\(\s*(['"])([^'"]+)\1\s*,/g;
+const JAVA_GET_LITERAL = /(?<![\w$])java\s*\.\s*get\s*\(\s*(['"])([^'"]+)\1\s*\)/g;
+const GET_ANY_RE = /@get:\{([^}]+?)\}/gi;
+
+/** 变量袋的文本级计划：每个详情 put 字段放的键、每个目录 get 字段读的键。编译期（compile.ts）再逐字段核实。 */
+export interface VarBagPlan {
+  puts: ReadonlyMap<string, ReadonlySet<string>>;
+  gets: ReadonlyMap<string, ReadonlySet<string>>;
+}
+
+const count = (text: string, re: RegExp): number => [...text.matchAll(re)].length;
+
+/**
+ * 原始规则（未经 resolveSourceVars）上判变量袋子集，不在子集内返回 null：
+ * - put（`@put:{…}` 与键为字面量的 `java.put('k', …)`）只在 ruleBookInfo.name/author/tocUrl；
+ * - get 只在 ruleToc 非列表字段（`@get:{k}` 与 `java.get('k')`），详情页内 `@get` 归 resolveSourceVars；
+ * - 键都是字面量、get 的键都被 put 过、一个键只由一个字段放（同字段 @put 与 java.put 也不重键）、不碰保留键；
+ * - 详情页 init 不是 JS（JS init 可能把内容换成对象，put 规则求值口径对不上）。
+ * 只是文本粗筛：字段能否编译、键在编译后是否真被收进来由调用方核实。
+ */
+export function varBagPlan(rules: object): VarBagPlan | null {
+  const source = rules as Record<string, unknown>;
+  const puts = new Map<string, Set<string>>();
+  const gets = new Map<string, Set<string>>();
+  if (typeof source.searchUrl === 'string' && usesBag(source.searchUrl)) return null;
+  for (const group of RULE_GROUPS) {
+    const fields = source[group];
+    if (!fields || typeof fields !== 'object' || Array.isArray(fields)) continue;
+    for (const [name, rule] of Object.entries(fields as Record<string, unknown>)) {
+      if (typeof rule !== 'string') continue;
+      const putCount = count(rule, PUT_RE) + count(rule, JAVA_PUT_ANY);
+      const javaGets = count(rule, JAVA_GET_ANY);
+      if (putCount > 0) {
+        if (group !== 'ruleBookInfo' || !(VAR_BAG_PUT_FIELDS as readonly string[]).includes(name)) return null;
+        const javaKeys = [...rule.matchAll(JAVA_PUT_LITERAL)].map((match) => match[2]);
+        if (javaKeys.length !== count(rule, JAVA_PUT_ANY)) return null;
+        const mapKeys = rulePuts(rule);
+        if (!mapKeys) return null;
+        if (javaKeys.some((key) => mapKeys.has(key))) return null;
+        puts.set(name, new Set([...mapKeys.keys(), ...javaKeys]));
+      }
+      if (group === 'ruleBookInfo') {
+        if (javaGets > 0) return null;
+        continue;
+      }
+      if (javaGets === 0 && !/@get:/i.test(rule)) continue;
+      if (group !== 'ruleToc' || !VAR_BAG_GET_FIELDS.has(name)) return null;
+      const javaKeys = [...rule.matchAll(JAVA_GET_LITERAL)].map((match) => match[2]);
+      if (javaKeys.length !== javaGets) return null;
+      const keys = [...[...rule.matchAll(GET_ANY_RE)].map((match) => match[1]), ...javaKeys];
+      if (count(rule, /@get:/gi) !== count(rule, GET_ANY_RE)) return null;
+      gets.set(name, new Set(keys));
+    }
+  }
+  const info = source.ruleBookInfo as Record<string, unknown> | undefined;
+  if (typeof info?.init === 'string' && /<js>|@js:/i.test(info.init)) return null;
+  if (gets.size === 0) return null;
+  const owner = new Map<string, string>();
+  for (const [name, keys] of puts) {
+    for (const key of keys) {
+      if (VAR_BAG_RESERVED_KEYS.has(key) || owner.has(key)) return null;
+      owner.set(key, name);
+    }
+  }
+  for (const keys of gets.values()) for (const key of keys) if (!owner.has(key)) return null;
+  return { puts, gets };
+}
+
+function usesBag(rule: string): boolean {
+  return /@(?:put|get):/i.test(rule) || count(rule, JAVA_PUT_ANY) + count(rule, JAVA_GET_ANY) > 0;
+}
+
+/** 字段原文里全部 `@put:{…}` 合并成的键 → 规则（varbag1028 编译用）；任一块解析不了返回 null。 */
+export function varPutRules(rule: string): Map<string, string> | null {
+  return rulePuts(rule);
+}

@@ -777,7 +777,7 @@ async function confirmSourceBook(
         // 「详情页无作者规则的同名异作者书」会被记成请求作者（入口只有用户点选，且 probe ok 已过 sourceBookMatches）。
         const identity = engineIdentityOf(detail, book);
         if (!identity.title) throw confirmFailure('该书源的详情页解析失败（取不到书名），请换一个候选。', 'detail_unparsed');
-        const toc = await engineFetchToc(engineSource, detail.tocUrl ?? url, context);
+        const toc = await engineFetchToc(engineSource, detail.tocUrl ?? url, context, false, detail.vars);
         if (!toc.chapters.length) throw confirmFailure('该书源的目录为空（站点可能改版或拦截），请重试或换一个候选。', 'toc_empty');
         const fallback = identityFallbackOf(detail, book);
         // 回退成功的确认也要看得见（confirmtocrev §8-1）：请求书与站上书不是同一本时，目录会记成请求的书名，
@@ -917,7 +917,7 @@ export async function resolveSourceBook(
             const identity = engineIdentityOf(detail, result);
             // 引擎只解释规则，不判断「这是不是那本书」——identity 是业务语义，留在调用方（§7.2）。
             if (!sourceBookMatches(book, identity)) continue;
-            const toc = await engineFetchToc(engineSource, detail.tocUrl ?? result.bookUrl, sourceContext);
+            const toc = await engineFetchToc(engineSource, detail.tocUrl ?? result.bookUrl, sourceContext, false, detail.vars);
             if (!toc.chapters.length) continue;
             const catalog = engineCatalogFrom(result.bookUrl, source, identity, toc.chapters);
             matches.set(catalog.bookUrl, catalog);
@@ -952,7 +952,7 @@ export async function resolveSourceBook(
               const detail = await engineFetchDetail(engineSource, result.bookUrl, sourceContext);
               const identity = engineIdentityOf(detail, result);
               if (!sourceBookMatches(book, identity)) continue;
-              const toc = await engineFetchToc(engineSource, detail.tocUrl ?? result.bookUrl, sourceContext);
+              const toc = await engineFetchToc(engineSource, detail.tocUrl ?? result.bookUrl, sourceContext, false, detail.vars);
               if (!toc.chapters.length) continue;
               const catalog = engineCatalogFrom(result.bookUrl, source, identity, toc.chapters);
               matches.set(catalog.bookUrl, catalog);
@@ -1333,7 +1333,7 @@ async function surveyOneSource(
         const detail = await engineFetchDetail(engineSource, result.bookUrl, context);
         const identity = engineIdentityOf(detail, result);
         if (!sourceBookMatches(book, identity)) continue;
-        const toc = await engineFetchToc(engineSource, detail.tocUrl ?? result.bookUrl, context);
+        const toc = await engineFetchToc(engineSource, detail.tocUrl ?? result.bookUrl, context, false, detail.vars);
         if (!toc.chapters.length) continue;
         return record(engineCatalogFrom(result.bookUrl, source, identity, toc.chapters));
       }

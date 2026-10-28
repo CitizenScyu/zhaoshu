@@ -201,7 +201,7 @@ export async function downloadBook(m, args, resolveSource, transport = fetchSour
     manifest.bookUrl = selected.bookUrl;
     stage = 'toc';
     const toc = () => operation(async ctx => {
-      if (!builtin) return (await m.api.engineFetchToc(engine, selected.tocUrl ?? selected.bookUrl, ctx, true)).chapters;
+      if (!builtin) return (await m.api.engineFetchToc(engine, selected.tocUrl ?? selected.bookUrl, ctx, true, selected.vars)).chapters;
       const page = await ctx.page(selected.bookUrl);
       return m.parser.parseSourceChapters(page.text, page.url);
     });
