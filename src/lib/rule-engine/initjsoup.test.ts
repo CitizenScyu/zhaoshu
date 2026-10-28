@@ -172,6 +172,42 @@ describe('求值', () => {
   });
 });
 
+describe('局部 var book 遮蔽宿主绑定', () => {
+  const SHADOW = '@js:var doc = org.jsoup.Jsoup.parse(result);\n'
+    + 'var book = {name: String(doc.select(".info h1").text()), tocUrl: String(doc.select("meta[property=og:novel:read_url]").attr("content"))};\n'
+    + 'book.author = String(doc.select(".writer").text()).replace("作者：", "");\nbook;';
+
+  it('首个 book 是第 0 层 var 声明：按局部变量收，返回对象照常取详情', async () => {
+    const init = compiledInit(SHADOW);
+    expect(init?.jsoup).toBe(true);
+    expect(compiledInit(SHADOW, OFF)).toBeUndefined();
+    const pages = new Map([[BOOK_URL, HTML_PAGE]]);
+    const bookInfo = { init: SHADOW, name: 'name', author: 'author', tocUrl: 'tocUrl' };
+    expect(await engineFetchDetail(engineSource(bookInfo), BOOK_URL, fakeContext(pages)))
+      .toEqual({ title: '书名', author: '某人', tocUrl: TOC_URL });
+  });
+
+  it('声明前先读宿主 book、块内/表达式内声明、有提升的函数声明、非 init 字段：照旧拒', () => {
+    for (const init of [
+      '@js:var o = book.origin; var doc = org.jsoup.Jsoup.parse(result); var book = {name: o}; book;',
+      '@js:var doc = org.jsoup.Jsoup.parse(result); if (doc) { var book = {name: "x"}; } book;',
+      '@js:var doc = org.jsoup.Jsoup.parse(result); var a = 1, book = {name: "x"}; book;',
+      '@js:var doc = org.jsoup.Jsoup.parse(result); var book = {name: f()}; function f(){ return String(doc.select("h1").text()); } book;',
+      '@js:var doc = org.jsoup.Jsoup.parse(result); let book = {name: "x"}; book;',
+    ]) {
+      expect(compiledInit(init)).toBeUndefined();
+    }
+    const name = compileSource(sourceOf({ name: '@js:var doc = org.jsoup.Jsoup.parse(result); var book = {n: "x"}; book.n' }), ON)
+      .get('ruleBookInfo.name');
+    expect(name !== undefined && 'skipped' in name).toBe(true);
+  });
+
+  it('遮蔽 init 的源计入 jsoup init 位', () => {
+    const using = sourceOf({ init: SHADOW, name: 'name' });
+    expect(versionOf(engineSourceRevision(using, ON)) - versionOf(engineSourceRevision(using, OFF))).toBe(ENGINE_SEMANTICS_INIT_JSOUP_BIT);
+  });
+});
+
 describe('按源判定', () => {
   it('jsoup init 的源只多翻 jsoup init 位；普通 JS init、非 JS init、jsoup 关不翻', () => {
     const using = sourceOf({ init: SOUP_INIT, name: 'name' });

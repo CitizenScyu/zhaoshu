@@ -54,9 +54,9 @@ let varBag: VarBagParse | undefined;
 /**
  * 当前 parseFieldRule 帧的 jsoup 直连重试（jsoup1028，ParseOptions.jsoupEnabled）：off 态口径编译被拒的字段才在这一帧里重编，
  * 帧内放行 `java.getElement(s)("规则")`（实参编进 elements）、`org.jsoup.Jsoup.parse`、条目级 `result`/`src`、列表链首段规则。
- * 嵌套解析不继承。`options` = 实参规则的编译开关（不含 JS）。
+ * 嵌套解析不继承。`options` = 实参规则的编译开关（不含 JS）。`init`（initjsoup1028）= 帧所在字段是 `ruleBookInfo.init`。
  */
-let jsoupFrame: { elements: Map<string, FieldIr>; options: ParseOptions } | undefined;
+let jsoupFrame: { elements: Map<string, FieldIr>; options: ParseOptions; init?: boolean } | undefined;
 
 /**
  * 当前 parseFieldRule 帧的书籍成员重试（book1028，ParseOptions.bookFieldsEnabled）：off 态口径编译被拒的字段才在这一帧里重编，
@@ -707,7 +707,9 @@ function parseFieldRuleFramed(rule: string, options: ParseOptions): FieldIr {
     };
     for (const attempt of attempts) {
       restoreBag();
-      const frame = attempt.jsoup ? { elements: new Map<string, FieldIr>(), options: jsSegmentOptions(options) } : undefined;
+      const frame = attempt.jsoup
+        ? { elements: new Map<string, FieldIr>(), options: jsSegmentOptions(options), init: options.field === 'ruleBookInfo.init' }
+        : undefined;
       const puts = attempt.jsoup ? options.bookVariablePuts : undefined;
       const book = attempt.book && members ? { members, used: new Set<string>(), puts, vars: new Set<string>() } : undefined;
       jsoupFrame = frame;
@@ -1353,8 +1355,10 @@ function checkJsCode(
   const got = gets ? collectJavaGets(code, rule, gets) : code;
   const collected = frame && bookFrame?.puts && binds?.has('book') ? collectBookVariables(got, bookFrame) : got;
   const bare = stripJsLiterals(collectVarCalls(frame ? collectJsoupCalls(collected, rule, frame) : collected)) ?? reject('字符串/注释未闭合');
+  const localBook = frame?.init === true && bookShadowed(bare);
   for (const match of bare.matchAll(/(?<![.\w$])[A-Za-z_$][\w$]*/g)) {
     const name = match[0];
+    if (localBook && name === 'book') continue;
     const members = binds?.get(name);
     if (members) {
       checkBoundRef(bare, match.index, name, members, reject);
@@ -1371,6 +1375,24 @@ function checkJsCode(
     }
     if (!member || !JS_JAVA_HELPERS.has(member[1])) reject(`用了沙箱不提供的 java.${member?.[1] ?? '[…]'}`);
   }
+}
+
+/**
+ * initjsoup1028：init 代码（已剥字面量）里 `book` 是否只是局部变量——legado Rhino 里顶层 `var book = …` 直接覆盖 evalJS 绑定的
+ * book（沙箱里注入的 book 也是可写全局属性，同样被覆盖）。只认：首个 `book` 就是第 0 层语句开头的 `var book =`，且没有会提升的
+ * `function 名(` 声明（其体可能先于这条声明执行、读到宿主 book）。
+ */
+function bookShadowed(bare: string): boolean {
+  const first = /(?<![.\w$])book(?![\w$])/.exec(bare);
+  if (first === null) return false;
+  const before = bare.slice(0, first.index);
+  if (!/(?:^|[;{}\n])\s*var\s+$/.test(before) || !/^\s*=(?!=)/.test(bare.slice(first.index + 4))) return false;
+  let depth = 0;
+  for (const ch of before) {
+    if (ch === '{' || ch === '(' || ch === '[') depth += 1;
+    else if (ch === '}' || ch === ')' || ch === ']') depth -= 1;
+  }
+  return depth === 0 && !/(?<![.\w$])function\s+[A-Za-z_$]/.test(bare);
 }
 
 // ---- 对称加解密 / toNumChapter 帮手（jsutil1028，ENGINE_SYNTAX_JS_UTIL）----
