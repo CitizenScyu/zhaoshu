@@ -672,7 +672,9 @@ export const JSOUP_PRELUDE = `(function(){
     else return bad('Jsoup.parse 的实参不是字符串');
     return E(call('P', '', s));
   }
-  var ns = freeze({ jsoup: freeze({ Jsoup: freeze({ parse: parse }) }) });
+  // pkgalias1029：nodes.Document/Element 只给占位对象——编译期已核别名定义后不再使用。
+  var ns = freeze({ jsoup: freeze({ Jsoup: freeze({ parse: parse }),
+    nodes: freeze({ Document: freeze({}), Element: freeze({}) }) }) });
   globalThis.org = ns;
   globalThis.Packages = freeze({ org: ns });
   function initVal(spec) { var rest = slice(spec, 2); return slice(spec, 0, 1) === 'E' ? E(rest) : L(idList(rest)); }

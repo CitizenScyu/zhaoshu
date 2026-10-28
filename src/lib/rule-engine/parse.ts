@@ -1567,16 +1567,53 @@ const JAVA_GET_ELEMENTS_CALL_RE = /(?<![\w$.])java\s*\.\s*getElements?\s*\(\s*("
 const JSOUP_PARSE_RE = /(?<![\w$.])(?:Packages\s*\.\s*)?org\s*\.\s*jsoup\s*\.\s*Jsoup\s*\.\s*parse(?![\w$])/g;
 
 /**
+ * jsoup 类别名（pkgalias1029）：`var NAME = [Packages.]org.jsoup.Jsoup;` / `….nodes.Document;` / `….nodes.Element;`，须以 `;` 收尾。
+ */
+const JSOUP_CLASS_ALIAS_RE = /(?<![\w$.])var\s+([A-Za-z_$][\w$]*)\s*=\s*((?:Packages\s*\.\s*)?org\s*\.\s*jsoup\s*\.\s*(Jsoup|nodes\s*\.\s*(?:Document|Element)))\s*;/g;
+
+/**
  * jsoup 帧内：字面量实参的 `java.getElement(s)` 编进 frame.elements（须是取节点的规则）、`Jsoup.parse` 入口换成 `(0)`，
  * 其余 `org`/`Packages`/动态实参照旧交白名单拒。
  */
 function collectJsoupCalls(code: string, rule: string, frame: NonNullable<typeof jsoupFrame>): string {
+  code = collectJsoupAliases(code, rule);
   const before = new Set(frame.elements.keys());
   const out = collectLiteralCalls(code, JAVA_GET_ELEMENTS_CALL_RE, rule, { options: frame.options, out: frame.elements }, 'java.getElements');
   for (const [text, field] of frame.elements) {
     if (!before.has(text) && !nodeFieldIr(field)) unsupported('JS 段 java.getElements 的实参不是取节点的规则', rule, { code: 'unsupported_js' });
   }
   return out.replace(JSOUP_PARSE_RE, '(0)');
+}
+
+/**
+ * jsoup 类别名（pkgalias1029）：定义处的类引用换成 `(0)`；Jsoup 别名只许 `NAME.parse` 用法（同样换成 `(0)`，沙箱的 Jsoup 只有
+ * parse），nodes.Document/Element 别名定义后不许再用（沙箱只给占位对象，legado 里是 Java 类）。换完后 NAME 只许剩定义处
+ * 那一个；重定义、遮住保留名、其余用法一律交白名单拒。
+ */
+function collectJsoupAliases(code: string, rule: string): string {
+  const aliases: { name: string; jsoup: boolean }[] = [];
+  let out = '';
+  let last = 0;
+  for (const match of code.matchAll(JSOUP_CLASS_ALIAS_RE)) {
+    const [whole, name, target, cls] = match;
+    if (JS_ALIAS_RESERVED.has(name) || JS_BANNED_IDENTIFIERS.has(name) || aliases.some((a) => a.name === name)) continue;
+    if (!startsInCode(code, match.index)) continue;
+    aliases.push({ name, jsoup: cls === 'Jsoup' });
+    const at = match.index + whole.indexOf(target, whole.indexOf('='));
+    out += `${code.slice(last, at)}(0)`;
+    last = at + target.length;
+  }
+  if (aliases.length === 0) return code;
+  let rewritten = out + code.slice(last);
+  for (const { name, jsoup } of aliases) {
+    const escaped = name.replace(/\$/g, '\\$');
+    if (jsoup) rewritten = rewritten.replace(new RegExp(`(?<![\\w$.])${escaped}\\s*\\.\\s*parse(?![\\w$])`, 'g'), '(0)');
+    const bare = stripJsLiterals(rewritten);
+    if (bare === null) return code;
+    const uses = [...bare.matchAll(new RegExp(`(?<![\\w$.])${escaped}(?![\\w$])`, 'g'))].length;
+    if (uses !== 1) unsupported(`JS 段 jsoup 类别名 ${name} 有${jsoup ? ' parse 以外的' : ''}用法`, rule, { code: 'unsupported_js' });
+  }
+  return rewritten;
 }
 
 /** 取节点的规则（jsoup1028）：单条不带末端操作的 CSS（或各支都是这种 CSS 的 ||/&&），不带链/替换/拼接/变量。 */
