@@ -259,7 +259,9 @@ export const ENGINE_SEMANTICS_JS_UTIL_BIT = 8192;
  * ENGINE_SYNTAX_JS_UTIL 独立开关（jsutil1028，默认 off，口径同 ENGINE_SYNTAX_OR；须 ENGINE_SYNTAX_JS 同开才生效）。
  * on = 字符串字段的 JS 链里放行 `java.createSymmetricCrypto(...)` 的 decryptStr/encryptBase64/encryptHex、几个等价的弃用
  * aes/des/3DES 包装与 `java.toNumChapter`，按 legado（hutool SymmetricCrypto、StringUtils.stringToInt）口径在宿主实现；
- * 口径不定的输入（非字符串实参、非 UTF-8 明文、奇数长 hex、CBC 缺 IV…）一律求值失败。off = 逐字不变。
+ * 口径不定的输入（非字符串实参、非 UTF-8 明文、奇数长 hex、CBC 缺 IV…）一律求值失败。t2s1029 另收 `java.t2s`（quick-transfer
+ * 0.2.17 词典 + legado fixT2sDict 排除词，t2s.ts），结果在 Rhino 里是 Java String，只收完成值、字符串拼接与 String() 实参。
+ * off = 逐字不变。
  */
 export function engineSyntaxJsUtilEnabled(env: OrEnv = process.env): boolean {
   const raw = env.ENGINE_SYNTAX_JS_UTIL?.trim().toLowerCase();

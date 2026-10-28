@@ -309,10 +309,11 @@ export const JS_JAVA_GETTERS: ReadonlySet<string> = new Set(['getString', 'getSt
 /**
  * 对称加解密与章节号帮手（jsutil1028）：不在 JS_JAVA_HELPERS 里，只在 ENGINE_SYNTAX_JS_UTIL on 时放行。弃用的 aes/des/3DES 包装
  * 只收 legado 里等价于 createSymmetricCrypto(...).decryptStr/encryptBase64 的几个（js-sandbox.ts UTIL_PRELUDE 同名单）。
+ * t2s1029 另收繁转简 `t2s`（结果只许按字符串用，见 parse.ts checkT2sCall）。
  */
 export const JS_JAVA_UTIL_HELPERS: ReadonlySet<string> = new Set([
   'createSymmetricCrypto', 'aesBase64DecodeToString', 'aesDecodeToString', 'aesEncodeToBase64String', 'desDecodeToString',
-  'desBase64DecodeToString', 'desEncodeToBase64String', 'tripleDESDecodeStr', 'tripleDESEncodeBase64Str', 'toNumChapter',
+  'desBase64DecodeToString', 'desEncodeToBase64String', 'tripleDESDecodeStr', 'tripleDESEncodeBase64Str', 'toNumChapter', 't2s',
 ]);
 export const MAX_CSS_CHAIN_DEPTH = 8; //         CssStep 链深上限
 export const MAX_REGEX_PATTERN_LENGTH = 256; //  正则 pattern 长度上限

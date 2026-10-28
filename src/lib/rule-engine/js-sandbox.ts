@@ -12,6 +12,7 @@
 import { createHash } from 'node:crypto';
 import type { QuickJSContext, QuickJSHandle, QuickJSSyncVariant, QuickJSWASMModule } from 'quickjs-emscripten-core';
 import { symmetricCrypt, toNumChapter, type SymOp } from './js-util';
+import { t2s } from './t2s';
 import type { JElement } from './jsoup-dom';
 import {
   decodeJsoupInit, decodeJsoupItems, decodeJsoupValue, exportJsoup, installJsoupHost, JSOUP_PRELUDE, type JsoupListItem, type JsoupMode,
@@ -213,13 +214,13 @@ const PRELUDE = `(function(){
   if (Array.isArray(globalThis.result)) asList(globalThis.result);
 })();`;
 
-// jsutil1028：加解密 / toNumChapter 帮手，排在 PRELUDE 前（PRELUDE 末尾冻结 java）。宿主函数藏在 __jsutil 里，闭包取走后删掉全局。
+// jsutil1028：加解密 / toNumChapter / t2s（t2s1029）帮手，排在 PRELUDE 前（PRELUDE 末尾冻结 java）。宿主函数藏在 __jsutil 里，闭包取走后删掉全局。
 // 实参严格按 legado 的 Kotlin 签名：个数不对、非字符串（null 只在可空处放行）、含孤立代理项一律经 bad() 致命失败。
 // createSymmetricCrypto 返回代理：只有 decryptStr/encryptBase64/encryptHex 三个方法，碰其他属性（decrypt/encrypt、toString…）致命。
 const UTIL_PRELUDE = `(function(){
   var u = globalThis.__jsutil, j = globalThis.java;
   delete globalThis.__jsutil;
-  var bad = u.bad, sym = u.sym, num = u.num, P = Proxy, S = String;
+  var bad = u.bad, sym = u.sym, num = u.num, t2 = u.t2s, P = Proxy, S = String;
   var cca = Function.prototype.call.bind(String.prototype.charCodeAt);
   var hasOwn = Function.prototype.call.bind(Object.prototype.hasOwnProperty);
   function str(v, what) {
@@ -272,6 +273,10 @@ const UTIL_PRELUDE = `(function(){
   j.toNumChapter = function(s) {
     arity(arguments.length, 1, 'toNumChapter');
     return s === null ? null : num(str(s, 'toNumChapter 实参'));
+  };
+  j.t2s = function(s) {
+    arity(arguments.length, 1, 't2s');
+    return t2(str(s, 't2s 实参'));
   };
 })();
 `;
@@ -522,6 +527,7 @@ function installUtilHost(context: QuickJSContext, host: { failure?: unknown }): 
     return symmetricCrypt(op as SymOp | 'check', transformation, key, iv, data);
   });
   add('num', ([text]) => toNumChapter(text));
+  add('t2s', ([text]) => t2s(text));
   add('bad', ([what]) => {
     throw new Error(`java 帮手不支持：${what}`);
   });

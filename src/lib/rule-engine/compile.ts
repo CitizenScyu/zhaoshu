@@ -812,9 +812,9 @@ export function sourceUsesListGetSyntax(
 
 const jsUtilMemo = new WeakMap<object, Map<string, boolean>>();
 
-/** 可能受 jsutil1028 影响的规则：JS 规则里出现加解密帮手或 toNumChapter 的名字。宁宽勿漏，实编译再判。 */
+/** 可能受 jsutil1028 影响的规则：JS 规则里出现加解密帮手、toNumChapter 或 t2s（t2s1029）的名字。宁宽勿漏，实编译再判。 */
 function ruleMayUseJsUtil(rule: string): boolean {
-  return ruleHasJs(rule) && /java\s*\.\s*(?:createSymmetricCrypto|aes|des|tripleDES|toNumChapter)/.test(rule);
+  return ruleHasJs(rule) && /java\s*\.\s*(?:createSymmetricCrypto|aes|des|tripleDES|toNumChapter|t2s)/.test(rule);
 }
 
 /**

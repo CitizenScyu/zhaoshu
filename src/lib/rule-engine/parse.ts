@@ -1077,7 +1077,15 @@ function parseJsChain(trimmed: string, rule: string, options: ParseOptions): Fie
   for (const match of trimmed.matchAll(JS_SEGMENT_RE)) {
     pushRule(trimmed.slice(last, match.index));
     // srcbind1028：先代入书源常量（帧外原样），注释 eval 的注释代码按本段口径过白名单。
-    const code = bindSourceConsts(match[1] ?? match[2] ?? '', (comment) => checkJsCode(comment, rule, itemLevel, jsExt, binds, gets, util));
+    const code = bindSourceConsts(match[1] ?? match[2] ?? '', (comment) => {
+      // t2s1029：注释 eval 的代码求值结果会回到外层代码里，完成值不算按字符串取。
+      if (util) util.evalBody = true;
+      try {
+        checkJsCode(comment, rule, itemLevel, jsExt, binds, gets, util);
+      } finally {
+        if (util) util.evalBody = false;
+      }
+    });
     // jsoup1028：帧内条目级首段 JS 的 result/src 是条目 Element（evaluate.ts evaluateJsoupChain），读输入也收。
     const first = itemLevel && chain.length === 0;
     const detached = first && jsExt && !jsReadsInput(code);
@@ -1389,6 +1397,7 @@ function checkJsCode(
     if (name !== 'java') continue;
     const member = /^\s*\.\s*([A-Za-z_$][\w$]*)/.exec(bare.slice(match.index + name.length));
     if (member && util && JS_JAVA_UTIL_HELPERS.has(member[1])) {
+      if (member[1] === 't2s') checkT2sCall(bare, match.index, match.index + name.length + member[0].length, util, reject);
       util.used = true;
       continue;
     }
@@ -1415,9 +1424,36 @@ function bookShadowed(bare: string): boolean {
 }
 
 // ---- 对称加解密 / toNumChapter 帮手（jsutil1028，ENGINE_SYNTAX_JS_UTIL）----
-/** 一条 JS 链编译期的帮手使用记录：任一段用到即 `used`。 */
+/** 一条 JS 链编译期的帮手使用记录：任一段用到即 `used`。`evalBody` = 正在查注释 eval 的代码（t2s1029）。 */
 interface JsUtil {
   used: boolean;
+  evalBody?: boolean;
+}
+
+/**
+ * t2s1029：`java.t2s(…)` 在 Rhino 里返回 Java String 包装（typeof 'object'、`.length` 是方法、`===` 比引用），沙箱给的是 JS 字符串。
+ * 只收两者同结果的位置：整段代码的完成值（前接串首/`;`/`}`、后接串尾/`;`；注释 eval 的代码除外）与 sourceConstSafe 认的
+ * 字符串拼接/`String()` 实参。`start`/`at` = `java` 的起点与 `java.t2s` 之后的位置；须紧跟一对不含模板字面量的括号。
+ */
+function checkT2sCall(bare: string, start: number, at: number, util: JsUtil, reject: (why: string) => never): void {
+  const open = /^\s*\(/.exec(bare.slice(at));
+  if (!open) return reject('只收直接调用的 java.t2s(…)');
+  let depth = 0;
+  let end = -1;
+  for (let i = at + open[0].length - 1; i < bare.length; i += 1) {
+    const ch = bare[i];
+    if (ch === '`') break;
+    if (ch === '(') depth += 1;
+    else if (ch === ')' && --depth === 0) {
+      end = i + 1;
+      break;
+    }
+  }
+  if (end < 0) reject('java.t2s 的实参形态不支持');
+  const before = bare.slice(0, start).trimEnd();
+  const after = bare.slice(end).trim();
+  if (util.evalBody !== true && /(?:^|[;}])$/.test(before) && (after === '' || after === ';')) return;
+  if (!sourceConstSafe(bare, start, end, false)) reject('把 java.t2s 的结果当 JS 字符串用（Rhino 里是 Java String）');
 }
 
 // ---- java.getString/getStringList（jsget1028，ENGINE_SYNTAX_JS_GET）----
