@@ -235,8 +235,8 @@ export interface FieldIr {
    */
   jsGets?: ReadonlyMap<string, FieldIr>;
   /**
-   * JS 链用到了对称加解密 / toNumChapter 帮手（jsutil1028，ENGINE_SYNTAX_JS_UTIL）：求值期只给这样的字段装这批帮手，
-   * 其余字段的沙箱逐字不变（见 js-sandbox.ts JsBindings.utilHelpers）。
+   * JS 链用到了对称加解密 / toNumChapter / t2s 帮手（jsutil1028，ENGINE_SYNTAX_JS_UTIL；列表 JS 自 listutil1029 起）：求值期只给
+   * 这样的字段装这批帮手，其余字段的沙箱逐字不变（见 js-sandbox.ts JsBindings.utilHelpers）。
    */
   jsUtil?: true;
   /**

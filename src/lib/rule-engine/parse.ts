@@ -616,7 +616,7 @@ export interface ParseOptions {
   listGetEnabled?: boolean;
   /**
    * 对称加解密 / toNumChapter 帮手（ENGINE_SYNTAX_JS_UTIL，jsutil1028；须 jsEnabled）：字符串字段 JS 链里放行 JS_JAVA_UTIL_HELPERS，
-   * 用到的字段标 FieldIr.jsUtil（列表 JS 与 makeUp 不收）。默认读 env（缺失=off）。
+   * 用到的字段标 FieldIr.jsUtil（makeUp 不收；列表 JS 自 listutil1029 起同收）。默认读 env（缺失=off）。
    */
   jsUtilEnabled?: boolean;
   /**
@@ -1077,15 +1077,7 @@ function parseJsChain(trimmed: string, rule: string, options: ParseOptions): Fie
   for (const match of trimmed.matchAll(JS_SEGMENT_RE)) {
     pushRule(trimmed.slice(last, match.index));
     // srcbind1028：先代入书源常量（帧外原样），注释 eval 的注释代码按本段口径过白名单。
-    const code = bindSourceConsts(match[1] ?? match[2] ?? '', (comment) => {
-      // t2s1029：注释 eval 的代码求值结果会回到外层代码里，完成值不算按字符串取。
-      if (util) util.evalBody = true;
-      try {
-        checkJsCode(comment, rule, itemLevel, jsExt, binds, gets, util);
-      } finally {
-        if (util) util.evalBody = false;
-      }
-    });
+    const code = bindSourceConsts(match[1] ?? match[2] ?? '', (comment) => checkCommentCode(comment, rule, itemLevel, jsExt, binds, gets, util));
     // jsoup1028：帧内条目级首段 JS 的 result/src 是条目 Element（evaluate.ts evaluateJsoupChain），读输入也收。
     const first = itemLevel && chain.length === 0;
     const detached = first && jsExt && !jsReadsInput(code);
@@ -1164,6 +1156,8 @@ function parseListJsChain(rule: string, options: ParseOptions): FieldIr {
       out: new Map(),
     }
     : undefined;
+  // listutil1029：加解密 / toNumChapter / t2s 帮手同字段 JS（ENGINE_SYNTAX_JS_UTIL），求值期 listBookBindings 装帮手。
+  const util: JsUtil | undefined = (options.jsUtilEnabled ?? engineSyntaxJsUtilEnabled()) ? { used: false } : undefined;
   const chain: ChainStage[] = [];
   let last = 0;
   for (const match of text.matchAll(JS_SEGMENT_RE)) {
@@ -1178,8 +1172,8 @@ function parseListJsChain(rule: string, options: ParseOptions): FieldIr {
     const ext = options.jsExtEnabled ?? engineSyntaxJsExtEnabled();
     // book1028：帧内列表 JS 也可读 book（legado 目录 getElements 的 ruleData 即 Book）。
     const binds = bookFrame ? fieldBinds(options.field) : undefined;
-    const code = bindSourceConsts(match[1] ?? match[2] ?? '', (comment) => checkJsCode(comment, rule, false, ext, binds, gets));
-    checkJsCode(code, rule, false, ext, binds, gets);
+    const code = bindSourceConsts(match[1] ?? match[2] ?? '', (comment) => checkCommentCode(comment, rule, false, ext, binds, gets, util));
+    checkJsCode(code, rule, false, ext, binds, gets, util);
     chain.push({ kind: 'js', code });
     last = match.index + match[0].length;
   }
@@ -1189,7 +1183,20 @@ function parseListJsChain(rule: string, options: ParseOptions): FieldIr {
   const field: FieldIr = { rules: [], chain };
   if (reverse) field.reverse = true;
   if (gets && gets.out.size > 0) field.jsGets = gets.out;
+  if (util?.used) field.jsUtil = true;
   return field;
+}
+
+/** srcbind1028 注释 eval 的注释代码按所在段口径过白名单；t2s1029：注释代码的完成值会回到外层代码里，不算按字符串取。 */
+function checkCommentCode(
+  comment: string, rule: string, itemLevel: boolean, allowEval: boolean, binds?: JsBinds, gets?: JsGets, util?: JsUtil,
+): void {
+  if (util) util.evalBody = true;
+  try {
+    checkJsCode(comment, rule, itemLevel, allowEval, binds, gets, util);
+  } finally {
+    if (util) util.evalBody = false;
+  }
 }
 
 /**

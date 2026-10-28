@@ -862,11 +862,13 @@ function listChainScopes(field: FieldIr, chain: readonly ChainStage[], scope: Ev
 }
 
 /**
- * 列表 JS 的 `book`（book1028）、变量袋回调（searchvars1028）与 getter 回调（listget1028，在页面作用域上取值——legado getElements
- * 时 content 是整页）：只给挂了 bookMembers / varGets / jsGets 的列表字段，其余宿主绑定列表 JS 照旧不给。
+ * 列表 JS 的 `book`（book1028）、变量袋回调（searchvars1028）、getter 回调（listget1028，在页面作用域上取值——legado getElements
+ * 时 content 是整页）与加解密 / toNumChapter / t2s 帮手（listutil1029）：只给挂了 bookMembers / varGets / jsGets / jsUtil 的列表字段，
+ * 其余宿主绑定列表 JS 照旧不给。
  */
-function listBookBindings(field: FieldIr, scope: EvalScope): Pick<JsBindings, 'objects' | 'callbacks' | 'jsLib'> {
-  const out: Pick<JsBindings, 'objects' | 'callbacks' | 'jsLib'> = { ...jsLibBinding() };
+function listBookBindings(field: FieldIr, scope: EvalScope): Pick<JsBindings, 'objects' | 'callbacks' | 'jsLib' | 'utilHelpers'> {
+  const out: Pick<JsBindings, 'objects' | 'callbacks' | 'jsLib' | 'utilHelpers'> = { ...jsLibBinding() };
+  if (field.jsUtil) out.utilHelpers = true;
   const book = field.bookMembers === undefined ? undefined : hostBindings(scope).objects?.book;
   if (book !== undefined) out.objects = { book };
   const vars = field.varGets ? scope.host?.vars : undefined;

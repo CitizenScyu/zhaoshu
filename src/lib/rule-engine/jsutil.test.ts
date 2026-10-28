@@ -123,10 +123,12 @@ describe('parse', () => {
     expect(on('#t@text@js:java.base64Decode(result)', NAME).jsUtil).toBeUndefined();
   });
 
-  it('名单外与计算成员照旧拒；列表 JS 不收', () => {
+  it('名单外与计算成员照旧拒；列表 JS 自 listutil1029 起同收（见 listutil.test.ts）', () => {
     expect(codeOf(() => on('@js:java.createAsymmetricCrypto("RSA")', NAME))).toBe('unsupported_js');
     expect(codeOf(() => on('@js:java["toNumChapter"](result)', NAME))).toBe('unsupported_js');
-    expect(codeOf(() => on('@js:java.toNumChapter(result)', 'ruleSearch.bookList', { listJsEnabled: true }))).toBe('unsupported_js');
+    expect(on('@js:java.toNumChapter(result)', 'ruleSearch.bookList', { listJsEnabled: true }).jsUtil).toBe(true);
+    expect(codeOf(() => on('@js:java.toNumChapter(result)', 'ruleSearch.bookList', { listJsEnabled: true, jsUtilEnabled: false })))
+      .toBe('unsupported_js');
   });
 });
 
