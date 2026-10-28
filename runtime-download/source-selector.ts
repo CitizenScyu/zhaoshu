@@ -7,7 +7,7 @@ import { searchKeysOf } from '../src/lib/search-key';
 import { pageContext, type Transport } from './identity-precheck';
 
 type Identity = { title?: string; author?: string };
-type SearchHit = { title?: string; author?: string; bookUrl: string; book?: unknown };
+type SearchHit = { title?: string; author?: string; bookUrl: string; book?: unknown; vars?: unknown };
 
 export type SourceSelectionTask = { id: number; title: string; author: string };
 export interface PoolSource { url: string; name: string; searchUrl: unknown; rules?: unknown }
@@ -17,7 +17,7 @@ interface Modules {
   supported: { BUILTIN_SOURCE_HOSTS: readonly string[] };
   api: {
     engineSearchBook(engine: unknown, title: string, ctx: unknown): Promise<SearchHit[]>;
-    engineFetchDetail(engine: unknown, bookUrl: string, ctx: unknown, book?: unknown): Promise<Identity>;
+    engineFetchDetail(engine: unknown, bookUrl: string, ctx: unknown, book?: unknown, vars?: unknown): Promise<Identity>;
   };
 }
 
@@ -94,7 +94,7 @@ export function createSourceSelector(options: SourceSelectorOptions): SourceSele
       && (!hit.author?.trim() || identityMatches(hit, hit, task)));
     for (const hit of hits.slice(0, 2)) {
       signal.throwIfAborted();
-      if (identityMatches(await modules.api.engineFetchDetail(engine, hit.bookUrl, context, hit.book), hit, task)) return true;
+      if (identityMatches(await modules.api.engineFetchDetail(engine, hit.bookUrl, context, hit.book, hit.vars), hit, task)) return true;
     }
     if (hits.length) return false;
     if (!authorSearchKey(task.title, task.author)) return false;
@@ -105,7 +105,7 @@ export function createSourceSelector(options: SourceSelectorOptions): SourceSele
     // 没有书名证据时认哪一本都是猜，错配一本比 0 命中坏得多。
     if (authorHits.length !== 1) return false;
     signal.throwIfAborted();
-    const detail = await modules.api.engineFetchDetail(engine, authorHits[0].bookUrl, context, authorHits[0].book);
+    const detail = await modules.api.engineFetchDetail(engine, authorHits[0].bookUrl, context, authorHits[0].book, authorHits[0].vars);
     return authorBridgeAccepts(authorHits, detail, task);
   };
 

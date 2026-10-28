@@ -30,7 +30,7 @@ export const IDENTITY_PRECHECK_BUDGET_MS = 120_000;
 
 type Page = { url: string; text: string };
 export type Transport = (url: string, options: { signal: AbortSignal; timeoutMs?: number }) => Promise<Page>;
-type Candidate = { title?: string; author?: string; bookUrl: string; book?: unknown };
+type Candidate = { title?: string; author?: string; bookUrl: string; book?: unknown; vars?: unknown };
 type Identity = { title?: string; author?: string };
 interface Modules {
   compile: { compileSource(source: unknown): unknown };
@@ -42,7 +42,7 @@ interface Modules {
   };
   api: {
     engineSearchBook(engine: unknown, title: string, ctx: unknown): Promise<Candidate[]>;
-    engineFetchDetail(engine: unknown, bookUrl: string, ctx: unknown, book?: unknown): Promise<Identity>;
+    engineFetchDetail(engine: unknown, bookUrl: string, ctx: unknown, book?: unknown, vars?: unknown): Promise<Identity>;
   };
 }
 interface Resolved { source: { url: string; name: string; searchUrl: unknown }; builtin: boolean }
@@ -101,10 +101,10 @@ export function createIdentityPrecheck(options: IdentityPrecheckOptions): Preche
     const ctx = pageContext(transport, signal, timeoutMs);
     const { source, builtin } = await options.resolveSource(m, task.source_url, signal) as Resolved;
     const engine = builtin ? null : { url: source.url, name: source.name, searchUrl: source.searchUrl, compiled: m.compile.compileSource(source) };
-    // book1028：搜索带出的书籍成员原样交给详情（读 book.name 等的源靠它求值）。
+    // book1028 / itemvars1028：搜索带出的书籍成员与条目袋原样交给详情（读 book.name、条目变量的源靠它求值）。
     const detailOf = async (candidate: Candidate): Promise<Identity> => builtin
       ? m.parser.parseSourceIdentity((await ctx.page(candidate.bookUrl)).text)
-      : await m.api.engineFetchDetail(engine, candidate.bookUrl, ctx, candidate.book);
+      : await m.api.engineFetchDetail(engine, candidate.bookUrl, ctx, candidate.book, candidate.vars);
     const matchesAny = async (candidates: Candidate[]): Promise<boolean> => {
       progress.stage = 'detail';
       for (const candidate of candidates.slice(0, MAX_PRECHECK_CANDIDATES)) {

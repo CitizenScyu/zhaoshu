@@ -168,7 +168,8 @@ export async function downloadBook(m, args, resolveSource, transport = fetchSour
     for (const candidate of candidates) {
       const detail = await operation(async ctx => {
         // book1028：搜索带出的书籍成员原样交给详情；详情带回的（补了 tocUrl）经 selected 交给目录。
-        if (!builtin) return m.api.engineFetchDetail(engine, candidate.bookUrl, ctx, candidate.book);
+        // itemvars1028：条目袋同样交给详情，详情带回的袋（以条目袋为初值）经 selected 交给目录。
+        if (!builtin) return m.api.engineFetchDetail(engine, candidate.bookUrl, ctx, candidate.book, candidate.vars);
         return m.parser.parseSourceIdentity((await ctx.page(candidate.bookUrl)).text);
       });
       if (identityMatches(detail, candidate, args)) { selected = { ...candidate, ...detail }; break; }
@@ -192,7 +193,7 @@ export async function downloadBook(m, args, resolveSource, transport = fetchSour
       if (authorHits.length === 1) {
         stage = 'detail';
         const detail = await operation(async ctx => {
-          if (!builtin) return m.api.engineFetchDetail(engine, authorHits[0].bookUrl, ctx, authorHits[0].book);
+          if (!builtin) return m.api.engineFetchDetail(engine, authorHits[0].bookUrl, ctx, authorHits[0].book, authorHits[0].vars);
           return m.parser.parseSourceIdentity((await ctx.page(authorHits[0].bookUrl)).text);
         });
         if (authorBridgeAccepts(authorHits, detail, args)) selected = { ...authorHits[0], ...detail };

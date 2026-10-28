@@ -23,13 +23,13 @@ export const ENGINE_SEMANTICS_XPATH_BIT = 2;
 /** vars1027：@put/@get 静态子集语义位。版本再 +4（5–8 = 含变量位的四种组合），1–4 逐字不变。 */
 export const ENGINE_SEMANTICS_VARS_BIT = 4;
 
-/** 语义版本随 || / XPath / 变量 / JS / XPath 求值 / 正则 / && / AllInOne / 搜索 JS / 列表 JS / JS 扩展 / 宿主绑定 / java.getString / 加解密帮手 / JSONPath 扩展 / 详情 init / 搜索选项 legado 口径 / URL 字段选项 / 搜索 webView / 详情 JS init / 详情→目录变量袋 / jsoup 直连 / 书籍成员 / 搜索 URL→搜索字段变量袋开关联动（唯一口径，供 compile.ts 缓存键与 rulesHash 复用）。 */
+/** 语义版本随 || / XPath / 变量 / JS / XPath 求值 / 正则 / && / AllInOne / 搜索 JS / 列表 JS / JS 扩展 / 宿主绑定 / java.getString / 加解密帮手 / JSONPath 扩展 / 详情 init / 搜索选项 legado 口径 / URL 字段选项 / 搜索 webView / 详情 JS init / 详情→目录变量袋 / jsoup 直连 / 书籍成员 / 搜索 URL→搜索字段变量袋 / 搜索条目袋开关联动（唯一口径，供 compile.ts 缓存键与 rulesHash 复用）。 */
 export function engineSemanticsVersion(
   orEnabled: boolean, xpathEnabled = false, varsEnabled = false, jsEnabled = false, xpathEvalEnabled = false,
   regexEnabled = false, andEnabled = false, aioEnabled = false, searchJsEnabled = false, listJsEnabled = false,
   jsExtEnabled = false, jsBindEnabled = false, jsGetEnabled = false, jsUtilEnabled = false, jsonPathEnabled = false,
   initEnabled = false, searchOptionsEnabled = false, urlOptionsEnabled = false, searchWebViewEnabled = false, initJsEnabled = false,
-  varBagEnabled = false, jsoupEnabled = false, bookFieldsEnabled = false, searchVarsEnabled = false,
+  varBagEnabled = false, jsoupEnabled = false, bookFieldsEnabled = false, searchVarsEnabled = false, itemVarsEnabled = false,
 ): number {
   return (orEnabled ? ENGINE_SEMANTICS_VERSION_OR : ENGINE_SEMANTICS_VERSION)
     + (xpathEnabled ? ENGINE_SEMANTICS_XPATH_BIT : 0) + (varsEnabled ? ENGINE_SEMANTICS_VARS_BIT : 0)
@@ -43,7 +43,7 @@ export function engineSemanticsVersion(
     + (urlOptionsEnabled ? ENGINE_SEMANTICS_URL_OPTIONS_BIT : 0) + (searchWebViewEnabled ? ENGINE_SEMANTICS_SEARCH_WEBVIEW_BIT : 0)
     + (initJsEnabled ? ENGINE_SEMANTICS_INIT_JS_BIT : 0) + (varBagEnabled ? ENGINE_SEMANTICS_VAR_BAG_BIT : 0)
     + (jsoupEnabled ? ENGINE_SEMANTICS_JSOUP_BIT : 0) + (bookFieldsEnabled ? ENGINE_SEMANTICS_BOOK_FIELDS_BIT : 0)
-    + (searchVarsEnabled ? ENGINE_SEMANTICS_SEARCH_VARS_BIT : 0);
+    + (searchVarsEnabled ? ENGINE_SEMANTICS_SEARCH_VARS_BIT : 0) + (itemVarsEnabled ? ENGINE_SEMANTICS_ITEM_VARS_BIT : 0);
 }
 
 /**
@@ -441,5 +441,24 @@ export const ENGINE_SEMANTICS_SEARCH_VARS_BIT = 16777216;
  */
 export function engineSyntaxSearchVarsEnabled(env: OrEnv = process.env): boolean {
   const raw = env.ENGINE_SYNTAX_SEARCH_VARS?.trim().toLowerCase();
+  return raw === '1' || raw === 'true' || raw === 'on';
+}
+
+/**
+ * itemvars1028：搜索条目袋语义位。版本再 +33554432（1–16777216 逐字不变）。
+ * 只对条目袋真生效（compile.ts compileItemVars 非 null）的源计入。
+ */
+export const ENGINE_SEMANTICS_ITEM_VARS_BIT = 33554432;
+
+/**
+ * ENGINE_SYNTAX_ITEM_VARS 独立开关（itemvars1028，默认 off，口径同 ENGINE_SYNTAX_OR；须搜索袋（ENGINE_SYNTAX_SEARCH_VARS 及其
+ * 前提）同生效）。on = legado 搜索条目袋：每条 SearchBook 以本次搜索 RuleData 的变量为初值，条目字段 `@put` / `java.put('k', v)`
+ * 写进本条的袋，后面的条目字段、同一本书的详情字段（name/author/tocUrl）与目录字段（chapterName/chapterUrl/nextTocUrl）读回
+ * （SearchBook.toBook 复制变量，详情/目录 setRuleData(book)）。只收字面量键、键放置位置唯一、读的键在求值顺序上已放过；
+ * 书籍列表、目录列表、正文字段的 put/get 照旧拒。袋由门面按 legado 顺序算好显式传递（engineSearchBook → engineFetchDetail
+ * → engineFetchToc），读条目袋的详情/目录没带袋即求值失败。off = 逐字不变。
+ */
+export function engineSyntaxItemVarsEnabled(env: OrEnv = process.env): boolean {
+  const raw = env.ENGINE_SYNTAX_ITEM_VARS?.trim().toLowerCase();
   return raw === '1' || raw === 'true' || raw === 'on';
 }

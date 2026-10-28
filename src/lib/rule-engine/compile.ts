@@ -18,10 +18,13 @@ import {
   engineSyntaxJsExtEnabled, engineSyntaxJsGetEnabled, engineSyntaxJsonPathEnabled, engineSyntaxJsUtilEnabled, engineSyntaxListJsEnabled,
   engineSyntaxOrEnabled, engineSyntaxRegexEnabled, engineSyntaxVarsEnabled, engineSyntaxXPathEnabled, engineSyntaxXPathEvalEnabled, engineUrlOptionsEnabled,
   engineSearchWebViewEnabled, engineSyntaxInitJsEnabled, engineSyntaxJsoupEnabled, engineSyntaxVarsBagEnabled,
-  engineSyntaxBookFieldsEnabled, engineSyntaxSearchVarsEnabled, ENGINE_SEMANTICS_VERSION,
+  engineSyntaxBookFieldsEnabled, engineSyntaxSearchVarsEnabled, engineSyntaxItemVarsEnabled, ENGINE_SEMANTICS_VERSION,
 } from './syntax-flags';
 import { urlOptionFields } from './url-options';
-import { resolveSourceVars, ruleMayUseVars, searchVarPlan, varBagPlan, varPutRules, type SearchVarPlan } from './vars-subset';
+import {
+  ITEM_FIELD_ORDER, ITEM_JAVA_PUT_FIELDS, VAR_BAG_PUT_FIELDS, itemVarPlan, resolveSourceVars, ruleMayUseVars, searchVarPlan, varBagPlan,
+  varPutRules, type ItemVarPlan, type SearchVarPlan,
+} from './vars-subset';
 import { ruleMayUseXPath } from './xpath-subset';
 
 export { ENGINE_SEMANTICS_VERSION };
@@ -46,6 +49,8 @@ export interface CompileOptions extends ParseOptions {
   // bookFieldsEnabled（book1028，ENGINE_SYNTAX_BOOK_FIELDS）见 ParseOptions；compile 层另要求 JS 链与宿主绑定对该源生效、canReName 为空。
   /** searchvars1028：搜索 URL put → 搜索字段 get 变量袋（ENGINE_SYNTAX_SEARCH_VARS，默认读 env；须 varsEnabled 与搜索 JS 同生效）。 */
   searchVarsEnabled?: boolean;
+  /** itemvars1028：搜索条目袋（ENGINE_SYNTAX_ITEM_VARS，默认读 env；须搜索袋同生效）。 */
+  itemVarsEnabled?: boolean;
 }
 
 /** 版本化缓存键（P0 口径）：semanticsVersion:contentRevision。 */
@@ -81,6 +86,7 @@ export function engineVersionedKey(contentRevision: string, semanticsVersion = E
  * （sourceUsesBookSyntax）时再加书籍成员位（+8388608）。
  * searchvars1028：ENGINE_SYNTAX_VARS、ENGINE_SYNTAX_SEARCH_VARS 与搜索 JS 都生效且搜索袋对该源真生效（compileSearchVars 非 null）时
  * 再加搜索袋位（+16777216）。
+ * itemvars1028：搜索袋各条件与 ENGINE_SYNTAX_ITEM_VARS 都生效且条目袋对该源真生效（compileItemVars 非 null）时再加条目袋位（+33554432）。
  */
 export function engineSourceRevision(
   source: { url: string; searchUrl: unknown; rules: Record<string, unknown> },
@@ -115,6 +121,7 @@ export function engineSourceRevision(
   const jsoup = jsChain && (options.jsoupEnabled ?? engineSyntaxJsoupEnabled());
   const book = jsBind && (options.bookFieldsEnabled ?? engineSyntaxBookFieldsEnabled()) && !sourceCanReName(source.rules);
   const searchVars = varsEnabled && searchJsEnabled && (options.searchVarsEnabled ?? engineSyntaxSearchVarsEnabled());
+  const itemVars = searchVars && (options.itemVarsEnabled ?? engineSyntaxItemVarsEnabled());
   // jsoup1028：其余各位先按 jsoup 关判（与旧口径逐字相同），jsoup 开时再补判一次取并集——jsoup 重试能救活
   // 某开关的 off 态（如条目首段 JS 以 Element 起链），只按 jsoup 开判会把该位清掉、在池源 identity 白翻。
   // book1028 同理：书籍成员重试也能救活别的开关的 off 态，book 开时再按 book 开（jsoup 两态）补判。
@@ -185,6 +192,11 @@ export function engineSourceRevision(
       jsGetEnabled: jsGet, jsUtilEnabled: jsUtil, jsonPathEnabled, initJsEnabled, jsoupEnabled: jsoup,
     }),
     searchVars && compileSearchVars(source, {
+      orEnabled, xpathEnabled, xpathEvalEnabled: xpathEval, jsEnabled: jsChain, regexEnabled, andEnabled, aioEnabled, listJsEnabled,
+      jsExtEnabled, jsBindEnabled: jsBind, jsGetEnabled: jsGet, jsUtilEnabled: jsUtil, jsonPathEnabled, initJsEnabled, jsoupEnabled: jsoup,
+      bookFieldsEnabled: book,
+    }) !== null,
+    itemVars && compileItemVars(source, {
       orEnabled, xpathEnabled, xpathEvalEnabled: xpathEval, jsEnabled: jsChain, regexEnabled, andEnabled, aioEnabled, listJsEnabled,
       jsExtEnabled, jsBindEnabled: jsBind, jsGetEnabled: jsGet, jsUtilEnabled: jsUtil, jsonPathEnabled, initJsEnabled, jsoupEnabled: jsoup,
       bookFieldsEnabled: book,
@@ -1159,6 +1171,149 @@ function buildSearchVars(rules: Record<string, unknown>, plan: SearchVarPlan, ba
   }
 }
 
+// ---- 搜索条目袋（itemvars1028）----
+const itemVarsMemo = new WeakMap<object, Map<string, ReadonlyMap<string, FieldIr> | null>>();
+
+/** 条目袋实际生效：搜索袋生效（engineSearchVarsActive）且 ENGINE_SYNTAX_ITEM_VARS 开。 */
+export function engineItemVarsActive(): boolean {
+  return engineSearchVarsActive() && engineSyntaxItemVarsEnabled();
+}
+
+/** 条目 put 值规则的编译口径：同 VAR_PUT_VALUE_FIELD，在条目上按非 URL 字符串字段编、不含 JS。 */
+const ITEM_PUT_VALUE_FIELD = 'ruleSearch.name';
+
+/**
+ * 条目袋生效时要换掉的字段（字段全名 → 带 varPuts/varPut/varGets/itemVars 的编译结果），不生效返回 null（整源照旧）。
+ * 先按 vars-subset.ts itemVarPlan 文本粗筛（searchUrl 有 put 时还须走搜索 JS），再逐字段编译核实：条目字段按 legado 顺序，
+ * kind…coverUrl 的 `@put` 挪到 bookUrl 前面；读袋字段在 get 模式、放 `java.put` 的字段在 put 模式下编译（字段规则用
+ * resolveSourceVars 改写过的，put 值规则另编）。任一字段编译不过、收进来的键不在计划里（条目字段只读 searchUrl 与更前字段的键，
+ * 详情只读搜索侧且详情不放的键，目录读搜索侧或详情的键）、ruleSearch/ruleToc 是 AllInOne、或编译后没有字段真读搜索侧的键
+ * （只有搜索字段读 searchUrl 的键不算），一律 null。compileSource / compileAdmission / engineSourceRevision 同一判据；开关由
+ * 调用方判（engineItemVarsActive），`options` 缺省的语法开关读 env。
+ */
+export function compileItemVars(
+  source: { url: string; searchUrl: unknown; rules: Record<string, unknown> }, options: ParseOptions = {},
+): ReadonlyMap<string, FieldIr> | null {
+  const plan = itemVarPlan(source.rules, source.searchUrl);
+  if (!plan || (plan.urlPuts.size > 0 && !searchTemplateNeedsJs(source.searchUrl, upgradeSourceTemplateUrl(source.url)))) return null;
+  const base = bagParseBase(source.rules, options);
+  const memoKey = JSON.stringify([base, source.searchUrl]); // put 键来自 searchUrl，可能不在 rules 对象里
+  let memo = itemVarsMemo.get(source.rules);
+  if (!memo) {
+    memo = new Map();
+    itemVarsMemo.set(source.rules, memo);
+  }
+  if (memo.has(memoKey)) return memo.get(memoKey)!;
+  const out = buildItemVars(source.rules, plan, base);
+  memo.set(memoKey, out);
+  return out;
+}
+
+function buildItemVars(rules: Record<string, unknown>, plan: ItemVarPlan, base: ParseOptions): ReadonlyMap<string, FieldIr> | null {
+  const sourceRules = resolveSourceVars(rules);
+  if (base.aioEnabled) {
+    const aio = aioGroups(sourceRules);
+    if (aio.has('ruleSearch') || aio.has('ruleToc')) return null;
+  }
+  const listJs = base.jsEnabled && base.listJsEnabled ? listJsGroups(sourceRules) : new Set<string>();
+  const group = (from: Record<string, unknown>, name: string) => (from[name] ?? {}) as Record<string, unknown>;
+  const ruleOf = (fields: Record<string, unknown>, name: string) => (typeof fields[name] === 'string' ? fields[name] as string : '');
+  const searchKeys = new Set(plan.urlPuts);
+  for (const keys of plan.searchPuts.values()) for (const key of keys) searchKeys.add(key);
+  const infoKeys = new Set<string>();
+  for (const keys of plan.infoPuts.values()) for (const key of keys) infoKeys.add(key);
+  const putValues = (raw: string, field: string): Array<readonly [string, FieldIr]> => {
+    const map = varPutRules(raw);
+    if (!map) throw new Error('put');
+    return [...map].map(([key, rule]) => [key, parseFieldRule(rule, { ...base, jsEnabled: false, field })] as const);
+  };
+  /** 一个字段换成袋口径：`gets` 有键走 get 模式，否则 put 模式（收 java.put 键）；`puts` 挂在字段规则之前求值。 */
+  const bagField = (
+    rule: string, field: string, listJsGroup: boolean, gets: ReadonlySet<string> | undefined, javaAllowed: ReadonlySet<string> | undefined,
+    puts: Array<readonly [string, FieldIr]>,
+  ): { ir: FieldIr; reads: ReadonlySet<string>; javaPut: boolean } | null => {
+    const keys = new Set<string>();
+    // 只剩 @put 的字段：legado 字段规则为空串，取值为空。
+    const ir: FieldIr = rule.trim() === ''
+      ? { rules: [{ kind: 'text', literal: '' }] }
+      : parseFieldRule(rule, { ...base, field, listJsGroup, varBag: { mode: gets ? 'get' : 'put', keys } });
+    if (gets) {
+      for (const key of keys) if (!gets.has(key)) return null;
+    } else {
+      for (const key of keys) if (!javaAllowed?.has(key)) return null;
+    }
+    const bagged: FieldIr = { ...ir };
+    if (puts.length > 0) bagged.varPuts = puts;
+    if (!gets && keys.size > 0) bagged.varPut = true;
+    if (gets && keys.size > 0) bagged.varGets = true;
+    return { ir: bagged, reads: gets ? keys : new Set(), javaPut: !gets && keys.size > 0 };
+  };
+  const out = new Map<string, FieldIr>();
+  let active = false;
+  try {
+    // 条目字段：门面求值 name/author/bookUrl（bookList 只读 searchUrl 的键），其余字段的 put 挪到 bookUrl 前。
+    const search = group(sourceRules, 'ruleSearch');
+    const rawSearch = group(rules, 'ruleSearch');
+    const searchListJs = listJs.has('ruleSearch');
+    const listGets = plan.gets.get('ruleSearch.bookList');
+    if (listGets) {
+      const done = bagField(ruleOf(search, 'bookList'), 'ruleSearch.bookList', searchListJs, listGets, undefined, []);
+      if (!done) return null;
+      if (done.reads.size > 0) out.set('ruleSearch.bookList', done.ir);
+    }
+    const pending: Array<readonly [string, FieldIr]> = [];
+    for (const name of ITEM_FIELD_ORDER) {
+      const field = `ruleSearch.${name}`;
+      const putKeys = plan.searchPuts.get(name);
+      const puts = putKeys ? putValues(ruleOf(rawSearch, name), ITEM_PUT_VALUE_FIELD) : [];
+      if (!ITEM_JAVA_PUT_FIELDS.has(name)) {
+        pending.push(...puts);
+        continue;
+      }
+      if (name === 'bookUrl') puts.unshift(...pending);
+      const gets = plan.gets.get(field);
+      if (puts.length === 0 && !putKeys && !gets) continue;
+      const done = bagField(ruleOf(search, name), field, searchListJs, gets, putKeys, puts);
+      if (!done) return null;
+      const readsItem = [...done.reads].some((key) => !plan.urlPuts.has(key));
+      if (readsItem) active = true;
+      if (puts.length === 0 && !done.javaPut && done.reads.size === 0) continue;
+      out.set(field, puts.length > 0 || done.javaPut || readsItem ? { ...done.ir, itemVars: true } : done.ir);
+    }
+    // 详情字段：放的同 varbag1028，读的只认搜索侧放、详情不放的键。
+    const info = group(sourceRules, 'ruleBookInfo');
+    const rawInfo = group(rules, 'ruleBookInfo');
+    const infoAllowed = new Set([...searchKeys].filter((key) => !infoKeys.has(key)));
+    for (const name of VAR_BAG_PUT_FIELDS) {
+      const field = `ruleBookInfo.${name}`;
+      const putKeys = plan.infoPuts.get(name);
+      const planGets = plan.gets.get(field);
+      if (!putKeys && !planGets) continue;
+      const gets = planGets ? new Set([...planGets].filter((key) => infoAllowed.has(key))) : undefined;
+      const done = bagField(ruleOf(info, name), field, false, gets, putKeys, putKeys ? putValues(ruleOf(rawInfo, name), VAR_PUT_VALUE_FIELD) : []);
+      if (!done) return null;
+      if (done.reads.size > 0) active = true;
+      if (done.ir.varPuts === undefined && !done.javaPut && done.reads.size === 0) continue;
+      out.set(field, done.reads.size > 0 ? { ...done.ir, itemVars: true } : done.ir);
+    }
+    // 目录字段：读搜索侧或详情放的键；读到详情不覆盖的搜索侧键才要门面带袋。
+    const toc = group(sourceRules, 'ruleToc');
+    const tocAllowed = new Set([...searchKeys, ...infoKeys]);
+    for (const [field, planGets] of plan.gets) {
+      if (!field.startsWith('ruleToc.')) continue;
+      const done = bagField(ruleOf(toc, field.slice('ruleToc.'.length)), field, listJs.has('ruleToc'), tocAllowed, undefined, []);
+      if (!done) return null;
+      if (done.reads.size === 0) continue;
+      for (const key of done.reads) if (!planGets.has(key)) return null;
+      if ([...done.reads].some((key) => searchKeys.has(key))) active = true;
+      out.set(field, [...done.reads].some((key) => searchKeys.has(key) && !infoKeys.has(key)) ? { ...done.ir, itemVars: true } : done.ir);
+    }
+    return active ? out : null;
+  } catch {
+    return null;
+  }
+}
+
 /** LRU 上限：单测/低并发下足够；无关热路径，只防规则对象无限积累。 */
 const CACHE_LIMIT = 64;
 const cache = new Map<string, CompiledRules>();
@@ -1199,10 +1354,11 @@ export function compileSource(
     && !sourceCanReName(source.rules);
   const searchJsEnabled = options.searchJsEnabled ?? engineSearchJsActive();
   const searchVarsEnabled = varsEnabled && searchJsEnabled && (options.searchVarsEnabled ?? engineSyntaxSearchVarsEnabled());
+  const itemVarsEnabled = searchVarsEnabled && (options.itemVarsEnabled ?? engineSyntaxItemVarsEnabled());
   const key = engineSourceRevision(source, {
     orEnabled, xpathEnabled, varsEnabled, jsEnabled, xpathEvalEnabled, regexEnabled, andEnabled, aioEnabled, listJsEnabled, jsExtEnabled,
     jsBindEnabled, jsGetEnabled, jsUtilEnabled, jsonPathEnabled, initEnabled, urlOptionsEnabled, initJsEnabled, varBagEnabled, jsoupEnabled,
-    bookFieldsEnabled, searchJsEnabled, searchVarsEnabled,
+    bookFieldsEnabled, searchJsEnabled, searchVarsEnabled, itemVarsEnabled,
   });
   const hit = cache.get(key);
   if (hit) {
@@ -1244,6 +1400,12 @@ export function compileSource(
     jsGetEnabled, jsUtilEnabled, jsonPathEnabled, initJsEnabled, jsoupEnabled, bookFieldsEnabled,
   }) : null;
   if (searchBag) for (const [name, ir] of searchBag) compiled.set(name, ir);
+  // itemvars1028：条目袋对该源生效时换掉放/读袋的搜索、详情、目录字段（判据与语义位同一个 compileItemVars；与搜索袋同时生效时后覆盖）。
+  const itemBag = itemVarsEnabled ? compileItemVars(source, {
+    orEnabled, xpathEnabled, xpathEvalEnabled, jsEnabled, regexEnabled, andEnabled, aioEnabled, listJsEnabled, jsExtEnabled, jsBindEnabled,
+    jsGetEnabled, jsUtilEnabled, jsonPathEnabled, initJsEnabled, jsoupEnabled, bookFieldsEnabled,
+  }) : null;
+  if (itemBag) for (const [name, ir] of itemBag) compiled.set(name, ir);
   // init1028：可复现的 init 挂 initScope（详情字段改在 init 结果上求值，见 evaluate.ts bookInfoScope）；判据看原文，不看 vars 改写后的。
   const init = compiled.get('ruleBookInfo.init');
   const initRule = initRuleOf(source.rules);

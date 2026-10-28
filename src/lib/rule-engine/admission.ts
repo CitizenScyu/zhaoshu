@@ -20,10 +20,14 @@ import {
 } from './compile-smoke';
 import { listJsGroups, parseFieldRule } from './parse';
 import {
-  bookInfoScope, compiledUsesBook, createScope, evaluateField, evaluateFieldList, fieldUsesJs, normalizeBody, scopeVars, withBook, withVars,
+  bookInfoScope, compiledDetailNeedsItemVars, compiledUsesBook, createScope, evaluateField, evaluateFieldList, fieldUsesJs, normalizeBody,
+  scopeVars, withBook, withVars,
 } from './evaluate';
 import { RuleEngineError, type FieldIr, type RuleDiagnostic } from './types';
-import { compileSearchVars, compileSource, compileVarBag, engineSearchVarsActive, engineSourceRevision, sourceCanReName } from './compile';
+import {
+  compileItemVars, compileSearchVars, compileSource, compileVarBag, engineItemVarsActive, engineSearchVarsActive, engineSourceRevision,
+  sourceCanReName,
+} from './compile';
 import {
   engineSyntaxAioEnabled, engineSyntaxBookFieldsEnabled, engineSyntaxJsBindEnabled, engineSyntaxVarsBagEnabled, engineSyntaxVarsEnabled,
   engineUrlOptionsEnabled,
@@ -447,11 +451,13 @@ export function compileAdmission(source: RawSource): AdmissionCompile {
     ? compileVarBag(source as unknown as Record<string, unknown>, { jsEnabled: coreJs }) : null;
   // searchvars1028：同 compileSource——搜索袋生效时读袋的搜索字段按带袋的编译结果算可解释。
   const searchBag = searchBagOf(source, coreJs);
+  // itemvars1028：同 compileSource——条目袋生效时放/读袋的搜索、详情、目录字段按带袋的编译结果算可解释。
+  const itemBag = itemBagOf(source, coreJs);
   // book1028：同 compileSource——canReName 非空的源不开书籍成员（宿主绑定开关的判定在 parseFieldRule 里）。
   const bookFieldsEnabled = engineSyntaxBookFieldsEnabled() && !sourceCanReName(source as Record<string, unknown>);
   for (const [field, rule] of iterRulePairs(rulesSource)) {
     if (!(field in coreFieldMask)) continue;
-    if (bag?.has(field) || searchBag?.has(field)) {
+    if (bag?.has(field) || searchBag?.has(field) || itemBag?.has(field)) {
       coreFieldMask[field] = true;
       continue;
     }
@@ -726,6 +732,9 @@ function buildAdmissionSearch(
 
 const MAX_CANDIDATE_SCAN = 50;
 
+/** 搜索候选：`book` 见 searchCandidates（book1028），`vars` = 本条的条目袋（itemvars1028，条目袋生效的源才带）。 */
+type SearchCandidate = { title: string; url: string; book?: BookView; vars?: Record<string, string> };
+
 /** bookList 求值 → 逐条 name/bookUrl 可解析的候选 URL（设计 §4.1：≥1 条即 ok；对照判据比 URL 集）。 */
 function searchCandidateUrls(source: RawSource, text: string, pageUrl: string, vars?: Readonly<Record<string, string>>): string[] {
   return searchCandidates(source, text, pageUrl, vars).map((item) => item.url);
@@ -735,6 +744,15 @@ function searchCandidateUrls(source: RawSource, text: string, pageUrl: string, v
 function searchBagOf(source: RawSource, jsEnabled: boolean): ReadonlyMap<string, FieldIr> | null {
   if (!engineSearchVarsActive()) return null;
   return compileSearchVars({
+    url: typeof source.bookSourceUrl === 'string' ? source.bookSourceUrl : '', searchUrl: source.searchUrl,
+    rules: source as Record<string, unknown>,
+  }, { jsEnabled });
+}
+
+/** itemvars1028：条目袋对该源生效时放/读袋的字段（与 compileSource 同一个 compileItemVars）；开关关或不生效返回 null。 */
+function itemBagOf(source: RawSource, jsEnabled: boolean): ReadonlyMap<string, FieldIr> | null {
+  if (!engineItemVarsActive()) return null;
+  return compileItemVars({
     url: typeof source.bookSourceUrl === 'string' ? source.bookSourceUrl : '', searchUrl: source.searchUrl,
     rules: source as Record<string, unknown>,
   }, { jsEnabled });
@@ -758,10 +776,11 @@ function sourceCompiledUsesBook(source: RawSource): boolean {
  * `book`（book1028）只在读书籍成员的源上带：name/author 已按 legado 格式化；bookUrl 是未剥选项后缀的原值（影子腿过门后换成绝对地址），
  * 剥过后缀时不带。
  * `vars`（searchvars1028）= 本次搜索 JS put 的变量；搜索袋对该源生效时读袋字段换成带袋的编译结果、页面作用域挂袋（同 api.ts）。
+ * 条目袋（itemvars1028）对该源生效时候选按 legado 顺序求值、每条以 `vars` 为初值建袋，结果另带本条的袋（同 api.ts engineSearchBook）。
  */
 function searchCandidates(
   source: RawSource, text: string, pageUrl: string, vars?: Readonly<Record<string, string>>,
-): { title: string; url: string; book?: BookView }[] {
+): SearchCandidate[] {
   const rules = (engineSyntaxVarsEnabled() ? resolveSourceVars(source) : source).ruleSearch;
   if (!rules || typeof rules !== 'object') return [];
   const bookList = (rules as Record<string, unknown>).bookList;
@@ -774,10 +793,12 @@ function searchCandidates(
   const listJsGroup = listJsGroups({ ruleSearch: rules }).has('ruleSearch');
   const bookFieldsEnabled = engineSyntaxBookFieldsEnabled() && !sourceCanReName(source as Record<string, unknown>);
   const searchBag = vars !== undefined ? searchBagOf(source, jsEnabled) : null;
+  const itemBag = itemBagOf(source, jsEnabled);
   const parseSafe = (rule: unknown, name?: string) => {
-    if (typeof rule !== 'string' || !rule.trim()) return undefined;
-    const bagged = name === undefined ? undefined : searchBag?.get(name);
+    // itemvars1028：条目袋字段规则可能只剩 @put（改写后为空），先取带袋的编译结果（同 compileSource 覆盖）。
+    const bagged = name === undefined ? undefined : itemBag?.get(name) ?? searchBag?.get(name);
     if (bagged) return bagged;
+    if (typeof rule !== 'string' || !rule.trim()) return undefined;
     try { return parseFieldRule(rule, { jsEnabled, field: name, aioGroup, listJsGroup, bookFieldsEnabled }); } catch { return undefined; }
   };
   const listIr = parseSafe(bookList, 'ruleSearch.bookList');
@@ -789,30 +810,36 @@ function searchCandidates(
   const authorIr = parseSafe(author, 'ruleSearch.author');
   const usesBook = [listIr, nameIr, authorIr, bookUrlIr].some((ir) => ir?.bookMembers !== undefined)
     || (bookFieldsEnabled && sourceCompiledUsesBook(source));
+  // itemvars1028：同 api.ts compiledUsesItemVars——条目袋生效的源才逐条建袋。
+  const itemVars = itemBag !== null && [...itemBag.values()].some((ir) => ir.itemVars === true);
   // urlopt1028：同 compileSource 挂 urlOptions 的判据（看源原文），候选 URL 剥 legado 选项后缀（可读性影子腿拿它当样本书地址）。
   const bookUrlOptions = engineUrlOptionsEnabled() && urlOptionFields(source as Record<string, unknown>).has('ruleSearch.bookUrl');
   let scope;
   try { scope = createScope(normalizeBody(text), pageUrl); } catch { return []; }
   // bind1028：宿主绑定同 api.ts pageScope（开关 on 才挂）。
   if (engineSyntaxJsBindEnabled()) scope.host = { origin: typeof source.bookSourceUrl === 'string' ? source.bookSourceUrl : '' };
-  if (searchBag && vars !== undefined) scope = withVars(scope, vars);
+  if ((searchBag || itemBag) && vars !== undefined) scope = withVars(scope, vars);
   // HTML 与 JSON 搜索页同一路径（JSON 页 bookList 取列表项，见 evaluateFieldList）。
   let items;
   try { items = evaluateFieldList(listIr, scope); } catch { return []; }
   // listjs1027：`-` 前缀整表反转（计数口径不去重，反转后取前 MAX_CANDIDATE_SCAN 条，与运行时同向）。
   if (listIr.reverse === true) items = [...items].reverse();
-  const found: { title: string; url: string; book?: BookView }[] = [];
+  const found: SearchCandidate[] = [];
   for (let i = 0; i < items.length && i < MAX_CANDIDATE_SCAN; i += 1) {
-    const inner = items[i];
-    if (usesBook) {
+    const inner = itemVars ? withVars(items[i], vars ?? {}) : items[i];
+    if (usesBook || itemVars) {
       try {
         const title = formatBookName(nameIr ? evaluateField(nameIr, inner) : '');
         if (!title) continue;
-        const writer = formatBookAuthor(authorIr ? evaluateField(authorIr, withBook(inner, bookView({ name: title }))) : '');
-        const raw = bookUrlIr ? evaluateField(bookUrlIr, withBook(inner, bookView({ name: title, author: writer }))) : '';
+        const writer = formatBookAuthor(authorIr ? evaluateField(authorIr, usesBook ? withBook(inner, bookView({ name: title })) : inner) : '');
+        const raw = bookUrlIr
+          ? evaluateField(bookUrlIr, usesBook ? withBook(inner, bookView({ name: title, author: writer })) : inner) : '';
         const url = stripUrlOptions(raw, bookUrlOptions);
-        const book = bookView({ name: title, author: writer, bookUrl: url === raw ? raw : undefined });
-        if (url.trim()) found.push({ title, url: url.trim(), book });
+        if (!url.trim()) continue;
+        const item: SearchCandidate = { title, url: url.trim() };
+        if (usesBook) item.book = bookView({ name: title, author: writer, bookUrl: url === raw ? raw : undefined });
+        if (itemVars) item.vars = scopeVars(inner);
+        found.push(item);
       } catch { /* 同下：单条候选求值失败跳过 */ }
       continue;
     }
@@ -832,9 +859,9 @@ export interface AdmissionSearchResult {
   error: string;
   /**
    * read1027：仅 sampleBook 开且 verdict=ok 时带——可读性影子腿用的样本书（url 可能为相对路径，pageUrl 为其基址）。
-   * `book`（book1028）只在读书籍成员的源上带，见 searchCandidates。
+   * `book`（book1028）只在读书籍成员的源上带，见 searchCandidates；`vars`（itemvars1028）只在条目袋生效的源上带。
    */
-  sample?: { title: string; url: string; pageUrl: string; book?: BookView };
+  sample?: { title: string; url: string; pageUrl: string; book?: BookView; vars?: Record<string, string> };
 }
 
 /**
@@ -1034,7 +1061,7 @@ class ReadabilityStop extends Error {
  */
 export async function readabilityShadow(
   source: RawSource,
-  sample: { url: string; pageUrl: string; book?: BookView },
+  sample: { url: string; pageUrl: string; book?: BookView; vars?: Readonly<Record<string, string>> },
   options: {
     fetchPage: AdmissionTransport;
     declaredHosts: ReadonlySet<string>;
@@ -1082,6 +1109,10 @@ export async function readabilityShadow(
       const ir = field(name);
       return ir ? evaluateField(ir, scope, multi) : '';
     };
+    // itemvars1028：同 api.ts engineFetchDetail——详情/目录读条目袋而样本没带袋时取页前即判失败。
+    if (sample.vars === undefined && compiledDetailNeedsItemVars(compiled)) {
+      throw new RuleEngineError('RULE_EVAL_FAILED', '详情/目录读搜索条目袋，但样本没带搜索结果的袋');
+    }
     const detailUrl = gate(sample.url, sample.pageUrl);
     const detail = await get(detailUrl);
     stage = 'toc';
@@ -1089,7 +1120,8 @@ export async function readabilityShadow(
     const book = sample.book === undefined ? undefined
       : bookView({ ...sample.book, bookUrl: sample.book.bookUrl === undefined ? undefined : detailUrl });
     // init1028：tocUrl 同 api.ts engineFetchDetail 在 init 结果上求值；tocUrl 缺省/等于详情页时目录照旧读详情页原文（legado tocHtml）。
-    const info = bookInfoScope(compiled, withBook(detail.scope, book));
+    // itemvars1028：详情袋以样本带来的条目袋为初值（同 api.ts）。
+    const info = bookInfoScope(compiled, withBook(detail.scope, book), sample.vars);
     // varbag1028：变量袋源同运行时按 name → author → tocUrl 求值填袋，目录页带着袋求值。
     if (scopeVars(info)) {
       text('ruleBookInfo.name', info);

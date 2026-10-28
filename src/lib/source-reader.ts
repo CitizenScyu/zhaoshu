@@ -914,7 +914,7 @@ export async function resolveSourceBook(
           if (result.bookUrl === options.excludeBookUrl || checked.has(source.url + result.bookUrl)) continue;
           checked.add(source.url + result.bookUrl);
           try {
-            const detail = await engineFetchDetail(engineSource, result.bookUrl, sourceContext, result.book);
+            const detail = await engineFetchDetail(engineSource, result.bookUrl, sourceContext, result.book, result.vars);
             const identity = engineIdentityOf(detail, result);
             // 引擎只解释规则，不判断「这是不是那本书」——identity 是业务语义，留在调用方（§7.2）。
             if (!sourceBookMatches(book, identity)) continue;
@@ -950,7 +950,7 @@ export async function resolveSourceBook(
             if (result.bookUrl === options.excludeBookUrl || checked.has(source.url + result.bookUrl)) continue;
             checked.add(source.url + result.bookUrl);
             try {
-              const detail = await engineFetchDetail(engineSource, result.bookUrl, sourceContext, result.book);
+              const detail = await engineFetchDetail(engineSource, result.bookUrl, sourceContext, result.book, result.vars);
               const identity = engineIdentityOf(detail, result);
               if (!sourceBookMatches(book, identity)) continue;
               const toc = await engineFetchToc(engineSource, detail.tocUrl ?? result.bookUrl, sourceContext, false, detail.vars, detail.book);
@@ -1331,7 +1331,7 @@ async function surveyOneSource(
       for (const result of candidates) {
         if (result.bookUrl === excludeBookUrl || checked.has(result.bookUrl)) continue;
         checked.add(result.bookUrl);
-        const detail = await engineFetchDetail(engineSource, result.bookUrl, context, result.book);
+        const detail = await engineFetchDetail(engineSource, result.bookUrl, context, result.book, result.vars);
         const identity = engineIdentityOf(detail, result);
         if (!sourceBookMatches(book, identity)) continue;
         const toc = await engineFetchToc(engineSource, detail.tocUrl ?? result.bookUrl, context, false, detail.vars, detail.book);

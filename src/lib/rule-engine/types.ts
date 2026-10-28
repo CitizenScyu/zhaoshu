@@ -258,6 +258,11 @@ export interface FieldIr {
   /** 目录字段读本书变量袋（varbag1028）：`@get:{键}` makeUp 片段或 JS 里的 `java.get('键')`。求值时作用域没带袋即失败。 */
   varGets?: true;
   /**
+   * 搜索条目袋（itemvars1028，ENGINE_SYNTAX_ITEM_VARS）：搜索字段放/读本条的袋，或详情/目录字段读搜索侧（searchUrl / 条目）
+   * 放的键。门面据此按 legado 顺序逐条建袋、把袋随结果带给详情（evaluate.ts compiledUsesItemVars / compiledDetailNeedsItemVars）。
+   */
+  itemVars?: true;
+  /**
    * JS 链直连 jsoup DOM（jsoup1028，ENGINE_SYNTAX_JSOUP）：沙箱装 Element/Elements/Java 字符串包装（js-sandbox.ts runJsoup），
    * 条目级首段 JS 的 result/src 是条目 Element、列表链首段规则的结果以 Elements 交给后面的 JS（evaluate.ts evaluateJsoupChain）。
    * 未挂 = 旧链路逐字不变。

@@ -510,7 +510,11 @@ function matchingBrace(text: string, open: number): number {
  * 仅 `ruleContent.content` 由门面传 `multi=true` 拼接多段落。见 dom-ops.ts:applyTerminal。
  */
 export function evaluateField(field: FieldIr, scope: EvalScope, multi = false): string {
-  if (scope.kind === 'json' && scope.object !== undefined) return objectFieldValue(field, scope.object);
+  if (scope.kind === 'json' && scope.object !== undefined) {
+    // itemvars1028：对象条目上 legado putRule 也按键直取求值，这里不复现，放袋的字段失败（不静默漏放）。
+    if (field.varPuts !== undefined || field.varPut) return evalFailed('对象条目上的字段放变量袋，不复现');
+    return objectFieldValue(field, scope.object);
+  }
   checkBookMembers(field, scope);
   if (field.varGets && scope.host?.vars === undefined) return evalFailed('字段读变量袋，但作用域没带变量袋');
   if (field.varPuts !== undefined) putVars(field.varPuts, scope);
@@ -1021,11 +1025,12 @@ function jsonInitScope(ir: RuleIr, scope: JsonScope): EvalScope {
 
 /**
  * 详情字段（ruleBookInfo.name/author/tocUrl…）的求值作用域：init 挂了 initScope 时换成 init 结果，否则即页面作用域。
- * 变量袋源（varbag1028）另挂一只空袋：详情字段求值时往里 put，调用方按 name → author → tocUrl 求值后用 scopeVars 取出。
+ * 变量袋源（varbag1028）另挂一只袋：详情字段求值时往里 put，调用方按 name → author → tocUrl 求值后用 scopeVars 取出。
+ * `seed`（itemvars1028）= 同一本书搜索条目带出的袋（legado toBook 复制变量），袋以它为初值；不传即空袋。
  */
-export function bookInfoScope(compiled: CompiledRules, scope: EvalScope): EvalScope {
+export function bookInfoScope(compiled: CompiledRules, scope: EvalScope, seed?: Readonly<Record<string, string>>): EvalScope {
   const init = compiled.get('ruleBookInfo.init');
-  const base = compiledUsesVarBag(compiled) ? { ...scope, host: { ...scope.host, vars: new Map<string, string>() } } : scope;
+  const base = compiledUsesVarBag(compiled) ? { ...scope, host: { ...scope.host, vars: new Map(Object.entries(seed ?? {})) } } : scope;
   return init && !('skipped' in init) && init.initScope ? evaluateInitScope(init, base) : base;
 }
 
@@ -1041,6 +1046,18 @@ export function compiledUsesVarBag(compiled: CompiledRules): boolean {
 /** 编译产物里是否有读搜索袋的搜索字段（searchvars1028）。没有时调用方不挂袋，搜索求值路径逐字不变。 */
 export function compiledUsesSearchVars(compiled: CompiledRules): boolean {
   for (const [name, field] of compiled) if (name.startsWith('ruleSearch.') && !('skipped' in field) && field.varGets) return true;
+  return false;
+}
+
+/** 编译产物里是否有条目袋字段（itemvars1028）。有时门面按 legado 顺序逐条建袋、结果带上本条的袋。 */
+export function compiledUsesItemVars(compiled: CompiledRules): boolean {
+  for (const field of compiled.values()) if (!('skipped' in field) && field.itemVars) return true;
+  return false;
+}
+
+/** 详情/目录字段是否读条目袋（itemvars1028）：是则调用方必须把搜索结果的袋交给详情，否则求值失败。 */
+export function compiledDetailNeedsItemVars(compiled: CompiledRules): boolean {
+  for (const [name, field] of compiled) if (!name.startsWith('ruleSearch.') && !('skipped' in field) && field.itemVars) return true;
   return false;
 }
 
