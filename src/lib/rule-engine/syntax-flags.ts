@@ -208,7 +208,8 @@ export const ENGINE_SEMANTICS_JS_EXT_BIT = 1024;
 /**
  * ENGINE_SYNTAX_JS_EXT 独立开关（jsext1028，默认 off，口径同 ENGINE_SYNTAX_OR；须 ENGINE_SYNTAX_JS 同开才生效）。
  * on = JS 段放行 `eval`（沙箱本身是安全边界），并按 legado SourceRule.makeUpRule 处理 JS 段内的 `{{规则}}`/`{{JS}}`
- * 与 `##正则##替换`：先求值占位拼回代码，再按 `##` 切出代码与替换。off = 逐字不变（这些 JS 段照旧拒）。
+ * 与 `##正则##替换`：先求值占位拼回代码，再按 `##` 切出代码与替换。andor1029 起 JS 链的规则段另按所在字段收顶层 `&&`
+ * （同 ENGINE_SYNTAX_AND 口径）并跳过 `||` 空支。off = 逐字不变（这些 JS 段照旧拒）。
  */
 export function engineSyntaxJsExtEnabled(env: OrEnv = process.env): boolean {
   const raw = env.ENGINE_SYNTAX_JS_EXT?.trim().toLowerCase();
@@ -278,6 +279,7 @@ export const ENGINE_SEMANTICS_JSON_PATH_BIT = 16384;
  * ENGINE_SYNTAX_JSON_PATH 独立开关（jsonpath1028，默认 off，口径同 ENGINE_SYNTAX_OR）。
  * on = off 态解析不了的 `$` 路径再试 Jayway 的 `.[`（单点后接方括号）与 `[?(表达式)]`（`@.a.b` 存在性 / 与字面量比较 /
  * && || ! 括号），按 Jayway 2.9.0 + legado SUPPRESS_EXCEPTIONS 口径求值；正则、`$` 路径、词运算符、转义等一律仍拒。
+ * andor1029 起 `&&` 合并的首支带 `@json:` 前缀同样算 Json 模式。
  * off 态能解析的路径 IR 逐字不变。
  */
 export function engineSyntaxJsonPathEnabled(env: OrEnv = process.env): boolean {

@@ -665,6 +665,16 @@ export interface ParseOptions {
    * sourceConstsOf）。给出时 JS 段与 `{{JS}}` 里的 `source.key` 等先代入成字面量（bindSourceConsts）；缺省 = `source` 照旧拒。
    */
   sourceConsts?: SourceConsts;
+  /**
+   * andor1029：`&&` 合并按哪个字段判（AND_FIELDS / URL / 列表口径），缺省同 field。只由 parseJsChain 在 JS_EXT 同开时给规则段传
+   * （段本身不带 field，免得 makeUp 等按字段的分支跟着变）。
+   */
+  andField?: string;
+  /**
+   * andor1029：`||` 的空支跳过（legado AnalyzeByJSoup/AnalyzeByJSonPath.getStringList 对空规则返回空表，空支永不胜出）。
+   * 只由 parseJsChain 在 JS_EXT 同开时给规则段传；列表字段、含顶层 `&&`、剩余支有 XPath 时不跳。缺省 = 空支照旧拒。
+   */
+  emptyOrBranches?: boolean;
 }
 
 /**
@@ -813,7 +823,8 @@ function parseFieldRuleText(rule: string, options: ParseOptions): FieldIr {
   const orEnabled = options.orEnabled ?? engineSyntaxOrEnabled();
   // and1027：off 判据（整串、含 ## 尾缀）命中才可能走 && 合并，未命中的规则两态逐字同路——开关只救被拒的规则。
   const offAnd = splitTopLevel(trimmed, '&&').length > 1;
-  const andEnabled = offAnd && orEnabled && options.field !== undefined && AND_FIELDS.has(options.field)
+  const andTarget = options.andField ?? options.field;
+  const andEnabled = offAnd && orEnabled && andTarget !== undefined && AND_FIELDS.has(andTarget)
     && (options.andEnabled ?? engineSyntaxAndEnabled());
   // 顶层 && → 拒（P1b 前两态一致）
   if (offAnd && !andEnabled) unsupported('规则含顶层 &&（T7）', rule, { code: 'unsupported_operator', operator: '&&' });
@@ -831,13 +842,24 @@ function parseFieldRuleText(rule: string, options: ParseOptions): FieldIr {
   // on：先剥字段级 ## 尾缀，再切顶层 ||。尾缀挂在 FieldIr.regex（组合选定后净化）。
   const { body, regex } = stripRegexSuffix(trimmed, rule, regexEnabled);
   if (body.trim() === '' && regex.length > 0) return regexOnlyField(regex, rule, regexEnabled, options.field);
-  const branches = tokenizeOrBranches(body);
+  let branches = tokenizeOrBranches(body);
+  // andor1029：空支跳过（见 ParseOptions.emptyOrBranches）。含顶层 && 的不跳：legado splitRule 只认首个出现的操作符。
+  if (options.emptyOrBranches === true && !offAnd && branches.length > 1 && branches.some((branch) => branch.trim() === '')
+    && !(andTarget !== undefined && isAioListField(andTarget))) {
+    const kept = branches.filter((branch) => branch.trim() !== '');
+    if (kept.length > 0 && !kept.some((branch) => /^\s*(?:@xpath:|\/)/i.test(branch))) {
+      if (kept.length === 1) {
+        return singleSegmentField(kept[0], rule, xpathEnabled, xpathEval, { body: kept[0], regex }, regexEnabled, options.field);
+      }
+      branches = kept;
+    }
+  }
   if (andEnabled) {
     const parts = tokenizeTopLevel(body, '&&');
     if (parts.length > 1) {
       // legado RuleAnalyzer.splitRule 只认首个出现的操作符，另一种留在支内当选择器文本——混用即坏规则，不猜。
       if (branches.length > 1) unsupported('规则混用顶层 || 与 &&', rule, { code: 'unsupported_operator', operator: '&&' });
-      return andField(parts, regex, rule, xpathEnabled, xpathEval, options.field!);
+      return andField(parts, regex, rule, xpathEnabled, xpathEval, andTarget!);
     }
   }
   if (branches.length > 1) {
@@ -914,6 +936,7 @@ const AND_LIST_FIELDS: ReadonlySet<string> = new Set(['ruleSearch.bookList', 'ru
  * 前缀定（`$.`/`$[` → Json，否则 Default），各支共用。这里只收两种能逐支对齐的形态：
  * - 全部支都是默认语法选择器（JSON 输入上各支照旧按 Jayway 重解释，与 legado isJSON → Json 模式一致）；
  * - 首支是 JSONPath（整条走 Json 模式），其后各支 JSONPath 或默认语法（Json 模式里补 `$.`，同上）。
+ *   andor1029：ENGINE_SYNTAX_JSON_PATH 开时首支 `@json:` 前缀同样算 Json 模式（legado splitSourceRule 先按前缀定整条模式）。
  * 显式 `@css:`（legado 整条切成 CSS 模式，后支不再按默认语法）、XPath、字面量、模板支一律拒，不猜。
  * 列表字段的支不能带末端操作（legado getElements 把 `@text` 当选择器步，取不到节点）。
  */
@@ -927,7 +950,14 @@ function andField(
   const list = AND_LIST_FIELDS.has(fieldName);
   // legado 列表规则以 `:` 开头是 AllInOne 正则模式（splitSourceRule allInOne），`&&` 是正则级联而非节点合并。
   if (list && parts[0].trim().startsWith(':')) reject('列表字段是 AllInOne 正则（`:` 开头）');
-  const jsonMode = parts[0].trim().startsWith('$');
+  const head = parts[0].trim();
+  const jsonPrefixed = jsonPathExt && /^@json:/i.test(head);
+  const jsonMode = head.startsWith('$') || jsonPrefixed;
+  if (jsonPrefixed) {
+    // 剥前缀后首支须是 `$` 路径（补 `$.` 的形态不收）
+    if (!head.slice(6).trim().startsWith('$')) reject('首支 @json: 后不是 $ 路径');
+    parts = [head.slice(6), ...parts.slice(1)];
+  }
   const branches = parts.map((part): RuleIr => {
     if (part.trim() === '') unsupported('&& 分支为空', rule, { code: 'empty_and_branch' });
     const ir = translateSegment(part, rule, xpathEnabled, xpathEval);
@@ -1062,6 +1092,8 @@ function parseJsChain(trimmed: string, rule: string, options: ParseOptions): Fie
   const gets: JsGets | undefined = (options.jsGetEnabled ?? engineSyntaxJsGetEnabled())
     ? { options: segmentOptions, out: new Map(), aliases: initJs } : undefined;
   const util: JsUtil | undefined = (options.jsUtilEnabled ?? engineSyntaxJsUtilEnabled()) ? { used: false } : undefined;
+  // andor1029：JS_EXT 同开时规则段按所在字段收 `&&`、跳过 `||` 空支（legado 链里每段 SourceRule 同样走 splitRule）。
+  const ruleOptions: ParseOptions = jsExt ? { ...segmentOptions, andEnabled: options.andEnabled, andField: field, emptyOrBranches: true } : segmentOptions;
   const chain: ChainStage[] = [];
   const pushRule = (text: string) => {
     const segment = text.trim();
@@ -1071,7 +1103,7 @@ function parseJsChain(trimmed: string, rule: string, options: ParseOptions): Fie
       chain.push({ kind: 'regex', regex: stripRegexSuffix(segment, rule, regexEnabled).regex });
       return;
     }
-    chain.push({ kind: 'rule', field: parseFieldRule(segment, segmentOptions) });
+    chain.push({ kind: 'rule', field: parseFieldRule(segment, ruleOptions) });
   };
   let last = 0;
   for (const match of trimmed.matchAll(JS_SEGMENT_RE)) {

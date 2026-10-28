@@ -1189,7 +1189,8 @@ const jsonPathMemo = new WeakMap<object, Map<string, boolean>>();
 
 /** 可能受 jsonpath1028 影响的规则：含 `$` 且出现 `.[` 或 `[?`。宁宽勿漏，实编译再判。 */
 function ruleMayUseJsonPath(rule: string): boolean {
-  return rule.includes('$') && /\.\s*\[|\[\s*\?/.test(rule);
+  // andor1029：`@json:` 前缀 + `&&`（andField 的 Json 模式判定）同样随开关变。
+  return rule.includes('$') && (/\.\s*\[|\[\s*\?/.test(rule) || (/@json:/i.test(rule) && rule.includes('&&')));
 }
 
 /**
