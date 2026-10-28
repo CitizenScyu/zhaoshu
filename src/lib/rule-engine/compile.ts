@@ -8,13 +8,16 @@ import { upgradeSourceTemplateUrl } from '@/lib/source-policy';
 import { sourceRevision } from '@/lib/source-revision';
 import { engineSearchJsActive, engineSearchOptionsActive } from './compile-smoke';
 import { aioGroups } from './aio-syntax';
-import { initFieldSupported, initRuleTextSupported, jsChainFieldAllowed, listJsGroups, parseFieldRule, ruleHasJs, type ParseOptions } from './parse';
+import {
+  initFieldSupported, initJsFieldSupported, initRuleTextSupported, jsChainFieldAllowed, listJsGroups, objectKeyOf, parseFieldRule, ruleHasJs,
+  type ParseOptions,
+} from './parse';
 import type { CompiledRules, FieldIr, RuleIr } from './types';
 import {
   engineSemanticsVersion, engineSyntaxAioEnabled, engineSyntaxAndEnabled, engineSyntaxInitEnabled, engineSyntaxJsBindEnabled, engineSyntaxJsEnabled,
   engineSyntaxJsExtEnabled, engineSyntaxJsGetEnabled, engineSyntaxJsonPathEnabled, engineSyntaxJsUtilEnabled, engineSyntaxListJsEnabled,
   engineSyntaxOrEnabled, engineSyntaxRegexEnabled, engineSyntaxVarsEnabled, engineSyntaxXPathEnabled, engineSyntaxXPathEvalEnabled, engineUrlOptionsEnabled,
-  engineSearchWebViewEnabled,
+  engineSearchWebViewEnabled, engineSyntaxInitJsEnabled,
   ENGINE_SEMANTICS_VERSION,
 } from './syntax-flags';
 import { urlOptionFields } from './url-options';
@@ -36,6 +39,7 @@ export interface CompileOptions extends ParseOptions {
   urlOptionsEnabled?: boolean;
   /** searchwv1028：搜索选项 webView 当普通请求（ENGINE_SEARCH_WEBVIEW，默认读 env；须搜索选项 legado 口径同生效）。只影响语义版本位。 */
   searchWebViewEnabled?: boolean;
+  // initJsEnabled（initjs1028，ENGINE_SYNTAX_INIT_JS）见 ParseOptions；compile 层另要求 initEnabled 同开。
 }
 
 /** 版本化缓存键（P0 口径）：semanticsVersion:contentRevision。 */
@@ -64,6 +68,7 @@ export function engineVersionedKey(contentRevision: string, semanticsVersion = E
  * searchopt1028：搜索选项 legado 口径生效且该源 searchUrl 的选项被旧口径拒（searchOptionsNeedParity）时再加选项位（65537–131072）。
  * urlopt1028：ENGINE_URL_OPTIONS on 且有 URL 字段原文像会产出 `,{选项}`（urlOptionFields 非空）时再加 URL 选项位（131073–262144）。
  * searchwv1028：ENGINE_SEARCH_WEBVIEW on、搜索选项位条件成立且选项可能让 webView 为真（searchOptionsMayUseWebView）时再加搜索 webView 位（262145–524288）。
+ * initjs1028：ENGINE_SYNTAX_INIT 与 ENGINE_SYNTAX_INIT_JS 都 on、JS 链对该源生效且 init 是可复现的 JS（sourceUsesInitJsSyntax）时再加 JS init 位（524289–1048576）。
  */
 export function engineSourceRevision(
   source: { url: string; searchUrl: unknown; rules: Record<string, unknown> },
@@ -88,6 +93,7 @@ export function engineSourceRevision(
   const searchOptionsEnabled = options.searchOptionsEnabled ?? engineSearchOptionsActive();
   const urlOptionsEnabled = options.urlOptionsEnabled ?? engineUrlOptionsEnabled();
   const searchWebViewEnabled = options.searchWebViewEnabled ?? engineSearchWebViewEnabled();
+  const initJsEnabled = initEnabled && (options.initJsEnabled ?? engineSyntaxInitJsEnabled());
   const searchOptionParity = searchOptionsEnabled && searchOptionsNeedParity(source.searchUrl, upgradeSourceTemplateUrl(source.url));
   const jsChain = jsEnabled && !sourceHasJsLib(source.rules);
   // 下游 sourceUses* 的编译与 compileSource 同一组开关（jsBind/jsGet/jsUtil 只在 JS 链生效时有意义）。
@@ -141,6 +147,10 @@ export function engineSourceRevision(
     searchOptionParity,
     urlOptionsEnabled && urlOptionFields(source.rules).size > 0,
     searchWebViewEnabled && searchOptionParity && searchOptionsMayUseWebView(source.searchUrl),
+    initJsEnabled && jsChain && sourceUsesInitJsSyntax(source.rules, {
+      orEnabled, xpathEnabled, xpathEvalEnabled: xpathEval, regexEnabled, andEnabled, aioEnabled, listJsEnabled,
+      jsExtEnabled, jsBindEnabled: jsBind, jsGetEnabled: jsGet, jsUtilEnabled: jsUtil, jsonPathEnabled,
+    }),
   ));
 }
 
@@ -745,6 +755,46 @@ export function sourceUsesInitSyntax(
   return uses;
 }
 
+/** compileSource 编出的 init 是否按 JS init 挂 initScope（initjs1028）：原文含 JS、编译结果过 initJsFieldSupported。 */
+function initJsApplies(rule: unknown, field: FieldIr | { skipped: string } | undefined): field is FieldIr {
+  return typeof rule === 'string' && ruleHasJs(rule.trim()) && field !== undefined && !('skipped' in field) && initJsFieldSupported(field);
+}
+
+const initJsMemo = new WeakMap<object, Map<string, boolean>>();
+
+/**
+ * 源是否会因 ENGINE_SYNTAX_INIT_JS 改变详情页求值（initjs1028）：init 原文含 JS、按 compileSource 同一组开关（JS 链已开）编译后
+ * 是可复现的 JS init。调用方还须确认 ENGINE_SYNTAX_INIT 与 JS 链（ENGINE_SYNTAX_JS on、无 jsLib）都生效。
+ */
+export function sourceUsesInitJsSyntax(
+  rules: Record<string, unknown>,
+  options: {
+    orEnabled: boolean; xpathEnabled: boolean; xpathEvalEnabled: boolean; regexEnabled: boolean; andEnabled: boolean;
+    aioEnabled: boolean; listJsEnabled: boolean; jsExtEnabled: boolean; jsBindEnabled: boolean; jsGetEnabled: boolean; jsUtilEnabled: boolean;
+    jsonPathEnabled: boolean;
+  },
+): boolean {
+  const rule = initRuleOf(rules);
+  if (typeof rule !== 'string' || !ruleHasJs(rule.trim())) return false;
+  const memoKey = `${options.orEnabled}:${options.xpathEnabled}:${options.xpathEvalEnabled}:${options.regexEnabled}:${options.andEnabled}:${options.aioEnabled}:${options.listJsEnabled}:${options.jsExtEnabled}:${options.jsBindEnabled}:${options.jsGetEnabled}:${options.jsUtilEnabled}:${options.jsonPathEnabled}`;
+  let memo = initJsMemo.get(rules);
+  const hit = memo?.get(memoKey);
+  if (hit !== undefined) return hit;
+  let field: FieldIr | undefined;
+  try {
+    field = parseFieldRule(rule, { ...options, jsEnabled: true, initJsEnabled: true, field: 'ruleBookInfo.init' });
+  } catch {
+    field = undefined;
+  }
+  const uses = initJsApplies(rule, field);
+  if (!memo) {
+    memo = new Map();
+    initJsMemo.set(rules, memo);
+  }
+  memo.set(memoKey, uses);
+  return uses;
+}
+
 /** LRU 上限：单测/低并发下足够；无关热路径，只防规则对象无限积累。 */
 const CACHE_LIMIT = 64;
 const cache = new Map<string, CompiledRules>();
@@ -778,9 +828,10 @@ export function compileSource(
   const jsonPathEnabled = options.jsonPathEnabled ?? engineSyntaxJsonPathEnabled();
   const initEnabled = options.initEnabled ?? engineSyntaxInitEnabled();
   const urlOptionsEnabled = options.urlOptionsEnabled ?? engineUrlOptionsEnabled();
+  const initJsEnabled = initEnabled && (options.initJsEnabled ?? engineSyntaxInitJsEnabled());
   const key = engineSourceRevision(source, {
     orEnabled, xpathEnabled, varsEnabled, jsEnabled, xpathEvalEnabled, regexEnabled, andEnabled, aioEnabled, listJsEnabled, jsExtEnabled,
-    jsBindEnabled, jsGetEnabled, jsUtilEnabled, jsonPathEnabled, initEnabled, urlOptionsEnabled,
+    jsBindEnabled, jsGetEnabled, jsUtilEnabled, jsonPathEnabled, initEnabled, urlOptionsEnabled, initJsEnabled,
   });
   const hit = cache.get(key);
   if (hit) {
@@ -802,7 +853,8 @@ export function compileSource(
       try {
         compiled.set(name, parseFieldRule(rule, {
           orEnabled, xpathEnabled, xpathEvalEnabled, jsEnabled, regexEnabled, andEnabled, aioEnabled, aioGroup: aio.has(group),
-          listJsEnabled, listJsGroup: listJs.has(group), jsExtEnabled, jsBindEnabled, jsGetEnabled, jsUtilEnabled, jsonPathEnabled, field: name,
+          listJsEnabled, listJsGroup: listJs.has(group), jsExtEnabled, jsBindEnabled, jsGetEnabled, jsUtilEnabled, jsonPathEnabled, initJsEnabled,
+          field: name,
         }));
       } catch {
         compiled.set(name, { skipped: 'unsupported' });
@@ -813,6 +865,15 @@ export function compileSource(
   const init = compiled.get('ruleBookInfo.init');
   const initRule = initRuleOf(source.rules);
   if (initEnabled && initApplies(initRule, init)) compiled.set('ruleBookInfo.init', { ...init, initScope: true });
+  // initjs1028：可复现的 JS init 同样挂 initScope；init 可能返回对象，详情字段另挂键值直取（parse.ts objectKeyOf，看编译所用原文）。
+  if (initJsEnabled && initJsApplies(initRule, init)) {
+    compiled.set('ruleBookInfo.init', { ...init, initScope: true });
+    for (const [name, rule] of Object.entries(sourceRules.ruleBookInfo as Record<string, unknown>)) {
+      const ir = compiled.get(`ruleBookInfo.${name}`);
+      if (name === 'init' || typeof rule !== 'string' || !ir || 'skipped' in ir) continue;
+      compiled.set(`ruleBookInfo.${name}`, { ...ir, objectKey: objectKeyOf(rule) });
+    }
+  }
   // urlopt1028：URL 字段挂 urlOptions（值进 host 门前剥 legado 选项后缀，见 url-options.ts）；判据同样看原文。
   if (urlOptionsEnabled) {
     for (const name of urlOptionFields(source.rules)) {

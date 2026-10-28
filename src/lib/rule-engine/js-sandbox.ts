@@ -60,9 +60,10 @@ export interface JsBindings {
   objects?: Readonly<Record<string, Readonly<Record<string, string>>>>;
   /**
    * 读宿主状态的 java.* 回调（jsget1028 的 getString/getStringList）：实参按字符串传入（缺省/非字符串按 String 转），
-   * 返回字符串、字符串数组（带 size()/get()）或 null。同名覆盖纯计算帮手。
+   * 返回字符串、字符串数组（带 size()/get()）或 null。同名覆盖纯计算帮手。`extra` = 其后的实参（initjs1028；字符串原样，
+   * 其余类型记 null），回调自行决定收不收。
    */
-  callbacks?: Readonly<Record<string, (arg: string) => JsValue | null>>;
+  callbacks?: Readonly<Record<string, (arg: string, extra: readonly (string | null)[]) => JsValue | null>>;
   /**
    * 装对称加解密 / toNumChapter 帮手（jsutil1028，名单见 types.ts JS_JAVA_UTIL_HELPERS）：只给编译期标了 FieldIr.jsUtil 的字段开，
    * 其余求值的沙箱逐字不变。帮手失败与回调一样致命。
@@ -276,6 +277,14 @@ export function runJsItems(code: string, bindings: JsBindings): JsListItem[] | n
   return execute(code, bindings, exportItems);
 }
 
+/**
+ * 详情页 JS init（initjs1028，legado BookInfo `setContent(getElement(init))` 的 `evalJS`）：字符串原样；普通对象 → 键值表
+ * （口径同 runJsItems 的对象项）；null/undefined（legado setContent(null) 断言失败）、数组、数字等一律求值失败。
+ */
+export function runJsInit(code: string, bindings: JsBindings, budgetKey = code): string | ReadonlyMap<string, string | null> {
+  return execute(code, bindings, exportInitValue, budgetKey) ?? evalFailed('init JS 返回了 null/undefined（legado setContent(null)）');
+}
+
 /** `budgetKey`：按哪段代码记预算（jsext1028 makeUp 后的代码随占位值变，按段原文记，免得每次换键绕过单段预算）。 */
 function execute<T>(
   code: string, bindings: JsBindings, exporter: (context: QuickJSContext, handle: QuickJSHandle) => T | null,
@@ -403,10 +412,11 @@ function installGlobals(context: QuickJSContext, bindings: JsBindings): { failur
     fn.dispose();
   }
   for (const [name, impl] of Object.entries(bindings.callbacks ?? {})) {
-    const fn = context.newFunction(name, (arg) => {
+    const fn = context.newFunction(name, (arg, ...rest) => {
       let out: JsValue | null;
       try {
-        out = impl(arg === undefined ? 'undefined' : context.getString(arg));
+        const extra = rest.map((handle) => (context.typeof(handle) === 'string' ? context.getString(handle) : null));
+        out = impl(arg === undefined ? 'undefined' : context.getString(arg), extra);
         const size = out === null ? 0 : typeof out === 'string' ? out.length : out.reduce((sum, item) => sum + item.length, 0);
         if (size > MAX_JS_OUTPUT_CHARS) throw new Error(`java.${name} 输出过大`);
       } catch (error) {
@@ -518,7 +528,25 @@ const ITEMS_SERIALIZER = `(function(v){
   return JSON.stringify(out);
 })`;
 
-function exportItems(context: QuickJSContext, handle: QuickJSHandle): JsListItem[] | null {
+/** runJsInit 的导出：套成单元素数组走 ITEMS_SERIALIZER，宿主照旧逐项校验。 */
+function exportInitValue(context: QuickJSContext, handle: QuickJSHandle): string | ReadonlyMap<string, string | null> | null {
+  const type = context.typeof(handle);
+  if (type === 'undefined' || (type === 'object' && isNull(context, handle))) return null;
+  if (type === 'string') return checkedOutput(context.getString(handle));
+  if (type !== 'object' || isArray(context, handle)) return evalFailed('init JS 返回的不是字符串/普通对象');
+  const wrapper = context.newArray();
+  try {
+    context.setProp(wrapper, 0, handle);
+    const items = exportItems(context, wrapper, 'init JS');
+    const item = items?.[0];
+    if (items?.length !== 1 || item === undefined || typeof item === 'string') return evalFailed('init JS 结果异常');
+    return item;
+  } finally {
+    wrapper.dispose();
+  }
+}
+
+function exportItems(context: QuickJSContext, handle: QuickJSHandle, what = '列表 JS'): JsListItem[] | null {
   const serializer = context.evalCode(ITEMS_SERIALIZER, 'items.js');
   if (serializer.error) {
     serializer.error.dispose();
@@ -530,7 +558,7 @@ function exportItems(context: QuickJSContext, handle: QuickJSHandle): JsListItem
     if (called.error) {
       const message = describeError(context, called.error);
       called.error.dispose();
-      return evalFailed(`列表 JS 结果无法读取：${message}`);
+      return evalFailed(`${what} 结果无法读取：${message}`);
     }
     try {
       text = context.typeof(called.value) === 'string' ? checkedOutput(context.getString(called.value)) : '';
@@ -549,7 +577,7 @@ function exportItems(context: QuickJSContext, handle: QuickJSHandle): JsListItem
   if (parsed === null) return null;
   if (parsed === 'string') return evalFailed('列表 JS 返回了字符串（legado getElements 强转 List 失败）');
   if (parsed === 'other') return evalFailed('列表 JS 返回的不是数组（legado getElements 强转 List 失败）');
-  if (parsed === 'item') return evalFailed('列表 JS 数组含字符串/普通对象以外的项');
+  if (parsed === 'item') return evalFailed(`${what === '列表 JS' ? '列表 JS 数组含' : `${what} 返回了`}字符串/普通对象以外的项`);
   if (!Array.isArray(parsed)) return evalFailed('列表 JS 结果异常');
   return parsed.map((item: unknown): JsListItem => {
     if (typeof item === 'string') return item;

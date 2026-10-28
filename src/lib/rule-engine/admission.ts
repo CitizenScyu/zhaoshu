@@ -20,7 +20,7 @@ import {
 } from './compile-smoke';
 import { listJsGroups, parseFieldRule } from './parse';
 import {
-  bookInfoScope, createScope, evaluateField, evaluateFieldList, normalizeBody,
+  bookInfoScope, createScope, evaluateField, evaluateFieldList, fieldUsesJs, normalizeBody,
 } from './evaluate';
 import { RuleEngineError, type FieldIr, type RuleDiagnostic } from './types';
 import { compileSource, engineSourceRevision } from './compile';
@@ -993,6 +993,8 @@ export async function readabilityShadow(
       url: typeof source.bookSourceUrl === 'string' ? source.bookSourceUrl : '', searchUrl: source.searchUrl,
       rules: source as Record<string, unknown>,
     });
+    // initjs1028：JS init 的源搜索段可能不含 JS（搜索时没预载沙箱）；开关关时 JS init 编译即跳过，这里不触发。
+    if (fieldUsesJs(compiled.get('ruleBookInfo.init'))) await preloadJsSandbox();
     const field = (name: string): FieldIr | undefined => {
       const found = compiled.get(name);
       return found && !('skipped' in found) ? found : undefined;

@@ -27,7 +27,7 @@ import { AIO_LIST_FIELDS, isAioListField, isAioListRule, parseAioField } from '.
 import {
   engineSyntaxAioEnabled, engineSyntaxAndEnabled, engineSyntaxJsBindEnabled, engineSyntaxJsEnabled, engineSyntaxJsExtEnabled,
   engineSyntaxJsGetEnabled, engineSyntaxJsonPathEnabled, engineSyntaxJsUtilEnabled, engineSyntaxListJsEnabled, engineSyntaxOrEnabled,
-  engineSyntaxRegexEnabled, engineSyntaxXPathEnabled, engineSyntaxXPathEvalEnabled,
+  engineSyntaxRegexEnabled, engineSyntaxXPathEnabled, engineSyntaxXPathEvalEnabled, engineInitJsActive,
 } from './syntax-flags';
 import { compileXPath, XPathSyntaxError } from './xpath-eval';
 import { looksLikeXPath, xpathPrefixed, xpathSegmentBody, xpathToCss } from './xpath-subset';
@@ -577,6 +577,11 @@ export interface ParseOptions {
    * （jsonpath.ts parseJsonPath ext）。默认读 env（缺失=off）。
    */
   jsonPathEnabled?: boolean;
+  /**
+   * 详情页 JS init（ENGINE_SYNTAX_INIT_JS，initjs1028；须 jsEnabled）：`ruleBookInfo.init` 的 JS 链放行，且 getter 白名单另认
+   * `X = (x) => java.getString(x)` 别名（collectJavaGets）。默认读 env（ENGINE_SYNTAX_INIT 与 ENGINE_SYNTAX_INIT_JS 同开才算）。
+   */
+  initJsEnabled?: boolean;
 }
 
 export function parseFieldRule(rule: string, options: ParseOptions = {}): FieldIr {
@@ -820,6 +825,26 @@ export function initFieldSupported(field: FieldIr): boolean {
 }
 
 /**
+ * JS init（initjs1028）的编译结果能否复现：整条规则恰好一段 JS（前后无规则段、无 `##` 替换），求值见 evaluate.ts jsInitScope。
+ * 原文另须含 JS（ruleHasJs），调用方判。
+ */
+export function initJsFieldSupported(field: FieldIr): boolean {
+  if (field.rules.length !== 0 || field.regex || field.makeUp || field.chain?.length !== 1) return false;
+  const stage = field.chain[0];
+  return stage.kind === 'js' && stage.regex === undefined && stage.detached !== true;
+}
+
+/** 准入初筛用（compile-smoke rulesNoJs）：init 原文按 env 开关编译后是可复现的 JS init。 */
+export function initJsRuleSupported(rule: unknown): boolean {
+  if (typeof rule !== 'string' || !ruleHasJs(rule.trim())) return false;
+  try {
+    return initJsFieldSupported(parseFieldRule(rule, { field: 'ruleBookInfo.init', jsEnabled: true, initJsEnabled: true }));
+  } catch {
+    return false;
+  }
+}
+
+/**
  * 依赖 legado 宿主状态或动态代码的标识符：沙箱里没有对应对象，编译期先拒，免得准入放进实跑必失败的源。
  * 只认「前面不是 `.`」的裸标识符（`x.book` 是属性访问，不算）；字符串/注释里的不算。
  */
@@ -836,7 +861,9 @@ const JS_BANNED_IDENTIFIERS: ReadonlySet<string> = new Set([
 function parseJsChain(trimmed: string, rule: string, options: ParseOptions): FieldIr {
   const field = options.field;
   const itemLevel = field !== undefined && JS_ITEM_FIELDS.has(field);
-  if (field === undefined || !jsChainFieldAllowed(field)) {
+  // initjs1028：详情页 init 是页面级（result/src = 详情页原文）。
+  const initJs = field === 'ruleBookInfo.init' && (options.initJsEnabled ?? engineInitJsActive());
+  if (field === undefined || !(jsChainFieldAllowed(field) || initJs)) {
     unsupported('规则含 JS（@js:/<js>）', rule, { code: 'unsupported_js' });
   }
   if (trimmed.length > MAX_JS_RULE_LENGTH) unsupported('规则过长', rule, { code: 'rule_too_long' });
@@ -848,7 +875,7 @@ function parseJsChain(trimmed: string, rule: string, options: ParseOptions): Fie
     regexEnabled, jsonPathEnabled: options.jsonPathEnabled,
   };
   const gets: JsGets | undefined = (options.jsGetEnabled ?? engineSyntaxJsGetEnabled())
-    ? { options: segmentOptions, out: new Map() } : undefined;
+    ? { options: segmentOptions, out: new Map(), aliases: initJs } : undefined;
   const util: JsUtil | undefined = (options.jsUtilEnabled ?? engineSyntaxJsUtilEnabled()) ? { used: false } : undefined;
   const chain: ChainStage[] = [];
   const pushRule = (text: string) => {
@@ -986,7 +1013,7 @@ const FIRST_JS_SEGMENT_RE = /<js>([\w\W]*?)<\/js>|@js:([\w\W]*)/i;
  * split("##") 切出键（trim）与替换（≥4 段即 replaceFirst）。首段即 JS 时首个 SourceRule 是 Js 模式、规则文本就是 JS 代码，
  * legado 照样拿它当键（不执行）。@put/@get/{{}}/`$N`（模板拼值）不复现。
  */
-function objectKeyOf(rule: string): NonNullable<FieldIr['objectKey']> {
+export function objectKeyOf(rule: string): NonNullable<FieldIr['objectKey']> {
   const js = FIRST_JS_SEGMENT_RE.exec(rule);
   let head = (js ? rule.slice(0, js.index) : rule).trim();
   if (head === '' && js) head = js[1] ?? js[2] ?? '';
@@ -1145,10 +1172,14 @@ interface JsUtil {
 }
 
 // ---- java.getString/getStringList（jsget1028，ENGINE_SYNTAX_JS_GET）----
-/** 编译期收集的实参白名单：`options` = 规则段的编译开关（不含 JS），`out` = 规则文本 → 编译结果。 */
+/**
+ * 编译期收集的实参白名单：`options` = 规则段的编译开关（不含 JS），`out` = 规则文本 → 编译结果。
+ * `aliases`（initjs1028，只给 JS init）：另认 getString 箭头函数别名（collectJavaAliases）。
+ */
 interface JsGets {
   options: ParseOptions;
   out: Map<string, FieldIr>;
+  aliases?: boolean;
 }
 
 /** `java.getString("…")`/`java.getStringList('…')`：恰好一个不跨行的字符串字面量实参（isUrl 等多参形态不收）。 */
@@ -1160,12 +1191,21 @@ const JAVA_GET_CALL_RE = /(?<![\w$.])java\s*\.\s*(?:getString|getStringList)\s*\
  * 实参规则编译不过 → 整段拒（unsupported_js）。
  */
 function collectJavaGets(code: string, rule: string, gets: JsGets): string {
+  return collectLiteralCalls(gets.aliases ? collectJavaAliases(code, rule, gets) : code, JAVA_GET_CALL_RE, rule, gets);
+}
+
+/** 探针：起点之前的代码接一个 `_`，剥完字面量后 `_` 还在末尾 = 起点在代码里（不在字符串/注释/正则/模板字面量里）。 */
+function startsInCode(code: string, index: number): boolean {
+  const probe = stripJsLiterals(`${code.slice(0, index)}_`);
+  return probe !== null && probe.endsWith('_') && (probe.split('`').length - 1) % 2 === 0;
+}
+
+/** 把 `pattern` 命中的字面量实参调用（首个捕获组 = 字面量）编进白名单、在待查代码里换成 `(0)`。 */
+function collectLiteralCalls(code: string, pattern: RegExp, rule: string, gets: JsGets): string {
   let out = '';
   let last = 0;
-  for (const match of code.matchAll(JAVA_GET_CALL_RE)) {
-    // 探针：起点之前的代码接一个 `_`，剥完字面量后 `_` 还在末尾 = 起点在代码里（不在字符串/注释/正则字面量里）。
-    const probe = stripJsLiterals(`${code.slice(0, match.index)}_`);
-    if (probe === null || !probe.endsWith('_') || (probe.split('`').length - 1) % 2 === 1) continue;
+  for (const match of code.matchAll(pattern)) {
+    if (!startsInCode(code, match.index)) continue;
     const text = jsStringLiteralValue(match[1]);
     if (text === null || text.includes(TEMPLATE_HOLE)) continue;
     if (!gets.out.has(text)) {
@@ -1179,6 +1219,43 @@ function collectJavaGets(code: string, rule: string, gets: JsGets): string {
     last = match.index + match[0].length;
   }
   return out + code.slice(last);
+}
+
+/**
+ * getString 箭头函数别名（initjs1028）：`[var|let|const] NAME = (P) => java.getString(P[, result])`（或 `P =>`），形参即实参。
+ * 别名的每次调用都必须是 `NAME("字面量")`——实参编进白名单、调用与别名体换成 `(0)`；换完后代码里的 NAME 只许剩定义处
+ * 那一个（重定义、传递、动态实参、对象键同名一律不认，交白名单拒）。运行时回调照旧只认白名单实参，第二实参须是 init 的
+ * result（evaluate.ts jsBindings）。
+ */
+const JAVA_ALIAS_DEF_RE = /(?<![\w$.])(?:(?:var|let|const)\s+)?([A-Za-z_$][\w$]*)\s*=\s*(?:\(\s*([A-Za-z_$][\w$]*)\s*\)|([A-Za-z_$][\w$]*))\s*=>\s*(java\s*\.\s*getString\s*\(\s*([A-Za-z_$][\w$]*)\s*(?:,\s*result\s*)?\))/g;
+
+/** 别名名不能遮住沙箱提供的全局或宿主绑定。 */
+const JS_ALIAS_RESERVED: ReadonlySet<string> = new Set(['java', 'result', 'src', 'baseUrl', 'var', 'let', 'const', 'return', 'typeof']);
+
+function collectJavaAliases(code: string, rule: string, gets: JsGets): string {
+  const names: string[] = [];
+  let out = '';
+  let last = 0;
+  for (const match of code.matchAll(JAVA_ALIAS_DEF_RE)) {
+    const [, name, wrapped, bare, body, arg] = match;
+    if ((wrapped ?? bare) !== arg || JS_ALIAS_RESERVED.has(name) || JS_BANNED_IDENTIFIERS.has(name) || names.includes(name)) continue;
+    if (!startsInCode(code, match.index)) continue;
+    names.push(name);
+    const bodyAt = match.index + match[0].length - body.length;
+    out += `${code.slice(last, bodyAt)}(0)`;
+    last = match.index + match[0].length;
+  }
+  let rewritten = out + code.slice(last);
+  for (const name of names) {
+    const escaped = name.replace(/\$/g, '\\$');
+    const call = new RegExp(`(?<![\\w$.])${escaped}\\s*\\(\\s*("(?:[^"\\\\\\n]|\\\\.)*"|'(?:[^'\\\\\\n]|\\\\.)*')\\s*\\)`, 'g');
+    rewritten = collectLiteralCalls(rewritten, call, rule, gets);
+    const bare = stripJsLiterals(rewritten);
+    if (bare === null) return code;
+    const uses = [...bare.matchAll(new RegExp(`(?<![\\w$.])${escaped}(?![\\w$])`, 'g'))].length;
+    if (uses !== 1) unsupported(`JS 段 getString 别名 ${name} 有非字面量用法`, rule, { code: 'unsupported_js' });
+  }
+  return rewritten;
 }
 
 const JS_SIMPLE_ESCAPES: Readonly<Record<string, string>> = { n: '\n', t: '\t', r: '\r', b: '\b', f: '\f', v: '\v' };

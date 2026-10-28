@@ -4,11 +4,11 @@
 
 import { upgradeSourceTemplateUrl } from '@/lib/source-policy';
 import { searchOptionsConstructible, searchTemplateNeedsJs } from '@/lib/source-parser';
-import { jsChainFieldAllowed, listJsGroupsFlat, parseFieldRule, ruleHasJs, type ParseOptions } from './parse';
+import { initJsRuleSupported, jsChainFieldAllowed, listJsGroupsFlat, parseFieldRule, ruleHasJs, type ParseOptions } from './parse';
 import { aioGroupsFlat, isAioListField, ruleGroupOf } from './aio-syntax';
 import { searchJsConstructible } from './search-js';
 import {
-  engineSearchJsEnabled, engineSearchOptionsEnabled, engineSyntaxAioEnabled, engineSyntaxJsEnabled, engineSyntaxListJsEnabled,
+  engineInitJsActive, engineSearchJsEnabled, engineSearchOptionsEnabled, engineSyntaxAioEnabled, engineSyntaxJsEnabled, engineSyntaxListJsEnabled,
 } from './syntax-flags';
 import { RuleEngineError, type RuleDiagnostic } from './types';
 
@@ -122,13 +122,14 @@ export function sourceHasJsChainField(src: RawSource, env: NodeJS.ProcessEnv = p
  */
 export function admissionSurveyOptions(
   src: RawSource, env: NodeJS.ProcessEnv = process.env,
-): { postSearch: boolean; noncoreJs: boolean; coreJs: boolean; searchJs: boolean; listJs: boolean } {
+): { postSearch: boolean; noncoreJs: boolean; coreJs: boolean; searchJs: boolean; listJs: boolean; initJs: boolean } {
   return {
     postSearch: enginePostSearchEnabled(env),
     noncoreJs: admissionNoncoreJsEnabled(env),
     coreJs: jsChainEnabledFor(src, env),
     searchJs: engineSearchJsActive(env),
     listJs: engineSyntaxListJsEnabled(env),
+    initJs: engineInitJsActive(env),
   };
 }
 
@@ -136,17 +137,22 @@ export function admissionSurveyOptions(
  * readingPathOnly（ADMISSION_NONCORE_JS 开）：只查阅读路径字段；关时查全部规则组（逐字原口径）。
  * coreJs（ENGINE_SYNTAX_JS on）：无 jsLib 的源里，JS 链白名单字段（parse.ts jsChainFieldAllowed）的 JS
  * 不再整源拒——引擎改由沙箱执行；READING_PATH_JS_FIELDS 照旧拒；列表字段（bookList/chapterList）只在 listJs
- * （ENGINE_SYNTAX_LIST_JS，listjs1027）同开时放行。coreJs 关时逐字原口径。
+ * （ENGINE_SYNTAX_LIST_JS，listjs1027）同开时放行；`ruleBookInfo.init` 只在 initJs（ENGINE_SYNTAX_INIT 与 ENGINE_SYNTAX_INIT_JS，
+ * initjs1028）同开且按 env 开关编译后是可复现的 JS init（parse.ts initJsRuleSupported）时放行。coreJs 关时逐字原口径。
  */
-function rulesNoJs(src: RawSource, options: { noncoreJs?: boolean; coreJs?: boolean; listJs?: boolean } = {}): boolean {
+function rulesNoJs(
+  src: RawSource, options: { noncoreJs?: boolean; coreJs?: boolean; listJs?: boolean; initJs?: boolean } = {},
+): boolean {
   const readingPathOnly = options.noncoreJs === true;
   const jsOk = options.coreJs === true && !hasJsLib(src);
   const listJsOk = jsOk && options.listJs === true;
+  const initJsOk = jsOk && options.initJs === true;
   for (const [field, v] of iterRulePairs(src)) {
     if (readingPathOnly && !READING_PATH_FIELDS.has(field)) continue;
     if (!ruleHasJs(v)) continue;
     if (jsOk && jsChainFieldAllowed(field)) continue;
     if (listJsOk && isAioListField(field)) continue;
+    if (initJsOk && field === 'ruleBookInfo.init' && initJsRuleSupported(v)) continue;
     return false;
   }
   return true;
@@ -180,7 +186,8 @@ function searchIsPureGet(su: unknown): boolean {
  * （search-js.ts searchJsConstructible，与运行时同一函数）。须先 await prepareSearchJs()，沙箱未就绪抛 SearchJsNotReadyError。
  */
 export function selectCandidates(
-  data: RawSource[], options: { postSearch?: boolean; noncoreJs?: boolean; coreJs?: boolean; searchJs?: boolean; listJs?: boolean } = {},
+  data: RawSource[],
+  options: { postSearch?: boolean; noncoreJs?: boolean; coreJs?: boolean; searchJs?: boolean; listJs?: boolean; initJs?: boolean } = {},
 ): RawSource[] {
   const out: RawSource[] = [];
   for (const s of data) {

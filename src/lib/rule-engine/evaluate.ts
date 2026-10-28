@@ -9,7 +9,7 @@ import {
   type RuleIr, type RegexSub, type SkippedField, type TemplatePart,
 } from './types';
 import { aioListCode } from './aio-syntax';
-import { type JsBindings, type JsListItem, type JsValue, runJs, runJsItems } from './js-sandbox';
+import { type JsBindings, type JsListItem, type JsValue, runJs, runJsInit, runJsItems } from './js-sandbox';
 import { evalJsonPath, evalJsonPathList, isDefinitePath, parseJsonPath } from './jsonpath';
 import { defaultSyntaxSource } from './parse';
 import { evaluateXPath } from './xpath-eval';
@@ -590,14 +590,19 @@ function hostBindings(scope: EvalScope): Pick<JsBindings, 'globals' | 'objects'>
  * 在字段作用域上取值——legado 的 `java` 是 AnalyzeRule，content 是整页或列表条目，不随链上一段结果变；默认模式多个命中
  * 按行拼接。getString 结果含 `&` 时按 unescapeHtml4 口径解码，getStringList 按行拆、不解码。同一次执行内按实参记忆。
  * `util`（jsutil1028）= 字段 JS 用到了加解密 / toNumChapter 帮手（FieldIr.jsUtil），只此时让沙箱装这批帮手。
+ * `initContent`（initjs1028，只给 JS init）：getter 收第二实参 mContent，须恰是 init 的 result（详情页原文，legado 在它上取值，
+ * 与 content 同一份）；别的第二实参、多于两个实参求值失败。缺省时多余实参照旧不看。
  */
 function jsBindings(
-  scope: EvalScope, gets: FieldIr['jsGets'], util?: true,
+  scope: EvalScope, gets: FieldIr['jsGets'], util?: true, initContent?: string,
 ): Pick<JsBindings, 'globals' | 'objects' | 'callbacks' | 'utilHelpers'> {
   const host = util ? { ...hostBindings(scope), utilHelpers: true } : hostBindings(scope);
   if (gets === undefined) return host;
   const memo = new Map<string, string>();
-  const read = (rule: string): string => {
+  const read = (rule: string, extra: readonly (string | null)[]): string => {
+    if (initContent !== undefined && extra.length > 0 && (extra.length > 1 || extra[0] !== initContent)) {
+      return evalFailed('init JS 的 java.getString 第二实参不是 result');
+    }
     const field = gets.get(rule);
     if (field === undefined) return evalFailed('java.getString 的实参不在编译期白名单里');
     let value = memo.get(rule);
@@ -610,11 +615,11 @@ function jsBindings(
   return {
     ...host,
     callbacks: {
-      getString: (rule) => {
-        const value = read(rule);
+      getString: (rule, extra) => {
+        const value = read(rule, extra);
         return value.includes('&') ? decodeHTMLStrict(value) : value;
       },
-      getStringList: (rule) => splitLines(read(rule)),
+      getStringList: (rule, extra) => splitLines(read(rule, extra)),
     },
   };
 }
@@ -805,11 +810,35 @@ function jsonListItems(ir: RuleIr, json: unknown): unknown[] {
  * 页面 URL 与宿主绑定沿用页面作用域。
  */
 export function evaluateInitScope(field: FieldIr, scope: EvalScope): EvalScope {
+  if (field.chain) {
+    const next = jsInitScope(field, field.chain, scope);
+    if (scope.host) next.host = scope.host;
+    return next;
+  }
   const ir = field.rules[0];
-  if (field.chain || field.rules.length !== 1 || ir === undefined) return evalFailed('init 规则不可复现');
+  if (field.rules.length !== 1 || ir === undefined) return evalFailed('init 规则不可复现');
   const next = scope.kind === 'html' ? htmlInitScope(ir, scope) : jsonInitScope(ir, scope);
   if (scope.host) next.host = scope.host;
   return next;
+}
+
+/**
+ * JS init（initjs1028，compile.ts 只给 parse.ts initJsFieldSupported 判可复现的挂 initScope）：legado getElement 的 Js 模式，
+ * `evalJS(init, content)`，result/src = 详情页原文。返回字符串 → 按内容重新判定 HTML/JSON 成为新页面；返回普通对象 → 详情字段
+ * 按 FieldIr.objectKey 键值直取（legado getString 的 NativeObject 分支，compile.ts 给 ruleBookInfo 字段挂）。
+ * makeUp 后带 `##` 替换或代码为空不复现。
+ */
+function jsInitScope(field: FieldIr, chain: readonly ChainStage[], scope: EvalScope): EvalScope {
+  const stage = chain[0];
+  if (chain.length !== 1 || stage?.kind !== 'js' || stage.regex !== undefined) return evalFailed('init JS 形态不可复现');
+  const source = scope.source;
+  if (source === undefined) return evalFailed('init JS 需要页面原文，当前作用域没有');
+  const { code, regex } = makeUpJs(stage, source, scope, field.jsGets, field.jsUtil);
+  if (regex !== undefined || code === '') return evalFailed('init JS makeUp 后带 ## 替换或为空，不复现');
+  const bindings = { result: source, src: source, baseUrl: scope.pageUrl, ...jsBindings(scope, field.jsGets, field.jsUtil, source) };
+  const out = runJsInit(code, bindings, stage.template ? stage.code : code);
+  if (typeof out === 'string') return rescope(out, scope);
+  return { kind: 'json', json: undefined, pageUrl: scope.pageUrl, object: out };
 }
 
 function htmlInitScope(ir: RuleIr, scope: HtmlScope): HtmlScope {

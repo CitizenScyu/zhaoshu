@@ -23,12 +23,12 @@ export const ENGINE_SEMANTICS_XPATH_BIT = 2;
 /** vars1027：@put/@get 静态子集语义位。版本再 +4（5–8 = 含变量位的四种组合），1–4 逐字不变。 */
 export const ENGINE_SEMANTICS_VARS_BIT = 4;
 
-/** 语义版本随 || / XPath / 变量 / JS / XPath 求值 / 正则 / && / AllInOne / 搜索 JS / 列表 JS / JS 扩展 / 宿主绑定 / java.getString / 加解密帮手 / JSONPath 扩展 / 详情 init / 搜索选项 legado 口径 / URL 字段选项 / 搜索 webView 开关联动（唯一口径，供 compile.ts 缓存键与 rulesHash 复用）。 */
+/** 语义版本随 || / XPath / 变量 / JS / XPath 求值 / 正则 / && / AllInOne / 搜索 JS / 列表 JS / JS 扩展 / 宿主绑定 / java.getString / 加解密帮手 / JSONPath 扩展 / 详情 init / 搜索选项 legado 口径 / URL 字段选项 / 搜索 webView / 详情 JS init 开关联动（唯一口径，供 compile.ts 缓存键与 rulesHash 复用）。 */
 export function engineSemanticsVersion(
   orEnabled: boolean, xpathEnabled = false, varsEnabled = false, jsEnabled = false, xpathEvalEnabled = false,
   regexEnabled = false, andEnabled = false, aioEnabled = false, searchJsEnabled = false, listJsEnabled = false,
   jsExtEnabled = false, jsBindEnabled = false, jsGetEnabled = false, jsUtilEnabled = false, jsonPathEnabled = false,
-  initEnabled = false, searchOptionsEnabled = false, urlOptionsEnabled = false, searchWebViewEnabled = false,
+  initEnabled = false, searchOptionsEnabled = false, urlOptionsEnabled = false, searchWebViewEnabled = false, initJsEnabled = false,
 ): number {
   return (orEnabled ? ENGINE_SEMANTICS_VERSION_OR : ENGINE_SEMANTICS_VERSION)
     + (xpathEnabled ? ENGINE_SEMANTICS_XPATH_BIT : 0) + (varsEnabled ? ENGINE_SEMANTICS_VARS_BIT : 0)
@@ -39,7 +39,8 @@ export function engineSemanticsVersion(
     + (jsBindEnabled ? ENGINE_SEMANTICS_JS_BIND_BIT : 0) + (jsGetEnabled ? ENGINE_SEMANTICS_JS_GET_BIT : 0)
     + (jsUtilEnabled ? ENGINE_SEMANTICS_JS_UTIL_BIT : 0) + (jsonPathEnabled ? ENGINE_SEMANTICS_JSON_PATH_BIT : 0)
     + (initEnabled ? ENGINE_SEMANTICS_INIT_BIT : 0) + (searchOptionsEnabled ? ENGINE_SEMANTICS_SEARCH_OPTIONS_BIT : 0)
-    + (urlOptionsEnabled ? ENGINE_SEMANTICS_URL_OPTIONS_BIT : 0) + (searchWebViewEnabled ? ENGINE_SEMANTICS_SEARCH_WEBVIEW_BIT : 0);
+    + (urlOptionsEnabled ? ENGINE_SEMANTICS_URL_OPTIONS_BIT : 0) + (searchWebViewEnabled ? ENGINE_SEMANTICS_SEARCH_WEBVIEW_BIT : 0)
+    + (initJsEnabled ? ENGINE_SEMANTICS_INIT_JS_BIT : 0);
 }
 
 /**
@@ -341,4 +342,27 @@ export const ENGINE_SEMANTICS_SEARCH_WEBVIEW_BIT = 262144;
 export function engineSearchWebViewEnabled(env: OrEnv = process.env): boolean {
   const raw = env.ENGINE_SEARCH_WEBVIEW?.trim().toLowerCase();
   return raw === '1' || raw === 'true' || raw === 'on';
+}
+
+/**
+ * initjs1028：详情页 JS init 语义位。版本再 +524288（524289–1048576），1–524288 逐字不变。
+ * 只对 init 是整条 JS 且编译可复现的源计入（compile.ts sourceUsesInitJsSyntax）。
+ */
+export const ENGINE_SEMANTICS_INIT_JS_BIT = 524288;
+
+/**
+ * ENGINE_SYNTAX_INIT_JS 独立开关（initjs1028，默认 off，口径同 ENGINE_SYNTAX_OR；只在 ENGINE_SYNTAX_INIT 与 JS 链同开、
+ * 源无 jsLib 时起作用）。on = `ruleBookInfo.init` 是整条 JS 时按 legado BookInfo `setContent(getElement(init))` 在沙箱里求值
+ * （result = 详情页原文）：返回字符串即换成新页面，返回普通对象即详情字段按 legado getString 的 NativeObject 分支键值直取；
+ * init 里 `X = (x) => java.getString(x)` 这类别名在 ENGINE_SYNTAX_JS_GET 开、且别名只以字面量实参调用时收进 getter 白名单。
+ * 其余形态的 JS init 照旧整源拒。off = 逐字不变。
+ */
+export function engineSyntaxInitJsEnabled(env: OrEnv = process.env): boolean {
+  const raw = env.ENGINE_SYNTAX_INIT_JS?.trim().toLowerCase();
+  return raw === '1' || raw === 'true' || raw === 'on';
+}
+
+/** initjs1028 实际生效（与 INIT 同开；JS 链与 jsLib 的判据由调用方另加）。 */
+export function engineInitJsActive(env: OrEnv = process.env): boolean {
+  return engineSyntaxInitEnabled(env) && engineSyntaxInitJsEnabled(env);
 }
