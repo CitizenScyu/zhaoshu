@@ -756,7 +756,19 @@ export const JSOUP_PRELUDE = `(function(){
     }
     return stringify(out);
   }
-  defProp(globalThis, '__jsoupExport', { value: function(v, mode){ return mode === 'items' ? expItems(v) : expVal(v, mode); },
+  // initjsoup1028：init 的返回（legado setContent）：字符串（含 Java 字符串）原样、普通对象按条目口径成键值表；Element/Elements/
+  // Java 数组记 node，数组、数字等记 other（宿主判失败）。
+  function expInit(v) {
+    if (v === undefined || v === null) return 'null';
+    var k = kindOf(v);
+    if (k !== undefined) return k.k === 'S' ? expStr(k.v) : '"node"';
+    if (typeof v === 'string') return expStr(v);
+    if (typeof v !== 'object' || isArr(v)) return '"other"';
+    return expItems([v]);
+  }
+  defProp(globalThis, '__jsoupExport', { value: function(v, mode){
+    return mode === 'items' ? expItems(v) : mode === 'init' ? expInit(v) : expVal(v, mode);
+  },
     writable: false, enumerable: false, configurable: false });
 })();
 `;
@@ -764,7 +776,7 @@ export const JSOUP_PRELUDE = `(function(){
 // ---------------------------------------------------------------- 导出解码（不信任沙箱产出，逐项校验）
 /** 调沙箱里的 `__jsoupExport` 取 JSON 文本；导出阶段的宿主失败（bad）照旧致命。 */
 export function exportJsoup(
-  context: QuickJSContext, handle: QuickJSHandle, session: JsoupSession, mode: JsoupMode | 'items',
+  context: QuickJSContext, handle: QuickJSHandle, session: JsoupSession, mode: JsoupMode | 'items' | 'init',
 ): string {
   const fn = context.getProp(context.global, '__jsoupExport');
   const modeHandle = context.newString(mode);
@@ -838,4 +850,24 @@ export function decodeJsoupItems(text: string, session: JsoupSession): JsoupList
     }
     return entries;
   });
+}
+
+/**
+ * 详情页 JS init 的返回（initjsoup1028）：字符串，或单个普通对象的键值表（口径同 decodeJsoupItems 的对象项）。返回 Element/Elements
+ * （legado setContent 拿节点续解析，这里不复现）、数组、数字等一律失败；null 交调用方判。
+ */
+export function decodeJsoupInit(text: string, session: JsoupSession): string | ReadonlyMap<string, string | null> | null {
+  const parsed = parseExport(text);
+  if (parsed === null) return null;
+  if (parsed === 'node') return jsoupFatal('init JS 返回了 Element/Elements/Java 数组（legado setContent 口径不复现）');
+  if (parsed === 'other' || parsed === 'item') return jsoupFatal('init JS 返回的不是字符串/普通对象');
+  if (!Array.isArray(parsed)) {
+    const s = typeof parsed === 'object' ? (parsed as { s?: unknown }).s : undefined;
+    if (typeof s !== 'string') return jsoupFatal('init JS 结果异常');
+    return s.length > MAX_OUTPUT_CHARS ? jsoupFatal('JS 输出过大') : s;
+  }
+  const items = decodeJsoupItems(text, session);
+  const item = items?.[0];
+  if (items?.length !== 1 || item === undefined || typeof item === 'string' || 'jsoupNode' in item) return jsoupFatal('init JS 结果异常');
+  return item;
 }

@@ -20,7 +20,7 @@ import {
   engineSyntaxOrEnabled, engineSyntaxRegexEnabled, engineSyntaxVarsEnabled, engineSyntaxXPathEnabled, engineSyntaxXPathEvalEnabled, engineUrlOptionsEnabled,
   engineSearchWebViewEnabled, engineSyntaxInitJsEnabled, engineSyntaxJsoupEnabled, engineSyntaxVarsBagEnabled,
   engineSyntaxBookFieldsEnabled, engineSyntaxSearchVarsEnabled, engineSyntaxItemVarsEnabled, engineSyntaxListGetEnabled, ENGINE_SEMANTICS_VERSION,
-  engineSyntaxBookVariableEnabled, engineSyntaxJsLibEnabled, engineSyntaxSourceBindEnabled,
+  engineSyntaxBookVariableEnabled, engineSyntaxJsLibEnabled, engineSyntaxSourceBindEnabled, engineSyntaxInitJsoupEnabled,
 } from './syntax-flags';
 import { urlOptionFields } from './url-options';
 import {
@@ -60,6 +60,7 @@ export interface CompileOptions extends ParseOptions {
   jsLibEnabled?: boolean;
   /** srcbind1028：书源常量代入（ENGINE_SYNTAX_SOURCE_BIND，默认读 env；须 JS 链对该源生效，见 sourceConstsOf）。变量袋/搜索袋/条目袋的字段不代入。 */
   sourceBindEnabled?: boolean;
+  // initJsoupEnabled（initjsoup1028，ENGINE_SYNTAX_INIT_JSOUP）见 ParseOptions；compile 层另要求 JS init 与 jsoup 对该源同生效。
 }
 
 /** 版本化缓存键（P0 口径）：semanticsVersion:contentRevision。 */
@@ -104,6 +105,8 @@ export function engineVersionedKey(contentRevision: string, semanticsVersion = E
  * （与 compileSource 开 JS 链同口径；内容 identity 仍按原规则），有字段带 JS（JS 段或 `{{}}`）时再加 jsLib 位（+268435456）。
  * srcbind1028：ENGINE_SYNTAX_SOURCE_BIND on、JS 链对该源生效且有字段不带书源常量被拒、带了编译通过（sourceUsesSourceBindSyntax）
  * 时再加书源常量位（+536870912）。
+ * initjsoup1028：ENGINE_SYNTAX_INIT_JSOUP on、JS init 与 jsoup 对该源同生效且 init 只有经 jsoup 重编才是可复现 JS init
+ * （sourceUsesInitJsoupSyntax）时再加 jsoup init 位（+1073741824，int4 最后一位）。其余位的探测不传本开关（读 env，同 listget1028 口径）。
  */
 export function engineSourceRevision(
   source: { url: string; searchUrl: unknown; rules: Record<string, unknown> },
@@ -145,6 +148,7 @@ export function engineSourceRevision(
   const listGet = jsGet && listJsEnabled && (options.listGetEnabled ?? engineSyntaxListGetEnabled());
   const bookVariable = jsoup && book && (options.bookVariableEnabled ?? engineSyntaxBookVariableEnabled());
   const sourceBind = jsChain && (options.sourceBindEnabled ?? engineSyntaxSourceBindEnabled());
+  const initJsoup = initJsEnabled && jsoup && (options.initJsoupEnabled ?? engineSyntaxInitJsoupEnabled());
   // jsoup1028：其余各位先按 jsoup 关判（与旧口径逐字相同），jsoup 开时再补判一次取并集——jsoup 重试能救活
   // 某开关的 off 态（如条目首段 JS 以 Element 起链），只按 jsoup 开判会把该位清掉、在池源 identity 白翻。
   // book1028 同理：书籍成员重试也能救活别的开关的 off 态，book 开时再按 book 开（jsoup 两态）补判。
@@ -237,6 +241,11 @@ export function engineSourceRevision(
       orEnabled, varsEnabled, xpathEnabled, xpathEvalEnabled: xpathEval, regexEnabled, andEnabled, aioEnabled, listJsEnabled, jsExtEnabled,
       jsBindEnabled: jsBind, jsGetEnabled: jsGet, jsUtilEnabled: jsUtil, jsonPathEnabled, initJsEnabled, jsoupEnabled: jsoup,
       bookFieldsEnabled: book, listGetEnabled: listGet, bookVariablePuts: bookVariable ? sourceBookVariablePuts(source) ?? undefined : undefined,
+    }),
+    initJsoup && sourceUsesInitJsoupSyntax(rules, {
+      orEnabled, xpathEnabled, xpathEvalEnabled: xpathEval, regexEnabled, andEnabled, aioEnabled, listJsEnabled,
+      jsExtEnabled, jsBindEnabled: jsBind, jsGetEnabled: jsGet, jsUtilEnabled: jsUtil, jsonPathEnabled, bookFieldsEnabled: book,
+      sourceConsts: sourceConstsOf(source.rules, sourceBind),
     }),
   ));
 }
@@ -1291,6 +1300,43 @@ function initJsApplies(rule: unknown, field: FieldIr | { skipped: string } | und
 }
 
 const initJsMemo = new WeakMap<object, Map<string, boolean>>();
+const initJsoupMemo = new WeakMap<object, Map<string, boolean>>();
+
+/**
+ * 源是否会因 ENGINE_SYNTAX_INIT_JSOUP 改变详情页求值（initjsoup1028）：init 原文含 JS、按 compileSource 同一组开关（JS 链、JS init、
+ * jsoup 与本开关都开，书源常量同主循环）编译后是可复现的 JS init，且是 jsoup 重编出来的（FieldIr.jsoup：off 态口径被拒才会重编）。
+ * 调用方还须确认 JS init 与 jsoup 对该源同生效。
+ */
+export function sourceUsesInitJsoupSyntax(
+  rules: Record<string, unknown>,
+  options: {
+    orEnabled: boolean; xpathEnabled: boolean; xpathEvalEnabled: boolean; regexEnabled: boolean; andEnabled: boolean;
+    aioEnabled: boolean; listJsEnabled: boolean; jsExtEnabled: boolean; jsBindEnabled: boolean; jsGetEnabled: boolean; jsUtilEnabled: boolean;
+    jsonPathEnabled: boolean; bookFieldsEnabled: boolean; sourceConsts?: SourceConsts;
+  },
+): boolean {
+  const rule = initRuleOf(rules);
+  if (typeof rule !== 'string' || !ruleHasJs(rule.trim())) return false;
+  const memoKey = `${options.orEnabled}:${options.xpathEnabled}:${options.xpathEvalEnabled}:${options.regexEnabled}:${options.andEnabled}:${options.aioEnabled}:${options.listJsEnabled}:${options.jsExtEnabled}:${options.jsBindEnabled}:${options.jsGetEnabled}:${options.jsUtilEnabled}:${options.jsonPathEnabled}:${options.bookFieldsEnabled}:${options.sourceConsts !== undefined}`;
+  let memo = initJsoupMemo.get(rules);
+  const hit = memo?.get(memoKey);
+  if (hit !== undefined) return hit;
+  let field: FieldIr | undefined;
+  try {
+    field = parseFieldRule(rule, {
+      ...options, jsEnabled: true, initJsEnabled: true, jsoupEnabled: true, initJsoupEnabled: true, field: 'ruleBookInfo.init',
+    });
+  } catch {
+    field = undefined;
+  }
+  const uses = field?.jsoup === true && initJsApplies(rule, field);
+  if (!memo) {
+    memo = new Map();
+    initJsoupMemo.set(rules, memo);
+  }
+  memo.set(memoKey, uses);
+  return uses;
+}
 
 /**
  * 源是否会因 ENGINE_SYNTAX_INIT_JS 改变详情页求值（initjs1028）：init 原文含 JS、按 compileSource 同一组开关（JS 链已开）编译后
@@ -1684,10 +1730,13 @@ export function compileSource(
   // srcbind1028：书源常量只进主循环（袋字段不代入）。
   const sourceBindEnabled = jsEnabled && (options.sourceBindEnabled ?? engineSyntaxSourceBindEnabled());
   const sourceConsts = sourceConstsOf(source.rules, sourceBindEnabled);
+  // initjsoup1028：init 的 jsoup 重编须 JS init 与 jsoup 同生效。
+  const initJsoupEnabled = initJsEnabled && jsoupEnabled && (options.initJsoupEnabled ?? engineSyntaxInitJsoupEnabled());
   const key = engineSourceRevision(source, {
     orEnabled, xpathEnabled, varsEnabled, jsEnabled, xpathEvalEnabled, regexEnabled, andEnabled, aioEnabled, listJsEnabled, jsExtEnabled,
     jsBindEnabled, jsGetEnabled, jsUtilEnabled, jsonPathEnabled, initEnabled, urlOptionsEnabled, initJsEnabled, varBagEnabled, jsoupEnabled,
     bookFieldsEnabled, searchJsEnabled, searchVarsEnabled, itemVarsEnabled, listGetEnabled, bookVariableEnabled, jsLibEnabled, sourceBindEnabled,
+    initJsoupEnabled,
   });
   const hit = cache.get(key);
   if (hit) {
@@ -1710,7 +1759,7 @@ export function compileSource(
         compiled.set(name, parseFieldRule(rule, {
           orEnabled, xpathEnabled, xpathEvalEnabled, jsEnabled, regexEnabled, andEnabled, aioEnabled, aioGroup: aio.has(group),
           listJsEnabled, listJsGroup: listJs.has(group), jsExtEnabled, jsBindEnabled, jsGetEnabled, jsUtilEnabled, jsonPathEnabled, initJsEnabled,
-          jsoupEnabled, bookFieldsEnabled, listGetEnabled, bookVariablePuts, sourceConsts, field: name,
+          jsoupEnabled, bookFieldsEnabled, listGetEnabled, bookVariablePuts, sourceConsts, initJsoupEnabled, field: name,
         }));
       } catch {
         compiled.set(name, { skipped: 'unsupported' });

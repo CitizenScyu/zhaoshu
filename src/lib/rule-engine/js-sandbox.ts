@@ -14,7 +14,7 @@ import type { QuickJSContext, QuickJSHandle, QuickJSSyncVariant, QuickJSWASMModu
 import { symmetricCrypt, toNumChapter, type SymOp } from './js-util';
 import type { JElement } from './jsoup-dom';
 import {
-  decodeJsoupItems, decodeJsoupValue, exportJsoup, installJsoupHost, JSOUP_PRELUDE, type JsoupListItem, type JsoupMode,
+  decodeJsoupInit, decodeJsoupItems, decodeJsoupValue, exportJsoup, installJsoupHost, JSOUP_PRELUDE, type JsoupListItem, type JsoupMode,
   JsoupSession,
 } from './jsoup-shim';
 import { RuleEngineError } from './types';
@@ -313,6 +313,16 @@ export function runJsInit(code: string, bindings: JsBindings, budgetKey = code):
 export function runJsoup(code: string, bindings: JsBindings, mode: JsoupMode, budgetKey = code): JsValue | null {
   const session = new JsoupSession(bindings.jsoup?.getElements);
   return execute(code, bindings, (context, handle) => decodeJsoupValue(exportJsoup(context, handle, session, mode)), budgetKey, session);
+}
+
+/**
+ * initjsoup1028 详情页 JS init 的 jsoup 口径（FieldIr.jsoup）：沙箱装 jsoup 包装，返回值口径见 jsoup-shim.ts decodeJsoupInit
+ * （字符串含 Java 字符串原样、普通对象 → 键值表、Element/Elements 失败）；null/undefined 同 runJsInit 失败。
+ */
+export function runJsoupInit(code: string, bindings: JsBindings, budgetKey = code): string | ReadonlyMap<string, string | null> {
+  const session = new JsoupSession(bindings.jsoup?.getElements);
+  return execute(code, bindings, (context, handle) => decodeJsoupInit(exportJsoup(context, handle, session, 'init'), session), budgetKey, session)
+    ?? evalFailed('init JS 返回了 null/undefined（legado setContent(null)）');
 }
 
 /** jsoup1028 列表字段末段 JS：Elements 与数组里的 Element 逐个成为条目，其余口径同 runJsItems。 */

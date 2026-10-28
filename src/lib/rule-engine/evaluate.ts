@@ -11,7 +11,7 @@ import {
 } from './types';
 import { aioListCode } from './aio-syntax';
 import {
-  type JsBindings, type JsListItem, type JsValue, runJs, runJsInit, runJsItems, runJsoup, runJsoupItems,
+  type JsBindings, type JsListItem, type JsValue, runJs, runJsInit, runJsItems, runJsoup, runJsoupInit, runJsoupItems,
 } from './js-sandbox';
 import { isDocument, isJElement, type JElement } from './jsoup-dom';
 import { docApi, registerHtmlDoc } from './jsoup-shim';
@@ -1016,7 +1016,8 @@ function evaluateInitScopeBody(field: FieldIr, scope: EvalScope): EvalScope {
  * JS init（initjs1028，compile.ts 只给 parse.ts initJsFieldSupported 判可复现的挂 initScope）：legado getElement 的 Js 模式，
  * `evalJS(init, content)`，result/src = 详情页原文。返回字符串 → 按内容重新判定 HTML/JSON 成为新页面；返回普通对象 → 详情字段
  * 按 FieldIr.objectKey 键值直取（legado getString 的 NativeObject 分支，compile.ts 给 ruleBookInfo 字段挂）。
- * makeUp 后带 `##` 替换或代码为空不复现。
+ * makeUp 后带 `##` 替换或代码为空不复现。initjsoup1028：jsoup 重编出的 init（FieldIr.jsoup）改走 runJsoupInit——result/src 仍是
+ * 详情页原文，`java.getElement(s)` 在页面作用域上取节点，返回 Element/Elements 求值失败。
  */
 function jsInitScope(field: FieldIr, chain: readonly ChainStage[], scope: EvalScope): EvalScope {
   const stage = chain[0];
@@ -1025,8 +1026,11 @@ function jsInitScope(field: FieldIr, chain: readonly ChainStage[], scope: EvalSc
   if (source === undefined) return evalFailed('init JS 需要页面原文，当前作用域没有');
   const { code, regex } = makeUpJs(stage, source, scope, field.jsGets, field.jsUtil);
   if (regex !== undefined || code === '') return evalFailed('init JS makeUp 后带 ## 替换或为空，不复现');
-  const bindings = { result: source, src: source, baseUrl: scope.pageUrl, ...jsBindings(scope, field.jsGets, field.jsUtil, source) };
-  const out = runJsInit(code, bindings, stage.template ? stage.code : code);
+  const bindings: JsBindings = { result: source, src: source, baseUrl: scope.pageUrl, ...jsBindings(scope, field.jsGets, field.jsUtil, source) };
+  const budgetKey = stage.template ? stage.code : code;
+  const out = field.jsoup
+    ? runJsoupInit(code, { ...bindings, jsoup: { getElements: jsoupGetElements(field, scope) } }, budgetKey)
+    : runJsInit(code, bindings, budgetKey);
   if (typeof out === 'string') return rescope(out, scope);
   return { kind: 'json', json: undefined, pageUrl: scope.pageUrl, object: out };
 }

@@ -28,7 +28,7 @@ import {
   engineSyntaxAioEnabled, engineSyntaxAndEnabled, engineSyntaxJsBindEnabled, engineSyntaxJsEnabled, engineSyntaxJsExtEnabled,
   engineSyntaxJsGetEnabled, engineSyntaxJsonPathEnabled, engineSyntaxJsUtilEnabled, engineSyntaxListJsEnabled, engineSyntaxOrEnabled,
   engineSyntaxRegexEnabled, engineSyntaxXPathEnabled, engineSyntaxXPathEvalEnabled, engineInitJsActive, engineSyntaxJsoupEnabled,
-  engineSyntaxBookFieldsEnabled, engineSyntaxListGetEnabled,
+  engineSyntaxBookFieldsEnabled, engineSyntaxListGetEnabled, engineSyntaxInitJsoupEnabled,
 } from './syntax-flags';
 import { compileXPath, XPathSyntaxError } from './xpath-eval';
 import { looksLikeXPath, xpathPrefixed, xpathSegmentBody, xpathToCss } from './xpath-subset';
@@ -636,6 +636,11 @@ export interface ParseOptions {
    */
   jsoupEnabled?: boolean;
   /**
+   * 详情页 JS init 的 jsoup 重编（ENGINE_SYNTAX_INIT_JSOUP，initjsoup1028；须 initJsEnabled 与 jsoupEnabled）：`ruleBookInfo.init`
+   * 同样进 jsoup 重试（见 jsoupRetryAllowed），求值见 evaluate.ts jsInitScope。默认读 env（缺失=off）。
+   */
+  initJsoupEnabled?: boolean;
+  /**
    * JS 读 `book` 的书籍成员（ENGINE_SYNTAX_BOOK_FIELDS，book1028；须 jsEnabled 与 jsBindEnabled）：字段按 off 态口径（及 jsoup
    * 重试）编译被拒时，再在 bookFrame 里重编，通过的字段标 FieldIr.bookMembers。`ruleBookInfo.canReName` 非空的源由 compile.ts
    * 传 false。默认读 env（缺失=off）。
@@ -734,9 +739,14 @@ function parseFieldRuleFramed(rule: string, options: ParseOptions): FieldIr {
   }
 }
 
-/** jsoup1028 重试的前提：开关同开、字段已知（详情 init 不收）、规则含 JS。 */
+/**
+ * jsoup1028 重试的前提：开关同开、字段已知、规则含 JS。详情 init 另须 JS init 与 ENGINE_SYNTAX_INIT_JSOUP 同开（initjsoup1028），
+ * 否则不收（逐字原口径）。
+ */
 function jsoupRetryAllowed(rule: string, options: ParseOptions): boolean {
-  return typeof rule === 'string' && options.field !== undefined && options.field !== 'ruleBookInfo.init'
+  if (options.field === 'ruleBookInfo.init' && !((options.initJsEnabled ?? engineInitJsActive())
+    && (options.initJsoupEnabled ?? engineSyntaxInitJsoupEnabled()))) return false;
+  return typeof rule === 'string' && options.field !== undefined
     && (options.jsEnabled ?? engineSyntaxJsEnabled()) && (options.jsoupEnabled ?? engineSyntaxJsoupEnabled())
     && ruleHasJs(rule.trim());
 }
