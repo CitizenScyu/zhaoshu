@@ -233,7 +233,8 @@ export async function downloadBook(m, args, resolveSource, transport = fetchSour
           if (hash(cached) === prior.sha256 && cached.trim()) text = cached;
         }
         if (text === undefined) text = await operation(async ctx => {
-          if (!builtin) return (await m.api.engineFetchContent(engine, chapter.url, ctx, true, stopUrls, chapter.title)).text;
+          // bookcontent1029：目录用过的书籍成员（详情带回）同样交给正文。
+          if (!builtin) return (await m.api.engineFetchContent(engine, chapter.url, ctx, true, stopUrls, chapter.title, selected.book)).text;
           return m.parser.parseSourceChapterText((await ctx.page(chapter.url)).text, chapter.title);
         });
         if (!text.trim()) throw new Error('empty_content');

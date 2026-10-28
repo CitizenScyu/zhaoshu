@@ -9,7 +9,8 @@ import { isHostSuspect, orderByHostHealth, recordHostFailure } from './source-ho
 import { normalizeBookTitle } from './book-identity';
 import { cleanSearchAuthor, cleanSearchTitle } from './search-key';
 import {
-  engineFetchContent, engineFetchDetail, engineFetchToc, engineSearchBook, MAX_CONTENT_PAGES, type EngineSearchResult, type EngineSource,
+  engineFetchContent, engineFetchDetail, engineFetchToc, engineSearchBook, MAX_CONTENT_PAGES, type BookView, type EngineSearchResult,
+  type EngineSource,
 } from './rule-engine/api';
 import { compileSource } from './rule-engine/compile';
 import { engineSearchJsActive } from './rule-engine/compile-smoke';
@@ -466,6 +467,11 @@ export interface SourceCatalog extends SourceBookIdentity {
   sourceId: string;
   version: string;
   chapters: SourceChapter[];
+  /**
+   * 引擎目录带出的书籍成员（bookcontent1029，ENGINE_SYNTAX_BOOK_FIELDS）：正文字段读 `book.name` 等时交给 engineFetchContent。
+   * 只有读成员的源才有（开关关时不出现，payload 与 version 逐字不变）；旧会话没有此键，读成员的正文求值失败进换源。
+   */
+  book?: BookView;
 }
 
 const hash = (value: unknown) => createHash('sha1').update(JSON.stringify(value)).digest('hex');
@@ -515,13 +521,16 @@ function engineAuthorSearchPending(book: SourceBookIdentity, results: EngineSear
 
 /** 引擎源目录构造：与 catalogFrom 同构，version 用 ENGINE_PARSER_VERSION 区分（设计 §7.2）。 */
 function engineCatalogFrom(
-  pageUrl: string, source: ReadingSource, identity: SourceBookIdentity, chapters: SourceChapter[],
+  pageUrl: string, source: ReadingSource, identity: SourceBookIdentity, chapters: SourceChapter[], book?: BookView,
 ): SourceCatalog {
   const sourceId = hash([source.url, pageUrl]);
   const revisionValue = sourceRevision(source);
+  // bookcontent1029：带 book 时同进 version（同一 version 的正文求值输入不变）；不带时 hash 输入逐字不变。
+  const keyed = book === undefined ? [ENGINE_PARSER_VERSION, sourceId, revisionValue, identity, chapters]
+    : [ENGINE_PARSER_VERSION, sourceId, revisionValue, identity, chapters, book];
   return {
     ...identity, sourceUrl: source.url, sourceName: source.name, sourceRevision: revisionValue, bookUrl: pageUrl,
-    sourceId, version: hash([ENGINE_PARSER_VERSION, sourceId, revisionValue, identity, chapters]), chapters,
+    sourceId, version: hash(keyed), chapters, ...(book === undefined ? {} : { book }),
   };
 }
 
@@ -788,7 +797,7 @@ async function confirmSourceBook(
             event: 'source_confirm_identity_fallback', sourceHost: hostnameOf(bookUrl), tier, identityFallback: fallback,
           }));
         }
-        return engineCatalogFrom(url, source, identity, toc.chapters);
+        return engineCatalogFrom(url, source, identity, toc.chapters, detail.book);
       } catch (error) {
         context.signal.throwIfAborted();
         throw engineConfirmUpstreamError(error);
@@ -920,7 +929,7 @@ export async function resolveSourceBook(
             if (!sourceBookMatches(book, identity)) continue;
             const toc = await engineFetchToc(engineSource, detail.tocUrl ?? result.bookUrl, sourceContext, false, detail.vars, detail.book);
             if (!toc.chapters.length) continue;
-            const catalog = engineCatalogFrom(result.bookUrl, source, identity, toc.chapters);
+            const catalog = engineCatalogFrom(result.bookUrl, source, identity, toc.chapters, detail.book);
             matches.set(catalog.bookUrl, catalog);
             if (knownSourceAuthor(book.author)) return catalog;
           } catch (error) {
@@ -955,7 +964,7 @@ export async function resolveSourceBook(
               if (!sourceBookMatches(book, identity)) continue;
               const toc = await engineFetchToc(engineSource, detail.tocUrl ?? result.bookUrl, sourceContext, false, detail.vars, detail.book);
               if (!toc.chapters.length) continue;
-              const catalog = engineCatalogFrom(result.bookUrl, source, identity, toc.chapters);
+              const catalog = engineCatalogFrom(result.bookUrl, source, identity, toc.chapters, detail.book);
               matches.set(catalog.bookUrl, catalog);
               if (knownSourceAuthor(book.author)) return catalog;
             } catch (error) {
@@ -1336,7 +1345,7 @@ async function surveyOneSource(
         if (!sourceBookMatches(book, identity)) continue;
         const toc = await engineFetchToc(engineSource, detail.tocUrl ?? result.bookUrl, context, false, detail.vars, detail.book);
         if (!toc.chapters.length) continue;
-        return record(engineCatalogFrom(result.bookUrl, source, identity, toc.chapters));
+        return record(engineCatalogFrom(result.bookUrl, source, identity, toc.chapters, detail.book));
       }
       return null;
     };
@@ -1611,6 +1620,7 @@ function tocStopUrls(chapters: SourceChapter[]): string | readonly string[] | un
 
 async function chapterText(
   context: SourceRequestContext, chapter: SourceChapter, source: ReadingSource, stopUrls?: string | readonly string[],
+  book?: BookView,
 ): Promise<string> {
   // N01 分派：builtin 走 book15 特化解析（逐字不变）；引擎档走 rule-engine 取正文。
   // 取页两侧都经 context.page ⇒ 预算/节流/重试层沿用；builtin 分支零行为变化。
@@ -1619,7 +1629,7 @@ async function chapterText(
     if (new URL(page.url).pathname !== new URL(chapter.url).pathname) throw new SourcePolicyError('章节跳转到了另一页面');
     return parseSourceChapterText(page.text, chapter.title);
   }
-  const { text } = await engineFetchContent(engineSourceOf(source), chapter.url, context, false, stopUrls, chapter.title);
+  const { text } = await engineFetchContent(engineSourceOf(source), chapter.url, context, false, stopUrls, chapter.title, book);
   // 引擎只解释规则不做内容判定：builtin 的两道内容闸（空正文 / 单章限长）在这里补齐，错误语义与 builtin
   // 对齐：当前源失败同样进章节级换源；候选失败记 SOURCE_POLICY_REJECTED 后试下一个候选。
   if (!text) throw new SourcePolicyError('书源未提供有效正文');
@@ -1678,7 +1688,7 @@ export async function readSourceChapter(session: string, chapterIndex: number, c
       const hasOthers = sources.some((item) => item.url !== catalog.sourceUrl);
       const until = context.startedAt + SOFT_BUDGET_MS - (hasOthers ? SOURCE_CURRENT_FAILOVER_RESERVE_MS : 0);
       const currentContext = context.child(source.url, { limit: MAX_CONTENT_PAGES, sliceMs: baseMs, slide: { stepMs: baseMs, until } });
-      text = await chapterText(currentContext, chapter, source, tocStopUrls(catalog.chapters));
+      text = await chapterText(currentContext, chapter, source, tocStopUrls(catalog.chapters), catalog.book);
     } catch (error) {
       // 章节正文失败(含源被停用/服务端判定失效/切片到点):进换源流程。
       context.signal.throwIfAborted();
@@ -1828,7 +1838,7 @@ async function switchSourceChapter(
       const chapterContext = sourceContext.child(candidate.url, { limit: MAX_CONTENT_PAGES, shareSlice: true });
       text = await chapterText(
         chapterContext, alternative.chapters[alternativeIndex], alternativeSource,
-        tocStopUrls(alternative.chapters),
+        tocStopUrls(alternative.chapters), alternative.book,
       );
     } catch (error) {
       throwIfCancelled();

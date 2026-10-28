@@ -356,10 +356,11 @@ function redirectedPageIdentity(url: string): string {
  * （cuoceng《鬼吹灯》第 0 章的下一章是目录第 3 章），只给目录里的下一章拦不住，调用方可以把整本目录都传进来。
  * 本章自身地址不参与停止判断（整本目录必然含本章；自指翻页仍按 visited/strict 的环检测处理）。
  * chapterTitle（bind1028）：本章章节名，正文两字段的 JS 读 `chapter.title`/`title` 时用；不传则读到 undefined。
+ * book（bookcontent1029）：engineFetchDetail 带出、目录用过的书籍成员；读成员的正文字段不传即求值失败（不猜值）。
  */
 export async function engineFetchContent(
   source: EngineSource, chapterUrl: string, context: SourceRequestContext, strict = false,
-  nextChapterUrl?: string | readonly string[], chapterTitle?: string,
+  nextChapterUrl?: string | readonly string[], chapterTitle?: string, book?: BookView,
 ): Promise<EngineContentResult> {
   await prepareJs(source);
   const parts: string[] = [];
@@ -399,7 +400,7 @@ export async function engineFetchContent(
       throw new SourcePolicyError('书源正文分页重复返回已读取的页面，请重试或更换书源');
     }
     receivedPages.add(receivedKey);
-    const scope = pageScope(source, page.text, page.url, chapterTitle);
+    const scope = withBook(pageScope(source, page.text, page.url, chapterTitle), book);
     // 首/后页同门：挑战页不能作为正文交付，也不能缓存已拼出的半章。
     if (scope.kind === 'html' && isStructuredChallengePage(scope.$)) {
       throw new SourcePolicyError('书源正文页被安全验证拦截，请重试或更换书源');

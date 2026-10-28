@@ -424,7 +424,8 @@ export const ENGINE_SEMANTICS_BOOK_FIELDS_BIT = 8388608;
  * 搜索条目字段读本条已求的 name/author（legado getSearchItem 求值顺序），详情字段读 name/author/bookUrl，目录字段（含列表 JS）
  * 另读 tocUrl。值由门面按 legado 口径算好显式传递（engineSearchBook → engineFetchDetail → engineFetchToc），没带或为空即
  * 求值失败。Rhino 里这些成员是 Java String 包装，只收与 JS 字符串同结果的用法（拼接/传参/`==`），后接 `.`/`[`/`(`、`typeof`、
- * 与 `===`/`!==` 相邻一律拒；正文字段、kind 等其余成员、`ruleBookInfo.canReName` 非空的源照旧拒。off = 逐字不变。
+ * 与 `===`/`!==` 相邻一律拒；kind 等其余成员、`ruleBookInfo.canReName` 非空的源照旧拒。正文两字段自 bookcontent1029 起同目录
+ * 口径（门面 engineFetchContent 收目录带出的 book，阅读器把它随目录会话存下）。off = 逐字不变。
  */
 export function engineSyntaxBookFieldsEnabled(env: OrEnv = process.env): boolean {
   const raw = env.ENGINE_SYNTAX_BOOK_FIELDS?.trim().toLowerCase();

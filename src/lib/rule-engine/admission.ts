@@ -1184,7 +1184,8 @@ export async function readabilityShadow(
     const middle = Math.floor(chapters / 2);
     const content = await get(urls[middle], titles[middle]);
     const contentField = field('ruleContent.content');
-    const raw = text('ruleContent.content', content.scope, true);
+    // bookcontent1029：正文同目录带 book（同 api.ts engineFetchContent）。
+    const raw = text('ruleContent.content', withBook(content.scope, tocBook), true);
     const chars = (contentNeedsHtmlToText(contentField) ? contentHtmlToText(raw) : raw).replace(/\s/g, '').length;
     const verdict: ReadabilityVerdict = chars === 0 ? 'content_empty' : chars < READABILITY_MIN_CHARS ? 'content_short' : 'readable';
     return { verdict, chapters, chars, error: '' };

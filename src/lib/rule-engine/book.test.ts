@@ -1,6 +1,6 @@
 // book1028：ENGINE_SYNTAX_BOOK_FIELDS —— JS 读 legado `book` 的书籍成员（name/author/bookUrl/tocUrl，按阶段递增）：编译期成员集与
 // Java String 用法拒收、canReName 源整源不开、运行期缺成员即失败、门面 搜索 → 详情 → 目录 传递、准入影子腿带 book、语义版本位、
-// legado formatBookName/formatBookAuthor 口径。规则与页面均为合成形态。
+// legado formatBookName/formatBookAuthor 口径。正文两字段自 bookcontent1029 起同目录（见 bookcontent.test.ts）。规则与页面均为合成形态。
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { SourceRequestContext } from '@/lib/source-reader';
 import { readabilityShadow, searchAdmission, type AdmissionTransport } from './admission';
@@ -87,18 +87,18 @@ describe('开关与语义版本', () => {
     const contentName = raw({ ruleContent: { content: '#c@text@js:result + book.name' } });
     const reName = raw({ ruleBookInfo: { ...tocReadsName, canReName: '1' } });
     const withLib = raw({ ruleBookInfo: tocReadsName, jsLib: 'function f(){}' });
-    for (const s of [readName, tocMember]) {
+    for (const s of [readName, tocMember, contentName]) {
       expect(rev(s, true)).not.toBe(rev(s, false));
       expect(rev(s, true, false)).toBe(rev(s, false, false));
     }
-    for (const s of [originOnly, contentName, reName, withLib]) expect(rev(s, true)).toBe(rev(s, false));
+    for (const s of [originOnly, reName, withLib]) expect(rev(s, true)).toBe(rev(s, false));
     const flags = {
       orEnabled: false, varsEnabled: false, xpathEnabled: false, xpathEvalEnabled: false, regexEnabled: false, andEnabled: false,
       aioEnabled: false, listJsEnabled: false, jsExtEnabled: false, jsGetEnabled: false, jsUtilEnabled: false, jsonPathEnabled: false,
       initJsEnabled: false, jsoupEnabled: false,
     };
-    for (const s of [readName, tocMember]) expect(sourceUsesBookSyntax(s.rules, flags)).toBe(true);
-    for (const s of [originOnly, contentName, reName, withLib]) expect(sourceUsesBookSyntax(s.rules, flags)).toBe(false);
+    for (const s of [readName, tocMember, contentName]) expect(sourceUsesBookSyntax(s.rules, flags)).toBe(true);
+    for (const s of [originOnly, reName, withLib]) expect(sourceUsesBookSyntax(s.rules, flags)).toBe(false);
   });
 
   it('compileSource：off 态照旧 skipped，on 态编译并标成员；canReName 源与宿主绑定关时不开；两态缓存互不污染', () => {
@@ -124,14 +124,15 @@ describe('parse：阶段成员', () => {
     expect(codeOf(() => on('@js:[book.name]', 'ruleSearch.bookList', { listJsEnabled: true, listJsGroup: true }))).toBe('unsupported_js');
   });
 
-  it('详情见 name/author/bookUrl；目录（含 chapterName 与列表）另见 tocUrl；正文不开', () => {
+  it('详情见 name/author/bookUrl；目录（含 chapterName 与列表）另见 tocUrl；正文同目录（bookcontent1029）', () => {
     expect(on('@js:book.author', 'ruleBookInfo.author').bookMembers).toEqual(['author']);
     expect(on('.toc@href@js:result + book.bookUrl', TOC_URL_FIELD).bookMembers).toEqual(['bookUrl']);
     expect(codeOf(() => on('.toc@href@js:result + book.tocUrl', TOC_URL_FIELD))).toBe('unsupported_js');
     expect(on('a@href@js:result + book.tocUrl', 'ruleToc.chapterUrl').bookMembers).toEqual(['tocUrl']);
     expect(on('a@text@js:book.name + result', 'ruleToc.chapterName').bookMembers).toEqual(['name']);
     expect(on('@js:[book.name]', 'ruleToc.chapterList', { listJsEnabled: true, listJsGroup: true }).bookMembers).toEqual(['name']);
-    expect(codeOf(() => on('#c@text@js:result + book.name', 'ruleContent.content'))).toBe('unsupported_js');
+    expect(on('#c@text@js:result + book.name', 'ruleContent.content').bookMembers).toEqual(['name']);
+    expect(codeOf(() => on('#c@text@js:result + book.kind', 'ruleContent.content'))).toBe('unsupported_js');
     expect(codeOf(() => on('a@href@js:result + book.kind', 'ruleToc.chapterUrl'))).toBe('unsupported_js');
   });
 

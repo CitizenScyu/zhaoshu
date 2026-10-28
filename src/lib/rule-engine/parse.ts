@@ -1803,15 +1803,17 @@ function fieldBinds(field: string | undefined): JsBinds | undefined {
 /**
  * book1028：字段求值时 legado `book` 上已有确定值的成员（含 origin）。搜索条目按 getSearchItem 顺序（name → author → kind →
  * wordCount → lastChapter → intro → coverUrl → bookUrl）只给本条已求出的 name/author；详情给 name/author（搜索条目带来，
- * canReName 源已排除）与 bookUrl；目录（含列表）另给 tocUrl。kind 等可空成员、正文、发现页不收。
+ * canReName 源已排除）与 bookUrl；目录（含列表）另给 tocUrl。正文两字段（bookcontent1029，legado BookContent 的 AnalyzeRule
+ * 带着同一本 Book）同目录。kind 等可空成员、发现页不收。
  */
 function bookStageMembers(field: string): ReadonlySet<string> | undefined {
   if (field === 'ruleSearch.author') return BOOK_SEARCH_AUTHOR;
   if (BOOK_SEARCH_LATE_FIELDS.has(field)) return BOOK_SEARCH_LATE;
   if (field.startsWith('ruleBookInfo.')) return BOOK_INFO;
-  if (field.startsWith('ruleToc.')) return BOOK_TOC;
+  if (field.startsWith('ruleToc.') || BOOK_CONTENT_FIELDS.has(field)) return BOOK_TOC;
   return undefined;
 }
+const BOOK_CONTENT_FIELDS: ReadonlySet<string> = new Set(['ruleContent.content', 'ruleContent.nextContentUrl']);
 const BOOK_SEARCH_AUTHOR: ReadonlySet<string> = new Set(['origin', 'name']);
 const BOOK_SEARCH_LATE: ReadonlySet<string> = new Set(['origin', 'name', 'author']);
 const BOOK_SEARCH_LATE_FIELDS: ReadonlySet<string> = new Set([
