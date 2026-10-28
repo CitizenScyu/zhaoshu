@@ -85,6 +85,11 @@ export interface JsBindings {
     /** bookvar1028：`book.getVariable` 得 Java 空串（见 JsoupInit.bookVariables）。 */
     readonly bookVariables?: boolean;
   };
+  /**
+   * 源的 jsLib 原文（jslib1028，只给编译期挂了 FieldIr.jsLib 的字段传）：prelude 之后、规则代码之前在全局作用域求值，
+   * 失败即本次求值失败（legado 共享作用域求值 jsLib 抛错，该源 JS 全部失败）。
+   */
+  jsLib?: string;
 }
 
 let ready: QuickJSWASMModule | undefined;
@@ -367,6 +372,15 @@ function runInFreshRuntime<T>(
         return evalFailed('JS 沙箱初始化失败');
       }
       prelude.value.dispose();
+      if (bindings.jsLib !== undefined) {
+        const lib = context.evalCode(bindings.jsLib, 'lib.js');
+        if (lib.error) {
+          const message = describeError(context, lib.error);
+          lib.error.dispose();
+          return evalFailed(`jsLib 求值失败：${message}`);
+        }
+        lib.value.dispose();
+      }
       const evaluated = context.evalCode(code, 'rule.js');
       // 宿主回调失败（jsget1028）一律致命：JS 里 try/catch 吞掉也不算数，免得规则拿兜底分支冒充 legado 产出。
       if (host.failure !== undefined) {

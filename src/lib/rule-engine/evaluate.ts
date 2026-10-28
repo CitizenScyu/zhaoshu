@@ -510,6 +510,10 @@ function matchingBrace(text: string, open: number): number {
  * 仅 `ruleContent.content` 由门面传 `multi=true` 拼接多段落。见 dom-ops.ts:applyTerminal。
  */
 export function evaluateField(field: FieldIr, scope: EvalScope, multi = false): string {
+  return withFieldJsLib(field, () => evaluateFieldBody(field, scope, multi));
+}
+
+function evaluateFieldBody(field: FieldIr, scope: EvalScope, multi: boolean): string {
   if (scope.kind === 'json' && scope.object !== undefined) {
     // itemvars1028：对象条目上 legado putRule 也按键直取求值，这里不复现，放袋的字段失败（不静默漏放）。
     if (field.varPuts !== undefined || field.varPut) return evalFailed('对象条目上的字段放变量袋，不复现');
@@ -538,6 +542,29 @@ export function evaluateField(field: FieldIr, scope: EvalScope, multi = false): 
   // unescapeHtml4）；正文（multi）交 content-html。
   if (!multi && (kind === 'self' || kind === 'groupRef') && value.includes('&')) value = decodeHTML(value);
   return value.trim();
+}
+
+/**
+ * jslib1028：当前字段的 jsLib 原文（FieldIr.jsLib，compile.ts 只挂给带 JS 的顶层字段）。求值同步进行，入口（evaluateField /
+ * evaluateFieldList / evaluateInitScope / evaluateFieldStrings）设上、返回时恢复；子字段（链里的规则段、模板占位、getter 白名单）
+ * 不挂，沿用外层的库（legado 同源共享作用域）。未挂 = 沙箱绑定逐字不变。
+ */
+let fieldJsLib: string | undefined;
+
+function withFieldJsLib<T>(field: FieldIr, run: () => T): T {
+  if (field.jsLib === undefined) return run();
+  const outer = fieldJsLib;
+  fieldJsLib = field.jsLib;
+  try {
+    return run();
+  } finally {
+    fieldJsLib = outer;
+  }
+}
+
+/** 沙箱绑定的 jsLib 键（jslib1028）：当前字段没库时不带键。 */
+function jsLibBinding(): Pick<JsBindings, 'jsLib'> {
+  return fieldJsLib === undefined ? {} : { jsLib: fieldJsLib };
 }
 
 /**
@@ -612,7 +639,7 @@ function makeUpText(parts: readonly JsTemplatePart[], scope: EvalScope, multi: b
     else if (part.kind === 'rule') text += evaluateField(part.field, scope, multi);
     else if (part.kind === 'get') text += varGet(part.key, scope);
     else {
-      const out = runJs(part.code, { result: scope.source ?? '', src: scope.source, baseUrl: scope.pageUrl, ...hostBindings(scope) });
+      const out = runJs(part.code, { result: scope.source ?? '', src: scope.source, baseUrl: scope.pageUrl, ...hostBindings(scope), ...jsLibBinding() });
       if (Array.isArray(out)) return evalFailed('模板 {{JS}} 返回了数组（legado 按 NativeArray.toString 拼，不复现）');
       if (out !== null) text += out;
     }
@@ -672,8 +699,9 @@ function varCallbacks(vars: Map<string, string>): NonNullable<JsBindings['callba
  */
 function jsBindings(
   scope: EvalScope, gets: FieldIr['jsGets'], util?: true, initContent?: string,
-): Pick<JsBindings, 'globals' | 'objects' | 'callbacks' | 'utilHelpers'> {
-  const host = util ? { ...hostBindings(scope), utilHelpers: true } : hostBindings(scope);
+): Pick<JsBindings, 'globals' | 'objects' | 'callbacks' | 'utilHelpers' | 'jsLib'> {
+  const base = util ? { ...hostBindings(scope), utilHelpers: true } : hostBindings(scope);
+  const host = fieldJsLib === undefined ? base : { ...base, ...jsLibBinding() };
   if (gets === undefined) return host;
   return { ...host, callbacks: { ...host.callbacks, ...getterCallbacks(scope, gets, initContent) } };
 }
@@ -749,6 +777,10 @@ export function evaluateFieldNodes(field: FieldIr, scope: EvalScope): CheerioNod
  * 条目作用域都沿用页面作用域的宿主绑定（bind1028；legado 同一个 AnalyzeRule 的 book 不随条目变）。
  */
 export function evaluateFieldList(field: FieldIr, scope: EvalScope): EvalScope[] {
+  return withFieldJsLib(field, () => evaluateFieldListBody(field, scope));
+}
+
+function evaluateFieldListBody(field: FieldIr, scope: EvalScope): EvalScope[] {
   checkBookMembers(field, scope);
   if (field.varGets && scope.host?.vars === undefined) evalFailed('列表字段读变量袋，但作用域没带变量袋');
   const scopes = fieldListScopes(field, scope);
@@ -833,8 +865,8 @@ function listChainScopes(field: FieldIr, chain: readonly ChainStage[], scope: Ev
  * 列表 JS 的 `book`（book1028）、变量袋回调（searchvars1028）与 getter 回调（listget1028，在页面作用域上取值——legado getElements
  * 时 content 是整页）：只给挂了 bookMembers / varGets / jsGets 的列表字段，其余宿主绑定列表 JS 照旧不给。
  */
-function listBookBindings(field: FieldIr, scope: EvalScope): Pick<JsBindings, 'objects' | 'callbacks'> {
-  const out: Pick<JsBindings, 'objects' | 'callbacks'> = {};
+function listBookBindings(field: FieldIr, scope: EvalScope): Pick<JsBindings, 'objects' | 'callbacks' | 'jsLib'> {
+  const out: Pick<JsBindings, 'objects' | 'callbacks' | 'jsLib'> = { ...jsLibBinding() };
   const book = field.bookMembers === undefined ? undefined : hostBindings(scope).objects?.book;
   if (book !== undefined) out.objects = { book };
   const vars = field.varGets ? scope.host?.vars : undefined;
@@ -963,6 +995,10 @@ function jsonListItems(ir: RuleIr, json: unknown): unknown[] {
  * 页面 URL 与宿主绑定沿用页面作用域。
  */
 export function evaluateInitScope(field: FieldIr, scope: EvalScope): EvalScope {
+  return withFieldJsLib(field, () => evaluateInitScopeBody(field, scope));
+}
+
+function evaluateInitScopeBody(field: FieldIr, scope: EvalScope): EvalScope {
   checkBookMembers(field, scope);
   if (field.chain) {
     const next = jsInitScope(field, field.chain, scope);
@@ -1113,6 +1149,10 @@ export function compiledUsesJs(compiled: CompiledRules): boolean {
  * URL 绝对化与去重留给调用方（对齐 legado isUrl 分支）。
  */
 export function evaluateFieldStrings(field: FieldIr, scope: EvalScope): string[] {
+  return withFieldJsLib(field, () => evaluateFieldStringsBody(field, scope));
+}
+
+function evaluateFieldStringsBody(field: FieldIr, scope: EvalScope): string[] {
   if (!field.chain) {
     const value = evaluateField(field, scope);
     return value === '' ? [] : [value];

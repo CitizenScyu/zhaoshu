@@ -9,7 +9,9 @@ import { aioGroupsFlat, isAioListField, ruleGroupOf } from './aio-syntax';
 import { searchJsConstructible } from './search-js';
 import {
   engineInitJsActive, engineSearchJsEnabled, engineSearchOptionsEnabled, engineSyntaxAioEnabled, engineSyntaxJsEnabled, engineSyntaxListJsEnabled,
+  engineSyntaxJsLibEnabled,
 } from './syntax-flags';
+import { analyzeJsLib, type JsLib } from './js-lib';
 import { RuleEngineError, type RuleDiagnostic } from './types';
 
 // survey.py CORE_FIELDS（阅读路径必需字段）
@@ -92,10 +94,19 @@ export function* iterRulePairs(src: RawSource): Generator<[string, string]> {
 
 const READING_PATH_FIELDS: ReadonlySet<string> = new Set([...CORE_FIELDS, ...READING_PATH_JS_FIELDS]);
 
-/** 源带 jsLib（公共函数库）：引擎沙箱不执行 jsLib，含 JS 段照样判拒（与 compile.ts sourceHasJsLib 同口径）。 */
-export function hasJsLib(src: RawSource): boolean {
+/**
+ * 源带 jsLib（公共函数库）且因此整源不开 JS 链：引擎沙箱不执行 jsLib，含 JS 段照样判拒（与 compile.ts sourceHasJsLib 同口径）。
+ * jslib1028：ENGINE_SYNTAX_JS_LIB 开且库可复现（js-lib.ts analyzeJsLib）时不算（同 compile.ts sourceJsLib；ENGINE_SYNTAX_JS 由调用方另判）。
+ */
+export function hasJsLib(src: RawSource, env: NodeJS.ProcessEnv = process.env): boolean {
   const lib = src.jsLib;
-  return typeof lib === 'string' && lib.trim() !== '';
+  if (typeof lib !== 'string' || lib.trim() === '') return false;
+  return !(engineSyntaxJsLibEnabled(env) && analyzeJsLib(lib) !== null);
+}
+
+/** jslib1028：该源编译/求值要带的库（JS 链对该源生效且库可复现时；否则 null）。准入求值与 compile.ts compileSource 同口径。 */
+export function sourceJsLibFor(src: RawSource, env: NodeJS.ProcessEnv = process.env): JsLib | null {
+  return engineSyntaxJsEnabled(env) && engineSyntaxJsLibEnabled(env) ? analyzeJsLib(src.jsLib) : null;
 }
 
 /**
@@ -103,7 +114,7 @@ export function hasJsLib(src: RawSource): boolean {
  * （selectCandidates 的 coreJs）、准入求值（admission.ts）三处必须同一判据，否则会把对侧拒的源放进来。
  */
 export function jsChainEnabledFor(src: RawSource, env: NodeJS.ProcessEnv = process.env): boolean {
-  return engineSyntaxJsEnabled(env) && !hasJsLib(src);
+  return engineSyntaxJsEnabled(env) && !hasJsLib(src, env);
 }
 
 /** 该源是否有字段会走 JS 链（白名单字段里含 JS 段；ENGINE_SYNTAX_LIST_JS on 时含列表字段）——用来决定要不要预加载沙箱。 */

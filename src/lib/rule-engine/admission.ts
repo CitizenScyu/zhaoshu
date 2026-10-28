@@ -16,7 +16,7 @@ import { type SourceSearchRequest, type SourceUrlValidator } from '@/lib/source-
 import { charsetFromContentType, encodeToBytes, type SourceCharset } from '@/lib/source-charset';
 import {
   admissionSurveyOptions, CORE_FIELDS, enginePostSearchEnabled, engineSearchJsActive, iterRulePairs, jsChainEnabledFor, selectCandidates,
-  sourceHasJsChainField, type RawSource,
+  sourceHasJsChainField, sourceJsLibFor, type RawSource,
 } from './compile-smoke';
 import { listJsGroups, parseFieldRule } from './parse';
 import {
@@ -26,6 +26,7 @@ import {
 import { RuleEngineError, type FieldIr, type RuleDiagnostic } from './types';
 import {
   compileItemVars, compileSearchVars, compileSource, compileVarBag, engineItemVarsActive, engineSearchVarsActive, engineSourceRevision,
+  fieldWithJsLib, ruleTextOf,
   sourceBookVariablePuts, sourceCanReName,
 } from './compile';
 import {
@@ -38,6 +39,7 @@ import { aioGroups, isAioListRule, ruleGroupOf } from './aio-syntax';
 import { preloadJsSandbox } from './js-sandbox';
 import { buildSearchRequestWithVars, prepareSearchJs, SearchJsNotReadyError, type SearchRequestWithVars } from './search-js';
 import { resolveSourceVars } from './vars-subset';
+import { jsLibRuleProblem } from './js-lib';
 import { contentHtmlToText, contentNeedsHtmlToText } from './content-html';
 import { isStructuredChallengePage } from './content-challenge';
 
@@ -458,8 +460,16 @@ export function compileAdmission(source: RawSource): AdmissionCompile {
   // bookvar1028：同 compileSource——源级放变量键集（只在 jsoup + 书籍成员重试帧里起作用，jsoup 判定在 parseFieldRule 里）。
   const bookVariablePuts = bookFieldsEnabled && engineSyntaxBookVariableEnabled()
     ? sourceBookVariablePuts({ searchUrl: source.searchUrl, rules: source as Record<string, unknown> }) ?? undefined : undefined;
+  // jslib1028：同 compileSource——带可复现库的源，字段（含袋字段）按原文与 vars 改写后的文本过 jsLibRuleProblem，编译时传库。
+  const jsLib = coreJs ? sourceJsLibFor(source) ?? undefined : undefined;
   for (const [field, rule] of iterRulePairs(rulesSource)) {
     if (!(field in coreFieldMask)) continue;
+    const libProblem = jsLib === undefined ? undefined : [rule, ruleTextOf(source as Record<string, unknown>, field)]
+      .map((text) => (text === undefined ? undefined : jsLibRuleProblem(jsLib, text))).find((problem) => problem !== undefined);
+    if (libProblem !== undefined) {
+      failures.push({ field, rule, message: `JS 段${libProblem}`, diagnostic: { code: 'unsupported_js' } });
+      continue;
+    }
     if (bag?.has(field) || searchBag?.has(field) || itemBag?.has(field)) {
       coreFieldMask[field] = true;
       continue;
@@ -467,7 +477,7 @@ export function compileAdmission(source: RawSource): AdmissionCompile {
     try {
       parseFieldRule(rule, {
         jsEnabled: coreJs, field, aioGroup: aio.has(ruleGroupOf(field)), listJsGroup: listJs.has(ruleGroupOf(field)), bookFieldsEnabled,
-        bookVariablePuts,
+        bookVariablePuts, jsLib,
       });
       coreFieldMask[field] = true;
     } catch (error) {
@@ -798,12 +808,17 @@ function searchCandidates(
   const bookFieldsEnabled = engineSyntaxBookFieldsEnabled() && !sourceCanReName(source as Record<string, unknown>);
   const searchBag = vars !== undefined ? searchBagOf(source, jsEnabled) : null;
   const itemBag = itemBagOf(source, jsEnabled);
+  // jslib1028：同 compileSource——带可复现库的源，字段过库并挂库原文（袋字段按原文与改写后的文本过）。
+  const jsLib = jsEnabled ? sourceJsLibFor(source) ?? undefined : undefined;
   const parseSafe = (rule: unknown, name?: string) => {
     // itemvars1028：条目袋字段规则可能只剩 @put（改写后为空），先取带袋的编译结果（同 compileSource 覆盖）。
     const bagged = name === undefined ? undefined : itemBag?.get(name) ?? searchBag?.get(name);
-    if (bagged) return bagged;
+    if (bagged) {
+      if (jsLib === undefined || name === undefined) return bagged;
+      return fieldWithJsLib(bagged, [typeof rule === 'string' ? rule : undefined, ruleTextOf(source as Record<string, unknown>, name)], jsLib);
+    }
     if (typeof rule !== 'string' || !rule.trim()) return undefined;
-    try { return parseFieldRule(rule, { jsEnabled, field: name, aioGroup, listJsGroup, bookFieldsEnabled }); } catch { return undefined; }
+    try { return parseFieldRule(rule, { jsEnabled, field: name, aioGroup, listJsGroup, bookFieldsEnabled, jsLib }); } catch { return undefined; }
   };
   const listIr = parseSafe(bookList, 'ruleSearch.bookList');
   if (!listIr) return [];

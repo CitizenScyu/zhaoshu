@@ -33,6 +33,7 @@ import {
 import { compileXPath, XPathSyntaxError } from './xpath-eval';
 import { looksLikeXPath, xpathPrefixed, xpathSegmentBody, xpathToCss } from './xpath-subset';
 import { VAR_BAG_RESERVED_KEYS } from './vars-subset';
+import { jsLibRuleProblem, type JsLib } from './js-lib';
 
 function unsupported(msg: string, rule: string, diagnostic: RuleDiagnostic): never {
   throw new RuleEngineError('RULE_UNSUPPORTED', msg, rule, diagnostic);
@@ -636,9 +637,27 @@ export interface ParseOptions {
    * FieldIr.bookVars；缺省 = 不放行（开关 off、依赖开关未生效或源内有动态键的放变量写法）。
    */
   bookVariablePuts?: ReadonlySet<string>;
+  /**
+   * 源的 jsLib（ENGINE_SYNTAX_JS_LIB，jslib1028）：compile.ts / admission.ts 只在开关生效且 js-lib.ts analyzeJsLib 认得库时传。
+   * 见 parseFieldRule。缺省 = 无库（开关 off 时带 jsLib 的源整源不开 JS 链，逐字原口径）。
+   */
+  jsLib?: JsLib;
 }
 
+/**
+ * 字段规则 → IR。jslib1028：options.jsLib 给出时先过 jsLibRuleProblem（不过即 unsupported_js），编出的字段带 JS（JS 段或 `{{}}`）
+ * 即挂 FieldIr.jsLib；嵌套解析（JS 链段、makeUp 片段、getter 实参）不再传库。
+ */
 export function parseFieldRule(rule: string, options: ParseOptions = {}): FieldIr {
+  const lib = options.jsLib;
+  if (lib === undefined) return parseFieldRuleFramed(rule, options);
+  const problem = jsLibRuleProblem(lib, rule);
+  if (problem !== undefined) unsupported(`JS 段${problem}`, rule, { code: 'unsupported_js' });
+  const field = parseFieldRuleFramed(rule, { ...options, jsLib: undefined });
+  return ruleHasJs(rule) || rule.includes('{{') ? { ...field, jsLib: lib.code } : field;
+}
+
+function parseFieldRuleFramed(rule: string, options: ParseOptions): FieldIr {
   const saved = jsonPathExt;
   const savedBag = varBag;
   const savedFrame = jsoupFrame;

@@ -281,6 +281,11 @@ export interface FieldIr {
    * 源内没有往书籍变量放该键的写法，求值时沙箱 `book.getVariable` 得 Java 空串（jsoup-shim.ts）。未挂 = 旧链路逐字不变。
    */
   bookVars?: readonly string[];
+  /**
+   * 源的 jsLib 原文（jslib1028，ENGINE_SYNTAX_JS_LIB；只挂在带 JS 段的字段上，库已过 js-lib.ts analyzeJsLib、字段已过 jsLibRuleProblem）：
+   * 求值时沙箱在规则代码前先求值库，失败即字段求值失败（legado 共享作用域口径）。未挂 = 旧链路逐字不变。
+   */
+  jsLib?: string;
 }
 
 /** 装饰字段编译失败不阻断，标 skip 的占位。 */

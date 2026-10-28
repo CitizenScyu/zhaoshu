@@ -13,13 +13,14 @@ import {
   type ParseOptions,
 } from './parse';
 import type { CompiledRules, FieldIr, RuleIr } from './types';
+import { analyzeJsLib, jsLibRuleProblem, type JsLib } from './js-lib';
 import {
   engineSemanticsVersion, engineSyntaxAioEnabled, engineSyntaxAndEnabled, engineSyntaxInitEnabled, engineSyntaxJsBindEnabled, engineSyntaxJsEnabled,
   engineSyntaxJsExtEnabled, engineSyntaxJsGetEnabled, engineSyntaxJsonPathEnabled, engineSyntaxJsUtilEnabled, engineSyntaxListJsEnabled,
   engineSyntaxOrEnabled, engineSyntaxRegexEnabled, engineSyntaxVarsEnabled, engineSyntaxXPathEnabled, engineSyntaxXPathEvalEnabled, engineUrlOptionsEnabled,
   engineSearchWebViewEnabled, engineSyntaxInitJsEnabled, engineSyntaxJsoupEnabled, engineSyntaxVarsBagEnabled,
   engineSyntaxBookFieldsEnabled, engineSyntaxSearchVarsEnabled, engineSyntaxItemVarsEnabled, engineSyntaxListGetEnabled, ENGINE_SEMANTICS_VERSION,
-  engineSyntaxBookVariableEnabled,
+  engineSyntaxBookVariableEnabled, engineSyntaxJsLibEnabled,
 } from './syntax-flags';
 import { urlOptionFields } from './url-options';
 import {
@@ -55,6 +56,8 @@ export interface CompileOptions extends ParseOptions {
   // listGetEnabled（listget1028，ENGINE_SYNTAX_LIST_GET）见 ParseOptions；compile 层另要求 JS 链对该源生效、列表 JS 与 getter 同开。
   /** bookvar1028：`book.getVariable`（ENGINE_SYNTAX_BOOK_VARIABLE，默认读 env；须 jsoup 与书籍成员同生效，源级键集见 sourceBookVariablePuts）。 */
   bookVariableEnabled?: boolean;
+  /** jslib1028：jsLib 公共函数库（ENGINE_SYNTAX_JS_LIB，默认读 env；须 JS 链同开，库须过 js-lib.ts analyzeJsLib，见 sourceJsLib）。 */
+  jsLibEnabled?: boolean;
 }
 
 /** 版本化缓存键（P0 口径）：semanticsVersion:contentRevision。 */
@@ -95,6 +98,8 @@ export function engineVersionedKey(contentRevision: string, semanticsVersion = E
  * （sourceUsesListGetSyntax）时再加列表 getter 位（+67108864）。其余位的探测不传本开关（读 env，与 compileSource 同口径）。
  * bookvar1028：ENGINE_SYNTAX_BOOK_VARIABLE on、jsoup 与书籍成员对该源生效且有字段 off 态被拒、on 态编译通过
  * （sourceUsesBookVariableSyntax）时再加书籍变量位（+134217728）。其余位的探测不传源级键集（同 listget1028 口径）。
+ * jslib1028：ENGINE_SYNTAX_JS 与 ENGINE_SYNTAX_JS_LIB 都 on 且库可复现（sourceJsLib 非 null）时，其余各位改在去掉 jsLib 的规则上判
+ * （与 compileSource 开 JS 链同口径；内容 identity 仍按原规则），有字段带 JS（JS 段或 `{{}}`）时再加 jsLib 位（+268435456）。
  */
 export function engineSourceRevision(
   source: { url: string; searchUrl: unknown; rules: Record<string, unknown> },
@@ -121,13 +126,16 @@ export function engineSourceRevision(
   const searchWebViewEnabled = options.searchWebViewEnabled ?? engineSearchWebViewEnabled();
   const initJsEnabled = initEnabled && (options.initJsEnabled ?? engineSyntaxInitJsEnabled());
   const searchOptionParity = searchOptionsEnabled && searchOptionsNeedParity(source.searchUrl, upgradeSourceTemplateUrl(source.url));
-  const jsChain = jsEnabled && !sourceHasJsLib(source.rules);
+  const libActive = sourceJsLib(source.rules, jsEnabled && (options.jsLibEnabled ?? engineSyntaxJsLibEnabled())) !== null;
+  const rules = libActive ? withoutJsLib(source.rules) : source.rules;
+  const probe = libActive ? { ...source, rules } : source;
+  const jsChain = jsEnabled && !sourceHasJsLib(rules);
   // 下游 sourceUses* 的编译与 compileSource 同一组开关（jsBind/jsGet/jsUtil 只在 JS 链生效时有意义）。
   const jsBind = jsChain && jsBindEnabled;
   const jsGet = jsChain && jsGetEnabled;
   const jsUtil = jsChain && jsUtilEnabled;
   const jsoup = jsChain && (options.jsoupEnabled ?? engineSyntaxJsoupEnabled());
-  const book = jsBind && (options.bookFieldsEnabled ?? engineSyntaxBookFieldsEnabled()) && !sourceCanReName(source.rules);
+  const book = jsBind && (options.bookFieldsEnabled ?? engineSyntaxBookFieldsEnabled()) && !sourceCanReName(rules);
   const searchVars = varsEnabled && searchJsEnabled && (options.searchVarsEnabled ?? engineSyntaxSearchVarsEnabled());
   const itemVars = searchVars && (options.itemVarsEnabled ?? engineSyntaxItemVarsEnabled());
   const listGet = jsGet && listJsEnabled && (options.listGetEnabled ?? engineSyntaxListGetEnabled());
@@ -138,87 +146,88 @@ export function engineSourceRevision(
   const soup = (probe: (jsoupEnabled: boolean, bookFieldsEnabled: boolean) => boolean) => probe(false, false)
     || (jsoup && probe(true, false)) || (book && (probe(false, true) || (jsoup && probe(true, true))));
   return engineVersionedKey(sourceRevision(source), engineSemanticsVersion(
-    orEnabled && sourceUsesOrSyntax(source.rules),
-    xpathEnabled && sourceUsesXPathSyntax(source.rules),
-    varsEnabled && sourceUsesVarSyntax(source.rules),
-    jsEnabled && sourceUsesJsSyntax(source.rules),
-    xpathEnabled && xpathEval && soup((j, b) => sourceUsesXPathEval(source.rules, {
+    orEnabled && sourceUsesOrSyntax(rules),
+    xpathEnabled && sourceUsesXPathSyntax(rules),
+    varsEnabled && sourceUsesVarSyntax(rules),
+    jsEnabled && sourceUsesJsSyntax(rules),
+    xpathEnabled && xpathEval && soup((j, b) => sourceUsesXPathEval(rules, {
       orEnabled, varsEnabled, jsEnabled: jsChain, listJsEnabled, jsExtEnabled, jsBindEnabled: jsBind, jsGetEnabled: jsGet, jsUtilEnabled: jsUtil,
       jsonPathEnabled, jsoupEnabled: j, bookFieldsEnabled: b,
     })),
-    regexEnabled && soup((j, b) => sourceUsesRegexSyntax(source.rules, {
+    regexEnabled && soup((j, b) => sourceUsesRegexSyntax(rules, {
       orEnabled, varsEnabled, jsEnabled: jsChain, xpathEnabled, xpathEvalEnabled: xpathEval, listJsEnabled, jsExtEnabled, jsBindEnabled: jsBind,
       jsGetEnabled: jsGet, jsUtilEnabled: jsUtil, jsonPathEnabled, jsoupEnabled: j, bookFieldsEnabled: b,
     })),
-    orEnabled && andEnabled && soup((j, b) => sourceUsesAndSyntax(source.rules, {
+    orEnabled && andEnabled && soup((j, b) => sourceUsesAndSyntax(rules, {
       varsEnabled, jsEnabled: jsChain, xpathEnabled, xpathEvalEnabled: xpathEval, regexEnabled, listJsEnabled, jsExtEnabled, jsBindEnabled: jsBind,
       jsGetEnabled: jsGet, jsUtilEnabled: jsUtil, jsonPathEnabled, jsoupEnabled: j, bookFieldsEnabled: b,
     })),
-    aioEnabled && sourceUsesAioSyntax(source.rules),
+    aioEnabled && sourceUsesAioSyntax(rules),
     searchJsEnabled && searchTemplateNeedsJs(source.searchUrl, upgradeSourceTemplateUrl(source.url)),
-    jsChain && listJsEnabled && sourceUsesListJsSyntax(source.rules),
-    jsChain && jsExtEnabled && soup((j, b) => sourceUsesJsExtSyntax(source.rules, {
+    jsChain && listJsEnabled && sourceUsesListJsSyntax(rules),
+    jsChain && jsExtEnabled && soup((j, b) => sourceUsesJsExtSyntax(rules, {
       orEnabled, varsEnabled, xpathEnabled, xpathEvalEnabled: xpathEval, regexEnabled, andEnabled, aioEnabled, listJsEnabled, jsBindEnabled: jsBind,
       jsGetEnabled: jsGet, jsUtilEnabled: jsUtil, jsonPathEnabled, jsoupEnabled: j, bookFieldsEnabled: b,
     })),
-    jsBind && soup((j, b) => sourceUsesJsBindSyntax(source.rules, {
+    jsBind && soup((j, b) => sourceUsesJsBindSyntax(rules, {
       orEnabled, varsEnabled, xpathEnabled, xpathEvalEnabled: xpathEval, regexEnabled, andEnabled, aioEnabled, listJsEnabled, jsExtEnabled,
       jsGetEnabled: jsGet, jsUtilEnabled: jsUtil, jsonPathEnabled, jsoupEnabled: j, bookFieldsEnabled: b,
     })),
-    jsGet && soup((j, b) => sourceUsesJsGetSyntax(source.rules, {
+    jsGet && soup((j, b) => sourceUsesJsGetSyntax(rules, {
       orEnabled, varsEnabled, xpathEnabled, xpathEvalEnabled: xpathEval, regexEnabled, andEnabled, aioEnabled, listJsEnabled, jsExtEnabled,
       jsBindEnabled: jsBind, jsUtilEnabled: jsUtil, jsonPathEnabled, jsoupEnabled: j, bookFieldsEnabled: b,
     })),
-    jsUtil && soup((j, b) => sourceUsesJsUtilSyntax(source.rules, {
+    jsUtil && soup((j, b) => sourceUsesJsUtilSyntax(rules, {
       orEnabled, varsEnabled, xpathEnabled, xpathEvalEnabled: xpathEval, regexEnabled, andEnabled, aioEnabled, listJsEnabled, jsExtEnabled,
       jsBindEnabled: jsBind, jsGetEnabled: jsGet, jsonPathEnabled, jsoupEnabled: j, bookFieldsEnabled: b,
     })),
-    jsonPathEnabled && soup((j, b) => sourceUsesJsonPathSyntax(source.rules, {
+    jsonPathEnabled && soup((j, b) => sourceUsesJsonPathSyntax(rules, {
       orEnabled, varsEnabled, jsEnabled: jsChain, xpathEnabled, xpathEvalEnabled: xpathEval, regexEnabled, andEnabled, aioEnabled, listJsEnabled,
       jsExtEnabled, jsBindEnabled: jsBind, jsGetEnabled: jsGet, jsUtilEnabled: jsUtil, jsoupEnabled: j, bookFieldsEnabled: b,
     })),
-    initEnabled && soup((j, b) => sourceUsesInitSyntax(source.rules, {
+    initEnabled && soup((j, b) => sourceUsesInitSyntax(rules, {
       orEnabled, xpathEnabled, xpathEvalEnabled: xpathEval, jsEnabled: jsChain, regexEnabled, andEnabled, aioEnabled, listJsEnabled,
       jsExtEnabled, jsBindEnabled: jsBind, jsGetEnabled: jsGet, jsUtilEnabled: jsUtil, jsonPathEnabled, jsoupEnabled: j, bookFieldsEnabled: b,
     })),
     searchOptionParity,
-    urlOptionsEnabled && urlOptionFields(source.rules).size > 0,
+    urlOptionsEnabled && urlOptionFields(rules).size > 0,
     searchWebViewEnabled && searchOptionParity && searchOptionsMayUseWebView(source.searchUrl),
-    initJsEnabled && jsChain && soup((j, b) => sourceUsesInitJsSyntax(source.rules, {
+    initJsEnabled && jsChain && soup((j, b) => sourceUsesInitJsSyntax(rules, {
       orEnabled, xpathEnabled, xpathEvalEnabled: xpathEval, regexEnabled, andEnabled, aioEnabled, listJsEnabled,
       jsExtEnabled, jsBindEnabled: jsBind, jsGetEnabled: jsGet, jsUtilEnabled: jsUtil, jsonPathEnabled, jsoupEnabled: j, bookFieldsEnabled: b,
     })),
-    varsEnabled && (options.varBagEnabled ?? engineSyntaxVarsBagEnabled()) && compileVarBag(source.rules, {
+    varsEnabled && (options.varBagEnabled ?? engineSyntaxVarsBagEnabled()) && compileVarBag(rules, {
       orEnabled, xpathEnabled, xpathEvalEnabled: xpathEval, jsEnabled: jsChain, regexEnabled, andEnabled, aioEnabled, listJsEnabled,
       jsExtEnabled, jsBindEnabled: jsBind, jsGetEnabled: jsGet, jsUtilEnabled: jsUtil, jsonPathEnabled, initJsEnabled, jsoupEnabled: jsoup,
       bookFieldsEnabled: book, listGetEnabled: listGet,
     }) !== null,
-    jsoup && [false, ...(book ? [true] : [])].some((b) => sourceUsesJsoupSyntax(source.rules, {
+    jsoup && [false, ...(book ? [true] : [])].some((b) => sourceUsesJsoupSyntax(rules, {
       orEnabled, varsEnabled, xpathEnabled, xpathEvalEnabled: xpathEval, regexEnabled, andEnabled, aioEnabled, listJsEnabled, jsExtEnabled,
       jsBindEnabled: jsBind, jsGetEnabled: jsGet, jsUtilEnabled: jsUtil, jsonPathEnabled, bookFieldsEnabled: b,
     })),
-    book && sourceUsesBookSyntax(source.rules, {
+    book && sourceUsesBookSyntax(rules, {
       orEnabled, varsEnabled, xpathEnabled, xpathEvalEnabled: xpathEval, regexEnabled, andEnabled, aioEnabled, listJsEnabled, jsExtEnabled,
       jsGetEnabled: jsGet, jsUtilEnabled: jsUtil, jsonPathEnabled, initJsEnabled, jsoupEnabled: jsoup,
     }),
-    searchVars && compileSearchVars(source, {
+    searchVars && compileSearchVars(probe, {
       orEnabled, xpathEnabled, xpathEvalEnabled: xpathEval, jsEnabled: jsChain, regexEnabled, andEnabled, aioEnabled, listJsEnabled,
       jsExtEnabled, jsBindEnabled: jsBind, jsGetEnabled: jsGet, jsUtilEnabled: jsUtil, jsonPathEnabled, initJsEnabled, jsoupEnabled: jsoup,
       bookFieldsEnabled: book, listGetEnabled: listGet,
     }) !== null,
-    itemVars && compileItemVars(source, {
+    itemVars && compileItemVars(probe, {
       orEnabled, xpathEnabled, xpathEvalEnabled: xpathEval, jsEnabled: jsChain, regexEnabled, andEnabled, aioEnabled, listJsEnabled,
       jsExtEnabled, jsBindEnabled: jsBind, jsGetEnabled: jsGet, jsUtilEnabled: jsUtil, jsonPathEnabled, initJsEnabled, jsoupEnabled: jsoup,
       bookFieldsEnabled: book, listGetEnabled: listGet,
     }) !== null,
-    listGet && soup((j, b) => sourceUsesListGetSyntax(source.rules, {
+    listGet && soup((j, b) => sourceUsesListGetSyntax(rules, {
       orEnabled, varsEnabled, xpathEnabled, xpathEvalEnabled: xpathEval, regexEnabled, andEnabled, aioEnabled, jsExtEnabled,
       jsBindEnabled: jsBind, jsUtilEnabled: jsUtil, jsonPathEnabled, jsoupEnabled: j, bookFieldsEnabled: b,
     })),
-    bookVariable && sourceUsesBookVariableSyntax(source, {
+    bookVariable && sourceUsesBookVariableSyntax(probe, {
       orEnabled, varsEnabled, xpathEnabled, xpathEvalEnabled: xpathEval, regexEnabled, andEnabled, aioEnabled, listJsEnabled, jsExtEnabled,
       jsGetEnabled: jsGet, jsUtilEnabled: jsUtil, jsonPathEnabled, initJsEnabled, listGetEnabled: listGet,
     }),
+    libActive && someRule(rules, (rule) => ruleHasJs(rule) || rule.includes('{{')),
   ));
 }
 
@@ -255,9 +264,43 @@ export function sourceUsesVarSyntax(rules: Record<string, unknown>): boolean {
   return someRule(rules, ruleMayUseVars);
 }
 
-/** 源带 jsLib（公共函数库）：JS 段多半调用其中函数，沙箱不执行 jsLib，整源不开 JS 链。 */
+/** 源带 jsLib（公共函数库）：JS 段多半调用其中函数，沙箱不执行 jsLib，整源不开 JS 链（jslib1028 开且库可复现时除外，见 sourceJsLib）。 */
 export function sourceHasJsLib(rules: Record<string, unknown>): boolean {
   return typeof rules.jsLib === 'string' && rules.jsLib.trim() !== '';
+}
+
+/**
+ * jslib1028：`enabled`（ENGINE_SYNTAX_JS 与 ENGINE_SYNTAX_JS_LIB 同开，由调用方判）且源带可复现的 jsLib（js-lib.ts analyzeJsLib）
+ * 时返回库，该源照常开 JS 链、字段另过 jsLibRuleProblem；否则 null（带 jsLib 的源照旧整源不开 JS 链）。
+ */
+export function sourceJsLib(rules: Record<string, unknown>, enabled: boolean): JsLib | null {
+  return enabled && sourceHasJsLib(rules) ? analyzeJsLib(rules.jsLib) : null;
+}
+
+/** 去掉 jsLib 的规则视图（jslib1028：库可复现时，各语义位按开 JS 链的口径判）。 */
+function withoutJsLib(rules: Record<string, unknown>): Record<string, unknown> {
+  const rest = { ...rules };
+  delete rest.jsLib;
+  return rest;
+}
+
+/**
+ * jslib1028：编译产物按其规则文本过库（compileSource 后处理与准入求值同一口径）：任一文本不过 jsLibRuleProblem → undefined
+ * （字段按不可解释处理）；有文本带 JS（JS 段或 `{{}}`）则挂库原文，否则原样。
+ */
+export function fieldWithJsLib(ir: FieldIr, texts: readonly (string | undefined)[], lib: JsLib): FieldIr | undefined {
+  const present = texts.filter((t): t is string => typeof t === 'string');
+  if (present.some((t) => jsLibRuleProblem(lib, t) !== undefined)) return undefined;
+  return present.some((t) => ruleHasJs(t) || t.includes('{{')) ? { ...ir, jsLib: lib.code } : ir;
+}
+
+/** 字段全名（`组.字段`）在规则对象里的原文；不是非空字符串时 undefined。 */
+export function ruleTextOf(rules: Record<string, unknown>, name: string): string | undefined {
+  const dot = name.indexOf('.');
+  const fields = rules[name.slice(0, dot)];
+  if (!fields || typeof fields !== 'object' || Array.isArray(fields)) return undefined;
+  const rule = (fields as Record<string, unknown>)[name.slice(dot + 1)];
+  return typeof rule === 'string' && rule.trim() ? rule : undefined;
 }
 
 /**
@@ -1522,8 +1565,11 @@ export function compileSource(
   const orEnabled = options.orEnabled ?? engineSyntaxOrEnabled();
   const xpathEnabled = options.xpathEnabled ?? engineSyntaxXPathEnabled();
   const varsEnabled = options.varsEnabled ?? engineSyntaxVarsEnabled();
-  // jsLib 源不开 JS 链（见 sourceHasJsLib）：字段里的 JS 照旧 unsupported_js。
-  const jsEnabled = (options.jsEnabled ?? engineSyntaxJsEnabled()) && !sourceHasJsLib(source.rules);
+  // jsLib 源不开 JS 链（见 sourceHasJsLib）：字段里的 JS 照旧 unsupported_js；jslib1028 开且库可复现时照常开（见 sourceJsLib）。
+  const jsRequested = options.jsEnabled ?? engineSyntaxJsEnabled();
+  const jsLibEnabled = options.jsLibEnabled ?? engineSyntaxJsLibEnabled();
+  const jsLib = sourceJsLib(source.rules, jsRequested && jsLibEnabled);
+  const jsEnabled = jsRequested && (!sourceHasJsLib(source.rules) || jsLib !== null);
   const xpathEvalEnabled = options.xpathEvalEnabled ?? engineSyntaxXPathEvalEnabled();
   const regexEnabled = options.regexEnabled ?? engineSyntaxRegexEnabled();
   const andEnabled = options.andEnabled ?? engineSyntaxAndEnabled();
@@ -1551,7 +1597,7 @@ export function compileSource(
   const key = engineSourceRevision(source, {
     orEnabled, xpathEnabled, varsEnabled, jsEnabled, xpathEvalEnabled, regexEnabled, andEnabled, aioEnabled, listJsEnabled, jsExtEnabled,
     jsBindEnabled, jsGetEnabled, jsUtilEnabled, jsonPathEnabled, initEnabled, urlOptionsEnabled, initJsEnabled, varBagEnabled, jsoupEnabled,
-    bookFieldsEnabled, searchJsEnabled, searchVarsEnabled, itemVarsEnabled, listGetEnabled, bookVariableEnabled,
+    bookFieldsEnabled, searchJsEnabled, searchVarsEnabled, itemVarsEnabled, listGetEnabled, bookVariableEnabled, jsLibEnabled,
   });
   const hit = cache.get(key);
   if (hit) {
@@ -1617,6 +1663,14 @@ export function compileSource(
     for (const name of urlOptionFields(source.rules)) {
       const ir = compiled.get(name);
       if (ir && !('skipped' in ir)) compiled.set(name, { ...ir, urlOptions: true });
+    }
+  }
+  // jslib1028：字段按原文与 vars 改写后的文本过 jsLibRuleProblem（袋/init 等后处理换上的字段一并过），不过即 skipped；
+  // 带 JS（JS 段或 `{{}}`）的字段挂库原文，求值时沙箱先求值库（js-sandbox.ts JsBindings.jsLib）。
+  if (jsLib) {
+    for (const [name, ir] of compiled) {
+      if ('skipped' in ir) continue;
+      compiled.set(name, fieldWithJsLib(ir, [ruleTextOf(source.rules, name), ruleTextOf(sourceRules, name)], jsLib) ?? { skipped: 'unsupported' });
     }
   }
   cache.set(key, compiled);
