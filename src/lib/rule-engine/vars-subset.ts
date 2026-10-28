@@ -245,6 +245,46 @@ function usesBag(rule: string): boolean {
   return /@(?:put|get):/i.test(rule) || count(rule, JAVA_PUT_ANY) + count(rule, JAVA_GET_ANY) > 0;
 }
 
+// ---- 搜索 URL put → 搜索字段 get 变量袋（searchvars1028，ENGINE_SYNTAX_SEARCH_VARS）----
+/** 读搜索袋的搜索字段：门面 engineSearchBook 与准入 searchCandidates 求值的那几个。 */
+const SEARCH_VAR_GET_FIELDS: ReadonlySet<string> = new Set(['bookList', 'name', 'author', 'bookUrl']);
+
+/** 搜索袋的文本级计划：searchUrl put 的键、每个搜索字段读的键。编译期（compile.ts compileSearchVars）再逐字段核实。 */
+export interface SearchVarPlan {
+  puts: ReadonlySet<string>;
+  gets: ReadonlyMap<string, ReadonlySet<string>>;
+}
+
+/**
+ * 原始规则（未经 resolveSourceVars）上判搜索袋子集，不在子集内返回 null：
+ * - put 只认 searchUrl 里键为字面量的 `java.put('k', …)`（legado AnalyzeUrl.put 写进本次搜索的 RuleData）；
+ * - ruleSearch 各字段一律不 put（`@put`/`java.put`：条目 put 写进各条 SearchBook，另一套语义）；
+ * - get（`@get:{k}` 与 `java.get('k')`）只换 bookList/name/author/bookUrl，键都是字面量、都被 searchUrl put 过、不碰保留键；
+ *   其余搜索字段里的 get 不看（门面不求值它们，照旧按普通编译）。
+ * 只是文本粗筛：字段能否编译、键在编译后是否真被收进来由调用方核实。
+ */
+export function searchVarPlan(rules: object, searchUrl: unknown): SearchVarPlan | null {
+  if (typeof searchUrl !== 'string') return null;
+  const puts = new Set([...searchUrl.matchAll(JAVA_PUT_LITERAL)].map((match) => match[2]));
+  if (puts.size === 0) return null;
+  const fields = (rules as Record<string, unknown>).ruleSearch;
+  if (!fields || typeof fields !== 'object' || Array.isArray(fields)) return null;
+  const gets = new Map<string, Set<string>>();
+  for (const [name, rule] of Object.entries(fields as Record<string, unknown>)) {
+    if (typeof rule !== 'string') continue;
+    if (count(rule, PUT_RE) + count(rule, JAVA_PUT_ANY) > 0) return null;
+    const javaGets = count(rule, JAVA_GET_ANY);
+    if (!SEARCH_VAR_GET_FIELDS.has(name) || (javaGets === 0 && !/@get:/i.test(rule))) continue;
+    const javaKeys = [...rule.matchAll(JAVA_GET_LITERAL)].map((match) => match[2]);
+    if (javaKeys.length !== javaGets) return null;
+    if (count(rule, /@get:/gi) !== count(rule, GET_ANY_RE)) return null;
+    const keys = [...[...rule.matchAll(GET_ANY_RE)].map((match) => match[1]), ...javaKeys];
+    if (keys.some((key) => VAR_BAG_RESERVED_KEYS.has(key) || !puts.has(key))) return null;
+    gets.set(name, new Set(keys));
+  }
+  return gets.size === 0 ? null : { puts, gets };
+}
+
 /** 字段原文里全部 `@put:{…}` 合并成的键 → 规则（varbag1028 编译用）；任一块解析不了返回 null。 */
 export function varPutRules(rule: string): Map<string, string> | null {
   return rulePuts(rule);

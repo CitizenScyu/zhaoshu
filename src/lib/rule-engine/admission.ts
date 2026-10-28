@@ -23,7 +23,7 @@ import {
   bookInfoScope, compiledUsesBook, createScope, evaluateField, evaluateFieldList, fieldUsesJs, normalizeBody, scopeVars, withBook, withVars,
 } from './evaluate';
 import { RuleEngineError, type FieldIr, type RuleDiagnostic } from './types';
-import { compileSource, compileVarBag, engineSourceRevision, sourceCanReName } from './compile';
+import { compileSearchVars, compileSource, compileVarBag, engineSearchVarsActive, engineSourceRevision, sourceCanReName } from './compile';
 import {
   engineSyntaxAioEnabled, engineSyntaxBookFieldsEnabled, engineSyntaxJsBindEnabled, engineSyntaxVarsBagEnabled, engineSyntaxVarsEnabled,
   engineUrlOptionsEnabled,
@@ -32,7 +32,7 @@ import { bookUrlMember, bookView, formatBookAuthor, formatBookName, type BookVie
 import { stripUrlOptions, urlOptionFields } from './url-options';
 import { aioGroups, isAioListRule, ruleGroupOf } from './aio-syntax';
 import { preloadJsSandbox } from './js-sandbox';
-import { buildSearchRequest, prepareSearchJs, SearchJsNotReadyError } from './search-js';
+import { buildSearchRequestWithVars, prepareSearchJs, SearchJsNotReadyError, type SearchRequestWithVars } from './search-js';
 import { resolveSourceVars } from './vars-subset';
 import { contentHtmlToText, contentNeedsHtmlToText } from './content-html';
 import { isStructuredChallengePage } from './content-challenge';
@@ -445,11 +445,13 @@ export function compileAdmission(source: RawSource): AdmissionCompile {
   // varbag1028：同 compileSource——变量袋生效时详情 put 字段与目录 get 字段按带袋的编译结果算可解释。
   const bag = engineSyntaxVarsEnabled() && engineSyntaxVarsBagEnabled()
     ? compileVarBag(source as unknown as Record<string, unknown>, { jsEnabled: coreJs }) : null;
+  // searchvars1028：同 compileSource——搜索袋生效时读袋的搜索字段按带袋的编译结果算可解释。
+  const searchBag = searchBagOf(source, coreJs);
   // book1028：同 compileSource——canReName 非空的源不开书籍成员（宿主绑定开关的判定在 parseFieldRule 里）。
   const bookFieldsEnabled = engineSyntaxBookFieldsEnabled() && !sourceCanReName(source as Record<string, unknown>);
   for (const [field, rule] of iterRulePairs(rulesSource)) {
     if (!(field in coreFieldMask)) continue;
-    if (bag?.has(field)) {
+    if (bag?.has(field) || searchBag?.has(field)) {
       coreFieldMask[field] = true;
       continue;
     }
@@ -697,6 +699,13 @@ export function queryControlKeyword(keyword: string): string | undefined {
 function buildAdmissionSearchRequest(
   source: RawSource, declaredHosts: ReadonlySet<string>, keyword = admissionKeyword(source),
 ): SourceSearchRequest {
+  return buildAdmissionSearch(source, declaredHosts, keyword).request;
+}
+
+/** 同 buildAdmissionSearchRequest，另带回搜索 JS put 的变量（searchvars1028，与运行时 buildSearchRequestWithVars 同一函数）。 */
+function buildAdmissionSearch(
+  source: RawSource, declaredHosts: ReadonlySet<string>, keyword = admissionKeyword(source),
+): SearchRequestWithVars {
   // bookSourceUrl 写死 http:// 的源（41-srcfix 改法2，selectCandidates 已按升级后判定放行）：基址同样升 https
   // 再过锁，否则 checkSourceUrl 先拒基址、相对 searchUrl 也无从解析。升级只改 scheme，锁本身不变。
   const base = typeof source.bookSourceUrl === 'string' ? upgradeSourceTemplateUrl(source.bookSourceUrl) : undefined;
@@ -704,7 +713,7 @@ function buildAdmissionSearchRequest(
   if (enginePostSearchEnabled()) {
     // 与运行时 sourceSearchUrl/buildSourceSearchRequest 同一口径（含 http→https 升级），否则「准入通过、阅读期被判死」两把锁漂移。
     // searchjs1027：ENGINE_SEARCH_JS 开时旧口径构造不出的 JS 模板与运行时同一函数求值（沙箱未就绪抛 SearchJsNotReadyError）。
-    return buildSearchRequest(source.searchUrl, keyword, base, validate, engineSearchJsActive());
+    return buildSearchRequestWithVars(source.searchUrl, keyword, base, validate, engineSearchJsActive());
   }
   const template = source.searchUrl;
   if (typeof template !== 'string' || template.length > 2048 || !/\{\{key\}\}/.test(template)) {
@@ -712,14 +721,23 @@ function buildAdmissionSearchRequest(
   }
   const expanded = template.replace(/\{\{key\}\}/g, encodeURIComponent(keyword)).replace(/\{\{page\}\}/g, '1');
   if (/[{}]|@js:|<js>|,\s*\[/i.test(expanded)) throw new SourcePolicyError('不支持该书源的动态搜索规则');
-  return { url: validateAdmissionUrl(upgradeSourceTemplateUrl(expanded), base, declaredHosts).href, method: 'GET', charset: 'utf-8' };
+  return { request: { url: validateAdmissionUrl(upgradeSourceTemplateUrl(expanded), base, declaredHosts).href, method: 'GET', charset: 'utf-8' } };
 }
 
 const MAX_CANDIDATE_SCAN = 50;
 
 /** bookList 求值 → 逐条 name/bookUrl 可解析的候选 URL（设计 §4.1：≥1 条即 ok；对照判据比 URL 集）。 */
-function searchCandidateUrls(source: RawSource, text: string, pageUrl: string): string[] {
-  return searchCandidates(source, text, pageUrl).map((item) => item.url);
+function searchCandidateUrls(source: RawSource, text: string, pageUrl: string, vars?: Readonly<Record<string, string>>): string[] {
+  return searchCandidates(source, text, pageUrl, vars).map((item) => item.url);
+}
+
+/** searchvars1028：搜索袋对该源生效时读袋的搜索字段（与 compileSource 同一个 compileSearchVars）；开关关或不生效返回 null。 */
+function searchBagOf(source: RawSource, jsEnabled: boolean): ReadonlyMap<string, FieldIr> | null {
+  if (!engineSearchVarsActive()) return null;
+  return compileSearchVars({
+    url: typeof source.bookSourceUrl === 'string' ? source.bookSourceUrl : '', searchUrl: source.searchUrl,
+    rules: source as Record<string, unknown>,
+  }, { jsEnabled });
 }
 
 /** book1028：按运行时同一份 compileSource 产物判源是否读书籍成员（规则文本无 `book.` 时不编译，判据同 compile.ts ruleMayUseBook）；编译异常按否。 */
@@ -739,8 +757,11 @@ function sourceCompiledUsesBook(source: RawSource): boolean {
  * 同 searchCandidateUrls，带上书名（read1027 可读性影子腿按书名挑样本书）。url 为字段求值结果（@href 已绝对化，JSON 值可能仍是相对路径）。
  * `book`（book1028）只在读书籍成员的源上带：name/author 已按 legado 格式化；bookUrl 是未剥选项后缀的原值（影子腿过门后换成绝对地址），
  * 剥过后缀时不带。
+ * `vars`（searchvars1028）= 本次搜索 JS put 的变量；搜索袋对该源生效时读袋字段换成带袋的编译结果、页面作用域挂袋（同 api.ts）。
  */
-function searchCandidates(source: RawSource, text: string, pageUrl: string): { title: string; url: string; book?: BookView }[] {
+function searchCandidates(
+  source: RawSource, text: string, pageUrl: string, vars?: Readonly<Record<string, string>>,
+): { title: string; url: string; book?: BookView }[] {
   const rules = (engineSyntaxVarsEnabled() ? resolveSourceVars(source) : source).ruleSearch;
   if (!rules || typeof rules !== 'object') return [];
   const bookList = (rules as Record<string, unknown>).bookList;
@@ -752,8 +773,11 @@ function searchCandidates(source: RawSource, text: string, pageUrl: string): { t
   const aioGroup = engineSyntaxAioEnabled() && isAioListRule(bookList);
   const listJsGroup = listJsGroups({ ruleSearch: rules }).has('ruleSearch');
   const bookFieldsEnabled = engineSyntaxBookFieldsEnabled() && !sourceCanReName(source as Record<string, unknown>);
+  const searchBag = vars !== undefined ? searchBagOf(source, jsEnabled) : null;
   const parseSafe = (rule: unknown, name?: string) => {
     if (typeof rule !== 'string' || !rule.trim()) return undefined;
+    const bagged = name === undefined ? undefined : searchBag?.get(name);
+    if (bagged) return bagged;
     try { return parseFieldRule(rule, { jsEnabled, field: name, aioGroup, listJsGroup, bookFieldsEnabled }); } catch { return undefined; }
   };
   const listIr = parseSafe(bookList, 'ruleSearch.bookList');
@@ -771,6 +795,7 @@ function searchCandidates(source: RawSource, text: string, pageUrl: string): { t
   try { scope = createScope(normalizeBody(text), pageUrl); } catch { return []; }
   // bind1028：宿主绑定同 api.ts pageScope（开关 on 才挂）。
   if (engineSyntaxJsBindEnabled()) scope.host = { origin: typeof source.bookSourceUrl === 'string' ? source.bookSourceUrl : '' };
+  if (searchBag && vars !== undefined) scope = withVars(scope, vars);
   // HTML 与 JSON 搜索页同一路径（JSON 页 bookList 取列表项，见 evaluateFieldList）。
   let items;
   try { items = evaluateFieldList(listIr, scope); } catch { return []; }
@@ -859,8 +884,9 @@ async function searchAdmissionOnce(
   source: RawSource, options: Parameters<typeof searchAdmission>[1], keyword: string,
 ): Promise<AdmissionSearchResult> {
   let request: SourceSearchRequest;
+  let vars: Readonly<Record<string, string>> | undefined;
   try {
-    request = buildAdmissionSearchRequest(source, options.declaredHosts, keyword);
+    ({ request, vars } = buildAdmissionSearch(source, options.declaredHosts, keyword));
   } catch (error) {
     if (error instanceof SearchJsNotReadyError) throw error; // 瞬时：由 runAdmissionBatch 写占位，不记 url_invalid
     return { verdict: 'url_invalid', candidateCount: 0, error: errorMessage(error) };
@@ -894,7 +920,7 @@ async function searchAdmissionOnce(
   // AllInOne 搜索列表（aio1027）的正则也在沙箱里跑。
   if ((jsChainEnabledFor(source) && sourceHasJsChainField(source))
     || (engineSyntaxAioEnabled() && aioGroups(source).has('ruleSearch'))) await preloadJsSandbox();
-  const found = searchCandidates(source, response.text, response.url);
+  const found = searchCandidates(source, response.text, response.url, vars);
   const urls = found.map((item) => item.url);
   const candidateCount = urls.length;
   if (candidateCount >= 1) {
@@ -938,8 +964,9 @@ async function controlQueryOverlap(
   const control = queryControlKeyword(keyword);
   if (!control) return undefined;
   let request: SourceSearchRequest;
+  let vars: Readonly<Record<string, string>> | undefined;
   try {
-    request = buildAdmissionSearchRequest(source, options.declaredHosts, control);
+    ({ request, vars } = buildAdmissionSearch(source, options.declaredHosts, control));
   } catch (error) {
     if (error instanceof SearchJsNotReadyError) throw error; // 不能因沙箱瞬时不可用跳过对照判定
     return undefined;
@@ -956,7 +983,7 @@ async function controlQueryOverlap(
   }
   if (response.status < 200 || response.status >= 300) return undefined;
   const a = new Set(primary);
-  const b = new Set(searchCandidateUrls(source, response.text, response.url));
+  const b = new Set(searchCandidateUrls(source, response.text, response.url, vars));
   if (b.size === 0) return 0;
   let shared = 0;
   for (const item of b) if (a.has(item)) shared += 1;

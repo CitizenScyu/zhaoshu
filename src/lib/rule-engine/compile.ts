@@ -18,10 +18,10 @@ import {
   engineSyntaxJsExtEnabled, engineSyntaxJsGetEnabled, engineSyntaxJsonPathEnabled, engineSyntaxJsUtilEnabled, engineSyntaxListJsEnabled,
   engineSyntaxOrEnabled, engineSyntaxRegexEnabled, engineSyntaxVarsEnabled, engineSyntaxXPathEnabled, engineSyntaxXPathEvalEnabled, engineUrlOptionsEnabled,
   engineSearchWebViewEnabled, engineSyntaxInitJsEnabled, engineSyntaxJsoupEnabled, engineSyntaxVarsBagEnabled,
-  engineSyntaxBookFieldsEnabled, ENGINE_SEMANTICS_VERSION,
+  engineSyntaxBookFieldsEnabled, engineSyntaxSearchVarsEnabled, ENGINE_SEMANTICS_VERSION,
 } from './syntax-flags';
 import { urlOptionFields } from './url-options';
-import { resolveSourceVars, ruleMayUseVars, varBagPlan, varPutRules } from './vars-subset';
+import { resolveSourceVars, ruleMayUseVars, searchVarPlan, varBagPlan, varPutRules, type SearchVarPlan } from './vars-subset';
 import { ruleMayUseXPath } from './xpath-subset';
 
 export { ENGINE_SEMANTICS_VERSION };
@@ -44,6 +44,8 @@ export interface CompileOptions extends ParseOptions {
   varBagEnabled?: boolean;
   // jsoupEnabled（jsoup1028，ENGINE_SYNTAX_JSOUP）见 ParseOptions；compile 层另要求 JS 链对该源生效。
   // bookFieldsEnabled（book1028，ENGINE_SYNTAX_BOOK_FIELDS）见 ParseOptions；compile 层另要求 JS 链与宿主绑定对该源生效、canReName 为空。
+  /** searchvars1028：搜索 URL put → 搜索字段 get 变量袋（ENGINE_SYNTAX_SEARCH_VARS，默认读 env；须 varsEnabled 与搜索 JS 同生效）。 */
+  searchVarsEnabled?: boolean;
 }
 
 /** 版本化缓存键（P0 口径）：semanticsVersion:contentRevision。 */
@@ -77,6 +79,8 @@ export function engineVersionedKey(contentRevision: string, semanticsVersion = E
  * jsoup1028：ENGINE_SYNTAX_JSOUP on、JS 链对该源生效且有含 JS 的字段 off 态被拒、on 态编译通过（sourceUsesJsoupSyntax）时再加 jsoup 位（+4194304）。
  * book1028：ENGINE_SYNTAX_BOOK_FIELDS on、宿主绑定对该源生效、canReName 为空且有读 `book.` 成员的字段 off 态被拒、on 态编译通过
  * （sourceUsesBookSyntax）时再加书籍成员位（+8388608）。
+ * searchvars1028：ENGINE_SYNTAX_VARS、ENGINE_SYNTAX_SEARCH_VARS 与搜索 JS 都生效且搜索袋对该源真生效（compileSearchVars 非 null）时
+ * 再加搜索袋位（+16777216）。
  */
 export function engineSourceRevision(
   source: { url: string; searchUrl: unknown; rules: Record<string, unknown> },
@@ -110,6 +114,7 @@ export function engineSourceRevision(
   const jsUtil = jsChain && jsUtilEnabled;
   const jsoup = jsChain && (options.jsoupEnabled ?? engineSyntaxJsoupEnabled());
   const book = jsBind && (options.bookFieldsEnabled ?? engineSyntaxBookFieldsEnabled()) && !sourceCanReName(source.rules);
+  const searchVars = varsEnabled && searchJsEnabled && (options.searchVarsEnabled ?? engineSyntaxSearchVarsEnabled());
   // jsoup1028：其余各位先按 jsoup 关判（与旧口径逐字相同），jsoup 开时再补判一次取并集——jsoup 重试能救活
   // 某开关的 off 态（如条目首段 JS 以 Element 起链），只按 jsoup 开判会把该位清掉、在池源 identity 白翻。
   // book1028 同理：书籍成员重试也能救活别的开关的 off 态，book 开时再按 book 开（jsoup 两态）补判。
@@ -179,6 +184,11 @@ export function engineSourceRevision(
       orEnabled, varsEnabled, xpathEnabled, xpathEvalEnabled: xpathEval, regexEnabled, andEnabled, aioEnabled, listJsEnabled, jsExtEnabled,
       jsGetEnabled: jsGet, jsUtilEnabled: jsUtil, jsonPathEnabled, initJsEnabled, jsoupEnabled: jsoup,
     }),
+    searchVars && compileSearchVars(source, {
+      orEnabled, xpathEnabled, xpathEvalEnabled: xpathEval, jsEnabled: jsChain, regexEnabled, andEnabled, aioEnabled, listJsEnabled,
+      jsExtEnabled, jsBindEnabled: jsBind, jsGetEnabled: jsGet, jsUtilEnabled: jsUtil, jsonPathEnabled, initJsEnabled, jsoupEnabled: jsoup,
+      bookFieldsEnabled: book,
+    }) !== null,
   ));
 }
 
@@ -1005,6 +1015,21 @@ const VAR_PUT_VALUE_FIELD = 'ruleBookInfo.name';
  * `options` 缺省的开关读 env（与 parseFieldRule 同口径）。
  */
 export function compileVarBag(rules: Record<string, unknown>, options: ParseOptions = {}): ReadonlyMap<string, FieldIr> | null {
+  const base = bagParseBase(rules, options);
+  const memoKey = JSON.stringify(base);
+  let memo = varBagMemo.get(rules);
+  if (!memo) {
+    memo = new Map();
+    varBagMemo.set(rules, memo);
+  }
+  if (memo.has(memoKey)) return memo.get(memoKey)!;
+  const out = buildVarBag(rules, base);
+  memo.set(memoKey, out);
+  return out;
+}
+
+/** 变量袋编译（varbag1028 / searchvars1028）的语法开关基底：`options` 缺省的读 env（与 parseFieldRule 同口径）。 */
+function bagParseBase(rules: Record<string, unknown>, options: ParseOptions): ParseOptions {
   const js = options.jsEnabled ?? engineSyntaxJsEnabled();
   const xpathEnabled = options.xpathEnabled ?? engineSyntaxXPathEnabled();
   const base: ParseOptions = {
@@ -1026,16 +1051,7 @@ export function compileVarBag(rules: Record<string, unknown>, options: ParseOpti
   };
   // book1028：同 compileSource（宿主绑定生效、canReName 为空才开）。
   base.bookFieldsEnabled = base.jsBindEnabled === true && (options.bookFieldsEnabled ?? engineSyntaxBookFieldsEnabled()) && !sourceCanReName(rules);
-  const memoKey = JSON.stringify(base);
-  let memo = varBagMemo.get(rules);
-  if (!memo) {
-    memo = new Map();
-    varBagMemo.set(rules, memo);
-  }
-  if (memo.has(memoKey)) return memo.get(memoKey)!;
-  const out = buildVarBag(rules, base);
-  memo.set(memoKey, out);
-  return out;
+  return base;
 }
 
 function buildVarBag(rules: Record<string, unknown>, base: ParseOptions): ReadonlyMap<string, FieldIr> | null {
@@ -1089,6 +1105,60 @@ function buildVarBag(rules: Record<string, unknown>, base: ParseOptions): Readon
   }
 }
 
+// ---- 搜索 URL put → 搜索字段 get 变量袋（searchvars1028）----
+const searchVarsMemo = new WeakMap<object, Map<string, ReadonlyMap<string, FieldIr> | null>>();
+
+/** 搜索袋实际生效：ENGINE_SYNTAX_VARS、ENGINE_SYNTAX_SEARCH_VARS 与搜索 JS（ENGINE_POST_SEARCH + ENGINE_SEARCH_JS）都开。 */
+export function engineSearchVarsActive(): boolean {
+  return engineSyntaxVarsEnabled() && engineSyntaxSearchVarsEnabled() && engineSearchJsActive();
+}
+
+/**
+ * 搜索袋生效时要换掉的搜索字段（字段全名 → get 模式编译结果，挂 varGets），不生效返回 null（整源照旧）。
+ * 先按 vars-subset.ts searchVarPlan 文本粗筛，且 searchUrl 须走搜索 JS（searchTemplateNeedsJs；旧口径构造得出的模板不跑 JS，
+ * 袋恒空），再逐字段在 get 模式下编译核实：任一计划字段编译不过、收进来的键没被 searchUrl put、ruleSearch 是 AllInOne、
+ * 或最后没有字段真读袋，一律 null。compileSource / compileAdmission / engineSourceRevision 同一判据；开关由调用方判
+ * （engineSearchVarsActive），`options` 缺省的语法开关读 env。
+ */
+export function compileSearchVars(
+  source: { url: string; searchUrl: unknown; rules: Record<string, unknown> }, options: ParseOptions = {},
+): ReadonlyMap<string, FieldIr> | null {
+  const plan = searchVarPlan(source.rules, source.searchUrl);
+  if (!plan || !searchTemplateNeedsJs(source.searchUrl, upgradeSourceTemplateUrl(source.url))) return null;
+  const base = bagParseBase(source.rules, options);
+  const memoKey = JSON.stringify([base, source.searchUrl]); // put 键来自 searchUrl，可能不在 rules 对象里
+  let memo = searchVarsMemo.get(source.rules);
+  if (!memo) {
+    memo = new Map();
+    searchVarsMemo.set(source.rules, memo);
+  }
+  if (memo.has(memoKey)) return memo.get(memoKey)!;
+  const out = buildSearchVars(source.rules, plan, base);
+  memo.set(memoKey, out);
+  return out;
+}
+
+function buildSearchVars(rules: Record<string, unknown>, plan: SearchVarPlan, base: ParseOptions): ReadonlyMap<string, FieldIr> | null {
+  const sourceRules = resolveSourceVars(rules);
+  if (base.aioEnabled && aioGroups(sourceRules).has('ruleSearch')) return null;
+  const listJsGroup = base.jsEnabled === true && base.listJsEnabled === true && listJsGroups(sourceRules).has('ruleSearch');
+  const search = (sourceRules.ruleSearch ?? {}) as Record<string, unknown>;
+  const out = new Map<string, FieldIr>();
+  try {
+    for (const name of plan.gets.keys()) {
+      const field = `ruleSearch.${name}`;
+      const keys = new Set<string>();
+      const ir = parseFieldRule(String(search[name]), { ...base, field, listJsGroup, varBag: { mode: 'get', keys } });
+      if (keys.size === 0) continue; // get 只出现在字面量/注释里：字段不读袋，普通编译即可
+      for (const key of keys) if (!plan.puts.has(key)) return null;
+      out.set(field, { ...ir, varGets: true });
+    }
+    return out.size > 0 ? out : null;
+  } catch {
+    return null;
+  }
+}
+
 /** LRU 上限：单测/低并发下足够；无关热路径，只防规则对象无限积累。 */
 const CACHE_LIMIT = 64;
 const cache = new Map<string, CompiledRules>();
@@ -1127,10 +1197,12 @@ export function compileSource(
   const jsoupEnabled = jsEnabled && (options.jsoupEnabled ?? engineSyntaxJsoupEnabled());
   const bookFieldsEnabled = jsEnabled && jsBindEnabled && (options.bookFieldsEnabled ?? engineSyntaxBookFieldsEnabled())
     && !sourceCanReName(source.rules);
+  const searchJsEnabled = options.searchJsEnabled ?? engineSearchJsActive();
+  const searchVarsEnabled = varsEnabled && searchJsEnabled && (options.searchVarsEnabled ?? engineSyntaxSearchVarsEnabled());
   const key = engineSourceRevision(source, {
     orEnabled, xpathEnabled, varsEnabled, jsEnabled, xpathEvalEnabled, regexEnabled, andEnabled, aioEnabled, listJsEnabled, jsExtEnabled,
     jsBindEnabled, jsGetEnabled, jsUtilEnabled, jsonPathEnabled, initEnabled, urlOptionsEnabled, initJsEnabled, varBagEnabled, jsoupEnabled,
-    bookFieldsEnabled,
+    bookFieldsEnabled, searchJsEnabled, searchVarsEnabled,
   });
   const hit = cache.get(key);
   if (hit) {
@@ -1166,6 +1238,12 @@ export function compileSource(
     jsGetEnabled, jsUtilEnabled, jsonPathEnabled, initJsEnabled, jsoupEnabled, bookFieldsEnabled,
   }) : null;
   if (bag) for (const [name, ir] of bag) compiled.set(name, ir);
+  // searchvars1028：搜索袋对该源生效时换掉读袋的搜索字段（判据与语义位同一个 compileSearchVars）。
+  const searchBag = searchVarsEnabled ? compileSearchVars(source, {
+    orEnabled, xpathEnabled, xpathEvalEnabled, jsEnabled, regexEnabled, andEnabled, aioEnabled, listJsEnabled, jsExtEnabled, jsBindEnabled,
+    jsGetEnabled, jsUtilEnabled, jsonPathEnabled, initJsEnabled, jsoupEnabled, bookFieldsEnabled,
+  }) : null;
+  if (searchBag) for (const [name, ir] of searchBag) compiled.set(name, ir);
   // init1028：可复现的 init 挂 initScope（详情字段改在 init 结果上求值，见 evaluate.ts bookInfoScope）；判据看原文，不看 vars 改写后的。
   const init = compiled.get('ruleBookInfo.init');
   const initRule = initRuleOf(source.rules);

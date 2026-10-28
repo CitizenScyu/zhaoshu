@@ -23,13 +23,13 @@ export const ENGINE_SEMANTICS_XPATH_BIT = 2;
 /** vars1027：@put/@get 静态子集语义位。版本再 +4（5–8 = 含变量位的四种组合），1–4 逐字不变。 */
 export const ENGINE_SEMANTICS_VARS_BIT = 4;
 
-/** 语义版本随 || / XPath / 变量 / JS / XPath 求值 / 正则 / && / AllInOne / 搜索 JS / 列表 JS / JS 扩展 / 宿主绑定 / java.getString / 加解密帮手 / JSONPath 扩展 / 详情 init / 搜索选项 legado 口径 / URL 字段选项 / 搜索 webView / 详情 JS init / 详情→目录变量袋 / jsoup 直连 / 书籍成员开关联动（唯一口径，供 compile.ts 缓存键与 rulesHash 复用）。 */
+/** 语义版本随 || / XPath / 变量 / JS / XPath 求值 / 正则 / && / AllInOne / 搜索 JS / 列表 JS / JS 扩展 / 宿主绑定 / java.getString / 加解密帮手 / JSONPath 扩展 / 详情 init / 搜索选项 legado 口径 / URL 字段选项 / 搜索 webView / 详情 JS init / 详情→目录变量袋 / jsoup 直连 / 书籍成员 / 搜索 URL→搜索字段变量袋开关联动（唯一口径，供 compile.ts 缓存键与 rulesHash 复用）。 */
 export function engineSemanticsVersion(
   orEnabled: boolean, xpathEnabled = false, varsEnabled = false, jsEnabled = false, xpathEvalEnabled = false,
   regexEnabled = false, andEnabled = false, aioEnabled = false, searchJsEnabled = false, listJsEnabled = false,
   jsExtEnabled = false, jsBindEnabled = false, jsGetEnabled = false, jsUtilEnabled = false, jsonPathEnabled = false,
   initEnabled = false, searchOptionsEnabled = false, urlOptionsEnabled = false, searchWebViewEnabled = false, initJsEnabled = false,
-  varBagEnabled = false, jsoupEnabled = false, bookFieldsEnabled = false,
+  varBagEnabled = false, jsoupEnabled = false, bookFieldsEnabled = false, searchVarsEnabled = false,
 ): number {
   return (orEnabled ? ENGINE_SEMANTICS_VERSION_OR : ENGINE_SEMANTICS_VERSION)
     + (xpathEnabled ? ENGINE_SEMANTICS_XPATH_BIT : 0) + (varsEnabled ? ENGINE_SEMANTICS_VARS_BIT : 0)
@@ -42,7 +42,8 @@ export function engineSemanticsVersion(
     + (initEnabled ? ENGINE_SEMANTICS_INIT_BIT : 0) + (searchOptionsEnabled ? ENGINE_SEMANTICS_SEARCH_OPTIONS_BIT : 0)
     + (urlOptionsEnabled ? ENGINE_SEMANTICS_URL_OPTIONS_BIT : 0) + (searchWebViewEnabled ? ENGINE_SEMANTICS_SEARCH_WEBVIEW_BIT : 0)
     + (initJsEnabled ? ENGINE_SEMANTICS_INIT_JS_BIT : 0) + (varBagEnabled ? ENGINE_SEMANTICS_VAR_BAG_BIT : 0)
-    + (jsoupEnabled ? ENGINE_SEMANTICS_JSOUP_BIT : 0) + (bookFieldsEnabled ? ENGINE_SEMANTICS_BOOK_FIELDS_BIT : 0);
+    + (jsoupEnabled ? ENGINE_SEMANTICS_JSOUP_BIT : 0) + (bookFieldsEnabled ? ENGINE_SEMANTICS_BOOK_FIELDS_BIT : 0)
+    + (searchVarsEnabled ? ENGINE_SEMANTICS_SEARCH_VARS_BIT : 0);
 }
 
 /**
@@ -421,5 +422,24 @@ export const ENGINE_SEMANTICS_BOOK_FIELDS_BIT = 8388608;
  */
 export function engineSyntaxBookFieldsEnabled(env: OrEnv = process.env): boolean {
   const raw = env.ENGINE_SYNTAX_BOOK_FIELDS?.trim().toLowerCase();
+  return raw === '1' || raw === 'true' || raw === 'on';
+}
+
+/**
+ * searchvars1028：搜索 URL put → 搜索字段 get 变量袋语义位。版本再 +16777216（1–8388608 逐字不变）。
+ * 只对搜索袋真生效（compile.ts compileSearchVars 非 null）的源计入。
+ */
+export const ENGINE_SEMANTICS_SEARCH_VARS_BIT = 16777216;
+
+/**
+ * ENGINE_SYNTAX_SEARCH_VARS 独立开关（searchvars1028，默认 off，口径同 ENGINE_SYNTAX_OR；须 ENGINE_SYNTAX_VARS 与搜索 JS
+ * （ENGINE_POST_SEARCH + ENGINE_SEARCH_JS）同开才生效）。on = legado 搜索：searchUrl JS 里 `java.put('k', v)` 写进本次搜索的
+ * RuleData，书籍列表（AnalyzeRule 同一份 RuleData）与条目字段（SearchBook 以它的变量为初值）的 `java.get('k')` / `@get:{k}`
+ * 读回。只收字面量键、键都被 searchUrl put 过、ruleSearch 字段自身不 put（条目 put 写进各条 SearchBook，另一套语义）；
+ * 只换 bookList/name/author/bookUrl。袋来自同一次搜索请求的 JS 求值（search-js.ts buildSearchRequestWithVars），
+ * 旧口径构造得出的模板不跑 JS、不开。off = 逐字不变。
+ */
+export function engineSyntaxSearchVarsEnabled(env: OrEnv = process.env): boolean {
+  const raw = env.ENGINE_SYNTAX_SEARCH_VARS?.trim().toLowerCase();
   return raw === '1' || raw === 'true' || raw === 'on';
 }

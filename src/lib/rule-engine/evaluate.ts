@@ -512,7 +512,7 @@ function matchingBrace(text: string, open: number): number {
 export function evaluateField(field: FieldIr, scope: EvalScope, multi = false): string {
   if (scope.kind === 'json' && scope.object !== undefined) return objectFieldValue(field, scope.object);
   checkBookMembers(field, scope);
-  if (field.varGets && scope.host?.vars === undefined) return evalFailed('目录字段读详情页变量，但作用域没带变量袋');
+  if (field.varGets && scope.host?.vars === undefined) return evalFailed('字段读变量袋，但作用域没带变量袋');
   if (field.varPuts !== undefined) putVars(field.varPuts, scope);
   if (field.chain) {
     const value = field.jsoup
@@ -743,6 +743,7 @@ export function evaluateFieldNodes(field: FieldIr, scope: EvalScope): CheerioNod
  */
 export function evaluateFieldList(field: FieldIr, scope: EvalScope): EvalScope[] {
   checkBookMembers(field, scope);
+  if (field.varGets && scope.host?.vars === undefined) evalFailed('列表字段读变量袋，但作用域没带变量袋');
   const scopes = fieldListScopes(field, scope);
   if (scope.host !== undefined) for (const item of scopes) item.host ??= scope.host;
   return scopes;
@@ -821,10 +822,17 @@ function listChainScopes(field: FieldIr, chain: readonly ChainStage[], scope: Ev
   return evalFailed('列表 JS 链形态异常');
 }
 
-/** 列表 JS 的 `book`（book1028）：只给挂了 bookMembers 的列表字段，其余宿主绑定列表 JS 照旧不给。 */
-function listBookBindings(field: FieldIr, scope: EvalScope): Pick<JsBindings, 'objects'> {
+/**
+ * 列表 JS 的 `book`（book1028）与变量袋回调（searchvars1028）：只给挂了 bookMembers / varGets 的列表字段，其余宿主绑定列表 JS
+ * 照旧不给。
+ */
+function listBookBindings(field: FieldIr, scope: EvalScope): Pick<JsBindings, 'objects' | 'callbacks'> {
+  const out: Pick<JsBindings, 'objects' | 'callbacks'> = {};
   const book = field.bookMembers === undefined ? undefined : hostBindings(scope).objects?.book;
-  return book === undefined ? {} : { objects: { book } };
+  if (book !== undefined) out.objects = { book };
+  const vars = field.varGets ? scope.host?.vars : undefined;
+  if (vars !== undefined) out.callbacks = varCallbacks(vars);
+  return out;
 }
 
 /**
@@ -1021,11 +1029,18 @@ export function bookInfoScope(compiled: CompiledRules, scope: EvalScope): EvalSc
   return init && !('skipped' in init) && init.initScope ? evaluateInitScope(init, base) : base;
 }
 
-/** 编译产物里是否有变量袋字段（varbag1028：详情 put 或目录 get）。 */
+/** 编译产物里是否有变量袋字段（varbag1028：详情 put 或目录 get；搜索字段的读袋属搜索袋，不算）。 */
 export function compiledUsesVarBag(compiled: CompiledRules): boolean {
-  for (const field of compiled.values()) {
+  for (const [name, field] of compiled) {
+    if (name.startsWith('ruleSearch.')) continue;
     if (!('skipped' in field) && (field.varPuts !== undefined || field.varPut || field.varGets)) return true;
   }
+  return false;
+}
+
+/** 编译产物里是否有读搜索袋的搜索字段（searchvars1028）。没有时调用方不挂袋，搜索求值路径逐字不变。 */
+export function compiledUsesSearchVars(compiled: CompiledRules): boolean {
+  for (const [name, field] of compiled) if (name.startsWith('ruleSearch.') && !('skipped' in field) && field.varGets) return true;
   return false;
 }
 

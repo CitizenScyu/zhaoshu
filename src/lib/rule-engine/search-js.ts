@@ -175,7 +175,8 @@ function replacePages(ruleUrl: string): string {
   return url;
 }
 
-interface EvaluatedSearchJs { ruleUrl: string; baseUrl: string }
+/** vars：JS 段 `java.put` 写进本次搜索 RuleData 的变量（searchvars1028 给搜索字段读）。 */
+interface EvaluatedSearchJs { ruleUrl: string; baseUrl: string; vars: Readonly<Record<string, string>> }
 
 /** searchopt1028：求值后的选项按 legado UrlOption 口径重读（开关开、且静态模板的选项被旧口径拒时）。 */
 function optionParity(template: string, base: string): boolean {
@@ -186,7 +187,8 @@ function optionParity(template: string, base: string): boolean {
 function evaluateSearchJs(template: string, title: string, base: string): EvaluatedSearchJs {
   const split = OPTION_SPLIT.exec(base);
   const ctx: EvalContext = { title, baseUrl: split ? base.slice(0, split.index) : base, vars: {} };
-  return { ruleUrl: replacePages(replaceInline(analyzeJs(template, ctx), ctx)), baseUrl: ctx.baseUrl };
+  const ruleUrl = replacePages(replaceInline(analyzeJs(template, ctx), ctx));
+  return { ruleUrl, baseUrl: ctx.baseUrl, vars: ctx.vars };
 }
 
 /** legado AnalyzeUrl 口径的整条搜索请求。base = 书源 bookSourceUrl。 */
@@ -197,17 +199,23 @@ export function buildSearchJsRequest(
   return buildLegadoSearchRequest(ruleUrl, baseUrl, validate, optionParity(template, base));
 }
 
+/** 搜索请求与本次求值得到的变量袋；旧口径构造出的请求不跑 JS，没有 vars。 */
+export interface SearchRequestWithVars {
+  request: SourceSearchRequest;
+  vars?: Readonly<Record<string, string>>;
+}
+
 function withSearchJs(
   template: unknown, title: string, base: string | undefined, validate: SourceUrlValidator, searchJs: boolean,
   evaluate: (template: string, base: string) => EvaluatedSearchJs,
-): SourceSearchRequest {
+): SearchRequestWithVars {
   try {
-    return buildSourceSearchRequest(template, title, base, validate);
+    return { request: buildSourceSearchRequest(template, title, base, validate) };
   } catch (error) {
     if (!(error instanceof SourcePolicyError) || !searchJs || typeof template !== 'string' || base === undefined
       || !searchTemplateNeedsJs(template, base)) throw error;
-    const { ruleUrl, baseUrl } = evaluate(template, base);
-    return buildLegadoSearchRequest(ruleUrl, baseUrl, validate, optionParity(template, base));
+    const { ruleUrl, baseUrl, vars } = evaluate(template, base);
+    return { request: buildLegadoSearchRequest(ruleUrl, baseUrl, validate, optionParity(template, base)), vars };
   }
 }
 
@@ -220,6 +228,14 @@ export function buildSearchRequest(
   template: unknown, title: string, base: string | undefined,
   validate: SourceUrlValidator = validateSourceUrl, searchJs = false,
 ): SourceSearchRequest {
+  return buildSearchRequestWithVars(template, title, base, validate, searchJs).request;
+}
+
+/** 同 buildSearchRequest，另带回 JS 段 put 的变量（searchvars1028：搜索字段读袋用；袋与请求出自同一次求值）。 */
+export function buildSearchRequestWithVars(
+  template: unknown, title: string, base: string | undefined,
+  validate: SourceUrlValidator = validateSourceUrl, searchJs = false,
+): SearchRequestWithVars {
   return withSearchJs(template, title, base, validate, searchJs, (t, b) => evaluateSearchJs(t, title, b));
 }
 
@@ -260,7 +276,7 @@ function probeSearchJs(template: string, base: string): EvaluatedSearchJs {
 export function buildSearchProbeRequest(
   template: unknown, base: string | undefined, validate: SourceUrlValidator = validateSourceUrl, searchJs = false,
 ): SourceSearchRequest {
-  return withSearchJs(template, SEARCH_PROBE_TITLE, base, validate, searchJs, probeSearchJs);
+  return withSearchJs(template, SEARCH_PROBE_TITLE, base, validate, searchJs, probeSearchJs).request;
 }
 
 /**

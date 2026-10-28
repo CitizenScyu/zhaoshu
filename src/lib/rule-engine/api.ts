@@ -14,12 +14,12 @@ import { contentHtmlToText, contentNeedsHtmlToText } from './content-html';
 import { isStructuredChallengePage } from './content-challenge';
 import { bookUrlMember, bookView, formatBookAuthor, formatBookName, type BookView } from './book-format';
 import {
-  bookInfoScope, compiledUsesBook, compiledUsesJs, createScope, evaluateField, evaluateFieldList, evaluateFieldStrings, fieldUsesJs,
-  normalizeBody, scopeVars, withBook, withVars,
+  bookInfoScope, compiledUsesBook, compiledUsesJs, compiledUsesSearchVars, createScope, evaluateField, evaluateFieldList, evaluateFieldStrings,
+  fieldUsesJs, normalizeBody, scopeVars, withBook, withVars,
 } from './evaluate';
 import { enginePostSearchEnabled, engineSearchJsActive } from './compile-smoke';
 import { preloadJsSandbox } from './js-sandbox';
-import { buildSearchRequest, prepareSearchJs } from './search-js';
+import { buildSearchRequestWithVars, prepareSearchJs } from './search-js';
 import { engineSyntaxJsBindEnabled } from './syntax-flags';
 import type { CompiledRules, FieldIr, SkippedField } from './types';
 import { stripUrlOptions } from './url-options';
@@ -125,11 +125,14 @@ export async function engineSearchBook(
   // 搜索 URL 展开：flag 关时复用 sourceSearchUrl（纯 GET、utf-8，逐字不变）；
   // flag 开时经 buildSourceSearchRequest 支持 POST/body/charset/白名单头（41-postsearch）。
   let page: { url: string; text: string };
+  let searchVars: Readonly<Record<string, string>> | undefined;
   if (enginePostSearchEnabled()) {
     // searchjs1027：旧口径构造不出、需 JS 的模板（ENGINE_SEARCH_JS 开）在沙箱里按 legado 口径求值；其余逐字走旧口径。
     const searchJs = engineSearchJsActive();
     if (searchJs && searchTemplateNeedsJs(source.searchUrl, source.url)) await prepareSearchJs();
-    const request = buildSearchRequest(source.searchUrl, title, source.url, validateSourceUrl, searchJs);
+    const built = buildSearchRequestWithVars(source.searchUrl, title, source.url, validateSourceUrl, searchJs);
+    const request = built.request;
+    searchVars = built.vars;
     page = await context.page(request.url, {
       request: { method: request.method, body: request.body, headers: request.headers, charset: request.charset },
       // 显式非 utf-8 字符集直接用；否则 'auto' 按 Content-Type 嗅探（utf-8 站维持原状）。
@@ -138,7 +141,10 @@ export async function engineSearchBook(
   } else {
     page = await context.page(sourceSearchUrl(source.searchUrl, title, source.url));
   }
-  const scope = pageScope(source, page.text, page.url);
+  // searchvars1028：搜索字段读袋的源挂上本次搜索 JS put 的变量（legado 同一份 RuleData；条目 SearchBook 以它为初值）。
+  // 旧口径构造出的请求没有袋，读袋字段照旧求值失败。
+  const plain = pageScope(source, page.text, page.url);
+  const scope = searchVars !== undefined && compiledUsesSearchVars(source.compiled) ? withVars(plain, searchVars) : plain;
   const list = field(source.compiled, 'ruleSearch.bookList');
   if (!list) return [];
   const items = evaluateFieldList(list, scope);
