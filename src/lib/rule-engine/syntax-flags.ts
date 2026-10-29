@@ -634,3 +634,16 @@ export function engineSearchGetPostJsEnabled(env: OrEnv = process.env): boolean 
   const raw = env.ENGINE_SEARCH_GETPOST_JS?.trim().toLowerCase();
   return raw === '1' || raw === 'true' || raw === 'on';
 }
+
+/**
+ * ENGINE_SYNTAX_NULL_SKIP 独立开关（nullskip1029，默认 off，口径同 ENGINE_SYNTAX_OR；须 JS 链生效）。on = 字符串字段 JS 链里的
+ * Default 模式规则段在 HTML 作用域上取空即整条链得空、跳过其后各段——legado AnalyzeRule.getString 的 `result ?: continue`：
+ * AnalyzeByJSoup.getString 对空表返回 null（text/html 只收非空、属性跳过空白），null 之后的 JS/正则段都不跑。只挂 legado 走
+ * getString（非 isUrl）的字段（parse.ts NULL_SKIP_FIELDS），段须无前缀/`@CSS:`/`@@` 且编译成末端不是 `@all` 的 CSS（可含 `||`/`&&`），
+ * 见 parse.ts nullSkipStage、evaluate.ts evaluateChain。off = 逐字不变（空串照旧喂给下一段）。
+ * 无新位：只改求值（不改编译放行），准入搜索判定只读 name/bookUrl（bookUrl 是 isUrl 不挂；name 带 JS 尾段的约 2 host），同 andor1029。
+ */
+export function engineSyntaxNullSkipEnabled(env: OrEnv = process.env): boolean {
+  const raw = env.ENGINE_SYNTAX_NULL_SKIP?.trim().toLowerCase();
+  return raw === '1' || raw === 'true' || raw === 'on';
+}

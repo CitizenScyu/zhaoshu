@@ -182,8 +182,10 @@ export type ChainStage =
    * `mode`（listjs1027，只出现在列表字段的链里）：该段在 legado 里的解析模式——SourceRule 按段前缀与**原页面**是否
    * JSON 定，不看 JS 产出的文本长什么样：`json` = `$.`/`$[`/`@Json:`；`html` = `@CSS:`/`@@`/`@XPath:`/`/`（强制 jsoup/XPath）；
    * `default` = 无前缀（原页面是 JSON 时按 Json 模式）。见 evaluate.ts listChainScopes。
+   * `nullSkip`（nullskip1029，ENGINE_SYNTAX_NULL_SKIP，只出现在字符串字段的链里）：该段在 HTML 作用域上取空 = legado getString 的
+   * null，整条链得空（见 parse.ts nullSkipStage、evaluate.ts evaluateChain）。
    */
-  | { kind: 'rule'; field: FieldIr; mode?: 'json' | 'html' | 'default' }
+  | { kind: 'rule'; field: FieldIr; mode?: 'json' | 'html' | 'default'; nullSkip?: true }
   /**
    * `template` / `regex`（jsext1028，ENGINE_SYNTAX_JS_EXT）：legado SourceRule.makeUpRule 对 JS 段的改写。`template` = 段内
    * `{{}}` 切出的片段，求值时拼回代码后再按 `##` 切（此时 code 是段原文，只作预算键）；无 `{{}}` 时编译期已切好，

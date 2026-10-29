@@ -29,6 +29,7 @@ import {
   engineSyntaxJsGetEnabled, engineSyntaxJsonPathEnabled, engineSyntaxJsUtilEnabled, engineSyntaxListJsEnabled, engineSyntaxOrEnabled,
   engineSyntaxRegexEnabled, engineSyntaxXPathEnabled, engineSyntaxXPathEvalEnabled, engineInitJsActive, engineSyntaxJsoupEnabled,
   engineSyntaxBookFieldsEnabled, engineSyntaxListGetEnabled, engineSyntaxInitJsoupEnabled, engineFieldNetJsEnabled,
+  engineSyntaxNullSkipEnabled,
 } from './syntax-flags';
 import { compileXPath, XPathSyntaxError } from './xpath-eval';
 import { looksLikeXPath, xpathPrefixed, xpathSegmentBody, xpathToCss } from './xpath-subset';
@@ -689,6 +690,10 @@ export interface ParseOptions {
    * 只由 parseJsChain 在 JS_EXT 同开时给规则段传；列表字段、含顶层 `&&`、剩余支有 XPath 时不跳。缺省 = 空支照旧拒。
    */
   emptyOrBranches?: boolean;
+  /**
+   * nullskip1029：JS 链的规则段按 legado getString 的 null 口径中止（ENGINE_SYNTAX_NULL_SKIP，见 nullSkipStage）。默认读 env（缺失=off）。
+   */
+  nullSkipEnabled?: boolean;
 }
 
 /**
@@ -1087,6 +1092,35 @@ const JS_BANNED_IDENTIFIERS: ReadonlySet<string> = new Set([
 ]);
 
 /**
+ * nullskip1029：legado 用 AnalyzeRule.getString（非 isUrl）取的字符串字段（BookList / BookInfo / BookChapterList / BookContent）。
+ * isUrl 的 bookUrl/tocUrl 走 getString0（取空得 ""），kind/downloadUrls/nextTocUrl/nextContentUrl 走 getStringList，init 走
+ * getElement——都不按 null 中止，不在表内。
+ */
+const NULL_SKIP_FIELDS: ReadonlySet<string> = new Set([
+  ...['ruleSearch', 'ruleExplore', 'ruleBookInfo'].flatMap((group) =>
+    ['name', 'author', 'wordCount', 'lastChapter', 'intro', 'coverUrl'].map((name) => `${group}.${name}`)),
+  'ruleToc.chapterName', 'ruleToc.chapterUrl', 'ruleToc.updateTime', 'ruleToc.isVolume', 'ruleToc.isVip', 'ruleToc.isPay',
+  'ruleContent.content', 'ruleContent.title',
+]);
+
+/**
+ * nullskip1029：JS 链规则段取空能否按 legado null 中止。段须是 Default 模式（无前缀或 `@CSS:`/`@@`；`@Json:`/`$.`/`$[`/`@XPath:`/`/`/`:`
+ * 各有自己的取空口径），且编译成 AnalyzeByJSoup.getString 的形态：单条或 `||`/`&&` 组合的 CSS、末端不是 `@all`（`@all` 空表也
+ * 产出 outerHtml，legado 得 "" 照旧往下跑）、没有 makeUp / `%%`。其余末端（含无末端）legado 只收非空值，取空即空表 → null。
+ * 段尾 `##` 替换不挡：legado 对 null 不做替换（求值期按替换后为空判，替换把空串变非空的少见情形照旧口径）。原页面是否 JSON
+ * （isJSON 时 Default 段走 JSONPath）由求值期看作用域定。
+ */
+function nullSkipStage(segment: string, stage: ChainStage): boolean {
+  if (stage.kind !== 'rule' || /^(@json:|@xpath:|\$\.|\$\[|\/|:)/i.test(segment)) return false;
+  const { field } = stage;
+  if (field.chain || field.makeUp || field.joins || field.concats || field.objectKey || field.rules.length === 0) return false;
+  const soupString = (ir: RuleIr): boolean => ir.kind === 'css'
+    ? ir.terminal?.op !== 'all'
+    : (ir.kind === 'or' || ir.kind === 'and') && ir.branches.every(soupString);
+  return field.rules.every(soupString);
+}
+
+/**
  * 含 JS 段的字段 → legado 链式 FieldIr（AnalyzeRule.splitSourceRule 的切法：JS 段原样、非 JS 段 trim 后为空即丢）。
  * 非 JS 段各自按普通规则编译（含 ## 尾缀/||，开关同外层）；剥掉 ## 后主体为空的段成为只做替换的 regex 段。
  * 求值见 evaluate.ts evaluateChain。
@@ -1112,6 +1146,8 @@ function parseJsChain(trimmed: string, rule: string, options: ParseOptions): Fie
   const util: JsUtil | undefined = (options.jsUtilEnabled ?? engineSyntaxJsUtilEnabled()) ? { used: false } : undefined;
   // andor1029：JS_EXT 同开时规则段按所在字段收 `&&`、跳过 `||` 空支（legado 链里每段 SourceRule 同样走 splitRule）。
   const ruleOptions: ParseOptions = jsExt ? { ...segmentOptions, andEnabled: options.andEnabled, andField: field, emptyOrBranches: true } : segmentOptions;
+  // nullskip1029：只挂 legado 走 getString（非 isUrl）的字段。
+  const nullSkip = NULL_SKIP_FIELDS.has(field) && (options.nullSkipEnabled ?? engineSyntaxNullSkipEnabled());
   const chain: ChainStage[] = [];
   const pushRule = (text: string) => {
     const segment = text.trim();
@@ -1121,7 +1157,8 @@ function parseJsChain(trimmed: string, rule: string, options: ParseOptions): Fie
       chain.push({ kind: 'regex', regex: stripRegexSuffix(segment, rule, regexEnabled).regex });
       return;
     }
-    chain.push({ kind: 'rule', field: parseFieldRule(segment, ruleOptions) });
+    const stage: ChainStage = { kind: 'rule', field: parseFieldRule(segment, ruleOptions) };
+    chain.push(nullSkip && nullSkipStage(segment, stage) ? { ...stage, nullSkip: true } : stage);
   };
   let last = 0;
   for (const match of trimmed.matchAll(JS_SEGMENT_RE)) {

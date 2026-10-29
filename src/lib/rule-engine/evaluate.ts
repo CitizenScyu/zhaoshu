@@ -1234,6 +1234,8 @@ function evaluateChain(
     if (stage.kind === 'rule') {
       const stageScope = value === undefined ? scope : rescope(joinLines(value), scope);
       value = list ? splitLines(evaluateField(stage.field, stageScope, true)) : evaluateField(stage.field, stageScope, multi);
+      // nullskip1029：legado getString 的 null（`result ?: continue`），余下各段不跑。isJSON 页上 Default 段走 JSONPath，取空得 ""。
+      if (stage.nullSkip && !list && scope.kind === 'html' && value === '') return null;
       continue;
     }
     const input = value ?? scope.source ?? (stage.kind === 'js' && stage.detached ? '' : undefined);
@@ -1275,6 +1277,7 @@ function evaluateJsoupChain(field: FieldIr, chain: readonly ChainStage[], scope:
     if (stage.kind === 'rule') {
       const stageScope = value === undefined ? scope : rescope(joinLines(value), scope);
       value = list ? splitLines(evaluateField(stage.field, stageScope, true)) : evaluateField(stage.field, stageScope, multi);
+      if (stage.nullSkip && !list && scope.kind === 'html' && value === '') return null; // nullskip1029，同 evaluateChain
       continue;
     }
     const element = value === undefined ? item : undefined;
