@@ -347,8 +347,8 @@ function execute<T>(
   code: string, bindings: JsBindings, exporter: (context: QuickJSContext, handle: QuickJSHandle) => T | null,
   budgetKey = code, session?: JsoupSession,
 ): T | null {
-  const module = ready;
-  if (!module) return evalFailed('JS 沙箱未就绪');
+  const wasm = ready;
+  if (!wasm) return evalFailed('JS 沙箱未就绪');
   // 首段 result 就是 src（installGlobals 复用同一句柄），只计一次。
   const results = typeof bindings.result === 'string'
     ? (bindings.result === bindings.src ? [] : [bindings.result])
@@ -362,7 +362,7 @@ function execute<T>(
   const startedPrecise = performance.now();
   checkBudget(budgetKey, started);
   try {
-    return runInFreshRuntime(module, code, bindings, started + EVAL_DEADLINE_MS, exporter, session);
+    return runInFreshRuntime(wasm, code, bindings, started + EVAL_DEADLINE_MS, exporter, session);
   } catch (error) {
     if (error instanceof RuleEngineError) throw error;
     discardModule();
