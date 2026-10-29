@@ -4,6 +4,7 @@
 
 import {
   ChainStage,
+  CssIndexItem,
   CssStep,
   FieldIr,
   JS_JAVA_HELPERS,
@@ -30,6 +31,7 @@ import {
   engineSyntaxRegexEnabled, engineSyntaxXPathEnabled, engineSyntaxXPathEvalEnabled, engineInitJsActive, engineSyntaxJsoupEnabled,
   engineSyntaxBookFieldsEnabled, engineSyntaxListGetEnabled, engineSyntaxInitJsoupEnabled, engineFieldNetJsEnabled,
   engineSyntaxNullSkipEnabled, engineSyntaxPageDetachedEnabled, engineSyntaxLastAttrEnabled, engineSyntaxNextListEnabled,
+  engineSyntaxRulePrefixEnabled, engineSyntaxTemplateHashEnabled, engineSyntaxBracketIndexEnabled,
 } from './syntax-flags';
 import { compileXPath, XPathSyntaxError } from './xpath-eval';
 import { looksLikeXPath, xpathPrefixed, xpathSegmentBody, xpathToCss } from './xpath-subset';
@@ -70,6 +72,12 @@ let jsObjectKeys = false;
 let lastAttr = false;
 /** lastattr1029：buildCssChain 按末段裸名编出 attr 终端的累计次数——next* 字段据此标 nextList（legado getStringList 口径）。 */
 let lastAttrHits = 0;
+
+/**
+ * 当前 parseFieldRule 帧是否按 bracket1029 认 legado `[…]` 索引（ParseOptions.bracketIndexEnabled，见 legadoIndexSet）。
+ * 嵌套解析经选项透传同口径。
+ */
+let bracketIndex = false;
 
 /**
  * fieldnet1029：可放行 `java.ajax` 的字段——页面级、取书链路必需的那几个（每页求值一次，取页次数有界）。条目级字段（如
@@ -368,7 +376,14 @@ function translateStep(raw: string, rule: string): CssStep {
   }
 
   // 逐 token 处理 class./id./tag. 与索引/排除后缀。先剥后缀（!排除、.数字索引/切片）。
-  s = extractSuffixes(s, step, rule);
+  // bracket1029：legado `[…]` 索引写法与 `.n`/`!n` 二选一（findIndexSet 的 head 分支），认出即不再剥其余后缀。
+  const indexed = bracketIndex && !/\[!([-\d,]+)\]\s*$/.test(s) ? legadoIndexSet(s) : null;
+  if (indexed) {
+    step.indexSet = indexed.set;
+    s = indexed.before;
+  } else {
+    s = extractSuffixes(s, step, rule);
+  }
 
   // 关键字翻译
   s = s
@@ -411,6 +426,71 @@ function extractSuffixes(s: string, step: CssStep, rule: string): string {
   }
   void rule;
   return s;
+}
+
+/**
+ * bracket1029：逐字移植 legado AnalyzeByJSoup.ElementsSingle.findIndexSet 的 `[…]` 分支——自尾向前读，`,` 分项、`:` 分区间端点与步长
+ * （`a:b:c` = 起、止、步），`!` 紧贴 `[` 为排除；遇到非索引字符（如 CSS 属性选择器 `[class="a"]`）即不是索引写法，返回 null（整段照旧
+ * 当选择器）。前置规则为空（legado 等价 children）、步长省略（legado 抛空指针）也返回 null，不改口径。项按书写顺序返回。
+ */
+export function legadoIndexSet(raw: string): { before: string; set: { exclude: boolean; items: CssIndexItem[] } } | null {
+  const rus = raw.trim();
+  if (!rus.endsWith(']')) return null;
+  const items: CssIndexItem[] = [];
+  const curList: (number | null)[] = [];
+  let digits = '';
+  let minus = false;
+  let exclude = false;
+  for (let i = rus.length - 2; i >= 0; i -= 1) {
+    let ch = rus[i];
+    if (ch === ' ') continue;
+    if (ch >= '0' && ch <= '9') {
+      digits = ch + digits;
+      continue;
+    }
+    if (ch === '-') {
+      minus = true;
+      continue;
+    }
+    const cur = digits === '' ? null : (minus ? -Number(digits) : Number(digits));
+    if (ch === ':') {
+      curList.push(cur);
+    } else {
+      if (curList.length === 0) {
+        if (cur === null) return null;
+        items.push(cur);
+      } else {
+        const step = curList.length === 2 ? curList[0] : 1;
+        if (step === null) return null;
+        items.push([cur, curList[curList.length - 1], step]);
+        curList.length = 0;
+      }
+      if (ch === '!') {
+        exclude = true;
+        do {
+          i -= 1;
+          ch = rus[i];
+        } while (i > 0 && ch === ' ');
+      }
+      if (ch === '[') {
+        const before = rus.slice(0, i).trim();
+        return before === '' ? null : { before, set: { exclude, items: items.reverse() } };
+      }
+      if (ch !== ',') return null;
+    }
+    digits = '';
+    minus = false;
+  }
+  return null;
+}
+
+/**
+ * 规则文本里是否可能有 bracket1029 改口径的 `[…]` 索引段（compile.ts sourceUsesBracketIndexSyntax 的语义位判据，宁多勿漏）：
+ * 非 JSONPath/XPath/`@css:` 规则按 `||`/`&&`/`%%`/`@` 切段（先剥 `##` 尾缀），任一段 legadoIndexSet 认得。
+ */
+export function ruleMayUseBracketIndex(rule: string): boolean {
+  if (/^\s*(?:\$|@json:|@css:|@xpath:|\/)/i.test(rule)) return false;
+  return rule.split('##')[0].split(/\|\||&&|%%|@/).some((seg) => legadoIndexSet(seg) !== null);
 }
 
 /** :contains(X) 里的文本转义（去掉可能破坏 css-select 的引号/括号）。 */
@@ -629,6 +709,46 @@ export function ruleMayUseLastAttr(rule: string): boolean {
   return false;
 }
 
+/**
+ * prefix1029：legado AnalyzeRule.SourceRule 构造按忽略大小写的前缀判模式——`@CSS:` 留在文本里交 AnalyzeByJSoup（同样忽略大小写），
+ * `@Json:` 剥掉后整条走 AnalyzeByJSonPath：splitRule 切出的各支交 Jayway，不以 `$`/`@` 开头的路径由 Jayway 补 `$.`。
+ * 这里把非小写 `@CSS:` 规范成解析器认的 `@css:`；`@Json:` 剥掉、`||`/`&&` 各支补成显式 `$` 路径（`[` 开头补 `$`），`##` 尾缀原样。
+ * 不收（原样返回，同 off）：剥后为空、含 `{`（`{$.}` 内嵌/模板）/`%%`/`@put`/`@get`、支为空或以 `@` 开头（Jayway 求值上下文）。
+ */
+export function normalizeRulePrefix(rule: string): string {
+  const css = /^@css:/i.exec(rule);
+  if (css) return css[0] === '@css:' ? rule : `@css:${rule.slice(5)}`;
+  if (!/^@json:/i.test(rule)) return rule;
+  const rest = rule.slice(6).trim();
+  if (rest === '' || rest.includes('{') || rest.includes('%%') || /@(?:put|get):/i.test(rest)) return rule;
+  const hash = rest.indexOf('##');
+  const body = hash < 0 ? rest : rest.slice(0, hash);
+  const tail = hash < 0 ? '' : rest.slice(hash);
+  const op = tokenizeOrBranches(body).length > 1 ? '||' : '&&';
+  const parts = tokenizeTopLevel(body, op).map((part) => part.trim());
+  if (parts.some((part) => part === '' || part.startsWith('@'))) return rule;
+  return parts.map((part) => (part.startsWith('$') ? part : part.startsWith('[') ? `$${part}` : `$.${part}`)).join(op) + tail;
+}
+
+/**
+ * 规则文本里是否可能有 prefix1029 改口径的前缀（compile.ts sourceUsesRulePrefixSyntax 的语义位判据）：任意大小写 `@json:`，
+ * 或非小写的 `@css:`。只看子串、宁宽勿漏（JS 链段的前缀也在串中）。
+ */
+export function ruleMayUseRulePrefix(rule: string): boolean {
+  return /@json:/i.test(rule) || [...rule.matchAll(/@css:/gi)].some((m) => m[0] !== '@css:');
+}
+
+/**
+ * tplhash1029：首个 `##` 落在某个 `{{…}}` 里（其前最近的 `{{` 在它之后才闭合）。legado 先切模板再 `split("##")`，这种规则的
+ * `##` 归内层规则；旧路径字段级先剥尾缀会把模板切开。也是 compile.ts sourceUsesTemplateHashSyntax 的语义位判据。
+ */
+export function ruleHashInTemplate(rule: string): boolean {
+  const hash = rule.indexOf('##');
+  if (hash < 0) return false;
+  const open = rule.lastIndexOf('{{', hash);
+  return open >= 0 && rule.indexOf('}}', open) > hash;
+}
+
 // ---- 顶层入口 ----
 /**
  * 编译一条字段规则文本为 FieldIr。
@@ -779,6 +899,20 @@ export interface ParseOptions {
    * nextlist1029：翻页字段的非链 CSS 规则按 legado getStringList 取全部值（ENGINE_SYNTAX_NEXT_LIST，见 nextListShape）。默认读 env（缺失=off）。
    */
   nextListEnabled?: boolean;
+  /**
+   * prefix1029：`@Json:`（任意大小写）/非小写 `@CSS:` 前缀按 legado SourceRule 口径归一（ENGINE_SYNTAX_RULE_PREFIX，见 normalizeRulePrefix）。
+   * 默认读 env（缺失=off）。
+   */
+  rulePrefixEnabled?: boolean;
+  /**
+   * tplhash1029：SELF_FIELDS 非 JS 规则首个 `##` 落在 `{{…}}` 内时走 legado makeUp（ENGINE_SYNTAX_TEMPLATE_HASH，见 ruleHashInTemplate）。
+   * 默认读 env（缺失=off）。
+   */
+  templateHashEnabled?: boolean;
+  /**
+   * bracket1029：默认语法段末 legado `[…]` 索引（ENGINE_SYNTAX_BRACKET_INDEX，见 legadoIndexSet）。默认读 env（缺失=off）。
+   */
+  bracketIndexEnabled?: boolean;
 }
 
 /**
@@ -802,9 +936,11 @@ function parseFieldRuleFramed(rule: string, options: ParseOptions): FieldIr {
   const savedSource = sourceFrame;
   const savedKeys = jsObjectKeys;
   const savedLastAttr = lastAttr;
+  const savedBracket = bracketIndex;
   jsonPathExt = options.jsonPathEnabled ?? engineSyntaxJsonPathEnabled();
   jsObjectKeys = bindActive(options);
   lastAttr = lastAttrActive(options);
+  bracketIndex = options.bracketIndexEnabled ?? engineSyntaxBracketIndexEnabled();
   sourceFrame = options.sourceConsts ?? sourceFrame;
   varBag = options.varBag;
   jsoupFrame = undefined;
@@ -871,6 +1007,7 @@ function parseFieldRuleFramed(rule: string, options: ParseOptions): FieldIr {
     sourceFrame = savedSource;
     jsObjectKeys = savedKeys;
     lastAttr = savedLastAttr;
+    bracketIndex = savedBracket;
   }
 }
 
@@ -900,6 +1037,7 @@ function jsSegmentOptions(options: ParseOptions): ParseOptions {
   return {
     orEnabled: options.orEnabled, xpathEnabled: options.xpathEnabled, xpathEvalEnabled: options.xpathEvalEnabled, jsEnabled: false,
     regexEnabled: options.regexEnabled ?? engineSyntaxRegexEnabled(), jsonPathEnabled: options.jsonPathEnabled,
+    rulePrefixEnabled: options.rulePrefixEnabled, bracketIndexEnabled: options.bracketIndexEnabled,
   };
 }
 
@@ -926,12 +1064,19 @@ function parseFieldRuleText(rule: string, options: ParseOptions): FieldIr {
     }
     return parseJsChain(trimmed, rule, options);
   }
+  // prefix1029：legado 前缀忽略大小写（JS 链的规则段经 parseJsChain 回到这里，同样归一）。归一后不再带可归一的前缀，只递归一次。
+  if (options.rulePrefixEnabled ?? engineSyntaxRulePrefixEnabled()) {
+    const normalized = normalizeRulePrefix(trimmed);
+    if (normalized !== trimmed) return parseFieldRuleText(normalized, options);
+  }
   if (trimmed.length > MAX_RULE_LENGTH) unsupported('规则过长', rule, { code: 'rule_too_long' });
 
   // bind1028：旧路径拒收的 `{{}}` 才改走 legado makeUp，旧路径收得下的模板（`{{$.x}}`/`{{baseUrl}}`）两态同路。
   // varbag1028：目录字段在变量袋 get 模式下，含 `@get:{}` 的规则同走 makeUp（legado evalPattern 把 @get 与 {{}} 一起切）。
+  // tplhash1029：首个 `##` 在模板里的同走 makeUp（旧路径先剥尾缀会把模板切开）。
   if (options.field !== undefined && SELF_FIELDS.has(options.field)
-    && ((trimmed.includes('{{') && bindActive(options) && templatesRejected(trimmed)) || (varBag?.mode === 'get' && /@get:\{/i.test(trimmed)))) {
+    && ((trimmed.includes('{{') && bindActive(options) && templatesRejected(trimmed)) || (varBag?.mode === 'get' && /@get:\{/i.test(trimmed))
+      || ((options.templateHashEnabled ?? engineSyntaxTemplateHashEnabled()) && ruleHashInTemplate(trimmed)))) {
     return parseMakeUpField(trimmed, rule, options);
   }
 
@@ -1236,7 +1381,8 @@ function parseJsChain(trimmed: string, rule: string, options: ParseOptions): Fie
   const binds = (options.jsBindEnabled ?? engineSyntaxJsBindEnabled()) ? fieldBinds(field) : undefined;
   const segmentOptions: ParseOptions = {
     orEnabled: options.orEnabled, xpathEnabled: options.xpathEnabled, xpathEvalEnabled: options.xpathEvalEnabled, jsEnabled: false,
-    regexEnabled, jsonPathEnabled: options.jsonPathEnabled,
+    regexEnabled, jsonPathEnabled: options.jsonPathEnabled, rulePrefixEnabled: options.rulePrefixEnabled,
+    bracketIndexEnabled: options.bracketIndexEnabled,
   };
   const gets: JsGets | undefined = (options.jsGetEnabled ?? engineSyntaxJsGetEnabled())
     ? { options: segmentOptions, out: new Map(), aliases: initJs } : undefined;
@@ -1338,6 +1484,7 @@ function parseListJsChain(rule: string, options: ParseOptions): FieldIr {
       options: {
         orEnabled: options.orEnabled, xpathEnabled: options.xpathEnabled, xpathEvalEnabled: options.xpathEvalEnabled, jsEnabled: false,
         regexEnabled: options.regexEnabled ?? engineSyntaxRegexEnabled(), jsonPathEnabled: options.jsonPathEnabled,
+        rulePrefixEnabled: options.rulePrefixEnabled, bracketIndexEnabled: options.bracketIndexEnabled,
       },
       out: new Map(),
     }

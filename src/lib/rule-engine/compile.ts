@@ -13,7 +13,7 @@ import { engineSearchJsActive, engineSearchOptionsActive } from './compile-smoke
 import { AIO_LIST_FIELDS, aioGroups } from './aio-syntax';
 import {
   FIELD_NET_FIELDS, initFieldSupported, initJsFieldSupported, initRuleTextSupported, jsChainFieldAllowed, listJsGroups, objectKeyOf, parseFieldRule,
-  ruleHasJs, ruleMayUseLastAttr, type ParseOptions, type SourceConsts,
+  ruleHasJs, ruleHashInTemplate, ruleMayUseBracketIndex, ruleMayUseLastAttr, ruleMayUseRulePrefix, type ParseOptions, type SourceConsts,
 } from './parse';
 import type { CompiledRules, FieldIr, RuleIr } from './types';
 import { analyzeJsLib, jsLibRuleProblem, type JsLib } from './js-lib';
@@ -25,6 +25,7 @@ import {
   engineSyntaxBookFieldsEnabled, engineSyntaxSearchVarsEnabled, engineSyntaxItemVarsEnabled, engineSyntaxListGetEnabled, ENGINE_SEMANTICS_VERSION,
   engineSyntaxBookVariableEnabled, engineSyntaxJsLibEnabled, engineSyntaxSourceBindEnabled, engineSyntaxInitJsoupEnabled, engineSearchNetJsEnabled,
   engineFieldNetJsEnabled, engineSearchConnectJsEnabled, engineSearchGetPostJsEnabled, engineSyntaxLastAttrEnabled,
+  engineSyntaxRulePrefixEnabled, engineSyntaxTemplateHashEnabled, engineSyntaxBracketIndexEnabled,
 } from './syntax-flags';
 import { urlOptionFields } from './url-options';
 import {
@@ -130,6 +131,12 @@ export function engineVersionedKey(contentRevision: string, semanticsVersion = E
  * 再加 java.get/post 位（+17179869184）。
  * lastattr1029：ENGINE_SYNTAX_LAST_ATTR on 且准入搜索判定读的 ruleSearch.name/author/bookUrl 里可能有末段裸名（sourceUsesLastAttrSyntax）
  * 时再加末段裸名位（+34359738368）；其余字段只改求值，不计位（同 nullskip1029）。
+ * prefix1029：ENGINE_SYNTAX_RULE_PREFIX on 且准入搜索判定读的 ruleSearch.bookList/name/author/bookUrl 里可能有 `@Json:`/非小写 `@CSS:`
+ * 前缀（sourceUsesRulePrefixSyntax）时再加规则前缀位（+68719476736）；其余字段同 lastattr1029 只改求值、不计位。
+ * tplhash1029：ENGINE_SYNTAX_TEMPLATE_HASH on 且准入搜索判定读的 ruleSearch.name/author/bookUrl 首个 `##` 落在 `{{…}}` 内
+ * （sourceUsesTemplateHashSyntax）时再加模板内 ## 位（+137438953472）；其余字段同上不计位。
+ * bracket1029：ENGINE_SYNTAX_BRACKET_INDEX on 且准入搜索判定读的 ruleSearch.bookList/name/author/bookUrl 里可能有 legado `[…]` 索引段
+ * （sourceUsesBracketIndexSyntax）时再加 [索引] 位（+274877906944）；其余字段同上不计位。
  */
 export function engineSourceRevision(
   source: { url: string; searchUrl: unknown; rules: Record<string, unknown> },
@@ -288,6 +295,9 @@ export function engineSourceRevision(
     searchNet((options.searchConnectJsEnabled ?? engineSearchConnectJsEnabled()) && searchTemplateUsesConnect(source.searchUrl)),
     searchNet((options.searchGetPostJsEnabled ?? engineSearchGetPostJsEnabled()) && searchTemplateUsesGetPost(source.searchUrl)),
     (options.lastAttrEnabled ?? engineSyntaxLastAttrEnabled()) && sourceUsesLastAttrSyntax(rules),
+    (options.rulePrefixEnabled ?? engineSyntaxRulePrefixEnabled()) && sourceUsesRulePrefixSyntax(rules),
+    (options.templateHashEnabled ?? engineSyntaxTemplateHashEnabled()) && sourceUsesTemplateHashSyntax(rules),
+    (options.bracketIndexEnabled ?? engineSyntaxBracketIndexEnabled()) && sourceUsesBracketIndexSyntax(rules),
   ));
 }
 
@@ -329,6 +339,45 @@ export function sourceUsesLastAttrSyntax(rules: Record<string, unknown>): boolea
   return ['name', 'author', 'bookUrl'].some((key) => {
     const rule = (search as Record<string, unknown>)[key];
     return typeof rule === 'string' && ruleMayUseLastAttr(rule);
+  });
+}
+
+/**
+ * 准入搜索判定读的 ruleSearch.bookList/name/author/bookUrl 里是否可能有 prefix1029 改口径的前缀（口径见 parse.ts ruleMayUseRulePrefix；
+ * 理由同 sourceUsesOrSyntax）。
+ */
+export function sourceUsesRulePrefixSyntax(rules: Record<string, unknown>): boolean {
+  const search = rules.ruleSearch;
+  if (!search || typeof search !== 'object' || Array.isArray(search)) return false;
+  return ['bookList', 'name', 'author', 'bookUrl'].some((key) => {
+    const rule = (search as Record<string, unknown>)[key];
+    return typeof rule === 'string' && ruleMayUseRulePrefix(rule);
+  });
+}
+
+/**
+ * 准入搜索判定读的 ruleSearch.bookList/name/author/bookUrl 里是否可能有 bracket1029 改口径的 `[…]` 索引段（口径见 parse.ts
+ * ruleMayUseBracketIndex；理由同 sourceUsesOrSyntax）。
+ */
+export function sourceUsesBracketIndexSyntax(rules: Record<string, unknown>): boolean {
+  const search = rules.ruleSearch;
+  if (!search || typeof search !== 'object' || Array.isArray(search)) return false;
+  return ['bookList', 'name', 'author', 'bookUrl'].some((key) => {
+    const rule = (search as Record<string, unknown>)[key];
+    return typeof rule === 'string' && ruleMayUseBracketIndex(rule);
+  });
+}
+
+/**
+ * 准入搜索判定读的 ruleSearch.name/author/bookUrl 里是否有首个 `##` 落在模板内的规则（tplhash1029，口径见 parse.ts ruleHashInTemplate；
+ * 只有 SELF_FIELDS 改走 makeUp，bookList 不在其中）。
+ */
+export function sourceUsesTemplateHashSyntax(rules: Record<string, unknown>): boolean {
+  const search = rules.ruleSearch;
+  if (!search || typeof search !== 'object' || Array.isArray(search)) return false;
+  return ['name', 'author', 'bookUrl'].some((key) => {
+    const rule = (search as Record<string, unknown>)[key];
+    return typeof rule === 'string' && ruleHashInTemplate(rule);
   });
 }
 

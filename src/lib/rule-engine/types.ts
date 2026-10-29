@@ -46,7 +46,15 @@ export interface CssStep {
    * 剔除「文本在子孙而非自身」的假命中（legado text. 语义，§3.2）。
    */
   ownTextContains?: string;
+  /**
+   * bracket1029：legado `[…]` 索引集（ElementsSingle.findIndexSet，ENGINE_SYNTAX_BRACKET_INDEX on 才产出）。`exclude` = `[!…]`；
+   * 项按书写顺序，单个下标或 `[start, end, step]` 闭区间（端点 null = 省略）。
+   */
+  indexSet?: { exclude: boolean; items: CssIndexItem[] };
 }
+
+/** bracket1029：索引集的一项。 */
+export type CssIndexItem = number | [number | null, number | null, number];
 
 /**
  * 末端操作符。对齐 legado AnalyzeByDefault：

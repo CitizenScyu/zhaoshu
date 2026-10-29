@@ -4,7 +4,7 @@
 
 import type { AnyNode, Element, Text } from 'domhandler';
 import type { Cheerio, CheerioAPI } from 'cheerio';
-import { type CssStep, RuleEngineError, type TerminalOp } from './types';
+import { type CssIndexItem, type CssStep, RuleEngineError, type TerminalOp } from './types';
 
 export type HtmlNode = AnyNode;
 export type CheerioNodes = Cheerio<AnyNode>;
@@ -171,7 +171,7 @@ export function evaluateCssChain(
  * 单段求值（§3.2 四步）：
  * 1) `scope.find(selector)`（首段的 scope 是 document 级）；
  * 2) `text.` 关键字的 ownText 复核（剔除「文本在子孙而非自身」的假命中）；
- * 3) excludes（负数从尾）→ index（负数从尾）→ slice。
+ * 3) excludes（负数从尾）→ index（负数从尾）→ slice；bracket1029 的 `[…]` 索引集与三者互斥（legadoIndexes）。
  */
 export function runStep($: CheerioAPI, scope: CheerioNodes, step: CssStep): CheerioNodes {
   let nodes: CheerioNodes;
@@ -185,6 +185,14 @@ export function runStep($: CheerioAPI, scope: CheerioNodes, step: CssStep): Chee
     nodes = nodes.filter((_index, node) => ownTextOf(node).includes(keyword));
   }
   let list = nodes.toArray();
+  if (step.indexSet !== undefined) {
+    const picked = legadoIndexes(step.indexSet.items, list.length);
+    if (step.indexSet.exclude) {
+      const drop = new Set(picked);
+      return $(list.filter((_node, index) => !drop.has(index)));
+    }
+    return $(picked.map((index) => list[index]));
+  }
   if (step.excludes !== undefined && step.excludes.length > 0) {
     const drop = new Set(step.excludes.map((raw) => (raw < 0 ? list.length + raw : raw)));
     list = list.filter((_node, index) => !drop.has(index));
@@ -198,4 +206,37 @@ export function runStep($: CheerioAPI, scope: CheerioNodes, step: CssStep): Chee
     list = list.slice(norm(start), norm(end));
   }
   return $(list);
+}
+
+/**
+ * bracket1029：legado ElementsSingle.getElementsSingle 的 `[…]` 下标展开——单个下标越界即丢、负数从尾；区间闭区间，端点省略 = 0 / len-1，
+ * 两端同侧越界整项丢、单侧越界钳到边，`start == end` 或步长 ≥ len 只取 start，步长 ≤ 0 时加 len（仍 ≤ 0 取 1），`end < start` 反向。
+ * 去重保首次出现的顺序。空列表直接空（legado 此时区间项会越界抛错，结果同为无节点）。
+ */
+export function legadoIndexes(items: readonly CssIndexItem[], len: number): number[] {
+  const out = new Set<number>();
+  if (len === 0) return [];
+  for (const item of items) {
+    if (typeof item === 'number') {
+      if (item >= 0 && item < len) out.add(item);
+      else if (item < 0 && len >= -item) out.add(item + len);
+      continue;
+    }
+    const [startX, endX, stepX] = item;
+    let start = startX ?? 0;
+    if (start < 0) start += len;
+    let end = endX ?? len - 1;
+    if (end < 0) end += len;
+    if ((start < 0 && end < 0) || (start >= len && end >= len)) continue;
+    start = start >= len ? len - 1 : Math.max(start, 0);
+    end = end >= len ? len - 1 : Math.max(end, 0);
+    if (start === end || stepX >= len) {
+      out.add(start);
+      continue;
+    }
+    const step = stepX > 0 ? stepX : -stepX < len ? stepX + len : 1;
+    if (end > start) for (let index = start; index <= end; index += step) out.add(index);
+    else for (let index = start; index >= end; index -= step) out.add(index);
+  }
+  return [...out];
 }

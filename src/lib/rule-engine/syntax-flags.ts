@@ -23,7 +23,7 @@ export const ENGINE_SEMANTICS_XPATH_BIT = 2;
 /** vars1027：@put/@get 静态子集语义位。版本再 +4（5–8 = 含变量位的四种组合），1–4 逐字不变。 */
 export const ENGINE_SEMANTICS_VARS_BIT = 4;
 
-/** 语义版本随 || / XPath / 变量 / JS / XPath 求值 / 正则 / && / AllInOne / 搜索 JS / 列表 JS / JS 扩展 / 宿主绑定 / java.getString / 加解密帮手 / JSONPath 扩展 / 详情 init / 搜索选项 legado 口径 / URL 字段选项 / 搜索 webView / 详情 JS init / 详情→目录变量袋 / jsoup 直连 / 书籍成员 / 搜索 URL→搜索字段变量袋 / 搜索条目袋 / 列表 JS getter / 书籍变量 / jsLib / 书源常量 / jsoup JS init / 搜索联网 JS / 字段联网 JS / 搜索 java.connect / 搜索 java.get·post / 末段裸名属性开关联动（唯一口径，供 compile.ts 缓存键与 rulesHash 复用）。 */
+/** 语义版本随 || / XPath / 变量 / JS / XPath 求值 / 正则 / && / AllInOne / 搜索 JS / 列表 JS / JS 扩展 / 宿主绑定 / java.getString / 加解密帮手 / JSONPath 扩展 / 详情 init / 搜索选项 legado 口径 / URL 字段选项 / 搜索 webView / 详情 JS init / 详情→目录变量袋 / jsoup 直连 / 书籍成员 / 搜索 URL→搜索字段变量袋 / 搜索条目袋 / 列表 JS getter / 书籍变量 / jsLib / 书源常量 / jsoup JS init / 搜索联网 JS / 字段联网 JS / 搜索 java.connect / 搜索 java.get·post / 末段裸名属性 / 规则前缀大小写 / 模板内 ## / [索引] 开关联动（唯一口径，供 compile.ts 缓存键与 rulesHash 复用）。 */
 export function engineSemanticsVersion(
   orEnabled: boolean, xpathEnabled = false, varsEnabled = false, jsEnabled = false, xpathEvalEnabled = false,
   regexEnabled = false, andEnabled = false, aioEnabled = false, searchJsEnabled = false, listJsEnabled = false,
@@ -32,7 +32,7 @@ export function engineSemanticsVersion(
   varBagEnabled = false, jsoupEnabled = false, bookFieldsEnabled = false, searchVarsEnabled = false, itemVarsEnabled = false,
   listGetEnabled = false, bookVariableEnabled = false, jsLibEnabled = false, sourceBindEnabled = false, initJsoupEnabled = false,
   searchNetJsEnabled = false, fieldNetJsEnabled = false, searchConnectJsEnabled = false, searchGetPostJsEnabled = false,
-  lastAttrEnabled = false,
+  lastAttrEnabled = false, rulePrefixEnabled = false, templateHashEnabled = false, bracketIndexEnabled = false,
 ): number {
   return (orEnabled ? ENGINE_SEMANTICS_VERSION_OR : ENGINE_SEMANTICS_VERSION)
     + (xpathEnabled ? ENGINE_SEMANTICS_XPATH_BIT : 0) + (varsEnabled ? ENGINE_SEMANTICS_VARS_BIT : 0)
@@ -52,7 +52,8 @@ export function engineSemanticsVersion(
     + (initJsoupEnabled ? ENGINE_SEMANTICS_INIT_JSOUP_BIT : 0) + (searchNetJsEnabled ? ENGINE_SEMANTICS_SEARCH_NET_JS_BIT : 0)
     + (fieldNetJsEnabled ? ENGINE_SEMANTICS_FIELD_NET_JS_BIT : 0) + (searchConnectJsEnabled ? ENGINE_SEMANTICS_SEARCH_CONNECT_JS_BIT : 0)
     + (searchGetPostJsEnabled ? ENGINE_SEMANTICS_SEARCH_GETPOST_JS_BIT : 0)
-    + (lastAttrEnabled ? ENGINE_SEMANTICS_LAST_ATTR_BIT : 0);
+    + (lastAttrEnabled ? ENGINE_SEMANTICS_LAST_ATTR_BIT : 0) + (rulePrefixEnabled ? ENGINE_SEMANTICS_RULE_PREFIX_BIT : 0)
+    + (templateHashEnabled ? ENGINE_SEMANTICS_TEMPLATE_HASH_BIT : 0) + (bracketIndexEnabled ? ENGINE_SEMANTICS_BRACKET_INDEX_BIT : 0);
 }
 
 /**
@@ -687,5 +688,57 @@ export function engineSyntaxLastAttrEnabled(env: OrEnv = process.env): boolean {
  */
 export function engineSyntaxNextListEnabled(env: OrEnv = process.env): boolean {
   const raw = env.ENGINE_SYNTAX_NEXT_LIST?.trim().toLowerCase();
+  return raw === '1' || raw === 'true' || raw === 'on';
+}
+
+/**
+ * prefix1029：规则前缀语义位。版本再 +68719476736（1–68719476735 逐字不变，bigint 列）。只对 ENGINE_SYNTAX_RULE_PREFIX on、
+ * 准入搜索判定读的 ruleSearch.bookList/name/author/bookUrl 里可能有 `@Json:`（任意大小写）或非小写 `@CSS:` 前缀（parse.ts
+ * ruleMayUseRulePrefix）的源计入（compile.ts sourceUsesRulePrefixSyntax）——详情/目录/正文字段只改求值，同 lastattr1029 不计位。
+ */
+export const ENGINE_SEMANTICS_RULE_PREFIX_BIT = 68719476736;
+
+/**
+ * ENGINE_SYNTAX_RULE_PREFIX 独立开关（prefix1029，默认 off，口径同 ENGINE_SYNTAX_OR）。on = 规则（含 JS 链规则段）按 legado
+ * AnalyzeRule.SourceRule 构造的忽略大小写前缀判模式：`@Json:`/`@JSON:`/`@json:` 剥掉后整条走 Json 模式，各支不以 `$` 开头时按
+ * Jayway 补 `$.`（`[` 开头补 `$`）；`@CSS:`/`@Css:` 规范成解析器认的小写 `@css:`。off = 逐字不变（`@Json:`/`@CSS:` 被当成
+ * 默认语法选择器 `Json:…`/`CSS:…`，编译放行、求值取不到节点）。
+ */
+export function engineSyntaxRulePrefixEnabled(env: OrEnv = process.env): boolean {
+  const raw = env.ENGINE_SYNTAX_RULE_PREFIX?.trim().toLowerCase();
+  return raw === '1' || raw === 'true' || raw === 'on';
+}
+
+/**
+ * tplhash1029：模板内 `##` 语义位。版本再 +137438953472（1–137438953471 逐字不变，bigint 列）。只对 ENGINE_SYNTAX_TEMPLATE_HASH on、
+ * 准入搜索判定读的 ruleSearch.name/author/bookUrl 首个 `##` 落在 `{{…}}` 内（parse.ts ruleHashInTemplate）的源计入（compile.ts
+ * sourceUsesTemplateHashSyntax）——详情/目录/正文字段只改求值，同 lastattr1029 不计位。
+ */
+export const ENGINE_SEMANTICS_TEMPLATE_HASH_BIT = 137438953472;
+
+/**
+ * ENGINE_SYNTAX_TEMPLATE_HASH 独立开关（tplhash1029，默认 off，口径同 ENGINE_SYNTAX_OR）。on = SELF_FIELDS 非 JS 规则首个 `##` 落在
+ * `{{…}}` 内时整条走 legado makeUp（AnalyzeRule.SourceRule 先按 evalPattern 切出 `{{}}`、拼好后才 `split("##")`，模板内的 `##` 归
+ * 内层规则）。off = 逐字不变（字段级先剥 `##` 尾缀，把模板从中间切开：`{{$.id##.*_}}` 成字面量 `{{$.id` + 正则 `.*_}}`）。
+ */
+export function engineSyntaxTemplateHashEnabled(env: OrEnv = process.env): boolean {
+  const raw = env.ENGINE_SYNTAX_TEMPLATE_HASH?.trim().toLowerCase();
+  return raw === '1' || raw === 'true' || raw === 'on';
+}
+
+/**
+ * bracket1029：`[索引]` 语义位。版本再 +274877906944（1–274877906943 逐字不变，bigint 列）。只对 ENGINE_SYNTAX_BRACKET_INDEX on、
+ * 准入搜索判定读的 ruleSearch.bookList/name/author/bookUrl 里有默认语法段以 legado `[…]` 索引收尾（parse.ts ruleMayUseBracketIndex）
+ * 的源计入（compile.ts sourceUsesBracketIndexSyntax）——详情/目录/正文字段只改求值，同 lastattr1029 不计位。
+ */
+export const ENGINE_SEMANTICS_BRACKET_INDEX_BIT = 274877906944;
+
+/**
+ * ENGINE_SYNTAX_BRACKET_INDEX 独立开关（bracket1029，默认 off，口径同 ENGINE_SYNTAX_OR）。on = 默认语法段末的 `[0]`/`[1:]`/`[0:4]`/
+ * `[-1]`/`[1,3]`/`[!0:2]`/`[-1:0]` 按 legado AnalyzeByJSoup.ElementsSingle.findIndexSet 求值（闭区间、可带步长、越界钳制、去重保序、
+ * 可反向）。off = 逐字不变（括号原样留在 CSS 选择器里，求值抛错；`[!a,b]` 照旧走排除）。
+ */
+export function engineSyntaxBracketIndexEnabled(env: OrEnv = process.env): boolean {
+  const raw = env.ENGINE_SYNTAX_BRACKET_INDEX?.trim().toLowerCase();
   return raw === '1' || raw === 'true' || raw === 'on';
 }
