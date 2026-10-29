@@ -19,6 +19,11 @@ const nextConfig: NextConfig = {
   // zhaoshu-web.service 以它为入口（standalone 不含 public 与 .next/static，须手拷）。
   // Vercel 构建兼容此键、行为不变。
   output: "standalone",
+  // qjsext1029：QuickJS 沙箱包不进服务端 bundle，运行时原生 require（standalone 追踪进 node_modules）。
+  // 内联时 Turbopack 产出的 singlefile 变体 chunk（内嵌 wasm 的大模板字符串）在 Node 下解析失败
+  // （SyntaxError: Octal escape sequences are not allowed in template strings → ChunkLoadError），
+  // 2026-10-29 生产开 JS 开关后刷新 502 即此。
+  serverExternalPackages: ["quickjs-emscripten-core", "@jitl/quickjs-singlefile-cjs-release-sync"],
   async headers() {
     return [
       {
