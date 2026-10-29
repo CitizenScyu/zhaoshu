@@ -27,7 +27,7 @@ import {
   engineSyntaxBookVariableEnabled, engineSyntaxJsLibEnabled, engineSyntaxSourceBindEnabled, engineSyntaxInitJsoupEnabled, engineSearchNetJsEnabled,
   engineFieldNetJsEnabled, engineSearchConnectJsEnabled, engineSearchGetPostJsEnabled, engineSyntaxLastAttrEnabled,
   engineSyntaxRulePrefixEnabled, engineSyntaxTemplateHashEnabled, engineSyntaxBracketIndexEnabled, engineSyntaxSelfMatchEnabled,
-  engineSyntaxBareAttrEnabled,
+  engineSyntaxBareAttrEnabled, engineSyntaxJsoupDoctypeEnabled, ENGINE_SEMANTICS_JSOUP_DOCTYPE_BIT,
 } from './syntax-flags';
 import { urlOptionFields } from './url-options';
 import {
@@ -41,6 +41,8 @@ export { ENGINE_SEMANTICS_VERSION };
 /** 编译选项：parse 层两开关 + 源级改写开关（vars1027，ENGINE_SYNTAX_VARS，默认读 env）。 */
 export interface CompileOptions extends ParseOptions {
   varsEnabled?: boolean;
+  /** doctype1029：jsoup 层按 jsoup 文档模式放行带 id 的 doctype（ENGINE_SYNTAX_JSOUP_DOCTYPE，默认读 env）。只影响语义版本位，求值读 env。 */
+  jsoupDoctypeEnabled?: boolean;
   /** searchjs1027：搜索模板 JS（缺省 = ENGINE_POST_SEARCH 与 ENGINE_SEARCH_JS 都开）。只影响语义版本位，不影响编译产物。 */
   searchJsEnabled?: boolean;
   /** init1028：详情页 init 生效（ENGINE_SYNTAX_INIT，默认读 env）。只给可复现的 init 挂 FieldIr.initScope。 */
@@ -143,6 +145,8 @@ export function engineVersionedKey(contentRevision: string, semanticsVersion = E
  * （sourceUsesSelfMatchSyntax）时再加选择器含自身位（+549755813888）；其余字段同上不计位。
  * bareattr1029：ENGINE_SYNTAX_BARE_ATTR on 且准入搜索判定读的 ruleSearch.name/author/bookUrl 某支是单段裸名、bookList 不是 JSONPath
  * （sourceUsesBareAttrSyntax）时再加单段裸名属性位（+1099511627776）；其余字段同上不计位。
+ * doctype1029：ENGINE_SYNTAX_JSOUP_DOCTYPE on 且 jsoup 对该源生效、关掉 ENGINE_SYNTAX_JSOUP 会改动该源其余各位（jsoup 位、袋位、联网位……
+ * 任一经 jsoup 重编的字段）时再加 jsoup 文档模式位（+2199023255552）。
  */
 export function engineSourceRevision(
   source: { url: string; searchUrl: unknown; rules: Record<string, unknown> },
@@ -196,7 +200,11 @@ export function engineSourceRevision(
     && (options.searchNetJsEnabled ?? engineSearchNetJsEnabled())
     && searchTemplateNeedsJs(source.searchUrl, upgradeSourceTemplateUrl(source.url),
       jsEnabled && jsUtilEnabled ? MAX_SEARCH_JS_LONG_TEMPLATE_LENGTH : MAX_SEARCH_JS_TEMPLATE_LENGTH);
-  return engineVersionedKey(sourceRevision(source), engineSemanticsVersion(
+  const jsoupUsed = jsoup && [false, ...(book ? [true] : [])].some((b) => sourceUsesJsoupSyntax(rules, {
+    orEnabled, varsEnabled, xpathEnabled, xpathEvalEnabled: xpathEval, regexEnabled, andEnabled, aioEnabled, listJsEnabled, jsExtEnabled,
+    jsBindEnabled: jsBind, jsGetEnabled: jsGet, jsUtilEnabled: jsUtil, jsonPathEnabled, bookFieldsEnabled: b,
+  }));
+  const version = engineSemanticsVersion(
     orEnabled && sourceUsesOrSyntax(rules),
     xpathEnabled && sourceUsesXPathSyntax(rules),
     varsEnabled && sourceUsesVarSyntax(rules),
@@ -254,10 +262,7 @@ export function engineSourceRevision(
       jsExtEnabled, jsBindEnabled: jsBind, jsGetEnabled: jsGet, jsUtilEnabled: jsUtil, jsonPathEnabled, initJsEnabled, jsoupEnabled: jsoup,
       bookFieldsEnabled: book, listGetEnabled: listGet,
     }) !== null,
-    jsoup && [false, ...(book ? [true] : [])].some((b) => sourceUsesJsoupSyntax(rules, {
-      orEnabled, varsEnabled, xpathEnabled, xpathEvalEnabled: xpathEval, regexEnabled, andEnabled, aioEnabled, listJsEnabled, jsExtEnabled,
-      jsBindEnabled: jsBind, jsGetEnabled: jsGet, jsUtilEnabled: jsUtil, jsonPathEnabled, bookFieldsEnabled: b,
-    })),
+    jsoupUsed,
     book && sourceUsesBookSyntax(rules, {
       orEnabled, varsEnabled, xpathEnabled, xpathEvalEnabled: xpathEval, regexEnabled, andEnabled, aioEnabled, listJsEnabled, jsExtEnabled,
       jsGetEnabled: jsGet, jsUtilEnabled: jsUtil, jsonPathEnabled, initJsEnabled, jsoupEnabled: jsoup,
@@ -306,7 +311,12 @@ export function engineSourceRevision(
     (options.bracketIndexEnabled ?? engineSyntaxBracketIndexEnabled()) && sourceUsesBracketIndexSyntax(rules),
     (options.selfMatchEnabled ?? engineSyntaxSelfMatchEnabled()) && sourceUsesSelfMatchSyntax(rules),
     (options.bareAttrEnabled ?? engineSyntaxBareAttrEnabled()) && sourceUsesBareAttrSyntax(rules),
-  ));
+  );
+  // doctype1029：jsoup 开关改得动该源任一位 ⇔ 有字段（含变量袋/搜索袋/条目袋等帧内编译）经 jsoup 重编、求值摸得到 jsoup 层。
+  // 只看 jsoup 位会漏掉袋字段（如 searchUrl put、bookList 首段取节点 + JS 读袋的源）。
+  const doctype = jsoup && (options.jsoupDoctypeEnabled ?? engineSyntaxJsoupDoctypeEnabled())
+    && (jsoupUsed || engineSourceRevision(source, { ...options, jsoupEnabled: false }) !== engineVersionedKey(sourceRevision(source), version));
+  return engineVersionedKey(sourceRevision(source), version + (doctype ? ENGINE_SEMANTICS_JSOUP_DOCTYPE_BIT : 0));
 }
 
 const RULE_GROUPS = ['ruleSearch', 'ruleBookInfo', 'ruleContent', 'ruleToc', 'ruleExplore'] as const;

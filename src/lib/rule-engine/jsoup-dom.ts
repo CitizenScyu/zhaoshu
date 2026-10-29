@@ -4,10 +4,13 @@
 //
 // parse5 与 jsoup HtmlTreeBuilder 的树并非处处相同：能从源码看出差异的形态（NUL、CDATA、template、非空元素自闭合、
 // command/device/menuitem、带 public/system id 的 doctype、head 里有内容的 noscript）整篇文档求值失败；
+// doctype1029（ENGINE_SYNTAX_JSOUP_DOCTYPE on）：带 id 的 doctype 放行，改按文档模式判——parse5 判 quirks 而 jsoup 不判时
+// 只有「p 内遇 table」一处树不同（jsoup 先关 p），见 quirksTableInP；
 // 只在序列化/取文本时才显形的差异（svg/math 外来元素、scripting 下 noscript 原文、CR 被 parse5 归一成 LF、
 // 无值属性与 `=""` 分不清、对象键序与 jsoup 属性序不同…）摸到才失败。口径不定一律 fatal，不猜。
 
 import type { AnyNode, Comment, Document, Element, ProcessingInstruction, Text } from 'domhandler';
+import { engineSyntaxJsoupDoctypeEnabled } from './syntax-flags';
 import { RuleEngineError } from './types';
 
 export type JElement = Element | Document;
@@ -273,6 +276,10 @@ export interface DocGuard {
   crLossy: boolean;
   /** 源码里出现过无值写法的属性名：jsoup 存 null（序列化折叠），parse5 存 ""，`=""` 与无值分不清。 */
   readonly valueless: Set<string>;
+  /** doctype1029：登记时读的 ENGINE_SYNTAX_JSOUP_DOCTYPE。 */
+  readonly doctypeIds: boolean;
+  /** 源码首个 doctype 声明里 name 之后的 PUBLIC/SYSTEM 关键字（jsoup pubSysKey 取分词器读到的关键字，parse5 不留）。 */
+  doctypeKey: string | null;
 }
 
 const GUARDS = new WeakMap<object, DocGuard>();
@@ -282,7 +289,7 @@ const DETACHED = new WeakMap<object, DocGuard>();
 export function registerDocSource(root: Document, source: string, options: { scripting: boolean; mutable: boolean }): void {
   GUARDS.set(root, {
     root, source, scripting: options.scripting, mutable: options.mutable, scanned: false, crLossy: false,
-    valueless: new Set(),
+    valueless: new Set(), doctypeIds: engineSyntaxJsoupDoctypeEnabled(), doctypeKey: null,
   });
 }
 
@@ -402,7 +409,14 @@ interface ForeignFrame {
   name: string;
 }
 
-function scanSource(src: string, valueless: Set<string>): { fatal?: string; nonBlankNoscript: boolean } {
+interface SourceScan {
+  fatal?: string;
+  nonBlankNoscript: boolean;
+  /** 首个 doctype 声明的 PUBLIC/SYSTEM 关键字（doctypeIds on 才记）。 */
+  doctypeKey?: string | null;
+}
+
+function scanSource(src: string, valueless: Set<string>, doctypeIds = false): SourceScan {
   if (src.includes('\0')) return { fatal: '源码含 NUL', nonBlankNoscript: false };
   if (src.includes('<![CDATA[')) return { fatal: '源码含 CDATA 段', nonBlankNoscript: false };
   if (/<template/i.test(src)) return { fatal: '源码含 template', nonBlankNoscript: false };
@@ -410,6 +424,7 @@ function scanSource(src: string, valueless: Set<string>): { fatal?: string; nonB
   const stack: ForeignFrame[] = [];
   let nonBlankNoscript = false;
   let noscriptStart = -1;
+  let doctypeKey: string | null | undefined;
   const n = src.length;
   let i = 0;
   while (i < n) {
@@ -424,7 +439,13 @@ function scanSource(src: string, valueless: Set<string>): { fatal?: string; nonB
       if (/^<!doctype/i.test(src.slice(lt, lt + 9))) {
         const gt = src.indexOf('>', lt);
         const decl = src.slice(lt, gt < 0 ? n : gt);
-        if (/\b(?:public|system)\b/i.test(decl)) return { fatal: 'doctype 带 public/system id', nonBlankNoscript };
+        if (!doctypeIds) {
+          if (/\b(?:public|system)\b/i.test(decl)) return { fatal: 'doctype 带 public/system id', nonBlankNoscript };
+        } else if (doctypeKey === undefined) {
+          // TokeniserState.BeforeDoctypeName/DoctypeName/AfterDoctypeName：name 之后的空白后 matchConsumeIgnoreCase(PUBLIC|SYSTEM)。
+          const key = /^<!doctype[\t\n\f\r ]*[^\t\n\f\r ]+[\t\n\f\r ]+(public|system)/i.exec(decl);
+          doctypeKey = key ? key[1].toUpperCase() : null;
+        }
       }
       const gt = src.indexOf('>', lt + 2);
       i = gt < 0 ? n : gt + 1;
@@ -484,7 +505,7 @@ function scanSource(src: string, valueless: Set<string>): { fatal?: string; nonB
     else if (name === 'noscript') noscriptStart = i;
   }
   if (noscriptStart >= 0 && !isBlankString(src.slice(noscriptStart))) nonBlankNoscript = true;
-  return { nonBlankNoscript };
+  return { nonBlankNoscript, doctypeKey };
 }
 
 function firstChildNamed(node: JElement, name: string): Element | null {
@@ -499,6 +520,29 @@ function subtreeHas(node: AnyNode, name: string): boolean {
   return false;
 }
 
+/** parse5 hasInButtonScope 的 HTML 边界元素（外来命名空间的边界不认：宁可多判）。 */
+const BUTTON_SCOPE_TAGS = new Set(['applet', 'caption', 'html', 'table', 'td', 'th', 'marquee', 'object', 'template', 'button']);
+
+/**
+ * parse5 quirks 下 tableStartTagInBody 不先关 button scope 内的 p，table 落进 p；jsoup（非 forceQuirks 一律 noQuirks）先关 p。
+ * 树里某个 HTML table 沿祖先先遇到 p、后遇到边界 → 两边树不同。forceQuirks 时 jsoup 也是 quirks，这里一并判（宁可误判）。
+ */
+function quirksTableInP(root: Document): boolean {
+  const pending: AnyNode[] = [...root.children];
+  while (pending.length > 0) {
+    const node = pending.pop()!;
+    if (!isElement(node)) continue;
+    pending.push(...node.children);
+    if (normalName(node) !== 'table' || (node.namespace !== undefined && node.namespace !== HTML_NS)) continue;
+    for (let up = node.parent; isElement(up); up = up.parent) {
+      const html = up.namespace === undefined || up.namespace === HTML_NS;
+      if (html && normalName(up) === 'p') return true;
+      if (html && BUTTON_SCOPE_TAGS.has(normalName(up))) break;
+    }
+  }
+  return false;
+}
+
 function scanDoc(guard: DocGuard): void {
   guard.scanned = true;
   guard.crLossy = guard.source.includes('\r');
@@ -508,9 +552,14 @@ function scanDoc(guard: DocGuard): void {
     guard.fatal = '内容以 <?xml 开头（legado 按 XML 解析）';
     return;
   }
-  const scan = scanSource(guard.source, guard.valueless);
+  const scan = scanSource(guard.source, guard.valueless, guard.doctypeIds);
   if (scan.fatal !== undefined) {
     guard.fatal = scan.fatal;
+    return;
+  }
+  guard.doctypeKey = scan.doctypeKey ?? null;
+  if (guard.doctypeIds && (guard.root as Document & Record<string, unknown>)['x-mode'] === 'quirks' && quirksTableInP(guard.root)) {
+    guard.fatal = 'quirks 文档里 table 落在 p 内（jsoup 非 quirks 先关 p）';
     return;
   }
   const html = firstChildNamed(guard.root, 'html');
@@ -919,9 +968,27 @@ function serializeHead(acc: Acc, node: AnyNode, depth: number, guard: DocGuard):
     acc.s += `<!--${node.data}-->`;
   } else if (isDoctypeNode(node)) {
     const pi = node as ProcessingInstruction & Record<string, unknown>;
+    const str = (key: string) => (typeof pi[key] === 'string' ? pi[key] as string : '');
+    const name = str('x-name');
+    if (guard.doctypeIds) {
+      // DocumentType.outerHtmlHead。quirks 文档的 doctype 可能是 forceQuirks（关键字/引号残缺），分词结果 parse5 不留 → 不猜。
+      if ((guard.root as Document & Record<string, unknown>)['x-mode'] === 'quirks') jsoupFatal('quirks 文档的 doctype 序列化口径不定');
+      const publicId = str('x-publicId');
+      const systemId = str('x-systemId');
+      checkCr(publicId + systemId, guard);
+      // normalizeTag 按 Locale.ENGLISH 全量转小写，parse5 只转 ASCII。
+      if (/[^\x00-\x7f]/.test(name)) jsoupFatal('doctype 名含非 ASCII 字符');
+      if (node.prev != null) acc.s += '\n';
+      acc.s += isBlankString(publicId) && isBlankString(systemId) ? '<!doctype' : '<!DOCTYPE';
+      if (!isBlankString(name)) acc.s += ` ${name}`;
+      if (guard.doctypeKey !== null) acc.s += ` ${guard.doctypeKey}`;
+      if (!isBlankString(publicId)) acc.s += ` "${publicId}"`;
+      if (!isBlankString(systemId)) acc.s += ` "${systemId}"`;
+      acc.s += '>';
+      return;
+    }
     if (pi['x-publicId'] != null || pi['x-systemId'] != null) jsoupFatal('doctype 带 public/system id');
     if (node.prev != null) acc.s += '\n';
-    const name = typeof pi['x-name'] === 'string' ? pi['x-name'] : '';
     acc.s += isBlankString(name) ? '<!doctype>' : `<!doctype ${name}>`;
   } else {
     jsoupFatal(`节点类型 ${node.type} 的序列化口径不复现`);
