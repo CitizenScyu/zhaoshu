@@ -23,7 +23,7 @@ export const ENGINE_SEMANTICS_XPATH_BIT = 2;
 /** vars1027：@put/@get 静态子集语义位。版本再 +4（5–8 = 含变量位的四种组合），1–4 逐字不变。 */
 export const ENGINE_SEMANTICS_VARS_BIT = 4;
 
-/** 语义版本随 || / XPath / 变量 / JS / XPath 求值 / 正则 / && / AllInOne / 搜索 JS / 列表 JS / JS 扩展 / 宿主绑定 / java.getString / 加解密帮手 / JSONPath 扩展 / 详情 init / 搜索选项 legado 口径 / URL 字段选项 / 搜索 webView / 详情 JS init / 详情→目录变量袋 / jsoup 直连 / 书籍成员 / 搜索 URL→搜索字段变量袋 / 搜索条目袋 / 列表 JS getter / 书籍变量 / jsLib / 书源常量 / jsoup JS init / 搜索联网 JS / 字段联网 JS / 搜索 java.connect / 搜索 java.get·post / 末段裸名属性 / 规则前缀大小写 / 模板内 ## / [索引] / 选择器含自身 / 单段裸名属性 / jsoup 文档模式 开关联动（唯一口径，供 compile.ts 缓存键与 rulesHash 复用）。 */
+/** 语义版本随 || / XPath / 变量 / JS / XPath 求值 / 正则 / && / AllInOne / 搜索 JS / 列表 JS / JS 扩展 / 宿主绑定 / java.getString / 加解密帮手 / JSONPath 扩展 / 详情 init / 搜索选项 legado 口径 / URL 字段选项 / 搜索 webView / 详情 JS init / 详情→目录变量袋 / jsoup 直连 / 书籍成员 / 搜索 URL→搜索字段变量袋 / 搜索条目袋 / 列表 JS getter / 书籍变量 / jsLib / 书源常量 / jsoup JS init / 搜索联网 JS / 字段联网 JS / 搜索 java.connect / 搜索 java.get·post / 末段裸名属性 / 规则前缀大小写 / 模板内 ## / [索引] / 选择器含自身 / 单段裸名属性 / jsoup 文档模式 / 属性值含空白 开关联动（唯一口径，供 compile.ts 缓存键与 rulesHash 复用）。 */
 export function engineSemanticsVersion(
   orEnabled: boolean, xpathEnabled = false, varsEnabled = false, jsEnabled = false, xpathEvalEnabled = false,
   regexEnabled = false, andEnabled = false, aioEnabled = false, searchJsEnabled = false, listJsEnabled = false,
@@ -33,7 +33,7 @@ export function engineSemanticsVersion(
   listGetEnabled = false, bookVariableEnabled = false, jsLibEnabled = false, sourceBindEnabled = false, initJsoupEnabled = false,
   searchNetJsEnabled = false, fieldNetJsEnabled = false, searchConnectJsEnabled = false, searchGetPostJsEnabled = false,
   lastAttrEnabled = false, rulePrefixEnabled = false, templateHashEnabled = false, bracketIndexEnabled = false,
-  selfMatchEnabled = false, bareAttrEnabled = false, jsoupDoctypeEnabled = false,
+  selfMatchEnabled = false, bareAttrEnabled = false, jsoupDoctypeEnabled = false, attrQuoteEnabled = false,
 ): number {
   return (orEnabled ? ENGINE_SEMANTICS_VERSION_OR : ENGINE_SEMANTICS_VERSION)
     + (xpathEnabled ? ENGINE_SEMANTICS_XPATH_BIT : 0) + (varsEnabled ? ENGINE_SEMANTICS_VARS_BIT : 0)
@@ -56,7 +56,7 @@ export function engineSemanticsVersion(
     + (lastAttrEnabled ? ENGINE_SEMANTICS_LAST_ATTR_BIT : 0) + (rulePrefixEnabled ? ENGINE_SEMANTICS_RULE_PREFIX_BIT : 0)
     + (templateHashEnabled ? ENGINE_SEMANTICS_TEMPLATE_HASH_BIT : 0) + (bracketIndexEnabled ? ENGINE_SEMANTICS_BRACKET_INDEX_BIT : 0)
     + (selfMatchEnabled ? ENGINE_SEMANTICS_SELF_MATCH_BIT : 0) + (bareAttrEnabled ? ENGINE_SEMANTICS_BARE_ATTR_BIT : 0)
-    + (jsoupDoctypeEnabled ? ENGINE_SEMANTICS_JSOUP_DOCTYPE_BIT : 0);
+    + (jsoupDoctypeEnabled ? ENGINE_SEMANTICS_JSOUP_DOCTYPE_BIT : 0) + (attrQuoteEnabled ? ENGINE_SEMANTICS_ATTR_QUOTE_BIT : 0);
 }
 
 /**
@@ -794,5 +794,23 @@ export const ENGINE_SEMANTICS_JSOUP_DOCTYPE_BIT = 2199023255552;
  */
 export function engineSyntaxJsoupDoctypeEnabled(env: OrEnv = process.env): boolean {
   const raw = env.ENGINE_SYNTAX_JSOUP_DOCTYPE?.trim().toLowerCase();
+  return raw === '1' || raw === 'true' || raw === 'on';
+}
+
+/**
+ * attrquote1030：属性值含空白语义位。版本再 +8796093022208（2^42 留给 lazyhost 分支；1–2199023255551 及 doctype 位逐字不变，bigint 列）。
+ * 只对 ENGINE_SYNTAX_ATTR_QUOTE on、准入搜索 bookList/name/author/bookUrl 有会被改写的选择器（compile.ts sourceUsesAttrQuoteSyntax，
+ * 静态近似）的源计入。
+ */
+export const ENGINE_SEMANTICS_ATTR_QUOTE_BIT = 8796093022208;
+
+/**
+ * ENGINE_SYNTAX_ATTR_QUOTE 独立开关（attrquote1030，默认 off，口径同 ENGINE_SYNTAX_OR）。jsoup QueryParser.byAttribute 的值取到 `]`
+ * 前的全部余下文本（trim，可含空格），`=`/`^=`/`$=`/`*=` 不分大小写；css-what 的无引号值遇空白即止、随后抛 "Attribute selector
+ * didn't terminate"（如 `div[style=text-indent: 2em;]`）。on = 无引号、含空格的这四种值改写成带 `i` 标志的引号串（parse.ts
+ * quoteLegadoAttrValues）；改写前这些选择器求值必抛，其余写法逐字不变。off = 逐字不变。
+ */
+export function engineSyntaxAttrQuoteEnabled(env: OrEnv = process.env): boolean {
+  const raw = env.ENGINE_SYNTAX_ATTR_QUOTE?.trim().toLowerCase();
   return raw === '1' || raw === 'true' || raw === 'on';
 }

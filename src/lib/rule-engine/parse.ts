@@ -32,7 +32,7 @@ import {
   engineSyntaxBookFieldsEnabled, engineSyntaxListGetEnabled, engineSyntaxInitJsoupEnabled, engineFieldNetJsEnabled,
   engineSyntaxNullSkipEnabled, engineSyntaxPageDetachedEnabled, engineSyntaxLastAttrEnabled, engineSyntaxNextListEnabled,
   engineSyntaxRulePrefixEnabled, engineSyntaxTemplateHashEnabled, engineSyntaxBracketIndexEnabled, engineSyntaxSelfMatchEnabled,
-  engineSyntaxBareAttrEnabled,
+  engineSyntaxBareAttrEnabled, engineSyntaxAttrQuoteEnabled,
 } from './syntax-flags';
 import { compileXPath, XPathSyntaxError } from './xpath-eval';
 import { looksLikeXPath, xpathPrefixed, xpathSegmentBody, xpathToCss } from './xpath-subset';
@@ -90,6 +90,11 @@ let selfMatch = false;
  * 嵌套解析（JS 链规则段、`{{规则}}`、getter 实参）不带字段名，不继承。
  */
 let bareAttr = false;
+/**
+ * 当前 parseFieldRule 帧是否按 attrquote1030 改写 CSS 步里无引号、含空格的属性值（ParseOptions.attrQuoteEnabled，见
+ * quoteLegadoAttrValues）。嵌套解析经选项透传同口径。
+ */
+let attrQuote = false;
 /**
  * fieldnet1029：可放行 `java.ajax` 的字段——页面级、取书链路必需的那几个（每页求值一次，取页次数有界）。条目级字段（如
  * lastChapter）逐条联网会把请求预算吃光，装饰字段丢了不影响取书，都不收（照旧拒）。
@@ -504,6 +509,53 @@ export function ruleMayUseBracketIndex(rule: string): boolean {
   return rule.split('##')[0].split(/\|\||&&|%%|@/).some((seg) => legadoIndexSet(seg) !== null);
 }
 
+/**
+ * attrquote1030：jsoup QueryParser.byAttribute 的值取 `]` 前全部余下文本（trim，可含空格），`=`/`^=`/`$=`/`*=` 不分大小写比较；
+ * css-what 的无引号值遇空白即止、随后抛 "Attribute selector didn't terminate"。这里只改写「无引号、trim 后含空格」的这四种值为
+ * `[k op "v" i]`——改写前这些 `[…]` 在 cheerio 上必抛，其余写法逐字不变：带引号/反斜杠/制表换行的不碰；`[k=v i]`、`[k=v s]`
+ * css-what 认作大小写标志、本就不抛，也不碰；`~=`/`|=`/`!=` 不碰；圆括号内（`:contains(…)`、`:not(…)`）不碰。
+ */
+export function quoteLegadoAttrValues(selector: string): string {
+  if (!selector.includes('[')) return selector;
+  let out = '';
+  let depth = 0;
+  let quote = '';
+  for (let i = 0; i < selector.length; i += 1) {
+    const ch = selector[i];
+    if (quote) {
+      out += ch;
+      if (ch === '\\' && i + 1 < selector.length) out += selector[++i];
+      else if (ch === quote) quote = '';
+      continue;
+    }
+    if (ch === '"' || ch === "'") quote = ch;
+    else if (ch === '(') depth += 1;
+    else if (ch === ')') depth = Math.max(0, depth - 1);
+    else if (ch === '[' && depth === 0) {
+      const end = selector.indexOf(']', i + 1);
+      const inner = end > 0 ? selector.slice(i + 1, end) : '';
+      const m = /^\s*([^\s~|^$*!=]+)\s*([\^$*]?=)\s*(.*?)\s*$/.exec(inner);
+      if (m && / /.test(m[3]) && !/["'\\[\t\n\r\f]/.test(inner) && !/^\S+ +[is]$/i.test(m[3])) {
+        out += `[${m[1]}${m[2]}"${m[3]}" i]`;
+        i = end;
+        continue;
+      }
+    }
+    out += ch;
+  }
+  return out;
+}
+
+/**
+ * 规则文本里是否可能有 attrquote1030 改写的 `[…]`（compile.ts sourceUsesAttrQuoteSyntax 的语义位判据，宁多勿漏）：JSONPath/XPath
+ * 规则不计；其余剥 `##` 尾缀后整条交 quoteLegadoAttrValues，有改动即计。
+ */
+export function ruleMayUseAttrQuote(rule: string): boolean {
+  if (/^\s*(?:\$|@json:|@xpath:|\/)/i.test(rule)) return false;
+  const head = rule.split('##')[0];
+  return quoteLegadoAttrValues(head) !== head;
+}
+
 /** :contains(X) 里的文本转义（去掉可能破坏 css-select 的引号/括号）。 */
 function cssEscapeContains(text: string): string {
   return text.replace(/[()]/g, '');
@@ -639,15 +691,17 @@ function buildCssChain(body: string, rule: string, explicit: boolean): RuleIr {
   for (const part of atParts) {
     const p = part.trim();
     if (p === '') continue;
+    let step: CssStep;
     if (explicit) {
       // @css: 段不做关键字翻译，但仍支持末端索引/切片/排除后缀
-      const step: CssStep = { selector: '' };
+      step = { selector: '' };
       const rest = extractSuffixes(p, step, rule);
       step.selector = rest.trim();
-      chain.push(step);
     } else {
-      chain.push(translateStep(p, rule));
+      step = translateStep(p, rule);
     }
+    if (attrQuote) step.selector = quoteLegadoAttrValues(step.selector);
+    chain.push(step);
   }
   // 裸 @op（如 chapterName=`@text`、chapterUrl=`@href`，book15 自身即此形态）：
   // 对当前 scope 节点集直接套末端操作，chain 合法为空。仅「既无选择器又无 terminal」才是空规则。
@@ -964,6 +1018,11 @@ export interface ParseOptions {
    * 默认读 env（缺失=off）。
    */
   bareAttrEnabled?: boolean;
+  /**
+   * attrquote1030：CSS 步里无引号、含空格的 `[k=v]`/`^=`/`$=`/`*=` 值改写成带 `i` 标志的引号串（ENGINE_SYNTAX_ATTR_QUOTE，见
+   * quoteLegadoAttrValues）。默认读 env（缺失=off）。
+   */
+  attrQuoteEnabled?: boolean;
 }
 
 /**
@@ -990,12 +1049,14 @@ function parseFieldRuleFramed(rule: string, options: ParseOptions): FieldIr {
   const savedBracket = bracketIndex;
   const savedSelf = selfMatch;
   const savedBare = bareAttr;
+  const savedQuote = attrQuote;
   jsonPathExt = options.jsonPathEnabled ?? engineSyntaxJsonPathEnabled();
   jsObjectKeys = bindActive(options);
   lastAttr = lastAttrActive(options);
   bracketIndex = options.bracketIndexEnabled ?? engineSyntaxBracketIndexEnabled();
   selfMatch = options.selfMatchEnabled ?? engineSyntaxSelfMatchEnabled();
   bareAttr = bareAttrActive(options);
+  attrQuote = options.attrQuoteEnabled ?? engineSyntaxAttrQuoteEnabled();
   sourceFrame = options.sourceConsts ?? sourceFrame;
   varBag = options.varBag;
   jsoupFrame = undefined;
@@ -1065,6 +1126,7 @@ function parseFieldRuleFramed(rule: string, options: ParseOptions): FieldIr {
     bracketIndex = savedBracket;
     selfMatch = savedSelf;
     bareAttr = savedBare;
+    attrQuote = savedQuote;
   }
 }
 
@@ -1095,7 +1157,7 @@ function jsSegmentOptions(options: ParseOptions): ParseOptions {
     orEnabled: options.orEnabled, xpathEnabled: options.xpathEnabled, xpathEvalEnabled: options.xpathEvalEnabled, jsEnabled: false,
     regexEnabled: options.regexEnabled ?? engineSyntaxRegexEnabled(), jsonPathEnabled: options.jsonPathEnabled,
     rulePrefixEnabled: options.rulePrefixEnabled, bracketIndexEnabled: options.bracketIndexEnabled,
-    selfMatchEnabled: options.selfMatchEnabled,
+    selfMatchEnabled: options.selfMatchEnabled, attrQuoteEnabled: options.attrQuoteEnabled,
   };
 }
 
@@ -1441,7 +1503,7 @@ function parseJsChain(trimmed: string, rule: string, options: ParseOptions): Fie
     orEnabled: options.orEnabled, xpathEnabled: options.xpathEnabled, xpathEvalEnabled: options.xpathEvalEnabled, jsEnabled: false,
     regexEnabled, jsonPathEnabled: options.jsonPathEnabled, rulePrefixEnabled: options.rulePrefixEnabled,
     bracketIndexEnabled: options.bracketIndexEnabled,
-    selfMatchEnabled: options.selfMatchEnabled,
+    selfMatchEnabled: options.selfMatchEnabled, attrQuoteEnabled: options.attrQuoteEnabled,
   };
   const gets: JsGets | undefined = (options.jsGetEnabled ?? engineSyntaxJsGetEnabled())
     ? { options: segmentOptions, out: new Map(), aliases: initJs } : undefined;
@@ -1544,7 +1606,7 @@ function parseListJsChain(rule: string, options: ParseOptions): FieldIr {
         orEnabled: options.orEnabled, xpathEnabled: options.xpathEnabled, xpathEvalEnabled: options.xpathEvalEnabled, jsEnabled: false,
         regexEnabled: options.regexEnabled ?? engineSyntaxRegexEnabled(), jsonPathEnabled: options.jsonPathEnabled,
         rulePrefixEnabled: options.rulePrefixEnabled, bracketIndexEnabled: options.bracketIndexEnabled,
-        selfMatchEnabled: options.selfMatchEnabled,
+        selfMatchEnabled: options.selfMatchEnabled, attrQuoteEnabled: options.attrQuoteEnabled,
       },
       out: new Map(),
     }

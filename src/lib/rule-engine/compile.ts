@@ -13,7 +13,7 @@ import { engineSearchJsActive, engineSearchOptionsActive } from './compile-smoke
 import { AIO_LIST_FIELDS, aioGroups } from './aio-syntax';
 import {
   FIELD_NET_FIELDS, initFieldSupported, initJsFieldSupported, initRuleTextSupported, jsChainFieldAllowed, listJsGroups, objectKeyOf, parseFieldRule,
-  ruleHasJs, ruleHashInTemplate, ruleMayUseBareAttr, ruleMayUseBracketIndex, ruleMayUseLastAttr, ruleMayUseRulePrefix, type ParseOptions,
+  ruleHasJs, ruleHashInTemplate, ruleMayUseAttrQuote, ruleMayUseBareAttr, ruleMayUseBracketIndex, ruleMayUseLastAttr, ruleMayUseRulePrefix, type ParseOptions,
   type SourceConsts,
 } from './parse';
 import type { CompiledRules, FieldIr, RuleIr } from './types';
@@ -27,7 +27,7 @@ import {
   engineSyntaxBookVariableEnabled, engineSyntaxJsLibEnabled, engineSyntaxSourceBindEnabled, engineSyntaxInitJsoupEnabled, engineSearchNetJsEnabled,
   engineFieldNetJsEnabled, engineSearchConnectJsEnabled, engineSearchGetPostJsEnabled, engineSyntaxLastAttrEnabled,
   engineSyntaxRulePrefixEnabled, engineSyntaxTemplateHashEnabled, engineSyntaxBracketIndexEnabled, engineSyntaxSelfMatchEnabled,
-  engineSyntaxBareAttrEnabled, engineSyntaxJsoupDoctypeEnabled, ENGINE_SEMANTICS_JSOUP_DOCTYPE_BIT,
+  engineSyntaxBareAttrEnabled, engineSyntaxJsoupDoctypeEnabled, ENGINE_SEMANTICS_JSOUP_DOCTYPE_BIT, engineSyntaxAttrQuoteEnabled,
 } from './syntax-flags';
 import { urlOptionFields } from './url-options';
 import {
@@ -147,6 +147,8 @@ export function engineVersionedKey(contentRevision: string, semanticsVersion = E
  * （sourceUsesBareAttrSyntax）时再加单段裸名属性位（+1099511627776）；其余字段同上不计位。
  * doctype1029：ENGINE_SYNTAX_JSOUP_DOCTYPE on 且 jsoup 对该源生效、关掉 ENGINE_SYNTAX_JSOUP 会改动该源其余各位（jsoup 位、袋位、联网位……
  * 任一经 jsoup 重编的字段）时再加 jsoup 文档模式位（+2199023255552）。
+ * attrquote1030：ENGINE_SYNTAX_ATTR_QUOTE on 且准入搜索判定读的 ruleSearch.bookList/name/author/bookUrl 有会被改写的无引号含空格
+ * 属性值（sourceUsesAttrQuoteSyntax）时再加属性值含空白位（+8796093022208）；其余字段同上不计位。
  */
 export function engineSourceRevision(
   source: { url: string; searchUrl: unknown; rules: Record<string, unknown> },
@@ -311,6 +313,8 @@ export function engineSourceRevision(
     (options.bracketIndexEnabled ?? engineSyntaxBracketIndexEnabled()) && sourceUsesBracketIndexSyntax(rules),
     (options.selfMatchEnabled ?? engineSyntaxSelfMatchEnabled()) && sourceUsesSelfMatchSyntax(rules),
     (options.bareAttrEnabled ?? engineSyntaxBareAttrEnabled()) && sourceUsesBareAttrSyntax(rules),
+    false, // doctype1029 位另算（见下）
+    (options.attrQuoteEnabled ?? engineSyntaxAttrQuoteEnabled()) && sourceUsesAttrQuoteSyntax(rules),
   );
   // doctype1029：jsoup 开关改得动该源任一位 ⇔ 有字段（含变量袋/搜索袋/条目袋等帧内编译）经 jsoup 重编、求值摸得到 jsoup 层。
   // 只看 jsoup 位会漏掉袋字段（如 searchUrl put、bookList 首段取节点 + JS 读袋的源）。
@@ -440,6 +444,20 @@ export function sourceUsesBareAttrSyntax(rules: Record<string, unknown>): boolea
   return ['name', 'author', 'bookUrl'].some((key) => {
     const rule = fields[key];
     return typeof rule === 'string' && ruleMayUseBareAttr(rule);
+  });
+}
+
+/**
+ * 准入搜索判定读的 ruleSearch.bookList/name/author/bookUrl 里是否可能有 attrquote1030 改写的属性值（口径见 parse.ts
+ * ruleMayUseAttrQuote；理由同 sourceUsesOrSyntax）。
+ */
+export function sourceUsesAttrQuoteSyntax(rules: Record<string, unknown>): boolean {
+  const search = rules.ruleSearch;
+  if (!search || typeof search !== 'object' || Array.isArray(search)) return false;
+  const fields = search as Record<string, unknown>;
+  return ['bookList', 'name', 'author', 'bookUrl'].some((key) => {
+    const rule = fields[key];
+    return typeof rule === 'string' && ruleMayUseAttrQuote(rule);
   });
 }
 
