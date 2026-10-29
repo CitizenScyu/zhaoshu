@@ -29,7 +29,7 @@ import {
   engineSyntaxJsGetEnabled, engineSyntaxJsonPathEnabled, engineSyntaxJsUtilEnabled, engineSyntaxListJsEnabled, engineSyntaxOrEnabled,
   engineSyntaxRegexEnabled, engineSyntaxXPathEnabled, engineSyntaxXPathEvalEnabled, engineInitJsActive, engineSyntaxJsoupEnabled,
   engineSyntaxBookFieldsEnabled, engineSyntaxListGetEnabled, engineSyntaxInitJsoupEnabled, engineFieldNetJsEnabled,
-  engineSyntaxNullSkipEnabled, engineSyntaxPageDetachedEnabled,
+  engineSyntaxNullSkipEnabled, engineSyntaxPageDetachedEnabled, engineSyntaxLastAttrEnabled,
 } from './syntax-flags';
 import { compileXPath, XPathSyntaxError } from './xpath-eval';
 import { looksLikeXPath, xpathPrefixed, xpathSegmentBody, xpathToCss } from './xpath-subset';
@@ -62,6 +62,14 @@ let jsoupFrame: { elements: Map<string, FieldIr>; options: ParseOptions; init?: 
 
 /** 当前 parseFieldRule 帧是否按 objkey1029 认对象字面量键（JS 与 ENGINE_SYNTAX_JS_BIND 同开，见 objectKeyAt）。 */
 let jsObjectKeys = false;
+
+/**
+ * 当前 parseFieldRule 帧的多段末段裸名口径（lastattr1029，ParseOptions.lastAttrEnabled，只在 LAST_ATTR_FIELDS 上开）：见 lastAttrToken。
+ * 嵌套解析（JS 链规则段、`{{规则}}`、getter 实参）不带字段名，不继承。
+ */
+let lastAttr = false;
+/** lastattr1029：buildCssChain 按末段裸名编出 attr 终端的累计次数——next* 字段据此标 lastAttrList（legado getStringList 口径）。 */
+let lastAttrHits = 0;
 
 /**
  * fieldnet1029：可放行 `java.ajax` 的字段——页面级、取书链路必需的那几个（每页求值一次，取页次数有界）。条目级字段（如
@@ -526,6 +534,11 @@ function buildCssChain(body: string, rule: string, explicit: boolean): RuleIr {
     // 不得用 isTerminalToken 兜底——否则裸标签名 div/a/p、具名属性 data-id 会被误判成 op/attr。
     terminal = toTerminal(last, rule);
     atParts.pop();
+  } else if (atParts.length > 1 && lastAttr && lastAttrToken(last)) {
+    // lastattr1029：legado AnalyzeByJSoup.getResultList 的末段恒为 lastRule，关键字之外一律 `attr(lastRule)`。
+    terminal = { op: 'attr', name: last };
+    atParts.pop();
+    lastAttrHits += 1;
   } else if (atParts.length > 1 && last === '') {
     // 末尾空 @（节点集原样，bookList/chapterList 用）
     atParts.pop();
@@ -556,6 +569,51 @@ function isTerminalToken(token: string): boolean {
   if (LEGADO_SPECIAL_VARS.has(token)) return true; // 交给 toTerminal 显式拒绝，不当选择器步
   // 具名属性形态：含 - 或 :（如 data-id、og:title）。裸标签名（li/a/p/div）是选择器步，不是末端。
   return /^[\w]+[-:][\w:-]*$/.test(token);
+}
+
+/**
+ * lastattr1029：开关开时字符串字段多段规则的末段裸名（`a@onclick`、`li@rel`）按属性取，不再当子选择器步——legado getString
+ * 的 getResultList 对末段只认 text/textNodes/ownText/html/all 关键字，其余都是 `elements.eachAttr(lastRule)`。HTML 标签名
+ * （`div@a`、`li@span`）在 legado 里同样是属性（多半取空），引擎当选择器偶能取到值、已在池的源靠它可读，照旧不动；`style` 两义，
+ * 按属性算。列表字段（legado getElements 把末段当选择器）不在 LAST_ATTR_FIELDS 里。
+ */
+const LAST_ATTR_FIELDS: ReadonlySet<string> = new Set([
+  'ruleSearch.name', 'ruleSearch.author', 'ruleSearch.bookUrl',
+  'ruleBookInfo.name', 'ruleBookInfo.author', 'ruleBookInfo.tocUrl',
+  'ruleToc.chapterName', 'ruleToc.chapterUrl', 'ruleToc.nextTocUrl',
+  'ruleContent.content', 'ruleContent.nextContentUrl',
+]);
+/** lastattr1029：legado 按 getStringList 取值的翻页字段——末段 attr 时逐节点取全部（如 `option@value` 的分页下拉）。 */
+const LAST_ATTR_LIST_FIELDS: ReadonlySet<string> = new Set(['ruleToc.nextTocUrl', 'ruleContent.nextContentUrl']);
+const HTML_TAG_NAMES: ReadonlySet<string> = new Set((
+  'a abbr address article aside audio b bdi bdo big blockquote body br button canvas caption center cite code col colgroup dd del '
+  + 'details dfn dialog dir div dl dt em embed fieldset figcaption figure font footer form frame frameset h1 h2 h3 h4 h5 h6 head header '
+  + 'hgroup hr i iframe img input ins kbd label legend li link main map mark menu meta meter nav nobr noscript object ol optgroup '
+  + 'option output p param picture pre progress q rp rt ruby s samp script section select small source span strike strong sub summary '
+  + 'sup svg table tbody td template textarea tfoot th thead time tr track tt u ul var video wbr'
+).split(' '));
+
+function lastAttrToken(token: string): boolean {
+  return /^[A-Za-z]\w*$/.test(token) && !TERMINAL_KEYWORDS.has(token) && !LEGADO_SPECIAL_VARS.has(token)
+    && !HTML_TAG_NAMES.has(token.toLowerCase());
+}
+
+/** 帧的 lastattr1029 口径：开关开且字段在 LAST_ATTR_FIELDS 里。 */
+function lastAttrActive(options: ParseOptions): boolean {
+  if (options.lastAttrSegment) return true;
+  return options.field !== undefined && LAST_ATTR_FIELDS.has(options.field)
+    && (options.lastAttrEnabled ?? engineSyntaxLastAttrEnabled());
+}
+
+/**
+ * 规则文本里是否可能有 lastattr1029 改口径的末段（compile.ts sourceUsesLastAttrSyntax 的语义位判据）：任一 `@` 后紧跟裸名、
+ * 裸名之后是串尾或 `##`/`||`/`&&`/`%%`/`@js:`/`<js>`。只看子串、宁宽勿漏（多算只是多重探一次）。
+ */
+export function ruleMayUseLastAttr(rule: string): boolean {
+  for (const m of rule.matchAll(/@([A-Za-z]\w*)\s*(?=$|##|\|\||&&|%%|@js:|<js>)/gi)) {
+    if (lastAttrToken(m[1])) return true;
+  }
+  return false;
 }
 
 // ---- 顶层入口 ----
@@ -698,6 +756,12 @@ export interface ParseOptions {
    * pagejs1029：详情页 name/author/tocUrl 首段 JS 不读 result/src 时挂 `detached`（ENGINE_SYNTAX_PAGE_DETACHED，须 JS_EXT）。默认读 env（缺失=off）。
    */
   pageDetachedEnabled?: boolean;
+  /**
+   * lastattr1029：字符串字段多段规则的末段裸名按属性取（ENGINE_SYNTAX_LAST_ATTR，只在 LAST_ATTR_FIELDS 上，见 lastAttrToken）。默认读 env（缺失=off）。
+   */
+  lastAttrEnabled?: boolean;
+  /** lastattr1029 内部：JS 链规则段（无字段名）沿用所在字段的口径——legado 链里每段 SourceRule 同走 getString。 */
+  lastAttrSegment?: boolean;
 }
 
 /**
@@ -720,15 +784,21 @@ function parseFieldRuleFramed(rule: string, options: ParseOptions): FieldIr {
   const savedBook = bookFrame;
   const savedSource = sourceFrame;
   const savedKeys = jsObjectKeys;
+  const savedLastAttr = lastAttr;
   jsonPathExt = options.jsonPathEnabled ?? engineSyntaxJsonPathEnabled();
   jsObjectKeys = bindActive(options);
+  lastAttr = lastAttrActive(options);
   sourceFrame = options.sourceConsts ?? sourceFrame;
   varBag = options.varBag;
   jsoupFrame = undefined;
   bookFrame = undefined;
   const bagKeys = varBag === undefined ? undefined : [...varBag.keys];
   try {
-    return parseFieldRuleWithObjectKey(rule, options);
+    const hitsBefore = lastAttrHits;
+    const field = parseFieldRuleWithObjectKey(rule, options);
+    // lastattr1029：next* 用到末段 attr 的非链规则按 legado getStringList 取全部值（多页并发），不再只取首个节点。
+    if (lastAttrHits > hitsBefore && !field.chain && LAST_ATTR_LIST_FIELDS.has(options.field ?? '')) return { ...field, lastAttrList: true };
+    return field;
   } catch (error) {
     if (!(error instanceof RuleEngineError) || error.code !== 'RULE_UNSUPPORTED') throw error;
     // 重试顺序：jsoup 单开（jsoup1028 原口径，逐字不变）→ book 单开 → 两者同开（book1028）。
@@ -781,6 +851,7 @@ function parseFieldRuleFramed(rule: string, options: ParseOptions): FieldIr {
     bookFrame = savedBook;
     sourceFrame = savedSource;
     jsObjectKeys = savedKeys;
+    lastAttr = savedLastAttr;
   }
 }
 
@@ -1152,7 +1223,9 @@ function parseJsChain(trimmed: string, rule: string, options: ParseOptions): Fie
     ? { options: segmentOptions, out: new Map(), aliases: initJs } : undefined;
   const util: JsUtil | undefined = (options.jsUtilEnabled ?? engineSyntaxJsUtilEnabled()) ? { used: false } : undefined;
   // andor1029：JS_EXT 同开时规则段按所在字段收 `&&`、跳过 `||` 空支（legado 链里每段 SourceRule 同样走 splitRule）。
-  const ruleOptions: ParseOptions = jsExt ? { ...segmentOptions, andEnabled: options.andEnabled, andField: field, emptyOrBranches: true } : segmentOptions;
+  const andOptions: ParseOptions = jsExt ? { ...segmentOptions, andEnabled: options.andEnabled, andField: field, emptyOrBranches: true } : segmentOptions;
+  // lastattr1029：规则段同所在字段口径（嵌套 {{}}/getter 实参不带）。
+  const ruleOptions: ParseOptions = lastAttrActive(options) ? { ...andOptions, lastAttrSegment: true } : andOptions;
   // nullskip1029：只挂 legado 走 getString（非 isUrl）的字段。
   const nullSkip = NULL_SKIP_FIELDS.has(field) && (options.nullSkipEnabled ?? engineSyntaxNullSkipEnabled());
   // pagejs1029：详情页字段首段 JS 不读输入时同条目级挂 detached（init 收窄后作用域没有原文，以空串起链）。

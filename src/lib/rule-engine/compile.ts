@@ -13,7 +13,7 @@ import { engineSearchJsActive, engineSearchOptionsActive } from './compile-smoke
 import { AIO_LIST_FIELDS, aioGroups } from './aio-syntax';
 import {
   FIELD_NET_FIELDS, initFieldSupported, initJsFieldSupported, initRuleTextSupported, jsChainFieldAllowed, listJsGroups, objectKeyOf, parseFieldRule,
-  ruleHasJs, type ParseOptions, type SourceConsts,
+  ruleHasJs, ruleMayUseLastAttr, type ParseOptions, type SourceConsts,
 } from './parse';
 import type { CompiledRules, FieldIr, RuleIr } from './types';
 import { analyzeJsLib, jsLibRuleProblem, type JsLib } from './js-lib';
@@ -24,7 +24,7 @@ import {
   engineSearchWebViewEnabled, engineSyntaxInitJsEnabled, engineSyntaxJsoupEnabled, engineSyntaxVarsBagEnabled,
   engineSyntaxBookFieldsEnabled, engineSyntaxSearchVarsEnabled, engineSyntaxItemVarsEnabled, engineSyntaxListGetEnabled, ENGINE_SEMANTICS_VERSION,
   engineSyntaxBookVariableEnabled, engineSyntaxJsLibEnabled, engineSyntaxSourceBindEnabled, engineSyntaxInitJsoupEnabled, engineSearchNetJsEnabled,
-  engineFieldNetJsEnabled, engineSearchConnectJsEnabled, engineSearchGetPostJsEnabled,
+  engineFieldNetJsEnabled, engineSearchConnectJsEnabled, engineSearchGetPostJsEnabled, engineSyntaxLastAttrEnabled,
 } from './syntax-flags';
 import { urlOptionFields } from './url-options';
 import {
@@ -128,6 +128,8 @@ export function engineVersionedKey(contentRevision: string, semanticsVersion = E
  * （searchTemplateUsesConnect）时再加 java.connect 位（+8589934592）。
  * getpost1029：同条件、ENGINE_SEARCH_GETPOST_JS on 且搜索模板里有 HTTP 形态的 java.get/java.post（searchTemplateUsesGetPost）时
  * 再加 java.get/post 位（+17179869184）。
+ * lastattr1029：ENGINE_SYNTAX_LAST_ATTR on 且准入搜索判定读的 ruleSearch.name/author/bookUrl 里可能有末段裸名（sourceUsesLastAttrSyntax）
+ * 时再加末段裸名位（+34359738368）；其余字段只改求值，不计位（同 nullskip1029）。
  */
 export function engineSourceRevision(
   source: { url: string; searchUrl: unknown; rules: Record<string, unknown> },
@@ -285,6 +287,7 @@ export function engineSourceRevision(
     }),
     searchNet((options.searchConnectJsEnabled ?? engineSearchConnectJsEnabled()) && searchTemplateUsesConnect(source.searchUrl)),
     searchNet((options.searchGetPostJsEnabled ?? engineSearchGetPostJsEnabled()) && searchTemplateUsesGetPost(source.searchUrl)),
+    (options.lastAttrEnabled ?? engineSyntaxLastAttrEnabled()) && sourceUsesLastAttrSyntax(rules),
   ));
 }
 
@@ -314,6 +317,19 @@ export function sourceUsesOrSyntax(rules: Record<string, unknown>): boolean {
 /** 源的规则组里是否可能有 XPath 段（xpath1027，口径见 ruleMayUseXPath；理由同 sourceUsesOrSyntax）。 */
 export function sourceUsesXPathSyntax(rules: Record<string, unknown>): boolean {
   return someRule(rules, ruleMayUseXPath);
+}
+
+/**
+ * 准入搜索判定读的 ruleSearch.name/author/bookUrl 里是否可能有 lastattr1029 改口径的末段（口径见 parse.ts ruleMayUseLastAttr；
+ * 理由同 sourceUsesOrSyntax）。
+ */
+export function sourceUsesLastAttrSyntax(rules: Record<string, unknown>): boolean {
+  const search = rules.ruleSearch;
+  if (!search || typeof search !== 'object' || Array.isArray(search)) return false;
+  return ['name', 'author', 'bookUrl'].some((key) => {
+    const rule = (search as Record<string, unknown>)[key];
+    return typeof rule === 'string' && ruleMayUseLastAttr(rule);
+  });
 }
 
 /** 源的规则组里是否有 @put/@get（vars1027；不涉及变量的源 resolveSourceVars 原样返回，identity 不该变）。 */

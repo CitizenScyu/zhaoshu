@@ -294,6 +294,11 @@ export interface FieldIr {
    * 求值时沙箱在规则代码前先求值库，失败即字段求值失败（legado 共享作用域口径）。未挂 = 旧链路逐字不变。
    */
   jsLib?: string;
+  /**
+   * 翻页字段（nextTocUrl/nextContentUrl）的非链规则用到末段裸名 attr（lastattr1029，ENGINE_SYNTAX_LAST_ATTR）：按 legado getStringList
+   * 逐节点取全部值、逐项套 `##` 替换（evaluate.ts evaluateFieldStrings），api.ts 照 JS 链口径取 1 个串行/多个并发。未挂 = 旧链路逐字不变。
+   */
+  lastAttrList?: true;
 }
 
 /** 装饰字段编译失败不阻断，标 skip 的占位。 */

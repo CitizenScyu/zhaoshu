@@ -1206,6 +1206,13 @@ export function evaluateFieldStrings(field: FieldIr, scope: EvalScope): string[]
 }
 
 function evaluateFieldStringsBody(field: FieldIr, scope: EvalScope): string[] {
+  if (!field.chain && field.lastAttrList) {
+    // lastattr1029：legado getStringList 末段 attr 逐节点取值，`##` 替换逐项套（不对拼接串）。
+    const { regex, ...bare } = field;
+    return splitLines(evaluateField(bare, scope, true))
+      .map((item) => (regex === undefined ? item : applyRegexSubs(item, regex)).trim())
+      .filter((item) => item !== '');
+  }
   if (!field.chain) {
     const value = evaluateField(field, scope);
     return value === '' ? [] : [value];
