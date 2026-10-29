@@ -313,8 +313,13 @@ export async function engineFetchToc(
   // JS 链 nextTocUrl 一次给出多页时（jsbox1027，legado BookChapterList 并发分支）：逐页全抓，这些页不再取下一页。
   // 非链字段恒为空，循环与改前逐字等价。
   const fanout: string[] = [];
+  // nextlist1029：并发页来自 nextList 字段（off 态只读得到首页）时，非 strict 按本源余量截断、交已读页，
+  // 不让 web 非首源的 L1 单源点数把整个目录打成 SOURCE_SCOPE_EXHAUSTED。JS 链的并发页不受影响。
+  let listFanout = false;
   for (let pageIndex = 0; (next || fanout.length > 0) && pageIndex < MAX_TOC_PAGES && seenUrls.size <= MAX_SOURCE_CHAPTERS; pageIndex += 1) {
     const fromFanout = !next;
+    // 脚本侧（engine-download）的 context 是只带 page 的裸对象：没有余量查询即不截断。
+    if (fromFanout && listFanout && !strict && typeof context.remainingFor === 'function' && context.remainingFor(0) < 1) break;
     if (!next) next = fanout.shift()!;
     if (visited.has(next)) { if (strict) throw new Error('pagination_cycle'); break; }
     visited.add(next);
@@ -370,7 +375,10 @@ export async function engineFetchToc(
       // JS 链在 JSON 页上照样求值（JS 段常用来解析 JSON 拼下一页）。
       const urls = chainNextUrls(nextField, scope, page.url, strict, nextField.nextList ? visited : undefined);
       next = urls.length === 1 ? urls[0] : undefined;
-      if (urls.length > 1) fanout.push(...urls.filter((url) => !visited.has(url)));
+      if (urls.length > 1) {
+        fanout.push(...urls.filter((url) => !visited.has(url)));
+        listFanout ||= nextField.nextList === true;
+      }
       continue;
     }
     // 只有当前页确实是 HTML 时才解析翻页 URL；否则链结束（避免对 JSON 输入跑 CSS 规则）。

@@ -98,6 +98,20 @@ describe('门面', () => {
     expect(offSeen).toEqual([`${SITE}/t/1.html`]);
   });
 
+  it('目录：非 strict 下拉并发页按本源余量截断、交已读页；strict 不截断', async () => {
+    vi.stubEnv('ENGINE_SYNTAX_NEXT_LIST', '1');
+    const rules = { ruleToc: { chapterList: '.ch', chapterName: 'a@text', chapterUrl: 'a@href', nextTocUrl: 'class.pg@option@value' } };
+    const budgeted = (seen: string[], limit: number) => Object.assign(ctx(tocPages, seen), { remainingFor: (reserve: number) => Math.max(0, limit - seen.length - reserve) });
+    const seen: string[] = [];
+    const toc = await engineFetchToc(src(rules), `${SITE}/t/1.html`, budgeted(seen, 2));
+    expect(toc.chapters.map((c) => c.title)).toEqual(['第1章', '第2章']);
+    expect(seen).toEqual([1, 2].map((n) => `${SITE}/t/${n}.html`));
+    const strictSeen: string[] = [];
+    // strict（准入/下载）照旧全抓：余量只在门面放宽口径里截断，不能让准入把半本目录当完整。
+    await engineFetchToc(src(rules), `${SITE}/t/1.html`, budgeted(strictSeen, 2), true);
+    expect(strictSeen).toHaveLength(3);
+  });
+
   it('目录：页码条只列后一页时 on 照旧串行', async () => {
     const pages = new Map([
       [`${SITE}/t/1.html`, `<ul>${ch(1)}</ul><a href="/t/2.html">下一页</a><p><a href="/t/2.html">下一页</a></p>`],
