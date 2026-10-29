@@ -678,3 +678,14 @@ export function engineSyntaxLastAttrEnabled(env: OrEnv = process.env): boolean {
   const raw = env.ENGINE_SYNTAX_LAST_ATTR?.trim().toLowerCase();
   return raw === '1' || raw === 'true' || raw === 'on';
 }
+
+/**
+ * ENGINE_SYNTAX_NEXT_LIST 独立开关（nextlist1029，默认 off，口径同 ENGINE_SYNTAX_OR）。on = 目录 nextTocUrl / 正文 nextContentUrl 的
+ * 非链 CSS 规则（可含 `||`，parse.ts nextListShape）按 legado getStringList 取全部值：分页下拉 `option@value` 每页都列出全部页，
+ * legado 取到多个即并发抓取，引擎旧口径只取首个（多半是当前页）→ 目录只剩首页。取到 1 个照旧串行，后页列出的已读页静默收尾
+ * （api.ts chainNextUrls）。off = 逐字不变。无新位：只改求值，准入搜索判定不读翻页字段。
+ */
+export function engineSyntaxNextListEnabled(env: OrEnv = process.env): boolean {
+  const raw = env.ENGINE_SYNTAX_NEXT_LIST?.trim().toLowerCase();
+  return raw === '1' || raw === 'true' || raw === 'on';
+}

@@ -103,17 +103,17 @@ describe('翻页字段列表口径（legado getStringList）', () => {
   const ch = (n: number) => `<li class="ch"><a href="/c/${n}.html">第${n}章</a></li>`;
   const tocScope = () => createScope(normalizeBody(`${ch(1)}${select}`), `${PSITE}/t/1.html`);
 
-  it('next* 非链规则末段 attr 挂 lastAttrList、逐节点取值、## 逐项替换；off / 非 next* / 关键字末段不挂', () => {
+  it('next* 非链规则末段 attr 挂 nextList、逐节点取值、## 逐项替换；off / 非 next* / 关键字末段不挂', () => {
     const f = on('class.pg@a@rel', 'ruleToc.nextTocUrl');
-    expect(f.lastAttrList).toBe(true);
+    expect(f.nextList).toBe(true);
     expect(evaluateFieldStrings(f, tocScope())).toEqual(['/t/1.html', '/t/2.html', '/t/3.html']);
     expect(evaluateFieldStrings(on('class.pg@a@rel##/t/##/p/', 'ruleContent.nextContentUrl'), tocScope()))
       .toEqual(['/p/1.html', '/p/2.html', '/p/3.html']);
-    expect(off('class.pg@a@rel', 'ruleToc.nextTocUrl').lastAttrList).toBeUndefined();
-    expect(on('class.pg@a@rel', 'ruleToc.chapterUrl').lastAttrList).toBeUndefined();
-    expect(on('class.pg@a@href', 'ruleToc.nextTocUrl').lastAttrList).toBeUndefined();
+    expect(off('class.pg@a@rel', 'ruleToc.nextTocUrl').nextList).toBeUndefined();
+    expect(on('class.pg@a@rel', 'ruleToc.chapterUrl').nextList).toBeUndefined();
+    expect(on('class.pg@a@href', 'ruleToc.nextTocUrl').nextList).toBeUndefined();
     const or = parseFieldRule('class.pg@a@rel||class.next@href', { field: 'ruleToc.nextTocUrl', lastAttrEnabled: true, orEnabled: true });
-    expect(or.lastAttrList).toBe(true);
+    expect(or.nextList).toBe(true);
     expect(evaluateFieldStrings(or, tocScope())).toEqual(['/t/1.html', '/t/2.html', '/t/3.html']);
   });
 

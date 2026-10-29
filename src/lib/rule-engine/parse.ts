@@ -29,7 +29,7 @@ import {
   engineSyntaxJsGetEnabled, engineSyntaxJsonPathEnabled, engineSyntaxJsUtilEnabled, engineSyntaxListJsEnabled, engineSyntaxOrEnabled,
   engineSyntaxRegexEnabled, engineSyntaxXPathEnabled, engineSyntaxXPathEvalEnabled, engineInitJsActive, engineSyntaxJsoupEnabled,
   engineSyntaxBookFieldsEnabled, engineSyntaxListGetEnabled, engineSyntaxInitJsoupEnabled, engineFieldNetJsEnabled,
-  engineSyntaxNullSkipEnabled, engineSyntaxPageDetachedEnabled, engineSyntaxLastAttrEnabled,
+  engineSyntaxNullSkipEnabled, engineSyntaxPageDetachedEnabled, engineSyntaxLastAttrEnabled, engineSyntaxNextListEnabled,
 } from './syntax-flags';
 import { compileXPath, XPathSyntaxError } from './xpath-eval';
 import { looksLikeXPath, xpathPrefixed, xpathSegmentBody, xpathToCss } from './xpath-subset';
@@ -68,7 +68,7 @@ let jsObjectKeys = false;
  * 嵌套解析（JS 链规则段、`{{规则}}`、getter 实参）不带字段名，不继承。
  */
 let lastAttr = false;
-/** lastattr1029：buildCssChain 按末段裸名编出 attr 终端的累计次数——next* 字段据此标 lastAttrList（legado getStringList 口径）。 */
+/** lastattr1029：buildCssChain 按末段裸名编出 attr 终端的累计次数——next* 字段据此标 nextList（legado getStringList 口径）。 */
 let lastAttrHits = 0;
 
 /**
@@ -583,8 +583,21 @@ const LAST_ATTR_FIELDS: ReadonlySet<string> = new Set([
   'ruleToc.chapterName', 'ruleToc.chapterUrl', 'ruleToc.nextTocUrl',
   'ruleContent.content', 'ruleContent.nextContentUrl',
 ]);
-/** lastattr1029：legado 按 getStringList 取值的翻页字段——末段 attr 时逐节点取全部（如 `option@value` 的分页下拉）。 */
-const LAST_ATTR_LIST_FIELDS: ReadonlySet<string> = new Set(['ruleToc.nextTocUrl', 'ruleContent.nextContentUrl']);
+/**
+ * legado 按 getStringList 取值的翻页字段：lastattr1029 末段 attr（如页码条 `a@rel`）或 nextlist1029 开关开时逐节点取全部
+ * （如分页下拉 `option@value`——value 本是终端关键字，只靠 nextlist1029）。
+ */
+const NEXT_LIST_FIELDS: ReadonlySet<string> = new Set(['ruleToc.nextTocUrl', 'ruleContent.nextContentUrl']);
+
+/**
+ * 能按列表口径逐项取值的翻页规则形态（evaluate.ts evaluateFieldStrings 的 nextList 分支）：非链、无 makeUp/`&&`/`%%`/放变量，
+ * 顶层候选只含 CSS 或全是 CSS 支的 `||`。XPath（multi 时元素节点出 HTML）、正则-only、模板、字面量、JSONPath 不挂，照旧单值。
+ */
+function nextListShape(field: FieldIr): boolean {
+  if (field.chain || field.makeUp || field.joins !== undefined || field.concats !== undefined || field.varPuts !== undefined) return false;
+  const css = (rule: RuleIr): boolean => rule.kind === 'css' || (rule.kind === 'or' && rule.branches.every((branch) => branch.kind === 'css'));
+  return field.rules.length > 0 && field.rules.every(css);
+}
 const HTML_TAG_NAMES: ReadonlySet<string> = new Set((
   'a abbr address article aside audio b bdi bdo big blockquote body br button canvas caption center cite code col colgroup dd del '
   + 'details dfn dialog dir div dl dt em embed fieldset figcaption figure font footer form frame frameset h1 h2 h3 h4 h5 h6 head header '
@@ -762,6 +775,10 @@ export interface ParseOptions {
   lastAttrEnabled?: boolean;
   /** lastattr1029 内部：JS 链规则段（无字段名）沿用所在字段的口径——legado 链里每段 SourceRule 同走 getString。 */
   lastAttrSegment?: boolean;
+  /**
+   * nextlist1029：翻页字段的非链 CSS 规则按 legado getStringList 取全部值（ENGINE_SYNTAX_NEXT_LIST，见 nextListShape）。默认读 env（缺失=off）。
+   */
+  nextListEnabled?: boolean;
 }
 
 /**
@@ -796,8 +813,10 @@ function parseFieldRuleFramed(rule: string, options: ParseOptions): FieldIr {
   try {
     const hitsBefore = lastAttrHits;
     const field = parseFieldRuleWithObjectKey(rule, options);
-    // lastattr1029：next* 用到末段 attr 的非链规则按 legado getStringList 取全部值（多页并发），不再只取首个节点。
-    if (lastAttrHits > hitsBefore && !field.chain && LAST_ATTR_LIST_FIELDS.has(options.field ?? '')) return { ...field, lastAttrList: true };
+    // lastattr1029 / nextlist1029：next* 的 CSS 规则用到末段 attr、或开关开时，按 legado getStringList 取全部值（多页并发），
+    // 不再只取首个节点。
+    if (NEXT_LIST_FIELDS.has(options.field ?? '') && nextListShape(field)
+      && (lastAttrHits > hitsBefore || (options.nextListEnabled ?? engineSyntaxNextListEnabled()))) return { ...field, nextList: true };
     return field;
   } catch (error) {
     if (!(error instanceof RuleEngineError) || error.code !== 'RULE_UNSUPPORTED') throw error;

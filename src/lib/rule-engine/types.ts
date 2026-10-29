@@ -295,10 +295,11 @@ export interface FieldIr {
    */
   jsLib?: string;
   /**
-   * 翻页字段（nextTocUrl/nextContentUrl）的非链规则用到末段裸名 attr（lastattr1029，ENGINE_SYNTAX_LAST_ATTR）：按 legado getStringList
-   * 逐节点取全部值、逐项套 `##` 替换（evaluate.ts evaluateFieldStrings），api.ts 照 JS 链口径取 1 个串行/多个并发。未挂 = 旧链路逐字不变。
+   * 翻页字段（nextTocUrl/nextContentUrl）的非链 CSS 规则按 legado getStringList 取值（parse.ts nextListShape）：用到末段裸名 attr
+   * （lastattr1029，ENGINE_SYNTAX_LAST_ATTR）或 ENGINE_SYNTAX_NEXT_LIST on（nextlist1029）时挂。逐节点取全部值、逐项套 `##` 替换
+   * （evaluate.ts evaluateFieldStrings），api.ts 照 JS 链口径取 1 个串行/多个并发。未挂 = 旧链路逐字不变。
    */
-  lastAttrList?: true;
+  nextList?: true;
 }
 
 /** 装饰字段编译失败不阻断，标 skip 的占位。 */

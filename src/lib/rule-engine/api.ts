@@ -124,7 +124,7 @@ function replayScope<S>(first: S, make: () => S): () => S {
 /**
  * JS 链下一页（jsbox1027，legado getStringList(isUrl=true)）：逐项绝对化、去重，去掉当前页（legado 目录
  * 排除 redirectUrl、正文以 nextUrlList 起始项排除）。strict 下任一项过不了 host 门即 invalid_next_page。
- * read（lastattr1029 列表式分页才传）：已读页也剔除——页码条/下拉每页都列全部页，后页列出的已读页按 legado nextUrlList 静默收尾，不当成环。
+ * read（lastattr1029 / nextlist1029 列表式分页才传）：已读页也剔除——页码条/下拉每页都列全部页，后页列出的已读页按 legado nextUrlList 静默收尾，不当成环。
  */
 function chainNextUrls(
   ir: FieldIr, scope: ReturnType<typeof createScope>, pageUrl: string, strict: boolean, read?: ReadonlySet<string>,
@@ -146,11 +146,12 @@ function chainNextUrls(
 }
 
 /**
- * 下一页按列表口径取（chainNextUrls）：JS 链，或末段 attr 的非链规则（lastattr1029，FieldIr.lastAttrList，legado getStringList——
- * `option@value` 分页下拉一次给出全部页）。后者同旧口径只在 HTML 页上跑；未挂标记 = 旧单值口径逐字不变。
+ * 下一页按列表口径取（chainNextUrls）：JS 链，或挂了 FieldIr.nextList 的非链 CSS 规则（lastattr1029 末段 attr 如页码条 `a@rel`、
+ * nextlist1029 开关开时如分页下拉 `option@value`，legado getStringList 一次给出全部页）。后者同旧口径只在 HTML 页上跑；
+ * 未挂标记 = 旧单值口径逐字不变。
  */
 function nextUsesList(ir: FieldIr | SkippedField | undefined, scope: ReturnType<typeof createScope>): ir is FieldIr {
-  return fieldUsesJs(ir) || (ir !== undefined && !('skipped' in ir) && ir.lastAttrList === true && scope.kind === 'html');
+  return fieldUsesJs(ir) || (ir !== undefined && !('skipped' in ir) && ir.nextList === true && scope.kind === 'html');
 }
 
 /** ruleSearch.bookList → 逐条 name/author/bookUrl；身份判定不在这里（§7.1）。 */
@@ -367,7 +368,7 @@ export async function engineFetchToc(
     const nextField = field(source.compiled, 'ruleToc.nextTocUrl');
     if (nextUsesList(nextField, scope)) {
       // JS 链在 JSON 页上照样求值（JS 段常用来解析 JSON 拼下一页）。
-      const urls = chainNextUrls(nextField, scope, page.url, strict, nextField.lastAttrList ? visited : undefined);
+      const urls = chainNextUrls(nextField, scope, page.url, strict, nextField.nextList ? visited : undefined);
       next = urls.length === 1 ? urls[0] : undefined;
       if (urls.length > 1) fanout.push(...urls.filter((url) => !visited.has(url)));
       continue;
@@ -484,7 +485,7 @@ export async function engineFetchContent(
     }
     if (nextUsesList(nextRule, scope)) {
       // 命中停止地址（下一章）的项先剔除：单项时等同 legado 顺序分支「等于下一章即停」，多项时不把下一章当本章分页抓。
-      const urls = chainNextUrls(nextRule, scope, page.url, strict, nextRule.lastAttrList ? visited : undefined)
+      const urls = chainNextUrls(nextRule, scope, page.url, strict, nextRule.nextList ? visited : undefined)
         .filter((url) => !stopKeys.has(pageIdentity(url)));
       next = urls.length === 1 ? urls[0] : undefined;
       if (urls.length > 1) fanout.push(...urls.filter((url) => !visited.has(url)));
