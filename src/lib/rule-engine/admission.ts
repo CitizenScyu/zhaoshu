@@ -620,8 +620,12 @@ async function readCappedBody(response: Response, signal: AbortSignal, maxBytes:
  * 41-admpost：request 携带 method/body/白名单头/charset（flag 开时由 buildAdmissionSearchRequest 产出）。
  * body 按 charset 字节化；仅连续同 origin 307/308 保留 POST，其余跳转降 GET（同 source-fetch 语义）。
  * flag 开时采用运行时搜索的声明/响应头优先级；flag 关时保持 UTF8。
+ * getpost1029：noFollow = 搜索 JS 的 java.get/post（jsoup followRedirects(false)）：3xx 原样返回、另带响应头条目，
+ * body 按 HTTP 声明字符集、没有则 UTF-8（同 fetchSourceText noFollow）。
  */
-async function admissionFetch(request: SourceSearchRequest, options: AdmissionFetchOptions): Promise<{ url: string; status: number; text: string }> {
+async function admissionFetch(
+  request: SourceSearchRequest, options: AdmissionFetchOptions, noFollow = false,
+): Promise<{ url: string; status: number; text: string; headers?: [string, string][] }> {
   const {
     fetchPage, declaredHosts, signal, timeoutMs = ADMISSION_TIMEOUT_MS,
     maxRedirects = ADMISSION_MAX_REDIRECTS, maxBytes = ADMISSION_MAX_BYTES,
@@ -660,6 +664,11 @@ async function admissionFetch(request: SourceSearchRequest, options: AdmissionFe
         method: sendOriginalRequest ? request.method : 'GET',
         body: sendOriginalRequest && request.method === 'POST' ? bodyBytes : undefined,
       });
+      if (noFollow) {
+        const text = await readCappedBody(response, probeSignal, maxBytes, charsetFromContentType(response.headers.get('content-type')) ?? 'utf-8');
+        probeSignal.throwIfAborted();
+        return { url: current, status: response.status, text, headers: [...response.headers] };
+      }
       if ([301, 302, 303, 307, 308].includes(response.status)) {
         const location = response.headers.get('location');
         cancelBody(response);
@@ -766,6 +775,7 @@ class AdmissionAjaxError extends Error {
  * netjs1029：同 buildAdmissionSearch，搜索 JS 的 java.ajax 页面走准入通道（admissionFetch，准入门、非 2xx 判失败）取回后重放求值；
  * 非联网模板与 buildAdmissionSearch 结果相同。`afterRequest`：构造前刚打过同站请求（对照搜索），首个 ajax 前先歇一个节流间隔；
  * ajax 之间同样补间隔。fetched = 取了几页（调用方据此给紧接的搜索请求补间隔）。取页失败抛 AdmissionAjaxError。
+ * getpost1029：java.get/post 的页不跟随跳转取（noFollow），2xx/3xx 都算取到（jsoup 只对 <200 / ≥400 抛错），另带状态码与响应头。
  */
 async function buildAdmissionSearchNet(
   source: RawSource, options: Parameters<typeof searchAdmission>[1], keyword: string, afterRequest: boolean,
@@ -774,17 +784,18 @@ async function buildAdmissionSearchNet(
   const { base, validate } = admissionSearchScope(source, options.declaredHosts);
   const throttleMs = options.throttleMs ?? ADMISSION_THROTTLE_MS;
   let fetched = 0;
-  const built = await buildSearchRequestWithNet(source.searchUrl, keyword, base, validate, engineSearchJsActive(), async (request) => {
-    let page: { url: string; status: number; text: string };
+  const built = await buildSearchRequestWithNet(source.searchUrl, keyword, base, validate, engineSearchJsActive(), async (request, net) => {
+    const noFollow = net?.noFollow === true;
+    let page: { url: string; status: number; text: string; headers?: [string, string][] };
     try {
       if (throttleMs > 0 && (afterRequest || fetched > 0)) await (options.sleep ?? defaultSleep)(throttleMs, options.signal);
       fetched += 1;
-      page = await admissionFetch(request, options);
+      page = await admissionFetch(request, options, noFollow);
     } catch (error) {
       throw new AdmissionAjaxError(undefined, error);
     }
-    if (page.status < 200 || page.status >= 300) throw new AdmissionAjaxError(page.status, undefined);
-    return { url: page.url, text: page.text };
+    if (page.status < 200 || page.status >= (noFollow ? 400 : 300)) throw new AdmissionAjaxError(page.status, undefined);
+    return noFollow ? { url: page.url, text: page.text, status: page.status, headers: page.headers } : { url: page.url, text: page.text };
   });
   return { ...built, fetched };
 }

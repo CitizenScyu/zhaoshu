@@ -393,6 +393,20 @@ const SEARCH_OPTION_KEYS = new Set(['method', 'body', 'charset', 'headers']);
 // 仅允许的安全请求头（小写匹配）；其余静默丢弃，绝不透传 Cookie/Authorization 等。
 const ALLOWED_REQUEST_HEADERS = new Set(['content-type', 'referer', 'user-agent']);
 
+/**
+ * getpost1029：搜索 JS 的 java.get/java.post 请求头（jsoup Connection.headers(Map)）按同一白名单过滤，其余静默丢弃；
+ * jsoup 设头不分大小写、后设覆盖先设。没有留下的返回 undefined。
+ */
+export function allowedSearchRequestHeaders(entries: readonly (readonly [string, string])[]): Record<string, string> | undefined {
+  const headers: Record<string, string> = {};
+  for (const [name, value] of entries) {
+    if (!ALLOWED_REQUEST_HEADERS.has(name.toLowerCase())) continue;
+    for (const key of Object.keys(headers)) if (key.toLowerCase() === name.toLowerCase()) delete headers[key];
+    headers[name] = value;
+  }
+  return Object.keys(headers).length ? headers : undefined;
+}
+
 /** 受限容错 JSON：先严格解析，失败再把单引号整体换双引号重试；仍失败返回 null（判不支持，不崩）。 */
 function parseSearchOptions(raw: string): Record<string, unknown> | null {
   for (const candidate of [raw, raw.replace(/'/g, '"')]) {
@@ -731,6 +745,15 @@ export function searchTemplateUsesAjax(template: unknown): boolean {
 /** connectnet1029：搜索模板里是否出现 `java.connect(` 调用（口径同 searchTemplateUsesAjax，宁宽勿漏）。 */
 export function searchTemplateUsesConnect(template: unknown): boolean {
   return typeof template === 'string' && /\bjava\s*\.\s*connect\s*\(/.test(template);
+}
+
+/**
+ * getpost1029：搜索模板里是否出现 HTTP 形态的 `java.post(` 或带第二个实参的 `java.get(…, …)`（单参 java.get 是变量袋读取，不算）。
+ * 口径同 searchTemplateUsesAjax，宁宽勿漏：首个实参里只看一层括号，看不准的多算只是多走一次 jsoup 包装求值。
+ */
+export function searchTemplateUsesGetPost(template: unknown): boolean {
+  return typeof template === 'string'
+    && (/\bjava\s*\.\s*post\s*\(/.test(template) || /\bjava\s*\.\s*get\s*\((?:[^()]|\([^()]*\))*,/.test(template));
 }
 
 // legado NetworkUtils.notNeedEncodingQuery / notNeedEncodingForm 与 AnalyzeUrl.queryEncoder

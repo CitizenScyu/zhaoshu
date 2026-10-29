@@ -5,7 +5,7 @@
 // 产物自然失效，不存在「|| 开关打开后仍复用 off 态编译缓存」的窗口。
 import {
   MAX_SEARCH_JS_LONG_TEMPLATE_LENGTH, MAX_SEARCH_JS_TEMPLATE_LENGTH, searchOptionsMayUseWebView, searchOptionsNeedParity,
-  searchTemplateNeedsJs, searchTemplateUsesAjax, searchTemplateUsesCjkEncodeUri, searchTemplateUsesConnect,
+  searchTemplateNeedsJs, searchTemplateUsesAjax, searchTemplateUsesCjkEncodeUri, searchTemplateUsesConnect, searchTemplateUsesGetPost,
 } from '@/lib/source-parser';
 import { upgradeSourceTemplateUrl } from '@/lib/source-policy';
 import { sourceRevision } from '@/lib/source-revision';
@@ -24,7 +24,7 @@ import {
   engineSearchWebViewEnabled, engineSyntaxInitJsEnabled, engineSyntaxJsoupEnabled, engineSyntaxVarsBagEnabled,
   engineSyntaxBookFieldsEnabled, engineSyntaxSearchVarsEnabled, engineSyntaxItemVarsEnabled, engineSyntaxListGetEnabled, ENGINE_SEMANTICS_VERSION,
   engineSyntaxBookVariableEnabled, engineSyntaxJsLibEnabled, engineSyntaxSourceBindEnabled, engineSyntaxInitJsoupEnabled, engineSearchNetJsEnabled,
-  engineFieldNetJsEnabled, engineSearchConnectJsEnabled,
+  engineFieldNetJsEnabled, engineSearchConnectJsEnabled, engineSearchGetPostJsEnabled,
 } from './syntax-flags';
 import { urlOptionFields } from './url-options';
 import {
@@ -69,6 +69,8 @@ export interface CompileOptions extends ParseOptions {
   searchNetJsEnabled?: boolean;
   /** connectnet1029：搜索 java.connect（ENGINE_SEARCH_CONNECT_JS，默认读 env；须搜索联网 JS 各条件同开）。只影响语义版本位。 */
   searchConnectJsEnabled?: boolean;
+  /** getpost1029：搜索 java.get/java.post（ENGINE_SEARCH_GETPOST_JS，默认读 env；须搜索联网 JS 各条件同开）。只影响语义版本位。 */
+  searchGetPostJsEnabled?: boolean;
 }
 
 /** 版本化缓存键（P0 口径）：semanticsVersion:contentRevision。 */
@@ -124,6 +126,8 @@ export function engineVersionedKey(contentRevision: string, semanticsVersion = E
  * （sourceUsesFieldNetSyntax）时再加字段联网 JS 位（+4294967296）。其余位的探测不传本开关（读 env，同 listget1028 口径）。
  * connectnet1029：搜索联网 JS 位除「带 java.ajax」外的各条件成立、ENGINE_SEARCH_CONNECT_JS on 且搜索模板里有 java.connect 调用
  * （searchTemplateUsesConnect）时再加 java.connect 位（+8589934592）。
+ * getpost1029：同条件、ENGINE_SEARCH_GETPOST_JS on 且搜索模板里有 HTTP 形态的 java.get/java.post（searchTemplateUsesGetPost）时
+ * 再加 java.get/post 位（+17179869184）。
  */
 export function engineSourceRevision(
   source: { url: string; searchUrl: unknown; rules: Record<string, unknown> },
@@ -280,6 +284,7 @@ export function engineSourceRevision(
       bookVariablePuts: bookVariable ? sourceBookVariablePuts(source) ?? undefined : undefined,
     }),
     searchNet((options.searchConnectJsEnabled ?? engineSearchConnectJsEnabled()) && searchTemplateUsesConnect(source.searchUrl)),
+    searchNet((options.searchGetPostJsEnabled ?? engineSearchGetPostJsEnabled()) && searchTemplateUsesGetPost(source.searchUrl)),
   ));
 }
 

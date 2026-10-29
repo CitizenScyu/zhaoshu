@@ -143,13 +143,22 @@ interface FetchSourceOptions {
   request?: SourcePageRequest;
   /** 显式字符集、或auto（HTTP声明→有界HTML head meta→UTF8）；缺省仍为UTF8。 */
   responseCharset?: SourceCharset | 'auto';
+  /**
+   * getpost1029（搜索 JS 的 java.get/post，jsoup followRedirects(false)）：不跟随跳转，3xx 连同 body 原样返回；
+   * 2xx/3xx 以外照旧抛 SourceHttpError；body 按 HTTP 声明字符集、没有则 UTF-8（不看 meta，responseCharset 不用）；
+   * 返回另带状态码与响应头条目（Headers 迭代口径：名小写，set-cookie 逐条、其余同名合并）。
+   */
+  noFollow?: boolean;
 }
+
+/** fetchSourceText 的结果；status/headers 只在 noFollow 时给。 */
+export interface SourceFetchedPage { url: string; text: string; status?: number; headers?: [string, string][] }
 
 // 41-M1.3：主机级健康记忆（source-host-health.ts）的唯一记录点——builtin 与引擎两条腿的每次逻辑请求都经过这里。
 // 换 host 兜底算同一次逻辑请求：任一 host 拿到正文即记成功；失败只按传输层硬失败计数（hostFailureKind），
 // HTTP 失败按实际响应 host 记、传输层错误记在初始 URL 的 host 上（apex 与 www 在健康记忆里是同一个站）。
 // 父 signal 已中止（调用方取消、切片到点）不计：那是调用方的时间决定，不是 host 的健康信号。
-export async function fetchSourceText(input: string, options: FetchSourceOptions) {
+export async function fetchSourceText(input: string, options: FetchSourceOptions): Promise<SourceFetchedPage> {
   options.signal.throwIfAborted();
   const initial = validateSourceUrl(input);
   // 退休 builtin 门（request640）：host 门（validateSourceUrl）只管「认得这个 host」，
@@ -172,12 +181,12 @@ export async function fetchSourceText(input: string, options: FetchSourceOptions
 async function fetchWithHostSwap(initial: URL, {
   signal: parentSignal, timeoutMs = SOURCE_TIMEOUT_MS, connectTimeoutMs = SOURCE_CONNECT_TIMEOUT_MS,
   maxRedirects = MAX_SOURCE_REDIRECTS, maxBytes = MAX_SOURCE_BYTES,
-  beforeRequest, beforeFetch, request, responseCharset,
-}: FetchSourceOptions) {
+  beforeRequest, beforeFetch, request, responseCharset, noFollow,
+}: FetchSourceOptions): Promise<SourceFetchedPage> {
   const swapped = swapHost(initial);
   try {
     return await attemptOnce(initial, {
-      signal: parentSignal, timeoutMs, connectTimeoutMs, maxRedirects, maxBytes, beforeRequest, beforeFetch, request, responseCharset,
+      signal: parentSignal, timeoutMs, connectTimeoutMs, maxRedirects, maxBytes, beforeRequest, beforeFetch, request, responseCharset, noFollow,
     });
   } catch (error) {
     // 4xx/5xx/策略拒绝：源站行为或响应侧判定，换 host 不改变结果，原样上抛；
@@ -187,7 +196,7 @@ async function fetchWithHostSwap(initial: URL, {
     await sourceHostSwapDelay(parentSignal);
     parentSignal.throwIfAborted();
     return await attemptOnce(swapped, {
-      signal: parentSignal, timeoutMs, connectTimeoutMs, maxRedirects, maxBytes, beforeRequest, beforeFetch, request, responseCharset,
+      signal: parentSignal, timeoutMs, connectTimeoutMs, maxRedirects, maxBytes, beforeRequest, beforeFetch, request, responseCharset, noFollow,
       skipFirstBeforeRequest: true,
     });
   }
@@ -233,7 +242,7 @@ function assertNotRetiredBuiltin(target: URL): void {
 
 async function attemptOnce(start: URL, {
   signal: parentSignal, timeoutMs, connectTimeoutMs, maxRedirects, maxBytes, beforeRequest, beforeFetch, request, responseCharset,
-  skipFirstBeforeRequest = false,
+  noFollow = false, skipFirstBeforeRequest = false,
 }: {
   signal: AbortSignal;
   timeoutMs: number;
@@ -245,9 +254,11 @@ async function attemptOnce(start: URL, {
   beforeFetch?: (signal: AbortSignal, url: string) => void | Promise<void>;
   request?: SourcePageRequest;
   responseCharset?: SourceCharset | 'auto';
+  /** 同 FetchSourceOptions.noFollow（getpost1029）。 */
+  noFollow?: boolean;
   /** 换 host 重试的首次请求：与失败的那次是同一逻辑请求，预算/节流不重复扣。 */
   skipFirstBeforeRequest?: boolean;
-}) {
+}): Promise<SourceFetchedPage> {
   let current = start.href;
   const visited = new Set([current]);
   const controller = new AbortController();
@@ -298,6 +309,16 @@ async function attemptOnce(start: URL, {
         clearTimeout(connectTimer);
       }
       if (received.redirected) throw new SourcePolicyError('书源响应发生未受控跳转');
+      if (noFollow) {
+        // getpost1029：jsoup followRedirects(false) + 默认 ignoreHttpErrors(false)：状态 <200 或 ≥400 抛 HttpStatusException。
+        if (received.status < 200 || received.status >= 400) {
+          throw new SourceHttpError(received.status, parseRetryAfterMs(received.headers.get('retry-after')), new URL(current).hostname);
+        }
+        const charset = charsetFromContentType(received.headers.get('content-type')) ?? 'utf-8';
+        const text = await responseText(received, signal, maxBytes, charset, false);
+        signal.throwIfAborted();
+        return { url: current, text, status: received.status, headers: [...received.headers] };
+      }
       if ([301, 302, 303, 307, 308].includes(received.status)) {
         const location = received.headers.get('location');
         cancelBody(received);

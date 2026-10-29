@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import { getSql } from './db';
 import { getReadingSources, getSourcePools, type ReadingSource, type SelectableSources } from './shuyuan';
 import { shuyuanReadCacheTtlMs } from './read-cache-ttl';
-import { fetchSourceText, sourceAbortable, SourceHttpError, SOURCE_CONNECT_TIMEOUT_MS, SOURCE_TIMEOUT_MS, type SourcePageRequest } from './source-fetch';
+import { fetchSourceText, sourceAbortable, SourceHttpError, SOURCE_CONNECT_TIMEOUT_MS, SOURCE_TIMEOUT_MS, type SourceFetchedPage, type SourcePageRequest } from './source-fetch';
 import { SourcePolicyError, stationKeyOfUrl, validateSourceUrl } from './source-policy';
 import { sourceRevision } from './source-revision';
 import { isHostSuspect, orderByHostHealth, recordHostFailure } from './source-host-health';
@@ -242,10 +242,14 @@ interface SourceContextOptions {
   cooldownSlots?: Map<string, number>;
 }
 
-/** page() 取页可选覆写（41-postsearch）：request=POST/body/头，responseCharset=响应解码字符集，attempts=重试次数。 */
+/**
+ * page() 取页可选覆写（41-postsearch）：request=POST/body/头，responseCharset=响应解码字符集，attempts=重试次数。
+ * noFollow = 不跟随跳转、另带回状态码与响应头（getpost1029，见 fetchSourceText）。
+ */
 export interface SourcePageOptions {
   request?: SourcePageRequest;
   responseCharset?: SourcePageRequest['charset'] | 'auto';
+  noFollow?: boolean;
   attempts?: number;
 }
 
@@ -370,8 +374,8 @@ export class SourceRequestContext {
     this.budget.cooldownUntil.delete(key);
   }
 
-  async page(url: string, opts: SourcePageOptions = {}): Promise<{ url: string; text: string }> {
-    const { request, responseCharset, attempts = MAX_SOURCE_ATTEMPTS } = opts;
+  async page(url: string, opts: SourcePageOptions = {}): Promise<SourceFetchedPage> {
+    const { request, responseCharset, noFollow, attempts = MAX_SOURCE_ATTEMPTS } = opts;
     let lastError: unknown;
     const throttleKey = sourceThrottleKey(url);
     for (let attempt = 0; attempt < attempts; attempt++) {
@@ -381,6 +385,7 @@ export class SourceRequestContext {
           signal: this.signal,
           request,
           responseCharset,
+          ...(noFollow ? { noFollow } : {}),
           beforeRequest: async (signal, targetUrl) => {
             // 新调用先检查窗口，冷却中的请求不预扣点数、不占节流槽。
             this.checkCooldown(targetUrl ?? url, signal);

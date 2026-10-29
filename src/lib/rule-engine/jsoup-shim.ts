@@ -671,7 +671,11 @@ export const JSOUP_PRELUDE = `(function(){
   // raw().request().url() 得 okhttp HttpUrl（转字符串 = 最终地址，toString() 得 Java 字符串），url()/body() 得 Java 字符串。
   // 其余成员（code/headers/message…）、StrResponse/Response/Request 转字符串（Rhino 是 okhttp 的 toString）、不调用就拿方法
   // 参与运算一律失败。这几种对象不登记进 kinds：导出/条目口径按普通对象走（HttpUrl 转串得地址，其余转串失败）。
-  var netT = new WeakMap(), netKinds = new WeakMap();
+  // getpost1029：http 回调（ENGINE_SEARCH_GETPOST_JS）收 [方法, 地址, body|null, 请求头条目]、返回 [状态码, 响应头条目 JSON, body]，
+  // 包成 jsoup Connection.Response 的子集：header(name)（不分大小写、多值以 ", " 连接、没有得 null）、headers(name)（Java List：
+  // 下标/size()/get(i)、转字符串 "[a, b]"）、statusCode()、body()。其余成员（headers() 整表、cookies()、url()…）一律失败。
+  // 成员表的 TPK = 转原始值口径（没有即失败）、IXK = 按下标取（Java List）；方法实参个数 = 成员函数形参数 − 1。
+  var netT = new WeakMap(), netKinds = new WeakMap(), TPK = Symbol('tp'), IXK = Symbol('ix');
   function NO(name, v, members) {
     var t = OC(null), rec = { n: name, v: v, m: members }, p = new P(t, NH);
     wmSet(netT, t, rec); wmSet(netKinds, p, rec);
@@ -680,12 +684,18 @@ export const JSOUP_PRELUDE = `(function(){
   function badMethodPrim() { return bad('Java 方法对象参与运算'); }
   var NH = {
     get: function(t, p){
-      var rec = wmGet(netT, t);
-      if (p === TP && rec.m === UM) return function(){ return rec.v; };
+      var rec = wmGet(netT, t), tp = rec.m[TPK], ix = rec.m[IXK];
+      if (p === TP && tp !== undefined) return function(){ return tp(rec.v); };
       if (typeof p === 'symbol') return bad(rec.n + ' 的 ' + S(p) + ' 不支持');
+      if (ix !== undefined && reTest(IDX, p)) return ix(rec.v, N(p));
       var m = rec.m[p];
       if (m === undefined) return bad(rec.n + '.' + p + ' 不支持');
-      var f = function(){ arity(arguments.length, 0, 0, rec.n + '.' + p); return m(rec.v); };
+      var f = function(){
+        arity(arguments.length, m.length - 1, m.length - 1, rec.n + '.' + p);
+        var a = [rec.v];
+        for (var i = 0; i < arguments.length; i++) push(a, arguments[i]);
+        return RA(m, null, a);
+      };
       defProp(f, TP, { value: badMethodPrim });
       return f;
     },
@@ -693,13 +703,34 @@ export const JSOUP_PRELUDE = `(function(){
     set: denyWrite('Java 对象'), defineProperty: denyWrite('Java 对象'), deleteProperty: denyWrite('Java 对象'),
     preventExtensions: denyWrite('Java 对象'), getPrototypeOf: noProto,
   };
-  var UM = OC(null), TM = OC(null), QM = OC(null), RM = OC(null);
+  var UM = OC(null), TM = OC(null), QM = OC(null), RM = OC(null), XM = OC(null), HL = OC(null);
+  UM[TPK] = function(v){ return v; };
   UM.toString = function(v){ return JS(v); };
   TM.url = function(v){ return NO('HttpUrl', v, UM); };
   QM.request = function(v){ return NO('Request', v, TM); };
   RM.raw = function(v){ return NO('Response', v[0], QM); };
   RM.url = function(v){ return JS(v[0]); };
   RM.body = function(v){ return JS(v[1]); };
+  function hdrs(v, name) {
+    var n = lower(sArg(name, 'Response.header')), out = [];
+    for (var i = 0; i < v.h.length; i++) if (lower(v.h[i][0]) === n) push(out, v.h[i][1]);
+    return out;
+  }
+  XM.header = function(v, name){ var a = hdrs(v, name); return a.length ? JS(join(a, ', ')) : null; };
+  XM.headers = function(v, name){ return NO('List', hdrs(v, name), HL); };
+  XM.statusCode = function(v){ return v.s; };
+  XM.body = function(v){ return JS(v.b); };
+  function listStr(v) { return '[' + join(v, ', ') + ']'; }
+  function listAt(v, i) {
+    if (typeof i !== 'number' || trunc(i) !== i || i < 0 || i >= v.length) return bad('List 下标越界');
+    return JS(v[i]);
+  }
+  HL[TPK] = listStr;
+  HL[IXK] = listAt;
+  HL.toString = function(v){ return JS(listStr(v)); };
+  HL.size = function(v){ return v.length; };
+  HL.isEmpty = function(v){ return v.length === 0; };
+  HL.get = function(v, i){ return listAt(v, i); };
   function unUrl(v) {
     if (typeof v !== 'object' || v === null) return undefined;
     var rec = wmGet(netKinds, v);
@@ -720,10 +751,31 @@ export const JSOUP_PRELUDE = `(function(){
       return NO('StrResponse', [S(r[0]), S(r[1])], RM);
     };
   }
-  if (typeof j.ajax === 'function' || typeof j.connect === 'function') {
+  var hreq;
+  if (typeof j.http === 'function') {
+    var hp = j.http, jparse = JSON.parse;
+    delete j.http;
+    // legado JsExtensions.get/post 的 headers 是 Map<String, String>：只收普通对象、字符串值（Rhino 转 Map 后非字符串值在 jsoup 里出错）。
+    hreq = function(method, url, body, headers){
+      var what = method === 'GET' ? 'java.get' : 'java.post';
+      if (typeof headers !== 'object' || headers === null || kindOf(headers) !== undefined || wmGet(netKinds, headers) !== undefined
+        || isArr(headers) || getProto(headers) !== OP) return bad(what + ' 的请求头须是普通对象');
+      var names = ownNames(headers), es = [];
+      for (var i = 0; i < names.length; i++) {
+        var d = ownDesc(headers, names[i]);
+        if (reTest(IDX, names[i]) || !d.enumerable || !('value' in d)) return bad(what + ' 的请求头口径不复现');
+        push(es, [names[i], sArg(d.value, what + ' 的请求头值')]);
+      }
+      var u = unUrl(url);
+      var r = hp(stringify([method, u !== undefined ? u : sArg(url, what), body === null ? null : sArg(body, what), es]));
+      return NO('Response', { s: N(r[0]), h: jparse(r[1]), b: S(r[2]) }, XM);
+    };
+  }
+  if (typeof j.ajax === 'function' || typeof j.connect === 'function' || hreq !== undefined) {
     defProp(globalThis, '__jstr', { value: freeze({
       un: function(v){ var k = kindOf(v); return k !== undefined && k.k === 'S' ? k.v : unUrl(v); },
-      of: function(v){ return JS(S(v)); }
+      of: function(v){ return JS(S(v)); },
+      http: hreq
     }), writable: false, enumerable: false, configurable: false });
   }
   function parse(html){
