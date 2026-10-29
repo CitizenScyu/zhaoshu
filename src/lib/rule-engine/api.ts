@@ -156,12 +156,14 @@ export async function engineSearchBook(
     const searchJs = engineSearchJsActive();
     if (searchJs && searchTemplateNeedsJs(source.searchUrl, source.url, searchJsTemplateLimit())) await prepareSearchJs();
     // netjs1029：联网 JS 模板的 java.ajax 页面同走 context.page（计请求预算、过 host 门），取回后重放求值。
-    const built = await buildSearchRequestWithNet(source.searchUrl, title, source.url, validateSourceUrl, searchJs, async (req) => (
-      await context.page(req.url, {
+    // connectnet1029：java.connect 另要跟随跳转后的最终地址（context.page 的 url）。
+    const built = await buildSearchRequestWithNet(source.searchUrl, title, source.url, validateSourceUrl, searchJs, async (req) => {
+      const fetched = await context.page(req.url, {
         request: { method: req.method, body: req.body, headers: req.headers, charset: req.charset },
         responseCharset: req.charset === 'utf-8' ? 'auto' : req.charset,
-      })
-    ).text);
+      });
+      return { url: fetched.url, text: fetched.text };
+    });
     const request = built.request;
     searchVars = built.vars;
     page = await context.page(request.url, {

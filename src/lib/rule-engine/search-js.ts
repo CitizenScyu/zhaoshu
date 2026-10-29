@@ -8,17 +8,20 @@
 // netjs1029（ENGINE_SEARCH_NET_JS，默认关）：含 java.ajax 的模板改在 jsoup 包装帧里跑，ajax 由宿主按缓存应答，
 // 未命中则抛出待取地址、由异步入口（buildSearchRequestWithNet）联网取回后整段重放。
 // 只对旧口径构造不出请求的模板生效（searchTemplateNeedsJs），旧口径能构造的模板逐字走旧路径。
+// connectnet1029（ENGINE_SEARCH_CONNECT_JS，默认关）：联网帧另装 java.connect（取页跟随跳转，带回最终地址），缓存与重放同 ajax。
 // 本模块只在服务端用（js-sandbox 依赖 node:crypto 与 wasm），纯函数部分在 source-parser.ts。
 
 import {
   buildLegadoSearchRequest, buildSourceSearchRequest, MAX_SEARCH_JS_LONG_TEMPLATE_LENGTH, MAX_SEARCH_JS_TEMPLATE_LENGTH,
-  searchOptionsNeedParity, searchTemplateNeedsJs, searchTemplateUsesAjax, type SourceSearchRequest, type SourceUrlValidator,
+  searchOptionsNeedParity, searchTemplateNeedsJs, searchTemplateUsesAjax, searchTemplateUsesConnect, type SourceSearchRequest,
+  type SourceUrlValidator,
 } from '@/lib/source-parser';
 import { checkSourceUrl, SourcePolicyError, validateSourceUrl } from '@/lib/source-policy';
 import { MAX_JS_INPUT_CHARS, preloadJsSandbox, runJs, runJsoup, type JsBindings } from './js-sandbox';
 import { FieldNetMissError, withFieldNet } from './evaluate';
 import {
-  engineSearchNetJsEnabled, engineSearchOptionsEnabled, engineSyntaxJsEnabled, engineSyntaxJsoupEnabled, engineSyntaxJsUtilEnabled,
+  engineSearchConnectJsEnabled, engineSearchNetJsEnabled, engineSearchOptionsEnabled, engineSyntaxJsEnabled, engineSyntaxJsoupEnabled,
+  engineSyntaxJsUtilEnabled,
 } from './syntax-flags';
 import { RuleEngineError } from './types';
 
@@ -110,36 +113,49 @@ const INLINE_FORMAT = formatCode(INLINE_BODY, false);
 const SEGMENT_FORMAT_NET = formatCode(SEGMENT_BODY, true);
 const INLINE_FORMAT_NET = formatCode(INLINE_BODY, true);
 
+const netCall = (connect: boolean) => (connect ? 'java.connect' : 'java.ajax');
+
 /**
  * netjs1029：联网帧里 java.ajax 要的页面还没取到（net 缓存未命中）。只在本模块内流转：沙箱把宿主回调的
  * RuleEngineError 原样抛出，evalSearchJs 认出它直接上抛，withSearchJs 转成 SearchNetPendingError 交调用方去取。
+ * connect = 是 java.connect 要的页（connectnet1029，缓存另记最终地址）。
  */
 class SearchNetMissError extends RuleEngineError {
-  constructor(readonly url: string) {
-    super('RULE_EVAL_FAILED', 'java.ajax 页面未取');
+  constructor(readonly url: string, readonly connect = false) {
+    super('RULE_EVAL_FAILED', `${netCall(connect)} 页面未取`);
     this.name = 'SearchNetMissError';
   }
 }
 
+/** 联网缓存键：ajax 用原串；connect（connectnet1029）另加前缀，值是 `[最终地址, body]` 的 JSON。 */
+const CONNECT_KEY = '\u0001connect\u0000';
+const netKey = (url: string, connect: boolean) => (connect ? CONNECT_KEY + url : url);
+
 /**
- * netjs1029：搜索模板的 java.ajax 要先联网取页面（legado JsExtensions.ajax → 新建 AnalyzeUrl 取 body）。`key` = JS 传进来的原串
- * （缓存键），`request` = 按 legado AnalyzeUrl 口径解析出的请求（地址已过 host 门）。buildSearchRequestWithNet 自动取、重放；
- * 同步入口原样抛给调用方（判「能否构造」类调用方视作能构造）。
+ * netjs1029：搜索模板的 java.ajax 要先联网取页面（legado JsExtensions.ajax → 新建 AnalyzeUrl 取 body）。`key` = 联网缓存键
+ * （ajax 即 JS 传进来的原串），`request` = 按 legado AnalyzeUrl 口径解析出的请求（地址已过 host 门）。buildSearchRequestWithNet
+ * 自动取、重放；同步入口原样抛给调用方（判「能否构造」类调用方视作能构造）。connect = java.connect 要的页（connectnet1029）。
  */
 export class SearchNetPendingError extends Error {
-  constructor(readonly key: string, readonly request: SourceSearchRequest) {
+  constructor(readonly key: string, readonly request: SourceSearchRequest, readonly connect = false) {
     super('搜索 JS 需联网取页面');
     this.name = 'SearchNetPendingError';
   }
 }
 
-/** netjs1029：联网取页面（运行时 context.page / 准入 admissionFetch），返回 body 原文；失败抛错。 */
-export type SearchNetFetch = (request: SourceSearchRequest) => Promise<string>;
+/** 联网取回的页面：url = 跟随跳转后的最终地址。 */
+export interface SearchNetPage { url: string; text: string }
+
+/**
+ * netjs1029：联网取页面（运行时 context.page / 准入 admissionFetch），返回 body 原文或带最终地址的页面；失败抛错。
+ * 只给 body 时 java.connect 的最终地址按请求地址算（没跟随跳转）。
+ */
+export type SearchNetFetch = (request: SourceSearchRequest) => Promise<string | SearchNetPage>;
 
 /** 一次请求构造最多联网取几页（legado 不限；这里有界，免得一个模板把请求预算吃光）。 */
 const MAX_NET_FETCHES = 4;
 
-/** net：联网帧的 ajax 页面缓存（url 原串 → body）；undefined = 非联网帧（无 ajax 回调，逐字走旧路径）。 */
+/** net：联网帧的页面缓存（netKey → body / connect 的 `[最终地址, body]`）；undefined = 非联网帧（无联网回调，逐字走旧路径）。 */
 interface EvalContext { title: string; baseUrl: string; vars: Record<string, string>; net?: ReadonlyMap<string, string> }
 
 /**
@@ -148,6 +164,11 @@ interface EvalContext { title: string; baseUrl: string; vars: Record<string, str
  */
 export function searchNetJsEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
   return engineSearchNetJsEnabled(env) && engineSyntaxJsEnabled(env) && engineSyntaxJsoupEnabled(env);
+}
+
+/** connectnet1029：联网帧另装 java.connect（ENGINE_SEARCH_CONNECT_JS 且搜索联网 JS 生效）。 */
+export function searchConnectJsEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return engineSearchConnectJsEnabled(env) && searchNetJsEnabled(env);
 }
 
 /** gbkjs1029：搜索模板里 `java.encodeURI(文本, 'gbk'|…)` 按 URLEncoder GBK 系口径编码（ENGINE_SYNTAX_JS 与 ENGINE_SYNTAX_JS_UTIL 同开）。 */
@@ -182,10 +203,18 @@ function evalSearchJs(code: string, ctx: EvalContext, result: string | null): st
         ...bindings,
         callbacks: {
           ajax: (url) => {
-            const body = net.get(url);
+            const body = url.startsWith(CONNECT_KEY) ? undefined : net.get(url);
             if (body === undefined) throw new SearchNetMissError(url);
             return body;
           },
+          // connectnet1029：返回 [最终地址, body]，jsoup-shim 包成 StrResponse 子集；开关关时不装（java.connect 不存在，逐字不变）。
+          ...(searchConnectJsEnabled() ? {
+            connect: (url: string) => {
+              const hit = net.get(netKey(url, true));
+              if (hit === undefined) throw new SearchNetMissError(url, true);
+              return JSON.parse(hit) as string[];
+            },
+          } : {}),
         },
       }, 'final')
       : runJs(wrapper, bindings);
@@ -277,19 +306,21 @@ function evaluateSearchJs(template: string, title: string, base: string, net?: R
   return { ruleUrl, baseUrl: ctx.baseUrl, vars: ctx.vars };
 }
 
-/** 该模板这次是否走联网帧（开关开且模板里有 java.ajax 调用）。 */
+/** 该模板这次是否走联网帧（开关开且模板里有 java.ajax 调用，或 connect 开关开且有 java.connect 调用）。 */
 function netFrame(template: string): boolean {
-  return searchNetJsEnabled() && searchTemplateUsesAjax(template);
+  return searchNetJsEnabled()
+    && (searchTemplateUsesAjax(template) || (searchConnectJsEnabled() && searchTemplateUsesConnect(template)));
 }
 
 /**
  * netjs1029：java.ajax 实参按 legado 新建 AnalyzeUrl(url, source) 口径解析成请求：那里 key/page 为 null、baseUrl 为空，
  * 只有展开好的绝对地址能用；`{{…}}`/JS 段/页码占位一律拒（不支持，不猜）。选项按 legado 口径读（与主模板同一开关）。
+ * java.connect（connectnet1029）同口径。
  */
-function ajaxRequest(url: string, validate: SourceUrlValidator, what = '搜索 JS'): SourceSearchRequest {
+function ajaxRequest(url: string, validate: SourceUrlValidator, what = '搜索 JS', call = 'java.ajax'): SourceSearchRequest {
   const ruleUrl = url.trim();
   if (!/^https?:\/\//i.test(ruleUrl) || /\{\{|<js>|@js:|<[^>]*>/i.test(ruleUrl)) {
-    throw new SourcePolicyError(`不支持该书源的${what}（java.ajax 地址须是展开好的绝对地址）`);
+    throw new SourcePolicyError(`不支持该书源的${what}（${call} 地址须是展开好的绝对地址）`);
   }
   return buildLegadoSearchRequest(ruleUrl, undefined, validate, engineSearchOptionsEnabled());
 }
@@ -322,7 +353,9 @@ function withSearchJs(
       evaluated = evaluate(template, base, netFrame(template));
     } catch (miss) {
       if (!(miss instanceof SearchNetMissError)) throw miss;
-      throw new SearchNetPendingError(miss.url, ajaxRequest(miss.url, validate));
+      throw new SearchNetPendingError(
+        netKey(miss.url, miss.connect), ajaxRequest(miss.url, validate, '搜索 JS', netCall(miss.connect)), miss.connect,
+      );
     }
     const { ruleUrl, baseUrl, vars } = evaluated;
     return { request: buildLegadoSearchRequest(ruleUrl, baseUrl, validate, optionParity(template, base)), vars };
@@ -353,6 +386,7 @@ export function buildSearchRequestWithVars(
 /**
  * netjs1029：同 buildSearchRequestWithVars，java.ajax 要的页面经 fetchNet 取回后整段模板从头重放（legado 求值是同步阻塞取页，
  * 这里取回 body 记进缓存、再求一遍，同一地址不重取）；最多取 MAX_NET_FETCHES 页。fetchNet 的错误原样上抛。
+ * java.connect（connectnet1029）同样取、另记最终地址（ajax 与 connect 共用页数上限，同一地址两种调用各取一次）。
  * 非联网帧的模板只求一遍，与 buildSearchRequestWithVars 逐字相同。
  */
 export async function buildSearchRequestWithNet(
@@ -365,10 +399,12 @@ export async function buildSearchRequestWithNet(
       return withSearchJs(template, title, base, validate, searchJs, (t, b, on) => evaluateSearchJs(t, title, b, on ? net : undefined));
     } catch (error) {
       if (!(error instanceof SearchNetPendingError)) throw error;
-      if (net.size >= MAX_NET_FETCHES) throw new SourcePolicyError('不支持该书源的搜索 JS（java.ajax 次数过多）');
-      const body = await fetchNet(error.request);
-      if (body.length > MAX_JS_INPUT_CHARS) throw new SourcePolicyError('不支持该书源的搜索 JS（java.ajax 页面过大）');
-      net.set(error.key, body);
+      const call = netCall(error.connect);
+      if (net.size >= MAX_NET_FETCHES) throw new SourcePolicyError(`不支持该书源的搜索 JS（${call} 次数过多）`);
+      const page = await fetchNet(error.request);
+      const body = typeof page === 'string' ? page : page.text;
+      if (body.length > MAX_JS_INPUT_CHARS) throw new SourcePolicyError(`不支持该书源的搜索 JS（${call} 页面过大）`);
+      net.set(error.key, error.connect ? JSON.stringify([typeof page === 'string' ? error.request.url : page.url, body]) : body);
     }
   }
 }
@@ -387,7 +423,8 @@ export async function evaluateWithFieldNet<T>(run: () => T, validate: SourceUrlV
     } catch (error) {
       if (!(error instanceof FieldNetMissError)) throw error;
       if (net.size >= MAX_NET_FETCHES) throw new SourcePolicyError('不支持该书源的字段 JS（java.ajax 次数过多）');
-      const body = await fetchNet(ajaxRequest(error.url, validate, '字段 JS'));
+      const page = await fetchNet(ajaxRequest(error.url, validate, '字段 JS'));
+      const body = typeof page === 'string' ? page : page.text;
       if (body.length > MAX_JS_INPUT_CHARS) throw new SourcePolicyError('不支持该书源的字段 JS（java.ajax 页面过大）');
       net.set(error.url, body);
     }
@@ -401,16 +438,16 @@ function allowAnyHost(value: unknown, base?: string): URL {
 /** 判「模板能否构造」用的占位书名（与 source-usability / 候选口径同一个）。 */
 export const SEARCH_PROBE_TITLE = '书';
 const MAX_PROBE_CACHE = 512;
-const probed = new Map<string, EvaluatedSearchJs | { rejected: string } | { pending: string }>();
+const probed = new Map<string, EvaluatedSearchJs | { rejected: string } | { pending: string; connect: boolean }>();
 
 /**
  * 占位书名下的 JS 段求值结果（ruleUrl 或策略拒原因）按 base+模板 LRU 记忆：候选筛与取书池每次请求都要判全部源，
  * 不能每次都起沙箱、吃共享 JS 预算（还会因单段预算耗尽让同一个源时好时坏）。只记忆求值结果，host 门/红线每次对
  * 结果重验；沙箱未就绪抛 SearchJsNotReadyError、不记忆。真实搜索（真书名）不走这里。
- * 联网帧（netjs1029）不联网：首个 java.ajax 未命中即记为 pending（地址每次重验），判定口径见各调用方。
+ * 联网帧（netjs1029）不联网：首个 java.ajax / java.connect 未命中即记为 pending（地址每次重验），判定口径见各调用方。
  */
 function probeSearchJs(template: string, base: string, net = false): EvaluatedSearchJs {
-  const cacheKey = `${searchCjkEncodeUri() ? 1 : 0}${net ? '\0net' : ''}\0${base}\0${template}`;
+  const cacheKey = `${searchCjkEncodeUri() ? 1 : 0}${net ? `\0net${searchConnectJsEnabled() ? 'c' : ''}` : ''}\0${base}\0${template}`;
   let entry = probed.get(cacheKey);
   if (entry !== undefined) {
     probed.delete(cacheKey);
@@ -418,7 +455,7 @@ function probeSearchJs(template: string, base: string, net = false): EvaluatedSe
     try {
       entry = evaluateSearchJs(template, SEARCH_PROBE_TITLE, base, net ? new Map() : undefined);
     } catch (error) {
-      if (error instanceof SearchNetMissError) entry = { pending: error.url };
+      if (error instanceof SearchNetMissError) entry = { pending: error.url, connect: error.connect };
       else if (!(error instanceof SourcePolicyError)) throw error;
       else entry = { rejected: error.message };
     }
@@ -426,7 +463,7 @@ function probeSearchJs(template: string, base: string, net = false): EvaluatedSe
   probed.set(cacheKey, entry);
   while (probed.size > MAX_PROBE_CACHE) probed.delete(probed.keys().next().value!);
   if ('rejected' in entry) throw new SourcePolicyError(entry.rejected);
-  if ('pending' in entry) throw new SearchNetMissError(entry.pending);
+  if ('pending' in entry) throw new SearchNetMissError(entry.pending, entry.connect);
   return entry;
 }
 
@@ -439,7 +476,7 @@ export function buildSearchProbeRequest(
 
 /**
  * 候选口径：该需 JS 的模板能否在沙箱里构造出请求（放开 host 白名单，红线照守；占位书名，求值结果记忆见 probeSearchJs）。
- * 联网 JS 模板到首个 java.ajax 为止：地址能解析成请求即算能构造（页面要联网才知道，交准入实测）。
+ * 联网 JS 模板到首个 java.ajax / java.connect 为止：地址能解析成请求即算能构造（页面要联网才知道，交准入实测）。
  * 沙箱未就绪抛 SearchJsNotReadyError。调用方先确认 searchTemplateNeedsJs。
  */
 export function searchJsConstructible(template: string, base: string): boolean {
@@ -449,7 +486,7 @@ export function searchJsConstructible(template: string, base: string): boolean {
       evaluated = probeSearchJs(template, base, netFrame(template));
     } catch (miss) {
       if (!(miss instanceof SearchNetMissError)) throw miss;
-      ajaxRequest(miss.url, allowAnyHost);
+      ajaxRequest(miss.url, allowAnyHost, '搜索 JS', netCall(miss.connect));
       return true;
     }
     const { ruleUrl, baseUrl } = evaluated;

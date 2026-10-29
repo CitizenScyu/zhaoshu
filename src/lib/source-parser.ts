@@ -728,6 +728,11 @@ export function searchTemplateUsesAjax(template: unknown): boolean {
   return typeof template === 'string' && /\bjava\s*\.\s*ajax\s*\(/.test(template);
 }
 
+/** connectnet1029：搜索模板里是否出现 `java.connect(` 调用（口径同 searchTemplateUsesAjax，宁宽勿漏）。 */
+export function searchTemplateUsesConnect(template: unknown): boolean {
+  return typeof template === 'string' && /\bjava\s*\.\s*connect\s*\(/.test(template);
+}
+
 // legado NetworkUtils.notNeedEncodingQuery / notNeedEncodingForm 与 AnalyzeUrl.queryEncoder
 // （RFC3986.UNRESERVED + `!$%&()*+,/:;=?@[\]^\`{|}`；`%` 安全，已有的 %XX 不重编）。
 const LEGADO_QUERY_PLAIN = /[A-Za-z0-9!$&()*+,\-./:;=?@[\\\]^_`{|}~]/;

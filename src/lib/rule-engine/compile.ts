@@ -5,7 +5,7 @@
 // 产物自然失效，不存在「|| 开关打开后仍复用 off 态编译缓存」的窗口。
 import {
   MAX_SEARCH_JS_LONG_TEMPLATE_LENGTH, MAX_SEARCH_JS_TEMPLATE_LENGTH, searchOptionsMayUseWebView, searchOptionsNeedParity,
-  searchTemplateNeedsJs, searchTemplateUsesAjax, searchTemplateUsesCjkEncodeUri,
+  searchTemplateNeedsJs, searchTemplateUsesAjax, searchTemplateUsesCjkEncodeUri, searchTemplateUsesConnect,
 } from '@/lib/source-parser';
 import { upgradeSourceTemplateUrl } from '@/lib/source-policy';
 import { sourceRevision } from '@/lib/source-revision';
@@ -24,7 +24,7 @@ import {
   engineSearchWebViewEnabled, engineSyntaxInitJsEnabled, engineSyntaxJsoupEnabled, engineSyntaxVarsBagEnabled,
   engineSyntaxBookFieldsEnabled, engineSyntaxSearchVarsEnabled, engineSyntaxItemVarsEnabled, engineSyntaxListGetEnabled, ENGINE_SEMANTICS_VERSION,
   engineSyntaxBookVariableEnabled, engineSyntaxJsLibEnabled, engineSyntaxSourceBindEnabled, engineSyntaxInitJsoupEnabled, engineSearchNetJsEnabled,
-  engineFieldNetJsEnabled,
+  engineFieldNetJsEnabled, engineSearchConnectJsEnabled,
 } from './syntax-flags';
 import { urlOptionFields } from './url-options';
 import {
@@ -67,6 +67,8 @@ export interface CompileOptions extends ParseOptions {
   // initJsoupEnabled（initjsoup1028，ENGINE_SYNTAX_INIT_JSOUP）见 ParseOptions；compile 层另要求 JS init 与 jsoup 对该源同生效。
   /** netjs1029：搜索联网 JS（ENGINE_SEARCH_NET_JS，默认读 env；须搜索 JS、ENGINE_SYNTAX_JS 与 jsoup 同开）。只影响语义版本位。 */
   searchNetJsEnabled?: boolean;
+  /** connectnet1029：搜索 java.connect（ENGINE_SEARCH_CONNECT_JS，默认读 env；须搜索联网 JS 各条件同开）。只影响语义版本位。 */
+  searchConnectJsEnabled?: boolean;
 }
 
 /** 版本化缓存键（P0 口径）：semanticsVersion:contentRevision。 */
@@ -120,6 +122,8 @@ export function engineVersionedKey(contentRevision: string, semanticsVersion = E
  * 搜索模板（按运行时同一长度上限）里有 java.ajax 调用（searchTemplateUsesAjax）时再加搜索联网 JS 位（+2147483648，bigint 列）。
  * fieldnet1029：ENGINE_FIELD_NET_JS on、jsoup 对该源生效且有页面级字段（parse.ts FIELD_NET_FIELDS）经 jsoup 重编用到 java.ajax
  * （sourceUsesFieldNetSyntax）时再加字段联网 JS 位（+4294967296）。其余位的探测不传本开关（读 env，同 listget1028 口径）。
+ * connectnet1029：搜索联网 JS 位除「带 java.ajax」外的各条件成立、ENGINE_SEARCH_CONNECT_JS on 且搜索模板里有 java.connect 调用
+ * （searchTemplateUsesConnect）时再加 java.connect 位（+8589934592）。
  */
 export function engineSourceRevision(
   source: { url: string; searchUrl: unknown; rules: Record<string, unknown> },
@@ -167,6 +171,12 @@ export function engineSourceRevision(
   // book1028 同理：书籍成员重试也能救活别的开关的 off 态，book 开时再按 book 开（jsoup 两态）补判。
   const soup = (probe: (jsoupEnabled: boolean, bookFieldsEnabled: boolean) => boolean) => probe(false, false)
     || (jsoup && probe(true, false)) || (book && (probe(false, true) || (jsoup && probe(true, true))));
+  // netjs1029 / connectnet1029：搜索联网帧的共同条件（ENGINE_SYNTAX_JS 用原始开关：搜索沙箱不看 JS 链；长度上限同运行时）。
+  // uses = 模板里有对应调用（先判，免得每个源都判 searchTemplateNeedsJs）。
+  const searchNet = (uses: boolean) => uses && searchJsEnabled && jsEnabled && (options.jsoupEnabled ?? engineSyntaxJsoupEnabled())
+    && (options.searchNetJsEnabled ?? engineSearchNetJsEnabled())
+    && searchTemplateNeedsJs(source.searchUrl, upgradeSourceTemplateUrl(source.url),
+      jsEnabled && jsUtilEnabled ? MAX_SEARCH_JS_LONG_TEMPLATE_LENGTH : MAX_SEARCH_JS_TEMPLATE_LENGTH);
   return engineVersionedKey(sourceRevision(source), engineSemanticsVersion(
     orEnabled && sourceUsesOrSyntax(rules),
     xpathEnabled && sourceUsesXPathSyntax(rules),
@@ -262,16 +272,14 @@ export function engineSourceRevision(
       jsExtEnabled, jsBindEnabled: jsBind, jsGetEnabled: jsGet, jsUtilEnabled: jsUtil, jsonPathEnabled, bookFieldsEnabled: book,
       sourceConsts: sourceConstsOf(source.rules, sourceBind),
     }),
-    searchJsEnabled && jsEnabled && (options.jsoupEnabled ?? engineSyntaxJsoupEnabled())
-      && (options.searchNetJsEnabled ?? engineSearchNetJsEnabled()) && searchTemplateUsesAjax(source.searchUrl)
-      && searchTemplateNeedsJs(source.searchUrl, upgradeSourceTemplateUrl(source.url),
-        jsEnabled && jsUtilEnabled ? MAX_SEARCH_JS_LONG_TEMPLATE_LENGTH : MAX_SEARCH_JS_TEMPLATE_LENGTH),
+    searchNet(searchTemplateUsesAjax(source.searchUrl)),
     jsoup && (options.fieldNetJsEnabled ?? engineFieldNetJsEnabled()) && sourceUsesFieldNetSyntax(rules, {
       orEnabled, varsEnabled, xpathEnabled, xpathEvalEnabled: xpathEval, regexEnabled, andEnabled, aioEnabled, listJsEnabled, jsExtEnabled,
       jsBindEnabled: jsBind, jsGetEnabled: jsGet, jsUtilEnabled: jsUtil, jsonPathEnabled, initJsEnabled, bookFieldsEnabled: book,
       listGetEnabled: listGet, initJsoupEnabled: initJsoup, sourceConsts: sourceConstsOf(source.rules, sourceBind),
       bookVariablePuts: bookVariable ? sourceBookVariablePuts(source) ?? undefined : undefined,
     }),
+    searchNet((options.searchConnectJsEnabled ?? engineSearchConnectJsEnabled()) && searchTemplateUsesConnect(source.searchUrl)),
   ));
 }
 

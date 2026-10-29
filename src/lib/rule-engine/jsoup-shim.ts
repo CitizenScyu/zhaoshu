@@ -665,16 +665,64 @@ export const JSOUP_PRELUDE = `(function(){
     j.getString = function(){ var r = RA(gs, j, arguments); return typeof r === 'string' ? JS(r) : r; };
   }
   // netjs1029：搜索模板联网 JS 才有 ajax 回调（search-js.ts）：只收一个字符串/Java 字符串实参（legado 收 List 取首项，这里不收），
-  // 返回 Java 字符串（legado getStrResponse().body）；另给搜索包装一个 Java 字符串拆/装口（__jstr，不可改写）。字段求值没有
-  // ajax 回调，不装、逐字不变。
+  // 返回 Java 字符串（legado getStrResponse().body）；另给搜索包装一个 Java 字符串拆/装口（__jstr，不可改写）。没有联网回调的
+  // 求值不装、逐字不变。
+  // connectnet1029：connect 回调（ENGINE_SEARCH_CONNECT_JS）返回 [最终地址, body]，包成 legado StrResponse 的子集：
+  // raw().request().url() 得 okhttp HttpUrl（转字符串 = 最终地址，toString() 得 Java 字符串），url()/body() 得 Java 字符串。
+  // 其余成员（code/headers/message…）、StrResponse/Response/Request 转字符串（Rhino 是 okhttp 的 toString）、不调用就拿方法
+  // 参与运算一律失败。这几种对象不登记进 kinds：导出/条目口径按普通对象走（HttpUrl 转串得地址，其余转串失败）。
+  var netT = new WeakMap(), netKinds = new WeakMap();
+  function NO(name, v, members) {
+    var t = OC(null), rec = { n: name, v: v, m: members }, p = new P(t, NH);
+    wmSet(netT, t, rec); wmSet(netKinds, p, rec);
+    return p;
+  }
+  function badMethodPrim() { return bad('Java 方法对象参与运算'); }
+  var NH = {
+    get: function(t, p){
+      var rec = wmGet(netT, t);
+      if (p === TP && rec.m === UM) return function(){ return rec.v; };
+      if (typeof p === 'symbol') return bad(rec.n + ' 的 ' + S(p) + ' 不支持');
+      var m = rec.m[p];
+      if (m === undefined) return bad(rec.n + '.' + p + ' 不支持');
+      var f = function(){ arity(arguments.length, 0, 0, rec.n + '.' + p); return m(rec.v); };
+      defProp(f, TP, { value: badMethodPrim });
+      return f;
+    },
+    has: denyProbe('Java 对象'), ownKeys: denyProbe('Java 对象'), getOwnPropertyDescriptor: denyProbe('Java 对象'),
+    set: denyWrite('Java 对象'), defineProperty: denyWrite('Java 对象'), deleteProperty: denyWrite('Java 对象'),
+    preventExtensions: denyWrite('Java 对象'), getPrototypeOf: noProto,
+  };
+  var UM = OC(null), TM = OC(null), QM = OC(null), RM = OC(null);
+  UM.toString = function(v){ return JS(v); };
+  TM.url = function(v){ return NO('HttpUrl', v, UM); };
+  QM.request = function(v){ return NO('Request', v, TM); };
+  RM.raw = function(v){ return NO('Response', v[0], QM); };
+  RM.url = function(v){ return JS(v[0]); };
+  RM.body = function(v){ return JS(v[1]); };
+  function unUrl(v) {
+    if (typeof v !== 'object' || v === null) return undefined;
+    var rec = wmGet(netKinds, v);
+    return rec !== undefined && rec.m === UM ? rec.v : undefined;
+  }
   if (typeof j.ajax === 'function') {
     var aj = j.ajax;
     j.ajax = function ajax(url){
       arity(arguments.length, 1, 1, 'java.ajax');
       return JS(aj(sArg(url, 'java.ajax')));
     };
+  }
+  if (typeof j.connect === 'function') {
+    var cn = j.connect;
+    j.connect = function connect(url){
+      arity(arguments.length, 1, 1, 'java.connect');
+      var u = unUrl(url), r = cn(u !== undefined ? u : sArg(url, 'java.connect'));
+      return NO('StrResponse', [S(r[0]), S(r[1])], RM);
+    };
+  }
+  if (typeof j.ajax === 'function' || typeof j.connect === 'function') {
     defProp(globalThis, '__jstr', { value: freeze({
-      un: function(v){ var k = kindOf(v); return k !== undefined && k.k === 'S' ? k.v : undefined; },
+      un: function(v){ var k = kindOf(v); return k !== undefined && k.k === 'S' ? k.v : unUrl(v); },
       of: function(v){ return JS(S(v)); }
     }), writable: false, enumerable: false, configurable: false });
   }

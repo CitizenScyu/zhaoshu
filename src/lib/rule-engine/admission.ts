@@ -784,7 +784,7 @@ async function buildAdmissionSearchNet(
       throw new AdmissionAjaxError(undefined, error);
     }
     if (page.status < 200 || page.status >= 300) throw new AdmissionAjaxError(page.status, undefined);
-    return page.text;
+    return { url: page.url, text: page.text };
   });
   return { ...built, fetched };
 }

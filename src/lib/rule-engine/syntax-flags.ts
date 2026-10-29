@@ -23,7 +23,7 @@ export const ENGINE_SEMANTICS_XPATH_BIT = 2;
 /** vars1027：@put/@get 静态子集语义位。版本再 +4（5–8 = 含变量位的四种组合），1–4 逐字不变。 */
 export const ENGINE_SEMANTICS_VARS_BIT = 4;
 
-/** 语义版本随 || / XPath / 变量 / JS / XPath 求值 / 正则 / && / AllInOne / 搜索 JS / 列表 JS / JS 扩展 / 宿主绑定 / java.getString / 加解密帮手 / JSONPath 扩展 / 详情 init / 搜索选项 legado 口径 / URL 字段选项 / 搜索 webView / 详情 JS init / 详情→目录变量袋 / jsoup 直连 / 书籍成员 / 搜索 URL→搜索字段变量袋 / 搜索条目袋 / 列表 JS getter / 书籍变量 / jsLib / 书源常量 / jsoup JS init / 搜索联网 JS / 字段联网 JS 开关联动（唯一口径，供 compile.ts 缓存键与 rulesHash 复用）。 */
+/** 语义版本随 || / XPath / 变量 / JS / XPath 求值 / 正则 / && / AllInOne / 搜索 JS / 列表 JS / JS 扩展 / 宿主绑定 / java.getString / 加解密帮手 / JSONPath 扩展 / 详情 init / 搜索选项 legado 口径 / URL 字段选项 / 搜索 webView / 详情 JS init / 详情→目录变量袋 / jsoup 直连 / 书籍成员 / 搜索 URL→搜索字段变量袋 / 搜索条目袋 / 列表 JS getter / 书籍变量 / jsLib / 书源常量 / jsoup JS init / 搜索联网 JS / 字段联网 JS / 搜索 java.connect 开关联动（唯一口径，供 compile.ts 缓存键与 rulesHash 复用）。 */
 export function engineSemanticsVersion(
   orEnabled: boolean, xpathEnabled = false, varsEnabled = false, jsEnabled = false, xpathEvalEnabled = false,
   regexEnabled = false, andEnabled = false, aioEnabled = false, searchJsEnabled = false, listJsEnabled = false,
@@ -31,7 +31,7 @@ export function engineSemanticsVersion(
   initEnabled = false, searchOptionsEnabled = false, urlOptionsEnabled = false, searchWebViewEnabled = false, initJsEnabled = false,
   varBagEnabled = false, jsoupEnabled = false, bookFieldsEnabled = false, searchVarsEnabled = false, itemVarsEnabled = false,
   listGetEnabled = false, bookVariableEnabled = false, jsLibEnabled = false, sourceBindEnabled = false, initJsoupEnabled = false,
-  searchNetJsEnabled = false, fieldNetJsEnabled = false,
+  searchNetJsEnabled = false, fieldNetJsEnabled = false, searchConnectJsEnabled = false,
 ): number {
   return (orEnabled ? ENGINE_SEMANTICS_VERSION_OR : ENGINE_SEMANTICS_VERSION)
     + (xpathEnabled ? ENGINE_SEMANTICS_XPATH_BIT : 0) + (varsEnabled ? ENGINE_SEMANTICS_VARS_BIT : 0)
@@ -49,7 +49,7 @@ export function engineSemanticsVersion(
     + (listGetEnabled ? ENGINE_SEMANTICS_LIST_GET_BIT : 0) + (bookVariableEnabled ? ENGINE_SEMANTICS_BOOK_VARIABLE_BIT : 0)
     + (jsLibEnabled ? ENGINE_SEMANTICS_JS_LIB_BIT : 0) + (sourceBindEnabled ? ENGINE_SEMANTICS_SOURCE_BIND_BIT : 0)
     + (initJsoupEnabled ? ENGINE_SEMANTICS_INIT_JSOUP_BIT : 0) + (searchNetJsEnabled ? ENGINE_SEMANTICS_SEARCH_NET_JS_BIT : 0)
-    + (fieldNetJsEnabled ? ENGINE_SEMANTICS_FIELD_NET_JS_BIT : 0);
+    + (fieldNetJsEnabled ? ENGINE_SEMANTICS_FIELD_NET_JS_BIT : 0) + (searchConnectJsEnabled ? ENGINE_SEMANTICS_SEARCH_CONNECT_JS_BIT : 0);
 }
 
 /**
@@ -595,5 +595,23 @@ export const ENGINE_SEMANTICS_FIELD_NET_JS_BIT = 4294967296;
  */
 export function engineFieldNetJsEnabled(env: OrEnv = process.env): boolean {
   const raw = env.ENGINE_FIELD_NET_JS?.trim().toLowerCase();
+  return raw === '1' || raw === 'true' || raw === 'on';
+}
+
+/**
+ * connectnet1029：搜索模板 java.connect 语义位。版本再 +8589934592（1–8589934591 逐字不变，bigint 列）。只对搜索联网 JS 生效、
+ * ENGINE_SEARCH_CONNECT_JS on、searchUrl 需 JS 且带 `java.connect(` 的源计入（compile.ts engineSourceRevision /
+ * source-parser.ts searchTemplateUsesConnect）。
+ */
+export const ENGINE_SEMANTICS_SEARCH_CONNECT_JS_BIT = 8589934592;
+
+/**
+ * ENGINE_SEARCH_CONNECT_JS 独立开关（connectnet1029，默认 off，口径同 ENGINE_SYNTAX_OR；须搜索联网 JS 同生效，见 search-js.ts
+ * searchConnectJsEnabled）。on = 需 JS 且带 `java.connect(` 的 searchUrl 走联网帧，`java.connect(url)`（单参）缺页即中止求值、由宿主
+ * 取页（跟随跳转）后整次重放，返回 legado StrResponse 的子集（raw().request().url() 最终地址、url()、body()）。
+ * off = 逐字不变（java.connect 不存在、求值失败判不支持）。
+ */
+export function engineSearchConnectJsEnabled(env: OrEnv = process.env): boolean {
+  const raw = env.ENGINE_SEARCH_CONNECT_JS?.trim().toLowerCase();
   return raw === '1' || raw === 'true' || raw === 'on';
 }
