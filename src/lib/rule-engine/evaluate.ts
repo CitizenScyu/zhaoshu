@@ -10,6 +10,7 @@ import {
   type RuleIr, type RegexSub, type SkippedField, type TemplatePart,
 } from './types';
 import { aioListCode } from './aio-syntax';
+import { ATTR_REGEX_PSEUDOS } from './attr-regex';
 import {
   type JsBindings, type JsListItem, type JsValue, runJs, runJsInit, runJsItems, runJsoup, runJsoupInit, runJsoupItems,
 } from './js-sandbox';
@@ -147,9 +148,12 @@ export type EvalScope = HtmlScope | JsonScope;
 
 export type EvalResult = { kind: 'text'; value: string } | { kind: 'nodes'; nodes: CheerioNodes };
 
-/** 载入 HTML 建立文档级作用域。文档登记给 jsoup 直连（jsoup1028）：只记原文与 cheerio 实例，首次 jsoup 访问才扫描。 */
+/**
+ * 载入 HTML 建立文档级作用域。文档登记给 jsoup 直连（jsoup1028）：只记原文与 cheerio 实例，首次 jsoup 访问才扫描。
+ * 自定义伪类只认 attrregex1030 改写出的 `:-nf-attr-re(…)`，其余选择器求值不变。
+ */
 export function createHtmlScope(html: string, pageUrl: string): HtmlScope {
-  const $ = load(html);
+  const $ = load(html, { pseudos: ATTR_REGEX_PSEUDOS });
   registerHtmlDoc($.root()[0] as unknown as Document, $, html);
   return { kind: 'html', $, nodes: $.root() as unknown as CheerioNodes, pageUrl };
 }
