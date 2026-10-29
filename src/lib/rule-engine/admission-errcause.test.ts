@@ -27,6 +27,7 @@ describe('errcause1030 errorCauseCode', () => {
     expect(errorCauseCode(failed(codeError('ENOTFOUND')))).toBe('ENOTFOUND');
     expect(errorCauseCode(failed(codeError('UND_ERR_CONNECT_TIMEOUT')))).toBe('UND_ERR_CONNECT_TIMEOUT');
     expect(errorCauseCode(failed(Object.assign(new Error('wrap'), { cause: codeError('CERT_HAS_EXPIRED') })))).toBe('CERT_HAS_EXPIRED');
+    expect(errorCauseCode(failed(codeError('ERR_SSL_SSL/TLS_ALERT_HANDSHAKE_FAILURE')))).toBe('ERR_SSL_SSL/TLS_ALERT_HANDSHAKE_FAILURE');
   });
 
   it('AggregateError（多地址连接失败）取 errors 里首个码', () => {

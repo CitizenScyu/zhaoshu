@@ -708,7 +708,8 @@ export function admissionErrorCauseEnabled(env: NodeJS.ProcessEnv = process.env)
   return env.ENGINE_ADMISSION_ERROR_CAUSE === '1' || env.ENGINE_ADMISSION_ERROR_CAUSE === 'true';
 }
 
-const ERROR_CAUSE_CODE = /^[A-Z][A-Z0-9_]{1,39}$/;
+// OpenSSL 透传的码带斜杠（ERR_SSL_SSL/TLS_ALERT_HANDSHAKE_FAILURE，2026-10-30 phoenix 实测 13 host）。
+const ERROR_CAUSE_CODE = /^[A-Z][A-Z0-9_/]{1,59}$/;
 
 /** cause 链（含 AggregateError.errors，Happy Eyeballs 多地址连接失败时出现）上首个形如错误码的 code；只取码，不取 message。 */
 export function errorCauseCode(error: unknown): string | undefined {
