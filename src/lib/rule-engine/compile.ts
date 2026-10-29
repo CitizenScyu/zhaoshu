@@ -6,6 +6,7 @@
 import {
   MAX_SEARCH_JS_LONG_TEMPLATE_LENGTH, MAX_SEARCH_JS_TEMPLATE_LENGTH, searchOptionsMayUseWebView, searchOptionsNeedParity,
   searchTemplateNeedsJs, searchTemplateUsesAjax, searchTemplateUsesCjkEncodeUri, searchTemplateUsesConnect, searchTemplateUsesGetPost,
+  searchTemplateUsesPagePattern,
 } from '@/lib/source-parser';
 import { upgradeSourceTemplateUrl } from '@/lib/source-policy';
 import { sourceRevision } from '@/lib/source-revision';
@@ -29,7 +30,7 @@ import {
   engineFieldNetJsEnabled, engineSearchConnectJsEnabled, engineSearchGetPostJsEnabled, engineSyntaxLastAttrEnabled,
   engineSyntaxRulePrefixEnabled, engineSyntaxTemplateHashEnabled, engineSyntaxBracketIndexEnabled, engineSyntaxSelfMatchEnabled,
   engineSyntaxBareAttrEnabled, engineSyntaxJsoupDoctypeEnabled, ENGINE_SEMANTICS_JSOUP_DOCTYPE_BIT, engineSyntaxAttrQuoteEnabled,
-  engineSyntaxAttrRegexEnabled, engineSyntaxChildrenEnabled,
+  engineSyntaxAttrRegexEnabled, engineSyntaxChildrenEnabled, engineSearchPagePatternEnabled,
 } from './syntax-flags';
 import { urlOptionFields } from './url-options';
 import {
@@ -78,6 +79,8 @@ export interface CompileOptions extends ParseOptions {
   searchConnectJsEnabled?: boolean;
   /** getpost1029：搜索 java.get/java.post（ENGINE_SEARCH_GETPOST_JS，默认读 env；须搜索联网 JS 各条件同开）。只影响语义版本位。 */
   searchGetPostJsEnabled?: boolean;
+  /** pagepat1030：旧口径搜索模板的页码列表 `<…>`（ENGINE_SEARCH_PAGE_PATTERN，默认读 env）。只影响语义版本位，展开读 env。 */
+  searchPagePatternEnabled?: boolean;
 }
 
 /** 版本化缓存键（P0 口径）：semanticsVersion:contentRevision。 */
@@ -155,6 +158,8 @@ export function engineVersionedKey(contentRevision: string, semanticsVersion = E
  * （sourceUsesAttrRegexSyntax）时再加属性正则位（+17592186044416）；其余字段同上不计位。
  * children1030：ENGINE_SYNTAX_CHILDREN on 且准入搜索判定读的 ruleSearch.bookList/name/author/bookUrl 有 `children` 段
  * （sourceUsesChildrenSyntax）时再加 children 关键字位（+35184372088832）；其余字段同上不计位。
+ * pagepat1030：ENGINE_SEARCH_PAGE_PATTERN on 且 searchUrl 是含 `<…>` 页码列表的旧口径模板（searchTemplateUsesPagePattern）时
+ * 再加搜索页码列表位（+70368744177664）。
  */
 export function engineSourceRevision(
   source: { url: string; searchUrl: unknown; rules: Record<string, unknown> },
@@ -323,6 +328,7 @@ export function engineSourceRevision(
     (options.attrQuoteEnabled ?? engineSyntaxAttrQuoteEnabled()) && sourceUsesAttrQuoteSyntax(rules),
     (options.attrRegexEnabled ?? engineSyntaxAttrRegexEnabled()) && sourceUsesAttrRegexSyntax(rules),
     (options.childrenEnabled ?? engineSyntaxChildrenEnabled()) && sourceUsesChildrenSyntax(rules),
+    (options.searchPagePatternEnabled ?? engineSearchPagePatternEnabled()) && searchTemplateUsesPagePattern(source.searchUrl),
   );
   // doctype1029：jsoup 开关改得动该源任一位 ⇔ 有字段（含变量袋/搜索袋/条目袋等帧内编译）经 jsoup 重编、求值摸得到 jsoup 层。
   // 只看 jsoup 位会漏掉袋字段（如 searchUrl put、bookList 首段取节点 + JS 读袋的源）。

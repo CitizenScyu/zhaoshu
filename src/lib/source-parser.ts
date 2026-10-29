@@ -3,7 +3,7 @@ import { alternateSourceHost, checkSourceUrl, upgradeSourceTemplateUrl, validate
 import { encodeQueryComponent, normalizeCharset, percentEncodeChars, type SourceCharset } from './source-charset';
 import { foldTraditional } from './zh-variant-fold';
 import { gsonAsString, gsonPlainInteger, gsonPrettyJson, parseGsonLenient, type GsonValue } from './gson-lenient';
-import { engineSearchOptionsEnabled, engineSearchWebViewEnabled } from './rule-engine/syntax-flags';
+import { engineSearchOptionsEnabled, engineSearchPagePatternEnabled, engineSearchWebViewEnabled } from './rule-engine/syntax-flags';
 
 export interface SourceBookIdentity { title: string; author: string; alias?: string }
 export interface SourceChapter { url: string; title: string }
@@ -357,6 +357,12 @@ export type SourceUrlValidator = (value: unknown, base?: string) => URL;
 export function sourceSearchUrl(
   template: unknown, title: string, base: string | undefined, validate: SourceUrlValidator = validateSourceUrl,
 ): string {
+  return plainSearchUrl(withSearchPagePattern(template), title, base, validate);
+}
+
+function plainSearchUrl(
+  template: unknown, title: string, base: string | undefined, validate: SourceUrlValidator,
+): string {
   if (typeof template !== 'string' || template.length > 2048 || !/\{\{key\}\}/.test(template)) {
     throw new SourcePolicyError('书源缺少支持的搜索模板');
   }
@@ -445,8 +451,9 @@ export function buildSourceSearchRequest(
   optionParity = searchOptionsActive(),
 ): SourceSearchRequest {
   try {
-    return buildDeclaredSearchRequest(template, title, base, validate);
+    return buildDeclaredSearchRequest(withSearchPagePattern(template), title, base, validate);
   } catch (error) {
+    // 选项口径重读按原模板判：含 `<…>` 的模板 legacyOptionParityApplies 恒否（pagepat1030 不改这一条）。
     if (!optionParity || !(error instanceof SourcePolicyError) || typeof template !== 'string'
       || !legacyOptionParityApplies(template)) throw error;
     // searchopt1028：旧口径因选项被拒 → 按 legado UrlOption 口径重读选项，其余流程（展开/红线/白名单头）与旧口径同一段代码。
@@ -473,7 +480,7 @@ function buildDeclaredSearchRequest(
   }
   const head = template.split('##')[0];
   const optMatch = /,\s*\{/.exec(head);
-  if (!optMatch) return { url: sourceSearchUrl(template, title, base, validate), method: 'GET', charset: 'utf-8' };
+  if (!optMatch) return { url: plainSearchUrl(template, title, base, validate), method: 'GET', charset: 'utf-8' };
 
   const urlPart = head.slice(0, optMatch.index);
   const options = parseSearchOptions(head.slice(optMatch.index + 1));
@@ -723,6 +730,30 @@ export function searchTemplateNeedsJs(
   if (typeof template !== 'string' || template.length > maxLength) return false;
   if (!SEARCH_JS_MARKER.test(template)) return false;
   return !searchOptionsConstructible(template, base);
+}
+
+/**
+ * pagepat1030：旧口径搜索模板（有 {{key}}、无 JS 与非 key/page 的 `{{}}`，即不进搜索 JS 路径）里是否有 legado 页码列表 `<…>`
+ * （语义版本位与展开共用，纯静态）。JS 模板的页码列表由 search-js.ts replacePages 展开，不在此列。
+ */
+export function searchTemplateUsesPagePattern(template: unknown): template is string {
+  return typeof template === 'string' && template.length <= 2048 && /\{\{key\}\}/.test(template)
+    && !SEARCH_JS_MARKER.test(template) && /<.*?>/.test(template);
+}
+
+/**
+ * pagepat1030（ENGINE_SEARCH_PAGE_PATTERN on）：按 legado AnalyzeUrl.replaceKeyPageJs 口径展开旧口径模板的页码列表——{{page}} 先换 1，
+ * 再把 `<(.*?)>` 的每处匹配（在替换前的串上找、逐个全量替换）换成逗号切后的首项（page=1；去两端 ≤ ' ' 字符）。{{key}} 留给原流程展开。
+ * 开关关或模板不适用时原样返回。
+ */
+function withSearchPagePattern(template: unknown): unknown {
+  if (!engineSearchPagePatternEnabled() || !searchTemplateUsesPagePattern(template)) return template;
+  const paged = template.replace(/\{\{page\}\}/g, '1');
+  let url = paged;
+  for (const match of paged.matchAll(/<(.*?)>/g)) {
+    url = url.split(match[0]).join(match[1].split(',')[0].replace(/^[\x00-\x20]+|[\x00-\x20]+$/g, ''));
+  }
+  return url;
 }
 
 /**
