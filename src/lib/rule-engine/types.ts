@@ -53,6 +53,11 @@ export interface CssStep {
   indexSet?: { exclude: boolean; items: CssIndexItem[] };
   /** selfmatch1029：子孙一个不中时改取上下文自身匹配的节点（legado Jsoup 选择含自身，ENGINE_SYNTAX_SELF_MATCH on 才产出）。 */
   selfFallback?: true;
+  /**
+   * children1030：legado `children` 段（ENGINE_SYNTAX_CHILDREN on 才产出，selector 为空）——逐上下文元素取直接子元素，索引/排除
+   * 按每个上下文元素各自的子元素表套用后按序拼接（ElementsSingle.getElementsSingle 逐 temp 调用）。
+   */
+  children?: true;
 }
 
 /** bracket1029：索引集的一项。 */

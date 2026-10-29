@@ -174,6 +174,8 @@ export function evaluateCssChain(
  * 3) excludes（负数从尾）→ index（负数从尾）→ slice；bracket1029 的 `[…]` 索引集与三者互斥（legadoIndexes）。
  */
 export function runStep($: CheerioAPI, scope: CheerioNodes, step: CssStep): CheerioNodes {
+  // children1030：逐上下文元素取直接子元素，各自套索引后按序拼接（legado 逐 temp 调 getElementsSingle 再 addAll）。
+  if (step.children) return $(scope.toArray().flatMap((node) => pickIndexes($(node).children().toArray(), step)));
   let nodes: CheerioNodes;
   try {
     nodes = scope.find(step.selector);
@@ -193,14 +195,19 @@ export function runStep($: CheerioAPI, scope: CheerioNodes, step: CssStep): Chee
     const keyword = step.ownTextContains;
     nodes = nodes.filter((_index, node) => ownTextOf(node).includes(keyword));
   }
-  let list = nodes.toArray();
+  return $(pickIndexes(nodes.toArray(), step));
+}
+
+/** runStep 第 3 步：按 step 的 `[…]` 索引集 / excludes / index / slice 从节点表里挑。 */
+function pickIndexes<T>(nodes: T[], step: CssStep): T[] {
+  let list = nodes;
   if (step.indexSet !== undefined) {
     const picked = legadoIndexes(step.indexSet.items, list.length);
     if (step.indexSet.exclude) {
       const drop = new Set(picked);
-      return $(list.filter((_node, index) => !drop.has(index)));
+      return list.filter((_node, index) => !drop.has(index));
     }
-    return $(picked.map((index) => list[index]));
+    return picked.map((index) => list[index]);
   }
   if (step.excludes !== undefined && step.excludes.length > 0) {
     const drop = new Set(step.excludes.map((raw) => (raw < 0 ? list.length + raw : raw)));
@@ -214,7 +221,7 @@ export function runStep($: CheerioAPI, scope: CheerioNodes, step: CssStep): Chee
     const norm = (value: number) => (value < 0 ? Math.max(list.length + value, 0) : Math.min(value, list.length));
     list = list.slice(norm(start), norm(end));
   }
-  return $(list);
+  return list;
 }
 
 /**

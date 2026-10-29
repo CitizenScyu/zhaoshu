@@ -32,7 +32,7 @@ import {
   engineSyntaxBookFieldsEnabled, engineSyntaxListGetEnabled, engineSyntaxInitJsoupEnabled, engineFieldNetJsEnabled,
   engineSyntaxNullSkipEnabled, engineSyntaxPageDetachedEnabled, engineSyntaxLastAttrEnabled, engineSyntaxNextListEnabled,
   engineSyntaxRulePrefixEnabled, engineSyntaxTemplateHashEnabled, engineSyntaxBracketIndexEnabled, engineSyntaxSelfMatchEnabled,
-  engineSyntaxBareAttrEnabled, engineSyntaxAttrQuoteEnabled, engineSyntaxAttrRegexEnabled,
+  engineSyntaxBareAttrEnabled, engineSyntaxAttrQuoteEnabled, engineSyntaxAttrRegexEnabled, engineSyntaxChildrenEnabled,
 } from './syntax-flags';
 import { rewriteLegadoAttrRegex } from './attr-regex';
 import { compileXPath, XPathSyntaxError } from './xpath-eval';
@@ -101,6 +101,11 @@ let attrQuote = false;
  * 见 attr-regex.ts rewriteLegadoAttrRegex）。嵌套解析经选项透传同口径。
  */
 let attrRegex = false;
+/**
+ * 当前 parseFieldRule 帧是否按 children1030 把默认语法里剥完索引恰为 `children` 的段编译成取直接子元素的步（ParseOptions.childrenEnabled，
+ * 见 CssStep.children）。嵌套解析经选项透传同口径。
+ */
+let childrenKw = false;
 /**
  * fieldnet1029：可放行 `java.ajax` 的字段——页面级、取书链路必需的那几个（每页求值一次，取页次数有界）。条目级字段（如
  * lastChapter）逐条联网会把请求预算吃光，装饰字段丢了不影响取书，都不收（照旧拒）。
@@ -407,6 +412,12 @@ function translateStep(raw: string, rule: string): CssStep {
     s = extractSuffixes(s, step, rule);
   }
 
+  // children1030：legado 前置规则首段为 `children` 即 temp.children()（不是标签名）。
+  if (childrenKw && s.trim() === 'children') {
+    step.children = true;
+    return step;
+  }
+
   // 关键字翻译
   s = s
     .replace(/(^|\s)tag\.([A-Za-z][\w-]*)/g, '$1$2')
@@ -570,6 +581,16 @@ export function ruleMayUseAttrRegex(rule: string): boolean {
   if (/^\s*(?:\$|@json:|@xpath:|\/)/i.test(rule)) return false;
   const head = rule.split('##')[0];
   return rewriteLegadoAttrRegex(head) !== head;
+}
+
+/**
+ * 规则文本里是否可能有 children1030 的 `children` 段（compile.ts sourceUsesChildrenSyntax 的语义位判据，宁多勿漏）：非 JSONPath/XPath/
+ * `@css:` 规则按 `||`/`&&`/`%%`/`@` 切段（先剥 `##` 尾缀），任一段剥索引后缀后恰为 `children`。
+ */
+export function ruleMayUseChildren(rule: string): boolean {
+  if (/^\s*(?:\$|@json:|@css:|@xpath:|\/)/i.test(rule)) return false;
+  return rule.split('##')[0].split(/\|\||&&|%%|@/)
+    .some((seg) => /^\s*children\s*(?:(?:[.!]-?\d+(?::-?\d+)*)|\[[^\]]*\])?\s*$/.test(seg));
 }
 
 /** :contains(X) 里的文本转义（去掉可能破坏 css-select 的引号/括号）。 */
@@ -1045,6 +1066,11 @@ export interface ParseOptions {
    * attr-regex.ts）。默认读 env（缺失=off）。
    */
   attrRegexEnabled?: boolean;
+  /**
+   * children1030：默认语法剥完索引恰为 `children` 的段按 legado temp.children() 求值（ENGINE_SYNTAX_CHILDREN，见 CssStep.children）。
+   * 默认读 env（缺失=off）。
+   */
+  childrenEnabled?: boolean;
 }
 
 /**
@@ -1073,6 +1099,7 @@ function parseFieldRuleFramed(rule: string, options: ParseOptions): FieldIr {
   const savedBare = bareAttr;
   const savedQuote = attrQuote;
   const savedRegex = attrRegex;
+  const savedChildren = childrenKw;
   jsonPathExt = options.jsonPathEnabled ?? engineSyntaxJsonPathEnabled();
   jsObjectKeys = bindActive(options);
   lastAttr = lastAttrActive(options);
@@ -1081,6 +1108,7 @@ function parseFieldRuleFramed(rule: string, options: ParseOptions): FieldIr {
   bareAttr = bareAttrActive(options);
   attrQuote = options.attrQuoteEnabled ?? engineSyntaxAttrQuoteEnabled();
   attrRegex = options.attrRegexEnabled ?? engineSyntaxAttrRegexEnabled();
+  childrenKw = options.childrenEnabled ?? engineSyntaxChildrenEnabled();
   sourceFrame = options.sourceConsts ?? sourceFrame;
   varBag = options.varBag;
   jsoupFrame = undefined;
@@ -1152,6 +1180,7 @@ function parseFieldRuleFramed(rule: string, options: ParseOptions): FieldIr {
     bareAttr = savedBare;
     attrQuote = savedQuote;
     attrRegex = savedRegex;
+    childrenKw = savedChildren;
   }
 }
 
@@ -1183,7 +1212,7 @@ function jsSegmentOptions(options: ParseOptions): ParseOptions {
     regexEnabled: options.regexEnabled ?? engineSyntaxRegexEnabled(), jsonPathEnabled: options.jsonPathEnabled,
     rulePrefixEnabled: options.rulePrefixEnabled, bracketIndexEnabled: options.bracketIndexEnabled,
     selfMatchEnabled: options.selfMatchEnabled, attrQuoteEnabled: options.attrQuoteEnabled,
-    attrRegexEnabled: options.attrRegexEnabled,
+    attrRegexEnabled: options.attrRegexEnabled, childrenEnabled: options.childrenEnabled,
   };
 }
 
@@ -1530,7 +1559,7 @@ function parseJsChain(trimmed: string, rule: string, options: ParseOptions): Fie
     regexEnabled, jsonPathEnabled: options.jsonPathEnabled, rulePrefixEnabled: options.rulePrefixEnabled,
     bracketIndexEnabled: options.bracketIndexEnabled,
     selfMatchEnabled: options.selfMatchEnabled, attrQuoteEnabled: options.attrQuoteEnabled,
-    attrRegexEnabled: options.attrRegexEnabled,
+    attrRegexEnabled: options.attrRegexEnabled, childrenEnabled: options.childrenEnabled,
   };
   const gets: JsGets | undefined = (options.jsGetEnabled ?? engineSyntaxJsGetEnabled())
     ? { options: segmentOptions, out: new Map(), aliases: initJs } : undefined;
@@ -1634,7 +1663,7 @@ function parseListJsChain(rule: string, options: ParseOptions): FieldIr {
         regexEnabled: options.regexEnabled ?? engineSyntaxRegexEnabled(), jsonPathEnabled: options.jsonPathEnabled,
         rulePrefixEnabled: options.rulePrefixEnabled, bracketIndexEnabled: options.bracketIndexEnabled,
         selfMatchEnabled: options.selfMatchEnabled, attrQuoteEnabled: options.attrQuoteEnabled,
-        attrRegexEnabled: options.attrRegexEnabled,
+        attrRegexEnabled: options.attrRegexEnabled, childrenEnabled: options.childrenEnabled,
       },
       out: new Map(),
     }

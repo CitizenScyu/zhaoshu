@@ -13,8 +13,8 @@ import { engineSearchJsActive, engineSearchOptionsActive } from './compile-smoke
 import { AIO_LIST_FIELDS, aioGroups } from './aio-syntax';
 import {
   FIELD_NET_FIELDS, initFieldSupported, initJsFieldSupported, initRuleTextSupported, jsChainFieldAllowed, listJsGroups, objectKeyOf, parseFieldRule,
-  ruleHasJs, ruleHashInTemplate, ruleMayUseAttrQuote, ruleMayUseAttrRegex, ruleMayUseBareAttr, ruleMayUseBracketIndex, ruleMayUseLastAttr,
-  ruleMayUseRulePrefix, type ParseOptions,
+  ruleHasJs, ruleHashInTemplate, ruleMayUseAttrQuote, ruleMayUseAttrRegex, ruleMayUseBareAttr, ruleMayUseBracketIndex, ruleMayUseChildren,
+  ruleMayUseLastAttr, ruleMayUseRulePrefix, type ParseOptions,
   type SourceConsts,
 } from './parse';
 import type { CompiledRules, FieldIr, RuleIr } from './types';
@@ -29,7 +29,7 @@ import {
   engineFieldNetJsEnabled, engineSearchConnectJsEnabled, engineSearchGetPostJsEnabled, engineSyntaxLastAttrEnabled,
   engineSyntaxRulePrefixEnabled, engineSyntaxTemplateHashEnabled, engineSyntaxBracketIndexEnabled, engineSyntaxSelfMatchEnabled,
   engineSyntaxBareAttrEnabled, engineSyntaxJsoupDoctypeEnabled, ENGINE_SEMANTICS_JSOUP_DOCTYPE_BIT, engineSyntaxAttrQuoteEnabled,
-  engineSyntaxAttrRegexEnabled,
+  engineSyntaxAttrRegexEnabled, engineSyntaxChildrenEnabled,
 } from './syntax-flags';
 import { urlOptionFields } from './url-options';
 import {
@@ -153,6 +153,8 @@ export function engineVersionedKey(contentRevision: string, semanticsVersion = E
  * 属性值（sourceUsesAttrQuoteSyntax）时再加属性值含空白位（+8796093022208）；其余字段同上不计位。
  * attrregex1030：ENGINE_SYNTAX_ATTR_REGEX on 且准入搜索判定读的 ruleSearch.bookList/name/author/bookUrl 有会被改写的 `[k~=re]`
  * （sourceUsesAttrRegexSyntax）时再加属性正则位（+17592186044416）；其余字段同上不计位。
+ * children1030：ENGINE_SYNTAX_CHILDREN on 且准入搜索判定读的 ruleSearch.bookList/name/author/bookUrl 有 `children` 段
+ * （sourceUsesChildrenSyntax）时再加 children 关键字位（+35184372088832）；其余字段同上不计位。
  */
 export function engineSourceRevision(
   source: { url: string; searchUrl: unknown; rules: Record<string, unknown> },
@@ -320,6 +322,7 @@ export function engineSourceRevision(
     false, // doctype1029 位另算（见下）
     (options.attrQuoteEnabled ?? engineSyntaxAttrQuoteEnabled()) && sourceUsesAttrQuoteSyntax(rules),
     (options.attrRegexEnabled ?? engineSyntaxAttrRegexEnabled()) && sourceUsesAttrRegexSyntax(rules),
+    (options.childrenEnabled ?? engineSyntaxChildrenEnabled()) && sourceUsesChildrenSyntax(rules),
   );
   // doctype1029：jsoup 开关改得动该源任一位 ⇔ 有字段（含变量袋/搜索袋/条目袋等帧内编译）经 jsoup 重编、求值摸得到 jsoup 层。
   // 只看 jsoup 位会漏掉袋字段（如 searchUrl put、bookList 首段取节点 + JS 读袋的源）。
@@ -477,6 +480,20 @@ export function sourceUsesAttrRegexSyntax(rules: Record<string, unknown>): boole
   return ['bookList', 'name', 'author', 'bookUrl'].some((key) => {
     const rule = fields[key];
     return typeof rule === 'string' && ruleMayUseAttrRegex(rule);
+  });
+}
+
+/**
+ * 准入搜索判定读的 ruleSearch.bookList/name/author/bookUrl 里是否可能有 children1030 的 `children` 段（口径见 parse.ts
+ * ruleMayUseChildren；理由同 sourceUsesOrSyntax）。
+ */
+export function sourceUsesChildrenSyntax(rules: Record<string, unknown>): boolean {
+  const search = rules.ruleSearch;
+  if (!search || typeof search !== 'object' || Array.isArray(search)) return false;
+  const fields = search as Record<string, unknown>;
+  return ['bookList', 'name', 'author', 'bookUrl'].some((key) => {
+    const rule = fields[key];
+    return typeof rule === 'string' && ruleMayUseChildren(rule);
   });
 }
 
