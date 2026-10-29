@@ -664,6 +664,20 @@ export const JSOUP_PRELUDE = `(function(){
     var gs = j.getString;
     j.getString = function(){ var r = RA(gs, j, arguments); return typeof r === 'string' ? JS(r) : r; };
   }
+  // netjs1029：搜索模板联网 JS 才有 ajax 回调（search-js.ts）：只收一个字符串/Java 字符串实参（legado 收 List 取首项，这里不收），
+  // 返回 Java 字符串（legado getStrResponse().body）；另给搜索包装一个 Java 字符串拆/装口（__jstr，不可改写）。字段求值没有
+  // ajax 回调，不装、逐字不变。
+  if (typeof j.ajax === 'function') {
+    var aj = j.ajax;
+    j.ajax = function ajax(url){
+      arity(arguments.length, 1, 1, 'java.ajax');
+      return JS(aj(sArg(url, 'java.ajax')));
+    };
+    defProp(globalThis, '__jstr', { value: freeze({
+      un: function(v){ var k = kindOf(v); return k !== undefined && k.k === 'S' ? k.v : undefined; },
+      of: function(v){ return JS(S(v)); }
+    }), writable: false, enumerable: false, configurable: false });
+  }
   function parse(html){
     arity(arguments.length, 1, 1, 'Jsoup.parse');
     var k = kindOf(html), s;

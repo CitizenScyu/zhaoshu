@@ -19,7 +19,7 @@ import {
 } from './evaluate';
 import { enginePostSearchEnabled, engineSearchJsActive } from './compile-smoke';
 import { preloadJsSandbox } from './js-sandbox';
-import { buildSearchRequestWithVars, prepareSearchJs, searchJsTemplateLimit } from './search-js';
+import { buildSearchRequestWithNet, prepareSearchJs, searchJsTemplateLimit } from './search-js';
 import { engineSyntaxJsBindEnabled } from './syntax-flags';
 import { RuleEngineError, type CompiledRules, type FieldIr, type SkippedField } from './types';
 import { stripUrlOptions } from './url-options';
@@ -132,7 +132,13 @@ export async function engineSearchBook(
     // searchjs1027：旧口径构造不出、需 JS 的模板（ENGINE_SEARCH_JS 开）在沙箱里按 legado 口径求值；其余逐字走旧口径。
     const searchJs = engineSearchJsActive();
     if (searchJs && searchTemplateNeedsJs(source.searchUrl, source.url, searchJsTemplateLimit())) await prepareSearchJs();
-    const built = buildSearchRequestWithVars(source.searchUrl, title, source.url, validateSourceUrl, searchJs);
+    // netjs1029：联网 JS 模板的 java.ajax 页面同走 context.page（计请求预算、过 host 门），取回后重放求值。
+    const built = await buildSearchRequestWithNet(source.searchUrl, title, source.url, validateSourceUrl, searchJs, async (req) => (
+      await context.page(req.url, {
+        request: { method: req.method, body: req.body, headers: req.headers, charset: req.charset },
+        responseCharset: req.charset === 'utf-8' ? 'auto' : req.charset,
+      })
+    ).text);
     const request = built.request;
     searchVars = built.vars;
     page = await context.page(request.url, {

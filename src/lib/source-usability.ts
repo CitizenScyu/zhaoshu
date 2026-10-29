@@ -3,7 +3,7 @@
 // （41-swq 实测：sfacg 两条规则 searchUrl 指向门外的 m.sfacg.com，准入记 search_ok，运行时必拒）。
 import { compileSource } from './rule-engine/compile';
 import { enginePostSearchEnabled, engineSearchJsActive } from './rule-engine/compile-smoke';
-import { buildSearchProbeRequest, buildSearchRequest, SEARCH_PROBE_TITLE, SearchJsNotReadyError } from './rule-engine/search-js';
+import { buildSearchProbeRequest, buildSearchRequest, SEARCH_PROBE_TITLE, SearchJsNotReadyError, SearchNetPendingError } from './rule-engine/search-js';
 import {
   engineSyntaxAioEnabled, engineSyntaxAndEnabled, engineSyntaxJsBindEnabled, engineSyntaxJsEnabled, engineSyntaxJsExtEnabled, engineSyntaxJsGetEnabled,
   engineSyntaxJsonPathEnabled, engineSyntaxJsUtilEnabled, engineSyntaxListJsEnabled,
@@ -38,6 +38,8 @@ export function searchTemplateRejected(source: RuleSource, title?: string): bool
     else buildSearchRequest(source.searchUrl, title, source.url, validateSourceUrl, engineSearchJsActive());
     return false;
   } catch (error) {
+    // netjs1029：联网 JS 模板构造到首个 java.ajax（地址已过 host 门）为止，页面要真搜索时才取，按能构造算。
+    if (error instanceof SearchNetPendingError) return false;
     if (error instanceof SourcePolicyError || error instanceof SearchJsNotReadyError) return true;
     throw error;
   }

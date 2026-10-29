@@ -720,6 +720,14 @@ export function searchTemplateUsesCjkEncodeUri(template: unknown, base: string):
     && searchTemplateNeedsJs(template, base);
 }
 
+/**
+ * netjs1029：搜索模板里是否出现 `java.ajax(` 调用（联网 JS 的沙箱口径与语义位用，只看子串、宁宽勿漏——注释里的也算，多算
+ * 只是多走一次 jsoup 包装求值；求值时没真调用 ajax 则不取页）。调用方另判 searchTemplateNeedsJs。
+ */
+export function searchTemplateUsesAjax(template: unknown): boolean {
+  return typeof template === 'string' && /\bjava\s*\.\s*ajax\s*\(/.test(template);
+}
+
 // legado NetworkUtils.notNeedEncodingQuery / notNeedEncodingForm 与 AnalyzeUrl.queryEncoder
 // （RFC3986.UNRESERVED + `!$%&()*+,/:;=?@[\]^\`{|}`；`%` 安全，已有的 %XX 不重编）。
 const LEGADO_QUERY_PLAIN = /[A-Za-z0-9!$&()*+,\-./:;=?@[\\\]^_`{|}~]/;

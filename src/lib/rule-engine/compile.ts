@@ -5,7 +5,7 @@
 // 产物自然失效，不存在「|| 开关打开后仍复用 off 态编译缓存」的窗口。
 import {
   MAX_SEARCH_JS_LONG_TEMPLATE_LENGTH, MAX_SEARCH_JS_TEMPLATE_LENGTH, searchOptionsMayUseWebView, searchOptionsNeedParity,
-  searchTemplateNeedsJs, searchTemplateUsesCjkEncodeUri,
+  searchTemplateNeedsJs, searchTemplateUsesAjax, searchTemplateUsesCjkEncodeUri,
 } from '@/lib/source-parser';
 import { upgradeSourceTemplateUrl } from '@/lib/source-policy';
 import { sourceRevision } from '@/lib/source-revision';
@@ -23,7 +23,7 @@ import {
   engineSyntaxOrEnabled, engineSyntaxRegexEnabled, engineSyntaxVarsEnabled, engineSyntaxXPathEnabled, engineSyntaxXPathEvalEnabled, engineUrlOptionsEnabled,
   engineSearchWebViewEnabled, engineSyntaxInitJsEnabled, engineSyntaxJsoupEnabled, engineSyntaxVarsBagEnabled,
   engineSyntaxBookFieldsEnabled, engineSyntaxSearchVarsEnabled, engineSyntaxItemVarsEnabled, engineSyntaxListGetEnabled, ENGINE_SEMANTICS_VERSION,
-  engineSyntaxBookVariableEnabled, engineSyntaxJsLibEnabled, engineSyntaxSourceBindEnabled, engineSyntaxInitJsoupEnabled,
+  engineSyntaxBookVariableEnabled, engineSyntaxJsLibEnabled, engineSyntaxSourceBindEnabled, engineSyntaxInitJsoupEnabled, engineSearchNetJsEnabled,
 } from './syntax-flags';
 import { urlOptionFields } from './url-options';
 import {
@@ -64,6 +64,8 @@ export interface CompileOptions extends ParseOptions {
   /** srcbind1028：书源常量代入（ENGINE_SYNTAX_SOURCE_BIND，默认读 env；须 JS 链对该源生效，见 sourceConstsOf）。变量袋/搜索袋/条目袋的字段不代入。 */
   sourceBindEnabled?: boolean;
   // initJsoupEnabled（initjsoup1028，ENGINE_SYNTAX_INIT_JSOUP）见 ParseOptions；compile 层另要求 JS init 与 jsoup 对该源同生效。
+  /** netjs1029：搜索联网 JS（ENGINE_SEARCH_NET_JS，默认读 env；须搜索 JS、ENGINE_SYNTAX_JS 与 jsoup 同开）。只影响语义版本位。 */
+  searchNetJsEnabled?: boolean;
 }
 
 /** 版本化缓存键（P0 口径）：semanticsVersion:contentRevision。 */
@@ -113,6 +115,8 @@ export function engineVersionedKey(contentRevision: string, semanticsVersion = E
  * longjs1029 同条件下超 8192、64K 内的需 JS 模板（只在长上限下才进新路径）同计 jsUtil 位，搜索 JS 位仍按 8192 判、逐字不变。
  * initjsoup1028：ENGINE_SYNTAX_INIT_JSOUP on、JS init 与 jsoup 对该源同生效且 init 只有经 jsoup 重编才是可复现 JS init
  * （sourceUsesInitJsoupSyntax）时再加 jsoup init 位（+1073741824，int4 最后一位）。其余位的探测不传本开关（读 env，同 listget1028 口径）。
+ * netjs1029：ENGINE_SEARCH_NET_JS、ENGINE_SYNTAX_JS（原始开关，搜索沙箱不看 JS 链）、ENGINE_SYNTAX_JSOUP 与搜索 JS 同开，且需 JS 的
+ * 搜索模板（按运行时同一长度上限）里有 java.ajax 调用（searchTemplateUsesAjax）时再加搜索联网 JS 位（+2147483648，bigint 列）。
  */
 export function engineSourceRevision(
   source: { url: string; searchUrl: unknown; rules: Record<string, unknown> },
@@ -255,6 +259,10 @@ export function engineSourceRevision(
       jsExtEnabled, jsBindEnabled: jsBind, jsGetEnabled: jsGet, jsUtilEnabled: jsUtil, jsonPathEnabled, bookFieldsEnabled: book,
       sourceConsts: sourceConstsOf(source.rules, sourceBind),
     }),
+    searchJsEnabled && jsEnabled && (options.jsoupEnabled ?? engineSyntaxJsoupEnabled())
+      && (options.searchNetJsEnabled ?? engineSearchNetJsEnabled()) && searchTemplateUsesAjax(source.searchUrl)
+      && searchTemplateNeedsJs(source.searchUrl, upgradeSourceTemplateUrl(source.url),
+        jsEnabled && jsUtilEnabled ? MAX_SEARCH_JS_LONG_TEMPLATE_LENGTH : MAX_SEARCH_JS_TEMPLATE_LENGTH),
   ));
 }
 

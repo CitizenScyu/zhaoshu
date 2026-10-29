@@ -5,16 +5,20 @@
 // 只绑定 key/page/baseUrl/result/source（只读：getKey/bookSourceUrl/getVariable→''）/cookie（空实现）/book=null，
 // java 在纯计算帮手之外补 put/get（本次请求构造内的变量袋，见 SETUP）；
 // java.ajax、cache、source.put 等依赖宿主状态的调用在沙箱里不存在 → 求值失败 → 判不支持。
+// netjs1029（ENGINE_SEARCH_NET_JS，默认关）：含 java.ajax 的模板改在 jsoup 包装帧里跑，ajax 由宿主按缓存应答，
+// 未命中则抛出待取地址、由异步入口（buildSearchRequestWithNet）联网取回后整段重放。
 // 只对旧口径构造不出请求的模板生效（searchTemplateNeedsJs），旧口径能构造的模板逐字走旧路径。
 // 本模块只在服务端用（js-sandbox 依赖 node:crypto 与 wasm），纯函数部分在 source-parser.ts。
 
 import {
   buildLegadoSearchRequest, buildSourceSearchRequest, MAX_SEARCH_JS_LONG_TEMPLATE_LENGTH, MAX_SEARCH_JS_TEMPLATE_LENGTH,
-  searchOptionsNeedParity, searchTemplateNeedsJs, type SourceSearchRequest, type SourceUrlValidator,
+  searchOptionsNeedParity, searchTemplateNeedsJs, searchTemplateUsesAjax, type SourceSearchRequest, type SourceUrlValidator,
 } from '@/lib/source-parser';
 import { checkSourceUrl, SourcePolicyError, validateSourceUrl } from '@/lib/source-policy';
-import { preloadJsSandbox, runJs } from './js-sandbox';
-import { engineSearchOptionsEnabled, engineSyntaxJsEnabled, engineSyntaxJsUtilEnabled } from './syntax-flags';
+import { MAX_JS_INPUT_CHARS, preloadJsSandbox, runJs, runJsoup, type JsBindings } from './js-sandbox';
+import {
+  engineSearchNetJsEnabled, engineSearchOptionsEnabled, engineSyntaxJsEnabled, engineSyntaxJsoupEnabled, engineSyntaxJsUtilEnabled,
+} from './syntax-flags';
 import { RuleEngineError } from './types';
 
 /**
@@ -43,8 +47,13 @@ const MAX_SEARCH_VARS_CHARS = 16_384;
 // get 读不到本次 put 过的键时 legado AnalyzeUrl.get 得空串（搜索用新建的 RuleData，不回查源变量）；读不到的键实测多出自
 // 联网段或宿主状态，这里保守判不支持；
 // 值只收字符串/布尔/无指数形态的数字（Rhino 转 String 与 JS 同形），其余形态不可复现即拒。
-const SETUP = `
-  var k = globalThis.__sourceKey; delete globalThis.__sourceKey;
+// netjs1029 联网帧（jsoup 包装下跑，java.ajax 返回 Java 字符串）：put/格式化先把 Java 字符串拆成原文（Rhino 里同是 String），
+// get 照 legado 返回 Java 字符串；非联网帧的代码逐字不变。
+const NET_UNWRAP = `if (typeof v === 'object' && v !== null) { var w = JSTR.un(v); if (w !== undefined) v = w; }
+  `;
+function setupCode(net: boolean): string {
+  return `
+  ${net ? 'var JSTR = globalThis.__jstr;\n  ' : ''}var k = globalThis.__sourceKey; delete globalThis.__sourceKey;
   var vars = Object.create(null), seed = JSON.parse(globalThis.__vars); delete globalThis.__vars;
   Object.keys(seed).forEach(function(n){ vars[n] = seed[n]; });
   globalThis.source = Object.freeze({
@@ -57,7 +66,7 @@ const SETUP = `
   Object.keys(j).forEach(function(n){ nj[n] = j[n]; });
   nj.put = function(name, v){
     if (typeof name !== 'string') throw new TypeError('java.put 键须为字符串');
-    var s;
+    ${net ? NET_UNWRAP : ''}var s;
     if (typeof v === 'string') s = v;
     else if (typeof v === 'boolean' || (typeof v === 'number' && isFinite(v) && !/e/i.test(String(v)))) s = String(v);
     else throw new TypeError('java.put 不支持的值类型：' + typeof v);
@@ -66,22 +75,25 @@ const SETUP = `
   };
   nj.get = function(name){
     if (typeof name !== 'string' || !Object.prototype.hasOwnProperty.call(vars, name)) throw new TypeError('java.get 读不到本次 put 的变量');
-    return vars[name];
+    return ${net ? 'JSTR.of(vars[name])' : 'vars[name]'};
   };
   globalThis.java = Object.freeze(nj);
 `;
+}
+const SETUP = setupCode(false);
+const SETUP_NET = setupCode(true);
 
 // analyzeJs：legado `evalJS(code, result).toString()`。null → "null"（照抄）；数字在 Rhino 是 Double，toString 得 "1.0"，
 // 与 JS 口径不一致，直接判不支持；对象/数组的 Java toString 形态不可复现，同样拒。
-const SEGMENT_FORMAT = `(function(v){
+const SEGMENT_BODY = `
   if (v === null || v === undefined) return 'null';
   if (typeof v === 'string' || typeof v === 'boolean') return String(v);
   throw new TypeError('不支持的 JS 结果类型：' + typeof v);
-})`;
+`;
 
 // `{{表达式}}`：legado `evalJS(it) ?: ""`，String 原样、整数 Double 按 "%.0f"，其余 toString。
 // 非整数只放行 Java Double.toString 与 JS String 一致的范围（1e-3 ≤ |v| < 1e7），其余形态不可复现即拒。
-const INLINE_FORMAT = `(function(v){
+const INLINE_BODY = `
   if (v === null || v === undefined) return '';
   if (typeof v === 'string' || typeof v === 'boolean') return String(v);
   if (typeof v === 'number' && isFinite(v)) {
@@ -90,9 +102,52 @@ const INLINE_FORMAT = `(function(v){
     if (a >= 1e-3 && a < 1e7) return String(v);
   }
   throw new TypeError('不支持的 JS 结果类型：' + typeof v);
-})`;
+`;
+const formatCode = (body: string, net: boolean) => `(function(v){${net ? `\n  ${NET_UNWRAP.trimEnd()}` : ''}${body}})`;
+const SEGMENT_FORMAT = formatCode(SEGMENT_BODY, false);
+const INLINE_FORMAT = formatCode(INLINE_BODY, false);
+const SEGMENT_FORMAT_NET = formatCode(SEGMENT_BODY, true);
+const INLINE_FORMAT_NET = formatCode(INLINE_BODY, true);
 
-interface EvalContext { title: string; baseUrl: string; vars: Record<string, string> }
+/**
+ * netjs1029：联网帧里 java.ajax 要的页面还没取到（net 缓存未命中）。只在本模块内流转：沙箱把宿主回调的
+ * RuleEngineError 原样抛出，evalSearchJs 认出它直接上抛，withSearchJs 转成 SearchNetPendingError 交调用方去取。
+ */
+class SearchNetMissError extends RuleEngineError {
+  constructor(readonly url: string) {
+    super('RULE_EVAL_FAILED', 'java.ajax 页面未取');
+    this.name = 'SearchNetMissError';
+  }
+}
+
+/**
+ * netjs1029：搜索模板的 java.ajax 要先联网取页面（legado JsExtensions.ajax → 新建 AnalyzeUrl 取 body）。`key` = JS 传进来的原串
+ * （缓存键），`request` = 按 legado AnalyzeUrl 口径解析出的请求（地址已过 host 门）。buildSearchRequestWithNet 自动取、重放；
+ * 同步入口原样抛给调用方（判「能否构造」类调用方视作能构造）。
+ */
+export class SearchNetPendingError extends Error {
+  constructor(readonly key: string, readonly request: SourceSearchRequest) {
+    super('搜索 JS 需联网取页面');
+    this.name = 'SearchNetPendingError';
+  }
+}
+
+/** netjs1029：联网取页面（运行时 context.page / 准入 admissionFetch），返回 body 原文；失败抛错。 */
+export type SearchNetFetch = (request: SourceSearchRequest) => Promise<string>;
+
+/** 一次请求构造最多联网取几页（legado 不限；这里有界，免得一个模板把请求预算吃光）。 */
+const MAX_NET_FETCHES = 4;
+
+/** net：联网帧的 ajax 页面缓存（url 原串 → body）；undefined = 非联网帧（无 ajax 回调，逐字走旧路径）。 */
+interface EvalContext { title: string; baseUrl: string; vars: Record<string, string>; net?: ReadonlyMap<string, string> }
+
+/**
+ * netjs1029：搜索联网 JS（ENGINE_SEARCH_NET_JS 与 ENGINE_SYNTAX_JS、ENGINE_SYNTAX_JSOUP 同开；java.ajax 返回 Java 字符串，
+ * 要 jsoup 包装）。搜索 JS 本身是否生效仍由调用方的 searchJs 参数判。
+ */
+export function searchNetJsEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return engineSearchNetJsEnabled(env) && engineSyntaxJsEnabled(env) && engineSyntaxJsoupEnabled(env);
+}
 
 /** gbkjs1029：搜索模板里 `java.encodeURI(文本, 'gbk'|…)` 按 URLEncoder GBK 系口径编码（ENGINE_SYNTAX_JS 与 ENGINE_SYNTAX_JS_UTIL 同开）。 */
 function searchCjkEncodeUri(): boolean {
@@ -108,18 +163,33 @@ export function searchJsTemplateLimit(env: NodeJS.ProcessEnv = process.env): num
 }
 
 function evalSearchJs(code: string, ctx: EvalContext, result: string | null): string {
-  const wrapper = `(function(){${SETUP}${result === null ? 'globalThis.result = null;\n' : ''}`
-    + `var out = ${result === null ? INLINE_FORMAT : SEGMENT_FORMAT}((0, eval)(${JSON.stringify(code)}));\n`
+  const net = ctx.net;
+  const format = result === null ? (net ? INLINE_FORMAT_NET : INLINE_FORMAT) : (net ? SEGMENT_FORMAT_NET : SEGMENT_FORMAT);
+  const wrapper = `(function(){${net ? SETUP_NET : SETUP}${result === null ? 'globalThis.result = null;\n' : ''}`
+    + `var out = ${format}((0, eval)(${JSON.stringify(code)}));\n`
     + 'return JSON.stringify([out, vars]);\n})()';
+  const bindings: JsBindings = {
+    result: result ?? '',
+    baseUrl: ctx.baseUrl,
+    globals: { key: ctx.title, page: SEARCH_PAGE, __sourceKey: ctx.baseUrl, __vars: JSON.stringify(ctx.vars) },
+    ...(searchCjkEncodeUri() ? { cjkEncodeUri: true } : {}),
+  };
   let packed: unknown;
   try {
-    packed = runJs(wrapper, {
-      result: result ?? '',
-      baseUrl: ctx.baseUrl,
-      globals: { key: ctx.title, page: SEARCH_PAGE, __sourceKey: ctx.baseUrl, __vars: JSON.stringify(ctx.vars) },
-      ...(searchCjkEncodeUri() ? { cjkEncodeUri: true } : {}),
-    });
+    packed = net
+      ? runJsoup(wrapper, {
+        ...bindings,
+        callbacks: {
+          ajax: (url) => {
+            const body = net.get(url);
+            if (body === undefined) throw new SearchNetMissError(url);
+            return body;
+          },
+        },
+      }, 'final')
+      : runJs(wrapper, bindings);
   } catch (error) {
+    if (error instanceof SearchNetMissError) throw error;
     if (error instanceof RuleEngineError) {
       if (/未就绪|预算耗尽|沙箱异常/.test(error.message)) throw new SearchJsNotReadyError(error.message);
       throw new SourcePolicyError(`不支持该书源的搜索 JS（${error.message}）`);
@@ -199,11 +269,28 @@ function optionParity(template: string, base: string): boolean {
 }
 
 /** legado AnalyzeUrl 的 JS 段与 `{{…}}`/页码求值，得交给 buildLegadoSearchRequest 的 ruleUrl。base 带选项时照 legado 剥掉，作相对地址基准。 */
-function evaluateSearchJs(template: string, title: string, base: string): EvaluatedSearchJs {
+function evaluateSearchJs(template: string, title: string, base: string, net?: ReadonlyMap<string, string>): EvaluatedSearchJs {
   const split = OPTION_SPLIT.exec(base);
-  const ctx: EvalContext = { title, baseUrl: split ? base.slice(0, split.index) : base, vars: {} };
+  const ctx: EvalContext = { title, baseUrl: split ? base.slice(0, split.index) : base, vars: {}, ...(net ? { net } : {}) };
   const ruleUrl = replacePages(replaceInline(analyzeJs(template, ctx), ctx));
   return { ruleUrl, baseUrl: ctx.baseUrl, vars: ctx.vars };
+}
+
+/** 该模板这次是否走联网帧（开关开且模板里有 java.ajax 调用）。 */
+function netFrame(template: string): boolean {
+  return searchNetJsEnabled() && searchTemplateUsesAjax(template);
+}
+
+/**
+ * netjs1029：java.ajax 实参按 legado 新建 AnalyzeUrl(url, source) 口径解析成请求：那里 key/page 为 null、baseUrl 为空，
+ * 只有展开好的绝对地址能用；`{{…}}`/JS 段/页码占位一律拒（不支持，不猜）。选项按 legado 口径读（与主模板同一开关）。
+ */
+function ajaxRequest(url: string, validate: SourceUrlValidator): SourceSearchRequest {
+  const ruleUrl = url.trim();
+  if (!/^https?:\/\//i.test(ruleUrl) || /\{\{|<js>|@js:|<[^>]*>/i.test(ruleUrl)) {
+    throw new SourcePolicyError('不支持该书源的搜索 JS（java.ajax 地址须是展开好的绝对地址）');
+  }
+  return buildLegadoSearchRequest(ruleUrl, undefined, validate, engineSearchOptionsEnabled());
 }
 
 /** legado AnalyzeUrl 口径的整条搜索请求。base = 书源 bookSourceUrl。 */
@@ -222,14 +309,21 @@ export interface SearchRequestWithVars {
 
 function withSearchJs(
   template: unknown, title: string, base: string | undefined, validate: SourceUrlValidator, searchJs: boolean,
-  evaluate: (template: string, base: string) => EvaluatedSearchJs,
+  evaluate: (template: string, base: string, net: boolean) => EvaluatedSearchJs,
 ): SearchRequestWithVars {
   try {
     return { request: buildSourceSearchRequest(template, title, base, validate) };
   } catch (error) {
     if (!(error instanceof SourcePolicyError) || !searchJs || typeof template !== 'string' || base === undefined
       || !searchTemplateNeedsJs(template, base, searchJsTemplateLimit())) throw error;
-    const { ruleUrl, baseUrl, vars } = evaluate(template, base);
+    let evaluated: EvaluatedSearchJs;
+    try {
+      evaluated = evaluate(template, base, netFrame(template));
+    } catch (miss) {
+      if (!(miss instanceof SearchNetMissError)) throw miss;
+      throw new SearchNetPendingError(miss.url, ajaxRequest(miss.url, validate));
+    }
+    const { ruleUrl, baseUrl, vars } = evaluated;
     return { request: buildLegadoSearchRequest(ruleUrl, baseUrl, validate, optionParity(template, base)), vars };
   }
 }
@@ -238,6 +332,7 @@ function withSearchJs(
  * 运行时/准入统一入口：先走旧口径（buildSourceSearchRequest，逐字不变）；只有旧口径构造不出、开关开、
  * 且模板确实要 JS（searchTemplateNeedsJs）时才按 legado JS 口径求值。其余情况原样抛旧口径的错误。
  * 调用前须已 await prepareSearchJs()，否则抛 SearchJsNotReadyError。
+ * 联网 JS 模板（searchNetJsEnabled）要取页面时抛 SearchNetPendingError；要真去取用 buildSearchRequestWithNet。
  */
 export function buildSearchRequest(
   template: unknown, title: string, base: string | undefined,
@@ -251,7 +346,30 @@ export function buildSearchRequestWithVars(
   template: unknown, title: string, base: string | undefined,
   validate: SourceUrlValidator = validateSourceUrl, searchJs = false,
 ): SearchRequestWithVars {
-  return withSearchJs(template, title, base, validate, searchJs, (t, b) => evaluateSearchJs(t, title, b));
+  return withSearchJs(template, title, base, validate, searchJs, (t, b, net) => evaluateSearchJs(t, title, b, net ? new Map() : undefined));
+}
+
+/**
+ * netjs1029：同 buildSearchRequestWithVars，java.ajax 要的页面经 fetchNet 取回后整段模板从头重放（legado 求值是同步阻塞取页，
+ * 这里取回 body 记进缓存、再求一遍，同一地址不重取）；最多取 MAX_NET_FETCHES 页。fetchNet 的错误原样上抛。
+ * 非联网帧的模板只求一遍，与 buildSearchRequestWithVars 逐字相同。
+ */
+export async function buildSearchRequestWithNet(
+  template: unknown, title: string, base: string | undefined,
+  validate: SourceUrlValidator, searchJs: boolean, fetchNet: SearchNetFetch,
+): Promise<SearchRequestWithVars> {
+  const net = new Map<string, string>();
+  for (;;) {
+    try {
+      return withSearchJs(template, title, base, validate, searchJs, (t, b, on) => evaluateSearchJs(t, title, b, on ? net : undefined));
+    } catch (error) {
+      if (!(error instanceof SearchNetPendingError)) throw error;
+      if (net.size >= MAX_NET_FETCHES) throw new SourcePolicyError('不支持该书源的搜索 JS（java.ajax 次数过多）');
+      const body = await fetchNet(error.request);
+      if (body.length > MAX_JS_INPUT_CHARS) throw new SourcePolicyError('不支持该书源的搜索 JS（java.ajax 页面过大）');
+      net.set(error.key, body);
+    }
+  }
 }
 
 function allowAnyHost(value: unknown, base?: string): URL {
@@ -261,29 +379,32 @@ function allowAnyHost(value: unknown, base?: string): URL {
 /** 判「模板能否构造」用的占位书名（与 source-usability / 候选口径同一个）。 */
 export const SEARCH_PROBE_TITLE = '书';
 const MAX_PROBE_CACHE = 512;
-const probed = new Map<string, EvaluatedSearchJs | { rejected: string }>();
+const probed = new Map<string, EvaluatedSearchJs | { rejected: string } | { pending: string }>();
 
 /**
  * 占位书名下的 JS 段求值结果（ruleUrl 或策略拒原因）按 base+模板 LRU 记忆：候选筛与取书池每次请求都要判全部源，
  * 不能每次都起沙箱、吃共享 JS 预算（还会因单段预算耗尽让同一个源时好时坏）。只记忆求值结果，host 门/红线每次对
  * 结果重验；沙箱未就绪抛 SearchJsNotReadyError、不记忆。真实搜索（真书名）不走这里。
+ * 联网帧（netjs1029）不联网：首个 java.ajax 未命中即记为 pending（地址每次重验），判定口径见各调用方。
  */
-function probeSearchJs(template: string, base: string): EvaluatedSearchJs {
-  const cacheKey = `${searchCjkEncodeUri() ? 1 : 0}\0${base}\0${template}`;
+function probeSearchJs(template: string, base: string, net = false): EvaluatedSearchJs {
+  const cacheKey = `${searchCjkEncodeUri() ? 1 : 0}${net ? '\0net' : ''}\0${base}\0${template}`;
   let entry = probed.get(cacheKey);
   if (entry !== undefined) {
     probed.delete(cacheKey);
   } else {
     try {
-      entry = evaluateSearchJs(template, SEARCH_PROBE_TITLE, base);
+      entry = evaluateSearchJs(template, SEARCH_PROBE_TITLE, base, net ? new Map() : undefined);
     } catch (error) {
-      if (!(error instanceof SourcePolicyError)) throw error;
-      entry = { rejected: error.message };
+      if (error instanceof SearchNetMissError) entry = { pending: error.url };
+      else if (!(error instanceof SourcePolicyError)) throw error;
+      else entry = { rejected: error.message };
     }
   }
   probed.set(cacheKey, entry);
   while (probed.size > MAX_PROBE_CACHE) probed.delete(probed.keys().next().value!);
   if ('rejected' in entry) throw new SourcePolicyError(entry.rejected);
+  if ('pending' in entry) throw new SearchNetMissError(entry.pending);
   return entry;
 }
 
@@ -296,11 +417,20 @@ export function buildSearchProbeRequest(
 
 /**
  * 候选口径：该需 JS 的模板能否在沙箱里构造出请求（放开 host 白名单，红线照守；占位书名，求值结果记忆见 probeSearchJs）。
+ * 联网 JS 模板到首个 java.ajax 为止：地址能解析成请求即算能构造（页面要联网才知道，交准入实测）。
  * 沙箱未就绪抛 SearchJsNotReadyError。调用方先确认 searchTemplateNeedsJs。
  */
 export function searchJsConstructible(template: string, base: string): boolean {
   try {
-    const { ruleUrl, baseUrl } = probeSearchJs(template, base);
+    let evaluated: EvaluatedSearchJs;
+    try {
+      evaluated = probeSearchJs(template, base, netFrame(template));
+    } catch (miss) {
+      if (!(miss instanceof SearchNetMissError)) throw miss;
+      ajaxRequest(miss.url, allowAnyHost);
+      return true;
+    }
+    const { ruleUrl, baseUrl } = evaluated;
     buildLegadoSearchRequest(ruleUrl, baseUrl, allowAnyHost, optionParity(template, base));
     return true;
   } catch (error) {

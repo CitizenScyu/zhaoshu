@@ -37,7 +37,10 @@ import { bookUrlMember, bookView, formatBookAuthor, formatBookName, type BookVie
 import { stripUrlOptions, urlOptionFields } from './url-options';
 import { aioGroups, isAioListRule, ruleGroupOf } from './aio-syntax';
 import { preloadJsSandbox } from './js-sandbox';
-import { buildSearchRequestWithVars, prepareSearchJs, SearchJsNotReadyError, type SearchRequestWithVars } from './search-js';
+import {
+  buildSearchRequestWithNet, buildSearchRequestWithVars, prepareSearchJs, SearchJsNotReadyError, SearchNetPendingError,
+  type SearchRequestWithVars,
+} from './search-js';
 import { resolveSourceVars } from './vars-subset';
 import { jsLibRuleProblem } from './js-lib';
 import { contentHtmlToText, contentNeedsHtmlToText } from './content-html';
@@ -728,10 +731,7 @@ function buildAdmissionSearchRequest(
 function buildAdmissionSearch(
   source: RawSource, declaredHosts: ReadonlySet<string>, keyword = admissionKeyword(source),
 ): SearchRequestWithVars {
-  // bookSourceUrl 写死 http:// 的源（41-srcfix 改法2，selectCandidates 已按升级后判定放行）：基址同样升 https
-  // 再过锁，否则 checkSourceUrl 先拒基址、相对 searchUrl 也无从解析。升级只改 scheme，锁本身不变。
-  const base = typeof source.bookSourceUrl === 'string' ? upgradeSourceTemplateUrl(source.bookSourceUrl) : undefined;
-  const validate: SourceUrlValidator = (value, b) => validateAdmissionUrl(value, b, declaredHosts);
+  const { base, validate } = admissionSearchScope(source, declaredHosts);
   if (enginePostSearchEnabled()) {
     // 与运行时 sourceSearchUrl/buildSourceSearchRequest 同一口径（含 http→https 升级），否则「准入通过、阅读期被判死」两把锁漂移。
     // searchjs1027：ENGINE_SEARCH_JS 开时旧口径构造不出的 JS 模板与运行时同一函数求值（沙箱未就绪抛 SearchJsNotReadyError）。
@@ -744,6 +744,59 @@ function buildAdmissionSearch(
   const expanded = template.replace(/\{\{key\}\}/g, encodeURIComponent(keyword)).replace(/\{\{page\}\}/g, '1');
   if (/[{}]|@js:|<js>|,\s*\[/i.test(expanded)) throw new SourcePolicyError('不支持该书源的动态搜索规则');
   return { request: { url: validateAdmissionUrl(upgradeSourceTemplateUrl(expanded), base, declaredHosts).href, method: 'GET', charset: 'utf-8' } };
+}
+
+function admissionSearchScope(source: RawSource, declaredHosts: ReadonlySet<string>): { base: string | undefined; validate: SourceUrlValidator } {
+  // bookSourceUrl 写死 http:// 的源（41-srcfix 改法2，selectCandidates 已按升级后判定放行）：基址同样升 https
+  // 再过锁，否则 checkSourceUrl 先拒基址、相对 searchUrl 也无从解析。升级只改 scheme，锁本身不变。
+  const base = typeof source.bookSourceUrl === 'string' ? upgradeSourceTemplateUrl(source.bookSourceUrl) : undefined;
+  const validate: SourceUrlValidator = (value, b) => validateAdmissionUrl(value, b, declaredHosts);
+  return { base, validate };
+}
+
+/** netjs1029：搜索 JS 的 java.ajax 取页失败（含取页前的节流等待被中止）。status = 拿到了非 2xx 响应。 */
+class AdmissionAjaxError extends Error {
+  constructor(readonly status: number | undefined, readonly reason: unknown) {
+    super(`java.ajax ${status !== undefined ? `HTTP ${status}` : errorMessage(reason)}`);
+    this.name = 'AdmissionAjaxError';
+  }
+}
+
+/**
+ * netjs1029：同 buildAdmissionSearch，搜索 JS 的 java.ajax 页面走准入通道（admissionFetch，准入门、非 2xx 判失败）取回后重放求值；
+ * 非联网模板与 buildAdmissionSearch 结果相同。`afterRequest`：构造前刚打过同站请求（对照搜索），首个 ajax 前先歇一个节流间隔；
+ * ajax 之间同样补间隔。fetched = 取了几页（调用方据此给紧接的搜索请求补间隔）。取页失败抛 AdmissionAjaxError。
+ */
+async function buildAdmissionSearchNet(
+  source: RawSource, options: Parameters<typeof searchAdmission>[1], keyword: string, afterRequest: boolean,
+): Promise<SearchRequestWithVars & { fetched: number }> {
+  if (!enginePostSearchEnabled()) return { ...buildAdmissionSearch(source, options.declaredHosts, keyword), fetched: 0 };
+  const { base, validate } = admissionSearchScope(source, options.declaredHosts);
+  const throttleMs = options.throttleMs ?? ADMISSION_THROTTLE_MS;
+  let fetched = 0;
+  const built = await buildSearchRequestWithNet(source.searchUrl, keyword, base, validate, engineSearchJsActive(), async (request) => {
+    let page: { url: string; status: number; text: string };
+    try {
+      if (throttleMs > 0 && (afterRequest || fetched > 0)) await (options.sleep ?? defaultSleep)(throttleMs, options.signal);
+      fetched += 1;
+      page = await admissionFetch(request, options);
+    } catch (error) {
+      throw new AdmissionAjaxError(undefined, error);
+    }
+    if (page.status < 200 || page.status >= 300) throw new AdmissionAjaxError(page.status, undefined);
+    return page.text;
+  });
+  return { ...built, fetched };
+}
+
+/** java.ajax 取页失败的判定：状态码分桶同主搜索（403=challenge、5xx、4xx），策略拒 = url_invalid，其余 = conn_fail。 */
+function ajaxFailureResult(error: AdmissionAjaxError): AdmissionSearchResult {
+  const { status } = error;
+  const message = errorMessage(error);
+  if (status === 403) return { verdict: 'challenge', candidateCount: 0, status, error: message };
+  if (status !== undefined) return { verdict: status >= 500 ? 'http_5xx' : 'http_4xx', candidateCount: 0, status, error: message };
+  if (error.reason instanceof SourcePolicyError) return { verdict: 'url_invalid', candidateCount: 0, error: message };
+  return { verdict: 'conn_fail', candidateCount: 0, error: message };
 }
 
 const MAX_CANDIDATE_SCAN = 50;
@@ -934,12 +987,20 @@ async function searchAdmissionOnce(
 ): Promise<AdmissionSearchResult> {
   let request: SourceSearchRequest;
   let vars: Readonly<Record<string, string>> | undefined;
+  let fetched: number;
   try {
-    ({ request, vars } = buildAdmissionSearch(source, options.declaredHosts, keyword));
+    ({ request, vars, fetched } = await buildAdmissionSearchNet(source, options, keyword, false));
   } catch (error) {
     if (error instanceof SearchJsNotReadyError) throw error; // 瞬时：由 runAdmissionBatch 写占位，不记 url_invalid
+    if (error instanceof AdmissionAjaxError) {
+      if (options.signal.aborted) throw error.reason ?? error; // 调用方中止（预算耗尽/取消）：不写判定
+      return ajaxFailureResult(error);
+    }
     return { verdict: 'url_invalid', candidateCount: 0, error: errorMessage(error) };
   }
+  // netjs1029：java.ajax 刚取过同站页面，主搜索前补一次节流间隔。
+  const throttleMs = options.throttleMs ?? ADMISSION_THROTTLE_MS;
+  if (fetched > 0 && throttleMs > 0) await (options.sleep ?? defaultSleep)(throttleMs, options.signal);
   let response: { url: string; status: number; text: string };
   try {
     response = await admissionFetch(request, options);
@@ -1015,9 +1076,11 @@ async function controlQueryOverlap(
   let request: SourceSearchRequest;
   let vars: Readonly<Record<string, string>> | undefined;
   try {
-    ({ request, vars } = buildAdmissionSearch(source, options.declaredHosts, control));
+    // netjs1029：java.ajax 页面同样走准入通道取（首页紧跟主搜索，先歇一个节流间隔）；取页失败当拿不到可比结论。
+    ({ request, vars } = await buildAdmissionSearchNet(source, options, control, true));
   } catch (error) {
     if (error instanceof SearchJsNotReadyError) throw error; // 不能因沙箱瞬时不可用跳过对照判定
+    if (error instanceof AdmissionAjaxError && options.signal.aborted) throw error.reason ?? error;
     return undefined;
   }
   const throttleMs = options.throttleMs ?? ADMISSION_THROTTLE_MS;
@@ -1301,7 +1364,9 @@ function hostOf(url: string): string {
 function admissionMutexHost(candidate: AdmissionCandidate, declaredHosts: ReadonlySet<string>): string {
   try {
     return hostOf(buildAdmissionSearchRequest(candidate.source, declaredHosts).url) || hostOf(candidate.url);
-  } catch {
+  } catch (error) {
+    // netjs1029：联网 JS 模板先打 java.ajax 的地址（同步构造不联网，取不到最终搜索地址）。
+    if (error instanceof SearchNetPendingError) return hostOf(error.request.url) || hostOf(candidate.url);
     return hostOf(candidate.url);
   }
 }
@@ -1372,7 +1437,8 @@ function searchUrlStillInvalid(source: RawSource, declaredHosts: ReadonlySet<str
     buildAdmissionSearchRequest(source, declaredHosts);
     return false;
   } catch (error) {
-    return !(error instanceof SearchJsNotReadyError); // 沙箱瞬时不可用不算「本地确定性失败」
+    // 沙箱瞬时不可用不算「本地确定性失败」；联网 JS 模板要联网才知道（netjs1029），也不算。
+    return !(error instanceof SearchJsNotReadyError) && !(error instanceof SearchNetPendingError);
   }
 }
 
