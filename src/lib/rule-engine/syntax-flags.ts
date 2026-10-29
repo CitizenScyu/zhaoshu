@@ -546,7 +546,8 @@ export function engineSyntaxSourceBindEnabled(env: OrEnv = process.env): boolean
 /**
  * initjsoup1028：jsoup JS init 语义位。版本再 +1073741824（1–536870912 逐字不变）。
  * 只对 init 不经 jsoup 重编被拒、经 jsoup 重编是可复现 JS init 的源计入（compile.ts engineSourceRevision / sourceUsesInitJsoupSyntax）。
- * 注意：source_admission.engine_semantics_version 是 int4（≤ 2147483647），这是该列能放下的最后一位；再加位须先迁 bigint。
+ * 注意：这是 int4（≤ 2147483647）能放下的最后一位。semver1029 起 source_admission.engine_semantics_version
+ * 为 bigint（迁移 0009），再加位（2147483648 起）上限是 Number.MAX_SAFE_INTEGER，且上线前生产库须已跑 0009。
  */
 export const ENGINE_SEMANTICS_INIT_JSOUP_BIT = 1073741824;
 

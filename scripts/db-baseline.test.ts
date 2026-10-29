@@ -137,10 +137,13 @@ maybe('PGlite 真库', () => {
     // runner 建的记账表形状（baseline 对「空记账表」的放行判据）同样来自真跑；identity 的 START WITH 2（0001:5）在契约里。
     expect(shapeToContract(shape, ['schema_migrations'])).toEqual(BASELINE_LEDGER_SHAPE);
     expect(BASELINE_SHAPE.users.columns.find((row) => row[0] === 'id')?.[6]).toMatch(/ start=2 /);
-    // 后续新增列只能列入 extra，不能反过来让未迁移 v4 的旧库无法 baseline。
+    // 后续新增列只能列入 extra，不能反过来让未迁移 v4 的旧库无法 baseline；v9 的放宽同理只报 extra。
     await applyMigration(createPGliteClient(pg), await load());
     expect(compareShape(await inspectShape(createPGliteClient(pg)))).toEqual({
-      problems: [], extra: [{ kind: 'column', table: 'cron_health', name: 'lease_generation' }],
+      problems: [], extra: [
+        { kind: 'column', table: 'cron_health', name: 'lease_generation' },
+        { kind: 'widened', table: 'source_admission', name: 'engine_semantics_version', to: 'bigint' },
+      ],
     });
   }, 120_000);
 
@@ -212,6 +215,8 @@ maybe('PGlite 真库', () => {
       { kind: 'column', table: 'download_tasks', name: 'user_id' },
       { kind: 'index', table: 'feedback', name: 'feedback_user_book_idx' },
       { kind: 'constraint', table: 'users', name: 'users_created_via_invite_fk' },
+      // semver1029：运行期 DDL 直接建 bigint（0009 终态），只报 widened 不拒绝。
+      { kind: 'widened', table: 'source_admission', name: 'engine_semantics_version', to: 'bigint' },
     ]));
     expect(await fingerprint(pg)).toEqual(before);
 
@@ -251,6 +256,10 @@ maybe('PGlite 真库', () => {
     it.each([
       ['缺列', 'ALTER TABLE labeled_books DROP COLUMN quality', /"kind":"missing-column","table":"labeled_books","column":"quality"/],
       ['类型不同', 'ALTER TABLE books ALTER COLUMN douban_rating TYPE real', /"column":"douban_rating","diff":\{"type"/],
+      ['semver 列放宽成 bigint 以外的类型（只豁免 0009 的 integer→bigint）', 'ALTER TABLE source_admission ALTER COLUMN engine_semantics_version TYPE numeric',
+        /"column":"engine_semantics_version","diff":\{"type"/],
+      ['semver 列是 bigint 但可空（放宽豁免只对「仅类型不同」生效）', 'ALTER TABLE source_admission ALTER COLUMN engine_semantics_version TYPE bigint, ALTER COLUMN engine_semantics_version DROP NOT NULL',
+        /"column":"engine_semantics_version","diff":\{"type".*"not_null"/],
       ['profile.id 默认值未去除（0001:66）', 'ALTER TABLE profile ALTER COLUMN id SET DEFAULT 1', /"table":"profile","column":"id","diff":\{"column_default"/],
       ['recommendations.user_id 默认值未去除（0001:96）', 'ALTER TABLE recommendations ALTER COLUMN user_id SET DEFAULT 1',
         /"table":"recommendations","column":"user_id","diff":\{"column_default"/],

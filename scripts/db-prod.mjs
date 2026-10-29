@@ -136,8 +136,15 @@ export async function runProdMigrate(client, migrations, mode) {
   // 已存在但形状错误、或已登记 v4 后丢列仍拒绝。check 本身始终要求完整新结构。
   const addsLeaseGeneration = before.ledger.pending.some((item) =>
     item.version === 4 && item.name === '0004_admission_lease_generation.sql');
+  // 0009 专门把 source_admission.engine_semantics_version 从 integer 放宽为 bigint；待执行时只放行
+  // 「仍是 integer、可空与默认值不变」这一种旧形状，其余漂移（含已登记 v9 后仍是 integer）照旧拒绝。
+  const widensSemver = before.ledger.pending.some((item) =>
+    item.version === 9 && item.name === '0009_admission_semver_bigint.sql');
   const columnProblems = before.runtimeColumns.problems.filter((item) => !(addsLeaseGeneration
-    && item.kind === 'missing' && item.table === 'cron_health' && item.column === 'lease_generation'));
+    && item.kind === 'missing' && item.table === 'cron_health' && item.column === 'lease_generation')
+    && !(widensSemver && item.kind === 'mismatch' && item.table === 'source_admission'
+      && item.column === 'engine_semantics_version' && item.actual?.data_type === 'integer'
+      && item.actual.is_nullable === item.expected.is_nullable && item.actual.column_default === item.expected.column_default));
   const refusals = [
     ...before.ledger.errors.map((item) => item.message),
     ...columnProblems.map(describeColumnProblem),

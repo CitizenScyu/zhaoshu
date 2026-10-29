@@ -288,6 +288,30 @@ maybe('PGlite 真库', () => {
     expect(await ledgerOf(pg)).toEqual(ledgerAfter);
   }, 120_000);
 
+  it('semver1029：生产现状 v1–v8 已记账、列为 integer → 只跑 v9，列放宽为 bigint、行原样、可写 >2^31 的版本值', async () => {
+    const pg = await prodLike();
+    const client = createPGliteClient(pg);
+    const list = await load();
+    await applyMigration(client, list.filter((item) => item.version < 9));
+    // 生产的列由旧运行期 DDL 建成 integer；prodLike 用的是新 DDL（直接 bigint），这里还原成生产现状。
+    await pg.exec('ALTER TABLE source_admission ALTER COLUMN engine_semantics_version TYPE integer');
+    await pg.query(`INSERT INTO source_admission (source_url, tier, compile_ok, core_field_mask, rules_hash, engine_semantics_version, host)
+      VALUES ('https://a.example', 'engine', true, '{}'::jsonb, '8:x', 8, 'a.example')`);
+    const typeOf = async () => (await pg.query(`SELECT data_type FROM information_schema.columns
+      WHERE table_name = 'source_admission' AND column_name = 'engine_semantics_version'`)).rows[0].data_type;
+    expect(await typeOf()).toBe('integer');
+    const plan = await runProdMigrate(client, list, 'dry-run');
+    expect(plan.status).toBe('dry-run');
+    expect(plan.ledger.pending.map((item: { version: number }) => item.version)).toEqual([9]);
+    const applied = await runProdMigrate(client, list, 'apply');
+    expect(applied.status).toBe('applied');
+    expect(applied.after).toMatchObject({ ok: true, runtimeColumnsOk: true });
+    expect(await typeOf()).toBe('bigint');
+    expect((await pg.query(`SELECT engine_semantics_version::text AS v FROM source_admission`)).rows).toEqual([{ v: '8' }]);
+    await pg.query(`UPDATE source_admission SET engine_semantics_version = 4294967304`);
+    expect((await pg.query(`SELECT engine_semantics_version::text AS v FROM source_admission`)).rows).toEqual([{ v: '4294967304' }]);
+  }, 120_000);
+
   it('冷建库全链：migrate:prod --apply → auth 只到 4 / artifact 未建（next 提示）→ 两个补迁移 → db:check:prod 通过', async () => {
     const pg = new PGliteCtor!();
     const client = createPGliteClient(pg);
@@ -388,10 +412,29 @@ maybe('PGlite 真库', () => {
       await expectRefused(pg, await load(), /cron_health\.lease_generation/);
     }, 120_000);
 
+    // semver1029：待迁 v9 只豁免「integer 且可空性/默认值与契约一致」这一种旧形态，别的错误形态照拒。
+    it.each([
+      'ALTER COLUMN engine_semantics_version TYPE text',
+      'ALTER COLUMN engine_semantics_version DROP NOT NULL',
+      'ALTER COLUMN engine_semantics_version SET DEFAULT 1',
+    ])('待迁 v9 只放宽 integer，错误既有列仍拒绝：%s', async (mutation) => {
+      const pg = await prodLike();
+      await pg.exec(`ALTER TABLE source_admission ${mutation}`);
+      await expectRefused(pg, await load(), /source_admission\.engine_semantics_version/);
+    }, 120_000);
+
+    it('v9 已记账但列又是 integer 时拒绝（豁免只对待迁 v9 生效）', async () => {
+      const pg = await prodLike();
+      await applyMigration(createPGliteClient(pg), await load());
+      await pg.exec('ALTER TABLE source_admission ALTER COLUMN engine_semantics_version TYPE integer');
+      await expectRefused(pg, await load(), /source_admission\.engine_semantics_version/);
+    }, 120_000);
+
     it('锁内复核：前置核对之后库里冒出更高版本，applyMigration strict 整批回滚', async () => {
       const pg = await prodLike();
       const client = createPGliteClient(pg);
-      await pg.query(`INSERT INTO schema_migrations(version, name, checksum) VALUES (9, '0009_x.sql', $1)`, ['9'.repeat(64)]);
+      const future = (await load()).at(-1)!.version + 1;
+      await pg.query(`INSERT INTO schema_migrations(version, name, checksum) VALUES (${future}, '00${future}_x.sql', $1)`, ['9'.repeat(64)]);
       const before = await ledgerOf(pg);
       await expect(applyMigration(client, await load(), { strict: true })).rejects.toThrow(/高于代码的最新版本/);
       expect(await ledgerOf(pg)).toEqual(before);

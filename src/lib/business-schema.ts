@@ -330,12 +330,14 @@ export async function initializeBusinessSchema(s: Sql) {
       search_verdict text NOT NULL DEFAULT '',
       search_checked_at timestamptz,
       rules_hash text NOT NULL,
-      engine_semantics_version integer NOT NULL DEFAULT 0,
+      engine_semantics_version bigint NOT NULL DEFAULT 0,
       host text NOT NULL,
       error text NOT NULL DEFAULT '',
       compile_diagnostics jsonb NOT NULL DEFAULT '[]'::jsonb
     )`,
-    tx`ALTER TABLE source_admission ADD COLUMN IF NOT EXISTS engine_semantics_version integer NOT NULL DEFAULT 0`,
+    // semver1029：新建与补列都直接是 bigint（与迁移链 0003→0009 终态同构）；已存在的 integer 列不在这里放宽
+    // （ALTER TYPE 要锁表重写），只由迁移 0009 做，未跑时 db:check:prod 报该列类型不符。
+    tx`ALTER TABLE source_admission ADD COLUMN IF NOT EXISTS engine_semantics_version bigint NOT NULL DEFAULT 0`,
     tx`ALTER TABLE source_admission ADD COLUMN IF NOT EXISTS compile_diagnostics jsonb NOT NULL DEFAULT '[]'::jsonb`,
     tx`CREATE INDEX IF NOT EXISTS source_admission_host_idx ON source_admission (host)`,
     // F15：每个用户一行「待吸收反馈」队列。反馈写事务只做快速持久化 + 把 pending_feedback_id

@@ -50,7 +50,7 @@ const migrationsDir = resolve(here, '..', 'migrations');
 
 // 迁移文件是显式有序列表，不扫目录：目录里多一个 .sql 不该在无人察觉时被执行。
 // version 由文件名前缀解析，SCHEMA_VERSION 必须等于列表里的最大版本（见 loadMigrations）。
-export const MIGRATION_FILES = ['0001_baseline.sql', '0002_identity_key.sql', '0003_runtime_tables.sql', '0004_admission_lease_generation.sql', '0005_prefetch_tables.sql', '0006_reader_sync_state.sql', '0007_followup_probe_state.sql', '0008_capacity_compressed_threshold.sql'];
+export const MIGRATION_FILES = ['0001_baseline.sql', '0002_identity_key.sql', '0003_runtime_tables.sql', '0004_admission_lease_generation.sql', '0005_prefetch_tables.sql', '0006_reader_sync_state.sql', '0007_followup_probe_state.sql', '0008_capacity_compressed_threshold.sql', '0009_admission_semver_bigint.sql'];
 
 // 已发布（已登记进某个库的 schema_migrations）的迁移摘要，冻结在这里由测试钉住。
 // v1 = 隔离库首次 db:migrate 登记的值（见下方 normalizeSqlText 注释）；生产从未跑过 runner、没有
@@ -68,6 +68,7 @@ export const PUBLISHED_CHECKSUMS = {
   6: 'c4dffc3d632de0faccbc3d51c7d33487d370b880f5742e7e49949984871077eb',
   7: '6ef340475b16fd26a3a9290cfbceabd6df76c9f6a9762a8ef63e7d3c2e5b2cf8',
   8: 'dfa812a0b51df407ae2a6f8f4cecf557d8c16a22943f98324e5bf868fa229e20',
+  9: 'b6ea7cea37da4df9fd2b97c9a1482a84feb8ff72a1d82c48be0a5bba035f83ee',
 };
 export const migrationPaths = MIGRATION_FILES.map((name) => resolve(migrationsDir, name));
 
@@ -437,7 +438,7 @@ export const EXPECTED_RUNTIME_COLUMNS = {
     ['search_verdict', 'text', 'NO', "''::text"],
     ['search_checked_at', 'timestamp with time zone', 'YES', null],
     ['rules_hash', 'text', 'NO', null],
-    ['engine_semantics_version', 'integer', 'NO', '0'],
+    ['engine_semantics_version', 'bigint', 'NO', '0'],
     ['host', 'text', 'NO', null],
     ['error', 'text', 'NO', "''::text"],
     ['compile_diagnostics', 'jsonb', 'NO', "'[]'::jsonb"],

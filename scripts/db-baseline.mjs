@@ -178,6 +178,12 @@ export function shapeToContract(shape, tables) {
 
 const COLUMN_FIELDS = ['type', 'not_null', 'column_default', 'identity', 'generated', 'sequence'];
 
+// v3 之后的迁移只放宽类型的列（semver1029：0009 integer→bigint，ALTER TYPE 到同类型是空转）：已是放宽后的类型
+// 且其余属性与契约全同时只报 extra，不拒 baseline（冷建库的运行时 DDL 直接建成 bigint）。
+const LATER_WIDENINGS = [
+  { table: 'source_admission', column: 'engine_semantics_version', from: 'integer', to: 'bigint' },
+];
+
 // 纯函数：库的结构快照对照契约。problems 任一条即拒绝；extra 只报告。
 export function compareShape(shape, contract = BASELINE_SHAPE) {
   const problems = [];
@@ -194,7 +200,10 @@ export function compareShape(shape, contract = BASELINE_SHAPE) {
       COLUMN_FIELDS.forEach((field, index) => {
         if (found[index + 1] !== row[index + 1]) diff[field] = { expected: row[index + 1], actual: found[index + 1] };
       });
-      if (Object.keys(diff).length) problems.push({ kind: 'column-mismatch', table, column: row[0], diff });
+      const widened = LATER_WIDENINGS.find((item) => item.table === table && item.column === row[0]);
+      if (widened && Object.keys(diff).length === 1 && diff.type?.expected === widened.from && diff.type.actual === widened.to) {
+        extra.push({ kind: 'widened', table, name: row[0], to: widened.to });
+      } else if (Object.keys(diff).length) problems.push({ kind: 'column-mismatch', table, column: row[0], diff });
     }
     const expectedColumns = new Set(expected.columns.map((row) => row[0]));
     for (const row of got.columns) if (!expectedColumns.has(row[0])) extra.push({ kind: 'column', table, name: row[0] });

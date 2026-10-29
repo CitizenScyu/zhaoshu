@@ -166,7 +166,7 @@ async function run() {
     SELECT source_url, tier, compile_ok, core_field_mask, search_ok, search_verdict, search_checked_at, rules_hash, engine_semantics_version, host, error
     FROM jsonb_to_recordset(${JSON.stringify(result.rows)}::jsonb)
       AS t(source_url text, tier text, compile_ok boolean, core_field_mask jsonb, search_ok boolean,
-           search_verdict text, search_checked_at timestamptz, rules_hash text, engine_semantics_version integer, host text, error text)
+           search_verdict text, search_checked_at timestamptz, rules_hash text, engine_semantics_version bigint, host text, error text)
     ON CONFLICT (source_url) DO UPDATE SET
       tier = EXCLUDED.tier, compile_ok = EXCLUDED.compile_ok, core_field_mask = EXCLUDED.core_field_mask,
       search_ok = EXCLUDED.search_ok, search_verdict = EXCLUDED.search_verdict,

@@ -1,0 +1,22 @@
+-- semver1029：source_admission.engine_semantics_version 从 integer 放宽为 bigint。
+--
+-- version = 9（文件名前缀即版本号），由 scripts/db-migration-lib.mjs 的 loadMigrations()
+-- 按有序列表执行并写入 schema_migrations。
+--
+-- 为什么：语义版本按开关位累加（src/lib/rule-engine/syntax-flags.ts engineSemanticsVersion），
+-- initjsoup1028 的 1073741824 已是 int4 能放下的最后一位；再加位就会在写库时报
+-- `integer out of range`、整批准入回滚。bigint 覆盖全部 JS 安全整数（≤ 2^53−1），
+-- 位按加法合成，在此范围内精确。
+--
+-- 兼容与部署顺序：
+--   - 只放宽值域，既有行原值不变；DEFAULT 0 / NOT NULL 不变。
+--   - 旧代码照常可用：写库时 jsonb_to_recordset 声明 integer 的值赋给 bigint 列是隐式赋值转换；
+--     neon 驱动把 int8 读成字符串，但读回的行只用于 rules_hash / 结论比对，写库行一律按
+--     rules_hash 现算版本（admission.ts semanticsVersionOf），不会把字符串写回。
+--   - 新代码（recordset 声明 bigint、读回 Number() 归一）在 integer 列上也照常可用。
+--   - 因此先迁移或先上代码均可；但任何超出 int4 的新语义位上线前，本迁移必须已执行。
+--   - 表约两千行，ALTER TYPE 重写整表，持锁时间很短；source_admission_host_idx 随表重建。
+--
+-- Executed as one statement inside the runner's transaction; do not add BEGIN/COMMIT here.
+
+ALTER TABLE source_admission ALTER COLUMN engine_semantics_version TYPE bigint;

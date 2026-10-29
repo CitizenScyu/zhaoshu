@@ -2115,7 +2115,8 @@ async function readAdmissionRows(s: Sql, urls: string[], signal: AbortSignal): P
     WHERE source_url IN (
       SELECT source_url FROM jsonb_to_recordset(${JSON.stringify(urls.map((source_url) => ({ source_url })))}::jsonb)
         AS q(source_url text))`, signal);
-  return new Map(rows.map((row) => [row.source_url, row]));
+  // semver1029：列为 bigint 后驱动把 int8 读成字符串，这里归一回 number（值 ≤ 2^53，精确）。
+  return new Map(rows.map((row) => [row.source_url, { ...row, engine_semantics_version: Number(row.engine_semantics_version) }]));
 }
 
 export type AdmissionWriteResult = { written: number } | { skipped: 'lease_lost'; written: 0 };
@@ -2158,7 +2159,7 @@ export async function writeAdmissionRows(
     FROM guard CROSS JOIN jsonb_to_recordset(${JSON.stringify(guardedRows)}::jsonb)
       AS t(source_url text, tier text, compile_ok boolean, core_field_mask jsonb, search_ok boolean,
            search_verdict text, search_checked_at timestamptz, rules_hash text,
-           engine_semantics_version integer, host text, error text, compile_diagnostics jsonb, expected_source jsonb)
+           engine_semantics_version bigint, host text, error text, compile_diagnostics jsonb, expected_source jsonb)
     WHERE EXISTS (
       SELECT 1 FROM shuyuan_sources current
       WHERE current.source_url = t.source_url AND current.source = t.expected_source
