@@ -16,6 +16,7 @@ import {
   previousElementSibling, registerDocSource, removeNode, resetJsoupBudget, siblingElements, textOf, valOf, wholeTextOf,
 } from './jsoup-dom';
 import { getElementById, getElementsByClass, getElementsByTag, select, selectFirst, selectRoots } from './jsoup-select';
+import { engineSyntaxStableSortEnabled } from './syntax-flags';
 import { RuleEngineError } from './types';
 
 /** 单次宿主调用 / 导出的字符上限（同 js-sandbox MAX_JS_OUTPUT_CHARS）。 */
@@ -233,6 +234,7 @@ export function installJsoupHost(
     handle.dispose();
   }
   if (init?.bookVariables) context.setProp(api, 'bv', context.true);
+  if (engineSyntaxStableSortEnabled()) context.setProp(api, 'ss', context.true);
   context.setProp(context.global, '__jsoup', api);
   api.dispose();
 }
@@ -244,7 +246,7 @@ export function installJsoupHost(
 export const JSOUP_PRELUDE = `(function(){
   var J = globalThis.__jsoup, j = globalThis.java;
   delete globalThis.__jsoup;
-  var call = J.call, bad = J.bad, initR = J.r, initS = J.s, bookVars = J.bv === true;
+  var call = J.call, bad = J.bad, initR = J.r, initS = J.s, bookVars = J.bv === true, stableSort = J.ss === true;
   var P = Proxy, S = String, N = Number, OC = Object.create, freeze = Object.freeze, defProp = Object.defineProperty;
   var getProto = Object.getPrototypeOf, ownDesc = Object.getOwnPropertyDescriptor, ownNames = Object.getOwnPropertyNames;
   var stringify = JSON.stringify, RA = Reflect.apply, RG = Reflect.get, RH = Reflect.has, isArr = Array.isArray;
@@ -620,15 +622,273 @@ export const JSOUP_PRELUDE = `(function(){
 
   // ---- Array.prototype.sort（Rhino：不稳定、NaN 当相等、undefined 排最后、默认按 ToString 比）
   // 稳定排序后逐对复核：比较器前后不一致，或并列项不是同一个值（Rhino 的次序不复现）→ 失败。
+  // stablesort1030（stableSort）：按 Rhino 1.8.0 口径——NativeArray.sort 把元素（空位记 NOT_FOUND）拷进工作数组，交 Java
+  // Arrays.sort（TimSort，稳定）；比较器包 ElementComparator（undefined 排后、空位最后）+ Double.compare（NaN 记 +1、-0 记 -1）；
+  // 抛 IllegalArgumentException（比较器不一致被 TimSort 察觉）时数组原样返回，否则逐位写回（空位删除）。下面 timSort 逐行移植
+  // java.util.TimSort（OpenJDK 17，Android libcore 同码），比较器不一致时的走法也照抄；Java 会越界或读到 null 暂存槽的走法 → 失败。
   function sameItem(a, b) {
     if (a === b) return true;
     var ka = kindOf(a), kb = kindOf(b);
     return ka !== undefined && kb !== undefined && ka.k === kb.k && ka.k !== 'A' && S(a) === S(b);
   }
+  var IAE = OC(null), NIL = OC(null), HOLE = OC(null);
+  function oob() { return bad('Array.sort 的比较器不一致且走到 Java 越界/空槽，Rhino 的次序不复现'); }
+  function filled(n, v) { var r = []; for (var i = 0; i < n; i++) push(r, v); return r; }
+  function ag(arr, i) { if (i < 0 || i >= arr.length) oob(); var v = arr[i]; if (v === NIL) oob(); return v; }
+  function as(arr, i, v) { if (i < 0 || i >= arr.length) oob(); arr[i] = v; }
+  function acopy(src, sp, dst, dp, n) {
+    if (n < 0 || sp < 0 || dp < 0 || sp + n > src.length || dp + n > dst.length) oob();
+    var i;
+    if (src === dst && sp < dp) for (i = n - 1; i >= 0; i--) dst[dp + i] = src[sp + i];
+    else for (i = 0; i < n; i++) dst[dp + i] = src[sp + i];
+  }
+  function timSort(a, cmp) {
+    var n = a.length, MIN_GALLOP = 7;
+    if (n < 2) return;
+    if (n < 32) { binarySort(0, n, countRun(0, n)); return; }
+    var minGallop = MIN_GALLOP, tmp = filled(n < 512 ? n >>> 1 : 256, NIL);
+    var stackLen = n < 120 ? 5 : n < 1542 ? 10 : n < 119151 ? 24 : 49;
+    var runBase = filled(stackLen, 0), runLen = filled(stackLen, 0), stackSize = 0;
+    var lo = 0, nRemaining = n, minRun = minRunLength(n);
+    do {
+      var rl = countRun(lo, n);
+      if (rl < minRun) {
+        var force = nRemaining <= minRun ? nRemaining : minRun;
+        binarySort(lo, lo + force, lo + rl);
+        rl = force;
+      }
+      if (stackSize >= stackLen) oob();
+      runBase[stackSize] = lo; runLen[stackSize] = rl; stackSize++;
+      mergeCollapse();
+      lo += rl; nRemaining -= rl;
+    } while (nRemaining !== 0);
+    while (stackSize > 1) {
+      var f = stackSize - 2;
+      if (f > 0 && runLen[f - 1] < runLen[f + 1]) f--;
+      mergeAt(f);
+    }
+    function binarySort(lo, hi, start) {
+      if (start === lo) start++;
+      for (; start < hi; start++) {
+        var pivot = ag(a, start), left = lo, right = start;
+        while (left < right) {
+          var mid = (left + right) >>> 1;
+          if (cmp(pivot, ag(a, mid)) < 0) right = mid; else left = mid + 1;
+        }
+        acopy(a, left, a, left + 1, start - left);
+        as(a, left, pivot);
+      }
+    }
+    function countRun(lo, hi) {
+      var runHi = lo + 1;
+      if (runHi === hi) return 1;
+      if (cmp(ag(a, runHi++), ag(a, lo)) < 0) {
+        while (runHi < hi && cmp(ag(a, runHi), ag(a, runHi - 1)) < 0) runHi++;
+        for (var x = lo, y = runHi - 1; x < y; x++, y--) { var t = a[x]; a[x] = a[y]; a[y] = t; }
+      } else {
+        while (runHi < hi && cmp(ag(a, runHi), ag(a, runHi - 1)) >= 0) runHi++;
+      }
+      return runHi - lo;
+    }
+    function minRunLength(m) { var r = 0; while (m >= 32) { r |= m & 1; m >>= 1; } return m + r; }
+    function mergeCollapse() {
+      while (stackSize > 1) {
+        var k = stackSize - 2;
+        if (k > 0 && runLen[k - 1] <= runLen[k] + runLen[k + 1] || k > 1 && runLen[k - 2] <= runLen[k] + runLen[k - 1]) {
+          if (runLen[k - 1] < runLen[k + 1]) k--;
+        } else if (k < 0 || runLen[k] > runLen[k + 1]) {
+          break;
+        }
+        mergeAt(k);
+      }
+    }
+    function mergeAt(i) {
+      var base1 = runBase[i], len1 = runLen[i], base2 = runBase[i + 1], len2 = runLen[i + 1];
+      runLen[i] = len1 + len2;
+      if (i === stackSize - 3) { runBase[i + 1] = runBase[i + 2]; runLen[i + 1] = runLen[i + 2]; }
+      stackSize--;
+      var k = gallopRight(ag(a, base2), a, base1, len1, 0);
+      base1 += k; len1 -= k;
+      if (len1 === 0) return;
+      len2 = gallopLeft(ag(a, base1 + len1 - 1), a, base2, len2, len2 - 1);
+      if (len2 === 0) return;
+      if (len1 <= len2) mergeLo(base1, len1, base2, len2); else mergeHi(base1, len1, base2, len2);
+    }
+    function gallopLeft(key, arr, base, len, hint) {
+      var lastOfs = 0, ofs = 1, maxOfs, t, m;
+      if (cmp(key, ag(arr, base + hint)) > 0) {
+        maxOfs = len - hint;
+        while (ofs < maxOfs && cmp(key, ag(arr, base + hint + ofs)) > 0) { lastOfs = ofs; ofs = (ofs << 1) + 1; if (ofs <= 0) ofs = maxOfs; }
+        if (ofs > maxOfs) ofs = maxOfs;
+        lastOfs += hint; ofs += hint;
+      } else {
+        maxOfs = hint + 1;
+        while (ofs < maxOfs && cmp(key, ag(arr, base + hint - ofs)) <= 0) { lastOfs = ofs; ofs = (ofs << 1) + 1; if (ofs <= 0) ofs = maxOfs; }
+        if (ofs > maxOfs) ofs = maxOfs;
+        t = lastOfs; lastOfs = hint - ofs; ofs = hint - t;
+      }
+      lastOfs++;
+      while (lastOfs < ofs) {
+        m = lastOfs + ((ofs - lastOfs) >>> 1);
+        if (cmp(key, ag(arr, base + m)) > 0) lastOfs = m + 1; else ofs = m;
+      }
+      return ofs;
+    }
+    function gallopRight(key, arr, base, len, hint) {
+      var ofs = 1, lastOfs = 0, maxOfs, t, m;
+      if (cmp(key, ag(arr, base + hint)) < 0) {
+        maxOfs = hint + 1;
+        while (ofs < maxOfs && cmp(key, ag(arr, base + hint - ofs)) < 0) { lastOfs = ofs; ofs = (ofs << 1) + 1; if (ofs <= 0) ofs = maxOfs; }
+        if (ofs > maxOfs) ofs = maxOfs;
+        t = lastOfs; lastOfs = hint - ofs; ofs = hint - t;
+      } else {
+        maxOfs = len - hint;
+        while (ofs < maxOfs && cmp(key, ag(arr, base + hint + ofs)) >= 0) { lastOfs = ofs; ofs = (ofs << 1) + 1; if (ofs <= 0) ofs = maxOfs; }
+        if (ofs > maxOfs) ofs = maxOfs;
+        lastOfs += hint; ofs += hint;
+      }
+      lastOfs++;
+      while (lastOfs < ofs) {
+        m = lastOfs + ((ofs - lastOfs) >>> 1);
+        if (cmp(key, ag(arr, base + m)) < 0) ofs = m; else lastOfs = m + 1;
+      }
+      return ofs;
+    }
+    function ensureCapacity(minCapacity) {
+      if (tmp.length < minCapacity) {
+        var size = 1;
+        while (size <= minCapacity) size *= 2;
+        tmp = filled(size < (n >>> 1) ? size : n >>> 1, NIL);
+      }
+      return tmp;
+    }
+    function mergeLo(base1, len1, base2, len2) {
+      var tb = ensureCapacity(len1), cursor1 = 0, cursor2 = base2, dest = base1, count1, count2, mg;
+      acopy(a, base1, tb, cursor1, len1);
+      as(a, dest++, ag(a, cursor2++));
+      if (--len2 === 0) { acopy(tb, cursor1, a, dest, len1); return; }
+      if (len1 === 1) { acopy(a, cursor2, a, dest, len2); as(a, dest + len2, ag(tb, cursor1)); return; }
+      mg = minGallop;
+      outer:
+      while (true) {
+        count1 = 0; count2 = 0;
+        do {
+          if (cmp(ag(a, cursor2), ag(tb, cursor1)) < 0) {
+            as(a, dest++, ag(a, cursor2++)); count2++; count1 = 0;
+            if (--len2 === 0) break outer;
+          } else {
+            as(a, dest++, ag(tb, cursor1++)); count1++; count2 = 0;
+            if (--len1 === 1) break outer;
+          }
+        } while ((count1 | count2) < mg);
+        do {
+          count1 = gallopRight(ag(a, cursor2), tb, cursor1, len1, 0);
+          if (count1 !== 0) {
+            acopy(tb, cursor1, a, dest, count1);
+            dest += count1; cursor1 += count1; len1 -= count1;
+            if (len1 <= 1) break outer;
+          }
+          as(a, dest++, ag(a, cursor2++));
+          if (--len2 === 0) break outer;
+          count2 = gallopLeft(ag(tb, cursor1), a, cursor2, len2, 0);
+          if (count2 !== 0) {
+            acopy(a, cursor2, a, dest, count2);
+            dest += count2; cursor2 += count2; len2 -= count2;
+            if (len2 === 0) break outer;
+          }
+          as(a, dest++, ag(tb, cursor1++));
+          if (--len1 === 1) break outer;
+          mg--;
+        } while (count1 >= MIN_GALLOP | count2 >= MIN_GALLOP);
+        if (mg < 0) mg = 0;
+        mg += 2;
+      }
+      minGallop = mg < 1 ? 1 : mg;
+      if (len1 === 1) { acopy(a, cursor2, a, dest, len2); as(a, dest + len2, ag(tb, cursor1)); }
+      else if (len1 === 0) throw IAE;
+      else acopy(tb, cursor1, a, dest, len1);
+    }
+    function mergeHi(base1, len1, base2, len2) {
+      var tb = ensureCapacity(len2), count1, count2, mg;
+      acopy(a, base2, tb, 0, len2);
+      var cursor1 = base1 + len1 - 1, cursor2 = len2 - 1, dest = base2 + len2 - 1;
+      as(a, dest--, ag(a, cursor1--));
+      if (--len1 === 0) { acopy(tb, 0, a, dest - (len2 - 1), len2); return; }
+      if (len2 === 1) {
+        dest -= len1; cursor1 -= len1;
+        acopy(a, cursor1 + 1, a, dest + 1, len1);
+        as(a, dest, ag(tb, cursor2));
+        return;
+      }
+      mg = minGallop;
+      outer:
+      while (true) {
+        count1 = 0; count2 = 0;
+        do {
+          if (cmp(ag(tb, cursor2), ag(a, cursor1)) < 0) {
+            as(a, dest--, ag(a, cursor1--)); count1++; count2 = 0;
+            if (--len1 === 0) break outer;
+          } else {
+            as(a, dest--, ag(tb, cursor2--)); count2++; count1 = 0;
+            if (--len2 === 1) break outer;
+          }
+        } while ((count1 | count2) < mg);
+        do {
+          count1 = len1 - gallopRight(ag(tb, cursor2), a, base1, len1, len1 - 1);
+          if (count1 !== 0) {
+            dest -= count1; cursor1 -= count1; len1 -= count1;
+            acopy(a, cursor1 + 1, a, dest + 1, count1);
+            if (len1 === 0) break outer;
+          }
+          as(a, dest--, ag(tb, cursor2--));
+          if (--len2 === 1) break outer;
+          count2 = len2 - gallopLeft(ag(a, cursor1), tb, 0, len2, len2 - 1);
+          if (count2 !== 0) {
+            dest -= count2; cursor2 -= count2; len2 -= count2;
+            acopy(tb, cursor2 + 1, a, dest + 1, count2);
+            if (len2 <= 1) break outer;
+          }
+          as(a, dest--, ag(a, cursor1--));
+          if (--len1 === 0) break outer;
+          mg--;
+        } while (count1 >= MIN_GALLOP | count2 >= MIN_GALLOP);
+        if (mg < 0) mg = 0;
+        mg += 2;
+      }
+      minGallop = mg < 1 ? 1 : mg;
+      if (len2 === 1) {
+        dest -= len1; cursor1 -= len1;
+        acopy(a, cursor1 + 1, a, dest + 1, len1);
+        as(a, dest, ag(tb, cursor2));
+      } else if (len2 === 0) throw IAE;
+      else acopy(tb, 0, a, dest - (len2 - 1), len2);
+    }
+  }
+  function rhinoSort(o, len, cmp) {
+    var w = [], i;
+    for (i = 0; i < len; i++) push(w, i in o ? o[i] : HOLE);
+    var child = cmp === undefined
+      ? function(a, b){ var x = S(a), y = S(b); return x < y ? -1 : x > y ? 1 : 0; }
+      : function(a, b){ var r = +cmp(a, b); return r < 0 || (r === 0 && 1 / r < 0) ? -1 : r > 0 || r !== r ? 1 : 0; };
+    try {
+      timSort(w, function(x, y){
+        if (x === undefined) return y === undefined ? 0 : y === HOLE ? -1 : 1;
+        if (x === HOLE) return y === HOLE ? 0 : 1;
+        if (y === HOLE || y === undefined) return -1;
+        return child(x, y);
+      });
+    } catch (e) {
+      if (e === IAE) return o;
+      throw e;
+    }
+    for (i = 0; i < len; i++) { if (w[i] === HOLE) delete o[i]; else o[i] = w[i]; }
+    return o;
+  }
   defProp(AP, 'sort', { value: function sort(cmp){
     if (cmp !== undefined && typeof cmp !== 'function') bad('Array.sort 的比较器不是函数');
     var o = Object(this), len = N(o.length), items = [], undef = 0, i;
     len = len > 0 ? trunc(len) : 0;
+    if (stableSort) return rhinoSort(o, len, cmp);
     for (i = 0; i < len; i++) {
       if (!(i in o)) continue;
       var x = o[i];

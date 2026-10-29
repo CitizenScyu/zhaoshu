@@ -826,3 +826,16 @@ export function engineSyntaxB64LenientEnabled(env: OrEnv = process.env): boolean
   const raw = env.ENGINE_SYNTAX_B64_LENIENT?.trim().toLowerCase();
   return raw === '1' || raw === 'true' || raw === 'on';
 }
+
+/**
+ * ENGINE_SYNTAX_STABLE_SORT 独立开关（stablesort1030，默认 off，口径同 ENGINE_SYNTAX_OR；只影响 jsoup1028 包装里的
+ * Array.prototype.sort）。参考 legado 用 Rhino 1.8.0：NativeArray.sort = Java Arrays.sort（TimSort，稳定），比较器结果经
+ * Double.compare(d, 0)（NaN 记 +1、-0 记 -1）。包装原按「Rhino 不稳定」拒一切非同值并列项。on = 逐行移植的 java.util.TimSort
+ * （OpenJDK 17 = Android libcore 同码；JDK 21 实跑差分 3000 例含 489 例 IAE 全同）求值：并列项按稳定次序，比较器不一致也照 Java
+ * 走法（抛 IllegalArgumentException 时原样返回）；Java 会越界/读 null 暂存槽的走法失败。off = 逐字不变。
+ * 无新位：只改求值。
+ */
+export function engineSyntaxStableSortEnabled(env: OrEnv = process.env): boolean {
+  const raw = env.ENGINE_SYNTAX_STABLE_SORT?.trim().toLowerCase();
+  return raw === '1' || raw === 'true' || raw === 'on';
+}
