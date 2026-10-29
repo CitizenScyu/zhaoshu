@@ -1,6 +1,6 @@
 // TypeScript port of zhaoshu-books/lib/source-fetch.mjs (batch 10).
 // Keep redirects, body limits and the single request/body timeout in sync.
-import { alternateSourceHost, SourcePolicyError, validateSourceUrl } from './source-policy';
+import { alternateSourceHost, SourcePolicyError, upgradeRedirectLocation, validateSourceUrl } from './source-policy';
 import { isRetiredBuiltinHost } from './supported-sources';
 import { recordHostFailure, recordHostSuccess, type HostFailureKind } from './source-host-health';
 import { charsetFromContentType, encodeToBytes, type SourceCharset } from './source-charset';
@@ -324,7 +324,7 @@ async function attemptOnce(start: URL, {
         cancelBody(received);
         if (!location) throw new SourcePolicyError('书源跳转缺少 Location');
         if (redirects >= maxRedirects) throw new SourcePolicyError('书源跳转次数超限');
-        const next = validateSourceUrl(location, current).href;
+        const next = validateSourceUrl(upgradeRedirectLocation(location), current).href;
         if (visited.has(next)) throw new SourcePolicyError('书源跳转形成循环');
         sendOriginalRequest = sendOriginalRequest && preservesSourcePostRedirect(request?.method, received.status, current, next);
         visited.add(next);

@@ -9,7 +9,7 @@
 // - 两把锁共享 source-policy.ts 的 checkSourceUrl（检查项逐条同款，仅 host 白名单来源不同）；
 // - admissionFetch / validateAdmissionUrl **不导出**（任务 4 有导出快照断言）。
 
-import { checkSourceUrl, upgradeSourceTemplateUrl, SourcePolicyError } from '@/lib/source-policy';
+import { checkSourceUrl, upgradeRedirectLocation, upgradeSourceTemplateUrl, SourcePolicyError } from '@/lib/source-policy';
 import { sourceRevision } from '@/lib/source-revision';
 import { preservesSourcePostRedirect, sourceAbortable } from '@/lib/source-fetch';
 import { type SourceSearchRequest, type SourceUrlValidator } from '@/lib/source-parser';
@@ -674,7 +674,7 @@ async function admissionFetch(
         cancelBody(response);
         if (!location) throw new SourcePolicyError('书源跳转缺少 Location');
         if (redirects >= maxRedirects) throw new SourcePolicyError('书源跳转次数超限');
-        const next = validateAdmissionUrl(location, current, declaredHosts).href;
+        const next = validateAdmissionUrl(upgradeRedirectLocation(location), current, declaredHosts).href;
         if (visited.has(next)) throw new SourcePolicyError('书源跳转形成循环');
         sendOriginalRequest = sendOriginalRequest && preservesSourcePostRedirect(request.method, response.status, current, next);
         visited.add(next);

@@ -110,6 +110,22 @@ export function upgradeSourceTemplateUrl(value: string): string {
   return /^http:\/\//i.test(value) ? `https://${value.slice(7)}` : value;
 }
 
+/**
+ * ENGINE_REDIRECT_HTTPS_UPGRADE 独立开关（redirup1030，默认 off）。on = 书源跳转的绝对 `http://` Location 先按模板同款升级成
+ * `https://` 再过锁（host 白名单/端口/IP 红线照旧由 checkSourceUrl 判，只换协议不放宽任何检查项）。legado 直接跟 http 跳转；
+ * 本引擎 HTTPS-only，旧口径整条判 url_invalid（2026-10-30 实测 6 个已声明 host 搜索被 http Location 拒，升级后 2 个可搜）。
+ * 不进 rules_hash（只改网络期跳转，不改规则语义）。off = 逐字不变（见上方注释 ①）。
+ */
+export function redirectHttpsUpgradeEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  const raw = env.ENGINE_REDIRECT_HTTPS_UPGRADE?.trim().toLowerCase();
+  return raw === '1' || raw === 'true' || raw === 'on';
+}
+
+/** 跳转 Location 过锁前的协议升级（redirup1030）；开关关时原样返回。 */
+export function upgradeRedirectLocation(location: string): string {
+  return redirectHttpsUpgradeEnabled() ? upgradeSourceTemplateUrl(location) : location;
+}
+
 // 相对引用只接受已验证的基址；返回规范 URL，供请求、入队和循环检测使用。
 export function validateSourceUrl(value: unknown, base?: string): URL {
   return checkSourceUrl(value, base, { hostAllowed: (hostname) => supportedHosts.has(hostname) });
