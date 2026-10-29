@@ -814,3 +814,15 @@ export function engineSyntaxAttrQuoteEnabled(env: OrEnv = process.env): boolean 
   const raw = env.ENGINE_SYNTAX_ATTR_QUOTE?.trim().toLowerCase();
   return raw === '1' || raw === 'true' || raw === 'on';
 }
+
+/**
+ * ENGINE_SYNTAX_B64_LENIENT 独立开关（b64lenient1030，默认 off，口径同 ENGINE_SYNTAX_OR；须 JS_UTIL）。legado 对称解密
+ * （createSymmetricCrypto().decryptStr / aesBase64DecodeToString 等）的非 hex 密文走 hutool Base64Decoder：非字母表字节跳过，
+ * 页面 JS 字面量里的 `\/` 转义、换行都照常解出；引擎原只收规范 base64、其余抛错。on = 按 hutool 逐字节口径解（js-util.ts
+ * hutoolBase64Decode）；规范 base64 两态结果相同。off = 逐字不变。
+ * 无新位：只改求值，准入搜索字段用到对称解密的源约 1 host（另有 jsLib 11 host），同 nullskip1029。
+ */
+export function engineSyntaxB64LenientEnabled(env: OrEnv = process.env): boolean {
+  const raw = env.ENGINE_SYNTAX_B64_LENIENT?.trim().toLowerCase();
+  return raw === '1' || raw === 'true' || raw === 'on';
+}

@@ -4,6 +4,7 @@
 // 宁可整段求值失败，也不产出与 legado 不同的值。
 
 import { createCipheriv, createDecipheriv } from 'node:crypto';
+import { engineSyntaxB64LenientEnabled } from './syntax-flags';
 
 export type SymOp = 'decryptStr' | 'encryptBase64' | 'encryptHex';
 
@@ -68,13 +69,14 @@ function symSpec(transformation: string, keyText: string, ivText: string): SymSp
 
 /**
  * SymmetricCryptoAndroid.decrypt(String)：全是 hex 字符按 hex 解，否则按 hutool Base64 解。hutool 跳过非法字符、长度另算，
- * 这里只收规范形态（标准或 URL 安全字母表、可省略的末尾 `=`），其余失败。
+ * 这里只收规范形态（标准或 URL 安全字母表、可省略的末尾 `=`），其余失败；b64lenient1030 开时改按 hutool 口径解。
  */
 function decodeCipherText(data: string): Buffer {
   if (/^[0-9A-Fa-f]*$/.test(data)) {
     if (data.length === 0 || data.length % 2 !== 0) throw new Error('hex 密文为空或长度为奇数');
     return Buffer.from(data, 'hex');
   }
+  if (engineSyntaxB64LenientEnabled()) return hutoolBase64Decode(data);
   const match = /^([A-Za-z0-9+/_-]+)(={0,2})$/.exec(data);
   if (!match) throw new Error('密文不是规范 base64');
   const [, body, pad] = match;
@@ -83,6 +85,47 @@ function decodeCipherText(data: string): Buffer {
     throw new Error('密文不是规范 base64');
   }
   return Buffer.from(body.replaceAll('-', '+').replaceAll('_', '/'), 'base64');
+}
+
+/** hutool Base64Decoder.DECODE_TABLE（0x00–0x7a）：-1 非字母表，-2 是 `=`；`+`/`-` = 62，`/`/`_` = 63。 */
+const HUTOOL_B64_TABLE: readonly number[] = (() => {
+  const table = new Array<number>(0x7b).fill(-1);
+  const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+  for (let i = 0; i < alphabet.length; i += 1) table[alphabet.charCodeAt(i)] = i;
+  table[0x2b] = 62; table[0x2d] = 62; table[0x2f] = 63; table[0x5f] = 63; table[0x3d] = -2;
+  return table;
+})();
+const HUTOOL_PADDING = -2;
+
+/**
+ * b64lenient1030：hutool Base64Decoder.decode 逐字移植——串按 UTF-8 取字节逐个查表，非字母表字节（含 `=` 与非 ASCII）跳过，
+ * 读到尾补 PADDING；每 4 个值一组，第 2/3/4 个是 PADDING 时不出对应字节。表只到 `z`：`{|}~` 与 DEL 在 hutool 里数组越界抛错，
+ * 这里同样失败。
+ */
+function hutoolBase64Decode(data: string): Buffer {
+  const bytes = Buffer.from(data, 'utf8');
+  let pos = 0;
+  const next = (): number => {
+    while (pos < bytes.length) {
+      const byte = bytes[pos++];
+      if (byte > 0x7f) continue; // Java byte 为负
+      if (byte >= HUTOOL_B64_TABLE.length) throw new Error('密文含 hutool 解码表外的字符');
+      const value = HUTOOL_B64_TABLE[byte];
+      if (value > -1) return value;
+    }
+    return HUTOOL_PADDING;
+  };
+  const out: number[] = [];
+  while (pos < bytes.length) {
+    const s0 = next();
+    const s1 = next();
+    const s2 = next();
+    const s3 = next();
+    if (s1 !== HUTOOL_PADDING) out.push(((s0 << 2) | (s1 >>> 4)) & 0xff);
+    if (s2 !== HUTOOL_PADDING) out.push((((s1 & 0xf) << 4) | (s2 >>> 2)) & 0xff);
+    if (s3 !== HUTOOL_PADDING) out.push((((s2 & 3) << 6) | s3) & 0xff);
+  }
+  return Buffer.from(out);
 }
 
 const UTF8_FATAL = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
