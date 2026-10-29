@@ -16,6 +16,7 @@ import {
 } from '@/lib/source-parser';
 import { checkSourceUrl, SourcePolicyError, validateSourceUrl } from '@/lib/source-policy';
 import { MAX_JS_INPUT_CHARS, preloadJsSandbox, runJs, runJsoup, type JsBindings } from './js-sandbox';
+import { FieldNetMissError, withFieldNet } from './evaluate';
 import {
   engineSearchNetJsEnabled, engineSearchOptionsEnabled, engineSyntaxJsEnabled, engineSyntaxJsoupEnabled, engineSyntaxJsUtilEnabled,
 } from './syntax-flags';
@@ -285,10 +286,10 @@ function netFrame(template: string): boolean {
  * netjs1029：java.ajax 实参按 legado 新建 AnalyzeUrl(url, source) 口径解析成请求：那里 key/page 为 null、baseUrl 为空，
  * 只有展开好的绝对地址能用；`{{…}}`/JS 段/页码占位一律拒（不支持，不猜）。选项按 legado 口径读（与主模板同一开关）。
  */
-function ajaxRequest(url: string, validate: SourceUrlValidator): SourceSearchRequest {
+function ajaxRequest(url: string, validate: SourceUrlValidator, what = '搜索 JS'): SourceSearchRequest {
   const ruleUrl = url.trim();
   if (!/^https?:\/\//i.test(ruleUrl) || /\{\{|<js>|@js:|<[^>]*>/i.test(ruleUrl)) {
-    throw new SourcePolicyError('不支持该书源的搜索 JS（java.ajax 地址须是展开好的绝对地址）');
+    throw new SourcePolicyError(`不支持该书源的${what}（java.ajax 地址须是展开好的绝对地址）`);
   }
   return buildLegadoSearchRequest(ruleUrl, undefined, validate, engineSearchOptionsEnabled());
 }
@@ -368,6 +369,27 @@ export async function buildSearchRequestWithNet(
       const body = await fetchNet(error.request);
       if (body.length > MAX_JS_INPUT_CHARS) throw new SourcePolicyError('不支持该书源的搜索 JS（java.ajax 页面过大）');
       net.set(error.key, body);
+    }
+  }
+}
+
+/**
+ * fieldnet1029：字段 JS 的 java.ajax（FieldIr.jsAjax）。同步求值 `run` 在 evaluate.ts withFieldNet 的缓存下跑，未命中
+ * （FieldNetMissError）即按搜索 java.ajax 同一口径（ajaxRequest：只认展开好的绝对地址、过 host 门）经 fetchNet 取回，
+ * 再整段重放 `run`（run 须可重入：作用域/变量袋每次现建）；同一地址不重取，最多取 MAX_NET_FETCHES 页。
+ * 没用到 java.ajax 的字段不会未命中，run 只跑一遍。fetchNet 的错误原样上抛（legado 取页失败给 JS 一串错误信息，这里保守按失败）。
+ */
+export async function evaluateWithFieldNet<T>(run: () => T, validate: SourceUrlValidator, fetchNet: SearchNetFetch): Promise<T> {
+  const net = new Map<string, string>();
+  for (;;) {
+    try {
+      return withFieldNet(net, run);
+    } catch (error) {
+      if (!(error instanceof FieldNetMissError)) throw error;
+      if (net.size >= MAX_NET_FETCHES) throw new SourcePolicyError('不支持该书源的字段 JS（java.ajax 次数过多）');
+      const body = await fetchNet(ajaxRequest(error.url, validate, '字段 JS'));
+      if (body.length > MAX_JS_INPUT_CHARS) throw new SourcePolicyError('不支持该书源的字段 JS（java.ajax 页面过大）');
+      net.set(error.url, body);
     }
   }
 }

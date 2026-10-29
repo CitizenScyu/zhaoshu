@@ -23,7 +23,7 @@ export const ENGINE_SEMANTICS_XPATH_BIT = 2;
 /** vars1027：@put/@get 静态子集语义位。版本再 +4（5–8 = 含变量位的四种组合），1–4 逐字不变。 */
 export const ENGINE_SEMANTICS_VARS_BIT = 4;
 
-/** 语义版本随 || / XPath / 变量 / JS / XPath 求值 / 正则 / && / AllInOne / 搜索 JS / 列表 JS / JS 扩展 / 宿主绑定 / java.getString / 加解密帮手 / JSONPath 扩展 / 详情 init / 搜索选项 legado 口径 / URL 字段选项 / 搜索 webView / 详情 JS init / 详情→目录变量袋 / jsoup 直连 / 书籍成员 / 搜索 URL→搜索字段变量袋 / 搜索条目袋 / 列表 JS getter / 书籍变量 / jsLib / 书源常量 / jsoup JS init / 搜索联网 JS 开关联动（唯一口径，供 compile.ts 缓存键与 rulesHash 复用）。 */
+/** 语义版本随 || / XPath / 变量 / JS / XPath 求值 / 正则 / && / AllInOne / 搜索 JS / 列表 JS / JS 扩展 / 宿主绑定 / java.getString / 加解密帮手 / JSONPath 扩展 / 详情 init / 搜索选项 legado 口径 / URL 字段选项 / 搜索 webView / 详情 JS init / 详情→目录变量袋 / jsoup 直连 / 书籍成员 / 搜索 URL→搜索字段变量袋 / 搜索条目袋 / 列表 JS getter / 书籍变量 / jsLib / 书源常量 / jsoup JS init / 搜索联网 JS / 字段联网 JS 开关联动（唯一口径，供 compile.ts 缓存键与 rulesHash 复用）。 */
 export function engineSemanticsVersion(
   orEnabled: boolean, xpathEnabled = false, varsEnabled = false, jsEnabled = false, xpathEvalEnabled = false,
   regexEnabled = false, andEnabled = false, aioEnabled = false, searchJsEnabled = false, listJsEnabled = false,
@@ -31,7 +31,7 @@ export function engineSemanticsVersion(
   initEnabled = false, searchOptionsEnabled = false, urlOptionsEnabled = false, searchWebViewEnabled = false, initJsEnabled = false,
   varBagEnabled = false, jsoupEnabled = false, bookFieldsEnabled = false, searchVarsEnabled = false, itemVarsEnabled = false,
   listGetEnabled = false, bookVariableEnabled = false, jsLibEnabled = false, sourceBindEnabled = false, initJsoupEnabled = false,
-  searchNetJsEnabled = false,
+  searchNetJsEnabled = false, fieldNetJsEnabled = false,
 ): number {
   return (orEnabled ? ENGINE_SEMANTICS_VERSION_OR : ENGINE_SEMANTICS_VERSION)
     + (xpathEnabled ? ENGINE_SEMANTICS_XPATH_BIT : 0) + (varsEnabled ? ENGINE_SEMANTICS_VARS_BIT : 0)
@@ -48,7 +48,8 @@ export function engineSemanticsVersion(
     + (searchVarsEnabled ? ENGINE_SEMANTICS_SEARCH_VARS_BIT : 0) + (itemVarsEnabled ? ENGINE_SEMANTICS_ITEM_VARS_BIT : 0)
     + (listGetEnabled ? ENGINE_SEMANTICS_LIST_GET_BIT : 0) + (bookVariableEnabled ? ENGINE_SEMANTICS_BOOK_VARIABLE_BIT : 0)
     + (jsLibEnabled ? ENGINE_SEMANTICS_JS_LIB_BIT : 0) + (sourceBindEnabled ? ENGINE_SEMANTICS_SOURCE_BIND_BIT : 0)
-    + (initJsoupEnabled ? ENGINE_SEMANTICS_INIT_JSOUP_BIT : 0) + (searchNetJsEnabled ? ENGINE_SEMANTICS_SEARCH_NET_JS_BIT : 0);
+    + (initJsoupEnabled ? ENGINE_SEMANTICS_INIT_JSOUP_BIT : 0) + (searchNetJsEnabled ? ENGINE_SEMANTICS_SEARCH_NET_JS_BIT : 0)
+    + (fieldNetJsEnabled ? ENGINE_SEMANTICS_FIELD_NET_JS_BIT : 0);
 }
 
 /**
@@ -578,5 +579,21 @@ export function engineSyntaxInitJsoupEnabled(env: OrEnv = process.env): boolean 
  */
 export function engineSearchNetJsEnabled(env: OrEnv = process.env): boolean {
   const raw = env.ENGINE_SEARCH_NET_JS?.trim().toLowerCase();
+  return raw === '1' || raw === 'true' || raw === 'on';
+}
+
+/**
+ * fieldnet1029：规则字段联网 JS 语义位。版本再 +4294967296（1–4294967295 逐字不变，bigint 列）。只对有字段经 jsoup 重编、
+ * 且重编帧里用到 `java.ajax` 才编得过（FieldIr.jsAjax）的源计入（compile.ts engineSourceRevision / sourceUsesFieldNetSyntax）。
+ */
+export const ENGINE_SEMANTICS_FIELD_NET_JS_BIT = 4294967296;
+
+/**
+ * ENGINE_FIELD_NET_JS 独立开关（fieldnet1029，默认 off，口径同 ENGINE_SYNTAX_OR；须 ENGINE_SYNTAX_JS 与 ENGINE_SYNTAX_JSOUP 同开才生效）。
+ * on = 规则字段的 JS 按 jsoup 口径重编时放行 `java.ajax(url)`（parse.ts jsoupFrame.net），求值时缺页即中止、由宿主取页（门面
+ * context.page，准入 admissionFetch）后整段重放，返回 Java 字符串（legado JsExtensions.ajax）。off = 逐字不变（java.ajax 照旧拒）。
+ */
+export function engineFieldNetJsEnabled(env: OrEnv = process.env): boolean {
+  const raw = env.ENGINE_FIELD_NET_JS?.trim().toLowerCase();
   return raw === '1' || raw === 'true' || raw === 'on';
 }

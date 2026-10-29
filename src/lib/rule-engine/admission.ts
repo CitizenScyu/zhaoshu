@@ -20,8 +20,8 @@ import {
 } from './compile-smoke';
 import { listJsGroups, parseFieldRule } from './parse';
 import {
-  bookInfoScope, compiledDetailNeedsItemVars, compiledUsesBook, createScope, evaluateField, evaluateFieldList, fieldUsesJs, normalizeBody,
-  scopeVars, withBook, withVars,
+  bookInfoScope, compiledDetailNeedsItemVars, compiledUsesBook, createScope, evaluateField, evaluateFieldList, FieldNetMissError, fieldUsesJs,
+  normalizeBody, scopeVars, withBook, withVars,
 } from './evaluate';
 import { RuleEngineError, type FieldIr, type RuleDiagnostic } from './types';
 import {
@@ -38,7 +38,7 @@ import { stripUrlOptions, urlOptionFields } from './url-options';
 import { aioGroups, isAioListRule, ruleGroupOf } from './aio-syntax';
 import { preloadJsSandbox } from './js-sandbox';
 import {
-  buildSearchRequestWithNet, buildSearchRequestWithVars, prepareSearchJs, SearchJsNotReadyError, SearchNetPendingError,
+  buildSearchRequestWithNet, buildSearchRequestWithVars, evaluateWithFieldNet, prepareSearchJs, SearchJsNotReadyError, SearchNetPendingError,
   type SearchRequestWithVars,
 } from './search-js';
 import { resolveSourceVars } from './vars-subset';
@@ -809,6 +809,29 @@ function searchCandidateUrls(source: RawSource, text: string, pageUrl: string, v
   return searchCandidates(source, text, pageUrl, vars).map((item) => item.url);
 }
 
+/**
+ * fieldnet1029：搜索页求候选时 bookList 的 java.ajax 页面走准入通道（admissionFetch，准入门、非 2xx 判失败）取回后整段重放
+ * （searchCandidates 每次从建作用域起重算）。每页前补一个节流间隔（紧跟在同站搜索请求之后）。没用到 java.ajax 的源只算一遍。
+ * 取页失败抛 AdmissionAjaxError；地址不合口径/次数过多/页面过大抛 SourcePolicyError（search-js evaluateWithFieldNet）。
+ */
+function searchCandidatesWithNet<T>(
+  source: RawSource, options: Parameters<typeof searchAdmission>[1], run: () => T,
+): Promise<T> {
+  const { validate } = admissionSearchScope(source, options.declaredHosts);
+  const throttleMs = options.throttleMs ?? ADMISSION_THROTTLE_MS;
+  return evaluateWithFieldNet(run, validate, async (request) => {
+    let page: { url: string; status: number; text: string };
+    try {
+      if (throttleMs > 0) await (options.sleep ?? defaultSleep)(throttleMs, options.signal);
+      page = await admissionFetch(request, options);
+    } catch (error) {
+      throw new AdmissionAjaxError(undefined, error);
+    }
+    if (page.status < 200 || page.status >= 300) throw new AdmissionAjaxError(page.status, undefined);
+    return page.text;
+  });
+}
+
 /** searchvars1028：搜索袋对该源生效时读袋的搜索字段（与 compileSource 同一个 compileSearchVars）；开关关或不生效返回 null。 */
 function searchBagOf(source: RawSource, jsEnabled: boolean): ReadonlyMap<string, FieldIr> | null {
   if (!engineSearchVarsActive()) return null;
@@ -895,8 +918,9 @@ function searchCandidates(
   if (engineSyntaxJsBindEnabled()) scope.host = { origin: typeof source.bookSourceUrl === 'string' ? source.bookSourceUrl : '' };
   if ((searchBag || itemBag) && vars !== undefined) scope = withVars(scope, vars);
   // HTML 与 JSON 搜索页同一路径（JSON 页 bookList 取列表项，见 evaluateFieldList）。
+  // fieldnet1029：bookList 的 java.ajax 待取页不吞，交调用方（searchCandidatesWithNet）取页后整段重放。
   let items;
-  try { items = evaluateFieldList(listIr, scope); } catch { return []; }
+  try { items = evaluateFieldList(listIr, scope); } catch (error) { if (error instanceof FieldNetMissError) throw error; return []; }
   // listjs1027：`-` 前缀整表反转（计数口径不去重，反转后取前 MAX_CANDIDATE_SCAN 条，与运行时同向）。
   if (listIr.reverse === true) items = [...items].reverse();
   const found: SearchCandidate[] = [];
@@ -1030,7 +1054,17 @@ async function searchAdmissionOnce(
   // AllInOne 搜索列表（aio1027）的正则也在沙箱里跑。
   if ((jsChainEnabledFor(source) && sourceHasJsChainField(source))
     || (engineSyntaxAioEnabled() && aioGroups(source).has('ruleSearch'))) await preloadJsSandbox();
-  const found = searchCandidates(source, response.text, response.url, vars);
+  let found: SearchCandidate[];
+  try {
+    found = await searchCandidatesWithNet(source, options, () => searchCandidates(source, response.text, response.url, vars));
+  } catch (error) {
+    if (error instanceof AdmissionAjaxError) {
+      if (options.signal.aborted) throw error.reason ?? error; // 调用方中止（预算耗尽/取消）：不写判定
+      return ajaxFailureResult(error);
+    }
+    if (error instanceof SourcePolicyError) return { verdict: 'url_invalid', candidateCount: 0, status: response.status, error: errorMessage(error) };
+    throw error;
+  }
   const urls = found.map((item) => item.url);
   const candidateCount = urls.length;
   if (candidateCount >= 1) {
@@ -1095,7 +1129,16 @@ async function controlQueryOverlap(
   }
   if (response.status < 200 || response.status >= 300) return undefined;
   const a = new Set(primary);
-  const b = new Set(searchCandidateUrls(source, response.text, response.url, vars));
+  let urls: string[];
+  try {
+    // fieldnet1029：对照页的 bookList java.ajax 同走准入通道；取页失败/不合口径当拿不到可比结论。
+    urls = await searchCandidatesWithNet(source, options, () => searchCandidateUrls(source, response.text, response.url, vars));
+  } catch (error) {
+    if (error instanceof AdmissionAjaxError && options.signal.aborted) throw error.reason ?? error;
+    if (error instanceof AdmissionAjaxError || error instanceof SourcePolicyError) return undefined;
+    throw error;
+  }
+  const b = new Set(urls);
   if (b.size === 0) return 0;
   let shared = 0;
   for (const item of b) if (a.has(item)) shared += 1;
@@ -1142,6 +1185,7 @@ class ReadabilityStop extends Error {
  * 不能用 api.ts 的 engineFetch*）；求值口径对齐 api.ts：tocUrl 缺省用详情页、chapterUrl 空用目录页 URL、
  * 正文多段拼接并按规则类型做 HTML→文本；解码同运行时 responseCharset 'auto'（ENGINE_POST_SEARCH 开时按
  * Content-Type）。只跑目录首页、不跟翻页，单本最多 3 个请求，请求间补节流间隔。
+ * fieldnet1029：字段 JS 的 java.ajax 在这里不取页（守单本 3 个请求的上限），用到它的字段求值失败、记 eval_error。
  * 从不抛错：调用方中止或预算不足一律 skipped。
  */
 export async function readabilityShadow(

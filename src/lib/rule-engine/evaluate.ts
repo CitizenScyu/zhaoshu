@@ -568,6 +568,53 @@ function jsLibBinding(): Pick<JsBindings, 'jsLib'> {
 }
 
 /**
+ * fieldnet1029：字段 `java.ajax` 要的页面还没取到（withFieldNet 缓存未命中）。`url` = JS 传进来的原串。沙箱把宿主回调的
+ * RuleEngineError 原样抛出（JS 的 try/catch 吞不掉），evaluateFieldSafe 也不吞；门面/准入认出它取页后整段重放。
+ */
+export class FieldNetMissError extends RuleEngineError {
+  constructor(readonly url: string) {
+    super('RULE_EVAL_FAILED', 'java.ajax 页面未取');
+    this.name = 'FieldNetMissError';
+  }
+}
+
+/**
+ * fieldnet1029：字段 `java.ajax` 的页面缓存（url 原串 → body）。求值同步进行，门面/准入的取页循环用 withFieldNet 设上、返回时
+ * 恢复。未设 = 调用方不取页：挂了 jsAjax 的字段求值失败（不是未命中）。引擎本身仍零网络。
+ */
+let fieldNet: ReadonlyMap<string, string> | undefined;
+
+export function withFieldNet<T>(net: ReadonlyMap<string, string>, run: () => T): T {
+  const outer = fieldNet;
+  fieldNet = net;
+  try {
+    return run();
+  } finally {
+    fieldNet = outer;
+  }
+}
+
+/** 挂了 FieldIr.jsAjax 的字段的 ajax 回调（jsoup 包装成 Java 字符串）；其余字段不装，沙箱逐字不变。 */
+function fieldNetCallbacks(field: FieldIr): NonNullable<JsBindings['callbacks']> | undefined {
+  if (!field.jsAjax) return undefined;
+  return {
+    ajax: (url) => {
+      const net = fieldNet;
+      if (net === undefined) return evalFailed('java.ajax 需联网取页，当前调用方不取页');
+      const body = net.get(url);
+      if (body === undefined) throw new FieldNetMissError(url);
+      return body;
+    },
+  };
+}
+
+/** 往沙箱绑定上并 ajax 回调（fieldnet1029）；字段没挂 jsAjax 时原样返回。 */
+function withNetCallbacks<T extends Pick<JsBindings, 'callbacks'>>(field: FieldIr, bindings: T): T {
+  const ajax = fieldNetCallbacks(field);
+  return ajax === undefined ? bindings : { ...bindings, callbacks: { ...bindings.callbacks, ...ajax } };
+}
+
+/**
  * book1028：字段读到的书籍成员（FieldIr.bookMembers）须在作用域上带齐且非空。缺 = 调用方没有该阶段的书信息（不猜）；
  * 空串在 Rhino 里是 Java String 包装、真值判断为 true，与 JS 空串不同口径，也失败。
  */
@@ -897,7 +944,7 @@ function jsoupListScopes(field: FieldIr, chain: readonly ChainStage[], scope: Ev
   if (source === undefined) return evalFailed('列表 JS 需要页面原文，当前作用域没有');
   const pageJson = scope.kind === 'json';
   const getElements = jsoupGetElements(field, scope);
-  const book = listBookBindings(field, scope);
+  const book = withNetCallbacks(field, listBookBindings(field, scope));
   const bookVariables = field.bookVars !== undefined;
   let value = source;
   let elements: JElement[] | undefined;
@@ -1031,7 +1078,7 @@ function jsInitScope(field: FieldIr, chain: readonly ChainStage[], scope: EvalSc
   const bindings: JsBindings = { result: source, src: source, baseUrl: scope.pageUrl, ...jsBindings(scope, field.jsGets, field.jsUtil, source) };
   const budgetKey = stage.template ? stage.code : code;
   const out = field.jsoup
-    ? runJsoupInit(code, { ...bindings, jsoup: { getElements: jsoupGetElements(field, scope) } }, budgetKey)
+    ? runJsoupInit(code, withNetCallbacks(field, { ...bindings, jsoup: { getElements: jsoupGetElements(field, scope) } }), budgetKey)
     : runJsInit(code, bindings, budgetKey);
   if (typeof out === 'string') return rescope(out, scope);
   return { kind: 'json', json: undefined, pageUrl: scope.pageUrl, object: out };
@@ -1244,10 +1291,10 @@ function evaluateJsoupChain(field: FieldIr, chain: readonly ChainStage[], scope:
     const { code, regex } = makeUpJs(stage, input, scope, field.jsGets, field.jsUtil);
     const next = chain[index + 1];
     const mode = regex !== undefined || next === undefined || next.kind === 'regex' ? 'final' : next.kind === 'rule' ? 'mid' : 'midjs';
-    const bindings: JsBindings = {
+    const bindings: JsBindings = withNetCallbacks(field, {
       result: input, src: scope.source, baseUrl: scope.pageUrl, ...jsBindings(scope, field.jsGets, field.jsUtil),
       jsoup: { result: element, src: item, getElements, bookVariables: field.bookVars !== undefined },
-    };
+    });
     const out = runJsoup(code, bindings, mode, code);
     if (out === null) return null;
     if (regex === undefined) value = out;
@@ -1403,6 +1450,7 @@ export function evaluateFieldSafe(fieldName: string, field: FieldIr, scope: Eval
   try {
     return evaluateField(field, scope);
   } catch (error) {
+    if (error instanceof FieldNetMissError) throw error; // fieldnet1029：待取页，交调用方取页重放
     const wrapped = error instanceof RuleEngineError && error.code === 'RULE_EVAL_FAILED'
       ? error
       : new RuleEngineError(

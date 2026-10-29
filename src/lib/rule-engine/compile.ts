@@ -12,8 +12,8 @@ import { sourceRevision } from '@/lib/source-revision';
 import { engineSearchJsActive, engineSearchOptionsActive } from './compile-smoke';
 import { AIO_LIST_FIELDS, aioGroups } from './aio-syntax';
 import {
-  initFieldSupported, initJsFieldSupported, initRuleTextSupported, jsChainFieldAllowed, listJsGroups, objectKeyOf, parseFieldRule, ruleHasJs,
-  type ParseOptions, type SourceConsts,
+  FIELD_NET_FIELDS, initFieldSupported, initJsFieldSupported, initRuleTextSupported, jsChainFieldAllowed, listJsGroups, objectKeyOf, parseFieldRule,
+  ruleHasJs, type ParseOptions, type SourceConsts,
 } from './parse';
 import type { CompiledRules, FieldIr, RuleIr } from './types';
 import { analyzeJsLib, jsLibRuleProblem, type JsLib } from './js-lib';
@@ -24,6 +24,7 @@ import {
   engineSearchWebViewEnabled, engineSyntaxInitJsEnabled, engineSyntaxJsoupEnabled, engineSyntaxVarsBagEnabled,
   engineSyntaxBookFieldsEnabled, engineSyntaxSearchVarsEnabled, engineSyntaxItemVarsEnabled, engineSyntaxListGetEnabled, ENGINE_SEMANTICS_VERSION,
   engineSyntaxBookVariableEnabled, engineSyntaxJsLibEnabled, engineSyntaxSourceBindEnabled, engineSyntaxInitJsoupEnabled, engineSearchNetJsEnabled,
+  engineFieldNetJsEnabled,
 } from './syntax-flags';
 import { urlOptionFields } from './url-options';
 import {
@@ -117,6 +118,8 @@ export function engineVersionedKey(contentRevision: string, semanticsVersion = E
  * （sourceUsesInitJsoupSyntax）时再加 jsoup init 位（+1073741824，int4 最后一位）。其余位的探测不传本开关（读 env，同 listget1028 口径）。
  * netjs1029：ENGINE_SEARCH_NET_JS、ENGINE_SYNTAX_JS（原始开关，搜索沙箱不看 JS 链）、ENGINE_SYNTAX_JSOUP 与搜索 JS 同开，且需 JS 的
  * 搜索模板（按运行时同一长度上限）里有 java.ajax 调用（searchTemplateUsesAjax）时再加搜索联网 JS 位（+2147483648，bigint 列）。
+ * fieldnet1029：ENGINE_FIELD_NET_JS on、jsoup 对该源生效且有页面级字段（parse.ts FIELD_NET_FIELDS）经 jsoup 重编用到 java.ajax
+ * （sourceUsesFieldNetSyntax）时再加字段联网 JS 位（+4294967296）。其余位的探测不传本开关（读 env，同 listget1028 口径）。
  */
 export function engineSourceRevision(
   source: { url: string; searchUrl: unknown; rules: Record<string, unknown> },
@@ -263,6 +266,12 @@ export function engineSourceRevision(
       && (options.searchNetJsEnabled ?? engineSearchNetJsEnabled()) && searchTemplateUsesAjax(source.searchUrl)
       && searchTemplateNeedsJs(source.searchUrl, upgradeSourceTemplateUrl(source.url),
         jsEnabled && jsUtilEnabled ? MAX_SEARCH_JS_LONG_TEMPLATE_LENGTH : MAX_SEARCH_JS_TEMPLATE_LENGTH),
+    jsoup && (options.fieldNetJsEnabled ?? engineFieldNetJsEnabled()) && sourceUsesFieldNetSyntax(rules, {
+      orEnabled, varsEnabled, xpathEnabled, xpathEvalEnabled: xpathEval, regexEnabled, andEnabled, aioEnabled, listJsEnabled, jsExtEnabled,
+      jsBindEnabled: jsBind, jsGetEnabled: jsGet, jsUtilEnabled: jsUtil, jsonPathEnabled, initJsEnabled, bookFieldsEnabled: book,
+      listGetEnabled: listGet, initJsoupEnabled: initJsoup, sourceConsts: sourceConstsOf(source.rules, sourceBind),
+      bookVariablePuts: bookVariable ? sourceBookVariablePuts(source) ?? undefined : undefined,
+    }),
   ));
 }
 
@@ -1358,6 +1367,55 @@ export function sourceUsesInitJsoupSyntax(
   return uses;
 }
 
+const fieldNetMemo = new WeakMap<object, Map<string, boolean>>();
+
+/**
+ * 源是否会因 ENGINE_FIELD_NET_JS 改变编译结果（fieldnet1029）：页面级字段（parse.ts FIELD_NET_FIELDS）原文含 JS 与 `ajax`，
+ * 按 compileSource 同一组开关（JS 链与 jsoup 已开、本开关开）编译后挂了 FieldIr.jsAjax（off 态 java.ajax 被拒，jsoup 重编帧里
+ * 才放行）。调用方须确认 jsoup 对该源生效。
+ */
+export function sourceUsesFieldNetSyntax(
+  rules: Record<string, unknown>,
+  options: {
+    orEnabled: boolean; varsEnabled: boolean; xpathEnabled: boolean; xpathEvalEnabled: boolean; regexEnabled: boolean; andEnabled: boolean;
+    aioEnabled: boolean; listJsEnabled: boolean; jsExtEnabled: boolean; jsBindEnabled: boolean; jsGetEnabled: boolean; jsUtilEnabled: boolean;
+    jsonPathEnabled: boolean; initJsEnabled: boolean; bookFieldsEnabled: boolean; listGetEnabled: boolean; initJsoupEnabled: boolean;
+    sourceConsts?: SourceConsts; bookVariablePuts?: ReadonlySet<string>;
+  },
+): boolean {
+  if (!someRule(rules, (rule) => ruleHasJs(rule) && rule.includes('ajax'))) return false;
+  const { sourceConsts, bookVariablePuts, varsEnabled, ...flags } = options;
+  const memoKey = `${JSON.stringify(flags)}:${varsEnabled}:${sourceConsts !== undefined}:${bookVariablePuts === undefined ? '-' : [...bookVariablePuts].sort().join(',')}`;
+  let memo = fieldNetMemo.get(rules);
+  const hit = memo?.get(memoKey);
+  if (hit !== undefined) return hit;
+  const sourceRules = varsEnabled ? resolveSourceVars(rules) : rules;
+  const aio = options.aioEnabled ? aioGroups(sourceRules) : new Set<string>();
+  const listJs = options.listJsEnabled ? listJsGroups(sourceRules) : new Set<string>();
+  let uses = false;
+  for (const name of FIELD_NET_FIELDS) {
+    const [group, field] = name.split('.');
+    const fields = sourceRules[group];
+    const rule = fields && typeof fields === 'object' && !Array.isArray(fields) ? (fields as Record<string, unknown>)[field] : undefined;
+    if (typeof rule !== 'string' || !ruleHasJs(rule) || !rule.includes('ajax')) continue;
+    try {
+      uses = parseFieldRule(rule, {
+        ...flags, jsEnabled: true, jsoupEnabled: true, fieldNetJsEnabled: true, aioGroup: aio.has(group), listJsGroup: listJs.has(group),
+        sourceConsts, bookVariablePuts, field: name,
+      }).jsAjax === true;
+    } catch {
+      continue;
+    }
+    if (uses) break;
+  }
+  if (!memo) {
+    memo = new Map();
+    fieldNetMemo.set(rules, memo);
+  }
+  memo.set(memoKey, uses);
+  return uses;
+}
+
 /**
  * 源是否会因 ENGINE_SYNTAX_INIT_JS 改变详情页求值（initjs1028）：init 原文含 JS、按 compileSource 同一组开关（JS 链已开）编译后
  * 是可复现的 JS init。调用方还须确认 ENGINE_SYNTAX_INIT 与 JS 链（ENGINE_SYNTAX_JS on、无 jsLib）都生效。
@@ -1752,11 +1810,13 @@ export function compileSource(
   const sourceConsts = sourceConstsOf(source.rules, sourceBindEnabled);
   // initjsoup1028：init 的 jsoup 重编须 JS init 与 jsoup 同生效。
   const initJsoupEnabled = initJsEnabled && jsoupEnabled && (options.initJsoupEnabled ?? engineSyntaxInitJsoupEnabled());
+  // fieldnet1029：字段 java.ajax 只在 jsoup 重编帧里放行。
+  const fieldNetJsEnabled = jsoupEnabled && (options.fieldNetJsEnabled ?? engineFieldNetJsEnabled());
   const key = engineSourceRevision(source, {
     orEnabled, xpathEnabled, varsEnabled, jsEnabled, xpathEvalEnabled, regexEnabled, andEnabled, aioEnabled, listJsEnabled, jsExtEnabled,
     jsBindEnabled, jsGetEnabled, jsUtilEnabled, jsonPathEnabled, initEnabled, urlOptionsEnabled, initJsEnabled, varBagEnabled, jsoupEnabled,
     bookFieldsEnabled, searchJsEnabled, searchVarsEnabled, itemVarsEnabled, listGetEnabled, bookVariableEnabled, jsLibEnabled, sourceBindEnabled,
-    initJsoupEnabled,
+    initJsoupEnabled, fieldNetJsEnabled,
   });
   const hit = cache.get(key);
   if (hit) {
@@ -1779,7 +1839,7 @@ export function compileSource(
         compiled.set(name, parseFieldRule(rule, {
           orEnabled, xpathEnabled, xpathEvalEnabled, jsEnabled, regexEnabled, andEnabled, aioEnabled, aioGroup: aio.has(group),
           listJsEnabled, listJsGroup: listJs.has(group), jsExtEnabled, jsBindEnabled, jsGetEnabled, jsUtilEnabled, jsonPathEnabled, initJsEnabled,
-          jsoupEnabled, bookFieldsEnabled, listGetEnabled, bookVariablePuts, sourceConsts, initJsoupEnabled, field: name,
+          jsoupEnabled, bookFieldsEnabled, listGetEnabled, bookVariablePuts, sourceConsts, initJsoupEnabled, fieldNetJsEnabled, field: name,
         }));
       } catch {
         compiled.set(name, { skipped: 'unsupported' });

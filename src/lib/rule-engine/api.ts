@@ -19,7 +19,7 @@ import {
 } from './evaluate';
 import { enginePostSearchEnabled, engineSearchJsActive } from './compile-smoke';
 import { preloadJsSandbox } from './js-sandbox';
-import { buildSearchRequestWithNet, prepareSearchJs, searchJsTemplateLimit } from './search-js';
+import { buildSearchRequestWithNet, evaluateWithFieldNet, prepareSearchJs, searchJsTemplateLimit } from './search-js';
 import { engineSyntaxJsBindEnabled } from './syntax-flags';
 import { RuleEngineError, type CompiledRules, type FieldIr, type SkippedField } from './types';
 import { stripUrlOptions } from './url-options';
@@ -99,6 +99,29 @@ async function prepareJs(source: EngineSource): Promise<void> {
 }
 
 /**
+ * fieldnet1029：页面级字段 JS 的 java.ajax 页面同走 context.page（计请求预算、过 host 门），取回后重放 `run`（search-js
+ * evaluateWithFieldNet）。没挂 FieldIr.jsAjax 的字段不会要页面，run 只跑一遍、与直接调用逐字相同。
+ */
+function withFieldNetPages<T>(context: SourceRequestContext, run: () => T): Promise<T> {
+  return evaluateWithFieldNet(run, validateSourceUrl, async (req) => (
+    await context.page(req.url, {
+      request: { method: req.method, body: req.body, headers: req.headers, charset: req.charset },
+      responseCharset: req.charset === 'utf-8' ? 'auto' : req.charset,
+    })
+  ).text);
+}
+
+/** 首次求值用已建好的作用域，重放（fieldnet1029）时现建一份：字段 JS 可能已往上一份作用域的袋里放过值。 */
+function replayScope<S>(first: S, make: () => S): () => S {
+  let used = false;
+  return () => {
+    if (used) return make();
+    used = true;
+    return first;
+  };
+}
+
+/**
  * JS 链下一页（jsbox1027，legado getStringList(isUrl=true)）：逐项绝对化、去重，去掉当前页（legado 目录
  * 排除 redirectUrl、正文以 nextUrlList 起始项排除）。strict 下任一项过不了 host 门即 invalid_next_page。
  */
@@ -151,11 +174,14 @@ export async function engineSearchBook(
   }
   // searchvars1028：搜索字段读袋的源挂上本次搜索 JS put 的变量（legado 同一份 RuleData；条目 SearchBook 以它为初值）。
   // 旧口径构造出的请求没有袋，读袋字段照旧求值失败。
-  const plain = pageScope(source, page.text, page.url);
-  const scope = searchVars !== undefined && compiledUsesSearchVars(source.compiled) ? withVars(plain, searchVars) : plain;
+  const searchScope = () => {
+    const plain = pageScope(source, page.text, page.url);
+    return searchVars !== undefined && compiledUsesSearchVars(source.compiled) ? withVars(plain, searchVars) : plain;
+  };
+  const scope = replayScope(searchScope(), searchScope);
   const list = field(source.compiled, 'ruleSearch.bookList');
   if (!list) return [];
-  const items = evaluateFieldList(list, scope);
+  const items = await withFieldNetPages(context, () => evaluateFieldList(list, scope()));
   const results: EngineSearchResult[] = [];
   const seen = new Set<string>();
   // listjs1027：`-` 前缀 = legado BookList 去重（保留首次出现）后整表反转，先收全再反转、截候选上限。
@@ -209,14 +235,17 @@ export async function engineFetchDetail(
   await prepareJs(source);
   const target = validateSourceUrl(bookUrl).href;
   const page = await context.page(target, { responseCharset: enginePostSearchEnabled() ? 'auto' : undefined });
-  const scope = withBook(pageScope(source, page.text, page.url), book);
-  // init1028：详情字段在 init 结果上求值（未挂 initScope 时即页面作用域）；作者/别名兜底仍读页面原文。
-  const info = bookInfoScope(source.compiled, scope, vars);
-  const detail: EngineDetailResult = {};
-  const title = evaluateText(source.compiled, 'ruleBookInfo.name', info);
-  const author = evaluateText(source.compiled, 'ruleBookInfo.author', info);
   const tocUrlIr = field(source.compiled, 'ruleBookInfo.tocUrl');
-  const rawTocUrl = evaluateText(source.compiled, 'ruleBookInfo.tocUrl', info);
+  // init1028：详情字段在 init 结果上求值（未挂 initScope 时即页面作用域）；作者/别名兜底仍读页面原文。
+  // fieldnet1029：init/tocUrl 的 java.ajax 页面取回后从建作用域起整段重放（变量袋每次现建）。
+  const { info, title, author, rawTocUrl } = await withFieldNetPages(context, () => {
+    const scope = withBook(pageScope(source, page.text, page.url), book);
+    const info = bookInfoScope(source.compiled, scope, vars);
+    const title = evaluateText(source.compiled, 'ruleBookInfo.name', info);
+    const author = evaluateText(source.compiled, 'ruleBookInfo.author', info);
+    return { info, title, author, rawTocUrl: evaluateText(source.compiled, 'ruleBookInfo.tocUrl', info) };
+  });
+  const detail: EngineDetailResult = {};
   const tocUrl = absoluteUrl(rawTocUrl, page.url, tocUrlIr);
   if (title) detail.title = title;
   if (tocUrl) detail.tocUrl = tocUrl;
@@ -279,12 +308,19 @@ export async function engineFetchToc(
       throw new SourcePolicyError('书源目录分页重复返回已读取的页面，请重试或更换书源');
     }
     receivedPages.add(receivedKey);
-    const scope = withBook(vars ? withVars(pageScope(source, page.text, page.url), vars) : pageScope(source, page.text, page.url), book);
+    const tocScope = () => withBook(vars ? withVars(pageScope(source, page.text, page.url), vars) : pageScope(source, page.text, page.url), book);
+    let scope = tocScope();
     let validChapters = 0;
     const list = field(source.compiled, 'ruleToc.chapterList');
     if (strict && [...source.compiled.entries()].some(([key, value]) => key.startsWith('ruleToc.') && 'skipped' in value)) throw new Error('unsupported_toc_rule');
     if (list) {
-      const items = evaluateFieldList(list, scope);
+      // fieldnet1029：chapterList 的 java.ajax 页面取回后重放（作用域现建；章节只在求值成功后才逐条收）。
+      const scopeOf = replayScope(scope, tocScope);
+      let items: ReturnType<typeof evaluateFieldList>;
+      ({ scope, items } = await withFieldNetPages(context, () => {
+        const pageScopeNow = scopeOf();
+        return { scope: pageScopeNow, items: evaluateFieldList(list, pageScopeNow) };
+      }));
       for (let index = 0; index < items.length; index += 1) {
         const inner = items[index];
         const title = evaluateText(source.compiled, 'ruleToc.chapterName', inner);
@@ -416,7 +452,8 @@ export async function engineFetchContent(
     // text/ownText/textNodes（或不写后缀，字段层默认按 @text 求值，evaluate.ts:220）时
     // 逐字节透传；@html / JSON 路径 / 模板 / 混合 || 分支一律转换，含实体解码。
     // evaluateText 的 @html 语义不变，简介等其它字段不受影响。
-    const raw = evaluateText(source.compiled, 'ruleContent.content', scope, true);
+    // fieldnet1029：content 的 java.ajax 页面取回后重放（正文作用域不带袋，重放沿用同一份）。
+    const raw = await withFieldNetPages(context, () => evaluateText(source.compiled, 'ruleContent.content', scope, true));
     const content = convertContent ? contentHtmlToText(raw) : raw;
     if (strict && !content.trim()) throw new Error('empty_content_page');
     // 阻止验证码/改版空后页把半章送入成功缓存；调用方据此走既有章节换源流程。

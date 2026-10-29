@@ -28,7 +28,7 @@ import {
   engineSyntaxAioEnabled, engineSyntaxAndEnabled, engineSyntaxJsBindEnabled, engineSyntaxJsEnabled, engineSyntaxJsExtEnabled,
   engineSyntaxJsGetEnabled, engineSyntaxJsonPathEnabled, engineSyntaxJsUtilEnabled, engineSyntaxListJsEnabled, engineSyntaxOrEnabled,
   engineSyntaxRegexEnabled, engineSyntaxXPathEnabled, engineSyntaxXPathEvalEnabled, engineInitJsActive, engineSyntaxJsoupEnabled,
-  engineSyntaxBookFieldsEnabled, engineSyntaxListGetEnabled, engineSyntaxInitJsoupEnabled,
+  engineSyntaxBookFieldsEnabled, engineSyntaxListGetEnabled, engineSyntaxInitJsoupEnabled, engineFieldNetJsEnabled,
 } from './syntax-flags';
 import { compileXPath, XPathSyntaxError } from './xpath-eval';
 import { looksLikeXPath, xpathPrefixed, xpathSegmentBody, xpathToCss } from './xpath-subset';
@@ -55,11 +55,20 @@ let varBag: VarBagParse | undefined;
  * 当前 parseFieldRule 帧的 jsoup 直连重试（jsoup1028，ParseOptions.jsoupEnabled）：off 态口径编译被拒的字段才在这一帧里重编，
  * 帧内放行 `java.getElement(s)("规则")`（实参编进 elements）、`org.jsoup.Jsoup.parse`、条目级 `result`/`src`、列表链首段规则。
  * 嵌套解析不继承。`options` = 实参规则的编译开关（不含 JS）。`init`（initjsoup1028）= 帧所在字段是 `ruleBookInfo.init`。
+ * `net`（fieldnet1029，ParseOptions.fieldNetJsEnabled）= 帧内另放行 `java.ajax`，用到即记 `used`（字段标 FieldIr.jsAjax）。
  */
-let jsoupFrame: { elements: Map<string, FieldIr>; options: ParseOptions; init?: boolean } | undefined;
+let jsoupFrame: { elements: Map<string, FieldIr>; options: ParseOptions; init?: boolean; net?: { used: boolean } } | undefined;
 
 /** 当前 parseFieldRule 帧是否按 objkey1029 认对象字面量键（JS 与 ENGINE_SYNTAX_JS_BIND 同开，见 objectKeyAt）。 */
 let jsObjectKeys = false;
+
+/**
+ * fieldnet1029：可放行 `java.ajax` 的字段——页面级、取书链路必需的那几个（每页求值一次，取页次数有界）。条目级字段（如
+ * lastChapter）逐条联网会把请求预算吃光，装饰字段丢了不影响取书，都不收（照旧拒）。
+ */
+export const FIELD_NET_FIELDS: ReadonlySet<string> = new Set([
+  'ruleSearch.bookList', 'ruleBookInfo.init', 'ruleBookInfo.tocUrl', 'ruleToc.chapterList', 'ruleContent.content',
+]);
 
 /**
  * 当前 parseFieldRule 帧的书籍成员重试（book1028，ParseOptions.bookFieldsEnabled）：off 态口径编译被拒的字段才在这一帧里重编，
@@ -644,6 +653,11 @@ export interface ParseOptions {
    */
   initJsoupEnabled?: boolean;
   /**
+   * 字段联网 JS（ENGINE_FIELD_NET_JS，fieldnet1029；须 jsoupEnabled）：jsoup 重编帧里放行 `java.ajax`（Rhino 里返回 Java String，
+   * 只有 jsoup 包装帧复现得了），用到的字段标 FieldIr.jsAjax。off 态与非 jsoup 帧照旧拒。默认读 env（缺失=off）。
+   */
+  fieldNetJsEnabled?: boolean;
+  /**
    * JS 读 `book` 的书籍成员（ENGINE_SYNTAX_BOOK_FIELDS，book1028；须 jsEnabled 与 jsBindEnabled）：字段按 off 态口径（及 jsoup
    * 重试）编译被拒时，再在 bookFrame 里重编，通过的字段标 FieldIr.bookMembers。`ruleBookInfo.canReName` 非空的源由 compile.ts
    * 传 false。默认读 env（缺失=off）。
@@ -723,7 +737,10 @@ function parseFieldRuleFramed(rule: string, options: ParseOptions): FieldIr {
     for (const attempt of attempts) {
       restoreBag();
       const frame = attempt.jsoup
-        ? { elements: new Map<string, FieldIr>(), options: jsSegmentOptions(options), init: options.field === 'ruleBookInfo.init' }
+        ? {
+          elements: new Map<string, FieldIr>(), options: jsSegmentOptions(options), init: options.field === 'ruleBookInfo.init',
+          ...((options.fieldNetJsEnabled ?? engineFieldNetJsEnabled()) && FIELD_NET_FIELDS.has(options.field ?? '') ? { net: { used: false } } : {}),
+        }
         : undefined;
       const puts = attempt.jsoup ? options.bookVariablePuts : undefined;
       const book = attempt.book && members ? { members, used: new Set<string>(), puts, vars: new Set<string>() } : undefined;
@@ -740,6 +757,7 @@ function parseFieldRuleFramed(rule: string, options: ParseOptions): FieldIr {
       if (frame) {
         field.jsoup = true;
         if (frame.elements.size > 0) field.jsElements = frame.elements;
+        if (frame.net?.used) field.jsAjax = true;
       }
       if (book && book.used.size > 0) field.bookMembers = [...book.used].sort();
       if (book && book.vars.size > 0) field.bookVars = [...book.vars].sort();
@@ -1438,6 +1456,11 @@ function checkJsCode(
     if (member && util && JS_JAVA_UTIL_HELPERS.has(member[1])) {
       if (member[1] === 't2s') checkT2sCall(bare, match.index, match.index + name.length + member[0].length, util, reject);
       util.used = true;
+      continue;
+    }
+    // fieldnet1029：jsoup 联网帧里 java.ajax 由宿主回调应答（evaluate.ts fieldNetCallbacks），返回 Java 字符串（jsoup-shim 包装）。
+    if (member?.[1] === 'ajax' && frame?.net) {
+      frame.net.used = true;
       continue;
     }
     if (!member || !JS_JAVA_HELPERS.has(member[1])) reject(`用了沙箱不提供的 java.${member?.[1] ?? '[…]'}`);

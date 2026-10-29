@@ -269,6 +269,11 @@ export interface FieldIr {
    * 未挂 = 旧链路逐字不变。
    */
   jsoup?: true;
+  /**
+   * jsoup 重编帧里用到了 `java.ajax`（fieldnet1029，ENGINE_FIELD_NET_JS）：求值期只给这样的字段装 ajax 回调，页面由宿主按
+   * evaluate.ts withFieldNet 的缓存应答，未取到即抛 FieldNetMissError（门面/准入取页后重放）。未挂 = 旧链路逐字不变。
+   */
+  jsAjax?: true;
   /** `java.getElement(s)("规则")` 的实参白名单（jsoup1028）：字面量规则文本 → 编译结果（不含 JS，须是取节点的规则）。 */
   jsElements?: ReadonlyMap<string, FieldIr>;
   /**
