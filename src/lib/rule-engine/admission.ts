@@ -698,8 +698,39 @@ async function admissionFetch(
   }
 }
 
+/**
+ * errcause1030：undici 网络错误的 message 恒为 `fetch failed`，真因只在 cause 链上（ENOTFOUND/ECONNREFUSED/
+ * ECONNRESET/UND_ERR_CONNECT_TIMEOUT/证书类 code 等）。2026-10-30 生产 conn_fail 中 641 行只剩 `fetch failed`，无从归因。
+ * ENGINE_ADMISSION_ERROR_CAUSE 开时把 cause 链上首个 code 附在记录文本末尾（`fetch failed (ENOTFOUND)`）；
+ * 只改 error 文本的尾部，verdict、失败计数前缀、退避窗口与熔断判据都不读这段，口径不变。
+ */
+export function admissionErrorCauseEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env.ENGINE_ADMISSION_ERROR_CAUSE === '1' || env.ENGINE_ADMISSION_ERROR_CAUSE === 'true';
+}
+
+const ERROR_CAUSE_CODE = /^[A-Z][A-Z0-9_]{1,39}$/;
+
+/** cause 链（含 AggregateError.errors，Happy Eyeballs 多地址连接失败时出现）上首个形如错误码的 code；只取码，不取 message。 */
+export function errorCauseCode(error: unknown): string | undefined {
+  let current: unknown = error instanceof Error ? error.cause : undefined;
+  for (let depth = 0; current && typeof current === 'object' && depth < 4; depth += 1) {
+    const { code, errors, cause } = current as { code?: unknown; errors?: unknown; cause?: unknown };
+    if (typeof code === 'string' && ERROR_CAUSE_CODE.test(code)) return code;
+    if (Array.isArray(errors)) {
+      for (const item of errors) {
+        const itemCode = (item as { code?: unknown } | null)?.code;
+        if (typeof itemCode === 'string' && ERROR_CAUSE_CODE.test(itemCode)) return itemCode;
+      }
+    }
+    current = cause;
+  }
+  return undefined;
+}
+
 function errorMessage(error: unknown): string {
-  return (error instanceof Error ? error.message : String(error)).slice(0, 200);
+  const message = error instanceof Error ? error.message : String(error);
+  const code = admissionErrorCauseEnabled() ? errorCauseCode(error) : undefined;
+  return (code ? `${message} (${code})` : message).slice(0, 200);
 }
 
 /** 准入主关键词：legado 标准位置是嵌套 ruleSearch.checkKeyWord（DB 995 源顶层无此字段）；
