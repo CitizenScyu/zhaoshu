@@ -180,6 +180,15 @@ export function runStep($: CheerioAPI, scope: CheerioNodes, step: CssStep): Chee
   } catch {
     return evalFailed(`选择器无法求值：${step.selector}`, step.selector);
   }
+  // selfmatch1029：legado Jsoup select/getElementsBy* 含上下文自身；子孙全不中时结果正是自身匹配者。
+  // filter 不认的选择器（如 `> a` 这类相对写法）保持子孙口径的空集，不把原来的「取空」变成求值失败。
+  if (step.selfFallback && nodes.length === 0) {
+    try {
+      nodes = scope.filter(step.selector);
+    } catch {
+      // 保持空集
+    }
+  }
   if (step.ownTextContains !== undefined) {
     const keyword = step.ownTextContains;
     nodes = nodes.filter((_index, node) => ownTextOf(node).includes(keyword));

@@ -51,6 +51,8 @@ export interface CssStep {
    * 项按书写顺序，单个下标或 `[start, end, step]` 闭区间（端点 null = 省略）。
    */
   indexSet?: { exclude: boolean; items: CssIndexItem[] };
+  /** selfmatch1029：子孙一个不中时改取上下文自身匹配的节点（legado Jsoup 选择含自身，ENGINE_SYNTAX_SELF_MATCH on 才产出）。 */
+  selfFallback?: true;
 }
 
 /** bracket1029：索引集的一项。 */

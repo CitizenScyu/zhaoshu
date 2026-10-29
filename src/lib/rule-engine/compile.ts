@@ -25,7 +25,7 @@ import {
   engineSyntaxBookFieldsEnabled, engineSyntaxSearchVarsEnabled, engineSyntaxItemVarsEnabled, engineSyntaxListGetEnabled, ENGINE_SEMANTICS_VERSION,
   engineSyntaxBookVariableEnabled, engineSyntaxJsLibEnabled, engineSyntaxSourceBindEnabled, engineSyntaxInitJsoupEnabled, engineSearchNetJsEnabled,
   engineFieldNetJsEnabled, engineSearchConnectJsEnabled, engineSearchGetPostJsEnabled, engineSyntaxLastAttrEnabled,
-  engineSyntaxRulePrefixEnabled, engineSyntaxTemplateHashEnabled, engineSyntaxBracketIndexEnabled,
+  engineSyntaxRulePrefixEnabled, engineSyntaxTemplateHashEnabled, engineSyntaxBracketIndexEnabled, engineSyntaxSelfMatchEnabled,
 } from './syntax-flags';
 import { urlOptionFields } from './url-options';
 import {
@@ -137,6 +137,8 @@ export function engineVersionedKey(contentRevision: string, semanticsVersion = E
  * （sourceUsesTemplateHashSyntax）时再加模板内 ## 位（+137438953472）；其余字段同上不计位。
  * bracket1029：ENGINE_SYNTAX_BRACKET_INDEX on 且准入搜索判定读的 ruleSearch.bookList/name/author/bookUrl 里可能有 legado `[…]` 索引段
  * （sourceUsesBracketIndexSyntax）时再加 [索引] 位（+274877906944）；其余字段同上不计位。
+ * selfmatch1029：ENGINE_SYNTAX_SELF_MATCH on 且准入搜索判定读的 ruleSearch.name/author/bookUrl 首段可能命中 bookList 条目自身
+ * （sourceUsesSelfMatchSyntax）时再加选择器含自身位（+549755813888）；其余字段同上不计位。
  */
 export function engineSourceRevision(
   source: { url: string; searchUrl: unknown; rules: Record<string, unknown> },
@@ -298,6 +300,7 @@ export function engineSourceRevision(
     (options.rulePrefixEnabled ?? engineSyntaxRulePrefixEnabled()) && sourceUsesRulePrefixSyntax(rules),
     (options.templateHashEnabled ?? engineSyntaxTemplateHashEnabled()) && sourceUsesTemplateHashSyntax(rules),
     (options.bracketIndexEnabled ?? engineSyntaxBracketIndexEnabled()) && sourceUsesBracketIndexSyntax(rules),
+    (options.selfMatchEnabled ?? engineSyntaxSelfMatchEnabled()) && sourceUsesSelfMatchSyntax(rules),
   ));
 }
 
@@ -365,6 +368,48 @@ export function sourceUsesBracketIndexSyntax(rules: Record<string, unknown>): bo
   return ['bookList', 'name', 'author', 'bookUrl'].some((key) => {
     const rule = (search as Record<string, unknown>)[key];
     return typeof rule === 'string' && ruleMayUseBracketIndex(rule);
+  });
+}
+
+/** selfmatch1029 判据不看的支：JS / 模板 / JSONPath / XPath / AllInOne（这些支不走 buildCssChain 或不在条目元素上选）。 */
+const SELF_MATCH_SKIP = /@js:|<js>|\{\{|^\s*(?:\$|@json:|@xpath:|\/|:)/i;
+
+/** selfmatch1029：段归一成可比的 CSS 形（剥 `@css:` 与下标/排除/`[…]` 尾缀，`tag.`/`class.`/`id.` 与 `tag[class=x]` 译成 CSS 写法）。 */
+function selfMatchKey(segment: string): string {
+  let key = segment.trim().replace(/^@?css:/i, '').trim().replace(/\[!?[-\d,:\s]*\]$/, '').replace(/(?:\.-?\d+(?::-?\d+)?|![-\d:]+)$/, '');
+  key = key.replace(/^tag\./, '').replace(/^class\.(\S+(?: \S+)*)$/, (_m, names: string) => `.${names.split(' ').join('.')}`).replace(/^id\./, '#');
+  return key.replace(/^([a-z0-9]+)\[class="?([\w-]+)"?\]$/i, '$1.$2').replace(/\s+/g, ' ');
+}
+
+/** selfmatch1029：一条规则各支（`||`/`&&` 切，先剥 `##` 尾缀）的首段或末段归一键；`@css:` 支整串即一段（末端 `@操作` 剥掉）。 */
+function selfMatchKeys(rule: string, end: 'first' | 'last'): string[] {
+  return rule.split(/\|\||&&/).filter((branch) => branch.trim() !== '' && !SELF_MATCH_SKIP.test(branch)).map((branch) => {
+    const body = branch.split('##')[0].trim();
+    if (/^@css:/i.test(body)) {
+      const at = body.lastIndexOf('@');
+      return selfMatchKey(at > 0 ? body.slice(0, at) : body);
+    }
+    const segments = body.split('@');
+    return selfMatchKey(end === 'first' ? segments[0] : segments[segments.length - 1]);
+  }).filter((key) => key !== '' && !/^(?:text|children|html|href|src)$/.test(key));
+}
+
+/**
+ * 准入搜索判定读的 ruleSearch.name/author/bookUrl 里是否可能有 selfmatch1029 改结果的首段（理由同 sourceUsesOrSyntax）：某支首段
+ * 归一后等于 bookList 某支末段，或是末段复合选择器里的一个简单选择器（`li` / `.x` / `#y` 对 `li.x#y`）——这类首段可能命中条目自身。
+ * 判据只看列表末段与字段首段，链内前后段同型（如 `div@div`）不计位；漏判只让准入沿用旧判定，运行时求值不受影响。
+ */
+export function sourceUsesSelfMatchSyntax(rules: Record<string, unknown>): boolean {
+  const search = rules.ruleSearch;
+  if (!search || typeof search !== 'object' || Array.isArray(search)) return false;
+  const fields = search as Record<string, unknown>;
+  if (typeof fields.bookList !== 'string') return false;
+  const ends = selfMatchKeys(fields.bookList, 'last');
+  if (ends.length === 0) return false;
+  const parts = new Set(ends.flatMap((key) => key.match(/^[a-z][a-z0-9]*|[.#][\w-]+/gi) ?? []));
+  return ['name', 'author', 'bookUrl'].some((key) => {
+    const rule = fields[key];
+    return typeof rule === 'string' && selfMatchKeys(rule, 'first').some((head) => ends.includes(head) || parts.has(head));
   });
 }
 

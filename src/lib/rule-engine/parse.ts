@@ -31,7 +31,7 @@ import {
   engineSyntaxRegexEnabled, engineSyntaxXPathEnabled, engineSyntaxXPathEvalEnabled, engineInitJsActive, engineSyntaxJsoupEnabled,
   engineSyntaxBookFieldsEnabled, engineSyntaxListGetEnabled, engineSyntaxInitJsoupEnabled, engineFieldNetJsEnabled,
   engineSyntaxNullSkipEnabled, engineSyntaxPageDetachedEnabled, engineSyntaxLastAttrEnabled, engineSyntaxNextListEnabled,
-  engineSyntaxRulePrefixEnabled, engineSyntaxTemplateHashEnabled, engineSyntaxBracketIndexEnabled,
+  engineSyntaxRulePrefixEnabled, engineSyntaxTemplateHashEnabled, engineSyntaxBracketIndexEnabled, engineSyntaxSelfMatchEnabled,
 } from './syntax-flags';
 import { compileXPath, XPathSyntaxError } from './xpath-eval';
 import { looksLikeXPath, xpathPrefixed, xpathSegmentBody, xpathToCss } from './xpath-subset';
@@ -79,6 +79,11 @@ let lastAttrHits = 0;
  */
 let bracketIndex = false;
 
+/**
+ * 当前 parseFieldRule 帧是否给 CSS 步挂 selfmatch1029 的自身回退（ParseOptions.selfMatchEnabled，见 CssStep.selfFallback）。
+ * 嵌套解析经选项透传同口径。
+ */
+let selfMatch = false;
 /**
  * fieldnet1029：可放行 `java.ajax` 的字段——页面级、取书链路必需的那几个（每页求值一次，取页次数有界）。条目级字段（如
  * lastChapter）逐条联网会把请求预算吃光，装饰字段丢了不影响取书，都不收（照旧拒）。
@@ -641,6 +646,7 @@ function buildCssChain(body: string, rule: string, explicit: boolean): RuleIr {
   // 裸 @op（如 chapterName=`@text`、chapterUrl=`@href`，book15 自身即此形态）：
   // 对当前 scope 节点集直接套末端操作，chain 合法为空。仅「既无选择器又无 terminal」才是空规则。
   if (chain.length === 0 && !terminal) unsupported('空选择器', rule, { code: 'empty_selector' });
+  if (selfMatch) for (const step of chain) step.selfFallback = true;
   return { kind: 'css', chain, terminal };
 }
 
@@ -913,6 +919,10 @@ export interface ParseOptions {
    * bracket1029：默认语法段末 legado `[…]` 索引（ENGINE_SYNTAX_BRACKET_INDEX，见 legadoIndexSet）。默认读 env（缺失=off）。
    */
   bracketIndexEnabled?: boolean;
+  /**
+   * selfmatch1029：CSS 步子孙不中时取上下文自身匹配者（ENGINE_SYNTAX_SELF_MATCH，legado Jsoup 选择含自身）。默认读 env（缺失=off）。
+   */
+  selfMatchEnabled?: boolean;
 }
 
 /**
@@ -937,10 +947,12 @@ function parseFieldRuleFramed(rule: string, options: ParseOptions): FieldIr {
   const savedKeys = jsObjectKeys;
   const savedLastAttr = lastAttr;
   const savedBracket = bracketIndex;
+  const savedSelf = selfMatch;
   jsonPathExt = options.jsonPathEnabled ?? engineSyntaxJsonPathEnabled();
   jsObjectKeys = bindActive(options);
   lastAttr = lastAttrActive(options);
   bracketIndex = options.bracketIndexEnabled ?? engineSyntaxBracketIndexEnabled();
+  selfMatch = options.selfMatchEnabled ?? engineSyntaxSelfMatchEnabled();
   sourceFrame = options.sourceConsts ?? sourceFrame;
   varBag = options.varBag;
   jsoupFrame = undefined;
@@ -1008,6 +1020,7 @@ function parseFieldRuleFramed(rule: string, options: ParseOptions): FieldIr {
     jsObjectKeys = savedKeys;
     lastAttr = savedLastAttr;
     bracketIndex = savedBracket;
+    selfMatch = savedSelf;
   }
 }
 
@@ -1038,6 +1051,7 @@ function jsSegmentOptions(options: ParseOptions): ParseOptions {
     orEnabled: options.orEnabled, xpathEnabled: options.xpathEnabled, xpathEvalEnabled: options.xpathEvalEnabled, jsEnabled: false,
     regexEnabled: options.regexEnabled ?? engineSyntaxRegexEnabled(), jsonPathEnabled: options.jsonPathEnabled,
     rulePrefixEnabled: options.rulePrefixEnabled, bracketIndexEnabled: options.bracketIndexEnabled,
+    selfMatchEnabled: options.selfMatchEnabled,
   };
 }
 
@@ -1383,6 +1397,7 @@ function parseJsChain(trimmed: string, rule: string, options: ParseOptions): Fie
     orEnabled: options.orEnabled, xpathEnabled: options.xpathEnabled, xpathEvalEnabled: options.xpathEvalEnabled, jsEnabled: false,
     regexEnabled, jsonPathEnabled: options.jsonPathEnabled, rulePrefixEnabled: options.rulePrefixEnabled,
     bracketIndexEnabled: options.bracketIndexEnabled,
+    selfMatchEnabled: options.selfMatchEnabled,
   };
   const gets: JsGets | undefined = (options.jsGetEnabled ?? engineSyntaxJsGetEnabled())
     ? { options: segmentOptions, out: new Map(), aliases: initJs } : undefined;
@@ -1485,6 +1500,7 @@ function parseListJsChain(rule: string, options: ParseOptions): FieldIr {
         orEnabled: options.orEnabled, xpathEnabled: options.xpathEnabled, xpathEvalEnabled: options.xpathEvalEnabled, jsEnabled: false,
         regexEnabled: options.regexEnabled ?? engineSyntaxRegexEnabled(), jsonPathEnabled: options.jsonPathEnabled,
         rulePrefixEnabled: options.rulePrefixEnabled, bracketIndexEnabled: options.bracketIndexEnabled,
+        selfMatchEnabled: options.selfMatchEnabled,
       },
       out: new Map(),
     }
