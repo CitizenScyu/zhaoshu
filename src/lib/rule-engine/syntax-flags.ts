@@ -23,7 +23,7 @@ export const ENGINE_SEMANTICS_XPATH_BIT = 2;
 /** vars1027：@put/@get 静态子集语义位。版本再 +4（5–8 = 含变量位的四种组合），1–4 逐字不变。 */
 export const ENGINE_SEMANTICS_VARS_BIT = 4;
 
-/** 语义版本随 || / XPath / 变量 / JS / XPath 求值 / 正则 / && / AllInOne / 搜索 JS / 列表 JS / JS 扩展 / 宿主绑定 / java.getString / 加解密帮手 / JSONPath 扩展 / 详情 init / 搜索选项 legado 口径 / URL 字段选项 / 搜索 webView / 详情 JS init / 详情→目录变量袋 / jsoup 直连 / 书籍成员 / 搜索 URL→搜索字段变量袋 / 搜索条目袋 / 列表 JS getter / 书籍变量 / jsLib / 书源常量 / jsoup JS init / 搜索联网 JS / 字段联网 JS / 搜索 java.connect / 搜索 java.get·post / 末段裸名属性 / 规则前缀大小写 / 模板内 ## / [索引] / 选择器含自身 开关联动（唯一口径，供 compile.ts 缓存键与 rulesHash 复用）。 */
+/** 语义版本随 || / XPath / 变量 / JS / XPath 求值 / 正则 / && / AllInOne / 搜索 JS / 列表 JS / JS 扩展 / 宿主绑定 / java.getString / 加解密帮手 / JSONPath 扩展 / 详情 init / 搜索选项 legado 口径 / URL 字段选项 / 搜索 webView / 详情 JS init / 详情→目录变量袋 / jsoup 直连 / 书籍成员 / 搜索 URL→搜索字段变量袋 / 搜索条目袋 / 列表 JS getter / 书籍变量 / jsLib / 书源常量 / jsoup JS init / 搜索联网 JS / 字段联网 JS / 搜索 java.connect / 搜索 java.get·post / 末段裸名属性 / 规则前缀大小写 / 模板内 ## / [索引] / 选择器含自身 / 单段裸名属性 开关联动（唯一口径，供 compile.ts 缓存键与 rulesHash 复用）。 */
 export function engineSemanticsVersion(
   orEnabled: boolean, xpathEnabled = false, varsEnabled = false, jsEnabled = false, xpathEvalEnabled = false,
   regexEnabled = false, andEnabled = false, aioEnabled = false, searchJsEnabled = false, listJsEnabled = false,
@@ -33,7 +33,7 @@ export function engineSemanticsVersion(
   listGetEnabled = false, bookVariableEnabled = false, jsLibEnabled = false, sourceBindEnabled = false, initJsoupEnabled = false,
   searchNetJsEnabled = false, fieldNetJsEnabled = false, searchConnectJsEnabled = false, searchGetPostJsEnabled = false,
   lastAttrEnabled = false, rulePrefixEnabled = false, templateHashEnabled = false, bracketIndexEnabled = false,
-  selfMatchEnabled = false,
+  selfMatchEnabled = false, bareAttrEnabled = false,
 ): number {
   return (orEnabled ? ENGINE_SEMANTICS_VERSION_OR : ENGINE_SEMANTICS_VERSION)
     + (xpathEnabled ? ENGINE_SEMANTICS_XPATH_BIT : 0) + (varsEnabled ? ENGINE_SEMANTICS_VARS_BIT : 0)
@@ -55,7 +55,7 @@ export function engineSemanticsVersion(
     + (searchGetPostJsEnabled ? ENGINE_SEMANTICS_SEARCH_GETPOST_JS_BIT : 0)
     + (lastAttrEnabled ? ENGINE_SEMANTICS_LAST_ATTR_BIT : 0) + (rulePrefixEnabled ? ENGINE_SEMANTICS_RULE_PREFIX_BIT : 0)
     + (templateHashEnabled ? ENGINE_SEMANTICS_TEMPLATE_HASH_BIT : 0) + (bracketIndexEnabled ? ENGINE_SEMANTICS_BRACKET_INDEX_BIT : 0)
-    + (selfMatchEnabled ? ENGINE_SEMANTICS_SELF_MATCH_BIT : 0);
+    + (selfMatchEnabled ? ENGINE_SEMANTICS_SELF_MATCH_BIT : 0) + (bareAttrEnabled ? ENGINE_SEMANTICS_BARE_ATTR_BIT : 0);
 }
 
 /**
@@ -758,5 +758,22 @@ export const ENGINE_SEMANTICS_SELF_MATCH_BIT = 549755813888;
  */
 export function engineSyntaxSelfMatchEnabled(env: OrEnv = process.env): boolean {
   const raw = env.ENGINE_SYNTAX_SELF_MATCH?.trim().toLowerCase();
+  return raw === '1' || raw === 'true' || raw === 'on';
+}
+
+/**
+ * bareattr1029：单段裸名属性语义位。版本再 +1099511627776（1–1099511627775 逐字不变，bigint 列）。只对 ENGINE_SYNTAX_BARE_ATTR on、
+ * 准入搜索 name/author/bookUrl 某支整条是单段裸名、bookList 不是 JSONPath（compile.ts sourceUsesBareAttrSyntax，静态近似）的源计入。
+ */
+export const ENGINE_SEMANTICS_BARE_ATTR_BIT = 1099511627776;
+
+/**
+ * ENGINE_SYNTAX_BARE_ATTR 独立开关（bareattr1029，默认 off，口径同 ENGINE_SYNTAX_OR）。legado getString 对单段规则 `onclick` 走
+ * getResultList：节点集 = [上下文自身]、末段 = `onclick`，关键字之外一律 `attr(onclick)`；引擎把它当子孙选择器 `<onclick>`，取空。
+ * on = 字符串字段（parse.ts BARE_ATTR_FIELDS）的单段裸名（非标签名/终端关键字）在 HTML 上选不到节点时改取上下文自身的同名属性
+ * （选得到的照旧，JSON 输入照旧按键取）。off = 逐字不变。
+ */
+export function engineSyntaxBareAttrEnabled(env: OrEnv = process.env): boolean {
+  const raw = env.ENGINE_SYNTAX_BARE_ATTR?.trim().toLowerCase();
   return raw === '1' || raw === 'true' || raw === 'on';
 }

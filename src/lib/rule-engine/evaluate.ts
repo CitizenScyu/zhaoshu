@@ -189,6 +189,10 @@ export function evaluateRule(ir: RuleIr, scope: EvalScope, multi = false): EvalR
         return { kind: 'text', value: jsonModeString(ir, scope.json) };
       }
       const result = evaluateCssChain(scope.$, scope.nodes, ir.chain, ir.terminal, scope.pageUrl, multi);
+      // bareattr1029：单段裸名选不到节点 ⇒ legado 口径取上下文自身的同名属性（parse.ts buildCssChain 只给字符串字段挂）。
+      if (ir.bareAttr !== undefined && typeof result !== 'string' && result.length === 0) {
+        return { kind: 'text', value: evaluateCssChain(scope.$, scope.nodes, [], { op: 'attr', name: ir.bareAttr }, scope.pageUrl, multi) as string };
+      }
       return typeof result === 'string' ? { kind: 'text', value: result } : { kind: 'nodes', nodes: result };
     }
     case 'jsonpath': {

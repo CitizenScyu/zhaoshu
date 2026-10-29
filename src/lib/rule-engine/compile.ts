@@ -13,7 +13,8 @@ import { engineSearchJsActive, engineSearchOptionsActive } from './compile-smoke
 import { AIO_LIST_FIELDS, aioGroups } from './aio-syntax';
 import {
   FIELD_NET_FIELDS, initFieldSupported, initJsFieldSupported, initRuleTextSupported, jsChainFieldAllowed, listJsGroups, objectKeyOf, parseFieldRule,
-  ruleHasJs, ruleHashInTemplate, ruleMayUseBracketIndex, ruleMayUseLastAttr, ruleMayUseRulePrefix, type ParseOptions, type SourceConsts,
+  ruleHasJs, ruleHashInTemplate, ruleMayUseBareAttr, ruleMayUseBracketIndex, ruleMayUseLastAttr, ruleMayUseRulePrefix, type ParseOptions,
+  type SourceConsts,
 } from './parse';
 import type { CompiledRules, FieldIr, RuleIr } from './types';
 import { analyzeJsLib, jsLibRuleProblem, type JsLib } from './js-lib';
@@ -26,6 +27,7 @@ import {
   engineSyntaxBookVariableEnabled, engineSyntaxJsLibEnabled, engineSyntaxSourceBindEnabled, engineSyntaxInitJsoupEnabled, engineSearchNetJsEnabled,
   engineFieldNetJsEnabled, engineSearchConnectJsEnabled, engineSearchGetPostJsEnabled, engineSyntaxLastAttrEnabled,
   engineSyntaxRulePrefixEnabled, engineSyntaxTemplateHashEnabled, engineSyntaxBracketIndexEnabled, engineSyntaxSelfMatchEnabled,
+  engineSyntaxBareAttrEnabled,
 } from './syntax-flags';
 import { urlOptionFields } from './url-options';
 import {
@@ -139,6 +141,8 @@ export function engineVersionedKey(contentRevision: string, semanticsVersion = E
  * （sourceUsesBracketIndexSyntax）时再加 [索引] 位（+274877906944）；其余字段同上不计位。
  * selfmatch1029：ENGINE_SYNTAX_SELF_MATCH on 且准入搜索判定读的 ruleSearch.name/author/bookUrl 首段可能命中 bookList 条目自身
  * （sourceUsesSelfMatchSyntax）时再加选择器含自身位（+549755813888）；其余字段同上不计位。
+ * bareattr1029：ENGINE_SYNTAX_BARE_ATTR on 且准入搜索判定读的 ruleSearch.name/author/bookUrl 某支是单段裸名、bookList 不是 JSONPath
+ * （sourceUsesBareAttrSyntax）时再加单段裸名属性位（+1099511627776）；其余字段同上不计位。
  */
 export function engineSourceRevision(
   source: { url: string; searchUrl: unknown; rules: Record<string, unknown> },
@@ -301,6 +305,7 @@ export function engineSourceRevision(
     (options.templateHashEnabled ?? engineSyntaxTemplateHashEnabled()) && sourceUsesTemplateHashSyntax(rules),
     (options.bracketIndexEnabled ?? engineSyntaxBracketIndexEnabled()) && sourceUsesBracketIndexSyntax(rules),
     (options.selfMatchEnabled ?? engineSyntaxSelfMatchEnabled()) && sourceUsesSelfMatchSyntax(rules),
+    (options.bareAttrEnabled ?? engineSyntaxBareAttrEnabled()) && sourceUsesBareAttrSyntax(rules),
   ));
 }
 
@@ -410,6 +415,21 @@ export function sourceUsesSelfMatchSyntax(rules: Record<string, unknown>): boole
   return ['name', 'author', 'bookUrl'].some((key) => {
     const rule = fields[key];
     return typeof rule === 'string' && selfMatchKeys(rule, 'first').some((head) => ends.includes(head) || parts.has(head));
+  });
+}
+
+/**
+ * 准入搜索判定读的 ruleSearch.name/author/bookUrl 里是否可能有 bareattr1029 挂回退的单段裸名（口径见 parse.ts ruleMayUseBareAttr；
+ * 理由同 sourceUsesOrSyntax）。bookList 是 JSONPath（`$`/`@json:` 起头）时条目全是 JSON、裸名照旧按键取，不计位。
+ */
+export function sourceUsesBareAttrSyntax(rules: Record<string, unknown>): boolean {
+  const search = rules.ruleSearch;
+  if (!search || typeof search !== 'object' || Array.isArray(search)) return false;
+  const fields = search as Record<string, unknown>;
+  if (typeof fields.bookList === 'string' && /^\s*(?:\$|@json:)/i.test(fields.bookList)) return false;
+  return ['name', 'author', 'bookUrl'].some((key) => {
+    const rule = fields[key];
+    return typeof rule === 'string' && ruleMayUseBareAttr(rule);
   });
 }
 

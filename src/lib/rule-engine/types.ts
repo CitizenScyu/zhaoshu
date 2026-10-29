@@ -119,8 +119,8 @@ export interface JsonPathIr {
 
 /** 一条规则编译后的中间表示。 */
 export type RuleIr =
-  // 默认语法与 @css:/css: 统一到 CSS 选择器链
-  | { kind: 'css'; chain: CssStep[]; terminal?: TerminalOp }
+  // 默认语法与 @css:/css: 统一到 CSS 选择器链。bareAttr（bareattr1029）：单段裸名规则在 HTML 上选不到节点时改取上下文自身的该属性。
+  | { kind: 'css'; chain: CssStep[]; terminal?: TerminalOp; bareAttr?: string }
   // $.x / $..x / [*] / [n] / [a:b] / [?(==)]
   | { kind: 'jsonpath'; path: JsonPathIr }
   // 含 {{$.x}} jsonpath 占位的字面模板（tpl_jsonpath，如 bookUrl 拼接 URL）；

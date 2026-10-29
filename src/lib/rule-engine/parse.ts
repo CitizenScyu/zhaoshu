@@ -32,6 +32,7 @@ import {
   engineSyntaxBookFieldsEnabled, engineSyntaxListGetEnabled, engineSyntaxInitJsoupEnabled, engineFieldNetJsEnabled,
   engineSyntaxNullSkipEnabled, engineSyntaxPageDetachedEnabled, engineSyntaxLastAttrEnabled, engineSyntaxNextListEnabled,
   engineSyntaxRulePrefixEnabled, engineSyntaxTemplateHashEnabled, engineSyntaxBracketIndexEnabled, engineSyntaxSelfMatchEnabled,
+  engineSyntaxBareAttrEnabled,
 } from './syntax-flags';
 import { compileXPath, XPathSyntaxError } from './xpath-eval';
 import { looksLikeXPath, xpathPrefixed, xpathSegmentBody, xpathToCss } from './xpath-subset';
@@ -84,6 +85,11 @@ let bracketIndex = false;
  * 嵌套解析经选项透传同口径。
  */
 let selfMatch = false;
+/**
+ * 当前 parseFieldRule 帧的单段裸名口径（bareattr1029，ParseOptions.bareAttrEnabled，只在 BARE_ATTR_FIELDS 上开）：见 bareAttrToken。
+ * 嵌套解析（JS 链规则段、`{{规则}}`、getter 实参）不带字段名，不继承。
+ */
+let bareAttr = false;
 /**
  * fieldnet1029：可放行 `java.ajax` 的字段——页面级、取书链路必需的那几个（每页求值一次，取页次数有界）。条目级字段（如
  * lastChapter）逐条联网会把请求预算吃光，装饰字段丢了不影响取书，都不收（照旧拒）。
@@ -647,6 +653,11 @@ function buildCssChain(body: string, rule: string, explicit: boolean): RuleIr {
   // 对当前 scope 节点集直接套末端操作，chain 合法为空。仅「既无选择器又无 terminal」才是空规则。
   if (chain.length === 0 && !terminal) unsupported('空选择器', rule, { code: 'empty_selector' });
   if (selfMatch) for (const step of chain) step.selfFallback = true;
+  // bareattr1029：legado getString 对单段规则走 getResultList（节点集 = [上下文自身]，唯一段即 lastRule ⇒ attr）。只挂回退名，
+  // 选择器照旧先选（选得到的在池源不动），求值见 evaluate.ts evaluateRule。
+  if (bareAttr && !explicit && atParts.length === 1 && terminal === undefined && bareAttrToken(atParts[0].trim())) {
+    return { kind: 'css', chain, terminal, bareAttr: atParts[0].trim() };
+  }
   return { kind: 'css', chain, terminal };
 }
 
@@ -702,6 +713,31 @@ function lastAttrActive(options: ParseOptions): boolean {
   if (options.lastAttrSegment) return true;
   return options.field !== undefined && LAST_ATTR_FIELDS.has(options.field)
     && (options.lastAttrEnabled ?? engineSyntaxLastAttrEnabled());
+}
+
+/**
+ * bareattr1029：单段裸名回退属性的字符串字段——LAST_ATTR_FIELDS 去掉翻页字段（next* 按 nextList 逐节点取值，不走 evaluateRule）。
+ */
+const BARE_ATTR_FIELDS: ReadonlySet<string> = new Set([...LAST_ATTR_FIELDS].filter((field) => !NEXT_LIST_FIELDS.has(field)));
+
+/** bareattr1029 认的单段：lastattr1029 的裸名，外加含 `-`/`:` 的具名属性形（`data-id`，单段时 buildCssChain 也当选择器）。 */
+function bareAttrToken(token: string): boolean {
+  return lastAttrToken(token) || /^[A-Za-z]\w*[-:][\w:-]*$/.test(token);
+}
+
+/** 帧的 bareattr1029 口径：开关开且字段在 BARE_ATTR_FIELDS 里。 */
+function bareAttrActive(options: ParseOptions): boolean {
+  return options.field !== undefined && BARE_ATTR_FIELDS.has(options.field)
+    && (options.bareAttrEnabled ?? engineSyntaxBareAttrEnabled());
+}
+
+/**
+ * 规则是否可能有 bareattr1029 挂回退的支（compile.ts sourceUsesBareAttrSyntax 的语义位判据）：剥 `##` 尾缀后按 `||`/`&&`/`%%` 切，
+ * 某支整条是 bareAttrToken。JS / 模板 / 前缀规则不切（整条不是裸名即不计）。只看文本、宁宽勿漏。
+ */
+export function ruleMayUseBareAttr(rule: string): boolean {
+  if (/@js:|<js>|\{\{/i.test(rule)) return false;
+  return rule.split('##')[0].split(/\|\||&&|%%/).some((branch) => bareAttrToken(branch.trim()));
 }
 
 /**
@@ -923,6 +959,11 @@ export interface ParseOptions {
    * selfmatch1029：CSS 步子孙不中时取上下文自身匹配者（ENGINE_SYNTAX_SELF_MATCH，legado Jsoup 选择含自身）。默认读 env（缺失=off）。
    */
   selfMatchEnabled?: boolean;
+  /**
+   * bareattr1029：字符串字段单段裸名在 HTML 上选不到节点时取上下文自身属性（ENGINE_SYNTAX_BARE_ATTR，只在 BARE_ATTR_FIELDS 上）。
+   * 默认读 env（缺失=off）。
+   */
+  bareAttrEnabled?: boolean;
 }
 
 /**
@@ -948,11 +989,13 @@ function parseFieldRuleFramed(rule: string, options: ParseOptions): FieldIr {
   const savedLastAttr = lastAttr;
   const savedBracket = bracketIndex;
   const savedSelf = selfMatch;
+  const savedBare = bareAttr;
   jsonPathExt = options.jsonPathEnabled ?? engineSyntaxJsonPathEnabled();
   jsObjectKeys = bindActive(options);
   lastAttr = lastAttrActive(options);
   bracketIndex = options.bracketIndexEnabled ?? engineSyntaxBracketIndexEnabled();
   selfMatch = options.selfMatchEnabled ?? engineSyntaxSelfMatchEnabled();
+  bareAttr = bareAttrActive(options);
   sourceFrame = options.sourceConsts ?? sourceFrame;
   varBag = options.varBag;
   jsoupFrame = undefined;
@@ -1021,6 +1064,7 @@ function parseFieldRuleFramed(rule: string, options: ParseOptions): FieldIr {
     lastAttr = savedLastAttr;
     bracketIndex = savedBracket;
     selfMatch = savedSelf;
+    bareAttr = savedBare;
   }
 }
 
