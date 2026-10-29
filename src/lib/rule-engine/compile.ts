@@ -4,7 +4,8 @@
 // ENGINE_SYNTAX_OR 联动——off=1 / on=2）：规则原文或引擎语义任一变化，键即变，旧编译
 // 产物自然失效，不存在「|| 开关打开后仍复用 off 态编译缓存」的窗口。
 import {
-  searchOptionsMayUseWebView, searchOptionsNeedParity, searchTemplateNeedsJs, searchTemplateUsesCjkEncodeUri,
+  MAX_SEARCH_JS_LONG_TEMPLATE_LENGTH, MAX_SEARCH_JS_TEMPLATE_LENGTH, searchOptionsMayUseWebView, searchOptionsNeedParity,
+  searchTemplateNeedsJs, searchTemplateUsesCjkEncodeUri,
 } from '@/lib/source-parser';
 import { upgradeSourceTemplateUrl } from '@/lib/source-policy';
 import { sourceRevision } from '@/lib/source-revision';
@@ -108,7 +109,8 @@ export function engineVersionedKey(contentRevision: string, semanticsVersion = E
  * srcbind1028：ENGINE_SYNTAX_SOURCE_BIND on、JS 链对该源生效且有字段不带书源常量被拒、带了编译通过（sourceUsesSourceBindSyntax）
  * 时再加书源常量位（+536870912）。
  * gbkjs1029：ENGINE_SYNTAX_JS、ENGINE_SYNTAX_JS_UTIL 与搜索 JS 同开、需 JS 的搜索模板里有 GBK 系 encodeURI
- * （searchTemplateUsesCjkEncodeUri）时也计 jsUtil 位（不另占位；搜索沙箱不载 jsLib，故按原始 JS 开关、不看 JS 链）。
+ * （searchTemplateUsesCjkEncodeUri）时也计 jsUtil 位（不另占位；搜索沙箱不载 jsLib，故按原始 JS 开关、不看 JS 链）；
+ * longjs1029 同条件下超 8192、64K 内的需 JS 模板（只在长上限下才进新路径）同计 jsUtil 位，搜索 JS 位仍按 8192 判、逐字不变。
  * initjsoup1028：ENGINE_SYNTAX_INIT_JSOUP on、JS init 与 jsoup 对该源同生效且 init 只有经 jsoup 重编才是可复现 JS init
  * （sourceUsesInitJsoupSyntax）时再加 jsoup init 位（+1073741824，int4 最后一位）。其余位的探测不传本开关（读 env，同 listget1028 口径）。
  */
@@ -193,8 +195,9 @@ export function engineSourceRevision(
     (jsUtil && soup((j, b) => sourceUsesJsUtilSyntax(rules, {
       orEnabled, varsEnabled, xpathEnabled, xpathEvalEnabled: xpathEval, regexEnabled, andEnabled, aioEnabled, listJsEnabled, jsExtEnabled,
       jsBindEnabled: jsBind, jsGetEnabled: jsGet, jsonPathEnabled, jsoupEnabled: j, bookFieldsEnabled: b,
-    }))) || (jsEnabled && jsUtilEnabled && searchJsEnabled
-      && searchTemplateUsesCjkEncodeUri(source.searchUrl, upgradeSourceTemplateUrl(source.url))),
+    }))) || (jsEnabled && jsUtilEnabled && searchJsEnabled && (searchTemplateUsesCjkEncodeUri(source.searchUrl, upgradeSourceTemplateUrl(source.url))
+      || (typeof source.searchUrl === 'string' && source.searchUrl.length > MAX_SEARCH_JS_TEMPLATE_LENGTH
+        && searchTemplateNeedsJs(source.searchUrl, upgradeSourceTemplateUrl(source.url), MAX_SEARCH_JS_LONG_TEMPLATE_LENGTH)))),
     jsonPathEnabled && soup((j, b) => sourceUsesJsonPathSyntax(rules, {
       orEnabled, varsEnabled, jsEnabled: jsChain, xpathEnabled, xpathEvalEnabled: xpathEval, regexEnabled, andEnabled, aioEnabled, listJsEnabled,
       jsExtEnabled, jsBindEnabled: jsBind, jsGetEnabled: jsGet, jsUtilEnabled: jsUtil, jsoupEnabled: j, bookFieldsEnabled: b,

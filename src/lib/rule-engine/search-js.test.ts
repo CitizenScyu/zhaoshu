@@ -2,8 +2,8 @@ import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import { checkSourceUrl, SourcePolicyError } from '@/lib/source-policy';
 import { buildSourceSearchRequest, searchTemplateNeedsJs } from '@/lib/source-parser';
 import { engineSourceRevision } from './compile';
-import { engineSearchJsActive, selectCandidates, type RawSource } from './compile-smoke';
-import { buildSearchRequest, prepareSearchJs, searchJsConstructible } from './search-js';
+import { admissionSurveyOptions, engineSearchJsActive, selectCandidates, type RawSource } from './compile-smoke';
+import { buildSearchRequest, prepareSearchJs, searchJsConstructible, searchJsTemplateLimit } from './search-js';
 import { engineSearchJsEnabled, engineSemanticsVersion, ENGINE_SEMANTICS_SEARCH_JS_BIT } from './syntax-flags';
 
 // searchjs1027：legado AnalyzeUrl 口径的搜索模板 JS。用例形态取自现网 searchUrl 桶（域名/参数为合成值）。
@@ -189,6 +189,47 @@ describe('gbkjs1029：搜索模板 java.encodeURI(…, gbk 系)', () => {
     expect(engineSourceRevision({ ...src, searchUrl: `${BASE}/s?q={{java.encodeURI(key)}}` }, all).split(':')[0]).toBe('257');
     expect(engineSourceRevision({ ...src, searchUrl: `${BASE}/s?q={{key}}&gbk=1` }, all).split(':')[0]).toBe('1');
     expect(engineSourceRevision(src, all).split(':')[1]).toBe(engineSourceRevision(src, {}).split(':')[1]);
+  });
+});
+
+describe('longjs1029：自带签名实现的长模板（8192–64K）', () => {
+  afterEach(() => { vi.unstubAllEnvs(); });
+  const on = () => { vi.stubEnv('ENGINE_SYNTAX_JS', '1'); vi.stubEnv('ENGINE_SYNTAX_JS_UTIL', '1'); };
+  const long = (pad: number) => `<js>/*${'x'.repeat(pad)}*/var t=String(page*7);'${BASE}/s?q='+encodeURIComponent(key)+'&t='+t</js>`;
+  const tpl = long(9000);
+
+  it('上限随开关：JS + JS_UTIL 同开才放到 64K', () => {
+    expect(searchJsTemplateLimit(env({}))).toBe(8192);
+    expect(searchJsTemplateLimit(env({ ENGINE_SYNTAX_JS_UTIL: '1' }))).toBe(8192);
+    expect(searchJsTemplateLimit(env({ ENGINE_SYNTAX_JS: '1', ENGINE_SYNTAX_JS_UTIL: '1' }))).toBe(65536);
+    expect(admissionSurveyOptions({}, env({ ENGINE_SYNTAX_JS: '1', ENGINE_SYNTAX_JS_UTIL: '1' })).searchJsLimit).toBe(65536);
+  });
+
+  it('关：超 8192 的模板照旧抛旧口径错误；开：按 legado 口径求值', () => {
+    expect(searchTemplateNeedsJs(tpl, BASE)).toBe(false);
+    expect(() => build(tpl)).toThrow(SourcePolicyError);
+    on();
+    expect(build(tpl).url).toBe(`${BASE}/s?q=%E4%B9%A6&t=7`);
+  });
+
+  it('开：超 64K 仍拒', () => {
+    on();
+    expect(() => build(long(70000))).toThrow(SourcePolicyError);
+  });
+
+  it('候选口径：searchJsLimit 传长上限才入选', () => {
+    const s: RawSource = { bookSourceUrl: BASE, searchUrl: tpl, ruleSearch: { bookList: '.book' }, ruleContent: { content: '.content' } };
+    expect(selectCandidates([s], { postSearch: true, searchJs: true }).length).toBe(0);
+    expect(selectCandidates([s], { postSearch: true, searchJs: true, searchJsLimit: 65536 }).length).toBe(1);
+  });
+
+  it('语义位：长模板只计 jsUtil 位（搜索 JS 位按 8192 判、不翻）；8192 内的模板不受影响', () => {
+    const rules = { ruleSearch: { bookList: '.b' } };
+    const all = { jsEnabled: true, jsUtilEnabled: true, searchJsEnabled: true };
+    expect(engineSourceRevision({ url: BASE, searchUrl: tpl, rules }, all).split(':')[0]).toBe(String(1 + 8192));
+    expect(engineSourceRevision({ url: BASE, searchUrl: tpl, rules }, { ...all, jsUtilEnabled: false }).split(':')[0]).toBe('1');
+    expect(engineSourceRevision({ url: BASE, searchUrl: long(70000), rules }, all).split(':')[0]).toBe('1');
+    expect(engineSourceRevision({ url: BASE, searchUrl: long(10), rules }, all).split(':')[0]).toBe('257');
   });
 });
 

@@ -691,15 +691,22 @@ function legadoUrlOption(raw: string, keyMark?: string): Record<string, unknown>
 
 /** 新路径接收的 searchUrl 上限（JS 模板比纯 URL 长，与规则 JS 上限同量级）。 */
 export const MAX_SEARCH_JS_TEMPLATE_LENGTH = 8192;
+/**
+ * longjs1029：ENGINE_SYNTAX_JS 与 ENGINE_SYNTAX_JS_UTIL 同开时的上限——模板里自带签名/加密实现（现网 47K 字符的
+ * `<js>` 段）的源。求值仍受沙箱 250ms/内存上限约束。
+ */
+export const MAX_SEARCH_JS_LONG_TEMPLATE_LENGTH = 65536;
 const SEARCH_JS_MARKER = /@js:|<js>|\{\{(?!(?:key|page)\}\})/i;
 
 /**
  * 该 searchUrl 是否要走 legado JS 求值路径：旧口径（buildSourceSearchRequest）构造不出请求，且模板里有 `@js:`/`<js>`
  * 或 `{{key}}`/`{{page}}` 以外的 `{{表达式}}`。纯静态判断（不执行 JS），供语义版本位与新路径闸门共用——
- * 旧口径能构造的模板永远不进新路径，开关开时这些源的请求逐字不变。
+ * 旧口径能构造的模板永远不进新路径，开关开时这些源的请求逐字不变。`maxLength` 缺省 8192（longjs1029 开时调用方传长上限）。
  */
-export function searchTemplateNeedsJs(template: unknown, base: string): boolean {
-  if (typeof template !== 'string' || template.length > MAX_SEARCH_JS_TEMPLATE_LENGTH) return false;
+export function searchTemplateNeedsJs(
+  template: unknown, base: string, maxLength: number = MAX_SEARCH_JS_TEMPLATE_LENGTH,
+): boolean {
+  if (typeof template !== 'string' || template.length > maxLength) return false;
   if (!SEARCH_JS_MARKER.test(template)) return false;
   return !searchOptionsConstructible(template, base);
 }

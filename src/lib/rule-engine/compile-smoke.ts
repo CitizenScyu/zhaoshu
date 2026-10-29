@@ -3,10 +3,10 @@
 // 设计依据：m1-engine-design.md v3 §8.2；移植逻辑参考 .rule-survey/survey.py。
 
 import { upgradeSourceTemplateUrl } from '@/lib/source-policy';
-import { searchOptionsConstructible, searchTemplateNeedsJs } from '@/lib/source-parser';
+import { MAX_SEARCH_JS_TEMPLATE_LENGTH, searchOptionsConstructible, searchTemplateNeedsJs } from '@/lib/source-parser';
 import { initJsRuleSupported, jsChainFieldAllowed, listJsGroupsFlat, parseFieldRule, ruleHasJs, type ParseOptions } from './parse';
 import { aioGroupsFlat, isAioListField, ruleGroupOf } from './aio-syntax';
-import { searchJsConstructible } from './search-js';
+import { searchJsConstructible, searchJsTemplateLimit } from './search-js';
 import {
   engineInitJsActive, engineSearchJsEnabled, engineSearchOptionsEnabled, engineSyntaxAioEnabled, engineSyntaxJsEnabled, engineSyntaxListJsEnabled,
   engineSyntaxJsLibEnabled,
@@ -133,7 +133,10 @@ export function sourceHasJsChainField(src: RawSource, env: NodeJS.ProcessEnv = p
  */
 export function admissionSurveyOptions(
   src: RawSource, env: NodeJS.ProcessEnv = process.env,
-): { postSearch: boolean; noncoreJs: boolean; coreJs: boolean; searchJs: boolean; listJs: boolean; initJs: boolean } {
+): {
+  postSearch: boolean; noncoreJs: boolean; coreJs: boolean; searchJs: boolean; listJs: boolean; initJs: boolean; searchJsLimit?: number;
+} {
+  const searchJsLimit = searchJsTemplateLimit(env);
   return {
     postSearch: enginePostSearchEnabled(env),
     noncoreJs: admissionNoncoreJsEnabled(env),
@@ -141,6 +144,8 @@ export function admissionSurveyOptions(
     searchJs: engineSearchJsActive(env),
     listJs: engineSyntaxListJsEnabled(env),
     initJs: engineInitJsActive(env),
+    // longjs1029：只在放长时带上，开关关时选项与旧口径逐键相同。
+    ...(searchJsLimit !== MAX_SEARCH_JS_TEMPLATE_LENGTH ? { searchJsLimit } : {}),
   };
 }
 
@@ -198,7 +203,11 @@ function searchIsPureGet(su: unknown): boolean {
  */
 export function selectCandidates(
   data: RawSource[],
-  options: { postSearch?: boolean; noncoreJs?: boolean; coreJs?: boolean; searchJs?: boolean; listJs?: boolean; initJs?: boolean } = {},
+  options: {
+    postSearch?: boolean; noncoreJs?: boolean; coreJs?: boolean; searchJs?: boolean; listJs?: boolean; initJs?: boolean;
+    /** longjs1029：需 JS 模板的长度上限（缺省 8192）。 */
+    searchJsLimit?: number;
+  } = {},
 ): RawSource[] {
   const out: RawSource[] = [];
   for (const s of data) {
@@ -208,7 +217,7 @@ export function selectCandidates(
     // 默认口径 = 纯 GET；postSearch 开时额外放行「可构造出 POST/GET 请求」的源（与运行时同一判据，未知键/展不开仍拒，webView 仅 ENGINE_SEARCH_WEBVIEW 开时放行）。
     if (!searchIsPureGet(s.searchUrl)
       && !(options.postSearch && searchOptionsConstructible(s.searchUrl, upgradedBase))
-      && !(options.postSearch && options.searchJs && searchTemplateNeedsJs(s.searchUrl, upgradedBase)
+      && !(options.postSearch && options.searchJs && searchTemplateNeedsJs(s.searchUrl, upgradedBase, options.searchJsLimit)
         && searchJsConstructible(s.searchUrl as string, upgradedBase))) continue;
     const rs = (s.ruleSearch ?? {}) as Record<string, unknown>;
     const rc = (s.ruleContent ?? {}) as Record<string, unknown>;

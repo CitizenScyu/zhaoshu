@@ -19,7 +19,7 @@ import {
 } from './evaluate';
 import { enginePostSearchEnabled, engineSearchJsActive } from './compile-smoke';
 import { preloadJsSandbox } from './js-sandbox';
-import { buildSearchRequestWithVars, prepareSearchJs } from './search-js';
+import { buildSearchRequestWithVars, prepareSearchJs, searchJsTemplateLimit } from './search-js';
 import { engineSyntaxJsBindEnabled } from './syntax-flags';
 import { RuleEngineError, type CompiledRules, type FieldIr, type SkippedField } from './types';
 import { stripUrlOptions } from './url-options';
@@ -131,7 +131,7 @@ export async function engineSearchBook(
   if (enginePostSearchEnabled()) {
     // searchjs1027：旧口径构造不出、需 JS 的模板（ENGINE_SEARCH_JS 开）在沙箱里按 legado 口径求值；其余逐字走旧口径。
     const searchJs = engineSearchJsActive();
-    if (searchJs && searchTemplateNeedsJs(source.searchUrl, source.url)) await prepareSearchJs();
+    if (searchJs && searchTemplateNeedsJs(source.searchUrl, source.url, searchJsTemplateLimit())) await prepareSearchJs();
     const built = buildSearchRequestWithVars(source.searchUrl, title, source.url, validateSourceUrl, searchJs);
     const request = built.request;
     searchVars = built.vars;

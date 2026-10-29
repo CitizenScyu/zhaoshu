@@ -9,8 +9,8 @@
 // 本模块只在服务端用（js-sandbox 依赖 node:crypto 与 wasm），纯函数部分在 source-parser.ts。
 
 import {
-  buildLegadoSearchRequest, buildSourceSearchRequest, searchOptionsNeedParity, searchTemplateNeedsJs,
-  type SourceSearchRequest, type SourceUrlValidator,
+  buildLegadoSearchRequest, buildSourceSearchRequest, MAX_SEARCH_JS_LONG_TEMPLATE_LENGTH, MAX_SEARCH_JS_TEMPLATE_LENGTH,
+  searchOptionsNeedParity, searchTemplateNeedsJs, type SourceSearchRequest, type SourceUrlValidator,
 } from '@/lib/source-parser';
 import { checkSourceUrl, SourcePolicyError, validateSourceUrl } from '@/lib/source-policy';
 import { preloadJsSandbox, runJs } from './js-sandbox';
@@ -97,6 +97,14 @@ interface EvalContext { title: string; baseUrl: string; vars: Record<string, str
 /** gbkjs1029：搜索模板里 `java.encodeURI(文本, 'gbk'|…)` 按 URLEncoder GBK 系口径编码（ENGINE_SYNTAX_JS 与 ENGINE_SYNTAX_JS_UTIL 同开）。 */
 function searchCjkEncodeUri(): boolean {
   return engineSyntaxJsEnabled() && engineSyntaxJsUtilEnabled();
+}
+
+/**
+ * longjs1029：需 JS 的搜索模板长度上限（ENGINE_SYNTAX_JS 与 ENGINE_SYNTAX_JS_UTIL 同开时放到 64K，收自带签名实现的模板；
+ * 否则 8192）。运行时闸门、候选初筛与语义位共用。
+ */
+export function searchJsTemplateLimit(env: NodeJS.ProcessEnv = process.env): number {
+  return engineSyntaxJsEnabled(env) && engineSyntaxJsUtilEnabled(env) ? MAX_SEARCH_JS_LONG_TEMPLATE_LENGTH : MAX_SEARCH_JS_TEMPLATE_LENGTH;
 }
 
 function evalSearchJs(code: string, ctx: EvalContext, result: string | null): string {
@@ -220,7 +228,7 @@ function withSearchJs(
     return { request: buildSourceSearchRequest(template, title, base, validate) };
   } catch (error) {
     if (!(error instanceof SourcePolicyError) || !searchJs || typeof template !== 'string' || base === undefined
-      || !searchTemplateNeedsJs(template, base)) throw error;
+      || !searchTemplateNeedsJs(template, base, searchJsTemplateLimit())) throw error;
     const { ruleUrl, baseUrl, vars } = evaluate(template, base);
     return { request: buildLegadoSearchRequest(ruleUrl, baseUrl, validate, optionParity(template, base)), vars };
   }

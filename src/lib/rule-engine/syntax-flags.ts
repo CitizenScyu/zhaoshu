@@ -253,7 +253,8 @@ export function engineSyntaxJsGetEnabled(env: OrEnv = process.env): boolean {
 /**
  * jsutil1028：对称加解密 / toNumChapter 帮手语义位。版本再 +8192（8193–16384），1–8192 逐字不变。
  * 只对 off 态被拒、on 态编译通过的字段所在源计入（compile.ts sourceUsesJsUtilSyntax）；gbkjs1029 另计需 JS 的搜索模板里
- * 有 GBK 系 encodeURI 的源（source-parser.ts searchTemplateUsesCjkEncodeUri，须搜索 JS 同生效）。
+ * 有 GBK 系 encodeURI 的源（source-parser.ts searchTemplateUsesCjkEncodeUri，须搜索 JS 同生效）；longjs1029 另计超 8192、
+ * 64K 内的需 JS 搜索模板。
  */
 export const ENGINE_SEMANTICS_JS_UTIL_BIT = 8192;
 
@@ -265,6 +266,7 @@ export const ENGINE_SEMANTICS_JS_UTIL_BIT = 8192;
  * 0.2.17 词典 + legado fixT2sDict 排除词，t2s.ts），结果在 Rhino 里是 Java String，只收完成值、字符串拼接与 String() 实参。
  * gbkjs1029：搜索模板 JS（搜索 JS 同开时）的 `java.encodeURI(文本, 'gbk'|'gb2312'|'gb18030')` 按 java.net.URLEncoder 口径编
  * GBK 系字节（source-charset.ts javaUrlEncodeCjk：ASCII 与 CJK 基本区汉字，其余字符致命失败、不回退 UTF-8）；规则字段不变。
+ * longjs1029：需 JS 的搜索模板长度上限 8192 → 64K（search-js.ts searchJsTemplateLimit，收自带签名实现的模板）。
  * off = 逐字不变。
  */
 export function engineSyntaxJsUtilEnabled(env: OrEnv = process.env): boolean {
