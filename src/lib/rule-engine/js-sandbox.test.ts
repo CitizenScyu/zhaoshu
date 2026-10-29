@@ -74,6 +74,16 @@ describe('js-sandbox: java.* 帮手', () => {
     expect(runJs('java.encodeURI("a b-_.*中")', { result: '', ...BASE })).toBe('a+b-_.*%E4%B8%AD');
   });
 
+  it('gbkjs1029：cjkEncodeUri 才按 GBK 系编码；表外字符致命（try/catch 吞不掉）；缺省逐字不变', () => {
+    expect(runJs('java.encodeURI("书 a","GBK")', { result: '', ...BASE, cjkEncodeUri: true })).toBe('%CA%E9+a');
+    expect(runJs('java.encodeURI("书")', { result: '', ...BASE, cjkEncodeUri: true })).toBe('%E4%B9%A6');
+    expect(runJs('java.encodeURI("书","utf-8")', { result: '', ...BASE, cjkEncodeUri: true })).toBe('%E4%B9%A6');
+    expect(failure('java.encodeURI("书","gbk")').message).toContain('只支持 UTF-8');
+    expect(failure('java.encodeURI("书","big5")', { result: '', ...BASE, cjkEncodeUri: true }).message).toContain('只支持 UTF-8');
+    expect(failure('try { java.encodeURI("·","gbk") } catch (e) { "x" }', { result: '', ...BASE, cjkEncodeUri: true }).message)
+      .toContain('JS 宿主回调失败');
+  });
+
   it('hexDecodeToString 按字节解', () => {
     expect(runJs('java.hexDecodeToString("e4b8ad")', { result: '', ...BASE })).toBe('中');
   });

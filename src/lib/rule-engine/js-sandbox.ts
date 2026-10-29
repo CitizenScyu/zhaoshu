@@ -11,6 +11,7 @@
 
 import { createHash } from 'node:crypto';
 import type { QuickJSContext, QuickJSHandle, QuickJSSyncVariant, QuickJSWASMModule } from 'quickjs-emscripten-core';
+import { javaCjkCharset, javaUrlEncodeCjk } from '@/lib/source-charset';
 import { symmetricCrypt, toNumChapter, type SymOp } from './js-util';
 import { t2s } from './t2s';
 import type { JElement } from './jsoup-dom';
@@ -75,6 +76,11 @@ export interface JsBindings {
    * 其余求值的沙箱逐字不变。帮手失败与回调一样致命。
    */
   utilHelpers?: boolean;
+  /**
+   * gbkjs1029：`java.encodeURI(文本, 'gbk'|'gb2312'|'gb18030')` 按 java.net.URLEncoder 的 GBK 系口径编码（source-charset.ts
+   * javaUrlEncodeCjk；只给搜索模板求值开，规则字段逐字不变）。不可复现的字符致命失败（try/catch 吞掉也不算数）。
+   */
+  cjkEncodeUri?: boolean;
   /**
    * jsoup1028 直连 DOM（只经 runJsoup/runJsoupItems 生效）：`result`/`src` 换成 Element/Elements 包装（缺省用上面的字符串），
    * `getElements` 是 `java.getElement(s)("规则")` 的取节点回调（编译期白名单里的规则）。
@@ -467,7 +473,18 @@ function installGlobals(context: QuickJSContext, bindings: JsBindings): { failur
   for (const [name, impl] of Object.entries(HOST_HELPERS)) {
     const fn = context.newFunction(name, (...args) => {
       const texts = args.map((arg) => (context.typeof(arg) === 'undefined' ? undefined : context.getString(arg)));
-      const out = impl(texts);
+      const cjk = bindings.cjkEncodeUri && name === 'encodeURI' ? javaCjkCharset(texts[1]) : null;
+      let out: string;
+      if (cjk) {
+        try {
+          out = javaUrlEncodeCjk(texts[0] ?? '', cjk);
+        } catch (error) {
+          host.failure ??= error;
+          throw error;
+        }
+      } else {
+        out = impl(texts);
+      }
       if (out.length > MAX_JS_OUTPUT_CHARS) throw new Error(`java.${name} 输出过大`);
       return context.newString(out);
     });

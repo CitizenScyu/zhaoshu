@@ -3,7 +3,9 @@
 // 缓存键 = 语义版本化 sourceRevision（P0 引入 engineVersionedKey；P1a 起语义版本随
 // ENGINE_SYNTAX_OR 联动——off=1 / on=2）：规则原文或引擎语义任一变化，键即变，旧编译
 // 产物自然失效，不存在「|| 开关打开后仍复用 off 态编译缓存」的窗口。
-import { searchOptionsMayUseWebView, searchOptionsNeedParity, searchTemplateNeedsJs } from '@/lib/source-parser';
+import {
+  searchOptionsMayUseWebView, searchOptionsNeedParity, searchTemplateNeedsJs, searchTemplateUsesCjkEncodeUri,
+} from '@/lib/source-parser';
 import { upgradeSourceTemplateUrl } from '@/lib/source-policy';
 import { sourceRevision } from '@/lib/source-revision';
 import { engineSearchJsActive, engineSearchOptionsActive } from './compile-smoke';
@@ -105,6 +107,8 @@ export function engineVersionedKey(contentRevision: string, semanticsVersion = E
  * （与 compileSource 开 JS 链同口径；内容 identity 仍按原规则），有字段带 JS（JS 段或 `{{}}`）时再加 jsLib 位（+268435456）。
  * srcbind1028：ENGINE_SYNTAX_SOURCE_BIND on、JS 链对该源生效且有字段不带书源常量被拒、带了编译通过（sourceUsesSourceBindSyntax）
  * 时再加书源常量位（+536870912）。
+ * gbkjs1029：ENGINE_SYNTAX_JS、ENGINE_SYNTAX_JS_UTIL 与搜索 JS 同开、需 JS 的搜索模板里有 GBK 系 encodeURI
+ * （searchTemplateUsesCjkEncodeUri）时也计 jsUtil 位（不另占位；搜索沙箱不载 jsLib，故按原始 JS 开关、不看 JS 链）。
  * initjsoup1028：ENGINE_SYNTAX_INIT_JSOUP on、JS init 与 jsoup 对该源同生效且 init 只有经 jsoup 重编才是可复现 JS init
  * （sourceUsesInitJsoupSyntax）时再加 jsoup init 位（+1073741824，int4 最后一位）。其余位的探测不传本开关（读 env，同 listget1028 口径）。
  */
@@ -186,10 +190,11 @@ export function engineSourceRevision(
       orEnabled, varsEnabled, xpathEnabled, xpathEvalEnabled: xpathEval, regexEnabled, andEnabled, aioEnabled, listJsEnabled, jsExtEnabled,
       jsBindEnabled: jsBind, jsUtilEnabled: jsUtil, jsonPathEnabled, jsoupEnabled: j, bookFieldsEnabled: b,
     })),
-    jsUtil && soup((j, b) => sourceUsesJsUtilSyntax(rules, {
+    (jsUtil && soup((j, b) => sourceUsesJsUtilSyntax(rules, {
       orEnabled, varsEnabled, xpathEnabled, xpathEvalEnabled: xpathEval, regexEnabled, andEnabled, aioEnabled, listJsEnabled, jsExtEnabled,
       jsBindEnabled: jsBind, jsGetEnabled: jsGet, jsonPathEnabled, jsoupEnabled: j, bookFieldsEnabled: b,
-    })),
+    }))) || (jsEnabled && jsUtilEnabled && searchJsEnabled
+      && searchTemplateUsesCjkEncodeUri(source.searchUrl, upgradeSourceTemplateUrl(source.url))),
     jsonPathEnabled && soup((j, b) => sourceUsesJsonPathSyntax(rules, {
       orEnabled, varsEnabled, jsEnabled: jsChain, xpathEnabled, xpathEvalEnabled: xpathEval, regexEnabled, andEnabled, aioEnabled, listJsEnabled,
       jsExtEnabled, jsBindEnabled: jsBind, jsGetEnabled: jsGet, jsUtilEnabled: jsUtil, jsoupEnabled: j, bookFieldsEnabled: b,

@@ -1,4 +1,4 @@
-import { beforeAll, describe, expect, it } from 'vitest';
+import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import { checkSourceUrl, SourcePolicyError } from '@/lib/source-policy';
 import { buildSourceSearchRequest, searchTemplateNeedsJs } from '@/lib/source-parser';
 import { engineSourceRevision } from './compile';
@@ -144,6 +144,54 @@ describe('legado AnalyzeUrl 口径求值', () => {
   });
 });
 
+describe('gbkjs1029：搜索模板 java.encodeURI(…, gbk 系)', () => {
+  afterEach(() => { vi.unstubAllEnvs(); });
+  const on = () => { vi.stubEnv('ENGINE_SYNTAX_JS', '1'); vi.stubEnv('ENGINE_SYNTAX_JS_UTIL', '1'); };
+  const tpl = `${BASE}/s?q={{java.encodeURI(key,'gbk')}}&p={{page}}`;
+
+  it('关（JS_UTIL 或 JS 任一未开）：照旧判不支持', () => {
+    expect(() => build(tpl)).toThrow(SourcePolicyError);
+    vi.stubEnv('ENGINE_SYNTAX_JS_UTIL', '1');
+    expect(() => build(tpl)).toThrow(SourcePolicyError);
+  });
+
+  it('开：GET 查询串里的 %XX 原样保留；POST 表单与 @js: 段同口径', () => {
+    on();
+    expect(build(tpl, '书 a')).toEqual({ url: `${BASE}/s?q=%CA%E9+a&p=1`, method: 'GET', charset: 'utf-8' });
+    expect(build(`${BASE}/s,{"method":"POST","body":"k={{java.encodeURI(key,'GB2312')}}"}`).body).toBe('k=%CA%E9');
+    expect(build(`@js:'${BASE}/s?q='+java.encodeURI(key,'gb18030')`).url).toBe(`${BASE}/s?q=%CA%E9`);
+  });
+
+  it('开：表外/映射不一的字符致命失败；非 gbk 系字符集照旧只收 UTF-8', () => {
+    on();
+    expect(() => build(tpl, '书·名')).toThrow(SourcePolicyError);
+    expect(() => build(`${BASE}/s?q={{(function(){try{return java.encodeURI(key,'gbk')}catch(e){return key}})()}}`, '·'))
+      .toThrow(SourcePolicyError);
+    expect(() => build(`${BASE}/s?q={{java.encodeURI(key,'big5')}}`)).toThrow(SourcePolicyError);
+  });
+
+  it('候选口径随开关变（探测记忆按开关分键）', () => {
+    expect(searchJsConstructible(tpl, BASE)).toBe(false);
+    on();
+    expect(searchJsConstructible(tpl, BASE)).toBe(true);
+    vi.unstubAllEnvs();
+    expect(searchJsConstructible(tpl, BASE)).toBe(false);
+  });
+
+  it('语义位：JS + JS_UTIL + 搜索 JS 同开且模板需 JS、带 GBK 系 encodeURI 才计 jsUtil 位，内容 identity 不变', () => {
+    const rules = { ruleSearch: { bookList: '.b' } };
+    const src = { url: BASE, searchUrl: tpl, rules };
+    const all = { jsEnabled: true, jsUtilEnabled: true, searchJsEnabled: true };
+    expect(engineSourceRevision(src, all).split(':')[0]).toBe(String(1 + 256 + 8192));
+    expect(engineSourceRevision(src, { ...all, jsUtilEnabled: false }).split(':')[0]).toBe('257');
+    expect(engineSourceRevision(src, { ...all, jsEnabled: false }).split(':')[0]).toBe('257');
+    expect(engineSourceRevision(src, { ...all, searchJsEnabled: false }).split(':')[0]).toBe('1');
+    expect(engineSourceRevision({ ...src, searchUrl: `${BASE}/s?q={{java.encodeURI(key)}}` }, all).split(':')[0]).toBe('257');
+    expect(engineSourceRevision({ ...src, searchUrl: `${BASE}/s?q={{key}}&gbk=1` }, all).split(':')[0]).toBe('1');
+    expect(engineSourceRevision(src, all).split(':')[1]).toBe(engineSourceRevision(src, {}).split(':')[1]);
+  });
+});
+
 describe('拒绝面', () => {
   it.each([
     ['webView 选项', `${BASE}/s?q={{key}}&p={{page+0}},{"webView":true}`],
@@ -154,7 +202,7 @@ describe('拒绝面', () => {
     ['死循环（250ms 截停）', '@js:while(true){}'],
     ['头值含非 ASCII（OkHttp 拒）', `${BASE}/s?p={{page+0}},{"headers":{"Referer":"{{key}}"}}`],
     ['非 https 结果', '@js:"http://127.0.0.1/s?q="+key'],
-    ['java.get 读本次未 put 的键（legado 会查持久化源变量）', `${BASE}/s?q={{key}}&t={{java.get('token')}}`],
+    ['java.get 读本次未 put 的键（legado 得空串，读不到多出自联网段，保守拒）', `${BASE}/s?q={{key}}&t={{java.get('token')}}`],
     ['java.put 对象值', `${BASE}/s?q={{key}}&t={{java.put('h', {a:1})}}`],
     ['java.put 指数形态数字', `${BASE}/s?q={{key}}&t={{java.put('n', 1e21)}}`],
     ['java 不可改写', `${BASE}/s?q={{key}}&t={{java.ajax = function(){ return 'x'; }, java.ajax()}}`],

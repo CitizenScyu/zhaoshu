@@ -704,6 +704,15 @@ export function searchTemplateNeedsJs(template: unknown, base: string): boolean 
   return !searchOptionsConstructible(template, base);
 }
 
+/**
+ * gbkjs1029：需 JS 的搜索模板里是否有 `encodeURI` 且出现 gbk/gb2312/gb18030 字样（语义版本位用，只看子串、宁宽勿漏——
+ * 多算只是多重探一次）。
+ */
+export function searchTemplateUsesCjkEncodeUri(template: unknown, base: string): boolean {
+  return typeof template === 'string' && /encodeURI/.test(template) && /gb(?:k|2312|18030)/i.test(template)
+    && searchTemplateNeedsJs(template, base);
+}
+
 // legado NetworkUtils.notNeedEncodingQuery / notNeedEncodingForm 与 AnalyzeUrl.queryEncoder
 // （RFC3986.UNRESERVED + `!$%&()*+,/:;=?@[\]^\`{|}`；`%` 安全，已有的 %XX 不重编）。
 const LEGADO_QUERY_PLAIN = /[A-Za-z0-9!$&()*+,\-./:;=?@[\\\]^_`{|}~]/;

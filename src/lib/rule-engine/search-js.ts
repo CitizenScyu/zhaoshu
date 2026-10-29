@@ -14,7 +14,7 @@ import {
 } from '@/lib/source-parser';
 import { checkSourceUrl, SourcePolicyError, validateSourceUrl } from '@/lib/source-policy';
 import { preloadJsSandbox, runJs } from './js-sandbox';
-import { engineSearchOptionsEnabled } from './syntax-flags';
+import { engineSearchOptionsEnabled, engineSyntaxJsEnabled, engineSyntaxJsUtilEnabled } from './syntax-flags';
 import { RuleEngineError } from './types';
 
 /**
@@ -40,7 +40,8 @@ const MAX_SEARCH_VARS_CHARS = 16_384;
 // 沙箱里的 legado 绑定（在包装函数体内展开：vars 是闭包变量，规则代码经间接 eval 在全局作用域跑、看不到它）。
 // source/cookie/java 冻结；__sourceKey/__vars 用完即删。
 // java.put/get = legado AnalyzeUrl.put/get：搜索时写进本次搜索的 RuleData（一次请求构造内各段共享），put 返回值本身。
-// get 读不到本次 put 过的键时 legado 会再查持久化的源变量，这里没有那份状态 → 判不支持；
+// get 读不到本次 put 过的键时 legado AnalyzeUrl.get 得空串（搜索用新建的 RuleData，不回查源变量）；读不到的键实测多出自
+// 联网段或宿主状态，这里保守判不支持；
 // 值只收字符串/布尔/无指数形态的数字（Rhino 转 String 与 JS 同形），其余形态不可复现即拒。
 const SETUP = `
   var k = globalThis.__sourceKey; delete globalThis.__sourceKey;
@@ -93,6 +94,11 @@ const INLINE_FORMAT = `(function(v){
 
 interface EvalContext { title: string; baseUrl: string; vars: Record<string, string> }
 
+/** gbkjs1029：搜索模板里 `java.encodeURI(文本, 'gbk'|…)` 按 URLEncoder GBK 系口径编码（ENGINE_SYNTAX_JS 与 ENGINE_SYNTAX_JS_UTIL 同开）。 */
+function searchCjkEncodeUri(): boolean {
+  return engineSyntaxJsEnabled() && engineSyntaxJsUtilEnabled();
+}
+
 function evalSearchJs(code: string, ctx: EvalContext, result: string | null): string {
   const wrapper = `(function(){${SETUP}${result === null ? 'globalThis.result = null;\n' : ''}`
     + `var out = ${result === null ? INLINE_FORMAT : SEGMENT_FORMAT}((0, eval)(${JSON.stringify(code)}));\n`
@@ -103,6 +109,7 @@ function evalSearchJs(code: string, ctx: EvalContext, result: string | null): st
       result: result ?? '',
       baseUrl: ctx.baseUrl,
       globals: { key: ctx.title, page: SEARCH_PAGE, __sourceKey: ctx.baseUrl, __vars: JSON.stringify(ctx.vars) },
+      ...(searchCjkEncodeUri() ? { cjkEncodeUri: true } : {}),
     });
   } catch (error) {
     if (error instanceof RuleEngineError) {
@@ -254,7 +261,7 @@ const probed = new Map<string, EvaluatedSearchJs | { rejected: string }>();
  * 结果重验；沙箱未就绪抛 SearchJsNotReadyError、不记忆。真实搜索（真书名）不走这里。
  */
 function probeSearchJs(template: string, base: string): EvaluatedSearchJs {
-  const cacheKey = `${base}\0${template}`;
+  const cacheKey = `${searchCjkEncodeUri() ? 1 : 0}\0${base}\0${template}`;
   let entry = probed.get(cacheKey);
   if (entry !== undefined) {
     probed.delete(cacheKey);

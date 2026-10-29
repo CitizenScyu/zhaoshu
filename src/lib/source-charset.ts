@@ -85,6 +85,37 @@ export function percentEncodeChars(
   return out;
 }
 
+/** gbkjs1029：legado 搜索 JS `java.encodeURI(文本, enc)` 收的中文字符集（Java Charset.forName 名，大小写不敏感、不 trim）。 */
+export type JavaCjkCharset = 'gbk' | 'gb2312' | 'gb18030';
+
+export function javaCjkCharset(raw: string | undefined): JavaCjkCharset | null {
+  const label = raw?.toLowerCase();
+  return label === 'gbk' || label === 'gb2312' || label === 'gb18030' ? label : null;
+}
+
+/**
+ * gbkjs1029：java.net.URLEncoder.encode(text, enc) 的 GBK 系口径——`A-Za-z0-9.-*_` 原样、空格 `+`、其余 ASCII 单字节 `%XX`，
+ * 非 ASCII 只收 U+3000 与 CJK 基本区 U+4E00–U+9FA5（Java GBK/GB2312/GB18030 与 TextDecoder 反查表在这些字符上映射一致；
+ * gb2312 另限 GB2312 区位 A1–F7/A1–FE）。其余字符 Java 会因表外记 `?` 或因各实现映射不一而不可复现，抛错、不回退 UTF-8。
+ */
+export function javaUrlEncodeCjk(text: string, charset: JavaCjkCharset): string {
+  const map = gbkMap();
+  let out = '';
+  for (const ch of text) {
+    const code = ch.codePointAt(0) ?? 0;
+    if (code < 0x80) {
+      out += /[A-Za-z0-9.\-*_]/.test(ch) ? ch : ch === ' ' ? '+' : pctByte(code);
+      continue;
+    }
+    const bytes = code === 0x3000 || (code >= 0x4e00 && code <= 0x9fa5) ? map.get(ch) : undefined;
+    if (!bytes || (charset === 'gb2312' && (bytes[0] < 0xa1 || bytes[0] > 0xf7 || bytes[1] < 0xa1))) {
+      throw new Error(`字符 U+${code.toString(16).toUpperCase().padStart(4, '0')} 不能按 ${charset} 复现 URLEncoder 编码`);
+    }
+    out += pctByte(bytes[0]) + pctByte(bytes[1]);
+  }
+  return out;
+}
+
 /**
  * 把整段文本按 charset 编成字节，用于 POST body 发送。utf-8 直接走 TextEncoder；
  * GBK/gb18030 按双字节表编码（ASCII 单字节透传），表外字符回退 UTF-8 字节。

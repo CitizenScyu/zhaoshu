@@ -1,5 +1,34 @@
 import { describe, expect, it } from 'vitest';
-import { charsetFromContentType, encodeQueryComponent, encodeToBytes, normalizeCharset } from './source-charset';
+import {
+  charsetFromContentType, encodeQueryComponent, encodeToBytes, javaCjkCharset, javaUrlEncodeCjk, normalizeCharset,
+} from './source-charset';
+
+describe('gbkjs1029 javaUrlEncodeCjk（java.net.URLEncoder GBK 系口径）', () => {
+  it('字符集名：Java Charset.forName 大小写不敏感、不 trim，只收 gbk/gb2312/gb18030', () => {
+    expect(javaCjkCharset('GBK')).toBe('gbk');
+    expect(javaCjkCharset('Gb2312')).toBe('gb2312');
+    expect(javaCjkCharset('gb18030')).toBe('gb18030');
+    for (const raw of [' gbk', 'gb-2312', 'x-gbk', 'utf-8', 'big5', undefined]) expect(javaCjkCharset(raw)).toBeNull();
+  });
+
+  it('ASCII 按 URLEncoder：只留 A-Za-z0-9.-*_，空格 +，其余单字节 %XX', () => {
+    expect(javaUrlEncodeCjk('a Z-_.*~!/', 'gbk')).toBe('a+Z-_.*%7E%21%2F');
+  });
+
+  it('汉字与全角空格编 GBK 双字节；三种字符集在 GB2312 区一致', () => {
+    for (const cs of ['gbk', 'gb2312', 'gb18030'] as const) expect(javaUrlEncodeCjk('书名　中', cs)).toBe('%CA%E9%C3%FB%A1%A1%D6%D0');
+  });
+
+  it('GBK 扩展区汉字：gbk/gb18030 收，gb2312 表外致命失败', () => {
+    expect(javaUrlEncodeCjk('镕', 'gbk')).toBe(javaUrlEncodeCjk('镕', 'gb18030'));
+    expect(javaUrlEncodeCjk('镕', 'gbk')).toMatch(/^%[89A-F][0-9A-F]%[0-9A-F]{2}$/);
+    expect(() => javaUrlEncodeCjk('镕', 'gb2312')).toThrow('U+9555');
+  });
+
+  it.each([['·'], ['é'], ['：'], ['€'], ['😀'], ['']])('映射不一/表外字符 %s 抛错、不回退 UTF-8', (ch) => {
+    expect(() => javaUrlEncodeCjk(`书${ch}`, 'gbk')).toThrow('不能按 gbk 复现');
+  });
+});
 
 describe('source-charset 归一化', () => {
   it.each([
