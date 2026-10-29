@@ -647,3 +647,15 @@ export function engineSyntaxNullSkipEnabled(env: OrEnv = process.env): boolean {
   const raw = env.ENGINE_SYNTAX_NULL_SKIP?.trim().toLowerCase();
   return raw === '1' || raw === 'true' || raw === 'on';
 }
+
+/**
+ * ENGINE_SYNTAX_PAGE_DETACHED 独立开关（pagejs1029，默认 off，口径同 ENGINE_SYNTAX_OR；须 JS_EXT 生效）。on = 详情页 name/author/
+ * tocUrl 的首段 JS 不读 result/src（parse.ts jsReadsInput）时同条目级挂 `detached`：init 收窄后作用域没有页面原文（evaluate.ts
+ * insideNode / JSON 节点），以空串起链而不是求值失败——legado 那里 result 是 init 取出的节点/对象，代码不读它，结果与输入无关；
+ * `{{规则}}` 占位照旧在 init 作用域取值。作用域有原文时原文优先，逐字不变。off = 逐字不变。
+ * 无新位：只改求值（编译放行不变，`detached` 只在作用域没有原文时起作用），准入搜索判定不读详情字段。
+ */
+export function engineSyntaxPageDetachedEnabled(env: OrEnv = process.env): boolean {
+  const raw = env.ENGINE_SYNTAX_PAGE_DETACHED?.trim().toLowerCase();
+  return raw === '1' || raw === 'true' || raw === 'on';
+}

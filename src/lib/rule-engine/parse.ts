@@ -29,7 +29,7 @@ import {
   engineSyntaxJsGetEnabled, engineSyntaxJsonPathEnabled, engineSyntaxJsUtilEnabled, engineSyntaxListJsEnabled, engineSyntaxOrEnabled,
   engineSyntaxRegexEnabled, engineSyntaxXPathEnabled, engineSyntaxXPathEvalEnabled, engineInitJsActive, engineSyntaxJsoupEnabled,
   engineSyntaxBookFieldsEnabled, engineSyntaxListGetEnabled, engineSyntaxInitJsoupEnabled, engineFieldNetJsEnabled,
-  engineSyntaxNullSkipEnabled,
+  engineSyntaxNullSkipEnabled, engineSyntaxPageDetachedEnabled,
 } from './syntax-flags';
 import { compileXPath, XPathSyntaxError } from './xpath-eval';
 import { looksLikeXPath, xpathPrefixed, xpathSegmentBody, xpathToCss } from './xpath-subset';
@@ -694,6 +694,10 @@ export interface ParseOptions {
    * nullskip1029：JS 链的规则段按 legado getString 的 null 口径中止（ENGINE_SYNTAX_NULL_SKIP，见 nullSkipStage）。默认读 env（缺失=off）。
    */
   nullSkipEnabled?: boolean;
+  /**
+   * pagejs1029：详情页 name/author/tocUrl 首段 JS 不读 result/src 时挂 `detached`（ENGINE_SYNTAX_PAGE_DETACHED，须 JS_EXT）。默认读 env（缺失=off）。
+   */
+  pageDetachedEnabled?: boolean;
 }
 
 /**
@@ -1103,6 +1107,9 @@ const NULL_SKIP_FIELDS: ReadonlySet<string> = new Set([
   'ruleContent.content', 'ruleContent.title',
 ]);
 
+/** pagejs1029：init 收窄后在 init 作用域上求值的页面级 JS 字段（JS_PAGE_FIELDS 里的详情页字段）。 */
+const PAGE_DETACHED_FIELDS: ReadonlySet<string> = new Set(['ruleBookInfo.name', 'ruleBookInfo.author', 'ruleBookInfo.tocUrl']);
+
 /**
  * nullskip1029：JS 链规则段取空能否按 legado null 中止。段须是 Default 模式（无前缀或 `@CSS:`/`@@`；`@Json:`/`$.`/`$[`/`@XPath:`/`/`/`:`
  * 各有自己的取空口径），且编译成 AnalyzeByJSoup.getString 的形态：单条或 `||`/`&&` 组合的 CSS、末端不是 `@all`（`@all` 空表也
@@ -1148,6 +1155,8 @@ function parseJsChain(trimmed: string, rule: string, options: ParseOptions): Fie
   const ruleOptions: ParseOptions = jsExt ? { ...segmentOptions, andEnabled: options.andEnabled, andField: field, emptyOrBranches: true } : segmentOptions;
   // nullskip1029：只挂 legado 走 getString（非 isUrl）的字段。
   const nullSkip = NULL_SKIP_FIELDS.has(field) && (options.nullSkipEnabled ?? engineSyntaxNullSkipEnabled());
+  // pagejs1029：详情页字段首段 JS 不读输入时同条目级挂 detached（init 收窄后作用域没有原文，以空串起链）。
+  const pageDetached = jsExt && PAGE_DETACHED_FIELDS.has(field) && (options.pageDetachedEnabled ?? engineSyntaxPageDetachedEnabled());
   const chain: ChainStage[] = [];
   const pushRule = (text: string) => {
     const segment = text.trim();
@@ -1167,14 +1176,12 @@ function parseJsChain(trimmed: string, rule: string, options: ParseOptions): Fie
     const code = bindSourceConsts(match[1] ?? match[2] ?? '', (comment) => checkCommentCode(comment, rule, itemLevel, jsExt, binds, gets, util));
     // jsoup1028：帧内条目级首段 JS 的 result/src 是条目 Element（evaluate.ts evaluateJsoupChain），读输入也收。
     const first = itemLevel && chain.length === 0;
-    const detached = first && jsExt && !jsReadsInput(code);
+    const detached = (first || (pageDetached && chain.length === 0)) && jsExt && !jsReadsInput(code);
     if (first && !detached && jsoupFrame === undefined) unsupported('条目级字段首段不能是 JS', rule, { code: 'unsupported_js' });
     if (jsExt) {
       const stage = parseJsExtStage(code, rule, itemLevel, segmentOptions, binds, gets, util);
-      if (first) {
-        if (stage.kind !== 'js') unsupported('条目级字段首段不能是纯正则', rule, { code: 'unsupported_js' });
-        if (detached) stage.detached = true;
-      }
+      if (first && stage.kind !== 'js') unsupported('条目级字段首段不能是纯正则', rule, { code: 'unsupported_js' });
+      if (detached && stage.kind === 'js') stage.detached = true;
       if (jsoupFrame !== undefined && stage.kind === 'js' && stage.template) {
         unsupported('jsoup 直连的 JS 段含 {{}}', rule, { code: 'unsupported_js' });
       }

@@ -190,7 +190,8 @@ export type ChainStage =
    * `template` / `regex`（jsext1028，ENGINE_SYNTAX_JS_EXT）：legado SourceRule.makeUpRule 对 JS 段的改写。`template` = 段内
    * `{{}}` 切出的片段，求值时拼回代码后再按 `##` 切（此时 code 是段原文，只作预算键）；无 `{{}}` 时编译期已切好，
    * code = 首段 trim，`regex` = 其后的替换，作用在 JS 结果上。`detached`（jsext1028）：条目级字段首段 JS 不读 result/src，
-   * 作用域没有原文时以空串起链（legado 首段 result 是 Element/Map，代码不碰它则产出相同）。
+   * 作用域没有原文时以空串起链（legado 首段 result 是 Element/Map，代码不碰它则产出相同）。pagejs1029 另给详情页 name/author/
+   * tocUrl 挂（init 收窄后的作用域，ENGINE_SYNTAX_PAGE_DETACHED）。
    */
   | { kind: 'js'; code: string; template?: JsTemplatePart[]; regex?: RegexSub; detached?: true }
   /** 剥掉 ## 尾缀后主体为空的段（如 `</js>##广告##`）：只对上一段结果做替换。 */
