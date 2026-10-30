@@ -14,7 +14,10 @@
 
 import { createHash } from 'node:crypto';
 import type { DownloadTaskLease } from './download-task-queue';
-import { PUBLICATION_RETRY_MAX_ATTEMPTS, SOURCE_RETRY_MAX_ATTEMPTS, sourceRetryDelayMs, type SourceRetryClass } from './download-task-policy';
+import {
+  HOST_WAIT_DELAY_MS, HOST_WAIT_MAX_FREE_CLAIMS, PUBLICATION_RETRY_MAX_ATTEMPTS, SOURCE_RETRY_MAX_ATTEMPTS,
+  sourceRetryDelayMs, type SourceRetryClass,
+} from './download-task-policy';
 import {
   gitBlobSha, isRetryablePublicationError, LeaseLostError, publishBookVersion, PublicationStageError, snapshotPaths,
   type GitHubContents, type PublishOutcome,
@@ -83,8 +86,8 @@ export interface WorkerStorage {
   progress(lease: DownloadTaskLease, update: { chaptersDone: number; chaptersTotal: number; charsTotal: number }): Promise<boolean>;
   /** 终态（租约条件）；false = 失租约。 */
   finish(lease: DownloadTaskLease, result: { status: 'done' | 'failed' | 'partial' | 'superseded_by_incomplete'; error?: string }): Promise<boolean>;
-  /** 非终态放回 pending 并退避（租约条件）；返回下次可领取时刻（ISO UTC），null = 失租约。 */
-  defer(lease: DownloadTaskLease, input: { delayMs: number; error?: string }): Promise<string | null>;
+  /** 非终态放回 pending 并退避（租约条件）；返回下次可领取时刻（ISO UTC），null = 失租约。countAttempt=false 不计 attempt（hostwait1031）。 */
+  defer(lease: DownloadTaskLease, input: { delayMs: number; error?: string; countAttempt?: boolean }): Promise<string | null>;
   /** 原样放回 pending（租约条件，不动 attempt_count/next_attempt_at）；false = 失租约。可选：缺省时停机放回不生效。 */
   releaseClaim?(lease: DownloadTaskLease): Promise<boolean>;
   /** T2 发布对账的 DB 前置：写前登记路径声明。 */
@@ -202,6 +205,13 @@ export interface WorkerOptions {
    * 发布阶段和终态守卫仍只看任务 signal，停机不打断发布。
    */
   shutdownSignal?: AbortSignal;
+  /**
+   * hostwait1031：true 时 adapter 回 source_unavailable + retryCause host_occupied（候选 host 全被别的任务
+   * 占着）按排队放回：不计 attempt、间隔 HOST_WAIT_DELAY_MS，不计数领取达 HOST_WAIT_MAX_FREE_CLAIMS 后回到
+   * 计数路径。缺省关 = 与引入前逐字一致。releaseClaim（停机/日预算满）同样只涨 lease_generation，也占这份
+   * 额度——只会更早回到旧行为，不会放宽上界。
+   */
+  hostWait?: boolean;
 }
 
 /** 切仓决策注入缝：端口（候选仓证据 + 显式时钟）与闭包重建工厂均由调用方（entry/测试）注入。 */
@@ -222,6 +232,8 @@ export interface WorkerResult {
   stage?: string;
   sourceHost?: string;
   retryAt?: string | null;
+  /** hostwait1031：本次放回是 host 排队（不计 attempt）。 */
+  hostWait?: true;
   feedback?: {
     code: 'LIMITER_FEEDBACK_UNAVAILABLE';
     origin: 'limiter-feedback';
@@ -417,6 +429,16 @@ export async function runDownloadTask(
         const stage = outcome.stage ?? 'unknown';
         const sourceHost = hostOf(task.source_url);
         const retryClass: SourceRetryClass = outcome.reason === 'no_candidates' ? 'no_candidates' : 'transient';
+        if (options.hostWait && outcome.reason === 'source_unavailable' && outcome.retryCause === 'host_occupied'
+          && lease.leaseGeneration - lease.attemptCount < HOST_WAIT_MAX_FREE_CLAIMS) {
+          const retryAt = await storage.defer(lease, {
+            delayMs: HOST_WAIT_DELAY_MS,
+            countAttempt: false,
+            error: `源 host 正忙（${stage} 阶段，第 ${lease.attemptCount} 次，不计次）：host_occupied，排队重试`,
+          });
+          if (!retryAt) throw new TaskLeaseLostError();
+          return { processed: true, reason: outcome.reason, stage, sourceHost, retryAt, hostWait: true };
+        }
         const { retryAt } = await settleSourceUnavailable(storage, lease, stage, retryClass);
         return retryAt
           ? { processed: true, reason: outcome.reason, stage, sourceHost, retryAt }

@@ -10,6 +10,7 @@ import {
   claimDownloadTask, deferDownloadTask, finishDownloadTask, heartbeatDownloadTask, retryDownloadTask, updateDownloadTaskProgress,
 } from './download-task-queue';
 import { findArtifactBinding, reserveArtifactPath } from './artifact-registry';
+import { HOST_WAIT_MAX_FREE_CLAIMS } from './download-task-policy';
 import { createWorkerStorage } from '../../runtime-download/storage';
 import {
   createEngineAdapter, runDownloadTask, runWorkerOnce, startLeaseHeartbeat,
@@ -415,6 +416,44 @@ maybe('T3 worker 任务层：租约、单写者、五阶段对账（PGlite + moc
     const result = await runDownloadTask({ storage: storageOver, github, adapters: [scriptAdapter({ kind: 'complete', txt, chaptersTotal: 3, chaptersDone: 3, charsTotal: 3 * 810 })], repositoryId: 1, branch: 'main' }, lease!);
     expect(result).toMatchObject({ processed: false, reason: 'lease_lost' });
     expect(await retryState(id)).toMatchObject({ status: 'failed', attempt_count: 1 });
+  });
+
+  // hostwait1031：回退候选 host 全被别的任务占着 ⇒ 开关开时排队放回、不计 attempt；不计数领取有上限。
+  const occupied: AdapterOutcome = {
+    kind: 'incomplete', reason: 'source_unavailable', stage: 'search', retryCause: 'host_occupied',
+    chaptersTotal: 0, chaptersDone: 0, charsTotal: 0,
+  };
+
+  it('hostwait1031：开关开 ⇒ attempt 不变、30m 后重领；开关关 ⇒ 与改前一致（+1、15m 阶梯）', async () => {
+    const id = await insertTask();
+    const on = await runDownloadTask(options([scriptAdapter(occupied)], { hostWait: true }), (await claimDownloadTask(sql as never, 'worker-a'))!);
+    expect(on).toMatchObject({ processed: true, reason: 'source_unavailable', stage: 'search', hostWait: true });
+    expect(on.terminal).toBeUndefined();
+    const waited = await retryState(id);
+    expect(waited).toMatchObject({ status: 'pending', attempt_count: 1, lease_owner: '', delay_min: 30 });
+    expect(waited.error).toContain('host_occupied');
+    await pg.query("UPDATE download_tasks SET next_attempt_at = now() - interval '1 second' WHERE id = $1", [id]);
+    const off = await runDownloadTask(options([scriptAdapter(occupied)]), (await claimDownloadTask(sql as never, 'worker-b'))!);
+    expect(off.hostWait).toBeUndefined();
+    expect(await retryState(id)).toMatchObject({ status: 'pending', attempt_count: 2, delay_min: 15 });
+  });
+
+  it('hostwait1031：普通 source_unavailable（无 retryCause）开关开也照旧计数', async () => {
+    const id = await insertTask();
+    const plain: AdapterOutcome = { kind: 'incomplete', reason: 'source_unavailable', stage: 'search', chaptersTotal: 0, chaptersDone: 0, charsTotal: 0 };
+    const result = await runDownloadTask(options([scriptAdapter(plain)], { hostWait: true }), (await claimDownloadTask(sql as never, 'worker-a'))!);
+    expect(result.hostWait).toBeUndefined();
+    expect(await retryState(id)).toMatchObject({ status: 'pending', attempt_count: 2, delay_min: 15 });
+  });
+
+  it.each([
+    [HOST_WAIT_MAX_FREE_CLAIMS - 2, 'pending'],
+    [HOST_WAIT_MAX_FREE_CLAIMS - 1, 'partial'],
+  ] as const)('hostwait1031 有界：已有 %i 次不计数领取 ⇒ %s（额度用尽回到计数路径，16 次照落 partial）', async (free, status) => {
+    const id = await insertTask('pending', { attempt_count: 16, lease_generation: 16 + free });
+    const result = await runDownloadTask(options([scriptAdapter(occupied)], { hostWait: true }), (await claimDownloadTask(sql as never, 'worker-a'))!);
+    expect(result.terminal).toBe(status === 'partial' ? 'partial' : undefined);
+    expect(await retryState(id)).toMatchObject({ status, attempt_count: 16 });
   });
 
   it('同内容重试不破坏 manifest：第二次发布保留首次 task_id/generated_at，规范幂等', async () => {

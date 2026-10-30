@@ -230,12 +230,14 @@ export async function finishDownloadTask(
 export async function deferDownloadTask(
   sql: DownloadQueueSql,
   lease: DownloadTaskLease,
-  input: { delayMs: number; error?: string },
+  input: { delayMs: number; error?: string; countAttempt?: boolean },
 ): Promise<string | null> {
   if (!Number.isSafeInteger(input.delayMs) || input.delayMs < 0) throw new Error('delayMs is invalid');
+  // hostwait1031：countAttempt=false（host 排队）只放回不计数；缺省计数，与改前逐字一致。
+  const increment = input.countAttempt === false ? 0 : 1;
   const rows = await sql`
     UPDATE download_tasks
-    SET status = 'pending', lease_owner = '', attempt_count = attempt_count + 1,
+    SET status = 'pending', lease_owner = '', attempt_count = attempt_count + ${increment}::int,
         next_attempt_at = now() + (${input.delayMs}::bigint * interval '1 millisecond'),
         error = ${input.error ?? ''}, updated_at = now()
     WHERE id = ${lease.id} AND status = 'running'

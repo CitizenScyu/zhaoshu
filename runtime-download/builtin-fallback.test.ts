@@ -1006,11 +1006,30 @@ describe('41-T8FB builtin-fallback', () => {
     };
     const out = await h.fallback.wrapAdapter(adapter({}, []), adapter({ 'a.example': gate }, calls), 'engine')
       .download(task({ source_kind: 'engine' }), context());
-    expect(out).toMatchObject({ kind: 'incomplete', reason: 'source_unavailable' });
+    expect(out).toEqual({
+      kind: 'incomplete', reason: 'source_unavailable', stage: 'search', retryCause: 'host_occupied',
+      chaptersTotal: 0, chaptersDone: 0, charsTotal: 0,
+    });
     expect(calls).toEqual(['a.example', 'b.example']);
     expect(state.failures).toEqual([[1, 'https://b.example/', 'permanent', 'identity_mismatch_or_no_candidate']]);
     expect(h.searched).toEqual([]);
     expect(state.stored).toEqual([]);
+  });
+
+  it('hostwait1031：原源付费墙预览、扫到的候选全被占用 ⇒ 按 host 排队收口，不落 preview_truncated 终态', async () => {
+    const state = { usable: [], stored: [] as [number, string[]][], failures: [] as [number, string, string, string][] };
+    const h = candidatesHarness(state);
+    const calls: string[] = [];
+    const gate: AdapterOutcome = {
+      kind: 'incomplete', reason: 'source_unavailable', retryCause: 'host_occupied',
+      chaptersTotal: 0, chaptersDone: 0, charsTotal: 0,
+    };
+    const preview: AdapterOutcome = { kind: 'incomplete', reason: 'preview_truncated', chaptersTotal: 9, chaptersDone: 9, charsTotal: 900 };
+    const out = await h.fallback.wrapAdapter(adapter({ 'book15.net': preview }, calls), adapter({ 'a.example': gate, 'b.example': gate }, calls))
+      .download(task(), context());
+    expect(out).toMatchObject({ kind: 'incomplete', reason: 'source_unavailable', stage: 'search', retryCause: 'host_occupied' });
+    expect(calls).toEqual(['book15.net', 'a.example', 'b.example']);
+    expect(state.failures).toEqual([]);
   });
 
   it('下载腿：失败分类落库（identity ⇒ permanent，超时 ⇒ temporary）', async () => {

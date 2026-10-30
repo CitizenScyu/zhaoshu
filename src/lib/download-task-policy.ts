@@ -34,6 +34,17 @@ export type SourceRetryClass = 'no_candidates' | 'transient';
 // attempt_count 记的是「自动放回 pending 的总次数」，不分原因，总数封顶，重试因此有界。
 export const PUBLICATION_RETRY_MAX_ATTEMPTS = SOURCE_RETRY_MAX_ATTEMPTS;
 
+/**
+ * hostwait1031：回退候选全被别的任务占着 host（host_occupied）不是源的问题，是排队——旧版照样
+ * attempt_count+1，同 host 长书在下时其余任务每 30 分钟烧一次额度（2026-10-30 生产：48h 内 11 本
+ * source_unavailable 终态里 6 本最后几轮是 host_occupied）。开关开时这类放回不计 attempt，间隔仍取
+ * 瞬时曲线封顶值（节奏与改前相同、不加出网）。有界：claim 每次 lease_generation+1，只有计数的放回会
+ * 让 attempt_count 跟着 +1，故 lease_generation − attempt_count 单调记「不计数的领取」，达
+ * HOST_WAIT_MAX_FREE_CLAIMS 后回到计数路径，退避总量依旧有界。
+ */
+export const HOST_WAIT_DELAY_MS = SOURCE_RETRY_MAX_DELAY_MS;
+export const HOST_WAIT_MAX_FREE_CLAIMS = 32;
+
 /** 第 attempt 次（1 起，即领取时的 attempt_count）不可达后的退避时长。 */
 export function sourceRetryDelayMs(attempt: number, retryClass: SourceRetryClass = 'transient'): number {
   const exponent = Math.max(0, Math.min(Math.floor(attempt) - 1, 30));

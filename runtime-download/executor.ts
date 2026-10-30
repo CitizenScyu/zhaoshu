@@ -120,6 +120,8 @@ export interface ExecutorDependencies {
    * entry 由 env DOWNLOAD_SHUTDOWN_RELEASE=1 开。
    */
   releaseOnShutdown?: boolean;
+  /** hostwait1031：透传 WorkerOptions.hostWait（host_occupied 放回不计 attempt）。entry 由 env DOWNLOAD_HOST_WAIT=1 开，缺省关。 */
+  hostWait?: boolean;
   // ---- 测试注入缝 ----
   now?: () => number;
   /** 冷却等待；signal 中止时须尽快 resolve（不 reject）。 */
@@ -161,10 +163,11 @@ export function createExecutor(deps: ExecutorDependencies): DownloadExecutor {
     taskTimeoutMs: deps.taskTimeoutMs,
     ...(deps.rollover ? { rollover: deps.rollover } : {}),
     ...(deps.releaseOnShutdown && signal ? { shutdownSignal: signal } : {}),
+    ...(deps.hostWait ? { hostWait: true } : {}),
   });
   // 书源不可达的结构化日志：扣额度前预检与下载腿打同一行，只含原因码/阶段/源 host/下次可重试时刻。
-  const logSourceUnavailable = (reason: string, stage: string, host: string, retryAt: string | null) =>
-    log('info', '书源不可达', { reason, stage, host, retryAt });
+  const logSourceUnavailable = (reason: string, stage: string, host: string, retryAt: string | null, hostWait = false) =>
+    log('info', '书源不可达', { reason, stage, host, retryAt, ...(hostWait ? { hostWait: true } : {}) });
 
   // 单轮本体（配额闸在下方对外的 runOnce）。
   const inner: DownloadExecutor = {
@@ -289,7 +292,7 @@ export function createExecutor(deps: ExecutorDependencies): DownloadExecutor {
       const shutdownReleased = !result.processed && result.reason === 'shutdown_released';
       if (shutdownReleased) log('info', '停机中止在途下载，已放回 pending', { reason: 'shutdown_released' });
       const sourceUnavailable = result.processed && (result.reason === 'source_unavailable' || result.reason === 'no_candidates');
-      if (sourceUnavailable) logSourceUnavailable(result.reason ?? 'source_unavailable', result.stage ?? 'unknown', result.sourceHost ?? '', result.retryAt ?? null);
+      if (sourceUnavailable) logSourceUnavailable(result.reason ?? 'source_unavailable', result.stage ?? 'unknown', result.sourceHost ?? '', result.retryAt ?? null, result.hostWait === true);
       if (sourceUnavailable || shutdownReleased) {
         // 书源不可达不计日预算：退还本次领取时的扣减。退还失败不影响已落库的任务状态，
         // 记一行错误（配额按已扣处理，保守侧）。

@@ -408,6 +408,8 @@ export async function createDownloadExecutor(options: ProductionExecutorOptions)
     ...(rollover ? { rollover } : {}),
     // shutrel1030：停机中止在途下载并原样放回 pending（见 executor releaseOnShutdown）。缺省关。
     ...(env.DOWNLOAD_SHUTDOWN_RELEASE === '1' ? { releaseOnShutdown: true } : {}),
+    // hostwait1031：回退候选 host 全被占用时排队放回、不计 attempt（见 WorkerOptions.hostWait）。缺省关。
+    ...(env.DOWNLOAD_HOST_WAIT === '1' ? { hostWait: true } : {}),
     // 数据库配额（Neon 402）长退避：默认 30 分钟，env DB_QUOTA_BACKOFF_MS 覆盖；恢复后在 cron_health 补记。
     quotaBackoffMs: dbQuotaBackoffMs(env),
     recordQuotaSeen: quotaSql ? (seenAt => recordDbQuotaSeen(quotaSql, seenAt)) : undefined,

@@ -383,6 +383,7 @@ export function createBuiltinFallback(options: BuiltinFallbackOptions) {
           if (stop) return stop;
           if (!sources.length) return primary ?? unavailable('search', lastScanned > 0);
           let supplemented = false;
+          let occupied = false;
           for (;;) {
             let allFailed = true;
             for (const url of sources) {
@@ -416,6 +417,7 @@ export function createBuiltinFallback(options: BuiltinFallbackOptions) {
               if (next.retryCause === 'host_occupancy_unavailable') return next;
               if (next.retryCause === 'host_occupied') {
                 allFailed = false;
+                occupied = true;
                 continue;
               }
               if (SOURCE_LEVEL_INCOMPLETE_REASONS.has(next.reason)) {
@@ -445,6 +447,9 @@ export function createBuiltinFallback(options: BuiltinFallbackOptions) {
           }
           stop = stopped(context.signal);
           if (stop) return stop;
+          // hostwait1031：有候选只是 host 正被别的任务占着（没真试过）⇒ 带 retryCause 收口，让任务层按排队
+          // 处理（WorkerOptions.hostWait）；也先于下面的身份终态——候选还没试，不能判这本书无源。
+          if (occupied) return { ...unavailable('search'), retryCause: 'host_occupied' };
           // nocandrev41 F1：预检判定过身份缺失（原源可达但无此书）且候选全失败 ⇒ 按身份失败
           // 终态收口（与预检腿选不到候选同一语义），不降级成 source_unavailable 16 轮退避重扫。
           if (primary === null && plan?.identityMissed) return { kind: 'failure', code: 'identity_mismatch_or_no_candidate' };
