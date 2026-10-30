@@ -20,7 +20,7 @@ import {
 import { enginePostSearchEnabled, engineSearchJsActive } from './compile-smoke';
 import { preloadJsSandbox } from './js-sandbox';
 import { buildSearchRequestWithNet, evaluateWithFieldNet, prepareSearchJs, searchJsTemplateLimit } from './search-js';
-import { engineSyntaxJsBindEnabled } from './syntax-flags';
+import { engineSyntaxJsBindEnabled, engineTocNextSkipChapterEnabled } from './syntax-flags';
 import { RuleEngineError, type CompiledRules, type FieldIr, type SkippedField } from './types';
 import { stripUrlOptions } from './url-options';
 
@@ -373,7 +373,9 @@ export async function engineFetchToc(
     const nextField = field(source.compiled, 'ruleToc.nextTocUrl');
     if (nextUsesList(nextField, scope)) {
       // JS 链在 JSON 页上照样求值（JS 段常用来解析 JSON 拼下一页）。
-      const urls = chainNextUrls(nextField, scope, page.url, strict, nextField.nextList ? visited : undefined);
+      let urls = chainNextUrls(nextField, scope, page.url, strict, nextField.nextList ? visited : undefined);
+      // tocself1030：翻页规则命中本目录已收的章节链接（标题含「下一」）不是后页；legado 抓了也是 0 章，净效果同剔除。
+      if (engineTocNextSkipChapterEnabled()) urls = urls.filter((url) => !seenUrls.has(url));
       next = urls.length === 1 ? urls[0] : undefined;
       if (urls.length > 1) {
         fanout.push(...urls.filter((url) => !visited.has(url)));

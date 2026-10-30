@@ -6,7 +6,7 @@ import { engineFetchContent, engineFetchToc, type EngineSource } from './api';
 import { compileSource } from './compile';
 import { createScope, evaluateField, evaluateFieldStrings, normalizeBody } from './evaluate';
 import { parseFieldRule } from './parse';
-import { engineSyntaxNextListEnabled } from './syntax-flags';
+import { engineSyntaxNextListEnabled, engineTocNextSkipChapterEnabled } from './syntax-flags';
 
 const SITE = 'https://book15.net'; // 过 host 门（.example 保留域取页被拒）
 const on = (rule: string, field = 'ruleToc.nextTocUrl', extra = {}) => parseFieldRule(rule, { field, nextListEnabled: true, ...extra });
@@ -23,6 +23,9 @@ describe('开关', () => {
     expect(engineSyntaxNextListEnabled({ ENGINE_SYNTAX_NEXT_LIST: 'yes' })).toBe(false);
     expect(engineSyntaxNextListEnabled({ ENGINE_SYNTAX_NEXT_LIST: ' On ' })).toBe(true);
     expect(engineSyntaxNextListEnabled({ ENGINE_SYNTAX_NEXT_LIST: 'true' })).toBe(true);
+    expect(engineTocNextSkipChapterEnabled({})).toBe(false);
+    expect(engineTocNextSkipChapterEnabled({ ENGINE_TOC_NEXT_SKIP_CHAPTER: 'yes' })).toBe(false);
+    expect(engineTocNextSkipChapterEnabled({ ENGINE_TOC_NEXT_SKIP_CHAPTER: ' On ' })).toBe(true);
   });
 });
 
@@ -124,6 +127,25 @@ describe('门面', () => {
       `${SITE}/t/1.html`, ctx(pages, seen), true);
     expect(toc.chapters.map((c) => c.title)).toEqual(['第1章', '第2章', '第3章']);
     expect(seen).toEqual([1, 2, 3].map((n) => `${SITE}/t/${n}.html`));
+  });
+
+  it('目录：翻页规则命中标题含「下一」的章节链接（tocself1030）on 剔除收尾；off strict 抓章节页得 empty_toc_page', async () => {
+    const named = (n: number, title: string) => `<li class="ch"><a href="/c/${n}.html">${title}</a></li>`;
+    const pages = new Map([
+      [`${SITE}/t/1.html`, `<ul>${named(1, '第1章 下一站')}</ul><a href="/t/2.html">下一页</a>`],
+      [`${SITE}/t/2.html`, `<ul>${ch(2)}${named(3, '第3章 下一步')}</ul>`],
+      [`${SITE}/c/1.html`, `<div class="content">一</div><a href="/c/2.html">下一章</a>`],
+      [`${SITE}/c/3.html`, `<div class="content">三</div><a href="/c/4.html">下一章</a>`],
+    ]);
+    const rules = (next: string) => ({ ruleToc: { chapterList: '.ch', chapterName: 'a@text', chapterUrl: 'a@href', nextTocUrl: next } });
+    vi.stubEnv('ENGINE_SYNTAX_NEXT_LIST', '1');
+    vi.stubEnv('ENGINE_TOC_NEXT_SKIP_CHAPTER', '1');
+    const seen: string[] = [];
+    const toc = await engineFetchToc(src(rules('text.下一@href')), `${SITE}/t/1.html`, ctx(pages, seen), true);
+    expect(toc.chapters.map((c) => c.title)).toEqual(['第1章 下一站', '第2章', '第3章 下一步']);
+    expect(seen).toEqual([`${SITE}/t/1.html`, `${SITE}/t/2.html`]);
+    vi.stubEnv('ENGINE_TOC_NEXT_SKIP_CHAPTER', '0');
+    await expect(engineFetchToc(src(rules('text.下一@href')), `${SITE}/t/1.html`, ctx(pages, []), true)).rejects.toThrow('empty_toc_page');
   });
 
   it('正文：下一页最后指向下一章时停，与 off 同结果', async () => {

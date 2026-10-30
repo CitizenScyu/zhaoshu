@@ -892,3 +892,14 @@ export function engineSearchPagePatternEnabled(env: OrEnv = process.env): boolea
   const raw = env.ENGINE_SEARCH_PAGE_PATTERN?.trim().toLowerCase();
   return raw === '1' || raw === 'true' || raw === 'on';
 }
+
+/**
+ * ENGINE_TOC_NEXT_SKIP_CHAPTER 独立开关（tocself1030，默认 off，口径同 ENGINE_SYNTAX_OR）。列表口径的目录翻页（api.ts nextUsesList：
+ * JS 链 / nextList）取到的 URL 若正是已收的章节 URL（`text.下一@href` 命中标题含「下一」的章节链接），legado 会去抓这些章节页、
+ * 章节列表为空不添条目，净效果同剔除；引擎原把它当后页、0 章即 empty_toc_page。on = 剔除这类 URL。off = 逐字不变。
+ * 无新位：只改目录求值。
+ */
+export function engineTocNextSkipChapterEnabled(env: OrEnv = process.env): boolean {
+  const raw = env.ENGINE_TOC_NEXT_SKIP_CHAPTER?.trim().toLowerCase();
+  return raw === '1' || raw === 'true' || raw === 'on';
+}
