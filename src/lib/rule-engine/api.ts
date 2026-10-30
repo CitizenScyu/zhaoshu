@@ -20,7 +20,7 @@ import {
 import { enginePostSearchEnabled, engineSearchJsActive } from './compile-smoke';
 import { preloadJsSandbox } from './js-sandbox';
 import { buildSearchRequestWithNet, evaluateWithFieldNet, prepareSearchJs, searchJsTemplateLimit } from './search-js';
-import { engineSyntaxJsBindEnabled, engineTocNextSkipChapterEnabled } from './syntax-flags';
+import { engineSyntaxJsBindEnabled, engineTocNextSkipChapterEnabled, engineTocStrictIgnoreUpdateTimeEnabled } from './syntax-flags';
 import { RuleEngineError, type CompiledRules, type FieldIr, type SkippedField } from './types';
 import { stripUrlOptions } from './url-options';
 
@@ -335,7 +335,10 @@ export async function engineFetchToc(
     let scope = tocScope();
     let validChapters = 0;
     const list = field(source.compiled, 'ruleToc.chapterList');
-    if (strict && [...source.compiled.entries()].some(([key, value]) => key.startsWith('ruleToc.') && 'skipped' in value)) throw new Error('unsupported_toc_rule');
+    // toctime1030：updateTime 只供展示、目录求值不读，开关开时它编不过也不拦 strict。
+    const ignoreTime = engineTocStrictIgnoreUpdateTimeEnabled();
+    if (strict && [...source.compiled.entries()].some(([key, value]) => key.startsWith('ruleToc.') && 'skipped' in value
+      && !(ignoreTime && key === 'ruleToc.updateTime'))) throw new Error('unsupported_toc_rule');
     if (list) {
       // fieldnet1029：chapterList 的 java.ajax 页面取回后重放（作用域现建；章节只在求值成功后才逐条收）。
       const scopeOf = replayScope(scope, tocScope);

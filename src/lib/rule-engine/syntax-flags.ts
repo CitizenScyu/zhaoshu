@@ -920,3 +920,13 @@ export function engineTocNextSkipChapterEnabled(env: OrEnv = process.env): boole
   const raw = env.ENGINE_TOC_NEXT_SKIP_CHAPTER?.trim().toLowerCase();
   return raw === '1' || raw === 'true' || raw === 'on';
 }
+
+/**
+ * ENGINE_TOC_STRICT_IGNORE_UPDATE_TIME 独立开关（toctime1030，默认 off，口径同 ENGINE_SYNTAX_OR）。strict 目录（下载）见任一 ruleToc
+ * 字段编译被 skip 即抛 unsupported_toc_rule；ruleToc.updateTime 只供展示、目录求值不读（如 17k 的 `{{java.timeFormat(…)}}`），
+ * 不该拦整本。on = 只有 updateTime 被 skip 时不抛。off = 逐字不变。无新位：只改下载目录门槛。
+ */
+export function engineTocStrictIgnoreUpdateTimeEnabled(env: OrEnv = process.env): boolean {
+  const raw = env.ENGINE_TOC_STRICT_IGNORE_UPDATE_TIME?.trim().toLowerCase();
+  return raw === '1' || raw === 'true' || raw === 'on';
+}
