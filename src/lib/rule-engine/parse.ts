@@ -33,6 +33,7 @@ import {
   engineSyntaxNullSkipEnabled, engineSyntaxPageDetachedEnabled, engineSyntaxLastAttrEnabled, engineSyntaxNextListEnabled,
   engineSyntaxRulePrefixEnabled, engineSyntaxTemplateHashEnabled, engineSyntaxBracketIndexEnabled, engineSyntaxSelfMatchEnabled,
   engineSyntaxBareAttrEnabled, engineSyntaxAttrQuoteEnabled, engineSyntaxAttrRegexEnabled, engineSyntaxChildrenEnabled,
+  engineSyntaxTrailDotEnabled,
 } from './syntax-flags';
 import { rewriteLegadoAttrRegex } from './attr-regex';
 import { compileXPath, XPathSyntaxError } from './xpath-eval';
@@ -106,6 +107,11 @@ let attrRegex = false;
  * 见 CssStep.children）。嵌套解析经选项透传同口径。
  */
 let childrenKw = false;
+/**
+ * 当前 parseFieldRule 帧是否按 traildot1030 去掉旧索引写法剥后缀后关键字段尾的单点（ParseOptions.trailDotEnabled，见 translateStep）。
+ * 嵌套解析经选项透传同口径。
+ */
+let trailDot = false;
 /**
  * fieldnet1029：可放行 `java.ajax` 的字段——页面级、取书链路必需的那几个（每页求值一次，取页次数有界）。条目级字段（如
  * lastChapter）逐条联网会把请求预算吃光，装饰字段丢了不影响取书，都不收（照旧拒）。
@@ -412,6 +418,10 @@ function translateStep(raw: string, rule: string): CssStep {
     s = extractSuffixes(s, step, rule);
   }
 
+  // traildot1030：legado findIndexSet 的 beforeRule 停在 `!`/`[` 前，`tag.li.!0` 剩 `tag.li.`；关键字前缀按 `.` 切只取第二段，
+  // 尾点无害。引擎原把 `li.` 当选择器抛错。只收剥过后缀、形如 `关键字.名.`/`children.` 的段。
+  if (trailDot && s !== raw.trim() && /^\s*(?:(?:tag|class|id)\.[\w-]+|children)\.\s*$/.test(s)) s = s.trim().slice(0, -1);
+
   // children1030：legado 前置规则首段为 `children` 即 temp.children()（不是标签名）。
   if (childrenKw && s.trim() === 'children') {
     step.children = true;
@@ -591,6 +601,16 @@ export function ruleMayUseChildren(rule: string): boolean {
   if (/^\s*(?:\$|@json:|@css:|@xpath:|\/)/i.test(rule)) return false;
   return rule.split('##')[0].split(/\|\||&&|%%|@/)
     .some((seg) => /^\s*children\s*(?:(?:[.!]-?\d+(?::-?\d+)*)|\[[^\]]*\])?\s*$/.test(seg));
+}
+
+/**
+ * 规则文本里是否可能有 traildot1030 的尾点段（compile.ts sourceUsesTrailDotSyntax 的语义位判据，宁多勿漏）：非 JSONPath/XPath/`@css:`
+ * 规则按 `||`/`&&`/`%%`/`@` 切段（先剥 `##` 尾缀），任一段形如 `关键字.名.!…`/`关键字.名.[…]`/`children.!…`/`children.[…]`。
+ */
+export function ruleMayUseTrailDot(rule: string): boolean {
+  if (/^\s*(?:\$|@json:|@css:|@xpath:|\/)/i.test(rule)) return false;
+  return rule.split('##')[0].split(/\|\||&&|%%|@/)
+    .some((seg) => /^\s*(?:(?:tag|class|id)\.[\w-]+|children)\.\s*(?:!-?\d|\[)/.test(seg));
 }
 
 /** :contains(X) 里的文本转义（去掉可能破坏 css-select 的引号/括号）。 */
@@ -1071,6 +1091,11 @@ export interface ParseOptions {
    * 默认读 env（缺失=off）。
    */
   childrenEnabled?: boolean;
+  /**
+   * traildot1030：旧索引写法剥后缀后剩 `关键字.名.`/`children.` 的段去掉尾点（ENGINE_SYNTAX_TRAIL_DOT，见 translateStep）。
+   * 默认读 env（缺失=off）。
+   */
+  trailDotEnabled?: boolean;
 }
 
 /**
@@ -1100,6 +1125,7 @@ function parseFieldRuleFramed(rule: string, options: ParseOptions): FieldIr {
   const savedQuote = attrQuote;
   const savedRegex = attrRegex;
   const savedChildren = childrenKw;
+  const savedTrailDot = trailDot;
   jsonPathExt = options.jsonPathEnabled ?? engineSyntaxJsonPathEnabled();
   jsObjectKeys = bindActive(options);
   lastAttr = lastAttrActive(options);
@@ -1109,6 +1135,7 @@ function parseFieldRuleFramed(rule: string, options: ParseOptions): FieldIr {
   attrQuote = options.attrQuoteEnabled ?? engineSyntaxAttrQuoteEnabled();
   attrRegex = options.attrRegexEnabled ?? engineSyntaxAttrRegexEnabled();
   childrenKw = options.childrenEnabled ?? engineSyntaxChildrenEnabled();
+  trailDot = options.trailDotEnabled ?? engineSyntaxTrailDotEnabled();
   sourceFrame = options.sourceConsts ?? sourceFrame;
   varBag = options.varBag;
   jsoupFrame = undefined;
@@ -1181,6 +1208,7 @@ function parseFieldRuleFramed(rule: string, options: ParseOptions): FieldIr {
     attrQuote = savedQuote;
     attrRegex = savedRegex;
     childrenKw = savedChildren;
+    trailDot = savedTrailDot;
   }
 }
 
@@ -1213,6 +1241,7 @@ function jsSegmentOptions(options: ParseOptions): ParseOptions {
     rulePrefixEnabled: options.rulePrefixEnabled, bracketIndexEnabled: options.bracketIndexEnabled,
     selfMatchEnabled: options.selfMatchEnabled, attrQuoteEnabled: options.attrQuoteEnabled,
     attrRegexEnabled: options.attrRegexEnabled, childrenEnabled: options.childrenEnabled,
+    trailDotEnabled: options.trailDotEnabled,
   };
 }
 
@@ -1560,6 +1589,7 @@ function parseJsChain(trimmed: string, rule: string, options: ParseOptions): Fie
     bracketIndexEnabled: options.bracketIndexEnabled,
     selfMatchEnabled: options.selfMatchEnabled, attrQuoteEnabled: options.attrQuoteEnabled,
     attrRegexEnabled: options.attrRegexEnabled, childrenEnabled: options.childrenEnabled,
+    trailDotEnabled: options.trailDotEnabled,
   };
   const gets: JsGets | undefined = (options.jsGetEnabled ?? engineSyntaxJsGetEnabled())
     ? { options: segmentOptions, out: new Map(), aliases: initJs } : undefined;
@@ -1664,6 +1694,7 @@ function parseListJsChain(rule: string, options: ParseOptions): FieldIr {
         rulePrefixEnabled: options.rulePrefixEnabled, bracketIndexEnabled: options.bracketIndexEnabled,
         selfMatchEnabled: options.selfMatchEnabled, attrQuoteEnabled: options.attrQuoteEnabled,
         attrRegexEnabled: options.attrRegexEnabled, childrenEnabled: options.childrenEnabled,
+        trailDotEnabled: options.trailDotEnabled,
       },
       out: new Map(),
     }

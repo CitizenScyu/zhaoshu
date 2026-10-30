@@ -23,7 +23,7 @@ export const ENGINE_SEMANTICS_XPATH_BIT = 2;
 /** vars1027：@put/@get 静态子集语义位。版本再 +4（5–8 = 含变量位的四种组合），1–4 逐字不变。 */
 export const ENGINE_SEMANTICS_VARS_BIT = 4;
 
-/** 语义版本随 || / XPath / 变量 / JS / XPath 求值 / 正则 / && / AllInOne / 搜索 JS / 列表 JS / JS 扩展 / 宿主绑定 / java.getString / 加解密帮手 / JSONPath 扩展 / 详情 init / 搜索选项 legado 口径 / URL 字段选项 / 搜索 webView / 详情 JS init / 详情→目录变量袋 / jsoup 直连 / 书籍成员 / 搜索 URL→搜索字段变量袋 / 搜索条目袋 / 列表 JS getter / 书籍变量 / jsLib / 书源常量 / jsoup JS init / 搜索联网 JS / 字段联网 JS / 搜索 java.connect / 搜索 java.get·post / 末段裸名属性 / 规则前缀大小写 / 模板内 ## / [索引] / 选择器含自身 / 单段裸名属性 / jsoup 文档模式 / 属性值含空白 / 属性正则 / children 关键字 / 搜索页码列表 开关联动（唯一口径，供 compile.ts 缓存键与 rulesHash 复用）。 */
+/** 语义版本随 || / XPath / 变量 / JS / XPath 求值 / 正则 / && / AllInOne / 搜索 JS / 列表 JS / JS 扩展 / 宿主绑定 / java.getString / 加解密帮手 / JSONPath 扩展 / 详情 init / 搜索选项 legado 口径 / URL 字段选项 / 搜索 webView / 详情 JS init / 详情→目录变量袋 / jsoup 直连 / 书籍成员 / 搜索 URL→搜索字段变量袋 / 搜索条目袋 / 列表 JS getter / 书籍变量 / jsLib / 书源常量 / jsoup JS init / 搜索联网 JS / 字段联网 JS / 搜索 java.connect / 搜索 java.get·post / 末段裸名属性 / 规则前缀大小写 / 模板内 ## / [索引] / 选择器含自身 / 单段裸名属性 / jsoup 文档模式 / 属性值含空白 / 属性正则 / children 关键字 / 搜索页码列表 / 索引尾点 开关联动（唯一口径，供 compile.ts 缓存键与 rulesHash 复用）。 */
 export function engineSemanticsVersion(
   orEnabled: boolean, xpathEnabled = false, varsEnabled = false, jsEnabled = false, xpathEvalEnabled = false,
   regexEnabled = false, andEnabled = false, aioEnabled = false, searchJsEnabled = false, listJsEnabled = false,
@@ -34,7 +34,7 @@ export function engineSemanticsVersion(
   searchNetJsEnabled = false, fieldNetJsEnabled = false, searchConnectJsEnabled = false, searchGetPostJsEnabled = false,
   lastAttrEnabled = false, rulePrefixEnabled = false, templateHashEnabled = false, bracketIndexEnabled = false,
   selfMatchEnabled = false, bareAttrEnabled = false, jsoupDoctypeEnabled = false, attrQuoteEnabled = false, attrRegexEnabled = false,
-  childrenEnabled = false, searchPagePatternEnabled = false,
+  childrenEnabled = false, searchPagePatternEnabled = false, trailDotEnabled = false,
 ): number {
   return (orEnabled ? ENGINE_SEMANTICS_VERSION_OR : ENGINE_SEMANTICS_VERSION)
     + (xpathEnabled ? ENGINE_SEMANTICS_XPATH_BIT : 0) + (varsEnabled ? ENGINE_SEMANTICS_VARS_BIT : 0)
@@ -59,7 +59,8 @@ export function engineSemanticsVersion(
     + (selfMatchEnabled ? ENGINE_SEMANTICS_SELF_MATCH_BIT : 0) + (bareAttrEnabled ? ENGINE_SEMANTICS_BARE_ATTR_BIT : 0)
     + (jsoupDoctypeEnabled ? ENGINE_SEMANTICS_JSOUP_DOCTYPE_BIT : 0) + (attrQuoteEnabled ? ENGINE_SEMANTICS_ATTR_QUOTE_BIT : 0)
     + (attrRegexEnabled ? ENGINE_SEMANTICS_ATTR_REGEX_BIT : 0) + (childrenEnabled ? ENGINE_SEMANTICS_CHILDREN_BIT : 0)
-    + (searchPagePatternEnabled ? ENGINE_SEMANTICS_SEARCH_PAGE_PATTERN_BIT : 0);
+    + (searchPagePatternEnabled ? ENGINE_SEMANTICS_SEARCH_PAGE_PATTERN_BIT : 0)
+    + (trailDotEnabled ? ENGINE_SEMANTICS_TRAIL_DOT_BIT : 0);
 }
 
 /**
@@ -890,6 +891,22 @@ export const ENGINE_SEMANTICS_SEARCH_PAGE_PATTERN_BIT = 70368744177664;
  */
 export function engineSearchPagePatternEnabled(env: OrEnv = process.env): boolean {
   const raw = env.ENGINE_SEARCH_PAGE_PATTERN?.trim().toLowerCase();
+  return raw === '1' || raw === 'true' || raw === 'on';
+}
+
+/**
+ * traildot1030：索引尾点语义位。版本再 +140737488355328（2^47；其余位逐字不变，bigint 列）。只对 ENGINE_SYNTAX_TRAIL_DOT on、
+ * 准入搜索 bookList/name/author/bookUrl 有尾点段（compile.ts sourceUsesTrailDotSyntax，静态近似）的源计入。
+ */
+export const ENGINE_SEMANTICS_TRAIL_DOT_BIT = 140737488355328;
+
+/**
+ * ENGINE_SYNTAX_TRAIL_DOT 独立开关（traildot1030，默认 off，口径同 ENGINE_SYNTAX_OR）。legado AnalyzeByJSoup.ElementsSingle
+ * findIndexSet 旧写法的 beforeRule 停在 `!` 前（`tag.li.!0:1:-1` 剩 `tag.li.`），关键字前缀按 `.` 切只取第二段，尾点无害；引擎剥完
+ * 后缀把 `li.` 当选择器抛 RULE_EVAL_FAILED。on = 剥过后缀、形如 `tag|class|id.名.`/`children.` 的段去掉尾点。off = 逐字不变。
+ */
+export function engineSyntaxTrailDotEnabled(env: OrEnv = process.env): boolean {
+  const raw = env.ENGINE_SYNTAX_TRAIL_DOT?.trim().toLowerCase();
   return raw === '1' || raw === 'true' || raw === 'on';
 }
 

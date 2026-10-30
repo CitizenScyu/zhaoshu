@@ -15,7 +15,7 @@ import { AIO_LIST_FIELDS, aioGroups } from './aio-syntax';
 import {
   FIELD_NET_FIELDS, initFieldSupported, initJsFieldSupported, initRuleTextSupported, jsChainFieldAllowed, listJsGroups, objectKeyOf, parseFieldRule,
   ruleHasJs, ruleHashInTemplate, ruleMayUseAttrQuote, ruleMayUseAttrRegex, ruleMayUseBareAttr, ruleMayUseBracketIndex, ruleMayUseChildren,
-  ruleMayUseLastAttr, ruleMayUseRulePrefix, type ParseOptions,
+  ruleMayUseLastAttr, ruleMayUseRulePrefix, ruleMayUseTrailDot, type ParseOptions,
   type SourceConsts,
 } from './parse';
 import type { CompiledRules, FieldIr, RuleIr } from './types';
@@ -30,7 +30,7 @@ import {
   engineFieldNetJsEnabled, engineSearchConnectJsEnabled, engineSearchGetPostJsEnabled, engineSyntaxLastAttrEnabled,
   engineSyntaxRulePrefixEnabled, engineSyntaxTemplateHashEnabled, engineSyntaxBracketIndexEnabled, engineSyntaxSelfMatchEnabled,
   engineSyntaxBareAttrEnabled, engineSyntaxJsoupDoctypeEnabled, ENGINE_SEMANTICS_JSOUP_DOCTYPE_BIT, engineSyntaxAttrQuoteEnabled,
-  engineSyntaxAttrRegexEnabled, engineSyntaxChildrenEnabled, engineSearchPagePatternEnabled,
+  engineSyntaxAttrRegexEnabled, engineSyntaxChildrenEnabled, engineSearchPagePatternEnabled, engineSyntaxTrailDotEnabled,
 } from './syntax-flags';
 import { urlOptionFields } from './url-options';
 import {
@@ -160,6 +160,8 @@ export function engineVersionedKey(contentRevision: string, semanticsVersion = E
  * （sourceUsesChildrenSyntax）时再加 children 关键字位（+35184372088832）；其余字段同上不计位。
  * pagepat1030：ENGINE_SEARCH_PAGE_PATTERN on 且 searchUrl 是含 `<…>` 页码列表的旧口径模板（searchTemplateUsesPagePattern）时
  * 再加搜索页码列表位（+70368744177664）。
+ * traildot1030：ENGINE_SYNTAX_TRAIL_DOT on 且准入搜索判定读的 ruleSearch.bookList/name/author/bookUrl 有尾点段
+ * （sourceUsesTrailDotSyntax）时再加索引尾点位（+140737488355328）；其余字段同上不计位。
  */
 export function engineSourceRevision(
   source: { url: string; searchUrl: unknown; rules: Record<string, unknown> },
@@ -329,6 +331,7 @@ export function engineSourceRevision(
     (options.attrRegexEnabled ?? engineSyntaxAttrRegexEnabled()) && sourceUsesAttrRegexSyntax(rules),
     (options.childrenEnabled ?? engineSyntaxChildrenEnabled()) && sourceUsesChildrenSyntax(rules),
     (options.searchPagePatternEnabled ?? engineSearchPagePatternEnabled()) && searchTemplateUsesPagePattern(source.searchUrl),
+    (options.trailDotEnabled ?? engineSyntaxTrailDotEnabled()) && sourceUsesTrailDotSyntax(rules),
   );
   // doctype1029：jsoup 开关改得动该源任一位 ⇔ 有字段（含变量袋/搜索袋/条目袋等帧内编译）经 jsoup 重编、求值摸得到 jsoup 层。
   // 只看 jsoup 位会漏掉袋字段（如 searchUrl put、bookList 首段取节点 + JS 读袋的源）。
@@ -500,6 +503,20 @@ export function sourceUsesChildrenSyntax(rules: Record<string, unknown>): boolea
   return ['bookList', 'name', 'author', 'bookUrl'].some((key) => {
     const rule = fields[key];
     return typeof rule === 'string' && ruleMayUseChildren(rule);
+  });
+}
+
+/**
+ * 准入搜索判定读的 ruleSearch.bookList/name/author/bookUrl 里是否可能有 traildot1030 的尾点段（口径见 parse.ts ruleMayUseTrailDot；
+ * 理由同 sourceUsesOrSyntax）。
+ */
+export function sourceUsesTrailDotSyntax(rules: Record<string, unknown>): boolean {
+  const search = rules.ruleSearch;
+  if (!search || typeof search !== 'object' || Array.isArray(search)) return false;
+  const fields = search as Record<string, unknown>;
+  return ['bookList', 'name', 'author', 'bookUrl'].some((key) => {
+    const rule = fields[key];
+    return typeof rule === 'string' && ruleMayUseTrailDot(rule);
   });
 }
 
