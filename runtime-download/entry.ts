@@ -25,7 +25,7 @@ import { createBudgetRefund } from './budget-refund';
 import { createIdentityPrecheck } from './identity-precheck';
 import { createBuiltinFallback } from './builtin-fallback';
 import { createHostOccupancy, type HostOccupancy } from './host-occupancy';
-import { createHostPriority, scanRotateEnabled } from './host-priority';
+import { createHostPriority, scanRotateEnabled, skipStrictTocEnabled } from './host-priority';
 import {
   failedCandidateSources, markCandidateFailure, occupiedHosts, replaceSourceCandidates,
   usableSourceCandidates,
@@ -328,6 +328,7 @@ export async function createDownloadExecutor(options: ProductionExecutorOptions)
       loadPool: options.loadEnginePool ?? (signal => loadEnginePool(modules, signal)),
       hostPriority: candidateSql ? createHostPriority(candidateSql, env) : undefined,
       scanRotate: scanRotateEnabled(env),
+      skipStrictToc: skipStrictTocEnabled(env),
       ...(candidateSql ? {
         candidates: {
           usable: (bookId) => usableSourceCandidates(candidateSql, bookId),

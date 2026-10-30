@@ -23,6 +23,12 @@ export function scanRotateEnabled(env: Record<string, string | undefined> = proc
   return raw === '1' || raw === 'true' || raw === 'on';
 }
 
+/** toctgate1030：DOWNLOAD_SCAN_SKIP_STRICT_TOC 开 ⇒ 选源跳过 strict 目录必拒的源（见 source-selector skipStrictToc）。缺省关。 */
+export function skipStrictTocEnabled(env: Record<string, string | undefined> = process.env): boolean {
+  const raw = env.DOWNLOAD_SCAN_SKIP_STRICT_TOC?.trim().toLowerCase();
+  return raw === '1' || raw === 'true' || raw === 'on';
+}
+
 export function createHostPriority(
   sql: CandidateSql,
   env: Record<string, string | undefined> = process.env,

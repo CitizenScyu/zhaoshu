@@ -288,6 +288,16 @@ export async function engineFetchDetail(
 }
 
 /**
+ * strict 目录（下载）是否必拒：任一 ruleToc 字段编译被 skip 即 unsupported_toc_rule。编译期可知、与页面无关，
+ * 选源器据此零出网跳过（toctgate1030）。toctime1030：updateTime 只供展示、目录求值不读，开关开时它编不过也不拦。
+ */
+export function strictTocUnsupported(compiled: CompiledRules): boolean {
+  const ignoreTime = engineTocStrictIgnoreUpdateTimeEnabled();
+  return [...compiled.entries()].some(([key, value]) => key.startsWith('ruleToc.') && 'skipped' in value
+    && !(ignoreTime && key === 'ruleToc.updateTime'));
+}
+
+/**
  * ruleToc.chapterList → SourceChapter[]，含 nextTocUrl 翻页循环。
  * `vars`（varbag1028）= 同一本书 engineFetchDetail 带出的变量袋，目录字段的 `@get:{k}` / `java.get('k')` 从这里读；
  * 读袋的源不传即求值失败（不猜值）。`book`（book1028）= engineFetchDetail 带回的书籍成员，同理不传即读成员的字段求值失败。
@@ -335,10 +345,7 @@ export async function engineFetchToc(
     let scope = tocScope();
     let validChapters = 0;
     const list = field(source.compiled, 'ruleToc.chapterList');
-    // toctime1030：updateTime 只供展示、目录求值不读，开关开时它编不过也不拦 strict。
-    const ignoreTime = engineTocStrictIgnoreUpdateTimeEnabled();
-    if (strict && [...source.compiled.entries()].some(([key, value]) => key.startsWith('ruleToc.') && 'skipped' in value
-      && !(ignoreTime && key === 'ruleToc.updateTime'))) throw new Error('unsupported_toc_rule');
+    if (strict && strictTocUnsupported(source.compiled)) throw new Error('unsupported_toc_rule');
     if (list) {
       // fieldnet1029：chapterList 的 java.ajax 页面取回后重放（作用域现建；章节只在求值成功后才逐条收）。
       const scopeOf = replayScope(scope, tocScope);

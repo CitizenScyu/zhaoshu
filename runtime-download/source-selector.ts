@@ -18,6 +18,7 @@ interface Modules {
   api: {
     engineSearchBook(engine: unknown, title: string, ctx: unknown): Promise<SearchHit[]>;
     engineFetchDetail(engine: unknown, bookUrl: string, ctx: unknown, book?: unknown, vars?: unknown): Promise<Identity>;
+    strictTocUnsupported?(compiled: unknown): boolean;
   };
 }
 
@@ -34,6 +35,12 @@ export interface SourceSelectorOptions {
    * 提供方自行吞错回空表（重排是优化不是门，读不到就退回池序，不得因此少扫或 fail-closed）。
    */
   hostPriority?: (signal: AbortSignal) => Promise<ReadonlyMap<string, number>>;
+  /**
+   * toctgate1030：出池跳过 strict 目录必拒的源（api.strictTocUnsupported：ruleToc 字段编译被 skip，编译期可知）。
+   * 这类源选中后下载腿必抛 unsupported_toc_rule（或在详情处先以别的错挂掉），白占候选位与出网；生产 m.qidian
+   * 24h 35 次 download_failed 即此形态（isVip/isVolume 被 skip）。缺省关 = 逐字同改前。编译抛错的源不在此判（留给原路径）。
+   */
+  skipStrictToc?: boolean;
 }
 
 export interface SourceSelectionRequest {
@@ -83,6 +90,20 @@ export function createSourceSelector(options: SourceSelectorOptions): SourceSele
   const log = options.log ?? (() => {});
   const timeoutMs = options.timeoutMs ?? 30_000;
   const builtinHosts = new Set(modules.supported.BUILTIN_SOURCE_HOSTS);
+  // toctgate1030：按 url 记忆判定（规则对象同一或 JSON 相同才复用），免得每轮选源把全池重编一遍（编译缓存只 64 条）。
+  const tocMemo = new Map<string, { rules: unknown; json: string; doomed: boolean }>();
+  const strictTocDoomed = (source: PoolSource): boolean => {
+    const unsupported = modules.api.strictTocUnsupported;
+    if (!unsupported) return false;
+    const hit = tocMemo.get(source.url);
+    if (hit && hit.rules === source.rules) return hit.doomed;
+    const json = JSON.stringify(source.rules ?? null) + '\0' + JSON.stringify(source.searchUrl ?? null);
+    if (hit && hit.json === json) { hit.rules = source.rules; return hit.doomed; }
+    let doomed = false;
+    try { doomed = unsupported(modules.compile.compileSource(source)); } catch { doomed = false; }
+    tocMemo.set(source.url, { rules: source.rules, json, doomed });
+    return doomed;
+  };
 
   // authbridge42：书名轮收 0 后的作者名回退轮。QQ 系书在镜像站按通行书名收录（队列名「少年羽皇」vs
   // 站名「帝临鸿蒙」），书名搜索天然失配，是生产 0 候选率 96.6% 的结构性根因；qqmirror42 出网实测
@@ -141,6 +162,7 @@ export function createSourceSelector(options: SourceSelectorOptions): SourceSele
         return { picked: [], scanned: 0 };
       }
       signal.throwIfAborted();
+      if (options.skipStrictToc) pool = pool.filter(source => !strictTocDoomed(source));
       let lead = 0;
       if (options.hostPriority) {
         let priority: ReadonlyMap<string, number> = new Map();

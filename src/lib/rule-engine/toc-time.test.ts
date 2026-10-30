@@ -2,7 +2,7 @@
 // 规则与页面均为合成形态。
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { SourceRequestContext } from '@/lib/source-reader';
-import { engineFetchToc, type EngineSource } from './api';
+import { engineFetchToc, strictTocUnsupported, type EngineSource } from './api';
 import { compileSource } from './compile';
 import { engineTocStrictIgnoreUpdateTimeEnabled } from './syntax-flags';
 
@@ -50,5 +50,14 @@ describe('toctime1030', () => {
   it('非 strict 两态都出章节', async () => {
     const toc = await engineFetchToc(src({ updateTime: '{{java.timeFormat(3)}}' }), TOC, ctx());
     expect(toc.chapters).toHaveLength(2);
+  });
+
+  it('toctgate1030：strictTocUnsupported 与 strict 目录同判', () => {
+    expect(strictTocUnsupported(src({}).compiled)).toBe(false);
+    const time = src({ updateTime: '{{java.timeFormat(4)}}' }).compiled;
+    expect(strictTocUnsupported(time)).toBe(true);
+    vi.stubEnv('ENGINE_TOC_STRICT_IGNORE_UPDATE_TIME', '1');
+    expect(strictTocUnsupported(time)).toBe(false);
+    expect(strictTocUnsupported(src({ isVip: '@js:false' }).compiled)).toBe(true);
   });
 });

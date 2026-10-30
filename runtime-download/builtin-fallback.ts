@@ -96,6 +96,8 @@ export interface BuiltinFallbackOptions {
   hostPriority?: (signal: AbortSignal) => Promise<ReadonlyMap<string, number>>;
   /** rotate1030：按任务 attempt_count 轮转扫描窗口（第 n 次 ⇒ rotate=n−1）；缺省关 = 每次同一窗口。 */
   scanRotate?: boolean;
+  /** toctgate1030：透传给 selector，跳过 strict 目录必拒的源；缺省关。 */
+  skipStrictToc?: boolean;
 }
 
 const hostOf = (url: string): string => {
@@ -168,6 +170,7 @@ export function createBuiltinFallback(options: BuiltinFallbackOptions) {
     log,
     timeoutMs: options.timeoutMs ?? 30000,
     hostPriority: options.hostPriority,
+    skipStrictToc: options.skipStrictToc,
   });
 
   // 预检选好的源交给下载腿：单槽（并发=1），按任务 id 认领，领一次即清。

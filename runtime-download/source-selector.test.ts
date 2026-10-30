@@ -18,15 +18,18 @@ function harness(opts: {
   suspect?: string[];
   builtinHosts?: string[];
   hostPriority?: (signal: AbortSignal) => Promise<ReadonlyMap<string, number>>;
+  doomed?: string[];
+  skipStrictToc?: boolean;
 }) {
   const searchedUrls: string[] = [];
   const searchKeys: string[] = [];
   const detailUrls: string[] = [];
   const poolLoads: number[] = [];
+  const compiles: string[] = [];
   const logs: Array<{ level: 'info' | 'error'; message: string; fields?: Record<string, unknown> }> = [];
   const selector = createSourceSelector({
     modules: {
-      compile: { compileSource: () => ({}) },
+      compile: { compileSource: (s: { url: string }) => { compiles.push(s.url); return { url: s.url }; } },
       supported: { BUILTIN_SOURCE_HOSTS: opts.builtinHosts ?? ['book15.net', 'www.book15.net'] },
       api: {
         // 非 async：让 search 能同步 throw（穿透到 sourceHasBook 成 rejection）。
@@ -39,6 +42,7 @@ function harness(opts: {
           detailUrls.push(bookUrl);
           return Promise.resolve(opts.detail?.(bookUrl) ?? { title: TASK.title, author: TASK.author });
         },
+        strictTocUnsupported: (compiled: { url: string }) => opts.doomed?.includes(compiled.url) ?? false,
       },
     },
     transport: async () => { throw new Error('unused'); },
@@ -53,8 +57,9 @@ function harness(opts: {
     isSuspect: (host: string) => opts.suspect?.includes(host) ?? false,
     log: (level, message, fields) => logs.push({ level, message, fields }),
     hostPriority: opts.hostPriority,
+    skipStrictToc: opts.skipStrictToc,
   });
-  return { selector, searchedUrls, searchKeys, detailUrls, poolLoads, logs };
+  return { selector, searchedUrls, searchKeys, detailUrls, poolLoads, logs, compiles };
 }
 
 const request = (over: Partial<SourceSelectionRequest> = {}): SourceSelectionRequest => ({
@@ -69,6 +74,21 @@ describe('共用选源器', () => {
     expect((await h.selector(request({ scanLimit: 200 }), freshSignal())).picked).toEqual([]);
     expect(h.searchedUrls).toHaveLength(200);
     expect(h.detailUrls).toEqual([]);
+  });
+
+  it('toctgate1030：skipStrictToc 开 ⇒ strict 目录必拒的源零出网出池、不耗 scanLimit；关 ⇒ 逐字同改前', async () => {
+    const pool = ['https://a.example/', 'https://q.example/', 'https://b.example/', 'https://c.example/'];
+    const on = harness({ pool, search: () => [], doomed: ['https://q.example/'], skipStrictToc: true });
+    expect((await on.selector(request({ scanLimit: 3 }), freshSignal())).scanned).toBe(3);
+    expect(on.searchedUrls).toEqual(['https://a.example/', 'https://b.example/', 'https://c.example/']);
+    // 同一规则对象第二轮选源走记忆，不重编译判定。
+    const before = on.compiles.filter(u => u === 'https://q.example/').length;
+    await on.selector(request({ scanLimit: 3 }), freshSignal());
+    expect(on.compiles.filter(u => u === 'https://q.example/').length).toBe(before);
+    const off = harness({ pool, search: () => [], doomed: ['https://q.example/'] });
+    await off.selector(request({ scanLimit: 3 }), freshSignal());
+    expect(off.searchedUrls).toEqual(['https://a.example/', 'https://q.example/', 'https://b.example/']);
+    expect(off.compiles).toEqual(off.searchedUrls);
   });
 
   it('yield1030：hostPriority 稳定重排——高分 host 先扫，同分与缺席保持池序，scanLimit 不变', async () => {
