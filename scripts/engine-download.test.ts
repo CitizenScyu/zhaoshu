@@ -673,14 +673,15 @@ describe('hostburst1030 按站连抓静置', () => {
 
   it('解析：缺省/非法项/未命中为 null，命中取值且 M 封顶 600000', () => {
     const src = 'https://www.book15.net/';
-    expect(hostBurstPause(src, {})).toBeNull();
-    expect(hostBurstPause(src, { DOWNLOAD_HOST_BURST_PAUSE: 'other.example=10/62000' })).toBeNull();
-    expect(hostBurstPause(src, { DOWNLOAD_HOST_BURST_PAUSE: 'book15.net=10,book15.net=a/1' })).toBeNull();
-    expect(hostBurstPause(src, { DOWNLOAD_HOST_BURST_PAUSE: 'book15.net=0/62000' })).toBeNull();
-    expect(hostBurstPause(src, { DOWNLOAD_HOST_BURST_PAUSE: 'so.book15.net=10/62000' })).toBeNull();
-    expect(hostBurstPause(src, { DOWNLOAD_HOST_BURST_PAUSE: ' x.example=1/1 , M.Book15.net = 10 / 62000 ' })).toEqual({ every: 10, pauseMs: 62000 });
-    expect(hostBurstPause(src, { DOWNLOAD_HOST_BURST_PAUSE: 'book15.net=3/9999999' })).toEqual({ every: 3, pauseMs: 600000 });
-    expect(hostBurstPause('not a url', { DOWNLOAD_HOST_BURST_PAUSE: 'book15.net=3/100' })).toBeNull();
+    const env = (value?: string) => (value === undefined ? {} : { DOWNLOAD_HOST_BURST_PAUSE: value }) as NodeJS.ProcessEnv;
+    expect(hostBurstPause(src, env())).toBeNull();
+    expect(hostBurstPause(src, env('other.example=10/62000'))).toBeNull();
+    expect(hostBurstPause(src, env('book15.net=10,book15.net=a/1'))).toBeNull();
+    expect(hostBurstPause(src, env('book15.net=0/62000'))).toBeNull();
+    expect(hostBurstPause(src, env('so.book15.net=10/62000'))).toBeNull();
+    expect(hostBurstPause(src, env(' x.example=1/1 , M.Book15.net = 10 / 62000 '))).toEqual({ every: 10, pauseMs: 62000 });
+    expect(hostBurstPause(src, env('book15.net=3/9999999'))).toEqual({ every: 3, pauseMs: 600000 });
+    expect(hostBurstPause('not a url', env('book15.net=3/100'))).toBeNull();
   });
 });
 
