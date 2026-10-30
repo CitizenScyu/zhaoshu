@@ -15,6 +15,8 @@
 //
 // 单写者/心跳/租约/五阶段发布全部在 T3 的 runWorkerOnce 内，本层只做预算闸门与决策归一。
 // drain 的 signal 用于「停机时不再领新任务」：在途任务由 T3 自身预算与心跳有界，drain 等在途收尾。
+// shutrel1030：releaseOnShutdown 开时 signal 另透传给下载腿，停机即中止在途下载并原样放回 pending
+// （systemd TimeoutStopSec=120s 远短于单本预算，不中止就是 SIGKILL 留孤儿租约）。
 
 import {
   runWorkerOnce, settleSourceUnavailable, TaskLeaseLostError,
@@ -112,6 +114,12 @@ export interface ExecutorDependencies {
    * 缺省 = 不注入 = 发布行为与 986 前逐字一致；装配期由 entry 按环境开关构造。
    */
   rollover?: PublicationRolloverSeam;
+  /**
+   * shutrel1030：true 时把 runOnce 的 drain signal 作 WorkerOptions.shutdownSignal 透传（停机中止在途下载、
+   * 原样放回 pending 并退还日预算）。缺省 = 不透传 = 停机只停领新任务，与引入前逐字一致。
+   * entry 由 env DOWNLOAD_SHUTDOWN_RELEASE=1 开。
+   */
+  releaseOnShutdown?: boolean;
   // ---- 测试注入缝 ----
   now?: () => number;
   /** 冷却等待；signal 中止时须尽快 resolve（不 reject）。 */
@@ -144,7 +152,7 @@ export function createExecutor(deps: ExecutorDependencies): DownloadExecutor {
       reason: 'db_quota_exceeded', where, backoffMs: quota.remainingMs(), retryAt: quota.retryAt(),
     });
   };
-  const workerOptions = (storage: WorkerStorage): WorkerOptions => ({
+  const workerOptions = (storage: WorkerStorage, signal?: AbortSignal): WorkerOptions => ({
     storage,
     github: deps.github,
     adapters: deps.adapters,
@@ -152,6 +160,7 @@ export function createExecutor(deps: ExecutorDependencies): DownloadExecutor {
     branch: deps.branch,
     taskTimeoutMs: deps.taskTimeoutMs,
     ...(deps.rollover ? { rollover: deps.rollover } : {}),
+    ...(deps.releaseOnShutdown && signal ? { shutdownSignal: signal } : {}),
   });
   // 书源不可达的结构化日志：扣额度前预检与下载腿打同一行，只含原因码/阶段/源 host/下次可重试时刻。
   const logSourceUnavailable = (reason: string, stage: string, host: string, retryAt: string | null) =>
@@ -263,7 +272,7 @@ export function createExecutor(deps: ExecutorDependencies): DownloadExecutor {
 
       let result;
       try {
-        result = await runWorkerOnce(workerOptions(storage), deps.owner);
+        result = await runWorkerOnce(workerOptions(storage, signal), deps.owner);
       } catch (error) {
         if (error instanceof BudgetExhaustedError) return decisions.BUDGET_EXHAUSTED;
         if (error instanceof PrecheckRejectedError) return decisions.TASK_DONE;
@@ -276,14 +285,18 @@ export function createExecutor(deps: ExecutorDependencies): DownloadExecutor {
         throw error; // drain → ERROR 退避
       }
       if (!result.processed && result.reason === 'queue_empty') return decisions.NO_TASK;
-      if (result.processed && (result.reason === 'source_unavailable' || result.reason === 'no_candidates')) {
-        logSourceUnavailable(result.reason, result.stage ?? 'unknown', result.sourceHost ?? '', result.retryAt ?? null);
+      // shutrel1030：停机中止放回 pending 的这本没下完，同书源不可达一样退还本次扣减（下次重领再扣）。
+      const shutdownReleased = !result.processed && result.reason === 'shutdown_released';
+      if (shutdownReleased) log('info', '停机中止在途下载，已放回 pending', { reason: 'shutdown_released' });
+      const sourceUnavailable = result.processed && (result.reason === 'source_unavailable' || result.reason === 'no_candidates');
+      if (sourceUnavailable) logSourceUnavailable(result.reason ?? 'source_unavailable', result.stage ?? 'unknown', result.sourceHost ?? '', result.retryAt ?? null);
+      if (sourceUnavailable || shutdownReleased) {
         // 书源不可达不计日预算：退还本次领取时的扣减。退还失败不影响已落库的任务状态，
         // 记一行错误（配额按已扣处理，保守侧）。
         const spent = ticket as BudgetTicket | null;
         if (spent && deps.refundBudget) {
           await deps.refundBudget(spent).catch(() => {
-            log('error', '日预算退还失败', { reason: 'source_unavailable' });
+            log('error', '日预算退还失败', { reason: shutdownReleased ? 'shutdown_released' : 'source_unavailable' });
           });
         }
       }

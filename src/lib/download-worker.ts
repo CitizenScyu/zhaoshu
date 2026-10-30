@@ -85,6 +85,8 @@ export interface WorkerStorage {
   finish(lease: DownloadTaskLease, result: { status: 'done' | 'failed' | 'partial' | 'superseded_by_incomplete'; error?: string }): Promise<boolean>;
   /** 非终态放回 pending 并退避（租约条件）；返回下次可领取时刻（ISO UTC），null = 失租约。 */
   defer(lease: DownloadTaskLease, input: { delayMs: number; error?: string }): Promise<string | null>;
+  /** 原样放回 pending（租约条件，不动 attempt_count/next_attempt_at）；false = 失租约。可选：缺省时停机放回不生效。 */
+  releaseClaim?(lease: DownloadTaskLease): Promise<boolean>;
   /** T2 发布对账的 DB 前置：写前登记路径声明。 */
   reserveArtifactPath(input: { labeledBookId: number; identityKey: string; repositoryId: number; branch: string; canonicalPath: string }): Promise<number>;
   /** 查同书既有 artifact 落位（identity_key 唯一）：换源重下时发布决策回旧行的仓。 */
@@ -192,6 +194,14 @@ export interface WorkerOptions {
    * 装配期常量只读：本字段与 options.github/repositoryId/branch 在任务执行中永不被改写。
    */
   rollover?: PublicationRolloverSeam;
+  /**
+   * shutrel1030 停机放回缝：缺省 = 不注入 = 与引入前逐字一致（停机只停领新任务，在途下载跑到
+   * systemd TimeoutStopSec 被 SIGKILL，租约要等回收器 30min+ 后才 +1 退避重排）。
+   * 注入后只并进下载腿的 signal：停机时抓取立即中止（检查点已落盘），未拿到整本则 releaseClaim
+   * 原样放回 pending、不写终态（中止产出的 interrupted 不能落 partial）；已拿到整本照常发布。
+   * 发布阶段和终态守卫仍只看任务 signal，停机不打断发布。
+   */
+  shutdownSignal?: AbortSignal;
 }
 
 /** 切仓决策注入缝：端口（候选仓证据 + 显式时钟）与闭包重建工厂均由调用方（entry/测试）注入。 */
@@ -323,6 +333,16 @@ export async function runDownloadTask(
   // 会把它归入 incomplete（检查点可续传），而不是当源站失败写 failed 终态。
   const taskTimer = setTimeout(() => taskDeadline.abort(new Error('budget_exhausted')), options.taskTimeoutMs ?? WORKER_TASK_TIMEOUT_MS);
   const signal = AbortSignal.any([heartbeat.signal, taskDeadline.signal]);
+  // shutrel1030：停机信号只并进下载腿（见 WorkerOptions.shutdownSignal）；storage 无 releaseClaim 时不接。
+  const shutdown = storage.releaseClaim ? options.shutdownSignal : undefined;
+  const legSignal = shutdown ? AbortSignal.any([signal, shutdown]) : signal;
+  let inLeg = true;
+  // 放回失败（库不可达）不落终态：行仍是本租约的 running，留给回收器，与改前停机同结局。
+  const releaseOnShutdown = async (): Promise<WorkerResult> => {
+    await heartbeat.stop();
+    const released = await storage.releaseClaim!(lease).catch(() => null);
+    return { processed: false, reason: released ? 'shutdown_released' : released === false ? 'lease_lost' : 'shutdown_release_failed' };
+  };
   let sawProgress = 0;
   let leaseLostObserved = false;
   let feedbackError: unknown;
@@ -369,7 +389,7 @@ export async function runDownloadTask(
     await heartbeat.check();
     const adapter = selectAdapter(options.adapters, task);
     const outcome = await adapter.download(task, {
-      signal,
+      signal: legSignal,
       onFeedbackFailure: recordFeedbackFailure,
       async progress(update) {
         // adapter 进度即心跳数据通道：写失败（失租约）立即中断抓取。
@@ -382,6 +402,8 @@ export async function runDownloadTask(
       },
     });
     if (feedbackError !== undefined) return await settleFeedback();
+    inLeg = false;
+    if (shutdown?.aborted && !signal.aborted && outcome.kind !== 'complete') return await releaseOnShutdown();
 
     if (outcome.kind === 'incomplete') {
       // partial 零发布：任何 GitHub PUT 都没发生，DB 只写终态。
@@ -527,6 +549,7 @@ export async function runDownloadTask(
     // 最终拒绝可能是含清理错误的 G，优先于先前回调记录的 F；收口开始后不再改引用。
     if (!feedbackSettlementStarted && isFeedbackFailure(error)) feedbackError = error;
     if (feedbackError !== undefined) return await settleFeedback(error);
+    if (inLeg && shutdown?.aborted && !signal.aborted && !isLeaseLostError(error)) return await releaseOnShutdown();
     await heartbeat.stop();
     if (isLeaseLostError(error) || signal.reason instanceof TaskLeaseLostError || signal.reason instanceof LeaseLostError) {
       // 失租约：不写终态（行已不属于本租约），让接管者/回收器决定后续。
