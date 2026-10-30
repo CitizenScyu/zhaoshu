@@ -26,7 +26,7 @@ import { createIdentityPrecheck } from './identity-precheck';
 import { createBuiltinFallback } from './builtin-fallback';
 import { createHostOccupancy, type HostOccupancy } from './host-occupancy';
 import { createHostPriority, scanRotateEnabled, skipStrictTocEnabled } from './host-priority';
-import { peerOutRoots, resumePeersEnabled, seedFromPeers } from './resume-seed';
+import { peerOutRoots, resumePeersEnabled, resumeStaleLocksEnabled, seedFromPeers } from './resume-seed';
 import {
   failedCandidateSources, markCandidateFailure, occupiedHosts, replaceSourceCandidates,
   usableSourceCandidates,
@@ -312,10 +312,11 @@ export async function createDownloadExecutor(options: ProductionExecutorOptions)
   const transport = hostOccupancy ? hostOccupancy.wrapTransport(baseTransport) : baseTransport;
 
   const outRoot = join(options.workDir, 'out');
-  // resumeseed1031：跨实例续传种子（见 resume-seed.ts）；只记计数。
+  // resumeseed1031：跨实例续传种子（见 resume-seed.ts）；只记计数。stalelock1031：同级失效锁不再挡种子。
+  const staleLocks = resumeStaleLocksEnabled(env);
   const prepareOut = resumePeersEnabled(env)
     ? (out: string) => {
-      const seeded = seedFromPeers(out, peerOutRoots(outRoot));
+      const seeded = seedFromPeers(out, peerOutRoots(outRoot), { staleLocks });
       if (seeded.chapters || seeded.unlocked) log('info', '跨实例续传种子', { ...seeded });
     }
     : undefined;

@@ -14,10 +14,27 @@
 import { copyFileSync, existsSync, linkSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
 
+const flagOn = (raw: string | undefined): boolean => {
+  const value = raw?.trim().toLowerCase();
+  return value === '1' || value === 'true' || value === 'on';
+};
+
 export function resumePeersEnabled(env: Record<string, string | undefined> = process.env): boolean {
-  const raw = env.DOWNLOAD_RESUME_PEERS?.trim().toLowerCase();
-  return raw === '1' || raw === 'true' || raw === 'on';
+  return flagOn(env.DOWNLOAD_RESUME_PEERS);
 }
+
+// stalelock1031：DOWNLOAD_RESUME_STALE_LOCKS（=1 开；缺省关 = 持锁同级一律跳过，逐字同改前）。
+// 生产 2026-10-31 只读：同级目录残留锁 129 个（117 个 >24h，全是 partial，锁与 manifest 都 >1h 未动），
+// 背后压着 8.8 万 done 章，其中 103 个任务键已在别的实例重跑过——崩溃/SIGKILL 遗留的锁把种子源挡死。
+// 活的运行每推进一章最多 5s 落一次 manifest，锁与 manifest 都 1h 未动即判失效。误判也安全：只读同级，
+// 章文件与 manifest 都是临时文件 + rename 落盘，读到的是一致快照，引擎照旧逐章核 sha256。
+export const PEER_LOCK_STALE_MS = 60 * 60_000;
+
+export function resumeStaleLocksEnabled(env: Record<string, string | undefined> = process.env): boolean {
+  return flagOn(env.DOWNLOAD_RESUME_STALE_LOCKS);
+}
+
+const mtimeMs = (path: string): number => statSync(path, { throwIfNoEntry: false })?.mtimeMs ?? 0;
 
 /** outRoot = <base>/<inst>/<work>/out ⇒ 同前缀（去尾部数字后相同）兄弟实例的 <base>/<peer>/<work>/out，不含自身、只取存在的。 */
 export function peerOutRoots(outRoot: string): string[] {
@@ -55,10 +72,18 @@ function place(src: string, dst: string): void {
 }
 
 export interface SeedResult { chapters: number; unlocked: number }
+export interface SeedOptions { staleLocks?: boolean; now?: number }
 
 /** 尽力而为：任何异常吞掉（照常从头抓）；只返回计数，不带路径。 */
-export function seedFromPeers(out: string, peers: readonly string[]): SeedResult {
+export function seedFromPeers(out: string, peers: readonly string[], options: SeedOptions = {}): SeedResult {
   const result: SeedResult = { chapters: 0, unlocked: 0 };
+  const now = options.now ?? Date.now();
+  const lockLive = (dir: string): boolean => {
+    const lock = join(dir, 'download.lock');
+    if (!existsSync(lock)) return false;
+    if (!options.staleLocks) return true;
+    return Math.max(mtimeMs(lock), mtimeMs(join(dir, 'manifest.json'))) > now - PEER_LOCK_STALE_MS;
+  };
   const key = basename(out);
   try {
     for (const sub of existsSync(out) ? readdirSync(out) : []) {
@@ -72,7 +97,7 @@ export function seedFromPeers(out: string, peers: readonly string[]): SeedResult
     try { subs = readdirSync(join(root, key)); } catch { continue; }
     for (const sub of subs) {
       const dir = join(root, key, sub);
-      if (existsSync(join(dir, 'download.lock'))) continue;
+      if (lockLive(dir)) continue;
       const read = readManifest(dir);
       if (!read || !read.done.length) continue;
       const current = best.get(sub);

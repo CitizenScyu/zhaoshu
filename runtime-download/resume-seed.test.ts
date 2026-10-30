@@ -1,8 +1,8 @@
 import { afterEach, describe, expect, it } from 'vitest';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { peerOutRoots, resumePeersEnabled, seedFromPeers } from './resume-seed';
+import { PEER_LOCK_STALE_MS, peerOutRoots, resumePeersEnabled, resumeStaleLocksEnabled, seedFromPeers } from './resume-seed';
 
 // resumeseed1031：合成目录布局 <base>/inst-N/download/out/<任务键>/<书键>/，全部假数据。
 const dirs: string[] = [];
@@ -101,5 +101,25 @@ describe('resumeseed1031 跨实例续传种子', () => {
     writeFileSync(join(peer, 'taskkey', 'bookkey', 'manifest.json'), '{not json');
     expect(seedFromPeers(join(own, 'taskkey'), [peer, join(peer, 'missing')])).toEqual({ chapters: 0, unlocked: 0 });
     expect(existsSync(join(own, 'taskkey'))).toBe(false);
+  });
+
+  it('stalelock1031：开关解析；锁与 manifest 都超 1h 未动 ⇒ 失效锁可作种子源，任一新鲜仍跳过；缺省关照旧跳过', () => {
+    expect(resumeStaleLocksEnabled({})).toBe(false);
+    expect(resumeStaleLocksEnabled({ DOWNLOAD_RESUME_STALE_LOCKS: '1' })).toBe(true);
+    const { outOf } = layout();
+    const own = outOf('inst-1');
+    const stale = outOf('inst-2');
+    const fresh = outOf('inst-3');
+    const staleDir = book(stale, 'ddd', { lock: true });
+    const freshDir = book(fresh, 'ddddd', { lock: true });
+    const old = (Date.now() - PEER_LOCK_STALE_MS - 60_000) / 1000;
+    for (const f of ['download.lock', 'manifest.json']) utimesSync(join(staleDir, f), old, old);
+    utimesSync(join(freshDir, 'download.lock'), old, old); // 锁旧但 manifest 新：可能正在跑
+    const out = join(own, 'taskkey');
+    expect(seedFromPeers(out, [stale, fresh])).toEqual({ chapters: 0, unlocked: 0 });
+    expect(seedFromPeers(out, [stale, fresh], { staleLocks: true })).toEqual({ chapters: 3, unlocked: 0 });
+    expect(readFileSync(join(own, 'taskkey', 'bookkey', '2.txt'), 'utf8')).toBe('第2章正文');
+    // 同级的锁不动
+    expect(existsSync(join(staleDir, 'download.lock'))).toBe(true);
   });
 });
