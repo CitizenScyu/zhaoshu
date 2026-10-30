@@ -110,6 +110,21 @@ export function hostBurstPause(source, env = process.env) {
   return null;
 }
 
+// diag1031：SourcePolicyError 不带 code，消息是本仓写死的中文（个别拼了规则键名或 JS 报错原文），按关键词归成
+// 固定枚举再进 manifest，原文不落盘。顺序即优先级：「正文跳转到目录中的其他章节」归正文，不归跳转。
+const POLICY_CODES = [
+  [/安全验证/, 'POLICY_CHALLENGE'],
+  [/退休/, 'POLICY_RETIRED'],
+  [/字段 JS/, 'POLICY_FIELD_JS'],
+  [/正文/, 'POLICY_CONTENT'],
+  [/目录/, 'POLICY_TOC'],
+  [/跳转/, 'POLICY_REDIRECT'],
+  [/体积超限/, 'POLICY_SIZE'],
+  [/搜索/, 'POLICY_SEARCH_RULE'],
+  [/来源|地址/, 'POLICY_URL'],
+];
+export const policyCodeOf = message => POLICY_CODES.find(([pattern]) => pattern.test(String(message ?? '')))?.[1] ?? 'POLICY_OTHER';
+
 // 身份判据的唯一实现：downloadBook 选候选、执行器扣额度前的身份预检（runtime-download/identity-precheck.ts）
 // 与 builtin 引擎源回退（runtime-download/builtin-fallback.ts）共用。
 //
@@ -361,7 +376,8 @@ export async function downloadBook(m, args, resolveSource, transport = fetchSour
       // diag1030：再记阶段与固定枚举 code（RuleEngineError.code 等，均为常量、不含上游文本）——只有构造器名时
       // 生产只看得到「RuleEngineError」，定位不到哪一步哪类规则。failure_stage 专供 source_unavailable 退避，故另起字段。
       manifest.failure_phase = stage;
-      if (/^[A-Z][A-Z0-9_]{1,39}$/.test(typeof error?.code === 'string' ? error.code : '')) manifest.failure_code = error.code;
+      const code = typeof error?.code === 'string' ? error.code : error?.name === 'SourcePolicyError' ? policyCodeOf(error.message) : '';
+      if (/^[A-Z][A-Z0-9_]{1,39}$/.test(code)) manifest.failure_code = code;
     }
   } finally {
     try {

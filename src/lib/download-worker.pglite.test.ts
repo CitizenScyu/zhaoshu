@@ -468,6 +468,8 @@ maybe('T3 worker 任务层：租约、单写者、五阶段对账（PGlite + moc
       // 删掉 `result.code===2` 分支测试仍绿。用 download_failed 才能钉住退出码契约。
       if (args.source.includes('dead')) return { code: 2, manifest: { status: 'partial', errors: ['download_failed'], chapters_total: 0, chapters_done: 0, chars: 0 } };
       // dlfail42：白名单外错误兜底 download_failed 时 manifest 带 failure_name（脱敏构造器名）
+      // diag1031：downloadBook 自身抛出（如检查点锁 EEXIST）⇒ adapter_runtime_error 带构造器名/固定码，原文不带
+      if (args.source.includes('throws')) throw Object.assign(new Error('EEXIST: synthetic path detail'), { code: 'EEXIST' });
       if (args.source.includes('opaque')) return { code: 1, manifest: { status: 'partial', errors: ['download_failed'], failure_name: 'TypeError', chapters_total: 0, chapters_done: 0, chars: 0 } };
       // diag1030：带固定码与阶段；phasebad 的阶段不合白名单 ⇒ 该段省略
       if (args.source.includes('ruleerr')) return { code: 1, manifest: { status: 'partial', errors: ['download_failed'], failure_name: 'RuleEngineError', failure_code: 'RULE_EVAL_FAILED', failure_phase: 'toc', chapters_total: 0, chapters_done: 0, chars: 0 } };
@@ -514,6 +516,9 @@ maybe('T3 worker 任务层：租约、单写者、五阶段对账（PGlite + moc
     });
     expect(await run(8, 'ruleerr')).toMatchObject({ kind: 'failure', code: 'download_failed', detail: 'RuleEngineError/RULE_EVAL_FAILED@toc' });
     expect(await run(9, 'phasebad')).toMatchObject({ kind: 'failure', code: 'download_failed', detail: 'RuleEngineError' });
+    const thrown = await run(10, 'throws');
+    expect(thrown).toMatchObject({ kind: 'failure', code: 'adapter_runtime_error', detail: 'Error/EEXIST' });
+    expect(JSON.stringify(thrown)).not.toContain('synthetic path detail');
     const noname = await adapter.download({ id: 7, book_id: 1, title: 't', author: 'a', status: 'running', source_url: 'https://noname.example/z', source_kind: 'engine', source_id: null, requested_by: 'system' }, {
       signal: new AbortController().signal,
       progress: async () => {},

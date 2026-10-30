@@ -707,7 +707,15 @@ export function createEngineAdapter(options: EngineAdapterOptions): SourceAdapte
             stage: 'request', retryCause,
           };
         }
-        return { kind: 'failure', code: /^[a-z0-9_]+$/.test((error as Error).message) ? (error as Error).message : 'adapter_runtime_error' };
+        const message = (error as Error)?.message;
+        if (typeof message === 'string' && /^[a-z0-9_]+$/.test(message)) return { kind: 'failure', code: message };
+        // diag1031：downloadBook 自身抛出（未进 manifest）时同样只带构造器名[/固定码]，如 Error/EEXIST，原文不进日志。
+        const name = (error as Error)?.name;
+        const code = (error as { code?: unknown })?.code;
+        const detail = typeof name === 'string' && /^[A-Za-z]{1,32}$/.test(name)
+          ? name + (typeof code === 'string' && /^[A-Z][A-Z0-9_]{1,39}$/.test(code) ? `/${code}` : '')
+          : undefined;
+        return detail ? { kind: 'failure', code: 'adapter_runtime_error', detail } : { kind: 'failure', code: 'adapter_runtime_error' };
       }
       const manifest = result.manifest;
       const chaptersTotal = manifest.chapters_total ?? 0;

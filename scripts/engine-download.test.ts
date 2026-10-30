@@ -10,7 +10,7 @@ import * as parser from '../src/lib/source-parser';
 import fixtures from '../src/lib/rule-engine/fixtures/smoke-174.json';
 import { SourceHttpError } from '../src/lib/source-fetch';
 import { SourcePolicyError } from '../src/lib/source-policy';
-import { contentFailStreak, contentRetryPasses, downloadBook, downloadOptions, hostBurstPause } from './engine-download.mjs';
+import { contentFailStreak, contentRetryPasses, downloadBook, downloadOptions, hostBurstPause, policyCodeOf } from './engine-download.mjs';
 
 const dirs: string[] = [];
 afterEach(() => { vi.unstubAllGlobals(); for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
@@ -87,6 +87,22 @@ describe('download offline full books', () => {
     const odd = await f.run(async () => { throw ruleError('not a constant: x'); });
     expect((odd.manifest as { failure_code?: string }).failure_code).toBeUndefined();
     expect(readFileSync(odd.manifestPath, 'utf8')).not.toContain('not a constant');
+  });
+  it('diag1031：SourcePolicyError 按关键词归成固定码，原文不落盘', async () => {
+    expect([
+      '书源正文页被安全验证拦截，请重试或更换书源', '书源已退休：不再对该来源发起请求', '不支持该书源的字段 JS（java.ajax 页面过大）',
+      '书源正文跳转到了目录中的其他章节，请重试或更换书源', '书源目录后续页未提供有效章节，请重试或更换书源', '书源跳转次数超限',
+      '书源响应体积超限', '不支持该书源的搜索选项：webView', '来源仅支持 HTTPS 完整地址', '别的', undefined,
+    ].map(policyCodeOf)).toEqual([
+      'POLICY_CHALLENGE', 'POLICY_RETIRED', 'POLICY_FIELD_JS', 'POLICY_CONTENT', 'POLICY_TOC', 'POLICY_REDIRECT',
+      'POLICY_SIZE', 'POLICY_SEARCH_RULE', 'POLICY_URL', 'POLICY_OTHER', 'POLICY_OTHER',
+    ]);
+    const f = setup();
+    const policyError = Object.assign(new Error('不支持该书源的搜索 JS（synthetic upstream）'), { name: 'SourcePolicyError' });
+    const result = await f.run(async () => { throw policyError; });
+    const manifest = result.manifest as { failure_name?: string; failure_phase?: string; failure_code?: string };
+    expect([manifest.failure_name, manifest.failure_code, manifest.failure_phase]).toEqual(['SourcePolicyError', 'POLICY_SEARCH_RULE', 'search']);
+    expect(readFileSync(result.manifestPath, 'utf8')).not.toContain('synthetic upstream');
   });
   it.each(['invalid_chapter', 'invalid_next_page', 'empty_content_page', 'content_page_limit', 'unsupported_content_rule'])('preserves safe diagnostic %s', async reason => {
     const f = setup();
