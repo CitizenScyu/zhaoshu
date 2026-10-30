@@ -10,7 +10,7 @@ import * as parser from '../src/lib/source-parser';
 import fixtures from '../src/lib/rule-engine/fixtures/smoke-174.json';
 import { SourceHttpError } from '../src/lib/source-fetch';
 import { SourcePolicyError } from '../src/lib/source-policy';
-import { contentFailStreak, downloadBook, downloadOptions, hostBurstPause } from './engine-download.mjs';
+import { contentFailStreak, contentRetryPasses, downloadBook, downloadOptions, hostBurstPause } from './engine-download.mjs';
 
 const dirs: string[] = [];
 afterEach(() => { vi.unstubAllGlobals(); for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
@@ -622,6 +622,88 @@ describe('failstreak1030 正文连续失败熔断', () => {
   it.each(['0', '', 'abc', '-3', '1e3'])('非正整数 %j 视为关', async value => {
     vi.stubEnv('DOWNLOAD_CONTENT_FAIL_STREAK', value);
     expect(contentFailStreak()).toBe(0);
+  });
+});
+
+// retrypass1030：瞬时类失败章补抓（DOWNLOAD_CONTENT_RETRY_PASSES，缺省关）。
+describe('retrypass1030 正文失败章补抓', () => {
+  afterEach(() => { vi.unstubAllEnvs(); });
+  const catalog = (n: number) => `<div class="d-chapter-list" id="full-catalog">${Array.from({ length: n }, (_, i) => `<dd><a href="/read/${i + 1}">第${i + 1}章</a></dd>`).join('')}</div>`;
+  /** 10 章书；flaky(n, 第几次读) 为 'http' 抛 502、'blank' 给空正文，否则正常。 */
+  const wrap = (f: ReturnType<typeof setup>, flaky: (n: number, attempt: number) => string) => {
+    const seen = new Map<number, number>();
+    return async (url: string, opts: { signal: AbortSignal; beforeRequest?: (s: AbortSignal) => Promise<void> }) => {
+      if (url === 'https://book15.net/books/details1.html') {
+        return { url, text: `<h1>测试书</h1><div class="d-info-panel"><a href="/author/1">作者甲</a></div><meta property="og:novel:book_name" content="测试书"><meta property="og:novel:author" content="作者甲">` + catalog(10) };
+      }
+      if (url.includes('/read/')) {
+        f.calls.push(url);
+        const n = Number(url.split('/read/')[1]);
+        const attempt = (seen.get(n) ?? 0) + 1;
+        seen.set(n, attempt);
+        const mode = flaky(n, attempt);
+        if (mode === 'http') throw new SourceHttpError(502);
+        return { url, text: `<li class="chapter-content" id="article-content">${mode === 'blank' ? '' : '<p>合成正文，离线测试。</p>'}</li>` };
+      }
+      return f.transport(url, opts);
+    };
+  };
+  const reads = (f: ReturnType<typeof setup>) => f.calls.filter(url => url.includes('/read/')).length;
+  const firstTry502 = (n: number, attempt: number) => (n % 3 === 0 && attempt === 1 ? 'http' : '');
+
+  it('缺省关：首轮 502 的章直接 missing_chapters，不补抓（零行为变化）', async () => {
+    const f = setup();
+    const r = await f.run(wrap(f, firstTry502));
+    expect(r.manifest.errors).toEqual(['missing_chapters']);
+    expect(reads(f)).toBe(10);
+    expect(r.manifest.chapters.filter((c: { error?: string }) => c.error === 'chapter_failed')).toHaveLength(3);
+  });
+
+  it('R=1：首轮 502 的 3 章补抓成功，整本 done，失败码不残留', async () => {
+    vi.stubEnv('DOWNLOAD_CONTENT_RETRY_PASSES', '1');
+    const f = setup();
+    const r = await f.run(wrap(f, firstTry502));
+    expect(r.code).toBe(0);
+    expect(r.manifest.status).toBe('done');
+    expect(reads(f)).toBe(13);
+    expect(r.manifest.chapters.some((c: { error?: string }) => 'error' in c)).toBe(false);
+  });
+
+  it('R=2：持续 502 的章补抓 2 轮后仍按 missing_chapters 收口', async () => {
+    vi.stubEnv('DOWNLOAD_CONTENT_RETRY_PASSES', '2');
+    const f = setup();
+    const r = await f.run(wrap(f, n => (n === 4 ? 'http' : '')));
+    expect(r.manifest.errors).toEqual(['missing_chapters']);
+    expect(reads(f)).toBe(12);
+  });
+
+  it('规则类失败（empty_content_page）不补抓', async () => {
+    vi.stubEnv('DOWNLOAD_CONTENT_RETRY_PASSES', '3');
+    const f = setup();
+    const r = await f.run(wrap(f, n => (n === 5 ? 'blank' : '')));
+    expect(r.manifest.errors).toEqual(['missing_chapters']);
+    expect(reads(f)).toBe(10);
+    expect((r.manifest.chapters[4] as { error?: string }).error).toBe('empty_content_page');
+  });
+
+  it('补抓轮连败同受 failstreak 熔断（轮内从 0 计）', async () => {
+    vi.stubEnv('DOWNLOAD_CONTENT_RETRY_PASSES', '1');
+    vi.stubEnv('DOWNLOAD_CONTENT_FAIL_STREAK', '2');
+    const f = setup();
+    // 首轮隔章 502（不触发 K=2）；补抓轮这 5 章全 502 ⇒ 连败 2 即停，只补抓 2 章。
+    const r = await f.run(wrap(f, n => (n % 2 === 0 ? 'http' : '')));
+    expect(r.manifest.errors).toEqual(['missing_chapters']);
+    expect(reads(f)).toBe(12);
+    expect((r.manifest as { content_fail_streak?: number }).content_fail_streak).toBe(2);
+  });
+
+  it.each(['0', '', 'abc', '-1', '4', '1.5'])('非 0..3 的 %j 视为关', value => {
+    vi.stubEnv('DOWNLOAD_CONTENT_RETRY_PASSES', value);
+    expect(contentRetryPasses()).toBe(0);
+  });
+  it.each([['1', 1], [' 3 ', 3]] as const)('%j 解析为 %d 轮', (value, passes) => {
+    vi.stubEnv('DOWNLOAD_CONTENT_RETRY_PASSES', value);
+    expect(contentRetryPasses()).toBe(passes);
   });
 });
 

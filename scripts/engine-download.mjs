@@ -75,6 +75,19 @@ export function contentFailStreak(env = process.env) {
   return Number(raw);
 }
 
+// retrypass1030：正文失败章补抓轮数 DOWNLOAD_CONTENT_RETRY_PASSES（0..3；缺省/0/非法 = 关，零行为变化）。
+// 全书一遍抓完后，对瞬时类失败章（chapter_failed / operation_timeout：5xx、连接重置、超时等）按目录序再抓 R 轮，
+// 每轮前静置 1s、轮内连败计数从 0 起算（熔断口径同 failstreak1030）。规则/结构类失败（empty_content_page、
+// invalid_* 等，同源重抓必然同错）不补抓。legado CacheBook 同义：出错等 1s 后重新排到待下载队尾，每章最多 3 次
+// （R=2 对齐）。动机（2026-10-30 phoenix 只读）：itxtbook 一本 109 章失败，抽查失败章当刻 502、10s 后重抓 200；
+// 不补抓则整本 missing_chapters → 换源/退避，原源已到手的大半本白抓。
+const RETRYABLE_CHAPTER_ERRORS = new Set(['chapter_failed', 'operation_timeout']);
+export function contentRetryPasses(env = process.env) {
+  const raw = env.DOWNLOAD_CONTENT_RETRY_PASSES?.trim() ?? '';
+  if (!/^[0-3]$/.test(raw)) return 0;
+  return Number(raw);
+}
+
 // hostburst1030：按站「连抓 N 次即静置 M 毫秒」DOWNLOAD_HOST_BURST_PAUSE（"站=N/M,站=N/M"；站按 stationKeyOfHost
 // 归一，www./m. 前缀互认；N 1..10000，M 封顶 600000）。缺省/未命中/非法项 = null（零行为变化）。
 // 静置在章与章之间、operation 超时之外进行（M 可远大于 timeout-ms），计数含本次下载的全部请求（搜索/详情/目录）。
@@ -267,7 +280,7 @@ export async function downloadBook(m, args, resolveSource, transport = fetchSour
     const stopUrls = manifest.chapters.length > 1 ? manifest.chapters.map(c => c.url) : manifest.chapters[0]?.url;
     const failStreakLimit = contentFailStreak();
     let failStreak = 0;
-    for (const chapter of manifest.chapters) {
+    const fetchChapter = async chapter => {
       controller.signal.throwIfAborted();
       try {
         const path = join(dir, chapter.file);
@@ -290,6 +303,7 @@ export async function downloadBook(m, args, resolveSource, transport = fetchSour
         if (bytes > MAX_BOOK_BYTES) throw new Error('size_limit');
         atomic(path, text);
         Object.assign(chapter, { status: 'done', chars: [...text].length, sha256: hash(text) });
+        delete chapter.error; // 补抓成功的章不留上一轮的失败码
         failStreak = 0;
       } catch (error) {
         if (isLimiterFeedbackError(error) || isHostGateError(error)) throw error;
@@ -303,6 +317,15 @@ export async function downloadBook(m, args, resolveSource, transport = fetchSour
         }
       }
       await checkpoint(false);
+    };
+    for (const chapter of manifest.chapters) await fetchChapter(chapter);
+    // retrypass1030：瞬时类失败章补抓（见 contentRetryPasses）；关时 0 轮，与改前逐字同序。
+    for (let pass = contentRetryPasses(); pass > 0; pass -= 1) {
+      const again = manifest.chapters.filter(c => c.status === 'failed' && RETRYABLE_CHAPTER_ERRORS.has(c.error));
+      if (!again.length) break;
+      await pause(1000, undefined, { signal: controller.signal }).catch(() => controller.signal.throwIfAborted());
+      failStreak = 0;
+      for (const chapter of again) await fetchChapter(chapter);
     }
     stage = 'toc';
     await burstGate();
