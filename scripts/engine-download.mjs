@@ -128,6 +128,13 @@ export function chapterResume(env = process.env) {
   return env.DOWNLOAD_RESUME_BY_CHAPTER?.trim() === '1';
 }
 
+// keepcache1031：DOWNLOAD_RESUME_KEEP_CACHED=1 时，缓存核 sha256 通过的章不再原样重写（atomic = 临时文件 + fsync + rename）。
+// 缺省/其他值 = 关（逐字同改前）。内容同字节，跳过只省 IO：续传千章书每轮白做上千次 fsync；
+// 跨实例种入的硬链接也因重写断开、各留一份（2026-10-31 生产：种入 940 章的检查点续跑后 940 个文件全成单链）。
+export function keepCached(env = process.env) {
+  return env.DOWNLOAD_RESUME_KEEP_CACHED?.trim() === '1';
+}
+
 // hostburst1030：按站「连抓 N 次即静置 M 毫秒」DOWNLOAD_HOST_BURST_PAUSE（"站=N/M,站=N/M"；站按 stationKeyOfHost
 // 归一，www./m. 前缀互认；N 1..10000，M 封顶 600000）。缺省/未命中/非法项 = null（零行为变化）。
 // 静置在章与章之间、operation 超时之外进行（M 可远大于 timeout-ms），计数含本次下载的全部请求（搜索/详情/目录）。
@@ -377,7 +384,7 @@ export async function downloadBook(m, args, resolveSource, transport = fetchSour
         if (!text.trim()) throw new Error('empty_content');
         bytes += Buffer.byteLength(chapter.title + '\n\n' + text + '\n\n');
         if (bytes > MAX_BOOK_BYTES) throw new Error('size_limit');
-        atomic(path, text);
+        if (fresh || !keepCached()) atomic(path, text);
         Object.assign(chapter, { status: 'done', chars: [...text].length, sha256: hash(text) });
         delete chapter.error; // 补抓成功的章不留上一轮的失败码
         failStreak = 0;

@@ -11,7 +11,7 @@ import fixtures from '../src/lib/rule-engine/fixtures/smoke-174.json';
 import { SourceHttpError } from '../src/lib/source-fetch';
 import { SourcePolicyError } from '../src/lib/source-policy';
 import { peerOutRoots, seedFromPeers } from '../runtime-download/resume-seed';
-import { breakerYield, chapterResume, contentFailStreak, contentRetryPasses, contentStopBookPages, downloadBook, downloadOptions, hostBurstPause, policyCodeOf, recheckYield } from './engine-download.mjs';
+import { breakerYield, chapterResume, contentFailStreak, contentRetryPasses, contentStopBookPages, downloadBook, downloadOptions, hostBurstPause, keepCached, policyCodeOf, recheckYield } from './engine-download.mjs';
 
 const dirs: string[] = [];
 afterEach(() => { vi.unstubAllGlobals(); for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
@@ -1040,6 +1040,32 @@ describe('chapterresume1031 目录变动后逐章续传', () => {
     expect(r.code).toBe(0);
     expect(r.manifestPath.startsWith(outOf('inst-1'))).toBe(true);
     expect(reads(f)).toBe(10);
+  });
+
+  it.each([[false, 1], [true, 2]] as const)('keepcache1031 KEEP_CACHED=%s：缓存章是否原样重写（硬链接 nlink=%i）', async (on, nlink) => {
+    vi.stubEnv('DOWNLOAD_BREAKER_YIELD', '1');
+    if (on) vi.stubEnv('DOWNLOAD_RESUME_KEEP_CACHED', '1');
+    const f = setup();
+    const base = mkdtempSync(join(tmpdir(), 't4-keep-')); dirs.push(base);
+    const outOf = (inst: string) => join(base, inst, 'download', 'out');
+    const task = 'synthetictaskkey';
+    const runIn = (inst: string, s: { n: number; open: boolean }) => downloadBook({ api, compile, parser },
+      { ...f.options, out: join(outOf(inst), task) }, async () => ({ source: f.source, builtin: f.builtin }), book(f, s));
+    const first = await runIn('inst-2', { n: 10, open: true });
+    expect(first.code).toBe(2);
+    mkdirSync(outOf('inst-1'), { recursive: true });
+    expect(seedFromPeers(join(outOf('inst-1'), task), peerOutRoots(outOf('inst-1'))).chapters).toBe(3);
+    const r = await runIn('inst-1', { n: 10, open: false });
+    expect(r.code).toBe(0);
+    expect(reads(f)).toBe(10);
+    const seeded = join(dirname(r.manifestPath), '0.txt');
+    expect(statSync(seeded).nlink).toBe(nlink);
+    expect(readFileSync(seeded, 'utf8')).toBe(readFileSync(join(dirname(first.manifestPath), '0.txt'), 'utf8'));
+  });
+
+  it.each([['1', true], ['0', false], ['', false]] as const)('KEEP_CACHED %j ⇒ %s', (value, on) => {
+    vi.stubEnv('DOWNLOAD_RESUME_KEEP_CACHED', value);
+    expect(keepCached()).toBe(on);
   });
 });
 
