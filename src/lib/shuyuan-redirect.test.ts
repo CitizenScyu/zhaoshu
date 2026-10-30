@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { fetchText, isTrustedRedirectTarget } from './shuyuan';
+import { fetchText, isSameStationRedirectTarget, isTrustedRedirectTarget, probeSameStationRedirect } from './shuyuan';
+import { refreshSupportedHosts } from './source-policy';
 
 // fetchText 的**有界跳转**语义:上游 yckceo 把合集 JSON 端点改成 302 跳转到 jsdelivr
 // (2026-09-21 实测 gcore.jsdelivr.net)。原先 redirect:'error' 硬拒一切跳转会全量失败;
@@ -101,5 +102,52 @@ describe('isTrustedRedirectTarget 判定', () => {
     expect(isTrustedRedirectTarget('http://cdn.jsdelivr.net/a.json', origin)).toBe(false); // 非 https
     expect(isTrustedRedirectTarget('https://127.0.0.1/a.json', origin)).toBe(false); // 内网
     expect(isTrustedRedirectTarget('not a url', origin)).toBe(false);
+  });
+});
+
+// stnredir1030：探测路径的同站跳转放行（apex↔www/m.），目标还须过运行时 host 门。
+describe('同站跳转（sameStationOf）', () => {
+  const src = 'https://station-a.example/';
+  afterEach(() => { refreshSupportedHosts([]); });
+
+  it('缺省不传 sameStationOf：同站 apex→www 仍拒绝（零行为变化）', async () => {
+    refreshSupportedHosts(['station-a.example', 'www.station-a.example']);
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValueOnce(redirect('https://www.station-a.example/', 301));
+    vi.stubGlobal('fetch', fetchMock);
+    await expect(fetchText(src, 12_000, signal())).rejects.toThrow('非受信主机');
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('传 sameStationOf：apex→www 跟随成功，redirect 仍 manual', async () => {
+    refreshSupportedHosts(['station-a.example', 'www.station-a.example']);
+    const fetchMock = vi.fn<typeof fetch>()
+      .mockResolvedValueOnce(redirect('https://www.station-a.example/', 301))
+      .mockResolvedValueOnce(ok('<html></html>'));
+    vi.stubGlobal('fetch', fetchMock);
+    await expect(fetchText(src, 12_000, signal(), { sameStationOf: src })).resolves.toBe('<html></html>');
+    expect(fetchMock.mock.calls[1][0]).toBe('https://www.station-a.example/');
+    expect(fetchMock.mock.calls.map(([, init]) => init?.redirect)).toEqual(['manual', 'manual']);
+  });
+
+  it('判定：跨站/非 https/目标不在 host 门/内网字面量一律拒绝', () => {
+    refreshSupportedHosts(['station-a.example', 'www.station-a.example', 'm.station-a.example', 'other.example', 'so.station-a.example']);
+    expect(isSameStationRedirectTarget('https://www.station-a.example/x', src, src)).toBe(true);
+    expect(isSameStationRedirectTarget('https://m.station-a.example/x', src, src)).toBe(true);
+    expect(isSameStationRedirectTarget('/relative', 'https://www.station-a.example/', src)).toBe(true);
+    expect(isSameStationRedirectTarget('https://other.example/x', src, src)).toBe(false); // 跨站
+    expect(isSameStationRedirectTarget('https://so.station-a.example/x', src, src)).toBe(false); // so. 不归 apex
+    expect(isSameStationRedirectTarget('http://www.station-a.example/x', src, src)).toBe(false); // 非 https
+    refreshSupportedHosts(['station-a.example']);
+    expect(isSameStationRedirectTarget('https://www.station-a.example/x', src, src)).toBe(false); // 不在 host 门
+    expect(isSameStationRedirectTarget('https://127.0.0.1/x', src, src)).toBe(false);
+    expect(isSameStationRedirectTarget('not a url', src, src)).toBe(false);
+  });
+
+  it('开关解析：只有 1/true/on 才开', () => {
+    expect(probeSameStationRedirect({})).toBe(false);
+    expect(probeSameStationRedirect({ PROBE_SAME_STATION_REDIRECT: '0' })).toBe(false);
+    expect(probeSameStationRedirect({ PROBE_SAME_STATION_REDIRECT: 'yes' })).toBe(false);
+    expect(probeSameStationRedirect({ PROBE_SAME_STATION_REDIRECT: ' ON ' })).toBe(true);
+    expect(probeSameStationRedirect({ PROBE_SAME_STATION_REDIRECT: '1' })).toBe(true);
   });
 });

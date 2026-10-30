@@ -265,6 +265,18 @@ export function admissionRunnerPhoenixOkPrefix(env: Record<string, string | unde
   return raw === '1' || raw === 'true' || raw === 'on';
 }
 
+/**
+ * stnredir1030：池可达性探测放行同站跳转（PROBE_SAME_STATION_REDIRECT）。fetchText 的跳转白名单只认 jsdelivr，
+ * 源首页 apex→www / www→apex 这类同站 301 也被判「非受信主机」，连败 3 次标 failed 出池——生产实测 suduguu.com
+ * （正文规则可用的那份）因此出池，下载线只剩 www 那份正文取空的源。开时探测（且只有探测）额外放行：目标过
+ * validateSourceUrl（https、非内网字面量、host 在运行时门内）且与源同站键（stationKeyOfUrl，www./m. 归 apex）。
+ * 只有显式 1/true/on（忽略大小写）才开；缺省/其它一律关 = 零行为变化。合集 JSON 抓取不受影响。
+ */
+export function probeSameStationRedirect(env: Record<string, string | undefined> = process.env): boolean {
+  const raw = env.PROBE_SAME_STATION_REDIRECT?.trim().toLowerCase();
+  return raw === '1' || raw === 'true' || raw === 'on';
+}
+
 /** M2-3 波次开关（m2-scaleout §6.1）：池上限默认 4（放量前与既有 slice(0,4) 逐字相同）。 */
 export const DEFAULT_READING_POOL_LIMIT = 4;
 
@@ -877,7 +889,24 @@ export function isTrustedRedirectTarget(rawLocation: string, base: string): bool
   return TRUSTED_REDIRECT_HOSTS.some((allowed) => host === allowed || host.endsWith(`.${allowed}`));
 }
 
-export async function fetchText(url: string, timeoutMs: number, parentSignal: AbortSignal): Promise<string> {
+/**
+ * stnredir1030：同站跳转判定（仅探测路径经 fetchText 的 sameStationOf 启用）。目标必须过运行时门
+ * validateSourceUrl（与引擎真实取页同一把锁，不扩 SSRF 面），且站键与源 URL 相同。
+ */
+export function isSameStationRedirectTarget(rawLocation: string, base: string, sourceUrl: string): boolean {
+  let target: URL;
+  try {
+    target = validateSourceUrl(new URL(rawLocation, base).href);
+  } catch {
+    return false;
+  }
+  const key = stationKeyOfUrl(sourceUrl);
+  return key !== '' && stationKeyOfUrl(target.href) === key;
+}
+
+export async function fetchText(
+  url: string, timeoutMs: number, parentSignal: AbortSignal, options: { sameStationOf?: string } = {},
+): Promise<string> {
   const deadline = createDeadline(timeoutMs);
   const signal = AbortSignal.any([parentSignal, deadline.signal]);
   let response: Response | undefined;
@@ -904,7 +933,8 @@ export async function fetchText(url: string, timeoutMs: number, parentSignal: Ab
         response = undefined;
         if (!location) throw new Error(`书源跳转缺少 Location ${hostOf(current)}`);
         if (redirects >= ADMISSION_MAX_REDIRECTS) throw new Error(`书源跳转次数超限 ${hostOf(current)}`);
-        if (!isTrustedRedirectTarget(location, current)) {
+        if (!isTrustedRedirectTarget(location, current)
+          && !(options.sameStationOf && isSameStationRedirectTarget(location, current, options.sameStationOf))) {
           throw new Error(`书源跳转到非受信主机(拒绝)${redirectHostOf(location, current)}`);
         }
         const next = new URL(location, current).href;
@@ -1729,12 +1759,14 @@ async function refreshWithinBudget(s: Sql, budget: RequestDeadline, signal: Abor
   // （在此之前只有人工 POST {action:disable} 会写它）。已有值不覆盖：那是历史失败证据。
   const probeFailures = new Map<string, string>();
   let next = 0;
+  const sameStation = probeSameStationRedirect();
   async function probeWorker() {
     while (next < probes.length) {
       if (signal.aborted || budget.remainingMs <= PROBE_TIMEOUT_MS + WRITE_RESERVE_MS) return;
       const url = probes[next++];
       try {
-        await fetchText(validateSourceUrl(url).href, PROBE_TIMEOUT_MS, signal);
+        const probeUrl = validateSourceUrl(url).href;
+        await fetchText(probeUrl, PROBE_TIMEOUT_MS, signal, sameStation ? { sameStationOf: probeUrl } : {});
         // 探测成功即清零连续失败计数，回到可达。
         states.set(url, { url, status: 'reachable', checked_at: new Date().toISOString(), error: null, consecutive_failures: 0 });
       } catch (error) {
