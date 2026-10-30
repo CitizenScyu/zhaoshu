@@ -10,7 +10,7 @@ import * as parser from '../src/lib/source-parser';
 import fixtures from '../src/lib/rule-engine/fixtures/smoke-174.json';
 import { SourceHttpError } from '../src/lib/source-fetch';
 import { SourcePolicyError } from '../src/lib/source-policy';
-import { breakerYield, contentFailStreak, contentRetryPasses, contentStopBookPages, downloadBook, downloadOptions, hostBurstPause, policyCodeOf } from './engine-download.mjs';
+import { breakerYield, contentFailStreak, contentRetryPasses, contentStopBookPages, downloadBook, downloadOptions, hostBurstPause, policyCodeOf, recheckYield } from './engine-download.mjs';
 
 const dirs: string[] = [];
 afterEach(() => { vi.unstubAllGlobals(); for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
@@ -864,6 +864,84 @@ describe('breakeryield1031 限速器熔断让出', () => {
   it.each([['1', true], [' 1 ', true], ['0', false], ['', false], ['true', false]] as const)('%j ⇒ %s', (value, on) => {
     vi.stubEnv('DOWNLOAD_BREAKER_YIELD', value);
     expect(breakerYield()).toBe(on);
+  });
+
+  it('breakerguard1031：续传轮零新抓且已有章失败（熔断是本轮自己连败打开的）⇒ 不让出，照关开关口径', async () => {
+    vi.stubEnv('DOWNLOAD_BREAKER_YIELD', '1');
+    const f = setup();
+    expect((await f.run(wrap(f, () => true))).code).toBe(2);
+    // 续传轮：第 4、5 章真实 502，之后熔断拒绝。
+    const r = await f.run(async (url, opts) => {
+      const n = url.includes('/read/') ? Number(url.split('/read/')[1]) : 0;
+      if (n === 4 || n === 5) throw new SourceHttpError(502);
+      return wrap(f, () => true)(url, opts);
+    });
+    expect(r.code).toBe(1);
+    expect(r.manifest.errors).toEqual(['missing_chapters']);
+    expect(statuses(r)).toBe('dddfffffff');
+    expect(extra(r).retry_cause).toBeUndefined();
+  });
+
+  it('breakerguard1031：续传轮零新抓但也零失败（熔断仍开着、本轮没真试）⇒ 仍让出', async () => {
+    vi.stubEnv('DOWNLOAD_BREAKER_YIELD', '1');
+    const f = setup();
+    const transport = wrap(f, () => true);
+    expect((await f.run(transport)).code).toBe(2);
+    const r = await f.run(transport);
+    expect(r.code).toBe(2);
+    expect(extra(r).retry_cause).toBe('host_breaker');
+    expect(statuses(r)).toBe('dddppppppp');
+  });
+});
+
+// recheckyield1031：收尾目录复核抖动不判源失败（DOWNLOAD_RECHECK_YIELD，缺省关）。
+describe('recheckyield1031 收尾复核抖动', () => {
+  afterEach(() => { vi.unstubAllEnvs(); });
+  const BOOK = 'https://book15.net/books/details1.html';
+  const timeout = () => new DOMException('书源连接超时', 'ConnectTimeoutError');
+  /** builtin 两章书（style -1：详情=1、目录=2、收尾复核=3 次读详情页）；failAt 次读详情页时超时，badChapters 章 500。 */
+  const wrap = (f: ReturnType<typeof setup>, failAt: number, badChapters = false) => {
+    let bookReads = 0;
+    return async (url: string, opts: Parameters<typeof f.transport>[1]) => {
+      if (url === BOOK && ++bookReads === failAt) throw timeout();
+      if (badChapters && url.includes('/chapter/')) throw new SourceHttpError(500);
+      return f.transport(url, opts);
+    };
+  };
+  const extra = (r: { manifest: object }) => r.manifest as { failure_stage?: string; retry_cause?: string };
+
+  it('缺省关：复核超时 ⇒ code=2 toc，无 retry_cause（零行为变化）', async () => {
+    const f = setup(-1);
+    const r = await f.run(wrap(f, 3));
+    expect(r.code).toBe(2);
+    expect(extra(r)).toMatchObject({ failure_stage: 'toc' });
+    expect(extra(r).retry_cause).toBeUndefined();
+  });
+
+  it('开：全章已抓、复核超时 ⇒ retry_cause=recheck_unavailable', async () => {
+    vi.stubEnv('DOWNLOAD_RECHECK_YIELD', '1');
+    const f = setup(-1);
+    const r = await f.run(wrap(f, 3));
+    expect(r.code).toBe(2);
+    expect(r.manifest.errors).toEqual(['source_unavailable']);
+    expect(extra(r)).toMatchObject({ failure_stage: 'toc', retry_cause: 'recheck_unavailable' });
+  });
+
+  it('开：首取目录超时（没进正文）或已抓不足一半 ⇒ 不带 retry_cause', async () => {
+    vi.stubEnv('DOWNLOAD_RECHECK_YIELD', '1');
+    const first = setup(-1);
+    const r1 = await first.run(wrap(first, 2));
+    expect(r1.code).toBe(2);
+    expect(extra(r1).retry_cause).toBeUndefined();
+    const bad = setup(-1);
+    const r2 = await bad.run(wrap(bad, 3, true));
+    expect(r2.code).toBe(2);
+    expect(extra(r2).retry_cause).toBeUndefined();
+  });
+
+  it.each([['1', true], ['0', false], ['', false]] as const)('%j ⇒ %s', (value, on) => {
+    vi.stubEnv('DOWNLOAD_RECHECK_YIELD', value);
+    expect(recheckYield()).toBe(on);
   });
 });
 

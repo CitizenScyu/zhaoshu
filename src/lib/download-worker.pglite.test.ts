@@ -456,6 +456,14 @@ maybe('T3 worker 任务层：租约、单写者、五阶段对账（PGlite + moc
     expect(waited.error).toContain('host_breaker');
   });
 
+  it('recheckyield1031：retryCause recheck_unavailable 不走排队，开关开也照常计次退避', async () => {
+    const id = await insertTask();
+    const recheck: AdapterOutcome = { ...occupied, stage: 'toc', retryCause: 'recheck_unavailable' };
+    const result = await runDownloadTask(options([scriptAdapter(recheck)], { hostWait: true }), (await claimDownloadTask(sql as never, 'worker-a'))!);
+    expect(result.hostWait).toBeUndefined();
+    expect(await retryState(id)).toMatchObject({ status: 'pending', attempt_count: 2, delay_min: 15 });
+  });
+
   it.each([
     [HOST_WAIT_MAX_FREE_CLAIMS - 2, 'pending'],
     [HOST_WAIT_MAX_FREE_CLAIMS - 1, 'partial'],
@@ -526,6 +534,7 @@ maybe('T3 worker 任务层：租约、单写者、五阶段对账（PGlite + moc
       if (args.source.includes('noname')) return { code: 1, manifest: { status: 'partial', errors: ['download_failed'], chapters_total: 0, chapters_done: 0, chars: 0 } };
       // breakeryield1031：熔断让出 ⇒ code=2 + retry_cause；其余 retry_cause 值不透传
       if (args.source.includes('breaker')) return { code: 2, manifest: { status: 'partial', errors: ['source_unavailable'], failure_stage: 'content', retry_cause: args.source.includes('breakerodd') ? 'other' : 'host_breaker', chapters_total: 3, chapters_done: 2, chars: 1620 } };
+      if (args.source.includes('recheck')) return { code: 2, manifest: { status: 'partial', errors: ['source_unavailable'], failure_stage: 'toc', retry_cause: 'recheck_unavailable', chapters_total: 3, chapters_done: 3, chars: 2430 } };
       const mode = args.source.includes('bad') ? 'missing' : 'ok';
       if (mode === 'ok') return { code: 0, manifest: { status: 'done', errors: [], chapters_total: 3, chapters_done: 3, chars: 2430, artifact: { file: 'book.txt', sha256: 'x', bytes: 9 } } };
       return { code: 1, manifest: { status: 'partial', errors: ['missing_chapters'], chapters_total: 3, chapters_done: 2, chars: 1620 } };
@@ -573,6 +582,7 @@ maybe('T3 worker 任务层：租约、单写者、五阶段对账（PGlite + moc
     expect(JSON.stringify(thrown)).not.toContain('synthetic path detail');
     expect(await run(11, 'breaker')).toMatchObject({ kind: 'incomplete', reason: 'source_unavailable', stage: 'content', retryCause: 'host_breaker', chaptersDone: 2 });
     expect((await run(12, 'breakerodd') as { retryCause?: string }).retryCause).toBeUndefined();
+    expect(await run(13, 'recheck')).toMatchObject({ kind: 'incomplete', reason: 'source_unavailable', stage: 'toc', retryCause: 'recheck_unavailable' });
     const noname = await adapter.download({ id: 7, book_id: 1, title: 't', author: 'a', status: 'running', source_url: 'https://noname.example/z', source_kind: 'engine', source_id: null, requested_by: 'system' }, {
       signal: new AbortController().signal,
       progress: async () => {},

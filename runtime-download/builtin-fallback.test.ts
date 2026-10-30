@@ -1045,6 +1045,24 @@ describe('41-T8FB builtin-fallback', () => {
     expect(state2.failures).toEqual([]);
   });
 
+  it('recheckyield1031：recheck_unavailable 同样不标失败、换下一源，收口带 recheck_unavailable', async () => {
+    const state = {
+      usable: [{ source_url: 'https://a.example/', host: 'a.example' }, { source_url: 'https://b.example/', host: 'b.example' }],
+      stored: [] as [number, string[]][], failures: [] as [number, string, string, string][],
+    };
+    const h = candidatesHarness(state);
+    const calls: string[] = [];
+    const recheck: AdapterOutcome = {
+      kind: 'incomplete', reason: 'source_unavailable', stage: 'toc', retryCause: 'recheck_unavailable',
+      chaptersTotal: 9, chaptersDone: 9, charsTotal: 900,
+    };
+    const out = await h.fallback.wrapAdapter(adapter({}, []), adapter({ 'a.example': recheck }, calls), 'engine')
+      .download(task({ source_kind: 'engine' }), context());
+    expect(out).toMatchObject({ kind: 'incomplete', reason: 'source_unavailable', retryCause: 'recheck_unavailable' });
+    expect(calls).toEqual(['a.example', 'b.example']);
+    expect(state.failures).toEqual([[1, 'https://b.example/', 'permanent', 'identity_mismatch_or_no_candidate']]);
+  });
+
   it('hostwait1031：原源付费墙预览、扫到的候选全被占用 ⇒ 按 host 排队收口，不落 preview_truncated 终态', async () => {
     const state = { usable: [], stored: [] as [number, string[]][], failures: [] as [number, string, string, string][] };
     const h = candidatesHarness(state);

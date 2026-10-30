@@ -321,8 +321,8 @@ export function createBuiltinFallback(options: BuiltinFallbackOptions) {
      * 依次用 engine 腿下载。
      * 逐源收口规则：
      * - complete 即收；任务层停止（budget_exhausted/interrupted）不标失败、不换源，按原分类收口；
-     * - 物理 host 门拒绝（retryCause）：绝不 markFailure——host_occupied / host_breaker（限速器熔断让出）
-     *   换下一已记录源，host_occupancy_unavailable 立即收口不再试；
+     * - 物理 host 门拒绝（retryCause）：绝不 markFailure——host_occupied / host_breaker（限速器熔断让出）/
+     *   recheck_unavailable（收尾复核抖动）换下一已记录源，host_occupancy_unavailable 立即收口不再试；
      * - kind='failure' 或源级 incomplete（source_unavailable / missing_chapters / toc_changed /
      *   operation_timeout / preview_truncated）⇒ 标失败记忆（identity ⇒ permanent，其余 temporary）
      *   后换下一个源；白名单外的未知 incomplete 不标失败、不换源；未知异常按原语义上抛。
@@ -383,7 +383,7 @@ export function createBuiltinFallback(options: BuiltinFallbackOptions) {
           if (stop) return stop;
           if (!sources.length) return primary ?? unavailable('search', lastScanned > 0);
           let supplemented = false;
-          let occupied: 'host_occupied' | 'host_breaker' | null = null;
+          let occupied: 'host_occupied' | 'host_breaker' | 'recheck_unavailable' | null = null;
           for (;;) {
             let allFailed = true;
             for (const url of sources) {
@@ -415,7 +415,7 @@ export function createBuiltinFallback(options: BuiltinFallbackOptions) {
               }
               if (next.reason === 'budget_exhausted' || next.reason === 'interrupted') return next;
               if (next.retryCause === 'host_occupancy_unavailable') return next;
-              if (next.retryCause === 'host_occupied' || next.retryCause === 'host_breaker') {
+              if (next.retryCause === 'host_occupied' || next.retryCause === 'host_breaker' || next.retryCause === 'recheck_unavailable') {
                 allFailed = false;
                 // 收口口径取最后一个让出的原因（两者任务层同样排队，只影响错误列措辞）。
                 occupied = next.retryCause;
@@ -450,7 +450,8 @@ export function createBuiltinFallback(options: BuiltinFallbackOptions) {
           if (stop) return stop;
           // hostwait1031：有候选只是 host 正被别的任务占着（没真试过）⇒ 带 retryCause 收口，让任务层按排队
           // 处理（WorkerOptions.hostWait）；也先于下面的身份终态——候选还没试，不能判这本书无源。
-          // breakeryield1031：host_breaker（本机限速器熔断中，同样没真试完）同此口径。
+          // breakeryield1031：host_breaker（本机限速器熔断中，同样没真试完）同此口径；recheckyield1031 的
+          // recheck_unavailable（正文已抓、只差复核）也不判无源，任务层按普通退避计次。
           if (occupied) return { ...unavailable('search'), retryCause: occupied };
           // nocandrev41 F1：预检判定过身份缺失（原源可达但无此书）且候选全失败 ⇒ 按身份失败
           // 终态收口（与预检腿选不到候选同一语义），不降级成 source_unavailable 16 轮退避重扫。

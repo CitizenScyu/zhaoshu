@@ -110,6 +110,15 @@ export function breakerYield(env = process.env) {
   return env.DOWNLOAD_BREAKER_YIELD?.trim() === '1';
 }
 
+// recheckyield1031：DOWNLOAD_RECHECK_YIELD=1 时，正文跑完后的收尾目录复核遇瞬时不可达（code=2 toc），且已抓
+// 章 ≥ 一半 ⇒ manifest.retry_cause='recheck_unavailable'：回退层不标候选失败（源刚刚还能抓，只是此刻抖），
+// 任务层照常计次退避，下次同源续传（已抓章走缓存，只补目录与缺章）。下次连搜索都不通则照旧标失败，最多多试一轮。
+// 缺省/其他值 = 关（零行为变化：复核失败 ⇒ 候选标 temporary 48h 换源从头抓）。
+// 动机（2026-10-31 phoenix 只读，72h）：cuoceng 213/213（全章已抓）、bqquge 196/216、858/1588 均以 toc 阶段 source_unavailable 收口。
+export function recheckYield(env = process.env) {
+  return env.DOWNLOAD_RECHECK_YIELD?.trim() === '1';
+}
+
 // hostburst1030：按站「连抓 N 次即静置 M 毫秒」DOWNLOAD_HOST_BURST_PAUSE（"站=N/M,站=N/M"；站按 stationKeyOfHost
 // 归一，www./m. 前缀互认；N 1..10000，M 封顶 600000）。缺省/未命中/非法项 = null（零行为变化）。
 // 静置在章与章之间、operation 超时之外进行（M 可远大于 timeout-ms），计数含本次下载的全部请求（搜索/详情/目录）。
@@ -208,7 +217,14 @@ export async function downloadBook(m, args, resolveSource, transport = fetchSour
   let feedbackError;
   let stage = 'resolve';
   const yieldOnBreaker = breakerYield();
-  const isBreakerYield = error => yieldOnBreaker && !controller.signal.aborted && BREAKER_ERROR_NAMES.has(error?.name);
+  // breakerguard1031：本轮已有章失败、却一章没新抓到 ⇒ 熔断多半是本轮自己连败打开的（sto66 实证：续传后
+  // 第 21 章起每轮都是同 5 章失败 → 熔断 → 让出，30m 后再来一遍，免费排队额度 32 次空转约 16h）。此时
+  // 不让出，回到关开关口径（逐章判失败 → 候选标失败换源）。本轮有新抓（源是好的、偶发成串 5xx）或
+  // 一章没失败（熔断是别处打开的，本轮没真试）才让出。
+  let fetchedThisRun = 0, failedThisRun = 0;
+  let rechecking = false; // 正文（含补抓轮）已跑完、进入收尾目录复核
+  const isBreakerYield = error => yieldOnBreaker && !controller.signal.aborted && BREAKER_ERROR_NAMES.has(error?.name)
+    && (fetchedThisRun > 0 || failedThisRun === 0);
   let lastCheckpoint = 0;
   // T3×P2 reconcile：两个节拍解耦——manifest 落盘按 5s 节流（P2-4 写放大修复），
   // onProgress 每次调用必发（T3 租约数据通道，每章上报；失权发现延迟不随写盘节流放大）。
@@ -332,6 +348,7 @@ export async function downloadBook(m, args, resolveSource, transport = fetchSour
           const cached = readFileSync(path, 'utf8');
           if (hash(cached) === prior.sha256 && cached.trim()) text = cached;
         }
+        let fresh = false;
         if (text === undefined) {
           await burstGate();
           text = await operation(async ctx => {
@@ -339,6 +356,7 @@ export async function downloadBook(m, args, resolveSource, transport = fetchSour
             if (!builtin) return (await m.api.engineFetchContent(engine, chapter.url, ctx, true, stopUrls, chapter.title, selected.book)).text;
             return m.parser.parseSourceChapterText((await ctx.page(chapter.url)).text, chapter.title);
           });
+          fresh = true;
         }
         if (!text.trim()) throw new Error('empty_content');
         bytes += Buffer.byteLength(chapter.title + '\n\n' + text + '\n\n');
@@ -347,10 +365,12 @@ export async function downloadBook(m, args, resolveSource, transport = fetchSour
         Object.assign(chapter, { status: 'done', chars: [...text].length, sha256: hash(text) });
         delete chapter.error; // 补抓成功的章不留上一轮的失败码
         failStreak = 0;
+        if (fresh) fetchedThisRun += 1;
       } catch (error) {
         if (isLimiterFeedbackError(error) || isHostGateError(error)) throw error;
         if (isBreakerYield(error)) throw error; // breakeryield1031：熔断不算本章失败，整本让出
         chapter.status = 'failed';
+        failedThisRun += 1;
         // Do not persist upstream messages, URLs or credentials in diagnostics.
         chapter.error = knownError.test(error.message) ? error.message : 'chapter_failed';
         if (chapter.error === 'size_limit' || controller.signal.aborted) throw error;
@@ -371,6 +391,7 @@ export async function downloadBook(m, args, resolveSource, transport = fetchSour
       for (const chapter of again) await fetchChapter(chapter);
     }
     stage = 'toc';
+    rechecking = true;
     await burstGate();
     if (hash(JSON.stringify(await toc())) !== manifest.tocHash) throw new Error('toc_changed');
     if (manifest.chapters.some(c => c.status !== 'done')) throw new Error('missing_chapters');
@@ -396,6 +417,8 @@ export async function downloadBook(m, args, resolveSource, transport = fetchSour
     // 外部中断（停机/租约/总预算）时的请求失败是被中止，不是书源不可达。
     if (SOURCE_STAGES.has(stage) && !controller.signal.aborted && isSourceUnavailableError(error)) failureCode = 2;
     if (isBreakerYield(error)) { failureCode = 2; manifest.retry_cause = 'host_breaker'; }
+    else if (failureCode === 2 && rechecking && recheckYield()
+      && manifest.chapters.filter(c => c.status === 'done').length * 2 >= manifest.chapters.length) manifest.retry_cause = 'recheck_unavailable';
     if (failureCode === 2) manifest.failure_stage = stage; // 固定枚举，不含上游细节
     manifest.errors.push(failureCode === 2 ? 'source_unavailable' : knownError.test(error.message) ? error.message : 'download_failed');
     // dlfail42：白名单外错误被脱敏成 download_failed 时记 Error 构造器名（TypeError 等，不含上游文本），

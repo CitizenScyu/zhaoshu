@@ -55,7 +55,7 @@ export type AdapterOutcome =
       chapterRanges?: TxtChapter[];
     }
   // stage：source_unavailable 时判定所在阶段（resolve/search/detail/toc），只作日志用的固定枚举。
-  | { kind: 'incomplete'; reason: string; chaptersTotal: number; chaptersDone: number; charsTotal: number; stage?: string; retryCause?: 'host_occupied' | 'host_occupancy_unavailable' | 'host_breaker' }
+  | { kind: 'incomplete'; reason: string; chaptersTotal: number; chaptersDone: number; charsTotal: number; stage?: string; retryCause?: 'host_occupied' | 'host_occupancy_unavailable' | 'host_breaker' | 'recheck_unavailable' }
   | { kind: 'failure'; code: string; /** 脱敏诊断类别（Error 构造器名，如 TypeError；diag1030 起可带 /固定码 与 @阶段）——download_failed 兜底时定位速败结构用。 */ detail?: string };
 
 export interface SourceAdapterContext {
@@ -773,8 +773,10 @@ export function createEngineAdapter(options: EngineAdapterOptions): SourceAdapte
         // 阶段只收固定小写枚举，防止任何上游文本借此进入日志/错误列。
         const stage = /^[a-z]+$/.test(manifest.failure_stage ?? '') ? manifest.failure_stage : 'unknown';
         // breakeryield1031：熔断让出带 retryCause，回退层不标候选失败、任务层按 host 忙排队。
+        // recheckyield1031：收尾目录复核抖动同样不标候选失败，但任务层照常计次退避（不在 hostWait 名单）。
+        const retryCause = manifest.retry_cause === 'host_breaker' || manifest.retry_cause === 'recheck_unavailable' ? manifest.retry_cause : undefined;
         return { kind: 'incomplete', reason: classified, chaptersTotal, chaptersDone, charsTotal, stage,
-          ...(manifest.retry_cause === 'host_breaker' ? { retryCause: 'host_breaker' as const } : {}) };
+          ...(retryCause ? { retryCause } : {}) };
       }
       if (classified === 'missing_chapters' || classified === 'toc_changed' || classified === 'budget_exhausted' || classified === 'interrupted' || classified === 'operation_timeout') {
         return { kind: 'incomplete', reason: classified, chaptersTotal, chaptersDone, charsTotal };
