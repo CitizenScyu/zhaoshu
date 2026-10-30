@@ -10,7 +10,7 @@ import * as parser from '../src/lib/source-parser';
 import fixtures from '../src/lib/rule-engine/fixtures/smoke-174.json';
 import { SourceHttpError } from '../src/lib/source-fetch';
 import { SourcePolicyError } from '../src/lib/source-policy';
-import { contentFailStreak, downloadBook, downloadOptions } from './engine-download.mjs';
+import { contentFailStreak, downloadBook, downloadOptions, hostBurstPause } from './engine-download.mjs';
 
 const dirs: string[] = [];
 afterEach(() => { vi.unstubAllGlobals(); for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
@@ -622,6 +622,65 @@ describe('failstreak1030 正文连续失败熔断', () => {
   it.each(['0', '', 'abc', '-3', '1e3'])('非正整数 %j 视为关', async value => {
     vi.stubEnv('DOWNLOAD_CONTENT_FAIL_STREAK', value);
     expect(contentFailStreak()).toBe(0);
+  });
+});
+
+// hostburst1030：按站「连抓 N 次即静置 M 毫秒」（DOWNLOAD_HOST_BURST_PAUSE，缺省关）。
+describe('hostburst1030 按站连抓静置', () => {
+  afterEach(() => { vi.unstubAllEnvs(); });
+  const catalog = (n: number) => `<div class="d-chapter-list" id="full-catalog">${Array.from({ length: n }, (_, i) => `<dd><a href="/read/${i + 1}">第${i + 1}章</a></dd>`).join('')}</div>`;
+  /** 20 章书，记录每次请求（beforeRequest 之后）的时刻。 */
+  const wrap = (f: ReturnType<typeof setup>, times: number[]) => async (url: string, opts: { signal: AbortSignal; beforeRequest?: (s: AbortSignal) => Promise<void> }) => {
+    if (url === 'https://book15.net/books/details1.html') {
+      await opts.beforeRequest?.(opts.signal); times.push(Date.now());
+      return { url, text: `<h1>测试书</h1><div class="d-info-panel"><a href="/author/1">作者甲</a></div><meta property="og:novel:book_name" content="测试书"><meta property="og:novel:author" content="作者甲">` + catalog(20) };
+    }
+    if (url.includes('/read/')) {
+      await opts.beforeRequest?.(opts.signal); times.push(Date.now());
+      return { url, text: '<li class="chapter-content" id="article-content"><p>合成正文，离线测试。</p></li>' };
+    }
+    const page = await f.transport(url, opts); times.push(Date.now()); return page;
+  };
+  /** 相邻请求间隔 < gapMs 的连续段长度。 */
+  const runs = (times: number[], gapMs: number) => {
+    const out = [1];
+    for (let i = 1; i < times.length; i++) times[i] - times[i - 1] >= gapMs ? out.push(1) : out[out.length - 1]++;
+    return out;
+  };
+
+  it('命中站（m. 前缀互认）：任意两次静置之间不超过 N 次请求，整本照常完成', async () => {
+    vi.stubEnv('DOWNLOAD_HOST_BURST_PAUSE', 'other.example=1/9000, m.book15.net=5/80');
+    const f = setup(); const times: number[] = [];
+    const r = await f.run(wrap(f, times));
+    expect(r.code).toBe(0);
+    const segments = runs(times, 70);
+    expect(segments.length).toBeGreaterThanOrEqual(4);
+    for (const n of segments) expect(n).toBeLessThanOrEqual(5);
+    expect(segments.reduce((a, b) => a + b, 0)).toBe(times.length);
+  });
+
+  it('静置中收到中断：立即按 interrupted 收口，不等满 M', async () => {
+    vi.stubEnv('DOWNLOAD_HOST_BURST_PAUSE', 'book15.net=1/600000');
+    const f = setup(); const times: number[] = [];
+    const t0 = Date.now();
+    const timer = setTimeout(() => process.emit('SIGINT'), 50);
+    const r = await f.run(wrap(f, times)); clearTimeout(timer);
+    expect(Date.now() - t0).toBeLessThan(3000);
+    expect(r.code).toBe(1);
+    expect(r.manifest.errors).toEqual(['interrupted']);
+    expect(r.manifest.chapters.filter((c: { status: string }) => c.status === 'done')).toHaveLength(0);
+  });
+
+  it('解析：缺省/非法项/未命中为 null，命中取值且 M 封顶 600000', () => {
+    const src = 'https://www.book15.net/';
+    expect(hostBurstPause(src, {})).toBeNull();
+    expect(hostBurstPause(src, { DOWNLOAD_HOST_BURST_PAUSE: 'other.example=10/62000' })).toBeNull();
+    expect(hostBurstPause(src, { DOWNLOAD_HOST_BURST_PAUSE: 'book15.net=10,book15.net=a/1' })).toBeNull();
+    expect(hostBurstPause(src, { DOWNLOAD_HOST_BURST_PAUSE: 'book15.net=0/62000' })).toBeNull();
+    expect(hostBurstPause(src, { DOWNLOAD_HOST_BURST_PAUSE: 'so.book15.net=10/62000' })).toBeNull();
+    expect(hostBurstPause(src, { DOWNLOAD_HOST_BURST_PAUSE: ' x.example=1/1 , M.Book15.net = 10 / 62000 ' })).toEqual({ every: 10, pauseMs: 62000 });
+    expect(hostBurstPause(src, { DOWNLOAD_HOST_BURST_PAUSE: 'book15.net=3/9999999' })).toEqual({ every: 3, pauseMs: 600000 });
+    expect(hostBurstPause('not a url', { DOWNLOAD_HOST_BURST_PAUSE: 'book15.net=3/100' })).toBeNull();
   });
 });
 

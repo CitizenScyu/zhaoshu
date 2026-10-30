@@ -7,6 +7,7 @@ import { authorBridgeAccepts, authorBridgeCandidates, authorSearchKey } from '..
 import { searchKeysOf } from '../src/lib/search-key.ts';
 import { sourceBookMatches } from '../src/lib/source-parser.ts';
 import { fetchSourceText, sourceAbortable } from '../src/lib/source-fetch.ts';
+import { stationKeyOfHost, stationKeyOfUrl } from '../src/lib/source-policy.ts';
 
 const hash = value => createHash('sha256').update(value).digest('hex');
 const atomic = (path, data) => {
@@ -74,6 +75,28 @@ export function contentFailStreak(env = process.env) {
   return Number(raw);
 }
 
+// hostburst1030：按站「连抓 N 次即静置 M 毫秒」DOWNLOAD_HOST_BURST_PAUSE（"站=N/M,站=N/M"；站按 stationKeyOfHost
+// 归一，www./m. 前缀互认；N 1..10000，M 封顶 600000）。缺省/未命中/非法项 = null（零行为变化）。
+// 静置在章与章之间、operation 超时之外进行（M 可远大于 timeout-ms），计数含本次下载的全部请求（搜索/详情/目录）。
+// 动机（2026-10-30 pc-linux 实测）：m.cuoceng.com 正文页按 IP 连续计数，第 11 次返回 400
+// {"code":"swq-003",...请60秒后重试}；改 6.5s 匀速仍在第 11 次被拒（非滑动窗口），「1s 连抓 10 次 → 静置 62s」3 轮 30/30 成功。
+// 默认节奏下每本恰好抓 10 章，第 11 章起连败 → 限速器熔断 → 余下章节与收尾目录全挂 CircuitOpenError
+// （近 7 天 cuoceng manifest 全 partial、终态 source_unavailable）。
+export function hostBurstPause(source, env = process.env) {
+  const raw = env.DOWNLOAD_HOST_BURST_PAUSE?.trim();
+  if (!raw) return null;
+  const key = stationKeyOfUrl(source);
+  if (!key) return null;
+  for (const item of raw.split(',')) {
+    const hit = /^\s*([a-z0-9.-]+)\s*=\s*(\d{1,5})\s*\/\s*(\d{1,7})\s*$/i.exec(item);
+    if (!hit || stationKeyOfHost(hit[1]) !== key) continue;
+    const every = Number(hit[2]);
+    if (every < 1) return null;
+    return { every, pauseMs: Math.min(Number(hit[3]), 600000) };
+  }
+  return null;
+}
+
 // 身份判据的唯一实现：downloadBook 选候选、执行器扣额度前的身份预检（runtime-download/identity-precheck.ts）
 // 与 builtin 引擎源回退（runtime-download/builtin-fallback.ts）共用。
 //
@@ -122,6 +145,14 @@ export async function downloadBook(m, args, resolveSource, transport = fetchSour
   const timer = setTimeout(() => controller.abort(new Error('budget_exhausted')), args['budget-ms']);
   process.on('SIGINT', stop); process.on('SIGTERM', stop);
   let nextAt = 0;
+  const burst = hostBurstPause(args.source);
+  let burstCount = 0;
+  // 计数到 N 即静置 M 后清零；中断/预算到点时抛 controller 的原因（interrupted/budget_exhausted），与 operation 同口径。
+  const burstGate = async () => {
+    if (!burst || burstCount < burst.every) return;
+    await pause(burst.pauseMs, undefined, { signal: controller.signal }).catch(() => controller.signal.throwIfAborted());
+    burstCount = 0;
+  };
   let bytes = 0;
   let failureCode = 1;
   let feedbackError;
@@ -150,6 +181,7 @@ export async function downloadBook(m, args, resolveSource, transport = fetchSour
       if (at > now) await pause(at - now, undefined, { signal: requestSignal });
       requestSignal.throwIfAborted();
       nextAt = Math.max(nextAt, Date.now() + args['rate-ms']);
+      burstCount++;
       } });
       if (new URL(page.url).pathname !== new URL(url).pathname) throw new Error('response_path_mismatch');
       return page;
@@ -245,11 +277,14 @@ export async function downloadBook(m, args, resolveSource, transport = fetchSour
           const cached = readFileSync(path, 'utf8');
           if (hash(cached) === prior.sha256 && cached.trim()) text = cached;
         }
-        if (text === undefined) text = await operation(async ctx => {
-          // bookcontent1029：目录用过的书籍成员（详情带回）同样交给正文。
-          if (!builtin) return (await m.api.engineFetchContent(engine, chapter.url, ctx, true, stopUrls, chapter.title, selected.book)).text;
-          return m.parser.parseSourceChapterText((await ctx.page(chapter.url)).text, chapter.title);
-        });
+        if (text === undefined) {
+          await burstGate();
+          text = await operation(async ctx => {
+            // bookcontent1029：目录用过的书籍成员（详情带回）同样交给正文。
+            if (!builtin) return (await m.api.engineFetchContent(engine, chapter.url, ctx, true, stopUrls, chapter.title, selected.book)).text;
+            return m.parser.parseSourceChapterText((await ctx.page(chapter.url)).text, chapter.title);
+          });
+        }
         if (!text.trim()) throw new Error('empty_content');
         bytes += Buffer.byteLength(chapter.title + '\n\n' + text + '\n\n');
         if (bytes > MAX_BOOK_BYTES) throw new Error('size_limit');
@@ -270,6 +305,7 @@ export async function downloadBook(m, args, resolveSource, transport = fetchSour
       await checkpoint(false);
     }
     stage = 'toc';
+    await burstGate();
     if (hash(JSON.stringify(await toc())) !== manifest.tocHash) throw new Error('toc_changed');
     if (manifest.chapters.some(c => c.status !== 'done')) throw new Error('missing_chapters');
     // vipwall42：付费墙预览识别（4393 实证：阅文系 chuangshi/yunqi 对 VIP 章返回 ~250-350 字预览文本，
