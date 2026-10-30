@@ -4,7 +4,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 const scores = vi.hoisted(() => vi.fn());
 vi.mock('../src/lib/download-source-candidates', () => ({ productiveHostScores: scores }));
 
-import { createHostPriority, HOST_PRIORITY_TTL_MS, productiveFirstEnabled } from './host-priority';
+import { createHostPriority, HOST_PRIORITY_TTL_MS, productiveFirstEnabled, scanRotateEnabled } from './host-priority';
 
 const sql = {} as never;
 const signal = new AbortController().signal;
@@ -18,6 +18,13 @@ describe('yield1030 host-priority', () => {
     expect(productiveFirstEnabled({ DOWNLOAD_SCAN_PRODUCTIVE_FIRST: ' On ' })).toBe(true);
     expect(productiveFirstEnabled({ DOWNLOAD_SCAN_PRODUCTIVE_FIRST: 'true' })).toBe(true);
     expect(scores).not.toHaveBeenCalled();
+  });
+
+  it('rotate1030：DOWNLOAD_SCAN_ROTATE 缺省/非真值关，1/true/on 开', () => {
+    expect(scanRotateEnabled({})).toBe(false);
+    expect(scanRotateEnabled({ DOWNLOAD_SCAN_ROTATE: '0' })).toBe(false);
+    expect(scanRotateEnabled({ DOWNLOAD_SCAN_ROTATE: ' On ' })).toBe(true);
+    expect(scanRotateEnabled({ DOWNLOAD_SCAN_ROTATE: '1' })).toBe(true);
   });
 
   it('成功结果按 TTL 记忆，过期重查', async () => {

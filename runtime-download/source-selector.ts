@@ -45,6 +45,13 @@ export interface SourceSelectionRequest {
   budgetMs: number;
   /** 同次下载的预检/补扫共用余额；每个实际扫描源在出网前扣一次，异常也不退回。 */
   scanBudget?: { remaining: number };
+  /**
+   * rotate1030：扫描窗口轮转序号（缺省/0 = 池序原样，逐字同改前）。第 k 轮把优先段（hostPriority>0）之后的
+   * 可扫源整体左移 k×窗口（窗口 = scanLimit − 优先段可扫数），只改顺序、不增减可扫源、不动 scanLimit/预算。
+   * 动机：池序按 probe/tier/checked_at 排，尾段结构性固定，scanLimit≈160 而可扫源 ~600，同一本书 16 次重试
+   * 扫的是同一个前 160——全池扫描实测命中源排在 160 之后的书（tuishujun 502/574 等）永远找不回。
+   */
+  rotate?: number;
 }
 
 /**
@@ -134,6 +141,7 @@ export function createSourceSelector(options: SourceSelectorOptions): SourceSele
         return { picked: [], scanned: 0 };
       }
       signal.throwIfAborted();
+      let lead = 0;
       if (options.hostPriority) {
         let priority: ReadonlyMap<string, number> = new Map();
         try {
@@ -146,10 +154,33 @@ export function createSourceSelector(options: SourceSelectorOptions): SourceSele
           pool = pool.map((source, index) => ({ source, index, p: rank(source) }))
             .sort((a, b) => b.p - a.p || a.index - b.index)
             .map(entry => entry.source);
+          lead = pool.filter(source => rank(source) > 0).length;
         }
       }
       const excludedHosts = new Set(request.excludedHosts);
       const excludedSources = new Set(request.excludedSources);
+      const scannable = (source: PoolSource): boolean => {
+        const host = hostOf(source.url);
+        return /^https:\/\//i.test(source.url) && Boolean(host) && !builtinHosts.has(host) && !isSuspect(host) && !isPaywallHost(host)
+          && !excludedHosts.has(host) && !excludedSources.has(source.url);
+      };
+      const rotate = Math.floor(request.rotate ?? 0);
+      if (rotate > 0) {
+        // 偏移按「可扫源」计（跳过的不耗 scanLimit，按原始下标算会让窗口越转越重叠）。
+        const tail = pool.slice(lead);
+        const tailScannable = tail.filter(scannable).length;
+        const window = Math.max(1, request.scanLimit - pool.slice(0, lead).filter(scannable).length);
+        if (tailScannable > window) {
+          const skip = (rotate * window) % tailScannable;
+          let cut = 0;
+          for (let seen = 0; cut < tail.length; cut += 1) {
+            if (!scannable(tail[cut])) continue;
+            if (seen === skip) break;
+            seen += 1;
+          }
+          pool = [...pool.slice(0, lead), ...tail.slice(cut), ...tail.slice(0, cut)];
+        }
+      }
       const picked: string[] = [];
       const pickedHosts: string[] = [];
       // 不做扫描内同 host 去重（2026-10-14 scanrev41 异厂复核推翻当日一手版）：同 host 变体承载
@@ -162,8 +193,7 @@ export function createSourceSelector(options: SourceSelectorOptions): SourceSele
         if (picked.length >= request.targetHits || scanned >= request.scanLimit || overall.aborted
           || (request.scanBudget && request.scanBudget.remaining <= 0)) break;
         const host = hostOf(source.url);
-        if (!/^https:\/\//i.test(source.url) || !host || builtinHosts.has(host) || isSuspect(host) || isPaywallHost(host)
-          || excludedHosts.has(host) || excludedSources.has(source.url) || pickedHosts.includes(host)) continue;
+        if (!scannable(source) || pickedHosts.includes(host)) continue;
         scanned += 1;
         if (request.scanBudget) request.scanBudget.remaining -= 1;
         try {

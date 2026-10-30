@@ -21,6 +21,7 @@ const signal = () => new AbortController().signal;
 
 function harness(opts: {
   pool?: string[] | (() => never); throwSearch?: string[]; suspect?: string[]; noBook?: string[]; hostTarget?: number; maxSources?: number;
+  scanRotate?: boolean;
 }) {
   const searched: string[] = [];
   const poolLoads: number[] = [];
@@ -48,6 +49,7 @@ function harness(opts: {
     isSuspect: host => opts.suspect?.includes(host) ?? false,
     hostTarget: opts.hostTarget,
     maxSources: opts.maxSources,
+    scanRotate: opts.scanRotate,
   });
   return { fallback, searched, poolLoads };
 }
@@ -80,6 +82,18 @@ describe('41-T8FB builtin-fallback', () => {
     expect(await h.fallback.wrapPrecheck(async () => UNAVAILABLE)(task()))
       .toEqual({ ok: true, reason: 'builtin_engine_fallback' });
     expect(h.searched).toEqual(['a.example', 'b.example']);
+  });
+
+  it('rotate1030：开关开时第 n 次尝试扫第 n 个窗口，扫描上限外的源也能被找回；关时每次同一窗口', async () => {
+    const pool = Array.from({ length: MAX_FALLBACK_SCAN_SOURCES + 10 }, (_, i) => `https://s${i}.example/`);
+    const hit = `s${MAX_FALLBACK_SCAN_SOURCES + 5}.example`;
+    const noBook = pool.map(hostOf).filter(host => host !== hit);
+    for (const [scanRotate, attempt, found] of [[true, 1, false], [true, 2, true], [false, 2, false]] as const) {
+      const h = harness({ pool, noBook, hostTarget: 1, scanRotate });
+      const result = await h.fallback.wrapPrecheck(async () => UNAVAILABLE)(task({ attempt_count: attempt }), signal());
+      expect(result.ok).toBe(found);
+      expect(new Set(h.searched).size).toBeLessThanOrEqual(MAX_FALLBACK_SCAN_SOURCES);
+    }
   });
 
   it('早停目标 3：hostTarget=3 时命中 3 个不同 host 才停，且仍受 maxSources 上限', async () => {

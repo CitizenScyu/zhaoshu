@@ -96,6 +96,33 @@ describe('共用选源器', () => {
     expect(h.searchedUrls).toEqual(['https://a.example/']);
   });
 
+  it('rotate1030：第 k 轮整体左移 k×scanLimit，几轮即覆盖全池；rotate=0 逐字同池序', async () => {
+    const pool = Array.from({ length: 10 }, (_, i) => `https://s${i}.example/`);
+    const scans: string[][] = [];
+    for (const rotate of [0, 1, 2, 3]) {
+      const h = harness({ pool, search: () => [] });
+      expect((await h.selector(request({ scanLimit: 3, rotate }), freshSignal())).scanned).toBe(3);
+      scans.push(h.searchedUrls.map(url => url.slice(8, 10)));
+    }
+    expect(scans).toEqual([['s0', 's1', 's2'], ['s3', 's4', 's5'], ['s6', 's7', 's8'], ['s9', 's0', 's1']]);
+  });
+
+  it('rotate1030：优先段钉在最前不参与轮转；窗口扣掉优先段，偏移只数可扫源', async () => {
+    const pool = ['http://skip.example/', 'https://t0.example/', 'https://busy.example/', 'https://t1.example/', 'https://p.example/',
+      'https://t2.example/', 'https://t3.example/', 'https://t4.example/'];
+    const h = harness({ pool, search: () => [], hostPriority: async () => new Map([['p.example', 3]]) });
+    await h.selector(request({ scanLimit: 3, rotate: 1, excludedHosts: ['busy.example'] }), freshSignal());
+    // 窗口 = 3 − 1（p 可扫）= 2；尾段可扫 t0..t4，跳过 2 个可扫源（t0、t1）⇒ 从 t2 起扫。
+    expect(h.searchedUrls).toEqual(['https://p.example/', 'https://t2.example/', 'https://t3.example/']);
+  });
+
+  it('rotate1030：尾段可扫源不超过一个窗口 ⇒ 不转（本来就扫得完）', async () => {
+    const pool = ['https://a.example/', 'https://b.example/', 'https://c.example/'];
+    const h = harness({ pool, search: () => [] });
+    await h.selector(request({ scanLimit: 3, rotate: 5 }), freshSignal());
+    expect(h.searchedUrls).toEqual(pool);
+  });
+
   it('共享扫描余额跨调用保留，过滤不扣额，耗尽后不再读池', async () => {
     const h = harness({ pool: ['http://skip.example/', 'https://a.example/', 'https://b.example/', 'https://c.example/'] });
     const scanBudget = { remaining: 3 };

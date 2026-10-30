@@ -17,6 +17,12 @@ export function productiveFirstEnabled(env: Record<string, string | undefined> =
   return raw === '1' || raw === 'true' || raw === 'on';
 }
 
+/** rotate1030：DOWNLOAD_SCAN_ROTATE 开 ⇒ 重试按 attempt_count 轮转扫描窗口（见 source-selector rotate）。缺省关。 */
+export function scanRotateEnabled(env: Record<string, string | undefined> = process.env): boolean {
+  const raw = env.DOWNLOAD_SCAN_ROTATE?.trim().toLowerCase();
+  return raw === '1' || raw === 'true' || raw === 'on';
+}
+
 export function createHostPriority(
   sql: CandidateSql,
   env: Record<string, string | undefined> = process.env,

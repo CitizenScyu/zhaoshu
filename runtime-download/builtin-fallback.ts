@@ -94,6 +94,8 @@ export interface BuiltinFallbackOptions {
   hostTarget?: number;
   /** yield1030：透传给 selector 的 host 扫描优先分；缺省 = 池序（见 host-priority.ts）。 */
   hostPriority?: (signal: AbortSignal) => Promise<ReadonlyMap<string, number>>;
+  /** rotate1030：按任务 attempt_count 轮转扫描窗口（第 n 次 ⇒ rotate=n−1）；缺省关 = 每次同一窗口。 */
+  scanRotate?: boolean;
 }
 
 const hostOf = (url: string): string => {
@@ -235,6 +237,7 @@ export function createBuiltinFallback(options: BuiltinFallbackOptions) {
       scanLimit: Math.min(MAX_FALLBACK_SCAN_SOURCES, scanBudget.remaining),
       scanBudget,
       budgetMs,
+      rotate: options.scanRotate ? Math.max(0, (task.attempt_count ?? 1) - 1) : 0,
     }, signal);
     if (selection.picked.length && candidates) {
       try {

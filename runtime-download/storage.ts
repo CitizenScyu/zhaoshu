@@ -28,7 +28,7 @@ export function createWorkerStorage(sql: DownloadSql): RuntimeWorkerStorage {
     // T3 WorkerStorage.taskRow 没有对应的导出函数（T3 测试绑定内联同一 SELECT）。
     async taskRow(id) {
       const rows = await sql`
-        SELECT id, book_id, title, author, status, source_url, source_kind, source_id, requested_by
+        SELECT id, book_id, title, author, status, source_url, source_kind, source_id, requested_by, attempt_count
         FROM download_tasks WHERE id = ${id}` as unknown as TaskRow[];
       return rows[0] ?? null;
     },

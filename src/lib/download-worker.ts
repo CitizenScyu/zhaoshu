@@ -41,6 +41,8 @@ export interface TaskRow {
   source_kind: string;
   source_id: string | null;
   requested_by: 'user' | 'system';
+  /** rotate1030：第几次尝试（DEFAULT 1，defer +1）。只给选源窗口轮转用；旧调用方/桩可不带。 */
+  attempt_count?: number;
 }
 
 export type AdapterOutcome =
