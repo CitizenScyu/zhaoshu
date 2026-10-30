@@ -119,8 +119,9 @@ describe('engine adapter 物理 host 占位门拒绝分类', () => {
 
   it('仅结构识别：同文案 message、带 status 或 code 近似的错误不归门分类', async () => {
     const lookalike = Object.assign(new Error('host gate (HOST_OCCUPIED)'), { status: 503 });
+    // diag1031：adapter_runtime_error 带构造器名（白名单形态），原文仍不进结果。
     expect(await adapter(rejecting(lookalike)).download(task, context()))
-      .toEqual({ kind: 'failure', code: 'adapter_runtime_error' });
+      .toEqual({ kind: 'failure', code: 'adapter_runtime_error', detail: 'Error' });
     const wrongCode = Object.assign(new Error('host occupied'), { code: 'HOST_OCCUPANCY_UNAVAILABLE_TYPO' });
     expect(await adapter(rejecting(wrongCode)).download(task, context())).toMatchObject({ kind: 'failure' });
   });
