@@ -119,6 +119,15 @@ export function recheckYield(env = process.env) {
   return env.DOWNLOAD_RECHECK_YIELD?.trim() === '1';
 }
 
+// chapterresume1031：DOWNLOAD_RESUME_BY_CHAPTER=1 时，目录 hash 变了（连载追加新章等）也逐章续传：同源同书
+// （sourceRevision、bookUrl 不变）且本章序号上的旧记录 url、章名都相同才复用缓存，缓存照旧核 sha256。
+// 缺省/其他值 = 关（零行为变化：目录 hash 一变整本从头抓）。
+// 动机（2026-10-31 phoenix 只读）：同书相邻两次运行 376 对里目录变了 89 对，51 对是纯追加，丢弃已抓 5439 章；
+// sto66 f1355f 目录 1045→1046 后前 20 章重抓，本轮「有新抓」使 breakerguard 失效、熔断让出继续空转。
+export function chapterResume(env = process.env) {
+  return env.DOWNLOAD_RESUME_BY_CHAPTER?.trim() === '1';
+}
+
 // hostburst1030：按站「连抓 N 次即静置 M 毫秒」DOWNLOAD_HOST_BURST_PAUSE（"站=N/M,站=N/M"；站按 stationKeyOfHost
 // 归一，www./m. 前缀互认；N 1..10000，M 封顶 600000）。缺省/未命中/非法项 = null（零行为变化）。
 // 静置在章与章之间、operation 超时之外进行（M 可远大于 timeout-ms），计数含本次下载的全部请求（搜索/详情/目录）。
@@ -195,6 +204,11 @@ export async function downloadBook(m, args, resolveSource, transport = fetchSour
   // 正文格式不同（缺字段按 1）的检查点当作不存在：不续传、不沿用章节记录，全量重抓（见 ENGINE_CONTENT_FORMAT）。
   if ((previous?.contentFormat ?? 1) !== ENGINE_CONTENT_FORMAT) previous = undefined;
   const manifest = { schemaVersion: 1, contentFormat: ENGINE_CONTENT_FORMAT, status: 'partial', title: args.title, author: args.author, source: args.source, chapters: previous?.chapters ?? [], errors: [], generated_at: new Date().toISOString() };
+  // chapterresume1031：沿用的章节记录连同续传判据一起带上——本轮在目录前（解析/搜索/详情）就失败时，
+  // 落盘的检查点仍可被下一轮续传（关时这三项缺失，下一轮必然从头抓）。走到对应阶段即被本轮值覆盖。
+  if (chapterResume() && previous) {
+    for (const key of ['sourceRevision', 'bookUrl', 'tocHash']) if (typeof previous[key] === 'string') manifest[key] = previous[key];
+  }
   const controller = new AbortController();
   const stop = () => controller.abort(new Error('interrupted'));
   const external = hooks.signal;
@@ -326,6 +340,7 @@ export async function downloadBook(m, args, resolveSource, transport = fetchSour
     await checkpoint();
     if (chapters.length > args['max-chapters']) throw new Error('max_chapters');
     const resume = previous?.sourceRevision === manifest.sourceRevision && previous?.tocHash === manifest.tocHash && previous?.bookUrl === manifest.bookUrl;
+    const sameBook = chapterResume() && previous?.sourceRevision === manifest.sourceRevision && previous?.bookUrl === manifest.bookUrl;
     stage = 'content';
     // dlstop42：停止点 = 整本目录（与阅读器 readerstop42 / 生产打标 EngineStopUrls 同口径）。站点「下一章」
     // 链的顺序可能与目录顺序不同（cuoceng 第 N 章的 linkNext 指向目录非相邻章），只传目录下一章拦不住，
@@ -342,7 +357,8 @@ export async function downloadBook(m, args, resolveSource, transport = fetchSour
       controller.signal.throwIfAborted();
       try {
         const path = join(dir, chapter.file);
-        const prior = resume && previous.chapters?.[chapter.index];
+        const before = previous?.chapters?.[chapter.index];
+        const prior = (resume || (sameBook && before?.url === chapter.url && before?.title === chapter.title)) && before;
         let text;
         if (prior?.status === 'done' && existsSync(path)) {
           const cached = readFileSync(path, 'utf8');

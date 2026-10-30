@@ -1,5 +1,5 @@
 import { describe, it, expect, afterEach, vi } from 'vitest';
-import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
 import { tmpdir } from 'node:os';
@@ -10,7 +10,8 @@ import * as parser from '../src/lib/source-parser';
 import fixtures from '../src/lib/rule-engine/fixtures/smoke-174.json';
 import { SourceHttpError } from '../src/lib/source-fetch';
 import { SourcePolicyError } from '../src/lib/source-policy';
-import { breakerYield, contentFailStreak, contentRetryPasses, contentStopBookPages, downloadBook, downloadOptions, hostBurstPause, policyCodeOf, recheckYield } from './engine-download.mjs';
+import { peerOutRoots, seedFromPeers } from '../runtime-download/resume-seed';
+import { breakerYield, chapterResume, contentFailStreak, contentRetryPasses, contentStopBookPages, downloadBook, downloadOptions, hostBurstPause, policyCodeOf, recheckYield } from './engine-download.mjs';
 
 const dirs: string[] = [];
 afterEach(() => { vi.unstubAllGlobals(); for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
@@ -946,6 +947,102 @@ describe('recheckyield1031 收尾复核抖动', () => {
 });
 
 // hostburst1030：按站「连抓 N 次即静置 M 毫秒」（DOWNLOAD_HOST_BURST_PAUSE，缺省关）。
+describe('chapterresume1031 目录变动后逐章续传', () => {
+  afterEach(() => { vi.unstubAllEnvs(); });
+  const breaker = () => Object.assign(new Error('源 book15.net 熔断中'), { name: 'CircuitOpenError' });
+  /** n 章书（n 可变 = 连载追加）；open() 为真时第 ≥4 章熔断拒绝；search() 为假时搜索不可达。 */
+  const book = (f: ReturnType<typeof setup>, s: { n: number; open: boolean; search?: boolean; title?: (i: number) => string }) =>
+    async (url: string, opts: { signal: AbortSignal; beforeRequest?: (s: AbortSignal) => Promise<void> }) => {
+      if (url.includes('/search') && s.search === false) throw new SourceHttpError(503);
+      if (url === 'https://book15.net/books/details1.html') {
+        const list = Array.from({ length: s.n }, (_, i) => `<dd><a href="/read/${i + 1}">${s.title?.(i + 1) ?? `第${i + 1}章`}</a></dd>`).join('');
+        return { url, text: `<h1>测试书</h1><div class="d-info-panel"><a href="/author/1">作者甲</a></div><meta property="og:novel:book_name" content="测试书"><meta property="og:novel:author" content="作者甲"><div class="d-chapter-list" id="full-catalog">${list}</div>` };
+      }
+      if (url.includes('/read/')) {
+        if (s.open && Number(url.split('/read/')[1]) >= 4) throw breaker();
+        f.calls.push(url);
+        return { url, text: '<li class="chapter-content" id="article-content"><p>合成正文，离线测试。</p></li>' };
+      }
+      return f.transport(url, opts);
+    };
+  const reads = (f: ReturnType<typeof setup>) => f.calls.filter(url => url.includes('/read/')).length;
+
+  async function grow(on: boolean, title?: (i: number) => string) {
+    vi.stubEnv('DOWNLOAD_BREAKER_YIELD', '1');
+    if (on) vi.stubEnv('DOWNLOAD_RESUME_BY_CHAPTER', '1');
+    const f = setup();
+    const s = { n: 10, open: true };
+    expect((await f.run(book(f, s))).code).toBe(2); // 抓到 3 章后让出
+    const r = await f.run(book(f, { n: 11, open: false, title }));
+    return { f, r };
+  }
+
+  it('缺省关：目录追加一章 ⇒ 整本从头抓（零行为变化）', async () => {
+    const { f, r } = await grow(false);
+    expect(r.code).toBe(0);
+    expect(reads(f)).toBe(3 + 11);
+  });
+
+  it('开：目录追加一章 ⇒ 前 3 章走缓存，只抓 8 章', async () => {
+    const { f, r } = await grow(true);
+    expect(r.code).toBe(0);
+    expect(r.manifest.chapters).toHaveLength(11);
+    expect(reads(f)).toBe(3 + 8);
+  });
+
+  it('开：同序号章名变了 ⇒ 该章不复用', async () => {
+    const { f, r } = await grow(true, i => i === 2 ? '第2章（修订）' : `第${i}章`);
+    expect(r.code).toBe(0);
+    expect(reads(f)).toBe(3 + 9);
+  });
+
+  it('开：搜索阶段失败的检查点保留续传判据，下一轮仍可续传', async () => {
+    vi.stubEnv('DOWNLOAD_BREAKER_YIELD', '1');
+    vi.stubEnv('DOWNLOAD_RESUME_BY_CHAPTER', '1');
+    const f = setup();
+    expect((await f.run(book(f, { n: 10, open: true }))).code).toBe(2);
+    const down = await f.run(book(f, { n: 10, open: false, search: false }));
+    expect(down.code).toBe(2);
+    expect(down.manifest).toMatchObject({ failure_stage: 'search' });
+    expect(typeof (down.manifest as { tocHash?: unknown }).tocHash).toBe('string');
+    const r = await f.run(book(f, { n: 10, open: false }));
+    expect(r.code).toBe(0);
+    expect(reads(f)).toBe(10);
+  });
+
+  it('关：搜索阶段失败的检查点不带续传判据（现状），下一轮从头抓', async () => {
+    vi.stubEnv('DOWNLOAD_BREAKER_YIELD', '1');
+    const f = setup();
+    expect((await f.run(book(f, { n: 10, open: true }))).code).toBe(2);
+    expect((await f.run(book(f, { n: 10, open: false, search: false }))).code).toBe(2);
+    const r = await f.run(book(f, { n: 10, open: false }));
+    expect(r.code).toBe(0);
+    expect(reads(f)).toBe(3 + 10);
+  });
+
+  it.each([['1', true], [' 1 ', true], ['0', false], ['', false], ['on', false]] as const)('%j ⇒ %s', (value, on) => {
+    vi.stubEnv('DOWNLOAD_RESUME_BY_CHAPTER', value);
+    expect(chapterResume()).toBe(on);
+  });
+
+  it('resumeseed1031 端到端：实例 A 抓 3 章让出 → 种子种入实例 B → B 只抓余下 7 章', async () => {
+    vi.stubEnv('DOWNLOAD_BREAKER_YIELD', '1');
+    const f = setup();
+    const base = mkdtempSync(join(tmpdir(), 't4-seed-')); dirs.push(base);
+    const outOf = (inst: string) => join(base, inst, 'download', 'out');
+    const task = 'synthetictaskkey'; // adapter 的任务键目录（真实为 sha256 前 24 位）
+    const runIn = (inst: string, s: { n: number; open: boolean }) => downloadBook({ api, compile, parser },
+      { ...f.options, out: join(outOf(inst), task) }, async () => ({ source: f.source, builtin: f.builtin }), book(f, s));
+    expect((await runIn('inst-2', { n: 10, open: true })).code).toBe(2);
+    mkdirSync(outOf('inst-1'), { recursive: true });
+    expect(seedFromPeers(join(outOf('inst-1'), task), peerOutRoots(outOf('inst-1')))).toEqual({ chapters: 3, unlocked: 0 });
+    const r = await runIn('inst-1', { n: 10, open: false });
+    expect(r.code).toBe(0);
+    expect(r.manifestPath.startsWith(outOf('inst-1'))).toBe(true);
+    expect(reads(f)).toBe(10);
+  });
+});
+
 describe('hostburst1030 按站连抓静置', () => {
   afterEach(() => { vi.unstubAllEnvs(); });
   const catalog = (n: number) => `<div class="d-chapter-list" id="full-catalog">${Array.from({ length: n }, (_, i) => `<dd><a href="/read/${i + 1}">第${i + 1}章</a></dd>`).join('')}</div>`;

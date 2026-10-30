@@ -26,6 +26,7 @@ import { createIdentityPrecheck } from './identity-precheck';
 import { createBuiltinFallback } from './builtin-fallback';
 import { createHostOccupancy, type HostOccupancy } from './host-occupancy';
 import { createHostPriority, scanRotateEnabled, skipStrictTocEnabled } from './host-priority';
+import { peerOutRoots, resumePeersEnabled, seedFromPeers } from './resume-seed';
 import {
   failedCandidateSources, markCandidateFailure, occupiedHosts, replaceSourceCandidates,
   usableSourceCandidates,
@@ -311,6 +312,13 @@ export async function createDownloadExecutor(options: ProductionExecutorOptions)
   const transport = hostOccupancy ? hostOccupancy.wrapTransport(baseTransport) : baseTransport;
 
   const outRoot = join(options.workDir, 'out');
+  // resumeseed1031：跨实例续传种子（见 resume-seed.ts）；只记计数。
+  const prepareOut = resumePeersEnabled(env)
+    ? (out: string) => {
+      const seeded = seedFromPeers(out, peerOutRoots(outRoot));
+      if (seeded.chapters || seeded.unlocked) log('info', '跨实例续传种子', { ...seeded });
+    }
+    : undefined;
   // 常驻 drain：包一层去掉 downloadBook 对 process 的 SIGINT/SIGTERM 注册（外部停机由 hooks.signal
   // 覆盖）；不然每本调用累积进程监听。并发=1，同一时刻只有一次 downloadBook 在跑。
   const engineDownload = withoutProcessSignals(
@@ -341,12 +349,12 @@ export async function createDownloadExecutor(options: ProductionExecutorOptions)
     });
   const engineAdapter = createEngineAdapter({
     downloadBook: engineDownload,
-    modules, resolveSource, transport, readBookText, outRoot, sourceKind: 'engine',
+    modules, resolveSource, transport, readBookText, outRoot, prepareOut, sourceKind: 'engine',
   });
   // builtin book15 任务（source_kind='builtin'）走同一 downloadBook 的 source-parser 分支。
   const builtinAdapter = createEngineAdapter({
     downloadBook: engineDownload,
-    modules, resolveSource, transport, readBookText, outRoot, sourceKind: 'builtin',
+    modules, resolveSource, transport, readBookText, outRoot, prepareOut, sourceKind: 'builtin',
   });
   // 每次引擎 download 各自一个物理占用作用域：fallback 换源调用的是已包装的 engine 腿，
   // 上一个源的作用域已在 engine.download 返回（finally 释放）后才进下一个源——没有整个

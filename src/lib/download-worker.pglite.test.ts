@@ -593,6 +593,29 @@ maybe('T3 worker 任务层：租约、单写者、五阶段对账（PGlite + moc
     expect(fakeDownload.mock.calls[0][4].onProgress).toBeTypeOf('function');
   });
 
+  it('resumeseed1031：engine adapter 开跑前以本任务 out 调 prepareOut；prepareOut 抛错不影响下载', async () => {
+    const seen: string[] = [];
+    const order: string[] = [];
+    const make = (prepareOut: (out: string) => void) => createEngineAdapter({
+      downloadBook: (async (_m: unknown, args: { out: string }) => {
+        order.push(`download:${args.out}`);
+        return { code: 0, manifest: { status: 'done', errors: [], chapters_total: 1, chapters_done: 1, chars: 3, artifact: { file: 'book.txt', sha256: 'x', bytes: 3 } } };
+      }) as never,
+      modules: {},
+      resolveSource: async () => ({}),
+      readBookText: async () => '合成文',
+      outRoot: 'synthetic-out',
+      prepareOut,
+    });
+    const task = { id: 1, book_id: 1, title: 't', author: 'a', status: 'running', source_url: 'https://seed.example/x', source_kind: 'engine', source_id: null, requested_by: 'system' } as const;
+    const hooks = { signal: new AbortController().signal, progress: async () => {} };
+    expect(await make(out => { seen.push(out); order.push(`prepare:${out}`); }).download(task, hooks)).toMatchObject({ kind: 'complete' });
+    expect(seen).toHaveLength(1);
+    expect(seen[0]).toMatch(/^synthetic-out\/[0-9a-f]{24}$/);
+    expect(order).toEqual([`prepare:${seen[0]}`, `download:${seen[0]}`]);
+    expect(await make(() => { throw new Error('synthetic seed failure'); }).download(task, hooks)).toMatchObject({ kind: 'complete' });
+  });
+
   it('engine adapter：外部信号触发中断 → TaskLeaseLost 语义传播（同内容重试不破坏 manifest 由发布器保证）', async () => {
     const controller = new AbortController();
     const adapter = createEngineAdapter({

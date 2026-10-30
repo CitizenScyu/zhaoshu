@@ -636,6 +636,8 @@ export interface EngineAdapterOptions {
   /** 读结果目录拼接 TXT 的方式：默认 require manifest.artifact 由 downloadBook 已写 book.txt。 */
   readBookText: (manifest: { artifact: { file: string } }, options: { out: string }) => Promise<string>;
   outRoot: string;
+  /** resumeseed1031：开跑前整理本任务 out 目录（跨实例续传种子/清残留锁）；尽力而为，抛错不影响下载。 */
+  prepareOut?: (out: string) => void;
   /** 引擎腿固定参数（与 CLI 契约一致的有界值）。 */
   maxChapters?: number;
   rateMs?: number;
@@ -696,6 +698,7 @@ export function createEngineAdapter(options: EngineAdapterOptions): SourceAdapte
     kind,
     async download(task, context) {
       const out = `${options.outRoot}/${createHash('sha256').update(`${task.source_url}|${task.title}|${task.author}`).digest('hex').slice(0, 24)}`;
+      try { options.prepareOut?.(out); } catch { /* 种子失败照常从头抓 */ }
       let result;
       try {
         result = await options.downloadBook(options.modules, {
