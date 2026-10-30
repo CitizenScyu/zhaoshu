@@ -623,7 +623,9 @@ describe('failstreak1030 正文连续失败熔断', () => {
     vi.stubEnv('DOWNLOAD_CONTENT_FAIL_STREAK', value);
     expect(contentFailStreak()).toBe(0);
   });
-});：下载腿作者名回退轮（主会话 2026-10-15 裁定扩范围到本文件）。
+});
+
+// authbridge42：下载腿作者名回退轮（主会话 2026-10-15 裁定扩范围到本文件）。
 // 背景：QQ 系别名书在镜像站按通行书名收录，选源/预检按作者名命中后，下载腿若仍只按书名搜，
 // 会把同一个源又判成 identity_mismatch_or_no_candidate → markFailure 淘汰，选源的改动等于白烧出网。
 describe('authbridge42 下载腿作者名回退轮', () => {

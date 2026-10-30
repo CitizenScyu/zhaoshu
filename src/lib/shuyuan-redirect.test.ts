@@ -140,7 +140,7 @@ describe('同站跳转（sameStationOf）', () => {
     refreshSupportedHosts(['station-a.example']);
     expect(isSameStationRedirectTarget('https://www.station-a.example/x', src, src)).toBe(false); // 不在 host 门
     expect(isSameStationRedirectTarget('https://127.0.0.1/x', src, src)).toBe(false);
-    expect(isSameStationRedirectTarget('not a url', src, src)).toBe(false);
+    expect(isSameStationRedirectTarget('https://[bad', src, src)).toBe(false); // 不可解析
   });
 
   it('开关解析：只有 1/true/on 才开', () => {
