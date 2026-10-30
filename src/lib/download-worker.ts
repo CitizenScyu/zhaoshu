@@ -55,7 +55,7 @@ export type AdapterOutcome =
       chapterRanges?: TxtChapter[];
     }
   // stage：source_unavailable 时判定所在阶段（resolve/search/detail/toc），只作日志用的固定枚举。
-  | { kind: 'incomplete'; reason: string; chaptersTotal: number; chaptersDone: number; charsTotal: number; stage?: string; retryCause?: 'host_occupied' | 'host_occupancy_unavailable' }
+  | { kind: 'incomplete'; reason: string; chaptersTotal: number; chaptersDone: number; charsTotal: number; stage?: string; retryCause?: 'host_occupied' | 'host_occupancy_unavailable' | 'host_breaker' }
   | { kind: 'failure'; code: string; /** 脱敏诊断类别（Error 构造器名，如 TypeError；diag1030 起可带 /固定码 与 @阶段）——download_failed 兜底时定位速败结构用。 */ detail?: string };
 
 export interface SourceAdapterContext {
@@ -210,6 +210,8 @@ export interface WorkerOptions {
    * 占着）按排队放回：不计 attempt、间隔 HOST_WAIT_DELAY_MS，不计数领取达 HOST_WAIT_MAX_FREE_CLAIMS 后回到
    * 计数路径。缺省关 = 与引入前逐字一致。releaseClaim（停机/日预算满）同样只涨 lease_generation，也占这份
    * 额度——只会更早回到旧行为，不会放宽上界。
+   * breakeryield1031：retryCause host_breaker（本机限速器对该 host 熔断中，见 engine-download breakerYield）
+   * 同走此路——熔断 30min 自动恢复，间隔 HOST_WAIT_DELAY_MS（=30min）正好错开。
    */
   hostWait?: boolean;
 }
@@ -429,12 +431,13 @@ export async function runDownloadTask(
         const stage = outcome.stage ?? 'unknown';
         const sourceHost = hostOf(task.source_url);
         const retryClass: SourceRetryClass = outcome.reason === 'no_candidates' ? 'no_candidates' : 'transient';
-        if (options.hostWait && outcome.reason === 'source_unavailable' && outcome.retryCause === 'host_occupied'
+        if (options.hostWait && outcome.reason === 'source_unavailable'
+          && (outcome.retryCause === 'host_occupied' || outcome.retryCause === 'host_breaker')
           && lease.leaseGeneration - lease.attemptCount < HOST_WAIT_MAX_FREE_CLAIMS) {
           const retryAt = await storage.defer(lease, {
             delayMs: HOST_WAIT_DELAY_MS,
             countAttempt: false,
-            error: `源 host 正忙（${stage} 阶段，第 ${lease.attemptCount} 次，不计次）：host_occupied，排队重试`,
+            error: `源 host 正忙（${stage} 阶段，第 ${lease.attemptCount} 次，不计次）：${outcome.retryCause}，排队重试`,
           });
           if (!retryAt) throw new TaskLeaseLostError();
           return { processed: true, reason: outcome.reason, stage, sourceHost, retryAt, hostWait: true };
@@ -618,6 +621,7 @@ export interface EngineDownloadLike {
         failure_name?: string;
         failure_phase?: string;
         failure_code?: string;
+        retry_cause?: string;
         artifact?: { file: string; sha256: string; bytes: number };
         chapters?: EngineChapterRecord[];
       };
@@ -768,7 +772,9 @@ export function createEngineAdapter(options: EngineAdapterOptions): SourceAdapte
       if (classified === 'source_unavailable') {
         // 阶段只收固定小写枚举，防止任何上游文本借此进入日志/错误列。
         const stage = /^[a-z]+$/.test(manifest.failure_stage ?? '') ? manifest.failure_stage : 'unknown';
-        return { kind: 'incomplete', reason: classified, chaptersTotal, chaptersDone, charsTotal, stage };
+        // breakeryield1031：熔断让出带 retryCause，回退层不标候选失败、任务层按 host 忙排队。
+        return { kind: 'incomplete', reason: classified, chaptersTotal, chaptersDone, charsTotal, stage,
+          ...(manifest.retry_cause === 'host_breaker' ? { retryCause: 'host_breaker' as const } : {}) };
       }
       if (classified === 'missing_chapters' || classified === 'toc_changed' || classified === 'budget_exhausted' || classified === 'interrupted' || classified === 'operation_timeout') {
         return { kind: 'incomplete', reason: classified, chaptersTotal, chaptersDone, charsTotal };

@@ -1016,6 +1016,35 @@ describe('41-T8FB builtin-fallback', () => {
     expect(state.stored).toEqual([]);
   });
 
+  it('breakeryield1031：host_breaker 同 host_occupied——不标失败、换下一源、收口带 host_breaker；原源让出原样返回不扫池', async () => {
+    const state = {
+      usable: [{ source_url: 'https://a.example/', host: 'a.example' }, { source_url: 'https://b.example/', host: 'b.example' }],
+      stored: [] as [number, string[]][], failures: [] as [number, string, string, string][],
+    };
+    const h = candidatesHarness(state);
+    const calls: string[] = [];
+    const breaker: AdapterOutcome = {
+      kind: 'incomplete', reason: 'source_unavailable', stage: 'content', retryCause: 'host_breaker',
+      chaptersTotal: 9, chaptersDone: 5, charsTotal: 500,
+    };
+    const out = await h.fallback.wrapAdapter(adapter({}, []), adapter({ 'a.example': breaker }, calls), 'engine')
+      .download(task({ source_kind: 'engine' }), context());
+    expect(out).toMatchObject({ kind: 'incomplete', reason: 'source_unavailable', stage: 'search', retryCause: 'host_breaker' });
+    expect(calls).toEqual(['a.example', 'b.example']);
+    expect(state.failures).toEqual([[1, 'https://b.example/', 'permanent', 'identity_mismatch_or_no_candidate']]);
+    expect(h.searched).toEqual([]);
+
+    const state2 = { usable: [], stored: [] as [number, string[]][], failures: [] as [number, string, string, string][] };
+    const h2 = candidatesHarness(state2);
+    const calls2: string[] = [];
+    const out2 = await h2.fallback.wrapAdapter(adapter({}, []), adapter({ 'book15.net': breaker }, calls2), 'engine')
+      .download(task({ source_kind: 'engine' }), context());
+    expect(out2).toEqual(breaker);
+    expect(calls2).toEqual(['book15.net']);
+    expect(h2.searched).toEqual([]);
+    expect(state2.failures).toEqual([]);
+  });
+
   it('hostwait1031：原源付费墙预览、扫到的候选全被占用 ⇒ 按 host 排队收口，不落 preview_truncated 终态', async () => {
     const state = { usable: [], stored: [] as [number, string[]][], failures: [] as [number, string, string, string][] };
     const h = candidatesHarness(state);

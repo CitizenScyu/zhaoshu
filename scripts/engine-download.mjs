@@ -97,6 +97,19 @@ export function contentStopBookPages(env = process.env) {
   return env.DOWNLOAD_CONTENT_STOP_BOOK_PAGES?.trim() === '1';
 }
 
+// breakeryield1031：DOWNLOAD_BREAKER_YIELD=1 时，任一阶段遇本机限速器熔断/日限（CircuitOpenError /
+// DailyRequestBudgetError：host 级、请求没出网、到点自动恢复）立即停抓，当前章保持原状态（不判 failed），
+// 按 source_unavailable + manifest.retry_cause='host_breaker' 收口（code=2）——回退层不标候选失败，
+// 任务层按 host 忙排队（与 hostwait1031 同路），已抓章留作同源续传。真实 5xx/超时不在此列，照旧标失败。
+// 缺省/其他值 = 关（零行为变化：逐章判 chapter_failed，连败熔断 → missing_chapters → 候选标 temporary 换源）。
+// 动机（2026-10-31 phoenix 只读）：sfwx/itxtbook/zhkanshu 偶发 502 成串，共享账本连续 5 次即熔断 30min；
+// 熔断后余下章节瞬时全判 chapter_failed，连败 50 收口（sfwx 01:36 / itxtbook 02:01 的连败收口时刻与账本
+// breakerUntilMs−30min 吻合），抓到一半的源被标失败 48h、换源从头抓。
+const BREAKER_ERROR_NAMES = new Set(['CircuitOpenError', 'DailyRequestBudgetError']);
+export function breakerYield(env = process.env) {
+  return env.DOWNLOAD_BREAKER_YIELD?.trim() === '1';
+}
+
 // hostburst1030：按站「连抓 N 次即静置 M 毫秒」DOWNLOAD_HOST_BURST_PAUSE（"站=N/M,站=N/M"；站按 stationKeyOfHost
 // 归一，www./m. 前缀互认；N 1..10000，M 封顶 600000）。缺省/未命中/非法项 = null（零行为变化）。
 // 静置在章与章之间、operation 超时之外进行（M 可远大于 timeout-ms），计数含本次下载的全部请求（搜索/详情/目录）。
@@ -194,6 +207,8 @@ export async function downloadBook(m, args, resolveSource, transport = fetchSour
   let failureCode = 1;
   let feedbackError;
   let stage = 'resolve';
+  const yieldOnBreaker = breakerYield();
+  const isBreakerYield = error => yieldOnBreaker && !controller.signal.aborted && BREAKER_ERROR_NAMES.has(error?.name);
   let lastCheckpoint = 0;
   // T3×P2 reconcile：两个节拍解耦——manifest 落盘按 5s 节流（P2-4 写放大修复），
   // onProgress 每次调用必发（T3 租约数据通道，每章上报；失权发现延迟不随写盘节流放大）。
@@ -334,6 +349,7 @@ export async function downloadBook(m, args, resolveSource, transport = fetchSour
         failStreak = 0;
       } catch (error) {
         if (isLimiterFeedbackError(error) || isHostGateError(error)) throw error;
+        if (isBreakerYield(error)) throw error; // breakeryield1031：熔断不算本章失败，整本让出
         chapter.status = 'failed';
         // Do not persist upstream messages, URLs or credentials in diagnostics.
         chapter.error = knownError.test(error.message) ? error.message : 'chapter_failed';
@@ -379,6 +395,7 @@ export async function downloadBook(m, args, resolveSource, transport = fetchSour
     if (isHostGateError(error)) throw error;
     // 外部中断（停机/租约/总预算）时的请求失败是被中止，不是书源不可达。
     if (SOURCE_STAGES.has(stage) && !controller.signal.aborted && isSourceUnavailableError(error)) failureCode = 2;
+    if (isBreakerYield(error)) { failureCode = 2; manifest.retry_cause = 'host_breaker'; }
     if (failureCode === 2) manifest.failure_stage = stage; // 固定枚举，不含上游细节
     manifest.errors.push(failureCode === 2 ? 'source_unavailable' : knownError.test(error.message) ? error.message : 'download_failed');
     // dlfail42：白名单外错误被脱敏成 download_failed 时记 Error 构造器名（TypeError 等，不含上游文本），

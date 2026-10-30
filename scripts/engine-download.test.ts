@@ -10,7 +10,7 @@ import * as parser from '../src/lib/source-parser';
 import fixtures from '../src/lib/rule-engine/fixtures/smoke-174.json';
 import { SourceHttpError } from '../src/lib/source-fetch';
 import { SourcePolicyError } from '../src/lib/source-policy';
-import { contentFailStreak, contentRetryPasses, contentStopBookPages, downloadBook, downloadOptions, hostBurstPause, policyCodeOf } from './engine-download.mjs';
+import { breakerYield, contentFailStreak, contentRetryPasses, contentStopBookPages, downloadBook, downloadOptions, hostBurstPause, policyCodeOf } from './engine-download.mjs';
 
 const dirs: string[] = [];
 afterEach(() => { vi.unstubAllGlobals(); for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
@@ -780,6 +780,90 @@ describe('retrypass1030 正文失败章补抓', () => {
   it.each([['1', 1], [' 3 ', 3]] as const)('%j 解析为 %d 轮', (value, passes) => {
     vi.stubEnv('DOWNLOAD_CONTENT_RETRY_PASSES', value);
     expect(contentRetryPasses()).toBe(passes);
+  });
+});
+
+// breakeryield1031：限速器熔断让出（DOWNLOAD_BREAKER_YIELD，缺省关）。
+describe('breakeryield1031 限速器熔断让出', () => {
+  afterEach(() => { vi.unstubAllEnvs(); });
+  const catalog = (n: number) => `<div class="d-chapter-list" id="full-catalog">${Array.from({ length: n }, (_, i) => `<dd><a href="/read/${i + 1}">第${i + 1}章</a></dd>`).join('')}</div>`;
+  const breaker = () => Object.assign(new Error('源 book15.net 熔断中'), { name: 'CircuitOpenError' });
+  /** 10 章书；open() 为真时第 ≥4 章按熔断拒绝（请求未出网，不计入 calls）。 */
+  const wrap = (f: ReturnType<typeof setup>, open: () => boolean, error: () => Error = breaker) =>
+    async (url: string, opts: { signal: AbortSignal; beforeRequest?: (s: AbortSignal) => Promise<void> }) => {
+      if (url === 'https://book15.net/books/details1.html') {
+        return { url, text: `<h1>测试书</h1><div class="d-info-panel"><a href="/author/1">作者甲</a></div><meta property="og:novel:book_name" content="测试书"><meta property="og:novel:author" content="作者甲">` + catalog(10) };
+      }
+      if (url.includes('/read/')) {
+        if (open() && Number(url.split('/read/')[1]) >= 4) throw error();
+        f.calls.push(url);
+        return { url, text: '<li class="chapter-content" id="article-content"><p>合成正文，离线测试。</p></li>' };
+      }
+      return f.transport(url, opts);
+    };
+  const reads = (f: ReturnType<typeof setup>) => f.calls.filter(url => url.includes('/read/')).length;
+  const extra = (r: { manifest: object }) => r.manifest as { failure_stage?: string; retry_cause?: string };
+  const statuses = (r: { manifest: { chapters: { status: string }[] } }) => r.manifest.chapters.map(c => c.status[0]).join('');
+
+  it('缺省关：熔断后余下章逐章判 chapter_failed，missing_chapters 收口（零行为变化）', async () => {
+    const f = setup();
+    const r = await f.run(wrap(f, () => true));
+    expect(r.code).toBe(1);
+    expect(r.manifest.errors).toEqual(['missing_chapters']);
+    expect(statuses(r)).toBe('dddfffffff');
+    expect(extra(r).retry_cause).toBeUndefined();
+  });
+
+  it('开：首个熔断即停，当前章不判失败，code=2 source_unavailable + retry_cause=host_breaker', async () => {
+    vi.stubEnv('DOWNLOAD_BREAKER_YIELD', '1');
+    const f = setup();
+    const r = await f.run(wrap(f, () => true));
+    expect(r.code).toBe(2);
+    expect(r.manifest.errors).toEqual(['source_unavailable']);
+    expect(extra(r)).toMatchObject({ failure_stage: 'content', retry_cause: 'host_breaker' });
+    expect(statuses(r)).toBe('dddppppppp');
+    expect(existsSync(join(dirname(r.manifestPath), 'download.lock'))).toBe(false);
+  });
+
+  it('开：熔断恢复后同源续传，只抓余下 7 章', async () => {
+    vi.stubEnv('DOWNLOAD_BREAKER_YIELD', '1');
+    const f = setup();
+    let open = true;
+    const transport = wrap(f, () => open);
+    expect((await f.run(transport)).code).toBe(2);
+    open = false;
+    const r = await f.run(transport);
+    expect(r.code).toBe(0);
+    expect(r.manifest.status).toBe('done');
+    expect(reads(f)).toBe(10);
+    expect(extra(r).retry_cause).toBeUndefined();
+  });
+
+  it('开：日请求上限同样让出；真实 502 不让出（照旧判章失败）', async () => {
+    vi.stubEnv('DOWNLOAD_BREAKER_YIELD', '1');
+    const daily = setup();
+    const budget = () => Object.assign(new Error('源 book15.net 当日请求预算触顶（20000）'), { name: 'DailyRequestBudgetError' });
+    const r1 = await daily.run(wrap(daily, () => true, budget));
+    expect(r1.code).toBe(2);
+    expect(extra(r1).retry_cause).toBe('host_breaker');
+    const http = setup();
+    const r2 = await http.run(wrap(http, () => true, () => new SourceHttpError(502)));
+    expect(r2.code).toBe(1);
+    expect(r2.manifest.errors).toEqual(['missing_chapters']);
+    expect(extra(r2).retry_cause).toBeUndefined();
+  });
+
+  it('开：搜索阶段熔断同样带 retry_cause（failure_stage=search）', async () => {
+    vi.stubEnv('DOWNLOAD_BREAKER_YIELD', '1');
+    const f = setup();
+    const r = await f.run(async (url, opts) => { if (url.includes('/search')) throw breaker(); return f.transport(url, opts); });
+    expect(r.code).toBe(2);
+    expect(extra(r)).toMatchObject({ failure_stage: 'search', retry_cause: 'host_breaker' });
+  });
+
+  it.each([['1', true], [' 1 ', true], ['0', false], ['', false], ['true', false]] as const)('%j ⇒ %s', (value, on) => {
+    vi.stubEnv('DOWNLOAD_BREAKER_YIELD', value);
+    expect(breakerYield()).toBe(on);
   });
 });
 

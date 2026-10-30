@@ -446,6 +446,16 @@ maybe('T3 worker 任务层：租约、单写者、五阶段对账（PGlite + moc
     expect(await retryState(id)).toMatchObject({ status: 'pending', attempt_count: 2, delay_min: 15 });
   });
 
+  it('breakeryield1031：retryCause host_breaker 开关开同样排队不计次，错误列标 host_breaker', async () => {
+    const id = await insertTask();
+    const breaker: AdapterOutcome = { ...occupied, stage: 'content', retryCause: 'host_breaker' };
+    const result = await runDownloadTask(options([scriptAdapter(breaker)], { hostWait: true }), (await claimDownloadTask(sql as never, 'worker-a'))!);
+    expect(result).toMatchObject({ processed: true, reason: 'source_unavailable', stage: 'content', hostWait: true });
+    const waited = await retryState(id);
+    expect(waited).toMatchObject({ status: 'pending', attempt_count: 1, delay_min: 30 });
+    expect(waited.error).toContain('host_breaker');
+  });
+
   it.each([
     [HOST_WAIT_MAX_FREE_CLAIMS - 2, 'pending'],
     [HOST_WAIT_MAX_FREE_CLAIMS - 1, 'partial'],
@@ -514,6 +524,8 @@ maybe('T3 worker 任务层：租约、单写者、五阶段对账（PGlite + moc
       if (args.source.includes('ruleerr')) return { code: 1, manifest: { status: 'partial', errors: ['download_failed'], failure_name: 'RuleEngineError', failure_code: 'RULE_EVAL_FAILED', failure_phase: 'toc', chapters_total: 0, chapters_done: 0, chars: 0 } };
       if (args.source.includes('phasebad')) return { code: 1, manifest: { status: 'partial', errors: ['download_failed'], failure_name: 'RuleEngineError', failure_code: 'bad code', failure_phase: 'To C', chapters_total: 0, chapters_done: 0, chars: 0 } };
       if (args.source.includes('noname')) return { code: 1, manifest: { status: 'partial', errors: ['download_failed'], chapters_total: 0, chapters_done: 0, chars: 0 } };
+      // breakeryield1031：熔断让出 ⇒ code=2 + retry_cause；其余 retry_cause 值不透传
+      if (args.source.includes('breaker')) return { code: 2, manifest: { status: 'partial', errors: ['source_unavailable'], failure_stage: 'content', retry_cause: args.source.includes('breakerodd') ? 'other' : 'host_breaker', chapters_total: 3, chapters_done: 2, chars: 1620 } };
       const mode = args.source.includes('bad') ? 'missing' : 'ok';
       if (mode === 'ok') return { code: 0, manifest: { status: 'done', errors: [], chapters_total: 3, chapters_done: 3, chars: 2430, artifact: { file: 'book.txt', sha256: 'x', bytes: 9 } } };
       return { code: 1, manifest: { status: 'partial', errors: ['missing_chapters'], chapters_total: 3, chapters_done: 2, chars: 1620 } };
@@ -542,6 +554,7 @@ maybe('T3 worker 任务层：租约、单写者、五阶段对账（PGlite + moc
       progress: async () => {},
     });
     expect(dead).toMatchObject({ kind: 'incomplete', reason: 'source_unavailable' });
+    expect((dead as { retryCause?: string }).retryCause).toBeUndefined();
     // dlfail42：download_failed 兜底带 failure_name ⇒ failure 带 detail（构造器名类别）；
     // 同兜底但无 failure_name（老 manifest）⇒ 无 detail，行为不变。
     const opaque = await adapter.download({ id: 6, book_id: 1, title: 't', author: 'a', status: 'running', source_url: 'https://opaque.example/z', source_kind: 'engine', source_id: null, requested_by: 'system' }, {
@@ -558,6 +571,8 @@ maybe('T3 worker 任务层：租约、单写者、五阶段对账（PGlite + moc
     const thrown = await run(10, 'throws');
     expect(thrown).toMatchObject({ kind: 'failure', code: 'adapter_runtime_error', detail: 'Error/EEXIST' });
     expect(JSON.stringify(thrown)).not.toContain('synthetic path detail');
+    expect(await run(11, 'breaker')).toMatchObject({ kind: 'incomplete', reason: 'source_unavailable', stage: 'content', retryCause: 'host_breaker', chaptersDone: 2 });
+    expect((await run(12, 'breakerodd') as { retryCause?: string }).retryCause).toBeUndefined();
     const noname = await adapter.download({ id: 7, book_id: 1, title: 't', author: 'a', status: 'running', source_url: 'https://noname.example/z', source_kind: 'engine', source_id: null, requested_by: 'system' }, {
       signal: new AbortController().signal,
       progress: async () => {},
