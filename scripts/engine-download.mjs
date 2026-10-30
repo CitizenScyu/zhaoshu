@@ -358,6 +358,10 @@ export async function downloadBook(m, args, resolveSource, transport = fetchSour
     // 供桥层透传进日志定位「5 秒速败」类失败的结构（阶段 + 异常类别）。
     if (failureCode !== 2 && !knownError.test(error.message)) {
       manifest.failure_name = /^[A-Za-z]{1,32}$/.test(error?.name) ? error.name : 'unknown';
+      // diag1030：再记阶段与固定枚举 code（RuleEngineError.code 等，均为常量、不含上游文本）——只有构造器名时
+      // 生产只看得到「RuleEngineError」，定位不到哪一步哪类规则。failure_stage 专供 source_unavailable 退避，故另起字段。
+      manifest.failure_phase = stage;
+      if (/^[A-Z][A-Z0-9_]{1,39}$/.test(typeof error?.code === 'string' ? error.code : '')) manifest.failure_code = error.code;
     }
   } finally {
     try {

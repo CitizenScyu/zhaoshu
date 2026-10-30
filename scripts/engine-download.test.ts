@@ -69,9 +69,24 @@ describe('download offline full books', () => {
     expect(result.manifest.errors).toEqual(['download_failed']);
     // failure_name 同 failure_stage：catch 里补上的字段，JS 推断的字面量类型里没有。
     expect((result.manifest as { failure_name?: string }).failure_name).toBe('TypeError');
+    // diag1030：同时记阶段（首个出网即搜索）；无 code 的错误不落 failure_code。
+    expect((result.manifest as { failure_phase?: string }).failure_phase).toBe('search');
+    expect((result.manifest as { failure_code?: string }).failure_code).toBeUndefined();
     // 上游消息原文绝不落盘；只有构造器名这个固定类别。
     expect(readFileSync(result.manifestPath, 'utf8')).not.toContain('synthetic opaque detail');
     expect(readFileSync(result.manifestPath, 'utf8')).toContain('TypeError');
+  });
+  it('diag1030：只记常量形态的 error.code，上游文本不落盘', async () => {
+    const f = setup();
+    const ruleError = (code: string) => Object.assign(new Error('synthetic upstream rule text'), { name: 'RuleEngineError', code });
+    const result = await f.run(async () => { throw ruleError('RULE_EVAL_FAILED'); });
+    const manifest = result.manifest as { failure_name?: string; failure_phase?: string; failure_code?: string };
+    expect(result.manifest.errors).toEqual(['download_failed']);
+    expect([manifest.failure_name, manifest.failure_code, manifest.failure_phase]).toEqual(['RuleEngineError', 'RULE_EVAL_FAILED', 'search']);
+    expect(readFileSync(result.manifestPath, 'utf8')).not.toContain('synthetic upstream rule text');
+    const odd = await f.run(async () => { throw ruleError('not a constant: x'); });
+    expect((odd.manifest as { failure_code?: string }).failure_code).toBeUndefined();
+    expect(readFileSync(odd.manifestPath, 'utf8')).not.toContain('not a constant');
   });
   it.each(['invalid_chapter', 'invalid_next_page', 'empty_content_page', 'content_page_limit', 'unsupported_content_rule'])('preserves safe diagnostic %s', async reason => {
     const f = setup();

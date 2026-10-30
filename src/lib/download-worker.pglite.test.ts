@@ -469,6 +469,9 @@ maybe('T3 worker 任务层：租约、单写者、五阶段对账（PGlite + moc
       if (args.source.includes('dead')) return { code: 2, manifest: { status: 'partial', errors: ['download_failed'], chapters_total: 0, chapters_done: 0, chars: 0 } };
       // dlfail42：白名单外错误兜底 download_failed 时 manifest 带 failure_name（脱敏构造器名）
       if (args.source.includes('opaque')) return { code: 1, manifest: { status: 'partial', errors: ['download_failed'], failure_name: 'TypeError', chapters_total: 0, chapters_done: 0, chars: 0 } };
+      // diag1030：带固定码与阶段；phasebad 的阶段不合白名单 ⇒ 该段省略
+      if (args.source.includes('ruleerr')) return { code: 1, manifest: { status: 'partial', errors: ['download_failed'], failure_name: 'RuleEngineError', failure_code: 'RULE_EVAL_FAILED', failure_phase: 'toc', chapters_total: 0, chapters_done: 0, chars: 0 } };
+      if (args.source.includes('phasebad')) return { code: 1, manifest: { status: 'partial', errors: ['download_failed'], failure_name: 'RuleEngineError', failure_code: 'bad code', failure_phase: 'To C', chapters_total: 0, chapters_done: 0, chars: 0 } };
       if (args.source.includes('noname')) return { code: 1, manifest: { status: 'partial', errors: ['download_failed'], chapters_total: 0, chapters_done: 0, chars: 0 } };
       const mode = args.source.includes('bad') ? 'missing' : 'ok';
       if (mode === 'ok') return { code: 0, manifest: { status: 'done', errors: [], chapters_total: 3, chapters_done: 3, chars: 2430, artifact: { file: 'book.txt', sha256: 'x', bytes: 9 } } };
@@ -505,6 +508,12 @@ maybe('T3 worker 任务层：租约、单写者、五阶段对账（PGlite + moc
       progress: async () => {},
     });
     expect(opaque).toMatchObject({ kind: 'failure', code: 'download_failed', detail: 'TypeError' });
+    const run = (id: number, host: string) => adapter.download({ id, book_id: 1, title: 't', author: 'a', status: 'running', source_url: `https://${host}.example/z`, source_kind: 'engine', source_id: null, requested_by: 'system' }, {
+      signal: new AbortController().signal,
+      progress: async () => {},
+    });
+    expect(await run(8, 'ruleerr')).toMatchObject({ kind: 'failure', code: 'download_failed', detail: 'RuleEngineError/RULE_EVAL_FAILED@toc' });
+    expect(await run(9, 'phasebad')).toMatchObject({ kind: 'failure', code: 'download_failed', detail: 'RuleEngineError' });
     const noname = await adapter.download({ id: 7, book_id: 1, title: 't', author: 'a', status: 'running', source_url: 'https://noname.example/z', source_kind: 'engine', source_id: null, requested_by: 'system' }, {
       signal: new AbortController().signal,
       progress: async () => {},

@@ -53,7 +53,7 @@ export type AdapterOutcome =
     }
   // stage：source_unavailable 时判定所在阶段（resolve/search/detail/toc），只作日志用的固定枚举。
   | { kind: 'incomplete'; reason: string; chaptersTotal: number; chaptersDone: number; charsTotal: number; stage?: string; retryCause?: 'host_occupied' | 'host_occupancy_unavailable' }
-  | { kind: 'failure'; code: string; /** 脱敏诊断类别（Error 构造器名，如 TypeError）——download_failed 兜底时定位速败结构用。 */ detail?: string };
+  | { kind: 'failure'; code: string; /** 脱敏诊断类别（Error 构造器名，如 TypeError；diag1030 起可带 /固定码 与 @阶段）——download_failed 兜底时定位速败结构用。 */ detail?: string };
 
 export interface SourceAdapterContext {
   /** 任务层提供的租约信号：adapter 中断后应立即停止抓取。 */
@@ -594,6 +594,8 @@ export interface EngineDownloadLike {
         chars?: number;
         failure_stage?: string;
         failure_name?: string;
+        failure_phase?: string;
+        failure_code?: string;
         artifact?: { file: string; sha256: string; bytes: number };
         chapters?: EngineChapterRecord[];
       };
@@ -744,7 +746,10 @@ export function createEngineAdapter(options: EngineAdapterOptions): SourceAdapte
       // dlfail42：download_failed 兜底（脱敏吞掉真实错误类别）时透传 Error 构造器名——不含上游文本，
       // 配合阶段足以定位速败结构；白名单错误无 detail（reason 本身即类别）。
       const failureName = /^[A-Za-z]{1,32}$/.test(manifest.failure_name ?? '') ? manifest.failure_name : undefined;
-      return failureName ? { kind: 'failure', code: classified, detail: failureName } : { kind: 'failure', code: classified };
+      // diag1030：detail = 构造器名[/固定码][@阶段]，各段独立白名单，不合格的段省略（老 manifest 只有构造器名）。
+      const failureCode = /^[A-Z][A-Z0-9_]{1,39}$/.test(manifest.failure_code ?? '') ? `/${manifest.failure_code}` : '';
+      const failurePhase = /^[a-z]{1,16}$/.test(manifest.failure_phase ?? '') ? `@${manifest.failure_phase}` : '';
+      return failureName ? { kind: 'failure', code: classified, detail: failureName + failureCode + failurePhase } : { kind: 'failure', code: classified };
     },
   };
 }
