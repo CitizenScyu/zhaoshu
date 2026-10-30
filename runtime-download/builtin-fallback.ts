@@ -92,6 +92,8 @@ export interface BuiltinFallbackOptions {
   maxSources?: number;
   /** 选源早停目标（不同 host 数）；缺省 FALLBACK_HOST_TARGET。测试缝，生产不覆盖。 */
   hostTarget?: number;
+  /** yield1030：透传给 selector 的 host 扫描优先分；缺省 = 池序（见 host-priority.ts）。 */
+  hostPriority?: (signal: AbortSignal) => Promise<ReadonlyMap<string, number>>;
 }
 
 const hostOf = (url: string): string => {
@@ -163,6 +165,7 @@ export function createBuiltinFallback(options: BuiltinFallbackOptions) {
     isSuspect,
     log,
     timeoutMs: options.timeoutMs ?? 30000,
+    hostPriority: options.hostPriority,
   });
 
   // 预检选好的源交给下载腿：单槽（并发=1），按任务 id 认领，领一次即清。

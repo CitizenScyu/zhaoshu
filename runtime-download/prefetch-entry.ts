@@ -16,6 +16,7 @@ import {
 import { createPrefetchStore, type PrefetchSql } from './prefetch-store';
 import { createSourceSelector, type SourceSelector } from './source-selector';
 import { createHostOccupancy } from './host-occupancy';
+import { createHostPriority } from './host-priority';
 import {
   assembleEngineModules, createSourceTransport, loadEnginePool,
   type EngineModules, type RateLimiterLike, type SourceTransport,
@@ -140,6 +141,7 @@ export function createSourcePrefetch(options: SourcePrefetchOptions): SourcePref
       transport,
       loadPool: options.loadPool ?? (signal => loadEnginePool(modules, signal)),
       log,
+      hostPriority: createHostPriority(sql, env),
     });
   })();
 

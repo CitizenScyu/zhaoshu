@@ -17,6 +17,7 @@ function harness(opts: {
   detail?: (bookUrl: string) => Detail;
   suspect?: string[];
   builtinHosts?: string[];
+  hostPriority?: (signal: AbortSignal) => Promise<ReadonlyMap<string, number>>;
 }) {
   const searchedUrls: string[] = [];
   const searchKeys: string[] = [];
@@ -51,6 +52,7 @@ function harness(opts: {
     },
     isSuspect: (host: string) => opts.suspect?.includes(host) ?? false,
     log: (level, message, fields) => logs.push({ level, message, fields }),
+    hostPriority: opts.hostPriority,
   });
   return { selector, searchedUrls, searchKeys, detailUrls, poolLoads, logs };
 }
@@ -67,6 +69,31 @@ describe('共用选源器', () => {
     expect((await h.selector(request({ scanLimit: 200 }), freshSignal())).picked).toEqual([]);
     expect(h.searchedUrls).toHaveLength(200);
     expect(h.detailUrls).toEqual([]);
+  });
+
+  it('yield1030：hostPriority 稳定重排——高分 host 先扫，同分与缺席保持池序，scanLimit 不变', async () => {
+    const pool = ['https://a.example/', 'https://b.example/', 'https://c.example/', 'https://d.example/', 'https://c.example/zh/'];
+    const h = harness({ pool, search: () => [],
+      hostPriority: async () => new Map([['c.example', 5], ['d.example', 5], ['b.example', 1]]) });
+    await h.selector(request({ scanLimit: 4 }), freshSignal());
+    expect(h.searchedUrls).toEqual(['https://c.example/', 'https://d.example/', 'https://c.example/zh/', 'https://b.example/']);
+  });
+
+  it('yield1030：hostPriority 抛错/空表 ⇒ 池序原样扫，不少扫', async () => {
+    const pool = ['https://a.example/', 'https://b.example/'];
+    for (const hostPriority of [async () => { throw new Error('db down'); }, async () => new Map<string, number>()]) {
+      const h = harness({ pool, search: () => [], hostPriority });
+      expect((await h.selector(request(), freshSignal())).scanned).toBe(2);
+      expect(h.searchedUrls).toEqual(pool);
+    }
+  });
+
+  it('yield1030：重排不绕过过滤——高分的 builtin/suspect/排除 host 照旧跳过', async () => {
+    const pool = ['https://a.example/', 'https://book15.net/', 'https://s.example/', 'https://x.example/'];
+    const h = harness({ pool, search: () => [], suspect: ['s.example'],
+      hostPriority: async () => new Map([['book15.net', 9], ['s.example', 9], ['x.example', 9]]) });
+    await h.selector(request({ excludedHosts: ['x.example'] }), freshSignal());
+    expect(h.searchedUrls).toEqual(['https://a.example/']);
   });
 
   it('共享扫描余额跨调用保留，过滤不扣额，耗尽后不再读池', async () => {

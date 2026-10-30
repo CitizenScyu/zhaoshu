@@ -159,6 +159,23 @@ export async function releaseSourcePrefetch(sql: CandidateSql, bookId: number, o
     DELETE FROM download_source_prefetch WHERE book_id = ${bookId} AND owner = ${owner}`;
 }
 
+/**
+ * yield1030：近 windowDays 天内各 host 实收（status='done'）的任务数——选源扫描优先分。
+ * 只认 done（真出过书），不认选源命中：命中但下载恒败的 host（invalid_chapter / pagination_cycle 型）
+ * 提前只会更早占掉早停槽位。host 取自任务 source_url（引擎回退成功的任务记的是实际下载源）。
+ */
+export async function productiveHostScores(sql: CandidateSql, windowDays = 30): Promise<Map<string, number>> {
+  if (!Number.isSafeInteger(windowDays) || windowDays <= 0) throw new Error('windowDays is invalid');
+  const rows = await sql`
+    SELECT lower(substring(source_url from '^[A-Za-z][A-Za-z0-9+.-]*://([^/?#:@]+)')) AS host, count(*)::int AS n
+    FROM download_tasks
+    WHERE status = 'done' AND updated_at > now() - (${windowDays}::int * interval '1 day')
+    GROUP BY 1` as unknown as { host: string | null; n: number }[];
+  const scores = new Map<string, number>();
+  for (const row of rows) if (row.host && Number.isFinite(Number(row.n)) && Number(row.n) > 0) scores.set(row.host, Number(row.n));
+  return scores;
+}
+
 /** 下载失败 → 候选失败分类（permanent/temporary）。判据与 AdapterOutcome.failure.code 对齐。 */
 export function classifyFailure(code: string): Exclude<CandidateFailureKind, ''> {
   // identity_mismatch_or_no_candidate：该源详情页/正文身份不符——确定不是这本书，重试无意义。

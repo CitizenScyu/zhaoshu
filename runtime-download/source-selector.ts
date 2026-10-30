@@ -28,6 +28,12 @@ export interface SourceSelectorOptions {
   isSuspect?: (host: string) => boolean;
   log?: (level: 'info' | 'error', message: string, fields?: Record<string, unknown>) => void;
   timeoutMs?: number;
+  /**
+   * yield1030：host 扫描优先分（越大越先扫，缺席 = 0）。缺省 = 池序原样（逐字同改前）。
+   * 只做稳定重排：不增减可扫源、不动 scanLimit/预算/过滤口径——同样的扫描额度先给历史上真出过书的 host。
+   * 提供方自行吞错回空表（重排是优化不是门，读不到就退回池序，不得因此少扫或 fail-closed）。
+   */
+  hostPriority?: (signal: AbortSignal) => Promise<ReadonlyMap<string, number>>;
 }
 
 export interface SourceSelectionRequest {
@@ -128,6 +134,20 @@ export function createSourceSelector(options: SourceSelectorOptions): SourceSele
         return { picked: [], scanned: 0 };
       }
       signal.throwIfAborted();
+      if (options.hostPriority) {
+        let priority: ReadonlyMap<string, number> = new Map();
+        try {
+          priority = await sourceAbortable(options.hostPriority(overall), overall);
+        } catch {
+          signal.throwIfAborted();
+        }
+        if (priority.size) {
+          const rank = (s: PoolSource) => priority.get(hostOf(s.url)) ?? 0;
+          pool = pool.map((source, index) => ({ source, index, p: rank(source) }))
+            .sort((a, b) => b.p - a.p || a.index - b.index)
+            .map(entry => entry.source);
+        }
+      }
       const excludedHosts = new Set(request.excludedHosts);
       const excludedSources = new Set(request.excludedSources);
       const picked: string[] = [];

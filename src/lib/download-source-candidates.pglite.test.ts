@@ -7,7 +7,7 @@ import { createPGliteSql } from '../lib/fixtures/pglite-sql';
 import { initializeBusinessSchema } from '../lib/business-schema';
 import {
   claimSourcePrefetch, classifyFailure, failedCandidateSources, markCandidateFailure, occupiedHosts,
-  releaseHostOccupancy, releaseSourcePrefetch, replaceSourceCandidates,
+  productiveHostScores, releaseHostOccupancy, releaseSourcePrefetch, replaceSourceCandidates,
   tryOccupyHost, usableSourceCandidates,
 } from './download-source-candidates';
 
@@ -150,5 +150,20 @@ maybe('bsrcfix-41：候选源持久化与跨实例占位（0005 三表）', () =
   it('expiresMs 非正数即拒绝（防占位永不过期的坏参数）', async () => {
     await expect(tryOccupyHost(sql(), 'a.example', 'w1', 'download', null, 0)).rejects.toThrow('expiresMs is invalid');
     await expect(claimSourcePrefetch(sql(), 1, 'p1', -1)).rejects.toThrow('expiresMs is invalid');
+  });
+
+  it('yield1030 productiveHostScores：只数窗口内 done，host 小写去端口，空 URL/失败/过窗不计', async () => {
+    await pg.exec(`
+      INSERT INTO download_tasks (user_id, book_id, title, status, source_url, updated_at)
+      SELECT 1, v.* FROM (VALUES
+        (11, 't', 'done', 'https://WWW.A.example/book/1', now()),
+        (12, 't', 'done', 'https://www.a.example:8443/book/2', now()),
+        (13, 't', 'done', 'https://b.example/x?y=1', now()),
+        (14, 't', 'failed', 'https://c.example/x', now()),
+        (15, 't', 'done', 'https://d.example/old', now() - interval '40 days'),
+        (16, 't', 'done', '', now())) AS v;
+    `);
+    expect(await productiveHostScores(sql())).toEqual(new Map([['www.a.example', 2], ['b.example', 1]]));
+    await expect(productiveHostScores(sql(), 0)).rejects.toThrow('windowDays is invalid');
   });
 });
