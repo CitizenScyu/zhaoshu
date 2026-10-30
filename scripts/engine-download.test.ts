@@ -10,7 +10,7 @@ import * as parser from '../src/lib/source-parser';
 import fixtures from '../src/lib/rule-engine/fixtures/smoke-174.json';
 import { SourceHttpError } from '../src/lib/source-fetch';
 import { SourcePolicyError } from '../src/lib/source-policy';
-import { downloadBook, downloadOptions } from './engine-download.mjs';
+import { contentFailStreak, downloadBook, downloadOptions } from './engine-download.mjs';
 
 const dirs: string[] = [];
 afterEach(() => { vi.unstubAllGlobals(); for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
@@ -573,7 +573,57 @@ describe('vipwall42 付费墙预览截断识别', () => {
   });
 });
 
-// authbridge42：下载腿作者名回退轮（主会话 2026-10-15 裁定扩范围到本文件）。
+// failstreak1030：正文连续失败熔断（DOWNLOAD_CONTENT_FAIL_STREAK，缺省关）。
+describe('failstreak1030 正文连续失败熔断', () => {
+  afterEach(() => { vi.unstubAllEnvs(); });
+  const catalog = (n: number) => `<div class="d-chapter-list" id="full-catalog">${Array.from({ length: n }, (_, i) => `<dd><a href="/read/${i + 1}">第${i + 1}章</a></dd>`).join('')}</div>`;
+  /** 40 章书；bad(n) 为真的章正文为空（strict 抛 empty_content_page）。 */
+  const wrap = (f: ReturnType<typeof setup>, bad: (n: number) => boolean) => async (url: string, opts: { signal: AbortSignal; beforeRequest?: (s: AbortSignal) => Promise<void> }) => {
+    if (url === 'https://book15.net/books/details1.html') {
+      return { url, text: `<h1>测试书</h1><div class="d-info-panel"><a href="/author/1">作者甲</a></div><meta property="og:novel:book_name" content="测试书"><meta property="og:novel:author" content="作者甲">` + catalog(40) };
+    }
+    if (url.includes('/read/')) {
+      f.calls.push(url);
+      return { url, text: `<li class="chapter-content" id="article-content">${bad(Number(url.split('/read/')[1])) ? '' : '<p>合成正文，离线测试。</p>'}</li>` };
+    }
+    return f.transport(url, opts);
+  };
+  const reads = (f: ReturnType<typeof setup>) => f.calls.filter(url => url.includes('/read/')).length;
+
+  it('缺省关：逐章抓完全书再按 missing_chapters 收口（零行为变化）', async () => {
+    const f = setup();
+    const r = await f.run(wrap(f, n => n >= 3));
+    expect(r.manifest.errors).toEqual(['missing_chapters']);
+    expect(reads(f)).toBe(40);
+    expect((r.manifest as { content_fail_streak?: number }).content_fail_streak).toBeUndefined();
+  });
+
+  it('K=5：连续 5 章失败即停，剩余章保持 pending，终态码仍是 missing_chapters', async () => {
+    vi.stubEnv('DOWNLOAD_CONTENT_FAIL_STREAK', '5');
+    const f = setup();
+    const r = await f.run(wrap(f, n => n >= 3));
+    expect(r.code).toBe(1);
+    expect(r.manifest.errors).toEqual(['missing_chapters']);
+    expect(reads(f)).toBe(7);
+    expect((r.manifest as { content_fail_streak?: number }).content_fail_streak).toBe(5);
+    expect(r.manifest.chapters.filter((c: { status: string }) => c.status === 'done')).toHaveLength(2);
+    expect(r.manifest.chapters.filter((c: { status: string }) => c.status === 'pending')).toHaveLength(33);
+    expect(existsSync(join(dirname(r.manifestPath), 'download.lock'))).toBe(false);
+  });
+
+  it('K=2：成功章清零计数，隔章失败不触发熔断', async () => {
+    vi.stubEnv('DOWNLOAD_CONTENT_FAIL_STREAK', '2');
+    const f = setup();
+    const r = await f.run(wrap(f, n => n % 2 === 0));
+    expect(r.manifest.errors).toEqual(['missing_chapters']);
+    expect(reads(f)).toBe(40);
+  });
+
+  it.each(['0', '', 'abc', '-3', '1e3'])('非正整数 %j 视为关', async value => {
+    vi.stubEnv('DOWNLOAD_CONTENT_FAIL_STREAK', value);
+    expect(contentFailStreak()).toBe(0);
+  });
+});：下载腿作者名回退轮（主会话 2026-10-15 裁定扩范围到本文件）。
 // 背景：QQ 系别名书在镜像站按通行书名收录，选源/预检按作者名命中后，下载腿若仍只按书名搜，
 // 会把同一个源又判成 identity_mismatch_or_no_candidate → markFailure 淘汰，选源的改动等于白烧出网。
 describe('authbridge42 下载腿作者名回退轮', () => {

@@ -63,6 +63,17 @@ export function downloadOptions(args) {
   return options;
 }
 
+// failstreak1030：正文连续失败熔断 DOWNLOAD_CONTENT_FAIL_STREAK（正整数 K；缺省/0/非法 = 关，零行为变化）。
+// 连续 K 章「实抓失败」（缓存命中的 done 章与抓成功的章都清零计数）即停抓剩余章节，按 missing_chapters 收口
+// （与跑完全书再抛的终态码相同，下游退避/换源口径不变）。动机（2026-10-30 生产只读）：正文规则对站点取空的源
+// （suduguu www 那份 .con@textNodes）每章都实打请求再判 empty_content_page，整本 2000+ 章逐章失败、周约 4.3 万次
+// 无效请求；书反正 partial，后面的章抓了也只是一样失败。已 done 章照旧落盘，下轮同源续传不受影响。
+export function contentFailStreak(env = process.env) {
+  const raw = env.DOWNLOAD_CONTENT_FAIL_STREAK?.trim() ?? '';
+  if (!/^\d{1,6}$/.test(raw)) return 0;
+  return Number(raw);
+}
+
 // 身份判据的唯一实现：downloadBook 选候选、执行器扣额度前的身份预检（runtime-download/identity-precheck.ts）
 // 与 builtin 引擎源回退（runtime-download/builtin-fallback.ts）共用。
 //
@@ -222,6 +233,8 @@ export async function downloadBook(m, args, resolveSource, transport = fetchSour
     // 分页不受影响）。单章书保持旧口径（字符串、含本章自身）：末章「下一页」常回绕首章，单章时即回绕自身，
     // 数组口径剔除本章后自指翻页会触发 pagination_cycle。只构造一次、循环外，逐章共享。
     const stopUrls = manifest.chapters.length > 1 ? manifest.chapters.map(c => c.url) : manifest.chapters[0]?.url;
+    const failStreakLimit = contentFailStreak();
+    let failStreak = 0;
     for (const chapter of manifest.chapters) {
       controller.signal.throwIfAborted();
       try {
@@ -242,12 +255,17 @@ export async function downloadBook(m, args, resolveSource, transport = fetchSour
         if (bytes > MAX_BOOK_BYTES) throw new Error('size_limit');
         atomic(path, text);
         Object.assign(chapter, { status: 'done', chars: [...text].length, sha256: hash(text) });
+        failStreak = 0;
       } catch (error) {
         if (isLimiterFeedbackError(error) || isHostGateError(error)) throw error;
         chapter.status = 'failed';
         // Do not persist upstream messages, URLs or credentials in diagnostics.
         chapter.error = knownError.test(error.message) ? error.message : 'chapter_failed';
         if (chapter.error === 'size_limit' || controller.signal.aborted) throw error;
+        if (failStreakLimit > 0 && ++failStreak >= failStreakLimit) {
+          manifest.content_fail_streak = failStreak;
+          throw new Error('missing_chapters');
+        }
       }
       await checkpoint(false);
     }
