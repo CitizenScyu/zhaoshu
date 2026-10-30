@@ -88,6 +88,15 @@ export function contentRetryPasses(env = process.env) {
   return Number(raw);
 }
 
+// stopbook1031：DOWNLOAD_CONTENT_STOP_BOOK_PAGES=1 时把详情页/目录页并入正文停止点（缺省/其他值 = 关，零行为变化）。
+// 动机（2026-10-31 phoenix 只读 + pc-linux 实网复现）：72h 内 24 本 manifest ≥90% 已抓、仅差末章即判 missing_chapters
+// 整本作废换源；m.cuoceng 末章 #linkNext 指回详情页（bookUrl），停止点只含目录章节拦不住，详情页按正文规则取空
+// → strict empty_content_page。legado 同义：末章「下一章」回目录/详情即视作本章结束。仅多章书生效（单章书沿用旧口径）。
+// 副作用：章节地址本身重定向到详情/目录页时改报「跳转到目录中的其他章节」（chapter_failed）而非 empty_content_page。
+export function contentStopBookPages(env = process.env) {
+  return env.DOWNLOAD_CONTENT_STOP_BOOK_PAGES?.trim() === '1';
+}
+
 // hostburst1030：按站「连抓 N 次即静置 M 毫秒」DOWNLOAD_HOST_BURST_PAUSE（"站=N/M,站=N/M"；站按 stationKeyOfHost
 // 归一，www./m. 前缀互认；N 1..10000，M 封顶 600000）。缺省/未命中/非法项 = null（零行为变化）。
 // 静置在章与章之间、operation 超时之外进行（M 可远大于 timeout-ms），计数含本次下载的全部请求（搜索/详情/目录）。
@@ -293,6 +302,9 @@ export async function downloadBook(m, args, resolveSource, transport = fetchSour
     // 分页不受影响）。单章书保持旧口径（字符串、含本章自身）：末章「下一页」常回绕首章，单章时即回绕自身，
     // 数组口径剔除本章后自指翻页会触发 pagination_cycle。只构造一次、循环外，逐章共享。
     const stopUrls = manifest.chapters.length > 1 ? manifest.chapters.map(c => c.url) : manifest.chapters[0]?.url;
+    if (Array.isArray(stopUrls) && contentStopBookPages()) {
+      for (const url of [selected.bookUrl, selected.tocUrl]) if (url && !stopUrls.includes(url)) stopUrls.push(url);
+    }
     const failStreakLimit = contentFailStreak();
     let failStreak = 0;
     const fetchChapter = async chapter => {

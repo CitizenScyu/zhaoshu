@@ -10,7 +10,7 @@ import * as parser from '../src/lib/source-parser';
 import fixtures from '../src/lib/rule-engine/fixtures/smoke-174.json';
 import { SourceHttpError } from '../src/lib/source-fetch';
 import { SourcePolicyError } from '../src/lib/source-policy';
-import { contentFailStreak, contentRetryPasses, downloadBook, downloadOptions, hostBurstPause, policyCodeOf } from './engine-download.mjs';
+import { contentFailStreak, contentRetryPasses, contentStopBookPages, downloadBook, downloadOptions, hostBurstPause, policyCodeOf } from './engine-download.mjs';
 
 const dirs: string[] = [];
 afterEach(() => { vi.unstubAllGlobals(); for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
@@ -371,6 +371,51 @@ describe('下载器逐章停止点 = 整本目录（dlstop42）', () => {
     expect(result.manifest.status).toBe('done');
     expect(readFileSync(join(dir, '0.txt'), 'utf8')).toBe('第7章正文');
     expect(chapterCalls(calls)).toEqual([chapter(7)]);
+  });
+
+  // stopbook1031：末章「下一章」指回详情页/目录页（m.cuoceng 实网形态）。开关关 = 旧口径（详情页按正文规则取空
+  // → empty_content_page → 整本 missing_chapters）；开 = 停在详情/目录页，末章只含本章正文、整本 done。
+  describe('stopbook1031 末章下一章回详情/目录页', () => {
+    afterEach(() => { vi.unstubAllEnvs(); });
+    const bookPage = 'https://book15.net/cc/b.html';
+    const tocUrl = 'https://book15.net/cc/b/toc.html';
+    const lastBackTo = (href: string) => { const pages = interleavedPages(); pages.set(chapter(4), body('第4章正文', href)); return pages; };
+    // 落点页在正文阶段之外的固有请求次数：详情页 1 次（详情），目录页 2 次（目录 + 收尾复核目录）。
+    const cases = [['详情页', '/cc/b.html', bookPage, 1], ['目录页', '/cc/b/toc.html', tocUrl, 2]] as const;
+
+    it.each(cases)('关：末章回%s ⇒ empty_content_page 缺章（零行为变化）', async (_, href, landing, base) => {
+      const { result, calls } = await runDownload(lastBackTo(href));
+      expect(result.manifest.errors).toEqual(['missing_chapters']);
+      expect((result.manifest.chapters[4] as { error?: string }).error).toBe('empty_content_page');
+      expect(calls.filter(url => url === landing)).toHaveLength(base + 1);
+    });
+
+    it.each(cases)('开：末章回%s ⇒ 停在本章，整本 done', async (_, href, landing, base) => {
+      vi.stubEnv('DOWNLOAD_CONTENT_STOP_BOOK_PAGES', '1');
+      const { result, calls, dir } = await runDownload(lastBackTo(href));
+      expect(result.code).toBe(0);
+      expect(result.manifest.status).toBe('done');
+      expect(readFileSync(join(dir, '4.txt'), 'utf8')).toBe('第4章正文');
+      expect(calls.filter(url => url === landing)).toHaveLength(base);
+    });
+
+    it('开：单章书不并入（沿用旧口径字符串停止点）', async () => {
+      vi.stubEnv('DOWNLOAD_CONTENT_STOP_BOOK_PAGES', '1');
+      const pages = new Map<string, string>([
+        [`https://book15.net/cc/so/${encodeURIComponent('测试书')}.html`, '<div class="book"><span class="name">测试书</span><span class="author">作者甲</span><a href="/cc/b.html">x</a></div>'],
+        [bookPage, '<h1 class="title">测试书</h1><span class="writer">作者甲</span><a class="toc" href="/cc/b/toc.html">目录</a>'],
+        [tocUrl, tocPage([7])],
+        [chapter(7), body('第7章正文', '/cc/b/7.html')],
+      ]);
+      const { result, calls } = await runDownload(pages);
+      expect(result.code).toBe(0);
+      expect(chapterCalls(calls)).toEqual([chapter(7)]);
+    });
+
+    it.each([['1', true], [' 1 ', true], ['0', false], ['', false], ['true', false]] as const)('%j 解析为 %s', (value, on) => {
+      vi.stubEnv('DOWNLOAD_CONTENT_STOP_BOOK_PAGES', value);
+      expect(contentStopBookPages()).toBe(on);
+    });
   });
 });
 
