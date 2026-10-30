@@ -2,8 +2,8 @@
 // 规则与页面均为合成形态。
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { SourceRequestContext } from '@/lib/source-reader';
-import { engineFetchToc, strictTocUnsupported, type EngineSource } from './api';
-import { compileSource } from './compile';
+import { engineFetchToc, type EngineSource } from './api';
+import { compileSource, strictTocUnsupported } from './compile';
 import { engineTocStrictIgnoreUpdateTimeEnabled } from './syntax-flags';
 
 const SITE = 'https://book15.net'; // 过 host 门（.example 保留域取页被拒）

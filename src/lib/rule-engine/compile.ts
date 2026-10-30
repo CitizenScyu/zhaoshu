@@ -31,6 +31,7 @@ import {
   engineSyntaxRulePrefixEnabled, engineSyntaxTemplateHashEnabled, engineSyntaxBracketIndexEnabled, engineSyntaxSelfMatchEnabled,
   engineSyntaxBareAttrEnabled, engineSyntaxJsoupDoctypeEnabled, ENGINE_SEMANTICS_JSOUP_DOCTYPE_BIT, engineSyntaxAttrQuoteEnabled,
   engineSyntaxAttrRegexEnabled, engineSyntaxChildrenEnabled, engineSearchPagePatternEnabled, engineSyntaxTrailDotEnabled,
+  engineTocStrictIgnoreUpdateTimeEnabled,
 } from './syntax-flags';
 import { urlOptionFields } from './url-options';
 import {
@@ -1990,6 +1991,17 @@ function buildItemVars(rules: Record<string, unknown>, plan: ItemVarPlan, base: 
 /** LRU 上限：单测/低并发下足够；无关热路径，只防规则对象无限积累。 */
 const CACHE_LIMIT = 64;
 const cache = new Map<string, CompiledRules>();
+
+/**
+ * strict 目录（下载）是否必拒：任一 ruleToc 字段编译被 skip 即 unsupported_toc_rule。编译期可知、与页面无关，
+ * 选源器据此零出网跳过（toctgate1030）。toctime1030：updateTime 只供展示、目录求值不读，开关开时它编不过也不拦。
+ * 放在 compile 而非 api：api 导出面恰为门面四函数（v3 E5 结构断言）。
+ */
+export function strictTocUnsupported(compiled: CompiledRules): boolean {
+  const ignoreTime = engineTocStrictIgnoreUpdateTimeEnabled();
+  return [...compiled.entries()].some(([key, value]) => key.startsWith('ruleToc.') && 'skipped' in value
+    && !(ignoreTime && key === 'ruleToc.updateTime'));
+}
 
 /**
  * 把一个源的规则原文编译成 `字段全名 → FieldIr`（设计 §7.1）。

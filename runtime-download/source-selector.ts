@@ -13,12 +13,11 @@ export type SourceSelectionTask = { id: number; title: string; author: string };
 export interface PoolSource { url: string; name: string; searchUrl: unknown; rules?: unknown }
 
 interface Modules {
-  compile: { compileSource(source: unknown): unknown };
+  compile: { compileSource(source: unknown): unknown; strictTocUnsupported?(compiled: unknown): boolean };
   supported: { BUILTIN_SOURCE_HOSTS: readonly string[] };
   api: {
     engineSearchBook(engine: unknown, title: string, ctx: unknown): Promise<SearchHit[]>;
     engineFetchDetail(engine: unknown, bookUrl: string, ctx: unknown, book?: unknown, vars?: unknown): Promise<Identity>;
-    strictTocUnsupported?(compiled: unknown): boolean;
   };
 }
 
@@ -36,7 +35,7 @@ export interface SourceSelectorOptions {
    */
   hostPriority?: (signal: AbortSignal) => Promise<ReadonlyMap<string, number>>;
   /**
-   * toctgate1030：出池跳过 strict 目录必拒的源（api.strictTocUnsupported：ruleToc 字段编译被 skip，编译期可知）。
+   * toctgate1030：出池跳过 strict 目录必拒的源（compile.strictTocUnsupported：ruleToc 字段编译被 skip，编译期可知）。
    * 这类源选中后下载腿必抛 unsupported_toc_rule（或在详情处先以别的错挂掉），白占候选位与出网；生产 m.qidian
    * 24h 35 次 download_failed 即此形态（isVip/isVolume 被 skip）。缺省关 = 逐字同改前。编译抛错的源不在此判（留给原路径）。
    */
@@ -93,7 +92,7 @@ export function createSourceSelector(options: SourceSelectorOptions): SourceSele
   // toctgate1030：按 url 记忆判定（规则对象同一或 JSON 相同才复用），免得每轮选源把全池重编一遍（编译缓存只 64 条）。
   const tocMemo = new Map<string, { rules: unknown; json: string; doomed: boolean }>();
   const strictTocDoomed = (source: PoolSource): boolean => {
-    const unsupported = modules.api.strictTocUnsupported;
+    const unsupported = modules.compile.strictTocUnsupported;
     if (!unsupported) return false;
     const hit = tocMemo.get(source.url);
     if (hit && hit.rules === source.rules) return hit.doomed;

@@ -29,7 +29,10 @@ function harness(opts: {
   const logs: Array<{ level: 'info' | 'error'; message: string; fields?: Record<string, unknown> }> = [];
   const selector = createSourceSelector({
     modules: {
-      compile: { compileSource: (s: { url: string }) => { compiles.push(s.url); return { url: s.url }; } },
+      compile: {
+        compileSource: (s: { url: string }) => { compiles.push(s.url); return { url: s.url }; },
+        strictTocUnsupported: (compiled: { url: string }) => opts.doomed?.includes(compiled.url) ?? false,
+      },
       supported: { BUILTIN_SOURCE_HOSTS: opts.builtinHosts ?? ['book15.net', 'www.book15.net'] },
       api: {
         // 非 async：让 search 能同步 throw（穿透到 sourceHasBook 成 rejection）。
@@ -42,7 +45,6 @@ function harness(opts: {
           detailUrls.push(bookUrl);
           return Promise.resolve(opts.detail?.(bookUrl) ?? { title: TASK.title, author: TASK.author });
         },
-        strictTocUnsupported: (compiled: { url: string }) => opts.doomed?.includes(compiled.url) ?? false,
       },
     },
     transport: async () => { throw new Error('unused'); },

@@ -20,7 +20,8 @@ import {
 import { enginePostSearchEnabled, engineSearchJsActive } from './compile-smoke';
 import { preloadJsSandbox } from './js-sandbox';
 import { buildSearchRequestWithNet, evaluateWithFieldNet, prepareSearchJs, searchJsTemplateLimit } from './search-js';
-import { engineSyntaxJsBindEnabled, engineTocNextSkipChapterEnabled, engineTocStrictIgnoreUpdateTimeEnabled } from './syntax-flags';
+import { strictTocUnsupported } from './compile';
+import { engineSyntaxJsBindEnabled, engineTocNextSkipChapterEnabled } from './syntax-flags';
 import { RuleEngineError, type CompiledRules, type FieldIr, type SkippedField } from './types';
 import { stripUrlOptions } from './url-options';
 
@@ -287,15 +288,6 @@ export async function engineFetchDetail(
   return detail;
 }
 
-/**
- * strict 目录（下载）是否必拒：任一 ruleToc 字段编译被 skip 即 unsupported_toc_rule。编译期可知、与页面无关，
- * 选源器据此零出网跳过（toctgate1030）。toctime1030：updateTime 只供展示、目录求值不读，开关开时它编不过也不拦。
- */
-export function strictTocUnsupported(compiled: CompiledRules): boolean {
-  const ignoreTime = engineTocStrictIgnoreUpdateTimeEnabled();
-  return [...compiled.entries()].some(([key, value]) => key.startsWith('ruleToc.') && 'skipped' in value
-    && !(ignoreTime && key === 'ruleToc.updateTime'));
-}
 
 /**
  * ruleToc.chapterList → SourceChapter[]，含 nextTocUrl 翻页循环。
