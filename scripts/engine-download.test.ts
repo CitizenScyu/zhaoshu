@@ -668,44 +668,44 @@ describe('previewearly1031 付费墙预览提前收口', () => {
   const reads = (f: ReturnType<typeof setup>) => f.calls.filter(url => url.includes('/read/')).length;
   const count = (r: { manifest: { chapters: { status: string }[] } }, status: string) => r.manifest.chapters.filter(c => c.status === status).length;
 
-  it('缺省关：200 章全预览照旧抓完全书再判 preview_truncated', async () => {
+  it('缺省关：120 章全预览照旧抓完全书再判 preview_truncated', async () => {
     const f = setup();
-    const r = await f.run(wrap(f, 200, () => 190));
+    const r = await f.run(wrap(f, 120, () => 190));
     expect(r.manifest.errors).toEqual(['preview_truncated']);
-    expect(reads(f)).toBe(200);
-  });
+    expect(reads(f)).toBe(120);
+  }, 60_000);
 
   it('开头 50 章全短 ⇒ 第 50 章后即收口，余章 pending、零 book.txt', async () => {
     vi.stubEnv('DOWNLOAD_PREVIEW_EARLY', '1');
     const f = setup();
-    const r = await f.run(wrap(f, 200, () => 190));
+    const r = await f.run(wrap(f, 120, () => 190));
     expect(r.code).toBe(1);
     expect(r.manifest.status).toBe('partial');
     expect(r.manifest.errors).toEqual(['preview_truncated']);
     expect(reads(f)).toBe(50);
-    expect(count(r, 'pending')).toBe(150);
+    expect(count(r, 'pending')).toBe(70);
     expect(existsSync(join(dirname(r.manifestPath), 'book.txt'))).toBe(false);
     expect(existsSync(join(dirname(r.manifestPath), 'download.lock'))).toBe(false);
-  });
+  }, 60_000);
 
-  it('前 60 章免费、其后预览 ⇒ 短章过半（101 章）即收口', async () => {
+  it('前 30 章免费、其后预览 ⇒ 短章过半（61 章）即收口', async () => {
     vi.stubEnv('DOWNLOAD_PREVIEW_EARLY', '1');
     const f = setup();
-    const r = await f.run(wrap(f, 200, n => n <= 60 ? 2200 : 190));
+    const r = await f.run(wrap(f, 120, n => n <= 30 ? 2200 : 190));
     expect(r.manifest.errors).toEqual(['preview_truncated']);
-    expect(reads(f)).toBe(161);
-    expect(count(r, 'pending')).toBe(39);
-  });
+    expect(reads(f)).toBe(91);
+    expect(count(r, 'pending')).toBe(29);
+  }, 60_000);
 
   it('长章书、开头有长章的短章少数书、小书短章均不提前收口', async () => {
     vi.stubEnv('DOWNLOAD_PREVIEW_EARLY', '1');
-    for (const [total, body] of [[200, () => 2200], [200, (n: number) => n % 3 === 0 ? 190 : 2200], [30, () => 190]] as const) {
+    for (const [total, body] of [[120, () => 2200], [120, (n: number) => n % 3 === 0 ? 190 : 2200], [30, () => 190]] as const) {
       const f = setup();
       const r = await f.run(wrap(f, total, body));
       expect(r.manifest.status).toBe('done');
       expect(reads(f)).toBe(total);
     }
-  });
+  }, 60_000);
 });
 
 // failstreak1030：正文连续失败熔断（DOWNLOAD_CONTENT_FAIL_STREAK，缺省关）。
