@@ -158,6 +158,21 @@ export function noticePlaceholder(env = process.env) {
   return env.DOWNLOAD_NOTICE_PLACEHOLDER?.trim() === '1';
 }
 
+// noticeaside1031：DOWNLOAD_NOTICE_UNNUMBERED=1 时，「编号书」（目录 ≥ 20 章且 ≥ 90% 章名含「第 N 章/节/回」）里
+// 章名不带编号、也不像正文（番外/楔子/序/尾声/终章/后记/外传/结局/引子/卷）的章，源站正文取空即写占位按 done 收口。
+// 缺省/其他值 = 关（零行为变化）。与 noticeskip1031 独立；正文非空照常抓原文，编号章取空照旧 failed。
+// 动机（2026-10-31 phoenix 只读，7 天）：book.qq 61 本 partial，空页章里只有 59 章是编号章，其余是「求月票」「更新说明」
+// 类短标题作者话（标题中位 5 字，done 章 44506 章编号章占 99.99%）；noticeskip 只认强公告词，只救 10 本，加此判据可救 31 本。
+const NUMBERED_TITLE = /第[0-9０-９零〇一二三四五六七八九十百千万两]+[章节回]/;
+const STORY_TITLE = /番外|楔子|序|尾声|终章|后记|外传|结局|引子|卷/;
+const ASIDE_TEXT = '（本章为非编号章节，源站无正文，疑为作者公告。）';
+export function noticeUnnumbered(env = process.env) {
+  return env.DOWNLOAD_NOTICE_UNNUMBERED?.trim() === '1';
+}
+export function numberedBook(titles) {
+  return titles.length >= 20 && titles.filter(t => NUMBERED_TITLE.test(t)).length >= titles.length * 0.9;
+}
+
 // chaperr1031：DOWNLOAD_CHAPTER_ERROR_KIND=1 时，白名单外的逐章失败（chapter.error='chapter_failed'）另记 chapter.error_kind =
 // 「构造器名[:HTTP 状态][:枚举 code]」（code 取 error.code / SourcePolicyError 归类 / undici cause.code，均为常量形态，不含上游文本
 // 与 URL）；补抓成功即删。缺省/其他值 = 关（零行为变化）。只是诊断字段，任何判据都不读它。
@@ -400,6 +415,7 @@ export async function downloadBook(m, args, resolveSource, transport = fetchSour
     }
     const failStreakLimit = contentFailStreak();
     let failStreak = 0;
+    const asideBook = noticeUnnumbered() && numberedBook(manifest.chapters.map(c => c.title));
     const fetchChapter = async chapter => {
       controller.signal.throwIfAborted();
       try {
@@ -415,15 +431,17 @@ export async function downloadBook(m, args, resolveSource, transport = fetchSour
         if (text === undefined) {
           await burstGate();
           const notice = noticePlaceholder() && NOTICE_TITLE.test(chapter.title);
+          const aside = !notice && asideBook && !NUMBERED_TITLE.test(chapter.title) && !STORY_TITLE.test(chapter.title);
           text = await operation(async ctx => {
             // bookcontent1029：目录用过的书籍成员（详情带回）同样交给正文。
             if (!builtin) return (await m.api.engineFetchContent(engine, chapter.url, ctx, true, stopUrls, chapter.title, selected.book)).text;
             return m.parser.parseSourceChapterText((await ctx.page(chapter.url)).text, chapter.title);
           }).catch(error => {
-            if (notice && error?.message === 'empty_content_page') return '';
+            if ((notice || aside) && error?.message === 'empty_content_page') return '';
             throw error;
           });
           if (notice && !text.trim()) text = NOTICE_TEXT;
+          else if (aside && !text.trim()) text = ASIDE_TEXT;
           fresh = true;
         }
         if (!text.trim()) throw new Error('empty_content');

@@ -11,7 +11,7 @@ import fixtures from '../src/lib/rule-engine/fixtures/smoke-174.json';
 import { SourceHttpError } from '../src/lib/source-fetch';
 import { SourcePolicyError } from '../src/lib/source-policy';
 import { peerOutRoots, seedFromPeers } from '../runtime-download/resume-seed';
-import { breakerYield, chapterErrorKind, chapterResume, contentFailStreak, contentRetryPasses, contentStopBookPages, downloadBook, downloadOptions, errorKindOf, hostBurstPause, keepCached, policyCodeOf, recheckYield } from './engine-download.mjs';
+import { breakerYield, chapterErrorKind, chapterResume, contentFailStreak, contentRetryPasses, contentStopBookPages, downloadBook, downloadOptions, errorKindOf, hostBurstPause, keepCached, noticeUnnumbered, numberedBook, policyCodeOf, recheckYield } from './engine-download.mjs';
 
 const dirs: string[] = [];
 afterEach(() => { vi.unstubAllGlobals(); for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
@@ -746,6 +746,60 @@ describe('noticeskip1031 公告章占位', () => {
     expect(r.manifest.errors).toEqual(['missing_chapters']);
     expect(r.manifest.chapters[1].error).toBe('empty_content_page');
   });
+});
+
+// noticeaside1031：编号书里非编号章正文取空写占位（DOWNLOAD_NOTICE_UNNUMBERED，缺省关）。
+describe('noticeaside1031 非编号章占位', () => {
+  afterEach(() => { vi.unstubAllEnvs(); });
+  /** n 章书，章名「第 i 章」；第 11 章（序号 10）章名换成 aside、正文为空。 */
+  const wrap = (f: ReturnType<typeof setup>, aside: string, n = 20) => async (url: string, opts: { signal: AbortSignal; beforeRequest?: (s: AbortSignal) => Promise<void> }) => {
+    if (url === 'https://book15.net/books/details1.html') {
+      const titles = Array.from({ length: n }, (_, i) => i === 10 ? aside : `第${i + 1}章`);
+      return { url, text: `<h1>测试书</h1><div class="d-info-panel"><a href="/author/1">作者甲</a></div><meta property="og:novel:book_name" content="测试书"><meta property="og:novel:author" content="作者甲"><div class="d-chapter-list" id="full-catalog">${titles.map((t, i) => `<dd><a href="/read/${i + 1}">${t}</a></dd>`).join('')}</div>` };
+    }
+    if (url.includes('/read/')) {
+      return { url, text: `<li class="chapter-content" id="article-content">${url.endsWith('/read/11') ? '' : '<p>合成正文，离线测试。</p>'}</li>` };
+    }
+    return f.transport(url, opts);
+  };
+
+  it('开关与编号书判据', () => {
+    expect(noticeUnnumbered()).toBe(false);
+    vi.stubEnv('DOWNLOAD_NOTICE_UNNUMBERED', '1');
+    expect(noticeUnnumbered()).toBe(true);
+    vi.stubEnv('DOWNLOAD_NOTICE_UNNUMBERED', 'on');
+    expect(noticeUnnumbered()).toBe(false);
+    const num = Array.from({ length: 18 }, (_, i) => `第${i + 1}章 标题`);
+    expect(numberedBook([...num, '求月票', '第十九章'])).toBe(true);
+    expect(numberedBook([...num, '求月票', '更新说明'])).toBe(false); // 18/20 < 90%
+    expect(numberedBook(num.slice(0, 10))).toBe(false); // 小书不判
+  });
+
+  it('缺省关：非编号章取空照旧 missing_chapters', async () => {
+    const f = setup();
+    const r = await f.run(wrap(f, '求月票'));
+    expect(r.manifest.errors).toEqual(['missing_chapters']);
+    expect(r.manifest.chapters[10].error).toBe('empty_content_page');
+  }, 60_000);
+
+  it('开：编号书里非编号章取空写占位，全书发布', async () => {
+    vi.stubEnv('DOWNLOAD_NOTICE_UNNUMBERED', '1');
+    const f = setup();
+    const r = await f.run(wrap(f, '求月票'));
+    expect(r.code).toBe(0);
+    expect(r.manifest.status).toBe('done');
+    expect(readFileSync(join(dirname(r.manifestPath), '10.txt'), 'utf8')).toBe('（本章为非编号章节，源站无正文，疑为作者公告。）');
+  }, 60_000);
+
+  it('开：番外/楔子类、编号章、小书取空照旧 failed', async () => {
+    vi.stubEnv('DOWNLOAD_NOTICE_UNNUMBERED', '1');
+    for (const [aside, n] of [['番外一', 20], ['第11章', 20], ['求月票', 12]] as const) {
+      const f = setup();
+      const r = await f.run(wrap(f, aside, n));
+      expect(r.manifest.errors).toEqual(['missing_chapters']);
+      expect(r.manifest.chapters[10].error).toBe('empty_content_page');
+    }
+  }, 60_000);
 });
 
 // chaperr1031：白名单外逐章失败记异常类别（DOWNLOAD_CHAPTER_ERROR_KIND，缺省关）。
