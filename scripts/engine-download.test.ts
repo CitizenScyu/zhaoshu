@@ -650,6 +650,64 @@ describe('vipwall42 付费墙预览截断识别', () => {
   });
 });
 
+// previewearly1031：付费墙预览首轮提前收口（DOWNLOAD_PREVIEW_EARLY，缺省关）。
+describe('previewearly1031 付费墙预览提前收口', () => {
+  afterEach(() => { vi.unstubAllEnvs(); });
+  const catalog = (n: number) => `<div class="d-chapter-list" id="full-catalog">${Array.from({ length: n }, (_, i) => `<dd><a href="/read/${i + 1}">第${i + 1}章</a></dd>`).join('')}</div>`;
+  /** total 章书；第 n 章（1 起）正文 body(n) 字。 */
+  const wrap = (f: ReturnType<typeof setup>, total: number, body: (n: number) => number) => async (url: string, opts: { signal: AbortSignal; beforeRequest?: (s: AbortSignal) => Promise<void> }) => {
+    if (url === 'https://book15.net/books/details1.html') {
+      return { url, text: `<h1>测试书</h1><div class="d-info-panel"><a href="/author/1">作者甲</a></div><meta property="og:novel:book_name" content="测试书"><meta property="og:novel:author" content="作者甲">` + catalog(total) };
+    }
+    if (url.includes('/read/')) {
+      f.calls.push(url);
+      return { url, text: `<li class="chapter-content" id="article-content"><p>${'文'.repeat(body(Number(url.split('/read/')[1])))}</p></li>` };
+    }
+    return f.transport(url, opts);
+  };
+  const reads = (f: ReturnType<typeof setup>) => f.calls.filter(url => url.includes('/read/')).length;
+  const count = (r: { manifest: { chapters: { status: string }[] } }, status: string) => r.manifest.chapters.filter(c => c.status === status).length;
+
+  it('缺省关：200 章全预览照旧抓完全书再判 preview_truncated', async () => {
+    const f = setup();
+    const r = await f.run(wrap(f, 200, () => 190));
+    expect(r.manifest.errors).toEqual(['preview_truncated']);
+    expect(reads(f)).toBe(200);
+  });
+
+  it('开头 50 章全短 ⇒ 第 50 章后即收口，余章 pending、零 book.txt', async () => {
+    vi.stubEnv('DOWNLOAD_PREVIEW_EARLY', '1');
+    const f = setup();
+    const r = await f.run(wrap(f, 200, () => 190));
+    expect(r.code).toBe(1);
+    expect(r.manifest.status).toBe('partial');
+    expect(r.manifest.errors).toEqual(['preview_truncated']);
+    expect(reads(f)).toBe(50);
+    expect(count(r, 'pending')).toBe(150);
+    expect(existsSync(join(dirname(r.manifestPath), 'book.txt'))).toBe(false);
+    expect(existsSync(join(dirname(r.manifestPath), 'download.lock'))).toBe(false);
+  });
+
+  it('前 60 章免费、其后预览 ⇒ 短章过半（101 章）即收口', async () => {
+    vi.stubEnv('DOWNLOAD_PREVIEW_EARLY', '1');
+    const f = setup();
+    const r = await f.run(wrap(f, 200, n => n <= 60 ? 2200 : 190));
+    expect(r.manifest.errors).toEqual(['preview_truncated']);
+    expect(reads(f)).toBe(161);
+    expect(count(r, 'pending')).toBe(39);
+  });
+
+  it('长章书、开头有长章的短章少数书、小书短章均不提前收口', async () => {
+    vi.stubEnv('DOWNLOAD_PREVIEW_EARLY', '1');
+    for (const [total, body] of [[200, () => 2200], [200, (n: number) => n % 3 === 0 ? 190 : 2200], [30, () => 190]] as const) {
+      const f = setup();
+      const r = await f.run(wrap(f, total, body));
+      expect(r.manifest.status).toBe('done');
+      expect(reads(f)).toBe(total);
+    }
+  });
+});
+
 // failstreak1030：正文连续失败熔断（DOWNLOAD_CONTENT_FAIL_STREAK，缺省关）。
 describe('failstreak1030 正文连续失败熔断', () => {
   afterEach(() => { vi.unstubAllEnvs(); });

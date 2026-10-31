@@ -135,6 +135,18 @@ export function keepCached(env = process.env) {
   return env.DOWNLOAD_RESUME_KEEP_CACHED?.trim() === '1';
 }
 
+// previewearly1031：DOWNLOAD_PREVIEW_EARLY=1 时付费墙预览（vipwall42 判据）在首轮逐章抓取中提前收口（缺省/其他值 = 关，零行为变化）。
+// 两种情形提前判 preview_truncated：
+// - 必中：目录 ≥ 50 章且短章（< 500 字）已过半——全书抓完中位数必 < 500，收尾闸门必判，后半本只是白抓；
+// - 开头：已 done ≥ 50 章且全是短章（xs.cn/xs8.cn 首章起即 ~190 字）。仅「>100 章、开头 50 章全短、后文过半长章」的书会误判（换源、不发布）。
+// 动机（2026-10-31 phoenix 只读，48h）：xs.cn/xs8.cn/hongxiu 15 本预览书逐章抓了约 9000 章（xs 系中位 186 字），
+// 其中 8 本收尾先因少数空页判 missing_chapters，付费墙闸门没走到；每本白抓上千章才换源。
+export function previewEarly(env = process.env) {
+  return env.DOWNLOAD_PREVIEW_EARLY?.trim() === '1';
+}
+const PREVIEW_MIN_CHAPTERS = 50;
+const PREVIEW_MAX_CHARS = 500;
+
 // hostburst1030：按站「连抓 N 次即静置 M 毫秒」DOWNLOAD_HOST_BURST_PAUSE（"站=N/M,站=N/M"；站按 stationKeyOfHost
 // 归一，www./m. 前缀互认；N 1..10000，M 封顶 600000）。缺省/未命中/非法项 = null（零行为变化）。
 // 静置在章与章之间、operation 超时之外进行（M 可远大于 timeout-ms），计数含本次下载的全部请求（搜索/详情/目录）。
@@ -404,7 +416,18 @@ export async function downloadBook(m, args, resolveSource, transport = fetchSour
       }
       await checkpoint(false);
     };
-    for (const chapter of manifest.chapters) await fetchChapter(chapter);
+    const earlyPreview = previewEarly();
+    let doneCount = 0, shortCount = 0, anyLong = false;
+    for (const chapter of manifest.chapters) {
+      await fetchChapter(chapter);
+      if (!earlyPreview || chapter.status !== 'done') continue;
+      doneCount += 1;
+      if (chapter.chars < PREVIEW_MAX_CHARS) shortCount += 1; else anyLong = true;
+      const total = manifest.chapters.length;
+      if (total >= PREVIEW_MIN_CHAPTERS && (shortCount > Math.floor(total / 2) || (doneCount >= PREVIEW_MIN_CHAPTERS && !anyLong))) {
+        throw new Error('preview_truncated');
+      }
+    }
     // retrypass1030：瞬时类失败章补抓（见 contentRetryPasses）；关时 0 轮，与改前逐字同序。
     for (let pass = contentRetryPasses(); pass > 0; pass -= 1) {
       const again = manifest.chapters.filter(c => c.status === 'failed' && RETRYABLE_CHAPTER_ERRORS.has(c.error));
@@ -424,7 +447,7 @@ export async function downloadBook(m, args, resolveSource, transport = fetchSour
     // 触发时按 preview_truncated partial 收口（零发布），16 轮退避换源重试免费源。
     {
       const doneChars = manifest.chapters.filter(c => c.status === 'done').map(c => c.chars).sort((a, b) => a - b);
-      if (doneChars.length >= 50 && doneChars[Math.floor(doneChars.length / 2)] < 500) throw new Error('preview_truncated');
+      if (doneChars.length >= PREVIEW_MIN_CHAPTERS && doneChars[Math.floor(doneChars.length / 2)] < PREVIEW_MAX_CHARS) throw new Error('preview_truncated');
     }
     const txt = manifest.chapters.map(c => `${c.title}\n\n${readFileSync(join(dir, c.file), 'utf8')}\n\n`).join('');
     atomic(join(dir, 'book.txt'), txt);
