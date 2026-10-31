@@ -147,6 +147,17 @@ export function previewEarly(env = process.env) {
 const PREVIEW_MIN_CHAPTERS = 50;
 const PREVIEW_MAX_CHARS = 500;
 
+// noticeskip1031：DOWNLOAD_NOTICE_PLACEHOLDER=1 时，章名是作者请假/无更/感言类公告、源站正文取空（empty_content_page /
+// empty_content）的章写占位文本按 done 收口（缺省/其他值 = 关，零行为变化：整章 failed → 全书 missing_chapters 不发布）。
+// 只认强公告词，「抱歉」「说明」「通知」等可能是正文章名的词不认；正文非空的公告章照常抓原文。
+// 动机（2026-10-31 phoenix 只读 + pc-linux 实网复现）：kxdu/92dxs 近完本书的缺章多是「…今晚无更」「…晚上无更」，
+// 源站该页只有「小编正在急急忙忙的手打」占位，同源重抓永远为空，整本因一条请假条作废换源。
+const NOTICE_TITLE = /请假|无更|断更|停更|休更|今[天晚日]不更|请个假|感言/;
+const NOTICE_TEXT = '（本章为作者公告，源站无正文。）';
+export function noticePlaceholder(env = process.env) {
+  return env.DOWNLOAD_NOTICE_PLACEHOLDER?.trim() === '1';
+}
+
 // hostburst1030：按站「连抓 N 次即静置 M 毫秒」DOWNLOAD_HOST_BURST_PAUSE（"站=N/M,站=N/M"；站按 stationKeyOfHost
 // 归一，www./m. 前缀互认；N 1..10000，M 封顶 600000）。缺省/未命中/非法项 = null（零行为变化）。
 // 静置在章与章之间、operation 超时之外进行（M 可远大于 timeout-ms），计数含本次下载的全部请求（搜索/详情/目录）。
@@ -386,11 +397,16 @@ export async function downloadBook(m, args, resolveSource, transport = fetchSour
         let fresh = false;
         if (text === undefined) {
           await burstGate();
+          const notice = noticePlaceholder() && NOTICE_TITLE.test(chapter.title);
           text = await operation(async ctx => {
             // bookcontent1029：目录用过的书籍成员（详情带回）同样交给正文。
             if (!builtin) return (await m.api.engineFetchContent(engine, chapter.url, ctx, true, stopUrls, chapter.title, selected.book)).text;
             return m.parser.parseSourceChapterText((await ctx.page(chapter.url)).text, chapter.title);
+          }).catch(error => {
+            if (notice && error?.message === 'empty_content_page') return '';
+            throw error;
           });
+          if (notice && !text.trim()) text = NOTICE_TEXT;
           fresh = true;
         }
         if (!text.trim()) throw new Error('empty_content');

@@ -708,6 +708,46 @@ describe('previewearly1031 付费墙预览提前收口', () => {
   }, 60_000);
 });
 
+// noticeskip1031：公告章正文取空写占位（DOWNLOAD_NOTICE_PLACEHOLDER，缺省关）。
+describe('noticeskip1031 公告章占位', () => {
+  afterEach(() => { vi.unstubAllEnvs(); });
+  /** 3 章书；第 2 章章名 middle、正文为空（strict 抛 empty_content_page）。 */
+  const wrap = (f: ReturnType<typeof setup>, middle: string) => async (url: string, opts: { signal: AbortSignal; beforeRequest?: (s: AbortSignal) => Promise<void> }) => {
+    if (url === 'https://book15.net/books/details1.html') {
+      const titles = ['第1章', middle, '第3章'];
+      return { url, text: `<h1>测试书</h1><div class="d-info-panel"><a href="/author/1">作者甲</a></div><meta property="og:novel:book_name" content="测试书"><meta property="og:novel:author" content="作者甲"><div class="d-chapter-list" id="full-catalog">${titles.map((t, i) => `<dd><a href="/read/${i + 1}">${t}</a></dd>`).join('')}</div>` };
+    }
+    if (url.includes('/read/')) {
+      return { url, text: `<li class="chapter-content" id="article-content">${url.endsWith('/read/2') ? '' : '<p>合成正文，离线测试。</p>'}</li>` };
+    }
+    return f.transport(url, opts);
+  };
+
+  it('缺省关：请假章取空照旧 missing_chapters', async () => {
+    const f = setup();
+    const r = await f.run(wrap(f, '第2章 今晚无更'));
+    expect(r.manifest.errors).toEqual(['missing_chapters']);
+    expect(r.manifest.chapters[1].error).toBe('empty_content_page');
+  });
+
+  it('开：请假章取空写占位按 done 收口，全书发布', async () => {
+    vi.stubEnv('DOWNLOAD_NOTICE_PLACEHOLDER', '1');
+    const f = setup();
+    const r = await f.run(wrap(f, '第2章 今晚无更'));
+    expect(r.code).toBe(0);
+    expect(r.manifest.status).toBe('done');
+    expect(readFileSync(join(dirname(r.manifestPath), '1.txt'), 'utf8')).toBe('（本章为作者公告，源站无正文。）');
+  });
+
+  it('开：非公告章名（含「抱歉」）取空照旧 failed', async () => {
+    vi.stubEnv('DOWNLOAD_NOTICE_PLACEHOLDER', '1');
+    const f = setup();
+    const r = await f.run(wrap(f, '第2章 抱歉'));
+    expect(r.manifest.errors).toEqual(['missing_chapters']);
+    expect(r.manifest.chapters[1].error).toBe('empty_content_page');
+  });
+});
+
 // failstreak1030：正文连续失败熔断（DOWNLOAD_CONTENT_FAIL_STREAK，缺省关）。
 describe('failstreak1030 正文连续失败熔断', () => {
   afterEach(() => { vi.unstubAllEnvs(); });
