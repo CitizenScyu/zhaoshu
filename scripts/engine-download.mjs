@@ -139,8 +139,8 @@ export function keepCached(env = process.env) {
 // 两种情形提前判 preview_truncated：
 // - 必中：目录 ≥ 50 章且短章（< 500 字）已过半——全书抓完中位数必 < 500，收尾闸门必判，后半本只是白抓；
 // - 开头：已 done ≥ 50 章且全是短章（xs.cn/xs8.cn 首章起即 ~190 字）。仅「>100 章、开头 50 章全短、后文过半长章」的书会误判（换源、不发布）。
-// 动机（2026-10-31 phoenix 只读，48h）：xs.cn/xs8.cn/hongxiu 15 本预览书逐章抓了约 9000 章（xs 系中位 186 字），
-// 其中 8 本收尾先因少数空页判 missing_chapters，付费墙闸门没走到；每本白抓上千章才换源。
+// 动机（2026-10-31 phoenix 只读，48h）：xs.cn/xs8.cn/hongxiu/cuoceng 15 本预览书逐章抓了约 9200 章（xs 系中位 186 字），
+// 只有 3 本走到 preview_truncated，余下多以 missing_chapters（少数空页）/ download_failed 收口；每本白抓上千章才换源。
 export function previewEarly(env = process.env) {
   return env.DOWNLOAD_PREVIEW_EARLY?.trim() === '1';
 }
