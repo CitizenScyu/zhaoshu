@@ -21,8 +21,8 @@ import { enginePostSearchEnabled, engineSearchJsActive } from './compile-smoke';
 import { preloadJsSandbox } from './js-sandbox';
 import { buildSearchRequestWithNet, evaluateWithFieldNet, prepareSearchJs, searchJsTemplateLimit } from './search-js';
 import { strictTocUnsupported } from './compile';
-import { engineSyntaxJsBindEnabled, engineTocFanoutFollowEnabled, engineTocNextSkipChapterEnabled } from './syntax-flags';
-import { RuleEngineError, type CompiledRules, type FieldIr, type SkippedField } from './types';
+import { engineContentTextNodesFallbackEnabled, engineSyntaxJsBindEnabled, engineTocFanoutFollowEnabled, engineTocNextSkipChapterEnabled } from './syntax-flags';
+import { RuleEngineError, type CompiledRules, type FieldIr, type RuleIr, type SkippedField } from './types';
 import { stripUrlOptions } from './url-options';
 
 export type { BookView };
@@ -67,6 +67,23 @@ function evaluateText(
 ): string {
   const ir = field(compiled, name);
   return ir ? evaluateField(ir, scope, multi) : '';
+}
+
+/**
+ * textnodes1031：正文规则（无 JS 链/makeUp）每支都是 `@textNodes` 末端的 CSS 时，返回末端换成 `@html` 的同形字段（`##` 尾缀照旧），
+ * 供该页取空时兜底；其余形态返回 undefined。
+ */
+function textNodesHtmlFallback(ir: FieldIr | undefined): FieldIr | undefined {
+  if (!ir || ir.chain || ir.makeUp || ir.rules.length === 0) return undefined;
+  const swap = (rule: RuleIr): RuleIr | undefined => {
+    if (rule.kind === 'or') {
+      const branches = rule.branches.map(swap);
+      return branches.every((b) => b !== undefined) ? { kind: 'or', branches: branches as RuleIr[] } : undefined;
+    }
+    return rule.kind === 'css' && rule.terminal?.op === 'textNodes' ? { ...rule, terminal: { op: 'html' } } : undefined;
+  };
+  const rules = ir.rules.map(swap);
+  return rules.every((r) => r !== undefined) ? { ...ir, rules: rules as RuleIr[] } : undefined;
 }
 
 /**
@@ -474,6 +491,7 @@ export async function engineFetchContent(
   const receivedPages = new Set<string>();
   const contentField = field(source.compiled, 'ruleContent.content');
   const convertContent = contentNeedsHtmlToText(contentField);
+  const htmlFallback = engineContentTextNodesFallbackEnabled() ? textNodesHtmlFallback(contentField) : undefined;
   let next = absoluteUrl(chapterUrl, source.url);
   // 下一章按本章 URL 绝对化（legado 以本章 redirectUrl 为基址）；过不了 host 门就不设判据（退回改前行为）。
   const stopKeys = new Set<string>();
@@ -518,7 +536,9 @@ export async function engineFetchContent(
     // evaluateText 的 @html 语义不变，简介等其它字段不受影响。
     // fieldnet1029：content 的 java.ajax 页面取回后重放（正文作用域不带袋，重放沿用同一份）。
     const raw = await withFieldNetPages(context, () => evaluateText(source.compiled, 'ruleContent.content', scope, true));
-    const content = convertContent ? contentHtmlToText(raw) : raw;
+    let content = convertContent ? contentHtmlToText(raw) : raw;
+    // textnodes1031：直接子文本取空（正文挪进了 <p> 等子元素）时同一选择器改取 @html 转纯文本。
+    if (htmlFallback && scope.kind === 'html' && !content.trim()) content = contentHtmlToText(evaluateField(htmlFallback, scope, true));
     if (strict && !content.trim()) throw new Error('empty_content_page');
     // 阻止验证码/改版空后页把半章送入成功缓存；调用方据此走既有章节换源流程。
     if (pageIndex > 0 && !content.trim()) throw new SourcePolicyError('书源正文后续页内容缺失，请重试或更换书源');

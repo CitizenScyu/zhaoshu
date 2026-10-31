@@ -933,6 +933,17 @@ export function engineTocFanoutFollowEnabled(env: OrEnv = process.env): boolean 
 }
 
 /**
+ * ENGINE_CONTENT_TEXTNODES_FALLBACK 独立开关（textnodes1031，默认 off，口径同 ENGINE_SYNTAX_OR）。正文规则每支都是 `@textNodes`
+ * 末端（含 XPath `/text()`）时只取直接子文本节点；站点改版把正文挪进 `<p>` 子元素后整章恒空（www.suduguu.com `.con@textNodes`：
+ * 2026-10-31 生产 7 天 117 本 0 章成功、占 empty_content_page 九成）。on = 该页取空时同一选择器改取 `@html` 并按正文口径转纯文本。
+ * off = 逐字不变。无新位：只改正文求值、只在原本必然失败的空页上生效。
+ */
+export function engineContentTextNodesFallbackEnabled(env: OrEnv = process.env): boolean {
+  const raw = env.ENGINE_CONTENT_TEXTNODES_FALLBACK?.trim().toLowerCase();
+  return raw === '1' || raw === 'true' || raw === 'on';
+}
+
+/**
  * ENGINE_TOC_STRICT_IGNORE_UPDATE_TIME 独立开关（toctime1030，默认 off，口径同 ENGINE_SYNTAX_OR）。strict 目录（下载）见任一 ruleToc
  * 字段编译被 skip 即抛 unsupported_toc_rule；ruleToc.updateTime 只供展示、目录求值不读（如 17k 的 `{{java.timeFormat(…)}}`），
  * 不该拦整本。on = 只有 updateTime 被 skip 时不抛。off = 逐字不变。无新位：只改下载目录门槛。
