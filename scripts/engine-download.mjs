@@ -165,6 +165,9 @@ export function noticePlaceholder(env = process.env) {
 // 类短标题作者话（标题中位 5 字，done 章 44506 章编号章占 99.99%）；noticeskip 只认强公告词，只救 10 本，加此判据可救 31 本。
 const NUMBERED_TITLE = /第[0-9０-９零〇一二三四五六七八九十百千万两]+[章节回]/;
 const STORY_TITLE = /番外|楔子|序|尾声|终章|后记|外传|结局|引子|卷/;
+// asidenum1031：只排除不计入编号书判据——章名以序号打头（「123.标题」「（12）」「第 12 章」「一、」「Chapter 3」）多是正文，
+// 取空照旧 failed。实证（2026-10-31 18:5x phoenix）：95dxs 一本 done 书里「NNN.标题」章取空被写成占位发布。
+const ORDINAL_TITLE = /^\s*[(（【[]?\s*第?\s*[0-9０-９零〇一二三四五六七八九十百千万两]+\s*(?:[章节回话集篇幕部]|[.．、:：,，_\-—\s)）】\]]|$)|chapter\s*\d/i;
 const ASIDE_TEXT = '（本章为非编号章节，源站无正文，疑为作者公告。）';
 export function noticeUnnumbered(env = process.env) {
   return env.DOWNLOAD_NOTICE_UNNUMBERED?.trim() === '1';
@@ -435,7 +438,7 @@ export async function downloadBook(m, args, resolveSource, transport = fetchSour
         if (text === undefined) {
           await burstGate();
           const notice = noticePlaceholder() && NOTICE_TITLE.test(chapter.title);
-          const aside = !notice && asideBook && !NUMBERED_TITLE.test(chapter.title) && !STORY_TITLE.test(chapter.title);
+          const aside = !notice && asideBook && !NUMBERED_TITLE.test(chapter.title) && !ORDINAL_TITLE.test(chapter.title) && !STORY_TITLE.test(chapter.title);
           text = await operation(async ctx => {
             // bookcontent1029：目录用过的书籍成员（详情带回）同样交给正文。
             if (!builtin) return (await m.api.engineFetchContent(engine, chapter.url, ctx, true, stopUrls, chapter.title, selected.book)).text;

@@ -785,16 +785,19 @@ describe('noticeaside1031 非编号章占位', () => {
 
   it('开：编号书里非编号章取空写占位，全书发布', async () => {
     vi.stubEnv('DOWNLOAD_NOTICE_UNNUMBERED', '1');
-    const f = setup();
-    const r = await f.run(wrap(f, '求月票'));
-    expect(r.code).toBe(0);
-    expect(r.manifest.status).toBe('done');
-    expect(readFileSync(join(dirname(r.manifestPath), '10.txt'), 'utf8')).toBe('（本章为非编号章节，源站无正文，疑为作者公告。）');
+    for (const aside of ['求月票', '三更求票']) { // 汉字数字打头但无分隔符的照旧算作者话
+      const f = setup();
+      const r = await f.run(wrap(f, aside));
+      expect(r.code).toBe(0);
+      expect(r.manifest.status).toBe('done');
+      expect(readFileSync(join(dirname(r.manifestPath), '10.txt'), 'utf8')).toBe('（本章为非编号章节，源站无正文，疑为作者公告。）');
+    }
   }, 60_000);
 
   it('开：番外/楔子类、编号章、小书取空照旧 failed', async () => {
     vi.stubEnv('DOWNLOAD_NOTICE_UNNUMBERED', '1');
-    for (const [aside, n] of [['番外一', 20], ['第11章', 20], ['求月票', 12]] as const) {
+    // asidenum1031：序号打头的章名（多是正文）同样不占位。
+    for (const [aside, n] of [['番外一', 20], ['第11章', 20], ['求月票', 12], ['123.夜雨', 20], ['（12）夜雨', 20], ['第 11 章', 20], ['一、夜雨', 20], ['Chapter 11', 20], ['11', 20]] as const) {
       const f = setup();
       const r = await f.run(wrap(f, aside, n));
       expect(r.manifest.errors).toEqual(['missing_chapters']);
