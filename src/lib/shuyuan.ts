@@ -904,6 +904,25 @@ export function isSameStationRedirectTarget(rawLocation: string, base: string, s
   return key !== '' && stationKeyOfUrl(target.href) === key;
 }
 
+// idxretry1031：SHUYUAN_FETCH_RETRY=1 时，yckceo 索引页与合集 JSON 拉取失败（非中止/非超预算）隔
+// FETCH_RETRY_DELAY_MS 重试一次。动机（2026-10-31 生产只读）：每日 10:00 cron 的索引页一次 'fetch failed'
+// （~10s，undici 连接超时形态）即整轮 502，探测/准入/同站跳转放行全部顺延 24h（10-29 同类失败靠人工重跑）。
+// 只重试上游拉取，不碰探测（连败计数口径不变）；缺省/其它值 = 关，零行为变化。
+export const FETCH_RETRY_DELAY_MS = 3_000;
+export function shuyuanFetchRetry(env: Record<string, string | undefined> = process.env): boolean {
+  return env.SHUYUAN_FETCH_RETRY?.trim() === '1';
+}
+
+async function fetchTextRetry(url: string, timeoutMs: number, signal: AbortSignal): Promise<string> {
+  try {
+    return await fetchText(url, timeoutMs, signal);
+  } catch (error) {
+    if (signal.aborted || !shuyuanFetchRetry()) throw error;
+    await raceDeadline(signal, () => new Promise((resolve) => setTimeout(resolve, FETCH_RETRY_DELAY_MS)));
+    return fetchText(url, timeoutMs, signal);
+  }
+}
+
 export async function fetchText(
   url: string, timeoutMs: number, parentSignal: AbortSignal, options: { sameStationOf?: string } = {},
 ): Promise<string> {
@@ -1618,7 +1637,7 @@ async function refreshWithinBudget(s: Sql, budget: RequestDeadline, signal: Abor
   const extraFeedFailures: ExtraFeedFailure[] = extraInvalid.map((raw) => ({
     feed: hostOf(raw), reason: 'env 条目非法：非 https 或无法解析',
   }));
-  const html = await fetchText(INDEX_URL, RESPONSE_TIMEOUT_MS * 2, signal);
+  const html = await fetchTextRetry(INDEX_URL, RESPONSE_TIMEOUT_MS * 2, signal);
   const entries = parseIndex(html);
   if (entries.length === 0) throw new Error('书源列表页解析到 0 个合集，页面结构可能变了');
 
@@ -1630,7 +1649,7 @@ async function refreshWithinBudget(s: Sql, budget: RequestDeadline, signal: Abor
     assertActive();
     let parsed: unknown;
     try {
-      parsed = JSON.parse(await fetchText(jsonUrl(entry.id), RESPONSE_TIMEOUT_MS, signal));
+      parsed = JSON.parse(await fetchTextRetry(jsonUrl(entry.id), RESPONSE_TIMEOUT_MS, signal));
     } catch (error) {
       assertActive();
       collectionFailures.push({ id: entry.id, reason: error instanceof Error ? error.message : '合集下载失败' });

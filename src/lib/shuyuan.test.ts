@@ -76,7 +76,7 @@ import {
   disableShuyuanSource, enableShuyuanSource, engineSourcesEnabled, getBuiltinRequestSource, getEngineSources, getFanoutPool, getReadingPool, getShuyuanCounts,
   getShuyuanPoolHealth, getShuyuanStats, getReadingSources, getSourcePools, refreshShuyuan,
   REFRESH_BUDGET_MS, PROBE_PENDING_PER_REFRESH, RESPONSE_TIMEOUT_MS, SHUYUAN_REFRESH_PARTIAL, ShuyuanRefreshPartialError,
-  ADMISSION_LEASE_ROW,
+  ADMISSION_LEASE_ROW, FETCH_RETRY_DELAY_MS, shuyuanFetchRetry,
 } from './shuyuan';
 import { resolveDownloadSource } from './download-source';
 import { assembleEngineModules, createResolveSource } from '../../runtime-download/engine';
@@ -294,6 +294,67 @@ describe('refreshShuyuan atomic refresh', () => {
     expect(transaction).not.toHaveBeenCalled();
     expect(execute).not.toHaveBeenCalled();
     expect(fetchMock).toHaveBeenCalledTimes(4);
+  });
+
+  // idxretry1031：上游拉取一次瞬时失败不再让整轮刷新 502（开关缺省关，零行为变化）。
+  describe('idxretry1031 上游拉取重试一次', () => {
+    const calls = (url: string) => fetchMock.mock.calls.filter(([input]) => String(input) === url).length;
+    function flakyOnce(url: string) {
+      const base = fetchMock.getMockImplementation()!;
+      let failed = false;
+      fetchMock.mockImplementation(async (input, options) => {
+        if (String(input) === url && !failed) { failed = true; throw new TypeError('fetch failed'); }
+        return base(input, options);
+      });
+    }
+    async function settle<T>(promise: Promise<T>): Promise<T> {
+      await vi.advanceTimersByTimeAsync(FETCH_RETRY_DELAY_MS);
+      return promise;
+    }
+
+    it('开关解析：只认 1', () => {
+      expect(shuyuanFetchRetry({})).toBe(false);
+      expect(shuyuanFetchRetry({ SHUYUAN_FETCH_RETRY: '0' })).toBe(false);
+      expect(shuyuanFetchRetry({ SHUYUAN_FETCH_RETRY: 'true' })).toBe(false);
+      expect(shuyuanFetchRetry({ SHUYUAN_FETCH_RETRY: ' 1 ' })).toBe(true);
+    });
+
+    it('关：索引页一次失败即整轮失败、不重试', async () => {
+      flakyOnce(indexUrl);
+      await expect(refreshShuyuan()).rejects.toThrow('fetch failed');
+      expect(calls(indexUrl)).toBe(1);
+      expect(transaction).not.toHaveBeenCalled();
+    });
+
+    it('开：索引页一次失败隔 3s 重试成功，照常刷新写库', async () => {
+      vi.stubEnv('SHUYUAN_FETCH_RETRY', '1');
+      vi.useFakeTimers();
+      flakyOnce(indexUrl);
+      await settle(refreshShuyuan());
+      expect(calls(indexUrl)).toBe(2);
+      expect(transaction.mock.calls[0][0].some((query) => query.text === 'DELETE FROM shuyuan_sources')).toBe(true);
+    });
+
+    it('开：合集一次网络失败重试成功，不再半挂中止', async () => {
+      vi.stubEnv('SHUYUAN_FETCH_RETRY', '1');
+      vi.useFakeTimers();
+      flakyOnce(collectionUrl(12));
+      await settle(refreshShuyuan());
+      expect(calls(collectionUrl(12))).toBe(2);
+      expect(transaction).toHaveBeenCalled();
+    });
+
+    it('开：合集持续失败只重试一次，仍按半挂中止、零写库', async () => {
+      vi.stubEnv('SHUYUAN_FETCH_RETRY', '1');
+      vi.useFakeTimers();
+      responses.set(collectionUrl(12), { body: 'unavailable', status: 503 });
+      const result = refreshShuyuan().catch((e: unknown) => e);
+      await vi.advanceTimersByTimeAsync(FETCH_RETRY_DELAY_MS);
+      expect(await result).toBeInstanceOf(ShuyuanRefreshPartialError);
+      expect(calls(collectionUrl(12))).toBe(2);
+      expect(transaction).not.toHaveBeenCalled();
+      expect(execute).not.toHaveBeenCalled();
+    });
   });
 
   // S3-1（静默失败审计）：半挂（只拉到部分合集）必须保持中止——写库是整表替换语义
