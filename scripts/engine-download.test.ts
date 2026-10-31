@@ -11,7 +11,10 @@ import fixtures from '../src/lib/rule-engine/fixtures/smoke-174.json';
 import { SourceHttpError } from '../src/lib/source-fetch';
 import { SourcePolicyError } from '../src/lib/source-policy';
 import { peerOutRoots, seedFromPeers } from '../runtime-download/resume-seed';
-import { breakerYield, chapterErrorKind, chapterResume, contentFailStreak, contentRetryPasses, contentStopBookPages, downloadBook, downloadOptions, errorKindOf, hostBurstPause, keepCached, noticeUnnumbered, numberedBook, policyCodeOf, recheckYield } from './engine-download.mjs';
+import { createHtmlScope, createJsonScope, evaluateField } from '../src/lib/rule-engine/evaluate';
+import { parseFieldRule } from '../src/lib/rule-engine/parse';
+import { RuleEngineError } from '../src/lib/rule-engine/types';
+import { breakerYield, chapterErrorKind, chapterResume, contentFailStreak, contentRetryPasses, contentStopBookPages, downloadBook, downloadOptions, errorKindOf, hostBurstPause, keepCached, noticeUnnumbered, numberedBook, policyCodeOf, recheckYield, ruleFailHint, ruleHintOf } from './engine-download.mjs';
 
 const dirs: string[] = [];
 afterEach(() => { vi.unstubAllGlobals(); for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
@@ -857,6 +860,52 @@ describe('chaperr1031 逐章失败类别', () => {
     const r2 = await g.run(wrap(g, () => new Error('empty_content_page')));
     expect((r2.manifest.chapters as Ch[])[1]).toMatchObject({ error: 'empty_content_page' });
     expect((r2.manifest.chapters as Ch[])[1].error_kind).toBeUndefined();
+  });
+});
+
+// rulehint1031：规则求值失败分类（DOWNLOAD_RULE_FAIL_HINT，缺省关）。
+describe('rulehint1031 规则求值失败分类', () => {
+  afterEach(() => { vi.unstubAllEnvs(); });
+  /** 用真引擎抛出的错误，免得报错文案漂移后分类悄悄失效。 */
+  const engineError = (rule: string, html: boolean) => {
+    try {
+      evaluateField(parseFieldRule(rule), html ? createHtmlScope('<p>拦截页</p>', 'https://h.example/') : createJsonScope({ a: 1 }, 'https://h.example/'));
+    } catch (error) { return error as Error; }
+    throw new Error('expected RuleEngineError');
+  };
+  /** 详情页取页即抛 fail()。 */
+  const wrap = (f: ReturnType<typeof setup>, fail: () => Error) => async (url: string, opts: { signal: AbortSignal; beforeRequest?: (s: AbortSignal) => Promise<void> }) => {
+    if (url === 'https://book15.net/books/details1.html') throw fail();
+    return f.transport(url, opts);
+  };
+
+  it('开关解析与分类（只落常量，不含报错原文）', () => {
+    expect(ruleFailHint()).toBe(false);
+    vi.stubEnv('DOWNLOAD_RULE_FAIL_HINT', ' 1 ');
+    expect(ruleFailHint()).toBe(true);
+    vi.stubEnv('DOWNLOAD_RULE_FAIL_HINT', 'on');
+    expect(ruleFailHint()).toBe(false);
+    expect(ruleHintOf(engineError('$.data[*].name', true))).toBe('JSON_RULE_ON_HTML');
+    expect(ruleHintOf(engineError('@css:div@text', false))).toBe('HTML_RULE_ON_JSON');
+    expect(ruleHintOf(new RuleEngineError('RULE_EVAL_FAILED', 'JS 执行失败：SyntaxError: unexpected token in JSON at <html>'))).toBe('JS_EXEC:SyntaxError');
+    expect(ruleHintOf(new RuleEngineError('RULE_EVAL_FAILED', 'JS 执行预算耗尽（该段代码）'))).toBe('JS_BUDGET');
+    expect(ruleHintOf(new RuleEngineError('RULE_EVAL_FAILED', '某种新报错 https://x.example/'))).toBe('OTHER');
+    expect(ruleHintOf(undefined)).toBe('OTHER');
+  });
+
+  it('缺省关：无 failure_hint（零行为变化）；开：RuleEngineError 记分类', async () => {
+    type M = { failure_name?: string; failure_hint?: string };
+    const f = setup();
+    const r = await f.run(wrap(f, () => engineError('$.data[*].name', true)));
+    expect((r.manifest as M).failure_name).toBe('RuleEngineError');
+    expect((r.manifest as M).failure_hint).toBeUndefined();
+    vi.stubEnv('DOWNLOAD_RULE_FAIL_HINT', '1');
+    const g = setup();
+    const r2 = await g.run(wrap(g, () => engineError('$.data[*].name', true)));
+    expect(r2.manifest).toMatchObject({ failure_name: 'RuleEngineError', failure_hint: 'JSON_RULE_ON_HTML' });
+    const h = setup();
+    const r3 = await h.run(wrap(h, () => new TypeError('boom')));
+    expect((r3.manifest as M).failure_hint).toBeUndefined(); // 非规则异常不记
   });
 });
 

@@ -197,6 +197,32 @@ export function errorKindOf(error) {
   return name + status + (code ? `:${code}` : '');
 }
 
+// rulehint1031：DOWNLOAD_RULE_FAIL_HINT=1 时，download_failed 且异常是 RuleEngineError 的 manifest 另记 failure_hint =
+// 规则求值失败的固定分类（按引擎自身的常量报错前缀归类，不落报错原文、规则与页面内容）。缺省/其他值 = 关（零行为变化）。
+// 动机（2026-10-31 phoenix 只读，24h）：appi.kuwo.cn 15 本 RULE_EVAL_FAILED@toc、m.92dxs @detail，PC 用生产全链复现不出，
+// 疑 phoenix 出口拿到的响应形态不同（如 JSON 接口回了 HTML 拦截页）；JSON_RULE_ON_HTML / JS_EXEC:SyntaxError 即可佐证，无需出网。
+export function ruleFailHint(env = process.env) {
+  return env.DOWNLOAD_RULE_FAIL_HINT?.trim() === '1';
+}
+const RULE_HINTS = [
+  [/不能对 HTML 输入求值|在 HTML 输入上不是合法/, 'JSON_RULE_ON_HTML'],
+  [/不能对 JSON (?:输入|条目)求值/, 'HTML_RULE_ON_JSON'],
+  [/预算耗尽/, 'JS_BUDGET'],
+  [/jsLib 求值失败/, 'JS_LIB'],
+  [/宿主回调失败/, 'JS_HOST'],
+  [/页面未取/, 'NET_PENDING'],
+  [/^jsoup:/, 'JSOUP'],
+  [/JS (?:输入|输出)过大/, 'JS_SIZE'],
+  [/列表 JS|init JS|结果无法读取|JS 沙箱/, 'JS_RESULT'],
+];
+export function ruleHintOf(error) {
+  const message = typeof error?.message === 'string' ? error.message : '';
+  const exec = /JS 执行失败：([A-Za-z]{1,32})/.exec(message);
+  if (exec) return `JS_EXEC:${exec[1]}`;
+  for (const [pattern, hint] of RULE_HINTS) if (pattern.test(message)) return hint;
+  return 'OTHER';
+}
+
 // hostburst1030：按站「连抓 N 次即静置 M 毫秒」DOWNLOAD_HOST_BURST_PAUSE（"站=N/M,站=N/M"；站按 stationKeyOfHost
 // 归一，www./m. 前缀互认；N 1..10000，M 封顶 600000）。缺省/未命中/非法项 = null（零行为变化）。
 // 静置在章与章之间、operation 超时之外进行（M 可远大于 timeout-ms），计数含本次下载的全部请求（搜索/详情/目录）。
@@ -537,6 +563,7 @@ export async function downloadBook(m, args, resolveSource, transport = fetchSour
       manifest.failure_phase = stage;
       const code = typeof error?.code === 'string' ? error.code : error?.name === 'SourcePolicyError' ? policyCodeOf(error.message) : '';
       if (/^[A-Z][A-Z0-9_]{1,39}$/.test(code)) manifest.failure_code = code;
+      if (manifest.failure_name === 'RuleEngineError' && ruleFailHint()) manifest.failure_hint = ruleHintOf(error);
     }
   } finally {
     try {
