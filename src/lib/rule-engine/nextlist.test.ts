@@ -6,7 +6,7 @@ import { engineFetchContent, engineFetchToc, type EngineSource } from './api';
 import { compileSource } from './compile';
 import { createScope, evaluateField, evaluateFieldStrings, normalizeBody } from './evaluate';
 import { parseFieldRule } from './parse';
-import { engineSyntaxNextListEnabled, engineTocNextSkipChapterEnabled } from './syntax-flags';
+import { engineSyntaxNextListEnabled, engineTocFanoutFollowEnabled, engineTocNextSkipChapterEnabled } from './syntax-flags';
 
 const SITE = 'https://book15.net'; // 过 host 门（.example 保留域取页被拒）
 const on = (rule: string, field = 'ruleToc.nextTocUrl', extra = {}) => parseFieldRule(rule, { field, nextListEnabled: true, ...extra });
@@ -26,6 +26,9 @@ describe('开关', () => {
     expect(engineTocNextSkipChapterEnabled({})).toBe(false);
     expect(engineTocNextSkipChapterEnabled({ ENGINE_TOC_NEXT_SKIP_CHAPTER: 'yes' })).toBe(false);
     expect(engineTocNextSkipChapterEnabled({ ENGINE_TOC_NEXT_SKIP_CHAPTER: ' On ' })).toBe(true);
+    expect(engineTocFanoutFollowEnabled({})).toBe(false);
+    expect(engineTocFanoutFollowEnabled({ ENGINE_TOC_FANOUT_FOLLOW: 'yes' })).toBe(false);
+    expect(engineTocFanoutFollowEnabled({ ENGINE_TOC_FANOUT_FOLLOW: ' On ' })).toBe(true);
   });
 });
 
@@ -146,6 +149,43 @@ describe('门面', () => {
     expect(seen).toEqual([`${SITE}/t/1.html`, `${SITE}/t/2.html`]);
     vi.stubEnv('ENGINE_TOC_NEXT_SKIP_CHAPTER', '0');
     await expect(engineFetchToc(src(rules('text.下一@href')), `${SITE}/t/1.html`, ctx(pages, []), true)).rejects.toThrow('empty_toc_page');
+  });
+
+  it('目录：窗口式页码条（tocfollow1031）on 并发页补抓中间页并按页码排序；off 截断', async () => {
+    // sfwx 形态：目录首页 /b/ 只列 1/2/3/>/末页，第 k 页列 k-1..k+1、>、末页；首页与第 1 页同内容。
+    const last = 6;
+    const bar = (k: number) => {
+      const nums = k === 0 ? [1, 2, 3] : [k - 1, k, k + 1].filter((n) => n >= 1 && n <= last);
+      const link = (n: number, label: string) => `<a href="/b/index_${n}.html">${label}</a>`;
+      return `<div class="pg">${nums.map((n) => link(n, String(n))).join('')}${k < last ? link(Math.max(k, 1) + 1, '&gt;') : ''}${link(last, '')}</div>`;
+    };
+    const pages = new Map([[`${SITE}/b/`, `<ul>${ch(1)}</ul>${bar(0)}`],
+      ...Array.from({ length: last }, (_, i) => [`${SITE}/b/index_${i + 1}.html`, `<ul>${ch(i + 1)}</ul>${bar(i + 1)}`] as [string, string])]);
+    const rules = { ruleToc: { chapterList: '.ch', chapterName: 'a@text', chapterUrl: 'a@href', nextTocUrl: 'class.pg@tag.a@href' } };
+    vi.stubEnv('ENGINE_SYNTAX_NEXT_LIST', '1');
+    const offToc = await engineFetchToc(src(rules), `${SITE}/b/`, ctx(pages, []), true);
+    expect(offToc.chapters.map((c) => c.title)).toEqual(['第1章', '第2章', '第3章', '第6章']);
+    vi.stubEnv('ENGINE_TOC_FANOUT_FOLLOW', '1');
+    const seen: string[] = [];
+    const toc = await engineFetchToc(src(rules), `${SITE}/b/`, ctx(pages, seen), true);
+    expect(toc.chapters.map((c) => c.title)).toEqual([1, 2, 3, 4, 5, 6].map((n) => `第${n}章`));
+    expect(seen).toHaveLength(last + 1);
+    expect(new Set(seen).size).toBe(last + 1);
+  });
+
+  it('目录：tocfollow1031 补抓页 URL 排不出页序时 strict 抛 toc_limit，非 strict 按取回顺序', async () => {
+    const pages = new Map([
+      [`${SITE}/b/`, `<ul>${ch(1)}</ul><div class="pg"><a href="/t/2.html">2</a><a href="/u/9.html">末</a></div>`],
+      [`${SITE}/t/2.html`, `<ul>${ch(2)}</ul><div class="pg"><a href="/t/3.html">3</a></div>`],
+      [`${SITE}/t/3.html`, `<ul>${ch(3)}</ul>`],
+      [`${SITE}/u/9.html`, `<ul>${ch(9)}</ul>`],
+    ]);
+    const rules = { ruleToc: { chapterList: '.ch', chapterName: 'a@text', chapterUrl: 'a@href', nextTocUrl: 'class.pg@tag.a@href' } };
+    vi.stubEnv('ENGINE_SYNTAX_NEXT_LIST', '1');
+    vi.stubEnv('ENGINE_TOC_FANOUT_FOLLOW', '1');
+    await expect(engineFetchToc(src(rules), `${SITE}/b/`, ctx(pages, []), true)).rejects.toThrow('toc_limit');
+    const toc = await engineFetchToc(src(rules), `${SITE}/b/`, ctx(pages, []));
+    expect(toc.chapters.map((c) => c.title)).toEqual(['第1章', '第2章', '第9章', '第3章']);
   });
 
   it('正文：下一页最后指向下一章时停，与 off 同结果', async () => {

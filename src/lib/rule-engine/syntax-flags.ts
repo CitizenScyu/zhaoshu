@@ -922,6 +922,17 @@ export function engineTocNextSkipChapterEnabled(env: OrEnv = process.env): boole
 }
 
 /**
+ * ENGINE_TOC_FANOUT_FOLLOW 独立开关（tocfollow1031，默认 off，口径同 ENGINE_SYNTAX_OR）。nextList 目录翻页（api.ts listFanout）
+ * 首页一次给出多页后这些页不再取下一页（legado 并发分支同款）；窗口式页码条（sfwx `.page-item@a@href` 首页只列 1/2/3/>/末页）
+ * 因此漏掉中间页，目录被静默截断，下载走到断口处「下一章」链跑出目录 → operation_timeout。on = 并发页上照样求翻页规则、
+ * 补抓未见页，取完按 URL 中唯一变化的页码数字重排；URL 不同形排不出序时 strict 抛 toc_limit。off = 逐字不变。无新位：只改目录求值。
+ */
+export function engineTocFanoutFollowEnabled(env: OrEnv = process.env): boolean {
+  const raw = env.ENGINE_TOC_FANOUT_FOLLOW?.trim().toLowerCase();
+  return raw === '1' || raw === 'true' || raw === 'on';
+}
+
+/**
  * ENGINE_TOC_STRICT_IGNORE_UPDATE_TIME 独立开关（toctime1030，默认 off，口径同 ENGINE_SYNTAX_OR）。strict 目录（下载）见任一 ruleToc
  * 字段编译被 skip 即抛 unsupported_toc_rule；ruleToc.updateTime 只供展示、目录求值不读（如 17k 的 `{{java.timeFormat(…)}}`），
  * 不该拦整本。on = 只有 updateTime 被 skip 时不抛。off = 逐字不变。无新位：只改下载目录门槛。

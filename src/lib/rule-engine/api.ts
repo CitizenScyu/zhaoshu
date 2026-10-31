@@ -21,7 +21,7 @@ import { enginePostSearchEnabled, engineSearchJsActive } from './compile-smoke';
 import { preloadJsSandbox } from './js-sandbox';
 import { buildSearchRequestWithNet, evaluateWithFieldNet, prepareSearchJs, searchJsTemplateLimit } from './search-js';
 import { strictTocUnsupported } from './compile';
-import { engineSyntaxJsBindEnabled, engineTocNextSkipChapterEnabled } from './syntax-flags';
+import { engineSyntaxJsBindEnabled, engineTocFanoutFollowEnabled, engineTocNextSkipChapterEnabled } from './syntax-flags';
 import { RuleEngineError, type CompiledRules, type FieldIr, type SkippedField } from './types';
 import { stripUrlOptions } from './url-options';
 
@@ -144,6 +144,18 @@ function chainNextUrls(
     urls.push(url);
   }
   return urls;
+}
+
+/** tocfollow1031：并发页 URL 同形且只有一处数字不同（index_2/index_14）时以该数字为页序；排不出返回 undefined。 */
+function fanoutPageOrder(urls: readonly string[]): Map<string, number> | undefined {
+  const parts = urls.map((url) => url.split(/(\d+)/));
+  const shape = (p: string[]) => p.map((s, i) => (i % 2 ? '#' : s)).join('');
+  if (parts.some((p) => shape(p) !== shape(parts[0]))) return undefined;
+  const varying = new Set<number>();
+  for (const p of parts) p.forEach((s, i) => { if (i % 2 && s !== parts[0][i]) varying.add(i); });
+  if (varying.size > 1) return undefined;
+  const [at] = varying;
+  return new Map(urls.map((url, i) => [url, at === undefined ? 0 : Number(parts[i][at])]));
 }
 
 /**
@@ -318,6 +330,10 @@ export async function engineFetchToc(
   // nextlist1029：并发页来自 nextList 字段（off 态只读得到首页）时，非 strict 按本源余量截断、交已读页，
   // 不让 web 非首源的 L1 单源点数把整个目录打成 SOURCE_SCOPE_EXHAUSTED。JS 链的并发页不受影响。
   let listFanout = false;
+  // tocfollow1031：并发页上补抓到的新页（off 恒 false）；entryFanout[i] = 条目 i 所在并发页 URL（非并发页为 undefined）。
+  const followFanout = engineTocFanoutFollowEnabled();
+  let followed = false;
+  const entryFanout: (string | undefined)[] = [];
   for (let pageIndex = 0; (next || fanout.length > 0) && pageIndex < MAX_TOC_PAGES && seenUrls.size <= MAX_SOURCE_CHAPTERS; pageIndex += 1) {
     const fromFanout = !next;
     // 脚本侧（engine-download）的 context 是只带 page 的裸对象：没有余量查询即不截断。
@@ -362,17 +378,26 @@ export async function engineFetchToc(
         validChapters += 1;
         seenUrls.add(chapterUrl);
         entries.push({ url: chapterUrl, title });
+        entryFanout.push(fromFanout ? next : undefined);
         if (seenUrls.size > MAX_SOURCE_CHAPTERS) break;
       }
     }
     if (strict && validChapters === 0) throw new Error('empty_toc_page');
     // 已声明并跟随的后页缺内容，不能把前页目录作为完整成功；不改变首页/章节URL兜底语义。
     if (pageIndex > 0 && validChapters === 0) throw new SourcePolicyError('书源目录后续页未提供有效章节，请重试或更换书源');
+    const nextField = field(source.compiled, 'ruleToc.nextTocUrl');
     if (fromFanout) {
+      // tocfollow1031：窗口式页码条只列邻近页，并发页上再求一次翻页规则补抓未见页（非 strict 口径：坏链只丢不抛）。
+      if (followFanout && listFanout && nextUsesList(nextField, scope) && nextField.nextList === true) {
+        let urls = chainNextUrls(nextField, scope, page.url, false, visited);
+        if (engineTocNextSkipChapterEnabled()) urls = urls.filter((url) => !seenUrls.has(url));
+        const fresh = urls.filter((url) => !fanout.includes(url));
+        fanout.push(...fresh);
+        followed ||= fresh.length > 0;
+      }
       next = undefined;
       continue;
     }
-    const nextField = field(source.compiled, 'ruleToc.nextTocUrl');
     if (nextUsesList(nextField, scope)) {
       // JS 链在 JSON 页上照样求值（JS 段常用来解析 JSON 拼下一页）。
       let urls = chainNextUrls(nextField, scope, page.url, strict, nextField.nextList ? visited : undefined);
@@ -391,6 +416,15 @@ export async function engineFetchToc(
     if (strict && rawNext.trim() && !next) throw new Error('invalid_next_page');
   }
   if (strict && (next || fanout.length > 0 || seenUrls.size > MAX_SOURCE_CHAPTERS)) throw new Error('toc_limit');
+  if (followed) {
+    // tocfollow1031：补抓页按发现顺序取回（第 2 页上才见到第 4 页、却排在末页之后），按页码重排；非并发页（首页）在前。
+    const order = fanoutPageOrder([...new Set(entryFanout.filter((url): url is string => url !== undefined))]);
+    if (order) {
+      const rank = (index: number) => { const url = entryFanout[index]; return url === undefined ? -1 : order.get(url)!; };
+      entries.map((_, index) => index).sort((a, b) => rank(a) - rank(b)).map((index) => entries[index])
+        .forEach((chapter, index) => { entries[index] = chapter; });
+    } else if (strict) throw new Error('toc_limit');
+  }
   // listjs1027：`-` 前缀时 legado 跳过去重前的那次反转，净效果 = 全部页的条目整表反转后再走下面的去重。
   if (field(source.compiled, 'ruleToc.chapterList')?.reverse === true) entries.reverse();
   // 保留每个 url 的**最后一次**出现。最后一次出现的位置严格递增，故按原序过滤即得 legado 净顺序。
