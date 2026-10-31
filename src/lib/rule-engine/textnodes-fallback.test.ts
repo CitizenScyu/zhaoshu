@@ -40,12 +40,14 @@ describe('textnodes1031 正文 @textNodes 取空兜底', () => {
 
   it('on：|| 全部是 @textNodes 支才兜底，首个非空支的结果不变', async () => {
     vi.stubEnv('ENGINE_CONTENT_TEXTNODES_FALLBACK', '1');
+    vi.stubEnv('ENGINE_SYNTAX_OR', '1');
     expect((await read('#nr@textNodes||.con@textNodes', pPage)).text).toBe('　　第一段&。\n　　第二段。');
     await expect(read('#nr@text||.con@textNodes', pPage)).rejects.toThrow('empty_content_page');
   });
 
-  it('on：XPath /text() 同口径', async () => {
+  it('on：XPath /text() 同口径（www.bqgns.com 形态）', async () => {
     vi.stubEnv('ENGINE_CONTENT_TEXTNODES_FALLBACK', '1');
+    vi.stubEnv('ENGINE_SYNTAX_XPATH', '1');
     expect((await read("//div[@class='con']/text()", pPage)).text).toBe('　　第一段&。\n　　第二段。');
   });
 
