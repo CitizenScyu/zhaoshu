@@ -826,7 +826,11 @@ describe('chaperr1031 逐章失败类别', () => {
     expect(errorKindOf(new SourceHttpError(502))).toMatch(/^[A-Za-z]+:502$/);
     expect(errorKindOf(new TypeError('fetch failed https://x.example/a', { cause: { code: 'ECONNRESET' } }))).toBe('TypeError:ECONNRESET');
     expect(errorKindOf(new SourcePolicyError('书源正文跳转到了目录中的其他章节，请重试或更换书源'))).toMatch(/^SourcePolicyError:POLICY_[A-Z_]+$/);
-    expect(errorKindOf(Object.assign(new Error('x'), { name: 'Bad Name!', code: 'lower' }))).toBe('unknown');
+    expect(errorKindOf(Object.assign(new Error('x'), { name: 'Bad Name!', code: 'lower' }))).toBe('Error');
+    // 非 Error 抛出物：name 缺失不得落成 "undefined"（生产 15:34 首批 4 章即此形）。
+    expect(errorKindOf({ status: 500 })).toBe('Object:500');
+    expect(errorKindOf(Object.create(null))).toBe('unknown');
+    expect(errorKindOf(undefined)).toBe('unknown');
   });
 
   it('缺省关：只有 chapter_failed、无 error_kind（零行为变化）', async () => {

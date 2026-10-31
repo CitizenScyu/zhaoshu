@@ -182,8 +182,12 @@ export function chapterErrorKind(env = process.env) {
   return env.DOWNLOAD_CHAPTER_ERROR_KIND?.trim() === '1';
 }
 const CONST_CODE = /^[A-Z][A-Z0-9_]{1,39}$/;
+const SAFE_NAME = /^[A-Za-z]{1,32}$/;
 export function errorKindOf(error) {
-  const name = /^[A-Za-z]{1,32}$/.test(error?.name) ? error.name : 'unknown';
+  // name 缺失（非 Error 抛出物）时退到构造器名；先判 typeof，免得 regex 把 undefined 字面量化成 "undefined"。
+  const ctor = error?.constructor?.name;
+  const name = typeof error?.name === 'string' && SAFE_NAME.test(error.name) ? error.name
+    : typeof ctor === 'string' && SAFE_NAME.test(ctor) ? ctor : 'unknown';
   const status = Number.isInteger(error?.status) && error.status >= 100 && error.status <= 599 ? `:${error.status}` : '';
   const own = typeof error?.code === 'string' ? error.code : error?.name === 'SourcePolicyError' ? policyCodeOf(error.message) : '';
   const code = CONST_CODE.test(own) ? own : typeof error?.cause?.code === 'string' && CONST_CODE.test(error.cause.code) ? error.cause.code : '';
