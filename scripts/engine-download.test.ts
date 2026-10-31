@@ -763,9 +763,11 @@ describe('chaperr1031 逐章失败类别', () => {
   type Ch = { error?: string; error_kind?: string };
 
   it('开关解析与类别形态（不含上游文本）', () => {
-    expect(chapterErrorKind({})).toBe(false);
-    expect(chapterErrorKind({ DOWNLOAD_CHAPTER_ERROR_KIND: ' 1 ' })).toBe(true);
-    expect(chapterErrorKind({ DOWNLOAD_CHAPTER_ERROR_KIND: 'on' })).toBe(false);
+    expect(chapterErrorKind()).toBe(false);
+    vi.stubEnv('DOWNLOAD_CHAPTER_ERROR_KIND', ' 1 ');
+    expect(chapterErrorKind()).toBe(true);
+    vi.stubEnv('DOWNLOAD_CHAPTER_ERROR_KIND', 'on');
+    expect(chapterErrorKind()).toBe(false);
     expect(errorKindOf(new SourceHttpError(502))).toMatch(/^[A-Za-z]+:502$/);
     expect(errorKindOf(new TypeError('fetch failed https://x.example/a', { cause: { code: 'ECONNRESET' } }))).toBe('TypeError:ECONNRESET');
     expect(errorKindOf(new SourcePolicyError('书源正文跳转到了目录中的其他章节，请重试或更换书源'))).toMatch(/^SourcePolicyError:POLICY_[A-Z_]+$/);
