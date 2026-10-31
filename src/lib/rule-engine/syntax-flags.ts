@@ -952,3 +952,23 @@ export function engineTocStrictIgnoreUpdateTimeEnabled(env: OrEnv = process.env)
   const raw = env.ENGINE_TOC_STRICT_IGNORE_UPDATE_TIME?.trim().toLowerCase();
   return raw === '1' || raw === 'true' || raw === 'on';
 }
+
+/**
+ * ENGINE_JS_PRELUDE_GRACE 独立开关（preludegrace1031，默认 off，口径同 ENGINE_SYNTAX_OR）。沙箱每次求值新建 runtime 并重跑 prelude，
+ * 250ms 中断时限从建 runtime 起算；2 核 20 实例同时重启时 prelude 会被挤过时限（「JS 沙箱初始化失败」）。on = 宿主装配 + prelude
+ * 另给 2s，规则代码（jsLib + 规则 JS）从 prelude 后起算 250ms。off = 逐字不变。无新位：预算计账与上限不变。
+ */
+export function engineJsPreludeGraceEnabled(env: OrEnv = process.env): boolean {
+  const raw = env.ENGINE_JS_PRELUDE_GRACE?.trim().toLowerCase();
+  return raw === '1' || raw === 'true' || raw === 'on';
+}
+
+/**
+ * ENGINE_JS_PURE_MEMO 独立开关（purememo1031，默认 off，口径同 ENGINE_SYNTAX_OR）。规则级 makeUp 的 `{{JS}}` 只读 baseUrl、只用纯字符串
+ * 方法时（如 kuwo 目录 chapterUrl `{{baseUrl.replace('?paging=0','')}}`），同页每条结果相同，却逐条进沙箱：千章目录在生产 2 核满载下
+ * 每条超出免计账额度，撞「JS 执行预算耗尽（该段代码）」。on = 这类代码按（代码, baseUrl）记忆结果，同值只进一次沙箱。off = 逐字不变。
+ */
+export function engineJsPureMemoEnabled(env: OrEnv = process.env): boolean {
+  const raw = env.ENGINE_JS_PURE_MEMO?.trim().toLowerCase();
+  return raw === '1' || raw === 'true' || raw === 'on';
+}

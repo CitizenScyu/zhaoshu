@@ -18,6 +18,7 @@ import { isDocument, isJElement, type JElement } from './jsoup-dom';
 import { docApi, registerHtmlDoc } from './jsoup-shim';
 import { evalJsonPath, evalJsonPathList, isDefinitePath, parseJsonPath } from './jsonpath';
 import { defaultSyntaxSource } from './parse';
+import { engineJsPureMemoEnabled } from './syntax-flags';
 import { evaluateXPath } from './xpath-eval';
 import {
   applyTerminal,
@@ -694,13 +695,53 @@ function makeUpText(parts: readonly JsTemplatePart[], scope: EvalScope, multi: b
     else if (part.kind === 'rule') text += evaluateField(part.field, scope, multi);
     else if (part.kind === 'get') text += varGet(part.key, scope);
     else {
-      const out = runJs(part.code, { result: scope.source ?? '', src: scope.source, baseUrl: scope.pageUrl, ...hostBindings(scope), ...jsLibBinding() });
+      const out = templateJs(part.code, scope);
       if (Array.isArray(out)) return evalFailed('模板 {{JS}} 返回了数组（legado 按 NativeArray.toString 拼，不复现）');
       if (out !== null) text += out;
     }
     if (text.length > MAX_MADE_UP_CHARS) return evalFailed('模板 makeUp 后过长');
   }
   return text;
+}
+
+/**
+ * purememo1031（ENGINE_JS_PURE_MEMO）：模板 `{{JS}}` 去掉字符串字面量后不含 `` ` / \ [ ] { } ``、标识符全在下列纯字符串名单里时，
+ * 结果只取决于 baseUrl（不读 result/src/java/book/chapter），按（代码, baseUrl）记忆；挂 jsLib 的字段不记（库可改写原型）。
+ */
+const PURE_TEMPLATE_NAMES: ReadonlySet<string> = new Set([
+  'baseUrl', 'String', 'Number', 'parseInt', 'parseFloat', 'encodeURIComponent', 'decodeURIComponent', 'encodeURI', 'decodeURI',
+  'replace', 'replaceAll', 'split', 'join', 'slice', 'substring', 'substr', 'indexOf', 'lastIndexOf', 'includes', 'startsWith', 'endsWith',
+  'trim', 'trimStart', 'trimEnd', 'toLowerCase', 'toUpperCase', 'length', 'concat', 'padStart', 'padEnd', 'charAt', 'toString',
+]);
+const MAX_PURE_TEMPLATE_MEMO = 256;
+const pureTemplateVerdicts = new Map<string, boolean>();
+const pureTemplateMemo = new Map<string, JsValue | null>();
+
+export function pureTemplateJs(code: string): boolean {
+  let verdict = pureTemplateVerdicts.get(code);
+  if (verdict === undefined) {
+    const bare = code.replace(/'(?:[^'\\\n]|\\.)*'|"(?:[^"\\\n]|\\.)*"/g, ' ');
+    verdict = !/[`'"/\\[\]{}]/.test(bare) && (bare.match(/[A-Za-z_$][\w$]*/g) ?? []).every((name) => PURE_TEMPLATE_NAMES.has(name));
+    if (pureTemplateVerdicts.size >= MAX_PURE_TEMPLATE_MEMO * 4) pureTemplateVerdicts.clear();
+    pureTemplateVerdicts.set(code, verdict);
+  }
+  return verdict;
+}
+
+function templateJs(code: string, scope: EvalScope): JsValue | null {
+  const run = () => runJs(code, { result: scope.source ?? '', src: scope.source, baseUrl: scope.pageUrl, ...hostBindings(scope), ...jsLibBinding() });
+  if (fieldJsLib !== undefined || !engineJsPureMemoEnabled() || !pureTemplateJs(code)) return run();
+  const key = `${code}\0${scope.pageUrl}`;
+  if (pureTemplateMemo.has(key)) {
+    const hit = pureTemplateMemo.get(key)!;
+    pureTemplateMemo.delete(key); // 触达即续期（Map 插入序 = LRU 序）
+    pureTemplateMemo.set(key, hit);
+    return hit;
+  }
+  const out = run();
+  pureTemplateMemo.set(key, out);
+  while (pureTemplateMemo.size > MAX_PURE_TEMPLATE_MEMO) pureTemplateMemo.delete(pureTemplateMemo.keys().next().value!);
+  return out;
 }
 
 /** makeUp 切出的正则（`split("##")` 第 2/3 段，≥4 段 replaceFirst）；正则段为空不替换。 */

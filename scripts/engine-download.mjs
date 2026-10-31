@@ -207,14 +207,20 @@ export function ruleFailHint(env = process.env) {
 const RULE_HINTS = [
   [/不能对 HTML 输入求值|在 HTML 输入上不是合法/, 'JSON_RULE_ON_HTML'],
   [/不能对 JSON (?:输入|条目)求值/, 'HTML_RULE_ON_JSON'],
+  // 生产 kuwo @toc 落在 JS_BUDGET（23:10 复查），分进程总账与单段代码账。
+  [/预算耗尽（进程）/, 'JS_BUDGET_PROC'],
+  [/预算耗尽（该段代码）/, 'JS_BUDGET_CODE'],
   [/预算耗尽/, 'JS_BUDGET'],
   [/jsLib 求值失败/, 'JS_LIB'],
   [/宿主回调失败/, 'JS_HOST'],
   [/页面未取/, 'NET_PENDING'],
   [/^jsoup:/, 'JSOUP'],
   [/JS (?:输入|输出)过大/, 'JS_SIZE'],
-  // 生产首例（21:06 后 95dxs @detail）落在旧的合并类 JS_RESULT，分不出沙箱没就绪还是规则结果形态不对，拆细。
-  [/JS 沙箱(?:未就绪|初始化失败)/, 'JS_NOT_READY'],
+  // 生产首例（21:06 后 95dxs @detail）落在旧的合并类 JS_RESULT，分不出沙箱没就绪还是规则结果形态不对，拆细；
+  // 两例都在重启后约 33s（2 核 20 实例同时冷启动），再分 prelude 被挤过时限 / 异常丢弃后重载中 / 真未加载。
+  [/JS 沙箱未就绪（异常后重载中）/, 'JS_RELOAD'],
+  [/JS 沙箱未就绪/, 'JS_NOT_READY'],
+  [/JS 沙箱初始化失败/, 'JS_PRELUDE'],
   [/JS 沙箱异常/, 'JS_SANDBOX'],
   [/init JS/, 'JS_INIT'],
   [/列表 JS/, 'JS_LIST'],

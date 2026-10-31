@@ -19,6 +19,7 @@ import {
   decodeJsoupInit, decodeJsoupItems, decodeJsoupValue, exportJsoup, installJsoupHost, JSOUP_PRELUDE, type JsoupListItem, type JsoupMode,
   JsoupSession,
 } from './jsoup-shim';
+import { engineJsPreludeGraceEnabled } from './syntax-flags';
 import { RuleEngineError } from './types';
 
 const WASM_INITIAL_PAGES = 256; // 16MB
@@ -26,6 +27,11 @@ const WASM_MAXIMUM_PAGES = 1024; // 64MB
 const RUNTIME_MEMORY_LIMIT = 16 << 20;
 const RUNTIME_STACK_LIMIT = 128 << 10;
 const EVAL_DEADLINE_MS = 250;
+/**
+ * preludegrace1031（ENGINE_JS_PRELUDE_GRACE on）：prelude 段的中断时限。冷进程首几次求值含 prelude 约 15–30ms（2026-10-31 PC 空载实测），
+ * 生产 2 核 20 实例同时重启时会被挤过 250ms，prelude 被中断即「JS 沙箱初始化失败」，整源本轮失败。
+ */
+const PRELUDE_DEADLINE_MS = 2_000;
 /** 注入沙箱的单个字符串上限（字符数）。正文页通常 50–200K 字符；超出按求值失败，不截断喂进去。 */
 export const MAX_JS_INPUT_CHARS = 1 << 20;
 /** 沙箱产出的总字符上限。 */
@@ -138,7 +144,9 @@ async function loadModule(): Promise<QuickJSWASMModule> {
 }
 
 /** 宿主级异常（wasm trap 等）后实例状态不可信：丢弃并在后台重新加载。 */
+let discards = 0;
 function discardModule(): void {
+  discards += 1;
   ready = undefined;
   loading = undefined;
   void preloadJsSandbox().catch(() => undefined);
@@ -348,7 +356,8 @@ function execute<T>(
   budgetKey = code, session?: JsoupSession,
 ): T | null {
   const wasm = ready;
-  if (!wasm) return evalFailed('JS 沙箱未就绪');
+  // 异常丢弃（discardModule）后的未就绪单独标出：页内装饰字段吞掉的「沙箱异常」会让随后的核心字段报未就绪（rulehint 分类用）。
+  if (!wasm) return evalFailed(discards > 0 && loading !== undefined ? 'JS 沙箱未就绪（异常后重载中）' : 'JS 沙箱未就绪');
   // 首段 result 就是 src（installGlobals 复用同一句柄），只计一次。
   const results = typeof bindings.result === 'string'
     ? (bindings.result === bindings.src ? [] : [bindings.result])
@@ -377,10 +386,13 @@ function runInFreshRuntime<T>(
   exporter: (context: QuickJSContext, handle: QuickJSHandle) => T | null, session?: JsoupSession,
 ): T | null {
   const runtime = module.newRuntime();
+  // preludegrace1031：on 时宿主装配 + prelude（自家固定代码）另给 PRELUDE_DEADLINE_MS，规则代码（jsLib + code）从 prelude 后起算 250ms。
+  const grace = engineJsPreludeGraceEnabled();
+  let limit = grace ? Date.now() + PRELUDE_DEADLINE_MS : deadline;
   try {
     runtime.setMemoryLimit(RUNTIME_MEMORY_LIMIT);
     runtime.setMaxStackSize(RUNTIME_STACK_LIMIT);
-    runtime.setInterruptHandler(() => Date.now() > deadline);
+    runtime.setInterruptHandler(() => Date.now() > limit);
     const context = runtime.newContext();
     try {
       const host = installGlobals(context, bindings);
@@ -389,10 +401,12 @@ function runInFreshRuntime<T>(
         ? (bindings.utilHelpers ? UTIL_PRELUDE : '') + JSOUP_PRELUDE + PRELUDE
         : bindings.utilHelpers ? UTIL_PRELUDE + PRELUDE : PRELUDE, 'prelude.js');
       if (prelude.error) {
+        const message = describeError(context, prelude.error);
         prelude.error.dispose();
-        return evalFailed('JS 沙箱初始化失败');
+        return evalFailed(`JS 沙箱初始化失败：${message}`);
       }
       prelude.value.dispose();
+      if (grace) limit = Date.now() + EVAL_DEADLINE_MS;
       if (bindings.jsLib !== undefined) {
         const lib = context.evalCode(bindings.jsLib, 'lib.js');
         if (lib.error) {
