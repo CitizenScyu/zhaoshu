@@ -158,6 +158,23 @@ export function noticePlaceholder(env = process.env) {
   return env.DOWNLOAD_NOTICE_PLACEHOLDER?.trim() === '1';
 }
 
+// chaperr1031：DOWNLOAD_CHAPTER_ERROR_KIND=1 时，白名单外的逐章失败（chapter.error='chapter_failed'）另记 chapter.error_kind =
+// 「构造器名[:HTTP 状态][:枚举 code]」（code 取 error.code / SourcePolicyError 归类 / undici cause.code，均为常量形态，不含上游文本
+// 与 URL）；补抓成功即删。缺省/其他值 = 关（零行为变化）。只是诊断字段，任何判据都不读它。
+// 动机（2026-10-31 phoenix 只读，7 天）：43664 章 chapter_failed（kanshuw/itxtbook/sfwx/zhkanshu 每本零散数十章）分不出是
+// 5xx/403、超时、连接重置还是正文跳转类策略拒绝，补抓/限速/熔断的调优无从下手。
+export function chapterErrorKind(env = process.env) {
+  return env.DOWNLOAD_CHAPTER_ERROR_KIND?.trim() === '1';
+}
+const CONST_CODE = /^[A-Z][A-Z0-9_]{1,39}$/;
+export function errorKindOf(error) {
+  const name = /^[A-Za-z]{1,32}$/.test(error?.name) ? error.name : 'unknown';
+  const status = Number.isInteger(error?.status) && error.status >= 100 && error.status <= 599 ? `:${error.status}` : '';
+  const own = typeof error?.code === 'string' ? error.code : error?.name === 'SourcePolicyError' ? policyCodeOf(error.message) : '';
+  const code = CONST_CODE.test(own) ? own : typeof error?.cause?.code === 'string' && CONST_CODE.test(error.cause.code) ? error.cause.code : '';
+  return name + status + (code ? `:${code}` : '');
+}
+
 // hostburst1030：按站「连抓 N 次即静置 M 毫秒」DOWNLOAD_HOST_BURST_PAUSE（"站=N/M,站=N/M"；站按 stationKeyOfHost
 // 归一，www./m. 前缀互认；N 1..10000，M 封顶 600000）。缺省/未命中/非法项 = null（零行为变化）。
 // 静置在章与章之间、operation 超时之外进行（M 可远大于 timeout-ms），计数含本次下载的全部请求（搜索/详情/目录）。
@@ -415,6 +432,7 @@ export async function downloadBook(m, args, resolveSource, transport = fetchSour
         if (fresh || !keepCached()) atomic(path, text);
         Object.assign(chapter, { status: 'done', chars: [...text].length, sha256: hash(text) });
         delete chapter.error; // 补抓成功的章不留上一轮的失败码
+        delete chapter.error_kind;
         failStreak = 0;
         if (fresh) fetchedThisRun += 1;
       } catch (error) {
@@ -424,6 +442,8 @@ export async function downloadBook(m, args, resolveSource, transport = fetchSour
         failedThisRun += 1;
         // Do not persist upstream messages, URLs or credentials in diagnostics.
         chapter.error = knownError.test(error.message) ? error.message : 'chapter_failed';
+        if (chapter.error === 'chapter_failed' && chapterErrorKind()) chapter.error_kind = errorKindOf(error);
+        else delete chapter.error_kind;
         if (chapter.error === 'size_limit' || controller.signal.aborted) throw error;
         if (failStreakLimit > 0 && ++failStreak >= failStreakLimit) {
           manifest.content_fail_streak = failStreak;

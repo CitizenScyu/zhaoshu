@@ -11,7 +11,7 @@ import fixtures from '../src/lib/rule-engine/fixtures/smoke-174.json';
 import { SourceHttpError } from '../src/lib/source-fetch';
 import { SourcePolicyError } from '../src/lib/source-policy';
 import { peerOutRoots, seedFromPeers } from '../runtime-download/resume-seed';
-import { breakerYield, chapterResume, contentFailStreak, contentRetryPasses, contentStopBookPages, downloadBook, downloadOptions, hostBurstPause, keepCached, policyCodeOf, recheckYield } from './engine-download.mjs';
+import { breakerYield, chapterErrorKind, chapterResume, contentFailStreak, contentRetryPasses, contentStopBookPages, downloadBook, downloadOptions, errorKindOf, hostBurstPause, keepCached, policyCodeOf, recheckYield } from './engine-download.mjs';
 
 const dirs: string[] = [];
 afterEach(() => { vi.unstubAllGlobals(); for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
@@ -745,6 +745,54 @@ describe('noticeskip1031 公告章占位', () => {
     const r = await f.run(wrap(f, '第2章 抱歉'));
     expect(r.manifest.errors).toEqual(['missing_chapters']);
     expect(r.manifest.chapters[1].error).toBe('empty_content_page');
+  });
+});
+
+// chaperr1031：白名单外逐章失败记异常类别（DOWNLOAD_CHAPTER_ERROR_KIND，缺省关）。
+describe('chaperr1031 逐章失败类别', () => {
+  afterEach(() => { vi.unstubAllEnvs(); });
+  /** 3 章书；第 2 章取页抛 fail()。 */
+  const wrap = (f: ReturnType<typeof setup>, fail: () => Error) => async (url: string, opts: { signal: AbortSignal; beforeRequest?: (s: AbortSignal) => Promise<void> }) => {
+    if (url === 'https://book15.net/books/details1.html') {
+      return { url, text: `<h1>测试书</h1><div class="d-info-panel"><a href="/author/1">作者甲</a></div><meta property="og:novel:book_name" content="测试书"><meta property="og:novel:author" content="作者甲"><div class="d-chapter-list" id="full-catalog">${[1, 2, 3].map(i => `<dd><a href="/read/${i}">第${i}章</a></dd>`).join('')}</div>` };
+    }
+    if (url.endsWith('/read/2')) throw fail();
+    if (url.includes('/read/')) return { url, text: '<li class="chapter-content" id="article-content"><p>合成正文，离线测试。</p></li>' };
+    return f.transport(url, opts);
+  };
+  type Ch = { error?: string; error_kind?: string };
+
+  it('开关解析与类别形态（不含上游文本）', () => {
+    expect(chapterErrorKind({})).toBe(false);
+    expect(chapterErrorKind({ DOWNLOAD_CHAPTER_ERROR_KIND: ' 1 ' })).toBe(true);
+    expect(chapterErrorKind({ DOWNLOAD_CHAPTER_ERROR_KIND: 'on' })).toBe(false);
+    expect(errorKindOf(new SourceHttpError(502))).toMatch(/^[A-Za-z]+:502$/);
+    expect(errorKindOf(new TypeError('fetch failed https://x.example/a', { cause: { code: 'ECONNRESET' } }))).toBe('TypeError:ECONNRESET');
+    expect(errorKindOf(new SourcePolicyError('书源正文跳转到了目录中的其他章节，请重试或更换书源'))).toMatch(/^SourcePolicyError:POLICY_[A-Z_]+$/);
+    expect(errorKindOf(Object.assign(new Error('x'), { name: 'Bad Name!', code: 'lower' }))).toBe('unknown');
+  });
+
+  it('缺省关：只有 chapter_failed、无 error_kind（零行为变化）', async () => {
+    const f = setup();
+    const r = await f.run(wrap(f, () => new TypeError('fetch failed', { cause: { code: 'ECONNRESET' } })));
+    expect(r.manifest.errors).toEqual(['missing_chapters']);
+    const ch = r.manifest.chapters[1] as Ch;
+    expect(ch.error).toBe('chapter_failed');
+    expect(ch.error_kind).toBeUndefined();
+  });
+
+  it('开：chapter_failed 章另记类别；白名单错误码与 done 章不记', async () => {
+    vi.stubEnv('DOWNLOAD_CHAPTER_ERROR_KIND', '1');
+    const f = setup();
+    const r = await f.run(wrap(f, () => new TypeError('fetch failed', { cause: { code: 'ECONNRESET' } })));
+    const chs = r.manifest.chapters as Ch[];
+    expect(chs[1]).toMatchObject({ error: 'chapter_failed', error_kind: 'TypeError:ECONNRESET' });
+    expect(chs[0].error_kind).toBeUndefined();
+    expect(JSON.stringify(r.manifest)).not.toContain('fetch failed');
+    const g = setup();
+    const r2 = await g.run(wrap(g, () => new Error('empty_content_page')));
+    expect((r2.manifest.chapters as Ch[])[1]).toMatchObject({ error: 'empty_content_page' });
+    expect((r2.manifest.chapters as Ch[])[1].error_kind).toBeUndefined();
   });
 });
 
