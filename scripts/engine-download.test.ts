@@ -771,7 +771,8 @@ describe('noticeaside1031 非编号章占位', () => {
     expect(noticeUnnumbered()).toBe(false);
     const num = Array.from({ length: 18 }, (_, i) => `第${i + 1}章 标题`);
     expect(numberedBook([...num, '求月票', '第十九章'])).toBe(true);
-    expect(numberedBook([...num, '求月票', '更新说明'])).toBe(false); // 18/20 < 90%
+    expect(numberedBook([...num, '求月票', '更新说明'])).toBe(true); // 18/20 = 90% 恰达线
+    expect(numberedBook([...num.slice(1), '求月票', '更新说明', '感谢'])).toBe(false); // 17/20 < 90%
     expect(numberedBook(num.slice(0, 10))).toBe(false); // 小书不判
   });
 
