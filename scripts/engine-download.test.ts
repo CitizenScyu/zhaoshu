@@ -889,6 +889,9 @@ describe('rulehint1031 规则求值失败分类', () => {
     expect(ruleHintOf(engineError('@css:div@text', false))).toBe('HTML_RULE_ON_JSON');
     expect(ruleHintOf(new RuleEngineError('RULE_EVAL_FAILED', 'JS 执行失败：SyntaxError: unexpected token in JSON at <html>'))).toBe('JS_EXEC:SyntaxError');
     expect(ruleHintOf(new RuleEngineError('RULE_EVAL_FAILED', 'JS 执行预算耗尽（该段代码）'))).toBe('JS_BUDGET');
+    expect(ruleHintOf(new RuleEngineError('RULE_EVAL_FAILED', 'JS 沙箱未就绪'))).toBe('JS_NOT_READY');
+    expect(ruleHintOf(new RuleEngineError('RULE_EVAL_FAILED', '列表 JS 返回的不是数组（legado getElements 强转 List 失败）'))).toBe('JS_LIST');
+    expect(ruleHintOf(new RuleEngineError('RULE_EVAL_FAILED', 'init JS 返回了 null/undefined（legado setContent(null)）'))).toBe('JS_INIT');
     expect(ruleHintOf(new RuleEngineError('RULE_EVAL_FAILED', '某种新报错 https://x.example/'))).toBe('OTHER');
     expect(ruleHintOf(undefined)).toBe('OTHER');
   });

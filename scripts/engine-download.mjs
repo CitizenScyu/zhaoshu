@@ -213,7 +213,12 @@ const RULE_HINTS = [
   [/页面未取/, 'NET_PENDING'],
   [/^jsoup:/, 'JSOUP'],
   [/JS (?:输入|输出)过大/, 'JS_SIZE'],
-  [/列表 JS|init JS|结果无法读取|JS 沙箱/, 'JS_RESULT'],
+  // 生产首例（21:06 后 95dxs @detail）落在旧的合并类 JS_RESULT，分不出沙箱没就绪还是规则结果形态不对，拆细。
+  [/JS 沙箱(?:未就绪|初始化失败)/, 'JS_NOT_READY'],
+  [/JS 沙箱异常/, 'JS_SANDBOX'],
+  [/init JS/, 'JS_INIT'],
+  [/列表 JS/, 'JS_LIST'],
+  [/结果无法读取/, 'JS_READ'],
 ];
 export function ruleHintOf(error) {
   const message = typeof error?.message === 'string' ? error.message : '';
