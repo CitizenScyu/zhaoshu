@@ -7,6 +7,7 @@ import { describe, expect, it } from 'vitest';
 import { createBuiltinFallback, MAX_FALLBACK_SCAN_SOURCES } from './builtin-fallback';
 import type { AdapterOutcome, SourceAdapter, TaskRow } from '../src/lib/download-worker';
 import type { PrecheckResult } from './executor';
+import type { ScanMissMemo } from './scan-miss-memo';
 
 const task = (over: Partial<TaskRow> = {}): TaskRow => ({
   id: 7, book_id: 1, title: '测试书', author: '佚名', status: 'running',
@@ -21,7 +22,7 @@ const signal = () => new AbortController().signal;
 
 function harness(opts: {
   pool?: string[] | (() => never); throwSearch?: string[]; suspect?: string[]; noBook?: string[]; hostTarget?: number; maxSources?: number;
-  scanRotate?: boolean;
+  scanRotate?: boolean; missMemo?: ScanMissMemo;
 }) {
   const searched: string[] = [];
   const poolLoads: number[] = [];
@@ -50,6 +51,7 @@ function harness(opts: {
     hostTarget: opts.hostTarget,
     maxSources: opts.maxSources,
     scanRotate: opts.scanRotate,
+    missMemo: opts.missMemo,
   });
   return { fallback, searched, poolLoads };
 }
@@ -226,6 +228,21 @@ describe('41-T8FB builtin-fallback', () => {
     const skipped = harness({ pool: ['https://busy.example/'], suspect: ['busy.example'] });
     expect(await skipped.fallback.wrapPrecheck(async () => UNAVAILABLE)(task(), signal())).toEqual(UNAVAILABLE);
     expect(skipped.searched).toEqual([]);
+  });
+
+  // scanmiss1101：记忆跳过的源是 TTL 内实探过的，全池都被记住仍是「整池没人挂」，不能降成瞬时不可达快退避。
+  it('scanmiss1101：池源全在确认无书记忆里 ⇒ 零出网仍回 no_candidates（预检腿与下载腿）', async () => {
+    const missMemo: ScanMissMemo = { load: () => () => true, record: () => {} };
+    const pre = harness({ pool: ['https://a.example/', 'https://b.example/'], missMemo });
+    expect(await pre.fallback.wrapPrecheck(async () => UNAVAILABLE)(task(), signal()))
+      .toEqual({ ...UNAVAILABLE, reason: 'no_candidates' });
+    expect(pre.searched).toEqual([]);
+
+    const leg = harness({ pool: ['https://a.example/'], suspect: ['book15.net'], missMemo });
+    const calls: string[] = [];
+    const out = await leg.fallback.wrapAdapter(adapter({}, calls), adapter({}, calls)).download(task(), context());
+    expect(out).toMatchObject({ kind: 'incomplete', reason: 'no_candidates', stage: 'search' });
+    expect(leg.searched).toEqual([]);
   });
 
   it('nocand42：下载腿零候选回 no_candidates；原源本身瞬时挂仍回它自己的 source_unavailable', async () => {

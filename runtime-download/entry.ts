@@ -26,6 +26,7 @@ import { createIdentityPrecheck } from './identity-precheck';
 import { createBuiltinFallback } from './builtin-fallback';
 import { createHostOccupancy, type HostOccupancy } from './host-occupancy';
 import { createHostPriority, scanRotateEnabled, skipStrictTocEnabled } from './host-priority';
+import { createScanMissMemo, scanMissDir, scanMissMemoEnabled } from './scan-miss-memo';
 import { peerOutRoots, resumePeersEnabled, resumeStaleLocksEnabled, seedFromPeers } from './resume-seed';
 import {
   failedCandidateSources, markCandidateFailure, occupiedHosts, replaceSourceCandidates,
@@ -338,6 +339,7 @@ export async function createDownloadExecutor(options: ProductionExecutorOptions)
       hostPriority: candidateSql ? createHostPriority(candidateSql, env) : undefined,
       scanRotate: scanRotateEnabled(env),
       skipStrictToc: skipStrictTocEnabled(env),
+      missMemo: scanMissMemoEnabled(env) ? createScanMissMemo(scanMissDir(options.workDir)) : undefined,
       ...(candidateSql ? {
         candidates: {
           usable: (bookId) => usableSourceCandidates(candidateSql, bookId),

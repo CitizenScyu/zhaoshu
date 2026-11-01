@@ -5,6 +5,7 @@ import { isHostSuspect, isPaywallHost } from '../src/lib/source-host-health';
 import { sourceAbortable } from '../src/lib/source-fetch';
 import { searchKeysOf } from '../src/lib/search-key';
 import { pageContext, type Transport } from './identity-precheck';
+import type { ScanMissMemo } from './scan-miss-memo';
 
 type Identity = { title?: string; author?: string };
 type SearchHit = { title?: string; author?: string; bookUrl: string; book?: unknown; vars?: unknown };
@@ -40,6 +41,11 @@ export interface SourceSelectorOptions {
    * 24h 35 次 download_failed 即此形态（isVip/isVolume 被 skip）。缺省关 = 逐字同改前。编译抛错的源不在此判（留给原路径）。
    */
   skipStrictToc?: boolean;
+  /**
+   * scanmiss1101：确认无书记忆（见 scan-miss-memo.ts）。缺省 = 无记忆（逐字同改前）。命中的源不出网、不扣
+   * scanBudget，但照旧占 scanLimit 名额（轮转窗口划分不变，记忆只省请求、不扩扫描面）。
+   */
+  missMemo?: ScanMissMemo;
 }
 
 export interface SourceSelectionRequest {
@@ -64,11 +70,13 @@ export interface SourceSelectionRequest {
  * 选源结果：picked = 命中的源 URL（按池序），scanned = 本轮实际出网探测的源数。
  * scanned 是区分「全池 0 候选」与「瞬时不可达」的唯一依据（nocand42）：scanned>0 且 picked 为空
  * 说明这本书整池没人挂，免费站收录以天计 ⇒ 长退避；scanned===0 是 busy 全占/池不可读/预算尽 ⇒ 快退避。
- * 扫描 0 个源时也如实返回 0，不粉饰。
+ * 扫描 0 个源时也如实返回 0，不粉饰。remembered = 按确认无书记忆跳过的源数（scanmiss1101；无记忆时缺席），
+ * scanned + remembered > 0 同样说明这本书整池没人挂（记忆里的源是 TTL 内实探过的）。
  */
 export interface SourceSelection {
   picked: string[];
   scanned: number;
+  remembered?: number;
 }
 
 export type SourceSelector =
@@ -209,12 +217,17 @@ export function createSourceSelector(options: SourceSelectorOptions): SourceSele
       // 同 host 变体永久死区——扫描无书不进 excludedSources（markFailure 只记下载过的源），轮轮
       // 如此。槽位饥饿已由 MAX_FALLBACK_SCAN_SOURCES≈全池解决；已命中 host 的去重（pickedHosts）保留。
       let scanned = 0;
+      const memo = options.missMemo;
+      const missed = memo ? memo.load(task) : undefined;
+      const misses: string[] = [];
+      let remembered = 0;
       for (const source of pool) {
         signal.throwIfAborted();
-        if (picked.length >= request.targetHits || scanned >= request.scanLimit || overall.aborted
+        if (picked.length >= request.targetHits || scanned + remembered >= request.scanLimit || overall.aborted
           || (request.scanBudget && request.scanBudget.remaining <= 0)) break;
         const host = hostOf(source.url);
         if (!scannable(source) || pickedHosts.includes(host)) continue;
+        if (missed?.(source.url)) { remembered += 1; continue; }
         scanned += 1;
         if (request.scanBudget) request.scanBudget.remaining -= 1;
         try {
@@ -223,15 +236,16 @@ export function createSourceSelector(options: SourceSelectorOptions): SourceSele
             if (overall.aborted) break;
             picked.push(source.url);
             pickedHosts.push(host);
-          }
+          } else if (memo && !overall.aborted) misses.push(source.url);
         } catch (error) {
           signal.throwIfAborted();
           if (isOccupancyUnavailable(error)) throw error;
           if (overall.aborted) break;
         }
       }
-      log('info', '选源完成', { taskId: task.id, scanned, candidates: picked.length, hosts: pickedHosts });
-      return { picked, scanned };
+      memo?.record(task, misses);
+      log('info', '选源完成', { taskId: task.id, scanned, candidates: picked.length, hosts: pickedHosts, ...(memo ? { remembered } : {}) });
+      return memo ? { picked, scanned, remembered } : { picked, scanned };
     } finally {
       clearTimeout(timer);
     }

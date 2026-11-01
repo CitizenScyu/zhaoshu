@@ -2,6 +2,7 @@
 // 身份判据与每源详情上限、停止语义（caller abort / 预算耗尽 / 池失败）、无持久化入口与日志脱敏。
 import { describe, expect, it } from 'vitest';
 import { createSourceSelector, type SourceSelectionRequest } from './source-selector';
+import type { ScanMissMemo } from './scan-miss-memo';
 
 const TASK = { id: 11, title: '测试书', author: '佚名' };
 const hang = <T,>() => new Promise<T>(() => {});
@@ -20,6 +21,7 @@ function harness(opts: {
   hostPriority?: (signal: AbortSignal) => Promise<ReadonlyMap<string, number>>;
   doomed?: string[];
   skipStrictToc?: boolean;
+  missMemo?: ScanMissMemo;
 }) {
   const searchedUrls: string[] = [];
   const searchKeys: string[] = [];
@@ -60,6 +62,7 @@ function harness(opts: {
     log: (level, message, fields) => logs.push({ level, message, fields }),
     hostPriority: opts.hostPriority,
     skipStrictToc: opts.skipStrictToc,
+    missMemo: opts.missMemo,
   });
   return { selector, searchedUrls, searchKeys, detailUrls, poolLoads, logs, compiles };
 }
@@ -408,6 +411,66 @@ describe('共用选源器', () => {
     const sync = harness({ poolThrows: 'sync' });
     expect(await sync.selector(request({ scanBudget: budget }), freshSignal())).toEqual({ picked: [], scanned: 0 });
     expect(budget.remaining).toBe(2);
+  });
+
+  // scanmiss1101：确认无书记忆只省出网，不扩扫描面；只记正常判否，异常/中止不记。
+  describe('scanmiss1101 确认无书记忆', () => {
+    const fakeMemo = (known: string[]) => {
+      const records: string[][] = [];
+      const memo: ScanMissMemo = {
+        load: () => url => known.includes(url),
+        record: (_task, urls) => { records.push([...urls]); },
+      };
+      return { memo, records };
+    };
+
+    it('记忆命中的源零出网、不扣 scanBudget；只记正常判否的源，异常与命中不记', async () => {
+      const { memo, records } = fakeMemo(['https://b.example/']);
+      const h = harness({
+        pool: ['https://a.example/', 'https://b.example/', 'https://c.example/', 'https://d.example/'],
+        missMemo: memo,
+        search: url => {
+          if (url === 'https://a.example/') throw new TypeError('fetch failed');
+          return url === 'https://d.example/' ? [{ title: TASK.title, author: TASK.author, bookUrl: `${url}b/1` }] : [];
+        },
+      });
+      const scanBudget = { remaining: 10 };
+      expect(await h.selector(request({ targetHits: 1, scanBudget }), freshSignal()))
+        .toEqual({ picked: ['https://d.example/'], scanned: 3, remembered: 1 });
+      expect(h.searchedUrls).toEqual(['https://a.example/', 'https://c.example/', 'https://d.example/']);
+      expect(scanBudget.remaining).toBe(7);
+      expect(records).toEqual([['https://c.example/']]);
+      expect(h.logs[0].fields).toMatchObject({ scanned: 3, remembered: 1, candidates: 1 });
+    });
+
+    it('记忆命中照旧占 scanLimit 名额（轮转窗口不变）；全被记住 ⇒ scanned=0、remembered>0', async () => {
+      const { memo } = fakeMemo(['https://a.example/', 'https://b.example/']);
+      const pool = ['https://a.example/', 'https://b.example/', 'https://c.example/', 'https://d.example/', 'https://e.example/'];
+      const h = harness({ pool, missMemo: memo, search: () => [] });
+      expect(await h.selector(request({ scanLimit: 3 }), freshSignal())).toEqual({ picked: [], scanned: 1, remembered: 2 });
+      expect(h.searchedUrls).toEqual(['https://c.example/']);
+
+      const all = harness({ pool: pool.slice(0, 2), missMemo: memo, search: () => [] });
+      expect(await all.selector(request(), freshSignal())).toEqual({ picked: [], scanned: 0, remembered: 2 });
+      expect(all.searchedUrls).toEqual([]);
+    });
+
+    it('预算超时中止的源不记（不是确认无书）', async () => {
+      const { memo, records } = fakeMemo([]);
+      const h = harness({
+        pool: ['https://a.example/', 'https://b.example/'],
+        missMemo: memo,
+        search: url => (url === 'https://b.example/' ? hang<Hit[]>() : []),
+      });
+      expect(await h.selector(request({ budgetMs: 60 }), freshSignal())).toEqual({ picked: [], scanned: 2, remembered: 0 });
+      expect(records).toEqual([['https://a.example/']]);
+    });
+
+    it('缺省无记忆 ⇒ 结果与日志逐字同改前（无 remembered 字段）', async () => {
+      const h = harness({ pool: ['https://a.example/'], search: () => [] });
+      expect(await h.selector(request(), freshSignal())).toEqual({ picked: [], scanned: 1 });
+      expect(h.logs[0].fields).not.toHaveProperty('remembered');
+    });
   });
 
   // authbridge42：QQ 系书在镜像站按通行书名收录（队列名「少年羽皇」vs 站名「帝临鸿蒙」），

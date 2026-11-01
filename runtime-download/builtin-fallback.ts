@@ -28,6 +28,7 @@ import {
 } from '../src/lib/download-worker';
 import { classifyFailure } from '../src/lib/download-source-candidates';
 import { createSourceSelector, type SourceSelection } from './source-selector';
+import type { ScanMissMemo } from './scan-miss-memo';
 import type { PrecheckHook, PrecheckResult } from './executor';
 
 /**
@@ -98,6 +99,8 @@ export interface BuiltinFallbackOptions {
   scanRotate?: boolean;
   /** toctgate1030：透传给 selector，跳过 strict 目录必拒的源；缺省关。 */
   skipStrictToc?: boolean;
+  /** scanmiss1101：透传给 selector 的确认无书记忆；缺省无（逐字同改前）。 */
+  missMemo?: ScanMissMemo;
 }
 
 const hostOf = (url: string): string => {
@@ -171,7 +174,10 @@ export function createBuiltinFallback(options: BuiltinFallbackOptions) {
     timeoutMs: options.timeoutMs ?? 30000,
     hostPriority: options.hostPriority,
     skipStrictToc: options.skipStrictToc,
+    missMemo: options.missMemo,
   });
+  // nocand42 的「整池实探过」判据：记忆跳过的源也是 TTL 内实探过的（scanmiss1101），一并计入。
+  const probed = (selection: SourceSelection): number => selection.scanned + (selection.remembered ?? 0);
 
   // 预检选好的源交给下载腿：单槽（并发=1），按任务 id 认领，领一次即清。
   // identityMissed：预检腿判定原源可达但库里无此书（41-nocand）——下载腿候选全失败时按
@@ -307,7 +313,7 @@ export function createBuiltinFallback(options: BuiltinFallbackOptions) {
           if (identityMissed) return { ok: false, reason: 'identity_mismatch', retryable: false };
           // 实探过整池仍零候选 ⇒ no_candidates（nocand42）：免费站收录以天计，走 1h/2h/4h 长退避；
           // 一次没探（busy 全占/池不可读/预算尽）⇒ 仍是瞬时不可达，维持 15m/30m 快退避捞回。
-          return { ok: false, reason: selection && selection.scanned > 0 ? 'no_candidates' : 'source_unavailable',
+          return { ok: false, reason: selection && probed(selection) > 0 ? 'no_candidates' : 'source_unavailable',
             retryable: true, stage };
         }
         planned = { taskId: task.id, sources, scanBudget, identityMissed };
@@ -376,7 +382,7 @@ export function createBuiltinFallback(options: BuiltinFallbackOptions) {
               const selected = await selectForDownload();
               if (!isSelection(selected)) return selected;
               sources = selected.picked;
-              lastScanned = selected.scanned;
+              lastScanned = probed(selected);
             }
           }
           stop = stopped(context.signal);
@@ -441,7 +447,7 @@ export function createBuiltinFallback(options: BuiltinFallbackOptions) {
             const selected = await selectForDownload();
             if (!isSelection(selected)) return selected;
             sources = selected.picked;
-            lastScanned = selected.scanned;
+            lastScanned = probed(selected);
             stop = stopped(context.signal);
             if (stop) return stop;
             if (!sources.length) break;
