@@ -73,7 +73,9 @@ async function handleGET(req: NextRequest) {
         const like = `%${escapeLike(query.toLowerCase())}%`;
         conds.push(tx`(lower(title) LIKE ${like} ESCAPE '\\' OR lower(author) LIKE ${like} ESCAPE '\\' OR lower(labels::text) LIKE ${like} ESCAPE '\\')`);
       }
-      if (category) conds.push(tx`(COALESCE(NULLIF(primary_genre, ''), category) = ${category})`);
+      // 与下方分类聚合同一归一式（facet1102）：category 也会是空串，只 NULLIF primary_genre 会聚出无名分类
+      // 「（1）」，且点「其他」筛不到这些行。
+      if (category) conds.push(tx`(COALESCE(NULLIF(primary_genre, ''), NULLIF(category, ''), '其他') = ${category})`);
       if (tag) {
         const tagLike = `%${escapeLike(tag.toLowerCase())}%`;
         // 括号必须包住整个 OR 组：AND 优先级更高，裸拼会让 tag 分支绕过其他筛选
@@ -121,7 +123,7 @@ async function handleGET(req: NextRequest) {
         SELECT count(*)::int AS total FROM labeled_books ${where}`,
         // 聚合可选筛选值（规范化主分类、完结状态）——给前端筛选条用
         tx`
-        SELECT COALESCE(NULLIF(primary_genre, ''), category, '其他') AS category,
+        SELECT COALESCE(NULLIF(primary_genre, ''), NULLIF(category, ''), '其他') AS category,
                count(*)::int AS n
         FROM labeled_books
         GROUP BY 1 ORDER BY n DESC LIMIT 20`,

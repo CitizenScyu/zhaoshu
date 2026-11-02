@@ -88,7 +88,7 @@ async function handleGET(req: NextRequest) {
              COALESCE(sum(chars_labeled), 0)::float8 AS chars_labeled
       FROM labeled_books`,
       tx`
-      SELECT COALESCE(NULLIF(primary_genre, ''), category, '其他') AS genre,
+      SELECT COALESCE(NULLIF(primary_genre, ''), NULLIF(category, ''), '其他') AS genre,
              count(*)::int AS n
       FROM labeled_books
       GROUP BY 1 ORDER BY n DESC LIMIT 12`,
