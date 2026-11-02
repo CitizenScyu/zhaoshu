@@ -64,7 +64,7 @@ describe('LibraryTab 失败详情错误码中文化', () => {
     const list = await openFailed('ARTIFACT_IDENTITY_CONFLICT\nLABELED_BOOK_MISSING: labeled_books id=7 不存在');
     const items = [...list.querySelectorAll('li')].map((li) => li.textContent);
     expect(items).toEqual([
-      '章节已下完，但这本书已有存档登记在别的存储位置，本次无法发布，需管理员处理（ARTIFACT_IDENTITY_CONFLICT）',
+      '这本书已有存档登记在别的存储位置，下载结果无法发布，重下也一样，需管理员处理（ARTIFACT_IDENTITY_CONFLICT）',
       '书库记录已不存在，请返回刷新书库（LABELED_BOOK_MISSING）',
     ]);
   });

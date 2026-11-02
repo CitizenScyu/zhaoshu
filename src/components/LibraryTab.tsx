@@ -164,7 +164,8 @@ function downloadStatusText(t: DownloadTask): string {
 // failcode1102：worker 终态 failed 只写错误码（download-worker storage.finish / ArtifactRegistryError），
 // 详情区原样列出等于给用户看英文码。已知码转中文、括注原码便于反馈；未知行原样保留。
 const TASK_ERROR_TEXT: Record<string, string> = {
-  ARTIFACT_IDENTITY_CONFLICT: '章节已下完，但这本书已有存档登记在别的存储位置，本次无法发布，需管理员处理',
+  // prepub1102 预检开启时可能在抓取前就落这个码，文案不能假设「章节已下完」。
+  ARTIFACT_IDENTITY_CONFLICT: '这本书已有存档登记在别的存储位置，下载结果无法发布，重下也一样，需管理员处理',
   ARTIFACT_PATH_COLLISION: '章节已下完，但存档路径与另一本书冲突，本次无法发布，需管理员处理',
   REPOSITORY_NOT_WRITABLE: '章节已下完，但存储仓库当前不可写，本次无法发布，需管理员处理',
   LABELED_BOOK_MISSING: '书库记录已不存在，请返回刷新书库',
