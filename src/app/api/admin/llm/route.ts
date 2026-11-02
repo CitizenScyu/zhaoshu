@@ -25,10 +25,10 @@ import { withDbQuotaGuard } from '@/lib/db-quota-guard';
 //   - model：当前生效的覆盖值。null = 清除覆盖，回退到默认值。**既有调用形态，语义不变。**
 //   - defaultModel：默认值本身（llm_model 没有覆盖值时用的那个）。null = 清除，回退到环境变量。
 // 只处理模型名：LLM_BASE_URL / LLM_API_KEY 永远留在环境变量里，这里不读、不写、不返回。
-// 探针最长 30s（MODEL_PROBE_TIMEOUT_MS），冷连接重试也在同一个 30s 截止时间内，不会翻倍；
+// 探针最长 45s（MODEL_PROBE_TIMEOUT_MS），冷连接重试也在同一个 45s 截止时间内，不会翻倍；
 // 加上读库/写库余量，60s 足够。改探针超时必须同步检查这里的前台预算，探测失败被平台砍掉
 // 60s 会让 owner 看到没有任何原因的失败。
-// ⚠️ 正因为预算是 60s，两个目标**不能**在同一个请求里各探测一次（30+30 会顶破 maxDuration），
+// ⚠️ 正因为预算是 60s，两个目标**不能**在同一个请求里各探测一次（45+45 会顶破 maxDuration），
 // 所以同时带上 model 与 defaultModel 时直接 400，而不是挑一个执行。
 export const maxDuration = 60;
 

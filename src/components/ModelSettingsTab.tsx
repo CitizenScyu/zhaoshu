@@ -317,7 +317,7 @@ export default function ModelSettingsTab() {
             </button>
           </form>
           <p className="text-xs" style={{ color: 'var(--ink-faint)' }}>
-            保存按钮会先用新模型发一次极小的验证请求（最长 30 秒），验证通过才写库。
+            保存按钮会先用新模型发一次极小的验证请求（最长 45 秒），验证通过才写库。
             「恢复默认」清空数据库覆盖值，回退到下面「默认值」那一栏的模型。
           </p>
 

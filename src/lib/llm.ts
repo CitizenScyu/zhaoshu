@@ -957,7 +957,11 @@ export async function chatRobust(
 // 两次尝试共享 MODEL_PROBE_TIMEOUT_MS，第二次拿到的是剩余预算而不是整份，所以探测墙钟
 // 上限不变（仍是 MODEL_PROBE_TIMEOUT_MS）；重试只针对「上游一个字节都没答复」的传输层
 // 失败，上游给出的 HTTP 状态、空正文、被截断都是关于这个模型的语义结论，不重试。
-export const MODEL_PROBE_TIMEOUT_MS = 30_000;
+//
+// probe1102：30s → 45s。生产网关对 deepseek-v4.1-flash-happy 实测响应头 29.7s 才到、
+// 之后 1.7s 就出完正文（141 token，finish=stop）——慢在网关排队而不是模型思考，30s 预算
+// 正好卡在边上，owner 4 次保存里 2 次被误判「总超时」。45s 仍给路由 60s 留 15s 读写库余量。
+export const MODEL_PROBE_TIMEOUT_MS = 45_000;
 export const MODEL_PROBE_MAX_TOKENS = 512;
 // 重试前的等待；以及开第二次所需的最小剩余预算——只剩几百毫秒的请求只会把截止时间耗光。
 export const MODEL_PROBE_RETRY_DELAY_MS = 500;
