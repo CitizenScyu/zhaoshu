@@ -316,11 +316,11 @@ function ReaderSession({ session, from }: Props) {
         void extend('next', true);
       } else {
         setAutoRead(false);
-        setNotice('已读到全书末尾，自动阅读停止。');
+        setNotice(sessionKind === 'source' ? '已读到本书源目录末尾，自动阅读停止。' : '已读到全书末尾，自动阅读停止。');
       }
     }, AUTO_READ_TICK_MS);
     return () => clearInterval(timer);
-  }, [autoRead, autoSpeed, autoHasNext, panel, failure, loading, flowing, extend, scroller, setNotice]);
+  }, [autoRead, autoSpeed, autoHasNext, panel, failure, loading, flowing, extend, scroller, setNotice, sessionKind]);
   // 用户手势(滚轮/触摸拖动/方向键)即接管滚动:自动阅读让位。
   function userScrollIntent(forward: boolean) {
     if (autoRead) setAutoRead(false);
@@ -472,7 +472,15 @@ function ReaderSession({ session, from }: Props) {
                 ? <button className={styles.primary} disabled={loading || flowing} onClick={() => void extend('next', true)}>
                     {flowing ? '正在接续…' : after.chapterIndex === last?.chapterIndex ? '继续本章 →' : '接着读下一章 →'}
                   </button>
-                : <p className={styles.finished}>已读到全书末尾 · 合卷，再寻一径</p>}
+                : session.kind === 'source'
+                  // srcend1103：书源目录可能收录不全（生产实测 dingdian888 的《大道争锋》只到第 4 卷 319 章），
+                  // 读到书源末尾不能说成「全书末尾」，就地给出换源入口。
+                  ? <p className={styles.finished}>
+                      已读到本书源目录末尾 · 若作品还未完，可
+                      <button type="button" className={styles.tool} onClick={() => showPanel('sources')}>换源</button>
+                      查看其他书源的后续章节
+                    </p>
+                  : <p className={styles.finished}>已读到全书末尾 · 合卷，再寻一径</p>}
               {after && settings.continuous && <p className={styles.continuousHint}>向下滚动，接着读</p>}
             </nav>
           </article>

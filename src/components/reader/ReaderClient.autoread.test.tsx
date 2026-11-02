@@ -206,7 +206,7 @@ describe('readerux42-B 自动阅读', () => {
 
     // 停下的是「出错」这条路径,不是「读到末尾」那条:错误条在,末尾提示不在。
     screen.getByText('下一章取不到内容');
-    expect(screen.queryByText(textIs('已读到全书末尾，自动阅读停止。'))).toBeNull();
+    expect(screen.queryByText(textIs('已读到本书源目录末尾，自动阅读停止。'))).toBeNull();
     // 开关自己回到关(不是停在「开但不滚」的假活状态):速度组收起、按钮回到未按下态。
     expect(screen.getByRole('button', { name: '自动阅读' }).getAttribute('aria-pressed')).toBe('false');
     expect(screen.queryByRole('button', { name: '停止自动' })).toBeNull();
@@ -235,7 +235,8 @@ describe('readerux42-B 自动阅读', () => {
     await act(async () => { await vi.advanceTimersByTimeAsync(1000); });
 
     expect(screen.getByRole('button', { name: '自动阅读' }).getAttribute('aria-pressed')).toBe('false');
-    screen.getByText(textIs('已读到全书末尾，自动阅读停止。'));
+    // 书源会话（srcend1103）：书源目录可能收录不全，提示的是「本书源目录末尾」。
+    screen.getByText(textIs('已读到本书源目录末尾，自动阅读停止。'));
     expect(urls(apiFetch).slice(before)).toEqual([]);
   });
 

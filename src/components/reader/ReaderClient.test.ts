@@ -348,6 +348,15 @@ describe('正文渲染', () => {
     expect(html).toContain('已读到全书末尾 · 合卷，再寻一径');
   });
 
+  // srcend1103：书源目录可能收录不全，书源会话读到末章不得说「全书末尾」，并就地给换源入口。
+  it('书源书末章：说「本书源目录末尾」并给换源按钮，不说全书末尾', () => {
+    mocks.reader = readingState(part(1, 0, '第二章 中段', '正文'), { percent: 100 });
+    const html = render({ session: { kind: 'source', title: '诡秘之主', author: '爱潜水的乌贼' } });
+    expect(html).toContain('已读到本书源目录末尾');
+    expect(html).not.toContain('已读到全书末尾');
+    expect(html.match(/<nav[^>]*aria-label="接着阅读"[\s\S]*?<\/nav>/)?.[0]).toMatch(/<button[^>]*>换源<\/button>/);
+  });
+
   it('还有下一处：给接续按钮与滚动提示', () => {
     mocks.reader = readingState(part(0, 2, '第一章 开头', '正文'));
     const html = render();
