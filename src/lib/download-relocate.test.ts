@@ -98,6 +98,18 @@ describe('resolveDownloadRelocation', () => {
       .rejects.toBe(unavailable);
   });
 
+  it('rewrites reader copy that points back to 下载全书 but keeps code/status', async () => {
+    resolveSourceBook.mockRejectedValueOnce(new SourceReaderError('书源暂时无法提供这本书，请稍后重试，也可返回书库尝试「下载全书」。', 'SOURCE_UNAVAILABLE', 503));
+    const rejection = resolveDownloadRelocation({ title: catalog.title, author: catalog.author }, new AbortController().signal);
+    await expect(rejection).rejects.toBeInstanceOf(SourceReaderError);
+    await expect(rejection).rejects.toMatchObject({
+      code: 'SOURCE_UNAVAILABLE', status: 503, message: '活跃书源暂时无法提供这本书，请稍后再点「换活跃源重下」。',
+    });
+    resolveSourceBook.mockRejectedValueOnce(new SourceReaderError('书源查询已取消或超时，可重试或尝试「下载全书」。', 'SOURCE_TIMEOUT', 504));
+    await expect(resolveDownloadRelocation({ title: catalog.title, author: catalog.author }, new AbortController().signal))
+      .rejects.toMatchObject({ code: 'SOURCE_TIMEOUT', status: 504, message: '活跃书源查询超时，请稍后再点「换活跃源重下」。' });
+  });
+
   it('maps SOURCE_SIMILAR to RELOCATION_IDENTITY_MISMATCH without candidates', async () => {
     resolveSourceBook.mockRejectedValueOnce(new SourceReaderError('similar only', 'SOURCE_SIMILAR', 422));
     const rejection = resolveDownloadRelocation({ title: catalog.title, author: catalog.author }, new AbortController().signal);

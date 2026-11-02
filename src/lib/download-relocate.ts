@@ -72,6 +72,15 @@ export async function resolveDownloadRelocation(
       }
       // Availability, rate-limit and budget errors retain the reader contract,
       // including their existing 503/504 status.
+      // reloc1102：阅读侧文案会引导「下载全书」，而换源重下正是下载全书失败后的入口，
+      // 原样透传等于让用户回去点刚失败的按钮；仅换文案，code/status 不变。
+      if (error.message.includes('下载全书')) {
+        throw new SourceReaderError(
+          `${error.status === 504 ? '活跃书源查询超时' : '活跃书源暂时无法提供这本书'}，请稍后再点「换活跃源重下」。`,
+          error.code,
+          error.status,
+        );
+      }
       throw error;
     }
     if (error instanceof SourcePolicyError) {
