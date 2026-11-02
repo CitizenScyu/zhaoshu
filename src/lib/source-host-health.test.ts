@@ -282,3 +282,25 @@ describe('唯一记录点 fetchSourceText:只有传输层硬失败才计数', ()
     expect(health.isHostSuspect('e1.test')).toBe(false);
   });
 });
+
+describe('hostshare1102 健康观察者', () => {
+  it('跨进 suspect 时回调一次（按站键）；记过失败的站成功时回调 recovered；没记过的成功不回调', () => {
+    const events: string[] = [];
+    health.setHostHealthListener({ suspect: key => events.push(`s:${key}`), recovered: key => events.push(`r:${key}`) });
+    fail('www.dead.test', 3);
+    health.recordHostSuccess('m.dead.test');
+    health.recordHostSuccess('ok.test');
+    expect(events).toEqual(['s:dead.test', 'r:dead.test']);
+    health.setHostHealthListener(null);
+    fail('dead.test', 2);
+    expect(events).toHaveLength(2);
+  });
+
+  it('观察者抛错不影响记账', () => {
+    health.setHostHealthListener({ suspect: () => { throw new Error('x'); }, recovered: () => { throw new Error('y'); } });
+    expect(() => fail('dead.test', 2)).not.toThrow();
+    expect(health.isHostSuspect('dead.test', 0)).toBe(true);
+    expect(() => health.recordHostSuccess('dead.test')).not.toThrow();
+    expect(health.isHostSuspect('dead.test', 0)).toBe(false);
+  });
+});

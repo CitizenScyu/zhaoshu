@@ -27,6 +27,8 @@ import { createBuiltinFallback } from './builtin-fallback';
 import { createHostOccupancy, type HostOccupancy } from './host-occupancy';
 import { createHostPriority, scanRotateEnabled, skipStrictTocEnabled } from './host-priority';
 import { createScanMissMemo, scanMissDir, scanMissMemoEnabled } from './scan-miss-memo';
+import { createSharedHostSuspect, hostSuspectDir, sharedHostSuspectEnabled } from './shared-host-suspect';
+import { isHostSuspect, setHostHealthListener, sourceHostSuspectMs } from '../src/lib/source-host-health';
 import { peerOutRoots, resumePeersEnabled, resumeStaleLocksEnabled, seedFromPeers } from './resume-seed';
 import {
   failedCandidateSources, markCandidateFailure, occupiedHosts, replaceSourceCandidates,
@@ -331,6 +333,11 @@ export async function createDownloadExecutor(options: ProductionExecutorOptions)
   // （包的是默认两条腿）。bsrcfix-41：注入候选源持久化接缝（0005 候选表；host 占位已改由
   // hostOccupancy 物理门负责，fallback 不再 coarse occupy）。
   const candidateSql = sql;
+  // hostshare1102：20 实例共享 suspect 记忆（见 shared-host-suspect.ts）。缺省关。只接回退/选源（isSuspect 缝）。
+  const sharedSuspect = !options.adapters && sharedHostSuspectEnabled(env)
+    ? createSharedHostSuspect(hostSuspectDir(options.workDir), sourceHostSuspectMs(env))
+    : undefined;
+  if (sharedSuspect) setHostHealthListener({ suspect: key => sharedSuspect.mark(key), recovered: key => sharedSuspect.clear(key) });
   const fallback = options.adapters || env.DOWNLOAD_ENGINE_FALLBACK === '0'
     ? undefined
     : createBuiltinFallback({
@@ -340,6 +347,7 @@ export async function createDownloadExecutor(options: ProductionExecutorOptions)
       scanRotate: scanRotateEnabled(env),
       skipStrictToc: skipStrictTocEnabled(env),
       missMemo: scanMissMemoEnabled(env) ? createScanMissMemo(scanMissDir(options.workDir)) : undefined,
+      ...(sharedSuspect ? { isSuspect: (host: string) => isHostSuspect(host) || sharedSuspect.isSuspect(host) } : {}),
       ...(candidateSql ? {
         candidates: {
           usable: (bookId) => usableSourceCandidates(candidateSql, bookId),

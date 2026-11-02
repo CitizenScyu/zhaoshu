@@ -60,6 +60,22 @@ interface HostHealth {
 // 成功直接删掉条目，所以表里只有「最近失败过、还没成功过」的 host。
 const hosts = new Map<string, HostHealth>();
 
+/**
+ * hostshare1102：健康记忆的进程外观察者（下载线 DOWNLOAD_SHARED_HOST_SUSPECT 用它把 suspect 广播给同机其他实例）。
+ * 缺省无 = 逐字同改前。回调只拿站键，抛错吞掉（记忆本身不受影响）。
+ */
+export interface HostHealthListener {
+  /** 某站刚跨进 suspect（与 warn 行同一时刻）。 */
+  suspect(key: string): void;
+  /** 本进程记过失败的站拿到一次成功（条目被清）。 */
+  recovered(key: string): void;
+}
+let listener: HostHealthListener | null = null;
+export function setHostHealthListener(next: HostHealthListener | null): void {
+  listener = next;
+}
+const notify = (fn: () => void) => { try { fn(); } catch { /* 观察者失败不影响记账 */ } };
+
 /** suspect 窗口：env `SOURCE_HOST_SUSPECT_MS`，默认 600000，钳在 [60000, 3600000]；空串/非数字/≤0 回退默认。 */
 export function sourceHostSuspectMs(env: Record<string, string | undefined> = process.env): number {
   const parsed = Number.parseInt(env.SOURCE_HOST_SUSPECT_MS ?? '', 10);
@@ -97,12 +113,15 @@ export function recordHostFailure(host: string, kind: HostFailureKind, now = Dat
     console.warn('[source-health] host_suspect', JSON.stringify({
       event: 'host_suspect', host: key, failures: entry.failures, kind, suspectMs: sourceHostSuspectMs(),
     }));
+    if (listener) notify(() => listener?.suspect(key));
   }
 }
 
 /** 记一次成功：清零（删掉条目）。 */
 export function recordHostSuccess(host: string): void {
-  if (host) hosts.delete(hostKey(host));
+  if (!host) return;
+  const key = hostKey(host);
+  if (hosts.delete(key) && listener) notify(() => listener?.recovered(key));
 }
 
 export function isHostSuspect(host: string, now = Date.now()): boolean {
