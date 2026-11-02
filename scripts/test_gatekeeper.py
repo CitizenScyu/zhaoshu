@@ -259,6 +259,35 @@ class MainFailClosedTest(unittest.TestCase):
         # .env 没写 LLM_URL 时退回内置默认（本机中转），且必须真的传到了 probe。
         self.assertEqual(set(endpoints), {gatekeeper.labeler.LLM_URL})
 
+    def test_launches_right_after_last_passing_probe(self):
+        """凑满 PASS_N 次通过后立刻启动 labeler，中间不再睡一个探测间隔。
+
+        旧实现每次探测后都 sleep，最后一次通过后要白等 10 分钟才放行（2026-11-02 生产实测）；
+        把 sleep 挪回无条件位置，本用例会变红。"""
+        events = []
+
+        class _Stop(Exception):
+            pass
+
+        def fake_run(cmd, **kw):
+            events.append('run')
+            raise _Stop
+
+        def fake_probe(api_key, models, llm_url):
+            events.append('probe')
+            return True
+
+        with mock.patch.object(gatekeeper.labeler, 'load_env',
+                               return_value=_env(LLM_MODELS='m-1')), \
+             mock.patch.object(gatekeeper, 'probe', side_effect=fake_probe), \
+             mock.patch.object(gatekeeper.subprocess, 'run', side_effect=fake_run), \
+             mock.patch.object(gatekeeper.time, 'sleep', lambda *_: events.append('sleep')):
+            with contextlib.redirect_stdout(io.StringIO()):
+                with self.assertRaises(_Stop):
+                    gatekeeper.main()
+        expected = ['probe', 'sleep'] * (gatekeeper.PASS_N - 1) + ['probe', 'run']
+        self.assertEqual(events, expected)
+
     def test_env_llm_url_reaches_probe(self):
         """端点版的 F3/M7：main 必须把 .env 的 LLM_URL 透传给 probe。
 

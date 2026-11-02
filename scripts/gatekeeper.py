@@ -243,7 +243,10 @@ def main() -> int:
                 print(f'  探测通过 {consecutive_ok}/{PASS_N}', flush=True)
             else:
                 consecutive_ok = 0
-            time.sleep(PROBE_INTERVAL)
+            # 凑满 PASS_N 次就立刻放行：此前最后一次通过后还要再睡 10 分钟才启动，
+            # 窗口已确认却白等，放行时探测结论也已过期 10 分钟（2026-11-02 实测）。
+            if consecutive_ok < PASS_N:
+                time.sleep(PROBE_INTERVAL)
         print(f'渠道就绪，启动 labeler round {round_no}', flush=True)
         code = launch_labeler()
         if code == EXIT_COMPANION_TOO_OLD:
