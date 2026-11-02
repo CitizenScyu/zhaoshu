@@ -161,6 +161,26 @@ function downloadStatusText(t: DownloadTask): string {
   }
 }
 
+// failcode1102：worker 终态 failed 只写错误码（download-worker storage.finish / ArtifactRegistryError），
+// 详情区原样列出等于给用户看英文码。已知码转中文、括注原码便于反馈；未知行原样保留。
+const TASK_ERROR_TEXT: Record<string, string> = {
+  ARTIFACT_IDENTITY_CONFLICT: '章节已下完，但这本书已有存档登记在别的存储位置，本次无法发布，需管理员处理',
+  ARTIFACT_PATH_COLLISION: '章节已下完，但存档路径与另一本书冲突，本次无法发布，需管理员处理',
+  REPOSITORY_NOT_WRITABLE: '章节已下完，但存储仓库当前不可写，本次无法发布，需管理员处理',
+  LABELED_BOOK_MISSING: '书库记录已不存在，请返回刷新书库',
+  no_candidates: '活跃书源中没有搜到这本书',
+  source_unavailable: '书源暂时无法访问，稍后可重试',
+  download_failed: '从书源下载失败，稍后可重试',
+  adapter_runtime_error: '下载器运行出错，稍后可重试',
+  limiter_feedback_unavailable: '限流服务暂时不可用，稍后可重试',
+};
+
+function taskNoteText(line: string): string {
+  const code = /^([A-Za-z_]+)(?::|$)/.exec(line)?.[1];
+  const text = code ? TASK_ERROR_TEXT[code] : undefined;
+  return text ? `${text}（${code}）` : line;
+}
+
 // Content-Disposition: filename*=UTF-8''xxx 或 filename="xxx"，取不到就用书名兜底
 function fileNameFrom(disposition: string, fallback: string): string {
   const star = /filename\*=(?:UTF-8|utf-8)''([^;]+)/.exec(disposition);
@@ -732,7 +752,7 @@ export default function LibraryTab({ view, setView }: {
   const pageSize = 30;
   const totalPages = Math.min(maxPage, Math.max(1, Math.ceil(total / pageSize)));
   const hasFilter = Boolean(search || category || tag || finish);
-  const taskNotes = task?.error?.split(/\r?\n/).map((line) => line.trim()).filter(Boolean) ?? [];
+  const taskNotes = task?.error?.split(/\r?\n/).map((line) => line.trim()).filter(Boolean).map(taskNoteText) ?? [];
 
   function resetFilters() {
     updateView({ page: 1, category: '', tag: '', finish: '', search: '', query: '' });
