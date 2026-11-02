@@ -809,6 +809,29 @@ class TestAutoImporter(TempDirCase):
             self.assertEqual(importer.retry_backlog(jsonl, limit=2), 0)
         self.assertEqual(len(calls), 3)                                # 尝试 3 条即停
 
+    def test_backlog_summarises_review_instead_of_logging_each(self):
+        # 2026-11-03：永久 review 每轮重扫、逐条打印，一天刷约 1.2 万行。欠账扫描只汇总一行，
+        # 首次打标（直接 import_record）仍逐条给原因。
+        records = [record(title=f'可疑{i}', site_title=f'可疑{i}',
+                          url=f'https://book15.net/books/details{i}.html')
+                   for i in range(4)]
+        for rec in records:
+            rec['labels']['site_title_match'] = False                  # 全 review
+        jsonl = self.dir / 'labels.jsonl'
+        jsonl.write_text('\n'.join(json.dumps(r, ensure_ascii=False) for r in records),
+                         encoding='utf-8')
+        logs = []
+        importer = import_one.AutoImporter(database_url='postgresql://u:p@db.example/neondb',
+                                           directory=self.dir, sql_exec=FakeDb(), log=logs.append)
+        self.assertEqual(importer.retry_backlog(jsonl, limit=2), 0)
+        self.assertEqual(logs, ['  自动导入: 欠账扫描 4 条，其中 4 条 review（逐条原因见首次打标日志）→ '
+                                '不自动导入，留给完整导入器 import_labels.mjs'])
+        logs.clear()
+        self.assertEqual(importer.import_record(records[0]), 'review')
+        self.assertEqual(len(logs), 1)
+        self.assertIn('不自动导入', logs[0])
+        self.assertNotIn('欠账扫描', logs[0])
+
     def test_retry_backlog_disabled_or_missing_file(self):
         db = FakeDb()
         importer = self.importer(db)

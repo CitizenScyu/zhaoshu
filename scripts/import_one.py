@@ -578,6 +578,8 @@ class AutoImporter:
         self._imported = set()
         # 最近一次导入失败的（已脱敏）错误文本；只给运维告警用，绝不落盘原始凭据。
         self.last_error = ''
+        # 欠账扫描期间不逐条打印 review（见 retry_backlog）。
+        self._quiet_review = False
         self.enabled = bool(enabled) and bool(self.database_url)
         self.disabled_reason = ''
         if not enabled:
@@ -738,7 +740,8 @@ class AutoImporter:
             duplicate = isinstance(url, str) and url in self._imported
             result = validate_record(rec)
             if result['status'] != 'ready':
-                if result['status'] in ('review', 'failed'):
+                quiet = result['status'] == 'review' and self._quiet_review
+                if result['status'] in ('review', 'failed') and not quiet:
                     self.log(f'  自动导入: {result["status"]}（{result.get("reason", "")}）→ '
                              f'不自动导入，留给完整导入器 import_labels.mjs')
                 return result['status']
@@ -786,26 +789,39 @@ class AutoImporter:
         except OSError as error:
             self.log(f'  自动导入: 读取 {path} 失败（忽略）: {error}')
             return 0
-        done = attempted = 0
+        done = attempted = reviewed = 0
         scan_cap = max(limit, IMPORT_BACKLOG_SCAN_CAP)
-        for line in reversed(lines):
-            if done >= limit or attempted >= scan_cap:
-                break
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                rec = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if not isinstance(rec, dict):
-                continue
-            url = rec.get('url')
-            if isinstance(url, str) and url in self._imported:
-                continue
-            attempted += 1
-            if self.import_record(rec) == 'imported':
-                done += 1
+        # review 是永久状态，每轮都会被重扫一遍：逐条打印时一天 28 轮刷出约 1.2 万行同样的
+        # 「作者为空」，把 gate.log 里真正的信号淹掉（2026-11-03 实测）。这里只汇总一行；
+        # 逐条原因在该书首次打标时已打印过。
+        self._quiet_review = True
+        try:
+            for line in reversed(lines):
+                if done >= limit or attempted >= scan_cap:
+                    break
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(rec, dict):
+                    continue
+                url = rec.get('url')
+                if isinstance(url, str) and url in self._imported:
+                    continue
+                attempted += 1
+                status = self.import_record(rec)
+                if status == 'imported':
+                    done += 1
+                elif status == 'review':
+                    reviewed += 1
+        finally:
+            self._quiet_review = False
+        if reviewed:
+            self.log(f'  自动导入: 欠账扫描 {attempted} 条，其中 {reviewed} 条 review（逐条原因见首次打标日志）→ '
+                     f'不自动导入，留给完整导入器 import_labels.mjs')
         return done
 
     def status_line(self):
