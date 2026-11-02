@@ -110,15 +110,21 @@ async function handleGET(req: NextRequest) {
       const myDownloadTask = canDownload ? tx`(SELECT dt.id FROM download_tasks dt
                 WHERE dt.requested_by = 'user' AND dt.user_id = ${auth.principal.userId} AND dt.book_id = labeled_books.id
                 ORDER BY dt.created_at DESC, dt.id DESC LIMIT 1)` : tx`NULL::integer`;
+      // 先分页、后取列（libpage1103）：两条相关子查询和 labels 原先对 OFFSET 跳过的行也要算，
+      // 生产实测第 170 页 2.1s、随页号线性变慢。内层只按排序键取本页 id，外层只对这 30 行
+      // 算子查询；外层按同一排序键 + id 重排，id 唯一，行与顺序逐字不变。
       return [
         tx`
         SELECT id, title, author, category, primary_genre, quality, finish_status,
                chars_labeled, labels, labeled_at::text AS labeled_at,
                ${sharedReadTask} AS shared_read_task_id,
                ${myDownloadTask} AS my_download_task_id
-        FROM labeled_books ${where}
-        ORDER BY ${orderBy}, id DESC
-        LIMIT ${PAGE_SIZE} OFFSET ${(page - 1) * PAGE_SIZE}`,
+        FROM labeled_books
+        JOIN (SELECT id AS page_id FROM labeled_books ${where}
+              ORDER BY ${orderBy}, id DESC
+              LIMIT ${PAGE_SIZE} OFFSET ${(page - 1) * PAGE_SIZE}) AS page_ids
+          ON page_ids.page_id = labeled_books.id
+        ORDER BY ${orderBy}, id DESC`,
         tx`
         SELECT count(*)::int AS total FROM labeled_books ${where}`,
         // 聚合可选筛选值（规范化主分类、完结状态）——给前端筛选条用
