@@ -175,9 +175,11 @@ REJECT_TERMINAL_THRESHOLD = 5
 REJECT_COOLDOWN_SEC = 86400
 REJECT_COOLDOWN_ENV = 'LABELER_REJECT_COOLDOWN_S'
 REJECTED_AT_FIELD = 'rejected_at'
-# 打标模型后备链：先 bohe，失败依次换 grok-4.6-hei → deepseek-v4.1-flash-hei → glm-5.3-agent。
+# 打标模型后备链：先 grok-4.6-bohe，失败依次换 deepseek-v4.1-flash-happy → agnes-3.0-flash-pm。
 # 可用 .env 的 LLM_MODELS=模型1,模型2,... 覆盖；无 LLM_MODELS 时兜底用旧 LLM_MODEL 单值。
-MODELS = ['deepseek-v4-flash-bohe', 'grok-4.6-hei', 'deepseek-v4.1-flash-hei', 'glm-5.3-agent']
+# 2026-11-02 与生产 .env 对齐并清掉不可用项：grok-4.6-wong 大请求 403 预扣费（当天 174 本全挂）、
+# glm-5.3-agent 网关已下架（503）、grok-4.6-hei 401；deepseek-v4-flash-bohe / deepseek-v4.1-flash-hei 早已不在链上。
+MODELS = ['grok-4.6-bohe', 'deepseek-v4.1-flash-happy', 'agnes-3.0-flash-pm']
 # 读库取模型名用的白名单：只是防呆（挡住空串/换行/注入了 SQL 的怪值），不是安全边界。
 MODEL_NAME_RE = re.compile(r'^[A-Za-z0-9._/-]{1,200}$')
 DB_MODEL_TIMEOUT_SEC = 5    # 读配置失败必须快速回落，不能拖住批量任务
