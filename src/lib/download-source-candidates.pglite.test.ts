@@ -8,7 +8,7 @@ import { initializeBusinessSchema } from '../lib/business-schema';
 import {
   claimSourcePrefetch, classifyFailure, failedCandidateSources, markCandidateFailure, occupiedHosts,
   productiveHostScores, releaseHostOccupancy, releaseSourcePrefetch, replaceSourceCandidates,
-  tryOccupyHost, usableSourceCandidates,
+  tryOccupyHost, usableSourceCandidates, zeroYieldHosts,
 } from './download-source-candidates';
 
 const PGliteCtor = await loadPGlite();
@@ -165,5 +165,36 @@ maybe('bsrcfix-41：候选源持久化与跨实例占位（0005 三表）', () =
     `);
     expect(await productiveHostScores(sql())).toEqual(new Map([['www.a.example', 2], ['b.example', 1]]));
     await expect(productiveHostScores(sql(), 0)).rejects.toThrow('windowDays is invalid');
+  });
+
+  it('zeroyield1102 zeroYieldHosts：窗口内失败书数 ≥ minBooks 且同站无 done；同书多源只算一本；可用行/过窗不计', async () => {
+    await pg.exec(`
+      INSERT INTO labeled_books (title, author) SELECT 'b' || g, '' FROM generate_series(2, 7) g;
+      INSERT INTO download_source_candidates (book_id, source_url, host, failure, updated_at) VALUES
+        (1, 'https://z.example/', 'z.example', 'temporary', now()),
+        (2, 'https://z.example/', 'z.example', 'permanent', now()),
+        (3, 'https://Z.example/s2', 'Z.example', 'temporary', now()),
+        (3, 'https://z.example/s3', 'z.example', 'temporary', now()),
+        (4, 'https://z.example/', 'z.example', 'temporary', now() - interval '40 days'),
+        (5, 'https://z.example/', 'z.example', '', now()),
+        (1, 'https://www.p.example/', 'www.p.example', 'temporary', now()),
+        (2, 'https://www.p.example/', 'www.p.example', 'temporary', now()),
+        (3, 'https://www.p.example/', 'www.p.example', 'temporary', now()),
+        (1, 'https://o.example/', 'o.example', 'temporary', now()),
+        (2, 'https://o.example/', 'o.example', 'temporary', now()),
+        (3, 'https://o.example/', 'o.example', 'temporary', now()),
+        (1, 'https://few.example/', 'few.example', 'temporary', now()),
+        (2, 'https://few.example/', 'few.example', 'temporary', now());
+      INSERT INTO download_tasks (user_id, book_id, title, status, source_url, updated_at) VALUES
+        (1, 21, 't', 'done', 'https://m.p.example/book/1', now()),
+        (1, 22, 't', 'done', 'https://o.example/book/1', now() - interval '40 days'),
+        (1, 23, 't', 'failed', 'https://z.example/book/1', now());
+    `);
+    // z：书 1/2/3 失败（书 3 两个源只算一本），书 4 过窗、书 5 可用不计 ⇒ 3；p：m. 上有 done（同站）⇒ 不降；
+    // o：done 已过窗 ⇒ 降；few：只 2 本 < 3。
+    expect(await zeroYieldHosts(sql(), 30, 3)).toEqual(new Map([['z.example', 3], ['o.example', 3]]));
+    expect(await zeroYieldHosts(sql())).toEqual(new Map());
+    await expect(zeroYieldHosts(sql(), 0)).rejects.toThrow('windowDays is invalid');
+    await expect(zeroYieldHosts(sql(), 30, 0)).rejects.toThrow('minBooks is invalid');
   });
 });

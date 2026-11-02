@@ -2,15 +2,18 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const scores = vi.hoisted(() => vi.fn());
-vi.mock('../src/lib/download-source-candidates', () => ({ productiveHostScores: scores }));
+const zero = vi.hoisted(() => vi.fn());
+vi.mock('../src/lib/download-source-candidates', () => ({ productiveHostScores: scores, zeroYieldHosts: zero }));
 
-import { createHostPriority, HOST_PRIORITY_TTL_MS, productiveFirstEnabled, scanRotateEnabled, skipStrictTocEnabled } from './host-priority';
+import {
+  createHostPriority, demoteZeroYieldEnabled, HOST_PRIORITY_TTL_MS, productiveFirstEnabled, scanRotateEnabled, skipStrictTocEnabled,
+} from './host-priority';
 
 const sql = {} as never;
 const signal = new AbortController().signal;
 
 describe('yield1030 host-priority', () => {
-  beforeEach(() => { scores.mockReset(); });
+  beforeEach(() => { scores.mockReset(); zero.mockReset(); });
 
   it('开关缺省/非真值 ⇒ undefined（selector 池序原样）', () => {
     expect(createHostPriority(sql, {})).toBeUndefined();
@@ -52,5 +55,30 @@ describe('yield1030 host-priority', () => {
     expect(await priority(signal)).toEqual(new Map());
     expect(await priority(signal)).toEqual(new Map([['a.example', 1]]));
     expect(scores).toHaveBeenCalledTimes(2);
+  });
+
+  it('zeroyield1102：开关 1/true/on；只开降级 ⇒ 零产出 -1、不查 done 分；两者都开 ⇒ 合并（有 done 分的不降）', async () => {
+    expect(demoteZeroYieldEnabled({})).toBe(false);
+    expect(demoteZeroYieldEnabled({ DOWNLOAD_SCAN_DEMOTE_ZERO_YIELD: 'yes' })).toBe(false);
+    expect(demoteZeroYieldEnabled({ DOWNLOAD_SCAN_DEMOTE_ZERO_YIELD: ' On ' })).toBe(true);
+    zero.mockResolvedValue(new Map([['z.example', 9], ['a.example', 5]]));
+    const only = createHostPriority(sql, { DOWNLOAD_SCAN_DEMOTE_ZERO_YIELD: '1' }, () => 0)!;
+    expect(await only(signal)).toEqual(new Map([['z.example', -1], ['a.example', -1]]));
+    expect(scores).not.toHaveBeenCalled();
+    scores.mockResolvedValue(new Map([['a.example', 2]]));
+    const both = createHostPriority(sql, { DOWNLOAD_SCAN_PRODUCTIVE_FIRST: '1', DOWNLOAD_SCAN_DEMOTE_ZERO_YIELD: '1' }, () => 0)!;
+    expect(await both(signal)).toEqual(new Map([['a.example', 2], ['z.example', -1]]));
+    const productiveOnly = createHostPriority(sql, { DOWNLOAD_SCAN_PRODUCTIVE_FIRST: '1' }, () => 0)!;
+    zero.mockClear();
+    expect(await productiveOnly(signal)).toEqual(new Map([['a.example', 2]]));
+    expect(zero).not.toHaveBeenCalled();
+  });
+
+  it('zeroyield1102：任一查询失败 ⇒ 空表且不缓存', async () => {
+    scores.mockResolvedValue(new Map([['a.example', 1]]));
+    zero.mockRejectedValueOnce(new Error('db down')).mockResolvedValueOnce(new Map([['z.example', 6]]));
+    const priority = createHostPriority(sql, { DOWNLOAD_SCAN_PRODUCTIVE_FIRST: '1', DOWNLOAD_SCAN_DEMOTE_ZERO_YIELD: '1' }, () => 0)!;
+    expect(await priority(signal)).toEqual(new Map());
+    expect(await priority(signal)).toEqual(new Map([['a.example', 1], ['z.example', -1]]));
   });
 });

@@ -176,6 +176,31 @@ export async function productiveHostScores(sql: CandidateSql, windowDays = 30): 
   return scores;
 }
 
+/**
+ * zeroyield1102：近 windowDays 天候选失败（failure<>''，任何原因）涉及 ≥ minBooks 本书、且同站（www./m. 归一，
+ * 同 stationKeyOfHost）同窗口内一本 done 都没有的候选 host ⇒ 失败书数。选源扫描据此把它们降到池尾（不剔除）。
+ * host 取候选表 host 列（= 选源池源 URL 的 host，与 selector 的 hostOf(source.url) 同键）。
+ * 物理 host 门让出（占用/熔断）不 markFailure，所以这里不会把「忙」算成「没产出」。
+ */
+export async function zeroYieldHosts(sql: CandidateSql, windowDays = 30, minBooks = 5): Promise<Map<string, number>> {
+  if (!Number.isSafeInteger(windowDays) || windowDays <= 0) throw new Error('windowDays is invalid');
+  if (!Number.isSafeInteger(minBooks) || minBooks <= 0) throw new Error('minBooks is invalid');
+  const rows = await sql`
+    WITH done AS (
+      SELECT DISTINCT regexp_replace(lower(substring(source_url from '^[A-Za-z][A-Za-z0-9+.-]*://([^/?#:@]+)')), '^((www|m)\\.)+', '') AS station
+      FROM download_tasks
+      WHERE status = 'done' AND updated_at > now() - (${windowDays}::int * interval '1 day'))
+    SELECT lower(c.host) AS host, count(DISTINCT c.book_id)::int AS n
+    FROM download_source_candidates c
+    WHERE c.failure <> '' AND c.host <> '' AND c.updated_at > now() - (${windowDays}::int * interval '1 day')
+      AND NOT EXISTS (SELECT 1 FROM done WHERE done.station = regexp_replace(lower(c.host), '^((www|m)\\.)+', ''))
+    GROUP BY 1
+    HAVING count(DISTINCT c.book_id) >= ${minBooks}::int` as unknown as { host: string | null; n: number }[];
+  const hosts = new Map<string, number>();
+  for (const row of rows) if (row.host && Number.isFinite(Number(row.n)) && Number(row.n) > 0) hosts.set(row.host, Number(row.n));
+  return hosts;
+}
+
 /** 下载失败 → 候选失败分类（permanent/temporary）。判据与 AdapterOutcome.failure.code 对齐。 */
 export function classifyFailure(code: string): Exclude<CandidateFailureKind, ''> {
   // identity_mismatch_or_no_candidate：该源详情页/正文身份不符——确定不是这本书，重试无意义。

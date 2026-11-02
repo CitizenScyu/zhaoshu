@@ -31,6 +31,7 @@ export interface SourceSelectorOptions {
   timeoutMs?: number;
   /**
    * yield1030：host 扫描优先分（越大越先扫，缺席 = 0）。缺省 = 池序原样（逐字同改前）。
+   * zeroyield1102：负分（零产出 host）排在缺席之后的池尾，仍在轮转尾段里，只降序不剔除。
    * 只做稳定重排：不增减可扫源、不动 scanLimit/预算/过滤口径——同样的扫描额度先给历史上真出过书的 host。
    * 提供方自行吞错回空表（重排是优化不是门，读不到就退回池序，不得因此少扫或 fail-closed）。
    */

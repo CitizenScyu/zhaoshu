@@ -148,6 +148,21 @@ describe('共用选源器', () => {
     expect(h.searchedUrls).toEqual(pool);
   });
 
+  it('zeroyield1102：负分（零产出）落在缺席之后的池尾；轮转照旧会转到它，只降序不剔除', async () => {
+    const pool = ['https://z.example/', 'https://a.example/', 'https://p.example/', 'https://b.example/', 'https://c.example/'];
+    const priority = async () => new Map([['z.example', -1], ['p.example', 2]]);
+    const first = harness({ pool, search: () => [], hostPriority: priority });
+    await first.selector(request({ scanLimit: 3 }), freshSignal());
+    expect(first.searchedUrls).toEqual(['https://p.example/', 'https://a.example/', 'https://b.example/']);
+    const all = harness({ pool, search: () => [], hostPriority: priority });
+    await all.selector(request({ scanLimit: 9 }), freshSignal());
+    expect(all.searchedUrls).toEqual(['https://p.example/', 'https://a.example/', 'https://b.example/', 'https://c.example/', 'https://z.example/']);
+    // 窗口 = 3 − 1 = 2；尾段 a b c z，rotate=1 跳过 a、b ⇒ c、z。
+    const turned = harness({ pool, search: () => [], hostPriority: priority });
+    await turned.selector(request({ scanLimit: 3, rotate: 1 }), freshSignal());
+    expect(turned.searchedUrls).toEqual(['https://p.example/', 'https://c.example/', 'https://z.example/']);
+  });
+
   it('共享扫描余额跨调用保留，过滤不扣额，耗尽后不再读池', async () => {
     const h = harness({ pool: ['http://skip.example/', 'https://a.example/', 'https://b.example/', 'https://c.example/'] });
     const scanBudget = { remaining: 3 };

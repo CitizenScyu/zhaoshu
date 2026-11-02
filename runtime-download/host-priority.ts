@@ -7,13 +7,24 @@
 // 真出过书的 host，不增出网。
 //
 // 读失败回空表（= 池序），不缓存失败；成功结果按 TTL 记忆，20 实例 × 每 10 分钟一次聚合查询。
+//
+// zeroyield1102：DOWNLOAD_SCAN_DEMOTE_ZERO_YIELD（缺省关）把零产出 host（近 30 天候选失败 ≥ 5 本书、同站无 done，
+// 见 zeroYieldHosts）记为 -1 分：selector 稳定排序后落到池尾（在默认 0 分之后），轮转窗口照旧覆盖，只降序不剔除。
+// 动机（2026-11-01 phoenix 只读，近 3 天）：zzxsa 131 次、17k 系 103 次、m.qidian 40、hongxiu 20 等下载恒败，
+// 选源命中后每本书各白耗一次下载尝试（temporary 记忆 48h 过期后再耗一次）。
 
-import { productiveHostScores, type CandidateSql } from '../src/lib/download-source-candidates';
+import { productiveHostScores, zeroYieldHosts, type CandidateSql } from '../src/lib/download-source-candidates';
 
 export const HOST_PRIORITY_TTL_MS = 10 * 60 * 1000;
 
 export function productiveFirstEnabled(env: Record<string, string | undefined> = process.env): boolean {
   const raw = env.DOWNLOAD_SCAN_PRODUCTIVE_FIRST?.trim().toLowerCase();
+  return raw === '1' || raw === 'true' || raw === 'on';
+}
+
+/** zeroyield1102：零产出 host 降到池尾。缺省关；1/true/on 开。 */
+export function demoteZeroYieldEnabled(env: Record<string, string | undefined> = process.env): boolean {
+  const raw = env.DOWNLOAD_SCAN_DEMOTE_ZERO_YIELD?.trim().toLowerCase();
   return raw === '1' || raw === 'true' || raw === 'on';
 }
 
@@ -34,12 +45,19 @@ export function createHostPriority(
   env: Record<string, string | undefined> = process.env,
   now: () => number = Date.now,
 ): ((signal: AbortSignal) => Promise<ReadonlyMap<string, number>>) | undefined {
-  if (!productiveFirstEnabled(env)) return undefined;
+  const productive = productiveFirstEnabled(env);
+  const demote = demoteZeroYieldEnabled(env);
+  if (!productive && !demote) return undefined;
   let memo: { at: number; value: ReadonlyMap<string, number> } | null = null;
   return async () => {
     if (memo && now() - memo.at < HOST_PRIORITY_TTL_MS) return memo.value;
     try {
-      const value = await productiveHostScores(sql);
+      const [scores, zero] = await Promise.all([
+        productive ? productiveHostScores(sql) : new Map<string, number>(),
+        demote ? zeroYieldHosts(sql) : new Map<string, number>(),
+      ]);
+      const value = new Map(scores);
+      for (const host of zero.keys()) if (!value.has(host)) value.set(host, -1);
       memo = { at: now(), value };
       return value;
     } catch {
