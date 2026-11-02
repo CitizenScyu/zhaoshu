@@ -22,7 +22,7 @@ import {
   gitBlobSha, isRetryablePublicationError, LeaseLostError, publishBookVersion, PublicationStageError, snapshotPaths,
   type GitHubContents, type PublishOutcome,
 } from './download-publisher';
-import { artifactIdentityKey } from './artifact-registry';
+import { artifactIdentityKey, type ArtifactIdentityOwner } from './artifact-registry';
 import type { TxtChapter } from './txt-chapters';
 // capacity986：发布期切仓决策（985 已交付模块，纯决策 + 端口注入，无 DB/网络副作用）。
 import { decideRepositoryForPublication, type RolloverEvidencePort } from '../../runtime-download/repository-rollover-wiring';
@@ -95,6 +95,8 @@ export interface WorkerStorage {
   reserveArtifactPath(input: { labeledBookId: number; identityKey: string; repositoryId: number; branch: string; canonicalPath: string }): Promise<number>;
   /** 查同书既有 artifact 落位（identity_key 唯一）：换源重下时发布决策回旧行的仓。 */
   findArtifactBinding(input: { identityKey: string; labeledBookId: number }): Promise<{ repositoryId: number; branch: string; canonicalPath: string } | null>;
+  /** prepub1102：按 identity_key 查既有落位全字段（不限书库记录）。可选；缺省时预检不生效。 */
+  findArtifactIdentityOwner?(input: { identityKey: string }): Promise<ArtifactIdentityOwner | null>;
   /** DB 阶段收口：登记已发布产物并把任务指向 artifact_id。 */
   registerArtifact(lease: DownloadTaskLease, input: {
     artifactId: number; version: string; blobSha: string; bytes: number;
@@ -220,6 +222,14 @@ export interface WorkerOptions {
    * HOST_WAIT_MAX_PROGRESS_CLAIMS 作不计数领取上限（无进展的仍是 HOST_WAIT_MAX_FREE_CLAIMS）。缺省关 = 逐字同改前。
    */
   hostWaitProgress?: boolean;
+  /**
+   * prepub1102：发布前预检。identity_key 唯一 ⇒ 每本书只有一条落位，而 reserveArtifactPath 只在
+   * 「书库记录 + 仓 + 分支 + 路径」四字段与既有行全等时放行。既有行挂在另一条书库记录下、或路径
+   * （书名/作者口径）与本次不同时，本次发布**必然**冲突——实测 8040 下完 42/42 章才撞
+   * ARTIFACT_IDENTITY_CONFLICT。开则领取后、抓取前先查一次，注定冲突的直接 failed，不再白下一整本。
+   * 缺省关 = 与引入前逐字一致；storage 未实现 findArtifactIdentityOwner 时同样不生效。
+   */
+  prePublishCheck?: boolean;
 }
 
 /** 切仓决策注入缝：端口（候选仓证据 + 显式时钟）与闭包重建工厂均由调用方（entry/测试）注入。 */
@@ -345,6 +355,41 @@ export async function runDownloadTask(
   if (task.status !== 'running') {
     // 领取语句与行读取之间被回收/终态化：停止，不写任何状态。
     return { processed: false, reason: 'task_not_running_after_claim' };
+  }
+
+  // prepub1102：发布前预检（默认关）。identity_key 唯一 ⇒ 每本书只有一条落位，而
+  // reserveArtifactPath 的 ON CONFLICT 只在与既有行「书库记录 + 仓 + 分支 + 路径」全等时放行。
+  // 既有行挂在别的书库记录下（重新入库/换书库 ID）或路径口径变了（书名/作者），本次发布
+  // 注定失败——实测白下完 42/42 章才撞 ARTIFACT_IDENTITY_CONFLICT。开则抓取前先判一次，
+  // 注定冲突的直接 failed，省掉整本下载。查询出错一律放行（fail-open），绝不因预检丢任务。
+  if (options.prePublishCheck && storage.findArtifactIdentityOwner) {
+    try {
+      const owner = await storage.findArtifactIdentityOwner({
+        identityKey: artifactIdentityKey(task.title, task.author),
+      });
+      if (owner) {
+        const { canonicalPath } = snapshotPaths(task.title, task.author);
+        const differs = [
+          owner.labeledBookId === task.book_id ? null : `书库记录 ${task.book_id}（已有落位登记在 ${owner.labeledBookId}）`,
+          owner.canonicalPath === canonicalPath ? null : `存档路径（已有落位 ${owner.canonicalPath}）`,
+        ].filter((item): item is string => item !== null);
+        if (differs.length) {
+          const written = await storage.finish(lease, {
+            status: 'failed',
+            error: cleanPgText([
+              'ARTIFACT_IDENTITY_CONFLICT: 这本书已有存档登记，与本次发布目标不一致，重下也会在发布阶段失败。',
+              `差异：${differs.join('；')}`,
+              '需管理员处理既有落位（或按既有落位重新入库）后再下载。',
+            ].join('\n').slice(0, 4000)),
+          });
+          if (!written) throw new TaskLeaseLostError();
+          return { processed: true, terminal: 'failed', reason: 'ARTIFACT_IDENTITY_CONFLICT' };
+        }
+      }
+    } catch (error) {
+      if (isLeaseLostError(error)) throw error;
+      // 预检不可用不影响正常下载：交给发布阶段的既有判定。
+    }
   }
 
   const heartbeat = startLeaseHeartbeat(storage, lease);

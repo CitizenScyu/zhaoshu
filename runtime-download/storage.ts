@@ -10,7 +10,7 @@ import {
   claimDownloadTask, deferDownloadTask, finishDownloadTask, heartbeatDownloadTask, updateDownloadTaskProgress,
   type DownloadTaskLease,
 } from '../src/lib/download-task-queue';
-import { findArtifactBinding, reserveArtifactPath } from '../src/lib/artifact-registry';
+import { findArtifactBinding, findArtifactIdentityOwner, reserveArtifactPath } from '../src/lib/artifact-registry';
 import type { ArtifactRegistrationResult, TaskRow, WorkerStorage } from '../src/lib/download-worker';
 
 export type DownloadSql = ReturnType<typeof neon>;
@@ -40,6 +40,8 @@ export function createWorkerStorage(sql: DownloadSql): RuntimeWorkerStorage {
 
     reserveArtifactPath: input => reserveArtifactPath(sql, input),
     findArtifactBinding: input => findArtifactBinding(sql, input),
+    // prepub1102：发布前预检（WorkerOptions.prePublishCheck 开时才被调用）。
+    findArtifactIdentityOwner: input => findArtifactIdentityOwner(sql, input),
 
     async registerArtifact(lease, input) {
       const rows = await sql`

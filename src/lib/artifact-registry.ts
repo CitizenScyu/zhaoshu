@@ -63,6 +63,42 @@ export async function findArtifactBinding(
   return { repositoryId, branch: row.branch, canonicalPath: row.canonical_path };
 }
 
+/** 按 identity_key 查既有落位的全字段（不限 labeled_book_id）：发布预检判「注定冲突」用。 */
+export interface ArtifactIdentityOwner {
+  labeledBookId: number;
+  repositoryId: number;
+  branch: string;
+  canonicalPath: string;
+}
+
+/**
+ * prepub1102：发布前预检的唯一查询。identity_key 唯一约束让每本书**只能有一条**落位，
+ * 而 reserveArtifactPath 的 ON CONFLICT 只在与既有行四字段全等时放行。因此：
+ * 既有行的 labeled_book_id ≠ 本次 book_id（重新入库/换书库记录）或 canonical_path ≠ 本次路径
+ * （书名/作者口径变了）时，本次发布**必然**落 failed——与重下多少次、下完多少章无关。
+ * findArtifactBinding 查的是「本书库记录 + 同身份」，这类情形它返回 null、不重定向，
+ * 于是用户白等一整本下载才在发布阶段失败。本函数只读，判定留给调用方。
+ */
+export async function findArtifactIdentityOwner(
+  sql: ReturnType<typeof neon>,
+  input: { identityKey: string },
+): Promise<ArtifactIdentityOwner | null> {
+  if (!input.identityKey || input.identityKey.includes('\0')) throw new Error('INVALID_ARTIFACT_INPUT');
+  const rows = await sql`
+    SELECT labeled_book_id, repository_id, branch, canonical_path FROM book_artifacts
+    WHERE identity_key = ${input.identityKey}
+    LIMIT 1` as { labeled_book_id: number | string; repository_id: number | string; branch: string; canonical_path: string }[];
+  const row = rows[0];
+  if (!row) return null;
+  const labeledBookId = Number(row.labeled_book_id);
+  const repositoryId = Number(row.repository_id);
+  if (!Number.isSafeInteger(labeledBookId) || labeledBookId <= 0
+    || !Number.isSafeInteger(repositoryId) || repositoryId <= 0 || !row.branch || !row.canonical_path) {
+    throw new Error('INVALID_ARTIFACT_BINDING_ROW');
+  }
+  return { labeledBookId, repositoryId, branch: row.branch, canonicalPath: row.canonical_path };
+}
+
 /**
  * T3 pre-write seam. Persist the path claim BEFORE any GitHub PUT. Identity is unique
  * because this table holds one canonical location per book, not snapshot history.
