@@ -309,6 +309,7 @@ export async function downloadBook(m, args, resolveSource, transport = fetchSour
   try { previous = JSON.parse(readFileSync(manifestPath, 'utf8')); } catch { /* first attempt */ }
   // 正文格式不同（缺字段按 1）的检查点当作不存在：不续传、不沿用章节记录，全量重抓（见 ENGINE_CONTENT_FORMAT）。
   if ((previous?.contentFormat ?? 1) !== ENGINE_CONTENT_FORMAT) previous = undefined;
+  const previousDone = Array.isArray(previous?.chapters) ? previous.chapters.filter(c => c?.status === 'done').length : 0;
   const manifest = { schemaVersion: 1, contentFormat: ENGINE_CONTENT_FORMAT, status: 'partial', title: args.title, author: args.author, source: args.source, chapters: previous?.chapters ?? [], errors: [], generated_at: new Date().toISOString() };
   // chapterresume1031：沿用的章节记录连同续传判据一起带上——本轮在目录前（解析/搜索/详情）就失败时，
   // 落盘的检查点仍可被下一轮续传（关时这三项缺失，下一轮必然从头抓）。走到对应阶段即被本轮值覆盖。
@@ -560,7 +561,13 @@ export async function downloadBook(m, args, resolveSource, transport = fetchSour
     if (isHostGateError(error)) throw error;
     // 外部中断（停机/租约/总预算）时的请求失败是被中止，不是书源不可达。
     if (SOURCE_STAGES.has(stage) && !controller.signal.aborted && isSourceUnavailableError(error)) failureCode = 2;
-    if (isBreakerYield(error)) { failureCode = 2; manifest.retry_cause = 'host_breaker'; }
+    if (isBreakerYield(error)) {
+      failureCode = 2; manifest.retry_cause = 'host_breaker';
+      // breakerprogress1102：本轮净增的已抓章（对比开跑时检查点里的 done 数；目录变了重抓的不算）。只写正数，
+      // 供任务层判「让出前有实进展」（WorkerOptions.hostWaitProgress）；纯诊断字段，引擎自身不读。
+      const gain = manifest.chapters.filter(c => c.status === 'done').length - previousDone;
+      if (gain > 0) manifest.progress_gain = gain;
+    }
     else if (failureCode === 2 && rechecking && recheckYield()
       && manifest.chapters.filter(c => c.status === 'done').length * 2 >= manifest.chapters.length) manifest.retry_cause = 'recheck_unavailable';
     if (failureCode === 2) manifest.failure_stage = stage; // 固定枚举，不含上游细节

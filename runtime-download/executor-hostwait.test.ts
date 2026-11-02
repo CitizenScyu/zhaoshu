@@ -16,11 +16,11 @@ const occupied: AdapterOutcome = {
   chaptersTotal: 0, chaptersDone: 0, charsTotal: 0,
 };
 
-function harness(hostWait: boolean) {
+function harness(hostWait: boolean, extra: { progress?: boolean; outcome?: AdapterOutcome; lease?: DownloadTaskLease } = {}) {
   const deferred: Parameters<WorkerStorage['defer']>[1][] = [];
   const logged: [string, Record<string, unknown> | undefined][] = [];
   const storage: WorkerStorage = {
-    claim: async () => lease,
+    claim: async () => extra.lease ?? lease,
     taskRow: async () => row,
     heartbeat: async () => true,
     progress: async () => true,
@@ -35,12 +35,13 @@ function harness(hostWait: boolean) {
     consume: async () => ({ allowed: true, date: '2026-10-31' }),
   };
   const refundBudget = vi.fn(async (_ticket: BudgetTicket): Promise<BudgetRefundOutcome> => 'refunded');
-  const adapter: SourceAdapter = { kind: 'engine', download: async () => occupied };
+  const adapter: SourceAdapter = { kind: 'engine', download: async () => extra.outcome ?? occupied };
   const executor = createExecutor({
     storage, github: { put: async () => {}, getBytes: async () => null }, adapters: [adapter], budget, refundBudget,
     repositoryId: 1, branch: 'main', owner: 'owner', decisions: DEFAULT_DECISIONS,
     log: (_level, message, fields) => { logged.push([message, fields]); },
     ...(hostWait ? { hostWait: true } : {}),
+    ...(extra.progress ? { hostWaitProgress: true } : {}),
   });
   return { run: () => executor.runOnce(), deferred, logged, refundBudget };
 }
@@ -65,5 +66,17 @@ describe('hostwait1031 执行器透传', () => {
     expect(h.logged).toEqual([['书源不可达', {
       reason: 'source_unavailable', stage: 'search', host: 'reader.test', retryAt: '2026-10-31T10:00:00.000Z',
     }]]);
+  });
+
+  it('breakerprogress1102：透传 hostWaitProgress——不计数领取已过 32 次时，有进展的熔断让出仍排队不计次', async () => {
+    const outcome: AdapterOutcome = { ...occupied, stage: 'content', retryCause: 'host_breaker', progressed: true };
+    const busy: DownloadTaskLease = { ...lease, leaseGeneration: 3 + 40, attemptCount: 3 };
+    const on = harness(true, { progress: true, outcome, lease: busy });
+    await on.run();
+    expect(on.deferred).toEqual([expect.objectContaining({ countAttempt: false })]);
+    const off = harness(true, { outcome, lease: busy });
+    await off.run();
+    expect(off.deferred).toHaveLength(1);
+    expect(off.deferred[0].countAttempt).toBeUndefined();
   });
 });

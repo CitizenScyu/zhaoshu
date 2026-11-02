@@ -44,6 +44,13 @@ export const PUBLICATION_RETRY_MAX_ATTEMPTS = SOURCE_RETRY_MAX_ATTEMPTS;
  */
 export const HOST_WAIT_DELAY_MS = SOURCE_RETRY_MAX_DELAY_MS;
 export const HOST_WAIT_MAX_FREE_CLAIMS = 32;
+/**
+ * breakerprogress1102：熔断让出但本轮有净增已抓章（WorkerOptions.hostWaitProgress）时的不计数领取上限。
+ * 动机（2026-11-02 phoenix 只读）：sto66 每 20 次请求即 400（swq-003，60s 冷却），每轮恰抓 20 章就熔断让出；
+ * 千章书要 ~50 轮，32 次额度用完即落 partial 终态（3 天 3 本，已抓 380~606 章）。256 × 30min ≈ 5.3 天，
+ * 每轮至少净增 1 章才用这份额度，仍有界。
+ */
+export const HOST_WAIT_MAX_PROGRESS_CLAIMS = 256;
 
 /** 第 attempt 次（1 起，即领取时的 attempt_count）不可达后的退避时长。 */
 export function sourceRetryDelayMs(attempt: number, retryClass: SourceRetryClass = 'transient'): number {

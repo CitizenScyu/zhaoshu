@@ -10,7 +10,7 @@ import {
   claimDownloadTask, deferDownloadTask, finishDownloadTask, heartbeatDownloadTask, retryDownloadTask, updateDownloadTaskProgress,
 } from './download-task-queue';
 import { findArtifactBinding, reserveArtifactPath } from './artifact-registry';
-import { HOST_WAIT_MAX_FREE_CLAIMS } from './download-task-policy';
+import { HOST_WAIT_MAX_FREE_CLAIMS, HOST_WAIT_MAX_PROGRESS_CLAIMS } from './download-task-policy';
 import { createWorkerStorage } from '../../runtime-download/storage';
 import {
   createEngineAdapter, runDownloadTask, runWorkerOnce, startLeaseHeartbeat,
@@ -474,6 +474,22 @@ maybe('T3 worker 任务层：租约、单写者、五阶段对账（PGlite + moc
     expect(await retryState(id)).toMatchObject({ status, attempt_count: 16 });
   });
 
+  // breakerprogress1102：熔断让出且本轮有净增 ⇒ 不计数领取上限放宽到 HOST_WAIT_MAX_PROGRESS_CLAIMS；无进展/开关关照旧 32。
+  const progressedBreaker: AdapterOutcome = { ...occupied, stage: 'content', retryCause: 'host_breaker', progressed: true };
+  const stalledBreaker: AdapterOutcome = { ...occupied, stage: 'content', retryCause: 'host_breaker' };
+  it.each<[number, boolean, AdapterOutcome, 'pending' | 'partial']>([
+    [HOST_WAIT_MAX_FREE_CLAIMS - 1, true, progressedBreaker, 'pending'],
+    [HOST_WAIT_MAX_PROGRESS_CLAIMS - 2, true, progressedBreaker, 'pending'],
+    [HOST_WAIT_MAX_PROGRESS_CLAIMS - 1, true, progressedBreaker, 'partial'],
+    [HOST_WAIT_MAX_FREE_CLAIMS - 1, true, stalledBreaker, 'partial'],
+    [HOST_WAIT_MAX_FREE_CLAIMS - 1, false, progressedBreaker, 'partial'],
+  ])('breakerprogress1102：已有 %i 次不计数领取、开关 %s（第 %# 例）', async (free, on, outcome, status) => {
+    const id = await insertTask('pending', { attempt_count: 16, lease_generation: 16 + free });
+    const result = await runDownloadTask(options([scriptAdapter(outcome)], { hostWait: true, ...(on ? { hostWaitProgress: true } : {}) }), (await claimDownloadTask(sql as never, 'worker-a'))!);
+    expect(result.terminal).toBe(status === 'partial' ? 'partial' : undefined);
+    expect(await retryState(id)).toMatchObject({ status, attempt_count: 16 });
+  });
+
   it('同内容重试不破坏 manifest：第二次发布保留首次 task_id/generated_at，规范幂等', async () => {
     const id = await insertTask();
     const txt = completeText('测试书', 3);
@@ -533,7 +549,9 @@ maybe('T3 worker 任务层：租约、单写者、五阶段对账（PGlite + moc
       if (args.source.includes('phasebad')) return { code: 1, manifest: { status: 'partial', errors: ['download_failed'], failure_name: 'RuleEngineError', failure_code: 'bad code', failure_phase: 'To C', chapters_total: 0, chapters_done: 0, chars: 0 } };
       if (args.source.includes('noname')) return { code: 1, manifest: { status: 'partial', errors: ['download_failed'], chapters_total: 0, chapters_done: 0, chars: 0 } };
       // breakeryield1031：熔断让出 ⇒ code=2 + retry_cause；其余 retry_cause 值不透传
-      if (args.source.includes('breaker')) return { code: 2, manifest: { status: 'partial', errors: ['source_unavailable'], failure_stage: 'content', retry_cause: args.source.includes('breakerodd') ? 'other' : 'host_breaker', chapters_total: 3, chapters_done: 2, chars: 1620 } };
+      if (args.source.includes('breaker')) return { code: 2, manifest: { status: 'partial', errors: ['source_unavailable'], failure_stage: 'content', retry_cause: args.source.includes('breakerodd') ? 'other' : 'host_breaker', chapters_total: 3, chapters_done: 2, chars: 1620,
+        // breakerprogress1102：progress_gain 正整数才透传 progressed
+        ...(args.source.includes('breakergain') ? { progress_gain: 2 } : args.source.includes('breakerzero') ? { progress_gain: 0 } : {}) } };
       if (args.source.includes('recheck')) return { code: 2, manifest: { status: 'partial', errors: ['source_unavailable'], failure_stage: 'toc', retry_cause: 'recheck_unavailable', chapters_total: 3, chapters_done: 3, chars: 2430 } };
       const mode = args.source.includes('bad') ? 'missing' : 'ok';
       if (mode === 'ok') return { code: 0, manifest: { status: 'done', errors: [], chapters_total: 3, chapters_done: 3, chars: 2430, artifact: { file: 'book.txt', sha256: 'x', bytes: 9 } } };
@@ -582,6 +600,9 @@ maybe('T3 worker 任务层：租约、单写者、五阶段对账（PGlite + moc
     expect(JSON.stringify(thrown)).not.toContain('synthetic path detail');
     expect(await run(11, 'breaker')).toMatchObject({ kind: 'incomplete', reason: 'source_unavailable', stage: 'content', retryCause: 'host_breaker', chaptersDone: 2 });
     expect((await run(12, 'breakerodd') as { retryCause?: string }).retryCause).toBeUndefined();
+    expect(await run(14, 'breakergain')).toMatchObject({ retryCause: 'host_breaker', progressed: true });
+    expect((await run(15, 'breakerzero') as { progressed?: boolean }).progressed).toBeUndefined();
+    expect((await run(16, 'breaker') as { progressed?: boolean }).progressed).toBeUndefined();
     expect(await run(13, 'recheck')).toMatchObject({ kind: 'incomplete', reason: 'source_unavailable', stage: 'toc', retryCause: 'recheck_unavailable' });
     const noname = await adapter.download({ id: 7, book_id: 1, title: 't', author: 'a', status: 'running', source_url: 'https://noname.example/z', source_kind: 'engine', source_id: null, requested_by: 'system' }, {
       signal: new AbortController().signal,

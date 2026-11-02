@@ -1158,6 +1158,31 @@ describe('breakeryield1031 限速器熔断让出', () => {
     expect(extra(r).retry_cause).toBe('host_breaker');
     expect(statuses(r)).toBe('dddppppppp');
   });
+
+  it('breakerprogress1102：让出时记本轮净增已抓章 progress_gain；续传轮零净增、搜索阶段熔断都不记', async () => {
+    vi.stubEnv('DOWNLOAD_BREAKER_YIELD', '1');
+    const f = setup();
+    let limit = 4;
+    const transport = wrap(f, () => false);
+    const gated = async (url: string, opts: Parameters<typeof transport>[1]) => {
+      const n = url.includes('/read/') ? Number(url.split('/read/')[1]) : 0;
+      if (n >= limit) throw breaker();
+      return transport(url, opts);
+    };
+    const r1 = await f.run(gated);
+    expect(r1.code).toBe(2);
+    expect((r1.manifest as { progress_gain?: number }).progress_gain).toBe(3);
+    const r2 = await f.run(gated);
+    expect(extra(r2).retry_cause).toBe('host_breaker');
+    expect((r2.manifest as { progress_gain?: number }).progress_gain).toBeUndefined();
+    limit = 7;
+    const r3 = await f.run(gated);
+    expect(statuses(r3)).toBe('ddddddpppp');
+    expect((r3.manifest as { progress_gain?: number }).progress_gain).toBe(3);
+    const s = setup();
+    const r4 = await s.run(async (url, opts) => { if (url.includes('/search')) throw breaker(); return s.transport(url, opts); });
+    expect((r4.manifest as { progress_gain?: number }).progress_gain).toBeUndefined();
+  });
 });
 
 // recheckyield1031：收尾目录复核抖动不判源失败（DOWNLOAD_RECHECK_YIELD，缺省关）。

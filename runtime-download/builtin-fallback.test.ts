@@ -1060,6 +1060,27 @@ describe('41-T8FB builtin-fallback', () => {
     expect(calls2).toEqual(['book15.net']);
     expect(h2.searched).toEqual([]);
     expect(state2.failures).toEqual([]);
+    expect((out as { progressed?: boolean }).progressed).toBeUndefined();
+  });
+
+  it('breakerprogress1102：任一候选熔断让出带 progressed ⇒ 收口带 progressed；原源让出原样透传', async () => {
+    const state = {
+      usable: [{ source_url: 'https://a.example/', host: 'a.example' }, { source_url: 'https://b.example/', host: 'b.example' }],
+      stored: [] as [number, string[]][], failures: [] as [number, string, string, string][],
+    };
+    const h = candidatesHarness(state);
+    const progressed: AdapterOutcome = {
+      kind: 'incomplete', reason: 'source_unavailable', stage: 'content', retryCause: 'host_breaker', progressed: true,
+      chaptersTotal: 9, chaptersDone: 5, charsTotal: 500,
+    };
+    const out = await h.fallback.wrapAdapter(adapter({}, []), adapter({ 'a.example': progressed }, []), 'engine')
+      .download(task({ source_kind: 'engine' }), context());
+    expect(out).toMatchObject({ kind: 'incomplete', stage: 'search', retryCause: 'host_breaker', progressed: true });
+
+    const h2 = candidatesHarness({ usable: [], stored: [] as [number, string[]][], failures: [] as [number, string, string, string][] });
+    const out2 = await h2.fallback.wrapAdapter(adapter({}, []), adapter({ 'book15.net': progressed }, []), 'engine')
+      .download(task({ source_kind: 'engine' }), context());
+    expect(out2).toEqual(progressed);
   });
 
   it('recheckyield1031：recheck_unavailable 同样不标失败、换下一源，收口带 recheck_unavailable', async () => {

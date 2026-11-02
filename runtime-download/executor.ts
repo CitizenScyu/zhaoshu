@@ -122,6 +122,8 @@ export interface ExecutorDependencies {
   releaseOnShutdown?: boolean;
   /** hostwait1031：透传 WorkerOptions.hostWait（host_occupied 放回不计 attempt）。entry 由 env DOWNLOAD_HOST_WAIT=1 开，缺省关。 */
   hostWait?: boolean;
+  /** breakerprogress1102：透传 WorkerOptions.hostWaitProgress。entry 由 env DOWNLOAD_HOST_WAIT_PROGRESS=1 开，缺省关。 */
+  hostWaitProgress?: boolean;
   // ---- 测试注入缝 ----
   now?: () => number;
   /** 冷却等待；signal 中止时须尽快 resolve（不 reject）。 */
@@ -164,6 +166,7 @@ export function createExecutor(deps: ExecutorDependencies): DownloadExecutor {
     ...(deps.rollover ? { rollover: deps.rollover } : {}),
     ...(deps.releaseOnShutdown && signal ? { shutdownSignal: signal } : {}),
     ...(deps.hostWait ? { hostWait: true } : {}),
+    ...(deps.hostWaitProgress ? { hostWaitProgress: true } : {}),
   });
   // 书源不可达的结构化日志：扣额度前预检与下载腿打同一行，只含原因码/阶段/源 host/下次可重试时刻。
   const logSourceUnavailable = (reason: string, stage: string, host: string, retryAt: string | null, hostWait = false) =>

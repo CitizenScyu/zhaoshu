@@ -390,6 +390,7 @@ export function createBuiltinFallback(options: BuiltinFallbackOptions) {
           if (!sources.length) return primary ?? unavailable('search', lastScanned > 0);
           let supplemented = false;
           let occupied: 'host_occupied' | 'host_breaker' | 'recheck_unavailable' | null = null;
+          let progressed = false; // breakerprogress1102：任一候选熔断让出前有净增已抓章
           for (;;) {
             let allFailed = true;
             for (const url of sources) {
@@ -404,6 +405,7 @@ export function createBuiltinFallback(options: BuiltinFallbackOptions) {
                 taskId: task.id, host, outcome: next.kind, reason,
                 ...(next.kind === 'failure' && next.detail ? { detail: next.detail } : {}),
                 ...(next.kind === 'incomplete' && next.retryCause ? { retryCause: next.retryCause } : {}),
+                ...(next.kind === 'incomplete' && next.progressed ? { progressed: true } : {}),
               });
               if (next.kind === 'complete') return next;
               if (next.kind === 'failure') {
@@ -425,6 +427,7 @@ export function createBuiltinFallback(options: BuiltinFallbackOptions) {
                 allFailed = false;
                 // 收口口径取最后一个让出的原因（两者任务层同样排队，只影响错误列措辞）。
                 occupied = next.retryCause;
+                if (next.progressed) progressed = true;
                 continue;
               }
               if (SOURCE_LEVEL_INCOMPLETE_REASONS.has(next.reason)) {
@@ -458,7 +461,7 @@ export function createBuiltinFallback(options: BuiltinFallbackOptions) {
           // 处理（WorkerOptions.hostWait）；也先于下面的身份终态——候选还没试，不能判这本书无源。
           // breakeryield1031：host_breaker（本机限速器熔断中，同样没真试完）同此口径；recheckyield1031 的
           // recheck_unavailable（正文已抓、只差复核）也不判无源，任务层按普通退避计次。
-          if (occupied) return { ...unavailable('search'), retryCause: occupied };
+          if (occupied) return { ...unavailable('search'), retryCause: occupied, ...(progressed ? { progressed: true as const } : {}) };
           // nocandrev41 F1：预检判定过身份缺失（原源可达但无此书）且候选全失败 ⇒ 按身份失败
           // 终态收口（与预检腿选不到候选同一语义），不降级成 source_unavailable 16 轮退避重扫。
           if (primary === null && plan?.identityMissed) return { kind: 'failure', code: 'identity_mismatch_or_no_candidate' };

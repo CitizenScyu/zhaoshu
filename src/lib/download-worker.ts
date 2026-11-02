@@ -15,7 +15,7 @@
 import { createHash } from 'node:crypto';
 import type { DownloadTaskLease } from './download-task-queue';
 import {
-  HOST_WAIT_DELAY_MS, HOST_WAIT_MAX_FREE_CLAIMS, PUBLICATION_RETRY_MAX_ATTEMPTS, SOURCE_RETRY_MAX_ATTEMPTS,
+  HOST_WAIT_DELAY_MS, HOST_WAIT_MAX_FREE_CLAIMS, HOST_WAIT_MAX_PROGRESS_CLAIMS, PUBLICATION_RETRY_MAX_ATTEMPTS, SOURCE_RETRY_MAX_ATTEMPTS,
   sourceRetryDelayMs, type SourceRetryClass,
 } from './download-task-policy';
 import {
@@ -55,7 +55,8 @@ export type AdapterOutcome =
       chapterRanges?: TxtChapter[];
     }
   // stage：source_unavailable 时判定所在阶段（resolve/search/detail/toc），只作日志用的固定枚举。
-  | { kind: 'incomplete'; reason: string; chaptersTotal: number; chaptersDone: number; charsTotal: number; stage?: string; retryCause?: 'host_occupied' | 'host_occupancy_unavailable' | 'host_breaker' | 'recheck_unavailable' }
+  // progressed（breakerprogress1102）：host_breaker 让出前本轮有净增已抓章（manifest.progress_gain>0）。
+  | { kind: 'incomplete'; reason: string; chaptersTotal: number; chaptersDone: number; charsTotal: number; stage?: string; retryCause?: 'host_occupied' | 'host_occupancy_unavailable' | 'host_breaker' | 'recheck_unavailable'; progressed?: true }
   | { kind: 'failure'; code: string; /** 脱敏诊断类别（Error 构造器名，如 TypeError；diag1030 起可带 /固定码 与 @阶段）——download_failed 兜底时定位速败结构用。 */ detail?: string };
 
 export interface SourceAdapterContext {
@@ -214,6 +215,11 @@ export interface WorkerOptions {
    * 同走此路——熔断 30min 自动恢复，间隔 HOST_WAIT_DELAY_MS（=30min）正好错开。
    */
   hostWait?: boolean;
+  /**
+   * breakerprogress1102：hostWait 开时，outcome.progressed（host_breaker 让出前本轮净增已抓章）的放回改用
+   * HOST_WAIT_MAX_PROGRESS_CLAIMS 作不计数领取上限（无进展的仍是 HOST_WAIT_MAX_FREE_CLAIMS）。缺省关 = 逐字同改前。
+   */
+  hostWaitProgress?: boolean;
 }
 
 /** 切仓决策注入缝：端口（候选仓证据 + 显式时钟）与闭包重建工厂均由调用方（entry/测试）注入。 */
@@ -431,9 +437,10 @@ export async function runDownloadTask(
         const stage = outcome.stage ?? 'unknown';
         const sourceHost = hostOf(task.source_url);
         const retryClass: SourceRetryClass = outcome.reason === 'no_candidates' ? 'no_candidates' : 'transient';
+        const freeClaimCap = options.hostWaitProgress && outcome.progressed ? HOST_WAIT_MAX_PROGRESS_CLAIMS : HOST_WAIT_MAX_FREE_CLAIMS;
         if (options.hostWait && outcome.reason === 'source_unavailable'
           && (outcome.retryCause === 'host_occupied' || outcome.retryCause === 'host_breaker')
-          && lease.leaseGeneration - lease.attemptCount < HOST_WAIT_MAX_FREE_CLAIMS) {
+          && lease.leaseGeneration - lease.attemptCount < freeClaimCap) {
           const retryAt = await storage.defer(lease, {
             delayMs: HOST_WAIT_DELAY_MS,
             countAttempt: false,
@@ -622,6 +629,7 @@ export interface EngineDownloadLike {
         failure_phase?: string;
         failure_code?: string;
         retry_cause?: string;
+        progress_gain?: number;
         artifact?: { file: string; sha256: string; bytes: number };
         chapters?: EngineChapterRecord[];
       };
@@ -778,8 +786,11 @@ export function createEngineAdapter(options: EngineAdapterOptions): SourceAdapte
         // breakeryield1031：熔断让出带 retryCause，回退层不标候选失败、任务层按 host 忙排队。
         // recheckyield1031：收尾目录复核抖动同样不标候选失败，但任务层照常计次退避（不在 hostWait 名单）。
         const retryCause = manifest.retry_cause === 'host_breaker' || manifest.retry_cause === 'recheck_unavailable' ? manifest.retry_cause : undefined;
+        // breakerprogress1102：熔断让出前本轮有净增已抓章（见 WorkerOptions.hostWaitProgress）。
+        const gain = manifest.progress_gain;
+        const progressed = retryCause === 'host_breaker' && typeof gain === 'number' && Number.isSafeInteger(gain) && gain > 0;
         return { kind: 'incomplete', reason: classified, chaptersTotal, chaptersDone, charsTotal, stage,
-          ...(retryCause ? { retryCause } : {}) };
+          ...(retryCause ? { retryCause } : {}), ...(progressed ? { progressed: true as const } : {}) };
       }
       if (classified === 'missing_chapters' || classified === 'toc_changed' || classified === 'budget_exhausted' || classified === 'interrupted' || classified === 'operation_timeout') {
         return { kind: 'incomplete', reason: classified, chaptersTotal, chaptersDone, charsTotal };
