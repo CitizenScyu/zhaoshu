@@ -1565,6 +1565,28 @@ class TestNormAuthor(unittest.TestCase):
                 self.assertTrue(douban_list.author_matches(a, b))
                 self.assertTrue(douban_list.author_matches(b, a))
 
+    def test_leading_at_handle_is_stripped(self):
+        # athandle1104：gate.log 实测「名单 遇牧烧绳 vs 引擎 @遇牧烧绳」判作者不符
+        for a, b in (('遇牧烧绳', '@遇牧烧绳'), ('弃吴钩', '＠弃吴钩'), ('刘和平', '@刘和平.'),
+                     ('唐家三少', '作者：@唐家三少'), ('唐家三少', '@ 唐家三少 著')):
+            with self.subTest(pair=(a, b)):
+                self.assertTrue(douban_list.author_matches(a, b))
+                self.assertTrue(douban_list.author_matches(b, a))
+        # 负对照：@ 后是另一个人照旧不符；名中的 @ 不剥；整串只有 @ 不剥成空
+        self.assertFalse(douban_list.author_matches('刘和平', '@好来巫'))
+        self.assertNotEqual(douban_list._norm_author('某@人'), douban_list._norm_author('某人'))
+        self.assertEqual(douban_list._norm_author('@'), '@')
+
+    def test_at_handle_variants_are_one_author_when_list_author_unknown(self):
+        # athandle1104：名单无作者时「@堵上西楼、堵上西楼」不再算 2 人判歧义；真多人照旧歧义
+        a = {'url': 'https://a.example/1'}
+        b = {'url': 'https://b.example/1'}
+        hit, ambiguous, _ = douban_list._author_unknown_decision([(a, '@堵上西楼'), (b, '堵上西楼')])
+        self.assertFalse(ambiguous)
+        self.assertIs(hit, a)
+        _, ambiguous, _ = douban_list._author_unknown_decision([(a, '@仰望黑夜'), (b, '@桃纸君萌萌哒')])
+        self.assertTrue(ambiguous)
+
 
 class TestSearchEngineAuthorLabel(unittest.TestCase):
     """labelerdiag41：候选阶段不得因「作者：」标签丢掉引擎兜底真命中。"""

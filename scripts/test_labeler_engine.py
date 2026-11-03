@@ -290,6 +290,8 @@ class TestEngineTocAuthorWriteback(unittest.TestCase):
         # 带「作者：」前缀 / 「著」尾缀被剥；保留大小写与「·」（不做身份比对式强归一）
         self.assertEqual(labeler.engine_author_writeback('', '作者：唐家三少 著', '书', '书'), '唐家三少')
         self.assertEqual(labeler.engine_author_writeback('', '乔治·奥威尔', '书', '书'), '乔治·奥威尔')
+        # athandle1104：前导「@」用户名记号不进入库作者串
+        self.assertEqual(labeler.engine_author_writeback('', '@堵上西楼', '书', '书'), '堵上西楼')
 
     def test_no_writeback_when_only_prefix_compatible_title(self):
         # rvauthor CE3：书名只前缀兼容（可能是另一本书）→ 不回写，保持作者空进 review
