@@ -132,6 +132,8 @@ def make_cli(sources: dict):
         if sub == 'toc':
             if spec.get('toc_fail'):
                 return _proc(1, '', 'x\n{"errorKind": "http_4xx"}\n')
+            if spec.get('toc_empty'):
+                return _proc(1, '', 'x\n{"errorKind": "empty"}\n')
             return _toc_proc(host, spec['n'], spec.get('title', TITLE), spec.get('author', AUTHOR),
                              spec.get('titles'))
         body = spec.get('body', lambda i: _book_body(i))(_idx(url))
@@ -453,6 +455,36 @@ class TestFetchSegmented(_NoSleep):
         cli = make_cli({'a.example.com': {'n': 100, 'toc_fail': True}})
         with self.assertRaises(labeler.EngineSourceGaveUp):
             _fetch(cli, _book())
+
+    def test_consecutive_empty_tocs_mark_host_dead(self):
+        """emptytoc1104：同 host 连续 EMPTY_TOC_GIVEUPS 本空目录 → 判死（回调落侧车），之后零请求。"""
+        dead_cb = []
+        tracker = labeler.SourceGiveupTracker(labeler.DEAD_HOST_GIVEUPS, on_dead=dead_cb.append)
+        cli = make_cli({'a.example.com': {'n': 100, 'toc_empty': True}})
+        for k in range(labeler.EMPTY_TOC_GIVEUPS):
+            self.assertNotIn('a.example.com', tracker.dead)
+            with self.assertRaises(labeler.EngineSourceGaveUp):
+                _fetch(cli, _book(), tracker=tracker)
+        self.assertIn('a.example.com', tracker.dead)
+        self.assertEqual(dead_cb, ['a.example.com'])
+        self.assertEqual(tracker.counts, {})           # 不占确定性放弃计数
+        before = len(cli.calls)
+        with self.assertRaises(labeler.EngineSourceGaveUp):
+            _fetch(cli, _book(), tracker=tracker)
+        self.assertEqual(len(cli.calls), before)
+
+    def test_successful_toc_resets_empty_streak(self):
+        tracker = labeler.SourceGiveupTracker(labeler.DEAD_HOST_GIVEUPS)
+        spec = {'n': 100, 'toc_empty': True}
+        cli = make_cli({'a.example.com': spec})
+        for _ in range(2):
+            for _ in range(labeler.EMPTY_TOC_GIVEUPS - 1):
+                with self.assertRaises(labeler.EngineSourceGaveUp):
+                    _fetch(cli, _book(), tracker=tracker)
+            spec['toc_empty'] = False
+            _fetch(cli, _book(), tracker=tracker)
+            spec['toc_empty'] = True
+        self.assertNotIn('a.example.com', tracker.dead)
 
     def test_time_budget_stops_fetching(self):
         """每个 CLI 请求耗 10s、时限 60s：到时即停，已取到的段照用，其余段标未取到；

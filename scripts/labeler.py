@@ -1498,6 +1498,12 @@ SERVER_ERROR_GIVEUP_STREAK = 8
 SERVER_ERROR_KIND = 'http_5xx'
 DEAD_HOST_GIVEUPS = 2
 DETERMINISTIC_ENGINE_ERRORS = frozenset({'policy', 'http_4xx', 'no_source'})
+# emptytoc1104：目录 errorKind=empty（无章/解析失败）单本可能是该站确无此书正文，不进确定性放弃；
+# 但同 host 连续多本都是空目录 = 该站目录解析整体失效（2026-11-04 local-server 实测
+# pre-api.tuishujun.com 每本都 empty、历史零成功，每轮 4–11 本全耗在它上面）→ 按死源处理
+# （本轮后续不再请求 + 落死源侧车跨轮跳过，选书阶段也不再选它的候选）。只看分段取文的目录阶段。
+EMPTY_TOC_KIND = 'empty'
+EMPTY_TOC_GIVEUPS = 3
 # 主源与全部备选都在本轮已失效 host 上、一个请求都没发时的放弃 kind（不是 CLI 错误类别）。
 DEAD_HOST_SKIP_KIND = 'dead_host_skipped'
 MIN_BOOK_CHARS = 10_000     # 一本书至少要抓到的字数（不足记「抓取字数不足」）
@@ -1655,14 +1661,28 @@ class SourceGiveupTracker:
                  dead: Iterable[str] = (), on_dead: Callable[[str], None] | None = None):
         self.threshold = threshold
         self.counts: dict[str, int] = {}
+        self.empty_tocs: dict[str, int] = {}
         self.dead: set[str] = set(dead)
         self.on_dead = on_dead
 
     def record(self, host: str) -> None:
         n = self.counts[host] = self.counts.get(host, 0) + 1
-        if n >= self.threshold and host not in self.dead:
+        if n >= self.threshold:
+            self._mark_dead(host, f'已累计放弃 {n} 次')
+
+    def record_empty_toc(self, host: str) -> None:
+        """emptytoc1104：同 host 连续 EMPTY_TOC_GIVEUPS 本书目录都是 empty（中间无一次目录成功）→ 判死。"""
+        n = self.empty_tocs[host] = self.empty_tocs.get(host, 0) + 1
+        if n >= EMPTY_TOC_GIVEUPS:
+            self._mark_dead(host, f'连续 {n} 本目录为空')
+
+    def record_toc_ok(self, host: str) -> None:
+        self.empty_tocs.pop(host, None)
+
+    def _mark_dead(self, host: str, why: str) -> None:
+        if host not in self.dead:
             self.dead.add(host)
-            print(f'  源失效（本轮）: {host} 已累计放弃 {n} 次，本轮后续条目不再请求该源', flush=True)
+            print(f'  源失效（本轮）: {host} {why}，本轮后续条目不再请求该源', flush=True)
             if self.on_dead is not None:
                 try:
                     self.on_dead(host)
@@ -2593,6 +2613,7 @@ def fetch_book_text_segmented(engine_cli, book: dict, tracker: SourceGiveupTrack
         else:
             try:
                 toc = _budget_engine_json(engine_cli, deadline, clock, 'toc', '--url', src['url'])
+                tracker.record_toc_ok(host)
                 toc_title, toc_author = _check_toc_identity(toc, expect_title, expect_author,
                                                             title_fold=True)
                 raw = [c for c in (toc.get('chapters') or []) if c.get('url')]
@@ -2612,6 +2633,8 @@ def fetch_book_text_segmented(engine_cli, book: dict, tracker: SourceGiveupTrack
                 print(f'  源 {host} 目录失败，跳过 [kind={e.kind or "?"}]: {e}')
                 if e.kind in DETERMINISTIC_ENGINE_ERRORS:
                     tracker.record(host)
+                elif e.kind == EMPTY_TOC_KIND:
+                    tracker.record_empty_toc(host)
             except Exception as e:
                 print(f'  源 {host} 目录失败，跳过: {e}')
         tocs[src['url']] = entry
