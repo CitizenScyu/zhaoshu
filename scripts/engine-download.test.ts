@@ -14,7 +14,7 @@ import { peerOutRoots, seedFromPeers } from '../runtime-download/resume-seed';
 import { createHtmlScope, createJsonScope, evaluateField } from '../src/lib/rule-engine/evaluate';
 import { parseFieldRule } from '../src/lib/rule-engine/parse';
 import { RuleEngineError } from '../src/lib/rule-engine/types';
-import { breakerYield, chapterErrorKind, chapterResume, contentFailStreak, contentRetryPasses, contentStopBookPages, downloadBook, downloadOptions, errorKindOf, hostBurstPause, keepCached, noticeUnnumbered, numberedBook, policyCodeOf, recheckYield, ruleFailHint, ruleHintOf } from './engine-download.mjs';
+import { breakerYield, chapterErrorKind, chapterResume, contentFailStreak, contentRetryPasses, contentStopBookPages, downloadBook, downloadOptions, errorKindOf, hostBurstPause, keepCached, noticeUnnumbered, numberedBook, policyCodeOf, recheckYield, retryPassPauseMs, ruleFailHint, ruleHintOf } from './engine-download.mjs';
 
 const dirs: string[] = [];
 afterEach(() => { vi.unstubAllGlobals(); for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
@@ -1046,6 +1046,29 @@ describe('retrypass1030 正文失败章补抓', () => {
   it.each([['1', 1], [' 3 ', 3]] as const)('%j 解析为 %d 轮', (value, passes) => {
     vi.stubEnv('DOWNLOAD_CONTENT_RETRY_PASSES', value);
     expect(contentRetryPasses()).toBe(passes);
+  });
+
+  // retrybackoff1103：补抓轮静置递增（DOWNLOAD_CONTENT_RETRY_BACKOFF，缺省关）。
+  it('缺省关：每轮静置 1s（零行为变化）', () => {
+    expect([0, 1, 2].map(i => retryPassPauseMs(i))).toEqual([1000, 1000, 1000]);
+    for (const value of ['0', '', 'true', '2']) {
+      vi.stubEnv('DOWNLOAD_CONTENT_RETRY_BACKOFF', value);
+      expect(retryPassPauseMs(1)).toBe(1000);
+    }
+  });
+  it('BACKOFF=1：第 1 轮仍 1s，第 2/3 轮 20s/60s，越界钳到末档', () => {
+    vi.stubEnv('DOWNLOAD_CONTENT_RETRY_BACKOFF', ' 1 ');
+    expect([0, 1, 2, 3].map(i => retryPassPauseMs(i))).toEqual([1000, 20_000, 60_000, 60_000]);
+  });
+  it('BACKOFF=1 + R=1：只走第 1 轮（1s），补抓结果与关时相同', async () => {
+    vi.stubEnv('DOWNLOAD_CONTENT_RETRY_PASSES', '1');
+    vi.stubEnv('DOWNLOAD_CONTENT_RETRY_BACKOFF', '1');
+    const f = setup();
+    const started = Date.now();
+    const r = await f.run(wrap(f, firstTry502));
+    expect(r.manifest.status).toBe('done');
+    expect(reads(f)).toBe(13);
+    expect(Date.now() - started).toBeLessThan(10_000);
   });
 });
 

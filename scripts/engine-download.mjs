@@ -88,6 +88,16 @@ export function contentRetryPasses(env = process.env) {
   return Number(raw);
 }
 
+// retrybackoff1103：DOWNLOAD_CONTENT_RETRY_BACKOFF=1 时补抓轮静置按轮次递增（第 1 轮 1s 不变，第 2 轮 20s、第 3 轮 60s）；
+// 缺省/其他值 = 关（每轮 1s，零行为变化）。动机（2026-11-03 phoenix 只读，3 天）：完成率 ≥90% 却 missing_chapters 的
+// 43 个 manifest 共 550 个缺章，546 个是瞬时类（ConnectTimeout 304 / 500 174 / 502 20 / 超时 40），R=1、1s 补抓仍失败——
+// 源站成串抖动通常持续十几秒以上，1s 后重打还在同一个抖动窗口里。
+const RETRY_BACKOFF_PAUSE_MS = [1000, 20_000, 60_000];
+export function retryPassPauseMs(passIndex, env = process.env) {
+  if (env.DOWNLOAD_CONTENT_RETRY_BACKOFF?.trim() !== '1') return 1000;
+  return RETRY_BACKOFF_PAUSE_MS[Math.min(passIndex, RETRY_BACKOFF_PAUSE_MS.length - 1)];
+}
+
 // stopbook1031：DOWNLOAD_CONTENT_STOP_BOOK_PAGES=1 时把详情页/目录页并入正文停止点（缺省/其他值 = 关，零行为变化）。
 // 动机（2026-10-31 phoenix 只读 + pc-linux 实网复现）：72h 内 24 本 manifest ≥90% 已抓、仅差末章即判 missing_chapters
 // 整本作废换源；m.cuoceng 末章 #linkNext 指回详情页（bookUrl），停止点只含目录章节拦不住，详情页按正文规则取空
@@ -528,10 +538,10 @@ export async function downloadBook(m, args, resolveSource, transport = fetchSour
       }
     }
     // retrypass1030：瞬时类失败章补抓（见 contentRetryPasses）；关时 0 轮，与改前逐字同序。
-    for (let pass = contentRetryPasses(); pass > 0; pass -= 1) {
+    for (let pass = contentRetryPasses(), passIndex = 0; pass > 0; pass -= 1, passIndex += 1) {
       const again = manifest.chapters.filter(c => c.status === 'failed' && RETRYABLE_CHAPTER_ERRORS.has(c.error));
       if (!again.length) break;
-      await pause(1000, undefined, { signal: controller.signal }).catch(() => controller.signal.throwIfAborted());
+      await pause(retryPassPauseMs(passIndex), undefined, { signal: controller.signal }).catch(() => controller.signal.throwIfAborted());
       failStreak = 0;
       for (const chapter of again) await fetchChapter(chapter);
     }
