@@ -2606,7 +2606,8 @@ def fetch_book_text_segmented(engine_cli, book: dict, tracker: SourceGiveupTrack
                     raise
                 print(f'  备选源 {host} 目录身份不符，跳过')
             except EngineCliError as e:
-                print(f'  源 {host} 目录失败，跳过: {e}')
+                # tockind1104：摘要常被 safeReason 抹成 [redacted-url]，带上 kind 才分得清确定性失败与抖动
+                print(f'  源 {host} 目录失败，跳过 [kind={e.kind or "?"}]: {e}')
                 if e.kind in DETERMINISTIC_ENGINE_ERRORS:
                     tracker.record(host)
             except Exception as e:
