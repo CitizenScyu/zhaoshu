@@ -638,19 +638,20 @@ describe('vipwall42 付费墙预览截断识别', () => {
     expect(r.manifest.status).toBe('partial');
     expect(r.manifest.errors).toEqual(['preview_truncated']);
     expect(existsSync(join(dirname(r.manifestPath), 'book.txt'))).toBe(false);
-  });
+  }, 60_000);
+  // flaketimeout1104：60 章整本在 2 核门禁机实测 3.6–5.3s，默认 5s 超时会偶发误挂
   it('60 章正常书（中位 2200 字）不受闸门影响照常 done', async () => {
     const f = setup();
     const r = await f.run(wrap(f, 60, fullText));
     expect(r.code).toBe(0);
     expect(r.manifest.status).toBe('done');
-  });
+  }, 60_000);
   it('小书短章（30 章 280 字）不触发闸门照常 done', async () => {
     const f = setup();
     const r = await f.run(wrap(f, 30, previewText));
     expect(r.code).toBe(0);
     expect(r.manifest.status).toBe('done');
-  });
+  }, 60_000);
 });
 
 // previewearly1031：付费墙预览首轮提前收口（DOWNLOAD_PREVIEW_EARLY，缺省关）。
@@ -1017,7 +1018,7 @@ describe('retrypass1030 正文失败章补抓', () => {
     const r = await f.run(wrap(f, n => (n === 4 ? 'http' : '')));
     expect(r.manifest.errors).toEqual(['missing_chapters']);
     expect(reads(f)).toBe(12);
-  });
+  }, 60_000);
 
   it('规则类失败（empty_content_page）不补抓', async () => {
     vi.stubEnv('DOWNLOAD_CONTENT_RETRY_PASSES', '3');
