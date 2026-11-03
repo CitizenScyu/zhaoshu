@@ -1143,7 +1143,8 @@ class EngineJunkTracker:
 
 def search_engine(cli, title: str, author: str = '',
                   stats: dict | None = None,
-                  junk: EngineJunkTracker | None = None) -> dict | None:
+                  junk: EngineJunkTracker | None = None,
+                  source_policy=None) -> dict | None:
     """book15 miss 后的引擎兜底搜索：调 CLI `search --title …`，title + 作者双校验。
 
     N02 修复：author 不再只传不用——候选作者非空且归一化后与名单作者不等 → 必拒
@@ -1157,7 +1158,9 @@ def search_engine(cli, title: str, author: str = '',
     stats（可选计数字典）：title 兼容但 URL 引擎取不了（非 HTTPS 等）的候选计入 stats['http_only']。
     espfix41：恒带 --no-builtin（book15 已由 search_book15 搜过或已熔断，其候选这里本来就跳过，
     CLI 里再搜一遍是纯浪费——book15 宕机时单这一步就 2×8s）；junk（可选）已判垃圾的 host 经
-    --skip-host 跳过，本次候选再喂给 junk.observe 继续识别。"""
+    --skip-host 跳过，本次候选再喂给 junk.observe 继续识别。
+    source_policy（可选）：停用 host 同样经 --skip-host 不搜；返回候选里停用/冷却中的源一律丢弃
+    （含备选），否则 readnovel 这类目录必失败的源每轮都被选中、白跑一次 toc。"""
     # authcv41 §7/M3：名单作者字段被污染（分类名/出版社）→ 降级为名单无作者，交内容聚类救回。
     # 放在组 args 之前，故也不会把污染值当 --author 传给引擎搜索。bogus_raw 透出到返回 hit，由
     # _resolve_candidates 据此把队列条目 author 置空/采信候选作者，绝不让污染串流到 labeler。
@@ -1180,9 +1183,11 @@ def search_engine(cli, title: str, author: str = '',
     if author:
         args += ['--author', author]
     args.append('--no-builtin')
-    if junk is not None:
-        for host in sorted(junk.hosts):
-            args += ['--skip-host', host]
+    skip = set(junk.hosts) if junk is not None else set()
+    if source_policy is not None:
+        skip |= source_policy.disabled_hosts()
+    for host in sorted(skip):
+        args += ['--skip-host', host]
     try:
         proc = cli.run('search', *args)
     except subprocess.TimeoutExpired:
@@ -1203,6 +1208,9 @@ def search_engine(cli, title: str, author: str = '',
         return None
     if not isinstance(candidates, list):
         return None
+    if source_policy is not None:
+        candidates = [c for c in candidates
+                      if not (isinstance(c, dict) and source_policy.blocked(c.get('source') or '')[0])]
     if junk is not None:
         junk.observe(title, candidates)
     candidates = _deprioritize_sources(candidates)
@@ -2257,7 +2265,8 @@ def _resolve_candidates(candidates: list[dict], http_get, origin: str = '',
         if engine_cli is not None and not engine_disabled:
             try:
                 engine_hit = search_engine(engine_cli, b['title'], list_author,
-                                           stats=engine_stats, junk=engine_junk)
+                                           stats=engine_stats, junk=engine_junk,
+                                           source_policy=source_policy)
             except EngineUnavailable as e:
                 # 环境错误：本轮禁用引擎兜底，不重试（不连坐后续候选）。
                 # 617：book15 已静态 retired 时**没有**「降级 book15-only」可言——

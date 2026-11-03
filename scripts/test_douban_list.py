@@ -1177,6 +1177,63 @@ def _pool_cli(real_hits: dict):
     return FakeEngineCli(results)
 
 
+class TestEngineSearchHonorsSourcePolicy(unittest.TestCase):
+    """引擎搜索遵守源策略：停用 host 经 --skip-host 不搜，返回候选里停用/冷却中的源丢弃（含备选）。
+    改前 LABELER_SOURCE_DISABLED_HOSTS 只拦 http_get，www.readnovel.com 这类目录必失败的源每轮被选中。"""
+
+    DEAD = 'www.readnovel.com'
+
+    def setUp(self):
+        no_wait(self)
+
+    def _cli(self, calls):
+        def results(sub, args):
+            calls.append(list(args))
+            title = args[args.index('--title') + 1]
+            return _proc(0, _engine_search_stdout([
+                {'source': self.DEAD, 'title': title, 'author': '',
+                 'bookUrl': f'https://{self.DEAD}/book/1'},
+                {'source': 'www.yingsx.com', 'title': title, 'author': '',
+                 'bookUrl': 'https://www.yingsx.com/book/2'},
+            ]))
+        return FakeEngineCli(results)
+
+    def test_disabled_host_skipped_and_filtered(self):
+        import labeler_source_policy as sp
+        policy = sp.SourcePolicy(extra_disabled=[self.DEAD])
+        calls = []
+        hit = douban_list.search_engine(self._cli(calls), '甲书', source_policy=policy)
+        self.assertIn(self.DEAD, calls[0][calls[0].index('--skip-host') + 1:])
+        self.assertEqual(hit['url'], 'https://www.yingsx.com/book/2')
+        self.assertFalse(any(self.DEAD in a['url'] for a in hit.get('alternates') or []))
+
+    def test_cooling_host_filtered(self):
+        import labeler_source_policy as sp
+        policy = sp.SourcePolicy(cooldown_ttl=3600, threshold=1)
+        with contextlib.redirect_stdout(io.StringIO()):
+            policy.record_failure(self.DEAD, 'test')
+        calls = []
+        hit = douban_list.search_engine(self._cli(calls), '甲书', source_policy=policy)
+        self.assertEqual(hit['url'], 'https://www.yingsx.com/book/2')
+
+    def test_counterexample_without_policy_dead_host_kept(self):
+        calls = []
+        hit = douban_list.search_engine(self._cli(calls), '甲书')
+        self.assertNotIn('--skip-host', calls[0])
+        urls = [hit['url']] + [a['url'] for a in hit.get('alternates') or []]
+        self.assertIn(f'https://{self.DEAD}/book/1', urls)
+
+    def test_resolve_candidates_passes_policy(self):
+        import labeler_source_policy as sp
+        policy = sp.SourcePolicy(builtin_disabled=sp.BOOK15_HOSTS, extra_disabled=[self.DEAD])
+        calls = []
+        queue = douban_list._resolve_candidates(
+            [{'title': '甲书'}], lambda url: NO_RESULT_HTML, engine_cli=self._cli(calls),
+            source_policy=policy)
+        self.assertEqual([b['url'] for b in queue], ['https://www.yingsx.com/book/2'])
+        self.assertIn(self.DEAD, calls[0])
+
+
 class TestEngineJunkSource(unittest.TestCase):
     """espfix41：查询不敏感的垃圾源——本轮识别后经 --skip-host 跳过，不再每本白请求。"""
 

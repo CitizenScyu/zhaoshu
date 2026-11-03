@@ -3927,7 +3927,7 @@ def _relocate_rank_books_to_engine(rank_books: list[dict], engine_cli,
             skipped_miss.append(b)
             continue
         try:
-            hit = douban_list.search_engine(engine_cli, title)
+            hit = douban_list.search_engine(engine_cli, title, source_policy=SOURCE_POLICY)
         except douban_list.EngineUnavailable as e:
             # 环境错误：一次就停，不逐本重试连坐（同名单线语义）。剩余全部按 miss 计。
             print(f'  引擎不可用，剩余榜单候选全部跳过（book15 已停用，不回退直连）: {e}',

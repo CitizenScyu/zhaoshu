@@ -303,7 +303,7 @@ class TestRelocationKeepsAlternates(IdentityHarness):
         hit = {'url': ENGINE_URL_A1, 'title': '书甲', 'source': 'src1.example',
                'alternates': [ALT]}
         stub = mock.patch.object(labeler.douban_list, 'search_engine',
-                                 side_effect=lambda cli, title: hit)
+                                 side_effect=lambda cli, title, **kw: hit)
         with stub:
             out, stats = labeler._relocate_rank_books_to_engine(
                 [{'url': DETAIL_A, 'title': '书甲'}], object())
