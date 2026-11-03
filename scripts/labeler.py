@@ -4502,6 +4502,11 @@ def main() -> int:
             }
             # 628：成功记录挂稳定身份键——下轮引擎换站后 split_queue 仍按身份认得（不重标）。
             _attach_identity(b_out, b)
+            list_title = (b.get('list_title') or '').strip()
+            if list_title and list_title != site_title:
+                # resolvedone1104：名单书名与站点书名不同时落盘，下轮 load_done_index 按名单书名
+                # 在搜索前就判已打标（省一次引擎搜索）；导入端按已知字段读取，忽略本字段。
+                b_out['list_title'] = list_title
             if quality_flag:
                 b_out['quality_flag'] = quality_flag
                 b_out['text_quality_evidence'] = evidence

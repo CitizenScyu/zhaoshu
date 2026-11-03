@@ -815,7 +815,9 @@ def _done_author(value) -> str:
 
 
 def load_done_index(path) -> dict[str, set[str]]:
-    """完成记录的title/site_title别名 → 作者集合；空作者项不能被已知作者覆盖。"""
+    """完成记录的title/site_title/list_title别名 → 作者集合；空作者项不能被已知作者覆盖。
+
+    list_title（resolvedone1104）= 引擎命中前的名单书名，与站点书名不同时由 labeler 落盘。"""
     titles: dict[str, set[str]] = {}
     source = Path(path)
     if not source.exists():
@@ -835,7 +837,7 @@ def load_done_index(path) -> dict[str, set[str]]:
         if not isinstance(rec, dict):
             continue
         author = _done_author(rec.get('author'))
-        for field in ('title', 'site_title'):
+        for field in ('title', 'site_title', 'list_title'):
             title = rec.get(field)
             key = _norm_title(title) if isinstance(title, str) else ''
             if key:
@@ -2201,6 +2203,8 @@ def _resolve_candidates(candidates: list[dict], http_get, origin: str = '',
     skipped = 0
     book15_hits = 0
     engine_hits = 0
+    resolved_done = 0                       # resolvedone1104：引擎命中后判已打标/本轮重复
+    queued_index: dict[str, set[str]] = {}  # 本轮已入队引擎条目（同 done_index 口径）
     bare_region_rejected = 0
     engine_stats: dict = {}
     engine_junk = EngineJunkTracker() if engine_cli is not None else None
@@ -2282,6 +2286,23 @@ def _resolve_candidates(candidates: list[dict], http_get, origin: str = '',
                       file=sys.stderr)
                 engine_disabled = True
         if engine_hit:
+            # resolvedone1104：上面的已打标判定只看名单书名，引擎命中后条目书名换成站点书名
+            # （《剑来1：少年起微末》/《剑来2…》→《剑来》、《鬼吹灯-全八册》→《鬼吹灯（盗墓者的经历）》），
+            # labels.jsonl 记的是站点书名 ⇒ 名单书名永远判不成已打标，同一本每轮重抓重标
+            # （2026-11-04 实测 labels.jsonl 6370 行里 610 行是重复，剑来 58 次）。
+            # 命中后按站点书名 + 作者再判一次已打标，并按同口径做本轮内去重（多卷名单同轮并进）。
+            hit_author = list_author or engine_hit.get('author') or ''
+            if ((done_index is not None
+                    and is_done_candidate(engine_hit['title'], hit_author, done_index))
+                    or is_done_candidate(engine_hit['title'], hit_author, queued_index)):
+                resolved_done += 1
+                print(f'  引擎命中书已打标或本轮已入队，跳过: 名单《{b.get("title", "")}》'
+                      f'→ 候选《{engine_hit["title"]}》')
+                if not book15_skipped:
+                    time.sleep(SEARCH_DELAY)
+                continue
+            queued_index.setdefault(_norm_title(engine_hit['title']), set()).add(
+                _done_author(hit_author))
             entry = {'url': engine_hit['url'], 'title': engine_hit['title'],
                      # 名单书名（rvauthor 增量必修）：engine_hit['title'] 是候选站点标题，会覆盖
                      # 名单书名；打标回写要用名单书名与 toc 标题比「完全相等」，故在条目里另存一份。
@@ -2316,6 +2337,8 @@ def _resolve_candidates(candidates: list[dict], http_get, origin: str = '',
             time.sleep(SEARCH_DELAY)
     # 开关关闭时 engine_hits=0 且 book15_hits==len(queue)，本行逐字复现旧文案（红线）。
     engine_note = f'，引擎兜底命中 {engine_hits} 本' if engine_cli is not None else ''
+    if resolved_done:
+        engine_note += f'（另 {resolved_done} 本命中后判已打标/本轮重复）'
     if engine_stats.get('http_only'):
         engine_note += f'（跳过非 HTTPS 源候选 {engine_stats["http_only"]} 条）'
     # 未熔断时本行逐字不变；熔断后补一段「熔断跳过 book15 搜索 N 本」。

@@ -32,6 +32,20 @@ class FakeCli:
         ]))
 
 
+class SiteTitleCli(FakeCli):
+    """引擎候选书名固定为站点书名（与名单书名不同，模拟《剑来1：少年起微末》→《剑来》）。"""
+    def __init__(self, site_title, author='甲作者'):
+        super().__init__(author)
+        self.site_title = site_title
+
+    def run(self, command, *args):
+        self.calls.append((command, args))
+        return SimpleNamespace(returncode=0, stderr='', stdout=json.dumps([
+            {'title': self.site_title, 'author': self.author, 'source': 'synthetic.example',
+             'bookUrl': 'https://synthetic.example/books/1'},
+        ]))
+
+
 class DoneAuthorGate(unittest.TestCase):
     def setUp(self):
         stack = contextlib.ExitStack()
@@ -129,6 +143,41 @@ class DoneAuthorGate(unittest.TestCase):
         self.assertEqual(self.resolve({'title': '合成书', 'author': '乙作者'}, done, cli,
                                       skip_titles={'合成书'}), [])
         self.assertEqual(cli.calls, [])
+
+    # resolvedone1104：名单书名 ≠ 站点书名时，命中后按站点书名再判已打标 + 本轮去重
+    def test_engine_hit_already_labeled_under_site_title_is_skipped(self):
+        done = self.index([{'title': '合成书', 'site_title': '合成书', 'author': '甲作者'}])
+        cli = SiteTitleCli('合成书', '甲作者')
+        self.assertEqual(self.resolve({'title': '合成书1：卷一', 'author': '甲作者'}, done, cli), [])
+        self.assertEqual(len(cli.calls), 1)        # 名单书名不在索引里，搜索照常发生
+        # 站点书名同名但作者可确认不同 ⇒ 不是同一本，照常入队
+        other = SiteTitleCli('合成书', '乙作者')
+        queue = self.resolve({'title': '合成书1：卷一', 'author': '乙作者'}, done, other)
+        self.assertEqual([e['title'] for e in queue], ['合成书'])
+
+    def test_volumes_resolving_to_one_book_are_queued_once_per_round(self):
+        cli = SiteTitleCli('合成书', '甲作者')
+        candidates = [{'title': f'合成书{i}：卷{i}', 'author': '甲作者'} for i in (1, 2, 5)]
+        queue = dl._resolve_candidates(candidates, self.http, done_index={}, engine_cli=cli,
+                                       source_policy=self.policy)
+        self.assertEqual([(e['title'], e['list_title']) for e in queue], [('合成书', '合成书1：卷1')])
+        self.assertEqual(len(cli.calls), 3)
+        # 不传 done_index（旧调用口径）本轮内去重同样生效
+        queue = dl._resolve_candidates(candidates, self.http, engine_cli=SiteTitleCli('合成书', '甲作者'),
+                                       source_policy=self.policy)
+        self.assertEqual(len(queue), 1)
+
+    def test_list_title_in_records_skips_before_search(self):
+        done = self.index([{'title': '合成书', 'site_title': '合成书', 'list_title': '合成书1：卷一',
+                            'author': '甲作者'}])
+        self.assertIn(dl._norm_title('合成书1：卷一'), done)
+        cli = SiteTitleCli('合成书', '甲作者')
+        self.assertEqual(self.resolve({'title': '合成书1：卷一', 'author': '甲作者'}, done, cli), [])
+        self.assertEqual(cli.calls, [])
+
+    def test_labeler_persists_list_title_on_success_record(self):
+        source = Path(__file__).with_name('labeler.py').read_text(encoding='utf-8')
+        self.assertIn("b_out['list_title'] = list_title", source)
 
     def test_both_queue_adapters_forward_the_same_index_decision(self):
         done = self.index([{'title': '合成书', 'author': '甲作者'}])
