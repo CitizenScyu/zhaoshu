@@ -1507,7 +1507,8 @@ class TestMainLoop(unittest.TestCase):
 
         def fake_build(http_get, skip_titles=None, include_douban=True, pages=None,
                        done_index=None,
-                       engine_cli=None, book15_breaker=None, source_policy=None):
+                       engine_cli=None, book15_breaker=None, source_policy=None,
+                       engine_miss=None):
             return [json.loads(json.dumps(book))]
         label_mock = mock.Mock(side_effect=label_fn)
         out, err = io.StringIO(), io.StringIO()

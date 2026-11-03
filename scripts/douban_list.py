@@ -21,12 +21,14 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import time
 import unicodedata
 import urllib.parse
 from collections import defaultdict
 from math import ceil
 from pathlib import Path
+from typing import Callable
 
 import labeler_source_policy
 
@@ -1146,6 +1148,101 @@ class EngineJunkTracker:
                       f' {len(urls)} 条无关结果，后续搜索跳过', flush=True)
 
 
+# ---- 引擎未命中跨轮记忆（engmiss1104）----
+# 2026-11-04 local-server 实测：名单 ~470 本里 ~180 本每轮都引擎搜不到（作者不符/歧义/无候选），
+# 一轮 19 分钟几乎全花在把这批书重搜一遍上，结果每轮相同、零产出，还每天对第三方源站多打
+# ~8000 次搜索。这里按（名单书名, 名单作者）记「干净 miss」：CLI 正常返回（rc=0/1、输出可解析）
+# 但没有可收候选。有效期内同一本不再发引擎搜索，过期自动重搜（源池/名单变化最晚 TTL 后生效）。
+# 超时 / rc=2 / 输出坏都不记（EngineUnavailable 或 stats['bad_output']）。TTL 默认对齐死源侧车 6h；
+# LABELER_ENGINE_MISS_TTL_SEC=0 关闭（行为同改前）。只存书名/作者归一键与时刻，不含 URL。
+ENGINE_MISS_TTL_SEC = 6 * 3600
+ENGINE_MISS_TTL_ENV = 'LABELER_ENGINE_MISS_TTL_SEC'
+ENGINE_MISS_FILENAME = 'labels-engine-miss.json'
+ENGINE_MISS_MAX = 20000
+
+
+def resolve_engine_miss_ttl(env: dict | None = None) -> int:
+    """LABELER_ENGINE_MISS_TTL_SEC → 秒；空/非整数 → 默认；<=0 = 关闭。"""
+    raw = str((env or {}).get(ENGINE_MISS_TTL_ENV) or '').strip()
+    if not raw:
+        return ENGINE_MISS_TTL_SEC
+    try:
+        return int(raw)
+    except ValueError:
+        print(f'  提示: {ENGINE_MISS_TTL_ENV}=「{raw}」不是整数，已忽略（用默认 {ENGINE_MISS_TTL_SEC}）',
+              file=sys.stderr)
+        return ENGINE_MISS_TTL_SEC
+
+
+class EngineMissMemo:
+    """引擎干净 miss 的跨轮记忆：{"version":1,"misses":{键: 记录时刻}}。读坏/缺文件 = 空记忆。"""
+
+    def __init__(self, path, ttl_sec: int = ENGINE_MISS_TTL_SEC, misses: dict | None = None,
+                 clock: Callable[[], float] = time.time):
+        self.path = Path(path)
+        self.ttl_sec = ttl_sec
+        self.misses: dict[str, float] = dict(misses or {})
+        self._clock = clock
+        self.dirty = False
+
+    @staticmethod
+    def key(title: str, author: str) -> str:
+        return f'{_norm_title(title)}\x1f{_norm_author(author or "")}'
+
+    @classmethod
+    def load(cls, path, ttl_sec: int = ENGINE_MISS_TTL_SEC,
+             clock: Callable[[], float] = time.time) -> 'EngineMissMemo':
+        memo = cls(path, ttl_sec, clock=clock)
+        if ttl_sec <= 0:
+            return memo
+        try:
+            raw = json.loads(Path(path).read_text(encoding='utf-8')).get('misses')
+            entries = {str(k): float(v) for k, v in raw.items() if isinstance(v, (int, float))}
+        except FileNotFoundError:
+            entries = {}
+        except (OSError, ValueError, TypeError, AttributeError) as e:
+            print(f'  提示: 引擎未命中记忆读取失败（按空处理）: {e}', file=sys.stderr)
+            entries = {}
+        now = clock()
+        memo.misses = {k: t for k, t in entries.items() if 0 <= now - t < ttl_sec}
+        memo.dirty = memo.misses != entries
+        return memo
+
+    def recent(self, title: str, author: str) -> bool:
+        if self.ttl_sec <= 0:
+            return False
+        t = self.misses.get(self.key(title, author))
+        return t is not None and 0 <= self._clock() - t < self.ttl_sec
+
+    def record(self, title: str, author: str) -> None:
+        if self.ttl_sec > 0 and _norm_title(title):
+            self.misses[self.key(title, author)] = self._clock()
+            self.dirty = True
+
+    def save(self) -> None:
+        """原子写（临时文件 + os.replace）；超上限留最新的。失败只告警。"""
+        if self.ttl_sec <= 0 or not self.dirty:
+            return
+        keep = dict(sorted(self.misses.items(), key=lambda kv: kv[1], reverse=True)[:ENGINE_MISS_MAX])
+        tmp = None
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            fd, tmp = tempfile.mkstemp(dir=str(self.path.parent), prefix='.engine-miss-')
+            with os.fdopen(fd, 'w', encoding='utf-8') as f:
+                json.dump({'version': 1, 'misses': keep}, f, ensure_ascii=False)
+            os.replace(tmp, self.path)
+            tmp = None
+            self.dirty = False
+        except OSError as e:
+            print(f'  提示: 引擎未命中记忆写入失败（不影响本轮）: {e}', file=sys.stderr)
+        finally:
+            if tmp is not None:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+
+
 def search_engine(cli, title: str, author: str = '',
                   stats: dict | None = None,
                   junk: EngineJunkTracker | None = None,
@@ -1210,8 +1307,10 @@ def search_engine(cli, title: str, author: str = '',
     try:
         candidates = json.loads(proc.stdout)
     except (json.JSONDecodeError, TypeError):
-        return None
+        candidates = None
     if not isinstance(candidates, list):
+        if stats is not None:      # engmiss1104：输出坏不是「干净 miss」，不进未命中记忆
+            stats['bad_output'] = stats.get('bad_output', 0) + 1
         return None
     if source_policy is not None:
         candidates = [c for c in candidates
@@ -2160,7 +2259,8 @@ def validate_engine(cli) -> None:
 def build_douban_queue(http_get, skip_titles: set | None = None,
                        pages: int | None = None, engine_cli=None,
                        book15_breaker: Book15Breaker | None = None,
-                       source_policy=None, done_index: dict[str, set[str]] | None = None) -> list[dict]:
+                       source_policy=None, done_index: dict[str, set[str]] | None = None,
+                       engine_miss: EngineMissMemo | None = None) -> list[dict]:
     """豆瓣名单 → book15 打标队列 [{url, title, author, category, status, douban_url}]。
 
     与 labeler.fetch_rank_books() 的产出同构（url 为站内相对路径），
@@ -2173,13 +2273,15 @@ def build_douban_queue(http_get, skip_titles: set | None = None,
     return _resolve_candidates(douban_books, http_get, origin='豆瓣tag',
                                skip_titles=skip_titles, engine_cli=engine_cli,
                                book15_breaker=book15_breaker,
-                               source_policy=source_policy, done_index=done_index)
+                               source_policy=source_policy, done_index=done_index,
+                               engine_miss=engine_miss)
 
 
 def _resolve_candidates(candidates: list[dict], http_get, origin: str = '',
                         skip_titles: set | None = None, engine_cli=None,
                         book15_breaker: Book15Breaker | None = None,
-                        source_policy=None, done_index: dict[str, set[str]] | None = None) -> list[dict]:
+                        source_policy=None, done_index: dict[str, set[str]] | None = None,
+                        engine_miss: EngineMissMemo | None = None) -> list[dict]:
     """候选名单（[{title, author, ...}]）→ 过 book15 搜索+校验的打标队列。
 
     各名单源共用：命中记队列（category 记来源标记，默认取候选自带 origin，
@@ -2197,10 +2299,15 @@ def _resolve_candidates(candidates: list[dict], http_get, origin: str = '',
 
     source_policy（617）：统一源策略。book15 停用/冷却中 ⇒ search_book15 零请求返回 None，
     候选自然全部走引擎兜底（= 任务书「book15 不再作为候选前置搜索」；引擎未开时按 miss 汇总，
-    不回退 book15 直连）。None 时行为与改前一致。"""
+    不回退 book15 直连）。None 时行为与改前一致。
+
+    engine_miss（engmiss1104）：引擎干净 miss 的跨轮记忆；TTL 内同（名单书名, 名单作者）不再
+    发引擎搜索、照常计入 miss。只记 search_engine 正常返回 None（不含 EngineUnavailable/输出坏）。
+    None 时行为不变；保存由调用方负责。"""
     queue: list[dict] = []
     miss: list[str] = []
     skipped = 0
+    engine_miss_skipped = 0
     book15_hits = 0
     engine_hits = 0
     resolved_done = 0                       # resolvedone1104：引擎命中后判已打标/本轮重复
@@ -2240,6 +2347,11 @@ def _resolve_candidates(candidates: list[dict], http_get, origin: str = '',
         # espfix41：book15 已熔断 ⇒ 本本不会请求 book15，SEARCH_DELAY（对 book15 的礼貌间隔）不再睡；
         # 引擎 CLI 内部自带按请求节流，且每本新起进程本身就隔开了对同站的两次搜索。
         book15_skipped = book15_breaker is not None and book15_breaker.open
+        # engmiss1104：源策略停用/冷却 book15 时 search_book15 同样零请求，礼貌间隔一并免掉
+        # （生产 book15 静态停用，此前每本白睡 1.5s，约 190 本/轮 ≈ 4.7 分钟）。
+        if (not book15_skipped and source_policy is not None
+                and source_policy.blocked(labeler_source_policy.BOOK15_HOST)[0]):
+            book15_skipped = True
         hit = search_book15(http_get, b['title'], breaker=book15_breaker,
                             source_policy=source_policy)
         if hit:
@@ -2269,11 +2381,23 @@ def _resolve_candidates(candidates: list[dict], http_get, origin: str = '',
                 time.sleep(SEARCH_DELAY)
             continue
         engine_hit = None
+        engine_clean_miss = False
+        if (engine_miss is not None and engine_cli is not None and not engine_disabled
+                and engine_miss.recent(b['title'], list_author)):
+            # engmiss1104：TTL 内已干净搜不到 ⇒ 本轮不再发引擎搜索（照常计入 miss 汇总）
+            engine_miss_skipped += 1
+            miss.append(b['title'])
+            if not book15_skipped:
+                time.sleep(SEARCH_DELAY)
+            continue
         if engine_cli is not None and not engine_disabled:
+            bad_before = engine_stats.get('bad_output', 0)
             try:
                 engine_hit = search_engine(engine_cli, b['title'], list_author,
                                            stats=engine_stats, junk=engine_junk,
                                            source_policy=source_policy)
+                engine_clean_miss = (not engine_hit
+                                     and engine_stats.get('bad_output', 0) == bad_before)
             except EngineUnavailable as e:
                 # 环境错误：本轮禁用引擎兜底，不重试（不连坐后续候选）。
                 # 617：book15 已静态 retired 时**没有**「降级 book15-only」可言——
@@ -2333,12 +2457,16 @@ def _resolve_candidates(candidates: list[dict], http_get, origin: str = '',
             engine_hits += 1
         else:
             miss.append(b['title'])
+            if engine_clean_miss and engine_miss is not None:
+                engine_miss.record(b['title'], list_author)
         if not book15_skipped:
             time.sleep(SEARCH_DELAY)
     # 开关关闭时 engine_hits=0 且 book15_hits==len(queue)，本行逐字复现旧文案（红线）。
     engine_note = f'，引擎兜底命中 {engine_hits} 本' if engine_cli is not None else ''
     if resolved_done:
         engine_note += f'（另 {resolved_done} 本命中后判已打标/本轮重复）'
+    if engine_miss_skipped:
+        engine_note += f'（{engine_miss_skipped} 本近期已搜无果，本轮未重搜）'
     if engine_stats.get('http_only'):
         engine_note += f'（跳过非 HTTPS 源候选 {engine_stats["http_only"]} 条）'
     # 未熔断时本行逐字不变；熔断后补一段「熔断跳过 book15 搜索 N 本」。
@@ -2687,7 +2815,8 @@ def build_webnovel_queue(http_get, include_douban: bool = True,
                          skip_titles: set | None = None,
                          pages: int | None = None, engine_cli=None,
                          book15_breaker: Book15Breaker | None = None,
-                         source_policy=None, done_index: dict[str, set[str]] | None = None) -> list[dict]:
+                         source_policy=None, done_index: dict[str, set[str]] | None = None,
+                         engine_miss: EngineMissMemo | None = None) -> list[dict]:
     """网文站名单（主）+ 豆瓣 tag（补充）→ book15 打标队列。
 
     用户指令（2026-09-18）：网文站榜单是对口 book15 的一手来源，优先；
@@ -2721,4 +2850,5 @@ def build_webnovel_queue(http_get, include_douban: bool = True,
         add_batch(fetch_douban_books(http_get, pages=pages), '豆瓣网文tag')
     return _resolve_candidates(candidates, http_get, skip_titles=skip_titles,
                                engine_cli=engine_cli, book15_breaker=book15_breaker,
-                               source_policy=source_policy, done_index=done_index)
+                               source_policy=source_policy, done_index=done_index,
+                               engine_miss=engine_miss)

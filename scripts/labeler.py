@@ -66,13 +66,15 @@ import labeler_source_policy
 EXIT_COMPANION_TOO_OLD = 5   # 配套文件版本不匹配：fail-closed（0/1/2 的语义见 main 末尾）
 REQUIRED_DOUBAN_LIST_API = (
     'Book15Breaker', 'CONTENT_TOC_MIN_MATCH', 'CONTENT_TOC_MIN_NAME_CHARS', 'ENGINE_CLI_TIMEOUT',
-    'EngineCli', 'EngineUnavailable', '_AUTHOR_SUFFIX_RE', '_body_decides', '_char_ngrams',
+    'ENGINE_MISS_FILENAME', 'EngineCli', 'EngineMissMemo', 'EngineUnavailable',
+    '_AUTHOR_SUFFIX_RE', '_body_decides', '_char_ngrams',
     '_clean_body_chapters', '_informative_toc_titles', '_is_auxiliary_toc_name', '_norm_author',
     '_norm_generic_toc_word', '_norm_title', '_norm_title_bare', '_split_toc_numbering',
     '_strip_author_label', '_to_simplified', '_toc_chapter_number', '_toc_decides',
     'author_matches', 'body_pair_details', 'build_douban_queue', 'build_webnovel_queue',
     'engine_fallback_enabled', 'fetch_content_fingerprint', 'is_placeholder_author',
-    'load_done_index', 'resolve_book15_breaker', 'resolve_douban_pages', 'same_book',
+    'load_done_index', 'resolve_book15_breaker', 'resolve_douban_pages',
+    'resolve_engine_miss_ttl', 'same_book',
     'search_engine', 'title_compatible', 'validate_engine',
 )
 REQUIRED_SOURCE_POLICY_API = (
@@ -4148,15 +4150,20 @@ def main() -> int:
                 engine_cli = EngineStopUrls(EngineChapterContext(engine_cli))
             # book15 熔断（labelerdiag41）：整站挂掉时别让每本 3 次全失败把一轮拖成十几小时。
             book15_breaker = douban_list.Book15Breaker(douban_list.resolve_book15_breaker(env))
+            # engmiss1104：近期干净 miss 的书跨轮不再重搜引擎（LABELER_ENGINE_MISS_TTL_SEC=0 关闭）
+            engine_miss = douban_list.EngineMissMemo.load(
+                data_path(douban_list.ENGINE_MISS_FILENAME),
+                douban_list.resolve_engine_miss_ttl(env))
             all_books = (douban_list.build_douban_queue(
                              bridged, done_index=done_index, pages=pages,
                              engine_cli=engine_cli, book15_breaker=book15_breaker,
-                             source_policy=SOURCE_POLICY)
+                             source_policy=SOURCE_POLICY, engine_miss=engine_miss)
                          if args.source == 'douban'
                          else douban_list.build_webnovel_queue(
                              bridged, done_index=done_index, pages=pages,
                              engine_cli=engine_cli, book15_breaker=book15_breaker,
-                             source_policy=SOURCE_POLICY))
+                             source_policy=SOURCE_POLICY, engine_miss=engine_miss))
+            engine_miss.save()
             print(f'{args.source} 线共 {len(all_books)} 本（搜索命中后）')
         else:
             print('拉取榜单书目...')
