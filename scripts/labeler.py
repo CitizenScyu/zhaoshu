@@ -64,6 +64,12 @@ import labeler_source_policy
 #     gatekeeper.py 那两处是刻意动态的，各自已有 fail-closed 兜底）。
 #   · 新加一个配套文件就在 COMPANION_MODULES 里加一行 + 在测试里加同款的名单反查。
 EXIT_COMPANION_TOO_OLD = 5   # 配套文件版本不匹配：fail-closed（0/1/2 的语义见 main 末尾）
+# 空队列（本轮无待打标条目）退出码，仅当调用方在**进程环境**里设了 IDLE_EXIT_ENV=1 才启用
+# （gatekeeper 会设；手动跑、旧门卫不设 ⇒ 照旧返回 0）。走 os.environ 而非 .env：这是门卫与
+# 子进程之间的进程级约定，不是部署配置。opt-in 的理由：旧门卫把未知码当异常退出，会进
+# 「探测→重启」循环，每圈白烧 25 万字段探测。
+EXIT_IDLE = 6
+IDLE_EXIT_ENV = 'LABELER_EXIT_IDLE'
 REQUIRED_DOUBAN_LIST_API = (
     'Book15Breaker', 'CONTENT_TOC_MIN_MATCH', 'CONTENT_TOC_MIN_NAME_CHARS', 'ENGINE_CLI_TIMEOUT',
     'ENGINE_MISS_FILENAME', 'EngineCli', 'EngineMissMemo', 'EngineUnavailable',
@@ -4610,7 +4616,10 @@ def main() -> int:
     print(f'\n完成: 成功 {ok} / 失败 {fail} / 残本候选跳过 {stub_skipped}，结果在 labels.jsonl')
     if fail:
         print(format_failure_kinds(fail_kinds))
-    # exit 2 = 整轮零成功（渠道坏，门卫据此回等待窗口）；1 = 部分失败；0 = 全成功
+    # exit 2 = 整轮零成功（渠道坏，门卫据此回等待窗口）；1 = 部分失败；0 = 全成功；
+    # EXIT_IDLE = 空队列且调用方 opt-in（见常量处）
+    if not queue and os.environ.get(IDLE_EXIT_ENV) == '1':
+        return EXIT_IDLE
     if ok == 0 and fail > 0:
         return 2
     return 0 if fail == 0 else 1

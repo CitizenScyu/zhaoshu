@@ -10,6 +10,7 @@ labeler 跑完或渠道转坏（探测 FAIL_M 次连挂）则等待下一窗口�
   nohup python3 -u gatekeeper.py > gate.log 2>&1 &
 """
 import json
+import os
 import subprocess
 import sys
 import time
@@ -35,6 +36,11 @@ EXIT_VERSION_MISMATCH = 4  # 同目录 labeler.py 太旧（缺 resolve_llm_url�
 EXIT_COMPANION_TOO_OLD = 5  # labeler.py 报「同目录配套文件不齐全」：停止重试，原样上交
 # 5 与 labeler.EXIT_COMPANION_TOO_OLD 是同一个数、同一个含义，两边刻意各写一份字面值而不是
 # 跨模块取常量：取常量就要求「新 gatekeeper 配新 labeler」，而那正是这个码要报的故障本身。
+EXIT_IDLE = 6               # 同 labeler.EXIT_IDLE（字面值理由同上）：本轮空队列
+IDLE_EXIT_ENV = 'LABELER_EXIT_IDLE'
+# 空队列后待机多久再试跑。名单源抽干后每轮 0 本（2026-11-04 生产实测），旧逻辑照样每圈
+# 「睡 10 分钟 + PASS_N 次整链 25 万字段探测」——不调模型就能知道没活干，探测纯属白烧。
+IDLE_SLEEP = 3600
 # 探测链要不要带上数据库 app_settings.label_model（链首）？labeler 启动时走
 # `resolve_models(env, use_db=not args.no_db_model)`，而 LABELER_CMD 未带 `--no-db-model`，
 # 所以 labeler 实际 use_db=True。门卫探测必须用同一条链，否则「探测的就是要跑的」不成立
@@ -168,7 +174,8 @@ def launch_labeler() -> int:
     两处启动点（首轮 + 恢复分支重启）共用一个入口，好让「配套不匹配就停止重试」这条判定只写一次：
     两处各补一遍的写法迟早漏掉一处，而漏掉的那处正好是没人测的那处（本仓已有先例）。"""
     t0 = time.time()
-    r = subprocess.run(LABELER_CMD, cwd=str(DIR))
+    # opt-in 空队列退出码（见 labeler.EXIT_IDLE）；旧 labeler 不认这个变量，照旧返回 0。
+    r = subprocess.run(LABELER_CMD, cwd=str(DIR), env={**os.environ, IDLE_EXIT_ENV: '1'})
     mins = (time.time() - t0) / 60
     print(f'labeler 退出: code={r.returncode} 用时 {mins:.0f} 分钟', flush=True)
     return r.returncode
@@ -232,25 +239,38 @@ def main() -> int:
     print(f'探测模型链来源: {src_key} -> {",".join(models)}', flush=True)
     consecutive_ok = 0
     round_no = 0
+    idle = False
     while True:
         round_no += 1
-        print(f'== 等待好窗口（round {round_no}）==', flush=True)
-        consecutive_ok = 0
-        # 等待连续 PASS_N 次通过
-        while consecutive_ok < PASS_N:
-            if probe(key, models, llm_url):
-                consecutive_ok += 1
-                print(f'  探测通过 {consecutive_ok}/{PASS_N}', flush=True)
-            else:
-                consecutive_ok = 0
-            # 凑满 PASS_N 次就立刻放行：此前最后一次通过后还要再睡 10 分钟才启动，
-            # 窗口已确认却白等，放行时探测结论也已过期 10 分钟（2026-11-02 实测）。
-            if consecutive_ok < PASS_N:
-                time.sleep(PROBE_INTERVAL)
-        print(f'渠道就绪，启动 labeler round {round_no}', flush=True)
+        if idle:
+            # 上轮空队列：待机后直接试跑、不探测。有书而渠道坏时 labeler 自己以 2 退出，
+            # 下一圈照常回到等窗口；名单源抽干期间每圈省 PASS_N 次整链探测。
+            idle = False
+            print(f'== 空队列待机 {IDLE_SLEEP // 60} 分钟后直接试跑（round {round_no}，不探测）==',
+                  flush=True)
+            time.sleep(IDLE_SLEEP)
+        else:
+            print(f'== 等待好窗口（round {round_no}）==', flush=True)
+            consecutive_ok = 0
+            # 等待连续 PASS_N 次通过
+            while consecutive_ok < PASS_N:
+                if probe(key, models, llm_url):
+                    consecutive_ok += 1
+                    print(f'  探测通过 {consecutive_ok}/{PASS_N}', flush=True)
+                else:
+                    consecutive_ok = 0
+                # 凑满 PASS_N 次就立刻放行：此前最后一次通过后还要再睡 10 分钟才启动，
+                # 窗口已确认却白等，放行时探测结论也已过期 10 分钟（2026-11-02 实测）。
+                if consecutive_ok < PASS_N:
+                    time.sleep(PROBE_INTERVAL)
+            print(f'渠道就绪，启动 labeler round {round_no}', flush=True)
         code = launch_labeler()
         if code == EXIT_COMPANION_TOO_OLD:
             return stop_on_companion_mismatch()
+        if code == EXIT_IDLE:
+            print('本轮无待打标条目', flush=True)
+            idle = True
+            continue
         if code == 0:
             # 正常跑完一轮；继续下一轮（断点续传会跳过已完成的）
             print('一轮跑完，10 分钟后探测下一轮', flush=True)
@@ -276,7 +296,9 @@ def main() -> int:
             code = launch_labeler()
             if code == EXIT_COMPANION_TOO_OLD:
                 return stop_on_companion_mismatch()
-            if code in (0, 2):
+            if code == EXIT_IDLE:
+                idle = True
+            if code in (0, 2, EXIT_IDLE):
                 break
 
 

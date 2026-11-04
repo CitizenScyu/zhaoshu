@@ -572,7 +572,8 @@ class CompanionMismatchTest(unittest.TestCase):
             code = gatekeeper.launch_labeler()
         self.assertEqual(code, 5)
         self.assertEqual(run.call_args.args[0], gatekeeper.LABELER_CMD)
-        self.assertEqual(run.call_args.kwargs, {'cwd': str(gatekeeper.DIR)})
+        self.assertEqual(run.call_args.kwargs['cwd'], str(gatekeeper.DIR))
+        self.assertEqual(run.call_args.kwargs['env'][gatekeeper.IDLE_EXIT_ENV], '1')
         self.assertIn('labeler 退出: code=5', out.getvalue())
         self.assertIn('用时 2 分钟', out.getvalue())     # 用时照旧打印（排查产能靠它）
 
