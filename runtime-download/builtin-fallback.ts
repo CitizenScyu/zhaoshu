@@ -101,6 +101,8 @@ export interface BuiltinFallbackOptions {
   skipStrictToc?: boolean;
   /** scanmiss1101：透传给 selector 的确认无书记忆；缺省无（逐字同改前）。 */
   missMemo?: ScanMissMemo;
+  /** scanpar1104：透传给 selector 的同时探测源数；缺省 1（串行，逐字同改前）。 */
+  scanConcurrency?: number;
 }
 
 const hostOf = (url: string): string => {
@@ -185,6 +187,7 @@ export function createBuiltinFallback(options: BuiltinFallbackOptions) {
     hostPriority: options.hostPriority,
     skipStrictToc: options.skipStrictToc,
     missMemo: options.missMemo,
+    scanConcurrency: options.scanConcurrency,
   });
   // nocand42 的「整池实探过」判据：记忆跳过的源也是 TTL 内实探过的（scanmiss1101），一并计入。
   const probed = (selection: SourceSelection): number => selection.scanned + (selection.remembered ?? 0);

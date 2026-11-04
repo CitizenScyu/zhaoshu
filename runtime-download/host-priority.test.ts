@@ -6,7 +6,8 @@ const zero = vi.hoisted(() => vi.fn());
 vi.mock('../src/lib/download-source-candidates', () => ({ productiveHostScores: scores, zeroYieldHosts: zero }));
 
 import {
-  createHostPriority, demoteZeroYieldEnabled, HOST_PRIORITY_TTL_MS, productiveFirstEnabled, scanRotateEnabled, skipStrictTocEnabled,
+  createHostPriority, demoteZeroYieldEnabled, HOST_PRIORITY_TTL_MS, productiveFirstEnabled, scanConcurrency, scanRotateEnabled,
+  skipStrictTocEnabled,
 } from './host-priority';
 
 const sql = {} as never;
@@ -27,6 +28,15 @@ describe('yield1030 host-priority', () => {
     expect(skipStrictTocEnabled({})).toBe(false);
     expect(skipStrictTocEnabled({ DOWNLOAD_SCAN_SKIP_STRICT_TOC: 'yes' })).toBe(false);
     expect(skipStrictTocEnabled({ DOWNLOAD_SCAN_SKIP_STRICT_TOC: ' On ' })).toBe(true);
+  });
+
+  it('scanpar1104：DOWNLOAD_SCAN_CONCURRENCY 缺省/非法 = 1，正整数夹到 1..8', () => {
+    expect(scanConcurrency({})).toBe(1);
+    expect(scanConcurrency({ DOWNLOAD_SCAN_CONCURRENCY: 'four' })).toBe(1);
+    expect(scanConcurrency({ DOWNLOAD_SCAN_CONCURRENCY: '-2' })).toBe(1);
+    expect(scanConcurrency({ DOWNLOAD_SCAN_CONCURRENCY: '0' })).toBe(1);
+    expect(scanConcurrency({ DOWNLOAD_SCAN_CONCURRENCY: ' 4 ' })).toBe(4);
+    expect(scanConcurrency({ DOWNLOAD_SCAN_CONCURRENCY: '32' })).toBe(8);
   });
 
   it('rotate1030：DOWNLOAD_SCAN_ROTATE 缺省/非真值关，1/true/on 开', () => {

@@ -47,6 +47,13 @@ export interface SourceSelectorOptions {
    * scanBudget，但照旧占 scanLimit 名额（轮转窗口划分不变，记忆只省请求、不扩扫描面）。
    */
   missMemo?: ScanMissMemo;
+  /**
+   * scanpar1104：同时探测的源数上限（缺省/≤1 = 逐源串行，逐字同改前）。动机（2026-11-04 生产只读）：串行扫一轮
+   * 160 源约 5 分钟（≈1.9s/源，基本是等跨 host 的网络往返），吃掉约三成 worker 时间。>1 时只并发不同 host 的源
+   * （同 host 等前一个提交后再扫；per-host QPS 仍由共享限速器管），命中按池序提交，picked 与串行同为池序前
+   * targetHits 个 host；早停时窗口内多出的探测照实计入 scanned/scanBudget（每个实际出网的源计一次，口径不变）。
+   */
+  scanConcurrency?: number;
 }
 
 export interface SourceSelectionRequest {
@@ -222,7 +229,58 @@ export function createSourceSelector(options: SourceSelectorOptions): SourceSele
       const missed = memo ? memo.load(task) : undefined;
       const misses: string[] = [];
       let remembered = 0;
-      for (const source of pool) {
+      const concurrency = Math.max(1, Math.floor(options.scanConcurrency ?? 1));
+      if (concurrency > 1) {
+        // 窗口按池序排：队头未完成时后面完成的先缓存，提交始终从队头起（命中顺序 = 池序）。
+        // late = 完成时整体已中止：与串行同口径，中止后的命中不收、未命中不记忆。
+        type Probe = { url: string; host: string; outcome?: { hit: boolean; late: boolean } | { error: unknown } };
+        const window: Probe[] = [];
+        const stop = new AbortController();
+        const probeSignal = AbortSignal.any([overall, stop.signal]);
+        let wake = () => {};
+        let cursor = 0;
+        const pendingHits = () => window.filter(p => p.outcome && 'hit' in p.outcome && p.outcome.hit && !p.outcome.late).length;
+        try {
+          for (;;) {
+            signal.throwIfAborted();
+            while (window[0]?.outcome) {
+              const probe = window.shift()!;
+              const outcome = probe.outcome!;
+              if ('error' in outcome) {
+                signal.throwIfAborted();
+                if (isOccupancyUnavailable(outcome.error)) throw outcome.error;
+              } else if (outcome.hit) {
+                if (!outcome.late && picked.length < request.targetHits && !pickedHosts.includes(probe.host)) {
+                  picked.push(probe.url);
+                  pickedHosts.push(probe.host);
+                }
+              } else if (memo && !outcome.late) misses.push(probe.url);
+            }
+            while (cursor < pool.length && window.filter(p => !p.outcome).length < concurrency
+              && picked.length + pendingHits() < request.targetHits && scanned + remembered < request.scanLimit
+              && !overall.aborted && !(request.scanBudget && request.scanBudget.remaining <= 0)) {
+              const source = pool[cursor];
+              const host = hostOf(source.url);
+              if (!scannable(source) || pickedHosts.includes(host)) { cursor += 1; continue; }
+              if (window.some(p => p.host === host)) break;
+              cursor += 1;
+              if (missed?.(source.url)) { remembered += 1; continue; }
+              scanned += 1;
+              if (request.scanBudget) request.scanBudget.remaining -= 1;
+              const probe: Probe = { url: source.url, host };
+              window.push(probe);
+              void sourceAbortable(sourceHasBook(source, task, probeSignal), probeSignal).then(
+                hit => { probe.outcome = { hit, late: overall.aborted }; },
+                error => { probe.outcome = { error }; },
+              ).finally(() => wake());
+            }
+            if (!window.length) break;
+            await new Promise<void>(resolve => { wake = resolve; });
+          }
+        } finally {
+          stop.abort();
+        }
+      } else for (const source of pool) {
         signal.throwIfAborted();
         if (picked.length >= request.targetHits || scanned + remembered >= request.scanLimit || overall.aborted
           || (request.scanBudget && request.scanBudget.remaining <= 0)) break;

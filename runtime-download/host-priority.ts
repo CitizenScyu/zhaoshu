@@ -40,6 +40,12 @@ export function skipStrictTocEnabled(env: Record<string, string | undefined> = p
   return raw === '1' || raw === 'true' || raw === 'on';
 }
 
+/** scanpar1104：DOWNLOAD_SCAN_CONCURRENCY = 选源同时探测源数（见 source-selector scanConcurrency）。缺省/非法 = 1（串行），上限 8。 */
+export function scanConcurrency(env: Record<string, string | undefined> = process.env): number {
+  const raw = env.DOWNLOAD_SCAN_CONCURRENCY?.trim() ?? '';
+  return /^\d+$/.test(raw) ? Math.min(8, Math.max(1, Number(raw))) : 1;
+}
+
 export function createHostPriority(
   sql: CandidateSql,
   env: Record<string, string | undefined> = process.env,

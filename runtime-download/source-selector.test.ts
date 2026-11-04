@@ -22,6 +22,7 @@ function harness(opts: {
   doomed?: string[];
   skipStrictToc?: boolean;
   missMemo?: ScanMissMemo;
+  scanConcurrency?: number;
 }) {
   const searchedUrls: string[] = [];
   const searchKeys: string[] = [];
@@ -63,6 +64,7 @@ function harness(opts: {
     hostPriority: opts.hostPriority,
     skipStrictToc: opts.skipStrictToc,
     missMemo: opts.missMemo,
+    scanConcurrency: opts.scanConcurrency,
   });
   return { selector, searchedUrls, searchKeys, detailUrls, poolLoads, logs, compiles };
 }
@@ -682,6 +684,135 @@ describe('共用选源器', () => {
       expect((await h.selector(request({ task, targetHits: 1 }), freshSignal())).picked)
         .toEqual(['https://a.example/']);
       expect(h.searchKeys).toEqual(['精灵宝钻', 'J.R.R.托尔金']);
+    });
+  });
+
+  describe('scanpar1104：并发探测', () => {
+    // 每源搜索挂起到测试手动放行；记录同时在途数与同 host 并发。
+    function gated(pool: string[], scanConcurrency: number, extra: Parameters<typeof harness>[0] = {}) {
+      const waiting = new Map<string, (hits: Hit[]) => void>();
+      let inflight = 0;
+      let peak = 0;
+      const hostsInFlight: string[] = [];
+      let sameHostOverlap = false;
+      const h = harness({
+        pool, scanConcurrency, ...extra,
+        search: (url) => {
+          const host = new URL(url).hostname;
+          if (hostsInFlight.includes(host)) sameHostOverlap = true;
+          hostsInFlight.push(host);
+          inflight += 1;
+          peak = Math.max(peak, inflight);
+          return new Promise<Hit[]>(resolve => {
+            waiting.set(url, hits => {
+              inflight -= 1;
+              hostsInFlight.splice(hostsInFlight.indexOf(host), 1);
+              resolve(hits);
+            });
+          });
+        },
+      });
+      const release = async (url: string, hit: boolean) => {
+        for (let i = 0; i < 50 && !waiting.has(url); i += 1) await tick();
+        const done = waiting.get(url);
+        if (!done) throw new Error(`not searched: ${url}`);
+        waiting.delete(url);
+        done(hit ? [{ title: TASK.title, author: TASK.author, bookUrl: `${url}b/1` }] : []);
+        await tick();
+      };
+      return { ...h, release, waiting, stats: () => ({ peak, sameHostOverlap }) };
+    }
+
+    it('缺省 1 = 串行：同时在途恒为 1', async () => {
+      const pool = ['https://a.example/', 'https://b.example/', 'https://c.example/'];
+      const g = gated(pool, 1);
+      const run = g.selector(request({ targetHits: 3 }), freshSignal());
+      for (const url of pool) await g.release(url, false);
+      expect((await run).scanned).toBe(3);
+      expect(g.stats().peak).toBe(1);
+    });
+
+    it('并发 3：在途不超过 3；后完成的先到也按池序提交，早停取池序前 targetHits 个 host', async () => {
+      const pool = ['https://a.example/', 'https://b.example/', 'https://c.example/', 'https://d.example/', 'https://e.example/'];
+      const g = gated(pool, 3);
+      const run = g.selector(request({ targetHits: 2 }), freshSignal());
+      await g.release('https://c.example/', true);
+      // c 先完成：在途降到 2、待提交命中 1 < 2 ⇒ 补扫 d。
+      await g.release('https://b.example/', true);
+      // a 未完成前 b/c 命中只缓存不提交；待提交命中已够 targetHits ⇒ 不再出网扩扫（e 不扫）。
+      expect(g.searchedUrls).toEqual(['https://a.example/', 'https://b.example/', 'https://c.example/', 'https://d.example/']);
+      await g.release('https://a.example/', true);
+      await g.release('https://d.example/', true);
+      const result = await run;
+      expect(result.picked).toEqual(['https://a.example/', 'https://b.example/']);
+      expect(result.scanned).toBe(4);
+      expect(g.stats().peak).toBe(3);
+    });
+
+    it('同 host 变体不并发：等前一个提交后再扫，命中后同 host 不再扫', async () => {
+      const pool = ['https://a.example/', 'https://a.example/#2', 'https://b.example/', 'https://a.example/#3'];
+      const g = gated(pool, 4);
+      const run = g.selector(request({ targetHits: 3 }), freshSignal());
+      await tick();
+      expect(g.searchedUrls).toEqual(['https://a.example/']);
+      await g.release('https://a.example/', true);
+      await g.release('https://b.example/', false);
+      const result = await run;
+      expect(result.picked).toEqual(['https://a.example/']);
+      expect(g.searchedUrls).toEqual(['https://a.example/', 'https://b.example/']);
+      expect(g.stats().sameHostOverlap).toBe(false);
+    });
+
+    it('scanLimit / scanBudget / 无书记忆口径同串行', async () => {
+      const pool = Array.from({ length: 30 }, (_, i) => `https://s${i}.example/`);
+      const recorded: string[][] = [];
+      const memo: ScanMissMemo = {
+        load: () => (url: string) => url === 'https://s1.example/',
+        record: (_task, urls) => { recorded.push([...urls]); },
+      } as ScanMissMemo;
+      const h = harness({ pool, search: () => [], scanConcurrency: 4, missMemo: memo });
+      const scanBudget = { remaining: 100 };
+      const result = await h.selector(request({ scanLimit: 10, scanBudget }), freshSignal());
+      expect(result).toEqual({ picked: [], scanned: 9, remembered: 1 });
+      expect(scanBudget.remaining).toBe(91);
+      expect(h.searchedUrls).toHaveLength(9);
+      expect(recorded).toEqual([h.searchedUrls]);
+    });
+
+    it('HOST_OCCUPANCY_UNAVAILABLE 按池序上抛，其余在途探测被中止', async () => {
+      const pool = ['https://a.example/', 'https://b.example/', 'https://c.example/'];
+      const h = harness({
+        pool, scanConcurrency: 3,
+        search: (url) => {
+          if (url === 'https://b.example/') {
+            return Promise.reject(Object.assign(new Error('synthetic gate'), { code: 'HOST_OCCUPANCY_UNAVAILABLE' }));
+          }
+          return url === 'https://a.example/' ? new Promise<Hit[]>(resolve => { setTimeout(() => resolve([]), 20); }) : hang<Hit[]>();
+        },
+      });
+      // b 先失败也要等 a 提交后才上抛；c 永远挂起——不等它（中止后 sourceAbortable 收尾）。
+      await expect(h.selector(request(), freshSignal())).rejects.toMatchObject({ code: 'HOST_OCCUPANCY_UNAVAILABLE' });
+      expect(h.searchedUrls).toEqual(pool);
+    });
+
+    it('调用方 abort：并发路径同样 reject', async () => {
+      const pool = ['https://a.example/', 'https://b.example/'];
+      const h = harness({ pool, scanConcurrency: 2, search: () => hang<Hit[]>() });
+      const controller = new AbortController();
+      const run = h.selector(request(), controller.signal);
+      await tick();
+      controller.abort(new Error('caller stop'));
+      await expect(run).rejects.toThrow('caller stop');
+    });
+
+    it('预算耗尽：并发路径收已完成命中后返回，不抛', async () => {
+      const pool = ['https://a.example/', 'https://b.example/', 'https://c.example/'];
+      const g = gated(pool, 3);
+      const run = g.selector(request({ targetHits: 3, budgetMs: 40 }), freshSignal());
+      await g.release('https://a.example/', true);
+      const result = await run;
+      expect(result.picked).toEqual(['https://a.example/']);
+      expect(result.scanned).toBe(3);
     });
   });
 });
