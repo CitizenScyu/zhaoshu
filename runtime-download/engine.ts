@@ -61,6 +61,18 @@ export class ResolveSourceError extends Error {
 /** resolveSource 的退休收口（code=2、稳定原因码）：识别集合内但无活跃内建源的 host。 */
 export const RETIRED_BUILTIN_REASON = 'builtin_source_retired';
 
+/**
+ * adultmiss1104：原源 host 落空且属成人站（adult1026 整站出池），或成人判定读库失败（fail-closed）。
+ * code=1 同属终态 miss，但构造器名不同：detail 记 `ResolveSourceBlocked@resolve`，回退层
+ * isUnresolvedHost 只认 `ResolveSourceError`，不会拿书名去干净池换源。
+ */
+export class ResolveSourceBlockedError extends ResolveSourceError {
+  constructor(reason: 'adult_station_excluded' | 'adult_check_unavailable') {
+    super(1, reason);
+    this.name = 'ResolveSourceBlocked';
+  }
+}
+
 const hostOf = (url: string): string => {
   try { return new URL(url).hostname; } catch { return ''; }
 };
@@ -137,8 +149,17 @@ export function createResolveSource(m: EngineModules) {
     const source = pool.find(candidate => candidate.url === url)
       ?? findSourceByLongestPrefix(pool, url)
       ?? findSourceByHost(m, pool, host);
-    if (!source) throw new ResolveSourceError(1, 'no_engine_source_for_host');
-    return { source, builtin: false };
+    if (source) return { source, builtin: false };
+    // adultmiss1104：落空时先排除成人站——resolvemiss1104 会把 ResolveSourceError 落空送去引擎回退。
+    let adult: boolean;
+    try {
+      adult = await m.shuyuan.isAdultSourceStation(host, signal);
+    } catch {
+      signal.throwIfAborted();
+      throw new ResolveSourceBlockedError('adult_check_unavailable');
+    }
+    if (adult) throw new ResolveSourceBlockedError('adult_station_excluded');
+    throw new ResolveSourceError(1, 'no_engine_source_for_host');
   };
 }
 

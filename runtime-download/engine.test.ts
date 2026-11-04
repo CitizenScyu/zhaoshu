@@ -4,7 +4,7 @@
 //   - 源站 HTTP 错误（含 429）→ recordFailure(host, ...)，429 带 Retry-After 则含 retryAfterMs（发现 4）；
 //   - 网络/传输错误（无 status）→ 不计熔断（recordFailure 不被调用）。
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { createResolveSource, createSourceTransport, loadEnginePool, type EngineModules, type RateLimiterLike } from "./engine";
+import { createResolveSource, createSourceTransport, loadEnginePool, ResolveSourceBlockedError, type EngineModules, type RateLimiterLike } from "./engine";
 import { refreshSupportedHosts, stationKeyOfHost } from "../src/lib/source-policy";
 
 vi.mock("../src/lib/supported-sources", async (importOriginal) => {
@@ -157,6 +157,27 @@ describe('引擎源完整 URL 解析', () => {
     const result = await h.resolve(null, h.selected.url, signal);
     expect(result).toEqual({ source: h.first, builtin: true });
     expect(h.modules.shuyuan.getEngineSources).not.toHaveBeenCalled();
+  });
+
+  // adultmiss1104：落空分三档——普通落空仍是 ResolveSourceError（回退层会换源）；成人站/判定失败改抛
+  // ResolveSourceBlocked（构造器名不同，回退层不换源）。命中池时不查成人判定。
+  it('池内落空：普通站 ResolveSourceError(1)；成人站与判定失败 ResolveSourceBlocked(1)', async () => {
+    const h = resolverFixture();
+    const isAdultSourceStation = vi.fn(async () => false);
+    Object.assign(h.modules.shuyuan, { isAdultSourceStation });
+    const signal = new AbortController().signal;
+    await h.resolve(null, h.selected.url, signal);
+    expect(isAdultSourceStation).not.toHaveBeenCalled();
+    const miss = h.resolve(null, 'https://other.example/book/1', signal);
+    await expect(miss).rejects.toMatchObject({ name: 'ResolveSourceError', code: 1, reason: 'no_engine_source_for_host' });
+    expect(isAdultSourceStation).toHaveBeenCalledWith('other.example', signal);
+    isAdultSourceStation.mockResolvedValueOnce(true);
+    await expect(h.resolve(null, 'https://other.example/book/1', signal))
+      .rejects.toMatchObject({ name: 'ResolveSourceBlocked', code: 1, reason: 'adult_station_excluded' });
+    isAdultSourceStation.mockRejectedValueOnce(new Error('db down'));
+    const blocked = await h.resolve(null, 'https://other.example/book/1', signal).catch((error: unknown) => error);
+    expect(blocked).toBeInstanceOf(ResolveSourceBlockedError);
+    expect(blocked).toMatchObject({ name: 'ResolveSourceBlocked', code: 1, reason: 'adult_check_unavailable' });
   });
 });
 

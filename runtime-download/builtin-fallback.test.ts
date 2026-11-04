@@ -173,6 +173,12 @@ describe('41-T8FB builtin-fallback', () => {
     expect(await direct.fallback.wrapAdapter(adapter({ 'book15.net': other }, []), adapter({}, untouched))
       .download(task(), context())).toEqual(other);
     expect(untouched).toEqual([]);
+    // adultmiss1104：成人站整站出池（ResolveSourceBlocked）不回退——回退会按书名绕过整站出池。
+    const blocked: AdapterOutcome = { kind: 'failure', code: 'download_failed', detail: 'ResolveSourceBlocked@resolve' };
+    const adult = harness({ pool: ['https://a.example/'] });
+    expect(await adult.fallback.wrapAdapter(adapter({ 'book15.net': blocked }, []), adapter({}, untouched))
+      .download(task(), context())).toEqual(blocked);
+    expect(untouched).toEqual([]);
   });
 
   it('逐书出网封顶：书不在池里时最多搜 MAX_FALLBACK_SCAN_SOURCES 个源', async () => {

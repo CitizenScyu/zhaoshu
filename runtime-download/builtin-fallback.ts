@@ -136,6 +136,7 @@ const isPreviewTruncated = (outcome: AdapterOutcome) =>
  * 打标池比下载池宽——2026-11-04 shudugu 等 74 本 attempt 1 即 download_failed 终态、从没试过别的源。
  * 与身份缺失同样走引擎回退；选不到/候选全失败仍按原 failure 收口（终态语义不变）。
  * detail 是 download-worker 白名单拼出的「构造器名[/码][@阶段]」，code=2 的解析失败已归 source_unavailable。
+ * 成人站整站出池（adultmiss1104）由 resolveSource 抛 ResolveSourceBlocked，构造器名不同，此处不匹配、不回退。
  */
 const isUnresolvedHost = (outcome: AdapterOutcome) =>
   outcome.kind === 'failure' && outcome.code === 'download_failed' && /^ResolveSourceError(@|$)/.test(outcome.detail ?? '');

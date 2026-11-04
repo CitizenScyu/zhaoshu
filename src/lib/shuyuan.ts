@@ -2,7 +2,7 @@ import { getSql } from '@/lib/db';
 import { engineHosts, normalizeUrlSql } from '@/lib/supported-sources-server';
 import { isRecord } from '@/lib/sanitize';
 import { createDeadline, raceDeadline, type RequestDeadline } from '@/lib/deadline';
-import { validateSourceUrl, refreshSupportedHosts, supportedHostList, supportedHostVersion, upgradeSourceTemplateUrl, isForbiddenHostAddress, isPermanentlyDisabledUrl, permanentDisableHostList, stationKeyOfUrl } from '@/lib/source-policy';
+import { validateSourceUrl, refreshSupportedHosts, supportedHostList, supportedHostVersion, upgradeSourceTemplateUrl, isForbiddenHostAddress, isPermanentlyDisabledUrl, permanentDisableHostList, stationKeyOfHost, stationKeyOfUrl } from '@/lib/source-policy';
 import { engineSourceUsable } from '@/lib/source-usability';
 import {
   BUILTIN_SOURCE_HOSTS, builtinUrlPrefixes,
@@ -16,7 +16,7 @@ import {
 import { admissionSurveyOptions, engineSearchJsActive, selectCandidates, type RawSource } from '@/lib/rule-engine/compile-smoke';
 import { prepareSearchJs, SearchJsNotReadyError } from '@/lib/rule-engine/search-js';
 import { DEFAULT_SHUYUAN_READ_CACHE_TTL_MS, shuyuanReadCacheTtlMs } from '@/lib/read-cache-ttl';
-import { adultStationKeys, classifySourceAdult, type SourceAdultClassification } from '@/lib/source-adult-classification';
+import { adultStationKeys, classifySourceAdult, isAdultSiteHost, type SourceAdultClassification } from '@/lib/source-adult-classification';
 import { isPaywallHost } from '@/lib/source-host-health';
 import {
   createPoolArtifact, currentPoolArtifact, noteLocalPoolWrite, poolArtifactEnabled, resetPoolArtifactMemo,
@@ -798,6 +798,23 @@ export async function getDownloadEngineSources(signal: AbortSignal): Promise<Rea
   syncReadCacheWithGate();
   const { states } = readMeta((await poolProbeMeta(s, signal)).collections);
   return engineReadingSources(s, states, signal, true);
+}
+
+/**
+ * adultmiss1104：host 所在站是否成人站（adult1026 同口径：域名专名/站键黑名单，或库里同站任一源判 adult，
+ * 含未准入、已禁用的行）。下载腿 resolveSource 落空时区分「成人站整站出池」与「不在下载池」——前者不得走
+ * resolvemiss1104 引擎回退（回退按书名去干净池找同名书，等于绕过整站出池）。只在落空时调用：
+ * 站键子串粗筛 + JS 精确比站键，不走池缓存（要覆盖池外行，且落空频率低）。
+ */
+export async function isAdultSourceStation(host: string, signal: AbortSignal): Promise<boolean> {
+  if (isAdultSiteHost(host)) return true;
+  const station = stationKeyOfHost(host);
+  if (!station) return false;
+  const s = getSql();
+  const rows = await readRows<{ source_url: string; name: unknown; source: unknown }>(s, s`
+    SELECT source_url, name, source FROM shuyuan_sources WHERE strpos(lower(source_url), ${station}) > 0`, signal);
+  return rows.some((row) => stationKeyOfUrl(row.source_url.trim().split(/[#,\s]/)[0]) === station
+    && classifySourceAdult(row.name, row.source) === 'adult');
 }
 
 function canProbe(url: string): boolean {

@@ -19,7 +19,7 @@ vi.mock('./db', () => ({ ensureSchema: vi.fn(), getSql }));
 
 import {
   downloadPoolIncludesPhoenixOk, getDownloadEngineSources, getDownloadPoolEngineHosts,
-  getEngineSources, getPoolEngineHosts, invalidateShuyuanReadCache,
+  getEngineSources, getPoolEngineHosts, invalidateShuyuanReadCache, isAdultSourceStation,
 } from './shuyuan';
 import { engineHosts } from './supported-sources-server';
 import { refreshSupportedHosts } from './source-policy';
@@ -140,5 +140,23 @@ maybe('bpool-normalize 下载池扩池（PGlite 真库）', () => {
   it('engineHosts 谓词：includePhoenixOk=true 含 phoenix_ok: host，缺省 false 不含', async () => {
     expect(await engineHosts()).toEqual(['clean.example']);
     expect((await engineHosts(undefined, { includePhoenixOk: true })).sort()).toEqual(['clean.example', 'phoenix.example']);
+  });
+
+  // adultmiss1104：落空 host 的成人判定按站键查全表（含未准入行），子串粗筛不误伤相邻站。
+  it('isAdultSourceStation：同站任一行判 adult 即真；子串相邻站、干净站为假；域名专名不查库', async () => {
+    const insert = (url: string, name: string) => pg.query(
+      `INSERT INTO shuyuan_sources (source_url, name, source) VALUES ($1, $2, $3::jsonb)`,
+      [url, name, JSON.stringify({ bookSourceUrl: url, bookSourceName: name })],
+    );
+    await insert('https://m.haitang.example#3', '🎃小说站🎃#3');
+    await insert('https://www.haitang.example', '🔞️海棠书屋');
+    await insert('https://xpure.example', '🔞成人小说');
+    const signal = new AbortController().signal;
+    expect(await isAdultSourceStation('haitang.example', signal)).toBe(true);
+    expect(await isAdultSourceStation('m.haitang.example', signal)).toBe(true);
+    expect(await isAdultSourceStation('pure.example', signal)).toBe(false);
+    expect(await isAdultSourceStation('clean.example', signal)).toBe(false);
+    getSql.mockReturnValue(undefined);
+    expect(await isAdultSourceStation('wap.po18.in', signal)).toBe(true);
   });
 });
