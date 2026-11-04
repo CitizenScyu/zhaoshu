@@ -31,6 +31,10 @@ const isHostGateError = error => error?.code === 'HOST_OCCUPIED'
 // 常按 URL/频率阶段性放行（noveltri 详情页对 phoenix 出网 403、同刻搜索页 200），
 // 以前这类被吞成 download_failed 终态。仍走既有退避（16 次上限），永久封禁最多退干净到 failed。
 const SOURCE_STAGES = new Set(['search', 'detail', 'toc']);
+// hostlock1104：共享限速未登记 host（锁在出网前取，零请求）同归 source_unavailable——回退层换源、
+// 任务层有限退避，登记补上后重试即恢复。此前落 download_failed 终态：打标机新主力 host
+// （biquluo/kushuge）未登记时 221 本 attempt 1 即失败。HOST_LOCK_CHANGED 等完整性错误维持原分类。
+const isHostUnregisteredError = error => error?.name === 'SharedRateControlError' && error?.code === 'HOST_LOCK_MISSING';
 const UNREACHABLE_ERROR_NAMES = new Set(['ConnectTimeoutError', 'TimeoutError', 'CircuitOpenError', 'DailyRequestBudgetError']);
 export function isSourceUnavailableError(error) {
   const status = error?.status;
@@ -591,6 +595,9 @@ export async function downloadBook(m, args, resolveSource, transport = fetchSour
     if (isHostGateError(error)) throw error;
     // 外部中断（停机/租约/总预算）时的请求失败是被中止，不是书源不可达。
     if (SOURCE_STAGES.has(stage) && !controller.signal.aborted && isSourceUnavailableError(error)) failureCode = 2;
+    else if (SOURCE_STAGES.has(stage) && !controller.signal.aborted && isHostUnregisteredError(error)) {
+      failureCode = 2; manifest.failure_code = 'HOST_LOCK_MISSING'; // 固定码，供巡检按 host 统计待登记
+    }
     if (isBreakerYield(error)) {
       failureCode = 2; manifest.retry_cause = 'host_breaker';
       // breakerprogress1102：本轮净增的已抓章（对比开跑时检查点里的 done 数；目录变了重抓的不算）。只写正数，

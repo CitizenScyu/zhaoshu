@@ -505,6 +505,26 @@ describe('书源不可达分类（41-EXEC-SRCUNAVAIL）', () => {
     expect(result.manifest.status).toBe('partial');
   });
 
+  // hostlock1104：共享限速未登记 host 归 source_unavailable 并记固定码；锁 inode 变化等完整性错误不放宽。
+  const sharedRate = (code: string) => Object.assign(new Error(`共享限速 ${code}：x`), { name: 'SharedRateControlError', code });
+  it.each(['search', 'detail'] as const)('%s 阶段 HOST_LOCK_MISSING ⇒ code=2、source_unavailable、failure_code', async (stage) => {
+    const f = setup(-1);
+    const result = await f.run(failAt(f, stage, () => sharedRate('HOST_LOCK_MISSING')));
+    expect(result.code).toBe(2);
+    expect(result.manifest.errors).toEqual(['source_unavailable']);
+    expect(stageOf(result)).toBe(stage);
+    expect((result.manifest as { failure_code?: string }).failure_code).toBe('HOST_LOCK_MISSING');
+  });
+
+  it('HOST_LOCK_CHANGED / 非 SharedRateControlError 同码 ⇒ 维持 download_failed（code=1）', async () => {
+    for (const error of [() => sharedRate('HOST_LOCK_CHANGED'), () => Object.assign(new Error('x'), { code: 'HOST_LOCK_MISSING' })]) {
+      const f = setup(-1);
+      const result = await f.run(failAt(f, 'search', error));
+      expect(result.code).toBe(1);
+      expect(result.manifest.errors).toEqual(['download_failed']);
+    }
+  });
+
   it('身份不符维持 identity_mismatch_or_no_candidate（code=1）', async () => {
     const f = setup(-1, 'identity');
     const result = await f.run();
