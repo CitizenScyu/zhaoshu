@@ -14,7 +14,7 @@ import { peerOutRoots, seedFromPeers } from '../runtime-download/resume-seed';
 import { createHtmlScope, createJsonScope, evaluateField } from '../src/lib/rule-engine/evaluate';
 import { parseFieldRule } from '../src/lib/rule-engine/parse';
 import { RuleEngineError } from '../src/lib/rule-engine/types';
-import { breakerYield, chapterErrorKind, chapterResume, contentFailStreak, contentRetryPasses, contentStopBookPages, downloadBook, downloadOptions, errorKindOf, hostBurstPause, keepCached, noticeUnnumbered, numberedBook, policyCodeOf, previewTail, previewTailRun, recheckYield, retryPassPauseMs, ruleFailHint, ruleHintOf } from './engine-download.mjs';
+import { breakerYield, chapterErrorKind, chapterResume, contentFailStreak, contentRetryPasses, contentStopBookPages, downloadBook, downloadOptions, errorKindOf, hostBurstPause, keepCached, noticeUnnumbered, numberedBook, policyCodeOf, previewStub, previewTail, previewTailRun, recheckYield, retryPassPauseMs, ruleFailHint, ruleHintOf } from './engine-download.mjs';
 
 const dirs: string[] = [];
 afterEach(() => { vi.unstubAllGlobals(); for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
@@ -709,6 +709,47 @@ describe('tailwall1104 书尾预览尾段识别', () => {
     });
     expect(r.manifest.errors).toEqual(['preview_truncated']);
     expect(existsSync(join(dirname(r.manifestPath), 'book.txt'))).toBe(false);
+  }, 60_000);
+});
+
+// stub1105：全书正文合计 < 3000 字的「完整」本（简介/首章预览）按 preview_truncated 换源（DOWNLOAD_PREVIEW_STUB，缺省关）。
+describe('stub1105 极短残本识别', () => {
+  afterEach(() => { vi.unstubAllEnvs(); });
+  const run = (f: ReturnType<typeof setup>, total: number, chars: number) => f.run(async (url, opts) => {
+    if (url === 'https://book15.net/books/details1.html') {
+      const catalog = `<div class="d-chapter-list" id="full-catalog">${Array.from({ length: total }, (_, i) => `<dd><a href="/read/${i + 1}">第${i + 1}章</a></dd>`).join('')}</div>`;
+      return { url, text: `<h1>测试书</h1><div class="d-info-panel"><a href="/author/1">作者甲</a></div><meta property="og:novel:book_name" content="测试书"><meta property="og:novel:author" content="作者甲">` + catalog };
+    }
+    if (url.includes('/read/')) return { url, text: `<li class="chapter-content" id="article-content"><p>${'文'.repeat(chars)}</p></li>` };
+    return f.transport(url, opts);
+  });
+  it('DOWNLOAD_PREVIEW_STUB=1 开，缺省/其他值关', () => {
+    expect(previewStub()).toBe(false);
+    vi.stubEnv('DOWNLOAD_PREVIEW_STUB', 'on');
+    expect(previewStub()).toBe(false);
+    vi.stubEnv('DOWNLOAD_PREVIEW_STUB', ' 1 ');
+    expect(previewStub()).toBe(true);
+  });
+  it('开：1 章 392 字 ⇒ preview_truncated、零 book.txt', async () => {
+    vi.stubEnv('DOWNLOAD_PREVIEW_STUB', '1');
+    const f = setup();
+    const r = await run(f, 1, 392);
+    expect(r.code).toBe(1);
+    expect(r.manifest.errors).toEqual(['preview_truncated']);
+    expect(existsSync(join(dirname(r.manifestPath), 'book.txt'))).toBe(false);
+  }, 60_000);
+  it('开：合计 ≥ 3000 字（2 章 × 1500）照常 done', async () => {
+    vi.stubEnv('DOWNLOAD_PREVIEW_STUB', '1');
+    const f = setup();
+    const r = await run(f, 2, 1500);
+    expect(r.code).toBe(0);
+    expect(r.manifest.status).toBe('done');
+  }, 60_000);
+  it('关：1 章 392 字与引入前一致照常 done', async () => {
+    const f = setup();
+    const r = await run(f, 1, 392);
+    expect(r.code).toBe(0);
+    expect(r.manifest.status).toBe('done');
   }, 60_000);
 });
 

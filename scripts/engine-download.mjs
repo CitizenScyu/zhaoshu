@@ -179,6 +179,13 @@ export function previewTailRun(chapters) {
   }
   return false;
 }
+// stub1105：全书 done 正文合计 < 3000 字即判 preview_truncated（源站只给简介/首章预览，如 2026-11-05 phoenix 只读：
+// 9 本 1 章 < 500 字、另有 1 章 2653 字 / 19 章 1103 字的「完整」本被发布 done；书库 chars_labeled 最小 11059，
+// 已发布正常本最小 5436 字）。按 preview_truncated 换源（零发布）。DOWNLOAD_PREVIEW_STUB=1 开（缺省/其他值 = 关，零行为变化）。
+const PREVIEW_STUB_MAX_TOTAL_CHARS = 3000;
+export function previewStub(env = process.env) {
+  return env.DOWNLOAD_PREVIEW_STUB?.trim() === '1';
+}
 
 // noticeskip1031：DOWNLOAD_NOTICE_PLACEHOLDER=1 时，章名是作者请假/无更/感言类公告、源站正文取空（empty_content_page /
 // empty_content）的章写占位文本按 done 收口（缺省/其他值 = 关，零行为变化：整章 failed → 全书 missing_chapters 不发布）。
@@ -581,6 +588,7 @@ export async function downloadBook(m, args, resolveSource, transport = fetchSour
       const doneChars = manifest.chapters.filter(c => c.status === 'done').map(c => c.chars).sort((a, b) => a - b);
       if (doneChars.length >= PREVIEW_MIN_CHAPTERS && doneChars[Math.floor(doneChars.length / 2)] < PREVIEW_MAX_CHARS) throw new Error('preview_truncated');
       if (previewTail() && previewTailRun(manifest.chapters)) throw new Error('preview_truncated');
+      if (previewStub() && doneChars.reduce((sum, n) => sum + n, 0) < PREVIEW_STUB_MAX_TOTAL_CHARS) throw new Error('preview_truncated');
     }
     const txt = manifest.chapters.map(c => `${c.title}\n\n${readFileSync(join(dir, c.file), 'utf8')}\n\n`).join('');
     atomic(join(dir, 'book.txt'), txt);
