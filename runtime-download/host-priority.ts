@@ -40,6 +40,12 @@ export function skipStrictTocEnabled(env: Record<string, string | undefined> = p
   return raw === '1' || raw === 'true' || raw === 'on';
 }
 
+/** variantdup1105：DOWNLOAD_SCAN_DEDUPE_VARIANTS 开 ⇒ 选源对同 url 功能规则全同的锚变体只扫池序第一条（见 source-selector dedupeVariants）。缺省关。 */
+export function dedupeVariantsEnabled(env: Record<string, string | undefined> = process.env): boolean {
+  const raw = env.DOWNLOAD_SCAN_DEDUPE_VARIANTS?.trim().toLowerCase();
+  return raw === '1' || raw === 'true' || raw === 'on';
+}
+
 /** scanpar1104：DOWNLOAD_SCAN_CONCURRENCY = 选源同时探测源数（见 source-selector scanConcurrency）。缺省/非法 = 1（串行），上限 8。 */
 export function scanConcurrency(env: Record<string, string | undefined> = process.env): number {
   const raw = env.DOWNLOAD_SCAN_CONCURRENCY?.trim() ?? '';

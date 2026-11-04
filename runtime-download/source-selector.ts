@@ -43,6 +43,13 @@ export interface SourceSelectorOptions {
    */
   skipStrictToc?: boolean;
   /**
+   * variantdup1105：同 url 的锚变体里功能规则逐字相同（只差站名/分组/排序/响应时间/注释等元数据）的只留池序第一条。
+   * 生产只读（2026-11-05 源池产物 753 源）：72 条与前面某条同 url 且功能规则全同，选源每轮拿同一套规则对同一 host
+   * 重复探测（≈1 成扫源额度与 host QPS）。留下的那条与被去掉的出网行为相同，去重不丢命中；规则有任何一处不同
+   * （含嵌套键序）都照旧分别扫。缺省关 = 逐字同改前。
+   */
+  dedupeVariants?: boolean;
+  /**
    * scanmiss1101：确认无书记忆（见 scan-miss-memo.ts）。缺省 = 无记忆（逐字同改前）。命中的源不出网、不扣
    * scanBudget，但照旧占 scanLimit 名额（轮转窗口划分不变，记忆只省请求、不扩扫描面）。
    */
@@ -129,6 +136,36 @@ export function createSourceSelector(options: SourceSelectorOptions): SourceSele
     tocMemo.set(source.url, entries);
     return doomed;
   };
+  // variantdup1105：功能指纹 = 剔除元数据键、bookSourceUrl 去锚后的规则 JSON，按规则对象记忆（池行在读缓存 TTL 内是同一对象）。
+  const VARIANT_META_KEYS = new Set(['bookSourceGroup', 'bookSourceName', 'bookSourceComment', 'customOrder', 'respondTime', 'lastUpdateTime', 'weight']);
+  const fingerprints = new WeakMap<object, string | null>();
+  const functionalKey = (source: PoolSource): string | null => {
+    const rules = source.rules;
+    if (typeof rules !== 'object' || rules === null) return null;
+    let fingerprint = fingerprints.get(rules);
+    if (fingerprint === undefined) {
+      try {
+        fingerprint = JSON.stringify(Object.entries(rules as Record<string, unknown>)
+          .filter(([key]) => !VARIANT_META_KEYS.has(key))
+          .map(([key, value]): [string, unknown] => [key, key === 'bookSourceUrl' && typeof value === 'string' ? value.split('#')[0] : value])
+          .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)));
+      } catch {
+        fingerprint = null;
+      }
+      fingerprints.set(rules, fingerprint);
+    }
+    return fingerprint === null ? null : `${source.url}\0${JSON.stringify(source.searchUrl ?? null)}\0${fingerprint}`;
+  };
+  const dedupeVariants = (pool: PoolSource[]): PoolSource[] => {
+    const seen = new Set<string>();
+    return pool.filter(source => {
+      const key = functionalKey(source);
+      if (key === null) return true;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+  };
 
   // authbridge42：书名轮收 0 后的作者名回退轮。QQ 系书在镜像站按通行书名收录（队列名「少年羽皇」vs
   // 站名「帝临鸿蒙」），书名搜索天然失配，是生产 0 候选率 96.6% 的结构性根因；qqmirror42 出网实测
@@ -187,6 +224,12 @@ export function createSourceSelector(options: SourceSelectorOptions): SourceSele
         return { picked: [], scanned: 0 };
       }
       signal.throwIfAborted();
+      let deduped = 0;
+      if (options.dedupeVariants) {
+        const before = pool.length;
+        pool = dedupeVariants(pool);
+        deduped = before - pool.length;
+      }
       if (options.skipStrictToc) pool = pool.filter(source => !strictTocDoomed(source));
       let lead = 0;
       if (options.hostPriority) {
@@ -313,7 +356,10 @@ export function createSourceSelector(options: SourceSelectorOptions): SourceSele
         }
       }
       memo?.record(task, misses);
-      log('info', '选源完成', { taskId: task.id, scanned, candidates: picked.length, hosts: pickedHosts, ...(memo ? { remembered } : {}) });
+      log('info', '选源完成', {
+        taskId: task.id, scanned, candidates: picked.length, hosts: pickedHosts,
+        ...(memo ? { remembered } : {}), ...(options.dedupeVariants ? { deduped } : {}),
+      });
       return memo ? { picked, scanned, remembered } : { picked, scanned };
     } finally {
       clearTimeout(timer);

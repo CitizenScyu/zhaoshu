@@ -99,6 +99,8 @@ export interface BuiltinFallbackOptions {
   scanRotate?: boolean;
   /** toctgate1030：透传给 selector，跳过 strict 目录必拒的源；缺省关。 */
   skipStrictToc?: boolean;
+  /** variantdup1105：透传给 selector，同 url 功能规则全同的锚变体只扫第一条；缺省关。 */
+  dedupeVariants?: boolean;
   /** scanmiss1101：透传给 selector 的确认无书记忆；缺省无（逐字同改前）。 */
   missMemo?: ScanMissMemo;
   /** scanpar1104：透传给 selector 的同时探测源数；缺省 1（串行，逐字同改前）。 */
@@ -186,6 +188,7 @@ export function createBuiltinFallback(options: BuiltinFallbackOptions) {
     timeoutMs: options.timeoutMs ?? 30000,
     hostPriority: options.hostPriority,
     skipStrictToc: options.skipStrictToc,
+    dedupeVariants: options.dedupeVariants,
     missMemo: options.missMemo,
     scanConcurrency: options.scanConcurrency,
   });

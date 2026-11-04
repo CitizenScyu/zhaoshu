@@ -6,7 +6,7 @@ const zero = vi.hoisted(() => vi.fn());
 vi.mock('../src/lib/download-source-candidates', () => ({ productiveHostScores: scores, zeroYieldHosts: zero }));
 
 import {
-  createHostPriority, demoteZeroYieldEnabled, HOST_PRIORITY_TTL_MS, productiveFirstEnabled, scanConcurrency, scanRotateEnabled,
+  createHostPriority, dedupeVariantsEnabled, demoteZeroYieldEnabled, HOST_PRIORITY_TTL_MS, productiveFirstEnabled, scanConcurrency, scanRotateEnabled,
   skipStrictTocEnabled,
 } from './host-priority';
 
@@ -28,6 +28,14 @@ describe('yield1030 host-priority', () => {
     expect(skipStrictTocEnabled({})).toBe(false);
     expect(skipStrictTocEnabled({ DOWNLOAD_SCAN_SKIP_STRICT_TOC: 'yes' })).toBe(false);
     expect(skipStrictTocEnabled({ DOWNLOAD_SCAN_SKIP_STRICT_TOC: ' On ' })).toBe(true);
+  });
+
+  it('variantdup1105：DOWNLOAD_SCAN_DEDUPE_VARIANTS 缺省/非真值关，1/true/on 开', () => {
+    expect(dedupeVariantsEnabled({})).toBe(false);
+    expect(dedupeVariantsEnabled({ DOWNLOAD_SCAN_DEDUPE_VARIANTS: 'yes' })).toBe(false);
+    expect(dedupeVariantsEnabled({ DOWNLOAD_SCAN_DEDUPE_VARIANTS: '0' })).toBe(false);
+    expect(dedupeVariantsEnabled({ DOWNLOAD_SCAN_DEDUPE_VARIANTS: ' On ' })).toBe(true);
+    expect(dedupeVariantsEnabled({ DOWNLOAD_SCAN_DEDUPE_VARIANTS: '1' })).toBe(true);
   });
 
   it('scanpar1104：DOWNLOAD_SCAN_CONCURRENCY 缺省/非法 = 1，正整数夹到 1..8', () => {

@@ -25,7 +25,7 @@ import { createBudgetRefund } from './budget-refund';
 import { createIdentityPrecheck } from './identity-precheck';
 import { createBuiltinFallback } from './builtin-fallback';
 import { createHostOccupancy, type HostOccupancy } from './host-occupancy';
-import { createHostPriority, scanConcurrency, scanRotateEnabled, skipStrictTocEnabled } from './host-priority';
+import { createHostPriority, dedupeVariantsEnabled, scanConcurrency, scanRotateEnabled, skipStrictTocEnabled } from './host-priority';
 import { createScanMissMemo, scanMissDir, scanMissMemoEnabled } from './scan-miss-memo';
 import { createSharedHostSuspect, hostSuspectDir, sharedHostSuspectEnabled } from './shared-host-suspect';
 import { isHostSuspect, setHostHealthListener, sourceHostSuspectMs } from '../src/lib/source-host-health';
@@ -346,6 +346,7 @@ export async function createDownloadExecutor(options: ProductionExecutorOptions)
       hostPriority: candidateSql ? createHostPriority(candidateSql, env) : undefined,
       scanRotate: scanRotateEnabled(env),
       skipStrictToc: skipStrictTocEnabled(env),
+      dedupeVariants: dedupeVariantsEnabled(env),
       missMemo: scanMissMemoEnabled(env) ? createScanMissMemo(scanMissDir(options.workDir)) : undefined,
       scanConcurrency: scanConcurrency(env),
       ...(sharedSuspect ? { isSuspect: (host: string) => isHostSuspect(host) || sharedSuspect.isSuspect(host) } : {}),

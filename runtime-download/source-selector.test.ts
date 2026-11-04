@@ -23,6 +23,7 @@ function harness(opts: {
   poolRules?: (id: string) => unknown;
   doomedRules?: (rules: unknown) => boolean;
   skipStrictToc?: boolean;
+  dedupeVariants?: boolean;
   missMemo?: ScanMissMemo;
   scanConcurrency?: number;
 }) {
@@ -67,6 +68,7 @@ function harness(opts: {
     log: (level, message, fields) => logs.push({ level, message, fields }),
     hostPriority: opts.hostPriority,
     skipStrictToc: opts.skipStrictToc,
+    dedupeVariants: opts.dedupeVariants,
     missMemo: opts.missMemo,
     scanConcurrency: opts.scanConcurrency,
   });
@@ -118,6 +120,34 @@ describe('共用选源器', () => {
       expect(h.compiles.filter(u => u === 'https://f.example/').length - h.searchedUrls.filter(u => u === 'https://f.example/').length).toBe(2);
       expect(h.compiles.filter(u => u === 'https://g.example/').length - h.searchedUrls.filter(u => u === 'https://g.example/').length).toBe(1);
     }
+  });
+
+  it('variantdup1105：同 url 功能规则全同的锚变体只扫第一条；元数据/锚不算差异，规则任一处不同或异 url 照旧分别扫；关 ⇒ 逐字同改前', async () => {
+    const pool = ['https://f.example/', 'https://f.example/', 'https://f.example/', 'https://g.example/', 'https://g.example/', 'https://h.example/'];
+    const rules: object[] = [
+      { bookSourceName: 'F', bookSourceUrl: 'https://f.example', ruleSearch: { a: 1 } },
+      { bookSourceName: 'F#1', bookSourceGroup: '优选', customOrder: 5, respondTime: 600, bookSourceUrl: 'https://f.example#🎃', ruleSearch: { a: 1 } },
+      { bookSourceName: 'F2', bookSourceUrl: 'https://f.example', ruleSearch: { a: 2 } },
+      { ruleSearch: { b: 2, a: 1 } },
+      { ruleSearch: { a: 1, b: 2 } },
+      { bookSourceName: 'F', bookSourceUrl: 'https://f.example', ruleSearch: { a: 1 } },
+    ];
+    const poolRules = (id: string) => rules[Number(id.slice(id.lastIndexOf('#') + 1))];
+    const on = harness({ pool, search: () => [], poolRules, dedupeVariants: true });
+    for (let round = 0; round < 2; round += 1) {
+      const before = on.searchedUrls.length;
+      expect((await on.selector(request(), freshSignal())).scanned).toBe(5);
+      expect(on.searchedUrls.slice(before)).toEqual(['https://f.example/', 'https://f.example/', 'https://g.example/', 'https://g.example/', 'https://h.example/']);
+      expect(on.logs.filter(l => l.message === '选源完成').at(-1)?.fields?.deduped).toBe(1);
+    }
+    const off = harness({ pool, search: () => [], poolRules });
+    expect((await off.selector(request(), freshSignal())).scanned).toBe(6);
+    expect(off.searchedUrls).toEqual(pool);
+    expect(off.logs.find(l => l.message === '选源完成')?.fields).not.toHaveProperty('deduped');
+    // 无规则对象（rules 缺席）不判重。
+    const bare = harness({ pool: ['https://f.example/', 'https://f.example/'], search: () => [], dedupeVariants: true });
+    await bare.selector(request(), freshSignal());
+    expect(bare.searchedUrls).toEqual(['https://f.example/', 'https://f.example/']);
   });
 
   it('yield1030：hostPriority 稳定重排——高分 host 先扫，同分与缺席保持池序，scanLimit 不变', async () => {
