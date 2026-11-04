@@ -22,7 +22,9 @@ import {
   gitBlobSha, isRetryablePublicationError, LeaseLostError, manifestIsWorse, publishBookVersion, PublicationStageError, snapshotPaths,
   type GitHubContents, type PublishOutcome,
 } from './download-publisher';
-import { artifactIdentityKey, type ArtifactIdentityOwner, type RelocatableArtifact } from './artifact-registry';
+import {
+  artifactIdentityKey, type ArtifactIdentityOwner, type FindRelocatableArtifactInput, type RelocatableArtifact,
+} from './artifact-registry';
 import type { TxtChapter } from './txt-chapters';
 // capacity986：发布期切仓决策（985 已交付模块，纯决策 + 端口注入，无 DB/网络副作用）。
 import { decideRepositoryForPublication, type RolloverEvidencePort } from '../../runtime-download/repository-rollover-wiring';
@@ -97,8 +99,8 @@ export interface WorkerStorage {
   findArtifactBinding(input: { identityKey: string; labeledBookId: number }): Promise<{ repositoryId: number; branch: string; canonicalPath: string } | null>;
   /** prepub1102：按 identity_key 查既有落位全字段（不限书库记录）。可选；缺省时预检不生效。 */
   findArtifactIdentityOwner?(input: { identityKey: string }): Promise<ArtifactIdentityOwner | null>;
-  /** relocate1105：既有落位的主键与已发布统计（与 findArtifactBinding 同口径）。可选；缺省时搬迁不生效。 */
-  findRelocatableArtifact?(input: { identityKey: string; labeledBookId: number }): Promise<RelocatableArtifact | null>;
+  /** relocate1105：既有落位的主键与已发布统计（与 findArtifactBinding 同口径），并查目标仓同路径是否被他行占用。可选；缺省时搬迁不生效。 */
+  findRelocatableArtifact?(input: FindRelocatableArtifactInput): Promise<RelocatableArtifact | null>;
   /** DB 阶段收口：登记已发布产物并把任务指向 artifact_id。 */
   registerArtifact(lease: DownloadTaskLease, input: {
     artifactId: number; version: string; blobSha: string; bytes: number;
@@ -570,8 +572,12 @@ export async function runDownloadTask(
       // relocate1105：旧行所在仓不合格（已满）⇒ 决策换了仓；同路径的旧行改为登记时搬迁，不再 reserve 撞冲突。
       if (options.relocateArtifacts && existingBinding && storage.findRelocatableArtifact
         && (publishRepositoryId !== existingBinding.repositoryId || publishBranch !== existingBinding.branch)) {
-        const found = await storage.findRelocatableArtifact({ identityKey, labeledBookId: task.book_id });
-        if (found && found.canonicalPath === canonicalPath
+        const found = await storage.findRelocatableArtifact({
+          identityKey, labeledBookId: task.book_id,
+          target: { repositoryId: publishRepositoryId, branch: publishBranch },
+        });
+        // 目标仓同路径已被他行占用时不搬迁：照旧 reserve，由既有冲突路径收口，绝不先覆盖他书文件。
+        if (found && found.canonicalPath === canonicalPath && !found.targetPathTaken
           && found.repositoryId === existingBinding.repositoryId && found.branch === existingBinding.branch) {
           relocation = found;
         }

@@ -200,18 +200,28 @@ maybe('T8 storage 绑定：租约条件/心跳/进度/终态/artifact 幂等', (
     it('findRelocatableArtifact 取回主键/落位/发布状态；搬迁登记 registered，重试 already', async () => {
       const { id, storage, lease, artifactId, input } = await registration();
       const identityKey = artifactIdentityKey('测试书', '佚名');
-      expect(await storage.findRelocatableArtifact!({ identityKey, labeledBookId: 1 })).toMatchObject({
+      expect(await storage.findRelocatableArtifact!({ identityKey, labeledBookId: 1, target: relocate.to })).toMatchObject({
         artifactId, repositoryId: 1, branch: 'main', published: false,
       });
       expect(await storage.registerArtifact(lease, { ...input, relocate })).toBe('registered');
       expect(await where(artifactId)).toMatchObject({ repository_id: 2, branch: 'main', quality_status: 'published' });
       expect((await state(id)).artifact_id).toBe(artifactId);
-      expect(await storage.findRelocatableArtifact!({ identityKey, labeledBookId: 1 })).toMatchObject({
+      expect(await storage.findRelocatableArtifact!({ identityKey, labeledBookId: 1, target: relocate.to })).toMatchObject({
         artifactId, repositoryId: 2, published: true, chaptersDone: 3, chars: 5678,
       });
       const before = await snapshot();
       expect(await storage.registerArtifact(lease, { ...input, relocate })).toBe('already');
       expect(await snapshot()).toEqual(before);
+    });
+
+    it('目标仓同路径已被他行占用 ⇒ targetPathTaken（worker 据此不搬迁、不先覆盖他书文件）', async () => {
+      const { storage } = await registration();
+      const row = (await pg.query('SELECT canonical_path FROM book_artifacts LIMIT 1')).rows[0] as { canonical_path: string };
+      await storage.reserveArtifactPath({ labeledBookId: 1, identityKey: 'synthetic-other',
+        repositoryId: 2, branch: 'main', canonicalPath: row.canonical_path });
+      expect(await storage.findRelocatableArtifact!({
+        identityKey: artifactIdentityKey('测试书', '佚名'), labeledBookId: 1, target: relocate.to,
+      })).toMatchObject({ repositoryId: 1, targetPathTaken: true });
     });
 
     it('不带 relocate 的登记不动落位（缺省与引入前一致）', async () => {

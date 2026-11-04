@@ -270,7 +270,7 @@ describe('capacity986 download-worker 切仓决策消费点（合成端口）', 
       const fx = fixture(rolloverSeam);
       fx.storage.findArtifactBinding.mockResolvedValue({ repositoryId: 1, branch: 'main', canonicalPath });
       const findRelocatableArtifact = vi.fn<NonNullable<WorkerStorage['findRelocatableArtifact']>>().mockResolvedValue({
-        artifactId: 55, repositoryId: 1, branch: 'main', canonicalPath, ...existing,
+        artifactId: 55, repositoryId: 1, branch: 'main', canonicalPath, targetPathTaken: false, ...existing,
       });
       Object.assign(fx.storage, { findRelocatableArtifact });
       if (relocateArtifacts) fx.options.relocateArtifacts = true;
@@ -284,6 +284,7 @@ describe('capacity986 download-worker 切仓决策消费点（合成端口）', 
       expect(result.terminal).toBe('done');
       expect(findRelocatableArtifact).toHaveBeenCalledWith({
         identityKey: artifactIdentityKey(task.title, task.author), labeledBookId: task.book_id,
+        target: { repositoryId: 2, branch: 'main' },
       });
       expect(storage.reserveArtifactPath).not.toHaveBeenCalled();
       expect(rebuildTargets).toEqual([NEXT]);
@@ -318,7 +319,18 @@ describe('capacity986 download-worker 切仓决策消费点（合成端口）', 
       const { storage, run, findRelocatableArtifact } = setup(true, { published: true, chaptersDone: 1, chars: 4 });
       findRelocatableArtifact.mockResolvedValue({
         artifactId: 55, repositoryId: 1, branch: 'main', canonicalPath: 'other/path.txt',
-        published: true, chaptersDone: 1, chars: 4,
+        published: true, chaptersDone: 1, chars: 4, targetPathTaken: false,
+      });
+      await run();
+      expect(storage.reserveArtifactPath).toHaveBeenCalledWith(expect.objectContaining({ repositoryId: 2 }));
+      expect(storage.registerArtifact).not.toHaveBeenCalledWith(lease, expect.objectContaining({ relocate: expect.anything() }));
+    });
+
+    it('j2. 开：目标仓同路径已被他行占用 ⇒ 不搬迁、不先覆盖他书文件，照旧 reserve', async () => {
+      const { storage, run, findRelocatableArtifact } = setup(true, { published: true, chaptersDone: 1, chars: 4 });
+      findRelocatableArtifact.mockResolvedValue({
+        artifactId: 55, repositoryId: 1, branch: 'main', canonicalPath,
+        published: true, chaptersDone: 1, chars: 4, targetPathTaken: true,
       });
       await run();
       expect(storage.reserveArtifactPath).toHaveBeenCalledWith(expect.objectContaining({ repositoryId: 2 }));

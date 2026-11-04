@@ -69,6 +69,12 @@ export interface RelocatableArtifact extends ArtifactBindingRow {
   published: boolean;
   chaptersDone: number;
   chars: number;
+  /** 搬迁目标仓/分支的同路径已被别的 artifact 行占用（跳过 reserve 后不先查，发布会先覆盖他书文件）。 */
+  targetPathTaken: boolean;
+}
+
+export interface FindRelocatableArtifactInput extends FindArtifactBindingInput {
+  target: { repositoryId: number; branch: string };
 }
 
 /**
@@ -78,16 +84,21 @@ export interface RelocatableArtifact extends ArtifactBindingRow {
  */
 export async function findRelocatableArtifact(
   sql: ReturnType<typeof neon>,
-  input: FindArtifactBindingInput,
+  input: FindRelocatableArtifactInput,
 ): Promise<RelocatableArtifact | null> {
   if (!input.identityKey || input.identityKey.includes('\0')
-    || !Number.isSafeInteger(input.labeledBookId) || input.labeledBookId <= 0) throw new Error('INVALID_ARTIFACT_INPUT');
+    || !Number.isSafeInteger(input.labeledBookId) || input.labeledBookId <= 0
+    || !Number.isSafeInteger(input.target?.repositoryId) || input.target.repositoryId <= 0
+    || !input.target.branch) throw new Error('INVALID_ARTIFACT_INPUT');
   const rows = await sql`
-    SELECT id, repository_id, branch, canonical_path, quality_status, chapters_done, chars FROM book_artifacts
-    WHERE identity_key = ${input.identityKey} AND labeled_book_id = ${input.labeledBookId}
+    SELECT a.id, a.repository_id, a.branch, a.canonical_path, a.quality_status, a.chapters_done, a.chars,
+      EXISTS (SELECT 1 FROM book_artifacts o WHERE o.repository_id = ${input.target.repositoryId}
+        AND o.branch = ${input.target.branch} AND o.canonical_path = a.canonical_path AND o.id <> a.id) AS target_path_taken
+    FROM book_artifacts a
+    WHERE a.identity_key = ${input.identityKey} AND a.labeled_book_id = ${input.labeledBookId}
     LIMIT 1` as {
       id: number | string; repository_id: number | string; branch: string; canonical_path: string;
-      quality_status: string; chapters_done: number | string; chars: number | string;
+      quality_status: string; chapters_done: number | string; chars: number | string; target_path_taken: boolean;
     }[];
   const row = rows[0];
   if (!row) return null;
@@ -102,6 +113,7 @@ export async function findRelocatableArtifact(
   return {
     artifactId, repositoryId, branch: row.branch, canonicalPath: row.canonical_path,
     published: row.quality_status === 'published', chaptersDone, chars,
+    targetPathTaken: row.target_path_taken === true,
   };
 }
 
