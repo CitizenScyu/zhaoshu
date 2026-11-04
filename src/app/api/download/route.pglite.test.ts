@@ -95,9 +95,12 @@ describe('T6 real v7 API isolation', () => {
     expect(list.tasks.map((t: { id: number }) => t.id).sort()).toEqual([1,5,9]);
     for (const id of [2,3,4]) {
       expect((await GET(request('GET', `?id=${id}`))).status).toBe(404);
-      expect((await fileGET(request(), { params: Promise.resolve({ id: String(id) }) })).status).toBe(404);
+      // shareddl1104：已完成 TXT（4）与在线阅读同口径共享；他人/系统未完成任务仍 404。
+      if (id !== 4) expect((await fileGET(request(), { params: Promise.resolve({ id: String(id) }) })).status).toBe(404);
       expect((await DELETE(request('DELETE','',{ taskId: id }))).status).toBe(404);
     }
+    // 本测试未配 GITHUB_TOKEN：共享完成本过了归属判定、停在文件服务配置（不发网络请求）。
+    expect((await fileGET(request(), { params: Promise.resolve({ id: '4' }) })).status).toBe(503);
     expect((await (await GET(request('GET','?bookId=7'))).json()).task.id).toBe(1);
     expect((await (await GET(request('GET','?bookId=8'))).json()).task).toBeNull();
     expect((await DELETE(request('DELETE','',{taskId:1}))).status).toBe(200);

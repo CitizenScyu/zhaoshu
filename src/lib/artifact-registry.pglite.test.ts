@@ -268,13 +268,19 @@ describe('artifact registry: real local Postgres and mock private GitHub', () =>
     expect((await reader.readBookIndex(await reader.getReadableTask(1, 2))).totalBytes).toBe(bytes.length);
   });
 
-  it('retains owner-only downloads and hides unfinished tasks from other readers', async () => {
-    await publish(1, Buffer.from('第一章\n测试正文'));
+  it('shares finished downloads like the reader and hides unfinished tasks from other readers', async () => {
+    const bytes = Buffer.from('第一章\n测试正文');
+    await publish(1, bytes);
     await pg.exec('UPDATE download_tasks SET user_id=2 WHERE id=1');
-    expect((await download()).status).toBe(404);
     expect((await download(1, 'incorrect')).status).toBe(401);
     expect(mocks.fetch).not.toHaveBeenCalled();
+    // shareddl1104：他人已完成的 TXT 与在线阅读同口径可取回。
+    mocks.fetch.mockResolvedValueOnce(new Response(bytes));
+    const shared = await download();
+    expect(shared.status).toBe(200);
+    expect(Buffer.from(await shared.arrayBuffer()).equals(bytes)).toBe(true);
     await pg.exec("UPDATE download_tasks SET status='pending' WHERE id=1");
+    expect((await download()).status).toBe(404);
     await expect(reader.getReadableTask(1, 1)).rejects.toMatchObject({ status: 404 });
     await pg.exec("UPDATE download_tasks SET status='done',user_id=1 WHERE id=1");
   });

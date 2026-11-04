@@ -720,14 +720,16 @@ export default function LibraryTab({ view, setView }: {
     }
   }
 
-  async function retrieveFile() {
+  // 取回本人已完成任务的文件；shareddl1104：书仓已有完成本（sharedReadTaskId）时直接取回同一份，免得重抓整本。
+  async function retrieveFile(shared?: { id: number; title: string }) {
     if (!isCurrentSession(sessionId)) return;
-    if (!canDownload || task?.requestedBy === 'system') return;
-    if (!task) return;
+    if (!canDownload) return;
+    const target = shared ?? (task && task.requestedBy !== 'system' ? task : null);
+    if (!target) return;
     const my = dlRequestId.current;
     const controller = beginAction();
     try {
-      const res = await apiFetch(`/api/download/${task.id}/file`, { signal: controller.signal });
+      const res = await apiFetch(`/api/download/${target.id}/file`, { signal: controller.signal });
       if (!isCurrentAction(controller, my)) return;
       if (!res.ok) {
         const data = await res.json().catch(() => ({}));
@@ -736,7 +738,7 @@ export default function LibraryTab({ view, setView }: {
       }
       const blob = await res.blob();
       if (!isCurrentAction(controller, my)) return;
-      const name = fileNameFrom(res.headers.get('Content-Disposition') ?? '', `${task.title || 'novel'}.txt`);
+      const name = fileNameFrom(res.headers.get('Content-Disposition') ?? '', `${target.title || 'novel'}.txt`);
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
@@ -806,6 +808,18 @@ export default function LibraryTab({ view, setView }: {
             <div className="mb-3">
               <ReadBookLink taskId={canDownload && task?.status === 'done' ? task.id : detail.sharedReadTaskId} title={detail.title} author={detail.author} from="library" />
             </div>
+            {canDownload && detail.sharedReadTaskId != null
+              && !(task?.status === 'done' && task.requestedBy !== 'system') && (
+              <div className="mb-3 flex flex-wrap items-center gap-3">
+                <button
+                  className="seal-button text-sm"
+                  onClick={() => void retrieveFile({ id: detail.sharedReadTaskId!, title: detail.title })}
+                >
+                  ⬇ 下载 TXT
+                </button>
+                <span className="text-xs" style={{ color: 'var(--ink-faint)' }}>书仓已有完整版，直接取回，无需重新下载。</span>
+              </div>
+            )}
             {canDownload && dlError && (
               <p role="alert" className="text-xs mb-2" style={{ color: 'var(--cinnabar)' }}>✗ {dlError}</p>
             )}

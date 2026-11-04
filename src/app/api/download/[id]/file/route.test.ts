@@ -185,13 +185,22 @@ describe('GET /api/download/[id]/file', () => {
     await expect(reader.read()).resolves.toEqual({ value: undefined, done: true });
   });
 
-  it('returns 404 for another user task before touching the file service', async () => {
+  it('returns 404 for another user unfinished task before touching the file service', async () => {
     sql.mockResolvedValueOnce([]);
     const res = await download();
     expect(res.status).toBe(404);
     expect(await res.json()).toMatchObject({ code: 'TASK_NOT_FOUND' });
     expect(sql.mock.calls[0].slice(1)).toEqual([42, 1]);
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('shareddl1104：已完成任务与在线阅读同口径共享，只有未完成任务限本人', async () => {
+    mockFile(new Response('共享正文'));
+    const res = await download();
+    expect(res.status).toBe(200);
+    expect(await res.text()).toBe('共享正文');
+    const query = sql.mock.calls[0][0].join('?');
+    expect(query).toContain("status = 'done' OR (requested_by = 'user' AND user_id = ?)");
   });
 
   it('transfers a 17 MiB file in order without waiting for all chunks before returning', async () => {

@@ -98,6 +98,32 @@ describe('书库详情的下载权限', () => {
     expect(screen.queryByText(permissionNote)).toBeNull();
   });
 
+  it('shareddl1104：书仓已有完成本时可直接下载 TXT，不新建下载任务', async () => {
+    const click = vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => {});
+    vi.stubGlobal('URL', Object.assign(class extends URL {}, { createObjectURL: vi.fn(() => 'blob:synthetic'), revokeObjectURL: vi.fn() }));
+    mocks.apiFetch.mockImplementation(async (url: string) => {
+      if (url.startsWith('/api/library')) return libraryResponse();
+      if (url === '/api/download/90/file') return new Response('合成正文', { headers: { 'Content-Disposition': "attachment; filename=\"novel.txt\"" } });
+      return json({ task: null });
+    });
+    render(<Harness />);
+    await openDetail();
+    fireEvent.click(await screen.findByRole('button', { name: '⬇ 下载 TXT' }));
+    await waitFor(() => expect(click).toHaveBeenCalledOnce());
+    expect(downloadCalls().some(([, init]) => init?.method === 'POST')).toBe(false);
+    vi.unstubAllGlobals();
+  });
+
+  it('shareddl1104：没有书仓完成本时不显示直接下载', async () => {
+    mocks.read = false;
+    mocks.apiFetch.mockImplementation(async (url: string) => url.startsWith('/api/library') ? libraryResponse() : json({ task: null }));
+    render(<Harness />);
+    await openDetail();
+    await waitFor(() => expect(downloadCalls()).toHaveLength(1));
+    expect(screen.queryByRole('button', { name: '⬇ 下载 TXT' })).toBeNull();
+    expect(screen.getByRole('button', { name: /下载全书/ })).toBeTruthy();
+  });
+
   it('撤销权限中止尚未完成的详情任务查询，恢复后重新查询而非复用迟到任务', async () => {
     const pending = deferred();
     let lookups = 0;

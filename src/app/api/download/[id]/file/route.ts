@@ -226,9 +226,11 @@ async function handleGET(
   try {
     await ensureSchema();
     const sql = getSql();
+    // shareddl1104：已完成 TXT 与在线阅读（getReadableTask）同口径共享——书库书多由系统任务下载，
+    // 只认本人任务时用户只能重抓整本；他人未完成任务的存在性仍不透出（同 404）。
     const rows = (await sql`
       SELECT id, title, author, status, to_jsonb(download_tasks)->>'artifact_id' AS artifact_id FROM download_tasks
-      WHERE id = ${taskId} AND requested_by = 'user' AND user_id = ${auth.principal.userId}`) as {
+      WHERE id = ${taskId} AND (status = 'done' OR (requested_by = 'user' AND user_id = ${auth.principal.userId}))`) as {
       id: number;
       title: string;
       author: string;
