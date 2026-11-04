@@ -64,11 +64,18 @@ describe('source adult metadata classification', () => {
   it.each([
     'https://m.lulushu18.com', 'https://lulushu18.com', 'https://dfu7.com', 'https://www.dfu7.com/',
     'https://m.blpopo.com', 'https://api.blpopo.com', 'https://www.jubu.cc', 'https://www.m.jubu.cc',
+    'https://sesebooks.com', 'https://www.sesebooks.com/', 'https://novel.seseclub.com',
   ])('recognizes blacklisted stations: %s', (bookSourceUrl) => {
     expect(classifySourceAdult('普通', { bookSourceUrl })).toBe('adult');
   });
 
-  it.each(['https://m.lulushu18.com.example', 'https://xdfu7.com', 'https://jubu.cc.cn'])(
+  // adult1104：生产池原样站名（域名不参与时也按站名判 adult）。
+  it.each(['涩涩书屋', '❤️涩涩小说🎃', '🎃涩涩小说🎃', '✈️ 涩涩俱乐部-九梦#书源.com'])(
+    'recognizes 涩涩 site names: %s', (name) => {
+      expect(classifySourceAdult(name, { bookSourceName: name })).toBe('adult');
+    });
+
+  it.each(['https://m.lulushu18.com.example', 'https://xdfu7.com', 'https://jubu.cc.cn', 'https://xsesebooks.com'])(
     'blacklist is exact-station only: %s', (bookSourceUrl) => {
       expect(classifySourceAdult('普通', { bookSourceUrl })).toBe('unmarked');
     });
