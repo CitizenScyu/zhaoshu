@@ -31,6 +31,8 @@ const policies: Record<string, Record<string, 'find' | 'read' | 'download' | 'ow
   'admin/download-stats': { GET: 'owner' },
   // requeue1104：终态未完成书的有界重排，owner 专用写入口。
   'admin/download-requeue': { POST: 'owner' },
+  // demote1104：试读本下架/恢复，owner 专用写入口。
+  'admin/download-demote': { POST: 'owner' },
   export: { GET: 'find' },
   feedback: { GET: 'find', POST: 'find' }, find: { POST: 'find' },
   // zhuigeng42：追更轮，只由 phoenix 侧 systemd timer 以 CRON_SECRET 调用（见 followup/route.test.ts）。

@@ -670,8 +670,9 @@ describe('tailwall1104 书尾预览尾段识别', () => {
     expect(previewTailRun([ch(2200), ch(200), ch(200), ch(100, '上架感言'), ch(200), ch(200), ch(200)])).toBe(true);
   });
   it('DOWNLOAD_PREVIEW_TAIL=0 关，缺省开', () => {
-    expect(previewTail({})).toBe(true);
-    expect(previewTail({ DOWNLOAD_PREVIEW_TAIL: '0' })).toBe(false);
+    expect(previewTail()).toBe(true);
+    vi.stubEnv('DOWNLOAD_PREVIEW_TAIL', '0');
+    expect(previewTail()).toBe(false);
   });
   it('整本：20 章免费 + 10 章预览尾段 ⇒ preview_truncated、零 book.txt', async () => {
     const f = setup();

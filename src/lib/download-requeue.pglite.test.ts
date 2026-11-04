@@ -1,8 +1,8 @@
 import { afterAll, beforeAll, expect, it } from 'vitest';
 import { loadPGlite, type PGliteLike } from '@/lib/fixtures/pglite';
 import { createPGliteSql } from '@/lib/fixtures/pglite-sql';
-import { createProductionSchema, seedProductionMembers } from '@/lib/fixtures/production-schema';
-import { requeueUnfinishedBooks } from './download-requeue';
+import { createArtifactSchema, createProductionSchema, seedProductionMembers } from '@/lib/fixtures/production-schema';
+import { demotePreviewTasks, requeueUnfinishedBooks } from './download-requeue';
 
 // requeue1104：真库验证「只挑终态未完成、无 done、无活动系统任务」的书，付费墙源默认排除，
 // dryRun 零写入，同一 revision 重放幂等。全部合成数据。
@@ -80,4 +80,38 @@ it('apply 插全新 pending 系统任务（attempt_count=1、新事件键），�
 it('拒绝非法 revision 与越界 limit', async () => {
   await expect(requeueUnfinishedBooks(sql, { sourceRevision: 'Bad Rev', limit: 1, dryRun: true })).rejects.toThrow('sourceRevision');
   await expect(requeueUnfinishedBooks(sql, { sourceRevision: 'requeue-x', limit: 501, dryRun: true })).rejects.toThrow('limit');
+});
+
+// demote1104：试读本下架只动给定的系统 done 任务（书库/阅读随之不列），可按原样恢复；之后可按 preview_truncated 重排。
+it('demote：dryRun 不写；只下架系统 done；restore 只恢复挂 artifact 的下架行；下架后可按原因重排', async () => {
+  await createArtifactSchema(sql as never);
+  await pg.exec(`
+    INSERT INTO labeled_books(id,title,author,source_url) VALUES
+      (20,'试读本','辛','https://book.qq.com/book-detail/20'),
+      (21,'用户本','壬','https://a.example/21'),
+      (22,'引擎判的','癸','https://a.example/22');
+    INSERT INTO storage_repositories(id,owner,repo,branch,enabled) VALUES (1,'fixture','private-a','main',true);
+    INSERT INTO book_artifacts(id,labeled_book_id,identity_key,repository_id,branch,canonical_path,version,blob_sha,bytes,quality_status,published_at)
+      VALUES (1,20,'id-20',1,'main','books/20.txt','v1','${'a'.repeat(40)}',10,'published',now());
+    INSERT INTO download_tasks(id,user_id,book_id,title,author,status,requested_by,enqueue_key,error,artifact_id) VALUES
+      (40,NULL,20,'试读本','辛','done','system','20:p:','',1),
+      (41,2,21,'用户本','壬','done','user',NULL,'',NULL),
+      (42,NULL,22,'引擎判的','癸','partial','system','22:p:','preview_truncated',NULL);`);
+  const status = async (id: number) => (await pg.query('SELECT status,error FROM download_tasks WHERE id=$1', [id])).rows[0];
+  expect(await demotePreviewTasks(sql, { taskIds: [40, 41, 42, 999], dryRun: true }))
+    .toEqual({ dryRun: true, restore: false, requested: 4, matched: 1, updated: 0 });
+  expect(await status(40)).toEqual({ status: 'done', error: '' });
+  expect(await demotePreviewTasks(sql, { taskIds: [40, 41, 40], dryRun: false })).toMatchObject({ requested: 2, matched: 1, updated: 1 });
+  expect(await status(40)).toEqual({ status: 'partial', error: 'preview_truncated' });
+  expect(await status(41)).toEqual({ status: 'done', error: '' });
+  const requeue = await requeueUnfinishedBooks(sql, {
+    sourceRevision: 'demote-test', limit: 10, dryRun: true, policyVersion: 'p', includePaywall: true, reasons: ['preview_truncated'],
+  });
+  expect(requeue.selected).toBe(2);
+  // 恢复：40 挂 artifact → 回 done；42 是引擎零发布的 preview_truncated、无 artifact → 不动。
+  expect(await demotePreviewTasks(sql, { taskIds: [40, 42], dryRun: false, restore: true })).toMatchObject({ matched: 1, updated: 1 });
+  expect(await status(40)).toEqual({ status: 'done', error: '' });
+  expect(await status(42)).toEqual({ status: 'partial', error: 'preview_truncated' });
+  await expect(demotePreviewTasks(sql, { taskIds: [], dryRun: true })).rejects.toThrow('taskIds');
+  await expect(demotePreviewTasks(sql, { taskIds: [0], dryRun: true })).rejects.toThrow('taskIds');
 });

@@ -18,7 +18,7 @@ export const REQUEUE_MAX_LIMIT = 500;
 const REVISION_PATTERN = /^[a-z0-9][a-z0-9._-]{2,63}$/;
 /** 失败原因码（从 error 文本里取第一个已知码）；未知归 other。 */
 export const REQUEUE_REASONS = [
-  'no_candidates', 'source_unavailable', 'missing_chapters', 'invalid_chapter',
+  'preview_truncated', 'no_candidates', 'source_unavailable', 'missing_chapters', 'invalid_chapter',
   'host_breaker', 'host_occupied', 'download_failed',
 ] as const;
 
@@ -119,5 +119,46 @@ export async function requeueUnfinishedBooks(sql: ImporterSql, options: RequeueO
     inserted: Number(row.inserted ?? 0),
     byHost: Array.isArray(row.by_host) ? row.by_host as RequeueResult['byHost'] : [],
     byReason: Array.isArray(row.by_reason) ? row.by_reason as RequeueResult['byReason'] : [],
+  };
+}
+
+// 试读本下架（demote1104）：tailwall1104 之前已按 done 发布的「免费前段 + 付费预览尾段」书，
+// 由 owner 给出任务 id（只读扫描书尾连续短章得出），把这些**系统** done 任务改成
+// partial / preview_truncated——书库与在线阅读只认 done，于是下架；GitHub 上的文件与
+// artifact 指针原样不动。随后可用 requeueUnfinishedBooks（reasons=['preview_truncated']）重排换源。
+// restore=true 反向恢复：只认 partial + preview_truncated 且仍挂 artifact 的行（引擎自己判的
+// preview_truncated 零发布、无 artifact，不会被误恢复成 done）。单语句；dryRun 只统计。
+export const DEMOTE_MAX_IDS = 500;
+
+export interface DemoteOptions { taskIds: number[]; dryRun: boolean; restore?: boolean }
+export interface DemoteResult { dryRun: boolean; restore: boolean; requested: number; matched: number; updated: number }
+
+export async function demotePreviewTasks(sql: ImporterSql, options: DemoteOptions): Promise<DemoteResult> {
+  const ids = [...new Set(options.taskIds)];
+  if (!ids.length || ids.length > DEMOTE_MAX_IDS || !ids.every(id => Number.isSafeInteger(id) && id > 0)) {
+    throw new Error('taskIds is invalid');
+  }
+  const restore = options.restore === true;
+  const rows = await sql`
+    WITH target AS (
+      SELECT dt.id FROM download_tasks dt
+      WHERE dt.id IN (SELECT jsonb_array_elements_text(${JSON.stringify(ids)}::jsonb)::bigint)
+        AND dt.requested_by = 'system'
+        AND CASE WHEN ${restore}
+              THEN dt.status = 'partial' AND dt.error = 'preview_truncated' AND to_jsonb(dt)->>'artifact_id' IS NOT NULL
+              ELSE dt.status = 'done' END
+    ), updated AS (
+      UPDATE download_tasks d
+      SET status = CASE WHEN ${restore} THEN 'done' ELSE 'partial' END,
+          error = CASE WHEN ${restore} THEN '' ELSE 'preview_truncated' END,
+          updated_at = now()
+      FROM target t WHERE d.id = t.id AND ${!options.dryRun}
+      RETURNING d.id
+    )
+    SELECT (SELECT count(*)::int FROM target) AS matched, (SELECT count(*)::int FROM updated) AS updated`;
+  const row = (Array.isArray(rows) ? rows : ((rows as { rows?: unknown[] })?.rows ?? []))[0] as Record<string, unknown> ?? {};
+  return {
+    dryRun: options.dryRun, restore, requested: ids.length,
+    matched: Number(row.matched ?? 0), updated: Number(row.updated ?? 0),
   };
 }

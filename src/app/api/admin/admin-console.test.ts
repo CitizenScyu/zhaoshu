@@ -29,6 +29,7 @@ import * as usersRoute from './users/route';
 import { PATCH as userPatch } from './users/[id]/route';
 import { GET as labelGet, PATCH as labelPatch } from './label-model/route';
 import { POST as requeuePost } from './download-requeue/route';
+import { POST as demotePost } from './download-demote/route';
 
 const OWNER_TOKEN = 'admin-console-owner-token';
 it('用户路由只导出 Next.js 支持的处理器', () => {
@@ -62,6 +63,7 @@ const WRITES: { name: string; path: string; handler: Handler; params?: Record<st
   { name: 'PATCH /api/admin/users/[id]', path: '/api/admin/users/2', handler: userPatch as Handler, params: { id: '2' } },
   { name: 'PATCH /api/admin/label-model', path: '/api/admin/label-model', handler: labelPatch as Handler },
   { name: 'POST /api/admin/download-requeue', path: '/api/admin/download-requeue', handler: requeuePost as Handler },
+  { name: 'POST /api/admin/download-demote', path: '/api/admin/download-demote', handler: demotePost as Handler },
 ];
 
 const READS: { name: string; path: string; handler: Handler }[] = [
@@ -163,6 +165,22 @@ describe('下载重排（requeue1104）入参校验', () => {
     const res = await call(requeuePost as Handler, owner('POST', '/api/admin/download-requeue', body));
     expect(res.status).toBe(400);
     expect(await res.json()).toMatchObject({ code });
+    expect(db.queries).toHaveLength(0);
+  });
+});
+
+describe('试读本下架（demote1104）入参校验', () => {
+  it.each([
+    [{ }],
+    [{ taskIds: [] }],
+    [{ taskIds: [1, 0] }],
+    [{ taskIds: ['1'] }],
+    [{ taskIds: [1.5] }],
+    [{ taskIds: Array.from({ length: 501 }, (_, i) => i + 1) }],
+  ])('%j → 400 INVALID_TASK_IDS，不碰数据库', async (body) => {
+    const res = await call(demotePost as Handler, owner('POST', '/api/admin/download-demote', body));
+    expect(res.status).toBe(400);
+    expect(await res.json()).toMatchObject({ code: 'INVALID_TASK_IDS' });
     expect(db.queries).toHaveLength(0);
   });
 });
