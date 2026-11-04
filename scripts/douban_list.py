@@ -26,6 +26,7 @@ import time
 import unicodedata
 import urllib.parse
 from collections import defaultdict
+from html import unescape
 from math import ceil
 from pathlib import Path
 from typing import Callable
@@ -2842,6 +2843,58 @@ def fetch_17k_quanben_books(http_get) -> list[dict]:
         return []
 
 
+def fetch_17k_top_books(http_get) -> list[dict]:
+    """17K 排行榜首页（lists1104）：/top/ 本身 SSR 汇总各榜前 10，约 250 个书 id，
+    与完本页同一锚点形态，直接复用 parse_17k_quanben（截断标题照样丢弃，作者多为空串）。
+    各榜 Top100 详情页仍被 WAF 挡，不接。"""
+    try:
+        return parse_17k_quanben(http_get(f'{Y17K_BASE}/top/'))
+    except Exception as e:
+        print(f'  17K[排行榜] 拉取失败: {e}', file=sys.stderr)
+        return []
+
+
+# ---- 七猫中文网（www.qimao.com/paihang，2026-11-04 调研接入 lists1104）----
+# 榜单页纯 SSR、UTF-8、无 JS 盾（local-server 实测 200 / 约 100KB），每榜 20 本：
+#   <a … class="s-book-title" …>书名</a> … <a href="https://www.qimao.com/zuozhe/…">作者</a>
+# 七猫是免费阅读平台，书目在源池里普遍有免费镜像（付费墙独源的 QQ 系正相反）。
+# slug 只收页面导航里实测出现的男频榜（女频路径未见，不猜）。
+QIMAO_BASE = 'https://www.qimao.com'
+QIMAO_RANKS = ('boy/hot/date', 'boy/hot/month', 'boy/over/date', 'boy/new/date',
+               'boy/collect/date', 'boy/update/date')
+_QM_TITLE_RE = re.compile(r'<a\s[^>]*class="s-book-title"[^>]*>([^<]+)</a>')
+_QM_AUTHOR_RE = re.compile(r'href="(?:https?:)?//www\.qimao\.com/zuozhe/[^"]*"[^>]*>([^<]+)</a>')
+
+
+def parse_qimao_rank(html: str) -> list[dict]:
+    """七猫榜单页 → [{title, author, origin}]；作者只在本条与下一条书名锚点之间找，避免串条。"""
+    entries = list(_QM_TITLE_RE.finditer(html))
+    books, seen = [], set()
+    for i, m in enumerate(entries):
+        title = unescape(m.group(1)).strip()
+        if not title or len(title) > 40:
+            continue
+        end = entries[i + 1].start() if i + 1 < len(entries) else len(html)
+        a = _QM_AUTHOR_RE.search(html, m.end(), end)
+        key = _norm_title(title)
+        if key and key not in seen:
+            seen.add(key)
+            books.append({'title': title, 'author': unescape(a.group(1)).strip() if a else '',
+                          'origin': '七猫榜单', 'douban_url': ''})
+    return books
+
+
+def fetch_qimao_rank_books(http_get) -> list[dict]:
+    """七猫 6 榜（热度日/月、完结、新书、收藏、更新，各 20 本）；单榜失败只告警。"""
+    books: list[dict] = []
+    for rank in QIMAO_RANKS:
+        try:
+            books.extend(parse_qimao_rank(http_get(f'{QIMAO_BASE}/paihang/{rank}/')))
+        except Exception as e:
+            print(f'  七猫[{rank}] 拉取失败: {e}', file=sys.stderr)
+    return books
+
+
 def build_webnovel_queue(http_get, include_douban: bool = True,
                          skip_titles: set | None = None,
                          pages: int | None = None, engine_cli=None,
@@ -2877,6 +2930,9 @@ def build_webnovel_queue(http_get, include_douban: bool = True,
     add_batch(fetch_zongheng_complete_books(http_get), '纵横完本')
     add_batch(fetch_17k_quanben_books(http_get), '17K完本')
     add_batch(fetch_qidian_rank_books(http_get), '起点榜单')
+    # lists1104：原名单源已抽干（每轮候选 0–1 本），补七猫榜单 + 17K 排行榜首页。
+    add_batch(fetch_qimao_rank_books(http_get), '七猫榜单')
+    add_batch(fetch_17k_top_books(http_get), '17K榜单')
     if include_douban:
         add_batch(fetch_douban_books(http_get, pages=pages), '豆瓣网文tag')
     return _resolve_candidates(candidates, http_get, skip_titles=skip_titles,
